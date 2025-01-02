@@ -1,0 +1,22 @@
+{
+  "name": "graphdl-sdk",
+  "version": "0.0.1",
+  "description": "GraphDL SDK",
+  "main": "./dist/index.js",
+  "types": "./index.ts",
+  "license": "MIT",
+  "author": "Samuel Lippert <samuel@driv.ly>",
+  "scripts": {
+    "prepublish": "tsc",
+    "test": "vitest"
+  },
+  "dependencies": {
+    "dotenv": "^16.3.1",
+    "payload-rest-client": "^0.0.7"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.2",
+    "typescript": "^5.3.2",
+    "vitest": "^1.0.1"
+  }
+}
