@@ -88,7 +88,7 @@ const GraphSchemas: CollectionConfig = {
                 const nounEntities: (gdl.Noun | gdl.GraphSchema)[] = []
 
                 // tokenize by noun names
-                ;(readings[0].text as string).split(nounRegex).forEach((token: any) => {
+                ;(readings[0].text as string).split(nounRegex).forEach((token) => {
                   const noun = entities.find((noun) => noun.name === token)
                   if (noun) nounEntities.push(noun)
                 })
@@ -204,7 +204,7 @@ const GraphSchemas: CollectionConfig = {
                   },
                 })
                 if (value === 'many-to-one') {
-                  const constraintSpan = await payload.create({
+                  const _constraintSpan = await payload.create({
                     collection: 'constraint-spans',
                     data: {
                       roles: data?.roles[0] || originalDoc.roles[0],
@@ -220,7 +220,7 @@ const GraphSchemas: CollectionConfig = {
                   // })
                   // console.log('roles', roles)
                 } else if (value === 'one-to-many') {
-                  const constraintSpan = await payload.create({
+                  const _constraintSpan = await payload.create({
                     collection: 'constraint-spans',
                     data: {
                       roles: data?.roles[1] || originalDoc.roles[1],
@@ -236,7 +236,7 @@ const GraphSchemas: CollectionConfig = {
                   // })
                   // console.log('roles', roles)
                 } else if (value === 'many-to-many') {
-                  const constraintSpan = await payload.create({
+                  const _constraintSpan = await payload.create({
                     collection: 'constraint-spans',
                     data: {
                       roles: data?.roles || originalDoc.roles,
@@ -259,7 +259,7 @@ const GraphSchemas: CollectionConfig = {
                       modality: 'Alethic',
                     },
                   })
-                  const constraintSpans = await Promise.all([
+                  const _constraintSpans = await Promise.all([
                     payload.create({
                       collection: 'constraint-spans',
                       data: {

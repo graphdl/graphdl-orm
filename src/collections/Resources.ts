@@ -1,4 +1,5 @@
 import { CollectionConfig } from 'payload'
+import * as gdl from '../payload-types'
 
 const Resources: CollectionConfig = {
   slug: 'resources',
@@ -17,29 +18,35 @@ const Resources: CollectionConfig = {
         beforeChange: [
           async ({ originalDoc, data, req: { payload } }) => {
             const typeId = data?.type || originalDoc?.type
-            const resourceIds = (data?.reference || originalDoc?.reference)
-              .filter((r: any) => r.relationTo === 'resources')
-              ?.map((r: any) => r.value)
+            const reference: {
+              relationTo: 'resources' | 'graphs'
+              value: string
+            }[] = data?.reference || originalDoc?.reference
+            const resourceIds = reference
+              .filter((r) => r.relationTo === 'resources')
+              ?.map((r) => r.value)
               ?.join(',')
-            const graphIds = (data?.reference || originalDoc?.reference)
-              .filter((r: any) => r.relationTo === 'graphs')
-              ?.map((r: any) => r.value)
+            const graphIds = reference
+              .filter((r) => r.relationTo === 'graphs')
+              ?.map((r) => r.value)
               ?.join(',')
             const [type, resources, graphs] = await Promise.all([
               typeId && payload.findByID({ collection: 'nouns', id: typeId }),
-              resourceIds &&
-                payload
-                  .find({ collection: 'resources', where: { id: { in: resourceIds } } })
-                  .then((r) => r.docs),
-              graphIds &&
-                payload
-                  .find({ collection: 'graphs', where: { id: { in: graphIds } } })
-                  .then((r) => r.docs),
+              resourceIds
+                ? payload
+                    .find({ collection: 'resources', where: { id: { in: resourceIds } } })
+                    .then((r) => r.docs)
+                : undefined,
+              graphIds
+                ? payload
+                    .find({ collection: 'graphs', where: { id: { in: graphIds } } })
+                    .then((r) => r.docs)
+                : undefined,
             ])
-            const references = (data?.reference || originalDoc?.reference).map((r: any) => {
+            const references = reference.map((r) => {
               return (
-                resources?.find((res: any) => res.id === r.value) ||
-                graphs?.find((g: any) => g.id === r.value)
+                resources?.find((res: gdl.Resource) => res.id === r.value) ||
+                graphs?.find((g: gdl.Graph) => g.id === r.value)
               )
             })
             console.log('references', references)
@@ -47,7 +54,11 @@ const Resources: CollectionConfig = {
               data?.value ||
               originalDoc?.value ||
               references
-                ?.map((r: any) => r.reference?.map((ref: any) => ref.value)?.join(', ') || r.value)
+                ?.map(
+                  (r) =>
+                    (r as gdl.Resource).reference?.map((ref) => ref.value)?.join(', ') ||
+                    (r as gdl.Resource)?.value,
+                )
                 ?.join(', ')
             }`
           },

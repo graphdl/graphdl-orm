@@ -89,7 +89,7 @@ const Generator: CollectionConfig = {
         if (!context.internal) context.internal = []
         ;(context.internal as string[])?.push('schemas.afterHook')
         // #region Retrieve data
-        const schemas: any = {}
+        const schemas: Record<string, Schema> = {}
 
         const [graphSchemas, nouns, constraintSpans, examples, jsons] = (await Promise.all([
           payload
@@ -198,22 +198,21 @@ const Generator: CollectionConfig = {
         processUnarySchemas(graphSchemas, nouns, nounRegex, schemas, jsonExamples, examples)
         // #region Schema processor
         // Flatten allOf chains in order to help parsing engines that don't support them
-        const componentSchemas: [string, JSONSchema][] = Object.entries(schemas)
+        const componentSchemas: [string, Schema][] = Object.entries(schemas)
         for (const [key, schema] of componentSchemas) {
           while (schema.allOf) {
             const mergedRequired: string[] = [...(schema.required || [])]
             let mergedProperties = schema.properties || {}
-            const mergedAllOf: JSONSchema[] = []
-            schema.allOf.forEach((s: any) => {
-              const dependency = schemas[s.$ref?.split('/').pop()]
+            const mergedAllOf: JSONSchemaDefinition[] = []
+            schema.allOf.forEach((s) => {
+              const dependency = schemas[(s as JSONSchema).$ref?.split('/').pop() || '']
               if (dependency.required?.length)
                 mergedRequired.push(
                   ...dependency.required.filter((f: string) => !mergedRequired.includes(f)),
                 )
               if (Object.keys(dependency.properties || {}).length)
                 mergedProperties = { ...dependency.properties, ...mergedProperties }
-              if (dependency.allOf?.length)
-                mergedAllOf.push(...dependency.allOf.map((a: JSONSchema) => a))
+              if (dependency.allOf?.length) mergedAllOf.push(...dependency.allOf.map((a) => a))
               if (!schema.title && dependency.title) schema.title = dependency.title
               if (!schema.description && dependency.description)
                 schema.description = dependency.description
@@ -318,9 +317,12 @@ const Generator: CollectionConfig = {
           paths: Object.fromEntries(
             Object.entries(schemas)
               .filter(([key, _schema]) => schemas['Update' + key] || schemas['New' + key])
-              .flatMap(([key, schema]: [string, any]) => {
+              .flatMap(([key, schema]: [string, Schema]) => {
                 const baseSchema = schemas['Update' + key] || schemas['New' + key] || schema
-                const idScheme: [PropertyKey, any][] | undefined = getIdScheme(baseSchema, schemas)
+                const idScheme: [PropertyKey, JSONSchemaDefinition][] | undefined = getIdScheme(
+                  baseSchema,
+                  schemas,
+                )
                 const subject = nouns.find((n) => nameToKey(n.name || '') === key)
                 const permissions = (
                   subject?.permissions || ['create', 'read', 'update', 'list', 'login', 'rateLimit']
@@ -352,9 +354,10 @@ const Generator: CollectionConfig = {
                 // #region Add paths for CRUD operations based on permissions
                 const basePath = `/${nameToKey(plural).toLowerCase()}`
                 if (permissions.includes('list')) {
-                  const wrapperTemplate = _.cloneDeep(globalWrapperTemplate) as {
-                    [key: string]: any
-                  }
+                  const wrapperTemplate = _.cloneDeep(globalWrapperTemplate) as Record<
+                    string,
+                    Schema
+                  >
                   const pathParameters = []
                   const operationParameters = []
                   if (databaseEngine === 'Payload') {
@@ -559,7 +562,7 @@ const Generator: CollectionConfig = {
                 if (permissions.includes('create')) {
                   const createSchema: JSONSchema | undefined = fillSchemaTemplate({
                     schema: { $ref: `#/components/schemas/${schema.$id}` },
-                    wrapperTemplate: globalWrapperTemplate,
+                    wrapperTemplate: globalWrapperTemplate as Record<string, Schema>,
                     replacementFieldPath,
                   })
                   postUsed = true
@@ -574,7 +577,7 @@ const Generator: CollectionConfig = {
                     _.set(createError, errorCodePath || 'error.code', 400)
                   }
 
-                  const create: any = {
+                  const create = {
                     summary: `${isId ? 'Create' : 'Add'} ${nounIsPlural ? '' : 'a '}new ${title}`,
                     operationId: `post-${key.toLowerCase()}`,
                     responses: {
@@ -667,11 +670,11 @@ const Generator: CollectionConfig = {
                   const parameters =
                     (idScheme?.length &&
                       idScheme.map((id) => ({
-                        schema: { type: id[1].type },
+                        schema: { type: (id[1] as JSONSchema).type },
                         name: id[0],
                         in: 'path',
                         required: true,
-                        description: id[1].description,
+                        description: (id[1] as JSONSchema).description,
                       }))) ||
                     []
                   if (databaseEngine === 'Payload') {
@@ -693,7 +696,7 @@ const Generator: CollectionConfig = {
                   if (permissions.includes('read')) {
                     const readSchema: JSONSchema | undefined = fillSchemaTemplate({
                       schema: { $ref: `#/components/schemas/${schema.$id}` },
-                      wrapperTemplate: globalWrapperTemplate,
+                      wrapperTemplate: globalWrapperTemplate as Record<string, Schema>,
                       replacementFieldPath,
                     })
                     retval[retval.length - 1][1].get = {
@@ -755,7 +758,7 @@ const Generator: CollectionConfig = {
                   if (permissions.includes('update')) {
                     const updateSchema: JSONSchema | undefined = fillSchemaTemplate({
                       schema: { $ref: `#/components/schemas/${schema.$id}` },
-                      wrapperTemplate: globalWrapperTemplate,
+                      wrapperTemplate: globalWrapperTemplate as Record<string, Schema>,
                       replacementFieldPath,
                     })
                     patchUsed = true
@@ -826,7 +829,7 @@ const Generator: CollectionConfig = {
                   }
                   if (permissions.includes('delete')) {
                     const deleteSchema: JSONSchema | undefined = fillSchemaTemplate({
-                      wrapperTemplate: globalWrapperTemplate,
+                      wrapperTemplate: globalWrapperTemplate as Record<string, Schema>,
                     })
                     retval[retval.length - 1][1].delete = {
                       responses: {
@@ -921,7 +924,7 @@ function processArraySchemas(
   arrayTypes: { gs: gdl.GraphSchema; cs: Omit<gdl.ConstraintSpan, 'updatedAt'> }[],
   nouns: Omit<gdl.GraphSchema | gdl.Noun, 'updatedAt'>[],
   nounRegex: RegExp,
-  schemas: any,
+  schemas: Record<string, Schema>,
   jsonExamples: { [k: string]: JSONSchemaType },
 ) {
   for (const { gs: schema } of arrayTypes) {
@@ -955,7 +958,7 @@ function processArraySchemas(
 
 function processBinarySchemas(
   constraintSpans: Omit<gdl.ConstraintSpan, 'updatedAt'>[],
-  schemas: any,
+  schemas: Record<string, Schema>,
   nouns: Omit<gdl.GraphSchema | gdl.Noun, 'updatedAt'>[],
   jsonExamples: { [k: string]: JSONSchemaType },
   nounRegex: RegExp,
@@ -991,7 +994,7 @@ function processBinarySchemas(
       .map(
         (c) =>
           propertySchema.roles?.find(
-            (r: any) => r.id !== ((c.value as gdl.ConstraintSpan).roles[0] as gdl.Role).id,
+            (r) => (r as gdl.Role).id !== ((c.value as gdl.ConstraintSpan).roles[0] as gdl.Role).id,
           ) as gdl.Role,
       )
 
@@ -1030,11 +1033,11 @@ function processUnarySchemas(
   graphSchemas: Omit<gdl.GraphSchema, 'updatedAt'>[],
   nouns: Omit<gdl.Noun | gdl.GraphSchema, 'updatedAt'>[],
   nounRegex: RegExp,
-  schemas: any,
+  schemas: Record<string, Schema>,
   jsonExamples: { [k: string]: JSONSchemaType },
   examples: Omit<gdl.Graph, 'updatedAt'>[],
 ) {
-  for (const unarySchema of graphSchemas.filter((s: any) => s.roles?.length === 1)) {
+  for (const unarySchema of graphSchemas.filter((s) => s.roles?.length === 1)) {
     const unaryRole = unarySchema.roles?.[0] as gdl.Role
     const subject = unaryRole?.noun?.value as gdl.Noun | gdl.GraphSchema
     const reading = (unarySchema.readings as gdl.Reading[])?.[0]
@@ -1060,7 +1063,7 @@ function processUnarySchemas(
       .map(
         (c) =>
           unarySchema.roles?.find(
-            (r: any) => r.id !== ((c.value as gdl.ConstraintSpan).roles[0] as gdl.Role).id,
+            (r) => (r as gdl.Role).id !== ((c.value as gdl.ConstraintSpan).roles[0] as gdl.Role).id,
           ) as gdl.Role,
       )
 
@@ -1082,7 +1085,7 @@ function processUnarySchemas(
 // #region Helper functions
 function removeDuplicateSchemas(
   patchUsed: boolean,
-  schemas: any,
+  schemas: Record<string, Schema>,
   key: string,
   replacements: string[][],
   postUsed: boolean,
@@ -1115,15 +1118,15 @@ function removeDuplicateSchemas(
           Object.keys(schemas[key].properties || {}).length))
   ) {
     postUsed = false
-    const allOf: any = schemas[key].allOf
+    const allOf = schemas[key].allOf
     if (!schemas['New' + key]?.allOf) delete schemas[key].allOf
     else if (
-      allOf[1] &&
+      allOf?.[1] &&
       (schemas['New' + key].allOf?.[0] as JSONSchema).$ref?.replace(/Update|New/, '') ===
-        allOf[1].$ref
+        (allOf[1] as Schema).$ref
     )
       allOf.splice(0, 1)
-    else allOf[0] = schemas['New' + key].allOf?.[0]
+    else if (allOf) allOf[0] = schemas['New' + key].allOf?.[0] as Schema
 
     const required = schemas[key].required
     schemas[key] = {
@@ -1157,7 +1160,7 @@ function createErrorTemplates(
   )[],
   errorMessagePath: string | null | undefined,
   errorCodePath: string | null | undefined,
-  title: any,
+  title: string,
 ) {
   let unauthorizedError: object | undefined = undefined,
     rateError: object | undefined = undefined,
@@ -1181,40 +1184,40 @@ function createErrorTemplates(
   return { unauthorizedError, rateError, notFoundError }
 }
 
-function getIdScheme(baseSchema: any, schemas: any) {
+function getIdScheme(baseSchema: Schema, schemas: Record<string, Schema>) {
   let idSchema = baseSchema
-  let idScheme: [PropertyKey, any][] | undefined =
-    idSchema?.properties &&
-    Object.entries(idSchema.properties)?.filter((p: any) =>
-      p[1]?.description?.includes('is uniquely identified by'),
-    )
+  let idScheme: [PropertyKey, JSONSchemaDefinition][] | undefined = idSchema?.properties
+    ? Object.entries(idSchema.properties)?.filter((p) =>
+        (p[1] as JSONSchema)?.description?.includes('is uniquely identified by'),
+      )
+    : undefined
   while (!idScheme?.length && idSchema?.allOf) {
     const key = (idSchema.allOf[0] as JSONSchema)?.$ref?.split('/')?.pop() as string
     const bareKey = key.replace(/^New|^Update/, '')
     idSchema = schemas['Update' + bareKey] || schemas['New' + bareKey] || schemas[bareKey]
     idScheme =
       idSchema?.properties &&
-      Object.entries(idSchema.properties)?.filter((p: any) =>
-        p[1]?.description?.includes('is uniquely identified by'),
+      Object.entries(idSchema.properties)?.filter((p) =>
+        (p[1] as JSONSchema)?.description?.includes('is uniquely identified by'),
       )
   }
 
   if (idScheme?.length)
     for (let i = 0; i < idScheme.length; i++) {
-      let value = idScheme[i][1]
+      let value = idScheme[i][1] as Schema
       while (value.oneOf) {
         const description = value.description
-        value = value.oneOf[0]
+        value = value.oneOf[0] as Schema
         if (value.properties) {
           idScheme.splice(
             i,
             1,
-            ...(Object.entries(value.properties).map((p: [PropertyKey, any]) => [
+            ...(Object.entries(value.properties).map((p: [PropertyKey, JSONSchemaDefinition]) => [
               p[0],
-              { description, ...p[1] },
-            ]) as [PropertyKey, any][]),
+              { description, ...(p[1] as JSONSchema) },
+            ]) as [PropertyKey, JSONSchemaDefinition][]),
           )
-          value = idScheme[i][1]
+          value = idScheme[i][1] as Schema
         } else idScheme[i][1] = { description, ...value }
       }
     }
@@ -1228,18 +1231,18 @@ function fillSchemaTemplate({
   replacementFieldPath,
 }: {
   schema?: JSONSchema
-  example?: any
-  wrapperTemplate: any
-  replacementFieldPath?: any
+  example?: unknown
+  wrapperTemplate?: Record<string, Schema>
+  replacementFieldPath?: string | null
 }) {
   const jsonSchema = new Draft06()
-  if (Object.keys(wrapperTemplate).length) {
+  if (wrapperTemplate && Object.keys(wrapperTemplate).length) {
     const wrapperSchema = jsonSchema.createSchemaOf(wrapperTemplate)
     if (replacementFieldPath && _.get(wrapperSchema.properties, replacementFieldPath))
       if (schema) _.set(wrapperSchema.properties, replacementFieldPath, schema)
       else _.unset(wrapperSchema.properties, replacementFieldPath)
     if (example) {
-      wrapperTemplate[replacementFieldPath] = example
+      wrapperTemplate[replacementFieldPath || ''] = example
       wrapperSchema.examples = [wrapperTemplate]
     }
     schema = wrapperSchema
@@ -1263,7 +1266,7 @@ function createProperty({
   }
 }) {
   object = nouns.find((n) => n.id === object.id) || object
-  const property: JSONSchemaDefinition = {}
+  const property: Schema = {}
   let { referenceScheme, superType, valueType } = object as gdl.Noun
   if (!referenceScheme) {
     referenceScheme =
@@ -1286,7 +1289,7 @@ function createProperty({
       property.enum = noun.enum.split(',').map((e) => {
         const val = e.trim()
         if (val === 'null') {
-          ;(property as any).nullable = true
+          property.nullable = true
           return null
         }
         return val
@@ -1586,3 +1589,12 @@ export function extractPropertyName(objectReading: string[]) {
   return propertyName
 }
 // #endregion
+
+type Schema = JSONSchema & {
+  nullable?: true | false
+  properties?:
+    | {
+        [k: string]: Schema
+      }
+    | undefined
+}
