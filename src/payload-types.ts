@@ -8,119 +8,1268 @@
 
 export interface Config {
   auth: {
-    users: UserAuthOperations;
-  };
+    users: UserAuthOperations
+  }
   collections: {
-    users: User;
-    media: Media;
-    'payload-preferences': PayloadPreference;
-    'payload-migrations': PayloadMigration;
-  };
+    generators: Generator
+    'json-examples': JsonExample
+    'graph-schemas': GraphSchema
+    readings: Reading
+    roles: Role
+    constraints: Constraint
+    'constraint-spans': ConstraintSpan
+    nouns: Noun
+    verbs: Verb
+    'event-types': EventType
+    streams: Stream
+    statuses: Status
+    'state-machine-definitions': StateMachineDefinition
+    transitions: Transition
+    guards: Guard
+    graphs: Graph
+    resources: Resource
+    'resource-roles': ResourceRole
+    events: Event
+    'state-machines': StateMachine
+    'guard-runs': GuardRun
+    users: User
+    'payload-locked-documents': PayloadLockedDocument
+    'payload-preferences': PayloadPreference
+    'payload-migrations': PayloadMigration
+  }
+  collectionsJoins: {}
+  collectionsSelect: {
+    'graph-schemas': GraphSchemasSelect<false> | GraphSchemasSelect<true>
+    readings: ReadingsSelect<false> | ReadingsSelect<true>
+    roles: RolesSelect<false> | RolesSelect<true>
+    constraints: ConstraintsSelect<false> | ConstraintsSelect<true>
+    'constraint-spans': ConstraintSpansSelect<false> | ConstraintSpansSelect<true>
+    nouns: NounsSelect<false> | NounsSelect<true>
+    verbs: VerbsSelect<false> | VerbsSelect<true>
+    'event-types': EventTypesSelect<false> | EventTypesSelect<true>
+    streams: StreamsSelect<false> | StreamsSelect<true>
+    statuses: StatusesSelect<false> | StatusesSelect<true>
+    'state-machine-definitions':
+      | StateMachineDefinitionsSelect<false>
+      | StateMachineDefinitionsSelect<true>
+    transitions: TransitionsSelect<false> | TransitionsSelect<true>
+    guards: GuardsSelect<false> | GuardsSelect<true>
+    graphs: GraphsSelect<false> | GraphsSelect<true>
+    resources: ResourcesSelect<false> | ResourcesSelect<true>
+    'resource-roles': ResourceRolesSelect<false> | ResourceRolesSelect<true>
+    events: EventsSelect<false> | EventsSelect<true>
+    'state-machines': StateMachinesSelect<false> | StateMachinesSelect<true>
+    'guard-runs': GuardRunsSelect<false> | GuardRunsSelect<true>
+    users: UsersSelect<false> | UsersSelect<true>
+    'payload-locked-documents':
+      | PayloadLockedDocumentsSelect<false>
+      | PayloadLockedDocumentsSelect<true>
+    'payload-preferences': PayloadPreferencesSelect<false> | PayloadPreferencesSelect<true>
+    'payload-migrations': PayloadMigrationsSelect<false> | PayloadMigrationsSelect<true>
+  }
   db: {
-    defaultIDType: string;
-  };
-  globals: {};
-  locale: null;
+    defaultIDType: string
+  }
+  globals: {}
+  globalsSelect: {}
+  locale: null
   user: User & {
-    collection: 'users';
-  };
+    collection: 'users'
+  }
+  jobs: {
+    tasks: unknown
+    workflows: unknown
+  }
 }
 export interface UserAuthOperations {
   forgotPassword: {
-    email: string;
-    password: string;
-  };
+    email: string
+    password: string
+  }
   login: {
-    email: string;
-    password: string;
-  };
+    email: string
+    password: string
+  }
   registerFirstUser: {
-    email: string;
-    password: string;
-  };
+    email: string
+    password: string
+  }
   unlock: {
-    email: string;
-    password: string;
-  };
+    email: string
+    password: string
+  }
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "generators".
+ */
+export interface Generator {
+  id: string
+  title?: string | null
+  version?: string | null
+  email?: string | null
+  name?: string | null
+  url?: string | null
+  description?: string | null
+  servers?:
+    | {
+        [k: string]: unknown
+      }
+    | unknown[]
+    | string
+    | number
+    | boolean
+    | null
+  globalPermissions?:
+    | ('create' | 'read' | 'update' | 'delete' | 'list' | 'login' | 'rateLimit')[]
+    | null
+  replacementFieldPath?: string | null
+  globalWrapperTemplate?:
+    | {
+        [k: string]: unknown
+      }
+    | unknown[]
+    | string
+    | number
+    | boolean
+    | null
+  errorCodePath?: string | null
+  errorMessagePath?: string | null
+  errorTemplate?:
+    | {
+        [k: string]: unknown
+      }
+    | unknown[]
+    | string
+    | number
+    | boolean
+    | null
+  databaseEngine: 'Payload'
+  output?:
+    | {
+        [k: string]: unknown
+      }
+    | unknown[]
+    | string
+    | number
+    | boolean
+    | null
+  updatedAt: string
+  createdAt: string
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "json-examples".
+ */
+export interface JsonExample {
+  id: string
+  title?: string | null
+  noun?:
+    | ({
+        relationTo: 'nouns'
+        value: string | Noun
+      } | null)
+    | ({
+        relationTo: 'graph-schemas'
+        value: string | GraphSchema
+      } | null)
+  jsonExample?:
+    | {
+        [k: string]: unknown
+      }
+    | unknown[]
+    | string
+    | number
+    | boolean
+    | null
+  verbatim?: boolean | null
+  outputGraphs?: (string | Graph)[] | null
+  updatedAt: string
+  createdAt: string
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "graph-schemas".
+ */
+export interface GraphSchema {
+  id: string
+  /**
+   * Graph Schema has Name.
+   */
+  name?: string | null
+  /**
+   * Noun has Description.
+   */
+  description?: string | null
+  title: string
+  /**
+   * Noun has plural reading.
+   */
+  plural?: string | null
+  /**
+   * Graph Schema has Reading.
+   */
+  readings?: (string | Reading)[] | null
+  /**
+   * Graph Schema uses Role.
+   */
+  roles?: (string | Role)[] | null
+  /**
+   * Graph Schema has enumeration Order.
+   */
+  order?: number | null
+  roleRelationship?: ('many-to-one' | 'one-to-many' | 'many-to-many' | 'one-to-one') | null
+  /**
+   * Graph is of Graph Schema.
+   */
+  graphs?: (string | Graph)[] | null
+  /**
+   * Noun has Access Permissions.
+   */
+  permissions?:
+    | ('create' | 'read' | 'update' | 'delete' | 'list' | 'versioned' | 'login' | 'rateLimit')[]
+    | null
+  updatedAt: string
+  createdAt: string
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "readings".
+ */
+export interface Reading {
+  id: string
+  /**
+   * Graph Schema has Reading.
+   */
+  graphSchema?: (string | null) | GraphSchema
+  /**
+   * Reading has Text.
+   */
+  text: string
+  /**
+   * Reading is used by Verb.
+   */
+  verb?: (string | null) | Verb
+  /**
+   * Reading has Endpoint URI.
+   */
+  endpointUri?: string | null
+  /**
+   * Reading is localized for Language.
+   */
+  languageCode?: string | null
+  /**
+   * Reading has Endpoint HTTP Operation Verb.
+   */
+  endpointHttpVerb: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
+  /**
+   * Role is used in Reading order.
+   */
+  roles?: (string | Role)[] | null
+  updatedAt: string
+  createdAt: string
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "verbs".
+ */
+export interface Verb {
+  id: string
+  /**
+   * Verb has name.
+   */
+  name?: string | null
+  updatedAt: string
+  createdAt: string
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "roles".
+ */
+export interface Role {
+  id: string
+  title: string
+  /**
+   * Noun plays Role.
+   */
+  noun?:
+    | ({
+        relationTo: 'nouns'
+        value: string | Noun
+      } | null)
+    | ({
+        relationTo: 'graph-schemas'
+        value: string | GraphSchema
+      } | null)
+  /**
+   * Graph Schema uses Role.
+   */
+  graphSchema?: (string | null) | GraphSchema
+  /**
+   * Constraint spans Role.
+   */
+  constraints?:
+    | (
+        | {
+            relationTo: 'constraint-spans'
+            value: string | ConstraintSpan
+          }
+        | {
+            relationTo: 'constraints'
+            value: string | Constraint
+          }
+      )[]
+    | null
+  required?: boolean | null
+  updatedAt: string
+  createdAt: string
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "nouns".
+ */
+export interface Noun {
+  id: string
+  /**
+   * schema:Thing has Name.
+   */
+  name?: string | null
+  /**
+   * Noun has plural reading.
+   */
+  plural?: string | null
+  /**
+   * Noun has Description.
+   */
+  description?: string | null
+  /**
+   * Noun has Assistant Prompt.
+   */
+  assistantPrompt?: string | null
+  /**
+   * Noun has Access Permissions.
+   */
+  permissions?:
+    | ('create' | 'read' | 'update' | 'delete' | 'list' | 'versioned' | 'login' | 'rateLimit')[]
+    | null
+  /**
+   * State Machine Definition is for Noun.
+   */
+  stateMachineDefinitions?: (string | StateMachineDefinition)[] | null
+  /**
+   * Noun has object type
+   */
+  objectType?: ('entity' | 'value') | null
+  /**
+   * Noun has Reference Scheme.
+   */
+  referenceScheme?: (string | Noun)[] | null
+  /**
+   * Noun has Value Type.
+   */
+  valueType?: ('string' | 'number' | 'integer' | 'boolean' | 'object' | 'array') | null
+  /**
+   * Noun has Minimum Length.
+   */
+  minLength?: number | null
+  /**
+   * Noun has Maximum Length.
+   */
+  maxLength?: number | null
+  /**
+   * Noun has Regex Pattern.
+   */
+  pattern?: string | null
+  /**
+   * Noun is constrained to comma-separated Enum values.
+   */
+  enum?: string | null
+  /**
+   * Noun has Format.
+   */
+  format?:
+    | (
+        | 'date-time'
+        | 'time'
+        | 'date'
+        | 'duration'
+        | 'email'
+        | 'idn-email'
+        | 'hostname'
+        | 'idn-hostname'
+        | 'ipv4'
+        | 'ipv6'
+        | 'uuid'
+        | 'uri'
+        | 'uri-reference'
+        | 'iri'
+        | 'iri-reference'
+        | 'uri-template'
+        | 'json-pointer'
+        | 'relative-json-pointer'
+        | 'regex'
+      )
+    | null
+  /**
+   * Noun has Minimum Value.
+   */
+  minimum?: number | null
+  /**
+   * Noun has Exclusive Minimum Value.
+   */
+  exclusiveMinimum?: number | null
+  /**
+   * Noun has Exclusive Maximum Value.
+   */
+  exclusiveMaximum?: number | null
+  /**
+   * Noun has Maximum Value.
+   */
+  maximum?: number | null
+  /**
+   * Noun has Multiple Of Value.
+   */
+  multipleOf?: number | null
+  /**
+   * Noun is sub type to Noun.
+   */
+  superType?: (string | null) | Noun
+  /**
+   * Noun has Sub Types.
+   */
+  subTypes?: (string | Noun)[] | null
+  updatedAt: string
+  createdAt: string
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "state-machine-definitions".
+ */
+export interface StateMachineDefinition {
+  id: string
+  title?: string | null
+  /**
+   * State Machine Definition is for Noun.
+   */
+  noun:
+    | {
+        relationTo: 'nouns'
+        value: string | Noun
+      }
+    | {
+        relationTo: 'graph-schemas'
+        value: string | GraphSchema
+      }
+  /**
+   * Status is defined in State Machine Definition.
+   */
+  statuses?: (string | Status)[] | null
+  updatedAt: string
+  createdAt: string
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "statuses".
+ */
+export interface Status {
+  id: string
+  title?: string | null
+  /**
+   * Status has name.
+   */
+  name?: string | null
+  /**
+   * Status is defined in State Machine Definition.
+   */
+  stateMachineDefinition?: (string | null) | StateMachineDefinition
+  /**
+   * Verb is performed in Status (Moore semantics).
+   */
+  verb?: (string | null) | Verb
+  /**
+   * Transition is from Status.
+   */
+  transitions?: (string | Transition)[] | null
+  updatedAt: string
+  createdAt: string
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "transitions".
+ */
+export interface Transition {
+  id: string
+  title?: string | null
+  /**
+   * Transition is from Status.
+   */
+  from: string | Status
+  /**
+   * Transition is to Status.
+   */
+  to: string | Status
+  /**
+   * Transition is triggered by Event Type.
+   */
+  eventType?: (string | null) | EventType
+  /**
+   * Guard prevents Transition.
+   */
+  guard?: (string | null) | Guard
+  /**
+   * Verb is performed during Transition (Mealy semantics).
+   */
+  verb?: (string | null) | Verb
+  updatedAt: string
+  createdAt: string
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "event-types".
+ */
+export interface EventType {
+  id: string
+  /**
+   * Event Type has Name.
+   */
+  name: string
+  /**
+   * Event Type publishes to Stream.
+   */
+  streams?: (string | Stream)[] | null
+  /**
+   * Event Type can be created by Verb.
+   */
+  canBeCreatedbyVerbs?: (string | Verb)[] | null
+  updatedAt: string
+  createdAt: string
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "streams".
+ */
+export interface Stream {
+  id: string
+  /**
+   * Stream has Name.
+   */
+  name: string
+  /**
+   * Event Type publishes to Stream
+   */
+  eventType: string | EventType
+  updatedAt: string
+  createdAt: string
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "guards".
+ */
+export interface Guard {
+  id: string
+  /**
+   * Guard has Name.
+   */
+  name?: string | null
+  /**
+   * Guard references Graph Schema.
+   */
+  graphSchemas?: (string | GraphSchema)[] | null
+  /**
+   * Guard prevents Transition.
+   */
+  transition: string | Transition
+  /**
+   * Guard Run is for Guard.
+   */
+  runs?: (string | null) | GuardRun
+  updatedAt: string
+  createdAt: string
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "guard-runs".
+ */
+export interface GuardRun {
+  id: string
+  /**
+   * Guard Run has Name.
+   */
+  name?: string | null
+  /**
+   * Guard Run is for Guard.
+   */
+  type?: (string | null) | Guard
+  /**
+   * Guard Run references Graph.
+   */
+  graphs?: (string | Graph)[] | null
+  updatedAt: string
+  createdAt: string
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "graphs".
+ */
+export interface Graph {
+  id: string
+  title?: string | null
+  /**
+   * Graph is of Graph Schema.
+   */
+  type: string | GraphSchema
+  /**
+   * Verb uses Graph.
+   */
+  verb?: (string | null) | Verb
+  /**
+   * Graph uses Resource for Role.
+   */
+  resourceRoles?: (string | ResourceRole)[] | null
+  /**
+   * Graph verb is done for now.
+   */
+  isDoneForNow?: boolean | null
+  /**
+   * Graph is an example.
+   */
+  isExample?: boolean | null
+  updatedAt: string
+  createdAt: string
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "resource-roles".
+ */
+export interface ResourceRole {
+  id: string
+  title?: string | null
+  /**
+   * Graph uses Resource for Role.
+   */
+  graph?: (string | null) | Graph
+  /**
+   * Resource is used in Graph for Role.
+   */
+  resource?:
+    | ({
+        relationTo: 'resources'
+        value: string | Resource
+      } | null)
+    | ({
+        relationTo: 'graphs'
+        value: string | Graph
+      } | null)
+  /**
+   * Role is played by Resource in Graph.
+   */
+  role: string | Role
+  updatedAt: string
+  createdAt: string
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "resources".
+ */
+export interface Resource {
+  id: string
+  title?: string | null
+  /**
+   * Resource is an instance of Noun.
+   */
+  type: string | Noun
+  /**
+   * Resource is identified by reference
+   */
+  reference?:
+    | (
+        | {
+            relationTo: 'resources'
+            value: string | Resource
+          }
+        | {
+            relationTo: 'graphs'
+            value: string | Graph
+          }
+      )[]
+    | null
+  /**
+   * Resource has parsable value
+   */
+  value?: string | null
+  updatedAt: string
+  createdAt: string
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "constraint-spans".
+ */
+export interface ConstraintSpan {
+  id: string
+  title?: string | null
+  /**
+   * Constraint spans Role.
+   */
+  constraint?: (string | null) | Constraint
+  /**
+   * Constraint spans Role.
+   */
+  roles: (string | Role)[]
+  /**
+   * Subset Constraint spans Autofilled Role. If checked, this role is filled from the superset.
+   */
+  subsetAutofill?: boolean | null
+  updatedAt: string
+  createdAt: string
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "constraints".
+ */
+export interface Constraint {
+  id: string
+  title?: string | null
+  /**
+   * Constraint is Kind of constraint.
+   */
+  kind: 'UC' | 'MR' | 'SS' | 'XC' | 'EQ' | 'OR' | 'XO'
+  /**
+   * Constraint has modality of Modality Type. Alethic constraints enforce data integrity, while Deontic constraints warn when the constraint is violated.
+   */
+  modality: 'Alethic' | 'Deontic'
+  /**
+   * Set Comparison Constraint has Argument Length.
+   */
+  setComparisonArgumentLength?: number | null
+  /**
+   * Constraint spans Role.
+   */
+  roles?:
+    | (
+        | {
+            relationTo: 'constraint-spans'
+            value: string | ConstraintSpan
+          }
+        | {
+            relationTo: 'roles'
+            value: string | Role
+          }
+      )[]
+    | null
+  updatedAt: string
+  createdAt: string
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "events".
+ */
+export interface Event {
+  id: string
+  /**
+   * Event is of Event Type.
+   */
+  type: string | EventType
+  /**
+   * Event occurred at Timestamp.
+   */
+  timestamp: string
+  /**
+   * Event is created by Graph.
+   */
+  graph?: (string | null) | Graph
+  /**
+   * Event was created by State Machine.
+   */
+  stateMachine?: (string | null) | StateMachine
+  updatedAt: string
+  createdAt: string
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "state-machines".
+ */
+export interface StateMachine {
+  id: string
+  /**
+   * State Machine has Name.
+   */
+  name?: string | null
+  /**
+   * State Machine is for Resource.
+   */
+  resource:
+    | {
+        relationTo: 'resources'
+        value: string | Resource
+      }
+    | {
+        relationTo: 'graphs'
+        value: string | Graph
+      }
+  /**
+   * State Machine is instance of State Machine Definition.
+   */
+  stateMachineType: string | StateMachine
+  /**
+   * State Machine is currently in Status.
+   */
+  stateMachineStatus: string | Status
+  updatedAt: string
+  createdAt: string
 }
 /**
  * This interface was referenced by `Config`'s JSON-Schema
  * via the `definition` "users".
  */
 export interface User {
-  id: string;
-  updatedAt: string;
-  createdAt: string;
-  email: string;
-  resetPasswordToken?: string | null;
-  resetPasswordExpiration?: string | null;
-  salt?: string | null;
-  hash?: string | null;
-  loginAttempts?: number | null;
-  lockUntil?: string | null;
-  password?: string | null;
+  id: string
+  updatedAt: string
+  createdAt: string
+  email: string
+  resetPasswordToken?: string | null
+  resetPasswordExpiration?: string | null
+  salt?: string | null
+  hash?: string | null
+  loginAttempts?: number | null
+  lockUntil?: string | null
+  password?: string | null
 }
 /**
  * This interface was referenced by `Config`'s JSON-Schema
- * via the `definition` "media".
+ * via the `definition` "payload-locked-documents".
  */
-export interface Media {
-  id: string;
-  alt: string;
-  updatedAt: string;
-  createdAt: string;
-  url?: string | null;
-  thumbnailURL?: string | null;
-  filename?: string | null;
-  mimeType?: string | null;
-  filesize?: number | null;
-  width?: number | null;
-  height?: number | null;
-  focalX?: number | null;
-  focalY?: number | null;
+export interface PayloadLockedDocument {
+  id: string
+  document?:
+    | ({
+        relationTo: 'graph-schemas'
+        value: string | GraphSchema
+      } | null)
+    | ({
+        relationTo: 'readings'
+        value: string | Reading
+      } | null)
+    | ({
+        relationTo: 'roles'
+        value: string | Role
+      } | null)
+    | ({
+        relationTo: 'constraints'
+        value: string | Constraint
+      } | null)
+    | ({
+        relationTo: 'constraint-spans'
+        value: string | ConstraintSpan
+      } | null)
+    | ({
+        relationTo: 'nouns'
+        value: string | Noun
+      } | null)
+    | ({
+        relationTo: 'verbs'
+        value: string | Verb
+      } | null)
+    | ({
+        relationTo: 'event-types'
+        value: string | EventType
+      } | null)
+    | ({
+        relationTo: 'streams'
+        value: string | Stream
+      } | null)
+    | ({
+        relationTo: 'statuses'
+        value: string | Status
+      } | null)
+    | ({
+        relationTo: 'state-machine-definitions'
+        value: string | StateMachineDefinition
+      } | null)
+    | ({
+        relationTo: 'transitions'
+        value: string | Transition
+      } | null)
+    | ({
+        relationTo: 'guards'
+        value: string | Guard
+      } | null)
+    | ({
+        relationTo: 'graphs'
+        value: string | Graph
+      } | null)
+    | ({
+        relationTo: 'resources'
+        value: string | Resource
+      } | null)
+    | ({
+        relationTo: 'resource-roles'
+        value: string | ResourceRole
+      } | null)
+    | ({
+        relationTo: 'events'
+        value: string | Event
+      } | null)
+    | ({
+        relationTo: 'state-machines'
+        value: string | StateMachine
+      } | null)
+    | ({
+        relationTo: 'guard-runs'
+        value: string | GuardRun
+      } | null)
+    | ({
+        relationTo: 'users'
+        value: string | User
+      } | null)
+  globalSlug?: string | null
+  user: {
+    relationTo: 'users'
+    value: string | User
+  }
+  updatedAt: string
+  createdAt: string
 }
 /**
  * This interface was referenced by `Config`'s JSON-Schema
  * via the `definition` "payload-preferences".
  */
 export interface PayloadPreference {
-  id: string;
+  id: string
   user: {
-    relationTo: 'users';
-    value: string | User;
-  };
-  key?: string | null;
+    relationTo: 'users'
+    value: string | User
+  }
+  key?: string | null
   value?:
     | {
-        [k: string]: unknown;
+        [k: string]: unknown
       }
     | unknown[]
     | string
     | number
     | boolean
-    | null;
-  updatedAt: string;
-  createdAt: string;
+    | null
+  updatedAt: string
+  createdAt: string
 }
 /**
  * This interface was referenced by `Config`'s JSON-Schema
  * via the `definition` "payload-migrations".
  */
 export interface PayloadMigration {
-  id: string;
-  name?: string | null;
-  batch?: number | null;
-  updatedAt: string;
-  createdAt: string;
+  id: string
+  name?: string | null
+  batch?: number | null
+  updatedAt: string
+  createdAt: string
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "graph-schemas_select".
+ */
+export interface GraphSchemasSelect<T extends boolean = true> {
+  name?: T
+  description?: T
+  title?: T
+  plural?: T
+  readings?: T
+  roles?: T
+  order?: T
+  roleRelationship?: T
+  graphs?: T
+  permissions?: T
+  updatedAt?: T
+  createdAt?: T
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "readings_select".
+ */
+export interface ReadingsSelect<T extends boolean = true> {
+  graphSchema?: T
+  text?: T
+  verb?: T
+  endpointUri?: T
+  languageCode?: T
+  endpointHttpVerb?: T
+  roles?: T
+  updatedAt?: T
+  createdAt?: T
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "roles_select".
+ */
+export interface RolesSelect<T extends boolean = true> {
+  title?: T
+  noun?: T
+  graphSchema?: T
+  constraints?: T
+  required?: T
+  updatedAt?: T
+  createdAt?: T
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "constraints_select".
+ */
+export interface ConstraintsSelect<T extends boolean = true> {
+  title?: T
+  kind?: T
+  modality?: T
+  setComparisonArgumentLength?: T
+  roles?: T
+  updatedAt?: T
+  createdAt?: T
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "constraint-spans_select".
+ */
+export interface ConstraintSpansSelect<T extends boolean = true> {
+  title?: T
+  constraint?: T
+  roles?: T
+  subsetAutofill?: T
+  updatedAt?: T
+  createdAt?: T
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "nouns_select".
+ */
+export interface NounsSelect<T extends boolean = true> {
+  name?: T
+  plural?: T
+  description?: T
+  assistantPrompt?: T
+  permissions?: T
+  stateMachineDefinitions?: T
+  objectType?: T
+  referenceScheme?: T
+  valueType?: T
+  minLength?: T
+  maxLength?: T
+  pattern?: T
+  enum?: T
+  format?: T
+  minimum?: T
+  exclusiveMinimum?: T
+  exclusiveMaximum?: T
+  maximum?: T
+  multipleOf?: T
+  superType?: T
+  subTypes?: T
+  updatedAt?: T
+  createdAt?: T
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "verbs_select".
+ */
+export interface VerbsSelect<T extends boolean = true> {
+  name?: T
+  updatedAt?: T
+  createdAt?: T
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "event-types_select".
+ */
+export interface EventTypesSelect<T extends boolean = true> {
+  name?: T
+  streams?: T
+  canBeCreatedbyVerbs?: T
+  updatedAt?: T
+  createdAt?: T
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "streams_select".
+ */
+export interface StreamsSelect<T extends boolean = true> {
+  name?: T
+  eventType?: T
+  updatedAt?: T
+  createdAt?: T
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "statuses_select".
+ */
+export interface StatusesSelect<T extends boolean = true> {
+  title?: T
+  name?: T
+  stateMachineDefinition?: T
+  verb?: T
+  transitions?: T
+  updatedAt?: T
+  createdAt?: T
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "state-machine-definitions_select".
+ */
+export interface StateMachineDefinitionsSelect<T extends boolean = true> {
+  title?: T
+  noun?: T
+  statuses?: T
+  updatedAt?: T
+  createdAt?: T
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "transitions_select".
+ */
+export interface TransitionsSelect<T extends boolean = true> {
+  title?: T
+  from?: T
+  to?: T
+  eventType?: T
+  guard?: T
+  verb?: T
+  updatedAt?: T
+  createdAt?: T
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "guards_select".
+ */
+export interface GuardsSelect<T extends boolean = true> {
+  name?: T
+  graphSchemas?: T
+  transition?: T
+  runs?: T
+  updatedAt?: T
+  createdAt?: T
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "graphs_select".
+ */
+export interface GraphsSelect<T extends boolean = true> {
+  title?: T
+  type?: T
+  verb?: T
+  resourceRoles?: T
+  isDoneForNow?: T
+  isExample?: T
+  updatedAt?: T
+  createdAt?: T
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "resources_select".
+ */
+export interface ResourcesSelect<T extends boolean = true> {
+  title?: T
+  type?: T
+  reference?: T
+  value?: T
+  updatedAt?: T
+  createdAt?: T
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "resource-roles_select".
+ */
+export interface ResourceRolesSelect<T extends boolean = true> {
+  title?: T
+  graph?: T
+  resource?: T
+  role?: T
+  updatedAt?: T
+  createdAt?: T
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "events_select".
+ */
+export interface EventsSelect<T extends boolean = true> {
+  type?: T
+  timestamp?: T
+  graph?: T
+  stateMachine?: T
+  updatedAt?: T
+  createdAt?: T
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "state-machines_select".
+ */
+export interface StateMachinesSelect<T extends boolean = true> {
+  name?: T
+  resource?: T
+  stateMachineType?: T
+  stateMachineStatus?: T
+  updatedAt?: T
+  createdAt?: T
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "guard-runs_select".
+ */
+export interface GuardRunsSelect<T extends boolean = true> {
+  name?: T
+  type?: T
+  graphs?: T
+  updatedAt?: T
+  createdAt?: T
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "users_select".
+ */
+export interface UsersSelect<T extends boolean = true> {
+  updatedAt?: T
+  createdAt?: T
+  email?: T
+  resetPasswordToken?: T
+  resetPasswordExpiration?: T
+  salt?: T
+  hash?: T
+  loginAttempts?: T
+  lockUntil?: T
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "payload-locked-documents_select".
+ */
+export interface PayloadLockedDocumentsSelect<T extends boolean = true> {
+  document?: T
+  globalSlug?: T
+  user?: T
+  updatedAt?: T
+  createdAt?: T
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "payload-preferences_select".
+ */
+export interface PayloadPreferencesSelect<T extends boolean = true> {
+  user?: T
+  key?: T
+  value?: T
+  updatedAt?: T
+  createdAt?: T
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "payload-migrations_select".
+ */
+export interface PayloadMigrationsSelect<T extends boolean = true> {
+  name?: T
+  batch?: T
+  updatedAt?: T
+  createdAt?: T
 }
 /**
  * This interface was referenced by `Config`'s JSON-Schema
  * via the `definition` "auth".
  */
 export interface Auth {
-  [k: string]: unknown;
+  [k: string]: unknown
 }
-
 
 declare module 'payload' {
   export interface GeneratedTypes extends Config {}
