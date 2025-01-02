@@ -8,7 +8,19 @@ import {
 import { Draft06 } from 'json-schema-library'
 import _ from 'lodash'
 import { CollectionBeforeChangeHook, CollectionConfig } from 'payload'
-import * as gdl from '../payload-types'
+import type {
+  Constraint,
+  ConstraintSpan,
+  Generator,
+  Graph,
+  GraphSchema,
+  JsonExample,
+  Noun,
+  Reading,
+  Resource,
+  ResourceRole,
+  Role,
+} from '../payload-types'
 
 const Generator: CollectionConfig = {
   slug: 'generators',
@@ -119,15 +131,15 @@ const Generator: CollectionConfig = {
             })
             .then((n) => n.docs),
         ])) as [
-          Omit<gdl.GraphSchema, 'updatedAt'>[],
-          Omit<gdl.Noun | gdl.GraphSchema, 'updatedAt'>[],
-          Omit<gdl.ConstraintSpan, 'updatedAt'>[],
-          Omit<gdl.Graph, 'updatedAt'>[],
-          Omit<gdl.JsonExample, 'updatedAt'>[],
+          Omit<GraphSchema, 'updatedAt'>[],
+          Omit<Noun | GraphSchema, 'updatedAt'>[],
+          Omit<ConstraintSpan, 'updatedAt'>[],
+          Omit<Graph, 'updatedAt'>[],
+          Omit<JsonExample, 'updatedAt'>[],
         ]
         const jsonExamples = Object.fromEntries(
           jsons.map((j) => [
-            nameToKey((j.noun?.value as gdl.Noun | gdl.GraphSchema)?.name || ''),
+            nameToKey((j.noun?.value as Noun | GraphSchema)?.name || ''),
             j.jsonExample as JSONSchemaType,
           ]),
         )
@@ -135,14 +147,14 @@ const Generator: CollectionConfig = {
         // #region Find composite uniqueness schemas
         const compoundUniqueSchemas = constraintSpans
           .filter((cs) => {
-            const roles = cs.roles as gdl.Role[]
+            const roles = cs.roles as Role[]
             return roles?.length > 1 && roles.every((r) => r.graphSchema === roles?.[0].graphSchema)
           })
-          .map((cs) => ({ gs: (cs.roles as gdl.Role[])[0].graphSchema as gdl.GraphSchema, cs }))
+          .map((cs) => ({ gs: (cs.roles as Role[])[0].graphSchema as GraphSchema, cs }))
         const arrayTypes = compoundUniqueSchemas.filter(
           ({ gs: cs }) =>
             !graphSchemas.find((s) =>
-              s.roles?.find((r) => ((r as gdl.Role).noun?.value as gdl.GraphSchema)?.id === cs.id),
+              s.roles?.find((r) => ((r as Role).noun?.value as GraphSchema)?.id === cs.id),
             ),
         )
         const associationSchemas = compoundUniqueSchemas.filter((cs) => !arrayTypes.includes(cs))
@@ -158,7 +170,7 @@ const Generator: CollectionConfig = {
             type: 'object',
             description:
               associationSchema.description ||
-              (associationSchema.readings?.[0] as gdl.Reading)?.text?.replace(/- /, ' '),
+              (associationSchema.readings?.[0] as Reading)?.text?.replace(/- /, ' '),
           }
           schemas['New' + key] = {
             $id: 'New' + key,
@@ -174,15 +186,13 @@ const Generator: CollectionConfig = {
             schemas[key].examples = [jsonExample]
           }
           for (const role of associationSchema.roles || []) {
-            const idNoun = (role as gdl.Role).noun?.value as gdl.Noun | gdl.GraphSchema
+            const idNoun = (role as Role).noun?.value as Noun | GraphSchema
             setTableProperty({
               tables: schemas,
               subject: associationSchema,
               object: idNoun,
               nouns,
-              required: cs.roles.find((r) => (r as gdl.Role).id === (role as gdl.Role).id)
-                ? true
-                : false,
+              required: cs.roles.find((r) => (r as Role).id === (role as Role).id) ? true : false,
               description: `${associationSchema.name} is uniquely identified by ${idNoun.name}`,
               property: createProperty({ object: idNoun, tables: schemas, nouns, jsonExamples }),
               jsonExamples,
@@ -912,7 +922,7 @@ const Generator: CollectionConfig = {
         data.output = JSON.parse(output)
 
         // #endregion
-      }) as CollectionBeforeChangeHook<gdl.Generator>,
+      }) as CollectionBeforeChangeHook<Generator>,
     ],
   },
 }
@@ -921,17 +931,17 @@ export default Generator
 
 // #region Fact type processors
 function processArraySchemas(
-  arrayTypes: { gs: gdl.GraphSchema; cs: Omit<gdl.ConstraintSpan, 'updatedAt'> }[],
-  nouns: Omit<gdl.GraphSchema | gdl.Noun, 'updatedAt'>[],
+  arrayTypes: { gs: GraphSchema; cs: Omit<ConstraintSpan, 'updatedAt'> }[],
+  nouns: Omit<GraphSchema | Noun, 'updatedAt'>[],
   nounRegex: RegExp,
   schemas: Record<string, Schema>,
   jsonExamples: { [k: string]: JSONSchemaType },
 ) {
   for (const { gs: schema } of arrayTypes) {
-    const reading = schema.readings?.[0] as gdl.Reading
+    const reading = schema.readings?.[0] as Reading
     const predicate = toPredicate({ reading: reading.text, nouns, nounRegex })
-    const subject = (schema.roles?.[0] as gdl.Role).noun?.value as gdl.Noun | gdl.GraphSchema
-    const object = (schema.roles?.[1] as gdl.Role).noun?.value as gdl.Noun | gdl.GraphSchema
+    const subject = (schema.roles?.[0] as Role).noun?.value as Noun | GraphSchema
+    const object = (schema.roles?.[1] as Role).noun?.value as Noun | GraphSchema
     const plural = object?.plural
 
     const { objectBegin, objectEnd } = findPredicateObject({ predicate, subject, object, plural })
@@ -957,28 +967,28 @@ function processArraySchemas(
 }
 
 function processBinarySchemas(
-  constraintSpans: Omit<gdl.ConstraintSpan, 'updatedAt'>[],
+  constraintSpans: Omit<ConstraintSpan, 'updatedAt'>[],
   schemas: Record<string, Schema>,
-  nouns: Omit<gdl.GraphSchema | gdl.Noun, 'updatedAt'>[],
+  nouns: Omit<GraphSchema | Noun, 'updatedAt'>[],
   jsonExamples: { [k: string]: JSONSchemaType },
   nounRegex: RegExp,
-  examples: Omit<gdl.Graph, 'updatedAt'>[],
+  examples: Omit<Graph, 'updatedAt'>[],
 ) {
   for (const propertySchema of constraintSpans
-    .filter((cs) => (cs.roles as gdl.Role[])?.length === 1)
-    .map((cs) => (cs.roles as gdl.Role[])[0].graphSchema as gdl.GraphSchema)) {
+    .filter((cs) => (cs.roles as Role[])?.length === 1)
+    .map((cs) => (cs.roles as Role[])[0].graphSchema as GraphSchema)) {
     const subjectRole = propertySchema.roles?.find((r) =>
-      (r as gdl.Role).constraints?.some(
-        (c) => ((c.value as gdl.ConstraintSpan)?.constraint as gdl.Constraint).kind === 'UC',
+      (r as Role).constraints?.some(
+        (c) => ((c.value as ConstraintSpan)?.constraint as Constraint).kind === 'UC',
       ),
-    ) as gdl.Role
+    ) as Role
 
-    const subject = subjectRole.noun?.value as gdl.Noun | gdl.GraphSchema
+    const subject = subjectRole.noun?.value as Noun | GraphSchema
     ensureTableExists({ tables: schemas, subject, nouns, jsonExamples })
 
-    const objectRole = propertySchema.roles?.find((r) => (r as gdl.Role).id !== subjectRole.id)
-    const object = (objectRole as gdl.Role)?.noun?.value as gdl.Noun | gdl.GraphSchema
-    const reading = propertySchema.readings?.[0] as gdl.Reading
+    const objectRole = propertySchema.roles?.find((r) => (r as Role).id !== subjectRole.id)
+    const object = (objectRole as Role)?.noun?.value as Noun | GraphSchema
+    const reading = propertySchema.readings?.[0] as Reading
     const predicate = toPredicate({ reading: reading.text, nouns, nounRegex })
     const { objectBegin, objectEnd } = findPredicateObject({ predicate, subject, object })
 
@@ -988,37 +998,33 @@ function processBinarySchemas(
     predicate.splice(objectBegin, objectReading.length, ...objectReading)
 
     const required = subjectRole.constraints
-      ?.filter(
-        (c) => ((c.value as gdl.ConstraintSpan)?.constraint as gdl.Constraint)?.kind === 'MR',
-      )
+      ?.filter((c) => ((c.value as ConstraintSpan)?.constraint as Constraint)?.kind === 'MR')
       .map(
         (c) =>
           propertySchema.roles?.find(
-            (r) => (r as gdl.Role).id !== ((c.value as gdl.ConstraintSpan).roles[0] as gdl.Role).id,
-          ) as gdl.Role,
+            (r) => (r as Role).id !== ((c.value as ConstraintSpan).roles[0] as Role).id,
+          ) as Role,
       )
 
     let example = undefined
-    const exampleProperty = examples.find(
-      (g) => (g.type as gdl.GraphSchema)?.id === propertySchema.id,
-    )
+    const exampleProperty = examples.find((g) => (g.type as GraphSchema)?.id === propertySchema.id)
     if (exampleProperty)
       example = (
-        (exampleProperty?.resourceRoles as gdl.ResourceRole[])?.find(
-          (role) => (objectRole as gdl.Role).id === (role.role as gdl.Role)?.id,
-        )?.resource?.value as gdl.Resource
+        (exampleProperty?.resourceRoles as ResourceRole[])?.find(
+          (role) => (objectRole as Role).id === (role.role as Role)?.id,
+        )?.resource?.value as Resource
       )?.value
 
     setTableProperty({
       tables: schemas,
       subject,
-      object: object as gdl.Noun,
+      object: object as Noun,
       nouns,
       propertyName: extractPropertyName(objectReading),
       description: predicate.join(' '),
       required: (required?.length || 0) > 0,
       property: createProperty({
-        object: object as gdl.Noun,
+        object: object as Noun,
         nouns,
         tables: schemas,
         jsonExamples,
@@ -1030,17 +1036,17 @@ function processBinarySchemas(
 }
 
 function processUnarySchemas(
-  graphSchemas: Omit<gdl.GraphSchema, 'updatedAt'>[],
-  nouns: Omit<gdl.Noun | gdl.GraphSchema, 'updatedAt'>[],
+  graphSchemas: Omit<GraphSchema, 'updatedAt'>[],
+  nouns: Omit<Noun | GraphSchema, 'updatedAt'>[],
   nounRegex: RegExp,
   schemas: Record<string, Schema>,
   jsonExamples: { [k: string]: JSONSchemaType },
-  examples: Omit<gdl.Graph, 'updatedAt'>[],
+  examples: Omit<Graph, 'updatedAt'>[],
 ) {
   for (const unarySchema of graphSchemas.filter((s) => s.roles?.length === 1)) {
-    const unaryRole = unarySchema.roles?.[0] as gdl.Role
-    const subject = unaryRole?.noun?.value as gdl.Noun | gdl.GraphSchema
-    const reading = (unarySchema.readings as gdl.Reading[])?.[0]
+    const unaryRole = unarySchema.roles?.[0] as Role
+    const subject = unaryRole?.noun?.value as Noun | GraphSchema
+    const reading = (unarySchema.readings as Reading[])?.[0]
     const predicate = toPredicate({ reading: reading.text, nouns, nounRegex })
     const { objectBegin } = findPredicateObject({ predicate, subject })
     const objectReading = predicate.slice(objectBegin)
@@ -1048,29 +1054,27 @@ function processUnarySchemas(
     ensureTableExists({ tables: schemas, subject, nouns, jsonExamples })
 
     let example = undefined
-    const exampleProperty = examples.find((g) => (g.type as gdl.GraphSchema)?.id === unarySchema.id)
+    const exampleProperty = examples.find((g) => (g.type as GraphSchema)?.id === unarySchema.id)
     if (exampleProperty)
       example = (
-        (exampleProperty?.resourceRoles as gdl.ResourceRole[])?.find(
-          (role) => unaryRole.id === (role.role as gdl.Role)?.id,
-        )?.resource?.value as gdl.Resource
+        (exampleProperty?.resourceRoles as ResourceRole[])?.find(
+          (role) => unaryRole.id === (role.role as Role)?.id,
+        )?.resource?.value as Resource
       )?.value
 
     const required = unaryRole.constraints
-      ?.filter(
-        (c) => ((c.value as gdl.ConstraintSpan)?.constraint as gdl.Constraint)?.kind === 'MR',
-      )
+      ?.filter((c) => ((c.value as ConstraintSpan)?.constraint as Constraint)?.kind === 'MR')
       .map(
         (c) =>
           unarySchema.roles?.find(
-            (r) => (r as gdl.Role).id !== ((c.value as gdl.ConstraintSpan).roles[0] as gdl.Role).id,
-          ) as gdl.Role,
+            (r) => (r as Role).id !== ((c.value as ConstraintSpan).roles[0] as Role).id,
+          ) as Role,
       )
 
     setTableProperty({
       tables: schemas,
       subject: subject,
-      object: subject as gdl.Noun,
+      object: subject as Noun,
       nouns,
       propertyName: extractPropertyName(objectReading),
       description: predicate.join(' '),
@@ -1258,8 +1262,8 @@ function createProperty({
   jsonExamples,
 }: {
   description?: string
-  object: Omit<gdl.Noun | gdl.GraphSchema, 'updatedAt'>
-  nouns: Omit<gdl.Noun | gdl.GraphSchema, 'updatedAt'>[]
+  object: Omit<Noun | GraphSchema, 'updatedAt'>
+  nouns: Omit<Noun | GraphSchema, 'updatedAt'>[]
   tables: { [id: string]: JSONSchema }
   jsonExamples: {
     [id: string]: JSONSchemaType
@@ -1267,22 +1271,22 @@ function createProperty({
 }) {
   object = nouns.find((n) => n.id === object.id) || object
   const property: Schema = {}
-  let { referenceScheme, superType, valueType } = object as gdl.Noun
+  let { referenceScheme, superType, valueType } = object as Noun
   if (!referenceScheme) {
     referenceScheme =
-      (object as gdl.GraphSchema).roles?.map((r) => {
-        return (r as gdl.Role).noun?.value as gdl.Noun
+      (object as GraphSchema).roles?.map((r) => {
+        return (r as Role).noun?.value as Noun
       }) || []
   }
   while (!referenceScheme?.length && !valueType && superType) {
-    if (typeof superType === 'string') superType = nouns.find((n) => n.id === superType) as gdl.Noun
+    if (typeof superType === 'string') superType = nouns.find((n) => n.id === superType) as Noun
     referenceScheme = superType?.referenceScheme
     valueType = superType?.valueType
     superType = superType?.superType
   }
   if (valueType) {
     property.type = valueType
-    const noun = object as gdl.Noun
+    const noun = object as Noun
     if (noun.format) property.format = noun.format?.toString()
     if (noun.pattern) property.pattern = noun.pattern?.toString()
     if (noun.enum)
@@ -1304,7 +1308,7 @@ function createProperty({
     if (description) property.description = description
   } else {
     if (typeof referenceScheme === 'string')
-      referenceScheme = [nouns.find((n) => n.id === referenceScheme?.toString()) as gdl.Noun]
+      referenceScheme = [nouns.find((n) => n.id === referenceScheme?.toString()) as Noun]
     const required: string[] = []
     const propertyKey = nameToKey(object.name || '')
     property.oneOf = [
@@ -1313,7 +1317,7 @@ function createProperty({
             type: 'object',
             properties: Object.fromEntries(
               referenceScheme?.map((role) => {
-                if (typeof role === 'string') role = nouns.find((n) => n.id === role) as gdl.Noun
+                if (typeof role === 'string') role = nouns.find((n) => n.id === role) as Noun
                 const propertyName = transformPropertyName(role.name || '')
                 required.push(propertyName)
                 return [
@@ -1328,7 +1332,7 @@ function createProperty({
           ? createProperty({
               object:
                 typeof referenceScheme[0] === 'string'
-                  ? (nouns.find((n) => n.id === referenceScheme?.[0]) as gdl.Noun)
+                  ? (nouns.find((n) => n.id === referenceScheme?.[0]) as Noun)
                   : referenceScheme[0],
               tables,
               nouns,
@@ -1354,8 +1358,8 @@ function ensureTableExists({
   jsonExamples,
 }: {
   tables: { [id: string]: JSONSchema }
-  subject: Omit<gdl.GraphSchema | gdl.Noun, 'updatedAt'>
-  nouns: Omit<gdl.Noun, 'updatedAt'>[]
+  subject: Omit<GraphSchema | Noun, 'updatedAt'>
+  nouns: Omit<Noun, 'updatedAt'>[]
   jsonExamples: {
     [id: string]: JSONSchemaType
   }
@@ -1384,17 +1388,17 @@ function ensureTableExists({
   }
 
   // Unpack black-box columns
-  if ((subject as gdl.Noun).referenceScheme) {
-    let { referenceScheme } = subject as gdl.Noun
+  if ((subject as Noun).referenceScheme) {
+    let { referenceScheme } = subject as Noun
     if (!(referenceScheme instanceof Array))
-      referenceScheme = [nouns.find((n) => n.id === referenceScheme?.toString()) as gdl.Noun]
+      referenceScheme = [nouns.find((n) => n.id === referenceScheme?.toString()) as Noun]
     for (let idRole of referenceScheme || []) {
-      if (typeof idRole === 'string') idRole = nouns.find((n) => n.id === idRole) as gdl.Noun
+      if (typeof idRole === 'string') idRole = nouns.find((n) => n.id === idRole) as Noun
       const property = createProperty({ object: idRole, nouns, tables, jsonExamples })
       setTableProperty({
         tables,
         subject,
-        object: idRole as gdl.Noun,
+        object: idRole as Noun,
         nouns,
         required: true,
         property,
@@ -1404,13 +1408,13 @@ function ensureTableExists({
     }
   }
 
-  let superType: Omit<gdl.GraphSchema | gdl.Noun, 'updatedAt'> | string | undefined | null = (
-    subject as gdl.Noun
+  let superType: Omit<GraphSchema | Noun, 'updatedAt'> | string | undefined | null = (
+    subject as Noun
   ).superType
   if (typeof superType === 'string') superType = nouns?.find((n) => n.id === superType)
-  if ((superType as gdl.Noun)?.name) {
-    superType = (superType as gdl.Noun) || nouns?.find((n) => n.id === (superType as gdl.Noun).id)
-    const superTypeKey = nameToKey((superType as gdl.Noun).name || '')
+  if ((superType as Noun)?.name) {
+    superType = (superType as Noun) || nouns?.find((n) => n.id === (superType as Noun).id)
+    const superTypeKey = nameToKey((superType as Noun).name || '')
     tables['Update' + key].allOf = [{ $ref: '#/components/schemas/Update' + superTypeKey }]
     tables['New' + key].allOf?.push({ $ref: '#/components/schemas/New' + superTypeKey })
     tables[key].allOf?.push({ $ref: '#/components/schemas/' + superTypeKey })
@@ -1425,8 +1429,8 @@ export function findPredicateObject({
   plural,
 }: {
   predicate: string[]
-  subject: gdl.GraphSchema | gdl.Noun
-  object?: gdl.GraphSchema | gdl.Noun
+  subject: GraphSchema | Noun
+  object?: GraphSchema | Noun
   plural?: string | null | undefined
 }) {
   let subjectIndex = predicate.indexOf(subject.name || '')
@@ -1458,7 +1462,7 @@ export function findPredicateObject({
   return { objectBegin, objectEnd }
 }
 
-export function nounListToRegex(nouns?: Omit<gdl.GraphSchema | gdl.Noun, 'updatedAt'>[]) {
+export function nounListToRegex(nouns?: Omit<GraphSchema | Noun, 'updatedAt'>[]) {
   return nouns
     ? new RegExp(
         '(' +
@@ -1478,7 +1482,7 @@ export function toPredicate({
   nounRegex,
 }: {
   reading: string
-  nouns: Omit<gdl.Noun | gdl.GraphSchema, 'updatedAt'>[]
+  nouns: Omit<Noun | GraphSchema, 'updatedAt'>[]
   nounRegex?: RegExp
 }) {
   // tokenize by noun names and then by space
@@ -1508,9 +1512,9 @@ function setTableProperty({
   jsonExamples,
 }: {
   tables: { [id: string]: JSONSchema }
-  nouns: Omit<gdl.Noun, 'updatedAt'>[]
-  subject: Omit<gdl.GraphSchema | gdl.Noun, 'updatedAt'>
-  object: gdl.Noun
+  nouns: Omit<Noun, 'updatedAt'>[]
+  subject: Omit<GraphSchema | Noun, 'updatedAt'>
+  object: Noun
   propertyName?: string
   description?: string
   required?: boolean

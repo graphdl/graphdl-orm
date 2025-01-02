@@ -1,5 +1,5 @@
 import { CollectionConfig } from 'payload'
-import * as gdl from '../payload-types'
+import type { ConstraintSpan, Role } from '../payload-types'
 
 const ConstraintSpans: CollectionConfig = {
   slug: 'constraint-spans',
@@ -34,7 +34,7 @@ const ConstraintSpans: CollectionConfig = {
                   })
                 : Promise.resolve({ docs: [] }),
             ])
-            return `${constraint?.modality} ${constraint?.kind} - ${roles.docs.map((r: gdl.Role) => r.title.split(' - ')[0]).join(', ')} - ${
+            return `${constraint?.modality} ${constraint?.kind} - ${roles.docs.map((r: Role) => r.title.split(' - ')[0]).join(', ')} - ${
               roles?.docs?.[0]?.title?.toString()?.split(' - ')?.[1]
             }`
           },
@@ -63,7 +63,7 @@ const ConstraintSpans: CollectionConfig = {
               const existingSpans = constraint.roles
               if (
                 existingSpans
-                  ?.map((s) => (s.value as gdl.Role | gdl.ConstraintSpan).id)
+                  ?.map((s) => (s.value as Role | ConstraintSpan).id)
                   .includes(data.id || originalDoc.id)
               )
                 return
@@ -75,7 +75,7 @@ const ConstraintSpans: CollectionConfig = {
                   roles: [
                     ...(existingSpans?.map((r) => ({
                       relationTo: r.relationTo,
-                      value: (r.value as gdl.Role | gdl.ConstraintSpan).id,
+                      value: (r.value as Role | ConstraintSpan).id,
                     })) || []),
                     {
                       relationTo: 'constraint-spans',

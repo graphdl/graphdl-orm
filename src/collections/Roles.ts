@@ -1,5 +1,5 @@
 import { CollectionConfig } from 'payload'
-import * as gdl from '../payload-types'
+import type { Role } from '../payload-types'
 
 const Roles: CollectionConfig = {
   slug: 'roles',
@@ -112,7 +112,7 @@ const Roles: CollectionConfig = {
                     id: v.value,
                     depth: 1,
                   })
-                  const roles = (constraintSpan.roles as gdl.Role[]).map((r) => r.id)
+                  const roles = (constraintSpan.roles as Role[]).map((r) => r.id)
                   if (!roles?.includes(role)) {
                     roles.push(role)
                     await payload.update({
