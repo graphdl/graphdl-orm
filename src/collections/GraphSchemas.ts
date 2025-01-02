@@ -1,5 +1,5 @@
 import { CollectionConfig } from 'payload'
-import * as gdl from '../payload-types'
+import type { GraphSchema, Noun } from '../payload-types'
 
 const GraphSchemas: CollectionConfig = {
   slug: 'graph-schemas',
@@ -85,7 +85,7 @@ const GraphSchemas: CollectionConfig = {
                       .join('|') +
                     ')\\b',
                 )
-                const nounEntities: (gdl.Noun | gdl.GraphSchema)[] = []
+                const nounEntities: (Noun | GraphSchema)[] = []
 
                 // tokenize by noun names
                 ;(readings[0].text as string).split(nounRegex).forEach((token) => {

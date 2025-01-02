@@ -1,5 +1,5 @@
 import { CollectionConfig } from 'payload'
-import { Graph, GraphSchema, Resource } from '../payload-types'
+import type { Graph, GraphSchema, Resource } from '../payload-types'
 
 const Graphs: CollectionConfig = {
   slug: 'graphs',

@@ -1,5 +1,5 @@
 import { CollectionConfig } from 'payload'
-import * as gdl from '../payload-types'
+import type { Graph, Resource } from '../payload-types'
 
 const Resources: CollectionConfig = {
   slug: 'resources',
@@ -45,8 +45,8 @@ const Resources: CollectionConfig = {
             ])
             const references = reference.map((r) => {
               return (
-                resources?.find((res: gdl.Resource) => res.id === r.value) ||
-                graphs?.find((g: gdl.Graph) => g.id === r.value)
+                resources?.find((res: Resource) => res.id === r.value) ||
+                graphs?.find((g: Graph) => g.id === r.value)
               )
             })
             console.log('references', references)
@@ -56,8 +56,8 @@ const Resources: CollectionConfig = {
               references
                 ?.map(
                   (r) =>
-                    (r as gdl.Resource).reference?.map((ref) => ref.value)?.join(', ') ||
-                    (r as gdl.Resource)?.value,
+                    (r as Resource).reference?.map((ref) => ref.value)?.join(', ') ||
+                    (r as Resource)?.value,
                 )
                 ?.join(', ')
             }`
