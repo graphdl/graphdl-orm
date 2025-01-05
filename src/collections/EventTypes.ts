@@ -18,26 +18,11 @@ const EventTypes: CollectionConfig = {
     // Bidirectional relationship child
     {
       name: 'streams',
-      type: 'relationship',
-      relationTo: 'streams',
-      hasMany: true,
+      type: 'join',
+      collection: 'streams',
+      on: 'eventType',
       admin: {
         description: 'Event Type publishes to Stream.',
-      },
-      hooks: {
-        beforeChange: [
-          async ({
-            data: _data,
-            originalDoc: _originalDoc,
-            req: { payload: _payload },
-            context,
-            value: _value,
-          }) => {
-            if ((context.internal as string[])?.includes('event-types.streams')) return
-            if (!context.internal) context.internal = []
-            ;(context.internal as string[]).push('event-types.streams')
-          },
-        ],
       },
     },
     {

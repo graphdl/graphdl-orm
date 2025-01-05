@@ -50,21 +50,6 @@ const Graphs: CollectionConfig = {
       admin: {
         description: 'Graph is of Graph Schema.',
       },
-      hooks: {
-        beforeChange: [
-          async ({
-            data: _data,
-            originalDoc: _originalDoc,
-            req: { payload: _payload },
-            context,
-            value: _value,
-          }) => {
-            if ((context.internal as string[])?.includes('graphs.type')) return
-            if (!context.internal) context.internal = []
-            ;(context.internal as string[]).push('graphs.type')
-          },
-        ],
-      },
     },
     {
       name: 'verb',
@@ -77,26 +62,11 @@ const Graphs: CollectionConfig = {
     // Bidirectional relationship child
     {
       name: 'resourceRoles',
-      type: 'relationship',
-      relationTo: 'resource-roles',
-      hasMany: true,
+      type: 'join',
+      collection: 'resource-roles',
+      on: 'graph',
       admin: {
         description: 'Graph uses Resource for Role.',
-      },
-      hooks: {
-        beforeChange: [
-          async ({
-            data: _data,
-            originalDoc: _originalDoc,
-            req: { payload: _payload },
-            context,
-            value: _value,
-          }) => {
-            if ((context.internal as string[])?.includes('graphs.resourceRoles')) return
-            if (!context.internal) context.internal = []
-            ;(context.internal as string[]).push('graphs.resourceRoles')
-          },
-        ],
       },
     },
     {
@@ -111,6 +81,15 @@ const Graphs: CollectionConfig = {
       type: 'checkbox',
       admin: {
         description: 'Graph is an example.',
+      },
+    },
+    {
+      name: 'stateMachine',
+      type: 'join',
+      collection: 'state-machines',
+      on: 'resource',
+      admin: {
+        description: 'State Machine is for Resource.',
       },
     },
   ],

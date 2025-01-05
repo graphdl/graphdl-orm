@@ -42,21 +42,6 @@ const Statuses: CollectionConfig = {
       admin: {
         description: 'Status is defined in State Machine Definition.',
       },
-      hooks: {
-        beforeChange: [
-          async ({
-            data: _data,
-            originalDoc: _originalDoc,
-            req: { payload: _payload },
-            context,
-            value: _value,
-          }) => {
-            if ((context.internal as string[])?.includes('statuses.stateMachineDefinition')) return
-            if (!context.internal) context.internal = []
-            ;(context.internal as string[]).push('statuses.stateMachineDefinition')
-          },
-        ],
-      },
     },
     {
       name: 'verb',
@@ -69,26 +54,11 @@ const Statuses: CollectionConfig = {
     // Bidirectional relationship child
     {
       name: 'transitions',
-      type: 'relationship',
-      relationTo: 'transitions',
-      hasMany: true,
+      type: 'join',
+      collection: 'transitions',
+      on: 'from',
       admin: {
         description: 'Transition is from Status.',
-      },
-      hooks: {
-        beforeChange: [
-          async ({
-            data: _data,
-            originalDoc: _originalDoc,
-            req: { payload: _payload },
-            context,
-            value: _value,
-          }) => {
-            if ((context.internal as string[])?.includes('statuses.transitions')) return
-            if (!context.internal) context.internal = []
-            ;(context.internal as string[]).push('statuses.transitions')
-          },
-        ],
       },
     },
   ],

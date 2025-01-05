@@ -57,27 +57,10 @@ const Nouns: CollectionConfig = {
     // Bidirectional relationship child
     {
       name: 'stateMachineDefinitions',
-      type: 'relationship',
-      relationTo: 'state-machine-definitions',
-      hasMany: true,
+      type: 'join',
+      collection: 'state-machine-definitions',
+      on: 'noun',
       admin: { description: 'State Machine Definition is for Noun.' },
-      hooks: {
-        beforeChange: [
-          async ({ data, originalDoc, req: { payload }, context, value }) => {
-            if ((context.internal as string[])?.includes('nouns.stateMachineDefinitions')) return
-            if (!context.internal) context.internal = []
-            ;(context.internal as string[]).push('nouns.stateMachineDefinitions')
-            if (value)
-              await payload.update({
-                collection: 'state-machine-definitions',
-                id: value,
-                data: {
-                  noun: data?.id || originalDoc?.id,
-                },
-              })
-          },
-        ],
-      },
     },
     {
       name: 'objectType',
@@ -224,44 +207,14 @@ const Nouns: CollectionConfig = {
       type: 'relationship',
       relationTo: 'nouns',
       admin: { description: 'Noun is sub type to Noun.' },
-      hooks: {
-        beforeChange: [
-          async ({
-            data: _data,
-            originalDoc: _originalDoc,
-            req: { payload: _payload },
-            context,
-            value: _value,
-          }) => {
-            if ((context.internal as string[])?.includes('nouns.superType')) return
-            if (!context.internal) context.internal = []
-            ;(context.internal as string[]).push('nouns.superType')
-          },
-        ],
-      },
     },
     // Bidirectional relationship child
     {
       name: 'subTypes',
-      type: 'relationship',
-      relationTo: 'nouns',
-      hasMany: true,
+      type: 'join',
+      collection: 'nouns',
+      on: 'superType',
       admin: { description: 'Noun has Sub Types.' },
-      hooks: {
-        beforeChange: [
-          async ({
-            data: _data,
-            originalDoc: _originalDoc,
-            req: { payload: _payload },
-            context,
-            value: _value,
-          }) => {
-            if ((context.internal as string[])?.includes('nouns.subTypes')) return
-            if (!context.internal) context.internal = []
-            ;(context.internal as string[]).push('nouns.subTypes')
-          },
-        ],
-      },
     },
   ],
 }

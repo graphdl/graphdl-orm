@@ -99,46 +99,10 @@ const Constraints: CollectionConfig = {
     // Bidirectional relationship child
     {
       name: 'roles',
-      type: 'relationship',
-      relationTo: ['constraint-spans', 'roles'],
-      hasMany: true,
+      type: 'join',
+      collection: 'constraint-spans',
+      on: 'constraint',
       admin: { description: 'Constraint spans Role.' },
-      hooks: {
-        beforeChange: [
-          async ({
-            data: _data,
-            originalDoc: _originalDoc,
-            req: { payload: _payload },
-            context,
-            value: _value,
-          }) => {
-            if ((context.internal as string[])?.includes('constraints.roles')) return
-            if (!context.internal) context.internal = []
-            ;(context.internal as string[]).push('constraints.roles')
-
-            // if (value?.relationTo === 'roles') {
-            //   const constraintSpan = await payload.create({
-            //     collection: 'constraint-spans',
-            //     data: {
-            //       constraint: data?.id || originalDoc?.id,
-            //       roles: value.value,
-            //     },
-            //   })
-            //   value = { value: constraintSpan.id, relationTo: 'constraint-spans' }
-            // }
-
-            // if (value?.relationTo === 'constraint-spans') {
-            //   await payload.update({
-            //     collection: 'constraint-spans',
-            //     id: value.value,
-            //     data: {
-            //       constraint: data?.id || originalDoc?.id,
-            //     },
-            //   })
-            // }
-          },
-        ],
-      },
     },
   ],
 }

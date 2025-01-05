@@ -13,21 +13,6 @@ const Readings: CollectionConfig = {
       type: 'relationship',
       relationTo: 'graph-schemas',
       admin: { description: 'Graph Schema has Reading.' },
-      hooks: {
-        beforeChange: [
-          async ({
-            data: _data,
-            originalDoc: _originalDoc,
-            req: { payload: _payload },
-            context,
-            value: _value,
-          }) => {
-            if ((context.internal as string[])?.includes('readings.graphSchema')) return
-            if (!context.internal) context.internal = []
-            ;(context.internal as string[]).push('readings.graphSchema')
-          },
-        ],
-      },
     },
     {
       name: 'text',
