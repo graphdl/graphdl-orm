@@ -154,7 +154,7 @@ const Generator: CollectionConfig = {
         const arrayTypes = compoundUniqueSchemas.filter(
           ({ gs: cs }) =>
             !graphSchemas.find((s) =>
-              s.roles?.find((r) => ((r as Role).noun?.value as GraphSchema)?.id === cs.id),
+              s.roles?.docs?.find((r) => ((r as Role).noun?.value as GraphSchema)?.id === cs.id),
             ),
         )
         const associationSchemas = compoundUniqueSchemas.filter((cs) => !arrayTypes.includes(cs))
@@ -170,7 +170,7 @@ const Generator: CollectionConfig = {
             type: 'object',
             description:
               associationSchema.description ||
-              (associationSchema.readings?.[0] as Reading)?.text?.replace(/- /, ' '),
+              (associationSchema.readings?.docs?.[0] as Reading)?.text?.replace(/- /, ' '),
           }
           schemas['New' + key] = {
             $id: 'New' + key,
@@ -185,7 +185,7 @@ const Generator: CollectionConfig = {
             schemas['New' + key].examples = [jsonExample]
             schemas[key].examples = [jsonExample]
           }
-          for (const role of associationSchema.roles || []) {
+          for (const role of associationSchema.roles?.docs || []) {
             const idNoun = (role as Role).noun?.value as Noun | GraphSchema
             setTableProperty({
               tables: schemas,
@@ -339,7 +339,7 @@ const Generator: CollectionConfig = {
                 ).concat(globalPermissions || [])
                 const isId = idScheme?.length === 1 && idScheme[0][0] === 'id'
                 const title = baseSchema.title || ''
-                const retval: [string, any][] = []
+                const retval: [string, Record<string, unknown>][] = []
                 const plural =
                   (subject?.plural && subject.plural[0].toUpperCase() + subject.plural.slice(1)) ||
                   title + 's'
@@ -938,10 +938,10 @@ function processArraySchemas(
   jsonExamples: { [k: string]: JSONSchemaType },
 ) {
   for (const { gs: schema } of arrayTypes) {
-    const reading = schema.readings?.[0] as Reading
+    const reading = schema.readings?.docs?.[0] as Reading
     const predicate = toPredicate({ reading: reading.text, nouns, nounRegex })
-    const subject = (schema.roles?.[0] as Role).noun?.value as Noun | GraphSchema
-    const object = (schema.roles?.[1] as Role).noun?.value as Noun | GraphSchema
+    const subject = (schema.roles?.docs?.[0] as Role).noun?.value as Noun | GraphSchema
+    const object = (schema.roles?.docs?.[1] as Role).noun?.value as Noun | GraphSchema
     const plural = object?.plural
 
     const { objectBegin, objectEnd } = findPredicateObject({ predicate, subject, object, plural })
@@ -977,18 +977,18 @@ function processBinarySchemas(
   for (const propertySchema of constraintSpans
     .filter((cs) => (cs.roles as Role[])?.length === 1)
     .map((cs) => (cs.roles as Role[])[0].graphSchema as GraphSchema)) {
-    const subjectRole = propertySchema.roles?.find((r) =>
-      (r as Role).constraints?.some(
-        (c) => ((c.value as ConstraintSpan)?.constraint as Constraint).kind === 'UC',
+    const subjectRole = propertySchema.roles?.docs?.find((r) =>
+      (r as Role).constraints?.docs?.some(
+        (c) => ((c as ConstraintSpan)?.constraint as Constraint).kind === 'UC',
       ),
     ) as Role
 
     const subject = subjectRole.noun?.value as Noun | GraphSchema
     ensureTableExists({ tables: schemas, subject, nouns, jsonExamples })
 
-    const objectRole = propertySchema.roles?.find((r) => (r as Role).id !== subjectRole.id)
+    const objectRole = propertySchema.roles?.docs?.find((r) => (r as Role).id !== subjectRole.id)
     const object = (objectRole as Role)?.noun?.value as Noun | GraphSchema
-    const reading = propertySchema.readings?.[0] as Reading
+    const reading = propertySchema.readings?.docs?.[0] as Reading
     const predicate = toPredicate({ reading: reading.text, nouns, nounRegex })
     const { objectBegin, objectEnd } = findPredicateObject({ predicate, subject, object })
 
@@ -997,12 +997,12 @@ function processBinarySchemas(
       .map((n) => n[0].toUpperCase() + n.slice(1).replace(/-$/, ''))
     predicate.splice(objectBegin, objectReading.length, ...objectReading)
 
-    const required = subjectRole.constraints
-      ?.filter((c) => ((c.value as ConstraintSpan)?.constraint as Constraint)?.kind === 'MR')
+    const required = subjectRole.constraints?.docs
+      ?.filter((c) => ((c as ConstraintSpan)?.constraint as Constraint)?.kind === 'MR')
       .map(
         (c) =>
-          propertySchema.roles?.find(
-            (r) => (r as Role).id !== ((c.value as ConstraintSpan).roles[0] as Role).id,
+          propertySchema.roles?.docs?.find(
+            (r) => (r as Role).id !== ((c as ConstraintSpan).roles[0] as Role).id,
           ) as Role,
       )
 
@@ -1043,8 +1043,8 @@ function processUnarySchemas(
   jsonExamples: { [k: string]: JSONSchemaType },
   examples: Omit<Graph, 'updatedAt'>[],
 ) {
-  for (const unarySchema of graphSchemas.filter((s) => s.roles?.length === 1)) {
-    const unaryRole = unarySchema.roles?.[0] as Role
+  for (const unarySchema of graphSchemas.filter((s) => s.roles?.docs?.length === 1)) {
+    const unaryRole = unarySchema.roles?.docs?.[0] as Role
     const subject = unaryRole?.noun?.value as Noun | GraphSchema
     const reading = (unarySchema.readings as Reading[])?.[0]
     const predicate = toPredicate({ reading: reading.text, nouns, nounRegex })
@@ -1062,12 +1062,12 @@ function processUnarySchemas(
         )?.resource?.value as Resource
       )?.value
 
-    const required = unaryRole.constraints
-      ?.filter((c) => ((c.value as ConstraintSpan)?.constraint as Constraint)?.kind === 'MR')
+    const required = unaryRole.constraints?.docs
+      ?.filter((c) => ((c as ConstraintSpan)?.constraint as Constraint)?.kind === 'MR')
       .map(
         (c) =>
-          unarySchema.roles?.find(
-            (r) => (r as Role).id !== ((c.value as ConstraintSpan).roles[0] as Role).id,
+          unarySchema.roles?.docs?.find(
+            (r) => (r as Role).id !== ((c as ConstraintSpan).roles[0] as Role).id,
           ) as Role,
       )
 
@@ -1274,7 +1274,7 @@ function createProperty({
   let { referenceScheme, superType, valueType } = object as Noun
   if (!referenceScheme) {
     referenceScheme =
-      (object as GraphSchema).roles?.map((r) => {
+      (object as GraphSchema).roles?.docs?.map((r) => {
         return (r as Role).noun?.value as Noun
       }) || []
   }

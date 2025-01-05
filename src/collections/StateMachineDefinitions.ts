@@ -34,45 +34,14 @@ const StateMachineDefinitions: CollectionConfig = {
       relationTo: ['nouns', 'graph-schemas'],
       required: true,
       admin: { description: 'State Machine Definition is for Noun.' },
-      hooks: {
-        beforeChange: [
-          async ({
-            data: _data,
-            originalDoc: _originalDoc,
-            req: { payload: _payload },
-            context,
-            value: _value,
-          }) => {
-            if ((context.internal as string[])?.includes('state-machine-definitions.noun')) return
-            if (!context.internal) context.internal = []
-            ;(context.internal as string[]).push('state-machine-definitions.noun')
-          },
-        ],
-      },
     },
     // Bidirectional relationship child
     {
       name: 'statuses',
-      type: 'relationship',
-      relationTo: 'statuses',
-      hasMany: true,
+      type: 'join',
+      collection: 'statuses',
+      on: 'stateMachineDefinition',
       admin: { description: 'Status is defined in State Machine Definition.' },
-      hooks: {
-        beforeChange: [
-          async ({
-            data: _data,
-            originalDoc: _originalDoc,
-            req: { payload: _payload },
-            context,
-            value: _value,
-          }) => {
-            if ((context.internal as string[])?.includes('state-machine-definitions.statuses'))
-              return
-            if (!context.internal) context.internal = []
-            ;(context.internal as string[]).push('state-machine-definitions.statuses')
-          },
-        ],
-      },
     },
   ],
 }

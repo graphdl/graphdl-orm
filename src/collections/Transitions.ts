@@ -45,21 +45,6 @@ const Transitions: CollectionConfig = {
       admin: {
         description: 'Transition is from Status.',
       },
-      hooks: {
-        beforeChange: [
-          async ({
-            data: _data,
-            originalDoc: _originalDoc,
-            req: { payload: _payload },
-            context,
-            value: _value,
-          }) => {
-            if ((context.internal as string[])?.includes('transitions.statuses')) return
-            if (!context.internal) context.internal = []
-            ;(context.internal as string[]).push('transitions.statuses')
-          },
-        ],
-      },
     },
     {
       name: 'to',
@@ -81,25 +66,11 @@ const Transitions: CollectionConfig = {
     // Bidirectional relationship child
     {
       name: 'guard',
-      type: 'relationship',
-      relationTo: 'guards',
+      type: 'join',
+      collection: 'guards',
+      on: 'transition',
       admin: {
         description: 'Guard prevents Transition.',
-      },
-      hooks: {
-        beforeChange: [
-          async ({
-            data: _data,
-            originalDoc: _originalDoc,
-            req: { payload: _payload },
-            context,
-            value: _value,
-          }) => {
-            if ((context.internal as string[])?.includes('transitions.guard')) return
-            if (!context.internal) context.internal = []
-            ;(context.internal as string[]).push('transitions.guard')
-          },
-        ],
       },
     },
     {

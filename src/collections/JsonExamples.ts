@@ -94,9 +94,9 @@ const JsonExamples: CollectionConfig = {
             graph?: Graph
           }[] = []
           for (const graphSchema of graphSchemas) {
-            const uniqueness = graphSchema.roles?.map((role) =>
-              (role as Role).constraints
-                ?.map((c) => (c.value as ConstraintSpan).constraint as Constraint)
+            const uniqueness = graphSchema.roles?.docs?.map((role) =>
+              (role as Role).constraints?.docs
+                ?.map((c) => (c as ConstraintSpan).constraint as Constraint)
                 .filter((c) => c.kind === 'UC'),
             )
             let type: UniquenessType = 'one-to-many'
@@ -112,7 +112,7 @@ const JsonExamples: CollectionConfig = {
               else if (!uniqueness?.[0]?.[0] && uniqueness?.[1]?.[0]) type = 'many-to-one'
             } else continue
 
-            const roles = graphSchema.roles?.map((role) => role as Role)
+            const roles = graphSchema.roles?.docs?.map((role) => role as Role)
             const subjectRole = roles?.[type === 'many-to-one' ? 1 : 0]
             const subject = subjectRole?.noun?.value as Noun | GraphSchema
             if (subject.id !== data.noun.value) continue
@@ -133,7 +133,7 @@ const JsonExamples: CollectionConfig = {
               const nouns = roles?.map((r) => r?.noun?.value) as (GraphSchema | Noun)[]
               const nounRegex = nounListToRegex(nouns)
               const predicate = toPredicate({
-                reading: (graphSchema.readings?.[0] as Reading).text,
+                reading: (graphSchema.readings?.docs?.[0] as Reading).text,
                 nounRegex,
                 nouns,
               })
@@ -171,7 +171,7 @@ const JsonExamples: CollectionConfig = {
               (g) =>
                 (g.type as GraphSchema).id === schema.graphSchema.id &&
                 // iterate over graph reference scheme to match example
-                g.resourceRoles?.every(
+                g.resourceRoles?.docs?.every(
                   (r) =>
                     !referenceScheme?.find((s) => s.id === ((r as ResourceRole).role as Role).id) ||
                     (r as ResourceRole).resource?.value === data.jsonExample[schema.propertyName],
@@ -185,7 +185,7 @@ const JsonExamples: CollectionConfig = {
                   collection: 'resources',
                   where: {
                     type: {
-                      in: schema.graphSchema.roles
+                      in: schema.graphSchema.roles?.docs
                         ?.map((r) => ((r as Role).noun?.value as Noun | GraphSchema).id)
                         .join(','),
                     },
@@ -220,14 +220,14 @@ const JsonExamples: CollectionConfig = {
               const graph = await payload.create({
                 collection: 'graphs',
                 data: {
-                  type: schema.graphSchema.id,
+                  type: schema.graphSchema,
                   isExample: true,
                 },
               })
 
-              const resourceRoles = schema.graphSchema.roles
+              const resourceRoles = schema.graphSchema.roles?.docs
                 ? await Promise.all(
-                    schema.graphSchema.roles.map((r) =>
+                    schema.graphSchema.roles?.docs?.map((r) =>
                       payload.create({
                         collection: 'resource-roles',
                         data: {
@@ -243,7 +243,7 @@ const JsonExamples: CollectionConfig = {
                 collection: 'graphs',
                 id: graph.id,
                 data: {
-                  resourceRoles,
+                  resourceRoles: { docs: resourceRoles },
                 },
               })
               schema.graph = graph

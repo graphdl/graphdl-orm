@@ -90,6 +90,16 @@ const Resources: CollectionConfig = {
         description: 'Resource has parsable value',
       },
     },
+    // Bidirectional relationship child
+    {
+      name: 'stateMachine',
+      type: 'join',
+      collection: 'state-machines',
+      on: 'resource',
+      admin: {
+        description: 'State Machine is for Resource.',
+      },
+    },
   ],
 }
 

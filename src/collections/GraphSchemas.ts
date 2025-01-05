@@ -50,9 +50,9 @@ const GraphSchemas: CollectionConfig = {
     // Bidirectional relationship child
     {
       name: 'readings',
-      type: 'relationship',
-      relationTo: 'readings',
-      hasMany: true,
+      type: 'join',
+      collection: 'readings',
+      on: 'graphSchema',
       admin: {
         description: 'Graph Schema has Reading.',
       },
@@ -128,26 +128,11 @@ const GraphSchemas: CollectionConfig = {
     // Bidirectional relationship child
     {
       name: 'roles',
-      type: 'relationship',
-      relationTo: 'roles',
-      hasMany: true,
+      type: 'join',
+      collection: 'roles',
+      on: 'graphSchema',
       admin: {
         description: 'Graph Schema uses Role.',
-      },
-      hooks: {
-        afterChange: [
-          async ({
-            value: _value,
-            req: { payload: _payload },
-            originalDoc: _originalDoc,
-            data: _data,
-            context,
-          }) => {
-            if ((context.internal as string[])?.includes('graph-schemas.roles')) return
-            if (!context.internal) context.internal = []
-            ;(context.internal as string[]).push('graph-schemas.roles')
-          },
-        ],
       },
     },
     {
@@ -302,29 +287,11 @@ const GraphSchemas: CollectionConfig = {
     // Bidirectional relationship child
     {
       name: 'graphs',
-      type: 'relationship',
-      relationTo: 'graphs',
-      hasMany: true,
+      type: 'join',
+      collection: 'graphs',
+      on: 'type',
       admin: {
         description: 'Graph is of Graph Schema.',
-      },
-      hooks: {
-        afterChange: [
-          async ({
-            value: _value,
-            req: { payload: _payload },
-            data: _data,
-            originalDoc: _originalDoc,
-            context: _context,
-          }) => {
-            // if (value?.length)
-            //   await payload.update({
-            //     collection: 'graphs',
-            //     where: { id: value },
-            //     data: { graphSchema: data?.id || originalDoc?.id },
-            //   })
-          },
-        ],
       },
     },
     {
@@ -345,6 +312,14 @@ const GraphSchemas: CollectionConfig = {
       admin: {
         description: 'Noun has Access Permissions.',
       },
+    },
+    // Bidirectional relationship child
+    {
+      name: 'stateMachineDefinitions',
+      type: 'join',
+      collection: 'state-machine-definitions',
+      on: 'noun',
+      admin: { description: 'State Machine Definition is for Noun.' },
     },
   ],
   hooks: {

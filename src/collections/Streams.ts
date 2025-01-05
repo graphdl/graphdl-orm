@@ -24,21 +24,6 @@ const Streams: CollectionConfig = {
       admin: {
         description: 'Event Type publishes to Stream',
       },
-      hooks: {
-        beforeChange: [
-          async ({
-            data: _data,
-            originalDoc: _originalDoc,
-            req: { payload: _payload },
-            context,
-            value: _value,
-          }) => {
-            if ((context.internal as string[])?.includes('streams.eventType')) return
-            if (!context.internal) context.internal = []
-            ;(context.internal as string[]).push('streams.eventType')
-          },
-        ],
-      },
     },
   ],
 }

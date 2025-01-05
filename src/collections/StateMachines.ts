@@ -14,6 +14,7 @@ const StateMachines: CollectionConfig = {
         description: 'State Machine has Name.',
       },
     },
+    // Bidirectional relationship parent
     {
       name: 'resource',
       type: 'relationship',

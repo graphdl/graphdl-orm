@@ -31,44 +31,15 @@ const Guards: CollectionConfig = {
       admin: {
         description: 'Guard prevents Transition.',
       },
-      hooks: {
-        beforeChange: [
-          async ({
-            data: _data,
-            originalDoc: _originalDoc,
-            req: { payload: _payload },
-            context,
-            value: _value,
-          }) => {
-            if ((context.internal as string[])?.includes('guards.transition')) return
-            if (!context.internal) context.internal = []
-            ;(context.internal as string[]).push('guards.transition')
-          },
-        ],
-      },
     },
     // Bidirectional relationship child
     {
       name: 'runs',
-      type: 'relationship',
-      relationTo: 'guard-runs',
+      type: 'join',
+      collection: 'guard-runs',
+      on: 'type',
       admin: {
         description: 'Guard Run is for Guard.',
-      },
-      hooks: {
-        beforeChange: [
-          async ({
-            data: _data,
-            originalDoc: _originalDoc,
-            req: { payload: _payload },
-            context,
-            value: _value,
-          }) => {
-            if ((context.internal as string[])?.includes('guards.runs')) return
-            if (!context.internal) context.internal = []
-            ;(context.internal as string[]).push('guards.runs')
-          },
-        ],
       },
     },
   ],
