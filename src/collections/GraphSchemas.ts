@@ -1,5 +1,5 @@
+import type { GraphSchema, Noun } from '@/payload-types'
 import { CollectionConfig } from 'payload'
-import type { GraphSchema, Noun } from '../payload-types'
 
 const GraphSchemas: CollectionConfig = {
   slug: 'graph-schemas',
@@ -322,20 +322,6 @@ const GraphSchemas: CollectionConfig = {
       admin: { description: 'State Machine Definition is for Noun.' },
     },
   ],
-  hooks: {
-    afterOperation: [
-      async ({ operation, result, args: { req } }) => {
-        if (result.roles && req?.payload && ['create', 'updateByID', 'update'].includes(operation))
-          await req.payload.update({
-            collection: 'roles',
-            where: { id: { in: result.roles } },
-            data: { graphSchema: result.id },
-          })
-
-        return result
-      },
-    ],
-  },
 }
 
 export default GraphSchemas
