@@ -1,5 +1,5 @@
 import { CollectionConfig } from 'payload'
-import type { ConstraintSpan, Role } from '../payload-types'
+import type { Role } from '../payload-types'
 
 const ConstraintSpans: CollectionConfig = {
   slug: 'constraint-spans',
@@ -48,46 +48,6 @@ const ConstraintSpans: CollectionConfig = {
       relationTo: 'constraints',
       admin: {
         description: 'Constraint spans Role.',
-      },
-      hooks: {
-        afterChange: [
-          async ({ data, originalDoc, req: { payload }, context, value: _value }) => {
-            if ((context.internal as string[])?.includes('constraint-spans.constraint')) return
-            if (!context.internal) context.internal = []
-            ;(context.internal as string[]).push('constraint-spans.constraint')
-            if (data?.constraint) {
-              const constraint = await payload.findByID({
-                collection: 'constraints',
-                id: data.constraint,
-              })
-              const existingSpans = constraint.roles
-              if (
-                existingSpans
-                  ?.map((s) => (s.value as Role | ConstraintSpan).id)
-                  .includes(data.id || originalDoc.id)
-              )
-                return
-              const title = `${constraint.modality} ${constraint.kind} - ${(data.title || originalDoc.title)?.toString()?.split(' - ')?.[2]}`
-              await payload.update({
-                collection: 'constraints',
-                id: constraint.id,
-                data: {
-                  roles: [
-                    ...(existingSpans?.map((r) => ({
-                      relationTo: r.relationTo,
-                      value: (r.value as Role | ConstraintSpan).id,
-                    })) || []),
-                    {
-                      relationTo: 'constraint-spans',
-                      value: data.id || originalDoc.id,
-                    },
-                  ],
-                  title,
-                },
-              })
-            }
-          },
-        ],
       },
     },
     // Bidirectional relationship parent

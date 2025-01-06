@@ -4,8 +4,8 @@ import {
   JSONSchema6Definition as JSONSchemaDefinition,
   JSONSchema6Object as JSONSchemaObject,
   JSONSchema6Type as JSONSchemaType,
+  JSONSchema6TypeName as JSONSchemaTypeName,
 } from 'json-schema'
-import { Draft06 } from 'json-schema-library'
 import _ from 'lodash'
 import { CollectionBeforeChangeHook, CollectionConfig } from 'payload'
 import type {
@@ -907,7 +907,7 @@ const Generator: CollectionConfig = {
           ),
           components: {
             schemas: errorTemplate
-              ? { ...schemas, ErrorModel: new Draft06().createSchemaOf(errorTemplate) }
+              ? { ...schemas, ErrorModel: createSchemaOf(errorTemplate as object) }
               : schemas,
           },
         })
@@ -1236,20 +1236,35 @@ function fillSchemaTemplate({
 }: {
   schema?: JSONSchema
   example?: unknown
-  wrapperTemplate?: Record<string, Schema>
+  wrapperTemplate?: Record<string, unknown>
   replacementFieldPath?: string | null
 }) {
-  const jsonSchema = new Draft06()
   if (wrapperTemplate && Object.keys(wrapperTemplate).length) {
-    const wrapperSchema = jsonSchema.createSchemaOf(wrapperTemplate)
+    const wrapperSchema = createSchemaOf(wrapperTemplate)
     if (replacementFieldPath && _.get(wrapperSchema.properties, replacementFieldPath))
-      if (schema) _.set(wrapperSchema.properties, replacementFieldPath, schema)
+      if (schema && wrapperSchema.properties)
+        _.set(wrapperSchema.properties, replacementFieldPath, schema)
       else _.unset(wrapperSchema.properties, replacementFieldPath)
     if (example) {
       wrapperTemplate[replacementFieldPath || ''] = example
-      wrapperSchema.examples = [wrapperTemplate]
+      wrapperSchema.examples = [wrapperTemplate as JSONSchemaType]
     }
     schema = wrapperSchema
+  }
+  return schema
+}
+
+function createSchemaOf(data: object) {
+  const schema: JSONSchemaDefinition = {
+    properties: {},
+  }
+  for (const [key, value] of Object.entries(data).filter(([, v]) => v !== undefined)) {
+    if (!schema.properties) schema.properties = {}
+    if (typeof value === 'object') {
+      schema.properties[key] = createSchemaOf(value)
+    } else {
+      schema.properties[key] = { type: typeof value as JSONSchemaTypeName }
+    }
   }
   return schema
 }
