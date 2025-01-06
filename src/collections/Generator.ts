@@ -997,15 +997,6 @@ function processBinarySchemas(
       .map((n) => n[0].toUpperCase() + n.slice(1).replace(/-$/, ''))
     predicate.splice(objectBegin, objectReading.length, ...objectReading)
 
-    const required = subjectRole.constraints?.docs
-      ?.filter((c) => ((c as ConstraintSpan)?.constraint as Constraint)?.kind === 'MR')
-      .map(
-        (c) =>
-          propertySchema.roles?.docs?.find(
-            (r) => (r as Role).id !== ((c as ConstraintSpan).roles[0] as Role).id,
-          ) as Role,
-      )
-
     let example = undefined
     const exampleProperty = examples.find((g) => (g.type as GraphSchema)?.id === propertySchema.id)
     if (exampleProperty)
@@ -1022,7 +1013,7 @@ function processBinarySchemas(
       nouns,
       propertyName: extractPropertyName(objectReading),
       description: predicate.join(' '),
-      required: (required?.length || 0) > 0,
+      required: subjectRole.required || false,
       property: createProperty({
         object: object as Noun,
         nouns,
@@ -1062,15 +1053,6 @@ function processUnarySchemas(
         )?.resource?.value as Resource
       )?.value
 
-    const required = unaryRole.constraints?.docs
-      ?.filter((c) => ((c as ConstraintSpan)?.constraint as Constraint)?.kind === 'MR')
-      .map(
-        (c) =>
-          unarySchema.roles?.docs?.find(
-            (r) => (r as Role).id !== ((c as ConstraintSpan).roles[0] as Role).id,
-          ) as Role,
-      )
-
     setTableProperty({
       tables: schemas,
       subject: subject,
@@ -1078,7 +1060,7 @@ function processUnarySchemas(
       nouns,
       propertyName: extractPropertyName(objectReading),
       description: predicate.join(' '),
-      required: (required?.length || 0) > 0,
+      required: unaryRole.required || false,
       property: { type: 'boolean' },
       example,
       jsonExamples,

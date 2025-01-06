@@ -550,7 +550,7 @@ export interface Constraint {
   /**
    * Constraint is Kind of constraint.
    */
-  kind: 'UC' | 'MR' | 'SS' | 'XC' | 'EQ' | 'OR' | 'XO';
+  kind: 'UC' | 'SS' | 'XC' | 'EQ' | 'OR' | 'XO';
   /**
    * Constraint has modality of Modality Type. Alethic constraints enforce data integrity, while Deontic constraints warn when the constraint is violated.
    */

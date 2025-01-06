@@ -1,4 +1,3 @@
-import type { Constraint } from '@/payload-types'
 import { CollectionConfig } from 'payload'
 
 const Roles: CollectionConfig = {
@@ -62,38 +61,6 @@ const Roles: CollectionConfig = {
     {
       name: 'required',
       type: 'checkbox',
-      hooks: {
-        beforeChange: [
-          async ({ data, originalDoc, req: { payload }, value }) => {
-            const { docs: constraints } = await payload.find({
-              collection: 'constraint-spans',
-              where: {
-                roles: { contains: data?.id || originalDoc.id },
-              },
-              depth: 2,
-            })
-            const mandatory = constraints
-              .map(({ constraint }) => constraint as Constraint)
-              .find((c) => c.modality === 'Alethic' && c.kind === 'MR')
-            if (value && !originalDoc.required && !mandatory) {
-              const constraint = await payload.create({
-                collection: 'constraints',
-                data: {
-                  modality: 'Alethic',
-                  kind: 'MR',
-                },
-              })
-              await payload.create({
-                collection: 'constraint-spans',
-                data: {
-                  roles: [data?.id || originalDoc.id],
-                  constraint: constraint.id,
-                },
-              })
-            }
-          },
-        ],
-      },
     },
   ],
   hooks: {

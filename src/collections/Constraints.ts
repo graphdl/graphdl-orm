@@ -48,10 +48,6 @@ const Constraints: CollectionConfig = {
           value: 'UC',
         },
         {
-          label: 'Mandatory Role',
-          value: 'MR',
-        },
-        {
           label: 'Subset Constraint',
           value: 'SS',
         },
