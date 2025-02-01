@@ -24,7 +24,7 @@ The GraphDL (Graph Descriptor Language) application framework provides a compreh
 
 ## Generation
 
-The data types from the fields in the database determine the UI, making it possible to generate software. UI may also be customized per entity or table. Relational database schemas and UIs can be generated using the `Generator` object.
+Relational database schemas and UIs can be generated using the `Generator` object. An AI may be generated as a specialized agent with tools for using the database. The data types from the database fields can also be used to generate a UI, making it possible to generate complete apps. UI may be customized per entity or table.
 
 ## Visualizations
 
