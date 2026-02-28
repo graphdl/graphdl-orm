@@ -16,12 +16,14 @@ const ConstraintSpans: CollectionConfig = {
       },
       hooks: {
         beforeChange: [
-          async ({ data, originalDoc, req: { payload }, context: _context }) => {
+          async ({ data, originalDoc, req, context: _context }) => {
+            const { payload } = req
             const [constraint, roles] = await Promise.all([
               (data?.constraint || originalDoc?.constraint) &&
                 payload.findByID({
                   collection: 'constraints',
                   id: data?.constraint || originalDoc?.constraint,
+                  req,
                 }),
               data?.roles || originalDoc?.roles
                 ? payload.find({
@@ -31,6 +33,7 @@ const ConstraintSpans: CollectionConfig = {
                         in: data?.roles || originalDoc?.roles,
                       },
                     },
+                    req,
                   })
                 : Promise.resolve({ docs: [] }),
             ])

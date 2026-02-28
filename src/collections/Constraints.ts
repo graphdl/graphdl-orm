@@ -15,7 +15,8 @@ const Constraints: CollectionConfig = {
       },
       hooks: {
         beforeChange: [
-          async ({ data, originalDoc, req: { payload }, context, value }) => {
+          async ({ data, originalDoc, req, context, value }) => {
+            const { payload } = req
             if ((context.internal as string[])?.includes('constraints.title')) return
             if (!context.internal) context.internal = []
             ;(context.internal as string[]).push('constraints.title')
@@ -26,6 +27,7 @@ const Constraints: CollectionConfig = {
                 .findByID({
                   collection: 'constraint-spans',
                   id,
+                  req,
                 })
                 .catch(() => null))
             const title =

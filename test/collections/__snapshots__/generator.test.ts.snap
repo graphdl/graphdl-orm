@@ -1,0 +1,1027 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`Generator collection > should match golden snapshot 1`] = `
+{
+  "components": {
+    "schemas": {
+      "Age": {
+        "$id": "Age",
+        "properties": {
+          "person": {
+            "description": "Person has Age",
+            "oneOf": [
+              {
+                "type": "string",
+              },
+              {
+                "$ref": "#/components/schemas/Person",
+              },
+            ],
+          },
+        },
+        "title": "Age",
+        "type": "object",
+      },
+      "ListModel": {
+        "properties": {
+          "hasNextPage": {
+            "description": "\`true/false\` if next page exists",
+            "examples": [
+              true,
+            ],
+            "type": "boolean",
+          },
+          "hasPrevPage": {
+            "description": "\`true/false\` if previous page exists",
+            "examples": [
+              true,
+            ],
+            "type": "boolean",
+          },
+          "limit": {
+            "description": "Limit query parameter, defaults to \`10\`",
+            "examples": [
+              10,
+            ],
+            "type": "number",
+          },
+          "nextPage": {
+            "description": "\`number\` of next page, \`null\` if it doesn't exist",
+            "examples": [
+              3,
+            ],
+            "nullable": true,
+            "type": "number",
+          },
+          "page": {
+            "description": "Current page number",
+            "examples": [
+              2,
+            ],
+            "type": "number",
+          },
+          "pagingCounter": {
+            "description": "\`number\` of the first record on the current page",
+            "examples": [
+              11,
+            ],
+            "type": "number",
+          },
+          "prevPage": {
+            "description": "\`number\` of previous page, \`null\` if it doesn't exist",
+            "examples": [
+              1,
+            ],
+            "nullable": true,
+            "type": "number",
+          },
+          "totalCount": {
+            "description": "Total available records within the database",
+            "examples": [
+              25,
+            ],
+            "type": "number",
+          },
+          "totalPages": {
+            "description": "Total pages available, based upon the \`limit\`",
+            "examples": [
+              3,
+            ],
+            "type": "number",
+          },
+        },
+      },
+      "Order": {
+        "$id": "Order",
+        "properties": {
+          "number": {
+            "description": "Order is uniquely identified by OrderNumber",
+            "type": "string",
+          },
+        },
+        "required": [
+          "number",
+        ],
+        "title": "Order",
+        "type": "object",
+      },
+      "OrderNumber": {
+        "$id": "OrderNumber",
+        "properties": {
+          "order": {
+            "description": "Order has OrderNumber",
+            "oneOf": [
+              {
+                "type": "string",
+              },
+              {
+                "$ref": "#/components/schemas/Order",
+              },
+            ],
+          },
+        },
+        "title": "OrderNumber",
+        "type": "object",
+      },
+      "Person": {
+        "$id": "Person",
+        "properties": {
+          "name": {
+            "description": "Person has PersonName",
+            "type": "string",
+          },
+          "order": {
+            "description": "Person places Order",
+            "oneOf": [
+              {
+                "type": "string",
+              },
+              {
+                "$ref": "#/components/schemas/Order",
+              },
+            ],
+          },
+        },
+        "required": [
+          "name",
+        ],
+        "title": "Person",
+        "type": "object",
+      },
+      "UpdateOrder": {
+        "$id": "UpdateOrder",
+        "properties": {
+          "number": {
+            "description": "Order is uniquely identified by OrderNumber",
+            "type": "string",
+          },
+        },
+        "title": "Order",
+        "type": "object",
+      },
+      "UpdatePerson": {
+        "$id": "UpdatePerson",
+        "properties": {
+          "name": {
+            "description": "Person has PersonName",
+            "type": "string",
+          },
+          "order": {
+            "description": "Person places Order",
+            "oneOf": [
+              {
+                "type": "string",
+              },
+              {
+                "$ref": "#/components/schemas/Order",
+              },
+            ],
+          },
+        },
+        "title": "Person",
+        "type": "object",
+      },
+      "WhereAge": {
+        "properties": {
+          "and": {
+            "items": {
+              "$ref": "#/components/schemas/WhereAge",
+            },
+            "type": "array",
+          },
+          "or": {
+            "items": {
+              "$ref": "#/components/schemas/WhereAge",
+            },
+            "type": "array",
+          },
+          "person": {
+            "properties": {
+              "all": {
+                "description": "The value must contain all values provided in the comma-delimited list.",
+                "type": "string",
+              },
+              "contains": {
+                "description": "Must contain the value entered, case-insensitive.",
+                "type": "string",
+              },
+              "equals": {
+                "description": "The value must be exactly equal.",
+              },
+              "exists": {
+                "description": "Only return documents where the value either exists (true) or does not exist (false).",
+                "type": "boolean",
+              },
+              "in": {
+                "description": "The value must be found within the provided comma-delimited list of values.",
+                "type": "string",
+              },
+              "like": {
+                "description": "Case-insensitive string must be present. If string of words, all words must be present, in any order.",
+                "type": "string",
+              },
+              "not_equals": {
+                "description": "The query will return all documents where the value is not equal.",
+              },
+              "not_in": {
+                "description": "The value must NOT be within the provided comma-delimited list of values.",
+                "type": "string",
+              },
+            },
+            "type": "object",
+          },
+        },
+        "type": "object",
+      },
+      "WhereOrder": {
+        "properties": {
+          "and": {
+            "items": {
+              "$ref": "#/components/schemas/WhereOrder",
+            },
+            "type": "array",
+          },
+          "number": {
+            "properties": {
+              "all": {
+                "description": "The value must contain all values provided in the comma-delimited list.",
+                "type": "string",
+              },
+              "contains": {
+                "description": "Must contain the value entered, case-insensitive.",
+                "type": "string",
+              },
+              "equals": {
+                "description": "The value must be exactly equal.",
+                "type": "string",
+              },
+              "exists": {
+                "description": "Only return documents where the value either exists (true) or does not exist (false).",
+                "type": "boolean",
+              },
+              "in": {
+                "description": "The value must be found within the provided comma-delimited list of values.",
+                "type": "string",
+              },
+              "like": {
+                "description": "Case-insensitive string must be present. If string of words, all words must be present, in any order.",
+                "type": "string",
+              },
+              "not_equals": {
+                "description": "The query will return all documents where the value is not equal.",
+                "type": "string",
+              },
+              "not_in": {
+                "description": "The value must NOT be within the provided comma-delimited list of values.",
+                "type": "string",
+              },
+            },
+            "type": "object",
+          },
+          "or": {
+            "items": {
+              "$ref": "#/components/schemas/WhereOrder",
+            },
+            "type": "array",
+          },
+        },
+        "type": "object",
+      },
+      "WhereOrderNumber": {
+        "properties": {
+          "and": {
+            "items": {
+              "$ref": "#/components/schemas/WhereOrderNumber",
+            },
+            "type": "array",
+          },
+          "or": {
+            "items": {
+              "$ref": "#/components/schemas/WhereOrderNumber",
+            },
+            "type": "array",
+          },
+          "order": {
+            "properties": {
+              "all": {
+                "description": "The value must contain all values provided in the comma-delimited list.",
+                "type": "string",
+              },
+              "contains": {
+                "description": "Must contain the value entered, case-insensitive.",
+                "type": "string",
+              },
+              "equals": {
+                "description": "The value must be exactly equal.",
+              },
+              "exists": {
+                "description": "Only return documents where the value either exists (true) or does not exist (false).",
+                "type": "boolean",
+              },
+              "in": {
+                "description": "The value must be found within the provided comma-delimited list of values.",
+                "type": "string",
+              },
+              "like": {
+                "description": "Case-insensitive string must be present. If string of words, all words must be present, in any order.",
+                "type": "string",
+              },
+              "not_equals": {
+                "description": "The query will return all documents where the value is not equal.",
+              },
+              "not_in": {
+                "description": "The value must NOT be within the provided comma-delimited list of values.",
+                "type": "string",
+              },
+            },
+            "type": "object",
+          },
+        },
+        "type": "object",
+      },
+      "WherePerson": {
+        "properties": {
+          "and": {
+            "items": {
+              "$ref": "#/components/schemas/WherePerson",
+            },
+            "type": "array",
+          },
+          "name": {
+            "properties": {
+              "all": {
+                "description": "The value must contain all values provided in the comma-delimited list.",
+                "type": "string",
+              },
+              "contains": {
+                "description": "Must contain the value entered, case-insensitive.",
+                "type": "string",
+              },
+              "equals": {
+                "description": "The value must be exactly equal.",
+                "type": "string",
+              },
+              "exists": {
+                "description": "Only return documents where the value either exists (true) or does not exist (false).",
+                "type": "boolean",
+              },
+              "in": {
+                "description": "The value must be found within the provided comma-delimited list of values.",
+                "type": "string",
+              },
+              "like": {
+                "description": "Case-insensitive string must be present. If string of words, all words must be present, in any order.",
+                "type": "string",
+              },
+              "not_equals": {
+                "description": "The query will return all documents where the value is not equal.",
+                "type": "string",
+              },
+              "not_in": {
+                "description": "The value must NOT be within the provided comma-delimited list of values.",
+                "type": "string",
+              },
+            },
+            "type": "object",
+          },
+          "or": {
+            "items": {
+              "$ref": "#/components/schemas/WherePerson",
+            },
+            "type": "array",
+          },
+          "order": {
+            "properties": {
+              "all": {
+                "description": "The value must contain all values provided in the comma-delimited list.",
+                "type": "string",
+              },
+              "contains": {
+                "description": "Must contain the value entered, case-insensitive.",
+                "type": "string",
+              },
+              "equals": {
+                "description": "The value must be exactly equal.",
+              },
+              "exists": {
+                "description": "Only return documents where the value either exists (true) or does not exist (false).",
+                "type": "boolean",
+              },
+              "in": {
+                "description": "The value must be found within the provided comma-delimited list of values.",
+                "type": "string",
+              },
+              "like": {
+                "description": "Case-insensitive string must be present. If string of words, all words must be present, in any order.",
+                "type": "string",
+              },
+              "not_equals": {
+                "description": "The query will return all documents where the value is not equal.",
+              },
+              "not_in": {
+                "description": "The value must NOT be within the provided comma-delimited list of values.",
+                "type": "string",
+              },
+            },
+            "type": "object",
+          },
+        },
+        "type": "object",
+      },
+    },
+  },
+  "info": {
+    "contact": {},
+    "title": "Test API",
+    "version": "1.0.0",
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/ages": {
+      "get": {
+        "operationId": "get-ages-list",
+        "parameters": [
+          {
+            "description": "Pass the name of a top-level field to sort by that field in ascending order. Prefix the name of the field with a minus symbol ("-") to sort in descending order.",
+            "in": "query",
+            "name": "sort",
+            "schema": {
+              "type": "string",
+            },
+          },
+          {
+            "description": "Limit number of results, default 10",
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "type": "number",
+            },
+          },
+          {
+            "description": "Search for results fitting criteria, uses qs library for query string parsing",
+            "in": "query",
+            "name": "where",
+            "schema": {
+              "$ref": "#/components/schemas/WhereAge",
+            },
+          },
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "items": {
+                        "$ref": "#/components/schemas/Age",
+                      },
+                      "type": "array",
+                    },
+                    {
+                      "$ref": "#/components/schemas/ListModel",
+                    },
+                  ],
+                },
+              },
+            },
+            "description": "Ages Found",
+          },
+        },
+        "summary": "Get Ages",
+      },
+      "parameters": [
+        {
+          "description": "The number of levels of related objects to include in the response",
+          "in": "query",
+          "name": "depth",
+          "required": false,
+          "schema": {
+            "type": "integer",
+          },
+        },
+      ],
+      "post": {
+        "operationId": "post-age",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Age",
+              },
+            },
+          },
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Age",
+                },
+              },
+            },
+            "description": "Age Added",
+          },
+        },
+        "summary": "Add a new Age",
+      },
+    },
+    "/ages/": {
+      "get": {
+        "operationId": "get-age",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Age",
+                },
+              },
+            },
+            "description": "Age Found",
+          },
+        },
+        "summary": "Retrieve an Age",
+      },
+      "parameters": [
+        {
+          "description": "The number of levels of related objects to include in the response",
+          "in": "query",
+          "name": "depth",
+          "required": false,
+          "schema": {
+            "type": "integer",
+          },
+        },
+      ],
+      "patch": {
+        "operationId": "patch-age",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Age",
+              },
+            },
+          },
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Age",
+                },
+              },
+            },
+            "description": "Age Updated",
+          },
+        },
+        "summary": "Update an existing Age",
+      },
+    },
+    "/ordernumbers": {
+      "get": {
+        "operationId": "get-ordernumbers-list",
+        "parameters": [
+          {
+            "description": "Pass the name of a top-level field to sort by that field in ascending order. Prefix the name of the field with a minus symbol ("-") to sort in descending order.",
+            "in": "query",
+            "name": "sort",
+            "schema": {
+              "type": "string",
+            },
+          },
+          {
+            "description": "Limit number of results, default 10",
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "type": "number",
+            },
+          },
+          {
+            "description": "Search for results fitting criteria, uses qs library for query string parsing",
+            "in": "query",
+            "name": "where",
+            "schema": {
+              "$ref": "#/components/schemas/WhereOrderNumber",
+            },
+          },
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "items": {
+                        "$ref": "#/components/schemas/OrderNumber",
+                      },
+                      "type": "array",
+                    },
+                    {
+                      "$ref": "#/components/schemas/ListModel",
+                    },
+                  ],
+                },
+              },
+            },
+            "description": "OrderNumbers Found",
+          },
+        },
+        "summary": "Get OrderNumbers",
+      },
+      "parameters": [
+        {
+          "description": "The number of levels of related objects to include in the response",
+          "in": "query",
+          "name": "depth",
+          "required": false,
+          "schema": {
+            "type": "integer",
+          },
+        },
+      ],
+      "post": {
+        "operationId": "post-ordernumber",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OrderNumber",
+              },
+            },
+          },
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrderNumber",
+                },
+              },
+            },
+            "description": "OrderNumber Added",
+          },
+        },
+        "summary": "Add a new OrderNumber",
+      },
+    },
+    "/ordernumbers/": {
+      "get": {
+        "operationId": "get-ordernumber",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrderNumber",
+                },
+              },
+            },
+            "description": "OrderNumber Found",
+          },
+        },
+        "summary": "Retrieve an OrderNumber",
+      },
+      "parameters": [
+        {
+          "description": "The number of levels of related objects to include in the response",
+          "in": "query",
+          "name": "depth",
+          "required": false,
+          "schema": {
+            "type": "integer",
+          },
+        },
+      ],
+      "patch": {
+        "operationId": "patch-ordernumber",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OrderNumber",
+              },
+            },
+          },
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrderNumber",
+                },
+              },
+            },
+            "description": "OrderNumber Updated",
+          },
+        },
+        "summary": "Update an existing OrderNumber",
+      },
+    },
+    "/orders": {
+      "get": {
+        "operationId": "get-orders-list",
+        "parameters": [
+          {
+            "description": "Pass the name of a top-level field to sort by that field in ascending order. Prefix the name of the field with a minus symbol ("-") to sort in descending order.",
+            "in": "query",
+            "name": "sort",
+            "schema": {
+              "type": "string",
+            },
+          },
+          {
+            "description": "Limit number of results, default 10",
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "type": "number",
+            },
+          },
+          {
+            "description": "Search for results fitting criteria, uses qs library for query string parsing",
+            "in": "query",
+            "name": "where",
+            "schema": {
+              "$ref": "#/components/schemas/WhereOrder",
+            },
+          },
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "items": {
+                        "$ref": "#/components/schemas/Order",
+                      },
+                      "type": "array",
+                    },
+                    {
+                      "$ref": "#/components/schemas/ListModel",
+                    },
+                  ],
+                },
+              },
+            },
+            "description": "Orders Found",
+          },
+        },
+        "summary": "Get Orders",
+      },
+      "parameters": [
+        {
+          "description": "The number of levels of related objects to include in the response",
+          "in": "query",
+          "name": "depth",
+          "required": false,
+          "schema": {
+            "type": "integer",
+          },
+        },
+      ],
+      "post": {
+        "operationId": "post-order",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Order",
+              },
+            },
+          },
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Order",
+                },
+              },
+            },
+            "description": "Order Added",
+          },
+        },
+        "summary": "Add a new Order",
+      },
+    },
+    "/orders/{number}": {
+      "get": {
+        "operationId": "get-order",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Order",
+                },
+              },
+            },
+            "description": "Order Found",
+          },
+        },
+        "summary": "Retrieve an Order",
+      },
+      "parameters": [
+        {
+          "description": "Order is uniquely identified by OrderNumber",
+          "in": "path",
+          "name": "number",
+          "required": true,
+          "schema": {
+            "type": "string",
+          },
+        },
+        {
+          "description": "The number of levels of related objects to include in the response",
+          "in": "query",
+          "name": "depth",
+          "required": false,
+          "schema": {
+            "type": "integer",
+          },
+        },
+      ],
+      "patch": {
+        "operationId": "patch-order",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateOrder",
+              },
+            },
+          },
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Order",
+                },
+              },
+            },
+            "description": "Order Updated",
+          },
+        },
+        "summary": "Update an existing Order",
+      },
+    },
+    "/people": {
+      "get": {
+        "operationId": "get-people-list",
+        "parameters": [
+          {
+            "description": "Pass the name of a top-level field to sort by that field in ascending order. Prefix the name of the field with a minus symbol ("-") to sort in descending order.",
+            "in": "query",
+            "name": "sort",
+            "schema": {
+              "type": "string",
+            },
+          },
+          {
+            "description": "Limit number of results, default 10",
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "type": "number",
+            },
+          },
+          {
+            "description": "Search for results fitting criteria, uses qs library for query string parsing",
+            "in": "query",
+            "name": "where",
+            "schema": {
+              "$ref": "#/components/schemas/WherePerson",
+            },
+          },
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "items": {
+                        "$ref": "#/components/schemas/Person",
+                      },
+                      "type": "array",
+                    },
+                    {
+                      "$ref": "#/components/schemas/ListModel",
+                    },
+                  ],
+                },
+              },
+            },
+            "description": "People Found",
+          },
+        },
+        "summary": "Get People",
+      },
+      "parameters": [
+        {
+          "description": "The number of levels of related objects to include in the response",
+          "in": "query",
+          "name": "depth",
+          "required": false,
+          "schema": {
+            "type": "integer",
+          },
+        },
+      ],
+      "post": {
+        "operationId": "post-person",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Person",
+              },
+            },
+          },
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Person",
+                },
+              },
+            },
+            "description": "Person Added",
+          },
+        },
+        "summary": "Add a new Person",
+      },
+    },
+    "/people/": {
+      "get": {
+        "operationId": "get-person",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Person",
+                },
+              },
+            },
+            "description": "Person Found",
+          },
+        },
+        "summary": "Retrieve a Person",
+      },
+      "parameters": [
+        {
+          "description": "The number of levels of related objects to include in the response",
+          "in": "query",
+          "name": "depth",
+          "required": false,
+          "schema": {
+            "type": "integer",
+          },
+        },
+      ],
+      "patch": {
+        "operationId": "patch-person",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdatePerson",
+              },
+            },
+          },
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Person",
+                },
+              },
+            },
+            "description": "Person Updated",
+          },
+        },
+        "summary": "Update an existing Person",
+      },
+    },
+  },
+}
+`;

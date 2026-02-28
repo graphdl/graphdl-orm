@@ -121,14 +121,15 @@ const JsonExamples: CollectionConfig = {
               referenceScheme =
                 data.noun.relationTo === 'nouns'
                   ? (subject as Noun).referenceScheme?.map((p) => p as Noun)
-                  : data.noun.value.roles.map((r: Role) => r.noun?.value as Noun | GraphSchema)
+                  : data.noun.value.roles?.docs?.map((r: Role) => r.noun?.value as Noun | GraphSchema)
             }
 
             const object =
               type === 'unary'
                 ? undefined
                 : (roles?.[type === 'many-to-one' ? 0 : 1]?.noun?.value as Noun | GraphSchema)
-            let propertyName = (object as GraphSchema)?.readings && (object as GraphSchema)?.name
+            let propertyName =
+              (object as GraphSchema)?.readings?.docs?.length && (object as GraphSchema)?.name
             if (!propertyName) {
               const nouns = roles?.map((r) => r?.noun?.value) as (GraphSchema | Noun)[]
               const nounRegex = nounListToRegex(nouns)
@@ -225,27 +226,20 @@ const JsonExamples: CollectionConfig = {
                 },
               })
 
-              const resourceRoles = schema.graphSchema.roles?.docs
-                ? await Promise.all(
-                    schema.graphSchema.roles?.docs?.map((r) =>
-                      payload.create({
-                        collection: 'resource-roles',
-                        data: {
-                          graph: graph.id,
-                          resource: null,
-                          role: (r as Role).id,
-                        },
-                      }),
-                    ),
-                  )
-                : []
-              await payload.update({
-                collection: 'graphs',
-                id: graph.id,
-                data: {
-                  resourceRoles: { docs: resourceRoles },
-                },
-              })
+              if (schema.graphSchema.roles?.docs) {
+                await Promise.all(
+                  schema.graphSchema.roles.docs.map((r) =>
+                    payload.create({
+                      collection: 'resource-roles',
+                      data: {
+                        graph: graph.id,
+                        resource: null,
+                        role: (r as Role).id,
+                      },
+                    }),
+                  ),
+                )
+              }
               schema.graph = graph
             }
           }

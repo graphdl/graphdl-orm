@@ -105,7 +105,7 @@ const Generator: CollectionConfig = {
 
         const [graphSchemas, nouns, constraintSpans, examples, jsons] = (await Promise.all([
           payload
-            .find({ collection: 'graph-schemas', pagination: false, depth: 2 })
+            .find({ collection: 'graph-schemas', pagination: false, depth: 4 })
             .then((s) => s.docs),
           payload.find({ collection: 'nouns', pagination: false }).then((n) => n.docs),
           payload
@@ -148,9 +148,19 @@ const Generator: CollectionConfig = {
         const compoundUniqueSchemas = constraintSpans
           .filter((cs) => {
             const roles = cs.roles as Role[]
-            return roles?.length > 1 && roles.every((r) => r.graphSchema === roles?.[0].graphSchema)
+            if (!roles?.length || roles.length <= 1) return false
+            const firstGsId = typeof roles[0].graphSchema === 'string' ? roles[0].graphSchema : (roles[0].graphSchema as GraphSchema)?.id
+            return roles.every((r) => {
+              const gsId = typeof r.graphSchema === 'string' ? r.graphSchema : (r.graphSchema as GraphSchema)?.id
+              return gsId === firstGsId
+            })
           })
-          .map((cs) => ({ gs: (cs.roles as Role[])[0].graphSchema as GraphSchema, cs }))
+          .map((cs) => {
+            const nestedGs = (cs.roles as Role[])[0].graphSchema as GraphSchema
+            // Look up the top-level graphSchema (which has join fields populated) instead of the nested one
+            const gs = graphSchemas.find((s) => s.id === nestedGs.id) || nestedGs
+            return { gs, cs }
+          })
         const arrayTypes = compoundUniqueSchemas.filter(
           ({ gs: cs }) =>
             !graphSchemas.find((s) =>
@@ -201,7 +211,7 @@ const Generator: CollectionConfig = {
         }
         const nounRegex = nounListToRegex(nouns)
         // #endregion
-        processBinarySchemas(constraintSpans, schemas, nouns, jsonExamples, nounRegex, examples)
+        processBinarySchemas(constraintSpans, schemas, nouns, jsonExamples, nounRegex, examples, graphSchemas)
         // #region Map association tables with no extra properties to arrays
         processArraySchemas(arrayTypes, nouns, nounRegex, schemas, jsonExamples)
         // #endregion
@@ -973,21 +983,29 @@ function processBinarySchemas(
   jsonExamples: { [k: string]: JSONSchemaType },
   nounRegex: RegExp,
   examples: Omit<Graph, 'updatedAt'>[],
+  graphSchemas: Omit<GraphSchema, 'updatedAt'>[],
 ) {
-  for (const propertySchema of constraintSpans
+  for (const { propertySchema, subjectRole } of constraintSpans
     .filter((cs) => (cs.roles as Role[])?.length === 1)
-    .map((cs) => (cs.roles as Role[])[0].graphSchema as GraphSchema)) {
-    const subjectRole = propertySchema.roles?.docs?.find((r) =>
-      (r as Role).constraints?.docs?.some(
-        (c) => ((c as ConstraintSpan)?.constraint as Constraint).kind === 'UC',
-      ),
-    ) as Role
+    .map((cs) => {
+      const constrainedRole = (cs.roles as Role[])[0]
+      const nestedGs = constrainedRole.graphSchema as GraphSchema
+      // Look up the top-level graphSchema (which has join fields populated) instead of the nested one
+      const propertySchema = graphSchemas.find((gs) => gs.id === nestedGs.id) || nestedGs
+      // The single role from the constraint span is fully populated (depth 6)
+      return { propertySchema, subjectRole: constrainedRole }
+    })) {
+    if (!subjectRole) continue
 
     const subject = subjectRole.noun?.value as Noun | GraphSchema
     ensureTableExists({ tables: schemas, subject, nouns, jsonExamples })
 
-    const objectRole = propertySchema.roles?.docs?.find((r) => (r as Role).id !== subjectRole.id)
-    const object = (objectRole as Role)?.noun?.value as Noun | GraphSchema
+    const objectRole = propertySchema.roles?.docs?.find((r) => (r as Role).id !== subjectRole.id) as Role
+    // Use noun from constraint span data (fully populated) if available, otherwise from join field
+    const objectNounValue = objectRole?.noun?.value
+    const object = (typeof objectNounValue === 'string'
+      ? nouns.find((n) => n.id === objectNounValue)
+      : objectNounValue) as Noun | GraphSchema
     const reading = propertySchema.readings?.docs?.[0] as Reading
     const predicate = toPredicate({ reading: reading.text, nouns, nounRegex })
     const { objectBegin, objectEnd } = findPredicateObject({ predicate, subject, object })
@@ -1001,7 +1019,7 @@ function processBinarySchemas(
     const exampleProperty = examples.find((g) => (g.type as GraphSchema)?.id === propertySchema.id)
     if (exampleProperty)
       example = (
-        (exampleProperty?.resourceRoles as ResourceRole[])?.find(
+        (exampleProperty?.resourceRoles?.docs as ResourceRole[])?.find(
           (role) => (objectRole as Role).id === (role.role as Role)?.id,
         )?.resource?.value as Resource
       )?.value
@@ -1037,7 +1055,7 @@ function processUnarySchemas(
   for (const unarySchema of graphSchemas.filter((s) => s.roles?.docs?.length === 1)) {
     const unaryRole = unarySchema.roles?.docs?.[0] as Role
     const subject = unaryRole?.noun?.value as Noun | GraphSchema
-    const reading = (unarySchema.readings as Reading[])?.[0]
+    const reading = unarySchema.readings?.docs?.[0] as Reading
     const predicate = toPredicate({ reading: reading.text, nouns, nounRegex })
     const { objectBegin } = findPredicateObject({ predicate, subject })
     const objectReading = predicate.slice(objectBegin)
@@ -1048,7 +1066,7 @@ function processUnarySchemas(
     const exampleProperty = examples.find((g) => (g.type as GraphSchema)?.id === unarySchema.id)
     if (exampleProperty)
       example = (
-        (exampleProperty?.resourceRoles as ResourceRole[])?.find(
+        (exampleProperty?.resourceRoles?.docs as ResourceRole[])?.find(
           (role) => unaryRole.id === (role.role as Role)?.id,
         )?.resource?.value as Resource
       )?.value
