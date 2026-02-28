@@ -74,6 +74,7 @@ export default buildConfig({
   },
   db: mongooseAdapter({
     url: process.env.DATABASE_URI || 'mongodb://localhost:27017/graphdl',
+    transactionOptions: process.env.PAYLOAD_DISABLE_ADMIN === 'true' ? false : {},
   }),
   sharp,
   // plugins: [

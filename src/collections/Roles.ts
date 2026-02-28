@@ -16,16 +16,20 @@ const Roles: CollectionConfig = {
       },
       hooks: {
         beforeChange: [
-          async ({ data, req: { payload } }) => {
+          async ({ data, req }) => {
+            const { payload } = req
+            const nounValue = typeof data?.noun?.value === 'object' ? data.noun.value?.id : data?.noun?.value
+            const graphSchemaId = typeof data?.graphSchema === 'object' ? (data.graphSchema as any)?.id : data?.graphSchema
             const [noun, graphSchema] = await Promise.all([
-              data?.noun?.relationTo
+              data?.noun?.relationTo && nounValue
                 ? payload.findByID({
                     collection: data.noun.relationTo,
-                    id: data.noun.value,
+                    id: nounValue,
+                    req,
                   })
                 : Promise.resolve(null),
-              data?.graphSchema
-                ? payload.findByID({ collection: 'graph-schemas', id: data.graphSchema })
+              graphSchemaId
+                ? payload.findByID({ collection: 'graph-schemas', id: graphSchemaId, req })
                 : Promise.resolve(null),
             ])
             return `${noun?.name} - ${graphSchema?.title}`
@@ -65,17 +69,24 @@ const Roles: CollectionConfig = {
   ],
   hooks: {
     afterChange: [
-      async ({ doc, req: { payload } }) => {
+      async ({ doc, req, context }) => {
+        const { payload } = req
+        if ((context.internal as string[])?.includes('roles.afterChange')) return
+        if (!context.internal) context.internal = []
+        ;(context.internal as string[]).push('roles.afterChange')
         if (doc.graphSchema && doc.title.endsWith(' - undefined')) {
+          const nounValue = typeof doc.noun?.value === 'object' ? doc.noun.value?.id : doc.noun?.value
+          const graphSchemaId = typeof doc.graphSchema === 'object' ? doc.graphSchema?.id : doc.graphSchema
           const [noun, graphSchema] = await Promise.all([
-            doc?.noun?.relationTo
+            doc?.noun?.relationTo && nounValue
               ? payload.findByID({
                   collection: doc.noun.relationTo,
-                  id: doc.noun.value,
+                  id: nounValue,
+                  req,
                 })
               : Promise.resolve(null),
-            doc?.graphSchema
-              ? payload.findByID({ collection: 'graph-schemas', id: doc.graphSchema })
+            graphSchemaId
+              ? payload.findByID({ collection: 'graph-schemas', id: graphSchemaId, req })
               : Promise.resolve(null),
           ])
           doc.title = `${noun?.name} - ${graphSchema?.title}`
@@ -85,6 +96,8 @@ const Roles: CollectionConfig = {
             data: {
               title: doc.title,
             },
+            req,
+            context,
           })
         }
       },

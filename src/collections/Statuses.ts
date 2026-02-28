@@ -15,11 +15,13 @@ const Statuses: CollectionConfig = {
       },
       hooks: {
         beforeChange: [
-          async ({ data, req: { payload } }) => {
+          async ({ data, req }) => {
+            const { payload } = req
             const machineDefinition = await (data?.stateMachineDefinition
               ? payload.findByID({
                   collection: 'state-machine-definitions',
                   id: data?.stateMachineDefinition,
+                  req,
                 })
               : Promise.resolve(null))
             return `${data?.name} - ${machineDefinition?.title}`

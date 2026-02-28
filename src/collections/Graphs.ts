@@ -16,17 +16,23 @@ const Graphs: CollectionConfig = {
       },
       hooks: {
         beforeChange: [
-          async ({ originalDoc, data, req: { payload } }) => {
+          async ({ originalDoc, data, req }) => {
+            const { payload } = req
+            const docId = data?.id || originalDoc?.id
             const type = await payload.findByID({
               collection: 'graph-schemas',
               id: data?.type || originalDoc?.type,
+              req,
             })
-            const resourceRoles = await payload
-              .find({
-                collection: 'resource-roles',
-                where: { id: { in: data?.resourceRoles || originalDoc?.resourceRoles } },
-              })
-              .then((r) => r.docs)
+            const resourceRoles = docId
+              ? await payload
+                  .find({
+                    collection: 'resource-roles',
+                    where: { graph: { equals: docId } },
+                    req,
+                  })
+                  .then((r) => r.docs)
+              : []
             return resourceRoles.reduce((title: string, { resource }) => {
               const [type, value] =
                 resource?.relationTo === 'graphs'

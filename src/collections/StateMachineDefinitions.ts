@@ -15,11 +15,13 @@ const StateMachineDefinitions: CollectionConfig = {
       },
       hooks: {
         beforeChange: [
-          async ({ data, req: { payload } }) => {
+          async ({ data, req }) => {
+            const { payload } = req
             const noun = await (data?.noun?.relationTo
               ? payload.findByID({
                   collection: data.noun.relationTo,
                   id: data.noun.value,
+                  req,
                 })
               : Promise.resolve(null))
             return `${noun?.name}`
