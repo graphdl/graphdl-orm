@@ -114,12 +114,4 @@ describe('Generator collection', () => {
     expect(ordersPath).toBeDefined()
   })
 
-  // ---------------------------------------------------------------------------
-  // Test 4: Golden snapshot — skipped because output ordering is non-deterministic
-  // (MongoDB ObjectId ordering varies between runs). The 3 structural tests above
-  // validate the output content.
-  // ---------------------------------------------------------------------------
-  it.skip('should match golden snapshot', () => {
-    expect(output).toMatchSnapshot()
-  })
 }, 120_000)

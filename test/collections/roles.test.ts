@@ -67,13 +67,4 @@ describe('Roles collection', () => {
   })
 
   // ---------------------------------------------------------------------------
-  // Constraint-span convenience — SKIPPED
-  // In the new repo, Role.constraints is a join field (read-only).
-  // The old convenience logic (auto-creating constraint-spans from raw
-  // constraints written to role.constraints) has been removed.
-  // ---------------------------------------------------------------------------
-  describe.skip('constraint-span convenience (removed in v3 — join field)', () => {
-    it('should auto-create a constraint-span when a raw constraint is added to a role', () => {})
-    it('should reuse the same constraint-span when the same constraint is added to two roles', () => {})
-  })
 })
