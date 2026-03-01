@@ -265,6 +265,125 @@ const Generator: CollectionConfig = {
           databaseEngine,
         } = data
 
+        // #region Generate Payload CMS collections
+        const payloadCollections: Record<string, unknown> = {}
+        if (databaseEngine === 'Payload') {
+          for (const noun of nouns.filter((n) => (n as Noun).permissions?.length)) {
+            const key = nameToKey(noun.name || '')
+            const slug = ((noun as Noun).plural || noun.name + 's')?.toLowerCase().replace(/ /g, '-')
+            // Use the fully-flattened base schema (has all merged properties)
+            const baseSchema = schemas[key] || schemas['New' + key] || schemas['Update' + key]
+            if (!baseSchema) continue
+
+            const fields: Record<string, unknown>[] = []
+            const properties = baseSchema.properties || {}
+            const required = baseSchema.required || schemas['New' + key]?.required || schemas['Update' + key]?.required || []
+
+            for (const [propName, propDef] of Object.entries(properties) as [string, Schema][]) {
+              const field: Record<string, unknown> = { name: propName }
+
+              if (propDef.enum) {
+                field.type = 'select'
+                field.options = (propDef.enum as unknown[]).filter((v) => v !== null).map((v) => String(v))
+              } else if (propDef.type === 'boolean') {
+                field.type = 'checkbox'
+              } else if (propDef.type === 'number' || propDef.type === 'integer') {
+                field.type = 'number'
+              } else if (propDef.type === 'array') {
+                const items = propDef.items as Schema | undefined
+                if (items?.$ref) {
+                  const refTarget = items.$ref.split('/').pop() || ''
+                  const refNoun = nouns.find((n) => nameToKey(n.name || '') === refTarget)
+                  field.type = 'relationship'
+                  field.relationTo = ((refNoun as Noun)?.plural || refTarget)?.toLowerCase().replace(/ /g, '-')
+                  field.hasMany = true
+                } else {
+                  field.type = 'json'
+                }
+              } else if (propDef.oneOf) {
+                const refSchema = (propDef.oneOf as Schema[]).find((s) => s.$ref)
+                if (refSchema?.$ref) {
+                  const refTarget = refSchema.$ref.split('/').pop() || ''
+                  const refNoun = nouns.find((n) => nameToKey(n.name || '') === refTarget)
+                  field.type = 'relationship'
+                  field.relationTo = ((refNoun as Noun)?.plural || refTarget)?.toLowerCase().replace(/ /g, '-')
+                } else {
+                  field.type = 'text'
+                }
+              } else if (propDef.format === 'email') {
+                field.type = 'email'
+              } else if (propDef.format === 'date-time' || propDef.format === 'date') {
+                field.type = 'date'
+              } else {
+                field.type = 'text'
+              }
+
+              if (required.includes(propName)) field.required = true
+              if (propDef.description?.includes('is uniquely identified by')) field.unique = true
+
+              fields.push(field)
+            }
+
+            const refSchemeField = fields.find((f) => f.unique) || fields[0]
+            const permissions = (noun as Noun).permissions || []
+            const access: Record<string, string> = {}
+            if (permissions.includes('create')) access.create = 'authenticated'
+            if (permissions.includes('read')) access.read = 'authenticated'
+            if (permissions.includes('update')) access.update = 'authenticated'
+            if (permissions.includes('delete')) access.delete = 'authenticated'
+
+            const collection: Record<string, unknown> = {
+              slug,
+              labels: { singular: noun.name, plural: (noun as Noun).plural || noun.name + 's' },
+              admin: { useAsTitle: (refSchemeField?.name as string) || 'id' },
+              timestamps: true,
+              fields,
+            }
+            if (Object.keys(access).length) collection.access = access
+            if (permissions.includes('login')) collection.auth = true
+
+            payloadCollections[slug] = collection
+          }
+
+          // Second pass: add join fields for reverse relationships
+          for (const cs of constraintSpans.filter((cs) => (cs.roles as Role[])?.length === 1)) {
+            const constrainedRole = (cs.roles as Role[])[0]
+            const nestedGs = constrainedRole.graphSchema as GraphSchema
+            const gs = graphSchemas.find((s) => s.id === nestedGs?.id) || nestedGs
+            if (!gs || (gs.roles?.docs?.length || 0) !== 2) continue
+
+            const objectRole = gs.roles?.docs?.find((r) => (r as Role).id !== constrainedRole.id) as Role
+            if (!objectRole) continue
+
+            const subjectNoun = constrainedRole.noun?.value as Noun | GraphSchema
+            const objectNoun = objectRole.noun?.value as Noun | GraphSchema
+            if (!subjectNoun?.name || !objectNoun?.name) continue
+
+            const subjectSlug = ((subjectNoun as Noun).plural || subjectNoun.name + 's')?.toLowerCase().replace(/ /g, '-')
+            const objectSlug = ((objectNoun as Noun).plural || objectNoun.name + 's')?.toLowerCase().replace(/ /g, '-')
+
+            const constrainedCollection = payloadCollections[subjectSlug] as Record<string, unknown> | undefined
+            const joinCollection = payloadCollections[objectSlug] as Record<string, unknown> | undefined
+            if (!constrainedCollection || !joinCollection) continue
+
+            const constrainedFields = constrainedCollection.fields as Record<string, unknown>[]
+            const relField = constrainedFields.find((f) => f.type === 'relationship' && f.relationTo === objectSlug)
+            if (!relField) continue
+
+            const joinFields = joinCollection.fields as Record<string, unknown>[]
+            const existingJoin = joinFields.find((f) => f.type === 'join' && f.collection === subjectSlug)
+            if (!existingJoin) {
+              joinFields.push({
+                name: subjectSlug,
+                type: 'join',
+                collection: subjectSlug,
+                on: relField.name,
+              })
+            }
+          }
+        }
+        // #endregion
+
         if (databaseEngine == 'Payload') {
           schemas['ListModel'] = {
             properties: {
@@ -929,7 +1048,11 @@ const Generator: CollectionConfig = {
           output = output.replace(new RegExp(key, 'g'), replacement)
         }
 
-        data.output = JSON.parse(output)
+        const parsedOutput = JSON.parse(output)
+        if (Object.keys(payloadCollections).length) {
+          parsedOutput.payloadCollections = payloadCollections
+        }
+        data.output = parsedOutput
 
         // #endregion
       }) as CollectionBeforeChangeHook<Generator>,
@@ -950,8 +1073,10 @@ function processArraySchemas(
   for (const { gs: schema } of arrayTypes) {
     const reading = schema.readings?.docs?.[0] as Reading
     const predicate = toPredicate({ reading: reading.text, nouns, nounRegex })
-    const subject = (schema.roles?.docs?.[0] as Role).noun?.value as Noun | GraphSchema
-    const object = (schema.roles?.docs?.[1] as Role).noun?.value as Noun | GraphSchema
+    const subjectRaw = (schema.roles?.docs?.[0] as Role).noun?.value
+    const subject = (typeof subjectRaw === 'string' ? nouns.find((n) => n.id === subjectRaw) : subjectRaw) as Noun | GraphSchema
+    const objectRaw = (schema.roles?.docs?.[1] as Role).noun?.value
+    const object = (typeof objectRaw === 'string' ? nouns.find((n) => n.id === objectRaw) : objectRaw) as Noun | GraphSchema
     const plural = object?.plural
 
     const { objectBegin, objectEnd } = findPredicateObject({ predicate, subject, object, plural })
