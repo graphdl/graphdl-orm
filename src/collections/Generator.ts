@@ -9,7 +9,6 @@ import {
 import _ from 'lodash'
 import { CollectionBeforeChangeHook, CollectionConfig } from 'payload'
 import type {
-  Constraint,
   ConstraintSpan,
   Generator,
   Graph,
@@ -271,15 +270,23 @@ const Generator: CollectionConfig = {
           for (const noun of nouns.filter((n) => (n as Noun).permissions?.length)) {
             const key = nameToKey(noun.name || '')
             const slug = ((noun as Noun).plural || noun.name + 's')?.toLowerCase().replace(/ /g, '-')
-            // Use the fully-flattened base schema (has all merged properties)
-            const baseSchema = schemas[key] || schemas['New' + key] || schemas['Update' + key]
-            if (!baseSchema) continue
+            // Merge properties from all schema variants (Update has the properties,
+            // New has required, base may have additional from flattening)
+            const allProperties: Record<string, Schema> = {
+              ...(schemas['Update' + key]?.properties || {}),
+              ...(schemas['New' + key]?.properties || {}),
+              ...(schemas[key]?.properties || {}),
+            }
+            if (!Object.keys(allProperties).length) continue
 
             const fields: Record<string, unknown>[] = []
-            const properties = baseSchema.properties || {}
-            const required = baseSchema.required || schemas['New' + key]?.required || schemas['Update' + key]?.required || []
+            const required = [
+              ...(schemas['Update' + key]?.required || []),
+              ...(schemas['New' + key]?.required || []),
+              ...(schemas[key]?.required || []),
+            ]
 
-            for (const [propName, propDef] of Object.entries(properties) as [string, Schema][]) {
+            for (const [propName, propDef] of Object.entries(allProperties) as [string, Schema][]) {
               const field: Record<string, unknown> = { name: propName }
 
               if (propDef.enum) {
@@ -1064,7 +1071,7 @@ export default Generator
 
 // #region Fact type processors
 function processArraySchemas(
-  arrayTypes: { gs: GraphSchema; cs: Omit<ConstraintSpan, 'updatedAt'> }[],
+  arrayTypes: { gs: Omit<GraphSchema, 'updatedAt'>; cs: Omit<ConstraintSpan, 'updatedAt'> }[],
   nouns: Omit<GraphSchema | Noun, 'updatedAt'>[],
   nounRegex: RegExp,
   schemas: Record<string, Schema>,
