@@ -1059,6 +1059,15 @@ const Generator: CollectionConfig = {
         if (Object.keys(payloadCollections).length) {
           parsedOutput.payloadCollections = payloadCollections
         }
+
+        const files: Record<string, string> = {}
+        if (databaseEngine === 'Payload') {
+          for (const [slug, collection] of Object.entries(payloadCollections) as [string, Record<string, unknown>][]) {
+            files[`collections/${slug}.ts`] = generateCollectionTypeScript(slug, collection)
+          }
+        }
+        if (Object.keys(files).length) parsedOutput.files = files
+
         data.output = parsedOutput
 
         // #endregion
@@ -1068,6 +1077,14 @@ const Generator: CollectionConfig = {
 }
 
 export default Generator
+
+function generateCollectionTypeScript(
+  slug: string,
+  collection: Record<string, unknown>,
+): string {
+  const pascalName = slug.split('-').map(s => s.charAt(0).toUpperCase() + s.slice(1)).join('')
+  return `import type { CollectionConfig } from 'payload'\n\nexport const ${pascalName}: CollectionConfig = ${JSON.stringify(collection, null, 2)}\n`
+}
 
 // #region Fact type processors
 function processArraySchemas(
