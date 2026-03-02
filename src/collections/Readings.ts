@@ -57,25 +57,25 @@ const Readings: CollectionConfig = {
 
         if (nounEntities.length === 0) return
 
-        // Create Roles from found nouns
-        const roles = await Promise.all(
-          nounEntities.map((n) =>
-            payload.create({
-              collection: 'roles',
-              req,
-              data: {
-                title: `${n?.name} Role`,
-                noun: {
-                  relationTo: graphSchemas.find((g) => g.id === n?.id)
-                    ? 'graph-schemas'
-                    : 'nouns',
-                  value: n?.id,
-                },
-                graphSchema: graphSchemaId,
+        // Create Roles from found nouns — sequentially to preserve reading order
+        const roles = []
+        for (const n of nounEntities) {
+          const role = await payload.create({
+            collection: 'roles',
+            req,
+            data: {
+              title: `${n?.name} Role`,
+              noun: {
+                relationTo: graphSchemas.find((g) => g.id === n?.id)
+                  ? 'graph-schemas'
+                  : 'nouns',
+                value: n?.id,
               },
-            }),
-          ),
-        )
+              graphSchema: graphSchemaId,
+            },
+          })
+          roles.push(role)
+        }
 
         // Update the reading with role references
         await payload.update({
