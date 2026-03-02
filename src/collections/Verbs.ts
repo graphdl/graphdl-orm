@@ -14,6 +14,14 @@ const Verbs: CollectionConfig = {
         description: 'Verb has name.',
       },
     },
+    {
+      name: 'function',
+      type: 'relationship',
+      relationTo: 'functions',
+      admin: {
+        description: 'Verb runs Function.',
+      },
+    },
   ],
 }
 
