@@ -1083,7 +1083,58 @@ function generateCollectionTypeScript(
   collection: Record<string, unknown>,
 ): string {
   const pascalName = slug.split('-').map(s => s.charAt(0).toUpperCase() + s.slice(1)).join('')
-  return `import type { CollectionConfig } from 'payload'\n\nexport const ${pascalName}: CollectionConfig = ${JSON.stringify(collection, null, 2)}\n`
+  const lines: string[] = []
+  lines.push("import type { CollectionConfig } from 'payload'")
+  lines.push('')
+  lines.push(`export const ${pascalName}: CollectionConfig = ${objectToTS(collection, 0)}`)
+  lines.push('')
+  return lines.join('\n')
+}
+
+function objectToTS(obj: unknown, indent: number): string {
+  const pad = '  '.repeat(indent)
+  const inner = '  '.repeat(indent + 1)
+
+  if (obj === null || obj === undefined) return String(obj)
+  if (typeof obj === 'boolean' || typeof obj === 'number') return String(obj)
+  if (typeof obj === 'string') return quote(obj)
+
+  if (Array.isArray(obj)) {
+    if (obj.length === 0) return '[]'
+    const items = obj.map(item => `${inner}${objectToTS(item, indent + 1)}`)
+    return `[\n${items.join(',\n')},\n${pad}]`
+  }
+
+  if (typeof obj === 'object') {
+    const entries = Object.entries(obj as Record<string, unknown>).filter(([, v]) => v !== undefined)
+    if (entries.length === 0) return '{}'
+    const props = entries.map(([key, value]) => {
+      if (key === 'access' && typeof value === 'object' && value !== null) {
+        return `${inner}access: ${accessToTS(value as Record<string, string>, indent + 1)}`
+      }
+      const k = /^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(key) ? key : quote(key)
+      return `${inner}${k}: ${objectToTS(value, indent + 1)}`
+    })
+    return `{\n${props.join(',\n')},\n${pad}}`
+  }
+
+  return String(obj)
+}
+
+function accessToTS(access: Record<string, string>, indent: number): string {
+  const pad = '  '.repeat(indent)
+  const inner = '  '.repeat(indent + 1)
+  const entries = Object.entries(access).filter(([, v]) => v !== undefined)
+  if (entries.length === 0) return '{}'
+  const props = entries.map(([key]) => {
+    return `${inner}${key}: ({ req: { user } }) => Boolean(user)`
+  })
+  return `{\n${props.join(',\n')},\n${pad}}`
+}
+
+function quote(s: string): string {
+  if (s.includes("'")) return `'${s.replace(/'/g, "\\'")}'`
+  return `'${s}'`
 }
 
 // #region Fact type processors
