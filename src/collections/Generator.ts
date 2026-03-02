@@ -1997,7 +1997,13 @@ function transformPropertyName(propertyName?: string) {
   propertyName = nameToKey(propertyName)
   // Lowercase the whole string if it is all caps
   if (propertyName === propertyName.toUpperCase()) return propertyName.toLowerCase()
-  // otherwise, lowercase the first letter
+  // Handle leading uppercase runs (e.g., APIKey → apiKey, KBBId → kbbId, HTTPMethod → httpMethod)
+  const leadingUpper = propertyName.match(/^[A-Z]+/)
+  if (leadingUpper) {
+    const run = leadingUpper[0]
+    if (run.length === propertyName.length) return propertyName.toLowerCase()
+    if (run.length > 1) return run.slice(0, -1).toLowerCase() + propertyName.slice(run.length - 1)
+  }
   return propertyName[0].toLowerCase() + propertyName.slice(1).replace(/ /g, '')
 }
 

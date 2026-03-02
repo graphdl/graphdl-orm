@@ -36,6 +36,7 @@ export async function seedSupportDomain(payload: Payload) {
   const featureRequestId = await payload.create({ collection: 'nouns', data: { name: 'FeatureRequestId', objectType: 'value', valueType: 'string', format: 'uuid' } })
   const voteCount = await payload.create({ collection: 'nouns', data: { name: 'VoteCount', objectType: 'value', valueType: 'integer', minimum: 0 } })
   const endpointSlug = await payload.create({ collection: 'nouns', data: { name: 'EndpointSlug', objectType: 'value', valueType: 'string' } })
+  const apiKey = await payload.create({ collection: 'nouns', data: { name: 'APIKey', plural: 'api-keys', objectType: 'value', valueType: 'string' } })
 
   // Reference schemes
   await payload.update({ collection: 'nouns', id: customer.id, data: { referenceScheme: [emailAddress.id] } })
@@ -59,11 +60,14 @@ export async function seedSupportDomain(payload: Payload) {
   await createFact(payload, 'FeatureRequestHasVoteCount', 'FeatureRequest has VoteCount', 'many-to-one')
   await createFact(payload, 'FeatureRequestConcernsAPIProduct', 'FeatureRequest concerns APIProduct', 'many-to-many')
 
+  // Customer API key
+  await createFact(payload, 'CustomerHasAPIKey', 'Customer has APIKey', 'one-to-one')
+
   // API product facts
   await createFact(payload, 'APIProductHasEndpointSlug', 'APIProduct has EndpointSlug', 'one-to-one')
 
   return {
-    nouns: { customer, supportRequest, featureRequest, apiProduct, emailAddress, subject, description, channelName, priority, requestId, featureRequestId, voteCount, endpointSlug },
+    nouns: { customer, supportRequest, featureRequest, apiProduct, emailAddress, subject, description, channelName, priority, requestId, featureRequestId, voteCount, endpointSlug, apiKey },
   }
 }
 
