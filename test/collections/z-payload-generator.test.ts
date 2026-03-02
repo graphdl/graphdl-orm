@@ -110,4 +110,10 @@ describe('Payload Collection Generator', () => {
     expect(tsContent).toContain("name: 'description'")
     expect(tsContent).toContain("name: 'priority'")
   })
+
+  it('should use correct camelCase for acronym field names', () => {
+    const tsContent = payloadOutput.files['collections/customers.ts']
+    expect(tsContent).toContain("name: 'apiKey'")
+    expect(tsContent).not.toContain("name: 'aPIKey'")
+  })
 }, 120_000)
