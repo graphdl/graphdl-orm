@@ -1012,7 +1012,7 @@ async function generatePayloadFiles(payload: any, sourceOutput: any): Promise<an
   const files: Record<string, string> = {}
   const payloadCollections: Record<string, Record<string, unknown>> = {}
 
-  for (const noun of nouns.filter((n: any) => n.permissions?.length)) {
+  for (const noun of nouns.filter((n: any) => n.permissions?.length && n.objectType === 'entity')) {
     const key = nameToKey(noun.name || '')
     const slug = (noun.plural || noun.name + 's')?.toLowerCase().replace(/ /g, '-')
 
