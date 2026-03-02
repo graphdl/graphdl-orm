@@ -3,7 +3,8 @@ import { initPayload } from '../helpers/initPayload'
 import { seedSupportDomain } from '../helpers/seed'
 
 let payload: any
-let output: any
+let openapiOutput: any
+let payloadOutput: any
 
 describe('Payload Collection Generator', () => {
   beforeAll(async () => {
@@ -14,7 +15,8 @@ describe('Payload Collection Generator', () => {
 
     await seedSupportDomain(payload)
 
-    const generator = await payload.create({
+    // Create OpenAPI generator (source)
+    const openapiGenerator = await payload.create({
       collection: 'generators',
       data: {
         title: 'auto.dev Support API',
@@ -22,23 +24,34 @@ describe('Payload Collection Generator', () => {
         databaseEngine: 'Payload',
       },
     })
+    openapiOutput = openapiGenerator.output
 
-    output = generator.output
+    // Create Payload generator (derives from OpenAPI)
+    const payloadGenerator = await payload.create({
+      collection: 'generators',
+      data: {
+        title: 'auto.dev Support Collections',
+        version: '1.0.0',
+        databaseEngine: 'Payload',
+        outputFormat: 'payload',
+      },
+    })
+    payloadOutput = payloadGenerator.output
   }, 120_000)
 
   it('should not include intermediate payloadCollections in output', () => {
-    expect(output.payloadCollections).toBeUndefined()
+    expect(payloadOutput.payloadCollections).toBeUndefined()
   })
 
   it('should generate .ts collection files in output.files', () => {
-    expect(output.files).toBeDefined()
-    expect(typeof output.files).toBe('object')
-    expect(output.files['collections/support-requests.ts']).toBeDefined()
-    expect(typeof output.files['collections/support-requests.ts']).toBe('string')
+    expect(payloadOutput.files).toBeDefined()
+    expect(typeof payloadOutput.files).toBe('object')
+    expect(payloadOutput.files['collections/support-requests.ts']).toBeDefined()
+    expect(typeof payloadOutput.files['collections/support-requests.ts']).toBe('string')
   })
 
   it('should generate valid TypeScript with proper imports and structure', () => {
-    const tsContent = output.files['collections/support-requests.ts']
+    const tsContent = payloadOutput.files['collections/support-requests.ts']
     expect(tsContent).toContain("import type { CollectionConfig } from 'payload'")
     expect(tsContent).toContain('export const SupportRequests: CollectionConfig')
     expect(tsContent).toContain("slug: 'support-requests'")
@@ -50,26 +63,37 @@ describe('Payload Collection Generator', () => {
   })
 
   it('should generate .ts files for all entity nouns with permissions', () => {
-    expect(output.files['collections/support-requests.ts']).toBeDefined()
-    expect(output.files['collections/feature-requests.ts']).toBeDefined()
-    expect(output.files['collections/customers.ts']).toBeDefined()
-    expect(output.files['collections/api-products.ts']).toBeDefined()
+    expect(payloadOutput.files['collections/support-requests.ts']).toBeDefined()
+    expect(payloadOutput.files['collections/feature-requests.ts']).toBeDefined()
+    expect(payloadOutput.files['collections/customers.ts']).toBeDefined()
+    expect(payloadOutput.files['collections/api-products.ts']).toBeDefined()
   })
 
   it('should include access control in generated TypeScript', () => {
-    const tsContent = output.files['collections/support-requests.ts']
+    const tsContent = payloadOutput.files['collections/support-requests.ts']
     expect(tsContent).toContain('access:')
     expect(tsContent).toContain('({ req: { user } }) => Boolean(user)')
   })
 
   it('should include auth config for login collections', () => {
-    const tsContent = output.files['collections/customers.ts']
+    const tsContent = payloadOutput.files['collections/customers.ts']
     expect(tsContent).toContain('auth: true')
   })
 
-  it('should generate valid OpenAPI output alongside Payload collections', () => {
-    expect(output.openapi).toBe('3.1.0')
-    expect(output.components?.schemas).toBeDefined()
-    expect(output.paths).toBeDefined()
+  it('should generate valid OpenAPI output (backwards compat, no outputFormat)', () => {
+    expect(openapiOutput.openapi).toBe('3.1.0')
+    expect(openapiOutput.components?.schemas).toBeDefined()
+    expect(openapiOutput.paths).toBeDefined()
+  })
+
+  it('should not include files in OpenAPI-only output', () => {
+    expect(openapiOutput.files).toBeUndefined()
+  })
+
+  it('should auto-find source OpenAPI generator for payload output', () => {
+    // payloadOutput was created without sourceGenerator
+    // it should have auto-found the openapi generator
+    expect(payloadOutput.files).toBeDefined()
+    expect(payloadOutput.files['collections/support-requests.ts']).toBeDefined()
   })
 }, 120_000)

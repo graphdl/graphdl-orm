@@ -19,7 +19,6 @@ import type {
   Resource,
   ResourceRole,
   Role,
-  StateMachineDefinition,
 } from '../payload-types'
 
 const Generator: CollectionConfig = {
@@ -90,6 +89,28 @@ const Generator: CollectionConfig = {
           required: true,
           defaultValue: 'Payload',
         },
+        {
+          name: 'outputFormat',
+          type: 'select',
+          options: [
+            { label: 'OpenAPI', value: 'openapi' },
+            { label: 'Payload Collections', value: 'payload' },
+            { label: 'XState + Agent', value: 'xstate' },
+          ],
+          defaultValue: 'openapi',
+          admin: {
+            description: 'What this generator produces. OpenAPI is the default.',
+          },
+        },
+        {
+          name: 'sourceGenerator',
+          type: 'relationship',
+          relationTo: 'generators',
+          admin: {
+            description: 'Source generator whose output is used as input. Auto-detected if not set.',
+            condition: (data) => data.outputFormat === 'payload',
+          },
+        },
       ],
     },
     { name: 'output', type: 'json' },
@@ -100,1113 +121,1164 @@ const Generator: CollectionConfig = {
         if ((context.internal as string[])?.includes('schemas.afterHook')) return
         if (!context.internal) context.internal = []
         ;(context.internal as string[])?.push('schemas.afterHook')
-        // #region Retrieve data
-        const schemas: Record<string, Schema> = {}
 
-        const [graphSchemas, nouns, constraintSpans, examples, jsons, stateMachineDefinitions] = (await Promise.all([
-          payload
-            .find({ collection: 'graph-schemas', pagination: false, depth: 4 })
-            .then((s) => s.docs),
-          payload.find({ collection: 'nouns', pagination: false }).then((n) => n.docs),
-          payload
-            .find({
-              collection: 'constraint-spans', // get constraints
-              pagination: false,
-              depth: 6,
-              where: { 'constraint.kind': { equals: 'UC' } }, // filter to uniqueness constraints
+        const outputFormat = data.outputFormat || 'openapi'
+
+        if (outputFormat === 'openapi') {
+          // Run the full existing OpenAPI generation
+          data.output = await generateOpenAPI(payload, data)
+        } else if (outputFormat === 'payload') {
+          // Find source: explicit sourceGenerator, or auto-find latest openapi generator
+          let sourceOutput: any
+          if (data.sourceGenerator) {
+            const sourceId = typeof data.sourceGenerator === 'string' ? data.sourceGenerator : data.sourceGenerator.id
+            const source = await payload.findByID({ collection: 'generators', id: sourceId })
+            sourceOutput = source.output
+          } else {
+            const latest = await payload.find({
+              collection: 'generators',
+              where: {
+                or: [
+                  { outputFormat: { equals: 'openapi' } },
+                  { outputFormat: { exists: false } },
+                ],
+              },
+              sort: '-updatedAt',
+              limit: 1,
             })
-            .then((cs) => cs.docs),
-          payload
-            .find({
-              collection: 'graphs',
-              where: { isExample: { equals: true } },
-              pagination: false,
-            })
-            .then((n) => n.docs),
-          payload
-            .find({
-              collection: 'json-examples',
-              where: { verbatim: { equals: true } },
-              pagination: false,
-            })
-            .then((n) => n.docs),
-          payload
-            .find({
-              collection: 'state-machine-definitions',
-              pagination: false,
-              depth: 0,
-            })
-            .then((s) => s.docs),
-        ])) as [
-          Omit<GraphSchema, 'updatedAt'>[],
-          Omit<Noun | GraphSchema, 'updatedAt'>[],
-          Omit<ConstraintSpan, 'updatedAt'>[],
-          Omit<Graph, 'updatedAt'>[],
-          Omit<JsonExample, 'updatedAt'>[],
-          Omit<StateMachineDefinition, 'updatedAt'>[],
-        ]
-        const jsonExamples = Object.fromEntries(
-          jsons.map((j) => [
-            nameToKey((j.noun?.value as Noun | GraphSchema)?.name || ''),
-            j.jsonExample as JSONSchemaType,
-          ]),
-        )
-        // #endregion
-        // #region Find composite uniqueness schemas
-        const compoundUniqueSchemas = constraintSpans
-          .filter((cs) => {
-            const roles = cs.roles as Role[]
-            if (!roles?.length || roles.length <= 1) return false
-            const firstGsId = typeof roles[0].graphSchema === 'string' ? roles[0].graphSchema : (roles[0].graphSchema as GraphSchema)?.id
-            return roles.every((r) => {
-              const gsId = typeof r.graphSchema === 'string' ? r.graphSchema : (r.graphSchema as GraphSchema)?.id
-              return gsId === firstGsId
-            })
-          })
-          .map((cs) => {
-            const nestedGs = (cs.roles as Role[])[0].graphSchema as GraphSchema
-            // Look up the top-level graphSchema (which has join fields populated) instead of the nested one
-            const gs = graphSchemas.find((s) => s.id === nestedGs.id) || nestedGs
-            return { gs, cs }
-          })
-        const arrayTypes = compoundUniqueSchemas.filter(
-          ({ gs: cs }) =>
-            !graphSchemas.find((s) =>
-              s.roles?.docs?.find((r) => ((r as Role).noun?.value as GraphSchema)?.id === cs.id),
-            ),
-        )
-        const associationSchemas = compoundUniqueSchemas.filter((cs) => !arrayTypes.includes(cs))
-        // #endregion
-        // #region Add gerunds to noun list and add association tables
-        nouns.push(...associationSchemas.map(({ gs }) => gs))
-        for (const { gs: associationSchema, cs } of associationSchemas) {
-          const key = (associationSchema.name || '').replace(/ /g, '')
-          const jsonExample = jsonExamples[key]
-          schemas['Update' + key] = {
-            $id: 'Update' + key,
-            title: associationSchema.name || '',
-            type: 'object',
-            description:
-              associationSchema.description ||
-              (associationSchema.readings?.docs?.[0] as Reading)?.text?.replace(/- /, ' '),
+            sourceOutput = latest.docs[0]?.output
           }
-          schemas['New' + key] = {
-            $id: 'New' + key,
-            allOf: [{ $ref: '#/components/schemas/Update' + key }],
+          if (!sourceOutput) {
+            data.output = { error: 'No source OpenAPI generator found. Create an OpenAPI generator first or set sourceGenerator.' }
+            return
           }
-          schemas[key] = {
-            $id: key,
-            allOf: [{ $ref: '#/components/schemas/New' + key }],
-          }
-          if (jsonExample) {
-            schemas['Update' + key].examples = [jsonExample]
-            schemas['New' + key].examples = [jsonExample]
-            schemas[key].examples = [jsonExample]
-          }
-          for (const role of associationSchema.roles?.docs || []) {
-            const idNoun = (role as Role).noun?.value as Noun | GraphSchema
-            setTableProperty({
-              tables: schemas,
-              subject: associationSchema,
-              object: idNoun,
-              nouns,
-              required: cs.roles.find((r) => (r as Role).id === (role as Role).id) ? true : false,
-              description: `${associationSchema.name} is uniquely identified by ${idNoun.name}`,
-              property: createProperty({ object: idNoun, tables: schemas, nouns, jsonExamples }),
-              jsonExamples,
-            })
-          }
+          data.output = await generatePayloadFiles(payload, sourceOutput)
+        } else if (outputFormat === 'xstate') {
+          data.output = await generateXStateFiles(payload)
         }
-        const nounRegex = nounListToRegex(nouns)
-        // #endregion
-        processBinarySchemas(constraintSpans, schemas, nouns, jsonExamples, nounRegex, examples, graphSchemas)
-        // #region Map association tables with no extra properties to arrays
-        processArraySchemas(arrayTypes, nouns, nounRegex, schemas, jsonExamples)
-        // #endregion
-        processUnarySchemas(graphSchemas, nouns, nounRegex, schemas, jsonExamples, examples)
-        // #region Schema processor
-        // Flatten allOf chains in order to help parsing engines that don't support them
-        const componentSchemas: [string, Schema][] = Object.entries(schemas)
-        for (const [key, schema] of componentSchemas) {
-          while (schema.allOf) {
-            const mergedRequired: string[] = [...(schema.required || [])]
-            let mergedProperties = schema.properties || {}
-            const mergedAllOf: JSONSchemaDefinition[] = []
-            schema.allOf.forEach((s) => {
-              const dependency = schemas[(s as JSONSchema).$ref?.split('/').pop() || '']
-              if (dependency.required?.length)
-                mergedRequired.push(
-                  ...dependency.required.filter((f: string) => !mergedRequired.includes(f)),
-                )
-              if (Object.keys(dependency.properties || {}).length)
-                mergedProperties = { ...dependency.properties, ...mergedProperties }
-              if (dependency.allOf?.length) mergedAllOf.push(...dependency.allOf.map((a) => a))
-              if (!schema.title && dependency.title) schema.title = dependency.title
-              if (!schema.description && dependency.description)
-                schema.description = dependency.description
-              if (!schema.type && dependency.type) schema.type = dependency.type
-              if (!schema.examples && Object.keys(dependency.examples || {}).length)
-                schema.examples = dependency.examples
-            })
-            delete schema.allOf
-            if (Object.keys(mergedProperties).length) schema.properties = mergedProperties
-            if (mergedRequired.length) schema.required = mergedRequired
-            if (mergedAllOf.length) schema.allOf = mergedAllOf
-          }
-          schemas[key] = schema
-        }
-
-        const {
-          replacementFieldPath,
-          globalWrapperTemplate,
-          errorTemplate,
-          errorCodePath,
-          errorMessagePath,
-          title,
-          version,
-          email,
-          name,
-          url,
-          description,
-          servers,
-          globalPermissions,
-          databaseEngine,
-        } = data
-
-
-        if (databaseEngine == 'Payload') {
-          schemas['ListModel'] = {
-            properties: {
-              page: {
-                type: 'number',
-                description: 'Current page number',
-                examples: [2],
-              },
-              nextPage: {
-                type: 'number',
-                nullable: true,
-                description: "`number` of next page, `null` if it doesn't exist",
-                examples: [3],
-              },
-              prevPage: {
-                type: 'number',
-                nullable: true,
-                description: "`number` of previous page, `null` if it doesn't exist",
-                examples: [1],
-              },
-              totalPages: {
-                type: 'number',
-                description: 'Total pages available, based upon the `limit`',
-                examples: [3],
-              },
-              totalCount: {
-                type: 'number',
-                description: 'Total available records within the database',
-                examples: [25],
-              },
-              limit: {
-                type: 'number',
-                description: 'Limit query parameter, defaults to `10`',
-                examples: [10],
-              },
-              pagingCounter: {
-                type: 'number',
-                description: '`number` of the first record on the current page',
-                examples: [11],
-              },
-              hasPrevPage: {
-                type: 'boolean',
-                description: '`true/false` if previous page exists',
-                examples: [true],
-              },
-              hasNextPage: {
-                type: 'boolean',
-                description: '`true/false` if next page exists',
-                examples: [true],
-              },
-            },
-          }
-        }
-
-        const replacements: string[][] = []
-        // stringify and parse later to remove undefined values
-        let output = JSON.stringify({
-          openapi: '3.1.0',
-          info: {
-            title: title || undefined,
-            version: version || undefined,
-            contact: {
-              email: email || undefined,
-              name: name || undefined,
-              url: url || undefined,
-            },
-            description: description || undefined,
-          },
-          servers: servers || undefined,
-          paths: Object.fromEntries(
-            Object.entries(schemas)
-              .filter(([key, _schema]) => schemas['Update' + key] || schemas['New' + key])
-              .flatMap(([key, schema]: [string, Schema]) => {
-                const baseSchema = schemas['Update' + key] || schemas['New' + key] || schema
-                const idScheme: [PropertyKey, JSONSchemaDefinition][] | undefined = getIdScheme(
-                  baseSchema,
-                  schemas,
-                )
-                const subject = nouns.find((n) => nameToKey(n.name || '') === key)
-                const permissions = (
-                  subject?.permissions || ['create', 'read', 'update', 'list', 'login', 'rateLimit']
-                ).concat(globalPermissions || [])
-                const isId = idScheme?.length === 1 && idScheme[0][0] === 'id'
-                const title = baseSchema.title || ''
-                const retval: [string, Record<string, unknown>][] = []
-                const plural =
-                  (subject?.plural && subject.plural[0].toUpperCase() + subject.plural.slice(1)) ||
-                  title + 's'
-                const nounIsPlural = plural === title
-                let postUsed = false,
-                  patchUsed = false
-                const {
-                  unauthorizedError,
-                  rateError,
-                  notFoundError,
-                }: {
-                  unauthorizedError: object | undefined
-                  rateError: object | undefined
-                  notFoundError: object | undefined
-                } = createErrorTemplates(
-                  errorTemplate,
-                  permissions,
-                  errorMessagePath,
-                  errorCodePath,
-                  title,
-                )
-                // #region Add paths for CRUD operations based on permissions
-                const basePath = `/${nameToKey(plural).toLowerCase()}`
-                if (permissions.includes('list')) {
-                  const wrapperTemplate = _.cloneDeep(globalWrapperTemplate) as Record<
-                    string,
-                    Schema
-                  >
-                  const pathParameters = []
-                  const operationParameters = []
-                  if (databaseEngine === 'Payload') {
-                    const whereSchema: JSONSchemaDefinition = {
-                      type: 'object',
-                      properties: {
-                        and: {
-                          type: 'array',
-                          items: {
-                            $ref: `#/components/schemas/Where${key}`,
-                          },
-                        },
-                        or: {
-                          type: 'array',
-                          items: {
-                            $ref: `#/components/schemas/Where${key}`,
-                          },
-                        },
-                      },
-                    }
-                    for (const [key, value] of Object.entries(baseSchema?.properties || {}) as [
-                      string,
-                      JSONSchema,
-                    ][]) {
-                      if (whereSchema.properties)
-                        whereSchema.properties[key] = {
-                          type: 'object',
-                          properties: {
-                            equals: {
-                              type: value.type,
-                              description: `The ${value.title || 'value'} must be exactly equal.`,
-                            },
-                            not_equals: {
-                              type: value.type,
-                              description: `The query will return all documents where the ${value.title || 'value'} is not equal.`,
-                            },
-                            greater_than: {
-                              type: value.type,
-                              description: `The ${value.title || 'value'} must be greater than.`,
-                            },
-                            greater_than_equal: {
-                              type: value.type,
-                              description: `The ${value.title || 'value'} must be greater than or equal.`,
-                            },
-                            less_than: {
-                              type: value.type,
-                              description: `The ${value.title || 'value'} must be less than.`,
-                            },
-                            less_than_equal: {
-                              type: value.type,
-                              description: `The ${value.title || 'value'} must be less than or equal.`,
-                            },
-                            like: {
-                              type: 'string',
-                              description:
-                                'Case-insensitive string must be present. If string of words, all words must be present, in any order.',
-                            },
-                            contains: {
-                              type: 'string',
-                              description: `Must contain the ${value.title || 'value'} entered, case-insensitive.`,
-                            },
-                            in: {
-                              type: 'string',
-                              description: `The ${value.title || 'value'} must be found within the provided comma-delimited list of values.`,
-                            },
-                            not_in: {
-                              type: 'string',
-                              description: `The ${value.title || 'value'} must NOT be within the provided comma-delimited list of values.`,
-                            },
-                            all: {
-                              type: 'string',
-                              description: `The ${value.title || 'value'} must contain all values provided in the comma-delimited list.`,
-                            },
-                            exists: {
-                              type: 'boolean',
-                              description: `Only return documents where the ${value.title || 'value'} either exists (true) or does not exist (false).`,
-                            },
-                            // near: {
-                            //   type: 'string',
-                            //   description:
-                            //     'For distance related to a point field comma separated as <longitude>, <latitude>, <maxDistance in meters (nullable)>, <minDistance in meters (nullable)>.',
-                            // },
-                          },
-                        }
-                      const whereProperty = whereSchema.properties?.[key] as JSONSchema
-                      if (
-                        whereProperty?.properties &&
-                        value.type !== 'number' &&
-                        value.format !== 'date-time' &&
-                        value.format !== 'date'
-                      ) {
-                        delete whereProperty.properties.greater_than
-                        delete whereProperty.properties.greater_than_equal
-                        delete whereProperty.properties.less_than
-                        delete whereProperty.properties.less_than_equal
-                      }
-                    }
-                    pathParameters.push({
-                      schema: { type: 'integer' },
-                      name: 'depth',
-                      in: 'query',
-                      required: false,
-                      description:
-                        'The number of levels of related objects to include in the response',
-                    })
-                    operationParameters.push(
-                      {
-                        schema: {
-                          type: 'string',
-                        },
-                        in: 'query',
-                        name: 'sort',
-                        description:
-                          'Pass the name of a top-level field to sort by that field in ascending order. Prefix the name of the field with a minus symbol ("-") to sort in descending order.',
-                      },
-                      {
-                        schema: {
-                          type: 'number',
-                        },
-                        in: 'query',
-                        name: 'limit',
-                        description: 'Limit number of results, default 10',
-                      },
-                      {
-                        schema: {
-                          $ref: `#/components/schemas/Where${key}`,
-                        },
-                        in: 'query',
-                        name: 'where',
-                        description:
-                          'Search for results fitting criteria, uses qs library for query string parsing',
-                      },
-                    )
-                    schemas['Where' + key] = whereSchema
-                  }
-                  const filledSchema = fillSchemaTemplate({
-                    schema: {
-                      type: 'array',
-                      items: { $ref: `#/components/schemas/${schema.$id}` },
-                    },
-                    wrapperTemplate,
-                    replacementFieldPath,
-                  })
-                  retval.push([
-                    basePath,
-                    {
-                      parameters: pathParameters?.length ? pathParameters : undefined,
-                      get: {
-                        summary: `Get ${plural}`,
-                        operationId: `get-${nameToKey(plural).toLowerCase()}-list`,
-                        responses: {
-                          '200': {
-                            description: `${plural} Found`,
-                            content: {
-                              'application/json': {
-                                schema:
-                                  databaseEngine === 'Payload'
-                                    ? {
-                                        allOf: [
-                                          filledSchema,
-                                          { $ref: '#/components/schemas/ListModel' },
-                                        ],
-                                      }
-                                    : filledSchema,
-                              },
-                            },
-                          },
-                          '401':
-                            permissions.includes('login') && unauthorizedError
-                              ? {
-                                  description: 'Unauthorized',
-                                  content: {
-                                    'application/json': {
-                                      schema: {
-                                        $ref: '#/components/schemas/ErrorModel',
-                                        examples: [unauthorizedError],
-                                      },
-                                    },
-                                  },
-                                }
-                              : undefined,
-                          '429':
-                            permissions.includes('rateLimit') && rateError
-                              ? {
-                                  description: 'Too Many Requests',
-                                  content: {
-                                    'application/json': {
-                                      schema: {
-                                        $ref: '#/components/schemas/ErrorModel',
-                                        examples: [rateError],
-                                      },
-                                    },
-                                  },
-                                }
-                              : undefined,
-                        },
-                        parameters: operationParameters?.length ? operationParameters : undefined,
-                      },
-                    },
-                  ])
-                }
-                if (permissions.includes('create')) {
-                  const createSchema: JSONSchema | undefined = fillSchemaTemplate({
-                    schema: { $ref: `#/components/schemas/${schema.$id}` },
-                    wrapperTemplate: globalWrapperTemplate as Record<string, Schema>,
-                    replacementFieldPath,
-                  })
-                  postUsed = true
-                  let createError: object | undefined = undefined
-                  if (errorTemplate) {
-                    createError = _.cloneDeep(errorTemplate) as object
-                    _.set(
-                      createError,
-                      errorMessagePath || 'error.message',
-                      'Missing Required Information',
-                    )
-                    _.set(createError, errorCodePath || 'error.code', 400)
-                  }
-
-                  const create = {
-                    summary: `${isId ? 'Create' : 'Add'} ${nounIsPlural ? '' : 'a '}new ${title}`,
-                    operationId: `post-${key.toLowerCase()}`,
-                    responses: {
-                      '200': {
-                        description: `${title} ${isId ? 'Created' : 'Added'}`,
-                        content: {
-                          'application/json': { schema: createSchema },
-                        },
-                      },
-                      '400': createError
-                        ? {
-                            description: 'Missing Required Information',
-                            content: createError
-                              ? {
-                                  'application/json': {
-                                    schema: {
-                                      $ref: '#/components/schemas/ErrorModel',
-                                      examples: [createError],
-                                    },
-                                  },
-                                }
-                              : undefined,
-                          }
-                        : undefined,
-                      '401':
-                        permissions.includes('login') && unauthorizedError
-                          ? {
-                              description: 'Unauthorized',
-                              content: {
-                                'application/json': {
-                                  schema: {
-                                    $ref: '#/components/schemas/ErrorModel',
-                                    examples: [unauthorizedError],
-                                  },
-                                },
-                              },
-                            }
-                          : undefined,
-                      '429':
-                        permissions.includes('rateLimit') && rateError
-                          ? {
-                              description: 'Too Many Requests',
-                              content: {
-                                'application/json': {
-                                  schema: {
-                                    $ref: '#/components/schemas/ErrorModel',
-                                    examples: [rateError],
-                                  },
-                                },
-                              },
-                            }
-                          : undefined,
-                    },
-                    requestBody: {
-                      content: {
-                        'application/json': {
-                          schema: {
-                            $ref: `#/components/schemas/${(schemas['New' + key] || schema).$id}`,
-                          },
-                        },
-                      },
-                    },
-                  }
-
-                  if (retval[retval.length - 1]?.[0] === basePath)
-                    retval[retval.length - 1][1].post = create
-                  else {
-                    const parameters = []
-                    if (databaseEngine === 'Payload') {
-                      parameters.push({
-                        schema: { type: 'integer' },
-                        name: 'depth',
-                        in: 'query',
-                        required: false,
-                        description:
-                          'The number of levels of related objects to include in the response',
-                      })
-                    }
-                    retval.push([
-                      basePath,
-                      { parameters: parameters?.length ? parameters : undefined, post: create },
-                    ])
-                  }
-                }
-                if (
-                  permissions.includes('read') ||
-                  permissions.includes('update') ||
-                  permissions.includes('delete')
-                ) {
-                  const parameters =
-                    (idScheme?.length &&
-                      idScheme.map((id) => ({
-                        schema: { type: (id[1] as JSONSchema).type },
-                        name: id[0],
-                        in: 'path',
-                        required: true,
-                        description: (id[1] as JSONSchema).description,
-                      }))) ||
-                    []
-                  if (databaseEngine === 'Payload') {
-                    parameters.push({
-                      schema: { type: 'integer' },
-                      name: 'depth',
-                      in: 'query',
-                      required: false,
-                      description:
-                        'The number of levels of related objects to include in the response',
-                    })
-                  }
-                  retval.push([
-                    `${basePath}/${idScheme?.map((i) => `{${i[0].toString()}}`)?.join('/')}`,
-                    {
-                      parameters: parameters?.length ? parameters : undefined,
-                    },
-                  ])
-                  if (permissions.includes('read')) {
-                    const readSchema: JSONSchema | undefined = fillSchemaTemplate({
-                      schema: { $ref: `#/components/schemas/${schema.$id}` },
-                      wrapperTemplate: globalWrapperTemplate as Record<string, Schema>,
-                      replacementFieldPath,
-                    })
-                    retval[retval.length - 1][1].get = {
-                      responses: {
-                        '200': {
-                          description: `${title} Found`,
-                          content: {
-                            'application/json': {
-                              schema: readSchema,
-                            },
-                          },
-                        },
-                        '404': notFoundError
-                          ? {
-                              description: `${title} Not Found`,
-                              content: {
-                                'application/json': {
-                                  schema: {
-                                    $ref: '#/components/schemas/ErrorModel',
-                                    examples: [notFoundError],
-                                  },
-                                },
-                              },
-                            }
-                          : undefined,
-                        '401':
-                          permissions.includes('login') && unauthorizedError
-                            ? {
-                                description: 'Unauthorized',
-                                content: {
-                                  'application/json': {
-                                    schema: {
-                                      $ref: '#/components/schemas/ErrorModel',
-                                      examples: [unauthorizedError],
-                                    },
-                                  },
-                                },
-                              }
-                            : undefined,
-                        '429':
-                          permissions.includes('rateLimit') && rateError
-                            ? {
-                                description: 'Too Many Requests',
-                                content: {
-                                  'application/json': {
-                                    schema: {
-                                      $ref: '#/components/schemas/ErrorModel',
-                                      examples: [rateError],
-                                    },
-                                  },
-                                },
-                              }
-                            : undefined,
-                      },
-                      summary: `Retrieve ${nounIsPlural ? '' : `a${['A', 'E', 'I', 'O', 'U'].includes(title[0].toUpperCase()) ? 'n ' : ' '}`}${title}`,
-                      operationId: `get-${key.toLowerCase()}`,
-                    }
-                  }
-                  if (permissions.includes('update')) {
-                    const updateSchema: JSONSchema | undefined = fillSchemaTemplate({
-                      schema: { $ref: `#/components/schemas/${schema.$id}` },
-                      wrapperTemplate: globalWrapperTemplate as Record<string, Schema>,
-                      replacementFieldPath,
-                    })
-                    patchUsed = true
-                    retval[retval.length - 1][1].patch = {
-                      responses: {
-                        '200': {
-                          description: `${title} Updated`,
-                          content: {
-                            'application/json': {
-                              schema: updateSchema,
-                            },
-                          },
-                        },
-                        '404': notFoundError
-                          ? {
-                              description: `${title} Not Found`,
-                              content: {
-                                'application/json': {
-                                  schema: {
-                                    $ref: '#/components/schemas/ErrorModel',
-                                    examples: [notFoundError],
-                                  },
-                                },
-                              },
-                            }
-                          : undefined,
-                        '401':
-                          permissions.includes('login') && unauthorizedError
-                            ? {
-                                description: 'Unauthorized',
-                                content: {
-                                  'application/json': {
-                                    schema: {
-                                      $ref: '#/components/schemas/ErrorModel',
-                                      examples: [unauthorizedError],
-                                    },
-                                  },
-                                },
-                              }
-                            : undefined,
-                        '429':
-                          permissions.includes('rateLimit') && rateError
-                            ? {
-                                description: 'Too Many Requests',
-                                content: {
-                                  'application/json': {
-                                    schema: {
-                                      $ref: '#/components/schemas/ErrorModel',
-                                      examples: [rateError],
-                                    },
-                                  },
-                                },
-                              }
-                            : undefined,
-                      },
-                      requestBody: {
-                        content: {
-                          'application/json': {
-                            schema: {
-                              $ref: `#/components/schemas/${(schemas['Update' + key] || schemas['New' + key] || schema).$id}`,
-                            },
-                          },
-                        },
-                      },
-                      summary: `Update ${nounIsPlural ? '' : 'an '}existing ${title}`,
-                      operationId: `patch-${key.toLowerCase()}`,
-                    }
-                  }
-                  if (permissions.includes('delete')) {
-                    const deleteSchema: JSONSchema | undefined = fillSchemaTemplate({
-                      wrapperTemplate: globalWrapperTemplate as Record<string, Schema>,
-                    })
-                    retval[retval.length - 1][1].delete = {
-                      responses: {
-                        '200': {
-                          description: `${title} Deleted`,
-                          content: deleteSchema
-                            ? {
-                                'application/json': {
-                                  schema: deleteSchema,
-                                },
-                              }
-                            : undefined,
-                        },
-                        '404': notFoundError
-                          ? {
-                              description: `${title} Not Found`,
-                              content: {
-                                'application/json': {
-                                  schema: {
-                                    $ref: '#/components/schemas/ErrorModel',
-                                    examples: [notFoundError],
-                                  },
-                                },
-                              },
-                            }
-                          : undefined,
-                        '401':
-                          permissions.includes('login') && unauthorizedError
-                            ? {
-                                description: 'Unauthorized',
-                                content: {
-                                  'application/json': {
-                                    schema: {
-                                      $ref: '#/components/schemas/ErrorModel',
-                                      examples: [unauthorizedError],
-                                    },
-                                  },
-                                },
-                              }
-                            : undefined,
-                        '429':
-                          permissions.includes('rateLimit') && rateError
-                            ? {
-                                description: 'Too Many Requests',
-                                content: {
-                                  'application/json': {
-                                    schema: {
-                                      $ref: '#/components/schemas/ErrorModel',
-                                      examples: [rateError],
-                                    },
-                                  },
-                                },
-                              }
-                            : undefined,
-                      },
-                      summary: `Delete ${nounIsPlural ? '' : 'an '}existing ${title}`,
-                      operationId: `delete-${key.toLowerCase()}`,
-                    }
-                  }
-                }
-                // #endregion
-                removeDuplicateSchemas(patchUsed, schemas, key, replacements, postUsed)
-                return retval
-              }),
-          ),
-          components: {
-            schemas: errorTemplate
-              ? { ...schemas, ErrorModel: createSchemaOf(errorTemplate as object) }
-              : schemas,
-          },
-        })
-        // #endregion
-        // #region Post-processing steps
-
-        // We don't know if a parent new/update schema had been merged until it happens, so use the replacements list to fix references
-        for (const [key, replacement] of replacements) {
-          output = output.replace(new RegExp(key, 'g'), replacement)
-        }
-
-        const parsedOutput = JSON.parse(output)
-
-        const files: Record<string, string> = {}
-        if (databaseEngine === 'Payload') {
-          const componentSchemas = parsedOutput.components?.schemas || {}
-          const payloadCollections: Record<string, Record<string, unknown>> = {}
-
-          for (const noun of nouns.filter((n) => (n as Noun).permissions?.length)) {
-            const key = nameToKey(noun.name || '')
-            const slug = ((noun as Noun).plural || noun.name + 's')?.toLowerCase().replace(/ /g, '-')
-
-            // Merge properties from all schema variants in the parsed OpenAPI output
-            const allProperties: Record<string, any> = {
-              ...(componentSchemas['Update' + key]?.properties || {}),
-              ...(componentSchemas['New' + key]?.properties || {}),
-              ...(componentSchemas[key]?.properties || {}),
-            }
-            if (!Object.keys(allProperties).length) continue
-
-            const fields: Record<string, unknown>[] = []
-            const required = [
-              ...(componentSchemas['Update' + key]?.required || []),
-              ...(componentSchemas['New' + key]?.required || []),
-              ...(componentSchemas[key]?.required || []),
-            ]
-
-            for (const [propName, propDef] of Object.entries(allProperties)) {
-              const field: Record<string, unknown> = { name: propName }
-
-              if (propDef.enum) {
-                field.type = 'select'
-                field.options = (propDef.enum as unknown[]).filter((v: unknown) => v !== null).map((v: unknown) => String(v))
-              } else if (propDef.type === 'boolean') {
-                field.type = 'checkbox'
-              } else if (propDef.type === 'number' || propDef.type === 'integer') {
-                field.type = 'number'
-              } else if (propDef.type === 'array') {
-                const items = propDef.items as Record<string, unknown> | undefined
-                if (items?.$ref) {
-                  const refTarget = (items.$ref as string).split('/').pop() || ''
-                  const refNoun = nouns.find((n) => nameToKey(n.name || '') === refTarget)
-                  field.type = 'relationship'
-                  field.relationTo = ((refNoun as Noun)?.plural || refTarget)?.toLowerCase().replace(/ /g, '-')
-                  field.hasMany = true
-                } else {
-                  field.type = 'json'
-                }
-              } else if (propDef.oneOf) {
-                const refSchema = (propDef.oneOf as Record<string, unknown>[]).find((s: Record<string, unknown>) => s.$ref)
-                if (refSchema?.$ref) {
-                  const refTarget = (refSchema.$ref as string).split('/').pop() || ''
-                  const refNoun = nouns.find((n) => nameToKey(n.name || '') === refTarget)
-                  field.type = 'relationship'
-                  field.relationTo = ((refNoun as Noun)?.plural || refTarget)?.toLowerCase().replace(/ /g, '-')
-                } else {
-                  field.type = 'text'
-                }
-              } else if (propDef.format === 'email') {
-                field.type = 'email'
-              } else if (propDef.format === 'date-time' || propDef.format === 'date') {
-                field.type = 'date'
-              } else {
-                field.type = 'text'
-              }
-
-              if (required.includes(propName)) field.required = true
-              if (propDef.description?.includes('is uniquely identified by')) field.unique = true
-
-              fields.push(field)
-            }
-
-            const refSchemeField = fields.find((f) => f.unique) || fields[0]
-            const permissions = (noun as Noun).permissions || []
-            const access: Record<string, string> = {}
-            if (permissions.includes('create')) access.create = 'authenticated'
-            if (permissions.includes('read')) access.read = 'authenticated'
-            if (permissions.includes('update')) access.update = 'authenticated'
-            if (permissions.includes('delete')) access.delete = 'authenticated'
-
-            const collection: Record<string, unknown> = {
-              slug,
-              labels: { singular: noun.name, plural: (noun as Noun).plural || noun.name + 's' },
-              admin: { useAsTitle: (refSchemeField?.name as string) || 'id' },
-              timestamps: true,
-              fields,
-            }
-            if (Object.keys(access).length) collection.access = access
-            if (permissions.includes('login')) collection.auth = true
-
-            payloadCollections[slug] = collection
-          }
-
-          // Second pass: add join fields for reverse relationships
-          for (const cs of constraintSpans.filter((cs) => (cs.roles as Role[])?.length === 1)) {
-            const constrainedRole = (cs.roles as Role[])[0]
-            const nestedGs = constrainedRole.graphSchema as GraphSchema
-            const gs = graphSchemas.find((s) => s.id === nestedGs?.id) || nestedGs
-            if (!gs || (gs.roles?.docs?.length || 0) !== 2) continue
-
-            const objectRole = gs.roles?.docs?.find((r) => (r as Role).id !== constrainedRole.id) as Role
-            if (!objectRole) continue
-
-            const subjectNoun = constrainedRole.noun?.value as Noun | GraphSchema
-            const objectNoun = objectRole.noun?.value as Noun | GraphSchema
-            if (!subjectNoun?.name || !objectNoun?.name) continue
-
-            const subjectSlug = ((subjectNoun as Noun).plural || subjectNoun.name + 's')?.toLowerCase().replace(/ /g, '-')
-            const objectSlug = ((objectNoun as Noun).plural || objectNoun.name + 's')?.toLowerCase().replace(/ /g, '-')
-
-            const constrainedCollection = payloadCollections[subjectSlug]
-            const joinCollection = payloadCollections[objectSlug]
-            if (!constrainedCollection || !joinCollection) continue
-
-            const constrainedFields = constrainedCollection.fields as Record<string, unknown>[]
-            const relField = constrainedFields.find((f) => f.type === 'relationship' && f.relationTo === objectSlug)
-            if (!relField) continue
-
-            const joinFields = joinCollection.fields as Record<string, unknown>[]
-            const existingJoin = joinFields.find((f) => f.type === 'join' && f.collection === subjectSlug)
-            if (!existingJoin) {
-              joinFields.push({
-                name: subjectSlug,
-                type: 'join',
-                collection: subjectSlug,
-                on: relField.name,
-              })
-            }
-          }
-
-          // Generate TypeScript files from the derived collections
-          for (const [slug, collection] of Object.entries(payloadCollections)) {
-            files[`collections/${slug}.ts`] = generateCollectionTypeScript(slug, collection)
-          }
-        }
-        // Generate XState state machine files
-        for (const smDef of stateMachineDefinitions) {
-          const fullDef = await payload.findByID({
-            collection: 'state-machine-definitions',
-            id: smDef.id,
-            depth: 2,
-          })
-          const statuses = (fullDef.statuses?.docs || []) as any[]
-          if (!statuses.length) continue
-
-          const allTransitions: { from: string; to: string; event: string }[] = []
-          for (const status of statuses) {
-            const statusWithTransitions = await payload.findByID({
-              collection: 'statuses',
-              id: status.id,
-              depth: 2,
-            })
-            const transitions = (statusWithTransitions.transitions?.docs || []) as any[]
-            for (const t of transitions) {
-              const toStatus = typeof t.to === 'string'
-                ? statuses.find((s: any) => s.id === t.to)
-                : t.to
-              const eventType = typeof t.eventType === 'string'
-                ? await payload.findByID({ collection: 'event-types', id: t.eventType })
-                : t.eventType
-              if (toStatus?.name && eventType?.name) {
-                allTransitions.push({
-                  from: status.name,
-                  to: toStatus.name,
-                  event: eventType.name,
-                })
-              }
-            }
-          }
-
-          const states: Record<string, any> = {}
-          for (const status of statuses) {
-            const outgoing = allTransitions.filter(t => t.from === status.name)
-            const on: Record<string, any> = {}
-            for (const t of outgoing) {
-              on[t.event] = { target: t.to }
-            }
-            states[status.name] = Object.keys(on).length ? { on } : {}
-          }
-
-          // Determine initial state: the status with no incoming transitions
-          const statesWithIncoming = new Set(allTransitions.map(t => t.to))
-          const initialStatus = statuses.find(s => !statesWithIncoming.has(s.name)) || statuses[0]
-
-          const nounRef = fullDef.noun as any
-          const nounValue = typeof nounRef?.value === 'string'
-            ? nouns.find(n => n.id === nounRef.value)
-            : nounRef?.value
-          const machineName = (nounValue?.name || 'unknown')
-            .replace(/([A-Z])/g, '-$1')
-            .toLowerCase()
-            .replace(/^-/, '')
-
-          const xstateConfig = {
-            id: machineName,
-            initial: initialStatus.name,
-            states,
-          }
-
-          files[`state-machines/${machineName}.json`] = JSON.stringify(xstateConfig, null, 2)
-
-          // Generate agent tool schemas from unique events
-          const uniqueEvents = new Map<string, { from: string[], to: string[] }>()
-          for (const t of allTransitions) {
-            if (!t.event) continue
-            if (!uniqueEvents.has(t.event)) {
-              uniqueEvents.set(t.event, { from: [], to: [] })
-            }
-            const entry = uniqueEvents.get(t.event)!
-            if (!entry.from.includes(t.from)) entry.from.push(t.from)
-            if (!entry.to.includes(t.to)) entry.to.push(t.to)
-          }
-
-          const tools = Array.from(uniqueEvents.entries()).map(([event, { from, to }]) => ({
-            name: event,
-            description: `Transition from ${from.join(' or ')} to ${to.join(' or ')}`,
-            parameters: {
-              type: 'object' as const,
-              properties: {},
-            },
-          }))
-
-          files[`agents/${machineName}-tools.json`] = JSON.stringify(tools, null, 2)
-
-          // Generate system prompt from readings + state machine
-          const readings = await payload.find({
-            collection: 'readings',
-            pagination: false,
-          }).then((r: any) => r.docs)
-
-          const readingTexts = readings.map((r: any) => r.text).filter(Boolean)
-          const stateNames = statuses.map((s: any) => s.name)
-          const eventNames = Array.from(uniqueEvents.keys())
-
-          const prompt = [
-            `# ${nounValue?.name || 'Agent'} Agent`,
-            '',
-            '## Domain Model',
-            ...readingTexts.map((r: string) => `- ${r}`),
-            '',
-            '## State Machine',
-            `States: ${stateNames.join(', ')}`,
-            '',
-            '## Available Actions',
-            ...eventNames.map(e => {
-              const { from, to } = uniqueEvents.get(e)!
-              return `- **${e}**: ${from.join('/')} → ${to.join('/')}`
-            }),
-            '',
-            '## Current State: {{currentState}}',
-            '',
-            '## Instructions',
-            'You operate within the domain model above. Use the available actions to transition the state machine. Do not take actions outside the defined transitions for the current state.',
-            '',
-          ].join('\n')
-
-          files[`agents/${machineName}-prompt.md`] = prompt
-        }
-
-        if (Object.keys(files).length) parsedOutput.files = files
-
-        data.output = parsedOutput
-
-        // #endregion
       }) as CollectionBeforeChangeHook<Generator>,
     ],
   },
 }
 
 export default Generator
+
+// #region Composable generator functions
+
+async function generateOpenAPI(payload: any, data: any): Promise<any> {
+  const schemas: Record<string, Schema> = {}
+
+  const [graphSchemas, nouns, constraintSpans, examples, jsons] = (await Promise.all([
+    payload
+      .find({ collection: 'graph-schemas', pagination: false, depth: 4 })
+      .then((s: any) => s.docs),
+    payload.find({ collection: 'nouns', pagination: false }).then((n: any) => n.docs),
+    payload
+      .find({
+        collection: 'constraint-spans',
+        pagination: false,
+        depth: 6,
+        where: { 'constraint.kind': { equals: 'UC' } },
+      })
+      .then((cs: any) => cs.docs),
+    payload
+      .find({
+        collection: 'graphs',
+        where: { isExample: { equals: true } },
+        pagination: false,
+      })
+      .then((n: any) => n.docs),
+    payload
+      .find({
+        collection: 'json-examples',
+        where: { verbatim: { equals: true } },
+        pagination: false,
+      })
+      .then((n: any) => n.docs),
+  ])) as [
+    Omit<GraphSchema, 'updatedAt'>[],
+    Omit<Noun | GraphSchema, 'updatedAt'>[],
+    Omit<ConstraintSpan, 'updatedAt'>[],
+    Omit<Graph, 'updatedAt'>[],
+    Omit<JsonExample, 'updatedAt'>[],
+  ]
+  const jsonExamples = Object.fromEntries(
+    jsons.map((j) => [
+      nameToKey((j.noun?.value as Noun | GraphSchema)?.name || ''),
+      j.jsonExample as JSONSchemaType,
+    ]),
+  )
+  // #region Find composite uniqueness schemas
+  const compoundUniqueSchemas = constraintSpans
+    .filter((cs) => {
+      const roles = cs.roles as Role[]
+      if (!roles?.length || roles.length <= 1) return false
+      const firstGsId = typeof roles[0].graphSchema === 'string' ? roles[0].graphSchema : (roles[0].graphSchema as GraphSchema)?.id
+      return roles.every((r) => {
+        const gsId = typeof r.graphSchema === 'string' ? r.graphSchema : (r.graphSchema as GraphSchema)?.id
+        return gsId === firstGsId
+      })
+    })
+    .map((cs) => {
+      const nestedGs = (cs.roles as Role[])[0].graphSchema as GraphSchema
+      const gs = graphSchemas.find((s) => s.id === nestedGs.id) || nestedGs
+      return { gs, cs }
+    })
+  const arrayTypes = compoundUniqueSchemas.filter(
+    ({ gs: cs }) =>
+      !graphSchemas.find((s) =>
+        s.roles?.docs?.find((r) => ((r as Role).noun?.value as GraphSchema)?.id === cs.id),
+      ),
+  )
+  const associationSchemas = compoundUniqueSchemas.filter((cs) => !arrayTypes.includes(cs))
+  // #endregion
+  // #region Add gerunds to noun list and add association tables
+  nouns.push(...associationSchemas.map(({ gs }) => gs))
+  for (const { gs: associationSchema, cs } of associationSchemas) {
+    const key = (associationSchema.name || '').replace(/ /g, '')
+    const jsonExample = jsonExamples[key]
+    schemas['Update' + key] = {
+      $id: 'Update' + key,
+      title: associationSchema.name || '',
+      type: 'object',
+      description:
+        associationSchema.description ||
+        (associationSchema.readings?.docs?.[0] as Reading)?.text?.replace(/- /, ' '),
+    }
+    schemas['New' + key] = {
+      $id: 'New' + key,
+      allOf: [{ $ref: '#/components/schemas/Update' + key }],
+    }
+    schemas[key] = {
+      $id: key,
+      allOf: [{ $ref: '#/components/schemas/New' + key }],
+    }
+    if (jsonExample) {
+      schemas['Update' + key].examples = [jsonExample]
+      schemas['New' + key].examples = [jsonExample]
+      schemas[key].examples = [jsonExample]
+    }
+    for (const role of associationSchema.roles?.docs || []) {
+      const idNoun = (role as Role).noun?.value as Noun | GraphSchema
+      setTableProperty({
+        tables: schemas,
+        subject: associationSchema,
+        object: idNoun,
+        nouns,
+        required: cs.roles.find((r) => (r as Role).id === (role as Role).id) ? true : false,
+        description: `${associationSchema.name} is uniquely identified by ${idNoun.name}`,
+        property: createProperty({ object: idNoun, tables: schemas, nouns, jsonExamples }),
+        jsonExamples,
+      })
+    }
+  }
+  const nounRegex = nounListToRegex(nouns)
+  // #endregion
+  processBinarySchemas(constraintSpans, schemas, nouns, jsonExamples, nounRegex, examples, graphSchemas)
+  // #region Map association tables with no extra properties to arrays
+  processArraySchemas(arrayTypes, nouns, nounRegex, schemas, jsonExamples)
+  // #endregion
+  processUnarySchemas(graphSchemas, nouns, nounRegex, schemas, jsonExamples, examples)
+  // #region Schema processor
+  // Flatten allOf chains in order to help parsing engines that don't support them
+  const componentSchemas: [string, Schema][] = Object.entries(schemas)
+  for (const [key, schema] of componentSchemas) {
+    while (schema.allOf) {
+      const mergedRequired: string[] = [...(schema.required || [])]
+      let mergedProperties = schema.properties || {}
+      const mergedAllOf: JSONSchemaDefinition[] = []
+      schema.allOf.forEach((s) => {
+        const dependency = schemas[(s as JSONSchema).$ref?.split('/').pop() || '']
+        if (dependency.required?.length)
+          mergedRequired.push(
+            ...dependency.required.filter((f: string) => !mergedRequired.includes(f)),
+          )
+        if (Object.keys(dependency.properties || {}).length)
+          mergedProperties = { ...dependency.properties, ...mergedProperties }
+        if (dependency.allOf?.length) mergedAllOf.push(...dependency.allOf.map((a) => a))
+        if (!schema.title && dependency.title) schema.title = dependency.title
+        if (!schema.description && dependency.description)
+          schema.description = dependency.description
+        if (!schema.type && dependency.type) schema.type = dependency.type
+        if (!schema.examples && Object.keys(dependency.examples || {}).length)
+          schema.examples = dependency.examples
+      })
+      delete schema.allOf
+      if (Object.keys(mergedProperties).length) schema.properties = mergedProperties
+      if (mergedRequired.length) schema.required = mergedRequired
+      if (mergedAllOf.length) schema.allOf = mergedAllOf
+    }
+    schemas[key] = schema
+  }
+
+  const {
+    replacementFieldPath,
+    globalWrapperTemplate,
+    errorTemplate,
+    errorCodePath,
+    errorMessagePath,
+    title,
+    version,
+    email,
+    name,
+    url,
+    description,
+    servers,
+    globalPermissions,
+    databaseEngine,
+  } = data
+
+
+  if (databaseEngine == 'Payload') {
+    schemas['ListModel'] = {
+      properties: {
+        page: {
+          type: 'number',
+          description: 'Current page number',
+          examples: [2],
+        },
+        nextPage: {
+          type: 'number',
+          nullable: true,
+          description: "`number` of next page, `null` if it doesn't exist",
+          examples: [3],
+        },
+        prevPage: {
+          type: 'number',
+          nullable: true,
+          description: "`number` of previous page, `null` if it doesn't exist",
+          examples: [1],
+        },
+        totalPages: {
+          type: 'number',
+          description: 'Total pages available, based upon the `limit`',
+          examples: [3],
+        },
+        totalCount: {
+          type: 'number',
+          description: 'Total available records within the database',
+          examples: [25],
+        },
+        limit: {
+          type: 'number',
+          description: 'Limit query parameter, defaults to `10`',
+          examples: [10],
+        },
+        pagingCounter: {
+          type: 'number',
+          description: '`number` of the first record on the current page',
+          examples: [11],
+        },
+        hasPrevPage: {
+          type: 'boolean',
+          description: '`true/false` if previous page exists',
+          examples: [true],
+        },
+        hasNextPage: {
+          type: 'boolean',
+          description: '`true/false` if next page exists',
+          examples: [true],
+        },
+      },
+    }
+  }
+
+  const replacements: string[][] = []
+  // stringify and parse later to remove undefined values
+  let output = JSON.stringify({
+    openapi: '3.1.0',
+    info: {
+      title: title || undefined,
+      version: version || undefined,
+      contact: {
+        email: email || undefined,
+        name: name || undefined,
+        url: url || undefined,
+      },
+      description: description || undefined,
+    },
+    servers: servers || undefined,
+    paths: Object.fromEntries(
+      Object.entries(schemas)
+        .filter(([key, _schema]) => schemas['Update' + key] || schemas['New' + key])
+        .flatMap(([key, schema]: [string, Schema]) => {
+          const baseSchema = schemas['Update' + key] || schemas['New' + key] || schema
+          const idScheme: [PropertyKey, JSONSchemaDefinition][] | undefined = getIdScheme(
+            baseSchema,
+            schemas,
+          )
+          const subject = nouns.find((n) => nameToKey(n.name || '') === key)
+          const permissions = (
+            subject?.permissions || ['create', 'read', 'update', 'list', 'login', 'rateLimit']
+          ).concat(globalPermissions || [])
+          const isId = idScheme?.length === 1 && idScheme[0][0] === 'id'
+          const title = baseSchema.title || ''
+          const retval: [string, Record<string, unknown>][] = []
+          const plural =
+            (subject?.plural && subject.plural[0].toUpperCase() + subject.plural.slice(1)) ||
+            title + 's'
+          const nounIsPlural = plural === title
+          let postUsed = false,
+            patchUsed = false
+          const {
+            unauthorizedError,
+            rateError,
+            notFoundError,
+          }: {
+            unauthorizedError: object | undefined
+            rateError: object | undefined
+            notFoundError: object | undefined
+          } = createErrorTemplates(
+            errorTemplate,
+            permissions,
+            errorMessagePath,
+            errorCodePath,
+            title,
+          )
+          // #region Add paths for CRUD operations based on permissions
+          const basePath = `/${nameToKey(plural).toLowerCase()}`
+          if (permissions.includes('list')) {
+            const wrapperTemplate = _.cloneDeep(globalWrapperTemplate) as Record<
+              string,
+              Schema
+            >
+            const pathParameters = []
+            const operationParameters = []
+            if (databaseEngine === 'Payload') {
+              const whereSchema: JSONSchemaDefinition = {
+                type: 'object',
+                properties: {
+                  and: {
+                    type: 'array',
+                    items: {
+                      $ref: `#/components/schemas/Where${key}`,
+                    },
+                  },
+                  or: {
+                    type: 'array',
+                    items: {
+                      $ref: `#/components/schemas/Where${key}`,
+                    },
+                  },
+                },
+              }
+              for (const [key, value] of Object.entries(baseSchema?.properties || {}) as [
+                string,
+                JSONSchema,
+              ][]) {
+                if (whereSchema.properties)
+                  whereSchema.properties[key] = {
+                    type: 'object',
+                    properties: {
+                      equals: {
+                        type: value.type,
+                        description: `The ${value.title || 'value'} must be exactly equal.`,
+                      },
+                      not_equals: {
+                        type: value.type,
+                        description: `The query will return all documents where the ${value.title || 'value'} is not equal.`,
+                      },
+                      greater_than: {
+                        type: value.type,
+                        description: `The ${value.title || 'value'} must be greater than.`,
+                      },
+                      greater_than_equal: {
+                        type: value.type,
+                        description: `The ${value.title || 'value'} must be greater than or equal.`,
+                      },
+                      less_than: {
+                        type: value.type,
+                        description: `The ${value.title || 'value'} must be less than.`,
+                      },
+                      less_than_equal: {
+                        type: value.type,
+                        description: `The ${value.title || 'value'} must be less than or equal.`,
+                      },
+                      like: {
+                        type: 'string',
+                        description:
+                          'Case-insensitive string must be present. If string of words, all words must be present, in any order.',
+                      },
+                      contains: {
+                        type: 'string',
+                        description: `Must contain the ${value.title || 'value'} entered, case-insensitive.`,
+                      },
+                      in: {
+                        type: 'string',
+                        description: `The ${value.title || 'value'} must be found within the provided comma-delimited list of values.`,
+                      },
+                      not_in: {
+                        type: 'string',
+                        description: `The ${value.title || 'value'} must NOT be within the provided comma-delimited list of values.`,
+                      },
+                      all: {
+                        type: 'string',
+                        description: `The ${value.title || 'value'} must contain all values provided in the comma-delimited list.`,
+                      },
+                      exists: {
+                        type: 'boolean',
+                        description: `Only return documents where the ${value.title || 'value'} either exists (true) or does not exist (false).`,
+                      },
+                      // near: {
+                      //   type: 'string',
+                      //   description:
+                      //     'For distance related to a point field comma separated as <longitude>, <latitude>, <maxDistance in meters (nullable)>, <minDistance in meters (nullable)>.',
+                      // },
+                    },
+                  }
+                const whereProperty = whereSchema.properties?.[key] as JSONSchema
+                if (
+                  whereProperty?.properties &&
+                  value.type !== 'number' &&
+                  value.format !== 'date-time' &&
+                  value.format !== 'date'
+                ) {
+                  delete whereProperty.properties.greater_than
+                  delete whereProperty.properties.greater_than_equal
+                  delete whereProperty.properties.less_than
+                  delete whereProperty.properties.less_than_equal
+                }
+              }
+              pathParameters.push({
+                schema: { type: 'integer' },
+                name: 'depth',
+                in: 'query',
+                required: false,
+                description:
+                  'The number of levels of related objects to include in the response',
+              })
+              operationParameters.push(
+                {
+                  schema: {
+                    type: 'string',
+                  },
+                  in: 'query',
+                  name: 'sort',
+                  description:
+                    'Pass the name of a top-level field to sort by that field in ascending order. Prefix the name of the field with a minus symbol ("-") to sort in descending order.',
+                },
+                {
+                  schema: {
+                    type: 'number',
+                  },
+                  in: 'query',
+                  name: 'limit',
+                  description: 'Limit number of results, default 10',
+                },
+                {
+                  schema: {
+                    $ref: `#/components/schemas/Where${key}`,
+                  },
+                  in: 'query',
+                  name: 'where',
+                  description:
+                    'Search for results fitting criteria, uses qs library for query string parsing',
+                },
+              )
+              schemas['Where' + key] = whereSchema
+            }
+            const filledSchema = fillSchemaTemplate({
+              schema: {
+                type: 'array',
+                items: { $ref: `#/components/schemas/${schema.$id}` },
+              },
+              wrapperTemplate,
+              replacementFieldPath,
+            })
+            retval.push([
+              basePath,
+              {
+                parameters: pathParameters?.length ? pathParameters : undefined,
+                get: {
+                  summary: `Get ${plural}`,
+                  operationId: `get-${nameToKey(plural).toLowerCase()}-list`,
+                  responses: {
+                    '200': {
+                      description: `${plural} Found`,
+                      content: {
+                        'application/json': {
+                          schema:
+                            databaseEngine === 'Payload'
+                              ? {
+                                  allOf: [
+                                    filledSchema,
+                                    { $ref: '#/components/schemas/ListModel' },
+                                  ],
+                                }
+                              : filledSchema,
+                        },
+                      },
+                    },
+                    '401':
+                      permissions.includes('login') && unauthorizedError
+                        ? {
+                            description: 'Unauthorized',
+                            content: {
+                              'application/json': {
+                                schema: {
+                                  $ref: '#/components/schemas/ErrorModel',
+                                  examples: [unauthorizedError],
+                                },
+                              },
+                            },
+                          }
+                        : undefined,
+                    '429':
+                      permissions.includes('rateLimit') && rateError
+                        ? {
+                            description: 'Too Many Requests',
+                            content: {
+                              'application/json': {
+                                schema: {
+                                  $ref: '#/components/schemas/ErrorModel',
+                                  examples: [rateError],
+                                },
+                              },
+                            },
+                          }
+                        : undefined,
+                  },
+                  parameters: operationParameters?.length ? operationParameters : undefined,
+                },
+              },
+            ])
+          }
+          if (permissions.includes('create')) {
+            const createSchema: JSONSchema | undefined = fillSchemaTemplate({
+              schema: { $ref: `#/components/schemas/${schema.$id}` },
+              wrapperTemplate: globalWrapperTemplate as Record<string, Schema>,
+              replacementFieldPath,
+            })
+            postUsed = true
+            let createError: object | undefined = undefined
+            if (errorTemplate) {
+              createError = _.cloneDeep(errorTemplate) as object
+              _.set(
+                createError,
+                errorMessagePath || 'error.message',
+                'Missing Required Information',
+              )
+              _.set(createError, errorCodePath || 'error.code', 400)
+            }
+
+            const create = {
+              summary: `${isId ? 'Create' : 'Add'} ${nounIsPlural ? '' : 'a '}new ${title}`,
+              operationId: `post-${key.toLowerCase()}`,
+              responses: {
+                '200': {
+                  description: `${title} ${isId ? 'Created' : 'Added'}`,
+                  content: {
+                    'application/json': { schema: createSchema },
+                  },
+                },
+                '400': createError
+                  ? {
+                      description: 'Missing Required Information',
+                      content: createError
+                        ? {
+                            'application/json': {
+                              schema: {
+                                $ref: '#/components/schemas/ErrorModel',
+                                examples: [createError],
+                              },
+                            },
+                          }
+                        : undefined,
+                    }
+                  : undefined,
+                '401':
+                  permissions.includes('login') && unauthorizedError
+                    ? {
+                        description: 'Unauthorized',
+                        content: {
+                          'application/json': {
+                            schema: {
+                              $ref: '#/components/schemas/ErrorModel',
+                              examples: [unauthorizedError],
+                            },
+                          },
+                        },
+                      }
+                    : undefined,
+                '429':
+                  permissions.includes('rateLimit') && rateError
+                    ? {
+                        description: 'Too Many Requests',
+                        content: {
+                          'application/json': {
+                            schema: {
+                              $ref: '#/components/schemas/ErrorModel',
+                              examples: [rateError],
+                            },
+                          },
+                        },
+                      }
+                    : undefined,
+              },
+              requestBody: {
+                content: {
+                  'application/json': {
+                    schema: {
+                      $ref: `#/components/schemas/${(schemas['New' + key] || schema).$id}`,
+                    },
+                  },
+                },
+              },
+            }
+
+            if (retval[retval.length - 1]?.[0] === basePath)
+              retval[retval.length - 1][1].post = create
+            else {
+              const parameters = []
+              if (databaseEngine === 'Payload') {
+                parameters.push({
+                  schema: { type: 'integer' },
+                  name: 'depth',
+                  in: 'query',
+                  required: false,
+                  description:
+                    'The number of levels of related objects to include in the response',
+                })
+              }
+              retval.push([
+                basePath,
+                { parameters: parameters?.length ? parameters : undefined, post: create },
+              ])
+            }
+          }
+          if (
+            permissions.includes('read') ||
+            permissions.includes('update') ||
+            permissions.includes('delete')
+          ) {
+            const parameters =
+              (idScheme?.length &&
+                idScheme.map((id) => ({
+                  schema: { type: (id[1] as JSONSchema).type },
+                  name: id[0],
+                  in: 'path',
+                  required: true,
+                  description: (id[1] as JSONSchema).description,
+                }))) ||
+              []
+            if (databaseEngine === 'Payload') {
+              parameters.push({
+                schema: { type: 'integer' },
+                name: 'depth',
+                in: 'query',
+                required: false,
+                description:
+                  'The number of levels of related objects to include in the response',
+              })
+            }
+            retval.push([
+              `${basePath}/${idScheme?.map((i) => `{${i[0].toString()}}`)?.join('/')}`,
+              {
+                parameters: parameters?.length ? parameters : undefined,
+              },
+            ])
+            if (permissions.includes('read')) {
+              const readSchema: JSONSchema | undefined = fillSchemaTemplate({
+                schema: { $ref: `#/components/schemas/${schema.$id}` },
+                wrapperTemplate: globalWrapperTemplate as Record<string, Schema>,
+                replacementFieldPath,
+              })
+              retval[retval.length - 1][1].get = {
+                responses: {
+                  '200': {
+                    description: `${title} Found`,
+                    content: {
+                      'application/json': {
+                        schema: readSchema,
+                      },
+                    },
+                  },
+                  '404': notFoundError
+                    ? {
+                        description: `${title} Not Found`,
+                        content: {
+                          'application/json': {
+                            schema: {
+                              $ref: '#/components/schemas/ErrorModel',
+                              examples: [notFoundError],
+                            },
+                          },
+                        },
+                      }
+                    : undefined,
+                  '401':
+                    permissions.includes('login') && unauthorizedError
+                      ? {
+                          description: 'Unauthorized',
+                          content: {
+                            'application/json': {
+                              schema: {
+                                $ref: '#/components/schemas/ErrorModel',
+                                examples: [unauthorizedError],
+                              },
+                            },
+                          },
+                        }
+                      : undefined,
+                  '429':
+                    permissions.includes('rateLimit') && rateError
+                      ? {
+                          description: 'Too Many Requests',
+                          content: {
+                            'application/json': {
+                              schema: {
+                                $ref: '#/components/schemas/ErrorModel',
+                                examples: [rateError],
+                              },
+                            },
+                          },
+                        }
+                      : undefined,
+                },
+                summary: `Retrieve ${nounIsPlural ? '' : `a${['A', 'E', 'I', 'O', 'U'].includes(title[0].toUpperCase()) ? 'n ' : ' '}`}${title}`,
+                operationId: `get-${key.toLowerCase()}`,
+              }
+            }
+            if (permissions.includes('update')) {
+              const updateSchema: JSONSchema | undefined = fillSchemaTemplate({
+                schema: { $ref: `#/components/schemas/${schema.$id}` },
+                wrapperTemplate: globalWrapperTemplate as Record<string, Schema>,
+                replacementFieldPath,
+              })
+              patchUsed = true
+              retval[retval.length - 1][1].patch = {
+                responses: {
+                  '200': {
+                    description: `${title} Updated`,
+                    content: {
+                      'application/json': {
+                        schema: updateSchema,
+                      },
+                    },
+                  },
+                  '404': notFoundError
+                    ? {
+                        description: `${title} Not Found`,
+                        content: {
+                          'application/json': {
+                            schema: {
+                              $ref: '#/components/schemas/ErrorModel',
+                              examples: [notFoundError],
+                            },
+                          },
+                        },
+                      }
+                    : undefined,
+                  '401':
+                    permissions.includes('login') && unauthorizedError
+                      ? {
+                          description: 'Unauthorized',
+                          content: {
+                            'application/json': {
+                              schema: {
+                                $ref: '#/components/schemas/ErrorModel',
+                                examples: [unauthorizedError],
+                              },
+                            },
+                          },
+                        }
+                      : undefined,
+                  '429':
+                    permissions.includes('rateLimit') && rateError
+                      ? {
+                          description: 'Too Many Requests',
+                          content: {
+                            'application/json': {
+                              schema: {
+                                $ref: '#/components/schemas/ErrorModel',
+                                examples: [rateError],
+                              },
+                            },
+                          },
+                        }
+                      : undefined,
+                },
+                requestBody: {
+                  content: {
+                    'application/json': {
+                      schema: {
+                        $ref: `#/components/schemas/${(schemas['Update' + key] || schemas['New' + key] || schema).$id}`,
+                      },
+                    },
+                  },
+                },
+                summary: `Update ${nounIsPlural ? '' : 'an '}existing ${title}`,
+                operationId: `patch-${key.toLowerCase()}`,
+              }
+            }
+            if (permissions.includes('delete')) {
+              const deleteSchema: JSONSchema | undefined = fillSchemaTemplate({
+                wrapperTemplate: globalWrapperTemplate as Record<string, Schema>,
+              })
+              retval[retval.length - 1][1].delete = {
+                responses: {
+                  '200': {
+                    description: `${title} Deleted`,
+                    content: deleteSchema
+                      ? {
+                          'application/json': {
+                            schema: deleteSchema,
+                          },
+                        }
+                      : undefined,
+                  },
+                  '404': notFoundError
+                    ? {
+                        description: `${title} Not Found`,
+                        content: {
+                          'application/json': {
+                            schema: {
+                              $ref: '#/components/schemas/ErrorModel',
+                              examples: [notFoundError],
+                            },
+                          },
+                        },
+                      }
+                    : undefined,
+                  '401':
+                    permissions.includes('login') && unauthorizedError
+                      ? {
+                          description: 'Unauthorized',
+                          content: {
+                            'application/json': {
+                              schema: {
+                                $ref: '#/components/schemas/ErrorModel',
+                                examples: [unauthorizedError],
+                              },
+                            },
+                          },
+                        }
+                      : undefined,
+                  '429':
+                    permissions.includes('rateLimit') && rateError
+                      ? {
+                          description: 'Too Many Requests',
+                          content: {
+                            'application/json': {
+                              schema: {
+                                $ref: '#/components/schemas/ErrorModel',
+                                examples: [rateError],
+                              },
+                            },
+                          },
+                        }
+                      : undefined,
+                },
+                summary: `Delete ${nounIsPlural ? '' : 'an '}existing ${title}`,
+                operationId: `delete-${key.toLowerCase()}`,
+              }
+            }
+          }
+          // #endregion
+          removeDuplicateSchemas(patchUsed, schemas, key, replacements, postUsed)
+          return retval
+        }),
+    ),
+    components: {
+      schemas: errorTemplate
+        ? { ...schemas, ErrorModel: createSchemaOf(errorTemplate as object) }
+        : schemas,
+    },
+  })
+  // #endregion
+  // #region Post-processing steps
+
+  // We don't know if a parent new/update schema had been merged until it happens, so use the replacements list to fix references
+  for (const [key, replacement] of replacements) {
+    output = output.replace(new RegExp(key, 'g'), replacement)
+  }
+
+  const parsedOutput = JSON.parse(output)
+
+  return parsedOutput
+}
+
+async function generatePayloadFiles(payload: any, sourceOutput: any): Promise<any> {
+  const componentSchemas = sourceOutput.components?.schemas || {}
+  const nouns = await payload.find({ collection: 'nouns', pagination: false }).then((n: any) => n.docs)
+  const constraintSpans = await payload.find({
+    collection: 'constraint-spans',
+    pagination: false,
+    depth: 6,
+    where: { 'constraint.kind': { equals: 'UC' } },
+  }).then((cs: any) => cs.docs)
+  const graphSchemas = await payload.find({ collection: 'graph-schemas', pagination: false, depth: 4 }).then((s: any) => s.docs)
+
+  const files: Record<string, string> = {}
+  const payloadCollections: Record<string, Record<string, unknown>> = {}
+
+  for (const noun of nouns.filter((n: any) => n.permissions?.length)) {
+    const key = nameToKey(noun.name || '')
+    const slug = (noun.plural || noun.name + 's')?.toLowerCase().replace(/ /g, '-')
+
+    // Merge properties from all schema variants in the parsed OpenAPI output
+    const allProperties: Record<string, any> = {
+      ...(componentSchemas['Update' + key]?.properties || {}),
+      ...(componentSchemas['New' + key]?.properties || {}),
+      ...(componentSchemas[key]?.properties || {}),
+    }
+    if (!Object.keys(allProperties).length) continue
+
+    const fields: Record<string, unknown>[] = []
+    const required = [
+      ...(componentSchemas['Update' + key]?.required || []),
+      ...(componentSchemas['New' + key]?.required || []),
+      ...(componentSchemas[key]?.required || []),
+    ]
+
+    for (const [propName, propDef] of Object.entries(allProperties)) {
+      const field: Record<string, unknown> = { name: propName }
+
+      if (propDef.enum) {
+        field.type = 'select'
+        field.options = (propDef.enum as unknown[]).filter((v: unknown) => v !== null).map((v: unknown) => String(v))
+      } else if (propDef.type === 'boolean') {
+        field.type = 'checkbox'
+      } else if (propDef.type === 'number' || propDef.type === 'integer') {
+        field.type = 'number'
+      } else if (propDef.type === 'array') {
+        const items = propDef.items as Record<string, unknown> | undefined
+        if (items?.$ref) {
+          const refTarget = (items.$ref as string).split('/').pop() || ''
+          const refNoun = nouns.find((n: any) => nameToKey(n.name || '') === refTarget)
+          field.type = 'relationship'
+          field.relationTo = (refNoun?.plural || refTarget)?.toLowerCase().replace(/ /g, '-')
+          field.hasMany = true
+        } else {
+          field.type = 'json'
+        }
+      } else if (propDef.oneOf) {
+        const refSchema = (propDef.oneOf as Record<string, unknown>[]).find((s: Record<string, unknown>) => s.$ref)
+        if (refSchema?.$ref) {
+          const refTarget = (refSchema.$ref as string).split('/').pop() || ''
+          const refNoun = nouns.find((n: any) => nameToKey(n.name || '') === refTarget)
+          field.type = 'relationship'
+          field.relationTo = (refNoun?.plural || refTarget)?.toLowerCase().replace(/ /g, '-')
+        } else {
+          field.type = 'text'
+        }
+      } else if (propDef.format === 'email') {
+        field.type = 'email'
+      } else if (propDef.format === 'date-time' || propDef.format === 'date') {
+        field.type = 'date'
+      } else {
+        field.type = 'text'
+      }
+
+      if (required.includes(propName)) field.required = true
+      if (propDef.description?.includes('is uniquely identified by')) field.unique = true
+
+      fields.push(field)
+    }
+
+    const refSchemeField = fields.find((f) => f.unique) || fields[0]
+    const permissions = noun.permissions || []
+    const access: Record<string, string> = {}
+    if (permissions.includes('create')) access.create = 'authenticated'
+    if (permissions.includes('read')) access.read = 'authenticated'
+    if (permissions.includes('update')) access.update = 'authenticated'
+    if (permissions.includes('delete')) access.delete = 'authenticated'
+
+    const collection: Record<string, unknown> = {
+      slug,
+      labels: { singular: noun.name, plural: noun.plural || noun.name + 's' },
+      admin: { useAsTitle: (refSchemeField?.name as string) || 'id' },
+      timestamps: true,
+      fields,
+    }
+    if (Object.keys(access).length) collection.access = access
+    if (permissions.includes('login')) collection.auth = true
+
+    payloadCollections[slug] = collection
+  }
+
+  // Second pass: add join fields for reverse relationships
+  for (const cs of constraintSpans.filter((cs: any) => (cs.roles as any[])?.length === 1)) {
+    const constrainedRole = (cs.roles as any[])[0]
+    const nestedGs = constrainedRole.graphSchema as GraphSchema
+    const gs = graphSchemas.find((s: any) => s.id === nestedGs?.id) || nestedGs
+    if (!gs || (gs.roles?.docs?.length || 0) !== 2) continue
+
+    const objectRole = gs.roles?.docs?.find((r: any) => r.id !== constrainedRole.id) as any
+    if (!objectRole) continue
+
+    const subjectNoun = constrainedRole.noun?.value as any
+    const objectNoun = objectRole.noun?.value as any
+    if (!subjectNoun?.name || !objectNoun?.name) continue
+
+    const subjectSlug = (subjectNoun.plural || subjectNoun.name + 's')?.toLowerCase().replace(/ /g, '-')
+    const objectSlug = (objectNoun.plural || objectNoun.name + 's')?.toLowerCase().replace(/ /g, '-')
+
+    const constrainedCollection = payloadCollections[subjectSlug]
+    const joinCollection = payloadCollections[objectSlug]
+    if (!constrainedCollection || !joinCollection) continue
+
+    const constrainedFields = constrainedCollection.fields as Record<string, unknown>[]
+    const relField = constrainedFields.find((f) => f.type === 'relationship' && f.relationTo === objectSlug)
+    if (!relField) continue
+
+    const joinFields = joinCollection.fields as Record<string, unknown>[]
+    const existingJoin = joinFields.find((f) => f.type === 'join' && f.collection === subjectSlug)
+    if (!existingJoin) {
+      joinFields.push({
+        name: subjectSlug,
+        type: 'join',
+        collection: subjectSlug,
+        on: relField.name,
+      })
+    }
+  }
+
+  // Generate TypeScript files from the derived collections
+  for (const [slug, collection] of Object.entries(payloadCollections)) {
+    files[`collections/${slug}.ts`] = generateCollectionTypeScript(slug, collection)
+  }
+
+  return { files }
+}
+
+async function generateXStateFiles(payload: any): Promise<any> {
+  const stateMachineDefinitions = await payload.find({
+    collection: 'state-machine-definitions',
+    pagination: false,
+    depth: 0,
+  }).then((s: any) => s.docs)
+  const nouns = await payload.find({ collection: 'nouns', pagination: false }).then((n: any) => n.docs)
+
+  const files: Record<string, string> = {}
+
+  for (const smDef of stateMachineDefinitions) {
+    const fullDef = await payload.findByID({
+      collection: 'state-machine-definitions',
+      id: smDef.id,
+      depth: 2,
+    })
+    const statuses = (fullDef.statuses?.docs || []) as any[]
+    if (!statuses.length) continue
+
+    const allTransitions: { from: string; to: string; event: string }[] = []
+    for (const status of statuses) {
+      const statusWithTransitions = await payload.findByID({
+        collection: 'statuses',
+        id: status.id,
+        depth: 2,
+      })
+      const transitions = (statusWithTransitions.transitions?.docs || []) as any[]
+      for (const t of transitions) {
+        const toStatus = typeof t.to === 'string'
+          ? statuses.find((s: any) => s.id === t.to)
+          : t.to
+        const eventType = typeof t.eventType === 'string'
+          ? await payload.findByID({ collection: 'event-types', id: t.eventType })
+          : t.eventType
+        if (toStatus?.name && eventType?.name) {
+          allTransitions.push({
+            from: status.name,
+            to: toStatus.name,
+            event: eventType.name,
+          })
+        }
+      }
+    }
+
+    const states: Record<string, any> = {}
+    for (const status of statuses) {
+      const outgoing = allTransitions.filter(t => t.from === status.name)
+      const on: Record<string, any> = {}
+      for (const t of outgoing) {
+        on[t.event] = { target: t.to }
+      }
+      states[status.name] = Object.keys(on).length ? { on } : {}
+    }
+
+    // Determine initial state: the status with no incoming transitions
+    const statesWithIncoming = new Set(allTransitions.map(t => t.to))
+    const initialStatus = statuses.find(s => !statesWithIncoming.has(s.name)) || statuses[0]
+
+    const nounRef = fullDef.noun as any
+    const nounValue = typeof nounRef?.value === 'string'
+      ? nouns.find((n: any) => n.id === nounRef.value)
+      : nounRef?.value
+    const machineName = (nounValue?.name || 'unknown')
+      .replace(/([A-Z])/g, '-$1')
+      .toLowerCase()
+      .replace(/^-/, '')
+
+    const xstateConfig = {
+      id: machineName,
+      initial: initialStatus.name,
+      states,
+    }
+
+    files[`state-machines/${machineName}.json`] = JSON.stringify(xstateConfig, null, 2)
+
+    // Generate agent tool schemas from unique events
+    const uniqueEvents = new Map<string, { from: string[], to: string[] }>()
+    for (const t of allTransitions) {
+      if (!t.event) continue
+      if (!uniqueEvents.has(t.event)) {
+        uniqueEvents.set(t.event, { from: [], to: [] })
+      }
+      const entry = uniqueEvents.get(t.event)!
+      if (!entry.from.includes(t.from)) entry.from.push(t.from)
+      if (!entry.to.includes(t.to)) entry.to.push(t.to)
+    }
+
+    const tools = Array.from(uniqueEvents.entries()).map(([event, { from, to }]) => ({
+      name: event,
+      description: `Transition from ${from.join(' or ')} to ${to.join(' or ')}`,
+      parameters: {
+        type: 'object' as const,
+        properties: {},
+      },
+    }))
+
+    files[`agents/${machineName}-tools.json`] = JSON.stringify(tools, null, 2)
+
+    // Generate system prompt from readings + state machine
+    const readings = await payload.find({
+      collection: 'readings',
+      pagination: false,
+    }).then((r: any) => r.docs)
+
+    const readingTexts = readings.map((r: any) => r.text).filter(Boolean)
+    const stateNames = statuses.map((s: any) => s.name)
+    const eventNames = Array.from(uniqueEvents.keys())
+
+    const prompt = [
+      `# ${nounValue?.name || 'Agent'} Agent`,
+      '',
+      '## Domain Model',
+      ...readingTexts.map((r: string) => `- ${r}`),
+      '',
+      '## State Machine',
+      `States: ${stateNames.join(', ')}`,
+      '',
+      '## Available Actions',
+      ...eventNames.map(e => {
+        const { from, to } = uniqueEvents.get(e)!
+        return `- **${e}**: ${from.join('/')} → ${to.join('/')}`
+      }),
+      '',
+      '## Current State: {{currentState}}',
+      '',
+      '## Instructions',
+      'You operate within the domain model above. Use the available actions to transition the state machine. Do not take actions outside the defined transitions for the current state.',
+      '',
+    ].join('\n')
+
+    files[`agents/${machineName}-prompt.md`] = prompt
+  }
+
+  return { files }
+}
+
+// #endregion
 
 function generateCollectionTypeScript(
   slug: string,
