@@ -11,6 +11,7 @@ import ConstraintSpans from './collections/ConstraintSpans'
 import Constraints from './collections/Constraints'
 import EventTypes from './collections/EventTypes'
 import Events from './collections/Events'
+import Functions from './collections/Functions'
 import Generator from './collections/Generator'
 import GraphSchemas from './collections/GraphSchemas'
 import Graphs from './collections/Graphs'
@@ -50,6 +51,7 @@ export default buildConfig({
     ConstraintSpans,
     Nouns,
     Verbs,
+    Functions,
     EventTypes,
     Streams,
     Statuses,
