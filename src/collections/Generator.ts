@@ -1158,7 +1158,12 @@ async function generateXStateFiles(payload: any): Promise<any> {
       id: smDef.id,
       depth: 2,
     })
-    const statuses = (fullDef.statuses?.docs || []) as any[]
+    const statuses = await payload.find({
+      collection: 'statuses',
+      where: { stateMachineDefinition: { equals: smDef.id } },
+      sort: 'createdAt',
+      pagination: false,
+    }).then((s: any) => s.docs)
     if (!statuses.length) continue
 
     const allTransitions: { from: string; to: string; event: string }[] = []
