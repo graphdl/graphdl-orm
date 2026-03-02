@@ -67,4 +67,40 @@ describe('Roles collection', () => {
   })
 
   // ---------------------------------------------------------------------------
+
+  // ---------------------------------------------------------------------------
+  // Role ordering
+  // ---------------------------------------------------------------------------
+  describe('role ordering', () => {
+    it('should create roles in reading text order', async () => {
+      const noun1 = await payload.create({
+        collection: 'nouns',
+        data: { name: 'Alpha', objectType: 'entity', plural: 'alphas' },
+      })
+      const noun2 = await payload.create({
+        collection: 'nouns',
+        data: { name: 'Beta', objectType: 'value', valueType: 'string' },
+      })
+      const gs = await payload.create({
+        collection: 'graph-schemas',
+        data: { name: 'AlphaHasBeta' },
+      })
+      await payload.create({
+        collection: 'readings',
+        data: { text: 'Alpha has Beta', graphSchema: gs.id },
+      })
+      const roles = await payload.find({
+        collection: 'roles',
+        where: { graphSchema: { equals: gs.id } },
+        sort: 'createdAt',
+      })
+      expect(roles.docs.length).toBe(2)
+      const firstNounId = typeof roles.docs[0].noun?.value === 'string' ? roles.docs[0].noun.value : (roles.docs[0].noun?.value as any)?.id
+      const secondNounId = typeof roles.docs[1].noun?.value === 'string' ? roles.docs[1].noun.value : (roles.docs[1].noun?.value as any)?.id
+      expect(firstNounId).toBe(noun1.id)
+      expect(secondNounId).toBe(noun2.id)
+    })
+  })
+
+  // ---------------------------------------------------------------------------
 })
