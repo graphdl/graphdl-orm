@@ -273,6 +273,12 @@ async function generateOpenAPI(payload: any, data: any): Promise<any> {
     }
   }
   const nounRegex = nounListToRegex(nouns)
+
+  // Ensure all entity nouns with permissions have schemas, even those with no readings
+  for (const noun of nouns.filter((n: any) => (n as any).permissions?.length && (n as any).objectType === 'entity')) {
+    ensureTableExists({ tables: schemas, subject: noun, nouns, jsonExamples })
+  }
+
   // #endregion
   processBinarySchemas(constraintSpans, schemas, nouns, jsonExamples, nounRegex, examples, graphSchemas)
   // #region Map association tables with no extra properties to arrays
@@ -1049,6 +1055,17 @@ async function generatePayloadFiles(payload: any, sourceOutput: any): Promise<an
           field.type = 'relationship'
           field.relationTo = (refNoun?.plural || refTarget)?.toLowerCase().replace(/ /g, '-')
           field.hasMany = true
+        } else if (items?.oneOf) {
+          const refSchema = (items.oneOf as Record<string, unknown>[]).find((s: Record<string, unknown>) => s.$ref)
+          if (refSchema?.$ref) {
+            const refTarget = (refSchema.$ref as string).split('/').pop() || ''
+            const refNoun = nouns.find((n: any) => nameToKey(n.name || '') === refTarget)
+            field.type = 'relationship'
+            field.relationTo = (refNoun?.plural || refTarget)?.toLowerCase().replace(/ /g, '-')
+            field.hasMany = true
+          } else {
+            field.type = 'json'
+          }
         } else {
           field.type = 'json'
         }
@@ -1412,7 +1429,7 @@ function processArraySchemas(
       .map((n) => n[0].toUpperCase() + n.slice(1).replace(/-$/, ''))
     predicate.splice(objectBegin, objectReading.length, ...objectReading)
     let propertyName = schema.name || extractPropertyName(objectReading) + (plural ? '' : 's')
-    propertyName = propertyName[0].toLowerCase() + propertyName.slice(1)
+    propertyName = transformPropertyName(propertyName)
 
     ensureTableExists({ tables: schemas, subject, nouns, jsonExamples })
     const key = nameToKey('Update' + (subject.name || ''))
