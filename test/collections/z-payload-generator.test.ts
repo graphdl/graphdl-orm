@@ -111,6 +111,12 @@ describe('Payload Collection Generator', () => {
     expect(tsContent).toContain("name: 'priority'")
   })
 
+  it('should render many-to-many relationships as relationship fields with hasMany', () => {
+    const tsContent = payloadOutput.files['collections/api-products.ts']
+    expect(tsContent).toContain("type: 'relationship'")
+    expect(tsContent).toContain('hasMany: true')
+  })
+
   it('should use correct camelCase for acronym field names', () => {
     const tsContent = payloadOutput.files['collections/customers.ts']
     expect(tsContent).toContain("name: 'apiKey'")
