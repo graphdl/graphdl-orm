@@ -1160,6 +1160,40 @@ const Generator: CollectionConfig = {
           }))
 
           files[`agents/${machineName}-tools.json`] = JSON.stringify(tools, null, 2)
+
+          // Generate system prompt from readings + state machine
+          const readings = await payload.find({
+            collection: 'readings',
+            pagination: false,
+          }).then((r: any) => r.docs)
+
+          const readingTexts = readings.map((r: any) => r.text).filter(Boolean)
+          const stateNames = statuses.map((s: any) => s.name)
+          const eventNames = Array.from(uniqueEvents.keys())
+
+          const prompt = [
+            `# ${nounValue?.name || 'Agent'} Agent`,
+            '',
+            '## Domain Model',
+            ...readingTexts.map((r: string) => `- ${r}`),
+            '',
+            '## State Machine',
+            `States: ${stateNames.join(', ')}`,
+            '',
+            '## Available Actions',
+            ...eventNames.map(e => {
+              const { from, to } = uniqueEvents.get(e)!
+              return `- **${e}**: ${from.join('/')} → ${to.join('/')}`
+            }),
+            '',
+            '## Current State: {{currentState}}',
+            '',
+            '## Instructions',
+            'You operate within the domain model above. Use the available actions to transition the state machine. Do not take actions outside the defined transitions for the current state.',
+            '',
+          ].join('\n')
+
+          files[`agents/${machineName}-prompt.md`] = prompt
         }
 
         if (Object.keys(files).length) parsedOutput.files = files
