@@ -1137,6 +1137,29 @@ const Generator: CollectionConfig = {
           }
 
           files[`state-machines/${machineName}.json`] = JSON.stringify(xstateConfig, null, 2)
+
+          // Generate agent tool schemas from unique events
+          const uniqueEvents = new Map<string, { from: string[], to: string[] }>()
+          for (const t of allTransitions) {
+            if (!t.event) continue
+            if (!uniqueEvents.has(t.event)) {
+              uniqueEvents.set(t.event, { from: [], to: [] })
+            }
+            const entry = uniqueEvents.get(t.event)!
+            if (!entry.from.includes(t.from)) entry.from.push(t.from)
+            if (!entry.to.includes(t.to)) entry.to.push(t.to)
+          }
+
+          const tools = Array.from(uniqueEvents.entries()).map(([event, { from, to }]) => ({
+            name: event,
+            description: `Transition from ${from.join(' or ')} to ${to.join(' or ')}`,
+            parameters: {
+              type: 'object' as const,
+              properties: {},
+            },
+          }))
+
+          files[`agents/${machineName}-tools.json`] = JSON.stringify(tools, null, 2)
         }
 
         if (Object.keys(files).length) parsedOutput.files = files
