@@ -20,6 +20,7 @@ describe('XState Generator', () => {
         title: 'Support State Machines',
         version: '1.0.0',
         databaseEngine: 'Payload',
+        outputFormat: 'xstate',
       },
     })
 
