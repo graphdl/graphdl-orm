@@ -89,6 +89,13 @@ describe('Payload Collection Generator', () => {
     }
   })
 
+  it('should generate .ts collection files in output.files', () => {
+    expect(output.files).toBeDefined()
+    expect(typeof output.files).toBe('object')
+    expect(output.files['collections/support-requests.ts']).toBeDefined()
+    expect(typeof output.files['collections/support-requests.ts']).toBe('string')
+  })
+
   it('should generate valid OpenAPI output alongside Payload collections', () => {
     expect(output.openapi).toBe('3.1.0')
     expect(output.components?.schemas).toBeDefined()
