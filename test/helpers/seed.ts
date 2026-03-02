@@ -109,6 +109,17 @@ export async function seedPersonSchema(payload: Payload) {
     data: { referenceScheme: [orderNumber.id] },
   })
 
+  // Entity with reference scheme but no readings — should still get a schema
+  const gadget = await payload.create({
+    collection: 'nouns',
+    data: { name: 'Gadget', plural: 'gadgets', objectType: 'entity', permissions: ['create', 'read'] },
+  })
+  const gadgetId = await payload.create({
+    collection: 'nouns',
+    data: { name: 'GadgetId', objectType: 'value', valueType: 'string', format: 'uuid' },
+  })
+  await payload.update({ collection: 'nouns', id: gadget.id, data: { referenceScheme: [gadgetId.id] } })
+
   // In v3, create graph-schemas first, then create readings with graphSchema set.
   // The afterChange hook on Readings auto-creates roles.
 

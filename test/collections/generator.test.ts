@@ -114,4 +114,14 @@ describe('Generator collection', () => {
     expect(ordersPath).toBeDefined()
   })
 
+  // ---------------------------------------------------------------------------
+  // Test 4: Entities with reference schemes but no readings still get schemas
+  // ---------------------------------------------------------------------------
+  it('should generate schemas for entities with reference schemes but no readings', () => {
+    const schemas = output.components?.schemas
+    expect(schemas?.Gadget).toBeDefined()
+    // "GadgetId" on subject "Gadget" strips the prefix => property name "id"
+    expect(schemas?.Gadget?.properties?.id).toBeDefined()
+  })
+
 }, 120_000)
