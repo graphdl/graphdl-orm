@@ -160,16 +160,17 @@ describe('GraphSchemas collection', () => {
         },
       })
 
-      // Re-fetch to get the join field populated
-      const fetched = await payload.findByID({
-        collection: 'graph-schemas',
-        id: gs.id,
+      // Fetch roles sorted by createdAt so roleIds[0] matches the hook's roles[0]
+      const rolesResult = await payload.find({
+        collection: 'roles',
+        where: { graphSchema: { equals: gs.id } },
+        sort: 'createdAt',
         depth: 0,
       })
-      const roles = fetched.roles?.docs || []
+      const roles = rolesResult.docs
       expect(roles).toHaveLength(2)
       const roleIds = toIds(roles)
-      return { gs: fetched, roleIds }
+      return { gs, roleIds }
     }
 
     it('many-to-one: creates a UC constraint with a span on role[0]', async () => {
@@ -294,6 +295,58 @@ describe('GraphSchemas collection', () => {
       // The two spans should reference different constraints
       const constraintIds = ourSpans.map((s: any) => typeof s.constraint === 'string' ? s.constraint : s.constraint?.id)
       expect(constraintIds[0]).not.toBe(constraintIds[1])
+    })
+
+    it('should place UC on the subject role for many-to-one', async () => {
+      const entity = await payload.create({
+        collection: 'nouns',
+        data: { name: 'Widget', objectType: 'entity', plural: 'widgets', permissions: ['create', 'read'] },
+      })
+      const value = await payload.create({
+        collection: 'nouns',
+        data: { name: 'WidgetLabel', objectType: 'value', valueType: 'string' },
+      })
+      const gs = await payload.create({
+        collection: 'graph-schemas',
+        data: { name: 'WidgetHasWidgetLabel' },
+      })
+      await payload.create({
+        collection: 'readings',
+        data: { text: 'Widget has WidgetLabel', graphSchema: gs.id },
+      })
+      await payload.update({
+        collection: 'graph-schemas',
+        id: gs.id,
+        data: { roleRelationship: 'many-to-one' },
+      })
+
+      // Fetch the roles for this schema, sorted by createdAt (subject first)
+      const rolesResult = await payload.find({
+        collection: 'roles',
+        where: { graphSchema: { equals: gs.id } },
+        sort: 'createdAt',
+        depth: 1,
+      })
+      expect(rolesResult.docs).toHaveLength(2)
+
+      // roles[0] should be the Widget (subject/entity) role
+      const subjectRole = rolesResult.docs[0]
+      const subjectNounId = typeof subjectRole.noun?.value === 'string' ? subjectRole.noun.value : (subjectRole.noun?.value as any)?.id
+      expect(subjectNounId).toBe(entity.id)
+
+      // The UC constraint span should be on the subject role (Widget), not WidgetLabel
+      const constraintSpans = await payload.find({
+        collection: 'constraint-spans',
+        pagination: false,
+        depth: 0,
+      })
+      const subjectRoleId = subjectRole.id
+      const span = constraintSpans.docs.find((cs: any) => {
+        const spanRoleIds = toIds(Array.isArray(cs.roles) ? cs.roles : [cs.roles])
+        return spanRoleIds.includes(subjectRoleId)
+      })
+      expect(span).toBeDefined()
+      expect(toIds(Array.isArray((span as any).roles) ? (span as any).roles : [(span as any).roles])).toHaveLength(1)
     })
   })
 

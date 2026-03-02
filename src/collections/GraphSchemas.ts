@@ -122,6 +122,7 @@ const GraphSchemas: CollectionConfig = {
                   collection: 'roles',
                   where: { graphSchema: { equals: docId } },
                   depth: 1,
+                  sort: 'createdAt',
                   req,
                 })
                 .then((r) => r.docs)
