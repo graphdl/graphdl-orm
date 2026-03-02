@@ -1,5 +1,6 @@
 import type { GraphSchema, Noun } from '../payload-types'
 import { CollectionConfig } from 'payload'
+import { domainField } from './shared/domainScope'
 
 const Readings: CollectionConfig = {
   slug: 'readings',
@@ -89,6 +90,7 @@ const Readings: CollectionConfig = {
     ],
   },
   fields: [
+    domainField,
     // Bidirectional relationship parent
     {
       name: 'graphSchema',

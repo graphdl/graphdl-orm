@@ -8,6 +8,7 @@ import {
 } from 'json-schema'
 import _ from 'lodash'
 import { CollectionBeforeChangeHook, CollectionConfig } from 'payload'
+import { domainField } from './shared/domainScope'
 import type {
   ConstraintSpan,
   Generator,
@@ -27,6 +28,7 @@ const Generator: CollectionConfig = {
     group: 'Relational Mapping',
   },
   fields: [
+    domainField,
     {
       label: 'Metadata',
       type: 'collapsible',
