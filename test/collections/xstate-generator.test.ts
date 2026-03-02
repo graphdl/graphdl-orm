@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll } from 'vitest'
 import { initPayload } from '../helpers/initPayload'
-import { seedStateMachine } from '../helpers/seed'
+import { seedStateMachine, seedSupportDomain } from '../helpers/seed'
 
 let payload: any
 let output: any
@@ -10,6 +10,8 @@ describe('XState Generator', () => {
     payload = await initPayload()
     await payload.db.connection.dropDatabase()
 
+    // Seed domain readings AND state machine
+    await seedSupportDomain(payload)
     await seedStateMachine(payload)
 
     const generator = await payload.create({
@@ -91,5 +93,23 @@ describe('XState Generator', () => {
     const triageTool = tools.find((t: any) => t.name === 'triage')
     expect(triageTool.description).toContain('Received')
     expect(triageTool.description).toContain('Triaging')
+  })
+
+  it('should generate a system prompt file', () => {
+    const promptFile = Object.entries(output.files).find(([k]) => k.startsWith('agents/') && k.endsWith('-prompt.md'))?.[1] as string
+    expect(promptFile).toBeDefined()
+    expect(typeof promptFile).toBe('string')
+  })
+
+  it('should include domain model from readings in prompt', () => {
+    const promptFile = Object.entries(output.files).find(([k]) => k.startsWith('agents/') && k.endsWith('-prompt.md'))?.[1] as string
+    expect(promptFile).toContain('SupportRequest')
+    expect(promptFile).toContain('Customer')
+  })
+
+  it('should include state machine context in prompt', () => {
+    const promptFile = Object.entries(output.files).find(([k]) => k.startsWith('agents/') && k.endsWith('-prompt.md'))?.[1] as string
+    expect(promptFile).toContain('Received')
+    expect(promptFile).toContain('triage')
   })
 }, 120_000)
