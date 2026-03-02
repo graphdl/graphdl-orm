@@ -1941,8 +1941,21 @@ export function findPredicateObject({
     objectBegin = 0
     objectEnd = objectIndex + 1
   }
-  while (objectIndex > -1 && !predicate[objectBegin].endsWith('-') && objectBegin !== objectIndex)
+  while (objectIndex > -1 && !predicate[objectBegin].endsWith('-') && objectBegin < objectIndex - 1)
     objectBegin++
+  // Skip the last pre-object token only if it's a verb/preposition (not a qualifier)
+  if (objectBegin < objectIndex) {
+    const token = predicate[objectBegin].toLowerCase()
+    const verbsAndPrepositions = [
+      'has', 'is', 'was', 'are', 'were', 'been',
+      'to', 'via', 'from', 'for', 'on', 'of', 'in', 'at', 'by', 'with', 'as',
+      'the', 'a', 'an',
+      'belongs', 'arrives', 'leads', 'sources', 'includes', 'concerns',
+      'submits', 'sends', 'affects', 'involves', 'authenticates',
+      'manufactured', 'connects', 'charges', 'covers', 'data',
+    ]
+    if (verbsAndPrepositions.includes(token)) objectBegin++
+  }
   return { objectBegin, objectEnd }
 }
 

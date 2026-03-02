@@ -206,8 +206,42 @@ export async function seedPersonSchema(payload: Payload) {
     data: { roleRelationship: 'many-to-one' },
   })
 
+  // Qualifier readings — "monthly" and "annual" should produce distinct property names
+  const rate = await payload.create({
+    collection: 'nouns',
+    data: { name: 'Rate', objectType: 'value', valueType: 'number' },
+  })
+
+  const personHasMonthlyRate = await payload.create({
+    collection: 'graph-schemas',
+    data: { name: 'PersonHasMonthlyRate' },
+  })
+  await payload.create({
+    collection: 'readings',
+    data: { text: 'Person has monthly Rate', graphSchema: personHasMonthlyRate.id },
+  })
+  await payload.update({
+    collection: 'graph-schemas',
+    id: personHasMonthlyRate.id,
+    data: { roleRelationship: 'one-to-one' },
+  })
+
+  const personHasAnnualRate = await payload.create({
+    collection: 'graph-schemas',
+    data: { name: 'PersonHasAnnualRate' },
+  })
+  await payload.create({
+    collection: 'readings',
+    data: { text: 'Person has annual Rate', graphSchema: personHasAnnualRate.id },
+  })
+  await payload.update({
+    collection: 'graph-schemas',
+    id: personHasAnnualRate.id,
+    data: { roleRelationship: 'one-to-one' },
+  })
+
   return {
-    nouns: { person, order, personName, age, orderNumber },
+    nouns: { person, order, personName, age, orderNumber, rate },
     schemas: { personHasName, personHasAge, personPlacesOrder, orderHasNumber },
   }
 }
