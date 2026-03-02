@@ -65,4 +65,31 @@ describe('XState Generator', () => {
     expect(config.states.Received.on.triage.target).toBe('Triaging')
     expect(config.states.WaitingOnCustomer.on.customerRespond.target).toBe('Investigating')
   })
+
+  it('should generate agent tool schemas', () => {
+    const toolsFile = Object.entries(output.files).find(([k]) => k.startsWith('agents/') && k.endsWith('-tools.json'))?.[1] as string
+    expect(toolsFile).toBeDefined()
+    const tools = JSON.parse(toolsFile)
+    expect(Array.isArray(tools)).toBe(true)
+    expect(tools.length).toBeGreaterThan(0)
+  })
+
+  it('should create a tool for each unique event type', () => {
+    const toolsFile = Object.entries(output.files).find(([k]) => k.startsWith('agents/') && k.endsWith('-tools.json'))?.[1] as string
+    const tools = JSON.parse(toolsFile)
+    const toolNames = tools.map((t: any) => t.name)
+    expect(toolNames).toContain('triage')
+    expect(toolNames).toContain('investigate')
+    expect(toolNames).toContain('requestInfo')
+    expect(toolNames).toContain('customerRespond')
+    expect(toolNames).toContain('resolve')
+  })
+
+  it('should include source and target states in tool descriptions', () => {
+    const toolsFile = Object.entries(output.files).find(([k]) => k.startsWith('agents/') && k.endsWith('-tools.json'))?.[1] as string
+    const tools = JSON.parse(toolsFile)
+    const triageTool = tools.find((t: any) => t.name === 'triage')
+    expect(triageTool.description).toContain('Received')
+    expect(triageTool.description).toContain('Triaging')
+  })
 }, 120_000)
