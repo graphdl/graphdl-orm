@@ -96,6 +96,36 @@ describe('Payload Collection Generator', () => {
     expect(typeof output.files['collections/support-requests.ts']).toBe('string')
   })
 
+  it('should generate valid TypeScript with proper imports and structure', () => {
+    const tsContent = output.files['collections/support-requests.ts']
+    expect(tsContent).toContain("import type { CollectionConfig } from 'payload'")
+    expect(tsContent).toContain('export const SupportRequests: CollectionConfig')
+    expect(tsContent).toContain("slug: 'support-requests'")
+    expect(tsContent).toContain("type: 'text'")
+    // Verify TypeScript syntax uses unquoted keys and single-quoted strings (not JSON double-quotes)
+    expect(tsContent).not.toContain('"slug"')
+    expect(tsContent).not.toContain('"type"')
+    expect(tsContent).not.toContain('"name"')
+  })
+
+  it('should generate .ts files for all entity nouns with permissions', () => {
+    expect(output.files['collections/support-requests.ts']).toBeDefined()
+    expect(output.files['collections/feature-requests.ts']).toBeDefined()
+    expect(output.files['collections/customers.ts']).toBeDefined()
+    expect(output.files['collections/api-products.ts']).toBeDefined()
+  })
+
+  it('should include access control in generated TypeScript', () => {
+    const tsContent = output.files['collections/support-requests.ts']
+    expect(tsContent).toContain('access:')
+    expect(tsContent).toContain('({ req: { user } }) => Boolean(user)')
+  })
+
+  it('should include auth config for login collections', () => {
+    const tsContent = output.files['collections/customers.ts']
+    expect(tsContent).toContain('auth: true')
+  })
+
   it('should generate valid OpenAPI output alongside Payload collections', () => {
     expect(output.openapi).toBe('3.1.0')
     expect(output.components?.schemas).toBeDefined()
