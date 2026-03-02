@@ -1296,7 +1296,7 @@ async function generateXStateFiles(payload: any): Promise<any> {
       return expandedSchemaIds.has(gsId)
     })
 
-    const readingTexts = readings.map((r: any) => r.text).filter(Boolean)
+    const readingTexts = [...new Set(readings.map((r: any) => r.text).filter(Boolean))]
     const stateNames = statuses.map((s: any) => s.name)
     const eventNames = Array.from(uniqueEvents.keys())
 
