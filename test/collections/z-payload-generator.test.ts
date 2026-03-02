@@ -122,4 +122,11 @@ describe('Payload Collection Generator', () => {
     expect(tsContent).toContain("name: 'apiKey'")
     expect(tsContent).not.toContain("name: 'aPIKey'")
   })
+
+  it('should generate join fields for the one-side of 1:* relationships', () => {
+    const tsContent = payloadOutput.files['collections/customers.ts']
+    // The "one" side should have a join field, not a relationship
+    expect(tsContent).toContain("type: 'join'")
+    expect(tsContent).toContain("collection: 'support-requests'")
+  })
 }, 120_000)
