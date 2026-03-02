@@ -19,6 +19,7 @@ import type {
   Resource,
   ResourceRole,
   Role,
+  StateMachineDefinition,
 } from '../payload-types'
 
 const Generator: CollectionConfig = {
@@ -102,7 +103,7 @@ const Generator: CollectionConfig = {
         // #region Retrieve data
         const schemas: Record<string, Schema> = {}
 
-        const [graphSchemas, nouns, constraintSpans, examples, jsons] = (await Promise.all([
+        const [graphSchemas, nouns, constraintSpans, examples, jsons, stateMachineDefinitions] = (await Promise.all([
           payload
             .find({ collection: 'graph-schemas', pagination: false, depth: 4 })
             .then((s) => s.docs),
@@ -129,12 +130,20 @@ const Generator: CollectionConfig = {
               pagination: false,
             })
             .then((n) => n.docs),
+          payload
+            .find({
+              collection: 'state-machine-definitions',
+              pagination: false,
+              depth: 0,
+            })
+            .then((s) => s.docs),
         ])) as [
           Omit<GraphSchema, 'updatedAt'>[],
           Omit<Noun | GraphSchema, 'updatedAt'>[],
           Omit<ConstraintSpan, 'updatedAt'>[],
           Omit<Graph, 'updatedAt'>[],
           Omit<JsonExample, 'updatedAt'>[],
+          Omit<StateMachineDefinition, 'updatedAt'>[],
         ]
         const jsonExamples = Object.fromEntries(
           jsons.map((j) => [
@@ -1063,6 +1072,73 @@ const Generator: CollectionConfig = {
             files[`collections/${slug}.ts`] = generateCollectionTypeScript(slug, collection)
           }
         }
+        // Generate XState state machine files
+        for (const smDef of stateMachineDefinitions) {
+          const fullDef = await payload.findByID({
+            collection: 'state-machine-definitions',
+            id: smDef.id,
+            depth: 2,
+          })
+          const statuses = (fullDef.statuses?.docs || []) as any[]
+          if (!statuses.length) continue
+
+          const allTransitions: { from: string; to: string; event: string }[] = []
+          for (const status of statuses) {
+            const statusWithTransitions = await payload.findByID({
+              collection: 'statuses',
+              id: status.id,
+              depth: 2,
+            })
+            const transitions = (statusWithTransitions.transitions?.docs || []) as any[]
+            for (const t of transitions) {
+              const toStatus = typeof t.to === 'string'
+                ? statuses.find((s: any) => s.id === t.to)
+                : t.to
+              const eventType = typeof t.eventType === 'string'
+                ? await payload.findByID({ collection: 'event-types', id: t.eventType })
+                : t.eventType
+              if (toStatus?.name && eventType?.name) {
+                allTransitions.push({
+                  from: status.name,
+                  to: toStatus.name,
+                  event: eventType.name,
+                })
+              }
+            }
+          }
+
+          const states: Record<string, any> = {}
+          for (const status of statuses) {
+            const outgoing = allTransitions.filter(t => t.from === status.name)
+            const on: Record<string, any> = {}
+            for (const t of outgoing) {
+              on[t.event] = { target: t.to }
+            }
+            states[status.name] = Object.keys(on).length ? { on } : {}
+          }
+
+          // Determine initial state: the status with no incoming transitions
+          const statesWithIncoming = new Set(allTransitions.map(t => t.to))
+          const initialStatus = statuses.find(s => !statesWithIncoming.has(s.name)) || statuses[0]
+
+          const nounRef = fullDef.noun as any
+          const nounValue = typeof nounRef?.value === 'string'
+            ? nouns.find(n => n.id === nounRef.value)
+            : nounRef?.value
+          const machineName = (nounValue?.name || 'unknown')
+            .replace(/([A-Z])/g, '-$1')
+            .toLowerCase()
+            .replace(/^-/, '')
+
+          const xstateConfig = {
+            id: machineName,
+            initial: initialStatus.name,
+            states,
+          }
+
+          files[`state-machines/${machineName}.json`] = JSON.stringify(xstateConfig, null, 2)
+        }
+
         if (Object.keys(files).length) parsedOutput.files = files
 
         data.output = parsedOutput
