@@ -124,4 +124,13 @@ describe('Generator collection', () => {
     expect(schemas?.Gadget?.properties?.id).toBeDefined()
   })
 
+  // ---------------------------------------------------------------------------
+  // Test 5: Qualifier words preserved in property names (monthly/annual)
+  // ---------------------------------------------------------------------------
+  it('should preserve qualifier words in property names (monthly/annual)', () => {
+    const personSchema = output.components?.schemas?.Person || output.components?.schemas?.UpdatePerson
+    expect(personSchema?.properties?.monthlyRate).toBeDefined()
+    expect(personSchema?.properties?.annualRate).toBeDefined()
+  })
+
 }, 120_000)
