@@ -1245,11 +1245,56 @@ async function generateXStateFiles(payload: any): Promise<any> {
 
     files[`agents/${machineName}-tools.json`] = JSON.stringify(tools, null, 2)
 
-    // Generate system prompt from readings + state machine
-    const readings = await payload.find({
+    // Generate system prompt from RELEVANT readings + state machine
+    // 1. Find graph schemas where the machine's entity noun plays a role
+    const nounId = typeof nounRef?.value === 'string' ? nounRef.value : nounRef?.value?.id
+    const allRoles = await payload.find({
+      collection: 'roles',
+      pagination: false,
+      depth: 1,
+    }).then((r: any) => r.docs)
+
+    const directSchemaIds = new Set<string>()
+    const relatedNounIds = new Set<string>()
+    relatedNounIds.add(nounId)
+
+    for (const role of allRoles) {
+      const roleNounId = typeof role.noun?.value === 'string' ? role.noun.value : role.noun?.value?.id
+      const gsId = typeof role.graphSchema === 'string' ? role.graphSchema : role.graphSchema?.id
+      if (roleNounId === nounId && gsId) {
+        directSchemaIds.add(gsId)
+      }
+    }
+
+    // 2. Collect all noun IDs that participate in those schemas
+    for (const role of allRoles) {
+      const gsId = typeof role.graphSchema === 'string' ? role.graphSchema : role.graphSchema?.id
+      if (directSchemaIds.has(gsId)) {
+        const roleNounId = typeof role.noun?.value === 'string' ? role.noun.value : role.noun?.value?.id
+        if (roleNounId) relatedNounIds.add(roleNounId)
+      }
+    }
+
+    // 3. Expand one level — schemas where any related noun participates
+    const expandedSchemaIds = new Set(directSchemaIds)
+    for (const role of allRoles) {
+      const roleNounId = typeof role.noun?.value === 'string' ? role.noun.value : role.noun?.value?.id
+      const gsId = typeof role.graphSchema === 'string' ? role.graphSchema : role.graphSchema?.id
+      if (relatedNounIds.has(roleNounId) && gsId) {
+        expandedSchemaIds.add(gsId)
+      }
+    }
+
+    // 4. Filter readings to those in the expanded schema set
+    const allReadings = await payload.find({
       collection: 'readings',
       pagination: false,
     }).then((r: any) => r.docs)
+
+    const readings = allReadings.filter((r: any) => {
+      const gsId = typeof r.graphSchema === 'string' ? r.graphSchema : r.graphSchema?.id
+      return expandedSchemaIds.has(gsId)
+    })
 
     const readingTexts = readings.map((r: any) => r.text).filter(Boolean)
     const stateNames = statuses.map((s: any) => s.name)
