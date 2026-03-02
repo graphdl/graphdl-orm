@@ -1124,8 +1124,16 @@ async function generatePayloadFiles(payload: any, sourceOutput: any): Promise<an
     const objectRole = gs.roles?.docs?.find((r: any) => r.id !== constrainedRole.id) as any
     if (!objectRole) continue
 
-    const subjectNoun = constrainedRole.noun?.value as any
-    const objectNoun = objectRole.noun?.value as any
+    // Resolve nouns — constrainedRole (from constraint span, depth 6) is populated,
+    // but objectRole (from graph schema join field, depth 4) may only have an ID string.
+    const resolveNoun = (role: any) => {
+      const nounVal = role.noun?.value
+      if (typeof nounVal === 'object' && nounVal?.name) return nounVal
+      const nounId = typeof nounVal === 'string' ? nounVal : nounVal?.id
+      return nounId ? nouns.find((n: any) => n.id === nounId) : undefined
+    }
+    const subjectNoun = resolveNoun(constrainedRole) as any
+    const objectNoun = resolveNoun(objectRole) as any
     if (!subjectNoun?.name || !objectNoun?.name) continue
 
     const subjectSlug = (subjectNoun.plural || subjectNoun.name + 's')?.toLowerCase().replace(/ /g, '-')
@@ -1142,6 +1150,13 @@ async function generatePayloadFiles(payload: any, sourceOutput: any): Promise<an
     const joinFields = joinCollection.fields as Record<string, unknown>[]
     const existingJoin = joinFields.find((f) => f.type === 'join' && f.collection === subjectSlug)
     if (!existingJoin) {
+      // Remove any first-pass relationship field that should be a join instead
+      const existingRelIdx = joinFields.findIndex(
+        (f) => f.type === 'relationship' && f.relationTo === subjectSlug
+      )
+      if (existingRelIdx !== -1) {
+        joinFields.splice(existingRelIdx, 1)
+      }
       joinFields.push({
         name: subjectSlug,
         type: 'join',
