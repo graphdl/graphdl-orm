@@ -196,3 +196,95 @@ export async function seedPersonSchema(payload: Payload) {
     schemas: { personHasName, personHasAge, personPlacesOrder, orderHasNumber },
   }
 }
+
+export async function seedStateMachine(payload: Payload) {
+  // Create the SupportRequest noun (if not already present)
+  let supportRequest = (await payload.find({
+    collection: 'nouns',
+    where: { name: { equals: 'SupportRequest' } },
+  })).docs[0]
+  if (!supportRequest) {
+    supportRequest = await payload.create({
+      collection: 'nouns',
+      data: { name: 'SupportRequest', plural: 'support-requests', objectType: 'entity', permissions: ['create', 'read', 'update', 'list'] },
+    })
+  }
+
+  // Create state machine definition
+  const definition = await payload.create({
+    collection: 'state-machine-definitions',
+    data: { noun: { relationTo: 'nouns', value: supportRequest.id } },
+  })
+
+  // Create statuses
+  const received = await payload.create({
+    collection: 'statuses',
+    data: { name: 'Received', stateMachineDefinition: definition.id },
+  })
+  const triaging = await payload.create({
+    collection: 'statuses',
+    data: { name: 'Triaging', stateMachineDefinition: definition.id },
+  })
+  const investigating = await payload.create({
+    collection: 'statuses',
+    data: { name: 'Investigating', stateMachineDefinition: definition.id },
+  })
+  const waitingOnCustomer = await payload.create({
+    collection: 'statuses',
+    data: { name: 'WaitingOnCustomer', stateMachineDefinition: definition.id },
+  })
+  const resolved = await payload.create({
+    collection: 'statuses',
+    data: { name: 'Resolved', stateMachineDefinition: definition.id },
+  })
+
+  // Create event types
+  const triage = await payload.create({
+    collection: 'event-types',
+    data: { name: 'triage' },
+  })
+  const investigate = await payload.create({
+    collection: 'event-types',
+    data: { name: 'investigate' },
+  })
+  const requestInfo = await payload.create({
+    collection: 'event-types',
+    data: { name: 'requestInfo' },
+  })
+  const customerRespond = await payload.create({
+    collection: 'event-types',
+    data: { name: 'customerRespond' },
+  })
+  const resolve = await payload.create({
+    collection: 'event-types',
+    data: { name: 'resolve' },
+  })
+
+  // Create transitions
+  await payload.create({
+    collection: 'transitions',
+    data: { from: received.id, to: triaging.id, eventType: triage.id },
+  })
+  await payload.create({
+    collection: 'transitions',
+    data: { from: triaging.id, to: investigating.id, eventType: investigate.id },
+  })
+  await payload.create({
+    collection: 'transitions',
+    data: { from: investigating.id, to: waitingOnCustomer.id, eventType: requestInfo.id },
+  })
+  await payload.create({
+    collection: 'transitions',
+    data: { from: waitingOnCustomer.id, to: investigating.id, eventType: customerRespond.id },
+  })
+  await payload.create({
+    collection: 'transitions',
+    data: { from: investigating.id, to: resolved.id, eventType: resolve.id },
+  })
+  await payload.create({
+    collection: 'transitions',
+    data: { from: triaging.id, to: resolved.id, eventType: resolve.id },
+  })
+
+  return { definition, statuses: { received, triaging, investigating, waitingOnCustomer, resolved } }
+}
