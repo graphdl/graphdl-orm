@@ -113,4 +113,15 @@ describe('XState Generator', () => {
     expect(promptFile).toContain('Received')
     expect(promptFile).toContain('triage')
   })
+
+  it('should only include relevant readings in prompt, not all readings', () => {
+    const promptFile = Object.entries(output.files).find(([k]) => k.startsWith('agents/') && k.endsWith('-prompt.md'))?.[1] as string
+    // The prompt should include SupportRequest-related readings
+    expect(promptFile).toContain('SupportRequest has Subject')
+    expect(promptFile).toContain('Customer submits SupportRequest')
+    // Count the reading lines — should be far fewer than total readings in DB
+    const readingLines = promptFile.split('\n').filter((l: string) => l.startsWith('- '))
+    // seedSupportDomain creates ~13 readings. Prompt should have roughly that many, not all.
+    expect(readingLines.length).toBeLessThan(30)
+  })
 }, 120_000)
