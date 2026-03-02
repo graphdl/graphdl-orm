@@ -1,4 +1,5 @@
 import { CollectionConfig } from 'payload'
+import { domainField } from './shared/domainScope'
 
 const StateMachineDefinitions: CollectionConfig = {
   slug: 'state-machine-definitions',
@@ -7,6 +8,7 @@ const StateMachineDefinitions: CollectionConfig = {
     group: 'State Machines',
   },
   fields: [
+    domainField,
     {
       name: 'title',
       type: 'text',

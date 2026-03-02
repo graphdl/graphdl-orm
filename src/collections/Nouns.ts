@@ -1,4 +1,5 @@
 import { CollectionConfig } from 'payload'
+import { domainField } from './shared/domainScope'
 
 const Nouns: CollectionConfig = {
   slug: 'nouns',
@@ -7,6 +8,7 @@ const Nouns: CollectionConfig = {
     group: 'Object-Role Modeling',
   },
   fields: [
+    domainField,
     {
       name: 'name',
       type: 'text',
