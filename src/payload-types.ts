@@ -20,6 +20,7 @@ export interface Config {
     'constraint-spans': ConstraintSpan;
     nouns: Noun;
     verbs: Verb;
+    functions: Function;
     'event-types': EventType;
     streams: Stream;
     statuses: Status;
@@ -87,6 +88,7 @@ export interface Config {
     'constraint-spans': ConstraintSpansSelect<false> | ConstraintSpansSelect<true>;
     nouns: NounsSelect<false> | NounsSelect<true>;
     verbs: VerbsSelect<false> | VerbsSelect<true>;
+    functions: FunctionsSelect<false> | FunctionsSelect<true>;
     'event-types': EventTypesSelect<false> | EventTypesSelect<true>;
     streams: StreamsSelect<false> | StreamsSelect<true>;
     statuses: StatusesSelect<false> | StatusesSelect<true>;
@@ -180,6 +182,14 @@ export interface Generator {
     | boolean
     | null;
   databaseEngine: 'Payload';
+  /**
+   * What this generator produces. OpenAPI is the default.
+   */
+  outputFormat?: ('openapi' | 'payload' | 'xstate') | null;
+  /**
+   * Source generator whose output is used as input. Auto-detected if not set.
+   */
+  sourceGenerator?: (string | null) | Generator;
   output?:
     | {
         [k: string]: unknown;
@@ -481,6 +491,47 @@ export interface Verb {
    * Verb has name.
    */
   name?: string | null;
+  /**
+   * Verb runs Function.
+   */
+  function?: (string | null) | Function;
+  updatedAt: string;
+  createdAt: string;
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "functions".
+ */
+export interface Function {
+  id: string;
+  /**
+   * Function has name.
+   */
+  name: string;
+  /**
+   * Function has FunctionType.
+   */
+  functionType: 'httpCallback' | 'query' | 'agentInvocation' | 'transform';
+  /**
+   * HttpCallback has CallbackUrl.
+   */
+  callbackUrl?: string | null;
+  /**
+   * HttpCallback has HttpMethod.
+   */
+  httpMethod?: ('GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE') | null;
+  /**
+   * Query has QueryText.
+   */
+  queryText?: string | null;
+  /**
+   * AgentInvocation has SystemPrompt.
+   */
+  systemPrompt?: string | null;
+  /**
+   * Transform has TransformExpression.
+   */
+  transformExpression?: string | null;
   updatedAt: string;
   createdAt: string;
 }
@@ -950,6 +1001,10 @@ export interface PayloadLockedDocument {
         value: string | Verb;
       } | null)
     | ({
+        relationTo: 'functions';
+        value: string | Function;
+      } | null)
+    | ({
         relationTo: 'event-types';
         value: string | EventType;
       } | null)
@@ -1062,6 +1117,8 @@ export interface GeneratorsSelect<T extends boolean = true> {
   errorMessagePath?: T;
   errorTemplate?: T;
   databaseEngine?: T;
+  outputFormat?: T;
+  sourceGenerator?: T;
   output?: T;
   updatedAt?: T;
   createdAt?: T;
@@ -1186,6 +1243,22 @@ export interface NounsSelect<T extends boolean = true> {
  */
 export interface VerbsSelect<T extends boolean = true> {
   name?: T;
+  function?: T;
+  updatedAt?: T;
+  createdAt?: T;
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "functions_select".
+ */
+export interface FunctionsSelect<T extends boolean = true> {
+  name?: T;
+  functionType?: T;
+  callbackUrl?: T;
+  httpMethod?: T;
+  queryText?: T;
+  systemPrompt?: T;
+  transformExpression?: T;
   updatedAt?: T;
   createdAt?: T;
 }
