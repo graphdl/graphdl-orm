@@ -96,4 +96,18 @@ describe('Payload Collection Generator', () => {
     expect(payloadOutput.files).toBeDefined()
     expect(payloadOutput.files['collections/support-requests.ts']).toBeDefined()
   })
+
+  it('should not generate collections for value nouns', () => {
+    const valueNounFiles = Object.keys(payloadOutput.files).filter(f =>
+      ['descriptions.ts', 'subjects.ts', 'prioritys.ts', 'bodys.ts', 'names.ts'].some(v => f.endsWith(v))
+    )
+    expect(valueNounFiles).toEqual([])
+  })
+
+  it('should include value-type fields as inline properties on entity collections', () => {
+    const tsContent = payloadOutput.files['collections/support-requests.ts']
+    expect(tsContent).toContain("name: 'subject'")
+    expect(tsContent).toContain("name: 'description'")
+    expect(tsContent).toContain("name: 'priority'")
+  })
 }, 120_000)
