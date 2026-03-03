@@ -6,7 +6,9 @@ export const Users: CollectionConfig = {
     useAsTitle: 'email',
     group: 'Implementations',
   },
-  auth: true,
+  auth: {
+    useAPIKey: true,
+  },
   fields: [
     // Email added by default
     // Add more fields as needed
