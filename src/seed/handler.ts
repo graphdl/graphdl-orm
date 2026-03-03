@@ -455,10 +455,15 @@ async function wireVerbsAndFunctions(
       if (fn.docs.length) {
         functionId = fn.docs[0].id
       } else {
-        const fnData: Record<string, any> = { name: functionName, functionType }
-        if (callbackUrl) fnData.callbackUrl = callbackUrl
-        if (httpMethod) fnData.httpMethod = httpMethod
-        const created = await payload.create({ collection: 'functions', data: fnData })
+        const created = await payload.create({
+          collection: 'functions',
+          data: {
+            name: functionName,
+            functionType: functionType as 'httpCallback' | 'query' | 'agentInvocation' | 'transform',
+            ...(callbackUrl && { callbackUrl }),
+            ...(httpMethod && { httpMethod: httpMethod as 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE' }),
+          },
+        })
         functionId = created.id
       }
 
