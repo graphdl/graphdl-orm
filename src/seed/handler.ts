@@ -147,6 +147,15 @@ export async function seedDomain(
   // ── Batch 3: Readings ──
   await seedReadings(payload, parsed.readings, domainData, result)
 
+  // ── Batch 4: Instance facts as readings (no multiplicity, no roles) ──
+  if (parsed.instanceFacts.length) {
+    const instanceReadings: ReadingDef[] = parsed.instanceFacts.map((text) => ({
+      text,
+      multiplicity: '*:1',
+    }))
+    await seedReadings(payload, instanceReadings, domainData, result)
+  }
+
   return result
 }
 
@@ -311,8 +320,10 @@ export async function seedStateMachine(
     })
 
     // ── Batch: All transitions ──
+    // Track transition IDs per event for verb wiring
+    const transitionsByEvent = new Map<string, string[]>()
     await batch(parsed.transitions, async (t) => {
-      await payload.create({
+      const transition = await payload.create({
         collection: 'transitions',
         data: {
           from: statusMap.get(t.from)!,
@@ -320,7 +331,13 @@ export async function seedStateMachine(
           eventType: eventTypeCache.get(t.event)!,
         },
       })
+      const existing = transitionsByEvent.get(t.event) || []
+      existing.push(transition.id)
+      transitionsByEvent.set(t.event, existing)
     })
+
+    // ── Post-process: Wire verbs and functions from instance-fact readings ──
+    await wireVerbsAndFunctions(payload, uniqueEvents, transitionsByEvent, result)
 
     result.stateMachines++
   } catch (err: any) {
@@ -328,4 +345,117 @@ export async function seedStateMachine(
   }
 
   return result
+}
+
+/**
+ * For each event name, search readings for instance facts that wire verbs to functions:
+ *   "<eventName> runs <FunctionName>"
+ *   "<FunctionName> has FunctionType <value>"
+ *   "<FunctionName> has CallbackUrl <value>"
+ *   "<FunctionName> has HttpMethod <value>"
+ *
+ * Creates Function and Verb records (idempotent), then updates transitions with the verb.
+ */
+async function wireVerbsAndFunctions(
+  payload: Payload,
+  uniqueEvents: string[],
+  transitionsByEvent: Map<string, string[]>,
+  result: SeedResult,
+): Promise<void> {
+  for (const eventName of uniqueEvents) {
+    try {
+      // Search for "<eventName> runs <FunctionName>"
+      const runsReadings = await payload.find({
+        collection: 'readings',
+        where: { text: { like: `${eventName} runs` } },
+        limit: 1,
+      })
+      if (!runsReadings.docs.length) continue
+
+      const runsText = (runsReadings.docs[0] as any).text as string
+      // Extract function name: "eventName runs FunctionName"
+      const runsMatch = runsText.match(/runs\s+(\S+)/)
+      if (!runsMatch) continue
+      const functionName = runsMatch[1]
+
+      // Query for function properties from instance-fact readings
+      const [typeReadings, urlReadings, methodReadings] = await Promise.all([
+        payload.find({
+          collection: 'readings',
+          where: { text: { like: `${functionName} has FunctionType` } },
+          limit: 1,
+        }),
+        payload.find({
+          collection: 'readings',
+          where: { text: { like: `${functionName} has CallbackUrl` } },
+          limit: 1,
+        }),
+        payload.find({
+          collection: 'readings',
+          where: { text: { like: `${functionName} has HttpMethod` } },
+          limit: 1,
+        }),
+      ])
+
+      // Extract values from reading text (last word after the property name)
+      const extractValue = (docs: any[], property: string): string | undefined => {
+        if (!docs.length) return undefined
+        const text = docs[0].text as string
+        const match = text.match(new RegExp(`has\\s+${property}\\s+(.+)$`))
+        return match?.[1]?.trim()
+      }
+
+      const functionType = extractValue(typeReadings.docs, 'FunctionType')
+      if (!functionType) continue // functionType is required
+
+      const callbackUrl = extractValue(urlReadings.docs, 'CallbackUrl')
+      const httpMethod = extractValue(methodReadings.docs, 'HttpMethod')
+
+      // Create Function (idempotent)
+      let fn = await payload.find({
+        collection: 'functions',
+        where: { name: { equals: functionName } },
+        limit: 1,
+      })
+      let functionId: string
+      if (fn.docs.length) {
+        functionId = fn.docs[0].id
+      } else {
+        const fnData: Record<string, any> = { name: functionName, functionType }
+        if (callbackUrl) fnData.callbackUrl = callbackUrl
+        if (httpMethod) fnData.httpMethod = httpMethod
+        const created = await payload.create({ collection: 'functions', data: fnData })
+        functionId = created.id
+      }
+
+      // Create Verb (idempotent)
+      let verb = await payload.find({
+        collection: 'verbs',
+        where: { name: { equals: eventName } },
+        limit: 1,
+      })
+      let verbId: string
+      if (verb.docs.length) {
+        verbId = verb.docs[0].id
+      } else {
+        const created = await payload.create({
+          collection: 'verbs',
+          data: { name: eventName, function: functionId },
+        })
+        verbId = created.id
+      }
+
+      // Update all transitions for this event with the verb
+      const transitionIds = transitionsByEvent.get(eventName) || []
+      for (const transitionId of transitionIds) {
+        await payload.update({
+          collection: 'transitions',
+          id: transitionId,
+          data: { verb: verbId },
+        })
+      }
+    } catch (err: any) {
+      result.errors.push(`verb/function wiring for "${eventName}": ${err.message}`)
+    }
+  }
 }
