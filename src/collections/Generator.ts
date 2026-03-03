@@ -1154,8 +1154,8 @@ async function generatePayloadFiles(payload: any, sourceOutput: any, domainFilte
       }
     }
     const finalFields = optionalValueFields.length >= 3
-      ? [...topLevelFields, { label: 'Details', type: 'collapsible', admin: { initCollapsed: true }, fields: optionalValueFields }]
-      : [...topLevelFields, ...optionalValueFields]
+      ? groupIntoRows([...topLevelFields, { label: 'Details', type: 'collapsible', admin: { initCollapsed: true }, fields: groupIntoRows(optionalValueFields) }])
+      : groupIntoRows([...topLevelFields, ...optionalValueFields])
 
     const collection: Record<string, unknown> = {
       slug,
@@ -1597,6 +1597,42 @@ async function generateMermaidDiagrams(payload: any, domainFilter: Where): Promi
 }
 
 // #endregion
+
+const ROW_ELIGIBLE_TYPES = new Set(['text', 'number', 'select', 'checkbox', 'email', 'date'])
+
+function groupIntoRows(fields: Record<string, unknown>[]): Record<string, unknown>[] {
+  const result: Record<string, unknown>[] = []
+  let buffer: Record<string, unknown>[] = []
+
+  const flush = () => {
+    if (buffer.length >= 2) {
+      // Chunk buffer into groups of 3
+      for (let i = 0; i < buffer.length; i += 3) {
+        const chunk = buffer.slice(i, i + 3)
+        if (chunk.length >= 2) {
+          result.push({ type: 'row', fields: chunk })
+        } else {
+          result.push(...chunk)
+        }
+      }
+    } else {
+      result.push(...buffer)
+    }
+    buffer = []
+  }
+
+  for (const field of fields) {
+    if (ROW_ELIGIBLE_TYPES.has(field.type as string)) {
+      buffer.push(field)
+    } else {
+      flush()
+      result.push(field)
+    }
+  }
+  flush()
+
+  return result
+}
 
 function generateCollectionTypeScript(
   slug: string,
