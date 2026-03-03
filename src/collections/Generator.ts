@@ -1248,7 +1248,7 @@ async function generateXStateFiles(payload: any, domainFilter: Where): Promise<a
 
     // Determine initial state: the status with no incoming transitions
     const statesWithIncoming = new Set(allTransitions.map(t => t.to))
-    const initialStatus = statuses.find(s => !statesWithIncoming.has(s.name)) || statuses[0]
+    const initialStatus = statuses.find((s: any) => !statesWithIncoming.has(s.name)) || statuses[0]
 
     const nounRef = fullDef.noun as any
     const nounValue = typeof nounRef?.value === 'string'
@@ -1341,7 +1341,7 @@ async function generateXStateFiles(payload: any, domainFilter: Where): Promise<a
       return expandedSchemaIds.has(gsId)
     })
 
-    const readingTexts = [...new Set(readings.map((r: any) => r.text).filter(Boolean))]
+    const readingTexts = [...new Set(readings.map((r: any) => r.text).filter(Boolean))] as string[]
     const stateNames = statuses.map((s: any) => s.name)
     const eventNames = Array.from(uniqueEvents.keys())
 
