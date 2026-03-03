@@ -7,8 +7,8 @@ import {
   JSONSchema6TypeName as JSONSchemaTypeName,
 } from 'json-schema'
 import _ from 'lodash'
-import { CollectionBeforeChangeHook, CollectionConfig } from 'payload'
-import { domainField } from './shared/domainScope'
+import { CollectionBeforeChangeHook, CollectionConfig, Where } from 'payload'
+import { buildDomainFilter, domainField } from './shared/domainScope'
 import type {
   ConstraintSpan,
   Generator,
@@ -29,6 +29,14 @@ const Generator: CollectionConfig = {
   },
   fields: [
     domainField,
+    {
+      name: 'domains',
+      type: 'text',
+      hasMany: true,
+      admin: {
+        description: 'Domains to include in generation. Empty = use single domain field or all.',
+      },
+    },
     {
       label: 'Metadata',
       type: 'collapsible',
@@ -125,10 +133,11 @@ const Generator: CollectionConfig = {
         ;(context.internal as string[])?.push('schemas.afterHook')
 
         const outputFormat = data.outputFormat || 'openapi'
+        const domainFilter = buildDomainFilter(data.domains, data.domain)
 
         if (outputFormat === 'openapi') {
           // Run the full existing OpenAPI generation
-          data.output = await generateOpenAPI(payload, data)
+          data.output = await generateOpenAPI(payload, data, domainFilter)
         } else if (outputFormat === 'payload') {
           // Find source: explicit sourceGenerator, or auto-find latest openapi generator
           let sourceOutput: any
@@ -154,9 +163,9 @@ const Generator: CollectionConfig = {
             data.output = { error: 'No source OpenAPI generator found. Create an OpenAPI generator first or set sourceGenerator.' }
             return
           }
-          data.output = await generatePayloadFiles(payload, sourceOutput, data.domain)
+          data.output = await generatePayloadFiles(payload, sourceOutput, domainFilter)
         } else if (outputFormat === 'xstate') {
-          data.output = await generateXStateFiles(payload, data.domain)
+          data.output = await generateXStateFiles(payload, domainFilter)
         }
       }) as CollectionBeforeChangeHook<Generator>,
     ],
@@ -167,9 +176,8 @@ export default Generator
 
 // #region Composable generator functions
 
-async function generateOpenAPI(payload: any, data: any): Promise<any> {
+async function generateOpenAPI(payload: any, data: any, domainFilter: Where): Promise<any> {
   const schemas: Record<string, Schema> = {}
-  const domainFilter = data.domain ? { domain: { equals: data.domain } } : {}
 
   const [graphSchemas, nouns, constraintSpans, examples, jsons] = (await Promise.all([
     payload
@@ -1008,9 +1016,8 @@ async function generateOpenAPI(payload: any, data: any): Promise<any> {
   return parsedOutput
 }
 
-async function generatePayloadFiles(payload: any, sourceOutput: any, domain?: string): Promise<any> {
+async function generatePayloadFiles(payload: any, sourceOutput: any, domainFilter: Where): Promise<any> {
   const componentSchemas = sourceOutput.components?.schemas || {}
-  const domainFilter = domain ? { domain: { equals: domain } } : {}
   const nouns = await payload.find({ collection: 'nouns', pagination: false, where: domainFilter }).then((n: any) => n.docs)
   const constraintSpans = await payload.find({
     collection: 'constraint-spans',
@@ -1179,8 +1186,7 @@ async function generatePayloadFiles(payload: any, sourceOutput: any, domain?: st
   return { files }
 }
 
-async function generateXStateFiles(payload: any, domain?: string): Promise<any> {
-  const domainFilter = domain ? { domain: { equals: domain } } : {}
+async function generateXStateFiles(payload: any, domainFilter: Where): Promise<any> {
   const stateMachineDefinitions = await payload.find({
     collection: 'state-machine-definitions',
     pagination: false,
