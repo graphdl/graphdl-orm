@@ -104,14 +104,6 @@ export function parseDomainMarkdown(markdown: string): DomainParseResult {
       return def
     })
 
-  // Readings
-  const readingLines = findSection(lines, 'Readings[^]*')
-  // Handle multiple readings sections (some domains split by sub-heading)
-  const allReadingLines = lines.filter((_, i) => {
-    // Find all ## Readings sections and their content
-    return false // We'll use a different approach
-  })
-
   // Collect all readings from any section that starts with "## Readings"
   const readings: ReadingDef[] = []
   let inReadingSection = false

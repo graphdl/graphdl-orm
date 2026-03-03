@@ -132,9 +132,9 @@ export async function seedReadings(
       }
 
       const name = r.text.split(' ').map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join('')
-      const schema = await payload.create({ collection: 'graph-schemas', data: { name, ...domainData } })
-      await payload.create({ collection: 'readings', data: { text: r.text, graphSchema: schema.id, ...domainData } })
-      await payload.update({ collection: 'graph-schemas', id: schema.id, data: { roleRelationship: rel } })
+      const schema = await payload.create({ collection: 'graph-schemas', data: { name, title: name, ...domainData } as any })
+      await payload.create({ collection: 'readings', data: { text: r.text, graphSchema: schema.id, ...domainData } as any })
+      await payload.update({ collection: 'graph-schemas', id: schema.id, data: { roleRelationship: rel } as any })
       result.readings++
     } catch (err: any) {
       result.errors.push(`reading "${r.text}": ${err.message}`)
@@ -181,9 +181,9 @@ export async function seedStateMachine(
       await payload.create({
         collection: 'transitions',
         data: {
-          from: statusMap.get(t.from),
-          to: statusMap.get(t.to),
-          eventType: eventTypeCache.get(t.event),
+          from: statusMap.get(t.from)!,
+          to: statusMap.get(t.to)!,
+          eventType: eventTypeCache.get(t.event)!,
         },
       })
     }
