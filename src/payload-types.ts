@@ -144,6 +144,14 @@ export interface UserAuthOperations {
  */
 export interface Generator {
   id: string;
+  /**
+   * Domain this resource belongs to.
+   */
+  domain?: string | null;
+  /**
+   * Domains to include in generation. Empty = use single domain field or all.
+   */
+  domains?: string[] | null;
   title?: string | null;
   version?: string | null;
   email?: string | null;
@@ -241,6 +249,10 @@ export interface JsonExample {
  */
 export interface Noun {
   id: string;
+  /**
+   * Domain this resource belongs to.
+   */
+  domain?: string | null;
   /**
    * schema:Thing has Name.
    */
@@ -362,6 +374,10 @@ export interface Noun {
  */
 export interface StateMachineDefinition {
   id: string;
+  /**
+   * Domain this resource belongs to.
+   */
+  domain?: string | null;
   title?: string | null;
   /**
    * State Machine Definition is for Noun.
@@ -391,6 +407,10 @@ export interface StateMachineDefinition {
  */
 export interface GraphSchema {
   id: string;
+  /**
+   * Domain this resource belongs to.
+   */
+  domain?: string | null;
   /**
    * Graph Schema has Name.
    */
@@ -450,6 +470,10 @@ export interface GraphSchema {
  */
 export interface Reading {
   id: string;
+  /**
+   * Domain this resource belongs to.
+   */
+  domain?: string | null;
   /**
    * Graph Schema has Reading.
    */
@@ -1103,6 +1127,8 @@ export interface PayloadMigration {
  * via the `definition` "generators_select".
  */
 export interface GeneratorsSelect<T extends boolean = true> {
+  domain?: T;
+  domains?: T;
   title?: T;
   version?: T;
   email?: T;
@@ -1141,6 +1167,7 @@ export interface JsonExamplesSelect<T extends boolean = true> {
  * via the `definition` "graph-schemas_select".
  */
 export interface GraphSchemasSelect<T extends boolean = true> {
+  domain?: T;
   name?: T;
   description?: T;
   title?: T;
@@ -1160,6 +1187,7 @@ export interface GraphSchemasSelect<T extends boolean = true> {
  * via the `definition` "readings_select".
  */
 export interface ReadingsSelect<T extends boolean = true> {
+  domain?: T;
   graphSchema?: T;
   text?: T;
   verb?: T;
@@ -1213,6 +1241,7 @@ export interface ConstraintSpansSelect<T extends boolean = true> {
  * via the `definition` "nouns_select".
  */
 export interface NounsSelect<T extends boolean = true> {
+  domain?: T;
   name?: T;
   plural?: T;
   description?: T;
@@ -1301,6 +1330,7 @@ export interface StatusesSelect<T extends boolean = true> {
  * via the `definition` "state-machine-definitions_select".
  */
 export interface StateMachineDefinitionsSelect<T extends boolean = true> {
+  domain?: T;
   title?: T;
   noun?: T;
   statuses?: T;
