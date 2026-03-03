@@ -171,4 +171,11 @@ describe('Payload Collection Generator', () => {
     // The heuristic should prefer 'name' over the unique 'slug'.
     expect(tsContent).toContain("useAsTitle: 'name'")
   })
+
+  it('should generate defaultColumns in admin config', () => {
+    const tsContent = payloadOutput.files['collections/support-requests.ts']
+    expect(tsContent).toContain('defaultColumns:')
+    // defaultColumns should be an array of field names, capped at 5
+    expect(tsContent).toMatch(/defaultColumns:\s*\[/)
+  })
 }, 120_000)

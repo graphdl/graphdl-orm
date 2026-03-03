@@ -1131,10 +1131,17 @@ async function generatePayloadFiles(payload: any, sourceOutput: any, domainFilte
     if (permissions.includes('update')) access.update = 'authenticated'
     if (permissions.includes('delete')) access.delete = 'authenticated'
 
+    // Build defaultColumns: [useAsTitle, ...required non-rel, ...other non-rel], capped at 5
+    const useAsTitleName = (refSchemeField?.name as string) || 'id'
+    const nonRelFields = fields.filter((f) => f.type !== 'relationship' && f.type !== 'join')
+    const requiredNonRel = nonRelFields.filter((f) => f.required && f.name !== useAsTitleName)
+    const otherNonRel = nonRelFields.filter((f) => !f.required && f.name !== useAsTitleName)
+    const defaultColumns = [useAsTitleName, ...requiredNonRel.map((f) => f.name as string), ...otherNonRel.map((f) => f.name as string)].slice(0, 5)
+
     const collection: Record<string, unknown> = {
       slug,
       labels: { singular: noun.name, plural: noun.plural || noun.name + 's' },
-      admin: { useAsTitle: (refSchemeField?.name as string) || 'id' },
+      admin: { useAsTitle: useAsTitleName, defaultColumns },
       timestamps: true,
       fields,
     }
