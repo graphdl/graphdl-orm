@@ -355,13 +355,17 @@ export async function seedStateMachine(
         })
 
         if (matchingTransitions.docs.length) {
-          await payload.create({
-            collection: 'guards',
-            data: {
-              name: t.guard,
-              transition: matchingTransitions.docs[0].id,
-            },
-          })
+          // Split on semicolons — each atomic guard gets its own record
+          const guardTexts = t.guard!.split(';').map((g: string) => g.trim()).filter(Boolean)
+          for (const guardText of guardTexts) {
+            await payload.create({
+              collection: 'guards',
+              data: {
+                name: guardText,
+                transition: matchingTransitions.docs[0].id,
+              },
+            })
+          }
         }
       })
     }
