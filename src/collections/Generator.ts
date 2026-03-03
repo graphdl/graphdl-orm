@@ -1107,6 +1107,12 @@ async function generatePayloadFiles(payload: any, sourceOutput: any, domainFilte
       if (required.includes(propName)) field.required = true
       if (propDef.description?.includes('is uniquely identified by')) field.unique = true
 
+      // Add description from matching noun
+      const matchingNoun = nouns.find((n: any) => nameToKey(n.name || '').toLowerCase() === propName.toLowerCase())
+      if (matchingNoun?.description) {
+        field.admin = { ...(field.admin as Record<string, unknown> || {}), description: matchingNoun.description }
+      }
+
       fields.push(field)
     }
 

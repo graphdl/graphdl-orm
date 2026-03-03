@@ -13,7 +13,14 @@ describe('Payload Collection Generator', () => {
     // Drop database for clean slate
     await payload.db.connection.dropDatabase()
 
-    await seedSupportDomain(payload)
+    const seeded = await seedSupportDomain(payload)
+
+    // Add a description to a noun so we can test field descriptions
+    await payload.update({
+      collection: 'nouns',
+      id: seeded.nouns.priority.id,
+      data: { description: 'The urgency level of a support request' },
+    })
 
     // Create OpenAPI generator (source)
     const openapiGenerator = await payload.create({
@@ -128,5 +135,11 @@ describe('Payload Collection Generator', () => {
     // The "one" side should have a join field, not a relationship
     expect(tsContent).toContain("type: 'join'")
     expect(tsContent).toContain("collection: 'support-requests'")
+  })
+
+  it('should include noun descriptions as field admin descriptions', () => {
+    const tsContent = payloadOutput.files['collections/support-requests.ts']
+    expect(tsContent).toContain('The urgency level of a support request')
+    expect(tsContent).toContain('description:')
   })
 }, 120_000)
