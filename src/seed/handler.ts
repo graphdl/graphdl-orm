@@ -446,7 +446,7 @@ async function wireVerbsAndFunctions(
       const httpMethod = extractValue(methodReadings.docs, 'HttpMethod')
 
       // Create Function (idempotent)
-      let fn = await payload.find({
+      const fn = await payload.find({
         collection: 'functions',
         where: { name: { equals: functionName } },
         limit: 1,
@@ -468,7 +468,7 @@ async function wireVerbsAndFunctions(
       }
 
       // Create Verb (idempotent)
-      let verb = await payload.find({
+      const verb = await payload.find({
         collection: 'verbs',
         where: { name: { equals: eventName } },
         limit: 1,
