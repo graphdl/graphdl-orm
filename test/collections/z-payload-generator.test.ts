@@ -192,4 +192,11 @@ describe('Payload Collection Generator', () => {
     expect(tsContent).toContain("type: 'join'")
     expect(tsContent).toContain('initCollapsed: true')
   })
+
+  it('should wrap optional value fields in a collapsible Details section', () => {
+    const tsContent = payloadOutput.files['collections/support-requests.ts']
+    // SupportRequest has 4+ optional value fields, should be wrapped
+    expect(tsContent).toContain("label: 'Details'")
+    expect(tsContent).toContain("type: 'collapsible'")
+  })
 }, 120_000)

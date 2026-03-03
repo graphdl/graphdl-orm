@@ -1143,12 +1143,26 @@ async function generatePayloadFiles(payload: any, sourceOutput: any, domainFilte
     const otherNonRel = nonRelFields.filter((f) => !f.required && f.name !== useAsTitleName)
     const defaultColumns = [useAsTitleName, ...requiredNonRel.map((f) => f.name as string), ...otherNonRel.map((f) => f.name as string)].slice(0, 5)
 
+    // Partition fields: required + relationship/join stay top-level; optional value fields may be collapsible
+    const topLevelFields: Record<string, unknown>[] = []
+    const optionalValueFields: Record<string, unknown>[] = []
+    for (const f of fields) {
+      if (f.required || f.type === 'relationship' || f.type === 'join') {
+        topLevelFields.push(f)
+      } else {
+        optionalValueFields.push(f)
+      }
+    }
+    const finalFields = optionalValueFields.length >= 3
+      ? [...topLevelFields, { label: 'Details', type: 'collapsible', admin: { initCollapsed: true }, fields: optionalValueFields }]
+      : [...topLevelFields, ...optionalValueFields]
+
     const collection: Record<string, unknown> = {
       slug,
       labels: { singular: noun.name, plural: noun.plural || noun.name + 's' },
       admin: { useAsTitle: useAsTitleName, defaultColumns },
       timestamps: true,
-      fields,
+      fields: finalFields,
     }
     if (Object.keys(access).length) collection.access = access
     if (permissions.includes('login')) collection.auth = true
