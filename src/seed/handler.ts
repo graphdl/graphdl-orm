@@ -336,6 +336,36 @@ export async function seedStateMachine(
       transitionsByEvent.set(t.event, existing)
     })
 
+    // ── Batch: Guards for transitions with guard conditions ──
+    const transitionsWithGuards = parsed.transitions.filter((t) => t.guard)
+    if (transitionsWithGuards.length) {
+      await batch(transitionsWithGuards, async (t) => {
+        const fromId = statusMap.get(t.from)
+        const toId = statusMap.get(t.to)
+        const eventId = eventTypeCache.get(t.event)
+
+        const matchingTransitions = await payload.find({
+          collection: 'transitions',
+          where: {
+            from: { equals: fromId },
+            to: { equals: toId },
+            eventType: { equals: eventId },
+          },
+          limit: 1,
+        })
+
+        if (matchingTransitions.docs.length) {
+          await payload.create({
+            collection: 'guards',
+            data: {
+              name: t.guard,
+              transition: matchingTransitions.docs[0].id,
+            },
+          })
+        }
+      })
+    }
+
     // ── Post-process: Wire verbs and functions from instance-fact readings ──
     await wireVerbsAndFunctions(payload, uniqueEvents, transitionsByEvent, result)
 
