@@ -1256,12 +1256,12 @@ async function generateXStateFiles(payload: any, domainFilter: Where): Promise<a
     }).then((s: any) => s.docs)
     if (!statuses.length) continue
 
-    const allTransitions: { from: string; to: string; event: string }[] = []
+    const allTransitions: { from: string; to: string; event: string; callback?: { url: string; method: string } }[] = []
     for (const status of statuses) {
       const statusWithTransitions = await payload.findByID({
         collection: 'statuses',
         id: status.id,
-        depth: 2,
+        depth: 3,
       })
       const transitions = (statusWithTransitions.transitions?.docs || []) as any[]
       for (const t of transitions) {
@@ -1271,11 +1271,25 @@ async function generateXStateFiles(payload: any, domainFilter: Where): Promise<a
         const eventType = typeof t.eventType === 'string'
           ? await payload.findByID({ collection: 'event-types', id: t.eventType })
           : t.eventType
+        // Resolve verb → function chain for callback metadata
+        let callback: { url: string; method: string } | undefined
+        const verb = typeof t.verb === 'string'
+          ? await payload.findByID({ collection: 'verbs', id: t.verb, depth: 1 })
+          : t.verb
+        if (verb) {
+          const func = typeof verb.function === 'string'
+            ? await payload.findByID({ collection: 'functions', id: verb.function })
+            : verb.function
+          if (func?.callbackUrl) {
+            callback = { url: func.callbackUrl, method: func.httpMethod || 'POST' }
+          }
+        }
         if (toStatus?.name && eventType?.name) {
           allTransitions.push({
             from: status.name,
             to: toStatus.name,
             event: eventType.name,
+            callback,
           })
         }
       }
@@ -1286,7 +1300,11 @@ async function generateXStateFiles(payload: any, domainFilter: Where): Promise<a
       const outgoing = allTransitions.filter(t => t.from === status.name)
       const on: Record<string, any> = {}
       for (const t of outgoing) {
-        on[t.event] = { target: t.to }
+        const transition: Record<string, any> = { target: t.to }
+        if (t.callback) {
+          transition.meta = { callback: t.callback }
+        }
+        on[t.event] = transition
       }
       states[status.name] = Object.keys(on).length ? { on } : {}
     }
