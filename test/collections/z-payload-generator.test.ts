@@ -22,6 +22,27 @@ describe('Payload Collection Generator', () => {
       data: { description: 'The urgency level of a support request' },
     })
 
+    // Add a Category entity with a 'name' text field to test useAsTitle heuristic
+    const category = await payload.create({
+      collection: 'nouns',
+      data: { name: 'Category', plural: 'categories', objectType: 'entity', permissions: ['create', 'read', 'update'] },
+    })
+    const catName = await payload.create({
+      collection: 'nouns',
+      data: { name: 'Name', objectType: 'value', valueType: 'string' },
+    })
+    const catSlug = await payload.create({
+      collection: 'nouns',
+      data: { name: 'Slug', objectType: 'value', valueType: 'string' },
+    })
+    await payload.update({ collection: 'nouns', id: category.id, data: { referenceScheme: [catSlug.id] } })
+    const categoryHasName = await payload.create({ collection: 'graph-schemas', data: { name: 'CategoryHasName' } })
+    await payload.create({ collection: 'readings', data: { text: 'Category has Name', graphSchema: categoryHasName.id } })
+    await payload.update({ collection: 'graph-schemas', id: categoryHasName.id, data: { roleRelationship: 'many-to-one' } })
+    const categoryHasSlug = await payload.create({ collection: 'graph-schemas', data: { name: 'CategoryHasSlug' } })
+    await payload.create({ collection: 'readings', data: { text: 'Category has Slug', graphSchema: categoryHasSlug.id } })
+    await payload.update({ collection: 'graph-schemas', id: categoryHasSlug.id, data: { roleRelationship: 'one-to-one' } })
+
     // Create OpenAPI generator (source)
     const openapiGenerator = await payload.create({
       collection: 'generators',
@@ -141,5 +162,13 @@ describe('Payload Collection Generator', () => {
     const tsContent = payloadOutput.files['collections/support-requests.ts']
     expect(tsContent).toContain('The urgency level of a support request')
     expect(tsContent).toContain('description:')
+  })
+
+  it('should use name field as useAsTitle when available', () => {
+    const tsContent = payloadOutput.files['collections/categories.ts']
+    expect(tsContent).toBeDefined()
+    // Category has both 'name' (text) and 'slug' (unique text).
+    // The heuristic should prefer 'name' over the unique 'slug'.
+    expect(tsContent).toContain("useAsTitle: 'name'")
   })
 }, 120_000)
