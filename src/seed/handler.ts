@@ -11,6 +11,7 @@ const MULT_MAP: Record<string, string> = {
   '1:*': 'one-to-many',
   '*:*': 'many-to-many',
   '1:1': 'one-to-one',
+  'ternary': 'many-to-many',
 }
 
 async function ensureNoun(payload: Payload, data: Record<string, any>): Promise<any> {

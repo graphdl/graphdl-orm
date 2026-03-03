@@ -116,9 +116,16 @@ export function parseDomainMarkdown(markdown: string): DomainParseResult {
       inReadingSection = false
       continue
     }
-    if (inReadingSection && line.includes('|') && !line.match(/^\s*\|[-\s|]+\|\s*$/) && !line.match(/^\s*\|\s*Reading\s*\|/)) {
+    if (inReadingSection && line.includes('|') && !line.match(/^\s*\|[-\s|]+\|\s*$/)) {
       const cells = line.split('|').slice(1, -1).map((c) => c.trim())
-      if (cells.length >= 2 && cells[0]) {
+      // Skip header rows
+      if (cells.some((c) => /^(#|Reading|Multiplicity)$/i.test(c))) continue
+      // Handle 2-column (Reading | Mult) or 3-column (# | Reading | Mult) formats
+      if (cells.length >= 3 && /^\d+$/.test(cells[0])) {
+        const text = cells[1]
+        const mult = cells[2].replace(/\\/g, '')
+        if (text) readings.push({ text, multiplicity: mult })
+      } else if (cells.length >= 2 && cells[0]) {
         const text = cells[0]
         const mult = cells[1].replace(/\\/g, '')
         readings.push({ text, multiplicity: mult })
