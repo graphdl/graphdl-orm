@@ -82,15 +82,16 @@ const WIPE_ORDER = [
 
 export const DELETE = async () => {
   const payload = await getPayload({ config: configPromise })
-  const counts: Record<string, number> = {}
 
-  for (const collection of WIPE_ORDER) {
-    const docs = await payload.find({ collection: collection as any, pagination: false, limit: 10000 })
-    for (const doc of docs.docs) {
-      await payload.delete({ collection: collection as any, id: doc.id })
-    }
-    counts[collection] = docs.docs.length
+  // Drop all collections except users (preserves auth)
+  const db = (payload.db as any).connection
+  const collections = await db.db.listCollections().toArray()
+  const dropped: string[] = []
+  for (const col of collections) {
+    if (col.name === 'users') continue
+    await db.db.dropCollection(col.name)
+    dropped.push(col.name)
   }
 
-  return Response.json({ wiped: counts })
+  return Response.json({ dropped })
 }
