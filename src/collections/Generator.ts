@@ -1116,7 +1116,14 @@ async function generatePayloadFiles(payload: any, sourceOutput: any, domainFilte
       fields.push(field)
     }
 
-    const refSchemeField = fields.find((f) => f.unique) || fields[0]
+    // useAsTitle priority: field named 'name' (text) > 'title' > 'label' > first unique > first required text > first field
+    const refSchemeField =
+      fields.find((f) => f.name === 'name' && f.type === 'text') ||
+      fields.find((f) => f.name === 'title' && f.type === 'text') ||
+      fields.find((f) => f.name === 'label' && f.type === 'text') ||
+      fields.find((f) => f.unique) ||
+      fields.find((f) => f.required && f.type === 'text') ||
+      fields[0]
     const permissions = noun.permissions || []
     const access: Record<string, string> = {}
     if (permissions.includes('create')) access.create = 'authenticated'
