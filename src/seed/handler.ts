@@ -17,7 +17,11 @@ async function batch<T>(
   fn: (item: T) => Promise<void>,
   concurrency = 5,
 ): Promise<void> {
-  for (let i = 0; i < items.length; i += concurrency) {
+  if (!items.length) return
+  // First item runs alone to initialize MongoDB collection + indexes
+  await fn(items[0])
+  // Rest run in parallel batches
+  for (let i = 1; i < items.length; i += concurrency) {
     await Promise.all(items.slice(i, i + concurrency).map(fn))
   }
 }
