@@ -76,7 +76,7 @@ export const POST = async (request: Request) => {
 
 const WIPE_ORDER = [
   'readings', 'graph-schemas', 'roles', 'constraint-spans', 'constraints',
-  'transitions', 'verbs', 'functions', 'statuses', 'event-types', 'state-machine-definitions',
+  'guards', 'guard-runs', 'transitions', 'verbs', 'functions', 'statuses', 'event-types', 'state-machine-definitions',
   'generators', 'graphs', 'json-examples', 'resources', 'resource-roles', 'nouns',
 ]
 
