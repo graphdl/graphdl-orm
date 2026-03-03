@@ -147,7 +147,7 @@ export async function seedReadings(
               return nounName === roleName
             })
             return role?.id
-          }).filter(Boolean)
+          }).filter((id): id is string => !!id)
 
           if (ucRoleIds.length) {
             const constraint = await payload.create({
@@ -157,7 +157,7 @@ export async function seedReadings(
             await payload.create({
               collection: 'constraint-spans',
               data: { constraint: constraint.id, roles: ucRoleIds },
-            })
+            } as any)
           }
         }
       } else {

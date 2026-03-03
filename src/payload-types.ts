@@ -193,7 +193,7 @@ export interface Generator {
   /**
    * What this generator produces. OpenAPI is the default.
    */
-  outputFormat?: ('openapi' | 'payload' | 'xstate') | null;
+  outputFormat?: ('openapi' | 'payload' | 'xstate' | 'mermaid') | null;
   /**
    * Source generator whose output is used as input. Auto-detected if not set.
    */
@@ -972,6 +972,9 @@ export interface User {
   id: string;
   updatedAt: string;
   createdAt: string;
+  enableAPIKey?: boolean | null;
+  apiKey?: string | null;
+  apiKeyIndex?: string | null;
   email: string;
   resetPasswordToken?: string | null;
   resetPasswordExpiration?: string | null;
@@ -1445,6 +1448,9 @@ export interface GuardRunsSelect<T extends boolean = true> {
 export interface UsersSelect<T extends boolean = true> {
   updatedAt?: T;
   createdAt?: T;
+  enableAPIKey?: T;
+  apiKey?: T;
+  apiKeyIndex?: T;
   email?: T;
   resetPasswordToken?: T;
   resetPasswordExpiration?: T;
