@@ -88,6 +88,22 @@ describe('parseDomainMarkdown', () => {
   it('should parse deontic constraints', () => {
     expect(result.deonticConstraints).toEqual(['Support response must not reference internal team structure'])
   })
+
+  it('should parse UC(Role1,Role2) ternary notation', () => {
+    const ternaryMd = `# Test
+## Readings
+| Reading | Multiplicity |
+|---------|-------------|
+| Listing has Price via ListingChannel | UC(Listing,ListingChannel) |
+`
+    const r = parseDomainMarkdown(ternaryMd)
+    expect(r.readings).toHaveLength(1)
+    expect(r.readings[0]).toEqual({
+      text: 'Listing has Price via ListingChannel',
+      multiplicity: 'ternary',
+      ucRoles: ['Listing', 'ListingChannel'],
+    })
+  })
 })
 
 describe('parseStateMachineMarkdown', () => {
@@ -120,6 +136,24 @@ describe('parseFORML2', () => {
   it('should default to *:1 when no multiplicity given', () => {
     const result = parseFORML2('Customer has Name')
     expect(result).toEqual([{ text: 'Customer has Name', multiplicity: '*:1' }])
+  })
+
+  it('should parse UC(Role1,Role2) notation', () => {
+    const result = parseFORML2('Listing has Price via Channel UC(Listing,Channel)')
+    expect(result).toEqual([{
+      text: 'Listing has Price via Channel',
+      multiplicity: 'ternary',
+      ucRoles: ['Listing', 'Channel'],
+    }])
+  })
+
+  it('should parse UC notation with pipe separator', () => {
+    const result = parseFORML2('Listing has Price via Channel | UC(Listing,Channel)')
+    expect(result).toEqual([{
+      text: 'Listing has Price via Channel',
+      multiplicity: 'ternary',
+      ucRoles: ['Listing', 'Channel'],
+    }])
   })
 
   it('should skip comments and blank lines', () => {

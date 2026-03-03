@@ -28,6 +28,7 @@ export interface ValueTypeDef {
 export interface ReadingDef {
   text: string
   multiplicity: string
+  ucRoles?: string[] // For ternary+: explicit UC role names e.g. UC(Listing,ListingChannel)
 }
 
 export interface DomainParseResult {
@@ -41,6 +42,20 @@ export interface DomainParseResult {
 export interface StateMachineParseResult {
   states: string[]
   transitions: { from: string; to: string; event: string; guard?: string }[]
+}
+
+// ─── Multiplicity Parser ────────────────────────────────────────────────────
+
+function parseMultiplicity(raw: string): { multiplicity: string; ucRoles?: string[] } {
+  const cleaned = raw.replace(/\\/g, '')
+  // UC(Role1,Role2,...) notation for ternary+ facts
+  const ucMatch = cleaned.match(/^UC\((.+)\)$/i)
+  if (ucMatch) {
+    const roles = ucMatch[1].split(',').map((r) => r.trim())
+    return { multiplicity: 'ternary', ucRoles: roles }
+  }
+  // Binary shorthand: *:1, 1:*, *:*, 1:1
+  return { multiplicity: cleaned }
 }
 
 // ─── Markdown Table Parser ──────────────────────────────────────────────────
@@ -123,12 +138,12 @@ export function parseDomainMarkdown(markdown: string): DomainParseResult {
       // Handle 2-column (Reading | Mult) or 3-column (# | Reading | Mult) formats
       if (cells.length >= 3 && /^\d+$/.test(cells[0])) {
         const text = cells[1]
-        const mult = cells[2].replace(/\\/g, '')
-        if (text) readings.push({ text, multiplicity: mult })
+        const { multiplicity: mult, ucRoles } = parseMultiplicity(cells[2])
+        if (text) readings.push({ text, multiplicity: mult, ...(ucRoles ? { ucRoles } : {}) })
       } else if (cells.length >= 2 && cells[0]) {
         const text = cells[0]
-        const mult = cells[1].replace(/\\/g, '')
-        readings.push({ text, multiplicity: mult })
+        const { multiplicity: mult, ucRoles } = parseMultiplicity(cells[1])
+        readings.push({ text, multiplicity: mult, ...(ucRoles ? { ucRoles } : {}) })
       }
     }
   }
@@ -185,6 +200,13 @@ export function parseFORML2(text: string): ReadingDef[] {
     .map((line) => line.trim())
     .filter((line) => line && !line.startsWith('#') && !line.startsWith('//'))
     .map((line) => {
+      // Match: "Reading text UC(Role1,Role2)" or "Reading text | UC(Role1,Role2)"
+      const ucPipeMatch = line.match(/^(.+?)\s*\|\s*(UC\(.+\))\s*$/i)
+      if (ucPipeMatch) return { text: ucPipeMatch[1].trim(), ...parseMultiplicity(ucPipeMatch[2]) }
+
+      const ucSpaceMatch = line.match(/^(.+?)\s+(UC\(.+\))\s*$/i)
+      if (ucSpaceMatch) return { text: ucSpaceMatch[1].trim(), ...parseMultiplicity(ucSpaceMatch[2]) }
+
       // Match: "Reading text *:1" or "Reading text | *:1"
       const pipeMatch = line.match(/^(.+?)\s*\|\s*([*1]:[*1])\s*$/)
       if (pipeMatch) return { text: pipeMatch[1].trim(), multiplicity: pipeMatch[2] }
