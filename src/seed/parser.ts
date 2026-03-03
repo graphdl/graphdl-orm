@@ -28,7 +28,8 @@ export interface ValueTypeDef {
 export interface ReadingDef {
   text: string
   multiplicity: string
-  ucRoles?: string[] // For ternary+: explicit UC role names e.g. UC(Listing,ListingChannel)
+  /** Each entry is one UC — a list of role names it spans. Multiple UCs per schema (e.g. 1:1 = two UCs). */
+  ucs?: string[][]
 }
 
 export interface DomainParseResult {
@@ -46,13 +47,13 @@ export interface StateMachineParseResult {
 
 // ─── Multiplicity Parser ────────────────────────────────────────────────────
 
-function parseMultiplicity(raw: string): { multiplicity: string; ucRoles?: string[] } {
-  const cleaned = raw.replace(/\\/g, '')
-  // UC(Role1,Role2,...) notation for ternary+ facts
-  const ucMatch = cleaned.match(/^UC\((.+)\)$/i)
-  if (ucMatch) {
-    const roles = ucMatch[1].split(',').map((r) => r.trim())
-    return { multiplicity: 'ternary', ucRoles: roles }
+function parseMultiplicity(raw: string): { multiplicity: string; ucs?: string[][] } {
+  const cleaned = raw.replace(/\\/g, '').trim()
+  // Multiple UC specs: UC(A,B), UC(A,C)
+  const ucMatches = [...cleaned.matchAll(/UC\(([^)]+)\)/gi)]
+  if (ucMatches.length) {
+    const ucs = ucMatches.map((m) => m[1].split(',').map((r) => r.trim()))
+    return { multiplicity: 'ternary', ucs }
   }
   // Binary shorthand: *:1, 1:*, *:*, 1:1
   return { multiplicity: cleaned }
@@ -138,12 +139,12 @@ export function parseDomainMarkdown(markdown: string): DomainParseResult {
       // Handle 2-column (Reading | Mult) or 3-column (# | Reading | Mult) formats
       if (cells.length >= 3 && /^\d+$/.test(cells[0])) {
         const text = cells[1]
-        const { multiplicity: mult, ucRoles } = parseMultiplicity(cells[2])
-        if (text) readings.push({ text, multiplicity: mult, ...(ucRoles ? { ucRoles } : {}) })
+        const { multiplicity: mult, ucs } = parseMultiplicity(cells[2])
+        if (text) readings.push({ text, multiplicity: mult, ...(ucs ? { ucs } : {}) })
       } else if (cells.length >= 2 && cells[0]) {
         const text = cells[0]
-        const { multiplicity: mult, ucRoles } = parseMultiplicity(cells[1])
-        readings.push({ text, multiplicity: mult, ...(ucRoles ? { ucRoles } : {}) })
+        const { multiplicity: mult, ucs } = parseMultiplicity(cells[1])
+        readings.push({ text, multiplicity: mult, ...(ucs ? { ucs } : {}) })
       }
     }
   }
@@ -200,11 +201,11 @@ export function parseFORML2(text: string): ReadingDef[] {
     .map((line) => line.trim())
     .filter((line) => line && !line.startsWith('#') && !line.startsWith('//'))
     .map((line) => {
-      // Match: "Reading text UC(Role1,Role2)" or "Reading text | UC(Role1,Role2)"
-      const ucPipeMatch = line.match(/^(.+?)\s*\|\s*(UC\(.+\))\s*$/i)
+      // Match: "Reading text UC(...)" or "Reading text | UC(...)" (possibly multiple)
+      const ucPipeMatch = line.match(/^(.+?)\s*\|\s*(UC\(.+)$/i)
       if (ucPipeMatch) return { text: ucPipeMatch[1].trim(), ...parseMultiplicity(ucPipeMatch[2]) }
 
-      const ucSpaceMatch = line.match(/^(.+?)\s+(UC\(.+\))\s*$/i)
+      const ucSpaceMatch = line.match(/^(.+?)\s+(UC\(.+)$/i)
       if (ucSpaceMatch) return { text: ucSpaceMatch[1].trim(), ...parseMultiplicity(ucSpaceMatch[2]) }
 
       // Match: "Reading text *:1" or "Reading text | *:1"

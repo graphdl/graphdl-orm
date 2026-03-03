@@ -130,33 +130,35 @@ export async function seedReadings(
       const schema = await payload.create({ collection: 'graph-schemas', data: { name, title: name, ...domainData } as any })
       await payload.create({ collection: 'readings', data: { text: r.text, graphSchema: schema.id, ...domainData } as any })
 
-      if (r.ucRoles?.length) {
-        // Ternary+ fact: create explicit UC constraint spanning named roles
-        // Wait for role auto-creation, then find the roles by noun name
+      if (r.ucs?.length) {
+        // Explicit UC constraints (ternary+ or multiple UCs like 1:1)
+        // Fetch roles created by the reading hook
         const roles = await payload.find({
           collection: 'roles',
           where: { graphSchema: { equals: schema.id } },
           depth: 2,
           pagination: false,
         })
-        const ucRoleIds = r.ucRoles.map((roleName) => {
-          const role = roles.docs.find((role: any) => {
-            const noun = role.noun
-            const nounName = typeof noun === 'string' ? null : noun?.value?.name || noun?.name
-            return nounName === roleName
-          })
-          return role?.id
-        }).filter(Boolean)
+        for (const ucRoleNames of r.ucs) {
+          const ucRoleIds = ucRoleNames.map((roleName) => {
+            const role = roles.docs.find((role: any) => {
+              const noun = role.noun
+              const nounName = typeof noun === 'string' ? null : noun?.value?.name || noun?.name
+              return nounName === roleName
+            })
+            return role?.id
+          }).filter(Boolean)
 
-        if (ucRoleIds.length >= 2) {
-          const constraint = await payload.create({
-            collection: 'constraints',
-            data: { kind: 'UC', modality: 'Alethic' },
-          })
-          await payload.create({
-            collection: 'constraint-spans',
-            data: { constraint: constraint.id, roles: ucRoleIds },
-          })
+          if (ucRoleIds.length) {
+            const constraint = await payload.create({
+              collection: 'constraints',
+              data: { kind: 'UC', modality: 'Alethic' },
+            })
+            await payload.create({
+              collection: 'constraint-spans',
+              data: { constraint: constraint.id, roles: ucRoleIds },
+            })
+          }
         }
       } else {
         // Binary fact: use roleRelationship shortcut
