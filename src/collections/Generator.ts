@@ -182,11 +182,12 @@ export default Generator
 async function generateOpenAPI(payload: any, data: any, domainFilter: Where): Promise<any> {
   const schemas: Record<string, Schema> = {}
 
-  const [graphSchemas, nouns, constraintSpans, examples, jsons] = (await Promise.all([
+  const [graphSchemas, nouns, domainNouns, constraintSpans, examples, jsons] = (await Promise.all([
     payload
       .find({ collection: 'graph-schemas', pagination: false, depth: 4, where: domainFilter })
       .then((s: any) => s.docs),
-    payload.find({ collection: 'nouns', pagination: false, where: domainFilter }).then((n: any) => n.docs),
+    payload.find({ collection: 'nouns', pagination: false }).then((n: any) => n.docs), // All nouns for reference resolution
+    payload.find({ collection: 'nouns', pagination: false, where: domainFilter }).then((n: any) => n.docs), // Domain-scoped for schema creation
     payload
       .find({
         collection: 'constraint-spans',
@@ -211,6 +212,7 @@ async function generateOpenAPI(payload: any, data: any, domainFilter: Where): Pr
       .then((n: any) => n.docs),
   ])) as [
     Omit<GraphSchema, 'updatedAt'>[],
+    Omit<Noun | GraphSchema, 'updatedAt'>[],
     Omit<Noun | GraphSchema, 'updatedAt'>[],
     Omit<ConstraintSpan, 'updatedAt'>[],
     Omit<Graph, 'updatedAt'>[],
@@ -289,8 +291,8 @@ async function generateOpenAPI(payload: any, data: any, domainFilter: Where): Pr
   }
   const nounRegex = nounListToRegex(nouns)
 
-  // Ensure all entity nouns with permissions have schemas, even those with no readings
-  for (const noun of nouns.filter((n: any) => (n as any).permissions?.length && (n as any).objectType === 'entity')) {
+  // Ensure domain-scoped entity nouns with permissions have schemas, even those with no readings
+  for (const noun of domainNouns.filter((n: any) => (n as any).permissions?.length && (n as any).objectType === 'entity')) {
     ensureTableExists({ tables: schemas, subject: noun, nouns, jsonExamples })
   }
 
@@ -433,7 +435,7 @@ async function generateOpenAPI(payload: any, data: any, domainFilter: Where): Pr
             subject?.permissions || ['create', 'read', 'update', 'list', 'login', 'rateLimit']
           ).concat(globalPermissions || [])
           const isId = idScheme?.length === 1 && idScheme[0][0] === 'id'
-          const title = baseSchema.title || ''
+          const title = baseSchema.title || key || 'Unknown'
           const retval: [string, Record<string, unknown>][] = []
           const plural =
             (subject?.plural && subject.plural[0].toUpperCase() + subject.plural.slice(1)) ||
@@ -1630,6 +1632,7 @@ function processArraySchemas(
     const subject = (typeof subjectRaw === 'string' ? nouns.find((n) => n.id === subjectRaw) : subjectRaw) as Noun | GraphSchema
     const objectRaw = (schema.roles?.docs?.[1] as Role).noun?.value
     const object = (typeof objectRaw === 'string' ? nouns.find((n) => n.id === objectRaw) : objectRaw) as Noun | GraphSchema
+    if (!subject?.name || !object?.name) continue // Skip readings with unresolved nouns
     const plural = object?.plural
 
     const { objectBegin, objectEnd } = findPredicateObject({ predicate, subject, object, plural })
@@ -1962,7 +1965,12 @@ function createProperty({
     [id: string]: JSONSchemaType
   }
 }) {
-  object = nouns.find((n) => n.id === object.id) || object
+  if (!object) return {}
+  if (typeof (object as any) === 'string') {
+    object = nouns.find((n) => n.id === (object as any)) || { id: object, name: object } as any
+  } else if (object.id) {
+    object = nouns.find((n) => n.id === object.id) || object
+  }
   const property: Schema = {}
   let { referenceScheme, superType, valueType } = object as Noun
   if (!referenceScheme) {
@@ -2130,7 +2138,7 @@ export function findPredicateObject({
   if (subjectIndex === -1 && subject.name)
     subjectIndex = predicate.indexOf(subject.name + '-' || '')
   if (subjectIndex === -1)
-    throw new Error(`Subject "${subject.name}" not found in predicate "${predicate.join(' ')}"`)
+    return { objectBegin: 0, objectEnd: 0 }
 
   let objectIndex = !object ? -1 : predicate.indexOf(object.name || '')
   if (object && objectIndex === -1 && object.name)
