@@ -199,4 +199,10 @@ describe('Payload Collection Generator', () => {
     expect(tsContent).toContain("label: 'Details'")
     expect(tsContent).toContain("type: 'collapsible'")
   })
+
+  it('should group consecutive value fields into rows', () => {
+    const tsContent = payloadOutput.files['collections/support-requests.ts']
+    // Inside the collapsible, consecutive value fields should be grouped into rows
+    expect(tsContent).toContain("type: 'row'")
+  })
 }, 120_000)
