@@ -154,9 +154,9 @@ const Generator: CollectionConfig = {
             data.output = { error: 'No source OpenAPI generator found. Create an OpenAPI generator first or set sourceGenerator.' }
             return
           }
-          data.output = await generatePayloadFiles(payload, sourceOutput)
+          data.output = await generatePayloadFiles(payload, sourceOutput, data.domain)
         } else if (outputFormat === 'xstate') {
-          data.output = await generateXStateFiles(payload)
+          data.output = await generateXStateFiles(payload, data.domain)
         }
       }) as CollectionBeforeChangeHook<Generator>,
     ],
@@ -169,12 +169,13 @@ export default Generator
 
 async function generateOpenAPI(payload: any, data: any): Promise<any> {
   const schemas: Record<string, Schema> = {}
+  const domainFilter = data.domain ? { domain: { equals: data.domain } } : {}
 
   const [graphSchemas, nouns, constraintSpans, examples, jsons] = (await Promise.all([
     payload
-      .find({ collection: 'graph-schemas', pagination: false, depth: 4 })
+      .find({ collection: 'graph-schemas', pagination: false, depth: 4, where: domainFilter })
       .then((s: any) => s.docs),
-    payload.find({ collection: 'nouns', pagination: false }).then((n: any) => n.docs),
+    payload.find({ collection: 'nouns', pagination: false, where: domainFilter }).then((n: any) => n.docs),
     payload
       .find({
         collection: 'constraint-spans',
@@ -223,9 +224,10 @@ async function generateOpenAPI(payload: any, data: any): Promise<any> {
     })
     .map((cs) => {
       const nestedGs = (cs.roles as Role[])[0].graphSchema as GraphSchema
-      const gs = graphSchemas.find((s) => s.id === nestedGs.id) || nestedGs
-      return { gs, cs }
+      const gs = graphSchemas.find((s) => s.id === nestedGs.id)
+      return gs ? { gs, cs } : undefined
     })
+    .filter((entry): entry is { gs: Omit<GraphSchema, 'updatedAt'>; cs: Omit<ConstraintSpan, 'updatedAt'> } => !!entry)
   const arrayTypes = compoundUniqueSchemas.filter(
     ({ gs: cs }) =>
       !graphSchemas.find((s) =>
@@ -1006,16 +1008,17 @@ async function generateOpenAPI(payload: any, data: any): Promise<any> {
   return parsedOutput
 }
 
-async function generatePayloadFiles(payload: any, sourceOutput: any): Promise<any> {
+async function generatePayloadFiles(payload: any, sourceOutput: any, domain?: string): Promise<any> {
   const componentSchemas = sourceOutput.components?.schemas || {}
-  const nouns = await payload.find({ collection: 'nouns', pagination: false }).then((n: any) => n.docs)
+  const domainFilter = domain ? { domain: { equals: domain } } : {}
+  const nouns = await payload.find({ collection: 'nouns', pagination: false, where: domainFilter }).then((n: any) => n.docs)
   const constraintSpans = await payload.find({
     collection: 'constraint-spans',
     pagination: false,
     depth: 6,
     where: { 'constraint.kind': { equals: 'UC' } },
   }).then((cs: any) => cs.docs)
-  const graphSchemas = await payload.find({ collection: 'graph-schemas', pagination: false, depth: 4 }).then((s: any) => s.docs)
+  const graphSchemas = await payload.find({ collection: 'graph-schemas', pagination: false, depth: 4, where: domainFilter }).then((s: any) => s.docs)
 
   const files: Record<string, string> = {}
   const payloadCollections: Record<string, Record<string, unknown>> = {}
@@ -1176,13 +1179,15 @@ async function generatePayloadFiles(payload: any, sourceOutput: any): Promise<an
   return { files }
 }
 
-async function generateXStateFiles(payload: any): Promise<any> {
+async function generateXStateFiles(payload: any, domain?: string): Promise<any> {
+  const domainFilter = domain ? { domain: { equals: domain } } : {}
   const stateMachineDefinitions = await payload.find({
     collection: 'state-machine-definitions',
     pagination: false,
     depth: 0,
+    where: domainFilter,
   }).then((s: any) => s.docs)
-  const nouns = await payload.find({ collection: 'nouns', pagination: false }).then((n: any) => n.docs)
+  const nouns = await payload.find({ collection: 'nouns', pagination: false, where: domainFilter }).then((n: any) => n.docs)
 
   const files: Record<string, string> = {}
 
@@ -1477,11 +1482,11 @@ function processBinarySchemas(
       const constrainedRole = (cs.roles as Role[])[0]
       const nestedGs = constrainedRole.graphSchema as GraphSchema
       // Look up the top-level graphSchema (which has join fields populated) instead of the nested one
-      const propertySchema = graphSchemas.find((gs) => gs.id === nestedGs.id) || nestedGs
+      const propertySchema = graphSchemas.find((gs) => gs.id === nestedGs.id)
       // The single role from the constraint span is fully populated (depth 6)
-      return { propertySchema, subjectRole: constrainedRole }
+      return { propertySchema, subjectRole: propertySchema ? constrainedRole : undefined }
     })) {
-    if (!subjectRole) continue
+    if (!subjectRole || !propertySchema) continue
 
     const subject = subjectRole.noun?.value as Noun | GraphSchema
     ensureTableExists({ tables: schemas, subject, nouns, jsonExamples })
