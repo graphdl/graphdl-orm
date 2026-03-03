@@ -101,7 +101,7 @@ describe('parseDomainMarkdown', () => {
     expect(r.readings[0]).toEqual({
       text: 'Listing has Price via ListingChannel',
       multiplicity: 'ternary',
-      ucRoles: ['Listing', 'ListingChannel'],
+      ucs: [['Listing', 'ListingChannel']],
     })
   })
 })
@@ -143,7 +143,7 @@ describe('parseFORML2', () => {
     expect(result).toEqual([{
       text: 'Listing has Price via Channel',
       multiplicity: 'ternary',
-      ucRoles: ['Listing', 'Channel'],
+      ucs: [['Listing', 'Channel']],
     }])
   })
 
@@ -152,7 +152,16 @@ describe('parseFORML2', () => {
     expect(result).toEqual([{
       text: 'Listing has Price via Channel',
       multiplicity: 'ternary',
-      ucRoles: ['Listing', 'Channel'],
+      ucs: [['Listing', 'Channel']],
+    }])
+  })
+
+  it('should parse multiple UCs per reading', () => {
+    const result = parseFORML2('Academic has Rank in Dept UC(Academic,Dept), UC(Academic,Rank)')
+    expect(result).toEqual([{
+      text: 'Academic has Rank in Dept',
+      multiplicity: 'ternary',
+      ucs: [['Academic', 'Dept'], ['Academic', 'Rank']],
     }])
   })
 
