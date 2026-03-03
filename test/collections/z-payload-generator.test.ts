@@ -178,4 +178,18 @@ describe('Payload Collection Generator', () => {
     // defaultColumns should be an array of field names, capped at 5
     expect(tsContent).toMatch(/defaultColumns:\s*\[/)
   })
+
+  it('should add initCollapsed to hasMany relationship fields', () => {
+    // api-products has hasMany relationships (M:M with support-requests/feature-requests)
+    const tsContent = payloadOutput.files['collections/api-products.ts']
+    expect(tsContent).toContain('hasMany: true')
+    expect(tsContent).toContain('initCollapsed: true')
+  })
+
+  it('should add initCollapsed to join fields', () => {
+    const tsContent = payloadOutput.files['collections/customers.ts']
+    // The join field for support-requests should have initCollapsed
+    expect(tsContent).toContain("type: 'join'")
+    expect(tsContent).toContain('initCollapsed: true')
+  })
 }, 120_000)

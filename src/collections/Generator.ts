@@ -1113,6 +1113,11 @@ async function generatePayloadFiles(payload: any, sourceOutput: any, domainFilte
         field.admin = { ...(field.admin as Record<string, unknown> || {}), description: matchingNoun.description }
       }
 
+      // Collapse hasMany fields by default
+      if (field.hasMany) {
+        field.admin = { ...(field.admin as Record<string, unknown> || {}), initCollapsed: true }
+      }
+
       fields.push(field)
     }
 
@@ -1199,6 +1204,7 @@ async function generatePayloadFiles(payload: any, sourceOutput: any, domainFilte
         type: 'join',
         collection: subjectSlug,
         on: relField.name,
+        admin: { initCollapsed: true },
       })
     }
   }
