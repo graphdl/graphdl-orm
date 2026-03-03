@@ -73,3 +73,24 @@ export const POST = async (request: Request) => {
 
   return Response.json(summary)
 }
+
+const WIPE_ORDER = [
+  'readings', 'graph-schemas', 'roles', 'constraint-spans', 'constraints',
+  'transitions', 'statuses', 'event-types', 'state-machine-definitions',
+  'generators', 'graphs', 'json-examples', 'resources', 'resource-roles', 'nouns',
+]
+
+export const DELETE = async () => {
+  const payload = await getPayload({ config: configPromise })
+  const counts: Record<string, number> = {}
+
+  for (const collection of WIPE_ORDER) {
+    const docs = await payload.find({ collection: collection as any, pagination: false, limit: 10000 })
+    for (const doc of docs.docs) {
+      await payload.delete({ collection: collection as any, id: doc.id })
+    }
+    counts[collection] = docs.docs.length
+  }
+
+  return Response.json({ wiped: counts })
+}
