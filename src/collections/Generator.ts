@@ -106,6 +106,7 @@ const Generator: CollectionConfig = {
             { label: 'OpenAPI', value: 'openapi' },
             { label: 'Payload Collections', value: 'payload' },
             { label: 'XState + Agent', value: 'xstate' },
+            { label: 'Mermaid Diagrams', value: 'mermaid' },
           ],
           defaultValue: 'openapi',
           admin: {
@@ -166,6 +167,8 @@ const Generator: CollectionConfig = {
           data.output = await generatePayloadFiles(payload, sourceOutput, domainFilter)
         } else if (outputFormat === 'xstate') {
           data.output = await generateXStateFiles(payload, domainFilter)
+        } else if (outputFormat === 'mermaid') {
+          data.output = await generateMermaidDiagrams(payload, domainFilter)
         }
       }) as CollectionBeforeChangeHook<Generator>,
     ],
@@ -1368,6 +1371,184 @@ async function generateXStateFiles(payload: any, domainFilter: Where): Promise<a
     ].join('\n')
 
     files[`agents/${machineName}-prompt.md`] = prompt
+  }
+
+  return { files }
+}
+
+async function generateMermaidDiagrams(payload: any, domainFilter: Where): Promise<any> {
+  const [graphSchemas, nouns, stateMachineDefinitions] = await Promise.all([
+    payload.find({ collection: 'graph-schemas', pagination: false, depth: 4, where: domainFilter }).then((s: any) => s.docs),
+    payload.find({ collection: 'nouns', pagination: false, where: domainFilter }).then((n: any) => n.docs),
+    payload.find({ collection: 'state-machine-definitions', pagination: false, depth: 0, where: domainFilter }).then((s: any) => s.docs),
+  ])
+
+  const files: Record<string, string> = {}
+
+  // ── ORM2 Diagram: entity-relationship diagram from graph schemas ──
+  const entityNouns = nouns.filter((n: any) => n.objectType === 'entity')
+  const valueNouns = nouns.filter((n: any) => n.objectType === 'value')
+  const nounById = new Map(nouns.map((n: any) => [n.id, n]))
+
+  const ormLines: string[] = ['erDiagram']
+
+  // Add entity types
+  for (const noun of entityNouns) {
+    const refScheme = (noun.referenceScheme || [])
+      .map((r: any) => {
+        const refNoun = typeof r === 'string' ? nounById.get(r) : r
+        return refNoun?.name
+      })
+      .filter(Boolean)
+    ormLines.push(`    ${noun.name} {`)
+    for (const ref of refScheme) {
+      ormLines.push(`        string ${ref} PK`)
+    }
+    ormLines.push(`    }`)
+  }
+
+  // Add relationships from graph schemas
+  for (const gs of graphSchemas) {
+    // Fetch roles directly for reliable resolution
+    const rolesResult = await payload.find({
+      collection: 'roles',
+      where: { graphSchema: { equals: gs.id } },
+      depth: 2,
+      pagination: false,
+    })
+    const roles = rolesResult.docs as any[]
+    if (roles.length < 2) continue
+
+    const resolveNoun = (role: any) => {
+      const ref = role?.noun
+      if (!ref) return null
+      if (typeof ref === 'string') return nounById.get(ref)
+      if (ref.value && typeof ref.value === 'string') return nounById.get(ref.value)
+      if (ref.value?.name) return ref.value
+      return ref.name ? ref : null
+    }
+    const role1Noun = resolveNoun(roles[0])
+    const role2Noun = resolveNoun(roles[1])
+    if (!role1Noun?.name || !role2Noun?.name) continue
+    // Only draw relationships between entities (or entity-value for properties)
+    if (role1Noun.objectType !== 'entity' && role2Noun.objectType !== 'entity') continue
+
+    const rel = gs.roleRelationship || 'many-to-one'
+    const mermaidRel =
+      rel === 'one-to-one' ? '||--||' :
+      rel === 'one-to-many' ? '||--o{' :
+      rel === 'many-to-one' ? '}o--||' :
+      '}o--o{' // many-to-many
+
+    // Get reading text for the label
+    const readings = (gs.readings?.docs || gs.readings || []) as any[]
+    const label = readings[0]?.text || gs.name || ''
+
+    ormLines.push(`    ${role1Noun.name} ${mermaidRel} ${role2Noun.name} : "${label}"`)
+  }
+
+  files['diagrams/orm2.mmd'] = ormLines.join('\n')
+
+  // ── State Machine Diagrams ──
+  for (const smDef of stateMachineDefinitions) {
+    const fullDef = await payload.findByID({ collection: 'state-machine-definitions', id: smDef.id, depth: 2 })
+    const statuses = await payload.find({
+      collection: 'statuses',
+      where: { stateMachineDefinition: { equals: smDef.id } },
+      sort: 'createdAt',
+      pagination: false,
+    }).then((s: any) => s.docs)
+    if (!statuses.length) continue
+
+    const nounRef = fullDef.noun as any
+    const nounValue = typeof nounRef?.value === 'string' ? nounById.get(nounRef.value) : nounRef?.value
+    const machineName = (nounValue?.name || 'unknown').replace(/([A-Z])/g, '-$1').toLowerCase().replace(/^-/, '')
+
+    const smLines: string[] = ['stateDiagram-v2']
+
+    // Find initial state
+    const allTransitions: { from: string; to: string; event: string }[] = []
+    for (const status of statuses) {
+      const full = await payload.findByID({ collection: 'statuses', id: status.id, depth: 2 })
+      const transitions = (full.transitions?.docs || []) as any[]
+      for (const t of transitions) {
+        const toStatus = typeof t.to === 'string' ? statuses.find((s: any) => s.id === t.to) : t.to
+        const eventType = typeof t.eventType === 'string'
+          ? await payload.findByID({ collection: 'event-types', id: t.eventType })
+          : t.eventType
+        if (toStatus?.name && eventType?.name) {
+          allTransitions.push({ from: status.name, to: toStatus.name, event: eventType.name })
+        }
+      }
+    }
+
+    const statesWithIncoming = new Set(allTransitions.map(t => t.to))
+    const initialStatus = statuses.find((s: any) => !statesWithIncoming.has(s.name)) || statuses[0]
+
+    // Find terminal states (no outgoing)
+    const statesWithOutgoing = new Set(allTransitions.map(t => t.from))
+    const terminalStates = statuses.filter((s: any) => !statesWithOutgoing.has(s.name))
+
+    smLines.push(`    [*] --> ${initialStatus.name}`)
+    for (const t of allTransitions) {
+      smLines.push(`    ${t.from} --> ${t.to}: ${t.event}`)
+    }
+    for (const ts of terminalStates) {
+      smLines.push(`    ${ts.name} --> [*]`)
+    }
+
+    files[`diagrams/state-${machineName}.mmd`] = smLines.join('\n')
+  }
+
+  // ── UML Class Diagram from OpenAPI schemas ──
+  // Find latest OpenAPI generator output for the same domain scope
+  const latestOpenAPI = await payload.find({
+    collection: 'generators',
+    where: { or: [{ outputFormat: { equals: 'openapi' } }, { outputFormat: { exists: false } }] },
+    sort: '-updatedAt',
+    limit: 1,
+  })
+  const openApiOutput = latestOpenAPI.docs[0]?.output
+  if (openApiOutput?.components?.schemas) {
+    const umlLines: string[] = ['classDiagram']
+    const componentSchemas = openApiOutput.components.schemas
+
+    for (const [name, schema] of Object.entries(componentSchemas) as [string, any][]) {
+      if (name.startsWith('Update') || name.startsWith('New') || name === 'ErrorModel') continue
+      const props = schema.properties || {}
+      umlLines.push(`    class ${name} {`)
+      for (const [propName, propDef] of Object.entries(props) as [string, any][]) {
+        const type = propDef.type || (propDef.oneOf ? 'ref' : '?')
+        umlLines.push(`        +${type} ${propName}`)
+      }
+      umlLines.push(`    }`)
+    }
+
+    // Add relationships from $ref and oneOf
+    for (const [name, schema] of Object.entries(componentSchemas) as [string, any][]) {
+      if (name.startsWith('Update') || name.startsWith('New') || name === 'ErrorModel') continue
+      const props = schema.properties || {}
+      for (const [propName, propDef] of Object.entries(props) as [string, any][]) {
+        if (propDef.oneOf) {
+          for (const opt of propDef.oneOf) {
+            const ref = opt.$ref?.split('/').pop()
+            if (ref && componentSchemas[ref] && !ref.startsWith('Update') && !ref.startsWith('New')) {
+              umlLines.push(`    ${name} --> ${ref} : ${propName}`)
+            }
+          }
+        }
+        if (propDef.type === 'array' && propDef.items?.oneOf) {
+          for (const opt of propDef.items.oneOf) {
+            const ref = opt.$ref?.split('/').pop()
+            if (ref && componentSchemas[ref] && !ref.startsWith('Update') && !ref.startsWith('New')) {
+              umlLines.push(`    ${name} "1" --> "*" ${ref} : ${propName}`)
+            }
+          }
+        }
+      }
+    }
+
+    files['diagrams/uml-classes.mmd'] = umlLines.join('\n')
   }
 
   return { files }
