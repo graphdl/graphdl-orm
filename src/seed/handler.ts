@@ -114,12 +114,6 @@ export async function seedReadings(
   result: SeedResult,
 ): Promise<void> {
   for (const r of readings) {
-    const rel = MULT_MAP[r.multiplicity]
-    if (!rel) {
-      result.errors.push(`unknown multiplicity "${r.multiplicity}": ${r.text}`)
-      result.skipped++
-      continue
-    }
     try {
       // Check if reading already exists
       const existing = await payload.find({
@@ -135,7 +129,46 @@ export async function seedReadings(
       const name = r.text.split(' ').map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join('')
       const schema = await payload.create({ collection: 'graph-schemas', data: { name, title: name, ...domainData } as any })
       await payload.create({ collection: 'readings', data: { text: r.text, graphSchema: schema.id, ...domainData } as any })
-      await payload.update({ collection: 'graph-schemas', id: schema.id, data: { roleRelationship: rel } as any })
+
+      if (r.ucRoles?.length) {
+        // Ternary+ fact: create explicit UC constraint spanning named roles
+        // Wait for role auto-creation, then find the roles by noun name
+        const roles = await payload.find({
+          collection: 'roles',
+          where: { graphSchema: { equals: schema.id } },
+          depth: 2,
+          pagination: false,
+        })
+        const ucRoleIds = r.ucRoles.map((roleName) => {
+          const role = roles.docs.find((role: any) => {
+            const noun = role.noun
+            const nounName = typeof noun === 'string' ? null : noun?.value?.name || noun?.name
+            return nounName === roleName
+          })
+          return role?.id
+        }).filter(Boolean)
+
+        if (ucRoleIds.length >= 2) {
+          const constraint = await payload.create({
+            collection: 'constraints',
+            data: { kind: 'UC', modality: 'Alethic' },
+          })
+          await payload.create({
+            collection: 'constraint-spans',
+            data: { constraint: constraint.id, roles: ucRoleIds },
+          })
+        }
+      } else {
+        // Binary fact: use roleRelationship shortcut
+        const rel = MULT_MAP[r.multiplicity]
+        if (!rel) {
+          result.errors.push(`unknown multiplicity "${r.multiplicity}": ${r.text}`)
+          result.skipped++
+          continue
+        }
+        await payload.update({ collection: 'graph-schemas', id: schema.id, data: { roleRelationship: rel } as any })
+      }
+
       result.readings++
     } catch (err: any) {
       result.errors.push(`reading "${r.text}": ${err.message}`)
