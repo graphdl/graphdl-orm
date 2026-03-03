@@ -19,7 +19,6 @@ const StateMachines: CollectionConfig = {
       name: 'resource',
       type: 'relationship',
       relationTo: ['resources', 'graphs'],
-      required: true,
       admin: {
         description: 'State Machine is for Resource.',
       },
