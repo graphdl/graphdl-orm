@@ -74,4 +74,24 @@ describe('Domain-scoped generator', () => {
     expect(schemas.Foo).toBeDefined()
     expect(schemas.Bar).toBeDefined()
   })
+
+  it('should include schemas from multiple domains when domains list is set', async () => {
+    const genMulti = await payload.create({
+      collection: 'generators',
+      data: { title: 'Multi Domain', version: '1.0.0', databaseEngine: 'Payload', domains: ['app-a', 'app-b'] },
+    })
+    const schemas = genMulti.output?.components?.schemas || {}
+    expect(schemas.Foo).toBeDefined()
+    expect(schemas.Bar).toBeDefined()
+  })
+
+  it('should respect domains list over single domain field', async () => {
+    const gen = await payload.create({
+      collection: 'generators',
+      data: { title: 'Domains Override', version: '1.0.0', databaseEngine: 'Payload', domain: 'app-a', domains: ['app-b'] },
+    })
+    const schemas = gen.output?.components?.schemas || {}
+    expect(schemas.Bar).toBeDefined()
+    expect(schemas.Foo).toBeUndefined()
+  })
 })
