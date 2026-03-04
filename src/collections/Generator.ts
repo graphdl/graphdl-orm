@@ -1598,7 +1598,7 @@ async function generateILayerFiles(payload: any, domainFilter: Where): Promise<a
     const fieldReadings: ReadingInfo[] = []
     const navReadings: ReadingInfo[] = []
     for (const r of entityReadings) {
-      const objectNoun = allNounById.get(r.objectNounId)
+      const objectNoun = allNounById.get(r.objectNounId) as any
       if (!objectNoun) continue
       if (objectNoun.objectType === 'value') {
         fieldReadings.push(r)
@@ -1610,7 +1610,7 @@ async function generateILayerFiles(payload: any, domainFilter: Where): Promise<a
     // Build fields from value readings
     const fields: any[] = []
     for (const r of fieldReadings) {
-      const valueNoun = allNounById.get(r.objectNounId)
+      const valueNoun = allNounById.get(r.objectNounId) as any
       if (!valueNoun) continue
       const { type, options } = mapFieldType(valueNoun)
       const field: any = {
@@ -1631,7 +1631,7 @@ async function generateILayerFiles(payload: any, domainFilter: Where): Promise<a
 
     // Build navigation from entity-to-entity relationships
     const navigation = navReadings.map((r) => {
-      const relatedNoun = allNounById.get(r.objectNounId)
+      const relatedNoun = allNounById.get(r.objectNounId) as any
       return {
         text: relatedNoun?.name || 'Unknown',
         address: `/layers/${toSlug(relatedNoun || { name: 'unknown', plural: 'unknowns' })}`,
