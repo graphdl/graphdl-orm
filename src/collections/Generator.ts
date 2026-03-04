@@ -136,7 +136,9 @@ const Generator: CollectionConfig = {
         ;(context.internal as string[])?.push('schemas.afterHook')
 
         const outputFormat = data.outputFormat || 'openapi'
-        const domainFilter = buildDomainFilter(data.domains, data.domain)
+        const domainIds = data.domains?.map((d: any) => (typeof d === 'object' ? d.id : d)) as string[] | undefined
+        const domainId = typeof data.domain === 'object' ? (data.domain as any).id : data.domain
+        const domainFilter = buildDomainFilter(domainIds, domainId)
 
         if (outputFormat === 'openapi') {
           // Run the full existing OpenAPI generation
