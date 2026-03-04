@@ -1445,7 +1445,7 @@ async function generateXStateFiles(payload: any, domainFilter: Where): Promise<a
 async function generateILayerFiles(payload: any, domainFilter: Where): Promise<any> {
   const [nouns, readings, stateMachineDefinitions] = await Promise.all([
     payload.find({ collection: 'nouns', pagination: false, where: domainFilter }).then((n: any) => n.docs),
-    payload.find({ collection: 'readings', pagination: false, depth: 0 }).then((r: any) => r.docs),
+    payload.find({ collection: 'readings', pagination: false, depth: 0, where: domainFilter }).then((r: any) => r.docs),
     payload
       .find({ collection: 'state-machine-definitions', pagination: false, depth: 0, where: domainFilter })
       .then((s: any) => s.docs),
@@ -1590,9 +1590,15 @@ async function generateILayerFiles(payload: any, domainFilter: Where): Promise<a
     }
   }
 
-  // Generate FormLayer for each entity noun
+  // Generate layers for each entity noun based on permissions
   for (const entity of entityNouns) {
     const slug = toSlug(entity)
+    const perms: string[] = entity.permissions || []
+    const hasCreate = perms.includes('create')
+    const hasRead = perms.includes('read')
+    const hasUpdate = perms.includes('update')
+    const hasList = perms.includes('list')
+    const hasDelete = perms.includes('delete')
 
     // Find readings where this entity is the subject
     const entityReadings = readingInfos.filter((r) => r.subjectNounId === entity.id)
@@ -1625,9 +1631,10 @@ async function generateILayerFiles(payload: any, domainFilter: Where): Promise<a
       fields.push(field)
     }
 
-    // Build action buttons from state machine events
+    // Build state machine event buttons
     const events = await getStateMachineEvents(entity.id)
-    const actionButtons = events.map((event) => ({
+    const eventButtons = events.map((event) => ({
+      id: event,
       text: toLabel(event),
       address: `/state/${entity.name}/${event}`,
     }))
@@ -1635,41 +1642,108 @@ async function generateILayerFiles(payload: any, domainFilter: Where): Promise<a
     // Build navigation from entity-to-entity relationships
     const navigation = navReadings.map((r) => {
       const relatedNoun = allNounById.get(r.objectNounId) as any
+      const relSlug = toSlug(relatedNoun || { name: 'unknown', plural: 'unknowns' })
       return {
         text: relatedNoun?.name || 'Unknown',
-        address: `/layers/${toSlug(relatedNoun || { name: 'unknown', plural: 'unknowns' })}`,
+        address: `/${relSlug}`,
       }
     })
 
-    const formLayer: any = {
-      name: slug,
-      title: entity.name,
-      type: 'formLayer',
-      layout: 'Rounded',
-      fieldsets: [
-        {
-          header: entity.name,
-          fields,
-        },
-      ],
+    // ── List layer (NavigationLayer) ──
+    if (hasList || hasRead) {
+      const listLayer: any = {
+        name: slug,
+        title: entity.name,
+        type: 'layer',
+        items: [
+          {
+            type: 'list',
+            items: fields.slice(0, 3).map((f: any) => ({
+              text: f.label,
+              subtext: `{${f.id}}`,
+              address: `/${slug}/{id}`,
+            })),
+          },
+        ],
+      }
+      if (hasCreate) {
+        listLayer.actionButtons = [{ id: 'create', text: `New ${entity.name}`, address: `/${slug}/new` }]
+      }
+      files[`layers/${slug}.json`] = JSON.stringify(listLayer, null, 2)
     }
-    if (actionButtons.length) formLayer.actionButtons = actionButtons
-    if (navigation.length) formLayer.navigation = navigation
 
-    files[`layers/${slug}.json`] = JSON.stringify(formLayer, null, 2)
+    // ── Detail/Read layer (FormLayer) ──
+    if (hasRead) {
+      const actionButtons: any[] = []
+      if (hasUpdate) actionButtons.push({ id: 'edit', text: 'Edit', action: 'edit' })
+      if (hasDelete) actionButtons.push({ id: 'delete', text: 'Delete', action: 'delete' })
+      actionButtons.push(...eventButtons)
+
+      const detailLayer: any = {
+        name: `${slug}-detail`,
+        title: entity.name,
+        type: 'formLayer',
+        layout: 'Rounded',
+        fieldsets: [{ header: entity.name, fields: fields.map((f: any) => ({ ...f, type: 'label' })) }],
+      }
+      if (actionButtons.length) detailLayer.actionButtons = actionButtons
+      if (navigation.length) detailLayer.navigation = navigation
+
+      files[`layers/${slug}-detail.json`] = JSON.stringify(detailLayer, null, 2)
+    }
+
+    // ── Create layer (FormLayer with editable fields) ──
+    if (hasCreate) {
+      const createLayer: any = {
+        name: `${slug}-new`,
+        title: `New ${entity.name}`,
+        type: 'formLayer',
+        layout: 'Rounded',
+        fieldsets: [{ header: entity.name, fields }],
+        actionButtons: [
+          { id: 'save', text: 'Save', action: 'create' },
+          { id: 'cancel', text: 'Cancel', address: `/${slug}` },
+        ],
+      }
+      files[`layers/${slug}-new.json`] = JSON.stringify(createLayer, null, 2)
+    }
+
+    // ── Edit layer (FormLayer with editable fields + update action) ──
+    if (hasUpdate) {
+      const editLayer: any = {
+        name: `${slug}-edit`,
+        title: `Edit ${entity.name}`,
+        type: 'formLayer',
+        layout: 'Rounded',
+        fieldsets: [{ header: entity.name, fields }],
+        actionButtons: [
+          { id: 'save', text: 'Save', action: 'update' },
+          { id: 'cancel', text: 'Cancel', address: `/${slug}/{id}` },
+          ...eventButtons,
+        ],
+      }
+      if (navigation.length) editLayer.navigation = navigation
+      files[`layers/${slug}-edit.json`] = JSON.stringify(editLayer, null, 2)
+    }
   }
 
-  // Generate index navigation layer
-  const indexItems = entityNouns.map((entity: any) => ({
-    text: entity.name,
-    subtext: entity.plural || toSlug(entity),
-    link: `/layers/${toSlug(entity)}`,
-  }))
+  // ── Index navigation layer ──
+  const indexItems = entityNouns
+    .filter((e: any) => {
+      const p: string[] = e.permissions || []
+      return p.includes('list') || p.includes('read')
+    })
+    .map((entity: any) => ({
+      text: entity.name,
+      subtext: entity.plural || toSlug(entity),
+      address: `/${toSlug(entity)}`,
+    }))
 
   const indexLayer = {
     name: 'index',
+    title: 'Home',
     type: 'layer',
-    items: indexItems,
+    items: [{ type: 'list', items: indexItems }],
   }
 
   files['layers/index.json'] = JSON.stringify(indexLayer, null, 2)

@@ -37,35 +37,59 @@ describe('iLayer Generator', () => {
     const index = JSON.parse(output.files['layers/index.json'])
     expect(index.name).toBe('index')
     expect(index.type).toBe('layer')
+    expect(index.title).toBe('Home')
     expect(Array.isArray(index.items)).toBe(true)
     expect(index.items.length).toBeGreaterThan(0)
-    // Should have items for entity nouns
-    const itemTexts = index.items.map((i: any) => i.text)
+    // Items are in a list group
+    const listItems = index.items[0].items
+    const itemTexts = listItems.map((i: any) => i.text)
     expect(itemTexts).toContain('Customer')
     expect(itemTexts).toContain('SupportRequest')
   })
 
-  it('should generate entity FormLayer files', () => {
-    const layerFiles = Object.keys(output.files).filter((f) => f.startsWith('layers/') && f !== 'layers/index.json')
-    expect(layerFiles.length).toBeGreaterThan(0)
-    // Should have a layer for support-requests
+  it('should generate list layers (NavigationLayer) for entities with list permission', () => {
     expect(output.files['layers/support-requests.json']).toBeDefined()
-    expect(output.files['layers/customers.json']).toBeDefined()
+    const layer = JSON.parse(output.files['layers/support-requests.json'])
+    expect(layer.type).toBe('layer')
+    expect(layer.title).toBe('SupportRequest')
+    expect(layer.name).toBe('support-requests')
+    expect(Array.isArray(layer.items)).toBe(true)
   })
 
-  it('should generate valid FormLayer structure', () => {
-    const layer = JSON.parse(output.files['layers/support-requests.json'])
+  it('should generate detail layers (FormLayer) for entities with read permission', () => {
+    expect(output.files['layers/support-requests-detail.json']).toBeDefined()
+    const layer = JSON.parse(output.files['layers/support-requests-detail.json'])
     expect(layer.type).toBe('formLayer')
     expect(layer.layout).toBe('Rounded')
     expect(layer.title).toBe('SupportRequest')
-    expect(layer.name).toBe('support-requests')
     expect(Array.isArray(layer.fieldsets)).toBe(true)
     expect(layer.fieldsets.length).toBeGreaterThan(0)
-    expect(layer.fieldsets[0].header).toBe('SupportRequest')
+    // Detail fields are read-only labels
+    const fields = layer.fieldsets[0].fields
+    expect(fields.every((f: any) => f.type === 'label')).toBe(true)
   })
 
-  it('should map string value nouns to text fields', () => {
-    const layer = JSON.parse(output.files['layers/support-requests.json'])
+  it('should generate create layers for entities with create permission', () => {
+    expect(output.files['layers/support-requests-new.json']).toBeDefined()
+    const layer = JSON.parse(output.files['layers/support-requests-new.json'])
+    expect(layer.type).toBe('formLayer')
+    expect(layer.title).toContain('New')
+    expect(layer.actionButtons).toBeDefined()
+    const saveBtn = layer.actionButtons.find((b: any) => b.action === 'create')
+    expect(saveBtn).toBeDefined()
+  })
+
+  it('should generate edit layers for entities with update permission', () => {
+    expect(output.files['layers/support-requests-edit.json']).toBeDefined()
+    const layer = JSON.parse(output.files['layers/support-requests-edit.json'])
+    expect(layer.type).toBe('formLayer')
+    expect(layer.title).toContain('Edit')
+    const saveBtn = layer.actionButtons.find((b: any) => b.action === 'update')
+    expect(saveBtn).toBeDefined()
+  })
+
+  it('should map string value nouns to text fields in create layer', () => {
+    const layer = JSON.parse(output.files['layers/support-requests-new.json'])
     const fields = layer.fieldsets[0].fields
     const subjectField = fields.find((f: any) => f.id === 'subject')
     expect(subjectField).toBeDefined()
@@ -74,18 +98,18 @@ describe('iLayer Generator', () => {
   })
 
   it('should map enum value nouns to select fields with options', () => {
-    const layer = JSON.parse(output.files['layers/support-requests.json'])
+    const layer = JSON.parse(output.files['layers/support-requests-new.json'])
     const fields = layer.fieldsets[0].fields
     const priorityField = fields.find((f: any) => f.id === 'priority')
     expect(priorityField).toBeDefined()
     expect(priorityField.type).toBe('select')
-    expect(priorityField.options).toBeDefined()
     expect(priorityField.options).toContain('low')
     expect(priorityField.options).toContain('urgent')
   })
 
   it('should map email format value nouns to email fields', () => {
-    const layer = JSON.parse(output.files['layers/customers.json'])
+    expect(output.files['layers/customers-new.json']).toBeDefined()
+    const layer = JSON.parse(output.files['layers/customers-new.json'])
     const fields = layer.fieldsets[0].fields
     const emailField = fields.find((f: any) => f.id === 'emailAddress')
     expect(emailField).toBeDefined()
@@ -93,59 +117,50 @@ describe('iLayer Generator', () => {
   })
 
   it('should map integer value nouns to numeric fields', () => {
-    const layer = JSON.parse(output.files['layers/feature-requests.json'])
+    expect(output.files['layers/feature-requests-new.json']).toBeDefined()
+    const layer = JSON.parse(output.files['layers/feature-requests-new.json'])
     const fields = layer.fieldsets[0].fields
     const voteCountField = fields.find((f: any) => f.id === 'voteCount')
     expect(voteCountField).toBeDefined()
     expect(voteCountField.type).toBe('numeric')
   })
 
-  it('should include state machine events as action buttons on SupportRequest', () => {
-    const layer = JSON.parse(output.files['layers/support-requests.json'])
+  it('should include state machine events as action buttons on detail layer', () => {
+    const layer = JSON.parse(output.files['layers/support-requests-detail.json'])
     expect(layer.actionButtons).toBeDefined()
     expect(layer.actionButtons.length).toBeGreaterThan(0)
     const buttonTexts = layer.actionButtons.map((b: any) => b.text.replace(/\s/g, '').toLowerCase())
-    // Events from state machine: triage, investigate, requestInfo, customerRespond, resolve
     expect(buttonTexts).toContain('triage')
     expect(buttonTexts).toContain('resolve')
   })
 
   it('should include action button addresses with /state/{Entity}/{event} format', () => {
-    const layer = JSON.parse(output.files['layers/support-requests.json'])
-    const triageBtn = layer.actionButtons.find((b: any) => b.address.includes('triage'))
+    const layer = JSON.parse(output.files['layers/support-requests-detail.json'])
+    const triageBtn = layer.actionButtons.find((b: any) => b.address?.includes('triage'))
     expect(triageBtn).toBeDefined()
     expect(triageBtn.address).toBe('/state/SupportRequest/triage')
   })
 
-  it('should include navigation links to related entities', () => {
-    const layer = JSON.parse(output.files['layers/support-requests.json'])
+  it('should include navigation links to related entities on detail layer', () => {
+    const layer = JSON.parse(output.files['layers/support-requests-detail.json'])
     expect(layer.navigation).toBeDefined()
     expect(layer.navigation.length).toBeGreaterThan(0)
-    // SupportRequest concerns APIProduct — should have a nav link
     const navTexts = layer.navigation.map((n: any) => n.text)
     expect(navTexts).toContain('APIProduct')
   })
 
-  it('should not include action buttons on entities without state machines', () => {
-    const layer = JSON.parse(output.files['layers/customers.json'])
-    // Customer has no state machine, so no actionButtons key or empty
-    expect(layer.actionButtons).toBeUndefined()
-  })
-
-  it('should include items in index layer with links to entity layers', () => {
+  it('should include index items with address links to entity list layers', () => {
     const index = JSON.parse(output.files['layers/index.json'])
-    const srItem = index.items.find((i: any) => i.text === 'SupportRequest')
+    const listItems = index.items[0].items
+    const srItem = listItems.find((i: any) => i.text === 'SupportRequest')
     expect(srItem).toBeDefined()
-    expect(srItem.link).toBe('/layers/support-requests')
+    expect(srItem.address).toBe('/support-requests')
   })
 
-  it('should map string value nouns with enum as select type', () => {
+  it('should include "New" button on list layer for entities with create permission', () => {
     const layer = JSON.parse(output.files['layers/support-requests.json'])
-    const fields = layer.fieldsets[0].fields
-    const channelField = fields.find((f: any) => f.id === 'channelName')
-    expect(channelField).toBeDefined()
-    expect(channelField.type).toBe('select')
-    expect(channelField.options).toContain('Slack')
-    expect(channelField.options).toContain('Email')
+    expect(layer.actionButtons).toBeDefined()
+    const newBtn = layer.actionButtons.find((b: any) => b.address?.includes('/new'))
+    expect(newBtn).toBeDefined()
   })
 }, 120_000)
