@@ -34,6 +34,20 @@ const MULT_MAP: Record<string, string> = {
   ternary: 'many-to-many',
 }
 
+async function ensureDomain(payload: Payload, domainSlug: string): Promise<string> {
+  const existing = await payload.find({
+    collection: 'domains',
+    where: { domainSlug: { equals: domainSlug } },
+    limit: 1,
+  })
+  if (existing.docs.length) return existing.docs[0].id
+  const created = await payload.create({
+    collection: 'domains',
+    data: { domainSlug, name: domainSlug },
+  })
+  return created.id
+}
+
 async function ensureNoun(payload: Payload, data: Record<string, any>): Promise<any> {
   const existing = await payload.find({
     collection: 'nouns',
@@ -68,6 +82,7 @@ export async function seedDomain(
   parsed: DomainParseResult,
   domain?: string,
 ): Promise<SeedResult> {
+  const domainId = domain ? await ensureDomain(payload, domain) : undefined
   const result: SeedResult = {
     domain,
     nouns: 0,
@@ -76,7 +91,7 @@ export async function seedDomain(
     skipped: 0,
     errors: [],
   }
-  const domainData = domain ? { domain } : {}
+  const domainData = domainId ? { domain: domainId } : {}
 
   // ── Batch 1: All nouns (no dependencies) ──
   const allNounDefs = [
@@ -123,7 +138,7 @@ export async function seedDomain(
   const allNouns = await payload.find({
     collection: 'nouns',
     pagination: false,
-    where: domain ? { domain: { equals: domain } } : {},
+    where: domainId ? { domain: { equals: domainId } } : {},
   })
   for (const n of allNouns.docs) nounCache.set((n as any).name, n)
 
@@ -275,6 +290,7 @@ export async function seedStateMachine(
   parsed: StateMachineParseResult,
   domain?: string,
 ): Promise<SeedResult> {
+  const domainId = domain ? await ensureDomain(payload, domain) : undefined
   const result: SeedResult = {
     domain,
     nouns: 0,
@@ -283,7 +299,7 @@ export async function seedStateMachine(
     skipped: 0,
     errors: [],
   }
-  const domainData = domain ? { domain } : {}
+  const domainData = domainId ? { domain: domainId } : {}
 
   try {
     const noun = await payload.find({

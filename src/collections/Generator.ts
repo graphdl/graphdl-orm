@@ -31,7 +31,8 @@ const Generator: CollectionConfig = {
     domainField,
     {
       name: 'domains',
-      type: 'text',
+      type: 'relationship',
+      relationTo: 'domains',
       hasMany: true,
       admin: {
         description: 'Domains to include in generation. Empty = use single domain field or all.',

@@ -58,7 +58,9 @@ describe('Seed handler', () => {
     expect(result.errors).toHaveLength(0)
 
     // Verify nouns exist with domain
-    const nouns = await payload.find({ collection: 'nouns', where: { domain: { equals: 'support' } }, pagination: false })
+    const domainDoc = await payload.find({ collection: 'domains', where: { domainSlug: { equals: 'support' } }, limit: 1 })
+    const domainId = domainDoc.docs[0].id
+    const nouns = await payload.find({ collection: 'nouns', where: { domain: { equals: domainId } }, pagination: false })
     expect(nouns.docs.length).toBeGreaterThanOrEqual(4)
 
     // Verify readings exist
@@ -86,7 +88,8 @@ describe('Seed handler', () => {
   it('should seed FORML2 plain text readings', async () => {
     const readings = parseFORML2('SupportRequest has Description *:1')
     const result: SeedResult = { nouns: 0, readings: 0, stateMachines: 0, skipped: 0, errors: [] }
-    await seedReadings(payload, readings, { domain: 'support' }, result)
+    const domainDoc = await payload.find({ collection: 'domains', where: { domainSlug: { equals: 'support' } }, limit: 1 })
+    await seedReadings(payload, readings, { domain: domainDoc.docs[0].id }, result)
 
     expect(result.readings).toBe(1)
     expect(result.errors).toHaveLength(0)
