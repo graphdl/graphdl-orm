@@ -1479,12 +1479,10 @@ async function generateILayerFiles(payload: any, domainFilter: Where): Promise<a
     const secondRole = roleById.get(roleIds[1])
     if (!firstRole || !secondRole) continue
 
-    const subjectNounId = typeof firstRole.noun?.value === 'string'
-      ? firstRole.noun.value
-      : firstRole.noun?.value?.id
-    const objectNounId = typeof secondRole.noun?.value === 'string'
-      ? secondRole.noun.value
-      : secondRole.noun?.value?.id
+    const subjectNounVal = (firstRole as any).noun?.value
+    const subjectNounId = typeof subjectNounVal === 'string' ? subjectNounVal : subjectNounVal?.id
+    const objectNounVal = (secondRole as any).noun?.value
+    const objectNounId = typeof objectNounVal === 'string' ? objectNounVal : objectNounVal?.id
 
     if (subjectNounId && objectNounId) {
       readingInfos.push({ subjectNounId, objectNounId, text: reading.text, gsId })
