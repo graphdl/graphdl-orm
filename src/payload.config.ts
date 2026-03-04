@@ -8,6 +8,7 @@ import sharp from 'sharp'
 import { fileURLToPath } from 'url'
 
 import ConstraintSpans from './collections/ConstraintSpans'
+import Domains from './collections/Domains'
 import Constraints from './collections/Constraints'
 import EventTypes from './collections/EventTypes'
 import Events from './collections/Events'
@@ -42,6 +43,7 @@ export default buildConfig({
     },
   },
   collections: [
+    Domains,
     Generator,
     JsonExamples,
     GraphSchemas,
