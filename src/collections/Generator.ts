@@ -107,6 +107,7 @@ const Generator: CollectionConfig = {
             { label: 'Payload Collections', value: 'payload' },
             { label: 'XState + Agent', value: 'xstate' },
             { label: 'Mermaid Diagrams', value: 'mermaid' },
+            { label: 'iLayer UI', value: 'ilayer' },
           ],
           defaultValue: 'openapi',
           admin: {
@@ -169,6 +170,8 @@ const Generator: CollectionConfig = {
           data.output = await generateXStateFiles(payload, domainFilter)
         } else if (outputFormat === 'mermaid') {
           data.output = await generateMermaidDiagrams(payload, domainFilter)
+        } else if (outputFormat === 'ilayer') {
+          data.output = await generateILayerFiles(payload, domainFilter)
         }
       }) as CollectionBeforeChangeHook<Generator>,
     ],
@@ -1432,6 +1435,243 @@ async function generateXStateFiles(payload: any, domainFilter: Where): Promise<a
 
     files[`agents/${machineName}-prompt.md`] = prompt
   }
+
+  return { files }
+}
+
+async function generateILayerFiles(payload: any, domainFilter: Where): Promise<any> {
+  const [nouns, readings, stateMachineDefinitions] = await Promise.all([
+    payload.find({ collection: 'nouns', pagination: false, where: domainFilter }).then((n: any) => n.docs),
+    payload.find({ collection: 'readings', pagination: false, depth: 0 }).then((r: any) => r.docs),
+    payload
+      .find({ collection: 'state-machine-definitions', pagination: false, depth: 0, where: domainFilter })
+      .then((s: any) => s.docs),
+  ])
+
+  const entityNouns = nouns.filter((n: any) => n.objectType === 'entity')
+  const allNouns = await payload.find({ collection: 'nouns', pagination: false }).then((n: any) => n.docs)
+  const allNounById = new Map(allNouns.map((n: any) => [n.id, n]))
+
+  // Build a map of role ID → role (with populated noun) for reading analysis
+  const allRoles = await payload
+    .find({ collection: 'roles', pagination: false, depth: 1 })
+    .then((r: any) => r.docs)
+  const roleById = new Map(allRoles.map((r: any) => [r.id, r]))
+
+  // For each reading, identify subject entity and object noun using the reading's roles array (preserves order)
+  type ReadingInfo = {
+    subjectNounId: string
+    objectNounId: string
+    text: string
+    gsId: string
+  }
+  const readingInfos: ReadingInfo[] = []
+
+  for (const reading of readings) {
+    const gsId = typeof reading.graphSchema === 'string' ? reading.graphSchema : reading.graphSchema?.id
+    if (!gsId) continue
+
+    // Use the reading's roles array which preserves creation order (subject first, object second)
+    const roleIds = (reading.roles || []) as string[]
+    if (roleIds.length < 2) continue
+
+    const firstRole = roleById.get(roleIds[0])
+    const secondRole = roleById.get(roleIds[1])
+    if (!firstRole || !secondRole) continue
+
+    const subjectNounId = typeof firstRole.noun?.value === 'string'
+      ? firstRole.noun.value
+      : firstRole.noun?.value?.id
+    const objectNounId = typeof secondRole.noun?.value === 'string'
+      ? secondRole.noun.value
+      : secondRole.noun?.value?.id
+
+    if (subjectNounId && objectNounId) {
+      readingInfos.push({ subjectNounId, objectNounId, text: reading.text, gsId })
+    }
+  }
+
+  const files: Record<string, string> = {}
+
+  // Helper: convert PascalCase name to camelCase field ID
+  function toCamelCase(name: string): string {
+    return nameToKey(name).replace(/^[A-Z]/, (c) => c.toLowerCase())
+  }
+
+  // Helper: split PascalCase into words for label
+  function toLabel(name: string): string {
+    return name.replace(/([A-Z])/g, ' $1').trim()
+  }
+
+  // Helper: convert entity name to slug (plural, lowercase, hyphenated)
+  function toSlug(noun: any): string {
+    if (noun.plural) return noun.plural
+    return noun.name
+      .replace(/([A-Z])/g, '-$1')
+      .toLowerCase()
+      .replace(/^-/, '')
+      + 's'
+  }
+
+  // Resolve state machine events for an entity noun
+  async function getStateMachineEvents(entityNounId: string): Promise<string[]> {
+    const events: string[] = []
+    for (const smDef of stateMachineDefinitions) {
+      const fullDef = await payload.findByID({
+        collection: 'state-machine-definitions',
+        id: smDef.id,
+        depth: 2,
+      })
+      const nounRef = fullDef.noun as any
+      const nounId = typeof nounRef?.value === 'string' ? nounRef.value : nounRef?.value?.id
+      if (nounId !== entityNounId) continue
+
+      const statuses = await payload
+        .find({
+          collection: 'statuses',
+          where: { stateMachineDefinition: { equals: smDef.id } },
+          pagination: false,
+        })
+        .then((s: any) => s.docs)
+
+      for (const status of statuses) {
+        const statusWithTransitions = await payload.findByID({
+          collection: 'statuses',
+          id: status.id,
+          depth: 3,
+        })
+        const transitions = (statusWithTransitions.transitions?.docs || []) as any[]
+        for (const t of transitions) {
+          const eventType =
+            typeof t.eventType === 'string'
+              ? await payload.findByID({ collection: 'event-types', id: t.eventType })
+              : t.eventType
+          if (eventType?.name && !events.includes(eventType.name)) {
+            events.push(eventType.name)
+          }
+        }
+      }
+    }
+    return events
+  }
+
+  // Map a value noun to an iLayer field type
+  function mapFieldType(valueNoun: any): { type: string; options?: string[] } {
+    // Check enum first
+    if (valueNoun.enum) {
+      const options = valueNoun.enum
+        .split(',')
+        .map((s: string) => s.trim())
+        .filter(Boolean)
+      return { type: 'select', options }
+    }
+
+    // Check format
+    if (valueNoun.format) {
+      if (valueNoun.format === 'email' || valueNoun.format === 'idn-email') return { type: 'email' }
+      if (valueNoun.format === 'date' || valueNoun.format === 'date-time' || valueNoun.format === 'time') return { type: 'date' }
+      if (valueNoun.format === 'uri' || valueNoun.format === 'uri-reference') return { type: 'text' }
+    }
+
+    // Check name for Email
+    if (valueNoun.name && /email/i.test(valueNoun.name)) return { type: 'email' }
+
+    // Check valueType
+    switch (valueNoun.valueType) {
+      case 'boolean':
+        return { type: 'bool' }
+      case 'number':
+      case 'integer':
+        return { type: 'numeric' }
+      case 'string':
+      default:
+        return { type: 'text' }
+    }
+  }
+
+  // Generate FormLayer for each entity noun
+  for (const entity of entityNouns) {
+    const slug = toSlug(entity)
+
+    // Find readings where this entity is the subject
+    const entityReadings = readingInfos.filter((r) => r.subjectNounId === entity.id)
+
+    // Separate value readings (fields) from entity readings (navigation)
+    const fieldReadings: ReadingInfo[] = []
+    const navReadings: ReadingInfo[] = []
+    for (const r of entityReadings) {
+      const objectNoun = allNounById.get(r.objectNounId)
+      if (!objectNoun) continue
+      if (objectNoun.objectType === 'value') {
+        fieldReadings.push(r)
+      } else if (objectNoun.objectType === 'entity') {
+        navReadings.push(r)
+      }
+    }
+
+    // Build fields from value readings
+    const fields: any[] = []
+    for (const r of fieldReadings) {
+      const valueNoun = allNounById.get(r.objectNounId)
+      if (!valueNoun) continue
+      const { type, options } = mapFieldType(valueNoun)
+      const field: any = {
+        id: toCamelCase(valueNoun.name),
+        type,
+        label: toLabel(valueNoun.name),
+      }
+      if (options) field.options = options
+      fields.push(field)
+    }
+
+    // Build action buttons from state machine events
+    const events = await getStateMachineEvents(entity.id)
+    const actionButtons = events.map((event) => ({
+      text: toLabel(event),
+      address: `/state/${entity.name}/${event}`,
+    }))
+
+    // Build navigation from entity-to-entity relationships
+    const navigation = navReadings.map((r) => {
+      const relatedNoun = allNounById.get(r.objectNounId)
+      return {
+        text: relatedNoun?.name || 'Unknown',
+        address: `/layers/${toSlug(relatedNoun || { name: 'unknown', plural: 'unknowns' })}`,
+      }
+    })
+
+    const formLayer: any = {
+      name: slug,
+      title: entity.name,
+      type: 'formLayer',
+      layout: 'Rounded',
+      fieldsets: [
+        {
+          header: entity.name,
+          fields,
+        },
+      ],
+    }
+    if (actionButtons.length) formLayer.actionButtons = actionButtons
+    if (navigation.length) formLayer.navigation = navigation
+
+    files[`layers/${slug}.json`] = JSON.stringify(formLayer, null, 2)
+  }
+
+  // Generate index navigation layer
+  const indexItems = entityNouns.map((entity: any) => ({
+    text: entity.name,
+    subtext: entity.plural || toSlug(entity),
+    link: `/layers/${toSlug(entity)}`,
+  }))
+
+  const indexLayer = {
+    name: 'index',
+    type: 'layer',
+    items: indexItems,
+  }
+
+  files['layers/index.json'] = JSON.stringify(indexLayer, null, 2)
 
   return { files }
 }
