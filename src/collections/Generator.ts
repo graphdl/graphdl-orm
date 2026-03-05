@@ -1616,8 +1616,9 @@ async function generateILayerFiles(payload: any, domainFilter: Where): Promise<a
       }
     }
 
-    // Build fields from value readings
+    // Build fields from value readings (deduplicate by field ID)
     const fields: any[] = []
+    const seenFieldIds = new Set<string>()
     for (const r of fieldReadings) {
       const valueNoun = allNounById.get(r.objectNounId) as any
       if (!valueNoun) continue
@@ -1627,6 +1628,8 @@ async function generateILayerFiles(payload: any, domainFilter: Where): Promise<a
         type,
         label: toLabel(valueNoun.name),
       }
+      if (seenFieldIds.has(field.id)) continue
+      seenFieldIds.add(field.id)
       if (options) field.options = options
       fields.push(field)
     }
