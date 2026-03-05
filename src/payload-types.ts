@@ -6,10 +6,66 @@
  * and re-run `payload generate:types` to regenerate this file.
  */
 
+/**
+ * Supported timezones in IANA format.
+ *
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "supportedTimezones".
+ */
+export type SupportedTimezones =
+  | 'Pacific/Midway'
+  | 'Pacific/Niue'
+  | 'Pacific/Honolulu'
+  | 'Pacific/Rarotonga'
+  | 'America/Anchorage'
+  | 'Pacific/Gambier'
+  | 'America/Los_Angeles'
+  | 'America/Tijuana'
+  | 'America/Denver'
+  | 'America/Phoenix'
+  | 'America/Chicago'
+  | 'America/Guatemala'
+  | 'America/New_York'
+  | 'America/Bogota'
+  | 'America/Caracas'
+  | 'America/Santiago'
+  | 'America/Buenos_Aires'
+  | 'America/Sao_Paulo'
+  | 'Atlantic/South_Georgia'
+  | 'Atlantic/Azores'
+  | 'Atlantic/Cape_Verde'
+  | 'Europe/London'
+  | 'Europe/Berlin'
+  | 'Africa/Lagos'
+  | 'Europe/Athens'
+  | 'Africa/Cairo'
+  | 'Europe/Moscow'
+  | 'Asia/Riyadh'
+  | 'Asia/Dubai'
+  | 'Asia/Baku'
+  | 'Asia/Karachi'
+  | 'Asia/Tashkent'
+  | 'Asia/Calcutta'
+  | 'Asia/Dhaka'
+  | 'Asia/Almaty'
+  | 'Asia/Jakarta'
+  | 'Asia/Bangkok'
+  | 'Asia/Shanghai'
+  | 'Asia/Singapore'
+  | 'Asia/Tokyo'
+  | 'Asia/Seoul'
+  | 'Australia/Brisbane'
+  | 'Australia/Sydney'
+  | 'Pacific/Guam'
+  | 'Pacific/Noumea'
+  | 'Pacific/Auckland'
+  | 'Pacific/Fiji';
+
 export interface Config {
   auth: {
     users: UserAuthOperations;
   };
+  blocks: {};
   collections: {
     domains: Domain;
     generators: Generator;
@@ -35,6 +91,7 @@ export interface Config {
     'state-machines': StateMachine;
     'guard-runs': GuardRun;
     users: User;
+    'payload-kv': PayloadKv;
     'payload-locked-documents': PayloadLockedDocument;
     'payload-preferences': PayloadPreference;
     'payload-migrations': PayloadMigration;
@@ -111,6 +168,7 @@ export interface Config {
     'state-machines': StateMachinesSelect<false> | StateMachinesSelect<true>;
     'guard-runs': GuardRunsSelect<false> | GuardRunsSelect<true>;
     users: UsersSelect<false> | UsersSelect<true>;
+    'payload-kv': PayloadKvSelect<false> | PayloadKvSelect<true>;
     'payload-locked-documents': PayloadLockedDocumentsSelect<false> | PayloadLockedDocumentsSelect<true>;
     'payload-preferences': PayloadPreferencesSelect<false> | PayloadPreferencesSelect<true>;
     'payload-migrations': PayloadMigrationsSelect<false> | PayloadMigrationsSelect<true>;
@@ -118,12 +176,14 @@ export interface Config {
   db: {
     defaultIDType: string;
   };
+  fallbackLocale: null;
   globals: {};
   globalsSelect: {};
   locale: null;
-  user: User & {
-    collection: 'users';
+  widgets: {
+    collections: CollectionsWidget;
   };
+  user: User;
   jobs: {
     tasks: unknown;
     workflows: unknown;
@@ -173,37 +233,42 @@ export interface Domain {
    * Noun belongs to Domain.
    */
   nouns?: {
-    docs?: (string | Noun)[] | null;
-    hasNextPage?: boolean | null;
-  } | null;
+    docs?: (string | Noun)[];
+    hasNextPage?: boolean;
+    totalDocs?: number;
+  };
   /**
    * Reading belongs to Domain.
    */
   readings?: {
-    docs?: (string | Reading)[] | null;
-    hasNextPage?: boolean | null;
-  } | null;
+    docs?: (string | Reading)[];
+    hasNextPage?: boolean;
+    totalDocs?: number;
+  };
   /**
    * GraphSchema belongs to Domain.
    */
   graphSchemas?: {
-    docs?: (string | GraphSchema)[] | null;
-    hasNextPage?: boolean | null;
-  } | null;
+    docs?: (string | GraphSchema)[];
+    hasNextPage?: boolean;
+    totalDocs?: number;
+  };
   /**
    * StateMachineDefinition belongs to Domain.
    */
   stateMachineDefinitions?: {
-    docs?: (string | StateMachineDefinition)[] | null;
-    hasNextPage?: boolean | null;
-  } | null;
+    docs?: (string | StateMachineDefinition)[];
+    hasNextPage?: boolean;
+    totalDocs?: number;
+  };
   /**
    * Generator belongs to Domain.
    */
   generators?: {
-    docs?: (string | Generator)[] | null;
-    hasNextPage?: boolean | null;
-  } | null;
+    docs?: (string | Generator)[];
+    hasNextPage?: boolean;
+    totalDocs?: number;
+  };
   updatedAt: string;
   createdAt: string;
 }
@@ -241,9 +306,10 @@ export interface Noun {
    * State Machine Definition is for Noun.
    */
   stateMachineDefinitions?: {
-    docs?: (string | StateMachineDefinition)[] | null;
-    hasNextPage?: boolean | null;
-  } | null;
+    docs?: (string | StateMachineDefinition)[];
+    hasNextPage?: boolean;
+    totalDocs?: number;
+  };
   /**
    * Noun has object type
    */
@@ -326,9 +392,10 @@ export interface Noun {
    * Noun has Sub Types.
    */
   subTypes?: {
-    docs?: (string | Noun)[] | null;
-    hasNextPage?: boolean | null;
-  } | null;
+    docs?: (string | Noun)[];
+    hasNextPage?: boolean;
+    totalDocs?: number;
+  };
   updatedAt: string;
   createdAt: string;
 }
@@ -359,9 +426,10 @@ export interface StateMachineDefinition {
    * Status is defined in State Machine Definition.
    */
   statuses?: {
-    docs?: (string | Status)[] | null;
-    hasNextPage?: boolean | null;
-  } | null;
+    docs?: (string | Status)[];
+    hasNextPage?: boolean;
+    totalDocs?: number;
+  };
   updatedAt: string;
   createdAt: string;
 }
@@ -392,16 +460,18 @@ export interface GraphSchema {
    * Graph Schema has Reading.
    */
   readings?: {
-    docs?: (string | Reading)[] | null;
-    hasNextPage?: boolean | null;
-  } | null;
+    docs?: (string | Reading)[];
+    hasNextPage?: boolean;
+    totalDocs?: number;
+  };
   /**
    * Graph Schema uses Role.
    */
   roles?: {
-    docs?: (string | Role)[] | null;
-    hasNextPage?: boolean | null;
-  } | null;
+    docs?: (string | Role)[];
+    hasNextPage?: boolean;
+    totalDocs?: number;
+  };
   /**
    * Graph Schema has enumeration Order.
    */
@@ -411,9 +481,10 @@ export interface GraphSchema {
    * Graph is of Graph Schema.
    */
   graphs?: {
-    docs?: (string | Graph)[] | null;
-    hasNextPage?: boolean | null;
-  } | null;
+    docs?: (string | Graph)[];
+    hasNextPage?: boolean;
+    totalDocs?: number;
+  };
   /**
    * Noun has Access Permissions.
    */
@@ -422,9 +493,10 @@ export interface GraphSchema {
    * State Machine Definition is for Noun.
    */
   stateMachineDefinitions?: {
-    docs?: (string | StateMachineDefinition)[] | null;
-    hasNextPage?: boolean | null;
-  } | null;
+    docs?: (string | StateMachineDefinition)[];
+    hasNextPage?: boolean;
+    totalDocs?: number;
+  };
   updatedAt: string;
   createdAt: string;
 }
@@ -550,9 +622,10 @@ export interface Role {
    * Constraint spans Role.
    */
   constraints?: {
-    docs?: (string | ConstraintSpan)[] | null;
-    hasNextPage?: boolean | null;
-  } | null;
+    docs?: (string | ConstraintSpan)[];
+    hasNextPage?: boolean;
+    totalDocs?: number;
+  };
   required?: boolean | null;
   updatedAt: string;
   createdAt: string;
@@ -602,9 +675,10 @@ export interface Constraint {
    * Constraint spans Role.
    */
   roles?: {
-    docs?: (string | ConstraintSpan)[] | null;
-    hasNextPage?: boolean | null;
-  } | null;
+    docs?: (string | ConstraintSpan)[];
+    hasNextPage?: boolean;
+    totalDocs?: number;
+  };
   updatedAt: string;
   createdAt: string;
 }
@@ -627,9 +701,10 @@ export interface Graph {
    * Graph uses Resource for Role.
    */
   resourceRoles?: {
-    docs?: (string | ResourceRole)[] | null;
-    hasNextPage?: boolean | null;
-  } | null;
+    docs?: (string | ResourceRole)[];
+    hasNextPage?: boolean;
+    totalDocs?: number;
+  };
   /**
    * Graph verb is done for now.
    */
@@ -642,9 +717,10 @@ export interface Graph {
    * State Machine is for Resource.
    */
   stateMachine?: {
-    docs?: (string | StateMachine)[] | null;
-    hasNextPage?: boolean | null;
-  } | null;
+    docs?: (string | StateMachine)[];
+    hasNextPage?: boolean;
+    totalDocs?: number;
+  };
   updatedAt: string;
   createdAt: string;
 }
@@ -712,9 +788,10 @@ export interface Resource {
    * State Machine is for Resource.
    */
   stateMachine?: {
-    docs?: (string | StateMachine)[] | null;
-    hasNextPage?: boolean | null;
-  } | null;
+    docs?: (string | StateMachine)[];
+    hasNextPage?: boolean;
+    totalDocs?: number;
+  };
   updatedAt: string;
   createdAt: string;
 }
@@ -774,9 +851,10 @@ export interface Status {
    * Transition is from Status.
    */
   transitions?: {
-    docs?: (string | Transition)[] | null;
-    hasNextPage?: boolean | null;
-  } | null;
+    docs?: (string | Transition)[];
+    hasNextPage?: boolean;
+    totalDocs?: number;
+  };
   updatedAt: string;
   createdAt: string;
 }
@@ -803,9 +881,10 @@ export interface Transition {
    * Guard prevents Transition.
    */
   guard?: {
-    docs?: (string | Guard)[] | null;
-    hasNextPage?: boolean | null;
-  } | null;
+    docs?: (string | Guard)[];
+    hasNextPage?: boolean;
+    totalDocs?: number;
+  };
   /**
    * Verb is performed during Transition (Mealy semantics).
    */
@@ -827,9 +906,10 @@ export interface EventType {
    * Event Type publishes to Stream.
    */
   streams?: {
-    docs?: (string | Stream)[] | null;
-    hasNextPage?: boolean | null;
-  } | null;
+    docs?: (string | Stream)[];
+    hasNextPage?: boolean;
+    totalDocs?: number;
+  };
   /**
    * Event Type can be created by Verb.
    */
@@ -876,9 +956,10 @@ export interface Guard {
    * Guard Run is for Guard.
    */
   runs?: {
-    docs?: (string | GuardRun)[] | null;
-    hasNextPage?: boolean | null;
-  } | null;
+    docs?: (string | GuardRun)[];
+    hasNextPage?: boolean;
+    totalDocs?: number;
+  };
   updatedAt: string;
   createdAt: string;
 }
@@ -1051,7 +1132,32 @@ export interface User {
   hash?: string | null;
   loginAttempts?: number | null;
   lockUntil?: string | null;
+  sessions?:
+    | {
+        id: string;
+        createdAt?: string | null;
+        expiresAt: string;
+      }[]
+    | null;
   password?: string | null;
+  collection: 'users';
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "payload-kv".
+ */
+export interface PayloadKv {
+  id: string;
+  key: string;
+  data:
+    | {
+        [k: string]: unknown;
+      }
+    | unknown[]
+    | string
+    | number
+    | boolean
+    | null;
 }
 /**
  * This interface was referenced by `Config`'s JSON-Schema
@@ -1548,6 +1654,21 @@ export interface UsersSelect<T extends boolean = true> {
   hash?: T;
   loginAttempts?: T;
   lockUntil?: T;
+  sessions?:
+    | T
+    | {
+        id?: T;
+        createdAt?: T;
+        expiresAt?: T;
+      };
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "payload-kv_select".
+ */
+export interface PayloadKvSelect<T extends boolean = true> {
+  key?: T;
+  data?: T;
 }
 /**
  * This interface was referenced by `Config`'s JSON-Schema
@@ -1580,6 +1701,16 @@ export interface PayloadMigrationsSelect<T extends boolean = true> {
   batch?: T;
   updatedAt?: T;
   createdAt?: T;
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "collections_widget".
+ */
+export interface CollectionsWidget {
+  data?: {
+    [k: string]: unknown;
+  };
+  width: 'full';
 }
 /**
  * This interface was referenced by `Config`'s JSON-Schema
