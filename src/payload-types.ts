@@ -11,6 +11,7 @@ export interface Config {
     users: UserAuthOperations;
   };
   collections: {
+    domains: Domain;
     generators: Generator;
     'json-examples': JsonExample;
     'graph-schemas': GraphSchema;
@@ -39,6 +40,13 @@ export interface Config {
     'payload-migrations': PayloadMigration;
   };
   collectionsJoins: {
+    domains: {
+      nouns: 'nouns';
+      readings: 'readings';
+      graphSchemas: 'graph-schemas';
+      stateMachineDefinitions: 'state-machine-definitions';
+      generators: 'generators';
+    };
     'graph-schemas': {
       readings: 'readings';
       roles: 'roles';
@@ -79,6 +87,7 @@ export interface Config {
     };
   };
   collectionsSelect: {
+    domains: DomainsSelect<false> | DomainsSelect<true>;
     generators: GeneratorsSelect<false> | GeneratorsSelect<true>;
     'json-examples': JsonExamplesSelect<false> | JsonExamplesSelect<true>;
     'graph-schemas': GraphSchemasSelect<false> | GraphSchemasSelect<true>;
@@ -140,106 +149,61 @@ export interface UserAuthOperations {
 }
 /**
  * This interface was referenced by `Config`'s JSON-Schema
- * via the `definition` "generators".
+ * via the `definition` "domains".
  */
-export interface Generator {
+export interface Domain {
   id: string;
   /**
-   * Domain this resource belongs to.
+   * Domain is identified by DomainSlug.
    */
-  domain?: string | null;
+  domainSlug: string;
   /**
-   * Domains to include in generation. Empty = use single domain field or all.
+   * Domain has Name.
    */
-  domains?: string[] | null;
-  title?: string | null;
-  version?: string | null;
-  email?: string | null;
   name?: string | null;
-  url?: string | null;
+  /**
+   * Domain has Description.
+   */
   description?: string | null;
-  servers?:
-    | {
-        [k: string]: unknown;
-      }
-    | unknown[]
-    | string
-    | number
-    | boolean
-    | null;
-  globalPermissions?: ('create' | 'read' | 'update' | 'delete' | 'list' | 'login' | 'rateLimit')[] | null;
-  replacementFieldPath?: string | null;
-  globalWrapperTemplate?:
-    | {
-        [k: string]: unknown;
-      }
-    | unknown[]
-    | string
-    | number
-    | boolean
-    | null;
-  errorCodePath?: string | null;
-  errorMessagePath?: string | null;
-  errorTemplate?:
-    | {
-        [k: string]: unknown;
-      }
-    | unknown[]
-    | string
-    | number
-    | boolean
-    | null;
-  databaseEngine: 'Payload';
   /**
-   * What this generator produces. OpenAPI is the default.
+   * Tenant email for API-layer access scoping.
    */
-  outputFormat?: ('openapi' | 'payload' | 'xstate' | 'mermaid') | null;
+  tenant?: string | null;
   /**
-   * Source generator whose output is used as input. Auto-detected if not set.
+   * Noun belongs to Domain.
    */
-  sourceGenerator?: (string | null) | Generator;
-  output?:
-    | {
-        [k: string]: unknown;
-      }
-    | unknown[]
-    | string
-    | number
-    | boolean
-    | null;
-  updatedAt: string;
-  createdAt: string;
-}
-/**
- * This interface was referenced by `Config`'s JSON-Schema
- * via the `definition` "json-examples".
- */
-export interface JsonExample {
-  id: string;
-  title?: string | null;
-  noun?:
-    | ({
-        relationTo: 'nouns';
-        value: string | Noun;
-      } | null)
-    | ({
-        relationTo: 'graph-schemas';
-        value: string | GraphSchema;
-      } | null);
-  jsonExample?:
-    | {
-        [k: string]: unknown;
-      }
-    | unknown[]
-    | string
-    | number
-    | boolean
-    | null;
+  nouns?: {
+    docs?: (string | Noun)[] | null;
+    hasNextPage?: boolean | null;
+  } | null;
   /**
-   * Add this JSON example verbatim to the generated output JSON and do not generate graphs
+   * Reading belongs to Domain.
    */
-  verbatim?: boolean | null;
-  outputGraphs?: (string | Graph)[] | null;
+  readings?: {
+    docs?: (string | Reading)[] | null;
+    hasNextPage?: boolean | null;
+  } | null;
+  /**
+   * GraphSchema belongs to Domain.
+   */
+  graphSchemas?: {
+    docs?: (string | GraphSchema)[] | null;
+    hasNextPage?: boolean | null;
+  } | null;
+  /**
+   * StateMachineDefinition belongs to Domain.
+   */
+  stateMachineDefinitions?: {
+    docs?: (string | StateMachineDefinition)[] | null;
+    hasNextPage?: boolean | null;
+  } | null;
+  /**
+   * Generator belongs to Domain.
+   */
+  generators?: {
+    docs?: (string | Generator)[] | null;
+    hasNextPage?: boolean | null;
+  } | null;
   updatedAt: string;
   createdAt: string;
 }
@@ -252,7 +216,7 @@ export interface Noun {
   /**
    * Domain this resource belongs to.
    */
-  domain?: string | null;
+  domain?: (string | null) | Domain;
   /**
    * schema:Thing has Name.
    */
@@ -377,7 +341,7 @@ export interface StateMachineDefinition {
   /**
    * Domain this resource belongs to.
    */
-  domain?: string | null;
+  domain?: (string | null) | Domain;
   title?: string | null;
   /**
    * State Machine Definition is for Noun.
@@ -410,7 +374,7 @@ export interface GraphSchema {
   /**
    * Domain this resource belongs to.
    */
-  domain?: string | null;
+  domain?: (string | null) | Domain;
   /**
    * Graph Schema has Name.
    */
@@ -473,7 +437,7 @@ export interface Reading {
   /**
    * Domain this resource belongs to.
    */
-  domain?: string | null;
+  domain?: (string | null) | Domain;
   /**
    * Graph Schema has Reading.
    */
@@ -767,15 +731,15 @@ export interface StateMachine {
   /**
    * State Machine is for Resource.
    */
-  resource:
-    | {
+  resource?:
+    | ({
         relationTo: 'resources';
         value: string | Resource;
-      }
-    | {
+      } | null)
+    | ({
         relationTo: 'graphs';
         value: string | Graph;
-      };
+      } | null);
   /**
    * State Machine is instance of State Machine Definition.
    */
@@ -941,6 +905,111 @@ export interface GuardRun {
 }
 /**
  * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "generators".
+ */
+export interface Generator {
+  id: string;
+  /**
+   * Domain this resource belongs to.
+   */
+  domain?: (string | null) | Domain;
+  /**
+   * Domains to include in generation. Empty = use single domain field or all.
+   */
+  domains?: (string | Domain)[] | null;
+  title?: string | null;
+  version?: string | null;
+  email?: string | null;
+  name?: string | null;
+  url?: string | null;
+  description?: string | null;
+  servers?:
+    | {
+        [k: string]: unknown;
+      }
+    | unknown[]
+    | string
+    | number
+    | boolean
+    | null;
+  globalPermissions?: ('create' | 'read' | 'update' | 'delete' | 'list' | 'login' | 'rateLimit')[] | null;
+  replacementFieldPath?: string | null;
+  globalWrapperTemplate?:
+    | {
+        [k: string]: unknown;
+      }
+    | unknown[]
+    | string
+    | number
+    | boolean
+    | null;
+  errorCodePath?: string | null;
+  errorMessagePath?: string | null;
+  errorTemplate?:
+    | {
+        [k: string]: unknown;
+      }
+    | unknown[]
+    | string
+    | number
+    | boolean
+    | null;
+  databaseEngine: 'Payload';
+  /**
+   * What this generator produces. OpenAPI is the default.
+   */
+  outputFormat?: ('openapi' | 'payload' | 'xstate' | 'mermaid' | 'ilayer') | null;
+  /**
+   * Source generator whose output is used as input. Auto-detected if not set.
+   */
+  sourceGenerator?: (string | null) | Generator;
+  output?:
+    | {
+        [k: string]: unknown;
+      }
+    | unknown[]
+    | string
+    | number
+    | boolean
+    | null;
+  updatedAt: string;
+  createdAt: string;
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "json-examples".
+ */
+export interface JsonExample {
+  id: string;
+  title?: string | null;
+  noun?:
+    | ({
+        relationTo: 'nouns';
+        value: string | Noun;
+      } | null)
+    | ({
+        relationTo: 'graph-schemas';
+        value: string | GraphSchema;
+      } | null);
+  jsonExample?:
+    | {
+        [k: string]: unknown;
+      }
+    | unknown[]
+    | string
+    | number
+    | boolean
+    | null;
+  /**
+   * Add this JSON example verbatim to the generated output JSON and do not generate graphs
+   */
+  verbatim?: boolean | null;
+  outputGraphs?: (string | Graph)[] | null;
+  updatedAt: string;
+  createdAt: string;
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
  * via the `definition` "events".
  */
 export interface Event {
@@ -991,6 +1060,10 @@ export interface User {
 export interface PayloadLockedDocument {
   id: string;
   document?:
+    | ({
+        relationTo: 'domains';
+        value: string | Domain;
+      } | null)
     | ({
         relationTo: 'generators';
         value: string | Generator;
@@ -1124,6 +1197,23 @@ export interface PayloadMigration {
   batch?: number | null;
   updatedAt: string;
   createdAt: string;
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "domains_select".
+ */
+export interface DomainsSelect<T extends boolean = true> {
+  domainSlug?: T;
+  name?: T;
+  description?: T;
+  tenant?: T;
+  nouns?: T;
+  readings?: T;
+  graphSchemas?: T;
+  stateMachineDefinitions?: T;
+  generators?: T;
+  updatedAt?: T;
+  createdAt?: T;
 }
 /**
  * This interface was referenced by `Config`'s JSON-Schema
