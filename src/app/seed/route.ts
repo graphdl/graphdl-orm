@@ -10,6 +10,38 @@ interface SeedFileInput {
   entityNoun?: string // required for state-machine type
 }
 
+export const GET = async () => {
+  const payload = await getPayload({ config: configPromise })
+
+  const [nouns, readings, domains, stateMachines, eventTypes, transitions, verbs, functions] = await Promise.all([
+    payload.count({ collection: 'nouns' }),
+    payload.count({ collection: 'readings' }),
+    payload.count({ collection: 'domains' }),
+    payload.count({ collection: 'state-machine-definitions' }),
+    payload.count({ collection: 'event-types' }),
+    payload.count({ collection: 'transitions' }),
+    payload.count({ collection: 'verbs' }),
+    payload.count({ collection: 'functions' }),
+  ])
+
+  return Response.json({
+    seed: {
+      nouns: nouns.totalDocs,
+      readings: readings.totalDocs,
+      domains: domains.totalDocs,
+      stateMachineDefinitions: stateMachines.totalDocs,
+      eventTypes: eventTypes.totalDocs,
+      transitions: transitions.totalDocs,
+      verbs: verbs.totalDocs,
+      functions: functions.totalDocs,
+    },
+    actions: {
+      seed: 'POST /seed with { markdown, type: "domain"|"state-machine"|"forml2", domain?, entityNoun? }',
+      wipe: 'DELETE /seed — drops all collections except users',
+    },
+  })
+}
+
 export const POST = async (request: Request) => {
   const payload = await getPayload({ config: configPromise })
   const body = await request.json()
