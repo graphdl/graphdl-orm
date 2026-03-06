@@ -29,6 +29,7 @@
     "payload": "3.79.0",
     "react": "19.0.0",
     "react-dom": "19.0.0",
+    "react-image-crop": "^11.0.10",
     "sharp": "0.33.5"
   },
   "devDependencies": {
