@@ -162,8 +162,11 @@ export function parseDomainMarkdown(markdown: string): DomainParseResult {
     .filter((row) => row.length >= 1 && row[0] !== 'Fact')
     .map((row) => row[0])
 
-  // Deontic Constraints
-  const constraintLines = findSection(lines, 'Deontic Constraints')
+  // Deontic Constraints (matches "Deontic Constraints" or "Fact Types with Deontic Mandatory Constraints")
+  let constraintLines = findSection(lines, 'Deontic Constraints')
+  if (!constraintLines.length) {
+    constraintLines = findSection(lines, 'Fact Types with Deontic Mandatory Constraints')
+  }
   const constraintRows = parseTableRows(constraintLines)
   const deonticConstraints = constraintRows
     .filter((row) => row.length >= 1 && row[0] !== 'Constraint')
