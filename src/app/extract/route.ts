@@ -3,26 +3,21 @@ import { getPayload } from 'payload'
 import { buildMatchers, matchText } from '../../extract/matcher'
 import type { DeonticConstraintGroup } from '../../seed/deontic'
 
-export const POST = async (request: Request) => {
-  let body: { text?: string; domain?: string }
-  try {
-    body = await request.json()
-  } catch {
-    return Response.json({ error: 'Invalid JSON body' }, { status: 400 })
+export const GET = async (request: Request) => {
+  const url = new URL(request.url)
+  const text = url.searchParams.get('text')
+  const domain = url.searchParams.get('domain')
+
+  if (!text || !domain) {
+    return Response.json({ error: 'Required params: ?text=...&domain=...' }, { status: 400 })
   }
 
-  const { text, domain } = body
+  return extract(text, domain)
+}
 
-  if (!text || typeof text !== 'string') {
-    return Response.json({ error: 'Missing or invalid "text" field' }, { status: 400 })
-  }
-  if (!domain || typeof domain !== 'string') {
-    return Response.json({ error: 'Missing or invalid "domain" field' }, { status: 400 })
-  }
-
+async function extract(text: string, domain: string) {
   const payload = await getPayload({ config: configPromise })
 
-  // Find the domain by slug
   const domainResult = await payload.find({
     collection: 'domains',
     where: { domainSlug: { equals: domain } },
@@ -35,7 +30,6 @@ export const POST = async (request: Request) => {
 
   const domainDoc = domainResult.docs[0]
 
-  // Fetch all readings in this domain
   const readingsResult = await payload.find({
     collection: 'readings',
     where: { domain: { equals: domainDoc.id } },
@@ -44,7 +38,6 @@ export const POST = async (request: Request) => {
 
   const readings = readingsResult.docs
 
-  // Identify deontic constraints: readings whose text contains "must"
   const deonticConstraints: string[] = []
   const allTexts: string[] = []
 
@@ -56,8 +49,6 @@ export const POST = async (request: Request) => {
     }
   }
 
-  // Filter out instance-fact readings: if a "must" reading is a prefix+value
-  // of another "must" reading, it's an instance fact, not a standalone constraint.
   const instanceFactTexts = new Set<string>()
   for (const a of deonticConstraints) {
     for (const b of deonticConstraints) {
@@ -68,8 +59,6 @@ export const POST = async (request: Request) => {
   }
   const rootConstraints = deonticConstraints.filter((c) => !instanceFactTexts.has(c))
 
-  // For each constraint, find instance facts: readings whose text starts with
-  // the constraint text and has additional content after it.
   const groups: DeonticConstraintGroup[] = rootConstraints.map((constraintText) => {
     const instances: string[] = []
 
@@ -77,7 +66,6 @@ export const POST = async (request: Request) => {
       if (readingText === constraintText) continue
       if (readingText.startsWith(constraintText)) {
         let trailing = readingText.slice(constraintText.length).trim()
-        // Strip surrounding quotes from the instance value
         if (
           trailing.length >= 2 &&
           ((trailing.startsWith("'") && trailing.endsWith("'")) ||
@@ -100,4 +88,24 @@ export const POST = async (request: Request) => {
   const result = matchText(text, matchers)
 
   return Response.json(result)
+}
+
+export const POST = async (request: Request) => {
+  let body: { text?: string; domain?: string }
+  try {
+    body = await request.json()
+  } catch {
+    return Response.json({ error: 'Invalid JSON body' }, { status: 400 })
+  }
+
+  const { text, domain } = body
+
+  if (!text || typeof text !== 'string') {
+    return Response.json({ error: 'Missing or invalid "text" field' }, { status: 400 })
+  }
+  if (!domain || typeof domain !== 'string') {
+    return Response.json({ error: 'Missing or invalid "domain" field' }, { status: 400 })
+  }
+
+  return extract(text, domain)
 }
