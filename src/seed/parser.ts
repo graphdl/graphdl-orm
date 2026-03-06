@@ -32,12 +32,18 @@ export interface ReadingDef {
   ucs?: string[][]
 }
 
+export interface DeonticConstraintInstanceDef {
+  constraint: string
+  instance: string
+}
+
 export interface DomainParseResult {
   entityTypes: EntityTypeDef[]
   valueTypes: ValueTypeDef[]
   readings: ReadingDef[]
   instanceFacts: string[]
   deonticConstraints: string[]
+  deonticConstraintInstances: DeonticConstraintInstanceDef[]
 }
 
 export interface StateMachineParseResult {
@@ -163,7 +169,14 @@ export function parseDomainMarkdown(markdown: string): DomainParseResult {
     .filter((row) => row.length >= 1 && row[0] !== 'Constraint')
     .map((row) => row[0])
 
-  return { entityTypes, valueTypes, readings, instanceFacts, deonticConstraints }
+  // Deontic Constraint Instance Facts
+  const deonticInstanceLines = findSection(lines, 'Deontic Mandatory Constraint Instance Facts')
+  const deonticInstanceRows = parseTableRows(deonticInstanceLines)
+  const deonticConstraintInstances: DeonticConstraintInstanceDef[] = deonticInstanceRows
+    .filter((row) => row.length >= 2 && row[0] !== 'Constraint')
+    .map((row) => ({ constraint: row[0], instance: row[1] }))
+
+  return { entityTypes, valueTypes, readings, instanceFacts, deonticConstraints, deonticConstraintInstances }
 }
 
 // ─── State Machine Parser ───────────────────────────────────────────────────
