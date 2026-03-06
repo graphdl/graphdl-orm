@@ -29,7 +29,7 @@ const Resources: CollectionConfig = {
         if (!stateMachines.docs.length) return
 
         for (const sm of stateMachines.docs) {
-          const currentStatusId = typeof sm.currentStatus === 'string' ? sm.currentStatus : (sm.currentStatus as any)?.id
+          const currentStatusId = typeof sm.stateMachineStatus === 'string' ? sm.stateMachineStatus : (sm.stateMachineStatus as any)?.id
           if (!currentStatusId) continue
 
           // Find transitions from the current status
@@ -73,7 +73,7 @@ const Resources: CollectionConfig = {
               await payload.update({
                 collection: 'state-machines',
                 id: (sm as any).id,
-                data: { currentStatus: toStatusId },
+                data: { stateMachineStatus: toStatusId },
                 req,
               })
             }
