@@ -7,6 +7,103 @@ const Resources: CollectionConfig = {
     group: 'Implementations',
     useAsTitle: 'title',
   },
+  hooks: {
+    afterChange: [
+      async ({ doc, req, operation, context }) => {
+        const { payload } = req
+        // Recursion guard
+        if ((context.internal as string[])?.includes('resources.afterChange')) return
+        if (!context.internal) context.internal = []
+        ;(context.internal as string[]).push('resources.afterChange')
+
+        if (operation !== 'create' && operation !== 'update') return
+
+        // Find state machine instances for this resource
+        const stateMachines = await payload.find({
+          collection: 'state-machines',
+          where: { resource: { equals: doc.id } },
+          depth: 2,
+          req,
+        })
+
+        if (!stateMachines.docs.length) return
+
+        for (const sm of stateMachines.docs) {
+          const currentStatusId = typeof sm.currentStatus === 'string' ? sm.currentStatus : (sm.currentStatus as any)?.id
+          if (!currentStatusId) continue
+
+          // Find transitions from the current status
+          const transitions = await payload.find({
+            collection: 'transitions',
+            where: { from: { equals: currentStatusId } },
+            depth: 3,
+            req,
+          })
+
+          for (const transition of transitions.docs) {
+            const verb = typeof transition.verb === 'object' ? transition.verb : null
+            if (!verb) continue
+
+            const eventType = typeof transition.eventType === 'object' ? transition.eventType : null
+            if (!eventType) continue
+
+            // Check if this verb is linked to the event type
+            const linkedVerbs = (eventType as any).canBeCreatedbyVerbs || []
+            const verbMatches = linkedVerbs.some((v: any) => {
+              const vId = typeof v === 'string' ? v : v?.id
+              return vId === (typeof verb === 'object' ? verb.id : verb)
+            })
+
+            if (!verbMatches) continue
+
+            // Create the event
+            await payload.create({
+              collection: 'events',
+              data: {
+                type: (eventType as any).id,
+                timestamp: new Date().toISOString(),
+                stateMachine: (sm as any).id,
+              },
+              req,
+            })
+
+            // Update state machine to new status
+            const toStatusId = typeof transition.to === 'string' ? transition.to : (transition.to as any)?.id
+            if (toStatusId) {
+              await payload.update({
+                collection: 'state-machines',
+                id: (sm as any).id,
+                data: { currentStatus: toStatusId },
+                req,
+              })
+            }
+
+            // Fire callback if the verb has a function with a callbackUrl
+            const func = typeof (verb as any).function === 'object' ? (verb as any).function : null
+            if (func?.callbackUrl) {
+              try {
+                await fetch(func.callbackUrl, {
+                  method: func.httpMethod || 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    resourceId: doc.id,
+                    event: (eventType as any).name,
+                    previousStatus: currentStatusId,
+                    newStatus: toStatusId,
+                    resource: doc,
+                  }),
+                })
+              } catch {
+                // Log but don't block
+              }
+            }
+
+            break // Only fire the first matching transition
+          }
+        }
+      },
+    ],
+  },
   fields: [
     {
       name: 'title',
