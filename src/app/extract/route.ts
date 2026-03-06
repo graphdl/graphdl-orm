@@ -56,9 +56,21 @@ export const POST = async (request: Request) => {
     }
   }
 
+  // Filter out instance-fact readings: if a "must" reading is a prefix+value
+  // of another "must" reading, it's an instance fact, not a standalone constraint.
+  const instanceFactTexts = new Set<string>()
+  for (const a of deonticConstraints) {
+    for (const b of deonticConstraints) {
+      if (a !== b && b.startsWith(a) && b.length > a.length) {
+        instanceFactTexts.add(b)
+      }
+    }
+  }
+  const rootConstraints = deonticConstraints.filter((c) => !instanceFactTexts.has(c))
+
   // For each constraint, find instance facts: readings whose text starts with
   // the constraint text and has additional content after it.
-  const groups: DeonticConstraintGroup[] = deonticConstraints.map((constraintText) => {
+  const groups: DeonticConstraintGroup[] = rootConstraints.map((constraintText) => {
     const instances: string[] = []
 
     for (const readingText of allTexts) {
