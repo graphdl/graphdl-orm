@@ -181,13 +181,26 @@ export async function seedDomain(
   }
 
   // ── Batch 6: Deontic constraint instance facts as readings ──
-  // Each instance fact is stored as "<constraint> <instance>" so the extract
+  // Each instance fact is stored as "<constraint> '<instance>'" so the extract
   // endpoint can find instances by prefix-matching against the constraint text.
   if (parsed.deonticConstraintInstances.length) {
-    const instanceReadings: ReadingDef[] = parsed.deonticConstraintInstances.map((d) => ({
-      text: `${d.constraint} '${d.instance}'`,
-      multiplicity: '*:1',
-    }))
+    const instanceReadings: ReadingDef[] = parsed.deonticConstraintInstances.map((d) => {
+      // Strip decorative quotes from markdown (e.g., "in summary" → in summary)
+      let inst = d.instance
+      if (
+        inst.length >= 2 &&
+        ((inst.startsWith('"') && inst.endsWith('"')) ||
+          (inst.startsWith("'") && inst.endsWith("'")) ||
+          (inst.startsWith('\u201C') && inst.endsWith('\u201D')) ||
+          (inst.startsWith('\u2018') && inst.endsWith('\u2019')))
+      ) {
+        inst = inst.slice(1, -1)
+      }
+      return {
+        text: `${d.constraint} '${inst}'`,
+        multiplicity: '*:1',
+      }
+    })
     await seedReadings(payload, instanceReadings, domainData, result)
   }
 
