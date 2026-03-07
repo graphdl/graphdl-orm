@@ -143,8 +143,11 @@ function parseConstraintSpec(reading: ReadingDef): ParsedConstraints {
       constraints.push({ kind: 'MC', modality: 'Alethic' })
       continue
     }
-    // "unary" is valid with no constraints (open world) — skip it
-    if (/^unary$/i.test(part)) continue
+    // "unary" — implicit UC on the single role (avoids redundancy)
+    if (/^unary$/i.test(part)) {
+      constraints.push({ kind: 'UC', modality: 'Alethic', uc: 'unary' })
+      continue
+    }
   }
 
   return { constraints }
@@ -205,6 +208,13 @@ async function applyConstraints(
           } as any)
         }
       }
+      continue
+    }
+
+    // Unary UC — implicit uniqueness on the single role
+    if (constraint.kind === 'UC' && constraint.uc === 'unary' && roles.docs.length >= 1) {
+      const c = await payload.create({ collection: 'constraints', data: { kind: 'UC', modality: constraint.modality } })
+      await payload.create({ collection: 'constraint-spans', data: { constraint: c.id, roles: [roles.docs[0].id] } } as any)
       continue
     }
 
