@@ -13,7 +13,7 @@ interface SeedFileInput {
 export const GET = async () => {
   const payload = await getPayload({ config: configPromise })
 
-  const [nouns, readings, domains, stateMachines, eventTypes, transitions, verbs, functions] = await Promise.all([
+  const [nouns, readings, domains, stateMachines, eventTypes, transitions, verbs, functions, graphs, resources, resourceRoles] = await Promise.all([
     payload.count({ collection: 'nouns' }),
     payload.count({ collection: 'readings' }),
     payload.count({ collection: 'domains' }),
@@ -22,6 +22,9 @@ export const GET = async () => {
     payload.count({ collection: 'transitions' }),
     payload.count({ collection: 'verbs' }),
     payload.count({ collection: 'functions' }),
+    payload.count({ collection: 'graphs' }),
+    payload.count({ collection: 'resources' }),
+    payload.count({ collection: 'resource-roles' }),
   ])
 
   return Response.json({
@@ -29,6 +32,9 @@ export const GET = async () => {
       nouns: nouns.totalDocs,
       readings: readings.totalDocs,
       domains: domains.totalDocs,
+      graphs: graphs.totalDocs,
+      resources: resources.totalDocs,
+      resourceRoles: resourceRoles.totalDocs,
       stateMachineDefinitions: stateMachines.totalDocs,
       eventTypes: eventTypes.totalDocs,
       transitions: transitions.totalDocs,

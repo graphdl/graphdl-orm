@@ -662,7 +662,7 @@ export interface Constraint {
   /**
    * Constraint is Kind of constraint.
    */
-  kind: 'UC' | 'SS' | 'XC' | 'EQ' | 'OR' | 'XO';
+  kind: 'UC' | 'SS' | 'XC' | 'EQ' | 'OR' | 'XO' | 'MC';
   /**
    * Constraint has modality of Modality Type. Alethic constraints enforce data integrity, while Deontic constraints warn when the constraint is violated.
    */
@@ -820,7 +820,7 @@ export interface StateMachine {
   /**
    * State Machine is instance of State Machine Definition.
    */
-  stateMachineType: string | StateMachine;
+  stateMachineType: string | StateMachineDefinition;
   /**
    * State Machine is currently in Status.
    */

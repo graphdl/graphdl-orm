@@ -118,7 +118,7 @@ const Resources: CollectionConfig = {
             const reference: {
               relationTo: 'resources' | 'graphs'
               value: string
-            }[] = data?.reference || originalDoc?.reference
+            }[] = data?.reference || originalDoc?.reference || []
             const resourceIds = reference
               .filter((r) => r.relationTo === 'resources')
               ?.map((r) => r.value)
@@ -128,7 +128,7 @@ const Resources: CollectionConfig = {
               ?.map((r) => r.value)
               ?.join(',')
             const [type, resources, graphs] = await Promise.all([
-              typeId && payload.findByID({ collection: 'nouns', id: typeId }),
+              typeId ? payload.findByID({ collection: 'nouns', id: typeId }).catch(() => null) : null,
               resourceIds
                 ? payload
                     .find({ collection: 'resources', where: { id: { in: resourceIds } } })
@@ -146,8 +146,8 @@ const Resources: CollectionConfig = {
                 graphs?.find((g: Graph) => g.id === r.value)
               )
             })
-            console.log('references', references)
-            return `${type.name} - ${
+            const typeName = type?.name || 'Resource'
+            return `${typeName} - ${
               data?.value ||
               originalDoc?.value ||
               references
