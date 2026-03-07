@@ -2,11 +2,20 @@
  * Seed handler: accepts parsed domain/state-machine definitions and creates
  * ORM entities via the Payload local API with idempotent upserts.
  *
- * Creates independent entities in parallel batches:
- * 1. All nouns (value + entity) — no dependencies
- * 2. Reference schemes — depends on noun IDs
- * 3. Graph schemas + readings — depends on nouns (for role auto-creation)
- * 4. Constraints — depends on roles (created by reading hooks)
+ * Readings are the source of truth. The handler:
+ * 1. Creates nouns (entity + value types)
+ * 2. Creates graph schemas + readings (hooks auto-detect nouns, create roles)
+ * 3. Applies uniqueness constraints from multiplicity notation
+ * 4. Handles subtype declarations by setting noun.superType
+ *
+ * Multiplicity notation is shorthand for uniqueness constraints:
+ *   *:1  → UC on role 0 (subject)
+ *   1:*  → UC on role 1 (object)
+ *   1:1  → UC on role 0 AND UC on role 1 (two separate constraints)
+ *   *:*  → UC spanning both roles (pair uniqueness)
+ *   UC(A,B) → explicit UC spanning named roles
+ *   unary → no constraint (single-role boolean fact)
+ *   subtype → sets noun.superType relationship
  */
 
 import type { Payload } from 'payload'
@@ -24,14 +33,6 @@ async function batch<T>(
   for (let i = 1; i < items.length; i += concurrency) {
     await Promise.all(items.slice(i, i + concurrency).map(fn))
   }
-}
-
-const MULT_MAP: Record<string, string> = {
-  '*:1': 'many-to-one',
-  '1:*': 'one-to-many',
-  '*:*': 'many-to-many',
-  '1:1': 'one-to-one',
-  ternary: 'many-to-many',
 }
 
 async function ensureDomain(payload: Payload, domainSlug: string): Promise<string> {
@@ -75,6 +76,349 @@ export interface SeedResult {
   stateMachines: number
   skipped: number
   errors: string[]
+}
+
+/**
+ * Parse a compound constraint spec into its parts.
+ *
+ * The multiplicity column is a constraint specification that can combine:
+ *   UC shorthand:  *:1, 1:*, *:*, 1:1, UC(A,B)
+ *   MC modifiers:  AMC (Alethic Mandatory), DMC (Deontic Mandatory)
+ *   Standalone:    subtype, unary, SS
+ *
+ * Examples:
+ *   "*:1"       → UC on role 0
+ *   "*:1 AMC"   → UC on role 0 + Alethic Mandatory (required field)
+ *   "1:* DMC"   → UC on role 1 + Deontic Mandatory (business rule)
+ *   "AMC"       → Alethic Mandatory only (no UC)
+ *   "unary"     → no constraints
+ */
+interface ParsedConstraints {
+  uc?: string           // *:1, 1:*, *:*, 1:1
+  ucs?: string[][]      // UC(A,B) explicit notation
+  amc?: boolean         // Alethic Mandatory Constraint
+  dmc?: boolean         // Deontic Mandatory Constraint
+  skip?: boolean        // unary, subtype, SS — handled elsewhere
+}
+
+function parseConstraintSpec(reading: ReadingDef): ParsedConstraints {
+  const mult = reading.multiplicity
+  if (mult === 'unary' || mult === 'subtype' || mult === 'SS') return { skip: true }
+
+  if (reading.ucs?.length) return { ucs: reading.ucs }
+
+  const parts = mult.split(/\s+/)
+  const result: ParsedConstraints = {}
+
+  for (const part of parts) {
+    if (/^[*1]:[*1]$/.test(part)) {
+      result.uc = part
+    } else if (part.toUpperCase() === 'AMC') {
+      result.amc = true
+    } else if (part.toUpperCase() === 'DMC') {
+      result.dmc = true
+    }
+    // Unknown parts are silently ignored — reported later if nothing matched
+  }
+
+  return result
+}
+
+/**
+ * Apply all constraints from a reading's constraint spec.
+ *
+ * Multiplicity notation is shorthand for uniqueness constraints:
+ *   *:1  → UC on role 0
+ *   1:*  → UC on role 1
+ *   1:1  → two UCs, one per role
+ *   *:*  → one UC spanning both roles
+ *
+ * MC notation creates mandatory constraints:
+ *   AMC  → Alethic MC (sets role.required = true)
+ *   DMC  → Deontic MC (creates Constraint record with deontic modality)
+ */
+async function applyConstraints(
+  payload: Payload,
+  schemaId: string,
+  reading: ReadingDef,
+  result: SeedResult,
+): Promise<void> {
+  const spec = parseConstraintSpec(reading)
+  if (spec.skip) return
+
+  // Fetch roles for this schema
+  const roles = await payload.find({
+    collection: 'roles',
+    where: { graphSchema: { equals: schemaId } },
+    depth: 2,
+    sort: 'createdAt',
+    pagination: false,
+  })
+
+  // Explicit UC notation: UC(Noun1,Noun2)
+  if (spec.ucs?.length) {
+    for (const ucRoleNames of spec.ucs) {
+      const ucRoleIds = ucRoleNames
+        .map((roleName) => {
+          const role = roles.docs.find((r: any) => {
+            const noun = r.noun
+            const nounName = typeof noun === 'string' ? null : noun?.value?.name || noun?.name
+            return nounName === roleName
+          })
+          return role?.id
+        })
+        .filter((id): id is string => !!id)
+
+      if (ucRoleIds.length) {
+        const constraint = await payload.create({
+          collection: 'constraints',
+          data: { kind: 'UC', modality: 'Alethic' },
+        })
+        await payload.create({
+          collection: 'constraint-spans',
+          data: { constraint: constraint.id, roles: ucRoleIds },
+        } as any)
+      }
+    }
+  }
+
+  // Binary UC shorthand
+  if (spec.uc && roles.docs.length >= 2) {
+    const role0 = roles.docs[0]
+    const role1 = roles.docs[1]
+
+    if (spec.uc === '*:1') {
+      const c = await payload.create({ collection: 'constraints', data: { kind: 'UC', modality: 'Alethic' } })
+      await payload.create({ collection: 'constraint-spans', data: { constraint: c.id, roles: [role0.id] } } as any)
+    } else if (spec.uc === '1:*') {
+      const c = await payload.create({ collection: 'constraints', data: { kind: 'UC', modality: 'Alethic' } })
+      await payload.create({ collection: 'constraint-spans', data: { constraint: c.id, roles: [role1.id] } } as any)
+    } else if (spec.uc === '*:*') {
+      const c = await payload.create({ collection: 'constraints', data: { kind: 'UC', modality: 'Alethic' } })
+      await payload.create({ collection: 'constraint-spans', data: { constraint: c.id, roles: [role0.id, role1.id] } } as any)
+    } else if (spec.uc === '1:1') {
+      const c0 = await payload.create({ collection: 'constraints', data: { kind: 'UC', modality: 'Alethic' } })
+      const c1 = await payload.create({ collection: 'constraints', data: { kind: 'UC', modality: 'Alethic' } })
+      await Promise.all([
+        payload.create({ collection: 'constraint-spans', data: { constraint: c0.id, roles: [role0.id] } } as any),
+        payload.create({ collection: 'constraint-spans', data: { constraint: c1.id, roles: [role1.id] } } as any),
+      ])
+    }
+  }
+
+  // Alethic Mandatory Constraint — set role.required = true on object role
+  if (spec.amc && roles.docs.length >= 1) {
+    // MC applies to the object role (last role) — "Entity has Value" means Value is mandatory for Entity
+    const objectRole = roles.docs[roles.docs.length - 1]
+    await payload.update({
+      collection: 'roles',
+      id: objectRole.id,
+      data: { required: true },
+    })
+  }
+
+  // Deontic Mandatory Constraint — role should be filled (warning, not enforced)
+  // The Constraints schema doesn't have an MC kind, so we use a Deontic UC
+  // on the single role. This isn't semantically perfect but captures the intent:
+  // "this role should be played" with deontic (warning) modality.
+  if (spec.dmc && roles.docs.length >= 1) {
+    const objectRole = roles.docs[roles.docs.length - 1]
+    const c = await payload.create({
+      collection: 'constraints',
+      data: { kind: 'UC', modality: 'Deontic' },
+    })
+    await payload.create({
+      collection: 'constraint-spans',
+      data: { constraint: c.id, roles: [objectRole.id] },
+    } as any)
+  }
+
+  // Report if nothing was recognized
+  if (!spec.uc && !spec.ucs && !spec.amc && !spec.dmc) {
+    result.errors.push(`unknown constraint notation "${reading.multiplicity}": ${reading.text}`)
+  }
+}
+
+/**
+ * Apply a subset constraint from a verbalization like:
+ * "If some StateMachine is currently in some Status then that Status is defined in
+ *  some StateMachineDefinition where that StateMachine is instance of that StateMachineDefinition"
+ *
+ * The verbalization uses "some" to introduce entity bindings and "that" to refer back.
+ * The subset constraint says: the roles in the "if" fact must be a subset of the
+ * corresponding roles in the "then"/"where" facts, matched by entity type.
+ *
+ * Creates Constraint(kind: 'SS') with two ConstraintSpans:
+ *   - Subset span: roles from the "if" clause
+ *   - Superset span: matching roles from the "then"/"where" clauses
+ */
+async function applySubsetConstraint(
+  payload: Payload,
+  text: string,
+  result: SeedResult,
+): Promise<void> {
+  // Parse "If ... then ... where ..." clauses
+  const clauseMatch = text.match(
+    /^If\s+(.+?)\s+then\s+(.+?)(?:\s+where\s+(.+))?$/i,
+  )
+  if (!clauseMatch) {
+    result.errors.push(`could not parse subset constraint: ${text}`)
+    return
+  }
+
+  const [, ifClause, thenClause, whereClause] = clauseMatch
+  const allClauses = [ifClause, thenClause, ...(whereClause ? [whereClause] : [])]
+
+  // Parse each clause into entity bindings and a fact pattern.
+  // "some X verb some Y" or "that X verb that Y" or "that X verb some Y"
+  // We extract the noun names and the reading text (with nouns substituted back in).
+  interface ClauseBinding {
+    readingText: string
+    nouns: string[] // noun names in order of appearance
+  }
+
+  // Fetch all nouns to build a regex for detection
+  const allNouns = await payload.find({ collection: 'nouns', pagination: false })
+  const nounNames = allNouns.docs.map((n: any) => n.name).sort((a: string, b: string) => b.length - a.length)
+  const nounRegex = new RegExp(`\\b(some|that)\\s+(${nounNames.join('|')})\\b`, 'g')
+
+  const parsedClauses: ClauseBinding[] = allClauses.map((clause) => {
+    const nouns: string[] = []
+    // Replace "some X" / "that X" with just "X" to get the reading text
+    const readingText = clause.replace(nounRegex, (_match, _quantifier, nounName) => {
+      nouns.push(nounName)
+      return nounName
+    }).trim()
+    return { readingText, nouns }
+  })
+
+  // Find the graph schemas + roles for each clause by matching reading text
+  const subsetClause = parsedClauses[0]
+  const supersetClauses = parsedClauses.slice(1)
+
+  // Find subset reading's roles
+  const subsetReading = await payload.find({
+    collection: 'readings',
+    where: { text: { equals: subsetClause.readingText } },
+    limit: 1,
+    depth: 0,
+  })
+  if (!subsetReading.docs.length) {
+    result.errors.push(`subset constraint: reading "${subsetClause.readingText}" not found`)
+    return
+  }
+  const subsetSchemaId = (subsetReading.docs[0] as any).graphSchema
+  const subsetRoles = await payload.find({
+    collection: 'roles',
+    where: { graphSchema: { equals: subsetSchemaId } },
+    depth: 2,
+    sort: 'createdAt',
+    pagination: false,
+  })
+
+  // Map noun names to role IDs in the subset fact
+  const subsetRoleIds: string[] = []
+  for (const nounName of subsetClause.nouns) {
+    const role = subsetRoles.docs.find((r: any) => {
+      const noun = r.noun
+      const name = typeof noun === 'string' ? null : noun?.value?.name || noun?.name
+      return name === nounName
+    })
+    if (role) subsetRoleIds.push(role.id)
+  }
+
+  // Find superset roles: for each noun in the subset, find the matching role
+  // in the superset clauses (the "then" and "where" facts)
+  const supersetRoleIds: string[] = []
+  for (const nounName of subsetClause.nouns) {
+    // Find which superset clause contains this noun
+    for (const superClause of supersetClauses) {
+      if (!superClause.nouns.includes(nounName)) continue
+
+      const superReading = await payload.find({
+        collection: 'readings',
+        where: { text: { equals: superClause.readingText } },
+        limit: 1,
+        depth: 0,
+      })
+      if (!superReading.docs.length) continue
+
+      const superSchemaId = (superReading.docs[0] as any).graphSchema
+      const superRoles = await payload.find({
+        collection: 'roles',
+        where: { graphSchema: { equals: superSchemaId } },
+        depth: 2,
+        sort: 'createdAt',
+        pagination: false,
+      })
+
+      const matchingRole = superRoles.docs.find((r: any) => {
+        const noun = r.noun
+        const name = typeof noun === 'string' ? null : noun?.value?.name || noun?.name
+        return name === nounName
+      })
+      if (matchingRole) {
+        supersetRoleIds.push(matchingRole.id)
+        break
+      }
+    }
+  }
+
+  if (!subsetRoleIds.length || !supersetRoleIds.length) {
+    result.errors.push(`subset constraint: could not resolve roles for "${text}"`)
+    return
+  }
+
+  // Create the SS constraint with two spans
+  const constraint = await payload.create({
+    collection: 'constraints',
+    data: { kind: 'SS', modality: 'Alethic' },
+  })
+
+  // Subset span (the "if" roles)
+  await payload.create({
+    collection: 'constraint-spans',
+    data: { constraint: constraint.id, roles: subsetRoleIds },
+  } as any)
+
+  // Superset span (the "then"/"where" roles)
+  await payload.create({
+    collection: 'constraint-spans',
+    data: { constraint: constraint.id, roles: supersetRoleIds },
+  } as any)
+}
+
+/**
+ * Handle subtype declarations: "X is a subtype of Y" → set noun.superType.
+ */
+async function applySubtype(
+  payload: Payload,
+  text: string,
+  result: SeedResult,
+): Promise<void> {
+  const match = text.match(/^(\S+)\s+is\s+a\s+subtype\s+of\s+(\S+)$/i)
+  if (!match) {
+    result.errors.push(`could not parse subtype declaration: ${text}`)
+    return
+  }
+  const [, childName, parentName] = match
+  const [childResult, parentResult] = await Promise.all([
+    payload.find({ collection: 'nouns', where: { name: { equals: childName } }, limit: 1 }),
+    payload.find({ collection: 'nouns', where: { name: { equals: parentName } }, limit: 1 }),
+  ])
+  if (!childResult.docs.length) {
+    result.errors.push(`subtype child noun "${childName}" not found`)
+    return
+  }
+  if (!parentResult.docs.length) {
+    result.errors.push(`subtype parent noun "${parentName}" not found`)
+    return
+  }
+  await payload.update({
+    collection: 'nouns',
+    id: childResult.docs[0].id,
+    data: { superType: parentResult.docs[0].id },
+  })
 }
 
 export async function seedDomain(
@@ -133,7 +477,7 @@ export async function seedDomain(
     }
   })
 
-  // ── Batch 2: Reference schemes in parallel (depends on noun IDs) ──
+  // ── Batch 2: Reference schemes (depends on noun IDs) ──
   const nounCache = new Map<string, any>()
   const allNouns = await payload.find({
     collection: 'nouns',
@@ -159,10 +503,10 @@ export async function seedDomain(
     }
   })
 
-  // ── Batch 3: Readings ──
+  // ── Batch 3: Readings (hooks create roles, then we apply constraints) ──
   await seedReadings(payload, parsed.readings, domainData, result)
 
-  // ── Batch 4: Instance facts as readings (no multiplicity, no roles) ──
+  // ── Batch 4: Instance facts as readings ──
   if (parsed.instanceFacts.length) {
     const instanceReadings: ReadingDef[] = parsed.instanceFacts.map((text) => ({
       text,
@@ -181,11 +525,8 @@ export async function seedDomain(
   }
 
   // ── Batch 6: Deontic constraint instance facts as readings ──
-  // Each instance fact is stored as "<constraint> '<instance>'" so the extract
-  // endpoint can find instances by prefix-matching against the constraint text.
   if (parsed.deonticConstraintInstances.length) {
     const instanceReadings: ReadingDef[] = parsed.deonticConstraintInstances.map((d) => {
-      // Strip decorative quotes from markdown (e.g., "in summary" → in summary)
       let inst = d.instance
       if (
         inst.length >= 2 &&
@@ -213,7 +554,7 @@ export async function seedReadings(
   domainData: Record<string, any>,
   result: SeedResult,
 ): Promise<void> {
-  // Check which readings already exist in one query
+  // Check which readings already exist
   const existingReadings = await payload.find({
     collection: 'readings',
     where: { text: { in: readings.map((r) => r.text) } },
@@ -221,7 +562,6 @@ export async function seedReadings(
   })
   const existingTexts = new Set(existingReadings.docs.map((d: any) => d.text))
 
-  // Separate new readings from existing
   const newReadings: ReadingDef[] = []
   for (const r of readings) {
     if (existingTexts.has(r.text)) {
@@ -231,9 +571,24 @@ export async function seedReadings(
     }
   }
 
-  // ── Batch 3a: Create all graph schemas ──
+  // Separate special readings from regular fact types
+  const subtypeReadings = newReadings.filter((r) => r.multiplicity === 'subtype')
+  const subsetReadings = newReadings.filter((r) => r.multiplicity === 'SS')
+  const regularReadings = newReadings.filter((r) => r.multiplicity !== 'subtype' && r.multiplicity !== 'SS')
+
+  // ── Handle subtypes: set noun.superType ──
+  for (const r of subtypeReadings) {
+    try {
+      await applySubtype(payload, r.text, result)
+      result.readings++
+    } catch (err: any) {
+      result.errors.push(`subtype "${r.text}": ${err.message}`)
+    }
+  }
+
+  // ── Create graph schemas for regular readings ──
   const schemaMap = new Map<string, any>()
-  await batch(newReadings, async (r) => {
+  await batch(regularReadings, async (r) => {
     try {
       const name = r.text
         .split(' ')
@@ -249,8 +604,8 @@ export async function seedReadings(
     }
   })
 
-  // ── Batch 3b: Create all readings (triggers role hooks) ──
-  await batch(newReadings, async (r) => {
+  // ── Create readings (hooks auto-create roles from text) ──
+  await batch(regularReadings, async (r) => {
     const schema = schemaMap.get(r.text)
     if (!schema) return
     try {
@@ -263,58 +618,27 @@ export async function seedReadings(
     }
   })
 
-  // ── Batch 3c: Set roleRelationships + UC constraints ──
-  await batch(newReadings, async (r) => {
+  // ── Apply uniqueness constraints from notation ──
+  await batch(regularReadings, async (r) => {
     const schema = schemaMap.get(r.text)
     if (!schema) return
     try {
-      if (r.ucs?.length) {
-        const roles = await payload.find({
-          collection: 'roles',
-          where: { graphSchema: { equals: schema.id } },
-          depth: 2,
-          pagination: false,
-        })
-        for (const ucRoleNames of r.ucs) {
-          const ucRoleIds = ucRoleNames
-            .map((roleName) => {
-              const role = roles.docs.find((role: any) => {
-                const noun = role.noun
-                const nounName = typeof noun === 'string' ? null : noun?.value?.name || noun?.name
-                return nounName === roleName
-              })
-              return role?.id
-            })
-            .filter((id): id is string => !!id)
-
-          if (ucRoleIds.length) {
-            const constraint = await payload.create({
-              collection: 'constraints',
-              data: { kind: 'UC', modality: 'Alethic' },
-            })
-            await payload.create({
-              collection: 'constraint-spans',
-              data: { constraint: constraint.id, roles: ucRoleIds },
-            } as any)
-          }
-        }
-      } else {
-        const rel = MULT_MAP[r.multiplicity]
-        if (!rel) {
-          result.errors.push(`unknown multiplicity "${r.multiplicity}": ${r.text}`)
-          return
-        }
-        await payload.update({
-          collection: 'graph-schemas',
-          id: schema.id,
-          data: { roleRelationship: rel } as any,
-        })
-      }
+      await applyConstraints(payload, schema.id, r, result)
       result.readings++
     } catch (err: any) {
       result.errors.push(`constraint "${r.text}": ${err.message}`)
     }
   })
+
+  // ── Apply subset constraints (SS) — must run after all readings exist ──
+  for (const r of subsetReadings) {
+    try {
+      await applySubsetConstraint(payload, r.text, result)
+      result.readings++
+    } catch (err: any) {
+      result.errors.push(`subset constraint "${r.text}": ${err.message}`)
+    }
+  }
 }
 
 export async function seedStateMachine(
@@ -350,7 +674,6 @@ export async function seedStateMachine(
       data: { noun: { relationTo: 'nouns', value: noun.docs[0].id }, ...domainData },
     })
 
-    // ── Batch: All statuses ──
     const statusMap = new Map<string, string>()
     await batch(parsed.states, async (s) => {
       const status = await payload.create({
@@ -360,7 +683,6 @@ export async function seedStateMachine(
       statusMap.set(s, status.id)
     })
 
-    // ── Batch: All event types ──
     const uniqueEvents = [...new Set(parsed.transitions.map((t) => t.event))]
     const eventTypeCache = new Map<string, string>()
     await batch(uniqueEvents, async (event) => {
@@ -368,8 +690,6 @@ export async function seedStateMachine(
       eventTypeCache.set(event, et.id)
     })
 
-    // ── Batch: All transitions ──
-    // Track transition IDs per event for verb wiring
     const transitionsByEvent = new Map<string, string[]>()
     await batch(parsed.transitions, async (t) => {
       const transition = await payload.create({
@@ -385,7 +705,6 @@ export async function seedStateMachine(
       transitionsByEvent.set(t.event, existing)
     })
 
-    // ── Batch: Guards for transitions with guard conditions ──
     const transitionsWithGuards = parsed.transitions.filter((t) => t.guard)
     if (transitionsWithGuards.length) {
       await batch(transitionsWithGuards, async (t) => {
@@ -404,7 +723,6 @@ export async function seedStateMachine(
         })
 
         if (matchingTransitions.docs.length) {
-          // Split on semicolons — each atomic guard gets its own record
           const guardTexts = t.guard!.split(';').map((g: string) => g.trim()).filter(Boolean)
           for (const guardText of guardTexts) {
             await payload.create({
@@ -419,7 +737,6 @@ export async function seedStateMachine(
       })
     }
 
-    // ── Post-process: Wire verbs and functions from instance-fact readings ──
     await wireVerbsAndFunctions(payload, uniqueEvents, transitionsByEvent, result)
 
     result.stateMachines++
@@ -431,13 +748,7 @@ export async function seedStateMachine(
 }
 
 /**
- * For each event name, search readings for instance facts that wire verbs to functions:
- *   "<eventName> runs <FunctionName>"
- *   "<FunctionName> has FunctionType <value>"
- *   "<FunctionName> has CallbackUrl <value>"
- *   "<FunctionName> has HttpMethod <value>"
- *
- * Creates Function and Verb records (idempotent), then updates transitions with the verb.
+ * For each event name, search readings for instance facts that wire verbs to functions.
  */
 async function wireVerbsAndFunctions(
   payload: Payload,
@@ -447,7 +758,6 @@ async function wireVerbsAndFunctions(
 ): Promise<void> {
   for (const eventName of uniqueEvents) {
     try {
-      // Search for "<eventName> runs <FunctionName>"
       const runsReadings = await payload.find({
         collection: 'readings',
         where: { text: { like: `${eventName} runs` } },
@@ -456,31 +766,16 @@ async function wireVerbsAndFunctions(
       if (!runsReadings.docs.length) continue
 
       const runsText = (runsReadings.docs[0] as any).text as string
-      // Extract function name: "eventName runs FunctionName"
       const runsMatch = runsText.match(/runs\s+(\S+)/)
       if (!runsMatch) continue
       const functionName = runsMatch[1]
 
-      // Query for function properties from instance-fact readings
       const [typeReadings, urlReadings, methodReadings] = await Promise.all([
-        payload.find({
-          collection: 'readings',
-          where: { text: { like: `${functionName} has FunctionType` } },
-          limit: 1,
-        }),
-        payload.find({
-          collection: 'readings',
-          where: { text: { like: `${functionName} has CallbackUrl` } },
-          limit: 1,
-        }),
-        payload.find({
-          collection: 'readings',
-          where: { text: { like: `${functionName} has HttpMethod` } },
-          limit: 1,
-        }),
+        payload.find({ collection: 'readings', where: { text: { like: `${functionName} has FunctionType` } }, limit: 1 }),
+        payload.find({ collection: 'readings', where: { text: { like: `${functionName} has CallbackUrl` } }, limit: 1 }),
+        payload.find({ collection: 'readings', where: { text: { like: `${functionName} has HttpMethod` } }, limit: 1 }),
       ])
 
-      // Extract values from reading text (last word after the property name)
       const extractValue = (docs: any[], property: string): string | undefined => {
         if (!docs.length) return undefined
         const text = docs[0].text as string
@@ -489,17 +784,12 @@ async function wireVerbsAndFunctions(
       }
 
       const functionType = extractValue(typeReadings.docs, 'FunctionType')
-      if (!functionType) continue // functionType is required
+      if (!functionType) continue
 
       const callbackUrl = extractValue(urlReadings.docs, 'CallbackUrl')
       const httpMethod = extractValue(methodReadings.docs, 'HttpMethod')
 
-      // Create Function (idempotent)
-      const fn = await payload.find({
-        collection: 'functions',
-        where: { name: { equals: functionName } },
-        limit: 1,
-      })
+      const fn = await payload.find({ collection: 'functions', where: { name: { equals: functionName } }, limit: 1 })
       let functionId: string
       if (fn.docs.length) {
         functionId = fn.docs[0].id
@@ -516,12 +806,7 @@ async function wireVerbsAndFunctions(
         functionId = created.id
       }
 
-      // Create Verb (idempotent)
-      const verb = await payload.find({
-        collection: 'verbs',
-        where: { name: { equals: eventName } },
-        limit: 1,
-      })
+      const verb = await payload.find({ collection: 'verbs', where: { name: { equals: eventName } }, limit: 1 })
       let verbId: string
       if (verb.docs.length) {
         verbId = verb.docs[0].id
@@ -533,7 +818,6 @@ async function wireVerbsAndFunctions(
         verbId = created.id
       }
 
-      // Update all transitions for this event with the verb
       const transitionIds = transitionsByEvent.get(eventName) || []
       for (const transitionId of transitionIds) {
         await payload.update({
