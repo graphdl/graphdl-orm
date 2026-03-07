@@ -81,61 +81,78 @@ export interface SeedResult {
 /**
  * Parse a compound constraint spec into its parts.
  *
- * The multiplicity column is a constraint specification that can combine:
- *   UC shorthand:  *:1, 1:*, *:*, 1:1, UC(A,B)
- *   MC modifiers:  AMC (Alethic Mandatory), DMC (Deontic Mandatory)
- *   Standalone:    subtype, unary, SS
+ * The multiplicity column is a constraint specification. Alethic modality is
+ * implicit; prefix with D for deontic.
  *
- * Examples:
- *   "*:1"       → UC on role 0
- *   "*:1 AMC"   → UC on role 0 + Alethic Mandatory (required field)
- *   "1:* DMC"   → UC on role 1 + Deontic Mandatory (business rule)
- *   "AMC"       → Alethic Mandatory only (no UC)
- *   "unary"     → no constraints
+ *   UC shorthand:   *:1, 1:*, *:*, 1:1       (Alethic)
+ *   Deontic UC:     D*:1, D1:*, D*:*, D1:1
+ *   Explicit UC:    UC(A,B), DUC(A,B)
+ *   Mandatory:      MC (Alethic), DMC (Deontic)
+ *   Subset:         SS (Alethic), DSS (Deontic)
+ *   Standalone:     subtype, unary
+ *
+ * Compound: "*:1 MC" = Alethic UC + Alethic MC
+ *           "D*:1 DMC" = Deontic UC + Deontic MC
  */
-interface ParsedConstraints {
+interface ParsedConstraint {
+  kind: 'UC' | 'MC'
+  modality: 'Alethic' | 'Deontic'
   uc?: string           // *:1, 1:*, *:*, 1:1
   ucs?: string[][]      // UC(A,B) explicit notation
-  amc?: boolean         // Alethic Mandatory Constraint
-  dmc?: boolean         // Deontic Mandatory Constraint
+}
+
+interface ParsedConstraints {
+  constraints: ParsedConstraint[]
   skip?: boolean        // unary, subtype, SS — handled elsewhere
 }
 
 function parseConstraintSpec(reading: ReadingDef): ParsedConstraints {
   const mult = reading.multiplicity
-  if (mult === 'unary' || mult === 'subtype' || mult === 'SS') return { skip: true }
+  if (mult === 'unary' || mult === 'subtype') return { constraints: [], skip: true }
+  if (/^D?SS$/i.test(mult.split(/\s+/)[0])) return { constraints: [], skip: true }
 
-  if (reading.ucs?.length) return { ucs: reading.ucs }
-
-  const parts = mult.split(/\s+/)
-  const result: ParsedConstraints = {}
-
-  for (const part of parts) {
-    if (/^[*1]:[*1]$/.test(part)) {
-      result.uc = part
-    } else if (part.toUpperCase() === 'AMC') {
-      result.amc = true
-    } else if (part.toUpperCase() === 'DMC') {
-      result.dmc = true
+  if (reading.ucs?.length) {
+    const deontic = /^D/i.test(mult)
+    return {
+      constraints: [{ kind: 'UC', modality: deontic ? 'Deontic' : 'Alethic', ucs: reading.ucs }],
     }
-    // Unknown parts are silently ignored — reported later if nothing matched
   }
 
-  return result
+  const parts = mult.split(/\s+/)
+  const constraints: ParsedConstraint[] = []
+
+  for (const part of parts) {
+    // Deontic UC: D*:1, D1:*, etc.
+    const ducMatch = part.match(/^D([*1]:[*1])$/i)
+    if (ducMatch) {
+      constraints.push({ kind: 'UC', modality: 'Deontic', uc: ducMatch[1] })
+      continue
+    }
+    // Alethic UC: *:1, 1:*, etc.
+    if (/^[*1]:[*1]$/.test(part)) {
+      constraints.push({ kind: 'UC', modality: 'Alethic', uc: part })
+      continue
+    }
+    // Deontic MC
+    if (/^DMC$/i.test(part)) {
+      constraints.push({ kind: 'MC', modality: 'Deontic' })
+      continue
+    }
+    // Alethic MC (AMC or just MC)
+    if (/^A?MC$/i.test(part)) {
+      constraints.push({ kind: 'MC', modality: 'Alethic' })
+      continue
+    }
+  }
+
+  return { constraints }
 }
 
 /**
  * Apply all constraints from a reading's constraint spec.
  *
- * Multiplicity notation is shorthand for uniqueness constraints:
- *   *:1  → UC on role 0
- *   1:*  → UC on role 1
- *   1:1  → two UCs, one per role
- *   *:*  → one UC spanning both roles
- *
- * MC notation creates mandatory constraints:
- *   AMC  → Alethic MC (sets role.required = true)
- *   DMC  → Deontic MC (creates Constraint record with deontic modality)
+ * Every constraint is a record with a kind and modality. Alethic is implicit;
+ * D prefix makes it deontic. Multiple constraints can be combined per reading.
  */
 async function applyConstraints(
   payload: Payload,
@@ -146,6 +163,11 @@ async function applyConstraints(
   const spec = parseConstraintSpec(reading)
   if (spec.skip) return
 
+  if (!spec.constraints.length) {
+    result.errors.push(`unknown constraint notation "${reading.multiplicity}": ${reading.text}`)
+    return
+  }
+
   // Fetch roles for this schema
   const roles = await payload.find({
     collection: 'roles',
@@ -155,86 +177,73 @@ async function applyConstraints(
     pagination: false,
   })
 
-  // Explicit UC notation: UC(Noun1,Noun2)
-  if (spec.ucs?.length) {
-    for (const ucRoleNames of spec.ucs) {
-      const ucRoleIds = ucRoleNames
-        .map((roleName) => {
-          const role = roles.docs.find((r: any) => {
-            const noun = r.noun
-            const nounName = typeof noun === 'string' ? null : noun?.value?.name || noun?.name
-            return nounName === roleName
+  for (const constraint of spec.constraints) {
+    // Explicit UC notation: UC(Noun1,Noun2)
+    if (constraint.ucs?.length) {
+      for (const ucRoleNames of constraint.ucs) {
+        const ucRoleIds = ucRoleNames
+          .map((roleName) => {
+            const role = roles.docs.find((r: any) => {
+              const noun = r.noun
+              const nounName = typeof noun === 'string' ? null : noun?.value?.name || noun?.name
+              return nounName === roleName
+            })
+            return role?.id
           })
-          return role?.id
-        })
-        .filter((id): id is string => !!id)
+          .filter((id): id is string => !!id)
 
-      if (ucRoleIds.length) {
-        const constraint = await payload.create({
-          collection: 'constraints',
-          data: { kind: 'UC', modality: 'Alethic' },
-        })
-        await payload.create({
-          collection: 'constraint-spans',
-          data: { constraint: constraint.id, roles: ucRoleIds },
-        } as any)
+        if (ucRoleIds.length) {
+          const c = await payload.create({
+            collection: 'constraints',
+            data: { kind: 'UC', modality: constraint.modality },
+          })
+          await payload.create({
+            collection: 'constraint-spans',
+            data: { constraint: c.id, roles: ucRoleIds },
+          } as any)
+        }
       }
+      continue
     }
-  }
 
-  // Binary UC shorthand
-  if (spec.uc && roles.docs.length >= 2) {
-    const role0 = roles.docs[0]
-    const role1 = roles.docs[1]
+    // Binary UC shorthand
+    if (constraint.kind === 'UC' && constraint.uc && roles.docs.length >= 2) {
+      const role0 = roles.docs[0]
+      const role1 = roles.docs[1]
 
-    if (spec.uc === '*:1') {
-      const c = await payload.create({ collection: 'constraints', data: { kind: 'UC', modality: 'Alethic' } })
-      await payload.create({ collection: 'constraint-spans', data: { constraint: c.id, roles: [role0.id] } } as any)
-    } else if (spec.uc === '1:*') {
-      const c = await payload.create({ collection: 'constraints', data: { kind: 'UC', modality: 'Alethic' } })
-      await payload.create({ collection: 'constraint-spans', data: { constraint: c.id, roles: [role1.id] } } as any)
-    } else if (spec.uc === '*:*') {
-      const c = await payload.create({ collection: 'constraints', data: { kind: 'UC', modality: 'Alethic' } })
-      await payload.create({ collection: 'constraint-spans', data: { constraint: c.id, roles: [role0.id, role1.id] } } as any)
-    } else if (spec.uc === '1:1') {
-      const c0 = await payload.create({ collection: 'constraints', data: { kind: 'UC', modality: 'Alethic' } })
-      const c1 = await payload.create({ collection: 'constraints', data: { kind: 'UC', modality: 'Alethic' } })
-      await Promise.all([
-        payload.create({ collection: 'constraint-spans', data: { constraint: c0.id, roles: [role0.id] } } as any),
-        payload.create({ collection: 'constraint-spans', data: { constraint: c1.id, roles: [role1.id] } } as any),
-      ])
+      if (constraint.uc === '*:1') {
+        const c = await payload.create({ collection: 'constraints', data: { kind: 'UC', modality: constraint.modality } })
+        await payload.create({ collection: 'constraint-spans', data: { constraint: c.id, roles: [role0.id] } } as any)
+      } else if (constraint.uc === '1:*') {
+        const c = await payload.create({ collection: 'constraints', data: { kind: 'UC', modality: constraint.modality } })
+        await payload.create({ collection: 'constraint-spans', data: { constraint: c.id, roles: [role1.id] } } as any)
+      } else if (constraint.uc === '*:*') {
+        const c = await payload.create({ collection: 'constraints', data: { kind: 'UC', modality: constraint.modality } })
+        await payload.create({ collection: 'constraint-spans', data: { constraint: c.id, roles: [role0.id, role1.id] } } as any)
+      } else if (constraint.uc === '1:1') {
+        const c0 = await payload.create({ collection: 'constraints', data: { kind: 'UC', modality: constraint.modality } })
+        const c1 = await payload.create({ collection: 'constraints', data: { kind: 'UC', modality: constraint.modality } })
+        await Promise.all([
+          payload.create({ collection: 'constraint-spans', data: { constraint: c0.id, roles: [role0.id] } } as any),
+          payload.create({ collection: 'constraint-spans', data: { constraint: c1.id, roles: [role1.id] } } as any),
+        ])
+      }
+      continue
     }
-  }
 
-  // Alethic Mandatory Constraint — role must be played (data integrity)
-  if (spec.amc && roles.docs.length >= 1) {
-    const objectRole = roles.docs[roles.docs.length - 1]
-    const c = await payload.create({
-      collection: 'constraints',
-      data: { kind: 'MC', modality: 'Alethic' },
-    })
-    await payload.create({
-      collection: 'constraint-spans',
-      data: { constraint: c.id, roles: [objectRole.id] },
-    } as any)
-  }
-
-  // Deontic Mandatory Constraint — role should be played (warning)
-  if (spec.dmc && roles.docs.length >= 1) {
-    const objectRole = roles.docs[roles.docs.length - 1]
-    const c = await payload.create({
-      collection: 'constraints',
-      data: { kind: 'MC', modality: 'Deontic' },
-    })
-    await payload.create({
-      collection: 'constraint-spans',
-      data: { constraint: c.id, roles: [objectRole.id] },
-    } as any)
-  }
-
-  // Report if nothing was recognized
-  if (!spec.uc && !spec.ucs && !spec.amc && !spec.dmc) {
-    result.errors.push(`unknown constraint notation "${reading.multiplicity}": ${reading.text}`)
+    // Mandatory constraint — applies to object role (last role)
+    if (constraint.kind === 'MC' && roles.docs.length >= 1) {
+      const objectRole = roles.docs[roles.docs.length - 1]
+      const c = await payload.create({
+        collection: 'constraints',
+        data: { kind: 'MC', modality: constraint.modality },
+      })
+      await payload.create({
+        collection: 'constraint-spans',
+        data: { constraint: c.id, roles: [objectRole.id] },
+      } as any)
+      continue
+    }
   }
 }
 
@@ -254,6 +263,7 @@ async function applyConstraints(
 async function applySubsetConstraint(
   payload: Payload,
   text: string,
+  modality: 'Alethic' | 'Deontic',
   result: SeedResult,
 ): Promise<void> {
   // Parse "If ... then ... where ..." clauses
@@ -371,7 +381,7 @@ async function applySubsetConstraint(
   // Create the SS constraint with two spans
   const constraint = await payload.create({
     collection: 'constraints',
-    data: { kind: 'SS', modality: 'Alethic' },
+    data: { kind: 'SS', modality },
   })
 
   // Subset span (the "if" roles)
@@ -572,8 +582,8 @@ export async function seedReadings(
 
   // Separate special readings from regular fact types
   const subtypeReadings = newReadings.filter((r) => r.multiplicity === 'subtype')
-  const subsetReadings = newReadings.filter((r) => r.multiplicity === 'SS')
-  const regularReadings = newReadings.filter((r) => r.multiplicity !== 'subtype' && r.multiplicity !== 'SS')
+  const subsetReadings = newReadings.filter((r) => /^D?SS$/i.test(r.multiplicity))
+  const regularReadings = newReadings.filter((r) => r.multiplicity !== 'subtype' && !/^D?SS$/i.test(r.multiplicity))
 
   // ── Handle subtypes: set noun.superType ──
   for (const r of subtypeReadings) {
@@ -632,7 +642,8 @@ export async function seedReadings(
   // ── Apply subset constraints (SS) — must run after all readings exist ──
   for (const r of subsetReadings) {
     try {
-      await applySubsetConstraint(payload, r.text, result)
+      const ssModality = /^D/i.test(r.multiplicity) ? 'Deontic' as const : 'Alethic' as const
+      await applySubsetConstraint(payload, r.text, ssModality, result)
       result.readings++
     } catch (err: any) {
       result.errors.push(`subset constraint "${r.text}": ${err.message}`)
