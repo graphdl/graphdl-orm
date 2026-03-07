@@ -69,6 +69,85 @@ async function ensureEventType(payload: Payload, name: string): Promise<any> {
   return payload.create({ collection: 'event-types', data: { name } })
 }
 
+async function ensureStateMachineDefinition(
+  payload: Payload,
+  nounId: string,
+  domainData: Record<string, any>,
+): Promise<any> {
+  const existing = await payload.find({
+    collection: 'state-machine-definitions',
+    where: { 'noun.value': { equals: nounId } },
+    limit: 1,
+  })
+  if (existing.docs.length) return existing.docs[0]
+  return payload.create({
+    collection: 'state-machine-definitions',
+    data: { noun: { relationTo: 'nouns', value: nounId }, ...domainData },
+  })
+}
+
+async function ensureStatus(
+  payload: Payload,
+  name: string,
+  definitionId: string,
+): Promise<any> {
+  const existing = await payload.find({
+    collection: 'statuses',
+    where: {
+      name: { equals: name },
+      stateMachineDefinition: { equals: definitionId },
+    },
+    limit: 1,
+  })
+  if (existing.docs.length) return existing.docs[0]
+  return payload.create({
+    collection: 'statuses',
+    data: { name, stateMachineDefinition: definitionId },
+  })
+}
+
+async function ensureTransition(
+  payload: Payload,
+  fromId: string,
+  toId: string,
+  eventTypeId: string,
+): Promise<any> {
+  const existing = await payload.find({
+    collection: 'transitions',
+    where: {
+      from: { equals: fromId },
+      to: { equals: toId },
+      eventType: { equals: eventTypeId },
+    },
+    limit: 1,
+  })
+  if (existing.docs.length) return existing.docs[0]
+  return payload.create({
+    collection: 'transitions',
+    data: { from: fromId, to: toId, eventType: eventTypeId },
+  })
+}
+
+async function ensureGuard(
+  payload: Payload,
+  transitionId: string,
+  name: string,
+): Promise<any> {
+  const existing = await payload.find({
+    collection: 'guards',
+    where: {
+      transition: { equals: transitionId },
+      name: { equals: name },
+    },
+    limit: 1,
+  })
+  if (existing.docs.length) return existing.docs[0]
+  return payload.create({
+    collection: 'guards',
+    data: { name, transition: transitionId },
+  })
+}
+
 export interface SeedResult {
   domain?: string
   nouns: number
@@ -691,17 +770,11 @@ export async function seedStateMachine(
       return result
     }
 
-    const definition = await payload.create({
-      collection: 'state-machine-definitions',
-      data: { noun: { relationTo: 'nouns', value: noun.docs[0].id }, ...domainData },
-    })
+    const definition = await ensureStateMachineDefinition(payload, noun.docs[0].id, domainData)
 
     const statusMap = new Map<string, string>()
     await batch(parsed.states, async (s) => {
-      const status = await payload.create({
-        collection: 'statuses',
-        data: { name: s, stateMachineDefinition: definition.id },
-      })
+      const status = await ensureStatus(payload, s, definition.id)
       statusMap.set(s, status.id)
     })
 
@@ -714,14 +787,12 @@ export async function seedStateMachine(
 
     const transitionsByEvent = new Map<string, string[]>()
     await batch(parsed.transitions, async (t) => {
-      const transition = await payload.create({
-        collection: 'transitions',
-        data: {
-          from: statusMap.get(t.from)!,
-          to: statusMap.get(t.to)!,
-          eventType: eventTypeCache.get(t.event)!,
-        },
-      })
+      const transition = await ensureTransition(
+        payload,
+        statusMap.get(t.from)!,
+        statusMap.get(t.to)!,
+        eventTypeCache.get(t.event)!,
+      )
       const existing = transitionsByEvent.get(t.event) || []
       existing.push(transition.id)
       transitionsByEvent.set(t.event, existing)
@@ -747,13 +818,7 @@ export async function seedStateMachine(
         if (matchingTransitions.docs.length) {
           const guardTexts = t.guard!.split(';').map((g: string) => g.trim()).filter(Boolean)
           for (const guardText of guardTexts) {
-            await payload.create({
-              collection: 'guards',
-              data: {
-                name: guardText,
-                transition: matchingTransitions.docs[0].id,
-              },
-            })
+            await ensureGuard(payload, matchingTransitions.docs[0].id, guardText)
           }
         }
       })
