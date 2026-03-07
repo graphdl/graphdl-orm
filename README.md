@@ -6,7 +6,7 @@
 
 A [`Thing`](https://schema.org/Thing) metamodel with admin interface.
 
-GraphDL (Graph Descriptor Language) makes it easy for developers, business analysts, and AIs to create e-commerce platforms, content management systems, and more. By describing the requirements for an application, the business rules can be added to the GraphDL application as `Graph Schema` objects, which form a knowledge graph than can generate an application's databases, UIs, and agents. The core components and concepts of GraphDL include:
+GraphDL (Graph Descriptor Language) makes it easy for developers, business analysts, and AIs to create e-commerce platforms, content management systems, and more. By describing the requirements for an application, the business rules can be added to GraphDL as `Graph Schema` objects, which form a knowledge graph than can generate an application's databases, UIs, and agents. The core components and concepts of GraphDL include:
 
 **Graph Schemas and Graphs** `Graph Schema`s act as blueprints for how data is structured within a `Graph`. They define the `Reading`s of `Noun`s and `Verb`s.
 
