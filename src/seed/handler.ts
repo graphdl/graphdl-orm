@@ -206,26 +206,25 @@ async function applyConstraints(
     }
   }
 
-  // Alethic Mandatory Constraint — set role.required = true on object role
+  // Alethic Mandatory Constraint — role must be played (data integrity)
   if (spec.amc && roles.docs.length >= 1) {
-    // MC applies to the object role (last role) — "Entity has Value" means Value is mandatory for Entity
     const objectRole = roles.docs[roles.docs.length - 1]
-    await payload.update({
-      collection: 'roles',
-      id: objectRole.id,
-      data: { required: true },
+    const c = await payload.create({
+      collection: 'constraints',
+      data: { kind: 'MC', modality: 'Alethic' },
     })
+    await payload.create({
+      collection: 'constraint-spans',
+      data: { constraint: c.id, roles: [objectRole.id] },
+    } as any)
   }
 
-  // Deontic Mandatory Constraint — role should be filled (warning, not enforced)
-  // The Constraints schema doesn't have an MC kind, so we use a Deontic UC
-  // on the single role. This isn't semantically perfect but captures the intent:
-  // "this role should be played" with deontic (warning) modality.
+  // Deontic Mandatory Constraint — role should be played (warning)
   if (spec.dmc && roles.docs.length >= 1) {
     const objectRole = roles.docs[roles.docs.length - 1]
     const c = await payload.create({
       collection: 'constraints',
-      data: { kind: 'UC', modality: 'Deontic' },
+      data: { kind: 'MC', modality: 'Deontic' },
     })
     await payload.create({
       collection: 'constraint-spans',

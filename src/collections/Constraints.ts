@@ -69,6 +69,10 @@ const Constraints: CollectionConfig = {
           label: 'Exclusive Or Constraint',
           value: 'XO',
         },
+        {
+          label: 'Mandatory Constraint',
+          value: 'MC',
+        },
       ],
       admin: {
         description: 'Constraint is Kind of constraint.',
