@@ -26,7 +26,7 @@ const StateMachines: CollectionConfig = {
     {
       name: 'stateMachineType',
       type: 'relationship',
-      relationTo: 'state-machines',
+      relationTo: 'state-machine-definitions',
       required: true,
       admin: {
         description: 'State Machine is instance of State Machine Definition.',
