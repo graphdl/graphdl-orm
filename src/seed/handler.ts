@@ -606,13 +606,9 @@ export async function seedDomain(
   // ── Batch 3: Readings (hooks create roles, then we apply constraints) ──
   await seedReadings(payload, parsed.readings, domainData, result)
 
-  // ── Batch 4: Instance facts as readings ──
+  // ── Batch 4: Instance facts as graphs ──
   if (parsed.instanceFacts.length) {
-    const instanceReadings: ReadingDef[] = parsed.instanceFacts.map((text) => ({
-      text,
-      multiplicity: '*:1',
-    }))
-    await seedReadings(payload, instanceReadings, domainData, result)
+    await seedInstanceFacts(payload, parsed.instanceFacts, domainData, result)
   }
 
   // ── Batch 5: Deontic constraints as readings ──
@@ -625,6 +621,7 @@ export async function seedDomain(
   }
 
   // ── Batch 6: Deontic constraint instance facts as readings ──
+  // These are violation-message annotations on constraints, not entity instance facts
   if (parsed.deonticConstraintInstances.length) {
     const instanceReadings: ReadingDef[] = parsed.deonticConstraintInstances.map((d) => {
       let inst = d.instance
@@ -646,6 +643,154 @@ export async function seedDomain(
   }
 
   return result
+}
+
+/**
+ * Parse an instance fact text into its base reading (fact type) and quoted instance values.
+ * e.g. "ProviderResource 'Fly.io/srcd' supports Service 'src.do'"
+ *   → baseReading: "ProviderResource supports Service"
+ *   → instances: [{ entityType: "ProviderResource", value: "Fly.io/srcd" }, { entityType: "Service", value: "src.do" }]
+ */
+function parseInstanceFact(text: string): { baseReading: string; instances: { entityType: string; value: string }[] } | null {
+  const instances: { entityType: string; value: string }[] = []
+
+  // Extract all quoted values with their preceding entity type word
+  const pattern = /(\b[A-Z]\w*)\s+'([^']+)'/g
+  let match
+  while ((match = pattern.exec(text)) !== null) {
+    instances.push({ entityType: match[1], value: match[2] })
+  }
+
+  if (instances.length === 0) return null
+
+  // Build the base reading by removing the quoted values
+  let baseReading = text
+  for (const inst of instances) {
+    baseReading = baseReading.replace(` '${inst.value}'`, '')
+  }
+  baseReading = baseReading.replace(/\s+/g, ' ').trim()
+
+  return { baseReading, instances }
+}
+
+async function ensureResource(
+  payload: Payload,
+  nounName: string,
+  value: string,
+  domainData: Record<string, any>,
+): Promise<any> {
+  // Find the noun for this entity type
+  const where: Record<string, any> = { name: { equals: nounName } }
+  if (domainData.domain) where.domain = { equals: domainData.domain }
+  const nounResult = await payload.find({
+    collection: 'nouns',
+    where,
+    limit: 1,
+  })
+  const noun = nounResult.docs[0]
+  if (!noun) return null
+
+  // Check if resource already exists with this type and value
+  const existing = await payload.find({
+    collection: 'resources',
+    where: {
+      type: { equals: noun.id },
+      value: { equals: value },
+    },
+    limit: 1,
+  })
+  if (existing.docs.length) return existing.docs[0]
+
+  return payload.create({
+    collection: 'resources',
+    data: { type: noun.id, value },
+  })
+}
+
+export async function seedInstanceFacts(
+  payload: Payload,
+  instanceTexts: string[],
+  domainData: Record<string, any>,
+  result: SeedResult,
+): Promise<void> {
+  // Check which instance facts already exist as graphs
+  const existingGraphs = await payload.find({
+    collection: 'graphs',
+    pagination: false,
+    depth: 1,
+  })
+  const existingTitles = new Set(existingGraphs.docs.map((d: any) => d.title))
+
+  for (const text of instanceTexts) {
+    try {
+      const parsed = parseInstanceFact(text)
+      if (!parsed) {
+        result.errors.push(`instance fact parse failed: "${text}"`)
+        continue
+      }
+
+      // Check if a graph with this title already exists (rough dedup)
+      if (existingTitles.has(text)) {
+        result.skipped++
+        continue
+      }
+
+      // Find the graph-schema for the base reading
+      const readingResult = await payload.find({
+        collection: 'readings',
+        where: { text: { equals: parsed.baseReading } },
+        limit: 1,
+        depth: 1,
+      })
+      const reading = readingResult.docs[0]
+      if (!reading) {
+        result.errors.push(`no reading found for base fact type "${parsed.baseReading}" (from: "${text}")`)
+        continue
+      }
+
+      const graphSchemaId = typeof reading.graphSchema === 'string' ? reading.graphSchema : (reading.graphSchema as any)?.id
+      if (!graphSchemaId) {
+        result.errors.push(`reading "${parsed.baseReading}" has no graph schema`)
+        continue
+      }
+
+      // Ensure resources exist for each quoted instance
+      const resources: any[] = []
+      for (const inst of parsed.instances) {
+        const resource = await ensureResource(payload, inst.entityType, inst.value, domainData)
+        if (resource) {
+          resources.push(resource)
+        } else {
+          result.errors.push(`could not create resource for ${inst.entityType} '${inst.value}'`)
+        }
+      }
+
+      // Create the graph (instance of the fact type)
+      const graph = await payload.create({
+        collection: 'graphs',
+        data: { type: graphSchemaId },
+      })
+
+      // Create resource-roles linking the graph to resources via the reading's roles
+      const roles: any[] = Array.isArray(reading.roles) ? reading.roles : []
+      for (let i = 0; i < resources.length && i < roles.length; i++) {
+        const roleId = typeof roles[i] === 'string' ? roles[i] : roles[i]?.id
+        if (!roleId) continue
+        await payload.create({
+          collection: 'resource-roles',
+          data: {
+            graph: graph.id,
+            resource: { relationTo: 'resources', value: resources[i].id },
+            role: roleId,
+          },
+        })
+      }
+
+      result.readings++ // reuse counter for instance facts
+    } catch (err: any) {
+      result.errors.push(`instance fact "${text}": ${err.message}`)
+    }
+  }
 }
 
 export async function seedReadings(
