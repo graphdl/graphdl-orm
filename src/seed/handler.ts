@@ -108,7 +108,7 @@ interface ParsedConstraints {
 
 function parseConstraintSpec(reading: ReadingDef): ParsedConstraints {
   const mult = reading.multiplicity
-  if (mult === 'unary' || mult === 'subtype') return { constraints: [], skip: true }
+  if (mult === 'subtype') return { constraints: [], skip: true }
   if (/^D?SS$/i.test(mult.split(/\s+/)[0])) return { constraints: [], skip: true }
 
   if (reading.ucs?.length) {
@@ -143,6 +143,8 @@ function parseConstraintSpec(reading: ReadingDef): ParsedConstraints {
       constraints.push({ kind: 'MC', modality: 'Alethic' })
       continue
     }
+    // "unary" is valid with no constraints (open world) — skip it
+    if (/^unary$/i.test(part)) continue
   }
 
   return { constraints }
@@ -164,7 +166,7 @@ async function applyConstraints(
   if (spec.skip) return
 
   if (!spec.constraints.length) {
-    result.errors.push(`unknown constraint notation "${reading.multiplicity}": ${reading.text}`)
+    // No constraints is valid (e.g., plain "unary" = open world)
     return
   }
 
