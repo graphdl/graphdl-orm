@@ -85,6 +85,25 @@ describe('Seed handler', () => {
     expect(result.errors).toHaveLength(0)
   })
 
+  it('should be idempotent on state machine re-seed', async () => {
+    const parsed = parseStateMachineMarkdown(SUPPORT_SM)
+    const result = await seedStateMachine(payload, 'SupportRequest', parsed, 'support')
+
+    expect(result.stateMachines).toBe(1)
+    expect(result.errors).toHaveLength(0)
+
+    // Verify no duplicate statuses were created
+    const allStatuses = await payload.find({
+      collection: 'statuses',
+      pagination: false,
+    })
+    // Original test created 3 (Received, Investigating, Resolved)
+    // Re-seed should NOT add more — still exactly 3
+    const statusNames = allStatuses.docs.map((s: any) => s.name)
+    const supportStatuses = statusNames.filter((n: string) => ['Received', 'Investigating', 'Resolved'].includes(n))
+    expect(supportStatuses.length).toBe(3) // not 6
+  })
+
   it('should seed FORML2 plain text readings', async () => {
     const readings = parseFORML2('SupportRequest has Description *:1')
     const result: SeedResult = { nouns: 0, readings: 0, stateMachines: 0, skipped: 0, errors: [] }
