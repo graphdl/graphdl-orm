@@ -5,7 +5,8 @@ import { seedDomain, seedReadings, seedStateMachine, type SeedResult } from '../
 
 interface SeedFileInput {
   markdown: string
-  type: 'domain' | 'state-machine' | 'forml2'
+  text?: string // plain text input for unified parser
+  type: 'domain' | 'state-machine' | 'forml2' | 'text'
   domain?: string
   entityNoun?: string // required for state-machine type
 }
@@ -42,7 +43,7 @@ export const GET = async () => {
       functions: functions.totalDocs,
     },
     actions: {
-      seed: 'POST /seed with { markdown, type: "domain"|"state-machine"|"forml2", domain?, entityNoun? }',
+      seed: 'POST /seed with { text, type: "text", domain } or { markdown, type: "domain"|"state-machine"|"forml2", domain?, entityNoun? }',
       wipe: 'DELETE /seed — drops all collections except users',
     },
   })
@@ -58,7 +59,63 @@ export const POST = async (request: Request) => {
   const results: SeedResult[] = []
 
   for (const file of files) {
-    if (file.type === 'domain') {
+    if (file.type === 'text' || file.text) {
+      const { seedReadingsFromText } = await import('../../seed/unified')
+      const inputText = file.text || file.markdown
+      if (!inputText) {
+        results.push({
+          domain: file.domain,
+          nouns: 0,
+          readings: 0,
+          stateMachines: 0,
+          skipped: 0,
+          errors: ['text field is required for type "text"'],
+        })
+        continue
+      }
+
+      // Find or create domain
+      let domainId: string
+      if (file.domain) {
+        const domainResult = await payload.find({
+          collection: 'domains',
+          where: { domainSlug: { equals: file.domain } },
+          limit: 1,
+        })
+        if (domainResult.docs.length) {
+          domainId = domainResult.docs[0].id
+        } else {
+          const newDomain = await payload.create({
+            collection: 'domains',
+            data: { domainSlug: file.domain, name: file.domain },
+          })
+          domainId = newDomain.id
+        }
+      } else {
+        results.push({
+          domain: file.domain,
+          nouns: 0,
+          readings: 0,
+          stateMachines: 0,
+          skipped: 0,
+          errors: ['domain is required for type "text"'],
+        })
+        continue
+      }
+
+      const unifiedResult = await seedReadingsFromText(payload, {
+        text: inputText,
+        domainId,
+      })
+      results.push({
+        domain: file.domain,
+        nouns: unifiedResult.nounsCreated,
+        readings: unifiedResult.readingsCreated,
+        stateMachines: 0,
+        skipped: 0,
+        errors: unifiedResult.errors,
+      })
+    } else if (file.type === 'domain') {
       const parsed = parseDomainMarkdown(file.markdown)
       const result = await seedDomain(payload, parsed, file.domain)
       results.push(result)
