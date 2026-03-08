@@ -1,11 +1,19 @@
 import { CollectionConfig } from 'payload'
 import type { Graph, Resource } from '../payload-types'
+import { domainField } from './shared/domainScope'
+import { instanceReadAccess, instanceWriteAccess } from './shared/instanceAccess'
 
 const Resources: CollectionConfig = {
   slug: 'resources',
   admin: {
     group: 'Implementations',
     useAsTitle: 'title',
+  },
+  access: {
+    read: instanceReadAccess,
+    create: instanceWriteAccess,
+    update: instanceWriteAccess,
+    delete: instanceWriteAccess,
   },
   hooks: {
     afterChange: [
@@ -63,6 +71,7 @@ const Resources: CollectionConfig = {
                 type: (eventType as any).id,
                 timestamp: new Date().toISOString(),
                 stateMachine: (sm as any).id,
+                ...(doc.domain ? { domain: typeof doc.domain === 'object' ? (doc.domain as any).id : doc.domain } : {}),
               },
               req,
             })
@@ -197,6 +206,7 @@ const Resources: CollectionConfig = {
         description: 'State Machine is for Resource.',
       },
     },
+    domainField,
   ],
 }
 

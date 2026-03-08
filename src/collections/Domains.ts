@@ -1,7 +1,13 @@
 import { CollectionConfig } from 'payload'
+import { domainReadAccess, domainWriteAccess } from './shared/instanceAccess'
 
 const Domains: CollectionConfig = {
   slug: 'domains',
+  access: {
+    read: domainReadAccess,
+    update: domainWriteAccess,
+    delete: domainWriteAccess,
+  },
   admin: {
     useAsTitle: 'domainSlug',
     group: 'Object-Role Modeling',
@@ -37,6 +43,15 @@ const Domains: CollectionConfig = {
       index: true,
       admin: {
         description: 'Tenant email for API-layer access scoping.',
+      },
+    },
+    {
+      name: 'visibility',
+      type: 'select',
+      options: ['private', 'public'],
+      defaultValue: 'private',
+      admin: {
+        description: 'Domain has DomainVisibility.',
       },
     },
     {

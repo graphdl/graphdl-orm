@@ -1,8 +1,15 @@
 import { CollectionConfig } from 'payload'
 import type { Graph, GraphSchema, Resource } from '../payload-types'
+import { instanceReadAccess, instanceWriteAccess } from './shared/instanceAccess'
 
 const Graphs: CollectionConfig = {
   slug: 'graphs',
+  access: {
+    read: instanceReadAccess,
+    create: instanceWriteAccess,
+    update: instanceWriteAccess,
+    delete: instanceWriteAccess,
+  },
   admin: {
     group: 'Implementations',
     useAsTitle: 'title',
@@ -73,6 +80,14 @@ const Graphs: CollectionConfig = {
       on: 'graph',
       admin: {
         description: 'Graph uses Resource for Role.',
+      },
+    },
+    {
+      name: 'domain',
+      type: 'relationship',
+      relationTo: 'domains',
+      admin: {
+        description: 'Graph belongs to Domain.',
       },
     },
     {

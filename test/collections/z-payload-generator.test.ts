@@ -100,7 +100,7 @@ describe('Payload Collection Generator', () => {
   it('should include access control in generated TypeScript', () => {
     const tsContent = payloadOutput.files['collections/support-requests.ts']
     expect(tsContent).toContain('access:')
-    expect(tsContent).toContain('({ req: { user } }) => Boolean(user)')
+    expect(tsContent).toContain('instanceReadAccess')
   })
 
   it('should include auth config for login collections', () => {

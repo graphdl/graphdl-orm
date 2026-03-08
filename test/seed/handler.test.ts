@@ -173,6 +173,88 @@ describe('Seed handler', () => {
     })
     expect(cancelVerb.docs.length).toBe(0)
   })
+
+  it('should populate domain on resources created by seedInstanceFacts', async () => {
+    const INSTANCE_DOMAIN = `# Instance Domain Test
+
+## Entity Types
+
+| Entity | Reference Scheme | Notes |
+|--------|-----------------|-------|
+| Widget | WidgetName | Test entity |
+| Color | ColorName | Test value entity |
+
+## Value Types
+
+| Value | Type | Constraints |
+|-------|------|------------|
+| WidgetName | string | |
+| ColorName | string | |
+
+## Readings
+
+| Reading | Multiplicity |
+|---------|-------------|
+| Widget has Color | \\*:1 |
+
+## Instance Facts
+
+| Fact |
+|------|
+| Widget 'Sprocket' has Color 'Red' |
+`
+    const parsed = parseDomainMarkdown(INSTANCE_DOMAIN)
+    const result = await seedDomain(payload, parsed, 'instance-domain-test')
+    expect(result.errors).toHaveLength(0)
+
+    const domainDoc = await payload.find({
+      collection: 'domains',
+      where: { domainSlug: { equals: 'instance-domain-test' } },
+      limit: 1,
+    })
+    const domainId = domainDoc.docs[0].id
+
+    const resources = await payload.find({
+      collection: 'resources',
+      where: { value: { in: ['Sprocket', 'Red'] } },
+      pagination: false,
+    })
+    for (const r of resources.docs) {
+      const domRef = typeof (r as any).domain === 'object' ? (r as any).domain?.id : (r as any).domain
+      expect(domRef).toBe(domainId)
+    }
+  })
+
+  it('ensureDomain should accept tenant parameter', async () => {
+    const parsed = parseDomainMarkdown(`# Tenant Test
+
+## Entity Types
+
+| Entity | Reference Scheme | Notes |
+|--------|-----------------|-------|
+| Gadget | GadgetId | Test |
+
+## Value Types
+
+| Value | Type | Constraints |
+|-------|------|------------|
+| GadgetId | string | |
+
+## Readings
+
+| Reading | Multiplicity |
+|---------|-------------|
+`)
+    const result = await seedDomain(payload, parsed, 'tenant-test', 'owner@example.com')
+    expect(result.errors).toHaveLength(0)
+
+    const domain = await payload.find({
+      collection: 'domains',
+      where: { domainSlug: { equals: 'tenant-test' } },
+      limit: 1,
+    })
+    expect(domain.docs[0].tenant).toBe('owner@example.com')
+  })
 })
 
 const BILLING_DOMAIN = `# Billing Test

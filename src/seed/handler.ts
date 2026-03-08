@@ -35,16 +35,26 @@ async function batch<T>(
   }
 }
 
-async function ensureDomain(payload: Payload, domainSlug: string): Promise<string> {
+async function ensureDomain(payload: Payload, domainSlug: string, tenant?: string): Promise<string> {
   const existing = await payload.find({
     collection: 'domains',
     where: { domainSlug: { equals: domainSlug } },
     limit: 1,
   })
-  if (existing.docs.length) return existing.docs[0].id
+  if (existing.docs.length) {
+    // Update tenant if provided and not already set
+    if (tenant && !existing.docs[0].tenant) {
+      await payload.update({
+        collection: 'domains',
+        id: existing.docs[0].id,
+        data: { tenant },
+      })
+    }
+    return existing.docs[0].id
+  }
   const created = await payload.create({
     collection: 'domains',
-    data: { domainSlug, name: domainSlug },
+    data: { domainSlug, name: domainSlug, ...(tenant ? { tenant } : {}) },
   })
   return created.id
 }
@@ -525,8 +535,9 @@ export async function seedDomain(
   payload: Payload,
   parsed: DomainParseResult,
   domain?: string,
+  tenant?: string,
 ): Promise<SeedResult> {
-  const domainId = domain ? await ensureDomain(payload, domain) : undefined
+  const domainId = domain ? await ensureDomain(payload, domain, tenant) : undefined
   const result: SeedResult = {
     domain,
     nouns: 0,
@@ -703,7 +714,7 @@ async function ensureResource(
 
   return payload.create({
     collection: 'resources',
-    data: { type: noun.id, value },
+    data: { type: noun.id, value, ...domainData },
   })
 }
 
@@ -725,7 +736,31 @@ export async function seedInstanceFacts(
     try {
       const parsed = parseInstanceFact(text)
       if (!parsed) {
-        result.errors.push(`instance fact parse failed: "${text}"`)
+        // No quoted values — seed as a plain reading (e.g. verb/function wiring facts
+        // like "subscribe runs SubscribeCustomer"). wireVerbsAndFunctions() searches
+        // the readings collection for these.
+        const existingReading = await payload.find({
+          collection: 'readings',
+          where: { text: { equals: text } },
+          limit: 1,
+        })
+        if (!existingReading.docs.length) {
+          const schemaName = text
+            .split(' ')
+            .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+            .join('')
+          const schema = await payload.create({
+            collection: 'graph-schemas',
+            data: { name: schemaName, title: schemaName, ...domainData } as any,
+          })
+          await payload.create({
+            collection: 'readings',
+            data: { text, graphSchema: schema.id, ...domainData } as any,
+          })
+          result.readings++
+        } else {
+          result.skipped++
+        }
         continue
       }
 
@@ -768,7 +803,7 @@ export async function seedInstanceFacts(
       // Create the graph (instance of the fact type)
       const graph = await payload.create({
         collection: 'graphs',
-        data: { type: graphSchemaId },
+        data: { type: graphSchemaId, ...domainData },
       })
 
       // Create resource-roles linking the graph to resources via the reading's roles
@@ -782,6 +817,7 @@ export async function seedInstanceFacts(
             graph: graph.id,
             resource: { relationTo: 'resources', value: resources[i].id },
             role: roleId,
+            ...domainData,
           },
         })
       }

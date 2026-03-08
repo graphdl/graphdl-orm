@@ -706,6 +706,10 @@ export interface Graph {
     totalDocs?: number;
   };
   /**
+   * Graph belongs to Domain.
+   */
+  domain?: (string | null) | Domain;
+  /**
    * Graph verb is done for now.
    */
   isDoneForNow?: boolean | null;
@@ -1571,6 +1575,7 @@ export interface GraphsSelect<T extends boolean = true> {
   type?: T;
   verb?: T;
   resourceRoles?: T;
+  domain?: T;
   isDoneForNow?: T;
   isExample?: T;
   stateMachine?: T;

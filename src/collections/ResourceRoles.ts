@@ -1,10 +1,18 @@
 import { CollectionConfig } from 'payload'
+import { domainField } from './shared/domainScope'
+import { instanceReadAccess, instanceWriteAccess } from './shared/instanceAccess'
 
 const ResourceRoles: CollectionConfig = {
   slug: 'resource-roles',
   admin: {
     group: 'Implementations',
     useAsTitle: 'title',
+  },
+  access: {
+    read: instanceReadAccess,
+    create: instanceWriteAccess,
+    update: instanceWriteAccess,
+    delete: instanceWriteAccess,
   },
   fields: [
     {
@@ -76,6 +84,7 @@ const ResourceRoles: CollectionConfig = {
         description: 'Role is played by Resource in Graph.',
       },
     },
+    domainField,
   ],
 }
 export default ResourceRoles
