@@ -23,21 +23,6 @@ export interface SeedResult {
   errors: string[]
 }
 
-// Schema.org DataType descendants — nouns matching these are value types
-const SCHEMA_ORG_VALUE_TYPES = new Set([
-  'Boolean', 'Date', 'DateTime', 'Float', 'Integer', 'Number', 'Text', 'Time', 'URL',
-])
-
-// Common domain value type names that map to Schema.org DataTypes
-const VALUE_TYPE_ALIASES: Record<string, string> = {
-  Name: 'string', Email: 'string', Phone: 'string', Address: 'string',
-  Description: 'string', Title: 'string', Code: 'string', Slug: 'string',
-  Password: 'string', Username: 'string', Label: 'string',
-  Price: 'number', Amount: 'number', Quantity: 'number', Count: 'number',
-  Weight: 'number', Height: 'number', Width: 'number', Length: 'number',
-  Age: 'integer', Score: 'number', Rating: 'number', Balance: 'number',
-  Timestamp: 'string', Duration: 'string',
-}
 
 /** Best-effort English pluralization using regular rules only.
  *  Irregular plurals (person→people, species→species) are handled by the LLM
@@ -114,30 +99,6 @@ export async function seedReadingsFromText(
 
   // Pass 2: re-parse with all nouns now known so each reading finds its nouns
   const parsed = parseText(text, allNounNames)
-
-  // Infer value types using two signals:
-  // 1. Schema.org: nouns matching DataType descendants or common value-type names
-  // 2. Positional: nouns that only appear in object position (never as subject)
-  const subjectNouns = new Set<string>()
-  const objectNouns = new Set<string>()
-  for (const r of parsed.readings) {
-    if (r.isTransition || r.isInstanceFact || r.isSubtype || r.nouns.length < 2) continue
-    subjectNouns.add(r.nouns[0])
-    for (let i = 1; i < r.nouns.length; i++) objectNouns.add(r.nouns[i])
-  }
-  for (const name of nounMap.keys()) {
-    const isSchemaValue = SCHEMA_ORG_VALUE_TYPES.has(name) || name in VALUE_TYPE_ALIASES
-    const isObjectOnly = objectNouns.has(name) && !subjectNouns.has(name)
-    if (!isSchemaValue && !isObjectOnly) continue
-    const noun = nounMap.get(name)
-    if (noun && noun.objectType !== 'value') {
-      const updateData: Record<string, string> = { objectType: 'value' }
-      if (name in VALUE_TYPE_ALIASES) updateData.valueType = VALUE_TYPE_ALIASES[name]
-      try {
-        await payload.update({ collection: 'nouns', id: noun.id, data: updateData })
-      } catch { /* best effort */ }
-    }
-  }
 
   for (const reading of parsed.readings) {
     try {
