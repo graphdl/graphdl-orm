@@ -270,6 +270,7 @@ async function generateReadingsOutput(payload: any, domainFilter: Where): Promis
     lines.push(`# State Machine: ${sm.title || sm.id}`)
     lines.push('')
     const statuses = sm.statuses?.docs || []
+    if (!statuses.length) continue
     const transitions = await payload.find({
       collection: 'transitions',
       where: {
