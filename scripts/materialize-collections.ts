@@ -50,4 +50,7 @@ async function materialize() {
   process.exit(0)
 }
 
-materialize().catch(console.error)
+materialize().catch((err) => {
+  console.error(err)
+  process.exit(1)
+})
