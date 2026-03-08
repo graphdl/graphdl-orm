@@ -7,7 +7,8 @@ interface SeedFileInput {
   markdown: string
   text?: string // plain text input for unified parser
   type: 'domain' | 'state-machine' | 'forml2' | 'text'
-  domain?: string
+  domain?: string // domain slug (looked up without tenant scoping — prefer domainId)
+  domainId?: string // domain ID (bypasses slug lookup — use when caller already resolved the domain)
   entityNoun?: string // required for state-machine type
 }
 
@@ -74,9 +75,11 @@ export const POST = async (request: Request) => {
         continue
       }
 
-      // Find or create domain
+      // Find or create domain — accept domainId directly or look up by slug
       let domainId: string
-      if (file.domain) {
+      if (file.domainId) {
+        domainId = file.domainId
+      } else if (file.domain) {
         const domainResult = await payload.find({
           collection: 'domains',
           where: { domainSlug: { equals: file.domain } },
