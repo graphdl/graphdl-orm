@@ -140,4 +140,12 @@ describe('Domain-level user scoping', () => {
     expect((alice as any).or[1]).toEqual({ 'domain.visibility': { equals: 'public' } })
     expect((bob as any).or[1]).toEqual({ 'domain.visibility': { equals: 'public' } })
   })
+
+  it('service account bypasses all access control', () => {
+    const serviceReq = { req: { user: { email: 'cicd@repo.do' } } } as any
+    expect(instanceReadAccess(serviceReq)).toBe(true)
+    expect(instanceWriteAccess(serviceReq)).toBe(true)
+    expect(domainReadAccess(serviceReq)).toBe(true)
+    expect(domainWriteAccess(serviceReq)).toBe(true)
+  })
 })
