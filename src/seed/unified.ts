@@ -23,6 +23,40 @@ export interface SeedResult {
   errors: string[]
 }
 
+// Schema.org DataType descendants — nouns matching these are value types
+const SCHEMA_ORG_VALUE_TYPES = new Set([
+  'Boolean', 'Date', 'DateTime', 'Float', 'Integer', 'Number', 'Text', 'Time', 'URL',
+])
+
+// Common domain value type names that map to Schema.org DataTypes
+const VALUE_TYPE_ALIASES: Record<string, string> = {
+  Name: 'string', Email: 'string', Phone: 'string', Address: 'string',
+  Description: 'string', Title: 'string', Code: 'string', Slug: 'string',
+  Password: 'string', Username: 'string', Label: 'string',
+  Price: 'number', Amount: 'number', Quantity: 'number', Count: 'number',
+  Weight: 'number', Height: 'number', Width: 'number', Length: 'number',
+  Age: 'integer', Score: 'number', Rating: 'number', Balance: 'number',
+  Timestamp: 'string', Duration: 'string',
+}
+
+/** Best-effort English pluralization using regular rules only.
+ *  Irregular plurals (person→people, species→species) are handled by the LLM
+ *  layer which writes the plural form directly in the readings. */
+function pluralize(word: string): string {
+  const lower = word.toLowerCase()
+  if (/(?:s|x|z|ch|sh)$/i.test(lower)) return lower + 'es'
+  if (/[^aeiou]y$/i.test(lower)) return lower.replace(/y$/i, 'ies')
+  return lower + 's'
+}
+
+/** Produce kebab-case plural slug: SupportRequest → support-requests */
+function pluralSlug(name: string): string {
+  const kebab = name.replace(/([A-Z])/g, '-$1').toLowerCase().replace(/^-/, '')
+  const lastSegment = kebab.split('-').pop() || kebab
+  const pluralLast = pluralize(lastSegment.charAt(0).toUpperCase() + lastSegment.slice(1))
+  return kebab.replace(new RegExp(lastSegment + '$'), pluralLast)
+}
+
 async function ensureNoun(payload: Payload, name: string, domainId: string): Promise<any> {
   const existing = await payload.find({
     collection: 'nouns',
@@ -32,7 +66,12 @@ async function ensureNoun(payload: Payload, name: string, domainId: string): Pro
   if (existing.docs.length) return existing.docs[0]
   return payload.create({
     collection: 'nouns',
-    data: { name, objectType: 'entity', domain: domainId },
+    data: {
+      name,
+      objectType: 'entity',
+      plural: pluralSlug(name),
+      domain: domainId,
+    },
   })
 }
 
@@ -75,6 +114,30 @@ export async function seedReadingsFromText(
 
   // Pass 2: re-parse with all nouns now known so each reading finds its nouns
   const parsed = parseText(text, allNounNames)
+
+  // Infer value types using two signals:
+  // 1. Schema.org: nouns matching DataType descendants or common value-type names
+  // 2. Positional: nouns that only appear in object position (never as subject)
+  const subjectNouns = new Set<string>()
+  const objectNouns = new Set<string>()
+  for (const r of parsed.readings) {
+    if (r.isTransition || r.isInstanceFact || r.isSubtype || r.nouns.length < 2) continue
+    subjectNouns.add(r.nouns[0])
+    for (let i = 1; i < r.nouns.length; i++) objectNouns.add(r.nouns[i])
+  }
+  for (const name of nounMap.keys()) {
+    const isSchemaValue = SCHEMA_ORG_VALUE_TYPES.has(name) || name in VALUE_TYPE_ALIASES
+    const isObjectOnly = objectNouns.has(name) && !subjectNouns.has(name)
+    if (!isSchemaValue && !isObjectOnly) continue
+    const noun = nounMap.get(name)
+    if (noun && noun.objectType !== 'value') {
+      const updateData: Record<string, string> = { objectType: 'value' }
+      if (name in VALUE_TYPE_ALIASES) updateData.valueType = VALUE_TYPE_ALIASES[name]
+      try {
+        await payload.update({ collection: 'nouns', id: noun.id, data: updateData })
+      } catch { /* best effort */ }
+    }
+  }
 
   for (const reading of parsed.readings) {
     try {
