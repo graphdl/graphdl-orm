@@ -1,10 +1,18 @@
 import { CollectionConfig } from 'payload'
+import { domainField } from './shared/domainScope'
+import { instanceReadAccess, instanceWriteAccess } from './shared/instanceAccess'
 
 const StateMachines: CollectionConfig = {
   slug: 'state-machines',
   admin: {
     useAsTitle: 'name',
     group: 'Implementations',
+  },
+  access: {
+    read: instanceReadAccess,
+    create: instanceWriteAccess,
+    update: instanceWriteAccess,
+    delete: instanceWriteAccess,
   },
   fields: [
     {
@@ -41,6 +49,7 @@ const StateMachines: CollectionConfig = {
         description: 'State Machine is currently in Status.',
       },
     },
+    domainField,
   ],
 }
 
