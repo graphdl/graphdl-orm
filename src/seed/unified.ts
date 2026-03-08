@@ -77,6 +77,9 @@ export async function seedReadingsFromText(
 
   for (const reading of parsed.readings) {
     try {
+      // Skip transitions and instance facts — handled separately
+      if (reading.isTransition || reading.isInstanceFact) continue
+
       if (reading.isSubtype) {
         // Set superType relationship on the child noun
         const subNoun = nounMap.get(reading.nouns[0])
@@ -88,7 +91,6 @@ export async function seedReadingsFromText(
             data: { superType: superNoun.id },
           })
         }
-        result.readingsCreated++
         continue
       }
 
