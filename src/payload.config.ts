@@ -33,14 +33,11 @@ import { Users } from './collections/Users'
 import Verbs from './collections/Verbs'
 
 import type { CollectionConfig } from 'payload'
+import * as generated from './collections/generated'
 
-let generatedCollections: CollectionConfig[] = []
-try {
-  const generated = require('./collections/generated')
-  generatedCollections = Object.values(generated)
-} catch {
-  // No generated collections yet — that's fine
-}
+const generatedCollections: CollectionConfig[] = Object.values(generated).filter(
+  (v): v is CollectionConfig => typeof v === 'object' && v !== null && 'slug' in v,
+)
 
 const filename = fileURLToPath(import.meta.url)
 const dirname = path.dirname(filename)

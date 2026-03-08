@@ -230,6 +230,10 @@ export interface Domain {
    */
   tenant?: string | null;
   /**
+   * Domain has DomainVisibility.
+   */
+  visibility?: ('private' | 'public') | null;
+  /**
    * Noun belongs to Domain.
    */
   nouns?: {
@@ -755,6 +759,10 @@ export interface ResourceRole {
    * Role is played by Resource in Graph.
    */
   role: string | Role;
+  /**
+   * Domain this resource belongs to.
+   */
+  domain?: (string | null) | Domain;
   updatedAt: string;
   createdAt: string;
 }
@@ -796,6 +804,10 @@ export interface Resource {
     hasNextPage?: boolean;
     totalDocs?: number;
   };
+  /**
+   * Domain this resource belongs to.
+   */
+  domain?: (string | null) | Domain;
   updatedAt: string;
   createdAt: string;
 }
@@ -829,6 +841,10 @@ export interface StateMachine {
    * State Machine is currently in Status.
    */
   stateMachineStatus: string | Status;
+  /**
+   * Domain this resource belongs to.
+   */
+  domain?: (string | null) | Domain;
   updatedAt: string;
   createdAt: string;
 }
@@ -985,6 +1001,10 @@ export interface GuardRun {
    * Guard Run references Graph.
    */
   graphs?: (string | Graph)[] | null;
+  /**
+   * Domain this resource belongs to.
+   */
+  domain?: (string | null) | Domain;
   updatedAt: string;
   createdAt: string;
 }
@@ -1043,7 +1063,7 @@ export interface Generator {
   /**
    * What this generator produces. OpenAPI is the default.
    */
-  outputFormat?: ('openapi' | 'payload' | 'xstate' | 'mermaid' | 'ilayer') | null;
+  outputFormat?: ('openapi' | 'payload' | 'xstate' | 'mermaid' | 'ilayer' | 'readings') | null;
   /**
    * Source generator whose output is used as input. Auto-detected if not set.
    */
@@ -1115,6 +1135,10 @@ export interface Event {
    * Event was created by State Machine.
    */
   stateMachine?: (string | null) | StateMachine;
+  /**
+   * Domain this resource belongs to.
+   */
+  domain?: (string | null) | Domain;
   updatedAt: string;
   createdAt: string;
 }
@@ -1317,6 +1341,7 @@ export interface DomainsSelect<T extends boolean = true> {
   name?: T;
   description?: T;
   tenant?: T;
+  visibility?: T;
   nouns?: T;
   readings?: T;
   graphSchemas?: T;
@@ -1592,6 +1617,7 @@ export interface ResourcesSelect<T extends boolean = true> {
   reference?: T;
   value?: T;
   stateMachine?: T;
+  domain?: T;
   updatedAt?: T;
   createdAt?: T;
 }
@@ -1604,6 +1630,7 @@ export interface ResourceRolesSelect<T extends boolean = true> {
   graph?: T;
   resource?: T;
   role?: T;
+  domain?: T;
   updatedAt?: T;
   createdAt?: T;
 }
@@ -1616,6 +1643,7 @@ export interface EventsSelect<T extends boolean = true> {
   timestamp?: T;
   graph?: T;
   stateMachine?: T;
+  domain?: T;
   updatedAt?: T;
   createdAt?: T;
 }
@@ -1628,6 +1656,7 @@ export interface StateMachinesSelect<T extends boolean = true> {
   resource?: T;
   stateMachineType?: T;
   stateMachineStatus?: T;
+  domain?: T;
   updatedAt?: T;
   createdAt?: T;
 }
@@ -1639,6 +1668,7 @@ export interface GuardRunsSelect<T extends boolean = true> {
   name?: T;
   type?: T;
   graphs?: T;
+  domain?: T;
   updatedAt?: T;
   createdAt?: T;
 }
