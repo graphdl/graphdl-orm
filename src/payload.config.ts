@@ -32,6 +32,16 @@ import Transitions from './collections/Transitions'
 import { Users } from './collections/Users'
 import Verbs from './collections/Verbs'
 
+import type { CollectionConfig } from 'payload'
+
+let generatedCollections: CollectionConfig[] = []
+try {
+  const generated = require('./collections/generated')
+  generatedCollections = Object.values(generated)
+} catch {
+  // No generated collections yet — that's fine
+}
+
 const filename = fileURLToPath(import.meta.url)
 const dirname = path.dirname(filename)
 
@@ -67,6 +77,7 @@ export default buildConfig({
     StateMachines,
     GuardRuns,
     Users,
+    ...generatedCollections,
   ],
   editor: slateEditor({}),
   secret: process.env.PAYLOAD_SECRET || '',
