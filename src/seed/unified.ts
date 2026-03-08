@@ -26,7 +26,7 @@ export interface SeedResult {
 async function ensureNoun(payload: Payload, name: string, domainId: string): Promise<any> {
   const existing = await payload.find({
     collection: 'nouns',
-    where: { name: { equals: name } },
+    where: { name: { equals: name }, domain: { equals: domainId } },
     limit: 1,
   })
   if (existing.docs.length) return existing.docs[0]
@@ -64,9 +64,10 @@ export async function seedReadingsFromText(
     }
   }
 
-  // Refresh noun map after creating new ones (needed for role auto-creation in hooks)
+  // Refresh noun map after creating new ones (domain-scoped)
   const allNouns = await payload.find({
     collection: 'nouns',
+    where: { domain: { equals: domainId } },
     pagination: false,
   })
   const nounMap = new Map(allNouns.docs.map((n: any) => [n.name, n]))
