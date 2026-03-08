@@ -109,6 +109,7 @@ const Generator: CollectionConfig = {
             { label: 'XState + Agent', value: 'xstate' },
             { label: 'Mermaid Diagrams', value: 'mermaid' },
             { label: 'iLayer UI', value: 'ilayer' },
+            { label: 'Readings', value: 'readings' },
           ],
           defaultValue: 'openapi',
           admin: {
@@ -175,6 +176,8 @@ const Generator: CollectionConfig = {
           data.output = await generateMermaidDiagrams(payload, domainFilter)
         } else if (outputFormat === 'ilayer') {
           data.output = await generateILayerFiles(payload, domainFilter)
+        } else if (outputFormat === 'readings') {
+          data.output = await generateReadingsOutput(payload, domainFilter)
         }
       }) as CollectionBeforeChangeHook<Generator>,
     ],
@@ -182,6 +185,113 @@ const Generator: CollectionConfig = {
 }
 
 export default Generator
+
+async function generateReadingsOutput(payload: any, domainFilter: Where): Promise<any> {
+  const nouns = await payload.find({ collection: 'nouns', pagination: false, where: domainFilter }).then((n: any) => n.docs)
+  const readings = await payload.find({ collection: 'readings', pagination: false, depth: 3, where: domainFilter }).then((r: any) => r.docs)
+  const constraintSpans = await payload.find({
+    collection: 'constraint-spans', pagination: false, depth: 6,
+  }).then((cs: any) => cs.docs)
+  const smDefs = await payload.find({
+    collection: 'state-machine-definitions', pagination: false, depth: 4, where: domainFilter,
+  }).then((s: any) => s.docs)
+
+  const lines: string[] = []
+
+  // Entity types
+  const entities = nouns.filter((n: any) => n.objectType === 'entity')
+  const values = nouns.filter((n: any) => n.objectType === 'value')
+
+  if (entities.length) {
+    lines.push('# Entity Types')
+    lines.push('')
+    for (const e of entities) {
+      const refScheme = e.referenceScheme?.map((r: any) =>
+        typeof r === 'object' ? r.name : r
+      ).join(', ')
+      const superType = typeof e.superType === 'object' ? e.superType?.name : null
+      let line = e.name
+      if (refScheme) line += ` (${refScheme})`
+      if (superType) line += ` : ${superType}`
+      lines.push(line)
+    }
+    lines.push('')
+  }
+
+  if (values.length) {
+    lines.push('# Value Types')
+    lines.push('')
+    for (const v of values) {
+      let line = v.name
+      const parts: string[] = []
+      if (v.valueType) parts.push(v.valueType)
+      if (v.format) parts.push(`format: ${v.format}`)
+      if (v.pattern) parts.push(`pattern: ${v.pattern}`)
+      if (v.enum) parts.push(`enum: ${v.enum}`)
+      if (parts.length) line += ` (${parts.join(', ')})`
+      lines.push(line)
+    }
+    lines.push('')
+  }
+
+  // Readings as FORML2
+  if (readings.length) {
+    lines.push('# Readings')
+    lines.push('')
+    for (const r of readings) {
+      if (!r.text) continue
+      // Find constraints on this reading's graph schema roles
+      const gsId = typeof r.graphSchema === 'object' ? r.graphSchema?.id : r.graphSchema
+      const roleConstraints = constraintSpans.filter((cs: any) => {
+        const roles = cs.roles || []
+        return roles.some((role: any) => {
+          const roleGs = typeof role === 'object' ? (typeof role.graphSchema === 'object' ? role.graphSchema?.id : role.graphSchema) : null
+          return roleGs === gsId
+        })
+      })
+
+      let constraintSuffix = ''
+      for (const cs of roleConstraints) {
+        const constraint = typeof cs.constraint === 'object' ? cs.constraint : null
+        if (constraint) {
+          const kind = constraint.kind || ''
+          const modality = constraint.modality === 'Deontic' ? 'D' : ''
+          constraintSuffix += ` [${modality}${kind}]`
+        }
+      }
+
+      lines.push(r.text + constraintSuffix)
+    }
+    lines.push('')
+  }
+
+  // State machines
+  for (const sm of smDefs) {
+    lines.push(`# State Machine: ${sm.title || sm.id}`)
+    lines.push('')
+    const statuses = sm.statuses?.docs || []
+    const transitions = await payload.find({
+      collection: 'transitions',
+      where: {
+        or: statuses.map((s: any) => ({ from: { equals: typeof s === 'object' ? s.id : s } })),
+      },
+      depth: 2,
+      pagination: false,
+    }).then((t: any) => t.docs)
+
+    for (const t of transitions) {
+      const from = typeof t.from === 'object' ? t.from?.name : t.from
+      const to = typeof t.to === 'object' ? t.to?.name : t.to
+      const event = typeof t.eventType === 'object' ? t.eventType?.name : t.eventType
+      if (from && to && event) {
+        lines.push(`${sm.title} transitions from ${from} to ${to} on ${event}`)
+      }
+    }
+    lines.push('')
+  }
+
+  return { text: lines.join('\n'), format: 'forml2' }
+}
 
 // #region Composable generator functions
 
