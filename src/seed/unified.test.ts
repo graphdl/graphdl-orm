@@ -66,7 +66,7 @@ describe('seedReadingsFromText', () => {
     })
 
     expect(result.errors).toHaveLength(0)
-    expect(result.readingsCreated).toBe(1)
+    expect(result.readingsCreated).toBe(0) // subtypes update nouns, not create readings
 
     // Verify superType was set
     const admin = await payload.find({
