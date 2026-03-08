@@ -1136,11 +1136,12 @@ async function generatePayloadFiles(payload: any, sourceOutput: any, domainFilte
       fields.find((f) => f.required && f.type === 'text') ||
       fields[0]
     const permissions = noun.permissions || []
-    const access: Record<string, string> = {}
-    if (permissions.includes('create')) access.create = 'authenticated'
-    if (permissions.includes('read')) access.read = 'authenticated'
-    if (permissions.includes('update')) access.update = 'authenticated'
-    if (permissions.includes('delete')) access.delete = 'authenticated'
+    const access: Record<string, string> = {
+      read: 'instanceReadAccess',
+      create: 'instanceWriteAccess',
+      update: 'instanceWriteAccess',
+      delete: 'instanceWriteAccess',
+    }
 
     // Build defaultColumns: [useAsTitle, ...required non-rel, ...other non-rel], capped at 5
     const useAsTitleName = (refSchemeField?.name as string) || 'id'
@@ -1163,6 +1164,8 @@ async function generatePayloadFiles(payload: any, sourceOutput: any, domainFilte
       ? groupIntoRows([...topLevelFields, { label: 'Details', type: 'collapsible', admin: { initCollapsed: true }, fields: groupIntoRows(optionalValueFields) }])
       : groupIntoRows([...topLevelFields, ...optionalValueFields])
 
+    finalFields.push({ name: 'domain', type: 'relationship', relationTo: 'domains', index: true })
+
     const collection: Record<string, unknown> = {
       slug,
       labels: { singular: noun.name, plural: noun.plural || noun.name + 's' },
@@ -1170,7 +1173,7 @@ async function generatePayloadFiles(payload: any, sourceOutput: any, domainFilte
       timestamps: true,
       fields: finalFields,
     }
-    if (Object.keys(access).length) collection.access = access
+    collection.access = access
     if (permissions.includes('login')) collection.auth = true
 
     payloadCollections[slug] = collection
@@ -1977,6 +1980,7 @@ function generateCollectionTypeScript(
   const pascalName = slug.split('-').map(s => s.charAt(0).toUpperCase() + s.slice(1)).join('')
   const lines: string[] = []
   lines.push("import type { CollectionConfig } from 'payload'")
+  lines.push("import { instanceReadAccess, instanceWriteAccess } from '../shared/instanceAccess'")
   lines.push('')
   lines.push(`export const ${pascalName}: CollectionConfig = ${objectToTS(collection, 0)}`)
   lines.push('')
@@ -2018,8 +2022,8 @@ function accessToTS(access: Record<string, string>, indent: number): string {
   const inner = '  '.repeat(indent + 1)
   const entries = Object.entries(access).filter(([, v]) => v !== undefined)
   if (entries.length === 0) return '{}'
-  const props = entries.map(([key]) => {
-    return `${inner}${key}: ({ req: { user } }) => Boolean(user)`
+  const props = entries.map(([key, value]) => {
+    return `${inner}${key}: ${value}`
   })
   return `{\n${props.join(',\n')},\n${pad}}`
 }

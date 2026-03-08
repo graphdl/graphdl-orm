@@ -14,7 +14,8 @@
     "payload": "cross-env NODE_OPTIONS=--no-deprecation payload",
     "start": "cross-env NODE_OPTIONS=--no-deprecation next start",
     "deploy": "yarn build && fly deploy",
-    "test": "vitest run"
+    "test": "vitest run",
+    "materialize": "npx tsx scripts/materialize-collections.ts"
   },
   "dependencies": {
     "@payloadcms/db-mongodb": "3.79.0",
