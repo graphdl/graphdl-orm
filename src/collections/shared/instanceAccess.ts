@@ -1,4 +1,4 @@
-import type { Access } from 'payload'
+import type { Access, Where } from 'payload'
 
 /**
  * Read access for instance-level collections.
@@ -8,8 +8,8 @@ export const instanceReadAccess: Access = ({ req }) => {
   if (!req.user) return false
   return {
     or: [
-      { 'domain.tenant': { equals: req.user.email } },
-      { 'domain.visibility': { equals: 'public' } },
+      { 'domain.tenant': { equals: req.user.email } } as Where,
+      { 'domain.visibility': { equals: 'public' } } as Where,
     ],
   }
 }
@@ -31,8 +31,8 @@ export const domainReadAccess: Access = ({ req }) => {
   if (!req.user) return false
   return {
     or: [
-      { tenant: { equals: req.user.email } },
-      { visibility: { equals: 'public' } },
+      { tenant: { equals: req.user.email } } as Where,
+      { visibility: { equals: 'public' } } as Where,
     ],
   }
 }

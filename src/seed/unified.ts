@@ -136,7 +136,7 @@ export async function seedReadingsFromText(
           graphSchema: graphSchema.id,
           domain: domainId,
         },
-      })
+      } as any)
       result.readingsCreated++
 
       // Apply constraints from the parser to the roles created by the hook
