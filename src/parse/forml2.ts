@@ -104,11 +104,13 @@ export function parseReading(text: string, knownNouns: string[]): ParsedReading 
   }
 
   // ── Tokenize to find nouns in order ───────────────────────────────────
-  const nounRegex = buildNounRegex(knownNouns)
-  let match
-  while ((match = nounRegex.exec(text)) !== null) {
-    if (!result.nouns.includes(match[1])) {
-      result.nouns.push(match[1])
+  if (knownNouns.length > 0) {
+    const nounRegex = buildNounRegex(knownNouns)
+    let match
+    while ((match = nounRegex.exec(text)) !== null) {
+      if (!result.nouns.includes(match[1])) {
+        result.nouns.push(match[1])
+      }
     }
   }
 

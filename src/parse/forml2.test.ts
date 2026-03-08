@@ -67,6 +67,13 @@ describe('parseReading', () => {
     })
   })
 
+  it('handles empty knownNouns without crashing', () => {
+    const result = parseReading('Customer has Name', [])
+    expect(result.nouns).toEqual([])
+    expect(result.predicate).toBe('')
+    expect(result.constraints).toEqual([])
+  })
+
   it('handles instance fact with quoted value', () => {
     const result = parseReading(
       "Customer with EmailDomain 'driv.ly' has UserRole 'ADMIN'",
