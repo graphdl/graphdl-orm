@@ -89,6 +89,27 @@ const Domains: CollectionConfig = {
       on: 'domain',
       admin: { description: 'Generator belongs to Domain.' },
     },
+    {
+      name: 'roles',
+      type: 'join',
+      collection: 'roles',
+      on: 'domain',
+      admin: { description: 'Role belongs to Domain.' },
+    },
+    {
+      name: 'constraints',
+      type: 'join',
+      collection: 'constraints',
+      on: 'domain',
+      admin: { description: 'Constraint belongs to Domain.' },
+    },
+    {
+      name: 'constraintSpans',
+      type: 'join',
+      collection: 'constraint-spans',
+      on: 'domain',
+      admin: { description: 'ConstraintSpan belongs to Domain.' },
+    },
   ],
 }
 

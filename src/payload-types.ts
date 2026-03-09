@@ -67,6 +67,7 @@ export interface Config {
   };
   blocks: {};
   collections: {
+    apps: App;
     domains: Domain;
     generators: Generator;
     'json-examples': JsonExample;
@@ -144,6 +145,7 @@ export interface Config {
     };
   };
   collectionsSelect: {
+    apps: AppsSelect<false> | AppsSelect<true>;
     domains: DomainsSelect<false> | DomainsSelect<true>;
     generators: GeneratorsSelect<false> | GeneratorsSelect<true>;
     'json-examples': JsonExamplesSelect<false> | JsonExamplesSelect<true>;
@@ -206,6 +208,39 @@ export interface UserAuthOperations {
     email: string;
     password: string;
   };
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "apps".
+ */
+export interface App {
+  id: string;
+  /**
+   * App has Name.
+   */
+  name: string;
+  /**
+   * App is identified by Slug.
+   */
+  slug: string;
+  /**
+   * Tenant email for access scoping.
+   */
+  tenant?: string | null;
+  /**
+   * App has Visibility.
+   */
+  visibility?: ('private' | 'public') | null;
+  /**
+   * App has Description.
+   */
+  description?: string | null;
+  /**
+   * App contains Domain.
+   */
+  domains?: (string | Domain)[] | null;
+  updatedAt: string;
+  createdAt: string;
 }
 /**
  * This interface was referenced by `Config`'s JSON-Schema
@@ -1195,6 +1230,10 @@ export interface PayloadLockedDocument {
   id: string;
   document?:
     | ({
+        relationTo: 'apps';
+        value: string | App;
+      } | null)
+    | ({
         relationTo: 'domains';
         value: string | Domain;
       } | null)
@@ -1331,6 +1370,20 @@ export interface PayloadMigration {
   batch?: number | null;
   updatedAt: string;
   createdAt: string;
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "apps_select".
+ */
+export interface AppsSelect<T extends boolean = true> {
+  name?: T;
+  slug?: T;
+  tenant?: T;
+  visibility?: T;
+  description?: T;
+  domains?: T;
+  updatedAt?: T;
+  createdAt?: T;
 }
 /**
  * This interface was referenced by `Config`'s JSON-Schema

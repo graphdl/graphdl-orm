@@ -10,6 +10,8 @@
 import type { Payload } from 'payload'
 import { parseText } from '../parse'
 
+const SEED_CONSTRAINT_KEYWORDS = new Set(['Each', 'It', 'That', 'The'])
+
 export interface SeedOptions {
   text: string
   domainId: string
@@ -42,7 +44,7 @@ function pluralSlug(name: string): string {
   return kebab.replace(new RegExp(lastSegment + '$'), pluralLast)
 }
 
-async function ensureNoun(payload: Payload, name: string, domainId: string): Promise<any> {
+async function ensureNoun(payload: Payload, name: string, domainId: string, objectType: 'entity' | 'value' = 'entity'): Promise<any> {
   const existing = await payload.find({
     collection: 'nouns',
     where: { name: { equals: name }, domain: { equals: domainId } },
@@ -53,7 +55,7 @@ async function ensureNoun(payload: Payload, name: string, domainId: string): Pro
     collection: 'nouns',
     data: {
       name,
-      objectType: 'entity',
+      objectType,
       plural: pluralSlug(name),
       domain: domainId,
     },
@@ -75,13 +77,47 @@ export async function seedReadingsFromText(
   })
   const knownNounNames = existingNouns.docs.map((n: any) => n.name as string).filter(Boolean)
 
+  // Analyze multiplicities to determine entity vs value object types
+  // In "A has B | *:1", B is a value (many A's share the same B).
+  // A noun is a value if it ONLY appears as the object of *:1 facts.
+  const subjectOf = new Map<string, Set<string>>() // noun → set of multiplicities where it's the subject
+  const objectOf = new Map<string, Set<string>>()  // noun → set of multiplicities where it's the object
+  const lines = text.split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('#'))
+  for (const line of lines) {
+    const [readingPart, multPart] = line.split('|').map(s => s.trim())
+    const mult = multPart || '*:1'
+    // Extract capitalized words as potential nouns (same heuristic as parser)
+    const caps = readingPart.match(/\b([A-Z][a-zA-Z]+)\b/g) || []
+    const lineNouns = caps.filter(w => !SEED_CONSTRAINT_KEYWORDS.has(w))
+    if (lineNouns.length >= 2) {
+      const subject = lineNouns[0]
+      const object = lineNouns[lineNouns.length - 1]
+      if (!subjectOf.has(subject)) subjectOf.set(subject, new Set())
+      subjectOf.get(subject)!.add(mult)
+      if (!objectOf.has(object)) objectOf.set(object, new Set())
+      objectOf.get(object)!.add(mult)
+    }
+  }
+
+  // A noun is a value type if:
+  // - It appears as the object of *:1 facts
+  // - It never appears as the subject of any fact
+  const valueNouns = new Set<string>()
+  for (const [noun, mults] of objectOf) {
+    const onlyStarOne = [...mults].every(m => m === '*:1')
+    if (onlyStarOne && !subjectOf.has(noun)) {
+      valueNouns.add(noun)
+    }
+  }
+
   // Pass 1: discover all noun candidates from the text
   const firstPass = parseText(text, knownNounNames)
 
   // Create any new noun candidates detected by the parser
   for (const nounName of firstPass.newNounCandidates) {
     try {
-      await ensureNoun(payload, nounName, domainId)
+      const objectType = valueNouns.has(nounName) ? 'value' : 'entity'
+      await ensureNoun(payload, nounName, domainId, objectType)
       result.nounsCreated++
     } catch (err: any) {
       result.errors.push(`Failed to create noun "${nounName}": ${err.message}`)
@@ -122,7 +158,8 @@ export async function seedReadingsFromText(
       // Ensure all nouns referenced in this reading exist
       for (const nounName of reading.nouns) {
         if (!nounMap.has(nounName)) {
-          const noun = await ensureNoun(payload, nounName, domainId)
+          const objectType = valueNouns.has(nounName) ? 'value' as const : 'entity' as const
+          const noun = await ensureNoun(payload, nounName, domainId, objectType)
           nounMap.set(nounName, noun)
           result.nounsCreated++
         }
@@ -175,7 +212,7 @@ export async function seedReadingsFromText(
           try {
             const c = await payload.create({
               collection: 'constraints',
-              data: { kind: constraint.kind, modality: constraint.modality },
+              data: { kind: constraint.kind, modality: constraint.modality, ...(domainId ? { domain: domainId } : {}) } as any,
             })
 
             const roleIds = constraint.roles
@@ -185,7 +222,7 @@ export async function seedReadingsFromText(
             if (roleIds.length) {
               await payload.create({
                 collection: 'constraint-spans',
-                data: { roles: roleIds, constraint: c.id },
+                data: { roles: roleIds, constraint: c.id, ...(domainId ? { domain: domainId } : {}) },
               } as any)
               result.constraintsCreated++
             }

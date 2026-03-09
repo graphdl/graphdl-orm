@@ -3,6 +3,34 @@ import type { Access, Where } from 'payload'
 const SERVICE_ACCOUNT = 'cicd@repo.do'
 
 /**
+ * Read access for schema-level collections (Nouns, Readings, GraphSchemas, Roles, Constraints, ConstraintSpans).
+ * Public domain content is readable by anyone — including unauthenticated users (like schema.org).
+ * Authenticated users also see their own private domain content.
+ */
+export const schemaReadAccess: Access = ({ req }) => {
+  if (!req.user) {
+    return { 'domain.visibility': { equals: 'public' } } as Where
+  }
+  if (req.user.email === SERVICE_ACCOUNT) return true
+  return {
+    or: [
+      { 'domain.tenant': { equals: req.user.email } },
+      { 'domain.visibility': { equals: 'public' } },
+    ],
+  } as Where
+}
+
+/**
+ * Write access for schema-level collections.
+ * Only the domain's tenant (or service account) can create/update/delete.
+ */
+export const schemaWriteAccess: Access = ({ req }) => {
+  if (!req.user) return false
+  if (req.user.email === SERVICE_ACCOUNT) return true
+  return { 'domain.tenant': { equals: req.user.email } }
+}
+
+/**
  * Read access for instance-level collections.
  * Users can read objects in their own domains + public domains.
  * Service account bypasses — the API proxy handles per-user scoping.

@@ -1,9 +1,24 @@
 import type { GraphSchema, Noun, Role } from '@/payload-types'
 import { CollectionConfig } from 'payload'
+import { parseMultiplicity, applyConstraints } from '../claims'
 import { domainField } from './shared/domainScope'
+import { schemaReadAccess, schemaWriteAccess } from './shared/instanceAccess'
+
+const enumToMult: Record<string, string> = {
+  'many-to-one': '*:1',
+  'one-to-many': '1:*',
+  'many-to-many': '*:*',
+  'one-to-one': '1:1',
+}
 
 const GraphSchemas: CollectionConfig = {
   slug: 'graph-schemas',
+  access: {
+    read: schemaReadAccess,
+    create: schemaWriteAccess,
+    update: schemaWriteAccess,
+    delete: schemaWriteAccess,
+  },
   admin: {
     useAsTitle: 'title',
     group: 'Object-Role Modeling',
@@ -119,6 +134,8 @@ const GraphSchemas: CollectionConfig = {
 
             if (value) {
               const docId = data?.id || originalDoc?.id
+              const domainId = data?.domain || originalDoc?.domain
+              const resolvedDomainId = domainId ? (typeof domainId === 'object' ? domainId.id : domainId) : undefined
               const roles = await payload
                 .find({
                   collection: 'roles',
@@ -133,68 +150,11 @@ const GraphSchemas: CollectionConfig = {
                 !roles[0].constraints?.docs?.length &&
                 !roles[1].constraints?.docs?.length
               ) {
-                const constraint = await payload.create({
-                  collection: 'constraints',
-                  data: {
-                    kind: 'UC',
-                    modality: 'Alethic',
-                  },
-                  req,
-                })
-                if (value === 'many-to-one') {
-                  await payload.create({
-                    collection: 'constraint-spans',
-                    data: {
-                      roles: [roles[0].id],
-                      constraint: constraint.id,
-                    },
-                    req,
-                  })
-                } else if (value === 'one-to-many') {
-                  await payload.create({
-                    collection: 'constraint-spans',
-                    data: {
-                      roles: [roles[1].id],
-                      constraint: constraint.id,
-                    },
-                    req,
-                  })
-                } else if (value === 'many-to-many') {
-                  await payload.create({
-                    collection: 'constraint-spans',
-                    data: {
-                      roles: roles.map((r: Role) => r.id),
-                      constraint: constraint.id,
-                    },
-                    req,
-                  })
-                } else if (value === 'one-to-one') {
-                  const toOneConstraint = await payload.create({
-                    collection: 'constraints',
-                    data: {
-                      kind: 'UC',
-                      modality: 'Alethic',
-                    },
-                    req,
-                  })
-                  await Promise.all([
-                    payload.create({
-                      collection: 'constraint-spans',
-                      data: {
-                        roles: [roles[0].id],
-                        constraint: constraint.id,
-                      },
-                      req,
-                    }),
-                    payload.create({
-                      collection: 'constraint-spans',
-                      data: {
-                        roles: [roles[1].id],
-                        constraint: toOneConstraint.id,
-                      },
-                      req,
-                    }),
-                  ])
+                const mult = enumToMult[value]
+                if (mult) {
+                  const constraintDefs = parseMultiplicity(mult)
+                  const roleIds = roles.map((r: any) => r.id)
+                  await applyConstraints(payload, { constraints: constraintDefs, roleIds, domainId: resolvedDomainId })
                 }
               }
             }

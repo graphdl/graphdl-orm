@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll } from 'vitest'
 import { initPayload } from '../helpers/initPayload'
-import { instanceReadAccess, instanceWriteAccess, domainReadAccess, domainWriteAccess } from '../../src/collections/shared/instanceAccess'
+import { schemaReadAccess, schemaWriteAccess, instanceReadAccess, instanceWriteAccess, domainReadAccess, domainWriteAccess } from '../../src/collections/shared/instanceAccess'
 
 let payload: any
 
@@ -90,6 +90,40 @@ describe('Domain-level user scoping', () => {
     expect(domainRef).toBe(domain.id)
   })
 
+  // --- Schema-level access (public reads, tenant writes) ---
+
+  it('schemaReadAccess returns public-only filter when no user', () => {
+    const result = schemaReadAccess({ req: {} } as any)
+    expect(result).toEqual({ 'domain.visibility': { equals: 'public' } })
+  })
+
+  it('schemaReadAccess returns tenant + public filter for authenticated user', () => {
+    const result = schemaReadAccess({ req: { user: { email: 'test@example.com' } } } as any)
+    expect(result).toHaveProperty('or')
+    expect((result as any).or).toHaveLength(2)
+    expect((result as any).or[0]).toEqual({ 'domain.tenant': { equals: 'test@example.com' } })
+    expect((result as any).or[1]).toEqual({ 'domain.visibility': { equals: 'public' } })
+  })
+
+  it('schemaWriteAccess returns false when no user', () => {
+    const result = schemaWriteAccess({ req: {} } as any)
+    expect(result).toBe(false)
+  })
+
+  it('schemaWriteAccess returns tenant filter for authenticated user', () => {
+    const result = schemaWriteAccess({ req: { user: { email: 'test@example.com' } } } as any)
+    expect(result).toEqual({ 'domain.tenant': { equals: 'test@example.com' } })
+  })
+
+  it('schemaReadAccess produces different filters for different users', () => {
+    const alice = schemaReadAccess({ req: { user: { email: 'alice@example.com' } } } as any)
+    const bob = schemaReadAccess({ req: { user: { email: 'bob@example.com' } } } as any)
+    expect((alice as any).or[0]['domain.tenant'].equals).toBe('alice@example.com')
+    expect((bob as any).or[0]['domain.tenant'].equals).toBe('bob@example.com')
+  })
+
+  // --- Instance-level access (authenticated only) ---
+
   it('instanceReadAccess returns false when no user', () => {
     const result = instanceReadAccess({ req: {} } as any)
     expect(result).toBe(false)
@@ -143,9 +177,34 @@ describe('Domain-level user scoping', () => {
 
   it('service account bypasses all access control', () => {
     const serviceReq = { req: { user: { email: 'cicd@repo.do' } } } as any
+    expect(schemaReadAccess(serviceReq)).toBe(true)
+    expect(schemaWriteAccess(serviceReq)).toBe(true)
     expect(instanceReadAccess(serviceReq)).toBe(true)
     expect(instanceWriteAccess(serviceReq)).toBe(true)
     expect(domainReadAccess(serviceReq)).toBe(true)
     expect(domainWriteAccess(serviceReq)).toBe(true)
+  })
+
+  // --- Key behavioral differences between tiers ---
+
+  it('unauthenticated: can read schemas (public), cannot read instances or domains', () => {
+    const unauthReq = { req: {} } as any
+    // Schema: returns a Where filter (truthy) — not false
+    const schemaResult = schemaReadAccess(unauthReq)
+    expect(schemaResult).not.toBe(false)
+    expect(schemaResult).toEqual({ 'domain.visibility': { equals: 'public' } })
+
+    // Instance: denied
+    expect(instanceReadAccess(unauthReq)).toBe(false)
+
+    // Domain: denied
+    expect(domainReadAccess(unauthReq)).toBe(false)
+  })
+
+  it('unauthenticated: cannot write to any tier', () => {
+    const unauthReq = { req: {} } as any
+    expect(schemaWriteAccess(unauthReq)).toBe(false)
+    expect(instanceWriteAccess(unauthReq)).toBe(false)
+    expect(domainWriteAccess(unauthReq)).toBe(false)
   })
 })
