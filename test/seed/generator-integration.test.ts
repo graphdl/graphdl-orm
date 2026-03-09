@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll } from 'vitest'
 import { initPayload } from '../helpers/initPayload'
 import { parseDomainMarkdown } from '../../src/seed/parser'
-import { seedDomain } from '../../src/seed/handler'
+import { domainParseToClaims, ingestClaims } from '../../src/claims'
 
 let payload: any
 
@@ -68,7 +68,13 @@ describe('Generator with real seeded domains', () => {
 
     for (const [domain, md] of Object.entries(TEST_DOMAINS)) {
       const parsed = parseDomainMarkdown(md)
-      const result = await seedDomain(payload, parsed, domain)
+      const claims = domainParseToClaims(parsed)
+      // Create domain
+      const domainDoc = await payload.create({
+        collection: 'domains',
+        data: { domainSlug: domain, name: domain },
+      })
+      const result = await ingestClaims(payload, { claims, domainId: domainDoc.id })
       console.log(`  ${domain}: ${result.nouns}n ${result.readings}r ${result.errors.length}err`)
     }
   }, 300_000)
