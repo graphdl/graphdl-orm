@@ -1,0 +1,23 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "graphdl-orm",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-01-01",
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "GRAPHDL_DB",
+        "class_name": "GraphDLDB"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["GraphDLDB"]
+    }
+  ],
+  "vars": {
+    "ENVIRONMENT": "production"
+  }
+}
