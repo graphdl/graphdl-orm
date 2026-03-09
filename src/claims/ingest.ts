@@ -296,9 +296,12 @@ export async function ingestClaims(
       schemaMap.set(reading.text, schema)
 
       // Create reading (afterChange hook auto-creates roles)
+      // disableTransaction prevents MongoDB session conflicts when the hook
+      // creates roles inside its own transaction context
       await payload.create({
         collection: 'readings',
         data: { text: reading.text, graphSchema: schema.id, domain: domainId },
+        disableTransaction: true,
       } as any)
       result.readings++
 
