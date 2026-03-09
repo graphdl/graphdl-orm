@@ -46,6 +46,15 @@ const Domains: CollectionConfig = {
       },
     },
     {
+      name: 'organization',
+      type: 'relationship',
+      relationTo: 'organizations',
+      index: true,
+      admin: {
+        description: 'Domain belongs to Organization (*:1)',
+      },
+    },
+    {
       name: 'visibility',
       type: 'select',
       options: ['private', 'public'],

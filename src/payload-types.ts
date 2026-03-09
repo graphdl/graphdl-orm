@@ -92,6 +92,7 @@ export interface Config {
     'state-machines': StateMachine;
     'guard-runs': GuardRun;
     organizations: Organization;
+    'org-memberships': OrgMembership;
     users: User;
     'payload-kv': PayloadKv;
     'payload-locked-documents': PayloadLockedDocument;
@@ -174,6 +175,7 @@ export interface Config {
     'state-machines': StateMachinesSelect<false> | StateMachinesSelect<true>;
     'guard-runs': GuardRunsSelect<false> | GuardRunsSelect<true>;
     organizations: OrganizationsSelect<false> | OrganizationsSelect<true>;
+    'org-memberships': OrgMembershipsSelect<false> | OrgMembershipsSelect<true>;
     users: UsersSelect<false> | UsersSelect<true>;
     'payload-kv': PayloadKvSelect<false> | PayloadKvSelect<true>;
     'payload-locked-documents': PayloadLockedDocumentsSelect<false> | PayloadLockedDocumentsSelect<true>;
@@ -233,6 +235,10 @@ export interface App {
    */
   tenant?: string | null;
   /**
+   * App belongs to Organization (*:1)
+   */
+  organization?: (string | null) | Organization;
+  /**
    * App has Visibility.
    */
   visibility?: ('private' | 'public') | null;
@@ -244,6 +250,17 @@ export interface App {
    * App contains Domain.
    */
   domains?: (string | Domain)[] | null;
+  updatedAt: string;
+  createdAt: string;
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "organizations".
+ */
+export interface Organization {
+  id: string;
+  slug: string;
+  name: string;
   updatedAt: string;
   createdAt: string;
 }
@@ -269,6 +286,10 @@ export interface Domain {
    * Tenant email for API-layer access scoping.
    */
   tenant?: string | null;
+  /**
+   * Domain belongs to Organization (*:1)
+   */
+  organization?: (string | null) | Organization;
   /**
    * Domain has DomainVisibility.
    */
@@ -1220,12 +1241,13 @@ export interface Event {
 }
 /**
  * This interface was referenced by `Config`'s JSON-Schema
- * via the `definition` "organizations".
+ * via the `definition` "org-memberships".
  */
-export interface Organization {
+export interface OrgMembership {
   id: string;
-  slug: string;
-  name: string;
+  user: string;
+  organization: string | Organization;
+  role: 'owner' | 'member';
   updatedAt: string;
   createdAt: string;
 }
@@ -1382,6 +1404,10 @@ export interface PayloadLockedDocument {
         value: string | Organization;
       } | null)
     | ({
+        relationTo: 'org-memberships';
+        value: string | OrgMembership;
+      } | null)
+    | ({
         relationTo: 'users';
         value: string | User;
       } | null);
@@ -1435,6 +1461,7 @@ export interface AppsSelect<T extends boolean = true> {
   name?: T;
   slug?: T;
   tenant?: T;
+  organization?: T;
   visibility?: T;
   description?: T;
   domains?: T;
@@ -1450,6 +1477,7 @@ export interface DomainsSelect<T extends boolean = true> {
   name?: T;
   description?: T;
   tenant?: T;
+  organization?: T;
   visibility?: T;
   nouns?: T;
   readings?: T;
@@ -1794,6 +1822,17 @@ export interface GuardRunsSelect<T extends boolean = true> {
 export interface OrganizationsSelect<T extends boolean = true> {
   slug?: T;
   name?: T;
+  updatedAt?: T;
+  createdAt?: T;
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "org-memberships_select".
+ */
+export interface OrgMembershipsSelect<T extends boolean = true> {
+  user?: T;
+  organization?: T;
+  role?: T;
   updatedAt?: T;
   createdAt?: T;
 }

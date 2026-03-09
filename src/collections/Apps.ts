@@ -39,6 +39,13 @@ const Apps: CollectionConfig = {
       admin: { description: 'Tenant email for access scoping.' },
     },
     {
+      name: 'organization',
+      type: 'relationship',
+      relationTo: 'organizations',
+      index: true,
+      admin: { description: 'App belongs to Organization (*:1)' },
+    },
+    {
       name: 'visibility',
       type: 'select',
       options: ['private', 'public'],
