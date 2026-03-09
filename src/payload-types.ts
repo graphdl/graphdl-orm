@@ -91,6 +91,7 @@ export interface Config {
     events: Event;
     'state-machines': StateMachine;
     'guard-runs': GuardRun;
+    organizations: Organization;
     users: User;
     'payload-kv': PayloadKv;
     'payload-locked-documents': PayloadLockedDocument;
@@ -172,6 +173,7 @@ export interface Config {
     events: EventsSelect<false> | EventsSelect<true>;
     'state-machines': StateMachinesSelect<false> | StateMachinesSelect<true>;
     'guard-runs': GuardRunsSelect<false> | GuardRunsSelect<true>;
+    organizations: OrganizationsSelect<false> | OrganizationsSelect<true>;
     users: UsersSelect<false> | UsersSelect<true>;
     'payload-kv': PayloadKvSelect<false> | PayloadKvSelect<true>;
     'payload-locked-documents': PayloadLockedDocumentsSelect<false> | PayloadLockedDocumentsSelect<true>;
@@ -1218,6 +1220,17 @@ export interface Event {
 }
 /**
  * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "organizations".
+ */
+export interface Organization {
+  id: string;
+  slug: string;
+  name: string;
+  updatedAt: string;
+  createdAt: string;
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
  * via the `definition` "users".
  */
 export interface User {
@@ -1363,6 +1376,10 @@ export interface PayloadLockedDocument {
     | ({
         relationTo: 'guard-runs';
         value: string | GuardRun;
+      } | null)
+    | ({
+        relationTo: 'organizations';
+        value: string | Organization;
       } | null)
     | ({
         relationTo: 'users';
@@ -1767,6 +1784,16 @@ export interface GuardRunsSelect<T extends boolean = true> {
   type?: T;
   graphs?: T;
   domain?: T;
+  updatedAt?: T;
+  createdAt?: T;
+}
+/**
+ * This interface was referenced by `Config`'s JSON-Schema
+ * via the `definition` "organizations_select".
+ */
+export interface OrganizationsSelect<T extends boolean = true> {
+  slug?: T;
+  name?: T;
   updatedAt?: T;
   createdAt?: T;
 }
