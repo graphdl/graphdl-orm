@@ -31,19 +31,20 @@ const Readings: CollectionConfig = {
           typeof doc.domain === 'string' ? doc.domain : doc.domain?.id || null
 
         // Check if this graph schema already has roles
+        // Note: omit `req` to avoid MongoDB transaction conflicts when multiple
+        // readings are created in sequence (each afterChange hook gets its own session)
         const existingRoles = await payload.find({
           collection: 'roles',
           where: { graphSchema: { equals: graphSchemaId } },
           limit: 1,
-          req,
         })
         if (existingRoles.docs.length > 0) return
 
         // Fetch all nouns and graph schemas to tokenize reading text
         const [nouns, graphSchemas] = await Promise.all([
-          payload.find({ collection: 'nouns', pagination: false, req }).then((n) => n.docs),
+          payload.find({ collection: 'nouns', pagination: false }).then((n) => n.docs),
           payload
-            .find({ collection: 'graph-schemas', pagination: false, depth: 3, req })
+            .find({ collection: 'graph-schemas', pagination: false, depth: 3 })
             .then((g) => g.docs),
         ])
 
@@ -66,7 +67,6 @@ const Readings: CollectionConfig = {
         for (const ref of nounRefs) {
           const role = await payload.create({
             collection: 'roles',
-            req,
             data: {
               title: `${ref.name} Role`,
               noun: {
@@ -86,7 +86,6 @@ const Readings: CollectionConfig = {
           id: doc.id,
           data: { roles: roles.map((r) => r.id) },
           context,
-          req,
         })
       },
     ],
