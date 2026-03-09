@@ -21,6 +21,7 @@ import GuardRuns from './collections/GuardRuns'
 import Guards from './collections/Guards'
 import JsonExamples from './collections/JsonExamples'
 import Nouns from './collections/Nouns'
+import { OrgMemberships } from './collections/OrgMemberships'
 import { Organizations } from './collections/Organizations'
 import Readings from './collections/Readings'
 import ResourceRoles from './collections/ResourceRoles'
@@ -77,6 +78,7 @@ export default buildConfig({
     StateMachines,
     GuardRuns,
     Organizations,
+    OrgMemberships,
     Users,
     ...generatedCollections,
   ],
