@@ -128,11 +128,13 @@ export async function applyConstraints(
     const constraint = await payload.create({
       collection: 'constraints',
       data: { kind: def.kind, modality: def.modality, ...domainData },
-    })
+      disableTransaction: true,
+    } as any)
 
     await payload.create({
       collection: 'constraint-spans',
       data: { constraint: constraint.id, roles: resolvedIds, ...domainData },
+      disableTransaction: true,
     } as any)
   }
 }

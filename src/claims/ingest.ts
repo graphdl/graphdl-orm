@@ -66,6 +66,16 @@ export interface IngestClaimsResult {
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
+/**
+ * Wrapper for payload.create that disables transactions.
+ * MongoDB replica sets have session/transaction conflicts when many creates
+ * happen in rapid succession (especially with afterChange hooks that do
+ * their own creates). disableTransaction avoids these collisions.
+ */
+function createNoTx(payload: Payload, args: Parameters<Payload['create']>[0]) {
+  return payload.create({ ...args, disableTransaction: true } as any)
+}
+
 /** Ensure a noun exists for this domain; return the doc. Updates objectType if it differs. */
 async function ensureNoun(
   payload: Payload,
@@ -86,7 +96,7 @@ async function ensureNoun(
     }
     return doc
   }
-  return payload.create({ collection: 'nouns', data: { name, domain: domainId, ...data } })
+  return createNoTx(payload, { collection: 'nouns', data: { name, domain: domainId, ...data } })
 }
 
 // ── ingestReading ──────────────────────────────────────────────────────────────
@@ -126,7 +136,7 @@ export async function ingestReading(
       ? tokenized.nounRefs.map((n) => n.name).join('')
       : text.split(' ').map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join('')
     try {
-      const schema = await payload.create({
+      const schema = await createNoTx(payload, {
         collection: 'graph-schemas',
         data: {
           name: schemaName,
@@ -162,14 +172,14 @@ export async function ingestReading(
   // 5. Create the reading (the afterChange hook auto-creates roles)
   let readingId = ''
   try {
-    const reading = await payload.create({
+    const reading = await createNoTx(payload, {
       collection: 'readings',
       data: {
         text,
         graphSchema: graphSchemaId,
         ...(domainId ? { domain: domainId } : {}),
       },
-    } as any)
+    })
     readingId = reading.id
   } catch (err: any) {
     errors.push(`reading: ${err.message}`)
@@ -289,20 +299,17 @@ export async function ingestClaims(
 
       // Create graph schema
       const schemaName = reading.nouns.join('')
-      const schema = await payload.create({
+      const schema = await createNoTx(payload, {
         collection: 'graph-schemas',
         data: { name: schemaName, title: schemaName, domain: domainId },
       })
       schemaMap.set(reading.text, schema)
 
       // Create reading (afterChange hook auto-creates roles)
-      // disableTransaction prevents MongoDB session conflicts when the hook
-      // creates roles inside its own transaction context
-      await payload.create({
+      await createNoTx(payload, {
         collection: 'readings',
         data: { text: reading.text, graphSchema: schema.id, domain: domainId },
-        disableTransaction: true,
-      } as any)
+      })
       result.readings++
 
       // Apply multiplicity constraints from the reading definition
@@ -342,7 +349,7 @@ export async function ingestClaims(
         sort: 'createdAt',
       })
 
-      const c = await payload.create({
+      const c = await createNoTx(payload, {
         collection: 'constraints',
         data: { kind: constraint.kind, modality: constraint.modality, domain: domainId } as any,
       })
@@ -352,7 +359,7 @@ export async function ingestClaims(
         .filter(Boolean)
 
       if (roleIds.length) {
-        await payload.create({
+        await createNoTx(payload, {
           collection: 'constraint-spans',
           data: { roles: roleIds, constraint: c.id, domain: domainId },
         } as any)
@@ -388,7 +395,7 @@ export async function ingestClaims(
         })
         const definition = existingDef.docs.length
           ? existingDef.docs[0]
-          : await payload.create({
+          : await createNoTx(payload, {
               collection: 'state-machine-definitions',
               data: { noun: { relationTo: 'nouns', value: noun.id }, domain: domainId },
             })
@@ -412,7 +419,7 @@ export async function ingestClaims(
           })
           const status = existing.docs.length
             ? existing.docs[0]
-            : await payload.create({
+            : await createNoTx(payload, {
                 collection: 'statuses',
                 data: { name, stateMachineDefinition: definition.id },
               })
@@ -429,7 +436,7 @@ export async function ingestClaims(
           })
           const et = existing.docs.length
             ? existing.docs[0]
-            : await payload.create({ collection: 'event-types', data: { name } })
+            : await createNoTx(payload, { collection: 'event-types', data: { name } })
           eventMap.set(name, et.id)
         }
 
@@ -445,7 +452,7 @@ export async function ingestClaims(
             limit: 1,
           })
           if (!existingT.docs.length) {
-            await payload.create({
+            await createNoTx(payload, {
               collection: 'transitions',
               data: { from: fromId, to: toId, eventType: eventId },
             })
@@ -518,7 +525,7 @@ export async function ingestClaims(
         }
 
         // Create the graph (instance of the fact type)
-        const graph = await payload.create({
+        const graph = await createNoTx(payload, {
           collection: 'graphs',
           data: { type: graphSchemaId, domain: domainId },
         })
@@ -528,7 +535,7 @@ export async function ingestClaims(
         for (let i = 0; i < resources.length && i < roles.length; i++) {
           const roleId = typeof roles[i] === 'string' ? roles[i] : roles[i]?.id
           if (!roleId) continue
-          await payload.create({
+          await createNoTx(payload, {
             collection: 'resource-roles',
             data: {
               graph: graph.id,
@@ -571,7 +578,7 @@ async function ensureResource(
   })
   if (existing.docs.length) return existing.docs[0]
 
-  return payload.create({
+  return createNoTx(payload, {
     collection: 'resources',
     data: { type: noun.id, value, domain: domainId },
   })
