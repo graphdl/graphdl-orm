@@ -104,6 +104,9 @@ export interface Config {
       graphSchemas: 'graph-schemas';
       stateMachineDefinitions: 'state-machine-definitions';
       generators: 'generators';
+      roles: 'roles';
+      constraints: 'constraints';
+      constraintSpans: 'constraint-spans';
     };
     'graph-schemas': {
       readings: 'readings';
@@ -305,6 +308,30 @@ export interface Domain {
    */
   generators?: {
     docs?: (string | Generator)[];
+    hasNextPage?: boolean;
+    totalDocs?: number;
+  };
+  /**
+   * Role belongs to Domain.
+   */
+  roles?: {
+    docs?: (string | Role)[];
+    hasNextPage?: boolean;
+    totalDocs?: number;
+  };
+  /**
+   * Constraint belongs to Domain.
+   */
+  constraints?: {
+    docs?: (string | Constraint)[];
+    hasNextPage?: boolean;
+    totalDocs?: number;
+  };
+  /**
+   * ConstraintSpan belongs to Domain.
+   */
+  constraintSpans?: {
+    docs?: (string | ConstraintSpan)[];
     hasNextPage?: boolean;
     totalDocs?: number;
   };
@@ -640,6 +667,10 @@ export interface Function {
  */
 export interface Role {
   id: string;
+  /**
+   * Domain this resource belongs to.
+   */
+  domain?: (string | null) | Domain;
   title: string;
   /**
    * Noun plays Role.
@@ -675,6 +706,10 @@ export interface Role {
  */
 export interface ConstraintSpan {
   id: string;
+  /**
+   * Domain this resource belongs to.
+   */
+  domain?: (string | null) | Domain;
   title?: string | null;
   /**
    * Constraint spans Role.
@@ -697,6 +732,10 @@ export interface ConstraintSpan {
  */
 export interface Constraint {
   id: string;
+  /**
+   * Domain this resource belongs to.
+   */
+  domain?: (string | null) | Domain;
   title?: string | null;
   /**
    * Constraint is Kind of constraint.
@@ -1400,6 +1439,9 @@ export interface DomainsSelect<T extends boolean = true> {
   graphSchemas?: T;
   stateMachineDefinitions?: T;
   generators?: T;
+  roles?: T;
+  constraints?: T;
+  constraintSpans?: T;
   updatedAt?: T;
   createdAt?: T;
 }
@@ -1484,6 +1526,7 @@ export interface ReadingsSelect<T extends boolean = true> {
  * via the `definition` "roles_select".
  */
 export interface RolesSelect<T extends boolean = true> {
+  domain?: T;
   title?: T;
   noun?: T;
   graphSchema?: T;
@@ -1497,6 +1540,7 @@ export interface RolesSelect<T extends boolean = true> {
  * via the `definition` "constraints_select".
  */
 export interface ConstraintsSelect<T extends boolean = true> {
+  domain?: T;
   title?: T;
   kind?: T;
   modality?: T;
@@ -1510,6 +1554,7 @@ export interface ConstraintsSelect<T extends boolean = true> {
  * via the `definition` "constraint-spans_select".
  */
 export interface ConstraintSpansSelect<T extends boolean = true> {
+  domain?: T;
   title?: T;
   constraint?: T;
   roles?: T;
