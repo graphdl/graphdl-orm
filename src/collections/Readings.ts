@@ -76,7 +76,8 @@ const Readings: CollectionConfig = {
               graphSchema: graphSchemaId,
               ...(domainId ? { domain: domainId } : {}),
             },
-          })
+            disableTransaction: true,
+          } as any)
           roles.push(role)
         }
 
@@ -86,7 +87,8 @@ const Readings: CollectionConfig = {
           id: doc.id,
           data: { roles: roles.map((r) => r.id) },
           context,
-        })
+          disableTransaction: true,
+        } as any)
       },
     ],
   },
