@@ -232,7 +232,7 @@ export async function ingestClaims(
       if (noun.plural) data.plural = noun.plural
       if (noun.valueType) data.valueType = noun.valueType
       if (noun.format) data.format = noun.format
-      if (noun.enum) data.enum = noun.enum
+      if (noun.enum) data.enum = Array.isArray(noun.enum) ? noun.enum.join(', ') : noun.enum
       if (noun.minimum !== undefined) data.minimum = noun.minimum
       if (noun.maximum !== undefined) data.maximum = noun.maximum
       if (noun.pattern) data.pattern = noun.pattern
