@@ -1,12 +1,21 @@
 import { CollectionConfig } from 'payload'
+import { domainField } from './shared/domainScope'
+import { schemaReadAccess, schemaWriteAccess } from './shared/instanceAccess'
 
 const Roles: CollectionConfig = {
   slug: 'roles',
+  access: {
+    read: schemaReadAccess,
+    create: schemaWriteAccess,
+    update: schemaWriteAccess,
+    delete: schemaWriteAccess,
+  },
   admin: {
     useAsTitle: 'title',
     group: 'Object-Role Modeling',
   },
   fields: [
+    domainField,
     {
       name: 'title',
       type: 'text',

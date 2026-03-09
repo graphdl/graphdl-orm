@@ -7,6 +7,7 @@ import { buildConfig } from 'payload'
 import sharp from 'sharp'
 import { fileURLToPath } from 'url'
 
+import Apps from './collections/Apps'
 import ConstraintSpans from './collections/ConstraintSpans'
 import Domains from './collections/Domains'
 import Constraints from './collections/Constraints'
@@ -50,6 +51,7 @@ export default buildConfig({
     },
   },
   collections: [
+    Apps,
     Domains,
     Generator,
     JsonExamples,

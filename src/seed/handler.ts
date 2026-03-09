@@ -253,6 +253,7 @@ async function applyConstraints(
   schemaId: string,
   reading: ReadingDef,
   result: SeedResult,
+  domainData: Record<string, any> = {},
 ): Promise<void> {
   const spec = parseConstraintSpec(reading)
   if (spec.skip) return
@@ -289,11 +290,11 @@ async function applyConstraints(
         if (ucRoleIds.length) {
           const c = await payload.create({
             collection: 'constraints',
-            data: { kind: 'UC', modality: constraint.modality },
+            data: { kind: 'UC', modality: constraint.modality, ...domainData },
           })
           await payload.create({
             collection: 'constraint-spans',
-            data: { constraint: c.id, roles: ucRoleIds },
+            data: { constraint: c.id, roles: ucRoleIds, ...domainData },
           } as any)
         }
       }
@@ -302,8 +303,8 @@ async function applyConstraints(
 
     // Unary UC — implicit uniqueness on the single role
     if (constraint.kind === 'UC' && constraint.uc === 'unary' && roles.docs.length >= 1) {
-      const c = await payload.create({ collection: 'constraints', data: { kind: 'UC', modality: constraint.modality } })
-      await payload.create({ collection: 'constraint-spans', data: { constraint: c.id, roles: [roles.docs[0].id] } } as any)
+      const c = await payload.create({ collection: 'constraints', data: { kind: 'UC', modality: constraint.modality, ...domainData } })
+      await payload.create({ collection: 'constraint-spans', data: { constraint: c.id, roles: [roles.docs[0].id], ...domainData } } as any)
       continue
     }
 
@@ -313,20 +314,20 @@ async function applyConstraints(
       const role1 = roles.docs[1]
 
       if (constraint.uc === '*:1') {
-        const c = await payload.create({ collection: 'constraints', data: { kind: 'UC', modality: constraint.modality } })
-        await payload.create({ collection: 'constraint-spans', data: { constraint: c.id, roles: [role0.id] } } as any)
+        const c = await payload.create({ collection: 'constraints', data: { kind: 'UC', modality: constraint.modality, ...domainData } })
+        await payload.create({ collection: 'constraint-spans', data: { constraint: c.id, roles: [role0.id], ...domainData } } as any)
       } else if (constraint.uc === '1:*') {
-        const c = await payload.create({ collection: 'constraints', data: { kind: 'UC', modality: constraint.modality } })
-        await payload.create({ collection: 'constraint-spans', data: { constraint: c.id, roles: [role1.id] } } as any)
+        const c = await payload.create({ collection: 'constraints', data: { kind: 'UC', modality: constraint.modality, ...domainData } })
+        await payload.create({ collection: 'constraint-spans', data: { constraint: c.id, roles: [role1.id], ...domainData } } as any)
       } else if (constraint.uc === '*:*') {
-        const c = await payload.create({ collection: 'constraints', data: { kind: 'UC', modality: constraint.modality } })
-        await payload.create({ collection: 'constraint-spans', data: { constraint: c.id, roles: [role0.id, role1.id] } } as any)
+        const c = await payload.create({ collection: 'constraints', data: { kind: 'UC', modality: constraint.modality, ...domainData } })
+        await payload.create({ collection: 'constraint-spans', data: { constraint: c.id, roles: [role0.id, role1.id], ...domainData } } as any)
       } else if (constraint.uc === '1:1') {
-        const c0 = await payload.create({ collection: 'constraints', data: { kind: 'UC', modality: constraint.modality } })
-        const c1 = await payload.create({ collection: 'constraints', data: { kind: 'UC', modality: constraint.modality } })
+        const c0 = await payload.create({ collection: 'constraints', data: { kind: 'UC', modality: constraint.modality, ...domainData } })
+        const c1 = await payload.create({ collection: 'constraints', data: { kind: 'UC', modality: constraint.modality, ...domainData } })
         await Promise.all([
-          payload.create({ collection: 'constraint-spans', data: { constraint: c0.id, roles: [role0.id] } } as any),
-          payload.create({ collection: 'constraint-spans', data: { constraint: c1.id, roles: [role1.id] } } as any),
+          payload.create({ collection: 'constraint-spans', data: { constraint: c0.id, roles: [role0.id], ...domainData } } as any),
+          payload.create({ collection: 'constraint-spans', data: { constraint: c1.id, roles: [role1.id], ...domainData } } as any),
         ])
       }
       continue
@@ -337,11 +338,11 @@ async function applyConstraints(
       const objectRole = roles.docs[roles.docs.length - 1]
       const c = await payload.create({
         collection: 'constraints',
-        data: { kind: 'MC', modality: constraint.modality },
+        data: { kind: 'MC', modality: constraint.modality, ...domainData },
       })
       await payload.create({
         collection: 'constraint-spans',
-        data: { constraint: c.id, roles: [objectRole.id] },
+        data: { constraint: c.id, roles: [objectRole.id], ...domainData },
       } as any)
       continue
     }
@@ -366,6 +367,7 @@ async function applySubsetConstraint(
   text: string,
   modality: 'Alethic' | 'Deontic',
   result: SeedResult,
+  domainData: Record<string, any> = {},
 ): Promise<void> {
   // Parse "If ... then ... where ..." clauses
   const clauseMatch = text.match(
@@ -482,19 +484,19 @@ async function applySubsetConstraint(
   // Create the SS constraint with two spans
   const constraint = await payload.create({
     collection: 'constraints',
-    data: { kind: 'SS', modality },
+    data: { kind: 'SS', modality, ...domainData },
   })
 
   // Subset span (the "if" roles)
   await payload.create({
     collection: 'constraint-spans',
-    data: { constraint: constraint.id, roles: subsetRoleIds },
+    data: { constraint: constraint.id, roles: subsetRoleIds, ...domainData },
   } as any)
 
   // Superset span (the "then"/"where" roles)
   await payload.create({
     collection: 'constraint-spans',
-    data: { constraint: constraint.id, roles: supersetRoleIds },
+    data: { constraint: constraint.id, roles: supersetRoleIds, ...domainData },
   } as any)
 }
 
@@ -904,7 +906,7 @@ export async function seedReadings(
     const schema = schemaMap.get(r.text)
     if (!schema) return
     try {
-      await applyConstraints(payload, schema.id, r, result)
+      await applyConstraints(payload, schema.id, r, result, domainData)
       result.readings++
     } catch (err: any) {
       result.errors.push(`constraint "${r.text}": ${err.message}`)
@@ -915,7 +917,7 @@ export async function seedReadings(
   for (const r of subsetReadings) {
     try {
       const ssModality = /^D/i.test(r.multiplicity) ? 'Deontic' as const : 'Alethic' as const
-      await applySubsetConstraint(payload, r.text, ssModality, result)
+      await applySubsetConstraint(payload, r.text, ssModality, result, domainData)
       result.readings++
     } catch (err: any) {
       result.errors.push(`subset constraint "${r.text}": ${err.message}`)

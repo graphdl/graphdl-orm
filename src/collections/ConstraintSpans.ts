@@ -1,13 +1,22 @@
 import { CollectionConfig } from 'payload'
 import type { Role } from '../payload-types'
+import { domainField } from './shared/domainScope'
+import { schemaReadAccess, schemaWriteAccess } from './shared/instanceAccess'
 
 const ConstraintSpans: CollectionConfig = {
   slug: 'constraint-spans',
+  access: {
+    read: schemaReadAccess,
+    create: schemaWriteAccess,
+    update: schemaWriteAccess,
+    delete: schemaWriteAccess,
+  },
   admin: {
     useAsTitle: 'title',
     group: 'Object-Role Modeling',
   },
   fields: [
+    domainField,
     {
       name: 'title',
       type: 'text',

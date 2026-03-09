@@ -1,9 +1,16 @@
-import type { GraphSchema, Noun } from '../payload-types'
-import { CollectionConfig } from 'payload'
+import type { CollectionConfig } from 'payload'
+import { tokenizeReading } from '../claims'
 import { domainField } from './shared/domainScope'
+import { schemaReadAccess, schemaWriteAccess } from './shared/instanceAccess'
 
 const Readings: CollectionConfig = {
   slug: 'readings',
+  access: {
+    read: schemaReadAccess,
+    create: schemaWriteAccess,
+    update: schemaWriteAccess,
+    delete: schemaWriteAccess,
+  },
   admin: {
     useAsTitle: 'text',
     group: 'Object-Role Modeling',
@@ -20,6 +27,8 @@ const Readings: CollectionConfig = {
 
         const graphSchemaId =
           typeof doc.graphSchema === 'string' ? doc.graphSchema : doc.graphSchema.id
+        const domainId =
+          typeof doc.domain === 'string' ? doc.domain : doc.domain?.id || null
 
         // Check if this graph schema already has roles
         const existingRoles = await payload.find({
@@ -38,41 +47,34 @@ const Readings: CollectionConfig = {
             .then((g) => g.docs),
         ])
 
-        const graphNouns = graphSchemas.filter((n) => n.title === n.name)
-        const entities = [...graphNouns, ...nouns]
-        const nounRegex = new RegExp(
-          '\\b(' +
-            entities
-              .map((e) => e.name)
-              .sort((a, b) => (b?.length || 0) - (a?.length || 0))
-              .join('|') +
-            ')\\b',
+        // Build combined entity list: regular nouns + objectified graph schemas
+        const graphSchemaIds = new Set(
+          graphSchemas.filter((g) => g.title === g.name).map((g) => g.id),
         )
-        const nounEntities: (Noun | GraphSchema)[] = []
+        const allEntities = [
+          ...graphSchemas
+            .filter((g) => g.title === g.name)
+            .map((g) => ({ name: g.name!, id: g.id, collection: 'graph-schemas' as const })),
+          ...nouns.map((n) => ({ name: n.name!, id: n.id, collection: 'nouns' as const })),
+        ]
 
-        // Tokenize reading text by noun names
-        ;(doc.text as string).split(nounRegex).forEach((token) => {
-          const noun = entities.find((noun) => noun.name === token)
-          if (noun) nounEntities.push(noun)
-        })
-
-        if (nounEntities.length === 0) return
+        const { nounRefs } = tokenizeReading(doc.text as string, allEntities)
+        if (nounRefs.length === 0) return
 
         // Create Roles from found nouns — sequentially to preserve reading order
         const roles = []
-        for (const n of nounEntities) {
+        for (const ref of nounRefs) {
           const role = await payload.create({
             collection: 'roles',
             req,
             data: {
-              title: `${n?.name} Role`,
+              title: `${ref.name} Role`,
               noun: {
-                relationTo: graphSchemas.find((g) => g.id === n?.id)
-                  ? 'graph-schemas'
-                  : 'nouns',
-                value: n?.id,
+                relationTo: graphSchemaIds.has(ref.id) ? 'graph-schemas' : 'nouns',
+                value: ref.id,
               },
               graphSchema: graphSchemaId,
+              ...(domainId ? { domain: domainId } : {}),
             },
           })
           roles.push(role)
