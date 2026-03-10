@@ -35,6 +35,9 @@ export const COLLECTION_TABLE_MAP: Record<string, string> = {
   'agents': 'agents',
   'completions': 'completions',
 
+  // Generator output
+  'generators': 'generators',
+
   // Runtime instances
   'graphs': 'graphs',
   'resources': 'resources',
@@ -85,7 +88,8 @@ export const FIELD_MAP: Record<string, Record<string, string>> = {
   resources: { noun: 'noun_id', domain: 'domain_id' },
   resource_roles: { graph: 'graph_id', resource: 'resource_id', role: 'role_id', domain: 'domain_id' },
   state_machines: { stateMachineDefinition: 'state_machine_definition_id', stateMachineType: 'state_machine_definition_id', currentStatus: 'current_status_id', stateMachineStatus: 'current_status_id', resource: 'resource_id', domain: 'domain_id' },
-  events: { eventType: 'event_type_id', stateMachine: 'state_machine_id', graph: 'graph_id', occurredAt: 'occurred_at' },
+  events: { eventType: 'event_type_id', stateMachine: 'state_machine_id', graph: 'graph_id', occurredAt: 'occurred_at', domain: 'domain_id' },
+  generators: { domain: 'domain_id', outputFormat: 'output_format', versionNum: 'version_num' },
   guard_runs: { guard: 'guard_id', graph: 'graph_id', domain: 'domain_id' },
 }
 
