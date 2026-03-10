@@ -179,9 +179,10 @@ export class GraphDLDB extends DurableObject {
     const migrations = [
       'ALTER TABLE functions ADD COLUMN headers TEXT',
       'ALTER TABLE domains ADD COLUMN app_id TEXT',
+      'CREATE INDEX IF NOT EXISTS idx_domains_app ON domains(app_id)',
     ]
     for (const migration of migrations) {
-      try { this.sql.exec(migration) } catch { /* column already exists */ }
+      try { this.sql.exec(migration) } catch { /* column/index already exists */ }
     }
 
     // Migration: widen org_memberships role CHECK to include 'admin'

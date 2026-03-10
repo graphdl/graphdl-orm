@@ -64,7 +64,7 @@ export const METAMODEL_DDL: string[] = [
 
   `CREATE INDEX IF NOT EXISTS idx_domains_org ON domains(organization_id)`,
   `CREATE INDEX IF NOT EXISTS idx_domains_slug ON domains(domain_slug)`,
-  `CREATE INDEX IF NOT EXISTS idx_domains_app ON domains(app_id)`,
+  // idx_domains_app is created in do.ts migrations (after ALTER TABLE adds app_id column)
 
   // ── Core Metamodel ──────────────────────────────────────────────────
   `CREATE TABLE IF NOT EXISTS nouns (
