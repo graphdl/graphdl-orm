@@ -183,6 +183,37 @@ export class GraphDLDB extends DurableObject {
       try { this.sql.exec(migration) } catch { /* column already exists */ }
     }
 
+    // Migration: widen org_memberships role CHECK to include 'admin'
+    // SQLite can't ALTER CHECK constraints, so recreate the table
+    try {
+      const hasAdmin = this.sql.exec(
+        `SELECT sql FROM sqlite_master WHERE name = 'org_memberships'`
+      ).toArray()
+      const ddl = hasAdmin[0]?.sql as string || ''
+      if (ddl && !ddl.includes("'admin'")) {
+        this.sql.exec(`CREATE TABLE IF NOT EXISTS org_memberships_new (
+          id TEXT PRIMARY KEY,
+          user_email TEXT NOT NULL,
+          organization_id TEXT NOT NULL REFERENCES organizations(id),
+          role TEXT NOT NULL DEFAULT 'member' CHECK (role IN ('owner', 'admin', 'member')),
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+          version INTEGER NOT NULL DEFAULT 1,
+          UNIQUE(user_email, organization_id)
+        )`)
+        this.sql.exec(`INSERT INTO org_memberships_new SELECT * FROM org_memberships`)
+        this.sql.exec(`DROP TABLE org_memberships`)
+        this.sql.exec(`ALTER TABLE org_memberships_new RENAME TO org_memberships`)
+        this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_org_memberships_email ON org_memberships(user_email)`)
+        this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_org_memberships_org ON org_memberships(organization_id)`)
+      }
+    } catch { /* migration already applied or table doesn't exist yet */ }
+
+    // Migration: unique partial index — at most one owner per org
+    try {
+      this.sql.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_org_one_owner ON org_memberships(organization_id) WHERE role = 'owner'`)
+    } catch { /* already exists */ }
+
     // CDC events table — tracks mutations for sync/forwarding
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS cdc_events (
