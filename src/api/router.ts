@@ -2,6 +2,7 @@ import { AutoRouter, json, error } from 'itty-router'
 import type { Env } from '../types'
 import { parseQueryOptions } from './collections'
 import { COLLECTION_TABLE_MAP } from '../collections'
+import { handleSeed } from './seed'
 
 /**
  * Get the GraphDL DO stub. One DO per system (for now, single instance).
@@ -100,6 +101,10 @@ router.delete('/api/:collection/:id', async (request, env: Env) => {
   if (!result.deleted) return error(404, { errors: [{ message: 'Not Found' }] })
   return json({ id, message: 'Deleted successfully' })
 })
+
+// ── Seed / Claims ───────────────────────────────────────────────────
+router.all('/seed', handleSeed)
+router.all('/claims', handleSeed) // Alias used by apis worker
 
 // ── 404 fallback ─────────────────────────────────────────────────────
 router.all('*', () => error(404, { errors: [{ message: 'Not Found' }] }))
