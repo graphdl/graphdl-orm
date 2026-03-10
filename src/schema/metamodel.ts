@@ -26,7 +26,7 @@ export const METAMODEL_DDL: string[] = [
     id TEXT PRIMARY KEY,
     user_email TEXT NOT NULL,
     organization_id TEXT NOT NULL REFERENCES organizations(id),
-    role TEXT NOT NULL DEFAULT 'member' CHECK (role IN ('owner', 'member')),
+    role TEXT NOT NULL DEFAULT 'member' CHECK (role IN ('owner', 'admin', 'member')),
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     version INTEGER NOT NULL DEFAULT 1,
@@ -35,6 +35,7 @@ export const METAMODEL_DDL: string[] = [
 
   `CREATE INDEX IF NOT EXISTS idx_org_memberships_email ON org_memberships(user_email)`,
   `CREATE INDEX IF NOT EXISTS idx_org_memberships_org ON org_memberships(organization_id)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_org_one_owner ON org_memberships(organization_id) WHERE role = 'owner'`,
 
   `CREATE TABLE IF NOT EXISTS domains (
     id TEXT PRIMARY KEY,
