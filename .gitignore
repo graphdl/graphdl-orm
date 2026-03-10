@@ -46,3 +46,6 @@ obj/
 
 # worktrees
 .worktrees/
+
+# Visual Studio
+.vs/
