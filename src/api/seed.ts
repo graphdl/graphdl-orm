@@ -7,12 +7,34 @@ export async function handleSeed(request: Request, env: Env): Promise<Response> 
   const db = getDB(env)
 
   if (request.method === 'GET') {
-    const stats = {
-      nouns: (await (db as any).findInCollection('nouns', {}, { limit: 0 })).totalDocs,
-      readings: (await (db as any).findInCollection('readings', {}, { limit: 0 })).totalDocs,
-      domains: (await (db as any).findInCollection('domains', {}, { limit: 0 })).totalDocs,
+    const [allNouns, allReadings, allDomains, allSchemas, allConstraints] = await Promise.all([
+      (db as any).findInCollection('nouns', {}, { limit: 0 }),
+      (db as any).findInCollection('readings', {}, { limit: 0 }),
+      (db as any).findInCollection('domains', {}, { limit: 100 }),
+      (db as any).findInCollection('graph-schemas', {}, { limit: 0 }),
+      (db as any).findInCollection('constraints', {}, { limit: 0 }),
+    ])
+
+    const perDomain: Record<string, { nouns: number; readings: number }> = {}
+    for (const d of allDomains.docs) {
+      const slug = (d.domainSlug || d.id) as string
+      const [nouns, readings] = await Promise.all([
+        (db as any).findInCollection('nouns', { domain: { equals: d.id } }, { limit: 0 }),
+        (db as any).findInCollection('readings', { domain: { equals: d.id } }, { limit: 0 }),
+      ])
+      perDomain[slug] = { nouns: nouns.totalDocs, readings: readings.totalDocs }
     }
-    return json(stats)
+
+    return json({
+      totals: {
+        domains: allDomains.totalDocs,
+        nouns: allNouns.totalDocs,
+        readings: allReadings.totalDocs,
+        graphSchemas: allSchemas.totalDocs,
+        constraints: allConstraints.totalDocs,
+      },
+      perDomain,
+    })
   }
 
   if (request.method === 'DELETE') {
