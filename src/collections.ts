@@ -71,7 +71,7 @@ export const FIELD_MAP: Record<string, Record<string, string>> = {
   graphs: { graphSchema: 'graph_schema_id', domain: 'domain_id', isDone: 'is_done' },
   resources: { noun: 'noun_id', domain: 'domain_id' },
   resource_roles: { graph: 'graph_id', resource: 'resource_id', role: 'role_id', domain: 'domain_id' },
-  state_machines: { stateMachineDefinition: 'state_machine_definition_id', currentStatus: 'current_status_id', resource: 'resource_id', domain: 'domain_id' },
+  state_machines: { stateMachineDefinition: 'state_machine_definition_id', stateMachineType: 'state_machine_definition_id', currentStatus: 'current_status_id', stateMachineStatus: 'current_status_id', resource: 'resource_id', domain: 'domain_id' },
   events: { eventType: 'event_type_id', stateMachine: 'state_machine_id', graph: 'graph_id', occurredAt: 'occurred_at' },
   guard_runs: { guard: 'guard_id', graph: 'graph_id', domain: 'domain_id' },
 }

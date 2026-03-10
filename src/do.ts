@@ -12,7 +12,7 @@
  */
 
 import { DurableObject } from 'cloudflare:workers'
-import { ALL_DDL } from './schema'
+import { ALL_DDL, ALL_BOOTSTRAP } from './schema'
 import { COLLECTION_TABLE_MAP, FIELD_MAP } from './collections'
 import type { Env } from './types'
 
@@ -148,6 +148,11 @@ export class GraphDLDB extends DurableObject {
     `)
     this.sql.exec('CREATE INDEX IF NOT EXISTS idx_cdc_events_timestamp ON cdc_events(timestamp)')
     this.sql.exec('CREATE INDEX IF NOT EXISTS idx_cdc_events_table ON cdc_events(table_name, entity_id)')
+
+    // Bootstrap metamodel data (idempotent)
+    for (const dml of ALL_BOOTSTRAP) {
+      this.sql.exec(dml)
+    }
   }
 
   // =========================================================================
