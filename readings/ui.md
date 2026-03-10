@@ -19,19 +19,19 @@
 ## Readings
 
 Dashboard has Section.
-  Each Section belongs to at most one Dashboard.
+  Each Section belongs to exactly one Dashboard.
 Section has Title.
-  Each Section has at most one Title.
+  Each Section has exactly one Title.
 Section has ColumnCount.
   Each Section has at most one ColumnCount.
 Section has Position.
-  Each Section has at most one Position.
+  Each Section has exactly one Position.
 Section has Widget.
-  Each Widget belongs to at most one Section.
+  Each Widget belongs to exactly one Section.
 Widget has Position.
-  Each Widget has at most one Position.
+  Each Widget has exactly one Position.
 Widget has WidgetType.
-  Each Widget has at most one WidgetType.
+  Each Widget has exactly one WidgetType.
 Widget references Entity.
   Each Widget references at most one Entity.
 Widget references Field.
