@@ -12,13 +12,19 @@ export interface NounRef {
   id: string
   name?: string | null
   plural?: string | null
+  description?: string | null
   objectType?: string
   valueType?: string | null
   format?: string | null
   pattern?: string | null
   enumValues?: string | null
   minimum?: number | null
+  exclusiveMinimum?: number | null
   maximum?: number | null
+  exclusiveMaximum?: number | null
+  minLength?: number | null
+  maxLength?: number | null
+  multipleOf?: number | null
   superType?: string | NounRef | null
   referenceScheme?: (string | NounRef)[] | null
 }
