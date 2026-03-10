@@ -180,6 +180,10 @@ export class GraphDLDB extends DurableObject {
       'ALTER TABLE functions ADD COLUMN headers TEXT',
       'ALTER TABLE domains ADD COLUMN app_id TEXT',
       'CREATE INDEX IF NOT EXISTS idx_domains_app ON domains(app_id)',
+      // events table: add domain_id and updated_at
+      'ALTER TABLE events ADD COLUMN domain_id TEXT REFERENCES domains(id)',
+      'ALTER TABLE events ADD COLUMN updated_at TEXT NOT NULL DEFAULT (datetime(\'now\'))',
+      'CREATE INDEX IF NOT EXISTS idx_events_domain ON events(domain_id)',
     ]
     for (const migration of migrations) {
       try { this.sql.exec(migration) } catch { /* column/index already exists */ }

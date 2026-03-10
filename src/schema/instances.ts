@@ -64,14 +64,17 @@ export const INSTANCE_DDL: string[] = [
     event_type_id TEXT REFERENCES event_types(id),
     state_machine_id TEXT REFERENCES state_machines(id),
     graph_id TEXT REFERENCES graphs(id),
+    domain_id TEXT REFERENCES domains(id),
     data TEXT,
     occurred_at TEXT NOT NULL DEFAULT (datetime('now')),
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     version INTEGER NOT NULL DEFAULT 1
   )`,
 
   `CREATE INDEX IF NOT EXISTS idx_events_state_machine ON events(state_machine_id)`,
   `CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_events_domain ON events(domain_id)`,
 
   `CREATE TABLE IF NOT EXISTS guard_runs (
     id TEXT PRIMARY KEY,
@@ -86,4 +89,20 @@ export const INSTANCE_DDL: string[] = [
   )`,
 
   `CREATE INDEX IF NOT EXISTS idx_guard_runs_guard ON guard_runs(guard_id)`,
+
+  // Generator output storage (persists generation results for ui.do to query)
+  `CREATE TABLE IF NOT EXISTS generators (
+    id TEXT PRIMARY KEY,
+    domain_id TEXT REFERENCES domains(id),
+    output_format TEXT NOT NULL DEFAULT 'openapi',
+    title TEXT,
+    version TEXT DEFAULT '1.0',
+    output TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    version_num INTEGER NOT NULL DEFAULT 1
+  )`,
+
+  `CREATE INDEX IF NOT EXISTS idx_generators_domain ON generators(domain_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_generators_format ON generators(output_format)`,
 ]
