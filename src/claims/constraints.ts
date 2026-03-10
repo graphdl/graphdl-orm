@@ -79,7 +79,6 @@ export async function applyConstraints(
       await db.createInCollection('constraint-spans', {
         constraint: constraint.id,
         role: roleId,
-        ...(domainId ? { domain: domainId } : {}),
       })
     }
   }

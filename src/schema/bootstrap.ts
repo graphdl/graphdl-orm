@@ -51,6 +51,12 @@ export const BOOTSTRAP_DML: string[] = [
   ...entityNoun('Function'),
   ...entityNoun('Stream'),
 
+  // ── AI Agent Entities ────────────────────────────────────────────────
+  ...entityNoun('Model'),
+  ...entityNoun('Agent Definition'),
+  ...entityNoun('Agent'),
+  ...entityNoun('Completion'),
+
   // ── Runtime Instances ─────────────────────────────────────────────────
   ...entityNoun('Resource'),
   ...entityNoun('Graph', 'Resource'),

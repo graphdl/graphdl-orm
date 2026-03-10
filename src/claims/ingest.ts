@@ -215,7 +215,6 @@ export async function ingestClaims(
         await db.createInCollection('constraint-spans', {
           constraint: c.id,
           role: roleId,
-          domain: domainId,
         })
       }
     } catch (err: any) {
