@@ -1,30 +1,22 @@
 {
   "compilerOptions": {
-    "forceConsistentCasingInFileNames": true,
-    "baseUrl": ".",
-    "lib": ["DOM", "DOM.Iterable", "ES2022"],
-    "allowJs": true,
-    "skipLibCheck": true,
-    "strict": true,
-    "noEmit": true,
-    "esModuleInterop": true,
-    "module": "esnext",
+    "target": "ES2022",
+    "module": "ESNext",
     "moduleResolution": "bundler",
-    "resolveJsonModule": true,
-    "isolatedModules": true,
-    "jsx": "preserve",
-    "incremental": true,
-    "plugins": [
-      {
-        "name": "next"
-      }
-    ],
+    "lib": ["ES2022"],
+    "types": ["@cloudflare/workers-types"],
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "outDir": "dist",
+    "declaration": true,
     "paths": {
       "@/*": ["./src/*"],
-      "@payload-config": ["./src/payload.config.ts"]
-    },
-    "target": "ES2022"
+      "@dotdo/db": ["./.do/db/src/index.ts"],
+      "@dotdo/db/*": ["./.do/db/src/*"]
+    }
   },
-  "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"],
-  "exclude": ["node_modules", "sdk", "test", "scripts"]
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "dist", ".do"]
 }
