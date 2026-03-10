@@ -46,15 +46,19 @@ function mkReading(id: string, text: string, roleIds: string[]) {
 }
 
 function mkStateMachineDef(id: string, nounId: string) {
-  return { id, noun: { value: nounId }, domain: DOMAIN_ID }
+  return { id, noun: nounId, domain: DOMAIN_ID }
 }
 
-function mkStatus(id: string, smDefId: string, transitions: any[]) {
-  return { id, stateMachineDefinition: smDefId, transitions: { docs: transitions } }
+function mkStatus(id: string, smDefId: string) {
+  return { id, stateMachineDefinition: smDefId }
+}
+
+function mkTransition(id: string, fromStatusId: string, toStatusId: string, eventTypeId: string) {
+  return { id, from: fromStatusId, to: toStatusId, eventType: eventTypeId }
 }
 
 function mkEventType(id: string, name: string) {
-  return { id, name }
+  return { id, name, domain: DOMAIN_ID }
 }
 
 // ---------------------------------------------------------------------------
@@ -223,10 +227,13 @@ describe('generateILayer', () => {
         nouns: [ticketNoun, titleNoun],
         readings: [mkReading('r1', 'Ticket has Title', ['role-1', 'role-2'])],
         'state-machine-definitions': [mkStateMachineDef('sm-1', 'n-ticket')],
-        roles: [mkRole('role-1', 'n-ticket'), mkRole('role-2', 'n-title')],
         statuses: [
-          mkStatus('status-1', 'sm-1', [{ eventType: 'et-1' }]),
-          mkStatus('status-2', 'sm-1', [{ eventType: 'et-2' }]),
+          mkStatus('status-1', 'sm-1'),
+          mkStatus('status-2', 'sm-1'),
+        ],
+        transitions: [
+          mkTransition('t-1', 'status-1', 'status-2', 'et-1'),
+          mkTransition('t-2', 'status-2', 'status-1', 'et-2'),
         ],
         'event-types': [mkEventType('et-1', 'Escalate'), mkEventType('et-2', 'Close')],
       })

@@ -107,53 +107,59 @@ export async function generateILayer(db: any, domainId: string): Promise<{ files
   const allNouns = await fetchAll(db, 'nouns')
   const allNounById = new Map(allNouns.map((n: any) => [n.id, n]))
 
-  const allRoles = await fetchAll(db, 'roles')
-  const roleById = new Map(allRoles.map((r: any) => [r.id, r]))
+  // Build name→id lookup for reading text parsing
+  const nounByName = new Map(allNouns.map((n: any) => [n.name, n]))
 
-  // ------ 3. Build reading infos ------
+  // ------ 3. Build reading infos by parsing reading text ------
   const entityNouns = nouns.filter((n: any) => n.objectType === 'entity')
   const readingInfos: ReadingInfo[] = []
 
   for (const reading of readings) {
-    const roleIds = (reading.roles || []) as string[]
-    if (roleIds.length < 2) continue
+    const text = reading.text || ''
+    if (!text) continue
 
-    const firstRole = roleById.get(roleIds[0])
-    const secondRole = roleById.get(roleIds[1])
-    if (!firstRole || !secondRole) continue
+    // Parse "SubjectNoun verb ObjectNoun" — find longest matching noun names
+    // at start and end of reading text
+    let subjectNoun: any = null
+    let objectNoun: any = null
 
-    const subjectNounVal = (firstRole as any).noun?.value
-    const subjectNounId = typeof subjectNounVal === 'string' ? subjectNounVal : subjectNounVal?.id
-    const objectNounVal = (secondRole as any).noun?.value
-    const objectNounId = typeof objectNounVal === 'string' ? objectNounVal : objectNounVal?.id
+    for (const [name, noun] of nounByName) {
+      if (text.startsWith(name + ' ')) {
+        if (!subjectNoun || name.length > subjectNoun.name.length) subjectNoun = noun
+      }
+      if (text.endsWith(' ' + name) || text.endsWith(' ' + name + '.')) {
+        if (!objectNoun || name.length > objectNoun.name.length) objectNoun = noun
+      }
+    }
 
-    if (subjectNounId && objectNounId) {
-      readingInfos.push({ subjectNounId, objectNounId, text: reading.text })
+    if (subjectNoun && objectNoun && subjectNoun.id !== objectNoun.id) {
+      readingInfos.push({ subjectNounId: subjectNoun.id, objectNounId: objectNoun.id, text })
     }
   }
 
   const files: Record<string, string> = {}
 
   // ------ 4. Resolve state machine events for an entity noun ------
+  // Pre-fetch all event types for the domain
+  const allEventTypes = await fetchAll(db, 'event-types', { domain: { equals: domainId } })
+  const eventTypeById = new Map(allEventTypes.map((et: any) => [et.id, et]))
+
   async function getStateMachineEvents(entityNounId: string): Promise<string[]> {
     const events: string[] = []
     for (const smDef of stateMachineDefinitions) {
-      const nounRef = smDef.noun as any
-      const nounId = typeof nounRef?.value === 'string' ? nounRef.value : nounRef?.value?.id
+      const nounId = typeof smDef.noun === 'string' ? smDef.noun : smDef.noun?.id
       if (nounId !== entityNounId) continue
 
       const statuses = await fetchAll(db, 'statuses', { stateMachineDefinition: { equals: smDef.id } })
 
       for (const status of statuses) {
-        const transitions = (status.transitions?.docs || []) as any[]
+        // Query transitions from this status directly
+        const transitions = await fetchAll(db, 'transitions', { from: { equals: status.id } })
         for (const t of transitions) {
           const eventTypeId = typeof t.eventType === 'string' ? t.eventType : t.eventType?.id
           if (!eventTypeId) continue
 
-          // Look up the event type from the event-types collection
-          const eventTypes = await fetchAll(db, 'event-types', { id: { equals: eventTypeId } })
-          const eventType = eventTypes[0] || (typeof t.eventType === 'object' ? t.eventType : null)
-
+          const eventType = eventTypeById.get(eventTypeId)
           if (eventType?.name && !events.includes(eventType.name)) {
             events.push(eventType.name)
           }
@@ -166,7 +172,7 @@ export async function generateILayer(db: any, domainId: string): Promise<{ files
   // ------ 5. Generate layers for each entity noun ------
   for (const entity of entityNouns) {
     const slug = toSlug(entity)
-    const perms: string[] = entity.permissions || []
+    const perms: string[] = entity.permissions || ['list', 'read', 'create', 'update', 'delete']
     const hasCreate = perms.includes('create')
     const hasRead = perms.includes('read')
     const hasUpdate = perms.includes('update')
@@ -306,7 +312,7 @@ export async function generateILayer(db: any, domainId: string): Promise<{ files
   // ------ 6. Index navigation layer ------
   const indexItems = entityNouns
     .filter((e: any) => {
-      const p: string[] = e.permissions || []
+      const p: string[] = e.permissions || ['list', 'read']
       return p.includes('list') || p.includes('read')
     })
     .map((entity: any) => ({
