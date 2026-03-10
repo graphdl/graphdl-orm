@@ -3,6 +3,7 @@ import type { Env } from '../types'
 import { parseQueryOptions } from './collections'
 import { COLLECTION_TABLE_MAP, FIELD_MAP, FK_TARGET_TABLE, REVERSE_FK_MAP } from '../collections'
 import { handleSeed } from './seed'
+import { handleGenerate } from './generate'
 
 /**
  * Get the GraphDL DO stub. One DO per system (for now, single instance).
@@ -194,6 +195,9 @@ router.delete('/api/:collection/:id', async (request, env: Env) => {
   if (!result.deleted) return error(404, { errors: [{ message: 'Not Found' }] })
   return json({ id, message: 'Deleted successfully', ...(result.cascaded && { cascaded: result.cascaded }) })
 })
+
+// ── Generate ────────────────────────────────────────────────────────
+router.post('/api/generate', handleGenerate)
 
 // ── Seed / Claims ───────────────────────────────────────────────────
 router.all('/seed', handleSeed)
