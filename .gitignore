@@ -32,3 +32,8 @@ yarn-error.log*
 
 # Visual Studio
 .vs/
+
+# legacy build artifacts
+.next/
+obj/
+media/

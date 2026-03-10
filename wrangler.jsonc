@@ -1,5 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
+  "account_id": "b6641681fe423910342b9ffa1364c76d",
   "name": "graphdl-orm",
   "main": "src/index.ts",
   "compatibility_date": "2026-03-09",
