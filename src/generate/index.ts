@@ -1,0 +1,16 @@
+export { generateOpenAPI } from './openapi'
+export { generateSQLite } from './sqlite'
+export { generateXState } from './xstate'
+export { generateILayer } from './ilayer'
+export { generateReadings } from './readings'
+
+// Pure RMap functions (for direct use or testing)
+export {
+  nameToKey,
+  transformPropertyName,
+  extractPropertyName,
+  toPredicate,
+  findPredicateObject,
+  nounListToRegex,
+  type NounRef,
+} from './rmap'
