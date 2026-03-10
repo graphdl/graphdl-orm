@@ -107,6 +107,9 @@ async function populateDocs(
 // ── Health ───────────────────────────────────────────────────────────
 router.get('/health', () => json({ status: 'ok', version: '0.1.0' }))
 
+// ── Generate ────────────────────────────────────────────────────────
+router.post('/api/generate', handleGenerate)
+
 // ── Collection CRUD ──────────────────────────────────────────────────
 
 /** GET /api/:collection — list/find */
@@ -195,9 +198,6 @@ router.delete('/api/:collection/:id', async (request, env: Env) => {
   if (!result.deleted) return error(404, { errors: [{ message: 'Not Found' }] })
   return json({ id, message: 'Deleted successfully', ...(result.cascaded && { cascaded: result.cascaded }) })
 })
-
-// ── Generate ────────────────────────────────────────────────────────
-router.post('/api/generate', handleGenerate)
 
 // ── Seed / Claims ───────────────────────────────────────────────────
 router.all('/seed', handleSeed)
