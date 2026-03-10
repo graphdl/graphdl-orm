@@ -11,37 +11,37 @@ Completion(.id) is an entity type.
 
 ### Model
 Model has Name.
-  Each Model has at most one Name.
+  Each Model has exactly one Name.
 
 ### AgentDefinition
 AgentDefinition belongs to Domain.
-  Each AgentDefinition belongs to at most one Domain.
+  Each AgentDefinition belongs to exactly one Domain.
 
 AgentDefinition has Name.
-  Each AgentDefinition has at most one Name.
+  Each AgentDefinition has exactly one Name.
 
 AgentDefinition uses Model.
-  Each AgentDefinition uses at most one Model.
+  Each AgentDefinition uses exactly one Model.
 
 ### Agent
 Agent is instance of AgentDefinition.
-  Each Agent is instance of at most one AgentDefinition.
+  Each Agent is instance of exactly one AgentDefinition.
 
 Agent is for Resource.
   Each Agent is for at most one Resource.
 
 ### Completion
 Completion belongs to Agent.
-  Each Completion belongs to at most one Agent.
+  Each Completion belongs to exactly one Agent.
 
 Completion has input Text.
-  Each Completion has at most one input Text.
+  Each Completion has exactly one input Text.
 
 Completion has output Text.
   Each Completion has at most one output Text.
 
 Completion occurred at Timestamp.
-  Each Completion occurred at at most one Timestamp.
+  Each Completion occurred at exactly one Timestamp.
 
 ### Verb connection
 Verb invokes AgentDefinition.
