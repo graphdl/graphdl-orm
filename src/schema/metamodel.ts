@@ -37,10 +37,24 @@ export const METAMODEL_DDL: string[] = [
   `CREATE INDEX IF NOT EXISTS idx_org_memberships_org ON org_memberships(organization_id)`,
   `CREATE UNIQUE INDEX IF NOT EXISTS idx_org_one_owner ON org_memberships(organization_id) WHERE role = 'owner'`,
 
+  `CREATE TABLE IF NOT EXISTS apps (
+    id TEXT PRIMARY KEY,
+    slug TEXT NOT NULL UNIQUE,
+    name TEXT,
+    organization_id TEXT REFERENCES organizations(id),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    version INTEGER NOT NULL DEFAULT 1
+  )`,
+
+  `CREATE INDEX IF NOT EXISTS idx_apps_slug ON apps(slug)`,
+  `CREATE INDEX IF NOT EXISTS idx_apps_org ON apps(organization_id)`,
+
   `CREATE TABLE IF NOT EXISTS domains (
     id TEXT PRIMARY KEY,
     domain_slug TEXT NOT NULL UNIQUE,
     name TEXT,
+    app_id TEXT REFERENCES apps(id),
     organization_id TEXT REFERENCES organizations(id),
     visibility TEXT NOT NULL DEFAULT 'private' CHECK (visibility IN ('private', 'public')),
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -50,6 +64,7 @@ export const METAMODEL_DDL: string[] = [
 
   `CREATE INDEX IF NOT EXISTS idx_domains_org ON domains(organization_id)`,
   `CREATE INDEX IF NOT EXISTS idx_domains_slug ON domains(domain_slug)`,
+  `CREATE INDEX IF NOT EXISTS idx_domains_app ON domains(app_id)`,
 
   // ── Core Metamodel ──────────────────────────────────────────────────
   `CREATE TABLE IF NOT EXISTS nouns (

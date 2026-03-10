@@ -1,7 +1,7 @@
 import { AutoRouter, json, error } from 'itty-router'
 import type { Env } from '../types'
 import { parseQueryOptions } from './collections'
-import { COLLECTION_TABLE_MAP, FIELD_MAP, FK_TARGET_TABLE } from '../collections'
+import { COLLECTION_TABLE_MAP, FIELD_MAP, FK_TARGET_TABLE, REVERSE_FK_MAP } from '../collections'
 import { handleSeed } from './seed'
 
 /**
@@ -60,6 +60,30 @@ async function populateDepth(
       }
     } catch {
       // If lookup fails, keep the ID
+    }
+  }
+
+  // Reverse FK population (has-many relationships, e.g. app.domains)
+  const reverseFKs = REVERSE_FK_MAP[table]
+  if (reverseFKs) {
+    for (const [payloadField, { childCollection, fkColumn }] of Object.entries(reverseFKs)) {
+      try {
+        const children = await db.findInCollection(childCollection, {
+          [fkColumn]: { equals: populated.id },
+        }, { limit: 100 })
+        const childTable = COLLECTION_TABLE_MAP[childCollection]
+        if (childTable && currentDepth + 1 < maxDepth) {
+          populated[payloadField] = await Promise.all(
+            children.docs.map((child: Record<string, unknown>) =>
+              populateDepth(db, child, childTable, currentDepth + 1, maxDepth)
+            )
+          )
+        } else {
+          populated[payloadField] = children.docs
+        }
+      } catch {
+        // If reverse lookup fails, skip
+      }
     }
   }
 
