@@ -41,5 +41,28 @@ export async function handleGenerate(request: Request, env: Env): Promise<Respon
       break
   }
 
+  // Persist the generator output so ui.do can fetch it via /graphdl/raw/generators
+  try {
+    // Find existing generator for this domain+format to update, or create new
+    const existing = await db.findInCollection('generators', {
+      domain: { equals: domainId },
+      outputFormat: { equals: outputFormat },
+    }, { limit: 1 })
+
+    const outputStr = typeof output === 'string' ? output : JSON.stringify(output)
+
+    if (existing?.docs?.[0]) {
+      await db.updateInCollection('generators', existing.docs[0].id, { output: outputStr })
+    } else {
+      await db.createInCollection('generators', {
+        domain: domainId,
+        outputFormat,
+        output: outputStr,
+      })
+    }
+  } catch {
+    // Don't fail the response if persistence fails
+  }
+
   return json({ output, format: outputFormat, domainId })
 }
