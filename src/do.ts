@@ -451,6 +451,10 @@ export class GraphDLDB extends DurableObject {
    */
   private cascadeDeleteDomain(domainId: string): number {
     let cascaded = 0
+    // Disable FK enforcement during cascade — cross-domain references (e.g. roles
+    // from other domains referencing nouns in this domain) would otherwise block deletion
+    try { this.sql.exec('PRAGMA foreign_keys = OFF') } catch { /* best effort */ }
+
     // Delete domain-scoped children in leaf-to-root order
     const domainScopedTables = [
       'guard_runs', 'events', 'state_machines', 'resource_roles', 'resources', 'graphs',
@@ -466,8 +470,9 @@ export class GraphDLDB extends DurableObject {
             `DELETE FROM constraint_spans WHERE constraint_id IN (SELECT id FROM constraints WHERE domain_id = ?)`, domainId
           )
         } else if (child === 'roles') {
+          // Delete roles by reading OR by noun — covers cross-domain references
           this.sql.exec(
-            `DELETE FROM roles WHERE reading_id IN (SELECT id FROM readings WHERE domain_id = ?)`, domainId
+            `DELETE FROM roles WHERE reading_id IN (SELECT id FROM readings WHERE domain_id = ?) OR noun_id IN (SELECT id FROM nouns WHERE domain_id = ?)`, domainId, domainId
           )
         } else if (child === 'transitions') {
           this.sql.exec(
@@ -483,6 +488,8 @@ export class GraphDLDB extends DurableObject {
         cascaded++
       } catch { /* table may not exist yet */ }
     }
+
+    try { this.sql.exec('PRAGMA foreign_keys = ON') } catch { /* best effort */ }
     return cascaded
   }
 
