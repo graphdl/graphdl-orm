@@ -75,3 +75,31 @@ export const FIELD_MAP: Record<string, Record<string, string>> = {
   events: { eventType: 'event_type_id', stateMachine: 'state_machine_id', graph: 'graph_id', occurredAt: 'occurred_at' },
   guard_runs: { guard: 'guard_id', graph: 'graph_id', domain: 'domain_id' },
 }
+
+/**
+ * Maps FK column names to their target table.
+ * Derived from REFERENCES clauses in DDL.
+ * Used by buildWhereClause to resolve dot-notation queries
+ * like `where[domain.domainSlug][equals]=joey`.
+ */
+export const FK_TARGET_TABLE: Record<string, string> = {
+  domain_id: 'domains',
+  organization_id: 'organizations',
+  super_type_id: 'nouns',
+  graph_schema_id: 'graph_schemas',
+  reading_id: 'readings',
+  noun_id: 'nouns',
+  constraint_id: 'constraints',
+  role_id: 'roles',
+  state_machine_definition_id: 'state_machine_definitions',
+  from_status_id: 'statuses',
+  to_status_id: 'statuses',
+  event_type_id: 'event_types',
+  verb_id: 'verbs',
+  transition_id: 'transitions',
+  guard_id: 'guards',
+  graph_id: 'graphs',
+  resource_id: 'resources',
+  state_machine_id: 'state_machines',
+  current_status_id: 'statuses',
+}

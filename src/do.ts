@@ -13,7 +13,7 @@
 
 import { DurableObject } from 'cloudflare:workers'
 import { ALL_DDL, ALL_BOOTSTRAP } from './schema'
-import { COLLECTION_TABLE_MAP, FIELD_MAP } from './collections'
+import { COLLECTION_TABLE_MAP, FIELD_MAP, FK_TARGET_TABLE } from './collections'
 import type { Env } from './types'
 
 // =========================================================================
@@ -60,7 +60,41 @@ function buildWhereClause(
 
   for (const [key, condition] of Object.entries(where)) {
     if (key === 'and' || key === 'or') continue
-    if (key.includes('.')) continue  // Skip deep relationship queries for now
+
+    // Dot-notation: where[domain.domainSlug][equals]=joey
+    // → domain_id IN (SELECT id FROM domains WHERE domain_slug = ?)
+    if (key.includes('.')) {
+      const [relationName, fieldName] = key.split('.', 2)
+      const fkCol = fieldMap[relationName] || `${relationName}_id`
+      const targetTable = FK_TARGET_TABLE[fkCol]
+      if (!targetTable) continue // unknown relationship, skip
+
+      const targetFieldMap = FIELD_MAP[targetTable] || {}
+      const targetCol = targetFieldMap[fieldName] || fieldName
+
+      if (typeof condition === 'object' && condition !== null) {
+        if ('equals' in condition) {
+          conditions.push(`${fkCol} IN (SELECT id FROM ${targetTable} WHERE ${targetCol} = ?)`)
+          params.push(condition.equals)
+        } else if ('not_equals' in condition) {
+          conditions.push(`${fkCol} NOT IN (SELECT id FROM ${targetTable} WHERE ${targetCol} = ?)`)
+          params.push(condition.not_equals)
+        } else if ('in' in condition && Array.isArray(condition.in)) {
+          const placeholders = condition.in.map(() => '?').join(', ')
+          conditions.push(`${fkCol} IN (SELECT id FROM ${targetTable} WHERE ${targetCol} IN (${placeholders}))`)
+          params.push(...condition.in)
+        } else if ('like' in condition) {
+          conditions.push(`${fkCol} IN (SELECT id FROM ${targetTable} WHERE ${targetCol} LIKE ?)`)
+          params.push(condition.like)
+        } else if ('exists' in condition) {
+          conditions.push(condition.exists ? `${fkCol} IS NOT NULL` : `${fkCol} IS NULL`)
+        }
+      } else {
+        conditions.push(`${fkCol} IN (SELECT id FROM ${targetTable} WHERE ${targetCol} = ?)`)
+        params.push(condition)
+      }
+      continue
+    }
 
     const col = fieldMap[key] || key
 
