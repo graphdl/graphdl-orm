@@ -8,6 +8,7 @@ export const COLLECTION_TABLE_MAP: Record<string, string> = {
   // Organizations & access
   'organizations': 'organizations',
   'org-memberships': 'org_memberships',
+  'apps': 'apps',
   'domains': 'domains',
 
   // Core metamodel
@@ -64,7 +65,8 @@ export const FIELD_MAP: Record<string, Record<string, string>> = {
   roles: { reading: 'reading_id', noun: 'noun_id', graphSchema: 'graph_schema_id', roleIndex: 'role_index' },
   constraints: { domain: 'domain_id' },
   constraint_spans: { constraint: 'constraint_id', role: 'role_id' },
-  domains: { domainSlug: 'domain_slug', organization: 'organization_id' },
+  apps: { organization: 'organization_id' },
+  domains: { domainSlug: 'domain_slug', organization: 'organization_id', app: 'app_id' },
   organizations: {},
   org_memberships: { organization: 'organization_id', userEmail: 'user_email' },
   state_machine_definitions: { domain: 'domain_id', noun: 'noun_id' },
@@ -94,6 +96,7 @@ export const FIELD_MAP: Record<string, Record<string, string>> = {
  * like `where[domain.domainSlug][equals]=joey`.
  */
 export const FK_TARGET_TABLE: Record<string, string> = {
+  app_id: 'apps',
   domain_id: 'domains',
   organization_id: 'organizations',
   super_type_id: 'nouns',
@@ -116,4 +119,15 @@ export const FK_TARGET_TABLE: Record<string, string> = {
   model_id: 'models',
   agent_definition_id: 'agent_definitions',
   agent_id: 'agents',
+}
+
+/**
+ * Reverse (has-many) relationships for depth population.
+ * Maps: parent table → { payloadField → { childTable, fkColumn } }
+ * Used to populate arrays like app.domains when depth>0.
+ */
+export const REVERSE_FK_MAP: Record<string, Record<string, { childCollection: string; fkColumn: string }>> = {
+  apps: {
+    domains: { childCollection: 'domains', fkColumn: 'app_id' },
+  },
 }
