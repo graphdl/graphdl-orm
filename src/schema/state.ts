@@ -85,6 +85,7 @@ export const STATE_DDL: string[] = [
     name TEXT,
     callback_url TEXT,
     http_method TEXT DEFAULT 'POST',
+    headers TEXT,
     verb_id TEXT REFERENCES verbs(id),
     domain_id TEXT REFERENCES domains(id),
     created_at TEXT NOT NULL DEFAULT (datetime('now')),

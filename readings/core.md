@@ -82,6 +82,7 @@ schema:Thing(.Name) is an entity type.
 Name is a value type.
 Text is a value type.
 URI is a value type.
+Header is a value type.
 Timestamp is a value type.
 Argument Length is a value type.
 
@@ -122,6 +123,8 @@ Function has callback URI.
   Each Function has at most one callback URI.
 Function has HTTP Method.
   Each Function has at most one HTTP Method.
+Function has Header.
+  Each Function has each Header at most once.
 
 ### Constraint
 Constraint is of Constraint Type.
