@@ -52,8 +52,8 @@ export const BOOTSTRAP_DML: string[] = [
   ...entityNoun('Stream'),
 
   // ── Runtime Instances ─────────────────────────────────────────────────
-  ...entityNoun('Graph', 'Resource'),
   ...entityNoun('Resource'),
+  ...entityNoun('Graph', 'Resource'),
   ...entityNoun('Resource Role'),
   ...entityNoun('State Machine'),
   ...entityNoun('Event'),
