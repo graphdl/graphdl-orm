@@ -184,6 +184,11 @@ export class GraphDLDB extends DurableObject {
       'ALTER TABLE events ADD COLUMN domain_id TEXT',
       'ALTER TABLE events ADD COLUMN updated_at TEXT',
       'CREATE INDEX IF NOT EXISTS idx_events_domain ON events(domain_id)',
+      // statuses + transitions: add domain_id for direct domain scoping
+      'ALTER TABLE statuses ADD COLUMN domain_id TEXT',
+      'CREATE INDEX IF NOT EXISTS idx_statuses_domain ON statuses(domain_id)',
+      'ALTER TABLE transitions ADD COLUMN domain_id TEXT',
+      'CREATE INDEX IF NOT EXISTS idx_transitions_domain ON transitions(domain_id)',
     ]
     for (const migration of migrations) {
       try { this.sql.exec(migration) } catch { /* column/index already exists */ }
