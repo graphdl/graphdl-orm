@@ -175,6 +175,14 @@ export class GraphDLDB extends DurableObject {
       this.sql.exec(ddl)
     }
 
+    // Migrations: add columns that didn't exist in earlier DDL versions
+    const migrations = [
+      'ALTER TABLE functions ADD COLUMN headers TEXT',
+    ]
+    for (const migration of migrations) {
+      try { this.sql.exec(migration) } catch { /* column already exists */ }
+    }
+
     // CDC events table — tracks mutations for sync/forwarding
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS cdc_events (
