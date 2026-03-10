@@ -192,7 +192,7 @@ router.delete('/api/:collection/:id', async (request, env: Env) => {
   const result = await db.deleteFromCollection(collection, id)
 
   if (!result.deleted) return error(404, { errors: [{ message: 'Not Found' }] })
-  return json({ id, message: 'Deleted successfully' })
+  return json({ id, message: 'Deleted successfully', ...(result.cascaded && { cascaded: result.cascaded }) })
 })
 
 // ── Seed / Claims ───────────────────────────────────────────────────
