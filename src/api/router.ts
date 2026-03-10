@@ -1,7 +1,7 @@
 import { AutoRouter, json, error } from 'itty-router'
 import type { Env } from '../types'
 import { parseQueryOptions } from './collections'
-import { COLLECTION_TABLE_MAP } from '../collections'
+import { COLLECTION_TABLE_MAP, FIELD_MAP, FK_TARGET_TABLE } from '../collections'
 import { handleSeed } from './seed'
 
 /**
@@ -14,6 +14,70 @@ function getDB(env: Env): DurableObjectStub {
 }
 
 export const router = AutoRouter()
+
+// ── Depth population ────────────────────────────────────────────────
+
+/**
+ * Resolve FK columns in a doc into populated objects (like Payload's depth).
+ * For each FK column (e.g. event_type_id), fetch the target row and replace
+ * the Payload field (e.g. eventType) with the full object.
+ */
+async function populateDepth(
+  db: any,
+  doc: Record<string, unknown>,
+  table: string,
+  currentDepth: number,
+  maxDepth: number,
+): Promise<Record<string, unknown>> {
+  if (currentDepth >= maxDepth) return doc
+
+  const fieldMap = FIELD_MAP[table] || {}
+  // Build reverse: SQL column → Payload field name
+  const reverseFieldMap: Record<string, string> = {}
+  for (const [payloadName, sqlCol] of Object.entries(fieldMap)) {
+    reverseFieldMap[sqlCol] = payloadName
+  }
+
+  const populated = { ...doc }
+
+  for (const [sqlCol, targetTable] of Object.entries(FK_TARGET_TABLE)) {
+    // Find the Payload field name that maps to this FK column
+    const payloadField = reverseFieldMap[sqlCol]
+    if (!payloadField || !(payloadField in populated)) continue
+
+    const fkValue = populated[payloadField]
+    if (!fkValue || typeof fkValue !== 'string') continue
+
+    // Look up the FK slug for the target collection
+    const targetSlug = Object.entries(COLLECTION_TABLE_MAP).find(([, t]) => t === targetTable)?.[0]
+    if (!targetSlug) continue
+
+    try {
+      const related = await db.getFromCollection(targetSlug, fkValue)
+      if (related) {
+        const populatedRelated = await populateDepth(db, related, targetTable, currentDepth + 1, maxDepth)
+        populated[payloadField] = populatedRelated
+      }
+    } catch {
+      // If lookup fails, keep the ID
+    }
+  }
+
+  return populated
+}
+
+/** Populate depth for an array of docs. */
+async function populateDocs(
+  db: any,
+  docs: Record<string, unknown>[],
+  collectionSlug: string,
+  depth: number,
+): Promise<Record<string, unknown>[]> {
+  if (depth <= 0) return docs
+  const table = COLLECTION_TABLE_MAP[collectionSlug]
+  if (!table) return docs
+  return Promise.all(docs.map(doc => populateDepth(db, doc, table, 0, depth)))
+}
 
 // ── Health ───────────────────────────────────────────────────────────
 router.get('/health', () => json({ status: 'ok', version: '0.1.0' }))
@@ -28,13 +92,14 @@ router.get('/api/:collection', async (request, env: Env) => {
   }
 
   const url = new URL(request.url)
-  const { where, limit, page, sort } = parseQueryOptions(url.searchParams)
+  const { where, limit, page, sort, depth } = parseQueryOptions(url.searchParams)
 
   const db = getDB(env) as any
   const result = await db.findInCollection(collection, where, { limit, page, sort })
+  const docs = await populateDocs(db, result.docs, collection, depth)
 
   return json({
-    docs: result.docs,
+    docs,
     totalDocs: result.totalDocs,
     limit: result.limit,
     page: result.page,
@@ -52,11 +117,15 @@ router.get('/api/:collection/:id', async (request, env: Env) => {
     return error(404, { errors: [{ message: `Collection "${collection}" not found` }] })
   }
 
+  const url = new URL(request.url)
+  const depth = parseInt(url.searchParams.get('depth') || '0', 10)
+
   const db = getDB(env) as any
   const doc = await db.getFromCollection(collection, id)
 
   if (!doc) return error(404, { errors: [{ message: 'Not Found' }] })
-  return json(doc)
+  const populated = depth > 0 ? await populateDepth(db, doc, COLLECTION_TABLE_MAP[collection], 0, depth) : doc
+  return json(populated)
 })
 
 /** POST /api/:collection — create */

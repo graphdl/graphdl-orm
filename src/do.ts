@@ -14,6 +14,12 @@
 import { DurableObject } from 'cloudflare:workers'
 import { ALL_DDL, ALL_BOOTSTRAP } from './schema'
 import { COLLECTION_TABLE_MAP, FIELD_MAP, FK_TARGET_TABLE } from './collections'
+
+/** Fields common to every table — Payload camelCase → SQL snake_case. */
+const COMMON_FIELDS: Record<string, string> = {
+  createdAt: 'created_at',
+  updatedAt: 'updated_at',
+}
 import type { Env } from './types'
 
 // =========================================================================
@@ -96,7 +102,7 @@ function buildWhereClause(
       continue
     }
 
-    const col = fieldMap[key] || key
+    const col = fieldMap[key] || COMMON_FIELDS[key] || key
 
     if (typeof condition === 'object' && condition !== null) {
       if ('equals' in condition) { conditions.push(`${col} = ?`); params.push(condition.equals) }
@@ -134,7 +140,7 @@ function payloadToRow(data: Record<string, unknown>, fieldMap: Record<string, st
   for (const [key, value] of Object.entries(data)) {
     // Skip meta fields
     if (key === 'createdAt' || key === 'updatedAt' || key === 'version') continue
-    const col = fieldMap[key] || key
+    const col = fieldMap[key] || COMMON_FIELDS[key] || key
     result[col] = value
   }
   return result
@@ -277,7 +283,7 @@ export class GraphDLDB extends DurableObject {
     if (options?.sort) {
       const sortField = options.sort.startsWith('-') ? options.sort.slice(1) : options.sort
       const sortDir = options.sort.startsWith('-') ? 'DESC' : 'ASC'
-      const sortCol = fieldMap[sortField] || sortField
+      const sortCol = fieldMap[sortField] || COMMON_FIELDS[sortField] || sortField
       query += ` ORDER BY ${sortCol} ${sortDir}`
     } else {
       query += ' ORDER BY created_at DESC'
@@ -326,17 +332,24 @@ export class GraphDLDB extends DurableObject {
       const { id: _id, createdAt: _ca, updatedAt: _ua, version: _v, ...rest } = data
       const sqlData = payloadToRow(rest, fieldMap)
 
+      // Only include columns that exist in the table
+      const tableColumns = new Set(getTableColumns(this.sql, table))
+      const filteredData: Record<string, unknown> = {}
+      for (const [col, value] of Object.entries(sqlData)) {
+        if (tableColumns.has(col)) filteredData[col] = value
+      }
+
       // Build columns and values
-      const columns = ['id', 'created_at', 'updated_at', 'version', ...Object.keys(sqlData)]
+      const columns = ['id', 'created_at', 'updated_at', 'version', ...Object.keys(filteredData)]
       const placeholders = columns.map(() => '?').join(', ')
-      const values = [id, now, now, 1, ...Object.values(sqlData)]
+      const values = [id, now, now, 1, ...Object.values(filteredData)]
 
       this.sql.exec(
         `INSERT INTO ${table} (${columns.join(', ')}) VALUES (${placeholders})`,
         ...values,
       )
 
-      this.logCdcEvent('create', table, id, { ...sqlData, id })
+      this.logCdcEvent('create', table, id, { ...filteredData, id })
 
       // Return the created record
       const rows = this.sql.exec(`SELECT * FROM ${table} WHERE id = ?`, id).toArray()

@@ -41,6 +41,8 @@ Guard(.id) is an entity type.
 
 Guard Run(.id) is an entity type.
 
+Function(.id) is an entity type.
+
 HTTP Operation(.code) is an entity type.
   The possible values of HTTP Operation are 'POST', 'GET', 'PUT', 'PATCH', 'DELETE'.
 
@@ -108,10 +110,18 @@ Role is used in Reading.
 ### Verb
 Verb has Name.
 Reading is used by Verb.
+Verb executes Function.
+  Each Verb executes at most one Function.
 Event Type can be created by Verb.
 Graph is referenced by Verb.
 Verb is performed during Transition (Mealy semantics).
 Verb is performed in Status (Moore semantics).
+
+### Function
+Function has callback URI.
+  Each Function has at most one callback URI.
+Function has HTTP Method.
+  Each Function has at most one HTTP Method.
 
 ### Constraint
 Constraint is of Constraint Type.

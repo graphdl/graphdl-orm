@@ -71,6 +71,7 @@ export const STATE_DDL: string[] = [
     status_id TEXT REFERENCES statuses(id),
     transition_id TEXT REFERENCES transitions(id),
     graph_id TEXT REFERENCES graphs(id),
+    agent_definition_id TEXT REFERENCES agent_definitions(id),
     domain_id TEXT REFERENCES domains(id),
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),

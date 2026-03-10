@@ -14,32 +14,50 @@
 ## Readings
 
 ### Graph
-Graph belongs to Domain (*:1)
-Graph is of GraphSchema (*:1)
+Graph belongs to Domain.
+  Each Graph belongs to at most one Domain.
+Graph is of GraphSchema.
+  Each Graph is of at most one GraphSchema.
 
 ### Resource
-Resource belongs to Domain (*:1)
-Resource is instance of Noun (*:1)
-Resource has Reference (*:1)
-Resource has Value (*:1)
+Resource belongs to Domain.
+  Each Resource belongs to at most one Domain.
+Resource is instance of Noun.
+  Each Resource is instance of at most one Noun.
+Resource has Reference.
+  Each Resource has at most one Reference.
+Resource has Value.
+  Each Resource has at most one Value.
 
 ### ResourceRole
-Graph uses Resource for Role — UC(Graph, Role)
+Graph uses Resource for Role — UC(Graph, Role).
 
 ### StateMachine
-StateMachine belongs to Domain (*:1)
-StateMachine has Name (*:1)
-StateMachine is instance of StateMachineDefinition (*:1)
-StateMachine is currently in Status (*:1)
-StateMachine is for Resource (*:1)
+StateMachine belongs to Domain.
+  Each StateMachine belongs to at most one Domain.
+StateMachine has Name.
+  Each StateMachine has at most one Name.
+StateMachine is instance of StateMachineDefinition.
+  Each StateMachine is instance of at most one StateMachineDefinition.
+StateMachine is currently in Status.
+  Each StateMachine is currently in at most one Status.
+StateMachine is for Resource.
+  Each StateMachine is for at most one Resource.
 
 ### Event
-Event belongs to StateMachine (*:1)
-Event is of EventType (*:1)
-Event occurred at Timestamp (*:1)
-Event is created by Graph (*:1)
+Event belongs to StateMachine.
+  Each Event belongs to at most one StateMachine.
+Event is of EventType.
+  Each Event is of at most one EventType.
+Event occurred at Timestamp.
+  Each Event occurred at at most one Timestamp.
+Event is created by Graph.
+  Each Event is created by at most one Graph.
 
 ### GuardRun
-GuardRun has Name (*:1)
-GuardRun is for Guard (*:1)
-GuardRun references Graph (*:1)
+GuardRun has Name.
+  Each GuardRun has at most one Name.
+GuardRun is for Guard.
+  Each GuardRun is for at most one Guard.
+GuardRun references Graph.
+  Each GuardRun references at most one Graph.

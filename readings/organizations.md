@@ -15,6 +15,8 @@
 
 ## Readings
 
-Organization has Name (*:1)
-User has OrgRole in Organization — UC(User, Organization)
-Domain belongs to Organization (*:1)
+Organization has Name.
+  Each Organization has at most one Name.
+User has OrgRole in Organization — UC(User, Organization).
+Domain belongs to Organization.
+  Each Domain belongs to at most one Organization.

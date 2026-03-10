@@ -18,14 +18,25 @@
 
 ## Readings
 
-Dashboard has Section (1:*)
-Section has Title (*:1)
-Section has ColumnCount (*:1)
-Section has Position (*:1)
-Section has Widget (1:*)
-Widget has Position (*:1)
-Widget has WidgetType (*:1)
-Widget references Entity (*:1)
-Widget references Field (*:1)
-Widget references Layer (*:1)
-Widget targets Widget (*:*)
+Dashboard has Section.
+  Each Section belongs to at most one Dashboard.
+Section has Title.
+  Each Section has at most one Title.
+Section has ColumnCount.
+  Each Section has at most one ColumnCount.
+Section has Position.
+  Each Section has at most one Position.
+Section has Widget.
+  Each Widget belongs to at most one Section.
+Widget has Position.
+  Each Widget has at most one Position.
+Widget has WidgetType.
+  Each Widget has at most one WidgetType.
+Widget references Entity.
+  Each Widget references at most one Entity.
+Widget references Field.
+  Each Widget references at most one Field.
+Widget references Layer.
+  Each Widget references at most one Layer.
+Widget targets Widget.
+  Each Widget targets each Widget at most once.

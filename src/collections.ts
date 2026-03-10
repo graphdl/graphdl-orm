@@ -28,6 +28,12 @@ export const COLLECTION_TABLE_MAP: Record<string, string> = {
   'functions': 'functions',
   'streams': 'streams',
 
+  // AI agent entities
+  'models': 'models',
+  'agent-definitions': 'agent_definitions',
+  'agents': 'agents',
+  'completions': 'completions',
+
   // Runtime instances
   'graphs': 'graphs',
   'resources': 'resources',
@@ -44,6 +50,7 @@ export const COLLECTION_SLUGS = Object.keys(COLLECTION_TABLE_MAP)
 export const INSTANCE_COLLECTIONS = new Set([
   'graphs', 'resources', 'resource-roles',
   'state-machines', 'events', 'guard-runs',
+  'agents', 'completions',
 ])
 
 /**
@@ -65,9 +72,13 @@ export const FIELD_MAP: Record<string, Record<string, string>> = {
   transitions: { from: 'from_status_id', to: 'to_status_id', eventType: 'event_type_id', verb: 'verb_id' },
   guards: { transition: 'transition_id', graphSchema: 'graph_schema_id', domain: 'domain_id' },
   event_types: { domain: 'domain_id' },
-  verbs: { status: 'status_id', transition: 'transition_id', graph: 'graph_id', domain: 'domain_id' },
+  verbs: { status: 'status_id', transition: 'transition_id', graph: 'graph_id', agentDefinition: 'agent_definition_id', domain: 'domain_id' },
   functions: { callbackUrl: 'callback_url', httpMethod: 'http_method', verb: 'verb_id', domain: 'domain_id' },
   streams: { domain: 'domain_id' },
+  models: {},
+  agent_definitions: { model: 'model_id', domain: 'domain_id' },
+  agents: { agentDefinition: 'agent_definition_id', resource: 'resource_id', domain: 'domain_id' },
+  completions: { agent: 'agent_id', inputText: 'input_text', outputText: 'output_text', occurredAt: 'occurred_at', domain: 'domain_id' },
   graphs: { graphSchema: 'graph_schema_id', domain: 'domain_id', isDone: 'is_done' },
   resources: { noun: 'noun_id', domain: 'domain_id' },
   resource_roles: { graph: 'graph_id', resource: 'resource_id', role: 'role_id', domain: 'domain_id' },
@@ -102,4 +113,7 @@ export const FK_TARGET_TABLE: Record<string, string> = {
   resource_id: 'resources',
   state_machine_id: 'state_machines',
   current_status_id: 'statuses',
+  model_id: 'models',
+  agent_definition_id: 'agent_definitions',
+  agent_id: 'agents',
 }
