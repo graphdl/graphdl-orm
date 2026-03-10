@@ -74,7 +74,7 @@ export const INSTANCE_DDL: string[] = [
 
   `CREATE INDEX IF NOT EXISTS idx_events_state_machine ON events(state_machine_id)`,
   `CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type_id)`,
-  `CREATE INDEX IF NOT EXISTS idx_events_domain ON events(domain_id)`,
+  // idx_events_domain created in do.ts migrations (after ALTER TABLE adds domain_id)
 
   `CREATE TABLE IF NOT EXISTS guard_runs (
     id TEXT PRIMARY KEY,
