@@ -178,7 +178,7 @@ export class GraphDLDB extends DurableObject {
     // Migrations: add columns that didn't exist in earlier DDL versions
     const migrations = [
       'ALTER TABLE functions ADD COLUMN headers TEXT',
-      'ALTER TABLE domains ADD COLUMN app_id TEXT REFERENCES apps(id)',
+      'ALTER TABLE domains ADD COLUMN app_id TEXT',
     ]
     for (const migration of migrations) {
       try { this.sql.exec(migration) } catch { /* column already exists */ }
