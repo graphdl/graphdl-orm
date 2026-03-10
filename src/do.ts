@@ -447,9 +447,49 @@ export class GraphDLDB extends DurableObject {
   }
 
   /**
-   * Delete a record by ID.
+   * Cascade-delete all children of a domain (no lock — caller must hold write lock).
    */
-  async deleteFromCollection(collectionSlug: string, id: string): Promise<{ deleted: boolean }> {
+  private cascadeDeleteDomain(domainId: string): number {
+    let cascaded = 0
+    // Delete domain-scoped children in leaf-to-root order
+    const domainScopedTables = [
+      'guard_runs', 'events', 'state_machines', 'resource_roles', 'resources', 'graphs',
+      'completions', 'agents', 'agent_definitions',
+      'functions', 'streams', 'verbs', 'guards', 'transitions', 'statuses', 'event_types', 'state_machine_definitions',
+      'constraint_spans', 'constraints', 'roles', 'readings', 'graph_schemas', 'nouns',
+    ]
+    for (const child of domainScopedTables) {
+      try {
+        // Tables without direct domain_id — delete via parent FK chain
+        if (child === 'constraint_spans') {
+          this.sql.exec(
+            `DELETE FROM constraint_spans WHERE constraint_id IN (SELECT id FROM constraints WHERE domain_id = ?)`, domainId
+          )
+        } else if (child === 'roles') {
+          this.sql.exec(
+            `DELETE FROM roles WHERE reading_id IN (SELECT id FROM readings WHERE domain_id = ?)`, domainId
+          )
+        } else if (child === 'transitions') {
+          this.sql.exec(
+            `DELETE FROM transitions WHERE status_from_id IN (SELECT id FROM statuses WHERE state_machine_definition_id IN (SELECT id FROM state_machine_definitions WHERE domain_id = ?))`, domainId
+          )
+        } else if (child === 'statuses') {
+          this.sql.exec(
+            `DELETE FROM statuses WHERE state_machine_definition_id IN (SELECT id FROM state_machine_definitions WHERE domain_id = ?)`, domainId
+          )
+        } else {
+          this.sql.exec(`DELETE FROM ${child} WHERE domain_id = ?`, domainId)
+        }
+        cascaded++
+      } catch { /* table may not exist yet */ }
+    }
+    return cascaded
+  }
+
+  /**
+   * Delete a record by ID. For domains and apps, cascade-deletes all children.
+   */
+  async deleteFromCollection(collectionSlug: string, id: string): Promise<{ deleted: boolean; cascaded?: number }> {
     return this.withWriteLock(async () => {
       const table = this.resolveTable(collectionSlug)
 
@@ -457,10 +497,25 @@ export class GraphDLDB extends DurableObject {
       const existing = this.sql.exec(`SELECT id FROM ${table} WHERE id = ?`, id).toArray()
       if (existing.length === 0) return { deleted: false }
 
+      let cascaded = 0
+
+      if (table === 'domains') {
+        cascaded = this.cascadeDeleteDomain(id)
+      } else if (table === 'apps') {
+        // Cascade-delete all domains belonging to this app
+        const appDomains = this.sql.exec(`SELECT id FROM domains WHERE app_id = ?`, id).toArray()
+        for (const domain of appDomains) {
+          cascaded += this.cascadeDeleteDomain(domain.id as string)
+          this.sql.exec(`DELETE FROM domains WHERE id = ?`, domain.id as string)
+          this.logCdcEvent('delete', 'domains', domain.id as string)
+          cascaded++
+        }
+      }
+
       this.sql.exec(`DELETE FROM ${table} WHERE id = ?`, id)
       this.logCdcEvent('delete', table, id)
 
-      return { deleted: true }
+      return { deleted: true, ...(cascaded > 0 && { cascaded }) }
     })
   }
 
