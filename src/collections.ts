@@ -73,7 +73,7 @@ export const FIELD_MAP: Record<string, Record<string, string>> = {
   guards: { transition: 'transition_id', graphSchema: 'graph_schema_id', domain: 'domain_id' },
   event_types: { domain: 'domain_id' },
   verbs: { status: 'status_id', transition: 'transition_id', graph: 'graph_id', agentDefinition: 'agent_definition_id', domain: 'domain_id' },
-  functions: { callbackUrl: 'callback_url', httpMethod: 'http_method', verb: 'verb_id', domain: 'domain_id' },
+  functions: { callbackUrl: 'callback_url', httpMethod: 'http_method', headers: 'headers', verb: 'verb_id', domain: 'domain_id' },
   streams: { domain: 'domain_id' },
   models: {},
   agent_definitions: { model: 'model_id', domain: 'domain_id' },
