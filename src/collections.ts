@@ -85,7 +85,7 @@ export const FIELD_MAP: Record<string, Record<string, string>> = {
   agents: { agentDefinition: 'agent_definition_id', resource: 'resource_id', domain: 'domain_id' },
   completions: { agent: 'agent_id', inputText: 'input_text', outputText: 'output_text', occurredAt: 'occurred_at', domain: 'domain_id' },
   graphs: { graphSchema: 'graph_schema_id', domain: 'domain_id', isDone: 'is_done' },
-  resources: { noun: 'noun_id', domain: 'domain_id' },
+  resources: { noun: 'noun_id', domain: 'domain_id', createdBy: 'created_by' },
   resource_roles: { graph: 'graph_id', resource: 'resource_id', role: 'role_id', domain: 'domain_id' },
   state_machines: { stateMachineDefinition: 'state_machine_definition_id', stateMachineType: 'state_machine_definition_id', currentStatus: 'current_status_id', stateMachineStatus: 'current_status_id', resource: 'resource_id', domain: 'domain_id' },
   events: { eventType: 'event_type_id', stateMachine: 'state_machine_id', graph: 'graph_id', occurredAt: 'occurred_at', domain: 'domain_id' },
