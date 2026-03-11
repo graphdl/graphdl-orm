@@ -189,6 +189,9 @@ export class GraphDLDB extends DurableObject {
       'CREATE INDEX IF NOT EXISTS idx_statuses_domain ON statuses(domain_id)',
       'ALTER TABLE transitions ADD COLUMN domain_id TEXT',
       'CREATE INDEX IF NOT EXISTS idx_transitions_domain ON transitions(domain_id)',
+      // resources: add created_by for per-user scoping
+      'ALTER TABLE resources ADD COLUMN created_by TEXT',
+      'CREATE INDEX IF NOT EXISTS idx_resources_created_by ON resources(created_by)',
     ]
     for (const migration of migrations) {
       try { this.sql.exec(migration) } catch { /* column/index already exists */ }

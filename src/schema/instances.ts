@@ -22,6 +22,7 @@ export const INSTANCE_DDL: string[] = [
     reference TEXT,
     value TEXT,
     domain_id TEXT REFERENCES domains(id),
+    created_by TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     version INTEGER NOT NULL DEFAULT 1
