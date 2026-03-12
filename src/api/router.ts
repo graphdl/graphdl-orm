@@ -4,6 +4,7 @@ import { parseQueryOptions } from './collections'
 import { COLLECTION_TABLE_MAP, FIELD_MAP, FK_TARGET_TABLE, REVERSE_FK_MAP } from '../collections'
 import { handleSeed } from './seed'
 import { handleGenerate } from './generate'
+import { createWithHook, refreshNouns, type HookContext, COLLECTION_HOOKS } from '../hooks'
 
 /**
  * Get the GraphDL DO stub. One DO per system (for now, single instance).
@@ -165,8 +166,23 @@ router.post('/api/:collection', async (request, env: Env) => {
 
   const body = await request.json() as Record<string, any>
   const db = getDB(env) as any
-  const doc = await db.createInCollection(collection, body)
 
+  // If a hook exists for this collection, use createWithHook
+  if (COLLECTION_HOOKS[collection]) {
+    const domainId = body.domain || ''
+    const allNouns = domainId ? await refreshNouns(db, domainId) : []
+    const context: HookContext = { domainId, allNouns }
+    const { doc, hookResult } = await createWithHook(db, collection, body, context)
+    return json({
+      doc,
+      message: 'Created successfully',
+      ...(Object.keys(hookResult.created).length > 0 && { created: hookResult.created }),
+      ...(hookResult.warnings.length > 0 && { warnings: hookResult.warnings }),
+    }, { status: 201 })
+  }
+
+  // No hook — standard create
+  const doc = await db.createInCollection(collection, body)
   return json({ doc, message: 'Created successfully' }, { status: 201 })
 })
 
