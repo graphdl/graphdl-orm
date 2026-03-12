@@ -93,3 +93,6 @@ COLLECTION_HOOKS['readings'] = readingAfterCreate
 
 import { smDefinitionAfterCreate } from './state-machines'
 COLLECTION_HOOKS['state-machine-definitions'] = smDefinitionAfterCreate
+
+import { constraintAfterCreate } from './constraints'
+COLLECTION_HOOKS['constraints'] = constraintAfterCreate
