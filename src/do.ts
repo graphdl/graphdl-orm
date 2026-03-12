@@ -192,6 +192,8 @@ export class GraphDLDB extends DurableObject {
       // resources: add created_by for per-user scoping
       'ALTER TABLE resources ADD COLUMN created_by TEXT',
       'CREATE INDEX IF NOT EXISTS idx_resources_created_by ON resources(created_by)',
+      // constraints: add text column for source text round-tripping
+      'ALTER TABLE constraints ADD COLUMN text TEXT',
     ]
     for (const migration of migrations) {
       try { this.sql.exec(migration) } catch { /* column/index already exists */ }
@@ -220,6 +222,30 @@ export class GraphDLDB extends DurableObject {
         this.sql.exec(`ALTER TABLE org_memberships_new RENAME TO org_memberships`)
         this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_org_memberships_email ON org_memberships(user_email)`)
         this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_org_memberships_org ON org_memberships(organization_id)`)
+      }
+    } catch { /* migration already applied or table doesn't exist yet */ }
+
+    // Migration: widen constraints kind CHECK to include 'RC' for ring constraints
+    try {
+      const constraintsDdl = this.sql.exec(
+        `SELECT sql FROM sqlite_master WHERE name = 'constraints'`
+      ).toArray()
+      const sql = constraintsDdl[0]?.sql as string || ''
+      if (sql && !sql.includes("'RC'")) {
+        this.sql.exec(`CREATE TABLE IF NOT EXISTS constraints_new (
+          id TEXT PRIMARY KEY,
+          kind TEXT NOT NULL CHECK (kind IN ('UC', 'MC', 'SS', 'XC', 'EQ', 'OR', 'XO', 'RC')),
+          modality TEXT NOT NULL DEFAULT 'Alethic' CHECK (modality IN ('Alethic', 'Deontic')),
+          text TEXT,
+          domain_id TEXT REFERENCES domains(id),
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+          version INTEGER NOT NULL DEFAULT 1
+        )`)
+        this.sql.exec(`INSERT INTO constraints_new SELECT id, kind, modality, text, domain_id, created_at, updated_at, version FROM constraints`)
+        this.sql.exec(`DROP TABLE constraints`)
+        this.sql.exec(`ALTER TABLE constraints_new RENAME TO constraints`)
+        this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_constraints_domain ON constraints(domain_id)`)
       }
     } catch { /* migration already applied or table doesn't exist yet */ }
 
