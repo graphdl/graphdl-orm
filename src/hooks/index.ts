@@ -87,3 +87,9 @@ export async function ensure(
 
 import { nounAfterCreate } from './nouns'
 COLLECTION_HOOKS['nouns'] = nounAfterCreate
+
+import { readingAfterCreate } from './readings'
+COLLECTION_HOOKS['readings'] = readingAfterCreate
+
+import { smDefinitionAfterCreate } from './state-machines'
+COLLECTION_HOOKS['state-machine-definitions'] = smDefinitionAfterCreate
