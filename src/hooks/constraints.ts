@@ -21,7 +21,7 @@ export async function constraintAfterCreate(
   const result: HookResult = { created: {}, warnings: [] }
   const domainId = context.domainId || doc.domain
 
-  let parsedConstraints: Array<{ kind: string; modality: string; deonticOperator?: string }>
+  let parsedConstraints: Array<{ kind: string; modality: string; deonticOperator?: string; roles?: number[] }>
   let constraintNouns: string[] = []
 
   if (doc.text) {
@@ -34,10 +34,10 @@ export async function constraintAfterCreate(
     parsedConstraints = parsed
     constraintNouns = parsed[0]?.nouns || []
   } else if (doc.multiplicity) {
-    // Shorthand notation path
+    // Shorthand notation path — preserve roles from parseMultiplicity
     const defs = parseMultiplicity(doc.multiplicity)
     if (!defs.length) return EMPTY_RESULT
-    parsedConstraints = defs.map(d => ({ kind: d.kind, modality: d.modality }))
+    parsedConstraints = defs.map(d => ({ kind: d.kind, modality: d.modality, roles: d.roles }))
     // Extract nouns from the reading text if provided
     if (doc.reading) {
       const tokenized = tokenizeReading(doc.reading, context.allNouns)
@@ -65,7 +65,7 @@ export async function constraintAfterCreate(
     // Match by noun set: find readings containing the same nouns
     const allReadings = await db.findInCollection('readings', {
       domain_id: { equals: domainId },
-    }, { limit: 0 })
+    }, { limit: 10000 })
 
     for (const reading of allReadings.docs) {
       const tokenized = tokenizeReading(
@@ -100,7 +100,7 @@ export async function constraintAfterCreate(
   // Fetch roles for the host reading
   const rolesResult = await db.findInCollection('roles', {
     reading_id: { equals: hostReading.id },
-  }, { limit: 0 })
+  }, { limit: 10000 })
   hostRoles = rolesResult.docs.sort((a: any, b: any) => a.roleIndex - b.roleIndex)
 
   if (hostRoles.length === 0) {
@@ -109,16 +109,37 @@ export async function constraintAfterCreate(
   }
 
   // Create constraint records and spans for each parsed constraint
-  for (const parsed of parsedConstraints) {
-    // Update the already-created constraint doc with parsed kind/modality
-    await db.updateInCollection('constraints', doc.id, {
-      kind: parsed.kind,
-      modality: parsed.modality,
-    })
+  for (let i = 0; i < parsedConstraints.length; i++) {
+    const parsed = parsedConstraints[i]
+    let constraintId: string
+
+    if (i === 0) {
+      // Update the already-created constraint doc with parsed kind/modality
+      await db.updateInCollection('constraints', doc.id, {
+        kind: parsed.kind,
+        modality: parsed.modality,
+      })
+      constraintId = doc.id
+    } else {
+      // "Exactly one" and similar produce multiple constraints — create new records
+      const newConstraint = await db.createInCollection('constraints', {
+        kind: parsed.kind,
+        modality: parsed.modality,
+        text: doc.text,
+        domain: domainId,
+      })
+      constraintId = newConstraint.id
+      result.created['constraints'] = [...(result.created['constraints'] || []), newConstraint]
+    }
 
     // Determine which roles to span
     let roleIds: string[]
-    if (parsed.kind === 'RC') {
+    if (parsed.roles && parsed.roles.length > 0) {
+      // Shorthand path: use explicit role indices from parseMultiplicity
+      roleIds = parsed.roles
+        .map(idx => idx === -1 ? hostRoles[hostRoles.length - 1]?.id : hostRoles[idx]?.id)
+        .filter((id): id is string => !!id)
+    } else if (parsed.kind === 'RC') {
       // Ring constraint spans the first role (self-referential)
       roleIds = hostRoles.length > 0 ? [hostRoles[0].id] : []
     } else if (constraintNouns.length === 2 && hostRoles.length >= 2) {
@@ -131,7 +152,7 @@ export async function constraintAfterCreate(
 
     for (const roleId of roleIds) {
       const span = await db.createInCollection('constraint-spans', {
-        constraint: doc.id,
+        constraint: constraintId,
         role: roleId,
       })
       result.created['constraint-spans'] = [

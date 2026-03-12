@@ -37,8 +37,8 @@ export function mergeResults(a: HookResult, b: HookResult): HookResult {
   return { created, warnings: [...a.warnings, ...b.warnings] }
 }
 
-/** Empty result constant. */
-export const EMPTY_RESULT: HookResult = { created: {}, warnings: [] }
+/** Empty result constant (frozen to prevent accidental mutation). */
+export const EMPTY_RESULT: HookResult = Object.freeze({ created: {}, warnings: [] }) as HookResult
 
 /**
  * Create a record and run its afterCreate hook if one exists.
@@ -64,7 +64,7 @@ export async function createWithHook(
  * Called before hook execution to ensure nouns created by prior hooks are visible.
  */
 export async function refreshNouns(db: any, domainId: string): Promise<Array<{ name: string; id: string }>> {
-  const result = await db.findInCollection('nouns', { domain_id: { equals: domainId } }, { limit: 0 })
+  const result = await db.findInCollection('nouns', { domain_id: { equals: domainId } }, { limit: 10000 })
   return result.docs.map((n: any) => ({ name: n.name, id: n.id }))
 }
 
