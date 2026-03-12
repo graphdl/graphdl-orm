@@ -84,3 +84,6 @@ export async function ensure(
   const doc = await db.createInCollection(collection, data)
   return { doc, created: true }
 }
+
+import { nounAfterCreate } from './nouns'
+COLLECTION_HOOKS['nouns'] = nounAfterCreate
