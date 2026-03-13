@@ -6,6 +6,7 @@ import { handleSeed } from './seed'
 import { handleGenerate } from './generate'
 import { handleParse } from './parse'
 import { handleVerify } from './verify'
+import { handleEvaluate } from './evaluate'
 import { createWithHook, refreshNouns, type HookContext, COLLECTION_HOOKS } from '../hooks'
 
 /**
@@ -112,6 +113,7 @@ router.get('/health', () => json({ status: 'ok', version: '0.1.0' }))
 
 // ── Generate ────────────────────────────────────────────────────────
 router.post('/api/generate', handleGenerate)
+router.post('/api/evaluate', handleEvaluate)
 
 // ── Collection CRUD ──────────────────────────────────────────────────
 
