@@ -43,12 +43,9 @@ Guard Run(.id) is an entity type.
 
 Function(.id) is an entity type.
 
-HTTP Operation(.code) is an entity type.
-  The possible values of HTTP Operation are 'POST', 'GET', 'PUT', 'PATCH', 'DELETE'.
-
 ReadingIsUsedByVerb objectifies "Reading is used by Verb".
 
-API objectifies "ReadingIsUsedByVerb is by HTTP Operation".
+API objectifies "ReadingIsUsedByVerb is by HTTP Method".
 
 Language(.code) is an entity type.
 
@@ -86,6 +83,12 @@ Header is a value type.
 Timestamp is a value type.
 Argument Length is a value type.
 
+HTTP Method is a value type.
+  The possible values of HTTP Method are 'GET', 'POST', 'PUT', 'PATCH', 'DELETE'.
+
+FunctionType is a value type.
+  The possible values of FunctionType are 'httpCallback', 'query', 'agentInvocation', 'transform'.
+
 ## Fact Types
 
 ### Noun
@@ -119,6 +122,8 @@ Verb is performed during Transition (Mealy semantics).
 Verb is performed in Status (Moore semantics).
 
 ### Function
+Function has FunctionType.
+  Each Function has at most one FunctionType.
 Function has callback URI.
   Each Function has at most one callback URI.
 Function has HTTP Method.
@@ -189,11 +194,11 @@ Guard references Graph Schema.
 Guard Run is run by Guard.
 Guard Run references Graph.
 
-### API (objectification of "ReadingIsUsedByVerb is by HTTP Operation")
+### API (objectification of "ReadingIsUsedByVerb is by HTTP Method")
 API has endpoint URI.
 
 ### ReadingIsUsedByVerb (objectification of "Reading is used by Verb")
-ReadingIsUsedByVerb is by HTTP Operation.
+ReadingIsUsedByVerb is by HTTP Method.
 
 ### UI Element
 Noun is displayed by UI Element.
