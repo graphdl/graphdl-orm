@@ -2,7 +2,7 @@ import { json, error } from 'itty-router'
 import type { Env } from '../types'
 import type { ExtractedClaims } from '../claims/ingest'
 import { tokenizeReading } from '../claims/tokenize'
-import { parseConstraintText } from '../hooks/parse-constraint'
+import { parseConstraintText, parseSetComparisonBlock, isInformationalPattern } from '../hooks/parse-constraint'
 
 interface ParseResult extends ExtractedClaims {
   warnings: string[]
@@ -41,6 +41,29 @@ export function parseFORML2(
   for (const block of blocks) {
     const lines = block.split('\n')
     const factLine = lines[0].trim().replace(/\.$/, '')
+
+    // Check for set-comparison block (XO/XC/OR/SS — multi-line, standalone)
+    const scBlock = parseSetComparisonBlock(block)
+    if (scBlock) {
+      for (const name of scBlock.nouns) {
+        if (!nounMap.has(name)) nounMap.set(name, { name, objectType: 'entity' })
+      }
+      constraints.push({
+        kind: scBlock.kind,
+        modality: scBlock.modality,
+        reading: '',
+        roles: [],
+        text: block.trim(),
+        clauses: scBlock.clauses,
+        entity: scBlock.entity,
+      })
+      continue
+    }
+
+    // Skip informational patterns (not readings or constraints)
+    if (isInformationalPattern(factLine)) {
+      continue
+    }
 
     // Check for subtype declaration
     const subtypeMatch = factLine.match(/^([A-Z][a-zA-Z0-9]*)\s+is a subtype of\s+([A-Z][a-zA-Z0-9]*)/i)
@@ -124,7 +147,7 @@ export function parseFORML2(
         }
 
         constraints.push({
-          kind: pc.kind as 'UC' | 'MC' | 'RC',
+          kind: pc.kind,
           modality: pc.modality,
           reading: readingText,
           roles,
@@ -151,7 +174,7 @@ export function parseFORML2(
 
         if (roles.length > 0) {
           constraints.push({
-            kind: pc.kind as 'UC' | 'MC' | 'RC',
+            kind: pc.kind,
             modality: pc.modality,
             reading: reading.text,
             roles,

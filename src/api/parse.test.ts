@@ -177,4 +177,118 @@ Customer submits SupportRequest.`
     // Order and Invoice never appear as a reading → warning
     expect(result.warnings.some(w => w.includes('unresolved'))).toBe(true)
   })
+
+  it('skips informational patterns without warnings', () => {
+    const text = `Customer is an entity type.
+
+Name is a value type.
+
+Customer has Name.
+  Each Customer has at most one Name.
+
+Reference Mode: .Name`
+
+    const result = parseFORML2(text, [])
+
+    expect(result.readings).toHaveLength(1)
+    expect(result.readings[0].text).toBe('Customer has Name')
+    // Informational lines should not produce warnings
+    expect(result.warnings).toEqual([])
+  })
+
+  it('parses XO set-comparison blocks as standalone constraints', () => {
+    const text = `Message has Lead.
+  Each Message has at most one Lead.
+
+For each Message, exactly one of the following holds:
+  that Message has MatchStatus 'Pending';
+  that Message has MatchStatus 'Confirmed';
+  that Message has MatchStatus 'Rejected'.`
+
+    const result = parseFORML2(text, [])
+
+    // Reading from the first block
+    expect(result.readings).toHaveLength(1)
+    expect(result.readings[0].text).toBe('Message has Lead')
+
+    // UC from the reading + XO from the set-comparison block
+    const xo = result.constraints.find(c => c.kind === 'XO')
+    expect(xo).toBeDefined()
+    expect(xo!.reading).toBe('')
+    expect(xo!.roles).toEqual([])
+    expect(xo!.clauses).toHaveLength(3)
+    expect(xo!.entity).toBe('Message')
+  })
+
+  it('parses SS subset constraints', () => {
+    const text = `If some Message has Lead then that Message has SalesRep.`
+
+    const result = parseFORML2(text, [])
+
+    const ss = result.constraints.find(c => c.kind === 'SS')
+    expect(ss).toBeDefined()
+    expect(ss!.kind).toBe('SS')
+    // SS nouns go into overall noun list, not on the constraint
+    expect(result.nouns.find(n => n.name === 'Message')).toBeDefined()
+    expect(result.nouns.find(n => n.name === 'Lead')).toBeDefined()
+    expect(result.nouns.find(n => n.name === 'SalesRep')).toBeDefined()
+  })
+
+  it('handles "Each X has some Y" as MC', () => {
+    const text = `Message has Lead.
+  Each Message has some Lead.`
+
+    const result = parseFORML2(text, [])
+
+    const mc = result.constraints.find(c => c.kind === 'MC')
+    expect(mc).toBeDefined()
+    expect(mc!.reading).toBe('Message has Lead')
+  })
+
+  it('handles "if and only if" as EQ', () => {
+    const text = `Message has Lead.
+  Message is matched if and only if Message has Lead.`
+
+    const result = parseFORML2(text, [])
+
+    const eq = result.constraints.find(c => c.kind === 'EQ')
+    expect(eq).toBeDefined()
+    expect(eq!.reading).toBe('Message has Lead')
+  })
+
+  it('parses a full domain with mixed readings and set-comparison blocks', () => {
+    const text = `Message has Lead.
+  Each Message has at most one Lead.
+
+Lead is assigned to SalesRep.
+  Each Lead is assigned to at most one SalesRep.
+
+For each Message, exactly one of the following holds:
+  that Message has MatchStatus 'Pending';
+  that Message has MatchStatus 'Confirmed';
+  that Message has MatchStatus 'Rejected'.
+
+If some Message has Lead then that Message has SalesRep.`
+
+    const result = parseFORML2(text, [])
+
+    // Two readings
+    expect(result.readings).toHaveLength(2)
+
+    // 2 UCs from readings + 1 XO + 1 SS
+    const uc = result.constraints.filter(c => c.kind === 'UC')
+    const xo = result.constraints.filter(c => c.kind === 'XO')
+    const ss = result.constraints.filter(c => c.kind === 'SS')
+    expect(uc).toHaveLength(2)
+    expect(xo).toHaveLength(1)
+    expect(ss).toHaveLength(1)
+
+    // All nouns accumulated
+    expect(result.nouns.find(n => n.name === 'Message')).toBeDefined()
+    expect(result.nouns.find(n => n.name === 'Lead')).toBeDefined()
+    expect(result.nouns.find(n => n.name === 'SalesRep')).toBeDefined()
+    expect(result.nouns.find(n => n.name === 'MatchStatus')).toBeDefined()
+
+    expect(result.warnings).toEqual([])
+  })
 })
