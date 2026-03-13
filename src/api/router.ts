@@ -4,6 +4,8 @@ import { parseQueryOptions } from './collections'
 import { COLLECTION_TABLE_MAP, FIELD_MAP, FK_TARGET_TABLE, REVERSE_FK_MAP } from '../collections'
 import { handleSeed } from './seed'
 import { handleGenerate } from './generate'
+import { handleParse } from './parse'
+import { handleVerify } from './verify'
 import { createWithHook, refreshNouns, type HookContext, COLLECTION_HOOKS } from '../hooks'
 
 /**
@@ -218,6 +220,10 @@ router.delete('/api/:collection/:id', async (request, env: Env) => {
 // ── Seed / Claims ───────────────────────────────────────────────────
 router.all('/seed', handleSeed)
 router.all('/claims', handleSeed) // Alias used by apis worker
+
+// ── Parse / Verify ──────────────────────────────────────────────────
+router.all('/parse', handleParse)
+router.all('/verify', handleVerify)
 
 // ── 404 fallback ─────────────────────────────────────────────────────
 router.all('*', () => error(404, { errors: [{ message: 'Not Found' }] }))
