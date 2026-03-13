@@ -39,15 +39,22 @@ class DomainModel {
   async constraints(): Promise<ConstraintDef[]>
   async constraintsFor(factTypes: FactTypeDef[]): Promise<ConstraintDef[]>
 
+  // ── Constraint spans (reconstructed from flat DB rows) ──────
+  // Groups one-row-per-role rows into multi-role constraint spans
+  async constraintSpans(): Promise<Map<string, SpanDef[]>>
+
   // ── State machines ──────────────────────────────────────────
   async stateMachines(): Promise<Map<string, StateMachineDef>>
 
+  // ── Readings (raw text, for generators that parse them) ─────
+  async readings(): Promise<ReadingDef[]>
+
   // ── Rendering ───────────────────────────────────────────────
-  // Apply a renderer across the entire model
+  // Apply a renderer across the entire model — convenience walker
   async render<T, Out>(generator: Generator<T, Out>): Promise<Out>
 
   // ── Invalidation ────────────────────────────────────────────
-  // Scoped cache invalidation; called by hooks after writes
+  // Scoped cache invalidation; called automatically by DO write methods
   invalidate(collection?: string): void
 }
 ```
@@ -62,11 +69,38 @@ Shared types used by all generators. Based on the existing `ConstraintIR` types 
 interface NounDef {
   id: string
   name: string
+  plural?: string
+  description?: string
   objectType: 'entity' | 'value'
-  enumValues?: string[]
-  valueType?: string
-  superType?: string
   domainId: string
+
+  // Value type properties
+  valueType?: string            // 'string' | 'number' | 'boolean'
+  format?: string               // 'email' | 'date' | 'uri' | etc.
+  pattern?: string              // regex pattern
+  enumValues?: string[]         // parsed from JSON string in DB
+
+  // Validation
+  minimum?: number
+  exclusiveMinimum?: number
+  maximum?: number
+  exclusiveMaximum?: number
+  minLength?: number
+  maxLength?: number
+  multipleOf?: number
+
+  // Entity type properties
+  superType?: string            // supertype noun name
+  referenceScheme?: string[]    // noun names composing the reference scheme
+
+  // Access control
+  permissions?: {
+    list?: boolean
+    read?: boolean
+    create?: boolean
+    update?: boolean
+    delete?: boolean
+  }
 }
 
 interface FactTypeDef {
@@ -92,6 +126,7 @@ interface ConstraintDef {
   spans: SpanDef[]
   entity?: string
   clauses?: string[]
+  setComparisonArgumentLength?: number  // for set comparison constraints (XC, EQ, OR, XO)
 }
 
 interface SpanDef {
@@ -103,15 +138,40 @@ interface SpanDef {
 interface StateMachineDef {
   id: string
   nounName: string
-  statuses: string[]
+  nounDef: NounDef              // resolved noun reference
+  statuses: StatusDef[]
   transitions: TransitionDef[]
+}
+
+interface StatusDef {
+  id: string
+  name: string
 }
 
 interface TransitionDef {
   from: string
   to: string
-  event: string
+  event: string                 // event type name
+  eventTypeId: string
+  verb?: VerbDef                // optional verb executed during transition
   guard?: { graphSchemaId: string; constraintIds: string[] }
+}
+
+interface VerbDef {
+  id: string
+  name: string
+  func?: {
+    callbackUrl?: string
+    httpMethod?: string
+    functionType?: string
+  }
+}
+
+interface ReadingDef {
+  id: string
+  text: string
+  graphSchemaId: string
+  roles: RoleDef[]              // resolved
 }
 ```
 
@@ -124,15 +184,17 @@ Each accessor checks `this.cache.get(key)` before querying SQLite. Cache keys ar
 | `nouns` | `nouns()` | nouns |
 | `factTypes` | `factTypes()` | graph-schemas, readings, roles |
 | `constraints` | `constraints()` | constraints, constraint-spans |
-| `stateMachines` | `stateMachines()` | state-machine-definitions, statuses, transitions, guards |
+| `constraintSpans` | `constraintSpans()` | constraints, constraint-spans |
+| `stateMachines` | `stateMachines()` | state-machine-definitions, statuses, transitions, guards, event-types |
+| `readings` | `readings()` | readings |
 
-`invalidate(collection)` clears the affected keys using a dependency map. `invalidate()` clears everything.
+`invalidate(collection)` clears affected keys using the `INVALIDATION_MAP` (see §4). `invalidate()` clears everything.
 
 ### Lifecycle
 
-- Instantiated in `GraphDLDB.ensureModel(domainId)` — one DomainModel per active domain
+- Instantiated in `GraphDLDB.getModel(domainId)` — one DomainModel per active domain
 - Stored in a `Map<string, DomainModel>` on the DO instance
-- Invalidated by hooks after writes (same domain only)
+- Auto-invalidated by DO write methods (`createInCollection`, `updateInCollection`, `deleteInCollection`)
 - Garbage collected when no references remain (DOs are long-lived but not permanent)
 
 ---
@@ -228,79 +290,146 @@ async render<T, Out>(gen: Generator<T, Out>): Promise<Out> {
 
 ## 3. Generator Rewrites
 
-Each existing generator becomes a `Generator<T, Out>` implementation. The query logic disappears — it's handled by the model.
+Generators come in two styles: **walker generators** that fit the `render()` walker, and **direct generators** that use DomainModel accessors for complex multi-pass logic. Both get their data from DomainModel — neither queries the DB directly.
 
-### OpenAPI Generator
+### OpenAPI Generator (direct)
 
-Currently: queries nouns, readings, roles, constraints, constraint-spans (5 collections). Builds schemas by iterating entity nouns, grouping facts, inferring property types.
+Currently: queries nouns, readings, roles, constraints, constraint-spans (5 collections). Three-pass processing: binary facts → properties, compound UCs → array types / association schemas, unary facts → booleans.
 
-Rewrite:
+This three-tier constraint-span-driven logic doesn't fit the uniform walker. The OpenAPI generator uses DomainModel accessors directly:
+
 ```typescript
-const openApiGenerator: Generator<OpenAPIPart, OpenAPIOutput> = {
-  noun: {
-    entity(noun, factTypes, constraints) {
-      // Binary fact types → properties
-      // Unary fact types → boolean properties
-      // Constraints → required fields, enums
-      return { type: 'schema', name: noun.name, schema: buildSchema(noun, factTypes, constraints) }
-    },
-    value(noun) {
-      return { type: 'value', name: noun.name, schema: buildValueSchema(noun) }
-    }
-  },
-  combine(parts) {
-    const schemas = Object.fromEntries(parts.filter(p => p.type === 'schema').map(p => [p.name, p.schema]))
-    return { openapi: '3.0.0', components: { schemas } }
-  }
+async function generateOpenAPI(model: DomainModel): Promise<OpenAPIOutput> {
+  const nouns = await model.nouns()
+  const factTypes = await model.factTypes()
+  const constraints = await model.constraints()
+  const constraintSpans = await model.constraintSpans()
+
+  // Three-pass processing using existing fact-processors.ts + schema-builder.ts:
+  // 1. processBinarySchemas — single-role UCs → typed properties
+  // 2. processArraySchemas — compound UCs → array properties / association schemas
+  // 3. processUnarySchemas — single-role facts → boolean properties
+  // rmap.ts provides predicate parsing, property naming, noun tokenization
+
+  return { openapi: '3.0.0', components: { schemas } }
 }
 ```
 
-### SQLite Generator
+The existing pure utility modules remain:
+- **`fact-processors.ts`** (259 lines) — `processBinarySchemas`, `processArraySchemas`, `processUnarySchemas`. Refactored to accept DomainModel types instead of raw DB rows.
+- **`schema-builder.ts`** (312 lines) — `createProperty`, `ensureTableExists`, `setTableProperty`. Refactored to accept `NounDef` (which now carries all the fields it needs: valueType, format, pattern, enum, min/max, referenceScheme, superType).
+- **`rmap.ts`** (169 lines) — Pure functions (`toPredicate`, `findPredicateObject`, `nameToKey`, `transformPropertyName`). No changes needed — already has zero external dependencies.
 
-Currently: takes OpenAPI output, transforms to DDL. With the model, it can go directly.
+### SQLite Generator (downstream of OpenAPI)
 
-Rewrite: `NounRenderer<DDLStatement>` — each entity noun → CREATE TABLE, binary facts → columns, constraints → SQL constraints.
+Currently: takes OpenAPI output, transforms to DDL. This remains unchanged — SQLite DDL is a pure transform of the OpenAPI schema.
 
-### iLayer Generator
+```typescript
+function generateSQLite(openApiOutput: OpenAPIOutput): SQLiteOutput {
+  // PascalCase schema names → snake_case tables
+  // camelCase properties → snake_case columns
+  // $ref patterns → FK columns + indexes
+  return { ddl, tableMap, fieldMap }
+}
+```
 
-Currently: queries entity nouns, builds list/detail/create/edit layers with field type mapping.
+No DomainModel dependency. Input is OpenAPI output; output is DDL + field maps.
 
-Rewrite: `NounRenderer<LayerDef>` — entity noun + its binary fact types → layer definitions. Unary facts → checkboxes. The rendering function IS the layer definition.
+### iLayer Generator (walker)
 
-### XState Generator
+Currently: queries entity nouns, readings, state machines. Builds list/detail/create/edit layers.
 
-Currently: queries state-machine-definitions, statuses, transitions, guards. Builds XState configs.
+Rewrite: `NounRenderer<LayerDef>` — entity noun + its binary fact types → layer definitions. Unary facts → checkboxes. Uses `noun.permissions` for access control, `noun.plural` for slugs/labels, and reading text to separate field readings (entity→value) from nav readings (entity→entity). Needs state machine data for action buttons, so also uses `stateMachine` renderer.
 
-Rewrite: Uses `stateMachine` renderer — each StateMachineDef → XState config JSON.
+```typescript
+const ilayerGenerator: Generator<LayerPart, LayerOutput> = {
+  noun: {
+    entity(noun, factTypes, constraints) {
+      // Binary FTs where value role is a value type → field definitions
+      // Binary FTs where value role is an entity → nav relationships
+      // Unary FTs → checkboxes
+      // noun.permissions → which layers to generate (list/detail/create/edit)
+      return { type: 'layer', noun, layers: buildLayers(noun, factTypes, constraints) }
+    },
+    value(noun) { return { type: 'skip' } }
+  },
+  stateMachine(sm) {
+    // Transitions → action buttons with event names
+    return { type: 'actions', nounName: sm.nounName, events: extractEvents(sm) }
+  },
+  combine(parts) { /* merge layers + actions by noun name */ }
+}
+```
 
-### Readings Generator
+### XState Generator (direct)
 
-Currently: queries nouns, readings, roles, constraints. Reverse-generates FORML2 text.
+Currently: queries state-machine-definitions, statuses, transitions, guards, event-types, verbs, functions, nouns, roles, graph-schemas, readings. Builds XState configs + agent tool schemas + system prompts.
 
-Rewrite: `NounRenderer<string>` + `FactTypeRenderer<string>` — each noun → declaration line, each fact type → reading line + indented constraints.
+This generator needs broad model access beyond what the walker provides (verbs, functions, expanded role/reading context for system prompts). Uses DomainModel accessors directly:
 
-### Constraint IR Generator
+```typescript
+async function generateXState(model: DomainModel): Promise<XStateOutput> {
+  const stateMachines = await model.stateMachines()  // includes StatusDef[], TransitionDef[] with VerbDef
+  const nouns = await model.nouns()
+  const factTypes = await model.factTypes()
+  const readings = await model.readings()
 
-Currently: queries 11 collections. Already produces the same typed structure as the DomainModel.
+  // Per state machine:
+  //   1. XState config JSON (states, events, initial state)
+  //   2. Agent tool schemas (unique events → tool definitions)
+  //   3. System prompt (noun context + readings for related schemas)
+  return { files }
+}
+```
 
-Rewrite: Nearly a passthrough — the DomainModel already IS the constraint IR. The renderer just serializes it.
+### Readings Generator (walker)
+
+Currently: queries nouns, readings, roles, constraints, state machines. Reverse-generates FORML2 text.
+
+Rewrite: `NounRenderer<string>` + `FactTypeRenderer<string>` — each noun → declaration line, each fact type → reading line + indented constraint annotations.
+
+### Constraint IR Generator (walker)
+
+Currently: queries 11 collections. Produces the same typed structure as DomainModel.
+
+Rewrite: Nearly a passthrough — the DomainModel already IS the constraint IR. The renderer serializes it to the shape expected by the WASM evaluator.
 
 ---
 
-## 4. Hook Integration
+## 4. Cache Invalidation
 
-Hooks continue to fire after creates. The only change: after a hook writes to the DB, it calls `model.invalidate(collection)`.
+Cache invalidation happens automatically inside the DO's write methods — not in hooks. Hooks use a `DurableObjectStub` (not the DO instance), so they cannot access the DomainModel directly.
 
 ```typescript
-// In readingAfterCreate:
-await db.createInCollection('nouns', nounData)
-model.invalidate('nouns')
-
-await db.createInCollection('graph-schemas', schemaData)
-model.invalidate('graph-schemas')
+// In GraphDLDB (do.ts) — write methods auto-invalidate
+async createInCollection(collection: string, data: any): Promise<any> {
+  const result = await this._insertRow(collection, data)
+  // Auto-invalidate any cached model for this domain
+  const domainId = data.domain_id ?? data.domainId
+  if (domainId) this.getModel(domainId).invalidate(collection)
+  return result
+}
 ```
 
-No hook logic changes — only the invalidation call is added.
+The dependency map inside `invalidate(collection)` determines which cache keys to clear:
+
+```typescript
+const INVALIDATION_MAP: Record<string, string[]> = {
+  'nouns':                       ['nouns', 'factTypes', 'constraints'],
+  'graph-schemas':               ['factTypes'],
+  'readings':                    ['factTypes', 'readings'],
+  'roles':                       ['factTypes'],
+  'constraints':                 ['constraints'],
+  'constraint-spans':            ['constraints'],
+  'state-machine-definitions':   ['stateMachines'],
+  'statuses':                    ['stateMachines'],
+  'transitions':                 ['stateMachines'],
+  'guards':                      ['stateMachines'],
+  'event-types':                 ['stateMachines'],
+}
+```
+
+No hook logic changes. Hooks continue to call `db.createInCollection()` — invalidation is transparent.
 
 ---
 
@@ -327,7 +456,18 @@ const output = await generateOpenAPI(db, domainId)
 To:
 ```typescript
 const model = db.getModel(domainId)
-const output = await model.render(openApiGenerator)
+
+// Direct generators (complex multi-pass logic):
+const openapi = await generateOpenAPI(model)
+const xstate = await generateXState(model)
+
+// Walker generators (uniform traversal):
+const readings = await model.render(readingsGenerator)
+const ilayer = await model.render(ilayerGenerator)
+const constraintIr = await model.render(constraintIrGenerator)
+
+// Downstream transform (no DomainModel):
+const sqlite = generateSQLite(openapi)
 ```
 
 ---
@@ -350,17 +490,21 @@ Any arity can override the default with a custom rendering function.
 
 ```
 src/model/
-  types.ts          — shared NounDef, FactTypeDef, etc.
-  domain-model.ts   — DomainModel class (lazy cache + render)
+  types.ts          — shared NounDef, FactTypeDef, ConstraintDef, StateMachineDef, etc.
+  domain-model.ts   — DomainModel class (lazy cache + accessors + render walker)
   renderer.ts       — Generator/Renderer interfaces
 
 src/generate/
-  openapi.ts        — openApiGenerator: Generator<OpenAPIPart, OpenAPIOutput>
-  sqlite.ts         — sqliteGenerator: Generator<DDLStatement, string[]>
-  ilayer.ts         — ilayerGenerator: Generator<LayerDef, LayerOutput>
-  xstate.ts         — xstateGenerator: Generator<XStatePart, XStateOutput>
-  readings.ts       — readingsGenerator: Generator<string, ReadingsOutput>
-  constraint-ir.ts  — constraintIrGenerator: Generator<IRPart, ConstraintIR>
+  openapi.ts        — generateOpenAPI(model) — direct DomainModel access (3-pass constraint logic)
+  sqlite.ts         — generateSQLite(openApiOutput) — pure transform, no DomainModel dependency
+  ilayer.ts         — ilayerGenerator: Generator<LayerPart, LayerOutput> — walker
+  xstate.ts         — generateXState(model) — direct DomainModel access (broad data needs)
+  readings.ts       — readingsGenerator: Generator<string, ReadingsOutput> — walker
+  constraint-ir.ts  — constraintIrGenerator: Generator<IRPart, ConstraintIR> — walker (passthrough)
+  fact-processors.ts — processBinarySchemas, processArraySchemas, processUnarySchemas (refactored for DomainModel types)
+  schema-builder.ts  — createProperty, ensureTableExists, setTableProperty (refactored for NounDef)
+  rmap.ts            — pure predicate parsing + property naming (unchanged)
+  index.ts           — barrel exports
 ```
 
 ---
@@ -368,11 +512,13 @@ src/generate/
 ## 8. Migration Path
 
 1. Create `src/model/` with types, DomainModel, and renderer interfaces
-2. Add `getModel()` to the DO
-3. Rewrite each generator as a `Generator<T, Out>` — one at a time, each independently testable
-4. Add `invalidate()` calls to hooks
-5. Remove old ad-hoc query logic from generators
-6. Existing tests pass with new generators (same output, different internals)
+2. Add `getModel()` and auto-invalidation to the DO's write methods
+3. Refactor `fact-processors.ts` and `schema-builder.ts` to accept DomainModel types instead of raw DB rows
+4. Rewrite OpenAPI generator to use DomainModel accessors directly (most complex, do first)
+5. SQLite generator: no changes (already a pure transform of OpenAPI output)
+6. Rewrite remaining generators — walker generators (iLayer, readings, constraint-ir) and direct generator (XState)
+7. Remove old ad-hoc query logic from generators
+8. Existing tests pass with new generators (same output, different internals)
 
 All existing HTTP endpoints, CRUD operations, hooks, and tests remain unchanged. Only the internal path from "generate request" to "output" changes.
 
@@ -391,9 +537,10 @@ All existing HTTP endpoints, CRUD operations, hooks, and tests remain unchanged.
 
 ## 10. Success Criteria
 
-- All 6 generators produce identical output through the renderer interface
-- No generator directly queries the DB — all go through DomainModel
-- Adding a new generator requires only implementing `Generator<T, Out>`
+- All 6 generators produce identical output (walker generators via `render()`, direct generators via DomainModel accessors)
+- No generator directly queries the DB — all go through DomainModel (except SQLite, which transforms OpenAPI output)
+- Adding a new walker generator requires only implementing `Generator<T, Out>`
 - DomainModel caches survive across requests on the DO
-- Hook writes invalidate affected caches
+- DO write methods auto-invalidate affected caches (no manual invalidation calls)
+- Existing utility modules (`fact-processors.ts`, `schema-builder.ts`, `rmap.ts`) are refactored for DomainModel types
 - All existing tests pass unchanged
