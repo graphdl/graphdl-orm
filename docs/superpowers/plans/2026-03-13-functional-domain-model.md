@@ -96,6 +96,18 @@ describe('model types', () => {
     expect(c.deonticOperator).toBe('obligatory')
   })
 
+  it('ConstraintDef supports frequency constraints with min/max occurrence', () => {
+    const c: ConstraintDef = {
+      id: 'c3', kind: 'FC', modality: 'Alethic',
+      text: 'Each Customer submits at least 1 and at most 5 SupportRequest',
+      spans: [{ factTypeId: 'gs3', roleIndex: 0 }],
+      minOccurrence: 1, maxOccurrence: 5,
+    }
+    expect(c.kind).toBe('FC')
+    expect(c.minOccurrence).toBe(1)
+    expect(c.maxOccurrence).toBe(5)
+  })
+
   it('StateMachineDef carries resolved statuses and transitions with verbs', () => {
     const noun: NounDef = { id: 'n1', name: 'Order', objectType: 'entity', domainId: 'd1' }
     const sm: StateMachineDef = {
@@ -140,6 +152,7 @@ Key details from spec:
 - `ConstraintDef.text` — added via ALTER TABLE migration in do.ts, exists at runtime
 - `ConstraintDef.setComparisonArgumentLength` — added via ALTER TABLE migration, exists at runtime
 - `ConstraintDef.deonticOperator` — NOT a DB column. Derived from `text` pattern: if text starts with "It is obligatory that" → `'obligatory'`, "It is forbidden that" → `'forbidden'`, "It is permitted that" → `'permitted'`. DomainModel parses this during `constraints()`.
+- `ConstraintDef.minOccurrence` and `ConstraintDef.maxOccurrence` — for Frequency Constraints (FC). `Frequency Constraint is a subtype of Constraint`. NOT in current DB DDL. Will be `undefined` until DDL migration adds `min_occurrence` and `max_occurrence` columns.
 - `ConstraintDef.entity` and `ConstraintDef.clauses` — NOT DB columns. Derived during constraint processing (entity from constraint spans, clauses from text parsing). May remain `undefined` if not derivable.
 - `SpanDef.subsetAutofill` — added via ALTER TABLE migration (INTEGER DEFAULT 0), exists at runtime
 - `StateMachineDef` includes `nounDef: NounDef` (resolved)
