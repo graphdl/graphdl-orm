@@ -70,7 +70,7 @@ interface NounDef {
   id: string
   name: string
   plural?: string
-  description?: string
+  description?: string          // from prompt_text column in DB
   objectType: 'entity' | 'value'
   domainId: string
 
@@ -78,7 +78,8 @@ interface NounDef {
   valueType?: string            // 'string' | 'number' | 'boolean'
   format?: string               // 'email' | 'date' | 'uri' | etc.
   pattern?: string              // regex pattern
-  enumValues?: string[]         // parsed from JSON string in DB
+  enumValues?: string[]         // DomainModel parses JSON string from DB into string[]
+                                // Downstream consumers receive pre-parsed arrays (not raw strings)
 
   // Validation
   minimum?: number
@@ -90,21 +91,17 @@ interface NounDef {
   multipleOf?: number
 
   // Entity type properties
-  superType?: string            // supertype noun name
-  referenceScheme?: string[]    // noun names composing the reference scheme
+  superType?: NounDef | string  // resolved NounDef when available, string ID as fallback
+  referenceScheme?: NounDef[]   // resolved noun references composing the reference scheme
 
-  // Access control
-  permissions?: {
-    list?: boolean
-    read?: boolean
-    create?: boolean
-    update?: boolean
-    delete?: boolean
-  }
+  // Access control — string array matching existing runtime convention
+  // Default: ['list', 'read', 'create', 'update', 'delete']
+  permissions?: string[]        // e.g. ['list', 'read', 'create']
 }
 
 interface FactTypeDef {
   id: string                    // graph_schema_id
+  name?: string                 // graph schema name (used by OpenAPI for schema keys)
   reading: string               // "Customer has Name"
   roles: RoleDef[]
   arity: number                 // roles.length
@@ -160,10 +157,15 @@ interface TransitionDef {
 interface VerbDef {
   id: string
   name: string
+  statusId?: string             // Moore semantics — verb performed in status
+  transitionId?: string         // Mealy semantics — verb performed during transition
+  graphId?: string              // graph referenced by verb
+  agentDefinitionId?: string    // agent definition for agent invocations
   func?: {
     callbackUrl?: string
     httpMethod?: string
     functionType?: string
+    headers?: Record<string, string>
   }
 }
 
@@ -237,6 +239,8 @@ interface Generator<T, Out> {
 ```
 
 ### DomainModel.render()
+
+The walker visits nouns first (each entity noun receives its fact types and constraints), then optionally visits fact types globally. Generators should use **either** the per-entity fact types in `noun.entity()` **or** the global `factType` renderer for a given concern — not both, to avoid double-processing.
 
 ```typescript
 async render<T, Out>(gen: Generator<T, Out>): Promise<Out> {
@@ -317,8 +321,8 @@ async function generateOpenAPI(model: DomainModel): Promise<OpenAPIOutput> {
 
 The existing pure utility modules remain:
 - **`fact-processors.ts`** (259 lines) — `processBinarySchemas`, `processArraySchemas`, `processUnarySchemas`. Refactored to accept DomainModel types instead of raw DB rows.
-- **`schema-builder.ts`** (312 lines) — `createProperty`, `ensureTableExists`, `setTableProperty`. Refactored to accept `NounDef` (which now carries all the fields it needs: valueType, format, pattern, enum, min/max, referenceScheme, superType).
-- **`rmap.ts`** (169 lines) — Pure functions (`toPredicate`, `findPredicateObject`, `nameToKey`, `transformPropertyName`). No changes needed — already has zero external dependencies.
+- **`schema-builder.ts`** (312 lines) — `createProperty`, `ensureTableExists`, `setTableProperty`. Refactored to accept `NounDef` (which now carries all the fields it needs: valueType, format, pattern, enum, min/max, referenceScheme, superType). Key contract change: `enumValues.split(',')` becomes iteration over the pre-parsed `string[]` from NounDef. Similarly, `referenceScheme` changes from `(string | NounRef)[]` to `NounDef[]` (resolved references).
+- **`rmap.ts`** (169 lines) — Pure functions (`toPredicate`, `findPredicateObject`, `nameToKey`, `transformPropertyName`). No changes needed — already has zero external dependencies. The `NounRef` interface in rmap.ts will be replaced by `NounDef` imports from the model types.
 
 ### SQLite Generator (downstream of OpenAPI)
 
@@ -415,17 +419,19 @@ The dependency map inside `invalidate(collection)` determines which cache keys t
 
 ```typescript
 const INVALIDATION_MAP: Record<string, string[]> = {
-  'nouns':                       ['nouns', 'factTypes', 'constraints'],
+  'nouns':                       ['nouns', 'factTypes', 'constraints', 'constraintSpans', 'readings'],
   'graph-schemas':               ['factTypes'],
   'readings':                    ['factTypes', 'readings'],
   'roles':                       ['factTypes'],
-  'constraints':                 ['constraints'],
-  'constraint-spans':            ['constraints'],
+  'constraints':                 ['constraints', 'constraintSpans'],
+  'constraint-spans':            ['constraints', 'constraintSpans'],
   'state-machine-definitions':   ['stateMachines'],
   'statuses':                    ['stateMachines'],
   'transitions':                 ['stateMachines'],
   'guards':                      ['stateMachines'],
   'event-types':                 ['stateMachines'],
+  'verbs':                       ['stateMachines'],
+  'functions':                   ['stateMachines'],
 }
 ```
 
@@ -513,12 +519,13 @@ src/generate/
 
 1. Create `src/model/` with types, DomainModel, and renderer interfaces
 2. Add `getModel()` and auto-invalidation to the DO's write methods
-3. Refactor `fact-processors.ts` and `schema-builder.ts` to accept DomainModel types instead of raw DB rows
+3. Refactor `fact-processors.ts` and `schema-builder.ts` to accept DomainModel types instead of raw DB rows (`NounRef` → `NounDef`, `enumValues` string → `string[]`, `referenceScheme` → `NounDef[]`)
 4. Rewrite OpenAPI generator to use DomainModel accessors directly (most complex, do first)
 5. SQLite generator: no changes (already a pure transform of OpenAPI output)
 6. Rewrite remaining generators — walker generators (iLayer, readings, constraint-ir) and direct generator (XState)
-7. Remove old ad-hoc query logic from generators
-8. Existing tests pass with new generators (same output, different internals)
+7. Update `src/api/generate.ts` handler to use `db.getModel(domainId)` and new generator calling conventions
+8. Remove old ad-hoc query logic from generators
+9. Existing tests pass with new generators (same output, different internals)
 
 All existing HTTP endpoints, CRUD operations, hooks, and tests remain unchanged. Only the internal path from "generate request" to "output" changes.
 
