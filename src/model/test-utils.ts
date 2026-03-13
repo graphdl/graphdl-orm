@@ -81,6 +81,7 @@ export function mkConstraint(params: {
   spans?: SpanDef[]
   id?: string
   modality?: 'Alethic' | 'Deontic'
+  deonticOperator?: 'obligatory' | 'forbidden' | 'permitted'
   text?: string
   entity?: string
   clauses?: string[]
@@ -120,6 +121,7 @@ export function mkStateMachine(params: {
 // ---------------------------------------------------------------------------
 
 export function createMockModel(data: {
+  domainId?: string
   nouns?: NounDef[]
   factTypes?: FactTypeDef[]
   constraints?: ConstraintDef[]
@@ -131,6 +133,7 @@ export function createMockModel(data: {
   const smMap = new Map((data.stateMachines ?? []).map((sm) => [sm.id, sm]))
 
   const mockModel = {
+    domainId: data.domainId ?? 'd1',
     nouns: async () => nounMap,
     noun: async (name: string) => nounMap.get(name),
     factTypes: async () => ftMap,
