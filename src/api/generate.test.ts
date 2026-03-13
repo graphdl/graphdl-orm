@@ -27,7 +27,7 @@ describe('handleGenerate', () => {
   })
 
   it('accepts all valid output formats without error on format validation', async () => {
-    for (const format of ['openapi', 'sqlite', 'xstate', 'ilayer', 'readings']) {
+    for (const format of ['openapi', 'sqlite', 'xstate', 'ilayer', 'readings', 'constraint-ir']) {
       const request = new Request('http://localhost/api/generate', {
         method: 'POST',
         body: JSON.stringify({ domainId: 'd1', outputFormat: format }),

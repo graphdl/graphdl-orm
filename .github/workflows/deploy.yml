@@ -15,6 +15,16 @@ jobs:
           node-version: 20
           cache: yarn
 
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Build WASM constraint evaluator
+        run: cd crates/constraint-eval && cargo test -- --test-threads=1 && wasm-pack build --target bundler
+
       - run: yarn install --frozen-lockfile
 
       - run: yarn test

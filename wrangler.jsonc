@@ -21,5 +21,8 @@
   ],
   "vars": {
     "ENVIRONMENT": "production"
-  }
+  },
+  "rules": [
+    { "type": "CompiledWasm", "globs": ["**/*.wasm"], "fallthrough": true }
+  ]
 }
