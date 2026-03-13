@@ -840,6 +840,175 @@ mod tests {
     }
 
     #[test]
+    fn test_mandatory_violation() {
+        let mut ir = empty_ir();
+        ir.nouns.insert("Customer".to_string(), NounDef {
+            object_type: "entity".to_string(),
+            enum_values: None,
+            value_type: None,
+            super_type: None,
+        });
+        ir.fact_types.insert("ft1".to_string(), FactTypeDef {
+            reading: "Customer has Name".to_string(),
+            roles: vec![
+                RoleDef { noun_name: "Customer".to_string(), role_index: 0 },
+                RoleDef { noun_name: "Name".to_string(), role_index: 1 },
+            ],
+        });
+        ir.fact_types.insert("ft2".to_string(), FactTypeDef {
+            reading: "Customer has Email".to_string(),
+            roles: vec![
+                RoleDef { noun_name: "Customer".to_string(), role_index: 0 },
+                RoleDef { noun_name: "Email".to_string(), role_index: 1 },
+            ],
+        });
+        ir.constraints.push(ConstraintDef {
+            id: "c1".to_string(),
+            kind: "MC".to_string(),
+            modality: "Alethic".to_string(),
+            deontic_operator: None,
+            text: "Each Customer has at least one Name".to_string(),
+            spans: vec![SpanDef { fact_type_id: "ft1".to_string(), role_index: 0, subset_autofill: None }],
+            set_comparison_argument_length: None,
+            clauses: None,
+            entity: None,
+        });
+
+        // Customer c1 appears in Email facts but NOT in Name facts → mandatory violation
+        let mut facts = HashMap::new();
+        facts.insert("ft2".to_string(), vec![FactInstance {
+            fact_type_id: "ft2".to_string(),
+            bindings: vec![("Customer".to_string(), "c1".to_string()), ("Email".to_string(), "a@b.com".to_string())],
+        }]);
+        let population = Population { facts };
+
+        let result = evaluate(&ir, &empty_response(), &population);
+        assert_eq!(result.len(), 1);
+        assert!(result[0].detail.contains("Mandatory violation"));
+        assert!(result[0].detail.contains("c1"));
+    }
+
+    #[test]
+    fn test_inclusive_or_violation() {
+        let mut ir = empty_ir();
+        ir.fact_types.insert("ft1".to_string(), FactTypeDef {
+            reading: "Customer hasPhone".to_string(),
+            roles: vec![RoleDef { noun_name: "Customer".to_string(), role_index: 0 }],
+        });
+        ir.fact_types.insert("ft2".to_string(), FactTypeDef {
+            reading: "Customer hasEmail".to_string(),
+            roles: vec![RoleDef { noun_name: "Customer".to_string(), role_index: 0 }],
+        });
+        ir.constraints.push(ConstraintDef {
+            id: "c1".to_string(),
+            kind: "OR".to_string(),
+            modality: "Alethic".to_string(),
+            deontic_operator: None,
+            text: "For each Customer, at least one of the following holds: hasPhone, hasEmail".to_string(),
+            spans: vec![
+                SpanDef { fact_type_id: "ft1".to_string(), role_index: 0, subset_autofill: None },
+                SpanDef { fact_type_id: "ft2".to_string(), role_index: 0, subset_autofill: None },
+            ],
+            set_comparison_argument_length: Some(2),
+            clauses: Some(vec!["Customer hasPhone".to_string(), "Customer hasEmail".to_string()]),
+            entity: Some("Customer".to_string()),
+        });
+
+        // Customer c1 participates in neither fact type → violation
+        // (c1 is known from a third unrelated fact type)
+        ir.fact_types.insert("ft3".to_string(), FactTypeDef {
+            reading: "Customer hasName".to_string(),
+            roles: vec![RoleDef { noun_name: "Customer".to_string(), role_index: 0 }],
+        });
+        let mut facts = HashMap::new();
+        facts.insert("ft3".to_string(), vec![FactInstance {
+            fact_type_id: "ft3".to_string(),
+            bindings: vec![("Customer".to_string(), "c1".to_string())],
+        }]);
+        let population = Population { facts };
+
+        let result = evaluate(&ir, &empty_response(), &population);
+        assert_eq!(result.len(), 1);
+        assert!(result[0].detail.contains("Set-comparison violation"));
+        assert!(result[0].detail.contains("at least one"));
+    }
+
+    #[test]
+    fn test_obligatory_missing_enum_value() {
+        let mut ir = empty_ir();
+        ir.nouns.insert("SenderIdentityValue".to_string(), NounDef {
+            object_type: "value".to_string(),
+            enum_values: Some(vec!["Auto.dev Team <team@auto.dev>".to_string()]),
+            value_type: Some("string".to_string()),
+            super_type: None,
+        });
+        ir.nouns.insert("SupportResponse".to_string(), NounDef {
+            object_type: "entity".to_string(),
+            enum_values: None,
+            value_type: None,
+            super_type: None,
+        });
+        ir.fact_types.insert("ft1".to_string(), FactTypeDef {
+            reading: "SupportResponse has SenderIdentityValue".to_string(),
+            roles: vec![
+                RoleDef { noun_name: "SupportResponse".to_string(), role_index: 0 },
+                RoleDef { noun_name: "SenderIdentityValue".to_string(), role_index: 1 },
+            ],
+        });
+        ir.constraints.push(ConstraintDef {
+            id: "c1".to_string(),
+            kind: "UC".to_string(),
+            modality: "Deontic".to_string(),
+            deontic_operator: Some("obligatory".to_string()),
+            text: "It is obligatory that each SupportResponse has SenderIdentity".to_string(),
+            spans: vec![SpanDef { fact_type_id: "ft1".to_string(), role_index: 0, subset_autofill: None }],
+            set_comparison_argument_length: None,
+            clauses: None,
+            entity: None,
+        });
+
+        // Response text does NOT contain the required sender identity value
+        let response = ResponseContext {
+            text: "Here is some help for you.".to_string(),
+            sender_identity: Some(String::new()),
+            fields: None,
+        };
+
+        let result = evaluate(&ir, &response, &empty_population());
+        // Should get violation for missing enum value AND missing sender identity
+        assert!(result.len() >= 1);
+        let details: Vec<&str> = result.iter().map(|v| v.detail.as_str()).collect();
+        assert!(details.iter().any(|d| d.contains("obligatory")));
+    }
+
+    #[test]
+    fn test_obligatory_sender_identity_empty() {
+        let mut ir = empty_ir();
+        ir.constraints.push(ConstraintDef {
+            id: "c1".to_string(),
+            kind: "UC".to_string(),
+            modality: "Deontic".to_string(),
+            deontic_operator: Some("obligatory".to_string()),
+            text: "It is obligatory that each SupportResponse has SenderIdentity".to_string(),
+            spans: vec![],
+            set_comparison_argument_length: None,
+            clauses: None,
+            entity: None,
+        });
+
+        // sender_identity present but empty string → violation
+        let response = ResponseContext {
+            text: "Hello".to_string(),
+            sender_identity: Some(String::new()),
+            fields: None,
+        };
+
+        let result = evaluate(&ir, &response, &empty_population());
+        assert_eq!(result.len(), 1);
+        assert!(result[0].detail.contains("SenderIdentity"));
+    }
+
+    #[test]
     fn test_equality_violation() {
         let mut ir = empty_ir();
         ir.fact_types.insert("ft1".to_string(), FactTypeDef {
