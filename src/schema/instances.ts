@@ -3,6 +3,19 @@
  * Derived from readings/instances.md.
  */
 export const INSTANCE_DDL: string[] = [
+  `CREATE TABLE IF NOT EXISTS citations (
+    id TEXT PRIMARY KEY,
+    text TEXT NOT NULL,
+    uri TEXT,
+    retrieval_date TEXT,
+    domain_id TEXT REFERENCES domains(id),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    version INTEGER NOT NULL DEFAULT 1
+  )`,
+
+  `CREATE INDEX IF NOT EXISTS idx_citations_domain ON citations(domain_id)`,
+
   `CREATE TABLE IF NOT EXISTS graphs (
     id TEXT PRIMARY KEY,
     graph_schema_id TEXT REFERENCES graph_schemas(id),
@@ -15,6 +28,20 @@ export const INSTANCE_DDL: string[] = [
 
   `CREATE INDEX IF NOT EXISTS idx_graphs_domain ON graphs(domain_id)`,
   `CREATE INDEX IF NOT EXISTS idx_graphs_schema ON graphs(graph_schema_id)`,
+
+  `CREATE TABLE IF NOT EXISTS graph_citations (
+    id TEXT PRIMARY KEY,
+    graph_id TEXT NOT NULL REFERENCES graphs(id),
+    citation_id TEXT NOT NULL REFERENCES citations(id),
+    domain_id TEXT REFERENCES domains(id),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    version INTEGER NOT NULL DEFAULT 1,
+    UNIQUE(graph_id, citation_id)
+  )`,
+
+  `CREATE INDEX IF NOT EXISTS idx_graph_citations_graph ON graph_citations(graph_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_graph_citations_citation ON graph_citations(citation_id)`,
 
   `CREATE TABLE IF NOT EXISTS resources (
     id TEXT PRIMARY KEY,
