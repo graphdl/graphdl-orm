@@ -2,20 +2,15 @@
  * generateILayer — generates iLayer UI definitions from entity nouns.
  *
  * Each entity gets list, detail, create, and edit layers based on its permissions.
- * Ported from Generator.ts.bak lines 1559-1869. Adapted for DO findInCollection API.
+ * Ported from Generator.ts.bak lines 1559-1869. Adapted for DomainModel API.
  */
 
 import { nameToKey } from './rmap'
+import type { NounDef, FactTypeDef, StateMachineDef } from '../model/types'
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/** Fetch all docs from a collection, handling pagination by using a large limit. */
-async function fetchAll(db: any, slug: string, where?: any): Promise<any[]> {
-  const result = await db.findInCollection(slug, where, { limit: 10000 })
-  return result?.docs || []
-}
 
 /** PascalCase → camelCase field ID. */
 function toCamelCase(name: string): string {
@@ -28,7 +23,7 @@ function toLabel(name: string): string {
 }
 
 /** Entity noun → URL slug (plural, lowercase, hyphenated). */
-function toSlug(noun: any): string {
+function toSlug(noun: { name: string; plural?: string }): string {
   if (noun.plural) return noun.plural
   return (
     noun.name
@@ -39,14 +34,10 @@ function toSlug(noun: any): string {
 }
 
 /** Map a value noun to an iLayer field type. */
-function mapFieldType(valueNoun: any): { type: string; options?: string[] } {
+function mapFieldType(valueNoun: NounDef): { type: string; options?: string[] } {
   // Check enum first
-  if (valueNoun.enum) {
-    const options = valueNoun.enum
-      .split(',')
-      .map((s: string) => s.trim())
-      .filter(Boolean)
-    return { type: 'select', options }
+  if (valueNoun.enumValues && valueNoun.enumValues.length > 0) {
+    return { type: 'select', options: valueNoun.enumValues }
   }
 
   // Check format
@@ -77,9 +68,24 @@ function mapFieldType(valueNoun: any): { type: string; options?: string[] } {
 // ---------------------------------------------------------------------------
 
 interface ReadingInfo {
-  subjectNounId: string
-  objectNounId: string
+  subjectNounName: string
+  objectNounName: string
   text: string
+}
+
+// ---------------------------------------------------------------------------
+// State machine events helper
+// ---------------------------------------------------------------------------
+
+function getStateMachineEvents(entityNounName: string, smMap: Map<string, StateMachineDef>): string[] {
+  const events: string[] = []
+  for (const [, sm] of smMap) {
+    if (sm.nounName !== entityNounName) continue
+    for (const t of sm.transitions) {
+      if (t.event && !events.includes(t.event)) events.push(t.event)
+    }
+  }
+  return events
 }
 
 // ---------------------------------------------------------------------------
@@ -89,87 +95,37 @@ interface ReadingInfo {
 /**
  * Generate iLayer UI definitions from domain model data.
  *
- * @param db       - Durable Object stub with `findInCollection(slug, where?, options?)`
- * @param domainId - The domain ID to scope nouns, readings, and state machines
+ * @param model - DomainModel providing nouns, factTypes, and stateMachines
  * @returns Object with `files` — a map of file paths to JSON strings
  */
-export async function generateILayer(db: any, domainId: string): Promise<{ files: Record<string, string> }> {
-  const domainFilter = { domain: { equals: domainId } }
-
+export async function generateILayer(model: {
+  nouns(): Promise<Map<string, NounDef>>
+  factTypes(): Promise<Map<string, FactTypeDef>>
+  stateMachines(): Promise<Map<string, StateMachineDef>>
+}): Promise<{ files: Record<string, string> }> {
   // ------ 1. Fetch domain-scoped data ------
-  const [nouns, readings, stateMachineDefinitions] = await Promise.all([
-    fetchAll(db, 'nouns', domainFilter),
-    fetchAll(db, 'readings', domainFilter),
-    fetchAll(db, 'state-machine-definitions', domainFilter),
+  const [nounMap, ftMap, smMap] = await Promise.all([
+    model.nouns(),
+    model.factTypes(),
+    model.stateMachines(),
   ])
 
-  // ------ 2. Fetch cross-domain data ------
-  const allNouns = await fetchAll(db, 'nouns')
-  const allNounById = new Map(allNouns.map((n: any) => [n.id, n]))
-
-  // Build name→id lookup for reading text parsing
-  const nounByName = new Map(allNouns.map((n: any) => [n.name, n]))
-
-  // ------ 3. Build reading infos by parsing reading text ------
-  const entityNouns = nouns.filter((n: any) => n.objectType === 'entity')
+  // ------ 2. Build reading infos from fact type roles ------
   const readingInfos: ReadingInfo[] = []
 
-  for (const reading of readings) {
-    const text = reading.text || ''
-    if (!text) continue
-
-    // Parse "SubjectNoun verb ObjectNoun" — find longest matching noun names
-    // at start and end of reading text
-    let subjectNoun: any = null
-    let objectNoun: any = null
-
-    for (const [name, noun] of nounByName) {
-      if (text.startsWith(name + ' ')) {
-        if (!subjectNoun || name.length > subjectNoun.name.length) subjectNoun = noun
-      }
-      if (text.endsWith(' ' + name) || text.endsWith(' ' + name + '.')) {
-        if (!objectNoun || name.length > objectNoun.name.length) objectNoun = noun
-      }
-    }
-
-    if (subjectNoun && objectNoun && subjectNoun.id !== objectNoun.id) {
-      readingInfos.push({ subjectNounId: subjectNoun.id, objectNounId: objectNoun.id, text })
-    }
+  for (const [, ft] of ftMap) {
+    if (ft.arity < 2) continue // skip unary
+    const subject = ft.roles[0]?.nounDef
+    const object = ft.roles[1]?.nounDef
+    if (!subject || !object || subject.name === object.name) continue
+    readingInfos.push({ subjectNounName: subject.name, objectNounName: object.name, text: ft.reading })
   }
 
   const files: Record<string, string> = {}
 
-  // ------ 4. Resolve state machine events for an entity noun ------
-  // Pre-fetch all event types for the domain
-  const allEventTypes = await fetchAll(db, 'event-types', { domain: { equals: domainId } })
-  const eventTypeById = new Map(allEventTypes.map((et: any) => [et.id, et]))
+  // ------ 3. Generate layers for each entity noun ------
+  const entityNouns = [...nounMap.values()].filter((n) => n.objectType === 'entity')
 
-  async function getStateMachineEvents(entityNounId: string): Promise<string[]> {
-    const events: string[] = []
-    for (const smDef of stateMachineDefinitions) {
-      const nounId = typeof smDef.noun === 'string' ? smDef.noun : smDef.noun?.id
-      if (nounId !== entityNounId) continue
-
-      const statuses = await fetchAll(db, 'statuses', { stateMachineDefinition: { equals: smDef.id } })
-
-      for (const status of statuses) {
-        // Query transitions from this status directly
-        const transitions = await fetchAll(db, 'transitions', { from: { equals: status.id } })
-        for (const t of transitions) {
-          const eventTypeId = typeof t.eventType === 'string' ? t.eventType : t.eventType?.id
-          if (!eventTypeId) continue
-
-          const eventType = eventTypeById.get(eventTypeId)
-          if (eventType?.name && !events.includes(eventType.name)) {
-            events.push(eventType.name)
-          }
-        }
-      }
-    }
-    return events
-  }
-
-  // ------ 5. Generate layers for each entity noun ------
   for (const entity of entityNouns) {
     const slug = toSlug(entity)
     const perms: string[] = entity.permissions || ['list', 'read', 'create', 'update', 'delete']
@@ -180,13 +136,13 @@ export async function generateILayer(db: any, domainId: string): Promise<{ files
     const hasDelete = perms.includes('delete')
 
     // Find readings where this entity is the subject
-    const entityReadings = readingInfos.filter((r) => r.subjectNounId === entity.id)
+    const entityReadings = readingInfos.filter((r) => r.subjectNounName === entity.name)
 
     // Separate value readings (fields) from entity readings (navigation)
     const fieldReadings: ReadingInfo[] = []
     const navReadings: ReadingInfo[] = []
     for (const r of entityReadings) {
-      const objectNoun = allNounById.get(r.objectNounId) as any
+      const objectNoun = nounMap.get(r.objectNounName)
       if (!objectNoun) continue
       if (objectNoun.objectType === 'value') {
         fieldReadings.push(r)
@@ -199,7 +155,7 @@ export async function generateILayer(db: any, domainId: string): Promise<{ files
     const fields: any[] = []
     const seenFieldIds = new Set<string>()
     for (const r of fieldReadings) {
-      const valueNoun = allNounById.get(r.objectNounId) as any
+      const valueNoun = nounMap.get(r.objectNounName)
       if (!valueNoun) continue
       const { type, options } = mapFieldType(valueNoun)
       const field: any = {
@@ -214,7 +170,7 @@ export async function generateILayer(db: any, domainId: string): Promise<{ files
     }
 
     // Build state machine event buttons
-    const events = await getStateMachineEvents(entity.id)
+    const events = getStateMachineEvents(entity.name, smMap)
     const eventButtons = events.map((event) => ({
       id: event,
       text: toLabel(event),
@@ -223,7 +179,7 @@ export async function generateILayer(db: any, domainId: string): Promise<{ files
 
     // Build navigation from entity-to-entity relationships
     const navigation = navReadings.map((r) => {
-      const relatedNoun = allNounById.get(r.objectNounId) as any
+      const relatedNoun = nounMap.get(r.objectNounName)
       const relSlug = toSlug(relatedNoun || { name: 'unknown', plural: 'unknowns' })
       return {
         text: relatedNoun?.name || 'Unknown',
@@ -231,7 +187,7 @@ export async function generateILayer(db: any, domainId: string): Promise<{ files
       }
     })
 
-    // ── List layer (NavigationLayer) ──
+    // -- List layer (NavigationLayer) --
     if (hasList || hasRead) {
       const listLayer: any = {
         name: slug,
@@ -254,7 +210,7 @@ export async function generateILayer(db: any, domainId: string): Promise<{ files
       files[`layers/${slug}.json`] = JSON.stringify(listLayer, null, 2)
     }
 
-    // ── Detail/Read layer (FormLayer) ──
+    // -- Detail/Read layer (FormLayer) --
     if (hasRead) {
       const actionButtons: any[] = []
       if (hasUpdate) actionButtons.push({ id: 'edit', text: 'Edit', action: 'edit' })
@@ -274,7 +230,7 @@ export async function generateILayer(db: any, domainId: string): Promise<{ files
       files[`layers/${slug}-detail.json`] = JSON.stringify(detailLayer, null, 2)
     }
 
-    // ── Create layer (FormLayer with editable fields) ──
+    // -- Create layer (FormLayer with editable fields) --
     if (hasCreate) {
       const createLayer: any = {
         name: `${slug}-new`,
@@ -290,7 +246,7 @@ export async function generateILayer(db: any, domainId: string): Promise<{ files
       files[`layers/${slug}-new.json`] = JSON.stringify(createLayer, null, 2)
     }
 
-    // ── Edit layer (FormLayer with editable fields + update action) ──
+    // -- Edit layer (FormLayer with editable fields + update action) --
     if (hasUpdate) {
       const editLayer: any = {
         name: `${slug}-edit`,
@@ -309,13 +265,13 @@ export async function generateILayer(db: any, domainId: string): Promise<{ files
     }
   }
 
-  // ------ 6. Index navigation layer ------
+  // ------ 4. Index navigation layer ------
   const indexItems = entityNouns
-    .filter((e: any) => {
+    .filter((e) => {
       const p: string[] = e.permissions || ['list', 'read']
       return p.includes('list') || p.includes('read')
     })
-    .map((entity: any) => ({
+    .map((entity) => ({
       text: entity.name,
       subtext: entity.plural || toSlug(entity),
       address: `/${toSlug(entity)}`,

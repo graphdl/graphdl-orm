@@ -1,97 +1,30 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, beforeEach } from 'vitest'
 import { generateILayer } from './ilayer'
-
-// ---------------------------------------------------------------------------
-// Mock DB helper
-// ---------------------------------------------------------------------------
-
-function mockDB(data: Record<string, any[]>) {
-  return {
-    findInCollection: async (slug: string, where?: any, _opts?: any) => {
-      let docs = data[slug] || []
-      if (where) {
-        docs = docs.filter((doc) => {
-          for (const [key, condition] of Object.entries(where)) {
-            const cond = condition as any
-            if (cond?.equals !== undefined) {
-              if (doc[key] !== cond.equals) return false
-            }
-          }
-          return true
-        })
-      }
-      return { docs, totalDocs: docs.length, hasNextPage: false, page: 1, limit: 100 }
-    },
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Test data factories
-// ---------------------------------------------------------------------------
-
-function mkNoun(overrides: { id: string; name: string } & Record<string, any>) {
-  return { objectType: 'entity', domain: DOMAIN_ID, ...overrides }
-}
-
-function mkValueNoun(overrides: { id: string; name: string } & Record<string, any>) {
-  return { objectType: 'value', domain: DOMAIN_ID, ...overrides }
-}
-
-function mkRole(id: string, nounId: string) {
-  return { id, noun: { value: nounId } }
-}
-
-function mkReading(id: string, text: string, roleIds: string[]) {
-  return { id, text, graphSchema: 'gs-1', roles: roleIds, domain: DOMAIN_ID }
-}
-
-function mkStateMachineDef(id: string, nounId: string) {
-  return { id, noun: nounId, domain: DOMAIN_ID }
-}
-
-function mkStatus(id: string, smDefId: string) {
-  return { id, stateMachineDefinition: smDefId }
-}
-
-function mkTransition(id: string, fromStatusId: string, toStatusId: string, eventTypeId: string) {
-  return { id, from: fromStatusId, to: toStatusId, eventType: eventTypeId }
-}
-
-function mkEventType(id: string, name: string) {
-  return { id, name, domain: DOMAIN_ID }
-}
+import { createMockModel, mkNounDef, mkValueNounDef, mkFactType, mkStateMachine, resetIds } from '../model/test-utils'
 
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
-const DOMAIN_ID = 'domain-1'
+beforeEach(() => resetIds())
 
 describe('generateILayer', () => {
   describe('entity with list+read+create permissions', () => {
     it('generates list, detail, create layers and index', async () => {
-      const customerNoun = mkNoun({ id: 'n-customer', name: 'Customer', permissions: ['list', 'read', 'create'], plural: 'customers' })
-      const nameNoun = mkValueNoun({ id: 'n-name', name: 'Name', valueType: 'string' })
-      const emailNoun = mkValueNoun({ id: 'n-email', name: 'Email', valueType: 'string', format: 'email' })
+      const customerNoun = mkNounDef({ name: 'Customer', permissions: ['list', 'read', 'create'], plural: 'customers' })
+      const nameNoun = mkValueNounDef({ name: 'Name', valueType: 'string' })
+      const emailNoun = mkValueNounDef({ name: 'Email', valueType: 'string', format: 'email' })
 
-      const db = mockDB({
+      const model = createMockModel({
         nouns: [customerNoun, nameNoun, emailNoun],
-        readings: [
-          mkReading('r1', 'Customer has Name', ['role-1', 'role-2']),
-          mkReading('r2', 'Customer has Email', ['role-3', 'role-4']),
+        factTypes: [
+          mkFactType({ reading: 'Customer has Name', roles: [{ nounDef: customerNoun, roleIndex: 0 }, { nounDef: nameNoun, roleIndex: 1 }] }),
+          mkFactType({ reading: 'Customer has Email', roles: [{ nounDef: customerNoun, roleIndex: 0 }, { nounDef: emailNoun, roleIndex: 1 }] }),
         ],
-        'state-machine-definitions': [],
-        roles: [
-          mkRole('role-1', 'n-customer'),
-          mkRole('role-2', 'n-name'),
-          mkRole('role-3', 'n-customer'),
-          mkRole('role-4', 'n-email'),
-        ],
-        statuses: [],
-        'event-types': [],
+        stateMachines: [],
       })
 
-      const result = await generateILayer(db, DOMAIN_ID)
+      const result = await generateILayer(model)
 
       // Should have list, detail, create, and index layers
       expect(result.files['layers/customers.json']).toBeDefined()
@@ -123,8 +56,8 @@ describe('generateILayer', () => {
       expect(create.name).toBe('customers-new')
       expect(create.title).toBe('New Customer')
       expect(create.type).toBe('formLayer')
-      expect(create.fieldsets[0].fields[0].type).toBe('text') // Name → text
-      expect(create.fieldsets[0].fields[1].type).toBe('email') // Email → email
+      expect(create.fieldsets[0].fields[0].type).toBe('text') // Name -> text
+      expect(create.fieldsets[0].fields[1].type).toBe('email') // Email -> email
       expect(create.actionButtons).toContainEqual({ id: 'save', text: 'Save', action: 'create' })
       expect(create.actionButtons).toContainEqual({ id: 'cancel', text: 'Cancel', address: '/customers' })
 
@@ -139,39 +72,29 @@ describe('generateILayer', () => {
   })
 
   describe('field type mapping', () => {
-    it('maps string→text, boolean→bool, enum→select, email→email, date→date, number→numeric', async () => {
-      const entity = mkNoun({ id: 'n-task', name: 'Task', permissions: ['create'], plural: 'tasks' })
-      const titleNoun = mkValueNoun({ id: 'n-title', name: 'Title', valueType: 'string' })
-      const activeNoun = mkValueNoun({ id: 'n-active', name: 'Active', valueType: 'boolean' })
-      const priorityNoun = mkValueNoun({ id: 'n-priority', name: 'Priority', valueType: 'string', enum: 'Low,Medium,High' })
-      const emailNoun = mkValueNoun({ id: 'n-email', name: 'ContactEmail', valueType: 'string', format: 'email' })
-      const dueDateNoun = mkValueNoun({ id: 'n-due', name: 'DueDate', valueType: 'string', format: 'date' })
-      const countNoun = mkValueNoun({ id: 'n-count', name: 'ItemCount', valueType: 'number' })
+    it('maps string->text, boolean->bool, enum->select, email->email, date->date, number->numeric', async () => {
+      const entity = mkNounDef({ name: 'Task', permissions: ['create'], plural: 'tasks' })
+      const titleNoun = mkValueNounDef({ name: 'Title', valueType: 'string' })
+      const activeNoun = mkValueNounDef({ name: 'Active', valueType: 'boolean' })
+      const priorityNoun = mkValueNounDef({ name: 'Priority', valueType: 'string', enumValues: ['Low', 'Medium', 'High'] })
+      const emailNoun = mkValueNounDef({ name: 'ContactEmail', valueType: 'string', format: 'email' })
+      const dueDateNoun = mkValueNounDef({ name: 'DueDate', valueType: 'string', format: 'date' })
+      const countNoun = mkValueNounDef({ name: 'ItemCount', valueType: 'number' })
 
-      const db = mockDB({
+      const model = createMockModel({
         nouns: [entity, titleNoun, activeNoun, priorityNoun, emailNoun, dueDateNoun, countNoun],
-        readings: [
-          mkReading('r1', 'Task has Title', ['role-1', 'role-2']),
-          mkReading('r2', 'Task has Active', ['role-3', 'role-4']),
-          mkReading('r3', 'Task has Priority', ['role-5', 'role-6']),
-          mkReading('r4', 'Task has ContactEmail', ['role-7', 'role-8']),
-          mkReading('r5', 'Task has DueDate', ['role-9', 'role-10']),
-          mkReading('r6', 'Task has ItemCount', ['role-11', 'role-12']),
+        factTypes: [
+          mkFactType({ reading: 'Task has Title', roles: [{ nounDef: entity, roleIndex: 0 }, { nounDef: titleNoun, roleIndex: 1 }] }),
+          mkFactType({ reading: 'Task has Active', roles: [{ nounDef: entity, roleIndex: 0 }, { nounDef: activeNoun, roleIndex: 1 }] }),
+          mkFactType({ reading: 'Task has Priority', roles: [{ nounDef: entity, roleIndex: 0 }, { nounDef: priorityNoun, roleIndex: 1 }] }),
+          mkFactType({ reading: 'Task has ContactEmail', roles: [{ nounDef: entity, roleIndex: 0 }, { nounDef: emailNoun, roleIndex: 1 }] }),
+          mkFactType({ reading: 'Task has DueDate', roles: [{ nounDef: entity, roleIndex: 0 }, { nounDef: dueDateNoun, roleIndex: 1 }] }),
+          mkFactType({ reading: 'Task has ItemCount', roles: [{ nounDef: entity, roleIndex: 0 }, { nounDef: countNoun, roleIndex: 1 }] }),
         ],
-        'state-machine-definitions': [],
-        roles: [
-          mkRole('role-1', 'n-task'), mkRole('role-2', 'n-title'),
-          mkRole('role-3', 'n-task'), mkRole('role-4', 'n-active'),
-          mkRole('role-5', 'n-task'), mkRole('role-6', 'n-priority'),
-          mkRole('role-7', 'n-task'), mkRole('role-8', 'n-email'),
-          mkRole('role-9', 'n-task'), mkRole('role-10', 'n-due'),
-          mkRole('role-11', 'n-task'), mkRole('role-12', 'n-count'),
-        ],
-        statuses: [],
-        'event-types': [],
+        stateMachines: [],
       })
 
-      const result = await generateILayer(db, DOMAIN_ID)
+      const result = await generateILayer(model)
       const create = JSON.parse(result.files['layers/tasks-new.json'])
       const fields = create.fieldsets[0].fields
 
@@ -189,26 +112,20 @@ describe('generateILayer', () => {
 
   describe('navigation from entity-to-entity readings', () => {
     it('includes navigation links on detail and edit layers', async () => {
-      const orderNoun = mkNoun({ id: 'n-order', name: 'Order', permissions: ['read', 'update'], plural: 'orders' })
-      const customerNoun = mkNoun({ id: 'n-customer', name: 'Customer', permissions: ['list'], plural: 'customers' })
-      const amountNoun = mkValueNoun({ id: 'n-amount', name: 'Amount', valueType: 'number' })
+      const orderNoun = mkNounDef({ name: 'Order', permissions: ['read', 'update'], plural: 'orders' })
+      const customerNoun = mkNounDef({ name: 'Customer', permissions: ['list'], plural: 'customers' })
+      const amountNoun = mkValueNounDef({ name: 'Amount', valueType: 'number' })
 
-      const db = mockDB({
+      const model = createMockModel({
         nouns: [orderNoun, customerNoun, amountNoun],
-        readings: [
-          mkReading('r1', 'Order has Amount', ['role-1', 'role-2']),
-          mkReading('r2', 'Order belongs to Customer', ['role-3', 'role-4']),
+        factTypes: [
+          mkFactType({ reading: 'Order has Amount', roles: [{ nounDef: orderNoun, roleIndex: 0 }, { nounDef: amountNoun, roleIndex: 1 }] }),
+          mkFactType({ reading: 'Order belongs to Customer', roles: [{ nounDef: orderNoun, roleIndex: 0 }, { nounDef: customerNoun, roleIndex: 1 }] }),
         ],
-        'state-machine-definitions': [],
-        roles: [
-          mkRole('role-1', 'n-order'), mkRole('role-2', 'n-amount'),
-          mkRole('role-3', 'n-order'), mkRole('role-4', 'n-customer'),
-        ],
-        statuses: [],
-        'event-types': [],
+        stateMachines: [],
       })
 
-      const result = await generateILayer(db, DOMAIN_ID)
+      const result = await generateILayer(model)
 
       const detail = JSON.parse(result.files['layers/orders-detail.json'])
       expect(detail.navigation).toEqual([{ text: 'Customer', address: '/customers' }])
@@ -220,25 +137,27 @@ describe('generateILayer', () => {
 
   describe('event buttons from state machine transitions', () => {
     it('adds event buttons to detail and edit layers', async () => {
-      const ticketNoun = mkNoun({ id: 'n-ticket', name: 'Ticket', permissions: ['read', 'update'], plural: 'tickets' })
-      const titleNoun = mkValueNoun({ id: 'n-title', name: 'Title', valueType: 'string' })
+      const ticketNoun = mkNounDef({ name: 'Ticket', permissions: ['read', 'update'], plural: 'tickets' })
+      const titleNoun = mkValueNounDef({ name: 'Title', valueType: 'string' })
 
-      const db = mockDB({
+      const model = createMockModel({
         nouns: [ticketNoun, titleNoun],
-        readings: [mkReading('r1', 'Ticket has Title', ['role-1', 'role-2'])],
-        'state-machine-definitions': [mkStateMachineDef('sm-1', 'n-ticket')],
-        statuses: [
-          mkStatus('status-1', 'sm-1'),
-          mkStatus('status-2', 'sm-1'),
+        factTypes: [
+          mkFactType({ reading: 'Ticket has Title', roles: [{ nounDef: ticketNoun, roleIndex: 0 }, { nounDef: titleNoun, roleIndex: 1 }] }),
         ],
-        transitions: [
-          mkTransition('t-1', 'status-1', 'status-2', 'et-1'),
-          mkTransition('t-2', 'status-2', 'status-1', 'et-2'),
+        stateMachines: [
+          mkStateMachine({
+            nounDef: ticketNoun,
+            statuses: [{ id: 'status-1', name: 'Open' }, { id: 'status-2', name: 'Closed' }],
+            transitions: [
+              { from: 'Open', to: 'Closed', event: 'Escalate', eventTypeId: 'et-1' },
+              { from: 'Closed', to: 'Open', event: 'Close', eventTypeId: 'et-2' },
+            ],
+          }),
         ],
-        'event-types': [mkEventType('et-1', 'Escalate'), mkEventType('et-2', 'Close')],
       })
 
-      const result = await generateILayer(db, DOMAIN_ID)
+      const result = await generateILayer(model)
 
       const detail = JSON.parse(result.files['layers/tickets-detail.json'])
       // Detail should have edit + event buttons
@@ -254,20 +173,17 @@ describe('generateILayer', () => {
 
   describe('index layer lists all entities with list/read permission', () => {
     it('includes multiple entities in index', async () => {
-      const customerNoun = mkNoun({ id: 'n-customer', name: 'Customer', permissions: ['list'], plural: 'customers' })
-      const orderNoun = mkNoun({ id: 'n-order', name: 'Order', permissions: ['read'], plural: 'orders' })
-      const secretNoun = mkNoun({ id: 'n-secret', name: 'Secret', permissions: ['create'] }) // no list/read
+      const customerNoun = mkNounDef({ name: 'Customer', permissions: ['list'], plural: 'customers' })
+      const orderNoun = mkNounDef({ name: 'Order', permissions: ['read'], plural: 'orders' })
+      const secretNoun = mkNounDef({ name: 'Secret', permissions: ['create'] }) // no list/read
 
-      const db = mockDB({
+      const model = createMockModel({
         nouns: [customerNoun, orderNoun, secretNoun],
-        readings: [],
-        'state-machine-definitions': [],
-        roles: [],
-        statuses: [],
-        'event-types': [],
+        factTypes: [],
+        stateMachines: [],
       })
 
-      const result = await generateILayer(db, DOMAIN_ID)
+      const result = await generateILayer(model)
       const index = JSON.parse(result.files['layers/index.json'])
       const texts = index.items[0].items.map((i: any) => i.text)
 
@@ -279,18 +195,15 @@ describe('generateILayer', () => {
 
   describe('entity without permissions', () => {
     it('generates no layers for the entity', async () => {
-      const noPermEntity = mkNoun({ id: 'n-hidden', name: 'Hidden', permissions: [] })
+      const noPermEntity = mkNounDef({ name: 'Hidden', permissions: [] })
 
-      const db = mockDB({
+      const model = createMockModel({
         nouns: [noPermEntity],
-        readings: [],
-        'state-machine-definitions': [],
-        roles: [],
-        statuses: [],
-        'event-types': [],
+        factTypes: [],
+        stateMachines: [],
       })
 
-      const result = await generateILayer(db, DOMAIN_ID)
+      const result = await generateILayer(model)
 
       // Only the index layer should exist (with no items)
       expect(Object.keys(result.files)).toEqual(['layers/index.json'])
@@ -301,19 +214,18 @@ describe('generateILayer', () => {
 
   describe('update+delete permissions', () => {
     it('generates edit layer with save/cancel/event buttons and delete on detail', async () => {
-      const entity = mkNoun({ id: 'n-item', name: 'Item', permissions: ['read', 'update', 'delete'], plural: 'items' })
-      const nameNoun = mkValueNoun({ id: 'n-name', name: 'Name', valueType: 'string' })
+      const entity = mkNounDef({ name: 'Item', permissions: ['read', 'update', 'delete'], plural: 'items' })
+      const nameNoun = mkValueNounDef({ name: 'Name', valueType: 'string' })
 
-      const db = mockDB({
+      const model = createMockModel({
         nouns: [entity, nameNoun],
-        readings: [mkReading('r1', 'Item has Name', ['role-1', 'role-2'])],
-        'state-machine-definitions': [],
-        roles: [mkRole('role-1', 'n-item'), mkRole('role-2', 'n-name')],
-        statuses: [],
-        'event-types': [],
+        factTypes: [
+          mkFactType({ reading: 'Item has Name', roles: [{ nounDef: entity, roleIndex: 0 }, { nounDef: nameNoun, roleIndex: 1 }] }),
+        ],
+        stateMachines: [],
       })
 
-      const result = await generateILayer(db, DOMAIN_ID)
+      const result = await generateILayer(model)
 
       // Detail should have edit + delete buttons
       const detail = JSON.parse(result.files['layers/items-detail.json'])
@@ -331,60 +243,48 @@ describe('generateILayer', () => {
 
   describe('slug generation', () => {
     it('uses plural if available', async () => {
-      const entity = mkNoun({ id: 'n-person', name: 'Person', permissions: ['list'], plural: 'people' })
+      const entity = mkNounDef({ name: 'Person', permissions: ['list'], plural: 'people' })
 
-      const db = mockDB({
+      const model = createMockModel({
         nouns: [entity],
-        readings: [],
-        'state-machine-definitions': [],
-        roles: [],
-        statuses: [],
-        'event-types': [],
+        factTypes: [],
+        stateMachines: [],
       })
 
-      const result = await generateILayer(db, DOMAIN_ID)
+      const result = await generateILayer(model)
       expect(result.files['layers/people.json']).toBeDefined()
     })
 
     it('generates slug from PascalCase name when no plural', async () => {
-      const entity = mkNoun({ id: 'n-sr', name: 'SupportRequest', permissions: ['list'] })
+      const entity = mkNounDef({ name: 'SupportRequest', permissions: ['list'] })
 
-      const db = mockDB({
+      const model = createMockModel({
         nouns: [entity],
-        readings: [],
-        'state-machine-definitions': [],
-        roles: [],
-        statuses: [],
-        'event-types': [],
+        factTypes: [],
+        stateMachines: [],
       })
 
-      const result = await generateILayer(db, DOMAIN_ID)
+      const result = await generateILayer(model)
       expect(result.files['layers/support-requests.json']).toBeDefined()
     })
   })
 
   describe('deduplication of fields', () => {
     it('deduplicates fields by field ID', async () => {
-      const entity = mkNoun({ id: 'n-item', name: 'Item', permissions: ['create'], plural: 'items' })
-      const nameNoun = mkValueNoun({ id: 'n-name', name: 'Name', valueType: 'string' })
+      const entity = mkNounDef({ name: 'Item', permissions: ['create'], plural: 'items' })
+      const nameNoun = mkValueNounDef({ name: 'Name', valueType: 'string' })
 
-      const db = mockDB({
+      const model = createMockModel({
         nouns: [entity, nameNoun],
-        readings: [
-          // Two readings referencing the same value noun
-          mkReading('r1', 'Item has Name', ['role-1', 'role-2']),
-          mkReading('r2', 'Item identifies Name', ['role-3', 'role-4']),
+        factTypes: [
+          // Two fact types referencing the same value noun
+          mkFactType({ reading: 'Item has Name', roles: [{ nounDef: entity, roleIndex: 0 }, { nounDef: nameNoun, roleIndex: 1 }] }),
+          mkFactType({ reading: 'Item identifies Name', roles: [{ nounDef: entity, roleIndex: 0 }, { nounDef: nameNoun, roleIndex: 1 }] }),
         ],
-        'state-machine-definitions': [],
-        roles: [
-          mkRole('role-1', 'n-item'), mkRole('role-2', 'n-name'),
-          mkRole('role-3', 'n-item'), mkRole('role-4', 'n-name'),
-        ],
-        statuses: [],
-        'event-types': [],
+        stateMachines: [],
       })
 
-      const result = await generateILayer(db, DOMAIN_ID)
+      const result = await generateILayer(model)
       const create = JSON.parse(result.files['layers/items-new.json'])
       const nameFields = create.fieldsets[0].fields.filter((f: any) => f.id === 'name')
       expect(nameFields.length).toBe(1)
@@ -393,32 +293,24 @@ describe('generateILayer', () => {
 
   describe('list layer field cap', () => {
     it('shows at most 3 fields in list items', async () => {
-      const entity = mkNoun({ id: 'n-item', name: 'Item', permissions: ['list'], plural: 'items' })
-      const f1 = mkValueNoun({ id: 'v1', name: 'FieldOne', valueType: 'string' })
-      const f2 = mkValueNoun({ id: 'v2', name: 'FieldTwo', valueType: 'string' })
-      const f3 = mkValueNoun({ id: 'v3', name: 'FieldThree', valueType: 'string' })
-      const f4 = mkValueNoun({ id: 'v4', name: 'FieldFour', valueType: 'string' })
+      const entity = mkNounDef({ name: 'Item', permissions: ['list'], plural: 'items' })
+      const f1 = mkValueNounDef({ name: 'FieldOne', valueType: 'string' })
+      const f2 = mkValueNounDef({ name: 'FieldTwo', valueType: 'string' })
+      const f3 = mkValueNounDef({ name: 'FieldThree', valueType: 'string' })
+      const f4 = mkValueNounDef({ name: 'FieldFour', valueType: 'string' })
 
-      const db = mockDB({
+      const model = createMockModel({
         nouns: [entity, f1, f2, f3, f4],
-        readings: [
-          mkReading('r1', 'Item has FieldOne', ['r-1', 'r-2']),
-          mkReading('r2', 'Item has FieldTwo', ['r-3', 'r-4']),
-          mkReading('r3', 'Item has FieldThree', ['r-5', 'r-6']),
-          mkReading('r4', 'Item has FieldFour', ['r-7', 'r-8']),
+        factTypes: [
+          mkFactType({ reading: 'Item has FieldOne', roles: [{ nounDef: entity, roleIndex: 0 }, { nounDef: f1, roleIndex: 1 }] }),
+          mkFactType({ reading: 'Item has FieldTwo', roles: [{ nounDef: entity, roleIndex: 0 }, { nounDef: f2, roleIndex: 1 }] }),
+          mkFactType({ reading: 'Item has FieldThree', roles: [{ nounDef: entity, roleIndex: 0 }, { nounDef: f3, roleIndex: 1 }] }),
+          mkFactType({ reading: 'Item has FieldFour', roles: [{ nounDef: entity, roleIndex: 0 }, { nounDef: f4, roleIndex: 1 }] }),
         ],
-        'state-machine-definitions': [],
-        roles: [
-          mkRole('r-1', 'n-item'), mkRole('r-2', 'v1'),
-          mkRole('r-3', 'n-item'), mkRole('r-4', 'v2'),
-          mkRole('r-5', 'n-item'), mkRole('r-6', 'v3'),
-          mkRole('r-7', 'n-item'), mkRole('r-8', 'v4'),
-        ],
-        statuses: [],
-        'event-types': [],
+        stateMachines: [],
       })
 
-      const result = await generateILayer(db, DOMAIN_ID)
+      const result = await generateILayer(model)
       const list = JSON.parse(result.files['layers/items.json'])
       expect(list.items[0].items.length).toBe(3)
     })
@@ -426,19 +318,18 @@ describe('generateILayer', () => {
 
   describe('email detection by name', () => {
     it('infers email type from noun name containing "email"', async () => {
-      const entity = mkNoun({ id: 'n-item', name: 'Item', permissions: ['create'], plural: 'items' })
-      const emailNoun = mkValueNoun({ id: 'n-contact-email', name: 'ContactEmail', valueType: 'string' })
+      const entity = mkNounDef({ name: 'Item', permissions: ['create'], plural: 'items' })
+      const emailNoun = mkValueNounDef({ name: 'ContactEmail', valueType: 'string' })
 
-      const db = mockDB({
+      const model = createMockModel({
         nouns: [entity, emailNoun],
-        readings: [mkReading('r1', 'Item has ContactEmail', ['r-1', 'r-2'])],
-        'state-machine-definitions': [],
-        roles: [mkRole('r-1', 'n-item'), mkRole('r-2', 'n-contact-email')],
-        statuses: [],
-        'event-types': [],
+        factTypes: [
+          mkFactType({ reading: 'Item has ContactEmail', roles: [{ nounDef: entity, roleIndex: 0 }, { nounDef: emailNoun, roleIndex: 1 }] }),
+        ],
+        stateMachines: [],
       })
 
-      const result = await generateILayer(db, DOMAIN_ID)
+      const result = await generateILayer(model)
       const create = JSON.parse(result.files['layers/items-new.json'])
       expect(create.fieldsets[0].fields[0].type).toBe('email')
     })
