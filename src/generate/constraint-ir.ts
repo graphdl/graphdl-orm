@@ -1,5 +1,5 @@
 // src/generate/constraint-ir.ts
-import { parseConstraintText } from '../hooks/parse-constraint'
+import { parseConstraintText, parseSetComparisonBlock } from '../hooks/parse-constraint'
 
 // ── Types ──────────────────────────────────────────────────────────────
 
@@ -97,6 +97,10 @@ export async function generateConstraintIR(db: any, domainId: string): Promise<C
   const domainReadingIds = new Set(readings.map((r: any) => r.id))
   const domainRoles = roles.filter((r: any) => domainReadingIds.has(r.reading))
 
+  // Filter constraint-spans to those whose role belongs to this domain (prevents cross-domain bleed)
+  const domainRoleIds = new Set(domainRoles.map((r: any) => r.id))
+  const domainConstraintSpans = constraintSpans.filter((s: any) => domainRoleIds.has(s.role))
+
   // ── Nouns ──
   const irNouns: ConstraintIR['nouns'] = {}
   for (const noun of nouns) {
@@ -137,7 +141,7 @@ export async function generateConstraintIR(db: any, domainId: string): Promise<C
   // ── Constraints ──
   // Build span lookup: constraintId → Array<{ roleId, ... }>
   const spansByConstraint = new Map<string, any[]>()
-  for (const span of constraintSpans) {
+  for (const span of domainConstraintSpans) {
     const cid = span.constraint
     if (!spansByConstraint.has(cid)) spansByConstraint.set(cid, [])
     spansByConstraint.get(cid)!.push(span)
@@ -182,6 +186,16 @@ export async function generateConstraintIR(db: any, domainId: string): Promise<C
     }
     if (deonticOperator) entry.deonticOperator = deonticOperator
     if (c.setComparisonArgumentLength) entry.setComparisonArgumentLength = c.setComparisonArgumentLength
+
+    // Populate clauses and entity for set-comparison constraints
+    if (['XO', 'XC', 'OR', 'SS', 'EQ'].includes(c.kind) && c.text) {
+      const setComparison = parseSetComparisonBlock(c.text)
+      if (setComparison) {
+        if (setComparison.entity) entry.entity = setComparison.entity
+        if (setComparison.clauses) entry.clauses = setComparison.clauses
+      }
+    }
+
     irConstraints.push(entry)
   }
 
@@ -218,7 +232,7 @@ export async function generateConstraintIR(db: any, domainId: string): Promise<C
             const gsRoleIds = domainRoles
               .filter((r: any) => r.graphSchema === gsId)
               .map((r: any) => r.id)
-            const guardSpans = constraintSpans.filter((s: any) =>
+            const guardSpans = domainConstraintSpans.filter((s: any) =>
               gsRoleIds.includes(s.role)
             )
             const constraintIds = [...new Set(guardSpans.map((s: any) => s.constraint))]
