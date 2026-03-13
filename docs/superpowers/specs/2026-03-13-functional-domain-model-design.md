@@ -104,7 +104,8 @@ interface FactTypeDef {
   name?: string                 // graph schema name (used by OpenAPI for schema keys)
   reading: string               // "Customer has Name"
   roles: RoleDef[]
-  arity: number                 // roles.length
+  arity: number                 // roles.length — derived per readings/core.md:
+                                // "Graph Schema has Arity := count of Role where Graph Schema has Role."
 }
 
 interface RoleDef {
@@ -114,9 +115,23 @@ interface RoleDef {
   roleIndex: number
 }
 
+// All 16 constraint types from readings/core.md instance facts
+// Structural: UC (Uniqueness), MC (Mandatory), FC (Frequency)
+// Set comparison: SS (Subset), EQ (Equality), XC (Exclusion), OR (InclusiveOr), XO (ExclusiveOr)
+// Ring: IR (Irreflexive), AS (Asymmetric), AT (Antisymmetric), SY (Symmetric),
+//       IT (Intransitive), TR (Transitive), AC (Acyclic)
+// Value: VC (ValueComparison)
+// Note: DB CHECK currently allows UC,MC,SS,XC,EQ,OR,XO,RC — migration needed for full set
+type ConstraintKind =
+  | 'UC' | 'MC' | 'FC'
+  | 'SS' | 'EQ' | 'XC' | 'OR' | 'XO'
+  | 'IR' | 'AS' | 'AT' | 'SY' | 'IT' | 'TR' | 'AC'
+  | 'VC'
+  | 'RC'  // legacy generic ring constraint — kept for backward compat with existing DB data
+
 interface ConstraintDef {
   id: string
-  kind: 'UC' | 'MC' | 'RC' | 'SS' | 'XC' | 'EQ' | 'OR' | 'XO'
+  kind: ConstraintKind
   modality: 'Alethic' | 'Deontic'
   deonticOperator?: 'obligatory' | 'forbidden' | 'permitted'
   text: string
