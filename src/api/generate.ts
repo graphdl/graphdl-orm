@@ -5,8 +5,9 @@ import { generateSQLite } from '../generate/sqlite'
 import { generateXState } from '../generate/xstate'
 import { generateILayer } from '../generate/ilayer'
 import { generateReadings } from '../generate/readings'
+import { generateConstraintIR } from '../generate/constraint-ir'
 
-const VALID_FORMATS = ['openapi', 'sqlite', 'xstate', 'ilayer', 'readings'] as const
+const VALID_FORMATS = ['openapi', 'sqlite', 'xstate', 'ilayer', 'readings', 'constraint-ir'] as const
 
 export async function handleGenerate(request: Request, env: Env): Promise<Response> {
   const body = await request.json() as Record<string, any>
@@ -38,6 +39,9 @@ export async function handleGenerate(request: Request, env: Env): Promise<Respon
       break
     case 'readings':
       output = await generateReadings(db, domainId)
+      break
+    case 'constraint-ir':
+      output = await generateConstraintIR(db, domainId)
       break
   }
 
