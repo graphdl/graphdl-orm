@@ -42,7 +42,7 @@ describe('model types', () => {
     expect(ft.roles[0].nounDef.name).toBe('Customer')
   })
 
-  it('ConstraintKind covers all 16 types from readings + legacy RC', () => {
+  it('ConstraintKind covers all 17 kinds (16 from readings + legacy RC)', () => {
     const kinds: ConstraintKind[] = [
       'UC', 'MC', 'FC',
       'SS', 'EQ', 'XC', 'OR', 'XO',
