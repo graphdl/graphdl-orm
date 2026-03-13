@@ -3,6 +3,7 @@ export { generateSQLite } from './sqlite'
 export { generateXState } from './xstate'
 export { generateILayer } from './ilayer'
 export { generateReadings } from './readings'
+export { generateConstraintIR } from './constraint-ir'
 
 // Pure RMap functions (for direct use or testing)
 export {
