@@ -5,13 +5,13 @@
  * Processes constraint spans and graph schemas into JSON Schema properties.
  */
 
+import type { NounDef } from '../model/types'
 import {
   toPredicate,
   findPredicateObject,
   extractPropertyName,
   transformPropertyName,
   nameToKey,
-  type NounRef,
 } from './rmap'
 import {
   ensureTableExists,
@@ -26,7 +26,7 @@ import {
 // ---------------------------------------------------------------------------
 interface Role {
   id: string
-  noun?: { value: NounRef | string }
+  noun?: { value: NounDef | string }
   graphSchema?: { id: string }
   required?: boolean
 }
@@ -59,7 +59,7 @@ interface Graph {
 // ---------------------------------------------------------------------------
 // resolveNoun — resolve a noun value that might be a string id
 // ---------------------------------------------------------------------------
-function resolveNoun(raw: NounRef | string | undefined, nouns: NounRef[]): NounRef | undefined {
+function resolveNoun(raw: NounDef | string | undefined, nouns: NounDef[]): NounDef | undefined {
   if (!raw) return undefined
   if (typeof raw === 'string') return nouns.find((n) => n.id === raw)
   if (raw.id) return nouns.find((n) => n.id === raw.id) || raw
@@ -82,7 +82,7 @@ function resolveNoun(raw: NounRef | string | undefined, nouns: NounRef[]): NounR
 export function processBinarySchemas(
   constraintSpans: ConstraintSpan[],
   schemas: Record<string, Schema>,
-  nouns: NounRef[],
+  nouns: NounDef[],
   jsonExamples: Record<string, JSONSchemaType>,
   nounRegex: RegExp,
   examples: Graph[],
@@ -135,13 +135,13 @@ export function processBinarySchemas(
     setTableProperty({
       tables: schemas,
       subject,
-      object: object as NounRef,
+      object: object as NounDef,
       nouns,
       propertyName: extractPropertyName(objectReading),
       description: predicate.join(' '),
       required: subjectRole.required || false,
       property: createProperty({
-        object: object as NounRef,
+        object: object as NounDef,
         nouns,
         tables: schemas,
         jsonExamples,
@@ -163,7 +163,7 @@ export function processBinarySchemas(
  */
 export function processArraySchemas(
   arrayTypes: { gs: GraphSchema; cs: ConstraintSpan }[],
-  nouns: NounRef[],
+  nouns: NounDef[],
   nounRegex: RegExp,
   schemas: Record<string, Schema>,
   jsonExamples: Record<string, JSONSchemaType>,
@@ -213,7 +213,7 @@ export function processArraySchemas(
  */
 export function processUnarySchemas(
   graphSchemas: GraphSchema[],
-  nouns: NounRef[],
+  nouns: NounDef[],
   nounRegex: RegExp,
   schemas: Record<string, Schema>,
   jsonExamples: Record<string, JSONSchemaType>,
@@ -221,7 +221,7 @@ export function processUnarySchemas(
 ): void {
   for (const unarySchema of graphSchemas.filter((s) => s.roles?.docs?.length === 1)) {
     const unaryRole = unarySchema.roles?.docs?.[0] as Role
-    const subject = unaryRole?.noun?.value as NounRef
+    const subject = unaryRole?.noun?.value as NounDef
     if (!subject) continue
     const reading = unarySchema.readings?.docs?.[0]
     if (!reading) continue
@@ -246,7 +246,7 @@ export function processUnarySchemas(
     setTableProperty({
       tables: schemas,
       subject,
-      object: subject as NounRef,
+      object: subject as NounDef,
       nouns,
       propertyName: extractPropertyName(objectReading),
       description: predicate.join(' '),

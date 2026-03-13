@@ -1,17 +1,17 @@
 import { describe, it, expect } from 'vitest'
 import { processBinarySchemas, processArraySchemas, processUnarySchemas } from './fact-processors'
-import type { NounRef } from './rmap'
+import type { NounDef } from '../model/types'
 import { nounListToRegex } from './rmap'
 import type { Schema, JSONSchemaType } from './schema-builder'
 
 // ---------------------------------------------------------------------------
 // Helper factories
 // ---------------------------------------------------------------------------
-function mkNoun(overrides: Partial<NounRef> & { id: string; name: string }): NounRef {
-  return { ...overrides }
+function mkNoun(overrides: Partial<NounDef> & { id: string; name: string }): NounDef {
+  return { objectType: 'entity', domainId: 'd1', ...overrides }
 }
 
-function mkRole(id: string, noun: NounRef, graphSchemaId: string) {
+function mkRole(id: string, noun: NounDef, graphSchemaId: string) {
   return { id, noun: { value: noun }, graphSchema: { id: graphSchemaId } }
 }
 
@@ -307,7 +307,7 @@ describe('processArraySchemas', () => {
 
   it('skips array types with unresolved nouns', () => {
     const customer = mkNoun({ id: 'n1', name: 'Customer', objectType: 'entity' })
-    const missingNoun: NounRef = { id: 'n2', name: undefined as any }
+    const missingNoun: NounDef = { id: 'n2', name: undefined as any, objectType: 'entity', domainId: 'd1' }
     const nouns = [customer, missingNoun]
     const nounRegex = nounListToRegex(nouns)
 
