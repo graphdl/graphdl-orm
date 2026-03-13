@@ -4,6 +4,7 @@ export { generateXState } from './xstate'
 export { generateILayer } from './ilayer'
 export { generateReadings } from './readings'
 export { generateConstraintIR } from './constraint-ir'
+export { generateMdxui } from './mdxui'
 
 // Pure RMap functions (for direct use or testing)
 export {
