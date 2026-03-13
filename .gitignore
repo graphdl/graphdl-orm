@@ -33,6 +33,10 @@ yarn-error.log*
 # Visual Studio
 .vs/
 
+# Rust
+/crates/constraint-eval/target/
+/crates/constraint-eval/pkg/
+
 # legacy build artifacts
 .next/
 obj/
