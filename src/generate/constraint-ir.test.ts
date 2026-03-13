@@ -1,54 +1,37 @@
 // src/generate/constraint-ir.test.ts
-import { describe, it, expect, vi } from 'vitest'
+import { describe, it, expect, beforeEach } from 'vitest'
 import { generateConstraintIR } from './constraint-ir'
-
-/**
- * Create a mock DB that returns canned data for findInCollection calls.
- * This mirrors the pattern used in openapi.test.ts and xstate.test.ts.
- */
-function createMockDB(data: Record<string, any[]>) {
-  return {
-    findInCollection: vi.fn(async (slug: string, _where?: any, _opts?: any) => ({
-      docs: data[slug] || [],
-      totalDocs: (data[slug] || []).length,
-      limit: 10000,
-      page: 1,
-      hasNextPage: false,
-    })),
-  }
-}
+import { createMockModel, mkNounDef, mkValueNounDef, mkFactType, mkConstraint, mkStateMachine, resetIds } from '../model/test-utils'
 
 describe('generateConstraintIR', () => {
+  beforeEach(() => {
+    resetIds()
+  })
+
   it('generates IR with nouns, factTypes, constraints, and stateMachines', async () => {
-    const db = createMockDB({
-      'nouns': [
-        { id: 'n1', name: 'Customer', objectType: 'entity', domain: 'd1' },
-        { id: 'n2', name: 'Name', objectType: 'value', valueType: 'string', domain: 'd1' },
+    const customer = mkNounDef({ name: 'Customer' })
+    const name = mkValueNounDef({ name: 'Name', valueType: 'string' })
+    const ft = mkFactType({
+      reading: 'Customer has Name',
+      roles: [
+        { nounDef: customer, roleIndex: 0 },
+        { nounDef: name, roleIndex: 1 },
       ],
-      'graph-schemas': [
-        { id: 'gs1', name: 'CustomerName', domain: 'd1' },
-      ],
-      'readings': [
-        { id: 'r1', text: 'Customer has Name', graphSchema: 'gs1', domain: 'd1' },
-      ],
-      'roles': [
-        { id: 'ro1', reading: 'r1', noun: 'n1', graphSchema: 'gs1', roleIndex: 0 },
-        { id: 'ro2', reading: 'r1', noun: 'n2', graphSchema: 'gs1', roleIndex: 1 },
-      ],
-      'constraints': [
-        { id: 'c1', kind: 'UC', modality: 'Alethic', text: 'Each Customer has at most one Name', domain: 'd1' },
-      ],
-      'constraint-spans': [
-        { id: 'cs1', constraint: 'c1', role: 'ro1' },
-      ],
-      'state-machine-definitions': [],
-      'statuses': [],
-      'transitions': [],
-      'event-types': [],
-      'guards': [],
     })
 
-    const ir = await generateConstraintIR(db, 'd1')
+    const model = createMockModel({
+      nouns: [customer, name],
+      factTypes: [ft],
+      constraints: [
+        mkConstraint({
+          kind: 'UC',
+          text: 'Each Customer has at most one Name',
+          spans: [{ factTypeId: ft.id, roleIndex: 0 }],
+        }),
+      ],
+    })
+
+    const ir = await generateConstraintIR(model)
 
     // Domain
     expect(ir.domain).toBe('d1')
@@ -59,9 +42,9 @@ describe('generateConstraintIR', () => {
 
     // FactTypes
     expect(Object.keys(ir.factTypes)).toHaveLength(1)
-    const ft = ir.factTypes['gs1']
-    expect(ft.reading).toBe('Customer has Name')
-    expect(ft.roles).toEqual([
+    const irFt = ir.factTypes[ft.id]
+    expect(irFt.reading).toBe('Customer has Name')
+    expect(irFt.roles).toEqual([
       { nounName: 'Customer', roleIndex: 0 },
       { nounName: 'Name', roleIndex: 1 },
     ])
@@ -69,11 +52,10 @@ describe('generateConstraintIR', () => {
     // Constraints
     expect(ir.constraints).toHaveLength(1)
     expect(ir.constraints[0]).toMatchObject({
-      id: 'c1',
       kind: 'UC',
       modality: 'Alethic',
       text: 'Each Customer has at most one Name',
-      spans: [{ factTypeId: 'gs1', roleIndex: 0 }],
+      spans: [{ factTypeId: ft.id, roleIndex: 0 }],
     })
     // UC alethic → no deonticOperator
     expect(ir.constraints[0].deonticOperator).toBeUndefined()
@@ -82,150 +64,122 @@ describe('generateConstraintIR', () => {
     expect(Object.keys(ir.stateMachines)).toHaveLength(0)
   })
 
-  it('re-derives deonticOperator from constraint text', async () => {
-    const db = createMockDB({
-      'nouns': [
-        { id: 'n1', name: 'SupportResponse', objectType: 'entity', domain: 'd1' },
-        { id: 'n2', name: 'ProhibitedText', objectType: 'value', domain: 'd1' },
+  it('passes through deonticOperator from DomainModel', async () => {
+    const response = mkNounDef({ name: 'SupportResponse' })
+    const prohibited = mkValueNounDef({ name: 'ProhibitedText' })
+    const ft = mkFactType({
+      reading: 'SupportResponse contains ProhibitedText',
+      roles: [
+        { nounDef: response, roleIndex: 0 },
+        { nounDef: prohibited, roleIndex: 1 },
       ],
-      'graph-schemas': [
-        { id: 'gs1', name: 'ResponseContainsProhibited', domain: 'd1' },
-      ],
-      'readings': [
-        { id: 'r1', text: 'SupportResponse contains ProhibitedText', graphSchema: 'gs1', domain: 'd1' },
-      ],
-      'roles': [
-        { id: 'ro1', reading: 'r1', noun: 'n1', graphSchema: 'gs1', roleIndex: 0 },
-        { id: 'ro2', reading: 'r1', noun: 'n2', graphSchema: 'gs1', roleIndex: 1 },
-      ],
-      'constraints': [
-        {
-          id: 'c1', kind: 'UC', modality: 'Deontic',
-          text: 'It is forbidden that SupportResponse contains ProhibitedText',
-          domain: 'd1',
-        },
-      ],
-      'constraint-spans': [
-        { id: 'cs1', constraint: 'c1', role: 'ro1' },
-      ],
-      'state-machine-definitions': [],
-      'statuses': [],
-      'transitions': [],
-      'event-types': [],
-      'guards': [],
     })
 
-    const ir = await generateConstraintIR(db, 'd1')
+    const model = createMockModel({
+      nouns: [response, prohibited],
+      factTypes: [ft],
+      constraints: [
+        mkConstraint({
+          kind: 'UC',
+          modality: 'Deontic',
+          deonticOperator: 'forbidden',
+          text: 'It is forbidden that SupportResponse contains ProhibitedText',
+          spans: [{ factTypeId: ft.id, roleIndex: 0 }],
+        }),
+      ],
+    })
+
+    const ir = await generateConstraintIR(model)
 
     expect(ir.constraints[0].deonticOperator).toBe('forbidden')
     expect(ir.constraints[0].modality).toBe('Deontic')
   })
 
   it('generates state machine IR with transitions', async () => {
-    const db = createMockDB({
-      'nouns': [
-        { id: 'n1', name: 'SupportRequest', objectType: 'entity', domain: 'd1' },
+    const supportRequest = mkNounDef({ name: 'SupportRequest' })
+    const sm = mkStateMachine({
+      nounDef: supportRequest,
+      statuses: [
+        { id: 's1', name: 'Received' },
+        { id: 's2', name: 'Investigating' },
+        { id: 's3', name: 'Resolved' },
       ],
-      'graph-schemas': [],
-      'readings': [],
-      'roles': [],
-      'constraints': [],
-      'constraint-spans': [],
-      'state-machine-definitions': [
-        { id: 'sm1', title: 'SupportRequest', noun: 'n1', domain: 'd1' },
+      transitions: [
+        { from: 'Received', to: 'Investigating', event: 'investigate', eventTypeId: 'et1' },
+        { from: 'Investigating', to: 'Resolved', event: 'resolve', eventTypeId: 'et2' },
       ],
-      'statuses': [
-        { id: 's1', name: 'Received', stateMachineDefinition: 'sm1', domain: 'd1', createdAt: '2026-01-01' },
-        { id: 's2', name: 'Investigating', stateMachineDefinition: 'sm1', domain: 'd1', createdAt: '2026-01-02' },
-        { id: 's3', name: 'Resolved', stateMachineDefinition: 'sm1', domain: 'd1', createdAt: '2026-01-03' },
-      ],
-      'transitions': [
-        { id: 't1', from: 's1', to: 's2', eventType: 'et1', domain: 'd1' },
-        { id: 't2', from: 's2', to: 's3', eventType: 'et2', domain: 'd1' },
-      ],
-      'event-types': [
-        { id: 'et1', name: 'investigate', domain: 'd1' },
-        { id: 'et2', name: 'resolve', domain: 'd1' },
-      ],
-      'guards': [],
     })
 
-    const ir = await generateConstraintIR(db, 'd1')
+    const model = createMockModel({
+      nouns: [supportRequest],
+      stateMachines: [sm],
+    })
 
-    const sm = ir.stateMachines['sm1']
-    expect(sm).toBeDefined()
-    expect(sm.nounName).toBe('SupportRequest')
-    expect(sm.statuses).toEqual(['Received', 'Investigating', 'Resolved'])
-    expect(sm.transitions).toHaveLength(2)
-    expect(sm.transitions[0]).toEqual({ from: 'Received', to: 'Investigating', event: 'investigate' })
-    expect(sm.transitions[1]).toEqual({ from: 'Investigating', to: 'Resolved', event: 'resolve' })
+    const ir = await generateConstraintIR(model)
+
+    const irSm = ir.stateMachines[sm.id]
+    expect(irSm).toBeDefined()
+    expect(irSm.nounName).toBe('SupportRequest')
+    expect(irSm.statuses).toEqual(['Received', 'Investigating', 'Resolved'])
+    expect(irSm.transitions).toHaveLength(2)
+    expect(irSm.transitions[0]).toEqual({ from: 'Received', to: 'Investigating', event: 'investigate' })
+    expect(irSm.transitions[1]).toEqual({ from: 'Investigating', to: 'Resolved', event: 'resolve' })
   })
 
-  it('resolves guard → graph_schema → constraint_spans → constraints', async () => {
-    const db = createMockDB({
-      'nouns': [
-        { id: 'n1', name: 'Order', objectType: 'entity', domain: 'd1' },
-        { id: 'n2', name: 'Payment', objectType: 'entity', domain: 'd1' },
-      ],
-      'graph-schemas': [
-        { id: 'gs1', name: 'OrderPayment', domain: 'd1' },
-      ],
-      'readings': [
-        { id: 'r1', text: 'Order has Payment', graphSchema: 'gs1', domain: 'd1' },
-      ],
-      'roles': [
-        { id: 'ro1', reading: 'r1', noun: 'n1', graphSchema: 'gs1', roleIndex: 0 },
-        { id: 'ro2', reading: 'r1', noun: 'n2', graphSchema: 'gs1', roleIndex: 1 },
-      ],
-      'constraints': [
-        { id: 'c1', kind: 'MC', modality: 'Alethic', text: 'Each Order has at least one Payment', domain: 'd1' },
-      ],
-      'constraint-spans': [
-        { id: 'cs1', constraint: 'c1', role: 'ro1' },
-      ],
-      'state-machine-definitions': [
-        { id: 'sm1', title: 'Order', noun: 'n1', domain: 'd1' },
-      ],
-      'statuses': [
-        { id: 's1', name: 'Pending', stateMachineDefinition: 'sm1', domain: 'd1', createdAt: '2026-01-01' },
-        { id: 's2', name: 'Paid', stateMachineDefinition: 'sm1', domain: 'd1', createdAt: '2026-01-02' },
-      ],
-      'transitions': [
-        { id: 't1', from: 's1', to: 's2', eventType: 'et1', domain: 'd1' },
-      ],
-      'event-types': [
-        { id: 'et1', name: 'pay', domain: 'd1' },
-      ],
-      'guards': [
-        { id: 'g1', transition: 't1', graphSchema: 'gs1', domain: 'd1' },
+  it('includes guard on transition when present', async () => {
+    const order = mkNounDef({ name: 'Order' })
+    const payment = mkNounDef({ name: 'Payment' })
+    const ft = mkFactType({
+      reading: 'Order has Payment',
+      roles: [
+        { nounDef: order, roleIndex: 0 },
+        { nounDef: payment, roleIndex: 1 },
       ],
     })
 
-    const ir = await generateConstraintIR(db, 'd1')
+    const constraint = mkConstraint({
+      kind: 'MC',
+      text: 'Each Order has at least one Payment',
+      spans: [{ factTypeId: ft.id, roleIndex: 0 }],
+    })
 
-    const sm = ir.stateMachines['sm1']
-    expect(sm.transitions[0].guard).toEqual({
-      graphSchemaId: 'gs1',
-      constraintIds: ['c1'],
+    const sm = mkStateMachine({
+      nounDef: order,
+      statuses: [
+        { id: 's1', name: 'Pending' },
+        { id: 's2', name: 'Paid' },
+      ],
+      transitions: [
+        {
+          from: 'Pending',
+          to: 'Paid',
+          event: 'pay',
+          eventTypeId: 'et1',
+          guard: { graphSchemaId: ft.id, constraintIds: [constraint.id] },
+        },
+      ],
+    })
+
+    const model = createMockModel({
+      nouns: [order, payment],
+      factTypes: [ft],
+      constraints: [constraint],
+      stateMachines: [sm],
+    })
+
+    const ir = await generateConstraintIR(model)
+
+    const irSm = ir.stateMachines[sm.id]
+    expect(irSm.transitions[0].guard).toEqual({
+      graphSchemaId: ft.id,
+      constraintIds: [constraint.id],
     })
   })
 
   it('handles empty domain gracefully', async () => {
-    const db = createMockDB({
-      'nouns': [],
-      'graph-schemas': [],
-      'readings': [],
-      'roles': [],
-      'constraints': [],
-      'constraint-spans': [],
-      'state-machine-definitions': [],
-      'statuses': [],
-      'transitions': [],
-      'event-types': [],
-      'guards': [],
-    })
+    const model = createMockModel({})
 
-    const ir = await generateConstraintIR(db, 'd1')
+    const ir = await generateConstraintIR(model)
 
     expect(ir.domain).toBe('d1')
     expect(ir.nouns).toEqual({})
@@ -235,25 +189,15 @@ describe('generateConstraintIR', () => {
   })
 
   it('includes noun enum values and superType', async () => {
-    const db = createMockDB({
-      'nouns': [
-        { id: 'n1', name: 'Priority', objectType: 'value', valueType: 'string', enumValues: '["low","medium","high"]', domain: 'd1' },
-        { id: 'n2', name: 'Customer', objectType: 'entity', domain: 'd1' },
-        { id: 'n3', name: 'PremiumCustomer', objectType: 'entity', superType: 'n2', domain: 'd1' },
-      ],
-      'graph-schemas': [],
-      'readings': [],
-      'roles': [],
-      'constraints': [],
-      'constraint-spans': [],
-      'state-machine-definitions': [],
-      'statuses': [],
-      'transitions': [],
-      'event-types': [],
-      'guards': [],
+    const priority = mkValueNounDef({ name: 'Priority', valueType: 'string', enumValues: ['low', 'medium', 'high'] })
+    const customer = mkNounDef({ name: 'Customer' })
+    const premiumCustomer = mkNounDef({ name: 'PremiumCustomer', superType: 'Customer' })
+
+    const model = createMockModel({
+      nouns: [priority, customer, premiumCustomer],
     })
 
-    const ir = await generateConstraintIR(db, 'd1')
+    const ir = await generateConstraintIR(model)
 
     expect(ir.nouns['Priority']).toEqual({
       objectType: 'value',
