@@ -106,3 +106,5 @@ export interface ReadingDef {
   graphSchemaId: string
   roles: RoleDef[]
 }
+
+export type { Generator, NounRenderer, FactTypeRenderer } from './renderer'
