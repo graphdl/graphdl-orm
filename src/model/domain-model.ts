@@ -148,7 +148,7 @@ export class DomainModel {
 
   constructor(
     private loader: DataLoader,
-    private domainId: string,
+    readonly domainId: string,
   ) {}
 
   // -------------------------------------------------------------------------

@@ -618,23 +618,24 @@ export class GraphDLDB extends DurableObject {
   // Request Routing (stub — Task 5 adds the full REST router)
   // =========================================================================
 
-  // Transitional generate() — delegates to old generator signatures
-  // Each generator import will be updated in Chunk 2
   async generate(domainId: string, format: string): Promise<any> {
+    const model = this.getModel(domainId)
     switch (format) {
       case 'openapi':
-        return (await import('./generate/openapi')).generateOpenAPI(this, domainId)
+        return (await import('./generate/openapi')).generateOpenAPI(model)
       case 'sqlite':
         return (await import('./generate/sqlite')).generateSQLite(
-          await (await import('./generate/openapi')).generateOpenAPI(this, domainId))
+          await (await import('./generate/openapi')).generateOpenAPI(model))
       case 'xstate':
-        return (await import('./generate/xstate')).generateXState(this, domainId)
+        return (await import('./generate/xstate')).generateXState(model)
       case 'ilayer':
-        return (await import('./generate/ilayer')).generateILayer(this, domainId)
+        return (await import('./generate/ilayer')).generateILayer(model)
       case 'readings':
-        return (await import('./generate/readings')).generateReadings(this, domainId)
+        return (await import('./generate/readings')).generateReadings(model)
       case 'constraint-ir':
-        return (await import('./generate/constraint-ir')).generateConstraintIR(this, domainId)
+        return (await import('./generate/constraint-ir')).generateConstraintIR(model)
+      case 'mdxui':
+        return (await import('./generate/mdxui')).generateMdxui(model)
       default:
         throw new Error(`Unknown format: ${format}`)
     }
