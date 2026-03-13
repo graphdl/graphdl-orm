@@ -1,5 +1,11 @@
 // crates/constraint-eval/src/lib.rs
+//
+// WASM interface. Two exports:
+//   load_ir    — parse JSON IR, compile into predicates (once)
+//   evaluate_response — apply compiled predicates to response + population (per request)
+
 mod types;
+mod compile;
 mod evaluate;
 
 use wasm_bindgen::prelude::*;
@@ -7,27 +13,34 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 
 use types::{ConstraintIR, ResponseContext, Population, Violation};
+use compile::{CompiledModel, EvalContext};
 
-static IR: OnceLock<Mutex<Option<ConstraintIR>>> = OnceLock::new();
+struct CompiledState {
+    ir: ConstraintIR,
+    model: CompiledModel,
+}
 
-fn ir_store() -> &'static Mutex<Option<ConstraintIR>> {
-    IR.get_or_init(|| Mutex::new(None))
+static STATE: OnceLock<Mutex<Option<CompiledState>>> = OnceLock::new();
+
+fn state_store() -> &'static Mutex<Option<CompiledState>> {
+    STATE.get_or_init(|| Mutex::new(None))
 }
 
 #[wasm_bindgen]
 pub fn load_ir(ir_json: &str) -> Result<(), JsValue> {
     let ir: ConstraintIR = serde_json::from_str(ir_json)
         .map_err(|e| JsValue::from_str(&format!("Failed to parse IR: {}", e)))?;
-    let mut store = ir_store().lock().unwrap();
-    *store = Some(ir);
+    let model = compile::compile(&ir);
+    let mut store = state_store().lock().unwrap();
+    *store = Some(CompiledState { ir, model });
     Ok(())
 }
 
 #[wasm_bindgen]
 pub fn evaluate_response(response_json: &str, population_json: &str) -> String {
-    let store = ir_store().lock().unwrap();
-    let ir = match store.as_ref() {
-        Some(ir) => ir,
+    let store = state_store().lock().unwrap();
+    let state = match store.as_ref() {
+        Some(s) => s,
         None => return serde_json::to_string(&Vec::<Violation>::new()).unwrap(),
     };
 
@@ -55,6 +68,11 @@ pub fn evaluate_response(response_json: &str, population_json: &str) -> String {
         }
     };
 
-    let violations = evaluate::evaluate(ir, &response, &population);
+    let ctx = EvalContext {
+        response: &response,
+        population: &population,
+    };
+
+    let violations = evaluate::evaluate(&state.model, &ctx);
     serde_json::to_string(&violations).unwrap()
 }
