@@ -38,6 +38,10 @@ export const COLLECTION_TABLE_MAP: Record<string, string> = {
   // Generator output
   'generators': 'generators',
 
+  // Citations
+  'citations': 'citations',
+  'graph-citations': 'graph_citations',
+
   // Runtime instances
   'graphs': 'graphs',
   'resources': 'resources',
@@ -53,6 +57,7 @@ export const COLLECTION_SLUGS = Object.keys(COLLECTION_TABLE_MAP)
 /** Instance collections — scoped per-domain. */
 export const INSTANCE_COLLECTIONS = new Set([
   'graphs', 'resources', 'resource-roles',
+  'citations', 'graph-citations',
   'state-machines', 'events', 'guard-runs',
   'agents', 'completions',
 ])
@@ -84,6 +89,8 @@ export const FIELD_MAP: Record<string, Record<string, string>> = {
   agent_definitions: { model: 'model_id', domain: 'domain_id' },
   agents: { agentDefinition: 'agent_definition_id', resource: 'resource_id', domain: 'domain_id' },
   completions: { agent: 'agent_id', inputText: 'input_text', outputText: 'output_text', occurredAt: 'occurred_at', domain: 'domain_id' },
+  citations: { domain: 'domain_id', retrievalDate: 'retrieval_date' },
+  graph_citations: { graph: 'graph_id', citation: 'citation_id', domain: 'domain_id' },
   graphs: { graphSchema: 'graph_schema_id', domain: 'domain_id', isDone: 'is_done' },
   resources: { noun: 'noun_id', domain: 'domain_id', createdBy: 'created_by' },
   resource_roles: { graph: 'graph_id', resource: 'resource_id', role: 'role_id', domain: 'domain_id' },
@@ -116,6 +123,7 @@ export const FK_TARGET_TABLE: Record<string, string> = {
   verb_id: 'verbs',
   transition_id: 'transitions',
   guard_id: 'guards',
+  citation_id: 'citations',
   graph_id: 'graphs',
   resource_id: 'resources',
   state_machine_id: 'state_machines',

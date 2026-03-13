@@ -10,14 +10,25 @@
 | StateMachine | Name (within Domain) |
 | Event | Timestamp (within StateMachine) |
 | GuardRun | Name (within Event) |
+| Citation | (id) |
 
 ## Readings
+
+### Citation
+Citation has Text.
+  Each Citation has exactly one Text.
+Citation has URI.
+  Each Citation has at most one URI.
+Citation has RetrievalDate.
+  Each Citation has at most one RetrievalDate.
 
 ### Graph
 Graph belongs to Domain.
   Each Graph belongs to exactly one Domain.
 Graph is of GraphSchema.
   Each Graph is of exactly one GraphSchema.
+Graph cites Citation.
+  For each pair of Graph and Citation, that Graph cites that Citation at most once.
 
 ### Resource
 Resource belongs to Domain.

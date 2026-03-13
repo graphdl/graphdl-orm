@@ -10,6 +10,7 @@ describe('instance DDL', () => {
   it('includes all runtime instance tables', () => {
     const joined = INSTANCE_DDL.join('\n')
     const expectedTables = [
+      'citations', 'graph_citations',
       'graphs', 'resources', 'resource_roles',
       'state_machines', 'events', 'guard_runs',
     ]
