@@ -5,29 +5,10 @@
  * Zero external dependencies — only string manipulation.
  */
 
-// ---------------------------------------------------------------------------
-// NounRef — minimal interface for noun references used by RMap functions
-// ---------------------------------------------------------------------------
-export interface NounRef {
-  id: string
-  name?: string | null
-  plural?: string | null
-  description?: string | null
-  objectType?: string
-  valueType?: string | null
-  format?: string | null
-  pattern?: string | null
-  enumValues?: string | null
-  minimum?: number | null
-  exclusiveMinimum?: number | null
-  maximum?: number | null
-  exclusiveMaximum?: number | null
-  minLength?: number | null
-  maxLength?: number | null
-  multipleOf?: number | null
-  superType?: string | NounRef | null
-  referenceScheme?: (string | NounRef)[] | null
-}
+import type { NounDef } from '../model/types'
+
+/** @deprecated Use NounDef from '../model/types' directly */
+export type NounRef = NounDef
 
 // ---------------------------------------------------------------------------
 // nameToKey — strips spaces/hyphens, replaces & with And
@@ -74,7 +55,7 @@ export function extractPropertyName(objectReading: string[]): string {
 // ---------------------------------------------------------------------------
 // nounListToRegex — create regex matching any noun name (longest first)
 // ---------------------------------------------------------------------------
-export function nounListToRegex(nouns?: NounRef[]): RegExp {
+export function nounListToRegex(nouns?: NounDef[]): RegExp {
   return nouns
     ? new RegExp(
         '(' +
@@ -97,7 +78,7 @@ export function toPredicate({
   nounRegex,
 }: {
   reading: string
-  nouns: NounRef[]
+  nouns: NounDef[]
   nounRegex?: RegExp
 }): string[] {
   return reading
@@ -123,8 +104,8 @@ export function findPredicateObject({
   plural,
 }: {
   predicate: string[]
-  subject: NounRef
-  object?: NounRef
+  subject: NounDef
+  object?: NounDef
   plural?: string | null | undefined
 }): { objectBegin: number; objectEnd: number } {
   let subjectIndex = predicate.indexOf(subject.name || '')
