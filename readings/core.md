@@ -15,12 +15,14 @@ Verb(.id) is an entity type.
 
 Constraint(.id) is an entity type.
   Set Comparison Constraint is a subtype of Constraint.
+  Frequency Constraint is a subtype of Constraint.
 
 Constraint Type(.code) is an entity type.
 
 ConstraintSpan objectifies "Constraint spans Role".
 
 Modality Type is a value type.
+  The possible values of Modality Type are 'Alethic', 'Deontic'.
 
 Resource(.id) is an entity type.
   Graph is a subtype of Resource.
@@ -76,7 +78,12 @@ schema:Thing(.Name) is an entity type.
 
 ## Value Types
 
+Arity is a value type.
+MinOccurrence is a value type.
+MaxOccurrence is a value type.
 Name is a value type.
+ObjectType is a value type.
+  The possible values of ObjectType are 'entity', 'value'.
 Text is a value type.
 URI is a value type.
 Header is a value type.
@@ -92,6 +99,9 @@ FunctionType is a value type.
 ## Fact Types
 
 ### Noun
+Noun has ObjectType.
+  Each Noun has exactly one ObjectType.
+Noun is subtype of Noun.
 Noun is described to AI by prompt Text.
 Noun is displayed by UI Element.
 Noun is of schema:Thing.
@@ -106,6 +116,7 @@ Role is used in Reading.
 ### Graph Schema (subtype of Noun)
 Graph Schema has Reading.
 Graph Schema has Role.
+Graph Schema has Arity.
 
 ### Role
 Constraint spans Role.
@@ -136,8 +147,18 @@ Constraint is of Constraint Type.
 Constraint has modality of Modality Type.
 Constraint spans Role.
 
+### Constraint Type
+Constraint Type has Name.
+  Each Constraint Type has exactly one Name.
+
 ### Set Comparison Constraint (subtype of Constraint)
 Set Comparison Constraint has Argument Length.
+
+### Frequency Constraint (subtype of Constraint)
+Frequency Constraint has MinOccurrence.
+  Each Frequency Constraint has exactly one MinOccurrence.
+Frequency Constraint has MaxOccurrence.
+  Each Frequency Constraint has at most one MaxOccurrence.
 
 ### ConstraintSpan (objectification of "Constraint spans Role")
 ConstraintSpan autofills from superset.
@@ -208,3 +229,34 @@ Toolbar has Toolbar Item.
 
 ### Menu
 Menu has Menu Button.
+
+## Ring Constraints
+
+No Noun is subtype of itself.
+If Noun1 is subtype of Noun2, then Noun2 is not subtype of Noun1.
+If Noun1 is subtype of Noun2 and Noun2 is subtype of Noun3, then Noun1 is subtype of Noun3.
+
+## Derivation Rules
+
+Graph Schema has Arity := count of Role where Graph Schema has Role.
+
+## Instance Facts
+
+### Constraint Types
+
+Constraint Type 'UC' has Name 'Uniqueness'.
+Constraint Type 'MC' has Name 'Mandatory'.
+Constraint Type 'FC' has Name 'Frequency'.
+Constraint Type 'SS' has Name 'Subset'.
+Constraint Type 'EQ' has Name 'Equality'.
+Constraint Type 'XC' has Name 'Exclusion'.
+Constraint Type 'OR' has Name 'InclusiveOr'.
+Constraint Type 'XO' has Name 'ExclusiveOr'.
+Constraint Type 'IR' has Name 'Irreflexive'.
+Constraint Type 'AS' has Name 'Asymmetric'.
+Constraint Type 'AT' has Name 'Antisymmetric'.
+Constraint Type 'SY' has Name 'Symmetric'.
+Constraint Type 'IT' has Name 'Intransitive'.
+Constraint Type 'TR' has Name 'Transitive'.
+Constraint Type 'AC' has Name 'Acyclic'.
+Constraint Type 'VC' has Name 'ValueComparison'.
