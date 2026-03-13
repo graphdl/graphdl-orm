@@ -37,7 +37,7 @@ export async function render<T, Out>(model: ModelAccessors, gen: Generator<T, Ou
   const parts: T[] = []
   const nouns = await model.nouns()
 
-  for (const [name, noun] of nouns) {
+  for (const [, noun] of nouns) {
     if (noun.objectType === 'entity') {
       const fts = await model.factTypesFor(noun)
       const cs = await model.constraintsFor(fts)
