@@ -27,7 +27,7 @@ export interface ExtractedClaims {
     multiplicity?: string
   }>
   constraints: Array<{
-    kind: 'UC' | 'MC'
+    kind: 'UC' | 'MC' | 'RC'
     modality: 'Alethic' | 'Deontic'
     reading: string
     roles: number[]
