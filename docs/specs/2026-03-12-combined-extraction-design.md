@@ -6,12 +6,14 @@ Wire up the three dead proxy endpoints (`/extract`, `/check`, `/parse`) with rea
 
 | Route | Repo | Input | Output | Purpose |
 |-------|------|-------|--------|---------|
-| `POST /parse` | graphdl-orm | `{ text, domain }` | `ExtractedClaims` | Deterministic FORML2 parsing |
-| `POST /verify` | graphdl-orm | `{ text, domain }` | `{ matches, unmatchedConstraints }` | Deterministic fact matching against prose |
+| `POST /parse` | graphdl-orm | `{ text, domain }` | `ExtractedClaims` | Deterministic FORML2 parsing (read-only) |
+| `POST /verify` | graphdl-orm | `{ text, domain }` | `{ matches, unmatchedConstraints }` | Deterministic noun matching against prose |
 | `POST /graphdl/extract` | apis | `{ text, domain?, seed? }` | `ExtractedClaims` | LLM semantic extraction (rename of `/extract/claims`) |
 | `POST /graphdl/extract/all` | apis | `{ text, domain, seed? }` | `{ deterministic, semantic, combined }` | Calls `/parse` + `/extract`, merges |
 | `POST /graphdl/verify` | apis | `{ text, domain }` | `{ warnings }` | Full agent verification in 1 call |
 | `POST /graphdl/extract/semantic` | apis | `{ text, constraints }` | `{ claims }` | LLM deontic violation detection (unchanged) |
+
+All graphdl-orm routes are root-level (`/parse`, `/verify`) like the existing `/seed` and `/claims` routes. All apis routes are under `/graphdl/`.
 
 ## Boundary Principle
 
@@ -19,12 +21,14 @@ graphdl-orm is open source — no LLM calls, no API keys, pure deterministic log
 
 ## graphdl-orm: `POST /parse`
 
+**Read-only.** Parses FORML2 text into structured claims without writing to the database. To persist, callers pass the result to `/claims`.
+
 ### Input
 
 ```typescript
 {
   text: string    // Multi-line FORML2 text
-  domain: string  // Domain ID
+  domain: string  // Domain ID (used for noun context, not for writes)
 }
 ```
 
@@ -40,31 +44,73 @@ Customer submits SupportRequest.
 
 ### Behavior
 
-1. Split text into blocks on blank lines. Each block is a reading (first line) plus its indented constraints.
-2. Create a batch `HookContext` with `batch: true` and an empty `deferred` array.
-3. For each block, call `createWithHook('readings', { text: block, domain }, context)`.
-4. After all blocks, retry deferred constraints (constraints that referenced readings appearing later in the text).
-5. Collect all created objects into an `ExtractedClaims`-shaped response.
+1. Load existing nouns for the domain (for tokenization context).
+2. Split text into blocks on blank lines. Each block is a reading (first line) plus its indented constraints (subsequent indented lines).
+3. For each block:
+   a. Extract noun names via PascalCase matching (known nouns matched via `tokenizeReading()`, unknown nouns detected by PascalCase).
+   b. Determine predicate from the text between the first two nouns.
+   c. Apply entity/value heuristic: object of "has" → value type, otherwise entity type.
+   d. Parse each indented constraint line via `parseConstraintText()`.
+   e. Accumulate nouns, readings, constraints into the result.
+4. Detect subtype declarations ("X is a subtype of Y") and add to subtypes.
+5. If a constraint references nouns not yet seen, defer it. After all blocks, retry deferred constraints against the full noun set. Report any still-unresolved constraints as warnings.
+
+This is a **pure-function pipeline** — it does NOT use `createWithHook()` or touch the database. It reuses `tokenizeReading()` and `parseConstraintText()` as pure functions.
 
 ### Output
 
+Uses the canonical `ExtractedClaims` interface from `src/claims/ingest.ts`:
+
 ```typescript
 interface ExtractedClaims {
-  nouns: Array<{ name: string; objectType: 'entity' | 'value' }>
-  readings: Array<{ text: string; nouns: string[]; predicate: string; multiplicity?: string }>
-  constraints: Array<{ kind: string; modality: string; reading: string; roles: number[] }>
-  subtypes: Array<{ child: string; parent: string }>
-  warnings: string[]
+  nouns: Array<{
+    name: string
+    objectType: 'entity' | 'value'
+    plural?: string
+    valueType?: string
+    format?: string
+    enum?: string[]
+    minimum?: number
+    maximum?: number
+    pattern?: string
+  }>
+  readings: Array<{
+    text: string
+    nouns: string[]
+    predicate: string
+    multiplicity?: string
+  }>
+  constraints: Array<{
+    kind: 'UC' | 'MC' | 'RC'
+    modality: 'Alethic' | 'Deontic'
+    reading: string
+    roles: number[]
+  }>
+  subtypes: Array<{
+    child: string
+    parent: string
+  }>
+  transitions: []   // Always empty — FORML2 text does not express transitions
+  facts: []          // Always empty — FORML2 text does not express instance facts
 }
 ```
 
-Same shape as the LLM extractor returns (minus `transitions` and `facts` which are not expressed in FORML2 constraint syntax). This allows `/extract/all` to merge them trivially.
+Plus a top-level `warnings: string[]` for unresolvable constraints or unrecognized patterns.
+
+### Error Handling
+
+Malformed input produces partial results with warnings. `/parse` never fails wholesale — it returns whatever it could parse, with warnings for anything it couldn't. Examples:
+- Unrecognized constraint pattern → warning, constraint skipped
+- Fewer than 2 nouns in a reading → warning, reading skipped
+- Deferred constraint still unresolved after retry → warning
 
 ### Implementation
 
-Reuses 100% of the existing hook chain — no new parsing logic. The route is a thin wrapper that feeds multi-line text through `createWithHook` in batch mode, then collects the results.
+New handler file `src/api/parse.ts`. Pure-function chain using:
+- `tokenizeReading()` from `src/claims/tokenize.ts`
+- `parseConstraintText()` from `src/hooks/parse-constraint.ts`
 
-Register in `router.ts` alongside `/seed` and `/claims`.
+Does NOT import or call hooks, `createWithHook`, or any DB methods.
 
 ## graphdl-orm: `POST /verify`
 
@@ -79,36 +125,37 @@ Register in `router.ts` alongside `/seed` and `/claims`.
 
 ### Behavior
 
-1. Load all readings, constraints, constraint-spans, and roles for the domain.
-2. For each reading, tokenize the prose text to find fact instances — occurrences of the reading's nouns in proximity with a matching predicate.
-3. For each constraint, check if the deterministic matches violate it:
-   - UC violations: two instances share the same constrained role value.
-   - MC violations: a required role has no instance.
-   - RC violations: a self-referential instance matches.
-4. Separate constraints into deterministically checked (violation found or definitively clear) and unmatched (need semantic analysis).
+1. Load all readings, constraints, constraint-spans, roles, and nouns for the domain.
+2. For each reading, tokenize the prose text to find **noun-type mentions** — occurrences of the reading's noun names in the text.
+3. Classify each constraint:
+   - **Deterministically checkable**: all nouns referenced by the constraint's reading appear in the prose text. These constraints' nouns are "in scope" and can be checked.
+   - **Unmatched**: the constraint's nouns do NOT appear in the prose. These need semantic (LLM) analysis.
+4. For deterministically checkable constraints, report which readings matched and what text fragments were found.
+
+Note: The deterministic `/verify` does **not** attempt to extract structured fact tuples or detect UC/MC violations from prose — that requires entity-instance resolution beyond what the tokenizer can do. It identifies which constraints are *relevant* to the text (noun types are mentioned) and which are not. The apis-side `/graphdl/verify` endpoint then uses the LLM to do deeper violation analysis on the relevant constraints.
 
 ### Output
 
 ```typescript
 {
   matches: Array<{
-    reading: string       // Reading text
-    instances: string[]   // Extracted fact instances from the prose
+    reading: string       // Reading text (e.g., "Customer has Name")
+    nouns: string[]       // Nouns from this reading found in the prose
   }>
-  unmatchedConstraints: string[]  // Constraint texts that need semantic checking
+  unmatchedConstraints: string[]  // Constraint texts whose nouns are absent from the prose
 }
 ```
 
 ### Implementation
 
-New handler file `src/api/verify.ts`. Uses `tokenizeReading()` from `src/claims/tokenize.ts` and constraint data from the DO. Pure deterministic — no LLM.
+New handler file `src/api/verify.ts`. Uses `tokenizeReading()` and constraint/reading data from the DO. Pure deterministic — no LLM.
 
 ## apis: `POST /graphdl/extract`
 
 Rename of existing `/graphdl/extract/claims`. Same LLM logic, same Claude system prompt, same `ExtractedClaims` response shape.
 
 - If `seed: true`, ingests the extracted claims via graphdl-orm `/claims`.
-- `/graphdl/extract/claims` becomes an alias for backward compatibility.
+- `/graphdl/extract/claims` stays as an alias for backward compatibility.
 
 ## apis: `POST /graphdl/extract/all`
 
@@ -120,7 +167,7 @@ The combined extraction endpoint.
 {
   text: string      // FORML2, natural language, or mixed
   domain: string    // Domain ID
-  seed?: boolean    // If true, ingest combined claims
+  seed?: boolean    // If true, ingest combined claims via /claims
 }
 ```
 
@@ -133,13 +180,17 @@ The combined extraction endpoint.
 4. if (seed) POST graphdl-orm /claims          → ingest combined
 ```
 
+Steps 1 and 2 can run in parallel (no dependency).
+
 ### Deduplication
 
 `mergeClaims()` merges two `ExtractedClaims` objects:
-- **Nouns**: deduplicate by name. Deterministic wins on `objectType` conflicts.
-- **Readings**: deduplicate by noun set + predicate. Keep both if predicates differ.
-- **Constraints**: deduplicate by kind + reading + role indices.
-- **Subtypes**: deduplicate by child + parent pair.
+- **Nouns**: deduplicate by `name` (case-sensitive). Deterministic wins on `objectType` conflicts.
+- **Readings**: deduplicate by sorted noun-name set. If both sides have the same noun set, keep the deterministic version's text (it's the canonical FORML2 form). If noun sets differ, keep both.
+- **Constraints**: deduplicate by `kind` + `reading` + sorted `roles` array.
+- **Subtypes**: deduplicate by `child` + `parent` pair.
+- **Transitions**: pass through from semantic only (deterministic never produces transitions).
+- **Facts**: pass through from semantic only.
 
 ### Output
 
@@ -161,7 +212,7 @@ Unified agent verification — replaces the 3-call pipeline in agent-chat.ts.
 ```typescript
 {
   text: string    // Agent's draft response
-  domain: string  // Domain name or ID
+  domain: string  // Domain ID
 }
 ```
 
@@ -175,9 +226,9 @@ Unified agent verification — replaces the 3-call pipeline in agent-chat.ts.
    POST own /extract/semantic { text, constraints: unmatchedConstraints }
    → { claims }
 
-3. Combine:
-   - Deterministic violations from matches → warnings with method: 'deterministic'
-   - Semantic violations from claims → warnings with method: 'semantic'
+3. Combine into warnings:
+   - Each match with a constraint → warning with method: 'deterministic'
+   - Each semantic claim → warning with method: 'semantic'
 ```
 
 ### Output
@@ -185,9 +236,9 @@ Unified agent verification — replaces the 3-call pipeline in agent-chat.ts.
 ```typescript
 {
   warnings: Array<{
-    reading: string                         // Constraint text
-    instance?: string                       // What the agent wrote
-    claim?: string                          // Semantic violation detail
+    reading: string                         // Constraint/reading text
+    instance?: string                       // What the agent wrote (if deterministic)
+    claim?: string                          // Semantic violation detail (if semantic)
     method: 'deterministic' | 'semantic'
     confidence?: number                     // Only for semantic (0.0–1.0)
   }>
@@ -212,41 +263,48 @@ const { warnings } = await verifyProxy({ text, domain }, env)
 
 | Old Route | Action |
 |-----------|--------|
-| `POST /graphdl/extract/claims` | Alias to `POST /graphdl/extract` |
+| `POST /graphdl/extract/claims` | Alias to `POST /graphdl/extract` (backward compat) |
 | `POST /graphdl/check` | Remove — absorbed into `/graphdl/verify` |
-| Dead `/graphdl/extract` proxy | Replaced with real `/graphdl/extract` |
-| Dead `/graphdl/check` proxy | Replaced with real `/graphdl/verify` |
-| Dead `/graphdl/parse` proxy | Replaced with real `/graphdl/parse` proxy |
+| Dead `/graphdl/extract` proxy (`extract-proxy.ts`) | Replaced with real `/graphdl/extract` handler |
+| Dead `/graphdl/check` proxy (`check-proxy.ts`) | Removed — replaced by `/graphdl/verify` |
+| Dead `/graphdl/parse` proxy (`parse-proxy.ts`) | Replaced with real proxy to graphdl-orm `/parse` |
 
 ## Files Changed
 
 ### graphdl-orm
+
 | File | Action |
 |------|--------|
-| `src/api/parse.ts` | Create — `/parse` handler |
-| `src/api/verify.ts` | Create — `/verify` handler |
+| `src/api/parse.ts` | Create — `/parse` handler (pure-function FORML2 parser) |
+| `src/api/parse.test.ts` | Create — unit tests for `/parse` |
+| `src/api/verify.ts` | Create — `/verify` handler (deterministic noun matching) |
+| `src/api/verify.test.ts` | Create — unit tests for `/verify` |
 | `src/api/router.ts` | Modify — register `/parse` and `/verify` routes |
 
 ### apis
+
 | File | Action |
 |------|--------|
-| `graphdl/extract-proxy.ts` | Rewrite — rename to `/extract`, alias `/extract/claims` |
+| `graphdl/extract-proxy.ts` | Rewrite — becomes real `/extract` handler (rename of extract-claims logic), add `/extract/claims` alias |
 | `graphdl/check-proxy.ts` | Delete — replaced by verify |
 | `graphdl/parse-proxy.ts` | Rewrite — proxy to graphdl-orm `/parse` |
-| `graphdl/verify-proxy.ts` | Create — orchestrates deterministic + semantic |
+| `graphdl/verify-proxy.ts` | Create — orchestrates deterministic + semantic verification |
 | `graphdl/extract-all.ts` | Create — combined extraction endpoint |
 | `graphdl/merge-claims.ts` | Create — `mergeClaims()` deduplication logic |
-| `graphdl/agent-chat.ts` | Modify — replace 3-call verify with single `/verify` |
+| `graphdl/merge-claims.test.ts` | Create — unit tests for deduplication |
+| `graphdl/agent-chat.ts` | Modify — replace 3-call verify with single `/verify` call |
 | `index.ts` | Modify — update route registrations |
 
 ## Testing
 
 ### graphdl-orm
-- **`/parse` unit tests**: multi-line FORML2 → correct `ExtractedClaims` shape; batch deferral works; idempotent re-parse
-- **`/verify` unit tests**: prose with fact instances → correct matches; UC violation detection; unmatched constraints listed
+
+- **`/parse`**: multi-line FORML2 → correct `ExtractedClaims` shape; deferred constraint retry; partial results with warnings for malformed input; empty arrays for transitions/facts; subtype detection
+- **`/verify`**: prose mentioning domain nouns → correct matches; prose without domain nouns → all constraints unmatched; mixed → correct split
 
 ### apis
-- **`/extract/all` integration**: mock both graphdl-orm `/parse` and own `/extract`, verify merge logic
-- **`mergeClaims()` unit tests**: deduplication by noun name, reading noun-set, constraint identity
-- **`/verify` integration**: mock graphdl-orm `/verify` and `/extract/semantic`, verify warnings shape
-- **Agent chat**: verify single-call `/verify` produces same re-draft behavior
+
+- **`mergeClaims()`**: deduplication by noun name, reading noun-set, constraint identity; deterministic wins on conflicts; transitions/facts pass through from semantic
+- **`/extract/all`**: mock both sides, verify merge and optional seeding
+- **`/verify`**: mock graphdl-orm `/verify` and `/extract/semantic`, verify warnings shape matches agent-chat expectations
+- **Agent chat**: verify single-call `/verify` produces same re-draft behavior as old 3-call pipeline
