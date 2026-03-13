@@ -2,10 +2,11 @@
  * Schema builder functions — JSON Schema generation from ORM noun definitions.
  *
  * Ported from Generator.ts.bak (commit ddb8880) lines 2480-2812.
- * Depends on rmap.ts for nameToKey, transformPropertyName, NounRef.
+ * Depends on rmap.ts for nameToKey, transformPropertyName.
  */
 
-import { nameToKey, transformPropertyName, type NounRef } from './rmap'
+import { nameToKey, transformPropertyName } from './rmap'
+import type { NounDef } from '../model/types'
 
 // ---------------------------------------------------------------------------
 // Loose JSON Schema types (enough for the builder, not a full spec)
@@ -57,14 +58,14 @@ export function createProperty({
   jsonExamples,
 }: {
   description?: string
-  object: NounRef
-  nouns: NounRef[]
+  object: NounDef
+  nouns: NounDef[]
   tables: Record<string, Schema>
   jsonExamples: Record<string, JSONSchemaType>
 }): Schema {
   if (!object) return {}
 
-  // Resolve string id → NounRef
+  // Resolve string id → NounDef
   if (typeof (object as any) === 'string') {
     object = nouns.find((n) => n.id === (object as any)) || ({ id: object, name: object } as any)
   } else if (object.id) {
@@ -76,7 +77,7 @@ export function createProperty({
 
   // Traverse supertype chain to resolve valueType or referenceScheme
   while (!referenceScheme?.length && !valueType && superType) {
-    if (typeof superType === 'string') superType = nouns.find((n) => n.id === superType) as NounRef
+    if (typeof superType === 'string') superType = nouns.find((n) => n.id === superType) as NounDef
     referenceScheme = superType?.referenceScheme
     valueType = superType?.valueType
     superType = superType?.superType
@@ -88,13 +89,12 @@ export function createProperty({
     if (object.format) property.format = String(object.format)
     if (object.pattern) property.pattern = String(object.pattern)
     if (object.enumValues)
-      property.enum = object.enumValues.split(',').map((e) => {
-        const val = e.trim()
-        if (val === 'null') {
+      property.enum = object.enumValues.map((e) => {
+        if (e === 'null') {
           property.nullable = true
           return null
         }
-        return val
+        return e
       })
     if (typeof object.minLength === 'number') property.minLength = object.minLength
     if (typeof object.maxLength === 'number') property.maxLength = object.maxLength
@@ -106,9 +106,6 @@ export function createProperty({
     if (description) property.description = description
   } else {
     // ---- Entity type → oneOf with $ref + inline reference scheme ----
-    if (typeof referenceScheme === 'string')
-      referenceScheme = [nouns.find((n) => n.id === referenceScheme?.toString()) as NounRef]
-
     const required: string[] = []
     const propertyKey = nameToKey(object.name || '')
 
@@ -118,7 +115,6 @@ export function createProperty({
             type: 'object',
             properties: Object.fromEntries(
               referenceScheme?.map((role) => {
-                if (typeof role === 'string') role = nouns.find((n) => n.id === role) as NounRef
                 const propertyName = transformPropertyName(role.name || '')
                 required.push(propertyName)
                 return [
@@ -131,10 +127,7 @@ export function createProperty({
           }
         : referenceScheme
           ? createProperty({
-              object:
-                typeof referenceScheme[0] === 'string'
-                  ? (nouns.find((n) => n.id === referenceScheme?.[0]) as NounRef)
-                  : referenceScheme[0],
+              object: referenceScheme[0],
               tables,
               nouns,
               description,
@@ -165,8 +158,8 @@ export function ensureTableExists({
   jsonExamples,
 }: {
   tables: Record<string, Schema>
-  subject: NounRef
-  nouns: NounRef[]
+  subject: NounDef
+  nouns: NounDef[]
   jsonExamples: Record<string, JSONSchemaType>
 }): void {
   const title = subject.name || ''
@@ -197,16 +190,12 @@ export function ensureTableExists({
 
   // Unpack reference scheme into properties
   if (subject.referenceScheme) {
-    let { referenceScheme } = subject
-    if (!(referenceScheme instanceof Array))
-      referenceScheme = [nouns.find((n) => n.id === referenceScheme?.toString()) as NounRef]
-    for (let idRole of referenceScheme || []) {
-      if (typeof idRole === 'string') idRole = nouns.find((n) => n.id === idRole) as NounRef
+    for (const idRole of subject.referenceScheme) {
       const property = createProperty({ object: idRole, nouns, tables, jsonExamples })
       setTableProperty({
         tables,
         subject,
-        object: idRole as NounRef,
+        object: idRole,
         nouns,
         required: true,
         property,
@@ -217,15 +206,15 @@ export function ensureTableExists({
   }
 
   // Wire supertype chain
-  let superType: NounRef | string | undefined | null = subject.superType
+  let superType: NounDef | string | undefined = subject.superType
   if (typeof superType === 'string') superType = nouns?.find((n) => n.id === superType)
-  if ((superType as NounRef)?.name) {
-    superType = (superType as NounRef) || nouns?.find((n) => n.id === (superType as NounRef).id)
-    const superTypeKey = nameToKey((superType as NounRef).name || '')
+  if ((superType as NounDef)?.name) {
+    superType = (superType as NounDef) || nouns?.find((n) => n.id === (superType as NounDef).id)
+    const superTypeKey = nameToKey((superType as NounDef).name || '')
     tables['Update' + key].allOf = [{ $ref: '#/components/schemas/Update' + superTypeKey }]
     tables['New' + key].allOf?.push({ $ref: '#/components/schemas/New' + superTypeKey })
     tables[key].allOf?.push({ $ref: '#/components/schemas/' + superTypeKey })
-    ensureTableExists({ tables, subject: superType as NounRef, nouns, jsonExamples })
+    ensureTableExists({ tables, subject: superType as NounDef, nouns, jsonExamples })
   } else {
     tables['Update' + key].type = 'object'
   }
@@ -254,9 +243,9 @@ export function setTableProperty({
   jsonExamples,
 }: {
   tables: Record<string, Schema>
-  nouns: NounRef[]
-  subject: NounRef
-  object: NounRef
+  nouns: NounDef[]
+  subject: NounDef
+  object: NounDef
   propertyName?: string
   description?: string
   required?: boolean

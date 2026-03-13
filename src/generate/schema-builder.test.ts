@@ -1,12 +1,12 @@
 import { describe, it, expect } from 'vitest'
 import { createProperty, ensureTableExists, setTableProperty } from './schema-builder'
-import type { NounRef } from './rmap'
+import type { NounDef } from '../model/types'
 
 // ---------------------------------------------------------------------------
-// Helper — quick NounRef factory
+// Helper — quick NounDef factory
 // ---------------------------------------------------------------------------
-function mkNoun(overrides: Partial<NounRef> & { id: string; name: string }): NounRef {
-  return { ...overrides }
+function mkNoun(overrides: Partial<NounDef> & { id: string; name: string }): NounDef {
+  return { objectType: 'value', domainId: 'd1', ...overrides }
 }
 
 // ---------------------------------------------------------------------------
@@ -109,13 +109,14 @@ describe('ensureTableExists', () => {
     expect(tables['UpdateCustomer'].properties['id'].type).toBe('integer')
   })
 
-  it('unpacks referenceScheme given as string ids', () => {
+  it('unpacks referenceScheme given as NounDef objects', () => {
     const tables: Record<string, any> = {}
     const idNoun = mkNoun({ id: 'id1', name: 'Customer Nr', valueType: 'integer' })
     const subject = mkNoun({
       id: '1',
       name: 'Customer',
-      referenceScheme: ['id1'],
+      objectType: 'entity',
+      referenceScheme: [idNoun],
     })
 
     ensureTableExists({ tables, subject, nouns: [subject, idNoun], jsonExamples: {} })
@@ -224,7 +225,7 @@ describe('createProperty', () => {
       id: '1',
       name: 'Status',
       valueType: 'string',
-      enumValues: 'active, inactive, pending',
+      enumValues: ['active', 'inactive', 'pending'],
     })
     const result = createProperty({ object: noun, nouns: [noun], tables: {}, jsonExamples: {} })
     expect(result.enum).toEqual(['active', 'inactive', 'pending'])
@@ -235,7 +236,7 @@ describe('createProperty', () => {
       id: '1',
       name: 'Status',
       valueType: 'string',
-      enumValues: 'active, null, pending',
+      enumValues: ['active', 'null', 'pending'],
     })
     const result = createProperty({ object: noun, nouns: [noun], tables: {}, jsonExamples: {} })
     expect(result.enum).toContain(null)
