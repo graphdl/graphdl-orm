@@ -1,15 +1,18 @@
-import { parseConstraintText } from './parse-constraint'
+import { parseConstraintText, parseSetComparisonBlock } from './parse-constraint'
 import { parseMultiplicity } from '../claims/constraints'
 import { tokenizeReading } from '../claims/tokenize'
 import type { HookResult, HookContext } from './index'
 import { EMPTY_RESULT } from './index'
 
+const SET_COMPARISON_KINDS = new Set(['SS', 'XC', 'EQ', 'OR', 'XO'])
+
 /**
  * Constraint afterCreate hook.
  *
- * Accepts two input formats:
- * - Natural language (text field): parse via parseConstraintText()
+ * Accepts three input formats:
+ * - Natural language (text field): parse via parseConstraintText() or parseSetComparisonBlock()
  * - Shorthand notation (multiplicity field): parse via parseMultiplicity()
+ * - Pre-parsed set-comparison (kind is SS/XC/EQ/OR/XO with no reading): skip host reading lookup
  *
  * After parsing, finds the host reading and creates constraint-spans.
  */
@@ -21,10 +24,27 @@ export async function constraintAfterCreate(
   const result: HookResult = { created: {}, warnings: [] }
   const domainId = context.domainId || doc.domain
 
+  // Pre-parsed set-comparison constraint (created via ingest pipeline or raw API)
+  if (SET_COMPARISON_KINDS.has(doc.kind) && !doc.text && !doc.multiplicity) {
+    return result
+  }
+
   let parsedConstraints: Array<{ kind: string; modality: string; deonticOperator?: string; roles?: number[] }>
   let constraintNouns: string[] = []
 
   if (doc.text) {
+    // Try set-comparison block parse first (multi-line XO/XC/OR/SS)
+    const scBlock = parseSetComparisonBlock(doc.text)
+    if (scBlock) {
+      // Update the constraint record with parsed kind/modality
+      await db.updateInCollection('constraints', doc.id, {
+        kind: scBlock.kind,
+        modality: scBlock.modality,
+      })
+      // Set-comparison constraints don't have a single host reading — done
+      return result
+    }
+
     // Natural language path
     const parsed = parseConstraintText(doc.text)
     if (!parsed) {

@@ -7,7 +7,7 @@
 import type { GraphDLDB } from '../do'
 
 export interface ConstraintDef {
-  kind: 'UC' | 'MC'
+  kind: 'UC' | 'MC' | 'RC' | 'SS' | 'XC' | 'EQ' | 'OR' | 'XO'
   modality: 'Alethic' | 'Deontic'
   roles: number[]
 }

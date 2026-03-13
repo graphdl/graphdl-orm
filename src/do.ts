@@ -194,6 +194,10 @@ export class GraphDLDB extends DurableObject {
       'CREATE INDEX IF NOT EXISTS idx_resources_created_by ON resources(created_by)',
       // constraints: add text column for source text round-tripping
       'ALTER TABLE constraints ADD COLUMN text TEXT',
+      // constraints: add set_comparison_argument_length for SS/XC/EQ
+      'ALTER TABLE constraints ADD COLUMN set_comparison_argument_length INTEGER',
+      // constraint_spans: add subset_autofill for SS constraints
+      'ALTER TABLE constraint_spans ADD COLUMN subset_autofill INTEGER DEFAULT 0',
     ]
     for (const migration of migrations) {
       try { this.sql.exec(migration) } catch { /* column/index already exists */ }

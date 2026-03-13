@@ -27,10 +27,18 @@ export interface ExtractedClaims {
     multiplicity?: string
   }>
   constraints: Array<{
-    kind: 'UC' | 'MC' | 'RC'
+    kind: 'UC' | 'MC' | 'RC' | 'SS' | 'XC' | 'EQ' | 'OR' | 'XO'
     modality: 'Alethic' | 'Deontic'
     reading: string
     roles: number[]
+    /** Full verbalized text (set-comparison constraints) */
+    text?: string
+    /** For XO/XC/OR: the individual clause texts */
+    clauses?: string[]
+    /** For set-comparison: the constrained entity name */
+    entity?: string
+    /** For set-comparison: role spans across multiple readings */
+    spans?: Array<{ reading: string; roles: number[] }>
   }>
   subtypes?: Array<{ child: string; parent: string }>
   transitions?: Array<{ entity: string; from: string; to: string; event: string }>
@@ -194,6 +202,36 @@ export async function ingestClaims(
   // Step 4: Apply explicit constraints
   for (const constraint of claims.constraints || []) {
     try {
+      // Set-comparison constraints (SS/XC/EQ/OR/XO) have no single host reading
+      if (!constraint.reading && ['SS', 'XC', 'EQ', 'OR', 'XO'].includes(constraint.kind)) {
+        const c = await db.createInCollection('constraints', {
+          kind: constraint.kind,
+          modality: constraint.modality,
+          domain: domainId,
+        })
+
+        // If cross-reading spans are provided, create constraint-spans
+        if (constraint.spans?.length) {
+          for (const span of constraint.spans) {
+            const schema = schemaMap.get(span.reading)
+            if (!schema) continue
+            const roles = await db.findInCollection('roles', {
+              graphSchema: { equals: schema.id },
+            }, { sort: 'createdAt' })
+            for (const idx of span.roles) {
+              const roleId = roles.docs[idx]?.id
+              if (roleId) {
+                await db.createInCollection('constraint-spans', {
+                  constraint: c.id,
+                  role: roleId,
+                })
+              }
+            }
+          }
+        }
+        continue
+      }
+
       const schema = schemaMap.get(constraint.reading)
       if (!schema) { result.errors.push(`constraint: reading "${constraint.reading}" not found`); continue }
 
