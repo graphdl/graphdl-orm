@@ -25,7 +25,7 @@
 ```typescript
 // src/model/types.test.ts
 import { describe, it, expect } from 'vitest'
-import type { NounDef, FactTypeDef, RoleDef, ConstraintDef, SpanDef, StateMachineDef, StatusDef, TransitionDef, VerbDef, ReadingDef } from './types'
+import type { NounDef, FactTypeDef, RoleDef, ConstraintDef, ConstraintKind, SpanDef, StateMachineDef, StatusDef, TransitionDef, VerbDef, ReadingDef } from './types'
 
 describe('model types', () => {
   it('NounDef represents entity nouns', () => {
@@ -67,7 +67,18 @@ describe('model types', () => {
     expect(ft.roles[0].nounDef.name).toBe('Customer')
   })
 
-  it('ConstraintDef supports all 8 kinds with spans', () => {
+  it('ConstraintKind covers all 16 types from readings + legacy RC', () => {
+    const kinds: ConstraintKind[] = [
+      'UC', 'MC', 'FC',                          // structural
+      'SS', 'EQ', 'XC', 'OR', 'XO',              // set comparison
+      'IR', 'AS', 'AT', 'SY', 'IT', 'TR', 'AC',  // ring
+      'VC',                                        // value comparison
+      'RC',                                        // legacy generic ring
+    ]
+    expect(kinds).toHaveLength(17)
+  })
+
+  it('ConstraintDef supports structural constraints with spans', () => {
     const c: ConstraintDef = {
       id: 'c1', kind: 'UC', modality: 'Alethic', text: 'Each Customer has at most one Name',
       spans: [{ factTypeId: 'gs1', roleIndex: 1 }],
@@ -108,7 +119,16 @@ Expected: FAIL — cannot find module `./types`
 
 - [ ] **Step 3: Create types.ts with all type definitions**
 
-Create `src/model/types.ts` with all interfaces from the spec (§1 Types section). Copy the full type definitions from the spec — `NounDef`, `FactTypeDef`, `RoleDef`, `ConstraintDef`, `SpanDef`, `StateMachineDef`, `StatusDef`, `TransitionDef`, `VerbDef`, `ReadingDef`. Export all interfaces.
+Create `src/model/types.ts` with all interfaces from the spec (§1 Types section). Copy the full type definitions from the spec — `ConstraintKind`, `NounDef`, `FactTypeDef`, `RoleDef`, `ConstraintDef`, `SpanDef`, `StateMachineDef`, `StatusDef`, `TransitionDef`, `VerbDef`, `ReadingDef`. Export all types.
+
+`ConstraintKind` is a union of all 16 constraint types from `readings/core.md` instance facts plus legacy `'RC'`:
+- Structural: UC (Uniqueness), MC (Mandatory), FC (Frequency)
+- Set comparison: SS (Subset), EQ (Equality), XC (Exclusion), OR (InclusiveOr), XO (ExclusiveOr)
+- Ring: IR (Irreflexive), AS (Asymmetric), AT (Antisymmetric), SY (Symmetric), IT (Intransitive), TR (Transitive), AC (Acyclic)
+- Value: VC (ValueComparison)
+- Legacy: RC (generic ring — kept for backward compat with existing DB data)
+
+Note: DB CHECK currently only allows UC,MC,SS,XC,EQ,OR,XO,RC. A migration to widen the CHECK will be needed when new constraint types are stored.
 
 Key details from spec:
 - `NounDef.enumValues` is `string[]` (DomainModel pre-parses from JSON string in DB)
@@ -1035,6 +1055,8 @@ git commit -m "refactor(generate): update fact-processors for NounDef types"
 - Modify: `src/generate/constraint-ir.test.ts`
 
 The constraint-ir generator is the simplest rewrite — the DomainModel already IS the constraint IR. The generator serializes the typed data to the output shape expected by the WASM evaluator. This is a **direct generator** (not a walker) because the IR output is a coordinated whole — nouns, factTypes, constraints, and stateMachines all appear in one flat JSON blob, not decomposed per-entity.
+
+**Data sources:** `readings/core.md` (instance facts define all 16 constraint types), `readings/validation.md` (deontic meta-constraints for ORM2 modeling discipline — arity decomposition, ring constraint completeness/validity, etc.). The validation constraints are enforced by the WASM evaluator at runtime.
 
 - [ ] **Step 1: Rewrite generator as direct DomainModel consumer**
 
