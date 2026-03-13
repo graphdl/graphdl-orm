@@ -6,8 +6,8 @@ import {
   nounListToRegex,
   toPredicate,
   findPredicateObject,
-  NounRef,
 } from './rmap'
+import type { NounDef } from '../model/types'
 
 // ---------------------------------------------------------------------------
 // nameToKey
@@ -126,9 +126,9 @@ describe('nounListToRegex', () => {
   })
 
   it('creates regex matching noun names', () => {
-    const nouns: NounRef[] = [
-      { id: '1', name: 'Customer' },
-      { id: '2', name: 'SupportRequest' },
+    const nouns: NounDef[] = [
+      { id: '1', name: 'Customer', objectType: 'entity', domainId: 'd1' },
+      { id: '2', name: 'SupportRequest', objectType: 'entity', domainId: 'd1' },
     ]
     const regex = nounListToRegex(nouns)
     expect(regex.test('Customer')).toBe(true)
@@ -137,9 +137,9 @@ describe('nounListToRegex', () => {
   })
 
   it('sorts longest names first to avoid partial matches', () => {
-    const nouns: NounRef[] = [
-      { id: '1', name: 'API' },
-      { id: '2', name: 'APIKey' },
+    const nouns: NounDef[] = [
+      { id: '1', name: 'API', objectType: 'entity', domainId: 'd1' },
+      { id: '2', name: 'APIKey', objectType: 'entity', domainId: 'd1' },
     ]
     const regex = nounListToRegex(nouns)
     // The regex should match 'APIKey' before 'API'
@@ -148,17 +148,14 @@ describe('nounListToRegex', () => {
     expect(match![0]).toBe('APIKey')
   })
 
-  it('filters out nouns with null/undefined names', () => {
-    const nouns: NounRef[] = [
-      { id: '1', name: null },
-      { id: '2', name: 'Customer' },
-    ]
+  it('handles empty noun list', () => {
+    const nouns: NounDef[] = []
     const regex = nounListToRegex(nouns)
-    expect(regex.test('Customer')).toBe(true)
+    expect(regex.source).toBe('()')
   })
 
   it('allows optional trailing hyphen', () => {
-    const nouns: NounRef[] = [{ id: '1', name: 'Customer' }]
+    const nouns: NounDef[] = [{ id: '1', name: 'Customer', objectType: 'entity', domainId: 'd1' }]
     const regex = nounListToRegex(nouns)
     expect(regex.test('Customer-')).toBe(true)
   })
@@ -167,11 +164,14 @@ describe('nounListToRegex', () => {
 // ---------------------------------------------------------------------------
 // toPredicate
 // ---------------------------------------------------------------------------
+const D = 'd1'
+const E = 'entity' as const
+
 describe('toPredicate', () => {
   it('tokenizes a simple reading', () => {
-    const nouns: NounRef[] = [
-      { id: '1', name: 'Customer' },
-      { id: '2', name: 'SupportRequest' },
+    const nouns: NounDef[] = [
+      { id: '1', name: 'Customer', objectType: E, domainId: D },
+      { id: '2', name: 'SupportRequest', objectType: E, domainId: D },
     ]
     const result = toPredicate({
       reading: 'Customer submits SupportRequest',
@@ -181,9 +181,9 @@ describe('toPredicate', () => {
   })
 
   it('keeps noun names intact even with hyphens', () => {
-    const nouns: NounRef[] = [
-      { id: '1', name: 'Customer' },
-      { id: '2', name: 'Support Request' },
+    const nouns: NounDef[] = [
+      { id: '1', name: 'Customer', objectType: E, domainId: D },
+      { id: '2', name: 'Support Request', objectType: E, domainId: D },
     ]
     const result = toPredicate({
       reading: 'Customer has Support Request',
@@ -193,9 +193,9 @@ describe('toPredicate', () => {
   })
 
   it('handles reading with pre-computed nounRegex', () => {
-    const nouns: NounRef[] = [
-      { id: '1', name: 'Customer' },
-      { id: '2', name: 'Domain' },
+    const nouns: NounDef[] = [
+      { id: '1', name: 'Customer', objectType: E, domainId: D },
+      { id: '2', name: 'Domain', objectType: E, domainId: D },
     ]
     const nounRegex = nounListToRegex(nouns)
     const result = toPredicate({
@@ -207,9 +207,9 @@ describe('toPredicate', () => {
   })
 
   it('filters out empty tokens', () => {
-    const nouns: NounRef[] = [
-      { id: '1', name: 'Customer' },
-      { id: '2', name: 'Name' },
+    const nouns: NounDef[] = [
+      { id: '1', name: 'Customer', objectType: E, domainId: D },
+      { id: '2', name: 'Name', objectType: 'value', domainId: D },
     ]
     const result = toPredicate({
       reading: 'Customer has Name',
@@ -219,7 +219,7 @@ describe('toPredicate', () => {
   })
 
   it('handles reading starting with noun', () => {
-    const nouns: NounRef[] = [{ id: '1', name: 'Vehicle' }]
+    const nouns: NounDef[] = [{ id: '1', name: 'Vehicle', objectType: E, domainId: D }]
     const result = toPredicate({
       reading: 'Vehicle has Color',
       nouns,
@@ -228,8 +228,8 @@ describe('toPredicate', () => {
   })
 
   it('converts hyphenated non-noun words to camelCase', () => {
-    const nouns: NounRef[] = [
-      { id: '1', name: 'Customer' },
+    const nouns: NounDef[] = [
+      { id: '1', name: 'Customer', objectType: E, domainId: D },
     ]
     const result = toPredicate({
       reading: 'Customer is-called Name',
@@ -243,7 +243,7 @@ describe('toPredicate', () => {
 // findPredicateObject
 // ---------------------------------------------------------------------------
 describe('findPredicateObject', () => {
-  const mkNoun = (name: string): NounRef => ({ id: name.toLowerCase(), name })
+  const mkNoun = (name: string): NounDef => ({ id: name.toLowerCase(), name, objectType: E, domainId: D })
 
   it('finds object after subject with verb', () => {
     const predicate = ['Customer', 'has', 'Priority']
