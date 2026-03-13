@@ -1,7 +1,7 @@
 import { json, error } from 'itty-router'
 import type { Env } from '../types'
 
-const VALID_FORMATS = ['openapi', 'sqlite', 'xstate', 'ilayer', 'readings', 'constraint-ir'] as const
+const VALID_FORMATS = ['openapi', 'sqlite', 'xstate', 'ilayer', 'readings', 'constraint-ir', 'mdxui'] as const
 
 export async function handleGenerate(request: Request, env: Env): Promise<Response> {
   const body = await request.json() as Record<string, any>
