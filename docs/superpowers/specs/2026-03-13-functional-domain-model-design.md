@@ -139,6 +139,8 @@ interface ConstraintDef {
   entity?: string
   clauses?: string[]
   setComparisonArgumentLength?: number  // for set comparison constraints (XC, EQ, OR, XO)
+  minOccurrence?: number               // for frequency constraints (FC) — mandatory when kind='FC'
+  maxOccurrence?: number               // for frequency constraints (FC) — optional
 }
 
 interface SpanDef {
