@@ -2,18 +2,14 @@
  * generateXState — generates XState machine configs, agent tool schemas,
  * and agent system prompts from state machine definitions.
  *
- * Ported from Generator.ts.bak lines 1354-1558. Adapted for DO findInCollection API.
+ * Consumes a DomainModel object instead of raw DB queries.
  */
+
+import type { NounDef, FactTypeDef, StateMachineDef, ReadingDef } from '../model/types'
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/** Fetch all docs from a collection, handling pagination by using a large limit. */
-async function fetchAll(db: any, slug: string, where?: any): Promise<any[]> {
-  const result = await db.findInCollection(slug, where, { limit: 10000 })
-  return result?.docs || []
-}
 
 /** Convert PascalCase to kebab-case: SupportRequest → support-request */
 function toKebab(name: string): string {
@@ -27,65 +23,35 @@ function toKebab(name: string): string {
 // Main
 // ---------------------------------------------------------------------------
 
-export async function generateXState(db: any, domainId: string): Promise<{ files: Record<string, string> }> {
-  const stateMachineDefinitions = await fetchAll(db, 'state-machine-definitions', { domain: { equals: domainId } })
-  const nouns = await fetchAll(db, 'nouns', { domain: { equals: domainId } })
+export async function generateXState(model: {
+  nouns(): Promise<Map<string, NounDef>>
+  factTypes(): Promise<Map<string, FactTypeDef>>
+  stateMachines(): Promise<Map<string, StateMachineDef>>
+  readings(): Promise<ReadingDef[]>
+}): Promise<{ files: Record<string, string> }> {
+  const stateMachines = await model.stateMachines()
   const files: Record<string, string> = {}
 
-  for (const smDef of stateMachineDefinitions) {
-    // Fetch statuses for this state machine definition, sorted by createdAt
-    const statuses = await fetchAll(db, 'statuses', { stateMachineDefinition: { equals: smDef.id } })
-    // Sort by createdAt ascending (string comparison works for ISO dates)
-    statuses.sort((a: any, b: any) => (a.createdAt || '').localeCompare(b.createdAt || ''))
+  for (const [, sm] of stateMachines) {
+    const { statuses, transitions } = sm
 
     if (!statuses.length) continue
 
-    // Collect all transitions across all statuses
+    // Build transition list with callback metadata
     const allTransitions: { from: string; to: string; event: string; callback?: { url: string; method: string } }[] = []
 
-    for (const status of statuses) {
-      const transitions = await fetchAll(db, 'transitions', { from: { equals: status.id } })
-
-      for (const t of transitions) {
-        // Resolve toStatus name
-        const toStatusId = t.to
-        const toStatus = statuses.find((s: any) => s.id === toStatusId)
-
-        // Resolve eventType name
-        const eventTypeId = t.eventType
-        let eventType: any = null
-        if (eventTypeId) {
-          const eventTypes = await fetchAll(db, 'event-types', { id: { equals: eventTypeId } })
-          eventType = eventTypes[0] || null
-        }
-
-        // Resolve verb → function chain for callback metadata
-        let callback: { url: string; method: string } | undefined
-        const verbId = t.verb
-        if (verbId) {
-          const verbs = await fetchAll(db, 'verbs', { id: { equals: verbId } })
-          const verb = verbs[0]
-          if (verb?.function) {
-            const funcId = typeof verb.function === 'string' ? verb.function : verb.function?.id
-            if (funcId) {
-              const funcs = await fetchAll(db, 'functions', { id: { equals: funcId } })
-              const func = funcs[0]
-              if (func?.callbackUrl) {
-                callback = { url: func.callbackUrl, method: func.httpMethod || 'POST' }
-              }
-            }
-          }
-        }
-
-        if (toStatus?.name && eventType?.name) {
-          allTransitions.push({
-            from: status.name,
-            to: toStatus.name,
-            event: eventType.name,
-            callback,
-          })
-        }
+    for (const t of transitions) {
+      let callback: { url: string; method: string } | undefined
+      if (t.verb?.func?.callbackUrl) {
+        callback = { url: t.verb.func.callbackUrl, method: t.verb.func.httpMethod || 'POST' }
       }
+
+      allTransitions.push({
+        from: t.from,
+        to: t.to,
+        event: t.event,
+        callback,
+      })
     }
 
     // Build states from statuses + transitions
@@ -105,12 +71,9 @@ export async function generateXState(db: any, domainId: string): Promise<{ files
 
     // Determine initial state: the status with no incoming transitions
     const statesWithIncoming = new Set(allTransitions.map((t) => t.to))
-    const initialStatus = statuses.find((s: any) => !statesWithIncoming.has(s.name)) || statuses[0]
+    const initialStatus = statuses.find((s) => !statesWithIncoming.has(s.name)) || statuses[0]
 
-    // Resolve noun name from the state machine definition
-    const nounId = smDef.noun
-    const nounValue = nouns.find((n: any) => n.id === nounId)
-    const machineName = toKebab(nounValue?.name || 'unknown')
+    const machineName = toKebab(sm.nounName)
 
     const xstateConfig = {
       id: machineName,
@@ -144,53 +107,46 @@ export async function generateXState(db: any, domainId: string): Promise<{ files
     files[`agents/${machineName}-tools.json`] = JSON.stringify(tools, null, 2)
 
     // Generate system prompt from RELEVANT readings + state machine
-    // 1. Find graph schemas where the machine's entity noun plays a role
-    const allRoles = await fetchAll(db, 'roles')
+    // 1. Find fact types where the SM's noun participates in a role
+    const allFactTypes = await model.factTypes()
 
-    const directSchemaIds = new Set<string>()
-    const relatedNounIds = new Set<string>()
-    if (nounId) relatedNounIds.add(nounId)
+    const directFactTypeIds = new Set<string>()
+    const relatedNounNames = new Set<string>()
+    relatedNounNames.add(sm.nounName)
 
-    for (const role of allRoles) {
-      const roleNounId = role.noun
-      const gsId = role.graphSchema
-      if (roleNounId === nounId && gsId) {
-        directSchemaIds.add(gsId)
+    for (const [ftId, ft] of allFactTypes) {
+      if (ft.roles.some((r) => r.nounName === sm.nounName)) {
+        directFactTypeIds.add(ftId)
       }
     }
 
-    // 2. Collect all noun IDs that participate in those schemas
-    for (const role of allRoles) {
-      const gsId = role.graphSchema
-      if (directSchemaIds.has(gsId)) {
-        const roleNounId = role.noun
-        if (roleNounId) relatedNounIds.add(roleNounId)
+    // 2. Collect all noun names that participate in those fact types
+    for (const [ftId, ft] of allFactTypes) {
+      if (directFactTypeIds.has(ftId)) {
+        for (const r of ft.roles) {
+          relatedNounNames.add(r.nounName)
+        }
       }
     }
 
-    // 3. Expand one level — schemas where any related noun participates
-    const expandedSchemaIds = new Set(directSchemaIds)
-    for (const role of allRoles) {
-      const roleNounId = role.noun
-      const gsId = role.graphSchema
-      if (relatedNounIds.has(roleNounId) && gsId) {
-        expandedSchemaIds.add(gsId)
+    // 3. Expand one level — fact types where any related noun participates
+    const expandedFactTypeIds = new Set(directFactTypeIds)
+    for (const [ftId, ft] of allFactTypes) {
+      if (ft.roles.some((r) => relatedNounNames.has(r.nounName))) {
+        expandedFactTypeIds.add(ftId)
       }
     }
 
-    // 4. Filter readings to those in the expanded schema set
-    const allReadings = await fetchAll(db, 'readings')
-    const readings = allReadings.filter((r: any) => {
-      const gsId = r.graphSchema
-      return expandedSchemaIds.has(gsId)
-    })
+    // 4. Filter readings to those in the expanded fact type set
+    const allReadings = await model.readings()
+    const readings = allReadings.filter((r) => expandedFactTypeIds.has(r.graphSchemaId))
 
-    const readingTexts = [...new Set(readings.map((r: any) => r.text).filter(Boolean))] as string[]
-    const stateNames = statuses.map((s: any) => s.name)
+    const readingTexts = [...new Set(readings.map((r) => r.text).filter(Boolean))] as string[]
+    const stateNames = statuses.map((s) => s.name)
     const eventNames = Array.from(uniqueEvents.keys())
 
     const prompt = [
-      `# ${nounValue?.name || 'Agent'} Agent`,
+      `# ${sm.nounName} Agent`,
       '',
       '## Domain Model',
       ...readingTexts.map((r: string) => `- ${r}`),
