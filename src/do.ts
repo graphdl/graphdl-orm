@@ -14,6 +14,7 @@
 import { DurableObject } from 'cloudflare:workers'
 import { ALL_DDL, ALL_BOOTSTRAP } from './schema'
 import { COLLECTION_TABLE_MAP, FIELD_MAP, FK_TARGET_TABLE } from './collections'
+import { DomainModel, SqlDataLoader } from './model/domain-model'
 
 /** Fields common to every table — Payload camelCase → SQL snake_case. */
 const COMMON_FIELDS: Record<string, string> = {
@@ -159,6 +160,16 @@ function getTableColumns(sql: SqlStorage, table: string): string[] {
 export class GraphDLDB extends DurableObject {
   protected sql: SqlStorage
   protected _writeTail: Promise<void> = Promise.resolve()
+  private models: Map<string, DomainModel> = new Map()
+
+  getModel(domainId: string): DomainModel {
+    let model = this.models.get(domainId)
+    if (!model) {
+      model = new DomainModel(new SqlDataLoader(this.sql), domainId)
+      this.models.set(domainId, model)
+    }
+    return model
+  }
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env)
@@ -434,6 +445,10 @@ export class GraphDLDB extends DurableObject {
 
       this.logCdcEvent('create', table, id, { ...filteredData, id })
 
+      // Auto-invalidate DomainModel cache
+      const domainId = (sqlData.domain_id ?? filteredData.domain_id) as string
+      if (domainId) this.getModel(domainId).invalidate(collectionSlug)
+
       // Return the created record
       const rows = this.sql.exec(`SELECT * FROM ${table} WHERE id = ?`, id).toArray()
       return rowToPayload(rows[0] as Record<string, unknown>, reverseMap)
@@ -481,6 +496,10 @@ export class GraphDLDB extends DurableObject {
       )
 
       this.logCdcEvent('update', table, id, sqlData)
+
+      // Auto-invalidate DomainModel cache
+      const domainId = (sqlData.domain_id ?? (existing[0] as any).domain_id) as string
+      if (domainId) this.getModel(domainId).invalidate(collectionSlug)
 
       // Return updated record
       const rows = this.sql.exec(`SELECT * FROM ${table} WHERE id = ?`, id).toArray()
@@ -542,8 +561,8 @@ export class GraphDLDB extends DurableObject {
     return this.withWriteLock(async () => {
       const table = this.resolveTable(collectionSlug)
 
-      // Check existence before delete
-      const existing = this.sql.exec(`SELECT id FROM ${table} WHERE id = ?`, id).toArray()
+      // Check existence before delete (SELECT * so we can read domain_id for cache invalidation)
+      const existing = this.sql.exec(`SELECT * FROM ${table} WHERE id = ?`, id).toArray()
       if (existing.length === 0) return { deleted: false }
 
       let cascaded = 0
@@ -563,6 +582,10 @@ export class GraphDLDB extends DurableObject {
 
       this.sql.exec(`DELETE FROM ${table} WHERE id = ?`, id)
       this.logCdcEvent('delete', table, id)
+
+      // Auto-invalidate DomainModel cache
+      const domainId = (existing[0] as any).domain_id as string
+      if (domainId) this.getModel(domainId).invalidate(collectionSlug)
 
       return { deleted: true, ...(cascaded > 0 && { cascaded }) }
     })
@@ -594,6 +617,28 @@ export class GraphDLDB extends DurableObject {
   // =========================================================================
   // Request Routing (stub — Task 5 adds the full REST router)
   // =========================================================================
+
+  // Transitional generate() — delegates to old generator signatures
+  // Each generator import will be updated in Chunk 2
+  async generate(domainId: string, format: string): Promise<any> {
+    switch (format) {
+      case 'openapi':
+        return (await import('./generate/openapi')).generateOpenAPI(this, domainId)
+      case 'sqlite':
+        return (await import('./generate/sqlite')).generateSQLite(
+          await (await import('./generate/openapi')).generateOpenAPI(this, domainId))
+      case 'xstate':
+        return (await import('./generate/xstate')).generateXState(this, domainId)
+      case 'ilayer':
+        return (await import('./generate/ilayer')).generateILayer(this, domainId)
+      case 'readings':
+        return (await import('./generate/readings')).generateReadings(this, domainId)
+      case 'constraint-ir':
+        return (await import('./generate/constraint-ir')).generateConstraintIR(this, domainId)
+      default:
+        throw new Error(`Unknown format: ${format}`)
+    }
+  }
 
   async fetch(request: Request): Promise<Response> {
     return new Response(JSON.stringify({ status: 'ok', version: '0.1.0' }), {

@@ -1,11 +1,5 @@
 import { json, error } from 'itty-router'
 import type { Env } from '../types'
-import { generateOpenAPI } from '../generate/openapi'
-import { generateSQLite } from '../generate/sqlite'
-import { generateXState } from '../generate/xstate'
-import { generateILayer } from '../generate/ilayer'
-import { generateReadings } from '../generate/readings'
-import { generateConstraintIR } from '../generate/constraint-ir'
 
 const VALID_FORMATS = ['openapi', 'sqlite', 'xstate', 'ilayer', 'readings', 'constraint-ir'] as const
 
@@ -21,33 +15,11 @@ export async function handleGenerate(request: Request, env: Env): Promise<Respon
   const id = env.GRAPHDL_DB.idFromName('graphdl-primary')
   const db = env.GRAPHDL_DB.get(id) as any
 
-  let output: any
-  switch (outputFormat) {
-    case 'openapi':
-      output = await generateOpenAPI(db, domainId)
-      break
-    case 'sqlite': {
-      const openapi = await generateOpenAPI(db, domainId)
-      output = generateSQLite(openapi)
-      break
-    }
-    case 'xstate':
-      output = await generateXState(db, domainId)
-      break
-    case 'ilayer':
-      output = await generateILayer(db, domainId)
-      break
-    case 'readings':
-      output = await generateReadings(db, domainId)
-      break
-    case 'constraint-ir':
-      output = await generateConstraintIR(db, domainId)
-      break
-  }
+  // Delegate to DO's generate() RPC method
+  const output = await db.generate(domainId, outputFormat)
 
   // Persist the generator output so ui.do can fetch it via /graphdl/raw/generators
   try {
-    // Find existing generator for this domain+format to update, or create new
     const existing = await db.findInCollection('generators', {
       domain: { equals: domainId },
       outputFormat: { equals: outputFormat },
