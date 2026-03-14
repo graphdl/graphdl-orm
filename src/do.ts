@@ -555,7 +555,45 @@ export class GraphDLDB extends DurableObject {
   }
 
   /**
-   * Delete a record by ID. For domains and apps, cascade-deletes all children.
+   * FK dependency map: parent_table → [(child_table, fk_column)].
+   * Used by deleteFromCollection to cascade-delete children before the parent.
+   */
+  private static readonly CASCADE_MAP: Record<string, Array<[string, string]>> = {
+    readings:                    [['roles', 'reading_id']],
+    graph_schemas:               [['roles', 'graph_schema_id'], ['readings', 'graph_schema_id']],
+    nouns:                       [['roles', 'noun_id']],
+    constraints:                 [['constraint_spans', 'constraint_id']],
+    roles:                       [['constraint_spans', 'role_id']],
+    state_machine_definitions:   [['statuses', 'state_machine_definition_id'], ['transitions', 'state_machine_definition_id']],
+    statuses:                    [['transitions', 'status_from_id'], ['transitions', 'status_to_id']],
+    event_types:                 [['transitions', 'event_type_id']],
+    transitions:                 [['guards', 'transition_id']],
+  }
+
+  /**
+   * Cascade-delete children of a record, recursively.
+   * Returns count of deleted child rows.
+   */
+  private cascadeDeleteChildren(table: string, id: string): number {
+    let cascaded = 0
+    const children = GraphDLDB.CASCADE_MAP[table]
+    if (!children) return cascaded
+
+    for (const [childTable, fkCol] of children) {
+      // Find child IDs first, then recurse before deleting
+      const childRows = this.sql.exec(`SELECT id FROM ${childTable} WHERE ${fkCol} = ?`, id).toArray()
+      for (const row of childRows) {
+        cascaded += this.cascadeDeleteChildren(childTable, row.id as string)
+        this.sql.exec(`DELETE FROM ${childTable} WHERE id = ?`, row.id as string)
+        this.logCdcEvent('delete', childTable, row.id as string)
+        cascaded++
+      }
+    }
+    return cascaded
+  }
+
+  /**
+   * Delete a record by ID. Cascade-deletes all children via FK dependency map.
    */
   async deleteFromCollection(collectionSlug: string, id: string): Promise<{ deleted: boolean; cascaded?: number }> {
     return this.withWriteLock(async () => {
@@ -578,6 +616,9 @@ export class GraphDLDB extends DurableObject {
           this.logCdcEvent('delete', 'domains', domain.id as string)
           cascaded++
         }
+      } else {
+        // General cascade: delete children via FK dependency map
+        cascaded = this.cascadeDeleteChildren(table, id)
       }
 
       this.sql.exec(`DELETE FROM ${table} WHERE id = ?`, id)
