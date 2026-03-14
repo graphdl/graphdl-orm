@@ -1071,6 +1071,73 @@ export class GraphDLDB extends DurableObject {
     }
   }
 
+  /**
+   * Query a 3NF entity table. Returns rows with pagination.
+   * The table name is derived from the noun name via RMAP.
+   */
+  async queryEntities(
+    domainId: string,
+    nounName: string,
+    options?: { where?: Record<string, any>; sort?: string; limit?: number; page?: number },
+  ): Promise<{ docs: Record<string, unknown>[]; totalDocs: number; page: number; limit: number; hasNextPage: boolean }> {
+    const { toTableName, toColumnName } = await import('./generate/sqlite')
+    const tableName = toTableName(nounName)
+    const limit = options?.limit || 100
+    const page = options?.page || 1
+    const offset = (page - 1) * limit
+
+    // Verify table exists
+    try {
+      this.sql.exec(`SELECT 1 FROM ${tableName} LIMIT 0`)
+    } catch {
+      return { docs: [], totalDocs: 0, page, limit, hasNextPage: false }
+    }
+
+    let query = `SELECT * FROM ${tableName} WHERE domain_id = ?`
+    let countQuery = `SELECT count(*) as cnt FROM ${tableName} WHERE domain_id = ?`
+    const params: any[] = [domainId]
+    const countParams: any[] = [domainId]
+
+    // Simple where clause support
+    if (options?.where) {
+      for (const [field, condition] of Object.entries(options.where)) {
+        const col = toColumnName(field)
+        if (typeof condition === 'object' && condition !== null) {
+          for (const [op, val] of Object.entries(condition as Record<string, any>)) {
+            if (op === 'equals') { query += ` AND ${col} = ?`; countQuery += ` AND ${col} = ?`; params.push(val); countParams.push(val) }
+            else if (op === 'not_equals') { query += ` AND ${col} != ?`; countQuery += ` AND ${col} != ?`; params.push(val); countParams.push(val) }
+            else if (op === 'like') { query += ` AND ${col} LIKE ?`; countQuery += ` AND ${col} LIKE ?`; params.push(val); countParams.push(val) }
+          }
+        } else {
+          query += ` AND ${col} = ?`; countQuery += ` AND ${col} = ?`; params.push(condition); countParams.push(condition)
+        }
+      }
+    }
+
+    // Sort
+    const sortField = options?.sort?.startsWith('-') ? options.sort.slice(1) : (options?.sort || 'created_at')
+    const sortDir = options?.sort?.startsWith('-') ? 'DESC' : 'DESC'
+    query += ` ORDER BY ${toColumnName(sortField)} ${sortDir}`
+    query += ` LIMIT ? OFFSET ?`
+    params.push(limit, offset)
+
+    const rows = this.sql.exec(query, ...params).toArray()
+    const countRow = this.sql.exec(countQuery, ...countParams).toArray()
+    const totalDocs = (countRow[0]?.cnt as number) ?? 0
+
+    // Convert snake_case columns to camelCase for API consumers
+    const docs = rows.map(row => {
+      const doc: Record<string, unknown> = {}
+      for (const [key, val] of Object.entries(row as Record<string, unknown>)) {
+        const camelKey = key.replace(/_([a-z])/g, (_, c) => c.toUpperCase())
+        doc[camelKey] = val
+      }
+      return doc
+    })
+
+    return { docs, totalDocs, page, limit, hasNextPage: offset + limit < totalDocs }
+  }
+
   async generate(domainId: string, format: string): Promise<any> {
     const model = this.getModel(domainId)
     switch (format) {

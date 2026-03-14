@@ -219,6 +219,45 @@ router.post('/api/entity', async (request, env: Env) => {
   return json(result, { status: 201 })
 })
 
+// ── Entity queries (3NF tables) ───────────────────────────────────────
+router.get('/api/entities/:noun', async (request, env: Env) => {
+  const { noun } = request.params
+  const url = new URL(request.url)
+  const domainId = url.searchParams.get('domain')
+  if (!domainId) return error(400, { errors: [{ message: 'domain query param required' }] })
+
+  const limit = parseInt(url.searchParams.get('limit') || '100', 10)
+  const page = parseInt(url.searchParams.get('page') || '1', 10)
+  const sort = url.searchParams.get('sort') || '-createdAt'
+
+  // Parse where params: where[field][op]=value
+  const where: Record<string, any> = {}
+  for (const [key, val] of url.searchParams.entries()) {
+    const m = key.match(/^where\[(\w+)\](?:\[(\w+)\])?$/)
+    if (m) {
+      const field = m[1]
+      const op = m[2] || 'equals'
+      where[field] = { [op]: val }
+    }
+  }
+
+  const db = getDB(env) as any
+  const result = await db.queryEntities(domainId, noun, { where, sort, limit, page })
+  return json(result)
+})
+
+router.get('/api/entities/:noun/:id', async (request, env: Env) => {
+  const { noun, id } = request.params
+  const url = new URL(request.url)
+  const domainId = url.searchParams.get('domain')
+  if (!domainId) return error(400, { errors: [{ message: 'domain query param required' }] })
+
+  const db = getDB(env) as any
+  const result = await db.queryEntities(domainId, noun, { where: { id: { equals: id } }, limit: 1 })
+  if (!result.docs.length) return error(404, { errors: [{ message: 'Not Found' }] })
+  return json(result.docs[0])
+})
+
 // ── Collection CRUD ──────────────────────────────────────────────────
 
 /** GET /api/:collection — list/find */
