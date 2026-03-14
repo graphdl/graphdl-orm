@@ -209,6 +209,9 @@ export class GraphDLDB extends DurableObject {
       'ALTER TABLE constraints ADD COLUMN set_comparison_argument_length INTEGER',
       // constraint_spans: add subset_autofill for SS constraints
       'ALTER TABLE constraint_spans ADD COLUMN subset_autofill INTEGER DEFAULT 0',
+      // apps: add config columns (from readings/organizations.md)
+      'ALTER TABLE apps ADD COLUMN app_type TEXT',
+      'ALTER TABLE apps ADD COLUMN chat_endpoint TEXT',
     ]
     for (const migration of migrations) {
       try { this.sql.exec(migration) } catch { /* column/index already exists */ }
