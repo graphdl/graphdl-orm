@@ -752,6 +752,197 @@ export class GraphDLDB extends DurableObject {
     })
   }
 
+  /**
+   * Create an entity instance with fields — the high-level write operation.
+   *
+   * "Create a SupportRequest with issueType='billing', customer='john@example.com'"
+   * becomes: Resource + Graph facts for each field, resolved from readings.
+   *
+   * The caller doesn't need to know noun IDs, graph schema IDs, or reading text.
+   * The readings are the source — the system resolves everything.
+   */
+  async createEntity(
+    domainId: string,
+    nounName: string,
+    fields: Record<string, string>,
+    reference?: string,
+    createdBy?: string,
+  ): Promise<Record<string, unknown>> {
+    return this.withWriteLock(async () => {
+      const now = new Date().toISOString().replace('T', ' ').replace('Z', '')
+
+      // Find the noun
+      const nouns = this.sql.exec(
+        'SELECT * FROM nouns WHERE name = ? AND domain_id = ? LIMIT 1', nounName, domainId,
+      ).toArray()
+      if (!nouns.length) throw new Error(`Noun "${nounName}" not found in domain`)
+      const noun = nouns[0]
+
+      // Create the primary resource
+      const resourceId = crypto.randomUUID()
+      const cols = ['id', 'noun_id', 'domain_id', 'created_at', 'updated_at', 'version']
+      const vals: any[] = [resourceId, noun.id, domainId, now, now, 1]
+      if (reference) { cols.push('reference'); vals.push(reference) }
+      if (createdBy) { cols.push('created_by'); vals.push(createdBy) }
+
+      // If there's a field matching the noun name (self-reference), use it as value
+      const lowerNoun = nounName.charAt(0).toLowerCase() + nounName.slice(1)
+      const selfValue = fields[lowerNoun] || fields[nounName]
+      if (selfValue) { cols.push('value'); vals.push(selfValue) }
+
+      this.sql.exec(
+        `INSERT INTO ${cols.map(() => '').join('')}resources (${cols.join(', ')}) VALUES (${cols.map(() => '?').join(', ')})`,
+        ...vals,
+      )
+      this.logCdcEvent('create', 'resources', resourceId)
+
+      // Find all binary fact types where this noun plays role 0
+      const roles = this.sql.exec(
+        `SELECT r.graph_schema_id, r.role_index, r.id as role_id, n.name as noun_name, n.id as noun_id, n.object_type
+         FROM roles r
+         JOIN nouns n ON r.noun_id = n.id
+         JOIN graph_schemas gs ON r.graph_schema_id = gs.id
+         WHERE gs.domain_id = ?
+         ORDER BY r.graph_schema_id, r.role_index`,
+        domainId,
+      ).toArray()
+
+      // Group roles by graph schema
+      const schemaRoles = new Map<string, any[]>()
+      for (const r of roles) {
+        const list = schemaRoles.get(r.graph_schema_id as string) ?? []
+        list.push(r)
+        schemaRoles.set(r.graph_schema_id as string, list)
+      }
+
+      // For each binary fact type where this noun is role 0, check if we have a matching field
+      const facts: Array<{ graphSchemaId: string; value: string; valueNounId: string }> = []
+      for (const [schemaId, schemaRoleList] of schemaRoles) {
+        if (schemaRoleList.length !== 2) continue  // only handle binary fact types
+        const role0 = schemaRoleList.find((r: any) => r.role_index === 0)
+        const role1 = schemaRoleList.find((r: any) => r.role_index === 1)
+        if (!role0 || !role1) continue
+        if (role0.noun_name !== nounName) continue  // this noun must be role 0
+
+        // Match field name to role 1 noun name (camelCase)
+        const valueNounName = role1.noun_name as string
+        const camelName = valueNounName.charAt(0).toLowerCase() + valueNounName.slice(1)
+        const fieldValue = fields[camelName] || fields[valueNounName]
+        if (!fieldValue) continue
+
+        facts.push({
+          graphSchemaId: schemaId,
+          value: fieldValue,
+          valueNounId: role1.noun_id as string,
+        })
+      }
+
+      // Also check for fact types where this noun is role 1 (e.g. "Customer submits SupportRequest")
+      for (const [schemaId, schemaRoleList] of schemaRoles) {
+        if (schemaRoleList.length !== 2) continue
+        const role0 = schemaRoleList.find((r: any) => r.role_index === 0)
+        const role1 = schemaRoleList.find((r: any) => r.role_index === 1)
+        if (!role0 || !role1) continue
+        if (role1.noun_name !== nounName) continue  // this noun is role 1
+
+        const subjectNounName = role0.noun_name as string
+        const camelName = subjectNounName.charAt(0).toLowerCase() + subjectNounName.slice(1)
+        const fieldValue = fields[camelName] || fields[subjectNounName]
+        if (!fieldValue) continue
+
+        // Create/find the subject resource and link it
+        const existing = this.sql.exec(
+          'SELECT id FROM resources WHERE noun_id = ? AND domain_id = ? AND value = ? LIMIT 1',
+          role0.noun_id, domainId, fieldValue,
+        ).toArray()
+
+        const subjectResourceId = existing.length
+          ? existing[0].id as string
+          : (() => {
+              const rid = crypto.randomUUID()
+              this.sql.exec(
+                'INSERT INTO resources (id, noun_id, domain_id, value, created_at, updated_at, version) VALUES (?, ?, ?, ?, ?, ?, 1)',
+                rid, role0.noun_id, domainId, fieldValue, now, now,
+              )
+              this.logCdcEvent('create', 'resources', rid)
+              return rid
+            })()
+
+        // Create the graph linking subject → this entity
+        const graphId = crypto.randomUUID()
+        this.sql.exec(
+          'INSERT INTO graphs (id, graph_schema_id, domain_id, created_at, updated_at, version) VALUES (?, ?, ?, ?, ?, 1)',
+          graphId, schemaId, domainId, now, now,
+        )
+        const rrRoles = this.sql.exec(
+          'SELECT id, role_index FROM roles WHERE graph_schema_id = ? ORDER BY role_index', schemaId,
+        ).toArray()
+        for (const rr of rrRoles) {
+          const rrId = crypto.randomUUID()
+          const resId = (rr.role_index as number) === 0 ? subjectResourceId : resourceId
+          this.sql.exec(
+            'INSERT INTO resource_roles (id, graph_id, resource_id, role_id, domain_id, created_at, updated_at, version) VALUES (?, ?, ?, ?, ?, ?, ?, 1)',
+            rrId, graphId, resId, rr.id, domainId, now, now,
+          )
+        }
+        this.logCdcEvent('create', 'graphs', graphId)
+      }
+
+      // Create graphs for the binary facts where this noun is role 0
+      for (const fact of facts) {
+        // Find or create the value resource
+        const existing = this.sql.exec(
+          'SELECT id FROM resources WHERE noun_id = ? AND domain_id = ? AND value = ? LIMIT 1',
+          fact.valueNounId, domainId, fact.value,
+        ).toArray()
+
+        const valueResourceId = existing.length
+          ? existing[0].id as string
+          : (() => {
+              const rid = crypto.randomUUID()
+              this.sql.exec(
+                'INSERT INTO resources (id, noun_id, domain_id, value, created_at, updated_at, version) VALUES (?, ?, ?, ?, ?, ?, 1)',
+                rid, fact.valueNounId, domainId, fact.value, now, now,
+              )
+              this.logCdcEvent('create', 'resources', rid)
+              return rid
+            })()
+
+        // Create graph
+        const graphId = crypto.randomUUID()
+        this.sql.exec(
+          'INSERT INTO graphs (id, graph_schema_id, domain_id, created_at, updated_at, version) VALUES (?, ?, ?, ?, ?, 1)',
+          graphId, fact.graphSchemaId, domainId, now, now,
+        )
+
+        // Create resource roles
+        const graphRoles = this.sql.exec(
+          'SELECT id, role_index FROM roles WHERE graph_schema_id = ? ORDER BY role_index', fact.graphSchemaId,
+        ).toArray()
+        for (const gr of graphRoles) {
+          const rrId = crypto.randomUUID()
+          const resId = (gr.role_index as number) === 0 ? resourceId : valueResourceId
+          this.sql.exec(
+            'INSERT INTO resource_roles (id, graph_id, resource_id, role_id, domain_id, created_at, updated_at, version) VALUES (?, ?, ?, ?, ?, ?, ?, 1)',
+            rrId, graphId, resId, gr.id, domainId, now, now,
+          )
+        }
+        this.logCdcEvent('create', 'graphs', graphId)
+      }
+
+      this.getModel(domainId).invalidate('graphs')
+
+      return {
+        id: resourceId,
+        noun: nounName,
+        domain: domainId,
+        reference,
+        facts: facts.length,
+        createdBy,
+      }
+    })
+  }
+
   async generate(domainId: string, format: string): Promise<any> {
     const model = this.getModel(domainId)
     switch (format) {
