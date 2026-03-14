@@ -83,6 +83,11 @@ export function createProperty({
     superType = superType?.superType
   }
 
+  // Value type nouns default to string when valueType isn't explicitly set
+  if (!valueType && object.objectType === 'value') {
+    valueType = 'string'
+  }
+
   if (valueType) {
     // ---- Value type → primitive property ----
     property.type = valueType
@@ -162,6 +167,9 @@ export function ensureTableExists({
   nouns: NounDef[]
   jsonExamples: Record<string, JSONSchemaType>
 }): void {
+  // Value types don't get their own tables — they become inline columns
+  if (subject.objectType === 'value') return
+
   const title = subject.name || ''
   const key = nameToKey(title)
   if (tables[key]) return

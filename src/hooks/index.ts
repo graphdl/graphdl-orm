@@ -50,6 +50,17 @@ export async function createWithHook(
   data: Record<string, any>,
   context: HookContext,
 ): Promise<{ doc: Record<string, any>; hookResult: HookResult }> {
+  // Pre-process: constraints with text need kind before insert (NOT NULL)
+  if (collection === 'constraints' && data.text && !data.kind) {
+    const { parseConstraintText } = await import('./parse-constraint')
+    const parsed = parseConstraintText(data.text)
+    if (parsed && parsed.length > 0) {
+      data.kind = parsed[0].kind
+      data.modality = data.modality || parsed[0].modality
+    } else {
+      data.kind = 'UC' // default
+    }
+  }
   const doc = await db.createInCollection(collection, data)
   const hook = COLLECTION_HOOKS[collection]
   if (hook) {
