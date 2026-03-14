@@ -206,7 +206,7 @@ router.post('/api/entity', async (request, env: Env) => {
   const body = await request.json() as {
     noun: string        // noun name, e.g. "SupportRequest"
     domain: string      // domain ID
-    fields: Record<string, string | string[]>  // singular → value, plural → array of values
+    fields: Record<string, string | string[] | Record<string, any>>  // string, array, or nested entity
     reference?: string  // display reference
     createdBy?: string  // creator identity
   }

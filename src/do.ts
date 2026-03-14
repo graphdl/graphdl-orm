@@ -777,7 +777,7 @@ export class GraphDLDB extends DurableObject {
   async createEntity(
     domainId: string,
     nounName: string,
-    fields: Record<string, string | string[]>,
+    fields: Record<string, string | string[] | Record<string, string | string[]>>,
     reference?: string,
     createdBy?: string,
   ): Promise<Record<string, unknown>> {
@@ -843,10 +843,85 @@ export class GraphDLDB extends DurableObject {
         const camelName = valueNounName.charAt(0).toLowerCase() + valueNounName.slice(1)
         const pluralName = camelName + 's'
         const rawValue = fields[camelName] || fields[valueNounName] || fields[pluralName] || fields[valueNounName + 's']
-        if (!rawValue) continue
+        if (rawValue === undefined || rawValue === null) continue
+
+        // Nested object = entity type — create it inline and link via graph
+        if (typeof rawValue === 'object' && !Array.isArray(rawValue)) {
+          const nestedNounId = role1.noun_id as string
+
+          // Create the nested entity resource
+          const nestedId = crypto.randomUUID()
+          this.sql.exec(
+            'INSERT INTO resources (id, noun_id, domain_id, created_at, updated_at, version) VALUES (?, ?, ?, ?, ?, 1)',
+            nestedId, nestedNounId, domainId, now, now,
+          )
+          this.logCdcEvent('create', 'resources', nestedId)
+
+          // Create facts for the nested entity's fields
+          // Inherit parent's string fields as back-relations (e.g. customer email)
+          const nestedFields = { ...rawValue } as Record<string, string>
+          for (const [fk, fv] of Object.entries(fields)) {
+            if (typeof fv === 'string' && !(fk in nestedFields)) {
+              nestedFields[fk] = fv
+            }
+          }
+
+          // Find binary fact types for the nested noun
+          for (const [nestedSchemaId, nestedRoles] of schemaRoles) {
+            if (nestedRoles.length !== 2) continue
+            const nr0 = nestedRoles.find((r: any) => r.role_index === 0)
+            const nr1 = nestedRoles.find((r: any) => r.role_index === 1)
+            if (!nr0 || !nr1 || nr0.noun_name !== valueNounName) continue
+
+            const nrCamel = (nr1.noun_name as string).charAt(0).toLowerCase() + (nr1.noun_name as string).slice(1)
+            const nrValue = nestedFields[nrCamel] || nestedFields[nr1.noun_name as string]
+            if (!nrValue || typeof nrValue !== 'string') continue
+
+            // Find or create the nested fact's value resource
+            const nrExisting = this.sql.exec(
+              'SELECT id FROM resources WHERE noun_id = ? AND domain_id = ? AND value = ? LIMIT 1',
+              nr1.noun_id, domainId, nrValue,
+            ).toArray()
+            const nrValResId = nrExisting.length
+              ? nrExisting[0].id as string
+              : (() => {
+                  const rid = crypto.randomUUID()
+                  this.sql.exec(
+                    'INSERT INTO resources (id, noun_id, domain_id, value, created_at, updated_at, version) VALUES (?, ?, ?, ?, ?, ?, 1)',
+                    rid, nr1.noun_id, domainId, nrValue, now, now,
+                  )
+                  return rid
+                })()
+
+            // Create graph for nested fact
+            const nGraphId = crypto.randomUUID()
+            this.sql.exec(
+              'INSERT INTO graphs (id, graph_schema_id, domain_id, created_at, updated_at, version) VALUES (?, ?, ?, ?, ?, 1)',
+              nGraphId, nestedSchemaId, domainId, now, now,
+            )
+            const nrRoles = this.sql.exec(
+              'SELECT id, role_index FROM roles WHERE graph_schema_id = ? ORDER BY role_index', nestedSchemaId,
+            ).toArray()
+            for (const nrr of nrRoles) {
+              const nrrId = crypto.randomUUID()
+              const nrResId = (nrr.role_index as number) === 0 ? nestedId : nrValResId
+              this.sql.exec(
+                'INSERT INTO resource_roles (id, graph_id, resource_id, role_id, domain_id, created_at, updated_at, version) VALUES (?, ?, ?, ?, ?, ?, ?, 1)',
+                nrrId, nGraphId, nrResId, nrr.id, domainId, now, now,
+              )
+            }
+          }
+
+          facts.push({
+            graphSchemaId: schemaId,
+            value: '__resource__' + nestedId,
+            valueNounId: nestedNounId,
+          })
+          continue
+        }
 
         // Normalize to array — plural field names expect arrays, singular expect one value
-        const values = Array.isArray(rawValue) ? rawValue : [rawValue]
+        const values = Array.isArray(rawValue) ? rawValue : [rawValue as string]
         for (const v of values) {
           facts.push({
             graphSchemaId: schemaId,
@@ -913,23 +988,30 @@ export class GraphDLDB extends DurableObject {
 
       // Create graphs for the binary facts where this noun is role 0
       for (const fact of facts) {
-        // Find or create the value resource
-        const existing = this.sql.exec(
-          'SELECT id FROM resources WHERE noun_id = ? AND domain_id = ? AND value = ? LIMIT 1',
-          fact.valueNounId, domainId, fact.value,
-        ).toArray()
+        let valueResourceId: string
 
-        const valueResourceId = existing.length
-          ? existing[0].id as string
-          : (() => {
-              const rid = crypto.randomUUID()
-              this.sql.exec(
-                'INSERT INTO resources (id, noun_id, domain_id, value, created_at, updated_at, version) VALUES (?, ?, ?, ?, ?, ?, 1)',
-                rid, fact.valueNounId, domainId, fact.value, now, now,
-              )
-              this.logCdcEvent('create', 'resources', rid)
-              return rid
-            })()
+        // __resource__ prefix = already-created nested entity, use resource ID directly
+        if (fact.value.startsWith('__resource__')) {
+          valueResourceId = fact.value.slice('__resource__'.length)
+        } else {
+          // Find or create the value resource
+          const existing = this.sql.exec(
+            'SELECT id FROM resources WHERE noun_id = ? AND domain_id = ? AND value = ? LIMIT 1',
+            fact.valueNounId, domainId, fact.value,
+          ).toArray()
+
+          valueResourceId = existing.length
+            ? existing[0].id as string
+            : (() => {
+                const rid = crypto.randomUUID()
+                this.sql.exec(
+                  'INSERT INTO resources (id, noun_id, domain_id, value, created_at, updated_at, version) VALUES (?, ?, ?, ?, ?, ?, 1)',
+                  rid, fact.valueNounId, domainId, fact.value, now, now,
+                )
+                this.logCdcEvent('create', 'resources', rid)
+                return rid
+              })()
+        }
 
         // Create graph
         const graphId = crypto.randomUUID()
