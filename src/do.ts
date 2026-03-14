@@ -764,7 +764,7 @@ export class GraphDLDB extends DurableObject {
   async createEntity(
     domainId: string,
     nounName: string,
-    fields: Record<string, string>,
+    fields: Record<string, string | string[]>,
     reference?: string,
     createdBy?: string,
   ): Promise<Record<string, unknown>> {
@@ -816,6 +816,7 @@ export class GraphDLDB extends DurableObject {
       }
 
       // For each binary fact type where this noun is role 0, check if we have a matching field
+      // Singular field name = one fact. Plural field name = one fact per array element.
       const facts: Array<{ graphSchemaId: string; value: string; valueNounId: string }> = []
       for (const [schemaId, schemaRoleList] of schemaRoles) {
         if (schemaRoleList.length !== 2) continue  // only handle binary fact types
@@ -824,17 +825,22 @@ export class GraphDLDB extends DurableObject {
         if (!role0 || !role1) continue
         if (role0.noun_name !== nounName) continue  // this noun must be role 0
 
-        // Match field name to role 1 noun name (camelCase)
+        // Match field name to role 1 noun name (camelCase singular or plural)
         const valueNounName = role1.noun_name as string
         const camelName = valueNounName.charAt(0).toLowerCase() + valueNounName.slice(1)
-        const fieldValue = fields[camelName] || fields[valueNounName]
-        if (!fieldValue) continue
+        const pluralName = camelName + 's'
+        const rawValue = fields[camelName] || fields[valueNounName] || fields[pluralName] || fields[valueNounName + 's']
+        if (!rawValue) continue
 
-        facts.push({
-          graphSchemaId: schemaId,
-          value: fieldValue,
-          valueNounId: role1.noun_id as string,
-        })
+        // Normalize to array — plural field names expect arrays, singular expect one value
+        const values = Array.isArray(rawValue) ? rawValue : [rawValue]
+        for (const v of values) {
+          facts.push({
+            graphSchemaId: schemaId,
+            value: v,
+            valueNounId: role1.noun_id as string,
+          })
+        }
       }
 
       // Also check for fact types where this noun is role 1 (e.g. "Customer submits SupportRequest")
@@ -847,9 +853,12 @@ export class GraphDLDB extends DurableObject {
 
         const subjectNounName = role0.noun_name as string
         const camelName = subjectNounName.charAt(0).toLowerCase() + subjectNounName.slice(1)
-        const fieldValue = fields[camelName] || fields[subjectNounName]
-        if (!fieldValue) continue
+        const pluralName = camelName + 's'
+        const rawValue = fields[camelName] || fields[subjectNounName] || fields[pluralName] || fields[subjectNounName + 's']
+        if (!rawValue) continue
 
+        const subjectValues = Array.isArray(rawValue) ? rawValue : [rawValue]
+        for (const fieldValue of subjectValues) {
         // Create/find the subject resource and link it
         const existing = this.sql.exec(
           'SELECT id FROM resources WHERE noun_id = ? AND domain_id = ? AND value = ? LIMIT 1',
@@ -886,6 +895,7 @@ export class GraphDLDB extends DurableObject {
           )
         }
         this.logCdcEvent('create', 'graphs', graphId)
+        } // end for subjectValues
       }
 
       // Create graphs for the binary facts where this noun is role 0
