@@ -964,6 +964,7 @@ export class GraphDLDB extends DurableObject {
    */
   async applySchema(domainId: string): Promise<{ tableMap: Record<string, string>; fieldMap: Record<string, Record<string, string>> }> {
     const model = this.getModel(domainId)
+    model.invalidate() // Clear cache to ensure fresh data
     const openapi = await (await import('./generate/openapi')).generateOpenAPI(model)
     const { ddl, tableMap, fieldMap } = (await import('./generate/sqlite')).generateSQLite(openapi)
 
