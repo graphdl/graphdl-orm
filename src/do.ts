@@ -783,269 +783,291 @@ export class GraphDLDB extends DurableObject {
   ): Promise<Record<string, unknown>> {
     return this.withWriteLock(async () => {
       const now = new Date().toISOString().replace('T', ' ').replace('Z', '')
+      const { toColumnName } = await import('./generate/sqlite')
 
-      // Find the noun
+      // Get the 3NF table for this noun (creates it if needed via applySchema)
+      const entityTable = await this.getEntityTable(domainId, nounName)
+
+      if (entityTable) {
+        // ── 3NF path: insert one row into the entity's table ──
+        const { tableName, fieldMap } = entityTable
+        const id = crypto.randomUUID()
+        const cols = ['id', 'domain_id', 'created_at', 'updated_at', 'version']
+        const vals: any[] = [id, domainId, now, now, 1]
+
+        // Get existing columns in the table
+        const tableColumns = new Set<string>()
+        try {
+          const pragma = this.sql.exec(`PRAGMA table_info(${tableName})`).toArray()
+          for (const row of pragma) tableColumns.add(row.name as string)
+        } catch { /* table doesn't exist */ }
+
+        // Map fields to columns
+        const nestedEntities: Array<{ nounName: string; fields: Record<string, any>; fkCol: string }> = []
+
+        for (const [fieldName, fieldValue] of Object.entries(fields)) {
+          if (fieldValue === undefined || fieldValue === null) continue
+
+          // Nested object = entity type — handle after parent insert
+          if (typeof fieldValue === 'object' && !Array.isArray(fieldValue)) {
+            const colName = fieldMap[fieldName] || toColumnName(fieldName) + '_id'
+            if (tableColumns.has(colName)) {
+              // Will be filled after nested entity is created
+              const nestedNounName = fieldName.charAt(0).toUpperCase() + fieldName.slice(1)
+              // Inherit parent's string fields as back-relations
+              const nestedFields = { ...fieldValue } as Record<string, any>
+              for (const [fk, fv] of Object.entries(fields)) {
+                if (typeof fv === 'string' && !(fk in nestedFields)) {
+                  nestedFields[fk] = fv
+                }
+              }
+              nestedEntities.push({ nounName: nestedNounName, fields: nestedFields, fkCol: colName })
+            }
+            continue
+          }
+
+          // Array = JSON column or multiple FK rows (handle as JSON for now)
+          if (Array.isArray(fieldValue)) {
+            const colName = fieldMap[fieldName] || toColumnName(fieldName)
+            if (tableColumns.has(colName)) {
+              cols.push(colName)
+              vals.push(JSON.stringify(fieldValue))
+            }
+            continue
+          }
+
+          // String value — find the column
+          // Try: fieldMap mapping, then snake_case, then _id suffix for FK
+          const colName = fieldMap[fieldName] || toColumnName(fieldName)
+          const fkColName = colName + '_id'
+          if (tableColumns.has(colName)) {
+            cols.push(colName)
+            vals.push(fieldValue)
+          } else if (tableColumns.has(fkColName)) {
+            // FK reference — find or create the related entity
+            cols.push(fkColName)
+            vals.push(fieldValue) // For now, store the value directly (TODO: resolve to resource ID)
+          }
+        }
+
+        // Insert the row
+        this.sql.exec(
+          `INSERT INTO ${tableName} (${cols.join(', ')}) VALUES (${cols.map(() => '?').join(', ')})`,
+          ...vals,
+        )
+        this.logCdcEvent('create', tableName, id, { domain_id: domainId })
+
+        // Create nested entities and update FK columns
+        for (const nested of nestedEntities) {
+          try {
+            const nestedResult = await this.createEntityInner(domainId, nested.nounName, nested.fields, undefined, createdBy, now)
+            if (nestedResult.id) {
+              this.sql.exec(`UPDATE ${tableName} SET ${nested.fkCol} = ? WHERE id = ?`, nestedResult.id, id)
+            }
+          } catch { /* nested entity creation is best-effort */ }
+        }
+
+        this.getModel(domainId).invalidate()
+
+        return {
+          id,
+          noun: nounName,
+          table: tableName,
+          domain: domainId,
+          reference,
+          createdBy,
+        }
+      }
+
+      // ── Fallback: generic resource path (no 3NF table yet) ──
       const nouns = this.sql.exec(
         'SELECT * FROM nouns WHERE name = ? AND domain_id = ? LIMIT 1', nounName, domainId,
       ).toArray()
       if (!nouns.length) throw new Error(`Noun "${nounName}" not found in domain`)
-      const noun = nouns[0]
 
-      // Create the primary resource
       const resourceId = crypto.randomUUID()
-      const cols = ['id', 'noun_id', 'domain_id', 'created_at', 'updated_at', 'version']
-      const vals: any[] = [resourceId, noun.id, domainId, now, now, 1]
-      if (reference) { cols.push('reference'); vals.push(reference) }
-      if (createdBy) { cols.push('created_by'); vals.push(createdBy) }
-
-      // If there's a field matching the noun name (self-reference), use it as value
-      const lowerNoun = nounName.charAt(0).toLowerCase() + nounName.slice(1)
-      const selfValue = fields[lowerNoun] || fields[nounName]
-      if (selfValue) { cols.push('value'); vals.push(selfValue) }
-
       this.sql.exec(
-        `INSERT INTO ${cols.map(() => '').join('')}resources (${cols.join(', ')}) VALUES (${cols.map(() => '?').join(', ')})`,
-        ...vals,
+        'INSERT INTO resources (id, noun_id, domain_id, reference, value, created_by, created_at, updated_at, version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)',
+        resourceId, nouns[0].id, domainId, reference || null, JSON.stringify(fields), createdBy || null, now, now,
       )
       this.logCdcEvent('create', 'resources', resourceId)
-
-      // Find all binary fact types where this noun plays role 0
-      const roles = this.sql.exec(
-        `SELECT r.graph_schema_id, r.role_index, r.id as role_id, n.name as noun_name, n.id as noun_id, n.object_type
-         FROM roles r
-         JOIN nouns n ON r.noun_id = n.id
-         JOIN graph_schemas gs ON r.graph_schema_id = gs.id
-         WHERE gs.domain_id = ?
-         ORDER BY r.graph_schema_id, r.role_index`,
-        domainId,
-      ).toArray()
-
-      // Group roles by graph schema
-      const schemaRoles = new Map<string, any[]>()
-      for (const r of roles) {
-        const list = schemaRoles.get(r.graph_schema_id as string) ?? []
-        list.push(r)
-        schemaRoles.set(r.graph_schema_id as string, list)
-      }
-
-      // For each binary fact type where this noun is role 0, check if we have a matching field
-      // Singular field name = one fact. Plural field name = one fact per array element.
-      const facts: Array<{ graphSchemaId: string; value: string; valueNounId: string }> = []
-      for (const [schemaId, schemaRoleList] of schemaRoles) {
-        if (schemaRoleList.length !== 2) continue  // only handle binary fact types
-        const role0 = schemaRoleList.find((r: any) => r.role_index === 0)
-        const role1 = schemaRoleList.find((r: any) => r.role_index === 1)
-        if (!role0 || !role1) continue
-        if (role0.noun_name !== nounName) continue  // this noun must be role 0
-
-        // Match field name to role 1 noun name (camelCase singular or plural)
-        const valueNounName = role1.noun_name as string
-        const camelName = valueNounName.charAt(0).toLowerCase() + valueNounName.slice(1)
-        const pluralName = camelName + 's'
-        const rawValue = fields[camelName] || fields[valueNounName] || fields[pluralName] || fields[valueNounName + 's']
-        if (rawValue === undefined || rawValue === null) continue
-
-        // Nested object = entity type — create it inline and link via graph
-        if (typeof rawValue === 'object' && !Array.isArray(rawValue)) {
-          const nestedNounId = role1.noun_id as string
-
-          // Create the nested entity resource
-          const nestedId = crypto.randomUUID()
-          this.sql.exec(
-            'INSERT INTO resources (id, noun_id, domain_id, created_at, updated_at, version) VALUES (?, ?, ?, ?, ?, 1)',
-            nestedId, nestedNounId, domainId, now, now,
-          )
-          this.logCdcEvent('create', 'resources', nestedId)
-
-          // Create facts for the nested entity's fields
-          // Inherit parent's string fields as back-relations (e.g. customer email)
-          const nestedFields = { ...rawValue } as Record<string, string>
-          for (const [fk, fv] of Object.entries(fields)) {
-            if (typeof fv === 'string' && !(fk in nestedFields)) {
-              nestedFields[fk] = fv
-            }
-          }
-
-          // Find binary fact types for the nested noun
-          for (const [nestedSchemaId, nestedRoles] of schemaRoles) {
-            if (nestedRoles.length !== 2) continue
-            const nr0 = nestedRoles.find((r: any) => r.role_index === 0)
-            const nr1 = nestedRoles.find((r: any) => r.role_index === 1)
-            if (!nr0 || !nr1 || nr0.noun_name !== valueNounName) continue
-
-            const nrCamel = (nr1.noun_name as string).charAt(0).toLowerCase() + (nr1.noun_name as string).slice(1)
-            const nrValue = nestedFields[nrCamel] || nestedFields[nr1.noun_name as string]
-            if (!nrValue || typeof nrValue !== 'string') continue
-
-            // Find or create the nested fact's value resource
-            const nrExisting = this.sql.exec(
-              'SELECT id FROM resources WHERE noun_id = ? AND domain_id = ? AND value = ? LIMIT 1',
-              nr1.noun_id, domainId, nrValue,
-            ).toArray()
-            const nrValResId = nrExisting.length
-              ? nrExisting[0].id as string
-              : (() => {
-                  const rid = crypto.randomUUID()
-                  this.sql.exec(
-                    'INSERT INTO resources (id, noun_id, domain_id, value, created_at, updated_at, version) VALUES (?, ?, ?, ?, ?, ?, 1)',
-                    rid, nr1.noun_id, domainId, nrValue, now, now,
-                  )
-                  return rid
-                })()
-
-            // Create graph for nested fact
-            const nGraphId = crypto.randomUUID()
-            this.sql.exec(
-              'INSERT INTO graphs (id, graph_schema_id, domain_id, created_at, updated_at, version) VALUES (?, ?, ?, ?, ?, 1)',
-              nGraphId, nestedSchemaId, domainId, now, now,
-            )
-            const nrRoles = this.sql.exec(
-              'SELECT id, role_index FROM roles WHERE graph_schema_id = ? ORDER BY role_index', nestedSchemaId,
-            ).toArray()
-            for (const nrr of nrRoles) {
-              const nrrId = crypto.randomUUID()
-              const nrResId = (nrr.role_index as number) === 0 ? nestedId : nrValResId
-              this.sql.exec(
-                'INSERT INTO resource_roles (id, graph_id, resource_id, role_id, domain_id, created_at, updated_at, version) VALUES (?, ?, ?, ?, ?, ?, ?, 1)',
-                nrrId, nGraphId, nrResId, nrr.id, domainId, now, now,
-              )
-            }
-          }
-
-          facts.push({
-            graphSchemaId: schemaId,
-            value: '__resource__' + nestedId,
-            valueNounId: nestedNounId,
-          })
-          continue
-        }
-
-        // Normalize to array — plural field names expect arrays, singular expect one value
-        const values = Array.isArray(rawValue) ? rawValue : [rawValue as string]
-        for (const v of values) {
-          facts.push({
-            graphSchemaId: schemaId,
-            value: v,
-            valueNounId: role1.noun_id as string,
-          })
-        }
-      }
-
-      // Also check for fact types where this noun is role 1 (e.g. "Customer submits SupportRequest")
-      for (const [schemaId, schemaRoleList] of schemaRoles) {
-        if (schemaRoleList.length !== 2) continue
-        const role0 = schemaRoleList.find((r: any) => r.role_index === 0)
-        const role1 = schemaRoleList.find((r: any) => r.role_index === 1)
-        if (!role0 || !role1) continue
-        if (role1.noun_name !== nounName) continue  // this noun is role 1
-
-        const subjectNounName = role0.noun_name as string
-        const camelName = subjectNounName.charAt(0).toLowerCase() + subjectNounName.slice(1)
-        const pluralName = camelName + 's'
-        const rawValue = fields[camelName] || fields[subjectNounName] || fields[pluralName] || fields[subjectNounName + 's']
-        if (!rawValue) continue
-
-        const subjectValues = Array.isArray(rawValue) ? rawValue : [rawValue]
-        for (const fieldValue of subjectValues) {
-        // Create/find the subject resource and link it
-        const existing = this.sql.exec(
-          'SELECT id FROM resources WHERE noun_id = ? AND domain_id = ? AND value = ? LIMIT 1',
-          role0.noun_id, domainId, fieldValue,
-        ).toArray()
-
-        const subjectResourceId = existing.length
-          ? existing[0].id as string
-          : (() => {
-              const rid = crypto.randomUUID()
-              this.sql.exec(
-                'INSERT INTO resources (id, noun_id, domain_id, value, created_at, updated_at, version) VALUES (?, ?, ?, ?, ?, ?, 1)',
-                rid, role0.noun_id, domainId, fieldValue, now, now,
-              )
-              this.logCdcEvent('create', 'resources', rid)
-              return rid
-            })()
-
-        // Create the graph linking subject → this entity
-        const graphId = crypto.randomUUID()
-        this.sql.exec(
-          'INSERT INTO graphs (id, graph_schema_id, domain_id, created_at, updated_at, version) VALUES (?, ?, ?, ?, ?, 1)',
-          graphId, schemaId, domainId, now, now,
-        )
-        const rrRoles = this.sql.exec(
-          'SELECT id, role_index FROM roles WHERE graph_schema_id = ? ORDER BY role_index', schemaId,
-        ).toArray()
-        for (const rr of rrRoles) {
-          const rrId = crypto.randomUUID()
-          const resId = (rr.role_index as number) === 0 ? subjectResourceId : resourceId
-          this.sql.exec(
-            'INSERT INTO resource_roles (id, graph_id, resource_id, role_id, domain_id, created_at, updated_at, version) VALUES (?, ?, ?, ?, ?, ?, ?, 1)',
-            rrId, graphId, resId, rr.id, domainId, now, now,
-          )
-        }
-        this.logCdcEvent('create', 'graphs', graphId)
-        } // end for subjectValues
-      }
-
-      // Create graphs for the binary facts where this noun is role 0
-      for (const fact of facts) {
-        let valueResourceId: string
-
-        // __resource__ prefix = already-created nested entity, use resource ID directly
-        if (fact.value.startsWith('__resource__')) {
-          valueResourceId = fact.value.slice('__resource__'.length)
-        } else {
-          // Find or create the value resource
-          const existing = this.sql.exec(
-            'SELECT id FROM resources WHERE noun_id = ? AND domain_id = ? AND value = ? LIMIT 1',
-            fact.valueNounId, domainId, fact.value,
-          ).toArray()
-
-          valueResourceId = existing.length
-            ? existing[0].id as string
-            : (() => {
-                const rid = crypto.randomUUID()
-                this.sql.exec(
-                  'INSERT INTO resources (id, noun_id, domain_id, value, created_at, updated_at, version) VALUES (?, ?, ?, ?, ?, ?, 1)',
-                  rid, fact.valueNounId, domainId, fact.value, now, now,
-                )
-                this.logCdcEvent('create', 'resources', rid)
-                return rid
-              })()
-        }
-
-        // Create graph
-        const graphId = crypto.randomUUID()
-        this.sql.exec(
-          'INSERT INTO graphs (id, graph_schema_id, domain_id, created_at, updated_at, version) VALUES (?, ?, ?, ?, ?, 1)',
-          graphId, fact.graphSchemaId, domainId, now, now,
-        )
-
-        // Create resource roles
-        const graphRoles = this.sql.exec(
-          'SELECT id, role_index FROM roles WHERE graph_schema_id = ? ORDER BY role_index', fact.graphSchemaId,
-        ).toArray()
-        for (const gr of graphRoles) {
-          const rrId = crypto.randomUUID()
-          const resId = (gr.role_index as number) === 0 ? resourceId : valueResourceId
-          this.sql.exec(
-            'INSERT INTO resource_roles (id, graph_id, resource_id, role_id, domain_id, created_at, updated_at, version) VALUES (?, ?, ?, ?, ?, ?, ?, 1)',
-            rrId, graphId, resId, gr.id, domainId, now, now,
-          )
-        }
-        this.logCdcEvent('create', 'graphs', graphId)
-      }
-
-      this.getModel(domainId).invalidate('graphs')
 
       return {
         id: resourceId,
         noun: nounName,
         domain: domainId,
         reference,
-        facts: facts.length,
         createdBy,
       }
     })
+  }
+
+  /** Inner createEntity — no write lock, used for nested entity creation. */
+  private async createEntityInner(
+    domainId: string,
+    nounName: string,
+    fields: Record<string, any>,
+    reference?: string,
+    createdBy?: string,
+    now?: string,
+  ): Promise<{ id: string }> {
+    const ts = now || new Date().toISOString().replace('T', ' ').replace('Z', '')
+    const { toColumnName } = await import('./generate/sqlite')
+    const entityTable = await this.getEntityTable(domainId, nounName)
+
+    if (!entityTable) {
+      // No table — create a generic resource
+      const id = crypto.randomUUID()
+      const nouns = this.sql.exec('SELECT id FROM nouns WHERE name = ? AND domain_id = ? LIMIT 1', nounName, domainId).toArray()
+      if (nouns.length) {
+        this.sql.exec(
+          'INSERT INTO resources (id, noun_id, domain_id, value, created_at, updated_at, version) VALUES (?, ?, ?, ?, ?, ?, 1)',
+          id, nouns[0].id, domainId, JSON.stringify(fields), ts, ts,
+        )
+      }
+      return { id }
+    }
+
+    const { tableName, fieldMap } = entityTable
+    const id = crypto.randomUUID()
+    const cols = ['id', 'domain_id', 'created_at', 'updated_at', 'version']
+    const vals: any[] = [id, domainId, ts, ts, 1]
+
+    const tableColumns = new Set<string>()
+    try {
+      const pragma = this.sql.exec(`PRAGMA table_info(${tableName})`).toArray()
+      for (const row of pragma) tableColumns.add(row.name as string)
+    } catch { /* */ }
+
+    for (const [fieldName, fieldValue] of Object.entries(fields)) {
+      if (fieldValue === undefined || fieldValue === null || typeof fieldValue === 'object') continue
+      const colName = fieldMap[fieldName] || toColumnName(fieldName)
+      const fkColName = colName + '_id'
+      if (tableColumns.has(colName)) { cols.push(colName); vals.push(fieldValue) }
+      else if (tableColumns.has(fkColName)) { cols.push(fkColName); vals.push(fieldValue) }
+    }
+
+    this.sql.exec(
+      `INSERT INTO ${tableName} (${cols.join(', ')}) VALUES (${cols.map(() => '?').join(', ')})`,
+      ...vals,
+    )
+    this.logCdcEvent('create', tableName, id, { domain_id: domainId })
+    return { id }
+  }
+
+  /**
+   * Apply generated schema to the DO's SQLite — materializes 3NF tables from readings.
+   *
+   * The loop: Readings → OpenAPI → SQLite DDL → CREATE TABLE IF NOT EXISTS.
+   * Tables are created or extended (new columns added), never dropped.
+   * Returns the table map and field map for use by createEntity.
+   */
+  async applySchema(domainId: string): Promise<{ tableMap: Record<string, string>; fieldMap: Record<string, Record<string, string>> }> {
+    const model = this.getModel(domainId)
+    const openapi = await (await import('./generate/openapi')).generateOpenAPI(model)
+    const { ddl, tableMap, fieldMap } = (await import('./generate/sqlite')).generateSQLite(openapi)
+
+    // Apply DDL — CREATE TABLE IF NOT EXISTS, ALTER TABLE ADD COLUMN for new columns
+    for (const statement of ddl) {
+      if (statement.startsWith('CREATE TABLE')) {
+        // Convert to IF NOT EXISTS
+        const safe = statement.replace('CREATE TABLE', 'CREATE TABLE IF NOT EXISTS')
+        try { this.sql.exec(safe) } catch { /* table exists with different schema */ }
+
+        // Check for new columns and add them
+        const tableMatch = statement.match(/CREATE TABLE (\w+)/)
+        if (tableMatch) {
+          const tableName = tableMatch[1]
+          const existingCols = new Set<string>()
+          try {
+            const pragma = this.sql.exec(`PRAGMA table_info(${tableName})`).toArray()
+            for (const row of pragma) existingCols.add(row.name as string)
+          } catch { continue }
+
+          // Parse columns from DDL
+          const colSection = statement.match(/\(([\s\S]+)\)/)
+          if (colSection) {
+            for (const line of colSection[1].split(',')) {
+              const colMatch = line.trim().match(/^(\w+)\s/)
+              if (colMatch && !existingCols.has(colMatch[1])) {
+                const colDef = line.trim()
+                // Strip NOT NULL and DEFAULT for ALTER TABLE ADD COLUMN
+                const safeCol = colDef.replace(/NOT NULL/g, '').replace(/DEFAULT\s+[^,)]+/g, '').trim()
+                try { this.sql.exec(`ALTER TABLE ${tableName} ADD COLUMN ${safeCol}`) } catch { /* already exists */ }
+              }
+            }
+          }
+        }
+      } else if (statement.startsWith('CREATE INDEX')) {
+        try { this.sql.exec(statement) } catch { /* index exists */ }
+      }
+    }
+
+    // Store the mapping so createEntity can use it
+    // Cache in the domain model for fast access
+    const cached = { tableMap, fieldMap, appliedAt: new Date().toISOString() }
+    this.getModel(domainId).invalidate()
+
+    // Persist the mapping in generators collection for external consumers
+    const existing = this.sql.exec(
+      "SELECT id FROM generators WHERE domain_id = ? AND output_format = 'schema-map'", domainId,
+    ).toArray()
+    const mapJson = JSON.stringify(cached)
+    const now = new Date().toISOString().replace('T', ' ').replace('Z', '')
+    if (existing.length) {
+      this.sql.exec('UPDATE generators SET output = ?, updated_at = ? WHERE id = ?', mapJson, now, existing[0].id)
+    } else {
+      this.sql.exec(
+        "INSERT INTO generators (id, domain_id, output_format, output, created_at, updated_at, version) VALUES (?, ?, 'schema-map', ?, ?, ?, 1)",
+        crypto.randomUUID(), domainId, mapJson, now, now,
+      )
+    }
+
+    return { tableMap, fieldMap }
+  }
+
+  /**
+   * Get the 3NF table name and field map for a noun in a domain.
+   * Uses cached schema-map from applySchema, or runs it if missing.
+   */
+  private async getEntityTable(domainId: string, nounName: string): Promise<{
+    tableName: string
+    fieldMap: Record<string, string>
+  } | null> {
+    // Check for cached schema map
+    const rows = this.sql.exec(
+      "SELECT output FROM generators WHERE domain_id = ? AND output_format = 'schema-map' LIMIT 1", domainId,
+    ).toArray()
+
+    let schemaMap: { tableMap: Record<string, string>; fieldMap: Record<string, Record<string, string>> }
+
+    if (rows.length && rows[0].output) {
+      schemaMap = JSON.parse(rows[0].output as string)
+    } else {
+      // Generate and apply on first use
+      schemaMap = await this.applySchema(domainId)
+    }
+
+    const { toTableName } = await import('./generate/sqlite')
+    const tableName = schemaMap.tableMap[nounName] || toTableName(nounName)
+
+    // Verify table exists
+    try {
+      this.sql.exec(`SELECT 1 FROM ${tableName} LIMIT 0`)
+    } catch {
+      // Table doesn't exist yet — apply schema and retry
+      schemaMap = await this.applySchema(domainId)
+      try {
+        this.sql.exec(`SELECT 1 FROM ${tableName} LIMIT 0`)
+      } catch {
+        return null // noun doesn't produce a table
+      }
+    }
+
+    return {
+      tableName,
+      fieldMap: schemaMap.fieldMap[tableName] || {},
+    }
   }
 
   async generate(domainId: string, format: string): Promise<any> {
@@ -1066,6 +1088,8 @@ export class GraphDLDB extends DurableObject {
         return (await import('./generate/constraint-ir')).generateConstraintIR(model)
       case 'mdxui':
         return (await import('./generate/mdxui')).generateMdxui(model)
+      case 'schema':
+        return this.applySchema(domainId)
       default:
         throw new Error(`Unknown format: ${format}`)
     }
