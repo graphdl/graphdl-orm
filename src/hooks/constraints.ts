@@ -93,8 +93,10 @@ export async function constraintAfterCreate(
         context.allNouns,
       )
       const readingNouns = tokenized.nounRefs.map(r => r.name)
-      if (readingNouns.length === constraintNouns.length &&
-          readingNouns.every((n, i) => n === constraintNouns[i])) {
+      const sortedReading = [...readingNouns].sort()
+      const sortedConstraint = [...constraintNouns].sort()
+      if (sortedReading.length === sortedConstraint.length &&
+          sortedReading.every((n, i) => n === sortedConstraint[i])) {
         hostReading = reading
         break
       }
@@ -162,9 +164,20 @@ export async function constraintAfterCreate(
     } else if (parsed.kind === 'RC') {
       // Ring constraint spans the first role (self-referential)
       roleIds = hostRoles.length > 0 ? [hostRoles[0].id] : []
-    } else if (constraintNouns.length === 2 && hostRoles.length >= 2) {
-      // Binary: "Each X ..." constrains role 0 (the X side)
-      roleIds = [hostRoles[0].id]
+    } else if (constraintNouns.length >= 1 && hostRoles.length >= 2) {
+      // The constrained noun is the first noun in the constraint text.
+      // Find the role in the host reading that plays that noun.
+      const constrainedNoun = constraintNouns[0]
+      const matchingRole = hostRoles.find((r: any) => {
+        const nounName = typeof r.noun === 'object' ? r.noun?.name : null
+        // If noun isn't populated, look it up from context
+        if (!nounName) {
+          const nounId = typeof r.noun === 'string' ? r.noun : r.noun?.id
+          return context.allNouns.some(n => n.id === nounId && n.name === constrainedNoun)
+        }
+        return nounName === constrainedNoun
+      })
+      roleIds = matchingRole ? [matchingRole.id] : [hostRoles[0].id]
     } else {
       // Spanning or ternary: all roles
       roleIds = hostRoles.map((r: any) => r.id)
