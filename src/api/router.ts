@@ -111,6 +111,20 @@ async function populateDocs(
 // ── Health ───────────────────────────────────────────────────────────
 router.get('/health', () => json({ status: 'ok', version: '0.1.0' }))
 
+// ── WebSocket (live events) ──────────────────────────────────────────
+router.get('/ws', async (request, env: Env) => {
+  if (request.headers.get('Upgrade') !== 'websocket') {
+    return error(426, { errors: [{ message: 'WebSocket upgrade required' }] })
+  }
+  const url = new URL(request.url)
+  const domain = url.searchParams.get('domain') || 'all'
+  const id = env.GRAPHDL_DB.idFromName('graphdl-primary')
+  const stub = env.GRAPHDL_DB.get(id)
+  return stub.fetch(new Request(`https://graphdl-orm/ws?domain=${domain}`, {
+    headers: request.headers,
+  }))
+})
+
 // ── Generate ────────────────────────────────────────────────────────
 router.post('/api/generate', handleGenerate)
 router.post('/api/evaluate', handleEvaluate)
