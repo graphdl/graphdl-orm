@@ -367,9 +367,10 @@ describe('generateOpenAPI', () => {
     const result = await generateOpenAPI(model)
     const s = result.components.schemas
 
-    // With no UC constraints, no schemas should be created
-    // (no binary, no array, no compound processing)
-    expect(Object.keys(s).length).toBe(0)
+    // Entity nouns always get schemas (RMAP Step 3).
+    // Without UC constraints, no properties are added — just the empty schema.
+    expect(s['UpdateCustomer']).toBeDefined()
+    expect(Object.keys(s['UpdateCustomer'].properties || {}).length).toBe(0)
   })
 
   it('ensures domain-scoped entity nouns with permissions get schemas even without readings', async () => {

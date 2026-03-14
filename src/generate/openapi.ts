@@ -170,11 +170,8 @@ export async function generateOpenAPI(model: {
 
   const nounRegex = nounListToRegex(nouns)
 
-  // Ensure domain-scoped entity nouns with permissions have schemas
-  const domainNouns = [...nounMap.values()].filter(
-    (n) => n.permissions?.length && n.objectType === 'entity',
-  )
-  for (const noun of domainNouns) {
+  // RMAP Step 3: every entity type gets a table
+  for (const noun of [...nounMap.values()].filter((n) => n.objectType === 'entity')) {
     ensureTableExists({ tables: schemas, subject: noun, nouns, jsonExamples })
   }
 
