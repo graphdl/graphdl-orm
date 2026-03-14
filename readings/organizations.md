@@ -15,6 +15,8 @@
 | AppSlug | string | unique |
 | OrgRole | string | enum: owner, admin, member |
 | Visibility | string | enum: private, public |
+| ChatEndpoint | string | |
+| AppType | string | enum: standard, chat |
 
 ## Readings
 
@@ -33,6 +35,15 @@ Organization is owned by User.
 
 App has Name.
   Each App has at most one Name.
+
+App has AppType.
+  Each App has at most one AppType.
+
+App has ChatEndpoint.
+  Each App has at most one ChatEndpoint.
+
+App has navigable Domain.
+  Each App has at least one navigable Domain.
 
 App belongs to Organization.
   Each App belongs to at most one Organization.

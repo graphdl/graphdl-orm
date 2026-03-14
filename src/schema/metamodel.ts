@@ -41,6 +41,8 @@ export const METAMODEL_DDL: string[] = [
     id TEXT PRIMARY KEY,
     slug TEXT NOT NULL UNIQUE,
     name TEXT,
+    app_type TEXT,
+    chat_endpoint TEXT,
     organization_id TEXT REFERENCES organizations(id),
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),

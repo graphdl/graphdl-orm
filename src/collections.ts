@@ -73,7 +73,7 @@ export const FIELD_MAP: Record<string, Record<string, string>> = {
   roles: { reading: 'reading_id', noun: 'noun_id', graphSchema: 'graph_schema_id', roleIndex: 'role_index' },
   constraints: { domain: 'domain_id', setComparisonArgumentLength: 'set_comparison_argument_length' },
   constraint_spans: { constraint: 'constraint_id', role: 'role_id', subsetAutofill: 'subset_autofill' },
-  apps: { organization: 'organization_id' },
+  apps: { organization: 'organization_id', appType: 'app_type', chatEndpoint: 'chat_endpoint' },
   domains: { domainSlug: 'domain_slug', organization: 'organization_id', app: 'app_id' },
   organizations: {},
   org_memberships: { organization: 'organization_id', userEmail: 'user_email' },
