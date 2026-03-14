@@ -187,6 +187,24 @@ router.post('/api/facts', async (request, env: Env) => {
   return json({ facts: results, errors }, { status: 201 })
 })
 
+// ── Entity (high-level: create noun instance with fields) ────────────
+router.post('/api/entity', async (request, env: Env) => {
+  const body = await request.json() as {
+    noun: string        // noun name, e.g. "SupportRequest"
+    domain: string      // domain ID
+    fields: Record<string, string>  // field name → value
+    reference?: string  // display reference
+    createdBy?: string  // creator identity
+  }
+  if (!body.noun || !body.domain || !body.fields) {
+    return error(400, { errors: [{ message: 'noun, domain, and fields required' }] })
+  }
+
+  const db = getDB(env) as any
+  const result = await db.createEntity(body.domain, body.noun, body.fields, body.reference, body.createdBy)
+  return json(result, { status: 201 })
+})
+
 // ── Collection CRUD ──────────────────────────────────────────────────
 
 /** GET /api/:collection — list/find */
