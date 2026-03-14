@@ -316,6 +316,19 @@ export class GraphDLDB extends DurableObject {
       'INSERT INTO cdc_events (id, timestamp, operation, table_name, entity_id, data) VALUES (?, datetime(\'now\'), ?, ?, ?, ?)',
       id, operation, tableName, entityId, jsonData,
     )
+
+    // Broadcast to connected WebSocket clients
+    const event = JSON.stringify({ type: 'cdc', operation, table: tableName, id: entityId, ...(data?.domain_id && { domain: data.domain_id }) })
+    for (const ws of this.ctx.getWebSockets()) {
+      try {
+        const tags = this.ctx.getTags(ws)
+        // Send to all clients, or domain-filtered clients
+        const domainId = data?.domain_id as string | undefined
+        if (!domainId || tags.includes('all') || tags.includes(domainId)) {
+          ws.send(event)
+        }
+      } catch { /* client disconnected */ }
+    }
   }
 
   // =========================================================================
@@ -977,8 +990,31 @@ export class GraphDLDB extends DurableObject {
   }
 
   async fetch(request: Request): Promise<Response> {
+    // WebSocket upgrade for live event streaming
+    if (request.headers.get('Upgrade') === 'websocket') {
+      const url = new URL(request.url)
+      const domain = url.searchParams.get('domain') || 'all'
+      const pair = new WebSocketPair()
+      this.ctx.acceptWebSocket(pair[1], [domain])
+      return new Response(null, { status: 101, webSocket: pair[0] })
+    }
+
     return new Response(JSON.stringify({ status: 'ok', version: '0.1.0' }), {
       headers: { 'Content-Type': 'application/json' },
     })
+  }
+
+  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
+    // Clients can send { type: 'subscribe', domain: '...' } to change subscription
+    try {
+      const data = JSON.parse(typeof message === 'string' ? message : new TextDecoder().decode(message))
+      if (data.type === 'ping') {
+        ws.send(JSON.stringify({ type: 'pong' }))
+      }
+    } catch { /* ignore malformed messages */ }
+  }
+
+  async webSocketClose(ws: WebSocket): Promise<void> {
+    // Cleanup handled by the runtime
   }
 }
