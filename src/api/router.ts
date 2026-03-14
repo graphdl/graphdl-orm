@@ -119,15 +119,72 @@ router.post('/api/evaluate', handleEvaluate)
 router.post('/api/facts', async (request, env: Env) => {
   const body = await request.json() as {
     domainId: string
-    graphSchemaId: string
-    bindings: Array<{ nounId: string; value?: string; resourceId?: string }>
+    graphSchemaId?: string
+    bindings?: Array<{ nounId: string; value?: string; resourceId?: string }>
+    // Batch mode: resolve reading text + noun names
+    facts?: Array<{
+      reading: string
+      bindings: Array<{ noun: string; value?: string; resourceId?: string }>
+    }>
   }
-  if (!body.domainId || !body.graphSchemaId || !body.bindings?.length) {
-    return error(400, { errors: [{ message: 'domainId, graphSchemaId, and bindings required' }] })
+  if (!body.domainId) {
+    return error(400, { errors: [{ message: 'domainId required' }] })
   }
+
   const db = getDB(env) as any
-  const result = await db.createFact(body.domainId, body.graphSchemaId, body.bindings)
-  return json(result, { status: 201 })
+
+  // Single fact with pre-resolved IDs
+  if (body.graphSchemaId && body.bindings?.length) {
+    const result = await db.createFact(body.domainId, body.graphSchemaId, body.bindings)
+    return json(result, { status: 201 })
+  }
+
+  // Batch mode: resolve reading text + noun names → IDs
+  if (!body.facts?.length) {
+    return error(400, { errors: [{ message: 'graphSchemaId+bindings or facts[] required' }] })
+  }
+
+  // Load nouns and readings for this domain
+  const nouns = await db.findInCollection('nouns', { domain: { equals: body.domainId } }, { limit: 1000 })
+  const nounByName = new Map<string, any>()
+  for (const n of nouns.docs) nounByName.set(n.name, n)
+
+  const readings = await db.findInCollection('readings', { domain: { equals: body.domainId } }, { limit: 1000 })
+  const schemaByReading = new Map<string, string>()
+  for (const r of readings.docs) {
+    if (r.text && r.graphSchema) schemaByReading.set(r.text, r.graphSchema)
+  }
+
+  const results: any[] = []
+  const errors: string[] = []
+
+  for (const fact of body.facts) {
+    try {
+      const graphSchemaId = schemaByReading.get(fact.reading)
+      if (!graphSchemaId) {
+        errors.push(`Reading not found: "${fact.reading}"`)
+        continue
+      }
+
+      const resolvedBindings = fact.bindings.map(b => {
+        const noun = nounByName.get(b.noun)
+        if (!noun) return null
+        return { nounId: noun.id, value: b.value, resourceId: b.resourceId }
+      }).filter(Boolean)
+
+      if (resolvedBindings.length < 2) {
+        errors.push(`Not enough nouns resolved for: "${fact.reading}"`)
+        continue
+      }
+
+      const result = await db.createFact(body.domainId, graphSchemaId, resolvedBindings)
+      results.push(result)
+    } catch (err: any) {
+      errors.push(`"${fact.reading}": ${err.message}`)
+    }
+  }
+
+  return json({ facts: results, errors }, { status: 201 })
 })
 
 // ── Collection CRUD ──────────────────────────────────────────────────
