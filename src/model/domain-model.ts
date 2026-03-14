@@ -14,6 +14,19 @@ import type { Generator } from './renderer'
 import { render } from './renderer'
 
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/** Parse enum_values from DB — handles JSON arrays and comma-separated strings. */
+function parseEnumValues(raw: string): string[] {
+  const trimmed = raw.trim()
+  if (trimmed.startsWith('[')) {
+    try { return JSON.parse(trimmed) } catch { /* fall through */ }
+  }
+  return trimmed.split(',').map((s: string) => s.trim()).filter(Boolean)
+}
+
+// ---------------------------------------------------------------------------
 // DataLoader
 // ---------------------------------------------------------------------------
 
@@ -99,7 +112,12 @@ export class SqlDataLoader implements DataLoader {
   }
 
   queryTransitions(domainId: string): Row[] {
-    return [...this.sql.exec('SELECT * FROM transitions WHERE domain_id = ?', domainId)]
+    return [
+      ...this.sql.exec(
+        'SELECT t.* FROM transitions t JOIN statuses s ON t.from_status_id = s.id JOIN state_machine_definitions smd ON s.state_machine_definition_id = smd.id WHERE smd.domain_id = ?',
+        domainId,
+      ),
+    ]
   }
 
   queryEventTypes(domainId: string): Row[] {
@@ -172,7 +190,7 @@ export class DomainModel {
         valueType: row.value_type ?? undefined,
         format: row.format ?? undefined,
         pattern: row.pattern ?? undefined,
-        enumValues: row.enum_values ? JSON.parse(row.enum_values) : undefined,
+        enumValues: row.enum_values ? parseEnumValues(row.enum_values) : undefined,
         minimum: row.minimum ?? undefined,
         maximum: row.maximum ?? undefined,
         superType: row.super_type_name ?? undefined,
