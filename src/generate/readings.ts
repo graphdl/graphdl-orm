@@ -1,22 +1,12 @@
 /**
- * generateReadings — exports the domain model back to FORML2 readings text.
+ * generateReadings — exports the domain model back to canonical FORML2 readings text.
  *
- * Consumes a DomainModel object (nouns, readings, constraints, state machines)
- * and formats them as FORML2.
+ * Output matches the format used in source reading files (e.g. support.auto.dev/domains/support.md).
+ * Roundtrip: readings file → parse → ingest → generateReadings → same readings file.
  */
 
 import type { NounDef, FactTypeDef, ConstraintDef, StateMachineDef, ReadingDef } from '../model/types'
 
-// ---------------------------------------------------------------------------
-// generateReadings
-// ---------------------------------------------------------------------------
-
-/**
- * Produce FORML2 readings text from domain model data.
- *
- * @param model - DomainModel providing nouns, factTypes, constraints, stateMachines, readings
- * @returns `{ text, format: 'forml2' }`
- */
 export async function generateReadings(model: {
   nouns(): Promise<Map<string, NounDef>>
   factTypes(): Promise<Map<string, FactTypeDef>>
@@ -24,7 +14,6 @@ export async function generateReadings(model: {
   stateMachines(): Promise<Map<string, StateMachineDef>>
   readings(): Promise<ReadingDef[]>
 }): Promise<{ text: string; format: string }> {
-  // ------ 1. Fetch all domain model data ------
   const [nounMap, readingsList, constraints, smMap] = await Promise.all([
     model.nouns(),
     model.readings(),
@@ -36,79 +25,172 @@ export async function generateReadings(model: {
   const entities = nouns.filter((n) => n.objectType === 'entity')
   const values = nouns.filter((n) => n.objectType === 'value')
 
+  // Index constraints by fact type for annotation
+  const constraintsByFactType = new Map<string, ConstraintDef[]>()
+  for (const c of constraints) {
+    for (const s of c.spans) {
+      const list = constraintsByFactType.get(s.factTypeId) ?? []
+      list.push(c)
+      constraintsByFactType.set(s.factTypeId, list)
+    }
+  }
+
+  // Build subtype map
+  const subtypes = new Map<string, string>() // child name → parent name
+  for (const n of entities) {
+    if (n.superType) {
+      const parentName = typeof n.superType === 'string' ? n.superType : n.superType.name
+      if (parentName) subtypes.set(n.name, parentName)
+    }
+  }
+
   const lines: string[] = []
 
-  // ------ 2. Entity types ------
+  // ── Entity Types ──────────────────────────────────────────────────
   if (entities.length) {
-    lines.push('# Entity Types')
-    lines.push('')
-    for (const e of entities) {
-      const refScheme = e.referenceScheme?.map((r) => r.name).join(', ') ?? null
-      const superTypeName =
-        typeof e.superType === 'string' ? e.superType : e.superType?.name ?? null
-
-      let line = e.name
-      if (refScheme) line += ` (${refScheme})`
-      if (superTypeName) line += ` : ${superTypeName}`
-      lines.push(line)
+    lines.push('## Entity Types', '')
+    for (const e of entities.sort((a, b) => a.name.localeCompare(b.name))) {
+      lines.push(`${e.name}(.${e.name}Id) is an entity type.`)
     }
     lines.push('')
   }
 
-  // ------ 3. Value types ------
+  // ── Subtypes ──────────────────────────────────────────────────────
+  if (subtypes.size > 0) {
+    lines.push('## Subtypes', '')
+    for (const [child, parent] of [...subtypes.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+      lines.push(`${child} is a subtype of ${parent}.`)
+    }
+    lines.push('')
+  }
+
+  // ── Value Types ───────────────────────────────────────────────────
   if (values.length) {
-    lines.push('# Value Types')
-    lines.push('')
-    for (const v of values) {
-      let line = v.name
-      const parts: string[] = []
-      if (v.valueType) parts.push(v.valueType)
-      if (v.format) parts.push(`format: ${v.format}`)
-      if (v.pattern) parts.push(`pattern: ${v.pattern}`)
-      if (v.enumValues && v.enumValues.length) parts.push(`enum: ${v.enumValues.join(',')}`)
-      if (parts.length) line += ` (${parts.join(', ')})`
-      lines.push(line)
+    lines.push('## Value Types', '')
+    for (const v of values.sort((a, b) => a.name.localeCompare(b.name))) {
+      lines.push(`${v.name} is a value type.`)
+      if (v.enumValues && v.enumValues.length > 0) {
+        const quoted = v.enumValues.map((e) => `'${e}'`).join(', ')
+        lines.push(`  The possible values of ${v.name} are ${quoted}.`)
+      }
     }
     lines.push('')
   }
 
-  // ------ 4. Readings with constraint annotations ------
+  // ── Fact Types (readings grouped by first noun) ───────────────────
   if (readingsList.length) {
-    lines.push('# Readings')
-    lines.push('')
+    lines.push('## Fact Types', '')
+
+    // Group readings by the first noun (role 0)
+    const byFirstNoun = new Map<string, ReadingDef[]>()
     for (const r of readingsList) {
       if (!r.text) continue
+      const firstNoun = r.roles[0]?.nounName ?? '_ungrouped'
+      const list = byFirstNoun.get(firstNoun) ?? []
+      list.push(r)
+      byFirstNoun.set(firstNoun, list)
+    }
 
-      // Find constraints whose spans reference this reading's graphSchemaId
-      const matchingConstraints = constraints.filter((c) =>
-        c.spans.some((s) => s.factTypeId === r.graphSchemaId),
-      )
-
-      let constraintSuffix = ''
-      for (const c of matchingConstraints) {
-        const modality = c.modality === 'Deontic' ? 'D' : ''
-        constraintSuffix += ` [${modality}${c.kind}]`
+    for (const [nounName, readings] of [...byFirstNoun.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+      lines.push(`### ${nounName}`)
+      for (const r of readings) {
+        lines.push(r.text)
       }
+      lines.push('')
+    }
+  }
 
-      lines.push(r.text + constraintSuffix)
+  // ── Alethic Constraints ───────────────────────────────────────────
+  const alethic = constraints.filter((c) => c.modality === 'Alethic')
+  if (alethic.length) {
+    lines.push('## Constraints', '')
+    for (const c of alethic) {
+      if (c.text) {
+        lines.push(`${c.text}.`)
+      } else {
+        // Reconstruct from kind + spans
+        const line = reconstructConstraint(c, nounMap, readingsList)
+        if (line) lines.push(line)
+      }
     }
     lines.push('')
   }
 
-  // ------ 5. State machines ------
-  const stateMachines = [...smMap.values()]
-  for (const sm of stateMachines) {
-    const smName = sm.nounName || sm.id
-    lines.push(`# State Machine: ${smName}`)
-    lines.push('')
-
-    for (const t of sm.transitions) {
-      if (t.from && t.to && t.event) {
-        lines.push(`${smName} transitions from ${t.from} to ${t.to} on ${t.event}`)
+  // ── Deontic Constraints ───────────────────────────────────────────
+  const deontic = constraints.filter((c) => c.modality === 'Deontic')
+  if (deontic.length) {
+    lines.push('## Deontic Constraints', '')
+    for (const c of deontic) {
+      if (c.text) {
+        lines.push(`${c.text}.`)
       }
     }
     lines.push('')
+  }
+
+  // ── State Machines ────────────────────────────────────────────────
+  const stateMachines = [...smMap.values()]
+  for (const sm of stateMachines) {
+    lines.push(`## State Machine: ${sm.nounName}`, '')
+    lines.push(`Entity: ${sm.nounName}`)
+    if (sm.statuses.length) {
+      lines.push(`Initial state: ${sm.statuses[0].name}`)
+      lines.push('')
+      lines.push('### States')
+      lines.push('')
+      lines.push(sm.statuses.map((s) => s.name).join(', '))
+      lines.push('')
+    }
+    if (sm.transitions.length) {
+      lines.push('### Transitions')
+      lines.push('')
+      for (const t of sm.transitions) {
+        lines.push(`${t.from} → ${t.to} via ${t.event}`)
+      }
+      lines.push('')
+    }
   }
 
   return { text: lines.join('\n'), format: 'forml2' }
+}
+
+// ── Constraint reconstruction from spans ────────────────────────────
+
+function reconstructConstraint(
+  c: ConstraintDef,
+  nounMap: Map<string, NounDef>,
+  readings: ReadingDef[],
+): string | null {
+  if (c.spans.length === 0) return null
+
+  // Find the reading for the first span
+  const reading = readings.find((r) => r.graphSchemaId === c.spans[0].factTypeId)
+  if (!reading || reading.roles.length < 2) return null
+
+  const subjectNoun = reading.roles[0]?.nounName ?? ''
+  const objectNoun = reading.roles[1]?.nounName ?? ''
+
+  switch (c.kind) {
+    case 'UC':
+      if (c.spans.length > 1) {
+        // Spanning UC
+        return `For each pair of ${subjectNoun} and ${objectNoun}, that ${subjectNoun} ${extractPredicate(reading.text, subjectNoun, objectNoun)} that ${objectNoun} at most once.`
+      }
+      return `Each ${subjectNoun} ${extractPredicate(reading.text, subjectNoun, objectNoun)} at most one ${objectNoun}.`
+    case 'MC':
+      return `Each ${subjectNoun} ${extractPredicate(reading.text, subjectNoun, objectNoun)} at least one ${objectNoun}.`
+    case 'RC':
+      return `No ${subjectNoun} ${extractPredicate(reading.text, subjectNoun, objectNoun)} itself.`
+    default:
+      return null
+  }
+}
+
+function extractPredicate(readingText: string, firstNoun: string, secondNoun: string): string {
+  const afterFirst = readingText.indexOf(firstNoun)
+  if (afterFirst === -1) return 'has'
+  const start = afterFirst + firstNoun.length
+  const beforeSecond = readingText.indexOf(secondNoun, start)
+  if (beforeSecond === -1) return 'has'
+  return readingText.slice(start, beforeSecond).trim() || 'has'
 }
