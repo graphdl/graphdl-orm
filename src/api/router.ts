@@ -115,6 +115,21 @@ router.get('/health', () => json({ status: 'ok', version: '0.1.0' }))
 router.post('/api/generate', handleGenerate)
 router.post('/api/evaluate', handleEvaluate)
 
+// ── Facts (instance-level graph creation) ────────────────────────────
+router.post('/api/facts', async (request, env: Env) => {
+  const body = await request.json() as {
+    domainId: string
+    graphSchemaId: string
+    bindings: Array<{ nounId: string; value?: string; resourceId?: string }>
+  }
+  if (!body.domainId || !body.graphSchemaId || !body.bindings?.length) {
+    return error(400, { errors: [{ message: 'domainId, graphSchemaId, and bindings required' }] })
+  }
+  const db = getDB(env) as any
+  const result = await db.createFact(body.domainId, body.graphSchemaId, body.bindings)
+  return json(result, { status: 201 })
+})
+
 // ── Collection CRUD ──────────────────────────────────────────────────
 
 /** GET /api/:collection — list/find */

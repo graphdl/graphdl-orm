@@ -662,6 +662,96 @@ export class GraphDLDB extends DurableObject {
   // Request Routing (stub — Task 5 adds the full REST router)
   // =========================================================================
 
+  /**
+   * Create a fact instance: a Graph linking Resources through Roles.
+   *
+   * This is the instance-level write operation. "Customer has ContactName 'John'"
+   * becomes: Graph(schema=CustomerHasContactName) + ResourceRole(Customer) + ResourceRole(ContactName).
+   *
+   * @param domainId - Domain ID
+   * @param graphSchemaId - Graph Schema ID (the fact type)
+   * @param bindings - Array of { nounId, value?, resourceId? } for each role
+   *                   If resourceId is provided, uses existing resource.
+   *                   If value is provided, finds or creates a resource for the noun with that value.
+   * @returns The created Graph with its resource roles
+   */
+  async createFact(
+    domainId: string,
+    graphSchemaId: string,
+    bindings: Array<{ nounId: string; value?: string; resourceId?: string }>,
+  ): Promise<Record<string, unknown>> {
+    return this.withWriteLock(async () => {
+      const now = new Date().toISOString().replace('T', ' ').replace('Z', '')
+
+      // Resolve or create resources for each binding
+      const resolvedResources: string[] = []
+      for (const binding of bindings) {
+        if (binding.resourceId) {
+          resolvedResources.push(binding.resourceId)
+          continue
+        }
+
+        // Find existing resource by noun + value, or create one
+        if (binding.value !== undefined) {
+          const existing = this.sql.exec(
+            'SELECT id FROM resources WHERE noun_id = ? AND domain_id = ? AND value = ? LIMIT 1',
+            binding.nounId, domainId, binding.value,
+          ).toArray()
+
+          if (existing.length > 0) {
+            resolvedResources.push(existing[0].id as string)
+          } else {
+            const resourceId = crypto.randomUUID()
+            this.sql.exec(
+              'INSERT INTO resources (id, noun_id, domain_id, value, created_at, updated_at, version) VALUES (?, ?, ?, ?, ?, ?, 1)',
+              resourceId, binding.nounId, domainId, binding.value, now, now,
+            )
+            this.logCdcEvent('create', 'resources', resourceId)
+            resolvedResources.push(resourceId)
+          }
+        }
+      }
+
+      // Create the Graph
+      const graphId = crypto.randomUUID()
+      this.sql.exec(
+        'INSERT INTO graphs (id, graph_schema_id, domain_id, created_at, updated_at, version) VALUES (?, ?, ?, ?, ?, 1)',
+        graphId, graphSchemaId, domainId, now, now,
+      )
+      this.logCdcEvent('create', 'graphs', graphId)
+
+      // Create ResourceRoles linking Graph → Resources
+      // Get roles for this graph schema to map bindings to role indices
+      const roles = this.sql.exec(
+        'SELECT id, role_index FROM roles WHERE graph_schema_id = ? ORDER BY role_index',
+        graphSchemaId,
+      ).toArray()
+
+      for (let i = 0; i < Math.min(resolvedResources.length, roles.length); i++) {
+        const rrId = crypto.randomUUID()
+        this.sql.exec(
+          'INSERT INTO resource_roles (id, graph_id, resource_id, role_id, domain_id, created_at, updated_at, version) VALUES (?, ?, ?, ?, ?, ?, ?, 1)',
+          rrId, graphId, resolvedResources[i], roles[i].id, domainId, now, now,
+        )
+        this.logCdcEvent('create', 'resource_roles', rrId)
+      }
+
+      // Invalidate cache
+      this.getModel(domainId).invalidate('graphs')
+
+      return {
+        id: graphId,
+        graphSchema: graphSchemaId,
+        domain: domainId,
+        resourceRoles: resolvedResources.map((rid, i) => ({
+          resource: rid,
+          role: roles[i]?.id,
+          roleIndex: i,
+        })),
+      }
+    })
+  }
+
   async generate(domainId: string, format: string): Promise<any> {
     const model = this.getModel(domainId)
     switch (format) {
