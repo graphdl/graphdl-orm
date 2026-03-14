@@ -351,5 +351,36 @@ export async function ingestClaims(
     }
   }
 
+  // Step 6: Create instance facts (Graphs with ResourceRoles)
+  if (claims.facts?.length) {
+    for (const fact of claims.facts) {
+      try {
+        // Find the graph schema by matching the reading text
+        const reading = fact.reading
+        const schema = schemaMap.get(reading)
+        if (!schema) {
+          result.errors.push(`fact: reading "${reading}" not found`)
+          continue
+        }
+
+        // Build bindings from the fact values
+        const bindings = fact.values.map(v => {
+          const noun = nounMap.get(v.noun)
+          if (!noun) return null
+          return { nounId: noun.id as string, value: v.value }
+        }).filter(Boolean) as Array<{ nounId: string; value: string }>
+
+        if (bindings.length < 2) {
+          result.errors.push(`fact: "${reading}" needs at least 2 bindings`)
+          continue
+        }
+
+        await (db as any).createFact(domainId, schema.id as string, bindings)
+      } catch (err: any) {
+        result.errors.push(`fact "${fact.reading}": ${err.message}`)
+      }
+    }
+  }
+
   return result
 }
