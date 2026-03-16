@@ -64,7 +64,8 @@ export async function createWithHook(
   const doc = await db.createInCollection(collection, data)
   const hook = COLLECTION_HOOKS[collection]
   if (hook) {
-    const hookResult = await hook(db, doc, context)
+    // Merge original data into doc so hooks see non-column fields (e.g. transitions array)
+    const hookResult = await hook(db, { ...data, ...doc }, context)
     return { doc, hookResult }
   }
   return { doc, hookResult: EMPTY_RESULT }

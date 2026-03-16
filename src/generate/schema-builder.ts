@@ -77,7 +77,7 @@ export function createProperty({
 
   // Traverse supertype chain to resolve valueType or referenceScheme
   while (!referenceScheme?.length && !valueType && superType) {
-    if (typeof superType === 'string') superType = nouns.find((n) => n.id === superType) as NounDef
+    if (typeof superType === 'string') superType = nouns.find((n) => n.id === superType || n.name === superType) as NounDef
     referenceScheme = superType?.referenceScheme
     valueType = superType?.valueType
     superType = superType?.superType
@@ -215,7 +215,7 @@ export function ensureTableExists({
 
   // Wire supertype chain
   let superType: NounDef | string | undefined = subject.superType
-  if (typeof superType === 'string') superType = nouns?.find((n) => n.id === superType)
+  if (typeof superType === 'string') superType = nouns?.find((n) => n.id === superType || n.name === superType)
   if ((superType as NounDef)?.name) {
     superType = (superType as NounDef) || nouns?.find((n) => n.id === (superType as NounDef).id)
     const superTypeKey = nameToKey((superType as NounDef).name || '')

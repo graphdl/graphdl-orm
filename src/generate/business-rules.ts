@@ -1,9 +1,9 @@
-// src/generate/constraint-ir.ts
+// src/generate/business-rules.ts
 import type { NounDef, FactTypeDef, ConstraintDef, StateMachineDef } from '../model/types'
 
 // ── Types ──────────────────────────────────────────────────────────────
 
-export interface ConstraintIR {
+export interface BusinessRules {
   domain: string
   nouns: Record<string, {
     objectType: 'entity' | 'value'
@@ -43,13 +43,13 @@ export interface ConstraintIR {
 
 // ── Generator ──────────────────────────────────────────────────────────
 
-export async function generateConstraintIR(model: {
+export async function generateBusinessRules(model: {
   domainId: string
   nouns(): Promise<Map<string, NounDef>>
   factTypes(): Promise<Map<string, FactTypeDef>>
   constraints(): Promise<ConstraintDef[]>
   stateMachines(): Promise<Map<string, StateMachineDef>>
-}): Promise<ConstraintIR> {
+}): Promise<BusinessRules> {
   const [nouns, factTypes, constraints, stateMachines] = await Promise.all([
     model.nouns(),
     model.factTypes(),
@@ -58,9 +58,9 @@ export async function generateConstraintIR(model: {
   ])
 
   // ── Nouns ──
-  const irNouns: ConstraintIR['nouns'] = {}
+  const irNouns: BusinessRules['nouns'] = {}
   for (const [name, noun] of nouns) {
-    const entry: ConstraintIR['nouns'][string] = { objectType: noun.objectType }
+    const entry: BusinessRules['nouns'][string] = { objectType: noun.objectType }
     if (noun.enumValues && noun.enumValues.length > 0) entry.enumValues = noun.enumValues
     if (noun.valueType) entry.valueType = noun.valueType
     if (noun.superType) {
@@ -72,7 +72,7 @@ export async function generateConstraintIR(model: {
   }
 
   // ── FactTypes ──
-  const irFactTypes: ConstraintIR['factTypes'] = {}
+  const irFactTypes: BusinessRules['factTypes'] = {}
   for (const [id, ft] of factTypes) {
     irFactTypes[id] = {
       reading: ft.reading,
@@ -84,9 +84,9 @@ export async function generateConstraintIR(model: {
   }
 
   // ── Constraints ──
-  const irConstraints: ConstraintIR['constraints'] = []
+  const irConstraints: BusinessRules['constraints'] = []
   for (const c of constraints) {
-    const entry: ConstraintIR['constraints'][number] = {
+    const entry: BusinessRules['constraints'][number] = {
       id: c.id,
       kind: c.kind,
       modality: c.modality || 'Alethic',
@@ -105,13 +105,13 @@ export async function generateConstraintIR(model: {
   }
 
   // ── State Machines ──
-  const irStateMachines: ConstraintIR['stateMachines'] = {}
+  const irStateMachines: BusinessRules['stateMachines'] = {}
   for (const [id, sm] of stateMachines) {
     irStateMachines[id] = {
       nounName: sm.nounName,
       statuses: sm.statuses.map((s) => s.name),
       transitions: sm.transitions.map((t) => {
-        const transition: ConstraintIR['stateMachines'][string]['transitions'][number] = {
+        const transition: BusinessRules['stateMachines'][string]['transitions'][number] = {
           from: t.from,
           to: t.to,
           event: t.event,

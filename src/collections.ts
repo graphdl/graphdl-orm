@@ -79,7 +79,7 @@ export const FIELD_MAP: Record<string, Record<string, string>> = {
   org_memberships: { organization: 'organization_id', userEmail: 'user_email' },
   state_machine_definitions: { domain: 'domain_id', noun: 'noun_id' },
   statuses: { stateMachineDefinition: 'state_machine_definition_id', domain: 'domain_id' },
-  transitions: { from: 'from_status_id', to: 'to_status_id', eventType: 'event_type_id', verb: 'verb_id', domain: 'domain_id' },
+  transitions: { from: 'from_status_id', to: 'to_status_id', eventType: 'event_type_id', verb: 'verb_id', stateMachineDefinition: 'state_machine_definition_id', domain: 'domain_id' },
   guards: { transition: 'transition_id', graphSchema: 'graph_schema_id', domain: 'domain_id' },
   event_types: { domain: 'domain_id' },
   verbs: { status: 'status_id', transition: 'transition_id', graph: 'graph_id', agentDefinition: 'agent_definition_id', domain: 'domain_id' },

@@ -181,6 +181,42 @@ export async function generateOpenAPI(model: {
   processArraySchemas(arrayTypes, nouns, nounRegex, schemas, jsonExamples)
   processUnarySchemas(graphSchemas, nouns, nounRegex, schemas, jsonExamples, examples)
 
+  // ------ Step G.5: Propagate supertype properties to subtypes ------
+  // If Resource has a property from "StateMachine is for Resource",
+  // then SupportRequest (subtype of Resource) should inherit that property.
+  const subtypeMap = new Map<string, string[]>() // parent name → child names
+  for (const noun of nouns) {
+    if (noun.superType) {
+      const parentName = typeof noun.superType === 'string' ? noun.superType : noun.superType.name
+      if (parentName) {
+        const children = subtypeMap.get(parentName) || []
+        children.push(noun.name)
+        subtypeMap.set(parentName, children)
+      }
+    }
+  }
+
+  // For each parent entity with subtypes, copy properties to child Update schemas
+  for (const [parentName, childNames] of subtypeMap) {
+    const parentKey = nameToKey('Update' + parentName)
+    const parentSchema = schemas[parentKey]
+    if (!parentSchema?.properties) continue
+
+    for (const childName of childNames) {
+      const childKey = nameToKey('Update' + childName)
+      if (!schemas[childKey]) continue
+      // Merge parent properties into child (child's own properties take precedence)
+      const childProps = schemas[childKey].properties || {}
+      schemas[childKey].properties = { ...parentSchema.properties, ...childProps }
+      // Also merge required arrays
+      if (parentSchema.required) {
+        const childRequired = new Set(schemas[childKey].required || [])
+        for (const r of parentSchema.required) childRequired.add(r)
+        schemas[childKey].required = [...childRequired]
+      }
+    }
+  }
+
   // ------ Step H: Flatten allOf chains ------
   const componentSchemas: [string, Schema][] = Object.entries(schemas)
   for (const [key, schema] of componentSchemas) {

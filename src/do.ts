@@ -174,6 +174,8 @@ export class GraphDLDB extends DurableObject {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env)
     this.sql = ctx.storage.sql
+    // Ensure clean FK state on startup — defer_foreign_keys persists on reused connections
+    this.sql.exec('PRAGMA defer_foreign_keys = OFF')
     this.initTables()
   }
 
@@ -199,6 +201,7 @@ export class GraphDLDB extends DurableObject {
       'ALTER TABLE statuses ADD COLUMN domain_id TEXT',
       'CREATE INDEX IF NOT EXISTS idx_statuses_domain ON statuses(domain_id)',
       'ALTER TABLE transitions ADD COLUMN domain_id TEXT',
+      'ALTER TABLE transitions ADD COLUMN state_machine_definition_id TEXT',
       'CREATE INDEX IF NOT EXISTS idx_transitions_domain ON transitions(domain_id)',
       // resources: add created_by for per-user scoping
       'ALTER TABLE resources ADD COLUMN created_by TEXT',
@@ -212,7 +215,11 @@ export class GraphDLDB extends DurableObject {
       // apps: add config columns (from readings/organizations.md)
       'ALTER TABLE apps ADD COLUMN app_type TEXT',
       'ALTER TABLE apps ADD COLUMN chat_endpoint TEXT',
+      // messages: add sender_identity for user/assistant role distinction
+      'ALTER TABLE messages ADD COLUMN sender_identity TEXT',
     ]
+
+    // Entity tables (messages, support_requests, etc.) are created by applySchema on first use.
     for (const migration of migrations) {
       try { this.sql.exec(migration) } catch { /* column/index already exists */ }
     }
@@ -289,6 +296,152 @@ export class GraphDLDB extends DurableObject {
     // Bootstrap metamodel data (idempotent)
     for (const dml of ALL_BOOTSTRAP) {
       this.sql.exec(dml)
+    }
+  }
+
+  /** Wipe all metamodel data for a domain (nouns, readings, constraints, roles, etc.) */
+  wipeDomainMetamodel(domainId: string): { deleted: boolean; domainId: string; counts: Record<string, any> } {
+    const counts: Record<string, any> = {}
+    this.sql.exec('PRAGMA foreign_keys = OFF')
+
+    // Delete child records via parent join (roles/constraint_spans don't have domain_id)
+    const countAndDelete = (table: string, where: string, ...params: any[]) => {
+      try {
+        const before = [...this.sql.exec(`SELECT count(*) as c FROM ${table} WHERE ${where}`, ...params)][0] as any
+        this.sql.exec(`DELETE FROM ${table} WHERE ${where}`, ...params)
+        counts[table] = { before: before?.c || 0, after: 0 }
+      } catch (e: any) { counts[table] = { error: e.message } }
+    }
+
+    // constraint_spans → via constraints
+    countAndDelete('constraint_spans',
+      'constraint_id IN (SELECT id FROM constraints WHERE domain_id = ?)', domainId)
+    // roles → via graph_schemas
+    countAndDelete('roles',
+      'graph_schema_id IN (SELECT id FROM graph_schemas WHERE domain_id = ?)', domainId)
+    // Direct domain_id tables
+    for (const table of ['constraints', 'readings', 'graph_schemas', 'nouns']) {
+      countAndDelete(table, 'domain_id = ?', domainId)
+    }
+
+    this.sql.exec('PRAGMA foreign_keys = ON')
+    try { this.sql.exec(`DELETE FROM generators WHERE domain_id = ?`, domainId) } catch { /* */ }
+    this.getModel(domainId).invalidate()
+    return { deleted: true, domainId, counts }
+  }
+
+  /**
+   * Resolve derivation rules for an entity type.
+   * Derivation rules are readings with `:=` predicates that compute values from related entities.
+   *
+   * Example: "SupportRequest was submitted on Date := min of SentAt where SupportRequest has Message and Message has SentAt."
+   * → For each SupportRequest, SELECT MIN(sent_at) FROM messages WHERE support_request_id = ?
+   */
+  private resolveDerivations(
+    domainId: string,
+    nounName: string,
+    docs: Record<string, unknown>[],
+    toTableName: (s: string) => string,
+    toColumnName: (s: string) => string,
+  ): Array<{ field: string; resolve: (entityId: string) => unknown }> {
+    if (docs.length === 0) return []
+
+    // Find derivation readings for this noun — search by domain_id on the reading itself
+    const likePattern = `${nounName}%:=%`
+    const derivationReadings = [...this.sql.exec(
+      `SELECT text FROM readings WHERE domain_id = ? AND text LIKE ?`,
+      domainId, likePattern,
+    )]
+
+    if (derivationReadings.length === 0) return []
+
+    const results: Array<{ field: string; resolve: (entityId: string) => unknown }> = []
+
+    for (const row of derivationReadings) {
+      const text = row.text as string
+      const match = text.match(/^(\w+)\s+(.+?)\s*:=\s*(.+?)\.?$/)
+      if (!match) continue
+
+      const [, subject, predicate, expression] = match
+
+      // Parse "min of SentAt where SupportRequest has Message and Message has SentAt"
+      const minMatch = expression.trim().match(/^min of (\w+) where (\w+) has (\w+) and (\w+) has (\w+)$/i)
+      if (minMatch) {
+        const [, aggregateField, parentNoun, childNoun, childNoun2, valueField] = minMatch
+        const childTable = toTableName(childNoun)
+        const parentFkCol = toColumnName(parentNoun) + '_id'
+        const valueCol = toColumnName(valueField)
+
+        // Derive the camelCase field name from the predicate
+        // "was submitted on Date" → "date" or "submittedOn"
+        const predicateWords = predicate.trim().split(/\s+/)
+        const lastWord = predicateWords[predicateWords.length - 1]
+        const fieldName = toColumnName(lastWord)
+
+        try {
+          // Verify table and columns exist
+          this.sql.exec(`SELECT 1 FROM ${childTable} LIMIT 0`)
+          const cols = new Set(
+            this.sql.exec(`PRAGMA table_info(${childTable})`).toArray().map((c: any) => c.name as string)
+          )
+          if (!cols.has(parentFkCol) || !cols.has(valueCol)) continue
+
+          results.push({
+            field: fieldName,
+            resolve: (entityId: string) => {
+              try {
+                const result = this.sql.exec(
+                  `SELECT MIN(${valueCol}) as val FROM ${childTable} WHERE ${parentFkCol} = ? AND domain_id = ?`,
+                  entityId, domainId,
+                ).toArray()
+                return result[0]?.val ?? null
+              } catch { return null }
+            },
+          })
+        } catch { /* table doesn't exist */ }
+      }
+    }
+
+    return results
+  }
+
+  /** Read entity table info from cached schema-map. No applySchema, no write lock. */
+  private async getEntityTableFromCache(
+    domainId: string,
+    nounName: string,
+    toTableName: (s: string) => string,
+  ): Promise<{ tableName: string; fieldMap: Record<string, string> } | null> {
+    const rows = this.sql.exec(
+      "SELECT output FROM generators WHERE domain_id = ? AND output_format = 'schema-map' LIMIT 1", domainId,
+    ).toArray()
+    if (!rows.length || !rows[0].output) return null
+    const cached = JSON.parse(rows[0].output as string)
+    const tableName = cached.tableMap?.[nounName] || toTableName(nounName)
+    try {
+      this.sql.exec(`SELECT 1 FROM ${tableName} LIMIT 0`)
+    } catch {
+      return null
+    }
+    return { tableName, fieldMap: cached.fieldMap?.[tableName] || {} }
+  }
+
+  // =========================================================================
+  // Debug
+  // =========================================================================
+
+  inspectTable(table: string): Record<string, any> {
+    try {
+      const columns = [...this.sql.exec(`PRAGMA table_info(${table})`)].map((r: any) => ({
+        name: r.name, type: r.type, notnull: r.notnull, dflt_value: r.dflt_value, pk: r.pk,
+      }))
+      const fks = [...this.sql.exec(`PRAGMA foreign_key_list(${table})`)].map((r: any) => ({
+        id: r.id, seq: r.seq, table: r.table, from: r.from, to: r.to,
+      }))
+      const foreignKeysOn = [...this.sql.exec('PRAGMA foreign_keys')][0]
+      const ddl = [...this.sql.exec(`SELECT sql FROM sqlite_master WHERE type='table' AND name='${table}'`)]
+      return { table, columns, foreignKeys: fks, foreignKeysPragma: foreignKeysOn, ddl: ddl[0]?.sql || null }
+    } catch (e: any) {
+      return { table, error: e.message }
     }
   }
 
@@ -781,12 +934,28 @@ export class GraphDLDB extends DurableObject {
     reference?: string,
     createdBy?: string,
   ): Promise<Record<string, unknown>> {
-    return this.withWriteLock(async () => {
-      const now = new Date().toISOString().replace('T', ' ').replace('Z', '')
-      const { toColumnName } = await import('./generate/sqlite')
+    // Pre-import and pre-warm child entity tables BEFORE entering the write lock
+    // to avoid await-induced transaction breaks and getEntityTable deadlocks
+    const { toColumnName, toTableName } = await import('./generate/sqlite')
 
-      // Get the 3NF table for this noun (creates it if needed via applySchema)
-      const entityTable = await this.getEntityTable(domainId, nounName)
+    // Pre-warm: ensure entity tables exist for any array-of-objects child nouns
+    for (const [fieldName, fieldValue] of Object.entries(fields)) {
+      if (Array.isArray(fieldValue) && fieldValue.length > 0 && typeof fieldValue[0] === 'object') {
+        const singular = fieldName.replace(/s$/, '')
+        const childNoun = singular.charAt(0).toUpperCase() + singular.slice(1)
+        await this.getEntityTable(domainId, childNoun) // triggers applySchema if needed
+      }
+    }
+    // Also pre-warm the parent table
+    await this.getEntityTable(domainId, nounName)
+
+    return this.withWriteLock(async () => {
+      // Reset deferred FK state (may persist from prior requests on reused connection)
+      this.sql.exec('PRAGMA defer_foreign_keys = OFF')
+      const now = new Date().toISOString().replace('T', ' ').replace('Z', '')
+
+      // Read table info from cached schema-map (pre-warmed above, no await needed)
+      const entityTable = await this.getEntityTableFromCache(domainId, nounName, toTableName)
 
       if (entityTable) {
         // ── 3NF path: insert one row into the entity's table ──
@@ -804,6 +973,7 @@ export class GraphDLDB extends DurableObject {
 
         // Map fields to columns
         const nestedEntities: Array<{ nounName: string; fields: Record<string, any>; fkCol: string }> = []
+        const childCreationResults: any[] = []
 
         for (const [fieldName, fieldValue] of Object.entries(fields)) {
           if (fieldValue === undefined || fieldValue === null) continue
@@ -826,7 +996,33 @@ export class GraphDLDB extends DurableObject {
             continue
           }
 
-          // Array = JSON column or multiple FK rows (handle as JSON for now)
+          // Array of objects = child entities (e.g. messages: [{body, sentAt}, ...])
+          // Create each as a separate entity with an FK back to this parent.
+          if (Array.isArray(fieldValue) && fieldValue.length > 0 && typeof fieldValue[0] === 'object') {
+            const singular = fieldName.replace(/s$/, '')
+            const childNoun = singular.charAt(0).toUpperCase() + singular.slice(1)
+            const parentFkField = nounName.charAt(0).toLowerCase() + nounName.slice(1)
+            for (const childObj of fieldValue) {
+              const childData = { ...(childObj as Record<string, any>), [parentFkField]: id }
+              try {
+                const childResult = await this.createEntityInner(domainId, childNoun, childData, undefined, createdBy, now, toColumnName, toTableName)
+                childCreationResults.push({ noun: childNoun, ...childResult })
+              } catch (err: any) {
+                childCreationResults.push({ noun: childNoun, error: err.message })
+              }
+            }
+            // Store child IDs as JSON array if the column exists
+            const idsCol = fieldMap[fieldName] || toColumnName(fieldName)
+            if (tableColumns.has(idsCol)) {
+              const childIds = childCreationResults.filter((r: any) => r.id).map((r: any) => r.id)
+              if (childIds.length) {
+                this.sql.exec(`UPDATE ${tableName} SET ${idsCol} = ? WHERE id = ?`, JSON.stringify(childIds), id)
+              }
+            }
+            continue
+          }
+
+          // Array of primitives = JSON column
           if (Array.isArray(fieldValue)) {
             const colName = fieldMap[fieldName] || toColumnName(fieldName)
             if (tableColumns.has(colName)) {
@@ -860,7 +1056,7 @@ export class GraphDLDB extends DurableObject {
         // Create nested entities and update FK columns
         for (const nested of nestedEntities) {
           try {
-            const nestedResult = await this.createEntityInner(domainId, nested.nounName, nested.fields, undefined, createdBy, now)
+            const nestedResult = await this.createEntityInner(domainId, nested.nounName, nested.fields, undefined, createdBy, now, toColumnName, toTableName)
             if (nestedResult.id) {
               this.sql.exec(`UPDATE ${tableName} SET ${nested.fkCol} = ? WHERE id = ?`, nestedResult.id, id)
             }
@@ -876,6 +1072,7 @@ export class GraphDLDB extends DurableObject {
           domain: domainId,
           reference,
           createdBy,
+          ...(childCreationResults.length > 0 && { children: childCreationResults }),
         }
       }
 
@@ -902,7 +1099,11 @@ export class GraphDLDB extends DurableObject {
     })
   }
 
-  /** Inner createEntity — no write lock, used for nested entity creation. */
+  /**
+   * Inner createEntity — no write lock, no getEntityTable (avoids deadlock).
+   * Derives table name directly and inserts. Used for child entity creation
+   * from within createEntity's write lock.
+   */
   private async createEntityInner(
     domainId: string,
     nounName: string,
@@ -910,13 +1111,29 @@ export class GraphDLDB extends DurableObject {
     reference?: string,
     createdBy?: string,
     now?: string,
+    toColumnName: (s: string) => string,
+    toTableName: (s: string) => string,
   ): Promise<{ id: string }> {
     const ts = now || new Date().toISOString().replace('T', ' ').replace('Z', '')
-    const { toColumnName } = await import('./generate/sqlite')
-    const entityTable = await this.getEntityTable(domainId, nounName)
 
-    if (!entityTable) {
-      // No table — create a generic resource
+    // Read fieldMap from cached schema-map (written by applySchema, already called by parent createEntity)
+    let fieldMap: Record<string, string> = {}
+    try {
+      const rows = this.sql.exec(
+        "SELECT output FROM generators WHERE domain_id = ? AND output_format = 'schema-map' LIMIT 1", domainId,
+      ).toArray()
+      if (rows.length && rows[0].output) {
+        const cached = JSON.parse(rows[0].output as string)
+        fieldMap = cached.fieldMap?.[tableName] || {}
+      }
+    } catch { /* no cache yet */ }
+
+    // FK checks already deferred by parent createEntity's PRAGMA defer_foreign_keys = ON
+
+    // Check if table exists — if not, fall back to generic resources
+    try {
+      this.sql.exec(`SELECT 1 FROM ${tableName} LIMIT 0`)
+    } catch {
       const id = crypto.randomUUID()
       const nouns = this.sql.exec('SELECT id FROM nouns WHERE name = ? AND domain_id = ? LIMIT 1', nounName, domainId).toArray()
       if (nouns.length) {
@@ -928,7 +1145,6 @@ export class GraphDLDB extends DurableObject {
       return { id }
     }
 
-    const { tableName, fieldMap } = entityTable
     const id = crypto.randomUUID()
     const cols = ['id', 'domain_id', 'created_at', 'updated_at', 'version']
     const vals: any[] = [id, domainId, ts, ts, 1]
@@ -947,10 +1163,19 @@ export class GraphDLDB extends DurableObject {
       else if (tableColumns.has(fkColName)) { cols.push(fkColName); vals.push(fieldValue) }
     }
 
-    this.sql.exec(
-      `INSERT INTO ${tableName} (${cols.join(', ')}) VALUES (${cols.map(() => '?').join(', ')})`,
-      ...vals,
-    )
+    try {
+      this.sql.exec(
+        `INSERT INTO ${tableName} (${cols.join(', ')}) VALUES (${cols.map(() => '?').join(', ')})`,
+        ...vals,
+      )
+      // Verify the row actually persisted
+      const verify = [...this.sql.exec(`SELECT id FROM ${tableName} WHERE id = ?`, id)]
+      if (verify.length === 0) {
+        throw new Error(`INSERT appeared to succeed but row not found | table=${tableName} id=${id}`)
+      }
+    } catch (e: any) {
+      throw new Error(`${e.message} | table=${tableName} cols=[${cols.join(',')}] vals=[${vals.map(v => String(v).slice(0, 30)).join(',')}]`)
+    }
     this.logCdcEvent('create', tableName, id, { domain_id: domainId })
     return { id }
   }
@@ -1072,6 +1297,172 @@ export class GraphDLDB extends DurableObject {
   }
 
   /**
+   * Resolve array-of-ID fields in an entity doc to full objects.
+   *
+   * For each field that's an array of UUID strings, query the corresponding
+   * entity table and replace IDs with full row objects (snake→camel converted).
+   * Also resolves reverse FK relationships: finds child entity tables that have
+   * a `<noun>_id` column pointing back to this entity and embeds matching rows.
+   */
+  async populateEntity(
+    domainId: string,
+    nounName: string,
+    doc: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    const { toTableName, toColumnName } = await import('./generate/sqlite')
+    const populated = { ...doc }
+    const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+    const snakeToCamel = (row: Record<string, unknown>) => {
+      const out: Record<string, unknown> = {}
+      for (const [k, v] of Object.entries(row)) {
+        const ck = k.replace(/_([a-z])/g, (_, c) => c.toUpperCase())
+        if (typeof v === 'string' && (v.startsWith('[') || v.startsWith('{'))) {
+          try { out[ck] = JSON.parse(v) } catch { out[ck] = v }
+        } else {
+          out[ck] = v
+        }
+      }
+      return out
+    }
+
+    // Forward: resolve arrays of UUIDs to full entity rows
+    for (const [key, val] of Object.entries(populated)) {
+      if (!Array.isArray(val) || val.length === 0) continue
+      if (typeof val[0] !== 'string' || !uuidRe.test(val[0])) continue
+
+      // Derive noun from field name: "messages" → "Message"
+      const singular = key.replace(/s$/, '')
+      const nounGuess = singular.charAt(0).toUpperCase() + singular.slice(1)
+      const tableName = toTableName(nounGuess)
+      try {
+        this.sql.exec(`SELECT 1 FROM ${tableName} LIMIT 0`)
+        const resolved: Record<string, unknown>[] = []
+        for (const id of val as string[]) {
+          const rows = this.sql.exec(`SELECT * FROM ${tableName} WHERE id = ? AND domain_id = ?`, id, domainId).toArray()
+          resolved.push(rows.length ? snakeToCamel(rows[0] as Record<string, unknown>) : { id })
+        }
+        populated[key] = resolved
+      } catch { /* table doesn't exist, keep raw array */ }
+    }
+
+    // Reverse FK: find child tables with a column pointing back to this entity
+    const fkCol = toColumnName(nounName) + '_id'
+    const tables = this.sql.exec("SELECT name FROM sqlite_master WHERE type='table'").toArray()
+    for (const { name } of tables) {
+      const table = name as string
+      if (table.startsWith('_') || table === toTableName(nounName)) continue
+      try {
+        const cols = this.sql.exec(`PRAGMA table_info(${table})`).toArray()
+        if (!cols.some(c => c.name === fkCol)) continue
+        const children = this.sql.exec(
+          `SELECT * FROM ${table} WHERE ${fkCol} = ? AND domain_id = ? ORDER BY created_at ASC`,
+          doc.id as string, domainId,
+        ).toArray()
+        if (children.length > 0) {
+          const camelField = table.replace(/_([a-z])/g, (_, c) => c.toUpperCase())
+          populated[camelField] = children.map(r => snakeToCamel(r as Record<string, unknown>))
+        }
+      } catch { /* skip */ }
+    }
+
+    return populated
+  }
+
+  /**
+   * Update an entity in a 3NF table.
+   */
+  async updateEntity(domainId: string, nounName: string, id: string, fields: Record<string, any>): Promise<Record<string, unknown> | null> {
+    const { toTableName, toColumnName } = await import('./generate/sqlite')
+    const entityTable = await this.getEntityTable(domainId, nounName)
+    const tableName = entityTable?.tableName || toTableName(nounName)
+    const fieldMap = entityTable?.fieldMap || {}
+
+    try {
+      const existing = this.sql.exec(`SELECT id FROM ${tableName} WHERE id = ? AND domain_id = ?`, id, domainId).toArray()
+      if (existing.length === 0) return null
+
+      const tableColumns = new Set<string>()
+      for (const row of this.sql.exec(`PRAGMA table_info(${tableName})`).toArray()) {
+        tableColumns.add(row.name as string)
+      }
+
+      const sets: string[] = []
+      const vals: any[] = []
+      for (const [fieldName, fieldValue] of Object.entries(fields)) {
+        if (fieldValue === undefined) continue
+        const colName = fieldMap[fieldName] || toColumnName(fieldName)
+        const fkColName = colName + '_id'
+        if (tableColumns.has(colName)) { sets.push(`${colName} = ?`); vals.push(fieldValue) }
+        else if (tableColumns.has(fkColName)) { sets.push(`${fkColName} = ?`); vals.push(fieldValue) }
+      }
+
+      if (sets.length === 0) return null
+
+      sets.push("updated_at = datetime('now')")
+      this.sql.exec(`UPDATE ${tableName} SET ${sets.join(', ')} WHERE id = ? AND domain_id = ?`, ...vals, id, domainId)
+      this.logCdcEvent('update', tableName, id, { domain_id: domainId })
+
+      const updated = this.sql.exec(`SELECT * FROM ${tableName} WHERE id = ?`, id).toArray()
+      if (!updated.length) return null
+      const doc: Record<string, unknown> = {}
+      for (const [key, val] of Object.entries(updated[0] as Record<string, unknown>)) {
+        doc[key.replace(/_([a-z])/g, (_, c) => c.toUpperCase())] = val
+      }
+      return doc
+    } catch {
+      return null
+    }
+  }
+
+  /**
+   * Delete an entity from a 3NF table.
+   * Checks the entity's own table first, then walks up the supertype chain.
+   * Also cascade-deletes child entities that have an FK referencing this entity.
+   */
+  async deleteEntity(domainId: string, nounName: string, id: string): Promise<{ deleted: boolean }> {
+    const { toTableName, toColumnName } = await import('./generate/sqlite')
+
+    // Build supertype chain: [SupportRequest, Request, ...]
+    const tablesToTry = [toTableName(nounName)]
+    const supertypes = this.sql.exec(
+      'SELECT n2.name FROM nouns n1 JOIN nouns n2 ON n1.super_type_id = n2.id WHERE n1.name = ? AND n1.domain_id = ?',
+      nounName, domainId,
+    ).toArray()
+    for (const st of supertypes) {
+      tablesToTry.push(toTableName(st.name as string))
+    }
+
+    // Try deleting from each table in the chain
+    for (const tableName of tablesToTry) {
+      try {
+        const existing = this.sql.exec(`SELECT id FROM ${tableName} WHERE id = ? AND domain_id = ?`, id, domainId).toArray()
+        if (existing.length === 0) continue
+
+        // Cascade: delete child entities that reference this entity via FK
+        const fkCol = toColumnName(nounName) + '_id'
+        const allTables = this.sql.exec("SELECT name FROM sqlite_master WHERE type='table'").toArray()
+        for (const { name } of allTables) {
+          const table = name as string
+          if (table.startsWith('_') || table === tableName) continue
+          try {
+            const cols = this.sql.exec(`PRAGMA table_info(${table})`).toArray()
+            if (cols.some(c => c.name === fkCol)) {
+              this.sql.exec(`DELETE FROM ${table} WHERE ${fkCol} = ? AND domain_id = ?`, id, domainId)
+            }
+          } catch { /* skip */ }
+        }
+
+        this.sql.exec(`DELETE FROM ${tableName} WHERE id = ? AND domain_id = ?`, id, domainId)
+        this.logCdcEvent('delete', tableName, id, { domain_id: domainId })
+        return { deleted: true }
+      } catch { /* table doesn't exist, try next */ }
+    }
+
+    return { deleted: false }
+  }
+
+  /**
    * Query a 3NF entity table. Returns rows with pagination.
    * The table name is derived from the noun name via RMAP.
    */
@@ -1093,47 +1484,137 @@ export class GraphDLDB extends DurableObject {
       return { docs: [], totalDocs: 0, page, limit, hasNextPage: false }
     }
 
-    let query = `SELECT * FROM ${tableName} WHERE domain_id = ?`
-    let countQuery = `SELECT count(*) as cnt FROM ${tableName} WHERE domain_id = ?`
+    // Build WHERE clause
+    let whereClause = 'WHERE domain_id = ?'
     const params: any[] = [domainId]
     const countParams: any[] = [domainId]
 
-    // Simple where clause support
     if (options?.where) {
       for (const [field, condition] of Object.entries(options.where)) {
         const col = toColumnName(field)
         if (typeof condition === 'object' && condition !== null) {
           for (const [op, val] of Object.entries(condition as Record<string, any>)) {
-            if (op === 'equals') { query += ` AND ${col} = ?`; countQuery += ` AND ${col} = ?`; params.push(val); countParams.push(val) }
-            else if (op === 'not_equals') { query += ` AND ${col} != ?`; countQuery += ` AND ${col} != ?`; params.push(val); countParams.push(val) }
-            else if (op === 'like') { query += ` AND ${col} LIKE ?`; countQuery += ` AND ${col} LIKE ?`; params.push(val); countParams.push(val) }
+            if (op === 'equals') { whereClause += ` AND ${col} = ?`; params.push(val); countParams.push(val) }
+            else if (op === 'not_equals') { whereClause += ` AND ${col} != ?`; params.push(val); countParams.push(val) }
+            else if (op === 'like') { whereClause += ` AND ${col} LIKE ?`; params.push(val); countParams.push(val) }
           }
         } else {
-          query += ` AND ${col} = ?`; countQuery += ` AND ${col} = ?`; params.push(condition); countParams.push(condition)
+          whereClause += ` AND ${col} = ?`; params.push(condition); countParams.push(condition)
         }
       }
     }
 
+    // Find subtype tables that share columns with this table (subtype UNION)
+    // e.g., querying Message also returns SupportResponse (a subtype of Message)
+    const subtypeNouns = this.sql.exec(
+      'SELECT n.name FROM nouns n WHERE n.super_type_id IN (SELECT id FROM nouns WHERE name = ? AND domain_id = ?) AND n.domain_id = ?',
+      nounName, domainId, domainId,
+    ).toArray()
+
+    const baseColumns = new Set<string>()
+    try {
+      for (const row of this.sql.exec(`PRAGMA table_info(${tableName})`).toArray()) {
+        baseColumns.add(row.name as string)
+      }
+    } catch { /* table doesn't exist */ }
+
+    const unionParts: string[] = [`SELECT *, '${nounName}' as _type FROM ${tableName} ${whereClause}`]
+
+    for (const subNoun of subtypeNouns) {
+      const subTable = toTableName(subNoun.name as string)
+      try {
+        this.sql.exec(`SELECT 1 FROM ${subTable} LIMIT 0`)
+        // Build SELECT with matching columns — use NULL for columns only in the base table
+        const subColumns = new Set<string>()
+        for (const row of this.sql.exec(`PRAGMA table_info(${subTable})`).toArray()) {
+          subColumns.add(row.name as string)
+        }
+        const selectCols = [...baseColumns].map(col => subColumns.has(col) ? col : `NULL as ${col}`)
+        selectCols.push(`'${subNoun.name}' as _type`)
+
+        // Build a WHERE clause for the subtype that only includes conditions on columns it actually has.
+        // Without this, conditions like `support_request_id = ?` become `NULL = ?` and match nothing.
+        let subWhereClause = 'WHERE domain_id = ?'
+        const subParams: any[] = [domainId]
+        if (options?.where) {
+          for (const [field, condition] of Object.entries(options.where)) {
+            const col = toColumnName(field)
+            if (!subColumns.has(col)) continue // skip conditions on columns this subtype doesn't have
+            if (typeof condition === 'object' && condition !== null) {
+              for (const [op, val] of Object.entries(condition as Record<string, any>)) {
+                if (op === 'equals') { subWhereClause += ` AND ${col} = ?`; subParams.push(val) }
+                else if (op === 'not_equals') { subWhereClause += ` AND ${col} != ?`; subParams.push(val) }
+                else if (op === 'like') { subWhereClause += ` AND ${col} LIKE ?`; subParams.push(val) }
+              }
+            } else {
+              subWhereClause += ` AND ${col} = ?`; subParams.push(condition)
+            }
+          }
+        }
+        unionParts.push(`SELECT ${selectCols.join(', ')} FROM ${subTable} ${subWhereClause}`)
+        // Track subtype params separately so they can be spliced in correctly
+        ;(unionParts as any).__subParams = (unionParts as any).__subParams || []
+        ;(unionParts as any).__subParams.push(subParams)
+      } catch { /* subtype table doesn't exist yet */ }
+    }
+
     // Sort
     const sortField = options?.sort?.startsWith('-') ? options.sort.slice(1) : (options?.sort || 'created_at')
-    const sortDir = options?.sort?.startsWith('-') ? 'DESC' : 'DESC'
-    query += ` ORDER BY ${toColumnName(sortField)} ${sortDir}`
-    query += ` LIMIT ? OFFSET ?`
-    params.push(limit, offset)
+    const sortDir = options?.sort?.startsWith('-') ? 'DESC' : 'ASC'
+
+    let query: string
+    let countQuery: string
+    if (unionParts.length > 1) {
+      const union = unionParts.join(' UNION ALL ')
+      query = `SELECT * FROM (${union}) ORDER BY ${toColumnName(sortField)} ${sortDir} LIMIT ? OFFSET ?`
+      countQuery = `SELECT count(*) as cnt FROM (${union})`
+      // Build combined params: base table params + each subtype's own params
+      const allParams: any[] = [...params]
+      const allCountParams: any[] = [...countParams]
+      const subParamsArr: any[][] = (unionParts as any).__subParams || []
+      for (const sp of subParamsArr) {
+        allParams.push(...sp)
+        allCountParams.push(...sp)
+      }
+      allParams.push(limit, offset)
+      params.length = 0; params.push(...allParams)
+      countParams.length = 0; countParams.push(...allCountParams)
+    } else {
+      query = `SELECT * FROM ${tableName} ${whereClause} ORDER BY ${toColumnName(sortField)} ${sortDir} LIMIT ? OFFSET ?`
+      countQuery = `SELECT count(*) as cnt FROM ${tableName} ${whereClause}`
+      params.push(limit, offset)
+    }
 
     const rows = this.sql.exec(query, ...params).toArray()
     const countRow = this.sql.exec(countQuery, ...countParams).toArray()
     const totalDocs = (countRow[0]?.cnt as number) ?? 0
 
     // Convert snake_case columns to camelCase for API consumers
+    // Parse JSON-encoded arrays and objects stored in TEXT columns
     const docs = rows.map(row => {
       const doc: Record<string, unknown> = {}
       for (const [key, val] of Object.entries(row as Record<string, unknown>)) {
         const camelKey = key.replace(/_([a-z])/g, (_, c) => c.toUpperCase())
-        doc[camelKey] = val
+        if (typeof val === 'string' && (val.startsWith('[') || val.startsWith('{'))) {
+          try { doc[camelKey] = JSON.parse(val) } catch { doc[camelKey] = val }
+        } else {
+          doc[camelKey] = val
+        }
       }
       return doc
     })
+
+    // Resolve derivation rules — computed properties from related entities
+    // Derivations are dynamic: they query related tables at read time, no schema compilation needed
+    // Resolve derivation rules — computed properties from related entities
+    try {
+      const derivations = this.resolveDerivations(domainId, nounName, docs, toTableName, toColumnName)
+      for (const doc of docs) {
+        for (const d of derivations) {
+          if (doc.id) doc[d.field] = d.resolve(doc.id as string)
+        }
+      }
+    } catch { /* derivation resolution is best-effort */ }
 
     return { docs, totalDocs, page, limit, hasNextPage: offset + limit < totalDocs }
   }
@@ -1152,10 +1633,12 @@ export class GraphDLDB extends DurableObject {
         return (await import('./generate/ilayer')).generateILayer(model)
       case 'readings':
         return (await import('./generate/readings')).generateReadings(model)
-      case 'constraint-ir':
-        return (await import('./generate/constraint-ir')).generateConstraintIR(model)
+      case 'business-rules':
+        return (await import('./generate/business-rules')).generateBusinessRules(model)
       case 'mdxui':
         return (await import('./generate/mdxui')).generateMdxui(model)
+      case 'readme':
+        return (await import('./generate/readme')).generateReadme(model)
       case 'schema':
         return this.applySchema(domainId)
       default:

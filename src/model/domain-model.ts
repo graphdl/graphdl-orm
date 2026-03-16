@@ -56,24 +56,32 @@ export interface SqlStorage {
   exec(query: string, ...bindings: any[]): Iterable<Row>
 }
 
+export const CORE_DOMAIN_ID = 'graphdl-core'
+
+/** Entity nouns without an explicit supertype default to this root. */
+export const DEFAULT_ENTITY_SUPERTYPE = 'Resource'
+
+/** Core root entity names that should NOT get a default supertype. */
+export const DEFAULT_SUPERTYPE_ROOTS = new Set(['Resource', 'Noun'])
+
 export class SqlDataLoader implements DataLoader {
   constructor(private sql: SqlStorage) {}
 
   queryNouns(domainId: string): Row[] {
     return [
       ...this.sql.exec(
-        'SELECT n.*, p.name as super_type_name FROM nouns n LEFT JOIN nouns p ON n.super_type_id = p.id WHERE n.domain_id = ?',
+        `SELECT n.*, p.name as super_type_name FROM nouns n LEFT JOIN nouns p ON n.super_type_id = p.id WHERE n.domain_id IN (?, '${CORE_DOMAIN_ID}')`,
         domainId,
       ),
     ]
   }
 
   queryGraphSchemas(domainId: string): Row[] {
-    return [...this.sql.exec('SELECT * FROM graph_schemas WHERE domain_id = ?', domainId)]
+    return [...this.sql.exec(`SELECT * FROM graph_schemas WHERE domain_id IN (?, '${CORE_DOMAIN_ID}')`, domainId)]
   }
 
   queryReadings(domainId: string): Row[] {
-    return [...this.sql.exec('SELECT * FROM readings WHERE domain_id = ?', domainId)]
+    return [...this.sql.exec(`SELECT * FROM readings WHERE domain_id IN (?, '${CORE_DOMAIN_ID}')`, domainId)]
   }
 
   queryRoles(): Row[] {
@@ -85,7 +93,7 @@ export class SqlDataLoader implements DataLoader {
   }
 
   queryConstraints(domainId: string): Row[] {
-    return [...this.sql.exec('SELECT * FROM constraints WHERE domain_id = ?', domainId)]
+    return [...this.sql.exec(`SELECT * FROM constraints WHERE domain_id IN (?, '${CORE_DOMAIN_ID}')`, domainId)]
   }
 
   queryConstraintSpans(): Row[] {
@@ -98,14 +106,14 @@ export class SqlDataLoader implements DataLoader {
 
   queryStateMachineDefs(domainId: string): Row[] {
     return [
-      ...this.sql.exec('SELECT * FROM state_machine_definitions WHERE domain_id = ?', domainId),
+      ...this.sql.exec(`SELECT * FROM state_machine_definitions WHERE domain_id IN (?, '${CORE_DOMAIN_ID}')`, domainId),
     ]
   }
 
   queryStatuses(domainId: string): Row[] {
     return [
       ...this.sql.exec(
-        'SELECT s.*, smd.domain_id FROM statuses s JOIN state_machine_definitions smd ON s.state_machine_definition_id = smd.id WHERE smd.domain_id = ?',
+        `SELECT s.*, smd.domain_id FROM statuses s JOIN state_machine_definitions smd ON s.state_machine_definition_id = smd.id WHERE smd.domain_id IN (?, '${CORE_DOMAIN_ID}')`,
         domainId,
       ),
     ]
@@ -114,26 +122,26 @@ export class SqlDataLoader implements DataLoader {
   queryTransitions(domainId: string): Row[] {
     return [
       ...this.sql.exec(
-        'SELECT t.* FROM transitions t JOIN statuses s ON t.from_status_id = s.id JOIN state_machine_definitions smd ON s.state_machine_definition_id = smd.id WHERE smd.domain_id = ?',
+        `SELECT t.* FROM transitions t JOIN statuses s ON t.from_status_id = s.id JOIN state_machine_definitions smd ON s.state_machine_definition_id = smd.id WHERE smd.domain_id IN (?, '${CORE_DOMAIN_ID}')`,
         domainId,
       ),
     ]
   }
 
   queryEventTypes(domainId: string): Row[] {
-    return [...this.sql.exec('SELECT * FROM event_types WHERE domain_id = ?', domainId)]
+    return [...this.sql.exec(`SELECT * FROM event_types WHERE domain_id IN (?, '${CORE_DOMAIN_ID}')`, domainId)]
   }
 
   queryGuards(domainId: string): Row[] {
-    return [...this.sql.exec('SELECT * FROM guards WHERE domain_id = ?', domainId)]
+    return [...this.sql.exec(`SELECT * FROM guards WHERE domain_id IN (?, '${CORE_DOMAIN_ID}')`, domainId)]
   }
 
   queryVerbs(domainId: string): Row[] {
-    return [...this.sql.exec('SELECT * FROM verbs WHERE domain_id = ?', domainId)]
+    return [...this.sql.exec(`SELECT * FROM verbs WHERE domain_id IN (?, '${CORE_DOMAIN_ID}')`, domainId)]
   }
 
   queryFunctions(domainId: string): Row[] {
-    return [...this.sql.exec('SELECT * FROM functions WHERE domain_id = ?', domainId)]
+    return [...this.sql.exec(`SELECT * FROM functions WHERE domain_id IN (?, '${CORE_DOMAIN_ID}')`, domainId)]
   }
 }
 
@@ -198,6 +206,16 @@ export class DomainModel {
       map.set(noun.name, noun)
     }
 
+    // Default supertype: entity nouns without an explicit supertype inherit from
+    // the core root entity for their kind. This ensures domain entities like
+    // SupportRequest → Request → Resource and get core properties (state machines).
+    for (const [, noun] of map) {
+      if (noun.superType || noun.objectType !== 'entity') continue
+      if (noun.domainId === CORE_DOMAIN_ID) continue // core nouns define the roots
+      if (DEFAULT_SUPERTYPE_ROOTS.has(noun.name)) continue // don't self-reference
+      noun.superType = DEFAULT_ENTITY_SUPERTYPE
+    }
+
     this.cache.set('nouns', map)
     return map
   }
@@ -219,10 +237,10 @@ export class DomainModel {
     const readingRows = this.loader.queryReadings(this.domainId)
     const roleRows = this.loader.queryRoles()
 
-    // Index roles by graph_schema_id
+    // Index roles by graph_schema_id (include core domain roles)
     const rolesByGs = new Map<string, Row[]>()
     for (const r of roleRows) {
-      if (r.domain_id !== this.domainId) continue
+      if (r.domain_id !== this.domainId && r.domain_id !== CORE_DOMAIN_ID) continue
       const list = rolesByGs.get(r.graph_schema_id) ?? []
       list.push(r)
       rolesByGs.set(r.graph_schema_id, list)
@@ -294,10 +312,10 @@ export class DomainModel {
     const constraintRows = this.loader.queryConstraints(this.domainId)
     const spanRows = this.loader.queryConstraintSpans()
 
-    // Group spans by constraint_id, filtering to this domain
+    // Group spans by constraint_id, filtering to this domain + core
     const spansByConstraint = new Map<string, Row[]>()
     for (const cs of spanRows) {
-      if (cs.domain_id !== this.domainId) continue
+      if (cs.domain_id !== this.domainId && cs.domain_id !== CORE_DOMAIN_ID) continue
       const list = spansByConstraint.get(cs.constraint_id) ?? []
       list.push(cs)
       spansByConstraint.set(cs.constraint_id, list)
@@ -373,10 +391,10 @@ export class DomainModel {
       nounById.set(n.id, n)
     }
 
-    // Group roles by graph_schema_id
+    // Group roles by graph_schema_id (include core domain roles)
     const rolesByGs = new Map<string, Row[]>()
     for (const r of roleRows) {
-      if (r.domain_id !== this.domainId) continue
+      if (r.domain_id !== this.domainId && r.domain_id !== CORE_DOMAIN_ID) continue
       const list = rolesByGs.get(r.graph_schema_id) ?? []
       list.push(r)
       rolesByGs.set(r.graph_schema_id, list)

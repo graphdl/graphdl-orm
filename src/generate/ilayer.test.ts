@@ -334,4 +334,259 @@ describe('generateILayer', () => {
       expect(create.fieldsets[0].fields[0].type).toBe('email')
     })
   })
+
+  describe('displayFields selection (primary, secondary, date)', () => {
+    it('selects a date-format field for the date slot', async () => {
+      const entity = mkNounDef({ name: 'Event', permissions: ['list'], plural: 'events' })
+      const titleNoun = mkValueNounDef({ name: 'Title', valueType: 'string' })
+      const startDateNoun = mkValueNounDef({ name: 'StartDate', valueType: 'string', format: 'date' })
+      const descNoun = mkValueNounDef({ name: 'Description', valueType: 'string' })
+
+      const model = createMockModel({
+        nouns: [entity, titleNoun, startDateNoun, descNoun],
+        factTypes: [
+          mkFactType({ reading: 'Event has Title', roles: [{ nounDef: entity, roleIndex: 0 }, { nounDef: titleNoun, roleIndex: 1 }] }),
+          mkFactType({ reading: 'Event has StartDate', roles: [{ nounDef: entity, roleIndex: 0 }, { nounDef: startDateNoun, roleIndex: 1 }] }),
+          mkFactType({ reading: 'Event has Description', roles: [{ nounDef: entity, roleIndex: 0 }, { nounDef: descNoun, roleIndex: 1 }] }),
+        ],
+        stateMachines: [],
+      })
+
+      const result = await generateILayer(model)
+      const list = JSON.parse(result.files['layers/events.json'])
+
+      // Title is an identifier → primary
+      expect(list.displayFields.primary).toBe('title')
+      // Description is secondary
+      expect(list.displayFields.secondary).toBe('description')
+      // StartDate should be in the date slot
+      expect(list.displayFields.date).toBe('startDate')
+    })
+
+    it('falls back to createdAt when no temporal fields exist', async () => {
+      const entity = mkNounDef({ name: 'Item', permissions: ['list'], plural: 'items' })
+      const nameNoun = mkValueNounDef({ name: 'Name', valueType: 'string' })
+
+      const model = createMockModel({
+        nouns: [entity, nameNoun],
+        factTypes: [
+          mkFactType({ reading: 'Item has Name', roles: [{ nounDef: entity, roleIndex: 0 }, { nounDef: nameNoun, roleIndex: 1 }] }),
+        ],
+        stateMachines: [],
+      })
+
+      const result = await generateILayer(model)
+      const list = JSON.parse(result.files['layers/items.json'])
+
+      expect(list.displayFields.primary).toBe('name')
+      // With no date-format field, date should default to createdAt
+      expect(list.displayFields.date).toBe('createdAt')
+    })
+  })
+
+  describe('action buttons on list and detail layers', () => {
+    it('list layer shows create button when entity has create permission', async () => {
+      const entity = mkNounDef({ name: 'Product', permissions: ['list', 'create'], plural: 'products' })
+      const nameNoun = mkValueNounDef({ name: 'Name', valueType: 'string' })
+
+      const model = createMockModel({
+        nouns: [entity, nameNoun],
+        factTypes: [
+          mkFactType({ reading: 'Product has Name', roles: [{ nounDef: entity, roleIndex: 0 }, { nounDef: nameNoun, roleIndex: 1 }] }),
+        ],
+        stateMachines: [],
+      })
+
+      const result = await generateILayer(model)
+      const list = JSON.parse(result.files['layers/products.json'])
+
+      expect(list.actionButtons).toHaveLength(1)
+      expect(list.actionButtons[0]).toEqual({ id: 'create', text: 'New Product', address: '/products/new' })
+    })
+
+    it('list layer has no action buttons when entity lacks create permission', async () => {
+      const entity = mkNounDef({ name: 'Log', permissions: ['list', 'read'], plural: 'logs' })
+      const textNoun = mkValueNounDef({ name: 'Message', valueType: 'string' })
+
+      const model = createMockModel({
+        nouns: [entity, textNoun],
+        factTypes: [
+          mkFactType({ reading: 'Log has Message', roles: [{ nounDef: entity, roleIndex: 0 }, { nounDef: textNoun, roleIndex: 1 }] }),
+        ],
+        stateMachines: [],
+      })
+
+      const result = await generateILayer(model)
+      const list = JSON.parse(result.files['layers/logs.json'])
+
+      // No create permission → no actionButtons
+      expect(list.actionButtons).toBeUndefined()
+    })
+
+    it('detail layer shows edit and delete buttons for read+update+delete', async () => {
+      const entity = mkNounDef({ name: 'Task', permissions: ['read', 'update', 'delete'], plural: 'tasks' })
+      const titleNoun = mkValueNounDef({ name: 'Title', valueType: 'string' })
+
+      const model = createMockModel({
+        nouns: [entity, titleNoun],
+        factTypes: [
+          mkFactType({ reading: 'Task has Title', roles: [{ nounDef: entity, roleIndex: 0 }, { nounDef: titleNoun, roleIndex: 1 }] }),
+        ],
+        stateMachines: [],
+      })
+
+      const result = await generateILayer(model)
+      const detail = JSON.parse(result.files['layers/tasks-detail.json'])
+
+      expect(detail.actionButtons).toContainEqual({ id: 'edit', text: 'Edit', action: 'edit' })
+      expect(detail.actionButtons).toContainEqual({ id: 'delete', text: 'Delete', action: 'delete' })
+    })
+
+    it('detail layer omits delete button when entity has no delete permission', async () => {
+      const entity = mkNounDef({ name: 'Task', permissions: ['read', 'update'], plural: 'tasks' })
+      const titleNoun = mkValueNounDef({ name: 'Title', valueType: 'string' })
+
+      const model = createMockModel({
+        nouns: [entity, titleNoun],
+        factTypes: [
+          mkFactType({ reading: 'Task has Title', roles: [{ nounDef: entity, roleIndex: 0 }, { nounDef: titleNoun, roleIndex: 1 }] }),
+        ],
+        stateMachines: [],
+      })
+
+      const result = await generateILayer(model)
+      const detail = JSON.parse(result.files['layers/tasks-detail.json'])
+
+      expect(detail.actionButtons).toContainEqual({ id: 'edit', text: 'Edit', action: 'edit' })
+      const deleteBtn = detail.actionButtons.find((b: any) => b.id === 'delete')
+      expect(deleteBtn).toBeUndefined()
+    })
+  })
+
+  describe('navigation links between related entities', () => {
+    it('adds navigation links for multiple entity-to-entity relationships', async () => {
+      const orderNoun = mkNounDef({ name: 'Order', permissions: ['read', 'update'], plural: 'orders' })
+      const customerNoun = mkNounDef({ name: 'Customer', permissions: ['list'], plural: 'customers' })
+      const warehouseNoun = mkNounDef({ name: 'Warehouse', permissions: ['list'], plural: 'warehouses' })
+      const amountNoun = mkValueNounDef({ name: 'Amount', valueType: 'number' })
+
+      const model = createMockModel({
+        nouns: [orderNoun, customerNoun, warehouseNoun, amountNoun],
+        factTypes: [
+          mkFactType({ reading: 'Order has Amount', roles: [{ nounDef: orderNoun, roleIndex: 0 }, { nounDef: amountNoun, roleIndex: 1 }] }),
+          mkFactType({ reading: 'Order belongs to Customer', roles: [{ nounDef: orderNoun, roleIndex: 0 }, { nounDef: customerNoun, roleIndex: 1 }] }),
+          mkFactType({ reading: 'Order ships from Warehouse', roles: [{ nounDef: orderNoun, roleIndex: 0 }, { nounDef: warehouseNoun, roleIndex: 1 }] }),
+        ],
+        stateMachines: [],
+      })
+
+      const result = await generateILayer(model)
+      const detail = JSON.parse(result.files['layers/orders-detail.json'])
+
+      expect(detail.navigation).toHaveLength(2)
+      expect(detail.navigation).toContainEqual({ text: 'Customer', address: '/customers' })
+      expect(detail.navigation).toContainEqual({ text: 'Warehouse', address: '/warehouses' })
+
+      const edit = JSON.parse(result.files['layers/orders-edit.json'])
+      expect(edit.navigation).toHaveLength(2)
+      expect(edit.navigation).toContainEqual({ text: 'Customer', address: '/customers' })
+      expect(edit.navigation).toContainEqual({ text: 'Warehouse', address: '/warehouses' })
+    })
+
+    it('does not add navigation for value-type readings', async () => {
+      const orderNoun = mkNounDef({ name: 'Order', permissions: ['read'], plural: 'orders' })
+      const totalNoun = mkValueNounDef({ name: 'Total', valueType: 'number' })
+
+      const model = createMockModel({
+        nouns: [orderNoun, totalNoun],
+        factTypes: [
+          mkFactType({ reading: 'Order has Total', roles: [{ nounDef: orderNoun, roleIndex: 0 }, { nounDef: totalNoun, roleIndex: 1 }] }),
+        ],
+        stateMachines: [],
+      })
+
+      const result = await generateILayer(model)
+      const detail = JSON.parse(result.files['layers/orders-detail.json'])
+
+      // Value-type reading should not produce navigation
+      expect(detail.navigation).toBeUndefined()
+    })
+  })
+
+  describe('semantic display field selection', () => {
+    it('picks Subject as primary and a multi-value enum as secondary (not positional)', async () => {
+      const requestNoun = mkNounDef({ name: 'SupportRequest', permissions: ['list'], plural: 'support-requests' })
+      const channelNoun = mkValueNounDef({ name: 'ChannelName', valueType: 'string', enumValues: ['Email'] })
+      const priorityNoun = mkValueNounDef({ name: 'Priority', valueType: 'string', enumValues: ['low', 'medium', 'high'] })
+      const issueTypeNoun = mkValueNounDef({ name: 'IssueType', valueType: 'string', enumValues: ['general', 'billing', 'technical'] })
+      const subjectNoun = mkValueNounDef({ name: 'Subject', valueType: 'string' })
+
+      const model = createMockModel({
+        nouns: [requestNoun, channelNoun, priorityNoun, issueTypeNoun, subjectNoun],
+        factTypes: [
+          mkFactType({ reading: 'SupportRequest arrives via ChannelName', roles: [{ nounDef: requestNoun, roleIndex: 0 }, { nounDef: channelNoun, roleIndex: 1 }] }),
+          mkFactType({ reading: 'SupportRequest has Priority', roles: [{ nounDef: requestNoun, roleIndex: 0 }, { nounDef: priorityNoun, roleIndex: 1 }] }),
+          mkFactType({ reading: 'SupportRequest has IssueType', roles: [{ nounDef: requestNoun, roleIndex: 0 }, { nounDef: issueTypeNoun, roleIndex: 1 }] }),
+          mkFactType({ reading: 'SupportRequest has Subject', roles: [{ nounDef: requestNoun, roleIndex: 0 }, { nounDef: subjectNoun, roleIndex: 1 }] }),
+        ],
+        stateMachines: [],
+      })
+
+      const result = await generateILayer(model)
+      const list = JSON.parse(result.files['layers/support-requests.json'])
+
+      // Subject is an identifying label → primary
+      expect(list.displayFields.primary).toBe('subject')
+      // Secondary should be a multi-value enum (Priority or IssueType), NOT channelName (single-value enum)
+      expect(['priority', 'issueType']).toContain(list.displayFields.secondary)
+      expect(list.displayFields.secondary).not.toBe('channelName')
+    })
+
+    it('picks Name as primary over description for a Customer entity', async () => {
+      const customerNoun = mkNounDef({ name: 'Customer', permissions: ['list'], plural: 'customers' })
+      const descriptionNoun = mkValueNounDef({ name: 'Description', valueType: 'string' })
+      const nameNoun = mkValueNounDef({ name: 'Name', valueType: 'string' })
+
+      const model = createMockModel({
+        nouns: [customerNoun, descriptionNoun, nameNoun],
+        factTypes: [
+          mkFactType({ reading: 'Customer has Description', roles: [{ nounDef: customerNoun, roleIndex: 0 }, { nounDef: descriptionNoun, roleIndex: 1 }] }),
+          mkFactType({ reading: 'Customer has Name', roles: [{ nounDef: customerNoun, roleIndex: 0 }, { nounDef: nameNoun, roleIndex: 1 }] }),
+        ],
+        stateMachines: [],
+      })
+
+      const result = await generateILayer(model)
+      const list = JSON.parse(result.files['layers/customers.json'])
+
+      // Name is an identifier → primary (not Description, which was first in readings)
+      expect(list.displayFields.primary).toBe('name')
+      expect(list.displayFields.secondary).toBe('description')
+    })
+
+    it('follows supertype chain to find inherited fields', async () => {
+      const requestNoun = mkNounDef({ name: 'Request', permissions: [] })
+      const supportRequestNoun = mkNounDef({ name: 'SupportRequest', permissions: ['list'], superType: requestNoun })
+      const subjectNoun = mkValueNounDef({ name: 'Subject', valueType: 'string' })
+      const issueTypeNoun = mkValueNounDef({ name: 'IssueType', valueType: 'string', enumValues: ['general', 'billing'] })
+
+      const model = createMockModel({
+        nouns: [requestNoun, supportRequestNoun, subjectNoun, issueTypeNoun],
+        factTypes: [
+          // Subject is on the parent type Request
+          mkFactType({ reading: 'Request has Subject', roles: [{ nounDef: requestNoun, roleIndex: 0 }, { nounDef: subjectNoun, roleIndex: 1 }] }),
+          mkFactType({ reading: 'SupportRequest has IssueType', roles: [{ nounDef: supportRequestNoun, roleIndex: 0 }, { nounDef: issueTypeNoun, roleIndex: 1 }] }),
+        ],
+        stateMachines: [],
+      })
+
+      const result = await generateILayer(model)
+      const list = JSON.parse(result.files['layers/support-requests.json'])
+
+      // Subject is inherited from Request via supertype chain
+      // IssueType is the best secondary (enum categorization)
+      expect(list.displayFields.primary).toBe('issueType')
+      expect(list.displayFields.secondary).toBeUndefined()
+    })
+  })
 })

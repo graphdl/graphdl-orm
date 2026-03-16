@@ -26,7 +26,7 @@ export async function smDefinitionAfterCreate(
   if (nounName) {
     await ensure(
       db, 'nouns',
-      { name: { equals: nounName }, domain_id: { equals: domainId } },
+      { name: { equals: nounName }, domain: { equals: domainId } },
       { name: nounName, objectType: 'entity', domain: domainId },
     )
   }
@@ -47,7 +47,7 @@ export async function smDefinitionAfterCreate(
       db, 'statuses',
       {
         name: { equals: name },
-        state_machine_definition_id: { equals: definitionId },
+        stateMachineDefinition: { equals: definitionId },
       },
       {
         name,
@@ -66,7 +66,7 @@ export async function smDefinitionAfterCreate(
   for (const name of eventNames) {
     const { doc: eventType, created } = await ensure(
       db, 'event-types',
-      { name: { equals: name }, domain_id: { equals: domainId } },
+      { name: { equals: name }, domain: { equals: domainId } },
       { name, domain: domainId },
     )
     eventMap.set(name, eventType.id)
@@ -82,8 +82,8 @@ export async function smDefinitionAfterCreate(
     const eventId = eventMap.get(t.event)!
 
     const transition = await db.createInCollection('transitions', {
-      fromStatus: fromId,
-      toStatus: toId,
+      from: fromId,
+      to: toId,
       eventType: eventId,
       domain: domainId,
     })

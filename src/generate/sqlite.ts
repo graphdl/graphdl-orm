@@ -116,6 +116,9 @@ export function generateSQLite(openapi: any): GenerateSQLiteResult {
     entityNames.push(baseName)
   }
 
+  // Collect entity names into a set for FK validation
+  const entityNameSet = new Set(entityNames)
+
   // Step 2: Generate DDL for each entity
   for (const entityName of entityNames) {
     const updateSchema = schemas[`Update${entityName}`]
@@ -131,13 +134,20 @@ export function generateSQLite(openapi: any): GenerateSQLiteResult {
     for (const [propName, propDef] of Object.entries(properties) as [string, any][]) {
       const refEntity = extractRef(propDef)
 
-      if (refEntity) {
-        // FK column
+      if (refEntity && entityNameSet.has(refEntity)) {
+        // FK column — only if the referenced entity has its own table
         const colName = toColumnName(propName) + '_id'
         const targetTable = toTableName(refEntity)
         columns.push(`${colName} TEXT REFERENCES ${targetTable}(id)`)
         fkColumns.push(colName)
         // Track fieldMap diff
+        if (propName !== colName) {
+          fieldDiffs[propName] = colName
+        }
+      } else if (refEntity) {
+        // Reference to a value type / non-table entity — store as plain TEXT
+        const colName = toColumnName(propName)
+        columns.push(`${colName} TEXT`)
         if (propName !== colName) {
           fieldDiffs[propName] = colName
         }

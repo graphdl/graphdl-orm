@@ -1,9 +1,9 @@
-// src/generate/constraint-ir.test.ts
+// src/generate/business-rules.test.ts
 import { describe, it, expect, beforeEach } from 'vitest'
-import { generateConstraintIR } from './constraint-ir'
+import { generateBusinessRules } from './business-rules'
 import { createMockModel, mkNounDef, mkValueNounDef, mkFactType, mkConstraint, mkStateMachine, resetIds } from '../model/test-utils'
 
-describe('generateConstraintIR', () => {
+describe('generateBusinessRules', () => {
   beforeEach(() => {
     resetIds()
   })
@@ -31,7 +31,7 @@ describe('generateConstraintIR', () => {
       ],
     })
 
-    const ir = await generateConstraintIR(model)
+    const ir = await generateBusinessRules(model)
 
     // Domain
     expect(ir.domain).toBe('d1')
@@ -89,7 +89,7 @@ describe('generateConstraintIR', () => {
       ],
     })
 
-    const ir = await generateConstraintIR(model)
+    const ir = await generateBusinessRules(model)
 
     expect(ir.constraints[0].deonticOperator).toBe('forbidden')
     expect(ir.constraints[0].modality).toBe('Deontic')
@@ -115,7 +115,7 @@ describe('generateConstraintIR', () => {
       stateMachines: [sm],
     })
 
-    const ir = await generateConstraintIR(model)
+    const ir = await generateBusinessRules(model)
 
     const irSm = ir.stateMachines[sm.id]
     expect(irSm).toBeDefined()
@@ -167,7 +167,7 @@ describe('generateConstraintIR', () => {
       stateMachines: [sm],
     })
 
-    const ir = await generateConstraintIR(model)
+    const ir = await generateBusinessRules(model)
 
     const irSm = ir.stateMachines[sm.id]
     expect(irSm.transitions[0].guard).toEqual({
@@ -179,7 +179,7 @@ describe('generateConstraintIR', () => {
   it('handles empty domain gracefully', async () => {
     const model = createMockModel({})
 
-    const ir = await generateConstraintIR(model)
+    const ir = await generateBusinessRules(model)
 
     expect(ir.domain).toBe('d1')
     expect(ir.nouns).toEqual({})
@@ -197,7 +197,7 @@ describe('generateConstraintIR', () => {
       nouns: [priority, customer, premiumCustomer],
     })
 
-    const ir = await generateConstraintIR(model)
+    const ir = await generateBusinessRules(model)
 
     expect(ir.nouns['Priority']).toEqual({
       objectType: 'value',

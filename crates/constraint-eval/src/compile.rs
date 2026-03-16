@@ -194,10 +194,10 @@ fn compile_constraint(ir: &ConstraintIR, def: &ConstraintDef) -> CompiledConstra
 // ── Alethic Predicates ─────────────────────────────────────────────
 // Each returns a Predicate that captures all needed data from the IR.
 
-fn compile_uniqueness(ir: &ConstraintIR, def: &ConstraintDef) -> Predicate {
+fn compile_uniqueness(_ir: &ConstraintIR, def: &ConstraintDef) -> Predicate {
     let id = def.id.clone();
     let text = def.text.clone();
-    let spans = resolve_spans(ir, &def.spans);
+    let spans = resolve_spans(_ir, &def.spans);
 
     Arc::new(move |ctx: &EvalContext| {
         spans.iter().flat_map(|span| {
@@ -226,10 +226,10 @@ fn compile_uniqueness(ir: &ConstraintIR, def: &ConstraintDef) -> Predicate {
     })
 }
 
-fn compile_mandatory(ir: &ConstraintIR, def: &ConstraintDef) -> Predicate {
+fn compile_mandatory(_ir: &ConstraintIR, def: &ConstraintDef) -> Predicate {
     let id = def.id.clone();
     let text = def.text.clone();
-    let spans = resolve_spans(ir, &def.spans);
+    let spans = resolve_spans(_ir, &def.spans);
 
     Arc::new(move |ctx: &EvalContext| {
         spans.iter().flat_map(|span| {
@@ -258,7 +258,7 @@ fn compile_mandatory(ir: &ConstraintIR, def: &ConstraintDef) -> Predicate {
     })
 }
 
-fn compile_ring(ir: &ConstraintIR, def: &ConstraintDef) -> Predicate {
+fn compile_ring(_ir: &ConstraintIR, def: &ConstraintDef) -> Predicate {
     let id = def.id.clone();
     let text = def.text.clone();
     let fact_type_ids: Vec<String> = def.spans.iter()
@@ -289,7 +289,7 @@ fn compile_ring(ir: &ConstraintIR, def: &ConstraintDef) -> Predicate {
 }
 
 fn compile_set_comparison(
-    ir: &ConstraintIR,
+    _ir: &ConstraintIR,
     def: &ConstraintDef,
     violates: fn(usize) -> bool,
     requirement: &'static str,
@@ -329,7 +329,7 @@ fn compile_set_comparison(
     })
 }
 
-fn compile_subset(ir: &ConstraintIR, def: &ConstraintDef) -> Predicate {
+fn compile_subset(_ir: &ConstraintIR, def: &ConstraintDef) -> Predicate {
     let id = def.id.clone();
     let text = def.text.clone();
 
@@ -341,7 +341,7 @@ fn compile_subset(ir: &ConstraintIR, def: &ConstraintDef) -> Predicate {
     let b_ft_id = def.spans[1].fact_type_id.clone();
 
     // Resolve entity noun name from the first span's role
-    let entity_name = ir.fact_types.get(&a_ft_id)
+    let entity_name = _ir.fact_types.get(&a_ft_id)
         .and_then(|ft| ft.roles.get(def.spans[0].role_index))
         .map(|r| r.noun_name.clone())
         .unwrap_or_default();
@@ -374,7 +374,7 @@ fn compile_subset(ir: &ConstraintIR, def: &ConstraintDef) -> Predicate {
     })
 }
 
-fn compile_equality(ir: &ConstraintIR, def: &ConstraintDef) -> Predicate {
+fn compile_equality(_ir: &ConstraintIR, def: &ConstraintDef) -> Predicate {
     let id = def.id.clone();
     let text = def.text.clone();
 

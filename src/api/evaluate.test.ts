@@ -1,4 +1,21 @@
 import { describe, it, expect, vi } from 'vitest'
+
+// Mock the WASM binary import — use the resolved path from evaluate.ts's perspective
+vi.mock(
+  '../../crates/constraint-eval/pkg/constraint_eval_bg.wasm',
+  () => ({ default: {} }),
+)
+
+// Mock the WASM JS bindings
+vi.mock(
+  '../../crates/constraint-eval/pkg/constraint_eval.js',
+  () => ({
+    initSync: vi.fn(() => { throw new Error('WASM not available in test') }),
+    load_ir: vi.fn(),
+    evaluate_response: vi.fn(),
+  }),
+)
+
 import { handleEvaluate } from './evaluate'
 
 function makeRequest(method: string, body?: any): Request {
