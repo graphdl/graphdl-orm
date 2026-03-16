@@ -1305,6 +1305,23 @@ export class GraphDLDB extends DurableObject {
       )
     }
 
+    // Auto-recompile business rules on schema change
+    try {
+      const rules = await (await import('./generate/business-rules')).generateBusinessRules(model)
+      const rulesJson = JSON.stringify(rules)
+      const rulesExisting = this.sql.exec(
+        "SELECT id FROM generators WHERE domain_id = ? AND output_format = 'business-rules'", domainId,
+      ).toArray()
+      if (rulesExisting.length) {
+        this.sql.exec('UPDATE generators SET output = ?, updated_at = ? WHERE id = ?', rulesJson, now, rulesExisting[0].id)
+      } else {
+        this.sql.exec(
+          "INSERT INTO generators (id, domain_id, output_format, output, created_at, updated_at, version) VALUES (?, ?, 'business-rules', ?, ?, ?, 1)",
+          crypto.randomUUID(), domainId, rulesJson, now, now,
+        )
+      }
+    } catch { /* business rules compilation is best-effort */ }
+
     return { tableMap, fieldMap }
   }
 
@@ -1692,6 +1709,7 @@ export class GraphDLDB extends DurableObject {
 
   async generate(domainId: string, format: string): Promise<any> {
     const model = this.getModel(domainId)
+    model.invalidate() // Always use fresh data for generation
     switch (format) {
       case 'openapi':
         return (await import('./generate/openapi')).generateOpenAPI(model)
