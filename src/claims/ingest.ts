@@ -16,6 +16,7 @@ export interface ExtractedClaims {
     valueType?: string
     format?: string
     enum?: string[]
+    enumValues?: string[]
     minimum?: number
     maximum?: number
     pattern?: string
@@ -70,8 +71,12 @@ async function ensureNoun(
 
   if (existing.docs.length) {
     const doc = existing.docs[0]
-    if (data.objectType && doc.objectType !== data.objectType) {
-      return (await db.updateInCollection('nouns', doc.id as string, { objectType: data.objectType }))!
+    const updates: Record<string, any> = {}
+    if (data.objectType && doc.objectType !== data.objectType) updates.objectType = data.objectType
+    if (data.enumValues && !doc.enumValues) updates.enumValues = data.enumValues
+    if (data.valueType && !doc.valueType) updates.valueType = data.valueType
+    if (Object.keys(updates).length) {
+      return (await db.updateInCollection('nouns', doc.id as string, updates))!
     }
     return doc
   }
@@ -97,7 +102,8 @@ export async function ingestClaims(
       if (noun.plural) data.plural = noun.plural
       if (noun.valueType) data.valueType = noun.valueType
       if (noun.format) data.format = noun.format
-      if (noun.enum) data.enumValues = Array.isArray(noun.enum) ? noun.enum.join(', ') : noun.enum
+      const enumVals = noun.enumValues || noun.enum
+      if (enumVals) data.enumValues = Array.isArray(enumVals) ? enumVals.join(', ') : enumVals
       if (noun.minimum !== undefined) data.minimum = noun.minimum
       if (noun.maximum !== undefined) data.maximum = noun.maximum
       if (noun.pattern) data.pattern = noun.pattern
@@ -128,6 +134,32 @@ export async function ingestClaims(
 
   for (const reading of claims.readings) {
     try {
+      // Derivation rules (predicate ':=') — store as reading with full text, no graph schema
+      if (reading.predicate === ':=' || reading.text.includes(':=')) {
+        const existingDeriv = await db.findInCollection('readings', {
+          text: { equals: reading.text },
+          domain: { equals: domainId },
+        }, { limit: 1 })
+        if (!existingDeriv.docs.length) {
+          // Create a graph schema to hold the derivation reading
+          const schema = await db.createInCollection('graph-schemas', {
+            name: 'derivation',
+            title: reading.text.split(':=')[0].trim(),
+            domain: domainId,
+          })
+          await db.createInCollection('readings', {
+            text: reading.text,
+            graphSchema: schema.id,
+            domain: domainId,
+          })
+          schemaMap.set(reading.text, schema)
+          result.readings++
+        } else {
+          result.skipped++
+        }
+        continue
+      }
+
       // Ensure referenced nouns exist
       for (const nounName of reading.nouns) {
         if (!nounMap.has(nounName)) {
@@ -232,16 +264,41 @@ export async function ingestClaims(
         continue
       }
 
-      const schema = schemaMap.get(constraint.reading)
+      let schema = schemaMap.get(constraint.reading)
+      if (!schema) {
+        // Reading may have been created in a prior ingestion — look it up from DB
+        const existingReading = await db.findInCollection('readings', {
+          text: { equals: constraint.reading },
+          domain: { equals: domainId },
+        }, { limit: 1 })
+        if (existingReading.docs.length) {
+          schema = { id: existingReading.docs[0].graphSchema }
+        }
+      }
       if (!schema) { result.errors.push(`constraint: reading "${constraint.reading}" not found`); continue }
 
       const roles = await db.findInCollection('roles', {
         graphSchema: { equals: schema.id },
       }, { sort: 'createdAt' })
 
-      const c = await db.createInCollection('constraints', {
+      // Idempotent: check if this constraint already exists by text + kind + modality
+      let c: any
+      if (constraint.text) {
+        const existing = await db.findInCollection('constraints', {
+          text: { equals: constraint.text },
+          domain: { equals: domainId },
+          kind: { equals: constraint.kind },
+        }, { limit: 1 })
+        if (existing.docs.length) {
+          result.skipped++
+          continue
+        }
+      }
+
+      c = await db.createInCollection('constraints', {
         kind: constraint.kind,
         modality: constraint.modality,
+        text: constraint.text || '',
         domain: domainId,
       })
 
@@ -340,6 +397,8 @@ export async function ingestClaims(
               from: fromId,
               to: toId,
               eventType: eventId,
+              stateMachineDefinition: definition.id,
+              domain: domainId,
             })
           }
         }

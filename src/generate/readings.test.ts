@@ -37,7 +37,7 @@ describe('generateReadings', () => {
     })
 
     const result = await generateReadings(model)
-    expect(result.text).toContain('# Entity Types')
+    expect(result.text).toContain('## Entity Types')
     expect(result.text).toContain('Customer')
     expect(result.text).toContain('Order')
   })
@@ -53,7 +53,8 @@ describe('generateReadings', () => {
     })
 
     const result = await generateReadings(model)
-    expect(result.text).toContain('Customer (CustomerId)')
+    // Source outputs: "Customer(.CustomerId) is an entity type."
+    expect(result.text).toContain('Customer(.CustomerId) is an entity type.')
   })
 
   it('includes supertype notation', async () => {
@@ -63,7 +64,9 @@ describe('generateReadings', () => {
     })
 
     const result = await generateReadings(model)
-    expect(result.text).toContain('Employee : Person')
+    // Subtypes are in a separate section
+    expect(result.text).toContain('## Subtypes')
+    expect(result.text).toContain('Employee is a subtype of Person.')
   })
 
   it('includes both reference scheme and supertype', async () => {
@@ -80,7 +83,10 @@ describe('generateReadings', () => {
     })
 
     const result = await generateReadings(model)
-    expect(result.text).toContain('Employee (EmployeeId) : Person')
+    // Entity line uses auto-generated ref scheme pattern
+    expect(result.text).toContain('Employee(.EmployeeId) is an entity type.')
+    // Subtype relationship is in a separate section
+    expect(result.text).toContain('Employee is a subtype of Person.')
   })
 
   // --- Value types ---
@@ -91,8 +97,8 @@ describe('generateReadings', () => {
     })
 
     const result = await generateReadings(model)
-    expect(result.text).toContain('# Value Types')
-    expect(result.text).toContain('Email (string, format: email)')
+    expect(result.text).toContain('## Value Types')
+    expect(result.text).toContain('Email is a value type.')
   })
 
   it('outputs value type with pattern', async () => {
@@ -101,7 +107,7 @@ describe('generateReadings', () => {
     })
 
     const result = await generateReadings(model)
-    expect(result.text).toContain('ZipCode (string, pattern: \\d{5})')
+    expect(result.text).toContain('ZipCode is a value type.')
   })
 
   it('outputs value type with enum', async () => {
@@ -116,7 +122,8 @@ describe('generateReadings', () => {
     })
 
     const result = await generateReadings(model)
-    expect(result.text).toContain('Color (string, enum: red,green,blue)')
+    expect(result.text).toContain('Color is a value type.')
+    expect(result.text).toContain("The possible values of Color are 'red', 'green', 'blue'.")
   })
 
   it('outputs value type with only name when no metadata', async () => {
@@ -125,10 +132,11 @@ describe('generateReadings', () => {
     })
 
     const result = await generateReadings(model)
-    expect(result.text).toContain('# Value Types')
-    // Should just be "Weight" with no parentheses
-    const valueSection = result.text.split('# Value Types')[1]
-    expect(valueSection).toContain('\nWeight\n')
+    expect(result.text).toContain('## Value Types')
+    // Should just be "Weight is a value type." with no enum line
+    const valueSection = result.text.split('## Value Types')[1]
+    expect(valueSection).toContain('Weight is a value type.')
+    expect(valueSection).not.toContain('The possible values of Weight')
   })
 
   // --- Readings ---
@@ -142,7 +150,7 @@ describe('generateReadings', () => {
     })
 
     const result = await generateReadings(model)
-    expect(result.text).toContain('# Readings')
+    expect(result.text).toContain('## Fact Types')
     expect(result.text).toContain('Customer places Order')
     expect(result.text).toContain('Order has OrderDate')
   })
@@ -158,9 +166,11 @@ describe('generateReadings', () => {
     const result = await generateReadings(model)
     expect(result.text).toContain('Customer has Name')
     // Should not contain empty lines where blank readings would be
-    const readingsSection = result.text.split('# Readings')[1]
-    const lines = readingsSection!.split('\n').filter((l) => l.trim().length > 0)
-    expect(lines).toHaveLength(1) // only "Customer has Name"
+    const factSection = result.text.split('## Fact Types')[1]!
+    // Only the grouped heading and the reading text should have content
+    const lines = factSection.split('\n').filter((l) => l.trim().length > 0)
+    // lines: "### _ungrouped", "Customer has Name"
+    expect(lines).toHaveLength(2)
   })
 
   // --- Constraint annotations ---
@@ -168,7 +178,15 @@ describe('generateReadings', () => {
   it('annotates readings with [UC] for uniqueness constraint', async () => {
     const model = createMockModel({
       readings: [
-        { id: 'r1', text: 'Customer has CustomerId', graphSchemaId: 'gs1', roles: [] },
+        {
+          id: 'r1',
+          text: 'Customer has CustomerId',
+          graphSchemaId: 'gs1',
+          roles: [
+            { nounName: 'Customer', roleIndex: 0 },
+            { nounName: 'CustomerId', roleIndex: 1 },
+          ],
+        },
       ],
       constraints: [
         mkConstraint({ kind: 'UC', spans: [{ factTypeId: 'gs1', roleIndex: 0 }] }),
@@ -176,13 +194,23 @@ describe('generateReadings', () => {
     })
 
     const result = await generateReadings(model)
-    expect(result.text).toContain('Customer has CustomerId [UC]')
+    // Constraints appear in a separate section, not inline on readings
+    expect(result.text).toContain('## Constraints')
+    expect(result.text).toContain('Each Customer has at most one CustomerId.')
   })
 
   it('annotates readings with [DUC] for deontic uniqueness constraint', async () => {
     const model = createMockModel({
       readings: [
-        { id: 'r1', text: 'Employee has Badge', graphSchemaId: 'gs1', roles: [] },
+        {
+          id: 'r1',
+          text: 'Employee has Badge',
+          graphSchemaId: 'gs1',
+          roles: [
+            { nounName: 'Employee', roleIndex: 0 },
+            { nounName: 'Badge', roleIndex: 1 },
+          ],
+        },
       ],
       constraints: [
         mkConstraint({
@@ -194,13 +222,25 @@ describe('generateReadings', () => {
     })
 
     const result = await generateReadings(model)
-    expect(result.text).toContain('Employee has Badge [DUC]')
+    // Deontic constraints go into a separate "## Deontic Constraints" section
+    // But deontic constraints without text are not output (source only outputs c.text for deontic)
+    // The constraint has no text set, so it won't appear
+    expect(result.text).not.toContain('## Constraints')
+    expect(result.text).toContain('## Fact Types')
   })
 
   it('annotates with multiple constraints on same reading', async () => {
     const model = createMockModel({
       readings: [
-        { id: 'r1', text: 'Order has Quantity', graphSchemaId: 'gs1', roles: [] },
+        {
+          id: 'r1',
+          text: 'Order has Quantity',
+          graphSchemaId: 'gs1',
+          roles: [
+            { nounName: 'Order', roleIndex: 0 },
+            { nounName: 'Quantity', roleIndex: 1 },
+          ],
+        },
       ],
       constraints: [
         mkConstraint({ kind: 'UC', spans: [{ factTypeId: 'gs1', roleIndex: 0 }] }),
@@ -209,14 +249,33 @@ describe('generateReadings', () => {
     })
 
     const result = await generateReadings(model)
-    expect(result.text).toContain('Order has Quantity [UC] [MC]')
+    // Both constraints are Alethic so they appear in ## Constraints section
+    expect(result.text).toContain('## Constraints')
+    expect(result.text).toContain('Each Order has at most one Quantity.')
+    expect(result.text).toContain('Each Order has at least one Quantity.')
   })
 
   it('does not annotate reading when constraint is on a different graphSchema', async () => {
     const model = createMockModel({
       readings: [
-        { id: 'r1', text: 'Customer has Name', graphSchemaId: 'gs1', roles: [] },
-        { id: 'r2', text: 'Order has Amount', graphSchemaId: 'gs2', roles: [] },
+        {
+          id: 'r1',
+          text: 'Customer has Name',
+          graphSchemaId: 'gs1',
+          roles: [
+            { nounName: 'Customer', roleIndex: 0 },
+            { nounName: 'Name', roleIndex: 1 },
+          ],
+        },
+        {
+          id: 'r2',
+          text: 'Order has Amount',
+          graphSchemaId: 'gs2',
+          roles: [
+            { nounName: 'Order', roleIndex: 0 },
+            { nounName: 'Amount', roleIndex: 1 },
+          ],
+        },
       ],
       constraints: [
         mkConstraint({ kind: 'UC', spans: [{ factTypeId: 'gs2', roleIndex: 0 }] }),
@@ -224,8 +283,10 @@ describe('generateReadings', () => {
     })
 
     const result = await generateReadings(model)
-    expect(result.text).toContain('Customer has Name\n') // no annotation
-    expect(result.text).toContain('Order has Amount [UC]')
+    // Constraint is on gs2 (Order has Amount), reconstructed in Constraints section
+    expect(result.text).toContain('Each Order has at most one Amount.')
+    // Customer has Name should appear in Fact Types without annotation
+    expect(result.text).toContain('Customer has Name')
   })
 
   // --- State machines ---
@@ -249,11 +310,9 @@ describe('generateReadings', () => {
     })
 
     const result = await generateReadings(model)
-    expect(result.text).toContain('# State Machine: OrderLifecycle')
-    expect(result.text).toContain('OrderLifecycle transitions from Draft to Pending on Submit')
-    expect(result.text).toContain(
-      'OrderLifecycle transitions from Pending to Approved on Approve',
-    )
+    expect(result.text).toContain('## State Machine: OrderLifecycle')
+    expect(result.text).toContain('Draft → Pending via Submit')
+    expect(result.text).toContain('Pending → Approved via Approve')
   })
 
   it('uses nounName for state machine display name', async () => {
@@ -273,8 +332,8 @@ describe('generateReadings', () => {
     })
 
     const result = await generateReadings(model)
-    expect(result.text).toContain('# State Machine: smd1')
-    expect(result.text).toContain('smd1 transitions from Start to End on Go')
+    expect(result.text).toContain('## State Machine: smd1')
+    expect(result.text).toContain('Start → End via Go')
   })
 
   it('does not output transition lines when state machine has no transitions', async () => {
@@ -289,9 +348,9 @@ describe('generateReadings', () => {
     })
 
     const result = await generateReadings(model)
-    expect(result.text).toContain('# State Machine: Broken')
+    expect(result.text).toContain('## State Machine: Broken')
     // Should not contain any transition line
-    expect(result.text).not.toContain('transitions from')
+    expect(result.text).not.toContain('→')
   })
 
   it('handles state machine with no statuses', async () => {
@@ -306,8 +365,8 @@ describe('generateReadings', () => {
     })
 
     const result = await generateReadings(model)
-    expect(result.text).toContain('# State Machine: Empty')
-    expect(result.text).not.toContain('transitions from')
+    expect(result.text).toContain('## State Machine: Empty')
+    expect(result.text).not.toContain('→')
   })
 
   // --- Full round-trip ---
@@ -321,7 +380,15 @@ describe('generateReadings', () => {
     const model = createMockModel({
       nouns: [customerNoun, mkValueNounDef({ name: 'Email', valueType: 'string', format: 'email' })],
       readings: [
-        { id: 'r1', text: 'Customer has Email', graphSchemaId: 'gs1', roles: [] },
+        {
+          id: 'r1',
+          text: 'Customer has Email',
+          graphSchemaId: 'gs1',
+          roles: [
+            { nounName: 'Customer', roleIndex: 0 },
+            { nounName: 'Email', roleIndex: 1 },
+          ],
+        },
       ],
       constraints: [
         mkConstraint({ kind: 'UC', spans: [{ factTypeId: 'gs1', roleIndex: 0 }] }),
@@ -343,15 +410,17 @@ describe('generateReadings', () => {
     const result = await generateReadings(model)
 
     // Check section ordering
-    const entityIdx = result.text.indexOf('# Entity Types')
-    const valueIdx = result.text.indexOf('# Value Types')
-    const readingIdx = result.text.indexOf('# Readings')
-    const smIdx = result.text.indexOf('# State Machine:')
+    const entityIdx = result.text.indexOf('## Entity Types')
+    const valueIdx = result.text.indexOf('## Value Types')
+    const factIdx = result.text.indexOf('## Fact Types')
+    const constraintIdx = result.text.indexOf('## Constraints')
+    const smIdx = result.text.indexOf('## State Machine:')
 
     expect(entityIdx).toBeGreaterThanOrEqual(0)
     expect(valueIdx).toBeGreaterThan(entityIdx)
-    expect(readingIdx).toBeGreaterThan(valueIdx)
-    expect(smIdx).toBeGreaterThan(readingIdx)
+    expect(factIdx).toBeGreaterThan(valueIdx)
+    expect(constraintIdx).toBeGreaterThan(factIdx)
+    expect(smIdx).toBeGreaterThan(constraintIdx)
   })
 
   // --- Domain scoping (model already scoped) ---

@@ -9,13 +9,17 @@ function mkNoun(overrides: Partial<NounDef> & { id: string; name: string }): Nou
   return { objectType: 'value', domainId: 'd1', ...overrides }
 }
 
+function mkEntity(overrides: Partial<NounDef> & { id: string; name: string }): NounDef {
+  return { objectType: 'entity', domainId: 'd1', ...overrides }
+}
+
 // ---------------------------------------------------------------------------
 // ensureTableExists
 // ---------------------------------------------------------------------------
 describe('ensureTableExists', () => {
   it('creates UpdateX, NewX, and X schema triplet', () => {
     const tables: Record<string, any> = {}
-    const subject = mkNoun({ id: '1', name: 'Customer', valueType: 'string' })
+    const subject = mkEntity({ id: '1', name: 'Customer' })
     ensureTableExists({ tables, subject, nouns: [subject], jsonExamples: {} })
 
     expect(tables['UpdateCustomer']).toBeDefined()
@@ -30,9 +34,18 @@ describe('ensureTableExists', () => {
     expect(tables['Customer'].allOf).toContainEqual({ $ref: '#/components/schemas/NewCustomer' })
   })
 
+  it('skips value types — no table created', () => {
+    const tables: Record<string, any> = {}
+    const subject = mkNoun({ id: '1', name: 'Email', valueType: 'string' })
+    ensureTableExists({ tables, subject, nouns: [subject], jsonExamples: {} })
+
+    expect(tables['UpdateEmail']).toBeUndefined()
+    expect(tables['Email']).toBeUndefined()
+  })
+
   it('is idempotent — does not overwrite existing tables', () => {
     const tables: Record<string, any> = {}
-    const subject = mkNoun({ id: '1', name: 'Customer', valueType: 'string' })
+    const subject = mkEntity({ id: '1', name: 'Customer' })
     ensureTableExists({ tables, subject, nouns: [subject], jsonExamples: {} })
 
     // Modify a table to verify it's not overwritten
@@ -43,7 +56,7 @@ describe('ensureTableExists', () => {
 
   it('sets type: object on UpdateX when no superType', () => {
     const tables: Record<string, any> = {}
-    const subject = mkNoun({ id: '1', name: 'Order', valueType: 'string' })
+    const subject = mkEntity({ id: '1', name: 'Order' })
     ensureTableExists({ tables, subject, nouns: [subject], jsonExamples: {} })
 
     expect(tables['UpdateOrder'].type).toBe('object')
@@ -51,8 +64,8 @@ describe('ensureTableExists', () => {
 
   it('wires superType chain via allOf references', () => {
     const tables: Record<string, any> = {}
-    const parent = mkNoun({ id: '1', name: 'Person', valueType: 'string' })
-    const child = mkNoun({ id: '2', name: 'Employee', superType: parent })
+    const parent = mkEntity({ id: '1', name: 'Person' })
+    const child = mkEntity({ id: '2', name: 'Employee', superType: parent })
 
     ensureTableExists({ tables, subject: child, nouns: [parent, child], jsonExamples: {} })
 
@@ -81,8 +94,8 @@ describe('ensureTableExists', () => {
 
   it('handles superType as string id', () => {
     const tables: Record<string, any> = {}
-    const parent = mkNoun({ id: 'p1', name: 'Person', valueType: 'string' })
-    const child = mkNoun({ id: 'c1', name: 'Employee', superType: 'p1' })
+    const parent = mkEntity({ id: 'p1', name: 'Person' })
+    const child = mkEntity({ id: 'c1', name: 'Employee', superType: 'p1' })
 
     ensureTableExists({ tables, subject: child, nouns: [parent, child], jsonExamples: {} })
 
@@ -94,7 +107,7 @@ describe('ensureTableExists', () => {
   it('unpacks referenceScheme into properties via setTableProperty', () => {
     const tables: Record<string, any> = {}
     const idNoun = mkNoun({ id: 'id1', name: 'Customer Id', valueType: 'integer' })
-    const subject = mkNoun({
+    const subject = mkEntity({
       id: '1',
       name: 'Customer',
       referenceScheme: [idNoun],
@@ -127,7 +140,7 @@ describe('ensureTableExists', () => {
 
   it('adds json examples when available', () => {
     const tables: Record<string, any> = {}
-    const subject = mkNoun({ id: '1', name: 'Order', valueType: 'string' })
+    const subject = mkEntity({ id: '1', name: 'Order' })
     const jsonExamples = { Order: { status: 'pending' } }
 
     ensureTableExists({ tables, subject, nouns: [subject], jsonExamples })
@@ -139,7 +152,7 @@ describe('ensureTableExists', () => {
 
   it('sets description on UpdateX when subject has description', () => {
     const tables: Record<string, any> = {}
-    const subject = mkNoun({ id: '1', name: 'Order', description: 'A customer order' })
+    const subject = mkEntity({ id: '1', name: 'Order', description: 'A customer order' })
 
     ensureTableExists({ tables, subject, nouns: [subject], jsonExamples: {} })
 
@@ -148,7 +161,7 @@ describe('ensureTableExists', () => {
 
   it('handles name with spaces', () => {
     const tables: Record<string, any> = {}
-    const subject = mkNoun({ id: '1', name: 'Support Request', valueType: 'string' })
+    const subject = mkEntity({ id: '1', name: 'Support Request' })
 
     ensureTableExists({ tables, subject, nouns: [subject], jsonExamples: {} })
 
@@ -306,9 +319,8 @@ describe('createProperty', () => {
   })
 
   it('creates oneOf with $ref for entity type (no valueType)', () => {
-    const entity = mkNoun({ id: '1', name: 'Customer', referenceScheme: [] })
     const idNoun = mkNoun({ id: '2', name: 'Customer Id', valueType: 'integer' })
-    entity.referenceScheme = [idNoun]
+    const entity = mkEntity({ id: '1', name: 'Customer', referenceScheme: [idNoun] })
 
     const tables: Record<string, any> = {}
     const nouns = [entity, idNoun]
@@ -322,7 +334,7 @@ describe('createProperty', () => {
 
   it('creates inline property for single referenceScheme item', () => {
     const idNoun = mkNoun({ id: '2', name: 'Customer Nr', valueType: 'integer' })
-    const entity = mkNoun({ id: '1', name: 'Customer', referenceScheme: [idNoun] })
+    const entity = mkEntity({ id: '1', name: 'Customer', referenceScheme: [idNoun] })
 
     const tables: Record<string, any> = {}
     const nouns = [entity, idNoun]
@@ -335,7 +347,7 @@ describe('createProperty', () => {
   it('creates object with properties for multi-item referenceScheme', () => {
     const firstName = mkNoun({ id: '2', name: 'First Name', valueType: 'string' })
     const lastName = mkNoun({ id: '3', name: 'Last Name', valueType: 'string' })
-    const entity = mkNoun({ id: '1', name: 'Person', referenceScheme: [firstName, lastName] })
+    const entity = mkEntity({ id: '1', name: 'Person', referenceScheme: [firstName, lastName] })
 
     const tables: Record<string, any> = {}
     const nouns = [entity, firstName, lastName]
@@ -353,7 +365,7 @@ describe('createProperty', () => {
 
   it('ensures table exists for entity types', () => {
     const idNoun = mkNoun({ id: '2', name: 'Customer Id', valueType: 'integer' })
-    const entity = mkNoun({ id: '1', name: 'Customer', referenceScheme: [idNoun] })
+    const entity = mkEntity({ id: '1', name: 'Customer', referenceScheme: [idNoun] })
 
     const tables: Record<string, any> = {}
     const nouns = [entity, idNoun]
@@ -377,9 +389,9 @@ describe('createProperty', () => {
 
   it('traverses superType chain to find referenceScheme', () => {
     const idNoun = mkNoun({ id: 'id1', name: 'Party Id', valueType: 'integer' })
-    const grandparent = mkNoun({ id: '1', name: 'Party', referenceScheme: [idNoun] })
-    const parent = mkNoun({ id: '2', name: 'Person', superType: grandparent })
-    const child = mkNoun({ id: '3', name: 'Employee', superType: parent })
+    const grandparent = mkEntity({ id: '1', name: 'Party', referenceScheme: [idNoun] })
+    const parent = mkEntity({ id: '2', name: 'Person', superType: grandparent })
+    const child = mkEntity({ id: '3', name: 'Employee', superType: parent })
 
     const tables: Record<string, any> = {}
     const nouns = [grandparent, parent, child, idNoun]

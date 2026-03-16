@@ -65,11 +65,16 @@ export async function handleSeed(request: Request, env: Env): Promise<Response> 
 
       // Single domain
       if (body.claims) {
-        const domainId = body.domainId || body.domain
-        if (!domainId) return error(400, { errors: [{ message: 'domainId or domains[] required' }] })
+        const slug = body.domain
+        const rawId = body.domainId
+        if (!slug && !rawId) return error(400, { errors: [{ message: 'domainId or domains[] required' }] })
 
-        const result = await ingestClaims(db as any, { claims: body.claims, domainId })
-        return json(result)
+        // Ensure domain record exists (find-or-create by slug)
+        const domain = slug
+          ? await ensureDomain(db as any, slug)
+          : { id: rawId }
+        const result = await ingestClaims(db as any, { claims: body.claims, domainId: domain.id })
+        return json({ ...result, domainId: domain.id })
       }
 
       return error(400, { errors: [{ message: 'Provide claims + domainId, or domains[]' }] })

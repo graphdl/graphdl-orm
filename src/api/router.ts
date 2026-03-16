@@ -111,6 +111,14 @@ async function populateDocs(
 // ── Health ───────────────────────────────────────────────────────────
 router.get('/health', () => json({ status: 'ok', version: '0.1.0' }))
 
+// ── Debug: table schema inspection ──────────────────────────────────
+router.get('/debug/table/:table', async (request, env: Env) => {
+  const { table } = request.params
+  const db = getDB(env) as any
+  const info = await db.inspectTable(table)
+  return json(info)
+})
+
 // ── WebSocket (live events) ──────────────────────────────────────────
 router.get('/ws', async (request, env: Env) => {
   if (request.headers.get('Upgrade') !== 'websocket') {
@@ -215,7 +223,46 @@ router.post('/api/entity', async (request, env: Env) => {
   }
 
   const db = getDB(env) as any
-  const result = await db.createEntity(body.domain, body.noun, body.fields, body.reference, body.createdBy)
+
+  // Extract array-of-objects fields (child entities) BEFORE creating the parent.
+  // Children are created as separate top-level createEntity calls to avoid
+  // Cloudflare DO implicit transaction/savepoint issues with nested writes.
+  const childArrays: Array<{ fieldName: string; childNoun: string; items: Record<string, any>[] }> = []
+  const parentFields: Record<string, any> = {}
+
+  for (const [fieldName, fieldValue] of Object.entries(body.fields)) {
+    if (Array.isArray(fieldValue) && fieldValue.length > 0 && typeof fieldValue[0] === 'object') {
+      const singular = fieldName.replace(/s$/, '')
+      const childNoun = singular.charAt(0).toUpperCase() + singular.slice(1)
+      childArrays.push({ fieldName, childNoun, items: fieldValue as Record<string, any>[] })
+    } else {
+      parentFields[fieldName] = fieldValue
+    }
+  }
+
+  // Create parent entity (without array-of-objects fields)
+  const result = await db.createEntity(body.domain, body.noun, parentFields, body.reference, body.createdBy)
+
+  // Create children as separate top-level calls, each with FK back to parent
+  if (childArrays.length > 0 && result.id) {
+    const parentFkField = body.noun.charAt(0).toLowerCase() + body.noun.slice(1)
+    const children: any[] = []
+    for (const { childNoun, items } of childArrays) {
+      for (const childFields of items) {
+        try {
+          const childResult = await db.createEntity(
+            body.domain, childNoun,
+            { ...childFields, [parentFkField]: result.id },
+          )
+          children.push({ noun: childNoun, id: childResult.id })
+        } catch (err: any) {
+          children.push({ noun: childNoun, error: err.message })
+        }
+      }
+    }
+    result.children = children
+  }
+
   return json(result, { status: 201 })
 })
 
@@ -241,8 +288,16 @@ router.get('/api/entities/:noun', async (request, env: Env) => {
     }
   }
 
+  const depth = parseInt(url.searchParams.get('depth') || '0', 10)
+
   const db = getDB(env) as any
   const result = await db.queryEntities(domainId, noun, { where, sort, limit, page })
+
+  if (depth > 0) {
+    result.docs = await Promise.all(
+      result.docs.map((doc: Record<string, unknown>) => db.populateEntity(domainId, noun, doc))
+    )
+  }
   return json(result)
 })
 
@@ -251,16 +306,57 @@ router.get('/api/entities/:noun/:id', async (request, env: Env) => {
   const url = new URL(request.url)
   const domainId = url.searchParams.get('domain')
   if (!domainId) return error(400, { errors: [{ message: 'domain query param required' }] })
+  const depth = parseInt(url.searchParams.get('depth') || '0', 10)
 
   const db = getDB(env) as any
   const result = await db.queryEntities(domainId, noun, { where: { id: { equals: id } }, limit: 1 })
   if (!result.docs.length) return error(404, { errors: [{ message: 'Not Found' }] })
-  return json(result.docs[0])
+
+  let doc = result.docs[0]
+  if (depth > 0) {
+    doc = await db.populateEntity(domainId, noun, doc)
+  }
+  return json(doc)
+})
+
+router.patch('/api/entities/:noun/:id', async (request, env: Env) => {
+  const { noun, id } = request.params
+  const url = new URL(request.url)
+  const domainId = url.searchParams.get('domain')
+  if (!domainId) return error(400, { errors: [{ message: 'domain query param required' }] })
+
+  const body = await request.json() as Record<string, any>
+  const db = getDB(env) as any
+  const result = await db.updateEntity(domainId, noun, id, body)
+  if (!result) return error(404, { errors: [{ message: 'Not Found' }] })
+  return json(result)
+})
+
+router.delete('/api/entities/:noun/:id', async (request, env: Env) => {
+  const { noun, id } = request.params
+  const url = new URL(request.url)
+  const domainId = url.searchParams.get('domain')
+  if (!domainId) return error(400, { errors: [{ message: 'domain query param required' }] })
+
+  const db = getDB(env) as any
+  const result = await db.deleteEntity(domainId, noun, id)
+  if (!result.deleted) return error(404, { errors: [{ message: 'Not Found' }] })
+  return json({ id, deleted: true })
 })
 
 // ── Collection CRUD ──────────────────────────────────────────────────
 
 /** GET /api/:collection — list/find */
+// ── Claims ingestion & stats (before generic :collection routes) ─────
+router.post('/api/claims', async (request, env: Env) => {
+  const { handleClaims } = await import('./claims')
+  return handleClaims(request, env)
+})
+router.get('/api/stats', async (request, env: Env) => {
+  const { handleStats } = await import('./claims')
+  return handleStats(request, env)
+})
+
 router.get('/api/:collection', async (request, env: Env) => {
   const { collection } = request.params
   if (!COLLECTION_TABLE_MAP[collection]) {
@@ -362,13 +458,35 @@ router.delete('/api/:collection/:id', async (request, env: Env) => {
   return json({ id, message: 'Deleted successfully', ...(result.cascaded && { cascaded: result.cascaded }) })
 })
 
-// ── Seed / Claims ───────────────────────────────────────────────────
+// ── Legacy aliases (backwards compat for /seed and /claims without /api prefix) ──
 router.all('/seed', handleSeed)
-router.all('/claims', handleSeed) // Alias used by apis worker
+router.all('/claims', handleSeed)
+
+// ── Domain wipe (metamodel only — nouns, readings, constraints, roles, etc.) ──
+router.delete('/api/domains/:domainId/metamodel', async (request, env: Env) => {
+  const { domainId } = request.params
+  const db = getDB(env) as any
+  const result = await db.wipeDomainMetamodel(domainId)
+  return json(result)
+})
 
 // ── Parse / Verify ──────────────────────────────────────────────────
 router.all('/parse', handleParse)
 router.all('/verify', handleVerify)
+
+// ── State Machine RPC ────────────────────────────────────────────────
+router.get('/api/state/*', async (request, env: Env) => {
+  const { handleGetState } = await import('./state')
+  return handleGetState(request, env)
+})
+router.post('/api/state/*', async (request, env: Env) => {
+  const { handleSendEvent } = await import('./state')
+  return handleSendEvent(request, env)
+})
+router.delete('/api/state/*', async (request, env: Env) => {
+  const { handleDeleteState } = await import('./state')
+  return handleDeleteState(request, env)
+})
 
 // ── 404 fallback ─────────────────────────────────────────────────────
 router.all('*', () => error(404, { errors: [{ message: 'Not Found' }] }))
