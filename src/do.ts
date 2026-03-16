@@ -1065,6 +1065,9 @@ export class GraphDLDB extends DurableObject {
 
         this.getModel(domainId).invalidate()
 
+        // Auto-create state machine instance at initial state if the noun has a definition
+        const smStatus = this.autoCreateStateMachine(domainId, nounName, id, now)
+
         return {
           id,
           noun: nounName,
@@ -1072,6 +1075,7 @@ export class GraphDLDB extends DurableObject {
           domain: domainId,
           reference,
           createdBy,
+          ...(smStatus && { status: smStatus }),
           ...(childCreationResults.length > 0 && { children: childCreationResults }),
         }
       }
@@ -1089,14 +1093,66 @@ export class GraphDLDB extends DurableObject {
       )
       this.logCdcEvent('create', 'resources', resourceId)
 
+      // Auto-create state machine for fallback path too
+      const smStatus = this.autoCreateStateMachine(domainId, nounName, resourceId, now)
+
       return {
         id: resourceId,
         noun: nounName,
         domain: domainId,
         reference,
         createdBy,
+        ...(smStatus && { status: smStatus }),
       }
     })
+  }
+
+  /**
+   * Auto-create a state machine instance at the initial state for an entity.
+   * Called from within createEntity's write lock — uses direct SQL, no async.
+   * Returns the initial status name or null if no state machine applies.
+   */
+  private autoCreateStateMachine(domainId: string, nounName: string, entityId: string, now: string): string | null {
+    try {
+      // Find state machine definition for this noun (by noun name match)
+      const defs = this.sql.exec(
+        `SELECT smd.id, smd.noun_id FROM state_machine_definitions smd
+         JOIN nouns n ON smd.noun_id = n.id
+         WHERE n.name = ? AND smd.domain_id = ?
+         LIMIT 1`,
+        nounName, domainId,
+      ).toArray()
+      if (!defs.length) return null
+
+      const defId = defs[0].id as string
+
+      // Find initial status (first status with no incoming transitions, or first created)
+      const statuses = this.sql.exec(
+        'SELECT id, name FROM statuses WHERE state_machine_definition_id = ? ORDER BY created_at ASC',
+        defId,
+      ).toArray()
+      if (!statuses.length) return null
+
+      let initialStatus = statuses[0]
+      for (const s of statuses) {
+        const incoming = this.sql.exec(
+          'SELECT 1 FROM transitions WHERE to_status_id = ? LIMIT 1', s.id,
+        ).toArray()
+        if (!incoming.length) { initialStatus = s; break }
+      }
+
+      // Create state machine instance
+      const smId = crypto.randomUUID()
+      this.sql.exec(
+        `INSERT INTO state_machines (id, name, state_machine_definition_id, current_status_id, domain_id, created_at, updated_at, version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 1)`,
+        smId, entityId, defId, initialStatus.id, domainId, now, now,
+      )
+
+      return initialStatus.name as string
+    } catch {
+      return null // best-effort — don't block entity creation
+    }
   }
 
   /**
@@ -1615,6 +1671,21 @@ export class GraphDLDB extends DurableObject {
         }
       }
     } catch { /* derivation resolution is best-effort */ }
+
+    // Normalize state machine status onto each entity
+    try {
+      for (const doc of docs) {
+        if (!doc.id) continue
+        const smRows = this.sql.exec(
+          `SELECT s.name FROM state_machines sm
+           JOIN statuses s ON sm.current_status_id = s.id
+           WHERE sm.name = ? AND sm.domain_id = ?
+           LIMIT 1`,
+          doc.id as string, domainId,
+        ).toArray()
+        if (smRows.length) doc.status = smRows[0].name
+      }
+    } catch { /* state machine lookup is best-effort */ }
 
     return { docs, totalDocs, page, limit, hasNextPage: offset + limit < totalDocs }
   }
