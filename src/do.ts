@@ -12,7 +12,7 @@
  */
 
 import { DurableObject } from 'cloudflare:workers'
-import { ALL_DDL, ALL_BOOTSTRAP } from './schema'
+import { ALL_DDL } from './schema'
 import { COLLECTION_TABLE_MAP, FIELD_MAP, FK_TARGET_TABLE } from './collections'
 import { DomainModel, SqlDataLoader } from './model/domain-model'
 
@@ -34,6 +34,34 @@ function reverseFieldMap(fieldMap: Record<string, string>): Record<string, strin
     reversed[sqlCol] = payloadName
   }
   return reversed
+}
+
+/** Convert a snake_case string to camelCase. */
+function snakeToCamel(s: string): string {
+  return s.replace(/_([a-z])/g, (_, c) => c.toUpperCase())
+}
+
+/**
+ * Resolve a where-clause key to a SQL column name.
+ *
+ * The API may receive field names in camelCase (e.g. `stateMachineDefinition`)
+ * or snake_case (e.g. `state_machine_definition`) from URL bracket notation.
+ * This helper tries the key directly in the field map first, then falls back
+ * to converting snake_case → camelCase for a second lookup.
+ */
+function resolveColumn(key: string, fieldMap: Record<string, string>): string {
+  // Direct match (camelCase key from Payload convention)
+  if (key in fieldMap) return fieldMap[key]
+  // Try snake_case → camelCase conversion
+  const camelKey = snakeToCamel(key)
+  if (camelKey !== key) {
+    if (camelKey in fieldMap) return fieldMap[camelKey]
+    if (camelKey in COMMON_FIELDS) return COMMON_FIELDS[camelKey]
+  }
+  // Check common fields
+  if (key in COMMON_FIELDS) return COMMON_FIELDS[key]
+  // Fall through: use key as-is (assume it's already a valid SQL column name)
+  return key
 }
 
 /**
@@ -72,12 +100,14 @@ function buildWhereClause(
     // → domain_id IN (SELECT id FROM domains WHERE domain_slug = ?)
     if (key.includes('.')) {
       const [relationName, fieldName] = key.split('.', 2)
-      const fkCol = fieldMap[relationName] || `${relationName}_id`
-      const targetTable = FK_TARGET_TABLE[fkCol]
+      const fkCol = resolveColumn(relationName, fieldMap)
+      // Ensure FK column ends with _id for FK_TARGET_TABLE lookup
+      const fkColResolved = fkCol.endsWith('_id') ? fkCol : `${fkCol}_id`
+      const targetTable = FK_TARGET_TABLE[fkColResolved]
       if (!targetTable) continue // unknown relationship, skip
 
       const targetFieldMap = FIELD_MAP[targetTable] || {}
-      const targetCol = targetFieldMap[fieldName] || fieldName
+      const targetCol = resolveColumn(fieldName, targetFieldMap)
 
       if (typeof condition === 'object' && condition !== null) {
         if ('equals' in condition) {
@@ -103,7 +133,7 @@ function buildWhereClause(
       continue
     }
 
-    const col = fieldMap[key] || COMMON_FIELDS[key] || key
+    const col = resolveColumn(key, fieldMap)
 
     if (typeof condition === 'object' && condition !== null) {
       if ('equals' in condition) { conditions.push(`${col} = ?`); params.push(condition.equals) }
@@ -141,7 +171,7 @@ function payloadToRow(data: Record<string, unknown>, fieldMap: Record<string, st
   for (const [key, value] of Object.entries(data)) {
     // Skip meta fields
     if (key === 'createdAt' || key === 'updatedAt' || key === 'version') continue
-    const col = fieldMap[key] || COMMON_FIELDS[key] || key
+    const col = resolveColumn(key, fieldMap)
     result[col] = value
   }
   return result
@@ -293,10 +323,8 @@ export class GraphDLDB extends DurableObject {
     this.sql.exec('CREATE INDEX IF NOT EXISTS idx_cdc_events_timestamp ON cdc_events(timestamp)')
     this.sql.exec('CREATE INDEX IF NOT EXISTS idx_cdc_events_table ON cdc_events(table_name, entity_id)')
 
-    // Bootstrap metamodel data (idempotent)
-    for (const dml of ALL_BOOTSTRAP) {
-      this.sql.exec(dml)
-    }
+    // Metamodel data is seeded via POST /graphdl/parse with seed:true
+    // (no hardcoded bootstrap — readings are the source of truth)
   }
 
   /** Wipe all metamodel data for a domain (nouns, readings, constraints, roles, etc.) */
@@ -546,7 +574,7 @@ export class GraphDLDB extends DurableObject {
     if (options?.sort) {
       const sortField = options.sort.startsWith('-') ? options.sort.slice(1) : options.sort
       const sortDir = options.sort.startsWith('-') ? 'DESC' : 'ASC'
-      const sortCol = fieldMap[sortField] || COMMON_FIELDS[sortField] || sortField
+      const sortCol = resolveColumn(sortField, fieldMap)
       query += ` ORDER BY ${sortCol} ${sortDir}`
     } else {
       query += ' ORDER BY created_at DESC'
@@ -706,7 +734,7 @@ export class GraphDLDB extends DurableObject {
           )
         } else if (child === 'transitions') {
           this.sql.exec(
-            `DELETE FROM transitions WHERE status_from_id IN (SELECT id FROM statuses WHERE state_machine_definition_id IN (SELECT id FROM state_machine_definitions WHERE domain_id = ?))`, domainId
+            `DELETE FROM transitions WHERE from_status_id IN (SELECT id FROM statuses WHERE state_machine_definition_id IN (SELECT id FROM state_machine_definitions WHERE domain_id = ?))`, domainId
           )
         } else if (child === 'statuses') {
           this.sql.exec(
@@ -733,10 +761,11 @@ export class GraphDLDB extends DurableObject {
     nouns:                       [['roles', 'noun_id']],
     constraints:                 [['constraint_spans', 'constraint_id']],
     roles:                       [['constraint_spans', 'role_id']],
-    state_machine_definitions:   [['statuses', 'state_machine_definition_id'], ['transitions', 'state_machine_definition_id']],
-    statuses:                    [['transitions', 'status_from_id'], ['transitions', 'status_to_id']],
+    state_machine_definitions:   [['statuses', 'state_machine_definition_id'], ['transitions', 'state_machine_definition_id'], ['state_machines', 'state_machine_definition_id']],
+    statuses:                    [['transitions', 'from_status_id'], ['transitions', 'to_status_id'], ['state_machines', 'current_status_id']],
     event_types:                 [['transitions', 'event_type_id']],
     transitions:                 [['guards', 'transition_id']],
+    verbs:                       [['functions', 'verb_id']],
   }
 
   /**
