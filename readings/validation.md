@@ -14,7 +14,7 @@ It is forbidden that a Constraint of Constraint Type 'UC' spans fewer Roles than
 
 ### Ring Constraint Completeness
 
-It is obligatory that when a Graph Schema has exactly two Roles that both reference the same Noun, at least one Constraint of Constraint Type 'IR', 'AS', 'AT', 'SY', 'IT', 'TR', or 'AC' spans those Roles.
+It is obligatory that when a Graph Schema has exactly two Roles that both reference the same Noun, some Constraint of Constraint Type 'IR', 'AS', 'AT', 'SY', 'IT', 'TR', or 'AC' spans those Roles.
 
 ### Ring Constraint Validity
 

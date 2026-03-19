@@ -4,20 +4,20 @@
 
 | Entity | Reference Scheme |
 |--------|-----------------|
-| Organization | OrgSlug |
-| App | AppSlug |
+| Organization | Org Slug |
+| App | App Slug |
 
 ## Value Types
 
 | Value | Type | Constraints |
 |-------|------|-------------|
-| OrgSlug | string | unique |
-| AppSlug | string | unique |
-| OrgRole | string | enum: owner, admin, member |
+| Org Slug | string | unique |
+| App Slug | string | unique |
+| Org Role | string | enum: owner, admin, member |
 | Visibility | string | enum: private, public |
 | Label | string | |
-| ChatEndpoint | string | |
-| AppType | string | enum: standard, chat |
+| Chat Endpoint | string | |
+| App Type | string | enum: standard, chat |
 
 ## Readings
 
@@ -26,8 +26,8 @@
 Organization has Name.
   Each Organization has exactly one Name.
 
-User has OrgRole in Organization.
-  Each User has at most one OrgRole in each Organization.
+User has Org Role in Organization.
+  Each User has at most one Org Role in each Organization.
 
 Organization is owned by User.
   Each Organization is owned by exactly one User.
@@ -37,14 +37,14 @@ Organization is owned by User.
 App has Name.
   Each App has at most one Name.
 
-App has AppType.
-  Each App has at most one AppType.
+App has App Type.
+  Each App has at most one App Type.
 
-App has ChatEndpoint.
-  Each App has at most one ChatEndpoint.
+App has Chat Endpoint.
+  Each App has at most one Chat Endpoint.
 
 App has navigable Domain.
-  Each App has at least one navigable Domain.
+  Each App has some navigable Domain.
 
 App belongs to Organization.
   Each App belongs to at most one Organization.
@@ -69,5 +69,5 @@ Deleting the owner User of an Organization deletes the Organization.
 
 ## Derivation Rules
 
-User can access Domain where User has OrgRole in Organization and Domain belongs to that Organization.
+User can access Domain where User has Org Role in Organization and Domain belongs to that Organization.
 Any User can access Domain where Domain has Visibility 'public'.

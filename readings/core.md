@@ -19,7 +19,7 @@ Constraint(.id) is an entity type.
 
 Constraint Type(.code) is an entity type.
 
-ConstraintSpan objectifies "Constraint spans Role".
+Constraint Span objectifies "Constraint spans Role".
 
 Modality Type is a value type.
   The possible values of Modality Type are 'Alethic', 'Deontic'.
@@ -45,9 +45,9 @@ Guard Run(.id) is an entity type.
 
 Function(.id) is an entity type.
 
-ReadingIsUsedByVerb objectifies "Reading is used by Verb".
+Reading Is Used By Verb objectifies "Reading is used by Verb".
 
-API objectifies "ReadingIsUsedByVerb is by HTTP Method".
+API objectifies "Reading Is Used By Verb is by HTTP Method".
 
 Language(.code) is an entity type.
 
@@ -79,11 +79,11 @@ schema:Thing(.Name) is an entity type.
 ## Value Types
 
 Arity is a value type.
-MinOccurrence is a value type.
-MaxOccurrence is a value type.
+Min Occurrence is a value type.
+Max Occurrence is a value type.
 Name is a value type.
-ObjectType is a value type.
-  The possible values of ObjectType are 'entity', 'value'.
+Object Type is a value type.
+  The possible values of Object Type are 'entity', 'value'.
 Text is a value type.
 URI is a value type.
 Header is a value type.
@@ -93,14 +93,14 @@ Argument Length is a value type.
 HTTP Method is a value type.
   The possible values of HTTP Method are 'GET', 'POST', 'PUT', 'PATCH', 'DELETE'.
 
-FunctionType is a value type.
-  The possible values of FunctionType are 'httpCallback', 'query', 'agentInvocation', 'transform'.
+Function Type is a value type.
+  The possible values of Function Type are 'httpCallback', 'query', 'agentInvocation', 'transform'.
 
 ## Fact Types
 
 ### Noun
-Noun has ObjectType.
-  Each Noun has exactly one ObjectType.
+Noun has Object Type.
+  Each Noun has exactly one Object Type.
 Noun is subtype of Noun.
 Noun is described to AI by prompt Text.
 Noun is displayed by UI Element.
@@ -133,8 +133,8 @@ Verb is performed during Transition (Mealy semantics).
 Verb is performed in Status (Moore semantics).
 
 ### Function
-Function has FunctionType.
-  Each Function has at most one FunctionType.
+Function has Function Type.
+  Each Function has at most one Function Type.
 Function has callback URI.
   Each Function has at most one callback URI.
 Function has HTTP Method.
@@ -155,13 +155,13 @@ Constraint Type has Name.
 Set Comparison Constraint has Argument Length.
 
 ### Frequency Constraint (subtype of Constraint)
-Frequency Constraint has MinOccurrence.
-  Each Frequency Constraint has exactly one MinOccurrence.
-Frequency Constraint has MaxOccurrence.
-  Each Frequency Constraint has at most one MaxOccurrence.
+Frequency Constraint has Min Occurrence.
+  Each Frequency Constraint has exactly one Min Occurrence.
+Frequency Constraint has Max Occurrence.
+  Each Frequency Constraint has at most one Max Occurrence.
 
-### ConstraintSpan (objectification of "Constraint spans Role")
-ConstraintSpan autofills from superset.
+### Constraint Span (objectification of "Constraint spans Role")
+Constraint Span autofills from superset.
 
 ### Resource
 Resource is of Noun.
@@ -215,11 +215,11 @@ Guard references Graph Schema.
 Guard Run is run by Guard.
 Guard Run references Graph.
 
-### API (objectification of "ReadingIsUsedByVerb is by HTTP Method")
+### API (objectification of "Reading Is Used By Verb is by HTTP Method")
 API has endpoint URI.
 
-### ReadingIsUsedByVerb (objectification of "Reading is used by Verb")
-ReadingIsUsedByVerb is by HTTP Method.
+### Reading Is Used By Verb (objectification of "Reading is used by Verb")
+Reading Is Used By Verb is by HTTP Method.
 
 ### UI Element
 Noun is displayed by UI Element.
