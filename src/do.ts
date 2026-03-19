@@ -1648,10 +1648,21 @@ export class GraphDLDB extends DurableObject {
       return { docs: [], totalDocs: 0, page, limit, hasNextPage: false }
     }
 
-    // Build WHERE clause
-    let whereClause = 'WHERE domain_id = ?'
-    const params: any[] = [domainId]
-    const countParams: any[] = [domainId]
+    // Build WHERE clause — search local domain first, fall back to all domains
+    // Entities like Status may live in state machine domains but be enriched from UI domains
+    let whereClause = 'WHERE 1=1'
+    const params: any[] = []
+    const countParams: any[] = []
+
+    // Only filter by domain if the table has rows in this domain
+    const localCount = this.sql.exec(
+      `SELECT count(*) as c FROM ${tableName} WHERE domain_id = ?`, domainId,
+    ).toArray()
+    if ((localCount[0]?.c as number) > 0) {
+      whereClause = 'WHERE domain_id = ?'
+      params.push(domainId)
+      countParams.push(domainId)
+    }
 
     if (options?.where) {
       for (const [field, condition] of Object.entries(options.where)) {
