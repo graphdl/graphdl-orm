@@ -990,10 +990,6 @@ export class GraphDLDB extends DurableObject {
       if (entityTable) {
         // ── 3NF path: insert one row into the entity's table ──
         const { tableName, fieldMap } = entityTable
-        const id = crypto.randomUUID()
-        const cols = ['id', 'domain_id', 'created_at', 'updated_at', 'version']
-        const vals: any[] = [id, domainId, now, now, 1]
-
         // Get existing columns in the table
         const tableColumns = new Set<string>()
         try {
@@ -1001,15 +997,57 @@ export class GraphDLDB extends DurableObject {
           for (const row of pragma) tableColumns.add(row.name as string)
         } catch { /* table doesn't exist */ }
 
-        // Store reference if provided and column exists
-        if (reference) {
-          if (tableColumns.has('reference')) {
-            cols.push('reference')
-            vals.push(reference)
-          } else if (tableColumns.has('name')) {
-            cols.push('name')
-            vals.push(reference)
+        // Determine the natural key column (reference scheme)
+        const refCol = tableColumns.has('reference') ? 'reference'
+          : tableColumns.has('name') ? 'name'
+          : tableColumns.has('slug') ? 'slug'
+          : tableColumns.has('domain_slug') ? 'domain_slug'
+          : null
+
+        // Upsert: if reference is provided, find existing row by natural key
+        if (reference && refCol) {
+          const existing = this.sql.exec(
+            `SELECT id FROM ${tableName} WHERE ${refCol} = ? AND domain_id = ? LIMIT 1`,
+            reference, domainId,
+          ).toArray()
+
+          if (existing.length) {
+            // Update existing row with new field values
+            const existingId = existing[0].id as string
+            const updates: string[] = [`updated_at = ?`]
+            const updateVals: any[] = [now]
+
+            for (const [fieldName, fieldValue] of Object.entries(fields)) {
+              if (fieldValue === undefined || fieldValue === null) continue
+              if (typeof fieldValue !== 'string' && typeof fieldValue !== 'number' && typeof fieldValue !== 'boolean') continue
+              const colName = fieldMap[fieldName] || toColumnName(fieldName)
+              if (tableColumns.has(colName)) {
+                updates.push(`${colName} = ?`)
+                updateVals.push(fieldValue)
+              }
+            }
+
+            if (updates.length > 1) {
+              this.sql.exec(
+                `UPDATE ${tableName} SET ${updates.join(', ')} WHERE id = ?`,
+                ...updateVals, existingId,
+              )
+              this.logCdcEvent('update', tableName, existingId, { domain_id: domainId })
+            }
+
+            this.getModel(domainId).invalidate()
+            return { id: existingId, noun: nounName, table: tableName, domain: domainId, reference, updated: true }
           }
+        }
+
+        // Insert new row
+        const id = crypto.randomUUID()
+        const cols = ['id', 'domain_id', 'created_at', 'updated_at', 'version']
+        const vals: any[] = [id, domainId, now, now, 1]
+
+        if (reference && refCol) {
+          cols.push(refCol)
+          vals.push(reference)
         }
         if (createdBy && tableColumns.has('created_by')) {
           cols.push('created_by')
