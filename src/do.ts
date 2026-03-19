@@ -1004,12 +1004,20 @@ export class GraphDLDB extends DurableObject {
           : tableColumns.has('domain_slug') ? 'domain_slug'
           : null
 
-        // Upsert: if reference is provided, find existing row by natural key
+        // Upsert: if reference is provided, find existing row by natural key.
+        // Search local domain first, then globally (status names are identifiers).
         if (reference && refCol) {
-          const existing = this.sql.exec(
+          let existing = this.sql.exec(
             `SELECT id FROM ${tableName} WHERE ${refCol} = ? AND domain_id = ? LIMIT 1`,
             reference, domainId,
           ).toArray()
+          // Cross-domain fallback: entity may live in another domain (e.g., state machine statuses)
+          if (!existing.length) {
+            existing = this.sql.exec(
+              `SELECT id FROM ${tableName} WHERE ${refCol} = ? LIMIT 1`,
+              reference,
+            ).toArray()
+          }
 
           if (existing.length) {
             // Update existing row with new field values
