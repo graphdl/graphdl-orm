@@ -329,50 +329,5 @@ Each Customer has at most one Priority.
     expect(priorityNoun.enumValues).toContain('Low')
   })
 
-  it('parses and ingests SPD-1 layering domain', async () => {
-    const fs = await import('fs')
-    const text = fs.readFileSync('C:/Users/lippe/Repos/spd-1/domains/layering.md', 'utf-8')
-    const parsed = parseFORML2(text, [])
-
-    expect(parsed.coverage).toBeGreaterThan(0)
-    expect(parsed.nouns.length).toBeGreaterThanOrEqual(5)
-
-    const db = mockDb()
-    const result = await ingestClaims(db as any, {
-      claims: parsed,
-      domainId: 'spd-1-layering',
-    })
-
-    expect(result.errors).toHaveLength(0)
-    expect(result.nouns).toBeGreaterThanOrEqual(5)
-    expect(result.readings).toBeGreaterThanOrEqual(5)
-  })
-
-  it('parses and ingests all 9 SPD-1 domains without errors', async () => {
-    const fs = await import('fs')
-    const domains = [
-      'layering', 'osi', 'eight-circuits', 'i-ching',
-      'maslow', 'spd-1', 'affect', 'evolution', 'ethics',
-    ]
-
-    for (const domain of domains) {
-      const fpath = `C:/Users/lippe/Repos/spd-1/domains/${domain}.md`
-      const text = fs.readFileSync(fpath, 'utf-8')
-
-      // For i-ching, skip instance facts (too large for in-memory mock)
-      const schemaText = text.split('## Instance Facts')[0]
-      const parsed = parseFORML2(schemaText, [])
-
-      expect(parsed.nouns.length, `${domain} should have nouns`).toBeGreaterThan(0)
-
-      const db = mockDb()
-      const result = await ingestClaims(db as any, {
-        claims: parsed,
-        domainId: `spd-1-${domain}`,
-      })
-
-      expect(result.errors, `${domain} should have no errors`).toHaveLength(0)
-      expect(result.nouns, `${domain} should create nouns`).toBeGreaterThan(0)
-    }
-  })
+  // SPD-1 ingestion tests moved to spd-1 repo (tests belong with fixtures)
 })
