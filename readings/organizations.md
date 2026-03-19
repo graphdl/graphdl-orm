@@ -2,22 +2,21 @@
 
 ## Entity Types
 
-| Entity | Reference Scheme |
-|--------|-----------------|
-| Organization | Org Slug |
-| App | App Slug |
+Organization(.Org Slug) is an entity type.
+App(.App Slug) is an entity type.
 
 ## Value Types
 
-| Value | Type | Constraints |
-|-------|------|-------------|
-| Org Slug | string | unique |
-| App Slug | string | unique |
-| Org Role | string | enum: owner, admin, member |
-| Visibility | string | enum: private, public |
-| Label | string | |
-| Chat Endpoint | string | |
-| App Type | string | enum: standard, chat |
+Org Slug is a value type.
+App Slug is a value type.
+Org Role is a value type.
+  The possible values of Org Role are 'owner', 'admin', 'member'.
+Visibility is a value type.
+  The possible values of Visibility are 'private', 'public'.
+Label is a value type.
+Chat Endpoint is a value type.
+App Type is a value type.
+  The possible values of App Type are 'standard', 'chat'.
 
 ## Readings
 
