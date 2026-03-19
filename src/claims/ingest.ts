@@ -91,6 +91,89 @@ async function ensureNoun(
 }
 
 /**
+ * Resolve a noun or reading across domain boundaries.
+ *
+ * Search order:
+ * 1. Target domain (domain-local)
+ * 2. Other domains in the same Organization (org-shared)
+ * 3. Public domains (visibility: 'public')
+ */
+async function resolveNounAcrossDomains(
+  db: GraphDLDB,
+  name: string,
+  domainId: string,
+): Promise<Record<string, any> | null> {
+  // 1. Domain-local
+  const local = await db.findInCollection('nouns', {
+    name: { equals: name },
+    domain: { equals: domainId },
+  }, { limit: 1 })
+  if (local.docs.length) return local.docs[0]
+
+  // 2. Org-shared — find the domain's org, then search sibling domains
+  const domain = await db.findInCollection('domains', { id: { equals: domainId } }, { limit: 1 })
+  const orgId = domain.docs[0]?.organization
+  if (orgId) {
+    const orgNoun = await db.findInCollection('nouns', {
+      name: { equals: name },
+    }, { limit: 10 })
+    // Find one in a sibling domain (same org)
+    for (const doc of orgNoun.docs) {
+      if (doc.domain === domainId) continue
+      const nounDomain = await db.findInCollection('domains', { id: { equals: doc.domain } }, { limit: 1 })
+      if (nounDomain.docs[0]?.organization === orgId) return doc
+    }
+  }
+
+  // 3. Public domains
+  const publicNoun = await db.findInCollection('nouns', {
+    name: { equals: name },
+  }, { limit: 10 })
+  for (const doc of publicNoun.docs) {
+    const nounDomain = await db.findInCollection('domains', { id: { equals: doc.domain } }, { limit: 1 })
+    if (nounDomain.docs[0]?.visibility === 'public') return doc
+  }
+
+  return null
+}
+
+async function resolveReadingAcrossDomains(
+  db: GraphDLDB,
+  readingText: string,
+  domainId: string,
+): Promise<{ schema: Record<string, any>; reading: Record<string, any> } | null> {
+  // 1. Domain-local
+  const local = await db.findInCollection('readings', {
+    text: { equals: readingText },
+    domain: { equals: domainId },
+  }, { limit: 1 })
+  if (local.docs.length) {
+    const r = local.docs[0]
+    return { schema: { id: r.graphSchema }, reading: r }
+  }
+
+  // 2. Search all readings (org-shared + public)
+  const all = await db.findInCollection('readings', {
+    text: { equals: readingText },
+  }, { limit: 10 })
+
+  const domain = await db.findInCollection('domains', { id: { equals: domainId } }, { limit: 1 })
+  const orgId = domain.docs[0]?.organization
+
+  for (const r of all.docs) {
+    const rDomain = await db.findInCollection('domains', { id: { equals: r.domain } }, { limit: 1 })
+    const rd = rDomain.docs[0]
+    if (!rd) continue
+    // Org-shared or public
+    if ((orgId && rd.organization === orgId) || rd.visibility === 'public') {
+      return { schema: { id: r.graphSchema }, reading: r }
+    }
+  }
+
+  return null
+}
+
+/**
  * Ingest bulk structured claims.
  */
 export async function ingestClaims(
@@ -122,11 +205,15 @@ export async function ingestClaims(
     }
   }
 
-  // Step 2: Apply subtypes
+  // Step 2: Apply subtypes (resolve parent across domains if needed)
   for (const sub of claims.subtypes || []) {
     try {
       const child = nounMap.get(sub.child)
-      const parent = nounMap.get(sub.parent)
+      let parent = nounMap.get(sub.parent)
+      if (!parent) {
+        parent = await resolveNounAcrossDomains(db, sub.parent, domainId) || undefined
+        if (parent) nounMap.set(sub.parent, parent)
+      }
       if (child && parent) {
         await db.updateInCollection('nouns', child.id as string, { superType: parent.id as string })
       }
@@ -441,19 +528,32 @@ export async function ingestClaims(
           continue
         }
 
-        // Find the graph schema by matching the reading text
-        const schema = schemaMap.get(reading)
+        // Find the graph schema — local first, then org-shared, then public
+        let schema = schemaMap.get(reading)
+        if (!schema) {
+          const resolved = await resolveReadingAcrossDomains(db, reading, domainId)
+          if (resolved) {
+            schema = resolved.schema
+            schemaMap.set(reading, schema) // cache for subsequent facts
+          }
+        }
         if (!schema) {
           result.errors.push(`fact: reading "${reading}" not found`)
           continue
         }
 
-        // Build bindings from the fact values
-        const bindings = values.map(v => {
-          const noun = nounMap.get(v.noun)
-          if (!noun) return null
-          return { nounId: noun.id as string, value: v.value }
-        }).filter(Boolean) as Array<{ nounId: string; value: string }>
+        // Build bindings — resolve nouns locally first, then across domains
+        const bindings: Array<{ nounId: string; value: string }> = []
+        for (const v of values) {
+          let noun = nounMap.get(v.noun)
+          if (!noun) {
+            noun = await resolveNounAcrossDomains(db, v.noun, domainId) || undefined
+            if (noun) nounMap.set(v.noun, noun) // cache
+          }
+          if (noun) {
+            bindings.push({ nounId: noun.id as string, value: v.value })
+          }
+        }
 
         if (bindings.length < 2) {
           result.errors.push(`fact: "${reading}" needs at least 2 bindings`)
