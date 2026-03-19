@@ -6,10 +6,10 @@
 |--------|-----------------|
 | Graph | (within Domain) |
 | Resource | Reference (within Domain) |
-| ResourceRole | (within Graph) |
-| StateMachine | Name (within Domain) |
-| Event | Timestamp (within StateMachine) |
-| GuardRun | Name (within Event) |
+| Resource Role | (within Graph) |
+| State Machine | Name (within Domain) |
+| Event | Timestamp (within State Machine) |
+| Guard Run | Name (within Event) |
 | Citation | (id) |
 
 ## Readings
@@ -19,14 +19,14 @@ Citation has Text.
   Each Citation has exactly one Text.
 Citation has URI.
   Each Citation has at most one URI.
-Citation has RetrievalDate.
-  Each Citation has at most one RetrievalDate.
+Citation has Retrieval Date.
+  Each Citation has at most one Retrieval Date.
 
 ### Graph
 Graph belongs to Domain.
   Each Graph belongs to exactly one Domain.
-Graph is of GraphSchema.
-  Each Graph is of exactly one GraphSchema.
+Graph is of Graph Schema.
+  Each Graph is of exactly one Graph Schema.
 Graph cites Citation.
   For each pair of Graph and Citation, that Graph cites that Citation at most once.
 
@@ -40,36 +40,36 @@ Resource has Reference.
 Resource has Value.
   Each Resource has at most one Value.
 
-### ResourceRole
+### Resource Role
 Graph uses Resource for Role.
   Each Graph uses at most one Resource for each Role.
 
-### StateMachine
-StateMachine belongs to Domain.
-  Each StateMachine belongs to exactly one Domain.
-StateMachine has Name.
-  Each StateMachine has exactly one Name.
-StateMachine is instance of StateMachineDefinition.
-  Each StateMachine is instance of exactly one StateMachineDefinition.
-StateMachine is currently in Status.
-  Each StateMachine is currently in exactly one Status.
-StateMachine is for Resource.
-  Each StateMachine is for at most one Resource.
+### State Machine
+State Machine belongs to Domain.
+  Each State Machine belongs to exactly one Domain.
+State Machine has Name.
+  Each State Machine has exactly one Name.
+State Machine is instance of State Machine Definition.
+  Each State Machine is instance of exactly one State Machine Definition.
+State Machine is currently in Status.
+  Each State Machine is currently in exactly one Status.
+State Machine is for Resource.
+  Each State Machine is for at most one Resource.
 
 ### Event
-Event belongs to StateMachine.
-  Each Event belongs to exactly one StateMachine.
-Event is of EventType.
-  Each Event is of exactly one EventType.
+Event belongs to State Machine.
+  Each Event belongs to exactly one State Machine.
+Event is of Event Type.
+  Each Event is of exactly one Event Type.
 Event occurred at Timestamp.
   Each Event occurred at exactly one Timestamp.
 Event is created by Graph.
   Each Event is created by at most one Graph.
 
-### GuardRun
-GuardRun has Name.
-  Each GuardRun has at most one Name.
-GuardRun is for Guard.
-  Each GuardRun is for exactly one Guard.
-GuardRun references Graph.
-  Each GuardRun references at most one Graph.
+### Guard Run
+Guard Run has Name.
+  Each Guard Run has at most one Name.
+Guard Run is for Guard.
+  Each Guard Run is for exactly one Guard.
+Guard Run references Graph.
+  Each Guard Run references at most one Graph.

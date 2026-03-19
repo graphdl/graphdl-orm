@@ -3,7 +3,7 @@
 ## Entity Types
 
 Model(.code) is an entity type.
-AgentDefinition(.id) is an entity type.
+Agent Definition(.id) is an entity type.
 Agent(.id) is an entity type.
 Completion(.id) is an entity type.
 
@@ -13,19 +13,19 @@ Completion(.id) is an entity type.
 Model has Name.
   Each Model has exactly one Name.
 
-### AgentDefinition
-AgentDefinition belongs to Domain.
-  Each AgentDefinition belongs to exactly one Domain.
+### Agent Definition
+Agent Definition belongs to Domain.
+  Each Agent Definition belongs to exactly one Domain.
 
-AgentDefinition has Name.
-  Each AgentDefinition has exactly one Name.
+Agent Definition has Name.
+  Each Agent Definition has exactly one Name.
 
-AgentDefinition uses Model.
-  Each AgentDefinition uses exactly one Model.
+Agent Definition uses Model.
+  Each Agent Definition uses exactly one Model.
 
 ### Agent
-Agent is instance of AgentDefinition.
-  Each Agent is instance of exactly one AgentDefinition.
+Agent is instance of Agent Definition.
+  Each Agent is instance of exactly one Agent Definition.
 
 Agent is for Resource.
   Each Agent is for at most one Resource.
@@ -44,5 +44,5 @@ Completion occurred at Timestamp.
   Each Completion occurred at exactly one Timestamp.
 
 ### Verb connection
-Verb invokes AgentDefinition.
-  Each Verb invokes at most one AgentDefinition.
+Verb invokes Agent Definition.
+  Each Verb invokes at most one Agent Definition.
