@@ -239,6 +239,13 @@ For each combination of Role and Reading, that Role has at most one Position for
 ## Subset Constraints
 
 If some Role is used in some Reading where some Graph Schema has that Reading then that Graph Schema has that Role.
+If some Graph uses some Resource for some Role then that Graph is of some Graph Schema that has that Role.
+If some Graph uses some Resource for some Role then that Resource is of some Noun that plays that Role.
+If some Graph Schema defines some Graph then some Resource that is that Graph is of some Noun that is that Graph Schema.
+If some Verb references some Graph that is of some Graph Schema then that Verb uses some Reading where that Graph Schema has that Reading.
+If some Graph creates some Event that is of some Event Type then that Graph is referenced by some Verb that can create that Event Type.
+If some Guard defines some Guard Run that references some Graph then that Guard references some Graph Schema that defines that Graph.
+If some State Machine is currently in some Status then that Status is defined in some State Machine Definition where that State Machine is instance of that State Machine Definition.
 
 ## Ring Constraints
 
