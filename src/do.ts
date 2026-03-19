@@ -13,7 +13,7 @@
 
 import { DurableObject } from 'cloudflare:workers'
 import { ALL_DDL } from './schema'
-import { COLLECTION_TABLE_MAP, FIELD_MAP, FK_TARGET_TABLE } from './collections'
+import { COLLECTION_TABLE_MAP, FIELD_MAP, FK_TARGET_TABLE, NOUN_TABLE_MAP } from './collections'
 import { DomainModel, SqlDataLoader } from './model/domain-model'
 
 /** Fields common to every table — Payload camelCase → SQL snake_case. */
@@ -1439,7 +1439,7 @@ export class GraphDLDB extends DurableObject {
     }
 
     const { toTableName } = await import('./generate/sqlite')
-    const tableName = schemaMap.tableMap[nounName] || toTableName(nounName)
+    const tableName = NOUN_TABLE_MAP[nounName] || schemaMap.tableMap[nounName] || toTableName(nounName)
 
     // Verify table exists
     try {
@@ -1636,7 +1636,8 @@ export class GraphDLDB extends DurableObject {
     options?: { where?: Record<string, any>; sort?: string; limit?: number; page?: number },
   ): Promise<{ docs: Record<string, unknown>[]; totalDocs: number; page: number; limit: number; hasNextPage: boolean }> {
     const { toTableName, toColumnName } = await import('./generate/sqlite')
-    const tableName = toTableName(nounName)
+    // Prefer metamodel table mapping, then generated table name
+    const tableName = NOUN_TABLE_MAP[nounName] || toTableName(nounName)
     const limit = options?.limit || 100
     const page = options?.page || 1
     const offset = (page - 1) * limit
