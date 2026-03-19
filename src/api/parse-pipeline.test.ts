@@ -51,20 +51,7 @@ The system should also track customer preferences and recommend products.
       expect(result.unparsed.length).toBeGreaterThan(0)
     })
 
-    it('achieves high coverage on all SPD-1 domains', () => {
-      const fs = require('fs')
-      const domains = [
-        'layering', 'osi', 'eight-circuits', 'i-ching',
-        'maslow', 'spd-1', 'affect', 'evolution', 'ethics',
-      ]
-
-      for (const domain of domains) {
-        const text = fs.readFileSync(`C:/Users/lippe/Repos/spd-1/domains/${domain}.md`, 'utf-8')
-        const schemaText = text.split('## Instance Facts')[0]
-        const result = parseFORML2(schemaText, [])
-        expect(result.coverage, `${domain} coverage`).toBeGreaterThanOrEqual(1.0)
-      }
-    })
+    // SPD-1 coverage tests moved to spd-1 repo (tests belong with fixtures)
   })
 
   describe('codeText', () => {
@@ -215,21 +202,6 @@ Customer has Name.
       expect(shortcodeCount).toBeGreaterThan(0)
     })
 
-    it('codes SPD-1 ethics domain correctly', () => {
-      const fs = require('fs')
-      const text = fs.readFileSync('C:/Users/lippe/Repos/spd-1/domains/ethics.md', 'utf-8')
-      const parsed = parseFORML2(text, [])
-      const { coded, legend, stats } = codeText(text, parsed)
-
-      // Should have shortcodes for Agent, Human, Harm, etc.
-      expect(legend).toContain('Agent')
-      expect(legend).toContain('Harm')
-
-      // Deontic constraints should be in legend
-      expect(legend).toContain('forbidden')
-
-      // High compression
-      expect(stats.parsedLines).toBeGreaterThan(10)
-    })
+    // SPD-1 codeText test moved to spd-1 repo (tests belong with fixtures)
   })
 })
