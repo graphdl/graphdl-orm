@@ -1,4 +1,38 @@
 /**
+ * Maps noun names (as they appear in readings) to their metamodel table names.
+ * Used by queryEntities to resolve the correct table for metamodel entities.
+ */
+export const NOUN_TABLE_MAP: Record<string, string> = {
+  'Organization': 'organizations',
+  'Domain': 'domains',
+  'App': 'apps',
+  'Noun': 'nouns',
+  'Graph Schema': 'graph_schemas',
+  'Reading': 'readings',
+  'Role': 'roles',
+  'Constraint': 'constraints',
+  'Constraint Span': 'constraint_spans',
+  'State Machine Definition': 'state_machine_definitions',
+  'Status': 'statuses',
+  'Transition': 'transitions',
+  'Guard': 'guards',
+  'Event Type': 'event_types',
+  'Verb': 'verbs',
+  'Function': 'functions',
+  'Stream': 'streams',
+  'Resource': 'resources',
+  'Graph': 'graphs',
+  'State Machine': 'state_machines',
+  'Event': 'events',
+  'Guard Run': 'guard_runs',
+  'Agent Definition': 'agent_definitions',
+  'Agent': 'agents',
+  'Model': 'models',
+  'Completion': 'completions',
+  'Citation': 'citations',
+}
+
+/**
  * Maps Payload CMS collection slugs (kebab-case) to SQLite table names (snake_case).
  *
  * The apis worker rawProxy uses Payload slugs in /graphdl/raw/<slug> URLs.
