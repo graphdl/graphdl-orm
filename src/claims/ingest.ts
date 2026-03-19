@@ -505,7 +505,8 @@ export async function ingestClaims(
     }
   }
 
-  // Step 6: Create instance facts (Graphs with ResourceRoles)
+  // Step 6: Create instance facts as 3NF entity rows
+  let schemaApplied = false
   if (claims.facts?.length) {
     for (const fact of claims.facts) {
       try {
@@ -554,17 +555,19 @@ export async function ingestClaims(
           continue
         }
 
+        // Ensure schema is applied before first entity creation
+        if (!schemaApplied) {
+          try {
+            await (db as any).applySchema(domainId)
+          } catch { /* may fail if no readings yet */ }
+          schemaApplied = true
+        }
+
         try {
           await (db as any).createEntity(domainId, entityName, fieldValues, entityRef)
         } catch (err: any) {
-          // Entity table may not exist yet — apply schema first
-          try {
-            await (db as any).applySchema(domainId)
-            await (db as any).createEntity(domainId, entityName, fieldValues, entityRef)
-          } catch (err2: any) {
-            result.errors.push(`fact "${entityName} '${entityRef}': ${err2.message}`)
-            continue
-          }
+          result.errors.push(`fact "${entityName} '${entityRef}': ${err.message}`)
+          continue
         }
       } catch (err: any) {
         result.errors.push(`fact "${fact.reading || fact.entity}": ${err.message}`)
