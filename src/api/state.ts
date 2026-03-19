@@ -61,13 +61,24 @@ async function findInitialStatus(db: any, definitionId: string) {
 }
 
 async function getInstance(db: any, machineType: string, instanceId: string) {
-  const definition = await findDefinition(db, machineType)
+  // First try: find by name (entity ID) — unambiguous, works even with duplicate definitions
+  const byName = await db.findInCollection('state-machines', {
+    name: { equals: instanceId },
+  }, { limit: 1 })
+  let doc = byName.docs?.[0]
 
-  const where: Record<string, any> = { name: { equals: instanceId } }
-  if (definition) where.stateMachineType = { equals: definition.id }
+  // If multiple machines exist for this name (shouldn't happen), narrow by definition
+  if (!doc) {
+    const definition = await findDefinition(db, machineType)
+    if (definition) {
+      const result = await db.findInCollection('state-machines', {
+        name: { equals: instanceId },
+        stateMachineType: { equals: definition.id },
+      }, { limit: 1 })
+      doc = result.docs?.[0]
+    }
+  }
 
-  const result = await db.findInCollection('state-machines', where, { limit: 1 })
-  const doc = result.docs?.[0]
   if (!doc) return null
 
   // Resolve status name
@@ -121,12 +132,40 @@ export async function handleGetState(request: Request, env: Env) {
   const parts = url.pathname.replace('/api/state/', '').split('/')
   const machineType = parts[0]
   const instanceId = parts[1]
+  const event = parts[2]
 
   if (!machineType || !instanceId) return error(400, { error: 'machineType and instanceId required' })
 
+  // If an event is provided on GET, delegate to sendEvent (GET-based event firing)
+  if (event) return handleSendEvent(request, env)
+
   const db = getDB(env)
-  const instance = await getInstance(db, machineType, instanceId)
-  if (!instance) return json({ error: 'Instance not found' }, { status: 404 })
+  let instance = await getInstance(db, machineType, instanceId)
+
+  // Auto-create instance at initial state if entity exists but no state machine yet
+  if (!instance) {
+    const definition = await findDefinition(db, machineType)
+    if (!definition) return json({ error: `Machine type '${machineType}' not found` }, { status: 404 })
+
+    const initialStatus = await findInitialStatus(db, definition.id)
+    if (!initialStatus) return json({ error: `No statuses found for '${machineType}'` }, { status: 404 })
+
+    const domainId = typeof definition.domain === 'object' ? definition.domain?.id : definition.domain
+    await db.createInCollection('state-machines', {
+      name: instanceId,
+      stateMachineType: definition.id,
+      stateMachineStatus: initialStatus.id,
+      ...(domainId ? { domain: domainId } : {}),
+    })
+
+    instance = {
+      id: '',
+      currentStatusId: initialStatus.id,
+      currentStatusName: initialStatus.name,
+      definitionId: definition.id,
+      domain: domainId,
+    }
+  }
 
   const rawTransitions = instance.currentStatusId
     ? await findTransitionsFrom(db, instance.currentStatusId)

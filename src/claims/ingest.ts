@@ -331,14 +331,16 @@ export async function ingestClaims(
         const noun = nounMap.get(entityName)
         if (!noun) { result.errors.push(`transition entity "${entityName}" not found`); continue }
 
-        // Ensure state machine definition
+        // Ensure state machine definition (find by noun + domain, or title + domain)
         const existingDef = await db.findInCollection('state-machine-definitions', {
           noun: { equals: noun.id },
+          domain: { equals: domainId },
         }, { limit: 1 })
 
         const definition = existingDef.docs.length
           ? existingDef.docs[0]
           : await db.createInCollection('state-machine-definitions', {
+              title: entityName,
               noun: noun.id,
               domain: domainId,
             })

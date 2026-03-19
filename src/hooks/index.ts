@@ -61,6 +61,18 @@ export async function createWithHook(
       data.kind = 'UC' // default
     }
   }
+
+  // Idempotent: find-or-create for state machine definitions (prevent duplicates)
+  if (collection === 'state-machine-definitions' && data.noun) {
+    const existing = await db.findInCollection('state-machine-definitions', {
+      noun: { equals: data.noun },
+      ...(data.domain && { domain: { equals: data.domain } }),
+    }, { limit: 1 })
+    if (existing.docs.length) {
+      return { doc: existing.docs[0], hookResult: EMPTY_RESULT }
+    }
+  }
+
   const doc = await db.createInCollection(collection, data)
   const hook = COLLECTION_HOOKS[collection]
   if (hook) {

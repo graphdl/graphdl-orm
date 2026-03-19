@@ -544,6 +544,69 @@ mod tests {
         assert!(result[0].detail.contains("SenderIdentity"));
     }
 
+    /// Regression: constraints spanning multiple fact types that share a value-type noun
+    /// must not produce duplicate violations. collect_enum_values deduplicates by noun name.
+    #[test]
+    fn test_no_duplicate_violations_for_multi_span_constraints() {
+        let mut ir = empty_ir();
+        ir.nouns.insert("FieldName".to_string(), NounDef {
+            object_type: "value".to_string(),
+            enum_values: Some(vec!["EndpointSlug".to_string(), "Title".to_string()]),
+            value_type: Some("string".to_string()),
+            super_type: None,
+        });
+        ir.nouns.insert("SupportResponse".to_string(), NounDef {
+            object_type: "entity".to_string(),
+            enum_values: None, value_type: None, super_type: None,
+        });
+        ir.nouns.insert("APIProduct".to_string(), NounDef {
+            object_type: "entity".to_string(),
+            enum_values: None, value_type: None, super_type: None,
+        });
+        // Three fact types that all reference FieldName — simulates multi-span constraint
+        for i in 1..=3 {
+            ir.fact_types.insert(format!("ft{}", i), FactTypeDef {
+                reading: format!("SupportResponse names APIProduct by FieldName ({})", i),
+                roles: vec![
+                    RoleDef { noun_name: "SupportResponse".to_string(), role_index: 0 },
+                    RoleDef { noun_name: "APIProduct".to_string(), role_index: 1 },
+                    RoleDef { noun_name: "FieldName".to_string(), role_index: 2 },
+                ],
+            });
+        }
+        ir.constraints.push(ConstraintDef {
+            id: "c1".to_string(),
+            kind: "UC".to_string(),
+            modality: "Deontic".to_string(),
+            deontic_operator: Some("obligatory".to_string()),
+            text: "It is obligatory that SupportResponse names APIProduct by FieldName 'Title'.".to_string(),
+            spans: vec![
+                SpanDef { fact_type_id: "ft1".to_string(), role_index: 0, subset_autofill: None },
+                SpanDef { fact_type_id: "ft2".to_string(), role_index: 0, subset_autofill: None },
+                SpanDef { fact_type_id: "ft3".to_string(), role_index: 0, subset_autofill: None },
+            ],
+            set_comparison_argument_length: None,
+            clauses: None,
+            entity: None,
+        });
+
+        let response = ResponseContext {
+            text: "test response without required field names".to_string(),
+            sender_identity: None,
+            fields: None,
+        };
+
+        let result = evaluate_ir(&ir, &response, &empty_population());
+        // Should produce exactly 1 violation per unique noun, not 3 duplicates
+        let field_name_violations: Vec<_> = result.iter()
+            .filter(|v| v.detail.contains("FieldName"))
+            .collect();
+        assert_eq!(field_name_violations.len(), 1,
+            "Expected 1 FieldName violation, got {}. Violations: {:?}",
+            field_name_violations.len(),
+            field_name_violations.iter().map(|v| &v.detail).collect::<Vec<_>>());
+    }
+
     #[test]
     fn test_equality_violation() {
         let mut ir = empty_ir();

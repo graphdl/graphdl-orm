@@ -110,15 +110,19 @@ fn resolve_spans(ir: &ConstraintIR, spans: &[SpanDef]) -> Vec<ResolvedSpan> {
 }
 
 /// Collect (noun_name, enum_values) for value-type nouns in spanned fact types.
+/// Deduplicates by noun name — each noun's enum values appear at most once.
 fn collect_enum_values(ir: &ConstraintIR, spans: &[SpanDef]) -> Vec<(String, Vec<String>)> {
+    let mut seen = HashSet::new();
     let mut result = Vec::new();
     for span in spans {
         if let Some(ft) = ir.fact_types.get(&span.fact_type_id) {
             for role in &ft.roles {
+                if seen.contains(&role.noun_name) { continue; }
                 if let Some(noun_def) = ir.nouns.get(&role.noun_name) {
                     if noun_def.object_type == "value" {
                         if let Some(vals) = &noun_def.enum_values {
                             if !vals.is_empty() {
+                                seen.insert(role.noun_name.clone());
                                 result.push((role.noun_name.clone(), vals.clone()));
                             }
                         }
