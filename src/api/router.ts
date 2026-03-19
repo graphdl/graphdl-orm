@@ -471,6 +471,32 @@ router.delete('/api/domains/:domainId/metamodel', async (request, env: Env) => {
   return json(result)
 })
 
+// ── Full reset (delete ALL data from ALL tables) ────────────────────
+router.delete('/api/reset', async (request, env: Env) => {
+  const db = getDB(env) as any
+  const tables = [
+    'guard_runs', 'events', 'state_machines', 'resource_roles', 'graph_citations',
+    'graphs', 'resources', 'citations', 'generators',
+    'completions', 'agents', 'agent_definitions', 'models',
+    'constraint_spans', 'constraints', 'roles', 'readings', 'graph_schemas',
+    'functions', 'verbs', 'guards', 'transitions', 'statuses',
+    'event_types', 'streams', 'state_machine_definitions',
+    'nouns', 'domains', 'apps', 'org_memberships', 'organizations',
+  ]
+  const counts: Record<string, number> = {}
+  for (const table of tables) {
+    try {
+      const result = db.sql.exec(`SELECT count(*) as c FROM ${table}`).toArray()
+      const count = result[0]?.c || 0
+      if (count > 0) {
+        db.sql.exec(`DELETE FROM ${table}`)
+        counts[table] = count
+      }
+    } catch { /* table may not exist */ }
+  }
+  return json({ reset: true, deleted: counts })
+})
+
 // ── Parse / Verify ──────────────────────────────────────────────────
 router.all('/parse', handleParse)
 router.all('/parse/orm', handleParseOrm)
