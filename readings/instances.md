@@ -2,15 +2,13 @@
 
 ## Entity Types
 
-| Entity | Reference Scheme |
-|--------|-----------------|
-| Graph | (within Domain) |
-| Resource | Reference (within Domain) |
-| Resource Role | (within Graph) |
-| State Machine | Name (within Domain) |
-| Event | Timestamp (within State Machine) |
-| Guard Run | Name (within Event) |
-| Citation | (id) |
+Graph(within Domain) is an entity type.
+Resource(.Reference within Domain) is an entity type.
+Resource Role(within Graph) is an entity type.
+State Machine(.Name within Domain) is an entity type.
+Event(.Timestamp within State Machine) is an entity type.
+Guard Run(.Name within Event) is an entity type.
+Citation is an entity type.
 
 ## Readings
 

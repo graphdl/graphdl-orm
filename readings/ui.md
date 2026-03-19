@@ -2,20 +2,18 @@
 
 ## Entity Types
 
-| Entity | Reference Scheme |
-|--------|-----------------|
-| Dashboard | Dashboard Name |
-| Section | Section Title |
-| Widget | Widget Id |
+Dashboard(.Dashboard Name) is an entity type.
+Section(.Section Title) is an entity type.
+Widget(.Widget Id) is an entity type.
 
 ## Value Types
 
-| Value | Type | Constraints |
-|-------|------|-------------|
-| Widget Type | string | enum: link, field, status-summary, submission, streaming, remote-control |
-| Position | number | |
-| Column Count | number | |
-| Display Color | string | enum: green, amber, red, blue, violet, gray |
+Widget Type is a value type.
+  The possible values of Widget Type are 'link', 'field', 'status-summary', 'submission', 'streaming', 'remote-control'.
+Position is a value type.
+Column Count is a value type.
+Display Color is a value type.
+  The possible values of Display Color are 'green', 'amber', 'red', 'blue', 'violet', 'gray'.
 
 ## Readings
 
@@ -56,30 +54,29 @@ An Entity List is a live view of Resource instances that automatically reflects 
 
 ## Entity Types
 
-| Entity | Reference Scheme |
-|--------|-----------------|
-| Entity List | (Noun + Domain) |
-| List Item | (Entity List + Resource) |
-| Page | (Entity List + Page Number) |
+Entity List(.Noun + Domain) is an entity type.
+List Item(.Entity List + Resource) is an entity type.
+Page(.Entity List + Page Number) is an entity type.
 
 ## Value Types
 
-| Value | Type | Constraints |
-|-------|------|-------------|
-| Display Text | string | |
-| Display Subtext | string | |
-| Display Status | string | |
-| Display Image Path | string | URL |
-| Polling Interval | number | milliseconds, default 5000 |
-| Change Type | string | enum: created, updated, deleted |
-| Scroll Style | string | enum: infinite-scroll, paginated, load-more |
-| Page Size | number | default 20 |
-| Page Number | number | starts at 1 |
-| Total Docs | number | |
-| Total Pages | number | |
-| Sort Field | string | |
-| Sort Direction | string | enum: asc, desc |
-| Status Filter | string | |
+Display Text is a value type.
+Display Subtext is a value type.
+Display Status is a value type.
+Display Image Path is a value type.
+Polling Interval is a value type.
+Change Type is a value type.
+  The possible values of Change Type are 'created', 'updated', 'deleted'.
+Scroll Style is a value type.
+  The possible values of Scroll Style are 'infinite-scroll', 'paginated', 'load-more'.
+Page Size is a value type.
+Page Number is a value type.
+Total Docs is a value type.
+Total Pages is a value type.
+Sort Field is a value type.
+Sort Direction is a value type.
+  The possible values of Sort Direction are 'asc', 'desc'.
+Status Filter is a value type.
 
 ## Fact Types
 

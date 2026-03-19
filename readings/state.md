@@ -2,12 +2,10 @@
 
 ## Entity Types
 
-| Entity | Reference Scheme |
-|--------|-----------------|
-| State Machine Definition | Title (within Domain) |
-| Status | Name (within State Machine Definition) |
-| Transition | (within State Machine Definition) |
-| Guard | Name (within Transition) |
+State Machine Definition(.Title within Domain) is an entity type.
+Status(.Name within State Machine Definition) is an entity type.
+Transition(within State Machine Definition) is an entity type.
+Guard(.Name within Transition) is an entity type.
 
 ## Readings
 
