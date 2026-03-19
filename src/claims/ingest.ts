@@ -44,8 +44,14 @@ export interface ExtractedClaims {
   subtypes?: Array<{ child: string; parent: string }>
   transitions?: Array<{ entity: string; from: string; to: string; event: string }>
   facts?: Array<{
-    reading: string
-    values: Array<{ noun: string; value: string }>
+    reading?: string
+    values?: Array<{ noun: string; value: string }>
+    /** Entity-centric format from FORML2 parser */
+    entity?: string
+    entityValue?: string
+    predicate?: string
+    valueType?: string
+    value?: string
   }>
 }
 
@@ -416,8 +422,26 @@ export async function ingestClaims(
   if (claims.facts?.length) {
     for (const fact of claims.facts) {
       try {
+        // Normalize: convert entity-centric format to reading-centric
+        let reading = fact.reading || ''
+        let values = fact.values || []
+
+        if (!reading && fact.entity && fact.valueType) {
+          // Entity-centric format: { entity, entityValue, predicate, valueType, value }
+          const predicate = fact.predicate || 'has'
+          reading = `${fact.entity} ${predicate} ${fact.valueType}`
+          values = [
+            { noun: fact.entity, value: fact.entityValue || '' },
+            { noun: fact.valueType, value: fact.value || '' },
+          ]
+        }
+
+        if (!reading) {
+          result.errors.push(`fact: no reading or entity/valueType`)
+          continue
+        }
+
         // Find the graph schema by matching the reading text
-        const reading = fact.reading
         const schema = schemaMap.get(reading)
         if (!schema) {
           result.errors.push(`fact: reading "${reading}" not found`)
@@ -425,7 +449,7 @@ export async function ingestClaims(
         }
 
         // Build bindings from the fact values
-        const bindings = fact.values.map(v => {
+        const bindings = values.map(v => {
           const noun = nounMap.get(v.noun)
           if (!noun) return null
           return { nounId: noun.id as string, value: v.value }
@@ -438,7 +462,7 @@ export async function ingestClaims(
 
         await (db as any).createFact(domainId, schema.id as string, bindings)
       } catch (err: any) {
-        result.errors.push(`fact "${fact.reading}": ${err.message}`)
+        result.errors.push(`fact "${fact.reading || fact.entity}": ${err.message}`)
       }
     }
   }
