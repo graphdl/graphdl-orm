@@ -290,14 +290,20 @@ export function parseFORML2(
       const parsed = parseConstraintText(line.replace(/\.$/, ''))
       if (parsed) {
         for (const pc of parsed) {
-          // For standalone constraints, try to match nouns to existing readings
+          // Match constraint nouns to the primary reading
+          // Graph schema role order = primary reading noun order
           const matchedReading = findMatchingReading(readings, pc.nouns)
+          const roles = matchedReading
+            ? pc.constrainedNoun
+              ? resolveConstrainedRole(matchedReading, pc.constrainedNoun, readings)
+              : resolveRoles(matchedReading, pc.nouns, readings) // spanning UC: all roles
+            : []
           constraints.push({
             kind: pc.kind,
             modality: section === 'deontic-constraints' ? 'Deontic' : pc.modality,
             deonticOperator: pc.deonticOperator,
             reading: matchedReading || '',
-            roles: matchedReading ? resolveRoles(matchedReading, pc.nouns, readings) : [],
+            roles,
             text: line,
           })
         }
@@ -404,11 +410,11 @@ export function parseFORML2(
         const parsed = parseConstraintText(constraintLine)
         if (parsed) {
           for (const pc of parsed) {
-            const constraintNouns = (pc.kind === 'UC' || pc.kind === 'MC') && pc.nouns.length > 0
-              ? [pc.nouns[0]] : pc.nouns
-            const roles = constraintNouns
-              .map(cn => nounNames.indexOf(cn))
-              .filter(idx => idx !== -1)
+            // Use constrainedNoun to find the role index in the primary reading.
+            // For spanning UCs (no constrainedNoun), all roles are constrained.
+            const roles = pc.constrainedNoun
+              ? [nounNames.indexOf(pc.constrainedNoun)].filter(idx => idx !== -1)
+              : pc.nouns.map(cn => nounNames.indexOf(cn)).filter(idx => idx !== -1)
             constraints.push({
               kind: pc.kind,
               modality: pc.modality,
@@ -501,6 +507,24 @@ function resolveRoles(
   return constraintNouns
     .map(cn => reading.nouns.indexOf(cn))
     .filter(idx => idx !== -1)
+}
+
+/**
+ * Resolve the role index of a constrained noun in a primary reading.
+ *
+ * In ORM2: "Each A R at most one B" → UC on A's role.
+ * The role index is A's position in the primary reading's noun order,
+ * which matches the graph schema's role order.
+ */
+function resolveConstrainedRole(
+  readingText: string,
+  constrainedNoun: string,
+  readings: ParseResult['readings'],
+): number[] {
+  const reading = readings.find(r => r.text === readingText)
+  if (!reading) return []
+  const idx = reading.nouns.indexOf(constrainedNoun)
+  return idx !== -1 ? [idx] : []
 }
 
 // ── HTTP Handler ───────────────────────────────────────────────────

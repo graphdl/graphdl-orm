@@ -14,6 +14,14 @@ export interface ParsedConstraint {
   modality: 'Alethic' | 'Deontic'
   deonticOperator?: 'obligatory' | 'forbidden' | 'permitted'
   nouns: string[]
+  /**
+   * The noun whose role is constrained. In ORM2 verbalization:
+   * - "Each A R at most one B" → constrainedNoun = A (UC on A's role)
+   * - "Each A R some B" → constrainedNoun = A (MC on A's role)
+   * The role index is resolved by finding constrainedNoun's position
+   * in the primary reading (graph schema role order = primary reading noun order).
+   */
+  constrainedNoun?: string
   /** For set-comparison (XO/XC/OR): the constrained entity name */
   entity?: string
   /** For set-comparison (XO/XC/OR): the individual clause texts */
@@ -87,34 +95,37 @@ export function parseConstraintText(text: string): ParsedConstraint[] | null {
   }
 
   // "Each X has exactly one Y" → UC + MC
+  // Constrained noun is X (the noun after "Each") — UC on X's role in the primary reading
   let m = clean.match(EXACTLY_ONE)
   if (m) {
     const nouns = [m[1], m[2]]
     return [
-      { kind: 'UC', modality: 'Alethic', nouns },
-      { kind: 'MC', modality: 'Alethic', nouns },
+      { kind: 'UC', modality: 'Alethic', nouns, constrainedNoun: m[1] },
+      { kind: 'MC', modality: 'Alethic', nouns, constrainedNoun: m[1] },
     ]
   }
 
-  // "Each X has at most one Y" → UC
+  // "Each X has at most one Y" → UC on X's role
   m = clean.match(AT_MOST_ONE)
   if (m) {
-    return [{ kind: 'UC', modality: 'Alethic', nouns: [m[1], m[2]] }]
+    return [{ kind: 'UC', modality: 'Alethic', nouns: [m[1], m[2]], constrainedNoun: m[1] }]
   }
 
-  // "Each X has at least one Y" → MC
+  // "Each X has at least one Y" → MC on X's role
   m = clean.match(AT_LEAST_ONE)
   if (m) {
-    return [{ kind: 'MC', modality: 'Alethic', nouns: [m[1], m[2]] }]
+    return [{ kind: 'MC', modality: 'Alethic', nouns: [m[1], m[2]], constrainedNoun: m[1] }]
   }
 
   // "For each combination of X and Y, ... at most one Z ..."
+  // UC spans X and Y roles (the nouns in the "For each" clause)
   m = clean.match(TERNARY_UC)
   if (m) {
-    return [{ kind: 'UC', modality: 'Alethic', nouns: [m[1], m[2], m[3]] }]
+    return [{ kind: 'UC', modality: 'Alethic', nouns: [m[1], m[2], m[3]], constrainedNoun: m[1] }]
   }
 
   // "For each pair of X and Y, ... at most once"
+  // Spanning UC — both roles are constrained (the combination is unique)
   m = clean.match(SPANNING_UC)
   if (m) {
     return [{ kind: 'UC', modality: 'Alethic', nouns: [m[1], m[2]] }]
@@ -123,13 +134,13 @@ export function parseConstraintText(text: string): ParsedConstraint[] | null {
   // "No X [verb] itself"
   m = clean.match(RING_IRREFLEXIVE)
   if (m) {
-    return [{ kind: 'RC', modality: 'Alethic', nouns: [m[1]] }]
+    return [{ kind: 'RC', modality: 'Alethic', nouns: [m[1]], constrainedNoun: m[1] }]
   }
 
-  // "Each X has some Y" → MC (alternative mandatory phrasing)
+  // "Each X has some Y" → MC on X's role
   m = clean.match(HAS_SOME)
   if (m) {
-    return [{ kind: 'MC', modality: 'Alethic', nouns: [m[1], m[2]] }]
+    return [{ kind: 'MC', modality: 'Alethic', nouns: [m[1], m[2]], constrainedNoun: m[1] }]
   }
 
   // "... if and only if ..." → EQ (equality/biconditional)

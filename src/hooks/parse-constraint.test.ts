@@ -6,14 +6,14 @@ describe('parseConstraintText', () => {
     it('parses "Each X has at most one Y"', () => {
       const result = parseConstraintText('Each Customer has at most one Name.')
       expect(result).toEqual([
-        { kind: 'UC', modality: 'Alethic', nouns: ['Customer', 'Name'] },
+        { kind: 'UC', modality: 'Alethic', nouns: ['Customer', 'Name'], constrainedNoun: 'Customer' },
       ])
     })
 
     it('parses "Each X belongs to at most one Y"', () => {
       const result = parseConstraintText('Each Domain belongs to at most one Organization.')
       expect(result).toEqual([
-        { kind: 'UC', modality: 'Alethic', nouns: ['Domain', 'Organization'] },
+        { kind: 'UC', modality: 'Alethic', nouns: ['Domain', 'Organization'], constrainedNoun: 'Domain' },
       ])
     })
 
@@ -31,7 +31,7 @@ describe('parseConstraintText', () => {
         'For each combination of Plan and Interval, that Plan has at most one Price per that Interval.'
       )
       expect(result).toEqual([
-        { kind: 'UC', modality: 'Alethic', nouns: ['Plan', 'Interval', 'Price'] },
+        { kind: 'UC', modality: 'Alethic', nouns: ['Plan', 'Interval', 'Price'], constrainedNoun: 'Plan' },
       ])
     })
   })
@@ -40,7 +40,7 @@ describe('parseConstraintText', () => {
     it('parses "Each X has at least one Y"', () => {
       const result = parseConstraintText('Each Organization has at least one Name.')
       expect(result).toEqual([
-        { kind: 'MC', modality: 'Alethic', nouns: ['Organization', 'Name'] },
+        { kind: 'MC', modality: 'Alethic', nouns: ['Organization', 'Name'], constrainedNoun: 'Organization' },
       ])
     })
   })
@@ -49,8 +49,8 @@ describe('parseConstraintText', () => {
     it('parses "Each X has exactly one Y" into two constraints', () => {
       const result = parseConstraintText('Each Section has exactly one Position.')
       expect(result).toEqual([
-        { kind: 'UC', modality: 'Alethic', nouns: ['Section', 'Position'] },
-        { kind: 'MC', modality: 'Alethic', nouns: ['Section', 'Position'] },
+        { kind: 'UC', modality: 'Alethic', nouns: ['Section', 'Position'], constrainedNoun: 'Section' },
+        { kind: 'MC', modality: 'Alethic', nouns: ['Section', 'Position'], constrainedNoun: 'Section' },
       ])
     })
   })
@@ -59,7 +59,7 @@ describe('parseConstraintText', () => {
     it('parses "No X [verb] itself"', () => {
       const result = parseConstraintText('No Widget targets itself.')
       expect(result).toEqual([
-        { kind: 'RC', modality: 'Alethic', nouns: ['Widget'] },
+        { kind: 'RC', modality: 'Alethic', nouns: ['Widget'], constrainedNoun: 'Widget' },
       ])
     })
   })
@@ -70,7 +70,7 @@ describe('parseConstraintText', () => {
         'It is obligatory that each Customer has at least one Name.'
       )
       expect(result).toEqual([
-        { kind: 'MC', modality: 'Deontic', deonticOperator: 'obligatory', nouns: ['Customer', 'Name'] },
+        { kind: 'MC', modality: 'Deontic', deonticOperator: 'obligatory', nouns: ['Customer', 'Name'], constrainedNoun: 'Customer' },
       ])
     })
 
@@ -93,14 +93,14 @@ describe('parseConstraintText', () => {
     it('parses "Each X has some Y"', () => {
       const result = parseConstraintText('Each Message has some Lead.')
       expect(result).toEqual([
-        { kind: 'MC', modality: 'Alethic', nouns: ['Message', 'Lead'] },
+        { kind: 'MC', modality: 'Alethic', nouns: ['Message', 'Lead'], constrainedNoun: 'Message' },
       ])
     })
 
     it('parses "Each X belongs to some Y"', () => {
       const result = parseConstraintText('Each Lead belongs to some SalesRep.')
       expect(result).toEqual([
-        { kind: 'MC', modality: 'Alethic', nouns: ['Lead', 'SalesRep'] },
+        { kind: 'MC', modality: 'Alethic', nouns: ['Lead', 'SalesRep'], constrainedNoun: 'Lead' },
       ])
     })
   })
