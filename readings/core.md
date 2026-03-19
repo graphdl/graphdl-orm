@@ -79,6 +79,7 @@ schema:Thing(.Name) is an entity type.
 ## Value Types
 
 Arity is a value type.
+Position is a value type.
 Min Occurrence is a value type.
 Max Occurrence is a value type.
 Name is a value type.
@@ -121,6 +122,7 @@ Graph Schema has Arity.
 ### Role
 Constraint spans Role.
 Role is used in Reading.
+Role has Position for Reading.
 
 ### Verb
 Verb has Name.
@@ -229,6 +231,14 @@ Toolbar has Toolbar Item.
 
 ### Menu
 Menu has Menu Button.
+
+## Constraints
+
+For each combination of Role and Reading, that Role has at most one Position for that Reading.
+
+## Subset Constraints
+
+If some Role is used in some Reading where some Graph Schema has that Reading then that Graph Schema has that Role.
 
 ## Ring Constraints
 
