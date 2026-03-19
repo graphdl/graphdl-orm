@@ -1001,6 +1001,21 @@ export class GraphDLDB extends DurableObject {
           for (const row of pragma) tableColumns.add(row.name as string)
         } catch { /* table doesn't exist */ }
 
+        // Store reference if provided and column exists
+        if (reference) {
+          if (tableColumns.has('reference')) {
+            cols.push('reference')
+            vals.push(reference)
+          } else if (tableColumns.has('name')) {
+            cols.push('name')
+            vals.push(reference)
+          }
+        }
+        if (createdBy && tableColumns.has('created_by')) {
+          cols.push('created_by')
+          vals.push(createdBy)
+        }
+
         // Map fields to columns
         const nestedEntities: Array<{ nounName: string; fields: Record<string, any>; fkCol: string }> = []
         const childCreationResults: any[] = []
