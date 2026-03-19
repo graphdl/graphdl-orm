@@ -528,39 +528,44 @@ export async function ingestClaims(
           continue
         }
 
-        // Find the graph schema — local first, then org-shared, then public
-        let schema = schemaMap.get(reading)
-        if (!schema) {
-          const resolved = await resolveReadingAcrossDomains(db, reading, domainId)
-          if (resolved) {
-            schema = resolved.schema
-            schemaMap.set(reading, schema) // cache for subsequent facts
-          }
+        // Instance facts go to 3NF tables via createEntity.
+        // The entity is identified by entityValue (reference), and the
+        // value type field is set from the fact's value.
+        //
+        // Example: Status 'Received' has Display Color 'blue'
+        //   → createEntity(domain, 'Status', { displayColor: 'blue' }, 'Received')
+
+        const entityName = fact.entity || values[0]?.noun || ''
+        const entityRef = fact.entityValue || values[0]?.value || ''
+        const fieldValues: Record<string, string> = {}
+
+        // For binary facts: the second value is the field
+        if (values.length >= 2) {
+          // Convert value type name to camelCase field name
+          const fieldName = values[1].noun
+            .split(' ')
+            .map((w, i) => i === 0 ? w.toLowerCase() : w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+            .join('')
+          fieldValues[fieldName] = values[1].value
         }
-        if (!schema) {
-          result.errors.push(`fact: reading "${reading}" not found`)
+
+        if (!entityName) {
+          result.errors.push(`fact: no entity name`)
           continue
         }
 
-        // Build bindings — resolve nouns locally first, then across domains
-        const bindings: Array<{ nounId: string; value: string }> = []
-        for (const v of values) {
-          let noun = nounMap.get(v.noun)
-          if (!noun) {
-            noun = await resolveNounAcrossDomains(db, v.noun, domainId) || undefined
-            if (noun) nounMap.set(v.noun, noun) // cache
-          }
-          if (noun) {
-            bindings.push({ nounId: noun.id as string, value: v.value })
+        try {
+          await (db as any).createEntity(domainId, entityName, fieldValues, entityRef)
+        } catch (err: any) {
+          // Entity table may not exist yet — apply schema first
+          try {
+            await (db as any).applySchema(domainId)
+            await (db as any).createEntity(domainId, entityName, fieldValues, entityRef)
+          } catch (err2: any) {
+            result.errors.push(`fact "${entityName} '${entityRef}': ${err2.message}`)
+            continue
           }
         }
-
-        if (bindings.length < 2) {
-          result.errors.push(`fact: "${reading}" needs at least 2 bindings`)
-          continue
-        }
-
-        await (db as any).createFact(domainId, schema.id as string, bindings)
       } catch (err: any) {
         result.errors.push(`fact "${fact.reading || fact.entity}": ${err.message}`)
       }
