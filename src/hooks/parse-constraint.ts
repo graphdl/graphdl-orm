@@ -20,24 +20,25 @@ export interface ParsedConstraint {
   clauses?: string[]
 }
 
-// Match PascalCase noun names (e.g., "Customer", "SupportRequest", "APIKey")
-const NOUN = '([A-Z][a-zA-Z0-9]*)'
+// Match noun names — may be multi-word with spaces (e.g., "Support Request", "API Product")
+// Stops before lowercase stopwords (per, that, for, via, etc.) to avoid over-matching
+const NOUN = '([A-Z][a-zA-Z0-9]*(?:\\s+(?!per\\b|that\\b|for\\b|of\\b|the\\b|at\\b|in\\b|via\\b|to\\b|from\\b|by\\b|with\\b|on\\b|or\\b|and\\b|some\\b|each\\b|is\\b|has\\b|are\\b|was\\b|no\\b|not\\b|more\\b|most\\b)[A-Z][a-zA-Z0-9]*)*)'
 
 // "Each X has/belongs to at most one Y."
 const AT_MOST_ONE = new RegExp(
-  `^Each ${NOUN} (?:has|belongs to|is [a-z]+ (?:by|to|in|for|of)) at most one ${NOUN}`,
+  `^Each ${NOUN} (?:has|belongs to|is [a-z]+ (?:by|to|in|for|of|via)) at most one ${NOUN}`,
   'i'
 )
 
 // "Each X has exactly one Y."
 const EXACTLY_ONE = new RegExp(
-  `^Each ${NOUN} (?:has|belongs to|is [a-z]+ (?:by|to|in|for|of)) exactly one ${NOUN}`,
+  `^Each ${NOUN} (?:has|belongs to|is [a-z]+ (?:by|to|in|for|of|via)) exactly one ${NOUN}`,
   'i'
 )
 
-// "Each X has at least one Y."
+// "Each X has at least one Y." / "Each X has some Y."
 const AT_LEAST_ONE = new RegExp(
-  `^Each ${NOUN} (?:has|belongs to|is [a-z]+ (?:by|to|in|for|of)) at least one ${NOUN}`,
+  `^Each ${NOUN} (?:has|belongs to|is [a-z]+ (?:by|to|in|for|of|via)) at least one ${NOUN}`,
   'i'
 )
 
@@ -59,9 +60,9 @@ const RING_IRREFLEXIVE = new RegExp(
   'i'
 )
 
-// "Each X has some Y." → MC (mandatory, alternative phrasing)
+// "Each X has some Y." → MC (mandatory)
 const HAS_SOME = new RegExp(
-  `^Each ${NOUN} (?:has|belongs to) some ${NOUN}`,
+  `^Each ${NOUN} (?:has|belongs to|authenticates via|provides|supports) some ${NOUN}`,
   'i'
 )
 
@@ -133,7 +134,9 @@ export function parseConstraintText(text: string): ParsedConstraint[] | null {
 
   // "... if and only if ..." → EQ (equality/biconditional)
   if (IF_AND_ONLY_IF.test(clean)) {
-    const allNouns = [...new Set(clean.match(/[A-Z][a-zA-Z0-9]*/g) || [])]
+    // Extract multi-word noun names by finding sequences of capitalized words
+    const allNouns = [...new Set(clean.match(/[A-Z][a-zA-Z0-9]*(?:\s+[A-Z][a-zA-Z0-9]*)*/g) || [])]
+      .filter(n => !['Each', 'For', 'The', 'That', 'Some', 'If', 'No', 'It', 'And', 'Or'].includes(n))
     return [{ kind: 'EQ', modality: 'Alethic', nouns: allNouns }]
   }
 

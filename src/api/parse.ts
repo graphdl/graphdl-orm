@@ -36,39 +36,42 @@ function detectSection(line: string): Section | null {
 }
 
 // ── Line-level patterns ───────────────────────────────────────────────
+// Noun names may be multi-word with spaces (e.g., "Support Request", "API Product").
+// Stops before lowercase stopwords to avoid over-matching into predicates.
+const N = '(?:[A-Z][a-zA-Z0-9]*(?:\\s+(?!per\\b|that\\b|for\\b|of\\b|the\\b|at\\b|in\\b|via\\b|to\\b|from\\b|by\\b|with\\b|on\\b|or\\b|and\\b|some\\b|each\\b|is\\b|has\\b|are\\b|was\\b|no\\b|not\\b|more\\b|most\\b)[A-Z][a-zA-Z0-9]*)*)'
 
-// Entity type: "EntityName(.RefScheme) is an entity type."
-const ENTITY_TYPE = /^([A-Z][a-zA-Z0-9]*)(?:\(\.([A-Z][a-zA-Z0-9]*)\))?\s+is an entity type\.?$/i
+// Entity type: "Support Request(.Request Id) is an entity type."
+const ENTITY_TYPE = new RegExp(`^(${N})(?:\\(\\.?(${N})\\))?\\s+is an entity type\\.?$`, 'i')
 
-// Value type: "ValueName is a value type."
-const VALUE_TYPE = /^([A-Z][a-zA-Z0-9]*)\s+is a value type\.?$/i
+// Value type: "Request Id is a value type."
+const VALUE_TYPE = new RegExp(`^(${N})\\s+is a value type\\.?$`, 'i')
 
-// Enum values: "The possible values of X are 'a', 'b', 'c'."
-const ENUM_VALUES = /^The possible values of ([A-Z][a-zA-Z0-9]*) are (.+)\.?$/i
+// Enum values: "The possible values of Plan Tier are 'a', 'b', 'c'."
+const ENUM_VALUES = new RegExp(`^The possible values of (${N}) are (.+)\\.?$`, 'i')
 
-// Subtype: "Child is a subtype of Parent."
-const SUBTYPE = /^([A-Z][a-zA-Z0-9]*)\s+is a subtype of\s+([A-Z][a-zA-Z0-9]*)\.?$/i
+// Subtype: "Support Request is a subtype of Request."
+const SUBTYPE = new RegExp(`^(${N})\\s+is a subtype of\\s+(${N})\\.?$`, 'i')
 
 // Partition: "Parent is partitioned into Child1, Child2."
-const PARTITION = /^([A-Z][a-zA-Z0-9]*)\s+is partitioned into\s+(.+)\.?$/i
+const PARTITION = new RegExp(`^(${N})\\s+is partitioned into\\s+(.+)\\.?$`, 'i')
 
-// Subtype exclusion: "No Parent is both a Child1 and a Child2."
-const SUBTYPE_EXCLUSION = /^No ([A-Z][a-zA-Z0-9]*) is both (?:a |an )?([A-Z][a-zA-Z0-9]*) and (?:a |an )?([A-Z][a-zA-Z0-9]*)\.?$/i
+// Subtype exclusion: "No Request is both a Support Request and a Feature Request."
+const SUBTYPE_EXCLUSION = new RegExp(`^No (${N}) is both (?:a |an )?(${N}) and (?:a |an )?(${N})\\.?$`, 'i')
 
-// Subtype totality: "Each Parent is a Child1 or a Child2."
-const SUBTYPE_TOTALITY = /^Each ([A-Z][a-zA-Z0-9]*) is (?:a |an )?([A-Z][a-zA-Z0-9]*) or (?:a |an )?([A-Z][a-zA-Z0-9]*)\.?$/i
+// Subtype totality: "Each Person is a Male or a Female."
+const SUBTYPE_TOTALITY = new RegExp(`^Each (${N}) is (?:a |an )?(${N}) or (?:a |an )?(${N})\\.?$`, 'i')
 
 // Derivation rule: "X has Y := expression."
 const DERIVATION = /^(.+?)\s*:=\s*(.+?)\.?$/
 
-// Instance fact: EntityName 'value' has ValueType 'value'.
-const INSTANCE_FACT = /^([A-Z][a-zA-Z0-9]*)\s+'([^']+)'\s+has\s+([A-Z][a-zA-Z0-9]*)\s+'([^']+)'\.?$/
+// Instance fact: Entity 'value' has Value Type 'value'.
+const INSTANCE_FACT = new RegExp(`^(${N})\\s+'([^']+)'\\s+has\\s+(${N})\\s+'([^']+)'\\.?$`)
 
-// Instance fact (verb): Verb 'name' runs Function 'name'. / Function 'name' has FunctionType 'type'.
-const INSTANCE_FACT_VERB = /^([A-Z][a-zA-Z0-9]*)\s+'([^']+)'\s+(\w+(?:\s+\w+)*)\s+([A-Z][a-zA-Z0-9]*)\s+'([^']+)'\.?$/
+// Instance fact (verb): Verb 'name' runs Function 'name'.
+const INSTANCE_FACT_VERB = new RegExp(`^(${N})\\s+'([^']+)'\\s+(\\w+(?:\\s+\\w+)*)\\s+(${N})\\s+'([^']+)'\\.?$`)
 
-// Instance fact (simple assignment): EntityName 'name' has ValueType 'value'.
-const INSTANCE_FACT_SIMPLE = /^([A-Z][a-zA-Z0-9]*)\s+(?:has\s+)?([A-Z][a-zA-Z0-9]*)\s+'([^']+)'\.?$/
+// Instance fact (simple assignment): Entity has Value Type 'value'. / Entity 'ref' has Value Type number.
+const INSTANCE_FACT_SIMPLE = new RegExp(`^(${N})\\s+(?:has\\s+)?(${N})\\s+'([^']+)'\\.?$`)
 
 // Markdown subsection header (### EntityName) — sets fact type grouping context
 const SUBSECTION = /^###\s+(.+)/
@@ -350,7 +353,21 @@ export function parseFORML2(
     const tokenized = tokenizeReading(cleanLine, currentNouns)
     let nounNames = tokenized.nounRefs.map(r => r.name)
 
-    // PascalCase fallback if tokenization found fewer than 2 nouns
+    // Known-noun fallback: try matching known noun names from the map
+    if (nounNames.length < 2) {
+      const knownNames = [...nounMap.keys()].sort((a, b) => b.length - a.length)
+      const found: string[] = []
+      let remaining = cleanLine
+      for (const name of knownNames) {
+        if (remaining.includes(name)) {
+          found.push(name)
+          remaining = remaining.replace(name, '\0')
+        }
+      }
+      if (found.length >= 2) nounNames = found
+    }
+
+    // PascalCase fallback if still fewer than 2 nouns
     if (nounNames.length < 2) {
       const pascalWords = cleanLine.match(/[A-Z][a-zA-Z0-9]*/g) || []
       if (pascalWords.length >= 2) nounNames = pascalWords
