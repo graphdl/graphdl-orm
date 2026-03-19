@@ -5,6 +5,7 @@ import { COLLECTION_TABLE_MAP, FIELD_MAP, FK_TARGET_TABLE, REVERSE_FK_MAP } from
 import { handleSeed } from './seed'
 import { handleGenerate } from './generate'
 import { handleParse } from './parse'
+import { handleParseOrm } from './parse-orm'
 import { handleVerify } from './verify'
 import { handleEvaluate } from './evaluate'
 import { createWithHook, refreshNouns, type HookContext, COLLECTION_HOOKS } from '../hooks'
@@ -472,6 +473,7 @@ router.delete('/api/domains/:domainId/metamodel', async (request, env: Env) => {
 
 // ── Parse / Verify ──────────────────────────────────────────────────
 router.all('/parse', handleParse)
+router.all('/parse/orm', handleParseOrm)
 router.all('/verify', handleVerify)
 
 // ── State Machine RPC ────────────────────────────────────────────────
