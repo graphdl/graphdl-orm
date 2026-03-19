@@ -37,6 +37,14 @@ function mockDb() {
       if (doc) Object.assign(doc, updates)
       return doc
     }),
+    createEntity: vi.fn(async (domainId: string, nounName: string, fields: any, reference?: string) => {
+      const doc = { id: `entity-${++idCounter}`, domain: domainId, noun: nounName, reference, ...fields }
+      const key = `entities_${nounName}`
+      if (!store[key]) store[key] = []
+      store[key].push(doc)
+      return doc
+    }),
+    applySchema: vi.fn(async () => ({ tableMap: {}, fieldMap: {} })),
   }
 }
 
@@ -213,10 +221,9 @@ describe('ingestClaims', () => {
 
     const result = await ingestClaims(db as any, { claims, domainId: 'd1' })
 
-    // Should report error, not crash
-    expect(result.errors.length).toBeGreaterThan(0)
-    expect(result.errors[0]).toContain('reading')
-    expect(result.errors[0]).toContain('not found')
+    // Facts now go through createEntity — no reading lookup needed
+    // The entity should have been created even without a matching reading
+    expect(db.createEntity).toHaveBeenCalled()
   })
 
   it('instance facts succeed when reading was created in same batch', async () => {
