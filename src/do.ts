@@ -223,6 +223,7 @@ export class GraphDLDB extends DurableObject {
       'ALTER TABLE functions ADD COLUMN headers TEXT',
       'ALTER TABLE domains ADD COLUMN app_id TEXT',
       'CREATE INDEX IF NOT EXISTS idx_domains_app ON domains(app_id)',
+      'ALTER TABLE domains ADD COLUMN label TEXT',
       // events table: add domain_id and updated_at
       'ALTER TABLE events ADD COLUMN domain_id TEXT',
       'ALTER TABLE events ADD COLUMN updated_at TEXT',

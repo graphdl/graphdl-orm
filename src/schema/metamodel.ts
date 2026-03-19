@@ -58,6 +58,7 @@ export const METAMODEL_DDL: string[] = [
     name TEXT,
     app_id TEXT REFERENCES apps(id),
     organization_id TEXT REFERENCES organizations(id),
+    label TEXT,
     visibility TEXT NOT NULL DEFAULT 'private' CHECK (visibility IN ('private', 'public')),
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),

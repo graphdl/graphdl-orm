@@ -15,6 +15,7 @@
 | AppSlug | string | unique |
 | OrgRole | string | enum: owner, admin, member |
 | Visibility | string | enum: private, public |
+| Label | string | |
 | ChatEndpoint | string | |
 | AppType | string | enum: standard, chat |
 
@@ -55,6 +56,9 @@ Domain belongs to App.
 
 Domain belongs to Organization.
   Each Domain belongs to at most one Organization.
+
+Domain has Label.
+  Each Domain has at most one Label.
 
 Domain has Visibility.
   Each Domain has exactly one Visibility.
