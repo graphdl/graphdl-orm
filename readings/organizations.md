@@ -4,11 +4,15 @@
 
 Organization(.Org Slug) is an entity type.
 App(.App Slug) is an entity type.
+Domain(.Domain Slug) is an entity type.
+User(.Email) is an entity type.
 
 ## Value Types
 
 Org Slug is a value type.
 App Slug is a value type.
+Domain Slug is a value type.
+Email is a value type.
 Org Role is a value type.
   The possible values of Org Role are 'owner', 'admin', 'member'.
 Visibility is a value type.
@@ -50,6 +54,9 @@ App belongs to Organization.
 
 ### Domain
 
+Domain has Name.
+  Each Domain has at most one Name.
+
 Domain belongs to App.
   Each Domain belongs to at most one App.
 
@@ -64,9 +71,13 @@ Domain has Visibility.
 
 ## Constraints
 
-Deleting the owner User of an Organization deletes the Organization.
+It is obligatory that when the owner User of an Organization is deleted, that Organization is also deleted.
 
 ## Derivation Rules
 
 User can access Domain where User has Org Role in Organization and Domain belongs to that Organization.
 Any User can access Domain where Domain has Visibility 'public'.
+Domain is visible to Domain := that Domain is the same Domain.
+Domain is visible to Domain := Domain has Visibility 'public'.
+Domain is visible to Domain := Domain belongs to App and that Domain belongs to the same App.
+Domain is visible to Domain := Domain belongs to Organization and that Domain belongs to the same Organization.

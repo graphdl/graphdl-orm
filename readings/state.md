@@ -7,21 +7,24 @@ Status(.Name within State Machine Definition) is an entity type.
 Transition(within State Machine Definition) is an entity type.
 Guard(.Name within Transition) is an entity type.
 
+Event Type(.id) is an entity type.
+Stream(.id) is an entity type.
+
+## Value Types
+
+Title is a value type.
+
 ## Readings
 
 ### State Machine Definition
 State Machine Definition belongs to Domain.
   Each State Machine Definition belongs to exactly one Domain.
-State Machine Definition has Title.
-  Each State Machine Definition has exactly one Title.
 State Machine Definition is for Noun.
   Each State Machine Definition is for exactly one Noun.
 
 ### Status
 Status belongs to State Machine Definition.
   Each Status belongs to exactly one State Machine Definition.
-Status has Name.
-  Each Status has exactly one Name.
 Verb is performed in Status.
   Each Verb is performed in at most one Status.
 
@@ -36,9 +39,13 @@ Verb is performed during Transition.
   Each Verb is performed during at most one Transition.
 
 ### Guard
-Guard has Name.
-  Each Guard has exactly one Name.
 Guard references Graph Schema.
-  Each Guard references at most one Graph Schema.
+  It is possible that some Guard references more than one Graph Schema and that for some Graph Schema, more than one Guard references that Graph Schema.
+  For each combination of Guard and Graph Schema, that Guard references that Graph Schema at most once.
 Guard prevents Transition.
-  Each Guard prevents exactly one Transition.
+  Each Guard prevents at most one Transition.
+  It is possible that more than one Guard prevents the same Transition.
+
+### State Machine Definition
+For each State Machine Definition, some Status belongs to that State Machine Definition.
+For each Noun, at most one State Machine Definition is for that Noun.
