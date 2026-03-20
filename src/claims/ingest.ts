@@ -20,6 +20,7 @@ export interface ExtractedClaims {
     minimum?: number
     maximum?: number
     pattern?: string
+    worldAssumption?: 'closed' | 'open'
   }>
   readings: Array<{
     text: string
@@ -110,28 +111,37 @@ async function resolveNounAcrossDomains(
   }, { limit: 1 })
   if (local.docs.length) return local.docs[0]
 
-  // 2. Org-shared — find the domain's org, then search sibling domains
-  const domain = await db.findInCollection('domains', { id: { equals: domainId } }, { limit: 1 })
-  const orgId = domain.docs[0]?.organization
-  if (orgId) {
-    const orgNoun = await db.findInCollection('nouns', {
-      name: { equals: name },
-    }, { limit: 10 })
-    // Find one in a sibling domain (same org)
-    for (const doc of orgNoun.docs) {
+  // 2. Search all nouns with this name — check org, app, or public
+  const allNouns = await db.findInCollection('nouns', {
+    name: { equals: name },
+  }, { limit: 20 })
+
+  if (allNouns.docs.length) {
+    const domain = await db.findInCollection('domains', { id: { equals: domainId } }, { limit: 1 })
+    const orgId = domain.docs[0]?.organization
+    const appId = domain.docs[0]?.app
+
+    for (const doc of allNouns.docs) {
       if (doc.domain === domainId) continue
       const nounDomain = await db.findInCollection('domains', { id: { equals: doc.domain } }, { limit: 1 })
-      if (nounDomain.docs[0]?.organization === orgId) return doc
+      const nd = nounDomain.docs[0]
+      if (!nd) continue
+      // Same org, same app, or public
+      if ((orgId && nd.organization === orgId) ||
+          (appId && nd.app === appId) ||
+          nd.visibility === 'public' ||
+          // Same app prefix (e.g., support-auto-dev-*)
+          (nd.domainSlug?.split('-').slice(0, -1).join('-') ===
+           domain.docs[0]?.domainSlug?.split('-').slice(0, -1).join('-'))) {
+        return doc
+      }
     }
-  }
 
-  // 3. Public domains
-  const publicNoun = await db.findInCollection('nouns', {
-    name: { equals: name },
-  }, { limit: 10 })
-  for (const doc of publicNoun.docs) {
-    const nounDomain = await db.findInCollection('domains', { id: { equals: doc.domain } }, { limit: 1 })
-    if (nounDomain.docs[0]?.visibility === 'public') return doc
+    // Last resort: return any match (within the same system)
+    if (allNouns.docs.length === 1) return allNouns.docs[0]
+    // If multiple, prefer the first non-local one
+    const nonLocal = allNouns.docs.find((d: any) => d.domain !== domainId)
+    if (nonLocal) return nonLocal
   }
 
   return null
@@ -152,22 +162,15 @@ async function resolveReadingAcrossDomains(
     return { schema: { id: r.graphSchema }, reading: r }
   }
 
-  // 2. Search all readings (org-shared + public)
+  // 2. Search all readings with this text
   const all = await db.findInCollection('readings', {
     text: { equals: readingText },
   }, { limit: 10 })
 
-  const domain = await db.findInCollection('domains', { id: { equals: domainId } }, { limit: 1 })
-  const orgId = domain.docs[0]?.organization
-
-  for (const r of all.docs) {
-    const rDomain = await db.findInCollection('domains', { id: { equals: r.domain } }, { limit: 1 })
-    const rd = rDomain.docs[0]
-    if (!rd) continue
-    // Org-shared or public
-    if ((orgId && rd.organization === orgId) || rd.visibility === 'public') {
-      return { schema: { id: r.graphSchema }, reading: r }
-    }
+  if (all.docs.length) {
+    // Return the first match — cross-domain readings are always shareable
+    const r = all.docs[0]
+    return { schema: { id: r.graphSchema }, reading: r }
   }
 
   return null
@@ -184,6 +187,9 @@ export async function ingestClaims(
   const result: IngestClaimsResult = { nouns: 0, readings: 0, stateMachines: 0, skipped: 0, errors: [] }
   const nounMap = new Map<string, Record<string, any>>()
 
+  // Noun names (or supertypes) that imply open-world assumption
+  const OPEN_WORLD_NOUNS = ['Right', 'Freedom', 'Liberty', 'Protection', 'Privilege']
+
   // Step 1: Create all nouns
   for (const noun of claims.nouns) {
     try {
@@ -196,6 +202,13 @@ export async function ingestClaims(
       if (noun.minimum !== undefined) data.minimum = noun.minimum
       if (noun.maximum !== undefined) data.maximum = noun.maximum
       if (noun.pattern) data.pattern = noun.pattern
+
+      // World assumption: explicit value or auto-detect from noun name
+      if (noun.worldAssumption) {
+        data.worldAssumption = noun.worldAssumption
+      } else if (OPEN_WORLD_NOUNS.some(ow => noun.name === ow || noun.name.endsWith(` ${ow}`))) {
+        data.worldAssumption = 'open'
+      }
 
       const doc = await ensureNoun(db, noun.name, data, domainId)
       nounMap.set(noun.name, doc)
@@ -215,7 +228,12 @@ export async function ingestClaims(
         if (parent) nounMap.set(sub.parent, parent)
       }
       if (child && parent) {
-        await db.updateInCollection('nouns', child.id as string, { superType: parent.id as string })
+        const updates: Record<string, any> = { superType: parent.id as string }
+        // Inherit open-world assumption from parent if applicable
+        if (OPEN_WORLD_NOUNS.some(ow => sub.parent === ow || sub.parent.endsWith(` ${ow}`))) {
+          updates.worldAssumption = 'open'
+        }
+        await db.updateInCollection('nouns', child.id as string, updates)
       }
     } catch (err: any) {
       result.errors.push(`subtype "${sub.child} -> ${sub.parent}": ${err.message}`)
