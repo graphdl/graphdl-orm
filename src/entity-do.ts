@@ -6,6 +6,8 @@
  * unit tested without the Cloudflare runtime.
  */
 
+import { DurableObject } from 'cloudflare:workers'
+
 export interface EntityData {
   id: string
   type: string
@@ -197,4 +199,47 @@ export function getEvents(sql: SqlLike, since?: string): EventRecord[] {
     data: row.data ?? null,
     prev: row.prev ?? null,
   }))
+}
+
+// =========================================================================
+// Durable Object class
+// =========================================================================
+
+export class EntityDB extends DurableObject {
+  private initialized = false
+
+  private ensureInit(): void {
+    if (this.initialized) return
+    initEntitySchema(this.ctx.storage.sql)
+    this.initialized = true
+  }
+
+  async get(): Promise<ReturnType<typeof getEntity>> {
+    this.ensureInit()
+    return getEntity(this.ctx.storage.sql)
+  }
+
+  async put(input: EntityData): Promise<{ id: string; version: number }> {
+    this.ensureInit()
+    const existing = getEntity(this.ctx.storage.sql)
+    if (existing) {
+      return updateEntity(this.ctx.storage.sql, input.data as Record<string, unknown>)!
+    }
+    return createEntity(this.ctx.storage.sql, input)
+  }
+
+  async patch(fields: Record<string, unknown>): Promise<{ id: string; version: number } | null> {
+    this.ensureInit()
+    return updateEntity(this.ctx.storage.sql, fields)
+  }
+
+  async delete(): Promise<{ id: string; deleted: boolean } | null> {
+    this.ensureInit()
+    return deleteEntity(this.ctx.storage.sql)
+  }
+
+  async events(since?: string): Promise<EventRecord[]> {
+    this.ensureInit()
+    return getEvents(this.ctx.storage.sql, since)
+  }
 }
