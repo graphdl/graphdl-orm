@@ -2,6 +2,7 @@ import { GraphDLDB } from './do'
 import { router } from './api/router'
 
 export { GraphDLDB }
+export { EntityDB } from './entity-do'
 
 export default {
   fetch: router.fetch,

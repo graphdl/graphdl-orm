@@ -15,8 +15,27 @@ function wasmStubPlugin(): Plugin {
   }
 }
 
+// Stub `cloudflare:workers` so modules importing DurableObject can be loaded
+// in Vitest without the Cloudflare runtime.
+function cloudflareStubPlugin(): Plugin {
+  return {
+    name: 'cloudflare-stub',
+    enforce: 'pre',
+    resolveId(id) {
+      if (id === 'cloudflare:workers') {
+        return '\0cloudflare:workers'
+      }
+    },
+    load(id) {
+      if (id === '\0cloudflare:workers') {
+        return 'export class DurableObject {}'
+      }
+    },
+  }
+}
+
 export default defineConfig({
-  plugins: [wasmStubPlugin()],
+  plugins: [wasmStubPlugin(), cloudflareStubPlugin()],
   test: {
     globals: true,
     include: ['src/**/*.test.ts', 'tests/**/*.test.ts', 'scripts/**/*.test.ts'],
