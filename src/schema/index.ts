@@ -1,17 +1,8 @@
-export { METAMODEL_DDL } from './metamodel'
-export { STATE_DDL } from './state'
-export { AGENT_DDL } from './agents'
-export { INSTANCE_DDL } from './instances'
+export { BOOTSTRAP_DDL } from './bootstrap'
 
-import { METAMODEL_DDL } from './metamodel'
-import { STATE_DDL } from './state'
-import { AGENT_DDL } from './agents'
-import { INSTANCE_DDL } from './instances'
+import { BOOTSTRAP_DDL } from './bootstrap'
 
-/** All DDL statements in dependency order. */
+/** All DDL statements in dependency order (generated from readings/*.md). */
 export const ALL_DDL: string[] = [
-  ...METAMODEL_DDL,
-  ...STATE_DDL,
-  ...AGENT_DDL,
-  ...INSTANCE_DDL,
+  ...BOOTSTRAP_DDL,
 ]

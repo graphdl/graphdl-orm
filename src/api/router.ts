@@ -7,7 +7,7 @@ import { handleGenerate } from './generate'
 import { handleParse } from './parse'
 import { handleParseOrm } from './parse-orm'
 import { handleVerify } from './verify'
-import { handleEvaluate } from './evaluate'
+import { handleEvaluate, handleSynthesize } from './evaluate'
 import { createWithHook, refreshNouns, type HookContext, COLLECTION_HOOKS } from '../hooks'
 
 /**
@@ -137,6 +137,7 @@ router.get('/ws', async (request, env: Env) => {
 // ── Generate ────────────────────────────────────────────────────────
 router.post('/api/generate', handleGenerate)
 router.post('/api/evaluate', handleEvaluate)
+router.post('/api/synthesize', (request, env) => handleSynthesize(request, env))
 
 // ── Facts (instance-level graph creation) ────────────────────────────
 router.post('/api/facts', async (request, env: Env) => {

@@ -202,6 +202,7 @@ export class DomainModel {
         minimum: row.minimum ?? undefined,
         maximum: row.maximum ?? undefined,
         superType: row.super_type_name ?? undefined,
+        worldAssumption: row.world_assumption ?? undefined,
       }
       map.set(noun.name, noun)
     }

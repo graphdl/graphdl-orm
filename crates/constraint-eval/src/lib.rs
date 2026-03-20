@@ -1,8 +1,10 @@
 // crates/constraint-eval/src/lib.rs
 //
-// WASM interface. Two exports:
-//   load_ir    — parse JSON IR, compile into predicates (once)
-//   evaluate_response — apply compiled predicates to response + population (per request)
+// WASM interface. Exports:
+//   load_ir            — parse JSON IR, compile into predicates (once)
+//   evaluate_response  — apply compiled predicates to response + population (per request)
+//   synthesize_noun    — collect all knowledge about a noun from the compiled model
+//   forward_chain      — apply derivation rules to population until fixed point
 
 mod types;
 mod compile;
@@ -12,7 +14,7 @@ use wasm_bindgen::prelude::*;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 
-use types::{ConstraintIR, ResponseContext, Population, Violation};
+use types::{ConstraintIR, ResponseContext, Population, Violation, SynthesisResult};
 use compile::{CompiledModel, EvalContext};
 
 struct CompiledState {
@@ -75,4 +77,39 @@ pub fn evaluate_response(response_json: &str, population_json: &str) -> String {
 
     let violations = evaluate::evaluate(&state.model, &ctx);
     serde_json::to_string(&violations).unwrap()
+}
+
+#[wasm_bindgen]
+pub fn synthesize_noun(noun_name: &str, depth: usize) -> String {
+    let store = state_store().lock().unwrap();
+    let state = match store.as_ref() {
+        Some(s) => s,
+        None => return serde_json::to_string(&SynthesisResult::empty(noun_name)).unwrap(),
+    };
+
+    let result = evaluate::synthesize(&state.model, &state.ir, noun_name, depth);
+    serde_json::to_string(&result).unwrap()
+}
+
+#[wasm_bindgen]
+pub fn forward_chain_population(population_json: &str) -> String {
+    let store = state_store().lock().unwrap();
+    let state = match store.as_ref() {
+        Some(s) => s,
+        None => return "[]".to_string(),
+    };
+
+    let mut population: Population = match serde_json::from_str(population_json) {
+        Ok(p) => p,
+        Err(e) => return format!("{{\"error\":\"{}\"}}", e),
+    };
+
+    let response = ResponseContext {
+        text: String::new(),
+        sender_identity: None,
+        fields: None,
+    };
+
+    let derived = evaluate::forward_chain(&state.model, &response, &mut population);
+    serde_json::to_string(&derived).unwrap()
 }

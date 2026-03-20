@@ -5,6 +5,8 @@ export type ConstraintKind =
   | 'VC'
   | 'RC'
 
+export type WorldAssumption = 'closed' | 'open'
+
 export interface NounDef {
   id: string
   name: string
@@ -26,6 +28,7 @@ export interface NounDef {
   superType?: NounDef | string
   referenceScheme?: NounDef[]
   permissions?: string[]
+  worldAssumption?: WorldAssumption
 }
 
 export interface FactTypeDef {

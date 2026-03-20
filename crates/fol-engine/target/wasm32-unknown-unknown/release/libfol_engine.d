@@ -1,0 +1,1 @@
+C:\Users\lippe\Repos\graphdl-orm\crates\fol-engine\target\wasm32-unknown-unknown\release\libfol_engine.rlib: C:\Users\lippe\Repos\graphdl-orm\crates\fol-engine\src\compile.rs C:\Users\lippe\Repos\graphdl-orm\crates\fol-engine\src\evaluate.rs C:\Users\lippe\Repos\graphdl-orm\crates\fol-engine\src\lib.rs C:\Users\lippe\Repos\graphdl-orm\crates\fol-engine\src\types.rs
