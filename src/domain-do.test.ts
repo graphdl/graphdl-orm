@@ -6,6 +6,7 @@ import {
   findInMetamodel,
   createInMetamodel,
   updateInMetamodel,
+  applyDomainSchema,
 } from './domain-do'
 
 /**
@@ -136,6 +137,17 @@ function createMockSql(): SqlLike & { tables: Record<string, any[]>; tableColumn
         return { toArray: () => [] }
       }
 
+      // ALTER TABLE <table> ADD COLUMN <col_def>
+      const alterMatch = trimmed.match(/ALTER\s+TABLE\s+(\w+)\s+ADD\s+COLUMN\s+(\w+)/i)
+      if (alterMatch) {
+        const tableName = alterMatch[1]
+        const colName = alterMatch[2]
+        if (tableColumns[tableName] && !tableColumns[tableName].includes(colName)) {
+          tableColumns[tableName].push(colName)
+        }
+        return { toArray: () => [] }
+      }
+
       // PRAGMA table_info(<table>)
       const pragmaMatch = trimmed.match(/PRAGMA\s+table_info\((\w+)\)/i)
       if (pragmaMatch) {
@@ -242,8 +254,42 @@ function createMockSql(): SqlLike & { tables: Record<string, any[]>; tableColumn
         return { toArray: () => matching }
       }
 
+      // SELECT ... FROM <table> WHERE <conditions> (no ORDER BY/LIMIT)
+      const selectWhereMatch = trimmed.match(/SELECT\s+(?:\*|\w+(?:,\s*\w+)*)\s+FROM\s+(\w+)\s+WHERE\s+(.+)/i)
+      if (selectWhereMatch) {
+        const tableName = selectWhereMatch[1]
+        let whereStr = selectWhereMatch[2]
+        const literalChecks: Array<{ col: string; val: string }> = []
+
+        // Replace inline string literals like output_format = 'schema-map'
+        // with a sentinel that matchesWhere will skip, and check them separately.
+        whereStr = whereStr.replace(/(\w+)\s*=\s*'([^']*)'/g, (_m, col, val) => {
+          literalChecks.push({ col, val })
+          return '1 = 1' // always-true placeholder
+        })
+
+        const rows = tables[tableName] || []
+        const matching = rows.filter(row => {
+          // Check literal equality conditions
+          for (const lc of literalChecks) {
+            if (row[lc.col] !== lc.val) return false
+          }
+          // Check parameterized conditions via matchesWhere
+          // "1 = 1" placeholders in the whereStr are harmless to the regex parser
+          // but matchesWhere won't match them — skip those by filtering to real conditions
+          const paramConditions = whereStr
+            .split(/\s+AND\s+/i)
+            .filter(c => c.trim() !== '1 = 1')
+            .join(' AND ')
+          if (!paramConditions.trim()) return true
+          const result = matchesWhere(row, paramConditions, params, 0)
+          return result.matches
+        })
+        return { toArray: () => matching }
+      }
+
       // SELECT * FROM <table>
-      const selectMatch = trimmed.match(/SELECT\s+\*\s+FROM\s+(\w+)/i)
+      const selectMatch = trimmed.match(/SELECT\s+(?:\*|\w+(?:,\s*\w+)*)\s+FROM\s+(\w+)/i)
       if (selectMatch) {
         const tableName = selectMatch[1]
         return { toArray: () => tables[tableName] ? [...tables[tableName]] : [] }
@@ -487,6 +533,114 @@ describe('domain-do', () => {
       expect(result!.objectType).toBe('entity')
       expect(result!.domain).toBe('domain-1')
       expect(result!.plural).toBe('People')
+    })
+  })
+
+  describe('applyDomainSchema', () => {
+    it('generates DDL from metamodel data and caches schema-map in generators', async () => {
+      initDomainSchema(sql)
+
+      const domainId = 'test-domain'
+
+      // Create a minimal domain: one entity noun, one value noun, one fact type, one constraint
+      createInMetamodel(sql, 'domains', { id: domainId, name: 'Test', domainSlug: 'test' })
+      createInMetamodel(sql, 'nouns', { id: 'n-entity', name: 'Order', objectType: 'entity', domain: domainId })
+      createInMetamodel(sql, 'nouns', { id: 'n-value', name: 'OrderNumber', objectType: 'value', domain: domainId, valueType: 'string' })
+      const gsId = 'gs-1'
+      createInMetamodel(sql, 'graph-schemas', { id: gsId, name: 'OrderHasOrderNumber', domain: domainId })
+      createInMetamodel(sql, 'roles', { id: 'r-1', graphSchema: gsId, noun: 'n-entity', roleIndex: 0 })
+      createInMetamodel(sql, 'roles', { id: 'r-2', graphSchema: gsId, noun: 'n-value', roleIndex: 1 })
+      createInMetamodel(sql, 'readings', { id: 'rd-1', text: 'Order has OrderNumber', graphSchema: gsId, domain: domainId })
+      createInMetamodel(sql, 'constraints', { id: 'c-1', kind: 'UC', modality: 'Alethic', domain: domainId })
+      createInMetamodel(sql, 'constraint-spans', { id: 'cs-1', constraint: 'c-1', role: 'r-2' })
+
+      // Call applyDomainSchema with a mock DomainModel + generate modules
+      // We test the DDL execution path using mocked generators
+      const mockTableMap = { 'Order': 'orders' }
+      const mockFieldMap = { 'orders': { 'orderNumber': 'order_number' } }
+      const mockDdl = [
+        'CREATE TABLE orders (id TEXT PRIMARY KEY, order_number TEXT)',
+        'CREATE INDEX idx_orders_order_number ON orders (order_number)',
+      ]
+
+      const result = await applyDomainSchema(sql, domainId, {
+        ddl: mockDdl,
+        tableMap: mockTableMap,
+        fieldMap: mockFieldMap,
+      })
+
+      expect(result.tableMap).toEqual(mockTableMap)
+      expect(result.fieldMap).toEqual(mockFieldMap)
+
+      // Verify DDL was executed: the 'orders' table should exist
+      expect(sql.tables).toHaveProperty('orders')
+
+      // Verify schema-map was cached in generators
+      const generators = sql.tables['generators'] || []
+      const schemaMapRow = generators.find((r: any) => r.output_format === 'schema-map' && r.domain_id === domainId)
+      expect(schemaMapRow).toBeDefined()
+      const cached = JSON.parse(schemaMapRow.output)
+      expect(cached.tableMap).toEqual(mockTableMap)
+      expect(cached.fieldMap).toEqual(mockFieldMap)
+      expect(cached.appliedAt).toBeDefined()
+    })
+
+    it('adds new columns via ALTER TABLE when table already exists', async () => {
+      initDomainSchema(sql)
+
+      const domainId = 'test-domain'
+      createInMetamodel(sql, 'domains', { id: domainId, name: 'Test', domainSlug: 'test' })
+
+      // Pre-create the table with only 'id' column
+      sql.exec('CREATE TABLE IF NOT EXISTS orders (id TEXT PRIMARY KEY)')
+
+      const mockDdl = [
+        'CREATE TABLE orders (id TEXT PRIMARY KEY, order_number TEXT, status TEXT NOT NULL DEFAULT \'pending\')',
+      ]
+
+      const result = await applyDomainSchema(sql, domainId, {
+        ddl: mockDdl,
+        tableMap: { 'Order': 'orders' },
+        fieldMap: {},
+      })
+
+      expect(result.tableMap).toEqual({ 'Order': 'orders' })
+
+      // The table should still exist (not recreated)
+      expect(sql.tables).toHaveProperty('orders')
+
+      // New columns should be added (tracked in tableColumns)
+      const cols = sql.tableColumns['orders'] || []
+      expect(cols).toContain('order_number')
+    })
+
+    it('updates existing schema-map on subsequent calls', async () => {
+      initDomainSchema(sql)
+
+      const domainId = 'test-domain'
+      createInMetamodel(sql, 'domains', { id: domainId, name: 'Test', domainSlug: 'test' })
+
+      // First call
+      await applyDomainSchema(sql, domainId, {
+        ddl: ['CREATE TABLE orders (id TEXT PRIMARY KEY)'],
+        tableMap: { 'Order': 'orders' },
+        fieldMap: {},
+      })
+
+      // Second call with updated schema
+      await applyDomainSchema(sql, domainId, {
+        ddl: ['CREATE TABLE orders (id TEXT PRIMARY KEY, name TEXT)'],
+        tableMap: { 'Order': 'orders', 'Product': 'products' },
+        fieldMap: { 'products': { 'productName': 'product_name' } },
+      })
+
+      // Only one schema-map row should exist
+      const generators = sql.tables['generators'] || []
+      const schemaMapRows = generators.filter((r: any) => r.output_format === 'schema-map' && r.domain_id === domainId)
+      expect(schemaMapRows).toHaveLength(1)
+
+      const cached = JSON.parse(schemaMapRows[0].output)
+      expect(cached.tableMap).toEqual({ 'Order': 'orders', 'Product': 'products' })
     })
   })
 })

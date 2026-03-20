@@ -410,3 +410,171 @@ export function updateInMetamodel(
   const rows = sql.exec(`SELECT * FROM ${table} WHERE id = ?`, id).toArray()
   return rowToPayload(rows[0] as Record<string, unknown>, reverseMap)
 }
+
+/**
+ * Apply the domain schema: execute DDL to create/alter tables for entity instances.
+ *
+ * When `precomputed` is provided, it is used directly instead of running
+ * generateOpenAPI + generateSQLite. This is useful for testing without
+ * the full generation pipeline.
+ *
+ * When `precomputed` is omitted, builds a DomainModel from the metamodel
+ * tables, generates an OpenAPI schema, converts it to SQLite DDL, executes
+ * the DDL, and caches the resulting table/field maps in the generators table.
+ */
+export async function applyDomainSchema(
+  sql: SqlLike,
+  domainId: string,
+  precomputed?: { ddl: string[]; tableMap: Record<string, string>; fieldMap: Record<string, Record<string, string>> },
+): Promise<{ tableMap: Record<string, string>; fieldMap: Record<string, Record<string, string>> }> {
+  let ddl: string[]
+  let tableMap: Record<string, string>
+  let fieldMap: Record<string, Record<string, string>>
+
+  if (precomputed) {
+    ddl = precomputed.ddl
+    tableMap = precomputed.tableMap
+    fieldMap = precomputed.fieldMap
+  } else {
+    // Build a DomainModel from the metamodel tables in this DO
+    const { SqlDataLoader } = await import('./model/domain-model')
+    // SqlDataLoader expects SqlStorage (exec returning Iterable<Row>).
+    // Cloudflare's sql.exec() returns a cursor that is both iterable AND
+    // has .toArray(), so we cast here.
+    const loader = new SqlDataLoader(sql as any)
+    const { DomainModel } = await import('./model/domain-model')
+    const model = new DomainModel(loader, domainId)
+    model.invalidate()
+
+    const openapi = await (await import('./generate/openapi')).generateOpenAPI(model)
+    const result = (await import('./generate/sqlite')).generateSQLite(openapi)
+    ddl = result.ddl
+    tableMap = result.tableMap
+    fieldMap = result.fieldMap
+  }
+
+  // Apply DDL — CREATE TABLE IF NOT EXISTS, ALTER TABLE ADD COLUMN for new columns
+  for (const statement of ddl) {
+    if (statement.startsWith('CREATE TABLE')) {
+      // Convert to IF NOT EXISTS
+      const safe = statement.replace('CREATE TABLE', 'CREATE TABLE IF NOT EXISTS')
+      try { sql.exec(safe) } catch { /* table exists with different schema */ }
+
+      // Check for new columns and add them
+      const tableMatch = statement.match(/CREATE TABLE (\w+)/)
+      if (tableMatch) {
+        const tableName = tableMatch[1]
+        const existingCols = new Set<string>()
+        try {
+          const pragma = sql.exec(`PRAGMA table_info(${tableName})`).toArray()
+          for (const row of pragma) existingCols.add((row as any).name as string)
+        } catch { continue }
+
+        // Parse columns from DDL
+        const colSection = statement.match(/\(([\s\S]+)\)/)
+        if (colSection) {
+          for (const line of colSection[1].split(',')) {
+            const colMatch = line.trim().match(/^(\w+)\s/)
+            if (colMatch && !existingCols.has(colMatch[1])) {
+              const colDef = line.trim()
+              // Strip NOT NULL and DEFAULT for ALTER TABLE ADD COLUMN
+              const safeCol = colDef.replace(/NOT NULL/g, '').replace(/DEFAULT\s+[^,)]+/g, '').trim()
+              try { sql.exec(`ALTER TABLE ${tableName} ADD COLUMN ${safeCol}`) } catch { /* already exists */ }
+            }
+          }
+        }
+      }
+    } else if (statement.startsWith('CREATE INDEX')) {
+      try { sql.exec(statement) } catch { /* index exists */ }
+    }
+  }
+
+  // Cache the mapping in generators for external consumers
+  const cached = { tableMap, fieldMap, appliedAt: new Date().toISOString() }
+  const existing = sql.exec(
+    "SELECT id FROM generators WHERE domain_id = ? AND output_format = 'schema-map'", domainId,
+  ).toArray()
+  const mapJson = JSON.stringify(cached)
+  const now = new Date().toISOString().replace('T', ' ').replace('Z', '')
+  if (existing.length) {
+    sql.exec('UPDATE generators SET output = ?, updated_at = ? WHERE id = ?', mapJson, now, (existing[0] as any).id)
+  } else {
+    sql.exec(
+      'INSERT INTO generators (id, domain_id, output_format, output, created_at, updated_at, version) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      crypto.randomUUID(), domainId, 'schema-map', mapJson, now, now, 1,
+    )
+  }
+
+  return { tableMap, fieldMap }
+}
+
+// =========================================================================
+// Durable Object class
+// =========================================================================
+
+import { DurableObject } from 'cloudflare:workers'
+
+/**
+ * DomainDB — Durable Object that holds a single domain's metamodel.
+ *
+ * Each DO instance stores type-level data (nouns, readings, constraints,
+ * etc.) for one domain, and can generate + apply the entity-instance
+ * schema from that metamodel.
+ */
+export class DomainDB extends DurableObject {
+  private initialized = false
+  private domainId: string | null = null
+
+  private ensureInit(): void {
+    if (this.initialized) return
+    initDomainSchema(this.ctx.storage.sql)
+    this.initialized = true
+  }
+
+  /** Set the domain ID for this DO. Called once after creation. */
+  async setDomainId(id: string): Promise<void> {
+    this.ensureInit()
+    this.domainId = id
+  }
+
+  /** Get the domain ID, or throw if not set. */
+  private getDomainId(): string {
+    if (!this.domainId) throw new Error('DomainDB: domainId not set. Call setDomainId first.')
+    return this.domainId
+  }
+
+  /** Find records in a metamodel collection. */
+  async findInCollection(
+    collection: string,
+    where?: Record<string, any>,
+    opts?: { limit?: number; page?: number; sort?: string },
+  ): Promise<ReturnType<typeof findInMetamodel>> {
+    this.ensureInit()
+    return findInMetamodel(this.ctx.storage.sql, collection, where, opts)
+  }
+
+  /** Create a record in a metamodel collection. */
+  async createInCollection(
+    collection: string,
+    data: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    this.ensureInit()
+    return createInMetamodel(this.ctx.storage.sql, collection, data)
+  }
+
+  /** Update a record in a metamodel collection. */
+  async updateInCollection(
+    collection: string,
+    id: string,
+    updates: Record<string, unknown>,
+  ): Promise<Record<string, unknown> | null> {
+    this.ensureInit()
+    return updateInMetamodel(this.ctx.storage.sql, collection, id, updates)
+  }
+
+  /** Generate and apply the entity-instance schema from this domain's metamodel. */
+  async applySchema(): Promise<{ tableMap: Record<string, string>; fieldMap: Record<string, Record<string, string>> }> {
+    this.ensureInit()
+    return applyDomainSchema(this.ctx.storage.sql, this.getDomainId())
+  }
+}
