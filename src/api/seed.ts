@@ -1,6 +1,6 @@
 import { json, error } from 'itty-router'
 import type { Env } from '../types'
-import { ingestClaims } from '../claims/ingest'
+import { ingestClaims, ingestProject } from '../claims/ingest'
 import type { ExtractedClaims } from '../claims/ingest'
 
 export async function handleSeed(request: Request, env: Env): Promise<Response> {
@@ -54,12 +54,22 @@ export async function handleSeed(request: Request, env: Env): Promise<Response> 
     if (body.type === 'claims') {
       // Bulk: multiple domains in one call
       if (body.domains?.length) {
-        const results = []
-        for (const entry of body.domains) {
-          const domain = await ensureDomain(db as any, entry.slug, entry.name)
-          const result = await ingestClaims(db as any, { claims: entry.claims, domainId: domain.id })
-          results.push({ domain: entry.slug, domainId: domain.id, ...result })
-        }
+        // Ensure all domain records exist first
+        const domainRecords = await Promise.all(
+          body.domains.map(entry => ensureDomain(db as any, entry.slug, entry.name))
+        )
+        // Build input for ingestProject
+        const projectDomains = body.domains.map((entry, i) => ({
+          domainId: domainRecords[i].id as string,
+          claims: entry.claims,
+        }))
+        const projectResult = await ingestProject(db as any, projectDomains)
+        // Flatten into the existing response shape
+        const results = body.domains.map((entry, i) => {
+          const domainId = domainRecords[i].id as string
+          const r = projectResult.domains.get(domainId)!
+          return { domain: entry.slug, domainId, ...r }
+        })
         return json({ domains: results })
       }
 
