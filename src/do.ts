@@ -22,6 +22,7 @@ const COMMON_FIELDS: Record<string, string> = {
   updatedAt: 'updated_at',
 }
 import type { Env } from './types'
+import { WIPE_TABLES } from './wipe-tables'
 
 // =========================================================================
 // Helpers
@@ -748,17 +749,14 @@ export class GraphDLDB extends DurableObject {
    */
   async wipeAllData(): Promise<void> {
     return this.withWriteLock(async () => {
-      // Delete in reverse dependency order (instances first, then definitions, then core)
-      const tables = [
-        'cdc_events',
-        'guard_runs', 'events', 'state_machines', 'resource_roles', 'resources', 'graphs',
-        'functions', 'streams', 'verbs', 'guards', 'transitions', 'statuses', 'event_types', 'state_machine_definitions',
-        'constraint_spans', 'constraints', 'roles', 'readings', 'graph_schemas', 'nouns',
-        'domains', 'org_memberships', 'organizations',
-      ]
-      for (const table of tables) {
-        this.sql.exec(`DELETE FROM ${table}`)
+      // Disable FK enforcement during wipe to avoid ordering issues
+      try { this.sql.exec('PRAGMA foreign_keys = OFF') } catch { /* best effort */ }
+
+      for (const table of WIPE_TABLES) {
+        try { this.sql.exec(`DELETE FROM ${table}`) } catch { /* table may not exist yet */ }
       }
+
+      try { this.sql.exec('PRAGMA foreign_keys = ON') } catch { /* best effort */ }
     })
   }
 
