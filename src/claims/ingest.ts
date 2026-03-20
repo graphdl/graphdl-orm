@@ -421,7 +421,11 @@ export async function ingestClaims(
 
     for (const [entityName, transitions] of byEntity) {
       try {
-        const noun = nounMap.get(entityName)
+        let noun = nounMap.get(entityName)
+        if (!noun) {
+          noun = await resolveNounAcrossDomains(db, entityName, domainId) || undefined
+          if (noun) nounMap.set(entityName, noun)
+        }
         if (!noun) { result.errors.push(`transition entity "${entityName}" not found`); continue }
 
         // Ensure state machine definition (find by noun + domain, or title + domain)
