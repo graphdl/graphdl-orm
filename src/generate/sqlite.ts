@@ -80,6 +80,30 @@ function extractRef(prop: any): string | null {
   return null
 }
 
+/**
+ * If a property is an array with items referencing an entity, return the
+ * referenced entity name. This indicates a M:N (many-to-many) relationship
+ * that needs a junction table.
+ *
+ * Detects patterns like:
+ *   `{ type: 'array', items: { $ref: '...' } }`
+ *   `{ type: 'array', items: { oneOf: [... { $ref: '...' } ...] } }`
+ */
+function extractArrayRef(prop: any): string | null {
+  if (prop.type !== 'array' || !prop.items) return null
+  return extractRef(prop.items)
+}
+
+/**
+ * Generate a junction table name from two entity names. Names are sorted
+ * alphabetically to ensure deterministic naming regardless of which entity
+ * the property was declared on.
+ */
+function toJunctionTableName(entityA: string, entityB: string): string {
+  const [first, second] = [toTableName(entityA), toTableName(entityB)].sort()
+  return `${first}_${second}`
+}
+
 // ---------------------------------------------------------------------------
 // System columns present on every table
 // ---------------------------------------------------------------------------
@@ -130,6 +154,10 @@ export function generateSQLite(openapi: any): GenerateSQLiteResult {
   // Collect entity names into a set for FK validation
   const entityNameSet = new Set(entityNames)
 
+  // Track junction tables to generate after entity tables
+  // Each entry: { ownerEntity, propName, targetEntity }
+  const junctionDefs: { ownerEntity: string; propName: string; targetEntity: string }[] = []
+
   // Step 2: Generate DDL for each entity
   for (const entityName of entityNames) {
     const updateSchema = schemas[`Update${entityName}`]
@@ -143,6 +171,14 @@ export function generateSQLite(openapi: any): GenerateSQLiteResult {
     const properties: Record<string, any> = updateSchema.properties || {}
 
     for (const [propName, propDef] of Object.entries(properties) as [string, any][]) {
+      // Check for M:N array reference BEFORE checking for regular refs
+      const arrayRefEntity = extractArrayRef(propDef)
+      if (arrayRefEntity && entityNameSet.has(arrayRefEntity)) {
+        // M:N relationship — defer junction table generation
+        junctionDefs.push({ ownerEntity: entityName, propName, targetEntity: arrayRefEntity })
+        continue // Do NOT add a column to this table
+      }
+
       const refEntity = extractRef(propDef)
 
       if (refEntity && entityNameSet.has(refEntity)) {
@@ -188,6 +224,55 @@ export function generateSQLite(openapi: any): GenerateSQLiteResult {
     if (Object.keys(fieldDiffs).length > 0) {
       fieldMap[tableName] = fieldDiffs
     }
+  }
+
+  // Step 3: Generate junction tables for M:N relationships
+  // De-duplicate by the sorted entity pair to avoid creating the same junction
+  // table twice (e.g., Role→Reading and Reading→Role).
+  const generatedJunctions = new Set<string>()
+
+  for (const { ownerEntity, targetEntity } of junctionDefs) {
+    const junctionTable = toJunctionTableName(ownerEntity, targetEntity)
+
+    if (generatedJunctions.has(junctionTable)) continue
+    generatedJunctions.add(junctionTable)
+
+    const ownerTable = toTableName(ownerEntity)
+    const targetTable = toTableName(targetEntity)
+
+    // Build FK column names from the entity names (snake_case + _id)
+    const ownerCol = toColumnName(ownerEntity) + '_id'
+    const targetCol = toColumnName(targetEntity) + '_id'
+
+    const junctionColumns = [
+      'id TEXT PRIMARY KEY',
+      `${ownerCol} TEXT NOT NULL REFERENCES ${ownerTable}(id)`,
+      `${targetCol} TEXT NOT NULL REFERENCES ${targetTable}(id)`,
+      'domain_id TEXT REFERENCES domains(id)',
+      "created_at TEXT NOT NULL DEFAULT (datetime('now'))",
+      "updated_at TEXT NOT NULL DEFAULT (datetime('now'))",
+      'version INTEGER NOT NULL DEFAULT 1',
+      `UNIQUE(${ownerCol}, ${targetCol})`,
+    ]
+
+    ddl.push(
+      `CREATE TABLE ${junctionTable} (\n  ${junctionColumns.join(',\n  ')}\n)`,
+    )
+
+    // Indexes on each FK column and domain_id
+    ddl.push(
+      `CREATE INDEX IF NOT EXISTS idx_${junctionTable}_${ownerCol} ON ${junctionTable}(${ownerCol})`,
+    )
+    ddl.push(
+      `CREATE INDEX IF NOT EXISTS idx_${junctionTable}_${targetCol} ON ${junctionTable}(${targetCol})`,
+    )
+    ddl.push(
+      `CREATE INDEX IF NOT EXISTS idx_${junctionTable}_domain_id ON ${junctionTable}(domain_id)`,
+    )
+
+    // Register junction table in tableMap using a composite key
+    const junctionKey = `${ownerEntity}_${targetEntity}`
+    tableMap[junctionKey] = junctionTable
   }
 
   return { ddl, tableMap, fieldMap }

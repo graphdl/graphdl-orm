@@ -394,4 +394,286 @@ describe('generateSQLite', () => {
     expect(createTable).toContain('version INTEGER NOT NULL DEFAULT 1')
     expect(result.tableMap['Widget']).toBe('widgets')
   })
+
+  // ---------------------------------------------------------------------------
+  // Junction table tests (M:N relationships)
+  // ---------------------------------------------------------------------------
+
+  it('generates junction table for M:N array property with $ref items', () => {
+    // Role has many Readings (M:N) — represented as array with $ref items
+    const api = openapi({
+      ...entityTriplet('Role', {
+        name: { type: 'string' },
+        readings: {
+          type: 'array',
+          items: { $ref: '#/components/schemas/Reading' },
+        },
+      }),
+      ...entityTriplet('Reading', {
+        text: { type: 'string' },
+      }),
+    })
+    const result = generateSQLite(api)
+
+    // Should NOT have a "readings TEXT" column on the roles table
+    const rolesTable = result.ddl.find(
+      (s) => s.startsWith('CREATE TABLE') && s.includes('roles ('),
+    )
+    expect(rolesTable).toBeDefined()
+    expect(rolesTable).not.toContain('readings TEXT')
+
+    // Should have a junction table (alphabetically sorted: readings_roles)
+    const junctionTable = result.ddl.find(
+      (s) => s.includes('CREATE TABLE') && s.includes('readings_roles'),
+    )
+    expect(junctionTable).toBeDefined()
+    expect(junctionTable).toContain('role_id TEXT NOT NULL REFERENCES roles(id)')
+    expect(junctionTable).toContain('reading_id TEXT NOT NULL REFERENCES readings(id)')
+    expect(junctionTable).toContain('id TEXT PRIMARY KEY')
+    expect(junctionTable).toContain('domain_id TEXT REFERENCES domains(id)')
+    expect(junctionTable).toContain("created_at TEXT NOT NULL DEFAULT (datetime('now'))")
+    expect(junctionTable).toContain("updated_at TEXT NOT NULL DEFAULT (datetime('now'))")
+    expect(junctionTable).toContain('version INTEGER NOT NULL DEFAULT 1')
+    expect(junctionTable).toContain('UNIQUE(role_id, reading_id)')
+  })
+
+  it('generates junction table for M:N with oneOf $ref items', () => {
+    // Guard references many GraphSchemas — oneOf style
+    const api = openapi({
+      ...entityTriplet('Guard', {
+        name: { type: 'string' },
+        graphSchemas: {
+          type: 'array',
+          items: {
+            oneOf: [
+              { type: 'string' },
+              { $ref: '#/components/schemas/GraphSchema' },
+            ],
+          },
+        },
+      }),
+      ...entityTriplet('GraphSchema', { name: { type: 'string' } }),
+    })
+    const result = generateSQLite(api)
+
+    // Junction table should exist (sorted: graph_schemas_guards)
+    const junctionTable = result.ddl.find(
+      (s) => s.includes('CREATE TABLE') && s.includes('graph_schemas_guards'),
+    )
+    expect(junctionTable).toBeDefined()
+    expect(junctionTable).toContain('guard_id TEXT NOT NULL REFERENCES guards(id)')
+    expect(junctionTable).toContain(
+      'graph_schema_id TEXT NOT NULL REFERENCES graph_schemas(id)',
+    )
+    expect(junctionTable).toContain('UNIQUE(guard_id, graph_schema_id)')
+  })
+
+  it('registers junction table in tableMap', () => {
+    const api = openapi({
+      ...entityTriplet('Role', {
+        readings: {
+          type: 'array',
+          items: { $ref: '#/components/schemas/Reading' },
+        },
+      }),
+      ...entityTriplet('Reading', { text: { type: 'string' } }),
+    })
+    const result = generateSQLite(api)
+
+    // Junction table should appear in tableMap with composite key
+    expect(result.tableMap['Role_Reading']).toBe('readings_roles')
+  })
+
+  it('generates indexes on junction table FK columns', () => {
+    const api = openapi({
+      ...entityTriplet('EventType', { name: { type: 'string' } }),
+      ...entityTriplet('Verb', {
+        name: { type: 'string' },
+        eventTypes: {
+          type: 'array',
+          items: { $ref: '#/components/schemas/EventType' },
+        },
+      }),
+    })
+    const result = generateSQLite(api)
+
+    const junctionIndexes = result.ddl.filter(
+      (s) => s.startsWith('CREATE INDEX') && s.includes('event_types_verbs'),
+    )
+
+    // Should have indexes for verb_id, event_type_id, and domain_id
+    expect(junctionIndexes.some((s) => s.includes('verb_id'))).toBe(true)
+    expect(junctionIndexes.some((s) => s.includes('event_type_id'))).toBe(true)
+    expect(junctionIndexes.some((s) => s.includes('domain_id'))).toBe(true)
+  })
+
+  it('de-duplicates junction tables when both sides declare the relationship', () => {
+    // Both Role and Reading declare the M:N relationship
+    const api = openapi({
+      ...entityTriplet('Role', {
+        readings: {
+          type: 'array',
+          items: { $ref: '#/components/schemas/Reading' },
+        },
+      }),
+      ...entityTriplet('Reading', {
+        roles: {
+          type: 'array',
+          items: { $ref: '#/components/schemas/Role' },
+        },
+      }),
+    })
+    const result = generateSQLite(api)
+
+    // Only one junction table should be created, not two
+    const junctionTables = result.ddl.filter(
+      (s) => s.includes('CREATE TABLE') && s.includes('readings_roles'),
+    )
+    expect(junctionTables.length).toBe(1)
+  })
+
+  it('does NOT create junction table for array of value types', () => {
+    // Array of strings (value type) should remain a TEXT (JSON) column, not a junction
+    const api = openapi(
+      entityTriplet('Customer', {
+        tags: { type: 'array', items: { type: 'string' } },
+      }),
+    )
+    const result = generateSQLite(api)
+
+    const createTable = result.ddl.find((s) => s.startsWith('CREATE TABLE'))
+    expect(createTable).toContain('tags TEXT')
+
+    // No junction table should be created
+    const allTables = result.ddl.filter((s) => s.includes('CREATE TABLE'))
+    expect(allTables.length).toBe(1) // Only the customers table
+  })
+
+  it('does NOT create junction table for array referencing non-entity schema', () => {
+    // Array references a schema that is NOT an entity (no Update prefix)
+    const api = openapi({
+      ...entityTriplet('Customer', {
+        addresses: {
+          type: 'array',
+          items: { $ref: '#/components/schemas/Address' },
+        },
+      }),
+      // Address exists but has no UpdateAddress → not an entity
+      Address: {
+        $id: 'Address',
+        type: 'object',
+        properties: { street: { type: 'string' } },
+      },
+    })
+    const result = generateSQLite(api)
+
+    // Should fall through to the regular value column path (TEXT for array)
+    const createTable = result.ddl.find(
+      (s) => s.startsWith('CREATE TABLE') && s.includes('customers'),
+    )
+    expect(createTable).toContain('addresses TEXT')
+
+    // No junction table
+    const allTables = result.ddl.filter((s) => s.includes('CREATE TABLE'))
+    expect(allTables.length).toBe(1)
+  })
+
+  it('handles multiple M:N relationships on the same entity', () => {
+    // Guard references both GraphSchema and Transition (M:N)
+    const api = openapi({
+      ...entityTriplet('Guard', {
+        name: { type: 'string' },
+        graphSchemas: {
+          type: 'array',
+          items: { $ref: '#/components/schemas/GraphSchema' },
+        },
+        transitions: {
+          type: 'array',
+          items: { $ref: '#/components/schemas/Transition' },
+        },
+      }),
+      ...entityTriplet('GraphSchema', { name: { type: 'string' } }),
+      ...entityTriplet('Transition', { name: { type: 'string' } }),
+    })
+    const result = generateSQLite(api)
+
+    // Guard entity table should have no array columns
+    const guardTable = result.ddl.find(
+      (s) => s.startsWith('CREATE TABLE') && s.includes('guards ('),
+    )
+    expect(guardTable).not.toContain('graph_schemas TEXT')
+    expect(guardTable).not.toContain('transitions TEXT')
+
+    // Two junction tables should be created
+    const junctionTables = result.ddl.filter(
+      (s) =>
+        s.includes('CREATE TABLE') &&
+        (s.includes('graph_schemas_guards') || s.includes('guards_transitions')),
+    )
+    expect(junctionTables.length).toBe(2)
+  })
+
+  it('junction table has correct structure matching NORMA 3NF pattern', () => {
+    // GuardRun ↔ Graph (M:N) — verify full structure
+    const api = openapi({
+      ...entityTriplet('GuardRun', {
+        graphs: {
+          type: 'array',
+          items: { $ref: '#/components/schemas/Graph' },
+        },
+      }),
+      ...entityTriplet('Graph', { name: { type: 'string' } }),
+    })
+    const result = generateSQLite(api)
+
+    const junctionDDL = result.ddl.find(
+      (s) => s.includes('CREATE TABLE') && s.includes('graphs_guard_runs'),
+    )
+    expect(junctionDDL).toBeDefined()
+
+    // Verify all required structural elements
+    expect(junctionDDL).toContain('id TEXT PRIMARY KEY')
+    expect(junctionDDL).toContain('guard_run_id TEXT NOT NULL REFERENCES guard_runs(id)')
+    expect(junctionDDL).toContain('graph_id TEXT NOT NULL REFERENCES graphs(id)')
+    expect(junctionDDL).toContain('domain_id TEXT REFERENCES domains(id)')
+    expect(junctionDDL).toContain("created_at TEXT NOT NULL DEFAULT (datetime('now'))")
+    expect(junctionDDL).toContain("updated_at TEXT NOT NULL DEFAULT (datetime('now'))")
+    expect(junctionDDL).toContain('version INTEGER NOT NULL DEFAULT 1')
+    expect(junctionDDL).toContain('UNIQUE(guard_run_id, graph_id)')
+  })
+
+  it('mixes FK columns and junction tables correctly on the same entity', () => {
+    // Order has one Customer (1:M FK) and many Tags entities (M:N junction)
+    const api = openapi({
+      ...entityTriplet('Customer', { name: { type: 'string' } }),
+      ...entityTriplet('Tag', { label: { type: 'string' } }),
+      ...entityTriplet('Order', {
+        customer: {
+          oneOf: [{ type: 'string' }, { $ref: '#/components/schemas/Customer' }],
+        },
+        total: { type: 'number' },
+        tags: {
+          type: 'array',
+          items: { $ref: '#/components/schemas/Tag' },
+        },
+      }),
+    })
+    const result = generateSQLite(api)
+
+    // Order table should have customer_id FK but NOT tags column
+    const orderTable = result.ddl.find(
+      (s) => s.startsWith('CREATE TABLE') && s.includes('orders ('),
+    )
+    expect(orderTable).toContain('customer_id TEXT REFERENCES customers(id)')
+    expect(orderTable).toContain('total REAL')
+    expect(orderTable).not.toContain('tags')
+
+    // Junction table for Order ↔ Tag
+    const junctionTable = result.ddl.find(
+      (s) => s.includes('CREATE TABLE') && s.includes('orders_tags'),
+    )
+    expect(junctionTable).toBeDefined()
+    expect(junctionTable).toContain('order_id TEXT NOT NULL REFERENCES orders(id)')
+    expect(junctionTable).toContain('tag_id TEXT NOT NULL REFERENCES tags(id)')
+  })
 })

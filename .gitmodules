@@ -1,3 +1,0 @@
-[submodule ".do/db"]
-	path = .do/db
-	url = https://github.com/dot-do/db.git

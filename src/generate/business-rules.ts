@@ -10,6 +10,7 @@ export interface BusinessRules {
     enumValues?: string[]
     valueType?: string
     superType?: string
+    worldAssumption?: 'closed' | 'open'
   }>
   factTypes: Record<string, {
     reading: string
@@ -38,6 +39,13 @@ export interface BusinessRules {
         constraintIds: string[]
       }
     }>
+  }>
+  derivationRules: Array<{
+    id: string
+    text: string
+    antecedentFactTypeIds: string[]
+    consequentFactTypeId: string
+    kind: 'subtypeInheritance' | 'modusPonens' | 'transitivity' | 'closedWorldNegation'
   }>
 }
 
@@ -68,6 +76,7 @@ export async function generateBusinessRules(model: {
         ? noun.superType
         : noun.superType.name
     }
+    if (noun.worldAssumption) entry.worldAssumption = noun.worldAssumption
     irNouns[name] = entry
   }
 
@@ -127,11 +136,63 @@ export async function generateBusinessRules(model: {
     }
   }
 
+  // ── Derivation Rules ──
+  const derivationRules: BusinessRules['derivationRules'] = []
+
+  // Subtype inheritance rules
+  for (const [name, noun] of nouns) {
+    const superType = noun.superType
+      ? (typeof noun.superType === 'string' ? noun.superType : noun.superType.name)
+      : undefined
+    if (superType) {
+      derivationRules.push({
+        id: `derive-subtype-${name}`,
+        text: `${name} inherits constraints of ${superType}`,
+        antecedentFactTypeIds: [],
+        consequentFactTypeId: '',
+        kind: 'subtypeInheritance',
+      })
+    }
+  }
+
+  // Modus ponens from subset constraints (SS)
+  for (const c of irConstraints) {
+    if (c.kind === 'SS' && c.spans.length >= 2) {
+      derivationRules.push({
+        id: `derive-mp-${c.id}`,
+        text: c.text,
+        antecedentFactTypeIds: [c.spans[0].factTypeId],
+        consequentFactTypeId: c.spans[1].factTypeId,
+        kind: 'modusPonens',
+      })
+    }
+  }
+
+  // CWA negation for closed-world nouns
+  for (const [name, noun] of nouns) {
+    const assumption = noun.worldAssumption || 'closed'
+    if (assumption === 'closed') {
+      const factTypeIds = Object.entries(irFactTypes)
+        .filter(([_, ft]) => ft.roles.some((r) => r.nounName === name))
+        .map(([id]) => id)
+      if (factTypeIds.length > 0) {
+        derivationRules.push({
+          id: `derive-cwa-${name}`,
+          text: `Absence of fact for ${name} implies negation (Closed World)`,
+          antecedentFactTypeIds: factTypeIds,
+          consequentFactTypeId: '',
+          kind: 'closedWorldNegation',
+        })
+      }
+    }
+  }
+
   return {
     domain: model.domainId,
     nouns: irNouns,
     factTypes: irFactTypes,
     constraints: irConstraints,
     stateMachines: irStateMachines,
+    derivationRules,
   }
 }

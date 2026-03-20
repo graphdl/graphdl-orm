@@ -101,7 +101,7 @@ export const INSTANCE_COLLECTIONS = new Set([
  * Only fields that differ from identity mapping need entries.
  */
 export const FIELD_MAP: Record<string, Record<string, string>> = {
-  nouns: { domain: 'domain_id', superType: 'super_type_id', objectType: 'object_type', promptText: 'prompt_text', enumValues: 'enum_values', valueType: 'value_type' },
+  nouns: { domain: 'domain_id', superType: 'super_type_id', objectType: 'object_type', promptText: 'prompt_text', enumValues: 'enum_values', valueType: 'value_type', worldAssumption: 'world_assumption' },
   graph_schemas: { domain: 'domain_id' },
   readings: { domain: 'domain_id', graphSchema: 'graph_schema_id' },
   roles: { reading: 'reading_id', noun: 'noun_id', graphSchema: 'graph_schema_id', roleIndex: 'role_index' },

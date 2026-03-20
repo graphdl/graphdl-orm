@@ -1,387 +1,213 @@
 # graphdl-orm
 
-A self-describing meta-framework for [Object-Role Modeling](https://en.wikipedia.org/wiki/Object-role_modeling) (ORM2/FORML2). Natural language readings are the source code -- they generate relational schemas, APIs, state machines, agent tools, and UI layouts.
+A self-describing meta-framework for [Object-Role Modeling](https://en.wikipedia.org/wiki/Object-role_modeling) (ORM2/FORML2). Natural language readings are the source code — they generate relational schemas, APIs, state machines, constraint algebras, and UI layouts.
 
-**Stack:** Cloudflare Workers + Durable Objects (SQLite) + itty-router
+**Stack:** Cloudflare Workers + Durable Objects (SQLite) + itty-router + Rust/WASM FOL engine
+
+## Intellectual Foundation
+
+This system implements ideas from five foundational works:
+
+- **Codd (1970)** — Data independence: applications derive from the model, not from storage
+- **Halpin (ORM2)** — Elementary facts in natural language as the conceptual layer
+- **Backus (1977)** — An algebra of programs: constraints compile to pure functions, evaluation is function application over whole structures
+- **Bush (1945)** — Associative trails: facts link to facts through readings, not hierarchical indexes
+- **Leibniz (1666)** — Characteristica Universalis: a formal language for all knowledge, disputes resolved by calculation (*Calculemus*)
+
+The readings are the source. Everything else is compilation.
 
 ## Architecture
 
 ```
-readings (FORML2)
-    |
-    v
-LLM claim extraction (/graphdl/extract/claims)
-    |
-    v
-Claim ingestion (/claims) --> 3NF SQLite tables in Durable Object
-    |
-    v
-REST API (/api/:collection) -- Payload CMS-compatible query language
-    |
-    v
-Consumers: apis worker (service binding), ui.do, support agents
+readings (FORML2 natural language)
+    │
+    ▼
+FORML2 parser (/parse) ──► claim extraction
+    │
+    ▼
+Claim ingestion (/claims) ──► 3NF SQLite in Durable Object
+    │
+    ▼
+Generators (/generate)
+    ├── schema      ──► SQLite DDL
+    ├── openapi     ──► JSON Schema / REST API
+    ├── xstate      ──► state machine configs
+    ├── business-rules ──► constraint IR (JSON)
+    ├── ilayer      ──► UI layout definitions
+    ├── readings    ──► FORML2 round-trip
+    └── readme      ──► self-documenting
+    │
+    ▼
+FOL Engine (Rust/WASM)
+    ├── evaluate    ──► constraint verification (Predicate → [Violation])
+    ├── forward-chain ──► FOL inference (Derivation → [DerivedFact])
+    └── synthesize  ──► noun knowledge synthesis (SynthesisResult)
+    │
+    ▼
+Consumers: REST API, ui.do, agents (joey), compliance products
 ```
 
-A single Durable Object (`GraphDLDB`) holds all metamodel + instance data in normalized SQLite tables. The Worker routes HTTP to the DO via itty-router. External consumers (like the `apis` worker) connect via Cloudflare service bindings -- no auth needed for worker-to-worker calls.
+A single Durable Object (`GraphDLDB`) holds all metamodel + instance data in normalized SQLite tables. The Worker routes HTTP to the DO via itty-router.
 
-## Schema
+## Three-Layer Schema
 
 ### Metamodel (Knowledge Layer)
 
-Describes *what exists* -- entity types, fact types, constraints.
+Describes *what exists* — entity types, fact types, constraints.
 
-```mermaid
-erDiagram
-    organizations {
-        text id PK
-        text slug UK
-        text name
-    }
-    org_memberships {
-        text id PK
-        text user_email
-        text organization_id FK
-        text role "owner | member"
-    }
-    domains {
-        text id PK
-        text domain_slug UK
-        text name
-        text organization_id FK
-        text visibility "private | public"
-    }
-    nouns {
-        text id PK
-        text name
-        text object_type "entity | value"
-        text domain_id FK
-        text super_type_id FK "self-ref"
-        text plural
-        text value_type
-        text enum_values
-    }
-    graph_schemas {
-        text id PK
-        text name
-        text title
-        text domain_id FK
-    }
-    readings {
-        text id PK
-        text text "FORML2 reading"
-        text graph_schema_id FK
-        text domain_id FK
-    }
-    roles {
-        text id PK
-        text reading_id FK
-        text noun_id FK
-        text graph_schema_id FK
-        int role_index
-    }
-    constraints {
-        text id PK
-        text kind "UC | MC | SS | XC | EQ | OR | XO"
-        text modality "Alethic | Deontic"
-        text domain_id FK
-    }
-    constraint_spans {
-        text id PK
-        text constraint_id FK
-        text role_id FK
-    }
+| Table | Purpose |
+|-------|---------|
+| `organizations` | Multi-tenancy root |
+| `domains` | Scoped knowledge domains |
+| `nouns` | Entity types and value types, with `world_assumption` (closed/open) |
+| `graph_schemas` | Fact type definitions |
+| `readings` | FORML2 natural language sentences |
+| `roles` | Positions in a fact type, references noun + graph_schema |
+| `constraints` | UC/MC/SS/XC/EQ/OR/XO/RC with modality (Alethic/Deontic) |
+| `constraint_spans` | Maps constraints to roles |
 
-    organizations ||--o{ org_memberships : "has members"
-    organizations ||--o{ domains : "owns"
-    domains ||--o{ nouns : "defines"
-    domains ||--o{ graph_schemas : "defines"
-    domains ||--o{ readings : "contains"
-    domains ||--o{ constraints : "governs"
-    nouns ||--o| nouns : "super_type"
-    graph_schemas ||--o{ readings : "has"
-    readings ||--o{ roles : "has"
-    nouns ||--o{ roles : "plays"
-    constraints ||--o{ constraint_spans : "spans"
-    roles ||--o{ constraint_spans : "spanned by"
+### Behavioral Layer (State)
+
+Describes *how things change* — state machines, transitions, guards.
+
+| Table | Purpose |
+|-------|---------|
+| `state_machine_definitions` | Lifecycle definitions, references a noun |
+| `statuses` | Named states |
+| `event_types` | Triggers for transitions |
+| `transitions` | From → to status, triggered by event |
+| `guards` | Constraints on transitions |
+| `verbs` | Actions/operations |
+| `functions` | HTTP callbacks for verbs |
+
+### Instance Layer (Runtime)
+
+Describes *what happened* — concrete facts, running state machines, events.
+
+| Table | Purpose |
+|-------|---------|
+| `graphs` | Fact type instances |
+| `resources` | Entity instances |
+| `resource_roles` | Bindings of resources to graph roles |
+| `state_machines` | Runtime state machines with current status |
+| `events` | State machine events that occurred |
+| `cdc_events` | Change Data Capture for audit/sync |
+
+## FOL Engine (`crates/fol-engine/`)
+
+A first-order logic reasoning engine compiled to WebAssembly, implementing Backus's FP algebra.
+
+Constraints and derivation rules compile to pure functions at load time. Evaluation is function application — no dispatch, no branching on kind, no mutable state. The algebra's laws (associativity of composition, distributivity of apply-to-all) hold by construction.
+
+### Capabilities
+
+**Constraint verification** — Apply all compiled predicates, collect violations. Supports ORM2 constraint kinds: UC, MC, RC, XO, XC, OR, SS, EQ, plus deontic modality (forbidden, obligatory, permitted).
+
+**Forward inference** — Apply derivation rules (subtype inheritance, modus ponens, transitivity, closed-world negation) iteratively until fixed point. Given base facts, derive all conclusions.
+
+**Synthesis** — Collect all knowledge about a noun: participating fact types, applicable constraints, state machines, related nouns, derived facts. Returns compact summaries for agent context injection.
+
+**Dual world assumptions** — Closed World (absence = false) for government powers and structural facts. Open World (absence = unknown) for individual rights and liberties. Encodes the 9th and 10th Amendments as formal parameters of the reasoning engine.
+
+### Usage
+
+```bash
+# Verify text against constraints
+fol --ir constraints.json --text "response to verify"
+
+# Synthesize knowledge about a noun
+fol --ir constraints.json --synthesize "AI System" --depth 2
+
+# Run forward inference
+fol --ir constraints.json --forward-chain --population facts.json
 ```
 
-### State Machine Definitions (Behavioral Layer)
-
-Describes *how things change* -- states, transitions, guards.
-
-```mermaid
-erDiagram
-    state_machine_definitions {
-        text id PK
-        text title
-        text noun_id FK
-        text domain_id FK
-    }
-    statuses {
-        text id PK
-        text name
-        text state_machine_definition_id FK
-    }
-    event_types {
-        text id PK
-        text name
-        text domain_id FK
-    }
-    transitions {
-        text id PK
-        text from_status_id FK
-        text to_status_id FK
-        text event_type_id FK
-        text verb_id FK
-    }
-    guards {
-        text id PK
-        text name
-        text transition_id FK
-        text graph_schema_id FK
-        text domain_id FK
-    }
-    verbs {
-        text id PK
-        text name
-        text status_id FK
-        text transition_id FK
-        text domain_id FK
-    }
-    functions {
-        text id PK
-        text name
-        text callback_url
-        text http_method "POST"
-        text verb_id FK
-        text domain_id FK
-    }
-    streams {
-        text id PK
-        text name
-        text domain_id FK
-    }
-
-    state_machine_definitions ||--o{ statuses : "defines"
-    statuses ||--o{ transitions : "from"
-    statuses ||--o{ transitions : "to"
-    event_types ||--o{ transitions : "triggers"
-    transitions ||--o{ guards : "guarded by"
-    transitions ||--o{ verbs : "performs"
-    verbs ||--o{ functions : "calls"
-```
-
-### Runtime Instances (Instance Layer)
-
-Describes *what happened* -- concrete facts, running state machines, events.
-
-```mermaid
-erDiagram
-    graphs {
-        text id PK
-        text graph_schema_id FK
-        text domain_id FK
-        int is_done
-    }
-    resources {
-        text id PK
-        text noun_id FK
-        text reference
-        text value
-        text domain_id FK
-    }
-    resource_roles {
-        text id PK
-        text graph_id FK
-        text resource_id FK
-        text role_id FK
-        text domain_id FK
-    }
-    state_machines {
-        text id PK
-        text name
-        text state_machine_definition_id FK
-        text current_status_id FK
-        text resource_id FK
-        text domain_id FK
-    }
-    events {
-        text id PK
-        text event_type_id FK
-        text state_machine_id FK
-        text graph_id FK
-        text data
-        text occurred_at
-    }
-    guard_runs {
-        text id PK
-        text name
-        text guard_id FK
-        text graph_id FK
-        int result
-        text domain_id FK
-    }
-
-    graphs ||--o{ resource_roles : "uses"
-    resources ||--o{ resource_roles : "plays"
-    state_machines ||--o{ events : "records"
-    graphs ||--o{ events : "creates"
-    guards ||--o{ guard_runs : "runs"
-```
-
-### CDC Event Log
-
-Every mutation is tracked for sync and audit:
-
-```sql
-cdc_events (id, timestamp, operation, table_name, entity_id, data)
-```
+See [`crates/fol-engine/README.md`](crates/fol-engine/README.md) for the full theoretical foundation and architecture.
 
 ## API
 
-Payload CMS-compatible REST API on all 23 collections:
+Payload CMS-compatible REST API on all collections:
 
 ```
-GET    /api/:collection          -- list/find (where, limit, page, sort)
-GET    /api/:collection/:id      -- get by ID
-POST   /api/:collection          -- create
-PATCH  /api/:collection/:id      -- update
-DELETE /api/:collection/:id      -- delete
+GET    /api/:collection          — list/find (where, limit, page, sort, depth)
+GET    /api/:collection/:id      — get by ID
+POST   /api/:collection          — create
+PATCH  /api/:collection/:id      — update
+DELETE /api/:collection/:id      — delete
 
-POST   /seed                     -- bulk seed (type: 'claims')
-POST   /claims                   -- alias for /seed
-GET    /seed                     -- stats (noun/reading/domain counts)
-DELETE /seed                     -- wipe all data
-GET    /health                   -- health check
+POST   /api/parse                — parse FORML2 text into structured claims
+POST   /api/generate             — generate artifacts (schema, openapi, xstate, business-rules, ilayer, readings)
+POST   /api/evaluate             — evaluate text against constraint IR via WASM
+POST   /api/synthesize           — synthesize all knowledge about a noun
+
+POST   /seed                     — bulk seed claims
+POST   /claims                   — alias for /seed
+GET    /seed                     — stats
+DELETE /seed                     — wipe all data
+GET    /health                   — health check
 ```
 
 ### Query Language
 
-Supports Payload-style `where` bracket notation:
+Supports Payload-style `where` bracket notation with FK traversal:
 
 ```
-/api/nouns?where[object_type][equals]=entity&limit=20&sort=-created_at
-/api/readings?where[domain_id][equals]=graphdl-core&limit=50
+/api/nouns?where[objectType][equals]=entity&limit=20&sort=-createdAt
+/api/readings?where[domain.domainSlug][equals]=joey&depth=2
 /api/nouns?where[name][like]=%State%
 ```
 
-### Collections
-
-| Slug | Table | Layer |
-|------|-------|-------|
-| `organizations` | organizations | Access |
-| `org-memberships` | org_memberships | Access |
-| `domains` | domains | Access |
-| `nouns` | nouns | Metamodel |
-| `graph-schemas` | graph_schemas | Metamodel |
-| `readings` | readings | Metamodel |
-| `roles` | roles | Metamodel |
-| `constraints` | constraints | Metamodel |
-| `constraint-spans` | constraint_spans | Metamodel |
-| `state-machine-definitions` | state_machine_definitions | State |
-| `statuses` | statuses | State |
-| `event-types` | event_types | State |
-| `transitions` | transitions | State |
-| `guards` | guards | State |
-| `verbs` | verbs | State |
-| `functions` | functions | State |
-| `streams` | streams | State |
-| `graphs` | graphs | Instance |
-| `resources` | resources | Instance |
-| `resource-roles` | resource_roles | Instance |
-| `state-machines` | state_machines | Instance |
-| `events` | events | Instance |
-| `guard-runs` | guard_runs | Instance |
+Operators: `equals`, `not_equals`, `in`, `like`, `exists`, logical `and`/`or`, dot-notation for FK subqueries.
 
 ## Claim Ingestion
 
-The `/claims` endpoint accepts structured claims extracted from natural language:
+The `/claims` endpoint accepts structured claims extracted from natural language. The ingestion engine:
 
-```json
-{
-  "type": "claims",
-  "domains": [
-    {
-      "slug": "library",
-      "claims": {
-        "nouns": [
-          { "name": "Book", "objectType": "entity", "plural": "Books" },
-          { "name": "Title", "objectType": "value", "valueType": "string" }
-        ],
-        "readings": [
-          { "text": "Book has Title", "nouns": ["Book", "Title"], "predicate": "has", "multiplicity": "*:1" }
-        ],
-        "constraints": [
-          { "kind": "UC", "modality": "Alethic", "reading": "Book has Title", "roles": [0] }
-        ],
-        "subtypes": [],
-        "transitions": [
-          { "entity": "Book", "from": "Available", "to": "Checked Out", "event": "checkout" }
-        ],
-        "facts": []
-      }
-    }
-  ]
-}
-```
-
-The ingestion engine:
 1. Creates nouns (find-or-create by name + domain)
 2. Applies subtypes (sets `super_type_id`)
 3. Creates graph schemas + readings + roles (auto-tokenized)
-4. Applies constraints (UC, MC, etc.)
+4. Applies constraints (UC, MC, SS, etc.)
 5. Seeds state machine definitions + statuses + transitions
+6. Auto-detects world assumption (nouns named Right, Freedom, Liberty, Protection, Privilege → open world)
 
-## Bootstrap
+Derivation rules (`:=` predicates) are stored as readings and resolved dynamically at query time.
 
-On first boot, the Durable Object seeds the `graphdl-core` domain with 23 entity type nouns -- one per physical table plus key subtypes (Graph Schema, Status, Graph). This makes the framework self-describing: you can query the metamodel about the metamodel.
+## Hooks
 
-## Deployment
+Collection write hooks trigger side effects deterministically — creating a reading auto-tokenizes it into roles, creating a constraint auto-spans it to roles, etc.
 
-```bash
-yarn install
-yarn deploy          # deploys to Cloudflare Workers
-```
+## Self-Description
 
-Requires `wrangler` CLI and access to the Cloudflare account.
-
-### Service Binding
-
-Other Cloudflare Workers connect via service binding (no auth needed):
-
-```typescript
-// In consuming worker's wrangler.jsonc:
-"services": [{ "binding": "GRAPHDL", "service": "graphdl-orm" }]
-
-// Usage:
-const res = await env.GRAPHDL.fetch(new Request('https://graphdl-orm/api/nouns?limit=10'))
-const data = await res.json()
-```
-
-## Seeding Domains
-
-The `scripts/seed-metamodel.ts` script reads FORML2 readings from `readings/*.md`, extracts structured claims via the LLM extraction endpoint, and seeds them into the database:
-
-```bash
-AUTO_DEV_API_KEY=your-key npx tsx scripts/seed-metamodel.ts
-```
-
-### Readings Files
-
-| File | Domain | Content |
-|------|--------|---------|
-| `core.md` | graphdl-core | Nouns, readings, roles, verbs, constraints, UI elements |
-| `organizations.md` | graphdl-organizations | Organizations, memberships, domain ownership |
-| `state.md` | graphdl-state | State machine definitions, statuses, transitions, guards |
-| `instances.md` | graphdl-instances | Graphs, resources, resource roles, state machines, events |
-| `ui.md` | graphdl-ui | Dashboards, sections, widgets |
+On first boot, the Durable Object seeds the `graphdl-core` domain with entity type nouns for every table. The framework can query the metamodel about the metamodel.
 
 ## Development
 
 ```bash
+yarn install
 yarn dev             # local dev server (wrangler dev)
 yarn test            # run tests (vitest)
 yarn typecheck       # type check (tsc --noEmit)
+
+# FOL engine
+cd crates/fol-engine
+cargo test           # 27 tests
+cargo build --release --target wasm32-unknown-unknown  # WASM build
+```
+
+## Deployment
+
+```bash
+yarn deploy          # deploys to Cloudflare Workers
+```
+
+Requires `wrangler` CLI and Cloudflare account access.
+
+### Service Binding
+
+Other Cloudflare Workers connect via service binding (no auth):
+
+```typescript
+const res = await env.GRAPHDL.fetch(new Request('https://graphdl-orm/api/nouns?limit=10'))
 ```
 
 ## License

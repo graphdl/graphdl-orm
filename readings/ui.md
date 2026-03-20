@@ -8,6 +8,9 @@ Widget(.Widget Id) is an entity type.
 
 ## Value Types
 
+Dashboard Name is a value type.
+Section Title is a value type.
+Widget Id is a value type.
 Widget Type is a value type.
   The possible values of Widget Type are 'link', 'field', 'status-summary', 'submission', 'streaming', 'remote-control'.
 Position is a value type.

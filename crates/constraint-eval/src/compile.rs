@@ -2,19 +2,22 @@
 //
 // Compilation: ConstraintIR → CompiledModel
 //
-// Following exec-symbols: constraints ARE predicates, not data that gets matched.
+// Constraints ARE predicates, not data that gets matched.
 // The match on constraint kind happens once at compile time. After compilation,
 // evaluation is pure function application — no dispatch, no branching on kind.
 //
-// exec-symbols architecture:
-//   Constraint(modality)(predicate)
-//   evaluate_constraint(constraint)(population)
-//   StateMachine(transition)(initial)
-//   run_machine(machine)(stream) = fold(transition)(initial)(stream)
+// This implements Backus's FP algebra (1977 Turing Lecture):
+//   - Constraints and derivations compile to pure functions (combining forms)
+//   - Evaluation is function application over whole structures
+//   - State machines are folds: run_machine = fold(transition)(initial)(stream)
+//   - No variables, no mutable state during evaluation — only reduction
 
 use std::sync::Arc;
 use std::collections::{HashMap, HashSet};
 use crate::types::*;
+
+// Re-export DerivedFact-related types used by derivation compilers
+// (already imported via crate::types::*)
 
 // ── Core Functional Types ──────────────────────────────────────────
 
@@ -49,20 +52,55 @@ pub struct CompiledConstraint {
     pub predicate: Predicate,
 }
 
+/// A compiled derivation rule — produces derived facts instead of violations.
+/// Same architecture as CompiledConstraint but output type differs.
+/// Derivation: (context, population) → [DerivedFact]
+pub type DeriveFn = Arc<dyn Fn(&EvalContext, &Population) -> Vec<DerivedFact> + Send + Sync>;
+
+pub struct CompiledDerivation {
+    pub id: String,
+    pub text: String,
+    pub kind: DerivationKind,
+    pub derive: DeriveFn,
+}
+
 /// A compiled state machine: transition function + initial state.
-/// exec-symbols: StateMachine(transition)(initial)
+/// Evaluation: fold(transition)(initial)(event_stream)
 pub struct CompiledStateMachine {
     pub noun_name: String,
+    pub statuses: Vec<String>,
     pub initial: String,
     /// Transition: (current_state, event, ctx) → Option<next_state>
     /// Guard passes iff guard predicate produces zero violations.
     pub transition: Arc<dyn Fn(&str, &str, &EvalContext) -> Option<String> + Send + Sync>,
+    /// Compiled transitions as (from, to, event) for introspection
+    pub transition_table: Vec<(String, String, String)>,
 }
 
-/// The compiled model — all constraints and state machines as executable functions.
+/// Index for fast noun lookups during synthesis.
+pub struct NounIndex {
+    /// noun_name -> list of (fact_type_id, role_index) where noun plays a role
+    pub noun_to_fact_types: HashMap<String, Vec<(String, usize)>>,
+    /// noun_name -> world assumption
+    pub world_assumptions: HashMap<String, WorldAssumption>,
+    /// noun_name -> supertype name
+    pub supertypes: HashMap<String, String>,
+    /// noun_name -> list of subtype names
+    pub subtypes: HashMap<String, Vec<String>>,
+    /// fact_type_id -> list of constraint IDs spanning it
+    pub fact_type_to_constraints: HashMap<String, Vec<String>>,
+    /// constraint_id -> index into CompiledModel.constraints
+    pub constraint_index: HashMap<String, usize>,
+    /// noun_name -> state machine index
+    pub noun_to_state_machines: HashMap<String, usize>,
+}
+
+/// The compiled model — all constraints, derivations, and state machines as executable functions.
 pub struct CompiledModel {
     pub constraints: Vec<CompiledConstraint>,
+    pub derivations: Vec<CompiledDerivation>,
     pub state_machines: Vec<CompiledStateMachine>,
+    pub noun_index: NounIndex,
 }
 
 // ── Population Primitives ──────────────────────────────────────────
@@ -147,11 +185,446 @@ pub fn compile(ir: &ConstraintIR) -> CompiledModel {
         .map(|c| (c.id.clone(), c.predicate.clone()))
         .collect();
 
-    let state_machines = ir.state_machines.values()
+    let state_machines: Vec<CompiledStateMachine> = ir.state_machines.values()
         .map(|sm_def| compile_state_machine(sm_def, &constraint_predicates))
         .collect();
 
-    CompiledModel { constraints, state_machines }
+    // Build NounIndex for synthesis queries
+    let noun_index = build_noun_index(ir, &constraints, &state_machines);
+
+    // Compile derivation rules — both explicit from IR and implicit from structure
+    let derivations = compile_derivations(ir);
+
+    CompiledModel { constraints, derivations, state_machines, noun_index }
+}
+
+/// Build the NounIndex by iterating the IR.
+fn build_noun_index(
+    ir: &ConstraintIR,
+    constraints: &[CompiledConstraint],
+    state_machines: &[CompiledStateMachine],
+) -> NounIndex {
+    // noun_name -> list of (fact_type_id, role_index)
+    let mut noun_to_fact_types: HashMap<String, Vec<(String, usize)>> = HashMap::new();
+    for (ft_id, ft) in &ir.fact_types {
+        for role in &ft.roles {
+            noun_to_fact_types.entry(role.noun_name.clone())
+                .or_default()
+                .push((ft_id.clone(), role.role_index));
+        }
+    }
+
+    // noun_name -> world assumption
+    let world_assumptions: HashMap<String, WorldAssumption> = ir.nouns.iter()
+        .map(|(name, def)| (name.clone(), def.world_assumption.clone()))
+        .collect();
+
+    // noun_name -> supertype
+    let mut supertypes: HashMap<String, String> = HashMap::new();
+    let mut subtypes: HashMap<String, Vec<String>> = HashMap::new();
+    for (name, def) in &ir.nouns {
+        if let Some(ref st) = def.super_type {
+            supertypes.insert(name.clone(), st.clone());
+            subtypes.entry(st.clone()).or_default().push(name.clone());
+        }
+    }
+
+    // fact_type_id -> list of constraint IDs spanning it
+    let mut fact_type_to_constraints: HashMap<String, Vec<String>> = HashMap::new();
+    for cdef in &ir.constraints {
+        for span in &cdef.spans {
+            fact_type_to_constraints.entry(span.fact_type_id.clone())
+                .or_default()
+                .push(cdef.id.clone());
+        }
+    }
+
+    // constraint_id -> index
+    let constraint_index: HashMap<String, usize> = constraints.iter()
+        .enumerate()
+        .map(|(i, c)| (c.id.clone(), i))
+        .collect();
+
+    // noun_name -> state machine index
+    let noun_to_state_machines: HashMap<String, usize> = state_machines.iter()
+        .enumerate()
+        .map(|(i, sm)| (sm.noun_name.clone(), i))
+        .collect();
+
+    NounIndex {
+        noun_to_fact_types,
+        world_assumptions,
+        supertypes,
+        subtypes,
+        fact_type_to_constraints,
+        constraint_index,
+        noun_to_state_machines,
+    }
+}
+
+/// Compile all derivation rules: explicit from IR + implicit structural rules.
+fn compile_derivations(ir: &ConstraintIR) -> Vec<CompiledDerivation> {
+    let mut derivations = Vec::new();
+
+    // Compile explicit derivation rules from IR
+    for rule in &ir.derivation_rules {
+        let compiled = match rule.kind {
+            DerivationKind::SubtypeInheritance => compile_explicit_derivation(ir, rule),
+            DerivationKind::ModusPonens => compile_explicit_derivation(ir, rule),
+            DerivationKind::Transitivity => compile_explicit_derivation(ir, rule),
+            DerivationKind::ClosedWorldNegation => compile_explicit_derivation(ir, rule),
+        };
+        derivations.push(compiled);
+    }
+
+    // Implicit: subtype inheritance from noun definitions
+    derivations.extend(compile_subtype_inheritance(ir));
+
+    // Implicit: modus ponens from subset constraints
+    derivations.extend(compile_modus_ponens(ir));
+
+    // Implicit: transitivity from shared roles
+    derivations.extend(compile_transitivity(ir));
+
+    // Implicit: CWA negation from world assumptions
+    derivations.extend(compile_cwa_negation(ir));
+
+    derivations
+}
+
+/// Compile an explicit derivation rule from the IR.
+fn compile_explicit_derivation(ir: &ConstraintIR, rule: &DerivationRuleDef) -> CompiledDerivation {
+    let id = rule.id.clone();
+    let text = rule.text.clone();
+    let kind = rule.kind.clone();
+    let antecedent_ids = rule.antecedent_fact_type_ids.clone();
+    let consequent_id = rule.consequent_fact_type_id.clone();
+    let consequent_reading = ir.fact_types.get(&consequent_id)
+        .map(|ft| ft.reading.clone())
+        .unwrap_or_default();
+
+    let derive_id = id.clone();
+    let derive: DeriveFn = Arc::new(move |_ctx: &EvalContext, population: &Population| {
+        // Check if all antecedent fact types have instances
+        let all_hold = antecedent_ids.iter().all(|ft_id| {
+            population.facts.get(ft_id).map_or(false, |facts| !facts.is_empty())
+        });
+
+        if all_hold {
+            // Collect all entity bindings from antecedent facts
+            let mut bindings = Vec::new();
+            for ft_id in &antecedent_ids {
+                if let Some(facts) = population.facts.get(ft_id) {
+                    for fact in facts {
+                        for binding in &fact.bindings {
+                            if !bindings.contains(binding) {
+                                bindings.push(binding.clone());
+                            }
+                        }
+                    }
+                }
+            }
+
+            vec![DerivedFact {
+                fact_type_id: consequent_id.clone(),
+                reading: consequent_reading.clone(),
+                bindings,
+                derived_by: derive_id.clone(),
+                confidence: Confidence::Definitive,
+            }]
+        } else {
+            Vec::new()
+        }
+    });
+
+    CompiledDerivation { id, text, kind, derive }
+}
+
+/// Subtype inheritance: for each noun with a supertype,
+/// instances of the subtype inherit participation in the supertype's fact types.
+fn compile_subtype_inheritance(ir: &ConstraintIR) -> Vec<CompiledDerivation> {
+    let mut derivations = Vec::new();
+
+    for (sub_name, noun_def) in &ir.nouns {
+        if let Some(ref super_name) = noun_def.super_type {
+            // Find all fact types where the supertype plays a role
+            let super_fact_types: Vec<(String, String, usize)> = ir.fact_types.iter()
+                .flat_map(|(ft_id, ft)| {
+                    ft.roles.iter()
+                        .filter(|r| r.noun_name == *super_name)
+                        .map(move |r| (ft_id.clone(), ft.reading.clone(), r.role_index))
+                })
+                .collect();
+
+            if super_fact_types.is_empty() {
+                continue;
+            }
+
+            let sub = sub_name.clone();
+            let sup = super_name.clone();
+            let sft = super_fact_types.clone();
+            let id = format!("_subtype_{}_{}", sub, sup);
+            let text = format!("{} is a subtype of {} — inherits fact types", sub, sup);
+
+            let derive: DeriveFn = Arc::new(move |_ctx: &EvalContext, population: &Population| {
+                let mut derived = Vec::new();
+
+                // Find all instances of the subtype in the population
+                let sub_instances = instances_of(&sub, population);
+
+                for (ft_id, reading, _role_idx) in &sft {
+                    for instance in &sub_instances {
+                        // Check if this instance already participates in this fact type
+                        if !participates_in(instance, &sup, ft_id, population) {
+                            derived.push(DerivedFact {
+                                fact_type_id: ft_id.clone(),
+                                reading: reading.clone(),
+                                bindings: vec![(sup.clone(), instance.clone())],
+                                derived_by: format!("_subtype_{}_{}", sub, sup),
+                                confidence: Confidence::Definitive,
+                            });
+                        }
+                    }
+                }
+
+                derived
+            });
+
+            derivations.push(CompiledDerivation {
+                id,
+                text,
+                kind: DerivationKind::SubtypeInheritance,
+                derive,
+            });
+        }
+    }
+
+    derivations
+}
+
+/// Modus ponens on subset constraints: if A subset B (SS constraint),
+/// when we find an instance in A, derive its presence in B.
+fn compile_modus_ponens(ir: &ConstraintIR) -> Vec<CompiledDerivation> {
+    let mut derivations = Vec::new();
+
+    for cdef in &ir.constraints {
+        if cdef.kind != "SS" || cdef.spans.len() < 2 {
+            continue;
+        }
+
+        let a_ft_id = cdef.spans[0].fact_type_id.clone();
+        let b_ft_id = cdef.spans[1].fact_type_id.clone();
+
+        let entity_name = ir.fact_types.get(&a_ft_id)
+            .and_then(|ft| ft.roles.get(cdef.spans[0].role_index))
+            .map(|r| r.noun_name.clone())
+            .unwrap_or_default();
+
+        let b_reading = ir.fact_types.get(&b_ft_id)
+            .map(|ft| ft.reading.clone())
+            .unwrap_or_default();
+
+        let id = format!("_modus_ponens_{}", cdef.id);
+        let text = format!("Modus ponens from SS constraint: {}", cdef.text);
+        let derive_id = id.clone();
+
+        let derive: DeriveFn = Arc::new(move |_ctx: &EvalContext, population: &Population| {
+            let a_facts = population.facts.get(&a_ft_id).cloned().unwrap_or_default();
+            let b_facts = population.facts.get(&b_ft_id).cloned().unwrap_or_default();
+
+            a_facts.iter().filter_map(|a_fact| {
+                if let Some((_, entity_val)) = a_fact.bindings.iter()
+                    .find(|(name, _)| *name == entity_name)
+                {
+                    let b_holds = b_facts.iter().any(|bf| {
+                        bf.bindings.iter().any(|(_, val)| val == entity_val)
+                    });
+                    if !b_holds {
+                        Some(DerivedFact {
+                            fact_type_id: b_ft_id.clone(),
+                            reading: b_reading.clone(),
+                            bindings: vec![(entity_name.clone(), entity_val.clone())],
+                            derived_by: derive_id.clone(),
+                            confidence: Confidence::Definitive,
+                        })
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }).collect()
+        });
+
+        derivations.push(CompiledDerivation {
+            id,
+            text,
+            kind: DerivationKind::ModusPonens,
+            derive,
+        });
+    }
+
+    derivations
+}
+
+/// Transitivity: for fact types that share a noun in different roles (A->B, B->C),
+/// derive the transitive closure A->C. Limited depth to prevent infinite chains.
+fn compile_transitivity(ir: &ConstraintIR) -> Vec<CompiledDerivation> {
+    let mut derivations = Vec::new();
+
+    // Find binary fact types (exactly 2 roles) that share a noun
+    let binary_fts: Vec<(&String, &FactTypeDef)> = ir.fact_types.iter()
+        .filter(|(_, ft)| ft.roles.len() == 2)
+        .collect();
+
+    for (i, (ft1_id, ft1)) in binary_fts.iter().enumerate() {
+        for (j, (ft2_id, ft2)) in binary_fts.iter().enumerate() {
+            if i == j { continue; } // skip self-pairing
+            // Skip same fact type (self-transitivity handled separately)
+            // Check if ft1's role[1] noun == ft2's role[0] noun (A->B, B->C)
+            let ft1_r1 = &ft1.roles[1].noun_name;
+            let ft2_r0 = &ft2.roles[0].noun_name;
+
+            if ft1_r1 != ft2_r0 {
+                continue;
+            }
+
+            let shared_noun = ft1_r1.clone();
+            let src_noun = ft1.roles[0].noun_name.clone();
+            let dst_noun = ft2.roles[1].noun_name.clone();
+
+            let ft1_id_c = (*ft1_id).clone();
+            let ft2_id_c = (*ft2_id).clone();
+            let reading = format!("{} transitively relates to {} via {}",
+                src_noun, dst_noun, shared_noun);
+
+            let id = format!("_transitivity_{}_{}",  ft1_id_c, ft2_id_c);
+            let derive_id = id.clone();
+            let reading_c = reading.clone();
+            let src_noun_c = src_noun.clone();
+            let dst_noun_c = dst_noun.clone();
+            let shared_noun_c = shared_noun.clone();
+
+            let derive: DeriveFn = Arc::new(move |_ctx: &EvalContext, population: &Population| {
+                let ft1_facts = population.facts.get(&ft1_id_c).cloned().unwrap_or_default();
+                let ft2_facts = population.facts.get(&ft2_id_c).cloned().unwrap_or_default();
+
+                let mut derived = Vec::new();
+
+                for f1 in &ft1_facts {
+                    // Get the value of the shared noun from ft1's role[1]
+                    let shared_val = f1.bindings.iter()
+                        .find(|(name, _)| *name == shared_noun_c)
+                        .map(|(_, v)| v.clone());
+
+                    let src_val = f1.bindings.iter()
+                        .find(|(name, _)| *name == src_noun_c)
+                        .map(|(_, v)| v.clone());
+
+                    if let (Some(shared_v), Some(src_v)) = (shared_val, src_val) {
+                        // Find matching ft2 facts where role[0] == shared_val
+                        for f2 in &ft2_facts {
+                            let f2_shared = f2.bindings.iter()
+                                .find(|(name, _)| *name == shared_noun_c)
+                                .map(|(_, v)| v.clone());
+
+                            if f2_shared.as_deref() == Some(&shared_v) {
+                                if let Some((_, dst_v)) = f2.bindings.iter()
+                                    .find(|(name, _)| *name == dst_noun_c)
+                                {
+                                    derived.push(DerivedFact {
+                                        fact_type_id: format!("_transitive_{}_{}",
+                                            ft1_id_c, ft2_id_c),
+                                        reading: reading_c.clone(),
+                                        bindings: vec![
+                                            (src_noun_c.clone(), src_v.clone()),
+                                            (dst_noun_c.clone(), dst_v.clone()),
+                                        ],
+                                        derived_by: derive_id.clone(),
+                                        confidence: Confidence::Definitive,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+
+                derived
+            });
+
+            derivations.push(CompiledDerivation {
+                id,
+                text: reading,
+                kind: DerivationKind::Transitivity,
+                derive,
+            });
+        }
+    }
+
+    derivations
+}
+
+/// CWA negation: for nouns with WorldAssumption::Closed,
+/// if a fact type involving this noun has no instances for a given entity,
+/// derive the negation. For OWA nouns, absence is unknown, not false.
+fn compile_cwa_negation(ir: &ConstraintIR) -> Vec<CompiledDerivation> {
+    let mut derivations = Vec::new();
+
+    for (noun_name, noun_def) in &ir.nouns {
+        if noun_def.world_assumption != WorldAssumption::Closed {
+            continue;
+        }
+
+        // Find all fact types where this CWA noun plays a role
+        let relevant_fts: Vec<(String, String, usize)> = ir.fact_types.iter()
+            .flat_map(|(ft_id, ft)| {
+                ft.roles.iter()
+                    .filter(|r| r.noun_name == *noun_name)
+                    .map(move |r| (ft_id.clone(), ft.reading.clone(), r.role_index))
+            })
+            .collect();
+
+        if relevant_fts.is_empty() {
+            continue;
+        }
+
+        let noun = noun_name.clone();
+        let rft = relevant_fts.clone();
+        let id = format!("_cwa_negation_{}", noun);
+        let text = format!("CWA: absent facts about {} are false", noun);
+        let derive_id = id.clone();
+
+        let derive: DeriveFn = Arc::new(move |_ctx: &EvalContext, population: &Population| {
+            let all_instances = instances_of(&noun, population);
+            let mut derived = Vec::new();
+
+            for (ft_id, reading, _role_idx) in &rft {
+                for instance in &all_instances {
+                    if !participates_in(instance, &noun, ft_id, population) {
+                        derived.push(DerivedFact {
+                            fact_type_id: ft_id.clone(),
+                            reading: format!("NOT: {} (CWA negation for {} '{}')",
+                                reading, noun, instance),
+                            bindings: vec![(noun.clone(), instance.clone())],
+                            derived_by: derive_id.clone(),
+                            confidence: Confidence::Definitive,
+                        });
+                    }
+                }
+            }
+
+            derived
+        });
+
+        derivations.push(CompiledDerivation {
+            id,
+            text,
+            kind: DerivationKind::ClosedWorldNegation,
+            derive,
+        });
+    }
+
+    derivations
 }
 
 fn compile_constraint(ir: &ConstraintIR, def: &ConstraintDef) -> CompiledConstraint {
@@ -576,8 +1049,8 @@ fn compile_obligatory(ir: &ConstraintIR, def: &ConstraintDef) -> Predicate {
 }
 
 // ── State Machine Compilation ──────────────────────────────────────
-// exec-symbols: StateMachine(transition)(initial)
-// run_machine(machine)(stream) = fold(transition)(initial)(stream)
+// State machines compile to transition functions.
+// run_machine = fold(transition)(initial)(stream)
 
 struct CompiledTransition {
     from: String,
@@ -590,6 +1063,11 @@ fn compile_state_machine(
     def: &StateMachineDef,
     constraint_predicates: &HashMap<String, Predicate>,
 ) -> CompiledStateMachine {
+    // Build transition table for introspection
+    let transition_table: Vec<(String, String, String)> = def.transitions.iter()
+        .map(|t| (t.from.clone(), t.to.clone(), t.event.clone()))
+        .collect();
+
     let transitions: Vec<CompiledTransition> = def.transitions.iter()
         .map(|t| {
             let guard_preds: Vec<Predicate> = t.guard.as_ref()
@@ -626,7 +1104,9 @@ fn compile_state_machine(
 
     CompiledStateMachine {
         noun_name: def.noun_name.clone(),
+        statuses: def.statuses.clone(),
         initial,
         transition: transition_fn,
+        transition_table,
     }
 }

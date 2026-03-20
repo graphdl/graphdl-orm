@@ -521,7 +521,7 @@ export async function handleParseOrm(request: Request, env: Env): Promise<Respon
     nouns: result.nouns.length,
     readings: result.readings.length,
     constraints: result.constraints.length,
-    subtypes: result.subtypes.length,
+    subtypes: (result.subtypes ?? []).length,
     warnings: result.warnings.length,
     claims: result,
   })
