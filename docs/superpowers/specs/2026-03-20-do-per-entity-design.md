@@ -20,6 +20,8 @@ The current graphdl-orm architecture puts an entire relational database (31 tabl
 
 **Subset constraints with autofill are lookups.** "Fills from superset" means: when a new fact arrives, the subset constraint resolves references against the superset population. This is how cross-entity relationships are derived — a message with a phone number automatically resolves to a Customer.
 
+**FP is the basis of parallelism.** The FOL engine is a functional programming system — pure functions over immutable populations, no shared mutable state. Fan-out to Entity DOs is map (each returns its immutable fact set). FOL predicate evaluation is reduce. Parallelism is safe because it falls out of the FP paradigm, not bolted on.
+
 ## Architecture
 
 ### Four DO Types
