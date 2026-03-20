@@ -12,6 +12,14 @@ export interface EntityData {
   data: Record<string, unknown>
 }
 
+export interface EventRecord {
+  id: string
+  timestamp: string
+  operation: string
+  data: string | null
+  prev: string | null
+}
+
 export interface SqlLike {
   exec(query: string, ...params: any[]): { toArray(): any[] }
 }
@@ -95,4 +103,98 @@ export function getEntity(sql: SqlLike): {
     updatedAt: row.updated_at ?? null,
     deletedAt: row.deleted_at ?? null,
   }
+}
+
+/**
+ * Updates an entity by shallow-merging fields into the existing data.
+ * Increments version, updates updated_at, and logs a CDC 'update' event.
+ * Returns null if no entity exists.
+ */
+export function updateEntity(sql: SqlLike, fields: Record<string, unknown>): { id: string; version: number } | null {
+  const existing = getEntity(sql)
+  if (!existing) return null
+
+  const now = new Date().toISOString()
+  const prevData = existing.data
+  const newData = { ...prevData, ...fields }
+  const newVersion = existing.version + 1
+  const newDataJson = JSON.stringify(newData)
+  const prevDataJson = JSON.stringify(prevData)
+
+  sql.exec(
+    `UPDATE entity SET data = ?, version = ?, updated_at = ? WHERE id = ?`,
+    newDataJson,
+    newVersion,
+    now,
+    existing.id,
+  )
+
+  const eventId = crypto.randomUUID()
+  sql.exec(
+    `INSERT INTO events (id, timestamp, operation, data, prev) VALUES (?, ?, ?, ?, ?)`,
+    eventId,
+    now,
+    'update',
+    newDataJson,
+    prevDataJson,
+  )
+
+  return { id: existing.id, version: newVersion }
+}
+
+/**
+ * Soft-deletes an entity by setting deleted_at and updated_at.
+ * Logs a CDC 'delete' event. Returns null if no entity exists.
+ */
+export function deleteEntity(sql: SqlLike): { id: string; deleted: boolean } | null {
+  const existing = getEntity(sql)
+  if (!existing) return null
+
+  const now = new Date().toISOString()
+  const prevDataJson = JSON.stringify(existing.data)
+
+  sql.exec(
+    `UPDATE entity SET deleted_at = ?, updated_at = ? WHERE id = ?`,
+    now,
+    now,
+    existing.id,
+  )
+
+  const eventId = crypto.randomUUID()
+  sql.exec(
+    `INSERT INTO events (id, timestamp, operation, data, prev) VALUES (?, ?, ?, ?, ?)`,
+    eventId,
+    now,
+    'delete',
+    null,
+    prevDataJson,
+  )
+
+  return { id: existing.id, deleted: true }
+}
+
+/**
+ * Returns events in reverse chronological order (newest first).
+ * If `since` is provided, only returns events after that timestamp.
+ */
+export function getEvents(sql: SqlLike, since?: string): EventRecord[] {
+  let rows: any[]
+  if (since) {
+    rows = sql.exec(
+      `SELECT * FROM events WHERE timestamp > ? ORDER BY timestamp DESC`,
+      since,
+    ).toArray()
+  } else {
+    rows = sql.exec(
+      `SELECT * FROM events ORDER BY timestamp DESC`,
+    ).toArray()
+  }
+
+  return rows.map((row: any) => ({
+    id: row.id,
+    timestamp: row.timestamp,
+    operation: row.operation,
+    data: row.data ?? null,
+    prev: row.prev ?? null,
+  }))
 }
