@@ -482,7 +482,7 @@ export async function ingestFacts(
       const fieldValues: Record<string, string> = {}
 
       // For binary facts: the second value is the field
-      if (values.length >= 2) {
+      if (values.length >= 2 && values[1].noun) {
         // Convert value type name to camelCase field name
         const fieldName = values[1].noun
           .split(' ')

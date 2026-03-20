@@ -1183,6 +1183,7 @@ export class GraphDLDB extends DurableObject {
     toColumnName: (s: string) => string,
     toTableName: (s: string) => string,
   ): Promise<{ id: string }> {
+    const tableName = toTableName(nounName)
     const ts = now || new Date().toISOString().replace('T', ' ').replace('Z', '')
 
     // Read fieldMap from cached schema-map (written by applySchema, already called by parent createEntity)
