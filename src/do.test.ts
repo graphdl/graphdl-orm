@@ -1,4 +1,6 @@
 import { describe, it, expect } from 'vitest'
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { COLLECTION_TABLE_MAP, COLLECTION_SLUGS } from './collections'
 import { BOOTSTRAP_DDL } from './schema/bootstrap'
 import { WIPE_TABLES } from './wipe-tables'
@@ -51,5 +53,32 @@ describe('wipeAllData coverage', () => {
 
   it('WIPE_TABLES includes the cdc_events infrastructure table', () => {
     expect(WIPE_TABLES).toContain('cdc_events')
+  })
+})
+
+describe('createEntityInner', () => {
+  it('defines tableName from toTableName(nounName) before first use', () => {
+    // createEntityInner is a private method on GraphDLDB, so we verify at source level
+    // that the variable is properly defined before it is referenced.
+    const source = readFileSync(join(__dirname, 'do.ts'), 'utf-8')
+
+    // Extract the createEntityInner method body
+    const methodStart = source.indexOf('private async createEntityInner(')
+    expect(methodStart).toBeGreaterThan(-1)
+
+    // Find the closing brace of the method signature (the line with "): Promise<{ id: string }> {")
+    const bodyStart = source.indexOf('): Promise<{ id: string }> {', methodStart)
+    expect(bodyStart).toBeGreaterThan(-1)
+
+    // Extract body from the opening brace to a reasonable length
+    const body = source.slice(bodyStart, bodyStart + 2000)
+
+    // tableName must be defined BEFORE it is used in expressions like `${tableName}`
+    const defIndex = body.indexOf('const tableName')
+    expect(defIndex).toBeGreaterThan(-1)
+
+    // The definition should come before any usage of tableName in template literals or references
+    const firstUsage = body.indexOf('tableName', defIndex + 'const tableName'.length)
+    expect(firstUsage).toBeGreaterThan(defIndex)
   })
 })

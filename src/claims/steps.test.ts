@@ -433,4 +433,43 @@ describe('ingestFacts', () => {
     expect(scope.errors.length).toBeGreaterThan(0)
     expect(scope.errors[0]).toContain('no entity name')
   })
+
+  it('does not crash when values[1].noun is undefined', async () => {
+    const db = mockDb()
+    const scope = createScope()
+
+    // values[1] exists but has no noun property — should not throw
+    await ingestFacts(db as any, [
+      {
+        reading: 'Customer has Name',
+        values: [
+          { noun: 'Customer', value: 'Acme' },
+          { value: 'Acme Corp' }, // missing noun
+        ],
+      },
+    ], 'd1', scope)
+
+    // Should not crash. createEntity should either not be called or be called
+    // without the field (since noun was missing and couldn't derive field name).
+    // Either way, no uncaught exception.
+    expect(scope.errors.length).toBe(0)
+  })
+
+  it('does not crash when values[1] is completely empty', async () => {
+    const db = mockDb()
+    const scope = createScope()
+
+    await ingestFacts(db as any, [
+      {
+        reading: 'Customer has Name',
+        values: [
+          { noun: 'Customer', value: 'Acme' },
+          {}, // no noun, no value
+        ],
+      },
+    ], 'd1', scope)
+
+    // Should not crash with "Cannot read properties of undefined (reading 'split')"
+    expect(scope.errors.length).toBe(0)
+  })
 })
