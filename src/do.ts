@@ -214,103 +214,14 @@ export class GraphDLDB extends DurableObject {
   // =========================================================================
 
   protected initTables(): void {
+    // Bootstrap DDL is generated from readings/*.md at build time.
+    // See: scripts/generate-bootstrap.ts
+    // Regenerate with: npx tsx scripts/generate-bootstrap.ts
     for (const ddl of ALL_DDL) {
       this.sql.exec(ddl)
     }
 
-    // Migrations: add columns that didn't exist in earlier DDL versions
-    const migrations = [
-      'ALTER TABLE functions ADD COLUMN headers TEXT',
-      'ALTER TABLE domains ADD COLUMN app_id TEXT',
-      'CREATE INDEX IF NOT EXISTS idx_domains_app ON domains(app_id)',
-      'ALTER TABLE domains ADD COLUMN label TEXT',
-      // events table: add domain_id and updated_at
-      'ALTER TABLE events ADD COLUMN domain_id TEXT',
-      'ALTER TABLE events ADD COLUMN updated_at TEXT',
-      'CREATE INDEX IF NOT EXISTS idx_events_domain ON events(domain_id)',
-      // statuses + transitions: add domain_id for direct domain scoping
-      'ALTER TABLE statuses ADD COLUMN domain_id TEXT',
-      'CREATE INDEX IF NOT EXISTS idx_statuses_domain ON statuses(domain_id)',
-      'ALTER TABLE transitions ADD COLUMN domain_id TEXT',
-      'ALTER TABLE transitions ADD COLUMN state_machine_definition_id TEXT',
-      'CREATE INDEX IF NOT EXISTS idx_transitions_domain ON transitions(domain_id)',
-      // resources: add created_by for per-user scoping
-      'ALTER TABLE resources ADD COLUMN created_by TEXT',
-      'CREATE INDEX IF NOT EXISTS idx_resources_created_by ON resources(created_by)',
-      // constraints: add text column for source text round-tripping
-      'ALTER TABLE constraints ADD COLUMN text TEXT',
-      // constraints: add set_comparison_argument_length for SS/XC/EQ
-      'ALTER TABLE constraints ADD COLUMN set_comparison_argument_length INTEGER',
-      // constraint_spans: add subset_autofill for SS constraints
-      'ALTER TABLE constraint_spans ADD COLUMN subset_autofill INTEGER DEFAULT 0',
-      // apps: add config columns (from readings/organizations.md)
-      'ALTER TABLE apps ADD COLUMN app_type TEXT',
-      'ALTER TABLE apps ADD COLUMN chat_endpoint TEXT',
-      // messages: add sender_identity for user/assistant role distinction
-      'ALTER TABLE messages ADD COLUMN sender_identity TEXT',
-    ]
-
-    // Entity tables (messages, support_requests, etc.) are created by applySchema on first use.
-    for (const migration of migrations) {
-      try { this.sql.exec(migration) } catch { /* column/index already exists */ }
-    }
-
-    // Migration: widen org_memberships role CHECK to include 'admin'
-    // SQLite can't ALTER CHECK constraints, so recreate the table
-    try {
-      const hasAdmin = this.sql.exec(
-        `SELECT sql FROM sqlite_master WHERE name = 'org_memberships'`
-      ).toArray()
-      const ddl = hasAdmin[0]?.sql as string || ''
-      if (ddl && !ddl.includes("'admin'")) {
-        this.sql.exec(`CREATE TABLE IF NOT EXISTS org_memberships_new (
-          id TEXT PRIMARY KEY,
-          user_email TEXT NOT NULL,
-          organization_id TEXT NOT NULL REFERENCES organizations(id),
-          role TEXT NOT NULL DEFAULT 'member' CHECK (role IN ('owner', 'admin', 'member')),
-          created_at TEXT NOT NULL DEFAULT (datetime('now')),
-          updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-          version INTEGER NOT NULL DEFAULT 1,
-          UNIQUE(user_email, organization_id)
-        )`)
-        this.sql.exec(`INSERT INTO org_memberships_new SELECT * FROM org_memberships`)
-        this.sql.exec(`DROP TABLE org_memberships`)
-        this.sql.exec(`ALTER TABLE org_memberships_new RENAME TO org_memberships`)
-        this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_org_memberships_email ON org_memberships(user_email)`)
-        this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_org_memberships_org ON org_memberships(organization_id)`)
-      }
-    } catch { /* migration already applied or table doesn't exist yet */ }
-
-    // Migration: widen constraints kind CHECK to include 'RC' for ring constraints
-    try {
-      const constraintsDdl = this.sql.exec(
-        `SELECT sql FROM sqlite_master WHERE name = 'constraints'`
-      ).toArray()
-      const sql = constraintsDdl[0]?.sql as string || ''
-      if (sql && !sql.includes("'RC'")) {
-        this.sql.exec(`CREATE TABLE IF NOT EXISTS constraints_new (
-          id TEXT PRIMARY KEY,
-          kind TEXT NOT NULL CHECK (kind IN ('UC', 'MC', 'SS', 'XC', 'EQ', 'OR', 'XO', 'RC')),
-          modality TEXT NOT NULL DEFAULT 'Alethic' CHECK (modality IN ('Alethic', 'Deontic')),
-          text TEXT,
-          domain_id TEXT REFERENCES domains(id),
-          created_at TEXT NOT NULL DEFAULT (datetime('now')),
-          updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-          version INTEGER NOT NULL DEFAULT 1
-        )`)
-        this.sql.exec(`INSERT INTO constraints_new SELECT id, kind, modality, text, domain_id, created_at, updated_at, version FROM constraints`)
-        this.sql.exec(`DROP TABLE constraints`)
-        this.sql.exec(`ALTER TABLE constraints_new RENAME TO constraints`)
-        this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_constraints_domain ON constraints(domain_id)`)
-      }
-    } catch { /* migration already applied or table doesn't exist yet */ }
-
-    // Migration: unique partial index — at most one owner per org
-    try {
-      this.sql.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_org_one_owner ON org_memberships(organization_id) WHERE role = 'owner'`)
-    } catch { /* already exists */ }
-
-    // CDC events table — tracks mutations for sync/forwarding
+    // CDC events table — infrastructure, not a domain concept
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS cdc_events (
         id TEXT PRIMARY KEY,
@@ -323,9 +234,6 @@ export class GraphDLDB extends DurableObject {
     `)
     this.sql.exec('CREATE INDEX IF NOT EXISTS idx_cdc_events_timestamp ON cdc_events(timestamp)')
     this.sql.exec('CREATE INDEX IF NOT EXISTS idx_cdc_events_table ON cdc_events(table_name, entity_id)')
-
-    // Metamodel data is seeded via POST /graphdl/parse with seed:true
-    // (no hardcoded bootstrap — readings are the source of truth)
   }
 
   /** Wipe all metamodel data for a domain (nouns, readings, constraints, roles, etc.) */
@@ -999,9 +907,9 @@ export class GraphDLDB extends DurableObject {
 
         // Determine the natural key column (reference scheme)
         const refCol = tableColumns.has('reference') ? 'reference'
-          : tableColumns.has('name') ? 'name'
           : tableColumns.has('slug') ? 'slug'
           : tableColumns.has('domain_slug') ? 'domain_slug'
+          : tableColumns.has('name') ? 'name'
           : null
 
         // Upsert: if reference is provided, find existing row by natural key.
@@ -1131,9 +1039,25 @@ export class GraphDLDB extends DurableObject {
             cols.push(colName)
             vals.push(fieldValue)
           } else if (tableColumns.has(fkColName)) {
-            // FK reference — find or create the related entity
-            cols.push(fkColName)
-            vals.push(fieldValue) // For now, store the value directly (TODO: resolve to resource ID)
+            // FK reference — resolve slug/name to UUID via target table
+            const targetTable = FK_TARGET_TABLE[fkColName]
+            if (targetTable && typeof fieldValue === 'string') {
+              const refCols = ['slug', 'domain_slug', 'name', 'reference']
+              let resolved: string | null = null
+              for (const rc of refCols) {
+                try {
+                  const rows = this.sql.exec(
+                    `SELECT id FROM ${targetTable} WHERE ${rc} = ? LIMIT 1`, fieldValue
+                  ).toArray()
+                  if (rows.length) { resolved = rows[0].id as string; break }
+                } catch { /* column may not exist */ }
+              }
+              cols.push(fkColName)
+              vals.push(resolved || fieldValue)
+            } else {
+              cols.push(fkColName)
+              vals.push(fieldValue)
+            }
           }
         }
 
