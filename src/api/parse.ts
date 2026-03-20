@@ -13,7 +13,8 @@ interface ParseResult extends ExtractedClaims {
 }
 
 type Section = 'entity-types' | 'value-types' | 'subtypes' | 'fact-types' | 'constraints'
-  | 'mandatory-constraints' | 'deontic-constraints' | 'derivation-rules' | 'instance-facts' | 'unknown'
+  | 'mandatory-constraints' | 'deontic-constraints' | 'derivation-rules' | 'instance-facts'
+  | 'states' | 'transitions' | 'unknown'
 
 // ── Section header detection ──────────────────────────────────────────
 
@@ -26,6 +27,8 @@ const SECTION_MAP: Array<[RegExp, Section]> = [
   [/^##\s*Deontic\s*Constraints?/i, 'deontic-constraints'],
   [/^##\s*Derivation\s*Rules?/i, 'derivation-rules'],
   [/^##\s*Instance\s*Facts?/i, 'instance-facts'],
+  [/^##\s*States?$/i, 'states'],
+  [/^##\s*Transitions?$/i, 'transitions'],
 ]
 
 function detectSection(line: string): Section | null {
@@ -105,6 +108,7 @@ export function parseFORML2(
   const readings: ParseResult['readings'] = []
   const constraints: ParseResult['constraints'] = []
   const subtypes: ParseResult['subtypes'] = []
+  const transitions: Array<{ entity: string; from: string; to: string; event: string }> = []
   const facts: ParseResult['facts'] = []
 
   // Initialize nounMap with existing nouns
@@ -146,6 +150,47 @@ export function parseFORML2(
     if (COMMENT_LINE.test(line)) continue
 
     totalLines++
+
+    // ── State machine states (comma-separated list) ──────────────────
+    if (section === 'states') {
+      // Parse "Triaging, Waiting On Customer, Resolved"
+      const stateNames = line.split(',').map(s => s.trim()).filter(Boolean)
+      if (stateNames.length >= 2) {
+        // Derive entity name from the document title (# Support Request Lifecycle → Support Request)
+        const titleMatch = text.match(/^#\s+(.+?)(?:\s+Lifecycle)?$/m)
+        const entityName = titleMatch ? titleMatch[1].trim() : ''
+        for (const state of stateNames) {
+          if (!nounMap.has(state)) nounMap.set(state, { name: state, objectType: 'entity' })
+        }
+        parsedLines++
+        continue
+      }
+    }
+
+    // ── State machine transitions (markdown table) ───────────────────
+    if (section === 'transitions') {
+      // Skip table header and separator rows
+      if (line.startsWith('|') && (line.includes('From') || line.includes('---'))) {
+        parsedLines++
+        continue
+      }
+      // Parse "| Triaging | Resolved | resolve |"
+      if (line.startsWith('|')) {
+        const cells = line.split('|').map(c => c.trim()).filter(Boolean)
+        if (cells.length >= 3) {
+          const titleMatch = text.match(/^#\s+(.+?)(?:\s+Lifecycle)?$/m)
+          const entityName = titleMatch ? titleMatch[1].trim() : ''
+          transitions.push({
+            entity: entityName,
+            from: cells[0],
+            to: cells[1],
+            event: cells[2],
+          })
+          parsedLines++
+          continue
+        }
+      }
+    }
 
     // ── Entity type declaration ──────────────────────────────────────
     let m = line.replace(/\.$/, '').match(ENTITY_TYPE)
@@ -446,7 +491,7 @@ export function parseFORML2(
     readings,
     constraints,
     subtypes,
-    transitions: [],
+    transitions,
     facts,
     warnings,
     unparsed,
