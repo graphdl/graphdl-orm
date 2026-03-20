@@ -278,12 +278,14 @@ export function setTableProperty({
   }
 
   const key = nameToKey('Update' + (subject.name || ''))
+  if (!tables[key]) return // Schema not yet created for this entity — skip silently
   const properties = tables[key].properties ?? {}
   properties[propertyName] = property
   tables[key].properties = properties
 
   if (required) {
     const reqKey = nameToKey((propertyName === 'id' ? '' : 'New') + (subject.name || ''))
+    if (!tables[reqKey]) return
     if (!tables[reqKey].required) tables[reqKey].required = []
     tables[reqKey].required?.push(propertyName)
   }
