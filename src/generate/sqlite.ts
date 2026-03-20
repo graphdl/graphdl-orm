@@ -10,8 +10,19 @@
 // Name conversion helpers
 // ---------------------------------------------------------------------------
 
-/** PascalCase → snake_case plural (table name). */
+import { NOUN_TABLE_MAP } from '../collections'
+
+/** Noun name → SQL table name. Checks metamodel mapping first, then generates snake_case plural. */
 export function toTableName(name: string): string {
+  // Check metamodel table mapping (handles irregular plurals like Status → statuses)
+  if (NOUN_TABLE_MAP[name]) return NOUN_TABLE_MAP[name]
+
+  // Handle spaced names: "Support Request" → "support_requests"
+  if (name.includes(' ')) {
+    return name.toLowerCase().replace(/\s+/g, '_') + 's'
+  }
+
+  // PascalCase → snake_case plural
   return (
     name
       .replace(/([A-Z])/g, '_$1')
