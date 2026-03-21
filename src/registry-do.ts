@@ -6,6 +6,8 @@
  * owns a given noun type.
  */
 
+import { DurableObject } from 'cloudflare:workers'
+
 // =========================================================================
 // Types
 // =========================================================================
@@ -78,6 +80,47 @@ export function indexNoun(sql: SqlLike, nounName: string, domainSlug: string): v
 }
 
 // =========================================================================
+// Entity indexing
+// =========================================================================
+
+/**
+ * Upsert an entity into the entity_index with deleted=0.
+ * INSERT OR REPLACE ensures idempotency and also "re-indexes" a
+ * previously soft-deleted entity.
+ */
+export function indexEntity(sql: SqlLike, nounType: string, entityId: string): void {
+  sql.exec(
+    `INSERT OR REPLACE INTO entity_index (noun_type, entity_id, deleted) VALUES (?, ?, ?)`,
+    nounType,
+    entityId,
+    0,
+  )
+}
+
+/**
+ * Soft-delete an entity from the index by setting deleted=1.
+ */
+export function deindexEntity(sql: SqlLike, nounType: string, entityId: string): void {
+  sql.exec(
+    `UPDATE entity_index SET deleted=1 WHERE noun_type=? AND entity_id=?`,
+    nounType,
+    entityId,
+  )
+}
+
+/**
+ * Returns all non-deleted entity IDs for a given noun type.
+ */
+export function getEntityIds(sql: SqlLike, nounType: string): string[] {
+  const rows = sql.exec(
+    `SELECT entity_id FROM entity_index WHERE noun_type=? AND deleted=0`,
+    nounType,
+  ).toArray()
+
+  return rows.map((row: any) => row.entity_id)
+}
+
+// =========================================================================
 // Noun resolution
 // =========================================================================
 
@@ -100,5 +143,49 @@ export function resolveNounInRegistry(sql: SqlLike, nounName: string): { domainS
   return {
     domainSlug: row.domain_slug,
     domainDoId: row.domain_do_id,
+  }
+}
+
+// =========================================================================
+// Durable Object class
+// =========================================================================
+
+export class RegistryDB extends DurableObject {
+  private initialized = false
+
+  private ensureInit(): void {
+    if (this.initialized) return
+    initRegistrySchema(this.ctx.storage.sql)
+    this.initialized = true
+  }
+
+  async registerDomain(slug: string, doId: string, visibility?: string): Promise<void> {
+    this.ensureInit()
+    registerDomain(this.ctx.storage.sql, slug, doId, visibility)
+  }
+
+  async indexNoun(nounName: string, domainSlug: string): Promise<void> {
+    this.ensureInit()
+    indexNoun(this.ctx.storage.sql, nounName, domainSlug)
+  }
+
+  async resolveNoun(nounName: string): Promise<{ domainSlug: string; domainDoId: string } | null> {
+    this.ensureInit()
+    return resolveNounInRegistry(this.ctx.storage.sql, nounName)
+  }
+
+  async indexEntity(nounType: string, entityId: string): Promise<void> {
+    this.ensureInit()
+    indexEntity(this.ctx.storage.sql, nounType, entityId)
+  }
+
+  async deindexEntity(nounType: string, entityId: string): Promise<void> {
+    this.ensureInit()
+    deindexEntity(this.ctx.storage.sql, nounType, entityId)
+  }
+
+  async getEntityIds(nounType: string): Promise<string[]> {
+    this.ensureInit()
+    return getEntityIds(this.ctx.storage.sql, nounType)
   }
 }
