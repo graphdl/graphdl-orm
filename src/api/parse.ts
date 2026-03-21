@@ -421,7 +421,31 @@ export function parseFORML2(
     // PascalCase fallback if still fewer than 2 nouns
     if (nounNames.length < 2) {
       const pascalWords = cleanLine.match(/[A-Z][a-zA-Z0-9]*/g) || []
-      if (pascalWords.length >= 2) nounNames = pascalWords
+      if (pascalWords.length >= 2) {
+        // Merge consecutive PascalCase words that form known noun names
+        // e.g. ["API", "Product", "Title"] → ["API Product", "Title"]
+        // when "API Product" is a known noun in nounMap
+        const merged: string[] = []
+        let pw = 0
+        while (pw < pascalWords.length) {
+          let matched = false
+          // Try longest sequence of consecutive words first
+          for (let end = pascalWords.length; end > pw; end--) {
+            const candidate = pascalWords.slice(pw, end).join(' ')
+            if (nounMap.has(candidate)) {
+              merged.push(candidate)
+              pw = end
+              matched = true
+              break
+            }
+          }
+          if (!matched) {
+            merged.push(pascalWords[pw])
+            pw++
+          }
+        }
+        nounNames = merged
+      }
     }
 
     // Unary fact (1 noun)
@@ -575,8 +599,8 @@ function resolveConstrainedRole(
 // ── HTTP Handler ───────────────────────────────────────────────────
 
 function getDB(env: Env): DurableObjectStub {
-  const id = env.GRAPHDL_DB.idFromName('graphdl-primary')
-  return env.GRAPHDL_DB.get(id)
+  const id = env.DOMAIN_DB.idFromName('graphdl-primary')
+  return env.DOMAIN_DB.get(id)
 }
 
 export async function handleParse(request: Request, env: Env): Promise<Response> {

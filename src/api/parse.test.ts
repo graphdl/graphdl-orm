@@ -298,4 +298,36 @@ If some Message has Lead then that Message has SalesRep.`
 
     expect(result.warnings).toEqual([])
   })
+
+  it('preserves compound noun names with acronyms in PascalCase fallback', () => {
+    const result = parseFORML2(`
+## Entity Types
+API Product(.Name) is an entity type.
+VIN Decode(.id) is an entity type.
+
+## Fact Types
+API Product has Title.
+VIN Decode has Result.
+`, [])
+
+    // "API Product" should be kept as a single multi-word noun,
+    // not split into "API" and "Product" by the PascalCase fallback
+    const apiProduct = result.nouns.find(n => n.name === 'API Product')
+    expect(apiProduct).toBeDefined()
+
+    const vinDecode = result.nouns.find(n => n.name === 'VIN Decode')
+    expect(vinDecode).toBeDefined()
+
+    // Readings should reference the multi-word noun names
+    const reading = result.readings.find(r => r.nouns.includes('API Product'))
+    expect(reading).toBeDefined()
+    expect(reading!.nouns).toContain('API Product')
+    expect(reading!.nouns).toContain('Title')
+    expect(reading!.predicate).toBe('has')
+
+    const reading2 = result.readings.find(r => r.nouns.includes('VIN Decode'))
+    expect(reading2).toBeDefined()
+    expect(reading2!.nouns).toContain('VIN Decode')
+    expect(reading2!.nouns).toContain('Result')
+  })
 })
