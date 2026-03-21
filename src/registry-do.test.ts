@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest'
 import type { SqlLike } from './registry-do'
-import { initRegistrySchema, registerDomain, indexNoun, resolveNounInRegistry } from './registry-do'
+import { initRegistrySchema, registerDomain, indexNoun, resolveNounInRegistry, indexEntity, deindexEntity, getEntityIds } from './registry-do'
 
 /**
  * In-memory mock of SqlLike that stores rows per table and supports
@@ -66,6 +66,63 @@ function createMockSql(): SqlLike & { tables: Record<string, any[]> } {
           }
         }
         return { toArray: () => results }
+      }
+
+      // UPDATE <table> SET col=val WHERE col=? AND col=?
+      const updateMatch = trimmed.match(/UPDATE\s+(\w+)\s+SET\s+(.+?)\s+WHERE\s+(.+)/i)
+      if (updateMatch) {
+        const tableName = updateMatch[1]
+        const setClause = updateMatch[2]
+        const whereClause = updateMatch[3]
+        // Parse SET assignments (e.g., "deleted=1" or "deleted = ?")
+        const setAssignments = setClause.split(',').map(s => s.trim())
+        // Parse WHERE conditions (e.g., "noun_type=? AND entity_id=?")
+        const whereConditions = whereClause.split(/\s+AND\s+/i).map(w => w.trim())
+
+        // Determine how many SET params use '?'
+        let setParamIdx = 0
+        const setValues: Record<string, any> = {}
+        for (const assign of setAssignments) {
+          const [col, val] = assign.split('=').map(s => s.trim())
+          if (val === '?') {
+            setValues[col] = params[setParamIdx++]
+          } else {
+            setValues[col] = isNaN(Number(val)) ? val : Number(val)
+          }
+        }
+
+        // Parse WHERE params
+        const whereFilters: { col: string; val: any }[] = []
+        for (const cond of whereConditions) {
+          const [col, val] = cond.split('=').map(s => s.trim())
+          if (val === '?') {
+            whereFilters.push({ col, val: params[setParamIdx++] })
+          } else {
+            whereFilters.push({ col, val: isNaN(Number(val)) ? val : Number(val) })
+          }
+        }
+
+        if (tables[tableName]) {
+          for (const row of tables[tableName]) {
+            const matches = whereFilters.every(f => row[f.col] === f.val)
+            if (matches) {
+              for (const [col, val] of Object.entries(setValues)) {
+                row[col] = val
+              }
+            }
+          }
+        }
+        return { toArray: () => [] }
+      }
+
+      // SELECT entity_id FROM entity_index WHERE noun_type=? AND deleted=0
+      const entityIdSelect = trimmed.match(/SELECT\s+entity_id\s+FROM\s+entity_index\s+WHERE\s+noun_type\s*=\s*\?\s+AND\s+deleted\s*=\s*0/i)
+      if (entityIdSelect) {
+        const nounType = params[0]
+        const rows = (tables['entity_index'] || [])
+          .filter((r: any) => r.noun_type === nounType && r.deleted === 0)
+          .map((r: any) => ({ entity_id: r.entity_id }))
+        return { toArray: () => rows }
       }
 
       // SELECT * FROM <table> WHERE col = ?
@@ -170,6 +227,63 @@ describe('registry-do', () => {
       const result = resolveNounInRegistry(sql, 'UnknownNoun')
 
       expect(result).toBeNull()
+    })
+  })
+
+  describe('indexEntity', () => {
+    it('adds an entity ID', () => {
+      initRegistrySchema(sql)
+
+      indexEntity(sql, 'Person', 'person-1')
+
+      expect(sql.tables['entity_index']).toHaveLength(1)
+      expect(sql.tables['entity_index'][0].noun_type).toBe('Person')
+      expect(sql.tables['entity_index'][0].entity_id).toBe('person-1')
+      expect(sql.tables['entity_index'][0].deleted).toBe(0)
+    })
+
+    it('is idempotent', () => {
+      initRegistrySchema(sql)
+
+      indexEntity(sql, 'Person', 'person-1')
+      indexEntity(sql, 'Person', 'person-1')
+
+      expect(sql.tables['entity_index']).toHaveLength(1)
+    })
+  })
+
+  describe('deindexEntity', () => {
+    it('marks entity as deleted', () => {
+      initRegistrySchema(sql)
+      indexEntity(sql, 'Person', 'person-1')
+
+      deindexEntity(sql, 'Person', 'person-1')
+
+      expect(sql.tables['entity_index'][0].deleted).toBe(1)
+    })
+  })
+
+  describe('getEntityIds', () => {
+    it('returns all non-deleted IDs', () => {
+      initRegistrySchema(sql)
+      indexEntity(sql, 'Person', 'person-1')
+      indexEntity(sql, 'Person', 'person-2')
+      indexEntity(sql, 'Person', 'person-3')
+
+      const ids = getEntityIds(sql, 'Person')
+
+      expect(ids).toEqual(['person-1', 'person-2', 'person-3'])
+    })
+
+    it('excludes soft-deleted entities', () => {
+      initRegistrySchema(sql)
+      indexEntity(sql, 'Person', 'person-1')
+      indexEntity(sql, 'Person', 'person-2')
+      deindexEntity(sql, 'Person', 'person-2')
+
+      const ids = getEntityIds(sql, 'Person')
+
+      expect(ids).toEqual(['person-1'])
     })
   })
 })
