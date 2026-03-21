@@ -27,6 +27,7 @@ export function initRegistrySchema(sql: SqlLike): void {
   sql.exec(`CREATE TABLE IF NOT EXISTS domains (
   domain_slug TEXT PRIMARY KEY,
   domain_do_id TEXT NOT NULL,
+  domain_uuid TEXT,
   visibility TEXT NOT NULL DEFAULT 'private'
 )`)
 
@@ -53,13 +54,20 @@ export function initRegistrySchema(sql: SqlLike): void {
  * INSERT OR REPLACE ensures idempotency — re-registering the same slug
  * simply updates the DO ID and visibility.
  */
-export function registerDomain(sql: SqlLike, slug: string, doId: string, visibility: string = 'private'): void {
+export function registerDomain(sql: SqlLike, slug: string, doId: string, visibility: string = 'private', uuid?: string): void {
   sql.exec(
-    `INSERT OR REPLACE INTO domains (domain_slug, domain_do_id, visibility) VALUES (?, ?, ?)`,
+    `INSERT OR REPLACE INTO domains (domain_slug, domain_do_id, visibility, domain_uuid) VALUES (?, ?, ?, ?)`,
     slug,
     doId,
     visibility,
+    uuid || null,
   )
+}
+
+/** Look up a domain slug by its UUID. */
+export function resolveSlugByUUID(sql: SqlLike, uuid: string): string | null {
+  const rows = sql.exec('SELECT domain_slug FROM domains WHERE domain_uuid = ? LIMIT 1', uuid).toArray()
+  return rows.length ? rows[0].domain_slug as string : null
 }
 
 // =========================================================================
@@ -167,9 +175,14 @@ export class RegistryDB extends DurableObject {
     this.initialized = true
   }
 
-  async registerDomain(slug: string, doId: string, visibility?: string): Promise<void> {
+  async registerDomain(slug: string, doId: string, visibility?: string, uuid?: string): Promise<void> {
     this.ensureInit()
-    registerDomain(this.ctx.storage.sql, slug, doId, visibility)
+    registerDomain(this.ctx.storage.sql, slug, doId, visibility, uuid)
+  }
+
+  async resolveSlugByUUID(uuid: string): Promise<string | null> {
+    this.ensureInit()
+    return resolveSlugByUUID(this.ctx.storage.sql, uuid)
   }
 
   async indexNoun(nounName: string, domainSlug: string): Promise<void> {

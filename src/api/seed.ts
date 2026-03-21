@@ -163,11 +163,16 @@ async function handleBulkSeed(
   )
   t('phase1_end')
 
+  // Build slug → UUID map from phase 1 results
+  const slugToUUID = new Map<string, string>()
+  for (const r of results) slugToUUID.set(r.domain, r.domainId)
+
   // Phase 1.5: Register domains + nouns in Registry (batched, not per-noun RPC)
   t('registry_start')
   await Promise.all(
     domains.map(async (entry) => {
-      await registry.registerDomain(entry.slug, entry.slug)
+      const uuid = slugToUUID.get(entry.slug)
+      await registry.registerDomain(entry.slug, entry.slug, 'private', uuid)
     })
   )
   // Batch all noun indexing: collect all noun→domain pairs, then index
@@ -183,10 +188,6 @@ async function handleBulkSeed(
     await Promise.all(batch.map(([name, slug]) => registry.indexNoun(name, slug)))
   }
   t('registry_end')
-
-  // Build slug → UUID map from phase 1 results
-  const slugToUUID = new Map<string, string>()
-  for (const r of results) slugToUUID.set(r.domain, r.domainId)
 
   // Phase 2: Process instance facts (after all metamodels are seeded)
   t('phase2_start')
