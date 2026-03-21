@@ -4,7 +4,7 @@ import { ingestClaims, ingestProject } from '../claims/ingest'
 import type { ExtractedClaims } from '../claims/ingest'
 
 export async function handleSeed(request: Request, env: Env): Promise<Response> {
-  const db = getLegacyDB(env)
+  const db = getPrimaryDB(env)
 
   if (request.method === 'GET') {
     const [allNouns, allReadings, allDomains, allSchemas, allConstraints] = await Promise.all([
@@ -97,13 +97,12 @@ export async function handleSeed(request: Request, env: Env): Promise<Response> 
 }
 
 /**
- * Legacy: get the monolithic GraphDLDB stub.
- * Seed uses this for metamodel ingestion which works with any GraphDLDBLike.
- * Full migration to Domain DOs will happen incrementally.
+ * Get the primary DomainDB DO stub.
+ * Used for metamodel ingestion which works with any GraphDLDBLike.
  */
-function getLegacyDB(env: Env) {
-  const id = env.GRAPHDL_DB.idFromName('graphdl-primary')
-  return env.GRAPHDL_DB.get(id)
+function getPrimaryDB(env: Env) {
+  const id = env.DOMAIN_DB.idFromName('graphdl-primary')
+  return env.DOMAIN_DB.get(id)
 }
 
 async function ensureDomain(db: any, slug: string, name?: string): Promise<Record<string, any>> {
@@ -113,9 +112,18 @@ async function ensureDomain(db: any, slug: string, name?: string): Promise<Recor
 
   if (existing.docs.length) return existing.docs[0]
 
-  return db.createInCollection('domains', {
-    domainSlug: slug,
-    name: name || slug,
-    visibility: 'private',
-  })
+  try {
+    return await db.createInCollection('domains', {
+      domainSlug: slug,
+      name: name || slug,
+      visibility: 'private',
+    })
+  } catch {
+    // UNIQUE constraint race: another concurrent call created it first
+    const retry = await db.findInCollection('domains', {
+      domainSlug: { equals: slug },
+    }, { limit: 1 })
+    if (retry.docs.length) return retry.docs[0]
+    throw new Error(`Failed to create or find domain: ${slug}`)
+  }
 }
