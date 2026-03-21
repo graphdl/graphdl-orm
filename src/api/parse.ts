@@ -23,7 +23,7 @@ const SECTION_MAP: Array<[RegExp, Section]> = [
   [/^##\s*Value\s*Types?/i, 'value-types'],
   [/^##\s*Subtypes?/i, 'subtypes'],
   [/^##\s*Fact\s*Types?/i, 'fact-types'],
-  [/^##\s*(?:Mandatory\s+)?Constraints?/i, 'constraints'],
+  [/^##\s*(?:(?:Mandatory|Ring|Subset|Disjunctive(?:\s+Mandatory)?|Frequency|Value|Equality|Exclusion|Set\s*Comparison)\s+)?Constraints?/i, 'constraints'],
   [/^##\s*Deontic\s*Constraints?/i, 'deontic-constraints'],
   [/^##\s*Derivation\s*Rules?/i, 'derivation-rules'],
   [/^##\s*Instance\s*Facts?/i, 'instance-facts'],
@@ -41,7 +41,7 @@ function detectSection(line: string): Section | null {
 // ── Line-level patterns ───────────────────────────────────────────────
 // Noun names may be multi-word with spaces (e.g., "Support Request", "API Product").
 // Stops before lowercase stopwords to avoid over-matching into predicates.
-const N = '(?:[A-Z][a-zA-Z0-9]*(?:\\s+(?!per\\b|that\\b|for\\b|of\\b|the\\b|at\\b|in\\b|via\\b|to\\b|from\\b|by\\b|with\\b|on\\b|or\\b|and\\b|some\\b|each\\b|is\\b|has\\b|are\\b|was\\b|no\\b|not\\b|more\\b|most\\b)[A-Z][a-zA-Z0-9]*)*)'
+const N = '(?:[A-Z][a-zA-Z0-9]*(?:\\s+(?![Pp]er\\b|[Tt]hat\\b|[Ff]or\\b|[Oo]f\\b|[Tt]he\\b|[Aa]t\\b|[Ii]n\\b|[Vv]ia\\b|[Tt]o\\b|[Ff]rom\\b|[Bb]y\\b|[Ww]ith\\b|[Oo]n\\b|[Oo]r\\b|[Aa]nd\\b|[Ss]ome\\b|[Ee]ach\\b|[Ii]s\\b|[Hh]as\\b|[Aa]re\\b|[Ww]as\\b|[Nn]o\\b|[Nn]ot\\b|[Mm]ore\\b|[Mm]ost\\b)[A-Z][a-zA-Z0-9]*)*)'
 
 // Entity type: "Support Request(.Request Id) is an entity type."
 const ENTITY_TYPE = new RegExp(`^(${N})(?:\\(\\.?(${N})\\))?\\s+is an entity type\\.?$`, 'i')
@@ -136,6 +136,12 @@ export function parseFORML2(
     const newSection = detectSection(line)
     if (newSection) {
       section = newSection
+      parsedLines++
+      continue
+    }
+
+    // Skip unrecognized ## headers that didn't match any section
+    if (/^##\s/.test(line)) {
       parsedLines++
       continue
     }
@@ -386,6 +392,20 @@ export function parseFORML2(
           parsedLines++
           continue
         }
+      }
+
+      // Ring constraints ("No X verb itself") and conditional constraints ("If X1 verb X2, then ...")
+      // that weren't matched by parseConstraintText — store as generic constraints
+      if (/^No\s/i.test(line) || /^If\s/i.test(line)) {
+        constraints.push({
+          kind: 'IR',
+          modality: section === 'deontic-constraints' ? 'Deontic' : 'Alethic',
+          reading: '',
+          roles: [],
+          text: line,
+        })
+        parsedLines++
+        continue
       }
     }
 

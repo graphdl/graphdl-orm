@@ -330,4 +330,68 @@ VIN Decode has Result.
     expect(reading2!.nouns).toContain('VIN Decode')
     expect(reading2!.nouns).toContain('Result')
   })
+
+  it('skips unrecognized ## headers without creating readings', () => {
+    const text = `## Entity Types
+Customer is an entity type.
+
+## Ring Constraints
+No Support Request is merged into itself.
+
+## Disjunctive Mandatory Constraints
+
+## Additional Entity Types
+`
+    const result = parseFORML2(text, [
+      { name: 'Support Request', id: 'sr1' },
+    ])
+
+    // "## Ring Constraints", "## Disjunctive Mandatory Constraints", "## Additional Entity Types"
+    // should NOT produce readings
+    const headerReadings = result.readings.filter(
+      r => r.text.startsWith('Ring') || r.text.startsWith('Disjunctive') || r.text.startsWith('Additional')
+    )
+    expect(headerReadings).toHaveLength(0)
+
+    // "No Support Request is merged into itself" should not produce a reading either
+    // (it is a ring constraint in the constraints section)
+    expect(result.readings).toHaveLength(0)
+  })
+
+  it('stores ring constraint text as constraints when in constraints section', () => {
+    const text = `## Constraints
+No Support Request is merged into itself.
+If Person1 reports to Person2, then Person2 does not report to Person1.
+`
+    const result = parseFORML2(text, [
+      { name: 'Support Request', id: 'sr1' },
+      { name: 'Person', id: 'p1' },
+    ])
+
+    // Both lines should be stored as constraints, not readings
+    expect(result.readings).toHaveLength(0)
+    expect(result.constraints.length).toBeGreaterThanOrEqual(2)
+
+    const irreflexive = result.constraints.find(c => c.text.includes('merged into itself'))
+    expect(irreflexive).toBeDefined()
+
+    const asymmetric = result.constraints.find(c => c.text.includes('reports to'))
+    expect(asymmetric).toBeDefined()
+  })
+
+  it('case-insensitive stopwords prevent "Sent At" from becoming a noun', () => {
+    const text = `## Fact Types
+Message has Sent At.
+`
+    const result = parseFORML2(text, [])
+
+    // "Sent At" should NOT be a single multi-word noun — "At" is a stopword
+    const sentAt = result.nouns.find(n => n.name === 'Sent At')
+    expect(sentAt).toBeUndefined()
+
+    // "Sent" and "At" should be separate or "At" should be filtered out
+    // The reading should have noun "Message" and "Sent" (not "Sent At")
+    expect(result.nouns.find(n => n.name === 'Message')).toBeDefined()
+    expect(result.nouns.find(n => n.name === 'Sent')).toBeDefined()
+  })
 })
