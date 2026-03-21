@@ -179,7 +179,7 @@ function reconstructConstraint(
       return `Each ${subjectNoun} ${extractPredicate(reading.text, subjectNoun, objectNoun)} at most one ${objectNoun}.`
     case 'MC':
       return `Each ${subjectNoun} ${extractPredicate(reading.text, subjectNoun, objectNoun)} at least one ${objectNoun}.`
-    case 'RC':
+    case 'IR':
       return `No ${subjectNoun} ${extractPredicate(reading.text, subjectNoun, objectNoun)} itself.`
     default:
       return null

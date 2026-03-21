@@ -48,9 +48,8 @@ describe('model types', () => {
       'SS', 'EQ', 'XC', 'OR', 'XO',
       'IR', 'AS', 'AT', 'SY', 'IT', 'TR', 'AC',
       'VC',
-      'RC',
     ]
-    expect(kinds).toHaveLength(17)
+    expect(kinds).toHaveLength(16)
   })
 
   it('ConstraintDef supports structural constraints with spans', () => {
