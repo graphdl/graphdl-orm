@@ -30,6 +30,8 @@ export function initRegistrySchema(sql: SqlLike): void {
   domain_uuid TEXT,
   visibility TEXT NOT NULL DEFAULT 'private'
 )`)
+  // Migration: add domain_uuid if table was created before this column existed
+  try { sql.exec('ALTER TABLE domains ADD COLUMN domain_uuid TEXT') } catch { /* already exists */ }
 
   sql.exec(`CREATE TABLE IF NOT EXISTS noun_index (
   noun_name TEXT NOT NULL,
