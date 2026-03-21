@@ -56,7 +56,7 @@ pub struct DerivationRuleDef {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "camelCase")]
 pub enum DerivationKind {
     SubtypeInheritance, // X is subtype of Y -> X inherits Y's constraints
     ModusPonens,        // If A then B, A holds -> B holds
