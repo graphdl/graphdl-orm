@@ -55,11 +55,11 @@ describe('parseConstraintText', () => {
     })
   })
 
-  describe('ring constraints (RC)', () => {
-    it('parses "No X [verb] itself"', () => {
+  describe('ring constraints (irreflexive)', () => {
+    it('parses "No X [verb] itself" as IR', () => {
       const result = parseConstraintText('No Widget targets itself.')
       expect(result).toEqual([
-        { kind: 'RC', modality: 'Alethic', nouns: ['Widget'], constrainedNoun: 'Widget' },
+        { kind: 'IR', modality: 'Alethic', nouns: ['Widget'], constrainedNoun: 'Widget' },
       ])
     })
   })

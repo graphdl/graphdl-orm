@@ -7,7 +7,7 @@
  * Pure function — no DB or LLM dependency.
  */
 
-export type ConstraintKind = 'UC' | 'MC' | 'RC' | 'SS' | 'XC' | 'EQ' | 'OR' | 'XO'
+export type ConstraintKind = 'UC' | 'MC' | 'IR' | 'SS' | 'XC' | 'EQ' | 'OR' | 'XO'
 
 export interface ParsedConstraint {
   kind: ConstraintKind
@@ -134,7 +134,7 @@ export function parseConstraintText(text: string): ParsedConstraint[] | null {
   // "No X [verb] itself"
   m = clean.match(RING_IRREFLEXIVE)
   if (m) {
-    return [{ kind: 'RC', modality: 'Alethic', nouns: [m[1]], constrainedNoun: m[1] }]
+    return [{ kind: 'IR', modality: 'Alethic', nouns: [m[1]], constrainedNoun: m[1] }]
   }
 
   // "Each X has some Y" → MC on X's role

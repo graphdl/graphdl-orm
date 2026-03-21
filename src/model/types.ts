@@ -3,7 +3,6 @@ export type ConstraintKind =
   | 'SS' | 'EQ' | 'XC' | 'OR' | 'XO'
   | 'IR' | 'AS' | 'AT' | 'SY' | 'IT' | 'TR' | 'AC'
   | 'VC'
-  | 'RC'
 
 export type WorldAssumption = 'closed' | 'open'
 

@@ -161,7 +161,7 @@ export async function constraintAfterCreate(
       roleIds = parsed.roles
         .map(idx => idx === -1 ? hostRoles[hostRoles.length - 1]?.id : hostRoles[idx]?.id)
         .filter((id): id is string => !!id)
-    } else if (parsed.kind === 'RC') {
+    } else if (parsed.kind === 'IR') {
       // Ring constraint spans the first role (self-referential)
       roleIds = hostRoles.length > 0 ? [hostRoles[0].id] : []
     } else if (constraintNouns.length >= 1 && hostRoles.length >= 2) {

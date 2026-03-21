@@ -30,7 +30,7 @@ export interface ExtractedClaims {
     derivation?: string
   }>
   constraints: Array<{
-    kind: 'UC' | 'MC' | 'RC' | 'SS' | 'XC' | 'EQ' | 'OR' | 'XO'
+    kind: 'UC' | 'MC' | 'IR' | 'SS' | 'XC' | 'EQ' | 'OR' | 'XO'
     modality: 'Alethic' | 'Deontic'
     deonticOperator?: 'obligatory' | 'forbidden' | 'permitted'
     reading: string
