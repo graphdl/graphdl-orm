@@ -10,11 +10,31 @@ import { handleVerify } from './verify'
 import { handleEvaluate, handleSynthesize } from './evaluate'
 import { createWithHook, refreshNouns, type HookContext, COLLECTION_HOOKS } from '../hooks'
 
+// ── DO helpers ───────────────────────────────────────────────────────
+
+/** Get a DomainDB DO stub for the given domain slug. */
+function getDomainDO(env: Env, domainSlug: string): DurableObjectStub {
+  const id = env.DOMAIN_DB.idFromName(domainSlug)
+  return env.DOMAIN_DB.get(id)
+}
+
+/** Get an EntityDB DO stub for the given entity ID. */
+function getEntityDO(env: Env, entityId: string): DurableObjectStub {
+  const id = env.ENTITY_DB.idFromName(entityId)
+  return env.ENTITY_DB.get(id)
+}
+
+/** Get a RegistryDB DO stub for the given scope (e.g. app/org/global). */
+function getRegistryDO(env: Env, scope: string): DurableObjectStub {
+  const id = env.REGISTRY_DB.idFromName(scope)
+  return env.REGISTRY_DB.get(id)
+}
+
 /**
- * Get the GraphDL DO stub. One DO per system (for now, single instance).
- * Later: one DO per domain per tenant.
+ * Legacy: get the monolithic GraphDLDB stub.
+ * Used for routes not yet migrated to the new DO architecture.
  */
-function getDB(env: Env): DurableObjectStub {
+function getLegacyDB(env: Env): DurableObjectStub {
   const id = env.GRAPHDL_DB.idFromName('graphdl-primary')
   return env.GRAPHDL_DB.get(id)
 }
@@ -115,7 +135,7 @@ router.get('/health', () => json({ status: 'ok', version: '0.1.0' }))
 // ── Debug: table schema inspection ──────────────────────────────────
 router.get('/debug/table/:table', async (request, env: Env) => {
   const { table } = request.params
-  const db = getDB(env) as any
+  const db = getLegacyDB(env) as any
   const info = await db.inspectTable(table)
   return json(info)
 })
@@ -155,7 +175,7 @@ router.post('/api/facts', async (request, env: Env) => {
     return error(400, { errors: [{ message: 'domainId required' }] })
   }
 
-  const db = getDB(env) as any
+  const db = getLegacyDB(env) as any
 
   // Single fact with pre-resolved IDs
   if (body.graphSchemaId && body.bindings?.length) {
@@ -224,11 +244,10 @@ router.post('/api/entity', async (request, env: Env) => {
     return error(400, { errors: [{ message: 'noun, domain, and fields required' }] })
   }
 
-  const db = getDB(env) as any
+  const registry = getRegistryDO(env, 'global') as any
 
   // Extract array-of-objects fields (child entities) BEFORE creating the parent.
-  // Children are created as separate top-level createEntity calls to avoid
-  // Cloudflare DO implicit transaction/savepoint issues with nested writes.
+  // Children are created as separate Entity DOs to keep each DO = one entity.
   const childArrays: Array<{ fieldName: string; childNoun: string; items: Record<string, any>[] }> = []
   const parentFields: Record<string, any> = {}
 
@@ -242,21 +261,39 @@ router.post('/api/entity', async (request, env: Env) => {
     }
   }
 
-  // Create parent entity (without array-of-objects fields)
-  const result = await db.createEntity(body.domain, body.noun, parentFields, body.reference, body.createdBy)
+  // Create parent entity in its own EntityDB DO
+  const parentId = crypto.randomUUID()
+  const parentData = {
+    ...parentFields,
+    ...(body.reference && { reference: body.reference }),
+    ...(body.createdBy && { createdBy: body.createdBy }),
+  }
+  const entityDO = getEntityDO(env, parentId) as any
+  const putResult = await entityDO.put({ id: parentId, type: body.noun, data: parentData })
 
-  // Create children as separate top-level calls, each with FK back to parent
-  if (childArrays.length > 0 && result.id) {
+  // Index the entity in the Registry
+  await registry.indexEntity(body.noun, parentId)
+
+  const result: Record<string, any> = {
+    id: parentId,
+    noun: body.noun,
+    domain: body.domain,
+    version: putResult.version,
+  }
+
+  // Create children as separate Entity DOs, each with FK back to parent
+  if (childArrays.length > 0) {
     const parentFkField = body.noun.charAt(0).toLowerCase() + body.noun.slice(1)
     const children: any[] = []
     for (const { childNoun, items } of childArrays) {
       for (const childFields of items) {
         try {
-          const childResult = await db.createEntity(
-            body.domain, childNoun,
-            { ...childFields, [parentFkField]: result.id },
-          )
-          children.push({ noun: childNoun, id: childResult.id })
+          const childId = crypto.randomUUID()
+          const childData = { ...childFields, [parentFkField]: parentId }
+          const childDO = getEntityDO(env, childId) as any
+          await childDO.put({ id: childId, type: childNoun, data: childData })
+          await registry.indexEntity(childNoun, childId)
+          children.push({ noun: childNoun, id: childId })
         } catch (err: any) {
           children.push({ noun: childNoun, error: err.message })
         }
@@ -277,7 +314,6 @@ router.get('/api/entities/:noun', async (request, env: Env) => {
 
   const limit = parseInt(url.searchParams.get('limit') || '100', 10)
   const page = parseInt(url.searchParams.get('page') || '1', 10)
-  const sort = url.searchParams.get('sort') || '-createdAt'
 
   // Parse where params: where[field][op]=value
   const where: Record<string, any> = {}
@@ -290,59 +326,89 @@ router.get('/api/entities/:noun', async (request, env: Env) => {
     }
   }
 
-  const depth = parseInt(url.searchParams.get('depth') || '0', 10)
+  // Get all entity IDs for this noun type from the Registry
+  const registry = getRegistryDO(env, 'global') as any
+  const allIds: string[] = await registry.getEntityIds(noun)
 
-  const db = getDB(env) as any
-  const result = await db.queryEntities(domainId, noun, { where, sort, limit, page })
+  // Fetch each entity from its EntityDB DO
+  const allDocs: Record<string, unknown>[] = []
+  await Promise.all(
+    allIds.map(async (entityId: string) => {
+      const entityDO = getEntityDO(env, entityId) as any
+      const entity = await entityDO.get()
+      if (entity && !entity.deletedAt) {
+        allDocs.push({ id: entity.id, type: entity.type, ...entity.data, version: entity.version, createdAt: entity.createdAt, updatedAt: entity.updatedAt })
+      }
+    })
+  )
 
-  if (depth > 0) {
-    result.docs = await Promise.all(
-      result.docs.map((doc: Record<string, unknown>) => db.populateEntity(domainId, noun, doc))
-    )
+  // Client-side filtering by where params
+  let filtered = allDocs
+  for (const [field, condition] of Object.entries(where)) {
+    if (typeof condition === 'object' && condition !== null && 'equals' in condition) {
+      filtered = filtered.filter(doc => doc[field] === condition.equals)
+    }
   }
-  return json(result)
+
+  // Pagination
+  const totalDocs = filtered.length
+  const offset = (page - 1) * limit
+  const docs = limit > 0 ? filtered.slice(offset, offset + limit) : filtered
+
+  return json({
+    docs,
+    totalDocs,
+    limit,
+    page,
+    totalPages: limit > 0 ? Math.ceil(totalDocs / limit) : 1,
+    hasNextPage: limit > 0 && offset + limit < totalDocs,
+    hasPrevPage: page > 1,
+  })
 })
 
 router.get('/api/entities/:noun/:id', async (request, env: Env) => {
-  const { noun, id } = request.params
-  const url = new URL(request.url)
-  const domainId = url.searchParams.get('domain')
-  if (!domainId) return error(400, { errors: [{ message: 'domain query param required' }] })
-  const depth = parseInt(url.searchParams.get('depth') || '0', 10)
+  const { id } = request.params
 
-  const db = getDB(env) as any
-  const result = await db.queryEntities(domainId, noun, { where: { id: { equals: id } }, limit: 1 })
-  if (!result.docs.length) return error(404, { errors: [{ message: 'Not Found' }] })
+  const entityDO = getEntityDO(env, id) as any
+  const entity = await entityDO.get()
 
-  let doc = result.docs[0]
-  if (depth > 0) {
-    doc = await db.populateEntity(domainId, noun, doc)
+  if (!entity || entity.deletedAt) {
+    return error(404, { errors: [{ message: 'Not Found' }] })
   }
-  return json(doc)
+
+  return json({
+    id: entity.id,
+    type: entity.type,
+    ...entity.data,
+    version: entity.version,
+    createdAt: entity.createdAt,
+    updatedAt: entity.updatedAt,
+  })
 })
 
 router.patch('/api/entities/:noun/:id', async (request, env: Env) => {
-  const { noun, id } = request.params
-  const url = new URL(request.url)
-  const domainId = url.searchParams.get('domain')
-  if (!domainId) return error(400, { errors: [{ message: 'domain query param required' }] })
-
+  const { id } = request.params
   const body = await request.json() as Record<string, any>
-  const db = getDB(env) as any
-  const result = await db.updateEntity(domainId, noun, id, body)
+
+  const entityDO = getEntityDO(env, id) as any
+  const result = await entityDO.patch(body)
+
   if (!result) return error(404, { errors: [{ message: 'Not Found' }] })
   return json(result)
 })
 
 router.delete('/api/entities/:noun/:id', async (request, env: Env) => {
   const { noun, id } = request.params
-  const url = new URL(request.url)
-  const domainId = url.searchParams.get('domain')
-  if (!domainId) return error(400, { errors: [{ message: 'domain query param required' }] })
 
-  const db = getDB(env) as any
-  const result = await db.deleteEntity(domainId, noun, id)
-  if (!result.deleted) return error(404, { errors: [{ message: 'Not Found' }] })
+  const entityDO = getEntityDO(env, id) as any
+  const result = await entityDO.delete()
+
+  if (!result) return error(404, { errors: [{ message: 'Not Found' }] })
+
+  // Deindex the entity in the Registry
+  const registry = getRegistryDO(env, 'global') as any
+  await registry.deindexEntity(noun, id)
+
   return json({ id, deleted: true })
 })
 
@@ -368,7 +434,7 @@ router.get('/api/:collection', async (request, env: Env) => {
   const url = new URL(request.url)
   const { where, limit, page, sort, depth } = parseQueryOptions(url.searchParams)
 
-  const db = getDB(env) as any
+  const db = getLegacyDB(env) as any
   const result = await db.findInCollection(collection, where, { limit, page, sort })
   const docs = await populateDocs(db, result.docs, collection, depth)
 
@@ -394,7 +460,7 @@ router.get('/api/:collection/:id', async (request, env: Env) => {
   const url = new URL(request.url)
   const depth = parseInt(url.searchParams.get('depth') || '0', 10)
 
-  const db = getDB(env) as any
+  const db = getLegacyDB(env) as any
   const doc = await db.getFromCollection(collection, id)
 
   if (!doc) return error(404, { errors: [{ message: 'Not Found' }] })
@@ -410,7 +476,7 @@ router.post('/api/:collection', async (request, env: Env) => {
   }
 
   const body = await request.json() as Record<string, any>
-  const db = getDB(env) as any
+  const db = getLegacyDB(env) as any
 
   // If a hook exists for this collection, use createWithHook
   if (COLLECTION_HOOKS[collection]) {
@@ -439,7 +505,7 @@ router.patch('/api/:collection/:id', async (request, env: Env) => {
   }
 
   const body = await request.json() as Record<string, any>
-  const db = getDB(env) as any
+  const db = getLegacyDB(env) as any
   const doc = await db.updateInCollection(collection, id, body)
 
   if (!doc) return error(404, { errors: [{ message: 'Not Found' }] })
@@ -453,7 +519,7 @@ router.delete('/api/:collection/:id', async (request, env: Env) => {
     return error(404, { errors: [{ message: `Collection "${collection}" not found` }] })
   }
 
-  const db = getDB(env) as any
+  const db = getLegacyDB(env) as any
   const result = await db.deleteFromCollection(collection, id)
 
   if (!result.deleted) return error(404, { errors: [{ message: 'Not Found' }] })
@@ -467,14 +533,14 @@ router.all('/claims', handleSeed)
 // ── Domain wipe (metamodel only — nouns, readings, constraints, roles, etc.) ──
 router.delete('/api/domains/:domainId/metamodel', async (request, env: Env) => {
   const { domainId } = request.params
-  const db = getDB(env) as any
+  const db = getLegacyDB(env) as any
   const result = await db.wipeDomainMetamodel(domainId)
   return json(result)
 })
 
 // ── Full reset (delete ALL data from ALL tables) ────────────────────
 router.delete('/api/reset', async (request, env: Env) => {
-  const db = getDB(env) as any
+  const db = getLegacyDB(env) as any
   const tables = [
     'guard_runs', 'events', 'state_machines', 'resource_roles', 'graph_citations',
     'graphs', 'resources', 'citations', 'generators',
