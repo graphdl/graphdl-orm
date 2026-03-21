@@ -5,10 +5,12 @@
 //   evaluate_response  — apply compiled predicates to response + population (per request)
 //   synthesize_noun    — collect all knowledge about a noun from the compiled model
 //   forward_chain      — apply derivation rules to population until fixed point
+//   query_population   — filter a population by predicate, return matching entities
 
 mod types;
 mod compile;
 mod evaluate;
+mod query;
 
 use wasm_bindgen::prelude::*;
 use std::sync::Mutex;
@@ -112,4 +114,12 @@ pub fn forward_chain_population(population_json: &str) -> String {
 
     let derived = evaluate::forward_chain(&state.model, &response, &mut population);
     serde_json::to_string(&derived).unwrap()
+}
+
+#[wasm_bindgen]
+pub fn query_population_wasm(population_json: &str, predicate_json: &str) -> String {
+    let population: Population = serde_json::from_str(population_json).unwrap_or_default();
+    let predicate: query::QueryPredicate = serde_json::from_str(predicate_json).unwrap_or_default();
+    let result = query::query_population(&population, &predicate);
+    serde_json::to_string(&result).unwrap_or_else(|_| r#"{"matches":[],"count":0}"#.to_string())
 }
