@@ -1,10 +1,10 @@
 /**
  * Extracted step functions for claims ingestion.
  *
- * Each step operates on a shared Scope object and a GraphDLDB instance.
+ * Each step operates on a shared Scope object and a GraphDLDBLike instance.
  * Extracted from the monolithic ingestClaims() in ingest.ts.
  */
-import type { GraphDLDB } from '../do'
+import type { GraphDLDBLike } from '../do-adapter'
 import type { ExtractedClaims } from './ingest'
 import type { Scope } from './scope'
 import { addNoun, resolveNoun, addSchema, resolveSchema } from './scope'
@@ -20,7 +20,7 @@ export const OPEN_WORLD_NOUNS = ['Right', 'Freedom', 'Liberty', 'Protection', 'P
 
 /** Ensure a noun exists for this domain; return the doc. */
 export async function ensureNoun(
-  db: GraphDLDB,
+  db: GraphDLDBLike,
   name: string,
   data: Record<string, any>,
   domainId: string,
@@ -50,7 +50,7 @@ export async function ensureNoun(
 // ---------------------------------------------------------------------------
 
 export async function ingestNouns(
-  db: GraphDLDB,
+  db: GraphDLDBLike,
   nouns: ExtractedClaims['nouns'],
   domainId: string,
   scope: Scope,
@@ -92,7 +92,7 @@ export async function ingestNouns(
 // ---------------------------------------------------------------------------
 
 export async function ingestSubtypes(
-  db: GraphDLDB,
+  db: GraphDLDBLike,
   subtypes: NonNullable<ExtractedClaims['subtypes']>,
   domainId: string,
   scope: Scope,
@@ -126,7 +126,7 @@ export async function ingestSubtypes(
 // ---------------------------------------------------------------------------
 
 export async function ingestReadings(
-  db: GraphDLDB,
+  db: GraphDLDBLike,
   readings: ExtractedClaims['readings'],
   domainId: string,
   scope: Scope,
@@ -239,7 +239,7 @@ export async function ingestReadings(
 // ---------------------------------------------------------------------------
 
 export async function ingestConstraints(
-  db: GraphDLDB,
+  db: GraphDLDBLike,
   constraints: NonNullable<ExtractedClaims['constraints']>,
   domainId: string,
   scope: Scope,
@@ -337,7 +337,7 @@ export async function ingestConstraints(
 // ---------------------------------------------------------------------------
 
 export async function ingestTransitions(
-  db: GraphDLDB,
+  db: GraphDLDBLike,
   transitions: NonNullable<ExtractedClaims['transitions']>,
   domainId: string,
   scope: Scope,
@@ -450,7 +450,7 @@ export async function ingestTransitions(
 // ---------------------------------------------------------------------------
 
 export async function ingestFacts(
-  db: GraphDLDB,
+  db: GraphDLDBLike,
   facts: NonNullable<ExtractedClaims['facts']>,
   domainId: string,
   scope: Scope,

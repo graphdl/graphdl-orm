@@ -2,9 +2,9 @@
  * Constraint parsing and application.
  *
  * parseMultiplicity() — pure function, unchanged from original.
- * applyConstraints() — ported from Payload to GraphDLDB DO calls.
+ * applyConstraints() — ported from Payload to GraphDLDBLike DO calls.
  */
-import type { GraphDLDB } from '../do'
+import type { GraphDLDBLike } from '../do-adapter'
 
 export interface ConstraintDef {
   kind: 'UC' | 'MC' | 'RC' | 'SS' | 'XC' | 'EQ' | 'OR' | 'XO'
@@ -50,10 +50,10 @@ function expandUC(pattern: string, modality: 'Alethic' | 'Deontic', out: Constra
 
 /**
  * Apply constraint definitions by creating constraint + constraint_span records.
- * Ported from Payload's applyConstraints to use GraphDLDB directly.
+ * Ported from Payload's applyConstraints to use GraphDLDBLike directly.
  */
 export async function applyConstraints(
-  db: GraphDLDB,
+  db: GraphDLDBLike,
   opts: {
     constraints: ConstraintDef[]
     roleIds: string[]
