@@ -53,15 +53,17 @@ export async function handleConceptualQuery(request: Request, env: Env) {
   if (!domainDB) return error(404, { errors: [{ message: `Domain not found: ${domainId}` }] })
 
   const [nounsResult, readingsResult] = await Promise.all([
-    domainDB.findInCollection('nouns', { object_type: { equals: 'entity' } }, { limit: 500 }),
+    domainDB.findInCollection('nouns', {}, { limit: 500 }),
     domainDB.findInCollection('readings', {}, { limit: 1000 }),
   ])
 
-  const nounDocs: NounDoc[] = nounsResult.docs || []
+  const nounDocs: NounDoc[] = (nounsResult.docs || []).filter((n: any) =>
+    (n.object_type === 'entity' || n.objectType === 'entity')
+  )
   const readingDocs: ReadingDoc[] = readingsResult.docs || []
 
-  const nouns = nounDocs.map(n => ({ name: n.name, id: n.id }))
-  const readings = readingDocs.map(r => {
+  const nouns = nounDocs.filter((n: any) => n.name && typeof n.name === 'string').map(n => ({ name: n.name, id: n.id }))
+  const readings = readingDocs.filter((r: any) => r.text && typeof r.text === 'string').map(r => {
     // Extract noun names from reading text using the known noun list
     const readingNouns: string[] = []
     const sorted = [...nouns].sort((a, b) => b.name.length - a.name.length)
@@ -79,11 +81,12 @@ export async function handleConceptualQuery(request: Request, env: Env) {
       const end = r.text.indexOf(readingNouns[1], start)
       if (end > start) predicate = r.text.slice(start, end).trim()
     }
-    return { text: r.text, nouns: readingNouns, predicate }
+    return { text: r.text, nouns: readingNouns.filter(Boolean) }
   })
 
-  // Resolve the conceptual query
-  const resolved = resolveConceptualQuery(queryText, nouns, readings)
+  // Resolve the conceptual query — resolveConceptualQuery takes string[] for nouns
+  const nounNames = nouns.map(n => n.name)
+  const resolved = resolveConceptualQuery(queryText, nounNames, readings)
 
   if (resolved.path.length === 0) {
     return json({

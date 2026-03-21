@@ -588,6 +588,10 @@ router.delete('/api/entities/:noun/:id', async (request, env: Env) => {
 // ── Collection CRUD ──────────────────────────────────────────────────
 
 /** GET /api/:collection — list/find */
+// ── Conceptual Query (before generic :collection routes) ─────────────
+router.get('/api/query', handleConceptualQuery)
+router.post('/api/query', handleConceptualQuery)
+
 // ── Claims ingestion & stats (before generic :collection routes) ─────
 router.post('/api/claims', async (request, env: Env) => {
   const { handleClaims } = await import('./claims')
@@ -739,10 +743,6 @@ router.delete('/api/state/*', async (request, env: Env) => {
   const { handleDeleteState } = await import('./state')
   return handleDeleteState(request, env)
 })
-
-// ── Conceptual Query ────────────────────────────────────────────────
-router.get('/api/query', handleConceptualQuery)
-router.post('/api/query', handleConceptualQuery)
 
 // ── 404 fallback ─────────────────────────────────────────────────────
 router.all('*', () => error(404, { errors: [{ message: 'Not Found' }] }))
