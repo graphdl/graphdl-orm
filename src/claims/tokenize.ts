@@ -18,6 +18,8 @@ export interface NounRef {
 export interface TokenizeResult {
   nounRefs: NounRef[]
   predicate: string
+  /** Property name derived from hyphen binding, e.g., "created- at Date" → "createdAtDate" */
+  boundPropertyName?: string
 }
 
 /**
@@ -70,5 +72,19 @@ export function tokenizeReading(
     }
   }
 
-  return { nounRefs, predicate }
+  // Hyphen binding: "was created- at Date" → boundPropertyName = "createdAtDate"
+  // A hyphen at the end of a word binds the following word(s) to the object noun
+  let boundPropertyName: string | undefined
+  const hyphenMatch = predicate.match(/(\w+)-\s+(.+)$/)
+  if (hyphenMatch && nounRefs.length >= 2) {
+    const boundWord = hyphenMatch[1]         // "created"
+    const trailingWords = hyphenMatch[2]     // "at" (words between hyphen and object noun)
+    const objectNoun = nounRefs[nounRefs.length - 1].name  // "Date"
+    // Build camelCase property: "created" + "At" + "Date"
+    const parts = trailingWords.split(/\s+/).filter(Boolean)
+    boundPropertyName = boundWord + parts.map(w => w.charAt(0).toUpperCase() + w.slice(1)).join('') +
+      objectNoun.replace(/\s+/g, '')
+  }
+
+  return { nounRefs, predicate, boundPropertyName }
 }
