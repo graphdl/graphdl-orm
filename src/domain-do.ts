@@ -798,11 +798,7 @@ export class DomainDB extends DurableObject {
     opts?: { limit?: number; page?: number; sort?: string },
   ): Promise<ReturnType<typeof findInMetamodel>> {
     this.ensureInit()
-    const result = findInMetamodel(this.ctx.storage.sql, collection, where, opts)
-    if (collection === 'nouns') {
-      console.log(`[DomainDB] findInCollection nouns: totalDocs=${result.totalDocs} where=${JSON.stringify(where)} doId=${this.ctx.id.toString()}`)
-    }
-    return result
+    return findInMetamodel(this.ctx.storage.sql, collection, where, opts)
   }
 
   /** Get a single record by ID. */
@@ -824,11 +820,6 @@ export class DomainDB extends DurableObject {
         this.logCdcEvent('create', table, doc.id as string, doc)
         const domainId = doc.domain_id as string || doc.domain as string
         if (domainId) this.getModel(domainId).invalidate(collection)
-      }
-      // Trace write
-      if (collection === 'nouns') {
-        const count = this.ctx.storage.sql.exec('SELECT COUNT(*) as cnt FROM nouns').toArray()
-        console.log(`[DomainDB] createInCollection nouns: id=${doc.id} name=${data.name} total=${(count[0] as any)?.cnt}`)
       }
       return doc
     })
