@@ -56,11 +56,21 @@ async function resolveDomainDB(env: Env, where?: Record<string, any>, body?: Rec
       return getDomainDO(env, domainId)
     }
 
-    // It's a UUID — look up the slug via the Registry
+    // It's a UUID — try Registry first, then primary DO for slug lookup
     const registry = getRegistryDO(env, 'global') as any
     try {
       const slug: string | null = await registry.resolveSlugByUUID(domainId)
       if (slug) return getDomainDO(env, slug)
+    } catch { /* fall through */ }
+
+    // Fallback: look up slug from primary DO's domains table
+    const primary = getPrimaryDB(env) as any
+    try {
+      const result = await primary.findInCollection('domains', { id: { equals: domainId } }, { limit: 1 })
+      if (result.docs.length) {
+        const slug = result.docs[0].domainSlug || result.docs[0].domain_slug
+        if (slug) return getDomainDO(env, slug)
+      }
     } catch { /* fall through */ }
   }
 
