@@ -4,7 +4,7 @@ import { ingestClaims, ingestProject } from '../claims/ingest'
 import type { ExtractedClaims } from '../claims/ingest'
 
 export async function handleSeed(request: Request, env: Env): Promise<Response> {
-  const db = getDB(env)
+  const db = getLegacyDB(env)
 
   if (request.method === 'GET') {
     const [allNouns, allReadings, allDomains, allSchemas, allConstraints] = await Promise.all([
@@ -96,7 +96,12 @@ export async function handleSeed(request: Request, env: Env): Promise<Response> 
   return error(405, { errors: [{ message: 'Method not allowed' }] })
 }
 
-function getDB(env: Env) {
+/**
+ * Legacy: get the monolithic GraphDLDB stub.
+ * Seed uses this for metamodel ingestion which works with any GraphDLDBLike.
+ * Full migration to Domain DOs will happen incrementally.
+ */
+function getLegacyDB(env: Env) {
   const id = env.GRAPHDL_DB.idFromName('graphdl-primary')
   return env.GRAPHDL_DB.get(id)
 }
