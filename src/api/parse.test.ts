@@ -3,7 +3,14 @@ import { parseFORML2 } from './parse'
 
 describe('parseFORML2', () => {
   it('parses a single reading with UC constraint', () => {
-    const text = `Customer has Name.
+    const text = `## Entity Types
+Customer is an entity type.
+
+## Value Types
+Name is a value type.
+
+## Fact Types
+Customer has Name.
   Each Customer has at most one Name.`
 
     const result = parseFORML2(text, [])
@@ -16,7 +23,7 @@ describe('parseFORML2', () => {
     })
     expect(result.nouns.find(n => n.name === 'Name')).toMatchObject({
       name: 'Name',
-      objectType: 'value', // object of "has" → value type
+      objectType: 'value',
     })
 
     // Readings
@@ -43,7 +50,15 @@ describe('parseFORML2', () => {
   })
 
   it('parses multiple readings separated by blank lines', () => {
-    const text = `Customer has Name.
+    const text = `## Entity Types
+Customer is an entity type.
+SupportRequest is an entity type.
+
+## Value Types
+Name is a value type.
+
+## Fact Types
+Customer has Name.
   Each Customer has at most one Name.
 
 Customer submits SupportRequest.
@@ -79,7 +94,16 @@ Customer submits SupportRequest.
   })
 
   it('produces partial results with warnings for malformed input', () => {
-    const text = `Customer has Name.
+    const text = `## Entity Types
+Customer is an entity type.
+SupportRequest is an entity type.
+
+## Value Types
+Name is a value type.
+Priority is a value type.
+
+## Fact Types
+Customer has Name.
   Each Customer has at most one Name.
 
 justgarbage
@@ -95,7 +119,14 @@ SupportRequest has Priority.`
   })
 
   it('handles "exactly one" producing UC + MC constraints', () => {
-    const text = `Organization has Name.
+    const text = `## Entity Types
+Organization is an entity type.
+
+## Value Types
+Name is a value type.
+
+## Fact Types
+Organization has Name.
   Each Organization has exactly one Name.`
 
     const result = parseFORML2(text, [])
@@ -120,7 +151,14 @@ SupportRequest has Priority.`
   })
 
   it('returns empty arrays for transitions and facts', () => {
-    const text = `Customer has Name.`
+    const text = `## Entity Types
+Customer is an entity type.
+
+## Value Types
+Name is a value type.
+
+## Fact Types
+Customer has Name.`
 
     const result = parseFORML2(text, [])
 
@@ -129,7 +167,14 @@ SupportRequest has Priority.`
   })
 
   it('warns on unrecognized constraint patterns', () => {
-    const text = `Customer has Name.
+    const text = `## Entity Types
+Customer is an entity type.
+
+## Value Types
+Name is a value type.
+
+## Fact Types
+Customer has Name.
   This is not a valid constraint.`
 
     const result = parseFORML2(text, [])
@@ -140,9 +185,13 @@ SupportRequest has Priority.`
   })
 
   it('handles non-"has" predicates as entity types', () => {
+    const existingNouns = [
+      { name: 'Customer', id: 'n1' },
+      { name: 'SupportRequest', id: 'n2', objectType: 'entity' as const },
+    ]
     const text = `Customer submits SupportRequest.`
 
-    const result = parseFORML2(text, [])
+    const result = parseFORML2(text, existingNouns)
 
     expect(result.nouns.find(n => n.name === 'SupportRequest')).toMatchObject({
       objectType: 'entity', // not "has" → entity, not value
@@ -150,13 +199,18 @@ SupportRequest has Priority.`
   })
 
   it('attaches indented constraints to the preceding reading', () => {
+    const existingNouns = [
+      { name: 'Customer', id: 'n1' },
+      { name: 'Name', id: 'n2' },
+      { name: 'SupportRequest', id: 'n3' },
+    ]
     // Constraint on first block is indented under first reading
     const text = `Customer has Name.
   Each SupportRequest is submitted by at most one Customer.
 
 Customer submits SupportRequest.`
 
-    const result = parseFORML2(text, [])
+    const result = parseFORML2(text, existingNouns)
 
     // The indented constraint is attached to the preceding reading
     expect(result.constraints.length).toBeGreaterThanOrEqual(1)
@@ -169,10 +223,14 @@ Customer submits SupportRequest.`
   })
 
   it('attaches cross-noun constraints to the preceding reading without warnings', () => {
+    const existingNouns = [
+      { name: 'Customer', id: 'n1' },
+      { name: 'Name', id: 'n2' },
+    ]
     const text = `Customer has Name.
   Each Order has at most one Invoice.`
 
-    const result = parseFORML2(text, [])
+    const result = parseFORML2(text, existingNouns)
 
     // The indented constraint is parsed and attached to the preceding reading
     expect(result.constraints.length).toBeGreaterThanOrEqual(1)
@@ -203,6 +261,11 @@ Customer has Name.
   })
 
   it('parses XO set-comparison blocks as standalone constraints', () => {
+    const existingNouns = [
+      { name: 'Message', id: 'n1' },
+      { name: 'Lead', id: 'n2' },
+      { name: 'MatchStatus', id: 'n3' },
+    ]
     const text = `Message has Lead.
   Each Message has at most one Lead.
 
@@ -211,7 +274,7 @@ For each Message, exactly one of the following holds:
   that Message has MatchStatus 'Confirmed';
   that Message has MatchStatus 'Rejected'.`
 
-    const result = parseFORML2(text, [])
+    const result = parseFORML2(text, existingNouns)
 
     // Reading from the first block
     expect(result.readings).toHaveLength(1)
@@ -230,9 +293,14 @@ For each Message, exactly one of the following holds:
     // Single-line "If some..." is not detected as a set-comparison block
     // because parseSetComparisonBlock only runs on multi-line blocks.
     // It falls through to reading parsing instead.
+    const existingNouns = [
+      { name: 'Message', id: 'n1' },
+      { name: 'Lead', id: 'n2' },
+      { name: 'SalesRep', id: 'n3' },
+    ]
     const text = `If some Message has Lead then that Message has SalesRep.`
 
-    const result = parseFORML2(text, [])
+    const result = parseFORML2(text, existingNouns)
 
     // Parsed as a reading, not an SS constraint
     expect(result.readings).toHaveLength(1)
@@ -244,10 +312,14 @@ For each Message, exactly one of the following holds:
   })
 
   it('handles "Each X has some Y" as MC', () => {
+    const existingNouns = [
+      { name: 'Message', id: 'n1' },
+      { name: 'Lead', id: 'n2' },
+    ]
     const text = `Message has Lead.
   Each Message has some Lead.`
 
-    const result = parseFORML2(text, [])
+    const result = parseFORML2(text, existingNouns)
 
     const mc = result.constraints.find(c => c.kind === 'MC')
     expect(mc).toBeDefined()
@@ -255,10 +327,14 @@ For each Message, exactly one of the following holds:
   })
 
   it('handles "if and only if" as EQ', () => {
+    const existingNouns = [
+      { name: 'Message', id: 'n1' },
+      { name: 'Lead', id: 'n2' },
+    ]
     const text = `Message has Lead.
   Message is matched if and only if Message has Lead.`
 
-    const result = parseFORML2(text, [])
+    const result = parseFORML2(text, existingNouns)
 
     const eq = result.constraints.find(c => c.kind === 'EQ')
     expect(eq).toBeDefined()
@@ -266,6 +342,12 @@ For each Message, exactly one of the following holds:
   })
 
   it('parses a full domain with mixed readings and set-comparison blocks', () => {
+    const existingNouns = [
+      { name: 'Message', id: 'n1' },
+      { name: 'Lead', id: 'n2' },
+      { name: 'SalesRep', id: 'n3' },
+      { name: 'MatchStatus', id: 'n4' },
+    ]
     const text = `Message has Lead.
   Each Message has at most one Lead.
 
@@ -279,7 +361,7 @@ For each Message, exactly one of the following holds:
 
 If some Message has Lead then that Message has SalesRep.`
 
-    const result = parseFORML2(text, [])
+    const result = parseFORML2(text, existingNouns)
 
     // Three readings: two fact types + the single-line "If some..." falls through as a reading
     expect(result.readings).toHaveLength(3)
@@ -299,11 +381,15 @@ If some Message has Lead then that Message has SalesRep.`
     expect(result.warnings).toEqual([])
   })
 
-  it('preserves compound noun names with acronyms in PascalCase fallback', () => {
+  it('resolves compound nouns against declarations, not PascalCase guessing', () => {
     const result = parseFORML2(`
 ## Entity Types
 API Product(.Name) is an entity type.
 VIN Decode(.id) is an entity type.
+
+## Value Types
+Title is a value type.
+Result is a value type.
 
 ## Fact Types
 API Product has Title.
@@ -311,7 +397,7 @@ VIN Decode has Result.
 `, [])
 
     // "API Product" should be kept as a single multi-word noun,
-    // not split into "API" and "Product" by the PascalCase fallback
+    // resolved against the declaration
     const apiProduct = result.nouns.find(n => n.name === 'API Product')
     expect(apiProduct).toBeDefined()
 
@@ -379,19 +465,145 @@ If Person1 reports to Person2, then Person2 does not report to Person1.
     expect(asymmetric).toBeDefined()
   })
 
-  it('case-insensitive stopwords prevent "Sent At" from becoming a noun', () => {
-    const text = `## Fact Types
-Message has Sent At.
-`
+  // ── New tests for declared-noun resolution ────────────────────────
+
+  it('"Sent At" stays as one noun when declared as value type', () => {
+    const text = `## Entity Types
+Message(.Message Id) is an entity type.
+
+## Value Types
+Message Id is a value type.
+Sent At is a value type.
+
+## Fact Types
+Message has Sent At.`
+
     const result = parseFORML2(text, [])
 
-    // "Sent At" should NOT be a single multi-word noun — "At" is a stopword
+    // "Sent At" is declared as a value type, so it matches as one noun
     const sentAt = result.nouns.find(n => n.name === 'Sent At')
-    expect(sentAt).toBeUndefined()
+    expect(sentAt).toBeDefined()
+    expect(sentAt!.objectType).toBe('value')
 
-    // "Sent" and "At" should be separate or "At" should be filtered out
-    // The reading should have noun "Message" and "Sent" (not "Sent At")
-    expect(result.nouns.find(n => n.name === 'Message')).toBeDefined()
-    expect(result.nouns.find(n => n.name === 'Sent')).toBeDefined()
+    // The reading should reference "Sent At" as a single noun
+    expect(result.readings).toHaveLength(1)
+    expect(result.readings[0].nouns).toContain('Message')
+    expect(result.readings[0].nouns).toContain('Sent At')
+    expect(result.readings[0].predicate).toBe('has')
+
+    // No false nouns "Sent" or "At"
+    expect(result.nouns.find(n => n.name === 'Sent')).toBeUndefined()
+    expect(result.nouns.find(n => n.name === 'At')).toBeUndefined()
+  })
+
+  it('"Cross-domain references: ..." lines are skipped entirely', () => {
+    const text = `# Support
+
+Cross-domain references: Customer (from customer-auth), Feature Request (from feature-requests)
+
+## Entity Types
+Request(.Request Id) is an entity type.
+
+## Fact Types
+Request has Subject.`
+
+    const result = parseFORML2(text, [
+      { name: 'Subject', id: 'n1' },
+    ])
+
+    // The cross-domain references line should not produce a reading or noun
+    expect(result.nouns.find(n => n.name === 'Cross')).toBeUndefined()
+    expect(result.readings.find(r => r.text.includes('Cross-domain'))).toBeUndefined()
+    expect(result.unparsed.find(l => l.includes('Cross-domain'))).toBeUndefined()
+  })
+
+  it('description prose lines fall through to unparsed without creating nouns', () => {
+    const text = `# Support
+
+Support request lifecycle and response content rules for the auto platform.
+
+## Entity Types
+Request(.Request Id) is an entity type.
+
+## Value Types
+Request Id is a value type.
+Subject is a value type.
+
+## Fact Types
+Request has Subject.`
+
+    const result = parseFORML2(text, [])
+
+    // Prose line has no declared nouns → falls through to unparsed
+    expect(result.nouns.find(n => n.name === 'Support')).toBeUndefined()
+    expect(result.readings).toHaveLength(1)
+    expect(result.readings[0].text).toBe('Request has Subject')
+    // The prose line ends up in unparsed (candidate for LLM extraction)
+    expect(result.unparsed).toContainEqual(
+      expect.stringContaining('Support request lifecycle')
+    )
+  })
+
+  it('undeclared nouns in readings do not create false noun entries', () => {
+    const text = `## Entity Types
+Customer is an entity type.
+
+## Value Types
+Name is a value type.
+
+## Fact Types
+Customer has Name.
+Customer submits SupportRequest.`
+
+    const result = parseFORML2(text, [])
+
+    // "SupportRequest" is not declared, so it should NOT appear as a noun
+    expect(result.nouns.find(n => n.name === 'SupportRequest')).toBeUndefined()
+
+    // The second reading should only find "Customer" (1 noun = unary)
+    // since "SupportRequest" is not declared
+    const submitReading = result.readings.find(r => r.text === 'Customer submits SupportRequest')
+    expect(submitReading).toBeDefined()
+    expect(submitReading!.nouns).toEqual(['Customer'])
+  })
+
+  it('compound nouns like "API Product" match as one noun when declared', () => {
+    const text = `## Entity Types
+API Product(.Name) is an entity type.
+Support Response(.Message Id) is an entity type.
+
+## Value Types
+Name is a value type.
+Message Id is a value type.
+
+## Fact Types
+Support Response recommends API Product.`
+
+    const result = parseFORML2(text, [])
+
+    // "API Product" matched as one noun, not "API" + "Product"
+    expect(result.nouns.find(n => n.name === 'API Product')).toBeDefined()
+    expect(result.nouns.find(n => n.name === 'API')).toBeUndefined()
+    expect(result.nouns.find(n => n.name === 'Product')).toBeUndefined()
+
+    const reading = result.readings.find(r => r.text.includes('recommends'))
+    expect(reading).toBeDefined()
+    expect(reading!.nouns).toContain('Support Response')
+    expect(reading!.nouns).toContain('API Product')
+  })
+
+  it('readings with only 1 declared noun are still stored (unary readings)', () => {
+    const text = `## Entity Types
+API is an entity type.
+
+## Fact Types
+API is internal.`
+
+    const result = parseFORML2(text, [])
+
+    // Unary reading with just 1 noun
+    expect(result.readings).toHaveLength(1)
+    expect(result.readings[0].nouns).toEqual(['API'])
+    expect(result.readings[0].predicate).toBe('is internal')
   })
 })

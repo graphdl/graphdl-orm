@@ -39,9 +39,10 @@ function detectSection(line: string): Section | null {
 }
 
 // ── Line-level patterns ───────────────────────────────────────────────
-// Noun names may be multi-word with spaces (e.g., "Support Request", "API Product").
-// Stops before lowercase stopwords to avoid over-matching into predicates.
-const N = '(?:[A-Z][a-zA-Z0-9]*(?:\\s+(?![Pp]er\\b|[Tt]hat\\b|[Ff]or\\b|[Oo]f\\b|[Tt]he\\b|[Aa]t\\b|[Ii]n\\b|[Vv]ia\\b|[Tt]o\\b|[Ff]rom\\b|[Bb]y\\b|[Ww]ith\\b|[Oo]n\\b|[Oo]r\\b|[Aa]nd\\b|[Ss]ome\\b|[Ee]ach\\b|[Ii]s\\b|[Hh]as\\b|[Aa]re\\b|[Ww]as\\b|[Nn]o\\b|[Nn]ot\\b|[Mm]ore\\b|[Mm]ost\\b)[A-Z][a-zA-Z0-9]*)*)'
+// Noun name pattern: one or more PascalCase words separated by spaces.
+// Used ONLY for structured declarations (entity/value type, subtype, instance fact).
+// Fact-type readings resolve nouns against the declared nounMap — no PascalCase guessing.
+const N = '(?:[A-Z][a-zA-Z0-9]*(?:\\s+[A-Z][a-zA-Z0-9]*)*)'
 
 // Entity type: "Support Request(.Request Id) is an entity type."
 const ENTITY_TYPE = new RegExp(`^(${N})(?:\\(\\.?(${N})\\))?\\s+is an entity type\\.?$`, 'i')
@@ -79,8 +80,11 @@ const INSTANCE_FACT_SIMPLE = new RegExp(`^(${N})\\s+(?:has\\s+)?(${N})\\s+'([^']
 // Markdown subsection header (### EntityName) — sets fact type grouping context
 const SUBSECTION = /^###\s+(.+)/
 
-// Comment or description line (starts with lowercase or is a markdown heading)
+// Comment or description line — not a FORML2 claim
 const COMMENT_LINE = /^(?:#\s|[a-z]|$|\[)/
+
+// Lines that look like documentation comments, not FORML2 readings
+const DESCRIPTION_LINE = /^Cross-domain references:/
 
 // Skip patterns — lines that are structural but not claims
 const SKIP_PATTERNS = [
@@ -152,7 +156,7 @@ export function parseFORML2(
       continue
     }
 
-    // Skip description lines (lowercase start, markdown links)
+    // Skip comment lines (lowercase start, markdown links)
     if (COMMENT_LINE.test(line)) continue
 
     totalLines++
@@ -409,11 +413,15 @@ export function parseFORML2(
       }
     }
 
+    // Skip prose descriptions and cross-domain reference comments.
+    // Checked after structured patterns so "X is an entity type" is not falsely skipped.
+    if (DESCRIPTION_LINE.test(line)) continue
+
     // ── Reading (fact type) ──────────────────────────────────────────
     // Try to parse as a reading — this is the catch-all for fact type lines
     const cleanLine = line.replace(/\.$/, '')
 
-    // Build current noun list for tokenization
+    // Build current noun list for tokenization (declared nouns only)
     const currentNouns = [
       ...existingNouns,
       ...[...nounMap.values()]
@@ -421,57 +429,13 @@ export function parseFORML2(
         .map(n => ({ name: n.name, id: '' })),
     ]
 
+    // Tokenize against declared nouns — longest-match-first via tokenizeReading
     const tokenized = tokenizeReading(cleanLine, currentNouns)
-    let nounNames = tokenized.nounRefs.map(r => r.name)
-
-    // Known-noun fallback: try matching known noun names from the map
-    if (nounNames.length < 2) {
-      const knownNames = [...nounMap.keys()].sort((a, b) => b.length - a.length)
-      const found: string[] = []
-      let remaining = cleanLine
-      for (const name of knownNames) {
-        if (remaining.includes(name)) {
-          found.push(name)
-          remaining = remaining.replace(name, '\0')
-        }
-      }
-      if (found.length >= 2) nounNames = found
-    }
-
-    // PascalCase fallback if still fewer than 2 nouns
-    if (nounNames.length < 2) {
-      const pascalWords = cleanLine.match(/[A-Z][a-zA-Z0-9]*/g) || []
-      if (pascalWords.length >= 2) {
-        // Merge consecutive PascalCase words that form known noun names
-        // e.g. ["API", "Product", "Title"] → ["API Product", "Title"]
-        // when "API Product" is a known noun in nounMap
-        const merged: string[] = []
-        let pw = 0
-        while (pw < pascalWords.length) {
-          let matched = false
-          // Try longest sequence of consecutive words first
-          for (let end = pascalWords.length; end > pw; end--) {
-            const candidate = pascalWords.slice(pw, end).join(' ')
-            if (nounMap.has(candidate)) {
-              merged.push(candidate)
-              pw = end
-              matched = true
-              break
-            }
-          }
-          if (!matched) {
-            merged.push(pascalWords[pw])
-            pw++
-          }
-        }
-        nounNames = merged
-      }
-    }
+    const nounNames = tokenized.nounRefs.map(r => r.name)
 
     // Unary fact (1 noun)
     if (nounNames.length === 1) {
       const predicate = tokenized.predicate || cleanLine.replace(nounNames[0], '').trim()
-      if (!nounMap.has(nounNames[0])) nounMap.set(nounNames[0], { name: nounNames[0], objectType: 'entity' })
       readings.push({ text: cleanLine, nouns: nounNames, predicate })
       parsedLines++
       continue
@@ -480,15 +444,6 @@ export function parseFORML2(
     // Binary+ fact (2+ nouns)
     if (nounNames.length >= 2) {
       const predicate = tokenized.predicate || extractPredicate(cleanLine, nounNames)
-      const isHasPredicate = /^has$/i.test(predicate.trim())
-
-      for (let j = 0; j < nounNames.length; j++) {
-        const name = nounNames[j]
-        if (!nounMap.has(name)) {
-          const objectType = (isHasPredicate && j === nounNames.length - 1) ? 'value' as const : 'entity' as const
-          nounMap.set(name, { name, objectType })
-        }
-      }
 
       readings.push({ text: cleanLine, nouns: nounNames, predicate })
 
