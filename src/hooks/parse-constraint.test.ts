@@ -55,11 +55,91 @@ describe('parseConstraintText', () => {
     })
   })
 
-  describe('ring constraints (irreflexive)', () => {
-    it('parses "No X [verb] itself" as IR', () => {
+  describe('ring constraints', () => {
+    it('parses "No X [verb] itself" as IR (irreflexive)', () => {
       const result = parseConstraintText('No Widget targets itself.')
       expect(result).toEqual([
         { kind: 'IR', modality: 'Alethic', nouns: ['Widget'], constrainedNoun: 'Widget' },
+      ])
+    })
+
+    it('parses "No Person is a parent of themselves" as IR', () => {
+      const result = parseConstraintText('No Person is a parent of itself.')
+      expect(result).toEqual([
+        { kind: 'IR', modality: 'Alethic', nouns: ['Person'], constrainedNoun: 'Person' },
+      ])
+    })
+
+    it('parses symmetric: "If X1 verb X2, then X2 verb X1"', () => {
+      const result = parseConstraintText('If Person1 is married to Person2, then Person2 is married to Person1.')
+      expect(result).toEqual([
+        { kind: 'SY', modality: 'Alethic', nouns: ['Person'], constrainedNoun: 'Person' },
+      ])
+    })
+
+    it('parses asymmetric: "If X1 verb X2, then X2 is not verb X1"', () => {
+      const result = parseConstraintText('If Person1 is parent of Person2, then Person2 is not parent of Person1.')
+      expect(result).toEqual([
+        { kind: 'AS', modality: 'Alethic', nouns: ['Person'], constrainedNoun: 'Person' },
+      ])
+    })
+
+    it('parses transitive: "If X1 verb X2 and X2 verb X3, then X1 verb X3"', () => {
+      const result = parseConstraintText('If Person1 is ancestor of Person2 and Person2 is ancestor of Person3, then Person1 is ancestor of Person3.')
+      expect(result).toEqual([
+        { kind: 'TR', modality: 'Alethic', nouns: ['Person'], constrainedNoun: 'Person' },
+      ])
+    })
+
+    it('parses intransitive: "If X1 verb X2 and X2 verb X3, then X1 is not verb X3"', () => {
+      const result = parseConstraintText('If Person1 is parent of Person2 and Person2 is parent of Person3, then Person1 is not parent of Person3.')
+      expect(result).toEqual([
+        { kind: 'IT', modality: 'Alethic', nouns: ['Person'], constrainedNoun: 'Person' },
+      ])
+    })
+
+    it('parses acyclic as IR + AS (irreflexive + asymmetric)', () => {
+      // Acyclic is expressed as two separate constraints in FORML2
+      const ir = parseConstraintText('No Noun is subtype of itself.')
+      expect(ir).toEqual([
+        { kind: 'IR', modality: 'Alethic', nouns: ['Noun'], constrainedNoun: 'Noun' },
+      ])
+      const as_ = parseConstraintText('If Noun1 is subtype of Noun2, then Noun2 is not subtype of Noun1.')
+      expect(as_).toEqual([
+        { kind: 'AS', modality: 'Alethic', nouns: ['Noun'], constrainedNoun: 'Noun' },
+      ])
+    })
+
+    it('parses symmetric + irreflexive as separate constraints', () => {
+      const sy = parseConstraintText('If Person1 is sibling of Person2, then Person2 is sibling of Person1.')
+      expect(sy).toEqual([
+        { kind: 'SY', modality: 'Alethic', nouns: ['Person'], constrainedNoun: 'Person' },
+      ])
+      const ir = parseConstraintText('No Person is sibling of itself.')
+      expect(ir).toEqual([
+        { kind: 'IR', modality: 'Alethic', nouns: ['Person'], constrainedNoun: 'Person' },
+      ])
+    })
+
+    it('parses asymmetric + intransitive as separate constraints', () => {
+      const as_ = parseConstraintText('If Person1 is parent of Person2, then Person2 is not parent of Person1.')
+      expect(as_).toEqual([
+        { kind: 'AS', modality: 'Alethic', nouns: ['Person'], constrainedNoun: 'Person' },
+      ])
+      const it_ = parseConstraintText('If Person1 is parent of Person2 and Person2 is parent of Person3, then Person1 is not parent of Person3.')
+      expect(it_).toEqual([
+        { kind: 'IT', modality: 'Alethic', nouns: ['Person'], constrainedNoun: 'Person' },
+      ])
+    })
+
+    it('parses symmetric + intransitive as separate constraints', () => {
+      const sy = parseConstraintText('If Person1 is friend of Person2, then Person2 is friend of Person1.')
+      expect(sy).toEqual([
+        { kind: 'SY', modality: 'Alethic', nouns: ['Person'], constrainedNoun: 'Person' },
+      ])
+      const it_ = parseConstraintText('If Person1 is friend of Person2 and Person2 is friend of Person3, then Person1 is not friend of Person3.')
+      expect(it_).toEqual([
+        { kind: 'IT', modality: 'Alethic', nouns: ['Person'], constrainedNoun: 'Person' },
       ])
     })
   })
