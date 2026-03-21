@@ -198,6 +198,16 @@ Intentional Tort is a subtype of Tort.
 
   it('parses fact types with constraints', () => {
     const result = parseFORML2(`
+## Entity Types
+
+Person is an entity type.
+Court is an entity type.
+
+## Value Types
+
+Name is a value type.
+Jurisdiction is a value type.
+
 ## Fact Types
 
 Person has Name.
