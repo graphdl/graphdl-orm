@@ -429,6 +429,13 @@ export function parseFORML2(
     // Checked after structured patterns so "X is an entity type" is not falsely skipped.
     if (DESCRIPTION_LINE.test(line)) continue
 
+    // Lines in instance-facts section that didn't match any instance pattern
+    // should NOT fall through to reading parsing — they're data, not schema
+    if (section === 'instance-facts') {
+      unparsed.push(line)
+      continue
+    }
+
     // ── Reading (fact type) ──────────────────────────────────────────
     // Try to parse as a reading — this is the catch-all for fact type lines
     const cleanLine = line.replace(/\.$/, '')
