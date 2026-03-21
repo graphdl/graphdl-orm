@@ -127,14 +127,14 @@ pub struct GuardDef {
 // ── Evaluation Types ─────────────────────────────────────────────────
 
 /// A snapshot of facts for evaluation. Keys are fact type IDs.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Population {
     pub facts: HashMap<String, Vec<FactInstance>>,
 }
 
 /// A single fact instance — binds references to roles in a fact type.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FactInstance {
     pub fact_type_id: String,
