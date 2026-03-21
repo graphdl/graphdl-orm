@@ -138,57 +138,72 @@ async function handleBulkSeed(
   env: Env,
   domains: Array<{ slug: string; name?: string; claims: ExtractedClaims }>,
 ): Promise<Response> {
+  const timings: Record<string, number> = {}
+  const t = (label: string) => { timings[label] = Date.now() }
+
+  t('start')
   const registry = getRegistryDO(env) as any
 
   // Phase 1: Seed each domain's metamodel in parallel (steps 1-5)
-  // Each domain gets its own DomainDB DO — no shared state needed
+  t('phase1_start')
   const results = await Promise.all(
     domains.map(async (entry) => {
       const domainDO = getDomainDO(env, entry.slug) as any
       await domainDO.setDomainId(entry.slug)
-
-      // Ensure domain record exists in this DO
       await ensureDomain(domainDO, entry.slug, entry.name)
-
-      // Use adapter to make DomainDB look like GraphDLDBLike
       const adapter = createDomainAdapter(domainDO)
-
-      // Ingest metamodel only (nouns, readings, constraints, transitions — no facts)
       const claimsWithoutFacts = { ...entry.claims, facts: [] }
       const result = await ingestClaims(adapter, {
         claims: claimsWithoutFacts,
         domainId: entry.slug,
       })
-
-      // Index nouns in the global registry for cross-domain resolution
-      for (const noun of entry.claims.nouns) {
-        await registry.indexNoun(noun.name, entry.slug)
-      }
-      await registry.registerDomain(entry.slug, entry.slug)
-
       return { domain: entry.slug, domainId: entry.slug, ...result }
     })
   )
+  t('phase1_end')
 
-  // Phase 2: Process instance facts for all domains (after all metamodels are seeded)
-  // Facts can reference nouns from other domains via the Registry
+  // Phase 1.5: Register domains + nouns in Registry (batched, not per-noun RPC)
+  t('registry_start')
+  await Promise.all(
+    domains.map(async (entry) => {
+      await registry.registerDomain(entry.slug, entry.slug)
+    })
+  )
+  // Batch all noun indexing: collect all noun→domain pairs, then index
+  const nounPairs: Array<[string, string]> = []
   for (const entry of domains) {
-    if (!entry.claims.facts?.length) continue
+    for (const noun of entry.claims.nouns) {
+      nounPairs.push([noun.name, entry.slug])
+    }
+  }
+  // Index in parallel batches of 50
+  for (let i = 0; i < nounPairs.length; i += 50) {
+    const batch = nounPairs.slice(i, i + 50)
+    await Promise.all(batch.map(([name, slug]) => registry.indexNoun(name, slug)))
+  }
+  t('registry_end')
 
-    const domainDO = getDomainDO(env, entry.slug) as any
+  // Phase 2: Process instance facts (after all metamodels are seeded)
+  t('phase2_start')
+  // Apply schema for all domains in parallel first
+  await Promise.all(
+    domains.filter(e => e.claims.facts?.length).map(async (entry) => {
+      const domainDO = getDomainDO(env, entry.slug) as any
+      try { await domainDO.applySchema(entry.slug) } catch {}
+    })
+  )
+  t('schema_applied')
 
-    // Apply schema before creating entity instances
-    try { await domainDO.applySchema(entry.slug) } catch { /* may fail if no readings yet */ }
-
-    // Process each fact via createEntity on the DomainDB DO
-    for (const fact of entry.claims.facts) {
-      try {
-        const entityName = fact.entity || ''
-        const entityRef = fact.entityValue || ''
-        const fieldValues: Record<string, string> = {}
-
-        if (fact.entity && fact.valueType) {
-          if (fact.value) {
+  // Process facts in parallel per domain
+  await Promise.all(
+    domains.filter(e => e.claims.facts?.length).map(async (entry) => {
+      const domainDO = getDomainDO(env, entry.slug) as any
+      for (const fact of entry.claims.facts!) {
+        try {
+          const entityName = fact.entity || ''
+          const entityRef = fact.entityValue || ''
+          const fieldValues: Record<string, string> = {}
+          if (fact.entity && fact.valueType && fact.value) {
             const fieldName = fact.valueType
               .split(' ')
               .map((w: string, i: number) =>
@@ -197,16 +212,23 @@ async function handleBulkSeed(
               .join('')
             fieldValues[fieldName] = fact.value
           }
-        }
+          if (entityName) {
+            await domainDO.createEntity(entry.slug, entityName, fieldValues, entityRef)
+          }
+        } catch { /* best-effort */ }
+      }
+    })
+  )
+  t('phase2_end')
 
-        if (entityName) {
-          await domainDO.createEntity(entry.slug, entityName, fieldValues, entityRef)
-        }
-      } catch { /* best-effort fact creation */ }
-    }
+  // Build timing report
+  const report: Record<string, string> = {}
+  const s = timings['start']
+  for (const [k, v] of Object.entries(timings)) {
+    if (k !== 'start') report[k] = `${v - s}ms`
   }
 
-  return json({ domains: results })
+  return json({ domains: results, timings: report })
 }
 
 // ── Single domain seeding ────────────────────────────────────────────
