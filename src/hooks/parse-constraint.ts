@@ -7,7 +7,7 @@
  * Pure function — no DB or LLM dependency.
  */
 
-export type ConstraintKind = 'UC' | 'MC' | 'IR' | 'SS' | 'XC' | 'EQ' | 'OR' | 'XO'
+export type ConstraintKind = 'UC' | 'MC' | 'IR' | 'SY' | 'AS' | 'TR' | 'IT' | 'ANS' | 'AC' | 'RF' | 'SS' | 'XC' | 'EQ' | 'OR' | 'XO'
 
 export interface ParsedConstraint {
   kind: ConstraintKind
@@ -96,6 +96,18 @@ const RING_TRANSITIVE = new RegExp(
   `^If ${RING_NOUN} .+? ${RING_NOUN} and ${RING_NOUN} .+? ${RING_NOUN},? then ${RING_NOUN} .+? ${RING_NOUN}$`,
   'i'
 )
+// "If X1 [verb] X2 and X2 [verb] X1, then X1 is the same as X2"
+const RING_ANTISYMMETRIC = new RegExp(
+  `^If ${RING_NOUN} .+? ${RING_NOUN} and ${RING_NOUN} .+? ${RING_NOUN},? then ${RING_NOUN} is the same (?:as )?${RING_NOUN}`,
+  'i'
+)
+// "No chain of [verb] links returns to its starting point" / "It is impossible that a cycle of [verb] exists"
+const RING_ACYCLIC = /^(?:No chain of .+ (?:returns|leads back)|It is impossible that .*cycl)/i
+// "Each X [verb] itself"
+const RING_REFLEXIVE = new RegExp(
+  `^Each ${RING_NOUN} .+? itself`,
+  'i'
+)
 
 // "Each X has some Y." → MC (mandatory)
 const HAS_SOME = new RegExp(
@@ -167,7 +179,16 @@ export function parseConstraintText(text: string): ParsedConstraint[] | null {
     return [{ kind: 'IR', modality: 'Alethic', nouns: [base], constrainedNoun: base }]
   }
 
-  // "If X1 ... X2 and X2 ... X3, then X1 is not ... X3" → Intransitive (must check before transitive)
+  // Ring constraints — order matters: more specific patterns first
+
+  // "If X1 ... X2 and X2 ... X1, then X1 is the same as X2" → Antisymmetric (before transitive/intransitive)
+  m = clean.match(RING_ANTISYMMETRIC)
+  if (m) {
+    const base = stripSubscript(m[1])
+    return [{ kind: 'ANS', modality: 'Alethic', nouns: [base], constrainedNoun: base }]
+  }
+
+  // "If X1 ... X2 and X2 ... X3, then X1 is not ... X3" → Intransitive (before transitive)
   m = clean.match(RING_INTRANSITIVE)
   if (m) {
     const base = stripSubscript(m[1])
@@ -181,7 +202,7 @@ export function parseConstraintText(text: string): ParsedConstraint[] | null {
     return [{ kind: 'TR', modality: 'Alethic', nouns: [base], constrainedNoun: base }]
   }
 
-  // "If X1 ... X2, then X2 is not ... X1" → Asymmetric (must check before symmetric)
+  // "If X1 ... X2, then X2 is not ... X1" → Asymmetric (before symmetric)
   m = clean.match(RING_ASYMMETRIC)
   if (m) {
     const base = stripSubscript(m[1])
@@ -193,6 +214,22 @@ export function parseConstraintText(text: string): ParsedConstraint[] | null {
   if (m) {
     const base = stripSubscript(m[1])
     return [{ kind: 'SY', modality: 'Alethic', nouns: [base], constrainedNoun: base }]
+  }
+
+  // "No chain of ... returns/leads back" → Acyclic
+  m = clean.match(RING_ACYCLIC)
+  if (m) {
+    // Extract noun from the text heuristically
+    const nounMatch = clean.match(/No chain of (\w+)/i) || clean.match(/cycle of (\w+)/i)
+    const noun = nounMatch ? nounMatch[1] : ''
+    return [{ kind: 'AC', modality: 'Alethic', nouns: [noun], constrainedNoun: noun }]
+  }
+
+  // "Each X [verb] itself" → Purely reflexive
+  m = clean.match(RING_REFLEXIVE)
+  if (m) {
+    const base = stripSubscript(m[1])
+    return [{ kind: 'RF', modality: 'Alethic', nouns: [base], constrainedNoun: base }]
   }
 
   // "Each X has some Y" → MC on X's role
