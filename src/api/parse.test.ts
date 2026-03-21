@@ -592,6 +592,57 @@ Support Response recommends API Product.`
     expect(reading!.nouns).toContain('API Product')
   })
 
+  it('compound ref schemes: "Layer State(.Layer, .Timestamp)" parsed as one noun', () => {
+    const text = `## Entity Types
+Layer(.Layered System, .Layer Number) is an entity type.
+Layer State(.Layer, .Timestamp) is an entity type.
+
+## Value Types
+Valence is a value type.
+Arousal is a value type.
+Timestamp is a value type.
+
+## Fact Types
+Layer State has Valence.
+Layer State has Arousal.`
+
+    const result = parseFORML2(text, [])
+
+    // "Layer State" should be a single compound noun, not split into "Layer" + "State"
+    expect(result.nouns.find(n => n.name === 'Layer State')).toBeDefined()
+    expect(result.nouns.find(n => n.name === 'Layer')).toBeDefined()
+    expect(result.nouns.find(n => n.name === 'State')).toBeUndefined()
+
+    // Readings should match "Layer State" as one noun
+    expect(result.readings).toHaveLength(2)
+    expect(result.readings[0].nouns).toContain('Layer State')
+    expect(result.readings[0].nouns).toContain('Valence')
+    expect(result.readings[1].nouns).toContain('Layer State')
+    expect(result.readings[1].nouns).toContain('Arousal')
+  })
+
+  it('compound identification: "City(.Name, .State)" registers both ref scheme parts', () => {
+    const text = `## Entity Types
+City(.Name, .State) is an entity type.
+
+## Value Types
+Name is a value type.
+State is a value type.
+
+## Fact Types
+City has Name.
+City has State.`
+
+    const result = parseFORML2(text, [])
+
+    expect(result.nouns.find(n => n.name === 'City')).toBeDefined()
+    expect(result.nouns.find(n => n.name === 'City')!.objectType).toBe('entity')
+    // Both ref scheme components registered as value types
+    expect(result.nouns.find(n => n.name === 'Name')).toBeDefined()
+    expect(result.nouns.find(n => n.name === 'State')).toBeDefined()
+    expect(result.readings).toHaveLength(2)
+  })
+
   it('readings with only 1 declared noun are still stored (unary readings)', () => {
     const text = `## Entity Types
 API is an entity type.

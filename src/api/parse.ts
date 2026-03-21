@@ -3,6 +3,7 @@ import type { Env } from '../types'
 import type { ExtractedClaims } from '../claims/ingest'
 import { tokenizeReading } from '../claims/tokenize'
 import { parseConstraintText, parseSetComparisonBlock } from '../hooks/parse-constraint'
+import { parseRule } from '../derivation/parse-rule'
 
 interface ParseResult extends ExtractedClaims {
   warnings: string[]
@@ -45,7 +46,9 @@ function detectSection(line: string): Section | null {
 const N = '(?:[A-Z][a-zA-Z0-9]*(?:\\s+[A-Z][a-zA-Z0-9]*)*)'
 
 // Entity type: "Support Request(.Request Id) is an entity type."
-const ENTITY_TYPE = new RegExp(`^(${N})(?:\\(\\.?(${N})\\))?\\s+is an entity type\\.?$`, 'i')
+// Also handles compound ref schemes: "Layer State(.Layer, .Timestamp) is an entity type."
+// And "within" syntax: "Status(.Name within State Machine Definition) is an entity type."
+const ENTITY_TYPE = new RegExp(`^(${N})(?:\\(([^)]+)\\))?\\s+is an entity type\\.?$`, 'i')
 
 // Value type: "Request Id is a value type."
 const VALUE_TYPE = new RegExp(`^(${N})\\s+is a value type\\.?$`, 'i')
@@ -206,10 +209,16 @@ export function parseFORML2(
     let m = line.replace(/\.$/, '').match(ENTITY_TYPE)
     if (m) {
       const name = m[1]
-      const refScheme = m[2]
+      const refSchemeRaw = m[2]
       nounMap.set(name, { name, objectType: 'entity' })
-      if (refScheme && !nounMap.has(refScheme)) {
-        nounMap.set(refScheme, { name: refScheme, objectType: 'value', valueType: 'string' })
+      if (refSchemeRaw) {
+        // Parse compound ref schemes: ".Layer, .Timestamp" — comma-separated value type IDs
+        const parts = refSchemeRaw.split(/,/).map(p => p.trim().replace(/^\./, '').trim()).filter(Boolean)
+        for (const part of parts) {
+          if (part && !nounMap.has(part)) {
+            nounMap.set(part, { name: part, objectType: 'value', valueType: 'string' })
+          }
+        }
       }
       parsedLines++
       continue
@@ -289,8 +298,11 @@ export function parseFORML2(
     // ── Derivation rule ──────────────────────────────────────────────
     m = line.match(DERIVATION)
     if (m) {
-      // Store as a reading with a derivation marker
-      readings.push({ text: line, nouns: [], predicate: ':=', derivation: m[2].trim() })
+      // Parse into structured IR and store alongside text
+      const nounNames = [...nounMap.keys()]
+      const ruleIR = parseRule(line, nounNames)
+      const ruleNouns = [ruleIR.consequent.subject, ruleIR.consequent.object].filter(Boolean)
+      readings.push({ text: line, nouns: ruleNouns, predicate: ':=', derivation: m[2].trim(), ruleIR })
       parsedLines++
       continue
     }

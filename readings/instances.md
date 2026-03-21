@@ -2,14 +2,14 @@
 
 ## Entity Types
 
-Resource(.Reference within Domain) is an entity type.
-Graph(within Domain) is an entity type.
+Resource(.Reference) is an entity type.
+Graph is an entity type.
   Graph is a subtype of Resource.
-Resource Role(within Graph) is an entity type.
-State Machine(.Name within Domain) is an entity type.
+Resource Role is an entity type.
+State Machine(.Name) is an entity type.
 Event(.id) is an entity type.
 Event Triggered Transition In State Machine objectifies "Event triggered Transition in State Machine".
-Guard Run(.Name within Event) is an entity type.
+Guard Run(.Name) is an entity type.
 Citation is an entity type.
 
 ## Value Types

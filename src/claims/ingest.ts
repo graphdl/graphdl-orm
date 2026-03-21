@@ -7,6 +7,7 @@
 import type { GraphDLDBLike } from '../do-adapter'
 import { createScope } from './scope'
 import { ingestNouns, ingestSubtypes, ingestReadings, ingestConstraints, ingestTransitions, ingestFacts } from './steps'
+import type { DerivationRule } from '../derivation/parse-rule'
 
 export interface ExtractedClaims {
   nouns: Array<{
@@ -28,6 +29,7 @@ export interface ExtractedClaims {
     predicate: string
     multiplicity?: string
     derivation?: string
+    ruleIR?: DerivationRule
   }>
   constraints: Array<{
     kind: 'UC' | 'MC' | 'IR' | 'SS' | 'XC' | 'EQ' | 'OR' | 'XO'

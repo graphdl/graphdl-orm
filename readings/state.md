@@ -2,10 +2,10 @@
 
 ## Entity Types
 
-State Machine Definition(.Title within Domain) is an entity type.
-Status(.Name within State Machine Definition) is an entity type.
-Transition(within State Machine Definition) is an entity type.
-Guard(.Name within Transition) is an entity type.
+State Machine Definition(.Title) is an entity type.
+Status(.Name) is an entity type.
+Transition is an entity type.
+Guard(.Name) is an entity type.
 
 Event Type(.id) is an entity type.
 Stream(.id) is an entity type.
