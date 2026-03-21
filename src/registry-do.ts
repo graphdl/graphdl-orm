@@ -125,6 +125,14 @@ export function getEntityIds(sql: SqlLike, nounType: string): string[] {
 // =========================================================================
 
 /**
+ * Returns all registered domain slugs.
+ */
+export function listDomains(sql: SqlLike): string[] {
+  const rows = sql.exec('SELECT domain_slug FROM domains').toArray()
+  return rows.map((row: any) => row.domain_slug)
+}
+
+/**
  * Join noun_index with domains to find which domain owns the given noun.
  * Returns the first match or null if the noun is not indexed.
  */
@@ -172,6 +180,11 @@ export class RegistryDB extends DurableObject {
   async resolveNoun(nounName: string): Promise<{ domainSlug: string; domainDoId: string } | null> {
     this.ensureInit()
     return resolveNounInRegistry(this.ctx.storage.sql, nounName)
+  }
+
+  async listDomains(): Promise<string[]> {
+    this.ensureInit()
+    return listDomains(this.ctx.storage.sql)
   }
 
   async indexEntity(nounType: string, entityId: string): Promise<void> {

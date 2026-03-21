@@ -1,109 +1,247 @@
 import { json, error } from 'itty-router'
 import type { Env } from '../types'
-import { ingestClaims, ingestProject } from '../claims/ingest'
+import { ingestClaims } from '../claims/ingest'
 import type { ExtractedClaims } from '../claims/ingest'
+import { createDomainAdapter } from '../do-adapter'
+
+// ── DO helpers ───────────────────────────────────────────────────────
+
+/** Get a DomainDB DO stub for a specific domain slug. */
+function getDomainDO(env: Env, domainSlug: string) {
+  return env.DOMAIN_DB.get(env.DOMAIN_DB.idFromName(domainSlug))
+}
+
+/** Get the global RegistryDB DO stub. */
+function getRegistryDO(env: Env) {
+  return env.REGISTRY_DB.get(env.REGISTRY_DB.idFromName('global'))
+}
+
+// ── Seed endpoint ────────────────────────────────────────────────────
 
 export async function handleSeed(request: Request, env: Env): Promise<Response> {
-  const db = getPrimaryDB(env)
-
   if (request.method === 'GET') {
-    const [allNouns, allReadings, allDomains, allSchemas, allConstraints] = await Promise.all([
-      (db as any).findInCollection('nouns', {}, { limit: 0 }),
-      (db as any).findInCollection('readings', {}, { limit: 0 }),
-      (db as any).findInCollection('domains', {}, { limit: 100 }),
-      (db as any).findInCollection('graph-schemas', {}, { limit: 0 }),
-      (db as any).findInCollection('constraints', {}, { limit: 0 }),
-    ])
-
-    const perDomain: Record<string, { nouns: number; readings: number }> = {}
-    for (const d of allDomains.docs) {
-      const slug = (d.domainSlug || d.id) as string
-      const [nouns, readings] = await Promise.all([
-        (db as any).findInCollection('nouns', { domain: { equals: d.id } }, { limit: 0 }),
-        (db as any).findInCollection('readings', { domain: { equals: d.id } }, { limit: 0 }),
-      ])
-      perDomain[slug] = { nouns: nouns.totalDocs, readings: readings.totalDocs }
-    }
-
-    return json({
-      totals: {
-        domains: allDomains.totalDocs,
-        nouns: allNouns.totalDocs,
-        readings: allReadings.totalDocs,
-        graphSchemas: allSchemas.totalDocs,
-        constraints: allConstraints.totalDocs,
-      },
-      perDomain,
-    })
+    return handleSeedGet(env)
   }
 
   if (request.method === 'DELETE') {
-    await (db as any).wipeAllData()
-    return json({ message: 'All data wiped' })
+    return handleSeedDelete(env)
   }
 
   if (request.method === 'POST') {
-    const body = await request.json() as {
-      type: string
-      claims?: ExtractedClaims
-      domain?: string
-      domainId?: string
-      domains?: Array<{ slug: string; name?: string; claims: ExtractedClaims }>
-    }
-
-    if (body.type === 'claims') {
-      // Bulk: multiple domains in one call
-      if (body.domains?.length) {
-        // Ensure all domain records exist first
-        const domainRecords = await Promise.all(
-          body.domains.map(entry => ensureDomain(db as any, entry.slug, entry.name))
-        )
-        // Build input for ingestProject
-        const projectDomains = body.domains.map((entry, i) => ({
-          domainId: domainRecords[i].id as string,
-          claims: entry.claims,
-        }))
-        const projectResult = await ingestProject(db as any, projectDomains)
-        // Flatten into the existing response shape
-        const results = body.domains.map((entry, i) => {
-          const domainId = domainRecords[i].id as string
-          const r = projectResult.domains.get(domainId)!
-          return { domain: entry.slug, domainId, ...r }
-        })
-        return json({ domains: results })
-      }
-
-      // Single domain
-      if (body.claims) {
-        const slug = body.domain
-        const rawId = body.domainId
-        if (!slug && !rawId) return error(400, { errors: [{ message: 'domainId or domains[] required' }] })
-
-        // Ensure domain record exists (find-or-create by slug)
-        const domain = slug
-          ? await ensureDomain(db as any, slug)
-          : { id: rawId }
-        const result = await ingestClaims(db as any, { claims: body.claims, domainId: domain.id })
-        return json({ ...result, domainId: domain.id })
-      }
-
-      return error(400, { errors: [{ message: 'Provide claims + domainId, or domains[]' }] })
-    }
-
-    return error(400, { errors: [{ message: 'Unsupported seed type. Use type: "claims"' }] })
+    return handleSeedPost(request, env)
   }
 
   return error(405, { errors: [{ message: 'Method not allowed' }] })
 }
 
-/**
- * Get the primary DomainDB DO stub.
- * Used for metamodel ingestion which works with any GraphDLDBLike.
- */
-function getPrimaryDB(env: Env) {
-  const id = env.DOMAIN_DB.idFromName('graphdl-primary')
-  return env.DOMAIN_DB.get(id)
+// ── GET /seed — stats from per-domain DOs ────────────────────────────
+
+async function handleSeedGet(env: Env): Promise<Response> {
+  const registry = getRegistryDO(env) as any
+  const domainSlugs: string[] = await registry.listDomains()
+
+  if (!domainSlugs.length) {
+    return json({
+      totals: { domains: 0, nouns: 0, readings: 0, graphSchemas: 0, constraints: 0 },
+      perDomain: {},
+    })
+  }
+
+  // Query each domain DO in parallel for its stats
+  const perDomainEntries = await Promise.all(
+    domainSlugs.map(async (slug) => {
+      const domainDO = getDomainDO(env, slug) as any
+      const [nouns, readings, schemas, constraints] = await Promise.all([
+        domainDO.findInCollection('nouns', {}, { limit: 0 }),
+        domainDO.findInCollection('readings', {}, { limit: 0 }),
+        domainDO.findInCollection('graph-schemas', {}, { limit: 0 }),
+        domainDO.findInCollection('constraints', {}, { limit: 0 }),
+      ])
+      return {
+        slug,
+        nouns: nouns.totalDocs as number,
+        readings: readings.totalDocs as number,
+        graphSchemas: schemas.totalDocs as number,
+        constraints: constraints.totalDocs as number,
+      }
+    })
+  )
+
+  const totals = {
+    domains: domainSlugs.length,
+    nouns: 0,
+    readings: 0,
+    graphSchemas: 0,
+    constraints: 0,
+  }
+  const perDomain: Record<string, { nouns: number; readings: number }> = {}
+
+  for (const entry of perDomainEntries) {
+    totals.nouns += entry.nouns
+    totals.readings += entry.readings
+    totals.graphSchemas += entry.graphSchemas
+    totals.constraints += entry.constraints
+    perDomain[entry.slug] = { nouns: entry.nouns, readings: entry.readings }
+  }
+
+  return json({ totals, perDomain })
 }
+
+// ── DELETE /seed — wipe all domain DOs ──────────────────────────────
+
+async function handleSeedDelete(env: Env): Promise<Response> {
+  const registry = getRegistryDO(env) as any
+  const domainSlugs: string[] = await registry.listDomains()
+
+  // Wipe each domain DO in parallel
+  await Promise.all(
+    domainSlugs.map(async (slug) => {
+      const domainDO = getDomainDO(env, slug) as any
+      await domainDO.wipeAllData()
+    })
+  )
+
+  return json({ message: 'All data wiped' })
+}
+
+// ── POST /seed — parallel per-domain ingestion ───────────────────────
+
+async function handleSeedPost(request: Request, env: Env): Promise<Response> {
+  const body = await request.json() as {
+    type: string
+    claims?: ExtractedClaims
+    domain?: string
+    domainId?: string
+    domains?: Array<{ slug: string; name?: string; claims: ExtractedClaims }>
+  }
+
+  if (body.type !== 'claims') {
+    return error(400, { errors: [{ message: 'Unsupported seed type. Use type: "claims"' }] })
+  }
+
+  // Bulk: multiple domains in one call — each gets its own DO
+  if (body.domains?.length) {
+    return handleBulkSeed(env, body.domains)
+  }
+
+  // Single domain
+  if (body.claims) {
+    return handleSingleSeed(env, body)
+  }
+
+  return error(400, { errors: [{ message: 'Provide claims + domainId, or domains[]' }] })
+}
+
+// ── Bulk multi-domain seeding ────────────────────────────────────────
+
+async function handleBulkSeed(
+  env: Env,
+  domains: Array<{ slug: string; name?: string; claims: ExtractedClaims }>,
+): Promise<Response> {
+  const registry = getRegistryDO(env) as any
+
+  // Phase 1: Seed each domain's metamodel in parallel (steps 1-5)
+  // Each domain gets its own DomainDB DO — no shared state needed
+  const results = await Promise.all(
+    domains.map(async (entry) => {
+      const domainDO = getDomainDO(env, entry.slug) as any
+      await domainDO.setDomainId(entry.slug)
+
+      // Ensure domain record exists in this DO
+      await ensureDomain(domainDO, entry.slug, entry.name)
+
+      // Use adapter to make DomainDB look like GraphDLDBLike
+      const adapter = createDomainAdapter(domainDO)
+
+      // Ingest metamodel only (nouns, readings, constraints, transitions — no facts)
+      const claimsWithoutFacts = { ...entry.claims, facts: [] }
+      const result = await ingestClaims(adapter, {
+        claims: claimsWithoutFacts,
+        domainId: entry.slug,
+      })
+
+      // Index nouns in the global registry for cross-domain resolution
+      for (const noun of entry.claims.nouns) {
+        await registry.indexNoun(noun.name, entry.slug)
+      }
+      await registry.registerDomain(entry.slug, entry.slug)
+
+      return { domain: entry.slug, domainId: entry.slug, ...result }
+    })
+  )
+
+  // Phase 2: Process instance facts for all domains (after all metamodels are seeded)
+  // Facts can reference nouns from other domains via the Registry
+  for (const entry of domains) {
+    if (!entry.claims.facts?.length) continue
+
+    const domainDO = getDomainDO(env, entry.slug) as any
+
+    // Apply schema before creating entity instances
+    try { await domainDO.applySchema(entry.slug) } catch { /* may fail if no readings yet */ }
+
+    // Process each fact via createEntity on the DomainDB DO
+    for (const fact of entry.claims.facts) {
+      try {
+        const entityName = fact.entity || ''
+        const entityRef = fact.entityValue || ''
+        const fieldValues: Record<string, string> = {}
+
+        if (fact.entity && fact.valueType) {
+          if (fact.value) {
+            const fieldName = fact.valueType
+              .split(' ')
+              .map((w: string, i: number) =>
+                i === 0 ? w.toLowerCase() : w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()
+              )
+              .join('')
+            fieldValues[fieldName] = fact.value
+          }
+        }
+
+        if (entityName) {
+          await domainDO.createEntity(entry.slug, entityName, fieldValues, entityRef)
+        }
+      } catch { /* best-effort fact creation */ }
+    }
+  }
+
+  return json({ domains: results })
+}
+
+// ── Single domain seeding ────────────────────────────────────────────
+
+async function handleSingleSeed(
+  env: Env,
+  body: { claims?: ExtractedClaims; domain?: string; domainId?: string },
+): Promise<Response> {
+  const slug = body.domain
+  const rawId = body.domainId
+  if (!slug && !rawId) {
+    return error(400, { errors: [{ message: 'domainId or domains[] required' }] })
+  }
+
+  const domainSlug = slug || rawId!
+  const domainDO = getDomainDO(env, domainSlug) as any
+  await domainDO.setDomainId(domainSlug)
+
+  // Ensure domain record exists in this DO
+  await ensureDomain(domainDO, domainSlug)
+
+  const adapter = createDomainAdapter(domainDO)
+  const result = await ingestClaims(adapter, { claims: body.claims!, domainId: domainSlug })
+
+  // Register in the global registry
+  const registry = getRegistryDO(env) as any
+  for (const noun of body.claims!.nouns) {
+    await registry.indexNoun(noun.name, domainSlug)
+  }
+  await registry.registerDomain(domainSlug, domainSlug)
+
+  return json({ ...result, domainId: domainSlug })
+}
+
+// ── Domain record helper ─────────────────────────────────────────────
 
 async function ensureDomain(db: any, slug: string, name?: string): Promise<Record<string, any>> {
   const existing = await db.findInCollection('domains', {
