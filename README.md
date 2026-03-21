@@ -4,7 +4,7 @@
 > (Entities should not be multiplied beyond necessity.)
 > -William of Ockham
 
-A self-describing meta-framework for [Object-Role Modeling](https://en.wikipedia.org/wiki/Object-role_modeling) (ORM2/FORML2). Natural language readings are the source code — they generate relational schemas, APIs, state machines, constraint algebras, and UI layouts.
+A self-describing meta-framework for [Object-Role Modeling](https://en.wikipedia.org/wiki/Object-role_modeling) (ORM2/FORML2). Natural language readings are the source code — they generate relational schemas, APIs, state machines, constraint algebras, UI layouts, and agent prompts.
 
 **Stack:** Cloudflare Workers + Durable Objects (SQLite) + itty-router + Rust/WASM FOL engine
 
