@@ -11,6 +11,7 @@ import { handleEvaluate, handleSynthesize } from './evaluate'
 import { createWithHook, refreshNouns, type HookContext, COLLECTION_HOOKS } from '../hooks'
 import { getInitialState, getValidTransitions, applyTransition } from '../worker/state-machine'
 import { handleConceptualQuery } from './conceptual-query'
+import { deriveOnWrite } from '../worker/derive-on-write'
 
 // ── DO helpers ───────────────────────────────────────────────────────
 
@@ -341,12 +342,46 @@ router.post('/api/entity', async (request, env: Env) => {
   // Index the entity in the Registry
   await registry.indexEntity(body.noun, parentId)
 
+  // Fire derivation rules (best-effort, don't block on failure)
+  let derivedCount = 0
+  try {
+    const deriveResult = await deriveOnWrite({
+      entity: { id: parentId, type: body.noun, data: parentData },
+      loadDerivationRules: async () => {
+        const readings = await domainDO.findInCollection('readings', {}, { limit: 1000 })
+        return (readings.docs || []).filter((r: any) => r.text?.includes(':='))
+      },
+      loadNouns: async () => {
+        const nouns = await domainDO.findInCollection('nouns', {}, { limit: 500 })
+        return (nouns.docs || []).map((n: any) => n.name)
+      },
+      loadRelatedFacts: async (nounType: string) => {
+        const ids: string[] = await registry.getEntityIds(nounType)
+        const entities: Array<{ id: string; type: string; data: Record<string, unknown> }> = []
+        await Promise.all(ids.slice(0, 50).map(async (id: string) => {
+          try {
+            const eDO = getEntityDO(env, id) as any
+            const e = await eDO.get()
+            if (e && !e.deletedAt) entities.push({ id: e.id, type: e.type, data: e.data })
+          } catch {}
+        }))
+        return entities
+      },
+      writeDerivedFact: async (entityId: string, field: string, value: string) => {
+        const eDO = getEntityDO(env, entityId) as any
+        await eDO.patch({ [field]: value })
+      },
+    })
+    derivedCount = deriveResult.derivedCount
+  } catch { /* derivation is best-effort */ }
+
   const result: Record<string, any> = {
     id: parentId,
     noun: body.noun,
     domain: body.domain,
     version: putResult.version,
     ...(smInit && { status: smInit.initialStatus }),
+    ...(derivedCount > 0 && { derived: derivedCount }),
   }
 
   // Create children as separate Entity DOs, each with FK back to parent
