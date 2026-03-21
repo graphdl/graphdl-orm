@@ -9,6 +9,7 @@ import { handleParseOrm } from './parse-orm'
 import { handleVerify } from './verify'
 import { handleEvaluate, handleSynthesize } from './evaluate'
 import { createWithHook, refreshNouns, type HookContext, COLLECTION_HOOKS } from '../hooks'
+import { getInitialState, getValidTransitions, applyTransition } from '../worker/state-machine'
 
 // ── DO helpers ───────────────────────────────────────────────────────
 
@@ -261,12 +262,22 @@ router.post('/api/entity', async (request, env: Env) => {
     }
   }
 
+  // Look up state machine definition for this noun type
+  const domainDO = getDomainDO(env, body.domain) as any
+  const smInit = await getInitialState(domainDO, body.noun, body.domain)
+
   // Create parent entity in its own EntityDB DO
   const parentId = crypto.randomUUID()
   const parentData = {
     ...parentFields,
     ...(body.reference && { reference: body.reference }),
     ...(body.createdBy && { createdBy: body.createdBy }),
+    // Initialize state machine at initial status
+    ...(smInit && {
+      _status: smInit.initialStatus,
+      _statusId: smInit.initialStatusId,
+      _stateMachineDefinition: smInit.definitionId,
+    }),
   }
   const entityDO = getEntityDO(env, parentId) as any
   const putResult = await entityDO.put({ id: parentId, type: body.noun, data: parentData })
@@ -279,6 +290,7 @@ router.post('/api/entity', async (request, env: Env) => {
     noun: body.noun,
     domain: body.domain,
     version: putResult.version,
+    ...(smInit && { status: smInit.initialStatus }),
   }
 
   // Create children as separate Entity DOs, each with FK back to parent
@@ -303,6 +315,76 @@ router.post('/api/entity', async (request, env: Env) => {
   }
 
   return json(result, { status: 201 })
+})
+
+// ── Entity state machine transitions ─────────────────────────────────
+// GET available transitions
+router.get('/api/entities/:noun/:id/transitions', async (request, env: Env) => {
+  const { noun, id } = request.params
+  const entityDO = getEntityDO(env, id) as any
+  const entity = await entityDO.get()
+  if (!entity) return error(404, { errors: [{ message: 'Not Found' }] })
+
+  if (!entity.data?._stateMachineDefinition || !entity.data?._statusId) {
+    return json({ transitions: [], message: 'Entity has no state machine' })
+  }
+
+  const url = new URL(request.url)
+  const domainSlug = url.searchParams.get('domain') || entity.data._domain || 'global'
+  const domainDO = getDomainDO(env, domainSlug) as any
+  const options = await getValidTransitions(domainDO, entity.data._stateMachineDefinition, entity.data._statusId)
+
+  return json({
+    currentStatus: entity.data._status,
+    transitions: options.map(o => ({ event: o.event, targetStatus: o.targetStatus })),
+  })
+})
+
+// POST fire a transition event
+router.post('/api/entities/:noun/:id/transition', async (request, env: Env) => {
+  const { noun, id } = request.params
+  const body = await request.json() as { event: string; domain?: string }
+  if (!body.event) return error(400, { errors: [{ message: 'event required' }] })
+
+  const entityDO = getEntityDO(env, id) as any
+  const entity = await entityDO.get()
+  if (!entity) return error(404, { errors: [{ message: 'Not Found' }] })
+
+  if (!entity.data?._stateMachineDefinition || !entity.data?._statusId) {
+    return error(400, { errors: [{ message: 'Entity has no state machine' }] })
+  }
+
+  const domainSlug = body.domain || entity.data._domain || 'global'
+  const domainDO = getDomainDO(env, domainSlug) as any
+  const result = await applyTransition(
+    domainDO,
+    entity.data._stateMachineDefinition,
+    entity.data._statusId,
+    body.event,
+  )
+
+  if (!result) {
+    const options = await getValidTransitions(domainDO, entity.data._stateMachineDefinition, entity.data._statusId)
+    return error(400, { errors: [{
+      message: `Invalid transition: event '${body.event}' not available from status '${entity.data._status}'`,
+      validEvents: options.map(o => o.event),
+    }] })
+  }
+
+  // Update entity with new status
+  await entityDO.patch({
+    _status: result.newStatus,
+    _statusId: result.newStatusId,
+  })
+
+  return json({
+    id,
+    noun,
+    previousStatus: result.previousStatus,
+    status: result.newStatus,
+    event: result.event,
+    transitionId: result.transitionId,
+  })
 })
 
 // ── Entity queries (3NF tables) ───────────────────────────────────────
