@@ -10,6 +10,7 @@ import { handleVerify } from './verify'
 import { handleEvaluate, handleSynthesize } from './evaluate'
 import { createWithHook, refreshNouns, type HookContext, COLLECTION_HOOKS } from '../hooks'
 import { getInitialState, getValidTransitions, applyTransition } from '../worker/state-machine'
+import { handleConceptualQuery } from './conceptual-query'
 
 // ── DO helpers ───────────────────────────────────────────────────────
 
@@ -703,6 +704,10 @@ router.delete('/api/state/*', async (request, env: Env) => {
   const { handleDeleteState } = await import('./state')
   return handleDeleteState(request, env)
 })
+
+// ── Conceptual Query ────────────────────────────────────────────────
+router.get('/api/query', handleConceptualQuery)
+router.post('/api/query', handleConceptualQuery)
 
 // ── 404 fallback ─────────────────────────────────────────────────────
 router.all('*', () => error(404, { errors: [{ message: 'Not Found' }] }))
