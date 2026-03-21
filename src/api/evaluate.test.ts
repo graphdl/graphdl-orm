@@ -28,7 +28,7 @@ function makeRequest(method: string, body?: any): Request {
 
 function makeMockEnv(docs: any[] = []) {
   return {
-    GRAPHDL_DB: {
+    DOMAIN_DB: {
       idFromName: vi.fn().mockReturnValue('test-id'),
       get: vi.fn().mockReturnValue({
         findInCollection: vi.fn().mockResolvedValue({ docs }),

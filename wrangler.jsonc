@@ -9,13 +9,13 @@
     "bindings": [
       { "name": "ENTITY_DB", "class_name": "EntityDB" },
       { "name": "DOMAIN_DB", "class_name": "DomainDB" },
-      { "name": "REGISTRY_DB", "class_name": "RegistryDB" },
-      { "name": "GRAPHDL_DB", "class_name": "GraphDLDB" }
+      { "name": "REGISTRY_DB", "class_name": "RegistryDB" }
     ]
   },
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["GraphDLDB"] },
-    { "tag": "v2", "new_sqlite_classes": ["EntityDB", "DomainDB", "RegistryDB"] }
+    { "tag": "v2", "new_sqlite_classes": ["EntityDB", "DomainDB", "RegistryDB"] },
+    { "tag": "v3", "deleted_classes": ["GraphDLDB"] }
   ],
   "vars": {
     "ENVIRONMENT": "production"

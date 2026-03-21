@@ -58,9 +58,9 @@ describe('wipeAllData coverage', () => {
 
 describe('createEntityInner', () => {
   it('defines tableName from toTableName(nounName) before first use', () => {
-    // createEntityInner is a private method on GraphDLDB, so we verify at source level
+    // createEntityInner is a private method on DomainDB, so we verify at source level
     // that the variable is properly defined before it is referenced.
-    const source = readFileSync(join(__dirname, 'do.ts'), 'utf-8')
+    const source = readFileSync(join(__dirname, 'domain-do.ts'), 'utf-8')
 
     // Extract the createEntityInner method body
     const methodStart = source.indexOf('private async createEntityInner(')

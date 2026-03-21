@@ -14,8 +14,8 @@ import type { Env } from '../types'
 import { COLLECTION_TABLE_MAP, FIELD_MAP } from '../collections'
 
 function getDB(env: Env) {
-  const id = env.GRAPHDL_DB.idFromName('graphdl-primary')
-  return env.GRAPHDL_DB.get(id) as any
+  const id = env.DOMAIN_DB.idFromName('graphdl-primary')
+  return env.DOMAIN_DB.get(id) as any
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
