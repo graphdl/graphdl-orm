@@ -1,5 +1,9 @@
 # graphdl-orm
 
+> "Entia non sunt multiplicanda praeter necessitatem."
+> (Entities should not be multiplied beyond necessity.)
+> -William of Ockham
+
 A self-describing meta-framework for [Object-Role Modeling](https://en.wikipedia.org/wiki/Object-role_modeling) (ORM2/FORML2). Natural language readings are the source code — they generate relational schemas, APIs, state machines, constraint algebras, and UI layouts.
 
 **Stack:** Cloudflare Workers + Durable Objects (SQLite) + itty-router + Rust/WASM FOL engine
@@ -12,7 +16,7 @@ This system implements ideas from five foundational works:
 - **Halpin (ORM2)** — Elementary facts in natural language as the conceptual layer
 - **Backus (1977)** — An algebra of programs: constraints compile to pure functions, evaluation is function application over whole structures
 - **Bush (1945)** — Associative trails: facts link to facts through readings, not hierarchical indexes
-- **Leibniz (1666)** — Characteristica Universalis: a formal language for all knowledge, disputes resolved by calculation (*Calculemus*)
+- **Leibniz (1666)** — Characteristica Universalis: a formal language for all knowledge, disputes resolved by calculation
 
 The readings are the source. Everything else is compilation.
 
