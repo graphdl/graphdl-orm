@@ -902,6 +902,7 @@ fn compile_forbidden(ir: &ConstraintIR, def: &ConstraintDef) -> Predicate {
     let id = def.id.clone();
     let text = def.text.clone();
     let forbidden_values = collect_enum_values(ir, &def.spans);
+    let entity_scope = def.entity.clone();
 
     // Extract key phrases from the constraint text for text-based matching.
     // "It is forbidden that Customer resells AutomotiveData to ThirdParty"
@@ -912,6 +913,16 @@ fn compile_forbidden(ir: &ConstraintIR, def: &ConstraintDef) -> Predicate {
         let mut violations = Vec::new();
         let mut seen = HashSet::new();
         let lower_text = ctx.response.text.to_lowercase();
+
+        // Entity scoping: only evaluate when the response references the scoped entity
+        if let Some(ref entity) = entity_scope {
+            let entity_lower = entity.to_lowercase();
+            let entity_compact: String = entity.chars().filter(|c| !c.is_whitespace()).collect();
+            let entity_compact_lower = entity_compact.to_lowercase();
+            if !lower_text.contains(&entity_lower) && !lower_text.contains(&entity_compact_lower) {
+                return violations;
+            }
+        }
 
         // Enum-based check (exact value match)
         for (noun_name, enum_vals) in &forbidden_values {
@@ -998,6 +1009,7 @@ fn compile_obligatory(ir: &ConstraintIR, def: &ConstraintDef) -> Predicate {
     let text = def.text.clone();
     let obligatory_values = collect_enum_values(ir, &def.spans);
     let checks_sender = def.text.to_lowercase().contains("senderidentity");
+    let entity_scope = def.entity.clone();
 
     // For text-based obligatory constraints, the constraint text itself is included
     // in the compiled model for semantic evaluation by the LLM layer.
@@ -1011,6 +1023,19 @@ fn compile_obligatory(ir: &ConstraintIR, def: &ConstraintDef) -> Predicate {
     Arc::new(move |ctx: &EvalContext| {
         let mut violations = Vec::new();
         let lower_text = ctx.response.text.to_lowercase();
+
+        // Entity scoping: if this constraint is scoped to an entity, only evaluate
+        // when the response text mentions that entity. A constraint about User/Organization
+        // should not fire on text about the weather.
+        if let Some(ref entity) = entity_scope {
+            let entity_lower = entity.to_lowercase();
+            // Also check for multi-word entity names with spaces removed (e.g. "OrgRole")
+            let entity_compact: String = entity.chars().filter(|c| !c.is_whitespace()).collect();
+            let entity_compact_lower = entity_compact.to_lowercase();
+            if !lower_text.contains(&entity_lower) && !lower_text.contains(&entity_compact_lower) {
+                return violations; // entity not relevant to this text
+            }
+        }
 
         // Enum-based check
         for (noun_name, enum_vals) in &obligatory_values {
