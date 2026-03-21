@@ -150,14 +150,15 @@ async function handleBulkSeed(
     domains.map(async (entry) => {
       const domainDO = getDomainDO(env, entry.slug) as any
       await domainDO.setDomainId(entry.slug)
-      await ensureDomain(domainDO, entry.slug, entry.name)
+      const domainRecord = await ensureDomain(domainDO, entry.slug, entry.name)
+      const domainUUID = domainRecord.id as string
       const adapter = createDomainAdapter(domainDO)
       const claimsWithoutFacts = { ...entry.claims, facts: [] }
       const result = await ingestClaims(adapter, {
         claims: claimsWithoutFacts,
-        domainId: entry.slug,
+        domainId: domainUUID,
       })
-      return { domain: entry.slug, domainId: entry.slug, ...result }
+      return { domain: entry.slug, domainId: domainUUID, ...result }
     })
   )
   t('phase1_end')
@@ -183,13 +184,18 @@ async function handleBulkSeed(
   }
   t('registry_end')
 
+  // Build slug → UUID map from phase 1 results
+  const slugToUUID = new Map<string, string>()
+  for (const r of results) slugToUUID.set(r.domain, r.domainId)
+
   // Phase 2: Process instance facts (after all metamodels are seeded)
   t('phase2_start')
   // Apply schema for all domains in parallel first
   await Promise.all(
     domains.filter(e => e.claims.facts?.length).map(async (entry) => {
       const domainDO = getDomainDO(env, entry.slug) as any
-      try { await domainDO.applySchema(entry.slug) } catch {}
+      const uuid = slugToUUID.get(entry.slug) || entry.slug
+      try { await domainDO.applySchema(uuid) } catch {}
     })
   )
   t('schema_applied')
@@ -198,6 +204,7 @@ async function handleBulkSeed(
   await Promise.all(
     domains.filter(e => e.claims.facts?.length).map(async (entry) => {
       const domainDO = getDomainDO(env, entry.slug) as any
+      const uuid = slugToUUID.get(entry.slug) || entry.slug
       for (const fact of entry.claims.facts!) {
         try {
           const entityName = fact.entity || ''
@@ -213,7 +220,7 @@ async function handleBulkSeed(
             fieldValues[fieldName] = fact.value
           }
           if (entityName) {
-            await domainDO.createEntity(entry.slug, entityName, fieldValues, entityRef)
+            await domainDO.createEntity(uuid, entityName, fieldValues, entityRef)
           }
         } catch { /* best-effort */ }
       }
@@ -248,10 +255,11 @@ async function handleSingleSeed(
   await domainDO.setDomainId(domainSlug)
 
   // Ensure domain record exists in this DO
-  await ensureDomain(domainDO, domainSlug)
+  const domainRecord = await ensureDomain(domainDO, domainSlug)
+  const domainUUID = domainRecord.id as string
 
   const adapter = createDomainAdapter(domainDO)
-  const result = await ingestClaims(adapter, { claims: body.claims!, domainId: domainSlug })
+  const result = await ingestClaims(adapter, { claims: body.claims!, domainId: domainUUID })
 
   // Register in the global registry
   const registry = getRegistryDO(env) as any
@@ -260,7 +268,7 @@ async function handleSingleSeed(
   }
   await registry.registerDomain(domainSlug, domainSlug)
 
-  return json({ ...result, domainId: domainSlug })
+  return json({ ...result, domainId: domainUUID })
 }
 
 // ── Domain record helper ─────────────────────────────────────────────
