@@ -132,6 +132,27 @@ describe('parseConstraintText', () => {
       ])
     })
 
+    it('parses antisymmetric: "If X1 verb X2 and X2 verb X1, then X1 is the same as X2"', () => {
+      const result = parseConstraintText('If Node1 contains Node2 and Node2 contains Node1, then Node1 is the same as Node2.')
+      expect(result).toEqual([
+        { kind: 'ANS', modality: 'Alethic', nouns: ['Node'], constrainedNoun: 'Node' },
+      ])
+    })
+
+    it('parses acyclic: "No chain of ... returns"', () => {
+      const result = parseConstraintText('No chain of dependency links returns to its starting point.')
+      expect(result).toEqual([
+        { kind: 'AC', modality: 'Alethic', nouns: ['dependency'], constrainedNoun: 'dependency' },
+      ])
+    })
+
+    it('parses purely reflexive: "Each X [verb] itself"', () => {
+      const result = parseConstraintText('Each Category includes itself.')
+      expect(result).toEqual([
+        { kind: 'RF', modality: 'Alethic', nouns: ['Category'], constrainedNoun: 'Category' },
+      ])
+    })
+
     it('parses symmetric + intransitive as separate constraints', () => {
       const sy = parseConstraintText('If Person1 is friend of Person2, then Person2 is friend of Person1.')
       expect(sy).toEqual([

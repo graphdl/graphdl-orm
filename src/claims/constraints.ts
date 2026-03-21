@@ -7,7 +7,7 @@
 import type { GraphDLDBLike } from '../do-adapter'
 
 export interface ConstraintDef {
-  kind: 'UC' | 'MC' | 'IR' | 'SS' | 'XC' | 'EQ' | 'OR' | 'XO'
+  kind: 'UC' | 'MC' | 'IR' | 'SY' | 'AS' | 'TR' | 'IT' | 'ANS' | 'AC' | 'RF' | 'SS' | 'XC' | 'EQ' | 'OR' | 'XO'
   modality: 'Alethic' | 'Deontic'
   roles: number[]
 }

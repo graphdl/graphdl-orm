@@ -32,7 +32,7 @@ export interface ExtractedClaims {
     ruleIR?: DerivationRule
   }>
   constraints: Array<{
-    kind: 'UC' | 'MC' | 'IR' | 'SS' | 'XC' | 'EQ' | 'OR' | 'XO'
+    kind: 'UC' | 'MC' | 'IR' | 'SY' | 'AS' | 'TR' | 'IT' | 'ANS' | 'AC' | 'RF' | 'SS' | 'XC' | 'EQ' | 'OR' | 'XO'
     modality: 'Alethic' | 'Deontic'
     deonticOperator?: 'obligatory' | 'forbidden' | 'permitted'
     reading: string
