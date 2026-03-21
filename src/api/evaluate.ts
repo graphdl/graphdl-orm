@@ -18,8 +18,8 @@ function initWasm() {
 }
 
 function getDB(env: Env): DurableObjectStub {
-  const id = env.GRAPHDL_DB.idFromName('graphdl-primary')
-  return env.GRAPHDL_DB.get(id)
+  const id = env.DOMAIN_DB.idFromName('graphdl-primary')
+  return env.DOMAIN_DB.get(id)
 }
 
 export async function handleEvaluate(request: Request, env: Env): Promise<Response> {

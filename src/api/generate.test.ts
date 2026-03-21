@@ -33,7 +33,7 @@ describe('handleGenerate', () => {
         body: JSON.stringify({ domainId: 'd1', outputFormat: format }),
         headers: { 'Content-Type': 'application/json' },
       })
-      // Will throw because env.GRAPHDL_DB is not set, but should NOT return 400
+      // Will throw because env.DOMAIN_DB is not set, but should NOT return 400
       try {
         await handleGenerate(request, {} as any)
       } catch {

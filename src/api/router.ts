@@ -31,12 +31,13 @@ function getRegistryDO(env: Env, scope: string): DurableObjectStub {
 }
 
 /**
- * Legacy: get the monolithic GraphDLDB stub.
- * Used for routes not yet migrated to the new DO architecture.
+ * Get the primary DomainDB DO stub.
+ * Replaces the old getLegacyDB that referenced GraphDLDB.
+ * Uses a single "primary" instance for all collection/metamodel operations.
  */
-function getLegacyDB(env: Env): DurableObjectStub {
-  const id = env.GRAPHDL_DB.idFromName('graphdl-primary')
-  return env.GRAPHDL_DB.get(id)
+function getPrimaryDB(env: Env): DurableObjectStub {
+  const id = env.DOMAIN_DB.idFromName('graphdl-primary')
+  return env.DOMAIN_DB.get(id)
 }
 
 export const router = AutoRouter()
@@ -135,7 +136,7 @@ router.get('/health', () => json({ status: 'ok', version: '0.1.0' }))
 // ── Debug: table schema inspection ──────────────────────────────────
 router.get('/debug/table/:table', async (request, env: Env) => {
   const { table } = request.params
-  const db = getLegacyDB(env) as any
+  const db = getPrimaryDB(env) as any
   const info = await db.inspectTable(table)
   return json(info)
 })
@@ -147,8 +148,7 @@ router.get('/ws', async (request, env: Env) => {
   }
   const url = new URL(request.url)
   const domain = url.searchParams.get('domain') || 'all'
-  const id = env.GRAPHDL_DB.idFromName('graphdl-primary')
-  const stub = env.GRAPHDL_DB.get(id)
+  const stub = getPrimaryDB(env)
   return stub.fetch(new Request(`https://graphdl-orm/ws?domain=${domain}`, {
     headers: request.headers,
   }))
@@ -175,7 +175,7 @@ router.post('/api/facts', async (request, env: Env) => {
     return error(400, { errors: [{ message: 'domainId required' }] })
   }
 
-  const db = getLegacyDB(env) as any
+  const db = getPrimaryDB(env) as any
 
   // Single fact with pre-resolved IDs
   if (body.graphSchemaId && body.bindings?.length) {
@@ -434,7 +434,7 @@ router.get('/api/:collection', async (request, env: Env) => {
   const url = new URL(request.url)
   const { where, limit, page, sort, depth } = parseQueryOptions(url.searchParams)
 
-  const db = getLegacyDB(env) as any
+  const db = getPrimaryDB(env) as any
   const result = await db.findInCollection(collection, where, { limit, page, sort })
   const docs = await populateDocs(db, result.docs, collection, depth)
 
@@ -460,7 +460,7 @@ router.get('/api/:collection/:id', async (request, env: Env) => {
   const url = new URL(request.url)
   const depth = parseInt(url.searchParams.get('depth') || '0', 10)
 
-  const db = getLegacyDB(env) as any
+  const db = getPrimaryDB(env) as any
   const doc = await db.getFromCollection(collection, id)
 
   if (!doc) return error(404, { errors: [{ message: 'Not Found' }] })
@@ -476,7 +476,7 @@ router.post('/api/:collection', async (request, env: Env) => {
   }
 
   const body = await request.json() as Record<string, any>
-  const db = getLegacyDB(env) as any
+  const db = getPrimaryDB(env) as any
 
   // If a hook exists for this collection, use createWithHook
   if (COLLECTION_HOOKS[collection]) {
@@ -505,7 +505,7 @@ router.patch('/api/:collection/:id', async (request, env: Env) => {
   }
 
   const body = await request.json() as Record<string, any>
-  const db = getLegacyDB(env) as any
+  const db = getPrimaryDB(env) as any
   const doc = await db.updateInCollection(collection, id, body)
 
   if (!doc) return error(404, { errors: [{ message: 'Not Found' }] })
@@ -519,7 +519,7 @@ router.delete('/api/:collection/:id', async (request, env: Env) => {
     return error(404, { errors: [{ message: `Collection "${collection}" not found` }] })
   }
 
-  const db = getLegacyDB(env) as any
+  const db = getPrimaryDB(env) as any
   const result = await db.deleteFromCollection(collection, id)
 
   if (!result.deleted) return error(404, { errors: [{ message: 'Not Found' }] })
@@ -533,35 +533,16 @@ router.all('/claims', handleSeed)
 // ── Domain wipe (metamodel only — nouns, readings, constraints, roles, etc.) ──
 router.delete('/api/domains/:domainId/metamodel', async (request, env: Env) => {
   const { domainId } = request.params
-  const db = getLegacyDB(env) as any
+  const db = getPrimaryDB(env) as any
   const result = await db.wipeDomainMetamodel(domainId)
   return json(result)
 })
 
 // ── Full reset (delete ALL data from ALL tables) ────────────────────
 router.delete('/api/reset', async (request, env: Env) => {
-  const db = getLegacyDB(env) as any
-  const tables = [
-    'guard_runs', 'events', 'state_machines', 'resource_roles', 'graph_citations',
-    'graphs', 'resources', 'citations', 'generators',
-    'completions', 'agents', 'agent_definitions', 'models',
-    'constraint_spans', 'constraints', 'roles', 'readings', 'graph_schemas',
-    'functions', 'verbs', 'guards', 'transitions', 'statuses',
-    'event_types', 'streams', 'state_machine_definitions',
-    'nouns', 'domains', 'apps', 'org_memberships', 'organizations',
-  ]
-  const counts: Record<string, number> = {}
-  for (const table of tables) {
-    try {
-      const result = db.sql.exec(`SELECT count(*) as c FROM ${table}`).toArray()
-      const count = result[0]?.c || 0
-      if (count > 0) {
-        db.sql.exec(`DELETE FROM ${table}`)
-        counts[table] = count
-      }
-    } catch { /* table may not exist */ }
-  }
-  return json({ reset: true, deleted: counts })
+  const db = getPrimaryDB(env) as any
+  await db.wipeAllData()
+  return json({ reset: true })
 })
 
 // ── Parse / Verify ──────────────────────────────────────────────────

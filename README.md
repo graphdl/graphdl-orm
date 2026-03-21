@@ -22,6 +22,8 @@ The readings are the source. Everything else is compilation.
 
 ## Architecture
 
+A Durable Object is a row. Individual resources are individual Durable Objects.
+
 ```
 readings (FORML2 natural language)
     │
@@ -29,8 +31,9 @@ readings (FORML2 natural language)
 FORML2 parser (/parse) ──► claim extraction
     │
     ▼
-Claim ingestion (/claims) ──► 3NF SQLite in Durable Object
-    │
+Claim ingestion (/seed) ──► per-domain DomainDB DOs (metamodel)
+    │                        + EntityDB DOs (instances)
+    │                        + RegistryDB DOs (indexes)
     ▼
 Generators (/generate)
     ├── schema      ──► SQLite DDL
@@ -43,159 +46,150 @@ Generators (/generate)
     │
     ▼
 FOL Engine (Rust/WASM)
-    ├── evaluate    ──► constraint verification (Predicate → [Violation])
-    ├── forward-chain ──► FOL inference (Derivation → [DerivedFact])
-    └── synthesize  ──► noun knowledge synthesis (SynthesisResult)
+    ├── evaluate       ──► constraint verification (Predicate → [Violation])
+    ├── forward-chain  ──► FOL inference (Derivation → [DerivedFact])
+    ├── query          ──► collection predicate evaluation (Population → [Match])
+    └── synthesize     ──► noun knowledge synthesis (SynthesisResult)
     │
     ▼
 Consumers: REST API, ui.do, agents (joey), compliance products
 ```
 
-A single Durable Object (`GraphDLDB`) holds all metamodel + instance data in normalized SQLite tables. The Worker routes HTTP to the DO via itty-router.
+### DO-Per-Entity Model
 
-## Three-Layer Schema
+Three Durable Object types, each with its own SQLite:
 
-### Metamodel (Knowledge Layer)
+| DO Type | Identity | Purpose |
+|---------|----------|---------|
+| **EntityDB** | One per entity instance | Single entity: JSON data + version + CDC events |
+| **DomainDB** | One per domain slug | Metamodel: nouns, readings, constraints, state machines |
+| **RegistryDB** | One per scope (app/org/global) | Indexes: domain registry, noun-to-domain, entity IDs per type |
 
-Describes *what exists* — entity types, fact types, constraints.
+The Worker is stateless — it routes requests, walks the Registry chain for schema resolution, and runs the FOL engine (WASM) for queries and enrichment.
+
+### Write Path
+
+1. Worker resolves noun schema via Registry chain (app → org → global)
+2. Validates input against schema
+3. Forward chains subset constraints with autofill (eager enrichment)
+4. Creates/updates EntityDB DO
+5. Registry indexes the entity
+
+### Read Path (Aggregate Query)
+
+1. Registry provides entity IDs for the noun type
+2. Worker fans out RPC to EntityDB DOs in parallel (map)
+3. FOL engine evaluates predicates over the collected Population (reduce)
+4. FP paradigm ensures parallelism is safe — pure functions over immutable data
+
+## Metamodel
+
+Noun is a subtype of Function. Every entity type, fact type, and constraint is a function. The FOL engine evaluates them. Readings are the interface; FOL is the plumbing.
+
+### Knowledge Layer
 
 | Table | Purpose |
 |-------|---------|
-| `organizations` | Multi-tenancy root |
-| `domains` | Scoped knowledge domains |
 | `nouns` | Entity types and value types, with `world_assumption` (closed/open) |
 | `graph_schemas` | Fact type definitions |
 | `readings` | FORML2 natural language sentences |
-| `roles` | Positions in a fact type, references noun + graph_schema |
-| `constraints` | UC/MC/SS/XC/EQ/OR/XO/RC with modality (Alethic/Deontic) |
+| `roles` | Positions in a fact type |
+| `constraints` | UC/MC/SS/XC/EQ/OR/XO/IR/AS/AT/SY/IT/TR/AC/FC/VC with modality |
 | `constraint_spans` | Maps constraints to roles |
 
-### Behavioral Layer (State)
-
-Describes *how things change* — state machines, transitions, guards.
+### Behavioral Layer
 
 | Table | Purpose |
 |-------|---------|
 | `state_machine_definitions` | Lifecycle definitions, references a noun |
 | `statuses` | Named states |
-| `event_types` | Triggers for transitions |
 | `transitions` | From → to status, triggered by event |
 | `guards` | Constraints on transitions |
 | `verbs` | Actions/operations |
 | `functions` | HTTP callbacks for verbs |
 
-### Instance Layer (Runtime)
+### Scoping
 
-Describes *what happened* — concrete facts, running state machines, events.
+```
+Domain is visible to Domain := that Domain is the same Domain.
+Domain is visible to Domain := Domain has Visibility 'public'.
+Domain is visible to Domain := Domain belongs to App and that Domain belongs to the same App.
+Domain is visible to Domain := Domain belongs to Organization and that Domain belongs to the same Organization.
+```
 
-| Table | Purpose |
-|-------|---------|
-| `graphs` | Fact type instances |
-| `resources` | Entity instances |
-| `resource_roles` | Bindings of resources to graph roles |
-| `state_machines` | Runtime state machines with current status |
-| `events` | State machine events that occurred |
-| `cdc_events` | Change Data Capture for audit/sync |
+Resolution walks the scope chain: local → app → org → global. First match wins.
 
 ## FOL Engine (`crates/fol-engine/`)
 
 A first-order logic reasoning engine compiled to WebAssembly, implementing Backus's FP algebra.
 
-Constraints and derivation rules compile to pure functions at load time. Evaluation is function application — no dispatch, no branching on kind, no mutable state. The algebra's laws (associativity of composition, distributivity of apply-to-all) hold by construction.
+Constraints and derivation rules compile to pure functions at load time. Evaluation is function application — no dispatch, no branching on kind, no mutable state.
 
 ### Capabilities
 
-**Constraint verification** — Apply all compiled predicates, collect violations. Supports ORM2 constraint kinds: UC, MC, RC, XO, XC, OR, SS, EQ, plus deontic modality (forbidden, obligatory, permitted).
+**Constraint verification** — All ORM2 constraint kinds: UC, MC, IR, AS, AT, SY, IT, TR, AC, XO, XC, OR, SS, EQ, FC, VC, plus deontic modality (forbidden, obligatory, permitted).
 
-**Forward inference** — Apply derivation rules (subtype inheritance, modus ponens, transitivity, closed-world negation) iteratively until fixed point. Given base facts, derive all conclusions.
+**Forward inference** — Derivation rules (subtype inheritance, modus ponens, transitivity, closed-world negation) applied iteratively until fixed point.
 
-**Synthesis** — Collect all knowledge about a noun: participating fact types, applicable constraints, state machines, related nouns, derived facts. Returns compact summaries for agent context injection.
+**Collection queries** — `query_population`: evaluate predicates over a Population, return matching entities. The reduce phase of the MapReduce query model.
 
-**Dual world assumptions** — Closed World (absence = false) for government powers and structural facts. Open World (absence = unknown) for individual rights and liberties. Encodes the 9th and 10th Amendments as formal parameters of the reasoning engine.
+**Synthesis** — Collect all knowledge about a noun: participating fact types, constraints, state machines, related nouns.
 
-### Usage
-
-```bash
-# Verify text against constraints
-fol --ir constraints.json --text "response to verify"
-
-# Synthesize knowledge about a noun
-fol --ir constraints.json --synthesize "AI System" --depth 2
-
-# Run forward inference
-fol --ir constraints.json --forward-chain --population facts.json
-```
-
-See [`crates/fol-engine/README.md`](crates/fol-engine/README.md) for the full theoretical foundation and architecture.
+**Dual world assumptions** — Closed World (absence = false) for structural facts. Open World (absence = unknown) for rights and liberties.
 
 ## API
 
-Payload CMS-compatible REST API on all collections:
-
 ```
-GET    /api/:collection          — list/find (where, limit, page, sort, depth)
-GET    /api/:collection/:id      — get by ID
-POST   /api/:collection          — create
-PATCH  /api/:collection/:id      — update
-DELETE /api/:collection/:id      — delete
+# Entity CRUD (via EntityDB DOs)
+POST   /api/entity                — create entity instance
+GET    /api/entities/:noun/:id    — get by ID
+PATCH  /api/entities/:noun/:id    — update
+DELETE /api/entities/:noun/:id    — delete
 
-POST   /api/parse                — parse FORML2 text into structured claims
-POST   /api/generate             — generate artifacts (schema, openapi, xstate, business-rules, ilayer, readings)
-POST   /api/evaluate             — evaluate text against constraint IR via WASM
-POST   /api/synthesize           — synthesize all knowledge about a noun
+# Collection CRUD (metamodel, via DomainDB)
+GET    /api/:collection           — list/find (where, limit, page, sort, depth)
+GET    /api/:collection/:id       — get by ID
+POST   /api/:collection           — create
+PATCH  /api/:collection/:id       — update
+DELETE /api/:collection/:id       — delete
 
-POST   /seed                     — bulk seed claims
-POST   /claims                   — alias for /seed
-GET    /seed                     — stats
-DELETE /seed                     — wipe all data
-GET    /health                   — health check
-```
+# Tooling
+POST   /api/parse                 — parse FORML2 text into structured claims
+POST   /api/generate              — generate artifacts
+POST   /api/evaluate              — evaluate text against constraints (WASM)
+POST   /api/synthesize            — synthesize knowledge about a noun
 
-### Query Language
-
-Supports Payload-style `where` bracket notation with FK traversal:
-
-```
-/api/nouns?where[objectType][equals]=entity&limit=20&sort=-createdAt
-/api/readings?where[domain.domainSlug][equals]=joey&depth=2
-/api/nouns?where[name][like]=%State%
+# Seeding
+POST   /seed                      — bulk seed (parallel per-domain DOs)
+GET    /seed                      — stats (fans out to all domain DOs)
+DELETE /seed                      — wipe all data
+GET    /health                    — health check
 ```
 
-Operators: `equals`, `not_equals`, `in`, `like`, `exists`, logical `and`/`or`, dot-notation for FK subqueries.
+## Seeding
 
-## Claim Ingestion
+The seed endpoint accepts FORML2 claims for multiple domains in one call. Each domain gets its own DomainDB DO, seeded in parallel:
 
-The `/claims` endpoint accepts structured claims extracted from natural language. The ingestion engine:
+```bash
+# Parse domain files and POST to seed
+curl -X POST https://graphdl-orm.dotdo.workers.dev/seed \
+  -H 'Content-Type: application/json' \
+  -d '{ "type": "claims", "domains": [{ "slug": "my-domain", "claims": {...} }] }'
+```
 
-1. Creates nouns (find-or-create by name + domain)
-2. Applies subtypes (sets `super_type_id`)
-3. Creates graph schemas + readings + roles (auto-tokenized)
-4. Applies constraints (UC, MC, SS, etc.)
-5. Seeds state machine definitions + statuses + transitions
-6. Auto-detects world assumption (nouns named Right, Freedom, Liberty, Protection, Privilege → open world)
-
-Derivation rules (`:=` predicates) are stored as readings and resolved dynamically at query time.
-
-## Hooks
-
-Collection write hooks trigger side effects deterministically — creating a reading auto-tokenizes it into roles, creating a constraint auto-spans it to roles, etc.
-
-## Self-Description
-
-On first boot, the Durable Object seeds the `graphdl-core` domain with entity type nouns for every table. The framework can query the metamodel about the metamodel.
+Phase 1 (metamodel) runs in parallel across DOs. Phase 2 (instance facts) runs after all metamodels are ready. Typical: 25 domains in ~11 seconds.
 
 ## Development
 
 ```bash
 yarn install
 yarn dev             # local dev server (wrangler dev)
-yarn test            # run tests (vitest)
+yarn test            # run tests (vitest) — 583 tests
 yarn typecheck       # type check (tsc --noEmit)
 
 # FOL engine
 cd crates/fol-engine
-cargo test           # 27 tests
-cargo build --release --target wasm32-unknown-unknown  # WASM build
+cargo test           # 28 tests
 ```
 
 ## Deployment
@@ -204,14 +198,12 @@ cargo build --release --target wasm32-unknown-unknown  # WASM build
 yarn deploy          # deploys to Cloudflare Workers
 ```
 
-Requires `wrangler` CLI and Cloudflare account access.
-
 ### Service Binding
 
-Other Cloudflare Workers connect via service binding (no auth):
+Other Cloudflare Workers connect via service binding:
 
 ```typescript
-const res = await env.GRAPHDL.fetch(new Request('https://graphdl-orm/api/nouns?limit=10'))
+const res = await env.GRAPHDL.fetch(new Request('https://graphdl-orm/api/entities/Customer/abc123'))
 ```
 
 ## License

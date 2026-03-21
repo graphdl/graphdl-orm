@@ -17,8 +17,8 @@ import { ingestClaims, ingestProject } from '../claims/ingest'
 import type { ExtractedClaims } from '../claims/ingest'
 
 function getDB(env: Env) {
-  const id = env.GRAPHDL_DB.idFromName('graphdl-primary')
-  return env.GRAPHDL_DB.get(id)
+  const id = env.DOMAIN_DB.idFromName('graphdl-primary')
+  return env.DOMAIN_DB.get(id)
 }
 
 async function ensureDomain(db: any, slug: string, name?: string): Promise<Record<string, any>> {

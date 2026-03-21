@@ -12,8 +12,8 @@ export async function handleGenerate(request: Request, env: Env): Promise<Respon
     return error(400, { errors: [{ message: `Invalid outputFormat. Valid: ${VALID_FORMATS.join(', ')}` }] })
   }
 
-  const id = env.GRAPHDL_DB.idFromName('graphdl-primary')
-  const db = env.GRAPHDL_DB.get(id) as any
+  const id = env.DOMAIN_DB.idFromName('graphdl-primary')
+  const db = env.DOMAIN_DB.get(id) as any
 
   // Delegate to DO's generate() RPC method
   const output = await db.generate(domainId, outputFormat)
