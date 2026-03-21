@@ -62,9 +62,38 @@ const TERNARY_UC = new RegExp(
   'i'
 )
 
+// Ring constraints — all operate on binary facts where subject and object are the same type
+// Subscripted noun: PascalCase word optionally followed by a digit (e.g., Person1, Person2)
+const RING_NOUN = '([A-Z][a-zA-Z]*\\d?)'
+
+/** Strip trailing digit subscript from a ring-constraint noun: "Person1" → "Person" */
+function stripSubscript(noun: string): string {
+  return noun.replace(/\d+$/, '')
+}
+
 // "No X [verb] itself."
 const RING_IRREFLEXIVE = new RegExp(
-  `^No ${NOUN} [a-z]+ itself`,
+  `^No ${RING_NOUN} .+? itself`,
+  'i'
+)
+// "If X1 [verb] X2, then X2 is not [verb] X1" / "If X1 [verb] X2, then X2 [verb] not X1"
+const RING_ASYMMETRIC = new RegExp(
+  `^If ${RING_NOUN} .+? ${RING_NOUN},? then ${RING_NOUN} (?:is not|does not|not) .+? ${RING_NOUN}`,
+  'i'
+)
+// "If X1 [verb] X2, then X2 [verb] X1"
+const RING_SYMMETRIC = new RegExp(
+  `^If ${RING_NOUN} .+? ${RING_NOUN},? then ${RING_NOUN} .+? ${RING_NOUN}$`,
+  'i'
+)
+// "If X1 [verb] X2 and X2 [verb] X3, then X1 is not [verb] X3"
+const RING_INTRANSITIVE = new RegExp(
+  `^If ${RING_NOUN} .+? ${RING_NOUN} and ${RING_NOUN} .+? ${RING_NOUN},? then ${RING_NOUN} (?:is not|does not|not) .+? ${RING_NOUN}`,
+  'i'
+)
+// "If X1 [verb] X2 and X2 [verb] X3, then X1 [verb] X3"
+const RING_TRANSITIVE = new RegExp(
+  `^If ${RING_NOUN} .+? ${RING_NOUN} and ${RING_NOUN} .+? ${RING_NOUN},? then ${RING_NOUN} .+? ${RING_NOUN}$`,
   'i'
 )
 
@@ -134,7 +163,36 @@ export function parseConstraintText(text: string): ParsedConstraint[] | null {
   // "No X [verb] itself"
   m = clean.match(RING_IRREFLEXIVE)
   if (m) {
-    return [{ kind: 'IR', modality: 'Alethic', nouns: [m[1]], constrainedNoun: m[1] }]
+    const base = stripSubscript(m[1])
+    return [{ kind: 'IR', modality: 'Alethic', nouns: [base], constrainedNoun: base }]
+  }
+
+  // "If X1 ... X2 and X2 ... X3, then X1 is not ... X3" → Intransitive (must check before transitive)
+  m = clean.match(RING_INTRANSITIVE)
+  if (m) {
+    const base = stripSubscript(m[1])
+    return [{ kind: 'IT', modality: 'Alethic', nouns: [base], constrainedNoun: base }]
+  }
+
+  // "If X1 ... X2 and X2 ... X3, then X1 ... X3" → Transitive
+  m = clean.match(RING_TRANSITIVE)
+  if (m) {
+    const base = stripSubscript(m[1])
+    return [{ kind: 'TR', modality: 'Alethic', nouns: [base], constrainedNoun: base }]
+  }
+
+  // "If X1 ... X2, then X2 is not ... X1" → Asymmetric (must check before symmetric)
+  m = clean.match(RING_ASYMMETRIC)
+  if (m) {
+    const base = stripSubscript(m[1])
+    return [{ kind: 'AS', modality: 'Alethic', nouns: [base], constrainedNoun: base }]
+  }
+
+  // "If X1 ... X2, then X2 ... X1" → Symmetric
+  m = clean.match(RING_SYMMETRIC)
+  if (m) {
+    const base = stripSubscript(m[1])
+    return [{ kind: 'SY', modality: 'Alethic', nouns: [base], constrainedNoun: base }]
   }
 
   // "Each X has some Y" → MC on X's role
