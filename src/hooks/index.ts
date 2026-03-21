@@ -12,7 +12,7 @@ export interface HookResult {
 }
 
 export type AfterCreateHook = (
-  db: any, // DurableObjectStub at runtime, typed as any for compatibility with GraphDLDB
+  db: any, // DurableObjectStub at runtime, typed as any for compatibility with GraphDLDBLike
   doc: Record<string, any>,
   context: HookContext,
 ) => Promise<HookResult>

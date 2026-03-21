@@ -1,10 +1,10 @@
 /**
- * Claims ingestion — ported from Payload to GraphDLDB.
+ * Claims ingestion — ported from Payload to GraphDLDBLike.
  *
  * Two entry points:
  * - ingestClaims()   — bulk structured claims
  */
-import type { GraphDLDB } from '../do'
+import type { GraphDLDBLike } from '../do-adapter'
 import { createScope } from './scope'
 import { ingestNouns, ingestSubtypes, ingestReadings, ingestConstraints, ingestTransitions, ingestFacts } from './steps'
 
@@ -70,7 +70,7 @@ export interface IngestClaimsResult {
  * Ingest bulk structured claims.
  */
 export async function ingestClaims(
-  db: GraphDLDB,
+  db: GraphDLDBLike,
   opts: { claims: ExtractedClaims; domainId: string },
 ): Promise<IngestClaimsResult> {
   const { claims, domainId } = opts
@@ -121,7 +121,7 @@ export interface ProjectResult {
  * so that later phases can rely on earlier phases across all domains.
  */
 export async function ingestProject(
-  db: GraphDLDB,
+  db: GraphDLDBLike,
   domains: Array<{ domainId: string; claims: ExtractedClaims }>,
 ): Promise<ProjectResult> {
   const scope = createScope()
