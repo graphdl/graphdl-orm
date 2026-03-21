@@ -47,20 +47,29 @@ function getPrimaryDB(env: Env): DurableObjectStub {
  * Uses the Registry to find which DomainDB DO has that domain.
  * Falls back to getPrimaryDB if no domain context is found.
  */
-async function resolveDomainDB(env: Env, where?: Record<string, any>, body?: Record<string, any>): Promise<DurableObjectStub> {
+/**
+ * Result of domain resolution — includes the DO stub and whether a specific
+ * domain was resolved (so the caller can strip the domain filter from queries).
+ */
+interface DomainResolution {
+  db: DurableObjectStub
+  resolved: boolean  // true = routed to a per-domain DO (strip domain filter)
+}
+
+async function resolveDomainDB(env: Env, where?: Record<string, any>, body?: Record<string, any>): Promise<DomainResolution> {
   const domainId = where?.domain?.equals || where?.['domain.domainSlug']?.equals || body?.domain
 
   if (domainId && typeof domainId === 'string') {
     // If it looks like a slug (has hyphens, not a UUID pattern), use directly
     if (domainId.includes('-') && !domainId.match(/^[0-9a-f]{8}-[0-9a-f]{4}-/)) {
-      return getDomainDO(env, domainId)
+      return { db: getDomainDO(env, domainId), resolved: true }
     }
 
     // It's a UUID — try Registry first, then primary DO for slug lookup
     const registry = getRegistryDO(env, 'global') as any
     try {
       const slug: string | null = await registry.resolveSlugByUUID(domainId)
-      if (slug) return getDomainDO(env, slug)
+      if (slug) return { db: getDomainDO(env, slug), resolved: true }
     } catch { /* fall through */ }
 
     // Fallback: look up slug from primary DO's domains table
@@ -69,13 +78,22 @@ async function resolveDomainDB(env: Env, where?: Record<string, any>, body?: Rec
       const result = await primary.findInCollection('domains', { id: { equals: domainId } }, { limit: 1 })
       if (result.docs.length) {
         const slug = result.docs[0].domainSlug || result.docs[0].domain_slug
-        if (slug) return getDomainDO(env, slug)
+        if (slug) return { db: getDomainDO(env, slug), resolved: true }
       }
     } catch { /* fall through */ }
   }
 
   // No domain context — fall back to primary
-  return getPrimaryDB(env)
+  return { db: getPrimaryDB(env), resolved: false }
+}
+
+/** Strip domain filter from where clause — not needed when querying a per-domain DO. */
+function stripDomainFilter(where: Record<string, any>): Record<string, any> {
+  const filtered = { ...where }
+  delete filtered.domain
+  delete filtered['domain.domainSlug']
+  delete filtered['domain.organization']
+  return filtered
 }
 
 export const router = AutoRouter()
@@ -554,9 +572,10 @@ router.get('/api/:collection', async (request, env: Env) => {
   const { where, limit, page, sort, depth } = parseQueryOptions(url.searchParams)
 
   // Route to the correct DomainDB based on domain context
-  const db = await resolveDomainDB(env, where) as any
-  const result = await db.findInCollection(collection, where, { limit, page, sort })
-  const docs = await populateDocs(db, result.docs, collection, depth)
+  const { db, resolved } = await resolveDomainDB(env, where)
+  const queryWhere = resolved ? stripDomainFilter(where || {}) : where
+  const result = await (db as any).findInCollection(collection, queryWhere, { limit, page, sort })
+  const docs = await populateDocs(db as any, result.docs, collection, depth)
 
   return json({
     docs,
@@ -581,11 +600,11 @@ router.get('/api/:collection/:id', async (request, env: Env) => {
   const depth = parseInt(url.searchParams.get('depth') || '0', 10)
   const { where } = parseQueryOptions(url.searchParams)
 
-  const db = await resolveDomainDB(env, where) as any
-  const doc = await db.getFromCollection(collection, id)
+  const { db } = await resolveDomainDB(env, where)
+  const doc = await (db as any).getFromCollection(collection, id)
 
   if (!doc) return error(404, { errors: [{ message: 'Not Found' }] })
-  const populated = depth > 0 ? await populateDepth(db, doc, COLLECTION_TABLE_MAP[collection], 0, depth) : doc
+  const populated = depth > 0 ? await populateDepth(db as any, doc, COLLECTION_TABLE_MAP[collection], 0, depth) : doc
   return json(populated)
 })
 
@@ -597,7 +616,7 @@ router.post('/api/:collection', async (request, env: Env) => {
   }
 
   const body = await request.json() as Record<string, any>
-  const db = await resolveDomainDB(env, undefined, body) as any
+  const { db } = await resolveDomainDB(env, undefined, body)
 
   // If a hook exists for this collection, use createWithHook
   if (COLLECTION_HOOKS[collection]) {
@@ -614,7 +633,7 @@ router.post('/api/:collection', async (request, env: Env) => {
   }
 
   // No hook — standard create
-  const doc = await db.createInCollection(collection, body)
+  const doc = await (db as any).createInCollection(collection, body)
   return json({ doc, message: 'Created successfully' }, { status: 201 })
 })
 
@@ -626,8 +645,8 @@ router.patch('/api/:collection/:id', async (request, env: Env) => {
   }
 
   const body = await request.json() as Record<string, any>
-  const db = await resolveDomainDB(env, undefined, body) as any
-  const doc = await db.updateInCollection(collection, id, body)
+  const { db } = await resolveDomainDB(env, undefined, body)
+  const doc = await (db as any).updateInCollection(collection, id, body)
 
   if (!doc) return error(404, { errors: [{ message: 'Not Found' }] })
   return json({ doc, message: 'Updated successfully' })
@@ -640,8 +659,8 @@ router.delete('/api/:collection/:id', async (request, env: Env) => {
     return error(404, { errors: [{ message: `Collection "${collection}" not found` }] })
   }
 
-  const db = await resolveDomainDB(env) as any
-  const result = await db.deleteFromCollection(collection, id)
+  const { db } = await resolveDomainDB(env)
+  const result = await (db as any).deleteFromCollection(collection, id)
 
   if (!result.deleted) return error(404, { errors: [{ message: 'Not Found' }] })
   return json({ id, message: 'Deleted successfully', ...(result.cascaded && { cascaded: result.cascaded }) })
