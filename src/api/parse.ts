@@ -84,7 +84,7 @@ const INSTANCE_FACT_SIMPLE = new RegExp(`^(${N})\\s+(?:has\\s+)?(${N})\\s+'([^']
 const SUBSECTION = /^###\s+(.+)/
 
 // Comment or description line — not a FORML2 claim
-const COMMENT_LINE = /^(?:#\s|[a-z]|$|\[)/
+const COMMENT_LINE = /^(?:#\s|[a-z]|$|\[|Note:\s)/
 
 // Lines that look like documentation comments, not FORML2 readings
 const DESCRIPTION_LINE = /^Cross-domain references:/
