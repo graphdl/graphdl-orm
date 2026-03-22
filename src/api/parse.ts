@@ -265,8 +265,13 @@ export function parseFORML2(
       continue
     }
 
-    // ── Subtype non-totality: "Not every X is a Y" (informational, skip) ──
-    if (/^Not every\b/i.test(line)) {
+    // ── Subtype annotations (totality, exclusion, non-totality) ──────
+    // "Not every X is a Y" — non-totality
+    // "Each X is a Y, a Z, or a W" — totality (partition enumeration)
+    // "No X belongs to more than one of these subtypes" — exclusion
+    if (/^Not every\b/i.test(line) ||
+        /^Each .+ is (?:a |an ).+(?:,|or )/i.test(line) ||
+        /^No .+ belongs to more than one/i.test(line)) {
       parsedLines++
       continue
     }
@@ -421,6 +426,26 @@ export function parseFORML2(
       if (/^No\s/i.test(line) || /^If\s/i.test(line)) {
         constraints.push({
           kind: 'IR',
+          modality: section === 'deontic-constraints' ? 'Deontic' : 'Alethic',
+          reading: '',
+          roles: [],
+          text: line,
+        })
+        parsedLines++
+        continue
+      }
+
+      // Any remaining line in a constraints section should NOT fall through to readings.
+      // Store as a generic constraint with the verbalization text preserved.
+      if (/^Each\s/i.test(line) || /^For each\s/i.test(line)) {
+        // Attempt to infer kind from text pattern
+        const kind = /exactly one/i.test(line) ? 'UC' as const
+          : /at most one/i.test(line) ? 'UC' as const
+          : /at least one/i.test(line) ? 'MC' as const
+          : /some/i.test(line) ? 'MC' as const
+          : 'UC' as const
+        constraints.push({
+          kind,
           modality: section === 'deontic-constraints' ? 'Deontic' : 'Alethic',
           reading: '',
           roles: [],
