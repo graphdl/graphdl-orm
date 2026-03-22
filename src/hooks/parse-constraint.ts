@@ -30,6 +30,10 @@ export interface ParsedConstraint {
 
 // Match noun names — may be multi-word with spaces (e.g., "Support Request", "API Product")
 // Stops before lowercase stopwords (per, that, for, via, etc.) to avoid over-matching
+// Noun name: PascalCase words separated by spaces.
+// Stopwords (per, that, for, etc.) prevent over-matching into predicates.
+// Note: "Of" in "Terms Of Service" is blocked by the 'i' flag on containing regexes.
+// Multi-word nouns with "Of" must be handled by the parser (parse.ts), not here.
 const NOUN = '([A-Z][a-zA-Z0-9]*(?:\\s+(?!per\\b|that\\b|for\\b|of\\b|the\\b|at\\b|in\\b|via\\b|to\\b|from\\b|by\\b|with\\b|on\\b|or\\b|and\\b|some\\b|each\\b|is\\b|has\\b|are\\b|was\\b|no\\b|not\\b|more\\b|most\\b)[A-Z][a-zA-Z0-9]*)*)'
 
 // "Each X has/belongs to at most one Y."
