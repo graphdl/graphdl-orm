@@ -3,6 +3,7 @@ import type { Env } from '../types'
 import { ingestClaims } from '../claims/ingest'
 import type { ExtractedClaims } from '../claims/ingest'
 import { createDomainAdapter } from '../do-adapter'
+import { parseFORML2 } from './parse'
 
 // ── DO helpers ───────────────────────────────────────────────────────
 
@@ -112,24 +113,37 @@ async function handleSeedPost(request: Request, env: Env): Promise<Response> {
     claims?: ExtractedClaims
     domain?: string
     domainId?: string
-    domains?: Array<{ slug: string; name?: string; claims: ExtractedClaims }>
+    domains?: Array<{ slug: string; name?: string; claims?: ExtractedClaims; text?: string }>
+    /** Raw FORML2 text — parsed server-side */
+    text?: string
   }
 
   if (body.type !== 'claims') {
     return error(400, { errors: [{ message: 'Unsupported seed type. Use type: "claims"' }] })
   }
 
-  // Bulk: multiple domains in one call — each gets its own DO
-  if (body.domains?.length) {
-    return handleBulkSeed(env, body.domains)
+  // Text mode: parse server-side, then seed
+  if (body.text && body.domain) {
+    const claims = parseFORML2(body.text, [])
+    return handleSingleSeed(env, { claims, domain: body.domain, domainId: body.domain })
   }
 
-  // Single domain
+  // Bulk: multiple domains — each can have claims or text
+  if (body.domains?.length) {
+    const resolved = body.domains.map(d => {
+      if (d.claims) return d as { slug: string; name?: string; claims: ExtractedClaims }
+      if (d.text) return { slug: d.slug, name: d.name, claims: parseFORML2(d.text, []) }
+      return { slug: d.slug, name: d.name, claims: { nouns: [], readings: [], constraints: [] } as ExtractedClaims }
+    })
+    return handleBulkSeed(env, resolved)
+  }
+
+  // Single domain with pre-parsed claims
   if (body.claims) {
     return handleSingleSeed(env, body)
   }
 
-  return error(400, { errors: [{ message: 'Provide claims + domainId, or domains[]' }] })
+  return error(400, { errors: [{ message: 'Provide claims + domain, text + domain, or domains[]' }] })
 }
 
 // ── Bulk multi-domain seeding ────────────────────────────────────────
