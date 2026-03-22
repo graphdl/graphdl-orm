@@ -265,6 +265,12 @@ export function parseFORML2(
       continue
     }
 
+    // ── Subtype non-totality: "Not every X is a Y" (informational, skip) ──
+    if (/^Not every\b/i.test(line)) {
+      parsedLines++
+      continue
+    }
+
     // ── Partition declaration ────────────────────────────────────────
     m = line.replace(/\.$/, '').match(PARTITION)
     if (m) {
