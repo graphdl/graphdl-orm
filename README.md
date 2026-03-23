@@ -1,9 +1,7 @@
 # graphdl-orm
 
-> "Entia non sunt multiplicanda praeter necessitatem."
+> "Entia non sunt multiplicanda praeter necessitatem." (Entities should not be multiplied beyond necessity.)
 > 
-> (Entities should not be multiplied beyond necessity.)
->
 > -William of Ockham
 
 A self-describing meta-framework for [Object-Role Modeling](https://en.wikipedia.org/wiki/Object-role_modeling) (ORM2/FORML2). Natural language readings are the source code — they generate relational schemas, APIs, state machines, constraint algebras, UI layouts, and agent prompts.
