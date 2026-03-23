@@ -199,10 +199,10 @@ curl -X POST https://graphdl-orm.dotdo.workers.dev/api/generate \
 | Format | Output |
 |--------|--------|
 | `openapi` | REST API specification (JSON Schema + endpoints) |
-| `schema` | JSON Schema for all entity types |
+| `schema` | Domain schema (nouns, fact types, constraints — input for the FOL engine) |
+| `json-schema` | Apply entity-instance DDL tables and return table/field map |
 | `sqlite` | Relational DDL (CREATE TABLE statements) |
 | `xstate` | XState state machine configurations |
-| `business-rules` | Constraint IR (input for the FOL engine) |
 | `ilayer` | UI layout definitions (controls, grids, menus) |
 | `readings` | FORML2 round-trip (reconstructed from metamodel) |
 | `readme` | Self-documenting markdown |

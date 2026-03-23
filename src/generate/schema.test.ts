@@ -1,14 +1,14 @@
-// src/generate/business-rules.test.ts
+// src/generate/schema.test.ts
 import { describe, it, expect, beforeEach } from 'vitest'
-import { generateBusinessRules } from './business-rules'
+import { generateSchema } from './schema'
 import { createMockModel, mkNounDef, mkValueNounDef, mkFactType, mkConstraint, mkStateMachine, resetIds } from '../model/test-utils'
 
-describe('generateBusinessRules', () => {
+describe('generateSchema (domain schema)', () => {
   beforeEach(() => {
     resetIds()
   })
 
-  it('generates IR with nouns, factTypes, constraints, and stateMachines', async () => {
+  it('generates schema with nouns, factTypes, constraints, and stateMachines', async () => {
     const customer = mkNounDef({ name: 'Customer' })
     const name = mkValueNounDef({ name: 'Name', valueType: 'string' })
     const ft = mkFactType({
@@ -31,7 +31,7 @@ describe('generateBusinessRules', () => {
       ],
     })
 
-    const ir = await generateBusinessRules(model)
+    const ir = await generateSchema(model)
 
     // Domain
     expect(ir.domain).toBe('d1')
@@ -89,13 +89,13 @@ describe('generateBusinessRules', () => {
       ],
     })
 
-    const ir = await generateBusinessRules(model)
+    const ir = await generateSchema(model)
 
     expect(ir.constraints[0].deonticOperator).toBe('forbidden')
     expect(ir.constraints[0].modality).toBe('Deontic')
   })
 
-  it('generates state machine IR with transitions', async () => {
+  it('generates state machine schema with transitions', async () => {
     const supportRequest = mkNounDef({ name: 'SupportRequest' })
     const sm = mkStateMachine({
       nounDef: supportRequest,
@@ -115,7 +115,7 @@ describe('generateBusinessRules', () => {
       stateMachines: [sm],
     })
 
-    const ir = await generateBusinessRules(model)
+    const ir = await generateSchema(model)
 
     const irSm = ir.stateMachines[sm.id]
     expect(irSm).toBeDefined()
@@ -167,7 +167,7 @@ describe('generateBusinessRules', () => {
       stateMachines: [sm],
     })
 
-    const ir = await generateBusinessRules(model)
+    const ir = await generateSchema(model)
 
     const irSm = ir.stateMachines[sm.id]
     expect(irSm.transitions[0].guard).toEqual({
@@ -179,7 +179,7 @@ describe('generateBusinessRules', () => {
   it('handles empty domain gracefully', async () => {
     const model = createMockModel({})
 
-    const ir = await generateBusinessRules(model)
+    const ir = await generateSchema(model)
 
     expect(ir.domain).toBe('d1')
     expect(ir.nouns).toEqual({})
@@ -197,7 +197,7 @@ describe('generateBusinessRules', () => {
       nouns: [priority, customer, premiumCustomer],
     })
 
-    const ir = await generateBusinessRules(model)
+    const ir = await generateSchema(model)
 
     expect(ir.nouns['Priority']).toEqual({
       objectType: 'value',

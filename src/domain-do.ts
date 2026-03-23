@@ -938,22 +938,22 @@ export class DomainDB extends DurableObject {
       )
     }
 
-    // Auto-recompile business rules
+    // Auto-recompile domain schema
     try {
-      const rules = await (await import('./generate/business-rules')).generateBusinessRules(model)
+      const rules = await (await import('./generate/schema')).generateSchema(model)
       const rulesJson = JSON.stringify(rules)
       const rulesExisting = this.sql.exec(
-        "SELECT id FROM generators WHERE domain_id = ? AND output_format = 'business-rules'", id,
+        "SELECT id FROM generators WHERE domain_id = ? AND output_format = 'schema'", id,
       ).toArray()
       if (rulesExisting.length) {
         this.sql.exec('UPDATE generators SET output = ?, updated_at = ? WHERE id = ?', rulesJson, now, rulesExisting[0].id)
       } else {
         this.sql.exec(
-          "INSERT INTO generators (id, domain_id, output_format, output, created_at, updated_at, version) VALUES (?, ?, 'business-rules', ?, ?, ?, 1)",
+          "INSERT INTO generators (id, domain_id, output_format, output, created_at, updated_at, version) VALUES (?, ?, 'schema', ?, ?, ?, 1)",
           crypto.randomUUID(), id, rulesJson, now, now,
         )
       }
-    } catch { /* business rules compilation is best-effort */ }
+    } catch { /* domain schema compilation is best-effort */ }
 
     return { tableMap, fieldMap }
   }
@@ -1431,10 +1431,10 @@ export class DomainDB extends DurableObject {
       case 'xstate': return (await import('./generate/xstate')).generateXState(model)
       case 'ilayer': return (await import('./generate/ilayer')).generateILayer(model)
       case 'readings': return (await import('./generate/readings')).generateReadings(model)
-      case 'business-rules': return (await import('./generate/business-rules')).generateBusinessRules(model)
+      case 'schema': return (await import('./generate/schema')).generateSchema(model)
       case 'mdxui': return (await import('./generate/mdxui')).generateMdxui(model)
       case 'readme': return (await import('./generate/readme')).generateReadme(model)
-      case 'schema': return this.applySchema(domainId)
+      case 'json-schema': return this.applySchema(domainId)
       default: throw new Error(`Unknown format: ${format}`)
     }
   }

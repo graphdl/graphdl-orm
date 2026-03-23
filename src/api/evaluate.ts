@@ -42,34 +42,34 @@ export async function handleEvaluate(request: Request, env: Env): Promise<Respon
 
   const db = getDB(env) as any
 
-  // Load constraint IR from generators collection
+  // Load domain schema from generators collection
   const genResult = await db.findInCollection('generators', {
     domain: { equals: body.domainId },
-    outputFormat: { equals: 'business-rules' },
+    outputFormat: { equals: 'schema' },
   }, { limit: 1 })
 
-  const irOutput = genResult?.docs?.[0]?.output
-  if (!irOutput) {
+  const schemaOutput = genResult?.docs?.[0]?.output
+  if (!schemaOutput) {
     return json({
       violations: [],
       constraintCount: 0,
       domainId: body.domainId,
-      warning: 'No constraint IR generated for this domain. Run POST /api/generate with outputFormat: "business-rules" first.',
+      warning: 'No domain schema generated for this domain. Run POST /api/generate with outputFormat: "schema" first.',
     })
   }
 
-  let constraintIR: any
+  let domainSchema: any
   try {
-    constraintIR = typeof irOutput === 'string' ? JSON.parse(irOutput) : irOutput
+    domainSchema = typeof schemaOutput === 'string' ? JSON.parse(schemaOutput) : schemaOutput
   } catch {
-    return error(500, { errors: [{ message: 'Failed to parse constraint IR' }] })
+    return error(500, { errors: [{ message: 'Failed to parse domain schema' }] })
   }
 
   // Try WASM evaluation
   try {
     initWasm()
     if (!wasmInitialized) throw new Error('WASM not initialized')
-    load_ir(JSON.stringify(constraintIR))
+    load_ir(JSON.stringify(domainSchema))
 
     const population = body.population || { facts: {} }
     const responseCtx = {
@@ -90,14 +90,14 @@ export async function handleEvaluate(request: Request, env: Env): Promise<Respon
         constraintText: v.constraintText,
         detail: v.detail,
       })),
-      constraintCount: constraintIR.constraints?.length || 0,
+      constraintCount: domainSchema.constraints?.length || 0,
       domainId: body.domainId,
     })
   } catch (wasmErr: any) {
     // WASM not available — return error details for debugging
     return json({
       violations: [],
-      constraintCount: constraintIR.constraints?.length || 0,
+      constraintCount: domainSchema.constraints?.length || 0,
       domainId: body.domainId,
       wasmError: wasmErr?.message || String(wasmErr),
       wasmInitialized,
@@ -125,32 +125,32 @@ export async function handleSynthesize(request: Request, env: Env): Promise<Resp
 
   const db = getDB(env) as any
 
-  // Load constraint IR
+  // Load domain schema
   const genResult = await db.findInCollection('generators', {
     domain: { equals: body.domainId },
-    outputFormat: { equals: 'business-rules' },
+    outputFormat: { equals: 'schema' },
   }, { limit: 1 })
 
-  const irOutput = genResult?.docs?.[0]?.output
-  if (!irOutput) {
+  const schemaOutput = genResult?.docs?.[0]?.output
+  if (!schemaOutput) {
     return json({
-      error: 'No constraint IR generated for this domain.',
-      suggestion: 'Run POST /api/generate with outputFormat: "business-rules" first.',
+      error: 'No domain schema generated for this domain.',
+      suggestion: 'Run POST /api/generate with outputFormat: "schema" first.',
     })
   }
 
-  let constraintIR: any
+  let domainSchema: any
   try {
-    constraintIR = typeof irOutput === 'string' ? JSON.parse(irOutput) : irOutput
+    domainSchema = typeof schemaOutput === 'string' ? JSON.parse(schemaOutput) : schemaOutput
   } catch {
-    return error(500, { errors: [{ message: 'Failed to parse constraint IR' }] })
+    return error(500, { errors: [{ message: 'Failed to parse domain schema' }] })
   }
 
   // Try WASM synthesis
   try {
     initWasm()
     if (!wasmInitialized) throw new Error('WASM not initialized')
-    load_ir(JSON.stringify(constraintIR))
+    load_ir(JSON.stringify(domainSchema))
 
     const resultJson = wasmSynthesize(body.nounName, body.depth || 2)
     const result = JSON.parse(resultJson)
@@ -158,7 +158,7 @@ export async function handleSynthesize(request: Request, env: Env): Promise<Resp
     return json(result)
   } catch (wasmErr: any) {
     // Fallback: do synthesis in JS if WASM not available
-    return json(synthesizeFallback(constraintIR, body.nounName, body.depth || 2))
+    return json(synthesizeFallback(domainSchema, body.nounName, body.depth || 2))
   }
 }
 
