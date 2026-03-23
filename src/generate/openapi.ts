@@ -69,7 +69,31 @@ export async function generateOpenAPI(model: {
     allConstraints.filter((c) => c.kind === 'UC').map((c) => c.id),
   )
 
-  // Build constraint spans: { roles: Role[] }[]
+  // Step D.1: Mark roles as required based on MC (mandatory) constraints.
+  // Per Halpin Ch 10 / Table 9.2: "Simple mandatory role" maps to NOT NULL / required.
+  const mcConstraintIds = new Set(
+    allConstraints.filter((c) => c.kind === 'MC').map((c) => c.id),
+  )
+  for (const [constraintId, spans] of spanMap) {
+    if (!mcConstraintIds.has(constraintId)) continue
+    for (const span of spans) {
+      const gs = graphSchemas.find((g) => g.id === span.factTypeId)
+      if (!gs) continue
+      const ft = ftMap.get(span.factTypeId)
+      if (!ft) continue
+      // MC spans the role that MUST be played — the OTHER role becomes required
+      // on the subject entity. For "Each Person was born in some Country",
+      // MC spans Person's role → Country column is required on Person's table.
+      // Find the constrained role and mark the opposite role as required.
+      const ftRole = ft.roles.find((fr) => fr.roleIndex === span.roleIndex)
+      if (!ftRole) continue
+      // In a binary, the opposite role's property becomes required
+      const oppositeRole = gs.roles?.docs?.find((r) => r.id !== ftRole.id)
+      if (oppositeRole) oppositeRole.required = true
+    }
+  }
+
+  // Step D.2: Build UC constraint spans: { roles: Role[] }[]
   const constraintSpans: { roles: any[] }[] = []
   for (const [constraintId, spans] of spanMap) {
     if (!ucConstraintIds.has(constraintId)) continue

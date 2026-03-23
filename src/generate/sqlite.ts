@@ -170,6 +170,11 @@ export function generateSQLite(openapi: any): GenerateSQLiteResult {
 
     const properties: Record<string, any> = updateSchema.properties || {}
 
+    // Per Halpin Ch 10 / RMAP: MC constraints → NOT NULL columns.
+    // The required array lives on the NewX schema (set by fact-processors via setTableProperty).
+    const newSchema = schemas[`New${entityName}`]
+    const requiredFields = new Set<string>(newSchema?.required || [])
+
     for (const [propName, propDef] of Object.entries(properties) as [string, any][]) {
       // Check for M:N array reference BEFORE checking for regular refs
       const arrayRefEntity = extractArrayRef(propDef)
@@ -181,11 +186,13 @@ export function generateSQLite(openapi: any): GenerateSQLiteResult {
 
       const refEntity = extractRef(propDef)
 
+      const notNull = requiredFields.has(propName) ? ' NOT NULL' : ''
+
       if (refEntity && entityNameSet.has(refEntity)) {
         // FK column — only if the referenced entity has its own table
         const colName = toColumnName(propName) + '_id'
         const targetTable = toTableName(refEntity)
-        columns.push(`${colName} TEXT REFERENCES ${targetTable}(id)`)
+        columns.push(`${colName} TEXT${notNull} REFERENCES ${targetTable}(id)`)
         fkColumns.push(colName)
         // Track fieldMap diff
         if (propName !== colName) {
@@ -194,7 +201,7 @@ export function generateSQLite(openapi: any): GenerateSQLiteResult {
       } else if (refEntity) {
         // Reference to a value type / non-table entity — store as plain TEXT
         const colName = toColumnName(propName)
-        columns.push(`${colName} TEXT`)
+        columns.push(`${colName} TEXT${notNull}`)
         if (propName !== colName) {
           fieldDiffs[propName] = colName
         }
@@ -202,7 +209,7 @@ export function generateSQLite(openapi: any): GenerateSQLiteResult {
         // Value column
         const colName = toColumnName(propName)
         const colType = sqliteType(propDef.type)
-        columns.push(`${colName} ${colType}`)
+        columns.push(`${colName} ${colType}${notNull}`)
         // Track fieldMap diff only when names differ
         if (propName !== colName) {
           fieldDiffs[propName] = colName
