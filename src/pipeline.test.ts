@@ -653,20 +653,20 @@ describe('6. Constraint evaluation patterns', () => {
       stateMachines: {},
     }
 
-    // The synthesize fallback can verify the constraint IR is well-formed
+    // The synthesize fallback can verify the schema is well-formed
     const result = synthesizeFallback(ir, 'SupportResponse', 1)
     expect(result.applicableConstraints).toHaveLength(1)
     expect(result.applicableConstraints[0].deonticOperator).toBe('forbidden')
     expect(result.applicableConstraints[0].text).toContain('forbidden')
 
-    // Verify the IR structure matches what the WASM evaluator expects
+    // Verify the schema structure matches what the WASM evaluator expects
     expect(ir.constraints[0].spans[0].factTypeId).toBe('ft1')
     const ft = ir.factTypes[ir.constraints[0].spans[0].factTypeId]
     expect(ft).toBeDefined()
     expect(ft.roles).toHaveLength(2)
   })
 
-  it('passes clean response — constraint IR with no matching violations', () => {
+  it('passes clean response — domain schema with no matching violations', () => {
     const ir = {
       domain: 'test',
       nouns: {
@@ -694,7 +694,7 @@ describe('6. Constraint evaluation patterns', () => {
     }
 
     // The constraint is well-formed but no population violations exist
-    // Verify the IR structure is valid for a clean evaluation
+    // Verify the schema structure is valid for a clean evaluation
     expect(ir.constraints).toHaveLength(1)
     expect(ir.nouns['SupportResponse']).toBeDefined()
     expect(ir.factTypes['ft1']).toBeDefined()
@@ -707,8 +707,8 @@ describe('6. Constraint evaluation patterns', () => {
     expect(Object.keys(population.facts)).toHaveLength(0)
   })
 
-  it('uniqueness constraint IR matches Rust integration test structure', () => {
-    // Verify the IR structure for UC violations matches what the Rust evaluator expects
+  it('uniqueness domain schema matches Rust integration test structure', () => {
+    // Verify the schema structure for UC violations matches what the Rust evaluator expects
     const ir = {
       domain: 'test',
       nouns: {
@@ -953,7 +953,7 @@ Each AI System has at most one Risk Level.
     expect(riskLevelNoun.enumValues).toContain('Unacceptable')
   })
 
-  it('parsed readings flow through to synthesizable constraint IR', () => {
+  it('parsed readings flow through to synthesizable domain schema', () => {
     const text = `# Legal Domain
 
 ## Entity Types
@@ -975,7 +975,7 @@ It is obligatory that each Person files Complaint in some Court.
     expect(parsed.readings.length).toBeGreaterThanOrEqual(1)
     expect(parsed.constraints.length).toBeGreaterThanOrEqual(1)
 
-    // Build a constraint IR from the parse result
+    // Build a domain schema from the parse result
     const ir: any = {
       domain: 'legal',
       nouns: {} as Record<string, any>,

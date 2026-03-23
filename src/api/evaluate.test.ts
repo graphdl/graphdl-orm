@@ -66,13 +66,13 @@ describe('evaluate endpoint', () => {
     expect(body.errors[0].message).toContain('response.text')
   })
 
-  it('returns warning when no constraint IR exists', async () => {
+  it('returns warning when no domain schema exists', async () => {
     const req = makeRequest('POST', { domainId: 'd1', response: { text: 'hello' } })
     const res = await handleEvaluate(req, makeMockEnv([]))
     expect(res.status).toBe(200)
     const body = await res.json() as any
     expect(body.violations).toEqual([])
-    expect(body.warning).toContain('No constraint IR')
+    expect(body.warning).toContain('No domain schema')
     expect(body.domainId).toBe('d1')
   })
 

@@ -1,9 +1,9 @@
-// src/generate/business-rules.ts
+// src/generate/schema.ts
 import type { NounDef, FactTypeDef, ConstraintDef, StateMachineDef } from '../model/types'
 
 // ── Types ──────────────────────────────────────────────────────────────
 
-export interface BusinessRules {
+export interface DomainSchema {
   domain: string
   nouns: Record<string, {
     objectType: 'entity' | 'value'
@@ -51,13 +51,13 @@ export interface BusinessRules {
 
 // ── Generator ──────────────────────────────────────────────────────────
 
-export async function generateBusinessRules(model: {
+export async function generateSchema(model: {
   domainId: string
   nouns(): Promise<Map<string, NounDef>>
   factTypes(): Promise<Map<string, FactTypeDef>>
   constraints(): Promise<ConstraintDef[]>
   stateMachines(): Promise<Map<string, StateMachineDef>>
-}): Promise<BusinessRules> {
+}): Promise<DomainSchema> {
   const [nouns, factTypes, constraints, stateMachines] = await Promise.all([
     model.nouns(),
     model.factTypes(),
@@ -66,9 +66,9 @@ export async function generateBusinessRules(model: {
   ])
 
   // ── Nouns ──
-  const irNouns: BusinessRules['nouns'] = {}
+  const schemaNouns: DomainSchema['nouns'] = {}
   for (const [name, noun] of nouns) {
-    const entry: BusinessRules['nouns'][string] = { objectType: noun.objectType }
+    const entry: DomainSchema['nouns'][string] = { objectType: noun.objectType }
     if (noun.enumValues && noun.enumValues.length > 0) entry.enumValues = noun.enumValues
     if (noun.valueType) entry.valueType = noun.valueType
     if (noun.superType) {
@@ -77,13 +77,13 @@ export async function generateBusinessRules(model: {
         : noun.superType.name
     }
     if (noun.worldAssumption) entry.worldAssumption = noun.worldAssumption
-    irNouns[name] = entry
+    schemaNouns[name] = entry
   }
 
   // ── FactTypes ──
-  const irFactTypes: BusinessRules['factTypes'] = {}
+  const schemaFactTypes: DomainSchema['factTypes'] = {}
   for (const [id, ft] of factTypes) {
-    irFactTypes[id] = {
+    schemaFactTypes[id] = {
       reading: ft.reading,
       roles: ft.roles.map((r) => ({
         nounName: r.nounName,
@@ -93,9 +93,9 @@ export async function generateBusinessRules(model: {
   }
 
   // ── Constraints ──
-  const irConstraints: BusinessRules['constraints'] = []
+  const schemaConstraints: DomainSchema['constraints'] = []
   for (const c of constraints) {
-    const entry: BusinessRules['constraints'][number] = {
+    const entry: DomainSchema['constraints'][number] = {
       id: c.id,
       kind: c.kind,
       modality: c.modality || 'Alethic',
@@ -110,17 +110,17 @@ export async function generateBusinessRules(model: {
     if (c.setComparisonArgumentLength) entry.setComparisonArgumentLength = c.setComparisonArgumentLength
     if (c.entity) entry.entity = c.entity
     if (c.clauses) entry.clauses = c.clauses
-    irConstraints.push(entry)
+    schemaConstraints.push(entry)
   }
 
   // ── State Machines ──
-  const irStateMachines: BusinessRules['stateMachines'] = {}
+  const schemaStateMachines: DomainSchema['stateMachines'] = {}
   for (const [id, sm] of stateMachines) {
-    irStateMachines[id] = {
+    schemaStateMachines[id] = {
       nounName: sm.nounName,
       statuses: sm.statuses.map((s) => s.name),
       transitions: sm.transitions.map((t) => {
-        const transition: BusinessRules['stateMachines'][string]['transitions'][number] = {
+        const transition: DomainSchema['stateMachines'][string]['transitions'][number] = {
           from: t.from,
           to: t.to,
           event: t.event,
@@ -137,7 +137,7 @@ export async function generateBusinessRules(model: {
   }
 
   // ── Derivation Rules ──
-  const derivationRules: BusinessRules['derivationRules'] = []
+  const derivationRules: DomainSchema['derivationRules'] = []
 
   // Subtype inheritance rules
   for (const [name, noun] of nouns) {
@@ -156,7 +156,7 @@ export async function generateBusinessRules(model: {
   }
 
   // Modus ponens from subset constraints (SS)
-  for (const c of irConstraints) {
+  for (const c of schemaConstraints) {
     if (c.kind === 'SS' && c.spans.length >= 2) {
       derivationRules.push({
         id: `derive-mp-${c.id}`,
@@ -172,7 +172,7 @@ export async function generateBusinessRules(model: {
   for (const [name, noun] of nouns) {
     const assumption = noun.worldAssumption || 'closed'
     if (assumption === 'closed') {
-      const factTypeIds = Object.entries(irFactTypes)
+      const factTypeIds = Object.entries(schemaFactTypes)
         .filter(([_, ft]) => ft.roles.some((r) => r.nounName === name))
         .map(([id]) => id)
       if (factTypeIds.length > 0) {
@@ -189,10 +189,10 @@ export async function generateBusinessRules(model: {
 
   return {
     domain: model.domainId,
-    nouns: irNouns,
-    factTypes: irFactTypes,
-    constraints: irConstraints,
-    stateMachines: irStateMachines,
+    nouns: schemaNouns,
+    factTypes: schemaFactTypes,
+    constraints: schemaConstraints,
+    stateMachines: schemaStateMachines,
     derivationRules,
   }
 }

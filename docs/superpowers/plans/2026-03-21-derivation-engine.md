@@ -20,7 +20,7 @@
 | `src/derivation/forward-chain.test.ts` | Create | Tests for forward chaining |
 | `src/derivation/conceptual-query.ts` | Create | Resolve natural-language queries via reading paths to structured filters |
 | `src/derivation/conceptual-query.test.ts` | Create | Tests for conceptual queries |
-| `src/generate/business-rules.ts` | Modify | Wire parsed `:=` rules into `derivationRules` array |
+| `src/generate/schema.ts` | Modify | Wire parsed `:=` rules into `derivationRules` array |
 | `src/api/parse.ts` | Modify | Store structured rule IR alongside text when parsing `:=` lines |
 
 ---

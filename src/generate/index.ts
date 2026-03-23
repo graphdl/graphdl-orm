@@ -3,7 +3,7 @@ export { generateSQLite } from './sqlite'
 export { generateXState } from './xstate'
 export { generateILayer } from './ilayer'
 export { generateReadings } from './readings'
-export { generateBusinessRules } from './business-rules'
+export { generateSchema } from './schema'
 export { generateMdxui } from './mdxui'
 export { generateReadme } from './readme'
 
