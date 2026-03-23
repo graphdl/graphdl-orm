@@ -29,41 +29,33 @@ export interface ParsedConstraint {
 }
 
 // Match noun names — may be multi-word with spaces (e.g., "Support Request", "API Product")
-// Stops before lowercase stopwords (per, that, for, via, etc.) to avoid over-matching
-// Noun name: PascalCase words separated by spaces.
-// Stopwords (per, that, for, etc.) prevent over-matching into predicates.
-// Note: "Of" in "Terms Of Service" is blocked by the 'i' flag on containing regexes.
-// Multi-word nouns with "Of" must be handled by the parser (parse.ts), not here.
-const NOUN = '([A-Z][a-zA-Z0-9]*(?:\\s+(?!per\\b|that\\b|for\\b|of\\b|the\\b|at\\b|in\\b|via\\b|to\\b|from\\b|by\\b|with\\b|on\\b|or\\b|and\\b|some\\b|each\\b|is\\b|has\\b|are\\b|was\\b|no\\b|not\\b|more\\b|most\\b)[A-Z][a-zA-Z0-9]*)*)'
+// PascalCase words separated by spaces. The [A-Z] anchor enforces uppercase (no 'i' flag
+// on containing regexes) so verbs and other lowercase words can't be swallowed into the noun.
+const NOUN = '([A-Z][a-zA-Z0-9]*(?:\\s+[A-Z][a-zA-Z0-9]*)*)'
 
-// "Each X has/belongs to at most one Y."
+// "Each X [verb] at most one Y." — any predicate between noun and quantifier
 const AT_MOST_ONE = new RegExp(
-  `^Each ${NOUN} (?:has|belongs to|is [a-z]+ (?:by|to|in|for|of|via)) at most one ${NOUN}`,
-  'i'
+  `^Each ${NOUN} .+? at most one ${NOUN}`
 )
 
-// "Each X has exactly one Y."
+// "Each X [verb] exactly one Y." — any predicate between noun and quantifier
 const EXACTLY_ONE = new RegExp(
-  `^Each ${NOUN} (?:has|belongs to|is [a-z]+ (?:by|to|in|for|of|via)) exactly one ${NOUN}`,
-  'i'
+  `^Each ${NOUN} .+? exactly one ${NOUN}`
 )
 
-// "Each X has at least one Y." / "Each X has some Y."
+// "Each X [verb] at least one Y." — any predicate between noun and quantifier
 const AT_LEAST_ONE = new RegExp(
-  `^Each ${NOUN} (?:has|belongs to|is [a-z]+ (?:by|to|in|for|of|via)) at least one ${NOUN}`,
-  'i'
+  `^Each ${NOUN} .+? at least one ${NOUN}`
 )
 
 // "For each pair of X and Y, that X ... that Y at most once."
 const SPANNING_UC = new RegExp(
-  `^For each pair of ${NOUN} and ${NOUN},.*at most once`,
-  'i'
+  `^For each pair of ${NOUN} and ${NOUN},.*at most once`
 )
 
 // "For each combination of X and Y, that X has at most one Z per that Y."
 const TERNARY_UC = new RegExp(
-  `^For each combination of ${NOUN} and ${NOUN},.*at most one ${NOUN}`,
-  'i'
+  `^For each combination of ${NOUN} and ${NOUN},.*at most one ${NOUN}`
 )
 
 // Ring constraints — all operate on binary facts where subject and object are the same type
@@ -77,46 +69,38 @@ function stripSubscript(noun: string): string {
 
 // "No X [verb] itself."
 const RING_IRREFLEXIVE = new RegExp(
-  `^No ${RING_NOUN} .+? itself`,
-  'i'
+  `^No ${RING_NOUN} .+? itself`
 )
 // "If X1 [verb] X2, then X2 is not [verb] X1" / "If X1 [verb] X2, then X2 [verb] not X1"
 const RING_ASYMMETRIC = new RegExp(
-  `^If ${RING_NOUN} .+? ${RING_NOUN},? then ${RING_NOUN} (?:is not|does not|not) .+? ${RING_NOUN}`,
-  'i'
+  `^If ${RING_NOUN} .+? ${RING_NOUN},? then ${RING_NOUN} (?:is not|does not|not) .+? ${RING_NOUN}`
 )
 // "If X1 [verb] X2, then X2 [verb] X1"
 const RING_SYMMETRIC = new RegExp(
-  `^If ${RING_NOUN} .+? ${RING_NOUN},? then ${RING_NOUN} .+? ${RING_NOUN}$`,
-  'i'
+  `^If ${RING_NOUN} .+? ${RING_NOUN},? then ${RING_NOUN} .+? ${RING_NOUN}$`
 )
 // "If X1 [verb] X2 and X2 [verb] X3, then X1 is not [verb] X3"
 const RING_INTRANSITIVE = new RegExp(
-  `^If ${RING_NOUN} .+? ${RING_NOUN} and ${RING_NOUN} .+? ${RING_NOUN},? then ${RING_NOUN} (?:is not|does not|not) .+? ${RING_NOUN}`,
-  'i'
+  `^If ${RING_NOUN} .+? ${RING_NOUN} and ${RING_NOUN} .+? ${RING_NOUN},? then ${RING_NOUN} (?:is not|does not|not) .+? ${RING_NOUN}`
 )
 // "If X1 [verb] X2 and X2 [verb] X3, then X1 [verb] X3"
 const RING_TRANSITIVE = new RegExp(
-  `^If ${RING_NOUN} .+? ${RING_NOUN} and ${RING_NOUN} .+? ${RING_NOUN},? then ${RING_NOUN} .+? ${RING_NOUN}$`,
-  'i'
+  `^If ${RING_NOUN} .+? ${RING_NOUN} and ${RING_NOUN} .+? ${RING_NOUN},? then ${RING_NOUN} .+? ${RING_NOUN}$`
 )
 // "If X1 [verb] X2 and X2 [verb] X1, then X1 is the same as X2"
 const RING_ANTISYMMETRIC = new RegExp(
-  `^If ${RING_NOUN} .+? ${RING_NOUN} and ${RING_NOUN} .+? ${RING_NOUN},? then ${RING_NOUN} is the same (?:as )?${RING_NOUN}`,
-  'i'
+  `^If ${RING_NOUN} .+? ${RING_NOUN} and ${RING_NOUN} .+? ${RING_NOUN},? then ${RING_NOUN} is the same (?:as )?${RING_NOUN}`
 )
 // "No chain of [verb] links returns to its starting point" / "It is impossible that a cycle of [verb] exists"
 const RING_ACYCLIC = /^(?:No chain of .+ (?:returns|leads back)|It is impossible that .*cycl)/i
 // "Each X [verb] itself"
 const RING_REFLEXIVE = new RegExp(
-  `^Each ${RING_NOUN} .+? itself`,
-  'i'
+  `^Each ${RING_NOUN} .+? itself`
 )
 
-// "Each X has some Y." → MC (mandatory)
+// "Each X [verb] some Y." → MC (mandatory) — any predicate before "some"
 const HAS_SOME = new RegExp(
-  `^Each ${NOUN} (?:has|belongs to|authenticates via|provides|supports) some ${NOUN}`,
-  'i'
+  `^Each ${NOUN} .+? some ${NOUN}`
 )
 
 // Deontic wrappers
@@ -134,7 +118,9 @@ export function parseConstraintText(text: string): ParsedConstraint[] | null {
   const deonticMatch = clean.match(DEONTIC)
   if (deonticMatch) {
     const operator = deonticMatch[1].toLowerCase() as 'obligatory' | 'forbidden' | 'permitted'
-    const inner = parseConstraintText(deonticMatch[2])
+    // Capitalize the inner text so PascalCase-sensitive patterns match
+    const innerText = deonticMatch[2].charAt(0).toUpperCase() + deonticMatch[2].slice(1)
+    const inner = parseConstraintText(innerText)
     if (!inner) return null
     return inner.map(c => ({ ...c, modality: 'Deontic' as const, deonticOperator: operator }))
   }
