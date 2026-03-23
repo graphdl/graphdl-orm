@@ -71,6 +71,7 @@ function findReading(
   // Forward: from is the first noun in the reading
   const forward = readings.find(
     (r) =>
+      r.nouns.length >= 2 &&
       r.nouns[0].toLowerCase() === from.toLowerCase() &&
       r.nouns.some((n) => n.toLowerCase() === to.toLowerCase()),
   )
@@ -79,6 +80,7 @@ function findReading(
   // Inverse: from appears in the reading but is not the first noun
   const inverse = readings.find(
     (r) =>
+      r.nouns.length >= 2 &&
       r.nouns.some((n) => n.toLowerCase() === from.toLowerCase()) &&
       r.nouns.some((n) => n.toLowerCase() === to.toLowerCase()) &&
       r.nouns[0].toLowerCase() !== from.toLowerCase(),
