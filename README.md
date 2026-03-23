@@ -50,9 +50,9 @@ Support Request has Priority.
 Support Request has Description.
   Each Support Request has at most one Description.
 
-## Constraints
+## Deontic Constraints
 
-It is obligatory that each Support Request has Priority.
+It is forbidden that Support Request has Priority 'Urgent' and Support Request has no assigned Agent.
 
 ## Derivation Rules
 
@@ -79,8 +79,9 @@ Resolved -> Open (reopen).
 | **Enum** | `The possible values of X are 'A', 'B'.` | `The possible values of Priority are 'Low', 'High'.` |
 | **Subtypes** | `X is a subtype of Y.` | `VIP Customer is a subtype of Customer.` |
 | **Fact type** | `Noun verb Noun.` | `Customer submits Support Request.` |
-| **Uniqueness** | `Each X has exactly one Y.` | `Each Support Request has exactly one Priority.` |
-| **Mandatory** | `It is obligatory that each X has Y.` | `It is obligatory that each Support Request has Priority.` |
+| **Uniqueness** | `Each X has at most one Y.` | `Each Support Request has at most one Priority.` |
+| **Mandatory** | `Each X has some Y.` | `Each Support Request has some Priority.` |
+| **Deontic** | `It is forbidden/obligatory that ...` | `It is forbidden that Support Request has Priority 'Urgent' and Support Request has no assigned Agent.` |
 | **Derivation** | `X has Y := condition.` | `Support Request is escalated := Support Request has Priority 'Urgent'.` |
 
 The framework supports the full ORM2 constraint taxonomy — uniqueness, mandatory, frequency, subset, equality, exclusion, inclusive/exclusive or, ring constraints (irreflexive, asymmetric, antisymmetric, symmetric, intransitive, transitive, acyclic), value comparison, and deontic modality (forbidden, obligatory, permitted).
