@@ -131,6 +131,7 @@ fn participates_in(entity: &str, noun_name: &str, fact_type_id: &str, population
 #[derive(Clone)]
 struct ResolvedSpan {
     fact_type_id: String,
+    role_index: usize,
     noun_name: String,
     reading: String,
 }
@@ -141,6 +142,7 @@ fn resolve_spans(ir: &ConstraintIR, spans: &[SpanDef]) -> Vec<ResolvedSpan> {
         let role = ft.roles.get(span.role_index)?;
         Some(ResolvedSpan {
             fact_type_id: span.fact_type_id.clone(),
+            role_index: span.role_index,
             noun_name: role.noun_name.clone(),
             reading: ft.reading.clone(),
         })
@@ -684,29 +686,71 @@ fn compile_uniqueness(_ir: &ConstraintIR, def: &ConstraintDef) -> Predicate {
     let text = def.text.clone();
     let spans = resolve_spans(_ir, &def.spans);
 
+    // Group spans by fact_type_id to handle compound (multi-role) UC correctly.
+    // Per Halpin Ch 4: a UC spanning multiple roles means the TUPLE of values
+    // at those roles must be unique, not each role independently.
+    let mut groups: HashMap<String, Vec<ResolvedSpan>> = HashMap::new();
+    for span in &spans {
+        groups.entry(span.fact_type_id.clone()).or_default().push(span.clone());
+    }
+    let span_groups: Vec<(String, Vec<ResolvedSpan>)> = groups.into_iter().collect();
+
     Arc::new(move |ctx: &EvalContext| {
-        spans.iter().flat_map(|span| {
-            let facts = ctx.population.facts.get(&span.fact_type_id)
+        span_groups.iter().flat_map(|(ft_id, group_spans)| {
+            let facts = ctx.population.facts.get(ft_id)
                 .map(|f| f.as_slice()).unwrap_or(&[]);
 
-            let mut seen: HashMap<String, usize> = HashMap::new();
-            for fact in facts {
-                if let Some((_, val)) = fact.bindings.iter().find(|(name, _)| *name == span.noun_name) {
-                    *seen.entry(val.clone()).or_insert(0) += 1;
+            if group_spans.len() == 1 {
+                // Simple UC: single role — check that role's values are unique
+                let span = &group_spans[0];
+                let mut seen: HashMap<String, usize> = HashMap::new();
+                for fact in facts {
+                    if let Some((_, val)) = fact.bindings.get(span.role_index) {
+                        *seen.entry(val.clone()).or_insert(0) += 1;
+                    }
                 }
-            }
+                seen.into_iter()
+                    .filter(|(_, count)| *count > 1)
+                    .map(|(val, count)| Violation {
+                        constraint_id: id.clone(),
+                        constraint_text: text.clone(),
+                        detail: format!(
+                            "Uniqueness violation: {} '{}' appears {} times in {}",
+                            span.noun_name, val, count, span.reading
+                        ),
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                // Compound UC: multiple roles — check that the TUPLE of values is unique.
+                // Per Halpin p.119 Figure 4.17(d): "No duplicate (a,b) rows are allowed"
+                let role_indices: Vec<usize> = group_spans.iter().map(|s| s.role_index).collect();
+                let role_names: Vec<&str> = group_spans.iter().map(|s| s.noun_name.as_str()).collect();
+                let reading = &group_spans[0].reading;
 
-            seen.into_iter()
-                .filter(|(_, count)| *count > 1)
-                .map(|(val, count)| Violation {
-                    constraint_id: id.clone(),
-                    constraint_text: text.clone(),
-                    detail: format!(
-                        "Uniqueness violation: {} '{}' appears {} times in {}",
-                        span.noun_name, val, count, span.reading
-                    ),
-                })
-                .collect::<Vec<_>>()
+                let mut seen: HashMap<String, usize> = HashMap::new();
+                for fact in facts {
+                    let tuple_key: String = role_indices.iter()
+                        .map(|&idx| fact.bindings.get(idx).map(|(_, v)| v.as_str()).unwrap_or(""))
+                        .collect::<Vec<_>>()
+                        .join("|");
+                    *seen.entry(tuple_key).or_insert(0) += 1;
+                }
+
+                seen.into_iter()
+                    .filter(|(_, count)| *count > 1)
+                    .map(|(tuple, count)| {
+                        let label = role_names.join(", ");
+                        Violation {
+                            constraint_id: id.clone(),
+                            constraint_text: text.clone(),
+                            detail: format!(
+                                "Uniqueness violation: ({}) combination '{}' appears {} times in {}",
+                                label, tuple.replace('|', ", "), count, reading
+                            ),
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            }
         }).collect()
     })
 }
