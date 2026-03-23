@@ -243,6 +243,13 @@ export function processUnarySchemas(
       )?.value
     }
 
+    // CWA unary = boolean (absence means false, e.g. "Person smokes")
+    // OWA unary = nullable boolean (absence means unknown, e.g. "Person has right to X")
+    const isOWA = (subject as any).worldAssumption === 'open'
+    const property: Schema = isOWA
+      ? { type: ['boolean', 'null'] as any, description: 'Open world: null = unknown' }
+      : { type: 'boolean' }
+
     setTableProperty({
       tables: schemas,
       subject,
@@ -251,7 +258,7 @@ export function processUnarySchemas(
       propertyName: extractPropertyName(objectReading),
       description: predicate.join(' '),
       required: unaryRole.required || false,
-      property: { type: 'boolean' },
+      property,
       example,
       jsonExamples,
     })
