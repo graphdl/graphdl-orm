@@ -650,7 +650,15 @@ fn compile_constraint(ir: &ConstraintIR, def: &ConstraintDef) -> CompiledConstra
         Modality::Alethic => match def.kind.as_str() {
             "UC" => compile_uniqueness(ir, def),
             "MC" => compile_mandatory(ir, def),
-            "RC" => compile_ring(ir, def),
+            // Ring constraints — each property has its own evaluator
+            "IR" => compile_ring_irreflexive(def),
+            "AS" => compile_ring_asymmetric(def),
+            "SY" => compile_ring_symmetric(def),
+            "AT" | "ANS" => compile_ring_antisymmetric(def),
+            "IT" => compile_ring_intransitive(def),
+            "TR" => compile_ring_transitive(def),
+            "AC" => compile_ring_acyclic(def),
+            "RF" => compile_ring_reflexive(ir, def),
             "XO" => compile_set_comparison(ir, def, |n| n != 1, "exactly one"),
             "XC" => compile_set_comparison(ir, def, |n| n > 1, "at most one"),
             "OR" => compile_set_comparison(ir, def, |n| n < 1, "at least one"),
@@ -735,33 +743,262 @@ fn compile_mandatory(_ir: &ConstraintIR, def: &ConstraintDef) -> Predicate {
     })
 }
 
-fn compile_ring(_ir: &ConstraintIR, def: &ConstraintDef) -> Predicate {
+/// Helper: collect all binary facts (pairs) from the constrained fact types.
+fn ring_facts(ctx: &EvalContext, fact_type_ids: &[String]) -> Vec<(String, String)> {
+    fact_type_ids.iter().flat_map(|ft_id| {
+        ctx.population.facts.get(ft_id)
+            .map(|f| f.as_slice()).unwrap_or(&[])
+            .iter()
+            .filter(|f| f.bindings.len() >= 2)
+            .map(|f| (f.bindings[0].1.clone(), f.bindings[1].1.clone()))
+    }).collect()
+}
+
+/// Helper: build a set of (x, y) pairs for fast lookup.
+fn ring_pair_set(pairs: &[(String, String)]) -> HashSet<(String, String)> {
+    pairs.iter().cloned().collect()
+}
+
+/// IR: No x such that xRx (irreflexive)
+fn compile_ring_irreflexive(def: &ConstraintDef) -> Predicate {
     let id = def.id.clone();
     let text = def.text.clone();
-    let fact_type_ids: Vec<String> = def.spans.iter()
-        .map(|s| s.fact_type_id.clone())
-        .collect();
+    let ft_ids: Vec<String> = def.spans.iter().map(|s| s.fact_type_id.clone()).collect();
 
     Arc::new(move |ctx: &EvalContext| {
-        fact_type_ids.iter().flat_map(|ft_id| {
-            let facts = ctx.population.facts.get(ft_id)
-                .map(|f| f.as_slice()).unwrap_or(&[]);
+        ring_facts(ctx, &ft_ids).iter()
+            .filter(|(x, y)| x == y)
+            .map(|(x, _)| Violation {
+                constraint_id: id.clone(),
+                constraint_text: text.clone(),
+                detail: format!("Irreflexive violation: '{}' references itself", x),
+            })
+            .collect()
+    })
+}
 
-            facts.iter().filter_map(|fact| {
-                if fact.bindings.len() >= 2 && fact.bindings[0].1 == fact.bindings[1].1 {
-                    Some(Violation {
+/// AS: xRy → ¬yRx (asymmetric)
+fn compile_ring_asymmetric(def: &ConstraintDef) -> Predicate {
+    let id = def.id.clone();
+    let text = def.text.clone();
+    let ft_ids: Vec<String> = def.spans.iter().map(|s| s.fact_type_id.clone()).collect();
+
+    Arc::new(move |ctx: &EvalContext| {
+        let pairs = ring_facts(ctx, &ft_ids);
+        let set = ring_pair_set(&pairs);
+        pairs.iter()
+            .filter(|(x, y)| x != y && set.contains(&(y.clone(), x.clone())))
+            .map(|(x, y)| Violation {
+                constraint_id: id.clone(),
+                constraint_text: text.clone(),
+                detail: format!("Asymmetric violation: '{}' relates to '{}' and vice versa", x, y),
+            })
+            .collect()
+    })
+}
+
+/// SY: xRy → yRx (symmetric) — violation when reverse is missing
+fn compile_ring_symmetric(def: &ConstraintDef) -> Predicate {
+    let id = def.id.clone();
+    let text = def.text.clone();
+    let ft_ids: Vec<String> = def.spans.iter().map(|s| s.fact_type_id.clone()).collect();
+
+    Arc::new(move |ctx: &EvalContext| {
+        let pairs = ring_facts(ctx, &ft_ids);
+        let set = ring_pair_set(&pairs);
+        pairs.iter()
+            .filter(|(x, y)| x != y && !set.contains(&(y.clone(), x.clone())))
+            .map(|(x, y)| Violation {
+                constraint_id: id.clone(),
+                constraint_text: text.clone(),
+                detail: format!("Symmetric violation: '{}' relates to '{}' but not the reverse", x, y),
+            })
+            .collect()
+    })
+}
+
+/// AT/ANS: xRy ∧ yRx → x = y (antisymmetric)
+fn compile_ring_antisymmetric(def: &ConstraintDef) -> Predicate {
+    let id = def.id.clone();
+    let text = def.text.clone();
+    let ft_ids: Vec<String> = def.spans.iter().map(|s| s.fact_type_id.clone()).collect();
+
+    Arc::new(move |ctx: &EvalContext| {
+        let pairs = ring_facts(ctx, &ft_ids);
+        let set = ring_pair_set(&pairs);
+        pairs.iter()
+            .filter(|(x, y)| x != y && set.contains(&(y.clone(), x.clone())))
+            .map(|(x, y)| Violation {
+                constraint_id: id.clone(),
+                constraint_text: text.clone(),
+                detail: format!("Antisymmetric violation: '{}' and '{}' relate to each other but are not the same", x, y),
+            })
+            .collect()
+    })
+}
+
+/// IT: xRy ∧ yRz → ¬xRz (intransitive)
+fn compile_ring_intransitive(def: &ConstraintDef) -> Predicate {
+    let id = def.id.clone();
+    let text = def.text.clone();
+    let ft_ids: Vec<String> = def.spans.iter().map(|s| s.fact_type_id.clone()).collect();
+
+    Arc::new(move |ctx: &EvalContext| {
+        let pairs = ring_facts(ctx, &ft_ids);
+        let set = ring_pair_set(&pairs);
+        // For each xRy, look for yRz, check if xRz exists (violation)
+        let mut violations = Vec::new();
+        for (x, y) in &pairs {
+            for (y2, z) in &pairs {
+                if y == y2 && x != z && set.contains(&(x.clone(), z.clone())) {
+                    violations.push(Violation {
                         constraint_id: id.clone(),
                         constraint_text: text.clone(),
                         detail: format!(
-                            "Ring constraint violation: '{}' references itself",
-                            fact.bindings[0].1
+                            "Intransitive violation: '{}'→'{}'→'{}' but '{}'→'{}' also exists",
+                            x, y, z, x, z
                         ),
-                    })
-                } else {
-                    None
+                    });
                 }
-            }).collect::<Vec<_>>()
-        }).collect()
+            }
+        }
+        violations
+    })
+}
+
+/// TR: xRy ∧ yRz → xRz (transitive) — violation when chain completion is missing
+fn compile_ring_transitive(def: &ConstraintDef) -> Predicate {
+    let id = def.id.clone();
+    let text = def.text.clone();
+    let ft_ids: Vec<String> = def.spans.iter().map(|s| s.fact_type_id.clone()).collect();
+
+    Arc::new(move |ctx: &EvalContext| {
+        let pairs = ring_facts(ctx, &ft_ids);
+        let set = ring_pair_set(&pairs);
+        let mut violations = Vec::new();
+        for (x, y) in &pairs {
+            for (y2, z) in &pairs {
+                if y == y2 && x != z && !set.contains(&(x.clone(), z.clone())) {
+                    violations.push(Violation {
+                        constraint_id: id.clone(),
+                        constraint_text: text.clone(),
+                        detail: format!(
+                            "Transitive violation: '{}'→'{}' and '{}'→'{}' but '{}'→'{}' is missing",
+                            x, y, y, z, x, z
+                        ),
+                    });
+                }
+            }
+        }
+        violations
+    })
+}
+
+/// AC: No cycle x₁Rx₂...xₙRx₁ (acyclic) — DFS cycle detection
+fn compile_ring_acyclic(def: &ConstraintDef) -> Predicate {
+    let id = def.id.clone();
+    let text = def.text.clone();
+    let ft_ids: Vec<String> = def.spans.iter().map(|s| s.fact_type_id.clone()).collect();
+
+    Arc::new(move |ctx: &EvalContext| {
+        let pairs = ring_facts(ctx, &ft_ids);
+        // Build adjacency list
+        let mut adj: HashMap<String, Vec<String>> = HashMap::new();
+        for (x, y) in &pairs {
+            if x != y {
+                adj.entry(x.clone()).or_default().push(y.clone());
+            }
+        }
+        // DFS cycle detection
+        let mut violations = Vec::new();
+        let mut visited = HashSet::new();
+        let mut in_stack = HashSet::new();
+
+        fn dfs(
+            node: &str,
+            adj: &HashMap<String, Vec<String>>,
+            visited: &mut HashSet<String>,
+            in_stack: &mut HashSet<String>,
+            cycle_nodes: &mut Vec<String>,
+        ) -> bool {
+            visited.insert(node.to_string());
+            in_stack.insert(node.to_string());
+            if let Some(neighbors) = adj.get(node) {
+                for next in neighbors {
+                    if !visited.contains(next.as_str()) {
+                        if dfs(next, adj, visited, in_stack, cycle_nodes) {
+                            cycle_nodes.push(node.to_string());
+                            return true;
+                        }
+                    } else if in_stack.contains(next.as_str()) {
+                        cycle_nodes.push(next.to_string());
+                        cycle_nodes.push(node.to_string());
+                        return true;
+                    }
+                }
+            }
+            in_stack.remove(node);
+            false
+        }
+
+        let nodes: Vec<String> = adj.keys().cloned().collect();
+        for node in &nodes {
+            if !visited.contains(node.as_str()) {
+                let mut cycle_nodes = Vec::new();
+                if dfs(node, &adj, &mut visited, &mut in_stack, &mut cycle_nodes) {
+                    cycle_nodes.reverse();
+                    violations.push(Violation {
+                        constraint_id: id.clone(),
+                        constraint_text: text.clone(),
+                        detail: format!(
+                            "Acyclic violation: cycle detected through {}",
+                            cycle_nodes.join(" → ")
+                        ),
+                    });
+                }
+            }
+        }
+        violations
+    })
+}
+
+/// RF: Each x must xRx (purely reflexive) — violation when self-reference is missing
+fn compile_ring_reflexive(ir: &ConstraintIR, def: &ConstraintDef) -> Predicate {
+    let id = def.id.clone();
+    let text = def.text.clone();
+    let ft_ids: Vec<String> = def.spans.iter().map(|s| s.fact_type_id.clone()).collect();
+    // Find the noun name from spans to know which instances to check
+    let noun_name: String = def.spans.first()
+        .and_then(|s| ir.fact_types.get(&s.fact_type_id))
+        .and_then(|ft| ft.roles.first())
+        .map(|r| r.noun_name.clone())
+        .unwrap_or_default();
+
+    Arc::new(move |ctx: &EvalContext| {
+        let pairs = ring_facts(ctx, &ft_ids);
+        let self_refs: HashSet<String> = pairs.iter()
+            .filter(|(x, y)| x == y)
+            .map(|(x, _)| x.clone())
+            .collect();
+        // Find all instances of this noun across the population
+        let mut all_instances = HashSet::new();
+        for facts in ctx.population.facts.values() {
+            for fact in facts {
+                for (noun, val) in &fact.bindings {
+                    if noun == &noun_name {
+                        all_instances.insert(val.clone());
+                    }
+                }
+            }
+        }
+        all_instances.iter()
+            .filter(|inst| !self_refs.contains(*inst))
+            .map(|inst| Violation {
+                constraint_id: id.clone(),
+                constraint_text: text.clone(),
+                detail: format!("Reflexive violation: '{}' does not reference itself", inst),
+            })
+            .collect()
     })
 }
 

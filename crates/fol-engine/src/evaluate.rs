@@ -427,7 +427,7 @@ mod tests {
         });
         ir.constraints.push(ConstraintDef {
             id: "c1".to_string(),
-            kind: "RC".to_string(),
+            kind: "IR".to_string(),
             modality: "Alethic".to_string(),
             deontic_operator: None,
             text: "No Person manages itself".to_string(),
@@ -448,7 +448,7 @@ mod tests {
 
         let result = evaluate_ir(&ir, &empty_response(), &population);
         assert!(!result.is_empty());
-        assert!(result[0].detail.contains("Ring constraint"));
+        assert!(result[0].detail.contains("Irreflexive"));
     }
 
     #[test]
