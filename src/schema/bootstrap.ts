@@ -88,7 +88,8 @@ export const BOOTSTRAP_DDL: string[] = [
   minimum REAL,
   maximum REAL,
   pattern TEXT,
-  prompt_text TEXT
+  prompt_text TEXT,
+  world_assumption TEXT DEFAULT 'closed' CHECK (world_assumption IN ('closed', 'open'))
 )`,
 
   `CREATE INDEX IF NOT EXISTS idx_nouns_domain ON nouns(domain_id)`,
