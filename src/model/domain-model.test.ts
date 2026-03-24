@@ -6,19 +6,19 @@ const DOMAIN = 'd1'
 
 function mockLoader(data: Partial<Record<string, any[]>>): DataLoader {
   return {
-    queryNouns: () => data.nouns ?? [],
-    queryGraphSchemas: () => data.graphSchemas ?? [],
-    queryReadings: () => data.readings ?? [],
-    queryRoles: () => data.roles ?? [],
-    queryConstraints: () => data.constraints ?? [],
-    queryConstraintSpans: () => data.constraintSpans ?? [],
-    queryStateMachineDefs: () => data.smDefs ?? [],
-    queryStatuses: () => data.statuses ?? [],
-    queryTransitions: () => data.transitions ?? [],
-    queryEventTypes: () => data.eventTypes ?? [],
-    queryGuards: () => data.guards ?? [],
-    queryVerbs: () => data.verbs ?? [],
-    queryFunctions: () => data.functions ?? [],
+    queryNouns: async () => data.nouns ?? [],
+    queryGraphSchemas: async () => data.graphSchemas ?? [],
+    queryReadings: async () => data.readings ?? [],
+    queryRoles: async () => data.roles ?? [],
+    queryConstraints: async () => data.constraints ?? [],
+    queryConstraintSpans: async () => data.constraintSpans ?? [],
+    queryStateMachineDefs: async () => data.smDefs ?? [],
+    queryStatuses: async () => data.statuses ?? [],
+    queryTransitions: async () => data.transitions ?? [],
+    queryEventTypes: async () => data.eventTypes ?? [],
+    queryGuards: async () => data.guards ?? [],
+    queryVerbs: async () => data.verbs ?? [],
+    queryFunctions: async () => data.functions ?? [],
   } as DataLoader
 }
 
