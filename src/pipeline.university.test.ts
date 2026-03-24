@@ -204,5 +204,21 @@ Academic uses Extension / Extension is used by Academic.`, [])
 })
 
 describe('Parser — formal subtype definitions', () => {
-  it.todo('parses "each Teacher is an Academic who..." — lines not reaching SUBTYPE_DEFINITION regex, needs parser flow investigation')
+  it('parses "each Teacher is an Academic who teaches some Subject"', () => {
+    const text = `## Entity Types
+Academic(.empNr) is an entity type.
+Subject(.code) is an entity type.
+Rank(.code) is an entity type.
+
+## Subtypes
+each Teacher is an Academic who teaches some Subject.
+each Professor is an Academic who has Rank 'P'.
+each TeachingProf is both a Teacher and a Professor.`
+
+    const result = parseFORML2(text, [])
+    expect(result.subtypes.find(s => s.child === 'Teacher' && s.parent === 'Academic')).toBeDefined()
+    expect(result.subtypes.find(s => s.child === 'Professor' && s.parent === 'Academic')).toBeDefined()
+    expect(result.subtypes.find(s => s.child === 'TeachingProf' && s.parent === 'Teacher')).toBeDefined()
+    expect(result.subtypes.find(s => s.child === 'TeachingProf' && s.parent === 'Professor')).toBeDefined()
+  })
 })

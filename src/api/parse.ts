@@ -95,17 +95,15 @@ const INSTANCE_FACT_SIMPLE = new RegExp(`^(${N})\\s+(?:has\\s+)?(${N})\\s+'([^']
 const SUBSECTION = /^###\s+(.+)/
 
 // Comment or description line — not a FORML2 claim
-const COMMENT_LINE = /^(?:#\s|[a-z]|$|\[|Note:\s)/
+// Skip lines that are clearly not FORML2: markdown links, notes, and prose
+// that starts with a lowercase word that isn't a FORML2 keyword.
+// "each" is a FORML2 keyword (subtype definitions, constraints).
+const COMMENT_LINE = /^(?:#\s|$|\[|Note:\s)/
 
 // Lines that look like documentation comments, not FORML2 readings
 const DESCRIPTION_LINE = /^Cross-domain references:/
 
 // Skip patterns — lines that are structural but not claims
-const SKIP_PATTERNS = [
-  /^#\s/,           // Top-level markdown heading
-  /^---/,           // Horizontal rule
-  /^\s*$/,          // Empty line
-]
 
 /**
  * Pure-function FORML2 parser.
@@ -146,10 +144,7 @@ export function parseFORML2(
     const raw = lines[i]
     const line = raw.trim()
 
-    // Skip empty and structural lines
-    if (SKIP_PATTERNS.some(p => p.test(line))) continue
-    if (!line) continue
-
+    if (!line || /^#\s/.test(line) || /^---/.test(line)) continue
     // Track section headers
     const newSection = detectSection(line)
     if (newSection) {
