@@ -194,6 +194,38 @@ describe('parseConstraintText — NORMA verbalizations (University model)', () =
       // not a constraint object. This test verifies the parser integration.
     })
   })
+  // ── Inverse UC ─────────────────────────────────────────────────────
+
+  describe('inverse UC', () => {
+    it('For each EmpName, at most one Academic has that EmpName (inverse)', () => {
+      const result = parseConstraintText('For each EmpName, at most one Academic has that EmpName.')
+      expect(result).toEqual([
+        { kind: 'UC', modality: 'Alethic', nouns: ['Academic', 'EmpName'], constrainedNoun: 'EmpName' },
+      ])
+    })
+  })
+
+  // ── Negative form UC ──────────────────────────────────────────────
+
+  describe('negative form UC', () => {
+    it('It is impossible that the same Person was born in more than one Country', () => {
+      const result = parseConstraintText(
+        'It is impossible that the same Person was born in more than one Country.'
+      )
+      expect(result).toEqual([
+        { kind: 'UC', modality: 'Alethic', nouns: ['Person', 'Country'], constrainedNoun: 'Person' },
+      ])
+    })
+
+    it('It is impossible that more than one Person was born in the same Country', () => {
+      const result = parseConstraintText(
+        'It is impossible that more than one Person was born in the same Country.'
+      )
+      expect(result).toEqual([
+        { kind: 'UC', modality: 'Alethic', nouns: ['Person', 'Country'], constrainedNoun: 'Country' },
+      ])
+    })
+  })
 })
 
 describe('parseSetComparisonBlock — NORMA verbalizations (University model)', () => {

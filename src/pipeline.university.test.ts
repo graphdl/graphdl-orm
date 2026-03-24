@@ -185,3 +185,24 @@ describe('University academic model — end-to-end', () => {
     expect(result.warnings).toHaveLength(0)
   })
 })
+
+describe('Parser — inverse readings', () => {
+  it('parses forward / inverse reading syntax', () => {
+    const result = parseFORML2(`## Entity Types
+Academic(.empNr) is an entity type.
+Extension(.extNr) is an entity type.
+
+## Fact Types
+Academic uses Extension / Extension is used by Academic.`, [])
+
+    // Both forward and inverse readings should be created
+    const forward = result.readings.find(r => r.text === 'Academic uses Extension')
+    const inverse = result.readings.find(r => r.text === 'Extension is used by Academic')
+    expect(forward).toBeDefined()
+    expect(inverse).toBeDefined()
+  })
+})
+
+describe('Parser — formal subtype definitions', () => {
+  it.todo('parses "each Teacher is an Academic who teaches some Subject" — needs regex fix for quoted values')
+})
