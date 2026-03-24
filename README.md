@@ -79,12 +79,20 @@ Resolved -> Open (reopen).
 | **Enum** | `The possible values of X are 'A', 'B'.` | `The possible values of Priority are 'Low', 'High'.` |
 | **Subtypes** | `X is a subtype of Y.` | `VIP Customer is a subtype of Customer.` |
 | **Fact type** | `Noun verb Noun.` | `Customer submits Support Request.` |
-| **Uniqueness** | `Each X has at most one Y.` | `Each Support Request has at most one Priority.` |
-| **Mandatory** | `Each X has some Y.` | `Each Support Request has some Priority.` |
+| **Uniqueness** | `Each X has at most one Y.` | `Each Academic has at most one Rank.` |
+| **Inverse UC** | `For each Y, at most one X [verb] that Y.` | `For each Chair, at most one Academic holds that Chair.` |
+| **Mandatory** | `Each X has some Y.` | `Each Academic has some Rank.` |
+| **Exactly one** | `Each X has exactly one Y.` (UC + MC) | `Each Academic works for exactly one Department.` |
+| **Frequency** | `Each X in the population of "..." occurs there exactly N times.` | `Each Activity in the population of "..." occurs there exactly 2 times.` |
+| **Inverse reading** | `A verb B / B verb A.` | `Academic uses Extension / Extension is used by Academic.` |
+| **Objectification** | `This association with A, B provides the preferred identification scheme for X.` | `This association with Academic, Subject provides the preferred identification scheme for Teaching.` |
+| **Ring (irreflexive)** | `No X [verb] the same X.` | `No Academic audits the same Academic.` |
+| **Subset** | `If some X [verb] some Y then that X [verb] that Y.` | `If some Academic heads some Department then that Academic works for that Department.` |
+| **Exclusive-or** | `For each X, exactly one of the following holds: ...` | (see below) |
 | **Deontic** | `It is forbidden/obligatory that ...` | `It is forbidden that Support Request has Priority 'Urgent' and Support Request has no assigned Agent.` |
 | **Derivation** | `X has Y := condition.` | `Support Request is escalated := Support Request has Priority 'Urgent'.` |
 
-The framework supports the full ORM2 constraint taxonomy — uniqueness, mandatory, frequency, subset, equality, exclusion, inclusive/exclusive or, ring constraints (irreflexive, asymmetric, antisymmetric, symmetric, intransitive, transitive, acyclic), value comparison, and deontic modality (forbidden, obligatory, permitted).
+The framework supports the full ORM2 constraint taxonomy — uniqueness (internal, external, spanning), mandatory, frequency, subset, equality, exclusion, inclusive/exclusive or, ring constraints (irreflexive, asymmetric, antisymmetric, symmetric, intransitive, transitive, acyclic), value comparison, and deontic modality (forbidden, obligatory, permitted). Reference schemes (`(.Email)`) generate implicit 1:1 mandatory binaries. Objectified fact types share identity between nouns and graph schemas. World assumptions (closed/open) control how absence of facts is interpreted.
 
 ## Seeding a Domain
 
