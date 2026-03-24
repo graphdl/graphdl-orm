@@ -62,10 +62,12 @@ export class EntityDataLoader implements DataLoader {
     private getStub: (id: string) => EntityStub,
   ) {}
 
-  // ---- Implemented: Noun fan-out ----
+  // ---- Private helper: fan-out by entity type ----
 
-  async queryNouns(domainId: string): Promise<Row[]> {
-    const ids = await this.registry.getEntityIds('Noun', domainId)
+  private async fetchByType(entityType: string, domainId?: string): Promise<Row[]> {
+    const ids = domainId
+      ? await this.registry.getEntityIds(entityType, domainId)
+      : await this.registry.getEntityIds(entityType)
     const entities = await fanOut(ids, async (id) => {
       const stub = this.getStub(id)
       return stub.get()
@@ -73,53 +75,81 @@ export class EntityDataLoader implements DataLoader {
     return entities.map((e) => ({ id: e.id, ...e.data }))
   }
 
-  // ---- Stubs: will be implemented in Task 6 ----
+  // ---- Noun ----
 
-  queryGraphSchemas(_domainId: string): Row[] {
-    return []
+  async queryNouns(domainId: string): Promise<Row[]> {
+    return this.fetchByType('Noun', domainId)
   }
 
-  queryReadings(_domainId: string): Row[] {
-    return []
+  // ---- Graph Schemas ----
+
+  async queryGraphSchemas(domainId: string): Promise<Row[]> {
+    return this.fetchByType('Graph Schema', domainId)
   }
 
-  queryRoles(): Row[] {
-    return []
+  // ---- Readings ----
+
+  async queryReadings(domainId: string): Promise<Row[]> {
+    return this.fetchByType('Reading', domainId)
   }
 
-  queryConstraints(_domainId: string): Row[] {
-    return []
+  // ---- Roles (no domain filter — fetches all) ----
+
+  async queryRoles(): Promise<Row[]> {
+    return this.fetchByType('Role')
   }
 
-  queryConstraintSpans(): Row[] {
-    return []
+  // ---- Constraints ----
+
+  async queryConstraints(domainId: string): Promise<Row[]> {
+    return this.fetchByType('Constraint', domainId)
   }
 
-  queryStateMachineDefs(_domainId: string): Row[] {
-    return []
+  // ---- Constraint Spans (no domain filter — fetches all) ----
+
+  async queryConstraintSpans(): Promise<Row[]> {
+    return this.fetchByType('Constraint Span')
   }
 
-  queryStatuses(_domainId: string): Row[] {
-    return []
+  // ---- State Machine Definitions ----
+
+  async queryStateMachineDefs(domainId: string): Promise<Row[]> {
+    return this.fetchByType('State Machine Definition', domainId)
   }
 
-  queryTransitions(_domainId: string): Row[] {
-    return []
+  // ---- Statuses ----
+
+  async queryStatuses(domainId: string): Promise<Row[]> {
+    return this.fetchByType('Status', domainId)
   }
 
-  queryEventTypes(_domainId: string): Row[] {
-    return []
+  // ---- Transitions ----
+
+  async queryTransitions(domainId: string): Promise<Row[]> {
+    return this.fetchByType('Transition', domainId)
   }
 
-  queryGuards(_domainId: string): Row[] {
-    return []
+  // ---- Event Types ----
+
+  async queryEventTypes(domainId: string): Promise<Row[]> {
+    return this.fetchByType('Event Type', domainId)
   }
 
-  queryVerbs(_domainId: string): Row[] {
-    return []
+  // ---- Guards ----
+
+  async queryGuards(domainId: string): Promise<Row[]> {
+    return this.fetchByType('Guard', domainId)
   }
 
-  queryFunctions(_domainId: string): Row[] {
-    return []
+  // ---- Verbs ----
+
+  async queryVerbs(domainId: string): Promise<Row[]> {
+    return this.fetchByType('Verb', domainId)
+  }
+
+  // ---- Functions ----
+
+  async queryFunctions(domainId: string): Promise<Row[]> {
+    return this.fetchByType('Function', domainId)
   }
 }
