@@ -83,9 +83,13 @@ export function verifyProse(prose: string, data: DomainData): VerifyResult {
 
 // ── HTTP Handler ───────────────────────────────────────────────────
 
-function getDB(env: Env): DurableObjectStub {
-  const id = env.DOMAIN_DB.idFromName('graphdl-primary')
-  return env.DOMAIN_DB.get(id)
+/** Fetch all entities of a given type for a domain via Registry+EntityDB fan-out. */
+async function fanOutEntities(env: Env, registry: any, entityType: string, domainSlug?: string): Promise<any[]> {
+  const ids: string[] = await registry.getEntityIds(entityType, domainSlug)
+  const entities = await Promise.all(
+    ids.map(id => (env.ENTITY_DB.get(env.ENTITY_DB.idFromName(id)) as any).get())
+  )
+  return entities.filter(Boolean).map((e: any) => ({ id: e.id, ...e.data }))
 }
 
 export async function handleVerify(request: Request, env: Env): Promise<Response> {
@@ -101,29 +105,29 @@ export async function handleVerify(request: Request, env: Env): Promise<Response
     return error(400, { errors: [{ message: 'domain is required' }] })
   }
 
-  const db = getDB(env) as any
-  const domainId = body.domain
+  const registry = env.REGISTRY_DB.get(env.REGISTRY_DB.idFromName('global')) as any
+  const domainSlug = body.domain
 
-  // Load all domain data in parallel (read-only)
-  // Note: roles and constraint-spans don't have a domain_id column — they're
-  // child records of domain-scoped readings/constraints. We load all and filter
-  // in-memory by matching against the domain-scoped reading IDs.
-  const [nounsResult, readingsResult, rolesResult, constraintsResult, spansResult] = await Promise.all([
-    db.findInCollection('nouns', { domain_id: { equals: domainId } }, { limit: 10000 }),
-    db.findInCollection('readings', { domain_id: { equals: domainId } }, { limit: 10000 }),
-    db.findInCollection('roles', {}, { limit: 10000 }),
-    db.findInCollection('constraints', { domain_id: { equals: domainId } }, { limit: 10000 }),
-    db.findInCollection('constraint-spans', {}, { limit: 10000 }),
+  // Load all domain data in parallel via Registry+EntityDB fan-out (read-only)
+  const [nounDocs, readingDocs, roleDocs, constraintDocs, spanDocs] = await Promise.all([
+    fanOutEntities(env, registry, 'Noun', domainSlug),
+    fanOutEntities(env, registry, 'Reading', domainSlug),
+    fanOutEntities(env, registry, 'Role'),
+    fanOutEntities(env, registry, 'Constraint', domainSlug),
+    fanOutEntities(env, registry, 'ConstraintSpan'),
   ])
 
+  // Filter roles and spans to only those belonging to domain-scoped readings
+  const readingIds = new Set(readingDocs.map((r: any) => r.id))
+
   const domainData: DomainData = {
-    nouns: nounsResult.docs.map((n: any) => ({ id: n.id, name: n.name })),
-    readings: readingsResult.docs.map((r: any) => ({ id: r.id, text: r.text })),
-    roles: rolesResult.docs
-      .filter((r: any) => readingsResult.docs.some((rd: any) => rd.id === r.reading))
-      .map((r: any) => ({ id: r.id, reading: r.reading, noun: r.noun, roleIndex: r.roleIndex })),
-    constraints: constraintsResult.docs.map((c: any) => ({ id: c.id, kind: c.kind, text: c.text })),
-    constraintSpans: spansResult.docs.map((s: any) => ({ constraint: s.constraint, role: s.role })),
+    nouns: nounDocs.map((n: any) => ({ id: n.id, name: n.name })),
+    readings: readingDocs.map((r: any) => ({ id: r.id, text: r.text })),
+    roles: roleDocs
+      .filter((r: any) => readingIds.has(r.reading || r.readingId))
+      .map((r: any) => ({ id: r.id, reading: r.reading || r.readingId, noun: r.noun || r.nounId, roleIndex: r.roleIndex })),
+    constraints: constraintDocs.map((c: any) => ({ id: c.id, kind: c.kind, text: c.text })),
+    constraintSpans: spanDocs.map((s: any) => ({ constraint: s.constraint || s.constraintId, role: s.role || s.roleId })),
   }
 
   const result = verifyProse(body.text, domainData)
