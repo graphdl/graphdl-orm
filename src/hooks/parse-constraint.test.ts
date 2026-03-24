@@ -63,15 +63,15 @@ describe('parseConstraintText — edge cases', () => {
 
 describe('parseSetComparisonBlock — structural tests', () => {
   it('handles multi-word entity names in XO', () => {
-    // From ORM2: multi-word entity names must be recognized
-    const block = `For each Lead Message Match, exactly one of the following holds:
-  that Lead Message Match is confirmed;
-  that Lead Message Match is rejected.`
+    // Multi-word entity names must be recognized and collapsed to PascalCase
+    const block = `For each State Machine Definition, exactly one of the following holds:
+  that State Machine Definition is active;
+  that State Machine Definition is archived.`
 
     const result = parseSetComparisonBlock(block)
     expect(result).not.toBeNull()
     expect(result!.kind).toBe('XO')
-    expect(result!.entity).toBe('LeadMessageMatch')
+    expect(result!.entity).toBe('StateMachineDefinition')
   })
 
   it('returns null for non-set-comparison text', () => {
