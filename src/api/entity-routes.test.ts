@@ -1,5 +1,11 @@
 import { describe, it, expect, vi } from 'vitest'
-import { handleListEntities, handleGetEntity, handleCreateEntity, handleDeleteEntity } from './entity-routes'
+import {
+  handleListEntities,
+  handleGetEntity,
+  handleCreateEntity,
+  handleDeleteEntity,
+  populateDepthForEntity,
+} from './entity-routes'
 
 describe('entity-routes', () => {
   // ── handleListEntities ──────────────────────────────────────────────
@@ -124,5 +130,113 @@ describe('entity-routes', () => {
     const result = await handleDeleteEntity('e1', stub, registry, 'Noun')
     expect(result).toBeNull()
     expect(registry.deindexEntity).not.toHaveBeenCalled()
+  })
+
+  // ── populateDepthForEntity ──────────────────────────────────────────
+
+  it('populateDepthForEntity resolves Id fields at depth=1', async () => {
+    const entity = { id: 'n1', type: 'Noun', data: { name: 'Customer', graphSchemaId: 'gs1' }, version: 1 }
+    const refStub = {
+      get: vi.fn().mockResolvedValue({ id: 'gs1', type: 'GraphSchema', data: { name: 'Tickets' }, version: 1 }),
+    }
+    const getStub = vi.fn().mockReturnValue(refStub)
+
+    const populated = await populateDepthForEntity(entity, 1, getStub)
+
+    expect(populated.graphSchemaId).toBe('gs1')
+    expect(populated.graphSchema).toEqual({ id: 'gs1', name: 'Tickets' })
+    expect(getStub).toHaveBeenCalledWith('gs1')
+  })
+
+  it('populateDepthForEntity leaves data unchanged when no Id fields', async () => {
+    const entity = { id: 'n1', type: 'Noun', data: { name: 'Customer', label: 'cust' }, version: 1 }
+    const getStub = vi.fn()
+
+    const populated = await populateDepthForEntity(entity, 1, getStub)
+
+    expect(populated).toEqual({ name: 'Customer', label: 'cust' })
+    expect(getStub).not.toHaveBeenCalled()
+  })
+
+  it('populateDepthForEntity leaves ID as-is when reference unreachable', async () => {
+    const entity = { id: 'n1', type: 'Noun', data: { name: 'Customer', graphSchemaId: 'gs-gone' }, version: 1 }
+    const refStub = {
+      get: vi.fn().mockRejectedValue(new Error('DO unreachable')),
+    }
+    const getStub = vi.fn().mockReturnValue(refStub)
+
+    const populated = await populateDepthForEntity(entity, 1, getStub)
+
+    expect(populated.graphSchemaId).toBe('gs-gone')
+    expect(populated.graphSchema).toBeUndefined()
+  })
+
+  it('populateDepthForEntity returns data as-is at depth=0', async () => {
+    const entity = { id: 'n1', type: 'Noun', data: { name: 'Customer', graphSchemaId: 'gs1' }, version: 1 }
+    const getStub = vi.fn()
+
+    const populated = await populateDepthForEntity(entity, 0, getStub)
+
+    expect(populated).toEqual({ name: 'Customer', graphSchemaId: 'gs1' })
+    expect(populated.graphSchema).toBeUndefined()
+    expect(getStub).not.toHaveBeenCalled()
+  })
+
+  it('populateDepthForEntity skips non-string Id fields', async () => {
+    const entity = { id: 'n1', type: 'Noun', data: { name: 'Customer', someId: 42 }, version: 1 }
+    const getStub = vi.fn()
+
+    const populated = await populateDepthForEntity(entity, 1, getStub)
+
+    expect(populated).toEqual({ name: 'Customer', someId: 42 })
+    expect(getStub).not.toHaveBeenCalled()
+  })
+
+  it('populateDepthForEntity handles ref returning null (deleted entity)', async () => {
+    const entity = { id: 'n1', type: 'Noun', data: { name: 'Customer', graphSchemaId: 'gs-deleted' }, version: 1 }
+    const refStub = { get: vi.fn().mockResolvedValue(null) }
+    const getStub = vi.fn().mockReturnValue(refStub)
+
+    const populated = await populateDepthForEntity(entity, 1, getStub)
+
+    expect(populated.graphSchemaId).toBe('gs-deleted')
+    expect(populated.graphSchema).toBeUndefined()
+  })
+
+  // ── handleListEntities with depth ───────────────────────────────────
+
+  it('handleListEntities populates depth=1 references in docs', async () => {
+    const registry = { getEntityIds: vi.fn().mockResolvedValue(['n1']) }
+    const nounStub = {
+      get: vi.fn().mockResolvedValue({ id: 'n1', type: 'Noun', data: { name: 'Customer', graphSchemaId: 'gs1' }, version: 1 }),
+    }
+    const schemaStub = {
+      get: vi.fn().mockResolvedValue({ id: 'gs1', type: 'GraphSchema', data: { name: 'Tickets' }, version: 1 }),
+    }
+    const stubs = new Map<string, any>([
+      ['n1', nounStub],
+      ['gs1', schemaStub],
+    ])
+
+    const result = await handleListEntities('Noun', 'tickets', registry, (id) => stubs.get(id)!, { depth: 1 })
+
+    expect(result.docs[0].data.graphSchema).toEqual({ id: 'gs1', name: 'Tickets' })
+    expect(result.docs[0].data.graphSchemaId).toBe('gs1')
+  })
+
+  it('handleGetEntity populates depth=1 references', async () => {
+    const nounStub = {
+      get: vi.fn().mockResolvedValue({ id: 'n1', type: 'Noun', data: { name: 'Customer', graphSchemaId: 'gs1' }, version: 1 }),
+    }
+    const schemaStub = {
+      get: vi.fn().mockResolvedValue({ id: 'gs1', type: 'GraphSchema', data: { name: 'Tickets' }, version: 1 }),
+    }
+    const stubs = new Map<string, any>([
+      ['gs1', schemaStub],
+    ])
+
+    const result = await handleGetEntity(nounStub, { depth: 1, getStub: (id) => stubs.get(id)! })
+
+    expect(result!.data.graphSchema).toEqual({ id: 'gs1', name: 'Tickets' })
   })
 })
