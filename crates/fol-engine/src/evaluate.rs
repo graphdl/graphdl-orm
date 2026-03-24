@@ -315,6 +315,8 @@ mod tests {
             set_comparison_argument_length: None,
             clauses: None,
             entity: None,
+            min_occurrence: None,
+            max_occurrence: None,
         });
 
         let response = ResponseContext {
@@ -363,6 +365,8 @@ mod tests {
             set_comparison_argument_length: None,
             clauses: None,
             entity: None,
+            min_occurrence: None,
+            max_occurrence: None,
         });
 
         let response = ResponseContext {
@@ -395,6 +399,8 @@ mod tests {
             set_comparison_argument_length: None,
             clauses: None,
             entity: None,
+            min_occurrence: None,
+            max_occurrence: None,
         });
 
         let mut facts = HashMap::new();
@@ -435,6 +441,8 @@ mod tests {
             set_comparison_argument_length: None,
             clauses: None,
             entity: None,
+            min_occurrence: None,
+            max_occurrence: None,
         });
 
         let mut facts = HashMap::new();
@@ -475,6 +483,8 @@ mod tests {
             set_comparison_argument_length: Some(2),
             clauses: Some(vec!["Order isPaid".to_string(), "Order isPending".to_string()]),
             entity: Some("Order".to_string()),
+            min_occurrence: None,
+            max_occurrence: None,
         });
 
         let mut facts = HashMap::new();
@@ -517,6 +527,8 @@ mod tests {
             set_comparison_argument_length: None,
             clauses: None,
             entity: None,
+            min_occurrence: None,
+            max_occurrence: None,
         });
 
         let mut facts = HashMap::new();
@@ -544,6 +556,8 @@ mod tests {
             set_comparison_argument_length: None,
             clauses: None,
             entity: None,
+            min_occurrence: None,
+            max_occurrence: None,
         });
 
         let result = evaluate_ir(&ir, &empty_response(), &empty_population());
@@ -574,6 +588,8 @@ mod tests {
             set_comparison_argument_length: Some(2),
             clauses: Some(vec!["Order isPaid".to_string(), "Order isPending".to_string()]),
             entity: Some("Order".to_string()),
+            min_occurrence: None,
+            max_occurrence: None,
         });
 
         let mut facts = HashMap::new();
@@ -626,6 +642,8 @@ mod tests {
             set_comparison_argument_length: None,
             clauses: None,
             entity: None,
+            min_occurrence: None,
+            max_occurrence: None,
         });
 
         let mut facts = HashMap::new();
@@ -665,6 +683,8 @@ mod tests {
             set_comparison_argument_length: Some(2),
             clauses: Some(vec!["Customer hasPhone".to_string(), "Customer hasEmail".to_string()]),
             entity: Some("Customer".to_string()),
+            min_occurrence: None,
+            max_occurrence: None,
         });
 
         ir.fact_types.insert("ft3".to_string(), FactTypeDef {
@@ -718,6 +738,8 @@ mod tests {
             set_comparison_argument_length: None,
             clauses: None,
             entity: None,
+            min_occurrence: None,
+            max_occurrence: None,
         });
 
         let response = ResponseContext {
@@ -745,6 +767,8 @@ mod tests {
             set_comparison_argument_length: None,
             clauses: None,
             entity: None,
+            min_occurrence: None,
+            max_occurrence: None,
         });
 
         let response = ResponseContext {
@@ -805,6 +829,8 @@ mod tests {
             set_comparison_argument_length: None,
             clauses: None,
             entity: None,
+            min_occurrence: None,
+            max_occurrence: None,
         });
 
         let response = ResponseContext {
@@ -848,6 +874,8 @@ mod tests {
             set_comparison_argument_length: None,
             clauses: None,
             entity: None,
+            min_occurrence: None,
+            max_occurrence: None,
         });
 
         let mut facts = HashMap::new();
@@ -951,6 +979,8 @@ mod tests {
             set_comparison_argument_length: None,
             clauses: None,
             entity: None,
+            min_occurrence: None,
+            max_occurrence: None,
         });
 
         let compiled = crate::compile::compile(&ir);
@@ -1101,6 +1131,8 @@ mod tests {
             set_comparison_argument_length: None,
             clauses: None,
             entity: None,
+            min_occurrence: None,
+            max_occurrence: None,
         });
 
         let compiled = crate::compile::compile(&ir);

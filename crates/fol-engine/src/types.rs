@@ -78,7 +78,7 @@ pub struct RoleDef {
     pub role_index: usize,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConstraintDef {
     pub id: String,
@@ -90,6 +90,8 @@ pub struct ConstraintDef {
     pub set_comparison_argument_length: Option<usize>,
     pub clauses: Option<Vec<String>>,
     pub entity: Option<String>,
+    pub min_occurrence: Option<usize>,
+    pub max_occurrence: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

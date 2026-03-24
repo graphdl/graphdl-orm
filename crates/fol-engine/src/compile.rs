@@ -652,6 +652,7 @@ fn compile_constraint(ir: &ConstraintIR, def: &ConstraintDef) -> CompiledConstra
         Modality::Alethic => match def.kind.as_str() {
             "UC" => compile_uniqueness(ir, def),
             "MC" => compile_mandatory(ir, def),
+            "FC" => compile_frequency(ir, def),
             // Ring constraints — each property has its own evaluator
             "IR" => compile_ring_irreflexive(def),
             "AS" => compile_ring_asymmetric(def),
@@ -781,6 +782,53 @@ fn compile_mandatory(_ir: &ConstraintIR, def: &ConstraintDef) -> Predicate {
                         "Mandatory violation: {} '{}' does not participate in {}",
                         span.noun_name, instance, span.reading
                     ),
+                })
+                .collect::<Vec<_>>()
+        }).collect()
+    })
+}
+
+/// FC: Frequency constraint — each value in the constrained role must occur
+/// within [min_occurrence, max_occurrence] times in the fact type's population.
+/// Per Halpin Ch 7.2: generalizes UC (FC with max=1 is a UC).
+fn compile_frequency(_ir: &ConstraintIR, def: &ConstraintDef) -> Predicate {
+    let id = def.id.clone();
+    let text = def.text.clone();
+    let spans = resolve_spans(_ir, &def.spans);
+    let min_occ = def.min_occurrence.unwrap_or(1);
+    let max_occ = def.max_occurrence;
+
+    Arc::new(move |ctx: &EvalContext| {
+        spans.iter().flat_map(|span| {
+            let facts = ctx.population.facts.get(&span.fact_type_id)
+                .map(|f| f.as_slice()).unwrap_or(&[]);
+
+            // Count occurrences of each value at the constrained role
+            let mut counts: HashMap<String, usize> = HashMap::new();
+            for fact in facts {
+                if let Some((_, val)) = fact.bindings.get(span.role_index) {
+                    *counts.entry(val.clone()).or_insert(0) += 1;
+                }
+            }
+
+            counts.into_iter()
+                .filter(|(_, count)| {
+                    *count < min_occ || max_occ.map_or(false, |max| *count > max)
+                })
+                .map(|(val, count)| {
+                    let range = match max_occ {
+                        Some(max) if max == min_occ => format!("exactly {}", min_occ),
+                        Some(max) => format!("between {} and {}", min_occ, max),
+                        None => format!("at least {}", min_occ),
+                    };
+                    Violation {
+                        constraint_id: id.clone(),
+                        constraint_text: text.clone(),
+                        detail: format!(
+                            "Frequency violation: {} '{}' occurs {} times in {}, expected {}",
+                            span.noun_name, val, count, span.reading, range
+                        ),
+                    }
                 })
                 .collect::<Vec<_>>()
         }).collect()
