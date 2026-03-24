@@ -90,7 +90,8 @@ export const BOOTSTRAP_DDL: string[] = [
   pattern TEXT,
   prompt_text TEXT,
   world_assumption TEXT DEFAULT 'closed' CHECK (world_assumption IN ('closed', 'open')),
-  reference_scheme TEXT
+  reference_scheme TEXT,
+  is_independent INTEGER NOT NULL DEFAULT 0
 )`,
 
   `CREATE INDEX IF NOT EXISTS idx_nouns_domain ON nouns(domain_id)`,
@@ -104,7 +105,8 @@ export const BOOTSTRAP_DDL: string[] = [
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
   version INTEGER NOT NULL DEFAULT 1,
   name TEXT NOT NULL,
-  title TEXT
+  title TEXT,
+  is_derived INTEGER NOT NULL DEFAULT 0
 )`,
 
   `CREATE INDEX IF NOT EXISTS idx_graph_schemas_domain ON graph_schemas(domain_id)`,
@@ -118,7 +120,8 @@ export const BOOTSTRAP_DDL: string[] = [
   text TEXT NOT NULL,
   graph_schema_id TEXT REFERENCES graph_schemas(id),
   verb_id TEXT REFERENCES verbs(id),
-  is_primary INTEGER NOT NULL DEFAULT 1
+  is_primary INTEGER NOT NULL DEFAULT 1,
+  language TEXT DEFAULT 'en'
 )`,
 
   `CREATE INDEX IF NOT EXISTS idx_readings_domain ON readings(domain_id)`,
