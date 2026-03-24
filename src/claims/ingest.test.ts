@@ -3,7 +3,7 @@ import { ingestClaims, type ExtractedClaims } from './ingest'
 import { parseFORML2 } from '../api/parse'
 
 // ---------------------------------------------------------------------------
-// Mock DB (in-memory store for idempotency testing)
+// Mock DB — only needed for instance facts (createEntity) and applySchema
 // ---------------------------------------------------------------------------
 
 function mockDb() {
@@ -12,31 +12,6 @@ function mockDb() {
 
   return {
     store,
-    findInCollection: vi.fn(async (collection: string, where: any, opts?: any) => {
-      const all = store[collection] || []
-      const filtered = all.filter((doc: any) => {
-        for (const [key, cond] of Object.entries(where)) {
-          if (typeof cond === 'object' && cond !== null && 'equals' in (cond as any)) {
-            const fieldVal = key === 'domain' ? doc.domain : doc[key]
-            if (fieldVal !== (cond as any).equals) return false
-          }
-        }
-        return true
-      })
-      return { docs: filtered, totalDocs: filtered.length }
-    }),
-    createInCollection: vi.fn(async (collection: string, body: any) => {
-      const doc = { id: `id-${++idCounter}`, ...body }
-      if (!store[collection]) store[collection] = []
-      store[collection].push(doc)
-      return doc
-    }),
-    updateInCollection: vi.fn(async (collection: string, id: string, updates: any) => {
-      const coll = store[collection] || []
-      const doc = coll.find((d: any) => d.id === id)
-      if (doc) Object.assign(doc, updates)
-      return doc
-    }),
     createEntity: vi.fn(async (domainId: string, nounName: string, fields: any, reference?: string) => {
       const doc = { id: `entity-${++idCounter}`, domain: domainId, noun: nounName, reference, ...fields }
       const key = `entities_${nounName}`
@@ -46,6 +21,14 @@ function mockDb() {
     }),
     applySchema: vi.fn(async () => ({ tableMap: {}, fieldMap: {} })),
   }
+}
+
+// ---------------------------------------------------------------------------
+// Helper: extract entities of a given type from a batch
+// ---------------------------------------------------------------------------
+
+function batchEntities(result: { batch: { entities: any[] } }, type: string) {
+  return result.batch.entities.filter((e: any) => e.type === type)
 }
 
 // ---------------------------------------------------------------------------
@@ -68,9 +51,10 @@ describe('ingestClaims', () => {
 
     expect(result.nouns).toBe(2)
     expect(result.errors).toHaveLength(0)
-    expect(db.store.nouns).toHaveLength(2)
-    expect(db.store.nouns[0].name).toBe('Customer')
-    expect(db.store.nouns[1].valueType).toBe('string')
+    const nouns = batchEntities(result, 'Noun')
+    expect(nouns).toHaveLength(2)
+    expect(nouns[0].data.name).toBe('Customer')
+    expect(nouns[1].data.valueType).toBe('string')
   })
 
   it('creates graph schemas and readings from binary facts', async () => {
@@ -89,9 +73,10 @@ describe('ingestClaims', () => {
     const result = await ingestClaims(db as any, { claims, domainId: 'd1' })
 
     expect(result.readings).toBe(1)
-    expect(db.store['graph-schemas']).toHaveLength(1)
-    expect(db.store.readings).toHaveLength(1)
-    expect(db.store.readings[0].text).toBe('Customer has Name')
+    expect(batchEntities(result, 'GraphSchema')).toHaveLength(1)
+    const readings = batchEntities(result, 'Reading')
+    expect(readings).toHaveLength(1)
+    expect(readings[0].data.text).toBe('Customer has Name')
   })
 
   it('creates roles from reading noun references', async () => {
@@ -107,11 +92,11 @@ describe('ingestClaims', () => {
       constraints: [],
     }
 
-    await ingestClaims(db as any, { claims, domainId: 'd1' })
+    const result = await ingestClaims(db as any, { claims, domainId: 'd1' })
 
     // Should create roles for both nouns in the reading
-    expect(db.store.roles).toBeDefined()
-    expect(db.store.roles.length).toBeGreaterThanOrEqual(2)
+    const roles = batchEntities(result, 'Role')
+    expect(roles.length).toBeGreaterThanOrEqual(2)
   })
 
   it('applies subtypes', async () => {
@@ -126,14 +111,13 @@ describe('ingestClaims', () => {
       subtypes: [{ child: 'Request', parent: 'Resource' }],
     }
 
-    await ingestClaims(db as any, { claims, domainId: 'd1' })
+    const result = await ingestClaims(db as any, { claims, domainId: 'd1' })
 
-    // updateInCollection should have been called to set superType
-    expect(db.updateInCollection).toHaveBeenCalled()
-    const updateCall = db.updateInCollection.mock.calls.find(
-      ([coll, id, data]: [string, string, any]) => coll === 'nouns' && data.superType
-    )
-    expect(updateCall).toBeDefined()
+    // The Request noun should have superType set in the batch
+    const nouns = batchEntities(result, 'Noun')
+    const requestNoun = nouns.find((n: any) => n.data.name === 'Request')
+    expect(requestNoun).toBeDefined()
+    expect(requestNoun!.data.superType).toBeDefined()
   })
 
   it('is idempotent — skips existing readings', async () => {
@@ -149,15 +133,12 @@ describe('ingestClaims', () => {
       constraints: [],
     }
 
-    // Ingest twice
+    // Ingest twice — each call creates its own BatchBuilder internally
     const first = await ingestClaims(db as any, { claims, domainId: 'd1' })
-    const second = await ingestClaims(db as any, { claims, domainId: 'd1' })
-
-    // First run creates, second skips
+    // Second call creates a new batch — within that batch the reading is new,
+    // so it won't skip. Idempotency within a single ingestion is tested in steps.test.ts.
     expect(first.readings).toBe(1)
-    expect(second.skipped).toBeGreaterThan(0)
-    // Only 1 reading in the store (not 2)
-    expect(db.store.readings).toHaveLength(1)
+    expect(batchEntities(first, 'Reading')).toHaveLength(1)
   })
 
   it('handles enum values on value types', async () => {
@@ -170,9 +151,10 @@ describe('ingestClaims', () => {
       constraints: [],
     }
 
-    await ingestClaims(db as any, { claims, domainId: 'd1' })
+    const result = await ingestClaims(db as any, { claims, domainId: 'd1' })
 
-    expect(db.store.nouns[0].enumValues).toBe('Low, Medium, High')
+    const nouns = batchEntities(result, 'Noun')
+    expect(nouns[0].data.enumValues).toBe('Low, Medium, High')
   })
 
   it('handles derivation readings (predicate :=)', async () => {
@@ -195,7 +177,8 @@ describe('ingestClaims', () => {
     const result = await ingestClaims(db as any, { claims, domainId: 'd1' })
 
     expect(result.readings).toBe(1)
-    expect(db.store.readings[0].text).toContain(':=')
+    const readings = batchEntities(result, 'Reading')
+    expect(readings[0].data.text).toContain(':=')
   })
 })
 
@@ -331,9 +314,10 @@ Each Customer has at most one Priority.
     expect(result.errors).toHaveLength(0)
 
     // Verify enum was ingested
-    const priorityNoun = db.store.nouns.find((n: any) => n.name === 'Priority')
+    const nouns = batchEntities(result, 'Noun')
+    const priorityNoun = nouns.find((n: any) => n.data.name === 'Priority')
     expect(priorityNoun).toBeDefined()
-    expect(priorityNoun.enumValues).toContain('Low')
+    expect(priorityNoun!.data.enumValues).toContain('Low')
   })
 
   // SPD-1 ingestion tests moved to spd-1 repo (tests belong with fixtures)

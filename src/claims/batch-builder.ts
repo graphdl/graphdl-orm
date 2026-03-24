@@ -36,6 +36,39 @@ export class BatchBuilder {
     return id
   }
 
+  /**
+   * Update an existing entity's data by merging new fields.
+   * Returns true if the entity was found and updated, false otherwise.
+   */
+  updateEntity(id: string, fields: Record<string, unknown>): boolean {
+    const entity = this.entities.find(e => e.id === id)
+    if (!entity) return false
+    entity.data = { ...entity.data, ...fields }
+    return true
+  }
+
+  /**
+   * Find an entity by id in the batch. Returns the entity or undefined.
+   */
+  findEntity(id: string): BatchEntity | undefined {
+    return this.entities.find(e => e.id === id)
+  }
+
+  /**
+   * Find entities by type and optional filter on data fields.
+   * Returns matching entities (useful for role/constraint lookups within the batch).
+   */
+  findEntities(type: string, filter?: Record<string, unknown>): BatchEntity[] {
+    return this.entities.filter(e => {
+      if (e.type !== type) return false
+      if (!filter) return true
+      for (const [key, value] of Object.entries(filter)) {
+        if (e.data[key] !== value) return false
+      }
+      return true
+    })
+  }
+
   /** Number of entities accumulated so far. */
   get entityCount(): number {
     return this.entities.length
