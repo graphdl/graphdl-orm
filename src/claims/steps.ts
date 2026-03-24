@@ -4,7 +4,7 @@
  * Each step operates on a shared Scope object and a GraphDLDBLike instance.
  * Extracted from the monolithic ingestClaims() in ingest.ts.
  */
-import type { GraphDLDBLike } from '../do-adapter'
+import type { GraphDLDBLike } from './ingest'
 import type { ExtractedClaims } from './ingest'
 import type { Scope } from './scope'
 import { addNoun, resolveNoun, addSchema, resolveSchema } from './scope'

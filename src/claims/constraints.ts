@@ -4,7 +4,7 @@
  * parseMultiplicity() — pure function, unchanged from original.
  * applyConstraints() — ported from Payload to GraphDLDBLike DO calls.
  */
-import type { GraphDLDBLike } from '../do-adapter'
+import type { GraphDLDBLike } from './ingest'
 
 export interface ConstraintDef {
   kind: 'UC' | 'MC' | 'IR' | 'SY' | 'AS' | 'TR' | 'IT' | 'ANS' | 'AC' | 'RF' | 'SS' | 'XC' | 'EQ' | 'OR' | 'XO'

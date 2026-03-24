@@ -1,16 +1,97 @@
 /**
- * DomainDB — pure functions for metamodel schema initialization and
- * collection CRUD. Holds only type-level data (nouns, readings,
- * constraints, etc.), not instance data.
+ * DomainDB — Durable Object that holds a single domain's metamodel
+ * and collection CRUD. Type-level data (nouns, readings, constraints, etc.).
  *
- * The DO class wrapping these functions will be added in a subsequent task.
+ * The Payload CMS abstraction layer (FIELD_MAP, FK_TARGET_TABLE, etc.)
+ * has been inlined as private constants pending full removal once all
+ * callers migrate to entity-type endpoints.
  */
 
 import { BOOTSTRAP_DDL } from './schema/bootstrap'
-import { COLLECTION_TABLE_MAP, FIELD_MAP, FK_TARGET_TABLE, NOUN_TABLE_MAP } from './collections'
-import { WIPE_TABLES } from './wipe-tables'
+import { COLLECTION_TABLE_MAP, NOUN_TABLE_MAP } from './collections'
 import { initBatchSchema, createBatch, getBatch, markCommitted, markFailed, getPendingBatches } from './batch-wal'
 import type { BatchEntity, Batch } from './batch-wal'
+
+// =========================================================================
+// Legacy Payload field maps (private — inlined from deleted collections.ts)
+// =========================================================================
+
+/** Column mapping per table. Maps Payload field names to SQLite column names. */
+const FIELD_MAP: Record<string, Record<string, string>> = {
+  nouns: { domain: 'domain_id', superType: 'super_type_id', objectType: 'object_type', promptText: 'prompt_text', enumValues: 'enum_values', valueType: 'value_type', worldAssumption: 'world_assumption', referenceScheme: 'reference_scheme' },
+  graph_schemas: { domain: 'domain_id' },
+  readings: { domain: 'domain_id', graphSchema: 'graph_schema_id' },
+  roles: { reading: 'reading_id', noun: 'noun_id', graphSchema: 'graph_schema_id', roleIndex: 'role_index' },
+  constraints: { domain: 'domain_id', setComparisonArgumentLength: 'set_comparison_argument_length' },
+  constraint_spans: { constraint: 'constraint_id', role: 'role_id', subsetAutofill: 'subset_autofill' },
+  apps: { organization: 'organization_id', appType: 'app_type', chatEndpoint: 'chat_endpoint' },
+  domains: { domainSlug: 'domain_slug', organization: 'organization_id', app: 'app_id' },
+  organizations: {},
+  org_memberships: { organization: 'organization_id', userEmail: 'user_email' },
+  state_machine_definitions: { domain: 'domain_id', noun: 'noun_id' },
+  statuses: { stateMachineDefinition: 'state_machine_definition_id', domain: 'domain_id' },
+  transitions: { from: 'from_status_id', to: 'to_status_id', eventType: 'event_type_id', verb: 'verb_id', stateMachineDefinition: 'state_machine_definition_id', domain: 'domain_id' },
+  guards: { transition: 'transition_id', graphSchema: 'graph_schema_id', domain: 'domain_id' },
+  event_types: { domain: 'domain_id' },
+  verbs: { status: 'status_id', transition: 'transition_id', graph: 'graph_id', agentDefinition: 'agent_definition_id', domain: 'domain_id' },
+  functions: { callbackUrl: 'callback_url', httpMethod: 'http_method', headers: 'headers', verb: 'verb_id', domain: 'domain_id' },
+  streams: { domain: 'domain_id' },
+  models: {},
+  agent_definitions: { model: 'model_id', domain: 'domain_id' },
+  agents: { agentDefinition: 'agent_definition_id', resource: 'resource_id', domain: 'domain_id' },
+  completions: { agent: 'agent_id', inputText: 'input_text', outputText: 'output_text', occurredAt: 'occurred_at', domain: 'domain_id' },
+  citations: { domain: 'domain_id', retrievalDate: 'retrieval_date' },
+  graph_citations: { graph: 'graph_id', citation: 'citation_id', domain: 'domain_id' },
+  graphs: { graphSchema: 'graph_schema_id', domain: 'domain_id', isDone: 'is_done' },
+  resources: { noun: 'noun_id', domain: 'domain_id', createdBy: 'created_by' },
+  resource_roles: { graph: 'graph_id', resource: 'resource_id', role: 'role_id', domain: 'domain_id' },
+  state_machines: { stateMachineDefinition: 'state_machine_definition_id', stateMachineType: 'state_machine_definition_id', currentStatus: 'current_status_id', stateMachineStatus: 'current_status_id', resource: 'resource_id', domain: 'domain_id' },
+  events: { eventType: 'event_type_id', stateMachine: 'state_machine_id', graph: 'graph_id', occurredAt: 'occurred_at', domain: 'domain_id' },
+  generators: { domain: 'domain_id', outputFormat: 'output_format', versionNum: 'version_num' },
+  guard_runs: { guard: 'guard_id', graph: 'graph_id', domain: 'domain_id' },
+}
+
+/** Maps FK column names to their target table. */
+const FK_TARGET_TABLE: Record<string, string> = {
+  app_id: 'apps',
+  domain_id: 'domains',
+  organization_id: 'organizations',
+  super_type_id: 'nouns',
+  graph_schema_id: 'graph_schemas',
+  reading_id: 'readings',
+  noun_id: 'nouns',
+  constraint_id: 'constraints',
+  role_id: 'roles',
+  state_machine_definition_id: 'state_machine_definitions',
+  from_status_id: 'statuses',
+  to_status_id: 'statuses',
+  event_type_id: 'event_types',
+  verb_id: 'verbs',
+  transition_id: 'transitions',
+  guard_id: 'guards',
+  citation_id: 'citations',
+  graph_id: 'graphs',
+  resource_id: 'resources',
+  state_machine_id: 'state_machines',
+  current_status_id: 'statuses',
+  model_id: 'models',
+  agent_definition_id: 'agent_definitions',
+  agent_id: 'agents',
+}
+
+/** All tables to wipe during reset, in leaf-to-root dependency order. */
+const WIPE_TABLES: readonly string[] = [
+  'cdc_events',
+  'generators', 'guard_runs', 'events', 'state_machines',
+  'resource_roles', 'graph_citations', 'resources', 'graphs',
+  'completions', 'agents', 'agent_definitions', 'models',
+  'citations',
+  'functions', 'streams', 'verbs',
+  'guards', 'transitions', 'statuses', 'event_types', 'state_machine_definitions',
+  'constraint_spans', 'constraints', 'roles', 'readings', 'graph_schemas',
+  'nouns',
+  'domains', 'apps', 'org_memberships', 'organizations',
+]
 
 // =========================================================================
 // Types
@@ -269,7 +350,7 @@ export function initDomainSchema(sql: SqlLike): void {
  *
  * Port of GraphDLDB.findInCollection for metamodel tables.
  */
-export function findInMetamodel(
+function findInMetamodel(
   sql: SqlLike,
   collection: string,
   where?: Record<string, any>,
@@ -325,7 +406,7 @@ export function findInMetamodel(
  *
  * Port of GraphDLDB.createInCollection for metamodel tables.
  */
-export function createInMetamodel(
+function createInMetamodel(
   sql: SqlLike,
   collection: string,
   data: Record<string, unknown>,
@@ -368,7 +449,7 @@ export function createInMetamodel(
  *
  * Port of GraphDLDB.updateInCollection for metamodel tables.
  */
-export function updateInMetamodel(
+function updateInMetamodel(
   sql: SqlLike,
   collection: string,
   id: string,
@@ -417,7 +498,7 @@ export function updateInMetamodel(
 /**
  * Get a single record by ID from a metamodel collection.
  */
-export function getFromMetamodel(
+function getFromMetamodel(
   sql: SqlLike,
   collection: string,
   id: string,
@@ -515,7 +596,7 @@ function cascadeDeleteDomain(sql: SqlLike, domainId: string): number {
 /**
  * Delete a record by ID from a metamodel collection, with cascade.
  */
-export function deleteFromMetamodel(
+function deleteFromMetamodel(
   sql: SqlLike,
   collection: string,
   id: string,
@@ -547,7 +628,7 @@ export function deleteFromMetamodel(
 /**
  * Inspect a table's schema (debug helper).
  */
-export function inspectTableSchema(
+function inspectTableSchema(
   sql: SqlLike,
   table: string,
 ): Record<string, any> {
@@ -569,7 +650,7 @@ export function inspectTableSchema(
 /**
  * Wipe all metamodel data for a domain.
  */
-export function wipeDomainMetamodelData(
+function wipeDomainMetamodelData(
   sql: SqlLike,
   domainId: string,
 ): { deleted: boolean; domainId: string; counts: Record<string, any> } {
@@ -600,7 +681,7 @@ export function wipeDomainMetamodelData(
 /**
  * Wipe all data from all tables (for testing/reset).
  */
-export function wipeAllMetamodelData(sql: SqlLike): void {
+function wipeAllMetamodelData(sql: SqlLike): void {
   try { sql.exec('PRAGMA foreign_keys = OFF') } catch { /* best effort */ }
   for (const table of WIPE_TABLES) {
     try { sql.exec(`DELETE FROM ${table}`) } catch { /* table may not exist yet */ }
@@ -619,7 +700,7 @@ export function wipeAllMetamodelData(sql: SqlLike): void {
  * tables, generates an OpenAPI schema, converts it to SQLite DDL, executes
  * the DDL, and caches the resulting table/field maps in the generators table.
  */
-export async function applyDomainSchema(
+async function applyDomainSchema(
   sql: SqlLike,
   domainId: string,
   precomputed?: { ddl: string[]; tableMap: Record<string, string>; fieldMap: Record<string, Record<string, string>> },

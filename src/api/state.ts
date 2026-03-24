@@ -11,7 +11,6 @@
 
 import { json, error } from 'itty-router'
 import type { Env } from '../types'
-import { COLLECTION_TABLE_MAP, FIELD_MAP } from '../collections'
 
 function getDB(env: Env) {
   const id = env.DOMAIN_DB.idFromName('graphdl-primary')
