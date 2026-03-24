@@ -1,9 +1,17 @@
 // crates/fol-engine/tests/integration.rs
+//
+// Integration tests use the global WASM state (load_ir + evaluate_response).
+// A test mutex serializes access to prevent race conditions when cargo test
+// runs tests in parallel.
 use fol_engine::{load_ir, evaluate_response};
 use serde_json::Value;
+use std::sync::Mutex;
+
+static TEST_MUTEX: Mutex<()> = Mutex::new(());
 
 #[test]
 fn test_full_pipeline_forbidden_text() {
+    let _lock = TEST_MUTEX.lock().unwrap();
     let ir_json = r#"{
         "domain": "test",
         "nouns": {
@@ -42,6 +50,7 @@ fn test_full_pipeline_forbidden_text() {
 
 #[test]
 fn test_full_pipeline_clean_response() {
+    let _lock = TEST_MUTEX.lock().unwrap();
     let ir_json = r#"{
         "domain": "test",
         "nouns": {
@@ -80,6 +89,7 @@ fn test_full_pipeline_clean_response() {
 
 #[test]
 fn test_full_pipeline_uniqueness_violation() {
+    let _lock = TEST_MUTEX.lock().unwrap();
     let ir_json = r#"{
         "domain": "test",
         "nouns": {
