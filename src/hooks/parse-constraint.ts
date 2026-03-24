@@ -7,7 +7,7 @@
  * Pure function — no DB or LLM dependency.
  */
 
-export type ConstraintKind = 'UC' | 'MC' | 'IR' | 'SY' | 'AS' | 'TR' | 'IT' | 'ANS' | 'AC' | 'RF' | 'SS' | 'XC' | 'EQ' | 'OR' | 'XO'
+export type ConstraintKind = 'UC' | 'MC' | 'FC' | 'IR' | 'SY' | 'AS' | 'TR' | 'IT' | 'ANS' | 'AC' | 'RF' | 'SS' | 'XC' | 'EQ' | 'OR' | 'XO'
 
 export interface ParsedConstraint {
   kind: ConstraintKind
@@ -28,6 +28,11 @@ export interface ParsedConstraint {
   clauses?: string[]
   /** External UC: spans roles from different fact types, joined through constrainedNoun */
   isExternal?: boolean
+  /** Frequency constraint: min and max occurrence count */
+  minOccurrence?: number
+  maxOccurrence?: number
+  /** Frequency constraint: the reading/population text */
+  populationText?: string
 }
 
 // Match noun names — may be multi-word with spaces (e.g., "Support Request", "API Product")
@@ -65,6 +70,10 @@ const SPANNING_UC = new RegExp(
 const TERNARY_UC = new RegExp(
   `^For each combination of ${NOUN} and ${NOUN},.*at most one ${NOUN}`
 )
+
+// Frequency constraint (NORMA population style):
+// "Each Activity in the population of "Department has for Activity a budget of MoneyAmt" occurs there exactly 2 times."
+const FREQUENCY_POP = /^Each ([A-Z][a-zA-Z0-9]*(?:\s+[A-Z][a-zA-Z0-9]*)*) in the population of [""\u201C](.+?)[""\u201D] occurs there (exactly|at least|at most) (\d+) times?/
 
 // External UC: "For each State and Name, at most one City resides in that State and has that Name."
 // Ternary n-1 UC: "For each Academic and Degree, that Academic obtained that Degree from at most one University."
@@ -136,6 +145,27 @@ export function parseConstraintText(text: string): ParsedConstraint[] | null {
     const inner = parseConstraintText(innerText)
     if (!inner) return null
     return inner.map(c => ({ ...c, modality: 'Deontic' as const, deonticOperator: operator }))
+  }
+
+  // Frequency constraint (NORMA population style):
+  // "Each Activity in the population of '...' occurs there exactly 2 times."
+  let fm = clean.match(FREQUENCY_POP)
+  if (fm) {
+    const noun = fm[1]
+    const populationText = fm[2]
+    const quantifier = fm[3].toLowerCase() // exactly | at least | at most
+    const n = parseInt(fm[4], 10)
+    const min = quantifier === 'at most' ? 1 : n
+    const max = quantifier === 'at least' ? undefined : n
+    return [{
+      kind: 'FC' as ConstraintKind,
+      modality: 'Alethic',
+      nouns: [noun],
+      constrainedNoun: noun,
+      minOccurrence: min,
+      maxOccurrence: max,
+      populationText,
+    }]
   }
 
   // "Each X has exactly one Y" → UC + MC

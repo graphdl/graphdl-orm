@@ -171,6 +171,20 @@ describe('parseConstraintText — NORMA verbalizations (University model)', () =
       )
     })
   })
+  // ── Frequency constraint ───────────────────────────────────────────
+
+  describe('frequency constraint', () => {
+    it('Each Activity in the population of "Department has for Activity a budget of MoneyAmt" occurs there exactly 2 times', () => {
+      const result = parseConstraintText(
+        'Each Activity in the population of "Department has for Activity a budget of MoneyAmt" occurs there exactly 2 times.'
+      )
+      expect(result).not.toBeNull()
+      expect(result![0].kind).toBe('FC')
+      expect(result![0].nouns).toContain('Activity')
+      expect(result![0]).toHaveProperty('minOccurrence', 2)
+      expect(result![0]).toHaveProperty('maxOccurrence', 2)
+    })
+  })
 })
 
 describe('parseSetComparisonBlock — NORMA verbalizations (University model)', () => {
