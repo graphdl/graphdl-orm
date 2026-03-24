@@ -68,6 +68,12 @@ const SUBTYPE_EXCLUSION = new RegExp(`^No (${N}) is both (?:a |an )?(${N}) and (
 // Subtype totality: "Each Person is a Male or a Female."
 const SUBTYPE_TOTALITY = new RegExp(`^Each (${N}) is (?:a |an )?(${N}) or (?:a |an )?(${N})\\.?$`, 'i')
 
+// Preferred identification (objectification):
+// 'This association with Model, Make provides the preferred identification scheme for MakeModel.'
+// 'This Code value provides the preferred identifier for Country.'
+const PREFERRED_ID_ASSOC = new RegExp(`^This association with\\s+(.+?)\\s+provides the preferred identification scheme for\\s+(${N})\\.?$`, 'i')
+const PREFERRED_ID_VALUE = new RegExp(`^This\\s+(${N})\\s+value provides the preferred identifier for\\s+(${N})\\.?$`, 'i')
+
 // Derivation rule: "X has Y := expression."
 const DERIVATION = /^(.+?)\s*:=\s*(.+?)\.?$/
 
@@ -111,7 +117,7 @@ export function parseFORML2(
 ): ParseResult {
   const warnings: string[] = []
   const unparsed: string[] = []
-  const nounMap = new Map<string, { name: string; objectType: 'entity' | 'value'; plural?: string; valueType?: string; enumValues?: string[]; refScheme?: string[] }>()
+  const nounMap = new Map<string, { name: string; objectType: 'entity' | 'value'; plural?: string; valueType?: string; enumValues?: string[]; refScheme?: string[]; objectifies?: string; }>()
   const readings: ParseResult['readings'] = []
   const constraints: ParseResult['constraints'] = []
   const subtypes: ParseResult['subtypes'] = []
@@ -252,6 +258,43 @@ export function parseFORML2(
         existing.enumValues = values
       } else {
         nounMap.set(name, { name, objectType: 'value', valueType: 'string', enumValues: values })
+      }
+      parsedLines++
+      continue
+    }
+
+    // ── Preferred identification (objectification) ─────────────────
+    // "This association with Model, Make provides the preferred identification scheme for MakeModel."
+    m = line.replace(/\.$/, '').match(PREFERRED_ID_ASSOC)
+    if (m) {
+      const roleNouns = m[1].split(/,/).map(s => s.trim()).filter(Boolean)
+      const nounName = m[2]
+      if (!nounMap.has(nounName)) {
+        nounMap.set(nounName, { name: nounName, objectType: 'entity', refScheme: roleNouns })
+      } else {
+        nounMap.get(nounName)!.refScheme = roleNouns
+      }
+      // Find the reading that involves exactly these role nouns — mark for ID sharing
+      const matchingReading = readings.find(r =>
+        roleNouns.every(n => r.nouns.includes(n)) && r.nouns.length === roleNouns.length
+      )
+      if (matchingReading) {
+        const existing = nounMap.get(nounName)!
+        existing.objectifies = matchingReading.text
+      }
+      parsedLines++
+      continue
+    }
+
+    // "This Code value provides the preferred identifier for Country."
+    m = line.replace(/\.$/, '').match(PREFERRED_ID_VALUE)
+    if (m) {
+      const valueName = m[1]
+      const nounName = m[2]
+      if (!nounMap.has(nounName)) {
+        nounMap.set(nounName, { name: nounName, objectType: 'entity', refScheme: [valueName] })
+      } else {
+        nounMap.get(nounName)!.refScheme = [valueName]
       }
       parsedLines++
       continue

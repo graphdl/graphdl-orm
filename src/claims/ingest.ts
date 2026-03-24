@@ -23,6 +23,7 @@ export interface ExtractedClaims {
     pattern?: string
     worldAssumption?: 'closed' | 'open'
     refScheme?: string[]
+    objectifies?: string
   }>
   readings: Array<{
     text: string
@@ -81,8 +82,20 @@ export async function ingestClaims(
 
   const nouns = await ingestNouns(db, claims.nouns, domainId, scope)
   await ingestSubtypes(db, claims.subtypes || [], domainId, scope)
+
+  // Build objectification map: reading text → noun ID
+  // For nouns with objectifies, map the reading text to the noun's ID
+  // so the graph schema shares the noun's identity (Graph Schema IS a Noun)
+  const objectificationMap = new Map<string, string>()
+  for (const noun of claims.nouns) {
+    if (noun.objectifies) {
+      const nounRecord = scope.nouns.get(`${domainId}:${noun.name}`)
+      if (nounRecord) objectificationMap.set(noun.objectifies, nounRecord.id)
+    }
+  }
+
   const nounsBefore = scope.nouns.size
-  const readings = await ingestReadings(db, claims.readings, domainId, scope)
+  const readings = await ingestReadings(db, claims.readings, domainId, scope, objectificationMap)
   const autoCreatedNouns = scope.nouns.size - nounsBefore
   await ingestConstraints(db, claims.constraints || [], domainId, scope)
   const stateMachines = await ingestTransitions(db, claims.transitions || [], domainId, scope)
@@ -141,7 +154,14 @@ export async function ingestProject(
   }
   // Step 3: All readings
   for (const { domainId, claims } of domains) {
-    counters.get(domainId)!.readings = await ingestReadings(db, claims.readings, domainId, scope)
+    const objMap = new Map<string, string>()
+    for (const noun of claims.nouns) {
+      if (noun.objectifies) {
+        const rec = scope.nouns.get(`${domainId}:${noun.name}`)
+        if (rec) objMap.set(noun.objectifies, rec.id)
+      }
+    }
+    counters.get(domainId)!.readings = await ingestReadings(db, claims.readings, domainId, scope, objMap.size > 0 ? objMap : undefined)
   }
   // Step 4: All constraints
   for (const { domainId, claims } of domains) {
