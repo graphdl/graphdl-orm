@@ -133,7 +133,8 @@ export const BOOTSTRAP_DDL: string[] = [
   reading_id TEXT REFERENCES readings(id),
   noun_id TEXT REFERENCES nouns(id),
   graph_schema_id TEXT REFERENCES graph_schemas(id),
-  role_index INTEGER NOT NULL DEFAULT 0
+  role_index INTEGER NOT NULL DEFAULT 0,
+  name TEXT
 )`,
 
   `CREATE INDEX IF NOT EXISTS idx_roles_reading ON roles(reading_id)`,
