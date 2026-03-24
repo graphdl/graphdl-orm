@@ -432,12 +432,13 @@ export function parseFORML2(
     }
 
     // ── Set-comparison block ─────────────────────────────────────────
-    // Look ahead for multi-line block
+    // Look ahead for multi-line block, or try single line (e.g., subset constraints)
     const blockEnd = findBlockEnd(lines, i)
-    if (blockEnd > i) {
-      const block = lines.slice(i, blockEnd + 1).join('\n')
-      const scBlock = parseSetComparisonBlock(block)
-      if (scBlock) {
+    const blockText = blockEnd > i
+      ? lines.slice(i, blockEnd + 1).join('\n')
+      : line  // single-line set-comparison (e.g., "If some X... then that X...")
+    const scBlock = parseSetComparisonBlock(blockText)
+    if (scBlock) {
         for (const name of scBlock.nouns) {
           if (!nounMap.has(name)) nounMap.set(name, { name, objectType: 'entity' })
         }
@@ -446,14 +447,13 @@ export function parseFORML2(
           modality: scBlock.modality,
           reading: '',
           roles: [],
-          text: block.trim(),
+          text: blockText.trim(),
           clauses: scBlock.clauses,
           entity: scBlock.entity,
         })
-        i = blockEnd // skip the block lines
+        if (blockEnd > i) i = blockEnd // skip multi-line block lines
         parsedLines++
         continue
-      }
     }
 
     // ── Standalone constraint (in ## Constraints or ## Deontic Constraints section) ──

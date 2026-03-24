@@ -289,26 +289,22 @@ For each Message, exactly one of the following holds:
     expect(xo!.entity).toBe('Message')
   })
 
-  it('parses single-line SS-style text as a reading (not a constraint)', () => {
-    // Single-line "If some..." is not detected as a set-comparison block
-    // because parseSetComparisonBlock only runs on multi-line blocks.
-    // It falls through to reading parsing instead.
+  it('parses single-line SS (subset) constraint correctly', () => {
+    // "If some X... then that X..." is a subset constraint per Halpin
     const existingNouns = [
-      { name: 'Message', id: 'n1' },
-      { name: 'Lead', id: 'n2' },
-      { name: 'SalesRep', id: 'n3' },
+      { name: 'Academic', id: 'n1' },
+      { name: 'Department', id: 'n2' },
     ]
-    const text = `If some Message has Lead then that Message has SalesRep.`
+    const text = `## Constraints
+If some Academic heads some Department then that Academic works for that Department.`
 
     const result = parseFORML2(text, existingNouns)
 
-    // Parsed as a reading, not an SS constraint
-    expect(result.readings).toHaveLength(1)
-    expect(result.constraints.filter(c => c.kind === 'SS')).toHaveLength(0)
-    // Nouns are still extracted
-    expect(result.nouns.find(n => n.name === 'Message')).toBeDefined()
-    expect(result.nouns.find(n => n.name === 'Lead')).toBeDefined()
-    expect(result.nouns.find(n => n.name === 'SalesRep')).toBeDefined()
+    // Parsed as SS constraint
+    const ss = result.constraints.filter(c => c.kind === 'SS')
+    expect(ss).toHaveLength(1)
+    expect(ss[0].text).toContain('Academic')
+    expect(ss[0].text).toContain('Department')
   })
 
   it('handles "Each X has some Y" as MC', () => {
@@ -363,14 +359,16 @@ If some Message has Lead then that Message has SalesRep.`
 
     const result = parseFORML2(text, existingNouns)
 
-    // Three readings: two fact types + the single-line "If some..." falls through as a reading
-    expect(result.readings).toHaveLength(3)
+    // Two readings (fact types); the "If some..." line is parsed as SS constraint
+    expect(result.readings).toHaveLength(2)
 
-    // 2 UCs from readings + 1 XO (single-line SS is parsed as reading, not constraint)
+    // 2 UCs from readings + 1 XO + 1 SS
     const uc = result.constraints.filter(c => c.kind === 'UC')
     const xo = result.constraints.filter(c => c.kind === 'XO')
+    const ss = result.constraints.filter(c => c.kind === 'SS')
     expect(uc).toHaveLength(2)
     expect(xo).toHaveLength(1)
+    expect(ss).toHaveLength(1)
 
     // All nouns accumulated
     expect(result.nouns.find(n => n.name === 'Message')).toBeDefined()
