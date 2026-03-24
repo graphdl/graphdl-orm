@@ -238,17 +238,34 @@ Invalid transitions return an error with the list of valid events from the curre
 
 ## Constraint Evaluation
 
-Validate data against business rules using the FOL engine (Rust/WASM):
+The FOL engine (Rust compiled to WASM) evaluates all ORM2 constraint types against a population:
 
 ```bash
 curl -X POST https://graphdl-orm.dotdo.workers.dev/api/evaluate \
   -H 'Content-Type: application/json' \
   -d '{
     "domainId": "uuid",
-    "response": { "text": "...", "fields": { "priority": "High" } }
+    "response": { "text": "..." },
+    "population": { "facts": { "ft1": [{ "factTypeId": "ft1", "bindings": [["Customer", "c1"], ["Name", "Alice"]] }] } }
   }'
-# → [{ "constraintId": "...", "text": "Each Support Request has exactly one Priority", "violation": "..." }]
+# → { "violations": [{ "constraintId": "...", "constraintText": "...", "detail": "..." }] }
 ```
+
+**Evaluated constraint types:**
+
+| Kind | Evaluation |
+|------|-----------|
+| UC | Uniqueness — single-role column uniqueness or compound tuple uniqueness |
+| MC | Mandatory — every entity instance must participate in the constrained role |
+| FC | Frequency — occurrence count within min/max bounds |
+| VC | Value — population values must be in the noun's enum set |
+| IR, AS, SY, AT, IT, TR, AC | Ring constraints — irreflexive, asymmetric, symmetric, antisymmetric, intransitive, transitive, acyclic |
+| SS | Subset — tuple-based join-path subset (pop(rs1) ⊆ pop(rs2)) |
+| EQ | Equality — bidirectional subset (pop(rs1) = pop(rs2)) |
+| XO, XC, OR | Set-comparison — exclusive-or, exclusion, inclusive-or |
+| Deontic | Text-matching for forbidden/obligatory content in response text |
+
+The engine also supports forward inference (derivation rules to fixed point), dual world assumptions (CWA/OWA), and noun knowledge synthesis.
 
 ### Synthesis
 
