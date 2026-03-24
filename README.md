@@ -388,6 +388,22 @@ GET    /health                         — health check
 GET    /ws                             — WebSocket (live events)
 ```
 
+## FOL Engine (`crates/fol-engine/`)
+
+A first-order logic reasoning engine compiled to WebAssembly. Five capabilities:
+
+**Constraint evaluation** — all ORM2 constraint types (UC, MC, FC, VC, ring, subset, equality, set-comparison, deontic). Constraints compile to pure functions at load time per Backus's FP algebra. Evaluation is function application — no dispatch, no branching on kind.
+
+**Forward inference** — derivation rules applied iteratively until fixed point. Subtype inheritance, modus ponens, transitivity, closed-world negation.
+
+**Backward chaining (proof engine)** — given a goal fact, work backward through derivation rules to build a proof tree. Returns Proven (derivation chain exists), Disproven (CWA — absence = false), or Unknown (OWA — absence ≠ false).
+
+**Induction** — given observed facts, discover the constraints and derivation rules that govern the data. UC/MC/FC/SS induction from population analysis. Derivation rule induction by join pattern matching. Confidence scores based on population significance.
+
+**Dual world assumptions** — Closed World (absence = false) for structural facts. Open World (absence = unknown) for rights and permissions. The 9th Amendment is an OWA declaration.
+
+The complete reasoning cycle: **Observe** (facts) → **Induce** (rules) → **Deduce** (forward chain) → **Prove** (backward chain) → **Evaluate** (constraint check).
+
 ## Architecture
 
 The framework runs on Cloudflare Workers with three Durable Object types, each backed by SQLite:
