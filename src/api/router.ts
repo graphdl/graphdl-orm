@@ -12,6 +12,7 @@ import { createWithHook, refreshNouns, type HookContext, COLLECTION_HOOKS } from
 import { getInitialState, getValidTransitions, applyTransition } from '../worker/state-machine'
 import { handleConceptualQuery } from './conceptual-query'
 import { deriveOnWrite } from '../worker/derive-on-write'
+import { induceConstraints } from '../csdp/induce'
 
 // ── DO helpers ───────────────────────────────────────────────────────
 
@@ -216,6 +217,16 @@ router.get('/ws', async (request, env: Env) => {
 router.post('/api/generate', handleGenerate)
 router.post('/api/evaluate', handleEvaluate)
 router.post('/api/synthesize', (request, env) => handleSynthesize(request, env))
+
+// ── Induction (discover constraints from population) ─────────────────
+router.post('/api/induce', async (request) => {
+  const body = await request.json() as { ir?: any; population?: any }
+  if (!body.ir || !body.population) {
+    return error(400, { errors: [{ message: 'ir and population are required' }] })
+  }
+  const result = induceConstraints(JSON.stringify(body.ir), JSON.stringify(body.population))
+  return json(result)
+})
 
 // ── Facts (instance-level graph creation) ────────────────────────────
 router.post('/api/facts', async (request, env: Env) => {
