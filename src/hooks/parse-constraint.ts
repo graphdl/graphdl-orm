@@ -50,6 +50,12 @@ const AT_LEAST_ONE = new RegExp(
   `^Each ${NOUN} .+? at least one ${NOUN}`
 )
 
+// "For each B, at most one A [verb] that B." — inverse UC on B's role
+// NORMA verbalization: "For each Chair, at most one Academic holds that Chair."
+const INVERSE_UC = new RegExp(
+  `^For each ${NOUN},\\s*at most one ${NOUN} .+? that ${NOUN}`
+)
+
 // "For each pair of X and Y, that X ... that Y at most once."
 const SPANNING_UC = new RegExp(
   `^For each pair of ${NOUN} and ${NOUN},.*at most once`
@@ -61,9 +67,9 @@ const TERNARY_UC = new RegExp(
 )
 
 // External UC: "For each State and Name, at most one City resides in that State and has that Name."
-// The (Noun1, Noun2...) combination uniquely identifies Entity across multiple fact types.
-// We capture the "For each ..." prefix and the entity after "at most one" separately.
-const EXTERNAL_UC = /^For each (.+?),\s*at most one ([A-Z][a-zA-Z0-9]*(?:\s+[A-Z][a-zA-Z0-9]*)*)/
+// Ternary n-1 UC: "For each Academic and Degree, that Academic obtained that Degree from at most one University."
+// Both patterns start with "For each X and Y," and contain "at most one Z" somewhere.
+const FOR_EACH_UC = /^For each (.+?),\s*.+?at most one ([A-Z][a-zA-Z0-9]*(?:\s+[A-Z][a-zA-Z0-9]*)*)/
 
 // Ring constraints — all operate on binary facts where subject and object are the same type
 // Subscripted noun: PascalCase word optionally followed by a digit (e.g., Person1, Person2)
@@ -74,9 +80,9 @@ function stripSubscript(noun: string): string {
   return noun.replace(/\d+$/, '')
 }
 
-// "No X [verb] itself."
+// "No X [verb] itself." or "No X [verb] the same X."
 const RING_IRREFLEXIVE = new RegExp(
-  `^No ${RING_NOUN} .+? itself`
+  `^No ${RING_NOUN} .+? (?:itself|the same ${RING_NOUN})`
 )
 // "If X1 [verb] X2, then X2 is not [verb] X1" / "If X1 [verb] X2, then X2 [verb] not X1"
 const RING_ASYMMETRIC = new RegExp(
@@ -155,15 +161,22 @@ export function parseConstraintText(text: string): ParsedConstraint[] | null {
     return [{ kind: 'MC', modality: 'Alethic', nouns: [m[1], m[2]], constrainedNoun: m[1] }]
   }
 
-  // External UC: "For each State and Name, at most one City resides in that State and has that Name."
-  // The identifying nouns come from different fact types, joined through the entity.
-  m = clean.match(EXTERNAL_UC)
+  // Inverse UC: "For each Chair, at most one Academic holds that Chair."
+  // UC on B's role — the noun after "For each" is the constrained noun.
+  m = clean.match(INVERSE_UC)
+  if (m) {
+    // m[1] = constrained noun (B), m[2] = entity (A), m[3] = should match m[1]
+    return [{ kind: 'UC', modality: 'Alethic', nouns: [m[2], m[1]], constrainedNoun: m[1] }]
+  }
+
+  // "For each X and Y, ... at most one Z ..." — external UC or ternary n-1 UC
+  m = clean.match(FOR_EACH_UC)
   if (m) {
     // Parse the "For each X and Y and Z" part to get identifying nouns
     const identifyingNounsPart = m[1]
     const entityNoun = m[2]
     const identifyingNouns = identifyingNounsPart
-      .split(/\s*(?:,\s*(?:and\s+)?|(?:^|,\s*)and\s+)\s*/i)
+      .split(/\s*(?:,\s*(?:and\s+)?|\band\b)\s*/i)
       .map(s => s.trim())
       .filter(Boolean)
 
