@@ -88,6 +88,39 @@ export function processBinarySchemas(
   examples: Graph[],
   graphSchemas: GraphSchema[],
 ): void {
+  // Per Halpin p.416-420: for 1:1 fact types, only one side gets the FK.
+  // Detect 1:1 by finding graph schemas with single-role UC on BOTH roles.
+  // The preferred side is: mandatory > more other roles > first role.
+  const singleRoleSpans = constraintSpans.filter((cs) => cs.roles?.length === 1)
+  const ucBySchema = new Map<string, string[]>() // graphSchemaId → [constrainedRoleId, ...]
+  for (const cs of singleRoleSpans) {
+    const role = cs.roles[0]
+    const gsId = typeof role.graphSchema === 'string' ? role.graphSchema : role.graphSchema?.id
+    if (gsId) {
+      const roles = ucBySchema.get(gsId) || []
+      roles.push(role.id)
+      ucBySchema.set(gsId, roles)
+    }
+  }
+  // For 1:1 schemas (two single-role UCs on same schema), pick the preferred side
+  const skipRoles = new Set<string>()
+  for (const [gsId, roleIds] of ucBySchema) {
+    if (roleIds.length === 2) {
+      // 1:1 detected — skip the second role (prefer the first/mandatory side)
+      const gs = graphSchemas.find((g) => g.id === gsId)
+      if (gs?.roles?.docs?.length === 2) {
+        const role0 = gs.roles.docs[0]
+        const role1 = gs.roles.docs[1]
+        // Prefer the mandatory side; if both or neither mandatory, prefer role 0
+        if (role1.required && !role0.required) {
+          skipRoles.add(role0.id) // role1 is mandatory, put FK there
+        } else {
+          skipRoles.add(role1.id) // role0 is mandatory or default, put FK there
+        }
+      }
+    }
+  }
+
   for (const { propertySchema, subjectRole } of constraintSpans
     .filter((cs) => cs.roles?.length === 1)
     .map((cs) => {
@@ -99,6 +132,9 @@ export function processBinarySchemas(
       return { propertySchema, subjectRole: propertySchema ? constrainedRole : undefined }
     })) {
     if (!subjectRole || !propertySchema) continue
+
+    // Skip the non-preferred side of 1:1 fact types (Halpin RMAP)
+    if (skipRoles.has(subjectRole.id)) continue
 
     const subject = resolveNoun(subjectRole.noun?.value, nouns)
     if (!subject) continue
