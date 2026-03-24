@@ -56,6 +56,48 @@ export interface ListResult {
 export interface PaginationOpts {
   limit?: number
   page?: number
+  depth?: number
+}
+
+export interface DepthOpts {
+  depth?: number
+  getStub?: (id: string) => EntityReadStub
+}
+
+// ---------------------------------------------------------------------------
+// populateDepthForEntity
+// ---------------------------------------------------------------------------
+
+/**
+ * Scan entity data for fields ending in `Id` (e.g., `graphSchemaId`).
+ * For each, do a secondary fan-out to resolve the referenced entity.
+ * The resolved object is added alongside the original ID field.
+ */
+export async function populateDepthForEntity(
+  entity: { id: string; type: string; data: Record<string, unknown>; version: number },
+  depth: number,
+  getStub: (id: string) => EntityReadStub,
+): Promise<Record<string, unknown>> {
+  if (depth <= 0) return entity.data
+
+  const populated = { ...entity.data }
+  for (const [key, value] of Object.entries(populated)) {
+    if (key.endsWith('Id') && typeof value === 'string') {
+      try {
+        const refStub = getStub(value)
+        const refEntity = await refStub.get()
+        if (refEntity) {
+          populated[key.replace(/Id$/, '')] = {
+            id: refEntity.id,
+            ...refEntity.data,
+          }
+        }
+      } catch {
+        /* leave as ID if unreachable */
+      }
+    }
+  }
+  return populated
 }
 
 // ---------------------------------------------------------------------------
@@ -106,6 +148,16 @@ export async function handleListEntities(
     }
   }
 
+  // Depth population
+  const depth = opts?.depth ?? 0
+  if (depth >= 1) {
+    await Promise.all(
+      docs.map(async (doc) => {
+        doc.data = await populateDepthForEntity(doc, depth, getStub)
+      }),
+    )
+  }
+
   // Pagination
   const totalDocs = docs.length
   const offset = (page - 1) * limit
@@ -131,12 +183,20 @@ export async function handleListEntities(
 /**
  * Fetch a single entity from its EntityDB DO.
  * Returns null if not found or soft-deleted.
+ * When depth >= 1, resolves Id-suffixed fields to full entity objects.
  */
 export async function handleGetEntity(
   stub: EntityReadStub,
+  opts?: DepthOpts,
 ): Promise<EntityRecord | null> {
   const entity = await stub.get()
   if (!entity || entity.deletedAt) return null
+
+  const depth = opts?.depth ?? 0
+  if (depth >= 1 && opts?.getStub) {
+    entity.data = await populateDepthForEntity(entity, depth, opts.getStub)
+  }
+
   return entity
 }
 
