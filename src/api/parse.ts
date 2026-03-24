@@ -111,7 +111,7 @@ export function parseFORML2(
 ): ParseResult {
   const warnings: string[] = []
   const unparsed: string[] = []
-  const nounMap = new Map<string, { name: string; objectType: 'entity' | 'value'; plural?: string; valueType?: string; enumValues?: string[] }>()
+  const nounMap = new Map<string, { name: string; objectType: 'entity' | 'value'; plural?: string; valueType?: string; enumValues?: string[]; refScheme?: string[] }>()
   const readings: ParseResult['readings'] = []
   const constraints: ParseResult['constraints'] = []
   const subtypes: ParseResult['subtypes'] = []
@@ -210,16 +210,18 @@ export function parseFORML2(
     if (m) {
       const name = m[1]
       const refSchemeRaw = m[2]
-      nounMap.set(name, { name, objectType: 'entity' })
+      const nounEntry: Record<string, any> = { name, objectType: 'entity' }
       if (refSchemeRaw) {
         // Parse compound ref schemes: ".Layer, .Timestamp" — comma-separated value type IDs
         const parts = refSchemeRaw.split(/,/).map(p => p.trim().replace(/^\./, '').trim()).filter(Boolean)
+        nounEntry.refScheme = parts
         for (const part of parts) {
           if (part && !nounMap.has(part)) {
             nounMap.set(part, { name: part, objectType: 'value', valueType: 'string' })
           }
         }
       }
+      nounMap.set(name, nounEntry)
       parsedLines++
       continue
     }
