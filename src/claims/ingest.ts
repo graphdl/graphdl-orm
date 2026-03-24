@@ -22,6 +22,7 @@ export interface ExtractedClaims {
     maximum?: number
     pattern?: string
     worldAssumption?: 'closed' | 'open'
+    refScheme?: string[]
   }>
   readings: Array<{
     text: string

@@ -76,6 +76,11 @@ export async function ingestNouns(
         data.worldAssumption = 'open'
       }
 
+      // Reference scheme: store as JSON array of value type noun names
+      if (noun.refScheme?.length) {
+        data.referenceScheme = JSON.stringify(noun.refScheme)
+      }
+
       const doc = await ensureNoun(db, noun.name, data, domainId)
       addNoun(scope, { id: doc.id as string, name: noun.name, domainId })
       count++

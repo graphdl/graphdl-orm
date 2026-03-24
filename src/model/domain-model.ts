@@ -207,6 +207,18 @@ export class DomainModel {
       map.set(noun.name, noun)
     }
 
+    // Resolve reference schemes: JSON array of noun names → NounDef[]
+    for (const row of rows) {
+      if (!row.reference_scheme) continue
+      const noun = map.get(row.name)
+      if (!noun) continue
+      try {
+        const names: string[] = JSON.parse(row.reference_scheme)
+        const resolved = names.map(n => map.get(n)).filter((n): n is NounDef => !!n)
+        if (resolved.length > 0) noun.referenceScheme = resolved
+      } catch { /* invalid JSON — skip */ }
+    }
+
     // Default supertype: entity nouns without an explicit supertype inherit from
     // the core root entity for their kind. This ensures domain entities like
     // SupportRequest → Request → Resource and get core properties (state machines).
