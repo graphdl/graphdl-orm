@@ -469,8 +469,16 @@ export function parseFORML2(
             return clauseNouns.length >= 2 && clauseNouns.every(n => r.nouns.includes(n))
           })
 
+          // Infer kind from the inner clause text — don't default to UC
+          const inferredKind = /at most one/i.test(innerClause) ? 'UC' as const
+            : /exactly one/i.test(innerClause) ? 'UC' as const
+            : /at least one|some\b/i.test(innerClause) ? 'MC' as const
+            : /more than one/i.test(innerClause) ? 'UC' as const
+            : operator === 'forbidden' ? 'UC' as const  // "forbidden that X" often means UC violation
+            : operator === 'obligatory' ? 'MC' as const  // "obligatory that X" often means MC
+            : 'MC' as const  // permitted = informational
           constraints.push({
-            kind: 'UC',
+            kind: inferredKind,
             modality: 'Deontic',
             deonticOperator: operator,
             reading: matchedReading?.text || '',
@@ -499,12 +507,12 @@ export function parseFORML2(
       // Any remaining line in a constraints section should NOT fall through to readings.
       // Store as a generic constraint with the verbalization text preserved.
       if (/^Each\s/i.test(line) || /^For each\s/i.test(line)) {
-        // Attempt to infer kind from text pattern
+        // Infer kind from text pattern — don't default to UC for unrecognized patterns
         const kind = /exactly one/i.test(line) ? 'UC' as const
           : /at most one/i.test(line) ? 'UC' as const
           : /at least one/i.test(line) ? 'MC' as const
           : /some/i.test(line) ? 'MC' as const
-          : 'UC' as const
+          : 'MC' as const
         constraints.push({
           kind,
           modality: section === 'deontic-constraints' ? 'Deontic' : 'Alethic',
