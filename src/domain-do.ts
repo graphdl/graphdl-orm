@@ -9,6 +9,8 @@
 import { BOOTSTRAP_DDL } from './schema/bootstrap'
 import { COLLECTION_TABLE_MAP, FIELD_MAP, FK_TARGET_TABLE, NOUN_TABLE_MAP } from './collections'
 import { WIPE_TABLES } from './wipe-tables'
+import { initBatchSchema, createBatch, getBatch, markCommitted, markFailed, getPendingBatches } from './batch-wal'
+import type { BatchEntity, Batch } from './batch-wal'
 
 // =========================================================================
 // Types
@@ -747,6 +749,8 @@ export class DomainDB extends DurableObject {
     `)
     this.sql.exec('CREATE INDEX IF NOT EXISTS idx_cdc_events_timestamp ON cdc_events(timestamp)')
     this.sql.exec('CREATE INDEX IF NOT EXISTS idx_cdc_events_table ON cdc_events(table_name, entity_id)')
+    // Batch WAL table — coexists with metamodel tables, will replace them in Task 18
+    initBatchSchema(this.ctx.storage.sql)
     this.initialized = true
   }
 
@@ -789,6 +793,42 @@ export class DomainDB extends DurableObject {
   async setDomainId(id: string): Promise<void> {
     this.ensureInit()
     this.domainId = id
+  }
+
+  // -----------------------------------------------------------------------
+  // Batch WAL methods
+  // -----------------------------------------------------------------------
+
+  /** Create a new batch in the WAL with pending status. */
+  async commitBatch(entities: BatchEntity[]): Promise<Batch> {
+    this.ensureInit()
+    const domain = this.domainId
+    if (!domain) throw new Error('DomainDB: domainId required for commitBatch (call setDomainId first)')
+    return createBatch(this.ctx.storage.sql, domain, entities)
+  }
+
+  /** Retrieve a batch by ID. */
+  async getBatch(id: string): Promise<Batch | null> {
+    this.ensureInit()
+    return getBatch(this.ctx.storage.sql, id)
+  }
+
+  /** Mark a batch as committed. */
+  async markBatchCommitted(id: string): Promise<void> {
+    this.ensureInit()
+    markCommitted(this.ctx.storage.sql, id)
+  }
+
+  /** Mark a batch as failed with an error message. */
+  async markBatchFailed(id: string, error: string): Promise<void> {
+    this.ensureInit()
+    markFailed(this.ctx.storage.sql, id, error)
+  }
+
+  /** Return all pending batches ordered by creation time (oldest first). */
+  async getPendingBatches(): Promise<Batch[]> {
+    this.ensureInit()
+    return getPendingBatches(this.ctx.storage.sql)
   }
 
   /** Find records in a metamodel collection. */
