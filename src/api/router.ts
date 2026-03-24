@@ -13,6 +13,7 @@ import { getInitialState, getValidTransitions, applyTransition } from '../worker
 import { handleConceptualQuery } from './conceptual-query'
 import { deriveOnWrite } from '../worker/derive-on-write'
 import { induceConstraints } from '../csdp/induce'
+import { handleListEntities, handleGetEntity, handleCreateEntity, handleDeleteEntity } from './entity-routes'
 
 // ── DO helpers ───────────────────────────────────────────────────────
 
@@ -489,7 +490,7 @@ router.post('/api/entities/:noun/:id/transition', async (request, env: Env) => {
   })
 })
 
-// ── Entity queries (3NF tables) ───────────────────────────────────────
+// ── Entity queries (fan-out via pure handlers) ───────────────────────
 router.get('/api/entities/:noun', async (request, env: Env) => {
   const { noun } = request.params
   const url = new URL(request.url)
@@ -499,7 +500,26 @@ router.get('/api/entities/:noun', async (request, env: Env) => {
   const limit = parseInt(url.searchParams.get('limit') || '100', 10)
   const page = parseInt(url.searchParams.get('page') || '1', 10)
 
-  // Parse where params: where[field][op]=value
+  const registry = getRegistryDO(env, 'global') as any
+  const result = await handleListEntities(
+    noun,
+    domainId,
+    registry,
+    (id) => getEntityDO(env, id) as any,
+    { limit, page },
+  )
+
+  // Flatten entity data for backwards compat (spread data into top level)
+  const docs = result.docs.map((e) => ({
+    id: e.id,
+    type: e.type,
+    ...e.data,
+    version: e.version,
+    createdAt: e.createdAt,
+    updatedAt: e.updatedAt,
+  }))
+
+  // Client-side filtering by where params
   const where: Record<string, any> = {}
   for (const [key, val] of url.searchParams.entries()) {
     const m = key.match(/^where\[(\w+)\](?:\[(\w+)\])?$/)
@@ -509,56 +529,30 @@ router.get('/api/entities/:noun', async (request, env: Env) => {
       where[field] = { [op]: val }
     }
   }
-
-  // Get all entity IDs for this noun type from the Registry
-  const registry = getRegistryDO(env, 'global') as any
-  const allIds: string[] = await registry.getEntityIds(noun)
-
-  // Fetch each entity from its EntityDB DO
-  const allDocs: Record<string, unknown>[] = []
-  await Promise.all(
-    allIds.map(async (entityId: string) => {
-      const entityDO = getEntityDO(env, entityId) as any
-      const entity = await entityDO.get()
-      if (entity && !entity.deletedAt) {
-        allDocs.push({ id: entity.id, type: entity.type, ...entity.data, version: entity.version, createdAt: entity.createdAt, updatedAt: entity.updatedAt })
-      }
-    })
-  )
-
-  // Client-side filtering by where params
-  let filtered = allDocs
+  let filtered = docs
   for (const [field, condition] of Object.entries(where)) {
     if (typeof condition === 'object' && condition !== null && 'equals' in condition) {
       filtered = filtered.filter(doc => doc[field] === condition.equals)
     }
   }
 
-  // Pagination
-  const totalDocs = filtered.length
-  const offset = (page - 1) * limit
-  const docs = limit > 0 ? filtered.slice(offset, offset + limit) : filtered
-
   return json({
-    docs,
-    totalDocs,
-    limit,
-    page,
-    totalPages: limit > 0 ? Math.ceil(totalDocs / limit) : 1,
-    hasNextPage: limit > 0 && offset + limit < totalDocs,
-    hasPrevPage: page > 1,
+    docs: filtered,
+    totalDocs: result.totalDocs,
+    limit: result.limit,
+    page: result.page,
+    totalPages: result.totalPages,
+    hasNextPage: result.hasNextPage,
+    hasPrevPage: result.hasPrevPage,
+    ...(result.warnings && { warnings: result.warnings }),
   })
 })
 
 router.get('/api/entities/:noun/:id', async (request, env: Env) => {
   const { id } = request.params
 
-  const entityDO = getEntityDO(env, id) as any
-  const entity = await entityDO.get()
-
-  if (!entity || entity.deletedAt) {
-    return error(404, { errors: [{ message: 'Not Found' }] })
-  }
+  const entity = await handleGetEntity(getEntityDO(env, id) as any)
+  if (!entity) return error(404, { errors: [{ message: 'Not Found' }] })
 
   return json({
     id: entity.id,
@@ -584,16 +578,11 @@ router.patch('/api/entities/:noun/:id', async (request, env: Env) => {
 router.delete('/api/entities/:noun/:id', async (request, env: Env) => {
   const { noun, id } = request.params
 
-  const entityDO = getEntityDO(env, id) as any
-  const result = await entityDO.delete()
+  const registry = getRegistryDO(env, 'global') as any
+  const result = await handleDeleteEntity(id, getEntityDO(env, id) as any, registry, noun)
 
   if (!result) return error(404, { errors: [{ message: 'Not Found' }] })
-
-  // Deindex the entity in the Registry
-  const registry = getRegistryDO(env, 'global') as any
-  await registry.deindexEntity(noun, id)
-
-  return json({ id, deleted: true })
+  return json(result)
 })
 
 // ── Collection CRUD ──────────────────────────────────────────────────
