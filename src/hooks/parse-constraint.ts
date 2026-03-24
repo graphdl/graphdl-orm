@@ -125,6 +125,15 @@ const HAS_SOME = new RegExp(
   `^Each ${NOUN} .+? some ${NOUN}`
 )
 
+// Negative form: "It is impossible that the same A R more than one B" → UC on A's role
+// "It is impossible that more than one A R the same B" → UC on B's role
+const NEGATIVE_UC_SAME_FIRST = new RegExp(
+  `^It is impossible that the same ${NOUN} .+? more than one ${NOUN}`
+)
+const NEGATIVE_UC_SAME_LAST = new RegExp(
+  `^It is impossible that more than one ${NOUN} .+? the same ${NOUN}`
+)
+
 // Deontic wrappers
 const DEONTIC = /^It is (obligatory|forbidden|permitted) that (.+)$/i
 
@@ -135,6 +144,17 @@ export function parseConstraintText(text: string): ParsedConstraint[] | null {
   if (!text || !text.trim()) return null
 
   const clean = text.trim().replace(/\.$/, '')
+
+  // Negative form UC: "It is impossible that the same A R more than one B"
+  // Per ORM2 tech report: negative form of uniqueness constraint
+  let nm = clean.match(NEGATIVE_UC_SAME_FIRST)
+  if (nm) {
+    return [{ kind: 'UC', modality: 'Alethic', nouns: [nm[1], nm[2]], constrainedNoun: nm[1] }]
+  }
+  nm = clean.match(NEGATIVE_UC_SAME_LAST)
+  if (nm) {
+    return [{ kind: 'UC', modality: 'Alethic', nouns: [nm[1], nm[2]], constrainedNoun: nm[2] }]
+  }
 
   // Check for deontic wrapper first
   const deonticMatch = clean.match(DEONTIC)
