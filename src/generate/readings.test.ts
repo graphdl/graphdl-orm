@@ -252,7 +252,7 @@ describe('generateReadings', () => {
     // Both constraints are Alethic so they appear in ## Constraints section
     expect(result.text).toContain('## Constraints')
     expect(result.text).toContain('Each Order has at most one Quantity.')
-    expect(result.text).toContain('Each Order has at least one Quantity.')
+    expect(result.text).toContain('Each Order has some Quantity.')
   })
 
   it('does not annotate reading when constraint is on a different graphSchema', async () => {
