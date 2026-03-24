@@ -225,6 +225,22 @@ export function parseFORML2(
           if (part && !nounMap.has(part)) {
             nounMap.set(part, { name: part, objectType: 'value', valueType: 'string' })
           }
+          // Emit implicit binary: "Entity has RefValue" with 1:1 mandatory UC
+          // Per Halpin: (.ref) abbreviates a mandatory 1:1 binary reference type
+          const readingText = `${name} has ${part}`
+          readings.push({
+            text: readingText,
+            nouns: [name, part],
+            predicate: 'has',
+            multiplicity: '1:1',
+          })
+          // MC on entity role: each Entity has some RefValue
+          constraints.push({
+            kind: 'MC',
+            modality: 'Alethic',
+            reading: readingText,
+            roles: [0],
+          })
         }
       }
       nounMap.set(name, nounEntry)
