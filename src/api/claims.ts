@@ -21,18 +21,28 @@ function getDB(env: Env) {
   return env.DOMAIN_DB.get(id)
 }
 
-async function ensureDomain(db: any, slug: string, name?: string): Promise<Record<string, any>> {
-  const existing = await db.findInCollection('domains', {
-    domainSlug: { equals: slug },
-  }, { limit: 1 })
+function getRegistry(env: Env) {
+  return env.REGISTRY_DB.get(env.REGISTRY_DB.idFromName('global'))
+}
 
-  if (existing.docs.length) return existing.docs[0]
+/**
+ * Ensure a Domain entity exists for the given slug.
+ * Uses Registry to check for existing domain entity IDs, then EntityDB for storage.
+ */
+async function ensureDomain(env: Env, registry: any, slug: string, name?: string): Promise<Record<string, any>> {
+  const existingIds: string[] = await registry.getEntityIds('Domain', slug)
+  if (existingIds.length > 0) {
+    const entityDO = env.ENTITY_DB.get(env.ENTITY_DB.idFromName(existingIds[0])) as any
+    const entity = await entityDO.get()
+    if (entity) return { id: entity.id, ...entity.data }
+  }
 
-  return db.createInCollection('domains', {
-    domainSlug: slug,
-    name: name || slug,
-    visibility: 'private',
-  })
+  const id = crypto.randomUUID()
+  const data = { domainSlug: slug, name: name || slug, visibility: 'private' }
+  const entityDO = env.ENTITY_DB.get(env.ENTITY_DB.idFromName(id)) as any
+  await entityDO.put({ id, type: 'Domain', data })
+  await registry.indexEntity('Domain', id, slug)
+  return { id, ...data }
 }
 
 export async function handleClaims(request: Request, env: Env): Promise<Response> {
@@ -41,6 +51,7 @@ export async function handleClaims(request: Request, env: Env): Promise<Response
   }
 
   const db = getDB(env)
+  const registry = getRegistry(env) as any
   const body = await request.json() as Record<string, any>
 
   // Unwrap legacy { type: "claims", ... } wrapper
@@ -52,9 +63,9 @@ export async function handleClaims(request: Request, env: Env): Promise<Response
 
   // Batch: multiple domains
   if (domains?.length) {
-    // Ensure all domain records exist first
+    // Ensure all domain records exist first via Registry+EntityDB
     const domainRecords = await Promise.all(
-      domains.map(entry => ensureDomain(db as any, entry.slug, entry.name))
+      domains.map(entry => ensureDomain(env, registry, entry.slug, entry.name))
     )
     // Build input for ingestProject
     const projectDomains = domains.map((entry, i) => ({
@@ -78,7 +89,7 @@ export async function handleClaims(request: Request, env: Env): Promise<Response
     }
 
     const domain = domainSlug
-      ? await ensureDomain(db as any, domainSlug)
+      ? await ensureDomain(env, registry, domainSlug)
       : { id: domainId }
     const result = await ingestClaims(db as any, { claims, domainId: domain!.id })
     return json({ ...result, domainId: domain!.id })
@@ -89,35 +100,40 @@ export async function handleClaims(request: Request, env: Env): Promise<Response
 
 /**
  * GET /api/stats — domain statistics (nouns, readings, constraints per domain).
+ * Uses Registry entity counts instead of DomainDB queries.
  */
 export async function handleStats(request: Request, env: Env): Promise<Response> {
-  const db = getDB(env) as any
+  const registry = getRegistry(env) as any
 
-  const [allNouns, allReadings, allDomains, allSchemas, allConstraints] = await Promise.all([
-    db.findInCollection('nouns', {}, { limit: 0 }),
-    db.findInCollection('readings', {}, { limit: 0 }),
-    db.findInCollection('domains', {}, { limit: 100 }),
-    db.findInCollection('graph-schemas', {}, { limit: 0 }),
-    db.findInCollection('constraints', {}, { limit: 0 }),
+  const domainSlugs: string[] = await registry.listDomains()
+
+  // Count all entities globally (no domain filter)
+  const [allNounIds, allReadingIds, allSchemaIds, allConstraintIds] = await Promise.all([
+    registry.getEntityIds('Noun') as Promise<string[]>,
+    registry.getEntityIds('Reading') as Promise<string[]>,
+    registry.getEntityIds('GraphSchema') as Promise<string[]>,
+    registry.getEntityIds('Constraint') as Promise<string[]>,
   ])
 
+  // Per-domain counts
   const perDomain: Record<string, { nouns: number; readings: number }> = {}
-  for (const d of allDomains.docs) {
-    const slug = (d.domainSlug || d.id) as string
-    const [nouns, readings] = await Promise.all([
-      db.findInCollection('nouns', { domain: { equals: d.id } }, { limit: 0 }),
-      db.findInCollection('readings', { domain: { equals: d.id } }, { limit: 0 }),
-    ])
-    perDomain[slug] = { nouns: nouns.totalDocs, readings: readings.totalDocs }
-  }
+  await Promise.all(
+    domainSlugs.map(async (slug: string) => {
+      const [nounIds, readingIds] = await Promise.all([
+        registry.getEntityIds('Noun', slug) as Promise<string[]>,
+        registry.getEntityIds('Reading', slug) as Promise<string[]>,
+      ])
+      perDomain[slug] = { nouns: nounIds.length, readings: readingIds.length }
+    })
+  )
 
   return json({
     totals: {
-      domains: allDomains.totalDocs,
-      nouns: allNouns.totalDocs,
-      readings: allReadings.totalDocs,
-      graphSchemas: allSchemas.totalDocs,
-      constraints: allConstraints.totalDocs,
+      domains: domainSlugs.length,
+      nouns: allNounIds.length,
+      readings: allReadingIds.length,
+      graphSchemas: allSchemaIds.length,
+      constraints: allConstraintIds.length,
     },
     perDomain,
   })

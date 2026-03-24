@@ -737,11 +737,6 @@ function resolveConstrainedRole(
 
 // ── HTTP Handler ───────────────────────────────────────────────────
 
-function getDB(env: Env): DurableObjectStub {
-  const id = env.DOMAIN_DB.idFromName('graphdl-primary')
-  return env.DOMAIN_DB.get(id)
-}
-
 export async function handleParse(request: Request, env: Env): Promise<Response> {
   if (request.method !== 'POST') {
     return error(405, { errors: [{ message: 'Method not allowed' }] })
@@ -755,12 +750,15 @@ export async function handleParse(request: Request, env: Env): Promise<Response>
     return error(400, { errors: [{ message: 'domain is required' }] })
   }
 
-  // Load existing nouns for tokenization context (read-only)
-  const db = getDB(env) as any
-  const existingNouns = await db.findInCollection('nouns', {
-    domain_id: { equals: body.domain },
-  }, { limit: 10000 })
-  const nouns = existingNouns.docs.map((n: any) => ({ name: n.name, id: n.id, objectType: n.objectType }))
+  // Load existing nouns for tokenization context via Registry+EntityDB fan-out
+  const registry = env.REGISTRY_DB.get(env.REGISTRY_DB.idFromName('global')) as any
+  const nounIds: string[] = await registry.getEntityIds('Noun', body.domain)
+  const nounEntities = await Promise.all(
+    nounIds.map(id => (env.ENTITY_DB.get(env.ENTITY_DB.idFromName(id)) as any).get())
+  )
+  const nouns = nounEntities
+    .filter(Boolean)
+    .map((e: any) => ({ name: e.data?.name ?? e.data?.Name, id: e.id, objectType: e.data?.objectType }))
 
   const result = parseFORML2(body.text, nouns)
 
