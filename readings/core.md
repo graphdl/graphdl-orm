@@ -27,6 +27,9 @@ This association with Constraint, Role provides the preferred identification sch
 Modality Type is a value type.
   The possible values of Modality Type are 'Alethic', 'Deontic'.
 
+World Assumption is a value type.
+  The possible values of World Assumption are 'closed', 'open'.
+
 This association with Reading, Verb provides the preferred identification scheme for Reading Is Used By Verb.
 
 This association with Reading Is Used By Verb, HTTP Method provides the preferred identification scheme for API.
@@ -142,7 +145,9 @@ Noun has Permission.
 Noun has Reference Scheme Noun.
 Noun is subtype of Noun.
 Noun is described to AI by prompt Text.
-Noun is displayed by UI Element.
+Noun has World Assumption.
+  Each Noun has exactly one World Assumption.
+Noun is independent.
 Noun is of schema:Thing.
   Each Noun is of at most one schema:Thing.
   It is possible that more than one Noun is of the same schema:Thing.
@@ -161,6 +166,7 @@ Reading is used by Verb.
 Reading is localized for Language.
   Each Reading is localized for at most one Language.
   It is possible that more than one Reading is localized for the same Language.
+Reading is primary.
 Role is used in Reading.
   Each Role is used in some Reading.
   For each Reading, some Role is used in that Reading.
@@ -181,12 +187,14 @@ Graph Schema has Order.
   Each Graph Schema has at most one Order.
 Graph Schema has Role Relationship.
   Each Graph Schema has at most one Role Relationship.
+Graph Schema is derived.
 
 ### Role
 Constraint spans Role.
   Each Constraint spans some Role.
 Role is used in Reading.
 Role has Position for Reading.
+  For each Role and Reading that Role has that Reading at most one Position.
 
 ### Verb
 Verb has Name.
@@ -223,6 +231,8 @@ Function has Scope.
 ### Constraint
 Constraint is of Constraint Type.
 Constraint has modality of Modality Type.
+Constraint has Text.
+  Each Constraint has at most one Text.
 Constraint spans Role.
 
 ### Constraint Type
@@ -275,8 +285,6 @@ Toolbar has Toolbar Item.
 Menu has Menu Button.
 
 ## Constraints
-
-For each combination of Role and Reading, that Role has at most one Position for that Reading.
 
 Each Constraint is of exactly one Constraint Type.
 It is possible that more than one Constraint is of the same Constraint Type.
