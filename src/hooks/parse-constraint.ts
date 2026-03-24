@@ -26,6 +26,8 @@ export interface ParsedConstraint {
   entity?: string
   /** For set-comparison (XO/XC/OR): the individual clause texts */
   clauses?: string[]
+  /** External UC: spans roles from different fact types, joined through constrainedNoun */
+  isExternal?: boolean
 }
 
 // Match noun names — may be multi-word with spaces (e.g., "Support Request", "API Product")
@@ -57,6 +59,11 @@ const SPANNING_UC = new RegExp(
 const TERNARY_UC = new RegExp(
   `^For each combination of ${NOUN} and ${NOUN},.*at most one ${NOUN}`
 )
+
+// External UC: "For each State and Name, at most one City resides in that State and has that Name."
+// The (Noun1, Noun2...) combination uniquely identifies Entity across multiple fact types.
+// We capture the "For each ..." prefix and the entity after "at most one" separately.
+const EXTERNAL_UC = /^For each (.+?),\s*at most one ([A-Z][a-zA-Z0-9]*(?:\s+[A-Z][a-zA-Z0-9]*)*)/
 
 // Ring constraints — all operate on binary facts where subject and object are the same type
 // Subscripted noun: PascalCase word optionally followed by a digit (e.g., Person1, Person2)
@@ -148,8 +155,32 @@ export function parseConstraintText(text: string): ParsedConstraint[] | null {
     return [{ kind: 'MC', modality: 'Alethic', nouns: [m[1], m[2]], constrainedNoun: m[1] }]
   }
 
+  // External UC: "For each State and Name, at most one City resides in that State and has that Name."
+  // The identifying nouns come from different fact types, joined through the entity.
+  m = clean.match(EXTERNAL_UC)
+  if (m) {
+    // Parse the "For each X and Y and Z" part to get identifying nouns
+    const identifyingNounsPart = m[1]
+    const entityNoun = m[2]
+    const identifyingNouns = identifyingNounsPart
+      .split(/\s*(?:,\s*(?:and\s+)?|(?:^|,\s*)and\s+)\s*/i)
+      .map(s => s.trim())
+      .filter(Boolean)
+
+    // If this has "combination of" or "pair of", it's an internal UC — fall through
+    if (!/combination of|pair of/i.test(identifyingNounsPart)) {
+      return [{
+        kind: 'UC',
+        modality: 'Alethic',
+        nouns: [...identifyingNouns, entityNoun],
+        constrainedNoun: entityNoun,
+        isExternal: true,
+      }]
+    }
+  }
+
   // "For each combination of X and Y, ... at most one Z ..."
-  // UC spans X and Y roles (the nouns in the "For each" clause)
+  // UC spans X and Y roles (the nouns in the "For each" clause) — internal UC on ternary
   m = clean.match(TERNARY_UC)
   if (m) {
     return [{ kind: 'UC', modality: 'Alethic', nouns: [m[1], m[2], m[3]], constrainedNoun: m[1] }]
