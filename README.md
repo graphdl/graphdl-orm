@@ -4,7 +4,9 @@
 >
 > -William of Ockham
 
-A meta-framework for [Object-Role Modeling](https://en.wikipedia.org/wiki/Object-role_modeling) (ORM2/FORML2). Write your domain in natural language. Get a relational schema, REST API, state machines, constraint validation, UI layouts, and agent prompts — compiled, not configured.
+An implementation of [Object-Role Modeling](https://en.wikipedia.org/wiki/Object-role_modeling) (ORM2/FORML2) as a runtime system. Write your domain in natural language readings. The framework compiles them into relational schemas, REST APIs, state machines, constraint evaluation, UI layouts, and formal proofs.
+
+Based on the work of [Terry Halpin](https://en.wikipedia.org/wiki/Terry_Halpin) (ORM2), [E.F. Codd](https://en.wikipedia.org/wiki/Edgar_F._Codd) (relational model), and [John Backus](https://en.wikipedia.org/wiki/John_Backus) (FP algebra). The readings are the source. Everything else is compilation.
 
 **Stack:** Cloudflare Workers + Durable Objects (SQLite) + itty-router + Rust/WASM FOL engine
 
