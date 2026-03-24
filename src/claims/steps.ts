@@ -135,6 +135,7 @@ export async function ingestReadings(
   readings: ExtractedClaims['readings'],
   domainId: string,
   scope: Scope,
+  objectificationMap?: Map<string, string>,
 ): Promise<number> {
   let count = 0
 
@@ -186,9 +187,11 @@ export async function ingestReadings(
         continue
       }
 
-      // Create graph schema
+      // Create graph schema — if a noun objectifies this reading, share the noun's ID
       const schemaName = reading.nouns.join('')
+      const objectifyingNounId = objectificationMap?.get(reading.text)
       const schema = await db.createInCollection('graph-schemas', {
+        ...(objectifyingNounId ? { id: objectifyingNounId } : {}),
         name: schemaName,
         title: schemaName,
         domain: domainId,

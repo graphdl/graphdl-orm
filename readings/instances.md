@@ -8,7 +8,7 @@ Graph is an entity type.
 Resource Role is an entity type.
 State Machine(.Name) is an entity type.
 Event(.id) is an entity type.
-Event Triggered Transition In State Machine objectifies "Event triggered Transition in State Machine".
+This association with Event, Transition, State Machine provides the preferred identification scheme for Event Triggered Transition In State Machine.
 Guard Run(.Name) is an entity type.
 Citation is an entity type.
 

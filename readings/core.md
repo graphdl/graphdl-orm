@@ -22,14 +22,14 @@ Constraint(.id) is an entity type.
 
 Constraint Type(.code) is an entity type.
 
-Constraint Span objectifies "Constraint spans Role".
+This association with Constraint, Role provides the preferred identification scheme for Constraint Span.
 
 Modality Type is a value type.
   The possible values of Modality Type are 'Alethic', 'Deontic'.
 
-Reading Is Used By Verb objectifies "Reading is used by Verb".
+This association with Reading, Verb provides the preferred identification scheme for Reading Is Used By Verb.
 
-API objectifies "Reading Is Used By Verb is by HTTP Method".
+This association with Reading Is Used By Verb, HTTP Method provides the preferred identification scheme for API.
 
 Language(.code) is an entity type.
 
