@@ -43,4 +43,61 @@ describe('BatchBuilder', () => {
     builder.addEntity('Reading', { text: 'A has B' })
     expect(builder.entityCount).toBe(3)
   })
+
+  it('updates an existing entity by id', () => {
+    const builder = new BatchBuilder('tickets')
+    const id = builder.addEntity('Noun', { name: 'Customer', objectType: 'entity' })
+
+    const updated = builder.updateEntity(id, { superType: 'parent-id' })
+
+    expect(updated).toBe(true)
+    const entity = builder.findEntity(id)
+    expect(entity!.data.superType).toBe('parent-id')
+    expect(entity!.data.name).toBe('Customer') // original fields preserved
+  })
+
+  it('returns false when updating non-existent entity', () => {
+    const builder = new BatchBuilder('tickets')
+    const updated = builder.updateEntity('non-existent-id', { foo: 'bar' })
+    expect(updated).toBe(false)
+  })
+
+  it('finds an entity by id', () => {
+    const builder = new BatchBuilder('tickets')
+    const id = builder.addEntity('Noun', { name: 'Customer' })
+    const entity = builder.findEntity(id)
+    expect(entity).toBeDefined()
+    expect(entity!.data.name).toBe('Customer')
+  })
+
+  it('returns undefined for non-existent entity', () => {
+    const builder = new BatchBuilder('tickets')
+    const entity = builder.findEntity('non-existent-id')
+    expect(entity).toBeUndefined()
+  })
+
+  it('finds entities by type and filter', () => {
+    const builder = new BatchBuilder('tickets')
+    builder.addEntity('Noun', { name: 'Customer', domain: 'd1' })
+    builder.addEntity('Noun', { name: 'Name', domain: 'd1' })
+    builder.addEntity('Reading', { text: 'Customer has Name', domain: 'd1' })
+    builder.addEntity('Noun', { name: 'Order', domain: 'd2' })
+
+    const allNouns = builder.findEntities('Noun')
+    expect(allNouns).toHaveLength(3)
+
+    const d1Nouns = builder.findEntities('Noun', { domain: 'd1' })
+    expect(d1Nouns).toHaveLength(2)
+
+    const customerNouns = builder.findEntities('Noun', { name: 'Customer' })
+    expect(customerNouns).toHaveLength(1)
+    expect(customerNouns[0].data.name).toBe('Customer')
+  })
+
+  it('returns empty array when no entities match filter', () => {
+    const builder = new BatchBuilder('tickets')
+    builder.addEntity('Noun', { name: 'Customer' })
+    const result = builder.findEntities('Reading')
+    expect(result).toHaveLength(0)
+  })
 })

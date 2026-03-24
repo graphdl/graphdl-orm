@@ -14,7 +14,7 @@ import {
 } from './model/test-utils'
 
 // ---------------------------------------------------------------------------
-// Mock DB (in-memory store) — same pattern as ingest.test.ts
+// Mock DB — only needed for instance facts (createEntity) and applySchema
 // ---------------------------------------------------------------------------
 
 function mockDb() {
@@ -23,31 +23,6 @@ function mockDb() {
 
   return {
     store,
-    findInCollection: vi.fn(async (collection: string, where: any, opts?: any) => {
-      const all = store[collection] || []
-      const filtered = all.filter((doc: any) => {
-        for (const [key, cond] of Object.entries(where)) {
-          if (typeof cond === 'object' && cond !== null && 'equals' in (cond as any)) {
-            const fieldVal = key === 'domain' ? doc.domain : doc[key]
-            if (fieldVal !== (cond as any).equals) return false
-          }
-        }
-        return true
-      })
-      return { docs: filtered, totalDocs: filtered.length }
-    }),
-    createInCollection: vi.fn(async (collection: string, body: any) => {
-      const doc = { id: `id-${++idCounter}`, ...body }
-      if (!store[collection]) store[collection] = []
-      store[collection].push(doc)
-      return doc
-    }),
-    updateInCollection: vi.fn(async (collection: string, id: string, updates: any) => {
-      const coll = store[collection] || []
-      const doc = coll.find((d: any) => d.id === id)
-      if (doc) Object.assign(doc, updates)
-      return doc
-    }),
     createEntity: vi.fn(async (domainId: string, nounName: string, fields: any, reference?: string) => {
       const doc = { id: `entity-${++idCounter}`, domain: domainId, noun: nounName, reference, ...fields }
       const key = `entities_${nounName}`
@@ -57,6 +32,14 @@ function mockDb() {
     }),
     applySchema: vi.fn(async () => ({ tableMap: {}, fieldMap: {} })),
   }
+}
+
+// ---------------------------------------------------------------------------
+// Helper: extract entities of a given type from a batch
+// ---------------------------------------------------------------------------
+
+function batchEntities(result: { batch: { entities: any[] } }, type: string) {
+  return result.batch.entities.filter((e: any) => e.type === type)
 }
 
 // ---------------------------------------------------------------------------
@@ -326,9 +309,10 @@ describe('2. Claim ingestion', () => {
 
     expect(result.nouns).toBe(2)
     expect(result.errors).toHaveLength(0)
-    expect(db.store.nouns).toHaveLength(2)
-    expect(db.store.nouns[0].name).toBe('AI System')
-    expect(db.store.nouns[1].enumValues).toContain('Unacceptable')
+    const nouns = batchEntities(result, 'Noun')
+    expect(nouns).toHaveLength(2)
+    expect(nouns[0].data.name).toBe('AI System')
+    expect(nouns[1].data.enumValues).toContain('Unacceptable')
   })
 
   it('ingests readings with roles', async () => {
@@ -348,11 +332,12 @@ describe('2. Claim ingestion', () => {
 
     // Should create graph_schema + reading + roles
     expect(result.readings).toBe(1)
-    expect(db.store['graph-schemas']).toHaveLength(1)
-    expect(db.store.readings).toHaveLength(1)
-    expect(db.store.readings[0].text).toBe('AI System is developed by Provider')
-    expect(db.store.roles).toBeDefined()
-    expect(db.store.roles.length).toBeGreaterThanOrEqual(2)
+    expect(batchEntities(result, 'GraphSchema')).toHaveLength(1)
+    const readings = batchEntities(result, 'Reading')
+    expect(readings).toHaveLength(1)
+    expect(readings[0].data.text).toBe('AI System is developed by Provider')
+    const roles = batchEntities(result, 'Role')
+    expect(roles.length).toBeGreaterThanOrEqual(2)
   })
 
   it('ingests subtypes by setting superType on child noun', async () => {
@@ -367,13 +352,13 @@ describe('2. Claim ingestion', () => {
       subtypes: [{ child: 'Negligence', parent: 'Tort' }],
     }
 
-    await ingestClaims(db as any, { claims, domainId: 'd1' })
+    const result = await ingestClaims(db as any, { claims, domainId: 'd1' })
 
-    expect(db.updateInCollection).toHaveBeenCalled()
-    const updateCall = db.updateInCollection.mock.calls.find(
-      ([coll, _id, data]: [string, string, any]) => coll === 'nouns' && data.superType
-    )
-    expect(updateCall).toBeDefined()
+    // The Negligence noun should have superType set in the batch
+    const nouns = batchEntities(result, 'Noun')
+    const negligenceNoun = nouns.find((n: any) => n.data.name === 'Negligence')
+    expect(negligenceNoun).toBeDefined()
+    expect(negligenceNoun!.data.superType).toBeDefined()
   })
 
   it('ingests enum values as comma-separated string', async () => {
@@ -386,9 +371,10 @@ describe('2. Claim ingestion', () => {
       constraints: [],
     }
 
-    await ingestClaims(db as any, { claims, domainId: 'd1' })
+    const result = await ingestClaims(db as any, { claims, domainId: 'd1' })
 
-    expect(db.store.nouns[0].enumValues).toBe('High, Medium, Low')
+    const nouns = batchEntities(result, 'Noun')
+    expect(nouns[0].data.enumValues).toBe('High, Medium, Low')
   })
 })
 
@@ -948,9 +934,10 @@ Each AI System has at most one Risk Level.
     expect(result.errors).toHaveLength(0)
 
     // Verify the enum was ingested
-    const riskLevelNoun = db.store.nouns.find((n: any) => n.name === 'Risk Level')
+    const nouns = batchEntities(result, 'Noun')
+    const riskLevelNoun = nouns.find((n: any) => n.data.name === 'Risk Level')
     expect(riskLevelNoun).toBeDefined()
-    expect(riskLevelNoun.enumValues).toContain('Unacceptable')
+    expect(riskLevelNoun!.data.enumValues).toContain('Unacceptable')
   })
 
   it('parsed readings flow through to synthesizable domain schema', () => {

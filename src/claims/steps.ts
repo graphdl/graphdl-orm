@@ -1,15 +1,17 @@
 /**
  * Extracted step functions for claims ingestion.
  *
- * Each step operates on a shared Scope object and a GraphDLDBLike instance.
- * Extracted from the monolithic ingestClaims() in ingest.ts.
+ * Each step operates on a shared Scope object and a BatchBuilder instance.
+ * Metamodel entities are accumulated in the batch (committed by the caller).
+ * Instance facts (ingestFacts) still use the DB interface directly.
  */
+import type { BatchBuilder } from './batch-builder'
 import type { GraphDLDBLike } from './ingest'
 import type { ExtractedClaims } from './ingest'
 import type { Scope } from './scope'
 import { addNoun, resolveNoun, addSchema, resolveSchema } from './scope'
 import { tokenizeReading } from './tokenize'
-import { parseMultiplicity, applyConstraints } from './constraints'
+import { parseMultiplicity, applyConstraintsBatch } from './constraints'
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -18,43 +20,30 @@ import { parseMultiplicity, applyConstraints } from './constraints'
 /** Noun names (or supertypes) that imply open-world assumption */
 export const OPEN_WORLD_NOUNS = ['Right', 'Freedom', 'Liberty', 'Protection', 'Privilege']
 
-/** Ensure a noun exists for this domain; return the doc. */
-export async function ensureNoun(
-  db: GraphDLDBLike,
+/** Ensure a noun exists in the batch for this domain; return its id. */
+export function ensureNoun(
+  builder: BatchBuilder,
   name: string,
   data: Record<string, any>,
   domainId: string,
-): Promise<Record<string, any>> {
-  const existing = await db.findInCollection('nouns', {
-    name: { equals: name },
-    domain: { equals: domainId },
-  }, { limit: 1 })
-
-  if (existing.docs.length) {
-    const doc = existing.docs[0]
-    const updates: Record<string, any> = {}
-    if (data.objectType && doc.objectType !== data.objectType) updates.objectType = data.objectType
-    if (data.enumValues && !doc.enumValues) updates.enumValues = data.enumValues
-    if (data.valueType && !doc.valueType) updates.valueType = data.valueType
-    if (Object.keys(updates).length) {
-      return (await db.updateInCollection('nouns', doc.id as string, updates))!
-    }
-    return doc
-  }
-
-  return db.createInCollection('nouns', { name, domain: domainId, ...data })
+): string {
+  return builder.ensureEntity('Noun', 'name', name, {
+    name,
+    domain: domainId,
+    ...data,
+  })
 }
 
 // ---------------------------------------------------------------------------
 // Step 1: Create nouns
 // ---------------------------------------------------------------------------
 
-export async function ingestNouns(
-  db: GraphDLDBLike,
+export function ingestNouns(
+  builder: BatchBuilder,
   nouns: ExtractedClaims['nouns'],
   domainId: string,
   scope: Scope,
-): Promise<number> {
+): number {
   let count = 0
 
   for (const noun of nouns) {
@@ -81,8 +70,8 @@ export async function ingestNouns(
         data.referenceScheme = JSON.stringify(noun.refScheme)
       }
 
-      const doc = await ensureNoun(db, noun.name, data, domainId)
-      addNoun(scope, { id: doc.id as string, name: noun.name, domainId })
+      const id = ensureNoun(builder, noun.name, data, domainId)
+      addNoun(scope, { id, name: noun.name, domainId })
       count++
     } catch (err: any) {
       scope.errors.push(`[${domainId}] noun "${noun.name}": ${err.message}`)
@@ -96,21 +85,21 @@ export async function ingestNouns(
 // Step 2: Apply subtypes
 // ---------------------------------------------------------------------------
 
-export async function ingestSubtypes(
-  db: GraphDLDBLike,
+export function ingestSubtypes(
+  builder: BatchBuilder,
   subtypes: NonNullable<ExtractedClaims['subtypes']>,
   domainId: string,
   scope: Scope,
-): Promise<void> {
+): void {
   for (const sub of subtypes) {
     try {
       const child = resolveNoun(scope, sub.child, domainId)
       let parent = resolveNoun(scope, sub.parent, domainId)
       if (!parent) {
         // Fallback: create the parent noun if it doesn't exist in scope
-        const doc = await ensureNoun(db, sub.parent, { objectType: 'entity' }, domainId)
-        addNoun(scope, { id: doc.id as string, name: sub.parent, domainId })
-        parent = { id: doc.id as string, name: sub.parent, domainId }
+        const id = ensureNoun(builder, sub.parent, { objectType: 'entity' }, domainId)
+        addNoun(scope, { id, name: sub.parent, domainId })
+        parent = { id, name: sub.parent, domainId }
       }
       if (child && parent) {
         const updates: Record<string, any> = { superType: parent.id }
@@ -118,7 +107,7 @@ export async function ingestSubtypes(
         if (OPEN_WORLD_NOUNS.some(ow => sub.parent === ow || sub.parent.endsWith(` ${ow}`))) {
           updates.worldAssumption = 'open'
         }
-        await db.updateInCollection('nouns', child.id, updates)
+        builder.updateEntity(child.id, updates)
       }
     } catch (err: any) {
       scope.errors.push(`[${domainId}] subtype "${sub.child} -> ${sub.parent}": ${err.message}`)
@@ -130,59 +119,55 @@ export async function ingestSubtypes(
 // Step 3: Create graph schemas + readings
 // ---------------------------------------------------------------------------
 
-export async function ingestReadings(
-  db: GraphDLDBLike,
+export function ingestReadings(
+  builder: BatchBuilder,
   readings: ExtractedClaims['readings'],
   domainId: string,
   scope: Scope,
   objectificationMap?: Map<string, string>,
-): Promise<number> {
+): number {
   let count = 0
 
   for (const reading of readings) {
     try {
       // Derivation rules (predicate ':=') — store as reading with full text, no graph schema
       if (reading.predicate === ':=' || reading.text.includes(':=')) {
-        const existingDeriv = await db.findInCollection('readings', {
-          text: { equals: reading.text },
-          domain: { equals: domainId },
-        }, { limit: 1 })
-        if (!existingDeriv.docs.length) {
-          // Create a graph schema to hold the derivation reading
-          const schema = await db.createInCollection('graph-schemas', {
-            name: 'derivation',
-            title: reading.text.split(':=')[0].trim(),
-            domain: domainId,
-          })
-          await db.createInCollection('readings', {
-            text: reading.text,
-            graphSchema: schema.id,
-            domain: domainId,
-          })
-          addSchema(scope, reading.text, schema)
-          count++
-        } else {
+        // Check if this derivation already exists in the batch
+        const existingDerivs = builder.findEntities('Reading', { text: reading.text, domain: domainId })
+        if (existingDerivs.length) {
           scope.skipped++
+          continue
         }
+
+        // Create a graph schema to hold the derivation reading
+        const schemaId = builder.addEntity('GraphSchema', {
+          name: 'derivation',
+          title: reading.text.split(':=')[0].trim(),
+          domain: domainId,
+        })
+        builder.addEntity('Reading', {
+          text: reading.text,
+          graphSchema: schemaId,
+          domain: domainId,
+        })
+        addSchema(scope, reading.text, { id: schemaId })
+        count++
         continue
       }
 
       // Ensure referenced nouns exist
       for (const nounName of reading.nouns) {
         if (!resolveNoun(scope, nounName, domainId)) {
-          const doc = await ensureNoun(db, nounName, { objectType: 'entity' }, domainId)
-          addNoun(scope, { id: doc.id as string, name: nounName, domainId })
+          const id = ensureNoun(builder, nounName, { objectType: 'entity' }, domainId)
+          addNoun(scope, { id, name: nounName, domainId })
         }
       }
 
-      // Check for existing reading
-      const existingReading = await db.findInCollection('readings', {
-        text: { equals: reading.text },
-        domain: { equals: domainId },
-      }, { limit: 1 })
-
-      if (existingReading.docs.length) {
-        addSchema(scope, reading.text, { id: existingReading.docs[0].graphSchema })
+      // Check for existing reading in the batch
+      const existingReadings = builder.findEntities('Reading', { text: reading.text, domain: domainId })
+      if (existingReadings.length) {
+        const existingReading = existingReadings[0]
+        addSchema(scope, reading.text, { id: existingReading.data.graphSchema as string })
         scope.skipped++
         continue
       }
@@ -190,35 +175,37 @@ export async function ingestReadings(
       // Create graph schema — if a noun objectifies this reading, share the noun's ID
       const schemaName = reading.nouns.join('')
       const objectifyingNounId = objectificationMap?.get(reading.text)
-      const schema = await db.createInCollection('graph-schemas', {
-        ...(objectifyingNounId ? { id: objectifyingNounId } : {}),
+      const schemaId = builder.addEntity('GraphSchema', {
         name: schemaName,
         title: schemaName,
         domain: domainId,
-      })
-      addSchema(scope, reading.text, schema)
+      }, objectifyingNounId)
+      addSchema(scope, reading.text, { id: schemaId })
 
       // Create reading
-      const readingDoc = await db.createInCollection('readings', {
+      const readingId = builder.addEntity('Reading', {
         text: reading.text,
-        graphSchema: schema.id,
+        graphSchema: schemaId,
         domain: domainId,
       })
 
-      // Auto-create roles
-      const allNouns = await db.findInCollection('nouns', {
-        domain: { equals: domainId },
-      }, { limit: 1000 })
-      const nounList = allNouns.docs.map((n: any) => ({ name: n.name, id: n.id }))
+      // Auto-create roles — collect all nouns from the batch for tokenization
+      const allNounEntities = builder.findEntities('Noun')
+      const nounList = allNounEntities.map(e => ({
+        name: e.data.name as string,
+        id: e.id,
+      }))
       const tokenized = tokenizeReading(reading.text, nounList)
 
+      const roleIds: string[] = []
       for (const nounRef of tokenized.nounRefs) {
-        await db.createInCollection('roles', {
-          reading: readingDoc.id,
+        const roleId = builder.addEntity('Role', {
+          reading: readingId,
           noun: nounRef.id,
-          graphSchema: schema.id,
+          graphSchema: schemaId,
           roleIndex: nounRef.index,
         })
+        roleIds.push(roleId)
       }
 
       count++
@@ -227,11 +214,7 @@ export async function ingestReadings(
       if (reading.multiplicity) {
         const constraintDefs = parseMultiplicity(reading.multiplicity)
         if (constraintDefs.length > 0) {
-          const roles = await db.findInCollection('roles', {
-            graphSchema: { equals: schema.id },
-          }, { sort: 'createdAt' })
-          const roleIds = roles.docs.map((r: any) => r.id)
-          await applyConstraints(db, { constraints: constraintDefs, roleIds, domainId })
+          applyConstraintsBatch(builder, { constraints: constraintDefs, roleIds, domainId })
         }
       }
     } catch (err: any) {
@@ -246,17 +229,17 @@ export async function ingestReadings(
 // Step 4: Apply explicit constraints
 // ---------------------------------------------------------------------------
 
-export async function ingestConstraints(
-  db: GraphDLDBLike,
+export function ingestConstraints(
+  builder: BatchBuilder,
   constraints: NonNullable<ExtractedClaims['constraints']>,
   domainId: string,
   scope: Scope,
-): Promise<void> {
+): void {
   for (const constraint of constraints) {
     try {
       // Set-comparison constraints (SS/XC/EQ/OR/XO) have no single host reading
       if (!constraint.reading && ['SS', 'XC', 'EQ', 'OR', 'XO'].includes(constraint.kind)) {
-        const c = await db.createInCollection('constraints', {
+        const constraintId = builder.addEntity('Constraint', {
           kind: constraint.kind,
           modality: constraint.modality,
           domain: domainId,
@@ -267,15 +250,15 @@ export async function ingestConstraints(
           for (const span of constraint.spans) {
             const schema = resolveSchema(scope, span.reading)
             if (!schema) continue
-            const roles = await db.findInCollection('roles', {
-              graphSchema: { equals: schema.id },
-            }, { sort: 'createdAt' })
+            const roles = builder.findEntities('Role', { graphSchema: schema.id })
+            // Sort by roleIndex to maintain consistent ordering
+            roles.sort((a, b) => (a.data.roleIndex as number) - (b.data.roleIndex as number))
             for (const idx of span.roles) {
-              const roleId = roles.docs[idx]?.id
-              if (roleId) {
-                await db.createInCollection('constraint-spans', {
-                  constraint: c.id,
-                  role: roleId,
+              const role = roles[idx]
+              if (role) {
+                builder.addEntity('ConstraintSpan', {
+                  constraint: constraintId,
+                  role: role.id,
                 })
               }
             }
@@ -286,13 +269,13 @@ export async function ingestConstraints(
 
       let schema = resolveSchema(scope, constraint.reading)
       if (!schema) {
-        // Reading may have been created in a prior ingestion — look it up from DB
-        const existingReading = await db.findInCollection('readings', {
-          text: { equals: constraint.reading },
-          domain: { equals: domainId },
-        }, { limit: 1 })
-        if (existingReading.docs.length) {
-          schema = { id: existingReading.docs[0].graphSchema }
+        // Reading may have been created in a prior ingestion — look it up from batch
+        const existingReadings = builder.findEntities('Reading', {
+          text: constraint.reading,
+          domain: domainId,
+        })
+        if (existingReadings.length) {
+          schema = { id: existingReadings[0].data.graphSchema as string }
         }
       }
       if (!schema) {
@@ -300,24 +283,24 @@ export async function ingestConstraints(
         continue
       }
 
-      const roles = await db.findInCollection('roles', {
-        graphSchema: { equals: schema.id },
-      }, { sort: 'createdAt' })
+      const roles = builder.findEntities('Role', { graphSchema: schema.id })
+      // Sort by roleIndex to maintain consistent ordering
+      roles.sort((a, b) => (a.data.roleIndex as number) - (b.data.roleIndex as number))
 
       // Idempotent: check if this constraint already exists by text + kind + modality
       if (constraint.text) {
-        const existing = await db.findInCollection('constraints', {
-          text: { equals: constraint.text },
-          domain: { equals: domainId },
-          kind: { equals: constraint.kind },
-        }, { limit: 1 })
-        if (existing.docs.length) {
+        const existingConstraints = builder.findEntities('Constraint', {
+          text: constraint.text,
+          domain: domainId,
+          kind: constraint.kind,
+        })
+        if (existingConstraints.length) {
           scope.skipped++
           continue
         }
       }
 
-      const c = await db.createInCollection('constraints', {
+      const constraintId = builder.addEntity('Constraint', {
         kind: constraint.kind,
         modality: constraint.modality,
         text: constraint.text || '',
@@ -325,12 +308,12 @@ export async function ingestConstraints(
       })
 
       const roleIds = constraint.roles
-        .map(idx => roles.docs[idx]?.id)
+        .map(idx => roles[idx]?.id)
         .filter(Boolean)
 
       for (const roleId of roleIds) {
-        await db.createInCollection('constraint-spans', {
-          constraint: c.id,
+        builder.addEntity('ConstraintSpan', {
+          constraint: constraintId,
           role: roleId,
         })
       }
@@ -344,12 +327,12 @@ export async function ingestConstraints(
 // Step 5: Seed state machine transitions
 // ---------------------------------------------------------------------------
 
-export async function ingestTransitions(
-  db: GraphDLDBLike,
+export function ingestTransitions(
+  builder: BatchBuilder,
   transitions: NonNullable<ExtractedClaims['transitions']>,
   domainId: string,
   scope: Scope,
-): Promise<number> {
+): number {
   let count = 0
 
   // Group transitions by entity
@@ -365,20 +348,20 @@ export async function ingestTransitions(
       let noun = resolveNoun(scope, entityName, domainId)
       if (!noun) {
         // Fallback: create the noun if it doesn't exist
-        const doc = await ensureNoun(db, entityName, { objectType: 'entity' }, domainId)
-        addNoun(scope, { id: doc.id as string, name: entityName, domainId })
-        noun = { id: doc.id as string, name: entityName, domainId }
+        const id = ensureNoun(builder, entityName, { objectType: 'entity' }, domainId)
+        addNoun(scope, { id, name: entityName, domainId })
+        noun = { id, name: entityName, domainId }
       }
 
-      // Ensure state machine definition (find by noun + domain)
-      const existingDef = await db.findInCollection('state-machine-definitions', {
-        noun: { equals: noun.id },
-        domain: { equals: domainId },
-      }, { limit: 1 })
+      // Ensure state machine definition (find by noun + domain in batch)
+      const existingDefs = builder.findEntities('StateMachineDefinition', {
+        noun: noun.id,
+        domain: domainId,
+      })
 
-      const definition = existingDef.docs.length
-        ? existingDef.docs[0]
-        : await db.createInCollection('state-machine-definitions', {
+      const definitionId = existingDefs.length
+        ? existingDefs[0].id
+        : builder.addEntity('StateMachineDefinition', {
             title: entityName,
             noun: noun.id,
             domain: domainId,
@@ -396,29 +379,20 @@ export async function ingestTransitions(
       // Ensure statuses
       const statusMap = new Map<string, string>()
       for (const name of stateNames) {
-        const existing = await db.findInCollection('statuses', {
-          name: { equals: name },
-          stateMachineDefinition: { equals: definition.id },
-        }, { limit: 1 })
-        const status = existing.docs.length
-          ? existing.docs[0]
-          : await db.createInCollection('statuses', {
-              name,
-              stateMachineDefinition: definition.id,
-            })
-        statusMap.set(name, status.id as string)
+        const statusId = builder.ensureEntity('Status', 'name', `${definitionId}:${name}`, {
+          name,
+          stateMachineDefinition: definitionId,
+        })
+        statusMap.set(name, statusId)
       }
 
       // Ensure event types
       const eventMap = new Map<string, string>()
       for (const name of eventNames) {
-        const existing = await db.findInCollection('event-types', {
-          name: { equals: name },
-        }, { limit: 1 })
-        const et = existing.docs.length
-          ? existing.docs[0]
-          : await db.createInCollection('event-types', { name })
-        eventMap.set(name, et.id as string)
+        const eventId = builder.ensureEntity('EventType', 'name', name, {
+          name,
+        })
+        eventMap.set(name, eventId)
       }
 
       // Create transitions
@@ -427,18 +401,19 @@ export async function ingestTransitions(
         const toId = statusMap.get(t.to)!
         const eventId = eventMap.get(t.event)!
 
-        const existingT = await db.findInCollection('transitions', {
-          from: { equals: fromId },
-          to: { equals: toId },
-          eventType: { equals: eventId },
-        }, { limit: 1 })
+        // Idempotent: check batch for existing transition
+        const existingTransitions = builder.findEntities('Transition', {
+          from: fromId,
+          to: toId,
+          eventType: eventId,
+        })
 
-        if (!existingT.docs.length) {
-          await db.createInCollection('transitions', {
+        if (!existingTransitions.length) {
+          builder.addEntity('Transition', {
             from: fromId,
             to: toId,
             eventType: eventId,
-            stateMachineDefinition: definition.id,
+            stateMachineDefinition: definitionId,
             domain: domainId,
           })
         }
@@ -457,6 +432,10 @@ export async function ingestTransitions(
 // Step 6: Create instance facts
 // ---------------------------------------------------------------------------
 
+/**
+ * Instance facts write to EntityDB DOs (not metamodel), so they still
+ * use the GraphDLDBLike interface directly. This step is NOT batched.
+ */
 export async function ingestFacts(
   db: GraphDLDBLike,
   facts: NonNullable<ExtractedClaims['facts']>,
