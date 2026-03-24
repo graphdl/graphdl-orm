@@ -1,7 +1,7 @@
 import { AutoRouter, json, error } from 'itty-router'
 import type { Env } from '../types'
 import { parseQueryOptions } from './collections'
-import { COLLECTION_TABLE_MAP, FIELD_MAP, FK_TARGET_TABLE, REVERSE_FK_MAP } from '../collections'
+import { COLLECTION_TABLE_MAP, NOUN_TABLE_MAP, FIELD_MAP, FK_TARGET_TABLE, REVERSE_FK_MAP } from '../collections'
 import { handleSeed } from './seed'
 import { handleGenerate } from './generate'
 import { handleParse } from './parse'
@@ -14,6 +14,22 @@ import { handleConceptualQuery } from './conceptual-query'
 import { deriveOnWrite } from '../worker/derive-on-write'
 import { induceConstraints } from '../csdp/induce'
 import { handleListEntities, handleGetEntity, handleCreateEntity, handleDeleteEntity } from './entity-routes'
+
+// ── Reverse mapping: collection slug → entity type name ──────────────
+// Built by inverting NOUN_TABLE_MAP (type→table) and joining with
+// COLLECTION_TABLE_MAP (slug→table). Only metamodel collections that
+// appear in NOUN_TABLE_MAP get an entry — runtime instance collections
+// and unknown slugs fall through to the legacy DomainDB handler.
+const TABLE_TO_ENTITY_TYPE: Record<string, string> = {}
+for (const [typeName, tableName] of Object.entries(NOUN_TABLE_MAP)) {
+  TABLE_TO_ENTITY_TYPE[tableName] = typeName
+}
+const COLLECTION_TO_ENTITY_TYPE: Record<string, string> = {}
+for (const [slug, tableName] of Object.entries(COLLECTION_TABLE_MAP)) {
+  if (TABLE_TO_ENTITY_TYPE[tableName]) {
+    COLLECTION_TO_ENTITY_TYPE[slug] = TABLE_TO_ENTITY_TYPE[tableName]
+  }
+}
 
 // ── DO helpers ───────────────────────────────────────────────────────
 
@@ -608,6 +624,56 @@ router.get('/api/:collection', async (request, env: Env) => {
     return error(404, { errors: [{ message: `Collection "${collection}" not found` }] })
   }
 
+  // Delegate to entity-type handler if this collection maps to a known entity type
+  const entityType = COLLECTION_TO_ENTITY_TYPE[collection]
+  if (entityType) {
+    const url = new URL(request.url)
+    const { where, limit: qLimit, page: qPage } = parseQueryOptions(url.searchParams)
+    const domainId = where?.domain?.equals || where?.['domain.domainSlug']?.equals || url.searchParams.get('domain') || ''
+    const registry = getRegistryDO(env, 'global') as any
+    const result = await handleListEntities(
+      entityType,
+      domainId,
+      registry,
+      (id) => getEntityDO(env, id) as any,
+      { limit: qLimit, page: qPage },
+    )
+
+    // Flatten entity data for backwards compat (spread data into top level)
+    const docs = result.docs.map((e) => ({
+      id: e.id,
+      type: e.type,
+      ...e.data,
+      version: e.version,
+      createdAt: e.createdAt,
+      updatedAt: e.updatedAt,
+    }))
+
+    // Client-side filtering by where params
+    let filtered = docs
+    if (where) {
+      for (const [field, condition] of Object.entries(where)) {
+        if (field === 'domain' || field === 'domain.domainSlug') continue // already used for routing
+        if (typeof condition === 'object' && condition !== null && 'equals' in condition) {
+          filtered = filtered.filter(doc => doc[field] === (condition as any).equals)
+        }
+      }
+    }
+
+    return json({
+      docs: filtered,
+      totalDocs: result.totalDocs,
+      limit: result.limit,
+      page: result.page,
+      totalPages: result.totalPages,
+      hasNextPage: result.hasNextPage,
+      hasPrevPage: result.hasPrevPage,
+      pagingCounter: (result.page - 1) * result.limit + 1,
+      ...(result.warnings && { warnings: result.warnings }),
+    })
+  }
+
+  // Fallback: legacy DomainDB handler for unmapped collections
   const url = new URL(request.url)
   const { where, limit, page, sort, depth } = parseQueryOptions(url.searchParams)
 
@@ -636,6 +702,22 @@ router.get('/api/:collection/:id', async (request, env: Env) => {
     return error(404, { errors: [{ message: `Collection "${collection}" not found` }] })
   }
 
+  // Delegate to entity-type handler if this collection maps to a known entity type
+  const entityType = COLLECTION_TO_ENTITY_TYPE[collection]
+  if (entityType) {
+    const entity = await handleGetEntity(getEntityDO(env, id) as any)
+    if (!entity) return error(404, { errors: [{ message: 'Not Found' }] })
+    return json({
+      id: entity.id,
+      type: entity.type,
+      ...entity.data,
+      version: entity.version,
+      createdAt: entity.createdAt,
+      updatedAt: entity.updatedAt,
+    })
+  }
+
+  // Fallback: legacy DomainDB handler
   const url = new URL(request.url)
   const depth = parseInt(url.searchParams.get('depth') || '0', 10)
   const { where } = parseQueryOptions(url.searchParams)
@@ -656,6 +738,23 @@ router.post('/api/:collection', async (request, env: Env) => {
   }
 
   const body = await request.json() as Record<string, any>
+
+  // Delegate to entity-type handler if this collection maps to a known entity type
+  const entityType = COLLECTION_TO_ENTITY_TYPE[collection]
+  if (entityType) {
+    const domain = body.domain || ''
+    const registry = getRegistryDO(env, 'global') as any
+    const result = await handleCreateEntity(
+      entityType,
+      domain,
+      body,
+      (id) => getEntityDO(env, id) as any,
+      registry,
+    )
+    return json({ doc: { id: result.id, ...body }, message: 'Created successfully' }, { status: 201 })
+  }
+
+  // Fallback: legacy DomainDB handler
   const { db } = await resolveDomainDB(env, undefined, body)
 
   // If a hook exists for this collection, use createWithHook
@@ -685,6 +784,17 @@ router.patch('/api/:collection/:id', async (request, env: Env) => {
   }
 
   const body = await request.json() as Record<string, any>
+
+  // Delegate to entity-type handler if this collection maps to a known entity type
+  const entityType = COLLECTION_TO_ENTITY_TYPE[collection]
+  if (entityType) {
+    const entityDO = getEntityDO(env, id) as any
+    const result = await entityDO.patch(body)
+    if (!result) return error(404, { errors: [{ message: 'Not Found' }] })
+    return json({ doc: result, message: 'Updated successfully' })
+  }
+
+  // Fallback: legacy DomainDB handler
   const { db } = await resolveDomainDB(env, undefined, body)
   const doc = await (db as any).updateInCollection(collection, id, body)
 
@@ -699,6 +809,16 @@ router.delete('/api/:collection/:id', async (request, env: Env) => {
     return error(404, { errors: [{ message: `Collection "${collection}" not found` }] })
   }
 
+  // Delegate to entity-type handler if this collection maps to a known entity type
+  const entityType = COLLECTION_TO_ENTITY_TYPE[collection]
+  if (entityType) {
+    const registry = getRegistryDO(env, 'global') as any
+    const result = await handleDeleteEntity(id, getEntityDO(env, id) as any, registry, entityType)
+    if (!result) return error(404, { errors: [{ message: 'Not Found' }] })
+    return json({ id, message: 'Deleted successfully' })
+  }
+
+  // Fallback: legacy DomainDB handler
   const { db } = await resolveDomainDB(env)
   const result = await (db as any).deleteFromCollection(collection, id)
 
