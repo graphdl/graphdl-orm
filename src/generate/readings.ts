@@ -170,17 +170,34 @@ function reconstructConstraint(
   const subjectNoun = reading.roles[0]?.nounName ?? ''
   const objectNoun = reading.roles[1]?.nounName ?? ''
 
+  const predicate = extractPredicate(reading.text, subjectNoun, objectNoun)
+
   switch (c.kind) {
     case 'UC':
       if (c.spans.length > 1) {
-        // Spanning UC
-        return `For each pair of ${subjectNoun} and ${objectNoun}, that ${subjectNoun} ${extractPredicate(reading.text, subjectNoun, objectNoun)} that ${objectNoun} at most once.`
+        return `For each pair of ${subjectNoun} and ${objectNoun}, that ${subjectNoun} ${predicate} that ${objectNoun} at most once.`
       }
-      return `Each ${subjectNoun} ${extractPredicate(reading.text, subjectNoun, objectNoun)} at most one ${objectNoun}.`
+      return `Each ${subjectNoun} ${predicate} at most one ${objectNoun}.`
     case 'MC':
-      return `Each ${subjectNoun} ${extractPredicate(reading.text, subjectNoun, objectNoun)} at least one ${objectNoun}.`
+      return `Each ${subjectNoun} ${predicate} some ${objectNoun}.`
+    case 'FC': {
+      const min = c.minOccurrence ?? 1
+      const max = c.maxOccurrence
+      const quantifier = max === min ? `exactly ${min}` : max ? `between ${min} and ${max}` : `at least ${min}`
+      return `Each ${subjectNoun} in the population of "${reading.text}" occurs there ${quantifier} times.`
+    }
     case 'IR':
-      return `No ${subjectNoun} ${extractPredicate(reading.text, subjectNoun, objectNoun)} itself.`
+      return `No ${subjectNoun} ${predicate} the same ${subjectNoun}.`
+    case 'AS':
+      return `If ${subjectNoun}1 ${predicate} ${subjectNoun}2, then ${subjectNoun}2 is not ${predicate} ${subjectNoun}1.`
+    case 'SY':
+      return `If ${subjectNoun}1 ${predicate} ${subjectNoun}2, then ${subjectNoun}2 ${predicate} ${subjectNoun}1.`
+    case 'TR':
+      return `If ${subjectNoun}1 ${predicate} ${subjectNoun}2 and ${subjectNoun}2 ${predicate} ${subjectNoun}3, then ${subjectNoun}1 ${predicate} ${subjectNoun}3.`
+    case 'IT':
+      return `If ${subjectNoun}1 ${predicate} ${subjectNoun}2 and ${subjectNoun}2 ${predicate} ${subjectNoun}3, then ${subjectNoun}1 is not ${predicate} ${subjectNoun}3.`
+    case 'SS':
+      return `If some ${subjectNoun} ${predicate} some ${objectNoun} then that ${subjectNoun} ${predicate} that ${objectNoun}.`
     default:
       return null
   }
