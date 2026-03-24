@@ -11,6 +11,7 @@ mod types;
 mod compile;
 mod evaluate;
 mod query;
+mod induce;
 
 use wasm_bindgen::prelude::*;
 use std::sync::Mutex;
@@ -122,6 +123,22 @@ pub fn query_population_wasm(population_json: &str, predicate_json: &str) -> Str
     let predicate: query::QueryPredicate = serde_json::from_str(predicate_json).unwrap_or_default();
     let result = query::query_population(&population, &predicate);
     serde_json::to_string(&result).unwrap_or_else(|_| r#"{"matches":[],"count":0}"#.to_string())
+}
+
+/// Induce constraints and rules from a population.
+/// Given observed facts, discover the UC, MC, FC, SS constraints and
+/// derivation rules that govern the data. This is the inverse of evaluation.
+#[wasm_bindgen]
+pub fn induce_from_population(population_json: &str) -> String {
+    let store = state_store().lock().unwrap();
+    let state = match store.as_ref() {
+        Some(s) => s,
+        None => return r#"{"constraints":[],"rules":[],"populationStats":{"factTypeCount":0,"totalFacts":0,"entityCount":0}}"#.to_string(),
+    };
+
+    let population: Population = serde_json::from_str(population_json).unwrap_or_default();
+    let result = induce::induce(&state.ir, &population);
+    serde_json::to_string(&result).unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string())
 }
 
 /// Prove a goal fact via backward chaining.
