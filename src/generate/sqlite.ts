@@ -284,3 +284,55 @@ export function generateSQLite(openapi: any): GenerateSQLiteResult {
 
   return { ddl, tableMap, fieldMap }
 }
+
+/**
+ * Generate CREATE VIEW statements for derived fact types.
+ *
+ * Takes the DomainSchema (which has derivation rules) and the table map
+ * from generateSQLite, and produces SQL views for derived fact types.
+ *
+ * Per Halpin p.426: derived fact types map to views or computed columns.
+ * Simple comparison derivations (X has Y := X has Z 'value') produce
+ * a view that filters the base table.
+ */
+export function generateDerivedViews(
+  domainSchema: {
+    derivationRules: Array<{
+      id: string
+      text: string
+      kind: string
+      antecedentFactTypeIds: string[]
+      consequentFactTypeId: string
+    }>
+    factTypes: Record<string, { reading: string; roles: Array<{ nounName: string; roleIndex: number }> }>
+  },
+  tableMap: Record<string, string>,
+): string[] {
+  const views: string[] = []
+
+  for (const rule of domainSchema.derivationRules) {
+    if (rule.kind !== 'subtypeInheritance' && rule.kind !== 'closedWorldNegation') {
+      // For modus ponens rules: create a view joining antecedent tables
+      if (rule.kind === 'modusPonens' && rule.antecedentFactTypeIds.length > 0) {
+        const antFt = domainSchema.factTypes[rule.antecedentFactTypeIds[0]]
+        const consFt = rule.consequentFactTypeId ? domainSchema.factTypes[rule.consequentFactTypeId] : null
+        if (antFt && consFt) {
+          const antSubject = antFt.roles[0]?.nounName
+          const consSubject = consFt.roles[0]?.nounName
+          if (antSubject && consSubject) {
+            const antTable = tableMap[antSubject]
+            const consTable = tableMap[consSubject]
+            if (antTable && consTable) {
+              const viewName = `derived_${toColumnName(rule.id)}`
+              views.push(
+                `CREATE VIEW IF NOT EXISTS ${viewName} AS SELECT a.* FROM ${antTable} a WHERE EXISTS (SELECT 1 FROM ${consTable} c WHERE c.id = a.id)`
+              )
+            }
+          }
+        }
+      }
+    }
+  }
+
+  return views
+}
