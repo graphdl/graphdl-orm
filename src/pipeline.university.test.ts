@@ -204,5 +204,5 @@ Academic uses Extension / Extension is used by Academic.`, [])
 })
 
 describe('Parser — formal subtype definitions', () => {
-  it.todo('parses "each Teacher is an Academic who teaches some Subject" — needs regex fix for quoted values')
+  it.todo('parses "each Teacher is an Academic who..." — lines not reaching SUBTYPE_DEFINITION regex, needs parser flow investigation')
 })
