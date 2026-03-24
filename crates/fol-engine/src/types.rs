@@ -182,6 +182,56 @@ pub enum Confidence {
     Incomplete, // derived under OWA — absence doesn't mean false
 }
 
+// ── Proof Engine Types ──────────────────────────────────────────────
+
+/// Result of attempting to prove a goal
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ProofStatus {
+    /// Goal is proven — a derivation chain exists from axioms to the goal
+    Proven,
+    /// Goal is disproven — under CWA, the absence of proof means false
+    Disproven,
+    /// Goal is unknown — under OWA, absence of proof doesn't mean false
+    Unknown,
+}
+
+/// A single step in a proof tree
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProofStep {
+    /// The fact being proven at this step
+    pub fact: String,
+    /// How this fact was established
+    pub justification: Justification,
+    /// Child steps (antecedents that were proven to derive this fact)
+    pub children: Vec<ProofStep>,
+}
+
+/// How a fact was established in a proof
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Justification {
+    /// Fact exists directly in the population (axiom)
+    Axiom,
+    /// Derived by applying a rule to the child steps
+    Derived { rule_id: String, rule_text: String },
+    /// Assumed false under Closed World Assumption
+    ClosedWorldNegation,
+    /// Cannot be proven or disproven under Open World Assumption
+    OpenWorld,
+}
+
+/// Complete proof result
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProofResult {
+    pub goal: String,
+    pub status: ProofStatus,
+    pub proof: Option<ProofStep>,
+    pub world_assumption: WorldAssumption,
+}
+
 /// Result of synthesizing knowledge about a noun
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]

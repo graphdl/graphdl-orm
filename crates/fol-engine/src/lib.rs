@@ -16,7 +16,7 @@ use wasm_bindgen::prelude::*;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 
-use types::{ConstraintIR, ResponseContext, Population, Violation, SynthesisResult};
+use types::{ConstraintIR, ResponseContext, Population, Violation, SynthesisResult, WorldAssumption};
 use compile::{CompiledModel, EvalContext};
 
 struct CompiledState {
@@ -122,4 +122,24 @@ pub fn query_population_wasm(population_json: &str, predicate_json: &str) -> Str
     let predicate: query::QueryPredicate = serde_json::from_str(predicate_json).unwrap_or_default();
     let result = query::query_population(&population, &predicate);
     serde_json::to_string(&result).unwrap_or_else(|_| r#"{"matches":[],"count":0}"#.to_string())
+}
+
+/// Prove a goal fact via backward chaining.
+/// Returns a ProofResult with status (Proven/Disproven/Unknown) and proof tree.
+#[wasm_bindgen]
+pub fn prove_goal(goal: &str, population_json: &str, world_assumption: &str) -> String {
+    let store = state_store().lock().unwrap();
+    let state = match store.as_ref() {
+        Some(s) => s,
+        None => return r#"{"goal":"","status":"unknown","proof":null,"worldAssumption":"closed"}"#.to_string(),
+    };
+
+    let population: Population = serde_json::from_str(population_json).unwrap_or_default();
+    let wa = match world_assumption {
+        "open" => WorldAssumption::Open,
+        _ => WorldAssumption::Closed,
+    };
+
+    let result = evaluate::prove(&state.ir, &population, goal, &wa);
+    serde_json::to_string(&result).unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string())
 }

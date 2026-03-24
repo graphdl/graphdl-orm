@@ -121,6 +121,138 @@ fn add_to_population(population: &mut Population, fact: &DerivedFact) {
         .push(instance);
 }
 
+// ── Proof Engine (Backward Chaining) ─────────────────────────────────
+// Given a goal fact, work backward through derivation rules to build a proof tree.
+// Each step either finds the fact in the population (axiom), derives it via a rule
+// (recursively proving antecedents), or concludes based on world assumption.
+
+/// Attempt to prove a goal fact.
+///
+/// `goal` is a string like "Academic has Rank 'P'" — a reading with optional values.
+/// The engine searches the population for a matching fact, then tries derivation
+/// rules whose consequent matches, recursively proving antecedents.
+pub fn prove(
+    ir: &ConstraintIR,
+    population: &Population,
+    goal: &str,
+    world_assumption: &WorldAssumption,
+) -> ProofResult {
+    let mut visited = HashSet::new();
+    let proof = prove_goal(ir, population, goal, &mut visited);
+
+    let status = match &proof {
+        Some(_) => ProofStatus::Proven,
+        None => match world_assumption {
+            WorldAssumption::Closed => ProofStatus::Disproven,
+            WorldAssumption::Open => ProofStatus::Unknown,
+        },
+    };
+
+    ProofResult {
+        goal: goal.to_string(),
+        status,
+        proof,
+        world_assumption: world_assumption.clone(),
+    }
+}
+
+/// Recursive backward chaining.
+fn prove_goal(
+    ir: &ConstraintIR,
+    population: &Population,
+    goal: &str,
+    visited: &mut HashSet<String>,
+) -> Option<ProofStep> {
+    // Cycle detection
+    if visited.contains(goal) {
+        return None;
+    }
+    visited.insert(goal.to_string());
+
+    // Step 1: Check if the goal is directly in the population (axiom)
+    for (ft_id, facts) in &population.facts {
+        if let Some(ft) = ir.fact_types.get(ft_id) {
+            for fact in facts {
+                // Match goal against reading + bindings
+                let fact_text = format_fact(&ft.reading, &fact.bindings);
+                if fact_text_matches(goal, &fact_text, &ft.reading) {
+                    return Some(ProofStep {
+                        fact: fact_text,
+                        justification: Justification::Axiom,
+                        children: vec![],
+                    });
+                }
+            }
+        }
+    }
+
+    // Step 2: Try derivation rules whose consequent could match the goal
+    for rule in &ir.derivation_rules {
+        if let Some(cons_ft) = ir.fact_types.get(&rule.consequent_fact_type_id) {
+            // Check if the goal could be the consequent of this rule
+            if goal.contains(&cons_ft.reading) || cons_ft.reading.contains(goal.split(' ').next().unwrap_or("")) {
+                // Try to prove all antecedents
+                let mut child_proofs = Vec::new();
+                let mut all_proven = true;
+
+                for ant_ft_id in &rule.antecedent_fact_type_ids {
+                    if let Some(ant_ft) = ir.fact_types.get(ant_ft_id) {
+                        match prove_goal(ir, population, &ant_ft.reading, visited) {
+                            Some(proof) => child_proofs.push(proof),
+                            None => {
+                                all_proven = false;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if all_proven && !child_proofs.is_empty() {
+                    return Some(ProofStep {
+                        fact: goal.to_string(),
+                        justification: Justification::Derived {
+                            rule_id: rule.id.clone(),
+                            rule_text: rule.text.clone(),
+                        },
+                        children: child_proofs,
+                    });
+                }
+            }
+        }
+    }
+
+    visited.remove(goal);
+    None
+}
+
+/// Format a fact from its reading template and bindings
+fn format_fact(reading: &str, bindings: &[(String, String)]) -> String {
+    let mut result = reading.to_string();
+    for (noun, value) in bindings {
+        // Replace first occurrence of the noun name with the value
+        if let Some(pos) = result.find(noun.as_str()) {
+            result = format!("{}{} '{}'{}",
+                &result[..pos], noun, value, &result[pos + noun.len()..]);
+        }
+    }
+    result
+}
+
+/// Check if a goal string matches a formatted fact
+fn fact_text_matches(goal: &str, fact_text: &str, reading: &str) -> bool {
+    // Exact match
+    if goal == fact_text || goal == reading {
+        return true;
+    }
+    // Goal without quotes matches reading
+    let goal_lower = goal.to_lowercase();
+    let fact_lower = fact_text.to_lowercase();
+    let reading_lower = reading.to_lowercase();
+    goal_lower == fact_lower || goal_lower == reading_lower
+        || fact_lower.contains(&goal_lower)
+        || goal_lower.contains(&reading_lower)
+}
+
 // ── Synthesis ────────────────────────────────────────────────────────
 // Collect all knowledge about a noun from the compiled model.
 
