@@ -68,6 +68,11 @@ const SUBTYPE_EXCLUSION = new RegExp(`^No (${N}) is both (?:a |an )?(${N}) and (
 // Subtype totality: "Each Person is a Male or a Female."
 const SUBTYPE_TOTALITY = new RegExp(`^Each (${N}) is (?:a |an )?(${N}) or (?:a |an )?(${N})\\.?$`, 'i')
 
+// Formal subtype definition: "each Teacher is an Academic who teaches some Subject."
+// "each TeachingProf is both a Teacher and a Professor."
+const SUBTYPE_DEFINITION = new RegExp(`^[Ee]ach (${N}) is (?:a |an )(${N}) who\\s+(.+)\\.?$`)
+const SUBTYPE_BOTH = new RegExp(`^[Ee]ach (${N}) is both (?:a |an )?(${N}) and (?:a |an )?(${N})\\.?$`)
+
 // Preferred identification (objectification):
 // 'This association with Model, Make provides the preferred identification scheme for MakeModel.'
 // 'This Code value provides the preferred identifier for Country.'
@@ -333,6 +338,33 @@ export function parseFORML2(
     if (/^Not every\b/i.test(line) ||
         /^Each .+ is (?:a |an ).+(?:,|or )/i.test(line) ||
         /^No .+ belongs to more than one/i.test(line)) {
+      parsedLines++
+      continue
+    }
+
+    // ── Formal subtype definition ─────────────────────────────────
+    // "each Teacher is an Academic who teaches some Subject."
+    m = line.replace(/\.$/, '').match(SUBTYPE_DEFINITION)
+    if (m) {
+      const child = m[1]
+      const parent = m[2]
+      // Store as subtype with defining predicate
+      subtypes.push({ child, parent })
+      if (!nounMap.has(child)) nounMap.set(child, { name: child, objectType: 'entity' })
+      if (!nounMap.has(parent)) nounMap.set(parent, { name: parent, objectType: 'entity' })
+      parsedLines++
+      continue
+    }
+
+    // "each TeachingProf is both a Teacher and a Professor."
+    m = line.replace(/\.$/, '').match(SUBTYPE_BOTH)
+    if (m) {
+      const child = m[1]
+      subtypes.push({ child, parent: m[2] })
+      subtypes.push({ child, parent: m[3] })
+      if (!nounMap.has(child)) nounMap.set(child, { name: child, objectType: 'entity' })
+      if (!nounMap.has(m[2])) nounMap.set(m[2], { name: m[2], objectType: 'entity' })
+      if (!nounMap.has(m[3])) nounMap.set(m[3], { name: m[3], objectType: 'entity' })
       parsedLines++
       continue
     }
