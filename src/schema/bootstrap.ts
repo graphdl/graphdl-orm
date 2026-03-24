@@ -1,4 +1,9 @@
 /**
+ * @deprecated Bootstrap DDL is being replaced by RMAP-generated schemas from readings.
+ * These statements are kept temporarily for backward compatibility with the
+ * DomainDB query engine (private, used by hooks/seed/state machine callers).
+ * Will be removed when all callers migrate to entity-type endpoints.
+ *
  * Bootstrap DDL for GraphDL metamodel tables.
  *
  * AUTO-GENERATED from readings/*.md — do not edit manually.
