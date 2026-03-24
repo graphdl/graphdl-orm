@@ -26,6 +26,8 @@ export interface DomainSchema {
     setComparisonArgumentLength?: number
     clauses?: string[]
     entity?: string
+    minOccurrence?: number
+    maxOccurrence?: number
   }>
   stateMachines: Record<string, {
     nounName: string
@@ -110,6 +112,8 @@ export async function generateSchema(model: {
     if (c.setComparisonArgumentLength) entry.setComparisonArgumentLength = c.setComparisonArgumentLength
     if (c.entity) entry.entity = c.entity
     if (c.clauses) entry.clauses = c.clauses
+    if (c.minOccurrence !== undefined) entry.minOccurrence = c.minOccurrence
+    if (c.maxOccurrence !== undefined) entry.maxOccurrence = c.maxOccurrence
     schemaConstraints.push(entry)
   }
 
