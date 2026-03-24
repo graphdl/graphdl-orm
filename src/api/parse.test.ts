@@ -405,13 +405,13 @@ VIN Decode has Result.
     expect(vinDecode).toBeDefined()
 
     // Readings should reference the multi-word noun names
-    const reading = result.readings.find(r => r.nouns.includes('API Product'))
+    const reading = result.readings.find(r => r.text === 'API Product has Title')
     expect(reading).toBeDefined()
     expect(reading!.nouns).toContain('API Product')
     expect(reading!.nouns).toContain('Title')
     expect(reading!.predicate).toBe('has')
 
-    const reading2 = result.readings.find(r => r.nouns.includes('VIN Decode'))
+    const reading2 = result.readings.find(r => r.text === 'VIN Decode has Result')
     expect(reading2).toBeDefined()
     expect(reading2!.nouns).toContain('VIN Decode')
     expect(reading2!.nouns).toContain('Result')
@@ -485,11 +485,12 @@ Message has Sent At.`
     expect(sentAt).toBeDefined()
     expect(sentAt!.objectType).toBe('value')
 
-    // The reading should reference "Sent At" as a single noun
-    expect(result.readings).toHaveLength(1)
-    expect(result.readings[0].nouns).toContain('Message')
-    expect(result.readings[0].nouns).toContain('Sent At')
-    expect(result.readings[0].predicate).toBe('has')
+    // The explicit reading should reference "Sent At" as a single noun
+    const sentAtReading = result.readings.find(r => r.text === 'Message has Sent At')
+    expect(sentAtReading).toBeDefined()
+    expect(sentAtReading!.nouns).toContain('Message')
+    expect(sentAtReading!.nouns).toContain('Sent At')
+    expect(sentAtReading!.predicate).toBe('has')
 
     // No false nouns "Sent" or "At"
     expect(result.nouns.find(n => n.name === 'Sent')).toBeUndefined()
@@ -536,8 +537,9 @@ Request has Subject.`
 
     // Prose line has no declared nouns → falls through to unparsed
     expect(result.nouns.find(n => n.name === 'Support')).toBeUndefined()
-    expect(result.readings).toHaveLength(1)
-    expect(result.readings[0].text).toBe('Request has Subject')
+    // Explicit reading + implicit ref scheme reading
+    const explicitReading = result.readings.find(r => r.text === 'Request has Subject')
+    expect(explicitReading).toBeDefined()
     // The prose line ends up in unparsed (candidate for LLM extraction)
     expect(result.unparsed).toContainEqual(
       expect.stringContaining('Support request lifecycle')
@@ -613,12 +615,13 @@ Layer State has Arousal.`
     expect(result.nouns.find(n => n.name === 'Layer')).toBeDefined()
     expect(result.nouns.find(n => n.name === 'State')).toBeUndefined()
 
-    // Readings should match "Layer State" as one noun
-    expect(result.readings).toHaveLength(2)
-    expect(result.readings[0].nouns).toContain('Layer State')
-    expect(result.readings[0].nouns).toContain('Valence')
-    expect(result.readings[1].nouns).toContain('Layer State')
-    expect(result.readings[1].nouns).toContain('Arousal')
+    // Explicit readings should match "Layer State" as one noun
+    const valenceReading = result.readings.find(r => r.text === 'Layer State has Valence')
+    expect(valenceReading).toBeDefined()
+    expect(valenceReading!.nouns).toContain('Layer State')
+    const arousalReading = result.readings.find(r => r.text === 'Layer State has Arousal')
+    expect(arousalReading).toBeDefined()
+    expect(arousalReading!.nouns).toContain('Layer State')
   })
 
   it('compound identification: "City(.Name, .State)" registers both ref scheme parts', () => {
@@ -640,7 +643,8 @@ City has State.`
     // Both ref scheme components registered as value types
     expect(result.nouns.find(n => n.name === 'Name')).toBeDefined()
     expect(result.nouns.find(n => n.name === 'State')).toBeDefined()
-    expect(result.readings).toHaveLength(2)
+    // Implicit ref scheme readings + explicit readings (may overlap)
+    expect(result.readings.filter(r => r.nouns.includes('City')).length).toBeGreaterThanOrEqual(2)
   })
 
   it('readings with only 1 declared noun are still stored (unary readings)', () => {
