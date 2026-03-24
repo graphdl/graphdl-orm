@@ -81,3 +81,186 @@ describe('CSDP Step 4: arity check', () => {
     expect(result.valid).toBe(true)
   })
 })
+
+describe('CSDP Step 1: undeclared noun check', () => {
+  it('rejects constraint referencing undeclared noun', () => {
+    const schema = {
+      nouns: [{ name: 'Person', objectType: 'entity' }],
+      factTypes: [{
+        id: 'ft1', reading: 'Person has Name',
+        roles: [{ nounName: 'Person', roleIndex: 0 }, { nounName: 'Name', roleIndex: 1 }],
+      }],
+      constraints: [],
+    }
+    const result = validateCsdp(schema)
+    expect(result.violations.some(v => v.type === 'undeclared_noun')).toBe(true)
+  })
+
+  it('accepts fact type where all nouns are declared', () => {
+    const schema = {
+      nouns: [
+        { name: 'Person', objectType: 'entity' },
+        { name: 'Name', objectType: 'value' },
+      ],
+      factTypes: [{
+        id: 'ft1', reading: 'Person has Name',
+        roles: [{ nounName: 'Person', roleIndex: 0 }, { nounName: 'Name', roleIndex: 1 }],
+      }],
+      constraints: [],
+    }
+    const result = validateCsdp(schema)
+    expect(result.violations.some(v => v.type === 'undeclared_noun')).toBe(false)
+  })
+})
+
+describe('CSDP Step 1: non-elementary fact check', () => {
+  it('flags reading with potential non-elementary conjunction', () => {
+    const schema = {
+      nouns: [
+        { name: 'Customer', objectType: 'entity' },
+        { name: 'Name', objectType: 'value' },
+        { name: 'Request', objectType: 'entity' },
+      ],
+      factTypes: [{
+        id: 'ft1', reading: 'Customer has Name and submits Request',
+        roles: [
+          { nounName: 'Customer', roleIndex: 0 },
+          { nounName: 'Name', roleIndex: 1 },
+          { nounName: 'Request', roleIndex: 2 },
+        ],
+      }],
+      constraints: [],
+    }
+    const result = validateCsdp(schema)
+    expect(result.violations.some(v => v.type === 'non_elementary_fact')).toBe(true)
+  })
+
+  it('accepts reading without conjunction', () => {
+    const schema = {
+      nouns: [
+        { name: 'Person', objectType: 'entity' },
+        { name: 'Name', objectType: 'value' },
+      ],
+      factTypes: [{
+        id: 'ft1', reading: 'Person has Name',
+        roles: [
+          { nounName: 'Person', roleIndex: 0 },
+          { nounName: 'Name', roleIndex: 1 },
+        ],
+      }],
+      constraints: [],
+    }
+    const result = validateCsdp(schema)
+    expect(result.violations.some(v => v.type === 'non_elementary_fact')).toBe(false)
+  })
+
+  it('does not flag "and" within a noun name', () => {
+    const schema = {
+      nouns: [
+        { name: 'Research and Development', objectType: 'entity' },
+        { name: 'Budget', objectType: 'value' },
+      ],
+      factTypes: [{
+        id: 'ft1', reading: 'Research and Development has Budget',
+        roles: [
+          { nounName: 'Research and Development', roleIndex: 0 },
+          { nounName: 'Budget', roleIndex: 1 },
+        ],
+      }],
+      constraints: [],
+    }
+    const result = validateCsdp(schema)
+    expect(result.violations.some(v => v.type === 'non_elementary_fact')).toBe(false)
+  })
+})
+
+describe('CSDP Step 6: missing subtype constraint', () => {
+  it('flags subtypes without totality or exclusion constraint', () => {
+    const schema = {
+      nouns: [
+        { name: 'Person', objectType: 'entity' },
+        { name: 'Male', objectType: 'entity' },
+        { name: 'Female', objectType: 'entity' },
+      ],
+      factTypes: [],
+      constraints: [],
+      subtypes: [
+        { subtype: 'Male', supertype: 'Person' },
+        { subtype: 'Female', supertype: 'Person' },
+      ],
+    }
+    const result = validateCsdp(schema)
+    expect(result.violations.some(v => v.type === 'missing_subtype_constraint')).toBe(true)
+  })
+
+  it('accepts subtypes with totality constraint', () => {
+    const schema = {
+      nouns: [
+        { name: 'Person', objectType: 'entity' },
+        { name: 'Male', objectType: 'entity' },
+        { name: 'Female', objectType: 'entity' },
+      ],
+      factTypes: [],
+      constraints: [{
+        kind: 'XO',
+        factTypeId: '',
+        roles: [],
+        text: 'Person is totally divided into Male, Female',
+      }],
+      subtypes: [
+        { subtype: 'Male', supertype: 'Person' },
+        { subtype: 'Female', supertype: 'Person' },
+      ],
+    }
+    const result = validateCsdp(schema)
+    expect(result.violations.some(v => v.type === 'missing_subtype_constraint')).toBe(false)
+  })
+})
+
+describe('CSDP Step 7: missing ring constraint', () => {
+  it('flags self-referential binary without ring constraint', () => {
+    const schema = {
+      nouns: [{ name: 'Person', objectType: 'entity' }],
+      factTypes: [{
+        id: 'ft1', reading: 'Person is parent of Person',
+        roles: [{ nounName: 'Person', roleIndex: 0 }, { nounName: 'Person', roleIndex: 1 }],
+      }],
+      constraints: [],
+    }
+    const result = validateCsdp(schema)
+    expect(result.violations.some(v => v.type === 'missing_ring_constraint')).toBe(true)
+  })
+
+  it('accepts self-referential binary with ring constraint', () => {
+    const schema = {
+      nouns: [{ name: 'Person', objectType: 'entity' }],
+      factTypes: [{
+        id: 'ft1', reading: 'Person is parent of Person',
+        roles: [{ nounName: 'Person', roleIndex: 0 }, { nounName: 'Person', roleIndex: 1 }],
+      }],
+      constraints: [{
+        kind: 'IR',
+        factTypeId: 'ft1',
+        roles: [0, 1],
+      }],
+    }
+    const result = validateCsdp(schema)
+    expect(result.violations.some(v => v.type === 'missing_ring_constraint')).toBe(false)
+  })
+
+  it('does not flag binary with different noun types', () => {
+    const schema = {
+      nouns: [
+        { name: 'Person', objectType: 'entity' },
+        { name: 'Name', objectType: 'value' },
+      ],
+      factTypes: [{
+        id: 'ft1', reading: 'Person has Name',
+        roles: [{ nounName: 'Person', roleIndex: 0 }, { nounName: 'Name', roleIndex: 1 }],
+      }],
+      constraints: [],
+    }
+    const result = validateCsdp(schema)
+    expect(result.violations.some(v => v.type === 'missing_ring_constraint')).toBe(false)
+  })
+})
