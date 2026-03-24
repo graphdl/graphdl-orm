@@ -1191,7 +1191,11 @@ fn compile_set_comparison(
     })
 }
 
-fn compile_subset(_ir: &ConstraintIR, def: &ConstraintDef) -> Predicate {
+/// SS: Subset constraint — pop(rs1) ⊆ pop(rs2).
+/// For join-path subsets like "If Academic heads Department then that Academic
+/// works for that Department", checks that every (Academic, Department) pair
+/// in fact type A also exists in fact type B, matching by noun name.
+fn compile_subset(ir: &ConstraintIR, def: &ConstraintDef) -> Predicate {
     let id = def.id.clone();
     let text = def.text.clone();
 
@@ -1202,33 +1206,54 @@ fn compile_subset(_ir: &ConstraintIR, def: &ConstraintDef) -> Predicate {
     let a_ft_id = def.spans[0].fact_type_id.clone();
     let b_ft_id = def.spans[1].fact_type_id.clone();
 
-    // Resolve entity noun name from the first span's role
-    let entity_name = _ir.fact_types.get(&a_ft_id)
-        .and_then(|ft| ft.roles.get(def.spans[0].role_index))
-        .map(|r| r.noun_name.clone())
+    // Find common noun names between the two fact types — these are the join keys
+    let a_nouns: Vec<String> = ir.fact_types.get(&a_ft_id)
+        .map(|ft| ft.roles.iter().map(|r| r.noun_name.clone()).collect())
         .unwrap_or_default();
+    let b_nouns: Vec<String> = ir.fact_types.get(&b_ft_id)
+        .map(|ft| ft.roles.iter().map(|r| r.noun_name.clone()).collect())
+        .unwrap_or_default();
+    let common_nouns: Vec<String> = a_nouns.iter()
+        .filter(|n| b_nouns.contains(n))
+        .cloned()
+        .collect();
 
     Arc::new(move |ctx: &EvalContext| {
         let a_facts = ctx.population.facts.get(&a_ft_id).cloned().unwrap_or_default();
         let b_facts = ctx.population.facts.get(&b_ft_id).cloned().unwrap_or_default();
 
+        // Build a set of value tuples from B for fast lookup
+        let b_tuples: HashSet<Vec<String>> = b_facts.iter().map(|bf| {
+            common_nouns.iter().map(|noun| {
+                bf.bindings.iter()
+                    .find(|(name, _)| name == noun)
+                    .map(|(_, val)| val.clone())
+                    .unwrap_or_default()
+            }).collect()
+        }).collect();
+
+        // Check each fact in A — its common-noun tuple must exist in B
         a_facts.iter().filter_map(|a_fact| {
-            if let Some((_, entity_val)) = a_fact.bindings.iter().find(|(name, _)| *name == entity_name) {
-                let b_holds = b_facts.iter().any(|bf| {
-                    bf.bindings.iter().any(|(_, val)| val == entity_val)
-                });
-                if !b_holds {
-                    Some(Violation {
-                        constraint_id: id.clone(),
-                        constraint_text: text.clone(),
-                        detail: format!(
-                            "Subset violation: entity '{}' has fact A but not fact B",
-                            entity_val
-                        ),
-                    })
-                } else {
-                    None
-                }
+            let a_tuple: Vec<String> = common_nouns.iter().map(|noun| {
+                a_fact.bindings.iter()
+                    .find(|(name, _)| name == noun)
+                    .map(|(_, val)| val.clone())
+                    .unwrap_or_default()
+            }).collect();
+
+            if !b_tuples.contains(&a_tuple) {
+                let pair_desc = common_nouns.iter().zip(a_tuple.iter())
+                    .map(|(n, v)| format!("{} '{}'", n, v))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Some(Violation {
+                    constraint_id: id.clone(),
+                    constraint_text: text.clone(),
+                    detail: format!(
+                        "Subset violation: ({}) participates in '{}' but not in '{}'",
+                        pair_desc, a_ft_id, b_ft_id
+                    ),
+                })
             } else {
                 None
             }
@@ -1236,7 +1261,9 @@ fn compile_subset(_ir: &ConstraintIR, def: &ConstraintDef) -> Predicate {
     })
 }
 
-fn compile_equality(_ir: &ConstraintIR, def: &ConstraintDef) -> Predicate {
+/// EQ: Equality constraint — pop(rs1) = pop(rs2) (bidirectional subset).
+/// Uses tuple-based comparison same as compile_subset.
+fn compile_equality(ir: &ConstraintIR, def: &ConstraintDef) -> Predicate {
     let id = def.id.clone();
     let text = def.text.clone();
 
@@ -1247,33 +1274,56 @@ fn compile_equality(_ir: &ConstraintIR, def: &ConstraintDef) -> Predicate {
     let a_ft_id = def.spans[0].fact_type_id.clone();
     let b_ft_id = def.spans[1].fact_type_id.clone();
 
+    let a_nouns: Vec<String> = ir.fact_types.get(&a_ft_id)
+        .map(|ft| ft.roles.iter().map(|r| r.noun_name.clone()).collect())
+        .unwrap_or_default();
+    let b_nouns: Vec<String> = ir.fact_types.get(&b_ft_id)
+        .map(|ft| ft.roles.iter().map(|r| r.noun_name.clone()).collect())
+        .unwrap_or_default();
+    let common_nouns: Vec<String> = a_nouns.iter()
+        .filter(|n| b_nouns.contains(n))
+        .cloned()
+        .collect();
+
     Arc::new(move |ctx: &EvalContext| {
         let a_facts = ctx.population.facts.get(&a_ft_id).cloned().unwrap_or_default();
         let b_facts = ctx.population.facts.get(&b_ft_id).cloned().unwrap_or_default();
 
-        let a_entities: HashSet<String> = a_facts.iter()
-            .flat_map(|f| f.bindings.iter().map(|(_, v)| v.clone()))
-            .collect();
+        let extract_tuples = |facts: &[FactInstance]| -> HashSet<Vec<String>> {
+            facts.iter().map(|f| {
+                common_nouns.iter().map(|noun| {
+                    f.bindings.iter()
+                        .find(|(name, _)| name == noun)
+                        .map(|(_, val)| val.clone())
+                        .unwrap_or_default()
+                }).collect()
+            }).collect()
+        };
 
-        let b_entities: HashSet<String> = b_facts.iter()
-            .flat_map(|f| f.bindings.iter().map(|(_, v)| v.clone()))
-            .collect();
+        let a_tuples = extract_tuples(&a_facts);
+        let b_tuples = extract_tuples(&b_facts);
 
         let mut violations = Vec::new();
 
-        for entity in a_entities.difference(&b_entities) {
+        for tuple in a_tuples.difference(&b_tuples) {
+            let desc = common_nouns.iter().zip(tuple.iter())
+                .map(|(n, v)| format!("{} '{}'", n, v))
+                .collect::<Vec<_>>().join(", ");
             violations.push(Violation {
                 constraint_id: id.clone(),
                 constraint_text: text.clone(),
-                detail: format!("Equality violation: '{}' has fact A but not fact B", entity),
+                detail: format!("Equality violation: ({}) in '{}' but not in '{}'", desc, a_ft_id, b_ft_id),
             });
         }
 
-        for entity in b_entities.difference(&a_entities) {
+        for tuple in b_tuples.difference(&a_tuples) {
+            let desc = common_nouns.iter().zip(tuple.iter())
+                .map(|(n, v)| format!("{} '{}'", n, v))
+                .collect::<Vec<_>>().join(", ");
             violations.push(Violation {
                 constraint_id: id.clone(),
                 constraint_text: text.clone(),
-                detail: format!("Equality violation: '{}' has fact B but not fact A", entity),
+                detail: format!("Equality violation: ({}) in '{}' but not in '{}'", desc, b_ft_id, a_ft_id),
             });
         }
 
