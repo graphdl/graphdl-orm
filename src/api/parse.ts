@@ -540,6 +540,10 @@ export function parseFORML2(
     // Try to parse as a reading — this is the catch-all for fact type lines
     const cleanLine = line.replace(/\.$/, '')
 
+    // Handle forward / inverse readings: "A verb B / B verb A"
+    // Per Halpin: both readings separated by "/" on the same line
+    const slashParts = cleanLine.split(/\s+\/\s+/)
+
     // Build current noun list for tokenization (declared nouns only)
     const currentNouns = [
       ...existingNouns,
@@ -548,23 +552,37 @@ export function parseFORML2(
         .map(n => ({ name: n.name, id: '' })),
     ]
 
-    // Tokenize against declared nouns — longest-match-first via tokenizeReading
-    const tokenized = tokenizeReading(cleanLine, currentNouns)
+    // Tokenize the primary (forward) reading
+    const primaryText = slashParts[0].trim()
+    const tokenized = tokenizeReading(primaryText, currentNouns)
     const nounNames = tokenized.nounRefs.map(r => r.name)
+
+    // If there's an inverse reading, parse it too (linked to same graph schema during ingestion)
+    if (slashParts.length > 1) {
+      const inverseText = slashParts[1].trim()
+      const inverseTokenized = tokenizeReading(inverseText, currentNouns)
+      if (inverseTokenized.nounRefs.length >= 2) {
+        readings.push({
+          text: inverseText,
+          nouns: inverseTokenized.nounRefs.map(r => r.name),
+          predicate: inverseTokenized.predicate || '',
+        })
+      }
+    }
 
     // Unary fact (1 noun)
     if (nounNames.length === 1) {
-      const predicate = tokenized.predicate || cleanLine.replace(nounNames[0], '').trim()
-      readings.push({ text: cleanLine, nouns: nounNames, predicate })
+      const predicate = tokenized.predicate || primaryText.replace(nounNames[0], '').trim()
+      readings.push({ text: primaryText, nouns: nounNames, predicate })
       parsedLines++
       continue
     }
 
     // Binary+ fact (2+ nouns)
     if (nounNames.length >= 2) {
-      const predicate = tokenized.predicate || extractPredicate(cleanLine, nounNames)
+      const predicate = tokenized.predicate || extractPredicate(primaryText, nounNames)
 
-      readings.push({ text: cleanLine, nouns: nounNames, predicate })
+      readings.push({ text: primaryText, nouns: nounNames, predicate })
 
       // Parse indented constraint lines following this reading
       while (i + 1 < lines.length && /^\s+\S/.test(lines[i + 1])) {
