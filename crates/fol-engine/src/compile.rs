@@ -653,6 +653,7 @@ fn compile_constraint(ir: &ConstraintIR, def: &ConstraintDef) -> CompiledConstra
             "UC" => compile_uniqueness(ir, def),
             "MC" => compile_mandatory(ir, def),
             "FC" => compile_frequency(ir, def),
+            "VC" => compile_value_constraint(ir, def),
             // Ring constraints — each property has its own evaluator
             "IR" => compile_ring_irreflexive(def),
             "AS" => compile_ring_asymmetric(def),
@@ -785,6 +786,61 @@ fn compile_mandatory(_ir: &ConstraintIR, def: &ConstraintDef) -> Predicate {
                 })
                 .collect::<Vec<_>>()
         }).collect()
+    })
+}
+
+/// VC: Value constraint — each value in the constrained role must be in the
+/// noun's allowed value set (enum_values). Per Halpin Ch 6.3.
+fn compile_value_constraint(ir: &ConstraintIR, def: &ConstraintDef) -> Predicate {
+    let id = def.id.clone();
+    let text = def.text.clone();
+    let spans = resolve_spans(ir, &def.spans);
+
+    // Collect allowed values from the nouns in the spanned fact types
+    let allowed: Vec<(String, HashSet<String>)> = spans.iter().filter_map(|span| {
+        let noun_def = ir.nouns.get(&span.noun_name)?;
+        let vals = noun_def.enum_values.as_ref()?;
+        if vals.is_empty() { return None; }
+        Some((span.noun_name.clone(), vals.iter().cloned().collect::<HashSet<_>>()))
+    }).collect();
+
+    // If no enum values found on spanned nouns, check all nouns with enum_values
+    // against their occurrences in the population (population-wide VC)
+    let all_enum_nouns: Vec<(String, HashSet<String>)> = if allowed.is_empty() {
+        ir.nouns.iter().filter_map(|(name, noun)| {
+            let vals = noun.enum_values.as_ref()?;
+            if vals.is_empty() { return None; }
+            Some((name.clone(), vals.iter().cloned().collect::<HashSet<_>>()))
+        }).collect()
+    } else {
+        Vec::new()
+    };
+
+    Arc::new(move |ctx: &EvalContext| {
+        let check_nouns = if !allowed.is_empty() { &allowed } else { &all_enum_nouns };
+        let mut violations = Vec::new();
+
+        for (noun_name, valid_values) in check_nouns {
+            // Scan all facts for this noun's values
+            for facts in ctx.population.facts.values() {
+                for fact in facts {
+                    for (name, val) in &fact.bindings {
+                        if name == noun_name && !valid_values.contains(val) {
+                            violations.push(Violation {
+                                constraint_id: id.clone(),
+                                constraint_text: text.clone(),
+                                detail: format!(
+                                    "Value constraint violation: {} '{}' is not in {{{}}}",
+                                    noun_name, val,
+                                    valid_values.iter().cloned().collect::<Vec<_>>().join(", ")
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        violations
     })
 }
 

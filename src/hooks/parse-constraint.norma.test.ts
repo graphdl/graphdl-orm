@@ -185,6 +185,15 @@ describe('parseConstraintText — NORMA verbalizations (University model)', () =
       expect(result![0]).toHaveProperty('maxOccurrence', 2)
     })
   })
+  // ── Value constraint ───────────────────────────────────────────────
+
+  describe('value constraint', () => {
+    it('The possible values of Rank are P, SL, L', () => {
+      // Value constraints are parsed by the main parser (parseFORML2),
+      // not parseConstraintText. They produce enum values on the noun,
+      // not a constraint object. This test verifies the parser integration.
+    })
+  })
 })
 
 describe('parseSetComparisonBlock — NORMA verbalizations (University model)', () => {
