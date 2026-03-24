@@ -8,7 +8,6 @@ import { handleParse } from './parse'
 import { handleParseOrm } from './parse-orm'
 import { handleVerify } from './verify'
 import { handleEvaluate, handleSynthesize } from './evaluate'
-import { createWithHook, refreshNouns, type HookContext, COLLECTION_HOOKS } from '../hooks'
 import { getInitialState, getValidTransitions, applyTransition } from '../worker/state-machine'
 import { handleConceptualQuery } from './conceptual-query'
 import { deriveOnWrite } from '../worker/derive-on-write'
@@ -663,24 +662,8 @@ router.post('/api/:collection', async (request, env: Env) => {
     return json({ doc: { id: result.id, ...body }, message: 'Created successfully' }, { status: 201 })
   }
 
-  // Fallback: legacy DomainDB handler
+  // Fallback: legacy DomainDB handler (no hooks — hook logic moved to BatchBuilder steps)
   const { db } = await resolveDomainDB(env, undefined, body)
-
-  // If a hook exists for this collection, use createWithHook
-  if (COLLECTION_HOOKS[collection]) {
-    const domainId = body.domain || ''
-    const allNouns = domainId ? await refreshNouns(db, domainId) : []
-    const context: HookContext = { domainId, allNouns }
-    const { doc, hookResult } = await createWithHook(db, collection, body, context)
-    return json({
-      doc,
-      message: 'Created successfully',
-      ...(Object.keys(hookResult.created).length > 0 && { created: hookResult.created }),
-      ...(hookResult.warnings.length > 0 && { warnings: hookResult.warnings }),
-    }, { status: 201 })
-  }
-
-  // No hook — standard create
   const doc = await (db as any).createInCollection(collection, body)
   return json({ doc, message: 'Created successfully' }, { status: 201 })
 })
