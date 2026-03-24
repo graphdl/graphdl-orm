@@ -28,6 +28,8 @@ export interface NounDef {
   referenceScheme?: NounDef[]
   permissions?: string[]
   worldAssumption?: WorldAssumption
+  /** Subtype mapping strategy for relational mapping (Halpin Ch 10, p.426-428) */
+  subtypeMapping?: 'absorption' | 'separation' | 'partition'
 }
 
 export interface FactTypeDef {
