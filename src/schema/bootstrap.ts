@@ -116,7 +116,8 @@ export const BOOTSTRAP_DDL: string[] = [
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
   version INTEGER NOT NULL DEFAULT 1,
   text TEXT NOT NULL,
-  graph_schema_id TEXT REFERENCES graph_schemas(id)
+  graph_schema_id TEXT REFERENCES graph_schemas(id),
+  verb_id TEXT REFERENCES verbs(id)
 )`,
 
   `CREATE INDEX IF NOT EXISTS idx_readings_domain ON readings(domain_id)`,
