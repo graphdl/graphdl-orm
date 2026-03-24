@@ -2,7 +2,6 @@ import { json, error } from 'itty-router'
 import type { Env } from '../types'
 import { ingestClaims } from '../claims/ingest'
 import type { ExtractedClaims } from '../claims/ingest'
-import { createDomainAdapter } from '../do-adapter'
 import { parseFORML2 } from './parse'
 
 // ── DO helpers ───────────────────────────────────────────────────────
@@ -166,7 +165,7 @@ async function handleBulkSeed(
       await domainDO.setDomainId(entry.slug)
       const domainRecord = await ensureDomain(domainDO, entry.slug, entry.name)
       const domainUUID = domainRecord.id as string
-      const adapter = createDomainAdapter(domainDO)
+      const adapter = domainDO as any
       const claimsWithoutFacts = { ...entry.claims, facts: [] }
       const result = await ingestClaims(adapter, {
         claims: claimsWithoutFacts,
@@ -273,7 +272,7 @@ async function handleSingleSeed(
   const domainRecord = await ensureDomain(domainDO, domainSlug)
   const domainUUID = domainRecord.id as string
 
-  const adapter = createDomainAdapter(domainDO)
+  const adapter = domainDO as any
   const result = await ingestClaims(adapter, { claims: body.claims!, domainId: domainUUID })
 
   // Register in the global registry

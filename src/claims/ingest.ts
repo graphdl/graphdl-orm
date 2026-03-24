@@ -1,10 +1,13 @@
 /**
- * Claims ingestion — ported from Payload to GraphDLDBLike.
- *
- * Two entry points:
- * - ingestClaims()   — bulk structured claims
+ * Claims ingestion — bulk structured claims.
  */
-import type { GraphDLDBLike } from '../do-adapter'
+
+/** Minimal DB interface expected by claims step functions. */
+export interface GraphDLDBLike {
+  findInCollection(collection: string, where: any, opts?: any): Promise<{ docs: any[]; totalDocs: number }>
+  createInCollection(collection: string, data: any): Promise<any>
+  updateInCollection(collection: string, id: string, updates: any): Promise<any>
+}
 import { createScope } from './scope'
 import { ingestNouns, ingestSubtypes, ingestReadings, ingestConstraints, ingestTransitions, ingestFacts } from './steps'
 import type { DerivationRule } from '../derivation/parse-rule'
