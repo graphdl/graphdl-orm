@@ -132,21 +132,19 @@ Each Entity List has at most one Page per Page Number.
 
 ## Derivation Rules
 
-List Item Display Text := Resource reference or Resource value or Resource id.
-List Item Display Subtext := Resource value when Resource has both reference and value.
-List Item Display Status := State Machine currentStatus name where State Machine is for Resource.
-List Item Display Image Path := Resource imagePath when Resource has imagePath.
-Entity List Total Docs := API response totalDocs.
-Entity List Total Pages := API response totalPages.
-Page Page Number := API response page.
+List Item has Display Text iff List Item displays Resource and that Resource has Reference and Display Text is that Reference.
+List Item has Display Text iff List Item displays Resource and that Resource has Value and that Resource has no Reference and Display Text is that Value.
+List Item has Display Subtext iff List Item displays Resource and that Resource has Reference and that Resource has Value and Display Subtext is that Value.
+List Item has Display Status iff List Item displays Resource and some State Machine is for that Resource and that State Machine is currently in some Status and Display Status is that Status.
+List Item has Display Image Path iff List Item displays Resource and that Resource has Value and Display Image Path is that Value.
 
 ## Deontic Constraints
 
-It is obligatory that Entity List pagination parameters (Page Size, Page Number, Sort Field, Sort Direction) map one-to-one to API query parameters (limit, page, sort).
-It is obligatory that when a Resource is created matching Entity List Noun and Domain, a List Item is added to Entity List.
-It is obligatory that when a Resource Display Text, Display Subtext, Display Status, or Display Image Path changes, the corresponding List Item properties are updated.
-It is obligatory that when a Resource is deleted, the corresponding List Item is removed from Entity List.
-It is obligatory that when a List Item is removed from a paginated Entity List and Total Docs exceeds the displayed count, Entity List fetches the next Resource to fill the gap.
-It is obligatory that when Scroll Style is 'infinite-scroll', loading the next Page appends List Items to the existing list rather than replacing it.
-It is obligatory that when Scroll Style is 'paginated', loading a Page replaces the current List Items.
-It is obligatory that when Scroll Style is 'load-more', activating load appends the next Page of List Items.
+It is obligatory that each Entity List has some Page Size.
+It is obligatory that each Entity List has some Sort Field.
+It is obligatory that each Entity List has some Sort Direction.
+
+If some Resource is instance of some Noun and some Entity List displays instances of that Noun and that Resource belongs to some Domain and that Entity List belongs to that Domain then some List Item displays that Resource and that List Item belongs to some Page of that Entity List.
+If some List Item displays some Resource and that Resource is deleted then that List Item is removed.
+If some Entity List has Scroll Style 'infinite-scroll' then for each Page of that Entity List, that Page appends to the existing List Items.
+If some Entity List has Scroll Style 'paginated' then for each Page of that Entity List, that Page replaces the current List Items.

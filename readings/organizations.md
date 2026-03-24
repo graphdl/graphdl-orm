@@ -71,13 +71,13 @@ Domain has Visibility.
 
 ## Constraints
 
-It is obligatory that when the owner User of an Organization is deleted, that Organization is also deleted.
+If some Organization is owned by some User and that User is deleted then that Organization is also deleted.
 
 ## Derivation Rules
 
-User can access Domain where User has Org Role in Organization and Domain belongs to that Organization.
-Any User can access Domain where Domain has Visibility 'public'.
+User can access Domain iff User has Org Role in Organization and Domain belongs to that Organization.
+User can access Domain if Domain has Visibility 'public'.
 Domain is visible to Domain := that Domain is the same Domain.
 Domain is visible to Domain := Domain has Visibility 'public'.
-Domain is visible to Domain := Domain belongs to App and that Domain belongs to the same App.
-Domain is visible to Domain := Domain belongs to Organization and that Domain belongs to the same Organization.
+Domain is visible to Domain if Domain belongs to App and that Domain belongs to the same App.
+Domain is visible to Domain if Domain belongs to Organization and that Domain belongs to the same Organization.
