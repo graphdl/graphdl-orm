@@ -1,5 +1,6 @@
 import { json, error } from 'itty-router'
 import type { Env } from '../types'
+import { persistViolations } from '../worker/outcomes'
 // @ts-ignore — WASM module imported by wrangler's CompiledWasm rule
 import wasmModule from '../../crates/fol-engine/pkg/fol_engine_bg.wasm'
 // @ts-ignore — WASM JS bindings (web target with initSync)
@@ -84,12 +85,23 @@ export async function handleEvaluate(request: Request, env: Env): Promise<Respon
     )
     const violations = JSON.parse(violationJson)
 
+    const mappedViolations = violations.map((v: any) => ({
+      constraintId: v.constraintId,
+      constraintText: v.constraintText,
+      detail: v.detail,
+    }))
+
+    // Best-effort: persist violations as EntityDB DOs (don't block response)
+    if (violations.length > 0) {
+      persistViolations(env, violations.map((v: any) => ({
+        domain: body.domainId!,
+        constraintId: v.constraintId ?? null,
+        text: v.detail || v.constraintText || 'Constraint violation',
+      }))).catch(() => { /* swallow — best-effort persistence */ })
+    }
+
     return json({
-      violations: violations.map((v: any) => ({
-        constraintId: v.constraintId,
-        constraintText: v.constraintText,
-        detail: v.detail,
-      })),
+      violations: mappedViolations,
       constraintCount: domainSchema.constraints?.length || 0,
       domainId: body.domainId,
     })

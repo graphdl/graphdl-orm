@@ -15,9 +15,24 @@ import type { ExtractedClaims } from '../claims/ingest'
 
 // ── Public types ─────────────────────────────────────────────────────
 
+export interface ViolationEntity {
+  id: string
+  type: 'Violation'
+  data: {
+    constraintId: string | null
+    text: string
+    severity: 'error'
+    failureType: string
+    fix: string
+    occurredAt: string
+  }
+}
+
 export interface PipelineResult {
   valid: boolean
   violations: CsdpViolation[]
+  /** Violation entities ready for persistence as EntityDB DOs. */
+  violationEntities: ViolationEntity[]
   batch?: { domain: string; entities: BatchEntity[] }
   tables?: TableDef[]
   induced?: InductionResult
@@ -41,7 +56,20 @@ export function runCsdpPipeline(claims: ExtractedClaims, domain: string): Pipeli
   // Step 2: Validate via CSDP
   const validation = validateCsdp(schemaIR)
   if (!validation.valid) {
-    return { valid: false, violations: validation.violations }
+    const now = new Date().toISOString()
+    const violationEntities: ViolationEntity[] = validation.violations.map(v => ({
+      id: crypto.randomUUID(),
+      type: 'Violation' as const,
+      data: {
+        constraintId: v.constraintId ?? null,
+        text: v.message,
+        severity: 'error' as const,
+        failureType: v.type,
+        fix: v.fix,
+        occurredAt: now,
+      },
+    }))
+    return { valid: false, violations: validation.violations, violationEntities }
   }
 
   // Step 3: Build batch via BatchBuilder
@@ -100,6 +128,7 @@ export function runCsdpPipeline(claims: ExtractedClaims, domain: string): Pipeli
   return {
     valid: true,
     violations: [],
+    violationEntities: [],
     batch: builder.toBatch(),
     tables,
     induced,
