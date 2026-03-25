@@ -1,0 +1,54 @@
+# GraphDL Outcomes — Violations and Failures as Facts
+
+Violations and failures are first-class domain entities, not out-of-band error responses.
+Every evaluation path returns either valid claims, violation facts, failure facts, or a combination. No silent paths.
+
+## Entity Types
+
+Violation(.id) is an entity type.
+Failure(.id) is an entity type.
+
+## Value Types
+
+Failure Type is a value type.
+  The possible values of Failure Type are 'extraction', 'evaluation', 'transition', 'parse', 'induction'.
+Severity is a value type.
+  The possible values of Severity are 'error', 'warning', 'info'.
+Confidence is a value type.
+
+## Fact Types
+
+### Violation
+Violation belongs to Domain.
+  Each Violation belongs to exactly one Domain.
+Violation is of Constraint.
+  Each Violation is of exactly one Constraint.
+Violation is against Resource.
+  Each Violation is against at most one Resource.
+Violation has Text.
+  Each Violation has exactly one Text.
+Violation has Severity.
+  Each Violation has exactly one Severity.
+Violation occurred at Timestamp.
+  Each Violation occurred at exactly one Timestamp.
+Violation belongs to Batch.
+  Each Violation belongs to at most one Batch.
+
+### Failure
+Failure belongs to Domain.
+  Each Failure belongs to at most one Domain.
+Failure has Failure Type.
+  Each Failure has exactly one Failure Type.
+Failure has input Text.
+  Each Failure has at most one input Text.
+Failure has reason Text.
+  Each Failure has exactly one reason Text.
+Failure has Severity.
+  Each Failure has exactly one Severity.
+Failure occurred at Timestamp.
+  Each Failure occurred at exactly one Timestamp.
+
+## Constraints
+
+Each Violation is of exactly one Constraint.
+Each Failure has exactly one Failure Type.
