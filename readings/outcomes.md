@@ -23,8 +23,8 @@ Violation belongs to Domain.
   Each Violation belongs to exactly one Domain.
 Violation is of Constraint.
   Each Violation is of exactly one Constraint.
-Violation is against Resource.
-  Each Violation is against at most one Resource.
+Violation is against Function.
+  Each Violation is against at most one Function.
 Violation has Text.
   Each Violation has exactly one Text.
 Violation has Severity.
@@ -39,6 +39,8 @@ Failure belongs to Domain.
   Each Failure belongs to at most one Domain.
 Failure has Failure Type.
   Each Failure has exactly one Failure Type.
+Failure is against Function.
+  Each Failure is against at most one Function.
 Failure has input Text.
   Each Failure has at most one input Text.
 Failure has reason Text.
