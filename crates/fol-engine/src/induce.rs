@@ -211,7 +211,7 @@ pub fn induce(ir: &ConstraintIR, population: &Population) -> InductionResult {
         .filter_map(|(ft_id, facts)| {
             let ft = ir.fact_types.get(ft_id)?;
             if ft.roles.is_empty() { return None; }
-            let noun = &ft.roles[0].noun_name;
+            let _noun = &ft.roles[0].noun_name;
             let vals: HashSet<String> = facts.iter()
                 .filter_map(|f| f.bindings.first().map(|(_, v)| v.clone()))
                 .collect();

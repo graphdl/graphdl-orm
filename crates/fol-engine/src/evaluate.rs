@@ -21,6 +21,7 @@ pub fn evaluate(model: &CompiledModel, ctx: &EvalContext) -> Vec<Violation> {
 
 /// Run a compiled state machine by folding events through the transition function.
 /// run_machine = fold(transition)(initial)(stream)
+#[allow(dead_code)] // used by lib.rs WASM export, not by main.rs binary
 pub fn run_machine(
     machine: &crate::compile::CompiledStateMachine,
     events: &[(String, String)],
@@ -33,6 +34,7 @@ pub fn run_machine(
 
 /// Convenience: compile + evaluate in one call.
 /// Used by tests and as backward-compatible entry point.
+#[allow(dead_code)] // used by tests
 pub fn evaluate_ir(
     ir: &ConstraintIR,
     response: &ResponseContext,
@@ -131,6 +133,7 @@ fn add_to_population(population: &mut Population, fact: &DerivedFact) {
 /// `goal` is a string like "Academic has Rank 'P'" — a reading with optional values.
 /// The engine searches the population for a matching fact, then tries derivation
 /// rules whose consequent matches, recursively proving antecedents.
+#[allow(dead_code)] // used by lib.rs WASM export, not by main.rs binary
 pub fn prove(
     ir: &ConstraintIR,
     population: &Population,
@@ -157,6 +160,7 @@ pub fn prove(
 }
 
 /// Recursive backward chaining.
+#[allow(dead_code)] // called by prove()
 fn prove_goal(
     ir: &ConstraintIR,
     population: &Population,
@@ -226,6 +230,7 @@ fn prove_goal(
 }
 
 /// Format a fact from its reading template and bindings
+#[allow(dead_code)] // called by prove_goal()
 fn format_fact(reading: &str, bindings: &[(String, String)]) -> String {
     let mut result = reading.to_string();
     for (noun, value) in bindings {
@@ -239,6 +244,7 @@ fn format_fact(reading: &str, bindings: &[(String, String)]) -> String {
 }
 
 /// Check if a goal string matches a formatted fact
+#[allow(dead_code)] // called by prove_goal()
 fn fact_text_matches(goal: &str, fact_text: &str, reading: &str) -> bool {
     // Exact match
     if goal == fact_text || goal == reading {

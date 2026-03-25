@@ -58,8 +58,11 @@ pub struct CompiledConstraint {
 pub type DeriveFn = Arc<dyn Fn(&EvalContext, &Population) -> Vec<DerivedFact> + Send + Sync>;
 
 pub struct CompiledDerivation {
+    #[allow(dead_code)] // deserialized from JSON, read by JS callers
     pub id: String,
+    #[allow(dead_code)] // deserialized from JSON, read by JS callers
     pub text: String,
+    #[allow(dead_code)] // deserialized from JSON, read by JS callers
     pub kind: DerivationKind,
     pub derive: DeriveFn,
 }
@@ -72,6 +75,7 @@ pub struct CompiledStateMachine {
     pub initial: String,
     /// Transition: (current_state, event, ctx) → Option<next_state>
     /// Guard passes iff guard predicate produces zero violations.
+    #[allow(dead_code)] // used by run_machine WASM export
     pub transition: Arc<dyn Fn(&str, &str, &EvalContext) -> Option<String> + Send + Sync>,
     /// Compiled transitions as (from, to, event) for introspection
     pub transition_table: Vec<(String, String, String)>,
@@ -84,8 +88,10 @@ pub struct NounIndex {
     /// noun_name -> world assumption
     pub world_assumptions: HashMap<String, WorldAssumption>,
     /// noun_name -> supertype name
+    #[allow(dead_code)] // deserialized from JSON, read by JS callers
     pub supertypes: HashMap<String, String>,
     /// noun_name -> list of subtype names
+    #[allow(dead_code)] // deserialized from JSON, read by JS callers
     pub subtypes: HashMap<String, Vec<String>>,
     /// fact_type_id -> list of constraint IDs spanning it
     pub fact_type_to_constraints: HashMap<String, Vec<String>>,

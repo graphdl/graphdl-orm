@@ -141,6 +141,37 @@ pub fn induce_from_population(population_json: &str) -> String {
     serde_json::to_string(&result).unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string())
 }
 
+/// Run a compiled state machine by folding events through the transition function.
+/// Events are [(event_name, payload)] pairs. Returns the final state.
+#[wasm_bindgen]
+pub fn run_machine_wasm(noun_name: &str, events_json: &str, population_json: &str) -> String {
+    let store = state_store().lock().unwrap();
+    let state = match store.as_ref() {
+        Some(s) => s,
+        None => return r#"{"error":"no IR loaded"}"#.to_string(),
+    };
+
+    let population: Population = serde_json::from_str(population_json).unwrap_or_default();
+    let response = ResponseContext {
+        text: String::new(),
+        sender_identity: None,
+        fields: None,
+    };
+    let ctx = EvalContext { response: &response, population: &population };
+
+    let events: Vec<(String, String)> = serde_json::from_str(events_json).unwrap_or_default();
+
+    // Find the state machine for this noun
+    let machine_idx = state.model.noun_index.noun_to_state_machines.get(noun_name);
+    match machine_idx.and_then(|&idx| state.model.state_machines.get(idx)) {
+        Some(machine) => {
+            let final_state = evaluate::run_machine(machine, &events, &ctx);
+            serde_json::to_string(&final_state).unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string())
+        }
+        None => format!(r#"{{"error":"no state machine for noun '{}'"}}"#, noun_name),
+    }
+}
+
 /// Prove a goal fact via backward chaining.
 /// Returns a ProofResult with status (Proven/Disproven/Unknown) and proof tree.
 #[wasm_bindgen]
