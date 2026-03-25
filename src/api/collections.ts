@@ -2,7 +2,7 @@
  * Payload-compatible REST API handlers for collections.
  *
  * Translates URL query params (where[], sort, limit, page, depth)
- * into GraphDLDB collection queries.
+ * into DomainDB collection queries.
  */
 
 /**

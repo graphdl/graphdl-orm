@@ -1,56 +1,60 @@
 /**
- * DomainDB — Durable Object that holds a single domain's metamodel
- * and collection CRUD. Type-level data (nouns, readings, constraints, etc.).
+ * DomainDB — Durable Object that holds a single domain's SQL storage.
  *
- * The Payload CMS field-map layer (FIELD_MAP, FK_TARGET_TABLE, etc.) is
- * retained only for the generators collection and the generate/createFact
- * pipelines. All other collection CRUD has migrated to entity-type DOs.
+ * Actively used capabilities:
+ * 1. Batch WAL (delegates to batch-wal.ts)
+ * 2. Generators cache (delegates to generators-cache.ts)
+ * 3. createFact / createEntity (instance fact creation, used by seed.ts)
+ * 4. applySchema (generates + applies entity-instance DDL from metamodel)
+ * 5. WebSocket CDC broadcast
  */
 
-import { COLLECTION_TABLE_MAP, NOUN_TABLE_MAP } from './collections'
+import { NOUN_TABLE_MAP } from './collections'
 import { initBatchSchema, createBatch, getBatch, markCommitted, markFailed, getPendingBatches } from './batch-wal'
 import type { BatchEntity, Batch } from './batch-wal'
+import {
+  findGenerators,
+  getGenerator,
+  createGenerator,
+  updateGenerator,
+  deleteGenerator,
+  deleteGeneratorsForDomain,
+} from './generators-cache'
 
 // =========================================================================
-// Legacy Payload field maps (private — inlined from deleted collections.ts)
+// Types
 // =========================================================================
 
-/** Column mapping per table. Maps Payload field names to SQLite column names. */
-const FIELD_MAP: Record<string, Record<string, string>> = {
-  nouns: { domain: 'domain_id', superType: 'super_type_id', objectType: 'object_type', promptText: 'prompt_text', enumValues: 'enum_values', valueType: 'value_type', worldAssumption: 'world_assumption', referenceScheme: 'reference_scheme' },
-  graph_schemas: { domain: 'domain_id' },
-  readings: { domain: 'domain_id', graphSchema: 'graph_schema_id' },
-  roles: { reading: 'reading_id', noun: 'noun_id', graphSchema: 'graph_schema_id', roleIndex: 'role_index' },
-  constraints: { domain: 'domain_id', setComparisonArgumentLength: 'set_comparison_argument_length' },
-  constraint_spans: { constraint: 'constraint_id', role: 'role_id', subsetAutofill: 'subset_autofill' },
-  apps: { organization: 'organization_id', appType: 'app_type', chatEndpoint: 'chat_endpoint' },
-  domains: { domainSlug: 'domain_slug', organization: 'organization_id', app: 'app_id' },
-  organizations: {},
-  org_memberships: { organization: 'organization_id', userEmail: 'user_email' },
-  state_machine_definitions: { domain: 'domain_id', noun: 'noun_id' },
-  statuses: { stateMachineDefinition: 'state_machine_definition_id', domain: 'domain_id' },
-  transitions: { from: 'from_status_id', to: 'to_status_id', eventType: 'event_type_id', verb: 'verb_id', stateMachineDefinition: 'state_machine_definition_id', domain: 'domain_id' },
-  guards: { transition: 'transition_id', graphSchema: 'graph_schema_id', domain: 'domain_id' },
-  event_types: { domain: 'domain_id' },
-  verbs: { status: 'status_id', transition: 'transition_id', graph: 'graph_id', agentDefinition: 'agent_definition_id', domain: 'domain_id' },
-  functions: { callbackUrl: 'callback_url', httpMethod: 'http_method', headers: 'headers', verb: 'verb_id', domain: 'domain_id' },
-  streams: { domain: 'domain_id' },
-  models: {},
-  agent_definitions: { model: 'model_id', domain: 'domain_id' },
-  agents: { agentDefinition: 'agent_definition_id', resource: 'resource_id', domain: 'domain_id' },
-  completions: { agent: 'agent_id', inputText: 'input_text', outputText: 'output_text', occurredAt: 'occurred_at', domain: 'domain_id' },
-  citations: { domain: 'domain_id', retrievalDate: 'retrieval_date' },
-  graph_citations: { graph: 'graph_id', citation: 'citation_id', domain: 'domain_id' },
-  graphs: { graphSchema: 'graph_schema_id', domain: 'domain_id', isDone: 'is_done' },
-  resources: { noun: 'noun_id', domain: 'domain_id', createdBy: 'created_by' },
-  resource_roles: { graph: 'graph_id', resource: 'resource_id', role: 'role_id', domain: 'domain_id' },
-  state_machines: { stateMachineDefinition: 'state_machine_definition_id', stateMachineType: 'state_machine_definition_id', currentStatus: 'current_status_id', stateMachineStatus: 'current_status_id', resource: 'resource_id', domain: 'domain_id' },
-  events: { eventType: 'event_type_id', stateMachine: 'state_machine_id', graph: 'graph_id', occurredAt: 'occurred_at', domain: 'domain_id' },
-  generators: { domain: 'domain_id', outputFormat: 'output_format', versionNum: 'version_num' },
-  guard_runs: { guard: 'guard_id', graph: 'graph_id', domain: 'domain_id' },
-}
+import type { SqlLike } from './sql-like'
+export type { SqlLike } from './sql-like'
 
-/** Maps FK column names to their target table. */
+// =========================================================================
+// Constants
+// =========================================================================
+
+/**
+ * The metamodel table names — type-level tables that define the schema,
+ * NOT instance/runtime data.
+ */
+export const METAMODEL_TABLES: string[] = [
+  'nouns',
+  'graph_schemas',
+  'readings',
+  'roles',
+  'constraints',
+  'constraint_spans',
+  'state_machine_definitions',
+  'statuses',
+  'transitions',
+  'guards',
+  'event_types',
+  'verbs',
+  'functions',
+  'streams',
+  'generators',
+]
+
+/** Maps FK column names to their target table (used by createEntity for FK resolution). */
 const FK_TARGET_TABLE: Record<string, string> = {
   app_id: 'apps',
   domain_id: 'domains',
@@ -93,518 +97,12 @@ const WIPE_TABLES: readonly string[] = [
 ]
 
 // =========================================================================
-// Types
-// =========================================================================
-
-import type { SqlLike } from './sql-like'
-export type { SqlLike } from './sql-like'
-
-// =========================================================================
-// Constants
+// Wipe helpers
 // =========================================================================
 
 /**
- * The metamodel table names — type-level tables that define the schema,
- * NOT instance/runtime data.
- */
-export const METAMODEL_TABLES: string[] = [
-  'nouns',
-  'graph_schemas',
-  'readings',
-  'roles',
-  'constraints',
-  'constraint_spans',
-  'state_machine_definitions',
-  'statuses',
-  'transitions',
-  'guards',
-  'event_types',
-  'verbs',
-  'functions',
-  'streams',
-  'generators',
-]
-
-
-/** Fields common to every table — Payload camelCase → SQL snake_case. */
-const COMMON_FIELDS: Record<string, string> = {
-  createdAt: 'created_at',
-  updatedAt: 'updated_at',
-}
-
-// =========================================================================
-// Helpers (ported from do.ts)
-// =========================================================================
-
-/** Convert a snake_case string to camelCase. */
-function snakeToCamel(s: string): string {
-  return s.replace(/_([a-z])/g, (_, c) => c.toUpperCase())
-}
-
-/**
- * Resolve a where-clause key to a SQL column name.
- */
-function resolveColumn(key: string, fieldMap: Record<string, string>): string {
-  if (key in fieldMap) return fieldMap[key]
-  const camelKey = snakeToCamel(key)
-  if (camelKey !== key) {
-    if (camelKey in fieldMap) return fieldMap[camelKey]
-    if (camelKey in COMMON_FIELDS) return COMMON_FIELDS[camelKey]
-  }
-  if (key in COMMON_FIELDS) return COMMON_FIELDS[key]
-  return key
-}
-
-/** Build a reverse map: SQL column name → Payload field name. */
-function reverseFieldMap(fieldMap: Record<string, string>): Record<string, string> {
-  const reversed: Record<string, string> = {}
-  for (const [payloadName, sqlCol] of Object.entries(fieldMap)) {
-    reversed[sqlCol] = payloadName
-  }
-  return reversed
-}
-
-/**
- * Translate a Payload-style where object to a SQL WHERE clause + params.
- *
- * Supports:
- * - and / or logical combinators
- * - equals, not_equals, in, like, exists operators
- * - Direct value shorthand (field: value)
- * - Dot-notation FK traversal (e.g. domain.domainSlug)
- */
-function buildWhereClause(
-  where: Record<string, any>,
-  fieldMap: Record<string, string>,
-): { clause: string; params: any[] } {
-  const conditions: string[] = []
-  const params: any[] = []
-
-  if (where.and) {
-    const subs = (where.and as any[]).map(sub => buildWhereClause(sub, fieldMap))
-    const clauses = subs.filter(s => s.clause).map(s => `(${s.clause})`)
-    if (clauses.length) conditions.push(clauses.join(' AND '))
-    for (const sub of subs) params.push(...sub.params)
-  }
-
-  if (where.or) {
-    const subs = (where.or as any[]).map(sub => buildWhereClause(sub, fieldMap))
-    const clauses = subs.filter(s => s.clause).map(s => `(${s.clause})`)
-    if (clauses.length) conditions.push(`(${clauses.join(' OR ')})`)
-    for (const sub of subs) params.push(...sub.params)
-  }
-
-  for (const [key, condition] of Object.entries(where)) {
-    if (key === 'and' || key === 'or') continue
-
-    // Dot-notation FK traversal
-    if (key.includes('.')) {
-      const [relationName, fieldName] = key.split('.', 2)
-      const fkCol = resolveColumn(relationName, fieldMap)
-      const fkColResolved = fkCol.endsWith('_id') ? fkCol : `${fkCol}_id`
-      const targetTable = FK_TARGET_TABLE[fkColResolved]
-      if (!targetTable) continue
-
-      const targetFieldMap = FIELD_MAP[targetTable] || {}
-      const targetCol = resolveColumn(fieldName, targetFieldMap)
-
-      if (typeof condition === 'object' && condition !== null) {
-        if ('equals' in condition) {
-          conditions.push(`${fkCol} IN (SELECT id FROM ${targetTable} WHERE ${targetCol} = ?)`)
-          params.push(condition.equals)
-        } else if ('not_equals' in condition) {
-          conditions.push(`${fkCol} NOT IN (SELECT id FROM ${targetTable} WHERE ${targetCol} = ?)`)
-          params.push(condition.not_equals)
-        } else if ('in' in condition && Array.isArray(condition.in)) {
-          const placeholders = condition.in.map(() => '?').join(', ')
-          conditions.push(`${fkCol} IN (SELECT id FROM ${targetTable} WHERE ${targetCol} IN (${placeholders}))`)
-          params.push(...condition.in)
-        } else if ('like' in condition) {
-          conditions.push(`${fkCol} IN (SELECT id FROM ${targetTable} WHERE ${targetCol} LIKE ?)`)
-          params.push(condition.like)
-        } else if ('exists' in condition) {
-          conditions.push(condition.exists ? `${fkCol} IS NOT NULL` : `${fkCol} IS NULL`)
-        }
-      } else {
-        conditions.push(`${fkCol} IN (SELECT id FROM ${targetTable} WHERE ${targetCol} = ?)`)
-        params.push(condition)
-      }
-      continue
-    }
-
-    const col = resolveColumn(key, fieldMap)
-
-    if (typeof condition === 'object' && condition !== null) {
-      if ('equals' in condition) { conditions.push(`${col} = ?`); params.push(condition.equals) }
-      else if ('not_equals' in condition) { conditions.push(`${col} != ?`); params.push(condition.not_equals) }
-      else if ('in' in condition && Array.isArray(condition.in)) {
-        const placeholders = condition.in.map(() => '?').join(', ')
-        conditions.push(`${col} IN (${placeholders})`); params.push(...condition.in)
-      }
-      else if ('like' in condition) { conditions.push(`${col} LIKE ?`); params.push(condition.like) }
-      else if ('exists' in condition) { conditions.push(condition.exists ? `${col} IS NOT NULL` : `${col} IS NULL`) }
-      if ('value' in condition && Object.keys(condition).length === 1) {
-        conditions.push(`${col} = ?`); params.push(condition.value)
-      }
-    } else {
-      conditions.push(`${col} = ?`); params.push(condition)
-    }
-  }
-
-  return { clause: conditions.join(' AND '), params }
-}
-
-/** Map a SQL row to a Payload-style object using the reverse field map. */
-function rowToPayload(row: Record<string, unknown>, reverseMap: Record<string, string>): Record<string, unknown> {
-  const result: Record<string, unknown> = {}
-  for (const [col, value] of Object.entries(row)) {
-    const payloadName = reverseMap[col] || col
-    result[payloadName] = value
-  }
-  return result
-}
-
-/** Map a Payload-style data object to SQL column names. */
-function payloadToRow(data: Record<string, unknown>, fieldMap: Record<string, string>): Record<string, unknown> {
-  const result: Record<string, unknown> = {}
-  for (const [key, value] of Object.entries(data)) {
-    if (key === 'createdAt' || key === 'updatedAt' || key === 'version') continue
-    const col = resolveColumn(key, fieldMap)
-    result[col] = value
-  }
-  return result
-}
-
-/** Get table column names by querying PRAGMA. */
-function getTableColumns(sql: SqlLike, table: string): string[] {
-  const rows = sql.exec(`PRAGMA table_info(${table})`).toArray()
-  return rows.map(r => (r as any).name as string)
-}
-
-// =========================================================================
-// Resolve table from collection slug
-// =========================================================================
-
-function resolveTable(collectionSlug: string): string {
-  const table = COLLECTION_TABLE_MAP[collectionSlug]
-  if (!table) {
-    throw new Error(`Unknown collection: ${collectionSlug}`)
-  }
-  return table
-}
-
-function getFieldMap(table: string): Record<string, string> {
-  return FIELD_MAP[table] || {}
-}
-
-/**
- * Find records in a metamodel collection.
- *
- * Port of GraphDLDB.findInCollection for metamodel tables.
- */
-function findInMetamodel(
-  sql: SqlLike,
-  collection: string,
-  where?: Record<string, any>,
-  opts?: { limit?: number; page?: number; sort?: string },
-): { docs: Record<string, unknown>[]; totalDocs: number; hasNextPage: boolean; page: number; limit: number } {
-  const table = resolveTable(collection)
-  const fieldMap = getFieldMap(table)
-  const reverseMap = reverseFieldMap(fieldMap)
-  const limit = opts?.limit ?? 100
-  const page = opts?.page ?? 1
-  const offset = (page - 1) * limit
-
-  let query = `SELECT * FROM ${table}`
-  let countQuery = `SELECT COUNT(*) as cnt FROM ${table}`
-  const queryParams: any[] = []
-  const countParams: any[] = []
-
-  if (where && Object.keys(where).length > 0) {
-    const { clause, params } = buildWhereClause(where, fieldMap)
-    if (clause) {
-      query += ` WHERE ${clause}`
-      countQuery += ` WHERE ${clause}`
-      queryParams.push(...params)
-      countParams.push(...params)
-    }
-  }
-
-  // Sort
-  if (opts?.sort) {
-    const sortField = opts.sort.startsWith('-') ? opts.sort.slice(1) : opts.sort
-    const sortDir = opts.sort.startsWith('-') ? 'DESC' : 'ASC'
-    const sortCol = resolveColumn(sortField, fieldMap)
-    query += ` ORDER BY ${sortCol} ${sortDir}`
-  } else {
-    query += ' ORDER BY created_at DESC'
-  }
-
-  query += ` LIMIT ? OFFSET ?`
-  queryParams.push(limit, offset)
-
-  const rows = sql.exec(query, ...queryParams).toArray()
-  const countRow = sql.exec(countQuery, ...countParams).toArray()
-  const totalDocs = ((countRow[0] as any)?.cnt as number) ?? 0
-
-  const docs = rows.map(row => rowToPayload(row as Record<string, unknown>, reverseMap))
-  const hasNextPage = offset + limit < totalDocs
-
-  return { docs, totalDocs, hasNextPage, page, limit }
-}
-
-/**
- * Create a new record in a metamodel collection.
- *
- * Port of GraphDLDB.createInCollection for metamodel tables.
- */
-function createInMetamodel(
-  sql: SqlLike,
-  collection: string,
-  data: Record<string, unknown>,
-): Record<string, unknown> {
-  const table = resolveTable(collection)
-  const fieldMap = getFieldMap(table)
-  const reverseMap = reverseFieldMap(fieldMap)
-
-  const id = (data.id as string) ?? crypto.randomUUID()
-  const now = new Date().toISOString().replace('T', ' ').replace('Z', '')
-
-  // Translate Payload field names to SQL column names
-  const { id: _id, createdAt: _ca, updatedAt: _ua, version: _v, ...rest } = data
-  const sqlData = payloadToRow(rest, fieldMap)
-
-  // Only include columns that exist in the table
-  const tableColumns = new Set(getTableColumns(sql, table))
-  const filteredData: Record<string, unknown> = {}
-  for (const [col, value] of Object.entries(sqlData)) {
-    if (tableColumns.has(col)) filteredData[col] = value
-  }
-
-  // Build columns and values
-  const columns = ['id', 'created_at', 'updated_at', 'version', ...Object.keys(filteredData)]
-  const placeholders = columns.map(() => '?').join(', ')
-  const values = [id, now, now, 1, ...Object.values(filteredData)]
-
-  sql.exec(
-    `INSERT INTO ${table} (${columns.join(', ')}) VALUES (${placeholders})`,
-    ...values,
-  )
-
-  // Return the created record
-  const rows = sql.exec(`SELECT * FROM ${table} WHERE id = ?`, id).toArray()
-  return rowToPayload(rows[0] as Record<string, unknown>, reverseMap)
-}
-
-/**
- * Update an existing record in a metamodel collection.
- *
- * Port of GraphDLDB.updateInCollection for metamodel tables.
- */
-function updateInMetamodel(
-  sql: SqlLike,
-  collection: string,
-  id: string,
-  updates: Record<string, unknown>,
-): Record<string, unknown> | null {
-  const table = resolveTable(collection)
-  const fieldMap = getFieldMap(table)
-  const reverseMap = reverseFieldMap(fieldMap)
-
-  // Check existence
-  const existing = sql.exec(`SELECT * FROM ${table} WHERE id = ?`, id).toArray()
-  if (existing.length === 0) return null
-
-  const currentVersion = ((existing[0] as any).version as number) ?? 1
-  const now = new Date().toISOString().replace('T', ' ').replace('Z', '')
-
-  // Translate and build SET clause
-  const { id: _id, createdAt: _ca, updatedAt: _ua, version: _v, ...rest } = updates
-  const sqlData = payloadToRow(rest, fieldMap)
-
-  const setClauses = ['updated_at = ?', 'version = ?']
-  const setValues: any[] = [now, currentVersion + 1]
-
-  // Only set columns that exist in the table
-  const tableColumns = getTableColumns(sql, table)
-  const tableColumnSet = new Set(tableColumns)
-
-  for (const [col, value] of Object.entries(sqlData)) {
-    if (tableColumnSet.has(col)) {
-      setClauses.push(`${col} = ?`)
-      setValues.push(value)
-    }
-  }
-
-  setValues.push(id)
-  sql.exec(
-    `UPDATE ${table} SET ${setClauses.join(', ')} WHERE id = ?`,
-    ...setValues,
-  )
-
-  // Return updated record
-  const rows = sql.exec(`SELECT * FROM ${table} WHERE id = ?`, id).toArray()
-  return rowToPayload(rows[0] as Record<string, unknown>, reverseMap)
-}
-
-/**
- * Get a single record by ID from a metamodel collection.
- */
-function getFromMetamodel(
-  sql: SqlLike,
-  collection: string,
-  id: string,
-): Record<string, unknown> | null {
-  const table = resolveTable(collection)
-  const fieldMap = getFieldMap(table)
-  const reverseMap = reverseFieldMap(fieldMap)
-
-  const rows = sql.exec(`SELECT * FROM ${table} WHERE id = ?`, id).toArray()
-  if (rows.length === 0) return null
-
-  return rowToPayload(rows[0] as Record<string, unknown>, reverseMap)
-}
-
-/**
- * FK dependency map: parent_table → [(child_table, fk_column)].
- * Used by deleteFromMetamodel to cascade-delete children before the parent.
- */
-const CASCADE_MAP: Record<string, Array<[string, string]>> = {
-  readings:                    [['roles', 'reading_id']],
-  graph_schemas:               [['roles', 'graph_schema_id'], ['readings', 'graph_schema_id']],
-  nouns:                       [['roles', 'noun_id']],
-  constraints:                 [['constraint_spans', 'constraint_id']],
-  roles:                       [['constraint_spans', 'role_id']],
-  state_machine_definitions:   [['statuses', 'state_machine_definition_id'], ['transitions', 'state_machine_definition_id'], ['state_machines', 'state_machine_definition_id']],
-  statuses:                    [['transitions', 'from_status_id'], ['transitions', 'to_status_id'], ['state_machines', 'current_status_id']],
-  event_types:                 [['transitions', 'event_type_id']],
-  transitions:                 [['guards', 'transition_id']],
-  verbs:                       [['functions', 'verb_id']],
-}
-
-/**
- * Cascade-delete children of a record, recursively.
- */
-function cascadeDeleteChildren(sql: SqlLike, table: string, id: string): number {
-  let cascaded = 0
-  const children = CASCADE_MAP[table]
-  if (!children) return cascaded
-
-  for (const [childTable, fkCol] of children) {
-    try {
-      const childRows = sql.exec(`SELECT id FROM ${childTable} WHERE ${fkCol} = ?`, id).toArray()
-      for (const row of childRows) {
-        cascaded += cascadeDeleteChildren(sql, childTable, (row as any).id as string)
-        sql.exec(`DELETE FROM ${childTable} WHERE id = ?`, (row as any).id as string)
-        cascaded++
-      }
-    } catch { /* table may not exist */ }
-  }
-  return cascaded
-}
-
-/**
- * Cascade-delete all children of a domain.
- */
-function cascadeDeleteDomain(sql: SqlLike, domainId: string): number {
-  let cascaded = 0
-  try { sql.exec('PRAGMA foreign_keys = OFF') } catch { /* best effort */ }
-
-  const domainScopedTables = [
-    'guard_runs', 'events', 'state_machines', 'resource_roles', 'resources', 'graphs',
-    'completions', 'agents', 'agent_definitions',
-    'functions', 'streams', 'verbs', 'guards', 'transitions', 'statuses', 'event_types', 'state_machine_definitions',
-    'constraint_spans', 'constraints', 'roles', 'readings', 'graph_schemas', 'nouns',
-  ]
-  for (const child of domainScopedTables) {
-    try {
-      if (child === 'constraint_spans') {
-        sql.exec(
-          `DELETE FROM constraint_spans WHERE constraint_id IN (SELECT id FROM constraints WHERE domain_id = ?)`, domainId
-        )
-      } else if (child === 'roles') {
-        sql.exec(
-          `DELETE FROM roles WHERE reading_id IN (SELECT id FROM readings WHERE domain_id = ?) OR noun_id IN (SELECT id FROM nouns WHERE domain_id = ?)`, domainId, domainId
-        )
-      } else if (child === 'transitions') {
-        sql.exec(
-          `DELETE FROM transitions WHERE from_status_id IN (SELECT id FROM statuses WHERE state_machine_definition_id IN (SELECT id FROM state_machine_definitions WHERE domain_id = ?))`, domainId
-        )
-      } else if (child === 'statuses') {
-        sql.exec(
-          `DELETE FROM statuses WHERE state_machine_definition_id IN (SELECT id FROM state_machine_definitions WHERE domain_id = ?)`, domainId
-        )
-      } else {
-        sql.exec(`DELETE FROM ${child} WHERE domain_id = ?`, domainId)
-      }
-      cascaded++
-    } catch { /* table may not exist yet */ }
-  }
-
-  try { sql.exec('PRAGMA foreign_keys = ON') } catch { /* best effort */ }
-  return cascaded
-}
-
-/**
- * Delete a record by ID from a metamodel collection, with cascade.
- */
-function deleteFromMetamodel(
-  sql: SqlLike,
-  collection: string,
-  id: string,
-): { deleted: boolean; cascaded?: number } {
-  const table = resolveTable(collection)
-
-  const existing = sql.exec(`SELECT * FROM ${table} WHERE id = ?`, id).toArray()
-  if (existing.length === 0) return { deleted: false }
-
-  let cascaded = 0
-
-  if (table === 'domains') {
-    cascaded = cascadeDeleteDomain(sql, id)
-  } else if (table === 'apps') {
-    const appDomains = sql.exec(`SELECT id FROM domains WHERE app_id = ?`, id).toArray()
-    for (const domain of appDomains) {
-      cascaded += cascadeDeleteDomain(sql, (domain as any).id as string)
-      sql.exec(`DELETE FROM domains WHERE id = ?`, (domain as any).id as string)
-      cascaded++
-    }
-  } else {
-    cascaded = cascadeDeleteChildren(sql, table, id)
-  }
-
-  sql.exec(`DELETE FROM ${table} WHERE id = ?`, id)
-  return { deleted: true, ...(cascaded > 0 && { cascaded }) }
-}
-
-/**
- * Inspect a table's schema (debug helper).
- */
-function inspectTableSchema(
-  sql: SqlLike,
-  table: string,
-): Record<string, any> {
-  // Whitelist-validate table name to prevent SQL injection via string interpolation
-  const VALID_TABLES = new Set([...METAMODEL_TABLES, 'organizations', 'org_memberships', 'apps', 'domains', 'batches', 'generators'])
-  if (!VALID_TABLES.has(table)) throw new Error(`Unknown table: ${table}`)
-
-  try {
-    const columns = sql.exec(`PRAGMA table_info(${table})`).toArray().map((r: any) => ({
-      name: r.name, type: r.type, notnull: r.notnull, dflt_value: r.dflt_value, pk: r.pk,
-    }))
-    const fks = sql.exec(`PRAGMA foreign_key_list(${table})`).toArray().map((r: any) => ({
-      id: r.id, seq: r.seq, table: r.table, from: r.from, to: r.to,
-    }))
-    const foreignKeysOn = sql.exec('PRAGMA foreign_keys').toArray()[0]
-    const ddl = sql.exec(`SELECT sql FROM sqlite_master WHERE type='table' AND name='${table}'`).toArray()
-    return { table, columns, foreignKeys: fks, foreignKeysPragma: foreignKeysOn, ddl: (ddl[0] as any)?.sql || null }
-  } catch (e: any) {
-    return { table, error: e.message }
-  }
-}
-
-/**
- * Wipe all metamodel data for a domain.
+ * Wipe all metamodel data for a domain (nouns, readings, constraints, etc.
+ * plus generators cache).
  */
 function wipeDomainMetamodelData(
   sql: SqlLike,
@@ -630,7 +128,7 @@ function wipeDomainMetamodelData(
   }
 
   sql.exec('PRAGMA foreign_keys = ON')
-  try { sql.exec(`DELETE FROM generators WHERE domain_id = ?`, domainId) } catch { /* */ }
+  deleteGeneratorsForDomain(sql, domainId)
   return { deleted: true, domainId, counts }
 }
 
@@ -654,12 +152,10 @@ import { ALL_DDL } from './schema'
 import { DomainModel, SqlDataLoader } from './model/domain-model'
 
 /**
- * DomainDB — Durable Object that holds a single domain's metamodel and
- * all collection + entity operations previously in GraphDLDB (do.ts).
+ * DomainDB — Durable Object that holds a single domain's SQL storage.
  *
- * Each DO instance stores type-level data (nouns, readings, constraints,
- * etc.) for one domain, and can generate + apply the entity-instance
- * schema from that metamodel.
+ * Stores generators cache (compiled outputs), entity-instance tables
+ * (via applySchema), and delegates batch WAL to batch-wal.ts.
  */
 export class DomainDB extends DurableObject {
   private initialized = false
@@ -672,7 +168,7 @@ export class DomainDB extends DurableObject {
     if (this.initialized) return
     this.sql = this.ctx.storage.sql
     this.sql.exec('PRAGMA defer_foreign_keys = OFF')
-    // Run ALL bootstrap DDL (not just metamodel) so entity tables, CDC, etc. are available
+    // Run ALL bootstrap DDL so entity tables, CDC, etc. are available
     for (const ddl of ALL_DDL) {
       this.sql.exec(ddl)
     }
@@ -689,7 +185,6 @@ export class DomainDB extends DurableObject {
     `)
     this.sql.exec('CREATE INDEX IF NOT EXISTS idx_cdc_events_timestamp ON cdc_events(timestamp)')
     this.sql.exec('CREATE INDEX IF NOT EXISTS idx_cdc_events_table ON cdc_events(table_name, entity_id)')
-    // Batch WAL table — coexists with metamodel tables, will replace them in Task 18
     initBatchSchema(this.ctx.storage.sql)
     this.initialized = true
   }
@@ -736,10 +231,9 @@ export class DomainDB extends DurableObject {
   }
 
   // -----------------------------------------------------------------------
-  // Batch WAL methods
+  // Batch WAL methods (delegate to batch-wal.ts)
   // -----------------------------------------------------------------------
 
-  /** Create a new batch in the WAL with pending status. */
   async commitBatch(entities: BatchEntity[]): Promise<Batch> {
     this.ensureInit()
     const domain = this.domainId
@@ -747,102 +241,87 @@ export class DomainDB extends DurableObject {
     return createBatch(this.ctx.storage.sql, domain, entities)
   }
 
-  /** Retrieve a batch by ID. */
   async getBatch(id: string): Promise<Batch | null> {
     this.ensureInit()
     return getBatch(this.ctx.storage.sql, id)
   }
 
-  /** Mark a batch as committed. */
   async markBatchCommitted(id: string): Promise<void> {
     this.ensureInit()
     markCommitted(this.ctx.storage.sql, id)
   }
 
-  /** Mark a batch as failed with an error message. */
   async markBatchFailed(id: string, error: string): Promise<void> {
     this.ensureInit()
     markFailed(this.ctx.storage.sql, id, error)
   }
 
-  /** Return all pending batches ordered by creation time (oldest first). */
   async getPendingBatches(): Promise<Batch[]> {
     this.ensureInit()
     return getPendingBatches(this.ctx.storage.sql)
   }
 
-  /** Find records in a metamodel collection. */
+  // -----------------------------------------------------------------------
+  // Generators cache (delegate to generators-cache.ts)
+  // -----------------------------------------------------------------------
+
+  /** Find generator records. Only the generators collection uses this. */
   async findInCollection(
-    collection: string,
+    _collection: string,
     where?: Record<string, any>,
     opts?: { limit?: number; page?: number; sort?: string },
-  ): Promise<ReturnType<typeof findInMetamodel>> {
+  ): Promise<ReturnType<typeof findGenerators>> {
     this.ensureInit()
-    return findInMetamodel(this.ctx.storage.sql, collection, where, opts)
+    return findGenerators(this.ctx.storage.sql, where, opts)
   }
 
-  /** Get a single record by ID. */
-  async getFromCollection(collectionSlug: string, id: string): Promise<Record<string, unknown> | null> {
+  /** Get a single generator record by ID. */
+  async getFromCollection(_collection: string, id: string): Promise<Record<string, unknown> | null> {
     this.ensureInit()
-    return getFromMetamodel(this.ctx.storage.sql, collectionSlug, id)
+    return getGenerator(this.ctx.storage.sql, id)
   }
 
-  /** Create a record in a metamodel collection. */
+  /** Create a generator record. */
   async createInCollection(
-    collection: string,
+    _collection: string,
     data: Record<string, unknown>,
   ): Promise<Record<string, unknown>> {
     this.ensureInit()
     return this.withWriteLock(async () => {
-      const doc = createInMetamodel(this.ctx.storage.sql, collection, data)
-      const table = COLLECTION_TABLE_MAP[collection]
-      if (table) {
-        this.logCdcEvent('create', table, doc.id as string, doc)
-        const domainId = doc.domain_id as string || doc.domain as string
-        if (domainId) this.getModel(domainId).invalidate(collection)
-      }
+      const doc = createGenerator(this.ctx.storage.sql, data)
+      this.logCdcEvent('create', 'generators', doc.id as string, doc)
+      const domainId = doc.domain_id as string || doc.domain as string
+      if (domainId) this.getModel(domainId).invalidate('generators')
       return doc
     })
   }
 
-  /** Update a record in a metamodel collection. */
+  /** Update a generator record. */
   async updateInCollection(
-    collection: string,
+    _collection: string,
     id: string,
     updates: Record<string, unknown>,
   ): Promise<Record<string, unknown> | null> {
     this.ensureInit()
     return this.withWriteLock(async () => {
-      const doc = updateInMetamodel(this.ctx.storage.sql, collection, id, updates)
+      const doc = updateGenerator(this.ctx.storage.sql, id, updates)
       if (doc) {
-        const table = COLLECTION_TABLE_MAP[collection]
-        if (table) {
-          this.logCdcEvent('update', table, id, doc)
-          const domainId = doc.domain_id as string || doc.domain as string
-          if (domainId) this.getModel(domainId).invalidate(collection)
-        }
+        this.logCdcEvent('update', 'generators', id, doc)
+        const domainId = doc.domain_id as string || doc.domain as string
+        if (domainId) this.getModel(domainId).invalidate('generators')
       }
       return doc
     })
   }
 
-  /** Delete a record by ID with cascade. */
-  async deleteFromCollection(collectionSlug: string, id: string): Promise<{ deleted: boolean; cascaded?: number }> {
+  /** Delete a generator record by ID. */
+  async deleteFromCollection(_collection: string, id: string): Promise<{ deleted: boolean }> {
     this.ensureInit()
     return this.withWriteLock(async () => {
-      const result = deleteFromMetamodel(this.ctx.storage.sql, collectionSlug, id)
-      if (result.deleted) {
-        const table = COLLECTION_TABLE_MAP[collectionSlug]
-        if (table) this.logCdcEvent('delete', table, id)
-      }
+      const result = deleteGenerator(this.ctx.storage.sql, id)
+      if (result.deleted) this.logCdcEvent('delete', 'generators', id)
       return result
     })
-  }
-
-  /** Debug: inspect table schema. */
-  inspectTable(table: string): Record<string, any> {
-    this.ensureInit()
-    return inspectTableSchema(this.ctx.storage.sql, table)
   }
 
   /** Wipe all metamodel data for a domain. */
@@ -860,6 +339,10 @@ export class DomainDB extends DurableObject {
       wipeAllMetamodelData(this.ctx.storage.sql)
     })
   }
+
+  // -----------------------------------------------------------------------
+  // Schema application + code generation
+  // -----------------------------------------------------------------------
 
   /** Generate and apply the entity-instance schema from this domain's metamodel. */
   async applySchema(domainId?: string): Promise<{ tableMap: Record<string, string>; fieldMap: Record<string, Record<string, string>> }> {
@@ -901,7 +384,7 @@ export class DomainDB extends DurableObject {
       }
     }
 
-    // Cache the mapping
+    // Cache the mapping in generators table
     const cached = { tableMap, fieldMap, appliedAt: new Date().toISOString() }
     model.invalidate()
     const existing = this.sql.exec(
@@ -937,6 +420,10 @@ export class DomainDB extends DurableObject {
 
     return { tableMap, fieldMap }
   }
+
+  // -----------------------------------------------------------------------
+  // Fact + entity instance creation (used by seed.ts and claims pipeline)
+  // -----------------------------------------------------------------------
 
   /** Create a fact instance: a Graph linking Resources through Roles. */
   async createFact(
@@ -1329,97 +816,10 @@ export class DomainDB extends DurableObject {
     })
   }
 
-  /** Query a 3NF entity table. Returns rows with pagination. */
-  async queryEntities(
-    domainId: string,
-    nounName: string,
-    options?: { where?: Record<string, any>; sort?: string; limit?: number; page?: number },
-  ): Promise<{ docs: Record<string, unknown>[]; totalDocs: number; page: number; limit: number; hasNextPage: boolean }> {
-    this.ensureInit()
-    const { toTableName, toColumnName } = await import('./generate/sqlite')
-    const tableName = NOUN_TABLE_MAP[nounName] || toTableName(nounName)
-    const limit = options?.limit || 100
-    const page = options?.page || 1
-    const offset = (page - 1) * limit
+  // -----------------------------------------------------------------------
+  // WebSocket (CDC broadcast)
+  // -----------------------------------------------------------------------
 
-    try { this.sql.exec(`SELECT 1 FROM ${tableName} LIMIT 0`) } catch {
-      return { docs: [], totalDocs: 0, page, limit, hasNextPage: false }
-    }
-
-    let whereClause = 'WHERE 1=1'
-    const params: any[] = []
-    const countParams: any[] = []
-
-    const localCount = this.sql.exec(
-      `SELECT count(*) as c FROM ${tableName} WHERE domain_id = ?`, domainId,
-    ).toArray()
-    if ((localCount[0]?.c as number) > 0) {
-      whereClause = 'WHERE domain_id = ?'
-      params.push(domainId)
-      countParams.push(domainId)
-    }
-
-    if (options?.where) {
-      for (const [field, condition] of Object.entries(options.where)) {
-        const col = toColumnName(field)
-        if (typeof condition === 'object' && condition !== null) {
-          for (const [op, val] of Object.entries(condition as Record<string, any>)) {
-            if (op === 'equals') { whereClause += ` AND ${col} = ?`; params.push(val); countParams.push(val) }
-            else if (op === 'not_equals') { whereClause += ` AND ${col} != ?`; params.push(val); countParams.push(val) }
-            else if (op === 'like') { whereClause += ` AND ${col} LIKE ?`; params.push(val); countParams.push(val) }
-          }
-        } else {
-          whereClause += ` AND ${col} = ?`; params.push(condition); countParams.push(condition)
-        }
-      }
-    }
-
-    const sortField = options?.sort?.startsWith('-') ? options.sort.slice(1) : (options?.sort || 'created_at')
-    const sortDir = options?.sort?.startsWith('-') ? 'DESC' : 'ASC'
-
-    const query = `SELECT * FROM ${tableName} ${whereClause} ORDER BY ${toColumnName(sortField)} ${sortDir} LIMIT ? OFFSET ?`
-    const countQuery = `SELECT count(*) as cnt FROM ${tableName} ${whereClause}`
-    params.push(limit, offset)
-
-    const rows = this.sql.exec(query, ...params).toArray()
-    const countRow = this.sql.exec(countQuery, ...countParams).toArray()
-    const totalDocs = (countRow[0]?.cnt as number) ?? 0
-
-    const docs = rows.map(row => {
-      const doc: Record<string, unknown> = {}
-      for (const [key, val] of Object.entries(row as Record<string, unknown>)) {
-        const camelKey = key.replace(/_([a-z])/g, (_, c) => c.toUpperCase())
-        if (typeof val === 'string' && (val.startsWith('[') || val.startsWith('{'))) {
-          try { doc[camelKey] = JSON.parse(val) } catch { doc[camelKey] = val }
-        } else { doc[camelKey] = val }
-      }
-      return doc
-    })
-
-    return { docs, totalDocs, page, limit, hasNextPage: offset + limit < totalDocs }
-  }
-
-  /** Generate output for a domain in the given format. */
-  async generate(domainId: string, format: string): Promise<any> {
-    this.ensureInit()
-    const model = this.getModel(domainId)
-    model.invalidate()
-    switch (format) {
-      case 'openapi': return (await import('./generate/openapi')).generateOpenAPI(model)
-      case 'sqlite': return (await import('./generate/sqlite')).generateSQLite(
-        await (await import('./generate/openapi')).generateOpenAPI(model))
-      case 'xstate': return (await import('./generate/xstate')).generateXState(model)
-      case 'ilayer': return (await import('./generate/ilayer')).generateILayer(model)
-      case 'readings': return (await import('./generate/readings')).generateReadings(model)
-      case 'schema': return (await import('./generate/schema')).generateSchema(model)
-      case 'mdxui': return (await import('./generate/mdxui')).generateMdxui(model)
-      case 'readme': return (await import('./generate/readme')).generateReadme(model)
-      case 'json-schema': return this.applySchema(domainId)
-      default: throw new Error(`Unknown format: ${format}`)
-    }
-  }
-
-  /** Handle HTTP requests (WebSocket upgrade). */
   async fetch(request: Request): Promise<Response> {
     if (request.headers.get('Upgrade') === 'websocket') {
       const url = new URL(request.url)

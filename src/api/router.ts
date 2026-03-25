@@ -48,7 +48,7 @@ function getRegistryDO(env: Env, scope: string): DurableObjectStub {
 
 /**
  * Get the primary DomainDB DO stub.
- * Replaces the old getLegacyDB that referenced GraphDLDB.
+ * Returns the primary DomainDB DO stub for generators cache and legacy operations.
  * Uses a single "primary" instance for all collection/metamodel operations.
  */
 function getPrimaryDB(env: Env): DurableObjectStub {
