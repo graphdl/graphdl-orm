@@ -133,6 +133,82 @@ export function getEntityIds(sql: SqlLike, nounType: string, domainSlug?: string
   return rows.map((row: any) => row.entity_id)
 }
 
+/**
+ * Soft-delete all entity index entries for a given domain.
+ * Returns the count of rows affected.
+ */
+export function deindexEntitiesForDomain(sql: SqlLike, domainSlug: string): number {
+  const before = sql.exec(
+    `SELECT count(*) as c FROM entity_index WHERE domain_slug=? AND deleted=0`,
+    domainSlug,
+  ).toArray()[0] as any
+  sql.exec(
+    `UPDATE entity_index SET deleted=1 WHERE domain_slug=? AND deleted=0`,
+    domainSlug,
+  )
+  return before?.c || 0
+}
+
+/**
+ * Remove noun_index entries for a given domain.
+ * Returns the count of rows removed.
+ */
+export function deindexNounsForDomain(sql: SqlLike, domainSlug: string): number {
+  const before = sql.exec(
+    `SELECT count(*) as c FROM noun_index WHERE domain_slug=?`,
+    domainSlug,
+  ).toArray()[0] as any
+  sql.exec(`DELETE FROM noun_index WHERE domain_slug=?`, domainSlug)
+  return before?.c || 0
+}
+
+/**
+ * Get all non-deleted entity IDs across all types for a given domain.
+ * Returns array of { nounType, entityId } for fan-out deletion.
+ */
+export function getAllEntityIdsForDomain(sql: SqlLike, domainSlug: string): Array<{ nounType: string; entityId: string }> {
+  const rows = sql.exec(
+    `SELECT noun_type, entity_id FROM entity_index WHERE domain_slug=? AND deleted=0`,
+    domainSlug,
+  ).toArray()
+  return rows.map((row: any) => ({ nounType: row.noun_type, entityId: row.entity_id }))
+}
+
+/**
+ * Get all non-deleted entity IDs across all types and domains.
+ * Returns array of { nounType, entityId } for fan-out deletion.
+ */
+export function getAllEntityIds(sql: SqlLike): Array<{ nounType: string; entityId: string }> {
+  const rows = sql.exec(
+    `SELECT noun_type, entity_id FROM entity_index WHERE deleted=0`,
+  ).toArray()
+  return rows.map((row: any) => ({ nounType: row.noun_type, entityId: row.entity_id }))
+}
+
+/**
+ * Wipe all data from all registry tables (for testing/reset).
+ */
+export function wipeAllRegistryData(sql: SqlLike): void {
+  sql.exec(`DELETE FROM entity_index`)
+  sql.exec(`DELETE FROM noun_index`)
+  sql.exec(`DELETE FROM domains`)
+}
+
+/**
+ * Get entity counts grouped by noun type (optionally filtered by domain).
+ */
+export function getEntityCounts(sql: SqlLike, domainSlug?: string): Array<{ nounType: string; count: number }> {
+  const rows = domainSlug
+    ? sql.exec(
+        `SELECT noun_type, count(*) as c FROM entity_index WHERE domain_slug=? AND deleted=0 GROUP BY noun_type ORDER BY noun_type`,
+        domainSlug,
+      ).toArray()
+    : sql.exec(
+        `SELECT noun_type, count(*) as c FROM entity_index WHERE deleted=0 GROUP BY noun_type ORDER BY noun_type`,
+      ).toArray()
+  return rows.map((row: any) => ({ nounType: row.noun_type, count: row.c }))
+}
+
 // =========================================================================
 // Noun resolution
 // =========================================================================
@@ -218,5 +294,35 @@ export class RegistryDB extends DurableObject {
   async getEntityIds(nounType: string, domainSlug?: string): Promise<string[]> {
     this.ensureInit()
     return getEntityIds(this.ctx.storage.sql, nounType, domainSlug)
+  }
+
+  async deindexEntitiesForDomain(domainSlug: string): Promise<number> {
+    this.ensureInit()
+    return deindexEntitiesForDomain(this.ctx.storage.sql, domainSlug)
+  }
+
+  async deindexNounsForDomain(domainSlug: string): Promise<number> {
+    this.ensureInit()
+    return deindexNounsForDomain(this.ctx.storage.sql, domainSlug)
+  }
+
+  async getAllEntityIdsForDomain(domainSlug: string): Promise<Array<{ nounType: string; entityId: string }>> {
+    this.ensureInit()
+    return getAllEntityIdsForDomain(this.ctx.storage.sql, domainSlug)
+  }
+
+  async getAllEntityIds(): Promise<Array<{ nounType: string; entityId: string }>> {
+    this.ensureInit()
+    return getAllEntityIds(this.ctx.storage.sql)
+  }
+
+  async wipeAll(): Promise<void> {
+    this.ensureInit()
+    wipeAllRegistryData(this.ctx.storage.sql)
+  }
+
+  async getEntityCounts(domainSlug?: string): Promise<Array<{ nounType: string; count: number }>> {
+    this.ensureInit()
+    return getEntityCounts(this.ctx.storage.sql, domainSlug)
   }
 }
