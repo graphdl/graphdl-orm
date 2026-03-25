@@ -58,7 +58,18 @@ Violation is triggered by Resource.
 Failure occurs during Transition.
   Each Failure occurs during at most one Transition.
 
+### Temporal Ordering
+Failure follows Violation.
+  Each Failure follows at most one Violation.
+Violation occurs before Transition.
+  Each Violation occurs before at most one Transition.
+
 ## Constraints
 
 Each Violation is of exactly one Constraint.
 Each Failure has exactly one Failure Type.
+
+## Subset Constraints
+
+If some Failure follows some Violation then that Failure is caused by that Violation or that Violation occurred at some Timestamp and that Failure occurred at some Timestamp where that Violation Timestamp is before that Failure Timestamp.
+If some Violation occurs before some Transition then that Violation occurred at some Timestamp and that Transition occurred at some Timestamp where that Violation Timestamp is before that Transition Timestamp.
