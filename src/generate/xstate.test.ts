@@ -55,8 +55,8 @@ describe('generateXState', () => {
     expect(config.id).toBe('support-request')
     expect(config.initial).toBe('New')
     expect(config.states).toEqual({
-      New: { on: { OPEN: { target: 'Open' } } },
-      Open: {},
+      New: { on: { OPEN: 'Open' } },
+      Open: { type: 'final' },
     })
   })
 
@@ -89,9 +89,9 @@ describe('generateXState', () => {
     const config = JSON.parse(result.files['state-machines/order.json'])
 
     expect(config.initial).toBe('Pending')
-    expect(config.states.Pending.on.CONFIRM.target).toBe('Confirmed')
-    expect(config.states.Confirmed.on.SHIP.target).toBe('Shipped')
-    expect(config.states.Shipped).toEqual({})
+    expect(config.states.Pending.on.CONFIRM).toBe('Confirmed')
+    expect(config.states.Confirmed.on.SHIP).toBe('Shipped')
+    expect(config.states.Shipped).toEqual({ type: 'final' })
   })
 
   // -------------------------------------------------------------------------
@@ -356,12 +356,10 @@ describe('generateXState', () => {
     const result = await generateXState(model)
     const config = JSON.parse(result.files['state-machines/payment.json'])
 
-    expect(config.states.Pending.on.PROCESS).toEqual({
-      target: 'Processed',
-      meta: {
-        callback: { url: 'https://api.example.com/process', method: 'POST' },
-      },
-    })
+    // Simple transition (no guard/pattern) uses string form
+    expect(config.states.Pending.on.PROCESS).toBe('Processed')
+    // Mealy callback lands on the target state in state.do format
+    expect(config.states.Processed.callback).toBe('https://api.example.com/process')
   })
 
   // -------------------------------------------------------------------------
@@ -399,7 +397,8 @@ describe('generateXState', () => {
 
     const result = await generateXState(model)
     const config = JSON.parse(result.files['state-machines/invoice.json'])
-    expect(config.states.Draft.on.SEND.meta.callback.method).toBe('POST')
+    // Mealy callback with default POST method lands on target state as simple URL
+    expect(config.states.Sent.callback).toBe('https://api.example.com/send')
   })
 
   // -------------------------------------------------------------------------
@@ -590,8 +589,221 @@ describe('generateXState', () => {
     const result = await generateXState(model)
     const config = JSON.parse(result.files['state-machines/job.json'])
 
-    expect(config.states.Queued.on.START).toEqual({ target: 'Running' })
-    expect(config.states.Queued.on.START.meta).toBeUndefined()
+    expect(config.states.Queued.on.START).toBe('Running')
+  })
+
+  // -------------------------------------------------------------------------
+  // isInitial flag takes precedence over heuristic
+  // -------------------------------------------------------------------------
+  it('uses isInitial flag for initial state', async () => {
+    const noun = mkNounDef({ name: 'Order' })
+    const sm = mkStateMachine({
+      nounDef: noun,
+      statuses: [
+        { id: 's1', name: 'Draft' },
+        { id: 's2', name: 'Active', isInitial: true },
+      ],
+      transitions: [
+        { from: 'Draft', to: 'Active', event: 'ACTIVATE', eventTypeId: 'et1' },
+      ],
+    })
+
+    const model = createMockModel({
+      nouns: [noun],
+      stateMachines: [sm],
+      factTypes: [],
+      readings: [],
+    })
+
+    const result = await generateXState(model)
+    const config = JSON.parse(result.files['state-machines/order.json'])
+    expect(config.initial).toBe('Active')
+  })
+
+  // -------------------------------------------------------------------------
+  // Event Type Pattern on transitions
+  // -------------------------------------------------------------------------
+  it('includes pattern metadata when Event Type has Pattern', async () => {
+    const noun = mkNounDef({ name: 'Webhook' })
+    const sm = mkStateMachine({
+      nounDef: noun,
+      statuses: [
+        { id: 's1', name: 'Pending' },
+        { id: 's2', name: 'Success' },
+        { id: 's3', name: 'Failure' },
+      ],
+      transitions: [
+        { from: 'Pending', to: 'Success', event: '2XX', eventTypeId: 'et1', eventPattern: '2XX' },
+        { from: 'Pending', to: 'Failure', event: '5XX', eventTypeId: 'et2', eventPattern: '5XX' },
+      ],
+    })
+
+    const model = createMockModel({
+      nouns: [noun],
+      stateMachines: [sm],
+      factTypes: [],
+      readings: [],
+    })
+
+    const result = await generateXState(model)
+    const config = JSON.parse(result.files['state-machines/webhook.json'])
+
+    // Transitions with patterns use object form
+    expect(config.states.Pending.on['2XX']).toEqual({ target: 'Success', meta: { pattern: '2XX' } })
+    expect(config.states.Pending.on['5XX']).toEqual({ target: 'Failure', meta: { pattern: '5XX' } })
+  })
+
+  // -------------------------------------------------------------------------
+  // Guard references on transitions
+  // -------------------------------------------------------------------------
+  it('includes guard when transition has guard', async () => {
+    const noun = mkNounDef({ name: 'Order' })
+    const sm = mkStateMachine({
+      nounDef: noun,
+      statuses: [
+        { id: 's1', name: 'Pending' },
+        { id: 's2', name: 'Shipped' },
+      ],
+      transitions: [
+        {
+          from: 'Pending', to: 'Shipped', event: 'SHIP', eventTypeId: 'et1',
+          guard: { graphSchemaId: 'gs-payment', constraintIds: ['c1'] },
+        },
+      ],
+    })
+
+    const model = createMockModel({
+      nouns: [noun],
+      stateMachines: [sm],
+      factTypes: [],
+      readings: [],
+    })
+
+    const result = await generateXState(model)
+    const config = JSON.parse(result.files['state-machines/order.json'])
+    expect(config.states.Pending.on.SHIP).toEqual({ target: 'Shipped', guard: 'gs-payment' })
+  })
+
+  // -------------------------------------------------------------------------
+  // Final states have type: 'final'
+  // -------------------------------------------------------------------------
+  it('marks terminal states as type: final', async () => {
+    const noun = mkNounDef({ name: 'Task' })
+    const sm = mkStateMachine({
+      nounDef: noun,
+      statuses: [
+        { id: 's1', name: 'Open' },
+        { id: 's2', name: 'Done' },
+      ],
+      transitions: [
+        { from: 'Open', to: 'Done', event: 'COMPLETE', eventTypeId: 'et1' },
+      ],
+    })
+
+    const model = createMockModel({
+      nouns: [noun],
+      stateMachines: [sm],
+      factTypes: [],
+      readings: [],
+    })
+
+    const result = await generateXState(model)
+    const config = JSON.parse(result.files['state-machines/task.json'])
+    expect(config.states.Done.type).toBe('final')
+    expect(config.states.Open.type).toBeUndefined()
+  })
+
+  // -------------------------------------------------------------------------
+  // Moore callback (Verb on Status entry)
+  // -------------------------------------------------------------------------
+  it('includes Moore callback from Status verb', async () => {
+    const noun = mkNounDef({ name: 'Pipeline' })
+    const sm = mkStateMachine({
+      nounDef: noun,
+      statuses: [
+        { id: 's1', name: 'Init' },
+        {
+          id: 's2', name: 'Processing',
+          verb: { id: 'v1', name: 'process', func: { callbackUrl: 'https://pipeline.example.com/run', httpMethod: 'PUT' } },
+        },
+        { id: 's3', name: 'Done' },
+      ],
+      transitions: [
+        { from: 'Init', to: 'Processing', event: 'START', eventTypeId: 'et1' },
+        { from: 'Processing', to: 'Done', event: 'FINISH', eventTypeId: 'et2' },
+      ],
+    })
+
+    const model = createMockModel({
+      nouns: [noun],
+      stateMachines: [sm],
+      factTypes: [],
+      readings: [],
+    })
+
+    const result = await generateXState(model)
+    const config = JSON.parse(result.files['state-machines/pipeline.json'])
+    // Moore callback: action on entry to Processing state
+    expect(config.states.Processing.callback).toEqual({ url: 'https://pipeline.example.com/run', method: 'PUT' })
+  })
+
+  // -------------------------------------------------------------------------
+  // Agent tools include guards
+  // -------------------------------------------------------------------------
+  it('includes guards in agent tool definitions', async () => {
+    const noun = mkNounDef({ name: 'Order' })
+    const sm = mkStateMachine({
+      nounDef: noun,
+      statuses: [
+        { id: 's1', name: 'Pending' },
+        { id: 's2', name: 'Shipped' },
+      ],
+      transitions: [
+        {
+          from: 'Pending', to: 'Shipped', event: 'SHIP', eventTypeId: 'et1',
+          guard: { graphSchemaId: 'gs-payment', constraintIds: ['c1'] },
+        },
+      ],
+    })
+
+    const model = createMockModel({
+      nouns: [noun],
+      stateMachines: [sm],
+      factTypes: [],
+      readings: [],
+    })
+
+    const result = await generateXState(model)
+    const tools = JSON.parse(result.files['agents/order-tools.json'])
+    expect(tools[0].guards).toEqual(['gs-payment'])
+  })
+
+  // -------------------------------------------------------------------------
+  // Prompt includes Initial state
+  // -------------------------------------------------------------------------
+  it('prompt includes initial state name', async () => {
+    const noun = mkNounDef({ name: 'Ticket' })
+    const sm = mkStateMachine({
+      nounDef: noun,
+      statuses: [
+        { id: 's1', name: 'Open', isInitial: true },
+        { id: 's2', name: 'Closed' },
+      ],
+      transitions: [
+        { from: 'Open', to: 'Closed', event: 'CLOSE', eventTypeId: 'et1' },
+      ],
+    })
+
+    const model = createMockModel({
+      nouns: [noun],
+      stateMachines: [sm],
+      factTypes: [],
+      readings: [],
+    })
+
+    const result = await generateXState(model)
+    const prompt = result.files['agents/ticket-prompt.md']
+    expect(prompt).toContain('Initial: Open')
   })
 
   // -------------------------------------------------------------------------
@@ -626,7 +838,6 @@ describe('generateXState', () => {
     const result = await generateXState(model)
     const config = JSON.parse(result.files['state-machines/task.json'])
 
-    expect(config.states.Todo.on.COMPLETE).toEqual({ target: 'Done' })
-    expect(config.states.Todo.on.COMPLETE.meta).toBeUndefined()
+    expect(config.states.Todo.on.COMPLETE).toBe('Done')
   })
 })

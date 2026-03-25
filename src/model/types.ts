@@ -78,6 +78,8 @@ export interface StateMachineDef {
 export interface StatusDef {
   id: string
   name: string
+  isInitial?: boolean
+  verb?: VerbDef  // Moore semantics — action on entry
 }
 
 export interface TransitionDef {
@@ -85,7 +87,8 @@ export interface TransitionDef {
   to: string
   event: string
   eventTypeId: string
-  verb?: VerbDef
+  eventPattern?: string  // Event Type Pattern (e.g., '2XX', '4XX', '*')
+  verb?: VerbDef         // Mealy semantics — action on transition
   guard?: { graphSchemaId: string; constraintIds: string[] }
 }
 
