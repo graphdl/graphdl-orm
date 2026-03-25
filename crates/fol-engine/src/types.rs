@@ -7,6 +7,7 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConstraintIR {
+    #[allow(dead_code)] // deserialized from JSON, read by JS callers
     pub domain: String,
     pub nouns: HashMap<String, NounDef>,
     pub fact_types: HashMap<String, FactTypeDef>,
@@ -35,6 +36,7 @@ impl Default for WorldAssumption {
 pub struct NounDef {
     pub object_type: String,
     pub enum_values: Option<Vec<String>>,
+    #[allow(dead_code)] // deserialized from JSON, read by JS callers
     pub value_type: Option<String>,
     pub super_type: Option<String>,
     #[serde(default)]
@@ -87,7 +89,9 @@ pub struct ConstraintDef {
     pub deontic_operator: Option<String>,
     pub text: String,
     pub spans: Vec<SpanDef>,
+    #[allow(dead_code)] // deserialized from JSON, read by JS callers
     pub set_comparison_argument_length: Option<usize>,
+    #[allow(dead_code)] // deserialized from JSON, read by JS callers
     pub clauses: Option<Vec<String>>,
     pub entity: Option<String>,
     pub min_occurrence: Option<usize>,
@@ -99,6 +103,7 @@ pub struct ConstraintDef {
 pub struct SpanDef {
     pub fact_type_id: String,
     pub role_index: usize,
+    #[allow(dead_code)] // deserialized from JSON, read by JS callers
     pub subset_autofill: Option<bool>,
 }
 
@@ -122,6 +127,7 @@ pub struct TransitionDef {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GuardDef {
+    #[allow(dead_code)] // deserialized from JSON, read by JS callers
     pub graph_schema_id: String,
     pub constraint_ids: Vec<String>,
 }
@@ -150,6 +156,7 @@ pub struct FactInstance {
 pub struct ResponseContext {
     pub text: String,
     pub sender_identity: Option<String>,
+    #[allow(dead_code)] // deserialized from JSON, read by JS callers
     pub fields: Option<HashMap<String, String>>,
 }
 
@@ -179,6 +186,7 @@ pub struct DerivedFact {
 #[serde(rename_all = "lowercase")]
 pub enum Confidence {
     Definitive, // derived under CWA — fact is definitively true/false
+    #[allow(dead_code)] // reserved: used when OWA derivation is implemented
     Incomplete, // derived under OWA — absence doesn't mean false
 }
 
@@ -187,6 +195,7 @@ pub enum Confidence {
 /// Result of attempting to prove a goal
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)] // used by lib.rs WASM export, not by main.rs binary
 pub enum ProofStatus {
     /// Goal is proven — a derivation chain exists from axioms to the goal
     Proven,
@@ -199,6 +208,7 @@ pub enum ProofStatus {
 /// A single step in a proof tree
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)] // used by lib.rs WASM export, not by main.rs binary
 pub struct ProofStep {
     /// The fact being proven at this step
     pub fact: String,
@@ -211,20 +221,24 @@ pub struct ProofStep {
 /// How a fact was established in a proof
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)] // used by lib.rs WASM export, not by main.rs binary
 pub enum Justification {
     /// Fact exists directly in the population (axiom)
     Axiom,
     /// Derived by applying a rule to the child steps
     Derived { rule_id: String, rule_text: String },
     /// Assumed false under Closed World Assumption
+    #[allow(dead_code)] // reserved: constructed when prove returns leaf-level CWA negation
     ClosedWorldNegation,
     /// Cannot be proven or disproven under Open World Assumption
+    #[allow(dead_code)] // reserved: constructed when prove returns leaf-level OWA unknown
     OpenWorld,
 }
 
 /// Complete proof result
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)] // used by lib.rs WASM export, not by main.rs binary
 pub struct ProofResult {
     pub goal: String,
     pub status: ProofStatus,
@@ -251,6 +265,7 @@ pub struct SynthesisResult {
 }
 
 impl SynthesisResult {
+    #[allow(dead_code)] // used by lib.rs WASM export, not by main.rs binary
     pub fn empty(noun_name: &str) -> Self {
         SynthesisResult {
             noun_name: noun_name.to_string(),

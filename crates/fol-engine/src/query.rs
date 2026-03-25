@@ -3,7 +3,9 @@
 // Population query: filter a Population by a predicate and return matching entity references.
 // Used by collection predicate evaluation (e.g., "all SupportRequests where Status = Investigating").
 
-use crate::types::{Population, FactInstance};
+use crate::types::Population;
+#[cfg(test)]
+use crate::types::FactInstance;
 use serde::{Serialize, Deserialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
