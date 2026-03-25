@@ -2,7 +2,8 @@
  * State machine initialization and transitions for Entity DOs.
  *
  * On entity creation: if the noun type has a state machine definition,
- * initialize at the initial state (first status with no incoming transitions).
+ * initialize at the initial state (status with isInitial flag, or first
+ * status with no incoming transitions as fallback).
  *
  * On event: validate the transition from current status, return the new status.
  * The entity's state is stored as _status/_statusId on the Entity DO's data.
@@ -118,15 +119,23 @@ export async function getInitialState(
   )
   if (!statuses.length) return null
 
-  // Load transitions to find the initial status (one with no incoming transitions)
-  const allTransitions = await loadEntities(registry, getStub, 'Transition', domain)
+  // Prefer the explicit isInitial flag if any status has it
+  const flagged = statuses.find(s => s.data.isInitial === true)
+  let initialStatus: EntityRecord
 
-  let initialStatus = statuses[0]
-  for (const s of statuses) {
-    const hasIncoming = allTransitions.some(t => t.data.to === s.id || t.data.toId === s.id)
-    if (!hasIncoming) {
-      initialStatus = s
-      break
+  if (flagged) {
+    initialStatus = flagged
+  } else {
+    // Fall back to heuristic: first status with no incoming transitions
+    const allTransitions = await loadEntities(registry, getStub, 'Transition', domain)
+
+    initialStatus = statuses[0]
+    for (const s of statuses) {
+      const hasIncoming = allTransitions.some(t => t.data.to === s.id || t.data.toId === s.id)
+      if (!hasIncoming) {
+        initialStatus = s
+        break
+      }
     }
   }
 
