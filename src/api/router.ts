@@ -17,8 +17,7 @@ import { handleListEntities, handleGetEntity, handleCreateEntity, handleDeleteEn
 // ── Reverse mapping: collection slug → entity type name ──────────────
 // Built by inverting NOUN_TABLE_MAP (type→table) and joining with
 // COLLECTION_TABLE_MAP (slug→table). Only metamodel collections that
-// appear in NOUN_TABLE_MAP get an entry — runtime instance collections
-// and unknown slugs fall through to the legacy DomainDB handler.
+// appear in NOUN_TABLE_MAP get an entry — unknown slugs return 404.
 const TABLE_TO_ENTITY_TYPE: Record<string, string> = {}
 for (const [typeName, tableName] of Object.entries(NOUN_TABLE_MAP)) {
   TABLE_TO_ENTITY_TYPE[tableName] = typeName
@@ -31,12 +30,6 @@ for (const [slug, tableName] of Object.entries(COLLECTION_TABLE_MAP)) {
 }
 
 // ── DO helpers ───────────────────────────────────────────────────────
-
-/** Get a DomainDB DO stub for the given domain slug. */
-function getDomainDO(env: Env, domainSlug: string): DurableObjectStub {
-  const id = env.DOMAIN_DB.idFromName(domainSlug)
-  return env.DOMAIN_DB.get(id)
-}
 
 /** Get an EntityDB DO stub for the given entity ID. */
 function getEntityDO(env: Env, entityId: string): DurableObjectStub {
@@ -58,61 +51,6 @@ function getRegistryDO(env: Env, scope: string): DurableObjectStub {
 function getPrimaryDB(env: Env): DurableObjectStub {
   const id = env.DOMAIN_DB.idFromName('graphdl-primary')
   return env.DOMAIN_DB.get(id)
-}
-
-/**
- * Resolve which DomainDB DO to query based on the domain context in the request.
- * Checks where[domain][equals] or body.domain for a domain UUID or slug.
- * Uses the Registry to find which DomainDB DO has that domain.
- * Falls back to getPrimaryDB if no domain context is found.
- */
-/**
- * Result of domain resolution — includes the DO stub and whether a specific
- * domain was resolved (so the caller can strip the domain filter from queries).
- */
-interface DomainResolution {
-  db: DurableObjectStub
-  resolved: boolean  // true = routed to a per-domain DO (strip domain filter)
-}
-
-async function resolveDomainDB(env: Env, where?: Record<string, any>, body?: Record<string, any>): Promise<DomainResolution> {
-  const domainId = where?.domain?.equals || where?.['domain.domainSlug']?.equals || body?.domain
-
-  if (domainId && typeof domainId === 'string') {
-    // If it looks like a slug (has hyphens, not a UUID pattern), use directly
-    if (domainId.includes('-') && !domainId.match(/^[0-9a-f]{8}-[0-9a-f]{4}-/)) {
-      return { db: getDomainDO(env, domainId), resolved: true }
-    }
-
-    // It's a UUID — try Registry first, then primary DO for slug lookup
-    const registry = getRegistryDO(env, 'global') as any
-    try {
-      const slug: string | null = await registry.resolveSlugByUUID(domainId)
-      if (slug) return { db: getDomainDO(env, slug), resolved: true }
-    } catch { /* fall through */ }
-
-    // Fallback: look up slug from primary DO's domains table
-    const primary = getPrimaryDB(env) as any
-    try {
-      const result = await primary.findInCollection('domains', { id: { equals: domainId } }, { limit: 1 })
-      if (result.docs.length) {
-        const slug = result.docs[0].domainSlug || result.docs[0].domain_slug
-        if (slug) return { db: getDomainDO(env, slug), resolved: true }
-      }
-    } catch { /* fall through */ }
-  }
-
-  // No domain context — fall back to primary
-  return { db: getPrimaryDB(env), resolved: false }
-}
-
-/** Strip domain filter from where clause — not needed when querying a per-domain DO. */
-function stripDomainFilter(where: Record<string, any>): Record<string, any> {
-  const filtered = { ...where }
-  delete filtered.domain
-  delete filtered['domain.domainSlug']
-  delete filtered['domain.organization']
-  return filtered
 }
 
 export const router = AutoRouter()
@@ -616,25 +554,26 @@ router.get('/api/:collection', async (request, env: Env) => {
     })
   }
 
-  // Fallback: legacy DomainDB handler for unmapped collections
-  const url = new URL(request.url)
-  const { where, limit, page, sort } = parseQueryOptions(url.searchParams)
+  // Generators collection stays in DomainDB (SQL table, not entity-per-DO)
+  if (collection === 'generators') {
+    const url = new URL(request.url)
+    const { where, limit, page, sort } = parseQueryOptions(url.searchParams)
+    const db = getPrimaryDB(env) as any
+    const result = await db.findInCollection(collection, where, { limit, page, sort })
+    return json({
+      docs: result.docs,
+      totalDocs: result.totalDocs,
+      limit: result.limit,
+      page: result.page,
+      totalPages: Math.ceil(result.totalDocs / result.limit),
+      hasNextPage: result.hasNextPage,
+      hasPrevPage: result.page > 1,
+      pagingCounter: (result.page - 1) * result.limit + 1,
+    })
+  }
 
-  // Route to the correct DomainDB based on domain context
-  const { db, resolved } = await resolveDomainDB(env, where)
-  const queryWhere = resolved ? stripDomainFilter(where || {}) : where
-  const result = await (db as any).findInCollection(collection, queryWhere, { limit, page, sort })
-
-  return json({
-    docs: result.docs,
-    totalDocs: result.totalDocs,
-    limit: result.limit,
-    page: result.page,
-    totalPages: Math.ceil(result.totalDocs / result.limit),
-    hasNextPage: result.hasNextPage,
-    hasPrevPage: result.page > 1,
-    pagingCounter: (result.page - 1) * result.limit + 1,
-  })
+  // No entity-type mapping and not generators — 404
+  return error(404, { errors: [{ message: `Collection "${collection}" has no entity-type handler` }] })
 })
 
 /** GET /api/:collection/:id — get by ID */
@@ -659,15 +598,15 @@ router.get('/api/:collection/:id', async (request, env: Env) => {
     })
   }
 
-  // Fallback: legacy DomainDB handler
-  const url = new URL(request.url)
-  const { where } = parseQueryOptions(url.searchParams)
+  // Generators collection stays in DomainDB
+  if (collection === 'generators') {
+    const db = getPrimaryDB(env) as any
+    const doc = await db.getFromCollection(collection, id)
+    if (!doc) return error(404, { errors: [{ message: 'Not Found' }] })
+    return json(doc)
+  }
 
-  const { db } = await resolveDomainDB(env, where)
-  const doc = await (db as any).getFromCollection(collection, id)
-
-  if (!doc) return error(404, { errors: [{ message: 'Not Found' }] })
-  return json(doc)
+  return error(404, { errors: [{ message: `Collection "${collection}" has no entity-type handler` }] })
 })
 
 /** POST /api/:collection — create */
@@ -694,10 +633,14 @@ router.post('/api/:collection', async (request, env: Env) => {
     return json({ doc: { id: result.id, ...body }, message: 'Created successfully' }, { status: 201 })
   }
 
-  // Fallback: legacy DomainDB handler (no hooks — hook logic moved to BatchBuilder steps)
-  const { db } = await resolveDomainDB(env, undefined, body)
-  const doc = await (db as any).createInCollection(collection, body)
-  return json({ doc, message: 'Created successfully' }, { status: 201 })
+  // Generators collection stays in DomainDB
+  if (collection === 'generators') {
+    const db = getPrimaryDB(env) as any
+    const doc = await db.createInCollection(collection, body)
+    return json({ doc, message: 'Created successfully' }, { status: 201 })
+  }
+
+  return error(404, { errors: [{ message: `Collection "${collection}" has no entity-type handler` }] })
 })
 
 /** PATCH /api/:collection/:id — update */
@@ -718,12 +661,15 @@ router.patch('/api/:collection/:id', async (request, env: Env) => {
     return json({ doc: result, message: 'Updated successfully' })
   }
 
-  // Fallback: legacy DomainDB handler
-  const { db } = await resolveDomainDB(env, undefined, body)
-  const doc = await (db as any).updateInCollection(collection, id, body)
+  // Generators collection stays in DomainDB
+  if (collection === 'generators') {
+    const db = getPrimaryDB(env) as any
+    const doc = await db.updateInCollection(collection, id, body)
+    if (!doc) return error(404, { errors: [{ message: 'Not Found' }] })
+    return json({ doc, message: 'Updated successfully' })
+  }
 
-  if (!doc) return error(404, { errors: [{ message: 'Not Found' }] })
-  return json({ doc, message: 'Updated successfully' })
+  return error(404, { errors: [{ message: `Collection "${collection}" has no entity-type handler` }] })
 })
 
 /** DELETE /api/:collection/:id — delete */
@@ -742,12 +688,15 @@ router.delete('/api/:collection/:id', async (request, env: Env) => {
     return json({ id, message: 'Deleted successfully' })
   }
 
-  // Fallback: legacy DomainDB handler
-  const { db } = await resolveDomainDB(env)
-  const result = await (db as any).deleteFromCollection(collection, id)
+  // Generators collection stays in DomainDB
+  if (collection === 'generators') {
+    const db = getPrimaryDB(env) as any
+    const result = await db.deleteFromCollection(collection, id)
+    if (!result.deleted) return error(404, { errors: [{ message: 'Not Found' }] })
+    return json({ id, message: 'Deleted successfully' })
+  }
 
-  if (!result.deleted) return error(404, { errors: [{ message: 'Not Found' }] })
-  return json({ id, message: 'Deleted successfully', ...(result.cascaded && { cascaded: result.cascaded }) })
+  return error(404, { errors: [{ message: `Collection "${collection}" has no entity-type handler` }] })
 })
 
 // ── Legacy aliases (backwards compat for /seed and /claims without /api prefix) ──
