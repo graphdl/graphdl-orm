@@ -107,17 +107,45 @@ async function handleSeedDelete(env: Env): Promise<Response> {
 // ── POST /seed — parallel per-domain ingestion ───────────────────────
 
 async function handleSeedPost(request: Request, env: Env): Promise<Response> {
+  const contentType = request.headers.get('content-type') || ''
+
+  // ── Multipart upload: each file is a .md readings file ──────────
+  // Domain slug derived from filename (minus extension).
+  // curl -X POST /seed -F core=@readings/core.md -F state=@readings/state.md
+  if (contentType.includes('multipart/form-data')) {
+    const formData = await request.formData()
+    const domains: Array<{ slug: string; name?: string; claims: ExtractedClaims }> = []
+
+    for (const [name, value] of formData.entries()) {
+      if (!(value instanceof File) && typeof value !== 'string') continue
+      const text = value instanceof File ? await value.text() : value
+      if (!text.trim()) continue
+
+      // Slug from field name or filename (minus .md extension)
+      const slug = name.replace(/\.md$/i, '')
+      const claims = parseFORML2(text, [])
+      domains.push({ slug, name: slug, claims })
+    }
+
+    if (domains.length === 0) {
+      return error(400, { errors: [{ message: 'No readings files in upload' }] })
+    }
+
+    return handleBulkSeed(env, domains)
+  }
+
+  // ── JSON body ───────────────────────────────────────────────────
   const body = await request.json() as {
-    type: string
+    type?: string
     claims?: ExtractedClaims
     domain?: string
     domainId?: string
     domains?: Array<{ slug: string; name?: string; claims?: ExtractedClaims; text?: string }>
-    /** Raw FORML2 text — parsed server-side */
     text?: string
   }
 
-  if (body.type !== 'claims') {
+  // Legacy wrapper: type: "claims"
+  if (body.type && body.type !== 'claims') {
     return error(400, { errors: [{ message: 'Unsupported seed type. Use type: "claims"' }] })
   }
 
@@ -142,7 +170,7 @@ async function handleSeedPost(request: Request, env: Env): Promise<Response> {
     return handleSingleSeed(env, body)
   }
 
-  return error(400, { errors: [{ message: 'Provide claims + domain, text + domain, or domains[]' }] })
+  return error(400, { errors: [{ message: 'Provide claims + domain, text + domain, domains[], or multipart file upload' }] })
 }
 
 // ── Bulk multi-domain seeding ────────────────────────────────────────
