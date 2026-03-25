@@ -2,11 +2,11 @@
  * Claims ingestion — bulk structured claims.
  *
  * Metamodel entities are accumulated via BatchBuilder (committed by the caller).
- * Instance facts still go through GraphDLDBLike.createEntity() directly.
+ * Instance facts still go through FactWriterLike.createEntity() directly.
  */
 
 /** Minimal DB interface needed only for instance facts (ingestFacts). */
-export interface GraphDLDBLike {
+export interface FactWriterLike {
   createEntity?(domainId: string, entityName: string, fields: any, reference?: string): Promise<any>
   applySchema?(domainId: string): Promise<any>
 }
@@ -87,7 +87,7 @@ export interface IngestClaimsResult {
  * Instance facts are written via db.createEntity() as before.
  */
 export async function ingestClaims(
-  db: GraphDLDBLike,
+  db: FactWriterLike,
   opts: { claims: ExtractedClaims; domainId: string },
 ): Promise<IngestClaimsResult> {
   const { claims, domainId } = opts
@@ -157,7 +157,7 @@ export interface ProjectResult {
  * entity references (e.g. roles pointing to nouns from other domains) resolve.
  */
 export async function ingestProject(
-  db: GraphDLDBLike,
+  db: FactWriterLike,
   domains: Array<{ domainId: string; claims: ExtractedClaims }>,
 ): Promise<ProjectResult> {
   const scope = createScope()

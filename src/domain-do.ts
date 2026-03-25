@@ -96,9 +96,8 @@ const WIPE_TABLES: readonly string[] = [
 // Types
 // =========================================================================
 
-export interface SqlLike {
-  exec(query: string, ...params: any[]): { toArray(): any[] }
-}
+import type { SqlLike } from './sql-like'
+export type { SqlLike } from './sql-like'
 
 // =========================================================================
 // Constants
@@ -585,6 +584,10 @@ function inspectTableSchema(
   sql: SqlLike,
   table: string,
 ): Record<string, any> {
+  // Whitelist-validate table name to prevent SQL injection via string interpolation
+  const VALID_TABLES = new Set([...METAMODEL_TABLES, 'organizations', 'org_memberships', 'apps', 'domains', 'batches', 'generators'])
+  if (!VALID_TABLES.has(table)) throw new Error(`Unknown table: ${table}`)
+
   try {
     const columns = sql.exec(`PRAGMA table_info(${table})`).toArray().map((r: any) => ({
       name: r.name, type: r.type, notnull: r.notnull, dflt_value: r.dflt_value, pk: r.pk,

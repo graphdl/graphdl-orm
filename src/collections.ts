@@ -88,11 +88,4 @@ export const COLLECTION_TABLE_MAP: Record<string, string> = {
 /** All supported Payload collection slugs. */
 export const COLLECTION_SLUGS = Object.keys(COLLECTION_TABLE_MAP)
 
-/** Instance collections — scoped per-domain. */
-export const INSTANCE_COLLECTIONS = new Set([
-  'graphs', 'resources', 'resource-roles',
-  'citations', 'graph-citations',
-  'state-machines', 'events', 'guard-runs',
-  'agents', 'completions',
-])
 

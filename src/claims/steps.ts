@@ -6,7 +6,7 @@
  * Instance facts (ingestFacts) still use the DB interface directly.
  */
 import type { BatchBuilder } from './batch-builder'
-import type { GraphDLDBLike } from './ingest'
+import type { FactWriterLike } from './ingest'
 import type { ExtractedClaims } from './ingest'
 import type { Scope } from './scope'
 import { addNoun, resolveNoun, addSchema, resolveSchema } from './scope'
@@ -434,10 +434,10 @@ export function ingestTransitions(
 
 /**
  * Instance facts write to EntityDB DOs (not metamodel), so they still
- * use the GraphDLDBLike interface directly. This step is NOT batched.
+ * use the FactWriterLike interface directly. This step is NOT batched.
  */
 export async function ingestFacts(
-  db: GraphDLDBLike,
+  db: FactWriterLike,
   facts: NonNullable<ExtractedClaims['facts']>,
   domainId: string,
   scope: Scope,
