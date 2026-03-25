@@ -97,6 +97,7 @@ export async function handleEvaluate(request: Request, env: Env): Promise<Respon
         domain: body.domainId!,
         constraintId: v.constraintId ?? null,
         text: v.detail || v.constraintText || 'Constraint violation',
+        triggeredByResourceId: v.resourceId ?? undefined,
       }))).catch(() => { /* swallow — best-effort persistence */ })
     }
 
