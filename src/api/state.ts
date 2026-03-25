@@ -11,6 +11,7 @@
 import { json, error } from 'itty-router'
 import type { Env } from '../types'
 import type { RegistryReadStub, EntityReadStub, EntityRecord } from './entity-routes'
+import { createFailure } from '../worker/outcomes'
 
 // ── DO helpers ───────────────────────────────────────────────────────
 
@@ -207,8 +208,16 @@ async function enrichTransitions(
       _eventTypeId: eventTypeId,
       _toStatusId: toStatusId,
       _verbId: (typeof t.data.verb === 'object' ? (t.data.verb as any)?.id : t.data.verb) as string | undefined,
+      _guardEntities: guards,
     }
   }))
+}
+
+/** Extract the Noun ID from a state machine definition entity. */
+function getNounId(definition: EntityRecord | null): string | undefined {
+  if (!definition) return undefined
+  const d = definition.data
+  return (typeof d.noun === 'object' ? (d.noun as any)?.id : d.noun ?? d.nounId ?? d.noun_id) as string | undefined
 }
 
 // ── GET /api/state/:type/:id ─────────────────────────────────────────
@@ -276,7 +285,7 @@ export async function handleGetState(request: Request, env: Env) {
     instanceId,
     currentState: instance.currentStatusName || 'unknown',
     availableEvents: availableTransitions.map((t: any) => t.event).filter(Boolean),
-    availableTransitions: availableTransitions.map(({ _eventTypeId, _toStatusId, _verbId, id, ...t }) => t),
+    availableTransitions: availableTransitions.map(({ _eventTypeId, _toStatusId, _verbId, _guardEntities, id, ...t }) => t),
   })
 }
 
@@ -300,16 +309,35 @@ export async function handleSendEvent(request: Request, env: Env) {
   const registry = getRegistryDO(env)
   const getStub: GetStubFn = (id) => getEntityStub(env, id)
   const domain = (body.domain as string) || url.searchParams.get('domain') || undefined
+  const domainSlug = domain || null
 
   // Find or create instance
   let instance = await getInstance(registry, getStub, machineType, instanceId, domain)
+  let definition: EntityRecord | null = null
 
   if (!instance) {
-    const definition = await findDefinition(registry, getStub, machineType, domain)
-    if (!definition) return json({ error: `Machine type '${machineType}' not found` }, { status: 404 })
+    definition = await findDefinition(registry, getStub, machineType, domain)
+    if (!definition) {
+      const reason = `State machine type '${machineType}' not found`
+      createFailure(env, {
+        domain: domainSlug,
+        failureType: 'transition',
+        reason,
+      }).catch(() => {}) // best-effort, don't block the response
+      return json({ error: reason }, { status: 404 })
+    }
 
     const initialStatus = await findInitialStatus(registry, getStub, definition.id, domain)
-    if (!initialStatus) return json({ error: `No statuses found for '${machineType}'` }, { status: 404 })
+    if (!initialStatus) {
+      const reason = `No statuses found for '${machineType}'`
+      createFailure(env, {
+        domain: domainSlug,
+        failureType: 'transition',
+        reason,
+        functionId: getNounId(definition),
+      }).catch(() => {}) // best-effort, don't block the response
+      return json({ error: reason }, { status: 404 })
+    }
 
     const domainId = (typeof definition.data.domain === 'object'
       ? (definition.data.domain as any)?.id : definition.data.domain) as string | undefined
@@ -338,17 +366,74 @@ export async function handleSendEvent(request: Request, env: Env) {
     }
   }
 
+  // Lazily resolve definition if we didn't load it above (instance already existed)
+  if (!definition) {
+    definition = await loadEntity(getStub, instance.definitionId)
+  }
+  const nounId = getNounId(definition)
+
   // Resolve transition
   const rawTransitions = await findTransitionsFrom(registry, getStub, instance.currentStatusId, domain)
   const enriched = await enrichTransitions(registry, getStub, rawTransitions, domain)
   const matching = enriched.find((t: any) => t.event === event)
 
   if (!matching) {
+    const reason = `No transition for event '${event}' in state '${instance.currentStatusName}'`
+    createFailure(env, {
+      domain: domainSlug,
+      failureType: 'transition',
+      reason,
+      functionId: nounId,
+    }).catch(() => {}) // best-effort, don't block the response
     return json({
-      error: `No transition for event '${event}' in state '${instance.currentStatusName}'`,
+      error: reason,
       currentState: instance.currentStatusName,
       availableEvents: enriched.map((t: any) => t.event).filter(Boolean),
     }, { status: 422 })
+  }
+
+  // ── Guard evaluation ───────────────────────────────────────────────
+  const guardEntities = (matching as any)._guardEntities as EntityRecord[] | undefined
+  if (guardEntities && guardEntities.length > 0) {
+    for (const guard of guardEntities) {
+      const guardName = (guard.data.name || guard.id) as string
+      const graphSchemaId = (guard.data.graphSchemaId || guard.data.graph_schema_id) as string | undefined
+
+      // If the guard references a graph schema, verify the schema exists
+      if (graphSchemaId) {
+        const schema = await loadEntity(getStub, graphSchemaId)
+        if (!schema) {
+          const reason = `Guard '${guardName}' references unavailable graph schema '${graphSchemaId}'`
+          createFailure(env, {
+            domain: domainSlug,
+            failureType: 'transition',
+            reason,
+            functionId: nounId,
+          }).catch(() => {}) // best-effort, don't block the response
+          return json({
+            error: reason,
+            currentState: instance.currentStatusName,
+            guard: guardName,
+          }, { status: 422 })
+        }
+      }
+
+      // Guard is defined on this transition — it blocks the transition
+      // (runtime guard evaluation requires constraint checking against entity data;
+      // guards are treated as blocking until a guard-run confirms passage)
+      const reason = `Guard '${guardName}' blocked transition from '${instance.currentStatusName}' to '${matching.target}'`
+      createFailure(env, {
+        domain: domainSlug,
+        failureType: 'transition',
+        reason,
+        functionId: nounId,
+      }).catch(() => {}) // best-effort, don't block the response
+      return json({
+        error: reason,
+        currentState: instance.currentStatusName,
+        guard: guardName,
+      }, { status: 422 })
+    }
   }
 
   const previousState = instance.currentStatusName
