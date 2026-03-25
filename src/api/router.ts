@@ -523,8 +523,18 @@ router.get('/api/entities/:noun', async (request, env: Env) => {
 
 router.get('/api/entities/:noun/:id', async (request, env: Env) => {
   const { id } = request.params
+  const url = new URL(request.url)
+  const domainSlug = url.searchParams.get('domain') || undefined
 
-  const entity = await handleGetEntity(getEntityDO(env, id) as any)
+  const smRegistry = getRegistryDO(env, 'global') as any
+  const smGetStub = (eid: string) => getEntityDO(env, eid) as any
+
+  const entity = await handleGetEntity(getEntityDO(env, id) as any, {
+    transitionOpts: {
+      getValidTransitions: (defId, statusId) =>
+        getValidTransitions(smRegistry, smGetStub, defId, statusId, domainSlug),
+    },
+  })
   if (!entity) return error(404, { errors: [{ message: 'Not Found' }] })
 
   return json({
@@ -534,6 +544,7 @@ router.get('/api/entities/:noun/:id', async (request, env: Env) => {
     version: entity.version,
     createdAt: entity.createdAt,
     updatedAt: entity.updatedAt,
+    ...(entity.transitions && { transitions: entity.transitions }),
   })
 })
 
@@ -662,7 +673,17 @@ router.get('/api/:collection/:id', async (request, env: Env) => {
   // Delegate to entity-type handler if this collection maps to a known entity type
   const entityType = COLLECTION_TO_ENTITY_TYPE[collection]
   if (entityType) {
-    const entity = await handleGetEntity(getEntityDO(env, id) as any)
+    const url = new URL(request.url)
+    const domainSlug = url.searchParams.get('domain') || undefined
+    const smRegistry = getRegistryDO(env, 'global') as any
+    const smGetStub = (eid: string) => getEntityDO(env, eid) as any
+
+    const entity = await handleGetEntity(getEntityDO(env, id) as any, {
+      transitionOpts: {
+        getValidTransitions: (defId, statusId) =>
+          getValidTransitions(smRegistry, smGetStub, defId, statusId, domainSlug),
+      },
+    })
     if (!entity) return error(404, { errors: [{ message: 'Not Found' }] })
     return json({
       id: entity.id,
@@ -671,6 +692,7 @@ router.get('/api/:collection/:id', async (request, env: Env) => {
       version: entity.version,
       createdAt: entity.createdAt,
       updatedAt: entity.updatedAt,
+      ...(entity.transitions && { transitions: entity.transitions }),
     })
   }
 

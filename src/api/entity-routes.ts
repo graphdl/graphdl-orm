@@ -39,6 +39,7 @@ export interface EntityRecord {
   deletedAt?: string
   createdAt?: string
   updatedAt?: string
+  transitions?: TransitionInfo[]
 }
 
 // ---------------------------------------------------------------------------
@@ -62,9 +63,22 @@ export interface PaginationOpts {
   depth?: number
 }
 
+export interface TransitionInfo {
+  transitionId: string
+  event: string
+  targetStatus: string
+  targetStatusId: string
+}
+
+export interface TransitionOpts {
+  /** Callback that returns valid transitions given (definitionId, currentStatusId). */
+  getValidTransitions: (definitionId: string, currentStatusId: string) => Promise<TransitionInfo[]>
+}
+
 export interface DepthOpts {
   depth?: number
   getStub?: (id: string) => EntityReadStub
+  transitionOpts?: TransitionOpts
 }
 
 // ---------------------------------------------------------------------------
@@ -187,6 +201,7 @@ export async function handleListEntities(
  * Fetch a single entity from its EntityDB DO.
  * Returns null if not found or soft-deleted.
  * When depth >= 1, resolves Id-suffixed fields to full entity objects.
+ * When transitionOpts is provided and entity has _statusId, includes valid transitions.
  */
 export async function handleGetEntity(
   stub: EntityReadStub,
@@ -198,6 +213,19 @@ export async function handleGetEntity(
   const depth = opts?.depth ?? 0
   if (depth >= 1 && opts?.getStub) {
     entity.data = await populateDepthForEntity(entity, depth, opts.getStub)
+  }
+
+  // Include valid transitions when entity has a state machine
+  if (
+    opts?.transitionOpts &&
+    typeof entity.data._statusId === 'string' &&
+    typeof entity.data._stateMachineDefinition === 'string'
+  ) {
+    const transitions = await opts.transitionOpts.getValidTransitions(
+      entity.data._stateMachineDefinition,
+      entity.data._statusId,
+    )
+    entity.transitions = transitions
   }
 
   return entity
