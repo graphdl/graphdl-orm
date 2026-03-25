@@ -6,7 +6,11 @@
  *
  * On event: validate the transition from current status, return the new status.
  * The entity's state is stored as _status/_statusId on the Entity DO's data.
+ *
+ * Queries use Registry+EntityDB fan-out instead of DomainDB SQL.
  */
+
+import type { RegistryReadStub, EntityReadStub, EntityRecord } from '../api/entity-routes'
 
 export interface StateMachineInit {
   definitionId: string
@@ -32,44 +36,95 @@ export interface TransitionResult {
   newStatusId: string
 }
 
-export interface DomainDBStub {
-  findInCollection(collection: string, where: any, opts?: any): Promise<{ docs: any[]; totalDocs: number }>
+/** Callback to obtain an EntityDB DO stub for a given entity ID. */
+export type GetStubFn = (id: string) => EntityReadStub
+
+// ---------------------------------------------------------------------------
+// Internal fan-out helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Load all entities of a given type from Registry+EntityDB fan-out.
+ * Returns non-deleted entities with their full data blobs.
+ */
+async function loadEntities(
+  registry: RegistryReadStub,
+  getStub: GetStubFn,
+  entityType: string,
+  domain?: string,
+): Promise<EntityRecord[]> {
+  const ids = await registry.getEntityIds(entityType, domain)
+  const settled = await Promise.allSettled(
+    ids.map(async (id) => {
+      const stub = getStub(id)
+      return stub.get()
+    }),
+  )
+  const results: EntityRecord[] = []
+  for (const r of settled) {
+    if (r.status === 'fulfilled' && r.value && !r.value.deletedAt) {
+      results.push(r.value)
+    }
+  }
+  return results
 }
+
+/**
+ * Load a single entity by ID from its EntityDB DO.
+ */
+async function loadEntity(
+  getStub: GetStubFn,
+  id: string,
+): Promise<EntityRecord | null> {
+  try {
+    const stub = getStub(id)
+    const entity = await stub.get()
+    return entity && !entity.deletedAt ? entity : null
+  } catch {
+    return null
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
 
 /**
  * Look up the state machine definition for a noun and determine the initial status.
  * Returns null if the noun has no state machine definition.
  */
 export async function getInitialState(
-  domainDB: DomainDBStub,
+  registry: RegistryReadStub,
+  getStub: GetStubFn,
   nounName: string,
-  domainId: string,
+  domain?: string,
 ): Promise<StateMachineInit | null> {
-  const nouns = await domainDB.findInCollection('nouns', {
-    name: { equals: nounName },
-  }, { limit: 1 })
-  if (!nouns.docs.length) return null
-  const nounId = nouns.docs[0].id
+  // Load all nouns to resolve the noun ID
+  const nouns = await loadEntities(registry, getStub, 'Noun', domain)
+  const noun = nouns.find(n => n.data.name === nounName)
+  if (!noun) return null
+  const nounId = noun.id
 
-  const defs = await domainDB.findInCollection('state-machine-definitions', {
-    noun: { equals: nounId },
-  }, { limit: 1 })
-  if (!defs.docs.length) return null
+  // Load state machine definitions for this noun
+  const defs = await loadEntities(registry, getStub, 'State Machine Definition', domain)
+  const def = defs.find(d => d.data.noun === nounId || d.data.nounId === nounId)
+  if (!def) return null
+  const defId = def.id
 
-  const def = defs.docs[0]
-  const defId = def.id as string
+  // Load statuses for this definition
+  const allStatuses = await loadEntities(registry, getStub, 'Status', domain)
+  const statuses = allStatuses.filter(s =>
+    s.data.stateMachineDefinition === defId || s.data.stateMachineDefinitionId === defId,
+  )
+  if (!statuses.length) return null
 
-  const statuses = await domainDB.findInCollection('statuses', {
-    stateMachineDefinition: { equals: defId },
-  }, { limit: 100, sort: 'createdAt' })
-  if (!statuses.docs.length) return null
+  // Load transitions to find the initial status (one with no incoming transitions)
+  const allTransitions = await loadEntities(registry, getStub, 'Transition', domain)
 
-  let initialStatus = statuses.docs[0]
-  for (const s of statuses.docs) {
-    const incoming = await domainDB.findInCollection('transitions', {
-      to: { equals: s.id },
-    }, { limit: 1 })
-    if (!incoming.docs.length) {
+  let initialStatus = statuses[0]
+  for (const s of statuses) {
+    const hasIncoming = allTransitions.some(t => t.data.to === s.id || t.data.toId === s.id)
+    if (!hasIncoming) {
       initialStatus = s
       break
     }
@@ -77,9 +132,9 @@ export async function getInitialState(
 
   return {
     definitionId: defId,
-    definitionTitle: (def.title || def.name || nounName) as string,
-    initialStatus: initialStatus.name as string,
-    initialStatusId: initialStatus.id as string,
+    definitionTitle: (def.data.title || def.data.name || nounName) as string,
+    initialStatus: initialStatus.data.name as string,
+    initialStatusId: initialStatus.id,
   }
 }
 
@@ -88,33 +143,37 @@ export async function getInitialState(
  * Returns available events and their target statuses.
  */
 export async function getValidTransitions(
-  domainDB: DomainDBStub,
+  registry: RegistryReadStub,
+  getStub: GetStubFn,
   definitionId: string,
   currentStatusId: string,
+  domain?: string,
 ): Promise<TransitionOption[]> {
-  const transitions = await domainDB.findInCollection('transitions', {
-    from: { equals: currentStatusId },
-    stateMachineDefinition: { equals: definitionId },
-  }, { limit: 100 })
+  // Load transitions for this definition from the current status
+  const allTransitions = await loadEntities(registry, getStub, 'Transition', domain)
+  const transitions = allTransitions.filter(t =>
+    (t.data.from === currentStatusId || t.data.fromId === currentStatusId) &&
+    (t.data.stateMachineDefinition === definitionId || t.data.stateMachineDefinitionId === definitionId),
+  )
 
   const options: TransitionOption[] = []
-  for (const t of transitions.docs) {
-    // Get target status name
-    const targetStatuses = await domainDB.findInCollection('statuses', {
-      id: { equals: t.to },
-    }, { limit: 1 })
-    // Get event type name
-    const eventTypes = await domainDB.findInCollection('event-types', {
-      id: { equals: t.eventType },
-    }, { limit: 1 })
+  for (const t of transitions) {
+    const toId = (t.data.to || t.data.toId) as string
+    const eventTypeId = (t.data.eventType || t.data.eventTypeId) as string
 
-    if (targetStatuses.docs.length && eventTypes.docs.length) {
+    // Resolve target status and event type by direct entity lookup
+    const [targetStatus, eventType] = await Promise.all([
+      toId ? loadEntity(getStub, toId) : null,
+      eventTypeId ? loadEntity(getStub, eventTypeId) : null,
+    ])
+
+    if (targetStatus && eventType) {
       options.push({
-        transitionId: t.id as string,
-        event: eventTypes.docs[0].name as string,
-        eventTypeId: t.eventType as string,
-        targetStatus: targetStatuses.docs[0].name as string,
-        targetStatusId: targetStatuses.docs[0].id as string,
+        transitionId: t.id,
+        event: eventType.data.name as string,
+        eventTypeId,
+        targetStatus: targetStatus.data.name as string,
+        targetStatusId: targetStatus.id,
       })
     }
   }
@@ -127,20 +186,20 @@ export async function getValidTransitions(
  * Returns the new status, or null if the event is not valid from the current state.
  */
 export async function applyTransition(
-  domainDB: DomainDBStub,
+  registry: RegistryReadStub,
+  getStub: GetStubFn,
   definitionId: string,
   currentStatusId: string,
   eventName: string,
+  domain?: string,
 ): Promise<TransitionResult | null> {
-  const options = await getValidTransitions(domainDB, definitionId, currentStatusId)
+  const options = await getValidTransitions(registry, getStub, definitionId, currentStatusId, domain)
   const match = options.find(o => o.event === eventName)
   if (!match) return null
 
-  // Get current status name
-  const currentStatuses = await domainDB.findInCollection('statuses', {
-    id: { equals: currentStatusId },
-  }, { limit: 1 })
-  const currentName = currentStatuses.docs.length ? currentStatuses.docs[0].name as string : 'unknown'
+  // Resolve current status name
+  const currentStatus = await loadEntity(getStub, currentStatusId)
+  const currentName = currentStatus ? currentStatus.data.name as string : 'unknown'
 
   return {
     transitionId: match.transitionId,
