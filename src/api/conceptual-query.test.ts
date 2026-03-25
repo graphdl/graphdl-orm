@@ -342,51 +342,64 @@ describe('handleConceptualQuery', () => {
       const entities = new Map<string, EntityDoc>()
       const entityIdsByType = new Map<string, string[]>()
 
-      // Nouns
+      // Nouns — "Supervisor" is longer than "Task", so the handler's longest-first
+      // noun extraction from the reading "Supervisor assigns Task" will place
+      // Supervisor at nouns[0]. When we query from Task's perspective, the
+      // resolution engine recognises it as an inverse path.
       const nounDocs: EntityDoc[] = [
-        { id: 'noun-order', type: 'Noun', data: { name: 'Order', objectType: 'entity' } },
-        { id: 'noun-customer', type: 'Noun', data: { name: 'Customer', objectType: 'entity' } },
+        { id: 'noun-task', type: 'Noun', data: { name: 'Task', objectType: 'entity' } },
+        { id: 'noun-supervisor', type: 'Noun', data: { name: 'Supervisor', objectType: 'entity' } },
       ]
       entityIdsByType.set('Noun', nounDocs.map(n => n.id))
       for (const n of nounDocs) entities.set(n.id, n)
 
-      // Reading: Customer places Order (Customer is subject)
+      // Reading: "Supervisor assigns Task" — Supervisor (10 chars) > Task (4 chars)
+      // so the handler's longest-first extraction will put Supervisor first in nouns[].
       const readingDocs: EntityDoc[] = [
-        { id: 'r1', type: 'Reading', data: { text: 'Customer places Order' } },
+        { id: 'r1', type: 'Reading', data: { text: 'Supervisor assigns Task' } },
       ]
       entityIdsByType.set('Reading', readingDocs.map(r => r.id))
       for (const r of readingDocs) entities.set(r.id, r)
 
-      // Orders with customerId FK
-      const orderDocs: EntityDoc[] = [
-        { id: 'ord-1', type: 'Order', data: { total: 100, customerId: 'cust-1' } },
-        { id: 'ord-2', type: 'Order', data: { total: 200, customerId: 'cust-2' } },
-        { id: 'ord-3', type: 'Order', data: { total: 50, customerId: 'cust-1' } },
+      // Tasks with supervisorId FK
+      const taskDocs: EntityDoc[] = [
+        { id: 'task-1', type: 'Task', data: { title: 'Review PR', supervisorId: 'sup-1' } },
+        { id: 'task-2', type: 'Task', data: { title: 'Deploy', supervisorId: 'sup-2' } },
       ]
-      entityIdsByType.set('Order', orderDocs.map(o => o.id))
-      for (const o of orderDocs) entities.set(o.id, o)
+      entityIdsByType.set('Task', taskDocs.map(t => t.id))
+      for (const t of taskDocs) entities.set(t.id, t)
 
-      // Customers
-      const customerDocs: EntityDoc[] = [
-        { id: 'cust-1', type: 'Customer', data: { name: 'Alice' } },
-        { id: 'cust-2', type: 'Customer', data: { name: 'Bob' } },
+      // Supervisors
+      const supervisorDocs: EntityDoc[] = [
+        { id: 'sup-1', type: 'Supervisor', data: { name: 'Alice' } },
+        { id: 'sup-2', type: 'Supervisor', data: { name: 'Bob' } },
       ]
-      entityIdsByType.set('Customer', customerDocs.map(c => c.id))
-      for (const c of customerDocs) entities.set(c.id, c)
+      entityIdsByType.set('Supervisor', supervisorDocs.map(s => s.id))
+      for (const s of supervisorDocs) entities.set(s.id, s)
 
       const env = buildMockEnv(entities, entityIdsByType)
-      // Query from Order perspective — "Order placed by Customer"
-      // Reading is "Customer places Order" so from Order's view this is inverse
+      // Query: "Task that assigned by Supervisor"
+      // Splits on "that" → ["Task", "assigned by Supervisor"]
+      // Segment 1 finds "Task", segment 2 finds "Supervisor".
+      // nounSequence = [Task, Supervisor].
+      // findReading("Task", "Supervisor"):
+      //   Reading nouns extracted as ["Supervisor", "Task"] (longest first).
+      //   Forward check: nouns[0]="Supervisor" != "Task" → fails.
+      //   Inverse check: "Task" in nouns ✓, "Supervisor" in nouns ✓,
+      //     nouns[0]="Supervisor" != "Task" ✓ → inverse match.
       const req = makeRequest('GET', {
-        q: 'Order placed by Customer',
-        domain: 'order-domain',
+        q: 'Task that assigned by Supervisor',
+        domain: 'task-domain',
       })
 
       const res = await handleConceptualQuery(req, env)
       const body = await res.json() as any
 
       expect(body.resolved).toBe(true)
-      expect(body.rootNoun).toBe('Order')
+      expect(body.rootNoun).toBe('Task')
+      expect(body.path).toHaveLength(1)
+      // The path should show inverse direction (arrows point <-)
+      expect(body.path[0]).toMatch(/<-/)
       expect(body.results).toBeInstanceOf(Array)
     })
   })
