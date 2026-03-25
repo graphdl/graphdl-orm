@@ -126,7 +126,7 @@ Claims ingestion follows Halpin's seven-step Conceptual Schema Design Procedure 
 
 ```bash
 # Claims ingestion with CSDP validation
-curl -X POST https://graphdl-orm.dotdo.workers.dev/api/claims \
+curl -X POST http://localhost:8787/api/claims \
   -H 'Content-Type: application/json' \
   -d '{ "claims": { ... }, "domain": "support" }'
 # → { "valid": true, "batch": { "entities": [...] }, "tables": [...] }
@@ -143,7 +143,7 @@ The FOL engine discovers constraints from data at three points:
 
 ```bash
 # Direct induction endpoint
-curl -X POST https://graphdl-orm.dotdo.workers.dev/api/induce \
+curl -X POST http://localhost:8787/api/induce \
   -H 'Content-Type: application/json' \
   -d '{ "ir": { ... }, "population": { ... } }'
 # → { "constraints": [{ "kind": "UC", "confidence": 0.9, "evidence": "..." }], "rules": [...] }
@@ -163,7 +163,7 @@ The validated conceptual schema is mapped to a relational schema following Halpi
 
 ```bash
 # Generate artifacts from RMAP output
-curl -X POST https://graphdl-orm.dotdo.workers.dev/api/generate \
+curl -X POST http://localhost:8787/api/generate \
   -H 'Content-Type: application/json' \
   -d '{ "domainId": "uuid", "outputFormat": "sqlite" }'
 ```
@@ -185,7 +185,7 @@ Any entity type can have a lifecycle. Transitions define what can happen — too
 
 **Entity responses include transitions:**
 ```bash
-curl https://graphdl-orm.dotdo.workers.dev/api/entities/SupportRequest/uuid?domain=support
+curl http://localhost:8787/api/entities/SupportRequest/uuid?domain=support
 # → {
 #   "id": "uuid", "type": "SupportRequest", "data": { ... },
 #   "state": "Open",
@@ -209,7 +209,7 @@ Three projections of the same data:
 
 **Fire a transition:**
 ```bash
-curl -X POST https://graphdl-orm.dotdo.workers.dev/api/entities/SupportRequest/uuid/transition \
+curl -X POST http://localhost:8787/api/entities/SupportRequest/uuid/transition \
   -H 'Content-Type: application/json' \
   -d '{ "event": "assign", "domain": "support" }'
 # → { "status": "In Progress", "cascade": { "statesVisited": [...] }, "availableEvents": ["resolve", "escalate"] }
@@ -236,7 +236,7 @@ Causal and temporal links:
 The FOL engine (Rust compiled to WASM) evaluates all ORM2 constraint types against a population:
 
 ```bash
-curl -X POST https://graphdl-orm.dotdo.workers.dev/api/evaluate \
+curl -X POST http://localhost:8787/api/evaluate \
   -H 'Content-Type: application/json' \
   -d '{ "domainId": "uuid", "response": { "text": "..." }, "population": { ... } }'
 # → { "violations": [{ "constraintId": "...", "constraintText": "...", "detail": "..." }] }
@@ -246,7 +246,7 @@ The complete reasoning cycle: **Observe** (facts) → **Induce** (rules from dat
 
 **Synthesis** — get everything the framework knows about an entity type:
 ```bash
-curl -X POST https://graphdl-orm.dotdo.workers.dev/api/synthesize \
+curl -X POST http://localhost:8787/api/synthesize \
   -H 'Content-Type: application/json' \
   -d '{ "domainId": "uuid", "nounName": "Support Request" }'
 ```
