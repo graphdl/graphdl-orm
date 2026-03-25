@@ -202,16 +202,9 @@ async function handleBulkSeed(
   t('registry_end')
 
   // Phase 2: Process instance facts (after all metamodels are seeded)
+  // Note: applySchema (SQL table creation inside DomainDB) is no longer needed —
+  // entity instances live in EntityDB DOs, not SQL tables.
   t('phase2_start')
-  // Apply schema for all domains in parallel first
-  await Promise.all(
-    domains.filter(e => e.claims.facts?.length).map(async (entry) => {
-      const domainDO = getDomainDO(env, entry.slug) as any
-      const uuid = slugToUUID.get(entry.slug) || entry.slug
-      try { await domainDO.applySchema(uuid) } catch {}
-    })
-  )
-  t('schema_applied')
 
   // Process facts in parallel per domain
   await Promise.all(
