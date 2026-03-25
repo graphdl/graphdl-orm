@@ -13,7 +13,7 @@ Reading(.id) is an entity type.
 
 Role(.id) is an entity type.
 
-Verb(.id) is an entity type.
+Verb is a subtype of Function.
 
 Constraint(.id) is an entity type.
   Set Comparison Constraint is a subtype of Constraint.

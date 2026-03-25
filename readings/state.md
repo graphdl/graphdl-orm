@@ -13,6 +13,7 @@ Stream(.id) is an entity type.
 ## Value Types
 
 Title is a value type.
+Pattern is a value type.
 
 ## Readings
 
@@ -37,6 +38,13 @@ Transition is triggered by Event Type.
   Each Transition is triggered by exactly one Event Type.
 Verb is performed during Transition.
   Each Verb is performed during at most one Transition.
+
+### Event Type
+Event Type has Pattern.
+  Each Event Type has at most one Pattern.
+
+### Status
+Status is initial.
 
 ### Guard
 Guard references Graph Schema.
