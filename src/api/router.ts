@@ -290,7 +290,10 @@ router.post('/api/entity', async (request, env: Env) => {
 
   // Persist deontic warnings as Violation entities (best-effort, don't block response)
   if (deonticCheck.violations.length > 0) {
-    persistViolations(env, deonticCheck.violations).catch(() => { /* best-effort */ })
+    persistViolations(env, deonticCheck.violations.map(v => ({
+      ...v,
+      triggeredByResourceId: parentId,
+    }))).catch(() => { /* best-effort */ })
   }
 
   // Fire derivation rules (best-effort, don't block on failure)
@@ -478,6 +481,7 @@ router.post('/api/entities/:noun/:id/transition', async (request, env: Env) => {
         failureType: 'transition',
         reason: failure,
         functionId: entity.data.nounId as string || undefined,
+        transitionId: result.transitionId,
       }).catch(() => { /* best-effort */ })
     }
   }
