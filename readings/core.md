@@ -318,6 +318,8 @@ If Noun1 is subtype of Noun2 and Noun2 is subtype of Noun3, then Noun1 is subtyp
 
 Graph Schema has Arity := count of Role where Graph Schema has Role.
 
+Constraint is semantic iff Constraint has modality of Modality Type 'Deontic' and Constraint spans some Role and that Role is played by some Noun and that Noun has Object Type 'entity' and no Resource is instance of that Noun.
+
 ## Instance Facts
 
 ### Constraint Types
