@@ -1,18 +1,14 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import type { SqlLike, BatchEntity } from './batch-wal'
 import { initBatchSchema, createBatch, getBatch, markCommitted, markFailed, getPendingBatches } from './batch-wal'
-import { initDomainSchema } from './domain-do'
 
 /**
- * In-memory mock of SqlLike that supports the SQL operations needed by both
- * the metamodel init (initDomainSchema) and the batch WAL (initBatchSchema).
+ * In-memory mock of SqlLike that supports the SQL operations needed by
+ * the batch WAL (initBatchSchema).
  *
  * Since DomainDB is a Durable Object and can't be instantiated in vitest,
  * we test the integration by calling the pure functions directly — the same
- * pattern used in domain-do.test.ts and batch-wal.test.ts.
- *
- * The key thing we're verifying: initBatchSchema coexists with initDomainSchema,
- * and batch operations work alongside metamodel tables.
+ * pattern used in batch-wal.test.ts.
  */
 function createMockSql(): SqlLike & { tables: Record<string, any[]>; tableColumns: Record<string, string[]> } {
   const tables: Record<string, any[]> = {}
@@ -138,22 +134,14 @@ describe('DomainDB.commitBatch (integration via pure functions)', () => {
     vi.unstubAllGlobals()
   })
 
-  it('initBatchSchema coexists with initDomainSchema', () => {
-    // Simulates what ensureInit() does: run metamodel DDL, then batch schema
-    initDomainSchema(sql)
+  it('initBatchSchema creates the batches table', () => {
     initBatchSchema(sql)
 
-    // Metamodel tables exist
-    expect(sql.tables).toHaveProperty('nouns')
-    expect(sql.tables).toHaveProperty('readings')
-    expect(sql.tables).toHaveProperty('constraints')
-
-    // Batch WAL table also exists
+    // Batch WAL table exists
     expect(sql.tables).toHaveProperty('batches')
   })
 
   it('creates a batch with pending status after both schemas are initialized', () => {
-    initDomainSchema(sql)
     initBatchSchema(sql)
 
     const entities: BatchEntity[] = [
@@ -172,7 +160,6 @@ describe('DomainDB.commitBatch (integration via pure functions)', () => {
   })
 
   it('retrieves a batch by ID', () => {
-    initDomainSchema(sql)
     initBatchSchema(sql)
 
     const entities: BatchEntity[] = [
@@ -189,7 +176,6 @@ describe('DomainDB.commitBatch (integration via pure functions)', () => {
   })
 
   it('marks a batch as committed', () => {
-    initDomainSchema(sql)
     initBatchSchema(sql)
 
     const entities: BatchEntity[] = [
@@ -205,7 +191,6 @@ describe('DomainDB.commitBatch (integration via pure functions)', () => {
   })
 
   it('marks a batch as failed with error message', () => {
-    initDomainSchema(sql)
     initBatchSchema(sql)
 
     const entities: BatchEntity[] = [
@@ -224,7 +209,6 @@ describe('DomainDB.commitBatch (integration via pure functions)', () => {
     let uuidCounter = 0
     vi.stubGlobal('crypto', { randomUUID: () => `batch-${++uuidCounter}` })
 
-    initDomainSchema(sql)
     initBatchSchema(sql)
 
     const entities: BatchEntity[] = [{ id: 'e1', type: 'A', domain: 'd', data: {} }]
@@ -249,7 +233,6 @@ describe('DomainDB.commitBatch (integration via pure functions)', () => {
   })
 
   it('uses domain slug from setDomainId pattern for batch creation', () => {
-    initDomainSchema(sql)
     initBatchSchema(sql)
 
     // Simulates the DO pattern: setDomainId stores slug, then commitBatch uses it

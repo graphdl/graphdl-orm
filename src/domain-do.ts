@@ -2,12 +2,11 @@
  * DomainDB — Durable Object that holds a single domain's metamodel
  * and collection CRUD. Type-level data (nouns, readings, constraints, etc.).
  *
- * The Payload CMS abstraction layer (FIELD_MAP, FK_TARGET_TABLE, etc.)
- * has been inlined as private constants pending full removal once all
- * callers migrate to entity-type endpoints.
+ * The Payload CMS field-map layer (FIELD_MAP, FK_TARGET_TABLE, etc.) is
+ * retained only for the generators collection and the generate/createFact
+ * pipelines. All other collection CRUD has migrated to entity-type DOs.
  */
 
-import { BOOTSTRAP_DDL } from './schema/bootstrap'
 import { COLLECTION_TABLE_MAP, NOUN_TABLE_MAP } from './collections'
 import { initBatchSchema, createBatch, getBatch, markCommitted, markFailed, getPendingBatches } from './batch-wal'
 import type { BatchEntity, Batch } from './batch-wal'
@@ -127,21 +126,6 @@ export const METAMODEL_TABLES: string[] = [
   'generators',
 ]
 
-/**
- * Tables that must also be created because metamodel tables have FK
- * references to them (e.g. nouns.domain_id → domains.id).
- */
-const SUPPORTING_TABLES: string[] = [
-  'organizations',
-  'org_memberships',
-  'apps',
-  'domains',
-  'models',
-  'agent_definitions',
-]
-
-/** All tables whose DDL we need to run. */
-const ALL_REQUIRED_TABLES = new Set([...METAMODEL_TABLES, ...SUPPORTING_TABLES])
 
 /** Fields common to every table — Payload camelCase → SQL snake_case. */
 const COMMON_FIELDS: Record<string, string> = {
@@ -312,37 +296,6 @@ function resolveTable(collectionSlug: string): string {
 
 function getFieldMap(table: string): Record<string, string> {
   return FIELD_MAP[table] || {}
-}
-
-// =========================================================================
-// Public API
-// =========================================================================
-
-/**
- * Runs only the BOOTSTRAP_DDL statements for metamodel tables and their
- * supporting FK targets (organizations, apps, domains, etc.).
- */
-export function initDomainSchema(sql: SqlLike): void {
-  for (const ddl of BOOTSTRAP_DDL) {
-    // Extract table name from CREATE TABLE or CREATE INDEX
-    const createTableMatch = ddl.match(/CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+(\w+)/i)
-    if (createTableMatch) {
-      const tableName = createTableMatch[1]
-      if (ALL_REQUIRED_TABLES.has(tableName)) {
-        sql.exec(ddl)
-      }
-      continue
-    }
-
-    const createIndexMatch = ddl.match(/CREATE\s+(?:UNIQUE\s+)?INDEX\s+IF\s+NOT\s+EXISTS\s+\w+\s+ON\s+(\w+)/i)
-    if (createIndexMatch) {
-      const tableName = createIndexMatch[1]
-      if (ALL_REQUIRED_TABLES.has(tableName)) {
-        sql.exec(ddl)
-      }
-      continue
-    }
-  }
 }
 
 /**
@@ -687,103 +640,6 @@ function wipeAllMetamodelData(sql: SqlLike): void {
     try { sql.exec(`DELETE FROM ${table}`) } catch { /* table may not exist yet */ }
   }
   try { sql.exec('PRAGMA foreign_keys = ON') } catch { /* best effort */ }
-}
-
-/**
- * Apply the domain schema: execute DDL to create/alter tables for entity instances.
- *
- * When `precomputed` is provided, it is used directly instead of running
- * generateOpenAPI + generateSQLite. This is useful for testing without
- * the full generation pipeline.
- *
- * When `precomputed` is omitted, builds a DomainModel from the metamodel
- * tables, generates an OpenAPI schema, converts it to SQLite DDL, executes
- * the DDL, and caches the resulting table/field maps in the generators table.
- */
-async function applyDomainSchema(
-  sql: SqlLike,
-  domainId: string,
-  precomputed?: { ddl: string[]; tableMap: Record<string, string>; fieldMap: Record<string, Record<string, string>> },
-): Promise<{ tableMap: Record<string, string>; fieldMap: Record<string, Record<string, string>> }> {
-  let ddl: string[]
-  let tableMap: Record<string, string>
-  let fieldMap: Record<string, Record<string, string>>
-
-  if (precomputed) {
-    ddl = precomputed.ddl
-    tableMap = precomputed.tableMap
-    fieldMap = precomputed.fieldMap
-  } else {
-    // Build a DomainModel from the metamodel tables in this DO
-    const { SqlDataLoader } = await import('./model/domain-model')
-    // SqlDataLoader expects SqlStorage (exec returning Iterable<Row>).
-    // Cloudflare's sql.exec() returns a cursor that is both iterable AND
-    // has .toArray(), so we cast here.
-    const loader = new SqlDataLoader(sql as any)
-    const { DomainModel } = await import('./model/domain-model')
-    const model = new DomainModel(loader, domainId)
-    model.invalidate()
-
-    const openapi = await (await import('./generate/openapi')).generateOpenAPI(model)
-    const result = (await import('./generate/sqlite')).generateSQLite(openapi)
-    ddl = result.ddl
-    tableMap = result.tableMap
-    fieldMap = result.fieldMap
-  }
-
-  // Apply DDL — CREATE TABLE IF NOT EXISTS, ALTER TABLE ADD COLUMN for new columns
-  for (const statement of ddl) {
-    if (statement.startsWith('CREATE TABLE')) {
-      // Convert to IF NOT EXISTS
-      const safe = statement.replace('CREATE TABLE', 'CREATE TABLE IF NOT EXISTS')
-      try { sql.exec(safe) } catch { /* table exists with different schema */ }
-
-      // Check for new columns and add them
-      const tableMatch = statement.match(/CREATE TABLE (\w+)/)
-      if (tableMatch) {
-        const tableName = tableMatch[1]
-        const existingCols = new Set<string>()
-        try {
-          const pragma = sql.exec(`PRAGMA table_info(${tableName})`).toArray()
-          for (const row of pragma) existingCols.add((row as any).name as string)
-        } catch { continue }
-
-        // Parse columns from DDL
-        const colSection = statement.match(/\(([\s\S]+)\)/)
-        if (colSection) {
-          for (const line of colSection[1].split(',')) {
-            const colMatch = line.trim().match(/^(\w+)\s/)
-            if (colMatch && !existingCols.has(colMatch[1])) {
-              const colDef = line.trim()
-              // Strip NOT NULL and DEFAULT for ALTER TABLE ADD COLUMN
-              const safeCol = colDef.replace(/NOT NULL/g, '').replace(/DEFAULT\s+[^,)]+/g, '').trim()
-              try { sql.exec(`ALTER TABLE ${tableName} ADD COLUMN ${safeCol}`) } catch { /* already exists */ }
-            }
-          }
-        }
-      }
-    } else if (statement.startsWith('CREATE INDEX')) {
-      try { sql.exec(statement) } catch { /* index exists */ }
-    }
-  }
-
-  // Cache the mapping in generators for external consumers
-  const cached = { tableMap, fieldMap, appliedAt: new Date().toISOString() }
-  const existing = sql.exec(
-    "SELECT id FROM generators WHERE domain_id = ? AND output_format = 'schema-map'", domainId,
-  ).toArray()
-  const mapJson = JSON.stringify(cached)
-  const now = new Date().toISOString().replace('T', ' ').replace('Z', '')
-  if (existing.length) {
-    sql.exec('UPDATE generators SET output = ?, updated_at = ? WHERE id = ?', mapJson, now, (existing[0] as any).id)
-  } else {
-    sql.exec(
-      'INSERT INTO generators (id, domain_id, output_format, output, created_at, updated_at, version) VALUES (?, ?, ?, ?, ?, ?, ?)',
-      crypto.randomUUID(), domainId, 'schema-map', mapJson, now, now, 1,
-    )
-  }
-
-  return { tableMap, fieldMap }
 }
 
 // =========================================================================
