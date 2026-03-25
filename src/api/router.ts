@@ -58,12 +58,31 @@ export const router = AutoRouter()
 // ── Health ───────────────────────────────────────────────────────────
 router.get('/health', () => json({ status: 'ok', version: '0.1.0' }))
 
-// ── Debug: table schema inspection ──────────────────────────────────
+// ── Debug: entity counts by type from Registry ──────────────────────
 router.get('/debug/table/:table', async (request, env: Env) => {
   const { table } = request.params
-  const db = getPrimaryDB(env) as any
-  const info = await db.inspectTable(table)
-  return json(info)
+  const url = new URL(request.url)
+  const domain = url.searchParams.get('domain') || undefined
+
+  // If caller asks for a specific entity type, return IDs from Registry
+  // Otherwise fall back to entity counts summary
+  const registry = getRegistryDO(env, 'global') as any
+
+  // Map table names (snake_case) to entity type names for backwards compat
+  const tableToType: Record<string, string> = {}
+  for (const [typeName, tableName] of Object.entries(NOUN_TABLE_MAP)) {
+    tableToType[tableName] = typeName
+  }
+
+  const entityType = tableToType[table]
+  if (entityType) {
+    const ids = await registry.getEntityIds(entityType, domain) as string[]
+    return json({ table, entityType, domain: domain || 'all', count: ids.length, entityIds: ids })
+  }
+
+  // For unknown tables or 'all', return counts summary
+  const counts = await registry.getEntityCounts(domain) as Array<{ nounType: string; count: number }>
+  return json({ table, domain: domain || 'all', counts })
 })
 
 // ── WebSocket (live events) ──────────────────────────────────────────
@@ -730,16 +749,96 @@ router.all('/claims', handleSeed)
 // ── Domain wipe (metamodel only — nouns, readings, constraints, roles, etc.) ──
 router.delete('/api/domains/:domainId/metamodel', async (request, env: Env) => {
   const { domainId } = request.params
-  const db = getPrimaryDB(env) as any
-  const result = await db.wipeDomainMetamodel(domainId)
-  return json(result)
+  const registry = getRegistryDO(env, 'global') as any
+
+  // 1. Get all entity IDs for this domain from Registry
+  const entities = await registry.getAllEntityIdsForDomain(domainId) as Array<{ nounType: string; entityId: string }>
+
+  // 2. Fan out to EntityDB DOs to soft-delete each (bounded concurrency)
+  const BATCH = 50
+  let deletedCount = 0
+  const failed: string[] = []
+
+  for (let i = 0; i < entities.length; i += BATCH) {
+    const chunk = entities.slice(i, i + BATCH)
+    const results = await Promise.allSettled(
+      chunk.map(async ({ entityId }) => {
+        const stub = getEntityDO(env, entityId) as any
+        return stub.delete()
+      }),
+    )
+    for (let j = 0; j < results.length; j++) {
+      if (results[j].status === 'fulfilled') deletedCount++
+      else failed.push(chunk[j].entityId)
+    }
+  }
+
+  // 3. Deindex all entities and nouns for this domain in Registry
+  const deindexedEntities = await registry.deindexEntitiesForDomain(domainId) as number
+  const deindexedNouns = await registry.deindexNounsForDomain(domainId) as number
+
+  // 4. Clear generators cache in DomainDB (generators still live in SQL)
+  try {
+    const db = getPrimaryDB(env) as any
+    await db.wipeDomainMetamodel(domainId)
+  } catch { /* best effort — DomainDB may not have data for this domain */ }
+
+  return json({
+    deleted: true,
+    domainId,
+    counts: {
+      entitiesSoftDeleted: deletedCount,
+      entitiesDeindexed: deindexedEntities,
+      nounsDeindexed: deindexedNouns,
+      failed: failed.length,
+    },
+    ...(failed.length > 0 && { failedIds: failed }),
+  })
 })
 
 // ── Full reset (delete ALL data from ALL tables) ────────────────────
 router.delete('/api/reset', async (request, env: Env) => {
-  const db = getPrimaryDB(env) as any
-  await db.wipeAllData()
-  return json({ reset: true })
+  const registry = getRegistryDO(env, 'global') as any
+
+  // 1. Get all entity IDs from Registry (across all domains)
+  const entities = await registry.getAllEntityIds() as Array<{ nounType: string; entityId: string }>
+
+  // 2. Fan out to EntityDB DOs to soft-delete each (bounded concurrency)
+  const BATCH = 50
+  let deletedCount = 0
+  const failed: string[] = []
+
+  for (let i = 0; i < entities.length; i += BATCH) {
+    const chunk = entities.slice(i, i + BATCH)
+    const results = await Promise.allSettled(
+      chunk.map(async ({ entityId }) => {
+        const stub = getEntityDO(env, entityId) as any
+        return stub.delete()
+      }),
+    )
+    for (let j = 0; j < results.length; j++) {
+      if (results[j].status === 'fulfilled') deletedCount++
+      else failed.push(chunk[j].entityId)
+    }
+  }
+
+  // 3. Wipe all Registry tables (entity_index, noun_index, domains)
+  await registry.wipeAll()
+
+  // 4. Wipe DomainDB SQL tables (generators, etc.)
+  try {
+    const db = getPrimaryDB(env) as any
+    await db.wipeAllData()
+  } catch { /* best effort — DomainDB may be empty */ }
+
+  return json({
+    reset: true,
+    counts: {
+      entitiesSoftDeleted: deletedCount,
+      failed: failed.length,
+    },
+    ...(failed.length > 0 && { failedIds: failed }),
+  })
 })
 
 // ── Parse / Verify ──────────────────────────────────────────────────
