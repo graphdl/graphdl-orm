@@ -258,9 +258,13 @@ router.post('/api/entity', async (request, env: Env) => {
     }
   }
 
-  // Look up state machine definition for this noun type
-  const domainDO = getDomainDO(env, body.domain) as any
-  const smInit = await getInitialState(domainDO, body.noun, body.domain)
+  // Look up state machine definition for this noun type via Registry+EntityDB fan-out
+  const smInit = await getInitialState(
+    registry,
+    (id) => getEntityDO(env, id) as any,
+    body.noun,
+    body.domain,
+  )
 
   // Create parent entity in its own EntityDB DO
   const parentId = crypto.randomUUID()
@@ -282,17 +286,32 @@ router.post('/api/entity', async (request, env: Env) => {
   await registry.indexEntity(body.noun, parentId)
 
   // Fire derivation rules (best-effort, don't block on failure)
+  const deriveGetStub = (eid: string) => getEntityDO(env, eid) as any
   let derivedCount = 0
   try {
     const deriveResult = await deriveOnWrite({
       entity: { id: parentId, type: body.noun, data: parentData },
       loadDerivationRules: async () => {
-        const readings = await domainDO.findInCollection('readings', {}, { limit: 1000 })
-        return (readings.docs || []).filter((r: any) => r.text?.includes(':='))
+        const readingIds: string[] = await registry.getEntityIds('Reading', body.domain)
+        const settled = await Promise.allSettled(readingIds.map(async (rid: string) => {
+          const stub = deriveGetStub(rid)
+          return stub.get()
+        }))
+        return settled
+          .filter((r: any) => r.status === 'fulfilled' && r.value && !r.value.deletedAt)
+          .map((r: any) => r.value.data)
+          .filter((d: any) => d.text?.includes(':='))
       },
       loadNouns: async () => {
-        const nouns = await domainDO.findInCollection('nouns', {}, { limit: 500 })
-        return (nouns.docs || []).map((n: any) => n.name)
+        const nounIds: string[] = await registry.getEntityIds('Noun', body.domain)
+        const settled = await Promise.allSettled(nounIds.map(async (nid: string) => {
+          const stub = deriveGetStub(nid)
+          return stub.get()
+        }))
+        return settled
+          .filter((r: any) => r.status === 'fulfilled' && r.value && !r.value.deletedAt)
+          .map((r: any) => r.value.data.name)
+          .filter(Boolean)
       },
       loadRelatedFacts: async (nounType: string) => {
         const ids: string[] = await registry.getEntityIds(nounType)
@@ -360,9 +379,15 @@ router.get('/api/entities/:noun/:id/transitions', async (request, env: Env) => {
   }
 
   const url = new URL(request.url)
-  const domainSlug = url.searchParams.get('domain') || entity.data._domain || 'global'
-  const domainDO = getDomainDO(env, domainSlug) as any
-  const options = await getValidTransitions(domainDO, entity.data._stateMachineDefinition, entity.data._statusId)
+  const domainSlug = url.searchParams.get('domain') || entity.data._domain as string || undefined
+  const smRegistry = getRegistryDO(env, 'global') as any
+  const smGetStub = (eid: string) => getEntityDO(env, eid) as any
+  const options = await getValidTransitions(
+    smRegistry, smGetStub,
+    entity.data._stateMachineDefinition as string,
+    entity.data._statusId as string,
+    domainSlug,
+  )
 
   return json({
     currentStatus: entity.data._status,
@@ -384,17 +409,24 @@ router.post('/api/entities/:noun/:id/transition', async (request, env: Env) => {
     return error(400, { errors: [{ message: 'Entity has no state machine' }] })
   }
 
-  const domainSlug = body.domain || entity.data._domain || 'global'
-  const domainDO = getDomainDO(env, domainSlug) as any
+  const domainSlug = body.domain || entity.data._domain as string || undefined
+  const smRegistry = getRegistryDO(env, 'global') as any
+  const smGetStub = (eid: string) => getEntityDO(env, eid) as any
   const result = await applyTransition(
-    domainDO,
-    entity.data._stateMachineDefinition,
-    entity.data._statusId,
+    smRegistry, smGetStub,
+    entity.data._stateMachineDefinition as string,
+    entity.data._statusId as string,
     body.event,
+    domainSlug,
   )
 
   if (!result) {
-    const options = await getValidTransitions(domainDO, entity.data._stateMachineDefinition, entity.data._statusId)
+    const options = await getValidTransitions(
+      smRegistry, smGetStub,
+      entity.data._stateMachineDefinition as string,
+      entity.data._statusId as string,
+      domainSlug,
+    )
     return error(400, { errors: [{
       message: `Invalid transition: event '${body.event}' not available from status '${entity.data._status}'`,
       validEvents: options.map(o => o.event),

@@ -1,8 +1,7 @@
 /**
  * State machine RPC — single-endpoint runtime for state machine operations.
  *
- * Replaces 400+ lines of HTTP-round-trip helpers in apis/state/.
- * All queries are in-process SQL — no service binding hops.
+ * Uses Registry+EntityDB fan-out instead of DomainDB SQL queries.
  *
  * GET    /api/state/:type/:id         → read current state + available transitions
  * POST   /api/state/:type/:id/:event  → send event (auto-creates instance on first event)
@@ -11,10 +10,57 @@
 
 import { json, error } from 'itty-router'
 import type { Env } from '../types'
+import type { RegistryReadStub, EntityReadStub, EntityRecord } from './entity-routes'
 
-function getDB(env: Env) {
-  const id = env.DOMAIN_DB.idFromName('graphdl-primary')
-  return env.DOMAIN_DB.get(id) as any
+// ── DO helpers ───────────────────────────────────────────────────────
+
+function getRegistryDO(env: Env): RegistryReadStub & { indexEntity(t: string, id: string, d?: string): Promise<void>; deindexEntity(t: string, id: string): Promise<void> } {
+  const id = env.REGISTRY_DB.idFromName('global')
+  return env.REGISTRY_DB.get(id) as any
+}
+
+function getEntityStub(env: Env, entityId: string): EntityReadStub & { put(input: any): Promise<any>; patch(data: any): Promise<any>; delete(): Promise<any> } {
+  const id = env.ENTITY_DB.idFromName(entityId)
+  return env.ENTITY_DB.get(id) as any
+}
+
+type GetStubFn = (id: string) => EntityReadStub
+
+// ── Fan-out helpers ──────────────────────────────────────────────────
+
+async function loadEntities(
+  registry: RegistryReadStub,
+  getStub: GetStubFn,
+  entityType: string,
+  domain?: string,
+): Promise<EntityRecord[]> {
+  const ids = await registry.getEntityIds(entityType, domain)
+  const settled = await Promise.allSettled(
+    ids.map(async (id) => {
+      const stub = getStub(id)
+      return stub.get()
+    }),
+  )
+  const results: EntityRecord[] = []
+  for (const r of settled) {
+    if (r.status === 'fulfilled' && r.value && !r.value.deletedAt) {
+      results.push(r.value)
+    }
+  }
+  return results
+}
+
+async function loadEntity(
+  getStub: GetStubFn,
+  id: string,
+): Promise<EntityRecord | null> {
+  try {
+    const stub = getStub(id)
+    const entity = await stub.get()
+    return entity && !entity.deletedAt ? entity : null
+  } catch {
+    return null
+  }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -24,57 +70,81 @@ function slugMatch(a: string, b: string): boolean {
   return norm(a) === norm(b)
 }
 
-async function findDefinition(db: any, machineType: string) {
-  const result = await db.findInCollection('state-machine-definitions', {}, { limit: 50 })
-  return result.docs?.find((d: any) =>
-    (d.title || d.name) && slugMatch(d.title || d.name, machineType)
+async function findDefinition(
+  registry: RegistryReadStub,
+  getStub: GetStubFn,
+  machineType: string,
+  domain?: string,
+): Promise<EntityRecord | null> {
+  const defs = await loadEntities(registry, getStub, 'State Machine Definition', domain)
+  return defs.find(d =>
+    (d.data.title || d.data.name) &&
+    slugMatch((d.data.title || d.data.name) as string, machineType),
   ) || null
 }
 
-async function findStatuses(db: any, definitionId: string) {
-  const result = await db.findInCollection('statuses', {
-    stateMachineDefinition: { equals: definitionId },
-  }, { limit: 100 })
-  return result.docs || []
+async function findStatuses(
+  registry: RegistryReadStub,
+  getStub: GetStubFn,
+  definitionId: string,
+  domain?: string,
+): Promise<EntityRecord[]> {
+  const statuses = await loadEntities(registry, getStub, 'Status', domain)
+  return statuses.filter(s =>
+    s.data.stateMachineDefinition === definitionId ||
+    s.data.stateMachineDefinitionId === definitionId,
+  )
 }
 
-async function findTransitionsFrom(db: any, statusId: string) {
-  const result = await db.findInCollection('transitions', {
-    from: { equals: statusId },
-  }, { limit: 100 })
-  return result.docs || []
+async function findTransitionsFrom(
+  registry: RegistryReadStub,
+  getStub: GetStubFn,
+  statusId: string,
+  domain?: string,
+): Promise<EntityRecord[]> {
+  const transitions = await loadEntities(registry, getStub, 'Transition', domain)
+  return transitions.filter(t => t.data.from === statusId || t.data.fromId === statusId)
 }
 
-async function findInitialStatus(db: any, definitionId: string) {
-  const statuses = await findStatuses(db, definitionId)
+async function findInitialStatus(
+  registry: RegistryReadStub,
+  getStub: GetStubFn,
+  definitionId: string,
+  domain?: string,
+): Promise<EntityRecord | null> {
+  const statuses = await findStatuses(registry, getStub, definitionId, domain)
   if (!statuses.length) return null
 
-  // Heuristic: first status with no incoming transitions, else first in list
+  // Load all transitions to check for incoming
+  const allTransitions = await loadEntities(registry, getStub, 'Transition', domain)
+
+  // First status with no incoming transitions, else first in list
   for (const s of statuses) {
-    const incoming = await db.findInCollection('transitions', {
-      to: { equals: s.id },
-    }, { limit: 1 })
-    if (!incoming.docs?.length) return s
+    const hasIncoming = allTransitions.some(t => t.data.to === s.id || t.data.toId === s.id)
+    if (!hasIncoming) return s
   }
   return statuses[0]
 }
 
-async function getInstance(db: any, machineType: string, instanceId: string) {
-  // First try: find by name (entity ID) — unambiguous, works even with duplicate definitions
-  const byName = await db.findInCollection('state-machines', {
-    name: { equals: instanceId },
-  }, { limit: 1 })
-  let doc = byName.docs?.[0]
+async function getInstance(
+  registry: RegistryReadStub,
+  getStub: GetStubFn,
+  machineType: string,
+  instanceId: string,
+  domain?: string,
+): Promise<{ id: string; currentStatusId: string; currentStatusName: string | null; definitionId: string; domain?: string } | null> {
+  // Load all state machine instances and find by name
+  const instances = await loadEntities(registry, getStub, 'State Machine', domain)
+  let doc = instances.find(i => i.data.name === instanceId)
 
-  // If multiple machines exist for this name (shouldn't happen), narrow by definition
+  // If not found by name alone, also try filtering by definition
   if (!doc) {
-    const definition = await findDefinition(db, machineType)
+    const definition = await findDefinition(registry, getStub, machineType, domain)
     if (definition) {
-      const result = await db.findInCollection('state-machines', {
-        name: { equals: instanceId },
-        stateMachineType: { equals: definition.id },
-      }, { limit: 1 })
-      doc = result.docs?.[0]
+      doc = instances.find(i =>
+        i.data.name === instanceId &&
+        (i.data.stateMachineType === definition.id || i.data.stateMachineTypeId === definition.id),
+      )
     }
   }
 
@@ -82,44 +152,61 @@ async function getInstance(db: any, machineType: string, instanceId: string) {
 
   // Resolve status name
   let currentStatusName: string | null = null
-  const statusId = typeof doc.stateMachineStatus === 'object' ? doc.stateMachineStatus?.id : doc.stateMachineStatus
+  const statusId = (typeof doc.data.stateMachineStatus === 'object'
+    ? (doc.data.stateMachineStatus as any)?.id
+    : doc.data.stateMachineStatus) as string | undefined
   if (statusId) {
-    const status = await db.getFromCollection('statuses', statusId)
-    currentStatusName = status?.name || null
+    const status = await loadEntity(getStub, statusId)
+    currentStatusName = status ? status.data.name as string : null
   }
+
+  const definitionId = (typeof doc.data.stateMachineType === 'object'
+    ? (doc.data.stateMachineType as any)?.id
+    : doc.data.stateMachineType) as string
+  const domainVal = (typeof doc.data.domain === 'object'
+    ? (doc.data.domain as any)?.id
+    : doc.data.domain) as string | undefined
 
   return {
     id: doc.id,
-    currentStatusId: statusId,
+    currentStatusId: statusId || '',
     currentStatusName,
-    definitionId: typeof doc.stateMachineType === 'object' ? doc.stateMachineType?.id : doc.stateMachineType,
-    domain: typeof doc.domain === 'object' ? doc.domain?.id : doc.domain,
+    definitionId,
+    domain: domainVal,
   }
 }
 
-async function enrichTransitions(db: any, transitions: any[]) {
-  return Promise.all(transitions.map(async (t: any) => {
-    const eventTypeId = typeof t.eventType === 'object' ? t.eventType?.id : t.eventType
-    const toStatusId = typeof t.to === 'object' ? t.to?.id : t.to
+async function enrichTransitions(
+  registry: RegistryReadStub,
+  getStub: GetStubFn,
+  transitions: EntityRecord[],
+  domain?: string,
+) {
+  return Promise.all(transitions.map(async (t) => {
+    const eventTypeId = (typeof t.data.eventType === 'object'
+      ? (t.data.eventType as any)?.id : t.data.eventType) as string | undefined
+    const toStatusId = (typeof t.data.to === 'object'
+      ? (t.data.to as any)?.id : t.data.to) as string | undefined
 
-    const [eventType, toStatus, guards] = await Promise.all([
-      eventTypeId ? db.getFromCollection('event-types', eventTypeId) : null,
-      toStatusId ? db.getFromCollection('statuses', toStatusId) : null,
-      db.findInCollection('guards', { transition: { equals: t.id } }, { limit: 10 })
-        .then((r: any) => r.docs || []),
+    // Load guards for this transition
+    const allGuards = await loadEntities(registry, getStub, 'Guard', domain)
+    const guards = allGuards.filter(g => g.data.transition === t.id || g.data.transitionId === t.id)
+
+    const [eventType, toStatus] = await Promise.all([
+      eventTypeId ? loadEntity(getStub, eventTypeId) : null,
+      toStatusId ? loadEntity(getStub, toStatusId) : null,
     ])
 
-    const guardNames = guards.map((g: any) => g.name).filter(Boolean)
+    const guardNames = guards.map(g => g.data.name).filter(Boolean)
 
     return {
       id: t.id,
-      event: eventType?.name || null,
-      target: toStatus?.name || null,
+      event: eventType?.data.name || null,
+      target: toStatus?.data.name || null,
       ...(guardNames.length ? { guards: guardNames } : {}),
-      // Keep raw refs for sendEvent matching
       _eventTypeId: eventTypeId,
       _toStatusId: toStatusId,
-      _verbId: typeof t.verb === 'object' ? t.verb?.id : t.verb,
+      _verbId: (typeof t.data.verb === 'object' ? (t.data.verb as any)?.id : t.data.verb) as string | undefined,
     }
   }))
 }
@@ -138,38 +225,51 @@ export async function handleGetState(request: Request, env: Env) {
   // If an event is provided on GET, delegate to sendEvent (GET-based event firing)
   if (event) return handleSendEvent(request, env)
 
-  const db = getDB(env)
-  let instance = await getInstance(db, machineType, instanceId)
+  const registry = getRegistryDO(env)
+  const getStub: GetStubFn = (id) => getEntityStub(env, id)
+  const domain = url.searchParams.get('domain') || undefined
+
+  let instance = await getInstance(registry, getStub, machineType, instanceId, domain)
 
   // Auto-create instance at initial state if entity exists but no state machine yet
   if (!instance) {
-    const definition = await findDefinition(db, machineType)
+    const definition = await findDefinition(registry, getStub, machineType, domain)
     if (!definition) return json({ error: `Machine type '${machineType}' not found` }, { status: 404 })
 
-    const initialStatus = await findInitialStatus(db, definition.id)
+    const initialStatus = await findInitialStatus(registry, getStub, definition.id, domain)
     if (!initialStatus) return json({ error: `No statuses found for '${machineType}'` }, { status: 404 })
 
-    const domainId = typeof definition.domain === 'object' ? definition.domain?.id : definition.domain
-    await db.createInCollection('state-machines', {
-      name: instanceId,
-      stateMachineType: definition.id,
-      stateMachineStatus: initialStatus.id,
-      ...(domainId ? { domain: domainId } : {}),
+    const domainId = (typeof definition.data.domain === 'object'
+      ? (definition.data.domain as any)?.id : definition.data.domain) as string | undefined
+
+    // Create state machine instance as EntityDB DO + register in Registry
+    const newId = crypto.randomUUID()
+    const entityStub = getEntityStub(env, newId)
+    await entityStub.put({
+      id: newId,
+      type: 'State Machine',
+      data: {
+        name: instanceId,
+        stateMachineType: definition.id,
+        stateMachineStatus: initialStatus.id,
+        ...(domainId ? { domain: domainId } : {}),
+      },
     })
+    await registry.indexEntity('State Machine', newId, domainId)
 
     instance = {
-      id: '',
+      id: newId,
       currentStatusId: initialStatus.id,
-      currentStatusName: initialStatus.name,
+      currentStatusName: initialStatus.data.name as string,
       definitionId: definition.id,
       domain: domainId,
     }
   }
 
   const rawTransitions = instance.currentStatusId
-    ? await findTransitionsFrom(db, instance.currentStatusId)
+    ? await findTransitionsFrom(registry, getStub, instance.currentStatusId, domain)
     : []
-  const availableTransitions = await enrichTransitions(db, rawTransitions)
+  const availableTransitions = await enrichTransitions(registry, getStub, rawTransitions, domain)
 
   return json({
     machineType,
@@ -197,38 +297,50 @@ export async function handleSendEvent(request: Request, env: Env) {
     ? Object.fromEntries(url.searchParams)
     : await request.json().catch(() => ({})) as Record<string, unknown>
 
-  const db = getDB(env)
+  const registry = getRegistryDO(env)
+  const getStub: GetStubFn = (id) => getEntityStub(env, id)
+  const domain = (body.domain as string) || url.searchParams.get('domain') || undefined
 
   // Find or create instance
-  let instance = await getInstance(db, machineType, instanceId)
+  let instance = await getInstance(registry, getStub, machineType, instanceId, domain)
 
   if (!instance) {
-    const definition = await findDefinition(db, machineType)
+    const definition = await findDefinition(registry, getStub, machineType, domain)
     if (!definition) return json({ error: `Machine type '${machineType}' not found` }, { status: 404 })
 
-    const initialStatus = await findInitialStatus(db, definition.id)
+    const initialStatus = await findInitialStatus(registry, getStub, definition.id, domain)
     if (!initialStatus) return json({ error: `No statuses found for '${machineType}'` }, { status: 404 })
 
-    const domainId = typeof definition.domain === 'object' ? definition.domain?.id : definition.domain
-    await db.createInCollection('state-machines', {
-      name: instanceId,
-      stateMachineType: definition.id,
-      stateMachineStatus: initialStatus.id,
-      ...(domainId ? { domain: domainId } : {}),
+    const domainId = (typeof definition.data.domain === 'object'
+      ? (definition.data.domain as any)?.id : definition.data.domain) as string | undefined
+
+    // Create state machine instance as EntityDB DO + register in Registry
+    const newId = crypto.randomUUID()
+    const entityStub = getEntityStub(env, newId)
+    await entityStub.put({
+      id: newId,
+      type: 'State Machine',
+      data: {
+        name: instanceId,
+        stateMachineType: definition.id,
+        stateMachineStatus: initialStatus.id,
+        ...(domainId ? { domain: domainId } : {}),
+      },
     })
+    await registry.indexEntity('State Machine', newId, domainId)
 
     instance = {
-      id: '',
+      id: newId,
       currentStatusId: initialStatus.id,
-      currentStatusName: initialStatus.name,
+      currentStatusName: initialStatus.data.name as string,
       definitionId: definition.id,
       domain: domainId,
     }
   }
 
   // Resolve transition
-  const rawTransitions = await findTransitionsFrom(db, instance.currentStatusId)
-  const enriched = await enrichTransitions(db, rawTransitions)
+  const rawTransitions = await findTransitionsFrom(registry, getStub, instance.currentStatusId, domain)
+  const enriched = await enrichTransitions(registry, getStub, rawTransitions, domain)
   const matching = enriched.find((t: any) => t.event === event)
 
   if (!matching) {
@@ -244,22 +356,24 @@ export async function handleSendEvent(request: Request, env: Env) {
   // Fire callback (verb → function → callbackUrl)
   let callbackResult: Record<string, unknown> | null = null
   if (matching._verbId) {
-    const funcResult = await db.findInCollection('functions', {
-      verb: { equals: matching._verbId },
-    }, { limit: 1 })
-    const func = funcResult.docs?.[0]
+    const allFunctions = await loadEntities(registry, getStub, 'Function', domain)
+    const func = allFunctions.find(f =>
+      f.data.verb === matching._verbId || f.data.verbId === matching._verbId,
+    )
 
-    if (func?.callbackUrl) {
+    if (func?.data.callbackUrl) {
       try {
         const callbackHeaders: Record<string, string> = { 'Content-Type': 'application/json' }
-        if (func.headers) {
-          const parsed = typeof func.headers === 'string' ? JSON.parse(func.headers) : func.headers
+        if (func.data.headers) {
+          const parsed = typeof func.data.headers === 'string'
+            ? JSON.parse(func.data.headers)
+            : func.data.headers
           for (const [key, val] of Object.entries(parsed)) {
             callbackHeaders[key] = String(val).replace(/\$\{(\w+)\}/g, (_, name) => (env as any)[name] || '')
           }
         }
-        const res = await fetch(func.callbackUrl, {
-          method: func.httpMethod || 'POST',
+        const res = await fetch(func.data.callbackUrl as string, {
+          method: (func.data.httpMethod as string) || 'POST',
           headers: callbackHeaders,
           body: JSON.stringify({
             instanceId, machineType, event, previousState,
@@ -267,27 +381,26 @@ export async function handleSendEvent(request: Request, env: Env) {
             ...body,
           }),
         })
-        callbackResult = { fired: true, url: func.callbackUrl, status: res.status, ok: res.ok }
+        callbackResult = { fired: true, url: func.data.callbackUrl, status: res.status, ok: res.ok }
       } catch (e) {
-        callbackResult = { fired: true, url: func.callbackUrl, error: String(e) }
+        callbackResult = { fired: true, url: func.data.callbackUrl, error: String(e) }
       }
     }
   }
 
-  // Update instance state
-  if (matching._toStatusId) {
-    // Re-fetch to get the doc ID (instance may have been just created)
-    const current = await getInstance(db, machineType, instanceId)
-    if (current?.id) {
-      await db.updateInCollection('state-machines', current.id, {
-        stateMachineStatus: matching._toStatusId,
-      })
-    }
+  // Update instance state via EntityDB.patch()
+  if (matching._toStatusId && instance.id) {
+    const instanceStub = getEntityStub(env, instance.id)
+    await instanceStub.patch({ stateMachineStatus: matching._toStatusId })
   }
 
   // Available events from new state
   const newTransitions = matching._toStatusId
-    ? await enrichTransitions(db, await findTransitionsFrom(db, matching._toStatusId))
+    ? await enrichTransitions(
+        registry, getStub,
+        await findTransitionsFrom(registry, getStub, matching._toStatusId, domain),
+        domain,
+      )
     : []
 
   return json({
@@ -310,10 +423,17 @@ export async function handleDeleteState(request: Request, env: Env) {
 
   if (!machineType || !instanceId) return error(400, { error: 'machineType and instanceId required' })
 
-  const db = getDB(env)
-  const instance = await getInstance(db, machineType, instanceId)
+  const registry = getRegistryDO(env)
+  const getStub: GetStubFn = (id) => getEntityStub(env, id)
+  const domain = url.searchParams.get('domain') || undefined
+
+  const instance = await getInstance(registry, getStub, machineType, instanceId, domain)
   if (!instance) return json({ error: 'Instance not found' }, { status: 404 })
 
-  await db.deleteFromCollection('state-machines', instance.id)
+  // Soft-delete via EntityDB + deindex from Registry
+  const entityStub = getEntityStub(env, instance.id)
+  await entityStub.delete()
+  await registry.deindexEntity('State Machine', instance.id)
+
   return json({ deleted: true, machineType, instanceId })
 }
