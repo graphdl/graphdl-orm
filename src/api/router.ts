@@ -469,6 +469,19 @@ router.post('/api/entities/:noun/:id/transition', async (request, env: Env) => {
       )
     : []
 
+  // Persist cascade failures as Failure entities (best-effort)
+  if (cascadeResult.failures.length > 0) {
+    const { createFailure } = await import('../worker/outcomes')
+    for (const failure of cascadeResult.failures) {
+      createFailure(env, {
+        domain: domainSlug,
+        failureType: 'transition',
+        reason: failure,
+        functionId: entity.data.nounId as string || undefined,
+      }).catch(() => { /* best-effort */ })
+    }
+  }
+
   return json({
     id,
     noun,
