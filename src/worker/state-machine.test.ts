@@ -83,6 +83,43 @@ describe('getInitialState', () => {
     expect(result).toBeNull()
   })
 
+  it('selects status with isInitial flag over heuristic', async () => {
+    // s1 has no incoming transitions (heuristic would pick it)
+    // s2 has isInitial: true AND has an incoming transition (heuristic would skip it)
+    // isInitial flag should win
+    const { registry, getStub } = mockFanOut({
+      'Noun': [{ id: 'n1', name: 'Ticket' }],
+      'State Machine Definition': [{ id: 'smd1', noun: 'n1', title: 'Ticket Lifecycle' }],
+      'Status': [
+        { id: 's1', name: 'Open', stateMachineDefinition: 'smd1' },
+        { id: 's2', name: 'Draft', stateMachineDefinition: 'smd1', isInitial: true },
+        { id: 's3', name: 'Closed', stateMachineDefinition: 'smd1' },
+      ],
+      'Transition': [
+        { id: 't1', from: 's2', to: 's1', eventType: 'e1', stateMachineDefinition: 'smd1' },
+        { id: 't2', from: 's1', to: 's3', eventType: 'e2', stateMachineDefinition: 'smd1' },
+        { id: 't3', from: 's3', to: 's2', eventType: 'e3', stateMachineDefinition: 'smd1' },
+      ],
+      'Event Type': [
+        { id: 'e1', name: 'open' },
+        { id: 'e2', name: 'close' },
+        { id: 'e3', name: 'reopen' },
+      ],
+    })
+    const result = await getInitialState(registry, getStub, 'Ticket', 'domain1')
+    expect(result).not.toBeNull()
+    expect(result!.initialStatus).toBe('Draft')
+    expect(result!.initialStatusId).toBe('s2')
+  })
+
+  it('falls back to heuristic when no status has isInitial flag', async () => {
+    // No status has isInitial — should use existing heuristic (no incoming transitions)
+    const { registry, getStub } = mockFanOut(SUPPORT_DATA)
+    const result = await getInitialState(registry, getStub, 'SupportRequest', 'domain1')
+    expect(result).not.toBeNull()
+    expect(result!.initialStatus).toBe('Received')
+  })
+
   it('falls back to first status for cyclic machines', async () => {
     const { registry, getStub } = mockFanOut({
       'Noun': [{ id: 'n1', name: 'Cyclic' }],
