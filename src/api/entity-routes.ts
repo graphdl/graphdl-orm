@@ -6,6 +6,9 @@
  * Uses Promise.allSettled for fan-out resilience (same pattern as materializer).
  */
 
+import { checkDeonticConstraints } from '../worker/deontic-check'
+import type { ViolationInput } from '../worker/outcomes'
+
 // ---------------------------------------------------------------------------
 // Stub interfaces (same shapes as EntityDB / RegistryDB DO RPCs)
 // ---------------------------------------------------------------------------
@@ -205,8 +208,36 @@ export async function handleGetEntity(
 // ---------------------------------------------------------------------------
 
 /**
+ * Options for deontic constraint checking on entity creation.
+ * When provided, constraints with modality='Deontic' are evaluated before
+ * the write is committed.
+ */
+export interface DeonticOpts {
+  /** Registry stub that supports getEntityIds (for loading constraints). */
+  registryRead: RegistryReadStub
+  /** Stub factory for reading Constraint, ConstraintSpan, Role, and Noun entities. */
+  getReadStub: (id: string) => EntityReadStub
+}
+
+export interface CreateEntityResult {
+  id: string
+  version: number
+  /** Present when deontic constraints produced warnings (write was allowed). */
+  warnings?: ViolationInput[]
+  /** Present when deontic constraints blocked the write (allowed=false). */
+  rejected?: true
+  violations?: ViolationInput[]
+}
+
+/**
  * Create an entity in its EntityDB DO and index it in the Registry.
  * Generates a UUID for the new entity.
+ *
+ * When `deonticOpts` is provided, deontic constraints are evaluated first:
+ * - If violations with severity='error' are found, the write is rejected
+ *   (no entity created) and `rejected: true` is returned with violations.
+ * - If only severity='warning' violations exist, the entity is created
+ *   and warnings are returned alongside the result.
  */
 export async function handleCreateEntity(
   type: string,
@@ -214,7 +245,35 @@ export async function handleCreateEntity(
   data: Record<string, unknown>,
   getStub: (id: string) => EntityWriteStub,
   registry: RegistryWriteStub,
-): Promise<{ id: string; version: number }> {
+  deonticOpts?: DeonticOpts,
+): Promise<CreateEntityResult> {
+  // Deontic constraint check (when configured)
+  if (deonticOpts) {
+    const check = await checkDeonticConstraints(
+      type, data, domain,
+      deonticOpts.registryRead,
+      deonticOpts.getReadStub,
+    )
+
+    if (!check.allowed) {
+      return {
+        id: '',
+        version: 0,
+        rejected: true,
+        violations: check.violations,
+      }
+    }
+
+    // Warnings present but allowed — create entity and attach warnings
+    if (check.violations.length > 0) {
+      const id = crypto.randomUUID()
+      const stub = getStub(id)
+      const result = await stub.put({ id, type, data })
+      await registry.indexEntity(type, id, domain)
+      return { id, version: result.version, warnings: check.violations }
+    }
+  }
+
   const id = crypto.randomUUID()
   const stub = getStub(id)
   const result = await stub.put({ id, type, data })

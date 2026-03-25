@@ -12,6 +12,8 @@ import { getInitialState, getValidTransitions, applyTransition } from '../worker
 import { handleConceptualQuery } from './conceptual-query'
 import { deriveOnWrite } from '../worker/derive-on-write'
 import { induceConstraints } from '../csdp/induce'
+import { checkDeonticConstraints } from '../worker/deontic-check'
+import { persistViolations } from '../worker/outcomes'
 import { handleListEntities, handleGetEntity, handleCreateEntity, handleDeleteEntity } from './entity-routes'
 
 // ── Reverse mapping: collection slug → entity type name ──────────────
@@ -247,6 +249,25 @@ router.post('/api/entity', async (request, env: Env) => {
     body.domain,
   )
 
+  // Deontic constraint check — reject forbidden, warn on obligatory
+  const deonticCheck = await checkDeonticConstraints(
+    body.noun,
+    parentFields,
+    body.domain,
+    registry,
+    (id) => getEntityDO(env, id) as any,
+  )
+
+  if (!deonticCheck.allowed) {
+    return error(422, {
+      errors: deonticCheck.violations.map((v) => ({
+        message: v.text,
+        constraintId: v.constraintId,
+        severity: v.severity,
+      })),
+    })
+  }
+
   // Create parent entity in its own EntityDB DO
   const parentId = crypto.randomUUID()
   const parentData = {
@@ -265,6 +286,11 @@ router.post('/api/entity', async (request, env: Env) => {
 
   // Index the entity in the Registry
   await registry.indexEntity(body.noun, parentId)
+
+  // Persist deontic warnings as Violation entities (best-effort, don't block response)
+  if (deonticCheck.violations.length > 0) {
+    persistViolations(env, deonticCheck.violations).catch(() => { /* best-effort */ })
+  }
 
   // Fire derivation rules (best-effort, don't block on failure)
   const deriveGetStub = (eid: string) => getEntityDO(env, eid) as any
@@ -321,6 +347,13 @@ router.post('/api/entity', async (request, env: Env) => {
     version: putResult.version,
     ...(smInit && { status: smInit.initialStatus }),
     ...(derivedCount > 0 && { derived: derivedCount }),
+    ...(deonticCheck.violations.length > 0 && {
+      deonticWarnings: deonticCheck.violations.map((v) => ({
+        constraintId: v.constraintId,
+        text: v.text,
+        severity: v.severity,
+      })),
+    }),
   }
 
   // Create children as separate Entity DOs, each with FK back to parent
