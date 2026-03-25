@@ -7,6 +7,7 @@ vi.mock('../worker/outcomes', () => ({
 
 import { handleSendEvent } from './state'
 import { createFailure } from '../worker/outcomes'
+import { executeCascade } from '../worker/cascade-transition'
 import type { Env } from '../types'
 
 /**
@@ -411,5 +412,147 @@ describe('handleSendEvent failure persistence', () => {
     expect(res.status).toBe(404)
     const body = await res.json() as any
     expect(body.error).toContain("'Ghost'")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Cascade integration tests (transition endpoint wiring)
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a mock fan-out pair (registry + getStub) matching the pattern used
+ * by the transition endpoint in router.ts.  The entity map is keyed by
+ * entity id → entity record.  The registry index maps entity type → list
+ * of entity ids.  The getStub also supports patch() for status updates.
+ */
+function buildCascadeMocks(
+  entityMap: Record<string, { id: string; type: string; data: Record<string, unknown> }>,
+  registryIndex: Record<string, string[]>,
+) {
+  const byId = new Map<string, { id: string; type: string; data: Record<string, unknown> }>()
+  for (const [id, entity] of Object.entries(entityMap)) {
+    byId.set(id, { ...entity })
+  }
+
+  const registry = {
+    getEntityIds: vi.fn(async (type: string, _domain?: string) => registryIndex[type] || []),
+  }
+
+  const patchCalls: Array<{ id: string; data: any }> = []
+  const getStub = (entityId: string) => ({
+    get: vi.fn(async () => byId.get(entityId) || null),
+    patch: vi.fn(async (data: any) => {
+      patchCalls.push({ id: entityId, data })
+      const existing = byId.get(entityId)
+      if (existing) {
+        byId.set(entityId, { ...existing, data: { ...existing.data, ...data } })
+      }
+      return { version: 2 }
+    }),
+  })
+
+  return { registry, getStub, patchCalls, byId }
+}
+
+describe('cascade integration — transition endpoint wiring', () => {
+  it('transition returns cascade result with statesVisited', async () => {
+    const { registry, getStub } = buildCascadeMocks(
+      {
+        'ent-1': { id: 'ent-1', type: 'Order', data: { _status: 'Open', _statusId: 'status-open', _stateMachineDefinition: 'smd-1' } },
+        'status-open': { id: 'status-open', type: 'Status', data: { name: 'Open', stateMachineDefinition: 'smd-1' } },
+        'status-closed': { id: 'status-closed', type: 'Status', data: { name: 'Closed', stateMachineDefinition: 'smd-1' } },
+        'trans-1': { id: 'trans-1', type: 'Transition', data: { from: 'status-open', to: 'status-closed', eventType: 'et-close', stateMachineDefinition: 'smd-1' } },
+        'et-close': { id: 'et-close', type: 'Event Type', data: { name: 'close' } },
+      },
+      {
+        'Transition': ['trans-1'],
+        'Event Type': ['et-close'],
+        'Status': ['status-open', 'status-closed'],
+        'Function': [],
+      },
+    )
+
+    const result = await executeCascade('ent-1', 'close', {
+      registry,
+      getStub,
+      domain: 'test',
+    })
+
+    // The shape that the router returns as cascade info
+    expect(result.finalState).toBe('Closed')
+    expect(result.statesVisited).toEqual(['Closed'])
+    expect(result.callbackResults).toEqual([])
+    expect(result.failures).toEqual([])
+  })
+
+  it('transition cascades through callback and returns full chain', async () => {
+    const mockFetch = vi.fn().mockResolvedValueOnce({ status: 200 })
+
+    const { registry, getStub } = buildCascadeMocks(
+      {
+        'ent-1': { id: 'ent-1', type: 'Order', data: { _status: 'Submitted', _statusId: 's-submitted', _stateMachineDefinition: 'smd-1' } },
+        's-submitted': { id: 's-submitted', type: 'Status', data: { name: 'Submitted', stateMachineDefinition: 'smd-1' } },
+        's-processing': { id: 's-processing', type: 'Status', data: { name: 'Processing', stateMachineDefinition: 'smd-1' } },
+        's-done': { id: 's-done', type: 'Status', data: { name: 'Done', stateMachineDefinition: 'smd-1' } },
+        't1': { id: 't1', type: 'Transition', data: { from: 's-submitted', to: 's-processing', eventType: 'et-submit', verb: 'v1', stateMachineDefinition: 'smd-1' } },
+        't2': { id: 't2', type: 'Transition', data: { from: 's-processing', to: 's-done', eventType: 'et-ok', stateMachineDefinition: 'smd-1' } },
+        'et-submit': { id: 'et-submit', type: 'Event Type', data: { name: 'submit' } },
+        'et-ok': { id: 'et-ok', type: 'Event Type', data: { name: 'on_ok', pattern: '2XX' } },
+        'func-1': { id: 'func-1', type: 'Function', data: { verb: 'v1', callbackUrl: 'https://api.test.com/process', httpMethod: 'POST' } },
+      },
+      {
+        'Transition': ['t1', 't2'],
+        'Event Type': ['et-submit', 'et-ok'],
+        'Status': ['s-submitted', 's-processing', 's-done'],
+        'Function': ['func-1'],
+      },
+    )
+
+    const result = await executeCascade('ent-1', 'submit', {
+      registry,
+      getStub,
+      fetchCallback: mockFetch,
+      domain: 'test',
+    })
+
+    expect(result.finalState).toBe('Done')
+    expect(result.statesVisited).toEqual(['Processing', 'Done'])
+    expect(result.callbackResults).toEqual([
+      { status: 200, url: 'https://api.test.com/process' },
+    ])
+    expect(result.failures).toEqual([])
+  })
+
+  it('cascade result includes failures on callback error', async () => {
+    const mockFetch = vi.fn().mockRejectedValueOnce(new Error('timeout'))
+
+    const { registry, getStub } = buildCascadeMocks(
+      {
+        'ent-1': { id: 'ent-1', type: 'Order', data: { _status: 'Open', _statusId: 's-open', _stateMachineDefinition: 'smd-1' } },
+        's-open': { id: 's-open', type: 'Status', data: { name: 'Open', stateMachineDefinition: 'smd-1' } },
+        's-calling': { id: 's-calling', type: 'Status', data: { name: 'Calling', stateMachineDefinition: 'smd-1' } },
+        't1': { id: 't1', type: 'Transition', data: { from: 's-open', to: 's-calling', eventType: 'et-call', verb: 'v1', stateMachineDefinition: 'smd-1' } },
+        'et-call': { id: 'et-call', type: 'Event Type', data: { name: 'call' } },
+        'func-1': { id: 'func-1', type: 'Function', data: { verb: 'v1', callbackUrl: 'https://api.test.com/webhook', httpMethod: 'POST' } },
+      },
+      {
+        'Transition': ['t1'],
+        'Event Type': ['et-call'],
+        'Status': ['s-open', 's-calling'],
+        'Function': ['func-1'],
+      },
+    )
+
+    const result = await executeCascade('ent-1', 'call', {
+      registry,
+      getStub,
+      fetchCallback: mockFetch,
+      domain: 'test',
+    })
+
+    expect(result.finalState).toBe('Calling')
+    expect(result.statesVisited).toEqual(['Calling'])
+    expect(result.failures.length).toBe(1)
+    expect(result.failures[0]).toContain('timeout')
   })
 })
