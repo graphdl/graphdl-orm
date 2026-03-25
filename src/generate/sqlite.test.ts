@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest'
-import { generateSQLite } from './sqlite'
+import { generateSQLite, generateSQLiteFromRmap } from './sqlite'
+import type { TableDef } from '../rmap/procedure'
 
 // ---------------------------------------------------------------------------
 // Helpers — build minimal OpenAPI-style schema objects
@@ -675,5 +676,138 @@ describe('generateSQLite', () => {
     expect(junctionTable).toBeDefined()
     expect(junctionTable).toContain('order_id TEXT NOT NULL REFERENCES orders(id)')
     expect(junctionTable).toContain('tag_id TEXT NOT NULL REFERENCES tags(id)')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// generateSQLiteFromRmap tests
+// ---------------------------------------------------------------------------
+
+describe('generateSQLiteFromRmap', () => {
+  it('generates CREATE TABLE from RMAP TableDef', () => {
+    const tables: TableDef[] = [{
+      name: 'person',
+      primaryKey: ['id'],
+      columns: [
+        { name: 'id', type: 'TEXT', nullable: false },
+        { name: 'name', type: 'TEXT', nullable: false },
+        { name: 'country_id', type: 'TEXT', nullable: true, references: 'country' },
+      ],
+      checks: [],
+    }]
+    const ddl = generateSQLiteFromRmap(tables)
+    expect(ddl).toContain('CREATE TABLE person')
+    expect(ddl).toContain('name TEXT NOT NULL')
+    expect(ddl).toContain('country_id TEXT REFERENCES country(id)')
+    // country_id is nullable, so no NOT NULL
+    expect(ddl).not.toContain('country_id TEXT NOT NULL')
+  })
+
+  it('generates PRIMARY KEY constraint', () => {
+    const tables: TableDef[] = [{
+      name: 'enrollment',
+      primaryKey: ['student_id', 'course_id'],
+      columns: [
+        { name: 'student_id', type: 'TEXT', nullable: false, references: 'student' },
+        { name: 'course_id', type: 'TEXT', nullable: false, references: 'course' },
+      ],
+    }]
+    const ddl = generateSQLiteFromRmap(tables)
+    expect(ddl).toContain('PRIMARY KEY (student_id, course_id)')
+  })
+
+  it('generates CHECK constraints', () => {
+    const tables: TableDef[] = [{
+      name: 'person',
+      primaryKey: ['id'],
+      columns: [
+        { name: 'id', type: 'TEXT', nullable: false },
+        { name: 'sex', type: 'TEXT', nullable: false },
+      ],
+      checks: ["sex IN ('male', 'female')"],
+    }]
+    const ddl = generateSQLiteFromRmap(tables)
+    expect(ddl).toContain("CHECK (sex IN ('male', 'female'))")
+  })
+
+  it('generates multiple tables separated by blank lines', () => {
+    const tables: TableDef[] = [
+      {
+        name: 'person',
+        primaryKey: ['id'],
+        columns: [
+          { name: 'id', type: 'TEXT', nullable: false },
+          { name: 'name', type: 'TEXT', nullable: false },
+        ],
+      },
+      {
+        name: 'country',
+        primaryKey: ['id'],
+        columns: [
+          { name: 'id', type: 'TEXT', nullable: false },
+        ],
+      },
+    ]
+    const ddl = generateSQLiteFromRmap(tables)
+    expect(ddl).toContain('CREATE TABLE person')
+    expect(ddl).toContain('CREATE TABLE country')
+    // Two separate statements
+    const statements = ddl.split(';').filter(s => s.trim().length > 0)
+    expect(statements.length).toBe(2)
+  })
+
+  it('returns empty string for empty tables array', () => {
+    const ddl = generateSQLiteFromRmap([])
+    expect(ddl).toBe('')
+  })
+
+  it('handles INTEGER and REAL column types', () => {
+    const tables: TableDef[] = [{
+      name: 'product',
+      primaryKey: ['id'],
+      columns: [
+        { name: 'id', type: 'TEXT', nullable: false },
+        { name: 'quantity', type: 'INTEGER', nullable: false },
+        { name: 'price', type: 'REAL', nullable: true },
+      ],
+    }]
+    const ddl = generateSQLiteFromRmap(tables)
+    expect(ddl).toContain('quantity INTEGER NOT NULL')
+    expect(ddl).toContain('price REAL')
+    // price is nullable, no NOT NULL
+    expect(ddl).not.toContain('price REAL NOT NULL')
+  })
+
+  it('handles table with multiple FK references', () => {
+    const tables: TableDef[] = [{
+      name: 'person_teaches_course',
+      primaryKey: ['person_id', 'course_id'],
+      columns: [
+        { name: 'person_id', type: 'TEXT', nullable: false, references: 'person' },
+        { name: 'course_id', type: 'TEXT', nullable: false, references: 'course' },
+      ],
+    }]
+    const ddl = generateSQLiteFromRmap(tables)
+    expect(ddl).toContain('person_id TEXT NOT NULL REFERENCES person(id)')
+    expect(ddl).toContain('course_id TEXT NOT NULL REFERENCES course(id)')
+  })
+
+  it('handles table with multiple CHECK constraints', () => {
+    const tables: TableDef[] = [{
+      name: 'person',
+      primaryKey: ['id'],
+      columns: [
+        { name: 'id', type: 'TEXT', nullable: false },
+        { name: 'sex', type: 'TEXT', nullable: false },
+        { name: 'status', type: 'TEXT', nullable: true },
+      ],
+      checks: [
+        "sex IN ('male', 'female')",
+        "status IN ('active', 'inactive')",
+      ],
+    }]
+    const ddl = generateSQLiteFromRmap(tables)
+    expect(ddl).toContain("CHECK (sex IN ('male', 'female'))")
+    expect(ddl).toContain("CHECK (status IN ('active', 'inactive'))")
   })
 })

@@ -42,9 +42,12 @@ export function initRegistrySchema(sql: SqlLike): void {
   sql.exec(`CREATE TABLE IF NOT EXISTS entity_index (
   noun_type TEXT NOT NULL,
   entity_id TEXT NOT NULL,
+  domain_slug TEXT,
   deleted INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (noun_type, entity_id)
 )`)
+  // Migration: add domain_slug if table was created before this column existed
+  try { sql.exec('ALTER TABLE entity_index ADD COLUMN domain_slug TEXT') } catch { /* already exists */ }
 }
 
 // =========================================================================
@@ -98,11 +101,12 @@ export function indexNoun(sql: SqlLike, nounName: string, domainSlug: string): v
  * INSERT OR REPLACE ensures idempotency and also "re-indexes" a
  * previously soft-deleted entity.
  */
-export function indexEntity(sql: SqlLike, nounType: string, entityId: string): void {
+export function indexEntity(sql: SqlLike, nounType: string, entityId: string, domainSlug?: string): void {
   sql.exec(
-    `INSERT OR REPLACE INTO entity_index (noun_type, entity_id, deleted) VALUES (?, ?, ?)`,
+    `INSERT OR REPLACE INTO entity_index (noun_type, entity_id, domain_slug, deleted) VALUES (?, ?, ?, ?)`,
     nounType,
     entityId,
+    domainSlug || null,
     0,
   )
 }
@@ -121,11 +125,10 @@ export function deindexEntity(sql: SqlLike, nounType: string, entityId: string):
 /**
  * Returns all non-deleted entity IDs for a given noun type.
  */
-export function getEntityIds(sql: SqlLike, nounType: string): string[] {
-  const rows = sql.exec(
-    `SELECT entity_id FROM entity_index WHERE noun_type=? AND deleted=0`,
-    nounType,
-  ).toArray()
+export function getEntityIds(sql: SqlLike, nounType: string, domainSlug?: string): string[] {
+  const rows = domainSlug
+    ? sql.exec(`SELECT entity_id FROM entity_index WHERE noun_type=? AND domain_slug=? AND deleted=0`, nounType, domainSlug).toArray()
+    : sql.exec(`SELECT entity_id FROM entity_index WHERE noun_type=? AND deleted=0`, nounType).toArray()
 
   return rows.map((row: any) => row.entity_id)
 }
@@ -202,9 +205,9 @@ export class RegistryDB extends DurableObject {
     return listDomains(this.ctx.storage.sql)
   }
 
-  async indexEntity(nounType: string, entityId: string): Promise<void> {
+  async indexEntity(nounType: string, entityId: string, domainSlug?: string): Promise<void> {
     this.ensureInit()
-    indexEntity(this.ctx.storage.sql, nounType, entityId)
+    indexEntity(this.ctx.storage.sql, nounType, entityId, domainSlug)
   }
 
   async deindexEntity(nounType: string, entityId: string): Promise<void> {
@@ -212,8 +215,8 @@ export class RegistryDB extends DurableObject {
     deindexEntity(this.ctx.storage.sql, nounType, entityId)
   }
 
-  async getEntityIds(nounType: string): Promise<string[]> {
+  async getEntityIds(nounType: string, domainSlug?: string): Promise<string[]> {
     this.ensureInit()
-    return getEntityIds(this.ctx.storage.sql, nounType)
+    return getEntityIds(this.ctx.storage.sql, nounType, domainSlug)
   }
 }

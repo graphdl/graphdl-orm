@@ -4,7 +4,7 @@ export interface RegistryStub {
 
 /**
  * Walk the registry chain to resolve a noun.
- * Registries are ordered by priority: [app, org, global].
+ * Registries are ordered by priority: [org, public].
  * First match wins — short-circuits.
  */
 export async function resolveNounInChain(

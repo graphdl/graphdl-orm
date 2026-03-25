@@ -7,6 +7,7 @@
  */
 
 import type { NounDef, FactTypeDef, ConstraintDef, SpanDef } from '../model/types'
+import type { TableDef } from '../rmap/procedure'
 import { nameToKey, nounListToRegex, type NounRef } from './rmap'
 import {
   ensureTableExists,
@@ -278,6 +279,111 @@ export async function generateOpenAPI(model: {
     openapi: '3.0.0',
     info: {
       title: `Domain ${model.domainId} Schema`,
+      version: '1.0.0',
+    },
+    components: {
+      schemas,
+    },
+  }
+}
+
+// ---------------------------------------------------------------------------
+// generateOpenAPIFromRmap — RMAP-driven OpenAPI generation
+// ---------------------------------------------------------------------------
+
+/** Map RMAP column types to JSON Schema / OpenAPI types */
+const SQLITE_TO_JSON_SCHEMA: Record<string, { type: string; format?: string }> = {
+  TEXT: { type: 'string' },
+  INTEGER: { type: 'integer' },
+  REAL: { type: 'number' },
+  BLOB: { type: 'string', format: 'binary' },
+}
+
+function toJsonSchemaType(sqlType: string): { type: string; format?: string } {
+  return SQLITE_TO_JSON_SCHEMA[sqlType.toUpperCase()] ?? { type: 'string' }
+}
+
+/** Convert snake_case table name to PascalCase schema name */
+function toPascalCase(snake: string): string {
+  return snake
+    .split('_')
+    .map(w => w.charAt(0).toUpperCase() + w.slice(1))
+    .join('')
+}
+
+/**
+ * Generate an OpenAPI 3.0 document directly from RMAP `TableDef[]` output.
+ *
+ * This is an alternative code path that bypasses the DomainModel-driven
+ * `generateOpenAPI()`, consuming pre-computed relational table definitions
+ * from `rmap()` in `src/rmap/procedure.ts`.
+ *
+ * Each table becomes a component schema. Columns become properties.
+ * FK references become `$ref` links. NOT NULL columns become required.
+ *
+ * @param tables - RMAP output table definitions
+ * @param domainName - Human-readable domain name for the info title
+ */
+export function generateOpenAPIFromRmap(tables: TableDef[], domainName: string): object {
+  const schemas: Record<string, any> = {}
+
+  for (const table of tables) {
+    const schemaName = toPascalCase(table.name)
+    const properties: Record<string, any> = {}
+    const required: string[] = []
+
+    for (const col of table.columns) {
+      if (col.references) {
+        // FK reference → $ref to the referenced table's schema
+        const refSchemaName = toPascalCase(col.references)
+        properties[col.name] = {
+          oneOf: [
+            toJsonSchemaType(col.type),
+            { $ref: `#/components/schemas/${refSchemaName}` },
+          ],
+          description: `FK reference to ${col.references}`,
+        }
+      } else {
+        const jsonType = toJsonSchemaType(col.type)
+        properties[col.name] = { ...jsonType }
+      }
+
+      if (!col.nullable) {
+        required.push(col.name)
+      }
+    }
+
+    // Add enum constraints from CHECK (column IN (...)) patterns
+    if (table.checks) {
+      for (const check of table.checks) {
+        const match = check.match(/^(\w+)\s+IN\s*\((.+)\)$/i)
+        if (match) {
+          const colName = match[1]
+          const values = match[2]
+            .split(',')
+            .map(v => v.trim().replace(/^'(.*)'$/, '$1'))
+          if (properties[colName]) {
+            properties[colName].enum = values
+          }
+        }
+      }
+    }
+
+    const schema: any = {
+      type: 'object',
+      properties,
+    }
+    if (required.length > 0) {
+      schema.required = required
+    }
+
+    schemas[schemaName] = schema
+  }
+
+  return {
+    openapi: '3.0.0',
+    info: {
+      title: `${domainName} Schema (RMAP)`,
       version: '1.0.0',
     },
     components: {

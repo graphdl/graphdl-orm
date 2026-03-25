@@ -33,19 +33,19 @@ function parseEnumValues(raw: string): string[] {
 type Row = Record<string, any>
 
 export interface DataLoader {
-  queryNouns(domainId: string): Row[]
-  queryGraphSchemas(domainId: string): Row[]
-  queryReadings(domainId: string): Row[]
-  queryRoles(): Row[]
-  queryConstraints(domainId: string): Row[]
-  queryConstraintSpans(): Row[]
-  queryStateMachineDefs(domainId: string): Row[]
-  queryStatuses(domainId: string): Row[]
-  queryTransitions(domainId: string): Row[]
-  queryEventTypes(domainId: string): Row[]
-  queryGuards(domainId: string): Row[]
-  queryVerbs(domainId: string): Row[]
-  queryFunctions(domainId: string): Row[]
+  queryNouns(domainId: string): Promise<Row[]>
+  queryGraphSchemas(domainId: string): Promise<Row[]>
+  queryReadings(domainId: string): Promise<Row[]>
+  queryRoles(): Promise<Row[]>
+  queryConstraints(domainId: string): Promise<Row[]>
+  queryConstraintSpans(): Promise<Row[]>
+  queryStateMachineDefs(domainId: string): Promise<Row[]>
+  queryStatuses(domainId: string): Promise<Row[]>
+  queryTransitions(domainId: string): Promise<Row[]>
+  queryEventTypes(domainId: string): Promise<Row[]>
+  queryGuards(domainId: string): Promise<Row[]>
+  queryVerbs(domainId: string): Promise<Row[]>
+  queryFunctions(domainId: string): Promise<Row[]>
 }
 
 // ---------------------------------------------------------------------------
@@ -67,7 +67,7 @@ export const DEFAULT_SUPERTYPE_ROOTS = new Set(['Resource', 'Noun'])
 export class SqlDataLoader implements DataLoader {
   constructor(private sql: SqlStorage) {}
 
-  queryNouns(domainId: string): Row[] {
+  async queryNouns(domainId: string): Promise<Row[]> {
     return [
       ...this.sql.exec(
         `SELECT n.*, p.name as super_type_name FROM nouns n LEFT JOIN nouns p ON n.super_type_id = p.id WHERE n.domain_id IN (?, '${CORE_DOMAIN_ID}')`,
@@ -76,15 +76,15 @@ export class SqlDataLoader implements DataLoader {
     ]
   }
 
-  queryGraphSchemas(domainId: string): Row[] {
+  async queryGraphSchemas(domainId: string): Promise<Row[]> {
     return [...this.sql.exec(`SELECT * FROM graph_schemas WHERE domain_id IN (?, '${CORE_DOMAIN_ID}')`, domainId)]
   }
 
-  queryReadings(domainId: string): Row[] {
+  async queryReadings(domainId: string): Promise<Row[]> {
     return [...this.sql.exec(`SELECT * FROM readings WHERE domain_id IN (?, '${CORE_DOMAIN_ID}')`, domainId)]
   }
 
-  queryRoles(): Row[] {
+  async queryRoles(): Promise<Row[]> {
     return [
       ...this.sql.exec(
         'SELECT r.*, gs.domain_id FROM roles r JOIN graph_schemas gs ON r.graph_schema_id = gs.id',
@@ -92,11 +92,11 @@ export class SqlDataLoader implements DataLoader {
     ]
   }
 
-  queryConstraints(domainId: string): Row[] {
+  async queryConstraints(domainId: string): Promise<Row[]> {
     return [...this.sql.exec(`SELECT * FROM constraints WHERE domain_id IN (?, '${CORE_DOMAIN_ID}')`, domainId)]
   }
 
-  queryConstraintSpans(): Row[] {
+  async queryConstraintSpans(): Promise<Row[]> {
     return [
       ...this.sql.exec(
         'SELECT cs.*, c.domain_id, r.graph_schema_id, r.role_index FROM constraint_spans cs JOIN constraints c ON cs.constraint_id = c.id JOIN roles r ON cs.role_id = r.id',
@@ -104,13 +104,13 @@ export class SqlDataLoader implements DataLoader {
     ]
   }
 
-  queryStateMachineDefs(domainId: string): Row[] {
+  async queryStateMachineDefs(domainId: string): Promise<Row[]> {
     return [
       ...this.sql.exec(`SELECT * FROM state_machine_definitions WHERE domain_id IN (?, '${CORE_DOMAIN_ID}')`, domainId),
     ]
   }
 
-  queryStatuses(domainId: string): Row[] {
+  async queryStatuses(domainId: string): Promise<Row[]> {
     return [
       ...this.sql.exec(
         `SELECT s.*, smd.domain_id FROM statuses s JOIN state_machine_definitions smd ON s.state_machine_definition_id = smd.id WHERE smd.domain_id IN (?, '${CORE_DOMAIN_ID}')`,
@@ -119,7 +119,7 @@ export class SqlDataLoader implements DataLoader {
     ]
   }
 
-  queryTransitions(domainId: string): Row[] {
+  async queryTransitions(domainId: string): Promise<Row[]> {
     return [
       ...this.sql.exec(
         `SELECT t.* FROM transitions t JOIN statuses s ON t.from_status_id = s.id JOIN state_machine_definitions smd ON s.state_machine_definition_id = smd.id WHERE smd.domain_id IN (?, '${CORE_DOMAIN_ID}')`,
@@ -128,19 +128,19 @@ export class SqlDataLoader implements DataLoader {
     ]
   }
 
-  queryEventTypes(domainId: string): Row[] {
+  async queryEventTypes(domainId: string): Promise<Row[]> {
     return [...this.sql.exec(`SELECT * FROM event_types WHERE domain_id IN (?, '${CORE_DOMAIN_ID}')`, domainId)]
   }
 
-  queryGuards(domainId: string): Row[] {
+  async queryGuards(domainId: string): Promise<Row[]> {
     return [...this.sql.exec(`SELECT * FROM guards WHERE domain_id IN (?, '${CORE_DOMAIN_ID}')`, domainId)]
   }
 
-  queryVerbs(domainId: string): Row[] {
+  async queryVerbs(domainId: string): Promise<Row[]> {
     return [...this.sql.exec(`SELECT * FROM verbs WHERE domain_id IN (?, '${CORE_DOMAIN_ID}')`, domainId)]
   }
 
-  queryFunctions(domainId: string): Row[] {
+  async queryFunctions(domainId: string): Promise<Row[]> {
     return [...this.sql.exec(`SELECT * FROM functions WHERE domain_id IN (?, '${CORE_DOMAIN_ID}')`, domainId)]
   }
 }
@@ -184,7 +184,7 @@ export class DomainModel {
   async nouns(): Promise<Map<string, NounDef>> {
     if (this.cache.has('nouns')) return this.cache.get('nouns')
 
-    const rows = this.loader.queryNouns(this.domainId)
+    const rows = await this.loader.queryNouns(this.domainId)
     const map = new Map<string, NounDef>()
 
     for (const row of rows) {
@@ -246,9 +246,11 @@ export class DomainModel {
     if (this.cache.has('factTypes')) return this.cache.get('factTypes')
 
     const nouns = await this.nouns()
-    const gsRows = this.loader.queryGraphSchemas(this.domainId)
-    const readingRows = this.loader.queryReadings(this.domainId)
-    const roleRows = this.loader.queryRoles()
+    const [gsRows, readingRows, roleRows] = await Promise.all([
+      this.loader.queryGraphSchemas(this.domainId),
+      this.loader.queryReadings(this.domainId),
+      this.loader.queryRoles(),
+    ])
 
     // Index roles by graph_schema_id (include core domain roles)
     const rolesByGs = new Map<string, Row[]>()
@@ -322,8 +324,10 @@ export class DomainModel {
   async constraints(): Promise<ConstraintDef[]> {
     if (this.cache.has('constraints')) return this.cache.get('constraints')
 
-    const constraintRows = this.loader.queryConstraints(this.domainId)
-    const spanRows = this.loader.queryConstraintSpans()
+    const [constraintRows, spanRows] = await Promise.all([
+      this.loader.queryConstraints(this.domainId),
+      this.loader.queryConstraintSpans(),
+    ])
 
     // Group spans by constraint_id, filtering to this domain + core
     const spansByConstraint = new Map<string, Row[]>()
@@ -395,8 +399,10 @@ export class DomainModel {
     if (this.cache.has('readings')) return this.cache.get('readings')
 
     const nouns = await this.nouns()
-    const readingRows = this.loader.queryReadings(this.domainId)
-    const roleRows = this.loader.queryRoles()
+    const [readingRows, roleRows] = await Promise.all([
+      this.loader.queryReadings(this.domainId),
+      this.loader.queryRoles(),
+    ])
 
     // Build noun lookup by id
     const nounById = new Map<string, NounDef>()
@@ -446,13 +452,15 @@ export class DomainModel {
     if (this.cache.has('stateMachines')) return this.cache.get('stateMachines')
 
     const nouns = await this.nouns()
-    const smDefRows = this.loader.queryStateMachineDefs(this.domainId)
-    const statusRows = this.loader.queryStatuses(this.domainId)
-    const transitionRows = this.loader.queryTransitions(this.domainId)
-    const eventTypeRows = this.loader.queryEventTypes(this.domainId)
-    const verbRows = this.loader.queryVerbs(this.domainId)
-    const functionRows = this.loader.queryFunctions(this.domainId)
-    const guardRows = this.loader.queryGuards(this.domainId)
+    const [smDefRows, statusRows, transitionRows, eventTypeRows, verbRows, functionRows, guardRows] = await Promise.all([
+      this.loader.queryStateMachineDefs(this.domainId),
+      this.loader.queryStatuses(this.domainId),
+      this.loader.queryTransitions(this.domainId),
+      this.loader.queryEventTypes(this.domainId),
+      this.loader.queryVerbs(this.domainId),
+      this.loader.queryFunctions(this.domainId),
+      this.loader.queryGuards(this.domainId),
+    ])
 
     // Build noun lookup by id
     const nounById = new Map<string, NounDef>()

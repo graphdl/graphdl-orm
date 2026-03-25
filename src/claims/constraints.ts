@@ -2,9 +2,9 @@
  * Constraint parsing and application.
  *
  * parseMultiplicity() — pure function, unchanged from original.
- * applyConstraints() — ported from Payload to GraphDLDBLike DO calls.
+ * applyConstraintsBatch() — accumulates constraints via BatchBuilder.
  */
-import type { GraphDLDBLike } from '../do-adapter'
+import type { BatchBuilder } from './batch-builder'
 
 export interface ConstraintDef {
   kind: 'UC' | 'MC' | 'IR' | 'SY' | 'AS' | 'TR' | 'IT' | 'ANS' | 'AC' | 'RF' | 'SS' | 'XC' | 'EQ' | 'OR' | 'XO'
@@ -49,17 +49,17 @@ function expandUC(pattern: string, modality: 'Alethic' | 'Deontic', out: Constra
 }
 
 /**
- * Apply constraint definitions by creating constraint + constraint_span records.
- * Ported from Payload's applyConstraints to use GraphDLDBLike directly.
+ * Apply constraint definitions by adding constraint + constraint-span entities
+ * to the BatchBuilder.
  */
-export async function applyConstraints(
-  db: GraphDLDBLike,
+export function applyConstraintsBatch(
+  builder: BatchBuilder,
   opts: {
     constraints: ConstraintDef[]
     roleIds: string[]
     domainId?: string
   },
-): Promise<void> {
+): void {
   const { constraints, roleIds, domainId } = opts
 
   for (const def of constraints) {
@@ -69,15 +69,15 @@ export async function applyConstraints(
 
     if (!resolvedIds.length) continue
 
-    const constraint = await db.createInCollection('constraints', {
+    const constraintId = builder.addEntity('Constraint', {
       kind: def.kind,
       modality: def.modality,
       ...(domainId ? { domain: domainId } : {}),
     })
 
     for (const roleId of resolvedIds) {
-      await db.createInCollection('constraint-spans', {
-        constraint: constraint.id,
+      builder.addEntity('ConstraintSpan', {
+        constraint: constraintId,
         role: roleId,
       })
     }

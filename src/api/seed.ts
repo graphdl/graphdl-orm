@@ -2,7 +2,6 @@ import { json, error } from 'itty-router'
 import type { Env } from '../types'
 import { ingestClaims } from '../claims/ingest'
 import type { ExtractedClaims } from '../claims/ingest'
-import { createDomainAdapter } from '../do-adapter'
 import { parseFORML2 } from './parse'
 
 // ── DO helpers ───────────────────────────────────────────────────────
@@ -48,22 +47,21 @@ async function handleSeedGet(env: Env): Promise<Response> {
     })
   }
 
-  // Query each domain DO in parallel for its stats
+  // Query entity counts per domain via Registry getEntityIds
   const perDomainEntries = await Promise.all(
     domainSlugs.map(async (slug) => {
-      const domainDO = getDomainDO(env, slug) as any
-      const [nouns, readings, schemas, constraints] = await Promise.all([
-        domainDO.findInCollection('nouns', {}, { limit: 0 }),
-        domainDO.findInCollection('readings', {}, { limit: 0 }),
-        domainDO.findInCollection('graph-schemas', {}, { limit: 0 }),
-        domainDO.findInCollection('constraints', {}, { limit: 0 }),
+      const [nounIds, readingIds, schemaIds, constraintIds] = await Promise.all([
+        registry.getEntityIds('Noun', slug) as Promise<string[]>,
+        registry.getEntityIds('Reading', slug) as Promise<string[]>,
+        registry.getEntityIds('GraphSchema', slug) as Promise<string[]>,
+        registry.getEntityIds('Constraint', slug) as Promise<string[]>,
       ])
       return {
         slug,
-        nouns: nouns.totalDocs as number,
-        readings: readings.totalDocs as number,
-        graphSchemas: schemas.totalDocs as number,
-        constraints: constraints.totalDocs as number,
+        nouns: nounIds.length,
+        readings: readingIds.length,
+        graphSchemas: schemaIds.length,
+        constraints: constraintIds.length,
       }
     })
   )
@@ -164,9 +162,9 @@ async function handleBulkSeed(
     domains.map(async (entry) => {
       const domainDO = getDomainDO(env, entry.slug) as any
       await domainDO.setDomainId(entry.slug)
-      const domainRecord = await ensureDomain(domainDO, entry.slug, entry.name)
+      const domainRecord = await ensureDomain(env, registry, entry.slug, entry.name)
       const domainUUID = domainRecord.id as string
-      const adapter = createDomainAdapter(domainDO)
+      const adapter = domainDO as any
       const claimsWithoutFacts = { ...entry.claims, facts: [] }
       const result = await ingestClaims(adapter, {
         claims: claimsWithoutFacts,
@@ -269,44 +267,45 @@ async function handleSingleSeed(
   const domainDO = getDomainDO(env, domainSlug) as any
   await domainDO.setDomainId(domainSlug)
 
-  // Ensure domain record exists in this DO
-  const domainRecord = await ensureDomain(domainDO, domainSlug)
+  // Ensure domain record exists via Registry+EntityDB
+  const registry = getRegistryDO(env) as any
+  const domainRecord = await ensureDomain(env, registry, domainSlug)
   const domainUUID = domainRecord.id as string
 
-  const adapter = createDomainAdapter(domainDO)
+  const adapter = domainDO as any
   const result = await ingestClaims(adapter, { claims: body.claims!, domainId: domainUUID })
 
   // Register in the global registry
-  const registry = getRegistryDO(env) as any
   for (const noun of body.claims!.nouns) {
     await registry.indexNoun(noun.name, domainSlug)
   }
-  await registry.registerDomain(domainSlug, domainSlug)
+  await registry.registerDomain(domainSlug, domainSlug, 'private', domainUUID)
 
   return json({ ...result, domainId: domainUUID })
 }
 
 // ── Domain record helper ─────────────────────────────────────────────
 
-async function ensureDomain(db: any, slug: string, name?: string): Promise<Record<string, any>> {
-  const existing = await db.findInCollection('domains', {
-    domainSlug: { equals: slug },
-  }, { limit: 1 })
-
-  if (existing.docs.length) return existing.docs[0]
-
-  try {
-    return await db.createInCollection('domains', {
-      domainSlug: slug,
-      name: name || slug,
-      visibility: 'private',
-    })
-  } catch {
-    // UNIQUE constraint race: another concurrent call created it first
-    const retry = await db.findInCollection('domains', {
-      domainSlug: { equals: slug },
-    }, { limit: 1 })
-    if (retry.docs.length) return retry.docs[0]
-    throw new Error(`Failed to create or find domain: ${slug}`)
+/**
+ * Ensure a Domain entity exists for the given slug.
+ * Uses Registry to check for existing domain entity IDs, then EntityDB for storage.
+ * Returns a record with { id } (the domain's UUID).
+ */
+async function ensureDomain(env: Env, registry: any, slug: string, name?: string): Promise<Record<string, any>> {
+  // Check if domain entities already exist in the Registry
+  const existingIds: string[] = await registry.getEntityIds('Domain', slug)
+  if (existingIds.length > 0) {
+    // Fetch the first existing domain entity
+    const entityDO = env.ENTITY_DB.get(env.ENTITY_DB.idFromName(existingIds[0])) as any
+    const entity = await entityDO.get()
+    if (entity) return { id: entity.id, ...entity.data }
   }
+
+  // Create a new Domain entity
+  const id = crypto.randomUUID()
+  const data = { domainSlug: slug, name: name || slug, visibility: 'private' }
+  const entityDO = env.ENTITY_DB.get(env.ENTITY_DB.idFromName(id)) as any
+  await entityDO.put({ id, type: 'Domain', data })
+  await registry.indexEntity('Domain', id, slug)
+  return { id, ...data }
 }

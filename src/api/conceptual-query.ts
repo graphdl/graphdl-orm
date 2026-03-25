@@ -48,19 +48,27 @@ export async function handleConceptualQuery(request: Request, env: Env) {
   if (!queryText) return error(400, { errors: [{ message: 'query text required (q param or body.q)' }] })
   if (!domainId) return error(400, { errors: [{ message: 'domain required' }] })
 
-  // Load nouns and readings from the domain DO
-  const domainDB = await resolveDomain(env, domainId)
-  if (!domainDB) return error(404, { errors: [{ message: `Domain not found: ${domainId}` }] })
+  // Load nouns and readings via Registry+EntityDB fan-out
+  const registry = env.REGISTRY_DB.get(env.REGISTRY_DB.idFromName('global')) as any
+  const domainSlug = await resolveDomainSlug(env, registry, domainId)
+  if (!domainSlug) return error(404, { errors: [{ message: `Domain not found: ${domainId}` }] })
 
-  const [nounsResult, readingsResult] = await Promise.all([
-    domainDB.findInCollection('nouns', {}, { limit: 500 }),
-    domainDB.findInCollection('readings', {}, { limit: 1000 }),
+  const [nounIds, readingIds] = await Promise.all([
+    registry.getEntityIds('Noun', domainSlug) as Promise<string[]>,
+    registry.getEntityIds('Reading', domainSlug) as Promise<string[]>,
+  ])
+  const [nounEntities, readingEntities] = await Promise.all([
+    Promise.all(nounIds.map(id => (env.ENTITY_DB.get(env.ENTITY_DB.idFromName(id)) as any).get())),
+    Promise.all(readingIds.map(id => (env.ENTITY_DB.get(env.ENTITY_DB.idFromName(id)) as any).get())),
   ])
 
-  const nounDocs: NounDoc[] = (nounsResult.docs || []).filter((n: any) =>
-    (n.object_type === 'entity' || n.objectType === 'entity')
-  )
-  const readingDocs: ReadingDoc[] = readingsResult.docs || []
+  const nounDocs: NounDoc[] = nounEntities
+    .filter(Boolean)
+    .map((e: any) => ({ id: e.id, name: e.data?.name, objectType: e.data?.objectType || e.data?.object_type }))
+    .filter((n: any) => n.objectType === 'entity')
+  const readingDocs: ReadingDoc[] = readingEntities
+    .filter(Boolean)
+    .map((e: any) => ({ id: e.id, text: e.data?.text }))
 
   const nouns = nounDocs.filter((n: any) => n.name && typeof n.name === 'string').map(n => ({ name: n.name, id: n.id }))
   const readings = readingDocs.filter((r: any) => r.text && typeof r.text === 'string').map(r => {
@@ -97,8 +105,7 @@ export async function handleConceptualQuery(request: Request, env: Env) {
     })
   }
 
-  // Walk the path against live Entity DOs
-  const registry = env.REGISTRY_DB.get(env.REGISTRY_DB.idFromName('global')) as any
+  // Walk the path against live Entity DOs (reuse the registry stub from above)
   const results = await walkPath(env, registry, resolved.path, resolved.filters)
 
   return json({
@@ -225,18 +232,17 @@ function toColumnName(noun: string): string {
   return noun.toLowerCase().replace(/\s+/g, '_')
 }
 
-/** Resolve a domain ID (UUID or slug) to a DomainDB DO stub */
-async function resolveDomain(env: Env, domainId: string): Promise<any | null> {
+/** Resolve a domain ID (UUID or slug) to a domain slug string */
+async function resolveDomainSlug(env: Env, registry: any, domainId: string): Promise<string | null> {
   // Slug (contains hyphens, not UUID-shaped)
   if (domainId.includes('-') && !domainId.match(/^[0-9a-f]{8}-[0-9a-f]{4}-/)) {
-    return env.DOMAIN_DB.get(env.DOMAIN_DB.idFromName(domainId)) as any
+    return domainId
   }
 
   // UUID — try registry
-  const registry = env.REGISTRY_DB.get(env.REGISTRY_DB.idFromName('global')) as any
   try {
     const slug: string | null = await registry.resolveSlugByUUID(domainId)
-    if (slug) return env.DOMAIN_DB.get(env.DOMAIN_DB.idFromName(slug)) as any
+    if (slug) return slug
   } catch { /* fall through */ }
 
   return null
