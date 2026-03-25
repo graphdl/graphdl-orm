@@ -72,7 +72,7 @@ describe('outcomes', () => {
       expect(putCalls[0].data.data.text).toBe('Status value "Unknown" is not in the allowed set.')
       expect(putCalls[0].data.data.severity).toBe('error')
       expect(putCalls[0].data.data.occurredAt).toBeDefined()
-      expect(putCalls[0].data.data.resourceId).toBeNull()
+      expect(putCalls[0].data.data.functionId).toBeNull()
       expect(putCalls[0].data.data.batchId).toBeNull()
 
       // Registry indexEntity was called
@@ -82,18 +82,18 @@ describe('outcomes', () => {
       expect(indexCalls[0].domain).toBe('support')
     })
 
-    it('sets optional resourceId and batchId when provided', async () => {
+    it('sets optional functionId and batchId when provided', async () => {
       const { env, putCalls } = createMockEnv()
 
       await createViolation(env, {
         domain: 'hr',
         constraintId: 'mc-salary',
         text: 'Employee must have a Salary.',
-        resourceId: 'entity-42',
+        functionId: 'entity-42',
         batchId: 'batch-7',
       })
 
-      expect(putCalls[0].data.data.resourceId).toBe('entity-42')
+      expect(putCalls[0].data.data.functionId).toBe('entity-42')
       expect(putCalls[0].data.data.batchId).toBe('batch-7')
     })
 
