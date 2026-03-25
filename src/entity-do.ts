@@ -7,6 +7,8 @@
  */
 
 import { DurableObject } from 'cloudflare:workers'
+import type { SqlLike } from './sql-like'
+export type { SqlLike } from './sql-like'
 
 export interface EntityData {
   id: string
@@ -20,10 +22,6 @@ export interface EventRecord {
   operation: string
   data: string | null
   prev: string | null
-}
-
-export interface SqlLike {
-  exec(query: string, ...params: any[]): { toArray(): any[] }
 }
 
 /**

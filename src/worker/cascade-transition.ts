@@ -8,6 +8,8 @@
  */
 
 import type { RegistryReadStub, EntityReadStub, EntityRecord } from '../api/entity-routes'
+import { loadEntities, loadEntity } from './fan-out'
+import type { GetStubFn } from './fan-out'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -41,47 +43,6 @@ export function matchPattern(statusCode: number, pattern: string): boolean {
   if (pattern === '*') return true
   const regex = new RegExp('^' + pattern.replace(/X/gi, '\\d') + '$')
   return regex.test(statusCode.toString())
-}
-
-// ---------------------------------------------------------------------------
-// Fan-out helpers (local copies, same logic as state-machine.ts)
-// ---------------------------------------------------------------------------
-
-type GetStubFn = (id: string) => EntityReadStub & { patch?(data: any): Promise<any> }
-
-async function loadEntities(
-  registry: RegistryReadStub,
-  getStub: GetStubFn,
-  entityType: string,
-  domain?: string,
-): Promise<EntityRecord[]> {
-  const ids = await registry.getEntityIds(entityType, domain)
-  const settled = await Promise.allSettled(
-    ids.map(async (id) => {
-      const stub = getStub(id)
-      return stub.get()
-    }),
-  )
-  const results: EntityRecord[] = []
-  for (const r of settled) {
-    if (r.status === 'fulfilled' && r.value && !r.value.deletedAt) {
-      results.push(r.value)
-    }
-  }
-  return results
-}
-
-async function loadEntity(
-  getStub: GetStubFn,
-  id: string,
-): Promise<EntityRecord | null> {
-  try {
-    const stub = getStub(id)
-    const entity = await stub.get()
-    return entity && !entity.deletedAt ? entity : null
-  } catch {
-    return null
-  }
 }
 
 // ---------------------------------------------------------------------------

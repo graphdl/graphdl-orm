@@ -12,9 +12,7 @@
     "outDir": "dist",
     "declaration": true,
     "paths": {
-      "@/*": ["./src/*"],
-      "@dotdo/db": ["./.do/db/src/index.ts"],
-      "@dotdo/db/*": ["./.do/db/src/*"]
+      "@/*": ["./src/*"]
     }
   },
   "include": ["src/**/*.ts"],

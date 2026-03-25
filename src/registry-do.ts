@@ -12,9 +12,8 @@ import { DurableObject } from 'cloudflare:workers'
 // Types
 // =========================================================================
 
-export interface SqlLike {
-  exec(query: string, ...params: any[]): { toArray(): any[] }
-}
+import type { SqlLike } from './sql-like'
+export type { SqlLike } from './sql-like'
 
 // =========================================================================
 // Schema initialisation

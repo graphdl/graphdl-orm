@@ -17,6 +17,7 @@ import { ingestClaims, ingestProject } from '../claims/ingest'
 import type { ExtractedClaims } from '../claims/ingest'
 import { persistViolations } from '../worker/outcomes'
 import { materializeBatch } from '../worker/materialize'
+import { ensureDomain } from './ensure-domain'
 
 function getDB(env: Env) {
   const id = env.DOMAIN_DB.idFromName('graphdl-primary')
@@ -25,26 +26,6 @@ function getDB(env: Env) {
 
 function getRegistry(env: Env) {
   return env.REGISTRY_DB.get(env.REGISTRY_DB.idFromName('global'))
-}
-
-/**
- * Ensure a Domain entity exists for the given slug.
- * Uses Registry to check for existing domain entity IDs, then EntityDB for storage.
- */
-async function ensureDomain(env: Env, registry: any, slug: string, name?: string): Promise<Record<string, any>> {
-  const existingIds: string[] = await registry.getEntityIds('Domain', slug)
-  if (existingIds.length > 0) {
-    const entityDO = env.ENTITY_DB.get(env.ENTITY_DB.idFromName(existingIds[0])) as any
-    const entity = await entityDO.get()
-    if (entity) return { id: entity.id, ...entity.data }
-  }
-
-  const id = crypto.randomUUID()
-  const data = { domainSlug: slug, name: name || slug, visibility: 'private' }
-  const entityDO = env.ENTITY_DB.get(env.ENTITY_DB.idFromName(id)) as any
-  await entityDO.put({ id, type: 'Domain', data })
-  await registry.indexEntity('Domain', id, slug)
-  return { id, ...data }
 }
 
 export async function handleClaims(request: Request, env: Env): Promise<Response> {

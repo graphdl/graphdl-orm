@@ -82,13 +82,6 @@ export async function handleConceptualQuery(request: Request, env: Env) {
         remaining = remaining.replace(noun.name, '\0'.repeat(noun.name.length))
       }
     }
-    // Extract predicate between first two nouns
-    let predicate = ''
-    if (readingNouns.length >= 2) {
-      const start = r.text.indexOf(readingNouns[0]) + readingNouns[0].length
-      const end = r.text.indexOf(readingNouns[1], start)
-      if (end > start) predicate = r.text.slice(start, end).trim()
-    }
     return { text: r.text, nouns: readingNouns.filter(Boolean) }
   })
 
