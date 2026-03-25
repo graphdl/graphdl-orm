@@ -18,8 +18,9 @@ export interface ViolationInput {
   constraintId: string | null
   text: string
   severity?: 'error' | 'warning' | 'info'
-  functionId?: string  // "is against Function" — the Function (Noun, Graph Schema, etc.) this violation is about
+  functionId?: string     // "is against Function" — the Function this violation is about
   batchId?: string
+  triggeredByResourceId?: string  // "is triggered by Resource" — the specific resource that triggered it
 }
 
 /**
@@ -40,6 +41,7 @@ export async function createViolation(env: Env, input: ViolationInput): Promise<
       occurredAt: new Date().toISOString(),
       functionId: input.functionId ?? null,
       batchId: input.batchId ?? null,
+      triggeredByResourceId: input.triggeredByResourceId ?? null,
     },
   })
 
@@ -58,7 +60,9 @@ export interface FailureInput {
   failureType: FailureType
   reason: string
   severity?: 'error' | 'warning' | 'info'
-  functionId?: string  // "is against Function" — the Function this failure relates to
+  functionId?: string       // "is against Function" — the Function this failure relates to
+  causedByViolationId?: string  // "is caused by Violation" — the violation that caused this failure
+  transitionId?: string     // "occurs during Transition" — the transition during which this failed
   input?: string
 }
 
@@ -78,6 +82,8 @@ export async function createFailure(env: Env, input: FailureInput): Promise<stri
       reason: input.reason,
       severity: input.severity ?? 'error',
       functionId: input.functionId ?? null,
+      causedByViolationId: input.causedByViolationId ?? null,
+      transitionId: input.transitionId ?? null,
       input: input.input ?? null,
       occurredAt: new Date().toISOString(),
     },

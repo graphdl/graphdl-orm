@@ -50,6 +50,14 @@ Failure has Severity.
 Failure occurred at Timestamp.
   Each Failure occurred at exactly one Timestamp.
 
+### Causal Links
+Failure is caused by Violation.
+  Each Failure is caused by at most one Violation.
+Violation is triggered by Resource.
+  Each Violation is triggered by at most one Resource.
+Failure occurs during Transition.
+  Each Failure occurs during at most one Transition.
+
 ## Constraints
 
 Each Violation is of exactly one Constraint.
