@@ -9,6 +9,7 @@ import { handleParseOrm } from './parse-orm'
 import { handleVerify } from './verify'
 import { handleEvaluate, handleSynthesize } from './evaluate'
 import { getInitialState, getValidTransitions, applyTransition } from '../worker/state-machine'
+import { executeCascade } from '../worker/cascade-transition'
 import { handleConceptualQuery } from './conceptual-query'
 import { deriveOnWrite } from '../worker/derive-on-write'
 import { induceConstraints } from '../csdp/induce'
@@ -409,7 +410,7 @@ router.get('/api/entities/:noun/:id/transitions', async (request, env: Env) => {
   })
 })
 
-// POST fire a transition event
+// POST fire a transition event (with cascade support)
 router.post('/api/entities/:noun/:id/transition', async (request, env: Env) => {
   const { noun, id } = request.params
   const body = await request.json() as { event: string; domain?: string }
@@ -426,6 +427,8 @@ router.post('/api/entities/:noun/:id/transition', async (request, env: Env) => {
   const domainSlug = body.domain || entity.data._domain as string || undefined
   const smRegistry = getRegistryDO(env, 'global') as any
   const smGetStub = (eid: string) => getEntityDO(env, eid) as any
+
+  // Validate the transition before cascading
   const result = await applyTransition(
     smRegistry, smGetStub,
     entity.data._stateMachineDefinition as string,
@@ -447,19 +450,38 @@ router.post('/api/entities/:noun/:id/transition', async (request, env: Env) => {
     }] })
   }
 
-  // Update entity with new status
-  await entityDO.patch({
-    _status: result.newStatus,
-    _statusId: result.newStatusId,
+  // Execute cascade — applies the transition, fires callbacks, and chains
+  const cascadeResult = await executeCascade(id, body.event, {
+    registry: smRegistry,
+    getStub: smGetStub,
+    domain: domainSlug,
   })
+
+  // Get valid transitions from the final state
+  const finalEntity = await entityDO.get()
+  const finalStatusId = finalEntity?.data?._statusId as string | undefined
+  const availableTransitions = finalStatusId
+    ? await getValidTransitions(
+        smRegistry, smGetStub,
+        entity.data._stateMachineDefinition as string,
+        finalStatusId,
+        domainSlug,
+      )
+    : []
 
   return json({
     id,
     noun,
     previousStatus: result.previousStatus,
-    status: result.newStatus,
+    status: cascadeResult.finalState,
     event: result.event,
     transitionId: result.transitionId,
+    cascade: {
+      statesVisited: cascadeResult.statesVisited,
+      callbackResults: cascadeResult.callbackResults,
+      ...(cascadeResult.failures.length > 0 && { failures: cascadeResult.failures }),
+    },
+    availableEvents: availableTransitions.map(o => o.event),
   })
 })
 
@@ -523,8 +545,18 @@ router.get('/api/entities/:noun', async (request, env: Env) => {
 
 router.get('/api/entities/:noun/:id', async (request, env: Env) => {
   const { id } = request.params
+  const url = new URL(request.url)
+  const domainSlug = url.searchParams.get('domain') || undefined
 
-  const entity = await handleGetEntity(getEntityDO(env, id) as any)
+  const smRegistry = getRegistryDO(env, 'global') as any
+  const smGetStub = (eid: string) => getEntityDO(env, eid) as any
+
+  const entity = await handleGetEntity(getEntityDO(env, id) as any, {
+    transitionOpts: {
+      getValidTransitions: (defId, statusId) =>
+        getValidTransitions(smRegistry, smGetStub, defId, statusId, domainSlug),
+    },
+  })
   if (!entity) return error(404, { errors: [{ message: 'Not Found' }] })
 
   return json({
@@ -534,6 +566,7 @@ router.get('/api/entities/:noun/:id', async (request, env: Env) => {
     version: entity.version,
     createdAt: entity.createdAt,
     updatedAt: entity.updatedAt,
+    ...(entity.transitions && { transitions: entity.transitions }),
   })
 })
 
@@ -662,7 +695,17 @@ router.get('/api/:collection/:id', async (request, env: Env) => {
   // Delegate to entity-type handler if this collection maps to a known entity type
   const entityType = COLLECTION_TO_ENTITY_TYPE[collection]
   if (entityType) {
-    const entity = await handleGetEntity(getEntityDO(env, id) as any)
+    const url = new URL(request.url)
+    const domainSlug = url.searchParams.get('domain') || undefined
+    const smRegistry = getRegistryDO(env, 'global') as any
+    const smGetStub = (eid: string) => getEntityDO(env, eid) as any
+
+    const entity = await handleGetEntity(getEntityDO(env, id) as any, {
+      transitionOpts: {
+        getValidTransitions: (defId, statusId) =>
+          getValidTransitions(smRegistry, smGetStub, defId, statusId, domainSlug),
+      },
+    })
     if (!entity) return error(404, { errors: [{ message: 'Not Found' }] })
     return json({
       id: entity.id,
@@ -671,6 +714,7 @@ router.get('/api/:collection/:id', async (request, env: Env) => {
       version: entity.version,
       createdAt: entity.createdAt,
       updatedAt: entity.updatedAt,
+      ...(entity.transitions && { transitions: entity.transitions }),
     })
   }
 
@@ -878,20 +922,6 @@ router.delete('/api/reset', async (request, env: Env) => {
 router.all('/parse', handleParse)
 router.all('/parse/orm', handleParseOrm)
 router.all('/verify', handleVerify)
-
-// ── State Machine RPC ────────────────────────────────────────────────
-router.get('/api/state/*', async (request, env: Env) => {
-  const { handleGetState } = await import('./state')
-  return handleGetState(request, env)
-})
-router.post('/api/state/*', async (request, env: Env) => {
-  const { handleSendEvent } = await import('./state')
-  return handleSendEvent(request, env)
-})
-router.delete('/api/state/*', async (request, env: Env) => {
-  const { handleDeleteState } = await import('./state')
-  return handleDeleteState(request, env)
-})
 
 // ── 404 fallback ─────────────────────────────────────────────────────
 router.all('*', () => error(404, { errors: [{ message: 'Not Found' }] }))
