@@ -1,14 +1,96 @@
 /**
- * DomainDB — pure functions for metamodel schema initialization and
- * collection CRUD. Holds only type-level data (nouns, readings,
- * constraints, etc.), not instance data.
+ * DomainDB — Durable Object that holds a single domain's metamodel
+ * and collection CRUD. Type-level data (nouns, readings, constraints, etc.).
  *
- * The DO class wrapping these functions will be added in a subsequent task.
+ * The Payload CMS field-map layer (FIELD_MAP, FK_TARGET_TABLE, etc.) is
+ * retained only for the generators collection and the generate/createFact
+ * pipelines. All other collection CRUD has migrated to entity-type DOs.
  */
 
-import { BOOTSTRAP_DDL } from './schema/bootstrap'
-import { COLLECTION_TABLE_MAP, FIELD_MAP, FK_TARGET_TABLE, NOUN_TABLE_MAP } from './collections'
-import { WIPE_TABLES } from './wipe-tables'
+import { COLLECTION_TABLE_MAP, NOUN_TABLE_MAP } from './collections'
+import { initBatchSchema, createBatch, getBatch, markCommitted, markFailed, getPendingBatches } from './batch-wal'
+import type { BatchEntity, Batch } from './batch-wal'
+
+// =========================================================================
+// Legacy Payload field maps (private — inlined from deleted collections.ts)
+// =========================================================================
+
+/** Column mapping per table. Maps Payload field names to SQLite column names. */
+const FIELD_MAP: Record<string, Record<string, string>> = {
+  nouns: { domain: 'domain_id', superType: 'super_type_id', objectType: 'object_type', promptText: 'prompt_text', enumValues: 'enum_values', valueType: 'value_type', worldAssumption: 'world_assumption', referenceScheme: 'reference_scheme' },
+  graph_schemas: { domain: 'domain_id' },
+  readings: { domain: 'domain_id', graphSchema: 'graph_schema_id' },
+  roles: { reading: 'reading_id', noun: 'noun_id', graphSchema: 'graph_schema_id', roleIndex: 'role_index' },
+  constraints: { domain: 'domain_id', setComparisonArgumentLength: 'set_comparison_argument_length' },
+  constraint_spans: { constraint: 'constraint_id', role: 'role_id', subsetAutofill: 'subset_autofill' },
+  apps: { organization: 'organization_id', appType: 'app_type', chatEndpoint: 'chat_endpoint' },
+  domains: { domainSlug: 'domain_slug', organization: 'organization_id', app: 'app_id' },
+  organizations: {},
+  org_memberships: { organization: 'organization_id', userEmail: 'user_email' },
+  state_machine_definitions: { domain: 'domain_id', noun: 'noun_id' },
+  statuses: { stateMachineDefinition: 'state_machine_definition_id', domain: 'domain_id' },
+  transitions: { from: 'from_status_id', to: 'to_status_id', eventType: 'event_type_id', verb: 'verb_id', stateMachineDefinition: 'state_machine_definition_id', domain: 'domain_id' },
+  guards: { transition: 'transition_id', graphSchema: 'graph_schema_id', domain: 'domain_id' },
+  event_types: { domain: 'domain_id' },
+  verbs: { status: 'status_id', transition: 'transition_id', graph: 'graph_id', agentDefinition: 'agent_definition_id', domain: 'domain_id' },
+  functions: { callbackUrl: 'callback_url', httpMethod: 'http_method', headers: 'headers', verb: 'verb_id', domain: 'domain_id' },
+  streams: { domain: 'domain_id' },
+  models: {},
+  agent_definitions: { model: 'model_id', domain: 'domain_id' },
+  agents: { agentDefinition: 'agent_definition_id', resource: 'resource_id', domain: 'domain_id' },
+  completions: { agent: 'agent_id', inputText: 'input_text', outputText: 'output_text', occurredAt: 'occurred_at', domain: 'domain_id' },
+  citations: { domain: 'domain_id', retrievalDate: 'retrieval_date' },
+  graph_citations: { graph: 'graph_id', citation: 'citation_id', domain: 'domain_id' },
+  graphs: { graphSchema: 'graph_schema_id', domain: 'domain_id', isDone: 'is_done' },
+  resources: { noun: 'noun_id', domain: 'domain_id', createdBy: 'created_by' },
+  resource_roles: { graph: 'graph_id', resource: 'resource_id', role: 'role_id', domain: 'domain_id' },
+  state_machines: { stateMachineDefinition: 'state_machine_definition_id', stateMachineType: 'state_machine_definition_id', currentStatus: 'current_status_id', stateMachineStatus: 'current_status_id', resource: 'resource_id', domain: 'domain_id' },
+  events: { eventType: 'event_type_id', stateMachine: 'state_machine_id', graph: 'graph_id', occurredAt: 'occurred_at', domain: 'domain_id' },
+  generators: { domain: 'domain_id', outputFormat: 'output_format', versionNum: 'version_num' },
+  guard_runs: { guard: 'guard_id', graph: 'graph_id', domain: 'domain_id' },
+}
+
+/** Maps FK column names to their target table. */
+const FK_TARGET_TABLE: Record<string, string> = {
+  app_id: 'apps',
+  domain_id: 'domains',
+  organization_id: 'organizations',
+  super_type_id: 'nouns',
+  graph_schema_id: 'graph_schemas',
+  reading_id: 'readings',
+  noun_id: 'nouns',
+  constraint_id: 'constraints',
+  role_id: 'roles',
+  state_machine_definition_id: 'state_machine_definitions',
+  from_status_id: 'statuses',
+  to_status_id: 'statuses',
+  event_type_id: 'event_types',
+  verb_id: 'verbs',
+  transition_id: 'transitions',
+  guard_id: 'guards',
+  citation_id: 'citations',
+  graph_id: 'graphs',
+  resource_id: 'resources',
+  state_machine_id: 'state_machines',
+  current_status_id: 'statuses',
+  model_id: 'models',
+  agent_definition_id: 'agent_definitions',
+  agent_id: 'agents',
+}
+
+/** All tables to wipe during reset, in leaf-to-root dependency order. */
+const WIPE_TABLES: readonly string[] = [
+  'cdc_events',
+  'generators', 'guard_runs', 'events', 'state_machines',
+  'resource_roles', 'graph_citations', 'resources', 'graphs',
+  'completions', 'agents', 'agent_definitions', 'models',
+  'citations',
+  'functions', 'streams', 'verbs',
+  'guards', 'transitions', 'statuses', 'event_types', 'state_machine_definitions',
+  'constraint_spans', 'constraints', 'roles', 'readings', 'graph_schemas',
+  'nouns',
+  'domains', 'apps', 'org_memberships', 'organizations',
+]
 
 // =========================================================================
 // Types
@@ -44,21 +126,6 @@ export const METAMODEL_TABLES: string[] = [
   'generators',
 ]
 
-/**
- * Tables that must also be created because metamodel tables have FK
- * references to them (e.g. nouns.domain_id → domains.id).
- */
-const SUPPORTING_TABLES: string[] = [
-  'organizations',
-  'org_memberships',
-  'apps',
-  'domains',
-  'models',
-  'agent_definitions',
-]
-
-/** All tables whose DDL we need to run. */
-const ALL_REQUIRED_TABLES = new Set([...METAMODEL_TABLES, ...SUPPORTING_TABLES])
 
 /** Fields common to every table — Payload camelCase → SQL snake_case. */
 const COMMON_FIELDS: Record<string, string> = {
@@ -231,43 +298,12 @@ function getFieldMap(table: string): Record<string, string> {
   return FIELD_MAP[table] || {}
 }
 
-// =========================================================================
-// Public API
-// =========================================================================
-
-/**
- * Runs only the BOOTSTRAP_DDL statements for metamodel tables and their
- * supporting FK targets (organizations, apps, domains, etc.).
- */
-export function initDomainSchema(sql: SqlLike): void {
-  for (const ddl of BOOTSTRAP_DDL) {
-    // Extract table name from CREATE TABLE or CREATE INDEX
-    const createTableMatch = ddl.match(/CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+(\w+)/i)
-    if (createTableMatch) {
-      const tableName = createTableMatch[1]
-      if (ALL_REQUIRED_TABLES.has(tableName)) {
-        sql.exec(ddl)
-      }
-      continue
-    }
-
-    const createIndexMatch = ddl.match(/CREATE\s+(?:UNIQUE\s+)?INDEX\s+IF\s+NOT\s+EXISTS\s+\w+\s+ON\s+(\w+)/i)
-    if (createIndexMatch) {
-      const tableName = createIndexMatch[1]
-      if (ALL_REQUIRED_TABLES.has(tableName)) {
-        sql.exec(ddl)
-      }
-      continue
-    }
-  }
-}
-
 /**
  * Find records in a metamodel collection.
  *
  * Port of GraphDLDB.findInCollection for metamodel tables.
  */
-export function findInMetamodel(
+function findInMetamodel(
   sql: SqlLike,
   collection: string,
   where?: Record<string, any>,
@@ -323,7 +359,7 @@ export function findInMetamodel(
  *
  * Port of GraphDLDB.createInCollection for metamodel tables.
  */
-export function createInMetamodel(
+function createInMetamodel(
   sql: SqlLike,
   collection: string,
   data: Record<string, unknown>,
@@ -366,7 +402,7 @@ export function createInMetamodel(
  *
  * Port of GraphDLDB.updateInCollection for metamodel tables.
  */
-export function updateInMetamodel(
+function updateInMetamodel(
   sql: SqlLike,
   collection: string,
   id: string,
@@ -415,7 +451,7 @@ export function updateInMetamodel(
 /**
  * Get a single record by ID from a metamodel collection.
  */
-export function getFromMetamodel(
+function getFromMetamodel(
   sql: SqlLike,
   collection: string,
   id: string,
@@ -513,7 +549,7 @@ function cascadeDeleteDomain(sql: SqlLike, domainId: string): number {
 /**
  * Delete a record by ID from a metamodel collection, with cascade.
  */
-export function deleteFromMetamodel(
+function deleteFromMetamodel(
   sql: SqlLike,
   collection: string,
   id: string,
@@ -545,7 +581,7 @@ export function deleteFromMetamodel(
 /**
  * Inspect a table's schema (debug helper).
  */
-export function inspectTableSchema(
+function inspectTableSchema(
   sql: SqlLike,
   table: string,
 ): Record<string, any> {
@@ -567,7 +603,7 @@ export function inspectTableSchema(
 /**
  * Wipe all metamodel data for a domain.
  */
-export function wipeDomainMetamodelData(
+function wipeDomainMetamodelData(
   sql: SqlLike,
   domainId: string,
 ): { deleted: boolean; domainId: string; counts: Record<string, any> } {
@@ -598,109 +634,12 @@ export function wipeDomainMetamodelData(
 /**
  * Wipe all data from all tables (for testing/reset).
  */
-export function wipeAllMetamodelData(sql: SqlLike): void {
+function wipeAllMetamodelData(sql: SqlLike): void {
   try { sql.exec('PRAGMA foreign_keys = OFF') } catch { /* best effort */ }
   for (const table of WIPE_TABLES) {
     try { sql.exec(`DELETE FROM ${table}`) } catch { /* table may not exist yet */ }
   }
   try { sql.exec('PRAGMA foreign_keys = ON') } catch { /* best effort */ }
-}
-
-/**
- * Apply the domain schema: execute DDL to create/alter tables for entity instances.
- *
- * When `precomputed` is provided, it is used directly instead of running
- * generateOpenAPI + generateSQLite. This is useful for testing without
- * the full generation pipeline.
- *
- * When `precomputed` is omitted, builds a DomainModel from the metamodel
- * tables, generates an OpenAPI schema, converts it to SQLite DDL, executes
- * the DDL, and caches the resulting table/field maps in the generators table.
- */
-export async function applyDomainSchema(
-  sql: SqlLike,
-  domainId: string,
-  precomputed?: { ddl: string[]; tableMap: Record<string, string>; fieldMap: Record<string, Record<string, string>> },
-): Promise<{ tableMap: Record<string, string>; fieldMap: Record<string, Record<string, string>> }> {
-  let ddl: string[]
-  let tableMap: Record<string, string>
-  let fieldMap: Record<string, Record<string, string>>
-
-  if (precomputed) {
-    ddl = precomputed.ddl
-    tableMap = precomputed.tableMap
-    fieldMap = precomputed.fieldMap
-  } else {
-    // Build a DomainModel from the metamodel tables in this DO
-    const { SqlDataLoader } = await import('./model/domain-model')
-    // SqlDataLoader expects SqlStorage (exec returning Iterable<Row>).
-    // Cloudflare's sql.exec() returns a cursor that is both iterable AND
-    // has .toArray(), so we cast here.
-    const loader = new SqlDataLoader(sql as any)
-    const { DomainModel } = await import('./model/domain-model')
-    const model = new DomainModel(loader, domainId)
-    model.invalidate()
-
-    const openapi = await (await import('./generate/openapi')).generateOpenAPI(model)
-    const result = (await import('./generate/sqlite')).generateSQLite(openapi)
-    ddl = result.ddl
-    tableMap = result.tableMap
-    fieldMap = result.fieldMap
-  }
-
-  // Apply DDL — CREATE TABLE IF NOT EXISTS, ALTER TABLE ADD COLUMN for new columns
-  for (const statement of ddl) {
-    if (statement.startsWith('CREATE TABLE')) {
-      // Convert to IF NOT EXISTS
-      const safe = statement.replace('CREATE TABLE', 'CREATE TABLE IF NOT EXISTS')
-      try { sql.exec(safe) } catch { /* table exists with different schema */ }
-
-      // Check for new columns and add them
-      const tableMatch = statement.match(/CREATE TABLE (\w+)/)
-      if (tableMatch) {
-        const tableName = tableMatch[1]
-        const existingCols = new Set<string>()
-        try {
-          const pragma = sql.exec(`PRAGMA table_info(${tableName})`).toArray()
-          for (const row of pragma) existingCols.add((row as any).name as string)
-        } catch { continue }
-
-        // Parse columns from DDL
-        const colSection = statement.match(/\(([\s\S]+)\)/)
-        if (colSection) {
-          for (const line of colSection[1].split(',')) {
-            const colMatch = line.trim().match(/^(\w+)\s/)
-            if (colMatch && !existingCols.has(colMatch[1])) {
-              const colDef = line.trim()
-              // Strip NOT NULL and DEFAULT for ALTER TABLE ADD COLUMN
-              const safeCol = colDef.replace(/NOT NULL/g, '').replace(/DEFAULT\s+[^,)]+/g, '').trim()
-              try { sql.exec(`ALTER TABLE ${tableName} ADD COLUMN ${safeCol}`) } catch { /* already exists */ }
-            }
-          }
-        }
-      }
-    } else if (statement.startsWith('CREATE INDEX')) {
-      try { sql.exec(statement) } catch { /* index exists */ }
-    }
-  }
-
-  // Cache the mapping in generators for external consumers
-  const cached = { tableMap, fieldMap, appliedAt: new Date().toISOString() }
-  const existing = sql.exec(
-    "SELECT id FROM generators WHERE domain_id = ? AND output_format = 'schema-map'", domainId,
-  ).toArray()
-  const mapJson = JSON.stringify(cached)
-  const now = new Date().toISOString().replace('T', ' ').replace('Z', '')
-  if (existing.length) {
-    sql.exec('UPDATE generators SET output = ?, updated_at = ? WHERE id = ?', mapJson, now, (existing[0] as any).id)
-  } else {
-    sql.exec(
-      'INSERT INTO generators (id, domain_id, output_format, output, created_at, updated_at, version) VALUES (?, ?, ?, ?, ?, ?, ?)',
-      crypto.randomUUID(), domainId, 'schema-map', mapJson, now, now, 1,
-    )
-  }
-
-  return { tableMap, fieldMap }
 }
 
 // =========================================================================
@@ -747,6 +686,8 @@ export class DomainDB extends DurableObject {
     `)
     this.sql.exec('CREATE INDEX IF NOT EXISTS idx_cdc_events_timestamp ON cdc_events(timestamp)')
     this.sql.exec('CREATE INDEX IF NOT EXISTS idx_cdc_events_table ON cdc_events(table_name, entity_id)')
+    // Batch WAL table — coexists with metamodel tables, will replace them in Task 18
+    initBatchSchema(this.ctx.storage.sql)
     this.initialized = true
   }
 
@@ -789,6 +730,42 @@ export class DomainDB extends DurableObject {
   async setDomainId(id: string): Promise<void> {
     this.ensureInit()
     this.domainId = id
+  }
+
+  // -----------------------------------------------------------------------
+  // Batch WAL methods
+  // -----------------------------------------------------------------------
+
+  /** Create a new batch in the WAL with pending status. */
+  async commitBatch(entities: BatchEntity[]): Promise<Batch> {
+    this.ensureInit()
+    const domain = this.domainId
+    if (!domain) throw new Error('DomainDB: domainId required for commitBatch (call setDomainId first)')
+    return createBatch(this.ctx.storage.sql, domain, entities)
+  }
+
+  /** Retrieve a batch by ID. */
+  async getBatch(id: string): Promise<Batch | null> {
+    this.ensureInit()
+    return getBatch(this.ctx.storage.sql, id)
+  }
+
+  /** Mark a batch as committed. */
+  async markBatchCommitted(id: string): Promise<void> {
+    this.ensureInit()
+    markCommitted(this.ctx.storage.sql, id)
+  }
+
+  /** Mark a batch as failed with an error message. */
+  async markBatchFailed(id: string, error: string): Promise<void> {
+    this.ensureInit()
+    markFailed(this.ctx.storage.sql, id, error)
+  }
+
+  /** Return all pending batches ordered by creation time (oldest first). */
+  async getPendingBatches(): Promise<Batch[]> {
+    this.ensureInit()
+    return getPendingBatches(this.ctx.storage.sql)
   }
 
   /** Find records in a metamodel collection. */

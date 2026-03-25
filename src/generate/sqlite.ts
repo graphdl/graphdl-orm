@@ -11,6 +11,7 @@
 // ---------------------------------------------------------------------------
 
 import { NOUN_TABLE_MAP } from '../collections'
+import type { TableDef } from '../rmap/procedure'
 
 /** Noun name → SQL table name. Checks metamodel mapping first, then generates snake_case plural. */
 export function toTableName(name: string): string {
@@ -335,4 +336,56 @@ export function generateDerivedViews(
   }
 
   return views
+}
+
+// ---------------------------------------------------------------------------
+// generateSQLiteFromRmap — RMAP-driven DDL generation
+// ---------------------------------------------------------------------------
+
+/**
+ * Generate SQLite CREATE TABLE DDL directly from RMAP `TableDef[]` output.
+ *
+ * This is an alternative code path that bypasses the OpenAPI intermediate
+ * representation, consuming pre-computed relational table definitions from
+ * `rmap()` in `src/rmap/procedure.ts`.
+ *
+ * Unlike the OpenAPI-driven `generateSQLite()`, this function does NOT add
+ * system columns (domain_id, created_at, etc.) — the RMAP output is the
+ * authoritative source of columns.
+ */
+export function generateSQLiteFromRmap(tables: TableDef[]): string {
+  const statements: string[] = []
+
+  for (const table of tables) {
+    const columnDefs: string[] = []
+
+    for (const col of table.columns) {
+      let def = `${col.name} ${col.type}`
+      if (!col.nullable) {
+        def += ' NOT NULL'
+      }
+      if (col.references) {
+        def += ` REFERENCES ${col.references}(id)`
+      }
+      columnDefs.push(def)
+    }
+
+    // Primary key constraint
+    if (table.primaryKey.length > 0) {
+      columnDefs.push(`PRIMARY KEY (${table.primaryKey.join(', ')})`)
+    }
+
+    // CHECK constraints
+    if (table.checks && table.checks.length > 0) {
+      for (const check of table.checks) {
+        columnDefs.push(`CHECK (${check})`)
+      }
+    }
+
+    statements.push(
+      `CREATE TABLE ${table.name} (\n  ${columnDefs.join(',\n  ')}\n);`,
+    )
+  }
+
+  return statements.join('\n\n')
 }

@@ -15,7 +15,8 @@
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["GraphDLDB"] },
     { "tag": "v2", "new_sqlite_classes": ["EntityDB", "DomainDB", "RegistryDB"] },
-    { "tag": "v3", "deleted_classes": ["GraphDLDB"] }
+    { "tag": "v3", "deleted_classes": ["GraphDLDB"] },
+    { "tag": "v4" }
   ],
   "vars": {
     "ENVIRONMENT": "production"

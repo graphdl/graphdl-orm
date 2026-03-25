@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest'
 import type { SqlLike } from './registry-do'
-import { initRegistrySchema, registerDomain, indexNoun, resolveNounInRegistry, indexEntity, deindexEntity, getEntityIds } from './registry-do'
+import { initRegistrySchema, registerDomain, indexNoun, resolveNounInRegistry, indexEntity, deindexEntity, getEntityIds, listDomains, resolveSlugByUUID } from './registry-do'
 
 /**
  * In-memory mock of SqlLike that stores rows per table and supports
@@ -13,6 +13,11 @@ function createMockSql(): SqlLike & { tables: Record<string, any[]> } {
     tables,
     exec(query: string, ...params: any[]) {
       const trimmed = query.trim()
+
+      // ALTER TABLE — ignore in mock (migration already handled by CREATE TABLE)
+      if (trimmed.match(/^ALTER\s+TABLE/i)) {
+        return { toArray: () => [] }
+      }
 
       // CREATE TABLE IF NOT EXISTS <name>
       const createMatch = trimmed.match(/CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+(\w+)/i)
@@ -113,6 +118,17 @@ function createMockSql(): SqlLike & { tables: Record<string, any[]> } {
           }
         }
         return { toArray: () => [] }
+      }
+
+      // SELECT entity_id FROM entity_index WHERE noun_type=? AND domain_slug=? AND deleted=0
+      const entityIdDomainSelect = trimmed.match(/SELECT\s+entity_id\s+FROM\s+entity_index\s+WHERE\s+noun_type\s*=\s*\?\s+AND\s+domain_slug\s*=\s*\?\s+AND\s+deleted\s*=\s*0/i)
+      if (entityIdDomainSelect) {
+        const nounType = params[0]
+        const domainSlug = params[1]
+        const rows = (tables['entity_index'] || [])
+          .filter((r: any) => r.noun_type === nounType && r.domain_slug === domainSlug && r.deleted === 0)
+          .map((r: any) => ({ entity_id: r.entity_id }))
+        return { toArray: () => rows }
       }
 
       // SELECT entity_id FROM entity_index WHERE noun_type=? AND deleted=0
@@ -284,6 +300,24 @@ describe('registry-do', () => {
       const ids = getEntityIds(sql, 'Person')
 
       expect(ids).toEqual(['person-1'])
+    })
+  })
+
+  describe('domain-scoped entity_index', () => {
+    it('indexes entities with domain_slug', () => {
+      initRegistrySchema(sql)
+      indexEntity(sql, 'Noun', 'entity-1', 'tickets')
+      indexEntity(sql, 'Noun', 'entity-2', 'billing')
+      const ticketNouns = getEntityIds(sql, 'Noun', 'tickets')
+      expect(ticketNouns).toEqual(['entity-1'])
+    })
+
+    it('returns all entities when no domain filter', () => {
+      initRegistrySchema(sql)
+      indexEntity(sql, 'Noun', 'entity-1', 'tickets')
+      indexEntity(sql, 'Noun', 'entity-2', 'billing')
+      const allNouns = getEntityIds(sql, 'Noun')
+      expect(allNouns).toEqual(['entity-1', 'entity-2'])
     })
   })
 })

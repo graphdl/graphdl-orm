@@ -12,31 +12,6 @@ function mockDb() {
 
   return {
     store,
-    findInCollection: vi.fn(async (collection: string, where: any) => {
-      const all = store[collection] || []
-      const filtered = all.filter((doc: any) => {
-        for (const [key, cond] of Object.entries(where)) {
-          if (typeof cond === 'object' && cond !== null && 'equals' in (cond as any)) {
-            const fieldVal = key === 'domain' ? doc.domain : doc[key]
-            if (fieldVal !== (cond as any).equals) return false
-          }
-        }
-        return true
-      })
-      return { docs: filtered, totalDocs: filtered.length }
-    }),
-    createInCollection: vi.fn(async (collection: string, body: any) => {
-      const doc = { id: `id-${++idCounter}`, ...body }
-      if (!store[collection]) store[collection] = []
-      store[collection].push(doc)
-      return doc
-    }),
-    updateInCollection: vi.fn(async (collection: string, id: string, updates: any) => {
-      const coll = store[collection] || []
-      const doc = coll.find((d: any) => d.id === id)
-      if (doc) Object.assign(doc, updates)
-      return doc
-    }),
     createEntity: vi.fn(async (domainId: string, nounName: string, fields: any, reference?: string) => {
       const doc = { id: `entity-${++idCounter}`, domain: domainId, noun: nounName, reference, ...fields }
       const key = `entities_${nounName}`

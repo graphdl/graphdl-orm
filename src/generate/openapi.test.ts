@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest'
-import { generateOpenAPI } from './openapi'
+import { generateOpenAPI, generateOpenAPIFromRmap } from './openapi'
+import type { TableDef } from '../rmap/procedure'
 import {
   createMockModel,
   mkNounDef,
@@ -648,5 +649,156 @@ describe('generateOpenAPI', () => {
     // Car should inherit mileage from Vehicle
     expect(s['Car']?.properties?.mileage).toBeDefined()
     expect(s['Car']?.properties?.mileage?.type).toBe('integer')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// generateOpenAPIFromRmap tests
+// ---------------------------------------------------------------------------
+
+describe('generateOpenAPIFromRmap', () => {
+  it('returns valid OpenAPI 3.0 structure', () => {
+    const result = generateOpenAPIFromRmap([], 'Test') as any
+    expect(result.openapi).toBe('3.0.0')
+    expect(result.info.title).toBe('Test Schema (RMAP)')
+    expect(result.info.version).toBe('1.0.0')
+    expect(result.components.schemas).toEqual({})
+  })
+
+  it('converts table to component schema with properties', () => {
+    const tables: TableDef[] = [{
+      name: 'person',
+      primaryKey: ['id'],
+      columns: [
+        { name: 'id', type: 'TEXT', nullable: false },
+        { name: 'name', type: 'TEXT', nullable: false },
+        { name: 'age', type: 'INTEGER', nullable: true },
+      ],
+    }]
+    const result = generateOpenAPIFromRmap(tables, 'University') as any
+    const schema = result.components.schemas['Person']
+
+    expect(schema).toBeDefined()
+    expect(schema.type).toBe('object')
+    expect(schema.properties.id.type).toBe('string')
+    expect(schema.properties.name.type).toBe('string')
+    expect(schema.properties.age.type).toBe('integer')
+  })
+
+  it('marks NOT NULL columns as required', () => {
+    const tables: TableDef[] = [{
+      name: 'person',
+      primaryKey: ['id'],
+      columns: [
+        { name: 'id', type: 'TEXT', nullable: false },
+        { name: 'name', type: 'TEXT', nullable: false },
+        { name: 'nickname', type: 'TEXT', nullable: true },
+      ],
+    }]
+    const result = generateOpenAPIFromRmap(tables, 'Test') as any
+    const schema = result.components.schemas['Person']
+
+    expect(schema.required).toContain('id')
+    expect(schema.required).toContain('name')
+    expect(schema.required).not.toContain('nickname')
+  })
+
+  it('generates $ref for FK references', () => {
+    const tables: TableDef[] = [{
+      name: 'person',
+      primaryKey: ['id'],
+      columns: [
+        { name: 'id', type: 'TEXT', nullable: false },
+        { name: 'country_id', type: 'TEXT', nullable: true, references: 'country' },
+      ],
+    }]
+    const result = generateOpenAPIFromRmap(tables, 'Test') as any
+    const schema = result.components.schemas['Person']
+
+    expect(schema.properties.country_id.oneOf).toBeDefined()
+    expect(schema.properties.country_id.oneOf).toEqual(
+      expect.arrayContaining([
+        { $ref: '#/components/schemas/Country' },
+      ]),
+    )
+  })
+
+  it('converts CHECK IN constraints to enum values', () => {
+    const tables: TableDef[] = [{
+      name: 'person',
+      primaryKey: ['id'],
+      columns: [
+        { name: 'id', type: 'TEXT', nullable: false },
+        { name: 'sex', type: 'TEXT', nullable: false },
+      ],
+      checks: ["sex IN ('male', 'female')"],
+    }]
+    const result = generateOpenAPIFromRmap(tables, 'Test') as any
+    const schema = result.components.schemas['Person']
+
+    expect(schema.properties.sex.enum).toEqual(['male', 'female'])
+  })
+
+  it('handles multiple tables', () => {
+    const tables: TableDef[] = [
+      {
+        name: 'person',
+        primaryKey: ['id'],
+        columns: [
+          { name: 'id', type: 'TEXT', nullable: false },
+          { name: 'name', type: 'TEXT', nullable: false },
+        ],
+      },
+      {
+        name: 'country',
+        primaryKey: ['id'],
+        columns: [
+          { name: 'id', type: 'TEXT', nullable: false },
+        ],
+      },
+    ]
+    const result = generateOpenAPIFromRmap(tables, 'Test') as any
+
+    expect(result.components.schemas['Person']).toBeDefined()
+    expect(result.components.schemas['Country']).toBeDefined()
+  })
+
+  it('converts snake_case table names to PascalCase schema names', () => {
+    const tables: TableDef[] = [{
+      name: 'person_teaches_course',
+      primaryKey: ['person_id', 'course_id'],
+      columns: [
+        { name: 'person_id', type: 'TEXT', nullable: false, references: 'person' },
+        { name: 'course_id', type: 'TEXT', nullable: false, references: 'course' },
+      ],
+    }]
+    const result = generateOpenAPIFromRmap(tables, 'Test') as any
+
+    expect(result.components.schemas['PersonTeachesCourse']).toBeDefined()
+  })
+
+  it('maps REAL type to number', () => {
+    const tables: TableDef[] = [{
+      name: 'product',
+      primaryKey: ['id'],
+      columns: [
+        { name: 'id', type: 'TEXT', nullable: false },
+        { name: 'price', type: 'REAL', nullable: false },
+      ],
+    }]
+    const result = generateOpenAPIFromRmap(tables, 'Test') as any
+    expect(result.components.schemas['Product'].properties.price.type).toBe('number')
+  })
+
+  it('does not set required array when all columns are nullable', () => {
+    const tables: TableDef[] = [{
+      name: 'optional_data',
+      primaryKey: [],
+      columns: [
+        { name: 'value', type: 'TEXT', nullable: true },
+      ],
+    }]
+    const result = generateOpenAPIFromRmap(tables, 'Test') as any
+    expect(result.components.schemas['OptionalData'].required).toBeUndefined()
   })
 })

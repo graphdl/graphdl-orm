@@ -108,7 +108,7 @@ Function Type is a value type.
   The possible values of Function Type are 'httpCallback', 'query', 'agentInvocation', 'transform'.
 
 Scope is a value type.
-  The possible values of Scope are 'local', 'app', 'organization', 'public'.
+  The possible values of Scope are 'organization', 'public'.
 
 ## Fact Types
 

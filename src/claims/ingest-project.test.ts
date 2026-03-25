@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from 'vitest'
 import { ingestProject, type ExtractedClaims } from './ingest'
 
 // ---------------------------------------------------------------------------
-// Mock DB (same pattern as steps.test.ts)
+// Mock DB — only needed for instance facts (createEntity) and applySchema
 // ---------------------------------------------------------------------------
 
 function mockDb() {
@@ -11,31 +11,6 @@ function mockDb() {
 
   return {
     store,
-    findInCollection: vi.fn(async (collection: string, where: any, opts?: any) => {
-      const all = store[collection] || []
-      const filtered = all.filter((doc: any) => {
-        for (const [key, cond] of Object.entries(where)) {
-          if (typeof cond === 'object' && cond !== null && 'equals' in (cond as any)) {
-            const fieldVal = key === 'domain' ? doc.domain : doc[key]
-            if (fieldVal !== (cond as any).equals) return false
-          }
-        }
-        return true
-      })
-      return { docs: filtered, totalDocs: filtered.length }
-    }),
-    createInCollection: vi.fn(async (collection: string, body: any) => {
-      const doc = { id: `id-${++idCounter}`, ...body }
-      if (!store[collection]) store[collection] = []
-      store[collection].push(doc)
-      return doc
-    }),
-    updateInCollection: vi.fn(async (collection: string, id: string, updates: any) => {
-      const coll = store[collection] || []
-      const doc = coll.find((d: any) => d.id === id)
-      if (doc) Object.assign(doc, updates)
-      return doc
-    }),
     createEntity: vi.fn(async (domainId: string, nounName: string, fields: any, reference?: string) => {
       const doc = { id: `entity-${++idCounter}`, domain: domainId, noun: nounName, reference, ...fields }
       const key = `entities_${nounName}`
@@ -53,6 +28,14 @@ function mockDb() {
 
 function emptyClaims(overrides: Partial<ExtractedClaims> = {}): ExtractedClaims {
   return { nouns: [], readings: [], constraints: [], ...overrides }
+}
+
+// ---------------------------------------------------------------------------
+// Helper: extract entities of a given type from a batch
+// ---------------------------------------------------------------------------
+
+function batchEntities(result: { batch: { entities: any[] } }, type: string) {
+  return result.batch.entities.filter((e: any) => e.type === type)
 }
 
 // ---------------------------------------------------------------------------
@@ -191,10 +174,11 @@ describe('ingestProject', () => {
     expect(result.totals.nouns).toBe(3)
     expect(result.totals.readings).toBe(2)
 
-    // The 'Currency' noun should exist only once in the DB store for domain d1
-    // (Domain 2 and 3 resolve it from scope, but ensureNoun will create a
-    // domain-local copy when auto-creating for readings — that's expected behavior)
-    const currencyNouns = db.store.nouns.filter((n: any) => n.name === 'Currency')
+    // The 'Currency' noun should exist in the batch (may have domain-local copies
+    // when auto-creating for readings — that's expected behavior)
+    const currencyNouns = batchEntities(result, 'Noun').filter(
+      (e: any) => e.data.name === 'Currency',
+    )
     expect(currencyNouns.length).toBeGreaterThanOrEqual(1)
   })
 
@@ -236,6 +220,10 @@ describe('ingestProject', () => {
     expect(result.totals).toHaveProperty('readings')
     expect(result.totals).toHaveProperty('stateMachines')
     expect(result.totals).toHaveProperty('errors')
+
+    // Combined batch should have all entities
+    expect(result.batch).toBeDefined()
+    expect(result.batch.entities.length).toBeGreaterThanOrEqual(2)
   })
 
   it('handles empty domains array gracefully', async () => {
@@ -248,5 +236,6 @@ describe('ingestProject', () => {
     expect(result.totals.readings).toBe(0)
     expect(result.totals.stateMachines).toBe(0)
     expect(result.totals.errors).toHaveLength(0)
+    expect(result.batch.entities).toHaveLength(0)
   })
 })
