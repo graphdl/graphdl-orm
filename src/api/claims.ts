@@ -15,6 +15,7 @@ import { json, error } from 'itty-router'
 import type { Env } from '../types'
 import { ingestClaims, ingestProject } from '../claims/ingest'
 import type { ExtractedClaims } from '../claims/ingest'
+import { persistViolations } from '../worker/outcomes'
 
 function getDB(env: Env) {
   const id = env.DOMAIN_DB.idFromName('graphdl-primary')
@@ -92,6 +93,21 @@ export async function handleClaims(request: Request, env: Env): Promise<Response
       ? await ensureDomain(env, registry, domainSlug)
       : { id: domainId }
     const result = await ingestClaims(db as any, { claims, domainId: domain!.id })
+
+    // Persist violations as Violation entities (best-effort)
+    if (result.batch?.entities) {
+      const violationEntities = result.batch.entities.filter((e: any) => e.type === 'Violation')
+      if (violationEntities.length > 0) {
+        persistViolations(env, violationEntities.map((e: any) => ({
+          domain: domainSlug || domain!.id,
+          constraintId: e.data?.constraintId || null,
+          text: e.data?.text || e.data?.message || 'CSDP validation violation',
+          severity: e.data?.severity || 'error',
+          functionId: e.data?.functionId || null,
+        }))).catch(() => { /* best-effort */ })
+      }
+    }
+
     return json({ ...result, domainId: domain!.id })
   }
 
