@@ -233,6 +233,7 @@ Constraint is of Constraint Type.
 Constraint has modality of Modality Type.
 Constraint has Text.
   Each Constraint has at most one Text.
+Constraint is semantic.
 Constraint spans Role.
 
 ### Constraint Type
