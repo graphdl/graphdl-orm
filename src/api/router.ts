@@ -923,19 +923,5 @@ router.all('/parse', handleParse)
 router.all('/parse/orm', handleParseOrm)
 router.all('/verify', handleVerify)
 
-// ── State Machine RPC ────────────────────────────────────────────────
-router.get('/api/state/*', async (request, env: Env) => {
-  const { handleGetState } = await import('./state')
-  return handleGetState(request, env)
-})
-router.post('/api/state/*', async (request, env: Env) => {
-  const { handleSendEvent } = await import('./state')
-  return handleSendEvent(request, env)
-})
-router.delete('/api/state/*', async (request, env: Env) => {
-  const { handleDeleteState } = await import('./state')
-  return handleDeleteState(request, env)
-})
-
 // ── 404 fallback ─────────────────────────────────────────────────────
 router.all('*', () => error(404, { errors: [{ message: 'Not Found' }] }))
