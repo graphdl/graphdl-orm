@@ -17,6 +17,7 @@ import { ingestClaims, ingestProject } from '../claims/ingest'
 import type { ExtractedClaims } from '../claims/ingest'
 import { persistViolations } from '../worker/outcomes'
 import { materializeBatch } from '../worker/materialize'
+import { deriveSemanticFlags } from '../worker/derive-semantic'
 import { ensureDomain } from './ensure-domain'
 
 function getDB(env: Env) {
@@ -94,6 +95,19 @@ export async function handleClaims(request: Request, env: Env): Promise<Response
         }
       }
     }
+
+    // Derive isSemantic flag on constraints (best-effort, post-materialization)
+    deriveSemanticFlags(resolvedSlug, {
+      getEntityIds: (type: string, domain?: string) => registry.getEntityIds(type, domain),
+      getEntity: async (id: string) => {
+        const stub = env.ENTITY_DB.get(env.ENTITY_DB.idFromName(id)) as any
+        return stub.get()
+      },
+      patchEntity: async (id: string, fields: Record<string, unknown>) => {
+        const stub = env.ENTITY_DB.get(env.ENTITY_DB.idFromName(id)) as any
+        await stub.patch(fields)
+      },
+    }).catch(() => { /* best-effort */ })
 
     // Persist violations as Violation entities (best-effort)
     if (result.batch?.entities) {
