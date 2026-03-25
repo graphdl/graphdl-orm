@@ -123,15 +123,39 @@ router.post('/api/facts', async (request, env: Env) => {
     return error(400, { errors: [{ message: 'graphSchemaId+bindings or facts[] required' }] })
   }
 
-  // Load nouns and readings for this domain
-  const nouns = await db.findInCollection('nouns', { domain: { equals: body.domainId } }, { limit: 1000 })
-  const nounByName = new Map<string, any>()
-  for (const n of nouns.docs) nounByName.set(n.name, n)
+  // Load nouns and readings for this domain via Registry+EntityDB fan-out
+  const registry = getRegistryDO(env, 'global') as any
 
-  const readings = await db.findInCollection('readings', { domain: { equals: body.domainId } }, { limit: 1000 })
+  const [nounIds, readingIds] = await Promise.all([
+    registry.getEntityIds('Noun', body.domainId) as Promise<string[]>,
+    registry.getEntityIds('Reading', body.domainId) as Promise<string[]>,
+  ])
+
+  const [nounSettled, readingSettled] = await Promise.all([
+    Promise.allSettled(nounIds.map(async (nid: string) => {
+      const stub = getEntityDO(env, nid) as any
+      return stub.get()
+    })),
+    Promise.allSettled(readingIds.map(async (rid: string) => {
+      const stub = getEntityDO(env, rid) as any
+      return stub.get()
+    })),
+  ])
+
+  const nounByName = new Map<string, any>()
+  for (const r of nounSettled) {
+    if (r.status === 'fulfilled' && r.value && !r.value.deletedAt) {
+      const n = { id: r.value.id, ...r.value.data }
+      if (n.name) nounByName.set(n.name, n)
+    }
+  }
+
   const schemaByReading = new Map<string, string>()
-  for (const r of readings.docs) {
-    if (r.text && r.graphSchema) schemaByReading.set(r.text, r.graphSchema)
+  for (const r of readingSettled) {
+    if (r.status === 'fulfilled' && r.value && !r.value.deletedAt) {
+      const rd = r.value.data
+      if (rd.text && rd.graphSchema) schemaByReading.set(rd.text, rd.graphSchema)
+    }
   }
 
   const results: any[] = []
