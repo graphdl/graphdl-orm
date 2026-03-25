@@ -16,6 +16,7 @@ import type { Env } from '../types'
 import { ingestClaims, ingestProject } from '../claims/ingest'
 import type { ExtractedClaims } from '../claims/ingest'
 import { persistViolations } from '../worker/outcomes'
+import { materializeBatch } from '../worker/materialize'
 
 function getDB(env: Env) {
   const id = env.DOMAIN_DB.idFromName('graphdl-primary')
@@ -93,6 +94,25 @@ export async function handleClaims(request: Request, env: Env): Promise<Response
       ? await ensureDomain(env, registry, domainSlug)
       : { id: domainId }
     const result = await ingestClaims(db as any, { claims, domainId: domain!.id })
+
+    // Materialize batch entities to EntityDB DOs + Registry
+    // Batch entities use domain UUID internally; Registry indexes by slug
+    const resolvedSlug = domainSlug || (domain as any)?.domainSlug || domain!.id
+    if (result.batch?.entities?.length) {
+      const nonViolationEntities = result.batch.entities
+        .filter((e: any) => e.type !== 'Violation')
+        .map((e: any) => ({ ...e, domain: resolvedSlug }))
+      if (nonViolationEntities.length > 0) {
+        const materializeResult = await materializeBatch(
+          nonViolationEntities,
+          (id: string) => env.ENTITY_DB.get(env.ENTITY_DB.idFromName(id)) as any,
+          registry,
+        )
+        if (materializeResult.failed.length > 0) {
+          console.error('Materialization failures:', materializeResult.failed)
+        }
+      }
+    }
 
     // Persist violations as Violation entities (best-effort)
     if (result.batch?.entities) {
