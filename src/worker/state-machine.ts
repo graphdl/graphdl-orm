@@ -92,7 +92,9 @@ export async function getInitialState(
 
     initialStatus = statuses[0]
     for (const s of statuses) {
-      const hasIncoming = allTransitions.some(t => t.data.to === s.id || t.data.toId === s.id)
+      const hasIncoming = allTransitions.some(t =>
+        t.data.to === s.id || t.data.toId === s.id || t.data.toStatus === (s.data.name as string)
+      )
       if (!hasIncoming) {
         initialStatus = s
         break

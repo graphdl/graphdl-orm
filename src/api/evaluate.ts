@@ -43,11 +43,41 @@ export async function handleEvaluate(request: Request, env: Env): Promise<Respon
 
   const db = getDB(env) as any
 
-  // Load domain schema from generators collection
-  const genResult = await db.findInCollection('generators', {
+  // Load domain schema from generators collection.
+  // The generators table may store the domain key as a slug (from generate.ts)
+  // or as a UUID (from claims.ts auto-generation). Try the domainId as-is first,
+  // then resolve slug→UUID and retry if needed.
+  let genResult = await db.findInCollection('generators', {
     domain: { equals: body.domainId },
     outputFormat: { equals: 'schema' },
   }, { limit: 1 })
+
+  if (!genResult?.docs?.[0]) {
+    // domainId might be a slug — resolve to UUID via Registry+EntityDB
+    try {
+      const registry = env.REGISTRY_DB.get(env.REGISTRY_DB.idFromName('global')) as any
+      const domainIds: string[] = await registry.getEntityIds('Domain', body.domainId)
+      if (domainIds.length > 0) {
+        const domainEntity = await (env.ENTITY_DB.get(env.ENTITY_DB.idFromName(domainIds[0])) as any).get()
+        if (domainEntity) {
+          const uuid = domainEntity.id as string
+          // Retry generators lookup with the resolved UUID
+          genResult = await db.findInCollection('generators', {
+            domain: { equals: uuid },
+            outputFormat: { equals: 'schema' },
+          }, { limit: 1 })
+          // Also check the slug-named DomainDB DO (claims.ts auto-gen stores there)
+          if (!genResult?.docs?.[0]) {
+            const slugDB = env.DOMAIN_DB.get(env.DOMAIN_DB.idFromName(body.domainId)) as any
+            genResult = await slugDB.findInCollection('generators', {
+              domain: { equals: uuid },
+              outputFormat: { equals: 'schema' },
+            }, { limit: 1 })
+          }
+        }
+      }
+    } catch { /* resolution failed — continue with null genResult */ }
+  }
 
   // Deterministic text check — runs regardless of FOL schema availability
   const { checkDeterministicText, buildTextConstraints } = await import('../worker/deterministic-text-check')
@@ -199,11 +229,35 @@ export async function handleSynthesize(request: Request, env: Env): Promise<Resp
 
   const db = getDB(env) as any
 
-  // Load domain schema
-  const genResult = await db.findInCollection('generators', {
+  // Load domain schema — same slug→UUID resolution as handleEvaluate
+  let genResult = await db.findInCollection('generators', {
     domain: { equals: body.domainId },
     outputFormat: { equals: 'schema' },
   }, { limit: 1 })
+
+  if (!genResult?.docs?.[0]) {
+    try {
+      const registry = env.REGISTRY_DB.get(env.REGISTRY_DB.idFromName('global')) as any
+      const domainIds: string[] = await registry.getEntityIds('Domain', body.domainId)
+      if (domainIds.length > 0) {
+        const domainEntity = await (env.ENTITY_DB.get(env.ENTITY_DB.idFromName(domainIds[0])) as any).get()
+        if (domainEntity) {
+          const uuid = domainEntity.id as string
+          genResult = await db.findInCollection('generators', {
+            domain: { equals: uuid },
+            outputFormat: { equals: 'schema' },
+          }, { limit: 1 })
+          if (!genResult?.docs?.[0]) {
+            const slugDB = env.DOMAIN_DB.get(env.DOMAIN_DB.idFromName(body.domainId!)) as any
+            genResult = await slugDB.findInCollection('generators', {
+              domain: { equals: uuid },
+              outputFormat: { equals: 'schema' },
+            }, { limit: 1 })
+          }
+        }
+      }
+    } catch { /* resolution failed */ }
+  }
 
   const schemaOutput = genResult?.docs?.[0]?.output
   if (!schemaOutput) {
