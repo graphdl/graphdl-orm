@@ -324,4 +324,37 @@ export class RegistryDB extends DurableObject {
     this.ensureInit()
     return getEntityCounts(this.ctx.storage.sql, domainSlug)
   }
+
+  /**
+   * Materialize a batch of entities: fan out to EntityDB DOs + index in Registry.
+   * Runs INSIDE the Registry DO — no subrequest limit on DO-to-DO calls.
+   * All entities are materialized in parallel (one Promise.allSettled).
+   */
+  async materializeBatch(
+    entities: Array<{ id: string; type: string; domain: string; data: Record<string, unknown> }>,
+  ): Promise<{ materialized: number; failed: string[] }> {
+    this.ensureInit()
+    const entityDB = (this.env as any).ENTITY_DB as DurableObjectNamespace
+
+    const results = await Promise.allSettled(
+      entities.map(async (entity) => {
+        const stub = entityDB.get(entityDB.idFromName(entity.id)) as any
+        await stub.put({ id: entity.id, type: entity.type, data: entity.data })
+        indexEntity(this.ctx.storage.sql, entity.type, entity.id, entity.domain)
+        if (entity.type === 'Noun') {
+          const name = entity.data.name as string
+          if (name) indexNoun(this.ctx.storage.sql, name, entity.domain)
+        }
+      }),
+    )
+
+    let materialized = 0
+    const failed: string[] = []
+    for (let i = 0; i < results.length; i++) {
+      if (results[i].status === 'fulfilled') materialized++
+      else failed.push(entities[i].id)
+    }
+
+    return { materialized, failed }
+  }
 }
