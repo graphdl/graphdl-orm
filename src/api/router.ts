@@ -841,8 +841,8 @@ router.all('/seed', handleSeed)
 router.all('/claims', handleSeed)
 
 // ── Domain wipe (metamodel only — nouns, readings, constraints, roles, etc.) ──
-// Deindex from Registry — EntityDB DOs become orphaned (unreachable).
-router.delete('/api/domains/:domainId/metamodel', async (request, env: Env) => {
+// Deindex from Registry — EntityDB DOs become orphaned. Background cleanup.
+router.delete('/api/domains/:domainId/metamodel', async (request, env: Env, ctx: ExecutionContext) => {
   const { domainId } = request.params
   const registry = getRegistryDO(env, 'global') as any
 
@@ -859,6 +859,19 @@ router.delete('/api/domains/:domainId/metamodel', async (request, env: Env) => {
     await db.wipeDomainMetamodel(domainId)
   } catch { /* best effort */ }
 
+  // Background: soft-delete orphaned DOs
+  if (entities.length > 0) {
+    const BATCH = 50
+    ctx.waitUntil((async () => {
+      for (let i = 0; i < entities.length; i += BATCH) {
+        const chunk = entities.slice(i, i + BATCH)
+        await Promise.allSettled(
+          chunk.map(({ entityId }) => (getEntityDO(env, entityId) as any).delete()),
+        )
+      }
+    })())
+  }
+
   return json({
     deleted: true,
     domainId,
@@ -866,21 +879,22 @@ router.delete('/api/domains/:domainId/metamodel', async (request, env: Env) => {
       entitiesOrphaned: entities.length,
       entitiesDeindexed: deindexedEntities,
       nounsDeindexed: deindexedNouns,
+      cleanupScheduled: entities.length > 0,
     },
   })
 })
 
 // ── Full reset (delete ALL data from ALL tables) ────────────────────
 // Wipe the Registry index — EntityDB DOs become orphaned (unreachable).
-// No need to soft-delete individual DOs; if nothing references them, they're dead.
-router.delete('/api/reset', async (request, env: Env) => {
+// Background process cleans up orphaned DOs after response is sent.
+router.delete('/api/reset', async (request, env: Env, ctx: ExecutionContext) => {
   const registry = getRegistryDO(env, 'global') as any
 
-  // Count before wiping
+  // Collect entity IDs before wiping
   const entities = await registry.getAllEntityIds() as Array<{ nounType: string; entityId: string }>
   const entityCount = entities.length
 
-  // Wipe all Registry tables (entity_index, noun_index, domains) — instant
+  // Wipe all Registry tables — instant
   await registry.wipeAll()
 
   // Wipe DomainDB SQL tables (generators, etc.)
@@ -889,10 +903,24 @@ router.delete('/api/reset', async (request, env: Env) => {
     await db.wipeAllData()
   } catch { /* best effort */ }
 
+  // Background: soft-delete orphaned DOs (fire and forget)
+  if (entities.length > 0) {
+    const BATCH = 50
+    ctx.waitUntil((async () => {
+      for (let i = 0; i < entities.length; i += BATCH) {
+        const chunk = entities.slice(i, i + BATCH)
+        await Promise.allSettled(
+          chunk.map(({ entityId }) => (getEntityDO(env, entityId) as any).delete()),
+        )
+      }
+    })())
+  }
+
   return json({
     reset: true,
     counts: {
       entitiesOrphaned: entityCount,
+      cleanupScheduled: entityCount > 0,
     },
   })
 })
