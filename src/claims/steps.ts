@@ -518,13 +518,21 @@ export async function ingestFacts(
         const valueTypeName = values[1].noun
         let fieldName: string
 
-        if (predicate === 'has' || predicate === 'has') {
-          // Simple "has" predicate — field name is just the value type
+        // Prepositional predicates need disambiguation in the field name:
+        // "is from Status" → fromStatus, "is to Status" → toStatus
+        // "is triggered by Event Type" → triggeredByEventType
+        // Simple predicates use just the value type name:
+        // "has Name" → name, "belongs to Department" → department
+        const isPrepositional = /^is\s+(from|to|by|in|for)\b/.test(predicate)
+          || /^is\s+\w+\s+(from|to|by|in|for)\b/.test(predicate)
+
+        if (!isPrepositional) {
+          // Simple predicate — field name is just the value type
           fieldName = valueTypeName.split(' ')
             .map((w: string, i: number) => i === 0 ? w.toLowerCase() : w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
             .join('')
         } else {
-          // Compound predicate — include it in the field name
+          // Prepositional predicate — include it in the field name
           // "is from" + "Status" → "fromStatus"
           // "is to" + "Status" → "toStatus"
           // "is triggered by" + "Event Type" → "triggeredByEventType"
