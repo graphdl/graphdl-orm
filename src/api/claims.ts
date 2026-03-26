@@ -96,6 +96,35 @@ export async function handleClaims(request: Request, env: Env): Promise<Response
       }
     }
 
+    // Auto-generate schema for FOL evaluation (best-effort, post-materialization)
+    // This eliminates the manual POST /api/generate step.
+    try {
+      const { DomainModel } = await import('../model/domain-model')
+      const { EntityDataLoader } = await import('../model/entity-data-loader')
+      const { generateSchema } = await import('../generate/schema')
+      const loader = new EntityDataLoader(registry, (id: string) => env.ENTITY_DB.get(env.ENTITY_DB.idFromName(id)) as any)
+      const model = new DomainModel(loader, resolvedSlug)
+      const schema = await generateSchema(model)
+      // Persist to DomainDB generators cache
+      const domainDO = env.DOMAIN_DB.get(env.DOMAIN_DB.idFromName(resolvedSlug)) as any
+      try {
+        const existing = await domainDO.findInCollection('generators', {
+          domain: { equals: domain!.id },
+          outputFormat: { equals: 'schema' },
+        }, { limit: 1 })
+        if (existing?.docs?.[0]) {
+          await domainDO.updateInCollection('generators', existing.docs[0].id, { output: JSON.stringify(schema) })
+        } else {
+          await domainDO.createInCollection('generators', {
+            domain: domain!.id,
+            outputFormat: 'schema',
+            title: `${resolvedSlug} schema`,
+            output: JSON.stringify(schema),
+          })
+        }
+      } catch { /* generators cache write failed — non-fatal */ }
+    } catch { /* schema generation failed — non-fatal */ }
+
     // Derive isSemantic flag on constraints (best-effort, post-materialization)
     deriveSemanticFlags(resolvedSlug, {
       getEntityIds: (type: string, domain?: string) => registry.getEntityIds(type, domain),
