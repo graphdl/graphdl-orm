@@ -62,14 +62,21 @@ export async function getInitialState(
 
   // Load state machine definitions for this noun
   const defs = await loadEntities(registry, getStub, 'State Machine Definition', domain)
-  const def = defs.find(d => d.data.noun === nounId || d.data.nounId === nounId)
+  const def = defs.find(d =>
+    d.data.noun === nounId || d.data.nounId === nounId ||
+    d.data.forNoun === nounName || d.data.noun === nounName ||
+    d.data.name === nounName,
+  )
   if (!def) return null
   const defId = def.id
 
   // Load statuses for this definition
   const allStatuses = await loadEntities(registry, getStub, 'Status', domain)
+  const defName = def.data.name as string || ''
   const statuses = allStatuses.filter(s =>
-    s.data.stateMachineDefinition === defId || s.data.stateMachineDefinitionId === defId,
+    s.data.stateMachineDefinition === defId || s.data.stateMachineDefinitionId === defId ||
+    s.data.definedInStateMachineDefinition === defId || s.data.definedInStateMachineDefinition === defName ||
+    s.data.stateMachineDefinition === defName,
   )
   if (!statuses.length) return null
 
@@ -113,28 +120,42 @@ export async function getValidTransitions(
   domain?: string,
 ): Promise<TransitionOption[]> {
   // Load transitions for this definition from the current status
+  // Load all transitions and statuses for this domain
   const allTransitions = await loadEntities(registry, getStub, 'Transition', domain)
-  const transitions = allTransitions.filter(t =>
-    (t.data.from === currentStatusId || t.data.fromId === currentStatusId) &&
-    (t.data.stateMachineDefinition === definitionId || t.data.stateMachineDefinitionId === definitionId),
-  )
+  const allStatuses = await loadEntities(registry, getStub, 'Status', domain)
+
+  // Resolve current status name for name-based matching
+  const currentStatus = allStatuses.find(s => s.id === currentStatusId)
+  const currentStatusName = currentStatus?.data.name as string || ''
+
+  // Filter transitions from the current status
+  // Support both ID-based (fromId) and name-based (fromStatus) references
+  const transitions = allTransitions.filter(t => {
+    const fromMatch = t.data.from === currentStatusId || t.data.fromId === currentStatusId ||
+      t.data.fromStatus === currentStatusName || t.data.from === currentStatusName
+    return fromMatch
+  })
 
   const options: TransitionOption[] = []
   for (const t of transitions) {
-    const toId = (t.data.to || t.data.toId) as string
-    const eventTypeId = (t.data.eventType || t.data.eventTypeId) as string
+    // Resolve target status — by ID or by name
+    const toRef = (t.data.to || t.data.toId || t.data.toStatus) as string
+    let targetStatus = toRef ? await loadEntity(getStub, toRef).catch(() => null) : null
+    if (!targetStatus) {
+      targetStatus = allStatuses.find(s => s.data.name === toRef) || null
+    }
 
-    // Resolve target status and event type by direct entity lookup
-    const [targetStatus, eventType] = await Promise.all([
-      toId ? loadEntity(getStub, toId) : null,
-      eventTypeId ? loadEntity(getStub, eventTypeId) : null,
-    ])
+    // Resolve event type — by ID or by name
+    const eventRef = (t.data.eventType || t.data.eventTypeId || t.data.triggeredByEventType) as string
+    let eventType = eventRef ? await loadEntity(getStub, eventRef).catch(() => null) : null
+    // If event is referenced by name (not a UUID), use it directly
+    const eventName = eventType?.data.name as string || eventRef || ''
 
-    if (targetStatus && eventType) {
+    if (targetStatus) {
       options.push({
         transitionId: t.id,
-        event: eventType.data.name as string,
-        eventTypeId,
+        event: eventName,
+        eventTypeId: eventType?.id || eventRef,
         targetStatus: targetStatus.data.name as string,
         targetStatusId: targetStatus.id,
       })
