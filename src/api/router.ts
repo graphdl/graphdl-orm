@@ -557,6 +557,7 @@ router.get('/api/entities/:noun', async (request, env: Env) => {
     hasNextPage: result.hasNextPage,
     hasPrevPage: result.hasPrevPage,
     ...(result.warnings && { warnings: result.warnings }),
+    ...(result._links && { _links: result._links }),
   })
 })
 
@@ -584,6 +585,8 @@ router.get('/api/entities/:noun/:id', async (request, env: Env) => {
     createdAt: entity.createdAt,
     updatedAt: entity.updatedAt,
     ...(entity.transitions && { transitions: entity.transitions }),
+    ...(entity._links && { _links: entity._links }),
+    ...(entity._actions && { _actions: entity._actions }),
   })
 })
 
@@ -732,6 +735,8 @@ router.get('/api/:collection/:id', async (request, env: Env) => {
       createdAt: entity.createdAt,
       updatedAt: entity.updatedAt,
       ...(entity.transitions && { transitions: entity.transitions }),
+      ...(entity._links && { _links: entity._links }),
+      ...(entity._actions && { _actions: entity._actions }),
     })
   }
 
