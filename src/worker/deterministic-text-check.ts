@@ -113,7 +113,14 @@ export function buildTextConstraints(
 
       let values: string[]
       if (typeof enumValues === 'string') {
-        try { values = JSON.parse(enumValues) } catch { continue }
+        // Try JSON array first, then comma-separated
+        try {
+          const parsed = JSON.parse(enumValues)
+          values = Array.isArray(parsed) ? parsed.map(String) : [String(parsed)]
+        } catch {
+          // Comma-separated: "**, ##, - , ```"
+          values = enumValues.split(',').map(v => v.trim()).filter(Boolean)
+        }
       } else if (Array.isArray(enumValues)) {
         values = enumValues.map(String)
       } else {
