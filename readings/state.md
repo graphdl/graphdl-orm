@@ -24,16 +24,16 @@ State Machine Definition is for Noun.
   Each State Machine Definition is for exactly one Noun.
 
 ### Status
-Status belongs to State Machine Definition.
-  Each Status belongs to exactly one State Machine Definition.
+Status is defined in State Machine Definition.
+  Each Status is defined in exactly one State Machine Definition.
 Verb is performed in Status.
   Each Verb is performed in at most one Status.
 
 ### Transition
-Transition has Status as source.
-  Each Transition has exactly one Status as source.
-Transition has Status as target.
-  Each Transition has exactly one Status as target.
+Transition is from Status.
+  Each Transition is from exactly one Status.
+Transition is to Status.
+  Each Transition is to exactly one Status.
 Transition is triggered by Event Type.
   Each Transition is triggered by exactly one Event Type.
 Verb is performed during Transition.
@@ -54,6 +54,8 @@ Guard prevents Transition.
   Each Guard prevents at most one Transition.
   It is possible that more than one Guard prevents the same Transition.
 
-### State Machine Definition
-For each State Machine Definition, some Status belongs to that State Machine Definition.
+## Constraints
+
+For each Status, some Transition is from that Status or some Transition is to that Status.
+For each State Machine Definition, some Status is defined in that State Machine Definition.
 For each Noun, at most one State Machine Definition is for that Noun.
