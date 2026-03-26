@@ -117,7 +117,7 @@ export async function ingestClaims(
   if (claims.facts?.length) {
     try { await db.applySchema?.(domainId) } catch { /* may fail if no readings yet */ }
   }
-  await ingestFacts(db, claims.facts || [], domainId, scope)
+  await ingestFacts(db, claims.facts || [], domainId, scope, builder)
 
   // Strip [domainId] prefix from errors for backward compatibility
   const prefix = `[${domainId}] `
@@ -201,7 +201,7 @@ export async function ingestProject(
   }
   // Step 6: All facts
   for (const { domainId, claims } of domains) {
-    await ingestFacts(db, claims.facts || [], domainId, scope)
+    await ingestFacts(db, claims.facts || [], domainId, scope, builder)
   }
 
   // Build per-domain results with domain-prefixed error attribution
