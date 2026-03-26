@@ -432,15 +432,21 @@ export function ingestTransitions(
 // Step 6: Create instance facts
 // ---------------------------------------------------------------------------
 
+/** Metamodel entity types that should be batched, not created via legacy path */
+const METAMODEL_ENTITY_TYPES = new Set([
+  'State Machine Definition', 'Status', 'Transition', 'Guard', 'Event Type',
+  'Stream', 'Verb', 'Function',
+])
+
 /**
- * Instance facts write to EntityDB DOs (not metamodel), so they still
- * use the FactWriterLike interface directly. This step is NOT batched.
+ * Instance facts: metamodel types go to BatchBuilder, domain instances use createEntity.
  */
 export async function ingestFacts(
   db: FactWriterLike,
   facts: NonNullable<ExtractedClaims['facts']>,
   domainId: string,
   scope: Scope,
+  builder?: BatchBuilder,
 ): Promise<void> {
   for (const fact of facts) {
     try {
@@ -449,7 +455,6 @@ export async function ingestFacts(
       let values = fact.values || []
 
       if (!reading && fact.entity && fact.valueType) {
-        // Entity-centric format: { entity, entityValue, predicate, valueType, value }
         const predicate = fact.predicate || 'has'
         reading = `${fact.entity} ${predicate} ${fact.valueType}`
         values = [
@@ -458,22 +463,40 @@ export async function ingestFacts(
         ]
       }
 
+      // Unary facts (e.g., "Status 'Triaging' is initial")
+      if (!reading && fact.entity && fact.entityValue && fact.predicate && !fact.valueType && !fact.value) {
+        const entityName = fact.entity
+        const entityRef = fact.entityValue
+        if (builder && METAMODEL_ENTITY_TYPES.has(entityName)) {
+          // Find existing entity in batch and add predicate as boolean field
+          const fieldName = fact.predicate.split(' ').map((w: string, i: number) =>
+            i === 0 ? w.toLowerCase() : w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()
+          ).join('')
+          const existingId = builder.findEntityByKey('name', entityRef)
+          if (existingId) {
+            builder.updateEntity(existingId, { [fieldName]: true })
+          } else {
+            builder.ensureEntity(entityName, 'name', entityRef, {
+              name: entityRef, domain: domainId, [fieldName]: true,
+            })
+          }
+          continue
+        }
+      }
+
       if (!reading) {
         scope.errors.push(`[${domainId}] fact: no reading or entity/valueType`)
         continue
       }
 
-      // Instance facts go to 3NF tables via createEntity.
       const entityName = fact.entity || values[0]?.noun || ''
       const entityRef = fact.entityValue || values[0]?.value || ''
       const fieldValues: Record<string, string> = {}
 
-      // For binary facts: the second value is the field
       if (values.length >= 2 && values[1].noun) {
-        // Convert value type name to camelCase field name
         const fieldName = values[1].noun
           .split(' ')
-          .map((w, i) => i === 0 ? w.toLowerCase() : w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+          .map((w: string, i: number) => i === 0 ? w.toLowerCase() : w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
           .join('')
         fieldValues[fieldName] = values[1].value
       }
@@ -483,6 +506,19 @@ export async function ingestFacts(
         continue
       }
 
+      // Metamodel entity types → BatchBuilder (creates EntityDB DOs)
+      if (builder && METAMODEL_ENTITY_TYPES.has(entityName)) {
+        const id = builder.ensureEntity(entityName, 'name', entityRef, {
+          name: entityRef, domain: domainId, ...fieldValues,
+        })
+        // For multi-fact entities (Transition has 3 facts), merge fields
+        if (Object.keys(fieldValues).length > 0) {
+          builder.updateEntity(id, fieldValues)
+        }
+        continue
+      }
+
+      // Domain instance facts → legacy createEntity path
       try {
         await (db as any).createEntity(domainId, entityName, fieldValues, entityRef)
       } catch (err: any) {

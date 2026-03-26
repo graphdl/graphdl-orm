@@ -69,6 +69,15 @@ export class BatchBuilder {
     })
   }
 
+  /**
+   * Find an entity's ID by a data field value.
+   * Searches all entities for one where data[key] === value.
+   */
+  findEntityByKey(key: string, value: unknown): string | undefined {
+    const entity = this.entities.find(e => e.data[key] === value)
+    return entity?.id
+  }
+
   /** Number of entities accumulated so far. */
   get entityCount(): number {
     return this.entities.length
