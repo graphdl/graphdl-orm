@@ -626,6 +626,7 @@ router.post('/api/claims', async (request, env: Env, ctx: ExecutionContext) => {
   const { handleClaims } = await import('./claims')
   return handleClaims(request, env, ctx)
 })
+router.all('/api/seed', handleSeed)
 router.get('/api/stats', async (request, env: Env) => {
   const { handleStats } = await import('./claims')
   return handleStats(request, env)
@@ -848,10 +849,6 @@ router.delete('/api/:collection/:id', async (request, env: Env) => {
   return error(404, { errors: [{ message: `Collection "${collection}" has no entity-type handler` }] })
 })
 
-// ── Seed endpoints ──
-router.all('/api/seed', handleSeed)
-router.all('/seed', handleSeed)
-router.all('/claims', handleSeed)
 
 // ── Domain wipe (metamodel only — nouns, readings, constraints, roles, etc.) ──
 // Deindex from Registry — EntityDB DOs become orphaned. Background cleanup.
@@ -939,9 +936,10 @@ router.delete('/api/reset', async (request, env: Env, ctx: ExecutionContext) => 
 })
 
 // ── Parse / Verify ──────────────────────────────────────────────────
-router.all('/parse', handleParse)
-router.all('/parse/orm', handleParseOrm)
-router.all('/verify', handleVerify)
+// Parse/verify available at /api/parse, /api/parse/orm, /api/verify (no legacy aliases)
+router.all('/api/parse', handleParse)
+router.all('/api/parse/orm', handleParseOrm)
+router.all('/api/verify', handleVerify)
 
 // ── 404 fallback ─────────────────────────────────────────────────────
 router.all('*', () => error(404, { errors: [{ message: 'Not Found' }] }))
