@@ -71,8 +71,14 @@ export async function handleEvaluate(request: Request, env: Env): Promise<Respon
   let textViolations: any[] = []
   try {
     const registry = env.REGISTRY_DB.get(env.REGISTRY_DB.idFromName('global')) as any
-    const constraintIds: string[] = await registry.getEntityIds('Constraint', body.domainId)
-    const nounIds: string[] = await registry.getEntityIds('Noun', body.domainId)
+    // Resolve domain slug — entities are indexed by slug, not UUID
+    let domainSlug = body.domainId!
+    try {
+      const slugResult: string | null = await registry.resolveSlugByUUID(body.domainId!)
+      if (slugResult) domainSlug = slugResult
+    } catch { /* use domainId as-is */ }
+    const constraintIds: string[] = await registry.getEntityIds('Constraint', domainSlug)
+    const nounIds: string[] = await registry.getEntityIds('Noun', domainSlug)
     const [constraintEntities, nounEntities] = await Promise.all([
       Promise.all(constraintIds.map(id => (env.ENTITY_DB.get(env.ENTITY_DB.idFromName(id)) as any).get())),
       Promise.all(nounIds.map(id => (env.ENTITY_DB.get(env.ENTITY_DB.idFromName(id)) as any).get())),
