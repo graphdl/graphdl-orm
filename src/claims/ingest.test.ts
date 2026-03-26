@@ -204,9 +204,9 @@ describe('ingestClaims', () => {
 
     const result = await ingestClaims(db as any, { claims, domainId: 'd1' })
 
-    // Facts now go through createEntity — no reading lookup needed
-    // The entity should have been created even without a matching reading
-    expect(db.createEntity).toHaveBeenCalled()
+    // Facts for declared entity types go to BatchBuilder, not createEntity
+    // Customer is declared as entity type, so the fact goes to the batch
+    expect(result.batch.entities.some((e: any) => e.type === 'Customer')).toBe(true)
   })
 
   it('instance facts succeed when reading was created in same batch', async () => {

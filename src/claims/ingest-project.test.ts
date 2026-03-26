@@ -77,14 +77,11 @@ describe('ingestProject', () => {
       { domainId: 'domainB', claims: domainB },
     ])
 
-    // createEntity should have been called for Domain B's fact
-    expect(db.createEntity).toHaveBeenCalledWith(
-      'domainB', 'Order', { status: 'Open' }, 'ORD-1',
-    )
-
-    // applySchema should have been called for both domains
-    expect(db.applySchema).toHaveBeenCalledWith('domainA')
-    expect(db.applySchema).toHaveBeenCalledWith('domainB')
+    // Order is a declared entity type — its instance facts go to BatchBuilder
+    const domainBResult = result.domains.get('domainB')!
+    const orderEntities = (domainBResult.batch?.entities || []).filter((e: any) => e.type === 'Order')
+    expect(orderEntities.length).toBe(1)
+    expect(orderEntities[0].data.status).toBe('Open')
 
     // Totals should reflect both domains
     expect(result.totals.nouns).toBe(2) // Status + Order

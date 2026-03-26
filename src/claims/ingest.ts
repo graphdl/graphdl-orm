@@ -204,19 +204,20 @@ export async function ingestProject(
     await ingestFacts(db, claims.facts || [], domainId, scope, builder)
   }
 
-  // Build per-domain results with domain-prefixed error attribution
+  // Split the shared builder's entities back to per-domain results
+  const allEntities = builder.toBatch().entities
   const perDomain = new Map<string, IngestClaimsResult>()
-  const emptyBatch = { domain: '', entities: [] as any[] }
   for (const { domainId } of domains) {
     const c = counters.get(domainId)!
     const prefix = `[${domainId}] `
+    const domainEntities = allEntities.filter(e => e.domain === domainId || e.data?.domain === domainId)
     perDomain.set(domainId, {
       nouns: c.nouns,
       readings: c.readings,
       stateMachines: c.stateMachines,
       skipped: scope.skipped,
       errors: scope.errors.filter(e => e.startsWith(prefix)).map(e => e.slice(prefix.length)),
-      batch: emptyBatch,
+      batch: { domain: domainId, entities: domainEntities },
     })
   }
 

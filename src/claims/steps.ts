@@ -433,10 +433,26 @@ export function ingestTransitions(
 // ---------------------------------------------------------------------------
 
 /** Metamodel entity types that should be batched, not created via legacy path */
-const METAMODEL_ENTITY_TYPES = new Set([
+/**
+ * Check if an entity name is a known entity type eligible for BatchBuilder.
+ * Checks the batch's declared Nouns first, then a fallback set for
+ * cross-domain metamodel types that may not be in this domain's batch.
+ */
+const CROSS_DOMAIN_ENTITY_TYPES = new Set([
   'State Machine Definition', 'Status', 'Transition', 'Guard', 'Event Type',
   'Stream', 'Verb', 'Function',
+  'Organization', 'App', 'Domain', 'User', 'Site Link',
 ])
+
+function isKnownEntityType(entityName: string, builder: BatchBuilder): boolean {
+  // Check this domain's batch
+  const nouns = builder.findEntities('Noun', { name: entityName })
+  if (nouns.length > 0 && nouns.some(n => n.data.objectType === 'entity')) {
+    return true
+  }
+  // Fall back to well-known cross-domain types
+  return CROSS_DOMAIN_ENTITY_TYPES.has(entityName)
+}
 
 /**
  * Instance facts: metamodel types go to BatchBuilder, domain instances use createEntity.
@@ -467,7 +483,7 @@ export async function ingestFacts(
       if (!reading && fact.entity && fact.entityValue && fact.predicate && !fact.valueType && !fact.value) {
         const entityName = fact.entity
         const entityRef = fact.entityValue
-        if (builder && METAMODEL_ENTITY_TYPES.has(entityName)) {
+        if (builder && isKnownEntityType(entityName, builder)) {
           // Find existing entity in batch and add predicate as boolean field
           const fieldName = fact.predicate.split(' ').map((w: string, i: number) =>
             i === 0 ? w.toLowerCase() : w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()
@@ -530,7 +546,7 @@ export async function ingestFacts(
       }
 
       // Metamodel entity types → BatchBuilder (creates EntityDB DOs)
-      if (builder && METAMODEL_ENTITY_TYPES.has(entityName)) {
+      if (builder && isKnownEntityType(entityName, builder)) {
         const id = builder.ensureEntity(entityName, 'name', entityRef, {
           name: entityRef, domain: domainId, ...fieldValues,
         })
