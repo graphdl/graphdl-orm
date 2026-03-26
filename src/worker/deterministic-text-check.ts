@@ -150,9 +150,21 @@ export function buildTextConstraints(
       continue
     }
 
-    // Filter out single ASCII characters — too noisy for text matching.
-    // Keep non-ASCII single chars (em-dash, en-dash, etc.) — they're meaningful.
-    values = values.filter(v => v.length >= 2 || (v.length === 1 && v.charCodeAt(0) > 127))
+    // Filter values that are too noisy for deterministic string matching:
+    // - Single ASCII characters (too common — matches everywhere)
+    // - Common English words (need semantic context to evaluate)
+    // Keep: non-ASCII single chars (em-dash, en-dash), symbols (**, ##, --),
+    //        and multi-word phrases that are unambiguous patterns.
+    values = values.filter(v => {
+      // Keep non-ASCII single chars
+      if (v.length === 1 && v.charCodeAt(0) > 127) return true
+      // Drop single ASCII chars
+      if (v.length < 2) return false
+      // Drop values that are just common English words (no special chars).
+      // Deterministic matching works for symbols and syntax, not natural language.
+      if (/^[a-zA-Z][a-zA-Z\s]+$/.test(v)) return false
+      return true
+    })
     if (values.length === 0) continue
 
     result.push({
