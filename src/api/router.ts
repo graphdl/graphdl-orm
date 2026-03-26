@@ -848,23 +848,15 @@ router.delete('/api/domains/:domainId/metamodel', async (request, env: Env) => {
   // 1. Get all entity IDs for this domain from Registry
   const entities = await registry.getAllEntityIdsForDomain(domainId) as Array<{ nounType: string; entityId: string }>
 
-  // 2. Fan out to EntityDB DOs to soft-delete each (bounded concurrency)
-  const BATCH = 50
+  // 2. Fan out to ALL EntityDB DOs in parallel to soft-delete
+  const deleteResults = await Promise.allSettled(
+    entities.map(({ entityId }) => (getEntityDO(env, entityId) as any).delete()),
+  )
   let deletedCount = 0
   const failed: string[] = []
-
-  for (let i = 0; i < entities.length; i += BATCH) {
-    const chunk = entities.slice(i, i + BATCH)
-    const results = await Promise.allSettled(
-      chunk.map(async ({ entityId }) => {
-        const stub = getEntityDO(env, entityId) as any
-        return stub.delete()
-      }),
-    )
-    for (let j = 0; j < results.length; j++) {
-      if (results[j].status === 'fulfilled') deletedCount++
-      else failed.push(chunk[j].entityId)
-    }
+  for (let i = 0; i < deleteResults.length; i++) {
+    if (deleteResults[i].status === 'fulfilled') deletedCount++
+    else failed.push(entities[i].entityId)
   }
 
   // 3. Deindex all entities and nouns for this domain in Registry
@@ -897,23 +889,15 @@ router.delete('/api/reset', async (request, env: Env) => {
   // 1. Get all entity IDs from Registry (across all domains)
   const entities = await registry.getAllEntityIds() as Array<{ nounType: string; entityId: string }>
 
-  // 2. Fan out to EntityDB DOs to soft-delete each (bounded concurrency)
-  const BATCH = 50
+  // 2. Fan out to ALL EntityDB DOs in parallel to soft-delete
+  const deleteResults = await Promise.allSettled(
+    entities.map(({ entityId }) => (getEntityDO(env, entityId) as any).delete()),
+  )
   let deletedCount = 0
   const failed: string[] = []
-
-  for (let i = 0; i < entities.length; i += BATCH) {
-    const chunk = entities.slice(i, i + BATCH)
-    const results = await Promise.allSettled(
-      chunk.map(async ({ entityId }) => {
-        const stub = getEntityDO(env, entityId) as any
-        return stub.delete()
-      }),
-    )
-    for (let j = 0; j < results.length; j++) {
-      if (results[j].status === 'fulfilled') deletedCount++
-      else failed.push(chunk[j].entityId)
-    }
+  for (let i = 0; i < deleteResults.length; i++) {
+    if (deleteResults[i].status === 'fulfilled') deletedCount++
+    else failed.push(entities[i].entityId)
   }
 
   // 3. Wipe all Registry tables (entity_index, noun_index, domains)
