@@ -848,7 +848,8 @@ router.delete('/api/:collection/:id', async (request, env: Env) => {
   return error(404, { errors: [{ message: `Collection "${collection}" has no entity-type handler` }] })
 })
 
-// ── Legacy aliases (backwards compat for /seed and /claims without /api prefix) ──
+// ── Seed endpoints ──
+router.all('/api/seed', handleSeed)
 router.all('/seed', handleSeed)
 router.all('/claims', handleSeed)
 
