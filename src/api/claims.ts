@@ -106,17 +106,18 @@ export async function handleClaims(request: Request, env: Env): Promise<Response
       const model = new DomainModel(loader, resolvedSlug)
       const schema = await generateSchema(model)
       // Persist to DomainDB generators cache
-      const domainDO = env.DOMAIN_DB.get(env.DOMAIN_DB.idFromName(resolvedSlug)) as any
+      // Store in graphdl-primary (consistent with generate.ts) using slug as domain key
+      const primaryDB = env.DOMAIN_DB.get(env.DOMAIN_DB.idFromName('graphdl-primary')) as any
       try {
-        const existing = await domainDO.findInCollection('generators', {
-          domain: { equals: domain!.id },
+        const existing = await primaryDB.findInCollection('generators', {
+          domain: { equals: resolvedSlug },
           outputFormat: { equals: 'schema' },
         }, { limit: 1 })
         if (existing?.docs?.[0]) {
-          await domainDO.updateInCollection('generators', existing.docs[0].id, { output: JSON.stringify(schema) })
+          await primaryDB.updateInCollection('generators', existing.docs[0].id, { output: JSON.stringify(schema) })
         } else {
-          await domainDO.createInCollection('generators', {
-            domain: domain!.id,
+          await primaryDB.createInCollection('generators', {
+            domain: resolvedSlug,
             outputFormat: 'schema',
             title: `${resolvedSlug} schema`,
             output: JSON.stringify(schema),
