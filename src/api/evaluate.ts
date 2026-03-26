@@ -66,6 +66,26 @@ export async function handleEvaluate(request: Request, env: Env): Promise<Respon
     return error(500, { errors: [{ message: 'Failed to parse domain schema' }] })
   }
 
+  // Deterministic text check — string matching against enum values
+  const { checkDeterministicText, buildTextConstraints } = await import('../worker/deterministic-text-check')
+  let textViolations: any[] = []
+  try {
+    const registry = env.REGISTRY_DB.get(env.REGISTRY_DB.idFromName('global')) as any
+    const constraintIds: string[] = await registry.getEntityIds('Constraint', body.domainId)
+    const nounIds: string[] = await registry.getEntityIds('Noun', body.domainId)
+    const [constraintEntities, nounEntities] = await Promise.all([
+      Promise.all(constraintIds.map(id => (env.ENTITY_DB.get(env.ENTITY_DB.idFromName(id)) as any).get())),
+      Promise.all(nounIds.map(id => (env.ENTITY_DB.get(env.ENTITY_DB.idFromName(id)) as any).get())),
+    ])
+    const textConstraints = buildTextConstraints(
+      constraintEntities.filter(Boolean),
+      nounEntities.filter(Boolean),
+    )
+    if (textConstraints.length > 0 && body.response?.text) {
+      textViolations = checkDeterministicText(body.response.text, textConstraints)
+    }
+  } catch { /* best-effort — continue to FOL evaluation */ }
+
   // Try WASM evaluation
   try {
     initWasm()
@@ -101,20 +121,47 @@ export async function handleEvaluate(request: Request, env: Env): Promise<Respon
       }))).catch(() => { /* swallow — best-effort persistence */ })
     }
 
+    // Merge text violations with FOL violations
+    const allViolations = [
+      ...mappedViolations,
+      ...textViolations.map((v: any) => ({
+        constraintId: v.constraintId,
+        constraintText: v.constraintText,
+        detail: `${v.operator}: found '${v.value}' — ${v.evidence}`,
+      })),
+    ]
+
+    // Persist all violations
+    if (allViolations.length > 0) {
+      persistViolations(env, allViolations.map((v: any) => ({
+        domain: body.domainId!,
+        constraintId: v.constraintId ?? null,
+        text: v.detail || v.constraintText || 'Constraint violation',
+      }))).catch(() => { /* best-effort */ })
+    }
+
     return json({
-      violations: mappedViolations,
+      violations: allViolations,
       constraintCount: domainSchema.constraints?.length || 0,
+      textConstraintsChecked: textViolations.length > 0 ? true : false,
       domainId: body.domainId,
     })
   } catch (wasmErr: any) {
-    // WASM not available — return error details for debugging
+    // WASM not available — still return text violations
+    const allViolations = textViolations.map((v: any) => ({
+      constraintId: v.constraintId,
+      constraintText: v.constraintText,
+      detail: `${v.operator}: found '${v.value}' — ${v.evidence}`,
+    }))
+
     return json({
-      violations: [],
+      violations: allViolations,
       constraintCount: domainSchema.constraints?.length || 0,
+      textConstraintsChecked: textViolations.length > 0 ? true : false,
       domainId: body.domainId,
       wasmError: wasmErr?.message || String(wasmErr),
       wasmInitialized,
-      warning: 'WASM evaluator not available.',
+      warning: 'WASM evaluator not available. Text constraints still checked.',
     })
   }
 }
