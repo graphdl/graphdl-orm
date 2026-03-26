@@ -79,7 +79,11 @@ If some User authenticates and no Organization is owned by that User then some O
 
 User can access Domain iff User has Org Role in Organization and Domain belongs to that Organization.
 User can access Domain if Domain has Visibility 'public'.
-Domain is visible to Domain := that Domain is the same Domain.
-Domain is visible to Domain := Domain has Visibility 'public'.
-Domain is visible to Domain if Domain belongs to App and that Domain belongs to the same App.
-Domain is visible to Domain if Domain belongs to Organization and that Domain belongs to the same Organization.
+
+User can view Resource in App iff User has Org Role in Organization and App belongs to that Organization and App has navigable Domain and Resource belongs to that Domain.
+User can view all Resources in App iff User has Org Role 'owner' in Organization and App belongs to that Organization.
+User can view all Resources in App iff User has Org Role 'admin' in Organization and App belongs to that Organization.
+User can view only own Resource in App iff User has Org Role 'member' in Organization and App belongs to that Organization and Resource is created by that User.
+
+App shows Domain iff App has navigable Domain and that Domain is that Domain.
+App shows Entity Type iff App has navigable Domain and some Noun is defined in that Domain and Entity Type is that Noun.
