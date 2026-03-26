@@ -29,7 +29,7 @@ function getRegistry(env: Env) {
   return env.REGISTRY_DB.get(env.REGISTRY_DB.idFromName('global'))
 }
 
-export async function handleClaims(request: Request, env: Env): Promise<Response> {
+export async function handleClaims(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
   if (request.method !== 'POST') {
     return error(405, { errors: [{ message: 'POST required' }] })
   }
@@ -77,62 +77,58 @@ export async function handleClaims(request: Request, env: Env): Promise<Response
       : { id: domainId }
     const result = await ingestClaims(db as any, { claims, domainId: domain!.id })
 
-    // Materialize batch entities via Registry DO (runs inside the DO — no subrequest limit)
+    // Background: materialize + generate schema + derive semantic flags
+    // Response returns immediately with the batch. DOs are populated async.
     const resolvedSlug = domainSlug || (domain as any)?.domainSlug || domain!.id
-    if (result.batch?.entities?.length) {
-      const nonViolationEntities = result.batch.entities
-        .filter((e: any) => e.type !== 'Violation')
-        .map((e: any) => ({ ...e, domain: resolvedSlug }))
-      if (nonViolationEntities.length > 0) {
-        const materializeResult = await registry.materializeBatch(nonViolationEntities)
-        if (materializeResult.failed.length > 0) {
-          console.error('Materialization failures:', materializeResult.failed)
+    const backgroundWork = async () => {
+      // 1. Materialize batch entities via Registry DO (no subrequest limit)
+      if (result.batch?.entities?.length) {
+        const nonViolationEntities = result.batch.entities
+          .filter((e: any) => e.type !== 'Violation')
+          .map((e: any) => ({ ...e, domain: resolvedSlug }))
+        if (nonViolationEntities.length > 0) {
+          await registry.materializeBatch(nonViolationEntities)
         }
       }
+
+      // 2. Auto-generate schema for FOL evaluation
+      try {
+        const { DomainModel } = await import('../model/domain-model')
+        const { EntityDataLoader } = await import('../model/entity-data-loader')
+        const { generateSchema } = await import('../generate/schema')
+        const loader = new EntityDataLoader(registry, (id: string) => env.ENTITY_DB.get(env.ENTITY_DB.idFromName(id)) as any)
+        const model = new DomainModel(loader, resolvedSlug)
+        const schema = await generateSchema(model)
+        const primaryDB = env.DOMAIN_DB.get(env.DOMAIN_DB.idFromName('graphdl-primary')) as any
+        try {
+          const existing = await primaryDB.findInCollection('generators', {
+            domain: { equals: resolvedSlug },
+            outputFormat: { equals: 'schema' },
+          }, { limit: 1 })
+          if (existing?.docs?.[0]) {
+            await primaryDB.updateInCollection('generators', existing.docs[0].id, { output: JSON.stringify(schema) })
+          } else {
+            await primaryDB.createInCollection('generators', {
+              domain: resolvedSlug, outputFormat: 'schema',
+              title: `${resolvedSlug} schema`, output: JSON.stringify(schema),
+            })
+          }
+        } catch { /* generators cache write failed */ }
+      } catch { /* schema generation failed */ }
+
+      // 3. Derive isSemantic flag on constraints
+      await deriveSemanticFlags(resolvedSlug, {
+        getEntityIds: (type: string, d?: string) => registry.getEntityIds(type, d),
+        getEntity: async (id: string) => (env.ENTITY_DB.get(env.ENTITY_DB.idFromName(id)) as any).get(),
+        patchEntity: async (id: string, fields: Record<string, unknown>) => (env.ENTITY_DB.get(env.ENTITY_DB.idFromName(id)) as any).patch(fields),
+      }).catch(() => {})
     }
 
-    // Auto-generate schema for FOL evaluation (best-effort, post-materialization)
-    // This eliminates the manual POST /api/generate step.
-    try {
-      const { DomainModel } = await import('../model/domain-model')
-      const { EntityDataLoader } = await import('../model/entity-data-loader')
-      const { generateSchema } = await import('../generate/schema')
-      const loader = new EntityDataLoader(registry, (id: string) => env.ENTITY_DB.get(env.ENTITY_DB.idFromName(id)) as any)
-      const model = new DomainModel(loader, resolvedSlug)
-      const schema = await generateSchema(model)
-      // Persist to DomainDB generators cache
-      // Store in graphdl-primary (consistent with generate.ts) using slug as domain key
-      const primaryDB = env.DOMAIN_DB.get(env.DOMAIN_DB.idFromName('graphdl-primary')) as any
-      try {
-        const existing = await primaryDB.findInCollection('generators', {
-          domain: { equals: resolvedSlug },
-          outputFormat: { equals: 'schema' },
-        }, { limit: 1 })
-        if (existing?.docs?.[0]) {
-          await primaryDB.updateInCollection('generators', existing.docs[0].id, { output: JSON.stringify(schema) })
-        } else {
-          await primaryDB.createInCollection('generators', {
-            domain: resolvedSlug,
-            outputFormat: 'schema',
-            title: `${resolvedSlug} schema`,
-            output: JSON.stringify(schema),
-          })
-        }
-      } catch { /* generators cache write failed — non-fatal */ }
-    } catch { /* schema generation failed — non-fatal */ }
-
-    // Derive isSemantic flag on constraints (best-effort, post-materialization)
-    deriveSemanticFlags(resolvedSlug, {
-      getEntityIds: (type: string, domain?: string) => registry.getEntityIds(type, domain),
-      getEntity: async (id: string) => {
-        const stub = env.ENTITY_DB.get(env.ENTITY_DB.idFromName(id)) as any
-        return stub.get()
-      },
-      patchEntity: async (id: string, fields: Record<string, unknown>) => {
-        const stub = env.ENTITY_DB.get(env.ENTITY_DB.idFromName(id)) as any
-        await stub.patch(fields)
-      },
-    }).catch(() => { /* best-effort */ })
+    if (ctx) {
+      ctx.waitUntil(backgroundWork())
+    } else {
+      await backgroundWork() // fallback for tests without ctx
+    }
 
     // Persist violations as Violation entities (best-effort)
     if (result.batch?.entities) {

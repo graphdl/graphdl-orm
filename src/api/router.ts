@@ -622,9 +622,9 @@ router.get('/api/query', handleConceptualQuery)
 router.post('/api/query', handleConceptualQuery)
 
 // ── Claims ingestion & stats (before generic :collection routes) ─────
-router.post('/api/claims', async (request, env: Env) => {
+router.post('/api/claims', async (request, env: Env, ctx: ExecutionContext) => {
   const { handleClaims } = await import('./claims')
-  return handleClaims(request, env)
+  return handleClaims(request, env, ctx)
 })
 router.get('/api/stats', async (request, env: Env) => {
   const { handleStats } = await import('./claims')
