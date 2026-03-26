@@ -28,8 +28,8 @@ const SECTION_MAP: Array<[RegExp, Section]> = [
   [/^##\s*Deontic\s*Constraints?/i, 'deontic-constraints'],
   [/^##\s*Derivation\s*Rules?/i, 'derivation-rules'],
   [/^##\s*Instance\s*Facts?/i, 'instance-facts'],
-  [/^##\s*States?$/i, 'states'],
-  [/^##\s*Transitions?$/i, 'transitions'],
+  [/^##\s*(?:[\w\s]+\s)?States?$/i, 'states'],
+  [/^##\s*(?:[\w\s]+\s)?Transitions?$/i, 'transitions'],
 ]
 
 function detectSection(line: string): Section | null {
@@ -85,8 +85,12 @@ const DERIVATION = /^(.+?)\s*:=\s*(.+?)\.?$/
 // Instance fact: Entity 'value' has Value Type 'value'.
 const INSTANCE_FACT = new RegExp(`^(${N})\\s+'([^']+)'\\s+has\\s+(${N})\\s+'([^']+)'\\.?$`)
 
-// Instance fact (verb): Verb 'name' runs Function 'name'.
-const INSTANCE_FACT_VERB = new RegExp(`^(${N})\\s+'([^']+)'\\s+(\\w+(?:\\s+\\w+)*)\\s+(${N})\\s+'([^']+)'\\.?$`)
+// Instance fact (verb): Entity 'value' predicate Entity 'value'.
+// Predicate is a non-greedy sequence of lowercase words (stops at the next PascalCase noun).
+const INSTANCE_FACT_VERB = new RegExp(`^(${N})\\s+'([^']+)'\\s+((?:[a-z]+\\s+)*[a-z]+)\\s+(${N})\\s+'([^']+)'\\.?$`)
+
+// Instance fact (unary): Entity 'value' predicate. (e.g., "Status 'Triaging' is initial.")
+const INSTANCE_FACT_UNARY = new RegExp(`^(${N})\\s+'([^']+)'\\s+((?:[a-z]+\\s+)*[a-z]+)\\.?$`)
 
 // Instance fact (simple assignment): Entity has Value Type 'value'. / Entity 'ref' has Value Type number.
 const INSTANCE_FACT_SIMPLE = new RegExp(`^(${N})\\s+(?:has\\s+)?(${N})\\s+'([^']+)'\\.?$`)
@@ -416,6 +420,12 @@ export function parseFORML2(
     m = line.replace(/\.$/, '').match(INSTANCE_FACT_VERB)
     if (m) {
       facts.push({ entity: m[1], entityValue: m[2], predicate: m[3], valueType: m[4], value: m[5] })
+      parsedLines++
+      continue
+    }
+    m = line.replace(/\.$/, '').match(INSTANCE_FACT_UNARY)
+    if (m) {
+      facts.push({ entity: m[1], entityValue: m[2], predicate: m[3] })
       parsedLines++
       continue
     }
