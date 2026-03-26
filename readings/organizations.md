@@ -75,6 +75,8 @@ If some Organization is owned by some User and that User is deleted then that Or
 
 ## Derivation Rules
 
+If some User authenticates and no Organization is owned by that User then some Organization is owned by that User and that Organization has Name that is that User's Email and that User has Org Role 'owner' in that Organization.
+
 User can access Domain iff User has Org Role in Organization and Domain belongs to that Organization.
 User can access Domain if Domain has Visibility 'public'.
 Domain is visible to Domain := that Domain is the same Domain.
