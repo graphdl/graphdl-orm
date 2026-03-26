@@ -104,6 +104,10 @@ export function buildTextConstraints(
     else if (text.toLowerCase().includes('obligatory')) operator = 'obligatory'
     if (!operator) continue
 
+    // Only forbidden constraints work for deterministic text matching.
+    // Obligatory constraints can't be checked by string presence alone.
+    if (operator !== 'forbidden') continue
+
     // Find nouns referenced in the constraint text that have enum values
     for (const [nounName, noun] of nounsByName) {
       if (!text.includes(nounName)) continue
@@ -127,6 +131,8 @@ export function buildTextConstraints(
         continue
       }
 
+      // Filter out single-character values — too noisy for text matching
+      values = values.filter(v => v.length >= 2)
       if (values.length === 0) continue
 
       result.push({

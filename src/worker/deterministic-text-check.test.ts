@@ -47,7 +47,7 @@ describe('checkDeterministicText', () => {
     expect(violations.some(v => v.value === ':** ')).toBe(true)
   })
 
-  it('reports obligatory value missing', () => {
+  it('skips obligatory constraints (not deterministically checkable by text)', () => {
     const constraints: TextConstraint[] = [{
       constraintId: 'c4',
       text: 'It is obligatory that Support Response is delivered via Channel Name Email.',
@@ -58,8 +58,7 @@ describe('checkDeterministicText', () => {
     const text = 'We sent you a letter.'
     const violations = checkDeterministicText(text, constraints)
 
-    expect(violations.length).toBe(1)
-    expect(violations[0].operator).toBe('obligatory')
+    expect(violations.length).toBe(0)
   })
 
   it('no violations when text is clean', () => {
