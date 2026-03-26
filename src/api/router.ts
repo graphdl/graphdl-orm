@@ -15,7 +15,7 @@ import { deriveOnWrite } from '../worker/derive-on-write'
 import { induceConstraints } from '../csdp/induce'
 import { checkDeonticConstraints } from '../worker/deontic-check'
 import { persistViolations } from '../worker/outcomes'
-import { handleListEntities, handleGetEntity, handleCreateEntity, handleDeleteEntity } from './entity-routes'
+import { handleListEntities, handleGetEntity, handleCreateEntity, handleDeleteEntity, buildEntityLinks, buildActions } from './entity-routes'
 
 // ── Reverse mapping: collection slug → entity type name ──────────────
 // Built by inverting NOUN_TABLE_MAP (type→table) and joining with
@@ -529,6 +529,8 @@ router.get('/api/entities/:noun', async (request, env: Env) => {
     version: e.version,
     createdAt: e.createdAt,
     updatedAt: e.updatedAt,
+    _links: buildEntityLinks(e.type, e.id, domainId || undefined),
+    _actions: buildActions(e.type, e.id),
   }))
 
   // Client-side filtering by where params
@@ -544,7 +546,7 @@ router.get('/api/entities/:noun', async (request, env: Env) => {
   let filtered = docs
   for (const [field, condition] of Object.entries(where)) {
     if (typeof condition === 'object' && condition !== null && 'equals' in condition) {
-      filtered = filtered.filter(doc => doc[field] === condition.equals)
+      filtered = filtered.filter(doc => (doc as any)[field] === condition.equals)
     }
   }
 
@@ -570,6 +572,7 @@ router.get('/api/entities/:noun/:id', async (request, env: Env) => {
   const smGetStub = (eid: string) => getEntityDO(env, eid) as any
 
   const entity = await handleGetEntity(getEntityDO(env, id) as any, {
+    domain: domainSlug,
     transitionOpts: {
       getValidTransitions: (defId, statusId) =>
         getValidTransitions(smRegistry, smGetStub, defId, statusId, domainSlug),
@@ -657,6 +660,8 @@ router.get('/api/:collection', async (request, env: Env) => {
       version: e.version,
       createdAt: e.createdAt,
       updatedAt: e.updatedAt,
+      _links: buildEntityLinks(e.type, e.id, domainId || undefined),
+      _actions: buildActions(e.type, e.id),
     }))
 
     // Client-side filtering by where params
@@ -665,7 +670,7 @@ router.get('/api/:collection', async (request, env: Env) => {
       for (const [field, condition] of Object.entries(where)) {
         if (field === 'domain' || field === 'domain.domainSlug') continue // already used for routing
         if (typeof condition === 'object' && condition !== null && 'equals' in condition) {
-          filtered = filtered.filter(doc => doc[field] === (condition as any).equals)
+          filtered = filtered.filter(doc => (doc as any)[field] === (condition as any).equals)
         }
       }
     }
@@ -680,6 +685,7 @@ router.get('/api/:collection', async (request, env: Env) => {
       hasPrevPage: result.hasPrevPage,
       pagingCounter: (result.page - 1) * result.limit + 1,
       ...(result.warnings && { warnings: result.warnings }),
+      ...(result._links && { _links: result._links }),
     })
   }
 
@@ -721,6 +727,7 @@ router.get('/api/:collection/:id', async (request, env: Env) => {
     const smGetStub = (eid: string) => getEntityDO(env, eid) as any
 
     const entity = await handleGetEntity(getEntityDO(env, id) as any, {
+      domain: domainSlug,
       transitionOpts: {
         getValidTransitions: (defId, statusId) =>
           getValidTransitions(smRegistry, smGetStub, defId, statusId, domainSlug),
@@ -772,7 +779,7 @@ router.post('/api/:collection', async (request, env: Env) => {
       (id) => getEntityDO(env, id) as any,
       registry,
     )
-    return json({ doc: { id: result.id, ...body }, message: 'Created successfully' }, { status: 201 })
+    return json({ doc: { id: result.id, ...body }, message: 'Created successfully', ...(result._links && { _links: result._links }) }, { status: 201 })
   }
 
   // Generators collection stays in DomainDB
