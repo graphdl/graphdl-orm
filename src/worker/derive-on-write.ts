@@ -19,20 +19,24 @@ export interface DeriveContext {
   loadRelatedFacts: (nounType: string) => Promise<Array<{ id: string; type: string; data: Record<string, unknown> }>>
   /** Write a derived fact back (e.g., patch entity data) */
   writeDerivedFact: (entityId: string, field: string, value: string) => Promise<void>
+  /** Check if an entity exists */
+  entityExists?: (entityId: string) => Promise<boolean>
+  /** Create a new entity from a derived fact (entity-creating derivation) */
+  createEntity?: (type: string, data: Record<string, unknown>) => Promise<string>
 }
 
 /**
  * Run derivation rules after an entity write.
  * Returns the number of derived facts produced.
  */
-export async function deriveOnWrite(ctx: DeriveContext): Promise<{ derivedCount: number; derived: Fact[] }> {
+export async function deriveOnWrite(ctx: DeriveContext): Promise<{ derivedCount: number; derived: Fact[]; createdCount: number }> {
   // Load derivation rules and nouns
   const [ruleTexts, nouns] = await Promise.all([
     ctx.loadDerivationRules(),
     ctx.loadNouns(),
   ])
 
-  if (ruleTexts.length === 0) return { derivedCount: 0, derived: [] }
+  if (ruleTexts.length === 0) return { derivedCount: 0, derived: [], createdCount: 0 }
 
   // Parse rules into IR
   const rules: DerivationRule[] = []
@@ -42,7 +46,7 @@ export async function deriveOnWrite(ctx: DeriveContext): Promise<{ derivedCount:
     } catch { /* skip unparseable rules */ }
   }
 
-  if (rules.length === 0) return { derivedCount: 0, derived: [] }
+  if (rules.length === 0) return { derivedCount: 0, derived: [], createdCount: 0 }
 
   // Determine which noun types are referenced in rules
   const referencedTypes = new Set<string>()
@@ -93,14 +97,31 @@ export async function deriveOnWrite(ctx: DeriveContext): Promise<{ derivedCount:
   }
   const derived = allDerived
 
-  // Write derived facts back
+  // Write derived facts back — create entities if they don't exist
+  const createdEntities = new Map<string, string>() // "Type:value" → created entity ID
   for (const fact of derived) {
     try {
+      // Entity-creating derivation: if the subject doesn't exist as a known
+      // entity ID, it's a new entity that needs to be born.
+      const subjectKey = `${fact.subjectType}:${fact.subject}`
+      if (ctx.entityExists && ctx.createEntity) {
+        const exists = await ctx.entityExists(fact.subject)
+        if (!exists && !createdEntities.has(subjectKey)) {
+          const newId = await ctx.createEntity(fact.subjectType, {
+            [fact.objectType]: fact.object,
+          })
+          createdEntities.set(subjectKey, newId)
+          fact.subject = newId
+        } else if (createdEntities.has(subjectKey)) {
+          // Already created in this derivation run — reuse the ID
+          fact.subject = createdEntities.get(subjectKey)!
+        }
+      }
       await ctx.writeDerivedFact(fact.subject, fact.objectType, fact.object)
     } catch { /* best effort */ }
   }
 
-  return { derivedCount: derived.length, derived }
+  return { derivedCount: derived.length, derived, createdCount: createdEntities.size }
 }
 
 /** Convert an entity's key-value data into facts in the store */
