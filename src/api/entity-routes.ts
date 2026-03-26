@@ -40,6 +40,8 @@ export interface EntityRecord {
   createdAt?: string
   updatedAt?: string
   transitions?: TransitionInfo[]
+  _links?: Record<string, string>
+  _actions?: HateoasAction[]
 }
 
 // ---------------------------------------------------------------------------
@@ -55,6 +57,7 @@ export interface ListResult {
   hasNextPage: boolean
   hasPrevPage: boolean
   warnings?: string[]
+  _links?: Record<string, string>
 }
 
 export interface PaginationOpts {
@@ -79,6 +82,91 @@ export interface DepthOpts {
   depth?: number
   getStub?: (id: string) => EntityReadStub
   transitionOpts?: TransitionOpts
+  /** Domain slug — used for HATEOAS link generation. */
+  domain?: string
+}
+
+// ---------------------------------------------------------------------------
+// HATEOAS link + action builders
+// ---------------------------------------------------------------------------
+
+export interface HateoasAction {
+  name: string
+  method: string
+  href: string
+  body?: Record<string, unknown>
+  target?: string
+}
+
+/** Navigation links for a single entity. */
+export function buildEntityLinks(type: string, id: string, domain?: string): Record<string, string> {
+  const encoded = encodeURIComponent(type)
+  const base = `/api/entities/${encoded}/${id}`
+  const qs = domain ? `?domain=${domain}` : ''
+  const links: Record<string, string> = {
+    self: base,
+    collection: `/api/entities/${encoded}${qs}`,
+    edit: base,
+    delete: base,
+    transitions: `${base}/transitions${qs}`,
+    transition: `${base}/transition`,
+    stream: `/ws${qs}`,
+    evaluate: '/api/evaluate',
+  }
+  if (domain) links.domain = `/api/entities/Domain?domain=${domain}`
+  return links
+}
+
+/** Action menu: state-machine transitions + CRUDL operations. */
+export function buildActions(type: string, id: string, transitions?: TransitionInfo[]): HateoasAction[] {
+  const encoded = encodeURIComponent(type)
+  const base = `/api/entities/${encoded}/${id}`
+  const actions: HateoasAction[] = []
+
+  if (transitions) {
+    for (const t of transitions) {
+      actions.push({
+        name: t.event,
+        method: 'POST',
+        href: `${base}/transition`,
+        body: { event: t.event },
+        target: t.targetStatus,
+      })
+    }
+  }
+
+  actions.push({ name: 'edit', method: 'PATCH', href: base })
+  actions.push({ name: 'delete', method: 'DELETE', href: base })
+
+  return actions
+}
+
+/** Navigation links for a paginated list. */
+export function buildListLinks(
+  type: string,
+  domain: string,
+  page: number,
+  limit: number,
+  hasNextPage: boolean,
+  hasPrevPage: boolean,
+): Record<string, string> {
+  const encoded = encodeURIComponent(type)
+  const base = `/api/entities/${encoded}`
+  const qs = (p: number) => {
+    const parts: string[] = []
+    if (domain) parts.push(`domain=${domain}`)
+    parts.push(`page=${p}`)
+    parts.push(`limit=${limit}`)
+    return parts.length > 0 ? `?${parts.join('&')}` : ''
+  }
+  const links: Record<string, string> = {
+    self: `${base}${qs(page)}`,
+    create: base,
+  }
+  if (hasNextPage) links.next = `${base}${qs(page + 1)}`
+  if (hasPrevPage) links.prev = `${base}${qs(page - 1)}`
+  if (domain) links.domain = `/api/entities/Domain?domain=${domain}`
+  return links
 }
 
 // ---------------------------------------------------------------------------
@@ -181,15 +269,19 @@ export async function handleListEntities(
   const paged = limit > 0 ? docs.slice(offset, offset + limit) : docs
   const totalPages = limit > 0 ? Math.ceil(totalDocs / limit) : 1
 
+  const hasNextPage = limit > 0 && offset + limit < totalDocs
+  const hasPrevPage = page > 1
+
   return {
     docs: paged,
     totalDocs,
     limit,
     page,
     totalPages,
-    hasNextPage: limit > 0 && offset + limit < totalDocs,
-    hasPrevPage: page > 1,
+    hasNextPage,
+    hasPrevPage,
     ...(warnings.length > 0 && { warnings }),
+    _links: buildListLinks(type, domain, page, limit, hasNextPage, hasPrevPage),
   }
 }
 
@@ -228,6 +320,10 @@ export async function handleGetEntity(
     entity.transitions = transitions
   }
 
+  // HATEOAS links and actions
+  entity._links = buildEntityLinks(entity.type, entity.id, opts?.domain)
+  entity._actions = buildActions(entity.type, entity.id, entity.transitions)
+
   return entity
 }
 
@@ -255,6 +351,7 @@ export interface CreateEntityResult {
   /** Present when deontic constraints blocked the write (allowed=false). */
   rejected?: true
   violations?: ViolationInput[]
+  _links?: Record<string, string>
 }
 
 /**
@@ -298,7 +395,12 @@ export async function handleCreateEntity(
       const stub = getStub(id)
       const result = await stub.put({ id, type, data })
       await registry.indexEntity(type, id, domain)
-      return { id, version: result.version, warnings: check.violations }
+      return {
+        id,
+        version: result.version,
+        warnings: check.violations,
+        _links: buildEntityLinks(type, id, domain),
+      }
     }
   }
 
@@ -306,7 +408,7 @@ export async function handleCreateEntity(
   const stub = getStub(id)
   const result = await stub.put({ id, type, data })
   await registry.indexEntity(type, id, domain)
-  return { id, version: result.version }
+  return { id, version: result.version, _links: buildEntityLinks(type, id, domain) }
 }
 
 // ---------------------------------------------------------------------------
