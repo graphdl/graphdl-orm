@@ -577,6 +577,30 @@ router.get('/api/entities/:noun/:id', async (request, env: Env) => {
       getValidTransitions: (defId, statusId) =>
         getValidTransitions(smRegistry, smGetStub, defId, statusId, domainSlug),
     },
+    getFieldOrder: async (entityType: string) => {
+      // Load graph schemas for this entity type, get their roles in order
+      const { loadEntities } = await import('../worker/fan-out')
+      const schemas = await loadEntities(smRegistry, smGetStub, 'GraphSchema', domainSlug)
+      const roles = await loadEntities(smRegistry, smGetStub, 'Role', domainSlug)
+      // Find schemas where this entity type participates
+      const nounEntities = await loadEntities(smRegistry, smGetStub, 'Noun', domainSlug)
+      const nounId = nounEntities.find(n => n.data.name === entityType)?.id
+      if (!nounId) return []
+      // Get roles where this noun plays, sorted by roleIndex
+      const entityRoles = roles.filter(r => r.data.noun === nounId || r.data.nounId === nounId)
+      // For each role's graph schema, find the OTHER noun (the property name)
+      const fieldNames: string[] = []
+      for (const role of entityRoles.sort((a, b) => ((a.data.graphSchema as string) || '').localeCompare((b.data.graphSchema as string) || ''))) {
+        const schemaId = role.data.graphSchema as string || role.data.graphSchemaId as string
+        const schemaRoles = roles.filter(r => (r.data.graphSchema === schemaId || r.data.graphSchemaId === schemaId) && r.id !== role.id)
+        for (const sr of schemaRoles) {
+          const otherNounId = sr.data.noun as string || sr.data.nounId as string
+          const otherNoun = nounEntities.find(n => n.id === otherNounId)
+          if (otherNoun) fieldNames.push(otherNoun.data.name as string)
+        }
+      }
+      return fieldNames
+    },
   })
   if (!entity) return error(404, { errors: [{ message: 'Not Found' }] })
 

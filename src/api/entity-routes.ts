@@ -84,6 +84,8 @@ export interface DepthOpts {
   transitionOpts?: TransitionOpts
   /** Domain slug — used for HATEOAS link generation. */
   domain?: string
+  /** Returns ordered field names for an entity type (from graph schema roles). */
+  getFieldOrder?: (entityType: string) => Promise<string[]>
 }
 
 // ---------------------------------------------------------------------------
@@ -96,6 +98,44 @@ export interface HateoasAction {
   href: string
   body?: Record<string, unknown>
   target?: string
+}
+
+/**
+ * Reorder entity data fields by graph schema role order.
+ * Fields in the order list come first (in order), then remaining fields alphabetically.
+ * System fields (_status, _statusId, etc.) always go last.
+ */
+function orderData(data: Record<string, unknown>, fieldOrder: string[]): Record<string, unknown> {
+  const ordered: Record<string, unknown> = {}
+  const systemKeys = new Set<string>()
+  const seen = new Set<string>()
+
+  // 1. Ordered fields first
+  for (const field of fieldOrder) {
+    // Try camelCase variants
+    const camel = field.split(' ').map((w, i) => i === 0 ? w.toLowerCase() : w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join('')
+    for (const key of [field, camel]) {
+      if (key in data && !seen.has(key)) {
+        ordered[key] = data[key]
+        seen.add(key)
+      }
+    }
+  }
+
+  // 2. Remaining data fields alphabetically (skip system fields)
+  for (const key of Object.keys(data).sort()) {
+    if (seen.has(key)) continue
+    if (key.startsWith('_')) { systemKeys.add(key); continue }
+    ordered[key] = data[key]
+    seen.add(key)
+  }
+
+  // 3. System fields last
+  for (const key of [...systemKeys].sort()) {
+    ordered[key] = data[key]
+  }
+
+  return ordered
 }
 
 /** Navigation links for a single entity. */
@@ -318,6 +358,16 @@ export async function handleGetEntity(
       entity.data._statusId,
     )
     entity.transitions = transitions
+  }
+
+  // Property ordering by graph schema role order
+  if (opts?.getFieldOrder) {
+    try {
+      const fieldOrder = await opts.getFieldOrder(entity.type)
+      if (fieldOrder.length > 0) {
+        entity.data = orderData(entity.data, fieldOrder)
+      }
+    } catch { /* best effort — unordered is fine */ }
   }
 
   // HATEOAS links and actions
