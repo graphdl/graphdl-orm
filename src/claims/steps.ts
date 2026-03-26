@@ -494,10 +494,33 @@ export async function ingestFacts(
       const fieldValues: Record<string, string> = {}
 
       if (values.length >= 2 && values[1].noun) {
-        const fieldName = values[1].noun
-          .split(' ')
-          .map((w: string, i: number) => i === 0 ? w.toLowerCase() : w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
-          .join('')
+        // Build field name from predicate + value type to disambiguate
+        // "is from Status" → fromStatus, "is to Status" → toStatus
+        // "is triggered by Event Type" → triggeredByEventType
+        // "has Name" → name (simple case, drop "has")
+        const predicate = fact.predicate || 'has'
+        const valueTypeName = values[1].noun
+        let fieldName: string
+
+        if (predicate === 'has' || predicate === 'has') {
+          // Simple "has" predicate — field name is just the value type
+          fieldName = valueTypeName.split(' ')
+            .map((w: string, i: number) => i === 0 ? w.toLowerCase() : w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+            .join('')
+        } else {
+          // Compound predicate — include it in the field name
+          // "is from" + "Status" → "fromStatus"
+          // "is to" + "Status" → "toStatus"
+          // "is triggered by" + "Event Type" → "triggeredByEventType"
+          // "is defined in" + "State Machine Definition" → "definedInStateMachineDefinition"
+          // "is for" + "Noun" → "forNoun"
+          const predicateWords = predicate.replace(/^is\s+/, '').split(' ')
+          const allWords = [...predicateWords, ...valueTypeName.split(' ')]
+          fieldName = allWords
+            .map((w: string, i: number) => i === 0 ? w.toLowerCase() : w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+            .join('')
+        }
+
         fieldValues[fieldName] = values[1].value
       }
 
