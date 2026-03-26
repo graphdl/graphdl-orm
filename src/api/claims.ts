@@ -77,19 +77,14 @@ export async function handleClaims(request: Request, env: Env): Promise<Response
       : { id: domainId }
     const result = await ingestClaims(db as any, { claims, domainId: domain!.id })
 
-    // Materialize batch entities to EntityDB DOs + Registry
-    // Batch entities use domain UUID internally; Registry indexes by slug
+    // Materialize batch entities via Registry DO (runs inside the DO — no subrequest limit)
     const resolvedSlug = domainSlug || (domain as any)?.domainSlug || domain!.id
     if (result.batch?.entities?.length) {
       const nonViolationEntities = result.batch.entities
         .filter((e: any) => e.type !== 'Violation')
         .map((e: any) => ({ ...e, domain: resolvedSlug }))
       if (nonViolationEntities.length > 0) {
-        const materializeResult = await materializeBatch(
-          nonViolationEntities,
-          (id: string) => env.ENTITY_DB.get(env.ENTITY_DB.idFromName(id)) as any,
-          registry,
-        )
+        const materializeResult = await registry.materializeBatch(nonViolationEntities)
         if (materializeResult.failed.length > 0) {
           console.error('Materialization failures:', materializeResult.failed)
         }
