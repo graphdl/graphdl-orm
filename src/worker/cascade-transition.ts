@@ -89,33 +89,43 @@ export async function executeCascade(
   let currentEvent: string | null = initialEvent
 
   for (let depth = 0; depth < maxDepth && currentEvent; depth++) {
-    // Find outgoing transitions from current status
+    // Find outgoing transitions from current status (by ID or name)
     const allTransitions = await loadEntities(registry, getStub, 'Transition', domain)
-    const outgoing = allTransitions.filter(t =>
-      (t.data.from === currentStatusId || t.data.fromId === currentStatusId) &&
-      (t.data.stateMachineDefinition === definitionId || t.data.stateMachineDefinitionId === definitionId),
-    )
+    const allStatuses = await loadEntities(registry, getStub, 'Status', domain)
+    const outgoing = allTransitions.filter(t => {
+      const fromMatch = t.data.from === currentStatusId || t.data.fromId === currentStatusId ||
+        t.data.fromStatus === currentStatusName || t.data.from === currentStatusName
+      return fromMatch
+    })
 
-    // Find the transition matching the current event
+    // Find the transition matching the current event (by ID or name)
     let matchedTransition: EntityRecord | null = null
     for (const t of outgoing) {
-      const eventTypeId = (t.data.eventType || t.data.eventTypeId) as string
-      if (!eventTypeId) continue
-      const eventType = await loadEntity(getStub, eventTypeId)
+      const eventRef = (t.data.eventType || t.data.eventTypeId || t.data.triggeredByEventType) as string
+      if (!eventRef) continue
+      // Try loading as entity ID first
+      const eventType = await loadEntity(getStub, eventRef).catch(() => null)
       if (eventType && eventType.data.name === currentEvent) {
+        matchedTransition = t
+        break
+      }
+      // Fall back to name-based match
+      if (eventRef === currentEvent) {
         matchedTransition = t
         break
       }
     }
 
-    if (!matchedTransition) {
-      // No valid transition for this event — stop
-      break
-    }
+    if (!matchedTransition) break
 
-    const toStatusId = (matchedTransition.data.to || matchedTransition.data.toId) as string
-    const toStatus = await loadEntity(getStub, toStatusId)
-    const toStatusName = toStatus ? (toStatus.data.name as string) : 'unknown'
+    // Resolve target status (by ID or name)
+    const toRef = (matchedTransition.data.to || matchedTransition.data.toId || matchedTransition.data.toStatus) as string
+    let toStatus = toRef ? await loadEntity(getStub, toRef).catch(() => null) : null
+    if (!toStatus) {
+      toStatus = allStatuses.find(s => s.data.name === toRef) || null
+    }
+    const toStatusName = toStatus ? (toStatus.data.name as string) : toRef || 'unknown'
+    const toStatusId = toStatus ? toStatus.id : toRef
 
     // Step 1: Apply the transition — update entity status
     const stub = getStub(entityId) as any
