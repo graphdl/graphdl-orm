@@ -108,40 +108,59 @@ export function buildTextConstraints(
     // Obligatory constraints can't be checked by string presence alone.
     if (operator !== 'forbidden') continue
 
-    // Find nouns referenced in the constraint text that have enum values
+    // Find the OBJECT noun — the last noun mentioned in the constraint text.
+    // Pattern: "It is forbidden that [Subject] [verb] [Object]."
+    // The object noun is the one whose enum values are the forbidden content.
+    // Match nouns by last occurrence in the text, longest match first (to prefer
+    // "Prohibited Formatting Pattern" over "Pattern").
+    const nounMatches: Array<{ name: string; noun: typeof nouns[0]; lastIndex: number }> = []
     for (const [nounName, noun] of nounsByName) {
-      if (!text.includes(nounName)) continue
-
-      const enumValues = noun.data.enumValues || noun.data.enum_values || noun.data.enum
-      if (!enumValues) continue
-
-      let values: string[]
-      if (typeof enumValues === 'string') {
-        // Try JSON array first, then comma-separated
-        try {
-          const parsed = JSON.parse(enumValues)
-          values = Array.isArray(parsed) ? parsed.map(String) : [String(parsed)]
-        } catch {
-          // Comma-separated: "**, ##, - , ```"
-          values = enumValues.split(',').map(v => v.trim()).filter(Boolean)
-        }
-      } else if (Array.isArray(enumValues)) {
-        values = enumValues.map(String)
-      } else {
-        continue
+      const idx = text.lastIndexOf(nounName)
+      if (idx >= 0) {
+        nounMatches.push({ name: nounName, noun, lastIndex: idx })
       }
-
-      // Filter out single-character values — too noisy for text matching
-      values = values.filter(v => v.length >= 2)
-      if (values.length === 0) continue
-
-      result.push({
-        constraintId: constraint.id,
-        text,
-        operator,
-        values,
-      })
     }
+    // Sort by last position descending — the object noun appears last in the sentence
+    nounMatches.sort((a, b) => b.lastIndex - a.lastIndex)
+
+    // Take only the last-appearing noun that has enum values
+    let objectNoun: typeof nouns[0] | null = null
+    for (const match of nounMatches) {
+      const enumValues = match.noun.data.enumValues || match.noun.data.enum_values || match.noun.data.enum
+      if (enumValues) {
+        objectNoun = match.noun
+        break
+      }
+    }
+    if (!objectNoun) continue
+
+    const enumValues = objectNoun.data.enumValues || objectNoun.data.enum_values || objectNoun.data.enum
+
+    let values: string[]
+    if (typeof enumValues === 'string') {
+      try {
+        const parsed = JSON.parse(enumValues as string)
+        values = Array.isArray(parsed) ? parsed.map(String) : [String(parsed)]
+      } catch {
+        values = (enumValues as string).split(',').map(v => v.trim()).filter(Boolean)
+      }
+    } else if (Array.isArray(enumValues)) {
+      values = enumValues.map(String)
+    } else {
+      continue
+    }
+
+    // Filter out single ASCII characters — too noisy for text matching.
+    // Keep non-ASCII single chars (em-dash, en-dash, etc.) — they're meaningful.
+    values = values.filter(v => v.length >= 2 || (v.length === 1 && v.charCodeAt(0) > 127))
+    if (values.length === 0) continue
+
+    result.push({
+      constraintId: constraint.id,
+      text,
+      operator,
+      values,
+    })
   }
 
   return result
