@@ -49,24 +49,7 @@ export async function handleEvaluate(request: Request, env: Env): Promise<Respon
     outputFormat: { equals: 'schema' },
   }, { limit: 1 })
 
-  const schemaOutput = genResult?.docs?.[0]?.output
-  if (!schemaOutput) {
-    return json({
-      violations: [],
-      constraintCount: 0,
-      domainId: body.domainId,
-      warning: 'No domain schema generated for this domain. Run POST /api/generate with outputFormat: "schema" first.',
-    })
-  }
-
-  let domainSchema: any
-  try {
-    domainSchema = typeof schemaOutput === 'string' ? JSON.parse(schemaOutput) : schemaOutput
-  } catch {
-    return error(500, { errors: [{ message: 'Failed to parse domain schema' }] })
-  }
-
-  // Deterministic text check — string matching against enum values
+  // Deterministic text check — runs regardless of FOL schema availability
   const { checkDeterministicText, buildTextConstraints } = await import('../worker/deterministic-text-check')
   let textViolations: any[] = []
   try {
@@ -91,6 +74,31 @@ export async function handleEvaluate(request: Request, env: Env): Promise<Respon
       textViolations = checkDeterministicText(body.response.text, textConstraints)
     }
   } catch { /* best-effort — continue to FOL evaluation */ }
+
+  // Load domain schema for FOL evaluation
+  const schemaOutput = genResult?.docs?.[0]?.output
+  if (!schemaOutput) {
+    // No FOL schema — return text violations only
+    const textOnly = textViolations.map((v: any) => ({
+      constraintId: v.constraintId,
+      constraintText: v.constraintText,
+      detail: `${v.operator}: found '${v.value}' — ${v.evidence}`,
+    }))
+    return json({
+      violations: textOnly,
+      constraintCount: 0,
+      textConstraintsChecked: textViolations.length > 0,
+      domainId: body.domainId,
+      warning: textOnly.length ? undefined : 'No domain schema generated. Text constraints checked. Run POST /api/generate with outputFormat: "schema" for FOL evaluation.',
+    })
+  }
+
+  let domainSchema: any
+  try {
+    domainSchema = typeof schemaOutput === 'string' ? JSON.parse(schemaOutput) : schemaOutput
+  } catch {
+    return error(500, { errors: [{ message: 'Failed to parse domain schema' }] })
+  }
 
   // Try WASM evaluation
   try {
