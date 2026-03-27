@@ -291,165 +291,18 @@ The command is a composition of functions. The composition is applied atomically
 The hypermedia links in the REST representation are projections of the compiled state machine's transition table. No URL patterns are hardcoded.
 \end{corollary}
 
-\section{Discussion}
-
-\subsection{Bounding the Specification--Implementation Gap}
-
-Theorem~\ref{thm:spec-equiv} holds to the extent that the engine
-correctly compiles and evaluates.  The gap does not vanish; it
-relocates from ``specification vs.\ hand-written code''
-($n$~independent reimplementations) to ``specification vs.\ engine
-correctness'' (one shared, testable component).  The compilation is
-deterministic and invertible; the evaluation rules are Backus's
-equations.  The engine is the only component that must be correct.
-
-\subsection{Performance Characteristics}
-
-Forward chaining in AREST is incremental: when a command adds or
-modifies facts, only derivation rules whose antecedents reference
-affected predicates fire.  The engine does not recompute the full
-population on each request.
-
-The working set for a single command is bounded by the entity's
-participation in the schema.  In the reference implementation, each
-entity instance occupies an independent storage unit.  A command
-touches at most the target entity, its state machine, and entities
-reachable through the schema's roles.  For schemas with $k$~roles,
-constraint evaluation per command is $O(k)$, independent of total
-population size.
-
-Aggregation rules (Insert/fold over a subset of the population) are an
-exception.  Computing a derived sum over related entities requires
-traversing the relevant subset, which is proportional to the number of
-related entities, not the total population.
-
-Facts are indexed by predicate and role player; lookup is
-constant-time per index.  For FORML~2 derivation rules, which are
-stratifiable by construction (negation appears only in constraints,
-not in derivation rule heads), forward chaining to fixed point is
-polynomial in population size.
-
-\subsection{Debuggability}
-
-In a combinator-based system, traditional step-through debugging does
-not apply.  AREST provides three diagnostic mechanisms:
-
-\begin{enumerate}[nosep]
-  \item \textbf{Constraint violations as readings.}  When a constraint
-        is violated, the engine returns the original FORML~2 text:
-        ``Each Customer has at most one Email.''  The specification is
-        the error message.
-  \item \textbf{Derivation trace as facts.}  Every derived fact is
-        attributable to the derivation rule that produced it.  The
-        trace is queryable over the same population, using the same
-        engine.
-  \item \textbf{Compiled model inspection.}  The compiled AST is a
-        data structure, not opaque bytecode.  Developers inspect the
-        combinator tree directly.
-\end{enumerate}
-
-The trade-off is real: developers must learn to read combinator trees
-rather than stepping through imperative code.  The benefit is that the
-artifact being inspected is the artifact being executed, not a
-separate debugging representation.
-
-\subsection{Induction and Ergonomics}
-
-Who writes the readings?  The reference implementation provides an
-induction pipeline where a large language model translates natural
-language domain descriptions into structured claims (nouns, readings,
-constraints, transitions).  The LLM's role is strictly translation;
-all reasoning is performed by the engine after ingestion.  Malformed
-claims are rejected via CSDP validation with the violated reading as
-the error message, bounding the LLM's failure mode to rejected claims
-rather than silently incorrect programs.
-
-For developers with ORM2 expertise, the LLM is unnecessary.
-Tools such as NORMA produce FORML~2 directly from graphical models.
-The induction pipeline is an accessibility layer, not an architectural
-dependency.
-
-\subsection{Expressiveness Boundary}
-
-FORML~2 can express entity and value types, $n$-ary fact types,
-subtypes, the full ORM2 constraint taxonomy, derivation rules
-with aggregation, and state machines.  This covers the domain
-logic layer of most information systems.
-
-Three categories of concern fall outside the model:
-
-\begin{enumerate}[nosep]
-  \item \textbf{Temporal logic.}  Time-varying propositions beyond
-        state machine sequencing (e.g., ``X must occur within 30
-        days of Y'') require temporal operators outside FOL.
-  \item \textbf{Side effects.}  Payments, emails, and external API
-        calls are not propositions and cannot be modeled as facts
-        in the population.
-  \item \textbf{Partial failure.}  Saga patterns, retry logic, and
-        compensation are process concerns, not predicate logic.
-\end{enumerate}
-
-These limitations are by design.  AREST models what is true about
-the domain, not how to make it true operationally.  Side effects
-are triggered at the transport boundary: a state machine transition
-fires within the population, and the transport layer dispatches the
-effect.  If the effect fails, the transition does not commit.  The
-boundary between declarative logic and imperative IO is explicit.
-
 \section{Related Work}
 
 \textbf{Datalog}~\cite{ceri89} shares AREST's bottom-up, fixed-point
-evaluation.  AREST differs in three respects: (1)~FORML~2 provides a
-controlled natural language surface; (2)~ORM2's constraint taxonomy is
-richer; (3)~AREST compiles to combining forms and renders as
-hypermedia via REST.  Unlike \textbf{Prolog}'s top-down evaluation
-with backtracking, AREST evaluates bottom-up, and ORM2 makes
-open-world vs.\ closed-world assumptions explicit per predicate.
-
+evaluation but lacks a controlled natural language surface, ORM2's
+constraint taxonomy, and the REST rendering layer.
 \textbf{Alloy}~\cite{jackson12} and \textbf{TLA+}~\cite{lamport02}
-are specification languages with model checkers that verify properties
-of specifications but do not produce running systems.  AREST
-specifications are running systems: the reading is simultaneously the
-specification and the executable.  Alloy's relational logic is similar
-in expressiveness to ORM2's fact types, but Alloy models are
-artifacts separate from the implementations they describe.
-
-\textbf{GraphQL} provides a query language and type system but does
-not close the specification--implementation gap: resolvers are
-hand-written functions that can diverge from the schema.  \textbf{OData}
-standardizes REST query conventions but remains procedural.
-\textbf{RDF/Linked Data} represents knowledge as triples and supports
-inference via RDFS/OWL, but lacks the constraint taxonomy, state
-machines, and algebraic computation model that ORM2 and Backus's FP
-provide.
-
-\textbf{CQRS and Event Sourcing} separate commands from queries and
-derive state by replaying an event stream.  AREST shares this
-structure: commands transform the population (write side),
-representations project it (read side), and state machines are folds
-over event sequences (Section~\ref{sec:sm}).  The difference is that
-in AREST, events and derived state are both facts in the same
-population governed by the same constraints, and the fold is a
-compiled combinator rather than a hand-written projection function.
-Event sourcing leaves projection logic to the developer; AREST
-compiles it from the readings.
-
-\textbf{CRDT-based systems}~\cite{shapiro11} model distributed state
-transitions algebraically and guarantee convergence without
-coordination.  AREST and CRDTs both treat state algebraically, but
-AREST enforces constraints that may reject transitions, whereas CRDTs
-accept all operations and resolve conflicts structurally.
-
-\textbf{Proof-Carrying Code}~\cite{necula97} verifies executable code
-against safety policies at the machine code level.  AREST's
-Curry-Howard analogy operates at the domain level: proposing a fact
-type is analogous to proposing a theorem, and CSDP validation is the
-consistency checker.
-
-AREST composes Backus's AST with Fielding's REST, two state transfer
-systems published 23 years apart in adjacent communities (programming
-languages and distributed systems) that operate at orthogonal layers
-of the same architecture.
+verify specifications but do not produce running systems.
+\textbf{CQRS and Event Sourcing} share the command/query separation
+and ``state as fold over events'' structure; AREST's difference is
+that the fold is a compiled combinator, not a hand-written projection.
+\textbf{GraphQL}, \textbf{OData}, and \textbf{RDF} each address
+fragments of the problem without closing the specification--implementation gap.
 
 \section{Conclusion}
 
@@ -496,12 +349,6 @@ D. Jackson, \emph{Software Abstractions: Logic, Language, and Analysis}, revised
 
 \bibitem{lamport02}
 L. Lamport, \emph{Specifying Systems: The TLA+ Language and Tools for Hardware and Software Engineers}. Addison-Wesley, 2002.
-
-\bibitem{necula97}
-G.C. Necula, ``Proof-Carrying Code,'' \emph{Proc. 24th ACM SIGPLAN-SIGACT Symposium on Principles of Programming Languages}, pp.~106--119, 1997.
-
-\bibitem{shapiro11}
-M. Shapiro, N. Pregui\c{c}a, C. Baquero, and M. Zawirski, ``Conflict-Free Replicated Data Types,'' in \emph{Stabilization, Safety, and Security of Distributed Systems (SSS)}, LNCS 6976, pp.~386--400, 2011.
 
 \end{thebibliography}
 
