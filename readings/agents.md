@@ -46,3 +46,7 @@ Completion occurred at Timestamp.
 ### Verb connection
 Verb invokes Agent Definition.
   Each Verb invokes at most one Agent Definition.
+
+## Instance Facts
+
+Domain 'agents' has Visibility 'public'.

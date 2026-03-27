@@ -404,10 +404,11 @@ export class DomainModel {
       this.loader.queryRoles(),
     ])
 
-    // Build noun lookup by id
+    // Build noun lookup by id AND by name (for cross-referencing)
     const nounById = new Map<string, NounDef>()
     for (const [, n] of nouns) {
       nounById.set(n.id, n)
+      if (n.name) nounById.set(n.name, n)
     }
 
     // Group roles by graph_schema_id (include core domain roles)
@@ -462,10 +463,11 @@ export class DomainModel {
       this.loader.queryGuards(this.domainId),
     ])
 
-    // Build noun lookup by id
+    // Build noun lookup by id AND by name (for cross-referencing)
     const nounById = new Map<string, NounDef>()
     for (const [, n] of nouns) {
       nounById.set(n.id, n)
+      if (n.name) nounById.set(n.name, n)
     }
 
     // Index lookups

@@ -1,7 +1,7 @@
 /**
  * generateReadings — exports the domain model back to canonical FORML2 readings text.
  *
- * Output matches the format used in source reading files (e.g. support.auto.dev/domains/support.md).
+ * Output matches the format used in source reading files (e.g. example domain files).
  * Roundtrip: readings file → parse → ingest → generateReadings → same readings file.
  */
 

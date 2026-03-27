@@ -20,8 +20,8 @@ pub struct ConstraintIR {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum WorldAssumption {
-    Closed, // not stated = false (government powers, corporate authority)
-    Open,   // not stated = unknown (individual rights, unenumerated freedoms)
+    Closed, // not stated = false (permissions, corporate authority)
+    Open,   // not stated = unknown (capabilities, unenumerated abilities)
 }
 
 impl Default for WorldAssumption {

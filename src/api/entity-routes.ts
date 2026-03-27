@@ -6,8 +6,7 @@
  * Uses Promise.allSettled for fan-out resilience (same pattern as materializer).
  */
 
-import { checkDeonticConstraints } from '../worker/deontic-check'
-import type { ViolationInput } from '../worker/outcomes'
+// Deontic constraints evaluated by WASM engine, not procedural TS code.
 
 // ---------------------------------------------------------------------------
 // Stub interfaces (same shapes as EntityDB / RegistryDB DO RPCs)
@@ -73,19 +72,13 @@ export interface TransitionInfo {
   targetStatusId: string
 }
 
-export interface TransitionOpts {
-  /** Callback that returns valid transitions given (definitionId, currentStatusId). */
-  getValidTransitions: (definitionId: string, currentStatusId: string) => Promise<TransitionInfo[]>
-}
-
 export interface DepthOpts {
   depth?: number
   getStub?: (id: string) => EntityReadStub
-  transitionOpts?: TransitionOpts
+  /** Valid transitions from current status — resolved by engine at router level. */
+  transitions?: TransitionInfo[]
   /** Domain slug — used for HATEOAS link generation. */
   domain?: string
-  /** Returns ordered field names for an entity type (from graph schema roles). */
-  getFieldOrder?: (entityType: string) => Promise<string[]>
 }
 
 // ---------------------------------------------------------------------------
@@ -138,12 +131,17 @@ function orderData(data: Record<string, unknown>, fieldOrder: string[]): Record<
   return ordered
 }
 
-/** Navigation links for a single entity. */
+/**
+ * Navigation links for a single entity.
+ * Derived from the entity's type (noun name from readings) and domain.
+ * The URL structure is a projection of the graph schema — entity types
+ * and their relationships are declared in readings, not hardcoded.
+ */
 export function buildEntityLinks(type: string, id: string, domain?: string): Record<string, string> {
   const encoded = encodeURIComponent(type)
   const base = `/api/entities/${encoded}/${id}`
   const qs = domain ? `?domain=${domain}` : ''
-  const links: Record<string, string> = {
+  return {
     self: base,
     collection: `/api/entities/${encoded}${qs}`,
     edit: base,
@@ -152,17 +150,26 @@ export function buildEntityLinks(type: string, id: string, domain?: string): Rec
     transition: `${base}/transition`,
     stream: `/ws${qs}`,
     evaluate: '/api/evaluate',
+    ...(domain ? { domain: `/api/entities/Domain?domain=${domain}` } : {}),
   }
-  if (domain) links.domain = `/api/entities/Domain?domain=${domain}`
-  return links
 }
 
-/** Action menu: state-machine transitions + CRUDL operations. */
+/**
+ * Action menu: state-machine transitions + CRUDL operations.
+ *
+ * Transitions come from the engine's compiled state machine — not passed
+ * as pre-computed data. Call getTransitions(type, currentStatus) to get
+ * valid transitions from the current state.
+ *
+ * CRUD actions are universal. Deontic constraints (forbidden/permitted)
+ * would further filter these — evaluated by the engine at request time.
+ */
 export function buildActions(type: string, id: string, transitions?: TransitionInfo[]): HateoasAction[] {
   const encoded = encodeURIComponent(type)
   const base = `/api/entities/${encoded}/${id}`
   const actions: HateoasAction[] = []
 
+  // State machine transitions — derived from readings via the engine
   if (transitions) {
     for (const t of transitions) {
       actions.push({
@@ -175,6 +182,7 @@ export function buildActions(type: string, id: string, transitions?: TransitionI
     }
   }
 
+  // Universal CRUD — deontic constraints may restrict these at evaluation time
   actions.push({ name: 'edit', method: 'PATCH', href: base })
   actions.push({ name: 'delete', method: 'DELETE', href: base })
 
@@ -333,7 +341,7 @@ export async function handleListEntities(
  * Fetch a single entity from its EntityDB DO.
  * Returns null if not found or soft-deleted.
  * When depth >= 1, resolves Id-suffixed fields to full entity objects.
- * When transitionOpts is provided and entity has _statusId, includes valid transitions.
+ * When opts.transitions is provided, includes valid transitions in the response.
  */
 export async function handleGetEntity(
   stub: EntityReadStub,
@@ -347,27 +355,10 @@ export async function handleGetEntity(
     entity.data = await populateDepthForEntity(entity, depth, opts.getStub)
   }
 
-  // Include valid transitions when entity has a state machine
-  if (
-    opts?.transitionOpts &&
-    typeof entity.data._statusId === 'string' &&
-    typeof entity.data._stateMachineDefinition === 'string'
-  ) {
-    const transitions = await opts.transitionOpts.getValidTransitions(
-      entity.data._stateMachineDefinition,
-      entity.data._statusId,
-    )
-    entity.transitions = transitions
-  }
-
-  // Property ordering by graph schema role order
-  if (opts?.getFieldOrder) {
-    try {
-      const fieldOrder = await opts.getFieldOrder(entity.type)
-      if (fieldOrder.length > 0) {
-        entity.data = orderData(entity.data, fieldOrder)
-      }
-    } catch { /* best effort — unordered is fine */ }
+  // Transitions are resolved by the engine at the router level
+  // (via getTransitions from engine.ts) and passed in opts.transitions.
+  if (opts?.transitions) {
+    entity.transitions = opts.transitions
   }
 
   // HATEOAS links and actions
@@ -381,26 +372,9 @@ export async function handleGetEntity(
 // handleCreateEntity
 // ---------------------------------------------------------------------------
 
-/**
- * Options for deontic constraint checking on entity creation.
- * When provided, constraints with modality='Deontic' are evaluated before
- * the write is committed.
- */
-export interface DeonticOpts {
-  /** Registry stub that supports getEntityIds (for loading constraints). */
-  registryRead: RegistryReadStub
-  /** Stub factory for reading Constraint, ConstraintSpan, Role, and Noun entities. */
-  getReadStub: (id: string) => EntityReadStub
-}
-
 export interface CreateEntityResult {
   id: string
   version: number
-  /** Present when deontic constraints produced warnings (write was allowed). */
-  warnings?: ViolationInput[]
-  /** Present when deontic constraints blocked the write (allowed=false). */
-  rejected?: true
-  violations?: ViolationInput[]
   _links?: Record<string, string>
 }
 
@@ -408,11 +382,8 @@ export interface CreateEntityResult {
  * Create an entity in its EntityDB DO and index it in the Registry.
  * Generates a UUID for the new entity.
  *
- * When `deonticOpts` is provided, deontic constraints are evaluated first:
- * - If violations with severity='error' are found, the write is rejected
- *   (no entity created) and `rejected: true` is returned with violations.
- * - If only severity='warning' violations exist, the entity is created
- *   and warnings are returned alongside the result.
+ * Deontic constraint checking is done by the WASM engine at the router level,
+ * not here. This function is pure CRUD — create + index.
  */
 export async function handleCreateEntity(
   type: string,
@@ -420,41 +391,9 @@ export async function handleCreateEntity(
   data: Record<string, unknown>,
   getStub: (id: string) => EntityWriteStub,
   registry: RegistryWriteStub,
-  deonticOpts?: DeonticOpts,
+  explicitId?: string,
 ): Promise<CreateEntityResult> {
-  // Deontic constraint check (when configured)
-  if (deonticOpts) {
-    const check = await checkDeonticConstraints(
-      type, data, domain,
-      deonticOpts.registryRead,
-      deonticOpts.getReadStub,
-    )
-
-    if (!check.allowed) {
-      return {
-        id: '',
-        version: 0,
-        rejected: true,
-        violations: check.violations,
-      }
-    }
-
-    // Warnings present but allowed — create entity and attach warnings
-    if (check.violations.length > 0) {
-      const id = crypto.randomUUID()
-      const stub = getStub(id)
-      const result = await stub.put({ id, type, data })
-      await registry.indexEntity(type, id, domain)
-      return {
-        id,
-        version: result.version,
-        warnings: check.violations,
-        _links: buildEntityLinks(type, id, domain),
-      }
-    }
-  }
-
-  const id = crypto.randomUUID()
+  const id = explicitId || crypto.randomUUID()
   const stub = getStub(id)
   const result = await stub.put({ id, type, data })
   await registry.indexEntity(type, id, domain)

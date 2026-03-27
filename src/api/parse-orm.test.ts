@@ -1,10 +1,14 @@
 import { describe, it, expect } from 'vitest'
 import { parseOrmXml } from './parse-orm'
-import { readFileSync } from 'fs'
+import { readFileSync, existsSync } from 'fs'
+import { join } from 'path'
 
 describe('parseOrmXml', () => {
+  const ormPath = join(__dirname, '../../test-fixtures/GraphDL.orm')
+
   it('parses the GraphDL.orm model', () => {
-    const xml = readFileSync('C:/Users/lippe/Repos/payload-experiments/samuel/GraphDL/GraphDL.orm', 'utf-8')
+    if (!existsSync(ormPath)) return // skip if fixture not available
+    const xml = readFileSync(ormPath, 'utf-8')
     const result = parseOrmXml(xml)
 
     // Should have entity types

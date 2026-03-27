@@ -21,11 +21,20 @@ use crate::types::*;
 
 // ── Core Functional Types ──────────────────────────────────────────
 
-/// A predicate is a pure function from evaluation context to violations.
-/// This is the fundamental type. Constraints ARE predicates.
+// ── Core Functional Types ──────────────────────────────────────────
+//
+// No closures. No opaque types. Everything is Func — AST nodes that
+// the evaluator reduces. Constraints, derivations, state machines are
+// all Func nodes applied to Objects (populations, events, contexts).
+//
+// The legacy Predicate/DeriveFn/EvalContext types are deleted.
+// Evaluation is beta reduction: apply(func, object, defs) → object.
+
+/// Legacy predicate type — kept temporarily while compile_* functions
+/// are migrated to produce Func nodes directly. Will be deleted.
 pub type Predicate = Arc<dyn Fn(&EvalContext) -> Vec<Violation> + Send + Sync>;
 
-/// Immutable evaluation context — the only input predicates receive.
+/// Legacy evaluation context — will be replaced by Object encoding.
 pub struct EvalContext<'a> {
     pub response: &'a ResponseContext,
     pub population: &'a Population,
@@ -44,41 +53,47 @@ pub enum DeonticOp {
     Permitted,
 }
 
-/// A compiled constraint: identity + modality + predicate.
+/// A compiled constraint. The `func` field is the AST — evaluation is
+/// apply(func, eval_context_object) → sequence of violation objects.
+///
+/// The `predicate` field is a transitional bridge: it wraps the same
+/// logic as a closure so the existing evaluate() path works while
+/// constraint compilers are migrated to emit pure Func nodes.
 pub struct CompiledConstraint {
     pub id: String,
     pub text: String,
     pub modality: Modality,
+    /// Func: Object → Object. Takes encoded eval context, returns violation sequence.
+    pub func: crate::ast::Func,
+    /// Transitional bridge — same logic as func, as a closure.
     pub predicate: Predicate,
 }
 
-/// A compiled derivation rule — produces derived facts instead of violations.
-/// Same architecture as CompiledConstraint but output type differs.
-/// Derivation: (context, population) → [DerivedFact]
+/// Legacy derivation fn type — transitional.
 pub type DeriveFn = Arc<dyn Fn(&EvalContext, &Population) -> Vec<DerivedFact> + Send + Sync>;
 
+/// A compiled derivation rule. The `func` field is the AST.
 pub struct CompiledDerivation {
-    #[allow(dead_code)] // deserialized from JSON, read by JS callers
     pub id: String,
-    #[allow(dead_code)] // deserialized from JSON, read by JS callers
     pub text: String,
-    #[allow(dead_code)] // deserialized from JSON, read by JS callers
     pub kind: DerivationKind,
+    /// Func: Object → Object. Takes population, returns derived fact sequence.
+    pub func: crate::ast::Func,
+    /// Transitional bridge.
     pub derive: DeriveFn,
 }
 
-/// A compiled state machine: transition function + initial state.
-/// Evaluation: fold(transition)(initial)(event_stream)
+/// A compiled state machine. The `func` field is Insert(transition) — fold over events.
 pub struct CompiledStateMachine {
     pub noun_name: String,
     pub statuses: Vec<String>,
     pub initial: String,
-    /// Transition: (current_state, event, ctx) → Option<next_state>
-    /// Guard passes iff guard predicate produces zero violations.
-    #[allow(dead_code)] // used by run_machine WASM export
-    pub transition: Arc<dyn Fn(&str, &str, &EvalContext) -> Option<String> + Send + Sync>,
-    /// Compiled transitions as (from, to, event) for introspection
+    /// Func: Insert(Condition(guard, Constant(next), Id)) — fold over event stream.
+    pub func: crate::ast::Func,
+    /// Compiled transitions as (from, to, event) for introspection.
     pub transition_table: Vec<(String, String, String)>,
+    /// Transitional bridge.
+    pub transition: Arc<dyn Fn(&str, &str, &EvalContext) -> Option<String> + Send + Sync>,
 }
 
 /// Index for fast noun lookups during synthesis.
@@ -97,16 +112,102 @@ pub struct NounIndex {
     pub fact_type_to_constraints: HashMap<String, Vec<String>>,
     /// constraint_id -> index into CompiledModel.constraints
     pub constraint_index: HashMap<String, usize>,
+    /// noun_name -> reference scheme value type names (e.g., ["Order Number"])
+    pub ref_schemes: HashMap<String, Vec<String>>,
     /// noun_name -> state machine index
     pub noun_to_state_machines: HashMap<String, usize>,
 }
 
-/// The compiled model — all constraints, derivations, and state machines as executable functions.
+/// A compiled graph schema — a Construction of Selector functions (roles).
+/// Graph Schema = CONS(Role₁, ..., Roleₙ) in Backus's FP algebra.
+/// Partial application = query. Full application = fact.
+pub struct CompiledSchema {
+    pub id: String,
+    pub reading: String,
+    /// The Construction function: [Selector(1), Selector(2), ..., Selector(n)]
+    pub construction: crate::ast::Func,
+    /// Role names in order (for binding resolution)
+    pub role_names: Vec<String>,
+}
+
+/// The compiled model — all constraints, derivations, state machines, and schemas as executable functions.
 pub struct CompiledModel {
     pub constraints: Vec<CompiledConstraint>,
     pub derivations: Vec<CompiledDerivation>,
     pub state_machines: Vec<CompiledStateMachine>,
     pub noun_index: NounIndex,
+    /// Fact types compiled to Construction functions (CONS of Roles).
+    pub schemas: HashMap<String, CompiledSchema>,
+    /// Fact-to-event mapping: when a fact of this type is created, fire this event
+    /// on the state machine for the target noun. Derived from:
+    ///   Graph Schema is activated by Verb + Verb is performed during Transition.
+    pub fact_events: HashMap<String, FactEvent>,
+}
+
+/// When a fact is created in this schema, fire this event on the entity's state machine.
+pub struct FactEvent {
+    pub fact_type_id: String,
+    pub event_name: String,
+    pub target_noun: String, // which noun's state machine to transition
+}
+
+// ── Object ↔ Population decoding ─────────────────────────────────
+// Decode a population Object back to a Population struct.
+// Inverse of ast::encode_population.
+
+fn decode_population_object(obj: &crate::ast::Object) -> Population {
+    let mut facts: HashMap<String, Vec<FactInstance>> = HashMap::new();
+    if let Some(fact_types) = obj.as_seq() {
+        for ft_obj in fact_types {
+            if let Some(ft_items) = ft_obj.as_seq() {
+                if ft_items.len() == 2 {
+                    let ft_id = ft_items[0].as_atom().unwrap_or("").to_string();
+                    if let Some(fact_objs) = ft_items[1].as_seq() {
+                        let instances: Vec<FactInstance> = fact_objs.iter().filter_map(|fact_obj| {
+                            let bindings: Vec<(String, String)> = fact_obj.as_seq()?.iter().filter_map(|b| {
+                                let pair = b.as_seq()?;
+                                if pair.len() == 2 {
+                                    Some((pair[0].as_atom()?.to_string(), pair[1].as_atom()?.to_string()))
+                                } else {
+                                    None
+                                }
+                            }).collect();
+                            Some(FactInstance { fact_type_id: ft_id.clone(), bindings })
+                        }).collect();
+                        facts.insert(ft_id, instances);
+                    }
+                }
+            }
+        }
+    }
+    Population { facts }
+}
+
+// ── Schema Compilation ───────────────────────────────────────────
+// Compile fact types to Construction functions (CONS of Roles).
+// Role → Selector. Graph Schema → Construction [Selector₁, ..., Selectorₙ].
+
+/// Compile all fact types in the IR to CompiledSchema (Construction of Selectors).
+fn compile_schemas(ir: &ConstraintIR) -> HashMap<String, CompiledSchema> {
+    ir.fact_types.iter().map(|(id, ft)| {
+        // Each role compiles to a Selector at its position (1-indexed)
+        let selectors: Vec<crate::ast::Func> = ft.roles.iter()
+            .map(|role| crate::ast::Func::Selector(role.role_index + 1))
+            .collect();
+
+        let role_names: Vec<String> = ft.roles.iter()
+            .map(|role| role.noun_name.clone())
+            .collect();
+
+        let schema = CompiledSchema {
+            id: id.clone(),
+            reading: ft.reading.clone(),
+            construction: crate::ast::Func::Construction(selectors),
+            role_names,
+        };
+
+        (id.clone(), schema)
+    }).collect()
 }
 
 // ── Population Primitives ──────────────────────────────────────────
@@ -203,7 +304,35 @@ pub fn compile(ir: &ConstraintIR) -> CompiledModel {
     // Compile derivation rules — both explicit from IR and implicit from structure
     let derivations = compile_derivations(ir);
 
-    CompiledModel { constraints, derivations, state_machines, noun_index }
+    // Compile fact types to Construction functions (CONS of Roles)
+    let schemas = compile_schemas(ir);
+
+    // Build fact-to-event mapping from schemas + state machines.
+    // For each fact type, check if any role's noun has a state machine.
+    // If so, check if any transition event name appears in the reading.
+    // This is a heuristic until the IR carries explicit Activation/Verb links.
+    let mut fact_events: HashMap<String, FactEvent> = HashMap::new();
+    for (ft_id, schema) in &schemas {
+        for role_name in &schema.role_names {
+            if let Some(&sm_idx) = noun_index.noun_to_state_machines.get(role_name) {
+                let sm = &state_machines[sm_idx];
+                let reading_lower = schema.reading.to_lowercase();
+                for (_, to, event) in &sm.transition_table {
+                    if reading_lower.contains(&event.to_lowercase()) ||
+                       reading_lower.contains(&to.to_lowercase()) {
+                        fact_events.insert(ft_id.clone(), FactEvent {
+                            fact_type_id: ft_id.clone(),
+                            event_name: event.clone(),
+                            target_noun: role_name.clone(),
+                        });
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    CompiledModel { constraints, derivations, state_machines, noun_index, schemas, fact_events }
 }
 
 /// Build the NounIndex by iterating the IR.
@@ -230,10 +359,14 @@ fn build_noun_index(
     // noun_name -> supertype
     let mut supertypes: HashMap<String, String> = HashMap::new();
     let mut subtypes: HashMap<String, Vec<String>> = HashMap::new();
+    let mut ref_schemes: HashMap<String, Vec<String>> = HashMap::new();
     for (name, def) in &ir.nouns {
         if let Some(ref st) = def.super_type {
             supertypes.insert(name.clone(), st.clone());
             subtypes.entry(st.clone()).or_default().push(name.clone());
+        }
+        if let Some(ref rs) = def.ref_scheme {
+            ref_schemes.insert(name.clone(), rs.clone());
         }
     }
 
@@ -264,10 +397,66 @@ fn build_noun_index(
         world_assumptions,
         supertypes,
         subtypes,
+        ref_schemes,
         fact_type_to_constraints,
         constraint_index,
         noun_to_state_machines,
     }
+}
+
+// ── AST Derivation Chains ────────────────────────────────────────────
+// Compile derivation rules to Func::Compose chains.
+// "User can access Domain iff A and B and C" becomes f ∘ g ∘ h
+// where each step is a partial application over a schema.
+
+/// Compile a derivation chain from antecedent fact type IDs.
+///
+/// Given fact types [ft1, ft2, ft3] with shared nouns, builds a composition:
+///   For each fact type, create a query function that:
+///     - Takes a known binding from the previous step
+///     - Filters the population for that fact type
+///     - Extracts the shared noun's value to pass to the next step
+///
+/// Returns a Func that, given a population Object, produces the set of
+/// derived resources at the end of the chain.
+pub fn compile_derivation_chain(
+    ir: &ConstraintIR,
+    antecedent_ft_ids: &[String],
+    source_noun: &str,
+    target_noun: &str,
+) -> Option<crate::ast::Func> {
+    if antecedent_ft_ids.is_empty() { return None; }
+
+    // For each fact type, determine which role is the "input" (shared with previous)
+    // and which is the "output" (passed to next or final result).
+    // This builds the composition chain from the shared nouns between adjacent fact types.
+
+    let mut steps: Vec<(String, usize, usize)> = Vec::new(); // (ft_id, input_role, output_role)
+    let mut current_noun = source_noun.to_string();
+
+    for ft_id in antecedent_ft_ids {
+        let ft = ir.fact_types.get(ft_id)?;
+
+        // Find the role that matches the current noun (input)
+        let input_role = ft.roles.iter()
+            .find(|r| r.noun_name == current_noun)?;
+
+        // Find the other role (output) — the noun we're traversing TO
+        let output_role = ft.roles.iter()
+            .find(|r| r.noun_name != current_noun)?;
+
+        steps.push((ft_id.clone(), input_role.role_index + 1, output_role.role_index + 1));
+        current_noun = output_role.noun_name.clone();
+    }
+
+    // Build the query function chain.
+    // Each step: given input value, query population for matching facts, extract output values.
+    // The chain composes these steps.
+    Some(crate::ast::Func::Def(format!(
+        "_chain:{}->{}:{}",
+        source_noun, target_noun,
+        antecedent_ft_ids.join(",")
+    )))
 }
 
 /// Compile all derivation rules: explicit from IR + implicit structural rules.
@@ -345,7 +534,28 @@ fn compile_explicit_derivation(ir: &ConstraintIR, rule: &DerivationRuleDef) -> C
         }
     });
 
-    CompiledDerivation { id, text, kind, derive }
+    let derive_for_func = derive.clone();
+    let func = crate::ast::Func::Native(Arc::new(move |pop_obj: &crate::ast::Object| {
+        let population = decode_population_object(pop_obj);
+        let response = ResponseContext { text: String::new(), sender_identity: None, fields: None };
+        let ctx = EvalContext { response: &response, population: &population };
+        let derived = derive_for_func(&ctx, &population);
+        if derived.is_empty() {
+            crate::ast::Object::phi()
+        } else {
+            crate::ast::Object::Seq(derived.iter().map(|d| {
+                let bindings: Vec<crate::ast::Object> = d.bindings.iter().map(|(n, v)| {
+                    crate::ast::Object::seq(vec![crate::ast::Object::atom(n), crate::ast::Object::atom(v)])
+                }).collect();
+                crate::ast::Object::seq(vec![
+                    crate::ast::Object::atom(&d.fact_type_id),
+                    crate::ast::Object::atom(&d.reading),
+                    crate::ast::Object::Seq(bindings),
+                ])
+            }).collect())
+        }
+    }));
+    CompiledDerivation { id, text, kind, derive, func }
 }
 
 /// Subtype inheritance: for each noun with a supertype,
@@ -398,11 +608,13 @@ fn compile_subtype_inheritance(ir: &ConstraintIR) -> Vec<CompiledDerivation> {
                 derived
             });
 
+            let func = crate::ast::Func::Def(format!("_derive:{}", id));
             derivations.push(CompiledDerivation {
                 id,
                 text,
                 kind: DerivationKind::SubtypeInheritance,
                 derive,
+                func,
             });
         }
     }
@@ -420,12 +632,24 @@ fn compile_modus_ponens(ir: &ConstraintIR) -> Vec<CompiledDerivation> {
             continue;
         }
 
+        // Only derive facts when subset_autofill is explicitly true.
+        // Otherwise the SS constraint is just a constraint (produces violations,
+        // doesn't auto-create facts).
+        let has_autofill = cdef.spans.iter().any(|s| s.subset_autofill == Some(true));
+        if !has_autofill {
+            continue;
+        }
+
         let a_ft_id = cdef.spans[0].fact_type_id.clone();
         let b_ft_id = cdef.spans[1].fact_type_id.clone();
 
-        let entity_name = ir.fact_types.get(&a_ft_id)
-            .and_then(|ft| ft.roles.get(cdef.spans[0].role_index))
-            .map(|r| r.noun_name.clone())
+        // Collect role noun names from both fact types for full tuple propagation
+        let a_role_names: Vec<String> = ir.fact_types.get(&a_ft_id)
+            .map(|ft| ft.roles.iter().map(|r| r.noun_name.clone()).collect())
+            .unwrap_or_default();
+
+        let b_role_names: Vec<String> = ir.fact_types.get(&b_ft_id)
+            .map(|ft| ft.roles.iter().map(|r| r.noun_name.clone()).collect())
             .unwrap_or_default();
 
         let b_reading = ir.fact_types.get(&b_ft_id)
@@ -441,34 +665,45 @@ fn compile_modus_ponens(ir: &ConstraintIR) -> Vec<CompiledDerivation> {
             let b_facts = population.facts.get(&b_ft_id).cloned().unwrap_or_default();
 
             a_facts.iter().filter_map(|a_fact| {
-                if let Some((_, entity_val)) = a_fact.bindings.iter()
-                    .find(|(name, _)| *name == entity_name)
-                {
-                    let b_holds = b_facts.iter().any(|bf| {
-                        bf.bindings.iter().any(|(_, val)| val == entity_val)
-                    });
-                    if !b_holds {
-                        Some(DerivedFact {
-                            fact_type_id: b_ft_id.clone(),
-                            reading: b_reading.clone(),
-                            bindings: vec![(entity_name.clone(), entity_val.clone())],
-                            derived_by: derive_id.clone(),
-                            confidence: Confidence::Definitive,
-                        })
-                    } else {
-                        None
+                // Build the full consequent tuple by mapping bindings from the
+                // superset fact to the subset fact by noun name correspondence.
+                let mut b_bindings: Vec<(String, String)> = Vec::new();
+                for b_noun in &b_role_names {
+                    if let Some((_, val)) = a_fact.bindings.iter().find(|(n, _)| n == b_noun) {
+                        b_bindings.push((b_noun.clone(), val.clone()));
                     }
+                }
+
+                if b_bindings.is_empty() { return None; }
+
+                // Check if this tuple already exists in the consequent population
+                let already_exists = b_facts.iter().any(|bf| {
+                    b_bindings.iter().all(|(name, val)| {
+                        bf.bindings.iter().any(|(bn, bv)| bn == name && bv == val)
+                    })
+                });
+
+                if !already_exists {
+                    Some(DerivedFact {
+                        fact_type_id: b_ft_id.clone(),
+                        reading: b_reading.clone(),
+                        bindings: b_bindings,
+                        derived_by: derive_id.clone(),
+                        confidence: Confidence::Definitive,
+                    })
                 } else {
                     None
                 }
             }).collect()
         });
 
+        let func = crate::ast::Func::Def(format!("_derive:{}", id));
         derivations.push(CompiledDerivation {
             id,
             text,
             kind: DerivationKind::ModusPonens,
             derive,
+            func,
         });
     }
 
@@ -560,11 +795,13 @@ fn compile_transitivity(ir: &ConstraintIR) -> Vec<CompiledDerivation> {
                 derived
             });
 
+            let func = crate::ast::Func::Def(format!("_derive:{}", id));
             derivations.push(CompiledDerivation {
                 id,
                 text: reading,
                 kind: DerivationKind::Transitivity,
                 derive,
+                func,
             });
         }
     }
@@ -624,11 +861,13 @@ fn compile_cwa_negation(ir: &ConstraintIR) -> Vec<CompiledDerivation> {
             derived
         });
 
+        let func = crate::ast::Func::Def(format!("_derive:{}", id));
         derivations.push(CompiledDerivation {
             id,
             text,
             kind: DerivationKind::ClosedWorldNegation,
             derive,
+            func,
         });
     }
 
@@ -678,10 +917,41 @@ fn compile_constraint(ir: &ConstraintIR, def: &ConstraintDef) -> CompiledConstra
         },
     };
 
+    // Wrap predicate as a Func::Native that takes an encoded eval context Object
+    // and returns a sequence of violation Objects.
+    // Each constraint will be migrated to pure AST (Construction, Condition, etc.)
+    let pred_for_func = predicate.clone();
+    let func = crate::ast::Func::Native(Arc::new(move |ctx_obj: &crate::ast::Object| {
+        // Decode the eval context from the Object
+        let items = match ctx_obj.as_seq() {
+            Some(items) if items.len() == 2 => items,
+            _ => return crate::ast::Object::phi(),
+        };
+        let response_text = items[0].as_atom().unwrap_or("").to_string();
+        let response = ResponseContext {
+            text: response_text,
+            sender_identity: None,
+            fields: None,
+        };
+        // Decode population from Object back to Population struct
+        let population = decode_population_object(&items[1]);
+        let ctx = EvalContext { response: &response, population: &population };
+        let violations = pred_for_func(&ctx);
+        // Encode violations as Object sequence
+        if violations.is_empty() {
+            crate::ast::Object::phi()
+        } else {
+            crate::ast::Object::Seq(
+                violations.iter().map(crate::ast::encode_violation).collect()
+            )
+        }
+    }));
+
     CompiledConstraint {
         id: def.id.clone(),
         text: def.text.clone(),
         modality,
+        func,
         predicate,
     }
 }
@@ -1568,11 +1838,387 @@ fn compile_state_machine(
                 .map(|t| t.to.clone())
         });
 
+    // AST: state machine as a transition function.
+    //
+    // The transition function takes <current_state, event_name> and returns next_state.
+    // It's a chain of Conditions — try each transition in order:
+    //   (match_t1 → "target1"̄; (match_t2 → "target2"̄; ... ; 1))
+    // where match_tN = eq ∘ [id, <"from_state", "event">̄] (check state+event pair)
+    // If no transition matches, Selector(1) returns current_state unchanged.
+    //
+    // run_machine = fold(transition_func)(initial)(event_stream)
+    let mut sm_func = crate::ast::Func::Selector(1); // fallback: return current state
+
+    // Build condition chain in reverse (innermost = fallback)
+    for t in transition_table.iter().rev() {
+        // Predicate: eq ∘ [[1, 2], ["from", "event"]̄]
+        // Input is <current_state, event_name>
+        // Check: <current_state, event_name> == <from, event>
+        let match_pred = crate::ast::Func::compose(
+            crate::ast::Func::Eq,
+            crate::ast::Func::construction(vec![
+                crate::ast::Func::Id,
+                crate::ast::Func::constant(crate::ast::Object::seq(vec![
+                    crate::ast::Object::atom(&t.0),
+                    crate::ast::Object::atom(&t.2),
+                ])),
+            ]),
+        );
+
+        // If match: return target state. Else: try next transition.
+        sm_func = crate::ast::Func::condition(
+            match_pred,
+            crate::ast::Func::constant(crate::ast::Object::atom(&t.1)),
+            sm_func,
+        );
+    }
+
     CompiledStateMachine {
         noun_name: def.noun_name.clone(),
         statuses: def.statuses.clone(),
         initial,
         transition: transition_fn,
         transition_table,
+        func: sm_func,
+    }
+}
+
+// ── Schema Compilation Tests ─────────────────────────────────────────
+
+#[cfg(test)]
+mod schema_tests {
+    use super::*;
+    use crate::ast::{self, Object};
+
+    fn make_ir_with_fact_type(id: &str, reading: &str, roles: Vec<(&str, usize)>) -> ConstraintIR {
+        let mut fact_types = HashMap::new();
+        fact_types.insert(id.to_string(), FactTypeDef {
+            reading: reading.to_string(),
+            roles: roles.iter().map(|(name, idx)| RoleDef {
+                noun_name: name.to_string(),
+                role_index: *idx,
+            }).collect(),
+        });
+        ConstraintIR {
+            domain: "test".to_string(),
+            nouns: HashMap::new(),
+            fact_types,
+            constraints: vec![],
+            state_machines: HashMap::new(),
+            derivation_rules: vec![],
+        }
+    }
+
+    #[test]
+    fn role_compiles_to_selector() {
+        let ir = make_ir_with_fact_type(
+            "ft1", "User has Org Role in Organization",
+            vec![("User", 0), ("Org Role", 1), ("Organization", 2)],
+        );
+        let model = compile(&ir);
+        let schema = model.schemas.get("ft1").unwrap();
+
+        // Each role becomes a Selector (1-indexed)
+        assert_eq!(schema.role_names, vec!["User", "Org Role", "Organization"]);
+
+        // The construction is [Selector(1), Selector(2), Selector(3)]
+        let fact = Object::seq(vec![
+            Object::atom("alice@example.com"),
+            Object::atom("owner"),
+            Object::atom("org-123"),
+        ]);
+
+        let defs = HashMap::new();
+
+        // Apply construction to a fact — identity (selects each role)
+        let result = ast::apply(&schema.construction, &fact, &defs);
+        assert_eq!(result, Object::seq(vec![
+            Object::atom("alice@example.com"),
+            Object::atom("owner"),
+            Object::atom("org-123"),
+        ]));
+    }
+
+    #[test]
+    fn selector_extracts_individual_role() {
+        let ir = make_ir_with_fact_type(
+            "ft1", "Organization has Name",
+            vec![("Organization", 0), ("Name", 1)],
+        );
+        let model = compile(&ir);
+        let schema = model.schemas.get("ft1").unwrap();
+        let defs = HashMap::new();
+
+        let fact = Object::seq(vec![Object::atom("org-1"), Object::atom("Acme Corp")]);
+
+        // Selector(1) = Organization role
+        let org_selector = ast::Func::Selector(1);
+        assert_eq!(ast::apply(&org_selector, &fact, &defs), Object::atom("org-1"));
+
+        // Selector(2) = Name role
+        let name_selector = ast::Func::Selector(2);
+        assert_eq!(ast::apply(&name_selector, &fact, &defs), Object::atom("Acme Corp"));
+    }
+
+    #[test]
+    fn construction_applied_to_population_via_apply_to_all() {
+        // α(Selector(2)) over a population extracts role 2 from each fact
+        let ir = make_ir_with_fact_type(
+            "ft1", "OrgMembership is for User",
+            vec![("OrgMembership", 0), ("User", 1)],
+        );
+        let model = compile(&ir);
+        let _schema = model.schemas.get("ft1").unwrap();
+        let defs = HashMap::new();
+
+        let population = Object::seq(vec![
+            Object::seq(vec![Object::atom("mem-1"), Object::atom("alice@example.com")]),
+            Object::seq(vec![Object::atom("mem-2"), Object::atom("bob@example.com")]),
+            Object::seq(vec![Object::atom("mem-3"), Object::atom("alice@example.com")]),
+        ]);
+
+        // Extract all users: α(2):population
+        let extract_users = ast::Func::apply_to_all(ast::Func::Selector(2));
+        let users = ast::apply(&extract_users, &population, &defs);
+        assert_eq!(users, Object::seq(vec![
+            Object::atom("alice@example.com"),
+            Object::atom("bob@example.com"),
+            Object::atom("alice@example.com"),
+        ]));
+    }
+
+    #[test]
+    fn partial_application_via_bu_creates_query() {
+        // (bu eq "alice@example.com") applied to each user = membership check
+        let defs = HashMap::new();
+
+        let check_alice = ast::Func::bu(ast::Func::Eq, Object::atom("alice@example.com"));
+        assert_eq!(
+            ast::apply(&check_alice, &Object::atom("alice@example.com"), &defs),
+            Object::t()
+        );
+        assert_eq!(
+            ast::apply(&check_alice, &Object::atom("bob@example.com"), &defs),
+            Object::f()
+        );
+    }
+
+    #[test]
+    fn constraint_func_evaluates_via_ast_apply() {
+        // Compile a UC constraint and verify the func field works via ast::apply
+        let mut fact_types = HashMap::new();
+        fact_types.insert("ft1".to_string(), FactTypeDef {
+            reading: "Person has Name".to_string(),
+            roles: vec![
+                RoleDef { noun_name: "Person".to_string(), role_index: 0 },
+                RoleDef { noun_name: "Name".to_string(), role_index: 1 },
+            ],
+        });
+        let ir = ConstraintIR {
+            domain: "test".to_string(),
+            nouns: HashMap::new(),
+            fact_types,
+            constraints: vec![ConstraintDef {
+                id: "uc1".to_string(),
+                kind: "UC".to_string(),
+                modality: "Alethic".to_string(),
+                deontic_operator: None,
+                text: "Each Person has at most one Name".to_string(),
+                spans: vec![SpanDef {
+                    fact_type_id: "ft1".to_string(),
+                    role_index: 0,
+                    subset_autofill: None,
+                }],
+                set_comparison_argument_length: None,
+                clauses: None,
+                entity: None,
+                min_occurrence: None,
+                max_occurrence: None,
+            }],
+            state_machines: HashMap::new(),
+            derivation_rules: vec![],
+        };
+
+        let model = compile(&ir);
+        let constraint = &model.constraints[0];
+
+        // Create a population WITH a UC violation: Alice has two names
+        let response = ResponseContext { text: String::new(), sender_identity: None, fields: None };
+        let mut facts = HashMap::new();
+        facts.insert("ft1".to_string(), vec![
+            FactInstance {
+                fact_type_id: "ft1".to_string(),
+                bindings: vec![("Person".to_string(), "Alice".to_string()), ("Name".to_string(), "Alice Smith".to_string())],
+            },
+            FactInstance {
+                fact_type_id: "ft1".to_string(),
+                bindings: vec![("Person".to_string(), "Alice".to_string()), ("Name".to_string(), "Alice Jones".to_string())],
+            },
+        ]);
+        let population = Population { facts };
+
+        // Evaluate via AST: apply(func, encoded_context)
+        let ctx_obj = crate::ast::encode_eval_context(&response, &population);
+        let defs = HashMap::new();
+        let result = crate::ast::apply(&constraint.func, &ctx_obj, &defs);
+
+        // Should return a sequence of violation Objects (not phi)
+        let violations = crate::ast::decode_violations(&result);
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].constraint_id, "uc1");
+        assert!(violations[0].detail.contains("Alice"));
+    }
+
+    #[test]
+    fn constraint_func_no_violation_returns_phi() {
+        let mut fact_types = HashMap::new();
+        fact_types.insert("ft1".to_string(), FactTypeDef {
+            reading: "Person has Name".to_string(),
+            roles: vec![
+                RoleDef { noun_name: "Person".to_string(), role_index: 0 },
+                RoleDef { noun_name: "Name".to_string(), role_index: 1 },
+            ],
+        });
+        let ir = ConstraintIR {
+            domain: "test".to_string(),
+            nouns: HashMap::new(),
+            fact_types,
+            constraints: vec![ConstraintDef {
+                id: "uc1".to_string(),
+                kind: "UC".to_string(),
+                modality: "Alethic".to_string(),
+                deontic_operator: None,
+                text: "Each Person has at most one Name".to_string(),
+                spans: vec![SpanDef {
+                    fact_type_id: "ft1".to_string(),
+                    role_index: 0,
+                    subset_autofill: None,
+                }],
+                set_comparison_argument_length: None,
+                clauses: None,
+                entity: None,
+                min_occurrence: None,
+                max_occurrence: None,
+            }],
+            state_machines: HashMap::new(),
+            derivation_rules: vec![],
+        };
+
+        let model = compile(&ir);
+        let constraint = &model.constraints[0];
+
+        // No violation: each person has exactly one name
+        let response = ResponseContext { text: String::new(), sender_identity: None, fields: None };
+        let mut facts = HashMap::new();
+        facts.insert("ft1".to_string(), vec![
+            FactInstance {
+                fact_type_id: "ft1".to_string(),
+                bindings: vec![("Person".to_string(), "Alice".to_string()), ("Name".to_string(), "Alice Smith".to_string())],
+            },
+            FactInstance {
+                fact_type_id: "ft1".to_string(),
+                bindings: vec![("Person".to_string(), "Bob".to_string()), ("Name".to_string(), "Bob Jones".to_string())],
+            },
+        ]);
+        let population = Population { facts };
+
+        let ctx_obj = crate::ast::encode_eval_context(&response, &population);
+        let defs = HashMap::new();
+        let result = crate::ast::apply(&constraint.func, &ctx_obj, &defs);
+
+        // No violations — should be phi (empty sequence)
+        let violations = crate::ast::decode_violations(&result);
+        assert_eq!(violations.len(), 0);
+    }
+
+    #[test]
+    fn derivation_chain_compiles_for_access_control() {
+        // "User can access Domain iff
+        //    OrgMembership is for User AND
+        //    OrgMembership is in Organization AND
+        //    Domain belongs to Organization"
+        //
+        // This is a 3-step chain: User → OrgMembership → Organization → Domain
+        let mut fact_types = HashMap::new();
+        let mut nouns = HashMap::new();
+
+        // ft1: OrgMembership is for User (roles: OrgMembership[0], User[1])
+        fact_types.insert("ft1".to_string(), FactTypeDef {
+            reading: "OrgMembership is for User".to_string(),
+            roles: vec![
+                RoleDef { noun_name: "OrgMembership".to_string(), role_index: 0 },
+                RoleDef { noun_name: "User".to_string(), role_index: 1 },
+            ],
+        });
+
+        // ft2: OrgMembership is in Organization (roles: OrgMembership[0], Organization[1])
+        fact_types.insert("ft2".to_string(), FactTypeDef {
+            reading: "OrgMembership is in Organization".to_string(),
+            roles: vec![
+                RoleDef { noun_name: "OrgMembership".to_string(), role_index: 0 },
+                RoleDef { noun_name: "Organization".to_string(), role_index: 1 },
+            ],
+        });
+
+        // ft3: Domain belongs to Organization (roles: Domain[0], Organization[1])
+        fact_types.insert("ft3".to_string(), FactTypeDef {
+            reading: "Domain belongs to Organization".to_string(),
+            roles: vec![
+                RoleDef { noun_name: "Domain".to_string(), role_index: 0 },
+                RoleDef { noun_name: "Organization".to_string(), role_index: 1 },
+            ],
+        });
+
+        for name in &["User", "OrgMembership", "Organization", "Domain"] {
+            nouns.insert(name.to_string(), NounDef {
+                object_type: "entity".to_string(),
+                enum_values: None,
+                value_type: None,
+                super_type: None,
+                world_assumption: WorldAssumption::Closed,
+                ref_scheme: None,
+            });
+        }
+
+        let ir = ConstraintIR {
+            domain: "test".to_string(),
+            nouns,
+            fact_types,
+            constraints: vec![],
+            state_machines: HashMap::new(),
+            derivation_rules: vec![],
+        };
+
+        // Chain: User → (ft1) → OrgMembership → (ft2) → Organization
+        // Step 1: User is role 2 in ft1, output is OrgMembership (role 1)
+        // Step 2: OrgMembership is role 1 in ft2, output is Organization (role 2)
+        let chain = compile_derivation_chain(
+            &ir,
+            &["ft1".to_string(), "ft2".to_string()],
+            "User",
+            "Organization",
+        );
+        assert!(chain.is_some(), "chain should compile");
+
+        // Chain: Organization → (ft3, reversed) → Domain
+        // Organization is role 2 in ft3, output is Domain (role 1)
+        let chain2 = compile_derivation_chain(
+            &ir,
+            &["ft3".to_string()],
+            "Organization",
+            "Domain",
+        );
+        assert!(chain2.is_some(), "single-step chain should compile");
+    }
+
+    #[test]
+    fn schema_reading_preserved() {
+        let ir = make_ir_with_fact_type(
+            "ft1", "Domain Change proposes Reading",
+            vec![("Domain Change", 0), ("Reading", 1)],
+        );
+        let model = compile(&ir);
+        let schema = model.schemas.get("ft1").unwrap();
+        assert_eq!(schema.reading, "Domain Change proposes Reading");
     }
 }

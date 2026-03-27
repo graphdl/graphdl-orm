@@ -30,9 +30,9 @@ Modality Type is a value type.
 World Assumption is a value type.
   The possible values of World Assumption are 'closed', 'open'.
 
-This association with Reading, Verb provides the preferred identification scheme for Reading Is Used By Verb.
+This association with Graph Schema, Verb provides the preferred identification scheme for Activation.
 
-This association with Reading Is Used By Verb, HTTP Method provides the preferred identification scheme for API.
+This association with Activation, HTTP Method provides the preferred identification scheme for API.
 
 Language(.code) is an entity type.
 
@@ -162,7 +162,7 @@ Reading has Text.
   It is possible that more than one Reading has the same Text.
 Reading is used by Verb.
   Each Reading is used by exactly one Verb.
-  It is possible that some Verb uses more than one Reading.
+  It is possible that some Verb is used by more than one Reading.
 Reading is localized for Language.
   Each Reading is localized for at most one Language.
   It is possible that more than one Reading is localized for the same Language.
@@ -200,7 +200,8 @@ Role has Position for Reading.
 Verb has Name.
   Each Verb has exactly one Name.
   It is possible that more than one Verb has the same Name.
-Reading is used by Verb.
+Graph Schema is activated by Verb.
+  In each population of Graph Schema is activated by Verb, each Graph Schema, Verb combination occurs at most once.
 Verb executes Function.
   Each Verb executes at most one Function.
 Event Type can be created by Verb.
@@ -266,13 +267,13 @@ Stream has Name.
   Each Stream has exactly one Name.
   It is possible that more than one Stream has the same Name.
 
-### API (objectification of "Reading Is Used By Verb is by HTTP Method")
+### Activation (objectification of "Graph Schema is activated by Verb")
+Activation is by HTTP Method.
+
+### API (objectification of "Activation is by HTTP Method")
 API has endpoint URI.
   Each API has exactly one endpoint URI.
   For each endpoint URI, at most one API has that endpoint URI.
-
-### Reading Is Used By Verb (objectification of "Reading is used by Verb")
-Reading Is Used By Verb is by HTTP Method.
 
 ### UI Element
 Noun is displayed by UI Element.
@@ -340,3 +341,5 @@ Constraint Type 'IT' has Name 'Intransitive'.
 Constraint Type 'TR' has Name 'Transitive'.
 Constraint Type 'AC' has Name 'Acyclic'.
 Constraint Type 'VC' has Name 'ValueComparison'.
+
+Domain 'core' has Visibility 'public'.

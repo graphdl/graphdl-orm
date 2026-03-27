@@ -53,7 +53,7 @@ export function ingestNouns(
       if (noun.valueType) data.valueType = noun.valueType
       if (noun.format) data.format = noun.format
       const enumVals = noun.enumValues || noun.enum
-      if (enumVals) data.enumValues = Array.isArray(enumVals) ? enumVals.join(', ') : enumVals
+      if (enumVals) data.enumValues = JSON.stringify(Array.isArray(enumVals) ? enumVals : [enumVals])
       if (noun.minimum !== undefined) data.minimum = noun.minimum
       if (noun.maximum !== undefined) data.maximum = noun.maximum
       if (noun.pattern) data.pattern = noun.pattern
@@ -354,16 +354,18 @@ export function ingestTransitions(
       }
 
       // Ensure state machine definition (find by noun + domain in batch)
-      const existingDefs = builder.findEntities('StateMachineDefinition', {
+      const existingDefs = builder.findEntities('State Machine Definition', {
         noun: noun.id,
         domain: domainId,
       })
 
       const definitionId = existingDefs.length
         ? existingDefs[0].id
-        : builder.addEntity('StateMachineDefinition', {
+        : builder.addEntity('State Machine Definition', {
             title: entityName,
+            name: entityName,
             noun: noun.id,
+            forNoun: entityName,
             domain: domainId,
           })
 
@@ -376,22 +378,31 @@ export function ingestTransitions(
         eventNames.add(t.event)
       }
 
+      // Detect initial status from explicit marking or heuristic
+      const explicitInitial = entityTransitions.find((t: any) => t.initial)?.initial
+      const toStates = new Set(entityTransitions.map((t: any) => t.to))
+      const heuristicInitial = [...stateNames].find(s => !toStates.has(s))
+
       // Ensure statuses
       const statusMap = new Map<string, string>()
       for (const name of stateNames) {
+        const isInitial = name === explicitInitial || (!explicitInitial && name === heuristicInitial)
         const statusId = builder.ensureEntity('Status', 'name', `${definitionId}:${name}`, {
           name,
           stateMachineDefinition: definitionId,
-        })
+          definedInStateMachineDefinition: definitionId,
+          ...(isInitial && { isInitial: true }),
+        }, true)
         statusMap.set(name, statusId)
       }
 
       // Ensure event types
       const eventMap = new Map<string, string>()
       for (const name of eventNames) {
-        const eventId = builder.ensureEntity('EventType', 'name', name, {
+        const eventId = builder.ensureEntity('Event Type', 'name', `${definitionId}:${name}`, {
           name,
-        })
+          stateMachineDefinition: definitionId,
+        }, true)
         eventMap.set(name, eventId)
       }
 
@@ -410,8 +421,12 @@ export function ingestTransitions(
 
         if (!existingTransitions.length) {
           builder.addEntity('Transition', {
+            name: t.event,
             from: fromId,
             to: toId,
+            fromStatus: t.from,
+            toStatus: t.to,
+            triggeredByEventType: t.event,
             eventType: eventId,
             stateMachineDefinition: definitionId,
             domain: domainId,
@@ -464,6 +479,22 @@ export async function ingestFacts(
   scope: Scope,
   builder?: BatchBuilder,
 ): Promise<void> {
+  // Pre-process: build Status → SM Definition map for composite IDs.
+  // "Status 'Draft' is defined in State Machine Definition 'Order'" → statusSmMap["Draft"] = "Order"
+  const statusSmMap = new Map<string, string>()
+  for (const fact of facts) {
+    if (fact.entity === 'Status' && fact.entityValue &&
+        fact.valueType === 'State Machine Definition' && fact.value) {
+      statusSmMap.set(fact.entityValue, fact.value)
+    }
+    // Also match the reading-based format
+    if (fact.reading?.includes('is defined in State Machine Definition') && fact.values?.length === 2) {
+      const statusVal = fact.values.find(v => v.noun === 'Status')?.value
+      const smVal = fact.values.find(v => v.noun === 'State Machine Definition')?.value
+      if (statusVal && smVal) statusSmMap.set(statusVal, smVal)
+    }
+  }
+
   for (const fact of facts) {
     try {
       // Normalize: convert entity-centric format to reading-centric
@@ -494,7 +525,7 @@ export async function ingestFacts(
           } else {
             builder.ensureEntity(entityName, 'name', entityRef, {
               name: entityRef, domain: domainId, [fieldName]: true,
-            })
+            }, true)
           }
           continue
         }
@@ -555,9 +586,15 @@ export async function ingestFacts(
 
       // Metamodel entity types → BatchBuilder (creates EntityDB DOs)
       if (builder && isKnownEntityType(entityName, builder)) {
-        const id = builder.ensureEntity(entityName, 'name', entityRef, {
+        // Composite IDs for Status and EventType (scoped by SM definition)
+        let compositeRef = entityRef
+        if (entityName === 'Status' || entityName === 'Event Type') {
+          const smDef = statusSmMap.get(entityRef) || fieldValues.definedInStateMachineDefinition || fieldValues.stateMachineDefinition
+          if (smDef) compositeRef = `${smDef}:${entityRef}`
+        }
+        const id = builder.ensureEntity(entityName, 'name', compositeRef, {
           name: entityRef, domain: domainId, ...fieldValues,
-        })
+        }, true)
         // For multi-fact entities (Transition has 3 facts), merge fields
         if (Object.keys(fieldValues).length > 0) {
           builder.updateEntity(id, fieldValues)

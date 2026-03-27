@@ -361,7 +361,7 @@ describe('2. Claim ingestion', () => {
     expect(negligenceNoun!.data.superType).toBeDefined()
   })
 
-  it('ingests enum values as comma-separated string', async () => {
+  it('ingests enum values as JSON array string', async () => {
     const db = mockDb()
     const claims: ExtractedClaims = {
       nouns: [
@@ -374,7 +374,7 @@ describe('2. Claim ingestion', () => {
     const result = await ingestClaims(db as any, { claims, domainId: 'd1' })
 
     const nouns = batchEntities(result, 'Noun')
-    expect(nouns[0].data.enumValues).toBe('High, Medium, Low')
+    expect(nouns[0].data.enumValues).toBe('["High","Medium","Low"]')
   })
 })
 
@@ -754,14 +754,14 @@ describe('7. World assumption behavior', () => {
     const ir = {
       domain: 'test',
       nouns: {
-        'Government Power': { objectType: 'entity', worldAssumption: 'closed' },
+        'Permission': { objectType: 'entity', worldAssumption: 'closed' },
       },
       factTypes: {},
       constraints: [],
       stateMachines: {},
       derivationRules: [],
     }
-    const result = synthesizeFallback(ir, 'Government Power', 1)
+    const result = synthesizeFallback(ir, 'Permission', 1)
     expect(result.worldAssumption).toBe('closed')
     // Under CWA, absence of facts means definitive non-existence
     expect(result.participatesIn).toHaveLength(0)
@@ -771,14 +771,14 @@ describe('7. World assumption behavior', () => {
     const ir = {
       domain: 'test',
       nouns: {
-        'Individual Right': { objectType: 'entity', worldAssumption: 'open' },
+        'Capability': { objectType: 'entity', worldAssumption: 'open' },
       },
       factTypes: {},
       constraints: [],
       stateMachines: {},
       derivationRules: [],
     }
-    const result = synthesizeFallback(ir, 'Individual Right', 1)
+    const result = synthesizeFallback(ir, 'Capability', 1)
     expect(result.worldAssumption).toBe('open')
     // Under OWA, absence of facts means incomplete knowledge, not non-existence
     expect(result.participatesIn).toHaveLength(0)

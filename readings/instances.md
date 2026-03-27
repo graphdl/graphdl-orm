@@ -94,3 +94,7 @@ Guard Run references Graph.
   For each combination of Guard Run and Graph, that Guard Run references that Graph at most once.
 Guard Run has Result.
   Each Guard Run has at most one Result.
+
+## Instance Facts
+
+Domain 'instances' has Visibility 'public'.

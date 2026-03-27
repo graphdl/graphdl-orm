@@ -689,7 +689,7 @@ mod tests {
         let mut ir = empty_ir();
         ir.nouns.insert("SenderIdentityValue".to_string(), NounDef {
             object_type: "value".to_string(),
-            enum_values: Some(vec!["Auto.dev Team <team@auto.dev>".to_string()]),
+            enum_values: Some(vec!["Support Team <support@example.com>".to_string()]),
             value_type: Some("string".to_string()),
             super_type: None,
             world_assumption: WorldAssumption::default(),
@@ -986,16 +986,16 @@ mod tests {
     fn test_cwa_vs_owa_negation() {
         let mut ir = empty_ir();
 
-        // CWA noun: GovernmentPower (not stated = false)
-        ir.nouns.insert("GovernmentPower".to_string(), NounDef {
+        // CWA noun: Permission (not stated = false)
+        ir.nouns.insert("Permission".to_string(), NounDef {
             object_type: "entity".to_string(),
             enum_values: None,
             value_type: None,
             super_type: None,
             world_assumption: WorldAssumption::Closed,
         });
-        // OWA noun: IndividualRight (not stated = unknown)
-        ir.nouns.insert("IndividualRight".to_string(), NounDef {
+        // OWA noun: Capability (not stated = unknown)
+        ir.nouns.insert("Capability".to_string(), NounDef {
             object_type: "entity".to_string(),
             enum_values: None,
             value_type: None,
@@ -1007,46 +1007,46 @@ mod tests {
 
         // Fact type involving CWA noun
         ir.fact_types.insert("ft_power".to_string(), FactTypeDef {
-            reading: "GovernmentPower grants Authority".to_string(),
+            reading: "Permission grants Authority".to_string(),
             roles: vec![
-                RoleDef { noun_name: "GovernmentPower".to_string(), role_index: 0 },
+                RoleDef { noun_name: "Permission".to_string(), role_index: 0 },
                 RoleDef { noun_name: "Authority".to_string(), role_index: 1 },
             ],
         });
         // Fact type involving OWA noun
         ir.fact_types.insert("ft_right".to_string(), FactTypeDef {
-            reading: "IndividualRight protects Authority".to_string(),
+            reading: "Capability protects Authority".to_string(),
             roles: vec![
-                RoleDef { noun_name: "IndividualRight".to_string(), role_index: 0 },
+                RoleDef { noun_name: "Capability".to_string(), role_index: 0 },
                 RoleDef { noun_name: "Authority".to_string(), role_index: 1 },
             ],
         });
 
         let compiled = crate::compile::compile(&ir);
 
-        // CWA derivation should exist for GovernmentPower
+        // CWA derivation should exist for Permission
         let cwa_derivations: Vec<_> = compiled.derivations.iter()
             .filter(|d| d.kind == DerivationKind::ClosedWorldNegation)
             .collect();
 
         let cwa_for_power = cwa_derivations.iter()
-            .any(|d| d.id.contains("GovernmentPower"));
+            .any(|d| d.id.contains("Permission"));
         assert!(cwa_for_power,
-            "Expected CWA negation derivation for GovernmentPower");
+            "Expected CWA negation derivation for Permission");
 
-        // No CWA derivation for IndividualRight (it's OWA)
+        // No CWA derivation for Capability (it's OWA)
         let cwa_for_right = cwa_derivations.iter()
-            .any(|d| d.id.contains("IndividualRight"));
+            .any(|d| d.id.contains("Capability"));
         assert!(!cwa_for_right,
-            "Expected NO CWA negation derivation for IndividualRight (OWA noun)");
+            "Expected NO CWA negation derivation for Capability (OWA noun)");
 
-        // Forward chain with a population where GovernmentPower exists
+        // Forward chain with a population where Permission exists
         // but doesn't participate in ft_power
         let mut facts = HashMap::new();
-        // GovernmentPower "tax" exists (via some other fact type)
+        // Permission "tax" exists (via some other fact type)
         facts.insert("ft_other".to_string(), vec![FactInstance {
             fact_type_id: "ft_other".to_string(),
-            bindings: vec![("GovernmentPower".to_string(), "tax".to_string())],
+            bindings: vec![("Permission".to_string(), "tax".to_string())],
         }]);
         let mut population = Population { facts };
         let response = empty_response();
@@ -1058,7 +1058,7 @@ mod tests {
             .filter(|d| d.derived_by.contains("cwa_negation") && d.reading.contains("NOT"))
             .collect();
         assert!(!negation_facts.is_empty(),
-            "Expected CWA to derive negation for GovernmentPower 'tax' not in ft_power");
+            "Expected CWA to derive negation for Permission 'tax' not in ft_power");
         assert_eq!(negation_facts[0].confidence, Confidence::Definitive);
     }
 

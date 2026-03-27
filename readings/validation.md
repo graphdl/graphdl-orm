@@ -43,3 +43,7 @@ It is forbidden that a Reading restates a Noun reference scheme as a separate fa
 ### Elementary Fact Decomposition
 
 It is forbidden that a Reading conjoins two independent assertions using 'and' when they can be expressed as separate Readings.
+
+## Instance Facts
+
+Domain 'validation' has Visibility 'public'.

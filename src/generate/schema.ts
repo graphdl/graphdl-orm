@@ -11,6 +11,7 @@ export interface DomainSchema {
     valueType?: string
     superType?: string
     worldAssumption?: 'closed' | 'open'
+    refScheme?: string[]
   }>
   factTypes: Record<string, {
     reading: string

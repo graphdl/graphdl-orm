@@ -148,3 +148,7 @@ If some Resource is instance of some Noun and some Entity List displays instance
 If some List Item displays some Resource and that Resource is deleted then that List Item is removed.
 If some Entity List has Scroll Style 'infinite-scroll' then for each Page of that Entity List, that Page appends to the existing List Items.
 If some Entity List has Scroll Style 'paginated' then for each Page of that Entity List, that Page replaces the current List Items.
+
+## Instance Facts
+
+Domain 'ui' has Visibility 'public'.

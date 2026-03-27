@@ -1,91 +1,100 @@
 /**
- * Maps noun names (as they appear in readings) to their metamodel table names.
- * Used by queryEntities to resolve the correct table for metamodel entities.
+ * Convention-based naming utilities for noun → slug/table name derivation.
+ *
+ * Noun names are the authority (from readings, seeded as Noun entities).
+ * Slugs and table names are deterministic projections of those names.
+ * No hardcoded maps — the Registry is the source of truth for what nouns exist.
  */
-export const NOUN_TABLE_MAP: Record<string, string> = {
-  'Organization': 'organizations',
-  'Domain': 'domains',
-  'App': 'apps',
-  'Noun': 'nouns',
-  'Graph Schema': 'graph_schemas',
-  'Reading': 'readings',
-  'Role': 'roles',
-  'Constraint': 'constraints',
-  'Constraint Span': 'constraint_spans',
-  'State Machine Definition': 'state_machine_definitions',
-  'Status': 'statuses',
-  'Transition': 'transitions',
-  'Guard': 'guards',
-  'Event Type': 'event_types',
-  'Verb': 'verbs',
-  'Function': 'functions',
-  'Stream': 'streams',
-  'Resource': 'resources',
-  'Graph': 'graphs',
-  'State Machine': 'state_machines',
-  'Event': 'events',
-  'Guard Run': 'guard_runs',
-  'Agent Definition': 'agent_definitions',
-  'Agent': 'agents',
-  'Model': 'models',
-  'Completion': 'completions',
-  'Citation': 'citations',
+
+// ---------------------------------------------------------------------------
+// Pluralization
+// ---------------------------------------------------------------------------
+
+/**
+ * Simple English pluralization for noun names.
+ * Handles common ORM2 patterns: Status→statuses, Entity→entities, App→apps
+ */
+export function pluralize(word: string): string {
+  const lower = word.toLowerCase()
+  if (lower.endsWith('z')) {
+    return word + 'zes' // Quiz → Quizzes (double z)
+  }
+  if (lower.endsWith('ss') || lower.endsWith('sh') || lower.endsWith('ch') || lower.endsWith('x')) {
+    return word + 'es'
+  }
+  if (lower.endsWith('s')) {
+    return word + 'es' // Status → Statuses
+  }
+  if (lower.endsWith('y') && !/[aeiou]y$/i.test(word)) {
+    return word.slice(0, -1) + 'ies' // Entity → Entities
+  }
+  return word + 's'
+}
+
+// ---------------------------------------------------------------------------
+// Noun name → collection slug (kebab-case, pluralized)
+// ---------------------------------------------------------------------------
+
+/**
+ * Derive a REST collection slug from a noun name.
+ *
+ * "Organization"             → "organizations"
+ * "OrgMembership"            → "org-memberships"
+ * "Graph Schema"             → "graph-schemas"
+ * "State Machine Definition" → "state-machine-definitions"
+ * "Status"                   → "statuses"
+ */
+export function nounToSlug(name: string): string {
+  const words = name.includes(' ')
+    ? name.split(/\s+/)
+    : name.split(/(?=[A-Z])/).filter(Boolean)
+
+  return words
+    .map((w, i) => (i === words.length - 1 ? pluralize(w) : w).toLowerCase())
+    .join('-')
+}
+
+// ---------------------------------------------------------------------------
+// Noun name → SQL table name (snake_case, pluralized)
+// ---------------------------------------------------------------------------
+
+/**
+ * Derive a SQL table name from a noun name.
+ *
+ * "Organization"    → "organizations"
+ * "OrgMembership"   → "org_memberships"
+ * "Graph Schema"    → "graph_schemas"
+ * "Support Request" → "support_requests"
+ * "Status"          → "statuses"
+ */
+export function nounToTable(name: string): string {
+  const words = name.includes(' ')
+    ? name.split(/\s+/)
+    : name.split(/(?=[A-Z])/).filter(Boolean)
+
+  return words
+    .map((w, i) => (i === words.length - 1 ? pluralize(w) : w).toLowerCase())
+    .join('_')
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic slug → noun resolution via Registry
+// ---------------------------------------------------------------------------
+
+export interface NounRegistry {
+  getRegisteredNouns(): Promise<string[]>
 }
 
 /**
- * Maps Payload CMS collection slugs (kebab-case) to SQLite table names (snake_case).
+ * Resolve a collection slug to its noun type name by querying the Registry
+ * for all noun names (seeded from readings) and matching via nounToSlug convention.
  *
- * The apis worker rawProxy uses Payload slugs in /graphdl/raw/<slug> URLs.
- * This map translates them to our 3NF table names.
+ * Returns null if no registered noun produces the given slug.
  */
-export const COLLECTION_TABLE_MAP: Record<string, string> = {
-  // Organizations & access
-  'organizations': 'organizations',
-  'org-memberships': 'org_memberships',
-  'apps': 'apps',
-  'domains': 'domains',
-
-  // Core metamodel
-  'nouns': 'nouns',
-  'graph-schemas': 'graph_schemas',
-  'readings': 'readings',
-  'roles': 'roles',
-  'constraints': 'constraints',
-  'constraint-spans': 'constraint_spans',
-
-  // State machine definitions
-  'state-machine-definitions': 'state_machine_definitions',
-  'statuses': 'statuses',
-  'transitions': 'transitions',
-  'guards': 'guards',
-  'event-types': 'event_types',
-  'verbs': 'verbs',
-  'functions': 'functions',
-  'streams': 'streams',
-
-  // AI agent entities
-  'models': 'models',
-  'agent-definitions': 'agent_definitions',
-  'agents': 'agents',
-  'completions': 'completions',
-
-  // Generator output
-  'generators': 'generators',
-
-  // Citations
-  'citations': 'citations',
-  'graph-citations': 'graph_citations',
-
-  // Runtime instances
-  'graphs': 'graphs',
-  'resources': 'resources',
-  'resource-roles': 'resource_roles',
-  'state-machines': 'state_machines',
-  'events': 'events',
-  'guard-runs': 'guard_runs',
+export async function resolveSlugToNoun(registry: NounRegistry, slug: string): Promise<string | null> {
+  const nouns = await registry.getRegisteredNouns()
+  for (const noun of nouns) {
+    if (nounToSlug(noun) === slug) return noun
+  }
+  return null
 }
-
-/** All supported Payload collection slugs. */
-export const COLLECTION_SLUGS = Object.keys(COLLECTION_TABLE_MAP)
-
-

@@ -3,7 +3,7 @@
 ## Entity Types
 
 State Machine Definition(.Title) is an entity type.
-Status(.Name) is an entity type.
+Status(.Name, .State Machine Definition) is an entity type.
 Transition is an entity type.
 Guard(.Name) is an entity type.
 
@@ -59,3 +59,7 @@ Guard prevents Transition.
 For each Status, some Transition is from that Status or some Transition is to that Status.
 For each State Machine Definition, some Status is defined in that State Machine Definition.
 For each Noun, at most one State Machine Definition is for that Noun.
+
+## Instance Facts
+
+Domain 'state' has Visibility 'public'.
