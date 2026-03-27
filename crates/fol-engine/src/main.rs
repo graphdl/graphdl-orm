@@ -23,7 +23,6 @@ mod parse_rule;
 mod arest;
 
 use types::{ConstraintIR, ResponseContext, Population};
-use compile::EvalContext;
 use query::QueryPredicate;
 
 fn main() {
@@ -87,12 +86,7 @@ fn main() {
     // ── Forward chain mode ───────────────────────────────────────────
     if do_forward_chain {
         let mut population = load_population(population_path, true);
-        let response = ResponseContext {
-            text: String::new(),
-            sender_identity: None,
-            fields: None,
-        };
-        let derived = evaluate::forward_chain(&model, &response, &mut population);
+        let derived = evaluate::forward_chain_ast(&model, &mut population);
         if derived.is_empty() {
             println!("No new facts derived");
         } else {
@@ -135,8 +129,7 @@ fn main() {
     };
 
     let population = load_population(population_path, false);
-    let ctx = EvalContext { response: &response, population: &population };
-    let violations = evaluate::evaluate(&model, &ctx);
+    let violations = evaluate::evaluate_via_ast(&model, &response, &population);
 
     if violations.is_empty() {
         println!("OK — no violations");
