@@ -30,12 +30,11 @@ use crate::types::*;
 // The legacy Predicate/DeriveFn/EvalContext types are deleted.
 // Evaluation is beta reduction: apply(func, object, defs) → object.
 
-/// Legacy predicate type — kept temporarily while compile_* functions
-/// are migrated to produce Func nodes directly. Will be deleted.
-pub type Predicate = Arc<dyn Fn(&EvalContext) -> Vec<Violation> + Send + Sync>;
+/// Internal predicate type — closures wrapped inside Func::Native nodes.
+pub(crate) type Predicate = Arc<dyn Fn(&EvalContext) -> Vec<Violation> + Send + Sync>;
 
-/// Legacy evaluation context — will be replaced by Object encoding.
-pub struct EvalContext<'a> {
+/// Internal evaluation context — used inside Func::Native closures.
+pub(crate) struct EvalContext<'a> {
     pub response: &'a ResponseContext,
     pub population: &'a Population,
 }
@@ -53,47 +52,32 @@ pub enum DeonticOp {
     Permitted,
 }
 
-/// A compiled constraint. The `func` field is the AST — evaluation is
-/// apply(func, eval_context_object) → sequence of violation objects.
-///
-/// The `predicate` field is a transitional bridge: it wraps the same
-/// logic as a closure so the existing evaluate() path works while
-/// constraint compilers are migrated to emit pure Func nodes.
+/// A compiled constraint. Evaluation is apply(func, eval_context_object) → violations.
 pub struct CompiledConstraint {
     pub id: String,
     pub text: String,
     pub modality: Modality,
-    /// Func: Object → Object. Takes encoded eval context, returns violation sequence.
     pub func: crate::ast::Func,
-    /// Transitional bridge — same logic as func, as a closure.
-    pub predicate: Predicate,
 }
 
-/// Legacy derivation fn type — transitional.
-pub type DeriveFn = Arc<dyn Fn(&EvalContext, &Population) -> Vec<DerivedFact> + Send + Sync>;
+/// Internal derivation fn type — closures wrapped inside Func::Native nodes.
+pub(crate) type DeriveFn = Arc<dyn Fn(&EvalContext, &Population) -> Vec<DerivedFact> + Send + Sync>;
 
-/// A compiled derivation rule. The `func` field is the AST.
+/// A compiled derivation rule. Evaluation is apply(func, population_object) → derived facts.
 pub struct CompiledDerivation {
     pub id: String,
     pub text: String,
     pub kind: DerivationKind,
-    /// Func: Object → Object. Takes population, returns derived fact sequence.
     pub func: crate::ast::Func,
-    /// Transitional bridge.
-    pub derive: DeriveFn,
 }
 
-/// A compiled state machine. The `func` field is Insert(transition) — fold over events.
+/// A compiled state machine. func is the transition function: <state, event> → state'.
 pub struct CompiledStateMachine {
     pub noun_name: String,
     pub statuses: Vec<String>,
     pub initial: String,
-    /// Func: Insert(Condition(guard, Constant(next), Id)) — fold over event stream.
     pub func: crate::ast::Func,
-    /// Compiled transitions as (from, to, event) for introspection.
     pub transition_table: Vec<(String, String, String)>,
-    /// Transitional bridge.
-    pub transition: Arc<dyn Fn(&str, &str, &EvalContext) -> Option<String> + Send + Sync>,
 }
 
 /// Index for fast noun lookups during synthesis.
@@ -290,12 +274,8 @@ pub fn compile(ir: &ConstraintIR) -> CompiledModel {
         .map(|def| compile_constraint(ir, def))
         .collect();
 
-    let constraint_predicates: HashMap<String, Predicate> = constraints.iter()
-        .map(|c| (c.id.clone(), c.predicate.clone()))
-        .collect();
-
     let state_machines: Vec<CompiledStateMachine> = ir.state_machines.values()
-        .map(|sm_def| compile_state_machine(sm_def, &constraint_predicates))
+        .map(|sm_def| compile_state_machine(sm_def))
         .collect();
 
     // Build NounIndex for synthesis queries
@@ -555,7 +535,32 @@ fn compile_explicit_derivation(ir: &ConstraintIR, rule: &DerivationRuleDef) -> C
             }).collect())
         }
     }));
-    CompiledDerivation { id, text, kind, derive, func }
+    CompiledDerivation { id, text, kind, func }
+}
+
+/// Wrap a DeriveFn closure in a Func::Native that decodes the population Object,
+/// calls the closure, and encodes the result back to an Object sequence.
+fn wrap_derive_fn(derive: DeriveFn) -> crate::ast::Func {
+    crate::ast::Func::Native(Arc::new(move |pop_obj: &crate::ast::Object| {
+        let population = decode_population_object(pop_obj);
+        let response = ResponseContext { text: String::new(), sender_identity: None, fields: None };
+        let ctx = EvalContext { response: &response, population: &population };
+        let derived = derive(&ctx, &population);
+        if derived.is_empty() {
+            crate::ast::Object::phi()
+        } else {
+            crate::ast::Object::Seq(derived.iter().map(|d| {
+                let bindings: Vec<crate::ast::Object> = d.bindings.iter().map(|(n, v)| {
+                    crate::ast::Object::seq(vec![crate::ast::Object::atom(n), crate::ast::Object::atom(v)])
+                }).collect();
+                crate::ast::Object::seq(vec![
+                    crate::ast::Object::atom(&d.fact_type_id),
+                    crate::ast::Object::atom(&d.reading),
+                    crate::ast::Object::Seq(bindings),
+                ])
+            }).collect())
+        }
+    }))
 }
 
 /// Subtype inheritance: for each noun with a supertype,
@@ -608,12 +613,11 @@ fn compile_subtype_inheritance(ir: &ConstraintIR) -> Vec<CompiledDerivation> {
                 derived
             });
 
-            let func = crate::ast::Func::Def(format!("_derive:{}", id));
+            let func = wrap_derive_fn(derive);
             derivations.push(CompiledDerivation {
                 id,
                 text,
                 kind: DerivationKind::SubtypeInheritance,
-                derive,
                 func,
             });
         }
@@ -697,12 +701,11 @@ fn compile_modus_ponens(ir: &ConstraintIR) -> Vec<CompiledDerivation> {
             }).collect()
         });
 
-        let func = crate::ast::Func::Def(format!("_derive:{}", id));
+        let func = wrap_derive_fn(derive);
         derivations.push(CompiledDerivation {
             id,
             text,
             kind: DerivationKind::ModusPonens,
-            derive,
             func,
         });
     }
@@ -795,12 +798,11 @@ fn compile_transitivity(ir: &ConstraintIR) -> Vec<CompiledDerivation> {
                 derived
             });
 
-            let func = crate::ast::Func::Def(format!("_derive:{}", id));
+            let func = wrap_derive_fn(derive);
             derivations.push(CompiledDerivation {
                 id,
                 text: reading,
                 kind: DerivationKind::Transitivity,
-                derive,
                 func,
             });
         }
@@ -861,12 +863,11 @@ fn compile_cwa_negation(ir: &ConstraintIR) -> Vec<CompiledDerivation> {
             derived
         });
 
-        let func = crate::ast::Func::Def(format!("_derive:{}", id));
+        let func = wrap_derive_fn(derive);
         derivations.push(CompiledDerivation {
             id,
             text,
             kind: DerivationKind::ClosedWorldNegation,
-            derive,
             func,
         });
     }
@@ -923,18 +924,23 @@ fn compile_constraint(ir: &ConstraintIR, def: &ConstraintDef) -> CompiledConstra
     let pred_for_func = predicate.clone();
     let func = crate::ast::Func::Native(Arc::new(move |ctx_obj: &crate::ast::Object| {
         // Decode the eval context from the Object
+        // Structure: <response_text, sender_identity, population>
         let items = match ctx_obj.as_seq() {
-            Some(items) if items.len() == 2 => items,
+            Some(items) if items.len() == 3 => items,
             _ => return crate::ast::Object::phi(),
         };
         let response_text = items[0].as_atom().unwrap_or("").to_string();
+        let sender_identity = match &items[1] {
+            crate::ast::Object::Atom(s) => Some(s.clone()),
+            _ => None,
+        };
         let response = ResponseContext {
             text: response_text,
-            sender_identity: None,
+            sender_identity,
             fields: None,
         };
         // Decode population from Object back to Population struct
-        let population = decode_population_object(&items[1]);
+        let population = decode_population_object(&items[2]);
         let ctx = EvalContext { response: &response, population: &population };
         let violations = pred_for_func(&ctx);
         // Encode violations as Object sequence
@@ -952,7 +958,6 @@ fn compile_constraint(ir: &ConstraintIR, def: &ConstraintDef) -> CompiledConstra
         text: def.text.clone(),
         modality,
         func,
-        predicate,
     }
 }
 
@@ -1788,72 +1793,19 @@ fn compile_obligatory(ir: &ConstraintIR, def: &ConstraintDef) -> Predicate {
 // State machines compile to transition functions.
 // run_machine = fold(transition)(initial)(stream)
 
-struct CompiledTransition {
-    from: String,
-    to: String,
-    event: String,
-    guard: Predicate,
-}
-
-fn compile_state_machine(
-    def: &StateMachineDef,
-    constraint_predicates: &HashMap<String, Predicate>,
-) -> CompiledStateMachine {
-    // Build transition table for introspection
+fn compile_state_machine(def: &StateMachineDef) -> CompiledStateMachine {
     let transition_table: Vec<(String, String, String)> = def.transitions.iter()
         .map(|t| (t.from.clone(), t.to.clone(), t.event.clone()))
         .collect();
 
-    let transitions: Vec<CompiledTransition> = def.transitions.iter()
-        .map(|t| {
-            let guard_preds: Vec<Predicate> = t.guard.as_ref()
-                .map(|g| g.constraint_ids.iter()
-                    .filter_map(|cid| constraint_predicates.get(cid).cloned())
-                    .collect())
-                .unwrap_or_default();
-
-            // Guard passes iff all constraint predicates produce zero violations
-            let guard: Predicate = Arc::new(move |ctx: &EvalContext| {
-                guard_preds.iter()
-                    .flat_map(|p| p(ctx))
-                    .collect()
-            });
-
-            CompiledTransition {
-                from: t.from.clone(),
-                to: t.to.clone(),
-                event: t.event.clone(),
-                guard,
-            }
-        })
-        .collect();
-
     let initial = def.statuses.first().cloned().unwrap_or_default();
 
-    // Transition function: find first matching (from, event) where guard passes
-    let transition_fn: Arc<dyn Fn(&str, &str, &EvalContext) -> Option<String> + Send + Sync> =
-        Arc::new(move |state: &str, event: &str, ctx: &EvalContext| {
-            transitions.iter()
-                .find(|t| t.from == state && t.event == event && (t.guard)(ctx).is_empty())
-                .map(|t| t.to.clone())
-        });
-
-    // AST: state machine as a transition function.
-    //
-    // The transition function takes <current_state, event_name> and returns next_state.
-    // It's a chain of Conditions — try each transition in order:
-    //   (match_t1 → "target1"̄; (match_t2 → "target2"̄; ... ; 1))
-    // where match_tN = eq ∘ [id, <"from_state", "event">̄] (check state+event pair)
-    // If no transition matches, Selector(1) returns current_state unchanged.
-    //
-    // run_machine = fold(transition_func)(initial)(event_stream)
-    let mut sm_func = crate::ast::Func::Selector(1); // fallback: return current state
-
-    // Build condition chain in reverse (innermost = fallback)
+    // AST: transition function <current_state, event> → next_state.
+    // Chain of Conditions — first matching (from, event) fires:
+    //   (match_t1 → target1; (match_t2 → target2; ... ; sel₁))
+    // Selector(1) = return current state unchanged (no match).
+    let mut sm_func = crate::ast::Func::Selector(1);
     for t in transition_table.iter().rev() {
-        // Predicate: eq ∘ [[1, 2], ["from", "event"]̄]
-        // Input is <current_state, event_name>
-        // Check: <current_state, event_name> == <from, event>
         let match_pred = crate::ast::Func::compose(
             crate::ast::Func::Eq,
             crate::ast::Func::construction(vec![
@@ -1864,8 +1816,6 @@ fn compile_state_machine(
                 ])),
             ]),
         );
-
-        // If match: return target state. Else: try next transition.
         sm_func = crate::ast::Func::condition(
             match_pred,
             crate::ast::Func::constant(crate::ast::Object::atom(&t.1)),
@@ -1877,7 +1827,6 @@ fn compile_state_machine(
         noun_name: def.noun_name.clone(),
         statuses: def.statuses.clone(),
         initial,
-        transition: transition_fn,
         transition_table,
         func: sm_func,
     }

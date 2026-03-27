@@ -25,7 +25,7 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 
 use types::{ConstraintIR, ResponseContext, Population, Violation, SynthesisResult, WorldAssumption};
-use compile::{CompiledModel, EvalContext};
+use compile::CompiledModel;
 
 struct CompiledState {
     ir: ConstraintIR,

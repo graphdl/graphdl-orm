@@ -102,14 +102,19 @@ impl fmt::Display for Object {
 use crate::types::{Population, FactInstance, ResponseContext, Violation};
 
 /// Encode an evaluation context (response + population) as a single Object.
-/// Structure: <response_text, <fact_type₁, fact_type₂, ...>>
+/// Structure: <response_text, sender_identity, population>
+/// sender_identity: atom if present, φ if None
 /// Each fact_type: <fact_type_id, <fact₁, fact₂, ...>>
 /// Each fact: <binding₁, binding₂, ...>
 /// Each binding: <noun_name, value>
 pub fn encode_eval_context(response: &ResponseContext, population: &Population) -> Object {
     let response_obj = Object::atom(&response.text);
+    let sender_obj = match &response.sender_identity {
+        Some(s) => Object::atom(s),
+        None => Object::phi(),
+    };
     let pop_obj = encode_population(population);
-    Object::seq(vec![response_obj, pop_obj])
+    Object::seq(vec![response_obj, sender_obj, pop_obj])
 }
 
 /// Encode a population as an Object.
