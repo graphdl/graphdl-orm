@@ -10,10 +10,17 @@
 // function application — no dispatch, no branching on kind, no mutable state.
 // Implements Backus's FP algebra (1977).
 
+mod ast;
 mod types;
 mod compile;
 mod evaluate;
 mod query;
+mod rmap;
+mod naming;
+mod csdp;
+mod conceptual_query;
+mod parse_rule;
+mod arest;
 
 use types::{ConstraintIR, ResponseContext, Population};
 use compile::EvalContext;

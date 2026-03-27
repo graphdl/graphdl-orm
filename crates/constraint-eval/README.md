@@ -100,9 +100,9 @@ Collect all knowledge about a noun: participating fact types, applicable constra
 
 The engine supports dual-mode reasoning via the `WorldAssumption` type on each noun:
 
-**Closed World (default):** If a fact is not in the store and not derivable, it is false. This is the standard database assumption. Applied to government powers, corporate authority, statutory obligations — if the law doesn't grant the power, it doesn't exist.
+**Closed World (default):** If a fact is not in the store and not derivable, it is false. This is the standard database assumption. Applied to permissions, corporate authority — if the permission is not granted, it does not exist.
 
-**Open World:** If a fact is not in the store and not derivable, it is unknown (not false). Applied to individual rights, freedoms, liberties — the absence of an enumerated right does not deny its existence.
+**Open World:** If a fact is not in the store and not derivable, it is unknown (not false). Applied to capabilities, unenumerated abilities — the absence of an explicit capability does not deny its existence.
 
 This distinction is not an implementation detail. It encodes the 9th and 10th Amendments to the United States Constitution:
 

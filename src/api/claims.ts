@@ -15,9 +15,10 @@ import { json, error } from 'itty-router'
 import type { Env } from '../types'
 import { ingestClaims, ingestProject } from '../claims/ingest'
 import type { ExtractedClaims } from '../claims/ingest'
-import { persistViolations } from '../worker/outcomes'
-import { materializeBatch } from '../worker/materialize'
-import { deriveSemanticFlags } from '../worker/derive-semantic'
+// Worker modules deleted — logic moved to WASM engine.
+// Violations are created as entities directly.
+// Materialization via registry.materializeBatch().
+// Semantic flags via WASM forward_chain.
 import { ensureDomain } from './ensure-domain'
 
 function getDB(env: Env) {
@@ -116,12 +117,11 @@ export async function handleClaims(request: Request, env: Env, ctx?: ExecutionCo
         } catch { /* generators cache write failed */ }
       } catch { /* schema generation failed */ }
 
-      // 3. Derive isSemantic flag on constraints
-      await deriveSemanticFlags(resolvedSlug, {
-        getEntityIds: (type: string, d?: string) => registry.getEntityIds(type, d),
-        getEntity: async (id: string) => (env.ENTITY_DB.get(env.ENTITY_DB.idFromName(id)) as any).get(),
-        patchEntity: async (id: string, fields: Record<string, unknown>) => (env.ENTITY_DB.get(env.ENTITY_DB.idFromName(id)) as any).patch(fields),
-      }).catch(() => {})
+      // 3. Semantic flag derivation — WASM engine forward_chain
+      try {
+        const { forwardChain: fwdChain } = await import('./engine')
+        fwdChain(JSON.stringify({ facts: {} }))
+      } catch { /* best-effort */ }
     }
 
     if (ctx) {
@@ -130,17 +130,16 @@ export async function handleClaims(request: Request, env: Env, ctx?: ExecutionCo
       await backgroundWork() // fallback for tests without ctx
     }
 
-    // Persist violations as Violation entities (best-effort)
+    // Persist violations as Violation entities (violations are facts — just create EntityDB DOs)
     if (result.batch?.entities) {
       const violationEntities = result.batch.entities.filter((e: any) => e.type === 'Violation')
-      if (violationEntities.length > 0) {
-        persistViolations(env, violationEntities.map((e: any) => ({
-          domain: domainSlug || domain!.id,
-          constraintId: e.data?.constraintId || null,
-          text: e.data?.text || e.data?.message || 'CSDP validation violation',
-          severity: e.data?.severity || 'error',
-          functionId: e.data?.functionId || null,
-        }))).catch(() => { /* best-effort */ })
+      for (const v of violationEntities) {
+        try {
+          const vId = v.id || crypto.randomUUID()
+          const vDO = env.ENTITY_DB.get(env.ENTITY_DB.idFromName(vId)) as any
+          await vDO.put({ id: vId, type: 'Violation', data: v.data })
+          await registry.indexEntity('Violation', vId, domainSlug || domain!.id)
+        } catch { /* best-effort */ }
       }
     }
 

@@ -21,8 +21,8 @@ pub struct ConstraintIR {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum WorldAssumption {
-    Closed, // not stated = false (government powers, corporate authority)
-    Open,   // not stated = unknown (individual rights, unenumerated freedoms)
+    Closed, // not stated = false (permissions, corporate authority)
+    Open,   // not stated = unknown (capabilities, unenumerated abilities)
 }
 
 impl Default for WorldAssumption {
@@ -36,11 +36,15 @@ impl Default for WorldAssumption {
 pub struct NounDef {
     pub object_type: String,
     pub enum_values: Option<Vec<String>>,
-    #[allow(dead_code)] // deserialized from JSON, read by JS callers
+    #[allow(dead_code)]
     pub value_type: Option<String>,
     pub super_type: Option<String>,
     #[serde(default)]
     pub world_assumption: WorldAssumption,
+    /// Reference scheme value type names, e.g. ["Org Slug"] for Organization(.Org Slug).
+    /// When present and not ["id"], entity IDs are derived from the field value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_scheme: Option<Vec<String>>,
 }
 
 /// A derivation rule in the IR — compiled to a DeriveFn at compile time.

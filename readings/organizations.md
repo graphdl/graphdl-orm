@@ -87,3 +87,7 @@ User can view only own Resource in App iff User has Org Role 'member' in Organiz
 
 App shows Domain iff App has navigable Domain and that Domain is that Domain.
 App shows Entity Type iff App has navigable Domain and some Noun is defined in that Domain and Entity Type is that Noun.
+
+## Instance Facts
+
+Domain 'organizations' has Visibility 'public'.

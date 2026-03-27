@@ -26,12 +26,15 @@ export class BatchBuilder {
   /**
    * Find-or-add: if an entity of the given type with keyField=keyValue
    * already exists in this batch, return its id. Otherwise add it.
+   *
+   * When useKeyAsId is true, the keyValue becomes the entity ID
+   * (for instance entities whose reference scheme defines their identity).
    */
-  ensureEntity(type: string, keyField: string, keyValue: string, data: Record<string, unknown>): string {
+  ensureEntity(type: string, keyField: string, keyValue: string, data: Record<string, unknown>, useKeyAsId?: boolean): string {
     const lookupKey = `${type}:${keyField}:${keyValue}`
     const existing = this.index.get(lookupKey)
     if (existing) return existing
-    const id = this.addEntity(type, data)
+    const id = this.addEntity(type, data, useKeyAsId ? keyValue : undefined)
     this.index.set(lookupKey, id)
     return id
   }

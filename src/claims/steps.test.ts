@@ -74,7 +74,7 @@ describe('ingestNouns', () => {
     ingestNouns(builder, nouns, 'd1', scope)
 
     const nounEntities = entitiesOfType(builder, 'Noun')
-    expect(nounEntities[0].data.enumValues).toBe('Low, Medium, High')
+    expect(nounEntities[0].data.enumValues).toBe('["Low","Medium","High"]')
   })
 
   it('auto-detects open-world assumption for matching noun names', () => {
@@ -340,9 +340,9 @@ describe('ingestTransitions', () => {
     ], 'd1', scope)
 
     expect(count).toBe(1) // 1 entity = 1 state machine
-    expect(entitiesOfType(builder, 'StateMachineDefinition')).toHaveLength(1)
+    expect(entitiesOfType(builder, 'State Machine Definition')).toHaveLength(1)
     expect(entitiesOfType(builder, 'Status')).toHaveLength(3) // New, Shipped, Delivered
-    expect(entitiesOfType(builder, 'EventType')).toHaveLength(2) // Ship, Deliver
+    expect(entitiesOfType(builder, 'Event Type')).toHaveLength(2) // Ship, Deliver
     expect(entitiesOfType(builder, 'Transition')).toHaveLength(2)
   })
 

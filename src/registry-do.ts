@@ -242,6 +242,15 @@ export function resolveNounInRegistry(sql: SqlLike, nounName: string): { domainS
   }
 }
 
+/**
+ * Returns all distinct noun names from the noun_index.
+ * These are the nouns seeded from readings — the source of truth for what entity types exist.
+ */
+export function getRegisteredNouns(sql: SqlLike): string[] {
+  const rows = sql.exec('SELECT DISTINCT noun_name FROM noun_index ORDER BY noun_name').toArray()
+  return rows.map((row: any) => row.noun_name)
+}
+
 // =========================================================================
 // Durable Object class
 // =========================================================================
@@ -325,16 +334,42 @@ export class RegistryDB extends DurableObject {
     return getEntityCounts(this.ctx.storage.sql, domainSlug)
   }
 
+  async getRegisteredNouns(): Promise<string[]> {
+    this.ensureInit()
+    return getRegisteredNouns(this.ctx.storage.sql)
+  }
+
   /**
    * Materialize a batch of entities: fan out to EntityDB DOs + index in Registry.
    * Runs INSIDE the Registry DO — no subrequest limit on DO-to-DO calls.
-   * All entities are materialized in parallel (one Promise.allSettled).
+   *
+   * Idempotent: for each domain in the batch, existing entities of the same
+   * types are deindexed first. Re-seeding the same readings replaces metamodel
+   * entities without duplicates. Instance entities of other types are preserved.
    */
   async materializeBatch(
     entities: Array<{ id: string; type: string; domain: string; data: Record<string, unknown> }>,
   ): Promise<{ materialized: number; failed: string[] }> {
     this.ensureInit()
     const entityDB = (this.env as any).ENTITY_DB as DurableObjectNamespace
+
+    // Deindex existing entities of the same types+domains (idempotent replace)
+    const domainTypes = new Map<string, Set<string>>()
+    for (const entity of entities) {
+      if (!entity.domain) continue
+      if (!domainTypes.has(entity.domain)) domainTypes.set(entity.domain, new Set())
+      domainTypes.get(entity.domain)!.add(entity.type)
+    }
+    for (const [domain, types] of domainTypes) {
+      for (const type of types) {
+        this.ctx.storage.sql.exec(
+          'UPDATE entity_index SET deleted=1 WHERE domain_slug=? AND noun_type=? AND deleted=0',
+          domain, type,
+        )
+      }
+      // Re-index nouns for this domain (will be repopulated from batch)
+      this.ctx.storage.sql.exec('DELETE FROM noun_index WHERE domain_slug=?', domain)
+    }
 
     const results = await Promise.allSettled(
       entities.map(async (entity) => {

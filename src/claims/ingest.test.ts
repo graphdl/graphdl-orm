@@ -154,7 +154,7 @@ describe('ingestClaims', () => {
     const result = await ingestClaims(db as any, { claims, domainId: 'd1' })
 
     const nouns = batchEntities(result, 'Noun')
-    expect(nouns[0].data.enumValues).toBe('Low, Medium, High')
+    expect(nouns[0].data.enumValues).toBe('["Low","Medium","High"]')
   })
 
   it('handles derivation readings (predicate :=)', async () => {
@@ -320,5 +320,5 @@ Each Customer has at most one Priority.
     expect(priorityNoun!.data.enumValues).toContain('Low')
   })
 
-  // SPD-1 ingestion tests moved to spd-1 repo (tests belong with fixtures)
+  // External domain tests belong in their respective repos
 })

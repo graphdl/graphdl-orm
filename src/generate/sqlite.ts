@@ -10,26 +10,12 @@
 // Name conversion helpers
 // ---------------------------------------------------------------------------
 
-import { NOUN_TABLE_MAP } from '../collections'
+import { nounToTable } from '../collections'
 import type { TableDef } from '../rmap/procedure'
 
-/** Noun name → SQL table name. Checks metamodel mapping first, then generates snake_case plural. */
+/** Noun name → SQL table name. Derived from naming convention, not a hardcoded map. */
 export function toTableName(name: string): string {
-  // Check metamodel table mapping (handles irregular plurals like Status → statuses)
-  if (NOUN_TABLE_MAP[name]) return NOUN_TABLE_MAP[name]
-
-  // Handle spaced names: "Support Request" → "support_requests"
-  if (name.includes(' ')) {
-    return name.toLowerCase().replace(/\s+/g, '_') + 's'
-  }
-
-  // PascalCase → snake_case plural
-  return (
-    name
-      .replace(/([A-Z])/g, '_$1')
-      .toLowerCase()
-      .replace(/^_/, '') + 's'
-  )
+  return nounToTable(name)
 }
 
 /** camelCase → snake_case (column name). */

@@ -9,7 +9,7 @@
  * 5. WebSocket CDC broadcast
  */
 
-import { NOUN_TABLE_MAP } from './collections'
+import { nounToTable } from './collections'
 import { initBatchSchema, createBatch, getBatch, markCommitted, markFailed, getPendingBatches } from './batch-wal'
 import type { BatchEntity, Batch } from './batch-wal'
 import {
@@ -530,7 +530,7 @@ export class DomainDB extends DurableObject {
       schemaMap = await this.applySchema(domainId)
     }
     const { toTableName } = await import('./generate/sqlite')
-    const tableName = NOUN_TABLE_MAP[nounName] || schemaMap.tableMap[nounName] || toTableName(nounName)
+    const tableName = schemaMap.tableMap[nounName] || toTableName(nounName)
     try {
       this.sql.exec(`SELECT 1 FROM ${tableName} LIMIT 0`)
     } catch {

@@ -1,27 +1,78 @@
 import { describe, it, expect } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { COLLECTION_TABLE_MAP, COLLECTION_SLUGS } from './collections'
+import { nounToSlug, nounToTable, pluralize } from './collections'
 
-describe('collections', () => {
-  it('maps all Payload collection slugs to table names', () => {
-    expect(COLLECTION_TABLE_MAP['nouns']).toBe('nouns')
-    expect(COLLECTION_TABLE_MAP['graph-schemas']).toBe('graph_schemas')
-    expect(COLLECTION_TABLE_MAP['readings']).toBe('readings')
-    expect(COLLECTION_TABLE_MAP['constraint-spans']).toBe('constraint_spans')
-    expect(COLLECTION_TABLE_MAP['state-machine-definitions']).toBe('state_machine_definitions')
-    expect(COLLECTION_TABLE_MAP['state-machines']).toBe('state_machines')
-    expect(COLLECTION_TABLE_MAP['resource-roles']).toBe('resource_roles')
-    expect(COLLECTION_TABLE_MAP['event-types']).toBe('event_types')
-    expect(COLLECTION_TABLE_MAP['guard-runs']).toBe('guard_runs')
-    expect(COLLECTION_TABLE_MAP['org-memberships']).toBe('org_memberships')
+describe('pluralize', () => {
+  it('adds -es for words ending in s, sh, ch, x, z', () => {
+    expect(pluralize('Status')).toBe('Statuses')
+    expect(pluralize('Crash')).toBe('Crashes')
+    expect(pluralize('Match')).toBe('Matches')
+    expect(pluralize('Box')).toBe('Boxes')
+    expect(pluralize('Quiz')).toBe('Quizzes')
   })
 
-  it('lists all collection slugs', () => {
-    expect(COLLECTION_SLUGS.length).toBeGreaterThanOrEqual(23)
-    expect(COLLECTION_SLUGS).toContain('nouns')
-    expect(COLLECTION_SLUGS).toContain('graph-schemas')
-    expect(COLLECTION_SLUGS).toContain('domains')
+  it('handles consonant + y → ies', () => {
+    expect(pluralize('Entity')).toBe('Entities')
+    expect(pluralize('Category')).toBe('Categories')
+  })
+
+  it('keeps vowel + y → ys', () => {
+    expect(pluralize('Key')).toBe('Keys')
+    expect(pluralize('Day')).toBe('Days')
+  })
+
+  it('adds -s for regular words', () => {
+    expect(pluralize('Organization')).toBe('Organizations')
+    expect(pluralize('Noun')).toBe('Nouns')
+    expect(pluralize('App')).toBe('Apps')
+  })
+})
+
+describe('nounToSlug', () => {
+  it('converts single-word nouns', () => {
+    expect(nounToSlug('Organization')).toBe('organizations')
+    expect(nounToSlug('Noun')).toBe('nouns')
+    expect(nounToSlug('Status')).toBe('statuses')
+    expect(nounToSlug('App')).toBe('apps')
+    expect(nounToSlug('Verb')).toBe('verbs')
+  })
+
+  it('converts PascalCase compound nouns', () => {
+    expect(nounToSlug('OrgMembership')).toBe('org-memberships')
+    expect(nounToSlug('ResourceRole')).toBe('resource-roles')
+    expect(nounToSlug('GuardRun')).toBe('guard-runs')
+    expect(nounToSlug('AgentDefinition')).toBe('agent-definitions')
+  })
+
+  it('converts space-separated nouns', () => {
+    expect(nounToSlug('Graph Schema')).toBe('graph-schemas')
+    expect(nounToSlug('State Machine Definition')).toBe('state-machine-definitions')
+    expect(nounToSlug('Constraint Span')).toBe('constraint-spans')
+    expect(nounToSlug('Event Type')).toBe('event-types')
+    expect(nounToSlug('Guard Run')).toBe('guard-runs')
+    expect(nounToSlug('State Machine')).toBe('state-machines')
+  })
+})
+
+describe('nounToTable', () => {
+  it('converts single-word nouns to snake_case plural', () => {
+    expect(nounToTable('Organization')).toBe('organizations')
+    expect(nounToTable('Status')).toBe('statuses')
+    expect(nounToTable('Noun')).toBe('nouns')
+  })
+
+  it('converts PascalCase compound nouns', () => {
+    expect(nounToTable('OrgMembership')).toBe('org_memberships')
+    expect(nounToTable('SupportRequest')).toBe('support_requests')
+    expect(nounToTable('ResourceRole')).toBe('resource_roles')
+  })
+
+  it('converts space-separated nouns', () => {
+    expect(nounToTable('Graph Schema')).toBe('graph_schemas')
+    expect(nounToTable('State Machine Definition')).toBe('state_machine_definitions')
+    expect(nounToTable('Constraint Span')).toBe('constraint_spans')
+    expect(nounToTable('Event Type')).toBe('event_types')
   })
 })
 

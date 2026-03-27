@@ -1,6 +1,6 @@
 import { json, error } from 'itty-router'
 import type { Env } from '../types'
-import { persistViolations } from '../worker/outcomes'
+// Violations are facts — persisted as EntityDB DOs directly.
 // @ts-ignore — WASM module imported by wrangler's CompiledWasm rule
 import wasmModule from '../../crates/fol-engine/pkg/fol_engine_bg.wasm'
 // @ts-ignore — WASM JS bindings (web target with initSync)
@@ -79,31 +79,10 @@ export async function handleEvaluate(request: Request, env: Env): Promise<Respon
     } catch { /* resolution failed — continue with null genResult */ }
   }
 
-  // Deterministic text check — runs regardless of FOL schema availability
-  const { checkDeterministicText, buildTextConstraints } = await import('../worker/deterministic-text-check')
-  let textViolations: any[] = []
-  try {
-    const registry = env.REGISTRY_DB.get(env.REGISTRY_DB.idFromName('global')) as any
-    // Resolve domain slug — entities are indexed by slug, not UUID
-    let domainSlug = body.domainId!
-    try {
-      const slugResult: string | null = await registry.resolveSlugByUUID(body.domainId!)
-      if (slugResult) domainSlug = slugResult
-    } catch { /* use domainId as-is */ }
-    const constraintIds: string[] = await registry.getEntityIds('Constraint', domainSlug)
-    const nounIds: string[] = await registry.getEntityIds('Noun', domainSlug)
-    const [constraintEntities, nounEntities] = await Promise.all([
-      Promise.all(constraintIds.map(id => (env.ENTITY_DB.get(env.ENTITY_DB.idFromName(id)) as any).get())),
-      Promise.all(nounIds.map(id => (env.ENTITY_DB.get(env.ENTITY_DB.idFromName(id)) as any).get())),
-    ])
-    const textConstraints = buildTextConstraints(
-      constraintEntities.filter(Boolean),
-      nounEntities.filter(Boolean),
-    )
-    if (textConstraints.length > 0 && body.response?.text) {
-      textViolations = checkDeterministicText(body.response.text, textConstraints)
-    }
-  } catch { /* best-effort — continue to FOL evaluation */ }
+  // Deterministic text checks are now compiled into the WASM engine's
+  // constraint predicates (forbidden/obligatory). They run as part of
+  // evaluate_response via the compiled AST, not as a separate TS module.
+  const textViolations: any[] = []
 
   // Load domain schema for FOL evaluation
   const schemaOutput = genResult?.docs?.[0]?.output
@@ -157,12 +136,14 @@ export async function handleEvaluate(request: Request, env: Env): Promise<Respon
 
     // Best-effort: persist violations as EntityDB DOs (don't block response)
     if (violations.length > 0) {
-      persistViolations(env, violations.map((v: any) => ({
-        domain: body.domainId!,
-        constraintId: v.constraintId ?? null,
-        text: v.detail || v.constraintText || 'Constraint violation',
-        triggeredByResourceId: v.resourceId ?? undefined,
-      }))).catch(() => { /* swallow — best-effort persistence */ })
+      // Violations are facts — persist as EntityDB DOs (best-effort)
+      for (const v of violations) {
+        try {
+          const vId = crypto.randomUUID()
+          const vDO = env.ENTITY_DB.get(env.ENTITY_DB.idFromName(vId)) as any
+          await vDO.put({ id: vId, type: 'Violation', data: { domain: body.domainId, constraintId: v.constraintId, text: v.detail || v.constraintText } })
+        } catch { /* best-effort */ }
+      }
     }
 
     // Merge text violations with FOL violations
@@ -177,11 +158,13 @@ export async function handleEvaluate(request: Request, env: Env): Promise<Respon
 
     // Persist all violations
     if (allViolations.length > 0) {
-      persistViolations(env, allViolations.map((v: any) => ({
-        domain: body.domainId!,
-        constraintId: v.constraintId ?? null,
-        text: v.detail || v.constraintText || 'Constraint violation',
-      }))).catch(() => { /* best-effort */ })
+      for (const v of allViolations) {
+        try {
+          const vId = crypto.randomUUID()
+          const vDO = env.ENTITY_DB.get(env.ENTITY_DB.idFromName(vId)) as any
+          await vDO.put({ id: vId, type: 'Violation', data: { domain: body.domainId, constraintId: v.constraintId, text: v.detail || v.constraintText } })
+        } catch { /* best-effort */ }
+      }
     }
 
     return json({

@@ -659,6 +659,21 @@ export function parseFORML2(
   const nouns = [...nounMap.values()]
   const coverage = totalLines > 0 ? parsedLines / totalLines : 1
 
+  // ── Extract state machine data from instance facts ─────────────────
+  // Instance facts like "Status 'Draft' is defined in State Machine Definition 'Order'"
+  // and "Transition 'place' is from Status 'Draft'" should be processed as structured
+  // transition data, not as individual entity facts. This ensures composite IDs and
+  // atomic state machine creation.
+  const smData = extractStateMachineFromFacts(facts)
+  if (smData.transitions.length > 0) {
+    transitions.push(...smData.transitions)
+    // Remove the extracted facts so they don't create duplicate entities
+    const extractedIndices = new Set(smData.extractedIndices)
+    const remainingFacts = facts.filter((_: any, i: number) => !extractedIndices.has(i))
+    facts.length = 0
+    facts.push(...remainingFacts)
+  }
+
   return {
     nouns,
     readings,
@@ -670,6 +685,126 @@ export function parseFORML2(
     unparsed,
     coverage,
   }
+}
+
+// ── State Machine Extraction from Instance Facts ─────────────────────
+// Recognizes patterns:
+//   "State Machine Definition 'X' is for Noun 'Y'"
+//   "Status 'S' is defined in State Machine Definition 'X'"
+//   "Status 'S' is initial."
+//   "Transition 'T' is from Status 'S'"
+//   "Transition 'T' is to Status 'S'"
+//   "Transition 'T' is triggered by Event Type 'E'"
+// and converts them to the structured transition format that ingestTransitions expects.
+
+function extractStateMachineFromFacts(facts: any[]): { transitions: any[]; extractedIndices: number[] } {
+  const smDefs = new Map<string, string>()  // SM name → noun name
+  const statusSm = new Map<string, string>()  // status name → SM name
+  const initialStatuses = new Set<string>()
+  const transitionFrom = new Map<string, string>()  // transition name → from status
+  const transitionTo = new Map<string, string>()    // transition name → to status
+  const transitionEvent = new Map<string, string>()  // transition name → event type
+  const extractedIndices: number[] = []
+
+  for (let i = 0; i < facts.length; i++) {
+    const f = facts[i]
+
+    // "State Machine Definition 'X' is for Noun 'Y'"
+    if (f.entity === 'State Machine Definition' && f.valueType === 'Noun' && f.entityValue && f.value) {
+      smDefs.set(f.entityValue, f.value)
+      extractedIndices.push(i)
+      continue
+    }
+
+    // "Status 'S' is defined in State Machine Definition 'X'"
+    if (f.entity === 'Status' && f.valueType === 'State Machine Definition' && f.entityValue && f.value) {
+      statusSm.set(f.entityValue, f.value)
+      extractedIndices.push(i)
+      continue
+    }
+
+    // "Status 'S' is initial."
+    if (f.entity === 'Status' && f.entityValue && f.predicate === 'is initial' && !f.valueType) {
+      initialStatuses.add(f.entityValue)
+      extractedIndices.push(i)
+      continue
+    }
+
+    // "Transition 'T' is from Status 'S'"
+    if (f.entity === 'Transition' && f.valueType === 'Status' && f.entityValue && f.value) {
+      if (f.predicate === 'is from' || f.reading?.includes('is from')) {
+        transitionFrom.set(f.entityValue, f.value)
+        extractedIndices.push(i)
+        continue
+      }
+      if (f.predicate === 'is to' || f.reading?.includes('is to')) {
+        transitionTo.set(f.entityValue, f.value)
+        extractedIndices.push(i)
+        continue
+      }
+    }
+
+    // "Transition 'T' is triggered by Event Type 'E'"
+    if (f.entity === 'Transition' && f.valueType === 'Event Type' && f.entityValue && f.value) {
+      transitionEvent.set(f.entityValue, f.value)
+      extractedIndices.push(i)
+      continue
+    }
+  }
+
+  // Build structured transition data grouped by SM definition
+  const smTransitions = new Map<string, { noun: string; states: Set<string>; initial?: string; transitions: Array<{ from: string; to: string; event: string }> }>()
+
+  for (const [smName, nounName] of smDefs) {
+    smTransitions.set(smName, { noun: nounName, states: new Set(), transitions: [] })
+  }
+
+  // Assign statuses to their SM definitions
+  for (const [statusName, smName] of statusSm) {
+    let sm = smTransitions.get(smName)
+    if (!sm) {
+      sm = { noun: smName, states: new Set(), transitions: [] }
+      smTransitions.set(smName, sm)
+    }
+    sm.states.add(statusName)
+    if (initialStatuses.has(statusName)) {
+      sm.initial = statusName
+    }
+  }
+
+  // Build transitions
+  for (const [tName, from] of transitionFrom) {
+    const to = transitionTo.get(tName) || ''
+    const event = transitionEvent.get(tName) || tName
+    if (!from || !to) continue
+
+    // Find which SM this transition belongs to (by from status)
+    for (const [smName, sm] of smTransitions) {
+      if (sm.states.has(from)) {
+        sm.transitions.push({ from, to, event })
+        break
+      }
+    }
+  }
+
+  // Flatten to the format ingestTransitions expects:
+  // [{ entity: "Order", from: "Draft", to: "Placed", event: "place", initial: "Draft" }, ...]
+  // The `initial` field is set on every transition for the same entity so ingestTransitions
+  // can mark the correct status.
+  const result: any[] = []
+  for (const [_smName, sm] of smTransitions) {
+    for (const t of sm.transitions) {
+      result.push({
+        entity: sm.noun,
+        from: t.from,
+        to: t.to,
+        event: t.event,
+        ...(sm.initial && { initial: sm.initial }),
+      })
+    }
+  }
+
+  return { transitions: result, extractedIndices }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────

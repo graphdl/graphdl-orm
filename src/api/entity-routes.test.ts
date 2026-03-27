@@ -6,7 +6,7 @@ import {
   handleDeleteEntity,
   populateDepthForEntity,
 } from './entity-routes'
-import type { TransitionOption } from '../worker/state-machine'
+type TransitionOption = { transitionId: string; event: string; eventTypeId: string; targetStatus: string; targetStatusId: string }
 
 describe('entity-routes', () => {
   // ── handleListEntities ──────────────────────────────────────────────
@@ -276,21 +276,17 @@ describe('entity-routes', () => {
         }),
       }
 
-      const getValidTransitions = vi.fn().mockResolvedValue(mockTransitions)
-
+      // Transitions are now resolved by the engine at router level and passed in
       const result = await handleGetEntity(stub, {
-        transitionOpts: {
-          getValidTransitions,
-        },
+        transitions: mockTransitions,
       })
 
       expect(result).toBeDefined()
       expect(result!.transitions).toBeDefined()
       expect(result!.transitions).toHaveLength(2)
-      expect(getValidTransitions).toHaveBeenCalledWith('def1', 'status-open')
     })
 
-    it('omits transitions when entity has no _statusId', async () => {
+    it('omits transitions when entity has no state machine', async () => {
       const stub = {
         get: vi.fn().mockResolvedValue({
           id: 'e1',
@@ -300,50 +296,31 @@ describe('entity-routes', () => {
         }),
       }
 
-      const getValidTransitions = vi.fn()
-
-      const result = await handleGetEntity(stub, {
-        transitionOpts: {
-          getValidTransitions,
-        },
-      })
+      const result = await handleGetEntity(stub, {})
 
       expect(result).toBeDefined()
       expect(result!.transitions).toBeUndefined()
-      expect(getValidTransitions).not.toHaveBeenCalled()
     })
 
-    it('each transition has event, target, and transitionId', async () => {
-      const stub = {
+    it('each transition has event and target', async () => {
+      const innerStub = {
         get: vi.fn().mockResolvedValue({
-          id: 'e1',
-          type: 'SupportRequest',
-          data: {
-            title: 'Help',
-            _status: 'Open',
-            _statusId: 'status-open',
-            _stateMachineDefinition: 'def1',
-          },
+          id: 'e1', type: 'SupportRequest',
+          data: { title: 'Help', _status: 'Open', _statusId: 'status-open', _stateMachineDefinition: 'def1' },
           version: 1,
         }),
       }
-
-      const getValidTransitions = vi.fn().mockResolvedValue(mockTransitions)
-
-      const result = await handleGetEntity(stub, {
-        transitionOpts: {
-          getValidTransitions,
-        },
+      const result = await handleGetEntity(innerStub, {
+        transitions: mockTransitions,
       })
 
       const t = result!.transitions![0]
       expect(t).toHaveProperty('event', 'approve')
       expect(t).toHaveProperty('targetStatus', 'Approved')
-      expect(t).toHaveProperty('targetStatusId', 'status-approved')
       expect(t).toHaveProperty('transitionId', 't1')
     })
 
-    it('omits transitions when no transitionOpts provided', async () => {
+    it('omits transitions when none provided', async () => {
       const stub = {
         get: vi.fn().mockResolvedValue({
           id: 'e1',

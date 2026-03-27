@@ -1,36 +1,21 @@
 import { AutoRouter, json, error } from 'itty-router'
 import type { Env } from '../types'
 import { parseQueryOptions } from './collections'
-import { COLLECTION_TABLE_MAP, NOUN_TABLE_MAP } from '../collections'
+import { nounToSlug, nounToTable, resolveSlugToNoun } from '../collections'
 import { handleSeed } from './seed'
 import { handleGenerate } from './generate'
 import { handleParse } from './parse'
 import { handleParseOrm } from './parse-orm'
 import { handleVerify } from './verify'
 import { handleEvaluate, handleSynthesize } from './evaluate'
-import { getInitialState, getValidTransitions, applyTransition } from '../worker/state-machine'
-import { executeCascade } from '../worker/cascade-transition'
 import { handleConceptualQuery } from './conceptual-query'
-import { deriveOnWrite } from '../worker/derive-on-write'
 import { induceConstraints } from '../csdp/induce'
-import { checkDeonticConstraints } from '../worker/deontic-check'
-import { persistViolations } from '../worker/outcomes'
 import { handleListEntities, handleGetEntity, handleCreateEntity, handleDeleteEntity, buildEntityLinks, buildActions } from './entity-routes'
+import { loadDomainSchema, loadDomainAndPopulation, getTransitions, applyCommand } from './engine'
 
-// ── Reverse mapping: collection slug → entity type name ──────────────
-// Built by inverting NOUN_TABLE_MAP (type→table) and joining with
-// COLLECTION_TABLE_MAP (slug→table). Only metamodel collections that
-// appear in NOUN_TABLE_MAP get an entry — unknown slugs return 404.
-const TABLE_TO_ENTITY_TYPE: Record<string, string> = {}
-for (const [typeName, tableName] of Object.entries(NOUN_TABLE_MAP)) {
-  TABLE_TO_ENTITY_TYPE[tableName] = typeName
-}
-const COLLECTION_TO_ENTITY_TYPE: Record<string, string> = {}
-for (const [slug, tableName] of Object.entries(COLLECTION_TABLE_MAP)) {
-  if (TABLE_TO_ENTITY_TYPE[tableName]) {
-    COLLECTION_TO_ENTITY_TYPE[slug] = TABLE_TO_ENTITY_TYPE[tableName]
-  }
-}
+// ── Collection slug → noun type resolution ───────────────────────────
+// Resolved dynamically from the Registry via nounToSlug convention.
+// Noun entities are seeded from readings — no hardcoded maps.
 
 // ── DO helpers ───────────────────────────────────────────────────────
 
@@ -62,29 +47,66 @@ export const router = AutoRouter()
 router.get('/health', () => json({ status: 'ok', version: '0.1.0' }))
 
 // ── Debug: entity counts by type from Registry ──────────────────────
+router.post('/api/debug/arest/:domain', async (request, env: Env) => {
+  const { domain } = request.params
+  const body = await request.json() as any
+  const registry = getRegistryDO(env, 'global') as any
+  const getStub = (id: string) => getEntityDO(env, id) as any
+  const populationJson = await loadDomainAndPopulation(registry, getStub, domain)
+  const result = applyCommand(body, populationJson)
+  return json(result)
+})
+
+router.get('/api/debug/compiled/:domain', async (request, env: Env) => {
+  const { domain } = request.params
+  const registry = getRegistryDO(env, 'global') as any
+  await loadDomainSchema(registry, (id: string) => getEntityDO(env, id) as any, domain)
+  const { debug_compiled_state: debugState } = await import('../../crates/fol-engine/pkg/fol_engine.js')
+  return json(JSON.parse(debugState()))
+})
+
+router.get('/api/debug/schema/:domain', async (request, env: Env) => {
+  const { domain } = request.params
+  const registry = getRegistryDO(env, 'global') as any
+  const { buildSchemaFromEntities } = await import('../generate/schema-from-entities')
+  const fetchEntities = async (type: string, d: string) => {
+    const ids: string[] = await registry.getEntityIds(type, d)
+    const results: Array<{ id: string; type: string; data: Record<string, unknown> }> = []
+    await Promise.allSettled(ids.map(async (id: string) => {
+      const entity = await (getEntityDO(env, id) as any).get()
+      if (entity && !entity.deletedAt) results.push({ id: entity.id, type: entity.type, data: entity.data })
+    }))
+    return results
+  }
+  const schema = await buildSchemaFromEntities(domain, fetchEntities)
+  return json({
+    domain,
+    nounCount: Object.keys(schema.nouns).length,
+    factTypeCount: Object.keys(schema.factTypes).length,
+    constraintCount: schema.constraints.length,
+    stateMachines: Object.entries(schema.stateMachines).map(([k, v]) => ({
+      id: k, nounName: (v as any).nounName, statuses: (v as any).statuses, transitions: (v as any).transitions,
+    })),
+  })
+})
+
 router.get('/debug/table/:table', async (request, env: Env) => {
   const { table } = request.params
   const url = new URL(request.url)
   const domain = url.searchParams.get('domain') || undefined
 
-  // If caller asks for a specific entity type, return IDs from Registry
-  // Otherwise fall back to entity counts summary
   const registry = getRegistryDO(env, 'global') as any
+  const counts = await registry.getEntityCounts(domain) as Array<{ nounType: string; count: number }>
 
-  // Map table names (snake_case) to entity type names for backwards compat
-  const tableToType: Record<string, string> = {}
-  for (const [typeName, tableName] of Object.entries(NOUN_TABLE_MAP)) {
-    tableToType[tableName] = typeName
-  }
+  // Resolve: accept noun type name, collection slug, or table name
+  const entityType = counts.find(c => c.nounType === table)?.nounType
+    || counts.find(c => nounToSlug(c.nounType) === table || nounToTable(c.nounType) === table)?.nounType
 
-  const entityType = tableToType[table]
   if (entityType) {
     const ids = await registry.getEntityIds(entityType, domain) as string[]
     return json({ table, entityType, domain: domain || 'all', count: ids.length, entityIds: ids })
   }
 
-  // For unknown tables or 'all', return counts summary
-  const counts = await registry.getEntityCounts(domain) as Array<{ nounType: string; count: number }>
   return json({ table, domain: domain || 'all', counts })
 })
 
@@ -227,6 +249,8 @@ router.post('/api/entity', async (request, env: Env) => {
 
   const registry = getRegistryDO(env, 'global') as any
 
+  // Access control: engine evaluates "User can access Domain iff..." derivation rules
+
   // Extract array-of-objects fields (child entities) BEFORE creating the parent.
   // Children are created as separate Entity DOs to keep each DO = one entity.
   const childArrays: Array<{ fieldName: string; childNoun: string; items: Record<string, any>[] }> = []
@@ -242,146 +266,57 @@ router.post('/api/entity', async (request, env: Env) => {
     }
   }
 
-  // Look up state machine definition for this noun type via Registry+EntityDB fan-out
-  const smInit = await getInitialState(
-    registry,
-    (id) => getEntityDO(env, id) as any,
-    body.noun,
-    body.domain,
-  )
+  // AREST: one command, one function application, one state transfer.
+  const getStub = (id: string) => getEntityDO(env, id) as any
+  let populationJson = JSON.stringify({ facts: {} })
+  populationJson = await loadDomainAndPopulation(registry, getStub, body.domain)
 
-  // Deontic constraint check — reject forbidden, warn on obligatory
-  const deonticCheck = await checkDeonticConstraints(
-    body.noun,
-    parentFields,
-    body.domain,
-    registry,
-    (id) => getEntityDO(env, id) as any,
-  )
+  const arestResult = applyCommand({
+    type: 'createEntity',
+    noun: body.noun,
+    domain: body.domain,
+    id: null, // resolved below from reference scheme
+    fields: parentFields,
+  }, populationJson)
 
-  if (!deonticCheck.allowed) {
-    return error(422, {
-      errors: deonticCheck.violations.map((v) => ({
-        message: v.text,
-        constraintId: v.constraintId,
-        severity: v.severity,
-      })),
-    })
+  if (arestResult.rejected) {
+    return error(422, { errors: arestResult.violations.map((v: any) => ({ message: v.detail, constraintId: v.constraintId })) })
   }
 
-  // Create parent entity in its own EntityDB DO
-  const parentId = crypto.randomUUID()
-  const parentData = {
-    ...parentFields,
-    ...(body.reference && { reference: body.reference }),
-    ...(body.createdBy && { createdBy: body.createdBy }),
-    // Initialize state machine at initial status
-    ...(smInit && {
-      _status: smInit.initialStatus,
-      _statusId: smInit.initialStatusId,
-      _stateMachineDefinition: smInit.definitionId,
-    }),
-  }
-  const entityDO = getEntityDO(env, parentId) as any
-  const putResult = await entityDO.put({ id: parentId, type: body.noun, data: parentData })
-
-  // Index the entity in the Registry
-  await registry.indexEntity(body.noun, parentId)
-
-  // Persist deontic warnings as Violation entities (best-effort, don't block response)
-  if (deonticCheck.violations.length > 0) {
-    persistViolations(env, deonticCheck.violations.map(v => ({
-      ...v,
-      triggeredByResourceId: parentId,
-    }))).catch(() => { /* best-effort */ })
+  // Persist all entities from the AREST result (Resource + State Machine + Violations)
+  for (const entity of arestResult.entities) {
+    const eid = entity.id || crypto.randomUUID()
+    const eDO = getEntityDO(env, eid) as any
+    await eDO.put({ id: eid, type: entity.type, data: entity.data })
+    await registry.indexEntity(entity.type, eid, body.domain)
   }
 
-  // Fire derivation rules (best-effort, don't block on failure)
-  const deriveGetStub = (eid: string) => getEntityDO(env, eid) as any
-  let derivedCount = 0
-  try {
-    const deriveResult = await deriveOnWrite({
-      entity: { id: parentId, type: body.noun, data: parentData },
-      loadDerivationRules: async () => {
-        const readingIds: string[] = await registry.getEntityIds('Reading', body.domain)
-        const settled = await Promise.allSettled(readingIds.map(async (rid: string) => {
-          const stub = deriveGetStub(rid)
-          return stub.get()
-        }))
-        return settled
-          .filter((r: any) => r.status === 'fulfilled' && r.value && !r.value.deletedAt)
-          .map((r: any) => r.value.data)
-          .filter((d: any) => d.text?.includes(':='))
-      },
-      loadNouns: async () => {
-        const nounIds: string[] = await registry.getEntityIds('Noun', body.domain)
-        const settled = await Promise.allSettled(nounIds.map(async (nid: string) => {
-          const stub = deriveGetStub(nid)
-          return stub.get()
-        }))
-        return settled
-          .filter((r: any) => r.status === 'fulfilled' && r.value && !r.value.deletedAt)
-          .map((r: any) => r.value.data.name)
-          .filter(Boolean)
-      },
-      loadRelatedFacts: async (nounType: string) => {
-        const ids: string[] = await registry.getEntityIds(nounType)
-        const entities: Array<{ id: string; type: string; data: Record<string, unknown> }> = []
-        await Promise.all(ids.slice(0, 50).map(async (id: string) => {
-          try {
-            const eDO = getEntityDO(env, id) as any
-            const e = await eDO.get()
-            if (e && !e.deletedAt) entities.push({ id: e.id, type: e.type, data: e.data })
-          } catch {}
-        }))
-        return entities
-      },
-      writeDerivedFact: async (entityId: string, field: string, value: string) => {
-        const eDO = getEntityDO(env, entityId) as any
-        await eDO.patch({ [field]: value })
-      },
-    })
-    derivedCount = deriveResult.derivedCount
-  } catch { /* derivation is best-effort */ }
+  // The primary entity ID — first entity in the result
+  const primaryEntity = arestResult.entities[0]
+  const parentId = primaryEntity?.id || crypto.randomUUID()
 
-  const result: Record<string, any> = {
+  // Create children as separate Entity DOs
+  if (childArrays.length > 0) {
+    const parentFkField = body.noun.charAt(0).toLowerCase() + body.noun.slice(1)
+    for (const { childNoun, items } of childArrays) {
+      for (const childFields of items) {
+        const childId = crypto.randomUUID()
+        const childDO = getEntityDO(env, childId) as any
+        await childDO.put({ id: childId, type: childNoun, data: { ...childFields, [parentFkField]: parentId } })
+        await registry.indexEntity(childNoun, childId, body.domain)
+      }
+    }
+  }
+
+  return json({
     id: parentId,
     noun: body.noun,
     domain: body.domain,
-    version: putResult.version,
-    ...(smInit && { status: smInit.initialStatus }),
-    ...(derivedCount > 0 && { derived: derivedCount }),
-    ...(deonticCheck.violations.length > 0 && {
-      deonticWarnings: deonticCheck.violations.map((v) => ({
-        constraintId: v.constraintId,
-        text: v.text,
-        severity: v.severity,
-      })),
-    }),
-  }
-
-  // Create children as separate Entity DOs, each with FK back to parent
-  if (childArrays.length > 0) {
-    const parentFkField = body.noun.charAt(0).toLowerCase() + body.noun.slice(1)
-    const children: any[] = []
-    for (const { childNoun, items } of childArrays) {
-      for (const childFields of items) {
-        try {
-          const childId = crypto.randomUUID()
-          const childData = { ...childFields, [parentFkField]: parentId }
-          const childDO = getEntityDO(env, childId) as any
-          await childDO.put({ id: childId, type: childNoun, data: childData })
-          await registry.indexEntity(childNoun, childId)
-          children.push({ noun: childNoun, id: childId })
-        } catch (err: any) {
-          children.push({ noun: childNoun, error: err.message })
-        }
-      }
-    }
-    result.children = children
-  }
-
-  return json(result, { status: 201 })
+    status: arestResult.status,
+    transitions: arestResult.transitions,
+    ...(arestResult.derivedCount > 0 && { derived: arestResult.derivedCount }),
+    ...(arestResult.violations.length > 0 && { deonticWarnings: arestResult.violations }),
+  }, { status: 201 })
 })
 
 // ── Entity state machine transitions ─────────────────────────────────
@@ -392,28 +327,28 @@ router.get('/api/entities/:noun/:id/transitions', async (request, env: Env) => {
   const entity = await entityDO.get()
   if (!entity) return error(404, { errors: [{ message: 'Not Found' }] })
 
-  if (!entity.data?._stateMachineDefinition || !entity.data?._statusId) {
+  if (!entity.data?._status) {
     return json({ transitions: [], message: 'Entity has no state machine' })
   }
 
-  const url = new URL(request.url)
-  const domainSlug = url.searchParams.get('domain') || entity.data._domain as string || undefined
-  const smRegistry = getRegistryDO(env, 'global') as any
-  const smGetStub = (eid: string) => getEntityDO(env, eid) as any
-  const options = await getValidTransitions(
-    smRegistry, smGetStub,
-    entity.data._stateMachineDefinition as string,
-    entity.data._statusId as string,
-    domainSlug,
-  )
+  // Valid transitions from the engine's compiled state machine
+  const registry = getRegistryDO(env, 'global') as any
+  let transitions: Array<{ event: string; targetStatus: string }> = []
+  try {
+    const reqUrl = new URL(request.url)
+    const domainSlug = reqUrl.searchParams.get('domain') || entity.data._domain as string || ''
+    await loadDomainSchema(registry, (eid: string) => getEntityDO(env, eid) as any, domainSlug)
+    transitions = getTransitions(entity.type, entity.data._status as string)
+      .map(t => ({ event: t.event, targetStatus: t.to }))
+  } catch { /* schema load failed */ }
 
   return json({
     currentStatus: entity.data._status,
-    transitions: options.map(o => ({ event: o.event, targetStatus: o.targetStatus })),
+    transitions,
   })
 })
 
-// POST fire a transition event (with cascade support)
+// POST fire a transition event — AREST command
 router.post('/api/entities/:noun/:id/transition', async (request, env: Env) => {
   const { noun, id } = request.params
   const body = await request.json() as { event: string; domain?: string }
@@ -423,82 +358,69 @@ router.post('/api/entities/:noun/:id/transition', async (request, env: Env) => {
   const entity = await entityDO.get()
   if (!entity) return error(404, { errors: [{ message: 'Not Found' }] })
 
-  if (!entity.data?._stateMachineDefinition || !entity.data?._statusId) {
+  const domainSlug = body.domain || entity.data?._domain as string || entity.data?.domain as string || ''
+  const registry = getRegistryDO(env, 'global') as any
+  const getStub = (eid: string) => getEntityDO(env, eid) as any
+
+  // Find the State Machine instance for this entity
+  const smIds: string[] = await registry.getEntityIds('State Machine', domainSlug)
+  let currentStatus: string | undefined
+  let smEntityId: string | undefined
+  for (const smId of smIds) {
+    try {
+      const sm = await getStub(smId).get()
+      if (sm?.data?.forResource === id) {
+        currentStatus = sm.data.currentlyInStatus as string
+        smEntityId = smId
+        break
+      }
+    } catch { continue }
+  }
+
+  if (!currentStatus || !smEntityId) {
     return error(400, { errors: [{ message: 'Entity has no state machine' }] })
   }
 
-  const domainSlug = body.domain || entity.data._domain as string || undefined
-  const smRegistry = getRegistryDO(env, 'global') as any
-  const smGetStub = (eid: string) => getEntityDO(env, eid) as any
+  // AREST: apply transition command
+  const populationJson = await loadDomainAndPopulation(registry, getStub, domainSlug)
+  const cmd = {
+    type: 'transition' as const,
+    entityId: id,
+    event: body.event,
+    currentStatus,
+    domain: domainSlug,
+  }
+  console.log('AREST transition cmd:', JSON.stringify(cmd))
+  const arestResult = applyCommand(cmd, populationJson)
+  console.log('AREST transition result:', JSON.stringify({ status: arestResult.status, entities: arestResult.entities?.length, error: (arestResult as any).error }))
 
-  // Validate the transition before cascading
-  const result = await applyTransition(
-    smRegistry, smGetStub,
-    entity.data._stateMachineDefinition as string,
-    entity.data._statusId as string,
-    body.event,
-    domainSlug,
-  )
-
-  if (!result) {
-    const options = await getValidTransitions(
-      smRegistry, smGetStub,
-      entity.data._stateMachineDefinition as string,
-      entity.data._statusId as string,
-      domainSlug,
-    )
-    return error(400, { errors: [{
-      message: `Invalid transition: event '${body.event}' not available from status '${entity.data._status}'`,
-      validEvents: options.map(o => o.event),
-    }] })
+  if (arestResult.rejected) {
+    return error(422, { errors: arestResult.violations.map((v: any) => ({ message: v.detail })) })
   }
 
-  // Execute cascade — applies the transition, fires callbacks, and chains
-  const cascadeResult = await executeCascade(id, body.event, {
-    registry: smRegistry,
-    getStub: smGetStub,
-    domain: domainSlug,
-  })
+  if (!arestResult.status) {
+    return error(400, { errors: [{
+      message: `Invalid transition: event '${body.event}' not available from status '${currentStatus}'`,
+    }], debug: { arestResult, cmd } })
+  }
 
-  // Get valid transitions from the final state
-  const finalEntity = await entityDO.get()
-  const finalStatusId = finalEntity?.data?._statusId as string | undefined
-  const availableTransitions = finalStatusId
-    ? await getValidTransitions(
-        smRegistry, smGetStub,
-        entity.data._stateMachineDefinition as string,
-        finalStatusId,
-        domainSlug,
-      )
-    : []
+  // Update the State Machine entity's current status
+  await getStub(smEntityId).patch({ currentlyInStatus: arestResult.status })
 
-  // Persist cascade failures as Failure entities (best-effort)
-  if (cascadeResult.failures.length > 0) {
-    const { createFailure } = await import('../worker/outcomes')
-    for (const failure of cascadeResult.failures) {
-      createFailure(env, {
-        domain: domainSlug,
-        failureType: 'transition',
-        reason: failure,
-        functionId: entity.data.nounId as string || undefined,
-        transitionId: result.transitionId,
-      }).catch(() => { /* best-effort */ })
-    }
+  // Persist any Event entities from the AREST result
+  for (const e of arestResult.entities) {
+    const eid = e.id || crypto.randomUUID()
+    await getStub(eid).put({ id: eid, type: e.type, data: e.data })
+    await registry.indexEntity(e.type, eid, domainSlug)
   }
 
   return json({
     id,
     noun,
-    previousStatus: result.previousStatus,
-    status: cascadeResult.finalState,
-    event: result.event,
-    transitionId: result.transitionId,
-    cascade: {
-      statesVisited: cascadeResult.statesVisited,
-      callbackResults: cascadeResult.callbackResults,
-      ...(cascadeResult.failures.length > 0 && { failures: cascadeResult.failures }),
-    },
-    availableEvents: availableTransitions.map(o => o.event),
+    previousStatus: currentStatus,
+    status: arestResult.status,
+    event: body.event,
+    transitions: arestResult.transitions,
   })
 })
 
@@ -568,39 +490,22 @@ router.get('/api/entities/:noun/:id', async (request, env: Env) => {
   const url = new URL(request.url)
   const domainSlug = url.searchParams.get('domain') || undefined
 
-  const smRegistry = getRegistryDO(env, 'global') as any
-  const smGetStub = (eid: string) => getEntityDO(env, eid) as any
+  // Resolve transitions from engine's compiled state machine
+  let transitions: Array<{ transitionId: string; event: string; targetStatus: string; targetStatusId: string }> = []
+  try {
+    const registry = getRegistryDO(env, 'global') as any
+    await loadDomainSchema(registry, (eid: string) => getEntityDO(env, eid) as any, domainSlug || '')
+    const entityStub = getEntityDO(env, id) as any
+    const raw = await entityStub.get()
+    if (raw?.data?._status) {
+      transitions = getTransitions(raw.type, raw.data._status as string)
+        .map(t => ({ transitionId: '', event: t.event, targetStatus: t.to, targetStatusId: '' }))
+    }
+  } catch { /* best-effort */ }
 
   const entity = await handleGetEntity(getEntityDO(env, id) as any, {
     domain: domainSlug,
-    transitionOpts: {
-      getValidTransitions: (defId, statusId) =>
-        getValidTransitions(smRegistry, smGetStub, defId, statusId, domainSlug),
-    },
-    getFieldOrder: async (entityType: string) => {
-      // Load graph schemas for this entity type, get their roles in order
-      const { loadEntities } = await import('../worker/fan-out')
-      const schemas = await loadEntities(smRegistry, smGetStub, 'GraphSchema', domainSlug)
-      const roles = await loadEntities(smRegistry, smGetStub, 'Role', domainSlug)
-      // Find schemas where this entity type participates
-      const nounEntities = await loadEntities(smRegistry, smGetStub, 'Noun', domainSlug)
-      const nounId = nounEntities.find(n => n.data.name === entityType)?.id
-      if (!nounId) return []
-      // Get roles where this noun plays, sorted by roleIndex
-      const entityRoles = roles.filter(r => r.data.noun === nounId || r.data.nounId === nounId)
-      // For each role's graph schema, find the OTHER noun (the property name)
-      const fieldNames: string[] = []
-      for (const role of entityRoles.sort((a, b) => ((a.data.graphSchema as string) || '').localeCompare((b.data.graphSchema as string) || ''))) {
-        const schemaId = role.data.graphSchema as string || role.data.graphSchemaId as string
-        const schemaRoles = roles.filter(r => (r.data.graphSchema === schemaId || r.data.graphSchemaId === schemaId) && r.id !== role.id)
-        for (const sr of schemaRoles) {
-          const otherNounId = sr.data.noun as string || sr.data.nounId as string
-          const otherNoun = nounEntities.find(n => n.id === otherNounId)
-          if (otherNoun) fieldNames.push(otherNoun.data.name as string)
-        }
-      }
-      return fieldNames
-    },
+    transitions,
   })
   if (!entity) return error(404, { errors: [{ message: 'Not Found' }] })
 
@@ -645,7 +550,7 @@ router.delete('/api/entities/:noun/:id', async (request, env: Env) => {
 router.get('/api/query', handleConceptualQuery)
 router.post('/api/query', handleConceptualQuery)
 
-// ── Claims ingestion & stats (before generic :collection routes) ─────
+// ── Named API routes (before generic :collection catch-all) ──────────
 router.post('/api/claims', async (request, env: Env, ctx: ExecutionContext) => {
   const { handleClaims } = await import('./claims')
   return handleClaims(request, env, ctx)
@@ -655,64 +560,12 @@ router.get('/api/stats', async (request, env: Env) => {
   const { handleStats } = await import('./claims')
   return handleStats(request, env)
 })
+router.all('/api/parse', handleParse)
+router.all('/api/parse/orm', handleParseOrm)
+router.all('/api/verify', handleVerify)
 
 router.get('/api/:collection', async (request, env: Env) => {
   const { collection } = request.params
-  if (!COLLECTION_TABLE_MAP[collection]) {
-    return error(404, { errors: [{ message: `Collection "${collection}" not found` }] })
-  }
-
-  // Delegate to entity-type handler if this collection maps to a known entity type
-  const entityType = COLLECTION_TO_ENTITY_TYPE[collection]
-  if (entityType) {
-    const url = new URL(request.url)
-    const { where, limit: qLimit, page: qPage } = parseQueryOptions(url.searchParams)
-    const domainId = where?.domain?.equals || where?.['domain.domainSlug']?.equals || url.searchParams.get('domain') || ''
-    const registry = getRegistryDO(env, 'global') as any
-    const result = await handleListEntities(
-      entityType,
-      domainId,
-      registry,
-      (id) => getEntityDO(env, id) as any,
-      { limit: qLimit, page: qPage },
-    )
-
-    // Flatten entity data for backwards compat (spread data into top level)
-    const docs = result.docs.map((e) => ({
-      id: e.id,
-      type: e.type,
-      ...e.data,
-      version: e.version,
-      createdAt: e.createdAt,
-      updatedAt: e.updatedAt,
-      _links: buildEntityLinks(e.type, e.id, domainId || undefined),
-      _actions: buildActions(e.type, e.id),
-    }))
-
-    // Client-side filtering by where params
-    let filtered = docs
-    if (where) {
-      for (const [field, condition] of Object.entries(where)) {
-        if (field === 'domain' || field === 'domain.domainSlug') continue // already used for routing
-        if (typeof condition === 'object' && condition !== null && 'equals' in condition) {
-          filtered = filtered.filter(doc => (doc as any)[field] === (condition as any).equals)
-        }
-      }
-    }
-
-    return json({
-      docs: filtered,
-      totalDocs: result.totalDocs,
-      limit: result.limit,
-      page: result.page,
-      totalPages: result.totalPages,
-      hasNextPage: result.hasNextPage,
-      hasPrevPage: result.hasPrevPage,
-      pagingCounter: (result.page - 1) * result.limit + 1,
-      ...(result.warnings && { warnings: result.warnings }),
-      ...(result._links && { _links: result._links }),
-    })
-  }
 
   // Generators collection stays in DomainDB (SQL table, not entity-per-DO)
   if (collection === 'generators') {
@@ -732,47 +585,67 @@ router.get('/api/:collection', async (request, env: Env) => {
     })
   }
 
-  // No entity-type mapping and not generators — 404
-  return error(404, { errors: [{ message: `Collection "${collection}" has no entity-type handler` }] })
+  // Resolve collection slug to noun type dynamically from Registry
+  const registry = getRegistryDO(env, 'global') as any
+  const entityType = await resolveSlugToNoun(registry, collection)
+  if (!entityType) {
+    return error(404, { errors: [{ message: `Collection "${collection}" not found` }] })
+  }
+
+  const url = new URL(request.url)
+  const { where, limit: qLimit, page: qPage } = parseQueryOptions(url.searchParams)
+  const domainId = where?.domain?.equals || where?.['domain.domainSlug']?.equals || url.searchParams.get('domain') || ''
+  const result = await handleListEntities(
+    entityType,
+    domainId,
+    registry,
+    (id) => getEntityDO(env, id) as any,
+    { limit: qLimit, page: qPage },
+  )
+
+  // Access control: engine evaluates "User can access Domain iff..." derivation rules
+
+  // Flatten entity data for backwards compat (spread data into top level)
+  const docs = result.docs.map((e) => ({
+    id: e.id,
+    type: e.type,
+    ...e.data,
+    version: e.version,
+    createdAt: e.createdAt,
+    updatedAt: e.updatedAt,
+    _links: buildEntityLinks(e.type, e.id, domainId || undefined),
+    _actions: buildActions(e.type, e.id),
+  }))
+
+  // Client-side filtering by where params
+  let filtered = docs
+  if (where) {
+    for (const [field, condition] of Object.entries(where)) {
+      if (field === 'domain' || field === 'domain.domainSlug') continue // already used for routing
+      if (typeof condition === 'object' && condition !== null && 'equals' in condition) {
+        filtered = filtered.filter(doc => (doc as any)[field] === (condition as any).equals)
+      }
+    }
+  }
+
+  return json({
+    docs: filtered,
+    totalDocs: result.totalDocs,
+    limit: result.limit,
+    page: result.page,
+    totalPages: result.totalPages,
+    hasNextPage: result.hasNextPage,
+    hasPrevPage: result.hasPrevPage,
+    pagingCounter: (result.page - 1) * result.limit + 1,
+    ...(result.warnings && { warnings: result.warnings }),
+    ...(result._links && { _links: result._links }),
+  })
 })
 
 /** GET /api/:collection/:id — get by ID */
 router.get('/api/:collection/:id', async (request, env: Env) => {
   const { collection, id } = request.params
-  if (!COLLECTION_TABLE_MAP[collection]) {
-    return error(404, { errors: [{ message: `Collection "${collection}" not found` }] })
-  }
 
-  // Delegate to entity-type handler if this collection maps to a known entity type
-  const entityType = COLLECTION_TO_ENTITY_TYPE[collection]
-  if (entityType) {
-    const url = new URL(request.url)
-    const domainSlug = url.searchParams.get('domain') || undefined
-    const smRegistry = getRegistryDO(env, 'global') as any
-    const smGetStub = (eid: string) => getEntityDO(env, eid) as any
-
-    const entity = await handleGetEntity(getEntityDO(env, id) as any, {
-      domain: domainSlug,
-      transitionOpts: {
-        getValidTransitions: (defId, statusId) =>
-          getValidTransitions(smRegistry, smGetStub, defId, statusId, domainSlug),
-      },
-    })
-    if (!entity) return error(404, { errors: [{ message: 'Not Found' }] })
-    return json({
-      id: entity.id,
-      type: entity.type,
-      ...entity.data,
-      version: entity.version,
-      createdAt: entity.createdAt,
-      updatedAt: entity.updatedAt,
-      ...(entity.transitions && { transitions: entity.transitions }),
-      ...(entity._links && { _links: entity._links }),
-      ...(entity._actions && { _actions: entity._actions }),
-    })
-  }
-
-  // Generators collection stays in DomainDB
   if (collection === 'generators') {
     const db = getPrimaryDB(env) as any
     const doc = await db.getFromCollection(collection, id)
@@ -780,62 +653,77 @@ router.get('/api/:collection/:id', async (request, env: Env) => {
     return json(doc)
   }
 
-  return error(404, { errors: [{ message: `Collection "${collection}" has no entity-type handler` }] })
+  const registry = getRegistryDO(env, 'global') as any
+  const entityType = await resolveSlugToNoun(registry, collection)
+  if (!entityType) {
+    return error(404, { errors: [{ message: `Collection "${collection}" not found` }] })
+  }
+
+  const url = new URL(request.url)
+  const domainSlug = url.searchParams.get('domain') || undefined
+
+  // Resolve transitions from engine
+  let collTransitions: Array<{ transitionId: string; event: string; targetStatus: string; targetStatusId: string }> = []
+  try {
+    await loadDomainSchema(registry, (eid: string) => getEntityDO(env, eid) as any, domainSlug || '')
+    const raw = await (getEntityDO(env, id) as any).get()
+    if (raw?.data?._status) {
+      collTransitions = getTransitions(raw.type, raw.data._status as string)
+        .map((t: any) => ({ transitionId: '', event: t.event, targetStatus: t.to, targetStatusId: '' }))
+    }
+  } catch { /* best-effort */ }
+
+  const entity = await handleGetEntity(getEntityDO(env, id) as any, {
+    domain: domainSlug,
+    transitions: collTransitions,
+  })
+  if (!entity) return error(404, { errors: [{ message: 'Not Found' }] })
+  return json({
+    id: entity.id,
+    type: entity.type,
+    ...entity.data,
+    version: entity.version,
+    createdAt: entity.createdAt,
+    updatedAt: entity.updatedAt,
+    ...(entity.transitions && { transitions: entity.transitions }),
+    ...(entity._links && { _links: entity._links }),
+    ...(entity._actions && { _actions: entity._actions }),
+  })
 })
 
 /** POST /api/:collection — create */
 router.post('/api/:collection', async (request, env: Env) => {
   const { collection } = request.params
-  if (!COLLECTION_TABLE_MAP[collection]) {
-    return error(404, { errors: [{ message: `Collection "${collection}" not found` }] })
-  }
-
   const body = await request.json() as Record<string, any>
 
-  // Delegate to entity-type handler if this collection maps to a known entity type
-  const entityType = COLLECTION_TO_ENTITY_TYPE[collection]
-  if (entityType) {
-    const domain = body.domain || ''
-    const registry = getRegistryDO(env, 'global') as any
-    const result = await handleCreateEntity(
-      entityType,
-      domain,
-      body,
-      (id) => getEntityDO(env, id) as any,
-      registry,
-    )
-    return json({ doc: { id: result.id, ...body }, message: 'Created successfully', ...(result._links && { _links: result._links }) }, { status: 201 })
-  }
-
-  // Generators collection stays in DomainDB
   if (collection === 'generators') {
     const db = getPrimaryDB(env) as any
     const doc = await db.createInCollection(collection, body)
     return json({ doc, message: 'Created successfully' }, { status: 201 })
   }
 
-  return error(404, { errors: [{ message: `Collection "${collection}" has no entity-type handler` }] })
+  const registry = getRegistryDO(env, 'global') as any
+  const entityType = await resolveSlugToNoun(registry, collection)
+  if (!entityType) {
+    return error(404, { errors: [{ message: `Collection "${collection}" not found` }] })
+  }
+
+  const domain = body.domain || ''
+  const result = await handleCreateEntity(
+    entityType,
+    domain,
+    body,
+    (id) => getEntityDO(env, id) as any,
+    registry,
+  )
+  return json({ doc: { id: result.id, ...body }, message: 'Created successfully', ...(result._links && { _links: result._links }) }, { status: 201 })
 })
 
 /** PATCH /api/:collection/:id — update */
 router.patch('/api/:collection/:id', async (request, env: Env) => {
   const { collection, id } = request.params
-  if (!COLLECTION_TABLE_MAP[collection]) {
-    return error(404, { errors: [{ message: `Collection "${collection}" not found` }] })
-  }
-
   const body = await request.json() as Record<string, any>
 
-  // Delegate to entity-type handler if this collection maps to a known entity type
-  const entityType = COLLECTION_TO_ENTITY_TYPE[collection]
-  if (entityType) {
-    const entityDO = getEntityDO(env, id) as any
-    const result = await entityDO.patch(body)
-    if (!result) return error(404, { errors: [{ message: 'Not Found' }] })
-    return json({ doc: result, message: 'Updated successfully' })
-  }
-
-  // Generators collection stays in DomainDB
   if (collection === 'generators') {
     const db = getPrimaryDB(env) as any
     const doc = await db.updateInCollection(collection, id, body)
@@ -843,26 +731,22 @@ router.patch('/api/:collection/:id', async (request, env: Env) => {
     return json({ doc, message: 'Updated successfully' })
   }
 
-  return error(404, { errors: [{ message: `Collection "${collection}" has no entity-type handler` }] })
+  const registry = getRegistryDO(env, 'global') as any
+  const entityType = await resolveSlugToNoun(registry, collection)
+  if (!entityType) {
+    return error(404, { errors: [{ message: `Collection "${collection}" not found` }] })
+  }
+
+  const entityDO = getEntityDO(env, id) as any
+  const result = await entityDO.patch(body)
+  if (!result) return error(404, { errors: [{ message: 'Not Found' }] })
+  return json({ doc: result, message: 'Updated successfully' })
 })
 
 /** DELETE /api/:collection/:id — delete */
 router.delete('/api/:collection/:id', async (request, env: Env) => {
   const { collection, id } = request.params
-  if (!COLLECTION_TABLE_MAP[collection]) {
-    return error(404, { errors: [{ message: `Collection "${collection}" not found` }] })
-  }
 
-  // Delegate to entity-type handler if this collection maps to a known entity type
-  const entityType = COLLECTION_TO_ENTITY_TYPE[collection]
-  if (entityType) {
-    const registry = getRegistryDO(env, 'global') as any
-    const result = await handleDeleteEntity(id, getEntityDO(env, id) as any, registry, entityType)
-    if (!result) return error(404, { errors: [{ message: 'Not Found' }] })
-    return json({ id, message: 'Deleted successfully' })
-  }
-
-  // Generators collection stays in DomainDB
   if (collection === 'generators') {
     const db = getPrimaryDB(env) as any
     const result = await db.deleteFromCollection(collection, id)
@@ -870,7 +754,15 @@ router.delete('/api/:collection/:id', async (request, env: Env) => {
     return json({ id, message: 'Deleted successfully' })
   }
 
-  return error(404, { errors: [{ message: `Collection "${collection}" has no entity-type handler` }] })
+  const registry = getRegistryDO(env, 'global') as any
+  const entityType = await resolveSlugToNoun(registry, collection)
+  if (!entityType) {
+    return error(404, { errors: [{ message: `Collection "${collection}" not found` }] })
+  }
+
+  const result = await handleDeleteEntity(id, getEntityDO(env, id) as any, registry, entityType)
+  if (!result) return error(404, { errors: [{ message: 'Not Found' }] })
+  return json({ id, message: 'Deleted successfully' })
 })
 
 
@@ -958,12 +850,6 @@ router.delete('/api/reset', async (request, env: Env, ctx: ExecutionContext) => 
     },
   })
 })
-
-// ── Parse / Verify ──────────────────────────────────────────────────
-// Parse/verify available at /api/parse, /api/parse/orm, /api/verify (no legacy aliases)
-router.all('/api/parse', handleParse)
-router.all('/api/parse/orm', handleParseOrm)
-router.all('/api/verify', handleVerify)
 
 // ── 404 fallback ─────────────────────────────────────────────────────
 router.all('*', () => error(404, { errors: [{ message: 'Not Found' }] }))

@@ -73,3 +73,7 @@ Each Failure has exactly one Failure Type.
 
 If some Failure follows some Violation then that Failure is caused by that Violation or that Violation occurred at some Timestamp and that Failure occurred at some Timestamp where that Violation Timestamp is before that Failure Timestamp.
 If some Violation occurs before some Transition then that Violation occurred at some Timestamp and that Transition occurred at some Timestamp where that Violation Timestamp is before that Transition Timestamp.
+
+## Instance Facts
+
+Domain 'outcomes' has Visibility 'public'.
