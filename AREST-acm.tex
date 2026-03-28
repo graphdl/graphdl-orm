@@ -366,19 +366,6 @@ Every externally observable value is derivable from the population by pure funct
 
 The execution model does not require global evaluation. RMAP partitions the population per entity, and commands operate on a bounded subpopulation determined by role reachability. All combinators, including Insert, execute over finite, entity-scoped sets. Locality is a consequence of the schema, not of the runtime.
 
-\section{Related Work}
-
-\textbf{Datalog}~\cite{ceri89} shares AREST's bottom-up, fixed-point
-evaluation but lacks a controlled natural language surface, ORM2's
-constraint taxonomy, and the REST rendering layer.
-\textbf{Alloy}~\cite{jackson12} and \textbf{TLA+}~\cite{lamport02}
-verify specifications but do not produce running systems.
-\textbf{CQRS and Event Sourcing} share the command/query separation
-and ``state as fold over events'' structure; AREST's difference is
-that the fold is a compiled combinator, not a hand-written projection.
-\textbf{GraphQL}, \textbf{OData}, and \textbf{RDF} each address
-fragments of the problem without closing the specification--implementation gap.
-
 \section{Conclusion}
 
 AREST composes Applicative State Transition systems with Representational State Transfer. The readings are axioms. The engine applies functions to populations. The API renders the result as hypermedia. The client navigates by following links. Each link is a function application waiting to happen.
@@ -393,7 +380,7 @@ Claude (Anthropic) was used as a programming assistant during implementation of 
 %% Bibliography
 %%
 \bibliographystyle{ACM-Reference-Format}
-\begin{thebibliography}{13}
+\begin{thebibliography}{6}
 
 \bibitem{backus78}
 J. Backus.
@@ -424,21 +411,6 @@ T. Halpin.
 T. Halpin and M. Curland.
 \newblock Automated Verbalization for {ORM} 2.
 \newblock In \emph{OTM Workshops}, pages 1181--1190, 2006.
-
-\bibitem{ceri89}
-S. Ceri, G. Gottlob, and L. Tanca.
-\newblock What You Always Wanted to Know About Datalog (And Never Dared to Ask).
-\newblock \emph{IEEE Transactions on Knowledge and Data Engineering}, 1(1):146--166, 1989.
-
-\bibitem{jackson12}
-D. Jackson.
-\newblock \emph{Software Abstractions: Logic, Language, and Analysis}.
-\newblock Revised edition. MIT Press, 2012.
-
-\bibitem{lamport02}
-L. Lamport.
-\newblock \emph{Specifying Systems: The TLA+ Language and Tools for Hardware and Software Engineers}.
-\newblock Addison-Wesley, 2002.
 
 \end{thebibliography}
 
