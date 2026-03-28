@@ -51,18 +51,24 @@ pub fn run_machine_ast(
 }
 
 // ── Forward Chaining ─────────────────────────────────────────────────
-// Apply all derivation rules until no new facts are produced (fixed point).
-// This is the FOL inference engine.
+//
+// Correctness: FORML 2 derivation rules are monotonic (add facts, never
+// remove). The population is finite. A monotonic sequence over a finite
+// set reaches a fixed point. The loop terminates when no new facts are
+// derived.
+//
+// Safety: the iteration bound prevents pathological rule sets from
+// producing unbounded intermediate populations. If the bound is hit,
+// the engine stops and returns what it has — a partial fixed point.
 
-/// Forward chain via AST reduction.
-/// Apply each derivation's func to the population Object until fixed point.
-#[allow(dead_code)]
+/// Forward chain via AST reduction to fixed point.
+/// Bounded to prevent pathological rule sets from running unbounded.
 pub fn forward_chain_ast(
     model: &CompiledModel,
     population: &mut Population,
 ) -> Vec<DerivedFact> {
     let mut all_derived: Vec<DerivedFact> = Vec::new();
-    let max_iterations = 10;
+    let max_iterations = 100;
     let defs = std::collections::HashMap::new();
 
     for _ in 0..max_iterations {
@@ -109,7 +115,7 @@ pub fn forward_chain_ast(
             }
         }
 
-        if new_facts.is_empty() { break; }
+        if new_facts.is_empty() { break; } // Fixed point reached — proof complete.
 
         for fact in &new_facts {
             add_to_population(population, fact);
