@@ -116,7 +116,7 @@ async function handleSeedPost(request: Request, env: Env): Promise<Response> {
   // curl -X POST /seed -F core=@readings/core.md -F state=@readings/state.md
   if (contentType.includes('multipart/form-data')) {
     const formData = await request.formData()
-    const domains: Array<{ slug: string; name?: string; claims: ExtractedClaims }> = []
+    const domains: Array<{ slug: string; name?: string; claims: ExtractedClaims; rawText?: string }> = []
 
     for (const [name, value] of formData.entries()) {
       if (!(value instanceof File) && typeof value !== 'string') continue
@@ -126,7 +126,7 @@ async function handleSeedPost(request: Request, env: Env): Promise<Response> {
       // Slug from field name or filename (minus .md extension)
       const slug = name.replace(/\.md$/i, '')
       const claims = parseFORML2(text, [])
-      domains.push({ slug, name: slug, claims })
+      domains.push({ slug, name: slug, claims, rawText: text })
     }
 
     if (domains.length === 0) {
@@ -179,7 +179,7 @@ async function handleSeedPost(request: Request, env: Env): Promise<Response> {
 
 async function handleBulkSeed(
   env: Env,
-  domains: Array<{ slug: string; name?: string; claims: ExtractedClaims }>,
+  domains: Array<{ slug: string; name?: string; claims: ExtractedClaims; rawText?: string }>,
 ): Promise<Response> {
   const timings: Record<string, number> = {}
   const t = (label: string) => { timings[label] = Date.now() }
@@ -319,60 +319,66 @@ async function handleSingleSeed(
  * into the WASM engine. Called once during seed.
  */
 function bootstrapValidationModel(
-  domains: Array<{ slug: string; claims: ExtractedClaims }>,
+  domains: Array<{ slug: string; claims: ExtractedClaims; rawText?: string }>,
 ) {
-  const core = domains.find(d => d.slug === 'core')
-  const validation = domains.find(d => d.slug === 'validation')
-  if (!core || !validation) return
-
-  // Combine core (schema) + validation (constraints) into one claims set
-  const combined: ExtractedClaims = {
-    nouns: [...core.claims.nouns, ...validation.claims.nouns],
-    readings: [...core.claims.readings, ...validation.claims.readings],
-    constraints: [...(core.claims.constraints ?? []), ...(validation.claims.constraints ?? [])],
-    subtypes: [...(core.claims.subtypes ?? []), ...(validation.claims.subtypes ?? [])],
-  }
-
-  // Build SchemaIR → ConstraintIR → load into engine
-  const schemaIR = buildSchemaIR(combined)
-  const nouns: Record<string, { objectType: string; superType?: string }> = {}
-  for (const n of combined.nouns) {
-    nouns[n.name] = { objectType: n.objectType }
-  }
-  for (const st of (combined.subtypes ?? [])) {
-    if (nouns[st.child]) nouns[st.child].superType = st.parent
-  }
-
-  const factTypes: Record<string, { reading: string; roles: Array<{ nounName: string; roleIndex: number }> }> = {}
-  for (const ft of schemaIR.factTypes) {
-    factTypes[ft.id] = { reading: ft.reading, roles: ft.roles }
-  }
-
-  const readingToId = new Map(schemaIR.factTypes.map(ft => [ft.reading, ft.id]))
-  const constraints = schemaIR.constraints.map((c, i) => ({
-    id: `val-${i}`,
-    kind: c.kind,
-    modality: c.modality ?? 'Alethic',
-    text: c.text ?? '',
-    spans: c.roles.map(roleIdx => ({
-      factTypeId: c.factTypeId,
-      roleIndex: roleIdx,
-    })),
-  }))
-
-  const ir = {
-    domain: 'validation',
-    nouns,
-    factTypes,
-    constraints,
-    stateMachines: {},
-    derivationRules: [],
-  }
-
   try {
+    const core = domains.find(d => d.slug === 'core')
+    const validation = domains.find(d => d.slug === 'validation')
+    if (!core || !validation) return
+
+    // Re-parse validation.md with core's nouns in scope so constraint
+    // references to Role, Noun, Graph Schema, etc. resolve correctly.
+    const coreNounNames = core.claims.nouns.map(n => n.name)
+    const valClaims = validation.rawText
+      ? parseFORML2(validation.rawText, coreNounNames)
+      : validation.claims
+
+    // Combine core (schema) + validation (constraints) into one claims set
+    const combined: ExtractedClaims = {
+      nouns: [...core.claims.nouns, ...(valClaims.nouns ?? [])],
+      readings: [...core.claims.readings, ...(valClaims.readings ?? [])],
+      constraints: [...(core.claims.constraints ?? []), ...(valClaims.constraints ?? [])],
+      subtypes: [...(core.claims.subtypes ?? []), ...(valClaims.subtypes ?? [])],
+    }
+
+    // Build SchemaIR → ConstraintIR → load into engine
+    const schemaIR = buildSchemaIR(combined)
+    const nouns: Record<string, { objectType: string; superType?: string }> = {}
+    for (const n of combined.nouns) {
+      nouns[n.name] = { objectType: n.objectType }
+    }
+    for (const st of (combined.subtypes ?? [])) {
+      if (nouns[st.child]) nouns[st.child].superType = st.parent
+    }
+
+    const factTypes: Record<string, { reading: string; roles: Array<{ nounName: string; roleIndex: number }> }> = {}
+    for (const ft of schemaIR.factTypes) {
+      factTypes[ft.id] = { reading: ft.reading, roles: ft.roles }
+    }
+
+    const constraints = (schemaIR.constraints ?? []).map((c, i) => ({
+      id: `val-${i}`,
+      kind: c.kind,
+      modality: c.modality ?? 'Alethic',
+      text: c.text ?? '',
+      spans: (c.roles ?? []).map(roleIdx => ({
+        factTypeId: c.factTypeId,
+        roleIndex: roleIdx,
+      })),
+    }))
+
+    const ir = {
+      domain: 'validation',
+      nouns,
+      factTypes,
+      constraints,
+      stateMachines: {},
+      derivationRules: [],
+    }
+
     loadValidationModel(JSON.stringify(ir))
   } catch {
-    // WASM not available — validation model not loaded
+    // Bootstrap failed (WASM unavailable, parse error, etc.) — non-fatal
   }
 }
 
