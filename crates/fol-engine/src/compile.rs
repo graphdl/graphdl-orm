@@ -275,7 +275,7 @@ pub fn compile(ir: &ConstraintIR) -> CompiledModel {
         .collect();
 
     let state_machines: Vec<CompiledStateMachine> = ir.state_machines.values()
-        .map(|sm_def| compile_state_machine(sm_def))
+        .map(|sm_def| compile_state_machine(sm_def, &constraints))
         .collect();
 
     // Build NounIndex for synthesis queries
@@ -1793,32 +1793,88 @@ fn compile_obligatory(ir: &ConstraintIR, def: &ConstraintDef) -> Predicate {
 // State machines compile to transition functions.
 // run_machine = fold(transition)(initial)(stream)
 
-fn compile_state_machine(def: &StateMachineDef) -> CompiledStateMachine {
+fn compile_state_machine(
+    def: &StateMachineDef,
+    constraints: &[CompiledConstraint],
+) -> CompiledStateMachine {
     let transition_table: Vec<(String, String, String)> = def.transitions.iter()
         .map(|t| (t.from.clone(), t.to.clone(), t.event.clone()))
+        .collect();
+
+    // Build constraint ID → func index for guard lookup
+    let constraint_by_id: HashMap<&str, &crate::ast::Func> = constraints.iter()
+        .map(|c| (c.id.as_str(), &c.func))
         .collect();
 
     let initial = def.statuses.first().cloned().unwrap_or_default();
 
     // AST: transition function <current_state, event> → next_state.
-    // Chain of Conditions — first matching (from, event) fires:
-    //   (match_t1 → target1; (match_t2 → target2; ... ; sel₁))
-    // Selector(1) = return current state unchanged (no match).
-    let mut sm_func = crate::ast::Func::Selector(1);
-    for t in transition_table.iter().rev() {
+    //
+    // Without guards:
+    //   (eq ∘ [id, <from, event>]) → target; next
+    //
+    // With guards (guard_passes ∧ match):
+    //   (null ∘ guard_func ∘ ... ∧ eq ∘ [id, <from, event>]) → target; next
+    //
+    // Guard passes iff the constraint func returns φ (empty = no violations).
+    let mut sm_func = crate::ast::Func::Selector(1); // fallback: return current state
+
+    for (i, t) in def.transitions.iter().enumerate().rev() {
+        // Match predicate: <current_state, event> == <from, event>
         let match_pred = crate::ast::Func::compose(
             crate::ast::Func::Eq,
             crate::ast::Func::construction(vec![
                 crate::ast::Func::Id,
                 crate::ast::Func::constant(crate::ast::Object::seq(vec![
-                    crate::ast::Object::atom(&t.0),
-                    crate::ast::Object::atom(&t.2),
+                    crate::ast::Object::atom(&t.from),
+                    crate::ast::Object::atom(&t.event),
                 ])),
             ]),
         );
+
+        // If transition has guards, compose them with the match predicate.
+        // Guard passes iff all constraint funcs produce φ (no violations).
+        let pred = if let Some(ref guard) = t.guard {
+            let guard_funcs: Vec<&crate::ast::Func> = guard.constraint_ids.iter()
+                .filter_map(|cid| constraint_by_id.get(cid.as_str()).copied())
+                .collect();
+
+            if guard_funcs.is_empty() {
+                match_pred
+            } else {
+                // Build: null_test ∘ guard_func (returns T if guard produces φ)
+                // For multiple guards: all must pass
+                let mut guard_check = crate::ast::Func::compose(
+                    crate::ast::Func::NullTest,
+                    guard_funcs[0].clone(),
+                );
+                for gf in &guard_funcs[1..] {
+                    // AND: both must be true (NullTest returns T/F)
+                    let next_check = crate::ast::Func::compose(
+                        crate::ast::Func::NullTest,
+                        (*gf).clone(),
+                    );
+                    // Compose as: if guard1_passes then check guard2+match else id
+                    guard_check = crate::ast::Func::condition(
+                        guard_check,
+                        next_check,
+                        crate::ast::Func::constant(crate::ast::Object::atom("F")),
+                    );
+                }
+                // Final: if guards pass AND state+event match → fire
+                crate::ast::Func::condition(
+                    guard_check,
+                    match_pred,
+                    crate::ast::Func::constant(crate::ast::Object::atom("F")),
+                )
+            }
+        } else {
+            match_pred
+        };
+
         sm_func = crate::ast::Func::condition(
-            match_pred,
-            crate::ast::Func::constant(crate::ast::Object::atom(&t.1)),
+            pred,
+            crate::ast::Func::constant(crate::ast::Object::atom(&t.to)),
             sm_func,
         );
     }
