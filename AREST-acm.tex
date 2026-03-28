@@ -52,7 +52,7 @@
 %% Abstract
 %%
 \begin{abstract}
-We present AREST (\textbf{A}pplicative \textbf{RE}presentational \textbf{S}tate \textbf{T}ransfer), a compositional architecture that unifies Backus's Applicative State Transition systems (1978) with Fielding's Representational State Transfer (2000). Domain knowledge is expressed as first-order logic propositions in controlled natural language (FORML 2 readings), compiled into executable functions via Backus's combining forms, and rendered as hypermedia representations with state machine transitions as navigation links. The representational state being transferred is the applicative state being transformed. We demonstrate that every transformation in this pipeline is deterministic, lossless, and invertible: the natural language reading is simultaneously the specification, the executable, and the proof obligation.
+We present AREST (\textbf{A}pplicative \textbf{RE}presentational \textbf{S}tate \textbf{T}ransfer), a compositional architecture that unifies Backus's Applicative State Transition systems (1978) with Fielding's Representational State Transfer (2000). Domain knowledge is expressed as first-order logic propositions in controlled natural language (FORML 2 readings), compiled into executable functions via Backus's combining forms, and rendered as hypermedia representations with state machine transitions as navigation links. The representational state being transferred is the applicative state being transformed. We demonstrate that every transformation from reading to compiled form is deterministic, lossless, and invertible: the natural language reading is simultaneously the specification and the executable.
 \end{abstract}
 
 %%
@@ -110,7 +110,7 @@ We observe that this divergence arises from treating specification and implement
 \emph{Each Customer has exactly one Email.}
 \end{quote}
 
-is simultaneously a human-readable requirement and a machine-executable uniqueness--mandatory constraint, every transformation in the pipeline is deterministic, lossless, and invertible.
+is simultaneously a human-readable requirement and a machine-executable uniqueness--mandatory constraint, every transformation from reading to compiled form is deterministic, lossless, and invertible.
 
 AREST achieves this by composing two state transfer systems that operate at orthogonal layers:
 
