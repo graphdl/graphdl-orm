@@ -10,7 +10,7 @@
  * All logic lives in the Rust AST. This file is plumbing.
  */
 
-import { initSync, load_ir, evaluate_response, forward_chain_population, run_machine_wasm, query_schema_wasm, get_transitions_wasm, resolve_fact_event, prepare_entity, apply_command_wasm, debug_compiled_state } from '../../crates/fol-engine/pkg/fol_engine.js'
+import { initSync, load_ir, evaluate_response, forward_chain_population, run_machine_wasm, query_schema_wasm, get_transitions_wasm, resolve_fact_event, prepare_entity, apply_command_wasm, debug_compiled_state, load_validation_model, validate_schema_wasm } from '../../crates/fol-engine/pkg/fol_engine.js'
 import wasmModule from '../../crates/fol-engine/pkg/fol_engine_bg.wasm'
 
 let wasmInitialized = false
@@ -240,5 +240,24 @@ export function querySchema(
 ): { matches: string[]; count: number } {
   ensureWasm()
   const resultJson = query_schema_wasm(schemaId, targetRole, JSON.stringify(filterBindings), populationJson)
+  return JSON.parse(resultJson)
+}
+
+/**
+ * Load the validation model (compiled from core.md + validation.md).
+ * Called once at startup. Persists across domain loads.
+ */
+export function loadValidationModel(irJson: string): void {
+  ensureWasm()
+  load_validation_model(irJson)
+}
+
+/**
+ * Validate a domain IR against the validation model.
+ * The validation model must be loaded first via loadValidationModel().
+ */
+export function validateSchema(domainIrJson: string): Array<{ constraint_id: string; constraint_text: string; detail: string }> {
+  ensureWasm()
+  const resultJson = validate_schema_wasm(domainIrJson)
   return JSON.parse(resultJson)
 }

@@ -33,6 +33,14 @@ struct CompiledState {
     model: CompiledModel,
 }
 
+/// Compiled validation model (from core.md + validation.md).
+/// Stored separately from the domain model so it persists across domain loads.
+static VALIDATION_MODEL: OnceLock<Mutex<Option<CompiledModel>>> = OnceLock::new();
+
+fn validation_store() -> &'static Mutex<Option<CompiledModel>> {
+    VALIDATION_MODEL.get_or_init(|| Mutex::new(None))
+}
+
 static STATE: OnceLock<Mutex<Option<CompiledState>>> = OnceLock::new();
 
 fn state_store() -> &'static Mutex<Option<CompiledState>> {
@@ -344,6 +352,36 @@ pub fn validate_csdp_wasm() -> String {
     };
     let result = csdp::validate_csdp(&state.ir);
     serde_json::to_string(&result).unwrap_or_else(|_| r#"{"valid":false,"violations":[]}"#.to_string())
+}
+
+/// Load the validation model (compiled from core.md + validation.md).
+/// Called once at startup. The validation model persists across domain loads.
+#[wasm_bindgen]
+pub fn load_validation_model(ir_json: &str) -> Result<(), JsValue> {
+    let ir: ConstraintIR = serde_json::from_str(ir_json)
+        .map_err(|e| JsValue::from_str(&format!("Failed to parse validation IR: {}", e)))?;
+    let model = compile::compile(&ir);
+    let mut store = validation_store().lock().unwrap();
+    *store = Some(model);
+    Ok(())
+}
+
+/// Validate a domain IR against the validation model.
+/// Takes domain IR as JSON, converts to metamodel population,
+/// evaluates validation constraints. Returns JSON violations array.
+#[wasm_bindgen]
+pub fn validate_schema_wasm(domain_ir_json: &str) -> String {
+    let val_store = validation_store().lock().unwrap();
+    let validation_model = match val_store.as_ref() {
+        Some(m) => m,
+        None => return "[]".to_string(),
+    };
+    let domain_ir: ConstraintIR = match serde_json::from_str(domain_ir_json) {
+        Ok(ir) => ir,
+        Err(e) => return format!(r#"[{{"constraint_id":"parse_error","constraint_text":"","detail":"{}"}}]"#, e),
+    };
+    let violations = validate::validate_schema(validation_model, &domain_ir);
+    serde_json::to_string(&violations).unwrap_or_else(|_| "[]".to_string())
 }
 
 /// Run RMAP (Relational Mapping Procedure) on the loaded IR.
