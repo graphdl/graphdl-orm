@@ -277,7 +277,7 @@ compiles to:
 
 Forward chaining from the user's identity resolves the accessible domains. The derivation rule is the policy.
 
-Domain evolution follows the same pattern. A proposed change to the readings is itself a fact in the population. A Curry-Howard analogy~\cite{howard80} applies: proposing a new fact type is analogous to proposing a theorem, and the schema is accepted only if the engine can verify its consistency. This is a structural parallel, not a formal type-theoretic isomorphism. CSDP validation serves as the consistency checker: just as a type checker rejects ill-typed programs, the engine rejects schemas that violate the design procedure's rules.
+Domain evolution follows the same pattern. A proposed change to the readings is itself a fact in the population. The change is accepted only if CSDP validation confirms that the resulting schema is consistent.
 
 \section{End-to-End Example}
 
@@ -350,6 +350,8 @@ The command is a composition of functions. The composition is applied atomically
 The hypermedia links in the REST representation are projections of the compiled state machine's transition table. No URL patterns are hardcoded.
 \end{corollary}
 
+The execution model does not require global evaluation. RMAP partitions the population per entity, and commands operate on a bounded subpopulation determined by role reachability. All combinators, including Insert, execute over finite, entity-scoped sets. Locality is a consequence of the schema, not of the runtime.
+
 \section{Related Work}
 
 \textbf{Datalog}~\cite{ceri89} shares AREST's bottom-up, fixed-point
@@ -408,11 +410,6 @@ T. Halpin.
 T. Halpin and M. Curland.
 \newblock Automated Verbalization for {ORM} 2.
 \newblock In \emph{OTM Workshops}, pages 1181--1190, 2006.
-
-\bibitem{howard80}
-W.A. Howard.
-\newblock The Formulae-as-Types Notion of Construction.
-\newblock In \emph{To H.B. Curry: Essays on Combinatory Logic, Lambda Calculus and Formalism}, pages 479--491. Academic Press, 1980.
 
 \bibitem{ceri89}
 S. Ceri, G. Gottlob, and L. Tanca.
