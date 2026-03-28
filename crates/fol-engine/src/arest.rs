@@ -97,12 +97,26 @@ fn apply_create_entity(
     // resolve: reference scheme selector → entity identity
     let entity_id = resolve_entity_id(model, noun, explicit_id, fields);
 
-    // Start building the new population
+    // Build the new population: Pop' = Pop ∪ {entity facts}
     let mut new_pop = population.clone();
 
-    // The Resource entity
+    // Insert entity as facts in the population.
+    // Each field becomes a fact: "Noun has FieldNoun" with bindings (entity_id, value).
     let mut entity_data = fields.clone();
     entity_data.insert("domain".to_string(), domain.to_string());
+    for (field_name, value) in &entity_data {
+        let ft_key = format!("{} has {}", noun, field_name);
+        new_pop.facts.entry(ft_key).or_default().push(
+            FactInstance {
+                fact_type_id: format!("{} has {}", noun, field_name),
+                bindings: vec![
+                    (noun.to_string(), entity_id.clone()),
+                    (field_name.clone(), value.clone()),
+                ],
+            }
+        );
+    }
+
     let mut entities = vec![EntityResult {
         id: entity_id.clone(),
         entity_type: noun.to_string(),
@@ -117,13 +131,35 @@ fn apply_create_entity(
         let initial = crate::evaluate::run_machine_ast(sm, &[]);
         status = Some(initial.clone());
 
+        // Insert SM facts into population
+        let sm_id = format!("sm:{}", entity_id);
+        let sm_facts = vec![
+            ("instanceOf", sm.noun_name.as_str()),
+            ("currentlyInStatus", initial.as_str()),
+            ("forResource", entity_id.as_str()),
+            ("domain", domain),
+        ];
+        for (field, value) in &sm_facts {
+            let ft_key = format!("State Machine has {}", field);
+            let ft_id = ft_key.clone();
+            new_pop.facts.entry(ft_key).or_default().push(
+                FactInstance {
+                    fact_type_id: ft_id,
+                    bindings: vec![
+                        ("State Machine".to_string(), sm_id.clone()),
+                        (field.to_string(), value.to_string()),
+                    ],
+                }
+            );
+        }
+
         let mut sm_data = std::collections::HashMap::new();
         sm_data.insert("instanceOf".to_string(), sm.noun_name.clone());
         sm_data.insert("currentlyInStatus".to_string(), initial);
         sm_data.insert("forResource".to_string(), entity_id.clone());
         sm_data.insert("domain".to_string(), domain.to_string());
         entities.push(EntityResult {
-            id: format!("sm:{}", entity_id),
+            id: sm_id,
             entity_type: "State Machine".to_string(),
             data: sm_data,
         });
@@ -421,20 +457,33 @@ mod tests {
     }
 
     #[test]
-    fn command_returns_population() {
+    fn population_contains_entity_facts() {
         let ir = make_order_ir();
         let model = crate::compile::compile(&ir);
         let pop = Population { facts: HashMap::new() };
+
+        let mut fields = HashMap::new();
+        fields.insert("orderNumber".to_string(), "ORD-1".to_string());
+        fields.insert("customer".to_string(), "acme".to_string());
 
         let cmd = Command::CreateEntity {
             noun: "Order".to_string(),
             domain: "orders".to_string(),
             id: Some("ORD-1".to_string()),
-            fields: HashMap::new(),
+            fields,
         };
 
         let result = apply_command(&model, &cmd, &pop);
-        // CommandResult includes the transformed population
-        let _ = &result.population;
+
+        // Entity fields are facts in the population
+        assert!(result.population.facts.contains_key("Order has customer"));
+        let customer_facts = &result.population.facts["Order has customer"];
+        assert_eq!(customer_facts.len(), 1);
+        assert!(customer_facts[0].bindings.iter().any(|(_, v)| v == "acme"));
+
+        // SM facts are in the population
+        assert!(result.population.facts.contains_key("State Machine has currentlyInStatus"));
+        let sm_facts = &result.population.facts["State Machine has currentlyInStatus"];
+        assert!(sm_facts[0].bindings.iter().any(|(_, v)| v == "Draft"));
     }
 }
