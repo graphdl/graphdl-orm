@@ -326,20 +326,12 @@ function bootstrapValidationModel(
     const validation = domains.find(d => d.slug === 'validation')
     if (!core || !validation) return
 
-    // Re-parse validation.md with core's nouns in scope so constraint
-    // references to Role, Noun, Graph Schema, etc. resolve correctly.
-    const coreNounNames = core.claims.nouns.map(n => n.name)
-    const valClaims = validation.rawText
-      ? parseFORML2(validation.rawText, coreNounNames)
-      : validation.claims
-
-    // Combine core (schema) + validation (constraints) into one claims set
-    const combined: ExtractedClaims = {
-      nouns: [...core.claims.nouns, ...(valClaims.nouns ?? [])],
-      readings: [...core.claims.readings, ...(valClaims.readings ?? [])],
-      constraints: [...(core.claims.constraints ?? []), ...(valClaims.constraints ?? [])],
-      subtypes: [...(core.claims.subtypes ?? []), ...(valClaims.subtypes ?? [])],
-    }
+    // Parse core + validation as a single document so validation
+    // constraints can reference core's readings (not just noun names).
+    // Cross-domain: the constraint "each Role references exactly one Noun"
+    // needs the reading "Noun plays Role" in scope to wire spans.
+    const combinedText = (core.rawText ?? '') + '\n\n' + (validation.rawText ?? '')
+    const combined = parseFORML2(combinedText, [])
 
     // Build SchemaIR → ConstraintIR → load into engine
     const schemaIR = buildSchemaIR(combined)
