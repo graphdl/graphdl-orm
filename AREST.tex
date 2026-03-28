@@ -41,7 +41,7 @@ We present AREST (\textbf{A}pplicative \textbf{RE}presentational \textbf{S}tate 
 
 \section{Introduction}
 
-Application development produces two artifacts, a specification and an implementation, that diverge over time. The specification states ``each customer has exactly one email''; the implementation enforces this through database constraints, API validation, frontend checks, and tests. These are four independent projections of the same proposition that can disagree.
+Application development produces two artifacts, a specification and an implementation, that diverge over time. The specification states ``each customer has exactly one email''; the implementation enforces this through database constraints, API validation, frontend checks, and tests. These are four independent projections of the same proposition that can disagree. Schema design, API frameworks, rule engines, and formal methods each address a fragment of this problem; none spans the full path from domain proposition to running system.
 
 We observe that this divergence arises from treating specification and implementation as separate artifacts. If the sentence
 \begin{quote}
@@ -114,7 +114,11 @@ Constant $\bar{x}$ & Literal value in a reading \\
 \end{tabular}
 \end{table}
 
-Backus's AST extends FP with explicit state: the system state is an object $s$, and a program $p$ transforms it: $s' = p : s$. The system evolves by successive application. In AREST, the state is the population of facts, and each API request is a command applied to the population.
+Backus's AST extends FP with explicit state: the system state is an object $s$, and a program $p$ transforms it: $s' = p : s$. The system evolves by successive application.
+
+\begin{definition}[Population]
+A \emph{population} is a set of ground facts: base facts asserted by commands and derived facts produced by forward chaining. The population is the complete state of the system. Every externally observable value, including entity attributes, state machine statuses, and HATEOAS links, is derivable from the population by pure function application.
+\end{definition}
 
 \subsection{Object-Role Modeling}
 
@@ -263,6 +267,12 @@ $\textit{transition} : \langle \texttt{Draft}, \texttt{Place} \rangle
 = \texttt{Placed}$ and the response includes new link
 \texttt{\{ship\}}, reflecting the updated valid transitions.
 
+If a second command attempts to assign a different Customer to the
+same Order, the UC on \textit{placedBy} fires and the command is
+rejected.  The response includes the violation as the original
+reading: ``Each Order was placed by exactly one Customer.''
+The population is unchanged.
+
 \section{Properties}
 
 \begin{theorem}[Specification Equivalence]\label{thm:spec-equiv}
@@ -284,6 +294,10 @@ The command is a composition of functions. The composition is applied atomically
 \begin{corollary}[HATEOAS from Readings]
 The hypermedia links in the REST representation are projections of the compiled state machine's transition table. No URL patterns are hardcoded.
 \end{corollary}
+
+\begin{theorem}[Derivability]
+Every externally observable value is derivable from the population by pure function application. No observable state exists outside the population.
+\end{theorem}
 
 The execution model does not require global evaluation. RMAP partitions the population per entity, and commands operate on a bounded subpopulation determined by role reachability. All combinators, including Insert, execute over finite, entity-scoped sets. Locality is a consequence of the schema, not of the runtime.
 
