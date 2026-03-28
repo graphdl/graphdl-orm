@@ -44,6 +44,15 @@ It is forbidden that a Reading restates a Noun reference scheme as a separate fa
 
 It is forbidden that a Reading conjoins two independent assertions using 'and' when they can be expressed as separate Readings.
 
+### Derivation Rule Acyclicity
+
+No Derivation Rule depends on itself.
+If Derivation Rule 1 depends on Derivation Rule 2, then Derivation Rule 2 does not depend on Derivation Rule 1.
+
+### Derivation Rule Range Restriction
+
+It is obligatory that each variable in a Derivation Rule consequent appears in at least one antecedent of that Derivation Rule.
+
 ## Instance Facts
 
 Domain 'validation' has Visibility 'public'.
