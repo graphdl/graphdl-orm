@@ -119,7 +119,7 @@ An \emph{Applicative State Transition} system~\cite{backus78} consists of a set 
 \end{definition}
 
 \begin{definition}[REST]
-A \emph{Representational State Transfer} system~\cite{fielding00} communicates state between distributed components by transferring representations via a uniform interface. Hypermedia links in the representation encode valid state transitions (HATEOAS).
+A \emph{Representational State Transfer} system~\cite{fielding00} communicates state between distributed components by transferring representations via a uniform interface. \emph{Hypermedia as the engine of application state} (HATEOAS): each response includes links encoding valid state transitions.
 \end{definition}
 
 \begin{definition}[AREST]
@@ -195,19 +195,13 @@ Each sentence is a FOL proposition. The reference scheme \texttt{(.Slug)} define
 
 The key property: the verbalization is lossless. Every ORM2 constraint has exactly one canonical verbalization pattern, and every well-formed verbalization maps to exactly one constraint. The grammar is restrictive enough to parse deterministically.
 
-ORM2 models state machines as facts about facts. A State Machine instance is a separate entity from the Resource it governs, connected by the fact type \texttt{State Machine is for Resource} (1:1). Objectification of such fact types requires a spanning uniqueness constraint~\cite{halpin20}.
+ORM2 models state machines as facts about facts. A State Machine instance is a separate entity from the Resource it governs, connected by the fact type \texttt{State Machine is for Resource} (1:1).
 
 RMAP maps conceptual schemas to Codd's relations~\cite{codd70}: uniqueness constraints become keys, mandatory constraints become NOT NULL.  In AREST, each entity instance is an independent storage unit keyed by its reference scheme, satisfying third normal form.
 
 \subsection{REST}
 
-Fielding's architectural style~\cite{fielding00} constrains distributed systems to transfer representations of state via a uniform interface. The critical constraint:
-
-\begin{quote}
-\emph{Hypermedia as the engine of application state} (HATEOAS): each response includes links encoding valid state transitions.
-\end{quote}
-
-In AREST, the state machine's valid transitions from the current status serve as the HATEOAS links. The API response for an entity in status ``Draft'' includes actions \texttt{[place, cancel]}, which are transitions compiled from the readings.
+Fielding's architectural style~\cite{fielding00} constrains distributed systems to transfer representations of state via a uniform interface. In AREST, the state machine's valid transitions from the current status serve as the HATEOAS links. The API response for an entity in status ``Draft'' includes actions \texttt{[place, cancel]}, which are transitions compiled from the readings.
 
 \section{The AREST Execution Model}
 
@@ -270,7 +264,7 @@ where $\text{guard\_passes} = \text{null} \circ \text{evaluate\_constraints}$.
 Any policy that can be expressed as a derivation rule is evaluated by the engine. Access control, visibility scoping, and domain evolution are all derivation rules compiled to Composition chains. For example, the access rule
 
 \begin{lstlisting}
-User can access Domain iff User has Org Role
+User accesses Domain iff User has Org Role
   in Organization and Domain belongs to
   that Organization.
 \end{lstlisting}
@@ -409,11 +403,6 @@ R.T. Fielding.
 T. Halpin.
 \newblock \emph{Information Modeling and Relational Databases}.
 \newblock 2nd edition. Morgan Kaufmann, 2008.
-
-\bibitem{halpin20}
-T. Halpin.
-\newblock Objectification and Atomicity.
-\newblock Unpublished note, updated 2020.
 
 \bibitem{halpin06}
 T. Halpin and M. Curland.
