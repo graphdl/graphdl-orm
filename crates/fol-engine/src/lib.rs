@@ -16,6 +16,7 @@ mod induce;
 pub mod rmap;
 pub mod naming;
 pub mod csdp;
+pub mod validate;
 pub mod conceptual_query;
 pub mod parse_rule;
 pub mod arest;
