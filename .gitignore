@@ -42,3 +42,11 @@ yarn-error.log*
 .next/
 obj/
 media/
+
+# LaTeX intermediate output
+*.aux
+*.log
+*.out
+*.bbl
+*.blg
+comment.cut
