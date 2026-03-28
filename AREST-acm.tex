@@ -217,7 +217,7 @@ Every API interaction is a Command: a function from population to population.
 \text{Command} &: \text{Population} \to (\text{Population}', \text{Representation}) \label{eq:cmd}
 \end{align}
 
-A \textsc{CreateEntity} command is a composed function that extends the population with new formulae:
+A \textsc{CreateEntity} command is a composed function that extends the population with new formulas:
 
 \begin{align}
 \text{create} &= \text{emit} \circ \text{derive} \circ \text{validate} \circ \text{resolve}
@@ -227,11 +227,11 @@ where:
 \begin{itemize}
   \item $\text{resolve}$: applies the reference scheme selector to determine the entity's identity
   \item $\text{validate}$: evaluates constraints against the current population
-  \item $\text{derive}$: forward-chains derivation rules to fixed point, adding derived formulae (including state machine initialization) to the population
+  \item $\text{derive}$: forward-chains derivation rules to fixed point, adding derived formulas (including state machine initialization) to the population
   \item $\text{emit}$: produces the new population containing the entity, its state machine instance, and all derived facts
 \end{itemize}
 
-State machine initialization is not a separate step. The state machine definition is a set of formulae in the population. When the entity is created, the derivation rules produce the State Machine instance and its initial Status as derived facts. The composition is compiled from the readings. The engine applies it as one reduction.
+State machine initialization is not a separate step. The state machine definition is a set of formulas in the population. When the entity is created, the derivation rules produce the State Machine instance and its initial Status as derived facts. The composition is compiled from the readings. The engine applies it as one reduction.
 
 \subsection{State Machines as Fold}\label{sec:sm}
 
