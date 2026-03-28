@@ -12,6 +12,7 @@ import { rmap, type RmapSchemaIR, type TableDef } from '../rmap/procedure'
 import { BatchBuilder } from '../claims/batch-builder'
 import type { BatchEntity } from '../batch-wal'
 import type { ExtractedClaims } from '../claims/ingest'
+import { validateSchema } from '../api/engine'
 
 // ── Public types ─────────────────────────────────────────────────────
 
@@ -53,8 +54,28 @@ export function runCsdpPipeline(claims: ExtractedClaims, domain: string): Pipeli
   // Step 1: Build SchemaIR from claims
   const schemaIR = buildSchemaIR(claims)
 
-  // Step 2: Validate via CSDP
+  // Step 2: Validate via CSDP (procedural) + engine self-evaluation (readings)
   const validation = validateCsdp(schemaIR)
+
+  // Also run engine-based validation if WASM engine is available
+  try {
+    const constraintIr = schemaIrToConstraintIr(schemaIR, claims)
+    const engineViolations = validateSchema(JSON.stringify(constraintIr))
+    if (engineViolations.length > 0) {
+      for (const v of engineViolations) {
+        validation.violations.push({
+          type: 'undeclared_noun' as const,
+          message: v.detail || v.constraint_text,
+          fix: 'Fix the reading to satisfy the validation constraint.',
+          constraintId: v.constraint_id,
+        })
+      }
+      validation.valid = false
+    }
+  } catch {
+    // WASM not available (e.g., in tests) — procedural validation still runs
+  }
+
   if (!validation.valid) {
     const now = new Date().toISOString()
     const violationEntities: ViolationEntity[] = validation.violations.map(v => ({
@@ -314,4 +335,45 @@ function buildPopulation(
   }
 
   return { facts }
+}
+
+/**
+ * Convert SchemaIR + ExtractedClaims to the Rust ConstraintIR format.
+ * This is the bridge for engine-based validation.
+ */
+function schemaIrToConstraintIr(schema: SchemaIR, claims: ExtractedClaims): Record<string, unknown> {
+  const nouns: Record<string, { objectType: string; superType?: string }> = {}
+  for (const n of claims.nouns) {
+    nouns[n.name] = { objectType: n.objectType }
+  }
+  for (const st of (claims.subtypes ?? [])) {
+    if (nouns[st.child]) {
+      nouns[st.child].superType = st.parent
+    }
+  }
+
+  const factTypes: Record<string, { reading: string; roles: Array<{ nounName: string; roleIndex: number }> }> = {}
+  for (const ft of schema.factTypes) {
+    factTypes[ft.id] = { reading: ft.reading, roles: ft.roles }
+  }
+
+  const constraints = schema.constraints.map((c, i) => ({
+    id: `c-${i}`,
+    kind: c.kind,
+    modality: c.modality ?? 'Alethic',
+    text: c.text ?? '',
+    spans: c.roles.map(roleIdx => ({
+      factTypeId: c.factTypeId,
+      roleIndex: roleIdx,
+    })),
+  }))
+
+  return {
+    domain: claims.nouns[0]?.name ?? 'unknown',
+    nouns,
+    factTypes,
+    constraints,
+    stateMachines: {},
+    derivationRules: [],
+  }
 }
