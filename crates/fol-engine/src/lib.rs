@@ -15,7 +15,6 @@ mod query;
 mod induce;
 pub mod rmap;
 pub mod naming;
-pub mod csdp;
 pub mod validate;
 pub mod conceptual_query;
 pub mod parse_rule;
@@ -339,19 +338,6 @@ pub fn prepare_entity(noun_name: &str, fields_json: &str, population_json: &str)
         "derivedFacts": derived,
         "factEvent": fact_event,
     })).unwrap_or_else(|_| r#"{"initialState":null,"violations":[],"derivedFacts":[]}"#.to_string())
-}
-
-/// Validate the loaded IR via CSDP (Conceptual Schema Design Procedure).
-/// Returns JSON: { valid: bool, violations: [...] }
-#[wasm_bindgen]
-pub fn validate_csdp_wasm() -> String {
-    let store = state_store().lock().unwrap();
-    let state = match store.as_ref() {
-        Some(s) => s,
-        None => return r#"{"valid":true,"violations":[]}"#.to_string(),
-    };
-    let result = csdp::validate_csdp(&state.ir);
-    serde_json::to_string(&result).unwrap_or_else(|_| r#"{"valid":false,"violations":[]}"#.to_string())
 }
 
 /// Load the validation model (compiled from core.md + validation.md).

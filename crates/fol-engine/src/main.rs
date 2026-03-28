@@ -17,7 +17,6 @@ mod evaluate;
 mod query;
 mod rmap;
 mod naming;
-mod csdp;
 mod conceptual_query;
 mod parse_rule;
 mod arest;
