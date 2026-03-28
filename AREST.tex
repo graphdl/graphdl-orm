@@ -36,7 +36,7 @@
 \maketitle
 
 \begin{abstract}
-We present AREST (\textbf{A}pplicative \textbf{RE}presentational \textbf{S}tate \textbf{T}ransfer), a compositional architecture that unifies Backus's Applicative State Transition systems (1978) with Fielding's Representational State Transfer (2000). Domain knowledge is expressed as first-order logic propositions in controlled natural language (FORML 2 readings), compiled into executable functions via Backus's combining forms, and rendered as hypermedia representations with state machine transitions as navigation links. The representational state being transferred is the applicative state being transformed. We demonstrate that this composition eliminates the specification--implementation gap: the natural language reading is simultaneously the specification, the executable, and the proof obligation.
+We present AREST (\textbf{A}pplicative \textbf{RE}presentational \textbf{S}tate \textbf{T}ransfer), a compositional architecture that unifies Backus's Applicative State Transition systems (1978) with Fielding's Representational State Transfer (2000). Domain knowledge is expressed as first-order logic propositions in controlled natural language (FORML 2 readings), compiled into executable functions via Backus's combining forms, and rendered as hypermedia representations with state machine transitions as navigation links. The representational state being transferred is the applicative state being transformed. We demonstrate that every transformation in this pipeline is deterministic, lossless, and invertible: the natural language reading is simultaneously the specification, the executable, and the proof obligation.
 \end{abstract}
 
 \section{Introduction}
@@ -47,7 +47,7 @@ We observe that this divergence arises from treating specification and implement
 \begin{quote}
 \emph{Each Customer has exactly one Email.}
 \end{quote}
-is simultaneously a human-readable requirement and a machine-executable uniqueness--mandatory constraint, no translation step exists to introduce error.
+is simultaneously a human-readable requirement and a machine-executable uniqueness--mandatory constraint, every transformation in the pipeline is deterministic, lossless, and invertible.
 
 AREST achieves this by composing two state transfer systems that operate at orthogonal layers:
 
@@ -266,7 +266,7 @@ $\textit{transition} : \langle \texttt{Draft}, \texttt{Place} \rangle
 \section{Properties}
 
 \begin{theorem}[Specification Equivalence]\label{thm:spec-equiv}
-In AREST, the FORML 2 reading is isomorphic to the executable constraint. No translation step exists between specification and implementation.
+In AREST, the FORML 2 reading is isomorphic to the executable constraint. Every transformation from reading to compiled form is deterministic, lossless, and invertible.
 \end{theorem}
 
 \begin{proof}
