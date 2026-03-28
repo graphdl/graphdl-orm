@@ -315,6 +315,18 @@ No Noun is subtype of itself.
 If Noun1 is subtype of Noun2, then Noun2 is not subtype of Noun1.
 If Noun1 is subtype of Noun2 and Noun2 is subtype of Noun3, then Noun1 is subtype of Noun3.
 
+### Derivation Rule
+
+Derivation Rule(.id) is an entity type.
+Derivation Rule has Text.
+  Each Derivation Rule has exactly one Text.
+Derivation Rule has antecedent Graph Schema.
+Derivation Rule produces Graph Schema.
+  Each Derivation Rule produces exactly one Graph Schema.
+Derivation Rule depends on Derivation Rule
+  := Derivation Rule has antecedent Graph Schema
+     and some other Derivation Rule produces that Graph Schema.
+
 ## Derivation Rules
 
 Graph Schema has Arity := count of Role where Graph Schema has Role.
