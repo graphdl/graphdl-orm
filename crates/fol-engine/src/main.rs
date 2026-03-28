@@ -21,6 +21,7 @@ mod csdp;
 mod conceptual_query;
 mod parse_rule;
 mod arest;
+mod validate;
 
 use types::{ConstraintIR, ResponseContext, Population};
 use query::QueryPredicate;
