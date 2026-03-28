@@ -469,7 +469,107 @@ fn compile_derivations(ir: &ConstraintIR) -> Vec<CompiledDerivation> {
     derivations
 }
 
+// ── Object-level population helpers ──────────────────────────────────
+// These operate directly on the population Object (Seq of <ft_id, <facts>>)
+// without decoding to Population structs. Used by derivation compilers.
+
+/// Find the facts Seq for a specific fact type ID in a population Object.
+/// Population: <E1, E2, ...> where Ei = <ft_id, <facts...>>
+/// Returns the <facts...> Seq if found, or empty Seq.
+fn obj_find_ft<'a>(pop_obj: &'a crate::ast::Object, target_ft_id: &str) -> &'a [crate::ast::Object] {
+    static EMPTY: Vec<crate::ast::Object> = Vec::new();
+    if let Some(entries) = pop_obj.as_seq() {
+        for entry in entries {
+            if let Some(pair) = entry.as_seq() {
+                if pair.len() == 2 {
+                    if let Some(ft_id) = pair[0].as_atom() {
+                        if ft_id == target_ft_id {
+                            return pair[1].as_seq().unwrap_or(&EMPTY);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    &EMPTY
+}
+
+/// Collect all unique values for a noun name across the entire population Object.
+fn obj_instances_of(pop_obj: &crate::ast::Object, noun_name: &str) -> HashSet<String> {
+    let mut result = HashSet::new();
+    if let Some(entries) = pop_obj.as_seq() {
+        for entry in entries {
+            if let Some(pair) = entry.as_seq() {
+                if pair.len() == 2 {
+                    if let Some(facts) = pair[1].as_seq() {
+                        for fact in facts {
+                            if let Some(bindings) = fact.as_seq() {
+                                for binding in bindings {
+                                    if let Some(bpair) = binding.as_seq() {
+                                        if bpair.len() == 2 {
+                                            if let (Some(n), Some(v)) = (bpair[0].as_atom(), bpair[1].as_atom()) {
+                                                if n == noun_name {
+                                                    result.insert(v.to_string());
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    result
+}
+
+/// Check if an entity participates in a specific fact type in the population Object.
+fn obj_participates_in(pop_obj: &crate::ast::Object, entity: &str, noun_name: &str, ft_id: &str) -> bool {
+    let facts = obj_find_ft(pop_obj, ft_id);
+    for fact in facts {
+        if let Some(bindings) = fact.as_seq() {
+            for binding in bindings {
+                if let Some(bpair) = binding.as_seq() {
+                    if bpair.len() == 2 {
+                        if let (Some(n), Some(v)) = (bpair[0].as_atom(), bpair[1].as_atom()) {
+                            if n == noun_name && v == entity {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Build a derived fact Object: <fact_type_id, reading, <bindings>>
+/// where each binding is <noun_name, value>.
+fn obj_derived_fact(ft_id: &str, reading: &str, bindings: &[(String, String)]) -> crate::ast::Object {
+    let binding_objs: Vec<crate::ast::Object> = bindings.iter().map(|(n, v)| {
+        crate::ast::Object::seq(vec![crate::ast::Object::atom(n), crate::ast::Object::atom(v)])
+    }).collect();
+    crate::ast::Object::seq(vec![
+        crate::ast::Object::atom(ft_id),
+        crate::ast::Object::atom(reading),
+        crate::ast::Object::Seq(binding_objs),
+    ])
+}
+
 /// Compile an explicit derivation rule from the IR.
+///
+/// Pure AST form would be:
+///   Condition(
+///     /And ∘ α(Compose(Not ∘ NullTest, find_ft)) : <antecedent_ids>,
+///     Construction of collected bindings,
+///     Constant(φ)
+///   )
+/// Blocked on: no Filter/Find primitive to locate a fact type by ID in the
+/// population Seq. Requires a fold-based search (Insert + Condition) that
+/// would be more complex than the direct Object traversal below.
 fn compile_explicit_derivation(ir: &ConstraintIR, rule: &DerivationRuleDef) -> CompiledDerivation {
     let id = rule.id.clone();
     let text = rule.text.clone();
@@ -480,60 +580,41 @@ fn compile_explicit_derivation(ir: &ConstraintIR, rule: &DerivationRuleDef) -> C
         .map(|ft| ft.reading.clone())
         .unwrap_or_default();
 
-    let derive_id = id.clone();
-    let derive: DeriveFn = Arc::new(move |_ctx: &EvalContext, population: &Population| {
-        // Check if all antecedent fact types have instances
+    // Operate directly on the population Object — no decode/re-encode.
+    let func = crate::ast::Func::Native(Arc::new(move |pop_obj: &crate::ast::Object| {
+        // Check if all antecedent fact types have non-empty fact lists
         let all_hold = antecedent_ids.iter().all(|ft_id| {
-            population.facts.get(ft_id).map_or(false, |facts| !facts.is_empty())
+            !obj_find_ft(pop_obj, ft_id).is_empty()
         });
 
-        if all_hold {
-            // Collect all entity bindings from antecedent facts
-            let mut bindings = Vec::new();
-            for ft_id in &antecedent_ids {
-                if let Some(facts) = population.facts.get(ft_id) {
-                    for fact in facts {
-                        for binding in &fact.bindings {
-                            if !bindings.contains(binding) {
-                                bindings.push(binding.clone());
+        if !all_hold {
+            return crate::ast::Object::phi();
+        }
+
+        // Collect all unique bindings from antecedent facts
+        let mut bindings: Vec<(String, String)> = Vec::new();
+        for ft_id in &antecedent_ids {
+            for fact in obj_find_ft(pop_obj, ft_id) {
+                if let Some(fact_bindings) = fact.as_seq() {
+                    for binding in fact_bindings {
+                        if let Some(bpair) = binding.as_seq() {
+                            if bpair.len() == 2 {
+                                if let (Some(n), Some(v)) = (bpair[0].as_atom(), bpair[1].as_atom()) {
+                                    let pair = (n.to_string(), v.to_string());
+                                    if !bindings.contains(&pair) {
+                                        bindings.push(pair);
+                                    }
+                                }
                             }
                         }
                     }
                 }
             }
-
-            vec![DerivedFact {
-                fact_type_id: consequent_id.clone(),
-                reading: consequent_reading.clone(),
-                bindings,
-                derived_by: derive_id.clone(),
-                confidence: Confidence::Definitive,
-            }]
-        } else {
-            Vec::new()
         }
-    });
 
-    let derive_for_func = derive.clone();
-    let func = crate::ast::Func::Native(Arc::new(move |pop_obj: &crate::ast::Object| {
-        let population = decode_population_object(pop_obj);
-        let response = ResponseContext { text: String::new(), sender_identity: None, fields: None };
-        let ctx = EvalContext { response: &response, population: &population };
-        let derived = derive_for_func(&ctx, &population);
-        if derived.is_empty() {
-            crate::ast::Object::phi()
-        } else {
-            crate::ast::Object::Seq(derived.iter().map(|d| {
-                let bindings: Vec<crate::ast::Object> = d.bindings.iter().map(|(n, v)| {
-                    crate::ast::Object::seq(vec![crate::ast::Object::atom(n), crate::ast::Object::atom(v)])
-                }).collect();
-                crate::ast::Object::seq(vec![
-                    crate::ast::Object::atom(&d.fact_type_id),
-                    crate::ast::Object::atom(&d.reading),
-                    crate::ast::Object::Seq(bindings),
-                ])
-            }).collect())
-        }
+        crate::ast::Object::Seq(vec![
+            obj_derived_fact(&consequent_id, &consequent_reading, &bindings),
+        ])
     }));
     CompiledDerivation { id, text, kind, func }
 }
@@ -565,6 +646,13 @@ fn wrap_derive_fn(derive: DeriveFn) -> crate::ast::Func {
 
 /// Subtype inheritance: for each noun with a supertype,
 /// instances of the subtype inherit participation in the supertype's fact types.
+///
+/// Pure AST form would be:
+///   For each supertype fact type:
+///     α(Condition(Not ∘ participates, construct_derived, Constant(φ))) ∘ instances
+///   Blocked on: instances_of requires a global scan (fold over all fact types
+///   extracting bindings), and participates_in requires a find-by-ID lookup.
+///   Both need Filter/Find primitives not yet in the AST.
 fn compile_subtype_inheritance(ir: &ConstraintIR) -> Vec<CompiledDerivation> {
     let mut derivations = Vec::new();
 
@@ -589,31 +677,32 @@ fn compile_subtype_inheritance(ir: &ConstraintIR) -> Vec<CompiledDerivation> {
             let id = format!("_subtype_{}_{}", sub, sup);
             let text = format!("{} is a subtype of {} — inherits fact types", sub, sup);
 
-            let derive: DeriveFn = Arc::new(move |_ctx: &EvalContext, population: &Population| {
+            // Operate directly on the population Object — no decode/re-encode.
+            let func = crate::ast::Func::Native(Arc::new(move |pop_obj: &crate::ast::Object| {
                 let mut derived = Vec::new();
 
                 // Find all instances of the subtype in the population
-                let sub_instances = instances_of(&sub, population);
+                let sub_instances = obj_instances_of(pop_obj, &sub);
 
                 for (ft_id, reading, _role_idx) in &sft {
                     for instance in &sub_instances {
                         // Check if this instance already participates in this fact type
-                        if !participates_in(instance, &sup, ft_id, population) {
-                            derived.push(DerivedFact {
-                                fact_type_id: ft_id.clone(),
-                                reading: reading.clone(),
-                                bindings: vec![(sup.clone(), instance.clone())],
-                                derived_by: format!("_subtype_{}_{}", sub, sup),
-                                confidence: Confidence::Definitive,
-                            });
+                        if !obj_participates_in(pop_obj, instance, &sup, ft_id) {
+                            derived.push(obj_derived_fact(
+                                ft_id,
+                                reading,
+                                &[(sup.clone(), instance.clone())],
+                            ));
                         }
                     }
                 }
 
-                derived
-            });
-
-            let func = wrap_derive_fn(derive);
+                if derived.is_empty() {
+                    crate::ast::Object::phi()
+                } else {
+                    crate::ast::Object::Seq(derived)
+                }
+            }));
             derivations.push(CompiledDerivation {
                 id,
                 text,
@@ -628,6 +717,14 @@ fn compile_subtype_inheritance(ir: &ConstraintIR) -> Vec<CompiledDerivation> {
 
 /// Modus ponens on subset constraints: if A subset B (SS constraint),
 /// when we find an instance in A, derive its presence in B.
+///
+/// Pure AST form would be:
+///   α(Condition(Not ∘ exists_in_B, construct_B_fact, Constant(φ)))
+///     ∘ α(project_to_B_nouns)
+///     ∘ find_ft(A)
+/// Blocked on: find_ft requires searching the population Seq by atom ID,
+/// and exists_in_B needs a nested membership check. Both need a fold-based
+/// search primitive (Insert + Condition) not yet ergonomic in the AST.
 fn compile_modus_ponens(ir: &ConstraintIR) -> Vec<CompiledDerivation> {
     let mut derivations = Vec::new();
 
@@ -648,10 +745,6 @@ fn compile_modus_ponens(ir: &ConstraintIR) -> Vec<CompiledDerivation> {
         let b_ft_id = cdef.spans[1].fact_type_id.clone();
 
         // Collect role noun names from both fact types for full tuple propagation
-        let a_role_names: Vec<String> = ir.fact_types.get(&a_ft_id)
-            .map(|ft| ft.roles.iter().map(|r| r.noun_name.clone()).collect())
-            .unwrap_or_default();
-
         let b_role_names: Vec<String> = ir.fact_types.get(&b_ft_id)
             .map(|ft| ft.roles.iter().map(|r| r.noun_name.clone()).collect())
             .unwrap_or_default();
@@ -662,46 +755,65 @@ fn compile_modus_ponens(ir: &ConstraintIR) -> Vec<CompiledDerivation> {
 
         let id = format!("_modus_ponens_{}", cdef.id);
         let text = format!("Modus ponens from SS constraint: {}", cdef.text);
-        let derive_id = id.clone();
 
-        let derive: DeriveFn = Arc::new(move |_ctx: &EvalContext, population: &Population| {
-            let a_facts = population.facts.get(&a_ft_id).cloned().unwrap_or_default();
-            let b_facts = population.facts.get(&b_ft_id).cloned().unwrap_or_default();
+        // Operate directly on the population Object — no decode/re-encode.
+        let func = crate::ast::Func::Native(Arc::new(move |pop_obj: &crate::ast::Object| {
+            let a_facts = obj_find_ft(pop_obj, &a_ft_id);
+            let b_facts = obj_find_ft(pop_obj, &b_ft_id);
 
-            a_facts.iter().filter_map(|a_fact| {
-                // Build the full consequent tuple by mapping bindings from the
-                // superset fact to the subset fact by noun name correspondence.
-                let mut b_bindings: Vec<(String, String)> = Vec::new();
-                for b_noun in &b_role_names {
-                    if let Some((_, val)) = a_fact.bindings.iter().find(|(n, _)| n == b_noun) {
-                        b_bindings.push((b_noun.clone(), val.clone()));
+            let mut derived = Vec::new();
+
+            for a_fact in a_facts {
+                if let Some(a_bindings) = a_fact.as_seq() {
+                    // Build the consequent tuple by mapping bindings by noun name
+                    let mut b_bindings: Vec<(String, String)> = Vec::new();
+                    for b_noun in &b_role_names {
+                        for ab in a_bindings {
+                            if let Some(abpair) = ab.as_seq() {
+                                if abpair.len() == 2 {
+                                    if let (Some(n), Some(v)) = (abpair[0].as_atom(), abpair[1].as_atom()) {
+                                        if n == b_noun {
+                                            b_bindings.push((b_noun.clone(), v.to_string()));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if b_bindings.is_empty() { continue; }
+
+                    // Check if this tuple already exists in the consequent population
+                    let already_exists = b_facts.iter().any(|bf| {
+                        if let Some(bf_bindings) = bf.as_seq() {
+                            b_bindings.iter().all(|(name, val)| {
+                                bf_bindings.iter().any(|bb| {
+                                    if let Some(bbpair) = bb.as_seq() {
+                                        bbpair.len() == 2
+                                            && bbpair[0].as_atom() == Some(name.as_str())
+                                            && bbpair[1].as_atom() == Some(val.as_str())
+                                    } else {
+                                        false
+                                    }
+                                })
+                            })
+                        } else {
+                            false
+                        }
+                    });
+
+                    if !already_exists {
+                        derived.push(obj_derived_fact(&b_ft_id, &b_reading, &b_bindings));
                     }
                 }
+            }
 
-                if b_bindings.is_empty() { return None; }
-
-                // Check if this tuple already exists in the consequent population
-                let already_exists = b_facts.iter().any(|bf| {
-                    b_bindings.iter().all(|(name, val)| {
-                        bf.bindings.iter().any(|(bn, bv)| bn == name && bv == val)
-                    })
-                });
-
-                if !already_exists {
-                    Some(DerivedFact {
-                        fact_type_id: b_ft_id.clone(),
-                        reading: b_reading.clone(),
-                        bindings: b_bindings,
-                        derived_by: derive_id.clone(),
-                        confidence: Confidence::Definitive,
-                    })
-                } else {
-                    None
-                }
-            }).collect()
-        });
-
-        let func = wrap_derive_fn(derive);
+            if derived.is_empty() {
+                crate::ast::Object::phi()
+            } else {
+                crate::ast::Object::Seq(derived)
+            }
+        }));
         derivations.push(CompiledDerivation {
             id,
             text,
@@ -715,6 +827,13 @@ fn compile_modus_ponens(ir: &ConstraintIR) -> Vec<CompiledDerivation> {
 
 /// Transitivity: for fact types that share a noun in different roles (A->B, B->C),
 /// derive the transitive closure A->C. Limited depth to prevent infinite chains.
+///
+/// Pure AST form would be:
+///   α(α(construct_pair) ∘ DistL) ∘ Trans ∘ [join_key_matches, src_vals, dst_vals]
+///   where join_key_matches filters the cross-product of ft1 x ft2 on shared noun.
+/// Blocked on: the equi-join (nested loop matching shared noun values) requires
+/// a cross-product (DistL/DistR) followed by a filter, which needs Filter or
+/// a fold-based select. The AST lacks these as first-class primitives.
 fn compile_transitivity(ir: &ConstraintIR) -> Vec<CompiledDerivation> {
     let mut derivations = Vec::new();
 
@@ -726,7 +845,6 @@ fn compile_transitivity(ir: &ConstraintIR) -> Vec<CompiledDerivation> {
     for (i, (ft1_id, ft1)) in binary_fts.iter().enumerate() {
         for (j, (ft2_id, ft2)) in binary_fts.iter().enumerate() {
             if i == j { continue; } // skip self-pairing
-            // Skip same fact type (self-transitivity handled separately)
             // Check if ft1's role[1] noun == ft2's role[0] noun (A->B, B->C)
             let ft1_r1 = &ft1.roles[1].noun_name;
             let ft2_r0 = &ft2.roles[0].noun_name;
@@ -745,60 +863,76 @@ fn compile_transitivity(ir: &ConstraintIR) -> Vec<CompiledDerivation> {
                 src_noun, dst_noun, shared_noun);
 
             let id = format!("_transitivity_{}_{}",  ft1_id_c, ft2_id_c);
-            let derive_id = id.clone();
             let reading_c = reading.clone();
             let src_noun_c = src_noun.clone();
             let dst_noun_c = dst_noun.clone();
             let shared_noun_c = shared_noun.clone();
+            let transitive_ft_id = format!("_transitive_{}_{}", ft1_id_c, ft2_id_c);
 
-            let derive: DeriveFn = Arc::new(move |_ctx: &EvalContext, population: &Population| {
-                let ft1_facts = population.facts.get(&ft1_id_c).cloned().unwrap_or_default();
-                let ft2_facts = population.facts.get(&ft2_id_c).cloned().unwrap_or_default();
+            // Operate directly on the population Object — no decode/re-encode.
+            let func = crate::ast::Func::Native(Arc::new(move |pop_obj: &crate::ast::Object| {
+                let ft1_facts = obj_find_ft(pop_obj, &ft1_id_c);
+                let ft2_facts = obj_find_ft(pop_obj, &ft2_id_c);
 
                 let mut derived = Vec::new();
 
-                for f1 in &ft1_facts {
-                    // Get the value of the shared noun from ft1's role[1]
-                    let shared_val = f1.bindings.iter()
-                        .find(|(name, _)| *name == shared_noun_c)
-                        .map(|(_, v)| v.clone());
+                for f1 in ft1_facts {
+                    if let Some(f1_bindings) = f1.as_seq() {
+                        // Extract shared and src values from f1
+                        let mut shared_val: Option<&str> = None;
+                        let mut src_val: Option<&str> = None;
+                        for b in f1_bindings {
+                            if let Some(bp) = b.as_seq() {
+                                if bp.len() == 2 {
+                                    if let (Some(n), Some(v)) = (bp[0].as_atom(), bp[1].as_atom()) {
+                                        if n == shared_noun_c { shared_val = Some(v); }
+                                        if n == src_noun_c { src_val = Some(v); }
+                                    }
+                                }
+                            }
+                        }
 
-                    let src_val = f1.bindings.iter()
-                        .find(|(name, _)| *name == src_noun_c)
-                        .map(|(_, v)| v.clone());
+                        if let (Some(sv), Some(srcv)) = (shared_val, src_val) {
+                            // Find matching ft2 facts where shared noun == sv
+                            for f2 in ft2_facts {
+                                if let Some(f2_bindings) = f2.as_seq() {
+                                    let mut f2_shared: Option<&str> = None;
+                                    let mut dst_val: Option<&str> = None;
+                                    for b in f2_bindings {
+                                        if let Some(bp) = b.as_seq() {
+                                            if bp.len() == 2 {
+                                                if let (Some(n), Some(v)) = (bp[0].as_atom(), bp[1].as_atom()) {
+                                                    if n == shared_noun_c { f2_shared = Some(v); }
+                                                    if n == dst_noun_c { dst_val = Some(v); }
+                                                }
+                                            }
+                                        }
+                                    }
 
-                    if let (Some(shared_v), Some(src_v)) = (shared_val, src_val) {
-                        // Find matching ft2 facts where role[0] == shared_val
-                        for f2 in &ft2_facts {
-                            let f2_shared = f2.bindings.iter()
-                                .find(|(name, _)| *name == shared_noun_c)
-                                .map(|(_, v)| v.clone());
-
-                            if f2_shared.as_deref() == Some(&shared_v) {
-                                if let Some((_, dst_v)) = f2.bindings.iter()
-                                    .find(|(name, _)| *name == dst_noun_c)
-                                {
-                                    derived.push(DerivedFact {
-                                        fact_type_id: format!("_transitive_{}_{}",
-                                            ft1_id_c, ft2_id_c),
-                                        reading: reading_c.clone(),
-                                        bindings: vec![
-                                            (src_noun_c.clone(), src_v.clone()),
-                                            (dst_noun_c.clone(), dst_v.clone()),
-                                        ],
-                                        derived_by: derive_id.clone(),
-                                        confidence: Confidence::Definitive,
-                                    });
+                                    if f2_shared == Some(sv) {
+                                        if let Some(dv) = dst_val {
+                                            derived.push(obj_derived_fact(
+                                                &transitive_ft_id,
+                                                &reading_c,
+                                                &[
+                                                    (src_noun_c.clone(), srcv.to_string()),
+                                                    (dst_noun_c.clone(), dv.to_string()),
+                                                ],
+                                            ));
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
                 }
 
-                derived
-            });
-
-            let func = wrap_derive_fn(derive);
+                if derived.is_empty() {
+                    crate::ast::Object::phi()
+                } else {
+                    crate::ast::Object::Seq(derived)
+                }
+            }));
             derivations.push(CompiledDerivation {
                 id,
                 text: reading,
@@ -814,6 +948,14 @@ fn compile_transitivity(ir: &ConstraintIR) -> Vec<CompiledDerivation> {
 /// CWA negation: for nouns with WorldAssumption::Closed,
 /// if a fact type involving this noun has no instances for a given entity,
 /// derive the negation. For OWA nouns, absence is unknown, not false.
+///
+/// Pure AST form would be:
+///   For each relevant fact type:
+///     α(Condition(Not ∘ participates_in_ft, construct_negation, Constant(φ)))
+///       ∘ all_instances(noun)
+///   Blocked on: all_instances requires a global fold over every fact type in
+///   the population extracting noun bindings, and participates_in_ft requires
+///   a find-by-ID search. Both need Filter/Find primitives not yet in the AST.
 fn compile_cwa_negation(ir: &ConstraintIR) -> Vec<CompiledDerivation> {
     let mut derivations = Vec::new();
 
@@ -839,31 +981,30 @@ fn compile_cwa_negation(ir: &ConstraintIR) -> Vec<CompiledDerivation> {
         let rft = relevant_fts.clone();
         let id = format!("_cwa_negation_{}", noun);
         let text = format!("CWA: absent facts about {} are false", noun);
-        let derive_id = id.clone();
 
-        let derive: DeriveFn = Arc::new(move |_ctx: &EvalContext, population: &Population| {
-            let all_instances = instances_of(&noun, population);
+        // Operate directly on the population Object — no decode/re-encode.
+        let func = crate::ast::Func::Native(Arc::new(move |pop_obj: &crate::ast::Object| {
+            let all_instances = obj_instances_of(pop_obj, &noun);
             let mut derived = Vec::new();
 
             for (ft_id, reading, _role_idx) in &rft {
                 for instance in &all_instances {
-                    if !participates_in(instance, &noun, ft_id, population) {
-                        derived.push(DerivedFact {
-                            fact_type_id: ft_id.clone(),
-                            reading: format!("NOT: {} (CWA negation for {} '{}')",
-                                reading, noun, instance),
-                            bindings: vec![(noun.clone(), instance.clone())],
-                            derived_by: derive_id.clone(),
-                            confidence: Confidence::Definitive,
-                        });
+                    if !obj_participates_in(pop_obj, instance, &noun, ft_id) {
+                        derived.push(obj_derived_fact(
+                            ft_id,
+                            &format!("NOT: {} (CWA negation for {} '{}')", reading, noun, instance),
+                            &[(noun.clone(), instance.clone())],
+                        ));
                     }
                 }
             }
 
-            derived
-        });
-
-        let func = wrap_derive_fn(derive);
+            if derived.is_empty() {
+                crate::ast::Object::phi()
+            } else {
+                crate::ast::Object::Seq(derived)
+            }
+        }));
         derivations.push(CompiledDerivation {
             id,
             text,
