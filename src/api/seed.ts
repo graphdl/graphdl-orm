@@ -103,6 +103,9 @@ async function handleSeedDelete(env: Env): Promise<Response> {
     })
   )
 
+  // Hard-wipe entity registry — not soft-delete, actual DELETE
+  await registry.wipeAllEntities()
+
   return json({ message: 'All data wiped' })
 }
 
