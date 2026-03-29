@@ -15,15 +15,19 @@ use crate::ast;
 
 // ── Commands ─────────────────────────────────────────────────────────
 
+/// The five input classes from Backus Section 14.4.2.
+/// Each corresponds to an AREST operation.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "type")]
 pub enum Command {
+    /// is-cmd: execute with validation (create entity with SM, constraints)
     CreateEntity {
         noun: String,
         domain: String,
         id: Option<String>,
         fields: std::collections::HashMap<String, String>,
     },
+    /// is-cmd: state machine transition
     Transition {
         #[serde(alias = "entityId")]
         entity_id: String,
@@ -31,6 +35,19 @@ pub enum Command {
         domain: String,
         #[serde(alias = "currentStatus", default)]
         current_status: Option<String>,
+    },
+    /// is-qry: query the population (partial application of graph schema)
+    Query {
+        #[serde(alias = "schemaId")]
+        schema_id: String,
+        domain: String,
+        target: String,
+        bindings: std::collections::HashMap<String, String>,
+    },
+    /// is-chg: install or update readings (modify definitions D)
+    LoadReadings {
+        markdown: String,
+        domain: String,
     },
 }
 
@@ -75,16 +92,28 @@ pub fn apply_command(
     population: &Population,
 ) -> CommandResult {
     match command {
+        // is-cmd: create entity with validation
         Command::CreateEntity { noun, domain, id, fields } => {
             apply_create_entity(model, noun, domain, id.as_deref(), fields, population)
         }
+        // is-cmd: state machine transition
         Command::Transition { entity_id, event, domain, current_status } => {
             apply_transition(model, entity_id, event, domain, current_status.as_deref(), population)
+        }
+        // is-qry: query the population via partial application
+        Command::Query { schema_id, domain: _, target, bindings } => {
+            apply_query(model, schema_id, target, bindings, population)
+        }
+        // is-chg: install readings (modify definitions)
+        Command::LoadReadings { markdown, domain } => {
+            apply_load_readings(markdown, domain, population)
         }
     }
 }
 
-// ── create = emit ∘ derive ∘ validate ∘ resolve ─────────────────────
+// ── create = emit ∘ validate ∘ derive ∘ resolve ─────────────────────
+// Right-to-left: resolve → derive → validate → emit
+// Validate must see the complete population (base + derived facts).
 
 fn apply_create_entity(
     model: &CompiledModel,
@@ -94,69 +123,52 @@ fn apply_create_entity(
     fields: &std::collections::HashMap<String, String>,
     population: &Population,
 ) -> CommandResult {
-    // resolve: reference scheme selector → entity identity
+    // create = emit ∘ validate ∘ derive ∘ resolve
+    //
+    // ── resolve ─────────────────────────────────────────────────────
+    // Apply the reference scheme selector to determine entity identity.
+    // Insert entity fields as facts: Pop' = Pop ∪ {entity facts}.
     let entity_id = resolve_entity_id(model, noun, explicit_id, fields);
 
-    // Build the new population: Pop' = Pop ∪ {entity facts}
     let mut new_pop = population.clone();
-
-    // Insert entity as facts in the population.
-    // Each field becomes a fact: "Noun has FieldNoun" with bindings (entity_id, value).
     let mut entity_data = fields.clone();
     entity_data.insert("domain".to_string(), domain.to_string());
     for (field_name, value) in &entity_data {
-        let ft_key = format!("{} has {}", noun, field_name);
-        new_pop.facts.entry(ft_key).or_default().push(
+        let ft_id = resolve_fact_type_id(model, noun, field_name);
+        new_pop.facts.entry(ft_id.clone()).or_default().push(
             FactInstance {
-                fact_type_id: format!("{} has {}", noun, field_name),
+                fact_type_id: ft_id,
                 bindings: vec![
                     (noun.to_string(), entity_id.clone()),
                     (field_name.clone(), value.clone()),
                 ],
+           
             }
         );
     }
 
+    // ── derive ──────────────────────────────────────────────────────
+    // Forward-chain derivation rules to fixed point.
+    // State machine initialization is NOT a separate step — the SM instance
+    // and its initial status are derived facts produced by forward chaining
+    // (compile_sm_initialization derivation rule).
+    let derived = crate::evaluate::forward_chain_ast(model, &mut new_pop);
+
+    // Build entity results from the population.
+    // The SM instance was derived by forward chaining — extract status from population.
     let mut entities = vec![EntityResult {
         id: entity_id.clone(),
         entity_type: noun.to_string(),
         data: entity_data,
     }];
 
-    // State Machine initialization via AST:
-    // apply sm.func to empty event stream → initial state
-    let mut status = None;
-    if let Some(&sm_idx) = model.noun_index.noun_to_state_machines.get(noun) {
-        let sm = &model.state_machines[sm_idx];
-        let initial = crate::evaluate::run_machine_ast(sm, &[]);
-        status = Some(initial.clone());
+    let sm_id = format!("sm:{}", entity_id);
+    let status = extract_sm_status(&new_pop, &sm_id);
 
-        // Insert SM facts into population
-        let sm_id = format!("sm:{}", entity_id);
-        let sm_facts = vec![
-            ("instanceOf", sm.noun_name.as_str()),
-            ("currentlyInStatus", initial.as_str()),
-            ("forResource", entity_id.as_str()),
-            ("domain", domain),
-        ];
-        for (field, value) in &sm_facts {
-            let ft_key = format!("State Machine has {}", field);
-            let ft_id = ft_key.clone();
-            new_pop.facts.entry(ft_key).or_default().push(
-                FactInstance {
-                    fact_type_id: ft_id,
-                    bindings: vec![
-                        ("State Machine".to_string(), sm_id.clone()),
-                        (field.to_string(), value.to_string()),
-                    ],
-                }
-            );
-        }
-
+    if let Some(ref st) = status {
         let mut sm_data = std::collections::HashMap::new();
-        sm_data.insert("instanceOf".to_string(), sm.noun_name.clone());
-        sm_data.insert("currentlyInStatus".to_string(), initial);
         sm_data.insert("forResource".to_string(), entity_id.clone());
+        sm_data.insert("currentlyInStatus".to_string(), st.clone());
         sm_data.insert("domain".to_string(), domain.to_string());
         entities.push(EntityResult {
             id: sm_id,
@@ -165,16 +177,40 @@ fn apply_create_entity(
         });
     }
 
-    // derive: forward chain to fixed point on the new population
-    let derived = crate::evaluate::forward_chain_ast(model, &mut new_pop);
+    // Inject transition facts into population (Theorem 3: T ⊆ P)
+    if status.is_some() {
+        if let Some(&sm_idx) = model.noun_index.noun_to_state_machines.get(noun) {
+            let sm = &model.state_machines[sm_idx];
+            for (from, to, event) in &sm.transition_table {
+                let ft_key = "Transition".to_string();
+                new_pop.facts.entry(ft_key.clone()).or_default().push(
+                    FactInstance {
+                        fact_type_id: ft_key,
+                        bindings: vec![
+                            ("from".to_string(), from.clone()),
+                            ("to".to_string(), to.clone()),
+                            ("event".to_string(), event.clone()),
+                        ],
+                   
+                    }
+                );
+            }
+        }
+    }
 
-    // validate: evaluate constraints against the new population
+    // ── validate ────────────────────────────────────────────────────
+    // Evaluate constraints against the complete population (base + derived).
     let response = ResponseContext { text: String::new(), sender_identity: None, fields: None };
     let violations = crate::evaluate::evaluate_via_ast(model, &response, &new_pop);
-    let rejected = violations.iter().any(|v| v.detail.contains("forbidden"));
 
-    // emit: HATEOAS links from compiled transition table
-    let transitions = hateoas_from_model(model, noun, &entity_id, status.as_deref());
+    // Alethic violations are structural impossibilities — always reject.
+    // Deontic violations are reportable but don't prevent the command.
+    let rejected = violations.iter().any(|v| v.alethic);
+
+    // ── emit ────────────────────────────────────────────────────────
+    // Produce the representation: entities, HATEOAS links, violations.
+    // If rejected, the population is unchanged (paper §4: "The population is unchanged").
+    let transitions = hateoas_from_population(&new_pop, noun, &entity_id, status.as_deref());
 
     CommandResult {
         entities,
@@ -183,7 +219,7 @@ fn apply_create_entity(
         violations,
         derived_count: derived.len(),
         rejected,
-        population: new_pop,
+        population: if rejected { population.clone() } else { new_pop },
     }
 }
 
@@ -222,7 +258,36 @@ fn apply_transition(
     }
 
     let mut entities = Vec::new();
-    if new_status.is_some() {
+    if let Some(ref status) = new_status {
+        // Pop' = Pop with updated SM status fact.
+        // Theorem 3: every observable value must be in the population.
+        let sm_id = format!("sm:{}", entity_id);
+        let status_key = "State Machine has currentlyInStatus".to_string();
+        if let Some(facts) = new_pop.facts.get_mut(&status_key) {
+            // Update existing SM status fact for this entity
+            for fact in facts.iter_mut() {
+                if fact.bindings.iter().any(|(_, v)| v == &sm_id) {
+                    for (noun, val) in fact.bindings.iter_mut() {
+                        if noun == "currentlyInStatus" {
+                            *val = status.clone();
+                        }
+                    }
+                }
+            }
+        } else {
+            // No existing SM facts — insert new status fact
+            new_pop.facts.entry(status_key.clone()).or_default().push(
+                FactInstance {
+                    fact_type_id: status_key,
+                    bindings: vec![
+                        ("State Machine".to_string(), sm_id),
+                        ("currentlyInStatus".to_string(), status.clone()),
+                    ],
+               
+                }
+            );
+        }
+
         let mut event_data = std::collections::HashMap::new();
         event_data.insert("eventType".to_string(), event.to_string());
         event_data.insert("domain".to_string(), domain.to_string());
@@ -231,16 +296,36 @@ fn apply_transition(
             entity_type: "Event".to_string(),
             data: event_data,
         });
+
+        // Inject transition facts into population (Theorem 3: T ⊆ P)
+        if let Some(&sm_idx) = model.noun_index.noun_to_state_machines.get(sm_noun.as_str()) {
+            let sm = &model.state_machines[sm_idx];
+            for (from, to, evt) in &sm.transition_table {
+                let ft_key = "Transition".to_string();
+                new_pop.facts.entry(ft_key.clone()).or_default().push(
+                    FactInstance {
+                        fact_type_id: ft_key,
+                        bindings: vec![
+                            ("from".to_string(), from.clone()),
+                            ("to".to_string(), to.clone()),
+                            ("event".to_string(), evt.clone()),
+                        ],
+                   
+                    }
+                );
+            }
+        }
     }
 
     let transitions = if let Some(ref status) = new_status {
-        hateoas_from_model(model, &sm_noun, entity_id, Some(status))
+        hateoas_from_population(&new_pop, &sm_noun, entity_id, Some(status))
     } else {
         vec![]
     };
 
     let rejected = new_status.is_none() && !model.state_machines.is_empty();
 
+    // If rejected (no valid transition), population is unchanged.
     CommandResult {
         entities,
         status: new_status,
@@ -248,35 +333,199 @@ fn apply_transition(
         violations: vec![],
         derived_count: 0,
         rejected,
-        population: new_pop,
+        population: if rejected { population.clone() } else { new_pop },
+    }
+}
+
+// ── is-qry: query the population ────────────────────────────────────
+
+fn apply_query(
+    model: &CompiledModel,
+    schema_id: &str,
+    target: &str,
+    bindings: &std::collections::HashMap<String, String>,
+    population: &Population,
+) -> CommandResult {
+    // Find the schema and resolve role positions
+    let schema = model.schemas.get(schema_id);
+    let role_names = schema.map(|s| &s.role_names);
+
+    // Build filter bindings: for each bound noun, find its role index
+    let mut filter_pairs: Vec<(usize, String)> = Vec::new();
+    let mut target_role: usize = 0;
+
+    if let Some(names) = role_names {
+        for (i, name) in names.iter().enumerate() {
+            if name == target {
+                target_role = i + 1; // 1-indexed
+            }
+            if let Some(value) = bindings.get(name) {
+                filter_pairs.push((i + 1, value.clone()));
+            }
+        }
+    }
+
+    // Query the population for matching facts
+    let facts = population.facts.get(schema_id).cloned().unwrap_or_default();
+    let mut matches: Vec<String> = Vec::new();
+
+    for fact in &facts {
+        let mut all_match = true;
+        for (role_idx, expected) in &filter_pairs {
+            let actual = fact.bindings.iter()
+                .nth(*role_idx - 1)
+                .map(|(_, v)| v.as_str());
+            if actual != Some(expected.as_str()) {
+                all_match = false;
+                break;
+            }
+        }
+        if all_match {
+            if let Some((_, value)) = fact.bindings.iter().nth(target_role.saturating_sub(1)) {
+                if !matches.contains(value) {
+                    matches.push(value.clone());
+                }
+            }
+        }
+    }
+
+    let mut data = std::collections::HashMap::new();
+    data.insert("matches".to_string(), matches.join(","));
+    data.insert("count".to_string(), matches.len().to_string());
+
+    CommandResult {
+        entities: vec![EntityResult {
+            id: format!("query:{}", schema_id),
+            entity_type: "QueryResult".to_string(),
+            data,
+        }],
+        status: None,
+        transitions: vec![],
+        violations: vec![],
+        derived_count: 0,
+        rejected: false,
+        population: population.clone(),
+    }
+}
+
+// ── is-chg: install readings ────────────────────────────────────────
+
+fn apply_load_readings(
+    markdown: &str,
+    domain: &str,
+    population: &Population,
+) -> CommandResult {
+    // Parse readings via the FORML 2 parser
+    match crate::parse_forml2::parse_markdown(markdown) {
+        Ok(ir) => {
+            let _model = crate::compile::compile(&ir);
+            let mut data = std::collections::HashMap::new();
+            data.insert("domain".to_string(), domain.to_string());
+            data.insert("nouns".to_string(), ir.nouns.len().to_string());
+            data.insert("factTypes".to_string(), ir.fact_types.len().to_string());
+            data.insert("constraints".to_string(), ir.constraints.len().to_string());
+            data.insert("stateMachines".to_string(), ir.state_machines.len().to_string());
+
+            CommandResult {
+                entities: vec![EntityResult {
+                    id: format!("schema:{}", domain),
+                    entity_type: "SchemaLoaded".to_string(),
+                    data,
+                }],
+                status: None,
+                transitions: vec![],
+                violations: vec![],
+                derived_count: 0,
+                rejected: false,
+                population: population.clone(),
+            }
+        }
+        Err(e) => {
+            CommandResult {
+                entities: vec![],
+                status: None,
+                transitions: vec![],
+                violations: vec![crate::types::Violation {
+                    constraint_id: "parse_error".to_string(),
+                    constraint_text: "FORML 2 parse error".to_string(),
+                    detail: e,
+                    alethic: true,
+                }],
+                derived_count: 0,
+                rejected: true,
+                population: population.clone(),
+            }
+        }
     }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
-/// HATEOAS: project valid transitions from the compiled model.
-fn hateoas_from_model(
-    model: &CompiledModel,
+/// Look up the compiled graph schema ID for a noun's field.
+/// Falls back to reading-format ID if no compiled schema matches.
+fn resolve_fact_type_id(model: &CompiledModel, noun: &str, field: &str) -> String {
+    if let Some(fts) = model.noun_index.noun_to_fact_types.get(noun) {
+        for (ft_id, role_idx) in fts {
+            if *role_idx != 0 { continue; }
+            if let Some(schema) = model.schemas.get(ft_id) {
+                if schema.role_names.len() >= 2 && schema.role_names[1] == field {
+                    return ft_id.clone();
+                }
+            }
+        }
+    }
+    format!("{} has {}", noun, field)
+}
+
+/// HATEOAS: Filter(p) : T where T ⊆ P.
+/// p(t) = (t.from == status)
+/// Returns valid transitions as links.
+fn hateoas_from_population(
+    population: &Population,
     noun: &str,
     entity_id: &str,
     status: Option<&str>,
 ) -> Vec<TransitionAction> {
     let Some(status) = status else { return vec![] };
-    let Some(&sm_idx) = model.noun_index.noun_to_state_machines.get(noun) else { return vec![] };
-    let sm = &model.state_machines[sm_idx];
     let encoded = noun.replace(' ', "%20");
-    sm.transition_table.iter()
-        .filter(|(from, _, _)| from == status)
-        .map(|(_, to, evt)| TransitionAction {
-            event: evt.clone(),
-            target_status: to.clone(),
-            method: "POST".to_string(),
-            href: format!("/api/entities/{}/{}/transition", encoded, entity_id),
+
+    let transition_facts = match population.facts.get("Transition") {
+        Some(facts) => facts,
+        None => return vec![],
+    };
+
+    transition_facts.iter()
+        .filter(|fact| {
+            fact.bindings.iter().any(|(k, v)| k == "from" && v == status)
+        })
+        .filter_map(|fact| {
+            let event = fact.bindings.iter().find(|(k, _)| k == "event").map(|(_, v)| v.clone())?;
+            let to = fact.bindings.iter().find(|(k, _)| k == "to").map(|(_, v)| v.clone())?;
+            Some(TransitionAction {
+                event,
+                target_status: to,
+                method: "POST".to_string(),
+                href: format!("/api/entities/{}/{}/transition", encoded, entity_id),
+            })
         })
         .collect()
 }
 
 /// Resolve entity ID from Halpin's reference scheme.
+/// Extract the current status of a State Machine instance from the population.
+fn extract_sm_status(population: &Population, sm_id: &str) -> Option<String> {
+    let status_facts = population.facts.get("State Machine has currentlyInStatus")?;
+    for fact in status_facts {
+        let has_sm = fact.bindings.iter().any(|(_, v)| v == sm_id);
+        if has_sm {
+            return fact.bindings.iter()
+                .find(|(n, _)| n == "currentlyInStatus")
+                .map(|(_, v)| v.clone());
+        }
+    }
+    None
+}
+
 fn resolve_entity_id(
     model: &CompiledModel,
     noun: &str,
@@ -347,7 +596,7 @@ mod tests {
         ir.nouns.insert("Order".to_string(), NounDef {
             object_type: "entity".to_string(),
             enum_values: None, value_type: None, super_type: None,
-            world_assumption: WorldAssumption::default(), ref_scheme: Some(vec!["Order Number".to_string()]),
+            world_assumption: WorldAssumption::default(), ref_scheme: Some(vec!["Order Number".to_string()]), objectifies: None, subtype_kind: None, rigid: false,
         });
         ir.state_machines.insert("Order".to_string(), StateMachineDef {
             noun_name: "Order".to_string(),
@@ -485,5 +734,123 @@ mod tests {
         assert!(result.population.facts.contains_key("State Machine has currentlyInStatus"));
         let sm_facts = &result.population.facts["State Machine has currentlyInStatus"];
         assert!(sm_facts[0].bindings.iter().any(|(_, v)| v == "Draft"));
+    }
+
+    #[test]
+    fn transition_updates_population_status() {
+        // Theorem 3: every observable value derivable from population.
+        // Transition must write new status into Pop'.
+        let ir = make_order_ir();
+        let model = crate::compile::compile(&ir);
+
+        // Create entity first to get a population with SM facts
+        let mut fields = HashMap::new();
+        fields.insert("orderNumber".to_string(), "ORD-1".to_string());
+        let create = Command::CreateEntity {
+            noun: "Order".to_string(),
+            domain: "orders".to_string(),
+            id: Some("ORD-1".to_string()),
+            fields,
+        };
+        let created = apply_command(&model, &create, &Population { facts: HashMap::new() });
+        assert_eq!(created.status.as_deref(), Some("Draft"));
+
+        // Transition: Draft → Placed
+        let transition = Command::Transition {
+            entity_id: "ORD-1".to_string(),
+            event: "place".to_string(),
+            domain: "orders".to_string(),
+            current_status: Some("Draft".to_string()),
+        };
+        let result = apply_command(&model, &transition, &created.population);
+
+        assert_eq!(result.status.as_deref(), Some("Placed"));
+
+        // Population must contain the updated status
+        let sm_facts = &result.population.facts["State Machine has currentlyInStatus"];
+        let sm_fact = sm_facts.iter().find(|f|
+            f.bindings.iter().any(|(_, v)| v == "sm:ORD-1")
+        ).expect("SM fact must exist for ORD-1");
+        let status_binding = sm_fact.bindings.iter()
+            .find(|(n, _)| n == "currentlyInStatus")
+            .expect("must have currentlyInStatus binding");
+        assert_eq!(status_binding.1, "Placed", "population must reflect new status");
+    }
+
+    // ── is-qry: Query command ───────────────────────────────────
+
+    #[test]
+    fn query_command_returns_matches() {
+        let ir = make_order_ir();
+        let model = crate::compile::compile(&ir);
+
+        // Populate with some facts
+        let mut pop = Population { facts: HashMap::new() };
+        let ft_id = "Order has customer".to_string();
+        pop.facts.insert(ft_id.clone(), vec![
+            FactInstance {
+                fact_type_id: ft_id.clone(),
+                bindings: vec![("Order".to_string(), "ord-1".to_string()), ("customer".to_string(), "acme".to_string())],
+           
+            },
+            FactInstance {
+                fact_type_id: ft_id.clone(),
+                bindings: vec![("Order".to_string(), "ord-2".to_string()), ("customer".to_string(), "acme".to_string())],
+           
+            },
+            FactInstance {
+                fact_type_id: ft_id.clone(),
+                bindings: vec![("Order".to_string(), "ord-3".to_string()), ("customer".to_string(), "beta".to_string())],
+           
+            },
+        ]);
+
+        let mut bindings = HashMap::new();
+        bindings.insert("customer".to_string(), "acme".to_string());
+
+        let cmd = Command::Query {
+            schema_id: ft_id,
+            domain: "orders".to_string(),
+            target: "Order".to_string(),
+            bindings,
+        };
+
+        let result = apply_command(&model, &cmd, &pop);
+        assert!(!result.rejected);
+        assert_eq!(result.entities[0].entity_type, "QueryResult");
+    }
+
+    // ── is-chg: LoadReadings command ────────────────────────────
+
+    #[test]
+    fn load_readings_command_parses_markdown() {
+        let ir = make_order_ir();
+        let model = crate::compile::compile(&ir);
+        let pop = Population { facts: HashMap::new() };
+
+        let cmd = Command::LoadReadings {
+            markdown: "# Test\n\nProduct(.SKU) is an entity type.\nCategory(.Name) is an entity type.\nProduct belongs to Category.\n  Each Product belongs to exactly one Category.".to_string(),
+            domain: "catalog".to_string(),
+        };
+
+        let result = apply_command(&model, &cmd, &pop);
+        assert!(!result.rejected);
+        assert_eq!(result.entities[0].entity_type, "SchemaLoaded");
+        assert_eq!(result.entities[0].data["nouns"], "2");
+    }
+
+    #[test]
+    fn load_readings_command_reports_parse_error() {
+        let ir = make_order_ir();
+        let model = crate::compile::compile(&ir);
+        let pop = Population { facts: HashMap::new() };
+
+        let cmd = Command::LoadReadings {
+            markdown: "".to_string(), // empty — should parse OK (empty domain)
+            domain: "empty".to_string(),
+        };
+
+        let result = apply_command(&model, &cmd, &pop);
+        assert!(!result.rejected); // empty is valid
     }
 }

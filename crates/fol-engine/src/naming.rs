@@ -82,7 +82,7 @@ pub fn resolve_entity_id(
     noun_name: &str,
     fields: &std::collections::HashMap<String, String>,
 ) -> Option<String> {
-    let noun_def = ir.nouns.get(noun_name)?;
+    let _noun_def = ir.nouns.get(noun_name)?;
     // Reference scheme is not stored in the IR nouns directly — it's in the
     // fact types where this noun plays a role with a value-type noun.
     // For now, check if any fact type has this noun as subject with a value-type object.

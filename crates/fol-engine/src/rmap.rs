@@ -428,7 +428,7 @@ mod tests {
                 value_type: None,
                 super_type: None,
                 world_assumption: WorldAssumption::default(),
-                ref_scheme: None,
+                ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
             });
         }
         for (id, reading, roles) in fact_types {

@@ -14,6 +14,7 @@ use crate::ast;
 
 /// Evaluate all compiled constraints via AST reduction.
 /// Evaluation = beta reduction: apply(func, object) → violations.
+/// Alethic constraints always reject. Deontic violations are tagged as non-alethic.
 pub fn evaluate_via_ast(model: &CompiledModel, response: &ResponseContext, population: &Population) -> Vec<Violation> {
     let ctx_obj = ast::encode_eval_context(response, population);
     let defs = std::collections::HashMap::new();
@@ -21,7 +22,11 @@ pub fn evaluate_via_ast(model: &CompiledModel, response: &ResponseContext, popul
     model.constraints.iter()
         .flat_map(|c| {
             let result = ast::apply(&c.func, &ctx_obj, &defs);
-            ast::decode_violations(&result)
+            let is_alethic = matches!(c.modality, crate::compile::Modality::Alethic);
+            ast::decode_violations(&result).into_iter().map(move |mut v| {
+                v.alethic = is_alethic;
+                v
+            })
         })
         .collect()
 }
@@ -441,7 +446,7 @@ mod tests {
             value_type: None,
             super_type: None,
             world_assumption: WorldAssumption::default(),
-            ref_scheme: None,
+            ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
         }
     }
 
@@ -667,7 +672,7 @@ mod tests {
             enum_values: Some(vec!["#".to_string(), "##".to_string(), "**".to_string()]),
             value_type: None, super_type: None,
             world_assumption: WorldAssumption::default(),
-            ref_scheme: None,
+            ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
         });
         ir.fact_types.insert("ft1".to_string(), FactTypeDef {
             reading: "Response contains Markdown Syntax".to_string(),
@@ -833,7 +838,7 @@ mod tests {
             object_type: "value".to_string(),
             enum_values: Some(vec!["internal-details".to_string()]),
             value_type: None, super_type: None,
-            world_assumption: WorldAssumption::default(), ref_scheme: None,
+            world_assumption: WorldAssumption::default(), ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
         });
 
         ir.fact_types.insert("ft_resp".to_string(), FactTypeDef {
@@ -1016,7 +1021,7 @@ mod tests {
         ir.nouns.insert("Teacher".to_string(), NounDef {
             object_type: "entity".to_string(), enum_values: None, value_type: None,
             super_type: Some("Academic".to_string()),
-            world_assumption: WorldAssumption::default(), ref_scheme: None,
+            world_assumption: WorldAssumption::default(), ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
         });
         ir.nouns.insert("Rank".to_string(), make_noun("value"));
         ir.fact_types.insert("ft1".to_string(), FactTypeDef {
@@ -1036,9 +1041,9 @@ mod tests {
         }]);
         let mut population = Population { facts };
 
-        let derived = forward_chain_ast(&compiled, &mut population);
+        let _derived = forward_chain_ast(&compiled, &mut population);
         // Should derive that T1 participates in Academic fact types via subtype inheritance
-        assert!(derived.len() >= 0); // subtype derivation adds inherited facts
+        // subtype derivation adds inherited facts (may be zero if none applicable)
     }
 
     #[test]
@@ -1094,8 +1099,7 @@ mod tests {
         }]);
         let mut population = Population { facts };
 
-        let derived = forward_chain_ast(&compiled, &mut population);
-        // Modus ponens should derive: A1 works for D1
+        let _derived = forward_chain_ast(&compiled, &mut population);
         // Modus ponens should derive: A1 works for D1
         // Note: the AST path encodes/decodes through Object, so the derivation
         // must survive the round-trip. If no derivations, the SS constraint
@@ -1150,7 +1154,7 @@ mod tests {
             value_type: Some("string".to_string()),
             super_type: None,
             world_assumption: WorldAssumption::default(),
-            ref_scheme: None,
+            ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
         });
         ir.nouns.insert("SupportResponse".to_string(), NounDef {
             object_type: "entity".to_string(),
@@ -1158,7 +1162,7 @@ mod tests {
             value_type: None,
             super_type: None,
             world_assumption: WorldAssumption::default(),
-            ref_scheme: None,
+            ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
         });
         ir.fact_types.insert("ft1".to_string(), FactTypeDef {
             reading: "SupportResponse contains ProhibitedText".to_string(),
@@ -1203,7 +1207,7 @@ mod tests {
             value_type: Some("string".to_string()),
             super_type: None,
             world_assumption: WorldAssumption::default(),
-            ref_scheme: None,
+            ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
         });
         ir.nouns.insert("SupportResponse".to_string(), NounDef {
             object_type: "entity".to_string(),
@@ -1211,7 +1215,7 @@ mod tests {
             value_type: None,
             super_type: None,
             world_assumption: WorldAssumption::default(),
-            ref_scheme: None,
+            ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
         });
         ir.fact_types.insert("ft1".to_string(), FactTypeDef {
             reading: "SupportResponse contains ProhibitedText".to_string(),
@@ -1489,7 +1493,7 @@ mod tests {
             value_type: None,
             super_type: None,
             world_assumption: WorldAssumption::default(),
-            ref_scheme: None,
+            ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
         });
         ir.fact_types.insert("ft1".to_string(), FactTypeDef {
             reading: "Customer has Name".to_string(),
@@ -1588,7 +1592,7 @@ mod tests {
             value_type: Some("string".to_string()),
             super_type: None,
             world_assumption: WorldAssumption::default(),
-            ref_scheme: None,
+            ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
         });
         ir.nouns.insert("SupportResponse".to_string(), NounDef {
             object_type: "entity".to_string(),
@@ -1596,7 +1600,7 @@ mod tests {
             value_type: None,
             super_type: None,
             world_assumption: WorldAssumption::default(),
-            ref_scheme: None,
+            ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
         });
         ir.fact_types.insert("ft1".to_string(), FactTypeDef {
             reading: "SupportResponse has SenderIdentityValue".to_string(),
@@ -1672,19 +1676,19 @@ mod tests {
             value_type: Some("string".to_string()),
             super_type: None,
             world_assumption: WorldAssumption::default(),
-            ref_scheme: None,
+            ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
         });
         ir.nouns.insert("SupportResponse".to_string(), NounDef {
             object_type: "entity".to_string(),
             enum_values: None, value_type: None, super_type: None,
             world_assumption: WorldAssumption::default(),
-            ref_scheme: None,
+            ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
         });
         ir.nouns.insert("APIProduct".to_string(), NounDef {
             object_type: "entity".to_string(),
             enum_values: None, value_type: None, super_type: None,
             world_assumption: WorldAssumption::default(),
-            ref_scheme: None,
+            ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
         });
         // Three fact types that all reference FieldName — simulates multi-span constraint
         for i in 1..=3 {
@@ -1788,7 +1792,7 @@ mod tests {
             value_type: None,
             super_type: Some("Vehicle".to_string()),
             world_assumption: WorldAssumption::default(),
-            ref_scheme: None,
+            ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
         });
         ir.nouns.insert("License".to_string(), make_noun("entity"));
 
@@ -1906,7 +1910,7 @@ mod tests {
             value_type: None,
             super_type: None,
             world_assumption: WorldAssumption::Closed,
-            ref_scheme: None,
+            ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
         });
         // OWA noun: Capability (not stated = unknown)
         ir.nouns.insert("Capability".to_string(), NounDef {
@@ -1915,7 +1919,7 @@ mod tests {
             value_type: None,
             super_type: None,
             world_assumption: WorldAssumption::Open,
-            ref_scheme: None,
+            ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
         });
 
         ir.nouns.insert("Resource".to_string(), make_noun("entity"));
@@ -1986,7 +1990,7 @@ mod tests {
             value_type: None,
             super_type: None,
             world_assumption: WorldAssumption::Closed,
-            ref_scheme: None,
+            ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
         });
         ir.nouns.insert("Name".to_string(), make_noun("value"));
         ir.nouns.insert("Email".to_string(), make_noun("value"));
@@ -2182,5 +2186,277 @@ mod tests {
         assert!(ir.derivation_rules.is_empty());
         let customer = ir.nouns.get("Customer").unwrap();
         assert_eq!(customer.world_assumption, WorldAssumption::Closed);
+    }
+
+    #[test]
+    fn join_derivation_equi_join_on_shared_key() {
+        // Generic test: join two fact types on a shared noun name.
+        // A has Key "k1", B has Key "k1" → derive C with both A and B values.
+        // A has Key "k1", B has Key "k2" → no derivation (keys don't match).
+        let mut fact_types = HashMap::new();
+        fact_types.insert("a_key".to_string(), FactTypeDef {
+            reading: "A has Key".to_string(),
+            roles: vec![
+                RoleDef { noun_name: "A".to_string(), role_index: 0 },
+                RoleDef { noun_name: "Key".to_string(), role_index: 1 },
+            ],
+        });
+        fact_types.insert("b_key".to_string(), FactTypeDef {
+            reading: "B has Key".to_string(),
+            roles: vec![
+                RoleDef { noun_name: "B".to_string(), role_index: 0 },
+                RoleDef { noun_name: "Key".to_string(), role_index: 1 },
+            ],
+        });
+        fact_types.insert("derived".to_string(), FactTypeDef {
+            reading: "A is matched to B".to_string(),
+            roles: vec![
+                RoleDef { noun_name: "A".to_string(), role_index: 0 },
+                RoleDef { noun_name: "B".to_string(), role_index: 1 },
+            ],
+        });
+
+        let ir = ConstraintIR {
+            domain: "test".to_string(),
+            nouns: HashMap::new(),
+            fact_types,
+            constraints: vec![],
+            state_machines: HashMap::new(),
+            derivation_rules: vec![DerivationRuleDef {
+                id: "join1".to_string(),
+                text: "A matches B on Key".to_string(),
+                antecedent_fact_type_ids: vec!["a_key".to_string(), "b_key".to_string()],
+                consequent_fact_type_id: "derived".to_string(),
+                kind: DerivationKind::Join,
+                join_on: vec!["Key".to_string()],
+                match_on: vec![],
+                consequent_bindings: vec!["A".to_string(), "B".to_string()],
+            }],
+        };
+
+        let compiled = crate::compile::compile(&ir);
+
+        let mut facts = HashMap::new();
+        facts.insert("a_key".to_string(), vec![
+            FactInstance { fact_type_id: "a_key".to_string(), bindings: vec![("A".to_string(), "a1".to_string()), ("Key".to_string(), "k1".to_string())]},
+            FactInstance { fact_type_id: "a_key".to_string(), bindings: vec![("A".to_string(), "a2".to_string()), ("Key".to_string(), "k2".to_string())] },
+        ]);
+        facts.insert("b_key".to_string(), vec![
+            FactInstance { fact_type_id: "b_key".to_string(), bindings: vec![("B".to_string(), "b1".to_string()), ("Key".to_string(), "k1".to_string())]},
+            FactInstance { fact_type_id: "b_key".to_string(), bindings: vec![("B".to_string(), "b2".to_string()), ("Key".to_string(), "k3".to_string())] },
+        ]);
+
+        let mut population = Population { facts };
+        forward_chain_ast(&compiled, &mut population);
+
+        let derived = population.facts.get("derived").expect("Should derive");
+        // Only a1↔b1 (both Key="k1"). a2 has Key="k2" which doesn't match any B.
+        assert_eq!(derived.len(), 1);
+        assert!(derived[0].bindings.contains(&("A".to_string(), "a1".to_string())));
+        assert!(derived[0].bindings.contains(&("B".to_string(), "b1".to_string())));
+    }
+
+    #[test]
+    fn join_derivation_entity_consistency_across_fact_types() {
+        // When the same entity noun appears in multiple antecedent fact types,
+        // the join must bind them to the same entity.
+        // Entity X has Key "k1" (ft1) and X has Label "L1" (ft2).
+        // Entity X with Key "k1" but Label "L2" should NOT match.
+        let mut fact_types = HashMap::new();
+        fact_types.insert("x_key".to_string(), FactTypeDef {
+            reading: "X has Key".to_string(),
+            roles: vec![
+                RoleDef { noun_name: "X".to_string(), role_index: 0 },
+                RoleDef { noun_name: "Key".to_string(), role_index: 1 },
+            ],
+        });
+        fact_types.insert("x_label".to_string(), FactTypeDef {
+            reading: "X has Label".to_string(),
+            roles: vec![
+                RoleDef { noun_name: "X".to_string(), role_index: 0 },
+                RoleDef { noun_name: "Label".to_string(), role_index: 1 },
+            ],
+        });
+        fact_types.insert("y_key".to_string(), FactTypeDef {
+            reading: "Y has Key".to_string(),
+            roles: vec![
+                RoleDef { noun_name: "Y".to_string(), role_index: 0 },
+                RoleDef { noun_name: "Key".to_string(), role_index: 1 },
+            ],
+        });
+        fact_types.insert("result".to_string(), FactTypeDef {
+            reading: "Y is resolved to X".to_string(),
+            roles: vec![
+                RoleDef { noun_name: "Y".to_string(), role_index: 0 },
+                RoleDef { noun_name: "X".to_string(), role_index: 1 },
+            ],
+        });
+
+        let ir = ConstraintIR {
+            domain: "test".to_string(),
+            nouns: HashMap::new(),
+            fact_types,
+            constraints: vec![],
+            state_machines: HashMap::new(),
+            derivation_rules: vec![DerivationRuleDef {
+                id: "join2".to_string(),
+                text: "Y resolves to X via Key".to_string(),
+                antecedent_fact_type_ids: vec!["y_key".to_string(), "x_key".to_string(), "x_label".to_string()],
+                consequent_fact_type_id: "result".to_string(),
+                kind: DerivationKind::Join,
+                join_on: vec!["Key".to_string(), "X".to_string()],
+                match_on: vec![],
+                consequent_bindings: vec!["Y".to_string(), "X".to_string()],
+            }],
+        };
+
+        let compiled = crate::compile::compile(&ir);
+
+        let mut facts = HashMap::new();
+        // Two X entities with the same key but different labels
+        facts.insert("x_key".to_string(), vec![
+            FactInstance { fact_type_id: "x_key".to_string(), bindings: vec![("X".to_string(), "x1".to_string()), ("Key".to_string(), "k1".to_string())]},
+            FactInstance { fact_type_id: "x_key".to_string(), bindings: vec![("X".to_string(), "x2".to_string()), ("Key".to_string(), "k1".to_string())] },
+        ]);
+        facts.insert("x_label".to_string(), vec![
+            FactInstance { fact_type_id: "x_label".to_string(), bindings: vec![("X".to_string(), "x1".to_string()), ("Label".to_string(), "L1".to_string())]},
+            FactInstance { fact_type_id: "x_label".to_string(), bindings: vec![("X".to_string(), "x2".to_string()), ("Label".to_string(), "L2".to_string())] },
+        ]);
+        facts.insert("y_key".to_string(), vec![
+            FactInstance { fact_type_id: "y_key".to_string(), bindings: vec![("Y".to_string(), "y1".to_string()), ("Key".to_string(), "k1".to_string())]},
+        ]);
+
+        let mut population = Population { facts };
+        forward_chain_ast(&compiled, &mut population);
+
+        let resolved = population.facts.get("result").expect("Should derive");
+        // Y "y1" should match BOTH x1 and x2 (both have Key="k1"), entity consistency
+        // holds because X bindings are consistent within each combination.
+        assert_eq!(resolved.len(), 2);
+    }
+
+    #[test]
+    fn join_derivation_match_on_containment() {
+        // Cross-noun containment predicate: A.FullName contains B.ShortName.
+        let mut fact_types = HashMap::new();
+        fact_types.insert("a_name".to_string(), FactTypeDef {
+            reading: "A has Full Name".to_string(),
+            roles: vec![
+                RoleDef { noun_name: "A".to_string(), role_index: 0 },
+                RoleDef { noun_name: "Full Name".to_string(), role_index: 1 },
+            ],
+        });
+        fact_types.insert("b_name".to_string(), FactTypeDef {
+            reading: "B has Short Name".to_string(),
+            roles: vec![
+                RoleDef { noun_name: "B".to_string(), role_index: 0 },
+                RoleDef { noun_name: "Short Name".to_string(), role_index: 1 },
+            ],
+        });
+        fact_types.insert("matched".to_string(), FactTypeDef {
+            reading: "B is matched to A".to_string(),
+            roles: vec![
+                RoleDef { noun_name: "B".to_string(), role_index: 0 },
+                RoleDef { noun_name: "A".to_string(), role_index: 1 },
+            ],
+        });
+
+        let ir = ConstraintIR {
+            domain: "test".to_string(),
+            nouns: HashMap::new(),
+            fact_types,
+            constraints: vec![],
+            state_machines: HashMap::new(),
+            derivation_rules: vec![DerivationRuleDef {
+                id: "match1".to_string(),
+                text: "B matches A by name containment".to_string(),
+                antecedent_fact_type_ids: vec!["a_name".to_string(), "b_name".to_string()],
+                consequent_fact_type_id: "matched".to_string(),
+                kind: DerivationKind::Join,
+                join_on: vec![],
+                match_on: vec![("Full Name".to_string(), "Short Name".to_string())],
+                consequent_bindings: vec!["B".to_string(), "A".to_string()],
+            }],
+        };
+
+        let compiled = crate::compile::compile(&ir);
+
+        let mut facts = HashMap::new();
+        facts.insert("a_name".to_string(), vec![
+            FactInstance { fact_type_id: "a_name".to_string(), bindings: vec![("A".to_string(), "a1".to_string()), ("Full Name".to_string(), "Alpha Bravo".to_string())]},
+            FactInstance { fact_type_id: "a_name".to_string(), bindings: vec![("A".to_string(), "a2".to_string()), ("Full Name".to_string(), "Charlie Delta".to_string())] },
+        ]);
+        facts.insert("b_name".to_string(), vec![
+            FactInstance { fact_type_id: "b_name".to_string(), bindings: vec![("B".to_string(), "b1".to_string()), ("Short Name".to_string(), "Alpha".to_string())]},
+        ]);
+
+        let mut population = Population { facts };
+        forward_chain_ast(&compiled, &mut population);
+
+        let matched = population.facts.get("matched").expect("Should derive");
+        // "Alpha Bravo" contains "Alpha" → a1 matches. "Charlie Delta" doesn't → a2 excluded.
+        assert_eq!(matched.len(), 1);
+        assert!(matched[0].bindings.contains(&("A".to_string(), "a1".to_string())));
+        assert!(matched[0].bindings.contains(&("B".to_string(), "b1".to_string())));
+    }
+
+    #[test]
+    fn join_derivation_no_match_produces_nothing() {
+        // When join keys don't match, no facts are derived.
+        let mut fact_types = HashMap::new();
+        fact_types.insert("a_key".to_string(), FactTypeDef {
+            reading: "A has Key".to_string(),
+            roles: vec![
+                RoleDef { noun_name: "A".to_string(), role_index: 0 },
+                RoleDef { noun_name: "Key".to_string(), role_index: 1 },
+            ],
+        });
+        fact_types.insert("b_key".to_string(), FactTypeDef {
+            reading: "B has Key".to_string(),
+            roles: vec![
+                RoleDef { noun_name: "B".to_string(), role_index: 0 },
+                RoleDef { noun_name: "Key".to_string(), role_index: 1 },
+            ],
+        });
+        fact_types.insert("derived".to_string(), FactTypeDef {
+            reading: "A matches B".to_string(),
+            roles: vec![
+                RoleDef { noun_name: "A".to_string(), role_index: 0 },
+                RoleDef { noun_name: "B".to_string(), role_index: 1 },
+            ],
+        });
+
+        let ir = ConstraintIR {
+            domain: "test".to_string(),
+            nouns: HashMap::new(),
+            fact_types,
+            constraints: vec![],
+            state_machines: HashMap::new(),
+            derivation_rules: vec![DerivationRuleDef {
+                id: "j".to_string(),
+                text: "join".to_string(),
+                antecedent_fact_type_ids: vec!["a_key".to_string(), "b_key".to_string()],
+                consequent_fact_type_id: "derived".to_string(),
+                kind: DerivationKind::Join,
+                join_on: vec!["Key".to_string()],
+                match_on: vec![],
+                consequent_bindings: vec!["A".to_string(), "B".to_string()],
+            }],
+        };
+
+        let compiled = crate::compile::compile(&ir);
+
+        let mut facts = HashMap::new();
+        facts.insert("a_key".to_string(), vec![
+            FactInstance { fact_type_id: "a_key".to_string(), bindings: vec![("A".to_string(), "a1".to_string()), ("Key".to_string(), "k1".to_string())]},
+        ]);
+        facts.insert("b_key".to_string(), vec![
+            FactInstance { fact_type_id: "b_key".to_string(), bindings: vec![("B".to_string(), "b1".to_string()), ("Key".to_string(), "k2".to_string())]},
+        ]);
+
+        let mut population = Population { facts };
+        forward_chain_ast(&compiled, &mut population);
+
+        assert!(population.facts.get("derived").is_none(), "No match should produce no derivation");
     }
 }

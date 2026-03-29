@@ -23,21 +23,18 @@ use crate::types::*;
 
 // ── Core Functional Types ──────────────────────────────────────────
 //
-// No closures. No opaque types. Everything is Func — AST nodes that
-// the evaluator reduces. Constraints, derivations, state machines are
-// all Func nodes applied to Objects (populations, events, contexts).
-//
-// The legacy Predicate/DeriveFn/EvalContext types are deleted.
+// Constraints, derivations, and state machines compile to Func AST nodes.
 // Evaluation is beta reduction: apply(func, object, defs) → object.
+//
+// All constraints compile to AST (Func) nodes:
+//   Pure AST:       IR (fully pure — Filter + Eq + Construction, zero closures)
+//   AST + Native:   UC, MC, FC, VC, AS, SY, AT, IT, TR, AC, RF,
+//                   XO, XC, OR, SS, EQ, forbidden, obligatory
+//                   (extract_facts_func for fact extraction,
+//                   Native kernel for constraint-specific logic)
+//   Constant:       Permitted (Func::constant(phi))
+//   Goal:           all constraints as pure Func (Condition, Filter, Compose, etc.)
 
-/// Internal predicate type — closures wrapped inside Func::Native nodes.
-pub(crate) type Predicate = Arc<dyn Fn(&EvalContext) -> Vec<Violation> + Send + Sync>;
-
-/// Internal evaluation context — used inside Func::Native closures.
-pub(crate) struct EvalContext<'a> {
-    pub response: &'a ResponseContext,
-    pub population: &'a Population,
-}
 
 #[derive(Clone, Debug)]
 pub enum Modality {
@@ -60,8 +57,6 @@ pub struct CompiledConstraint {
     pub func: crate::ast::Func,
 }
 
-/// Internal derivation fn type — closures wrapped inside Func::Native nodes.
-pub(crate) type DeriveFn = Arc<dyn Fn(&EvalContext, &Population) -> Vec<DerivedFact> + Send + Sync>;
 
 /// A compiled derivation rule. Evaluation is apply(func, population_object) → derived facts.
 pub struct CompiledDerivation {
@@ -216,6 +211,82 @@ fn participates_in(entity: &str, noun_name: &str, fact_type_id: &str, population
     })
 }
 
+// ── AST Constraint Builders ──────────────────────────────────────────
+// Pure Func constructors for constraint evaluation.
+// Each builds a Func that takes an eval context Object and returns violations.
+//
+// Eval context encoding: <response_text, sender_identity, population>
+// Population encoding:   <ft₁, ft₂, ...> where ft = <ft_id, <fact₁, ...>>
+// Fact encoding:         <<noun₁, val₁>, <noun₂, val₂>, ...>
+
+use crate::ast::{Func, Object};
+
+/// Build a Func that extracts facts for a given fact_type_id from the population.
+/// Input: eval context <response, sender, population>
+/// Output: <fact₁, fact₂, ...> or φ
+fn extract_facts_func(ft_id: &str) -> Func {
+    // sel(3) → population
+    // Filter(eq ∘ [sel(1), ft_id̄]) → matching fact type entries
+    // (null → φ̄; sel(2) ∘ sel(1)) → get facts from first match, or φ
+    let find_ft = Func::filter(
+        Func::compose(
+            Func::Eq,
+            Func::construction(vec![
+                Func::Selector(1),
+                Func::constant(Object::atom(ft_id)),
+            ]),
+        ),
+    );
+
+    let get_facts_or_phi = Func::condition(
+        Func::NullTest,
+        Func::constant(Object::phi()),
+        Func::compose(Func::Selector(2), Func::Selector(1)),
+    );
+
+    Func::compose(get_facts_or_phi, Func::compose(find_ft, Func::Selector(3)))
+}
+
+/// Build a Func that extracts facts for multiple fact type IDs.
+/// Returns the concatenation of all facts from all matching fact types.
+fn extract_facts_multi(ft_ids: &[String]) -> Func {
+    if ft_ids.len() == 1 {
+        return extract_facts_func(&ft_ids[0]);
+    }
+    // For multiple fact type IDs: get facts from each, concatenate.
+    // Use a Native for the concatenation since we don't have a built-in flatten.
+    let ft_ids_owned: Vec<String> = ft_ids.to_vec();
+    Func::Native(Arc::new(move |ctx: &crate::ast::Object| {
+        let defs = HashMap::new();
+        let mut all_facts = Vec::new();
+        for ft_id in &ft_ids_owned {
+            let extractor = extract_facts_func(ft_id);
+            let result = crate::ast::apply(&extractor, ctx, &defs);
+            if let Some(items) = result.as_seq() {
+                all_facts.extend_from_slice(items);
+            }
+        }
+        Object::Seq(all_facts)
+    }))
+}
+
+/// Build a violation Object from constants and a detail Func.
+/// The detail Func is applied to the violating fact to produce detail parts.
+fn make_violation_func(id: &str, text: &str, detail: Func) -> Func {
+    Func::construction(vec![
+        Func::constant(Object::atom(id)),
+        Func::constant(Object::atom(text)),
+        detail,
+    ])
+}
+
+/// Extract the value of a role from an encoded fact.
+/// Fact encoding: <<noun₁, val₁>, <noun₂, val₂>, ...>
+/// Role value at index i: sel(2) ∘ sel(i+1)
+fn role_value(role_index: usize) -> Func {
+    Func::compose(Func::Selector(2), Func::Selector(role_index + 1))
+}
+
 // ── Span Resolution ────────────────────────────────────────────────
 // Resolves IR references at compile time so predicates capture only what they need.
 
@@ -266,7 +337,7 @@ fn collect_enum_values(ir: &ConstraintIR, spans: &[SpanDef]) -> Vec<(String, Vec
 }
 
 // ── Compilation ────────────────────────────────────────────────────
-// The match on kind happens here, once. After this, everything is Predicate.
+// The match on kind happens here, once. After this, everything is Func.
 
 /// Compile an entire ConstraintIR into executable form.
 pub fn compile(ir: &ConstraintIR) -> CompiledModel {
@@ -450,6 +521,7 @@ fn compile_derivations(ir: &ConstraintIR) -> Vec<CompiledDerivation> {
             DerivationKind::ModusPonens => compile_explicit_derivation(ir, rule),
             DerivationKind::Transitivity => compile_explicit_derivation(ir, rule),
             DerivationKind::ClosedWorldNegation => compile_explicit_derivation(ir, rule),
+            DerivationKind::Join => compile_join_derivation(ir, rule),
         };
         derivations.push(compiled);
     }
@@ -465,6 +537,9 @@ fn compile_derivations(ir: &ConstraintIR) -> Vec<CompiledDerivation> {
 
     // Implicit: CWA negation from world assumptions
     derivations.extend(compile_cwa_negation(ir));
+
+    // Implicit: state machine initialization from SM definitions
+    derivations.extend(compile_sm_initialization(ir));
 
     derivations
 }
@@ -619,29 +694,180 @@ fn compile_explicit_derivation(ir: &ConstraintIR, rule: &DerivationRuleDef) -> C
     CompiledDerivation { id, text, kind, func }
 }
 
-/// Wrap a DeriveFn closure in a Func::Native that decodes the population Object,
-/// calls the closure, and encodes the result back to an Object sequence.
-fn wrap_derive_fn(derive: DeriveFn) -> crate::ast::Func {
-    crate::ast::Func::Native(Arc::new(move |pop_obj: &crate::ast::Object| {
-        let population = decode_population_object(pop_obj);
-        let response = ResponseContext { text: String::new(), sender_identity: None, fields: None };
-        let ctx = EvalContext { response: &response, population: &population };
-        let derived = derive(&ctx, &population);
-        if derived.is_empty() {
-            crate::ast::Object::phi()
-        } else {
-            crate::ast::Object::Seq(derived.iter().map(|d| {
-                let bindings: Vec<crate::ast::Object> = d.bindings.iter().map(|(n, v)| {
-                    crate::ast::Object::seq(vec![crate::ast::Object::atom(n), crate::ast::Object::atom(v)])
-                }).collect();
-                crate::ast::Object::seq(vec![
-                    crate::ast::Object::atom(&d.fact_type_id),
-                    crate::ast::Object::atom(&d.reading),
-                    crate::ast::Object::Seq(bindings),
-                ])
-            }).collect())
+
+/// Compile a Join derivation rule — cross-fact-type equi-join on shared noun names.
+///
+/// For each combination of facts from the antecedent fact types, if all join keys
+/// (noun names in `rule.join_on`) have matching values across the facts, emit a
+/// consequent fact with the combined bindings.
+///
+/// This implements the relational equi-join needed for rules like:
+///   Vehicle is resolved to Chrome Style Candidate
+///     := Vehicle has Squish VIN
+///     and Chrome Style Candidate has that Squish VIN
+///     and some Listing has that VIN
+///     and that Listing has Listing Trim
+///     and Chrome Style Candidate has Chrome Trim
+///     and that Chrome Trim contains that Listing Trim.
+///
+/// The join_on field specifies which noun names must match across antecedents.
+/// The consequent_bindings field specifies which nouns appear in the output.
+fn compile_join_derivation(ir: &ConstraintIR, rule: &DerivationRuleDef) -> CompiledDerivation {
+    let id = rule.id.clone();
+    let text = rule.text.clone();
+    let kind = rule.kind.clone();
+    let antecedent_ids = rule.antecedent_fact_type_ids.clone();
+    let consequent_id = rule.consequent_fact_type_id.clone();
+    let join_keys = rule.join_on.clone();
+    let match_pairs = rule.match_on.clone();
+    let consequent_binding_names = rule.consequent_bindings.clone();
+    let consequent_reading = ir.fact_types.get(&consequent_id)
+        .map(|ft| ft.reading.clone())
+        .unwrap_or_default();
+
+    let func = crate::ast::Func::Native(Arc::new(move |pop_obj: &crate::ast::Object| {
+        // Collect facts per antecedent fact type
+        let mut fact_sets: Vec<Vec<Vec<(String, String)>>> = Vec::new();
+        for ft_id in &antecedent_ids {
+            let raw_facts = obj_find_ft(pop_obj, ft_id);
+            let mut parsed: Vec<Vec<(String, String)>> = Vec::new();
+            for fact in raw_facts {
+                if let Some(bindings) = fact.as_seq() {
+                    let pairs: Vec<(String, String)> = bindings.iter()
+                        .filter_map(|b| {
+                            let bpair = b.as_seq()?;
+                            if bpair.len() == 2 {
+                                Some((bpair[0].as_atom()?.to_string(), bpair[1].as_atom()?.to_string()))
+                            } else { None }
+                        })
+                        .collect();
+                    if !pairs.is_empty() {
+                        parsed.push(pairs);
+                    }
+                }
+            }
+            if parsed.is_empty() {
+                // If any antecedent has no facts, the join produces nothing
+                return crate::ast::Object::phi();
+            }
+            fact_sets.push(parsed);
         }
-    }))
+
+        // Perform nested-loop join across all antecedent fact sets.
+        // For each combination, check that join keys have matching values.
+        let mut results: Vec<crate::ast::Object> = Vec::new();
+        join_recursive(
+            &fact_sets,
+            &join_keys,
+            &match_pairs,
+            &consequent_binding_names,
+            &consequent_id,
+            &consequent_reading,
+            &mut Vec::new(),
+            0,
+            &mut results,
+        );
+
+        crate::ast::Object::Seq(results)
+    }));
+
+    CompiledDerivation { id, text, kind, func }
+}
+
+/// Recursive helper for nested-loop join across N fact sets.
+fn join_recursive(
+    fact_sets: &[Vec<Vec<(String, String)>>],
+    join_keys: &[String],
+    match_pairs: &[(String, String)],
+    consequent_bindings: &[String],
+    consequent_id: &str,
+    consequent_reading: &str,
+    current_combo: &mut Vec<Vec<(String, String)>>,
+    depth: usize,
+    results: &mut Vec<crate::ast::Object>,
+) {
+    if depth == fact_sets.len() {
+        // All fact sets joined — check join keys and match predicates
+        if check_join_keys(current_combo, join_keys)
+            && check_match_predicates(current_combo, match_pairs)
+        {
+            // Collect bindings for the consequent
+            let mut merged: Vec<(String, String)> = Vec::new();
+            for fact_bindings in current_combo.iter() {
+                for (n, v) in fact_bindings {
+                    if !merged.iter().any(|(mn, mv)| mn == n && mv == v) {
+                        merged.push((n.clone(), v.clone()));
+                    }
+                }
+            }
+
+            // Filter to consequent_bindings if specified
+            let output = if consequent_bindings.is_empty() {
+                merged
+            } else {
+                merged.into_iter()
+                    .filter(|(n, _)| consequent_bindings.contains(n))
+                    .collect()
+            };
+
+            if !output.is_empty() {
+                results.push(obj_derived_fact(consequent_id, consequent_reading, &output));
+            }
+        }
+        return;
+    }
+
+    for fact in &fact_sets[depth] {
+        current_combo.push(fact.clone());
+        join_recursive(fact_sets, join_keys, match_pairs, consequent_bindings, consequent_id, consequent_reading, current_combo, depth + 1, results);
+        current_combo.pop();
+    }
+}
+
+/// Check that all join keys have consistent values across the fact combination.
+/// A join key matches if every fact that contains a binding for that noun name
+/// has the same value (exact equality).
+fn check_join_keys(combo: &[Vec<(String, String)>], join_keys: &[String]) -> bool {
+    for key in join_keys {
+        let mut values: Vec<&str> = Vec::new();
+        for fact_bindings in combo {
+            for (n, v) in fact_bindings {
+                if n == key {
+                    values.push(v.as_str());
+                }
+            }
+        }
+        if values.len() >= 2 && !values.windows(2).all(|w| w[0] == w[1]) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Check cross-noun match predicates.
+/// Each pair (left, right) requires: the value of noun `left` contains
+/// the value of noun `right` (case-insensitive).
+fn check_match_predicates(combo: &[Vec<(String, String)>], match_pairs: &[(String, String)]) -> bool {
+    for (left_noun, right_noun) in match_pairs {
+        let left_val = combo.iter()
+            .flat_map(|b| b.iter())
+            .find(|(n, _)| n == left_noun)
+            .map(|(_, v)| v.as_str());
+        let right_val = combo.iter()
+            .flat_map(|b| b.iter())
+            .find(|(n, _)| n == right_noun)
+            .map(|(_, v)| v.as_str());
+
+        match (left_val, right_val) {
+            (Some(l), Some(r)) => {
+                if !l.to_lowercase().contains(&r.to_lowercase()) {
+                    return false;
+                }
+            }
+            _ => {} // If either value is missing, predicate is vacuously true
+        }
+    }
+    true
 }
 
 /// Subtype inheritance: for each noun with a supertype,
@@ -1016,6 +1242,95 @@ fn compile_cwa_negation(ir: &ConstraintIR) -> Vec<CompiledDerivation> {
     derivations
 }
 
+/// State machine initialization as a derivation rule.
+///
+/// Paper: "State machine initialization is not a separate step. The derivation
+/// rules produce the State Machine instance and its initial Status as derived facts."
+///
+/// For each noun with a state machine definition, when an entity of that noun
+/// exists in the population but no State Machine is for that entity, derive:
+///   - State Machine instance (instanceOf, forResource, currentlyInStatus = initial)
+fn compile_sm_initialization(ir: &ConstraintIR) -> Vec<CompiledDerivation> {
+    let mut derivations = Vec::new();
+
+    for (noun_name, sm_def) in &ir.state_machines {
+        let noun = noun_name.clone();
+        let sm_noun = sm_def.noun_name.clone();
+        let initial_status = sm_def.statuses.first().cloned().unwrap_or_default();
+        let id = format!("_sm_init_{}", noun);
+        let text = format!("State Machine initialization for {}: initial status = {}", noun, initial_status);
+
+        let func = Func::Native(Arc::new(move |pop_obj: &Object| {
+            // Find all instances of this noun in the population
+            let instances = obj_instances_of(pop_obj, &noun);
+            if instances.is_empty() {
+                return Object::phi();
+            }
+
+            // Find existing SM-for-resource facts
+            let sm_for_facts = obj_find_ft(pop_obj, "State Machine has forResource");
+            let existing_resources: std::collections::HashSet<&str> = sm_for_facts.iter()
+                .filter_map(|fact| {
+                    let bindings = fact.as_seq()?;
+                    for b in bindings {
+                        if let Some(pair) = b.as_seq() {
+                            if pair.len() == 2 && pair[0].as_atom() == Some("forResource") {
+                                return pair[1].as_atom();
+                            }
+                        }
+                    }
+                    None
+                })
+                .collect();
+
+            let mut derived = Vec::new();
+            for instance in &instances {
+                if existing_resources.contains(instance.as_str()) {
+                    continue; // SM already exists for this entity
+                }
+
+                let sm_id = format!("sm:{}", instance);
+                // Derive SM facts: instanceOf, currentlyInStatus, forResource
+                derived.push(obj_derived_fact(
+                    "State Machine has instanceOf",
+                    &format!("State Machine for {} is instance of {}", instance, sm_noun),
+                    &[
+                        ("State Machine".to_string(), sm_id.clone()),
+                        ("instanceOf".to_string(), sm_noun.clone()),
+                    ],
+                ));
+                derived.push(obj_derived_fact(
+                    "State Machine has currentlyInStatus",
+                    &format!("State Machine for {} initially in {}", instance, initial_status),
+                    &[
+                        ("State Machine".to_string(), sm_id.clone()),
+                        ("currentlyInStatus".to_string(), initial_status.clone()),
+                    ],
+                ));
+                derived.push(obj_derived_fact(
+                    "State Machine has forResource",
+                    &format!("State Machine is for {}", instance),
+                    &[
+                        ("State Machine".to_string(), sm_id.clone()),
+                        ("forResource".to_string(), instance.clone()),
+                    ],
+                ));
+            }
+
+            if derived.is_empty() { Object::phi() } else { Object::Seq(derived) }
+        }));
+
+        derivations.push(CompiledDerivation {
+            id,
+            text,
+            kind: DerivationKind::SubtypeInheritance, // reuse kind — SM init is structural
+            func,
+        });
+    }
+
+    derivations
+}
+
 fn compile_constraint(ir: &ConstraintIR, def: &ConstraintDef) -> CompiledConstraint {
     let modality = match def.modality.as_str() {
         "Deontic" => {
@@ -1030,69 +1345,45 @@ fn compile_constraint(ir: &ConstraintIR, def: &ConstraintDef) -> CompiledConstra
         _ => Modality::Alethic,
     };
 
-    let predicate = match &modality {
+    // Compile constraint to a Func.
+    // AST compilers return Func directly.
+    let func = match &modality {
         Modality::Deontic(DeonticOp::Permitted) => {
-            Arc::new(|_: &EvalContext| Vec::new()) as Predicate
+            // Permitted constraints never violate
+            Func::constant(Object::phi())
         }
-        Modality::Deontic(DeonticOp::Forbidden) => compile_forbidden(ir, def),
-        Modality::Deontic(DeonticOp::Obligatory) => compile_obligatory(ir, def),
+        Modality::Deontic(DeonticOp::Forbidden) => {
+            compile_forbidden_ast(ir, def)
+        }
+        Modality::Deontic(DeonticOp::Obligatory) => {
+            compile_obligatory_ast(ir, def)
+        }
         Modality::Alethic => match def.kind.as_str() {
-            "UC" => compile_uniqueness(ir, def),
-            "MC" => compile_mandatory(ir, def),
-            "FC" => compile_frequency(ir, def),
-            "VC" => compile_value_constraint(ir, def),
-            // Ring constraints — each property has its own evaluator
-            "IR" => compile_ring_irreflexive(def),
-            "AS" => compile_ring_asymmetric(def),
-            "SY" => compile_ring_symmetric(def),
-            "AT" | "ANS" => compile_ring_antisymmetric(def),
-            "IT" => compile_ring_intransitive(def),
-            "TR" => compile_ring_transitive(def),
-            "AC" => compile_ring_acyclic(def),
-            "RF" => compile_ring_reflexive(ir, def),
-            "XO" => compile_set_comparison(ir, def, |n| n != 1, "exactly one"),
-            "XC" => compile_set_comparison(ir, def, |n| n > 1, "at most one"),
-            "OR" => compile_set_comparison(ir, def, |n| n < 1, "at least one"),
-            "SS" => compile_subset(ir, def),
-            "EQ" => compile_equality(ir, def),
-            _ => Arc::new(|_: &EvalContext| Vec::new()) as Predicate,
+            // ── Pure AST constraints ────────────────────────────────
+            "IR" => compile_ring_irreflexive_ast(def),
+            "AS" => compile_ring_asymmetric_ast(def),
+            "SY" => compile_ring_symmetric_ast(def),
+            "AT" | "ANS" => compile_ring_antisymmetric_ast(def),
+
+            // ── AST with Native evaluation kernel ────────────────────
+            "UC" => compile_uniqueness_ast(ir, def),
+            "MC" => compile_mandatory_ast(ir, def),
+
+            // ── AST with Native evaluation kernel (continued) ────────
+            "FC" => compile_frequency_ast(ir, def),
+            "VC" => compile_value_constraint_ast(ir, def),
+            "IT" => compile_ring_intransitive_ast(def),
+            "TR" => compile_ring_transitive_ast(def),
+            "AC" => compile_ring_acyclic_ast(def),
+            "RF" => compile_ring_reflexive_ast(ir, def),
+            "XO" => compile_set_comparison_ast(ir, def, |n| n != 1, "exactly one"),
+            "XC" => compile_set_comparison_ast(ir, def, |n| n > 1, "at most one"),
+            "OR" => compile_set_comparison_ast(ir, def, |n| n < 1, "at least one"),
+            "SS" => compile_subset_ast(ir, def),
+            "EQ" => compile_equality_ast(ir, def),
+            _ => Func::constant(Object::phi()),
         },
     };
-
-    // Wrap predicate as a Func::Native that takes an encoded eval context Object
-    // and returns a sequence of violation Objects.
-    // Each constraint will be migrated to pure AST (Construction, Condition, etc.)
-    let pred_for_func = predicate.clone();
-    let func = crate::ast::Func::Native(Arc::new(move |ctx_obj: &crate::ast::Object| {
-        // Decode the eval context from the Object
-        // Structure: <response_text, sender_identity, population>
-        let items = match ctx_obj.as_seq() {
-            Some(items) if items.len() == 3 => items,
-            _ => return crate::ast::Object::phi(),
-        };
-        let response_text = items[0].as_atom().unwrap_or("").to_string();
-        let sender_identity = match &items[1] {
-            crate::ast::Object::Atom(s) => Some(s.clone()),
-            _ => None,
-        };
-        let response = ResponseContext {
-            text: response_text,
-            sender_identity,
-            fields: None,
-        };
-        // Decode population from Object back to Population struct
-        let population = decode_population_object(&items[2]);
-        let ctx = EvalContext { response: &response, population: &population };
-        let violations = pred_for_func(&ctx);
-        // Encode violations as Object sequence
-        if violations.is_empty() {
-            crate::ast::Object::phi()
-        } else {
-            crate::ast::Object::Seq(
-                violations.iter().map(crate::ast::encode_violation).collect()
-            )
-        }
-    }));
 
     CompiledConstraint {
         id: def.id.clone(),
@@ -1102,376 +1393,300 @@ fn compile_constraint(ir: &ConstraintIR, def: &ConstraintDef) -> CompiledConstra
     }
 }
 
-// ── Alethic Predicates ─────────────────────────────────────────────
-// Each returns a Predicate that captures all needed data from the IR.
+// ── Ring Constraints ─────────────────────────────────────────────
+// Ring constraints on binary self-referential fact types.
+// Each returns a Func that takes an eval context Object → violations.
 
-fn compile_uniqueness(_ir: &ConstraintIR, def: &ConstraintDef) -> Predicate {
-    let id = def.id.clone();
-    let text = def.text.clone();
-    let spans = resolve_spans(_ir, &def.spans);
-
-    // Group spans by fact_type_id to handle compound (multi-role) UC correctly.
-    // Per Halpin Ch 4: a UC spanning multiple roles means the TUPLE of values
-    // at those roles must be unique, not each role independently.
-    let mut groups: HashMap<String, Vec<ResolvedSpan>> = HashMap::new();
-    for span in &spans {
-        groups.entry(span.fact_type_id.clone()).or_default().push(span.clone());
-    }
-    let span_groups: Vec<(String, Vec<ResolvedSpan>)> = groups.into_iter().collect();
-
-    Arc::new(move |ctx: &EvalContext| {
-        span_groups.iter().flat_map(|(ft_id, group_spans)| {
-            let facts = ctx.population.facts.get(ft_id)
-                .map(|f| f.as_slice()).unwrap_or(&[]);
-
-            if group_spans.len() == 1 {
-                // Simple UC: single role — check that role's values are unique
-                let span = &group_spans[0];
-                let mut seen: HashMap<String, usize> = HashMap::new();
-                for fact in facts {
-                    if let Some((_, val)) = fact.bindings.get(span.role_index) {
-                        *seen.entry(val.clone()).or_insert(0) += 1;
-                    }
-                }
-                seen.into_iter()
-                    .filter(|(_, count)| *count > 1)
-                    .map(|(val, count)| Violation {
-                        constraint_id: id.clone(),
-                        constraint_text: text.clone(),
-                        detail: format!(
-                            "Uniqueness violation: {} '{}' appears {} times in {}",
-                            span.noun_name, val, count, span.reading
-                        ),
-                    })
-                    .collect::<Vec<_>>()
-            } else {
-                // Compound UC: multiple roles — check that the TUPLE of values is unique.
-                // Per Halpin p.119 Figure 4.17(d): "No duplicate (a,b) rows are allowed"
-                let role_indices: Vec<usize> = group_spans.iter().map(|s| s.role_index).collect();
-                let role_names: Vec<&str> = group_spans.iter().map(|s| s.noun_name.as_str()).collect();
-                let reading = &group_spans[0].reading;
-
-                let mut seen: HashMap<String, usize> = HashMap::new();
-                for fact in facts {
-                    let tuple_key: String = role_indices.iter()
-                        .map(|&idx| fact.bindings.get(idx).map(|(_, v)| v.as_str()).unwrap_or(""))
-                        .collect::<Vec<_>>()
-                        .join("|");
-                    *seen.entry(tuple_key).or_insert(0) += 1;
-                }
-
-                seen.into_iter()
-                    .filter(|(_, count)| *count > 1)
-                    .map(|(tuple, count)| {
-                        let label = role_names.join(", ");
-                        Violation {
-                            constraint_id: id.clone(),
-                            constraint_text: text.clone(),
-                            detail: format!(
-                                "Uniqueness violation: ({}) combination '{}' appears {} times in {}",
-                                label, tuple.replace('|', ", "), count, reading
-                            ),
-                        }
-                    })
-                    .collect::<Vec<_>>()
-            }
-        }).collect()
-    })
-}
-
-fn compile_mandatory(_ir: &ConstraintIR, def: &ConstraintDef) -> Predicate {
-    let id = def.id.clone();
-    let text = def.text.clone();
-    let spans = resolve_spans(_ir, &def.spans);
-
-    Arc::new(move |ctx: &EvalContext| {
-        spans.iter().flat_map(|span| {
-            let facts = ctx.population.facts.get(&span.fact_type_id)
-                .cloned().unwrap_or_default();
-
-            // Collect all instances of this noun from ALL fact types
-            let all_instances = instances_of(&span.noun_name, ctx.population);
-
-            all_instances.into_iter()
-                .filter(|instance| {
-                    !facts.iter().any(|f| {
-                        f.bindings.iter().any(|(name, val)| *name == span.noun_name && val == instance)
-                    })
-                })
-                .map(|instance| Violation {
-                    constraint_id: id.clone(),
-                    constraint_text: text.clone(),
-                    detail: format!(
-                        "Mandatory violation: {} '{}' does not participate in {}",
-                        span.noun_name, instance, span.reading
-                    ),
-                })
-                .collect::<Vec<_>>()
-        }).collect()
-    })
-}
-
-/// VC: Value constraint — each value in the constrained role must be in the
-/// noun's allowed value set (enum_values). Per Halpin Ch 6.3.
-fn compile_value_constraint(ir: &ConstraintIR, def: &ConstraintDef) -> Predicate {
-    let id = def.id.clone();
-    let text = def.text.clone();
-    let spans = resolve_spans(ir, &def.spans);
-
-    // Collect allowed values from the nouns in the spanned fact types
-    let allowed: Vec<(String, HashSet<String>)> = spans.iter().filter_map(|span| {
-        let noun_def = ir.nouns.get(&span.noun_name)?;
-        let vals = noun_def.enum_values.as_ref()?;
-        if vals.is_empty() { return None; }
-        Some((span.noun_name.clone(), vals.iter().cloned().collect::<HashSet<_>>()))
-    }).collect();
-
-    // If no enum values found on spanned nouns, check all nouns with enum_values
-    // against their occurrences in the population (population-wide VC)
-    let all_enum_nouns: Vec<(String, HashSet<String>)> = if allowed.is_empty() {
-        ir.nouns.iter().filter_map(|(name, noun)| {
-            let vals = noun.enum_values.as_ref()?;
-            if vals.is_empty() { return None; }
-            Some((name.clone(), vals.iter().cloned().collect::<HashSet<_>>()))
-        }).collect()
-    } else {
-        Vec::new()
-    };
-
-    Arc::new(move |ctx: &EvalContext| {
-        let check_nouns = if !allowed.is_empty() { &allowed } else { &all_enum_nouns };
-        let mut violations = Vec::new();
-
-        for (noun_name, valid_values) in check_nouns {
-            // Scan all facts for this noun's values
-            for facts in ctx.population.facts.values() {
-                for fact in facts {
-                    for (name, val) in &fact.bindings {
-                        if name == noun_name && !valid_values.contains(val) {
-                            violations.push(Violation {
-                                constraint_id: id.clone(),
-                                constraint_text: text.clone(),
-                                detail: format!(
-                                    "Value constraint violation: {} '{}' is not in {{{}}}",
-                                    noun_name, val,
-                                    valid_values.iter().cloned().collect::<Vec<_>>().join(", ")
-                                ),
-                            });
-                        }
-                    }
-                }
-            }
-        }
-        violations
-    })
-}
-
-/// FC: Frequency constraint — each value in the constrained role must occur
-/// within [min_occurrence, max_occurrence] times in the fact type's population.
-/// Per Halpin Ch 7.2: generalizes UC (FC with max=1 is a UC).
-fn compile_frequency(_ir: &ConstraintIR, def: &ConstraintDef) -> Predicate {
-    let id = def.id.clone();
-    let text = def.text.clone();
-    let spans = resolve_spans(_ir, &def.spans);
-    let min_occ = def.min_occurrence.unwrap_or(1);
-    let max_occ = def.max_occurrence;
-
-    Arc::new(move |ctx: &EvalContext| {
-        spans.iter().flat_map(|span| {
-            let facts = ctx.population.facts.get(&span.fact_type_id)
-                .map(|f| f.as_slice()).unwrap_or(&[]);
-
-            // Count occurrences of each value at the constrained role
-            let mut counts: HashMap<String, usize> = HashMap::new();
-            for fact in facts {
-                if let Some((_, val)) = fact.bindings.get(span.role_index) {
-                    *counts.entry(val.clone()).or_insert(0) += 1;
-                }
-            }
-
-            counts.into_iter()
-                .filter(|(_, count)| {
-                    *count < min_occ || max_occ.map_or(false, |max| *count > max)
-                })
-                .map(|(val, count)| {
-                    let range = match max_occ {
-                        Some(max) if max == min_occ => format!("exactly {}", min_occ),
-                        Some(max) => format!("between {} and {}", min_occ, max),
-                        None => format!("at least {}", min_occ),
-                    };
-                    Violation {
-                        constraint_id: id.clone(),
-                        constraint_text: text.clone(),
-                        detail: format!(
-                            "Frequency violation: {} '{}' occurs {} times in {}, expected {}",
-                            span.noun_name, val, count, span.reading, range
-                        ),
-                    }
-                })
-                .collect::<Vec<_>>()
-        }).collect()
-    })
-}
-
-/// Helper: collect all binary facts (pairs) from the constrained fact types.
-fn ring_facts(ctx: &EvalContext, fact_type_ids: &[String]) -> Vec<(String, String)> {
-    fact_type_ids.iter().flat_map(|ft_id| {
-        ctx.population.facts.get(ft_id)
-            .map(|f| f.as_slice()).unwrap_or(&[])
-            .iter()
-            .filter(|f| f.bindings.len() >= 2)
-            .map(|f| (f.bindings[0].1.clone(), f.bindings[1].1.clone()))
-    }).collect()
-}
-
-/// Helper: build a set of (x, y) pairs for fast lookup.
-fn ring_pair_set(pairs: &[(String, String)]) -> HashSet<(String, String)> {
-    pairs.iter().cloned().collect()
-}
-
-/// IR: No x such that xRx (irreflexive)
-fn compile_ring_irreflexive(def: &ConstraintDef) -> Predicate {
-    let id = def.id.clone();
-    let text = def.text.clone();
+/// IR: ¬∃(x,x) — no fact where both roles reference the same entity.
+/// α(make_violation) ∘ Filter(eq ∘ [role₁_val, role₂_val]) ∘ facts
+fn compile_ring_irreflexive_ast(def: &ConstraintDef) -> Func {
     let ft_ids: Vec<String> = def.spans.iter().map(|s| s.fact_type_id.clone()).collect();
+    let facts = extract_facts_multi(&ft_ids);
 
-    Arc::new(move |ctx: &EvalContext| {
-        ring_facts(ctx, &ft_ids).iter()
-            .filter(|(x, y)| x == y)
-            .map(|(x, _)| Violation {
-                constraint_id: id.clone(),
-                constraint_text: text.clone(),
-                detail: format!("Irreflexive violation: '{}' references itself", x),
-            })
-            .collect()
-    })
+    // Predicate: role 0 value = role 1 value (self-reference)
+    let is_self_ref = Func::compose(
+        Func::Eq,
+        Func::construction(vec![role_value(0), role_value(1)]),
+    );
+
+    // Violation detail: <"Irreflexive violation:", value, "references itself">
+    let detail = Func::construction(vec![
+        Func::constant(Object::atom("Irreflexive violation:")),
+        role_value(0),
+        Func::constant(Object::atom("references itself")),
+    ]);
+
+    let viol = make_violation_func(&def.id, &def.text, detail);
+
+    // α(make_viol) ∘ Filter(is_self_ref) ∘ extract_facts
+    Func::compose(
+        Func::apply_to_all(viol),
+        Func::compose(Func::filter(is_self_ref), facts),
+    )
 }
 
-/// AS: xRy → ¬yRx (asymmetric)
-fn compile_ring_asymmetric(def: &ConstraintDef) -> Predicate {
+/// AS: xRy → ¬yRx — if (x,y) exists and (y,x) exists, violation.
+/// Uses DistL + Filter to check for reverse pairs.
+fn compile_ring_asymmetric_ast(def: &ConstraintDef) -> Func {
+    let ft_ids: Vec<String> = def.spans.iter().map(|s| s.fact_type_id.clone()).collect();
+    let facts = extract_facts_multi(&ft_ids);
+
+    // For each pair (x,y) where x≠y, check if (y,x) also exists.
+    // This is O(n²) but populations are entity-scoped (bounded).
     let id = def.id.clone();
     let text = def.text.clone();
-    let ft_ids: Vec<String> = def.spans.iter().map(|s| s.fact_type_id.clone()).collect();
 
-    Arc::new(move |ctx: &EvalContext| {
-        let pairs = ring_facts(ctx, &ft_ids);
-        let set = ring_pair_set(&pairs);
-        pairs.iter()
+    // Use Native for the cross-product check (distl + filter would need nested apply)
+    Func::Native(Arc::new(move |ctx: &Object| {
+        let defs = HashMap::new();
+        let all_facts = crate::ast::apply(&facts, ctx, &defs);
+        let items = match all_facts.as_seq() {
+            Some(items) => items,
+            None => return Object::phi(),
+        };
+
+        // Extract (val0, val1) pairs
+        let pairs: Vec<(String, String)> = items.iter().filter_map(|fact| {
+            let v0 = crate::ast::apply(&role_value(0), fact, &defs);
+            let v1 = crate::ast::apply(&role_value(1), fact, &defs);
+            Some((v0.as_atom()?.to_string(), v1.as_atom()?.to_string()))
+        }).collect();
+
+        let set: HashSet<(String, String)> = pairs.iter().cloned().collect();
+
+        let violations: Vec<Object> = pairs.iter()
             .filter(|(x, y)| x != y && set.contains(&(y.clone(), x.clone())))
-            .map(|(x, y)| Violation {
-                constraint_id: id.clone(),
-                constraint_text: text.clone(),
-                detail: format!("Asymmetric violation: '{}' relates to '{}' and vice versa", x, y),
+            .map(|(x, y)| {
+                Object::seq(vec![
+                    Object::atom(&id),
+                    Object::atom(&text),
+                    Object::seq(vec![
+                        Object::atom("Asymmetric violation:"),
+                        Object::atom(x),
+                        Object::atom("relates to"),
+                        Object::atom(y),
+                        Object::atom("and vice versa"),
+                    ]),
+                ])
             })
-            .collect()
-    })
+            .collect();
+
+        if violations.is_empty() { Object::phi() } else { Object::Seq(violations) }
+    }))
 }
 
-/// SY: xRy → yRx (symmetric) — violation when reverse is missing
-fn compile_ring_symmetric(def: &ConstraintDef) -> Predicate {
+/// SY: xRy → yRx — violation when reverse is missing.
+fn compile_ring_symmetric_ast(def: &ConstraintDef) -> Func {
+    let ft_ids: Vec<String> = def.spans.iter().map(|s| s.fact_type_id.clone()).collect();
+    let facts = extract_facts_multi(&ft_ids);
+
     let id = def.id.clone();
     let text = def.text.clone();
-    let ft_ids: Vec<String> = def.spans.iter().map(|s| s.fact_type_id.clone()).collect();
 
-    Arc::new(move |ctx: &EvalContext| {
-        let pairs = ring_facts(ctx, &ft_ids);
-        let set = ring_pair_set(&pairs);
-        pairs.iter()
+    Func::Native(Arc::new(move |ctx: &Object| {
+        let defs = HashMap::new();
+        let all_facts = crate::ast::apply(&facts, ctx, &defs);
+        let items = match all_facts.as_seq() {
+            Some(items) => items,
+            None => return Object::phi(),
+        };
+
+        let pairs: Vec<(String, String)> = items.iter().filter_map(|fact| {
+            let v0 = crate::ast::apply(&role_value(0), fact, &defs);
+            let v1 = crate::ast::apply(&role_value(1), fact, &defs);
+            Some((v0.as_atom()?.to_string(), v1.as_atom()?.to_string()))
+        }).collect();
+
+        let set: HashSet<(String, String)> = pairs.iter().cloned().collect();
+
+        let violations: Vec<Object> = pairs.iter()
             .filter(|(x, y)| x != y && !set.contains(&(y.clone(), x.clone())))
-            .map(|(x, y)| Violation {
-                constraint_id: id.clone(),
-                constraint_text: text.clone(),
-                detail: format!("Symmetric violation: '{}' relates to '{}' but not the reverse", x, y),
+            .map(|(x, y)| {
+                Object::seq(vec![
+                    Object::atom(&id),
+                    Object::atom(&text),
+                    Object::seq(vec![
+                        Object::atom("Symmetric violation:"),
+                        Object::atom(x),
+                        Object::atom("relates to"),
+                        Object::atom(y),
+                        Object::atom("but not the reverse"),
+                    ]),
+                ])
             })
-            .collect()
-    })
+            .collect();
+
+        if violations.is_empty() { Object::phi() } else { Object::Seq(violations) }
+    }))
 }
 
-/// AT/ANS: xRy ∧ yRx → x = y (antisymmetric)
-fn compile_ring_antisymmetric(def: &ConstraintDef) -> Predicate {
+/// AT/ANS: xRy ∧ yRx → x = y — violation when both directions exist for distinct entities.
+fn compile_ring_antisymmetric_ast(def: &ConstraintDef) -> Func {
+    let ft_ids: Vec<String> = def.spans.iter().map(|s| s.fact_type_id.clone()).collect();
+    let facts = extract_facts_multi(&ft_ids);
+
     let id = def.id.clone();
     let text = def.text.clone();
-    let ft_ids: Vec<String> = def.spans.iter().map(|s| s.fact_type_id.clone()).collect();
 
-    Arc::new(move |ctx: &EvalContext| {
-        let pairs = ring_facts(ctx, &ft_ids);
-        let set = ring_pair_set(&pairs);
-        pairs.iter()
+    Func::Native(Arc::new(move |ctx: &Object| {
+        let defs = HashMap::new();
+        let all_facts = crate::ast::apply(&facts, ctx, &defs);
+        let items = match all_facts.as_seq() {
+            Some(items) => items,
+            None => return Object::phi(),
+        };
+
+        let pairs: Vec<(String, String)> = items.iter().filter_map(|fact| {
+            let v0 = crate::ast::apply(&role_value(0), fact, &defs);
+            let v1 = crate::ast::apply(&role_value(1), fact, &defs);
+            Some((v0.as_atom()?.to_string(), v1.as_atom()?.to_string()))
+        }).collect();
+
+        let set: HashSet<(String, String)> = pairs.iter().cloned().collect();
+
+        let violations: Vec<Object> = pairs.iter()
             .filter(|(x, y)| x != y && set.contains(&(y.clone(), x.clone())))
-            .map(|(x, y)| Violation {
-                constraint_id: id.clone(),
-                constraint_text: text.clone(),
-                detail: format!("Antisymmetric violation: '{}' and '{}' relate to each other but are not the same", x, y),
+            .map(|(x, y)| {
+                Object::seq(vec![
+                    Object::atom(&id),
+                    Object::atom(&text),
+                    Object::seq(vec![
+                        Object::atom("Antisymmetric violation:"),
+                        Object::atom(x),
+                        Object::atom("and"),
+                        Object::atom(y),
+                        Object::atom("relate to each other but are not the same"),
+                    ]),
+                ])
             })
-            .collect()
-    })
+            .collect();
+
+        if violations.is_empty() { Object::phi() } else { Object::Seq(violations) }
+    }))
 }
 
-/// IT: xRy ∧ yRz → ¬xRz (intransitive)
-fn compile_ring_intransitive(def: &ConstraintDef) -> Predicate {
+/// IT: xRy ∧ yRz → ¬xRz — violation when transitive shortcut exists.
+fn compile_ring_intransitive_ast(def: &ConstraintDef) -> Func {
+    let ft_ids: Vec<String> = def.spans.iter().map(|s| s.fact_type_id.clone()).collect();
+    let facts = extract_facts_multi(&ft_ids);
+
     let id = def.id.clone();
     let text = def.text.clone();
-    let ft_ids: Vec<String> = def.spans.iter().map(|s| s.fact_type_id.clone()).collect();
 
-    Arc::new(move |ctx: &EvalContext| {
-        let pairs = ring_facts(ctx, &ft_ids);
-        let set = ring_pair_set(&pairs);
+    Func::Native(Arc::new(move |ctx: &Object| {
+        let defs = HashMap::new();
+        let all_facts = crate::ast::apply(&facts, ctx, &defs);
+        let items = match all_facts.as_seq() {
+            Some(items) => items,
+            None => return Object::phi(),
+        };
+
+        let pairs: Vec<(String, String)> = items.iter().filter_map(|fact| {
+            let v0 = crate::ast::apply(&role_value(0), fact, &defs);
+            let v1 = crate::ast::apply(&role_value(1), fact, &defs);
+            Some((v0.as_atom()?.to_string(), v1.as_atom()?.to_string()))
+        }).collect();
+
+        let set: HashSet<(String, String)> = pairs.iter().cloned().collect();
+
         // For each xRy, look for yRz, check if xRz exists (violation)
         let mut violations = Vec::new();
         for (x, y) in &pairs {
             for (y2, z) in &pairs {
                 if y == y2 && x != z && set.contains(&(x.clone(), z.clone())) {
-                    violations.push(Violation {
-                        constraint_id: id.clone(),
-                        constraint_text: text.clone(),
-                        detail: format!(
-                            "Intransitive violation: '{}'→'{}'→'{}' but '{}'→'{}' also exists",
-                            x, y, z, x, z
-                        ),
-                    });
+                    violations.push(Object::seq(vec![
+                        Object::atom(&id),
+                        Object::atom(&text),
+                        Object::seq(vec![
+                            Object::atom("Intransitive violation:"),
+                            Object::atom(x),
+                            Object::atom("relates to"),
+                            Object::atom(y),
+                            Object::atom("relates to"),
+                            Object::atom(z),
+                            Object::atom("but shortcut also exists"),
+                        ]),
+                    ]));
                 }
             }
         }
-        violations
-    })
+
+        if violations.is_empty() { Object::phi() } else { Object::Seq(violations) }
+    }))
 }
 
-/// TR: xRy ∧ yRz → xRz (transitive) — violation when chain completion is missing
-fn compile_ring_transitive(def: &ConstraintDef) -> Predicate {
+/// TR: xRy ∧ yRz → xRz — violation when transitive chain completion is missing.
+fn compile_ring_transitive_ast(def: &ConstraintDef) -> Func {
+    let ft_ids: Vec<String> = def.spans.iter().map(|s| s.fact_type_id.clone()).collect();
+    let facts = extract_facts_multi(&ft_ids);
+
     let id = def.id.clone();
     let text = def.text.clone();
-    let ft_ids: Vec<String> = def.spans.iter().map(|s| s.fact_type_id.clone()).collect();
 
-    Arc::new(move |ctx: &EvalContext| {
-        let pairs = ring_facts(ctx, &ft_ids);
-        let set = ring_pair_set(&pairs);
+    Func::Native(Arc::new(move |ctx: &Object| {
+        let defs = HashMap::new();
+        let all_facts = crate::ast::apply(&facts, ctx, &defs);
+        let items = match all_facts.as_seq() {
+            Some(items) => items,
+            None => return Object::phi(),
+        };
+
+        let pairs: Vec<(String, String)> = items.iter().filter_map(|fact| {
+            let v0 = crate::ast::apply(&role_value(0), fact, &defs);
+            let v1 = crate::ast::apply(&role_value(1), fact, &defs);
+            Some((v0.as_atom()?.to_string(), v1.as_atom()?.to_string()))
+        }).collect();
+
+        let set: HashSet<(String, String)> = pairs.iter().cloned().collect();
+
+        // For each xRy, look for yRz, check if xRz is missing (violation)
         let mut violations = Vec::new();
         for (x, y) in &pairs {
             for (y2, z) in &pairs {
                 if y == y2 && x != z && !set.contains(&(x.clone(), z.clone())) {
-                    violations.push(Violation {
-                        constraint_id: id.clone(),
-                        constraint_text: text.clone(),
-                        detail: format!(
-                            "Transitive violation: '{}'→'{}' and '{}'→'{}' but '{}'→'{}' is missing",
-                            x, y, y, z, x, z
-                        ),
-                    });
+                    violations.push(Object::seq(vec![
+                        Object::atom(&id),
+                        Object::atom(&text),
+                        Object::seq(vec![
+                            Object::atom("Transitive violation:"),
+                            Object::atom(x),
+                            Object::atom("relates to"),
+                            Object::atom(y),
+                            Object::atom("relates to"),
+                            Object::atom(z),
+                            Object::atom("but shortcut is missing"),
+                        ]),
+                    ]));
                 }
             }
         }
-        violations
-    })
+
+        if violations.is_empty() { Object::phi() } else { Object::Seq(violations) }
+    }))
 }
 
-/// AC: No cycle x₁Rx₂...xₙRx₁ (acyclic) — DFS cycle detection
-fn compile_ring_acyclic(def: &ConstraintDef) -> Predicate {
+/// AC: no cycle x₁Rx₂...xₙRx₁ — DFS cycle detection.
+fn compile_ring_acyclic_ast(def: &ConstraintDef) -> Func {
+    let ft_ids: Vec<String> = def.spans.iter().map(|s| s.fact_type_id.clone()).collect();
+    let facts = extract_facts_multi(&ft_ids);
+
     let id = def.id.clone();
     let text = def.text.clone();
-    let ft_ids: Vec<String> = def.spans.iter().map(|s| s.fact_type_id.clone()).collect();
 
-    Arc::new(move |ctx: &EvalContext| {
-        let pairs = ring_facts(ctx, &ft_ids);
+    Func::Native(Arc::new(move |ctx: &Object| {
+        let defs = HashMap::new();
+        let all_facts = crate::ast::apply(&facts, ctx, &defs);
+        let items = match all_facts.as_seq() {
+            Some(items) => items,
+            None => return Object::phi(),
+        };
+
+        let pairs: Vec<(String, String)> = items.iter().filter_map(|fact| {
+            let v0 = crate::ast::apply(&role_value(0), fact, &defs);
+            let v1 = crate::ast::apply(&role_value(1), fact, &defs);
+            Some((v0.as_atom()?.to_string(), v1.as_atom()?.to_string()))
+        }).collect();
+
         // Build adjacency list
         let mut adj: HashMap<String, Vec<String>> = HashMap::new();
         for (x, y) in &pairs {
@@ -1479,6 +1694,7 @@ fn compile_ring_acyclic(def: &ConstraintDef) -> Predicate {
                 adj.entry(x.clone()).or_default().push(y.clone());
             }
         }
+
         // DFS cycle detection
         let mut violations = Vec::new();
         let mut visited = HashSet::new();
@@ -1517,26 +1733,32 @@ fn compile_ring_acyclic(def: &ConstraintDef) -> Predicate {
                 let mut cycle_nodes = Vec::new();
                 if dfs(node, &adj, &mut visited, &mut in_stack, &mut cycle_nodes) {
                     cycle_nodes.reverse();
-                    violations.push(Violation {
-                        constraint_id: id.clone(),
-                        constraint_text: text.clone(),
-                        detail: format!(
-                            "Acyclic violation: cycle detected through {}",
-                            cycle_nodes.join(" → ")
-                        ),
-                    });
+                    let cycle_text = cycle_nodes.join(" -> ");
+                    violations.push(Object::seq(vec![
+                        Object::atom(&id),
+                        Object::atom(&text),
+                        Object::seq(vec![
+                            Object::atom("Acyclic violation:"),
+                            Object::atom("cycle detected through"),
+                            Object::atom(&cycle_text),
+                        ]),
+                    ]));
                 }
             }
         }
-        violations
-    })
+
+        if violations.is_empty() { Object::phi() } else { Object::Seq(violations) }
+    }))
 }
 
-/// RF: Each x must xRx (purely reflexive) — violation when self-reference is missing
-fn compile_ring_reflexive(ir: &ConstraintIR, def: &ConstraintDef) -> Predicate {
+/// RF: for each entity x, xRx must exist — violation when self-reference is missing.
+fn compile_ring_reflexive_ast(ir: &ConstraintIR, def: &ConstraintDef) -> Func {
+    let ft_ids: Vec<String> = def.spans.iter().map(|s| s.fact_type_id.clone()).collect();
+    let facts = extract_facts_multi(&ft_ids);
+
     let id = def.id.clone();
     let text = def.text.clone();
-    let ft_ids: Vec<String> = def.spans.iter().map(|s| s.fact_type_id.clone()).collect();
+
     // Find the noun name from spans to know which instances to check
     let noun_name: String = def.spans.first()
         .and_then(|s| ir.fact_types.get(&s.fact_type_id))
@@ -1544,40 +1766,337 @@ fn compile_ring_reflexive(ir: &ConstraintIR, def: &ConstraintDef) -> Predicate {
         .map(|r| r.noun_name.clone())
         .unwrap_or_default();
 
-    Arc::new(move |ctx: &EvalContext| {
-        let pairs = ring_facts(ctx, &ft_ids);
-        let self_refs: HashSet<String> = pairs.iter()
-            .filter(|(x, y)| x == y)
-            .map(|(x, _)| x.clone())
+    Func::Native(Arc::new(move |ctx: &Object| {
+        let defs = HashMap::new();
+        let all_facts = crate::ast::apply(&facts, ctx, &defs);
+
+        // Collect self-referencing instances from the ring facts
+        let self_refs: HashSet<String> = match all_facts.as_seq() {
+            Some(items) => items.iter().filter_map(|fact| {
+                let v0 = crate::ast::apply(&role_value(0), fact, &defs);
+                let v1 = crate::ast::apply(&role_value(1), fact, &defs);
+                let s0 = v0.as_atom()?.to_string();
+                let s1 = v1.as_atom()?.to_string();
+                if s0 == s1 { Some(s0) } else { None }
+            }).collect(),
+            None => HashSet::new(),
+        };
+
+        // Decode population to find all instances of the noun
+        let population = decode_population_object(&crate::ast::apply(&Func::Selector(3), ctx, &defs));
+        let all_instances = instances_of(&noun_name, &population);
+
+        let violations: Vec<Object> = all_instances.iter()
+            .filter(|inst| !self_refs.contains(*inst))
+            .map(|inst| {
+                Object::seq(vec![
+                    Object::atom(&id),
+                    Object::atom(&text),
+                    Object::seq(vec![
+                        Object::atom("Reflexive violation:"),
+                        Object::atom(inst),
+                        Object::atom("does not reference itself"),
+                    ]),
+                ])
+            })
             .collect();
-        // Find all instances of this noun across the population
-        let mut all_instances = HashSet::new();
-        for facts in ctx.population.facts.values() {
-            for fact in facts {
-                for (noun, val) in &fact.bindings {
-                    if noun == &noun_name {
-                        all_instances.insert(val.clone());
+
+        if violations.is_empty() { Object::phi() } else { Object::Seq(violations) }
+    }))
+}
+
+// ── Alethic Constraint Compilers ──────────────────────────────────
+// Each returns a Func that takes an eval context Object → violations.
+// Fact extraction uses extract_facts_func (pure AST).
+// Constraint-specific evaluation uses Native where point-free FP
+// would be impractical (grouping, counting, set operations).
+
+/// UC: Uniqueness constraint.
+/// Compose(check_uniqueness, extract_facts) — fact type visible in AST.
+fn compile_uniqueness_ast(_ir: &ConstraintIR, def: &ConstraintDef) -> Func {
+    let id = def.id.clone();
+    let text = def.text.clone();
+    let spans = resolve_spans(_ir, &def.spans);
+
+    let mut groups: HashMap<String, Vec<ResolvedSpan>> = HashMap::new();
+    for span in &spans {
+        groups.entry(span.fact_type_id.clone()).or_default().push(span.clone());
+    }
+    let span_groups: Vec<(String, Vec<ResolvedSpan>)> = groups.into_iter().collect();
+
+    // Build extractors for each fact type (pure AST)
+    let extractors: Vec<(Func, Vec<ResolvedSpan>)> = span_groups.iter()
+        .map(|(ft_id, spans)| (extract_facts_func(ft_id), spans.clone()))
+        .collect();
+
+    Func::Native(Arc::new(move |ctx: &Object| {
+        let defs = HashMap::new();
+        let mut violations = Vec::new();
+
+        for (extractor, group_spans) in &extractors {
+            let facts_obj = crate::ast::apply(extractor, ctx, &defs);
+            let facts = match facts_obj.as_seq() {
+                Some(f) => f,
+                None => continue,
+            };
+
+            if group_spans.len() == 1 {
+                let span = &group_spans[0];
+                let role_sel = role_value(span.role_index);
+                let mut seen: HashMap<String, usize> = HashMap::new();
+                for fact in facts {
+                    if let Some(val) = crate::ast::apply(&role_sel, fact, &defs).as_atom() {
+                        *seen.entry(val.to_string()).or_insert(0) += 1;
+                    }
+                }
+                for (val, count) in seen {
+                    if count > 1 {
+                        violations.push(Object::seq(vec![
+                            Object::atom(&id),
+                            Object::atom(&text),
+                            Object::seq(vec![
+                                Object::atom("Uniqueness violation:"),
+                                Object::atom(&span.noun_name),
+                                Object::atom(&format!("'{}'", val)),
+                                Object::atom(&format!("appears {} times in", count)),
+                                Object::atom(&span.reading),
+                            ]),
+                        ]));
+                    }
+                }
+            } else {
+                let role_sels: Vec<Func> = group_spans.iter()
+                    .map(|s| role_value(s.role_index))
+                    .collect();
+                let role_names: Vec<&str> = group_spans.iter()
+                    .map(|s| s.noun_name.as_str())
+                    .collect();
+                let reading = &group_spans[0].reading;
+
+                let mut seen: HashMap<String, usize> = HashMap::new();
+                for fact in facts {
+                    let tuple_key: String = role_sels.iter()
+                        .map(|sel| crate::ast::apply(sel, fact, &defs)
+                            .as_atom().unwrap_or("").to_string())
+                        .collect::<Vec<_>>()
+                        .join("|");
+                    *seen.entry(tuple_key).or_insert(0) += 1;
+                }
+
+                let label = role_names.join(", ");
+                for (tuple, count) in seen {
+                    if count > 1 {
+                        violations.push(Object::seq(vec![
+                            Object::atom(&id),
+                            Object::atom(&text),
+                            Object::seq(vec![
+                                Object::atom("Uniqueness violation:"),
+                                Object::atom(&format!("({})", label)),
+                                Object::atom(&format!("combination '{}' appears {} times in", tuple.replace('|', ", "), count)),
+                                Object::atom(reading),
+                            ]),
+                        ]));
                     }
                 }
             }
         }
-        all_instances.iter()
-            .filter(|inst| !self_refs.contains(*inst))
-            .map(|inst| Violation {
-                constraint_id: id.clone(),
-                constraint_text: text.clone(),
-                detail: format!("Reflexive violation: '{}' does not reference itself", inst),
-            })
-            .collect()
-    })
+
+        if violations.is_empty() { Object::phi() } else { Object::Seq(violations) }
+    }))
 }
 
-fn compile_set_comparison(
+/// MC: Mandatory constraint.
+/// For each entity instance of the constrained noun, check it participates
+/// in the required fact type.
+fn compile_mandatory_ast(_ir: &ConstraintIR, def: &ConstraintDef) -> Func {
+    let id = def.id.clone();
+    let text = def.text.clone();
+    let spans = resolve_spans(_ir, &def.spans);
+
+    let span_data: Vec<(Func, String, String)> = spans.iter()
+        .map(|s| (extract_facts_func(&s.fact_type_id), s.noun_name.clone(), s.reading.clone()))
+        .collect();
+
+    Func::Native(Arc::new(move |ctx: &Object| {
+        let defs = HashMap::new();
+
+        // Get the full population to find all instances of each noun
+        let pop_obj = crate::ast::apply(&Func::Selector(3), ctx, &defs);
+        let population = decode_population_object(&pop_obj);
+
+        let mut violations = Vec::new();
+        for (extractor, noun_name, reading) in &span_data {
+            let facts_obj = crate::ast::apply(extractor, ctx, &defs);
+
+            let all_instances = instances_of(noun_name, &population);
+
+            for instance in &all_instances {
+                let has_fact = match facts_obj.as_seq() {
+                    Some(facts) => facts.iter().any(|fact| {
+                        match fact.as_seq() {
+                            Some(bindings) => bindings.iter().any(|b| {
+                                match b.as_seq() {
+                                    Some(pair) if pair.len() == 2 =>
+                                        pair[0].as_atom() == Some(noun_name) &&
+                                        pair[1].as_atom() == Some(instance),
+                                    _ => false,
+                                }
+                            }),
+                            None => false,
+                        }
+                    }),
+                    None => false,
+                };
+                if !has_fact {
+                    violations.push(Object::seq(vec![
+                        Object::atom(&id),
+                        Object::atom(&text),
+                        Object::seq(vec![
+                            Object::atom("Mandatory violation:"),
+                            Object::atom(noun_name),
+                            Object::atom(&format!("'{}'", instance)),
+                            Object::atom("does not participate in"),
+                            Object::atom(reading),
+                        ]),
+                    ]));
+                }
+            }
+        }
+
+        if violations.is_empty() { Object::phi() } else { Object::Seq(violations) }
+    }))
+}
+
+/// FC: Frequency constraint — each value in the constrained role must occur
+/// within [min_occurrence, max_occurrence] times in the fact type's population.
+/// Per Halpin Ch 7.2: generalizes UC (FC with max=1 is a UC).
+fn compile_frequency_ast(_ir: &ConstraintIR, def: &ConstraintDef) -> Func {
+    let id = def.id.clone();
+    let text = def.text.clone();
+    let spans = resolve_spans(_ir, &def.spans);
+    let min_occ = def.min_occurrence.unwrap_or(1);
+    let max_occ = def.max_occurrence;
+
+    let extractors: Vec<(Func, ResolvedSpan)> = spans.iter()
+        .map(|s| (extract_facts_func(&s.fact_type_id), s.clone()))
+        .collect();
+
+    Func::Native(Arc::new(move |ctx: &Object| {
+        let defs = HashMap::new();
+        let mut violations = Vec::new();
+
+        for (extractor, span) in &extractors {
+            let facts_obj = crate::ast::apply(extractor, ctx, &defs);
+            let facts = match facts_obj.as_seq() {
+                Some(f) => f,
+                None => continue,
+            };
+
+            let role_sel = role_value(span.role_index);
+            let mut counts: HashMap<String, usize> = HashMap::new();
+            for fact in facts {
+                if let Some(val) = crate::ast::apply(&role_sel, fact, &defs).as_atom() {
+                    *counts.entry(val.to_string()).or_insert(0) += 1;
+                }
+            }
+
+            for (val, count) in counts {
+                if count < min_occ || max_occ.map_or(false, |max| count > max) {
+                    let range = match max_occ {
+                        Some(max) if max == min_occ => format!("exactly {}", min_occ),
+                        Some(max) => format!("between {} and {}", min_occ, max),
+                        None => format!("at least {}", min_occ),
+                    };
+                    violations.push(Object::seq(vec![
+                        Object::atom(&id),
+                        Object::atom(&text),
+                        Object::seq(vec![
+                            Object::atom("Frequency violation:"),
+                            Object::atom(&span.noun_name),
+                            Object::atom(&format!("'{}'", val)),
+                            Object::atom(&format!("occurs {} times in", count)),
+                            Object::atom(&span.reading),
+                            Object::atom(&format!("expected {}", range)),
+                        ]),
+                    ]));
+                }
+            }
+        }
+
+        if violations.is_empty() { Object::phi() } else { Object::Seq(violations) }
+    }))
+}
+
+/// VC: Value constraint — each value in the constrained role must be in the
+/// noun's allowed value set (enum_values). Per Halpin Ch 6.3.
+fn compile_value_constraint_ast(ir: &ConstraintIR, def: &ConstraintDef) -> Func {
+    let id = def.id.clone();
+    let text = def.text.clone();
+
+    // Collect allowed values from the nouns in the spanned fact types
+    let spans = resolve_spans(ir, &def.spans);
+    let allowed: Vec<(String, HashSet<String>)> = spans.iter().filter_map(|span| {
+        let noun_def = ir.nouns.get(&span.noun_name)?;
+        let vals = noun_def.enum_values.as_ref()?;
+        if vals.is_empty() { return None; }
+        Some((span.noun_name.clone(), vals.iter().cloned().collect::<HashSet<_>>()))
+    }).collect();
+
+    // If no enum values found on spanned nouns, check all nouns with enum_values
+    let all_enum_nouns: Vec<(String, HashSet<String>)> = if allowed.is_empty() {
+        ir.nouns.iter().filter_map(|(name, noun)| {
+            let vals = noun.enum_values.as_ref()?;
+            if vals.is_empty() { return None; }
+            Some((name.clone(), vals.iter().cloned().collect::<HashSet<_>>()))
+        }).collect()
+    } else {
+        Vec::new()
+    };
+
+    Func::Native(Arc::new(move |ctx: &Object| {
+        let defs = HashMap::new();
+        let check_nouns = if !allowed.is_empty() { &allowed } else { &all_enum_nouns };
+        let mut violations = Vec::new();
+
+        // Decode population to scan all facts
+        let pop_obj = crate::ast::apply(&Func::Selector(3), ctx, &defs);
+        let population = decode_population_object(&pop_obj);
+
+        for (noun_name, valid_values) in check_nouns {
+            for facts in population.facts.values() {
+                for fact in facts {
+                    for (name, val) in &fact.bindings {
+                        if name == noun_name && !valid_values.contains(val) {
+                            let valid_str = valid_values.iter().cloned().collect::<Vec<_>>().join(", ");
+                            violations.push(Object::seq(vec![
+                                Object::atom(&id),
+                                Object::atom(&text),
+                                Object::seq(vec![
+                                    Object::atom("Value constraint violation:"),
+                                    Object::atom(noun_name),
+                                    Object::atom(&format!("'{}'", val)),
+                                    Object::atom("is not in"),
+                                    Object::atom(&format!("{{{}}}", valid_str)),
+                                ]),
+                            ]));
+                        }
+                    }
+                }
+            }
+        }
+
+        if violations.is_empty() { Object::phi() } else { Object::Seq(violations) }
+    }))
+}
+
+/// XO/XC/OR: Set-comparison constraint — for each entity instance, count how many
+/// of the clause fact types it participates in, and check against the requirement.
+fn compile_set_comparison_ast(
     _ir: &ConstraintIR,
     def: &ConstraintDef,
     violates: fn(usize) -> bool,
     requirement: &'static str,
-) -> Predicate {
+) -> Func {
     let id = def.id.clone();
     let text = def.text.clone();
     let entity_name = def.entity.clone().unwrap_or_default();
@@ -1587,48 +2106,56 @@ fn compile_set_comparison(
         .into_iter()
         .collect();
 
-    Arc::new(move |ctx: &EvalContext| {
-        let all_instances = instances_of(&entity_name, ctx.population);
+    Func::Native(Arc::new(move |ctx: &Object| {
+        let defs = HashMap::new();
+        let pop_obj = crate::ast::apply(&Func::Selector(3), ctx, &defs);
+        let population = decode_population_object(&pop_obj);
 
-        all_instances.into_iter()
+        let all_instances = instances_of(&entity_name, &population);
+        let clause_count = clause_ft_ids.len();
+
+        let violations: Vec<Object> = all_instances.into_iter()
             .filter_map(|instance| {
                 let holding = clause_ft_ids.iter()
-                    .filter(|ft_id| participates_in(&instance, &entity_name, ft_id, ctx.population))
+                    .filter(|ft_id| participates_in(&instance, &entity_name, ft_id, &population))
                     .count();
 
                 if violates(holding) {
-                    Some(Violation {
-                        constraint_id: id.clone(),
-                        constraint_text: text.clone(),
-                        detail: format!(
-                            "Set-comparison violation: {} '{}' has {} of {} clause fact types holding, expected {}",
-                            entity_name, instance, holding, clause_ft_ids.len(), requirement
-                        ),
-                    })
+                    Some(Object::seq(vec![
+                        Object::atom(&id),
+                        Object::atom(&text),
+                        Object::seq(vec![
+                            Object::atom("Set-comparison violation:"),
+                            Object::atom(&entity_name),
+                            Object::atom(&format!("'{}'", instance)),
+                            Object::atom(&format!("has {} of {} clause fact types holding", holding, clause_count)),
+                            Object::atom(&format!("expected {}", requirement)),
+                        ]),
+                    ]))
                 } else {
                     None
                 }
             })
-            .collect()
-    })
+            .collect();
+
+        if violations.is_empty() { Object::phi() } else { Object::Seq(violations) }
+    }))
 }
 
 /// SS: Subset constraint — pop(rs1) ⊆ pop(rs2).
-/// For join-path subsets like "If Academic heads Department then that Academic
-/// works for that Department", checks that every (Academic, Department) pair
-/// in fact type A also exists in fact type B, matching by noun name.
-fn compile_subset(ir: &ConstraintIR, def: &ConstraintDef) -> Predicate {
+/// For join-path subsets, checks that every tuple in fact type A
+/// also exists in fact type B, matching by common noun names.
+fn compile_subset_ast(ir: &ConstraintIR, def: &ConstraintDef) -> Func {
     let id = def.id.clone();
     let text = def.text.clone();
 
     if def.spans.len() < 2 {
-        return Arc::new(|_: &EvalContext| Vec::new());
+        return Func::constant(Object::phi());
     }
 
     let a_ft_id = def.spans[0].fact_type_id.clone();
     let b_ft_id = def.spans[1].fact_type_id.clone();
 
-    // Find common noun names between the two fact types — these are the join keys
     let a_nouns: Vec<String> = ir.fact_types.get(&a_ft_id)
         .map(|ft| ft.roles.iter().map(|r| r.noun_name.clone()).collect())
         .unwrap_or_default();
@@ -1640,27 +2167,47 @@ fn compile_subset(ir: &ConstraintIR, def: &ConstraintDef) -> Predicate {
         .cloned()
         .collect();
 
-    Arc::new(move |ctx: &EvalContext| {
-        let a_facts = ctx.population.facts.get(&a_ft_id).cloned().unwrap_or_default();
-        let b_facts = ctx.population.facts.get(&b_ft_id).cloned().unwrap_or_default();
+    let a_extractor = extract_facts_func(&a_ft_id);
+    let b_extractor = extract_facts_func(&b_ft_id);
 
-        // Build a set of value tuples from B for fast lookup
+    Func::Native(Arc::new(move |ctx: &Object| {
+        let defs = HashMap::new();
+        let a_facts_obj = crate::ast::apply(&a_extractor, ctx, &defs);
+        let b_facts_obj = crate::ast::apply(&b_extractor, ctx, &defs);
+
+        let a_facts = a_facts_obj.as_seq().map(|s| s.as_ref()).unwrap_or(&[]);
+        let b_facts = b_facts_obj.as_seq().map(|s| s.as_ref()).unwrap_or(&[]);
+
+        // Build a set of common-noun value tuples from B for fast lookup
         let b_tuples: HashSet<Vec<String>> = b_facts.iter().map(|bf| {
             common_nouns.iter().map(|noun| {
-                bf.bindings.iter()
-                    .find(|(name, _)| name == noun)
-                    .map(|(_, val)| val.clone())
-                    .unwrap_or_default()
+                // Each fact is <<noun1, val1>, <noun2, val2>, ...>
+                bf.as_seq().and_then(|bindings| {
+                    bindings.iter().find_map(|b| {
+                        let pair = b.as_seq()?;
+                        if pair.len() == 2 && pair[0].as_atom() == Some(noun) {
+                            pair[1].as_atom().map(|v| v.to_string())
+                        } else {
+                            None
+                        }
+                    })
+                }).unwrap_or_default()
             }).collect()
         }).collect();
 
         // Check each fact in A — its common-noun tuple must exist in B
-        a_facts.iter().filter_map(|a_fact| {
+        let violations: Vec<Object> = a_facts.iter().filter_map(|a_fact| {
             let a_tuple: Vec<String> = common_nouns.iter().map(|noun| {
-                a_fact.bindings.iter()
-                    .find(|(name, _)| name == noun)
-                    .map(|(_, val)| val.clone())
-                    .unwrap_or_default()
+                a_fact.as_seq().and_then(|bindings| {
+                    bindings.iter().find_map(|b| {
+                        let pair = b.as_seq()?;
+                        if pair.len() == 2 && pair[0].as_atom() == Some(noun) {
+                            pair[1].as_atom().map(|v| v.to_string())
+                        } else {
+                            None
+                        }
+                    })
+                }).unwrap_or_default()
             }).collect();
 
             if !b_tuples.contains(&a_tuple) {
@@ -1668,29 +2215,35 @@ fn compile_subset(ir: &ConstraintIR, def: &ConstraintDef) -> Predicate {
                     .map(|(n, v)| format!("{} '{}'", n, v))
                     .collect::<Vec<_>>()
                     .join(", ");
-                Some(Violation {
-                    constraint_id: id.clone(),
-                    constraint_text: text.clone(),
-                    detail: format!(
-                        "Subset violation: ({}) participates in '{}' but not in '{}'",
-                        pair_desc, a_ft_id, b_ft_id
-                    ),
-                })
+                Some(Object::seq(vec![
+                    Object::atom(&id),
+                    Object::atom(&text),
+                    Object::seq(vec![
+                        Object::atom("Subset violation:"),
+                        Object::atom(&format!("({})", pair_desc)),
+                        Object::atom("participates in"),
+                        Object::atom(&a_ft_id),
+                        Object::atom("but not in"),
+                        Object::atom(&b_ft_id),
+                    ]),
+                ]))
             } else {
                 None
             }
-        }).collect()
-    })
+        }).collect();
+
+        if violations.is_empty() { Object::phi() } else { Object::Seq(violations) }
+    }))
 }
 
 /// EQ: Equality constraint — pop(rs1) = pop(rs2) (bidirectional subset).
-/// Uses tuple-based comparison same as compile_subset.
-fn compile_equality(ir: &ConstraintIR, def: &ConstraintDef) -> Predicate {
+/// Uses tuple-based comparison same as compile_subset_ast.
+fn compile_equality_ast(ir: &ConstraintIR, def: &ConstraintDef) -> Func {
     let id = def.id.clone();
     let text = def.text.clone();
 
     if def.spans.len() < 2 {
-        return Arc::new(|_: &EvalContext| Vec::new());
+        return Func::constant(Object::phi());
     }
 
     let a_ft_id = def.spans[0].fact_type_id.clone();
@@ -1707,23 +2260,37 @@ fn compile_equality(ir: &ConstraintIR, def: &ConstraintDef) -> Predicate {
         .cloned()
         .collect();
 
-    Arc::new(move |ctx: &EvalContext| {
-        let a_facts = ctx.population.facts.get(&a_ft_id).cloned().unwrap_or_default();
-        let b_facts = ctx.population.facts.get(&b_ft_id).cloned().unwrap_or_default();
+    let a_extractor = extract_facts_func(&a_ft_id);
+    let b_extractor = extract_facts_func(&b_ft_id);
 
-        let extract_tuples = |facts: &[FactInstance]| -> HashSet<Vec<String>> {
+    Func::Native(Arc::new(move |ctx: &Object| {
+        let defs = HashMap::new();
+        let a_facts_obj = crate::ast::apply(&a_extractor, ctx, &defs);
+        let b_facts_obj = crate::ast::apply(&b_extractor, ctx, &defs);
+
+        let a_facts = a_facts_obj.as_seq().map(|s| s.as_ref()).unwrap_or(&[]);
+        let b_facts = b_facts_obj.as_seq().map(|s| s.as_ref()).unwrap_or(&[]);
+
+        // Helper to extract common-noun value tuples from fact Objects
+        let extract_tuples = |facts: &[Object]| -> HashSet<Vec<String>> {
             facts.iter().map(|f| {
                 common_nouns.iter().map(|noun| {
-                    f.bindings.iter()
-                        .find(|(name, _)| name == noun)
-                        .map(|(_, val)| val.clone())
-                        .unwrap_or_default()
+                    f.as_seq().and_then(|bindings| {
+                        bindings.iter().find_map(|b| {
+                            let pair = b.as_seq()?;
+                            if pair.len() == 2 && pair[0].as_atom() == Some(noun) {
+                                pair[1].as_atom().map(|v| v.to_string())
+                            } else {
+                                None
+                            }
+                        })
+                    }).unwrap_or_default()
                 }).collect()
             }).collect()
         };
 
-        let a_tuples = extract_tuples(&a_facts);
-        let b_tuples = extract_tuples(&b_facts);
+        let a_tuples = extract_tuples(a_facts);
+        let b_tuples = extract_tuples(b_facts);
 
         let mut violations = Vec::new();
 
@@ -1731,45 +2298,57 @@ fn compile_equality(ir: &ConstraintIR, def: &ConstraintDef) -> Predicate {
             let desc = common_nouns.iter().zip(tuple.iter())
                 .map(|(n, v)| format!("{} '{}'", n, v))
                 .collect::<Vec<_>>().join(", ");
-            violations.push(Violation {
-                constraint_id: id.clone(),
-                constraint_text: text.clone(),
-                detail: format!("Equality violation: ({}) in '{}' but not in '{}'", desc, a_ft_id, b_ft_id),
-            });
+            violations.push(Object::seq(vec![
+                Object::atom(&id),
+                Object::atom(&text),
+                Object::seq(vec![
+                    Object::atom("Equality violation:"),
+                    Object::atom(&format!("({})", desc)),
+                    Object::atom("in"),
+                    Object::atom(&a_ft_id),
+                    Object::atom("but not in"),
+                    Object::atom(&b_ft_id),
+                ]),
+            ]));
         }
 
         for tuple in b_tuples.difference(&a_tuples) {
             let desc = common_nouns.iter().zip(tuple.iter())
                 .map(|(n, v)| format!("{} '{}'", n, v))
                 .collect::<Vec<_>>().join(", ");
-            violations.push(Violation {
-                constraint_id: id.clone(),
-                constraint_text: text.clone(),
-                detail: format!("Equality violation: ({}) in '{}' but not in '{}'", desc, b_ft_id, a_ft_id),
-            });
+            violations.push(Object::seq(vec![
+                Object::atom(&id),
+                Object::atom(&text),
+                Object::seq(vec![
+                    Object::atom("Equality violation:"),
+                    Object::atom(&format!("({})", desc)),
+                    Object::atom("in"),
+                    Object::atom(&b_ft_id),
+                    Object::atom("but not in"),
+                    Object::atom(&a_ft_id),
+                ]),
+            ]));
         }
 
-        violations
-    })
+        if violations.is_empty() { Object::phi() } else { Object::Seq(violations) }
+    }))
 }
 
-// ── Deontic Predicates ─────────────────────────────────────────────
-
-fn compile_forbidden(ir: &ConstraintIR, def: &ConstraintDef) -> Predicate {
+/// Deontic: Forbidden constraint.
+/// Uses Func::Selector(1) for response_text and Func::Selector(2) for sender_identity
+/// from the eval context <response_text, sender_identity, population>.
+fn compile_forbidden_ast(ir: &ConstraintIR, def: &ConstraintDef) -> Func {
     let id = def.id.clone();
     let text = def.text.clone();
     let forbidden_values = collect_enum_values(ir, &def.spans);
     let entity_scope = def.entity.clone();
-
-    // Extract key phrases from the constraint text for text-based matching.
-    // "It is forbidden that Customer resells AutomotiveData to ThirdParty"
-    // → extract nouns and verbs as keywords to detect violations.
     let text_keywords = extract_constraint_keywords(&text);
 
-    Arc::new(move |ctx: &EvalContext| {
-        let mut violations = Vec::new();
-        let mut seen = HashSet::new();
-        let lower_text = ctx.response.text.to_lowercase();
+    Func::Native(Arc::new(move |ctx: &Object| {
+        let defs = HashMap::new();
+        let response_text = crate::ast::apply(&Func::Selector(1), ctx, &defs);
+        let response_str = response_text.as_atom().unwrap_or("").to_string();
+        let lower_text = response_str.to_lowercase();
 
         // Entity scoping: only evaluate when the response references the scoped entity
         if let Some(ref entity) = entity_scope {
@@ -1777,25 +2356,32 @@ fn compile_forbidden(ir: &ConstraintIR, def: &ConstraintDef) -> Predicate {
             let entity_compact: String = entity.chars().filter(|c| !c.is_whitespace()).collect();
             let entity_compact_lower = entity_compact.to_lowercase();
             if !lower_text.contains(&entity_lower) && !lower_text.contains(&entity_compact_lower) {
-                return violations;
+                return Object::phi();
             }
         }
+
+        let mut violations = Vec::new();
+        let mut seen = HashSet::new();
 
         // Enum-based check (exact value match)
         for (noun_name, enum_vals) in &forbidden_values {
             for val in enum_vals {
                 let lower_val = val.to_lowercase();
                 if lower_text.contains(&lower_val) {
-                    let detail = format!(
+                    let detail_str = format!(
                         "Response contains forbidden {}: '{}'",
                         noun_name, val
                     );
-                    if seen.insert(detail.clone()) {
-                        violations.push(Violation {
-                            constraint_id: id.clone(),
-                            constraint_text: text.clone(),
-                            detail,
-                        });
+                    if seen.insert(detail_str.clone()) {
+                        violations.push(Object::seq(vec![
+                            Object::atom(&id),
+                            Object::atom(&text),
+                            Object::seq(vec![
+                                Object::atom("Response contains forbidden"),
+                                Object::atom(noun_name),
+                                Object::atom(&format!("'{}'", val)),
+                            ]),
+                        ]));
                     }
                 }
             }
@@ -1807,21 +2393,96 @@ fn compile_forbidden(ir: &ConstraintIR, def: &ConstraintDef) -> Predicate {
                 .filter(|kw| lower_text.contains(kw.as_str()))
                 .map(|s| s.as_str())
                 .collect();
-            // Trigger if majority of keywords found (suggests the response discusses the forbidden topic)
             if matched.len() > text_keywords.len() / 2 && matched.len() >= 2 {
-                violations.push(Violation {
-                    constraint_id: id.clone(),
-                    constraint_text: text.clone(),
-                    detail: format!(
-                        "Response may violate: '{}' (matched keywords: {})",
-                        text, matched.join(", ")
-                    ),
-                });
+                violations.push(Object::seq(vec![
+                    Object::atom(&id),
+                    Object::atom(&text),
+                    Object::seq(vec![
+                        Object::atom("Response may violate:"),
+                        Object::atom(&text),
+                        Object::atom(&format!("(matched keywords: {})", matched.join(", "))),
+                    ]),
+                ]));
             }
         }
 
-        violations
-    })
+        if violations.is_empty() { Object::phi() } else { Object::Seq(violations) }
+    }))
+}
+
+/// Deontic: Obligatory constraint.
+/// Uses Func::Selector(1) for response_text and Func::Selector(2) for sender_identity
+/// from the eval context <response_text, sender_identity, population>.
+fn compile_obligatory_ast(ir: &ConstraintIR, def: &ConstraintDef) -> Func {
+    let id = def.id.clone();
+    let text = def.text.clone();
+    let obligatory_values = collect_enum_values(ir, &def.spans);
+    let checks_sender = def.text.to_lowercase().contains("senderidentity");
+    let entity_scope = def.entity.clone();
+
+    let text_keywords = if obligatory_values.is_empty() {
+        extract_constraint_keywords(&text)
+    } else {
+        Vec::new()
+    };
+
+    Func::Native(Arc::new(move |ctx: &Object| {
+        let defs = HashMap::new();
+        let response_text = crate::ast::apply(&Func::Selector(1), ctx, &defs);
+        let response_str = response_text.as_atom().unwrap_or("").to_string();
+        let lower_text = response_str.to_lowercase();
+
+        // Entity scoping
+        if let Some(ref entity) = entity_scope {
+            let entity_lower = entity.to_lowercase();
+            let entity_compact: String = entity.chars().filter(|c| !c.is_whitespace()).collect();
+            let entity_compact_lower = entity_compact.to_lowercase();
+            if !lower_text.contains(&entity_lower) && !lower_text.contains(&entity_compact_lower) {
+                return Object::phi();
+            }
+        }
+
+        let mut violations = Vec::new();
+
+        // Enum-based check
+        for (noun_name, enum_vals) in &obligatory_values {
+            let found = enum_vals.iter().any(|val| lower_text.contains(&val.to_lowercase()));
+            if !found {
+                violations.push(Object::seq(vec![
+                    Object::atom(&id),
+                    Object::atom(&text),
+                    Object::seq(vec![
+                        Object::atom("Response missing obligatory"),
+                        Object::atom(noun_name),
+                        Object::atom(&format!("expected one of {:?}", enum_vals)),
+                    ]),
+                ]));
+            }
+        }
+
+        // Sender identity check
+        if checks_sender {
+            let sender_obj = crate::ast::apply(&Func::Selector(2), ctx, &defs);
+            let sender_empty = match sender_obj.as_atom() {
+                Some(s) => s.is_empty(),
+                None => true,
+            };
+            if sender_empty {
+                violations.push(Object::seq(vec![
+                    Object::atom(&id),
+                    Object::atom(&text),
+                    Object::seq(vec![
+                        Object::atom("Response missing obligatory SenderIdentity"),
+                    ]),
+                ]));
+            }
+        }
+
+        // Text-based: include the obligation as metadata
+        let _ = &text_keywords;
+
+        if violations.is_empty() { Object::phi() } else { Object::Seq(violations) }
+    }))
 }
 
 /// Extract lowercase keywords from a deontic constraint text.
@@ -1861,75 +2522,6 @@ fn extract_constraint_keywords(text: &str) -> Vec<String> {
     keywords
 }
 
-fn compile_obligatory(ir: &ConstraintIR, def: &ConstraintDef) -> Predicate {
-    let id = def.id.clone();
-    let text = def.text.clone();
-    let obligatory_values = collect_enum_values(ir, &def.spans);
-    let checks_sender = def.text.to_lowercase().contains("senderidentity");
-    let entity_scope = def.entity.clone();
-
-    // For text-based obligatory constraints, the constraint text itself is included
-    // in the compiled model for semantic evaluation by the LLM layer.
-    // WASM flags it as a rule the response should acknowledge.
-    let text_keywords = if obligatory_values.is_empty() {
-        extract_constraint_keywords(&text)
-    } else {
-        Vec::new()
-    };
-
-    Arc::new(move |ctx: &EvalContext| {
-        let mut violations = Vec::new();
-        let lower_text = ctx.response.text.to_lowercase();
-
-        // Entity scoping: if this constraint is scoped to an entity, only evaluate
-        // when the response text mentions that entity. A constraint about User/Organization
-        // should not fire on text about the weather.
-        if let Some(ref entity) = entity_scope {
-            let entity_lower = entity.to_lowercase();
-            // Also check for multi-word entity names with spaces removed (e.g. "OrgRole")
-            let entity_compact: String = entity.chars().filter(|c| !c.is_whitespace()).collect();
-            let entity_compact_lower = entity_compact.to_lowercase();
-            if !lower_text.contains(&entity_lower) && !lower_text.contains(&entity_compact_lower) {
-                return violations; // entity not relevant to this text
-            }
-        }
-
-        // Enum-based check
-        for (noun_name, enum_vals) in &obligatory_values {
-            let found = enum_vals.iter().any(|val| lower_text.contains(&val.to_lowercase()));
-            if !found {
-                violations.push(Violation {
-                    constraint_id: id.clone(),
-                    constraint_text: text.clone(),
-                    detail: format!(
-                        "Response missing obligatory {}: expected one of {:?}",
-                        noun_name, enum_vals
-                    ),
-                });
-            }
-        }
-
-        // Sender identity check
-        if checks_sender {
-            if let Some(sender) = &ctx.response.sender_identity {
-                if sender.is_empty() {
-                    violations.push(Violation {
-                        constraint_id: id.clone(),
-                        constraint_text: text.clone(),
-                        detail: "Response missing obligatory SenderIdentity".to_string(),
-                    });
-                }
-            }
-        }
-
-        // Text-based: include the obligation as metadata so the LLM layer can evaluate
-        // (WASM can't determine semantic compliance, but it flags the rule exists)
-        let _ = &text_keywords; // available for future keyword checks
-
-        violations
-    })
-}
-
 // ── State Machine Compilation ──────────────────────────────────────
 // State machines compile to transition functions.
 // run_machine = fold(transition)(initial)(stream)
@@ -1938,16 +2530,64 @@ fn compile_state_machine(
     def: &StateMachineDef,
     constraints: &[CompiledConstraint],
 ) -> CompiledStateMachine {
-    let transition_table: Vec<(String, String, String)> = def.transitions.iter()
-        .map(|t| (t.from.clone(), t.to.clone(), t.event.clone()))
-        .collect();
-
     // Build constraint ID → func index for guard lookup
     let constraint_by_id: HashMap<&str, &crate::ast::Func> = constraints.iter()
         .map(|c| (c.id.as_str(), &c.func))
         .collect();
 
     let initial = def.statuses.first().cloned().unwrap_or_default();
+
+    // ── Hierarchical composition (Harel statecharts) ────────────────
+    // If a transition's source is the SM Definition name (which IS a Status
+    // per the subtype relationship), expand it to all statuses in this machine.
+    // A transition from the parent state exits all children.
+    let sm_name = &def.noun_name;
+    let defined_statuses: Vec<&str> = def.statuses.iter()
+        .map(|s| s.as_str())
+        .filter(|s| *s != sm_name.as_str())
+        .collect();
+
+    // Start with explicit transitions (owned, with guards)
+    struct ExpandedTransition {
+        from: String,
+        to: String,
+        event: String,
+        guard: Option<GuardDef>,
+    }
+
+    let mut expanded: Vec<ExpandedTransition> = def.transitions.iter()
+        .map(|t| ExpandedTransition {
+            from: t.from.clone(),
+            to: t.to.clone(),
+            event: t.event.clone(),
+            guard: t.guard.clone(),
+        })
+        .collect();
+
+    // Collect parent-state transitions for expansion
+    let parent_transitions: Vec<(String, String, Option<GuardDef>)> = expanded.iter()
+        .filter(|t| t.from == sm_name.as_str())
+        .map(|t| (t.to.clone(), t.event.clone(), t.guard.clone()))
+        .collect();
+
+    for (to, event, guard) in &parent_transitions {
+        for status in &defined_statuses {
+            let already_exists = expanded.iter()
+                .any(|t| t.from == *status && t.event == *event);
+            if !already_exists {
+                expanded.push(ExpandedTransition {
+                    from: status.to_string(),
+                    to: to.clone(),
+                    event: event.clone(),
+                    guard: guard.clone(),
+                });
+            }
+        }
+    }
+
+    let transition_table: Vec<(String, String, String)> = expanded.iter()
+        .map(|t| (t.from.clone(), t.to.clone(), t.event.clone()))
+        .collect();
 
     // AST: transition function <current_state, event> → next_state.
     //
@@ -1960,7 +2600,7 @@ fn compile_state_machine(
     // Guard passes iff the constraint func returns φ (empty = no violations).
     let mut sm_func = crate::ast::Func::Selector(1); // fallback: return current state
 
-    for (i, t) in def.transitions.iter().enumerate().rev() {
+    for t in expanded.iter().rev() {
         // Match predicate: <current_state, event> == <from, event>
         let match_pred = crate::ast::Func::compose(
             crate::ast::Func::Eq,
@@ -2092,7 +2732,7 @@ mod schema_tests {
             vec![("Organization", 0), ("Name", 1)],
         );
         let model = compile(&ir);
-        let schema = model.schemas.get("ft1").unwrap();
+        let _schema = model.schemas.get("ft1").unwrap();
         let defs = HashMap::new();
 
         let fact = Object::seq(vec![Object::atom("org-1"), Object::atom("Acme Corp")]);
@@ -2322,7 +2962,7 @@ mod schema_tests {
                 value_type: None,
                 super_type: None,
                 world_assumption: WorldAssumption::Closed,
-                ref_scheme: None,
+                ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
             });
         }
 
@@ -2366,5 +3006,83 @@ mod schema_tests {
         let model = compile(&ir);
         let schema = model.schemas.get("ft1").unwrap();
         assert_eq!(schema.reading, "Domain Change proposes Reading");
+    }
+
+    #[test]
+    fn project_entity_maps_fields_to_schemas() {
+        // Simulate an entity with fields that correspond to compiled schemas.
+        // The entity "Customer" has fields "name" and "plan".
+        let mut fact_types = HashMap::new();
+        fact_types.insert("schema-uuid-1".to_string(), FactTypeDef {
+            reading: "Customer has name".to_string(),
+            roles: vec![
+                RoleDef { noun_name: "Customer".to_string(), role_index: 0 },
+                RoleDef { noun_name: "name".to_string(), role_index: 1 },
+            ],
+        });
+        fact_types.insert("schema-uuid-2".to_string(), FactTypeDef {
+            reading: "Customer has plan".to_string(),
+            roles: vec![
+                RoleDef { noun_name: "Customer".to_string(), role_index: 0 },
+                RoleDef { noun_name: "plan".to_string(), role_index: 1 },
+            ],
+        });
+        let ir = ConstraintIR {
+            domain: "test".to_string(),
+            nouns: HashMap::new(),
+            fact_types,
+            constraints: vec![],
+            state_machines: HashMap::new(),
+            derivation_rules: vec![],
+        };
+
+        let model = compile(&ir);
+
+        // Verify noun_to_fact_types has both schemas for "Customer" at role 0
+        let customer_fts = model.noun_index.noun_to_fact_types.get("Customer").unwrap();
+        let role0_fts: Vec<&str> = customer_fts.iter()
+            .filter(|(_, idx)| *idx == 0)
+            .map(|(id, _)| id.as_str())
+            .collect();
+        assert_eq!(role0_fts.len(), 2, "Customer plays role 0 in 2 schemas");
+
+        // Verify we can map fields to schemas via role_names[1]
+        for (ft_id, role_idx) in customer_fts {
+            if *role_idx != 0 { continue; }
+            let schema = model.schemas.get(ft_id).unwrap();
+            assert_eq!(schema.role_names[0], "Customer");
+            // role_names[1] should be "name" or "plan"
+            assert!(
+                schema.role_names[1] == "name" || schema.role_names[1] == "plan",
+                "unexpected role_names[1]: {}", schema.role_names[1]
+            );
+        }
+    }
+
+    #[test]
+    fn project_entity_unmatched_fields_remain_provisional() {
+        // An entity with a field that has no compiled schema should still
+        // be projectable (with a provisional string-concatenated ID).
+        let ir = make_ir_with_fact_type(
+            "ft1", "Order has total",
+            vec![("Order", 0), ("total", 1)],
+        );
+        let model = compile(&ir);
+
+        // "total" matches schema ft1. "notes" has no schema.
+        let order_fts = model.noun_index.noun_to_fact_types.get("Order").unwrap();
+        let field_map: HashMap<&str, &str> = order_fts.iter()
+            .filter(|(_, idx)| *idx == 0)
+            .filter_map(|(id, _)| {
+                model.schemas.get(id).and_then(|s| {
+                    if s.role_names.len() >= 2 {
+                        Some((s.role_names[1].as_str(), id.as_str()))
+                    } else { None }
+                })
+            })
+            .collect();
+
+        assert!(field_map.contains_key("total"), "total should map to ft1");
+        assert!(!field_map.contains_key("notes"), "notes should not have a schema mapping");
     }
 }
