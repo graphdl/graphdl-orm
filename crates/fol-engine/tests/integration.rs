@@ -1,17 +1,13 @@
 // crates/fol-engine/tests/integration.rs
 //
-// Integration tests use the global WASM state (load_ir + evaluate_response).
-// A test mutex serializes access to prevent race conditions when cargo test
-// runs tests in parallel.
-use fol_engine::{load_ir, evaluate_response};
-use serde_json::Value;
-use std::sync::Mutex;
-
-static TEST_MUTEX: Mutex<()> = Mutex::new(());
+// Integration tests exercise the compile + evaluate pipeline directly,
+// bypassing the wasm_bindgen layer (which requires JsValue).
+use fol_engine::types::{ConstraintIR, ResponseContext, Population};
+use fol_engine::compile;
+use fol_engine::evaluate;
 
 #[test]
 fn test_full_pipeline_forbidden_text() {
-    let _lock = TEST_MUTEX.lock().unwrap();
     let ir_json = r#"{
         "domain": "test",
         "nouns": {
@@ -38,19 +34,20 @@ fn test_full_pipeline_forbidden_text() {
         "stateMachines": {}
     }"#;
 
-    load_ir(ir_json).unwrap();
+    let ir: ConstraintIR = serde_json::from_str(ir_json).unwrap();
+    let model = compile::compile(&ir);
 
-    let response = r#"{"text": "Hello — how are you?", "senderIdentity": null, "fields": null}"#;
-    let population = r#"{"facts": {}}"#;
+    let response: ResponseContext = serde_json::from_str(
+        r#"{"text": "Hello — how are you?", "senderIdentity": null, "fields": null}"#
+    ).unwrap();
+    let population: Population = serde_json::from_str(r#"{"facts": {}}"#).unwrap();
 
-    let result = evaluate_response(response, population);
-    let violations: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+    let violations = evaluate::evaluate_via_ast(&model, &response, &population);
     assert!(!violations.is_empty());
 }
 
 #[test]
 fn test_full_pipeline_clean_response() {
-    let _lock = TEST_MUTEX.lock().unwrap();
     let ir_json = r#"{
         "domain": "test",
         "nouns": {
@@ -77,19 +74,20 @@ fn test_full_pipeline_clean_response() {
         "stateMachines": {}
     }"#;
 
-    load_ir(ir_json).unwrap();
+    let ir: ConstraintIR = serde_json::from_str(ir_json).unwrap();
+    let model = compile::compile(&ir);
 
-    let response = r#"{"text": "Hello, how are you today?", "senderIdentity": null, "fields": null}"#;
-    let population = r#"{"facts": {}}"#;
+    let response: ResponseContext = serde_json::from_str(
+        r#"{"text": "Hello, how are you today?", "senderIdentity": null, "fields": null}"#
+    ).unwrap();
+    let population: Population = serde_json::from_str(r#"{"facts": {}}"#).unwrap();
 
-    let result = evaluate_response(response, population);
-    let violations: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+    let violations = evaluate::evaluate_via_ast(&model, &response, &population);
     assert!(violations.is_empty());
 }
 
 #[test]
 fn test_full_pipeline_uniqueness_violation() {
-    let _lock = TEST_MUTEX.lock().unwrap();
     let ir_json = r#"{
         "domain": "test",
         "nouns": {
@@ -115,20 +113,22 @@ fn test_full_pipeline_uniqueness_violation() {
         "stateMachines": {}
     }"#;
 
-    load_ir(ir_json).unwrap();
+    let ir: ConstraintIR = serde_json::from_str(ir_json).unwrap();
+    let model = compile::compile(&ir);
 
-    // Customer c1 has two names → UC violation
-    let response = r#"{"text": "", "senderIdentity": null, "fields": null}"#;
-    let population = r#"{"facts": {
+    // Customer c1 has two names -> UC violation
+    let response: ResponseContext = serde_json::from_str(
+        r#"{"text": "", "senderIdentity": null, "fields": null}"#
+    ).unwrap();
+    let population: Population = serde_json::from_str(r#"{"facts": {
         "ft1": [
             { "factTypeId": "ft1", "bindings": [["Customer", "c1"], ["Name", "Alice"]] },
             { "factTypeId": "ft1", "bindings": [["Customer", "c1"], ["Name", "Bob"]] }
         ]
-    }}"#;
+    }}"#).unwrap();
 
-    let result = evaluate_response(response, population);
-    let violations: Vec<Value> = serde_json::from_str(&result).unwrap();
+    let violations = evaluate::evaluate_via_ast(&model, &response, &population);
     assert_eq!(violations.len(), 1);
-    assert!(violations[0]["detail"].as_str().unwrap().contains("Uniqueness violation"));
-    assert!(violations[0]["constraintId"].as_str().unwrap() == "c1");
+    assert!(violations[0].detail.contains("Uniqueness violation"));
+    assert_eq!(violations[0].constraint_id, "c1");
 }

@@ -1,15 +1,16 @@
 // crates/fol-engine/src/query.rs
 //
-// Population query via the FP AST.
+// Population query via partial application of graph schemas.
 //
-// A query is a partially applied graph schema:
-//   BinaryToUnary(Eq, known_resource) checks if a role matches.
-//   ApplyToAll maps the check over a population.
-//   Insert(/or) aggregates to "exists".
-//   Compose chains these into a derivation.
+// A query is a partially applied graph schema (Backus 1977):
+//   Schema     = CONS(Sel(1), ..., Sel(n))       — a Construction
+//   Bind roles = eq ∘ [Sel(i), valuē]             — predicate per bound role
+//   Filter     = Filter(predicate)                — keep matching facts
+//   Extract    = α(Sel(target))                   — map selector over matches
+//   Query      = α(Sel(target)) ∘ Filter(pred)   — composed function
+//   Execute    = apply(query, population)          — beta reduction
 //
-// The old QueryPredicate struct is kept for backward compatibility.
-// New code should use query_with_ast which operates on Func nodes.
+// No Func::Native. No manual iteration. Pure AST throughout.
 
 use crate::types::Population;
 use crate::ast::{self, Func, Object};
@@ -17,7 +18,6 @@ use crate::compile::CompiledSchema;
 #[cfg(test)]
 use crate::types::FactInstance;
 use serde::{Serialize, Deserialize};
-use std::sync::Arc;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -58,7 +58,7 @@ pub fn query_population(population: &Population, predicate: &QueryPredicate) -> 
     QueryResult { matches, count }
 }
 
-// ── AST-based query ──────────────────────────────────────────────────
+// ── Partial application as query ────────────────────────────────────
 // Query = partial application of a graph schema.
 // Given a schema and known bindings, return matching resources from population.
 
@@ -86,30 +86,13 @@ pub fn population_to_object(population: &Population, schema: &CompiledSchema) ->
     Object::Seq(items)
 }
 
-/// Query a population using AST partial application.
+/// Build a predicate Func from filter bindings.
 ///
-/// Given a compiled schema, a role index to extract (1-indexed), and
-/// filter bindings (role_index, value), returns matching values.
-///
-/// This is: α(target_selector) ∘ filter(bindings) applied to the population.
-/// Filter uses composition + condition on each binding.
-pub fn query_with_ast(
-    population: &Population,
-    schema: &CompiledSchema,
-    target_role: usize,
-    filter_bindings: &[(usize, &str)],
-) -> Vec<String> {
-    let defs = std::collections::HashMap::new();
-    let pop = population_to_object(population, schema);
-
-    if matches!(pop, Object::Seq(ref items) if items.is_empty()) {
-        return vec![];
-    }
-
-    // Build a predicate that checks all filter bindings:
-    // For each (role_idx, value): eq ∘ [Selector(role_idx), valuē]
-    // Combined with AND: all must be T
-    let mut check_fns: Vec<Func> = filter_bindings.iter().map(|(role_idx, value)| {
+/// Single binding:  eq ∘ [Sel(i), valuē]
+/// Multiple:        nested Condition — each check gates the next (pure AND).
+/// Zero:            constant T (match all)
+fn build_predicate(filter_bindings: &[(usize, &str)]) -> Func {
+    let checks: Vec<Func> = filter_bindings.iter().map(|(role_idx, value)| {
         Func::compose(
             Func::Eq,
             Func::construction(vec![
@@ -119,49 +102,60 @@ pub fn query_with_ast(
         )
     }).collect();
 
-    // Build combined predicate: and all checks
-    // For a single check, just use it directly.
-    // For multiple, chain with native AND.
-    let predicate = if check_fns.is_empty() {
-        Func::constant(Object::t()) // No filters = always match
-    } else if check_fns.len() == 1 {
-        check_fns.remove(0)
-    } else {
-        // Native AND combinator
-        let and_fn: ast::Fn1 = Arc::new(|x: &Object| {
-            match x.as_seq() {
-                Some(items) if items.len() == 2 => {
-                    let a = items[0].as_atom().unwrap_or("F");
-                    let b = items[1].as_atom().unwrap_or("F");
-                    if a == "T" && b == "T" { Object::t() } else { Object::f() }
-                }
-                _ => Object::Bottom,
-            }
-        });
-
-        // /and ∘ [check₁, check₂, ..., checkₙ]
-        let all_checks = Func::construction(check_fns);
-        Func::compose(
-            Func::insert(Func::Native(and_fn)),
-            all_checks,
-        )
-    };
-
-    // Apply predicate to each fact, collect target role from matching facts
-    let mut results = Vec::new();
-    if let Some(items) = pop.as_seq() {
-        for item in items {
-            let check = ast::apply(&predicate, item, &defs);
-            if check == Object::t() {
-                let target = ast::apply(&Func::Selector(target_role), item, &defs);
-                if let Some(val) = target.as_atom() {
-                    results.push(val.to_string());
-                }
-            }
+    match checks.len() {
+        0 => Func::constant(Object::t()),
+        1 => checks.into_iter().next().unwrap(),
+        _ => {
+            // AND via nested Condition: (p₁ → (p₂ → ... → T̄; F̄); F̄)
+            // Each check gates the next — all must pass.
+            checks.into_iter().rev().fold(
+                Func::constant(Object::t()),
+                |inner, check| Func::condition(check, inner, Func::constant(Object::f())),
+            )
         }
     }
+}
 
-    results
+/// Build a query Func: α(Sel(target)) ∘ Filter(predicate).
+///
+/// This is partial application of a graph schema:
+///   Schema = CONS(Sel(1), ..., Sel(n))
+///   Bind some roles to constants → predicate
+///   Filter(predicate) selects matching facts
+///   α(Sel(target)) extracts the free role from matches
+pub fn build_query(target_role: usize, filter_bindings: &[(usize, &str)]) -> Func {
+    let predicate = build_predicate(filter_bindings);
+    Func::compose(
+        Func::apply_to_all(Func::Selector(target_role)),
+        Func::filter(predicate),
+    )
+}
+
+/// Query a population using partial application of a graph schema.
+///
+/// Given a compiled schema, a role index to extract (1-indexed), and
+/// filter bindings (role_index, value), returns matching values.
+///
+/// This is: α(Sel(target)) ∘ Filter(predicate) applied to the population.
+/// Pure AST — no Native closures, no manual iteration.
+pub fn query_with_ast(
+    population: &Population,
+    schema: &CompiledSchema,
+    target_role: usize,
+    filter_bindings: &[(usize, &str)],
+) -> Vec<String> {
+    let defs = std::collections::HashMap::new();
+    let pop = population_to_object(population, schema);
+
+    let query = build_query(target_role, filter_bindings);
+    let result = ast::apply(&query, &pop, &defs);
+
+    match result.as_seq() {
+        Some(items) => items.iter()
+            .filter_map(|obj| obj.as_atom().map(|s| s.to_string()))
+            .collect(),
+        None => vec![],
+    }
 }
 
 #[cfg(test)]
@@ -278,7 +272,7 @@ mod tests {
         assert_eq!(result.count, 2);
     }
 
-    // ── AST-based query tests ────────────────────────────────────
+    // ── AST-based query tests (partial application) ─────────────
 
     fn make_schema(id: &str, role_names: Vec<&str>) -> CompiledSchema {
         let selectors: Vec<Func> = (0..role_names.len())
@@ -381,5 +375,16 @@ mod tests {
 
         let results = query_with_ast(&pop, &schema, 1, &[]);
         assert_eq!(results, vec!["a", "b"]);
+    }
+
+    // ── build_query produces inspectable AST ────────────────────
+
+    #[test]
+    fn build_query_is_pure_ast() {
+        // Verify the query function contains no Native nodes
+        let query = build_query(2, &[(1, "alice"), (3, "active")]);
+        let debug = format!("{:?}", query);
+        assert!(!debug.contains("<native>"), "query must be pure AST, got: {}", debug);
+        assert!(debug.contains("Filter"), "query must use Filter, got: {}", debug);
     }
 }
