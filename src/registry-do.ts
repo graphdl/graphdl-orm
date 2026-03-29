@@ -329,6 +329,13 @@ export class RegistryDB extends DurableObject {
     wipeAllRegistryData(this.ctx.storage.sql)
   }
 
+  async wipeAllEntities(): Promise<void> {
+    this.ensureInit()
+    this.ctx.storage.sql.exec('DELETE FROM entity_index')
+    this.ctx.storage.sql.exec('DELETE FROM noun_index')
+    this.ctx.storage.sql.exec('DELETE FROM domains')
+  }
+
   async getEntityCounts(domainSlug?: string): Promise<Array<{ nounType: string; count: number }>> {
     this.ensureInit()
     return getEntityCounts(this.ctx.storage.sql, domainSlug)
