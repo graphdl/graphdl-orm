@@ -11,7 +11,7 @@ describe('handleGenerate', () => {
     const response = await handleGenerate(request, {} as any)
     expect(response.status).toBe(400)
     const body = await response.json() as any
-    expect(body.errors[0].message).toBe('domainId is required')
+    expect(body.errors[0].message).toBe('domainId or appId is required')
   })
 
   it('returns 400 for unknown outputFormat', async () => {

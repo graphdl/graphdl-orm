@@ -5,6 +5,7 @@ import {
   handleCreateEntity,
   handleDeleteEntity,
   populateDepthForEntity,
+  buildEntityLinks,
 } from './entity-routes'
 type TransitionOption = { transitionId: string; event: string; eventTypeId: string; targetStatus: string; targetStatusId: string }
 
@@ -22,11 +23,14 @@ describe('entity-routes', () => {
     expect(result.totalDocs).toBe(2)
   })
 
-  it('handleGetEntity returns single entity by ID', async () => {
+  it('handleGetEntity returns single entity by ID with _links', async () => {
     const stub = { get: vi.fn().mockResolvedValue({ id: 'e1', type: 'Noun', data: { name: 'Customer' }, version: 1 }) }
     const result = await handleGetEntity(stub)
     expect(result).toBeDefined()
     expect(result!.data.name).toBe('Customer')
+    expect(result!._links).toBeDefined()
+    expect(result!._links!.self).toEqual({ href: '/api/entities/Noun/e1' })
+    expect(result!._links!.collection).toEqual({ href: '/api/entities/Noun' })
   })
 
   it('handleListEntities filters by domain', async () => {
@@ -241,9 +245,9 @@ describe('entity-routes', () => {
     expect(result!.data.graphSchema).toEqual({ id: 'gs1', name: 'Tickets' })
   })
 
-  // ── entity response with transitions ──────────────────────────────
+  // ── transitions folded into _links (AREST whitepaper) ─────────────
 
-  describe('entity response with transitions', () => {
+  describe('transitions folded into _links', () => {
     const mockTransitions: TransitionOption[] = [
       {
         transitionId: 't1',
@@ -261,7 +265,7 @@ describe('entity-routes', () => {
       },
     ]
 
-    it('includes transitions when entity has _statusId', async () => {
+    it('includes transition events as links when transitions provided', async () => {
       const stub = {
         get: vi.fn().mockResolvedValue({
           id: 'e1',
@@ -276,17 +280,23 @@ describe('entity-routes', () => {
         }),
       }
 
-      // Transitions are now resolved by the engine at router level and passed in
       const result = await handleGetEntity(stub, {
         transitions: mockTransitions,
       })
 
       expect(result).toBeDefined()
-      expect(result!.transitions).toBeDefined()
-      expect(result!.transitions).toHaveLength(2)
+      expect(result!._links).toBeDefined()
+      expect(result!._links!.approve).toEqual({
+        href: '/api/entities/SupportRequest/e1/transition',
+        method: 'POST',
+      })
+      expect(result!._links!.reject).toEqual({
+        href: '/api/entities/SupportRequest/e1/transition',
+        method: 'POST',
+      })
     })
 
-    it('omits transitions when entity has no state machine', async () => {
+    it('_links has only navigation links when no transitions', async () => {
       const stub = {
         get: vi.fn().mockResolvedValue({
           id: 'e1',
@@ -299,10 +309,12 @@ describe('entity-routes', () => {
       const result = await handleGetEntity(stub, {})
 
       expect(result).toBeDefined()
-      expect(result!.transitions).toBeUndefined()
+      expect(result!._links).toBeDefined()
+      expect(result!._links!.self).toEqual({ href: '/api/entities/Noun/e1' })
+      expect(result!._links!.approve).toBeUndefined()
     })
 
-    it('each transition has event and target', async () => {
+    it('transition links include self and collection alongside events', async () => {
       const innerStub = {
         get: vi.fn().mockResolvedValue({
           id: 'e1', type: 'SupportRequest',
@@ -314,13 +326,15 @@ describe('entity-routes', () => {
         transitions: mockTransitions,
       })
 
-      const t = result!.transitions![0]
-      expect(t).toHaveProperty('event', 'approve')
-      expect(t).toHaveProperty('targetStatus', 'Approved')
-      expect(t).toHaveProperty('transitionId', 't1')
+      // Navigation links
+      expect(result!._links!.self).toEqual({ href: '/api/entities/SupportRequest/e1' })
+      expect(result!._links!.collection).toEqual({ href: '/api/entities/SupportRequest' })
+      // Transition links
+      expect(result!._links!.approve).toBeDefined()
+      expect(result!._links!.approve.method).toBe('POST')
     })
 
-    it('omits transitions when none provided', async () => {
+    it('omits transition links when none provided', async () => {
       const stub = {
         get: vi.fn().mockResolvedValue({
           id: 'e1',
@@ -338,7 +352,46 @@ describe('entity-routes', () => {
       const result = await handleGetEntity(stub)
 
       expect(result).toBeDefined()
-      expect(result!.transitions).toBeUndefined()
+      expect(result!._links).toBeDefined()
+      expect(result!._links!.self).toBeDefined()
+      // No transition links without transitions
+      expect(result!._links!.approve).toBeUndefined()
+    })
+  })
+
+  // ── buildEntityLinks ──────────────────────────────────────────────
+
+  describe('buildEntityLinks', () => {
+    it('returns self and collection links as objects', () => {
+      const links = buildEntityLinks('Order', 'ord-1')
+      expect(links.self).toEqual({ href: '/api/entities/Order/ord-1' })
+      expect(links.collection).toEqual({ href: '/api/entities/Order' })
+    })
+
+    it('includes domain in collection link', () => {
+      const links = buildEntityLinks('Order', 'ord-1', 'orders')
+      expect(links.collection).toEqual({ href: '/api/entities/Order?domain=orders' })
+    })
+
+    it('includes transition events as POST links', () => {
+      const transitions = [
+        { transitionId: 't1', event: 'place', targetStatus: 'Placed', targetStatusId: 's1' },
+        { transitionId: 't2', event: 'cancel', targetStatus: 'Cancelled', targetStatusId: 's2' },
+      ]
+      const links = buildEntityLinks('Order', 'ord-1', 'orders', transitions)
+      expect(links.place).toEqual({
+        href: '/api/entities/Order/ord-1/transition',
+        method: 'POST',
+      })
+      expect(links.cancel).toEqual({
+        href: '/api/entities/Order/ord-1/transition',
+        method: 'POST',
+      })
+    })
+
+    it('omits transition links when no transitions', () => {
+      const links = buildEntityLinks('Order', 'ord-1', 'orders')
+      expect(links.place).toBeUndefined()
     })
   })
 })

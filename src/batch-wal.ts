@@ -105,6 +105,48 @@ export function getBatch(sql: SqlLike, id: string): Batch | null {
 }
 
 /**
+ * Query all entities of a given type from ALL batches for a domain.
+ * Used by the generate pipeline to read metamodel entities from DomainDB
+ * without going through EntityDB DOs.
+ */
+export function queryEntitiesByType(sql: SqlLike, domain: string, entityType: string): BatchEntity[] {
+  const rows = sql.exec(
+    `SELECT entities FROM batches WHERE domain = ?`,
+    domain,
+  ).toArray()
+
+  const results: BatchEntity[] = []
+  for (const row of rows) {
+    const entities: BatchEntity[] = typeof (row as any).entities === 'string'
+      ? JSON.parse((row as any).entities)
+      : (row as any).entities
+    for (const e of entities) {
+      if (e.type === entityType) results.push(e)
+    }
+  }
+  return results
+}
+
+/**
+ * Query ALL entities from ALL batches for a domain.
+ */
+export function queryAllEntities(sql: SqlLike, domain: string): BatchEntity[] {
+  const rows = sql.exec(
+    `SELECT entities FROM batches WHERE domain = ?`,
+    domain,
+  ).toArray()
+
+  const results: BatchEntity[] = []
+  for (const row of rows) {
+    const entities: BatchEntity[] = typeof (row as any).entities === 'string'
+      ? JSON.parse((row as any).entities)
+      : (row as any).entities
+    results.push(...entities)
+  }
+  return results
+}
+
+/**
  * Marks a batch as committed. Sets status to 'committed' and records
  * the committed_at timestamp.
  */

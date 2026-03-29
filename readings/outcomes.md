@@ -7,6 +7,7 @@ Every evaluation path returns either valid claims, violation facts, failure fact
 
 Violation(.id) is an entity type.
 Failure(.id) is an entity type.
+Batch(.id) is an entity type.
 
 ## Value Types
 

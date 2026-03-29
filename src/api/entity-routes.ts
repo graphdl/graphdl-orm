@@ -38,9 +38,7 @@ export interface EntityRecord {
   deletedAt?: string
   createdAt?: string
   updatedAt?: string
-  transitions?: TransitionInfo[]
-  _links?: Record<string, string>
-  _actions?: HateoasAction[]
+  _links?: Record<string, { href: string; method?: string }>
 }
 
 // ---------------------------------------------------------------------------
@@ -56,7 +54,7 @@ export interface ListResult {
   hasNextPage: boolean
   hasPrevPage: boolean
   warnings?: string[]
-  _links?: Record<string, string>
+  _links?: Record<string, string>  // List-level navigation links remain plain strings
 }
 
 export interface PaginationOpts {
@@ -82,16 +80,8 @@ export interface DepthOpts {
 }
 
 // ---------------------------------------------------------------------------
-// HATEOAS link + action builders
+// HATEOAS link builders
 // ---------------------------------------------------------------------------
-
-export interface HateoasAction {
-  name: string
-  method: string
-  href: string
-  body?: Record<string, unknown>
-  target?: string
-}
 
 /**
  * Reorder entity data fields by graph schema role order.
@@ -137,56 +127,28 @@ function orderData(data: Record<string, unknown>, fieldOrder: string[]): Record<
  * The URL structure is a projection of the graph schema — entity types
  * and their relationships are declared in readings, not hardcoded.
  */
-export function buildEntityLinks(type: string, id: string, domain?: string): Record<string, string> {
+export function buildEntityLinks(
+  type: string,
+  id: string,
+  domain?: string,
+  transitions?: TransitionInfo[],
+): Record<string, { href: string; method?: string }> {
   const encoded = encodeURIComponent(type)
   const base = `/api/entities/${encoded}/${id}`
   const qs = domain ? `?domain=${domain}` : ''
-  return {
-    self: base,
-    collection: `/api/entities/${encoded}${qs}`,
-    edit: base,
-    delete: base,
-    transitions: `${base}/transitions${qs}`,
-    transition: `${base}/transition`,
-    stream: `/ws${qs}`,
-    evaluate: '/api/evaluate',
-    ...(domain ? { domain: `/api/entities/Domain?domain=${domain}` } : {}),
+  const links: Record<string, { href: string; method?: string }> = {
+    self: { href: base },
+    collection: { href: `/api/entities/${encoded}${qs}` },
   }
-}
 
-/**
- * Action menu: state-machine transitions + CRUDL operations.
- *
- * Transitions come from the engine's compiled state machine — not passed
- * as pre-computed data. Call getTransitions(type, currentStatus) to get
- * valid transitions from the current state.
- *
- * CRUD actions are universal. Deontic constraints (forbidden/permitted)
- * would further filter these — evaluated by the engine at request time.
- */
-export function buildActions(type: string, id: string, transitions?: TransitionInfo[]): HateoasAction[] {
-  const encoded = encodeURIComponent(type)
-  const base = `/api/entities/${encoded}/${id}`
-  const actions: HateoasAction[] = []
-
-  // State machine transitions — derived from readings via the engine
+  // Transitions as links (per AREST whitepaper — transitions ARE links)
   if (transitions) {
     for (const t of transitions) {
-      actions.push({
-        name: t.event,
-        method: 'POST',
-        href: `${base}/transition`,
-        body: { event: t.event },
-        target: t.targetStatus,
-      })
+      links[t.event] = { href: `${base}/transition`, method: 'POST' }
     }
   }
 
-  // Universal CRUD — deontic constraints may restrict these at evaluation time
-  actions.push({ name: 'edit', method: 'PATCH', href: base })
-  actions.push({ name: 'delete', method: 'DELETE', href: base })
-
-  return actions
+  return links
 }
 
 /** Navigation links for a paginated list. */
@@ -341,7 +303,7 @@ export async function handleListEntities(
  * Fetch a single entity from its EntityDB DO.
  * Returns null if not found or soft-deleted.
  * When depth >= 1, resolves Id-suffixed fields to full entity objects.
- * When opts.transitions is provided, includes valid transitions in the response.
+ * When opts.transitions is provided, they are folded into _links per the AREST whitepaper.
  */
 export async function handleGetEntity(
   stub: EntityReadStub,
@@ -355,15 +317,8 @@ export async function handleGetEntity(
     entity.data = await populateDepthForEntity(entity, depth, opts.getStub)
   }
 
-  // Transitions are resolved by the engine at the router level
-  // (via getTransitions from engine.ts) and passed in opts.transitions.
-  if (opts?.transitions) {
-    entity.transitions = opts.transitions
-  }
-
-  // HATEOAS links and actions
-  entity._links = buildEntityLinks(entity.type, entity.id, opts?.domain)
-  entity._actions = buildActions(entity.type, entity.id, entity.transitions)
+  // HATEOAS links — transitions folded in per AREST whitepaper
+  entity._links = buildEntityLinks(entity.type, entity.id, opts?.domain, opts?.transitions)
 
   return entity
 }
@@ -375,7 +330,7 @@ export async function handleGetEntity(
 export interface CreateEntityResult {
   id: string
   version: number
-  _links?: Record<string, string>
+  _links?: Record<string, { href: string; method?: string }>
 }
 
 /**

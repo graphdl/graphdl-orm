@@ -10,8 +10,8 @@ import { handleVerify } from './verify'
 import { handleEvaluate, handleSynthesize } from './evaluate'
 import { handleConceptualQuery } from './conceptual-query'
 import { induceConstraints } from '../csdp/induce'
-import { handleListEntities, handleGetEntity, handleCreateEntity, handleDeleteEntity, buildEntityLinks, buildActions } from './entity-routes'
-import { loadDomainSchema, loadDomainAndPopulation, getTransitions, applyCommand } from './engine'
+import { handleListEntities, handleGetEntity, handleCreateEntity, handleDeleteEntity, buildEntityLinks } from './entity-routes'
+import { loadDomainSchema, loadDomainAndPopulation, getTransitions, applyCommand, querySchema, forwardChain, getNounSchemas } from './engine'
 
 // ── Collection slug → noun type resolution ───────────────────────────
 // Resolved dynamically from the Registry via nounToSlug convention.
@@ -452,7 +452,6 @@ router.get('/api/entities/:noun', async (request, env: Env) => {
     createdAt: e.createdAt,
     updatedAt: e.updatedAt,
     _links: buildEntityLinks(e.type, e.id, domainId || undefined),
-    _actions: buildActions(e.type, e.id),
   }))
 
   // Client-side filtering by where params
@@ -490,7 +489,7 @@ router.get('/api/entities/:noun/:id', async (request, env: Env) => {
   const url = new URL(request.url)
   const domainSlug = url.searchParams.get('domain') || undefined
 
-  // Resolve transitions from engine's compiled state machine
+  // Load domain schema and resolve transitions from engine's compiled state machine
   let transitions: Array<{ transitionId: string; event: string; targetStatus: string; targetStatusId: string }> = []
   try {
     const registry = getRegistryDO(env, 'global') as any
@@ -516,9 +515,7 @@ router.get('/api/entities/:noun/:id', async (request, env: Env) => {
     version: entity.version,
     createdAt: entity.createdAt,
     updatedAt: entity.updatedAt,
-    ...(entity.transitions && { transitions: entity.transitions }),
     ...(entity._links && { _links: entity._links }),
-    ...(entity._actions && { _actions: entity._actions }),
   })
 })
 
@@ -544,6 +541,113 @@ router.delete('/api/entities/:noun/:id', async (request, env: Env) => {
 })
 
 // ── Collection CRUD ──────────────────────────────────────────────────
+
+// ── Fact Query: partial application of graph schemas ────────────────
+// GET /api/facts/:schema?domain=X&bind[NounA]=value&target=NounB
+// A query IS a partially applied Construction. Bind some roles, get the free roles.
+// The engine loads the domain schema, federates to populate facts, forward-chains
+// derivation rules, then applies Filter(predicate) to return matching values.
+
+router.get('/api/facts/:schema', async (request, env: Env) => {
+  const { schema } = request.params
+  const url = new URL(request.url)
+  const domainSlug = url.searchParams.get('domain')
+  const targetRole = url.searchParams.get('target')
+
+  if (!domainSlug) return error(400, { errors: [{ message: 'domain query param required' }] })
+  if (!targetRole) return error(400, { errors: [{ message: 'target query param required (the role to extract)' }] })
+
+  // Collect bind[NounName]=value pairs from query string
+  const bindings: Array<[string, string]> = []
+  for (const [key, value] of url.searchParams.entries()) {
+    const match = key.match(/^bind\[(.+)\]$/)
+    if (match) {
+      bindings.push([match[1], value])
+    }
+  }
+
+  try {
+    const registry = getRegistryDO(env, 'global') as any
+    const getStub = (eid: string) => getEntityDO(env, eid) as any
+
+    // Load domain schema + build federated population
+    const populationJson = await loadDomainAndPopulation(registry, getStub, domainSlug)
+
+    // Forward-chain derivation rules (including joins)
+    const derived = forwardChain(populationJson)
+
+    // Merge derived facts into population
+    const population = JSON.parse(populationJson)
+    for (const fact of derived) {
+      if (!population.facts[fact.factTypeId]) population.facts[fact.factTypeId] = []
+      population.facts[fact.factTypeId].push({
+        factTypeId: fact.factTypeId,
+        bindings: fact.bindings,
+      })
+    }
+    const enrichedPopJson = JSON.stringify(population)
+
+    // Resolve the schema ID — try exact match, then reading-format match
+    // The schema param can be a graph schema ID or a reading like "Vehicle is resolved to Chrome Style Candidate"
+    const schemaId = decodeURIComponent(schema)
+
+    // Resolve role names to 1-indexed role positions using the compiled schema.
+    // The schema's role_names array maps position → noun name.
+    // We need to find the schema in the compiled model to get its role_names.
+    // Try synthesize_noun for the first bound noun to discover the schema's roles.
+    let roleNames: string[] = []
+    try {
+      // Use the schema ID to look up role names from the compiled model
+      // getNounSchemas returns schemas where a noun plays role 0
+      // We need a more direct lookup — use the population's fact type to infer roles
+      const popFacts = population.facts[schemaId]
+      if (popFacts && popFacts.length > 0) {
+        roleNames = popFacts[0].bindings.map((b: [string, string]) => b[0])
+      }
+    } catch { /* fall through to index-based */ }
+
+    const filterBindings: Array<[number, string]> = []
+    for (const [noun, value] of bindings) {
+      const idx = parseInt(noun)
+      if (!isNaN(idx)) {
+        filterBindings.push([idx, value])
+      } else {
+        // Map noun name to 1-indexed role position
+        const roleIdx = roleNames.indexOf(noun)
+        if (roleIdx >= 0) {
+          filterBindings.push([roleIdx + 1, value])
+        }
+      }
+    }
+
+    // Resolve target role: name or 1-indexed number
+    const targetIdx = parseInt(targetRole)
+    let targetRoleIndex: number
+    if (!isNaN(targetIdx)) {
+      targetRoleIndex = targetIdx
+    } else {
+      const idx = roleNames.indexOf(targetRole)
+      targetRoleIndex = idx >= 0 ? idx + 1 : 2
+    }
+
+    const result = querySchema(schemaId, targetRoleIndex, filterBindings, enrichedPopJson)
+
+    return json({
+      schema: schemaId,
+      target: targetRole,
+      bindings: Object.fromEntries(bindings),
+      matches: result.matches,
+      count: result.count,
+      derived: derived.length,
+      _links: {
+        self: { href: url.pathname + url.search },
+        domain: { href: `/api/entities/Domain?domain=${domainSlug}` },
+      },
+    })
+  } catch (e: any) {
+    return error(500, { errors: [{ message: e.message || 'Query failed' }] })
+  }
+})
 
 /** GET /api/:collection — list/find */
 // ── Conceptual Query (before generic :collection routes) ─────────────
@@ -614,7 +718,6 @@ router.get('/api/:collection', async (request, env: Env) => {
     createdAt: e.createdAt,
     updatedAt: e.updatedAt,
     _links: buildEntityLinks(e.type, e.id, domainId || undefined),
-    _actions: buildActions(e.type, e.id),
   }))
 
   // Client-side filtering by where params
@@ -685,9 +788,7 @@ router.get('/api/:collection/:id', async (request, env: Env) => {
     version: entity.version,
     createdAt: entity.createdAt,
     updatedAt: entity.updatedAt,
-    ...(entity.transitions && { transitions: entity.transitions }),
     ...(entity._links && { _links: entity._links }),
-    ...(entity._actions && { _actions: entity._actions }),
   })
 })
 

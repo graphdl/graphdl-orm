@@ -3,7 +3,11 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "bin": {
+    "graphdl": "./src/cli/import.ts"
+  },
   "scripts": {
+    "import": "tsx src/cli/import.ts",
     "build:wasm": "cd crates/fol-engine && wasm-pack build --target web --out-dir pkg",
     "build:wasm:test": "cd crates/fol-engine && cargo test",
     "build": "yarn build:wasm",
