@@ -45,6 +45,20 @@ pub struct NounDef {
     /// When present and not ["id"], entity IDs are derived from the field value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ref_scheme: Option<Vec<String>>,
+    /// If this noun objectifies a fact type, the fact type reading.
+    /// Objectification requires a spanning UC on the objectified fact type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub objectifies: Option<String>,
+    /// Subtype classification (Halpin, "Subtyping Revisited", 2006):
+    /// - "asserted": declared without derivation rule
+    /// - "derived": fully determined by derivation rule(s)
+    /// - "semi-derived": partially determined
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtype_kind: Option<String>,
+    /// Whether instances can migrate between subtypes at runtime.
+    /// true = rigid (fixed classification), false = flexible (can change)
+    #[serde(default)]
+    pub rigid: bool,
 }
 
 /// A derivation rule in the IR — compiled to a DeriveFn at compile time.
@@ -59,6 +73,22 @@ pub struct DerivationRuleDef {
     pub consequent_fact_type_id: String,
     /// Derivation kind for compile dispatch
     pub kind: DerivationKind,
+    /// For Join rules: noun names that must have equal values across all
+    /// antecedent facts that mention them. Enforces both:
+    /// - Value join keys (e.g., "Squish VIN" matches Vehicle↔Candidate↔Listing)
+    /// - Entity consistency (e.g., "Chrome Style Candidate" is the same entity
+    ///   across candidate_squishvin and candidate_trim facts)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub join_on: Vec<String>,
+    /// For Join rules: cross-noun match predicates. Each pair (left, right)
+    /// requires that the value of left contains the value of right (case-insensitive).
+    /// Used for fuzzy matching like "Chrome Trim" contains "Listing Trim".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub match_on: Vec<(String, String)>,
+    /// For Join rules: noun names to include in the consequent bindings.
+    /// If empty, all bindings from the joined facts are included.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub consequent_bindings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -68,6 +98,7 @@ pub enum DerivationKind {
     ModusPonens,        // If A then B, A holds -> B holds
     Transitivity,       // A->B, B->C -> A->C
     ClosedWorldNegation, // Not derivable under CWA -> false
+    Join,               // Cross-fact-type equi-join on shared noun names
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -146,12 +177,38 @@ pub struct Population {
 }
 
 /// A single fact instance — binds references to roles in a fact type.
+/// Part of Codd's named set (base facts) or expressible set (derived facts).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FactInstance {
     pub fact_type_id: String,
     /// Vec of (role_noun_name, reference_value)
     pub bindings: Vec<(String, String)>,
+}
+
+/// Extended fact instance with provenance tracking.
+/// Distinguishes Codd's named set (base) from expressible set (derived).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProvenancedFact {
+    pub fact_type_id: String,
+    pub bindings: Vec<(String, String)>,
+    /// true if derived by forward chaining, false if asserted by command
+    pub derived: bool,
+    /// ID of the derivation rule that produced this fact (if derived)
+    pub derived_by: Option<String>,
+}
+
+impl Population {
+    /// Track which fact type IDs contain derived facts.
+    /// Base facts (named set) are those not in this set.
+    /// Derived facts (expressible set) are those produced by forward chaining.
+    pub fn derived_fact_types(&self) -> std::collections::HashSet<String> {
+        // By convention, derived fact types are tracked externally
+        // (by the forward chaining result). This method is a placeholder
+        // for when provenance tracking is integrated into Population.
+        std::collections::HashSet::new()
+    }
 }
 
 /// The response being evaluated (for deontic text constraints).
@@ -171,7 +228,14 @@ pub struct Violation {
     pub constraint_id: String,
     pub constraint_text: String,
     pub detail: String,
+    /// Alethic violations are structural impossibilities (always reject).
+    /// Deontic violations are reportable but may not reject.
+    #[serde(default = "default_alethic")]
+    pub alethic: bool,
 }
+
+#[allow(dead_code)] // Used by serde default attribute
+fn default_alethic() -> bool { true }
 
 // ── Forward Inference & Synthesis Types ──────────────────────────────
 

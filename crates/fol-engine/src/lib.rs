@@ -8,9 +8,9 @@
 //   query_population   — filter a population by predicate, return matching entities
 
 pub mod ast;
-mod types;
-mod compile;
-mod evaluate;
+pub mod types;
+pub mod compile;
+pub mod evaluate;
 mod query;
 mod induce;
 pub mod rmap;
@@ -18,14 +18,99 @@ pub mod naming;
 pub mod validate;
 pub mod conceptual_query;
 pub mod parse_rule;
+pub mod parse_forml2;
+pub mod verbalize;
 pub mod arest;
 
 use wasm_bindgen::prelude::*;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 
-use types::{ConstraintIR, ResponseContext, Population, Violation, SynthesisResult, WorldAssumption};
+use types::{ConstraintIR, ResponseContext, Population, Violation, DerivedFact, SynthesisResult, WorldAssumption};
+
+/// Convert a JsValue to a Rust type via serde-wasm-bindgen (no JSON string roundtrip).
+fn from_js<T: serde::de::DeserializeOwned>(val: &JsValue) -> Result<T, JsValue> {
+    serde_wasm_bindgen::from_value(val.clone())
+        .map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+/// Convert a Rust type to JsValue via serde-wasm-bindgen (no JSON string roundtrip).
+fn to_js<T: serde::Serialize>(val: &T) -> JsValue {
+    serde_wasm_bindgen::to_value(val).unwrap_or(JsValue::NULL)
+}
 use compile::CompiledModel;
+
+/// Lightweight transition record for JsValue serialization (get_transitions_wasm).
+#[derive(serde::Serialize)]
+struct Transition {
+    from: String,
+    to: String,
+    event: String,
+}
+
+/// Lightweight fact-event record for JsValue serialization (resolve_fact_event).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FactEventRecord {
+    fact_type_id: String,
+    event_name: String,
+    target_noun: String,
+}
+
+/// Debug state machine info for JsValue serialization.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DebugSmInfo {
+    noun_name: String,
+    initial: String,
+    transitions: usize,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DebugCompiledState {
+    loaded: bool,
+    state_machines: Vec<DebugSmInfo>,
+    noun_to_state_machines: std::collections::HashMap<String, usize>,
+}
+
+#[derive(serde::Serialize)]
+struct DebugCompiledStateEmpty {
+    loaded: bool,
+}
+
+/// Result of prepare_entity for JsValue serialization.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PrepareEntityResult {
+    initial_state: Option<String>,
+    violations: Vec<Violation>,
+    derived_facts: Vec<DerivedFact>,
+    fact_event: Option<FactEventRecord>,
+}
+
+/// A fact projected from an entity row using compiled graph schema references.
+/// This is the output of α(project) applied to the 3NF row.
+#[derive(serde::Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ProjectedFact {
+    /// The compiled graph schema ID (from the engine, not string concatenation)
+    schema_id: String,
+    /// The natural language reading (e.g., "Customer has name")
+    reading: String,
+    /// Role bindings: [(role_name, value), ...] in schema role order
+    bindings: Vec<(String, String)>,
+}
+
+/// Schema mapping entry: maps a field name to its compiled graph schema.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FieldSchemaMapping {
+    field_name: String,
+    schema_id: String,
+    reading: String,
+    role_names: Vec<String>,
+}
 
 struct CompiledState {
     ir: ConstraintIR,
@@ -57,78 +142,51 @@ pub fn load_ir(ir_json: &str) -> Result<(), JsValue> {
 }
 
 #[wasm_bindgen]
-pub fn evaluate_response(response_json: &str, population_json: &str) -> String {
+pub fn evaluate_response(response_val: JsValue, population_val: JsValue) -> Result<JsValue, JsValue> {
     let store = state_store().lock().unwrap();
     let state = match store.as_ref() {
         Some(s) => s,
-        None => return serde_json::to_string(&Vec::<Violation>::new()).unwrap(),
+        None => return Ok(to_js(&Vec::<Violation>::new())),
     };
 
-    let response: ResponseContext = match serde_json::from_str(response_json) {
-        Ok(r) => r,
-        Err(e) => {
-            let v = vec![Violation {
-                constraint_id: "PARSE_ERROR".to_string(),
-                constraint_text: String::new(),
-                detail: format!("Failed to parse response: {}", e),
-            }];
-            return serde_json::to_string(&v).unwrap();
-        }
-    };
-
-    let population: Population = match serde_json::from_str(population_json) {
-        Ok(p) => p,
-        Err(e) => {
-            let v = vec![Violation {
-                constraint_id: "PARSE_ERROR".to_string(),
-                constraint_text: String::new(),
-                detail: format!("Failed to parse population: {}", e),
-            }];
-            return serde_json::to_string(&v).unwrap();
-        }
-    };
+    let response: ResponseContext = from_js(&response_val)?;
+    let population: Population = from_js(&population_val)?;
 
     // Evaluate via AST reduction
     let violations = evaluate::evaluate_via_ast(&state.model, &response, &population);
-    serde_json::to_string(&violations).unwrap()
+    Ok(to_js(&violations))
 }
 
 #[wasm_bindgen]
-pub fn synthesize_noun(noun_name: &str, depth: usize) -> String {
+pub fn synthesize_noun(noun_name: &str, depth: usize) -> JsValue {
     let store = state_store().lock().unwrap();
     let state = match store.as_ref() {
         Some(s) => s,
-        None => return serde_json::to_string(&SynthesisResult::empty(noun_name)).unwrap(),
+        None => return to_js(&SynthesisResult::empty(noun_name)),
     };
 
     let result = evaluate::synthesize(&state.model, &state.ir, noun_name, depth);
-    serde_json::to_string(&result).unwrap()
+    to_js(&result)
 }
 
 #[wasm_bindgen]
-pub fn forward_chain_population(population_json: &str) -> String {
+pub fn forward_chain_population(population_val: JsValue) -> Result<JsValue, JsValue> {
     let store = state_store().lock().unwrap();
-    let state = match store.as_ref() {
-        Some(s) => s,
-        None => return "[]".to_string(),
-    };
+    let state = store.as_ref().ok_or_else(|| JsValue::from_str("no IR loaded"))?;
 
-    let mut population: Population = match serde_json::from_str(population_json) {
-        Ok(p) => p,
-        Err(e) => return format!("{{\"error\":\"{}\"}}", e),
-    };
+    let mut population: Population = from_js(&population_val)?;
 
     // Forward chain via AST reduction
     let derived = evaluate::forward_chain_ast(&state.model, &mut population);
-    serde_json::to_string(&derived).unwrap()
+    Ok(to_js(&derived))
 }
 
 #[wasm_bindgen]
-pub fn query_population_wasm(population_json: &str, predicate_json: &str) -> String {
-    let population: Population = serde_json::from_str(population_json).unwrap_or_default();
-    let predicate: query::QueryPredicate = serde_json::from_str(predicate_json).unwrap_or_default();
+pub fn query_population_wasm(population_val: JsValue, predicate_val: JsValue) -> Result<JsValue, JsValue> {
+    let population: Population = from_js(&population_val)?;
+    let predicate: query::QueryPredicate = from_js(&predicate_val)?;
     let result = query::query_population(&population, &predicate);
-    serde_json::to_string(&result).unwrap_or_else(|_| r#"{"matches":[],"count":0}"#.to_string())
+    Ok(to_js(&result))
 }
 
 /// Query a population using the AST-based partial application model.
@@ -143,58 +201,46 @@ pub fn query_population_wasm(population_json: &str, predicate_json: &str) -> Str
 pub fn query_schema_wasm(
     schema_id: &str,
     target_role: usize,
-    filter_json: &str,
-    population_json: &str,
-) -> String {
+    filter_val: JsValue,
+    population_val: JsValue,
+) -> Result<JsValue, JsValue> {
     let store = state_store().lock().unwrap();
-    let state = match store.as_ref() {
-        Some(s) => s,
-        None => return r#"{"matches":[],"count":0}"#.to_string(),
-    };
+    let state = store.as_ref().ok_or_else(|| JsValue::from_str("no IR loaded"))?;
 
-    let schema = match state.model.schemas.get(schema_id) {
-        Some(s) => s,
-        None => return r#"{"matches":[],"count":0,"error":"schema not found"}"#.to_string(),
-    };
+    let schema = state.model.schemas.get(schema_id)
+        .ok_or_else(|| JsValue::from_str("schema not found"))?;
 
-    let population: Population = serde_json::from_str(population_json).unwrap_or_default();
-    let filters: Vec<(usize, String)> = serde_json::from_str(filter_json).unwrap_or_default();
+    let population: Population = from_js(&population_val)?;
+    let filters: Vec<(usize, String)> = from_js(&filter_val)?;
     let filter_refs: Vec<(usize, &str)> = filters.iter().map(|(i, v)| (*i, v.as_str())).collect();
 
     let matches = query::query_with_ast(&population, schema, target_role, &filter_refs);
     let count = matches.len();
 
-    serde_json::to_string(&query::QueryResult { matches, count })
-        .unwrap_or_else(|_| r#"{"matches":[],"count":0}"#.to_string())
+    Ok(to_js(&query::QueryResult { matches, count }))
 }
 
 /// Induce constraints and rules from a population.
 /// Given observed facts, discover the UC, MC, FC, SS constraints and
 /// derivation rules that govern the data. This is the inverse of evaluation.
 #[wasm_bindgen]
-pub fn induce_from_population(population_json: &str) -> String {
+pub fn induce_from_population(population_val: JsValue) -> Result<JsValue, JsValue> {
     let store = state_store().lock().unwrap();
-    let state = match store.as_ref() {
-        Some(s) => s,
-        None => return r#"{"constraints":[],"rules":[],"populationStats":{"factTypeCount":0,"totalFacts":0,"entityCount":0}}"#.to_string(),
-    };
+    let state = store.as_ref().ok_or_else(|| JsValue::from_str("no IR loaded"))?;
 
-    let population: Population = serde_json::from_str(population_json).unwrap_or_default();
+    let population: Population = from_js(&population_val)?;
     let result = induce::induce(&state.ir, &population);
-    serde_json::to_string(&result).unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string())
+    Ok(to_js(&result))
 }
 
 /// Run a compiled state machine by folding events through the transition function.
 /// Events are [(event_name, payload)] pairs. Returns the final state.
 #[wasm_bindgen]
-pub fn run_machine_wasm(noun_name: &str, events_json: &str, population_json: &str) -> String {
+pub fn run_machine_wasm(noun_name: &str, events_val: JsValue, _population_val: JsValue) -> Result<JsValue, JsValue> {
     let store = state_store().lock().unwrap();
-    let state = match store.as_ref() {
-        Some(s) => s,
-        None => return r#"{"error":"no IR loaded"}"#.to_string(),
-    };
+    let state = store.as_ref().ok_or_else(|| JsValue::from_str("no IR loaded"))?;
 
-    let events: Vec<(String, String)> = serde_json::from_str(events_json).unwrap_or_default();
+    let events: Vec<(String, String)> = from_js(&events_val)?;
     let event_names: Vec<&str> = events.iter().map(|(e, _)| e.as_str()).collect();
 
     // Find the state machine for this noun and run via AST reduction
@@ -202,79 +248,84 @@ pub fn run_machine_wasm(noun_name: &str, events_json: &str, population_json: &st
     match machine_idx.and_then(|&idx| state.model.state_machines.get(idx)) {
         Some(machine) => {
             let final_state = evaluate::run_machine_ast(machine, &event_names);
-            serde_json::to_string(&final_state).unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string())
+            Ok(to_js(&final_state))
         }
-        None => format!(r#"{{"error":"no state machine for noun '{}'"}}"#, noun_name),
+        None => Err(JsValue::from_str(&format!("no state machine for noun '{}'", noun_name))),
     }
 }
 
 /// Get valid transitions from a given status in a compiled state machine.
 /// Returns JSON: [{ "from": "status", "to": "target", "event": "eventName" }]
 #[wasm_bindgen]
-pub fn get_transitions_wasm(noun_name: &str, current_status: &str) -> String {
+pub fn get_transitions_wasm(noun_name: &str, current_status: &str) -> JsValue {
     let store = state_store().lock().unwrap();
     let state = match store.as_ref() {
         Some(s) => s,
-        None => return "[]".to_string(),
+        None => return to_js(&Vec::<Transition>::new()),
     };
 
     let machine_idx = state.model.noun_index.noun_to_state_machines.get(noun_name);
     match machine_idx.and_then(|&idx| state.model.state_machines.get(idx)) {
         Some(machine) => {
-            let valid: Vec<_> = machine.transition_table.iter()
+            let valid: Vec<Transition> = machine.transition_table.iter()
                 .filter(|(from, _, _)| from == current_status)
-                .map(|(from, to, event)| {
-                    serde_json::json!({ "from": from, "to": to, "event": event })
+                .map(|(from, to, event)| Transition {
+                    from: from.clone(),
+                    to: to.clone(),
+                    event: event.clone(),
                 })
                 .collect();
-            serde_json::to_string(&valid).unwrap_or_else(|_| "[]".to_string())
+            to_js(&valid)
         }
-        None => "[]".to_string(),
+        None => to_js(&Vec::<Transition>::new()),
     }
 }
 
 /// Given a fact type ID, resolve what event should fire on which state machine.
 /// Returns JSON: { "factTypeId": "...", "eventName": "...", "targetNoun": "..." } or null.
 #[wasm_bindgen]
-pub fn resolve_fact_event(fact_type_id: &str) -> String {
+pub fn resolve_fact_event(fact_type_id: &str) -> JsValue {
     let store = state_store().lock().unwrap();
     let state = match store.as_ref() {
         Some(s) => s,
-        None => return "null".to_string(),
+        None => return JsValue::NULL,
     };
     match state.model.fact_events.get(fact_type_id) {
-        Some(fe) => serde_json::to_string(&serde_json::json!({
-            "factTypeId": fe.fact_type_id,
-            "eventName": fe.event_name,
-            "targetNoun": fe.target_noun,
-        })).unwrap_or_else(|_| "null".to_string()),
-        None => "null".to_string(),
+        Some(fe) => {
+            let record = FactEventRecord {
+                fact_type_id: fe.fact_type_id.clone(),
+                event_name: fe.event_name.clone(),
+                target_noun: fe.target_noun.clone(),
+            };
+            to_js(&record)
+        }
+        None => JsValue::NULL,
     }
 }
 
 /// Debug: return the compiled model state (noun-to-SM mapping)
 #[wasm_bindgen]
-pub fn debug_compiled_state() -> String {
+pub fn debug_compiled_state() -> JsValue {
     let store = state_store().lock().unwrap();
     match store.as_ref() {
         Some(s) => {
-            let sm_info: Vec<serde_json::Value> = s.model.state_machines.iter()
-                .map(|sm| serde_json::json!({
-                    "nounName": sm.noun_name,
-                    "initial": sm.initial,
-                    "transitions": sm.transition_table.len(),
-                }))
+            let sm_info: Vec<DebugSmInfo> = s.model.state_machines.iter()
+                .map(|sm| DebugSmInfo {
+                    noun_name: sm.noun_name.clone(),
+                    initial: sm.initial.clone(),
+                    transitions: sm.transition_table.len(),
+                })
                 .collect();
             let noun_map: std::collections::HashMap<&str, usize> = s.model.noun_index.noun_to_state_machines.iter()
                 .map(|(k, v)| (k.as_str(), *v))
                 .collect();
-            serde_json::to_string(&serde_json::json!({
-                "loaded": true,
-                "stateMachines": sm_info,
-                "nounToStateMachines": noun_map,
-            })).unwrap_or_else(|_| r#"{"error":"serialization"}"#.to_string())
+            to_js(&DebugCompiledState {
+                loaded: true,
+                state_machines: sm_info,
+                noun_to_state_machines: noun_map.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+            })
         }
-        None => r#"{"loaded":false}"#.to_string(),
+        None => to_js(&DebugCompiledStateEmpty { loaded: false }),
     }
 }
 
@@ -282,21 +333,14 @@ pub fn debug_compiled_state() -> String {
 /// One function application. One state transfer.
 /// Returns the complete result: entities, status, transitions, violations, derived facts.
 #[wasm_bindgen]
-pub fn apply_command_wasm(command_json: &str, population_json: &str) -> String {
+pub fn apply_command_wasm(command_val: JsValue, population_val: JsValue) -> Result<JsValue, JsValue> {
     let store = state_store().lock().unwrap();
-    let state = match store.as_ref() {
-        Some(s) => s,
-        None => return r#"{"entities":[],"status":null,"transitions":[],"violations":[],"derivedCount":0,"rejected":false}"#.to_string(),
-    };
+    let state = store.as_ref().ok_or_else(|| JsValue::from_str("no IR loaded"))?;
 
-    let command: arest::Command = match serde_json::from_str(command_json) {
-        Ok(c) => c,
-        Err(e) => return format!(r#"{{"error":"Invalid command: {}"}}"#, e),
-    };
-
-    let population: Population = serde_json::from_str(population_json).unwrap_or_default();
+    let command: arest::Command = from_js(&command_val)?;
+    let population: Population = from_js(&population_val)?;
     let result = arest::apply_command(&state.model, &command, &population);
-    serde_json::to_string(&result).unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string())
+    Ok(to_js(&result))
 }
 
 /// Prepare entity creation: given a noun name, return the initial state
@@ -306,12 +350,9 @@ pub fn apply_command_wasm(command_json: &str, population_json: &str) -> String {
 ///
 /// Returns JSON: { initialState: "Draft" | null, violations: [...], derivedFacts: [...] }
 #[wasm_bindgen]
-pub fn prepare_entity(noun_name: &str, fields_json: &str, population_json: &str) -> String {
+pub fn prepare_entity(noun_name: &str, _fields_val: JsValue, population_val: JsValue) -> Result<JsValue, JsValue> {
     let store = state_store().lock().unwrap();
-    let state = match store.as_ref() {
-        Some(s) => s,
-        None => return r#"{"initialState":null,"violations":[],"derivedFacts":[]}"#.to_string(),
-    };
+    let state = store.as_ref().ok_or_else(|| JsValue::from_str("no IR loaded"))?;
 
     // 1. State machine initialization — find initial state for this noun
     let initial_state = state.model.noun_index.noun_to_state_machines.get(noun_name)
@@ -320,7 +361,7 @@ pub fn prepare_entity(noun_name: &str, fields_json: &str, population_json: &str)
 
     // 2. Deontic constraint evaluation
     let response = types::ResponseContext { text: String::new(), sender_identity: None, fields: None };
-    let population: types::Population = serde_json::from_str(population_json).unwrap_or_default();
+    let population: types::Population = from_js(&population_val)?;
     let violations = evaluate::evaluate_via_ast(&state.model, &response, &population);
 
     // 3. Forward chain derivation rules
@@ -330,14 +371,130 @@ pub fn prepare_entity(noun_name: &str, fields_json: &str, population_json: &str)
     // 4. Fact-to-event resolution — does creating this entity trigger a transition?
     let fact_event = state.model.fact_events.values()
         .find(|fe| fe.target_noun == noun_name)
-        .map(|fe| serde_json::json!({ "eventName": fe.event_name, "factTypeId": fe.fact_type_id }));
+        .map(|fe| FactEventRecord {
+            fact_type_id: fe.fact_type_id.clone(),
+            event_name: fe.event_name.clone(),
+            target_noun: fe.target_noun.clone(),
+        });
 
-    serde_json::to_string(&serde_json::json!({
-        "initialState": initial_state,
-        "violations": violations,
-        "derivedFacts": derived,
-        "factEvent": fact_event,
-    })).unwrap_or_else(|_| r#"{"initialState":null,"violations":[],"derivedFacts":[]}"#.to_string())
+    Ok(to_js(&PrepareEntityResult {
+        initial_state,
+        violations,
+        derived_facts: derived,
+        fact_event,
+    }))
+}
+
+/// Project an entity's fields into facts using compiled graph schema references.
+///
+/// This is α(project) applied to the 3NF row: for each field, find the compiled
+/// schema where this noun plays role 0 and the field name matches role 1's noun name,
+/// then produce a fact with the compiled schema ID and proper bindings.
+///
+/// Fields that don't match a compiled schema are included with provisional IDs
+/// (the reading format: "Noun has field"). System fields (starting with _) are excluded.
+#[wasm_bindgen]
+pub fn project_entity_wasm(noun_name: &str, entity_id: &str, fields_val: JsValue) -> Result<JsValue, JsValue> {
+    let store = state_store().lock().unwrap();
+    let fields: std::collections::HashMap<String, String> = from_js(&fields_val)?;
+
+    let state = match store.as_ref() {
+        Some(s) => s,
+        None => {
+            // No schema loaded — produce provisional facts (same as entity-do getFacts)
+            let facts: Vec<ProjectedFact> = fields.iter()
+                .filter(|(k, v)| !k.starts_with('_') && !v.is_empty())
+                .map(|(field, value)| ProjectedFact {
+                    schema_id: format!("{} has {}", noun_name, field),
+                    reading: format!("{} has {}", noun_name, field),
+                    bindings: vec![(noun_name.to_string(), entity_id.to_string()), (field.clone(), value.clone())],
+                })
+                .collect();
+            return Ok(to_js(&facts));
+        }
+    };
+
+    // Build a field_name → (schema_id, reading, role_names) map for this noun
+    let noun_fts = state.model.noun_index.noun_to_fact_types.get(noun_name);
+    let mut field_to_schema: std::collections::HashMap<&str, (&str, &str, &[String])> = std::collections::HashMap::new();
+
+    if let Some(fts) = noun_fts {
+        for (ft_id, role_idx) in fts {
+            // Only schemas where this noun plays role 0 (the entity/subject role)
+            if *role_idx != 0 { continue; }
+            if let Some(schema) = state.model.schemas.get(ft_id) {
+                // Binary fact type: role 0 = entity, role 1 = field
+                if schema.role_names.len() >= 2 {
+                    let field_name = &schema.role_names[1];
+                    field_to_schema.insert(field_name.as_str(), (ft_id.as_str(), schema.reading.as_str(), &schema.role_names));
+                }
+            }
+        }
+    }
+
+    let mut facts: Vec<ProjectedFact> = Vec::new();
+
+    for (field, value) in &fields {
+        if field.starts_with('_') || value.is_empty() { continue; }
+
+        if let Some(&(schema_id, reading, _role_names)) = field_to_schema.get(field.as_str()) {
+            // Compiled schema match — use the engine's schema ID
+            facts.push(ProjectedFact {
+                schema_id: schema_id.to_string(),
+                reading: reading.to_string(),
+                bindings: vec![(noun_name.to_string(), entity_id.to_string()), (field.clone(), value.clone())],
+            });
+        } else {
+            // No compiled schema — provisional fact with reading-format ID
+            facts.push(ProjectedFact {
+                schema_id: format!("{} has {}", noun_name, field),
+                reading: format!("{} has {}", noun_name, field),
+                bindings: vec![(noun_name.to_string(), entity_id.to_string()), (field.clone(), value.clone())],
+            });
+        }
+    }
+
+    // Sort by schema_id for deterministic output
+    facts.sort_by(|a, b| a.schema_id.cmp(&b.schema_id));
+
+    Ok(to_js(&facts))
+}
+
+/// Get the field-to-schema mapping for a noun.
+/// Returns all compiled graph schemas where this noun plays role 0 (entity role),
+/// mapped by the role 1 noun name (the field name).
+///
+/// This is the schema metadata needed by the TypeScript layer to understand
+/// how entity fields map to compiled constructions.
+#[wasm_bindgen]
+pub fn get_noun_schemas_wasm(noun_name: &str) -> JsValue {
+    let store = state_store().lock().unwrap();
+    let state = match store.as_ref() {
+        Some(s) => s,
+        None => return to_js(&Vec::<FieldSchemaMapping>::new()),
+    };
+
+    let noun_fts = state.model.noun_index.noun_to_fact_types.get(noun_name);
+    let mut mappings: Vec<FieldSchemaMapping> = Vec::new();
+
+    if let Some(fts) = noun_fts {
+        for (ft_id, role_idx) in fts {
+            if *role_idx != 0 { continue; }
+            if let Some(schema) = state.model.schemas.get(ft_id) {
+                if schema.role_names.len() >= 2 {
+                    mappings.push(FieldSchemaMapping {
+                        field_name: schema.role_names[1].clone(),
+                        schema_id: schema.id.clone(),
+                        reading: schema.reading.clone(),
+                        role_names: schema.role_names.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    mappings.sort_by(|a, b| a.field_name.cmp(&b.field_name));
+    to_js(&mappings)
 }
 
 /// Load the validation model (compiled from core.md + validation.md).
@@ -353,52 +510,48 @@ pub fn load_validation_model(ir_json: &str) -> Result<(), JsValue> {
 }
 
 /// Validate a domain IR against the validation model.
-/// Takes domain IR as JSON, converts to metamodel population,
-/// evaluates validation constraints. Returns JSON violations array.
+/// Takes domain IR as JSON string, converts to metamodel population,
+/// evaluates validation constraints. Returns JS array of violations.
 #[wasm_bindgen]
-pub fn validate_schema_wasm(domain_ir_json: &str) -> String {
+pub fn validate_schema_wasm(domain_ir_json: &str) -> Result<JsValue, JsValue> {
     let val_store = validation_store().lock().unwrap();
     let validation_model = match val_store.as_ref() {
         Some(m) => m,
-        None => return "[]".to_string(),
+        None => return Ok(to_js(&Vec::<Violation>::new())),
     };
-    let domain_ir: ConstraintIR = match serde_json::from_str(domain_ir_json) {
-        Ok(ir) => ir,
-        Err(e) => return format!(r#"[{{"constraint_id":"parse_error","constraint_text":"","detail":"{}"}}]"#, e),
-    };
+    let domain_ir: ConstraintIR = serde_json::from_str(domain_ir_json)
+        .map_err(|e| JsValue::from_str(&format!("Failed to parse domain IR: {}", e)))?;
     let violations = validate::validate_schema(validation_model, &domain_ir);
-    serde_json::to_string(&violations).unwrap_or_else(|_| "[]".to_string())
+    Ok(to_js(&violations))
 }
 
 /// Run RMAP (Relational Mapping Procedure) on the loaded IR.
 /// Returns table definitions as JSON.
 #[wasm_bindgen]
-pub fn rmap_wasm() -> String {
+pub fn rmap_wasm() -> JsValue {
     let store = state_store().lock().unwrap();
     let state = match store.as_ref() {
         Some(s) => s,
-        None => return "[]".to_string(),
+        None => return to_js(&Vec::<()>::new()),
     };
     let tables = rmap::rmap(&state.ir);
-    serde_json::to_string(&tables).unwrap_or_else(|_| "[]".to_string())
+    to_js(&tables)
 }
 
 /// Prove a goal fact via backward chaining.
 /// Returns a ProofResult with status (Proven/Disproven/Unknown) and proof tree.
 #[wasm_bindgen]
-pub fn prove_goal(goal: &str, population_json: &str, world_assumption: &str) -> String {
+pub fn prove_goal(goal: &str, population_val: JsValue, world_assumption: &str) -> Result<JsValue, JsValue> {
     let store = state_store().lock().unwrap();
-    let state = match store.as_ref() {
-        Some(s) => s,
-        None => return r#"{"goal":"","status":"unknown","proof":null,"worldAssumption":"closed"}"#.to_string(),
-    };
+    let state = store.as_ref().ok_or_else(|| JsValue::from_str("no IR loaded"))?;
 
-    let population: Population = serde_json::from_str(population_json).unwrap_or_default();
+    let population: Population = from_js(&population_val)?;
     let wa = match world_assumption {
         "open" => WorldAssumption::Open,
         _ => WorldAssumption::Closed,
     };
 
     let result = evaluate::prove(&state.ir, &population, goal, &wa);
-    serde_json::to_string(&result).unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string())
+    Ok(to_js(&result))
 }
+
