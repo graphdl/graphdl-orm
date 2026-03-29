@@ -4,7 +4,7 @@ import { ingestClaims } from '../claims/ingest'
 import type { ExtractedClaims } from '../claims/ingest'
 import { parseFORML2 } from './parse'
 import { ensureDomain } from './ensure-domain'
-import { loadValidationModel } from './engine'
+import { loadValidationModel, loadDomainSchema, applyCommand } from './engine'
 import { buildSchemaIR } from '../csdp/pipeline'
 
 // ── DO helpers ───────────────────────────────────────────────────────
@@ -118,6 +118,22 @@ async function handleSeedPost(request: Request, env: Env): Promise<Response> {
     const formData = await request.formData()
     const domains: Array<{ slug: string; name?: string; claims: ExtractedClaims; rawText?: string }> = []
 
+    // Load existing nouns from the registry as parser context.
+    // This allows business domains to reference metamodel nouns
+    // without re-declaring them.
+    const registry = getRegistryDO(env) as any
+    let existingNouns: Array<{ name: string; id: string; objectType?: 'entity' | 'value' }> = []
+    try {
+      const allNounIds: string[] = await registry.getEntityIds('Noun')
+      // Noun entity IDs are the noun names themselves
+      existingNouns = allNounIds.map(id => ({ name: id, id }))
+    } catch {
+      // No existing nouns yet — first seed
+    }
+    if (existingNouns.length > 0) {
+      console.log(`[seed] Loaded ${existingNouns.length} existing nouns as parser context`)
+    }
+
     for (const [name, value] of formData.entries()) {
       if (!(value instanceof File) && typeof value !== 'string') continue
       const text = value instanceof File ? await value.text() : value
@@ -125,7 +141,7 @@ async function handleSeedPost(request: Request, env: Env): Promise<Response> {
 
       // Slug from field name or filename (minus .md extension)
       const slug = name.replace(/\.md$/i, '')
-      const claims = parseFORML2(text, [])
+      const claims = parseFORML2(text, existingNouns)
       domains.push({ slug, name: slug, claims, rawText: text })
     }
 
@@ -151,9 +167,17 @@ async function handleSeedPost(request: Request, env: Env): Promise<Response> {
     return error(400, { errors: [{ message: 'Unsupported seed type. Use type: "claims"' }] })
   }
 
+  // Load existing nouns for JSON modes too
+  const registryForJson = getRegistryDO(env) as any
+  let existingNounsJson: Array<{ name: string; id: string; objectType?: 'entity' | 'value' }> = []
+  try {
+    const ids: string[] = await registryForJson.getEntityIds('Noun')
+    existingNounsJson = ids.map(id => ({ name: id, id }))
+  } catch {}
+
   // Text mode: parse server-side, then seed
   if (body.text && body.domain) {
-    const claims = parseFORML2(body.text, [])
+    const claims = parseFORML2(body.text, existingNounsJson)
     return handleSingleSeed(env, { claims, domain: body.domain, domainId: body.domain })
   }
 
@@ -161,7 +185,7 @@ async function handleSeedPost(request: Request, env: Env): Promise<Response> {
   if (body.domains?.length) {
     const resolved = body.domains.map(d => {
       if (d.claims) return d as { slug: string; name?: string; claims: ExtractedClaims }
-      if (d.text) return { slug: d.slug, name: d.name, claims: parseFORML2(d.text, []) }
+      if (d.text) return { slug: d.slug, name: d.name, claims: parseFORML2(d.text, existingNounsJson) }
       return { slug: d.slug, name: d.name, claims: { nouns: [], readings: [], constraints: [] } as ExtractedClaims }
     })
     return handleBulkSeed(env, resolved)
@@ -201,6 +225,10 @@ async function handleBulkSeed(
         claims: claimsWithoutFacts,
         domainId: domainUUID,
       })
+      // Commit the batch of metamodel entities to the DomainDB
+      if (result.batch.entities.length > 0) {
+        await domainDO.commitBatch(result.batch.entities)
+      }
       return { domain: entry.slug, domainId: domainUUID, ...result }
     })
   )
@@ -213,7 +241,7 @@ async function handleBulkSeed(
   const slugToUUID = new Map<string, string>()
   for (const r of results) slugToUUID.set(r.domain, r.domainId)
 
-  // Phase 1.5: Register domains + nouns in Registry (batched, not per-noun RPC)
+  // Phase 1.5: Register domains + index nouns in Registry
   t('registry_start')
   await Promise.all(
     domains.map(async (entry) => {
@@ -221,14 +249,13 @@ async function handleBulkSeed(
       await registry.registerDomain(entry.slug, entry.slug, 'private', uuid)
     })
   )
-  // Batch all noun indexing: collect all noun→domain pairs, then index
+  // Index nouns so parser context works for cross-domain references
   const nounPairs: Array<[string, string]> = []
   for (const entry of domains) {
     for (const noun of entry.claims.nouns) {
       nounPairs.push([noun.name, entry.slug])
     }
   }
-  // Index in parallel batches of 50
   for (let i = 0; i < nounPairs.length; i += 50) {
     const batch = nounPairs.slice(i, i + 50)
     await Promise.all(batch.map(([name, slug]) => registry.indexNoun(name, slug)))
@@ -279,6 +306,8 @@ async function handleBulkSeed(
 }
 
 // ── Single domain seeding ────────────────────────────────────────────
+// Conforms to the AREST spec: every entity goes through the engine's
+// command pipeline (resolve → derive → validate → emit).
 
 async function handleSingleSeed(
   env: Env,
@@ -291,24 +320,133 @@ async function handleSingleSeed(
   }
 
   const domainSlug = slug || rawId!
-  const domainDO = getDomainDO(env, domainSlug) as any
-  await domainDO.setDomainId(domainSlug)
-
-  // Ensure domain record exists via Registry+EntityDB
   const registry = getRegistryDO(env) as any
+
+  // Ensure domain record exists
   const domainRecord = await ensureDomain(env, registry, domainSlug)
-  const domainUUID = domainRecord.id as string
+  await registry.registerDomain(domainSlug, domainSlug, 'private', domainRecord.id)
 
-  const adapter = domainDO as any
-  const result = await ingestClaims(adapter, { claims: body.claims!, domainId: domainUUID })
+  // Load domain schema into the WASM engine
+  const getStub = (id: string) => env.ENTITY_DB.get(env.ENTITY_DB.idFromName(id)) as any
+  await loadDomainSchema(registry, getStub, domainSlug)
 
-  // Register in the global registry
-  for (const noun of body.claims!.nouns) {
+  // Build the current population (may be empty for new domains)
+  let population = JSON.stringify({ facts: {} })
+
+  const claims = body.claims!
+  let nouns = 0
+  let readings = 0
+  const errors: string[] = []
+  const allEntities: Array<{ id: string; type: string; domain: string; data: Record<string, unknown> }> = []
+
+  // Create each metamodel entity through the engine's command pipeline.
+  // Every entity goes through resolve → derive → validate → emit.
+  // WASM runs in-process (no subrequests). Entities are collected,
+  // then fanned out to EntityDB DOs via the Registry DO (one call).
+
+  // Nouns
+  for (const noun of claims.nouns) {
+    try {
+      const result = applyCommand({
+        type: 'createEntity',
+        noun: 'Noun',
+        domain: domainSlug,
+        id: noun.name,
+        fields: {
+          name: noun.name,
+          objectType: noun.objectType,
+          ...(noun.plural ? { plural: noun.plural } : {}),
+          ...(noun.valueType ? { valueType: noun.valueType } : {}),
+          ...(noun.enumValues ? { enumValues: JSON.stringify(noun.enumValues) } : {}),
+          ...(noun.refScheme ? { referenceScheme: JSON.stringify(noun.refScheme) } : {}),
+          ...(noun.worldAssumption ? { worldAssumption: noun.worldAssumption } : {}),
+        },
+      }, population)
+
+      // Collect entities from the engine result
+      for (const entity of result.entities) {
+        allEntities.push({
+          id: entity.id || noun.name,
+          type: entity.type,
+          domain: domainSlug,
+          data: entity.data,
+        })
+      }
+
+      // Update population with the engine's output
+      if (!result.rejected && result.population) {
+        population = JSON.stringify(result.population)
+      }
+
+      nouns++
+    } catch (e: any) {
+      errors.push(`Noun ${noun.name}: ${e.message || e}`)
+    }
+  }
+
+  // Readings
+  for (const reading of claims.readings) {
+    try {
+      const result = applyCommand({
+        type: 'createEntity',
+        noun: 'Reading',
+        domain: domainSlug,
+        id: null,
+        fields: {
+          text: reading.text,
+          nouns: JSON.stringify(reading.nouns),
+          predicate: reading.predicate,
+        },
+      }, population)
+
+      for (const entity of result.entities) {
+        allEntities.push({
+          id: entity.id || crypto.randomUUID(),
+          type: entity.type,
+          domain: domainSlug,
+          data: entity.data,
+        })
+      }
+
+      if (!result.rejected && result.population) {
+        population = JSON.stringify(result.population)
+      }
+
+      readings++
+    } catch (e: any) {
+      errors.push(`Reading: ${e.message || e}`)
+    }
+  }
+
+  // Only materialize entities that belong to THIS domain (not context nouns
+  // from previous domains that the parser auto-created).
+  const domainEntities = allEntities.filter(e => {
+    // Nouns: only materialize if declared in this domain's claims
+    if (e.type === 'Noun') {
+      return claims.nouns.some(n => n.name === e.data.name)
+    }
+    // Readings, constraints, etc: always belong to this domain
+    return true
+  })
+
+  // Fan out: ONE call to Registry DO, which creates EntityDB DOs
+  // from its own subrequest budget.
+  if (domainEntities.length > 0) {
+    await registry.materializeBatch(domainEntities)
+  }
+
+  // Index this domain's nouns for parser context
+  for (const noun of claims.nouns) {
     await registry.indexNoun(noun.name, domainSlug)
   }
-  await registry.registerDomain(domainSlug, domainSlug, 'private', domainUUID)
 
-  return json({ ...result, domainId: domainUUID })
+  return json({
+    nouns,
+    readings,
+    created: allEntities.length,
+    errors,
+    domainId: domainRecord.id,
+  })
 }
 
 // ── Validation model bootstrap ─────────────────────────────────────

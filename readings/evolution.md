@@ -76,29 +76,29 @@ Domain Change is valid iff all proposed Model Elements are parseable as FORML2 a
 ## Instance Facts
 
 State Machine Definition 'Domain Change' is for Noun 'Domain Change'.
-Status 'Proposed' is defined in State Machine Definition 'Domain Change'.
-Status 'Under Review' is defined in State Machine Definition 'Domain Change'.
-Status 'Approved' is defined in State Machine Definition 'Domain Change'.
-Status 'Applied' is defined in State Machine Definition 'Domain Change'.
-Status 'Rejected' is defined in State Machine Definition 'Domain Change'.
-Status 'Proposed' is initial.
+Status 'Proposed' is initial in State Machine Definition 'Domain Change'.
 
+Transition 'review' is defined in State Machine Definition 'Domain Change'.
 Transition 'review' is from Status 'Proposed'.
 Transition 'review' is to Status 'Under Review'.
 Transition 'review' is triggered by Event Type 'review-requested'.
 
-Transition 'approve' is from Status 'Under Review'.
-Transition 'approve' is to Status 'Approved'.
-Transition 'approve' is triggered by Event Type 'approved'.
+Transition 'approve-change' is defined in State Machine Definition 'Domain Change'.
+Transition 'approve-change' is from Status 'Under Review'.
+Transition 'approve-change' is to Status 'Approved'.
+Transition 'approve-change' is triggered by Event Type 'approved'.
 
+Transition 'reject' is defined in State Machine Definition 'Domain Change'.
 Transition 'reject' is from Status 'Under Review'.
 Transition 'reject' is to Status 'Rejected'.
 Transition 'reject' is triggered by Event Type 'rejected'.
 
+Transition 'revise' is defined in State Machine Definition 'Domain Change'.
 Transition 'revise' is from Status 'Under Review'.
 Transition 'revise' is to Status 'Proposed'.
 Transition 'revise' is triggered by Event Type 'revision-requested'.
 
+Transition 'apply' is defined in State Machine Definition 'Domain Change'.
 Transition 'apply' is from Status 'Approved'.
 Transition 'apply' is to Status 'Applied'.
 Transition 'apply' is triggered by Event Type 'applied'.

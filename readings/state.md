@@ -2,18 +2,13 @@
 
 ## Entity Types
 
-State Machine Definition(.Title) is an entity type.
-Status(.Name, .State Machine Definition) is an entity type.
-Transition is an entity type.
+Status(.Name) is an entity type.
+State Machine Definition is a subtype of Status.
+Transition(.id) is an entity type.
 Guard(.Name) is an entity type.
 
 Event Type(.id) is an entity type.
 Stream(.id) is an entity type.
-
-## Value Types
-
-Title is a value type.
-Pattern is a value type.
 
 ## Readings
 
@@ -24,12 +19,12 @@ State Machine Definition is for Noun.
   Each State Machine Definition is for exactly one Noun.
 
 ### Status
-Status is defined in State Machine Definition.
-  Each Status is defined in exactly one State Machine Definition.
 Verb is performed in Status.
   Each Verb is performed in at most one Status.
 
 ### Transition
+Transition is defined in State Machine Definition.
+  Each Transition is defined in exactly one State Machine Definition.
 Transition is from Status.
   Each Transition is from exactly one Status.
 Transition is to Status.
@@ -44,7 +39,9 @@ Event Type has Pattern.
   Each Event Type has at most one Pattern.
 
 ### Status
-Status is initial.
+Status is initial in State Machine Definition.
+  Each State Machine Definition has at most one initial Status.
+Status is terminal in State Machine Definition.
 
 ### Guard
 Guard references Graph Schema.
@@ -54,11 +51,18 @@ Guard prevents Transition.
   Each Guard prevents at most one Transition.
   It is possible that more than one Guard prevents the same Transition.
 
+## Derivation Rules
+
+Status is defined in State Machine Definition iff some Transition is defined in that State Machine Definition and that Transition is from that Status or that Transition is to that Status.
+
+Status is terminal in State Machine Definition iff that Status is defined in that State Machine Definition and no Transition is defined in that State Machine Definition where that Transition is from that Status.
+
 ## Constraints
 
-For each Status, some Transition is from that Status or some Transition is to that Status.
-For each State Machine Definition, some Status is defined in that State Machine Definition.
 For each Noun, at most one State Machine Definition is for that Noun.
+Each State Machine Definition has exactly one initial Status.
+Each State Machine Definition has at least one terminal Status.
+For each State Machine Definition, the initial Status of that State Machine Definition is defined in that State Machine Definition.
 
 ## Instance Facts
 

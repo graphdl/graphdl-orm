@@ -261,6 +261,24 @@ export class DomainDB extends DurableObject {
     return getPendingBatches(this.ctx.storage.sql)
   }
 
+  /** Query entities by type from committed batches. Used by generate pipeline. */
+  async queryEntitiesByType(entityType: string): Promise<Array<{ id: string; type: string; data: Record<string, unknown> }>> {
+    this.ensureInit()
+    const domain = this.domainId
+    if (!domain) return []
+    const { queryEntitiesByType } = await import('./batch-wal')
+    return queryEntitiesByType(this.ctx.storage.sql, domain, entityType)
+  }
+
+  /** Query ALL entities from committed batches. */
+  async queryAllEntities(): Promise<Array<{ id: string; type: string; data: Record<string, unknown> }>> {
+    this.ensureInit()
+    const domain = this.domainId
+    if (!domain) return []
+    const { queryAllEntities } = await import('./batch-wal')
+    return queryAllEntities(this.ctx.storage.sql, domain)
+  }
+
   // -----------------------------------------------------------------------
   // Generators cache (delegate to generators-cache.ts)
   // -----------------------------------------------------------------------

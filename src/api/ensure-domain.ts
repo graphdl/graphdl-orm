@@ -14,7 +14,8 @@ export async function ensureDomain(env: Env, registry: any, slug: string, name?:
     if (entity) return { id: entity.id, ...entity.data }
   }
 
-  const id = crypto.randomUUID()
+  // Domain identity IS its slug (CSDP: reference scheme is the identity)
+  const id = slug
   const data = { domainSlug: slug, name: name || slug, visibility: 'private' }
   const entityDO = env.ENTITY_DB.get(env.ENTITY_DB.idFromName(id)) as any
   await entityDO.put({ id, type: 'Domain', data })

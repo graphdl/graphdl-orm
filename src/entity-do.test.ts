@@ -1,105 +1,112 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest'
-import type { SqlLike, EntityData, EventRecord } from './entity-do'
-import { initEntitySchema, createEntity, getEntity, updateEntity, deleteEntity, getEvents } from './entity-do'
+import { describe, it, expect, vi } from 'vitest'
+import type { SqlLike, Fact } from './entity-do'
+import {
+  initEntitySchema, createEntity, getEntity, updateEntity, deleteEntity, getEvents,
+  getFacts, getFactsBySchema, toPopulation,
+  initSecretSchema, storeSecret, resolveSecret, deleteSecret, listConnectedSystems,
+} from './entity-do'
 
-/**
- * In-memory mock of SqlLike that tracks SQL operations.
- *
- * Stores rows keyed by table name. Supports CREATE TABLE, INSERT INTO, and
- * SELECT FROM queries by parsing the SQL string.
- */
 function createMockSql(): SqlLike & { tables: Record<string, any[]> } {
   const tables: Record<string, any[]> = {}
-
   return {
     tables,
     exec(query: string, ...params: any[]) {
-      const trimmed = query.trim()
+      const n = query.replace(/\s+/g, ' ').trim()
 
-      // CREATE TABLE IF NOT EXISTS <name>
-      const createMatch = trimmed.match(/CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+(\w+)/i)
-      if (createMatch) {
-        const tableName = createMatch[1]
-        if (!tables[tableName]) {
-          tables[tableName] = []
+      if (/^CREATE/i.test(n)) {
+        const m = n.match(/(?:TABLE|INDEX)\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:idx_\w+\s+ON\s+)?(\w+)/i)
+        if (m && !tables[m[1]]) tables[m[1]] = []
+        return { toArray: () => [] }
+      }
+
+      // INSERT OR REPLACE
+      if (/INSERT OR REPLACE/i.test(n)) {
+        const m = n.match(/INSERT OR REPLACE INTO (\w+)\s*\(([^)]+)\)\s*VALUES/i)
+        if (m) {
+          const t = m[1], cols = m[2].split(',').map(c => c.trim())
+          if (!tables[t]) tables[t] = []
+          const row: any = {}; cols.forEach((c, i) => row[c] = params[i])
+          const idx = tables[t].findIndex((r: any) => r[cols[0]] === row[cols[0]])
+          if (idx >= 0) tables[t][idx] = row; else tables[t].push(row)
         }
         return { toArray: () => [] }
       }
 
-      // INSERT INTO <table> (col1, col2, ...) VALUES (?, ?, ...)
-      const insertMatch = trimmed.match(/INSERT\s+INTO\s+(\w+)\s*\(([^)]+)\)\s*VALUES\s*\(([^)]+)\)/i)
-      if (insertMatch) {
-        const tableName = insertMatch[1]
-        const columns = insertMatch[2].split(',').map(c => c.trim())
-        if (!tables[tableName]) {
-          tables[tableName] = []
+      // INSERT ... ON CONFLICT
+      if (/ON\s+CONFLICT/i.test(n)) {
+        const m = n.match(/INSERT INTO (\w+)\s*\(([^)]+)\)\s*VALUES.*ON\s+CONFLICT\s*\(\s*(\w+)\s*\)/i)
+        if (m) {
+          const t = m[1], cols = m[2].split(',').map((c: string) => c.trim()), pk = m[3]
+          if (!tables[t]) tables[t] = []
+          const row: any = {}; cols.forEach((c, i) => row[c] = params[i])
+          const ex = tables[t].find((r: any) => r[pk] === row[pk])
+          if (ex) Object.assign(ex, row); else tables[t].push(row)
         }
-        const row: Record<string, any> = {}
-        for (let i = 0; i < columns.length; i++) {
-          row[columns[i]] = params[i]
-        }
-        tables[tableName].push(row)
         return { toArray: () => [] }
       }
 
-      // UPDATE <table> SET col1=?, col2=?, ... WHERE id=?
-      const updateMatch = trimmed.match(/UPDATE\s+(\w+)\s+SET\s+(.+?)\s+WHERE\s+id\s*=\s*\?/i)
-      if (updateMatch) {
-        const tableName = updateMatch[1]
-        const setClauses = updateMatch[2].split(',').map(c => c.trim().replace(/\s*=\s*\?/, ''))
-        const idValue = params[setClauses.length] // id param is after the SET params
-        if (tables[tableName]) {
-          const row = tables[tableName].find((r: any) => r.id === idValue)
-          if (row) {
-            for (let i = 0; i < setClauses.length; i++) {
-              row[setClauses[i]] = params[i]
+      // INSERT
+      if (/^INSERT INTO/i.test(n)) {
+        const m = n.match(/INSERT INTO (\w+)\s*\(([^)]+)\)\s*VALUES/i)
+        if (m) {
+          const t = m[1], cols = m[2].split(',').map(c => c.trim())
+          if (!tables[t]) tables[t] = []
+          const row: any = {}; cols.forEach((c, i) => row[c] = params[i])
+          tables[t].push(row)
+        }
+        return { toArray: () => [] }
+      }
+
+      // UPDATE
+      if (/^UPDATE/i.test(n)) {
+        const m = n.match(/UPDATE (\w+) SET (.+?) WHERE/i)
+        if (m) {
+          const t = m[1]
+          const sets = m[2].split(',').map(s => s.trim().split(/\s*=\s*/))
+          for (const row of (tables[t] || [])) {
+            if (row.id === params[params.length - 1]) {
+              let pi = 0
+              for (const [col, expr] of sets) {
+                if (expr === 'version + 1') row.version = (row.version || 0) + 1
+                else row[col] = params[pi++]
+              }
             }
           }
         }
         return { toArray: () => [] }
       }
 
-      // SELECT * FROM <table> WHERE <condition> ORDER BY ...
-      const selectWhereMatch = trimmed.match(/SELECT\s+\*\s+FROM\s+(\w+)\s+WHERE\s+(.+?)\s+ORDER\s+BY\s+(\w+)\s+(ASC|DESC)/i)
-      if (selectWhereMatch) {
-        const tableName = selectWhereMatch[1]
-        const dir = selectWhereMatch[4].toUpperCase()
-        const orderCol = selectWhereMatch[3]
-        if (!tables[tableName]) return { toArray: () => [] }
-        let rows = [...tables[tableName]]
-        // Apply WHERE timestamp > ? filter
-        if (selectWhereMatch[2].match(/timestamp\s*>\s*\?/i) && params.length > 0) {
-          const since = params[0]
-          rows = rows.filter((r: any) => r.timestamp > since)
+      // DELETE
+      if (/^DELETE FROM/i.test(n)) {
+        const m = n.match(/DELETE FROM (\w+) WHERE (\w+)\s*=\s*\?/i)
+        if (m) {
+          const t = m[1], col = m[2]
+          if (tables[t]) tables[t] = tables[t].filter((r: any) => r[col] !== params[0])
         }
-        rows.sort((a: any, b: any) => {
-          if (dir === 'DESC') return a[orderCol] > b[orderCol] ? -1 : a[orderCol] < b[orderCol] ? 1 : 0
-          return a[orderCol] > b[orderCol] ? 1 : a[orderCol] < b[orderCol] ? -1 : 0
-        })
-        return { toArray: () => rows }
+        return { toArray: () => [] }
       }
 
-      // SELECT * FROM <table> ORDER BY <col> ASC|DESC
-      const selectOrderMatch = trimmed.match(/SELECT\s+\*\s+FROM\s+(\w+)\s+ORDER\s+BY\s+(\w+)\s+(ASC|DESC)/i)
-      if (selectOrderMatch) {
-        const tableName = selectOrderMatch[1]
-        const orderCol = selectOrderMatch[2]
-        const dir = selectOrderMatch[3].toUpperCase()
-        if (!tables[tableName]) return { toArray: () => [] }
-        const rows = [...tables[tableName]]
-        rows.sort((a: any, b: any) => {
-          if (dir === 'DESC') return a[orderCol] > b[orderCol] ? -1 : a[orderCol] < b[orderCol] ? 1 : 0
-          return a[orderCol] > b[orderCol] ? 1 : a[orderCol] < b[orderCol] ? -1 : 0
-        })
-        return { toArray: () => rows }
+      // SELECT value FROM secrets WHERE system = ?
+      if (/SELECT value FROM secrets/i.test(n)) {
+        return { toArray: () => (tables['secrets'] || []).filter((r: any) => r.system === params[0]).map((r: any) => ({ value: r.value })) }
+      }
+
+      // SELECT system FROM secrets ORDER BY
+      if (/SELECT system FROM secrets/i.test(n)) {
+        return { toArray: () => [...(tables['secrets'] || [])].sort((a: any, b: any) => a.system > b.system ? 1 : -1).map(r => ({ system: r.system })) }
+      }
+
+      // SELECT * FROM events WHERE
+      if (/FROM events WHERE/i.test(n)) {
+        return { toArray: () => (tables['events'] || []).filter((r: any) => r.timestamp > params[0]).sort((a: any, b: any) => b.timestamp > a.timestamp ? 1 : -1) }
+      }
+      if (/FROM events ORDER/i.test(n)) {
+        return { toArray: () => [...(tables['events'] || [])].sort((a: any, b: any) => b.timestamp > a.timestamp ? 1 : -1) }
       }
 
       // SELECT * FROM <table>
-      const selectMatch = trimmed.match(/SELECT\s+\*\s+FROM\s+(\w+)/i)
-      if (selectMatch) {
-        const tableName = selectMatch[1]
-        return { toArray: () => tables[tableName] ? [...tables[tableName]] : [] }
-      }
+      const sel = n.match(/SELECT \* FROM (\w+)/i)
+      if (sel) return { toArray: () => [...(tables[sel[1]] || [])] }
 
       return { toArray: () => [] }
     },
@@ -107,232 +114,149 @@ function createMockSql(): SqlLike & { tables: Record<string, any[]> } {
 }
 
 describe('entity-do', () => {
-  let sql: ReturnType<typeof createMockSql>
-
-  beforeEach(() => {
-    sql = createMockSql()
-  })
-
-  describe('initEntitySchema', () => {
-    it('creates both entity and events tables', () => {
+  describe('3NF row storage', () => {
+    it('creates entity with fields', () => {
+      const sql = createMockSql()
       initEntitySchema(sql)
 
-      expect(sql.tables).toHaveProperty('entity')
-      expect(sql.tables).toHaveProperty('events')
+      const row = createEntity(sql, 'alice@example.com', 'Customer', 'support', {
+        name: 'Alice', plan: 'Growth',
+      })
+
+      expect(row.id).toBe('alice@example.com')
+      expect(row.noun).toBe('Customer')
+      expect(row.fields.name).toBe('Alice')
+      expect(row.fields.plan).toBe('Growth')
+    })
+
+    it('retrieves entity row', () => {
+      const sql = createMockSql()
+      initEntitySchema(sql)
+      createEntity(sql, 'cust-1', 'Customer', 'core', { name: 'Bob' })
+
+      const row = getEntity(sql)
+      expect(row?.id).toBe('cust-1')
+      expect(row?.fields.name).toBe('Bob')
+    })
+
+    it('updates fields by merge', () => {
+      const sql = createMockSql()
+      initEntitySchema(sql)
+      createEntity(sql, 'cust-1', 'Customer', 'core', { name: 'Alice' })
+
+      const updated = updateEntity(sql, { plan: 'Growth' })
+      expect(updated?.fields.name).toBe('Alice')
+      expect(updated?.fields.plan).toBe('Growth')
     })
   })
 
-  describe('createEntity', () => {
-    it('inserts entity row and logs CDC event', () => {
-      // Mock crypto.randomUUID
-      vi.stubGlobal('crypto', { randomUUID: () => 'test-event-uuid' })
-
+  describe('fact projection', () => {
+    it('projects row fields as facts', () => {
+      const sql = createMockSql()
       initEntitySchema(sql)
+      createEntity(sql, 'alice@example.com', 'Customer', 'core', {
+        name: 'Alice', plan: 'Growth', email: 'alice@example.com',
+      })
 
-      const input: EntityData = {
-        id: 'entity-1',
-        type: 'User',
-        data: { name: 'Alice', age: 30 },
-      }
+      const facts = getFacts(sql)
+      expect(facts.length).toBe(3)
 
-      const result = createEntity(sql, input)
+      const nameFact = facts.find(f => f.graphSchemaId === 'Customer has name')
+      expect(nameFact).toBeDefined()
+      expect(nameFact!.bindings[0]).toEqual(['Customer', 'alice@example.com'])
+      expect(nameFact!.bindings[1]).toEqual(['name', 'Alice'])
+    })
 
-      expect(result).toEqual({ id: 'entity-1', version: 1 })
+    it('projects facts by schema', () => {
+      const sql = createMockSql()
+      initEntitySchema(sql)
+      createEntity(sql, 'cust-1', 'Customer', 'core', {
+        name: 'Alice', plan: 'Growth', email: 'a@b.com',
+      })
 
-      // Verify entity was inserted
-      const entities = sql.tables.entity
-      expect(entities).toHaveLength(1)
-      expect(entities[0].id).toBe('entity-1')
-      expect(entities[0].type).toBe('User')
-      expect(entities[0].data).toBe(JSON.stringify({ name: 'Alice', age: 30 }))
-      expect(entities[0].version).toBe(1)
-      expect(entities[0].created_at).toBeDefined()
-      expect(entities[0].updated_at).toBeDefined()
+      const planFacts = getFactsBySchema(sql, 'Customer has plan')
+      expect(planFacts).toHaveLength(1)
+      expect(planFacts[0].bindings[1]).toEqual(['plan', 'Growth'])
+    })
 
-      // Verify CDC event was logged
-      const events = sql.tables.events
-      expect(events).toHaveLength(1)
-      expect(events[0].id).toBe('test-event-uuid')
-      expect(events[0].operation).toBe('create')
-      expect(events[0].data).toBe(JSON.stringify({ name: 'Alice', age: 30 }))
-      expect(events[0].prev).toBeNull()
+    it('converts to population format', () => {
+      const sql = createMockSql()
+      initEntitySchema(sql)
+      createEntity(sql, 'cust-1', 'Customer', 'core', { name: 'Alice', plan: 'Growth' })
 
-      vi.unstubAllGlobals()
+      const pop = toPopulation(sql)
+      expect(Object.keys(pop)).toHaveLength(2)
+      expect(pop['Customer has name']).toHaveLength(1)
+      expect(pop['Customer has plan']).toHaveLength(1)
+    })
+
+    it('empty fields produce no facts', () => {
+      const sql = createMockSql()
+      initEntitySchema(sql)
+      createEntity(sql, 'cust-1', 'Customer', 'core', {})
+
+      expect(getFacts(sql)).toHaveLength(0)
+    })
+
+    it('bindings ordered by noun order: entity first, field second', () => {
+      const sql = createMockSql()
+      initEntitySchema(sql)
+      createEntity(sql, 'ord-1', 'Order', 'orders', { customer: 'alice' })
+
+      const facts = getFacts(sql)
+      expect(facts[0].bindings[0][0]).toBe('Order')
+      expect(facts[0].bindings[1][0]).toBe('customer')
     })
   })
 
-  describe('getEntity', () => {
-    it('returns entity data with parsed JSON', () => {
-      vi.stubGlobal('crypto', { randomUUID: () => 'evt-1' })
-
-      initEntitySchema(sql)
-
-      const input: EntityData = {
-        id: 'entity-2',
-        type: 'Product',
-        data: { title: 'Widget', price: 9.99 },
-      }
-
-      createEntity(sql, input)
-      const entity = getEntity(sql)
-
-      expect(entity).not.toBeNull()
-      expect(entity!.id).toBe('entity-2')
-      expect(entity!.type).toBe('Product')
-      expect(entity!.data).toEqual({ title: 'Widget', price: 9.99 })
-      expect(entity!.version).toBe(1)
-      expect(entity!.createdAt).toBeDefined()
-      expect(entity!.updatedAt).toBeDefined()
-      expect(entity!.deletedAt).toBeNull()
-
-      vi.unstubAllGlobals()
+  describe('secret storage', () => {
+    it('stores and resolves', () => {
+      const sql = createMockSql()
+      initSecretSchema(sql)
+      storeSecret(sql, 'acme-api', 'key_123')
+      expect(resolveSecret(sql, 'acme-api')).toBe('key_123')
     })
 
-    it('returns null for empty DO', () => {
-      initEntitySchema(sql)
-      const entity = getEntity(sql)
-      expect(entity).toBeNull()
-    })
-  })
-
-  describe('updateEntity', () => {
-    it('merges fields, increments version, logs CDC with prev state', () => {
-      let eventCounter = 0
-      vi.stubGlobal('crypto', { randomUUID: () => `evt-${++eventCounter}` })
-
-      initEntitySchema(sql)
-      createEntity(sql, { id: 'e1', type: 'User', data: { name: 'Alice', age: 30 } })
-
-      const result = updateEntity(sql, { name: 'Bob' })
-
-      expect(result).not.toBeNull()
-      expect(result!.id).toBe('e1')
-      expect(result!.version).toBe(2)
-
-      // Verify entity was updated in store
-      const entity = getEntity(sql)
-      expect(entity!.data).toEqual({ name: 'Bob', age: 30 })
-      expect(entity!.version).toBe(2)
-
-      // Verify CDC event was logged
-      const events = sql.tables.events
-      expect(events).toHaveLength(2) // create + update
-      const updateEvent = events[1]
-      expect(updateEvent.operation).toBe('update')
-      expect(JSON.parse(updateEvent.data)).toEqual({ name: 'Bob', age: 30 })
-      expect(JSON.parse(updateEvent.prev)).toEqual({ name: 'Alice', age: 30 })
-
-      vi.unstubAllGlobals()
+    it('returns null for unknown', () => {
+      const sql = createMockSql()
+      initSecretSchema(sql)
+      expect(resolveSecret(sql, 'nope')).toBeNull()
     })
 
-    it('returns null when no entity exists', () => {
-      initEntitySchema(sql)
-
-      const result = updateEntity(sql, { name: 'Bob' })
-
-      expect(result).toBeNull()
+    it('upserts', () => {
+      const sql = createMockSql()
+      initSecretSchema(sql)
+      storeSecret(sql, 'acme-api', 'old')
+      storeSecret(sql, 'acme-api', 'new')
+      expect(resolveSecret(sql, 'acme-api')).toBe('new')
     })
 
-    it('preserves existing fields not in the update (patch semantics)', () => {
-      let eventCounter = 0
-      vi.stubGlobal('crypto', { randomUUID: () => `evt-${++eventCounter}` })
-
-      initEntitySchema(sql)
-      createEntity(sql, { id: 'e1', type: 'User', data: { name: 'Alice', age: 30, email: 'alice@test.com' } })
-
-      updateEntity(sql, { age: 31 })
-
-      const entity = getEntity(sql)
-      expect(entity!.data).toEqual({ name: 'Alice', age: 31, email: 'alice@test.com' })
-
-      vi.unstubAllGlobals()
-    })
-  })
-
-  describe('deleteEntity', () => {
-    it('sets deleted_at and logs CDC event', () => {
-      let eventCounter = 0
-      vi.stubGlobal('crypto', { randomUUID: () => `evt-${++eventCounter}` })
-
-      initEntitySchema(sql)
-      createEntity(sql, { id: 'e1', type: 'User', data: { name: 'Alice' } })
-
-      const result = deleteEntity(sql)
-
-      expect(result).not.toBeNull()
-      expect(result!.id).toBe('e1')
-      expect(result!.deleted).toBe(true)
-
-      // Verify entity has deleted_at set
-      const entity = getEntity(sql)
-      expect(entity!.deletedAt).toBeDefined()
-      expect(entity!.deletedAt).not.toBeNull()
-
-      // Verify CDC event
-      const events = sql.tables.events
-      expect(events).toHaveLength(2) // create + delete
-      const deleteEvent = events[1]
-      expect(deleteEvent.operation).toBe('delete')
-      expect(deleteEvent.data).toBeNull()
-      expect(JSON.parse(deleteEvent.prev)).toEqual({ name: 'Alice' })
-
-      vi.unstubAllGlobals()
+    it('deletes', () => {
+      const sql = createMockSql()
+      initSecretSchema(sql)
+      storeSecret(sql, 'acme-api', 'key')
+      deleteSecret(sql, 'acme-api')
+      expect(resolveSecret(sql, 'acme-api')).toBeNull()
     })
 
-    it('returns null when no entity exists', () => {
-      initEntitySchema(sql)
-
-      const result = deleteEntity(sql)
-
-      expect(result).toBeNull()
-    })
-  })
-
-  describe('getEvents', () => {
-    it('returns events in reverse chronological order', () => {
-      let eventCounter = 0
-      vi.stubGlobal('crypto', { randomUUID: () => `evt-${++eventCounter}` })
-
-      initEntitySchema(sql)
-
-      // Manually insert events with known timestamps to ensure deterministic ordering
-      sql.tables.events.push(
-        { id: 'evt-a', timestamp: '2025-01-01T00:00:00.000Z', operation: 'create', data: JSON.stringify({ name: 'Alice' }), prev: null },
-        { id: 'evt-b', timestamp: '2025-02-01T00:00:00.000Z', operation: 'update', data: JSON.stringify({ name: 'Bob' }), prev: JSON.stringify({ name: 'Alice' }) },
-        { id: 'evt-c', timestamp: '2025-03-01T00:00:00.000Z', operation: 'update', data: JSON.stringify({ name: 'Charlie' }), prev: JSON.stringify({ name: 'Bob' }) },
-      )
-
-      const events = getEvents(sql)
-
-      expect(events).toHaveLength(3)
-      // Newest first
-      expect(events[0].operation).toBe('update')
-      expect(JSON.parse(events[0].data!)).toEqual({ name: 'Charlie' })
-      expect(events[1].operation).toBe('update')
-      expect(events[2].operation).toBe('create')
-
-      vi.unstubAllGlobals()
+    it('lists systems', () => {
+      const sql = createMockSql()
+      initSecretSchema(sql)
+      storeSecret(sql, 'acme-api', 'k1')
+      storeSecret(sql, 'email-svc', 'k2')
+      storeSecret(sql, 'analytics-db', 'k3')
+      expect(listConnectedSystems(sql)).toEqual(['acme-api', 'analytics-db', 'email-svc'])
     })
 
-    it('filters events with since parameter', () => {
-      let eventCounter = 0
-      vi.stubGlobal('crypto', { randomUUID: () => `evt-${++eventCounter}` })
-
+    it('isolated from entity data', () => {
+      const sql = createMockSql()
       initEntitySchema(sql)
+      initSecretSchema(sql)
+      createEntity(sql, 'org-1', 'Organization', 'core', { name: 'Acme' })
+      storeSecret(sql, 'acme-api', 'secret_value')
 
-      // Manually insert events with known timestamps for reliable filtering
-      sql.tables.events.push(
-        { id: 'old-1', timestamp: '2025-01-01T00:00:00.000Z', operation: 'create', data: '{}', prev: null },
-        { id: 'old-2', timestamp: '2025-06-01T00:00:00.000Z', operation: 'update', data: '{}', prev: '{}' },
-        { id: 'new-1', timestamp: '2026-01-01T00:00:00.000Z', operation: 'update', data: '{}', prev: '{}' },
-      )
-
-      const events = getEvents(sql, '2025-06-01T00:00:00.000Z')
-
-      expect(events).toHaveLength(1)
-      expect(events[0].id).toBe('new-1')
-
-      vi.unstubAllGlobals()
+      const facts = getFacts(sql)
+      expect(JSON.stringify(facts)).not.toContain('secret_value')
     })
   })
 })

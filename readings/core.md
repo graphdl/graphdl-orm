@@ -22,6 +22,8 @@ Constraint(.id) is an entity type.
 
 Constraint Type(.code) is an entity type.
 
+Derivation Rule(.id) is an entity type.
+
 This association with Constraint, Role provides the preferred identification scheme for Constraint Span.
 
 Modality Type is a value type.
@@ -36,35 +38,14 @@ This association with Activation, HTTP Method provides the preferred identificat
 
 Language(.code) is an entity type.
 
-UI Element(.id) is an entity type.
-  Control is a subtype of UI Element.
-    Button is a subtype of Control.
-    Checkbox is a subtype of Control.
-    Date Picker is a subtype of Control.
-    Image is a subtype of Control.
-    Label is a subtype of Control.
-    Password Box is a subtype of Control.
-    Select List is a subtype of Control.
-    Slider is a subtype of Control.
-    Text Area is a subtype of Control.
-    Text Box is a subtype of Control.
-    Time Picker is a subtype of Control.
-    {Button, Checkbox, Date Picker, Image, Label, Password Box, Select List, Slider, Text Area, Text Box, Time Picker} are mutually exclusive subtypes of Control.
-  Grid is a subtype of UI Element.
-  Menu is a subtype of UI Element.
-  Menu Button is a subtype of UI Element.
-  Search Box is a subtype of UI Element.
-  Toolbar is a subtype of UI Element.
-  Toolbar Item is a subtype of UI Element.
-    Toolbar Button is a subtype of Toolbar Item.
-    Toolbar Separator is a subtype of Toolbar Item.
-    {Toolbar Button, Toolbar Separator} are mutually exclusive subtypes of Toolbar Item.
-  Alert is a subtype of UI Element.
-  {Control, Grid, Menu, Menu Button, Search Box, Toolbar, Toolbar Item, Alert} are mutually exclusive subtypes of UI Element.
-
 schema:Thing(.Name) is an entity type.
 
+External System(.Name) is an entity type.
+
 ## Value Types
+
+Base URL is a value type.
+Secret Reference is a value type.
 
 Arity is a value type.
 Position is a value type.
@@ -94,6 +75,7 @@ Argument Length is a value type.
 Order is a value type.
 Data is a value type.
 Result is a value type.
+Title is a value type.
 
 Permission is a value type.
   The possible values of Permission are 'create', 'read', 'update', 'delete', 'list', 'versioned', 'login', 'rateLimit'.
@@ -275,17 +257,6 @@ API has endpoint URI.
   Each API has exactly one endpoint URI.
   For each endpoint URI, at most one API has that endpoint URI.
 
-### UI Element
-Noun is displayed by UI Element.
-  Each Noun is displayed by at most one UI Element.
-  It is possible that more than one Noun is displayed by the same UI Element.
-
-### Toolbar
-Toolbar has Toolbar Item.
-
-### Menu
-Menu has Menu Button.
-
 ## Constraints
 
 Each Constraint is of exactly one Constraint Type.
@@ -307,13 +278,25 @@ If some Graph uses some Resource for some Role then that Resource is instance of
 If some Graph Schema defines some Graph then some Resource that is that Graph is instance of some Noun that is that Graph Schema.
 If some Verb references some Graph that is of some Graph Schema then that Verb uses some Reading where that Graph Schema has that Reading.
 If some Guard Run is for some Guard and that Guard Run references some Graph then that Guard references some Graph Schema that defines that Graph.
-If some State Machine is currently in some Status then that Status belongs to some State Machine Definition where that State Machine is instance of that State Machine Definition.
+If some State Machine is currently in some Status then that Status is defined in some State Machine Definition where that State Machine is instance of that State Machine Definition.
 
 ## Ring Constraints
 
 No Noun is subtype of itself.
 If Noun1 is subtype of Noun2, then Noun2 is not subtype of Noun1.
 If Noun1 is subtype of Noun2 and Noun2 is subtype of Noun3, then Noun1 is subtype of Noun3.
+
+### External System
+External System has Base URL.
+  Each External System has exactly one Base URL.
+Noun is backed by External System.
+  Each Noun is backed by at most one External System.
+Function is backed by External System.
+  Each Function is backed by at most one External System.
+
+### Domain Connection
+Domain connects to External System with Secret Reference.
+  Each Domain has at most one Secret Reference per External System.
 
 ### Derivation Rule
 

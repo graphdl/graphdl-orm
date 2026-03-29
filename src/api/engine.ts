@@ -10,7 +10,7 @@
  * All logic lives in the Rust AST. This file is plumbing.
  */
 
-import { initSync, load_ir, evaluate_response, forward_chain_population, run_machine_wasm, query_schema_wasm, get_transitions_wasm, resolve_fact_event, prepare_entity, apply_command_wasm, debug_compiled_state, load_validation_model, validate_schema_wasm } from '../../crates/fol-engine/pkg/fol_engine.js'
+import { initSync, load_ir, evaluate_response, forward_chain_population, run_machine_wasm, query_schema_wasm, get_transitions_wasm, resolve_fact_event, prepare_entity, apply_command_wasm, debug_compiled_state, load_validation_model, validate_schema_wasm, project_entity_wasm, get_noun_schemas_wasm } from '../../crates/fol-engine/pkg/fol_engine.js'
 import wasmModule from '../../crates/fol-engine/pkg/fol_engine_bg.wasm'
 
 let wasmInitialized = false
@@ -106,17 +106,161 @@ async function buildPopulation(
   return JSON.stringify({ facts })
 }
 
+// ── Federation: External System resolution ──────────────────────────
+// When a noun is backed by an External System, resolve its population
+// from the existing service that already has the connection.
+// The engine never calls backing stores directly. It calls the existing
+// services that already have the connections and credentials.
+
+export interface ServiceEndpoint {
+  /** The existing service to call */
+  service: string
+  /** Full URL or path template. Use {id} for entity-specific lookups. */
+  url: string
+  /** Auth header name (default: X-API-Key) */
+  authHeader?: string
+  /** How to extract items from the response */
+  responsePath?: string
+  /** Map response fields to noun fields (response_field → noun_field) */
+  fieldMap?: Record<string, string>
+}
+
+export interface FederatedSource {
+  /** Noun name → service endpoint that serves it */
+  endpoints: Record<string, ServiceEndpoint>
+  /** Resolve a secret/API key for a service from DO storage */
+  resolveSecret?: (service: string) => Promise<string | null>
+}
+
+/**
+ * Fetch population facts for a noun from the service that already serves it.
+ */
+async function resolveFromService(
+  nounType: string,
+  endpoint: ServiceEndpoint,
+  secret: string | null,
+): Promise<Record<string, Array<{ factTypeId: string; bindings: Array<[string, string]> }>>> {
+  const facts: Record<string, Array<{ factTypeId: string; bindings: Array<[string, string]> }>> = {}
+
+  try {
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+    if (secret) {
+      const headerName = endpoint.authHeader ?? 'X-API-Key'
+      headers[headerName] = secret
+    }
+
+    const response = await fetch(endpoint.url, { headers })
+    if (!response.ok) return facts
+
+    const raw = await response.json() as any
+
+    // Navigate response path (e.g., "data" or "data.subscriptions")
+    let data = raw
+    if (endpoint.responsePath) {
+      for (const key of endpoint.responsePath.split('.')) {
+        data = data?.[key]
+      }
+    }
+
+    const items = Array.isArray(data) ? data
+      : data && typeof data === 'object' ? [data]
+      : []
+
+    const fieldMap = endpoint.fieldMap ?? {}
+
+    for (const item of items) {
+      const entityId = item.id ?? item._id ?? item.vin ?? ''
+      for (const [responseField, value] of Object.entries(item)) {
+        if (responseField === 'id' || responseField === '_id' || responseField === 'object') continue
+        if (typeof value !== 'string' && typeof value !== 'number' && typeof value !== 'boolean') continue
+        if (value === null || value === undefined) continue
+
+        const nounField = fieldMap[responseField] ?? responseField
+        const ftId = `${nounType}_${nounField}`
+        if (!facts[ftId]) facts[ftId] = []
+        facts[ftId].push({
+          factTypeId: ftId,
+          bindings: [[nounType, String(entityId)], [nounField, String(value)]],
+        })
+      }
+
+      // Flatten nested objects one level (e.g., vehicle.year → year)
+      for (const [key, nested] of Object.entries(item)) {
+        if (nested && typeof nested === 'object' && !Array.isArray(nested)) {
+          for (const [subField, subValue] of Object.entries(nested as Record<string, unknown>)) {
+            if (typeof subValue !== 'string' && typeof subValue !== 'number' && typeof subValue !== 'boolean') continue
+            const nounField = fieldMap[`${key}.${subField}`] ?? subField
+            const ftId = `${nounType}_${nounField}`
+            if (!facts[ftId]) facts[ftId] = []
+            facts[ftId].push({
+              factTypeId: ftId,
+              bindings: [[nounType, String(entityId)], [nounField, String(subValue)]],
+            })
+          }
+        }
+      }
+    }
+  } catch {
+    // Service unavailable — return empty facts, don't fail
+  }
+
+  return facts
+}
+
+/**
+ * Build a federated population from EntityDB + existing services.
+ * Local entities come from DOs. Service-backed nouns come from
+ * the existing services that already serve them.
+ */
+async function buildFederatedPopulation(
+  registry: any,
+  getStub: (id: string) => any,
+  domainSlug: string,
+  federation?: FederatedSource,
+): Promise<string> {
+  // Start with local EntityDB population
+  const localPopJson = await buildPopulation(registry, getStub, domainSlug)
+  if (!federation || Object.keys(federation.endpoints).length === 0) {
+    return localPopJson
+  }
+
+  const localPop = JSON.parse(localPopJson) as { facts: Record<string, any[]> }
+
+  // Resolve service-backed nouns in parallel
+  const serviceResults = await Promise.allSettled(
+    Object.entries(federation.endpoints).map(async ([nounType, endpoint]) => {
+      const secret = federation.resolveSecret
+        ? await federation.resolveSecret(endpoint.service)
+        : null
+      return resolveFromService(nounType, endpoint, secret)
+    }),
+  )
+
+  // Merge service facts into the population
+  for (const result of serviceResults) {
+    if (result.status !== 'fulfilled') continue
+    for (const [ftId, serviceFacts] of Object.entries(result.value)) {
+      if (!localPop.facts[ftId]) localPop.facts[ftId] = []
+      localPop.facts[ftId].push(...serviceFacts)
+    }
+  }
+
+  return JSON.stringify(localPop)
+}
+
 /**
  * Load domain schema and build live population in one call.
- * Returns the population JSON string.
+ * Supports federation: nouns backed by External Systems are resolved
+ * from those systems, not from EntityDB.
  */
 export async function loadDomainAndPopulation(
   registry: any,
   getStub: (id: string) => any,
   domainSlug: string,
+  federation?: FederatedSource,
 ): Promise<string> {
   await loadDomainSchema(registry, getStub, domainSlug)
-  return buildPopulation(registry, getStub, domainSlug)
+  return buildFederatedPopulation(registry, getStub, domainSlug, federation)
 }
 
 /**
@@ -152,13 +296,11 @@ export function applyCommand(
   violations: Array<{ constraintId: string; constraintText: string; detail: string }>
   derivedCount: number
   rejected: boolean
+  population: any
 } {
   ensureWasm()
-  const commandJson = JSON.stringify(command)
-  console.log('AREST applyCommand input:', commandJson.slice(0, 300))
-  const resultJson = apply_command_wasm(commandJson, populationJson)
-  console.log('AREST applyCommand output:', resultJson.slice(0, 300))
-  const result = JSON.parse(resultJson)
+  const population = JSON.parse(populationJson)
+  const result = apply_command_wasm(command, population)
   return result
 }
 
@@ -260,4 +402,48 @@ export function validateSchema(domainIrJson: string): Array<{ constraint_id: str
   ensureWasm()
   const resultJson = validate_schema_wasm(domainIrJson)
   return JSON.parse(resultJson)
+}
+
+// ── Fact Projection ────────────────────────────────────────────────
+
+export interface ProjectedFact {
+  schemaId: string
+  reading: string
+  bindings: Array<[string, string]>
+}
+
+export interface FieldSchemaMapping {
+  fieldName: string
+  schemaId: string
+  reading: string
+  roleNames: string[]
+}
+
+/**
+ * α(project) applied to a 3NF entity row.
+ *
+ * Maps each field to its compiled graph schema (Construction of Selectors)
+ * and produces facts with proper schema references. Fields without a
+ * compiled schema get provisional IDs (reading format).
+ *
+ * This is the projection half of the REST GET function:
+ *   GET = α(project) ∘ load(DO[id])
+ */
+export function projectEntity(
+  nounName: string,
+  entityId: string,
+  fields: Record<string, string>,
+): ProjectedFact[] {
+  ensureWasm()
+  return project_entity_wasm(nounName, entityId, fields)
+}
+
+/**
+ * Get the field-to-schema mapping for a noun.
+ * Returns all compiled graph schemas where this noun plays role 0,
+ * keyed by the field name (role 1's noun name).
+ */
+export function getNounSchemas(nounName: string): FieldSchemaMapping[] {
+  ensureWasm()
+  return get_noun_schemas_wasm(nounName)
 }

@@ -20,7 +20,8 @@ import { parseMultiplicity, applyConstraintsBatch } from './constraints'
 /** Noun names (or supertypes) that imply open-world assumption */
 export const OPEN_WORLD_NOUNS = ['Right', 'Freedom', 'Liberty', 'Protection', 'Privilege']
 
-/** Ensure a noun exists in the batch for this domain; return its id. */
+/** Ensure a noun exists in the batch for this domain; return its id.
+ *  A noun's identity IS its name — use name as entity ID. */
 export function ensureNoun(
   builder: BatchBuilder,
   name: string,
@@ -31,7 +32,7 @@ export function ensureNoun(
     name,
     domain: domainId,
     ...data,
-  })
+  }, true)
 }
 
 // ---------------------------------------------------------------------------
