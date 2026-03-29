@@ -133,6 +133,46 @@ A state machine is a fold~\cite[Sec.\,11.2.4]{backus78}:
 \mathit{transition} &= (p \to \bar{s'} ;\; \mathit{id}) \label{eq:trans}
 \end{align}
 
+\section{Execution Semantics}
+
+\subsection{Evaluation as $\beta$-Reduction}
+
+FFP objects denote $\lambda$-terms via Backus's correspondence~\cite[Sec.\,12.9]{backus78}. The representation function $\rho$ yields the executable term. Execution is applicative-order (innermost-first) $\beta$-reduction to normal form:
+
+$\mu$ evaluates an expression under definitions $D$ by repeatedly replacing its innermost application $(x\!:\!y)$ with $(\rho\,x)\!:\!y$, where $\rho$ resolves $x$ to a $\lambda$-term under environment $D$ and primitives over $P$~\cite[Sec.\,13.3.1]{backus78}. Each step is a $\beta$-reduction: $\rho$ yields the $\lambda$-term; application reduces it. The function $\mathit{apply}(\mathit{func}, x, D)$ in the implementation is this reduction step.
+
+All evaluation in AREST is over finite $P$ with monotonic derivations; reduction terminates for all requests.
+
+\subsection{Evaluation Strategy}
+
+Three constraints govern execution:
+\begin{enumerate}[nosep]
+\item \textbf{Reduction order:} applicative (call-by-value). All arguments are reduced before the function is applied.
+\item \textbf{Scope:} evaluation is confined to the request-local partition of $D$. RMAP~\cite[Ch.\,17]{halpin08} determines the partition from the schema's uniqueness constraints.
+\item \textbf{Derivation:} forward chaining, monotonic, evaluated to the least fixed point per request. Since $\mathit{derive}$ only adds facts over finite $P_{\mathit{local}}$, the fixed point exists (Knaster-Tarski) and is reached in $\leq |P_{\mathit{local,max}}|$ iterations.
+\end{enumerate}
+The completeness result (Theorem~\ref{thm:complete}) assumes evaluation to the least fixed point under this strategy.
+
+\subsection{Boundary Conditions}
+
+The system operates over three categories:
+\begin{enumerate}[nosep]
+\item \textbf{Facts} $(P)$: ORM\,2 elementary facts, persisted in cells.
+\item \textbf{Computations} $(O$ via $\rho)$: total, deterministic functions over $P$.
+\item \textbf{Inputs} $(I)$: request payload, timestamp, external signals --- part of the operand $x$ in $\mu(\mathit{SYSTEM}\!:\!x)$~\cite[Sec.\,14.3.1]{backus78}.
+\end{enumerate}
+
+Time, randomness, and external effects are classified as follows:
+\begin{itemize}[nosep]
+\item \textbf{Time}: an input fact. ``Now'' is part of $x$, not hidden state. Time-dependent queries are constraints on timestamp facts in $P$.
+\item \textbf{Effects}: the output $o$ in $\langle o, D'\rangle$. The engine computes directives (send email, charge payment); the runtime executes them. Outcomes are facts in $D'$.
+\item \textbf{Non-determinism}: identity generation is a primitive function producing a fresh atom, or the client provides the ID in $I$.
+\item \textbf{Partial information}: the world assumption per noun~\cite[Ch.\,7]{halpin08} governs incompleteness. CWA: not stated $=$ false. OWA: not stated $=$ unknown.
+\item \textbf{Identity}: the reference scheme~\cite[Ch.\,5]{halpin08} determines identity before facts are asserted. $\mathit{resolve}$ in~(\ref{eq:create}) applies the selector.
+\end{itemize}
+
+AREST governs the derivation of representations from $(P, I)$. Theorem~\ref{thm:scope} holds: every value derivable from $(P, I)$ by a computable function is in scope; values outside are non-factual or non-computable.
+
 \section{Properties}
 
 \begin{theorem}[Grammar Unambiguity]\label{thm:grammar}
