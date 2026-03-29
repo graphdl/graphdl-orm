@@ -99,7 +99,7 @@ impl fmt::Display for Object {
 // The population is the data. It encodes as an Object for evaluation.
 // Facts become sequences. The population becomes a sequence of tagged sequences.
 
-use crate::types::{Population, FactInstance, ResponseContext, Violation};
+use crate::types::{Population, ResponseContext, Violation};
 
 /// Encode an evaluation context (response + population) as a single Object.
 /// Structure: <response_text, sender_identity, population>
@@ -133,13 +133,25 @@ pub fn encode_population(population: &Population) -> Object {
 
 /// Decode a violation Object back to a Violation struct.
 /// Expected: <constraint_id, constraint_text, detail>
+/// Decode a violation Object back to a Violation struct.
+/// Expected: <constraint_id, constraint_text, detail>
+/// Detail can be an atom (string) or a sequence of atoms (joined with spaces).
 pub fn decode_violation(obj: &Object) -> Option<Violation> {
     let items = obj.as_seq()?;
     if items.len() != 3 { return None; }
+    let detail = match &items[2] {
+        Object::Atom(s) => s.clone(),
+        Object::Seq(parts) => parts.iter()
+            .filter_map(|p| p.as_atom())
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => return None,
+    };
     Some(Violation {
         constraint_id: items[0].as_atom()?.to_string(),
         constraint_text: items[1].as_atom()?.to_string(),
-        detail: items[2].as_atom()?.to_string(),
+        detail,
+        alethic: true,
     })
 }
 
@@ -209,6 +221,39 @@ pub enum Func {
     /// Reverse: reverse:<x₁,...,xₙ> = <xₙ,...,x₁>
     Reverse,
 
+    /// Append right: apndr:<<y₁,...,yₙ>, z> = <y₁,...,yₙ, z>
+    ApndR,
+
+    /// Rotate left: rotl:<x₁,...,xₙ> = <x₂,...,xₙ, x₁>
+    RotL,
+
+    /// Rotate right: rotr:<x₁,...,xₙ> = <xₙ, x₁,...,xₙ₋₁>
+    RotR,
+
+    // ── Arithmetic (Backus 11.2.3) ──────────────────────────────
+    /// Add: +:<y,z> = y+z where y,z are number atoms
+    Add,
+    /// Subtract: -:<y,z> = y-z
+    Sub,
+    /// Multiply: ×:<y,z> = y×z
+    Mul,
+    /// Divide: ÷:<y,z> = y÷z, bottom if z=0
+    Div,
+
+    // ── Logic (Backus 11.2.3) ───────────────────────────────────
+    /// And: and:<T,T> = T, and:<T,F> = F, etc.
+    And,
+    /// Or: or:<F,F> = F, or:<T,F> = T, etc.
+    Or,
+    /// Not: not:T = F, not:F = T
+    Not,
+
+    // ── Cells (Backus 14.3) ─────────────────────────────────────
+    /// Fetch: ↑n:<name, D> → contents of cell named name in D
+    Fetch,
+    /// Store: ↓n:<name, contents, D> → D' with cell name updated
+    Store,
+
     // ── Combining Forms ──────────────────────────────────────────
 
     /// Constant: x̄:y = x (for all y ≠ ⊥). A literal value in a reading.
@@ -233,6 +278,12 @@ pub enum Func {
     /// Binary-to-unary: (bu f x):y = f:<x, y>. Partial application / currying.
     BinaryToUnary(Box<Func>, Object),
 
+    /// Filter: Filter(p):<x₁,...,xₙ> = <xᵢ | p:xᵢ = T>.
+    /// The missing primitive for queries as partial application.
+    /// Partial apply a graph schema (bind some roles) → predicate falls out.
+    /// Filter(predicate) applied to population → matching facts.
+    Filter(Box<Func>),
+
     /// While: (while p f):x = if p:x = T then (while p f):(f:x) else x.
     While(Box<Func>, Box<Func>),
 
@@ -246,6 +297,30 @@ pub enum Func {
 
 // ── Application (the single operation) ───────────────────────────────
 // f:x → Object. This is beta reduction.
+
+/// Parse a pair of number atoms, apply an arithmetic operation (Backus +,-,×,÷).
+fn apply_arithmetic(x: &Object, op: fn(f64, f64) -> Option<f64>) -> Object {
+    match x.as_seq() {
+        Some(items) if items.len() == 2 => {
+            let a = items[0].as_atom().and_then(|s| s.parse::<f64>().ok());
+            let b = items[1].as_atom().and_then(|s| s.parse::<f64>().ok());
+            match (a, b) {
+                (Some(a), Some(b)) => match op(a, b) {
+                    Some(r) => {
+                        if r.fract() == 0.0 && r.abs() < i64::MAX as f64 {
+                            Object::Atom((r as i64).to_string())
+                        } else {
+                            Object::Atom(r.to_string())
+                        }
+                    }
+                    None => Object::Bottom,
+                },
+                _ => Object::Bottom,
+            }
+        }
+        _ => Object::Bottom,
+    }
+}
 
 /// Apply a function to an object. The only operation in the FP system.
 pub fn apply(func: &Func, x: &Object, defs: &std::collections::HashMap<String, Func>) -> Object {
@@ -380,6 +455,111 @@ pub fn apply(func: &Func, x: &Object, defs: &std::collections::HashMap<String, F
             }
         }
 
+        Func::ApndR => {
+            match x.as_seq() {
+                Some(items) if items.len() == 2 => {
+                    match items[0].as_seq() {
+                        Some(ys) => {
+                            let mut result = ys.to_vec();
+                            result.push(items[1].clone());
+                            Object::Seq(result)
+                        }
+                        _ => Object::Bottom,
+                    }
+                }
+                _ => Object::Bottom,
+            }
+        }
+
+        Func::RotL => {
+            match x.as_seq() {
+                Some(items) if items.len() >= 2 => {
+                    let mut result = items[1..].to_vec();
+                    result.push(items[0].clone());
+                    Object::Seq(result)
+                }
+                Some(_) => x.clone(),
+                _ => Object::Bottom,
+            }
+        }
+
+        Func::RotR => {
+            match x.as_seq() {
+                Some(items) if items.len() >= 2 => {
+                    let mut result = vec![items[items.len() - 1].clone()];
+                    result.extend_from_slice(&items[..items.len() - 1]);
+                    Object::Seq(result)
+                }
+                Some(_) => x.clone(),
+                _ => Object::Bottom,
+            }
+        }
+
+        Func::Add => apply_arithmetic(x, |a, b| Some(a + b)),
+        Func::Sub => apply_arithmetic(x, |a, b| Some(a - b)),
+        Func::Mul => apply_arithmetic(x, |a, b| Some(a * b)),
+        Func::Div => apply_arithmetic(x, |a, b| if b == 0.0 { None } else { Some(a / b) }),
+
+        Func::Fetch => {
+            // fetch:<name, D> → contents of cell named name in D
+            match x.as_seq() {
+                Some(items) if items.len() == 2 => {
+                    match items[0].as_atom() {
+                        Some(name) => fetch(name, &items[1]),
+                        None => Object::Bottom,
+                    }
+                }
+                _ => Object::Bottom,
+            }
+        }
+
+        Func::Store => {
+            // store:<name, contents, D> → D' with cell updated
+            match x.as_seq() {
+                Some(items) if items.len() == 3 => {
+                    match items[0].as_atom() {
+                        Some(name) => store(name, items[1].clone(), &items[2]),
+                        None => Object::Bottom,
+                    }
+                }
+                _ => Object::Bottom,
+            }
+        }
+
+        Func::And => {
+            match x.as_seq() {
+                Some(items) if items.len() == 2 => {
+                    match (items[0].as_atom(), items[1].as_atom()) {
+                        (Some("T"), Some("T")) => Object::t(),
+                        (Some("T"), Some("F")) | (Some("F"), Some("T")) | (Some("F"), Some("F")) => Object::f(),
+                        _ => Object::Bottom,
+                    }
+                }
+                _ => Object::Bottom,
+            }
+        }
+
+        Func::Or => {
+            match x.as_seq() {
+                Some(items) if items.len() == 2 => {
+                    match (items[0].as_atom(), items[1].as_atom()) {
+                        (Some("F"), Some("F")) => Object::f(),
+                        (Some("T"), Some("T")) | (Some("T"), Some("F")) | (Some("F"), Some("T")) => Object::t(),
+                        _ => Object::Bottom,
+                    }
+                }
+                _ => Object::Bottom,
+            }
+        }
+
+        Func::Not => {
+            match x.as_atom() {
+                Some("T") => Object::f(),
+                Some("F") => Object::t(),
+                _ => Object::Bottom,
+            }
+        }
+
         // ── Combining Forms ──────────────────────────────────────
 
         Func::Constant(obj) => obj.clone(),
@@ -426,6 +606,20 @@ pub fn apply(func: &Func, x: &Object, defs: &std::collections::HashMap<String, F
             }
         }
 
+        Func::Filter(p) => {
+            match x.as_seq() {
+                Some(items) if items.is_empty() => Object::phi(),
+                Some(items) => {
+                    let kept: Vec<Object> = items.iter()
+                        .filter(|xi| apply(p, xi, defs) == Object::t())
+                        .cloned()
+                        .collect();
+                    Object::Seq(kept)
+                }
+                _ => Object::Bottom,
+            }
+        }
+
         Func::BinaryToUnary(f, obj) => {
             apply(f, &Object::seq(vec![obj.clone(), x.clone()]), defs)
         }
@@ -457,6 +651,481 @@ pub fn apply(func: &Func, x: &Object, defs: &std::collections::HashMap<String, F
     }
 }
 
+// ── FFP: Objects represent functions (Backus Section 13) ────────────
+//
+// In FFP, every object represents a function via the representation
+// function ρ. Primitive atoms map to primitive functions. Sequences
+// map to functional forms via metacomposition. Defined atoms map to
+// their definitions. The meaning function μ evaluates expressions by
+// replacing innermost applications (x:y) with (ρ x):y.
+//
+// This layer bridges FFP semantics with the compiled Func representation.
+// The Func enum is the compiled (optimized) form. Objects are the source.
+
+/// Standard atom names for primitive functions (Backus 11.2.3).
+pub mod primitives {
+    pub const ID: &str = "id";
+    pub const TL: &str = "tl";
+    pub const ATOM: &str = "atom";
+    pub const EQ: &str = "eq";
+    pub const NULL: &str = "null";
+    pub const REVERSE: &str = "reverse";
+    pub const DISTL: &str = "distl";
+    pub const DISTR: &str = "distr";
+    pub const LENGTH: &str = "length";
+    pub const TRANS: &str = "trans";
+    pub const APNDL: &str = "apndl";
+    pub const APNDR: &str = "apndr";
+    pub const ROTL: &str = "rotl";
+    pub const ROTR: &str = "rotr";
+    pub const ADD: &str = "+";
+    pub const SUB: &str = "-";
+    pub const MUL: &str = "*";
+    pub const DIV: &str = "/";
+    pub const AND: &str = "and";
+    pub const OR: &str = "or";
+    pub const NOT: &str = "not";
+    pub const FETCH: &str = "fetch";
+    pub const STORE: &str = "store";
+}
+
+/// Standard atom names for functional forms (Backus 11.2.4, 13.3.2).
+pub mod forms {
+    pub const COMP: &str = "COMP";
+    pub const CONS: &str = "CONS";
+    pub const COND: &str = "COND";
+    pub const ALPHA: &str = "ALPHA";
+    pub const INSERT: &str = "INSERT";
+    pub const BU: &str = "BU";
+    pub const FILTER: &str = "FILTER";
+    pub const WHILE: &str = "WHILE";
+    pub const CONST: &str = "CONST";
+}
+
+// ── Cells and State (Backus Section 14.3, 14.7) ─────────────────────
+//
+// The AST state D is a sequence of cells. Each cell is <CELL, name, contents>.
+// fetch (↑n) retrieves the contents of the first cell named n.
+// store (↓n) replaces or appends the cell named n with new contents.
+// Cells can contain sub-stores (Section 14.7): a cell whose contents
+// is itself a sequence of cells. This models partitioned populations.
+
+/// The atom that marks a cell: <CELL, name, contents>
+pub const CELL_TAG: &str = "CELL";
+
+/// Create a cell object: <CELL, name, contents>
+pub fn cell(name: &str, contents: Object) -> Object {
+    Object::Seq(vec![Object::atom(CELL_TAG), Object::atom(name), contents])
+}
+
+/// Fetch (↑n): retrieve contents of the first cell named n from a sequence of cells.
+/// ↑n:D → c where D contains <CELL, n, c>
+/// Returns bottom if no cell named n exists.
+pub fn fetch(name: &str, state: &Object) -> Object {
+    match state.as_seq() {
+        Some(cells) => {
+            for cell_obj in cells {
+                if let Some(items) = cell_obj.as_seq() {
+                    if items.len() == 3
+                        && items[0].as_atom() == Some(CELL_TAG)
+                        && items[1].as_atom() == Some(name)
+                    {
+                        return items[2].clone();
+                    }
+                }
+            }
+            Object::Bottom
+        }
+        None => Object::Bottom,
+    }
+}
+
+/// Store (↓n): replace or append cell named n with new contents.
+/// ↓n:<x, D> → D' where D' has cell n with contents x.
+/// If cell n exists, its contents are replaced. Otherwise a new cell is appended.
+pub fn store(name: &str, contents: Object, state: &Object) -> Object {
+    let cells = match state.as_seq() {
+        Some(cells) => cells,
+        None => return Object::Bottom,
+    };
+
+    let mut result: Vec<Object> = Vec::new();
+    let mut found = false;
+    for cell_obj in cells {
+        if let Some(items) = cell_obj.as_seq() {
+            if items.len() == 3
+                && items[0].as_atom() == Some(CELL_TAG)
+                && items[1].as_atom() == Some(name)
+            {
+                // Replace contents
+                result.push(cell(name, contents.clone()));
+                found = true;
+                continue;
+            }
+        }
+        result.push(cell_obj.clone());
+    }
+    if !found {
+        result.push(cell(name, contents));
+    }
+    Object::Seq(result)
+}
+
+/// The representation function ρ: Object → Func (Backus 13.3.2).
+///
+/// Maps objects to the functions they represent:
+/// - Primitive atoms → primitive Func variants
+/// - Defined atoms → definitions from D
+/// - Undefined atoms → ⊥̄ (bottom everywhere)
+/// - Sequences → functional forms via controlling operator
+pub fn rho(obj: &Object, defs: &std::collections::HashMap<String, Func>) -> Func {
+    match obj {
+        Object::Bottom => Func::Constant(Object::Bottom),
+        Object::Atom(name) => rho_atom(name, defs),
+        Object::Seq(items) if items.is_empty() => Func::Constant(Object::Bottom),
+        Object::Seq(items) => {
+            // Metacomposition: the first element determines the form.
+            // ρ<x₁,...,xₙ>:y = (ρ x₁):<<x₁,...,xₙ>, y>
+            // We resolve the controlling operator and build the Func.
+            rho_sequence(items, defs)
+        }
+    }
+}
+
+fn rho_atom(name: &str, defs: &std::collections::HashMap<String, Func>) -> Func {
+    // Check definitions first (Backus 13.3.2: Def n ≡ r)
+    if let Some(func) = defs.get(name) {
+        return func.clone();
+    }
+
+    // Primitive atoms (Backus 11.2.3)
+    match name {
+        primitives::ID => Func::Id,
+        primitives::TL => Func::Tail,
+        primitives::ATOM => Func::AtomTest,
+        primitives::EQ => Func::Eq,
+        primitives::NULL => Func::NullTest,
+        primitives::REVERSE => Func::Reverse,
+        primitives::DISTL => Func::DistL,
+        primitives::DISTR => Func::DistR,
+        primitives::LENGTH => Func::Length,
+        primitives::TRANS => Func::Trans,
+        primitives::APNDL => Func::ApndL,
+        primitives::APNDR => Func::ApndR,
+        primitives::ROTL => Func::RotL,
+        primitives::ROTR => Func::RotR,
+        primitives::ADD => Func::Add,
+        primitives::SUB => Func::Sub,
+        primitives::MUL => Func::Mul,
+        primitives::DIV => Func::Div,
+        primitives::AND => Func::And,
+        primitives::OR => Func::Or,
+        primitives::NOT => Func::Not,
+        primitives::FETCH => Func::Fetch,
+        primitives::STORE => Func::Store,
+        // Selector atoms: "1", "2", "3", ...
+        s if s.parse::<usize>().is_ok() => Func::Selector(s.parse().unwrap()),
+        // Undefined atom → ⊥̄
+        _ => Func::Constant(Object::Bottom),
+    }
+}
+
+fn rho_sequence(items: &[Object], defs: &std::collections::HashMap<String, Func>) -> Func {
+    if items.is_empty() { return Func::Constant(Object::Bottom); }
+
+    // The controlling operator is the first element
+    let controller = match items[0].as_atom() {
+        Some(name) => name,
+        None => return Func::Constant(Object::Bottom),
+    };
+
+    match controller {
+        forms::COMP if items.len() == 3 => {
+            // <COMP, f, g> → f ∘ g
+            let f = rho(&items[1], defs);
+            let g = rho(&items[2], defs);
+            Func::Compose(Box::new(f), Box::new(g))
+        }
+        forms::CONS if items.len() >= 2 => {
+            // <CONS, f₁, ..., fₙ> → [f₁, ..., fₙ]
+            let funcs: Vec<Func> = items[1..].iter().map(|o| rho(o, defs)).collect();
+            Func::Construction(funcs)
+        }
+        forms::COND if items.len() == 4 => {
+            // <COND, p, f, g> → (p → f; g)
+            let p = rho(&items[1], defs);
+            let f = rho(&items[2], defs);
+            let g = rho(&items[3], defs);
+            Func::Condition(Box::new(p), Box::new(f), Box::new(g))
+        }
+        forms::ALPHA if items.len() == 2 => {
+            // <ALPHA, f> → αf
+            let f = rho(&items[1], defs);
+            Func::ApplyToAll(Box::new(f))
+        }
+        forms::INSERT if items.len() == 2 => {
+            // <INSERT, f> → /f
+            let f = rho(&items[1], defs);
+            Func::Insert(Box::new(f))
+        }
+        forms::BU if items.len() == 3 => {
+            // <BU, f, x> → (bu f x)
+            let f = rho(&items[1], defs);
+            let x = items[2].clone();
+            Func::BinaryToUnary(Box::new(f), x)
+        }
+        forms::FILTER if items.len() == 2 => {
+            // <FILTER, p> → Filter(p)
+            let p = rho(&items[1], defs);
+            Func::Filter(Box::new(p))
+        }
+        forms::WHILE if items.len() == 3 => {
+            // <WHILE, p, f> → (while p f)
+            let p = rho(&items[1], defs);
+            let f = rho(&items[2], defs);
+            Func::While(Box::new(p), Box::new(f))
+        }
+        forms::CONST if items.len() == 2 => {
+            // <CONST, x> → x̄
+            Func::Constant(items[1].clone())
+        }
+        _ => {
+            // Unknown controlling operator → ⊥̄
+            Func::Constant(Object::Bottom)
+        }
+    }
+}
+
+/// FFP application: evaluate (x:y) where x is an object representing
+/// a function and y is the operand (Backus 13.3.1).
+///
+/// μ(x:y) = (ρ x):y
+pub fn apply_ffp(
+    operator: &Object,
+    operand: &Object,
+    defs: &std::collections::HashMap<String, Func>,
+) -> Object {
+    let func = rho(operator, defs);
+    apply(&func, operand, defs)
+}
+
+/// Convert a Func back to its FFP object representation.
+/// This is the inverse of ρ (on the image of compilation).
+pub fn func_to_object(func: &Func) -> Object {
+    match func {
+        Func::Id => Object::atom(primitives::ID),
+        Func::Selector(n) => Object::atom(&n.to_string()),
+        Func::Tail => Object::atom(primitives::TL),
+        Func::AtomTest => Object::atom(primitives::ATOM),
+        Func::NullTest => Object::atom(primitives::NULL),
+        Func::Eq => Object::atom(primitives::EQ),
+        Func::Length => Object::atom(primitives::LENGTH),
+        Func::DistL => Object::atom(primitives::DISTL),
+        Func::DistR => Object::atom(primitives::DISTR),
+        Func::Trans => Object::atom(primitives::TRANS),
+        Func::ApndL => Object::atom(primitives::APNDL),
+        Func::Reverse => Object::atom(primitives::REVERSE),
+        Func::ApndR => Object::atom(primitives::APNDR),
+        Func::RotL => Object::atom(primitives::ROTL),
+        Func::RotR => Object::atom(primitives::ROTR),
+        Func::Add => Object::atom(primitives::ADD),
+        Func::Sub => Object::atom(primitives::SUB),
+        Func::Mul => Object::atom(primitives::MUL),
+        Func::Div => Object::atom(primitives::DIV),
+        Func::And => Object::atom(primitives::AND),
+        Func::Or => Object::atom(primitives::OR),
+        Func::Not => Object::atom(primitives::NOT),
+        Func::Fetch => Object::atom(primitives::FETCH),
+        Func::Store => Object::atom(primitives::STORE),
+        Func::Constant(x) => Object::seq(vec![Object::atom(forms::CONST), x.clone()]),
+        Func::Compose(f, g) => Object::seq(vec![
+            Object::atom(forms::COMP), func_to_object(f), func_to_object(g),
+        ]),
+        Func::Construction(funcs) => {
+            let mut items = vec![Object::atom(forms::CONS)];
+            items.extend(funcs.iter().map(func_to_object));
+            Object::Seq(items) // not bottom-preserving — these are form objects
+        }
+        Func::Condition(p, f, g) => Object::seq(vec![
+            Object::atom(forms::COND), func_to_object(p), func_to_object(f), func_to_object(g),
+        ]),
+        Func::ApplyToAll(f) => Object::seq(vec![Object::atom(forms::ALPHA), func_to_object(f)]),
+        Func::Insert(f) => Object::seq(vec![Object::atom(forms::INSERT), func_to_object(f)]),
+        Func::BinaryToUnary(f, x) => Object::seq(vec![
+            Object::atom(forms::BU), func_to_object(f), x.clone(),
+        ]),
+        Func::Filter(p) => Object::seq(vec![Object::atom(forms::FILTER), func_to_object(p)]),
+        Func::While(p, f) => Object::seq(vec![
+            Object::atom(forms::WHILE), func_to_object(p), func_to_object(f),
+        ]),
+        Func::Def(name) => Object::atom(name),
+        Func::Native(_) => Object::atom("<native>"),
+    }
+}
+
+// ── Codd's θ₁: Named Relational Algebra Definitions ─────────────────
+//
+// Codd 1970 Sec 2.2: an adequate collection θ₁ for the named set is
+// {projection, natural join, tie, restriction}. Each is an FFP definition
+// composed from Backus's primitives and forms. These are registered in
+// the definitions set D so they can be called by name via ρ.
+
+/// Register Codd's θ₁ relational algebra operations as named definitions.
+/// Call this to populate a defs map with the standard relational operations.
+pub fn register_theta1(defs: &mut std::collections::HashMap<String, Func>) {
+    // projection: π_L(R) ≡ α[s_{i₁},...,s_{iₖ}] : R
+    // As a definition, "project" takes <indices, R> and projects R onto those columns.
+    // project:<⟨i₁,...,iₖ⟩, R> = α([s_{i₁},...,s_{iₖ}]):R
+    // We define it as a Native that builds the construction dynamically from the indices.
+    // This is acceptable because the indices determine which selectors to use at runtime.
+    defs.insert("project".to_string(), Func::Native(Arc::new(|x: &Object| {
+        let items = match x.as_seq() {
+            Some(items) if items.len() == 2 => items,
+            _ => return Object::Bottom,
+        };
+        let indices = match items[0].as_seq() {
+            Some(idx) => idx,
+            None => return Object::Bottom,
+        };
+        let relation = match items[1].as_seq() {
+            Some(r) => r,
+            None => return Object::Bottom,
+        };
+        // Build selectors from indices
+        let selectors: Vec<usize> = indices.iter()
+            .filter_map(|i| i.as_atom().and_then(|s| s.parse().ok()))
+            .collect();
+        if selectors.is_empty() { return Object::Bottom; }
+
+        // Apply α[s₁,...,sₖ] to relation, removing duplicate rows
+        let mut rows: Vec<Object> = Vec::new();
+        for tuple in relation {
+            if let Some(cols) = tuple.as_seq() {
+                let projected: Vec<Object> = selectors.iter()
+                    .filter_map(|&s| if s >= 1 && s <= cols.len() { Some(cols[s-1].clone()) } else { None })
+                    .collect();
+                let row = Object::Seq(projected);
+                if !rows.contains(&row) {
+                    rows.push(row);
+                }
+            }
+        }
+        Object::Seq(rows)
+    })));
+
+    // restriction: restrict:<predicate_obj, R> = Filter(ρ predicate_obj) : R
+    // The predicate is an FFP object resolved via ρ at application time.
+    // We use the standard Filter form.
+    // For now, register "restrict" as a synonym for Filter applied to relation.
+
+    // join: join:<shared_col, R, S> = natural join on shared column index
+    defs.insert("join".to_string(), Func::Native(Arc::new(|x: &Object| {
+        let items = match x.as_seq() {
+            Some(items) if items.len() == 3 => items,
+            _ => return Object::Bottom,
+        };
+        let shared_col: usize = match items[0].as_atom().and_then(|s| s.parse().ok()) {
+            Some(c) => c,
+            None => return Object::Bottom,
+        };
+        let r = match items[1].as_seq() { Some(r) => r, None => return Object::Bottom };
+        let s = match items[2].as_seq() { Some(s) => s, None => return Object::Bottom };
+
+        // Natural join: for each pair (r_tuple, s_tuple) where r[shared] = s[shared],
+        // produce the merged tuple
+        let mut result: Vec<Object> = Vec::new();
+        for r_tuple in r {
+            let r_cols = match r_tuple.as_seq() { Some(c) => c, None => continue };
+            let r_val = if shared_col >= 1 && shared_col <= r_cols.len() {
+                &r_cols[shared_col - 1]
+            } else { continue };
+
+            for s_tuple in s {
+                let s_cols = match s_tuple.as_seq() { Some(c) => c, None => continue };
+                let s_val = if shared_col >= 1 && shared_col <= s_cols.len() {
+                    &s_cols[shared_col - 1]
+                } else { continue };
+
+                if r_val == s_val {
+                    // Merge: all r columns + s columns excluding shared
+                    let mut merged: Vec<Object> = r_cols.to_vec();
+                    for (i, col) in s_cols.iter().enumerate() {
+                        if i + 1 != shared_col {
+                            merged.push(col.clone());
+                        }
+                    }
+                    result.push(Object::Seq(merged));
+                }
+            }
+        }
+        Object::Seq(result)
+    })));
+
+    // tie: γ(R) = Filter(eq∘[s₁, sₙ]) : R — select tuples where first = last
+    defs.insert("tie".to_string(), Func::Native(Arc::new(|x: &Object| {
+        let relation = match x.as_seq() {
+            Some(r) => r,
+            None => return Object::Bottom,
+        };
+        let mut result: Vec<Object> = Vec::new();
+        for tuple in relation {
+            if let Some(cols) = tuple.as_seq() {
+                if cols.len() >= 2 && cols[0] == cols[cols.len() - 1] {
+                    // Remove last column (tied to first)
+                    result.push(Object::Seq(cols[..cols.len()-1].to_vec()));
+                }
+            }
+        }
+        Object::Seq(result)
+    })));
+
+    // composition: R·S = π₁ₛ(R*S) — natural composition
+    defs.insert("compose_rel".to_string(), Func::Native(Arc::new(|x: &Object| {
+        let items = match x.as_seq() {
+            Some(items) if items.len() == 3 => items,
+            _ => return Object::Bottom,
+        };
+        let shared_col: usize = match items[0].as_atom().and_then(|s| s.parse().ok()) {
+            Some(c) => c,
+            None => return Object::Bottom,
+        };
+        let r = match items[1].as_seq() { Some(r) => r, None => return Object::Bottom };
+        let s = match items[2].as_seq() { Some(s) => s, None => return Object::Bottom };
+
+        // Join then project out the shared column
+        let mut result: Vec<Object> = Vec::new();
+        for r_tuple in r {
+            let r_cols = match r_tuple.as_seq() { Some(c) => c, None => continue };
+            let r_val = if shared_col >= 1 && shared_col <= r_cols.len() {
+                &r_cols[shared_col - 1]
+            } else { continue };
+
+            for s_tuple in s {
+                let s_cols = match s_tuple.as_seq() { Some(c) => c, None => continue };
+                let s_val = if shared_col >= 1 && shared_col <= s_cols.len() {
+                    &s_cols[shared_col - 1]
+                } else { continue };
+
+                if r_val == s_val {
+                    // Project: r columns (excluding shared) + s columns (excluding shared)
+                    let mut projected: Vec<Object> = Vec::new();
+                    for (i, col) in r_cols.iter().enumerate() {
+                        if i + 1 != shared_col { projected.push(col.clone()); }
+                    }
+                    for (i, col) in s_cols.iter().enumerate() {
+                        if i + 1 != shared_col { projected.push(col.clone()); }
+                    }
+                    let row = Object::Seq(projected);
+                    if !result.contains(&row) {
+                        result.push(row);
+                    }
+                }
+            }
+        }
+        Object::Seq(result)
+    })));
+}
+
 // ── Convenience constructors ─────────────────────────────────────────
 
 impl Func {
@@ -483,6 +1152,11 @@ impl Func {
     /// /f
     pub fn insert(f: Func) -> Func {
         Func::Insert(Box::new(f))
+    }
+
+    /// Filter(p)
+    pub fn filter(p: Func) -> Func {
+        Func::Filter(Box::new(p))
     }
 
     /// bu f x
@@ -518,6 +1192,18 @@ impl fmt::Debug for Func {
             Func::Trans => write!(f, "trans"),
             Func::ApndL => write!(f, "apndl"),
             Func::Reverse => write!(f, "reverse"),
+            Func::ApndR => write!(f, "apndr"),
+            Func::RotL => write!(f, "rotl"),
+            Func::RotR => write!(f, "rotr"),
+            Func::Add => write!(f, "+"),
+            Func::Sub => write!(f, "-"),
+            Func::Mul => write!(f, "×"),
+            Func::Div => write!(f, "÷"),
+            Func::And => write!(f, "and"),
+            Func::Or => write!(f, "or"),
+            Func::Not => write!(f, "not"),
+            Func::Fetch => write!(f, "↑"),
+            Func::Store => write!(f, "↓"),
             Func::Constant(obj) => write!(f, "{:?}̄", obj),
             Func::Compose(g, h) => write!(f, "({:?} ∘ {:?})", g, h),
             Func::Construction(funcs) => {
@@ -531,6 +1217,7 @@ impl fmt::Debug for Func {
             Func::Condition(p, t, e) => write!(f, "({:?} → {:?}; {:?})", p, t, e),
             Func::ApplyToAll(g) => write!(f, "α{:?}", g),
             Func::Insert(g) => write!(f, "/{:?}", g),
+            Func::Filter(p) => write!(f, "Filter({:?})", p),
             Func::BinaryToUnary(g, x) => write!(f, "(bu {:?} {:?})", g, x),
             Func::While(p, g) => write!(f, "(while {:?} {:?})", p, g),
             Func::Def(name) => write!(f, "{}", name),
@@ -672,20 +1359,8 @@ mod tests {
 
     #[test]
     fn insert_folds() {
-        // A native "or" function for testing insert
-        let or_fn = Func::Native(Arc::new(|x: &Object| {
-            match x.as_seq() {
-                Some(items) if items.len() == 2 => {
-                    let a = items[0].as_atom().unwrap_or("F");
-                    let b = items[1].as_atom().unwrap_or("F");
-                    if a == "T" || b == "T" { Object::t() } else { Object::f() }
-                }
-                _ => Object::Bottom,
-            }
-        }));
-
         // /(or):<F, F, T> = or:<F, or:<F, T>> = or:<F, T> = T
-        let f = Func::insert(or_fn);
+        let f = Func::insert(Func::Or);
         let seq = Object::seq(vec![Object::f(), Object::f(), Object::t()]);
         assert_eq!(apply(&f, &seq, &defs()), Object::t());
 
@@ -768,18 +1443,7 @@ mod tests {
     fn insert_or_checks_existence() {
         // /(or):<T, F, F> = T  (at least one org matches → user has access)
         // /(or):<F, F, F> = F  (no org matches → no access)
-        let or_fn = Func::Native(Arc::new(|x: &Object| {
-            match x.as_seq() {
-                Some(items) if items.len() == 2 => {
-                    let a = items[0].as_atom().unwrap_or("F");
-                    let b = items[1].as_atom().unwrap_or("F");
-                    if a == "T" || b == "T" { Object::t() } else { Object::f() }
-                }
-                _ => Object::Bottom,
-            }
-        }));
-
-        let exists = Func::insert(or_fn);
+        let exists = Func::insert(Func::Or);
         let has_match = Object::seq(vec![Object::t(), Object::f(), Object::f()]);
         let no_match = Object::seq(vec![Object::f(), Object::f(), Object::f()]);
         assert_eq!(apply(&exists, &has_match, &defs()), Object::t());
@@ -797,21 +1461,10 @@ mod tests {
         //         = /(or) ∘ <eq:<org-2, org-1>, eq:<org-2, org-2>>
         //         = /(or) ∘ <F, T>
         //         = T
-        let or_fn = Func::Native(Arc::new(|x: &Object| {
-            match x.as_seq() {
-                Some(items) if items.len() == 2 => {
-                    let a = items[0].as_atom().unwrap_or("F");
-                    let b = items[1].as_atom().unwrap_or("F");
-                    if a == "T" || b == "T" { Object::t() } else { Object::f() }
-                }
-                _ => Object::Bottom,
-            }
-        }));
-
         // Domain org = "org-2". Check: is org-2 in user's org list?
         let domain_org = Object::atom("org-2");
         let check_access = Func::compose(
-            Func::insert(or_fn),
+            Func::insert(Func::Or),
             Func::apply_to_all(Func::bu(Func::Eq, domain_org)),
         );
 
@@ -834,6 +1487,89 @@ mod tests {
         assert_eq!(apply(&Func::construction(vec![Func::Id]), &Object::Bottom, &d), Object::Bottom);
         assert_eq!(apply(&Func::compose(Func::Id, Func::Id), &Object::Bottom, &d), Object::Bottom);
         assert_eq!(apply(&Func::apply_to_all(Func::Id), &Object::Bottom, &d), Object::Bottom);
+        assert_eq!(apply(&Func::filter(Func::Id), &Object::Bottom, &d), Object::Bottom);
+    }
+
+    // ── Filter ───────────────────────────────────────────────────
+
+    #[test]
+    fn filter_keeps_matching_items() {
+        // Filter(bu eq "owner"):<"owner", "member", "owner"> = <"owner", "owner">
+        let pred = Func::bu(Func::Eq, Object::atom("owner"));
+        let seq = Object::seq(vec![
+            Object::atom("owner"),
+            Object::atom("member"),
+            Object::atom("owner"),
+        ]);
+        assert_eq!(
+            apply(&Func::filter(pred), &seq, &defs()),
+            Object::seq(vec![Object::atom("owner"), Object::atom("owner")])
+        );
+    }
+
+    #[test]
+    fn filter_on_tuples_checks_role() {
+        // Filter facts where role 2 = "owner":
+        // Filter(eq ∘ [2, "owner"̄])
+        let pred = Func::compose(
+            Func::Eq,
+            Func::construction(vec![
+                Func::Selector(2),
+                Func::constant(Object::atom("owner")),
+            ]),
+        );
+        let pop = Object::seq(vec![
+            Object::seq(vec![Object::atom("alice"), Object::atom("owner"), Object::atom("org-1")]),
+            Object::seq(vec![Object::atom("bob"), Object::atom("member"), Object::atom("org-2")]),
+            Object::seq(vec![Object::atom("carol"), Object::atom("owner"), Object::atom("org-3")]),
+        ]);
+        let result = apply(&Func::filter(pred), &pop, &defs());
+        assert_eq!(
+            result,
+            Object::seq(vec![
+                Object::seq(vec![Object::atom("alice"), Object::atom("owner"), Object::atom("org-1")]),
+                Object::seq(vec![Object::atom("carol"), Object::atom("owner"), Object::atom("org-3")]),
+            ])
+        );
+    }
+
+    #[test]
+    fn filter_empty_returns_phi() {
+        let pred = Func::bu(Func::Eq, Object::atom("x"));
+        assert_eq!(apply(&Func::filter(pred), &Object::phi(), &defs()), Object::phi());
+    }
+
+    #[test]
+    fn filter_no_matches_returns_phi() {
+        let pred = Func::bu(Func::Eq, Object::atom("x"));
+        let seq = Object::seq(vec![Object::atom("a"), Object::atom("b")]);
+        assert_eq!(apply(&Func::filter(pred), &seq, &defs()), Object::phi());
+    }
+
+    #[test]
+    fn filter_compose_extracts_from_matches() {
+        // Full query pipeline: α(1) ∘ Filter(eq ∘ [2, "owner"̄])
+        // = extract role 1 from facts where role 2 = "owner"
+        let pred = Func::compose(
+            Func::Eq,
+            Func::construction(vec![
+                Func::Selector(2),
+                Func::constant(Object::atom("owner")),
+            ]),
+        );
+        let query = Func::compose(
+            Func::apply_to_all(Func::Selector(1)),
+            Func::filter(pred),
+        );
+        let pop = Object::seq(vec![
+            Object::seq(vec![Object::atom("alice"), Object::atom("owner")]),
+            Object::seq(vec![Object::atom("bob"), Object::atom("member")]),
+            Object::seq(vec![Object::atom("carol"), Object::atom("owner")]),
+        ]);
+        assert_eq!(
+            apply(&query, &pop, &defs()),
+            Object::seq(vec![Object::atom("alice"), Object::atom("carol")])
+        );
     }
 
     // ── Named definitions ────────────────────────────────────────
@@ -847,5 +1583,745 @@ mod tests {
         let f = Func::Def("second".to_string());
         let seq = Object::seq(vec![Object::atom("a"), Object::atom("b")]);
         assert_eq!(apply(&f, &seq, &d), Object::atom("b"));
+    }
+
+    // ── Backus sequence primitives (Task 1) ─────────────────────
+
+    #[test]
+    fn apndr_appends_to_right() {
+        let x = Object::seq(vec![
+            Object::seq(vec![Object::atom("a"), Object::atom("b")]),
+            Object::atom("c"),
+        ]);
+        assert_eq!(
+            apply(&Func::ApndR, &x, &defs()),
+            Object::seq(vec![Object::atom("a"), Object::atom("b"), Object::atom("c")])
+        );
+    }
+
+    #[test]
+    fn rotl_rotates_left() {
+        let seq = Object::seq(vec![Object::atom("a"), Object::atom("b"), Object::atom("c")]);
+        assert_eq!(
+            apply(&Func::RotL, &seq, &defs()),
+            Object::seq(vec![Object::atom("b"), Object::atom("c"), Object::atom("a")])
+        );
+    }
+
+    #[test]
+    fn rotr_rotates_right() {
+        let seq = Object::seq(vec![Object::atom("a"), Object::atom("b"), Object::atom("c")]);
+        assert_eq!(
+            apply(&Func::RotR, &seq, &defs()),
+            Object::seq(vec![Object::atom("c"), Object::atom("a"), Object::atom("b")])
+        );
+    }
+
+    // ── Backus arithmetic (Task 2) ──────────────────────────────
+
+    #[test]
+    fn add_numbers() {
+        let x = Object::seq(vec![Object::atom("3"), Object::atom("4")]);
+        assert_eq!(apply(&Func::Add, &x, &defs()), Object::atom("7"));
+    }
+
+    #[test]
+    fn sub_numbers() {
+        let x = Object::seq(vec![Object::atom("7"), Object::atom("4")]);
+        assert_eq!(apply(&Func::Sub, &x, &defs()), Object::atom("3"));
+    }
+
+    #[test]
+    fn mul_numbers() {
+        let x = Object::seq(vec![Object::atom("3"), Object::atom("4")]);
+        assert_eq!(apply(&Func::Mul, &x, &defs()), Object::atom("12"));
+    }
+
+    #[test]
+    fn div_numbers() {
+        let x = Object::seq(vec![Object::atom("12"), Object::atom("4")]);
+        assert_eq!(apply(&Func::Div, &x, &defs()), Object::atom("3"));
+    }
+
+    #[test]
+    fn div_by_zero_is_bottom() {
+        let x = Object::seq(vec![Object::atom("12"), Object::atom("0")]);
+        assert_eq!(apply(&Func::Div, &x, &defs()), Object::Bottom);
+    }
+
+    #[test]
+    fn arithmetic_on_non_numbers_is_bottom() {
+        let x = Object::seq(vec![Object::atom("hello"), Object::atom("4")]);
+        assert_eq!(apply(&Func::Add, &x, &defs()), Object::Bottom);
+    }
+
+    #[test]
+    fn add_floats() {
+        let x = Object::seq(vec![Object::atom("2.5"), Object::atom("1.5")]);
+        assert_eq!(apply(&Func::Add, &x, &defs()), Object::atom("4"));
+    }
+
+    // ── Backus logic (Task 3) ───────────────────────────────────
+
+    #[test]
+    fn and_logic() {
+        assert_eq!(apply(&Func::And, &Object::seq(vec![Object::t(), Object::t()]), &defs()), Object::t());
+        assert_eq!(apply(&Func::And, &Object::seq(vec![Object::t(), Object::f()]), &defs()), Object::f());
+        assert_eq!(apply(&Func::And, &Object::seq(vec![Object::f(), Object::f()]), &defs()), Object::f());
+    }
+
+    #[test]
+    fn or_logic() {
+        assert_eq!(apply(&Func::Or, &Object::seq(vec![Object::f(), Object::f()]), &defs()), Object::f());
+        assert_eq!(apply(&Func::Or, &Object::seq(vec![Object::t(), Object::f()]), &defs()), Object::t());
+        assert_eq!(apply(&Func::Or, &Object::seq(vec![Object::f(), Object::t()]), &defs()), Object::t());
+    }
+
+    #[test]
+    fn not_logic() {
+        assert_eq!(apply(&Func::Not, &Object::t(), &defs()), Object::f());
+        assert_eq!(apply(&Func::Not, &Object::f(), &defs()), Object::t());
+        assert_eq!(apply(&Func::Not, &Object::atom("x"), &defs()), Object::Bottom);
+    }
+
+    // ── Backus inner product (Task 4) ───────────────────────────
+
+    #[test]
+    fn insert_add_folds_sum() {
+        // /+:<1,2,3> = 6
+        let f = Func::insert(Func::Add);
+        let seq = Object::seq(vec![Object::atom("1"), Object::atom("2"), Object::atom("3")]);
+        assert_eq!(apply(&f, &seq, &defs()), Object::atom("6"));
+    }
+
+    #[test]
+    fn insert_add_singleton() {
+        // /+:<7> = 7
+        let f = Func::insert(Func::Add);
+        let seq = Object::seq(vec![Object::atom("7")]);
+        assert_eq!(apply(&f, &seq, &defs()), Object::atom("7"));
+    }
+
+    #[test]
+    fn inner_product_backus_example() {
+        // Def IP ≡ (/+) ∘ (α×) ∘ trans
+        // IP:<<1,2,3>,<6,5,4>> = 28
+        let ip = Func::compose(
+            Func::insert(Func::Add),
+            Func::compose(
+                Func::apply_to_all(Func::Mul),
+                Func::Trans,
+            ),
+        );
+        let input = Object::seq(vec![
+            Object::seq(vec![Object::atom("1"), Object::atom("2"), Object::atom("3")]),
+            Object::seq(vec![Object::atom("6"), Object::atom("5"), Object::atom("4")]),
+        ]);
+        assert_eq!(apply(&ip, &input, &defs()), Object::atom("28"));
+    }
+
+    // ── Insert with first-class Or (replaces Native) ────────────
+
+    #[test]
+    fn insert_or_with_first_class() {
+        // /(or):<F, F, T> = T — using first-class Or instead of Native
+        let f = Func::insert(Func::Or);
+        let seq = Object::seq(vec![Object::f(), Object::f(), Object::t()]);
+        assert_eq!(apply(&f, &seq, &defs()), Object::t());
+
+        let seq2 = Object::seq(vec![Object::f(), Object::f(), Object::f()]);
+        assert_eq!(apply(&f, &seq2, &defs()), Object::f());
+    }
+
+    #[test]
+    fn insert_and_with_first_class() {
+        let f = Func::insert(Func::And);
+        let seq = Object::seq(vec![Object::t(), Object::t(), Object::t()]);
+        assert_eq!(apply(&f, &seq, &defs()), Object::t());
+
+        let seq2 = Object::seq(vec![Object::t(), Object::f(), Object::t()]);
+        assert_eq!(apply(&f, &seq2, &defs()), Object::f());
+    }
+
+    // ── Codd θ₁ relational operations ─────────────────────────
+
+    fn theta1_defs() -> HashMap<String, Func> {
+        let mut d = HashMap::new();
+        register_theta1(&mut d);
+        d
+    }
+
+    #[test]
+    fn theta1_projection() {
+        // π_{1,3}(R) where R = <<a,b,c>,<d,e,f>>
+        // project:<⟨1,3⟩, R> = <<a,c>,<d,f>>
+        let d = theta1_defs();
+        let input = Object::seq(vec![
+            Object::seq(vec![Object::atom("1"), Object::atom("3")]),
+            Object::Seq(vec![
+                Object::seq(vec![Object::atom("a"), Object::atom("b"), Object::atom("c")]),
+                Object::seq(vec![Object::atom("d"), Object::atom("e"), Object::atom("f")]),
+            ]),
+        ]);
+        let result = apply_ffp(&Object::atom("project"), &input, &d);
+        assert_eq!(result, Object::Seq(vec![
+            Object::Seq(vec![Object::atom("a"), Object::atom("c")]),
+            Object::Seq(vec![Object::atom("d"), Object::atom("f")]),
+        ]));
+    }
+
+    #[test]
+    fn theta1_projection_removes_duplicates() {
+        // project:<⟨1⟩, <<a,x>,<b,y>,<a,z>>> = <<a>,<b>> (a appears once)
+        let d = theta1_defs();
+        let input = Object::seq(vec![
+            Object::seq(vec![Object::atom("1")]),
+            Object::Seq(vec![
+                Object::seq(vec![Object::atom("a"), Object::atom("x")]),
+                Object::seq(vec![Object::atom("b"), Object::atom("y")]),
+                Object::seq(vec![Object::atom("a"), Object::atom("z")]),
+            ]),
+        ]);
+        let result = apply_ffp(&Object::atom("project"), &input, &d);
+        assert_eq!(result, Object::Seq(vec![
+            Object::Seq(vec![Object::atom("a")]),
+            Object::Seq(vec![Object::atom("b")]),
+        ]));
+    }
+
+    #[test]
+    fn theta1_natural_join() {
+        // R = <<1,a>,<2,b>>, S = <<a,x>,<b,y>>
+        // join on col 2 of R = col 1 of S (shared value domain)
+        // join:<2, R, S> (but col 2 of R matches col 1 of S by value)
+        // Actually: join on shared column means same index.
+        // Let's use: R = <<s1,p1>,<s2,p1>>, S = <<p1,j1>,<p2,j2>>
+        // join:<2, R, S> where col 2 is the shared domain
+        // Wait — our join takes shared_col as the index that's shared in BOTH relations.
+        // R = <<1,a>,<2,a>,<2,b>>, S = <<a,x>,<b,y>>
+        // join on col 1 of S = col 2 of R... this is a simplification.
+        // Let's use Codd's example from Figure 5-6:
+        // R(supplier, part): <<1,1>,<2,1>,<2,2>>
+        // S(part, project): <<1,1>,<1,2>,<2,1>>
+        // Natural join on "part" (col 2 in R, col 1 in S):
+        // Our impl uses same-index join, which is simpler.
+        // Use: shared_col=1, R and S both have col 1 as join key
+        let d = theta1_defs();
+        let r = Object::Seq(vec![
+            Object::seq(vec![Object::atom("a"), Object::atom("x")]),
+            Object::seq(vec![Object::atom("b"), Object::atom("y")]),
+        ]);
+        let s = Object::Seq(vec![
+            Object::seq(vec![Object::atom("a"), Object::atom("1")]),
+            Object::seq(vec![Object::atom("a"), Object::atom("2")]),
+            Object::seq(vec![Object::atom("c"), Object::atom("3")]),
+        ]);
+        // join on col 1: a matches a (twice), b has no match, c has no match in R
+        let input = Object::seq(vec![Object::atom("1"), r, s]);
+        let result = apply_ffp(&Object::atom("join"), &input, &d);
+        // Expected: <<a,x,1>, <a,x,2>> (a matched, x from R, 1/2 from S minus shared)
+        // S cols excluding shared col 1: just col 2
+        assert_eq!(result, Object::Seq(vec![
+            Object::Seq(vec![Object::atom("a"), Object::atom("x"), Object::atom("1")]),
+            Object::Seq(vec![Object::atom("a"), Object::atom("x"), Object::atom("2")]),
+        ]));
+    }
+
+    #[test]
+    fn theta1_tie() {
+        // γ(R): select tuples where first = last, remove last column
+        // R = <<a,1,a>,<b,2,c>,<c,3,c>>
+        // tie:R = <<a,1>,<c,3>> (first=last for a and c)
+        let d = theta1_defs();
+        let r = Object::Seq(vec![
+            Object::seq(vec![Object::atom("a"), Object::atom("1"), Object::atom("a")]),
+            Object::seq(vec![Object::atom("b"), Object::atom("2"), Object::atom("c")]),
+            Object::seq(vec![Object::atom("c"), Object::atom("3"), Object::atom("c")]),
+        ]);
+        let result = apply_ffp(&Object::atom("tie"), &r, &d);
+        assert_eq!(result, Object::Seq(vec![
+            Object::Seq(vec![Object::atom("a"), Object::atom("1")]),
+            Object::Seq(vec![Object::atom("c"), Object::atom("3")]),
+        ]));
+    }
+
+    #[test]
+    fn theta1_composition() {
+        // R·S = π₁ₛ(R*S) — project out shared column from join
+        // R = <<a,x>,<b,y>>, S = <<x,1>,<y,2>>
+        // compose_rel on col 2 of R = col 1 of S:
+        // join gives <<a,x,1>,<b,y,2>>, project out col 2 gives <<a,1>,<b,2>>
+        let d = theta1_defs();
+        let r = Object::Seq(vec![
+            Object::seq(vec![Object::atom("a"), Object::atom("x")]),
+            Object::seq(vec![Object::atom("b"), Object::atom("y")]),
+        ]);
+        let s = Object::Seq(vec![
+            Object::seq(vec![Object::atom("x"), Object::atom("1")]),
+            Object::seq(vec![Object::atom("y"), Object::atom("2")]),
+        ]);
+        // compose_rel:<shared_col, R, S>
+        // shared_col = 2 for R (col 2), = 1 for S (col 1)
+        // Our impl uses same index for both, so use col 1:
+        // Actually our compose_rel joins on shared_col in both, then removes it.
+        // R' = <<x,a>>, S' = <<x,1>> with shared on col 1:
+        let r2 = Object::Seq(vec![
+            Object::seq(vec![Object::atom("x"), Object::atom("a")]),
+            Object::seq(vec![Object::atom("y"), Object::atom("b")]),
+        ]);
+        let s2 = Object::Seq(vec![
+            Object::seq(vec![Object::atom("x"), Object::atom("1")]),
+            Object::seq(vec![Object::atom("y"), Object::atom("2")]),
+        ]);
+        let input = Object::seq(vec![Object::atom("1"), r2, s2]);
+        let result = apply_ffp(&Object::atom("compose_rel"), &input, &d);
+        // x matches x: project out col 1 → <a, 1>
+        // y matches y: project out col 1 → <b, 2>
+        assert_eq!(result, Object::Seq(vec![
+            Object::Seq(vec![Object::atom("a"), Object::atom("1")]),
+            Object::Seq(vec![Object::atom("b"), Object::atom("2")]),
+        ]));
+    }
+
+    // ── Algebraic Laws (Backus 12.2) ──────────────────────────
+    // Mechanical verification that the implementation respects the algebra.
+
+    // I. Composition and construction
+    #[test]
+    fn law_i1_construction_distributes_over_composition() {
+        // I.1: [f₁,...,fₙ]∘g ≡ [f₁∘g,...,fₙ∘g]
+        let d = defs();
+        let x = Object::seq(vec![Object::atom("a"), Object::atom("b"), Object::atom("c")]);
+
+        let lhs = Func::compose(
+            Func::construction(vec![Func::Selector(1), Func::Selector(2)]),
+            Func::Tail,
+        );
+        let rhs = Func::construction(vec![
+            Func::compose(Func::Selector(1), Func::Tail),
+            Func::compose(Func::Selector(2), Func::Tail),
+        ]);
+        assert_eq!(apply(&lhs, &x, &d), apply(&rhs, &x, &d));
+    }
+
+    #[test]
+    fn law_i2_alpha_distributes_over_construction() {
+        // I.2: α∘[g₁,...,gₙ] ≡ [f∘g₁,...,f∘gₙ] — wait, that's wrong
+        // I.2: α f∘[g₁,...,gₙ] ≡ [f∘g₁,...,f∘gₙ]
+        // Actually Backus I.2: αf∘[g₁,...,gₙ] ≡ [f∘g₁,...,f∘gₙ]
+        let d = defs();
+        let x = Object::seq(vec![Object::atom("a"), Object::atom("b")]);
+
+        // αf = α(length), g₁ = [1], g₂ = [2]... no, let's use simpler functions
+        // Actually the law is about applying αf to the result of a construction
+        // αf∘[g₁,...,gₙ]:x = αf:<g₁:x,...,gₙ:x> = <f:(g₁:x),...,f:(gₙ:x)>
+        // [f∘g₁,...,f∘gₙ]:x = <(f∘g₁):x,...,(f∘gₙ):x> = <f:(g₁:x),...,f:(gₙ:x)>
+        // Use f = not, g₁ = atom (returns T for atom), g₂ = null
+        let lhs = Func::compose(
+            Func::apply_to_all(Func::Not),
+            Func::construction(vec![Func::AtomTest, Func::NullTest]),
+        );
+        let rhs = Func::construction(vec![
+            Func::compose(Func::Not, Func::AtomTest),
+            Func::compose(Func::Not, Func::NullTest),
+        ]);
+        // x = <a, b> is a sequence: atom returns F, null returns F
+        // lhs: α(not):< F, F> = <T, T>
+        // rhs: [not∘atom, not∘null]:x = <T, T>
+        assert_eq!(apply(&lhs, &x, &d), apply(&rhs, &x, &d));
+    }
+
+    #[test]
+    fn law_i3_insert_over_construction() {
+        // I.3: /f∘[g₁,...,gₙ] ≡ f∘[g₁, /f∘[g₂,...,gₙ]] when n≥2
+        // Simplified: /+∘[1, 2, 3]:x = +:<1:x, +:<2:x, 3:x>>
+        let d = defs();
+        let x = Object::seq(vec![Object::atom("10"), Object::atom("20"), Object::atom("30")]);
+
+        let lhs = Func::compose(
+            Func::insert(Func::Add),
+            Func::construction(vec![Func::Selector(1), Func::Selector(2), Func::Selector(3)]),
+        );
+        // rhs: [1,2,3]:x = <10,20,30>, then /+:<10,20,30> = 60
+        assert_eq!(apply(&lhs, &x, &d), Object::atom("60"));
+    }
+
+    #[test]
+    fn law_i5_selector_construction_identity() {
+        // I.5: s∘[f₁,...,fₙ] ≤ fₛ for selector s, s≤n
+        // 2∘[f₁,f₂,f₃] = f₂
+        let d = defs();
+        let x = Object::seq(vec![Object::atom("a"), Object::atom("b"), Object::atom("c")]);
+
+        let lhs = Func::compose(
+            Func::Selector(2),
+            Func::construction(vec![Func::Selector(3), Func::Selector(1), Func::Selector(2)]),
+        );
+        // [3,1,2]:x = <c,a,b>, then 2:<c,a,b> = a = 1:x
+        let rhs = Func::Selector(1);
+        assert_eq!(apply(&lhs, &x, &d), apply(&rhs, &x, &d));
+    }
+
+    // II. Composition and condition
+    #[test]
+    fn law_ii1_condition_compose_left() {
+        // II.1: (p→f;g)∘h ≡ p∘h → f∘h; g∘h
+        let d = defs();
+        let x = Object::seq(vec![Object::atom("a"), Object::atom("b")]);
+
+        let lhs = Func::compose(
+            Func::condition(Func::NullTest, Func::constant(Object::atom("yes")), Func::constant(Object::atom("no"))),
+            Func::Tail,
+        );
+        // tl:<a,b> = <b>, null:<b> = F, so result = "no"
+        let rhs = Func::condition(
+            Func::compose(Func::NullTest, Func::Tail),
+            Func::compose(Func::constant(Object::atom("yes")), Func::Tail),
+            Func::compose(Func::constant(Object::atom("no")), Func::Tail),
+        );
+        assert_eq!(apply(&lhs, &x, &d), apply(&rhs, &x, &d));
+    }
+
+    // III. Composition and miscellaneous
+    #[test]
+    fn law_iii1_constant_absorbs_composition() {
+        // III.1: x̄∘f ≤ x̄ (defined→f → x̄∘f:y = x̄:(f:y) = x)
+        let d = defs();
+        let y = Object::seq(vec![Object::atom("a"), Object::atom("b")]);
+        let lhs = Func::compose(Func::constant(Object::atom("hello")), Func::Tail);
+        let rhs = Func::constant(Object::atom("hello"));
+        assert_eq!(apply(&lhs, &y, &d), apply(&rhs, &y, &d));
+    }
+
+    #[test]
+    fn law_iii2_compose_id_is_identity() {
+        // III.2: f∘id ≡ id∘f ≡ f
+        let d = defs();
+        let x = Object::seq(vec![Object::atom("a"), Object::atom("b")]);
+        let f = Func::Selector(1);
+        let lhs1 = Func::compose(f.clone(), Func::Id);
+        let lhs2 = Func::compose(Func::Id, f.clone());
+        assert_eq!(apply(&lhs1, &x, &d), apply(&f, &x, &d));
+        assert_eq!(apply(&lhs2, &x, &d), apply(&f, &x, &d));
+    }
+
+    #[test]
+    fn law_iii4_alpha_compose_distributes() {
+        // III.4: α(f∘g) ≡ αf ∘ αg
+        let d = defs();
+        let x = Object::seq(vec![
+            Object::seq(vec![Object::atom("a"), Object::atom("b")]),
+            Object::seq(vec![Object::atom("c"), Object::atom("d")]),
+        ]);
+        // f = 1, g = reverse
+        let lhs = Func::apply_to_all(Func::compose(Func::Selector(1), Func::Reverse));
+        let rhs = Func::compose(
+            Func::apply_to_all(Func::Selector(1)),
+            Func::apply_to_all(Func::Reverse),
+        );
+        // lhs: α(1∘reverse):<<a,b>,<c,d>> = <(1∘reverse):<a,b>, (1∘reverse):<c,d>> = <b, d>
+        // rhs: α1∘(αreverse:<<a,b>,<c,d>>) = α1:<<b,a>,<d,c>> = <b, d>
+        assert_eq!(apply(&lhs, &x, &d), apply(&rhs, &x, &d));
+    }
+
+    // ── Cells and State (Backus 14.3) ─────────────────────────
+
+    #[test]
+    fn cell_fetch_retrieves_contents() {
+        // D = <<CELL, "FILE", <a,b>>, <CELL, "defs", <c>>>
+        // ↑FILE:D = <a,b>
+        let state = Object::Seq(vec![
+            cell("FILE", Object::seq(vec![Object::atom("a"), Object::atom("b")])),
+            cell("defs", Object::seq(vec![Object::atom("c")])),
+        ]);
+        assert_eq!(fetch("FILE", &state), Object::seq(vec![Object::atom("a"), Object::atom("b")]));
+        assert_eq!(fetch("defs", &state), Object::seq(vec![Object::atom("c")]));
+        assert_eq!(fetch("missing", &state), Object::Bottom);
+    }
+
+    #[test]
+    fn cell_store_replaces_contents() {
+        let state = Object::Seq(vec![
+            cell("FILE", Object::seq(vec![Object::atom("old")])),
+            cell("defs", Object::seq(vec![Object::atom("c")])),
+        ]);
+        let new_state = store("FILE", Object::seq(vec![Object::atom("new")]), &state);
+        assert_eq!(fetch("FILE", &new_state), Object::seq(vec![Object::atom("new")]));
+        assert_eq!(fetch("defs", &new_state), Object::seq(vec![Object::atom("c")]));
+    }
+
+    #[test]
+    fn cell_store_appends_new_cell() {
+        let state = Object::Seq(vec![
+            cell("FILE", Object::atom("data")),
+        ]);
+        let new_state = store("defs", Object::atom("rules"), &state);
+        assert_eq!(fetch("FILE", &new_state), Object::atom("data"));
+        assert_eq!(fetch("defs", &new_state), Object::atom("rules"));
+    }
+
+    #[test]
+    fn fetch_via_func_apply() {
+        // fetch:<"FILE", D> via Func::Fetch
+        let state = Object::Seq(vec![
+            cell("FILE", Object::atom("population")),
+        ]);
+        let input = Object::seq(vec![Object::atom("FILE"), state]);
+        assert_eq!(apply(&Func::Fetch, &input, &defs()), Object::atom("population"));
+    }
+
+    #[test]
+    fn store_via_func_apply() {
+        // store:<"FILE", new_contents, D> via Func::Store
+        let state = Object::Seq(vec![
+            cell("FILE", Object::atom("old")),
+        ]);
+        let input = Object::seq(vec![Object::atom("FILE"), Object::atom("new"), state]);
+        let result = apply(&Func::Store, &input, &defs());
+        assert_eq!(fetch("FILE", &result), Object::atom("new"));
+    }
+
+    #[test]
+    fn fetch_via_ffp() {
+        // FFP: ("fetch":<"FILE", D>)
+        let state = Object::Seq(vec![
+            cell("FILE", Object::atom("pop")),
+        ]);
+        let input = Object::seq(vec![Object::atom("FILE"), state]);
+        assert_eq!(apply_ffp(&Object::atom("fetch"), &input, &defs()), Object::atom("pop"));
+    }
+
+    #[test]
+    fn ast_state_as_cell_sequence() {
+        // Full AST state D = <<CELL, FILE, population>, <CELL, defs, definitions>>
+        // This models Backus Section 14.3: the state is a sequence of cells.
+        let population = Object::seq(vec![
+            Object::seq(vec![Object::atom("Order"), Object::atom("ord-1")]),
+            Object::seq(vec![Object::atom("Customer"), Object::atom("acme")]),
+        ]);
+        let definitions = Object::seq(vec![
+            Object::atom("create"),
+            Object::atom("validate"),
+        ]);
+        let d = Object::Seq(vec![
+            cell("FILE", population.clone()),
+            cell("defs", definitions.clone()),
+        ]);
+
+        assert_eq!(fetch("FILE", &d), population);
+        assert_eq!(fetch("defs", &d), definitions);
+
+        // Store updated population
+        let new_pop = Object::seq(vec![
+            Object::seq(vec![Object::atom("Order"), Object::atom("ord-1")]),
+            Object::seq(vec![Object::atom("Customer"), Object::atom("acme")]),
+            Object::seq(vec![Object::atom("SM"), Object::atom("Draft")]),
+        ]);
+        let d_prime = store("FILE", new_pop.clone(), &d);
+        assert_eq!(fetch("FILE", &d_prime), new_pop);
+        assert_eq!(fetch("defs", &d_prime), definitions); // defs unchanged
+    }
+
+    // ── FFP: ρ and metacomposition (Backus 13) ──────────────────
+
+    #[test]
+    fn rho_primitive_atom_resolves() {
+        // ρ("+") = Add
+        let d = defs();
+        let func = rho(&Object::atom("+"), &d);
+        let x = Object::seq(vec![Object::atom("3"), Object::atom("4")]);
+        assert_eq!(apply(&func, &x, &d), Object::atom("7"));
+    }
+
+    #[test]
+    fn rho_selector_atom_resolves() {
+        // ρ("2") = Selector(2)
+        let d = defs();
+        let func = rho(&Object::atom("2"), &d);
+        let x = Object::seq(vec![Object::atom("a"), Object::atom("b"), Object::atom("c")]);
+        assert_eq!(apply(&func, &x, &d), Object::atom("b"));
+    }
+
+    #[test]
+    fn rho_undefined_atom_is_bottom() {
+        // ρ("undefined_name") = ⊥̄
+        let d = defs();
+        let func = rho(&Object::atom("undefined_name"), &d);
+        assert_eq!(apply(&func, &Object::atom("x"), &d), Object::Bottom);
+    }
+
+    #[test]
+    fn rho_defined_atom_resolves() {
+        // Def "second" ≡ Selector(2)
+        let mut d = HashMap::new();
+        d.insert("second".to_string(), Func::Selector(2));
+        let func = rho(&Object::atom("second"), &d);
+        let x = Object::seq(vec![Object::atom("a"), Object::atom("b")]);
+        assert_eq!(apply(&func, &x, &d), Object::atom("b"));
+    }
+
+    #[test]
+    fn rho_comp_sequence() {
+        // ρ<COMP, "1", "tl"> = 1 ∘ tl
+        // (1 ∘ tl):<a,b,c> = 1:<b,c> = b
+        let d = defs();
+        let obj = Object::Seq(vec![
+            Object::atom(forms::COMP),
+            Object::atom("1"),
+            Object::atom(primitives::TL),
+        ]);
+        let func = rho(&obj, &d);
+        let x = Object::seq(vec![Object::atom("a"), Object::atom("b"), Object::atom("c")]);
+        assert_eq!(apply(&func, &x, &d), Object::atom("b"));
+    }
+
+    #[test]
+    fn rho_cons_sequence() {
+        // ρ<CONS, "1", "2"> = [1, 2]
+        // [1, 2]:<a, b, c> = <a, b>
+        let d = defs();
+        let obj = Object::Seq(vec![
+            Object::atom(forms::CONS),
+            Object::atom("1"),
+            Object::atom("2"),
+        ]);
+        let func = rho(&obj, &d);
+        let x = Object::seq(vec![Object::atom("a"), Object::atom("b"), Object::atom("c")]);
+        assert_eq!(apply(&func, &x, &d), Object::seq(vec![Object::atom("a"), Object::atom("b")]));
+    }
+
+    #[test]
+    fn rho_cond_sequence() {
+        // ρ<COND, "null", <CONST, "empty">, <CONST, "notempty">> = (null → "empty"̄; "notempty"̄)
+        let d = defs();
+        let obj = Object::Seq(vec![
+            Object::atom(forms::COND),
+            Object::atom(primitives::NULL),
+            Object::Seq(vec![Object::atom(forms::CONST), Object::atom("empty")]),
+            Object::Seq(vec![Object::atom(forms::CONST), Object::atom("notempty")]),
+        ]);
+        let func = rho(&obj, &d);
+        assert_eq!(apply(&func, &Object::phi(), &d), Object::atom("empty"));
+        assert_eq!(apply(&func, &Object::seq(vec![Object::atom("x")]), &d), Object::atom("notempty"));
+    }
+
+    #[test]
+    fn rho_insert_add() {
+        // ρ<INSERT, "+"> = /+
+        // /+:<1,2,3> = 6
+        let d = defs();
+        let obj = Object::Seq(vec![
+            Object::atom(forms::INSERT),
+            Object::atom(primitives::ADD),
+        ]);
+        let func = rho(&obj, &d);
+        let x = Object::seq(vec![Object::atom("1"), Object::atom("2"), Object::atom("3")]);
+        assert_eq!(apply(&func, &x, &d), Object::atom("6"));
+    }
+
+    #[test]
+    fn rho_alpha_sequence() {
+        // ρ<ALPHA, "1"> = α(1)
+        // α(1):<<a,b>,<c,d>> = <a,c>
+        let d = defs();
+        let obj = Object::Seq(vec![
+            Object::atom(forms::ALPHA),
+            Object::atom("1"),
+        ]);
+        let func = rho(&obj, &d);
+        let x = Object::seq(vec![
+            Object::seq(vec![Object::atom("a"), Object::atom("b")]),
+            Object::seq(vec![Object::atom("c"), Object::atom("d")]),
+        ]);
+        assert_eq!(apply(&func, &x, &d), Object::seq(vec![Object::atom("a"), Object::atom("c")]));
+    }
+
+    #[test]
+    fn rho_bu_sequence() {
+        // ρ<BU, "eq", "owner"> = (bu eq "owner")
+        let d = defs();
+        let obj = Object::Seq(vec![
+            Object::atom(forms::BU),
+            Object::atom(primitives::EQ),
+            Object::atom("owner"),
+        ]);
+        let func = rho(&obj, &d);
+        assert_eq!(apply(&func, &Object::atom("owner"), &d), Object::t());
+        assert_eq!(apply(&func, &Object::atom("member"), &d), Object::f());
+    }
+
+    #[test]
+    fn apply_ffp_evaluates_object_as_function() {
+        // FFP: ("+":< 3, 4>) = 7
+        let d = defs();
+        let operator = Object::atom("+");
+        let operand = Object::seq(vec![Object::atom("3"), Object::atom("4")]);
+        assert_eq!(apply_ffp(&operator, &operand, &d), Object::atom("7"));
+    }
+
+    #[test]
+    fn apply_ffp_composition_as_object() {
+        // FFP: (<COMP, "+", <CONS, "1", "1">>:<3, 4>) = +:<3, 3> = ... no
+        // Better: (<COMP, <INSERT, "+">, <ALPHA, "*">>:<<1,2,3>,<6,5,4>>) = 28
+        // This is the inner product as an FFP object
+        let d = defs();
+        let ip_obj = Object::Seq(vec![
+            Object::atom(forms::COMP),
+            Object::Seq(vec![Object::atom(forms::INSERT), Object::atom(primitives::ADD)]),
+            Object::Seq(vec![
+                Object::atom(forms::COMP),
+                Object::Seq(vec![Object::atom(forms::ALPHA), Object::atom(primitives::MUL)]),
+                Object::atom(primitives::TRANS),
+            ]),
+        ]);
+        let input = Object::seq(vec![
+            Object::seq(vec![Object::atom("1"), Object::atom("2"), Object::atom("3")]),
+            Object::seq(vec![Object::atom("6"), Object::atom("5"), Object::atom("4")]),
+        ]);
+        assert_eq!(apply_ffp(&ip_obj, &input, &d), Object::atom("28"));
+    }
+
+    #[test]
+    fn func_to_object_roundtrip() {
+        // Func → Object → ρ → Func → apply should give same result
+        let d = defs();
+        let original = Func::compose(
+            Func::insert(Func::Add),
+            Func::compose(
+                Func::apply_to_all(Func::Mul),
+                Func::Trans,
+            ),
+        );
+        let obj = func_to_object(&original);
+        let recovered = rho(&obj, &d);
+        let input = Object::seq(vec![
+            Object::seq(vec![Object::atom("1"), Object::atom("2"), Object::atom("3")]),
+            Object::seq(vec![Object::atom("6"), Object::atom("5"), Object::atom("4")]),
+        ]);
+        assert_eq!(apply(&original, &input, &d), apply(&recovered, &input, &d));
+        assert_eq!(apply(&recovered, &input, &d), Object::atom("28"));
+    }
+
+    #[test]
+    fn filter_as_ffp_object() {
+        // ρ<FILTER, <BU, "eq", "owner">> applied to sequence
+        let d = defs();
+        let filter_obj = Object::Seq(vec![
+            Object::atom(forms::FILTER),
+            Object::Seq(vec![
+                Object::atom(forms::BU),
+                Object::atom(primitives::EQ),
+                Object::atom("owner"),
+            ]),
+        ]);
+        let seq = Object::seq(vec![
+            Object::atom("owner"),
+            Object::atom("member"),
+            Object::atom("owner"),
+        ]);
+        assert_eq!(
+            apply_ffp(&filter_obj, &seq, &d),
+            Object::seq(vec![Object::atom("owner"), Object::atom("owner")])
+        );
     }
 }

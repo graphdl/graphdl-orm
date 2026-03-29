@@ -10,16 +10,31 @@
 // function application — no dispatch, no branching on kind, no mutable state.
 // Implements Backus's FP algebra (1977).
 
+#[allow(dead_code)] // Functions used by WASM lib.rs, not by this binary
 mod ast;
+#[allow(dead_code)]
 mod types;
+#[allow(dead_code)]
 mod compile;
+#[allow(dead_code)]
 mod evaluate;
+#[allow(dead_code)]
 mod query;
+#[allow(dead_code)]
 mod rmap;
+#[allow(dead_code)]
 mod naming;
+#[allow(dead_code)]
 mod conceptual_query;
+#[allow(dead_code)]
 mod parse_rule;
+#[allow(dead_code)]
+mod parse_forml2;
+#[allow(dead_code)]
+mod verbalize;
+#[allow(dead_code)]
 mod arest;
+#[allow(dead_code)]
 mod validate;
 
 use types::{ConstraintIR, ResponseContext, Population};
