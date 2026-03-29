@@ -57,6 +57,13 @@ export function initEntitySchema(sql: SqlLike): void {
     deleted_at TEXT
   )`)
 
+  // Migration: add fields column to DOs created before it existed
+  try {
+    sql.exec(`ALTER TABLE entity ADD COLUMN fields TEXT NOT NULL DEFAULT '{}'`)
+  } catch {
+    // Column already exists — expected
+  }
+
   sql.exec(`CREATE TABLE IF NOT EXISTS events (
     id TEXT PRIMARY KEY,
     timestamp TEXT NOT NULL DEFAULT (datetime('now')),

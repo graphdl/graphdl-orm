@@ -425,6 +425,32 @@ router.post('/api/entities/:noun/:id/transition', async (request, env: Env) => {
 })
 
 // ── Entity queries (fan-out via pure handlers) ───────────────────────
+// POST /api/entities/:noun — create entity via direct DO write
+router.post('/api/entities/:noun', async (request, env: Env) => {
+  const { noun } = request.params
+  const body = await request.json() as { domain?: string; data?: Record<string, unknown>; id?: string }
+  const domain = body.domain || new URL(request.url).searchParams.get('domain') || ''
+  if (!domain) return error(400, { errors: [{ message: 'domain required in body or query param' }] })
+
+  const entityId = body.id || crypto.randomUUID()
+  const entityDO = getEntityDO(env, entityId) as any
+  await entityDO.put({ id: entityId, type: noun, data: body.data || {} })
+
+  const registry = getRegistryDO(env, 'global') as any
+  await registry.indexEntity(noun, entityId, domain)
+
+  const entity = await entityDO.get()
+  return json({
+    id: entity.id,
+    type: entity.type,
+    ...entity.data,
+    version: entity.version,
+    createdAt: entity.createdAt,
+    updatedAt: entity.updatedAt,
+    _links: buildEntityLinks(noun, entityId, domain),
+  }, { status: 201 })
+})
+
 router.get('/api/entities/:noun', async (request, env: Env) => {
   const { noun } = request.params
   const url = new URL(request.url)
