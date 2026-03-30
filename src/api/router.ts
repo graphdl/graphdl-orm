@@ -3,15 +3,9 @@ import type { Env } from '../types'
 import { parseQueryOptions } from './collections'
 import { nounToSlug, nounToTable, resolveSlugToNoun } from '../collections'
 import { handleSeed } from './seed'
-import { handleGenerate } from './generate'
-import { handleParse } from './parse'
-import { handleParseOrm } from './parse-orm'
-import { handleVerify } from './verify'
 import { handleEvaluate, handleSynthesize } from './evaluate'
-import { handleConceptualQuery } from './conceptual-query'
-import { induceConstraints } from '../csdp/induce'
 import { handleListEntities, handleGetEntity, handleCreateEntity, handleDeleteEntity, buildEntityLinks } from './entity-routes'
-import { loadDomainSchema, loadDomainAndPopulation, getTransitions, applyCommand, querySchema, forwardChain, getNounSchemas } from './engine'
+import { loadDomainSchema, loadDomainAndPopulation, getTransitions, applyCommand, querySchema, forwardChain, getNounSchemas, evaluateAccess, deriveViewMetadata, deriveNavContext, getTopLevelNouns } from './engine'
 
 // ── Collection slug → noun type resolution ───────────────────────────
 // Resolved dynamically from the Registry via nounToSlug convention.
@@ -25,26 +19,42 @@ function getEntityDO(env: Env, entityId: string): DurableObjectStub {
   return env.ENTITY_DB.get(id)
 }
 
+/** Decode URL-encoded entity ID from route params. Entity IDs contain colons (domain:name). */
+function decodeId(params: Record<string, string>): string {
+  return decodeURIComponent(params.id || '')
+}
+
 /** Get a RegistryDB DO stub for the given scope (e.g. app/org/global). */
 function getRegistryDO(env: Env, scope: string): DurableObjectStub {
   const id = env.REGISTRY_DB.idFromName(scope)
   return env.REGISTRY_DB.get(id)
 }
 
-/**
- * Get the primary DomainDB DO stub.
- * Returns the primary DomainDB DO stub for generators cache and legacy operations.
- * Uses a single "primary" instance for all collection/metamodel operations.
- */
-function getPrimaryDB(env: Env): DurableObjectStub {
-  const id = env.DOMAIN_DB.idFromName('graphdl-primary')
-  return env.DOMAIN_DB.get(id)
-}
 
 export const router = AutoRouter()
 
 // ── Health ───────────────────────────────────────────────────────────
 router.get('/health', () => json({ status: 'ok', version: '0.1.0' }))
+
+// ── Access: derive what the authenticated user can see ──────────────
+// Per the paper: the user is part of input I in μ(SYSTEM:x).
+// The derivation rules in organizations.md determine visibility.
+// This endpoint returns the user's accessible apps, domains, and orgs
+// as derived from the population P via ρ.
+router.get('/api/access', async (request, env: Env) => {
+  const userEmail = request.headers.get('x-user-email') || ''
+  const registry = getRegistryDO(env, 'global') as any
+  const getStub = (id: string) => getEntityDO(env, id) as any
+
+  const { accessibleDomains, userOrgs, visibleApps } = await evaluateAccess(registry, getStub, userEmail)
+
+  return json({
+    user: userEmail,
+    orgs: userOrgs,
+    apps: visibleApps,
+    domains: [...accessibleDomains],
+  })
+})
 
 // ── Debug: entity counts by type from Registry ──────────────────────
 router.post('/api/debug/arest/:domain', async (request, env: Env) => {
@@ -66,19 +76,11 @@ router.get('/api/debug/compiled/:domain', async (request, env: Env) => {
 })
 
 router.get('/api/debug/schema/:domain', async (request, env: Env) => {
-  const { domain } = request.params
+  const domain = decodeURIComponent(request.params.domain)
   const registry = getRegistryDO(env, 'global') as any
-  const { buildSchemaFromEntities } = await import('../generate/schema-from-entities')
-  const fetchEntities = async (type: string, d: string) => {
-    const ids: string[] = await registry.getEntityIds(type, d)
-    const results: Array<{ id: string; type: string; data: Record<string, unknown> }> = []
-    await Promise.allSettled(ids.map(async (id: string) => {
-      const entity = await (getEntityDO(env, id) as any).get()
-      if (entity && !entity.deletedAt) results.push({ id: entity.id, type: entity.type, data: entity.data })
-    }))
-    return results
-  }
-  const schema = await buildSchemaFromEntities(domain, fetchEntities)
+  await loadDomainSchema(registry, (id: string) => getEntityDO(env, id) as any, domain)
+  const { debug_compiled_state } = await import('../../crates/fol-engine/pkg/fol_engine.js')
+  const schema = JSON.parse(debug_compiled_state())
   return json({
     domain,
     nounCount: Object.keys(schema.nouns).length,
@@ -110,36 +112,24 @@ router.get('/debug/table/:table', async (request, env: Env) => {
   return json({ table, domain: domain || 'all', counts })
 })
 
-// ── WebSocket (live events) ──────────────────────────────────────────
-router.get('/ws', async (request, env: Env) => {
-  if (request.headers.get('Upgrade') !== 'websocket') {
-    return error(426, { errors: [{ message: 'WebSocket upgrade required' }] })
-  }
-  const url = new URL(request.url)
-  const domain = url.searchParams.get('domain') || 'all'
-  const stub = getPrimaryDB(env)
-  return stub.fetch(new Request(`https://graphdl-orm/ws?domain=${domain}`, {
-    headers: request.headers,
-  }))
-})
-
-// ── Generate ────────────────────────────────────────────────────────
-router.post('/api/generate', handleGenerate)
+// ── Evaluate / Synthesize (WASM engine) ─────────────────────────────
 router.post('/api/evaluate', handleEvaluate)
 router.post('/api/synthesize', (request, env) => handleSynthesize(request, env))
 
-// ── Induction (discover constraints from population) ─────────────────
+// ── Induction (discover constraints from population) — uses WASM engine
 router.post('/api/induce', async (request) => {
   const body = await request.json() as { ir?: any; population?: any }
   if (!body.ir || !body.population) {
     return error(400, { errors: [{ message: 'ir and population are required' }] })
   }
-  const result = induceConstraints(JSON.stringify(body.ir), JSON.stringify(body.population))
+  const { induce_from_population } = await import('../../crates/fol-engine/pkg/fol_engine.js')
+  const result = induce_from_population(JSON.stringify(body.population))
   return json(result)
 })
 
-// ── Facts (instance-level graph creation) ────────────────────────────
-router.post('/api/facts', async (request, env: Env) => {
+// Entity creation goes through POST /api/entities/:noun (the AREST command path).
+
+router.post('/api/_placeholder', async (_request: Request, _env: Env) => {
   const body = await request.json() as {
     domainId: string
     graphSchemaId?: string
@@ -188,7 +178,7 @@ router.post('/api/facts', async (request, env: Env) => {
 
   const nounByName = new Map<string, any>()
   for (const r of nounSettled) {
-    if (r.status === 'fulfilled' && r.value && !r.value.deletedAt) {
+    if (r.status === 'fulfilled' && r.value) {
       const n = { id: r.value.id, ...r.value.data }
       if (n.name) nounByName.set(n.name, n)
     }
@@ -196,7 +186,7 @@ router.post('/api/facts', async (request, env: Env) => {
 
   const schemaByReading = new Map<string, string>()
   for (const r of readingSettled) {
-    if (r.status === 'fulfilled' && r.value && !r.value.deletedAt) {
+    if (r.status === 'fulfilled' && r.value) {
       const rd = r.value.data
       if (rd.text && rd.graphSchema) schemaByReading.set(rd.text, rd.graphSchema)
     }
@@ -322,7 +312,7 @@ router.post('/api/entity', async (request, env: Env) => {
 // ── Entity state machine transitions ─────────────────────────────────
 // GET available transitions
 router.get('/api/entities/:noun/:id/transitions', async (request, env: Env) => {
-  const { noun, id } = request.params
+  const noun = decodeURIComponent(request.params.noun); const id = decodeURIComponent(request.params.id)
   const entityDO = getEntityDO(env, id) as any
   const entity = await entityDO.get()
   if (!entity) return error(404, { errors: [{ message: 'Not Found' }] })
@@ -350,7 +340,7 @@ router.get('/api/entities/:noun/:id/transitions', async (request, env: Env) => {
 
 // POST fire a transition event — AREST command
 router.post('/api/entities/:noun/:id/transition', async (request, env: Env) => {
-  const { noun, id } = request.params
+  const noun = decodeURIComponent(request.params.noun); const id = decodeURIComponent(request.params.id)
   const body = await request.json() as { event: string; domain?: string }
   if (!body.event) return error(400, { errors: [{ message: 'event required' }] })
 
@@ -404,8 +394,11 @@ router.post('/api/entities/:noun/:id/transition', async (request, env: Env) => {
     }], debug: { arestResult, cmd } })
   }
 
-  // Update the State Machine entity's current status
-  await getStub(smEntityId).patch({ currentlyInStatus: arestResult.status })
+  // Update the State Machine entity's current status via cell store (↓n)
+  const smCell = await getStub(smEntityId).get()
+  if (smCell) {
+    await getStub(smEntityId).put({ id: smCell.id, type: smCell.type, data: { ...smCell.data, currentlyInStatus: arestResult.status } })
+  }
 
   // Persist any Event entities from the AREST result
   for (const e of arestResult.entities) {
@@ -427,7 +420,7 @@ router.post('/api/entities/:noun/:id/transition', async (request, env: Env) => {
 // ── Entity queries (fan-out via pure handlers) ───────────────────────
 // POST /api/entities/:noun — create entity via direct DO write
 router.post('/api/entities/:noun', async (request, env: Env) => {
-  const { noun } = request.params
+  const noun = decodeURIComponent(request.params.noun)
   const body = await request.json() as { domain?: string; data?: Record<string, unknown>; id?: string }
   const domain = body.domain || new URL(request.url).searchParams.get('domain') || ''
   if (!domain) return error(400, { errors: [{ message: 'domain required in body or query param' }] })
@@ -439,55 +432,59 @@ router.post('/api/entities/:noun', async (request, env: Env) => {
   const registry = getRegistryDO(env, 'global') as any
   await registry.indexEntity(noun, entityId, domain)
 
-  const entity = await entityDO.get()
+  const cell = await entityDO.get()
   return json({
-    id: entity.id,
-    type: entity.type,
-    ...entity.data,
-    version: entity.version,
-    createdAt: entity.createdAt,
-    updatedAt: entity.updatedAt,
+    id: cell.id,
+    type: cell.type,
+    ...cell.data,
     _links: buildEntityLinks(noun, entityId, domain),
   }, { status: 201 })
 })
 
 router.get('/api/entities/:noun', async (request, env: Env) => {
-  const { noun } = request.params
+  const noun = decodeURIComponent(request.params.noun)
   const url = new URL(request.url)
   const domainId = url.searchParams.get('domain')
   if (!domainId) return error(400, { errors: [{ message: 'domain query param required' }] })
 
   const limit = parseInt(url.searchParams.get('limit') || '100', 10)
   const page = parseInt(url.searchParams.get('page') || '1', 10)
+  const userEmail = request.headers.get('x-user-email') || ''
 
   const registry = getRegistryDO(env, 'global') as any
-  const result = await handleListEntities(
-    noun,
-    domainId,
-    registry,
-    (id) => getEntityDO(env, id) as any,
-    { limit, page },
-  )
+  const getStub = (id: string) => getEntityDO(env, id) as any
 
-  // Flatten entity data for backwards compat (spread data into top level)
+  // Fetch entities + derive view metadata in parallel
+  // Per Theorem 4: every value in the representation is (ρf):P
+  const [result, viewMeta, navCtx] = await Promise.all([
+    handleListEntities(noun, domainId, registry, getStub, { limit, page }),
+    deriveViewMetadata(registry, getStub, noun, domainId),
+    userEmail ? deriveNavContext(registry, getStub, userEmail, domainId, noun) : null,
+  ])
+
+  // When listing Nouns, enrich each doc with _topLevel derived from the compiled IR
+  let topLevelInfo: { topLevel: Set<string> } | null = null
+  if (noun === 'Noun' && domainId) {
+    const irCell = await getStub(`ir:${domainId}`).get()
+    if (irCell?.data?.ir) {
+      topLevelInfo = getTopLevelNouns(typeof irCell.data.ir === 'string' ? irCell.data.ir : JSON.stringify(irCell.data.ir))
+    }
+  }
+
   const docs = result.docs.map((e) => ({
     id: e.id,
     type: e.type,
     ...e.data,
-    version: e.version,
-    createdAt: e.createdAt,
-    updatedAt: e.updatedAt,
+    ...(topLevelInfo ? { _topLevel: topLevelInfo.topLevel.has((e.data as any)?.name || e.id) } : {}),
     _links: buildEntityLinks(e.type, e.id, domainId || undefined),
   }))
 
-  // Client-side filtering by where params
+  // Where-param filtering
   const where: Record<string, any> = {}
   for (const [key, val] of url.searchParams.entries()) {
     const m = key.match(/^where\[(\w+)\](?:\[(\w+)\])?$/)
     if (m) {
-      const field = m[1]
-      const op = m[2] || 'equals'
-      where[field] = { [op]: val }
+      where[m[1]] = { [m[2] || 'equals']: val }
     }
   }
   let filtered = docs
@@ -507,11 +504,15 @@ router.get('/api/entities/:noun', async (request, env: Env) => {
     hasPrevPage: result.hasPrevPage,
     ...(result.warnings && { warnings: result.warnings }),
     ...(result._links && { _links: result._links }),
+    // Self-describing representation: view metadata derived from readings in P
+    _view: viewMeta,
+    // Navigation context derived from access derivation rules
+    ...(navCtx && { _nav: navCtx }),
   })
 })
 
 router.get('/api/entities/:noun/:id', async (request, env: Env) => {
-  const { id } = request.params
+  const id = decodeURIComponent(request.params.id)
   const url = new URL(request.url)
   const domainSlug = url.searchParams.get('domain') || undefined
 
@@ -528,36 +529,45 @@ router.get('/api/entities/:noun/:id', async (request, env: Env) => {
     }
   } catch { /* best-effort */ }
 
+  const registry = getRegistryDO(env, 'global') as any
+  const getStub = (eid: string) => getEntityDO(env, eid) as any
+
   const entity = await handleGetEntity(getEntityDO(env, id) as any, {
     domain: domainSlug,
     transitions,
   })
   if (!entity) return error(404, { errors: [{ message: 'Not Found' }] })
 
+  // Derive view metadata for detail view
+  const viewMeta = domainSlug
+    ? await deriveViewMetadata(registry, getStub, entity.type, domainSlug)
+    : null
+
   return json({
     id: entity.id,
     type: entity.type,
     ...entity.data,
-    version: entity.version,
-    createdAt: entity.createdAt,
-    updatedAt: entity.updatedAt,
     ...(entity._links && { _links: entity._links }),
+    ...(viewMeta && { _view: { ...viewMeta, type: 'DetailView' } }),
   })
 })
 
+// PATCH on entities: ↓n with merged data (cell store replaces contents)
 router.patch('/api/entities/:noun/:id', async (request, env: Env) => {
   const { id } = request.params
   const body = await request.json() as Record<string, any>
 
   const entityDO = getEntityDO(env, id) as any
-  const result = await entityDO.patch(body)
+  const existing = await entityDO.get()
+  if (!existing) return error(404, { errors: [{ message: 'Not Found' }] })
 
-  if (!result) return error(404, { errors: [{ message: 'Not Found' }] })
-  return json(result)
+  const merged = { ...existing.data, ...body }
+  const result = await entityDO.put({ id: existing.id, type: existing.type, data: merged })
+  return json({ id: result.id, type: result.type, ...result.data })
 })
 
 router.delete('/api/entities/:noun/:id', async (request, env: Env) => {
-  const { noun, id } = request.params
+  const noun = decodeURIComponent(request.params.noun); const id = decodeURIComponent(request.params.id)
 
   const registry = getRegistryDO(env, 'global') as any
   const result = await handleDeleteEntity(id, getEntityDO(env, id) as any, registry, noun)
@@ -677,43 +687,48 @@ router.get('/api/facts/:schema', async (request, env: Env) => {
 
 /** GET /api/:collection — list/find */
 // ── Conceptual Query (before generic :collection routes) ─────────────
-router.get('/api/query', handleConceptualQuery)
-router.post('/api/query', handleConceptualQuery)
+// Conceptual query — uses WASM query_schema_wasm (θ₁ operations on P)
 
-// ── Named API routes (before generic :collection catch-all) ──────────
-router.post('/api/claims', async (request, env: Env, ctx: ExecutionContext) => {
-  const { handleClaims } = await import('./claims')
-  return handleClaims(request, env, ctx)
+// ── Conceptual Query — θ₁ operations on P via WASM ─────────────────
+// GET/POST /api/query?domain=X&q=<natural language query>
+// Uses query_schema_wasm to evaluate partial application of graph schemas.
+router.all('/api/query', async (request, env: Env) => {
+  const url = new URL(request.url)
+  let domain: string | undefined
+  let query: string | undefined
+
+  if (request.method === 'POST') {
+    const body = await request.json() as any
+    domain = body.domain || body.domainId
+    query = body.query || body.q
+  } else {
+    domain = url.searchParams.get('domain') || undefined
+    query = url.searchParams.get('q') || url.searchParams.get('query') || undefined
+  }
+
+  if (!domain || !query) {
+    return error(400, { errors: [{ message: 'domain and q (query) are required' }] })
+  }
+
+  const registry = getRegistryDO(env, 'global') as any
+  const getStub = (id: string) => getEntityDO(env, id) as any
+
+  // Load schema + build population, then query via WASM
+  await loadDomainSchema(registry, getStub, domain)
+  const populationJson = await loadDomainAndPopulation(registry, getStub, domain)
+
+  // Use WASM prove_goal for the query
+  const { prove_goal } = await import('../../crates/fol-engine/pkg/fol_engine.js')
+  const result = prove_goal(query, JSON.parse(populationJson), 'closed')
+
+  return json(result)
 })
+
+// Seed is the ONLY ingestion path — readings → WASM parse → cells in D
 router.all('/api/seed', handleSeed)
-router.get('/api/stats', async (request, env: Env) => {
-  const { handleStats } = await import('./claims')
-  return handleStats(request, env)
-})
-router.all('/api/parse', handleParse)
-router.all('/api/parse/orm', handleParseOrm)
-router.all('/api/verify', handleVerify)
 
 router.get('/api/:collection', async (request, env: Env) => {
-  const { collection } = request.params
-
-  // Generators collection stays in DomainDB (SQL table, not entity-per-DO)
-  if (collection === 'generators') {
-    const url = new URL(request.url)
-    const { where, limit, page, sort } = parseQueryOptions(url.searchParams)
-    const db = getPrimaryDB(env) as any
-    const result = await db.findInCollection(collection, where, { limit, page, sort })
-    return json({
-      docs: result.docs,
-      totalDocs: result.totalDocs,
-      limit: result.limit,
-      page: result.page,
-      totalPages: Math.ceil(result.totalDocs / result.limit),
-      hasNextPage: result.hasNextPage,
-      hasPrevPage: result.page > 1,
-      pagingCounter: (result.page - 1) * result.limit + 1,
-    })
-  }
+  const collection = decodeURIComponent(request.params.collection)
 
   // Resolve collection slug to noun type dynamically from Registry
   const registry = getRegistryDO(env, 'global') as any
@@ -735,14 +750,11 @@ router.get('/api/:collection', async (request, env: Env) => {
 
   // Access control: engine evaluates "User can access Domain iff..." derivation rules
 
-  // Flatten entity data for backwards compat (spread data into top level)
+  // Flatten cell data into top level
   const docs = result.docs.map((e) => ({
     id: e.id,
     type: e.type,
     ...e.data,
-    version: e.version,
-    createdAt: e.createdAt,
-    updatedAt: e.updatedAt,
     _links: buildEntityLinks(e.type, e.id, domainId || undefined),
   }))
 
@@ -773,14 +785,7 @@ router.get('/api/:collection', async (request, env: Env) => {
 
 /** GET /api/:collection/:id — get by ID */
 router.get('/api/:collection/:id', async (request, env: Env) => {
-  const { collection, id } = request.params
-
-  if (collection === 'generators') {
-    const db = getPrimaryDB(env) as any
-    const doc = await db.getFromCollection(collection, id)
-    if (!doc) return error(404, { errors: [{ message: 'Not Found' }] })
-    return json(doc)
-  }
+  const collection = decodeURIComponent(request.params.collection); const id = decodeURIComponent(request.params.id)
 
   const registry = getRegistryDO(env, 'global') as any
   const entityType = await resolveSlugToNoun(registry, collection)
@@ -811,23 +816,14 @@ router.get('/api/:collection/:id', async (request, env: Env) => {
     id: entity.id,
     type: entity.type,
     ...entity.data,
-    version: entity.version,
-    createdAt: entity.createdAt,
-    updatedAt: entity.updatedAt,
     ...(entity._links && { _links: entity._links }),
   })
 })
 
 /** POST /api/:collection — create */
 router.post('/api/:collection', async (request, env: Env) => {
-  const { collection } = request.params
+  const collection = decodeURIComponent(request.params.collection)
   const body = await request.json() as Record<string, any>
-
-  if (collection === 'generators') {
-    const db = getPrimaryDB(env) as any
-    const doc = await db.createInCollection(collection, body)
-    return json({ doc, message: 'Created successfully' }, { status: 201 })
-  }
 
   const registry = getRegistryDO(env, 'global') as any
   const entityType = await resolveSlugToNoun(registry, collection)
@@ -848,15 +844,8 @@ router.post('/api/:collection', async (request, env: Env) => {
 
 /** PATCH /api/:collection/:id — update */
 router.patch('/api/:collection/:id', async (request, env: Env) => {
-  const { collection, id } = request.params
+  const collection = decodeURIComponent(request.params.collection); const id = decodeURIComponent(request.params.id)
   const body = await request.json() as Record<string, any>
-
-  if (collection === 'generators') {
-    const db = getPrimaryDB(env) as any
-    const doc = await db.updateInCollection(collection, id, body)
-    if (!doc) return error(404, { errors: [{ message: 'Not Found' }] })
-    return json({ doc, message: 'Updated successfully' })
-  }
 
   const registry = getRegistryDO(env, 'global') as any
   const entityType = await resolveSlugToNoun(registry, collection)
@@ -865,21 +854,16 @@ router.patch('/api/:collection/:id', async (request, env: Env) => {
   }
 
   const entityDO = getEntityDO(env, id) as any
-  const result = await entityDO.patch(body)
-  if (!result) return error(404, { errors: [{ message: 'Not Found' }] })
-  return json({ doc: result, message: 'Updated successfully' })
+  const existing = await entityDO.get()
+  if (!existing) return error(404, { errors: [{ message: 'Not Found' }] })
+  const merged = { ...existing.data, ...body }
+  const result = await entityDO.put({ id: existing.id, type: existing.type, data: merged })
+  return json({ doc: { id: result.id, type: result.type, ...result.data }, message: 'Updated successfully' })
 })
 
 /** DELETE /api/:collection/:id — delete */
 router.delete('/api/:collection/:id', async (request, env: Env) => {
-  const { collection, id } = request.params
-
-  if (collection === 'generators') {
-    const db = getPrimaryDB(env) as any
-    const result = await db.deleteFromCollection(collection, id)
-    if (!result.deleted) return error(404, { errors: [{ message: 'Not Found' }] })
-    return json({ id, message: 'Deleted successfully' })
-  }
+  const collection = decodeURIComponent(request.params.collection); const id = decodeURIComponent(request.params.id)
 
   const registry = getRegistryDO(env, 'global') as any
   const entityType = await resolveSlugToNoun(registry, collection)
@@ -906,11 +890,6 @@ router.delete('/api/domains/:domainId/metamodel', async (request, env: Env, ctx:
   const deindexedEntities = await registry.deindexEntitiesForDomain(domainId) as number
   const deindexedNouns = await registry.deindexNounsForDomain(domainId) as number
 
-  // Clear generators cache
-  try {
-    const db = getPrimaryDB(env) as any
-    await db.wipeDomainMetamodel(domainId)
-  } catch { /* best effort */ }
 
   // Background: soft-delete orphaned DOs
   if (entities.length > 0) {
@@ -950,11 +929,6 @@ router.delete('/api/reset', async (request, env: Env, ctx: ExecutionContext) => 
   // Wipe all Registry tables — instant
   await registry.wipeAll()
 
-  // Wipe DomainDB SQL tables (generators, etc.)
-  try {
-    const db = getPrimaryDB(env) as any
-    await db.wipeAllData()
-  } catch { /* best effort */ }
 
   // Background: soft-delete orphaned DOs (fire and forget)
   if (entities.length > 0) {

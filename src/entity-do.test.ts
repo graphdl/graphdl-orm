@@ -1,7 +1,7 @@
-import { describe, it, expect, vi } from 'vitest'
+import { describe, it, expect } from 'vitest'
 import type { SqlLike, Fact } from './entity-do'
 import {
-  initEntitySchema, createEntity, getEntity, updateEntity, deleteEntity, getEvents,
+  initCellSchema, fetchCell, storeCell, removeCell,
   getFacts, getFactsBySchema, toPopulation,
   initSecretSchema, storeSecret, resolveSecret, deleteSecret, listConnectedSystems,
 } from './entity-do'
@@ -19,6 +19,13 @@ function createMockSql(): SqlLike & { tables: Record<string, any[]> } {
         return { toArray: () => [] }
       }
 
+      // DROP TABLE — just remove if exists
+      if (/^DROP TABLE/i.test(n)) {
+        const m = n.match(/DROP TABLE (\w+)/i)
+        if (m && tables[m[1]]) delete tables[m[1]]
+        return { toArray: () => [] }
+      }
+
       // INSERT OR REPLACE
       if (/INSERT OR REPLACE/i.test(n)) {
         const m = n.match(/INSERT OR REPLACE INTO (\w+)\s*\(([^)]+)\)\s*VALUES/i)
@@ -28,19 +35,6 @@ function createMockSql(): SqlLike & { tables: Record<string, any[]> } {
           const row: any = {}; cols.forEach((c, i) => row[c] = params[i])
           const idx = tables[t].findIndex((r: any) => r[cols[0]] === row[cols[0]])
           if (idx >= 0) tables[t][idx] = row; else tables[t].push(row)
-        }
-        return { toArray: () => [] }
-      }
-
-      // INSERT ... ON CONFLICT
-      if (/ON\s+CONFLICT/i.test(n)) {
-        const m = n.match(/INSERT INTO (\w+)\s*\(([^)]+)\)\s*VALUES.*ON\s+CONFLICT\s*\(\s*(\w+)\s*\)/i)
-        if (m) {
-          const t = m[1], cols = m[2].split(',').map((c: string) => c.trim()), pk = m[3]
-          if (!tables[t]) tables[t] = []
-          const row: any = {}; cols.forEach((c, i) => row[c] = params[i])
-          const ex = tables[t].find((r: any) => r[pk] === row[pk])
-          if (ex) Object.assign(ex, row); else tables[t].push(row)
         }
         return { toArray: () => [] }
       }
@@ -57,26 +51,12 @@ function createMockSql(): SqlLike & { tables: Record<string, any[]> } {
         return { toArray: () => [] }
       }
 
-      // UPDATE
-      if (/^UPDATE/i.test(n)) {
-        const m = n.match(/UPDATE (\w+) SET (.+?) WHERE/i)
-        if (m) {
-          const t = m[1]
-          const sets = m[2].split(',').map(s => s.trim().split(/\s*=\s*/))
-          for (const row of (tables[t] || [])) {
-            if (row.id === params[params.length - 1]) {
-              let pi = 0
-              for (const [col, expr] of sets) {
-                if (expr === 'version + 1') row.version = (row.version || 0) + 1
-                else row[col] = params[pi++]
-              }
-            }
-          }
-        }
+      // DELETE
+      if (/^DELETE FROM (\w+)$/i.test(n)) {
+        const m = n.match(/DELETE FROM (\w+)/i)
+        if (m && tables[m[1]]) tables[m[1]] = []
         return { toArray: () => [] }
       }
-
-      // DELETE
       if (/^DELETE FROM/i.test(n)) {
         const m = n.match(/DELETE FROM (\w+) WHERE (\w+)\s*=\s*\?/i)
         if (m) {
@@ -84,6 +64,11 @@ function createMockSql(): SqlLike & { tables: Record<string, any[]> } {
           if (tables[t]) tables[t] = tables[t].filter((r: any) => r[col] !== params[0])
         }
         return { toArray: () => [] }
+      }
+
+      // SELECT id, type, data FROM cell
+      if (/SELECT id, type, data FROM cell/i.test(n)) {
+        return { toArray: () => [...(tables['cell'] || [])] }
       }
 
       // SELECT value FROM secrets WHERE system = ?
@@ -96,12 +81,9 @@ function createMockSql(): SqlLike & { tables: Record<string, any[]> } {
         return { toArray: () => [...(tables['secrets'] || [])].sort((a: any, b: any) => a.system > b.system ? 1 : -1).map(r => ({ system: r.system })) }
       }
 
-      // SELECT * FROM events WHERE
-      if (/FROM events WHERE/i.test(n)) {
-        return { toArray: () => (tables['events'] || []).filter((r: any) => r.timestamp > params[0]).sort((a: any, b: any) => b.timestamp > a.timestamp ? 1 : -1) }
-      }
-      if (/FROM events ORDER/i.test(n)) {
-        return { toArray: () => [...(tables['events'] || [])].sort((a: any, b: any) => b.timestamp > a.timestamp ? 1 : -1) }
+      // ALTER TABLE — throw to simulate "already exists"
+      if (/^ALTER/i.test(n)) {
+        throw new Error('column already exists')
       }
 
       // SELECT * FROM <table>
@@ -113,48 +95,70 @@ function createMockSql(): SqlLike & { tables: Record<string, any[]> } {
   }
 }
 
-describe('entity-do', () => {
-  describe('3NF row storage', () => {
-    it('creates entity with fields', () => {
+describe('entity-do (cell model)', () => {
+  describe('cell operations (↑n / ↓n)', () => {
+    it('storeCell creates a cell, fetchCell retrieves it', () => {
       const sql = createMockSql()
-      initEntitySchema(sql)
+      initCellSchema(sql)
 
-      const row = createEntity(sql, 'alice@example.com', 'Customer', 'support', {
+      const cell = storeCell(sql, 'alice@example.com', 'Customer', {
         name: 'Alice', plan: 'Growth',
       })
 
-      expect(row.id).toBe('alice@example.com')
-      expect(row.noun).toBe('Customer')
-      expect(row.fields.name).toBe('Alice')
-      expect(row.fields.plan).toBe('Growth')
+      expect(cell.id).toBe('alice@example.com')
+      expect(cell.type).toBe('Customer')
+      expect(cell.data.name).toBe('Alice')
+      expect(cell.data.plan).toBe('Growth')
+
+      const fetched = fetchCell(sql)
+      expect(fetched?.id).toBe('alice@example.com')
+      expect(fetched?.type).toBe('Customer')
+      expect(fetched?.data.name).toBe('Alice')
     })
 
-    it('retrieves entity row', () => {
+    it('fetchCell returns null for empty DO', () => {
       const sql = createMockSql()
-      initEntitySchema(sql)
-      createEntity(sql, 'cust-1', 'Customer', 'core', { name: 'Bob' })
+      initCellSchema(sql)
 
-      const row = getEntity(sql)
-      expect(row?.id).toBe('cust-1')
-      expect(row?.fields.name).toBe('Bob')
+      expect(fetchCell(sql)).toBeNull()
     })
 
-    it('updates fields by merge', () => {
+    it('storeCell replaces existing cell contents', () => {
       const sql = createMockSql()
-      initEntitySchema(sql)
-      createEntity(sql, 'cust-1', 'Customer', 'core', { name: 'Alice' })
+      initCellSchema(sql)
 
-      const updated = updateEntity(sql, { plan: 'Growth' })
-      expect(updated?.fields.name).toBe('Alice')
-      expect(updated?.fields.plan).toBe('Growth')
+      storeCell(sql, 'cust-1', 'Customer', { name: 'Alice' })
+      storeCell(sql, 'cust-1', 'Customer', { name: 'Alice', plan: 'Growth' })
+
+      const cell = fetchCell(sql)
+      expect(cell?.data.name).toBe('Alice')
+      expect(cell?.data.plan).toBe('Growth')
+    })
+
+    it('removeCell hard-deletes the cell', () => {
+      const sql = createMockSql()
+      initCellSchema(sql)
+
+      storeCell(sql, 'cust-1', 'Customer', { name: 'Alice' })
+      const result = removeCell(sql)
+
+      expect(result?.id).toBe('cust-1')
+      expect(fetchCell(sql)).toBeNull()
+    })
+
+    it('removeCell returns null when no cell exists', () => {
+      const sql = createMockSql()
+      initCellSchema(sql)
+
+      expect(removeCell(sql)).toBeNull()
     })
   })
 
   describe('fact projection', () => {
-    it('projects row fields as facts', () => {
+    it('projects cell data as facts', () => {
       const sql = createMockSql()
-      initEntitySchema(sql)
-      createEntity(sql, 'alice@example.com', 'Customer', 'core', {
+      initCellSchema(sql)
+      storeCell(sql, 'alice@example.com', 'Customer', {
         name: 'Alice', plan: 'Growth', email: 'alice@example.com',
       })
 
@@ -169,8 +173,8 @@ describe('entity-do', () => {
 
     it('projects facts by schema', () => {
       const sql = createMockSql()
-      initEntitySchema(sql)
-      createEntity(sql, 'cust-1', 'Customer', 'core', {
+      initCellSchema(sql)
+      storeCell(sql, 'cust-1', 'Customer', {
         name: 'Alice', plan: 'Growth', email: 'a@b.com',
       })
 
@@ -181,8 +185,8 @@ describe('entity-do', () => {
 
     it('converts to population format', () => {
       const sql = createMockSql()
-      initEntitySchema(sql)
-      createEntity(sql, 'cust-1', 'Customer', 'core', { name: 'Alice', plan: 'Growth' })
+      initCellSchema(sql)
+      storeCell(sql, 'cust-1', 'Customer', { name: 'Alice', plan: 'Growth' })
 
       const pop = toPopulation(sql)
       expect(Object.keys(pop)).toHaveLength(2)
@@ -190,18 +194,18 @@ describe('entity-do', () => {
       expect(pop['Customer has plan']).toHaveLength(1)
     })
 
-    it('empty fields produce no facts', () => {
+    it('empty data produces no facts', () => {
       const sql = createMockSql()
-      initEntitySchema(sql)
-      createEntity(sql, 'cust-1', 'Customer', 'core', {})
+      initCellSchema(sql)
+      storeCell(sql, 'cust-1', 'Customer', {})
 
       expect(getFacts(sql)).toHaveLength(0)
     })
 
-    it('bindings ordered by noun order: entity first, field second', () => {
+    it('bindings ordered: entity first, field second', () => {
       const sql = createMockSql()
-      initEntitySchema(sql)
-      createEntity(sql, 'ord-1', 'Order', 'orders', { customer: 'alice' })
+      initCellSchema(sql)
+      storeCell(sql, 'ord-1', 'Order', { customer: 'alice' })
 
       const facts = getFacts(sql)
       expect(facts[0].bindings[0][0]).toBe('Order')
@@ -209,7 +213,7 @@ describe('entity-do', () => {
     })
   })
 
-  describe('secret storage', () => {
+  describe('secret storage (infrastructure)', () => {
     it('stores and resolves', () => {
       const sql = createMockSql()
       initSecretSchema(sql)
@@ -248,11 +252,11 @@ describe('entity-do', () => {
       expect(listConnectedSystems(sql)).toEqual(['acme-api', 'analytics-db', 'email-svc'])
     })
 
-    it('isolated from entity data', () => {
+    it('isolated from cell data', () => {
       const sql = createMockSql()
-      initEntitySchema(sql)
+      initCellSchema(sql)
       initSecretSchema(sql)
-      createEntity(sql, 'org-1', 'Organization', 'core', { name: 'Acme' })
+      storeCell(sql, 'org-1', 'Organization', { name: 'Acme' })
       storeSecret(sql, 'acme-api', 'secret_value')
 
       const facts = getFacts(sql)

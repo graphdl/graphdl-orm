@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 // ── IR Types (deserialized from generator JSON) ──────────────────────
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConstraintIR {
     #[allow(dead_code)] // deserialized from JSON, read by JS callers
@@ -31,7 +31,7 @@ impl Default for WorldAssumption {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NounDef {
     pub object_type: String,
@@ -62,7 +62,7 @@ pub struct NounDef {
 }
 
 /// A derivation rule in the IR — compiled to a DeriveFn at compile time.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DerivationRuleDef {
     pub id: String,
@@ -101,21 +101,21 @@ pub enum DerivationKind {
     Join,               // Cross-fact-type equi-join on shared noun names
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FactTypeDef {
     pub reading: String,
     pub roles: Vec<RoleDef>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RoleDef {
     pub noun_name: String,
     pub role_index: usize,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConstraintDef {
     pub id: String,
@@ -133,7 +133,7 @@ pub struct ConstraintDef {
     pub max_occurrence: Option<usize>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SpanDef {
     pub fact_type_id: String,
@@ -142,7 +142,7 @@ pub struct SpanDef {
     pub subset_autofill: Option<bool>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StateMachineDef {
     pub noun_name: String,
@@ -150,7 +150,7 @@ pub struct StateMachineDef {
     pub transitions: Vec<TransitionDef>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TransitionDef {
     pub from: String,
@@ -159,7 +159,7 @@ pub struct TransitionDef {
     pub guard: Option<GuardDef>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GuardDef {
     #[allow(dead_code)] // deserialized from JSON, read by JS callers
@@ -212,7 +212,7 @@ impl Population {
 }
 
 /// The response being evaluated (for deontic text constraints).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResponseContext {
     pub text: String,

@@ -77,16 +77,16 @@ If some Organization is owned by some User and that User is deleted then that Or
 
 If some User authenticates and no Organization is owned by that User then some Organization is owned by that User and that Organization has Name that is that User's Email and that User has Org Role 'owner' in that Organization.
 
-User can access Domain iff User has Org Role in Organization and Domain belongs to that Organization.
-User can access Domain if Domain has Visibility 'public'.
+User accesses Domain iff User has Org Role in Organization and Domain belongs to that Organization.
+User accesses Domain if Domain has Visibility 'public'.
 
-User can view Resource in App iff User has Org Role in Organization and App belongs to that Organization and App has navigable Domain and Resource belongs to that Domain.
-User can view all Resources in App iff User has Org Role 'owner' in Organization and App belongs to that Organization.
-User can view all Resources in App iff User has Org Role 'admin' in Organization and App belongs to that Organization.
-User can view only own Resource in App iff User has Org Role 'member' in Organization and App belongs to that Organization and Resource is created by that User.
+User views Resource in App iff User has Org Role in Organization and App belongs to that Organization and App has navigable Domain and Resource belongs to that Domain.
+User views all Resources in App iff User has Org Role 'owner' in Organization and App belongs to that Organization.
+User views all Resources in App iff User has Org Role 'admin' in Organization and App belongs to that Organization.
+User views only own Resource in App iff User has Org Role 'member' in Organization and App belongs to that Organization and Resource is created by that User.
 
-App shows Domain iff App has navigable Domain and that Domain is that Domain.
-App shows Entity Type iff App has navigable Domain and some Noun is defined in that Domain and Entity Type is that Noun.
+App navigates Domain iff App has navigable Domain and that Domain is that Domain.
+App displays Noun iff App has navigable Domain and Noun is defined in that Domain.
 
 ## Instance Facts
 

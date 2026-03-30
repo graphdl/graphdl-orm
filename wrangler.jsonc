@@ -1,6 +1,5 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  // account_id set via CLOUDFLARE_ACCOUNT_ID env var or wrangler login
   "name": "graphdl-orm",
   "main": "src/index.ts",
   "compatibility_date": "2026-03-09",
@@ -8,7 +7,6 @@
   "durable_objects": {
     "bindings": [
       { "name": "ENTITY_DB", "class_name": "EntityDB" },
-      { "name": "DOMAIN_DB", "class_name": "DomainDB" },
       { "name": "REGISTRY_DB", "class_name": "RegistryDB" }
     ]
   },
@@ -16,7 +14,8 @@
     { "tag": "v1", "new_sqlite_classes": ["GraphDLDB"] },
     { "tag": "v2", "new_sqlite_classes": ["EntityDB", "DomainDB", "RegistryDB"] },
     { "tag": "v3", "deleted_classes": ["GraphDLDB"] },
-    { "tag": "v4" }
+    { "tag": "v4" },
+    { "tag": "v5", "deleted_classes": ["DomainDB"] }
   ],
   "vars": {
     "ENVIRONMENT": "production"

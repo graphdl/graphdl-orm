@@ -44,6 +44,14 @@ pub enum Command {
         target: String,
         bindings: std::collections::HashMap<String, String>,
     },
+    /// is-upd: update entity fields (↓F ∘ [upd, defs])
+    UpdateEntity {
+        noun: String,
+        domain: String,
+        #[serde(alias = "entityId")]
+        entity_id: String,
+        fields: std::collections::HashMap<String, String>,
+    },
     /// is-chg: install or update readings (modify definitions D)
     LoadReadings {
         markdown: String,
@@ -103,6 +111,10 @@ pub fn apply_command(
         // is-qry: query the population via partial application
         Command::Query { schema_id, domain: _, target, bindings } => {
             apply_query(model, schema_id, target, bindings, population)
+        }
+        // is-upd: update entity fields with validation
+        Command::UpdateEntity { noun, domain, entity_id, fields } => {
+            apply_update_entity(model, noun, domain, entity_id, fields, population)
         }
         // is-chg: install readings (modify definitions)
         Command::LoadReadings { markdown, domain } => {
@@ -214,6 +226,90 @@ fn apply_create_entity(
 
     CommandResult {
         entities,
+        status,
+        transitions,
+        violations,
+        derived_count: derived.len(),
+        rejected,
+        population: if rejected { population.clone() } else { new_pop },
+    }
+}
+
+// ── update = emit ∘ validate ∘ derive ∘ (↓F ∘ [upd, ↑F]) ───────────
+// Per Eq. 6: is-upd ∘ ↑K → [rpt, ↓F ∘ [upd, defs]] ∘ [↑I, ↑F]
+// Reads current facts (↑F), merges new fields (upd), validates, stores (↓F).
+
+fn apply_update_entity(
+    model: &CompiledModel,
+    noun: &str,
+    domain: &str,
+    entity_id: &str,
+    new_fields: &std::collections::HashMap<String, String>,
+    population: &Population,
+) -> CommandResult {
+    // ↑F: read current entity facts from population
+    let mut merged_fields = std::collections::HashMap::new();
+    merged_fields.insert("domain".to_string(), domain.to_string());
+
+    // Extract existing fields for this entity from population
+    for (ft_id, instances) in &population.facts {
+        for inst in instances {
+            if inst.bindings.len() >= 2 && inst.bindings[0].1 == entity_id {
+                let field_name = &inst.bindings[1].0;
+                let field_value = &inst.bindings[1].1;
+                merged_fields.insert(field_name.clone(), field_value.clone());
+            }
+        }
+    }
+
+    // upd: merge new fields over existing
+    for (k, v) in new_fields {
+        merged_fields.insert(k.clone(), v.clone());
+    }
+
+    // ↓F: replace entity facts in population
+    let mut new_pop = population.clone();
+    for (field_name, value) in &merged_fields {
+        let ft_id = resolve_fact_type_id(model, noun, field_name);
+        // Remove old fact for this entity+field
+        if let Some(instances) = new_pop.facts.get_mut(&ft_id) {
+            instances.retain(|inst| {
+                !(inst.bindings.len() >= 2 && inst.bindings[0].1 == entity_id)
+            });
+        }
+        // Insert updated fact
+        new_pop.facts.entry(ft_id.clone()).or_default().push(
+            FactInstance {
+                fact_type_id: ft_id,
+                bindings: vec![
+                    (noun.to_string(), entity_id.to_string()),
+                    (field_name.clone(), value.clone()),
+                ],
+            }
+        );
+    }
+
+    // derive: forward-chain to fixed point
+    let derived = crate::evaluate::forward_chain_ast(model, &mut new_pop);
+
+    // validate: evaluate constraints against complete population
+    let response = ResponseContext { text: String::new(), sender_identity: None, fields: None };
+    let violations = crate::evaluate::evaluate_via_ast(model, &response, &new_pop);
+    let rejected = violations.iter().any(|v| v.alethic);
+
+    // emit: produce representation
+    let entity = EntityResult {
+        id: entity_id.to_string(),
+        entity_type: noun.to_string(),
+        data: merged_fields,
+    };
+
+    let sm_id = format!("sm:{}", entity_id);
+    let status = extract_sm_status(&new_pop, &sm_id);
+    let transitions = hateoas_from_population(&new_pop, noun, entity_id, status.as_deref());
+
+    CommandResult {
+        entities: vec![entity],
         status,
         transitions,
         violations,
@@ -477,9 +573,13 @@ fn resolve_fact_type_id(model: &CompiledModel, noun: &str, field: &str) -> Strin
     format!("{} has {}", noun, field)
 }
 
-/// HATEOAS: Filter(p) : T where T ⊆ P.
-/// p(t) = (t.from == status)
-/// Returns valid transitions as links.
+/// HATEOAS as Projection (Theorem 3):
+/// links(s) = π_event(Filter(p) : T)
+/// where p(t) = (s_from(t) = s) ∨ anc(s_from(t), s)
+///
+/// anc(a, b) = true if a is a supertype status that b inherits transitions from.
+/// For flat state machines (no subtyping), only direct matches apply.
+/// When subtype state machines are supported, anc traverses the subtype hierarchy.
 fn hateoas_from_population(
     population: &Population,
     noun: &str,
@@ -494,9 +594,30 @@ fn hateoas_from_population(
         None => return vec![],
     };
 
+    // Build ancestor set: statuses that the current status inherits from.
+    // For now: check if any Status subtype facts exist in P.
+    // anc(a, s) = true if "Status s is subtype of Status a" in P.
+    let mut ancestor_statuses: Vec<String> = vec![status.to_string()];
+    if let Some(subtype_facts) = population.facts.get("Status is subtype of Status") {
+        // Traverse upward: if current status is a subtype, include the supertype
+        let mut frontier = vec![status.to_string()];
+        while let Some(current) = frontier.pop() {
+            for fact in subtype_facts {
+                if fact.bindings.len() >= 2 && fact.bindings[0].1 == current {
+                    let supertype = &fact.bindings[1].1;
+                    if !ancestor_statuses.contains(supertype) {
+                        ancestor_statuses.push(supertype.clone());
+                        frontier.push(supertype.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    // Filter(p) : T where p(t) = s_from(t) ∈ {status} ∪ ancestors(status)
     transition_facts.iter()
         .filter(|fact| {
-            fact.bindings.iter().any(|(k, v)| k == "from" && v == status)
+            fact.bindings.iter().any(|(k, v)| k == "from" && ancestor_statuses.contains(v))
         })
         .filter_map(|fact| {
             let event = fact.bindings.iter().find(|(k, _)| k == "event").map(|(_, v)| v.clone())?;
