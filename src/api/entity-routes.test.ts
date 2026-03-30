@@ -15,8 +15,8 @@ describe('entity-routes', () => {
   it('handleListEntities returns entities by type from Registry fan-out', async () => {
     const registry = { getEntityIds: vi.fn().mockResolvedValue(['e1', 'e2']) }
     const entities = new Map([
-      ['e1', { get: vi.fn().mockResolvedValue({ id: 'e1', type: 'Noun', data: { name: 'Customer' }, version: 1 }) }],
-      ['e2', { get: vi.fn().mockResolvedValue({ id: 'e2', type: 'Noun', data: { name: 'Order' }, version: 1 }) }],
+      ['e1', { get: vi.fn().mockResolvedValue({ id: 'e1', type: 'Noun', data: { name: 'Customer' } }) }],
+      ['e2', { get: vi.fn().mockResolvedValue({ id: 'e2', type: 'Noun', data: { name: 'Order' } }) }],
     ])
     const result = await handleListEntities('Noun', 'tickets', registry, (id) => entities.get(id)!)
     expect(result.docs).toHaveLength(2)
@@ -24,7 +24,7 @@ describe('entity-routes', () => {
   })
 
   it('handleGetEntity returns single entity by ID with _links', async () => {
-    const stub = { get: vi.fn().mockResolvedValue({ id: 'e1', type: 'Noun', data: { name: 'Customer' }, version: 1 }) }
+    const stub = { get: vi.fn().mockResolvedValue({ id: 'e1', type: 'Noun', data: { name: 'Customer' } }) }
     const result = await handleGetEntity(stub)
     expect(result).toBeDefined()
     expect(result!.data.name).toBe('Customer')
@@ -36,7 +36,7 @@ describe('entity-routes', () => {
   it('handleListEntities filters by domain', async () => {
     const registry = { getEntityIds: vi.fn().mockResolvedValue(['e1']) }
     const entities = new Map([
-      ['e1', { get: vi.fn().mockResolvedValue({ id: 'e1', type: 'Noun', data: { name: 'Customer' }, version: 1 }) }],
+      ['e1', { get: vi.fn().mockResolvedValue({ id: 'e1', type: 'Noun', data: { name: 'Customer' } }) }],
     ])
     await handleListEntities('Noun', 'tickets', registry, (id) => entities.get(id)!)
     expect(registry.getEntityIds).toHaveBeenCalledWith('Noun', 'tickets')
@@ -45,7 +45,7 @@ describe('entity-routes', () => {
   it('handleListEntities returns warnings for unreachable DOs', async () => {
     const registry = { getEntityIds: vi.fn().mockResolvedValue(['e1', 'e2']) }
     const entities = new Map([
-      ['e1', { get: vi.fn().mockResolvedValue({ id: 'e1', type: 'Noun', data: { name: 'A' }, version: 1 }) }],
+      ['e1', { get: vi.fn().mockResolvedValue({ id: 'e1', type: 'Noun', data: { name: 'A' } }) }],
       ['e2', { get: vi.fn().mockRejectedValue(new Error('DO unreachable')) }],
     ])
     const result = await handleListEntities('Noun', 'tickets', registry, (id) => entities.get(id)!)
@@ -59,7 +59,7 @@ describe('entity-routes', () => {
     const entities = new Map(
       ids.map((id) => [
         id,
-        { get: vi.fn().mockResolvedValue({ id, type: 'Noun', data: { name: `N${id}` }, version: 1 }) },
+        { get: vi.fn().mockResolvedValue({ id, type: 'Noun', data: { name: `N${id}` } }) },
       ]),
     )
     const result = await handleListEntities('Noun', 'tickets', registry, (id) => entities.get(id)!, { limit: 2, page: 2 })
@@ -74,33 +74,26 @@ describe('entity-routes', () => {
   it('handleListEntities defaults to limit=100, page=1', async () => {
     const registry = { getEntityIds: vi.fn().mockResolvedValue(['e1']) }
     const entities = new Map([
-      ['e1', { get: vi.fn().mockResolvedValue({ id: 'e1', type: 'Noun', data: { name: 'A' }, version: 1 }) }],
+      ['e1', { get: vi.fn().mockResolvedValue({ id: 'e1', type: 'Noun', data: { name: 'A' } }) }],
     ])
     const result = await handleListEntities('Noun', 'tickets', registry, (id) => entities.get(id)!)
     expect(result.limit).toBe(100)
     expect(result.page).toBe(1)
   })
 
-  it('handleListEntities skips soft-deleted entities', async () => {
+  it('handleListEntities includes all cells from registry (no soft-delete filtering)', async () => {
     const registry = { getEntityIds: vi.fn().mockResolvedValue(['e1', 'e2']) }
     const entities = new Map([
-      ['e1', { get: vi.fn().mockResolvedValue({ id: 'e1', type: 'Noun', data: { name: 'A' }, version: 1 }) }],
-      ['e2', { get: vi.fn().mockResolvedValue({ id: 'e2', type: 'Noun', data: { name: 'B' }, version: 1, deletedAt: '2024-01-01' }) }],
+      ['e1', { get: vi.fn().mockResolvedValue({ id: 'e1', type: 'Noun', data: { name: 'A' } }) }],
+      ['e2', { get: vi.fn().mockResolvedValue({ id: 'e2', type: 'Noun', data: { name: 'B' } }) }],
     ])
     const result = await handleListEntities('Noun', 'tickets', registry, (id) => entities.get(id)!)
-    expect(result.docs).toHaveLength(1)
-    expect(result.docs[0].id).toBe('e1')
+    expect(result.docs).toHaveLength(2)
   })
 
   // ── handleGetEntity ─────────────────────────────────────────────────
 
-  it('handleGetEntity returns null for deleted entity', async () => {
-    const stub = { get: vi.fn().mockResolvedValue({ id: 'e1', type: 'Noun', data: {}, version: 1, deletedAt: '2024-01-01' }) }
-    const result = await handleGetEntity(stub)
-    expect(result).toBeNull()
-  })
-
-  it('handleGetEntity returns null when entity not found', async () => {
+  it('handleGetEntity returns null when cell not found', async () => {
     const stub = { get: vi.fn().mockResolvedValue(null) }
     const result = await handleGetEntity(stub)
     expect(result).toBeNull()
@@ -108,20 +101,20 @@ describe('entity-routes', () => {
 
   // ── handleCreateEntity ──────────────────────────────────────────────
 
-  it('handleCreateEntity creates entity and indexes in registry', async () => {
-    const stub = { put: vi.fn().mockResolvedValue({ id: 'new1', version: 1 }) }
+  it('handleCreateEntity creates cell and indexes in registry', async () => {
+    const stub = { put: vi.fn().mockResolvedValue({ id: 'new1', type: 'Noun', data: { name: 'Customer' } }) }
     const registry = { indexEntity: vi.fn().mockResolvedValue(undefined) }
     const result = await handleCreateEntity('Noun', 'tickets', { name: 'Customer' }, () => stub, registry)
     expect(result.id).toBeDefined()
-    expect(result.version).toBe(1)
+    expect(result.type).toBe('Noun')
     expect(stub.put).toHaveBeenCalled()
     expect(registry.indexEntity).toHaveBeenCalledWith('Noun', expect.any(String), 'tickets')
   })
 
   // ── handleDeleteEntity ──────────────────────────────────────────────
 
-  it('handleDeleteEntity soft-deletes and deindexes', async () => {
-    const stub = { delete: vi.fn().mockResolvedValue({ id: 'e1', deleted: true }) }
+  it('handleDeleteEntity removes cell and deindexes', async () => {
+    const stub = { delete: vi.fn().mockResolvedValue({ id: 'e1' }) }
     const registry = { deindexEntity: vi.fn().mockResolvedValue(undefined) }
     const result = await handleDeleteEntity('e1', stub, registry, 'Noun')
     expect(result).toEqual({ id: 'e1', deleted: true })
@@ -129,7 +122,7 @@ describe('entity-routes', () => {
     expect(registry.deindexEntity).toHaveBeenCalledWith('Noun', 'e1')
   })
 
-  it('handleDeleteEntity returns null when entity not found', async () => {
+  it('handleDeleteEntity returns null when cell not found', async () => {
     const stub = { delete: vi.fn().mockResolvedValue(null) }
     const registry = { deindexEntity: vi.fn().mockResolvedValue(undefined) }
     const result = await handleDeleteEntity('e1', stub, registry, 'Noun')
@@ -140,9 +133,9 @@ describe('entity-routes', () => {
   // ── populateDepthForEntity ──────────────────────────────────────────
 
   it('populateDepthForEntity resolves Id fields at depth=1', async () => {
-    const entity = { id: 'n1', type: 'Noun', data: { name: 'Customer', graphSchemaId: 'gs1' }, version: 1 }
+    const entity = { id: 'n1', type: 'Noun', data: { name: 'Customer', graphSchemaId: 'gs1' } }
     const refStub = {
-      get: vi.fn().mockResolvedValue({ id: 'gs1', type: 'GraphSchema', data: { name: 'Tickets' }, version: 1 }),
+      get: vi.fn().mockResolvedValue({ id: 'gs1', type: 'GraphSchema', data: { name: 'Tickets' } }),
     }
     const getStub = vi.fn().mockReturnValue(refStub)
 
@@ -154,7 +147,7 @@ describe('entity-routes', () => {
   })
 
   it('populateDepthForEntity leaves data unchanged when no Id fields', async () => {
-    const entity = { id: 'n1', type: 'Noun', data: { name: 'Customer', label: 'cust' }, version: 1 }
+    const entity = { id: 'n1', type: 'Noun', data: { name: 'Customer', label: 'cust' } }
     const getStub = vi.fn()
 
     const populated = await populateDepthForEntity(entity, 1, getStub)
@@ -164,7 +157,7 @@ describe('entity-routes', () => {
   })
 
   it('populateDepthForEntity leaves ID as-is when reference unreachable', async () => {
-    const entity = { id: 'n1', type: 'Noun', data: { name: 'Customer', graphSchemaId: 'gs-gone' }, version: 1 }
+    const entity = { id: 'n1', type: 'Noun', data: { name: 'Customer', graphSchemaId: 'gs-gone' } }
     const refStub = {
       get: vi.fn().mockRejectedValue(new Error('DO unreachable')),
     }
@@ -177,7 +170,7 @@ describe('entity-routes', () => {
   })
 
   it('populateDepthForEntity returns data as-is at depth=0', async () => {
-    const entity = { id: 'n1', type: 'Noun', data: { name: 'Customer', graphSchemaId: 'gs1' }, version: 1 }
+    const entity = { id: 'n1', type: 'Noun', data: { name: 'Customer', graphSchemaId: 'gs1' } }
     const getStub = vi.fn()
 
     const populated = await populateDepthForEntity(entity, 0, getStub)
@@ -188,7 +181,7 @@ describe('entity-routes', () => {
   })
 
   it('populateDepthForEntity skips non-string Id fields', async () => {
-    const entity = { id: 'n1', type: 'Noun', data: { name: 'Customer', someId: 42 }, version: 1 }
+    const entity = { id: 'n1', type: 'Noun', data: { name: 'Customer', someId: 42 } }
     const getStub = vi.fn()
 
     const populated = await populateDepthForEntity(entity, 1, getStub)
@@ -197,14 +190,14 @@ describe('entity-routes', () => {
     expect(getStub).not.toHaveBeenCalled()
   })
 
-  it('populateDepthForEntity handles ref returning null (deleted entity)', async () => {
-    const entity = { id: 'n1', type: 'Noun', data: { name: 'Customer', graphSchemaId: 'gs-deleted' }, version: 1 }
+  it('populateDepthForEntity handles ref returning null (removed cell)', async () => {
+    const entity = { id: 'n1', type: 'Noun', data: { name: 'Customer', graphSchemaId: 'gs-removed' } }
     const refStub = { get: vi.fn().mockResolvedValue(null) }
     const getStub = vi.fn().mockReturnValue(refStub)
 
     const populated = await populateDepthForEntity(entity, 1, getStub)
 
-    expect(populated.graphSchemaId).toBe('gs-deleted')
+    expect(populated.graphSchemaId).toBe('gs-removed')
     expect(populated.graphSchema).toBeUndefined()
   })
 
@@ -213,10 +206,10 @@ describe('entity-routes', () => {
   it('handleListEntities populates depth=1 references in docs', async () => {
     const registry = { getEntityIds: vi.fn().mockResolvedValue(['n1']) }
     const nounStub = {
-      get: vi.fn().mockResolvedValue({ id: 'n1', type: 'Noun', data: { name: 'Customer', graphSchemaId: 'gs1' }, version: 1 }),
+      get: vi.fn().mockResolvedValue({ id: 'n1', type: 'Noun', data: { name: 'Customer', graphSchemaId: 'gs1' } }),
     }
     const schemaStub = {
-      get: vi.fn().mockResolvedValue({ id: 'gs1', type: 'GraphSchema', data: { name: 'Tickets' }, version: 1 }),
+      get: vi.fn().mockResolvedValue({ id: 'gs1', type: 'GraphSchema', data: { name: 'Tickets' } }),
     }
     const stubs = new Map<string, any>([
       ['n1', nounStub],
@@ -231,10 +224,10 @@ describe('entity-routes', () => {
 
   it('handleGetEntity populates depth=1 references', async () => {
     const nounStub = {
-      get: vi.fn().mockResolvedValue({ id: 'n1', type: 'Noun', data: { name: 'Customer', graphSchemaId: 'gs1' }, version: 1 }),
+      get: vi.fn().mockResolvedValue({ id: 'n1', type: 'Noun', data: { name: 'Customer', graphSchemaId: 'gs1' } }),
     }
     const schemaStub = {
-      get: vi.fn().mockResolvedValue({ id: 'gs1', type: 'GraphSchema', data: { name: 'Tickets' }, version: 1 }),
+      get: vi.fn().mockResolvedValue({ id: 'gs1', type: 'GraphSchema', data: { name: 'Tickets' } }),
     }
     const stubs = new Map<string, any>([
       ['gs1', schemaStub],
@@ -248,44 +241,21 @@ describe('entity-routes', () => {
   // ── transitions folded into _links (AREST whitepaper) ─────────────
 
   describe('transitions folded into _links', () => {
-    const mockTransitions: TransitionOption[] = [
-      {
-        transitionId: 't1',
-        event: 'approve',
-        eventTypeId: 'evt1',
-        targetStatus: 'Approved',
-        targetStatusId: 'status-approved',
-      },
-      {
-        transitionId: 't2',
-        event: 'reject',
-        eventTypeId: 'evt2',
-        targetStatus: 'Rejected',
-        targetStatusId: 'status-rejected',
-      },
+    const mockTransitions = [
+      { transitionId: 't1', event: 'approve', targetStatus: 'Approved', targetStatusId: 'status-approved' },
+      { transitionId: 't2', event: 'reject', targetStatus: 'Rejected', targetStatusId: 'status-rejected' },
     ]
 
     it('includes transition events as links when transitions provided', async () => {
       const stub = {
         get: vi.fn().mockResolvedValue({
-          id: 'e1',
-          type: 'SupportRequest',
-          data: {
-            title: 'Help',
-            _status: 'Open',
-            _statusId: 'status-open',
-            _stateMachineDefinition: 'def1',
-          },
-          version: 1,
+          id: 'e1', type: 'SupportRequest',
+          data: { title: 'Help', _status: 'Open' },
         }),
       }
 
-      const result = await handleGetEntity(stub, {
-        transitions: mockTransitions,
-      })
+      const result = await handleGetEntity(stub, { transitions: mockTransitions })
 
-      expect(result).toBeDefined()
-      expect(result!._links).toBeDefined()
       expect(result!._links!.approve).toEqual({
         href: '/api/entities/SupportRequest/e1/transition',
         method: 'POST',
@@ -298,64 +268,28 @@ describe('entity-routes', () => {
 
     it('_links has only navigation links when no transitions', async () => {
       const stub = {
-        get: vi.fn().mockResolvedValue({
-          id: 'e1',
-          type: 'Noun',
-          data: { name: 'Customer' },
-          version: 1,
-        }),
+        get: vi.fn().mockResolvedValue({ id: 'e1', type: 'Noun', data: { name: 'Customer' } }),
       }
 
       const result = await handleGetEntity(stub, {})
 
-      expect(result).toBeDefined()
-      expect(result!._links).toBeDefined()
       expect(result!._links!.self).toEqual({ href: '/api/entities/Noun/e1' })
       expect(result!._links!.approve).toBeUndefined()
     })
 
     it('transition links include self and collection alongside events', async () => {
-      const innerStub = {
-        get: vi.fn().mockResolvedValue({
-          id: 'e1', type: 'SupportRequest',
-          data: { title: 'Help', _status: 'Open', _statusId: 'status-open', _stateMachineDefinition: 'def1' },
-          version: 1,
-        }),
-      }
-      const result = await handleGetEntity(innerStub, {
-        transitions: mockTransitions,
-      })
-
-      // Navigation links
-      expect(result!._links!.self).toEqual({ href: '/api/entities/SupportRequest/e1' })
-      expect(result!._links!.collection).toEqual({ href: '/api/entities/SupportRequest' })
-      // Transition links
-      expect(result!._links!.approve).toBeDefined()
-      expect(result!._links!.approve.method).toBe('POST')
-    })
-
-    it('omits transition links when none provided', async () => {
       const stub = {
         get: vi.fn().mockResolvedValue({
-          id: 'e1',
-          type: 'SupportRequest',
-          data: {
-            title: 'Help',
-            _status: 'Open',
-            _statusId: 'status-open',
-            _stateMachineDefinition: 'def1',
-          },
-          version: 1,
+          id: 'e1', type: 'SupportRequest',
+          data: { title: 'Help', _status: 'Open' },
         }),
       }
+      const result = await handleGetEntity(stub, { transitions: mockTransitions })
 
-      const result = await handleGetEntity(stub)
-
-      expect(result).toBeDefined()
-      expect(result!._links).toBeDefined()
-      expect(result!._links!.self).toBeDefined()
-      // No transition links without transitions
-      expect(result!._links!.approve).toBeUndefined()
+      expect(result!._links!.self).toEqual({ href: '/api/entities/SupportRequest/e1' })
+      expect(result!._links!.collection).toEqual({ href: '/api/entities/SupportRequest' })
+      expect(result!._links!.approve).toBeDefined()
+      expect(result!._links!.approve.method).toBe('POST')
     })
   })
 
@@ -387,11 +321,6 @@ describe('entity-routes', () => {
         href: '/api/entities/Order/ord-1/transition',
         method: 'POST',
       })
-    })
-
-    it('omits transition links when no transitions', () => {
-      const links = buildEntityLinks('Order', 'ord-1', 'orders')
-      expect(links.place).toBeUndefined()
     })
   })
 })

@@ -555,3 +555,181 @@ pub fn prove_goal(goal: &str, population_val: JsValue, world_assumption: &str) -
     Ok(to_js(&result))
 }
 
+/// Parse FORML 2 markdown readings → entities ready for materialization.
+/// This is the ONLY path from readings to entities. No TS parser.
+///
+/// Per the paper: parse: R → Φ (Theorem 2).
+#[wasm_bindgen]
+pub fn parse_readings_wasm(markdown: &str, domain: &str) -> Result<JsValue, JsValue> {
+    let ir = parse_forml2::parse_markdown(markdown)
+        .map_err(|e| JsValue::from_str(&e))?;
+
+    let mut entities: Vec<serde_json::Value> = Vec::new();
+
+    // Domains are NORMA tabs — not partitions. Fact types are idempotent.
+    // A noun "Customer" declared in multiple domains is ONE cell.
+    // Domain is metadata (which tab), not identity.
+
+    // Nouns → Noun entities (id = noun name, globally unique in the UoD)
+    for (name, noun) in &ir.nouns {
+        let mut data = serde_json::Map::new();
+        data.insert("name".into(), serde_json::Value::String(name.clone()));
+        data.insert("domain".into(), serde_json::Value::String(domain.into()));
+        data.insert("objectType".into(), serde_json::Value::String(noun.object_type.clone()));
+        if let Some(ref st) = noun.super_type {
+            data.insert("superType".into(), serde_json::Value::String(st.clone()));
+        }
+        if let Some(ref rs) = noun.ref_scheme {
+            data.insert("referenceScheme".into(),
+                serde_json::Value::String(serde_json::to_string(rs).unwrap_or_default()));
+        }
+        if let Some(ref obj) = noun.objectifies {
+            data.insert("objectifies".into(), serde_json::Value::String(obj.clone()));
+        }
+        if let Some(ref evs) = noun.enum_values {
+            if !evs.is_empty() {
+                data.insert("enumValues".into(),
+                    serde_json::Value::String(serde_json::to_string(evs).unwrap_or_default()));
+            }
+        }
+
+        // ID is the noun name — idempotent across domains
+        entities.push(serde_json::json!({
+            "id": name,
+            "type": "Noun",
+            "domain": domain,
+            "data": serde_json::Value::Object(data),
+        }));
+    }
+
+    // Fact types → Reading + Graph Schema + Role entities
+    // Reading ID = fact type ID (the predicate reading text is the identity)
+    for (ft_id, ft) in &ir.fact_types {
+        entities.push(serde_json::json!({
+            "id": ft_id,
+            "type": "Reading",
+            "domain": domain,
+            "data": {
+                "text": ft.reading,
+                "domain": domain,
+                "graphSchema": ft_id,
+            },
+        }));
+
+        entities.push(serde_json::json!({
+            "id": ft_id,
+            "type": "Graph Schema",
+            "domain": domain,
+            "data": {
+                "name": ft_id,
+                "domain": domain,
+                "reading": ft.reading,
+                "arity": ft.roles.len(),
+            },
+        }));
+
+        for (i, role) in ft.roles.iter().enumerate() {
+            entities.push(serde_json::json!({
+                "id": format!("{}:role:{}", ft_id, i),
+                "type": "Role",
+                "domain": domain,
+                "data": {
+                    "nounName": role.noun_name,
+                    "position": i,
+                    "graphSchema": ft_id,
+                    "domain": domain,
+                },
+            }));
+        }
+    }
+
+    // Constraints → Constraint entities (id = constraint text, idempotent)
+    for (i, c) in ir.constraints.iter().enumerate() {
+        let reading_ref = c.spans.first().map(|s| s.fact_type_id.clone()).unwrap_or_default();
+        // Use constraint text as ID when available, fall back to index
+        let constraint_id = if !c.text.is_empty() {
+            c.text.clone()
+        } else {
+            format!("constraint:{}", i)
+        };
+        entities.push(serde_json::json!({
+            "id": constraint_id,
+            "type": "Constraint",
+            "domain": domain,
+            "data": {
+                "text": c.text,
+                "kind": c.kind,
+                "modality": c.modality,
+                "reading": reading_ref,
+                "domain": domain,
+            },
+        }));
+    }
+
+    // State machines → SM Definition, Status, Transition entities
+    for (sm_name, sm) in &ir.state_machines {
+        let sm_id = format!("sm:{}", sm_name);
+        entities.push(serde_json::json!({
+            "id": &sm_id,
+            "type": "State Machine Definition",
+            "domain": domain,
+            "data": { "name": sm_name, "forNoun": &sm.noun_name, "domain": domain },
+        }));
+
+        for status_name in &sm.statuses {
+            entities.push(serde_json::json!({
+                "id": format!("{}:{}", sm_id, status_name),
+                "type": "Status",
+                "domain": domain,
+                "data": {
+                    "name": status_name,
+                    "stateMachineDefinition": &sm_id,
+                    "domain": domain,
+                },
+            }));
+        }
+
+        for transition in &sm.transitions {
+            entities.push(serde_json::json!({
+                "id": format!("{}:{}:{}", sm_id, transition.from, transition.to),
+                "type": "Transition",
+                "domain": domain,
+                "data": {
+                    "from": transition.from,
+                    "to": transition.to,
+                    "event": transition.event,
+                    "stateMachineDefinition": &sm_id,
+                    "domain": domain,
+                },
+            }));
+        }
+    }
+
+    // Derivation rules
+    for (i, rule) in ir.derivation_rules.iter().enumerate() {
+        let rule_id = if !rule.text.is_empty() {
+            rule.text.clone()
+        } else {
+            format!("derivation:{}", i)
+        };
+        entities.push(serde_json::json!({
+            "id": rule_id,
+            "type": "Derivation Rule",
+            "domain": domain,
+            "data": { "text": rule.text, "domain": domain },
+        }));
+    }
+
+    // Store the compiled IR as a cell — compile(parse(readings)) is a derived fact.
+    // loadDomainSchema reads this one cell instead of reconstructing from parts.
+    let ir_json = serde_json::to_string(&ir).map_err(|e| JsValue::from_str(&format!("{}", e)))?;
+    entities.push(serde_json::json!({
+        "id": format!("ir:{}", domain),
+        "type": "CompiledSchema",
+        "domain": domain,
+        "data": { "domain": domain, "ir": ir_json },
+    }));
+
+    let json_str = serde_json::to_string(&entities).map_err(|e| JsValue::from_str(&format!("{}", e)))?;
+    Ok(JsValue::from_str(&json_str))
+}

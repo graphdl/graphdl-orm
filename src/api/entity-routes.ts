@@ -3,22 +3,31 @@
  * injected stubs (RegistryStub, EntityStub) rather than env, so they
  * are fully testable without the Cloudflare runtime.
  *
- * Uses Promise.allSettled for fan-out resilience (same pattern as materializer).
+ * Per the AREST whitepaper:
+ *   - Each entity is a cell: ⟨CELL, id, contents⟩
+ *   - ↑n fetches, ↓n stores
+ *   - The population P is the set of all cells
+ *   - If a cell isn't in the registry, it's not in the population
  */
 
-// Deontic constraints evaluated by WASM engine, not procedural TS code.
+// ---------------------------------------------------------------------------
+// Stub interfaces (match EntityDB / RegistryDB DO RPCs)
+// ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
-// Stub interfaces (same shapes as EntityDB / RegistryDB DO RPCs)
-// ---------------------------------------------------------------------------
+export interface CellRecord {
+  id: string
+  type: string
+  data: Record<string, unknown>
+  _links?: Record<string, { href: string; method?: string }>
+}
 
 export interface EntityReadStub {
-  get(): Promise<EntityRecord | null>
+  get(): Promise<CellRecord | null>
 }
 
 export interface EntityWriteStub {
-  put(input: { id: string; type: string; data: Record<string, unknown> }): Promise<{ id: string; version: number }>
-  delete(): Promise<{ id: string; deleted: boolean } | null>
+  put(input: { id: string; type: string; data: Record<string, unknown> }): Promise<CellRecord>
+  delete(): Promise<{ id: string } | null>
 }
 
 export interface RegistryReadStub {
@@ -30,23 +39,12 @@ export interface RegistryWriteStub {
   deindexEntity(entityType: string, entityId: string): Promise<void>
 }
 
-export interface EntityRecord {
-  id: string
-  type: string
-  data: Record<string, unknown>
-  version: number
-  deletedAt?: string
-  createdAt?: string
-  updatedAt?: string
-  _links?: Record<string, { href: string; method?: string }>
-}
-
 // ---------------------------------------------------------------------------
 // Result types
 // ---------------------------------------------------------------------------
 
 export interface ListResult {
-  docs: EntityRecord[]
+  docs: CellRecord[]
   totalDocs: number
   limit: number
   page: number
@@ -54,7 +52,7 @@ export interface ListResult {
   hasNextPage: boolean
   hasPrevPage: boolean
   warnings?: string[]
-  _links?: Record<string, string>  // List-level navigation links remain plain strings
+  _links?: Record<string, string>
 }
 
 export interface PaginationOpts {
@@ -73,9 +71,7 @@ export interface TransitionInfo {
 export interface DepthOpts {
   depth?: number
   getStub?: (id: string) => EntityReadStub
-  /** Valid transitions from current status — resolved by engine at router level. */
   transitions?: TransitionInfo[]
-  /** Domain slug — used for HATEOAS link generation. */
   domain?: string
 }
 
@@ -83,50 +79,6 @@ export interface DepthOpts {
 // HATEOAS link builders
 // ---------------------------------------------------------------------------
 
-/**
- * Reorder entity data fields by graph schema role order.
- * Fields in the order list come first (in order), then remaining fields alphabetically.
- * System fields (_status, _statusId, etc.) always go last.
- */
-function orderData(data: Record<string, unknown>, fieldOrder: string[]): Record<string, unknown> {
-  const ordered: Record<string, unknown> = {}
-  const systemKeys = new Set<string>()
-  const seen = new Set<string>()
-
-  // 1. Ordered fields first
-  for (const field of fieldOrder) {
-    // Try camelCase variants
-    const camel = field.split(' ').map((w, i) => i === 0 ? w.toLowerCase() : w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join('')
-    for (const key of [field, camel]) {
-      if (key in data && !seen.has(key)) {
-        ordered[key] = data[key]
-        seen.add(key)
-      }
-    }
-  }
-
-  // 2. Remaining data fields alphabetically (skip system fields)
-  for (const key of Object.keys(data).sort()) {
-    if (seen.has(key)) continue
-    if (key.startsWith('_')) { systemKeys.add(key); continue }
-    ordered[key] = data[key]
-    seen.add(key)
-  }
-
-  // 3. System fields last
-  for (const key of [...systemKeys].sort()) {
-    ordered[key] = data[key]
-  }
-
-  return ordered
-}
-
-/**
- * Navigation links for a single entity.
- * Derived from the entity's type (noun name from readings) and domain.
- * The URL structure is a projection of the graph schema — entity types
- * and their relationships are declared in readings, not hardcoded.
- */
 export function buildEntityLinks(
   type: string,
   id: string,
@@ -141,7 +93,6 @@ export function buildEntityLinks(
     collection: { href: `/api/entities/${encoded}${qs}` },
   }
 
-  // Transitions as links (per AREST whitepaper — transitions ARE links)
   if (transitions) {
     for (const t of transitions) {
       links[t.event] = { href: `${base}/transition`, method: 'POST' }
@@ -151,7 +102,6 @@ export function buildEntityLinks(
   return links
 }
 
-/** Navigation links for a paginated list. */
 export function buildListLinks(
   type: string,
   domain: string,
@@ -183,13 +133,8 @@ export function buildListLinks(
 // populateDepthForEntity
 // ---------------------------------------------------------------------------
 
-/**
- * Scan entity data for fields ending in `Id` (e.g., `graphSchemaId`).
- * For each, do a secondary fan-out to resolve the referenced entity.
- * The resolved object is added alongside the original ID field.
- */
 export async function populateDepthForEntity(
-  entity: { id: string; type: string; data: Record<string, unknown>; version: number },
+  entity: CellRecord,
   depth: number,
   getStub: (id: string) => EntityReadStub,
 ): Promise<Record<string, unknown>> {
@@ -219,11 +164,6 @@ export async function populateDepthForEntity(
 // handleListEntities
 // ---------------------------------------------------------------------------
 
-/**
- * Fan out to EntityDB DOs for a given entity type + domain.
- * Returns a Payload-style paginated result with an optional warnings array
- * tracking entity IDs whose DOs were unreachable.
- */
 export async function handleListEntities(
   type: string,
   domain: string,
@@ -234,32 +174,28 @@ export async function handleListEntities(
   const limit = opts?.limit ?? 100
   const page = opts?.page ?? 1
 
-  // Ask the Registry which entity IDs match this type + domain
   const ids = await registry.getEntityIds(type, domain)
 
-  // Fan out reads with allSettled for resilience
   const settled = await Promise.allSettled(
     ids.map(async (id) => {
       const stub = getStub(id)
-      const entity = await stub.get()
-      return { id, entity }
+      const cell = await stub.get()
+      return { id, cell }
     }),
   )
 
-  const docs: EntityRecord[] = []
+  const docs: CellRecord[] = []
   const warnings: string[] = []
 
   for (const result of settled) {
     if (result.status === 'rejected') {
-      // Extract the entity ID from the original promise — we need to find it
-      // by index since allSettled preserves order
       const idx = settled.indexOf(result)
       warnings.push(ids[idx])
       continue
     }
-    const { entity } = result.value
-    if (entity && !entity.deletedAt) {
-      docs.push(entity)
+    const { cell } = result.value
+    if (cell) {
+      docs.push(cell)
     }
   }
 
@@ -299,28 +235,21 @@ export async function handleListEntities(
 // handleGetEntity
 // ---------------------------------------------------------------------------
 
-/**
- * Fetch a single entity from its EntityDB DO.
- * Returns null if not found or soft-deleted.
- * When depth >= 1, resolves Id-suffixed fields to full entity objects.
- * When opts.transitions is provided, they are folded into _links per the AREST whitepaper.
- */
 export async function handleGetEntity(
   stub: EntityReadStub,
   opts?: DepthOpts,
-): Promise<EntityRecord | null> {
-  const entity = await stub.get()
-  if (!entity || entity.deletedAt) return null
+): Promise<CellRecord | null> {
+  const cell = await stub.get()
+  if (!cell) return null
 
   const depth = opts?.depth ?? 0
   if (depth >= 1 && opts?.getStub) {
-    entity.data = await populateDepthForEntity(entity, depth, opts.getStub)
+    cell.data = await populateDepthForEntity(cell, depth, opts.getStub)
   }
 
-  // HATEOAS links — transitions folded in per AREST whitepaper
-  entity._links = buildEntityLinks(entity.type, entity.id, opts?.domain, opts?.transitions)
+  cell._links = buildEntityLinks(cell.type, cell.id, opts?.domain, opts?.transitions)
 
-  return entity
+  return cell
 }
 
 // ---------------------------------------------------------------------------
@@ -329,17 +258,10 @@ export async function handleGetEntity(
 
 export interface CreateEntityResult {
   id: string
-  version: number
+  type: string
   _links?: Record<string, { href: string; method?: string }>
 }
 
-/**
- * Create an entity in its EntityDB DO and index it in the Registry.
- * Generates a UUID for the new entity.
- *
- * Deontic constraint checking is done by the WASM engine at the router level,
- * not here. This function is pure CRUD — create + index.
- */
 export async function handleCreateEntity(
   type: string,
   domain: string,
@@ -350,19 +272,15 @@ export async function handleCreateEntity(
 ): Promise<CreateEntityResult> {
   const id = explicitId || crypto.randomUUID()
   const stub = getStub(id)
-  const result = await stub.put({ id, type, data })
+  await stub.put({ id, type, data })
   await registry.indexEntity(type, id, domain)
-  return { id, version: result.version, _links: buildEntityLinks(type, id, domain) }
+  return { id, type, _links: buildEntityLinks(type, id, domain) }
 }
 
 // ---------------------------------------------------------------------------
 // handleDeleteEntity
 // ---------------------------------------------------------------------------
 
-/**
- * Soft-delete an entity via its EntityDB DO and deindex it from the Registry.
- * Returns null if entity not found.
- */
 export async function handleDeleteEntity(
   id: string,
   stub: EntityWriteStub,
@@ -372,5 +290,5 @@ export async function handleDeleteEntity(
   const result = await stub.delete()
   if (!result) return null
   await registry.deindexEntity(type, id)
-  return result
+  return { id: result.id, deleted: true }
 }
