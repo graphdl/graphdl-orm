@@ -51,7 +51,7 @@
 %% Abstract
 %%
 \begin{abstract}
-We define AREST, a compositional architecture unifying Backus's Formal Functional Programming and Applicative State Transition systems~\cite{backus78} with Fielding's Representational State Transfer~\cite{fielding00}, using Halpin's ORM\,2~\cite{halpin08} as the surface syntax. Domain knowledge is expressed as FFP objects in FORML\,2~\cite{halpin06}; the representation function~$\rho$ maps each object to its executable; the system state is Backus's AST cell sequence; the persistent data is Codd's named set~\cite{codd70}. We prove eight properties: grammar unambiguity, specification equivalence, completeness of state transfer, HATEOAS as projection, derivability, query adequacy, derivation completeness, and scope.
+A single set of FORML\,2 declarations can define a database schema, constraint rules, state machine workflows, and a REST API with hypermedia navigation, producing a complete application from domain facts alone. We formalize this as AREST, a compositional architecture unifying Backus's FFP/AST~\cite{backus78} with Fielding's REST~\cite{fielding00} via Halpin's ORM\,2~\cite{halpin08}. Each declaration is an FFP object; the representation function~$\rho$ maps it to an executable; the persistent data is Codd's named set~\cite{codd70}; state machine transitions produce HATEOAS links that expose every valid action at every state. Because the API surface is a complete projection of the domain model, an LLM can reason about the system from the API alone. We prove five properties: grammar unambiguity, specification equivalence, completeness of state transfer, HATEOAS as projection, and derivability.
 \end{abstract}
 
 %%
@@ -268,7 +268,7 @@ The system operates over three categories:
 \begin{enumerate}[nosep]
 \item \textbf{Facts} $(P)$: ORM\,2 elementary facts, persisted in cells.
 \item \textbf{Computations} $(O$ via $\rho)$: total, deterministic functions over $P$.
-\item \textbf{Inputs} $(I)$: request payload, timestamp, external signals --- part of the operand $x$ in $\mu(\mathit{SYSTEM}\!:\!x)$~\cite[Sec.\,14.3.1]{backus78}.
+\item \textbf{Inputs} $(I)$: request payload, timestamp, and external signals, supplied as the operand $x$ in $\mu(\mathit{SYSTEM}\!:\!x)$~\cite[Sec.\,14.3.1]{backus78}.
 \end{enumerate}
 
 Time, randomness, and external effects are classified as follows:
@@ -280,7 +280,21 @@ Time, randomness, and external effects are classified as follows:
 \item \textbf{Identity}: the reference scheme~\cite[Ch.\,5]{halpin08} determines identity before facts are asserted. $\mathit{resolve}$ in~(\ref{eq:create}) applies the selector.
 \end{itemize}
 
-AREST governs the derivation of representations from $(P, I)$. Theorem~\ref{thm:scope} holds: every value derivable from $(P, I)$ by a computable function is in scope; values outside are non-factual or non-computable.
+AREST governs the derivation of representations from $(P, I)$. Theorem~\ref{thm:derive} establishes that every value in the representation is a $\rho$-application over $P$.
+
+\subsection{The Application as a Fold}
+
+A state machine~(\ref{eq:sm}) is a fold over an event stream: each event is an input $x$; the accumulator is the state $D$; the fold body is $\mu(\mathit{SYSTEM}\!:\!x) = \langle o, D'\rangle$. The application IS this fold. The fold is well-defined only if each $\mu$ runs to completion before the next event mutates $D$. Otherwise two concurrent applications of $\mu$ may read the same $D$, and one silently overwrites the other.
+
+Backus states this directly: ``the state cannot change during the computation of system:x''~\cite[Sec.\,14.6(c)]{backus78}. We make the requirement a definition so that theorems can reference it.
+
+\begin{definition}[Cell Isolation]\label{def:isolation}
+For each cell $\langle\mathit{CELL}, n, c\rangle$ in $D$, at most one $\mu$ application that writes to $n$ may be in progress at any time. Concurrent $\mu$ applications over disjoint cells are permitted.
+\end{definition}
+
+\noindent RMAP~\cite[Ch.\,17]{halpin08} determines which facts belong to which cell from the schema's uniqueness constraints. Each entity is a cell; its fold is independent of other entities' folds. A single-threaded runtime (e.g.\ a WASM isolate) satisfies Definition~\ref{def:isolation} trivially. A distributed system requires one writer per cell (actor mailbox, partitioned queue, or single-writer lease).
+
+Theorems~\ref{thm:complete}--\ref{thm:derive} hold under Definition~\ref{def:isolation}. Without it, Theorem~\ref{thm:complete} fails: two concurrent $\mathit{create}$ operations on the same cell may both pass $\mathit{validate}$ against stale $P$ and produce a $D'$ that violates a uniqueness constraint.
 
 \section{Properties}
 
@@ -324,11 +338,17 @@ $\mathit{parse}$ is injective by Theorem~\ref{thm:grammar}: each sentence has on
 \end{proof}
 
 \begin{theorem}[Completeness of State Transfer]\label{thm:complete}
-$\mathit{create}$~(\ref{eq:create}) produces a complete $\langle o, D'\rangle$ containing entity, state machine instance, derived facts, violations, and HATEOAS links.
+Let $F_S : 2^P \to 2^P$ be the monotonic operator that applies all derivation rules in schema $S$ to a population, and let $C_S$ be the set of constraint objects in $S$. Under Definition~\ref{def:isolation}, $\mathit{create}$~(\ref{eq:create}) applied to input $I$ and state $D$ produces $\langle o, D'\rangle$ such that:
+\begin{enumerate}[nosep]
+\item $P' = P \cup \mathit{resolve}(S, I)$ contains all entity facts entailed by $(S, I)$;
+\item $P'' = \mathit{lfp}(F_S, P')$, the least fixed point of $F_S$ above $P'$;
+\item $V = \{(\rho\,c)\!:\!P'' \mid c \in C_S\}$ evaluates every constraint;
+\item $o$ is the REST representation of $(P'', V, \mathit{links}(s))$ and $D' = D[\mathit{FILE} \mapsto P'']$ if $V$ contains no alethic violation, else $D' = D$.
+\end{enumerate}
 \end{theorem}
 
 \begin{proof}
-Let $P = \uparrow\!\mathit{FILE}\!:\!D$. (1)~$\mathit{resolve}$ inserts entity facts: $P' = P \cup E$. (2)~$\mathit{derive}$ is monotonic over finite~$P$; by Knaster-Tarski, a unique least fixed point $P''$ exists. (3)~$\mathit{validate}$ evaluates all constraint objects in $D$ against $P''$: $V = \{(\rho\,c)\!:\!P'' \mid c \in D_{\mathit{constraints}}\}$. (4)~$\mathit{emit}$ produces $\langle o, D[\mathit{FILE} \mapsto P'']\rangle$ if no alethic violation, else $D' = D$. The state does not change during evaluation~\cite[Sec.\,14.1]{backus78}.
+$P$ is finite. $F_S$ is monotonic (derivation rules only add facts). By Knaster-Tarski, $\mathit{lfp}(F_S, P')$ exists and is unique. Iterative application of $F_S$ reaches it in at most $|P''_{\max}| - |P'|$ steps. $\mathit{validate}$ evaluates every $c \in C_S$ against the fixed point; no constraint is skipped. $\mathit{emit}$ constructs $o$ from $P''$, $V$, and $\mathit{links}(s)$ (Theorem~\ref{thm:hateoas}). The state does not change during evaluation~\cite[Sec.\,14.6(c)]{backus78}; Definition~\ref{def:isolation} ensures no concurrent write to the same cell.
 \end{proof}
 
 \begin{theorem}[HATEOAS as Projection]\label{thm:hateoas}
@@ -344,51 +364,32 @@ $T \subseteq P$. $\mathit{Filter}$ is restriction~(\ref{eq:restrict}); $\pi$ is 
 \end{proof}
 
 \begin{theorem}[Derivability]\label{thm:derive}
-For every domain value $v$ in an AREST representation:
-\begin{align}
-\exists f \in O.\; v = (\rho\,f)\!:\!P \label{eq:derive}
-\end{align}
+Define the \emph{representation} of an entity $e$ with status $s$ in population $P$ under schema $S$ as:
+\begin{align*}
+\mathit{repr}(e, s, P, S) = \;&\{(\rho\,s_i)\!:\!f \mid f \in P,\, f \text{ involves } e\} \\
+\cup\; &\{(\rho\,r)\!:\!P \mid r \in S_{\mathit{derivations}}\} \\
+\cup\; &\{(\rho\,c)\!:\!P \mid c \in S_{\mathit{constraints}}\} \\
+\cup\; &\mathit{links}(s)
+\end{align*}
+Then for every $v \in \mathit{repr}(e, s, P, S)$, there exists $f \in O$ such that $v = (\rho\,f)\!:\!P$.
 \end{theorem}
 
 \begin{proof}
-Domain values partition into: (1)~entity attributes (facts in $P$; $v = (\rho\,s_i)\!:\!\mathit{fact}$), (2)~derived facts ($v = (\rho\,r)\!:\!P$ for derivation rule $r$), (3)~state machine status (derived fact), (4)~links ($v = (\rho\,\langle\mathit{COMP}, \pi, \mathit{Filter}(p)\rangle)\!:\!T$ by Theorem~\ref{thm:hateoas}), (5)~violations ($v = (\rho\,c)\!:\!P$ for constraint $c$). Each case yields~(\ref{eq:derive}).
+Each component of $\mathit{repr}$ is a $\rho$-application by construction: selectors extract attributes; derivation rules are FFP objects whose $\rho$-image computes derived facts; constraints are FFP objects whose $\rho$-image evaluates to $\phi$ or a violation; links are $\theta_1$ operations (Theorem~\ref{thm:hateoas}). No value in $\mathit{repr}$ is produced by a mechanism outside $\rho$.
 \end{proof}
 
-\begin{theorem}[Query Adequacy]\label{thm:adequate}
-Every query on $P$ is expressible using $\theta_1$, each element of which is an FFP definition~(\ref{eq:proj})--(\ref{eq:tie}).
-\end{theorem}
+\medskip
+\noindent\textbf{Remark} (Query Adequacy). $P$ is a named set of relations in normal form (ORM\,2 elementary facts are 5NF by construction~\cite[Ch.\,12]{halpin08}). Codd shows that $\theta_1 = \{\text{projection, natural join, restriction, tie}\}$ is adequate for the named set~\cite{codd72}. Equations~(\ref{eq:proj})--(\ref{eq:tie}) express each element of $\theta_1$ as an FFP definition.
 
-\begin{proof}
-$P$ is a named set of relations in normal form (ORM\,2 elementary facts are 5NF by construction~\cite[Ch.\,12]{halpin08}). $\theta_1$ is adequate for the named set~\cite[Sec.\,2.2]{codd70}. Each element of $\theta_1$ is an FFP definition by~(\ref{eq:proj})--(\ref{eq:tie}).
-\end{proof}
+\medskip
+\noindent\textbf{Remark} (Verbalizability). Each $\theta_1$ primitive has a FORML\,2 verbalization: projection as role selection, join as qualified composition, restriction as constraint predicate, tie as self-reference. Halpin and Curland~\cite{halpin06} give the automated verbalization algorithm for ORM\,2 constraints. Composed $\theta_1$ operations verbalize via FORML\,2 qualified readings (``who\ldots'', ``that\ldots''), which parse unambiguously by Theorem~\ref{thm:grammar}.
 
-\begin{theorem}[Derivation Completeness]\label{thm:deriv-complete}
-Every $\theta_1$-derivable relation has a FORML\,2 reading. Forward chaining evaluates the corresponding FFP objects to the least fixed point.
-\end{theorem}
-
-\begin{proof}
-Each $\theta_1$ operation has a FORML\,2 verbalization: projection verbalizes as role selection (``$X$ has $Y$''); join as shared-role composition (``$X$ who $R_1$ $Y$ and $R_2$ $Z$''); restriction as constraint predicate (``$X$ where $Y$ exceeds $Z$''); tie as self-reference (``$X$ is ancestor of $X$''). By Theorem~\ref{thm:grammar}, each verbalization has a unique parse, so each $\theta_1$ composition has a unique reading. Forward chaining applies derivation rules (FFP objects) to $P$ monotonically; by Knaster-Tarski the least fixed point exists and is reached in $|P_{\max}|$ steps.
-\end{proof}
-
-\begin{theorem}[Scope]\label{thm:scope}
-The architecture covers all values that are both factual and computable. Values outside are either non-factual or non-computable.
-\end{theorem}
-
-\begin{proof}
-Any factual proposition (a statement with a truth value) is expressible as a tuple in a relation~\cite[Sec.\,1.3]{codd70}, hence a fact in $P$. Any computable function (an effective method) is expressible as a $\lambda$-term~\cite{church36}; Backus shows the equivalence of FP combining forms to $\lambda$-calculus combinators~\cite[Sec.\,12.9]{backus78}, and FFP extends FP with metacomposition. Therefore every factual-and-computable value is $(\rho\,f)\!:\!P$ for some $f \in O$, $P \subseteq D$. Non-factual values (no truth value) cannot be relations. Non-computable values (no effective method) cannot be computed by any system.
-\end{proof}
-
-\begin{corollary}[Algebraic Optimization]\label{cor:algebra}
-Programs composed from FFP combining forms admit algebraic transformation via the laws of~\cite[Sec.\,12.2]{backus78}. Compilation from FFP objects to optimized evaluation preserves $\rho$-semantics.
-\end{corollary}
-
-\begin{proof}
-The 24 laws of the FP algebra~\cite[Sec.\,12.2]{backus78} are equations between functional forms. An FFP object representing a program can be transformed to an equivalent object by applying these laws. The $\rho$-image is preserved because the laws hold for all objects in the domain. Ahead-of-time compilation from objects to evaluation trees is one such transformation.
-\end{proof}
+\medskip
+\noindent\textbf{Remark} (Algebraic Optimization). The algebraic laws of FP~\cite[Sec.\,12.2]{backus78} are equations between functional forms. Since FFP objects represent the same forms via $\rho$~\cite[Sec.\,13.3.2]{backus78}, an FFP object can be transformed to an equivalent object by applying these laws. Ahead-of-time compilation from objects to optimized evaluation trees is one such transformation.
 
 \section{Conclusion}
 
-AREST composes FFP/AST~\cite{backus78} with REST~\cite{fielding00} via ORM\,2~\cite{halpin08}. Readings are FFP objects; $\rho$ maps them to executables; the population is Codd's named set~\cite{codd70} stored as Backus's FILE cell; transitions produce hypermedia. The eight results establish: the grammar is unambiguous (Theorem~\ref{thm:grammar}); specifications and executables are the same object (Theorem~\ref{thm:spec}); state transfer is complete in one application (Theorem~\ref{thm:complete}); HATEOAS is a $\theta_1$ projection (Theorem~\ref{thm:hateoas}); all domain values are derivable (Theorem~\ref{thm:derive}); all queries are expressible (Theorem~\ref{thm:adequate}); all derivations are verbalizable (Theorem~\ref{thm:deriv-complete}); and the scope is factual-and-computable, which is everything (Theorem~\ref{thm:scope}).
+AREST composes FFP/AST~\cite{backus78} with REST~\cite{fielding00} via ORM\,2~\cite{halpin08}. Readings are FFP objects; $\rho$ maps them to executables; the population is Codd's named set~\cite{codd70} stored as Backus's FILE cell; transitions produce hypermedia. The five theorems establish: the grammar is unambiguous (Theorem~\ref{thm:grammar}); specifications and executables are the same object (Theorem~\ref{thm:spec}); state transfer is complete in one $\mu$ application under cell isolation (Theorem~\ref{thm:complete}); HATEOAS is a $\theta_1$ projection (Theorem~\ref{thm:hateoas}); and every value in the representation is a $\rho$-application over the population (Theorem~\ref{thm:derive}). Query adequacy follows from Codd~\cite{codd72}; verbalizability from Halpin and Curland~\cite{halpin06}; algebraic optimization from Backus~\cite[Sec.\,12.2]{backus78}.
 
 \begin{acks}
 Claude (Anthropic) was used as a programming assistant during implementation and as a drafting aid during manuscript preparation. All architectural decisions and the composition of FFP/AST with REST were made by the human author.
@@ -398,22 +399,22 @@ Claude (Anthropic) was used as a programming assistant during implementation and
 %% Bibliography
 %%
 \bibliographystyle{ACM-Reference-Format}
-\begin{thebibliography}{7}
+\begin{thebibliography}{8}
 
 \bibitem{backus78}
 J. Backus.
 \newblock Can Programming Be Liberated from the von Neumann Style? {A} Functional Style and Its Algebra of Programs.
 \newblock \emph{Communications of the ACM}, 21(8):613--641, 1978.
 
-\bibitem{church36}
-A. Church.
-\newblock An Unsolvable Problem of Elementary Number Theory.
-\newblock \emph{American Journal of Mathematics}, 58(2):345--363, 1936.
-
 \bibitem{codd70}
 E.F. Codd.
 \newblock A Relational Model of Data for Large Shared Data Banks.
 \newblock \emph{Communications of the ACM}, 13(6):377--387, 1970.
+
+\bibitem{codd72}
+E.F. Codd.
+\newblock Relational Completeness of Data Base Sublanguages.
+\newblock In R. Rustin, ed., \emph{Data Base Systems}, Prentice-Hall, pages 65--98, 1972.
 
 \bibitem{fielding00}
 R.T. Fielding.
