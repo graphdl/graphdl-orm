@@ -2691,7 +2691,7 @@ mod schema_tests {
             fact_types,
             constraints: vec![],
             state_machines: HashMap::new(),
-            derivation_rules: vec![],
+            derivation_rules: vec![], general_instance_facts: vec![],
         }
     }
 
@@ -2822,7 +2822,7 @@ mod schema_tests {
                 max_occurrence: None,
             }],
             state_machines: HashMap::new(),
-            derivation_rules: vec![],
+            derivation_rules: vec![], general_instance_facts: vec![],
         };
 
         let model = compile(&ir);
@@ -2887,7 +2887,7 @@ mod schema_tests {
                 max_occurrence: None,
             }],
             state_machines: HashMap::new(),
-            derivation_rules: vec![],
+            derivation_rules: vec![], general_instance_facts: vec![],
         };
 
         let model = compile(&ir);
@@ -2962,7 +2962,7 @@ mod schema_tests {
                 value_type: None,
                 super_type: None,
                 world_assumption: WorldAssumption::Closed,
-                ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
+                ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false, backed_by: None,
             });
         }
 
@@ -2972,7 +2972,7 @@ mod schema_tests {
             fact_types,
             constraints: vec![],
             state_machines: HashMap::new(),
-            derivation_rules: vec![],
+            derivation_rules: vec![], general_instance_facts: vec![],
         };
 
         // Chain: User → (ft1) → OrgMembership → (ft2) → Organization
@@ -3033,7 +3033,7 @@ mod schema_tests {
             fact_types,
             constraints: vec![],
             state_machines: HashMap::new(),
-            derivation_rules: vec![],
+            derivation_rules: vec![], general_instance_facts: vec![],
         };
 
         let model = compile(&ir);
