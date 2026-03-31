@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 // ── IR Types (deserialized from generator JSON) ──────────────────────
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConstraintIR {
     #[allow(dead_code)] // deserialized from JSON, read by JS callers
@@ -15,6 +15,20 @@ pub struct ConstraintIR {
     pub state_machines: HashMap<String, StateMachineDef>,
     #[serde(default)]
     pub derivation_rules: Vec<DerivationRuleDef>,
+    #[serde(default)]
+    pub general_instance_facts: Vec<GeneralInstanceFact>,
+}
+
+/// x̄ — a constant asserted into P.
+/// Subject noun 'value' predicate object 'value'.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeneralInstanceFact {
+    pub subject_noun: String,
+    pub subject_value: String,
+    pub field_name: String,
+    pub object_noun: String,
+    pub object_value: String,
 }
 
 /// World assumption for a noun — determines how absence of facts is interpreted
@@ -59,6 +73,10 @@ pub struct NounDef {
     /// true = rigid (fixed classification), false = flexible (can change)
     #[serde(default)]
     pub rigid: bool,
+    /// External System that backs this noun's population.
+    /// When set, resolve fetches from the External System instead of local cells.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backed_by: Option<String>,
 }
 
 /// A derivation rule in the IR — compiled to a DeriveFn at compile time.

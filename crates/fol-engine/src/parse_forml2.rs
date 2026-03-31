@@ -47,6 +47,7 @@ fn try_entity_type(line: &str) -> Option<ParseAction> {
         object_type: "entity".into(), enum_values: None, value_type: None,
         super_type: None, world_assumption: WorldAssumption::default(),
         ref_scheme, objectifies: None, subtype_kind: None, rigid: false,
+        backed_by: None,
     }))
 }
 
@@ -56,6 +57,7 @@ fn try_value_type(line: &str) -> Option<ParseAction> {
         object_type: "value".into(), enum_values: None, value_type: None,
         super_type: None, world_assumption: WorldAssumption::default(),
         ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
+        backed_by: None,
     }))
 }
 
@@ -68,6 +70,7 @@ fn try_subtype(line: &str) -> Option<ParseAction> {
         object_type: "entity".into(), enum_values: None, value_type: None,
         super_type: Some(sup), world_assumption: WorldAssumption::default(),
         ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
+        backed_by: None,
     }))
 }
 
@@ -116,11 +119,14 @@ fn try_deontic(line: &str) -> Option<ParseAction> {
 }
 
 fn try_instance_fact(line: &str) -> Option<ParseAction> {
-    let is_sm = line.starts_with("State Machine Definition '");
-    let is_status = line.starts_with("Status '") && line.contains("is initial in");
-    let is_transition = line.starts_with("Transition '");
-    let is_domain = line.starts_with("Domain '") && line.contains("has");
-    (is_sm || is_status || is_transition || is_domain)
+    // An instance fact contains a quoted value: NounName 'value' predicate ...
+    // Must contain at least one single-quoted value and not be a constraint or enum.
+    let has_quote = line.contains('\'');
+    let is_enum = line.contains("The possible values of");
+    let is_constraint_prefix = line.starts_with("Each ") || line.starts_with("For each ")
+        || line.starts_with("It is ") || line.starts_with("No ")
+        || line.starts_with("If ") || line.starts_with("Context:");
+    (has_quote && !is_enum && !is_constraint_prefix)
         .then(|| ParseAction::AddInstanceFact(line.into()))
 }
 
@@ -149,6 +155,15 @@ fn try_constraint(line: &str, noun_names: &[String]) -> Option<ParseAction> {
 }
 
 fn try_fact_type(line: &str, noun_names: &[String]) -> Option<ParseAction> {
+    // Instance facts have a quoted value immediately after the subject noun:
+    // NounName 'value' predicate ...
+    // Fact type readings may contain quotes later (object position) but not
+    // right after the first noun. Check by finding the first noun and seeing
+    // if a quote follows it.
+    for noun in noun_names {
+        let prefix = format!("{} '", noun);
+        if line.starts_with(&prefix) { return None; }
+    }
     let (ft_id, ft_def) = parse_fact(line, noun_names)?;
     Some(ParseAction::AddFactType(ft_id, ft_def))
 }
@@ -161,6 +176,7 @@ pub fn parse_markdown(input: &str) -> Result<ConstraintIR, String> {
     let mut ir = ConstraintIR {
         domain: String::new(), nouns: HashMap::new(), fact_types: HashMap::new(),
         constraints: vec![], state_machines: HashMap::new(), derivation_rules: vec![],
+        general_instance_facts: vec![],
     };
 
     let lines: Vec<String> = input.lines().map(|s| s.to_string()).collect();
@@ -198,7 +214,9 @@ pub fn parse_markdown(input: &str) -> Result<ConstraintIR, String> {
     }
 
     // Pass 2: α(recognize_reading) : lines — fact types, constraints, derivations
-    let noun_names: Vec<String> = ir.nouns.keys().cloned().collect();
+    // Sorted longest-first for Theorem 1 (unambiguous longest-first matching)
+    let mut noun_names: Vec<String> = ir.nouns.keys().cloned().collect();
+    noun_names.sort_by(|a, b| b.len().cmp(&a.len()));
 
     for i in 0..lines.len() {
         let line = lines[i].trim();
@@ -223,11 +241,11 @@ pub fn parse_markdown(input: &str) -> Result<ConstraintIR, String> {
         }
 
         let action = None
-            .or_else(|| try_instance_fact(line))
             .or_else(|| try_derivation(line))
             .or_else(|| try_deontic(line))
             .or_else(|| try_constraint(line, &noun_names))
-            .or_else(|| try_fact_type(line, &noun_names));
+            .or_else(|| try_fact_type(line, &noun_names))
+            .or_else(|| try_instance_fact(line));
 
         // Split "exactly one" constraints into UC + MC
         match &action {
@@ -268,10 +286,28 @@ fn apply_action(ir: &mut ConstraintIR, action: Option<ParseAction>, lines: &[Str
                     object_type: "entity".into(), enum_values: None, value_type: None,
                     super_type: Some(sup.clone()), world_assumption: WorldAssumption::default(),
                     ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
+                    backed_by: None,
                 });
             }
         }
-        ParseAction::AddFactType(id, def) => { ir.fact_types.entry(id).or_insert(def); }
+        ParseAction::AddFactType(id, def) => {
+            // Check if this fact type connects a noun to External System.
+            // Identified by roles, not by reading text (readings may be internationalized).
+            if def.roles.len() == 2 {
+                let role0_noun = &def.roles[0].noun_name;
+                let role1_noun = &def.roles[1].noun_name;
+                if role1_noun == "External System" {
+                    if let Some(noun) = ir.nouns.get_mut(role0_noun) {
+                        noun.backed_by = Some("External System".into());
+                    }
+                } else if role0_noun == "External System" {
+                    if let Some(noun) = ir.nouns.get_mut(role1_noun) {
+                        noun.backed_by = Some("External System".into());
+                    }
+                }
+            }
+            ir.fact_types.entry(id).or_insert(def);
+        }
         ParseAction::AddConstraint(c) => { ir.constraints.push(c); }
         ParseAction::AddDerivation(r) => { ir.derivation_rules.push(r); }
         ParseAction::AddInstanceFact(raw) => {
@@ -431,9 +467,13 @@ fn parse_instance_fact(ir: &mut ConstraintIR, line: &str, lines: &[&str], idx: u
     // Transition
     if let Some(event) = extract_quoted(clean, "Transition '") {
         let from = extract_quoted(clean, "is from Status '")
-            .or_else(|| look_ahead(lines, idx, &event, "is from Status '"));
+            .or_else(|| look_ahead(lines, idx, &event, "is from Status '"))
+            .or_else(|| extract_quoted(clean, "is from Subscription Status '"))
+            .or_else(|| extract_quoted(clean, "is from Incident Status '"));
         let to = extract_quoted(clean, "is to Status '")
-            .or_else(|| look_ahead(lines, idx, &event, "is to Status '"));
+            .or_else(|| look_ahead(lines, idx, &event, "is to Status '"))
+            .or_else(|| extract_quoted(clean, "is to Subscription Status '"))
+            .or_else(|| extract_quoted(clean, "is to Incident Status '"));
 
         if let (Some(from), Some(to)) = (from, to) {
             for sm in ir.state_machines.values_mut() {
@@ -450,7 +490,91 @@ fn parse_instance_fact(ir: &mut ConstraintIR, line: &str, lines: &[&str], idx: u
                 sm.transitions.push(TransitionDef { from, to, event, guard: None });
             }
         }
+        return;
     }
+
+    // General instance fact: NounName 'value' predicate NounName 'value'.
+    // Longest-first matching against declared nouns (Theorem 1).
+    // The fact is x-bar (constant) asserted into P.
+    parse_general_instance_fact(ir, clean);
+}
+
+fn parse_general_instance_fact(ir: &mut ConstraintIR, line: &str) {
+    // Longest-first noun matching (Theorem 1, step 3)
+    let mut noun_names: Vec<String> = ir.nouns.keys().cloned().collect();
+    noun_names.sort_by(|a, b| b.len().cmp(&a.len()));
+
+    // bu(match_subject, line) — find the first noun that matches as subject
+    let subject = noun_names.iter()
+        .filter_map(|noun| {
+            let prefix = format!("{} '", noun);
+            line.starts_with(&prefix).then(|| {
+                let after = &line[prefix.len()..];
+                after.find('\'').map(|end| (noun.clone(), after[..end].to_string(), after[end + 1..].trim()))
+            })?
+        })
+        .next();
+
+    let (subject_noun, subject_value, rest) = match subject {
+        Some((n, v, r)) => (n, v, r),
+        None => return,
+    };
+
+    // bu(match_object, rest) — find the object noun+value in the remainder
+    let object_match = noun_names.iter()
+        .filter_map(|noun| {
+            let obj_prefix = format!("{} '", noun);
+            rest.find(&obj_prefix).and_then(|pred_end| {
+                let predicate = rest[..pred_end].trim();
+                let obj_rest = &rest[pred_end + obj_prefix.len()..];
+                obj_rest.find('\'').map(|end| (predicate.to_string(), noun.clone(), obj_rest[..end].to_string()))
+            })
+        })
+        .next();
+
+    let fact = match object_match {
+        Some((predicate, object_noun, object_value)) => Some(GeneralInstanceFact {
+            subject_noun,
+            subject_value,
+            field_name: to_camel_case(&predicate),
+            object_noun,
+            object_value,
+        }),
+        None => extract_value_fact(rest).map(|(predicate, value)| GeneralInstanceFact {
+            subject_noun,
+            subject_value,
+            field_name: to_camel_case(&predicate),
+            object_noun: String::new(),
+            object_value: value,
+        }),
+    };
+
+    if let Some(f) = fact { ir.general_instance_facts.push(f); }
+}
+
+fn extract_value_fact(rest: &str) -> Option<(String, String)> {
+    let last_q_end = rest.rfind('\'')?;
+    let before_last = &rest[..last_q_end];
+    let val_start = before_last.rfind('\'')?;
+    let value = before_last[val_start + 1..].to_string();
+    let predicate = before_last[..val_start].trim().to_string();
+    Some((predicate, value))
+}
+
+fn to_camel_case(s: &str) -> String {
+    let words: Vec<&str> = s.split_whitespace()
+        .filter(|w| !w.is_empty())
+        .collect();
+    if words.is_empty() { return String::new(); }
+    let mut result = words[0].to_lowercase();
+    for word in &words[1..] {
+        let mut chars = word.chars();
+        if let Some(first) = chars.next() {
+            result.push(first.to_uppercase().next().unwrap_or(first));
+            result.extend(chars);
+        }
+    }
+    result
 }
 
 fn extract_quoted(text: &str, prefix: &str) -> Option<String> {
@@ -548,5 +672,55 @@ mod tests {
         let input = "X(.id) is an entity type.\nY(.id) is an entity type.\nX has Y iff some condition.";
         let ir = parse_markdown(input).unwrap();
         assert!(!ir.derivation_rules.is_empty());
+    }
+
+    #[test]
+    fn instance_facts_value() {
+        let input = "Domain(.Slug) is an entity type.\nVisibility is a value type.\n  The possible values of Visibility are 'public', 'private'.\n## Fact Types\nDomain has Visibility.\n## Instance Facts\nDomain 'support' has Visibility 'public'.";
+        let ir = parse_markdown(input).unwrap();
+        assert_eq!(ir.general_instance_facts.len(), 1);
+        assert_eq!(ir.general_instance_facts[0].subject_noun, "Domain");
+        assert_eq!(ir.general_instance_facts[0].subject_value, "support");
+        assert_eq!(ir.general_instance_facts[0].object_value, "public");
+    }
+
+    #[test]
+    fn instance_facts_noun_to_noun() {
+        let input = "API Endpoint(.Path) is an entity type.\nClickHouse Table(.Name) is an entity type.\n## Fact Types\nAPI Endpoint reads from ClickHouse Table.\n## Instance Facts\nAPI Endpoint '/data/:vin' reads from ClickHouse Table 'sources.currentResources'.";
+        let ir = parse_markdown(input).unwrap();
+        assert_eq!(ir.general_instance_facts.len(), 1);
+        assert_eq!(ir.general_instance_facts[0].subject_noun, "API Endpoint");
+        assert_eq!(ir.general_instance_facts[0].subject_value, "/data/:vin");
+        assert_eq!(ir.general_instance_facts[0].object_noun, "ClickHouse Table");
+        assert_eq!(ir.general_instance_facts[0].object_value, "sources.currentResources");
+    }
+
+    #[test]
+    fn instance_facts_multiple() {
+        let input = "Domain(.Slug) is an entity type.\nVisibility is a value type.\nDomain has Visibility.\nDomain 'support' has Visibility 'public'.\nDomain 'core' has Visibility 'private'.";
+        let ir = parse_markdown(input).unwrap();
+        assert_eq!(ir.general_instance_facts.len(), 2);
+    }
+
+    #[test]
+    fn backed_by_from_roles() {
+        let input = "Vehicle Specs(.VIN) is an entity type.\nExternal System(.Name) is an entity type.\nVehicle Specs is backed by External System.";
+        let ir = parse_markdown(input).unwrap();
+        assert_eq!(ir.nouns["Vehicle Specs"].backed_by.as_deref(), Some("External System"));
+    }
+
+    #[test]
+    fn backed_by_reverse_role_order() {
+        let input = "External System(.Name) is an entity type.\nLog Entry(.id) is an entity type.\nExternal System backs Log Entry.";
+        let ir = parse_markdown(input).unwrap();
+        assert_eq!(ir.nouns["Log Entry"].backed_by.as_deref(), Some("External System"));
+    }
+
+    #[test]
+    fn not_backed_by_without_external_system() {
+        let input = "Customer(.Name) is an entity type.\nOrder(.Id) is an entity type.\nCustomer places Order.";
+        let ir = parse_markdown(input).unwrap();
+        assert!(ir.nouns["Customer"].backed_by.is_none());
+        assert!(ir.nouns["Order"].backed_by.is_none());
     }
 }

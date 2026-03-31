@@ -419,7 +419,7 @@ mod tests {
             fact_types: HashMap::new(),
             constraints: Vec::new(),
             state_machines: HashMap::new(),
-            derivation_rules: Vec::new(),
+            derivation_rules: Vec::new(), general_instance_facts: Vec::new(),
         };
         for (name, obj_type) in nouns {
             ir.nouns.insert(name.to_string(), NounDef {
@@ -428,7 +428,7 @@ mod tests {
                 value_type: None,
                 super_type: None,
                 world_assumption: WorldAssumption::default(),
-                ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
+                ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false, backed_by: None,
             });
         }
         for (id, reading, roles) in fact_types {

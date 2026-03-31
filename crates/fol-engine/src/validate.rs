@@ -455,17 +455,17 @@ mod tests {
             fact_types: HashMap::new(),
             constraints: vec![],
             state_machines: HashMap::new(),
-            derivation_rules: vec![],
+            derivation_rules: vec![], general_instance_facts: vec![],
         };
         ir.nouns.insert("Person".to_string(), NounDef {
             object_type: "entity".to_string(),
             enum_values: None, value_type: None, super_type: None,
-            world_assumption: WorldAssumption::default(), ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
+            world_assumption: WorldAssumption::default(), ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false, backed_by: None,
         });
         ir.nouns.insert("Name".to_string(), NounDef {
             object_type: "value".to_string(),
             enum_values: None, value_type: None, super_type: None,
-            world_assumption: WorldAssumption::default(), ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
+            world_assumption: WorldAssumption::default(), ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false, backed_by: None,
         });
         ir.fact_types.insert("ft1".to_string(), FactTypeDef {
             reading: "Person has Name".to_string(),
@@ -610,7 +610,7 @@ mod tests {
             object_type: "entity".to_string(),
             enum_values: None, value_type: None, super_type: None,
             world_assumption: WorldAssumption::default(),
-            ref_scheme: None, objectifies: Some("ft1".to_string()), subtype_kind: None, rigid: false,
+            ref_scheme: None, objectifies: Some("ft1".to_string()), subtype_kind: None, rigid: false, backed_by: None,
         });
         ir.constraints.push(ConstraintDef {
             id: "uc-person-name".to_string(),
@@ -635,7 +635,7 @@ mod tests {
             object_type: "entity".to_string(),
             enum_values: None, value_type: None, super_type: None,
             world_assumption: WorldAssumption::default(),
-            ref_scheme: None, objectifies: Some("ft1".to_string()), subtype_kind: None, rigid: false,
+            ref_scheme: None, objectifies: Some("ft1".to_string()), subtype_kind: None, rigid: false, backed_by: None,
         });
         // Spanning UC: spans ALL roles (both role 0 and role 1)
         ir.constraints.push(ConstraintDef {
@@ -725,7 +725,7 @@ mod tests {
             super_type: Some("Person".to_string()),
             world_assumption: WorldAssumption::default(),
             ref_scheme: None, objectifies: None,
-            subtype_kind: Some("derived".to_string()), rigid: false,
+            subtype_kind: Some("derived".to_string()), rigid: false, backed_by: None,
         });
         // No derivation rule for Teacher
         let violations = check_subtype_derivation_rules(&ir);
@@ -742,7 +742,7 @@ mod tests {
             super_type: Some("Person".to_string()),
             world_assumption: WorldAssumption::default(),
             ref_scheme: None, objectifies: None,
-            subtype_kind: Some("derived".to_string()), rigid: false,
+            subtype_kind: Some("derived".to_string()), rigid: false, backed_by: None,
         });
         ir.derivation_rules.push(DerivationRuleDef {
             id: "rule-teacher".to_string(),
@@ -765,7 +765,7 @@ mod tests {
             super_type: Some("Person".to_string()),
             world_assumption: WorldAssumption::default(),
             ref_scheme: None, objectifies: None,
-            subtype_kind: Some("asserted".to_string()), rigid: true,
+            subtype_kind: Some("asserted".to_string()), rigid: true, backed_by: None,
         });
         let violations = check_subtype_derivation_rules(&ir);
         assert_eq!(violations.len(), 0, "asserted subtypes don't need rules");
@@ -895,7 +895,7 @@ mod tests {
             object_type: "value".to_string(),
             enum_values: None, value_type: None, super_type: None,
             world_assumption: WorldAssumption::default(),
-            ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
+            ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false, backed_by: None,
         });
         ir.fact_types.insert("ft2".to_string(), FactTypeDef {
             reading: "Person has Name and Age".to_string(),
@@ -917,7 +917,7 @@ mod tests {
             object_type: "entity".to_string(),
             enum_values: None, value_type: None, super_type: None,
             world_assumption: WorldAssumption::default(),
-            ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
+            ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false, backed_by: None,
         });
         ir.fact_types.insert("ft2".to_string(), FactTypeDef {
             reading: "Person was born in Country".to_string(),

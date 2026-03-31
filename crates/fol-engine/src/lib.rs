@@ -7,6 +7,8 @@
 //   forward_chain      — apply derivation rules to population until fixed point
 //   query_population   — filter a population by predicate, return matching entities
 
+use std::collections::HashMap;
+
 pub mod ast;
 pub mod types;
 pub mod compile;
@@ -586,6 +588,9 @@ pub fn parse_readings_wasm(markdown: &str, domain: &str) -> Result<JsValue, JsVa
         if let Some(ref obj) = noun.objectifies {
             data.insert("objectifies".into(), serde_json::Value::String(obj.clone()));
         }
+        if let Some(ref backed) = noun.backed_by {
+            data.insert("backedBy".into(), serde_json::Value::String(backed.clone()));
+        }
         if let Some(ref evs) = noun.enum_values {
             if !evs.is_empty() {
                 data.insert("enumValues".into(),
@@ -719,6 +724,30 @@ pub fn parse_readings_wasm(markdown: &str, domain: &str) -> Result<JsValue, JsVa
             "data": { "text": rule.text, "domain": domain },
         }));
     }
+
+    // Instance facts — x̄ asserted into P.
+    // /merge : α key_by : instance_facts  (fold groups, then map to entities)
+    let instance_entities = ir.general_instance_facts.iter()
+        .map(|fact| (format!("{}:{}", fact.subject_noun, fact.subject_value), fact))
+        .fold(HashMap::<String, serde_json::Map<String, serde_json::Value>>::new(), |mut acc, (id, fact)| {
+            let data = acc.entry(id).or_insert_with(|| {
+                let mut m = serde_json::Map::new();
+                m.insert("domain".into(), serde_json::Value::String(domain.into()));
+                m
+            });
+            data.insert(fact.field_name.clone(), serde_json::Value::String(fact.object_value.clone()));
+            acc
+        });
+
+    entities.extend(instance_entities.iter().map(|(entity_id, data)| {
+        let noun_name = entity_id.split(':').next().unwrap_or("");
+        serde_json::json!({
+            "id": entity_id,
+            "type": noun_name,
+            "domain": domain,
+            "data": serde_json::Value::Object(data.clone()),
+        })
+    }));
 
     // Store the compiled IR as a cell — compile(parse(readings)) is a derived fact.
     // loadDomainSchema reads this one cell instead of reconstructing from parts.
