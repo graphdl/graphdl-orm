@@ -6,6 +6,7 @@ import { handleSeed } from './seed'
 import { handleEvaluate, handleSynthesize } from './evaluate'
 import { handleListEntities, handleGetEntity, handleCreateEntity, handleDeleteEntity, buildEntityLinks } from './entity-routes'
 import { loadDomainSchema, loadDomainAndPopulation, getTransitions, applyCommand, querySchema, forwardChain, getNounSchemas, evaluateAccess, deriveViewMetadata, deriveNavContext, getTopLevelNouns } from './engine'
+import { system } from './system'
 
 // ── Collection slug → noun type resolution ───────────────────────────
 // Resolved dynamically from the Registry via nounToSlug convention.
@@ -57,6 +58,13 @@ router.get('/api/access', async (request, env: Env) => {
 })
 
 // ── Debug: entity counts by type from Registry ──────────────────────
+router.get('/api/debug/counts/:domain', async (request, env: Env) => {
+  const { domain } = request.params
+  const registry = getRegistryDO(env, 'global') as any
+  const counts = await registry.getEntityCounts(domain)
+  return json({ domain, counts })
+})
+
 router.post('/api/debug/arest/:domain', async (request, env: Env) => {
   const { domain } = request.params
   const body = await request.json() as any
@@ -447,20 +455,20 @@ router.get('/api/entities/:noun', async (request, env: Env) => {
   const domainId = url.searchParams.get('domain')
   if (!domainId) return error(400, { errors: [{ message: 'domain query param required' }] })
 
-  const limit = parseInt(url.searchParams.get('limit') || '100', 10)
-  const page = parseInt(url.searchParams.get('page') || '1', 10)
   const userEmail = request.headers.get('x-user-email') || ''
+
+  const params: Record<string, string> = {}
+  url.searchParams.forEach((v, k) => { params[k] = v })
 
   const registry = getRegistryDO(env, 'global') as any
   const getStub = (id: string) => getEntityDO(env, id) as any
 
-  // Fetch entities + derive view metadata in parallel
-  // Per Theorem 4: every value in the representation is (ρf):P
-  const [result, viewMeta, navCtx] = await Promise.all([
-    handleListEntities(noun, domainId, registry, getStub, { limit, page }),
-    deriveViewMetadata(registry, getStub, noun, domainId),
-    userEmail ? deriveNavContext(registry, getStub, userEmail, domainId, noun) : null,
-  ])
+  // SYSTEM:x = (ρ (↑entity(x) : D)) : ↑op(x)
+  const result = await system(noun, domainId || '', 'read', params, { registry, getStub })
+
+  // Enrich with view metadata (derived from ρ, not procedural)
+  const viewMeta = await deriveViewMetadata(registry, getStub, noun, domainId).catch(() => null)
+  const navCtx = userEmail ? await deriveNavContext(registry, getStub, userEmail, domainId, noun).catch(() => null) : null
 
   // When listing Nouns, enrich each doc with _topLevel derived from the compiled IR
   let topLevelInfo: { topLevel: Set<string> } | null = null
@@ -471,85 +479,67 @@ router.get('/api/entities/:noun', async (request, env: Env) => {
     }
   }
 
-  const docs = result.docs.map((e) => ({
-    id: e.id,
-    type: e.type,
-    ...e.data,
-    ...(topLevelInfo ? { _topLevel: topLevelInfo.topLevel.has((e.data as any)?.name || e.id) } : {}),
-    _links: buildEntityLinks(e.type, e.id, domainId || undefined),
+  const body = result.body as any
+  const docs = (body.docs || []).map((e: any) => ({
+    ...e,
+    ...(topLevelInfo ? { _topLevel: topLevelInfo.topLevel.has(e.name || e.id) } : {}),
+    _links: buildEntityLinks(e.type || noun, e.id, domainId || undefined),
   }))
 
   // Where-param filtering
   const where: Record<string, any> = {}
-  for (const [key, val] of url.searchParams.entries()) {
+  url.searchParams.forEach((val, key) => {
     const m = key.match(/^where\[(\w+)\](?:\[(\w+)\])?$/)
     if (m) {
       where[m[1]] = { [m[2] || 'equals']: val }
     }
-  }
-  let filtered = docs
-  for (const [field, condition] of Object.entries(where)) {
-    if (typeof condition === 'object' && condition !== null && 'equals' in condition) {
-      filtered = filtered.filter(doc => (doc as any)[field] === condition.equals)
-    }
-  }
+  })
+  const filtered = Object.entries(where).reduce(
+    (acc, [field, condition]) =>
+      (typeof condition === 'object' && condition !== null && 'equals' in condition)
+        ? acc.filter((doc: any) => doc[field] === condition.equals)
+        : acc,
+    docs,
+  )
 
   return json({
     docs: filtered,
-    totalDocs: result.totalDocs,
-    limit: result.limit,
-    page: result.page,
-    totalPages: result.totalPages,
-    hasNextPage: result.hasNextPage,
-    hasPrevPage: result.hasPrevPage,
-    ...(result.warnings && { warnings: result.warnings }),
-    ...(result._links && { _links: result._links }),
-    // Self-describing representation: view metadata derived from readings in P
+    totalDocs: body.totalDocs,
+    limit: body.limit,
+    page: body.page,
+    totalPages: body.totalPages,
+    hasNextPage: body.hasNextPage,
+    hasPrevPage: body.hasPrevPage,
     _view: viewMeta,
-    // Navigation context derived from access derivation rules
     ...(navCtx && { _nav: navCtx }),
   })
 })
 
 router.get('/api/entities/:noun/:id', async (request, env: Env) => {
+  const noun = decodeURIComponent(request.params.noun)
   const id = decodeURIComponent(request.params.id)
   const url = new URL(request.url)
-  const domainSlug = url.searchParams.get('domain') || undefined
-
-  // Load domain schema and resolve transitions from engine's compiled state machine
-  let transitions: Array<{ transitionId: string; event: string; targetStatus: string; targetStatusId: string }> = []
-  try {
-    const registry = getRegistryDO(env, 'global') as any
-    await loadDomainSchema(registry, (eid: string) => getEntityDO(env, eid) as any, domainSlug || '')
-    const entityStub = getEntityDO(env, id) as any
-    const raw = await entityStub.get()
-    if (raw?.data?._status) {
-      transitions = getTransitions(raw.type, raw.data._status as string)
-        .map(t => ({ transitionId: '', event: t.event, targetStatus: t.to, targetStatusId: '' }))
-    }
-  } catch { /* best-effort */ }
+  const domainSlug = url.searchParams.get('domain') || ''
 
   const registry = getRegistryDO(env, 'global') as any
   const getStub = (eid: string) => getEntityDO(env, eid) as any
 
-  const entity = await handleGetEntity(getEntityDO(env, id) as any, {
-    domain: domainSlug,
-    transitions,
-  })
-  if (!entity) return error(404, { errors: [{ message: 'Not Found' }] })
+  // SYSTEM:x = (ρ (↑entity(x) : D)) : ↑op(x)
+  const result = await system(noun, domainSlug, 'readDetail', { _id: id, domain: domainSlug }, { registry, getStub })
 
-  // Derive view metadata for detail view
+  const entity = result.body as any
   const viewMeta = domainSlug
-    ? await deriveViewMetadata(registry, getStub, entity.type, domainSlug)
+    ? await deriveViewMetadata(registry, getStub, noun, domainSlug).catch(() => null)
     : null
 
   return json({
-    id: entity.id,
-    type: entity.type,
-    ...entity.data,
-    ...(entity._links && { _links: entity._links }),
-    ...(viewMeta && { _view: { ...viewMeta, type: 'DetailView' } }),
-  })
+    ...entity,
+    ...(viewMeta ? { _view: { ...viewMeta, type: 'DetailView' } } : {}),
+    _links: {
+      self: { href: `/api/entities/${encodeURIComponent(noun)}/${id}` },
+      collection: { href: `/api/entities/${encodeURIComponent(noun)}?domain=${domainSlug}` },
+    },
+  }, { status: result.status })
 })
 
 // PATCH on entities: ↓n with merged data (cell store replaces contents)
