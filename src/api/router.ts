@@ -5,7 +5,7 @@ import { nounToSlug, nounToTable, resolveSlugToNoun } from '../collections'
 import { handleSeed } from './seed'
 import { handleEvaluate, handleSynthesize } from './evaluate'
 import { handleListEntities, handleGetEntity, handleCreateEntity, handleDeleteEntity, buildEntityLinks } from './entity-routes'
-import { loadDomainSchema, loadDomainAndPopulation, getTransitions, applyCommand, querySchema, forwardChain, getNounSchemas, evaluateAccess, deriveViewMetadata, deriveNavContext, getTopLevelNouns } from './engine'
+import { loadDomainSchema, loadDomainAndPopulation, buildPopulation, getTransitions, applyCommand, querySchema, forwardChain, getNounSchemas, evaluateAccess, deriveViewMetadata, deriveNavContext, getTopLevelNouns, computeRMAP } from './engine'
 import { system } from './system'
 
 // ── Collection slug → noun type resolution ───────────────────────────
@@ -57,6 +57,29 @@ router.get('/api/access', async (request, env: Env) => {
   })
 })
 
+// ── Derivation trace for a domain ────────────────────────────────────
+// Per the paper: derivation chains are recorded and available on demand.
+// Returns the full forward-chained derivation trace for a domain's population.
+router.get('/api/trace/:domain', async (request, env: Env) => {
+  const domain = decodeURIComponent(request.params.domain)
+  const registry = getRegistryDO(env, 'global') as any
+  const getStub = (id: string) => getEntityDO(env, id) as any
+
+  await loadDomainSchema(registry, getStub, domain).catch(() => {})
+  const popJson = await buildPopulation(registry, getStub, domain)
+  const derived = forwardChain(popJson)
+
+  return json({
+    domain,
+    derivedFacts: derived.length,
+    trace: derived.map(fact => ({
+      rule: fact.derivedBy,
+      reading: fact.reading,
+      bindings: fact.bindings,
+    })),
+  })
+})
+
 // ── Debug: entity counts by type from Registry ──────────────────────
 router.get('/api/debug/counts/:domain', async (request, env: Env) => {
   const { domain } = request.params
@@ -98,6 +121,16 @@ router.get('/api/debug/schema/:domain', async (request, env: Env) => {
       id: k, nounName: (v as any).nounName, statuses: (v as any).statuses, transitions: (v as any).transitions,
     })),
   })
+})
+
+// RMAP: show cell partitioning derived from UC structure (Halpin, Ch. 17).
+router.get('/api/debug/rmap/:domain', async (request, env: Env) => {
+  const domain = decodeURIComponent(request.params.domain)
+  const registry = getRegistryDO(env, 'global') as any
+  const getStub = (id: string) => getEntityDO(env, id) as any
+  await loadDomainSchema(registry, getStub, domain).catch(() => {})
+  const tables = computeRMAP()
+  return json({ domain, tables })
 })
 
 router.get('/debug/table/:table', async (request, env: Env) => {

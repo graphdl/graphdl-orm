@@ -53,7 +53,7 @@ export async function loadDomainSchema(
  *
  * Returns a Population JSON string suitable for WASM evaluation.
  */
-async function buildPopulation(
+export async function buildPopulation(
   registry: any,
   getStub: (id: string) => any,
   domainSlug: string,
@@ -534,6 +534,33 @@ export function parseReadings(markdown: string, domain: string): Array<{ id: str
   return typeof result === 'string' ? JSON.parse(result) : result
 }
 
+// ── RMAP: Relational Mapping Procedure ───────────────────────────────
+// RMAP (Halpin, Ch. 17) determines cell partitioning from UC structure.
+// Each entity is a cell. Value-type fields are absorbed into entity tables.
+
+export interface RmapColumn {
+  name: string
+  type: string
+  nullable: boolean
+  references?: string
+}
+
+export interface RmapTable {
+  name: string
+  columns: RmapColumn[]
+  primaryKey: string[]
+  checks?: string[]
+}
+
+/**
+ * Compute RMAP table definitions from the loaded IR.
+ * RMAP (Halpin, Ch. 17) determines cell partitioning from UC structure.
+ */
+export function computeRMAP(): RmapTable[] {
+  ensureWasm()
+  return rmap_wasm() as unknown as RmapTable[]
+}
+
 // ── Self-Describing Representations ──────────────────────────────────
 // Per Theorem 4 (Derivability): every domain value v = (ρf):P.
 // The representation includes _view metadata derived from readings in P.
@@ -559,6 +586,7 @@ export async function deriveViewMetadata(
   topLevel: boolean
   parent?: string
   children: string[]
+  rmap: RmapTable | null
 }> {
   // Query Reading cells for this noun's fact types
   const readingIds: string[] = await registry.getEntityIds('Reading', domainSlug)
@@ -630,6 +658,11 @@ export async function deriveViewMetadata(
     .filter(([_, p]) => p === nounName)
     .map(([child]) => child)
 
+  // RMAP: compute cell partitioning from UC structure (Halpin, Ch. 17).
+  // The IR must already be loaded (done above via irCell fetch triggering load_ir).
+  const rmapTables = computeRMAP()
+  const nounTable = rmapTables.find(t => t.name === nounName) ?? null
+
   return {
     type: 'ListView',
     title: nounName,
@@ -642,6 +675,7 @@ export async function deriveViewMetadata(
     topLevel: !parent,
     parent,
     children,
+    rmap: nounTable,
   }
 }
 
@@ -697,99 +731,111 @@ export async function evaluateAccess(
   userOrgs: Array<{ orgId: string; orgName: string; role: string }>
   visibleApps: Array<{ id: string; name: string; slug: string; organization: string; navigableDomains: string[] }>
 }> {
-  // Fetch org-domain entities from the organizations domain
-  const [orgIds, appIds, userIds] = await Promise.all([
-    registry.getEntityIds('Organization', 'organizations') as Promise<string[]>,
-    registry.getEntityIds('App', 'organizations') as Promise<string[]>,
-    registry.getEntityIds('User', 'organizations') as Promise<string[]>,
-  ])
+  // Build population from the organizations domain.
+  // The derivation rules in organizations.md determine access.
+  try { await loadDomainSchema(registry, getStub, 'organizations') } catch {}
+  const popJson = await buildPopulation(registry, getStub, 'organizations')
 
-  // Fan out reads
-  const [orgEntities, appEntities, userEntities] = await Promise.all([
-    Promise.all(orgIds.map(async (id: string) => {
-      const cell = await getStub(id).get()
-      return cell ? { id: cell.id, ...cell.data } : null
-    })).then(results => results.filter(Boolean)),
-    Promise.all(appIds.map(async (id: string) => {
-      const cell = await getStub(id).get()
-      return cell ? { id: cell.id, ...cell.data } : null
-    })).then(results => results.filter(Boolean)),
-    Promise.all(userIds.map(async (id: string) => {
-      const cell = await getStub(id).get()
-      return cell ? { id: cell.id, ...cell.data } : null
-    })).then(results => results.filter(Boolean)),
-  ])
+  // Forward-chain the derivation rules over P to derive access facts.
+  let derived: Array<{ factTypeId: string; reading: string; bindings: Array<[string, string]>; derivedBy: string }> = []
+  try { derived = forwardChain(popJson) } catch {}
 
-  // Find the user's org memberships from facts in P.
-  // "User has Org Role in Organization" — stored as { orgRole, organization } on User entity.
-  // "Organization is owned by User" — stored as { ownedBy } on Organization entity.
-  const userOrgs: Array<{ orgId: string; orgName: string; role: string }> = []
-  const user = userEntities.find((u: any) => u.email === userEmail || u.id === userEmail)
+  // Parse the population to read base facts.
+  const pop = JSON.parse(popJson) as { facts: Record<string, Array<{ factTypeId: string; bindings: Array<[string, string]> }>> }
 
-  if (user) {
-    const userData = user as any
-    // Check User entity's orgRole + organization fact
-    if (userData.orgRole && userData.organization) {
-      const orgSlug = userData.organization
-      const org = orgEntities.find((o: any) => o.orgSlug === orgSlug || o.id === orgSlug) as any
-      if (org) {
-        userOrgs.push({ orgId: org.id, orgName: org.name || org.orgSlug || org.id, role: userData.orgRole })
-      }
-    }
+  // Find User entity matching the authenticated email.
+  const userFacts = pop.facts['User_email'] || []
+  const userBinding = userFacts.find(f => f.bindings.some(([, v]) => v === userEmail))
+  const userId = userBinding?.bindings.find(([k]) => k === 'User')?.[1] || ''
 
-    // Also check Organization.ownedBy (the inverse direction)
-    for (const org of orgEntities) {
-      const orgData = org as any
-      if (orgData.ownedBy === userEmail || orgData.ownedBy === userData.id) {
-        if (!userOrgs.some(uo => uo.orgId === orgData.id)) {
-          userOrgs.push({ orgId: orgData.id, orgName: orgData.name || orgData.orgSlug || orgData.id, role: 'owner' })
-        }
-      }
-    }
-  }
+  // Extract org memberships from "User has Org Role in Organization" facts.
+  // The ternary is stored as two fields on the User entity: orgRole + organization.
+  const userOrgs: Array<{ orgId: string; orgName: string; orgSlug: string; role: string }> = []
+  const orgRoleFacts = pop.facts['User_orgRole'] || []
+  const orgMemberFacts = pop.facts['User_organization'] || []
 
-  // Determine accessible domains
-  const accessibleDomains = new Set<string>()
+  for (const roleFact of orgRoleFacts) {
+    const factUserId = roleFact.bindings.find(([k]) => k === 'User')?.[1]
+    if (factUserId !== userId) continue
+    const role = roleFact.bindings.find(([k]) => k === 'orgRole')?.[1] || ''
 
-  // Public domains are accessible to everyone
-  // (All seeded domains are currently public by default via readings)
-  const allDomainSlugs = await registry.listDomains() as string[]
-  for (const slug of allDomainSlugs) {
-    // For now: all seeded domains are accessible (public visibility)
-    // All seeded domains are public — visibility filtering comes from derivation rules
-    accessibleDomains.add(slug)
-  }
+    // Find matching organization binding for this user
+    const orgFact = orgMemberFacts.find(f => f.bindings.find(([k]) => k === 'User')?.[1] === userId)
+    const orgSlug = orgFact?.bindings.find(([k]) => k === 'organization')?.[1] || ''
 
-  // Org-specific domains: user accesses Domain iff org role + domain belongs to org
-  for (const { orgId } of userOrgs) {
-    // Apps belonging to this org → their navigable domains
-    for (const app of appEntities) {
-      const appData = app as any
-      if (appData.organization === orgId || appData.organization === (orgEntities.find((o: any) => o.id === orgId) as any)?.orgSlug) {
-        const navDomains = appData.navigableDomains
-        if (Array.isArray(navDomains)) {
-          for (const d of navDomains) accessibleDomains.add(d)
-        }
-      }
-    }
-  }
-
-  // Visible apps: filter by user's org membership
-  const visibleApps = appEntities
-    .filter((app: any) => {
-      if (userOrgs.length === 0) return false // no org membership → no apps
-      return userOrgs.some(({ orgId }) => {
-        const orgSlug = (orgEntities.find((o: any) => o.id === orgId) as any)?.orgSlug
-        return app.organization === orgId || app.organization === orgSlug
-      })
+    // Look up the org name
+    const orgNameFacts = pop.facts['Organization_name'] || []
+    const orgNameFact = orgNameFacts.find(f => {
+      const orgId = f.bindings.find(([k]) => k === 'Organization')?.[1]
+      return orgId === orgSlug || (pop.facts['Organization_orgSlug'] || []).some(
+        sf => sf.bindings.find(([k]) => k === 'Organization')?.[1] === orgId
+          && sf.bindings.find(([k]) => k === 'orgSlug')?.[1] === orgSlug
+      )
     })
-    .map((app: any) => ({
-      id: app.id,
-      name: app.name || app.appSlug || app.id,
-      slug: app.appSlug || app.id,
-      organization: app.organization,
-      navigableDomains: Array.isArray(app.navigableDomains) ? app.navigableDomains : [],
-    }))
+    const orgName = orgNameFact?.bindings.find(([k]) => k === 'name')?.[1] || orgSlug
+    const orgId = orgNameFact?.bindings.find(([k]) => k === 'Organization')?.[1] || orgSlug
+
+    userOrgs.push({ orgId, orgName, orgSlug, role })
+  }
+
+  // Accessible domains: all seeded domains with Visibility 'public' are accessible.
+  // The derivation rule "User accesses Domain if Domain has Visibility 'public'" handles this.
+  // Org-specific access comes from "User accesses Domain if User has Org Role in Organization
+  // and Domain belongs to that Organization."
+  const accessibleDomains = new Set<string>()
+  const allDomainSlugs = await registry.listDomains() as string[]
+
+  // Check derived "User accesses Domain" facts from forward chaining
+  for (const fact of derived) {
+    if (fact.factTypeId === 'User_accesses_Domain' || fact.reading?.includes('accesses Domain')) {
+      const domain = fact.bindings.find(([k]: [string, string]) => k === 'Domain')?.[1]
+      if (domain) accessibleDomains.add(domain)
+    }
+  }
+
+  // Fallback: if the forward chainer doesn't produce access facts yet,
+  // use public visibility from the population directly.
+  if (accessibleDomains.size === 0) {
+    for (const slug of allDomainSlugs) {
+      const visFacts = pop.facts['Domain_visibility'] || []
+      const domainVis = visFacts.find(f =>
+        f.bindings.find(([k]) => k === 'Domain')?.[1] === slug
+      )
+      const vis = domainVis?.bindings.find(([k]) => k === 'visibility')?.[1]
+      if (vis === 'public' || !domainVis) accessibleDomains.add(slug)
+    }
+  }
+
+  // Visible apps: filter by user's org membership from base facts.
+  const appFacts = pop.facts['App_organization'] || []
+  const appNameFacts = pop.facts['App_name'] || []
+  const appSlugFacts = pop.facts['App_appSlug'] || []
+  const appNavFacts = pop.facts['App_navigableDomains'] || []
+
+  const visibleApps: Array<{ id: string; name: string; slug: string; organization: string; navigableDomains: string[] }> = []
+
+  for (const appOrgFact of appFacts) {
+    const appId = appOrgFact.bindings.find(([k]) => k === 'App')?.[1] || ''
+    const appOrg = appOrgFact.bindings.find(([k]) => k === 'organization')?.[1] || ''
+
+    // Check if user belongs to this app's organization
+    if (!userOrgs.some(uo => uo.orgId === appOrg || uo.orgName === appOrg || uo.orgSlug === appOrg)) continue
+
+    const name = appNameFacts.find(f => f.bindings.find(([k]) => k === 'App')?.[1] === appId)
+      ?.bindings.find(([k]) => k === 'name')?.[1] || appId
+    const slug = appSlugFacts.find(f => f.bindings.find(([k]) => k === 'App')?.[1] === appId)
+      ?.bindings.find(([k]) => k === 'appSlug')?.[1] || appId
+    // navigableDomains is an array, which the population builder skips.
+    // Read it from the entity cell directly.
+    let navDomains: string[] = []
+    try {
+      const appCell = await getStub(appId).get()
+      const nd = appCell?.data?.navigableDomains
+      navDomains = Array.isArray(nd) ? nd : (typeof nd === 'string' ? [nd] : [])
+    } catch {}
+
+    visibleApps.push({ id: appId, name, slug, organization: appOrg, navigableDomains: navDomains })
+  }
 
   return { accessibleDomains, userOrgs, visibleApps }
 }
