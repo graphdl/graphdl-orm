@@ -5,12 +5,11 @@
 Resource(.Reference) is an entity type.
 Graph is an entity type.
   Graph is a subtype of Resource.
-Resource Role is an entity type.
 State Machine(.Name) is an entity type.
 Event(.id) is an entity type.
 This association with Event, Transition, State Machine provides the preferred identification scheme for Event Triggered Transition In State Machine.
 Guard Run(.Name) is an entity type.
-Citation is an entity type.
+Citation(.id) is an entity type.
 
 ## Value Types
 
@@ -54,6 +53,7 @@ Resource is created by User.
 Graph uses Resource for Role.
   Each Graph uses at most one Resource for each Role.
   Each Graph uses some Resource for some Role.
+This association with Graph, Resource, Role provides the preferred identification scheme for Resource Role.
 
 ### State Machine
 State Machine belongs to Domain.
