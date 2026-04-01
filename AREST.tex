@@ -33,29 +33,41 @@
 \maketitle
 
 \begin{abstract}
-A single set of FORML\,2 declarations can define a database schema, constraint rules, state machine workflows, and a REST API with hypermedia navigation, producing a complete application from domain facts alone. We formalize this as AREST, a compositional architecture unifying Backus's FFP/AST~\cite{backus78} with Fielding's REST~\cite{fielding00} via Halpin's ORM\,2~\cite{halpin08}. Each declaration is an FFP object; the representation function~$\rho$ maps it to an executable; the persistent data is Codd's named set~\cite{codd70}; state machine transitions produce HATEOAS links that expose every valid action at every state. Because the API surface is a complete projection of the domain model, an LLM can reason about the system from the API alone. We prove five properties: grammar unambiguity, specification equivalence, completeness of state transfer, HATEOAS as projection, and derivability.
+Domain knowledge enters software as natural language requirements, is re-encoded as schemas, validation logic, state machines, and API routes, and drifts out of sync in production. The informal layer between specification and execution is where bugs live and where automated agents hallucinate. We show that a single set of FORML\,2 declarations can define a database schema, constraint rules, state machine workflows, and a REST API with hypermedia navigation, producing a complete application from domain facts alone. We formalize this as AREST, a Backus AST system~\cite{backus78} whose definitions are compiled FORML\,2 readings~\cite{halpin08} and whose state is Codd's named set~\cite{codd70} of ORM\,2 elementary facts. REST endpoints are applications of a single system function. Ingesting new readings is self-modification. Five theorems establish that the grammar is unambiguous, that specifications and executables are the same object, that state transfer is complete, that HATEOAS links are projections of the population, and that every value in the API is derived from facts. Together they eliminate the informal layer entirely.
 \end{abstract}
+
+\section{Introduction}
+
+Software begins as domain knowledge in someone's head. It enters the system through meetings, documents, and tickets, in natural language that two engineers can read differently. The specification is ambiguous, and nobody finds out until integration.
+
+The specification is then re-encoded. Schemas capture the data model. Validation logic enforces constraints. State machines govern workflows. API routes expose operations. Each is a separate artifact, maintained by a separate process, and any of them can drift from the others. The schema says one thing, the validation enforces another, the API exposes a third.
+
+At 2am, a constraint that was in the specification never made it into the validation layer. Or it did, but the state machine transition bypasses it. The system is formally specified and informally implemented, and the informal parts are where it breaks.
+
+The cause is the same at every level: domain knowledge and executable code are different artifacts. Every bug lives in the gap between them. AREST eliminates the gap by identifying what was never separate to begin with.
+
+\section{Terminology}
+
+Three terms carry overloaded abbreviations. \emph{AST} follows Backus's usage (Applicative State Transition, 1978), not the compiler term. \emph{ORM} follows Halpin's usage (Object-Role Modeling, 2008), not the persistence pattern. \emph{FP} follows Backus's usage (Function-level Programming), not the broader tradition. \emph{FFP} is Backus's extension of FP with named definitions and a representation function $\rho$ that maps objects to the functions they denote~\cite[Sec.\,13]{backus78}.
 
 \section{Definitions}
 
-\begin{definition}[AREST]\label{def:arest}
-An \emph{Applicative REpresentational State Transfer} system is a tuple $(O, \rho, D, P, \mathit{sub})$ where:
-\begin{itemize}[nosep]
-\item $O$ is the set of FFP objects~\cite[Sec.\,13.2]{backus78}
-\item $\rho: O \to (O \to O)$ is the representation function~\cite[Sec.\,13.3.2]{backus78}
-\item $D$ is the AST state, a sequence of cells~\cite[Sec.\,14.3]{backus78}
-\item $P = \uparrow\!\mathit{FILE}\!:\!D$ is the population, a named set of relations~\cite[Sec.\,1.6]{codd70} whose elements are ORM\,2 elementary facts~\cite[Ch.\,2]{halpin08}
-\item $\mathit{sub}$ is the subsystem function dispatching inputs to state transitions, producing output as REST representations~\cite{fielding00} with HATEOAS links
-\end{itemize}
-\end{definition}
+Each source formalism solved one layer. Backus solved the evaluation model. Codd solved the data model. Halpin solved the constraint language. Fielding solved the transfer protocol. The contribution of AREST is identification, not integration. A FORML\,2 reading is simultaneously an FFP object, a relation schema, a constraint specification, and a resource definition. The compiler recognizes this identity. The five theorems verify it.
 
-Three terms carry overloaded abbreviations. \emph{AST} follows Backus's usage (Applicative State Transition, 1978), not the compiler term. \emph{ORM} follows Halpin's usage (Object-Role Modeling, 2008), not the persistence pattern. \emph{FP} follows Backus's usage (Function-level Programming), not the broader tradition.
+\begin{definition}[AREST]\label{def:arest}
+An \emph{Applicative REpresentational State Transfer} system is an AST system~\cite[Sec.\,14]{backus78} whose state $D$ satisfies:
+\begin{itemize}[nosep]
+\item The $\mathit{FILE}$ cell contains a population $P = \uparrow\!\mathit{FILE}\!:\!D$, a named set of relations~\cite[Sec.\,1.6]{codd70} whose elements are ORM\,2 elementary facts~\cite[Ch.\,2]{halpin08}
+\item The $\mathit{DEFS}$ cells contain FFP objects~\cite[Sec.\,13.2]{backus78}. These are readings compiled from FORML\,2 declarations~\cite{halpin08}, and functions registered by the runtime
+\end{itemize}
+The system function $\mathit{SYSTEM}\!:\!x = \langle o, D'\rangle$~\cite[Sec.\,14.3.1]{backus78} is defined by the definitions in $D$. REST endpoints are applications of $\mathit{SYSTEM}$ with distinct inputs. The representation function $\rho$~\cite[Sec.\,13.3.2]{backus78} and the universe of FFP objects $O$ are inherited from the AST framework.
+\end{definition}
 
 The primitive atoms of $O$ include Backus's structural functions~\cite[Sec.\,11.2.3]{backus78}. Sequences represent functional forms via metacomposition~\cite[Sec.\,13.3.2]{backus78}:
 \begin{align}
 (\rho\langle x_1, \ldots, x_n\rangle)\!:\!y = (\rho\,x_1)\!:\!\langle\langle x_1, \ldots, x_n\rangle, y\rangle \label{eq:metacomp}
 \end{align}
-The first element determines which functional form; the remaining elements are its parameters. In AREST, a FORML\,2 reading is an object; $\rho$ extracts the constraint or derivation function it represents.
+The first element determines which functional form. The remaining elements are its parameters. In AREST, a FORML\,2 reading is an object. $\rho$ extracts the constraint or derivation function it represents.
 
 \section{Operations}
 
@@ -81,7 +93,28 @@ $\bar{x}$ & Constant & Literal \\
 \end{tabular}
 \end{center}
 
-A graph schema $\langle\mathit{CONS}, s_1, \ldots, s_n\rangle$ applied to all roles is a fact; partially applied via $\mathit{bu}$ it is a query.
+A graph schema $\langle\mathit{CONS}, s_1, \ldots, s_n\rangle$ applied to all roles is a fact. Partially applied via $\mathit{bu}$ it is a query.
+
+The compiled form for each FORML\,2 construct:
+
+\begin{center}
+\footnotesize
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{FORML\,2 Construct} & \textbf{Compiled FFP Object} \\
+\midrule
+Entity type \texttt{X(.ref)} & $\langle\mathit{CONS}, s_1, \ldots, s_n\rangle$ \\
+Fact type \texttt{X r Y} & $\langle\mathit{CONS}, s_1, s_2\rangle$ (binary) \\
+UC: \texttt{at most one} & $\langle\mathit{COND},\, (\mathit{count} \leq 1) \circ \mathit{Filter},\, \bar{\phi},\, \mathit{viol}\rangle$ \\
+MC: \texttt{each\ldots some} & $\langle\mathit{COND},\, \mathit{null?},\, \mathit{viol},\, \bar{\phi}\rangle$ \\
+UC$+$MC: \texttt{exactly one} & $\langle\mathit{COND},\, (\mathit{count} = 1),\, \bar{\phi},\, \mathit{viol}\rangle$ \\
+FC: \texttt{at least $k$\ldots} & $\langle\mathit{COND},\, (k \leq \mathit{count} \leq m),\, \bar{\phi},\, \mathit{viol}\rangle$ \\
+Derivation rule & $\langle\mathit{COMP}, f, g\rangle$ \\
+State machine & $/\mathit{transition} : \langle e_1, \ldots, e_n \rangle$ \\
+Instance fact & $\bar{x}$ asserted into $P$ \\
+\bottomrule
+\end{tabular}
+\end{center}
 
 \subsection{Relational Algebra}
 
@@ -94,6 +127,8 @@ R \cdot S &\equiv \pi_{1s}(R \mathbin{*} S) \label{eq:rcomp} \\
 \gamma(R) &\equiv \mathit{Filter}(\mathit{eq} \circ [s_1, s_n]) : R \label{eq:tie}
 \end{align}
 
+\noindent $P$ is a named set of relations in normal form (ORM\,2 elementary facts are 5NF by construction~\cite[Ch.\,12]{halpin08}). Codd shows that $\theta_1 = \{\text{projection, natural join, restriction, tie}\}$ is adequate for the named set~\cite{codd72}. Equations~(\ref{eq:proj})--(\ref{eq:tie}) express each element of $\theta_1$ as an FFP definition.
+
 \subsection{State and Cells}
 
 The state $D$ is a sequence of cells $\langle\mathit{CELL}, n, c\rangle$~\cite[Sec.\,14.3]{backus78}:
@@ -101,23 +136,17 @@ The state $D$ is a sequence of cells $\langle\mathit{CELL}, n, c\rangle$~\cite[S
 \uparrow\!n\!:\!D &\to c \qquad \text{(fetch)} \label{eq:fetch} \\
 \downarrow\!n\!:\!\langle x, D\rangle &\to D' \quad\; \text{(store)} \label{eq:store}
 \end{align}
-$\mathit{FILE}$ is a cell whose contents is~$P$. Each entity is a cell. Cells may contain sub-stores~\cite[Sec.\,14.7]{backus78}; partitioning is a cell containing a subset of~$P$.
+$\mathit{FILE}$ is a cell whose contents is~$P$. Each entity is a cell. Cells may contain sub-stores~\cite[Sec.\,14.7]{backus78}. Partitioning is a cell containing a subset of~$P$.
 
-\subsection{Subsystem Dispatch}
+\section{The System Function}
 
-Following~\cite[Sec.\,14.4.2]{backus78}:
-{\small
+Each input $x$ addresses an entity and carries an operation. The runtime maps the HTTP method to a registered function (\texttt{GET} $\to$ $\mathit{read}$, \texttt{POST} $\to$ $\mathit{create}$, \texttt{PUT} $\to$ $\mathit{update}$, \texttt{DELETE} $\to$ $\mathit{delete}$). The system function routes the input to the addressed entity and passes the operation as the operand:
 \begin{align}
-&\mathit{sub} \equiv \nonumber \\
-&\; \mathit{is\text{-}chg} \circ \uparrow\!\mathit{K} \to [\mathit{rpt}, \mathit{apl}] \circ [\uparrow\!\mathit{I}, \mathit{defs}]; \nonumber \\
-&\; \mathit{is\text{-}qry} \circ \uparrow\!\mathit{K} \to [\mathit{qry} \circ [\uparrow\!\mathit{I}, \uparrow\!\mathit{F}], \mathit{defs}]; \nonumber \\
-&\; \mathit{is\text{-}cmd} \circ \uparrow\!\mathit{K} \to \mathit{chk} \circ \mathit{apl} \circ [\uparrow\!\mathit{I}, \mathit{defs}]; \nonumber \\
-&\; \mathit{is\text{-}upd} \circ \uparrow\!\mathit{K} \to \nonumber \\
-&\;\quad [\mathit{rpt}, \downarrow\!\mathit{F} \circ [\mathit{upd}, \mathit{defs}]] \circ [\uparrow\!\mathit{I}, \uparrow\!\mathit{F}]; \nonumber \\
-&\; [\mathit{err} \circ [\uparrow\!\mathit{K}, \uparrow\!\mathit{I}], \mathit{defs}] \label{eq:sub}
+\mathit{SYSTEM}\!:\!x &= (\rho\,(\uparrow\!\mathit{entity}(x)\!:\!D))\!:\!\uparrow\!\mathit{op}(x) \label{eq:sys}
 \end{align}
-}
-where $K = \mathit{KEY}$, $I = \mathit{INPUT}$, $F = \mathit{FILE}$.
+The entity is fetched from $D$. $\rho$ resolves it to a functional form determined by its type and the definitions in $\mathit{DEFS}$. The operation ($\mathit{read}$, $\mathit{create}$, etc.) is applied as the operand. The entity handles the dispatch, not the system function. A local entity applies $\mathit{read}$ by selecting its attributes from $P$. A backed entity applies $\mathit{read}$ by calling $\mathit{httpFetch}$. Both are $\rho$-applications over the same interface.
+
+Self-modification is the same mechanism. Ingesting readings~\cite[Sec.\,14.6]{backus78} is an application of $\mathit{SYSTEM}$ where the addressed entity is $\mathit{DEFS}$ and the operation is $\mathit{compile} \circ \mathit{parse}$. The new FFP objects are stored via $\downarrow\!\mathit{DEFS}$. Subsequent applications of $\mathit{SYSTEM}$ evaluate the new constraints and derivation rules. The system extends its own program.
 
 \subsection{Commands}
 
@@ -137,6 +166,21 @@ A state machine is a fold~\cite[Sec.\,11.2.4]{backus78}:
 \mathit{transition} &= (p \to \bar{s'} ;\; \mathit{id}) \label{eq:trans}
 \end{align}
 
+Deletion is a transition to a terminal state, not a distinct primitive. The entity receives $\mathit{delete}$ as the operation. It reaches a state with no outgoing transitions and is excluded from query results by restriction~(\ref{eq:restrict}).
+
+\subsection{Platform Binding}
+
+The runtime registers functions into $\mathit{DEFS}$ via $\downarrow\!\mathit{DEFS}$. A browser runtime registers rendering functions. A server runtime registers $\mathit{httpFetch}$, $\mathit{upsert}$, $\mathit{notify}$. The fact is the FFP object. The registered function is the operand. $\rho$ resolves the fact to a functional form that knows its schema and applies the function to its own data:
+\begin{align*}
+(\rho\,\mathit{fact})\!:\!\mathit{render} &\to \mathit{widget} \\
+(\rho\,\mathit{fact})\!:\!\mathit{httpFetch} &\to \mathit{response} \\
+(\rho\,\mathit{fact})\!:\!\mathit{upsert} &\to D'
+\end{align*}
+
+The fact drives the application. The function is passed to the fact, not the fact to the function. In $\lambda$-calculus terms, a fact is $\lambda f.\, f(\mathit{data})$. This follows from metacomposition~(\ref{eq:metacomp}): the fact's type (its first element) determines the functional form, and $\rho$ resolves it from $\mathit{DEFS}$.
+
+Runtime functions that interact with external state (e.g.\ $\mathit{httpFetch}$) execute during $\mathit{resolve}$~(\ref{eq:create}), populating cells before $\mathit{derive}$ runs. Functions that consume the representation (e.g.\ $\mathit{render}$) execute after $\mathit{emit}$. This keeps $\mathit{derive}$ pure, monotonic, and terminating over $P$. The engine does not know which runtime it serves. It applies $\rho$ to facts, and the registered functions determine the effect. A single $\mathit{SYSTEM}$ serves browser, server, and storage runtimes by varying $\mathit{DEFS}$, not by varying the logic. Because the binding is via $\rho$, it is live. When a cell's contents change via $\downarrow$, the $\rho$-application re-evaluates and the bound function fires. Event streaming is not a separate subscription mechanism. It is the re-evaluation of $\rho$ over updated $D$.
+
 \section{Example}
 
 An order domain is declared in FORML\,2:
@@ -147,26 +191,28 @@ Customer(.Name) is an entity type.
 Order was placed by Customer.
   Each Order was placed by exactly one
   Customer.
-Status 'Draft' is initial in State Machine
-  Definition 'Order'.
-Transition 'place' is from Status 'Draft'.
-  Transition 'place' is to Status 'Placed'.
+Status 'Draft' is initial in
+  State Machine Definition 'Order'.
+Transition 'place' is from
+  Status 'Draft'.
+Transition 'place' is to
+  Status 'Placed'.
 \end{lstlisting}
 
-The constraint reading is an FFP object; $\rho$ yields:
+The constraint reading is an FFP object. $\rho$ yields the following.
 \begin{align*}
 (\rho\,\mathit{reading}) = \langle\mathit{COND},\; &(\mathit{count} \leq 1) \circ \mathit{Filter}(\mathit{eq} \circ [s_1, \bar{o}]),\\
 &\bar{\phi},\; \mathit{violation}\rangle : P_{\mathit{placedBy}}
 \end{align*}
 
-\texttt{POST /orders \{"customer":"acme"\}} dispatches as $\mathit{is\text{-}cmd}$ in~(\ref{eq:sub}). The engine applies $\mathit{create}$~(\ref{eq:create}):
+\texttt{POST /orders \{"customer":"acme"\}} is the application $\mathit{SYSTEM}\!:\!x$ where the addressed entity is $\mathit{orders}$ and the operation is $\mathit{create}$~(\ref{eq:create}). By~(\ref{eq:sys}), $(\rho\,\mathit{orders})\!:\!\mathit{create}$ applies the pipeline:
 \begin{align*}
 P' = P \cup \{&\mathit{Order}(\texttt{ord\text{-}1}),\;
 \mathit{placedBy}(\texttt{ord\text{-}1}, \texttt{acme}),\\
 &\mathit{SM}(\texttt{ord\text{-}1}, \texttt{Draft})\}
 \end{align*}
 
-Response (Theorem~\ref{thm:hateoas}: links from $P'$):
+The response includes links derived from $P'$ (Theorem~\ref{thm:hateoas}).
 \begin{lstlisting}
 { "id": "ord-1", "customer": "acme",
   "status": "Draft",
@@ -176,17 +222,13 @@ Response (Theorem~\ref{thm:hateoas}: links from $P'$):
       "method": "POST" } } }
 \end{lstlisting}
 
-Following ``place'' applies~(\ref{eq:sm}). The new representation contains $\{\mathit{ship}\}$, not $\{\mathit{place}\}$. If a second command assigns a different Customer to the same Order, the UC fires and the command is rejected. The violation is returned as the original reading.
+Following ``place'' applies~(\ref{eq:sm}). The new representation contains $\{\mathit{ship}\}$, not $\{\mathit{place}\}$. If a second command assigns a different Customer to the same Order, the UC fires and the command is rejected. The violation is returned as the original reading (Corollary~\ref{cor:verbalize}).
 
 \section{Execution Semantics}
 
-\subsection{Evaluation as $\beta$-Reduction}
+\subsection{Evaluation}
 
-FFP objects denote $\lambda$-terms via Backus's correspondence~\cite[Sec.\,12.9]{backus78}. The representation function $\rho$ yields the executable term. Execution is applicative-order (innermost-first) $\beta$-reduction to normal form:
-
-$\mu$ evaluates an expression under definitions $D$ by repeatedly replacing its innermost application $(x\!:\!y)$ with $(\rho\,x)\!:\!y$, where $\rho$ resolves $x$ to a $\lambda$-term under environment $D$ and primitives over $P$~\cite[Sec.\,13.3.1]{backus78}. Each step is a $\beta$-reduction: $\rho$ yields the $\lambda$-term; application reduces it. The function $\mathit{apply}(\mathit{func}, x, D)$ in the implementation is this reduction step.
-
-All evaluation in AREST is over finite $P$ with monotonic derivations; reduction terminates for all requests.
+$\mu$ evaluates by applicative-order $\beta$-reduction~\cite[Sec.\,13.3.1]{backus78}. It repeatedly replaces the innermost application $(x\!:\!y)$ with $(\rho\,x)\!:\!y$, where $\rho$ resolves $x$ to a $\lambda$-term under definitions $D$~\cite[Sec.\,12.9]{backus78}. All evaluation is over finite $P$ with monotonic derivations. Reduction terminates for all requests.
 
 \subsection{Evaluation Strategy}
 
@@ -194,33 +236,17 @@ Three constraints govern execution:
 \begin{enumerate}[nosep]
 \item \textbf{Reduction order:} applicative (call-by-value). All arguments are reduced before the function is applied.
 \item \textbf{Scope:} evaluation is confined to the request-local partition of $D$. RMAP~\cite[Ch.\,17]{halpin08} determines the partition from the schema's uniqueness constraints.
-\item \textbf{Derivation:} forward chaining, monotonic, evaluated to the least fixed point per request. Since $\mathit{derive}$ only adds facts over finite $P_{\mathit{local}}$, the fixed point exists (Knaster-Tarski) and is reached in $\leq |P_{\mathit{local,max}}|$ iterations.
+\item \textbf{Derivation:} forward chaining, monotonic, evaluated to the least fixed point per request. Since $\mathit{derive}$ only adds facts over finite $P_{\mathit{local}}$, the fixed point exists (Knaster-Tarski) and is reached in $\leq |P_{\mathit{local,max}}|$ iterations. The derivation chain (which rules fired, in what order, producing which facts) is recorded and available on demand as part of the representation.
 \end{enumerate}
 The completeness result (Theorem~\ref{thm:complete}) assumes evaluation to the least fixed point under this strategy.
 
 \subsection{Boundary Conditions}
 
-The system operates over three categories:
-\begin{enumerate}[nosep]
-\item \textbf{Facts} $(P)$: ORM\,2 elementary facts, persisted in cells.
-\item \textbf{Computations} $(O$ via $\rho)$: total, deterministic functions over $P$.
-\item \textbf{Inputs} $(I)$: request payload, timestamp, and external signals, supplied as the operand $x$ in $\mu(\mathit{SYSTEM}\!:\!x)$~\cite[Sec.\,14.3.1]{backus78}.
-\end{enumerate}
+The system operates over facts~$(P)$, computations~$(O$ via $\rho)$, and inputs~$(I)$, the operand $x$ in $\mu(\mathit{SYSTEM}\!:\!x)$~\cite[Sec.\,14.3.1]{backus78}. Time is an input fact in $x$, not hidden state. Effects are directives in the output $o$. Their outcomes are facts in $D'$. Identity follows from the reference scheme~\cite[Ch.\,5]{halpin08}. $\mathit{resolve}$ in~(\ref{eq:create}) applies it. The world assumption per noun~\cite[Ch.\,7]{halpin08} governs incompleteness. Under CWA, a fact not in $P$ is false. Under OWA, it is unknown. Derivation rules for function invocation operate under OWA because the rules capture known reasons to act, not all possible reasons. When the derived course of action is \emph{unknown}, that is itself a reason to escalate to a human or broader-context agent.
 
-Time, randomness, and external effects are classified as follows:
-\begin{itemize}[nosep]
-\item \textbf{Time}: an input fact. ``Now'' is part of $x$, not hidden state. Time-dependent queries are constraints on timestamp facts in $P$.
-\item \textbf{Effects}: the output $o$ in $\langle o, D'\rangle$. The engine computes directives (send email, charge payment); the runtime executes them. Outcomes are facts in $D'$.
-\item \textbf{Non-determinism}: identity generation is a primitive function producing a fresh atom, or the client provides the ID in $I$.
-\item \textbf{Partial information}: the world assumption per noun~\cite[Ch.\,7]{halpin08} governs incompleteness. CWA: not stated $=$ false. OWA: not stated $=$ unknown.
-\item \textbf{Identity}: the reference scheme~\cite[Ch.\,5]{halpin08} determines identity before facts are asserted. $\mathit{resolve}$ in~(\ref{eq:create}) applies the selector.
-\end{itemize}
+\subsection{Isolation}
 
-AREST governs the derivation of representations from $(P, I)$. Theorem~\ref{thm:derive} establishes that every value in the representation is a $\rho$-application over $P$.
-
-\subsection{The Application as a Fold}
-
-A state machine~(\ref{eq:sm}) is a fold over an event stream: each event is an input $x$; the accumulator is the state $D$; the fold body is $\mu(\mathit{SYSTEM}\!:\!x) = \langle o, D'\rangle$. The application IS this fold. The fold is well-defined only if each $\mu$ runs to completion before the next event mutates $D$. Otherwise two concurrent applications of $\mu$ may read the same $D$, and one silently overwrites the other.
+A state machine~(\ref{eq:sm}) is a fold over an event stream. Each event is an input $x$. The accumulator is the state $D$. The fold body is $\mu(\mathit{SYSTEM}\!:\!x) = \langle o, D'\rangle$. The application is this fold. The fold is well-defined only if each $\mu$ runs to completion before the next event mutates $D$. Otherwise two concurrent applications of $\mu$ may read the same $D$, and one silently overwrites the other.
 
 Backus states this directly: ``the state cannot change during the computation of system:x''~\cite[Sec.\,14.6(c)]{backus78}. We make the requirement a definition so that theorems can reference it.
 
@@ -228,11 +254,31 @@ Backus states this directly: ``the state cannot change during the computation of
 For each cell $\langle\mathit{CELL}, n, c\rangle$ in $D$, at most one $\mu$ application that writes to $n$ may be in progress at any time. Concurrent $\mu$ applications over disjoint cells are permitted.
 \end{definition}
 
-\noindent RMAP~\cite[Ch.\,17]{halpin08} determines which facts belong to which cell from the schema's uniqueness constraints. Each entity is a cell; its fold is independent of other entities' folds. A single-threaded runtime (e.g.\ a WASM isolate) satisfies Definition~\ref{def:isolation} trivially. A distributed system requires one writer per cell (actor mailbox, partitioned queue, or single-writer lease).
+\noindent RMAP~\cite[Ch.\,17]{halpin08} determines which facts belong to which cell from the schema's uniqueness constraints. Each entity is a cell. Its fold is independent of other entities' folds. A single-threaded runtime (e.g.\ a WASM isolate) satisfies Definition~\ref{def:isolation} trivially. A distributed system requires one writer per cell (actor mailbox, partitioned queue, or single-writer lease).
 
-Theorems~\ref{thm:complete}--\ref{thm:derive} hold under Definition~\ref{def:isolation}. Without it, Theorem~\ref{thm:complete} fails: two concurrent $\mathit{create}$ operations on the same cell may both pass $\mathit{validate}$ against stale $P$ and produce a $D'$ that violates a uniqueness constraint.
+Theorems~\ref{thm:complete}--\ref{thm:derive} hold under Definition~\ref{def:isolation}. Without it, Theorem~\ref{thm:complete} fails silently. Two concurrent $\mathit{create}$ operations on the same cell may both pass $\mathit{validate}$ against stale $P$ and produce a $D'$ that violates a uniqueness constraint. Unlike a grammar violation (Theorem~\ref{thm:grammar}), which is caught at parse time, a cell isolation violation produces inconsistent state without an error.
+
+\subsection{Distributed Evaluation}
+
+The event stream $E$ is demultiplexed into per-cell streams by RMAP~\cite[Ch.\,17]{halpin08}:
+\begin{align}
+E_n &= \mathit{Filter}(\mathit{eq} \circ [\mathit{RMAP}, \bar{n}]) : E \label{eq:demux}
+\end{align}
+
+Each cell folds its stream independently:
+\begin{align}
+D_n' &= /\mu_n : E_n \label{eq:cellfold}
+\end{align}
+where $\mu_n$ is $\mathit{SYSTEM}$ restricted to cell $n$. By Definition~\ref{def:isolation}, no $\mu_n$ reads another cell's in-progress state. Cross-cell queries read committed state:
+\begin{align}
+P &= \textstyle\bigcup_n \uparrow\!\mathit{FILE}\!:\!D_n \label{eq:pop}
+\end{align}
+
+The router distributes events via $\alpha\,\mathit{RMAP}$~(apply-to-all). Each cell reduces its partition via $/\mu_n$~(insert). Adding cells to the cluster scales $\mathit{SYSTEM}$ horizontally without changing its definition.
 
 \section{Properties}
+
+The five theorems form a chain. Each depends on the previous one and eliminates one source of failure in the path from domain knowledge to running software.
 
 \begin{theorem}[Grammar Unambiguity]\label{thm:grammar}
 Let $N$ be a declared set of object type names and $F$ a declared set of predicate readings, such that no element of $N$ contains a formal item of the grammar as a substring. Then each FORML\,2 sentence over $(N, F)$ has exactly one parse.
@@ -261,6 +307,8 @@ where $\mathit{modal} \in \{$``It is obligatory that'', ``It is forbidden that''
 Each structural position admits exactly one parse. The constraint type is determined by the pair $(\mathit{quant}_1, \mathit{quant}_2)$, which maps injectively to constraint kinds: (Each, at most one)~$\to$~UC; (Each, some)~$\to$~MC; (Each, exactly one)~$\to$~UC$+$MC; (Each, at least $k$\ldots)~$\to$~FC; (the same, more than one)~$\to$~UC$^{-}$. No two pairs map to the same kind.
 \end{proof}
 
+\noindent The hypothesis on $N$ is enforced by the compiler, which rejects any declared name containing a formal item of the grammar as a substring.
+
 \begin{theorem}[Specification Equivalence]\label{thm:spec}
 Let $\mathit{parse}: R \to \Phi$ and $\mathit{compile}: \Phi \to O$ be injective, with $R$ the set of FORML\,2 readings, $\Phi$ the set of FOL formulas, and $O$ the set of FFP objects. Then:
 \begin{align}
@@ -272,6 +320,8 @@ and $\rho(\mathit{compile}(\mathit{parse}(r)))$ is the executable for every $r \
 \begin{proof}
 $\mathit{parse}$ is injective by Theorem~\ref{thm:grammar}: each sentence has one parse, so distinct sentences yield distinct formulas. $\mathit{compile}$ is injective: the $(\mathit{quant}_1, \mathit{quant}_2)$ pair determines the constraint kind (Theorem~\ref{thm:grammar}), which determines the FFP object structure (Condition for UC, null-test for MC, count for FC). Both have left inverses; composing: $\mathit{parse}^{-1} \circ \mathit{compile}^{-1} \circ \mathit{compile} \circ \mathit{parse} = \mathit{id}_R$. Executability: $\rho$ maps the compiled object to a function by~\cite[Sec.\,13.4]{backus78}.
 \end{proof}
+
+\noindent\textbf{Remark} (Surjectivity). $\mathit{compile}$ is not surjective. There exist FFP objects in $O$ that no FORML\,2 reading produces. This is intentional: runtime-registered functions (Sec.\,5.3) occupy the complement. FORML\,2 readings cover the domain layer. Registered functions cover the platform layer. Together they span the objects in $\mathit{DEFS}$.
 
 \begin{theorem}[Completeness of State Transfer]\label{thm:complete}
 Let $F_S : 2^P \to 2^P$ be the monotonic operator that applies all derivation rules in schema $S$ to a population, and let $C_S$ be the set of constraint objects in $S$. Under Definition~\ref{def:isolation}, $\mathit{create}$~(\ref{eq:create}) applied to input $I$ and state $D$ produces $\langle o, D'\rangle$ such that:
@@ -299,6 +349,10 @@ where $p(t) = (s_{\mathit{from}}(t) = s) \lor \mathit{anc}(s_{\mathit{from}}(t),
 $T \subseteq P$. $\mathit{Filter}$ is restriction~(\ref{eq:restrict}); $\pi$ is projection~(\ref{eq:proj}). Both are $\theta_1$ operations on the named set. The representation renders $P$; $\mathit{links}(s)$ is derived from $P$ by $\theta_1$ operations and therefore appears in the representation without external computation.
 \end{proof}
 
+\begin{corollary}[Deletion as Terminal State]\label{cor:delete}
+Let $s_{\mathit{del}}$ be a state with no outgoing transitions in $T$. Then $\mathit{links}(s_{\mathit{del}}) = \emptyset$, and the entity is excluded from query results by $\mathit{Filter}(\neg\,\mathit{terminal?}) : P$.
+\end{corollary}
+
 \begin{theorem}[Derivability]\label{thm:derive}
 Define the \emph{representation} of an entity $e$ with status $s$ in population $P$ under schema $S$ as:
 \begin{align*}
@@ -311,21 +365,36 @@ Then for every $v \in \mathit{repr}(e, s, P, S)$, there exists $f \in O$ such th
 \end{theorem}
 
 \begin{proof}
-Each component of $\mathit{repr}$ is a $\rho$-application by construction: selectors extract attributes; derivation rules are FFP objects whose $\rho$-image computes derived facts; constraints are FFP objects whose $\rho$-image evaluates to $\phi$ or a violation; links are $\theta_1$ operations (Theorem~\ref{thm:hateoas}). No value in $\mathit{repr}$ is produced by a mechanism outside $\rho$.
+Each component of $\mathit{repr}$ is a $\rho$-application by construction. Selectors extract attributes. Derivation rules are FFP objects whose $\rho$-image computes derived facts. Constraints are FFP objects whose $\rho$-image evaluates to $\phi$ or a violation. Links are $\theta_1$ operations (Theorem~\ref{thm:hateoas}). No value in $\mathit{repr}$ is produced by a mechanism outside $\rho$.
 \end{proof}
 
-\medskip
-\noindent\textbf{Remark} (Query Adequacy). $P$ is a named set of relations in normal form (ORM\,2 elementary facts are 5NF by construction~\cite[Ch.\,12]{halpin08}). Codd shows that $\theta_1 = \{\text{projection, natural join, restriction, tie}\}$ is adequate for the named set~\cite{codd72}. Equations~(\ref{eq:proj})--(\ref{eq:tie}) express each element of $\theta_1$ as an FFP definition.
+\begin{corollary}[Violation Verbalization]\label{cor:verbalize}
+Let $c \in C_S$ be a constraint object compiled from reading $r \in R$. If $(\rho\,c)\!:\!P'' \neq \bar{\phi}$, the violation output is $\mathit{compile}^{-1}(c)$, recovering $r$ by Theorem~\ref{thm:spec}. The error message is the original reading.
+\end{corollary}
 
-\medskip
-\noindent\textbf{Remark} (Verbalizability). Each $\theta_1$ primitive has a FORML\,2 verbalization: projection as role selection, join as qualified composition, restriction as constraint predicate, tie as self-reference. Halpin and Curland~\cite{halpin06} give the automated verbalization algorithm for ORM\,2 constraints. Composed $\theta_1$ operations verbalize via FORML\,2 qualified readings (``who\ldots'', ``that\ldots''), which parse unambiguously by Theorem~\ref{thm:grammar}.
+\noindent Each $\theta_1$ primitive has a FORML\,2 verbalization. Projection verbalizes as role selection, join as qualified composition, restriction as constraint predicate, tie as self-reference. Halpin and Curland~\cite{halpin06} give the automated verbalization algorithm for ORM\,2 constraints. Composed $\theta_1$ operations verbalize via FORML\,2 qualified readings (``who\ldots'', ``that\ldots''), which parse unambiguously by Theorem~\ref{thm:grammar}.
 
-\medskip
-\noindent\textbf{Remark} (Algebraic Optimization). The algebraic laws of FP~\cite[Sec.\,12.2]{backus78} are equations between functional forms. Since FFP objects represent the same forms via $\rho$~\cite[Sec.\,13.3.2]{backus78}, an FFP object can be transformed to an equivalent object by applying these laws. Ahead-of-time compilation from objects to optimized evaluation trees is one such transformation.
+\begin{corollary}[Closure Under Self-Modification]\label{cor:closure}
+Let $D' = D$ after applying $\mathit{SYSTEM}$ with operation $\mathit{compile} \circ \mathit{parse}$ to a set of FORML\,2 readings $R'$. Then Theorems~\ref{thm:grammar}--\ref{thm:derive} hold for all subsequent applications of $\mathit{SYSTEM}$ over $D'$.
+\end{corollary}
+
+\begin{proof}
+Each new reading $r' \in R'$ parses unambiguously (Theorem~\ref{thm:grammar} depends on the grammar, not on $D$). The compiled objects are faithful to the readings (Theorem~\ref{thm:spec} depends on the injectivity of $\mathit{parse}$ and $\mathit{compile}$, which are stateless). The new constraints and derivation rules enter $\mathit{DEFS}$ via $\downarrow\!\mathit{DEFS}$, joining the existing definitions. Theorem~\ref{thm:complete} evaluates all $c \in C_S$, including the new ones. Theorems~\ref{thm:hateoas} and~\ref{thm:derive} operate over $P$ and $S$, both of which now include the new facts and schemas. No theorem's proof depends on $D$ being fixed at initialization.
+\end{proof}
+
+\noindent The algebraic laws of FP~\cite[Sec.\,12.2]{backus78} are equations between functional forms. Since FFP objects represent the same forms via $\rho$~\cite[Sec.\,13.3.2]{backus78}, an FFP object can be transformed to an equivalent object by applying these laws. Ahead-of-time compilation from objects to optimized evaluation trees is one such transformation.
+
+\section{Middleware Elimination}
+
+Traditional middleware (authentication, validation, rate limiting, transformation) is either a COND constraint, a COMP derivation, or a fact in $P$. Authorization, for instance, is a derivation. ``User accesses Domain iff User belongs to Organization that manages Domain'' compiles to $\langle\mathit{COMP}, f, g\rangle$ whose $\rho$-image computes the access predicate over $P$. External service calls, database persistence, and UI rendering are not middleware either. They are runtime functions registered into $\mathit{DEFS}$ and applied via $\rho$ (Sec.\,5.3). Theorem~\ref{thm:derive} leaves no room for a computation layer outside $\rho$. Every value in the representation is a $\rho$-application.
 
 \section{Conclusion}
 
-AREST composes FFP/AST~\cite{backus78} with REST~\cite{fielding00} via ORM\,2~\cite{halpin08}. Readings are FFP objects; $\rho$ maps them to executables; the population is Codd's named set~\cite{codd70} stored as Backus's FILE cell; transitions produce hypermedia. The five theorems establish: the grammar is unambiguous (Theorem~\ref{thm:grammar}); specifications and executables are the same object (Theorem~\ref{thm:spec}); state transfer is complete in one $\mu$ application under cell isolation (Theorem~\ref{thm:complete}); HATEOAS is a $\theta_1$ projection (Theorem~\ref{thm:hateoas}); and every value in the representation is a $\rho$-application over the population (Theorem~\ref{thm:derive}). Query adequacy follows from Codd~\cite{codd72}; verbalizability from Halpin and Curland~\cite{halpin06}; algebraic optimization from Backus~\cite[Sec.\,12.2]{backus78}.
+AREST is a Backus AST system~\cite{backus78} whose definitions are compiled FORML\,2 readings~\cite{halpin08} and whose state is Codd's named set~\cite{codd70} of ORM\,2 elementary facts. REST endpoints~\cite{fielding00} are applications of the system function. Ingesting readings is self-modification. Transitions produce hypermedia. The five theorems form a chain: the grammar is unambiguous (Theorem~\ref{thm:grammar}), so specifications compile faithfully to executables (Theorem~\ref{thm:spec}), so state transfer is complete (Theorem~\ref{thm:complete}), so HATEOAS links are projections of the population (Theorem~\ref{thm:hateoas}), so every value in the representation is a $\rho$-application (Theorem~\ref{thm:derive}). Self-modification preserves all five (Corollary~\ref{cor:closure}). The system grows by ingesting facts and never loses its guarantees.
+
+The five properties compose into a guarantee for automated agents, addressing two distinct sources of LLM hallucination. First, the specification-execution gap. An LLM writing FORML\,2 readings produces unambiguous specifications (Theorem~\ref{thm:grammar}) that are the executables (Theorem~\ref{thm:spec}). An LLM consuming the API reads values that are $\rho$-applications over $P$ (Theorem~\ref{thm:derive}) and discovers every valid action via HATEOAS links (Theorem~\ref{thm:hateoas}). There are no undocumented endpoints, no hidden middleware, no informal contracts to hallucinate through. Second, the reasoning chain gap. LLMs do not reliably chain logical inferences, and errors compound over steps. The forward chainer in $\mathit{derive}$~(\ref{eq:create}) evaluates derivation rules to the least fixed point (Theorem~\ref{thm:complete}), and the derived facts appear in the representation (Theorem~\ref{thm:derive}). The LLM reads \emph{conclusions}, not premises. The logical chain that produced them was evaluated deterministically by the engine, outside the LLM's context. The LLM does not reason through the chain; it consumes the result. When the chain itself is needed (for debugging, auditing, or explanation), the derivation trace is available on demand as a sequence of rule applications over $P$, each a $\rho$-application (Theorem~\ref{thm:derive}).
+
+The gap between domain knowledge and running software is the gap where requirements drift, implementations diverge, and production breaks. AREST eliminates the gap by identifying what was never separate to begin with.
 
 \section*{Acknowledgments}
 

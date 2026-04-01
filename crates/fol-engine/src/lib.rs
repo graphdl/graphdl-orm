@@ -561,11 +561,56 @@ pub fn prove_goal(goal: &str, population_val: JsValue, world_assumption: &str) -
 /// This is the ONLY path from readings to entities. No TS parser.
 ///
 /// Per the paper: parse: R → Φ (Theorem 2).
+/// Parse with pre-existing nouns from other domains (cross-domain resolution).
+#[wasm_bindgen]
+pub fn parse_readings_with_nouns_wasm(markdown: &str, domain: &str, nouns_json: &str) -> Result<JsValue, JsValue> {
+    let existing_nouns: std::collections::HashMap<String, types::NounDef> =
+        serde_json::from_str(nouns_json).unwrap_or_default();
+    let existing_noun_names: std::collections::HashSet<String> = existing_nouns.keys().cloned().collect();
+    let ir = parse_forml2::parse_markdown_with_nouns(markdown, &existing_nouns)
+        .map_err(|e| JsValue::from_str(&e))?;
+    emit_entities_filtered(&ir, domain, &existing_noun_names)
+}
+
+/// Per the paper: parse: R → Φ (Theorem 2).
 #[wasm_bindgen]
 pub fn parse_readings_wasm(markdown: &str, domain: &str) -> Result<JsValue, JsValue> {
     let ir = parse_forml2::parse_markdown(markdown)
         .map_err(|e| JsValue::from_str(&e))?;
+    emit_entities(&ir, domain)
+}
 
+fn emit_entities_filtered(ir: &types::ConstraintIR, domain: &str, context_nouns: &std::collections::HashSet<String>) -> Result<JsValue, JsValue> {
+    // Parse the markdown again without context to find which nouns are declared in this text.
+    // Only emit nouns that are declared in this domain, not context-only nouns.
+    // A noun declared in both the context and this domain IS emitted (idempotent).
+    //
+    // The IR has all nouns (context + declared). We emit nouns that are either:
+    // 1. Not in the context (newly declared)
+    // 2. In the context but also have fact types, constraints, or instance facts in this IR
+    //    (meaning the domain references them meaningfully, not just inherited from context)
+    //
+    // Simplification: emit nouns that appear in any fact type role in this IR.
+    let referenced_nouns: std::collections::HashSet<String> = ir.fact_types.values()
+        .flat_map(|ft| ft.roles.iter().map(|r| r.noun_name.clone()))
+        .collect();
+
+    let filtered_ir = types::ConstraintIR {
+        domain: ir.domain.clone(),
+        nouns: ir.nouns.iter()
+            .filter(|(name, _)| !context_nouns.contains(*name) || referenced_nouns.contains(*name))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+        fact_types: ir.fact_types.clone(),
+        constraints: ir.constraints.clone(),
+        state_machines: ir.state_machines.clone(),
+        derivation_rules: ir.derivation_rules.clone(),
+        general_instance_facts: ir.general_instance_facts.clone(),
+    };
+    emit_entities(&filtered_ir, domain)
+}
+
+fn emit_entities(ir: &types::ConstraintIR, domain: &str) -> Result<JsValue, JsValue> {
     let mut entities: Vec<serde_json::Value> = Vec::new();
 
     // Domains are NORMA tabs — not partitions. Fact types are idempotent.
@@ -727,8 +772,17 @@ pub fn parse_readings_wasm(markdown: &str, domain: &str) -> Result<JsValue, JsVa
 
     // Instance facts — x̄ asserted into P.
     // /merge : α key_by : instance_facts  (fold groups, then map to entities)
+    // Metamodel entities (Noun, Domain, etc.) use just the name as ID.
+    // Domain entities use compound IDs (Type:value) to avoid collisions.
+    let metamodel_types = ["Noun", "Domain", "External System", "State Machine Definition"];
     let instance_entities = ir.general_instance_facts.iter()
-        .map(|fact| (format!("{}:{}", fact.subject_noun, fact.subject_value), fact))
+        .map(|fact| {
+            let id = metamodel_types.iter()
+                .find(|&&t| t == fact.subject_noun)
+                .map(|_| fact.subject_value.clone())
+                .unwrap_or_else(|| format!("{}:{}", fact.subject_noun, fact.subject_value));
+            (id, fact)
+        })
         .fold(HashMap::<String, serde_json::Map<String, serde_json::Value>>::new(), |mut acc, (id, fact)| {
             let data = acc.entry(id).or_insert_with(|| {
                 let mut m = serde_json::Map::new();
