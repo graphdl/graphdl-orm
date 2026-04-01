@@ -9,10 +9,9 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { handleSeed } from './seed'
 import type { Env } from '../types'
 
-// Mock the WASM engine — parseReadings is the only function seed.ts uses
-vi.mock('./engine', () => ({
-  parseReadings: vi.fn((markdown: string, domain: string) => {
-    // Simulate: extract nouns from "X is an entity type." lines
+// Mock the WASM engine — seed.ts uses parseReadingsWithNouns
+vi.mock('./engine', () => {
+  const parse = (markdown: string, domain: string) => {
     const entities: any[] = []
     for (const line of markdown.split('\n')) {
       const m = line.match(/^(\w[\w\s]*?)\s+is an entity type/i)
@@ -35,8 +34,13 @@ vi.mock('./engine', () => ({
       }
     }
     return entities
-  }),
-}))
+  }
+  return {
+    parseReadings: vi.fn(parse),
+    parseReadingsWithNouns: vi.fn((markdown: string, domain: string, _existingNouns: string) => parse(markdown, domain)),
+    ensureWasm: vi.fn(),
+  }
+})
 
 function mockDONamespace(factory: (...args: any[]) => any) {
   return {
