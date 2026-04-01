@@ -539,8 +539,9 @@ fn parse_enum(line: &str) -> Option<Vec<String>> {
 /// (just different voice) produce the same ID.
 fn graph_schema_id(role_nouns: &[&str], verb: &str) -> String {
     let verb_part = verb.to_lowercase().replace(' ', "_");
-    let mut parts = vec![role_nouns[0], &verb_part];
-    parts.extend(&role_nouns[1..]);
+    let noun_parts: Vec<String> = role_nouns.iter().map(|n| n.replace(' ', "_")).collect();
+    let mut parts: Vec<&str> = vec![&noun_parts[0], &verb_part];
+    noun_parts[1..].iter().for_each(|n| parts.push(n));
     parts.join("_")
 }
 
@@ -1074,6 +1075,11 @@ mod tests {
             graph_schema_id(&["Customer"], "is active"),
             "Customer_is_active"
         );
+        // Multi-word nouns: "Auth Session uses Session Strategy"
+        assert_eq!(
+            graph_schema_id(&["Auth Session", "Session Strategy"], "uses"),
+            "Auth_Session_uses_Session_Strategy"
+        );
     }
 
     #[test]
@@ -1149,5 +1155,38 @@ mod tests {
         let c = &ir.constraints[0];
         assert_eq!(c.spans[0].fact_type_id, "User_owns_Organization",
             "Constraint span should reference Graph Schema ID, not reading text");
+    }
+
+    #[test]
+    fn real_domain_produces_schema_ids() {
+        let input = "\
+# Auth
+
+## Entity Types
+Auth Session(.id) is an entity type.
+Customer(.Name) is an entity type.
+Session Strategy is a value type.
+
+## Fact Types
+Auth Session is for Customer.
+  Each Auth Session is for exactly one Customer.
+Auth Session uses Session Strategy.
+  Each Auth Session uses exactly one Session Strategy.
+";
+        let ir = parse_markdown(input).unwrap();
+        let keys: Vec<&String> = ir.fact_types.keys().collect();
+        // All keys should be underscore format, not reading format
+        for key in &keys {
+            assert!(!key.contains(' '), "Fact type key '{}' should not contain spaces", key);
+        }
+        assert!(ir.fact_types.contains_key("Auth_Session_is_for_Customer"));
+        assert!(ir.fact_types.contains_key("Auth_Session_uses_Session_Strategy"));
+        // Constraints should reference schema IDs
+        for c in &ir.constraints {
+            for span in &c.spans {
+                assert!(!span.fact_type_id.contains(' '),
+                    "Constraint span '{}' should not contain spaces", span.fact_type_id);
+            }
+        }
     }
 }

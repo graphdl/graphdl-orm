@@ -570,7 +570,7 @@ fn resolve_fact_type_id(model: &CompiledModel, noun: &str, field: &str) -> Strin
             }
         }
     }
-    format!("{} has {}", noun, field)
+    format!("{}_has_{}", noun, field)
 }
 
 /// HATEOAS as Projection (Theorem 3):
@@ -845,9 +845,9 @@ mod tests {
 
         let result = apply_command(&model, &cmd, &pop);
 
-        // Entity fields are facts in the population
-        assert!(result.population.facts.contains_key("Order has customer"));
-        let customer_facts = &result.population.facts["Order has customer"];
+        // Entity fields are facts in the population (Graph Schema ID format)
+        assert!(result.population.facts.contains_key("Order_has_customer"));
+        let customer_facts = &result.population.facts["Order_has_customer"];
         assert_eq!(customer_facts.len(), 1);
         assert!(customer_facts[0].bindings.iter().any(|(_, v)| v == "acme"));
 
