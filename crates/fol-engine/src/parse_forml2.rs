@@ -480,6 +480,19 @@ fn graph_schema_id(role_nouns: &[&str], verb: &str) -> String {
     parts.join("_")
 }
 
+/// Parse a role token into (base_noun_name, full_token_with_subscript).
+/// "Person1" -> ("Person", "Person1"). "User" -> ("User", "User").
+fn parse_role_token(token: &str) -> (&str, &str) {
+    let boundary = token
+        .char_indices()
+        .rev()
+        .take_while(|(_, c)| c.is_ascii_digit())
+        .last()
+        .map(|(i, _)| i)
+        .unwrap_or(token.len());
+    (&token[..boundary], token)
+}
+
 fn parse_fact(line: &str, noun_names: &[String]) -> Option<(String, FactTypeDef)> {
     let clean = line.trim_end_matches('.');
     let found = find_nouns(clean, noun_names);
@@ -910,5 +923,15 @@ mod tests {
             graph_schema_id(&["Customer"], "is active"),
             "Customer_is_active"
         );
+    }
+
+    #[test]
+    fn strip_role_subscript() {
+        assert_eq!(parse_role_token("Person1"), ("Person", "Person1"));
+        assert_eq!(parse_role_token("Person2"), ("Person", "Person2"));
+        assert_eq!(parse_role_token("User"), ("User", "User"));
+        assert_eq!(parse_role_token("Organization"), ("Organization", "Organization"));
+        // Multi-word noun with subscript
+        assert_eq!(parse_role_token("Support Request1"), ("Support Request", "Support Request1"));
     }
 }
