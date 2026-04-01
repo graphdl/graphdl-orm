@@ -468,7 +468,9 @@ mod tests {
             world_assumption: WorldAssumption::default(), ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false, backed_by: None,
         });
         ir.fact_types.insert("ft1".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "Person has Name".to_string(),
+            readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "Person".to_string(), role_index: 0 },
                 RoleDef { noun_name: "Name".to_string(), role_index: 1 },
@@ -541,7 +543,9 @@ mod tests {
     fn derivation_dependency_computed() {
         let mut ir = simple_ir();
         ir.fact_types.insert("ft2".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "Person has Full Name".to_string(),
+            readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "Person".to_string(), role_index: 0 },
                 RoleDef { noun_name: "Name".to_string(), role_index: 1 },
@@ -581,7 +585,9 @@ mod tests {
         let mut ir = simple_ir();
         // Add a fact type referencing an undeclared noun
         ir.fact_types.insert("ft-bad".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "Person has Age".to_string(),
+            readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "Person".to_string(), role_index: 0 },
                 RoleDef { noun_name: "Age".to_string(), role_index: 1 }, // Age not declared
@@ -662,7 +668,9 @@ mod tests {
         let mut ir = simple_ir();
         // Add a ternary fact type
         ir.fact_types.insert("ft-ternary".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "Plan charges Price per Interval".to_string(),
+            readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "Plan".to_string(), role_index: 0 },
                 RoleDef { noun_name: "Price".to_string(), role_index: 1 },
@@ -689,7 +697,9 @@ mod tests {
     fn ternary_with_n_minus_1_uc_passes() {
         let mut ir = simple_ir();
         ir.fact_types.insert("ft-ternary".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "Plan charges Price per Interval".to_string(),
+            readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "Plan".to_string(), role_index: 0 },
                 RoleDef { noun_name: "Price".to_string(), role_index: 1 },
@@ -898,7 +908,9 @@ mod tests {
             ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false, backed_by: None,
         });
         ir.fact_types.insert("ft2".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "Person has Name and Age".to_string(),
+            readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "Person".to_string(), role_index: 0 },
                 RoleDef { noun_name: "Name".to_string(), role_index: 1 },
@@ -920,7 +932,9 @@ mod tests {
             ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false, backed_by: None,
         });
         ir.fact_types.insert("ft2".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "Person was born in Country".to_string(),
+            readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "Person".to_string(), role_index: 0 },
                 RoleDef { noun_name: "Country".to_string(), role_index: 1 },

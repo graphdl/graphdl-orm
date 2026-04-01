@@ -2679,7 +2679,9 @@ mod schema_tests {
     fn make_ir_with_fact_type(id: &str, reading: &str, roles: Vec<(&str, usize)>) -> ConstraintIR {
         let mut fact_types = HashMap::new();
         fact_types.insert(id.to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: reading.to_string(),
+            readings: vec![],
             roles: roles.iter().map(|(name, idx)| RoleDef {
                 noun_name: name.to_string(),
                 role_index: *idx,
@@ -2794,7 +2796,9 @@ mod schema_tests {
         // Compile a UC constraint and verify the func field works via ast::apply
         let mut fact_types = HashMap::new();
         fact_types.insert("ft1".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "Person has Name".to_string(),
+            readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "Person".to_string(), role_index: 0 },
                 RoleDef { noun_name: "Name".to_string(), role_index: 1 },
@@ -2859,7 +2863,9 @@ mod schema_tests {
     fn constraint_func_no_violation_returns_phi() {
         let mut fact_types = HashMap::new();
         fact_types.insert("ft1".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "Person has Name".to_string(),
+            readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "Person".to_string(), role_index: 0 },
                 RoleDef { noun_name: "Name".to_string(), role_index: 1 },
@@ -2930,7 +2936,9 @@ mod schema_tests {
 
         // ft1: OrgMembership is for User (roles: OrgMembership[0], User[1])
         fact_types.insert("ft1".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "OrgMembership is for User".to_string(),
+            readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "OrgMembership".to_string(), role_index: 0 },
                 RoleDef { noun_name: "User".to_string(), role_index: 1 },
@@ -2939,7 +2947,9 @@ mod schema_tests {
 
         // ft2: OrgMembership is in Organization (roles: OrgMembership[0], Organization[1])
         fact_types.insert("ft2".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "OrgMembership is in Organization".to_string(),
+            readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "OrgMembership".to_string(), role_index: 0 },
                 RoleDef { noun_name: "Organization".to_string(), role_index: 1 },
@@ -2948,7 +2958,9 @@ mod schema_tests {
 
         // ft3: Domain belongs to Organization (roles: Domain[0], Organization[1])
         fact_types.insert("ft3".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "Domain belongs to Organization".to_string(),
+            readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "Domain".to_string(), role_index: 0 },
                 RoleDef { noun_name: "Organization".to_string(), role_index: 1 },
@@ -3014,14 +3026,18 @@ mod schema_tests {
         // The entity "Customer" has fields "name" and "plan".
         let mut fact_types = HashMap::new();
         fact_types.insert("schema-uuid-1".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "Customer has name".to_string(),
+            readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "Customer".to_string(), role_index: 0 },
                 RoleDef { noun_name: "name".to_string(), role_index: 1 },
             ],
         });
         fact_types.insert("schema-uuid-2".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "Customer has plan".to_string(),
+            readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "Customer".to_string(), role_index: 0 },
                 RoleDef { noun_name: "plan".to_string(), role_index: 1 },
