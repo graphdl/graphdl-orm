@@ -358,7 +358,7 @@ fn apply_transition(
         // Pop' = Pop with updated SM status fact.
         // Theorem 3: every observable value must be in the population.
         let sm_id = format!("sm:{}", entity_id);
-        let status_key = "State Machine has currentlyInStatus".to_string();
+        let status_key = "StateMachine_has_currentlyInStatus".to_string();
         if let Some(facts) = new_pop.facts.get_mut(&status_key) {
             // Update existing SM status fact for this entity
             for fact in facts.iter_mut() {
@@ -635,7 +635,7 @@ fn hateoas_from_population(
 /// Resolve entity ID from Halpin's reference scheme.
 /// Extract the current status of a State Machine instance from the population.
 fn extract_sm_status(population: &Population, sm_id: &str) -> Option<String> {
-    let status_facts = population.facts.get("State Machine has currentlyInStatus")?;
+    let status_facts = population.facts.get("StateMachine_has_currentlyInStatus")?;
     for fact in status_facts {
         let has_sm = fact.bindings.iter().any(|(_, v)| v == sm_id);
         if has_sm {
@@ -852,8 +852,8 @@ mod tests {
         assert!(customer_facts[0].bindings.iter().any(|(_, v)| v == "acme"));
 
         // SM facts are in the population
-        assert!(result.population.facts.contains_key("State Machine has currentlyInStatus"));
-        let sm_facts = &result.population.facts["State Machine has currentlyInStatus"];
+        assert!(result.population.facts.contains_key("StateMachine_has_currentlyInStatus"));
+        let sm_facts = &result.population.facts["StateMachine_has_currentlyInStatus"];
         assert!(sm_facts[0].bindings.iter().any(|(_, v)| v == "Draft"));
     }
 
@@ -888,7 +888,7 @@ mod tests {
         assert_eq!(result.status.as_deref(), Some("Placed"));
 
         // Population must contain the updated status
-        let sm_facts = &result.population.facts["State Machine has currentlyInStatus"];
+        let sm_facts = &result.population.facts["StateMachine_has_currentlyInStatus"];
         let sm_fact = sm_facts.iter().find(|f|
             f.bindings.iter().any(|(_, v)| v == "sm:ORD-1")
         ).expect("SM fact must exist for ORD-1");

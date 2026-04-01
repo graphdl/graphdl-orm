@@ -1268,7 +1268,7 @@ fn compile_sm_initialization(ir: &ConstraintIR) -> Vec<CompiledDerivation> {
             }
 
             // Find existing SM-for-resource facts
-            let sm_for_facts = obj_find_ft(pop_obj, "State Machine has forResource");
+            let sm_for_facts = obj_find_ft(pop_obj, "StateMachine_has_forResource");
             let existing_resources: std::collections::HashSet<&str> = sm_for_facts.iter()
                 .filter_map(|fact| {
                     let bindings = fact.as_seq()?;
@@ -1292,7 +1292,7 @@ fn compile_sm_initialization(ir: &ConstraintIR) -> Vec<CompiledDerivation> {
                 let sm_id = format!("sm:{}", instance);
                 // Derive SM facts: instanceOf, currentlyInStatus, forResource
                 derived.push(obj_derived_fact(
-                    "State Machine has instanceOf",
+                    "StateMachine_has_instanceOf",
                     &format!("State Machine for {} is instance of {}", instance, sm_noun),
                     &[
                         ("State Machine".to_string(), sm_id.clone()),
@@ -1300,7 +1300,7 @@ fn compile_sm_initialization(ir: &ConstraintIR) -> Vec<CompiledDerivation> {
                     ],
                 ));
                 derived.push(obj_derived_fact(
-                    "State Machine has currentlyInStatus",
+                    "StateMachine_has_currentlyInStatus",
                     &format!("State Machine for {} initially in {}", instance, initial_status),
                     &[
                         ("State Machine".to_string(), sm_id.clone()),
@@ -1308,7 +1308,7 @@ fn compile_sm_initialization(ir: &ConstraintIR) -> Vec<CompiledDerivation> {
                     ],
                 ));
                 derived.push(obj_derived_fact(
-                    "State Machine has forResource",
+                    "StateMachine_has_forResource",
                     &format!("State Machine is for {}", instance),
                     &[
                         ("State Machine".to_string(), sm_id.clone()),
