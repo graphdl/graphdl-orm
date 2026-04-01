@@ -58,8 +58,8 @@ export async function buildPopulation(
   getStub: (id: string) => any,
   domainSlug: string,
 ): Promise<string> {
-  // Build a lookup from (nounType, fieldName) → fact type reading ID.
-  // The IR has fact types like {id: "User has Org Role", roles: [{nounName: "User"}, {nounName: "Org Role"}]}.
+  // Build a lookup from (nounType, fieldName) → Graph Schema ID.
+  // The IR has fact types like {id: "User_has_Org_Role", roles: [{nounName: "User"}, {nounName: "Org Role"}]}.
   // Entity fields are camelCase ("orgRole"). Role noun names are title case ("Org Role").
   // We match by normalizing both to lowercase.
   const irCell = await getStub(`ir:${domainSlug}`).get().catch(() => null)
@@ -99,8 +99,8 @@ export async function buildPopulation(
     const spacedKey = `${nounType.toLowerCase()}:${spaced.toLowerCase()}`
     const spacedMatch = ftLookup.get(spacedKey)
     if (spacedMatch) return spacedMatch
-    // Last fallback: legacy format
-    return `${nounType}_${fieldName}`
+    // Last fallback: Graph Schema ID format
+    return `${nounType}_has_${fieldName}`
   }
 
   // Get all entity IDs for this domain
@@ -214,7 +214,7 @@ async function resolveFromService(
         if (value === null || value === undefined) continue
 
         const nounField = fieldMap[responseField] ?? responseField
-        const ftId = `${nounType}_${nounField}`
+        const ftId = `${nounType}_has_${nounField}`
         if (!facts[ftId]) facts[ftId] = []
         facts[ftId].push({
           factTypeId: ftId,
@@ -228,7 +228,7 @@ async function resolveFromService(
           for (const [subField, subValue] of Object.entries(nested as Record<string, unknown>)) {
             if (typeof subValue !== 'string' && typeof subValue !== 'number' && typeof subValue !== 'boolean') continue
             const nounField = fieldMap[`${key}.${subField}`] ?? subField
-            const ftId = `${nounType}_${nounField}`
+            const ftId = `${nounType}_has_${nounField}`
             if (!facts[ftId]) facts[ftId] = []
             facts[ftId].push({
               factTypeId: ftId,
@@ -802,7 +802,7 @@ export async function evaluateAccess(
   let derived: Array<{ factTypeId: string; reading: string; bindings: Array<[string, string]>; derivedBy: string }> = []
   try { derived = forwardChain(popJson) } catch {}
 
-  // Parse population for reading-based fact type IDs.
+  // Parse population for Graph Schema ID keyed facts.
   const pop = JSON.parse(popJson) as { facts: Record<string, Array<{ factTypeId: string; bindings: Array<[string, string]> }>> }
 
   // Helper: find binding value by noun name in a fact
@@ -810,25 +810,25 @@ export async function evaluateAccess(
     fact.bindings.find(([k]) => k === noun)?.[1] || ''
 
   // Find User entity matching the authenticated email
-  const userFacts = pop.facts['User_email'] || pop.facts['User has Email'] || []
+  const userFacts = pop.facts['User_has_Email'] || []
   const userId = bindVal(
     userFacts.find(f => f.bindings.some(([, v]) => v === userEmail)) || { bindings: [] },
     'User',
   )
 
   // Extract org memberships from binary role fact types
-  const roleFactTypes = ['User owns Organization', 'User administers Organization', 'User belongs to Organization']
+  const roleFactTypes = ['User_owns_Organization', 'User_administers_Organization', 'User_belongs_to_Organization']
   const roleMap: Record<string, string> = {
-    'User owns Organization': 'owner',
-    'User administers Organization': 'admin',
-    'User belongs to Organization': 'member',
+    'User_owns_Organization': 'owner',
+    'User_administers_Organization': 'admin',
+    'User_belongs_to_Organization': 'member',
   }
   const userOrgs = roleFactTypes.flatMap(ftId =>
     (pop.facts[ftId] || [])
       .filter(f => bindVal(f, 'User') === userId)
       .map(f => {
         const orgId = bindVal(f, 'owns') || bindVal(f, 'administers') || bindVal(f, 'Organization') || ''
-        const orgNameFacts = pop.facts['Organization has Name'] || []
+        const orgNameFacts = pop.facts['Organization_has_Name'] || []
         const orgName = bindVal(
           orgNameFacts.find(nf => bindVal(nf, 'Organization') === orgId) || { bindings: [] },
           'Name',
@@ -842,7 +842,7 @@ export async function evaluateAccess(
   const allDomainSlugs = await registry.listDomains() as string[]
 
   derived
-    .filter(fact => fact.factTypeId === 'User accesses Domain')
+    .filter(fact => fact.factTypeId === 'User_accesses_Domain')
     .forEach(fact => {
       const domain = fact.bindings.find(([k]: [string, string]) => k === 'Domain')?.[1]
       domain && accessibleDomains.add(domain)
@@ -850,7 +850,7 @@ export async function evaluateAccess(
 
   // Fallback: public visibility
   if (accessibleDomains.size === 0) {
-    const visFacts = pop.facts['Domain has Visibility'] || []
+    const visFacts = pop.facts['Domain_has_Visibility'] || []
     allDomainSlugs.forEach(slug => {
       const vis = visFacts.find(f => bindVal(f, 'Domain') === slug)
       const visibility = vis ? bindVal(vis, 'Visibility') : null
@@ -859,8 +859,8 @@ export async function evaluateAccess(
   }
 
   // Visible apps: filter by org membership
-  const appOrgFacts = pop.facts['App belongs to Organization'] || []
-  const appNameFacts = pop.facts['App has Name'] || []
+  const appOrgFacts = pop.facts['App_belongs_to_Organization'] || []
+  const appNameFacts = pop.facts['App_has_Name'] || []
   const orgSlugs = new Set(userOrgs.map(uo => uo.orgSlug))
 
   const visibleApps = await Promise.all(
