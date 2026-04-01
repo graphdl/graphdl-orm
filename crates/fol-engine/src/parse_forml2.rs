@@ -131,7 +131,11 @@ fn try_instance_fact(line: &str) -> Option<ParseAction> {
 }
 
 fn try_derivation(line: &str) -> Option<ParseAction> {
+    // " if " mid-sentence is a derivation rule (Consequent if Antecedent).
+    // Lines starting with "If " are constraint/deontic, not derivations.
+    let has_if = line.contains(" if ") && !line.starts_with("If ");
     let has_marker = line.contains(" iff ")
+        || has_if
         || line.contains(" is derived as ")
         || (line.starts_with("For each ") && line.contains(" = "))
         || line.contains("count each")
@@ -172,12 +176,29 @@ fn try_fact_type(line: &str, noun_names: &[String]) -> Option<ParseAction> {
 // Main parser — fold recognizers over lines
 // =========================================================================
 
+/// Parse with pre-existing nouns from other domains.
+/// Domains are NORMA tabs. Nouns are global across the UoD.
+pub fn parse_markdown_with_nouns(input: &str, existing_nouns: &HashMap<String, NounDef>) -> Result<ConstraintIR, String> {
+    let mut ir = ConstraintIR {
+        domain: String::new(), nouns: existing_nouns.clone(), fact_types: HashMap::new(),
+        constraints: vec![], state_machines: HashMap::new(), derivation_rules: vec![],
+        general_instance_facts: vec![],
+    };
+    parse_into(&mut ir, input)?;
+    Ok(ir)
+}
+
 pub fn parse_markdown(input: &str) -> Result<ConstraintIR, String> {
     let mut ir = ConstraintIR {
         domain: String::new(), nouns: HashMap::new(), fact_types: HashMap::new(),
         constraints: vec![], state_machines: HashMap::new(), derivation_rules: vec![],
         general_instance_facts: vec![],
     };
+    parse_into(&mut ir, input)?;
+    Ok(ir)
+}
+
+fn parse_into(ir: &mut ConstraintIR, input: &str) -> Result<(), String> {
 
     let lines: Vec<String> = input.lines().map(|s| s.to_string()).collect();
 
@@ -195,7 +216,7 @@ pub fn parse_markdown(input: &str) -> Result<ConstraintIR, String> {
             .or_else(|| try_exclusive_subtypes(line))
             .or_else(|| try_enum_values(line));
 
-        apply_action(&mut ir, action, &lines, i);
+        apply_action(ir, action, &lines, i);
 
         // Look ahead for enum values after value type declaration
         if line.ends_with(" is a value type.") {
@@ -237,7 +258,7 @@ pub fn parse_markdown(input: &str) -> Result<ConstraintIR, String> {
 
         // Totality → mark abstract (but don't skip — still parse as constraint)
         if let Some(action) = try_totality(line) {
-            apply_action(&mut ir, Some(action), &lines, i);
+            apply_action(ir, Some(action), &lines, i);
         }
 
         let action = None
@@ -255,11 +276,89 @@ pub fn parse_markdown(input: &str) -> Result<ConstraintIR, String> {
                 ir.constraints.push(uc);
                 ir.constraints.push(mc);
             }
-            _ => { apply_action(&mut ir, action, &lines, i); }
+            _ => { apply_action(ir, action, &lines, i); }
         }
     }
 
-    Ok(ir)
+    Ok(())
+}
+
+/// Resolve a derivation rule's text into structured fact type references.
+///
+/// Splits on " if "/" iff " to get consequent and antecedent parts,
+/// then matches each part's nouns against ir.fact_types by role noun names.
+/// Anaphoric "that X" references are stripped to bare noun name "X".
+fn resolve_derivation_rule(rule: &mut DerivationRuleDef, ir: &ConstraintIR) {
+    // Longest-first noun list for Theorem 1 matching
+    let mut noun_names: Vec<String> = ir.nouns.keys().cloned().collect();
+    noun_names.sort_by(|a, b| b.len().cmp(&a.len()));
+
+    // Split on " iff " or " if " to get (consequent, antecedent_text)
+    let (consequent_text, antecedent_text) = rule.text
+        .find(" iff ")
+        .map(|i| (&rule.text[..i], &rule.text[i + 5..]))
+        .or_else(|| rule.text.find(" if ")
+            .map(|i| (&rule.text[..i], &rule.text[i + 4..])))
+        .unwrap_or((&rule.text, ""));
+
+    // Split antecedent on " and " to get individual conditions
+    let antecedent_parts: Vec<&str> = antecedent_text
+        .split(" and ")
+        .map(|s| s.trim().trim_end_matches('.'))
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    // Strip "that " prefix from noun references in a text fragment,
+    // returning the cleaned text.
+    let strip_anaphora = |text: &str| -> String {
+        text.replace("that ", "")
+    };
+
+    // Find the fact type whose role noun names match the nouns found in a text fragment.
+    let resolve_fact_type = |fragment: &str| -> Option<String> {
+        let cleaned = strip_anaphora(fragment);
+        let found_nouns: Vec<String> = find_nouns(&cleaned, &noun_names)
+            .iter()
+            .map(|(_, _, name)| name.clone())
+            .collect();
+        ir.fact_types.iter()
+            .find(|(_, ft)| {
+                let role_nouns: Vec<&String> = ft.roles.iter()
+                    .map(|r| &r.noun_name)
+                    .collect();
+                found_nouns.len() == role_nouns.len()
+                    && found_nouns.iter().all(|n| role_nouns.contains(&n))
+            })
+            .map(|(id, _)| id.clone())
+    };
+
+    // Detect "that X" anaphoric references — nouns preceded by "that " in
+    // antecedent parts become join keys.
+    let join_keys: Vec<String> = antecedent_parts.iter()
+        .flat_map(|part| {
+            noun_names.iter().filter_map(|noun| {
+                let pattern = format!("that {}", noun);
+                part.contains(&pattern).then(|| noun.clone())
+            }).collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+
+    // Resolve consequent
+    rule.consequent_fact_type_id = resolve_fact_type(consequent_text).unwrap_or_default();
+
+    // Resolve antecedents
+    rule.antecedent_fact_type_ids = antecedent_parts.iter()
+        .filter_map(|part| resolve_fact_type(part))
+        .collect();
+
+    // Deduplicate join keys
+    let mut seen = std::collections::HashSet::new();
+    rule.join_on = join_keys.into_iter()
+        .filter(|k| seen.insert(k.clone()))
+        .collect();
+
+    // Set rule ID from consequent
+    rule.id = rule.consequent_fact_type_id.clone();
 }
 
 /// Apply a parse action to the IR accumulator.
@@ -309,7 +408,10 @@ fn apply_action(ir: &mut ConstraintIR, action: Option<ParseAction>, lines: &[Str
             ir.fact_types.entry(id).or_insert(def);
         }
         ParseAction::AddConstraint(c) => { ir.constraints.push(c); }
-        ParseAction::AddDerivation(r) => { ir.derivation_rules.push(r); }
+        ParseAction::AddDerivation(mut r) => {
+            resolve_derivation_rule(&mut r, ir);
+            ir.derivation_rules.push(r);
+        }
         ParseAction::AddInstanceFact(raw) => {
             let line_refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
             parse_instance_fact(ir, &raw, &line_refs, idx);
@@ -533,13 +635,21 @@ fn parse_general_instance_fact(ir: &mut ConstraintIR, line: &str) {
         .next();
 
     let fact = match object_match {
-        Some((predicate, object_noun, object_value)) => Some(GeneralInstanceFact {
-            subject_noun,
-            subject_value,
-            field_name: to_camel_case(&predicate),
-            object_noun,
-            object_value,
-        }),
+        Some((predicate, object_noun, object_value)) => {
+            // Field name: drop generic verbs ("has", "is"), keep descriptive predicates.
+            // "has URI" → "uri". "reads from ClickHouse Table" → "readsFrom".
+            let field = match predicate.trim() {
+                "has" | "is" | "belongs to" | "is of" => to_camel_case(&object_noun),
+                _ => to_camel_case(&predicate),
+            };
+            Some(GeneralInstanceFact {
+                subject_noun,
+                subject_value,
+                field_name: field,
+                object_noun,
+                object_value,
+            })
+        }
         None => extract_value_fact(rest).map(|(predicate, value)| GeneralInstanceFact {
             subject_noun,
             subject_value,
@@ -722,5 +832,24 @@ mod tests {
         let ir = parse_markdown(input).unwrap();
         assert!(ir.nouns["Customer"].backed_by.is_none());
         assert!(ir.nouns["Order"].backed_by.is_none());
+    }
+
+    #[test]
+    fn derivation_rule_extracts_fact_types() {
+        let input = "User(.Email) is an entity type.\nDomain(.Slug) is an entity type.\nOrg Role is a value type.\nOrganization(.Slug) is an entity type.\n## Fact Types\nUser has Org Role in Organization.\nDomain belongs to Organization.\nUser accesses Domain.\n## Derivation Rules\nUser accesses Domain if User has Org Role in Organization and Domain belongs to that Organization.";
+        let ir = parse_markdown(input).unwrap();
+        assert!(!ir.derivation_rules.is_empty());
+        let rule = &ir.derivation_rules[0];
+        assert!(!rule.consequent_fact_type_id.is_empty(), "consequent should be resolved");
+        assert!(!rule.antecedent_fact_type_ids.is_empty(), "antecedents should be resolved");
+        assert!(rule.antecedent_fact_type_ids.len() >= 2, "should have at least 2 antecedents");
+    }
+
+    #[test]
+    fn derivation_rule_identifies_join_keys() {
+        let input = "User(.Email) is an entity type.\nDomain(.Slug) is an entity type.\nOrg Role is a value type.\nOrganization(.Slug) is an entity type.\n## Fact Types\nUser has Org Role in Organization.\nDomain belongs to Organization.\nUser accesses Domain.\n## Derivation Rules\nUser accesses Domain if User has Org Role in Organization and Domain belongs to that Organization.";
+        let ir = parse_markdown(input).unwrap();
+        let rule = &ir.derivation_rules[0];
+        assert!(rule.join_on.contains(&"Organization".to_string()), "Organization should be a join key (referenced with 'that')");
     }
 }
