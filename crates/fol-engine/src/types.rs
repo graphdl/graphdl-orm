@@ -122,8 +122,19 @@ pub enum DerivationKind {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FactTypeDef {
+    #[serde(default)]
+    pub schema_id: String,
     pub reading: String,
+    #[serde(default)]
+    pub readings: Vec<ReadingDef>,
     pub roles: Vec<RoleDef>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadingDef {
+    pub text: String,
+    pub role_order: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

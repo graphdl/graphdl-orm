@@ -433,7 +433,9 @@ mod tests {
         }
         for (id, reading, roles) in fact_types {
             ir.fact_types.insert(id.to_string(), FactTypeDef {
+                schema_id: String::new(),
                 reading: reading.to_string(),
+                readings: vec![],
                 roles: roles.iter().map(|(name, idx)| RoleDef {
                     noun_name: name.to_string(),
                     role_index: *idx,

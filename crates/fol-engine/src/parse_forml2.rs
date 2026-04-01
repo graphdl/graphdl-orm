@@ -506,7 +506,24 @@ fn parse_fact(line: &str, noun_names: &[String]) -> Option<(String, FactTypeDef)
         .map(|(i, (_, _, name))| RoleDef { noun_name: name.clone(), role_index: i })
         .collect();
 
-    Some((reading.clone(), FactTypeDef { reading, roles }))
+    // Build role tokens for schema ID (preserving subscript digits from the source text)
+    let role_refs: Vec<&str> = found.iter().map(|(_, _, name)| name.as_str()).collect();
+    let schema_id = graph_schema_id(&role_refs, predicate);
+
+    let active_reading = ReadingDef {
+        text: reading.clone(),
+        role_order: (0..roles.len()).collect(),
+    };
+
+    Some((
+        schema_id.clone(),
+        FactTypeDef {
+            schema_id,
+            reading,
+            readings: vec![active_reading],
+            roles,
+        },
+    ))
 }
 
 fn parse_constraint(line: &str, noun_names: &[String]) -> Option<ConstraintDef> {
@@ -933,5 +950,16 @@ mod tests {
         assert_eq!(parse_role_token("Organization"), ("Organization", "Organization"));
         // Multi-word noun with subscript
         assert_eq!(parse_role_token("Support Request1"), ("Support Request", "Support Request1"));
+    }
+
+    #[test]
+    fn parse_fact_produces_schema_id() {
+        let nouns = vec!["User".to_string(), "Organization".to_string()];
+        let (id, ft) = parse_fact("User owns Organization.", &nouns).unwrap();
+        assert_eq!(id, "User_owns_Organization");
+        assert_eq!(ft.schema_id, "User_owns_Organization");
+        assert_eq!(ft.reading, "User owns Organization");
+        assert_eq!(ft.readings.len(), 1);
+        assert_eq!(ft.readings[0].role_order, vec![0, 1]);
     }
 }

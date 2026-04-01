@@ -456,7 +456,9 @@ mod tests {
     fn test_evaluate_via_ast_uniqueness_violation() {
         let mut ir = empty_ir();
         ir.fact_types.insert("ft1".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "Person has Name".to_string(),
+            readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "Person".to_string(), role_index: 0 },
                 RoleDef { noun_name: "Name".to_string(), role_index: 1 },
@@ -500,7 +502,9 @@ mod tests {
     fn test_evaluate_via_ast_no_violations() {
         let mut ir = empty_ir();
         ir.fact_types.insert("ft1".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "Person has Name".to_string(),
+            readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "Person".to_string(), role_index: 0 },
                 RoleDef { noun_name: "Name".to_string(), role_index: 1 },
@@ -675,7 +679,9 @@ mod tests {
             ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false, backed_by: None,
         });
         ir.fact_types.insert("ft1".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "Response contains Markdown Syntax".to_string(),
+            readings: vec![],
             roles: vec![RoleDef { noun_name: "Markdown Syntax".to_string(), role_index: 0 }],
         });
         ir.constraints.push(ConstraintDef {
@@ -746,7 +752,9 @@ mod tests {
 
         // Graph Schema
         ir.fact_types.insert("ft_submit".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "Customer submits SupportRequest".to_string(),
+            readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "Customer".to_string(), role_index: 0 },
                 RoleDef { noun_name: "SupportRequest".to_string(), role_index: 1 },
@@ -797,7 +805,9 @@ mod tests {
         ir.nouns.insert("SupportRequest".to_string(), make_noun("entity"));
 
         ir.fact_types.insert("ft_submit".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "Customer submits SupportRequest".to_string(),
+            readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "Customer".to_string(), role_index: 0 },
                 RoleDef { noun_name: "SupportRequest".to_string(), role_index: 1 },
@@ -842,7 +852,9 @@ mod tests {
         });
 
         ir.fact_types.insert("ft_resp".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "Response contains Prohibited".to_string(),
+            readings: vec![],
             roles: vec![RoleDef { noun_name: "Prohibited".to_string(), role_index: 0 }],
         });
 
@@ -920,14 +932,18 @@ mod tests {
 
         // Two fact types with different verbs
         ir.fact_types.insert("ft_submit".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "Customer submits SupportRequest".to_string(),
+            readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "Customer".to_string(), role_index: 0 },
                 RoleDef { noun_name: "SupportRequest".to_string(), role_index: 1 },
             ],
         });
         ir.fact_types.insert("ft_resolve".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "Agent resolves SupportRequest".to_string(),
+            readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "Agent".to_string(), role_index: 0 },
                 RoleDef { noun_name: "SupportRequest".to_string(), role_index: 1 },
@@ -964,11 +980,15 @@ mod tests {
         let mut ir = empty_ir();
         ir.nouns.insert("Person".to_string(), make_noun("entity"));
         ir.fact_types.insert("ft1".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "Person hasLicense".to_string(),
+            readings: vec![],
             roles: vec![RoleDef { noun_name: "Person".to_string(), role_index: 0 }],
         });
         ir.fact_types.insert("ft2".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "Person hasInsurance".to_string(),
+            readings: vec![],
             roles: vec![RoleDef { noun_name: "Person".to_string(), role_index: 0 }],
         });
         // SS constraint WITHOUT autofill — just validates, doesn't derive
@@ -1025,7 +1045,9 @@ mod tests {
         });
         ir.nouns.insert("Rank".to_string(), make_noun("value"));
         ir.fact_types.insert("ft1".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "Academic has Rank".to_string(),
+            readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "Academic".to_string(), role_index: 0 },
                 RoleDef { noun_name: "Rank".to_string(), role_index: 1 },
@@ -1054,14 +1076,18 @@ mod tests {
         ir.nouns.insert("Department".to_string(), make_noun("entity"));
 
         ir.fact_types.insert("ft_heads".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "Academic heads Department".to_string(),
+            readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "Academic".to_string(), role_index: 0 },
                 RoleDef { noun_name: "Department".to_string(), role_index: 1 },
             ],
         });
         ir.fact_types.insert("ft_works".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "Academic works for Department".to_string(),
+            readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "Academic".to_string(), role_index: 0 },
                 RoleDef { noun_name: "Department".to_string(), role_index: 1 },
@@ -1165,7 +1191,9 @@ mod tests {
             ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false, backed_by: None,
         });
         ir.fact_types.insert("ft1".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "SupportResponse contains ProhibitedText".to_string(),
+            readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "SupportResponse".to_string(), role_index: 0 },
                 RoleDef { noun_name: "ProhibitedText".to_string(), role_index: 1 },
@@ -1218,7 +1246,9 @@ mod tests {
             ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false, backed_by: None,
         });
         ir.fact_types.insert("ft1".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "SupportResponse contains ProhibitedText".to_string(),
+            readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "SupportResponse".to_string(), role_index: 0 },
                 RoleDef { noun_name: "ProhibitedText".to_string(), role_index: 1 },
@@ -1253,7 +1283,9 @@ mod tests {
     fn test_uniqueness_violation() {
         let mut ir = empty_ir();
         ir.fact_types.insert("ft1".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "Customer has Name".to_string(),
+            readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "Customer".to_string(), role_index: 0 },
                 RoleDef { noun_name: "Name".to_string(), role_index: 1 },
@@ -1296,7 +1328,9 @@ mod tests {
     fn test_ring_irreflexive_violation() {
         let mut ir = empty_ir();
         ir.fact_types.insert("ft1".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "Person manages Person".to_string(),
+            readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "Person".to_string(), role_index: 0 },
                 RoleDef { noun_name: "Person".to_string(), role_index: 1 },
@@ -1335,11 +1369,15 @@ mod tests {
     fn test_exclusive_or_violation() {
         let mut ir = empty_ir();
         ir.fact_types.insert("ft1".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "Order isPaid".to_string(),
+            readings: vec![],
             roles: vec![RoleDef { noun_name: "Order".to_string(), role_index: 0 }],
         });
         ir.fact_types.insert("ft2".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "Order isPending".to_string(),
+            readings: vec![],
             roles: vec![RoleDef { noun_name: "Order".to_string(), role_index: 0 }],
         });
         ir.constraints.push(ConstraintDef {
@@ -1380,11 +1418,15 @@ mod tests {
     fn test_subset_violation() {
         let mut ir = empty_ir();
         ir.fact_types.insert("ft1".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "Person hasLicense".to_string(),
+            readings: vec![],
             roles: vec![RoleDef { noun_name: "Person".to_string(), role_index: 0 }],
         });
         ir.fact_types.insert("ft2".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "Person hasInsurance".to_string(),
+            readings: vec![],
             roles: vec![RoleDef { noun_name: "Person".to_string(), role_index: 0 }],
         });
         ir.constraints.push(ConstraintDef {
@@ -1443,11 +1485,15 @@ mod tests {
     fn test_exclusive_choice_violation() {
         let mut ir = empty_ir();
         ir.fact_types.insert("ft1".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "Order isPaid".to_string(),
+            readings: vec![],
             roles: vec![RoleDef { noun_name: "Order".to_string(), role_index: 0 }],
         });
         ir.fact_types.insert("ft2".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "Order isPending".to_string(),
+            readings: vec![],
             roles: vec![RoleDef { noun_name: "Order".to_string(), role_index: 0 }],
         });
         ir.constraints.push(ConstraintDef {
@@ -1496,14 +1542,18 @@ mod tests {
             ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false, backed_by: None,
         });
         ir.fact_types.insert("ft1".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "Customer has Name".to_string(),
+            readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "Customer".to_string(), role_index: 0 },
                 RoleDef { noun_name: "Name".to_string(), role_index: 1 },
             ],
         });
         ir.fact_types.insert("ft2".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "Customer has Email".to_string(),
+            readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "Customer".to_string(), role_index: 0 },
                 RoleDef { noun_name: "Email".to_string(), role_index: 1 },
@@ -1541,11 +1591,15 @@ mod tests {
     fn test_inclusive_or_violation() {
         let mut ir = empty_ir();
         ir.fact_types.insert("ft1".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "Customer hasPhone".to_string(),
+            readings: vec![],
             roles: vec![RoleDef { noun_name: "Customer".to_string(), role_index: 0 }],
         });
         ir.fact_types.insert("ft2".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "Customer hasEmail".to_string(),
+            readings: vec![],
             roles: vec![RoleDef { noun_name: "Customer".to_string(), role_index: 0 }],
         });
         ir.constraints.push(ConstraintDef {
@@ -1566,7 +1620,9 @@ mod tests {
         });
 
         ir.fact_types.insert("ft3".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "Customer hasName".to_string(),
+            readings: vec![],
             roles: vec![RoleDef { noun_name: "Customer".to_string(), role_index: 0 }],
         });
         let mut facts = HashMap::new();
@@ -1603,7 +1659,9 @@ mod tests {
             ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false, backed_by: None,
         });
         ir.fact_types.insert("ft1".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "SupportResponse has SenderIdentityValue".to_string(),
+            readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "SupportResponse".to_string(), role_index: 0 },
                 RoleDef { noun_name: "SenderIdentityValue".to_string(), role_index: 1 },
@@ -1693,7 +1751,9 @@ mod tests {
         // Three fact types that all reference FieldName — simulates multi-span constraint
         for i in 1..=3 {
             ir.fact_types.insert(format!("ft{}", i), FactTypeDef {
+                schema_id: String::new(),
                 reading: format!("SupportResponse names APIProduct by FieldName ({})", i),
+                readings: vec![],
                 roles: vec![
                     RoleDef { noun_name: "SupportResponse".to_string(), role_index: 0 },
                     RoleDef { noun_name: "APIProduct".to_string(), role_index: 1 },
@@ -1741,11 +1801,15 @@ mod tests {
     fn test_equality_violation() {
         let mut ir = empty_ir();
         ir.fact_types.insert("ft1".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "Person isEmployee".to_string(),
+            readings: vec![],
             roles: vec![RoleDef { noun_name: "Person".to_string(), role_index: 0 }],
         });
         ir.fact_types.insert("ft2".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "Person hasBadge".to_string(),
+            readings: vec![],
             roles: vec![RoleDef { noun_name: "Person".to_string(), role_index: 0 }],
         });
         ir.constraints.push(ConstraintDef {
@@ -1798,7 +1862,9 @@ mod tests {
 
         // Fact type: Vehicle has License
         ir.fact_types.insert("ft_vehicle_license".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "Vehicle has License".to_string(),
+            readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "Vehicle".to_string(), role_index: 0 },
                 RoleDef { noun_name: "License".to_string(), role_index: 1 },
@@ -1807,7 +1873,9 @@ mod tests {
 
         // Fact type: Car has Color (to give Car instances)
         ir.fact_types.insert("ft_car_color".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "Car has Color".to_string(),
+            readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "Car".to_string(), role_index: 0 },
             ],
@@ -1846,11 +1914,15 @@ mod tests {
 
         ir.nouns.insert("Person".to_string(), make_noun("entity"));
         ir.fact_types.insert("ft1".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "Person hasLicense".to_string(),
+            readings: vec![],
             roles: vec![RoleDef { noun_name: "Person".to_string(), role_index: 0 }],
         });
         ir.fact_types.insert("ft2".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "Person hasInsurance".to_string(),
+            readings: vec![],
             roles: vec![RoleDef { noun_name: "Person".to_string(), role_index: 0 }],
         });
         // SS constraint with autofill: hasLicense -> automatically derive hasInsurance
@@ -1926,7 +1998,9 @@ mod tests {
 
         // Fact type involving CWA noun
         ir.fact_types.insert("ft_perm".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "Permission grants access to Resource".to_string(),
+            readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "Permission".to_string(), role_index: 0 },
                 RoleDef { noun_name: "Resource".to_string(), role_index: 1 },
@@ -1934,7 +2008,9 @@ mod tests {
         });
         // Fact type involving OWA noun
         ir.fact_types.insert("ft_cap".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "Capability enables Resource".to_string(),
+            readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "Capability".to_string(), role_index: 0 },
                 RoleDef { noun_name: "Resource".to_string(), role_index: 1 },
@@ -1996,14 +2072,18 @@ mod tests {
         ir.nouns.insert("Email".to_string(), make_noun("value"));
 
         ir.fact_types.insert("ft1".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "Customer has Name".to_string(),
+            readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "Customer".to_string(), role_index: 0 },
                 RoleDef { noun_name: "Name".to_string(), role_index: 1 },
             ],
         });
         ir.fact_types.insert("ft2".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "Customer has Email".to_string(),
+            readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "Customer".to_string(), role_index: 0 },
                 RoleDef { noun_name: "Email".to_string(), role_index: 1 },
@@ -2070,7 +2150,9 @@ mod tests {
         let mut ir = empty_ir();
         ir.nouns.insert("A".to_string(), make_noun("entity"));
         ir.fact_types.insert("ft1".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "A exists".to_string(),
+            readings: vec![],
             roles: vec![RoleDef { noun_name: "A".to_string(), role_index: 0 }],
         });
 
@@ -2099,7 +2181,9 @@ mod tests {
 
         // City isIn State
         ir.fact_types.insert("ft_city_state".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "City isIn State".to_string(),
+            readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "City".to_string(), role_index: 0 },
                 RoleDef { noun_name: "State".to_string(), role_index: 1 },
@@ -2107,7 +2191,9 @@ mod tests {
         });
         // State isIn Country
         ir.fact_types.insert("ft_state_country".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "State isIn Country".to_string(),
+            readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "State".to_string(), role_index: 0 },
                 RoleDef { noun_name: "Country".to_string(), role_index: 1 },
@@ -2195,21 +2281,27 @@ mod tests {
         // A has Key "k1", B has Key "k2" → no derivation (keys don't match).
         let mut fact_types = HashMap::new();
         fact_types.insert("a_key".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "A has Key".to_string(),
+            readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "A".to_string(), role_index: 0 },
                 RoleDef { noun_name: "Key".to_string(), role_index: 1 },
             ],
         });
         fact_types.insert("b_key".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "B has Key".to_string(),
+            readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "B".to_string(), role_index: 0 },
                 RoleDef { noun_name: "Key".to_string(), role_index: 1 },
             ],
         });
         fact_types.insert("derived".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "A is matched to B".to_string(),
+            readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "A".to_string(), role_index: 0 },
                 RoleDef { noun_name: "B".to_string(), role_index: 1 },
@@ -2265,28 +2357,36 @@ mod tests {
         // Entity X with Key "k1" but Label "L2" should NOT match.
         let mut fact_types = HashMap::new();
         fact_types.insert("x_key".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "X has Key".to_string(),
+            readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "X".to_string(), role_index: 0 },
                 RoleDef { noun_name: "Key".to_string(), role_index: 1 },
             ],
         });
         fact_types.insert("x_label".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "X has Label".to_string(),
+            readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "X".to_string(), role_index: 0 },
                 RoleDef { noun_name: "Label".to_string(), role_index: 1 },
             ],
         });
         fact_types.insert("y_key".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "Y has Key".to_string(),
+            readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "Y".to_string(), role_index: 0 },
                 RoleDef { noun_name: "Key".to_string(), role_index: 1 },
             ],
         });
         fact_types.insert("result".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "Y is resolved to X".to_string(),
+            readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "Y".to_string(), role_index: 0 },
                 RoleDef { noun_name: "X".to_string(), role_index: 1 },
@@ -2342,21 +2442,27 @@ mod tests {
         // Cross-noun containment predicate: A.FullName contains B.ShortName.
         let mut fact_types = HashMap::new();
         fact_types.insert("a_name".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "A has Full Name".to_string(),
+            readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "A".to_string(), role_index: 0 },
                 RoleDef { noun_name: "Full Name".to_string(), role_index: 1 },
             ],
         });
         fact_types.insert("b_name".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "B has Short Name".to_string(),
+            readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "B".to_string(), role_index: 0 },
                 RoleDef { noun_name: "Short Name".to_string(), role_index: 1 },
             ],
         });
         fact_types.insert("matched".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "B is matched to A".to_string(),
+            readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "B".to_string(), role_index: 0 },
                 RoleDef { noun_name: "A".to_string(), role_index: 1 },
@@ -2408,21 +2514,27 @@ mod tests {
         // When join keys don't match, no facts are derived.
         let mut fact_types = HashMap::new();
         fact_types.insert("a_key".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "A has Key".to_string(),
+            readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "A".to_string(), role_index: 0 },
                 RoleDef { noun_name: "Key".to_string(), role_index: 1 },
             ],
         });
         fact_types.insert("b_key".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "B has Key".to_string(),
+            readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "B".to_string(), role_index: 0 },
                 RoleDef { noun_name: "Key".to_string(), role_index: 1 },
             ],
         });
         fact_types.insert("derived".to_string(), FactTypeDef {
+            schema_id: String::new(),
             reading: "A matches B".to_string(),
+            readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "A".to_string(), role_index: 0 },
                 RoleDef { noun_name: "B".to_string(), role_index: 1 },
