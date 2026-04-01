@@ -281,3 +281,112 @@ describe('handleArestRequest', () => {
     expect(result).toBeNull()
   })
 })
+
+describe('HATEOAS walkability', () => {
+  const testIR = {
+    nouns: {
+      Organization: { objectType: 'entity' },
+      App: { objectType: 'entity' },
+      Domain: { objectType: 'entity' },
+      Name: { objectType: 'value' },
+    },
+    factTypes: {
+      App_belongs_to_Organization: {
+        schemaId: 'App_belongs_to_Organization',
+        reading: 'App belongs to Organization',
+        roles: [{ nounName: 'App', roleIndex: 0 }, { nounName: 'Organization', roleIndex: 1 }],
+        readings: [],
+      },
+      Domain_belongs_to_Organization: {
+        schemaId: 'Domain_belongs_to_Organization',
+        reading: 'Domain belongs to Organization',
+        roles: [{ nounName: 'Domain', roleIndex: 0 }, { nounName: 'Organization', roleIndex: 1 }],
+        readings: [],
+      },
+      Organization_has_Name: {
+        schemaId: 'Organization_has_Name',
+        reading: 'Organization has Name',
+        roles: [{ nounName: 'Organization', roleIndex: 0 }, { nounName: 'Name', roleIndex: 1 }],
+        readings: [],
+      },
+    },
+    constraints: [
+      { id: 'uc1', kind: 'UC', spans: [{ factTypeId: 'App_belongs_to_Organization', roleIndex: 0 }] },
+      { id: 'uc2', kind: 'UC', spans: [{ factTypeId: 'Domain_belongs_to_Organization', roleIndex: 0 }] },
+    ],
+  }
+
+  const entities: Record<string, any> = {
+    acme: { id: 'acme', type: 'Organization', data: { name: 'Acme Corp' } },
+    'support-app': { id: 'support-app', type: 'App', data: { name: 'Support' } },
+  }
+
+  const mockRegistry = {
+    getEntityIds: async (type: string) => {
+      if (type === 'App') return ['support-app']
+      if (type === 'Organization') return ['acme']
+      return []
+    },
+    getEntityCounts: async () => [{ nounType: 'Organization', count: 1 }],
+  }
+
+  const mockGetStub = (id: string) => ({
+    get: async () => entities[id] || null,
+  })
+
+  const population = {
+    facts: {
+      User_owns_Organization: [
+        { factTypeId: 'User_owns_Organization', bindings: [['User', 'test@example.com'], ['Organization', 'acme']] },
+      ],
+    },
+  }
+
+  it('every link from root resolves to a valid response', async () => {
+    // Step 1: Start at root
+    const root = await handleArestRequest({
+      path: '/arest/',
+      method: 'GET',
+      ir: testIR,
+      registry: mockRegistry as any,
+      getStub: mockGetStub as any,
+      userEmail: 'test@example.com',
+      population,
+    })
+    expect(root).not.toBeNull()
+    expect(root.type).toBe('User')
+    expect(root._links.self.href).toBe('/arest/')
+    expect(root._links.organizations).toBeDefined()
+    expect(root._links.organizations.length).toBeGreaterThan(0)
+
+    // Step 2: Follow first org link
+    const orgHref = root._links.organizations[0].href
+    const org = await handleArestRequest({
+      path: orgHref,
+      method: 'GET',
+      ir: testIR,
+      registry: mockRegistry as any,
+      getStub: mockGetStub as any,
+    })
+    expect(org).not.toBeNull()
+    expect(org.type).toBe('Organization')
+    expect(org._links.self.href).toBe(orgHref)
+    expect(org._links.apps).toBeDefined()
+    expect(org._links.apps.factType).toBe('App_belongs_to_Organization')
+
+    // Step 3: Follow apps collection link
+    const appsHref = org._links.apps.href
+    const apps = await handleArestRequest({
+      path: appsHref,
+      method: 'GET',
+      ir: testIR,
+      registry: mockRegistry as any,
+      getStub: mockGetStub as any,
+    })
+    expect(apps).not.toBeNull()
+    expect(apps.docs).toBeDefined()
+    expect(apps._schema).toBeDefined()
+    expect(apps._schema.fields).toBeDefined()
+    expect(apps._links.self.href).toBe(appsHref)
+  })
+})
