@@ -5,9 +5,8 @@
 Resource(.Reference) is an entity type.
 Graph is an entity type.
   Graph is a subtype of Resource.
-State Machine(.Name) is an entity type.
 Event(.id) is an entity type.
-This association with Event, Transition, State Machine provides the preferred identification scheme for Event Triggered Transition In State Machine.
+This association with Event, Transition, Resource provides the preferred identification scheme for Event Triggered Transition.
 Guard Run(.Name) is an entity type.
 Citation(.id) is an entity type.
 
@@ -55,18 +54,14 @@ Graph uses Resource for Role.
   Each Graph uses some Resource for some Role.
 This association with Graph, Resource, Role provides the preferred identification scheme for Resource Role.
 
-### State Machine
-State Machine belongs to Domain.
-  Each State Machine belongs to exactly one Domain.
-State Machine is instance of State Machine Definition.
-  Each State Machine is instance of exactly one State Machine Definition.
-State Machine is currently in Status.
-  Each State Machine is currently in exactly one Status.
-State Machine is for Resource.
-  Each State Machine is for exactly one Resource.
-  For each Resource, at most one State Machine is for that Resource.
+### State (absorbed into Resource cell by RMAP)
+Resource is currently in Status.
+  Each Resource is currently in at most one Status.
 
 ### Event
+Event(.id) is an entity type.
+Event is for Resource.
+  Each Event is for exactly one Resource.
 Event is of Event Type.
   Each Event is of exactly one Event Type.
 Event occurred at Timestamp.
@@ -74,16 +69,13 @@ Event occurred at Timestamp.
 Event has Data.
   Each Event has at most one Data.
 
-### Event Triggered Transition In State Machine (objectification of "Event triggered Transition in State Machine")
-Event triggered Transition in State Machine.
-  It is possible that for some Event and Transition, that Event triggered that Transition in more than one State Machine
-    and that for some Event and State Machine, that Event triggered more than one Transition in that State Machine
-    and that for some Transition and State Machine, more than one Event triggered that Transition in that State Machine.
-  In each population of Event triggered Transition in State Machine, each Event, Transition, State Machine combination occurs at most once.
+### Event Triggered Transition (objectification of "Event triggered Transition for Resource")
+Event triggered Transition for Resource.
+  In each population of Event triggered Transition for Resource, each Event, Transition, Resource combination occurs at most once.
 
 ## Subset Constraints
 
-If some Event triggered some Transition in some State Machine then that Event is of some Event Type
+If some Event triggered some Transition for some Resource then that Event is of some Event Type
   where that Transition is triggered by that Event Type.
 
 ### Guard Run

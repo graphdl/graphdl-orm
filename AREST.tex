@@ -52,7 +52,7 @@ Three terms carry overloaded abbreviations. \emph{AST} follows Backus's usage (A
 
 \section{Definitions}
 
-Each source formalism solved one layer. Backus solved the evaluation model. Codd solved the data model. Halpin solved the constraint language. Fielding solved the transfer protocol. The contribution of AREST is identification, not integration. A FORML\,2 reading is simultaneously an FFP object, a relation schema, a constraint specification, and a resource definition. The compiler recognizes this identity. The five theorems verify it.
+Each source formalism solved one layer: Backus the evaluation model, Codd the data model, Halpin the constraint language, and Fielding the transfer protocol. The contribution of AREST is identification, not integration. A FORML\,2 reading is simultaneously an FFP object, a relation schema, a constraint specification, and a resource definition, and the compiler recognizes this identity. The five theorems verify it.
 
 \begin{definition}[AREST]\label{def:arest}
 An \emph{Applicative REpresentational State Transfer} system is an AST system~\cite[Sec.\,14]{backus78} whose state $D$ satisfies:
@@ -60,14 +60,14 @@ An \emph{Applicative REpresentational State Transfer} system is an AST system~\c
 \item The $\mathit{FILE}$ cell contains a population $P = \uparrow\!\mathit{FILE}\!:\!D$, a named set of relations~\cite[Sec.\,1.6]{codd70} whose elements are ORM\,2 elementary facts~\cite[Ch.\,2]{halpin08}
 \item The $\mathit{DEFS}$ cells contain FFP objects~\cite[Sec.\,13.2]{backus78}. These are readings compiled from FORML\,2 declarations~\cite{halpin08}, and functions registered by the runtime
 \end{itemize}
-The system function $\mathit{SYSTEM}\!:\!x = \langle o, D'\rangle$~\cite[Sec.\,14.3.1]{backus78} is defined by the definitions in $D$. REST endpoints are applications of $\mathit{SYSTEM}$ with distinct inputs. The representation function $\rho$~\cite[Sec.\,13.3.2]{backus78} and the universe of FFP objects $O$ are inherited from the AST framework.
+The system function $\mathit{SYSTEM}\!:\!x = \langle o, D'\rangle$~\cite[Sec.\,14.3.1]{backus78} is defined by the definitions in $D$. REST endpoints are applications of $\mathit{SYSTEM}$ with distinct inputs. The representation function $\rho$~\cite[Sec.\,13.3.2]{backus78} maps an object to the function it represents. Given a fact type, $\rho$ looks it up in $\mathit{DEFS}$ and returns the functional form that determines what happens when an operation is applied. The universe of FFP objects $O$ and $\rho$ are inherited from the AST framework.
 \end{definition}
 
-The primitive atoms of $O$ include Backus's structural functions~\cite[Sec.\,11.2.3]{backus78}. Sequences represent functional forms via metacomposition~\cite[Sec.\,13.3.2]{backus78}:
+A fact type~\cite[Ch.\,2]{halpin08} is a constructor ($\mathit{CONS}$) of roles~\cite[Sec.\,11.2.4]{backus78}. Populate the roles with object instances and you get a fact. The fact is a sequence $\langle\mathit{ft}, o_1, \ldots, o_n\rangle$ where $\mathit{ft}$ is the fact type and $o_1, \ldots, o_n$ are the objects playing its roles. Metacomposition~\cite[Sec.\,13.3.2]{backus78} resolves the fact by looking up its fact type:
 \begin{align}
 (\rho\langle x_1, \ldots, x_n\rangle)\!:\!y = (\rho\,x_1)\!:\!\langle\langle x_1, \ldots, x_n\rangle, y\rangle \label{eq:metacomp}
 \end{align}
-The first element determines which functional form. The remaining elements are its parameters. In AREST, a FORML\,2 reading is an object. $\rho$ extracts the constraint or derivation function it represents.
+$\rho$ resolves the fact type ($x_1$) from $\mathit{DEFS}$ to determine the functional form, and the full fact ($\langle x_1, \ldots, x_n \rangle$) and the operand ($y$) are passed to it. The operand is the operation ($\mathit{render}$, $\mathit{httpFetch}$, $\mathit{validate}$, or any function the runtime has registered). The fact is a function in the $\lambda$-calculus sense: $\lambda f.\, f(o_1, \ldots, o_n)$, accepting an operation and applying it to its own objects.
 
 \section{Operations}
 
@@ -127,7 +127,7 @@ R \cdot S &\equiv \pi_{1s}(R \mathbin{*} S) \label{eq:rcomp} \\
 \gamma(R) &\equiv \mathit{Filter}(\mathit{eq} \circ [s_1, s_n]) : R \label{eq:tie}
 \end{align}
 
-\noindent $P$ is a named set of relations in normal form (ORM\,2 elementary facts are 5NF by construction~\cite[Ch.\,12]{halpin08}). Codd shows that $\theta_1 = \{\text{projection, natural join, restriction, tie}\}$ is adequate for the named set~\cite{codd72}. Equations~(\ref{eq:proj})--(\ref{eq:tie}) express each element of $\theta_1$ as an FFP definition.
+\noindent $P$ is a named set of relations in normal form (ORM\,2 elementary facts are 5NF by construction~\cite[Ch.\,12]{halpin08}). Codd shows that $\theta_1 = \{\text{projection, natural join, restriction, tie}\}$ is adequate for the named set~\cite{codd72}. Equations~(\ref{eq:proj})--(\ref{eq:tie}) express each element of $\theta_1$ as an FFP definition. The combining forms that query the population are the same combining forms that evaluate constraints and derive facts. There is no separate query language. The evaluation algebra is the query algebra.
 
 \subsection{State and Cells}
 
@@ -136,7 +136,7 @@ The state $D$ is a sequence of cells $\langle\mathit{CELL}, n, c\rangle$~\cite[S
 \uparrow\!n\!:\!D &\to c \qquad \text{(fetch)} \label{eq:fetch} \\
 \downarrow\!n\!:\!\langle x, D\rangle &\to D' \quad\; \text{(store)} \label{eq:store}
 \end{align}
-$\mathit{FILE}$ is a cell whose contents is~$P$. Each entity is a cell. Cells may contain sub-stores~\cite[Sec.\,14.7]{backus78}. Partitioning is a cell containing a subset of~$P$.
+$\mathit{FILE}$ is a cell whose contents is~$P$. RMAP~\cite[Ch.\,17]{halpin08} determines which facts belong to which cell from the schema's uniqueness constraints. The result is a 3NF row: the complete set of facts that depend on one entity's key. Each entity is a cell. The cell stores exactly the facts that RMAP groups under that entity. A cell is what it says it is: a complete object of a type. Cells may contain sub-stores~\cite[Sec.\,14.7]{backus78}. Partitioning is a cell containing a subset of~$P$.
 
 \section{The System Function}
 
@@ -144,42 +144,38 @@ Each input $x$ addresses an entity and carries an operation. The runtime maps th
 \begin{align}
 \mathit{SYSTEM}\!:\!x &= (\rho\,(\uparrow\!\mathit{entity}(x)\!:\!D))\!:\!\uparrow\!\mathit{op}(x) \label{eq:sys}
 \end{align}
-The entity is fetched from $D$. $\rho$ resolves it to a functional form determined by its type and the definitions in $\mathit{DEFS}$. The operation ($\mathit{read}$, $\mathit{create}$, etc.) is applied as the operand. The entity handles the dispatch, not the system function. A local entity applies $\mathit{read}$ by selecting its attributes from $P$. A backed entity applies $\mathit{read}$ by calling $\mathit{httpFetch}$. Both are $\rho$-applications over the same interface.
+The entity is fetched from $D$. $\rho$ resolves it to a functional form determined by its fact type and the definitions in $\mathit{DEFS}$. The operation ($\mathit{read}$, $\mathit{create}$, etc.) is applied as the operand. The entity handles the dispatch, not the system function. In conventional architectures, a router dispatches operations to handlers. Adding a new operation or a new entity type requires changing the router. Here, the entity receives an operation it has never seen before and applies it, because the entity is a $\lambda$-function and the operation is its argument. New operations are registered in $\mathit{DEFS}$ without modifying any entity, and new entity types are added without modifying any operation. This is what makes the system shardable: each entity is self-contained, and two entities on different machines apply the same operation without coordinating.
 
 Self-modification is the same mechanism. Ingesting readings~\cite[Sec.\,14.6]{backus78} is an application of $\mathit{SYSTEM}$ where the addressed entity is $\mathit{DEFS}$ and the operation is $\mathit{compile} \circ \mathit{parse}$. The new FFP objects are stored via $\downarrow\!\mathit{DEFS}$. Subsequent applications of $\mathit{SYSTEM}$ evaluate the new constraints and derivation rules. The system extends its own program.
 
 \subsection{Commands}
 
-Each interaction is an AST transition~\cite[Sec.\,14.3.1]{backus78}:
-\begin{align}
-\mu(\mathit{SYSTEM}\!:\!x) &= \langle o, D' \rangle \label{eq:transition}
-\end{align}
+$\mu$ denotes evaluation~\cite[Sec.\,14.3.1]{backus78}. Applying $\mathit{SYSTEM}$ to an input produces an output $o$ and a new state $D'$. Each application is an AST transition: the state before, the state after, nothing else changes.
 
 A \textsc{Create} command:
 \begin{align}
 \mathit{create} &= \mathit{emit} \circ \mathit{validate} \circ \mathit{derive} \circ \mathit{resolve} \label{eq:create}
 \end{align}
+$\mathit{resolve}$ determines identity from the reference scheme. $\mathit{derive}$ forward-chains derivation rules to the least fixed point. $\mathit{validate}$ evaluates every constraint against the complete population. $\mathit{emit}$ always runs. An alethic violation produces a rejection and the state is unchanged ($D' = D$). A deontic violation produces warnings but the operation succeeds ($D' = D''$). The violation message is the original reading (Corollary~\ref{cor:verbalize}).
 
-A state machine is a fold~\cite[Sec.\,11.2.4]{backus78}:
+A state machine is a fold~\cite[Sec.\,11.2.4]{backus78} over an event stream:
 \begin{align}
 \mathit{machine} &= /\mathit{transition} : \langle e_1, \ldots, e_n \rangle \label{eq:sm} \\
 \mathit{transition} &= (p \to \bar{s'} ;\; \mathit{id}) \label{eq:trans}
 \end{align}
+The fold ($/$) applies each event in sequence, accumulating the state. Each transition checks a condition ($p$). If the condition holds, the state changes to $s'$. If not, the state is unchanged ($\mathit{id}$). The fold is pure replay. Applying the event stream to a machine produces the current state without side effects, and no entry verbs or callbacks execute. This is restoration of a hibernating machine. Only a new event, not yet in the stream, causes a real transition where the entry verb fires and effects are produced.
 
 Deletion is a transition to a terminal state, not a distinct primitive. The entity receives $\mathit{delete}$ as the operation. It reaches a state with no outgoing transitions and is excluded from query results by restriction~(\ref{eq:restrict}).
 
 \subsection{Platform Binding}
 
-The runtime registers functions into $\mathit{DEFS}$ via $\downarrow\!\mathit{DEFS}$. A browser runtime registers rendering functions. A server runtime registers $\mathit{httpFetch}$, $\mathit{upsert}$, $\mathit{notify}$. The fact is the FFP object. The registered function is the operand. $\rho$ resolves the fact to a functional form that knows its schema and applies the function to its own data:
+The runtime registers functions into $\mathit{DEFS}$ via $\downarrow\!\mathit{DEFS}$. A browser runtime registers rendering functions, and a server runtime registers $\mathit{httpFetch}$, $\mathit{upsert}$, and $\mathit{notify}$. In practice, metacomposition~(\ref{eq:metacomp}) looks like this:
 \begin{align*}
 (\rho\,\mathit{fact})\!:\!\mathit{render} &\to \mathit{widget} \\
 (\rho\,\mathit{fact})\!:\!\mathit{httpFetch} &\to \mathit{response} \\
 (\rho\,\mathit{fact})\!:\!\mathit{upsert} &\to D'
 \end{align*}
-
-The fact drives the application. The function is passed to the fact, not the fact to the function. In $\lambda$-calculus terms, a fact is $\lambda f.\, f(\mathit{data})$. This follows from metacomposition~(\ref{eq:metacomp}): the fact's type (its first element) determines the functional form, and $\rho$ resolves it from $\mathit{DEFS}$.
-
-Runtime functions that interact with external state (e.g.\ $\mathit{httpFetch}$) execute during $\mathit{resolve}$~(\ref{eq:create}), populating cells before $\mathit{derive}$ runs. Functions that consume the representation (e.g.\ $\mathit{render}$) execute after $\mathit{emit}$. This keeps $\mathit{derive}$ pure, monotonic, and terminating over $P$. The engine does not know which runtime it serves. It applies $\rho$ to facts, and the registered functions determine the effect. A single $\mathit{SYSTEM}$ serves browser, server, and storage runtimes by varying $\mathit{DEFS}$, not by varying the logic. Because the binding is via $\rho$, it is live. When a cell's contents change via $\downarrow$, the $\rho$-application re-evaluates and the bound function fires. Event streaming is not a separate subscription mechanism. It is the re-evaluation of $\rho$ over updated $D$.
+The fact receives a function and applies it to its own objects. Runtime functions that interact with external state execute during $\mathit{resolve}$~(\ref{eq:create}), populating cells before $\mathit{derive}$ runs, and functions that consume the representation execute after $\mathit{emit}$. This keeps $\mathit{derive}$ pure, monotonic, and terminating over $P$. A single $\mathit{SYSTEM}$ serves browser, server, and storage runtimes by varying $\mathit{DEFS}$, not by varying the logic. Because the binding is via $\rho$, it is live: when a cell's contents change via $\downarrow$, the $\rho$-application re-evaluates and the bound function fires, making event streaming the re-evaluation of $\rho$ over updated $D$ rather than a separate subscription mechanism.
 
 \section{Example}
 
@@ -260,7 +256,7 @@ Theorems~\ref{thm:complete}--\ref{thm:derive} hold under Definition~\ref{def:iso
 
 \subsection{Distributed Evaluation}
 
-The event stream $E$ is demultiplexed into per-cell streams by RMAP~\cite[Ch.\,17]{halpin08}:
+Each cell from Sec.\,4.2 stores the 3NF row, including the state machine's current status as one of its facts. The event stream $E$ is demultiplexed into per-cell streams by RMAP~\cite[Ch.\,17]{halpin08}:
 \begin{align}
 E_n &= \mathit{Filter}(\mathit{eq} \circ [\mathit{RMAP}, \bar{n}]) : E \label{eq:demux}
 \end{align}
@@ -274,7 +270,7 @@ where $\mu_n$ is $\mathit{SYSTEM}$ restricted to cell $n$. By Definition~\ref{de
 P &= \textstyle\bigcup_n \uparrow\!\mathit{FILE}\!:\!D_n \label{eq:pop}
 \end{align}
 
-The router distributes events via $\alpha\,\mathit{RMAP}$~(apply-to-all). Each cell reduces its partition via $/\mu_n$~(insert). Adding cells to the cluster scales $\mathit{SYSTEM}$ horizontally without changing its definition.
+The router distributes events via $\alpha\,\mathit{RMAP}$~(apply-to-all), and each cell reduces its partition via $/\mu_n$~(insert). Adding cells to the cluster scales $\mathit{SYSTEM}$ horizontally without changing its definition.
 
 \section{Properties}
 
@@ -354,14 +350,14 @@ Let $s_{\mathit{del}}$ be a state with no outgoing transitions in $T$. Then $\ma
 \end{corollary}
 
 \begin{theorem}[Derivability]\label{thm:derive}
-Define the \emph{representation} of an entity $e$ with status $s$ in population $P$ under schema $S$ as:
+Define the \emph{representation} of an entity $e$ in population $P$ under schema $S$ as:
 \begin{align*}
-\mathit{repr}(e, s, P, S) = \;&\{(\rho\,s_i)\!:\!f \mid f \in P,\, f \text{ involves } e\} \\
+\mathit{repr}(e, P, S) = \;&\{(\rho\,s_i)\!:\!f \mid f \in P,\, f \text{ involves } e\} \\
 \cup\; &\{(\rho\,r)\!:\!P \mid r \in S_{\mathit{derivations}}\} \\
 \cup\; &\{(\rho\,c)\!:\!P \mid c \in S_{\mathit{constraints}}\} \\
-\cup\; &\mathit{links}(s)
+\cup\; &\mathit{links}(\mathit{status}(e, P))
 \end{align*}
-Then for every $v \in \mathit{repr}(e, s, P, S)$, there exists $f \in O$ such that $v = (\rho\,f)\!:\!P$.
+where $\mathit{status}(e, P)$ is the current status of $e$, a fact in $P$ (absorbed into the entity's cell by RMAP). Then for every $v \in \mathit{repr}(e, P, S)$, there exists $f \in O$ such that $v = (\rho\,f)\!:\!P$.
 \end{theorem}
 
 \begin{proof}
