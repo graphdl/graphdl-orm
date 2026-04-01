@@ -1001,10 +1001,11 @@ async function handleArestRoute(request: Request, env: Env) {
   const url = new URL(request.url)
   const userEmail = request.headers.get('x-user-email') || ''
 
-  // Load organizations domain IR for constraint graph
+  // Load domain IR for constraint graph (default: organizations)
   const registryDO = getRegistryDO(env, 'global') as any
-  try { await loadDomainSchema(registryDO, (id: string) => getEntityDO(env, id) as any, 'organizations') } catch {}
-  const irCell = await (getEntityDO(env, 'ir:organizations') as any).get().catch(() => null)
+  const irDomain = url.searchParams.get('ir_domain') || 'organizations'
+  try { await loadDomainSchema(registryDO, (id: string) => getEntityDO(env, id) as any, irDomain) } catch {}
+  const irCell = await (getEntityDO(env, `ir:${irDomain}`) as any).get().catch(() => null)
   const irRaw = irCell?.data?.ir
   const ir = irRaw
     ? JSON.parse(typeof irRaw === 'string' ? irRaw : JSON.stringify(irRaw))
@@ -1014,12 +1015,14 @@ async function handleArestRoute(request: Request, env: Env) {
 
   // Debug: return IR shape if ?debug=ir
   if (url.searchParams.get('debug') === 'ir') {
-    const ucConstraints = (ir.constraints || []).filter((c: any) => c.kind === 'UC')
     return json({
       factTypeKeys: Object.keys(ir.factTypes || ir.fact_types || {}),
       constraintCount: (ir.constraints || []).length,
-      ucConstraints: ucConstraints.map((c: any) => ({ text: c.text, spans: c.spans })),
       nounKeys: Object.keys(ir.nouns || {}),
+      nounDetails: Object.fromEntries(
+        Object.entries(ir.nouns || {}).map(([k, v]: [string, any]) => [k, { objectType: v.objectType, backedBy: v.backedBy, superType: v.superType }])
+      ),
+      instanceFacts: (ir.generalInstanceFacts || []).length,
     })
   }
 

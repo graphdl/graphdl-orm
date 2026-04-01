@@ -1055,6 +1055,29 @@ mod tests {
     }
 
     #[test]
+    fn instance_fact_noun_uri() {
+        let input = "Noun is an entity type.\nURI is a value type.\n## Fact Types\nNoun has URI.\n## Instance Facts\nNoun 'API Product' has URI '/api'.";
+        let ir = parse_markdown(input).unwrap();
+        assert_eq!(ir.general_instance_facts.len(), 1);
+        let f = &ir.general_instance_facts[0];
+        eprintln!("subject_noun={} subject_value={} field_name={} object_noun={} object_value={}",
+            f.subject_noun, f.subject_value, f.field_name, f.object_noun, f.object_value);
+        assert_eq!(f.subject_noun, "Noun");
+        assert_eq!(f.subject_value, "API Product");
+        assert_eq!(f.object_value, "/api");
+    }
+
+    #[test]
+    fn backed_by_subtype() {
+        let input = "API(.Slug) is an entity type.\nAPI Product(.Slug) is an entity type.\nAPI Product is a subtype of API.\nExternal System(.Name) is an entity type.\nAPI Product is backed by External System.";
+        let ir = parse_markdown(input).unwrap();
+        assert_eq!(ir.nouns["API Product"].backed_by.as_deref(), Some("External System"),
+            "Subtype noun should have backed_by");
+        assert!(ir.nouns["API"].backed_by.is_none(),
+            "Supertype should not inherit backed_by");
+    }
+
+    #[test]
     fn not_backed_by_without_external_system() {
         let input = "Customer(.Name) is an entity type.\nOrder(.Id) is an entity type.\nCustomer places Order.";
         let ir = parse_markdown(input).unwrap();

@@ -6,6 +6,7 @@ Organization(.Slug) is an entity type.
 App(.Slug) is an entity type.
 Domain(.Slug) is an entity type.
 User(.Email) is an entity type.
+External System(.Name) is an entity type.
 
 ## Value Types
 

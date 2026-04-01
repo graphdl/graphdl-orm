@@ -92,9 +92,21 @@ async function resolveExternalSystem(data: FactData): Promise<{
     ? await data.env.getStub(systemName).get().catch(() => null)
     : null
 
-  // 3. Look up the noun's URI
-  const nounEntity = await data.env.getStub(data.noun).get().catch(() => null)
-  const uri = nounEntity?.data?.uri || `/${encodeURIComponent(data.noun)}`
+  // 3. Resolve the noun's URI from the IR instance facts.
+  // The readings declare: Noun 'API Product' has URI '/api'.
+  // Parsed as GeneralInstanceFact: { subjectNoun: "Noun", subjectValue: "API Product", fieldName: "uri", objectValue: "/api" }
+  let uri = `/${encodeURIComponent(data.noun)}`
+  const irCell = await data.env.getStub(`ir:${data.domain}`).get().catch(() => null)
+  if (irCell?.data?.ir) {
+    const ir = typeof irCell.data.ir === 'string' ? JSON.parse(irCell.data.ir) : irCell.data.ir
+    const nounUriFact = (ir.generalInstanceFacts || []).find(
+      (f: any) => f.subjectNoun === 'Noun' && f.subjectValue === data.noun
+        && (f.fieldName === 'uri' || f.fieldName === 'URI')
+    )
+    if (nounUriFact?.objectValue) {
+      uri = nounUriFact.objectValue
+    }
+  }
 
   // 4. Resolve secret
   const secret = systemName
@@ -111,7 +123,8 @@ async function resolveExternalSystem(data: FactData): Promise<{
 }
 
 async function resolveExternal(data: FactData, page: number, limit: number): Promise<SystemOutput> {
-  const { baseUrl, secret, authHeader, authPrefix, uri } = await resolveExternalSystem(data)
+  const ext = await resolveExternalSystem(data)
+  const { baseUrl, secret, authHeader, authPrefix, uri } = ext
 
   const fetchUrl = baseUrl
     ? `${baseUrl}${uri}?page=${page}&limit=${limit}`
@@ -178,24 +191,33 @@ async function resolveLocalDetail(data: FactData): Promise<SystemOutput> {
 }
 
 async function resolveExternalDetail(data: FactData): Promise<SystemOutput> {
-  const { baseUrl, secret, authHeader, authPrefix, uri } = await resolveExternalSystem(data)
+  const { baseUrl, secret, authHeader, authPrefix } = await resolveExternalSystem(data)
 
-  const fetchUrl = baseUrl
-    ? `${baseUrl}${uri}/${encodeURIComponent(data.id || '')}`
-    : null
+  // First, fetch the local entity to get its endpoint path and other metadata
+  const localCell = await data.env.getStub(data.id || '').get().catch(() => null)
+  const endpointPath = localCell?.data?.endpointPath || localCell?.endpointPath
 
-  const headers: Record<string, string> = { Accept: 'application/json' }
-  const combined = [authPrefix, secret].filter(Boolean).join(' ')
-  combined && authHeader && (headers[authHeader] = combined)
+  // If the entity has an endpoint path, fetch live data from the backing service
+  if (baseUrl && endpointPath) {
+    const headers: Record<string, string> = { Accept: 'application/json' }
+    const combined = [authPrefix, secret].filter(Boolean).join(' ')
+    if (combined && authHeader) headers[authHeader] = combined
 
-  const response = fetchUrl
-    ? await fetch(fetchUrl, { headers }).catch(() => null)
-    : null
+    const fetchUrl = `${baseUrl}${endpointPath}`
+    const response = await fetch(fetchUrl, { headers }).catch(() => null)
+    const raw = response?.ok ? await response.json().catch(() => null) : null
 
-  const raw = response?.ok ? await response.json().catch(() => null) : null
-  return raw
-    ? { status: 200, body: { id: raw.id || data.id, type: data.noun, ...raw } }
-    : { status: 404, body: { errors: [{ message: 'Not found in External System' }] } }
+    if (raw) {
+      // Merge live data with local entity metadata
+      const merged = { id: data.id, type: data.noun, ...(localCell?.data || {}), _live: raw }
+      return { status: 200, body: merged }
+    }
+  }
+
+  // Fall back to local entity
+  return localCell
+    ? { status: 200, body: { id: localCell.id, type: localCell.type, ...localCell.data } }
+    : { status: 404, body: { errors: [{ message: 'Not found' }] } }
 }
 
 // ── Operations ──────────────────────────────────────────────────────
@@ -209,8 +231,9 @@ async function resolveExternalDetail(data: FactData): Promise<SystemOutput> {
 const read: Operation = async (data) => {
   const page = parseInt(data.params.page || '1')
   const limit = parseInt(data.params.limit || '100')
-  const resolve = data.backedBy ? resolveExternal : resolveLocal
-  return resolve(data, page, limit)
+  // List always resolves locally. Entities are seeded from readings.
+  // Federation applies at the detail level (resolveExternalDetail).
+  return resolveLocal(data, page, limit)
 }
 
 const readDetail: Operation = async (data) => {

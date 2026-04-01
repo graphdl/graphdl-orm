@@ -774,15 +774,30 @@ fn emit_entities(ir: &types::ConstraintIR, domain: &str) -> Result<JsValue, JsVa
     // /merge : α key_by : instance_facts  (fold groups, then map to entities)
     // Metamodel entities (Noun, Domain, etc.) use just the name as ID.
     // Domain entities use compound IDs (Type:value) to avoid collisions.
-    let metamodel_types = ["Noun", "Domain", "External System", "State Machine Definition"];
+    //
+    // Subtype absorption (DO equivalent of RMAP step 3):
+    // Supertype facts are absorbed into the subtype entity.
+    // Built as a ρ-lookup map, not procedural iteration.
+    let metamodel_types: std::collections::HashSet<&str> = ["Noun", "Domain", "External System", "State Machine Definition"]
+        .iter().copied().collect();
+
+    // ρ-lookup: supertype name → subtype name (absorb toward subtype)
+    let absorption: HashMap<&str, &str> = ir.nouns.iter()
+        .filter_map(|(name, noun)| noun.super_type.as_ref().map(|st| (st.as_str(), name.as_str())))
+        .collect();
+
+    // Resolve entity ID: absorb supertype IDs into subtype IDs via ρ-lookup
+    let resolve_id = |fact: &types::GeneralInstanceFact| -> String {
+        let raw_id = metamodel_types.get(fact.subject_noun.as_str())
+            .map(|_| fact.subject_value.clone())
+            .unwrap_or_else(|| format!("{}:{}", fact.subject_noun, fact.subject_value));
+        absorption.get(fact.subject_noun.as_str())
+            .map(|subtype| format!("{}:{}", subtype, fact.subject_value))
+            .unwrap_or(raw_id)
+    };
+
     let instance_entities = ir.general_instance_facts.iter()
-        .map(|fact| {
-            let id = metamodel_types.iter()
-                .find(|&&t| t == fact.subject_noun)
-                .map(|_| fact.subject_value.clone())
-                .unwrap_or_else(|| format!("{}:{}", fact.subject_noun, fact.subject_value));
-            (id, fact)
-        })
+        .map(|fact| (resolve_id(fact), fact))
         .fold(HashMap::<String, serde_json::Map<String, serde_json::Value>>::new(), |mut acc, (id, fact)| {
             let data = acc.entry(id).or_insert_with(|| {
                 let mut m = serde_json::Map::new();
