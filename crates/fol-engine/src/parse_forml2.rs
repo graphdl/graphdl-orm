@@ -237,7 +237,7 @@ fn parse_into(ir: &mut ConstraintIR, input: &str) -> Result<(), String> {
         }
     }
 
-    // Pass 2: α(recognize_reading) : lines — fact types, constraints, derivations
+    // Pass 2a: collect fact types and instance facts
     // Sorted longest-first for Theorem 1 (unambiguous longest-first matching)
     let mut noun_names: Vec<String> = ir.nouns.keys().cloned().collect();
     noun_names.sort_by(|a, b| b.len().cmp(&a.len()));
@@ -246,7 +246,7 @@ fn parse_into(ir: &mut ConstraintIR, input: &str) -> Result<(), String> {
         let line = lines[i].trim();
         if line.is_empty() { continue; }
 
-        // Skip lines already handled in pass 1
+        // Skip pass 1 lines
         let is_pass1 = try_entity_type(line).is_some()
             || try_value_type(line).is_some()
             || (try_subtype(line).is_some() && !line.starts_with("Each"))
@@ -256,7 +256,61 @@ fn parse_into(ir: &mut ConstraintIR, input: &str) -> Result<(), String> {
             || try_exclusive_subtypes(line).is_some()
             || try_association(line).is_some()
             || try_header(line).is_some();
+        if is_pass1 { continue; }
 
+        // Skip lines that belong to Pass 2b (constraints, derivations, deontic)
+        // Preserves the original recognizer priority: these recognizers fire before try_fact_type
+        let is_pass2b = try_derivation(line).is_some()
+            || try_deontic(line).is_some()
+            || try_constraint(line, &noun_names).is_some()
+            || try_totality(line).is_some();
+        if is_pass2b { continue; }
+
+        // Only collect fact types and instance facts in this sub-pass
+        if let Some(action) = try_fact_type(line, &noun_names) {
+            apply_action(ir, Some(action), &lines, i);
+        } else if let Some(action) = try_instance_fact(line) {
+            apply_action(ir, Some(action), &lines, i);
+        }
+    }
+
+    // Build schema catalog from collected fact types
+    let catalog = {
+        let mut cat = SchemaCatalog::new();
+        for (schema_id, ft) in &ir.fact_types {
+            let role_nouns: Vec<&str> = ft.roles.iter().map(|r| r.noun_name.as_str()).collect();
+            // Extract verb from reading: text between first and last noun
+            let verb = ft.roles.first()
+                .and_then(|r0| {
+                    let after = ft.reading.find(&r0.noun_name)
+                        .map(|i| &ft.reading[i + r0.noun_name.len()..]);
+                    after.map(|a| {
+                        ft.roles.last()
+                            .and_then(|r1| a.find(&r1.noun_name).map(|j| a[..j].trim()))
+                            .unwrap_or(a.trim())
+                    })
+                })
+                .unwrap_or("");
+            cat.register(schema_id, &role_nouns, verb);
+        }
+        cat
+    };
+
+    // Pass 2b: constraints and derivations (with catalog)
+    for i in 0..lines.len() {
+        let line = lines[i].trim();
+        if line.is_empty() { continue; }
+
+        // Skip pass 1 lines
+        let is_pass1 = try_entity_type(line).is_some()
+            || try_value_type(line).is_some()
+            || (try_subtype(line).is_some() && !line.starts_with("Each"))
+            || try_abstract(line).is_some()
+            || try_partition(line).is_some()
+            || try_enum_values(line).is_some()
+            || try_exclusive_subtypes(line).is_some()
+            || try_association(line).is_some()
+            || try_header(line).is_some();
         if is_pass1 { continue; }
 
         // Totality → mark abstract (but don't skip — still parse as constraint)
@@ -264,22 +318,32 @@ fn parse_into(ir: &mut ConstraintIR, input: &str) -> Result<(), String> {
             apply_action(ir, Some(action), &lines, i);
         }
 
+        // Try recognizers in original priority order.
+        // Derivations, deontic, and constraints have priority over fact types.
         let action = None
             .or_else(|| try_derivation(line))
             .or_else(|| try_deontic(line))
-            .or_else(|| try_constraint(line, &noun_names))
-            .or_else(|| try_fact_type(line, &noun_names))
-            .or_else(|| try_instance_fact(line));
+            .or_else(|| try_constraint(line, &noun_names));
+
+        // If no constraint/derivation/deontic matched, this line was already
+        // handled in Pass 2a (fact type or instance fact). Skip it.
+        let Some(action) = action else { continue; };
 
         // Split "exactly one" constraints into UC + MC
         match &action {
-            Some(ParseAction::AddConstraint(c)) if line.contains("exactly one") => {
-                let mut uc = c.clone(); uc.kind = "UC".into();
-                let mut mc = c.clone(); mc.kind = "MC".into();
+            ParseAction::AddConstraint(c) if line.contains("exactly one") => {
+                let mut uc = resolve_constraint_schema(c.clone(), &noun_names, &catalog);
+                uc.kind = "UC".into();
+                let mut mc = resolve_constraint_schema(c.clone(), &noun_names, &catalog);
+                mc.kind = "MC".into();
                 ir.constraints.push(uc);
                 ir.constraints.push(mc);
             }
-            _ => { apply_action(ir, action, &lines, i); }
+            ParseAction::AddConstraint(c) => {
+                let resolved = resolve_constraint_schema(c.clone(), &noun_names, &catalog);
+                ir.constraints.push(resolved);
+            }
+            _ => { apply_action(ir, Some(action), &lines, i); }
         }
     }
 
@@ -478,6 +542,76 @@ fn graph_schema_id(role_nouns: &[&str], verb: &str) -> String {
     let mut parts = vec![role_nouns[0], &verb_part];
     parts.extend(&role_nouns[1..]);
     parts.join("_")
+}
+
+/// Schema catalog for ρ-lookup: noun set → Graph Schema ID.
+/// The noun set is the key. The catalog is the DEFS cell.
+struct SchemaCatalog {
+    /// Sorted noun set → vec of (schema_id, verb) for disambiguation
+    by_noun_set: HashMap<Vec<String>, Vec<(String, String)>>,
+}
+
+impl SchemaCatalog {
+    fn new() -> Self {
+        SchemaCatalog { by_noun_set: HashMap::new() }
+    }
+
+    fn register(&mut self, schema_id: &str, role_nouns: &[&str], verb: &str) {
+        let mut key: Vec<String> = role_nouns.iter().map(|n| {
+            let (base, _) = parse_role_token(n);
+            base.to_lowercase()
+        }).collect();
+        key.sort();
+        self.by_noun_set
+            .entry(key)
+            .or_default()
+            .push((schema_id.to_string(), verb.to_lowercase()));
+    }
+
+    fn resolve(&self, role_nouns: &[&str], verb: Option<&str>) -> Option<String> {
+        let mut key: Vec<String> = role_nouns.iter().map(|n| {
+            let (base, _) = parse_role_token(n);
+            base.to_lowercase()
+        }).collect();
+        key.sort();
+        let entries = self.by_noun_set.get(&key)?;
+        entries
+            .iter()
+            .find(|(_, v)| verb.map_or(entries.len() == 1, |vb| v == &vb.to_lowercase()))
+            .map(|(id, _)| id.clone())
+    }
+}
+
+/// Resolve a constraint's span fact_type_ids through the schema catalog.
+fn resolve_constraint_schema(
+    mut constraint: ConstraintDef,
+    noun_names: &[String],
+    catalog: &SchemaCatalog,
+) -> ConstraintDef {
+    // Extract nouns from the constraint text to find the target schema
+    let stripped = constraint.text
+        .replace("Each ", "").replace("each ", "")
+        .replace("at most one ", "").replace("exactly one ", "")
+        .replace("at least one ", "").replace("some ", "")
+        .replace("No ", "").replace("no ", "");
+    let found = find_nouns(&stripped, noun_names);
+
+    if found.len() >= 2 {
+        let role_nouns: Vec<&str> = found.iter().map(|(_, _, n)| n.as_str()).collect();
+        // Extract verb between first two nouns
+        let verb_text = stripped[found[0].1..found[1].0].trim();
+        let verb = if verb_text.is_empty() { None } else { Some(verb_text) };
+
+        if let Some(schema_id) = catalog.resolve(&role_nouns, verb)
+            .or_else(|| catalog.resolve(&role_nouns, None))
+        {
+            // Update all spans to reference the resolved schema ID
+            for span in &mut constraint.spans {
+                span.fact_type_id = schema_id.clone();
+            }
+        }
+    }
+    constraint
 }
 
 /// Parse a role token into (base_noun_name, full_token_with_subscript).
@@ -961,5 +1095,59 @@ mod tests {
         assert_eq!(ft.reading, "User owns Organization");
         assert_eq!(ft.readings.len(), 1);
         assert_eq!(ft.readings[0].role_order, vec![0, 1]);
+    }
+
+    #[test]
+    fn schema_catalog_resolves_by_noun_set() {
+        let mut catalog = SchemaCatalog::new();
+        catalog.register("User_owns_Organization", &["User", "Organization"], "owns");
+        catalog.register("User_administers_Organization", &["User", "Organization"], "administers");
+        catalog.register("Domain_belongs_to_App", &["Domain", "App"], "belongs to");
+
+        // Single match by noun set
+        assert_eq!(
+            catalog.resolve(&["Domain", "App"], None),
+            Some("Domain_belongs_to_App".to_string())
+        );
+        // Ambiguous noun set, disambiguate by verb
+        assert_eq!(
+            catalog.resolve(&["User", "Organization"], Some("owns")),
+            Some("User_owns_Organization".to_string())
+        );
+        assert_eq!(
+            catalog.resolve(&["User", "Organization"], Some("administers")),
+            Some("User_administers_Organization".to_string())
+        );
+        // Reverse order still resolves
+        assert_eq!(
+            catalog.resolve(&["App", "Domain"], None),
+            Some("Domain_belongs_to_App".to_string())
+        );
+        // No match
+        assert_eq!(
+            catalog.resolve(&["Foo", "Bar"], None),
+            None
+        );
+    }
+
+    #[test]
+    fn inverse_reading_constraint_resolves_to_schema() {
+        let input = "# test\n\
+            ## Entity Types\n\
+            User(.Name) is an entity type.\n\
+            Organization(.Name) is an entity type.\n\
+            ## Fact Types\n\
+            User owns Organization.\n\
+            ## Constraints\n\
+            Each Organization is owned by at most one User.\n";
+        let ir = parse_markdown(input).unwrap();
+        // Fact type keyed by Graph Schema ID
+        assert!(ir.fact_types.contains_key("User_owns_Organization"));
+        assert!(!ir.fact_types.contains_key("User owns Organization"));
+        // The constraint's spans should reference the same schema ID
+        assert!(!ir.constraints.is_empty());
+        let c = &ir.constraints[0];
+        assert_eq!(c.spans[0].fact_type_id, "User_owns_Organization",
+            "Constraint span should reference Graph Schema ID, not reading text");
     }
 }
