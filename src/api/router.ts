@@ -7,6 +7,7 @@ import { handleEvaluate, handleSynthesize } from './evaluate'
 import { handleListEntities, handleGetEntity, handleCreateEntity, handleDeleteEntity, buildEntityLinks } from './entity-routes'
 import { loadDomainSchema, loadDomainAndPopulation, buildPopulation, getTransitions, applyCommand, querySchema, forwardChain, getNounSchemas, evaluateAccess, deriveViewMetadata, deriveNavContext, getTopLevelNouns, computeRMAP } from './engine'
 import { system } from './system'
+import { handleArestRequest } from './arest-router'
 
 // ── Collection slug → noun type resolution ───────────────────────────
 // Resolved dynamically from the Registry via nounToSlug convention.
@@ -1007,6 +1008,57 @@ router.delete('/api/reset', async (request, env: Env, ctx: ExecutionContext) => 
       cleanupScheduled: entityCount > 0,
     },
   })
+})
+
+// ── HATEOAS API: /arest/ routes ─────────────────────────────────────
+// All /arest/ paths resolve against the constraint graph derived from IR.
+// This is additive — the old /api/ routes remain untouched.
+
+async function handleArestRoute(request: Request, env: Env) {
+  const url = new URL(request.url)
+  const userEmail = request.headers.get('x-user-email') || ''
+
+  // Load organizations domain IR for constraint graph
+  const registryDO = getRegistryDO(env, 'global') as any
+  try { await loadDomainSchema(registryDO, (id: string) => getEntityDO(env, id) as any, 'organizations') } catch {}
+  const irCell = await (getEntityDO(env, 'ir:organizations') as any).get().catch(() => null)
+  const irRaw = irCell?.data?.ir
+  const ir = irRaw
+    ? JSON.parse(typeof irRaw === 'string' ? irRaw : JSON.stringify(irRaw))
+    : null
+
+  if (!ir) return json({ error: 'No schema loaded' }, { status: 500 })
+
+  // Build population for root resource (needed to resolve org memberships)
+  let population = { facts: {} as Record<string, any[]> }
+  if (url.pathname === '/arest/' || url.pathname === '/arest') {
+    try {
+      const popJson = await buildPopulation(registryDO, (id: string) => getEntityDO(env, id) as any, 'organizations')
+      try { forwardChain(popJson) } catch {}
+      population = JSON.parse(popJson)
+    } catch {}
+  }
+
+  const result = await handleArestRequest({
+    path: url.pathname,
+    method: request.method,
+    ir,
+    registry: registryDO,
+    getStub: (id: string) => getEntityDO(env, id) as any,
+    userEmail,
+    population,
+  })
+
+  if (!result) return error(404, { errors: [{ message: 'Not Found' }] })
+  return json(result)
+}
+
+router.get('/arest', async (request, env: Env) => {
+  return handleArestRoute(request, env)
+})
+
+router.get('/arest/*', async (request, env: Env) => {
+  return handleArestRoute(request, env)
 })
 
 // ── 404 fallback ─────────────────────────────────────────────────────
