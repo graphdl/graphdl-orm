@@ -41,14 +41,14 @@ export function deriveLinks(input: DeriveLinksInput): Record<string, LinkEntry> 
     links.create = { href: basePath, method: 'POST' }
   }
 
-  // Build UC index: factTypeId -> constrained role index
+  // Build UC index: factTypeId -> constrained role index (first span only)
+  // UC "Each X verb at most one Y" constrains X (first noun, span[0])
   const ucIndex = new Map<string, number>()
   ;(ir.constraints || [])
     .filter((c: any) => c.kind === 'UC')
     .forEach((c: any) => {
-      ;(c.spans || []).forEach((span: any) => {
-        ucIndex.set(span.factTypeId, span.roleIndex)
-      })
+      const span = (c.spans || [])[0]
+      if (span) ucIndex.set(span.factTypeId, span.roleIndex)
     })
 
   // Project links from binary fact types involving this noun
