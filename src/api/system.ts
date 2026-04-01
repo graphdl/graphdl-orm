@@ -6,6 +6,8 @@
  * The entity decides how, not the router.
  */
 
+import { loadDomainSchema, buildPopulation, forwardChain } from './engine'
+
 // ── Types ───────────────────────────────────────────────────────────
 
 /** A fact is λf. f(data). It receives a function and applies it to itself. */
@@ -73,26 +75,54 @@ async function resolveLocal(data: FactData, page: number, limit: number): Promis
   }
 }
 
-async function resolveExternal(data: FactData, page: number, limit: number): Promise<SystemOutput> {
-  const systemIds: string[] = await data.env.registry.getEntityIds('External System', 'core').catch(() => [])
-  const settled = await Promise.allSettled(
-    systemIds.map(async (id: string) => {
-      const cell = await data.env.getStub(id).get()
-      return cell ? { id: cell.id, ...cell.data } : null
-    }),
-  )
-  const systemEntity = settled
-    .filter((r): r is PromiseFulfilledResult<any> => r.status === 'fulfilled' && r.value !== null)
-    .map((r) => r.value)
-    .find((s: any) => s.name === data.backedBy)
+async function resolveExternalSystem(data: FactData): Promise<{
+  baseUrl: string | null
+  secret: string | null
+  authHeader: string | null
+  authPrefix: string | null
+  uri: string
+}> {
+  // 1. Find which External System this domain is connected to
+  const domainSecretsDO = data.env.getStub(`domain-secrets:${data.domain}`)
+  const connectedSystems: string[] = await domainSecretsDO.connectedSystems().catch(() => [])
+  const systemName = connectedSystems[0] || ''
 
-  const baseUrl = systemEntity?.baseUrl
-  const fetchUrl = baseUrl
-    ? `${baseUrl}/${encodeURIComponent(data.noun)}?page=${page}&limit=${limit}`
+  // 2. Look up the system entity for base URL and auth config
+  const systemCell = systemName
+    ? await data.env.getStub(systemName).get().catch(() => null)
     : null
 
+  // 3. Look up the noun's URI
+  const nounEntity = await data.env.getStub(data.noun).get().catch(() => null)
+  const uri = nounEntity?.data?.uri || `/${encodeURIComponent(data.noun)}`
+
+  // 4. Resolve secret
+  const secret = systemName
+    ? await domainSecretsDO.resolveSystemSecret(systemName).catch(() => null)
+    : null
+
+  return {
+    baseUrl: systemCell?.data?.url || systemCell?.data?.baseUrl || null,
+    secret,
+    authHeader: systemCell?.data?.header || null,
+    authPrefix: systemCell?.data?.prefix || null,
+    uri,
+  }
+}
+
+async function resolveExternal(data: FactData, page: number, limit: number): Promise<SystemOutput> {
+  const { baseUrl, secret, authHeader, authPrefix, uri } = await resolveExternalSystem(data)
+
+  const fetchUrl = baseUrl
+    ? `${baseUrl}${uri}?page=${page}&limit=${limit}`
+    : null
+
+  const headers: Record<string, string> = { Accept: 'application/json' }
+  const combined = [authPrefix, secret].filter(Boolean).join(' ')
+  combined && authHeader && (headers[authHeader] = combined)
+
   const response = fetchUrl
-    ? await fetch(fetchUrl, { headers: { Accept: 'application/json' } }).catch(() => null)
+    ? await fetch(fetchUrl, { headers }).catch(() => null)
     : null
 
   const raw = response?.ok ? await response.json().catch(() => null) : null
@@ -117,33 +147,49 @@ async function resolveExternal(data: FactData, page: number, limit: number): Pro
   }
 }
 
+/**
+ * Build a derivation trace for the given entity.
+ * Loads the domain schema and population, runs the forward chainer,
+ * and filters derived facts to those involving this entity.
+ */
+async function buildTrace(
+  data: FactData,
+): Promise<Array<{ rule: string; reading: string; bindings: Array<[string, string]> }>> {
+  await loadDomainSchema(data.env.registry, data.env.getStub, data.domain)
+  const popJson = await buildPopulation(data.env.registry, data.env.getStub, data.domain)
+  const derived = forwardChain(popJson)
+  const entityId = data.id || ''
+  return derived
+    .filter(fact => fact.bindings.some(([, v]) => v === entityId))
+    .map(fact => ({ rule: fact.derivedBy, reading: fact.reading, bindings: fact.bindings }))
+}
+
 async function resolveLocalDetail(data: FactData): Promise<SystemOutput> {
   const cell = await data.env.getStub(data.id || '').get().catch(() => null)
+  const includeTrace = data.params.trace === 'true'
+
+  const trace = includeTrace
+    ? await buildTrace(data).catch(() => [])
+    : undefined
+
   return cell
-    ? { status: 200, body: { id: cell.id, type: cell.type, ...cell.data } }
+    ? { status: 200, body: { id: cell.id, type: cell.type, ...cell.data, ...(trace ? { _trace: trace } : {}) } }
     : { status: 404, body: { errors: [{ message: 'Not found' }] } }
 }
 
 async function resolveExternalDetail(data: FactData): Promise<SystemOutput> {
-  const systemIds: string[] = await data.env.registry.getEntityIds('External System', 'core').catch(() => [])
-  const settled = await Promise.allSettled(
-    systemIds.map(async (id: string) => {
-      const cell = await data.env.getStub(id).get()
-      return cell ? { id: cell.id, ...cell.data } : null
-    }),
-  )
-  const systemEntity = settled
-    .filter((r): r is PromiseFulfilledResult<any> => r.status === 'fulfilled' && r.value !== null)
-    .map((r) => r.value)
-    .find((s: any) => s.name === data.backedBy)
+  const { baseUrl, secret, authHeader, authPrefix, uri } = await resolveExternalSystem(data)
 
-  const baseUrl = systemEntity?.baseUrl
   const fetchUrl = baseUrl
-    ? `${baseUrl}/${encodeURIComponent(data.noun)}/${encodeURIComponent(data.id || '')}`
+    ? `${baseUrl}${uri}/${encodeURIComponent(data.id || '')}`
     : null
 
+  const headers: Record<string, string> = { Accept: 'application/json' }
+  const combined = [authPrefix, secret].filter(Boolean).join(' ')
+  combined && authHeader && (headers[authHeader] = combined)
+
   const response = fetchUrl
-    ? await fetch(fetchUrl, { headers: { Accept: 'application/json' } }).catch(() => null)
+    ? await fetch(fetchUrl, { headers }).catch(() => null)
     : null
 
   const raw = response?.ok ? await response.json().catch(() => null) : null

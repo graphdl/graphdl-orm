@@ -10,7 +10,7 @@
  * All logic lives in the Rust AST. This file is plumbing.
  */
 
-import { initSync, load_ir, evaluate_response, forward_chain_population, run_machine_wasm, query_schema_wasm, get_transitions_wasm, resolve_fact_event, prepare_entity, apply_command_wasm, debug_compiled_state, load_validation_model, validate_schema_wasm, project_entity_wasm, get_noun_schemas_wasm, parse_readings_wasm, rmap_wasm } from '../../crates/fol-engine/pkg/fol_engine.js'
+import { initSync, load_ir, evaluate_response, forward_chain_population, run_machine_wasm, query_schema_wasm, get_transitions_wasm, resolve_fact_event, prepare_entity, apply_command_wasm, debug_compiled_state, load_validation_model, validate_schema_wasm, project_entity_wasm, get_noun_schemas_wasm, parse_readings_wasm, parse_readings_with_nouns_wasm, rmap_wasm } from '../../crates/fol-engine/pkg/fol_engine.js'
 import wasmModule from '../../crates/fol-engine/pkg/fol_engine_bg.wasm'
 
 let wasmInitialized = false
@@ -58,40 +58,88 @@ export async function buildPopulation(
   getStub: (id: string) => any,
   domainSlug: string,
 ): Promise<string> {
+  // Build a lookup from (nounType, fieldName) → fact type reading ID.
+  // The IR has fact types like {id: "User has Org Role", roles: [{nounName: "User"}, {nounName: "Org Role"}]}.
+  // Entity fields are camelCase ("orgRole"). Role noun names are title case ("Org Role").
+  // We match by normalizing both to lowercase.
+  const irCell = await getStub(`ir:${domainSlug}`).get().catch(() => null)
+  const ir = irCell?.data?.ir
+    ? JSON.parse(typeof irCell.data.ir === 'string' ? irCell.data.ir : JSON.stringify(irCell.data.ir))
+    : null
+
+  const ftLookup = new Map<string, string>()
+  Object.entries(ir?.factTypes || {}).forEach(([ftId, ft]: [string, any]) => {
+    const firstRole = (ft.roles?.[0]?.nounName || '').toLowerCase()
+    // Index by (firstRole, eachRoleNoun)
+    ;(ft.roles || []).forEach((role: any) => {
+      ftLookup.set(`${firstRole}:${role.nounName.toLowerCase()}`, ftId)
+    })
+    // Also index by (firstRole, verb) extracted from the reading
+    // Reading format: "NounA verb NounB" → extract verb between first and second noun
+    const reading = (ft.reading || ftId) as string
+    const roles = (ft.roles || []) as Array<{ nounName: string }>
+    if (roles.length >= 2) {
+      const r = reading
+      const first = roles[0].nounName
+      const second = roles[roles.length - 1].nounName
+      const afterFirst = r.indexOf(first) >= 0 ? r.substring(r.indexOf(first) + first.length).trim() : ''
+      const beforeSecond = second && afterFirst.indexOf(second) >= 0 ? afterFirst.substring(0, afterFirst.indexOf(second)).trim() : afterFirst
+      const verb = beforeSecond.replace(/\.$/, '').trim()
+      ftLookup.set(`${firstRole}:${verb.toLowerCase()}`, ftId)
+    }
+  })
+
+  const resolveFactTypeId = (nounType: string, fieldName: string): string => {
+    // Try exact match: nounType + fieldName as role noun or verb (case-insensitive)
+    const key = `${nounType.toLowerCase()}:${fieldName.toLowerCase()}`
+    const match = ftLookup.get(key)
+    if (match) return match
+    // Fallback: try matching camelCase field to space-separated role name
+    const spaced = fieldName.replace(/([A-Z])/g, ' $1').trim()
+    const spacedKey = `${nounType.toLowerCase()}:${spaced.toLowerCase()}`
+    const spacedMatch = ftLookup.get(spacedKey)
+    if (spacedMatch) return spacedMatch
+    // Last fallback: legacy format
+    return `${nounType}_${fieldName}`
+  }
+
   // Get all entity IDs for this domain
   const counts = await registry.getEntityCounts(domainSlug) as Array<{ nounType: string; count: number }>
   const facts: Record<string, Array<{ factTypeId: string; bindings: Array<[string, string]> }>> = {}
 
-  for (const { nounType } of counts) {
-    const ids: string[] = await registry.getEntityIds(nounType, domainSlug)
-
-    // Fan out to read entity data
-    const entities = await Promise.allSettled(
-      ids.map(async (id) => {
-        const entity = await getStub(id).get()
-        return entity ? entity : null
-      }),
+  // Skip schema entities. Only domain entities contribute to the population.
+  const schemaTypes = new Set(['Noun', 'Reading', 'Graph Schema', 'Role', 'Constraint', 'CompiledSchema', 'Derivation Rule', 'State Machine Definition', 'Status', 'Transition', 'External System'])
+  const entitySettled = await Promise.allSettled(
+    counts.filter(({ nounType }) => !schemaTypes.has(nounType)).flatMap(({ nounType }) =>
+      registry.getEntityIds(nounType, domainSlug).then((ids: string[]) =>
+        Promise.allSettled(ids.map(async (id: string) => {
+          const entity = await getStub(id).get()
+          return entity ? { ...entity, nounType } : null
+        }))
+      )
     )
+  )
 
-    for (const result of entities) {
-      if (result.status !== 'fulfilled' || !result.value) continue
-      const entity = result.value
+  // Flatten and process all entities
+  entitySettled
+    .filter((r): r is PromiseFulfilledResult<any> => r.status === 'fulfilled')
+    .flatMap(r => r.value)
+    .filter((r: any): r is PromiseFulfilledResult<any> => r.status === 'fulfilled' && r.value)
+    .map((r: any) => r.value)
+    .forEach((entity: any) => {
+      Object.entries(entity.data || {}).forEach(([field, value]) => {
+        if (field.startsWith('_')) return
+        if (typeof value !== 'string' && typeof value !== 'number' && typeof value !== 'boolean') return
 
-      // For each data field, create a fact binding:
-      // fact_type = "NounType has FieldName", bindings = [(NounType, entityId), (FieldName, value)]
-      for (const [field, value] of Object.entries(entity.data || {})) {
-        if (field.startsWith('_')) continue // skip system fields
-        if (typeof value !== 'string' && typeof value !== 'number' && typeof value !== 'boolean') continue
-
-        const ftId = `${nounType}_${field}`
-        if (!facts[ftId]) facts[ftId] = []
-        facts[ftId].push({
+        const ftId = resolveFactTypeId(entity.nounType || entity.type, field)
+        const list = facts[ftId] || []
+        list.push({
           factTypeId: ftId,
-          bindings: [[nounType, entity.id], [field, String(value)]],
+          bindings: [[entity.nounType || entity.type, entity.id], [field, String(value)]],
         })
-      }
-    }
-  }
+        facts[ftId] = list
+      })
+    })
 
   return JSON.stringify({ facts })
 }
@@ -530,7 +578,21 @@ export function getTopLevelNouns(irJson: string): { topLevel: Set<string>; depen
 export function parseReadings(markdown: string, domain: string): Array<{ id: string; type: string; domain: string; data: Record<string, unknown> }> {
   ensureWasm()
   const result = parse_readings_wasm(markdown, domain)
-  // WASM returns JSON string — parse it
+  return typeof result === 'string' ? JSON.parse(result) : result
+}
+
+/**
+ * Parse readings with cross-domain noun context.
+ * Existing nouns from previously seeded domains are passed as JSON
+ * so the parser resolves cross-domain references.
+ */
+export function parseReadingsWithNouns(
+  markdown: string,
+  domain: string,
+  existingNounsJson: string,
+): Array<{ id: string; type: string; domain: string; data: Record<string, unknown> }> {
+  ensureWasm()
+  const result = parse_readings_with_nouns_wasm(markdown, domain, existingNounsJson)
   return typeof result === 'string' ? JSON.parse(result) : result
 }
 
@@ -740,102 +802,83 @@ export async function evaluateAccess(
   let derived: Array<{ factTypeId: string; reading: string; bindings: Array<[string, string]>; derivedBy: string }> = []
   try { derived = forwardChain(popJson) } catch {}
 
-  // Parse the population to read base facts.
+  // Parse population for reading-based fact type IDs.
   const pop = JSON.parse(popJson) as { facts: Record<string, Array<{ factTypeId: string; bindings: Array<[string, string]> }>> }
 
-  // Find User entity matching the authenticated email.
-  const userFacts = pop.facts['User_email'] || []
-  const userBinding = userFacts.find(f => f.bindings.some(([, v]) => v === userEmail))
-  const userId = userBinding?.bindings.find(([k]) => k === 'User')?.[1] || ''
+  // Helper: find binding value by noun name in a fact
+  const bindVal = (fact: { bindings: Array<[string, string]> }, noun: string) =>
+    fact.bindings.find(([k]) => k === noun)?.[1] || ''
 
-  // Extract org memberships from "User has Org Role in Organization" facts.
-  // The ternary is stored as two fields on the User entity: orgRole + organization.
-  const userOrgs: Array<{ orgId: string; orgName: string; orgSlug: string; role: string }> = []
-  const orgRoleFacts = pop.facts['User_orgRole'] || []
-  const orgMemberFacts = pop.facts['User_organization'] || []
+  // Find User entity matching the authenticated email
+  const userFacts = pop.facts['User_email'] || pop.facts['User has Email'] || []
+  const userId = bindVal(
+    userFacts.find(f => f.bindings.some(([, v]) => v === userEmail)) || { bindings: [] },
+    'User',
+  )
 
-  for (const roleFact of orgRoleFacts) {
-    const factUserId = roleFact.bindings.find(([k]) => k === 'User')?.[1]
-    if (factUserId !== userId) continue
-    const role = roleFact.bindings.find(([k]) => k === 'orgRole')?.[1] || ''
-
-    // Find matching organization binding for this user
-    const orgFact = orgMemberFacts.find(f => f.bindings.find(([k]) => k === 'User')?.[1] === userId)
-    const orgSlug = orgFact?.bindings.find(([k]) => k === 'organization')?.[1] || ''
-
-    // Look up the org name
-    const orgNameFacts = pop.facts['Organization_name'] || []
-    const orgNameFact = orgNameFacts.find(f => {
-      const orgId = f.bindings.find(([k]) => k === 'Organization')?.[1]
-      return orgId === orgSlug || (pop.facts['Organization_orgSlug'] || []).some(
-        sf => sf.bindings.find(([k]) => k === 'Organization')?.[1] === orgId
-          && sf.bindings.find(([k]) => k === 'orgSlug')?.[1] === orgSlug
-      )
-    })
-    const orgName = orgNameFact?.bindings.find(([k]) => k === 'name')?.[1] || orgSlug
-    const orgId = orgNameFact?.bindings.find(([k]) => k === 'Organization')?.[1] || orgSlug
-
-    userOrgs.push({ orgId, orgName, orgSlug, role })
+  // Extract org memberships from binary role fact types
+  const roleFactTypes = ['User owns Organization', 'User administers Organization', 'User belongs to Organization']
+  const roleMap: Record<string, string> = {
+    'User owns Organization': 'owner',
+    'User administers Organization': 'admin',
+    'User belongs to Organization': 'member',
   }
+  const userOrgs = roleFactTypes.flatMap(ftId =>
+    (pop.facts[ftId] || [])
+      .filter(f => bindVal(f, 'User') === userId)
+      .map(f => {
+        const orgId = bindVal(f, 'owns') || bindVal(f, 'administers') || bindVal(f, 'Organization') || ''
+        const orgNameFacts = pop.facts['Organization has Name'] || []
+        const orgName = bindVal(
+          orgNameFacts.find(nf => bindVal(nf, 'Organization') === orgId) || { bindings: [] },
+          'Name',
+        ) || orgId
+        return { orgId, orgName, orgSlug: orgId, role: roleMap[ftId] || 'member' }
+      })
+  )
 
-  // Accessible domains: all seeded domains with Visibility 'public' are accessible.
-  // The derivation rule "User accesses Domain if Domain has Visibility 'public'" handles this.
-  // Org-specific access comes from "User accesses Domain if User has Org Role in Organization
-  // and Domain belongs to that Organization."
+  // Accessible domains from derived facts or public visibility
   const accessibleDomains = new Set<string>()
   const allDomainSlugs = await registry.listDomains() as string[]
 
-  // Check derived "User accesses Domain" facts from forward chaining
-  for (const fact of derived) {
-    if (fact.factTypeId === 'User_accesses_Domain' || fact.reading?.includes('accesses Domain')) {
+  derived
+    .filter(fact => fact.factTypeId === 'User accesses Domain')
+    .forEach(fact => {
       const domain = fact.bindings.find(([k]: [string, string]) => k === 'Domain')?.[1]
-      if (domain) accessibleDomains.add(domain)
-    }
-  }
+      domain && accessibleDomains.add(domain)
+    })
 
-  // Fallback: if the forward chainer doesn't produce access facts yet,
-  // use public visibility from the population directly.
+  // Fallback: public visibility
   if (accessibleDomains.size === 0) {
-    for (const slug of allDomainSlugs) {
-      const visFacts = pop.facts['Domain_visibility'] || []
-      const domainVis = visFacts.find(f =>
-        f.bindings.find(([k]) => k === 'Domain')?.[1] === slug
-      )
-      const vis = domainVis?.bindings.find(([k]) => k === 'visibility')?.[1]
-      if (vis === 'public' || !domainVis) accessibleDomains.add(slug)
-    }
+    const visFacts = pop.facts['Domain has Visibility'] || []
+    allDomainSlugs.forEach(slug => {
+      const vis = visFacts.find(f => bindVal(f, 'Domain') === slug)
+      const visibility = vis ? bindVal(vis, 'Visibility') : null
+      if (visibility === 'public' || !vis) accessibleDomains.add(slug)
+    })
   }
 
-  // Visible apps: filter by user's org membership from base facts.
-  const appFacts = pop.facts['App_organization'] || []
-  const appNameFacts = pop.facts['App_name'] || []
-  const appSlugFacts = pop.facts['App_appSlug'] || []
-  const appNavFacts = pop.facts['App_navigableDomains'] || []
+  // Visible apps: filter by org membership
+  const appOrgFacts = pop.facts['App belongs to Organization'] || []
+  const appNameFacts = pop.facts['App has Name'] || []
+  const orgSlugs = new Set(userOrgs.map(uo => uo.orgSlug))
 
-  const visibleApps: Array<{ id: string; name: string; slug: string; organization: string; navigableDomains: string[] }> = []
-
-  for (const appOrgFact of appFacts) {
-    const appId = appOrgFact.bindings.find(([k]) => k === 'App')?.[1] || ''
-    const appOrg = appOrgFact.bindings.find(([k]) => k === 'organization')?.[1] || ''
-
-    // Check if user belongs to this app's organization
-    if (!userOrgs.some(uo => uo.orgId === appOrg || uo.orgName === appOrg || uo.orgSlug === appOrg)) continue
-
-    const name = appNameFacts.find(f => f.bindings.find(([k]) => k === 'App')?.[1] === appId)
-      ?.bindings.find(([k]) => k === 'name')?.[1] || appId
-    const slug = appSlugFacts.find(f => f.bindings.find(([k]) => k === 'App')?.[1] === appId)
-      ?.bindings.find(([k]) => k === 'appSlug')?.[1] || appId
-    // navigableDomains is an array, which the population builder skips.
-    // Read it from the entity cell directly.
-    let navDomains: string[] = []
-    try {
-      const appCell = await getStub(appId).get()
-      const nd = appCell?.data?.navigableDomains
-      navDomains = Array.isArray(nd) ? nd : (typeof nd === 'string' ? [nd] : [])
-    } catch {}
-
-    visibleApps.push({ id: appId, name, slug, organization: appOrg, navigableDomains: navDomains })
-  }
+  const visibleApps = await Promise.all(
+    appOrgFacts
+      .filter(f => orgSlugs.has(bindVal(f, 'Organization') || bindVal(f, 'belongs to')))
+      .map(async f => {
+        const appId = bindVal(f, 'App')
+        const name = bindVal(
+          appNameFacts.find(nf => bindVal(nf, 'App') === appId) || { bindings: [] },
+          'Name',
+        ) || appId
+        const appCell = await getStub(appId).get().catch(() => null)
+        const slug = appCell?.data?.appSlug || appCell?.data?.slug || appId
+        const nd = appCell?.data?.navigableDomains
+        const navDomains = Array.isArray(nd) ? nd : (typeof nd === 'string' ? [nd] : [])
+        return { id: appId, name, slug, organization: bindVal(f, 'Organization') || bindVal(f, 'belongs to'), navigableDomains: navDomains }
+      })
+  )
 
   return { accessibleDomains, userOrgs, visibleApps }
 }

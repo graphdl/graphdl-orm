@@ -132,10 +132,13 @@ fn try_instance_fact(line: &str) -> Option<ParseAction> {
 
 fn try_derivation(line: &str) -> Option<ParseAction> {
     // " if " mid-sentence is a derivation rule (Consequent if Antecedent).
-    // Lines starting with "If " are constraint/deontic, not derivations.
+    // Lines starting with "If ... then ..." are conditional derivation rules.
+    // Lines starting with "If " without " then " are constraints.
     let has_if = line.contains(" if ") && !line.starts_with("If ");
+    let is_conditional = line.starts_with("If ") && line.contains(" then ");
     let has_marker = line.contains(" iff ")
         || has_if
+        || is_conditional
         || line.contains(" is derived as ")
         || (line.starts_with("For each ") && line.contains(" = "))
         || line.contains("count each")
@@ -314,20 +317,42 @@ fn resolve_derivation_rule(rule: &mut DerivationRuleDef, ir: &ConstraintIR) {
         text.replace("that ", "")
     };
 
-    // Find the fact type whose role noun names match the nouns found in a text fragment.
+    // Find the fact type whose roles and verb match a text fragment.
+    // When multiple fact types share the same roles, the verb disambiguates.
     let resolve_fact_type = |fragment: &str| -> Option<String> {
         let cleaned = strip_anaphora(fragment);
-        let found_nouns: Vec<String> = find_nouns(&cleaned, &noun_names)
-            .iter()
+        let found_nouns: Vec<(usize, usize, String)> = find_nouns(&cleaned, &noun_names);
+        let noun_names_only: Vec<String> = found_nouns.iter()
             .map(|(_, _, name)| name.clone())
             .collect();
+
+        // Extract the verb: text between the first and second noun
+        let verb = found_nouns.windows(2)
+            .next()
+            .map(|pair| cleaned[pair[0].1..pair[1].0].trim().to_string())
+            .unwrap_or_default();
+
+        // First try: match roles AND verb against the fact type reading
         ir.fact_types.iter()
             .find(|(_, ft)| {
                 let role_nouns: Vec<&String> = ft.roles.iter()
                     .map(|r| &r.noun_name)
                     .collect();
-                found_nouns.len() == role_nouns.len()
-                    && found_nouns.iter().all(|n| role_nouns.contains(&n))
+                let roles_match = noun_names_only.len() == role_nouns.len()
+                    && noun_names_only.iter().all(|n| role_nouns.contains(&n));
+                let verb_match = !verb.is_empty() && ft.reading.contains(&verb);
+                roles_match && verb_match
+            })
+            .or_else(|| {
+                // Fallback: match roles only (for cases where verb matching fails)
+                ir.fact_types.iter()
+                    .find(|(_, ft)| {
+                        let role_nouns: Vec<&String> = ft.roles.iter()
+                            .map(|r| &r.noun_name)
+                            .collect();
+                        noun_names_only.len() == role_nouns.len()
+                            && noun_names_only.iter().all(|n| role_nouns.contains(&n))
+                    })
             })
             .map(|(id, _)| id.clone())
     };

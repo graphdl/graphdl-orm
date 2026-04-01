@@ -37,6 +37,27 @@ export const router = AutoRouter()
 // ── Health ───────────────────────────────────────────────────────────
 router.get('/health', () => json({ status: 'ok', version: '0.1.0' }))
 
+// ── Domain Connection: store secrets for External System access ──────
+// Per core.md: Domain connects to External System with Secret Reference.
+// Secrets are stored in the Domain entity's DO via connectSystem().
+router.post('/api/connect/:domain/:system', async (request, env: Env) => {
+  const { domain, system } = request.params
+  const body = await request.json() as any
+  const secret = body?.secret
+  if (!secret) return error(400, { errors: [{ message: 'secret required' }] })
+
+  const domainDO = getEntityDO(env, `domain-secrets:${domain}`) as any
+  await domainDO.connectSystem(system, secret)
+  return json({ connected: true, domain, system })
+})
+
+router.get('/api/connect/:domain', async (request, env: Env) => {
+  const { domain } = request.params
+  const domainDO = getEntityDO(env, `domain-secrets:${domain}`) as any
+  const systems = await domainDO.connectedSystems()
+  return json({ domain, connectedSystems: systems })
+})
+
 // ── Access: derive what the authenticated user can see ──────────────
 // Per the paper: the user is part of input I in μ(SYSTEM:x).
 // The derivation rules in organizations.md determine visibility.
@@ -67,7 +88,8 @@ router.get('/api/trace/:domain', async (request, env: Env) => {
 
   await loadDomainSchema(registry, getStub, domain).catch(() => {})
   const popJson = await buildPopulation(registry, getStub, domain)
-  const derived = forwardChain(popJson)
+  let derived: Array<{ factTypeId: string; reading: string; bindings: Array<[string, string]>; derivedBy: string }> = []
+  try { derived = forwardChain(popJson) } catch {}
 
   return json({
     domain,
@@ -78,6 +100,18 @@ router.get('/api/trace/:domain', async (request, env: Env) => {
       bindings: fact.bindings,
     })),
   })
+})
+
+// ── Debug: population fact type IDs ──────────────────────────────────
+router.get('/api/debug/population/:domain', async (request, env: Env) => {
+  const domain = decodeURIComponent(request.params.domain)
+  const registry = getRegistryDO(env, 'global') as any
+  const getStub = (id: string) => getEntityDO(env, id) as any
+  await loadDomainSchema(registry, getStub, domain).catch(() => {})
+  const popJson = await buildPopulation(registry, getStub, domain)
+  const pop = JSON.parse(popJson) as { facts: Record<string, any[]> }
+  const summary = Object.entries(pop.facts).map(([ftId, facts]) => ({ ftId, count: facts.length }))
+  return json({ domain, factTypes: summary })
 })
 
 // ── Debug: entity counts by type from Registry ──────────────────────

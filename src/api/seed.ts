@@ -12,7 +12,7 @@
 
 import { json, error } from 'itty-router'
 import type { Env } from '../types'
-import { parseReadings } from './engine'
+import { parseReadings, parseReadingsWithNouns } from './engine'
 
 function getRegistryDO(env: Env) {
   return env.REGISTRY_DB.get(env.REGISTRY_DB.idFromName('global'))
@@ -105,31 +105,52 @@ async function handleSeedPost(request: Request, env: Env): Promise<Response> {
   const registry = getRegistryDO(env) as any
   const results: Array<{ domain: string; entities: number; nouns: number; readings: number; errors: string[] }> = []
 
-  // For each domain: parse via ρ (WASM), register domain, materialize cells
+  // Domains are NORMA tabs, not separate universes. Nouns are global.
+  // Load existing noun definitions from the IR for cross-domain resolution.
+  // No generated text. The existing IR has the real noun definitions.
+  let existingNounsJson = '{}'
+  try {
+    const allDomains: string[] = await registry.listDomains()
+    const irCells = await Promise.allSettled(
+      allDomains.map(async (d: string) => {
+        const stub = env.ENTITY_DB.get(env.ENTITY_DB.idFromName(`ir:${d}`)) as any
+        const cell = await stub.get()
+        return cell?.data?.ir
+          ? JSON.parse(typeof cell.data.ir === 'string' ? cell.data.ir : JSON.stringify(cell.data.ir))
+          : null
+      }),
+    )
+    // Merge all noun definitions from all domain IRs
+    const mergedNouns: Record<string, unknown> = {}
+    irCells
+      .filter((r): r is PromiseFulfilledResult<any> => r.status === 'fulfilled' && r.value?.nouns)
+      .map(r => r.value.nouns)
+      .forEach(nouns => Object.assign(mergedNouns, nouns))
+    existingNounsJson = JSON.stringify(mergedNouns)
+  } catch {}
+
+  // Parse each domain with the full noun context from all existing domains.
   for (const { slug, text } of rawDomains) {
     const errors: string[] = []
-
-    // parse: R → Φ via WASM (the ONLY parser)
     let entities: Array<{ id: string; type: string; domain: string; data: Record<string, unknown> }>
     try {
-      entities = parseReadings(text, slug)
+      entities = parseReadingsWithNouns(text, slug, existingNounsJson)
     } catch (e) {
       errors.push(`parse error: ${e}`)
       results.push({ domain: slug, entities: 0, nouns: 0, readings: 0, errors })
       continue
     }
 
-    // Register domain in Registry
     await registry.registerDomain(slug, slug, 'private')
 
-    // Index nouns for cross-domain reference
     const nounEntities = entities.filter(e => e.type === 'Noun')
-    for (const noun of nounEntities) {
-      const name = noun.data.name as string
-      if (name) await registry.indexNoun(name, slug)
-    }
+    await Promise.all(
+      nounEntities.map(async (noun) => {
+        const name = noun.data.name as string
+        return name ? registry.indexNoun(name, slug) : null
+      }),
+    )
 
-    // Materialize all entities as cells in D
     if (entities.length > 0) {
       await registry.materializeBatch(entities)
     }
