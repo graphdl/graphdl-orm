@@ -470,6 +470,16 @@ fn parse_enum(line: &str) -> Option<Vec<String>> {
     Some(after.trim_end_matches('.').split(", ").map(|s| s.trim().trim_matches('\'').into()).collect())
 }
 
+/// Canonical Graph Schema ID from role nouns and verb.
+/// The ID is the key in DEFS. Two readings with the same roles and verb
+/// (just different voice) produce the same ID.
+fn graph_schema_id(role_nouns: &[&str], verb: &str) -> String {
+    let verb_part = verb.to_lowercase().replace(' ', "_");
+    let mut parts = vec![role_nouns[0], &verb_part];
+    parts.extend(&role_nouns[1..]);
+    parts.join("_")
+}
+
 fn parse_fact(line: &str, noun_names: &[String]) -> Option<(String, FactTypeDef)> {
     let clean = line.trim_end_matches('.');
     let found = find_nouns(clean, noun_names);
@@ -876,5 +886,29 @@ mod tests {
         let ir = parse_markdown(input).unwrap();
         let rule = &ir.derivation_rules[0];
         assert!(rule.join_on.contains(&"Organization".to_string()), "Organization should be a join key (referenced with 'that')");
+    }
+
+    #[test]
+    fn graph_schema_id_from_roles_and_verb() {
+        // Binary fact type: "User owns Organization"
+        assert_eq!(
+            graph_schema_id(&["User", "Organization"], "owns"),
+            "User_owns_Organization"
+        );
+        // Verb with spaces: "was placed by"
+        assert_eq!(
+            graph_schema_id(&["Order", "Customer"], "was placed by"),
+            "Order_was_placed_by_Customer"
+        );
+        // Ring constraint with subscripts
+        assert_eq!(
+            graph_schema_id(&["Person1", "Person2"], "is parent of"),
+            "Person1_is_parent_of_Person2"
+        );
+        // Unary: "Customer is active"
+        assert_eq!(
+            graph_schema_id(&["Customer"], "is active"),
+            "Customer_is_active"
+        );
     }
 }
