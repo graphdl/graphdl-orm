@@ -407,7 +407,7 @@ pub fn project_entity_wasm(noun_name: &str, entity_id: &str, fields_val: JsValue
             let facts: Vec<ProjectedFact> = fields.iter()
                 .filter(|(k, v)| !k.starts_with('_') && !v.is_empty())
                 .map(|(field, value)| ProjectedFact {
-                    schema_id: format!("{} has {}", noun_name, field),
+                    schema_id: format!("{}_has_{}", noun_name, field),
                     reading: format!("{} has {}", noun_name, field),
                     bindings: vec![(noun_name.to_string(), entity_id.to_string()), (field.clone(), value.clone())],
                 })
@@ -447,9 +447,9 @@ pub fn project_entity_wasm(noun_name: &str, entity_id: &str, fields_val: JsValue
                 bindings: vec![(noun_name.to_string(), entity_id.to_string()), (field.clone(), value.clone())],
             });
         } else {
-            // No compiled schema — provisional fact with reading-format ID
+            // No compiled schema — provisional fact with Graph Schema ID format
             facts.push(ProjectedFact {
-                schema_id: format!("{} has {}", noun_name, field),
+                schema_id: format!("{}_has_{}", noun_name, field),
                 reading: format!("{} has {}", noun_name, field),
                 bindings: vec![(noun_name.to_string(), entity_id.to_string()), (field.clone(), value.clone())],
             });
