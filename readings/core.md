@@ -44,7 +44,7 @@ External System(.Name) is an entity type.
 
 ## Value Types
 
-Base URL is a value type.
+URL is a value type.
 Secret Reference is a value type.
 
 Arity is a value type.
@@ -55,7 +55,6 @@ Name is a value type.
 Plural is a value type.
 Object Type is a value type.
   The possible values of Object Type are 'entity', 'value'.
-Value Type Name is a value type.
 Format is a value type.
 Enum Values is a value type.
 Minimum is a value type.
@@ -69,6 +68,7 @@ Pattern is a value type.
 Description is a value type.
 Text is a value type.
 URI is a value type.
+Prefix is a value type.
 Header is a value type.
 Timestamp is a value type.
 Argument Length is a value type.
@@ -99,8 +99,8 @@ Noun has Object Type.
   Each Noun has exactly one Object Type.
 Noun has Plural.
   Each Noun has at most one Plural.
-Noun has Value Type Name.
-  Each Noun has at most one Value Type Name.
+Noun has value-type- Name.
+  Each Noun has at most one value-type- Name.
 Noun has Format.
   Each Noun has at most one Format.
 Noun has Enum Values.
@@ -253,9 +253,9 @@ Stream has Name.
 Activation is by HTTP Method.
 
 ### API (objectification of "Activation is by HTTP Method")
-API has endpoint URI.
-  Each API has exactly one endpoint URI.
-  For each endpoint URI, at most one API has that endpoint URI.
+API has URI.
+  Each API has exactly one URI.
+  For each URI, at most one API has that URI.
 
 ## Constraints
 
@@ -287,12 +287,19 @@ If Noun1 is subtype of Noun2, then Noun2 is not subtype of Noun1.
 If Noun1 is subtype of Noun2 and Noun2 is subtype of Noun3, then Noun1 is subtype of Noun3.
 
 ### External System
-External System has Base URL.
-  Each External System has exactly one Base URL.
+External System has URL.
+  Each External System has exactly one URL.
+External System has Header.
+  Each External System has at most one Header.
+External System has Prefix.
+  Each External System has at most one Prefix.
 Noun is backed by External System.
   Each Noun is backed by at most one External System.
 Function is backed by External System.
   Each Function is backed by at most one External System.
+
+Noun has URI.
+  Each Noun has at most one URI.
 
 ### Domain Connection
 Domain connects to External System with Secret Reference.
@@ -336,5 +343,11 @@ Constraint Type 'IT' has Name 'Intransitive'.
 Constraint Type 'TR' has Name 'Transitive'.
 Constraint Type 'AC' has Name 'Acyclic'.
 Constraint Type 'VC' has Name 'ValueComparison'.
+
+External System 'auth.vin' has URL 'https://auth.vin'.
+External System 'auth.vin' has Header 'Authorization'.
+External System 'auth.vin' has Prefix 'users API-Key'.
+External System 'auto.dev' has URL 'https://api.auto.dev'.
+External System 'auto.dev' has Header 'X-API-Key'.
 
 Domain 'core' has Visibility 'public'.

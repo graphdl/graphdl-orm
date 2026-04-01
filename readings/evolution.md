@@ -13,6 +13,7 @@ The system can only evolve by proving something new.
 
 Domain Change(.Change Id) is an entity type.
 Signal(.Signal Id) is an entity type.
+Model Element(.id) is an entity type.
 
 ## Value Types
 
@@ -71,7 +72,7 @@ It is forbidden that a Domain Change targeting Domain 'core' is applied without 
 
 ## Derivation Rules
 
-Domain Change is valid iff all proposed Model Elements are parseable as FORML2 and no proposed Constraint contradicts an existing Constraint in the target Domain.
+Domain Change is valid iff all proposed Model Elements are parseable as FORML 2 and the proposed population is consistent with the existing population in the target Domain and the proposed Constraints are satisfiable with the existing Constraints in the target Domain.
 
 ## Instance Facts
 

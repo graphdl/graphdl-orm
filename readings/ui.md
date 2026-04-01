@@ -58,7 +58,7 @@ Search Box(.id) is an entity type.
 
 ### Layout
 Element(.id) is an entity type.
-Dashboard(.Dashboard Name) is an entity type.
+Dashboard(.Name) is an entity type.
 Widget(.Widget Id) is an entity type.
 Entity List(.Noun + Domain) is an entity type.
 List Item(.Entity List + Resource) is an entity type.
@@ -93,14 +93,11 @@ Text Alignment is a value type.
   The possible values of Text Alignment are 'left', 'center', 'right'.
 Text Completion is a value type.
   The possible values of Text Completion are 'none', 'offer-suggestions', 'auto-correct'.
-Dashboard Name is a value type.
 Widget Id is a value type.
 Widget Type is a value type.
   The possible values of Widget Type are 'link', 'field', 'status-summary', 'submission', 'streaming', 'remote-control'.
 Display Color is a value type.
   The possible values of Display Color are 'green', 'amber', 'red', 'blue', 'violet', 'gray'.
-Display Text is a value type.
-Display Subtext is a value type.
 Display Status is a value type.
 Display Image Path is a value type.
 Polling Interval is a value type.
@@ -122,8 +119,6 @@ Image Path is a value type.
 Placeholder is a value type.
 Expression is a value type.
 Submit Key is a value type.
-Date Format is a value type.
-Time Format is a value type.
 Min Value is a value type.
 Max Value is a value type.
 Badge Value is a value type.
@@ -227,12 +222,12 @@ Text Box has Text Completion.
   Each Text Box has at most one Text Completion.
 
 ### Date Picker
-Date Picker has Date Format.
-  Each Date Picker has at most one Date Format.
+Date Picker has date- Format.
+  Each Date Picker has at most one date- Format.
 
 ### Time Picker
-Time Picker has Time Format.
-  Each Time Picker has at most one Time Format.
+Time Picker has time- Format.
+  Each Time Picker has at most one time- Format.
 
 ### Slider
 Slider has Min Value.
@@ -339,10 +334,10 @@ List Item belongs to Page.
   Each List Item belongs to exactly one Page.
 List Item displays Resource.
   Each List Item displays exactly one Resource.
-List Item has Display Text.
-  Each List Item has at most one Display Text.
-List Item has Display Subtext.
-  Each List Item has at most one Display Subtext.
+List Item has display- Text.
+  Each List Item has at most one display- Text.
+List Item has display-sub- Text.
+  Each List Item has at most one display-sub- Text.
 List Item has Display Status.
   Each List Item has at most one Display Status.
 List Item has Display Image Path.
@@ -356,10 +351,10 @@ No View Renderer is for the same View on the same Platform more than once.
 
 ## Derivation Rules
 
-List Item has Display Text iff List Item displays Resource and that Resource has Reference and Display Text is that Reference.
-List Item has Display Text iff List Item displays Resource and that Resource has Value and that Resource has no Reference and Display Text is that Value.
-List Item has Display Subtext iff List Item displays Resource and that Resource has Reference and that Resource has Value and Display Subtext is that Value.
-List Item has Display Status iff List Item displays Resource and some State Machine is for that Resource and that State Machine is currently in some Status and Display Status is that Status.
+List Item has display- Text if List Item displays Resource and that Resource has Reference and display- Text is that Reference.
+List Item has display- Text if List Item displays Resource and that Resource has Value and that Resource has no Reference and display- Text is that Value.
+List Item has display-sub- Text if List Item displays Resource and that Resource has Reference and that Resource has Value and display-sub- Text is that Value.
+List Item has Display Status if List Item displays Resource and some State Machine is for that Resource and that State Machine is currently in some Status and Display Status is that Status.
 
 ## Deontic Constraints
 
