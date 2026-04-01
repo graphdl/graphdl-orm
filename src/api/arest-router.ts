@@ -41,13 +41,13 @@ export function nounToSlug(noun: string): string {
  * the child is navigable under the parent.
  */
 export function buildConstraintGraph(ir: any): ConstraintGraph {
+  // UC "Each X verb at most one Y" constrains X (first noun, span[0])
   const ucIndex = new Map<string, number>()
   ;(ir.constraints || [])
     .filter((c: any) => c.kind === 'UC')
     .forEach((c: any) => {
-      ;(c.spans || []).forEach((span: any) => {
-        ucIndex.set(span.factTypeId, span.roleIndex)
-      })
+      const span = (c.spans || [])[0]
+      if (span) ucIndex.set(span.factTypeId, span.roleIndex)
     })
 
   const children = new Map<string, ChildRelation[]>()
@@ -187,9 +187,10 @@ export async function handleRoot(
   const orgLinks = await Promise.all(
     orgFactTypes.flatMap(ftId =>
       (population.facts?.[ftId] || [])
-        .filter((f: any) => f.bindings.some(([k, v]: [string, string]) => k === 'User' && v === userEmail))
+        .filter((f: any) => f.bindings.some(([, v]: [string, string]) => v === userEmail))
         .map(async (f: any) => {
-          const orgId = f.bindings.find(([k]: [string, string]) => k === 'Organization')?.[1] || ''
+          // The binding that is not the user's email is the org ID
+          const orgId = f.bindings.find(([, v]: [string, string]) => v !== userEmail)?.[1] || ''
           const orgEntity = await getStub(orgId).get().catch(() => null)
           const title = orgEntity?.data?.name || orgEntity?.data?.slug || orgId
           return { href: `/arest/organizations/${orgId}`, title, factType: ftId }

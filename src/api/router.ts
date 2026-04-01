@@ -1012,6 +1012,17 @@ async function handleArestRoute(request: Request, env: Env) {
 
   if (!ir) return json({ error: 'No schema loaded' }, { status: 500 })
 
+  // Debug: return IR shape if ?debug=ir
+  if (url.searchParams.get('debug') === 'ir') {
+    const ucConstraints = (ir.constraints || []).filter((c: any) => c.kind === 'UC')
+    return json({
+      factTypeKeys: Object.keys(ir.factTypes || ir.fact_types || {}),
+      constraintCount: (ir.constraints || []).length,
+      ucConstraints: ucConstraints.map((c: any) => ({ text: c.text, spans: c.spans })),
+      nounKeys: Object.keys(ir.nouns || {}),
+    })
+  }
+
   // Build population for root resource (needed to resolve org memberships)
   let population = { facts: {} as Record<string, any[]> }
   if (url.pathname === '/arest/' || url.pathname === '/arest') {
