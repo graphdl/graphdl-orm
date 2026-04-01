@@ -291,7 +291,7 @@ fn parse_into(ir: &mut ConstraintIR, input: &str) -> Result<(), String> {
                     })
                 })
                 .unwrap_or("");
-            cat.register(schema_id, &role_nouns, verb);
+            cat.register(schema_id, &role_nouns, verb, &ft.reading);
         }
         cat
     };
@@ -329,21 +329,26 @@ fn parse_into(ir: &mut ConstraintIR, input: &str) -> Result<(), String> {
         // handled in Pass 2a (fact type or instance fact). Skip it.
         let Some(action) = action else { continue; };
 
-        // Split "exactly one" constraints into UC + MC
-        match &action {
+        // Split "exactly one" constraints into UC + MC.
+        // Derivation rules resolve through catalog, not through apply_action.
+        match action {
             ParseAction::AddConstraint(c) if line.contains("exactly one") => {
-                let mut uc = resolve_constraint_schema(c.clone(), &noun_names, &catalog);
+                let mut uc = resolve_constraint_schema(c.clone(), &noun_names, &catalog, ir);
                 uc.kind = "UC".into();
-                let mut mc = resolve_constraint_schema(c.clone(), &noun_names, &catalog);
+                let mut mc = resolve_constraint_schema(c, &noun_names, &catalog, ir);
                 mc.kind = "MC".into();
                 ir.constraints.push(uc);
                 ir.constraints.push(mc);
             }
             ParseAction::AddConstraint(c) => {
-                let resolved = resolve_constraint_schema(c.clone(), &noun_names, &catalog);
+                let resolved = resolve_constraint_schema(c, &noun_names, &catalog, ir);
                 ir.constraints.push(resolved);
             }
-            _ => { apply_action(ir, Some(action), &lines, i); }
+            ParseAction::AddDerivation(mut r) => {
+                resolve_derivation_rule(&mut r, ir, &catalog);
+                ir.derivation_rules.push(r);
+            }
+            other => { apply_action(ir, Some(other), &lines, i); }
         }
     }
 
@@ -355,7 +360,7 @@ fn parse_into(ir: &mut ConstraintIR, input: &str) -> Result<(), String> {
 /// Splits on " if "/" iff " to get consequent and antecedent parts,
 /// then matches each part's nouns against ir.fact_types by role noun names.
 /// Anaphoric "that X" references are stripped to bare noun name "X".
-fn resolve_derivation_rule(rule: &mut DerivationRuleDef, ir: &ConstraintIR) {
+fn resolve_derivation_rule(rule: &mut DerivationRuleDef, ir: &ConstraintIR, catalog: &SchemaCatalog) {
     // Longest-first noun list for Theorem 1 matching
     let mut noun_names: Vec<String> = ir.nouns.keys().cloned().collect();
     noun_names.sort_by(|a, b| b.len().cmp(&a.len()));
@@ -375,50 +380,27 @@ fn resolve_derivation_rule(rule: &mut DerivationRuleDef, ir: &ConstraintIR) {
         .filter(|s| !s.is_empty())
         .collect();
 
-    // Strip "that " prefix from noun references in a text fragment,
-    // returning the cleaned text.
+    // Strip "that " prefix from noun references in a text fragment.
     let strip_anaphora = |text: &str| -> String {
         text.replace("that ", "")
     };
 
-    // Find the fact type whose roles and verb match a text fragment.
-    // When multiple fact types share the same roles, the verb disambiguates.
+    // Resolve a text fragment to a Graph Schema ID via ρ-lookup through the catalog.
     let resolve_fact_type = |fragment: &str| -> Option<String> {
         let cleaned = strip_anaphora(fragment);
         let found_nouns: Vec<(usize, usize, String)> = find_nouns(&cleaned, &noun_names);
-        let noun_names_only: Vec<String> = found_nouns.iter()
-            .map(|(_, _, name)| name.clone())
-            .collect();
+        let role_refs: Vec<&str> = found_nouns.iter().map(|(_, _, n)| n.as_str()).collect();
 
         // Extract the verb: text between the first and second noun
         let verb = found_nouns.windows(2)
             .next()
-            .map(|pair| cleaned[pair[0].1..pair[1].0].trim().to_string())
-            .unwrap_or_default();
+            .map(|pair| cleaned[pair[0].1..pair[1].0].trim())
+            .unwrap_or("");
 
-        // First try: match roles AND verb against the fact type reading
-        ir.fact_types.iter()
-            .find(|(_, ft)| {
-                let role_nouns: Vec<&String> = ft.roles.iter()
-                    .map(|r| &r.noun_name)
-                    .collect();
-                let roles_match = noun_names_only.len() == role_nouns.len()
-                    && noun_names_only.iter().all(|n| role_nouns.contains(&n));
-                let verb_match = !verb.is_empty() && ft.reading.contains(&verb);
-                roles_match && verb_match
-            })
-            .or_else(|| {
-                // Fallback: match roles only (for cases where verb matching fails)
-                ir.fact_types.iter()
-                    .find(|(_, ft)| {
-                        let role_nouns: Vec<&String> = ft.roles.iter()
-                            .map(|r| &r.noun_name)
-                            .collect();
-                        noun_names_only.len() == role_nouns.len()
-                            && noun_names_only.iter().all(|n| role_nouns.contains(&n))
-                    })
-            })
-            .map(|(id, _)| id.clone())
+        // ρ-lookup: try with verb first, then noun set only
+        let verb_opt = (!verb.is_empty()).then_some(verb);
+        catalog.resolve(&role_refs, verb_opt)
+            .or_else(|| catalog.resolve(&role_refs, None))
     };
 
     // Detect "that X" anaphoric references — nouns preceded by "that " in
@@ -497,8 +479,9 @@ fn apply_action(ir: &mut ConstraintIR, action: Option<ParseAction>, lines: &[Str
             ir.fact_types.entry(id).or_insert(def);
         }
         ParseAction::AddConstraint(c) => { ir.constraints.push(c); }
-        ParseAction::AddDerivation(mut r) => {
-            resolve_derivation_rule(&mut r, ir);
+        ParseAction::AddDerivation(r) => {
+            // Derivation rule resolution happens in Pass 2b with the catalog.
+            // This path stores the unresolved rule for later resolution.
             ir.derivation_rules.push(r);
         }
         ParseAction::AddInstanceFact(raw) => {
@@ -548,8 +531,8 @@ fn graph_schema_id(role_nouns: &[&str], verb: &str) -> String {
 /// Schema catalog for ρ-lookup: noun set → Graph Schema ID.
 /// The noun set is the key. The catalog is the DEFS cell.
 struct SchemaCatalog {
-    /// Sorted noun set → vec of (schema_id, verb) for disambiguation
-    by_noun_set: HashMap<Vec<String>, Vec<(String, String)>>,
+    /// Sorted noun set → vec of (schema_id, verb, reading) for disambiguation
+    by_noun_set: HashMap<Vec<String>, Vec<(String, String, String)>>,
 }
 
 impl SchemaCatalog {
@@ -557,7 +540,7 @@ impl SchemaCatalog {
         SchemaCatalog { by_noun_set: HashMap::new() }
     }
 
-    fn register(&mut self, schema_id: &str, role_nouns: &[&str], verb: &str) {
+    fn register(&mut self, schema_id: &str, role_nouns: &[&str], verb: &str, reading: &str) {
         let mut key: Vec<String> = role_nouns.iter().map(|n| {
             let (base, _) = parse_role_token(n);
             base.to_lowercase()
@@ -566,9 +549,14 @@ impl SchemaCatalog {
         self.by_noun_set
             .entry(key)
             .or_default()
-            .push((schema_id.to_string(), verb.to_lowercase()));
+            .push((schema_id.to_string(), verb.to_lowercase(), reading.to_lowercase()));
     }
 
+    /// ρ-lookup: noun set → Graph Schema ID.
+    /// Resolution strategy (no COND dispatch, just cascading lookup):
+    /// 1. Exact verb match
+    /// 2. Verb contained in stored reading (handles inverse voice)
+    /// 3. Unique entry for noun set (no verb needed)
     fn resolve(&self, role_nouns: &[&str], verb: Option<&str>) -> Option<String> {
         let mut key: Vec<String> = role_nouns.iter().map(|n| {
             let (base, _) = parse_role_token(n);
@@ -576,10 +564,20 @@ impl SchemaCatalog {
         }).collect();
         key.sort();
         let entries = self.by_noun_set.get(&key)?;
-        entries
-            .iter()
-            .find(|(_, v)| verb.map_or(entries.len() == 1, |vb| v == &vb.to_lowercase()))
-            .map(|(id, _)| id.clone())
+        let vb = verb.map(|v| v.to_lowercase());
+        // Exact verb match
+        entries.iter()
+            .find(|(_, v, _)| vb.as_ref().map_or(false, |vb| v == vb))
+            .or_else(||
+                // Verb contained in stored reading (inverse voice: "is owned by" matches "owns")
+                entries.iter()
+                    .find(|(_, _, reading)| vb.as_ref().map_or(false, |vb| reading.contains(vb.as_str())))
+            )
+            .or_else(||
+                // Unique entry for this noun set
+                (entries.len() == 1).then(|| &entries[0])
+            )
+            .map(|(id, _, _)| id.clone())
     }
 }
 
@@ -588,6 +586,7 @@ fn resolve_constraint_schema(
     mut constraint: ConstraintDef,
     noun_names: &[String],
     catalog: &SchemaCatalog,
+    ir: &ConstraintIR,
 ) -> ConstraintDef {
     // Extract nouns from the constraint text to find the target schema
     let stripped = constraint.text
@@ -603,8 +602,37 @@ fn resolve_constraint_schema(
         let verb_text = stripped[found[0].1..found[1].0].trim();
         let verb = if verb_text.is_empty() { None } else { Some(verb_text) };
 
+        // Primary: ρ-lookup through catalog (exact verb, then reading containment, then unique)
+        // Secondary: verb containment against ir.fact_types readings (handles inverse voice
+        // when multiple schemas share the same noun pair)
         if let Some(schema_id) = catalog.resolve(&role_nouns, verb)
             .or_else(|| catalog.resolve(&role_nouns, None))
+            .or_else(|| {
+                // Inverse voice fallback: find schema where constraint verb appears in reading
+                // or reading verb appears in constraint text
+                let noun_set: std::collections::HashSet<&str> = role_nouns.iter().copied().collect();
+                ir.fact_types.iter()
+                    .filter(|(_, ft)| {
+                        let ft_nouns: std::collections::HashSet<&str> = ft.roles.iter()
+                            .map(|r| r.noun_name.as_str()).collect();
+                        ft_nouns == noun_set
+                    })
+                    .find(|(_, ft)| {
+                        verb.map_or(false, |v| {
+                            let v_lower = v.to_lowercase();
+                            let r_lower = ft.reading.to_lowercase();
+                            // Check word stem overlap: words sharing a 3+ char prefix
+                            // ("owned"/"owns" share "own", "administered"/"administers" share "administ")
+                            let shared_prefix = |a: &str, b: &str| -> usize {
+                                a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count()
+                            };
+                            v_lower.split_whitespace()
+                                .any(|w| w.len() >= 3 && r_lower.split_whitespace()
+                                    .any(|rw| rw.len() >= 3 && shared_prefix(w, rw) >= 3))
+                        })
+                    })
+                    .map(|(id, _)| id.clone())
+            })
         {
             // Update all spans to reference the resolved schema ID
             for span in &mut constraint.spans {
@@ -1106,9 +1134,9 @@ mod tests {
     #[test]
     fn schema_catalog_resolves_by_noun_set() {
         let mut catalog = SchemaCatalog::new();
-        catalog.register("User_owns_Organization", &["User", "Organization"], "owns");
-        catalog.register("User_administers_Organization", &["User", "Organization"], "administers");
-        catalog.register("Domain_belongs_to_App", &["Domain", "App"], "belongs to");
+        catalog.register("User_owns_Organization", &["User", "Organization"], "owns", "User owns Organization");
+        catalog.register("User_administers_Organization", &["User", "Organization"], "administers", "User administers Organization");
+        catalog.register("Domain_belongs_to_App", &["Domain", "App"], "belongs to", "Domain belongs to App");
 
         // Single match by noun set
         assert_eq!(
@@ -1124,7 +1152,10 @@ mod tests {
             catalog.resolve(&["User", "Organization"], Some("administers")),
             Some("User_administers_Organization".to_string())
         );
-        // Reverse order still resolves
+        // Inverse voice: catalog alone can't resolve inverse voice for ambiguous noun sets.
+        // The full resolution uses word-stem matching against ir.fact_types (resolve_constraint_schema).
+        // See inverse_voice_ambiguous_noun_set_resolves test for end-to-end coverage.
+        // Reverse order with unique noun set still resolves
         assert_eq!(
             catalog.resolve(&["App", "Domain"], None),
             Some("Domain_belongs_to_App".to_string())
@@ -1155,6 +1186,37 @@ mod tests {
         let c = &ir.constraints[0];
         assert_eq!(c.spans[0].fact_type_id, "User_owns_Organization",
             "Constraint span should reference Graph Schema ID, not reading text");
+    }
+
+    #[test]
+    fn inverse_voice_ambiguous_noun_set_resolves() {
+        let input = "# test\n\
+            ## Entity Types\n\
+            User(.Name) is an entity type.\n\
+            Organization(.Name) is an entity type.\n\
+            ## Fact Types\n\
+            User owns Organization.\n\
+            User administers Organization.\n\
+            ## Constraints\n\
+            Each Organization is owned by at most one User.\n\
+            Each Organization is administered by at most one User.\n";
+        let ir = parse_markdown(input).unwrap();
+        // Both fact types present
+        assert!(ir.fact_types.contains_key("User_owns_Organization"));
+        assert!(ir.fact_types.contains_key("User_administers_Organization"));
+        // "is owned by" constraint should resolve to "User_owns_Organization"
+        // via word overlap: "owned" matches "owns"
+        let owned_constraint = ir.constraints.iter()
+            .find(|c| c.text.contains("is owned by"))
+            .expect("should have 'is owned by' constraint");
+        assert_eq!(owned_constraint.spans[0].fact_type_id, "User_owns_Organization",
+            "Inverse voice 'is owned by' should resolve to 'owns' schema");
+        // "is administered by" should resolve to "User_administers_Organization"
+        let admin_constraint = ir.constraints.iter()
+            .find(|c| c.text.contains("is administered by"))
+            .expect("should have 'is administered by' constraint");
+        assert_eq!(admin_constraint.spans[0].fact_type_id, "User_administers_Organization",
+            "Inverse voice 'is administered by' should resolve to 'administers' schema");
     }
 
     #[test]
