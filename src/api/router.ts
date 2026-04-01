@@ -5,7 +5,7 @@ import { nounToSlug, nounToTable, resolveSlugToNoun } from '../collections'
 import { handleSeed } from './seed'
 import { handleEvaluate, handleSynthesize } from './evaluate'
 import { handleListEntities, handleGetEntity, handleCreateEntity, handleDeleteEntity, buildEntityLinks } from './entity-routes'
-import { loadDomainSchema, loadDomainAndPopulation, buildPopulation, getTransitions, applyCommand, querySchema, forwardChain, getNounSchemas, evaluateAccess, deriveViewMetadata, deriveNavContext, getTopLevelNouns, computeRMAP } from './engine'
+import { loadDomainSchema, loadDomainAndPopulation, buildPopulation, getTransitions, applyCommand, querySchema, forwardChain, getNounSchemas, deriveViewMetadata, deriveNavContext, getTopLevelNouns, computeRMAP } from './engine'
 import { system } from './system'
 import { handleArestRequest } from './arest-router'
 
@@ -59,25 +59,8 @@ router.get('/api/connect/:domain', async (request, env: Env) => {
   return json({ domain, connectedSystems: systems })
 })
 
-// ── Access: derive what the authenticated user can see ──────────────
-// Per the paper: the user is part of input I in μ(SYSTEM:x).
-// The derivation rules in organizations.md determine visibility.
-// This endpoint returns the user's accessible apps, domains, and orgs
-// as derived from the population P via ρ.
-router.get('/api/access', async (request, env: Env) => {
-  const userEmail = request.headers.get('x-user-email') || ''
-  const registry = getRegistryDO(env, 'global') as any
-  const getStub = (id: string) => getEntityDO(env, id) as any
-
-  const { accessibleDomains, userOrgs, visibleApps } = await evaluateAccess(registry, getStub, userEmail)
-
-  return json({
-    user: userEmail,
-    orgs: userOrgs,
-    apps: visibleApps,
-    domains: [...accessibleDomains],
-  })
-})
+// REMOVED: /api/access is replaced by GET /arest/ (root resource with org membership links).
+// See handleArestRequest in arest-router.ts.
 
 // ── Derivation trace for a domain ────────────────────────────────────
 // Per the paper: derivation chains are recorded and available on demand.

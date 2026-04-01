@@ -635,6 +635,7 @@ export function computeRMAP(): RmapTable[] {
  * A graph schema ⟨CONS, s₁, …, sₙ⟩ applied to roles gives the columns.
  * Constraints give validation rules. State machines give transitions.
  */
+// DEPRECATED: replaced by deriveSchema in hateoas.ts
 export async function deriveViewMetadata(
   registry: any,
   getStub: (id: string) => any,
@@ -745,6 +746,7 @@ export async function deriveViewMetadata(
  * Derive navigation context from access rules.
  * Returns the domains and apps visible to the user, plus the current breadcrumb.
  */
+// DEPRECATED: replaced by HATEOAS links at each level
 export async function deriveNavContext(
   registry: any,
   getStub: (id: string) => any,
@@ -784,6 +786,7 @@ export async function deriveNavContext(
  *
  * Returns the set of domain slugs the user can access.
  */
+// DEPRECATED: replaced by /arest/ root resource
 export async function evaluateAccess(
   registry: any,
   getStub: (id: string) => any,

@@ -79,6 +79,7 @@ export interface DepthOpts {
 // HATEOAS link builders
 // ---------------------------------------------------------------------------
 
+// DEPRECATED: replaced by deriveLinks in hateoas.ts
 export function buildEntityLinks(
   type: string,
   id: string,
@@ -102,6 +103,7 @@ export function buildEntityLinks(
   return links
 }
 
+// DEPRECATED: replaced by deriveLinks in hateoas.ts
 export function buildListLinks(
   type: string,
   domain: string,
