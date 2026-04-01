@@ -11,23 +11,25 @@ User(.Email) is an entity type.
 
 Slug is a value type.
 Email is a value type.
-Org Role is a value type.
-  The possible values of Org Role are 'owner', 'admin', 'member'.
 Visibility is a value type.
   The possible values of Visibility are 'private', 'public'.
 Label is a value type.
 App Type is a value type.
   The possible values of App Type are 'standard', 'chat'.
 
-## Readings
+## Fact Types
 
 ### Organization
 
 Organization has Name.
   Each Organization has exactly one Name.
 
-User has Org Role in Organization.
-  Each User has at most one Org Role in each Organization.
+User owns Organization.
+  Each Organization is owned by at most one User.
+
+User administers Organization.
+
+User belongs to Organization.
 
 ### App
 
@@ -63,21 +65,24 @@ Domain has Label.
 Domain has Visibility.
   Each Domain has exactly one Visibility.
 
+### Derived Fact Types
+
+User accesses Domain.
+App navigates Domain.
+App displays Noun.
+
 ## Constraints
 
-If some User has Org Role 'owner' in some Organization and that User is deleted then that Organization is also deleted.
+If some User owns some Organization and that User is deleted then that Organization is also deleted.
 
 ## Derivation Rules
 
-If some User authenticates and that User has no Org Role in any Organization then that User has Org Role 'owner' in some Organization and that Organization has Name that is that User's Email.
+If some User authenticates and that User does not own any Organization then that User owns some Organization and that Organization has Name that is that User's Email.
 
-User accesses Domain if User has Org Role in Organization and Domain belongs to that Organization.
+User accesses Domain if User owns Organization and Domain belongs to that Organization.
+User accesses Domain if User administers Organization and Domain belongs to that Organization.
+User accesses Domain if User belongs to Organization and Domain belongs to that Organization.
 User accesses Domain if Domain has Visibility 'public'.
-
-User views Resource in App if User has Org Role in Organization and App belongs to that Organization and App has navigable Domain and Resource belongs to that Domain.
-User views all Resources in App if User has Org Role 'owner' in Organization and App belongs to that Organization.
-User views all Resources in App if User has Org Role 'admin' in Organization and App belongs to that Organization.
-User views only own Resource in App if User has Org Role 'member' in Organization and App belongs to that Organization and Resource is created by that User.
 
 App navigates Domain if App has navigable Domain.
 App displays Noun if App has navigable Domain and Noun is defined in that Domain.
