@@ -1,3 +1,5 @@
+import { deriveLinks, deriveSchema } from './hateoas'
+
 export interface ChildRelation {
   noun: string
   slug: string
@@ -154,4 +156,143 @@ function findChildBySlug(slug: string, parentNoun: string, graph: ConstraintGrap
   const children = graph.children.get(parentNoun) || []
   const match = children.find(c => c.slug === slug)
   return match?.noun || null
+}
+
+// ── Root Resource ──────────────────────────────────────────────────
+
+export interface RootResource {
+  type: string
+  id: string
+  data: Record<string, unknown>
+  _links: Record<string, any>
+}
+
+/**
+ * Build the root resource for an authenticated user.
+ *
+ * Projects org membership facts from the population.
+ * Each org link carries the factType (Graph Schema ID).
+ */
+export async function handleRoot(
+  userEmail: string,
+  population: any,
+  getStub: (id: string) => { get(): Promise<any> },
+): Promise<RootResource> {
+  const orgFactTypes = [
+    'User_owns_Organization',
+    'User_administers_Organization',
+    'User_belongs_to_Organization',
+  ]
+
+  const orgLinks = await Promise.all(
+    orgFactTypes.flatMap(ftId =>
+      (population.facts?.[ftId] || [])
+        .filter((f: any) => f.bindings.some(([k, v]: [string, string]) => k === 'User' && v === userEmail))
+        .map(async (f: any) => {
+          const orgId = f.bindings.find(([k]: [string, string]) => k === 'Organization')?.[1] || ''
+          const orgEntity = await getStub(orgId).get().catch(() => null)
+          const title = orgEntity?.data?.name || orgEntity?.data?.slug || orgId
+          return { href: `/arest/organizations/${orgId}`, title, factType: ftId }
+        })
+    )
+  )
+
+  return {
+    type: 'User',
+    id: userEmail,
+    data: { email: userEmail },
+    _links: {
+      self: { href: '/arest/' },
+      organizations: orgLinks,
+    },
+  }
+}
+
+// ── AREST Route Handler ────────────────────────────────────────────
+
+export interface ArestRequestInput {
+  path: string
+  method: string
+  ir: any
+  registry: any
+  getStub: (id: string) => any
+  userEmail?: string
+  population?: any
+  body?: any
+}
+
+/**
+ * Handle an /arest/ request by resolving the path against the constraint
+ * graph and returning the appropriate resource with derived links.
+ *
+ * Entity responses get entity data + _links (navigation + transitions).
+ * Collection responses get docs array + _links + _schema.
+ * Root gets user resource + org membership links.
+ * Invalid paths return null.
+ */
+export async function handleArestRequest(input: ArestRequestInput): Promise<any> {
+  const { path, method, ir, registry, getStub } = input
+
+  const graph = buildConstraintGraph(ir)
+  const resolved = resolvePath(path, graph)
+  if (!resolved) return null
+
+  if (resolved.level === 'root') {
+    return handleRoot(input.userEmail || '', input.population || { facts: {} }, getStub)
+  }
+
+  if (resolved.level === 'entity' && method === 'GET') {
+    const entity = await getStub(resolved.id!).get().catch(() => null)
+    if (!entity) return null
+
+    const collectionPath = buildBasePath(resolved.segments.map((s, i) =>
+      i === resolved.segments.length - 1 ? { noun: s.noun, slug: s.slug } : s
+    ))
+
+    const parentPath = resolved.segments.length >= 2
+      ? buildBasePath(resolved.segments.slice(0, -1))
+      : undefined
+
+    const links = deriveLinks({
+      noun: resolved.noun!,
+      id: resolved.id!,
+      basePath: collectionPath,
+      ir,
+      parentPath,
+    })
+
+    return { ...entity, _links: links }
+  }
+
+  if (resolved.level === 'collection' && method === 'GET') {
+    const basePath = buildBasePath(resolved.segments)
+    const allIds = await registry.getEntityIds(resolved.noun!).catch(() => [])
+
+    const entities = await Promise.all(
+      allIds.map(async (id: string) => {
+        const entity = await getStub(id).get().catch(() => null)
+        return entity
+      })
+    )
+    const docs = entities.filter(Boolean)
+
+    const links = deriveLinks({ noun: resolved.noun!, basePath, ir })
+    const schema = deriveSchema(resolved.noun!, ir)
+
+    return {
+      type: resolved.noun,
+      docs,
+      totalDocs: docs.length,
+      _links: links,
+      _schema: schema,
+    }
+  }
+
+  return null
+}
+
+function buildBasePath(segments: PathSegment[]): string {
+  return '/arest/' + segments
+    .map(s => s.id ? `${s.slug}/${s.id}` : s.slug)
+    .join('/')
 }
