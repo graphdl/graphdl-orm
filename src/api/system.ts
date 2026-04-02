@@ -22,7 +22,6 @@ interface FactData {
   domain: string
   params: Record<string, string>
   body?: unknown
-  backedBy?: string
   env: SystemEnv
 }
 
@@ -36,14 +35,36 @@ export interface SystemOutput {
   body: unknown
 }
 
-// ── ρ — resolve a fact to its functional form ───────────────────────
+// ── DEFS — named definitions registered by the runtime ──────────────
 
-/**
- * ρ resolves a fact to its functional form.
- * The fact is λf. f(data). The type determines what f can do with data.
- */
-const rho = (data: FactData): Fact =>
-  (op: Operation) => op(data)
+/** DEFS maps (noun, operation) to the function that handles it.
+ *  ρ looks up DEFS to resolve a fact to its functional form.
+ *  Runtime registers functions via ↓DEFS (registerDef). */
+type Defs = Map<string, Operation>
+
+function defKey(noun: string, op: string): string { return `${noun}:${op}` }
+function defaultKey(op: string): string { return `*:${op}` }
+
+function registerDef(defs: Defs, noun: string, op: string, fn: Operation): void {
+  defs.set(defKey(noun, op), fn)
+}
+
+function registerDefault(defs: Defs, op: string, fn: Operation): void {
+  defs.set(defaultKey(op), fn)
+}
+
+/** ρ resolves a fact to its functional form by looking up DEFS.
+ *  The fact is λf. f(data). ρ finds the right f from DEFS. */
+function rho(defs: Defs, data: FactData): Fact {
+  return async (op: Operation) => {
+    // ρ-lookup: noun-specific definition first, then default
+    const opName = Object.entries(operations).find(([, v]) => v === op)?.[0] || ''
+    const fn = defs.get(defKey(data.noun, opName))
+      || defs.get(defaultKey(opName))
+      || op
+    return fn(data)
+  }
+}
 
 // ── Resolution functions ────────────────────────────────────────────
 
@@ -237,8 +258,7 @@ const read: Operation = async (data) => {
 }
 
 const readDetail: Operation = async (data) => {
-  const resolve = data.backedBy ? resolveExternalDetail : resolveLocalDetail
-  return resolve(data)
+  return resolveLocalDetail(data)
 }
 
 const create: Operation = async (data) => {
@@ -270,31 +290,48 @@ export async function system(
   env: SystemEnv,
   body?: unknown,
 ): Promise<SystemOutput> {
-  // ↑entity(x) : D — fetch the noun definition from the IR cell
+  // ↑entity(x) : D — fetch the IR from the domain cell
   const irCell = await env.getStub(`ir:${domain}`).get().catch(() => null)
   const ir = irCell?.data?.ir
     ? JSON.parse(typeof irCell.data.ir === 'string' ? irCell.data.ir : JSON.stringify(irCell.data.ir))
     : null
-  const nounDef = ir?.nouns?.[noun]
 
-  // Build the fact's data — everything the fact needs to apply an operation
+  // ↓DEFS — build definitions from the IR and runtime registrations
+  const defs: Defs = new Map()
+  registerDefault(defs, 'read', read)
+  registerDefault(defs, 'readDetail', readDetail)
+  registerDefault(defs, 'create', create)
+
+  // Register external fetch for nouns backed by External Systems.
+  // The instance facts declare: Noun 'X' is backed by External System 'Y'.
+  // For backed nouns, the readDetail function in DEFS IS the external fetch.
+  if (ir?.generalInstanceFacts) {
+    for (const fact of ir.generalInstanceFacts) {
+      if (fact.subjectNoun === 'Noun' && fact.objectNoun === 'External System') {
+        registerDef(defs, fact.subjectValue, 'readDetail', resolveExternalDetail)
+        registerDef(defs, fact.subjectValue, 'read', async (d) => {
+          const page = parseInt(d.params.page || '1')
+          const limit = parseInt(d.params.limit || '100')
+          return resolveExternal(d, page, limit)
+        })
+      }
+    }
+  }
+
+  // Build the fact's data
   const factData: FactData = {
     noun,
     id: params._id,
     domain,
     params,
     body,
-    backedBy: nounDef?.backedBy,
     env,
   }
-
-  // ρ resolves the fact to a functional form based on its type.
-  // The fact is λf. f(data). It receives the operation and applies it.
-  const fact = rho(factData)
 
   // ↑op(x) — resolve the operation from the HTTP method
   const operation = operations[op]
 
-  // (ρ fact) : op — the fact applies the operation
+  // (ρ fact) : op — ρ looks up DEFS for this noun and operation
+  const fact = rho(defs, factData)
   return fact(operation)
 }
