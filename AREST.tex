@@ -71,7 +71,8 @@ $\rho$ resolves the fact type ($x_1$) from $\mathit{DEFS}$ to determine the func
 
 Each combining form~\cite[Sec.\,11.2.4]{backus78} is an FFP object with a domain interpretation:
 
-\begin{center}
+\begin{table}[h]
+\centering
 \small
 \begin{tabular}{@{}lll@{}}
 \toprule
@@ -85,11 +86,17 @@ $\langle\alpha, f\rangle$ & Apply-to-all & Traversal \\
 $\langle/, f\rangle$ & Insert & Aggregation \\
 $\langle\mathit{bu}, f, x\rangle$ & Binary-to-unary & Query \\
 $\bar{x}$ & Constant & Literal \\
+\midrule
+$\mathit{Filter}(p)$ & Restriction & Constraint \\
+$\mathit{distl}$ & Distribute-left & Join preparation \\
+$\mathit{eq}$ & Equality test & Predicate \\
+$\mathit{foldl}\;f\;z\;E$ & Left fold & Accumulation \\
 \bottomrule
 \end{tabular}
-\end{center}
+\caption{FFP primitives with domain interpretations.}\label{tab:ffp}
+\end{table}
 
-A fact type $\langle\mathit{CONS}, s_1, \ldots, s_n\rangle$ is a function that produces a fact when applied to object instances. Partially applied via $\mathit{bu}$ it produces a query.
+A fact type $\langle\mathit{CONS}, s_1, \ldots, s_n\rangle$ (Table~\ref{tab:ffp}) is a function that produces a fact when applied to object instances. Partially applied via $\mathit{bu}$ (Table~\ref{tab:ffp}) it produces a query.
 
 The compiled form for each FORML\,2 construct:
 
@@ -102,10 +109,10 @@ The compiled form for each FORML\,2 construct:
 Entity type \texttt{X(.ref)} & $\langle\mathit{CONS}, s_1, \ldots, s_n\rangle$ \\
 Fact type \texttt{X r Y} & $\langle\mathit{CONS}, s_1, s_2\rangle$ (binary) \\
 Derivation rule & $\langle\mathit{COMP}, f, g\rangle$ \\
-State machine & $\mathit{foldl}\;\mathit{transition}\;s_0\;E$ \\
+State machine & $\mathit{foldl}\;\mathit{transition}\;s_0\;E$ (Table~\ref{tab:ffp}) \\
 Instance fact & $\bar{x}$ asserted into $P$ \\
 \midrule
-\multicolumn{2}{@{}l@{}}{\textit{Constraints (all compile to $\mathit{Filter}(p) : P$)}} \\
+\multicolumn{2}{@{}l@{}}{\textit{Constraints (all compile to $\mathit{Filter}(p) : P$, Table~\ref{tab:ffp})}} \\
 \midrule
 \multicolumn{2}{@{}l@{}}{\textit{Cardinality family:} $p = \mathit{count}(\mathit{scope}) \notin [k, m]$} \\
 UC, MC, FC, XC, XO, OR & scope $\in$ \{role, participation\} \\
@@ -123,7 +130,7 @@ VC (value) & target $=$ declared value set \\
 
 \subsection{Relational Algebra}
 
-Codd's adequate $\theta_1$~\cite[Sec.\,2.2]{codd70} as FFP definitions:
+Codd's adequate $\theta_1$~\cite[Sec.\,2.2]{codd70} as FFP definitions (all primitives from Table~\ref{tab:ffp}):
 \begin{align}
 \pi_L(R) &\equiv \alpha\,[s_{i_1}, \ldots, s_{i_k}] : R \label{eq:proj} \\
 R \mathbin{*} S &\equiv \mathit{Filter}(\mathit{eq} \circ [s_{\mathit{sh}}]) \circ \mathit{distl} \label{eq:join} \\
@@ -131,6 +138,7 @@ R_{L|_M}\!S &\equiv \mathit{Filter}(p) : R \label{eq:restrict} \\
 R \cdot S &\equiv \pi_{1s}(R \mathbin{*} S) \label{eq:rcomp} \\
 \gamma(R) &\equiv \mathit{Filter}(\mathit{eq} \circ [s_1, s_n]) : R \label{eq:tie}
 \end{align}
+\noindent where $s_{\mathit{sh}}$ selects the roles shared between $R$ and $S$.
 
 \noindent $P$ is a named set of relations in normal form (ORM\,2 elementary facts are 5NF by construction~\cite[Ch.\,12]{halpin08}). Codd shows that $\theta_1 = \{\text{projection, natural join, restriction, tie}\}$ is adequate for the named set~\cite{codd72}. Equations~(\ref{eq:proj})--(\ref{eq:tie}) express each element of $\theta_1$ as an FFP definition. The combining forms that query the population are the same combining forms that evaluate constraints and derive facts. There is no separate query language. The evaluation algebra is the query algebra.
 
