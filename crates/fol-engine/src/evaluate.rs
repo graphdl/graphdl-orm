@@ -446,7 +446,7 @@ mod tests {
             value_type: None,
             super_type: None,
             world_assumption: WorldAssumption::default(),
-            ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false, backed_by: None,
+            ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
         }
     }
 
@@ -676,7 +676,7 @@ mod tests {
             enum_values: Some(vec!["#".to_string(), "##".to_string(), "**".to_string()]),
             value_type: None, super_type: None,
             world_assumption: WorldAssumption::default(),
-            ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false, backed_by: None,
+            ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
         });
         ir.fact_types.insert("ft1".to_string(), FactTypeDef {
             schema_id: String::new(),
@@ -848,7 +848,7 @@ mod tests {
             object_type: "value".to_string(),
             enum_values: Some(vec!["internal-details".to_string()]),
             value_type: None, super_type: None,
-            world_assumption: WorldAssumption::default(), ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false, backed_by: None,
+            world_assumption: WorldAssumption::default(), ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
         });
 
         ir.fact_types.insert("ft_resp".to_string(), FactTypeDef {
@@ -1041,7 +1041,7 @@ mod tests {
         ir.nouns.insert("Teacher".to_string(), NounDef {
             object_type: "entity".to_string(), enum_values: None, value_type: None,
             super_type: Some("Academic".to_string()),
-            world_assumption: WorldAssumption::default(), ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false, backed_by: None,
+            world_assumption: WorldAssumption::default(), ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
         });
         ir.nouns.insert("Rank".to_string(), make_noun("value"));
         ir.fact_types.insert("ft1".to_string(), FactTypeDef {
@@ -1180,7 +1180,7 @@ mod tests {
             value_type: Some("string".to_string()),
             super_type: None,
             world_assumption: WorldAssumption::default(),
-            ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false, backed_by: None,
+            ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
         });
         ir.nouns.insert("SupportResponse".to_string(), NounDef {
             object_type: "entity".to_string(),
@@ -1188,7 +1188,7 @@ mod tests {
             value_type: None,
             super_type: None,
             world_assumption: WorldAssumption::default(),
-            ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false, backed_by: None,
+            ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
         });
         ir.fact_types.insert("ft1".to_string(), FactTypeDef {
             schema_id: String::new(),
@@ -1235,7 +1235,7 @@ mod tests {
             value_type: Some("string".to_string()),
             super_type: None,
             world_assumption: WorldAssumption::default(),
-            ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false, backed_by: None,
+            ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
         });
         ir.nouns.insert("SupportResponse".to_string(), NounDef {
             object_type: "entity".to_string(),
@@ -1243,7 +1243,7 @@ mod tests {
             value_type: None,
             super_type: None,
             world_assumption: WorldAssumption::default(),
-            ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false, backed_by: None,
+            ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
         });
         ir.fact_types.insert("ft1".to_string(), FactTypeDef {
             schema_id: String::new(),
@@ -1539,7 +1539,7 @@ mod tests {
             value_type: None,
             super_type: None,
             world_assumption: WorldAssumption::default(),
-            ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false, backed_by: None,
+            ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
         });
         ir.fact_types.insert("ft1".to_string(), FactTypeDef {
             schema_id: String::new(),
@@ -1648,7 +1648,7 @@ mod tests {
             value_type: Some("string".to_string()),
             super_type: None,
             world_assumption: WorldAssumption::default(),
-            ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false, backed_by: None,
+            ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
         });
         ir.nouns.insert("SupportResponse".to_string(), NounDef {
             object_type: "entity".to_string(),
@@ -1656,7 +1656,7 @@ mod tests {
             value_type: None,
             super_type: None,
             world_assumption: WorldAssumption::default(),
-            ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false, backed_by: None,
+            ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
         });
         ir.fact_types.insert("ft1".to_string(), FactTypeDef {
             schema_id: String::new(),
@@ -1734,19 +1734,19 @@ mod tests {
             value_type: Some("string".to_string()),
             super_type: None,
             world_assumption: WorldAssumption::default(),
-            ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false, backed_by: None,
+            ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
         });
         ir.nouns.insert("SupportResponse".to_string(), NounDef {
             object_type: "entity".to_string(),
             enum_values: None, value_type: None, super_type: None,
             world_assumption: WorldAssumption::default(),
-            ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false, backed_by: None,
+            ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
         });
         ir.nouns.insert("APIProduct".to_string(), NounDef {
             object_type: "entity".to_string(),
             enum_values: None, value_type: None, super_type: None,
             world_assumption: WorldAssumption::default(),
-            ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false, backed_by: None,
+            ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
         });
         // Three fact types that all reference FieldName — simulates multi-span constraint
         for i in 1..=3 {
@@ -1856,7 +1856,7 @@ mod tests {
             value_type: None,
             super_type: Some("Vehicle".to_string()),
             world_assumption: WorldAssumption::default(),
-            ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false, backed_by: None,
+            ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
         });
         ir.nouns.insert("License".to_string(), make_noun("entity"));
 
@@ -1982,7 +1982,7 @@ mod tests {
             value_type: None,
             super_type: None,
             world_assumption: WorldAssumption::Closed,
-            ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false, backed_by: None,
+            ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
         });
         // OWA noun: Capability (not stated = unknown)
         ir.nouns.insert("Capability".to_string(), NounDef {
@@ -1991,7 +1991,7 @@ mod tests {
             value_type: None,
             super_type: None,
             world_assumption: WorldAssumption::Open,
-            ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false, backed_by: None,
+            ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
         });
 
         ir.nouns.insert("Resource".to_string(), make_noun("entity"));
@@ -2066,7 +2066,7 @@ mod tests {
             value_type: None,
             super_type: None,
             world_assumption: WorldAssumption::Closed,
-            ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false, backed_by: None,
+            ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
         });
         ir.nouns.insert("Name".to_string(), make_noun("value"));
         ir.nouns.insert("Email".to_string(), make_noun("value"));
