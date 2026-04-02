@@ -73,10 +73,6 @@ pub struct NounDef {
     /// true = rigid (fixed classification), false = flexible (can change)
     #[serde(default)]
     pub rigid: bool,
-    /// External System that backs this noun's population.
-    /// When set, resolve fetches from the External System instead of local cells.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub backed_by: Option<String>,
 }
 
 /// A derivation rule in the IR — compiled to a DeriveFn at compile time.

@@ -2974,7 +2974,7 @@ mod schema_tests {
                 value_type: None,
                 super_type: None,
                 world_assumption: WorldAssumption::Closed,
-                ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false, backed_by: None,
+                ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
             });
         }
 

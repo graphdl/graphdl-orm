@@ -633,9 +633,6 @@ fn emit_entities(ir: &types::ConstraintIR, domain: &str) -> Result<JsValue, JsVa
         if let Some(ref obj) = noun.objectifies {
             data.insert("objectifies".into(), serde_json::Value::String(obj.clone()));
         }
-        if let Some(ref backed) = noun.backed_by {
-            data.insert("backedBy".into(), serde_json::Value::String(backed.clone()));
-        }
         if let Some(ref evs) = noun.enum_values {
             if !evs.is_empty() {
                 data.insert("enumValues".into(),

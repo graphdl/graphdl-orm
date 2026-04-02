@@ -47,7 +47,6 @@ fn try_entity_type(line: &str) -> Option<ParseAction> {
         object_type: "entity".into(), enum_values: None, value_type: None,
         super_type: None, world_assumption: WorldAssumption::default(),
         ref_scheme, objectifies: None, subtype_kind: None, rigid: false,
-        backed_by: None,
     }))
 }
 
@@ -57,7 +56,6 @@ fn try_value_type(line: &str) -> Option<ParseAction> {
         object_type: "value".into(), enum_values: None, value_type: None,
         super_type: None, world_assumption: WorldAssumption::default(),
         ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
-        backed_by: None,
     }))
 }
 
@@ -70,7 +68,6 @@ fn try_subtype(line: &str) -> Option<ParseAction> {
         object_type: "entity".into(), enum_values: None, value_type: None,
         super_type: Some(sup), world_assumption: WorldAssumption::default(),
         ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
-        backed_by: None,
     }))
 }
 
@@ -843,26 +840,10 @@ fn apply_action(ir: &mut ConstraintIR, action: Option<ParseAction>, lines: &[Str
                     object_type: "entity".into(), enum_values: None, value_type: None,
                     super_type: Some(sup.clone()), world_assumption: WorldAssumption::default(),
                     ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
-                    backed_by: None,
                 });
             }
         }
         ParseAction::AddFactType(id, def) => {
-            // Check if this fact type connects a noun to External System.
-            // Identified by roles, not by reading text (readings may be internationalized).
-            if def.roles.len() == 2 {
-                let role0_noun = &def.roles[0].noun_name;
-                let role1_noun = &def.roles[1].noun_name;
-                if role1_noun == "External System" {
-                    if let Some(noun) = ir.nouns.get_mut(role0_noun) {
-                        noun.backed_by = Some("External System".into());
-                    }
-                } else if role0_noun == "External System" {
-                    if let Some(noun) = ir.nouns.get_mut(role1_noun) {
-                        noun.backed_by = Some("External System".into());
-                    }
-                }
-            }
             ir.fact_types.entry(id).or_insert(def);
         }
         ParseAction::AddConstraint(c) => { ir.constraints.push(c); }
@@ -1428,20 +1409,6 @@ mod tests {
     }
 
     #[test]
-    fn backed_by_from_roles() {
-        let input = "Vehicle Specs(.VIN) is an entity type.\nExternal System(.Name) is an entity type.\nVehicle Specs is backed by External System.";
-        let ir = parse_markdown(input).unwrap();
-        assert_eq!(ir.nouns["Vehicle Specs"].backed_by.as_deref(), Some("External System"));
-    }
-
-    #[test]
-    fn backed_by_reverse_role_order() {
-        let input = "External System(.Name) is an entity type.\nLog Entry(.id) is an entity type.\nExternal System backs Log Entry.";
-        let ir = parse_markdown(input).unwrap();
-        assert_eq!(ir.nouns["Log Entry"].backed_by.as_deref(), Some("External System"));
-    }
-
-    #[test]
     fn instance_fact_noun_uri() {
         let input = "Noun is an entity type.\nURI is a value type.\n## Fact Types\nNoun has URI.\n## Instance Facts\nNoun 'API Product' has URI '/api'.";
         let ir = parse_markdown(input).unwrap();
@@ -1452,24 +1419,6 @@ mod tests {
         assert_eq!(f.subject_noun, "Noun");
         assert_eq!(f.subject_value, "API Product");
         assert_eq!(f.object_value, "/api");
-    }
-
-    #[test]
-    fn backed_by_subtype() {
-        let input = "API(.Slug) is an entity type.\nAPI Product(.Slug) is an entity type.\nAPI Product is a subtype of API.\nExternal System(.Name) is an entity type.\nAPI Product is backed by External System.";
-        let ir = parse_markdown(input).unwrap();
-        assert_eq!(ir.nouns["API Product"].backed_by.as_deref(), Some("External System"),
-            "Subtype noun should have backed_by");
-        assert!(ir.nouns["API"].backed_by.is_none(),
-            "Supertype should not inherit backed_by");
-    }
-
-    #[test]
-    fn not_backed_by_without_external_system() {
-        let input = "Customer(.Name) is an entity type.\nOrder(.Id) is an entity type.\nCustomer places Order.";
-        let ir = parse_markdown(input).unwrap();
-        assert!(ir.nouns["Customer"].backed_by.is_none());
-        assert!(ir.nouns["Order"].backed_by.is_none());
     }
 
     #[test]
