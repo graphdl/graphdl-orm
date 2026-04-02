@@ -91,3 +91,6 @@ App displays Noun if App has navigable Domain and Noun is defined in that Domain
 ## Instance Facts
 
 Domain 'organizations' has Visibility 'public'.
+
+Noun 'User' is backed by External System 'auth.vin'.
+Noun 'User' has URI '/users'.
