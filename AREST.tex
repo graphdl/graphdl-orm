@@ -84,7 +84,7 @@ Each combining form~\cite[Sec.\,11.2.4]{backus78} is an FFP object with a domain
 $\langle\mathit{CONS}, s_1, \ldots, s_n\rangle$ & Construction & Graph Schema \\
 $s_i$ & Selector & Role \\
 $\langle\mathit{COMP}, f, g\rangle$ & Composition & Derivation \\
-$\langle\mathit{COND}, p, f, g\rangle$ & Condition & Constraint \\
+$\langle\mathit{COND}, p, f, g\rangle$ & Condition & Guard \\
 $\langle\alpha, f\rangle$ & Apply-to-all & Traversal \\
 $\langle/, f\rangle$ & Insert & Aggregation \\
 $\langle\mathit{bu}, f, x\rangle$ & Binary-to-unary & Query \\
@@ -105,12 +105,12 @@ The compiled form for each FORML\,2 construct:
 \midrule
 Entity type \texttt{X(.ref)} & $\langle\mathit{CONS}, s_1, \ldots, s_n\rangle$ \\
 Fact type \texttt{X r Y} & $\langle\mathit{CONS}, s_1, s_2\rangle$ (binary) \\
-UC: \texttt{at most one} & $\langle\mathit{COND},\, (\mathit{count} \leq 1) \circ \mathit{Filter},\, \bar{\phi},\, \mathit{viol}\rangle$ \\
-MC: \texttt{each\ldots some} & $\langle\mathit{COND},\, \mathit{null?},\, \mathit{viol},\, \bar{\phi}\rangle$ \\
-UC$+$MC: \texttt{exactly one} & $\langle\mathit{COND},\, (\mathit{count} = 1),\, \bar{\phi},\, \mathit{viol}\rangle$ \\
-FC: \texttt{at least $k$\ldots} & $\langle\mathit{COND},\, (k \leq \mathit{count} \leq m),\, \bar{\phi},\, \mathit{viol}\rangle$ \\
+UC: \texttt{at most one} & $\mathit{Filter}(\mathit{count}(s_i) > 1)$ \\
+MC: \texttt{each\ldots some} & $\mathit{Filter}(\mathit{absent?} \circ s_j)$ \\
+UC$+$MC: \texttt{exactly one} & $\mathit{Filter}(\mathit{count}(s_i) \neq 1)$ \\
+FC: \texttt{at least $k$\ldots} & $\mathit{Filter}(\neg(k \leq \mathit{count}(s_i) \leq m))$ \\
 Derivation rule & $\langle\mathit{COMP}, f, g\rangle$ \\
-State machine & $/\mathit{transition} : \langle e_1, \ldots, e_n \rangle$ \\
+State machine & $\mathit{foldl}\;\mathit{transition}\;s_0\;E$ \\
 Instance fact & $\bar{x}$ asserted into $P$ \\
 \bottomrule
 \end{tabular}
@@ -156,14 +156,14 @@ A \textsc{Create} command:
 \begin{align}
 \mathit{create} &= \mathit{emit} \circ \mathit{validate} \circ \mathit{derive} \circ \mathit{resolve} \label{eq:create}
 \end{align}
-$\mathit{resolve}$ determines identity from the reference scheme. $\mathit{derive}$ forward-chains derivation rules to the least fixed point. $\mathit{validate}$ evaluates every constraint against the complete population. $\mathit{emit}$ always runs. An alethic violation produces a rejection and the state is unchanged ($D' = D$). A deontic violation produces warnings but the operation succeeds ($D' = D''$). The violation message is the original reading (Corollary~\ref{cor:verbalize}).
+$\mathit{resolve}$ determines identity from the reference scheme. $\mathit{derive}$ forward-chains derivation rules to the least fixed point. $\mathit{validate}$ applies every constraint as a restriction~(\ref{eq:restrict}) over the complete population, producing violation sets. $\mathit{emit}$ always runs. An alethic violation produces a rejection and the state is unchanged ($D' = D$). A deontic violation produces warnings but the operation succeeds ($D' = D''$). The violation message is the original reading (Corollary~\ref{cor:verbalize}).
 
-A state machine is a fold~\cite[Sec.\,11.2.4]{backus78} over an event stream:
+A state machine is a left fold over an event stream:
 \begin{align}
-\mathit{machine} &= /\mathit{transition} : \langle e_1, \ldots, e_n \rangle \label{eq:sm} \\
-\mathit{transition} &= (p \to \bar{s'} ;\; \mathit{id}) \label{eq:trans}
+\mathit{machine}(s_0, E) &= \mathit{foldl}\;\mathit{transition}\;s_0\;E \label{eq:sm} \\
+\mathit{transition}(s, e) &= (p \to \bar{s'} ;\; \bar{s})\!:\!\langle s, e \rangle \label{eq:trans}
 \end{align}
-The fold ($/$) applies each event in sequence, accumulating the state. Each transition checks a condition ($p$). If the condition holds, the state changes to $s'$. If not, the state is unchanged ($\mathit{id}$). The fold is pure replay. Applying the event stream to a machine produces the current state without side effects, and no entry verbs or callbacks execute. This is restoration of a hibernating machine. Only a new event, not yet in the stream, causes a real transition where the entry verb fires and effects are produced.
+where $\mathit{foldl}\;f\;z\;\langle\rangle = z$ and $\mathit{foldl}\;f\;z\;\langle e, E'\rangle = \mathit{foldl}\;f\;(f\;z\;e)\;E'$. Events are stored and processed in chronological order. Each transition checks a guard~($p$). If the guard holds, the state changes to $s'$. If not, the state is unchanged~($\bar{s}$). The fold is pure replay. Applying the event stream to a machine produces the current state without side effects, and no entry verbs or callbacks execute. This is restoration of a hibernating machine. Only a new event, not yet in the stream, causes a real transition where the entry verb fires and effects are produced.
 
 Deletion is a transition to a terminal state, not a distinct primitive. The entity receives $\mathit{delete}$ as the operation. It reaches a state with no outgoing transitions and is excluded from query results by restriction~(\ref{eq:restrict}).
 
@@ -195,11 +195,11 @@ Transition 'place' is to
   Status 'Placed'.
 \end{lstlisting}
 
-The constraint reading is an FFP object. $\rho$ yields the following.
+The constraint reading compiles to a restriction~(\ref{eq:restrict}). $\rho$ yields the following.
 \begin{align*}
-(\rho\,\mathit{reading}) = \langle\mathit{COND},\; &(\mathit{count} \leq 1) \circ \mathit{Filter}(\mathit{eq} \circ [s_1, \bar{o}]),\\
-&\bar{\phi},\; \mathit{violation}\rangle : P_{\mathit{placedBy}}
+(\rho\,\mathit{reading})\!:\!P_{\mathit{placedBy}} = \mathit{Filter}(\mathit{count}(s_1) > 1) : P_{\mathit{placedBy}}
 \end{align*}
+The result is the set of Orders with more than one Customer in $\mathit{placedBy}$. An empty set means the constraint is satisfied.
 
 \texttt{POST /orders \{"customer":"acme"\}} is the application $\mathit{SYSTEM}\!:\!x$ where the addressed entity is $\mathit{orders}$ and the operation is $\mathit{create}$~(\ref{eq:create}). By~(\ref{eq:sys}), $(\rho\,\mathit{orders})\!:\!\mathit{create}$ applies the pipeline:
 \begin{align*}
@@ -218,7 +218,7 @@ The response includes links derived from $P'$ (Theorem~\ref{thm:hateoas}).
       "method": "POST" } } }
 \end{lstlisting}
 
-Following ``place'' applies~(\ref{eq:sm}). The new representation contains $\{\mathit{ship}\}$, not $\{\mathit{place}\}$. If a second command assigns a different Customer to the same Order, the UC fires and the command is rejected. The violation is returned as the original reading (Corollary~\ref{cor:verbalize}).
+Following ``place'' applies~(\ref{eq:sm}). The new representation contains $\{\mathit{ship}\}$, not $\{\mathit{place}\}$. If a second command assigns a different Customer to the same Order, the UC restriction produces a non-empty violation set and the command is rejected. The violation is returned as the original reading (Corollary~\ref{cor:verbalize}).
 
 \section{Execution Semantics}
 
@@ -242,7 +242,7 @@ The system operates over facts~$(P)$, computations~$(O$ via $\rho)$, and inputs~
 
 \subsection{Isolation}
 
-A state machine~(\ref{eq:sm}) is a fold over an event stream. Each event is an input $x$. The accumulator is the state $D$. The fold body is $\mu(\mathit{SYSTEM}\!:\!x) = \langle o, D'\rangle$. The application is this fold. The fold is well-defined only if each $\mu$ runs to completion before the next event mutates $D$. Otherwise two concurrent applications of $\mu$ may read the same $D$, and one silently overwrites the other.
+A state machine~(\ref{eq:sm}) is a left fold over an event stream. Each event is an input $x$. The accumulator is the state $D$. The fold body is $\mu(\mathit{SYSTEM}\!:\!x) = \langle o, D'\rangle$. The application is this fold. The fold is well-defined only if each $\mu$ runs to completion before the next event mutates $D$. Otherwise two concurrent applications of $\mu$ may read the same $D$, and one silently overwrites the other.
 
 Backus states this directly: ``the state cannot change during the computation of system:x''~\cite[Sec.\,14.6(c)]{backus78}. We make the requirement a definition so that theorems can reference it.
 
@@ -263,14 +263,14 @@ E_n &= \mathit{Filter}(\mathit{eq} \circ [\mathit{RMAP}, \bar{n}]) : E \label{eq
 
 Each cell folds its stream independently:
 \begin{align}
-D_n' &= /\mu_n : E_n \label{eq:cellfold}
+D_n' &= \mathit{foldl}\;\mu_n\;D_n\;E_n \label{eq:cellfold}
 \end{align}
 where $\mu_n$ is $\mathit{SYSTEM}$ restricted to cell $n$. By Definition~\ref{def:isolation}, no $\mu_n$ reads another cell's in-progress state. Cross-cell queries read committed state:
 \begin{align}
 P &= \textstyle\bigcup_n \uparrow\!\mathit{FILE}\!:\!D_n \label{eq:pop}
 \end{align}
 
-The router distributes events via $\alpha\,\mathit{RMAP}$~(apply-to-all), and each cell reduces its partition via $/\mu_n$~(insert). Adding cells to the cluster scales $\mathit{SYSTEM}$ horizontally without changing its definition.
+The router distributes events via $\alpha\,\mathit{RMAP}$~(apply-to-all), and each cell reduces its partition via $\mathit{foldl}\;\mu_n$. Adding cells to the cluster scales $\mathit{SYSTEM}$ horizontally without changing its definition.
 
 \section{Properties}
 
@@ -314,7 +314,7 @@ and $\rho(\mathit{compile}(\mathit{parse}(r)))$ is the executable for every $r \
 \end{theorem}
 
 \begin{proof}
-$\mathit{parse}$ is injective by Theorem~\ref{thm:grammar}: each sentence has one parse, so distinct sentences yield distinct formulas. $\mathit{compile}$ is injective: the $(\mathit{quant}_1, \mathit{quant}_2)$ pair determines the constraint kind (Theorem~\ref{thm:grammar}), which determines the FFP object structure (Condition for UC, null-test for MC, count for FC). Both have left inverses; composing: $\mathit{parse}^{-1} \circ \mathit{compile}^{-1} \circ \mathit{compile} \circ \mathit{parse} = \mathit{id}_R$. Executability: $\rho$ maps the compiled object to a function by~\cite[Sec.\,13.4]{backus78}.
+$\mathit{parse}$ is injective by Theorem~\ref{thm:grammar}: each sentence has one parse, so distinct sentences yield distinct formulas. $\mathit{parse}$ recognizes the structural positions of Theorem~\ref{thm:grammar} and produces the corresponding formula. $\mathit{compile}$ is injective: the $(\mathit{quant}_1, \mathit{quant}_2)$ pair determines the constraint kind (Theorem~\ref{thm:grammar}), and each kind compiles to a restriction~(\ref{eq:restrict}) with a distinct predicate ($\mathit{count} > 1$ for UC, $\mathit{absent?}$ for MC, $\mathit{count} \neq 1$ for UC$+$MC, range predicate for FC). Distinct predicates yield distinct FFP objects. Both $\mathit{parse}$ and $\mathit{compile}$ have left inverses ($\mathit{compile}^{-1}$ is Halpin and Curland's verbalization algorithm~\cite{halpin06}); composing: $\mathit{parse}^{-1} \circ \mathit{compile}^{-1} \circ \mathit{compile} \circ \mathit{parse} = \mathit{id}_R$. Executability: $\rho$ maps the compiled object to a function by~\cite[Sec.\,13.4]{backus78}.
 \end{proof}
 
 \noindent\textbf{Remark} (Surjectivity). $\mathit{compile}$ is not surjective. There exist FFP objects in $O$ that no FORML\,2 reading produces. This is intentional: runtime-registered functions (Sec.\,5.3) occupy the complement. FORML\,2 readings cover the domain layer. Registered functions cover the platform layer. Together they span the objects in $\mathit{DEFS}$.
@@ -324,13 +324,13 @@ Let $F_S : 2^P \to 2^P$ be the monotonic operator that applies all derivation ru
 \begin{enumerate}[nosep]
 \item $P' = P \cup \mathit{resolve}(S, I)$ contains all entity facts entailed by $(S, I)$;
 \item $P'' = \mathit{lfp}(F_S, P')$, the least fixed point of $F_S$ above $P'$;
-\item $V = \{(\rho\,c)\!:\!P'' \mid c \in C_S\}$ evaluates every constraint;
+\item $V = \bigcup\{(\rho\,c)\!:\!P'' \mid c \in C_S\}$ collects all violations (each constraint produces a possibly empty set via restriction);
 \item $o$ is the REST representation of $(P'', V, \mathit{links}(s))$ and $D' = D[\mathit{FILE} \mapsto P'']$ if $V$ contains no alethic violation, else $D' = D$.
 \end{enumerate}
 \end{theorem}
 
 \begin{proof}
-$P$ is finite. $F_S$ is monotonic (derivation rules only add facts). By Knaster-Tarski, $\mathit{lfp}(F_S, P')$ exists and is unique. Iterative application of $F_S$ reaches it in at most $|P''_{\max}| - |P'|$ steps. $\mathit{validate}$ evaluates every $c \in C_S$ against the fixed point; no constraint is skipped. $\mathit{emit}$ constructs $o$ from $P''$, $V$, and $\mathit{links}(s)$ (Theorem~\ref{thm:hateoas}). The state does not change during evaluation~\cite[Sec.\,14.6(c)]{backus78}; Definition~\ref{def:isolation} ensures no concurrent write to the same cell.
+$P$ is finite. $F_S$ is monotonic (derivation rules only add facts). By Knaster-Tarski, $\mathit{lfp}(F_S, P')$ exists and is unique. Iterative application of $F_S$ reaches it in at most $|P''_{\max}| - |P'|$ steps. $\mathit{validate}$ applies every $c \in C_S$ as a restriction over the fixed point; each produces a (possibly empty) set of violations. $\mathit{emit}$ constructs $o$ from $P''$, $V$, and $\mathit{links}(s)$ (Theorem~\ref{thm:hateoas}). The state does not change during evaluation~\cite[Sec.\,14.6(c)]{backus78}; Definition~\ref{def:isolation} ensures no concurrent write to the same cell.
 \end{proof}
 
 \begin{theorem}[HATEOAS as Projection]\label{thm:hateoas}
@@ -345,6 +345,22 @@ where $p(t) = (s_{\mathit{from}}(t) = s) \lor \mathit{anc}(s_{\mathit{from}}(t),
 $T \subseteq P$. $\mathit{Filter}$ is restriction~(\ref{eq:restrict}); $\pi$ is projection~(\ref{eq:proj}). Both are $\theta_1$ operations on the named set. The representation renders $P$; $\mathit{links}(s)$ is derived from $P$ by $\theta_1$ operations and therefore appears in the representation without external computation.
 \end{proof}
 
+\begin{theorem}[Navigation as Constraint Projection]\label{thm:nav}
+Let $C_{\mathit{UC}} \subseteq C_S$ be the uniqueness constraints and $F_B$ be the binary fact types between entity nouns. For a fact type $f \in F_B$ with roles $(r_0, r_1)$, if a UC constrains $r_0$, then the $r_0$ noun is a child of the $r_1$ noun. The navigation links for an entity $e$ of noun $n$ are:
+\begin{align}
+\mathit{nav}(e, n) &= \pi_{\mathit{noun}}\!\left(\mathit{Filter}(p_{\mathit{child}}) : F_B\right) \;\cup\; \pi_{\mathit{noun}}\!\left(\mathit{Filter}(p_{\mathit{parent}}) : F_B\right) \label{eq:nav}
+\end{align}
+where $p_{\mathit{child}}(f) = (\mathit{role}_1(f) = n) \land \mathit{uc}(\mathit{role}_0(f))$ selects children and $p_{\mathit{parent}}(f) = (\mathit{role}_0(f) = n) \land \mathit{uc}(\mathit{role}_0(f))$ selects the parent.
+\end{theorem}
+
+\begin{proof}
+$C_{\mathit{UC}}$ and $F_B$ are subsets of $S$. $\mathit{Filter}$ is restriction; $\pi$ is projection. The UC on $r_0$ establishes a functional dependency from $r_0$ to $r_1$ (RMAP step 2), making $r_0$ the dependent noun. The entity hierarchy and the URL structure are both determined by this projection without external configuration. Combined with $\mathit{links}(s)$ from Theorem~\ref{thm:hateoas}, the full representation of navigable links is:
+\[
+\mathit{links}_{\mathit{full}}(e, n, s) = \mathit{nav}(e, n) \;\cup\; \mathit{links}(s)
+\]
+Both components are $\theta_1$ operations on $S$ and $P$ respectively.
+\end{proof}
+
 \begin{corollary}[Deletion as Terminal State]\label{cor:delete}
 Let $s_{\mathit{del}}$ be a state with no outgoing transitions in $T$. Then $\mathit{links}(s_{\mathit{del}}) = \emptyset$, and the entity is excluded from query results by $\mathit{Filter}(\neg\,\mathit{terminal?}) : P$.
 \end{corollary}
@@ -355,17 +371,17 @@ Define the \emph{representation} of an entity $e$ in population $P$ under schema
 \mathit{repr}(e, P, S) = \;&\{(\rho\,s_i)\!:\!f \mid f \in P,\, f \text{ involves } e\} \\
 \cup\; &\{(\rho\,r)\!:\!P \mid r \in S_{\mathit{derivations}}\} \\
 \cup\; &\{(\rho\,c)\!:\!P \mid c \in S_{\mathit{constraints}}\} \\
-\cup\; &\mathit{links}(\mathit{status}(e, P))
+\cup\; &\mathit{links}_{\mathit{full}}(e, n, \mathit{status}(e, P))
 \end{align*}
-where $\mathit{status}(e, P)$ is the current status of $e$, a fact in $P$ (absorbed into the entity's cell by RMAP). Then for every $v \in \mathit{repr}(e, P, S)$, there exists $f \in O$ such that $v = (\rho\,f)\!:\!P$.
+where $\mathit{status}(e, P)$ is the current status of $e$, a fact in $P$ (absorbed into the entity's cell by RMAP), and $\mathit{links}_{\mathit{full}}$ combines navigation links (Theorem~\ref{thm:nav}) with transition links (Theorem~\ref{thm:hateoas}). Then for every $v \in \mathit{repr}(e, P, S)$, there exists $f \in O$ such that $v = (\rho\,f)\!:\!P$.
 \end{theorem}
 
 \begin{proof}
-Each component of $\mathit{repr}$ is a $\rho$-application by construction. Selectors extract attributes. Derivation rules are FFP objects whose $\rho$-image computes derived facts. Constraints are FFP objects whose $\rho$-image evaluates to $\phi$ or a violation. Links are $\theta_1$ operations (Theorem~\ref{thm:hateoas}). No value in $\mathit{repr}$ is produced by a mechanism outside $\rho$.
+Each component of $\mathit{repr}$ is a $\rho$-application by construction. Selectors extract attributes. Derivation rules are FFP objects whose $\rho$-image computes derived facts. Constraints are restrictions~(\ref{eq:restrict}) whose $\rho$-image produces a set of violations (empty if satisfied). Links are $\theta_1$ operations (Theorem~\ref{thm:hateoas}). No value in $\mathit{repr}$ is produced by a mechanism outside $\rho$.
 \end{proof}
 
 \begin{corollary}[Violation Verbalization]\label{cor:verbalize}
-Let $c \in C_S$ be a constraint object compiled from reading $r \in R$. If $(\rho\,c)\!:\!P'' \neq \bar{\phi}$, the violation output is $\mathit{compile}^{-1}(c)$, recovering $r$ by Theorem~\ref{thm:spec}. The error message is the original reading.
+Let $c \in C_S$ be a constraint object compiled from reading $r \in R$. If $(\rho\,c)\!:\!P'' \neq \emptyset$, the violation output is $\mathit{compile}^{-1}(c)$, recovering $r$ by Theorem~\ref{thm:spec}. The error message is the original reading.
 \end{corollary}
 
 \noindent Each $\theta_1$ primitive has a FORML\,2 verbalization. Projection verbalizes as role selection, join as qualified composition, restriction as constraint predicate, tie as self-reference. Halpin and Curland~\cite{halpin06} give the automated verbalization algorithm for ORM\,2 constraints. Composed $\theta_1$ operations verbalize via FORML\,2 qualified readings (``who\ldots'', ``that\ldots''), which parse unambiguously by Theorem~\ref{thm:grammar}.
@@ -382,7 +398,7 @@ Each new reading $r' \in R'$ parses unambiguously (Theorem~\ref{thm:grammar} dep
 
 \section{Middleware Elimination}
 
-Traditional middleware (authentication, validation, rate limiting, transformation) is either a COND constraint, a COMP derivation, or a fact in $P$. Authorization, for instance, is a derivation. ``User accesses Domain iff User belongs to Organization that manages Domain'' compiles to $\langle\mathit{COMP}, f, g\rangle$ whose $\rho$-image computes the access predicate over $P$. External service calls, database persistence, and UI rendering are not middleware either. They are runtime functions registered into $\mathit{DEFS}$ and applied via $\rho$ (Sec.\,5.3). Theorem~\ref{thm:derive} leaves no room for a computation layer outside $\rho$. Every value in the representation is a $\rho$-application.
+Traditional middleware (authentication, validation, rate limiting, transformation) is either a restriction over $P$, a COMP derivation, or a fact in $P$. Authorization, for instance, is a derivation. ``User accesses Domain iff User belongs to Organization that manages Domain'' compiles to $\langle\mathit{COMP}, f, g\rangle$ whose $\rho$-image computes the access predicate over $P$. External service calls, database persistence, and UI rendering are not middleware either. They are runtime functions registered into $\mathit{DEFS}$ and applied via $\rho$ (Sec.\,5.3). Theorem~\ref{thm:derive} leaves no room for a computation layer outside $\rho$. Every value in the representation is a $\rho$-application.
 
 \section{Conclusion}
 
