@@ -350,7 +350,7 @@ Let $T = \{(s_i, s_j, e_k)\} \subseteq P$ be transition facts and $s$ the curren
 \begin{align}
 \mathit{links}(s) &= \pi_{\mathit{event}}\!\left(\mathit{Filter}(p) : T\right) \label{eq:hateoas}
 \end{align}
-where $p(t) = (s_{\mathit{from}}(t) = s)$.
+where $p(t) = (s_{\mathit{from}}(t) = s) \lor \mathit{anc}(s_{\mathit{from}}(t), s)$ and $\mathit{anc}(s', s)$ holds when $s$ is reachable from $s'$ through the transition graph. This includes hierarchical containment (a parent state's transitions apply to all descendant states) and cycles (every state in a loop is an ancestor of every other).
 \end{theorem}
 
 \begin{proof}
