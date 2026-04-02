@@ -77,7 +77,7 @@ Each combining form~\cite[Sec.\,11.2.4]{backus78} is an FFP object with a domain
 \toprule
 \textbf{FFP Object} & \textbf{Form} & \textbf{Domain} \\
 \midrule
-$\langle\mathit{CONS}, s_1, \ldots, s_n\rangle$ & Construction & Graph Schema \\
+$\langle\mathit{CONS}, s_1, \ldots, s_n\rangle$ & Construction & Fact Type \\
 $s_i$ & Selector & Role \\
 $\langle\mathit{COMP}, f, g\rangle$ & Composition & Derivation \\
 $\langle\mathit{COND}, p, f, g\rangle$ & Condition & Guard \\
@@ -89,7 +89,7 @@ $\bar{x}$ & Constant & Literal \\
 \end{tabular}
 \end{center}
 
-A graph schema $\langle\mathit{CONS}, s_1, \ldots, s_n\rangle$ applied to all roles is a fact. Partially applied via $\mathit{bu}$ it is a query.
+A fact type $\langle\mathit{CONS}, s_1, \ldots, s_n\rangle$ applied to all roles is a fact. Partially applied via $\mathit{bu}$ it is a query.
 
 The compiled form for each FORML\,2 construct:
 
