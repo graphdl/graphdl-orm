@@ -213,6 +213,243 @@ fn try_ring(line: &str, noun_names: &[String]) -> Option<ParseAction> {
     }))
 }
 
+/// try_subset — SS: "If some A R₁ some B then that A R₂ that B."
+/// Distinguishes from ring: subset has multiple different base noun types.
+fn try_subset(line: &str, noun_names: &[String]) -> Option<ParseAction> {
+    let clean = line.trim_end_matches('.');
+    // Must start with "If " and contain " then "
+    if !clean.starts_with("If ") { return None; }
+    let then_idx = clean.find(" then ")?;
+    let antecedent = &clean[3..then_idx];
+    let consequent = &clean[then_idx + 6..];
+
+    // Antecedent must contain "some" (existential), consequent must contain "that" (back-ref)
+    if !antecedent.contains("some ") { return None; }
+    if !consequent.contains("that ") { return None; }
+
+    // Collect base noun types from antecedent
+    let ant_bases: Vec<&str> = antecedent
+        .split_whitespace()
+        .filter_map(|word| {
+            let w = word.trim_end_matches(',');
+            let (base, _) = parse_role_token(w);
+            noun_names.iter().any(|n| n == base).then_some(base)
+        })
+        .collect();
+
+    if ant_bases.len() < 2 { return None; }
+
+    // Subset has multiple DIFFERENT base noun types (distinguishes from ring which has all same)
+    let first = ant_bases[0];
+    let all_same = ant_bases.iter().all(|b| *b == first);
+    if all_same { return None; }
+
+    // Build spans: [0] = subset (antecedent), [1] = superset (consequent)
+    // SpanDef with empty fact_type_id — resolve_constraint_schema fills it in later
+    let spans = vec![
+        SpanDef { fact_type_id: String::new(), role_index: 0, subset_autofill: None },
+        SpanDef { fact_type_id: String::new(), role_index: 0, subset_autofill: None },
+    ];
+
+    Some(ParseAction::AddConstraint(ConstraintDef {
+        id: String::new(), kind: "SS".into(), modality: "alethic".into(),
+        deontic_operator: None, text: clean.into(),
+        spans, set_comparison_argument_length: None, clauses: None,
+        entity: None, min_occurrence: None, max_occurrence: None,
+    }))
+}
+
+/// try_equality — EQ: "...if and only if..." or "all or none of the following hold:..."
+fn try_equality(line: &str) -> Option<ParseAction> {
+    let clean = line.trim_end_matches('.');
+    let matches = clean.contains(" if and only if ")
+        || clean.to_lowercase().starts_with("all or none of the following hold");
+    if !matches { return None; }
+    Some(ParseAction::AddConstraint(ConstraintDef {
+        id: String::new(), kind: "EQ".into(), modality: "alethic".into(),
+        deontic_operator: None, text: clean.into(),
+        spans: vec![], set_comparison_argument_length: None, clauses: None,
+        entity: None, min_occurrence: None, max_occurrence: None,
+    }))
+}
+
+/// try_set_comparison — XO, XC, OR
+/// Patterns:
+///   "For each A, exactly one of the following holds: ..." → XO
+///   "For each A, at most one of the following holds: ..."  → XC
+///   "For each A, at least one of the following holds: ..." → OR (inclusive disjunction)
+///   "Each A R₁ some B₁ or R₂ some B₂."                   → OR (DMaC disjunctive MC)
+fn try_set_comparison(line: &str, noun_names: &[String]) -> Option<ParseAction> {
+    let clean = line.trim_end_matches('.');
+
+    // "For each X, <quantifier> of the following holds: clause1; clause2..."
+    if let Some(rest) = clean.strip_prefix("For each ") {
+        let comma = rest.find(',')?;
+        let entity = rest[..comma].trim().to_string();
+        let body = rest[comma + 1..].trim();
+
+        let (kind, after_quant) = if let Some(r) = body.strip_prefix("exactly one of the following holds:") {
+            ("XO", r)
+        } else if let Some(r) = body.strip_prefix("at most one of the following holds:") {
+            ("XC", r)
+        } else if let Some(r) = body.strip_prefix("at least one of the following holds:") {
+            ("OR", r)
+        } else {
+            return None;
+        };
+
+        let clauses: Vec<String> = after_quant
+            .split(';')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        return Some(ParseAction::AddConstraint(ConstraintDef {
+            id: String::new(), kind: kind.into(), modality: "alethic".into(),
+            deontic_operator: None, text: clean.into(),
+            spans: vec![], set_comparison_argument_length: Some(clauses.len()),
+            clauses: Some(clauses),
+            entity: Some(entity), min_occurrence: None, max_occurrence: None,
+        }));
+    }
+
+    // "Each A R₁ some B₁ or R₂ some B₂." — DMaC disjunctive MC → OR
+    if let Some(rest) = clean.strip_prefix("Each ") {
+        // Must contain " or " and reference known nouns
+        if !rest.contains(" or ") { return None; }
+        // Find a known entity noun at the start
+        let entity = noun_names.iter().find(|n| rest.starts_with(n.as_str()))?.clone();
+        let after = rest[entity.len()..].trim();
+        // Must have " or " in the remainder (not " or a/an " as in totality)
+        if !after.contains(" or ") { return None; }
+        // Exclude totality pattern: "Each X is a Y or a Z" (handled by try_totality)
+        // A disjunctive MC has " or is" or " or has" — a verb after "or"
+        let or_idx = after.find(" or ")?;
+        let after_or = &after[or_idx + 4..];
+        // Totality uses "a " / "an " after "or"; disjunctive MC uses a predicate verb
+        let is_totality = after_or.starts_with("a ") || after_or.starts_with("an ");
+        if is_totality { return None; }
+
+        let clauses = vec![
+            after[..or_idx].trim().to_string(),
+            after_or.trim().to_string(),
+        ];
+
+        return Some(ParseAction::AddConstraint(ConstraintDef {
+            id: String::new(), kind: "OR".into(), modality: "alethic".into(),
+            deontic_operator: None, text: clean.into(),
+            spans: vec![], set_comparison_argument_length: Some(clauses.len()),
+            clauses: Some(clauses),
+            entity: Some(entity), min_occurrence: None, max_occurrence: None,
+        }));
+    }
+
+    None
+}
+
+/// try_frequency — FC: "Each A R at least {k} and at most {m} B."
+/// MUST fire before try_constraint because "at least 1" (digit) is FC
+/// while "at least one" (word) is MC. try_constraint would misclassify it.
+fn try_frequency(line: &str, noun_names: &[String]) -> Option<ParseAction> {
+    let clean = line.trim_end_matches('.');
+    let rest = clean.strip_prefix("Each ")?;
+
+    // Pattern: "at least {digit}" somewhere in line
+    let at_least_idx = rest.find("at least ")?;
+    let after_al = &rest[at_least_idx + 9..];
+
+    // The digit must come immediately after "at least " (not a word like "one")
+    let min_end = after_al.find(|c: char| !c.is_ascii_digit())?;
+    if min_end == 0 { return None; } // no digit found
+    let min_str = &after_al[..min_end];
+    let min_val: usize = min_str.parse().ok()?;
+
+    // Look for optional "and at most {digit}"
+    let max_val: Option<usize> = after_al[min_end..].find("at most ")
+        .and_then(|i| {
+            let after_am = &after_al[min_end + i + 8..];
+            let max_end = after_am.find(|c: char| !c.is_ascii_digit()).unwrap_or(after_am.len());
+            if max_end == 0 { return None; }
+            after_am[..max_end].parse().ok()
+        });
+
+    // Find the entity noun(s) to build spans
+    let stripped = clean
+        .replace("Each ", "")
+        .replace(&format!("at least {}", min_str), "")
+        .replace("and at most", "");
+    // Remove max digit if present
+    let stripped = if let Some(mv) = max_val {
+        stripped.replace(&mv.to_string(), "")
+    } else {
+        stripped
+    };
+    let found = find_nouns(&stripped, noun_names);
+
+    let spans: Vec<SpanDef> = found.iter().enumerate()
+        .map(|(i, _)| SpanDef { fact_type_id: String::new(), role_index: i, subset_autofill: None })
+        .collect();
+
+    Some(ParseAction::AddConstraint(ConstraintDef {
+        id: String::new(), kind: "FC".into(), modality: "alethic".into(),
+        deontic_operator: None, text: clean.into(),
+        spans, set_comparison_argument_length: None, clauses: None,
+        entity: None, min_occurrence: Some(min_val), max_occurrence: max_val,
+    }))
+}
+
+/// try_external_uc — UC (external uniqueness and context pattern)
+/// Patterns:
+///   "For each B₁ and B₂, at most one A R₁ that B₁ and R₂ that B₂."
+///   "Context: F₁; F₂. In this context, each B₁, B₂ combination is associated with at most one A."
+fn try_external_uc(line: &str, noun_names: &[String]) -> Option<ParseAction> {
+    let clean = line.trim_end_matches('.');
+
+    // Context pattern: starts with "Context:"
+    if clean.starts_with("Context:") {
+        if clean.contains("at most one") || clean.contains("combination is associated with") {
+            // Find the entity noun mentioned in "at most one A"
+            let entity = noun_names.iter().find(|n| {
+                let pattern = format!("at most one {}", n);
+                clean.contains(&pattern)
+            }).cloned();
+            return Some(ParseAction::AddConstraint(ConstraintDef {
+                id: String::new(), kind: "UC".into(), modality: "alethic".into(),
+                deontic_operator: None, text: clean.into(),
+                spans: vec![], set_comparison_argument_length: None, clauses: None,
+                entity, min_occurrence: None, max_occurrence: None,
+            }));
+        }
+        return None;
+    }
+
+    // "For each B₁ and B₂, at most one A ..."
+    if let Some(rest) = clean.strip_prefix("For each ") {
+        // Must have "at most one" in the body
+        if !clean.contains("at most one") { return None; }
+        // Must have " and " in the "For each" list (external UC uses "B₁ and B₂")
+        let comma_idx = rest.find(',')?;
+        let quantified = &rest[..comma_idx];
+        if !quantified.contains(" and ") { return None; }
+
+        // Find the entity noun after "at most one"
+        let after_amo = clean.find("at most one ")?;
+        let noun_start = after_amo + 12;
+        let entity = noun_names.iter().find(|n| {
+            clean[noun_start..].starts_with(n.as_str())
+        }).cloned();
+
+        return Some(ParseAction::AddConstraint(ConstraintDef {
+            id: String::new(), kind: "UC".into(), modality: "alethic".into(),
+            deontic_operator: None, text: clean.into(),
+            spans: vec![], set_comparison_argument_length: None, clauses: None,
+            entity, min_occurrence: None, max_occurrence: None,
+        }));
+    }
+
+    None
+}
+
 fn try_deontic(line: &str) -> Option<ParseAction> {
     let (operator, rest) = line.strip_prefix("It is obligatory that ").map(|r| ("obligatory", r))
         .or_else(|| line.strip_prefix("It is forbidden that ").map(|r| ("forbidden", r)))
@@ -369,6 +606,11 @@ fn parse_into(ir: &mut ConstraintIR, input: &str) -> Result<(), String> {
         // Skip lines that belong to Pass 2b (constraints, derivations, deontic)
         // Preserves the original recognizer priority: these recognizers fire before try_fact_type
         let is_pass2b = try_ring(line, &noun_names).is_some()
+            || try_subset(line, &noun_names).is_some()
+            || try_equality(line).is_some()
+            || try_set_comparison(line, &noun_names).is_some()
+            || try_frequency(line, &noun_names).is_some()
+            || try_external_uc(line, &noun_names).is_some()
             || try_derivation(line).is_some()
             || try_deontic(line).is_some()
             || try_constraint(line, &noun_names).is_some()
@@ -427,11 +669,17 @@ fn parse_into(ir: &mut ConstraintIR, input: &str) -> Result<(), String> {
             apply_action(ir, Some(action), &lines, i);
         }
 
-        // Try recognizers in original priority order.
-        // Ring constraints fire before derivation (ring patterns match "If...then..." too).
-        // Derivations, deontic, and constraints have priority over fact types.
+        // Try recognizers in priority order.
+        // Ring and subset fire before derivation (both match "If...then...").
+        // Frequency fires before constraint ("at least 1" digit vs "at least one" word).
+        // External UC fires before constraint to handle "For each B1 and B2, at most one...".
         let action = None
             .or_else(|| try_ring(line, &noun_names))
+            .or_else(|| try_subset(line, &noun_names))
+            .or_else(|| try_equality(line))
+            .or_else(|| try_set_comparison(line, &noun_names))
+            .or_else(|| try_frequency(line, &noun_names))
+            .or_else(|| try_external_uc(line, &noun_names))
             .or_else(|| try_derivation(line))
             .or_else(|| try_deontic(line))
             .or_else(|| try_constraint(line, &noun_names));
@@ -440,10 +688,16 @@ fn parse_into(ir: &mut ConstraintIR, input: &str) -> Result<(), String> {
         // handled in Pass 2a (fact type or instance fact). Skip it.
         let Some(action) = action else { continue; };
 
-        // Split "exactly one" constraints into UC + MC.
+        // Split inline "exactly one" constraints into UC + MC.
+        // Skip the split for set-comparison kinds (XO, XC, OR) which carry their own semantics.
         // Derivation rules resolve through catalog, not through apply_action.
+        let set_comparison_kinds = ["XO", "XC", "OR", "SS", "EQ", "FC"];
         match action {
-            ParseAction::AddConstraint(c) if line.contains("exactly one") => {
+            ParseAction::AddConstraint(ref c)
+                if line.contains("exactly one")
+                    && !set_comparison_kinds.contains(&c.kind.as_str()) =>
+            {
+                let c = match action { ParseAction::AddConstraint(c) => c, _ => unreachable!() };
                 let mut uc = resolve_constraint_schema(c.clone(), &noun_names, &catalog, ir);
                 uc.kind = "UC".into();
                 let mut mc = resolve_constraint_schema(c, &noun_names, &catalog, ir);
@@ -461,6 +715,28 @@ fn parse_into(ir: &mut ConstraintIR, input: &str) -> Result<(), String> {
             }
             other => { apply_action(ir, Some(other), &lines, i); }
         }
+    }
+
+    // Task 6: Value Constraint (VC) — emit one VC per noun with enum_values.
+    // The compiler (line 2032) reads enum values from the noun's enum_values field;
+    // the ConstraintDef just marks which noun has a value constraint.
+    let vc_nouns: Vec<String> = ir.nouns.iter()
+        .filter_map(|(name, def)| def.enum_values.as_ref().map(|_| name.clone()))
+        .collect();
+    for noun_name in vc_nouns {
+        ir.constraints.push(ConstraintDef {
+            id: String::new(),
+            kind: "VC".into(),
+            modality: "alethic".into(),
+            deontic_operator: None,
+            text: format!("{} has a value constraint", noun_name),
+            spans: vec![],
+            set_comparison_argument_length: None,
+            clauses: None,
+            entity: Some(noun_name),
+            min_occurrence: None,
+            max_occurrence: None,
+        });
     }
 
     Ok(())
@@ -1393,6 +1669,72 @@ mod tests {
         let input = "Category(.Name) is an entity type.\nCategory contains Category.\nNo Category may cycle back to itself via one or more traversals through contains.";
         let ir = parse_markdown(input).unwrap();
         assert!(ir.constraints.iter().any(|c| c.kind == "AC"), "Expected AC constraint, got: {:?}", ir.constraints);
+    }
+
+    #[test]
+    fn subset_constraint() {
+        let input = "Person(.Name) is an entity type.\nBook(.Title) is an entity type.\nPerson authored Book.\nPerson reviewed Book.\nIf some Person authored some Book then that Person reviewed that Book.";
+        let ir = parse_markdown(input).unwrap();
+        assert!(ir.constraints.iter().any(|c| c.kind == "SS"), "Expected SS constraint, got: {:?}", ir.constraints);
+    }
+
+    #[test]
+    fn equality_constraint() {
+        let input = "Person(.Name) is an entity type.\nBook(.Title) is an entity type.\nPerson authored Book.\nPerson reviewed Book.\nFor each Person, that Person authored some Book if and only if that Person reviewed some Book.";
+        let ir = parse_markdown(input).unwrap();
+        assert!(ir.constraints.iter().any(|c| c.kind == "EQ"), "Expected EQ constraint, got: {:?}", ir.constraints);
+    }
+
+    #[test]
+    fn exclusion_general() {
+        let input = "Person(.Name) is an entity type.\nPerson is tenured.\nPerson is contracted.\nFor each Person, at most one of the following holds: that Person is tenured; that Person is contracted.";
+        let ir = parse_markdown(input).unwrap();
+        assert!(ir.constraints.iter().any(|c| c.kind == "XC"), "Expected XC, got: {:?}", ir.constraints);
+    }
+
+    #[test]
+    fn exclusive_or() {
+        let input = "Person(.Name) is an entity type.\nPerson is tenured.\nPerson is contracted.\nFor each Person, exactly one of the following holds: that Person is tenured; that Person is contracted.";
+        let ir = parse_markdown(input).unwrap();
+        assert!(ir.constraints.iter().any(|c| c.kind == "XO"), "Expected XO, got: {:?}", ir.constraints);
+    }
+
+    #[test]
+    fn inclusive_or() {
+        let input = "Lecturer(.Name) is an entity type.\nDate(.Value) is a value type.\nLecturer is contracted until Date.\nLecturer is tenured.\nEach Lecturer is contracted until some Date or is tenured.";
+        let ir = parse_markdown(input).unwrap();
+        assert!(ir.constraints.iter().any(|c| c.kind == "OR"), "Expected OR, got: {:?}", ir.constraints);
+    }
+
+    #[test]
+    fn frequency_constraint() {
+        let input = "Customer(.Name) is an entity type.\nOrder(.Id) is an entity type.\nCustomer places Order.\nEach Customer places at least 1 and at most 5 Order.";
+        let ir = parse_markdown(input).unwrap();
+        assert!(ir.constraints.iter().any(|c| c.kind == "FC"), "Expected FC constraint, got: {:?}", ir.constraints);
+        let fc = ir.constraints.iter().find(|c| c.kind == "FC").unwrap();
+        assert_eq!(fc.min_occurrence, Some(1));
+        assert_eq!(fc.max_occurrence, Some(5));
+    }
+
+    #[test]
+    fn value_constraint() {
+        let input = "Priority is a value type.\n  The possible values of Priority are 'Low', 'Medium', 'High'.\nTicket(.Id) is an entity type.\nTicket has Priority.";
+        let ir = parse_markdown(input).unwrap();
+        assert!(ir.constraints.iter().any(|c| c.kind == "VC"), "Expected VC constraint, got: {:?}", ir.constraints);
+    }
+
+    #[test]
+    fn external_uniqueness() {
+        let input = "Room(.Nr) is an entity type.\nBuilding(.Code) is an entity type.\nRoomNr is a value type.\nRoom is in Building.\nRoom has RoomNr.\nFor each Building and RoomNr, at most one Room is in that Building and has that RoomNr.";
+        let ir = parse_markdown(input).unwrap();
+        assert!(ir.constraints.iter().any(|c| c.kind == "UC"), "Expected UC (external), got: {:?}", ir.constraints);
+    }
+
+    #[test]
+    fn context_pattern() {
+        let input = "Room(.Nr) is an entity type.\nBuilding(.Code) is an entity type.\nRoomNr is a value type.\nRoom is in Building.\nRoom has RoomNr.\nContext: Room is in Building; Room has RoomNr. In this context, each Building, RoomNr combination is associated with at most one Room.";
+        let ir = parse_markdown(input).unwrap();
+        assert!(ir.constraints.iter().any(|c| c.kind == "UC"), "Expected UC (context), got: {:?}", ir.constraints);
     }
 
     #[test]
