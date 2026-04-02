@@ -350,7 +350,7 @@ Let $T = \{(s_i, s_j, e_k)\} \subseteq P$ be transition facts and $s$ the curren
 \begin{align}
 \mathit{links}(s) &= \pi_{\mathit{event}}\!\left(\mathit{Filter}(p) : T\right) \label{eq:hateoas}
 \end{align}
-where $p(t) = (s_{\mathit{from}}(t) = s) \lor \mathit{anc}(s_{\mathit{from}}(t), s)$.
+where $p(t) = (s_{\mathit{from}}(t) = s)$.
 \end{theorem}
 
 \begin{proof}
@@ -375,7 +375,7 @@ Both components are $\theta_1$ operations on $S$ and $P$ respectively.
 \end{proof}
 
 \begin{corollary}[Deletion as Terminal State]\label{cor:delete}
-Let $s_{\mathit{del}}$ be a state with no outgoing transitions in $T$. Then $\mathit{links}(s_{\mathit{del}}) = \emptyset$, and the entity is excluded from query results by $\mathit{Filter}(\neg\,\mathit{terminal?}) : P$.
+Let $s_{\mathit{del}}$ be a state with no outgoing transitions in $T$, i.e.\ $\neg\exists\,t \in T : s_{\mathit{from}}(t) = s_{\mathit{del}}$. Then $\mathit{links}(s_{\mathit{del}}) = \emptyset$ by Theorem~\ref{thm:hateoas}, and the entity is excluded from query results by $\mathit{Filter}(p_{\mathit{live}}) : P$ where $p_{\mathit{live}}(e) = \exists\,t \in T : s_{\mathit{from}}(t) = \mathit{status}(e)$.
 \end{corollary}
 
 \begin{theorem}[Derivability]\label{thm:derive}
