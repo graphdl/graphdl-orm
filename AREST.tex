@@ -33,7 +33,7 @@
 \maketitle
 
 \begin{abstract}
-Domain knowledge enters software as natural language requirements, is re-encoded as schemas, validation logic, state machines, and API routes, and drifts out of sync in production. The informal layer between specification and execution is where bugs live and where automated agents hallucinate. We show that a single set of FORML\,2 declarations can define a database schema, constraint rules, state machine workflows, and a REST API with hypermedia navigation, producing a complete application from domain facts alone. We formalize this as AREST, a Backus AST system~\cite{backus78} whose definitions are compiled FORML\,2 readings~\cite{halpin08} and whose state is Codd's named set~\cite{codd70} of ORM\,2 elementary facts. REST endpoints are applications of a single system function. Ingesting new readings is self-modification. Five theorems establish that the grammar is unambiguous, that specifications and executables are the same object, that state transfer is complete, that HATEOAS links are projections of the population, and that every value in the API is derived from facts. Together they eliminate the informal layer entirely.
+Domain knowledge enters software as natural language requirements, is re-encoded as schemas, validation logic, state machines, and API routes, and drifts out of sync in production. The informal layer between specification and execution is where bugs live and where automated agents hallucinate. We show that a single set of FORML\,2 declarations can define a database schema, constraint rules, state machine workflows, and a REST API with hypermedia navigation, producing a complete application from domain facts alone. We formalize this as AREST, a Backus AST system~\cite{backus78} whose definitions are compiled FORML\,2 readings~\cite{halpin08} and whose state is Codd's named set~\cite{codd70} of ORM\,2 elementary facts. REST endpoints are applications of a single system function. Ingesting new readings is self-modification. Six theorems establish that the grammar is unambiguous, that specifications and executables are the same object, that state transfer is complete, that HATEOAS links are projections of the population, that the entity hierarchy is determined by uniqueness constraints, and that every value in the API is derived from facts. Together they eliminate the informal layer entirely.
 \end{abstract}
 
 \section{Introduction}
@@ -52,7 +52,7 @@ Three terms carry overloaded abbreviations. \emph{AST} follows Backus's usage (A
 
 \section{Definitions}
 
-Each source formalism solved one layer: Backus the evaluation model, Codd the data model, Halpin the constraint language, and Fielding the transfer protocol. The contribution of AREST is identification, not integration. A FORML\,2 reading is simultaneously an FFP object, a relation schema, a constraint specification, and a resource definition, and the compiler recognizes this identity. The five theorems verify it.
+Each source formalism solved one layer: Backus the evaluation model, Codd the data model, Halpin the constraint language, and Fielding the transfer protocol. The contribution of AREST is identification, not integration. A FORML\,2 reading is simultaneously an FFP object, a relation schema, a constraint specification, and a resource definition, and the compiler recognizes this identity. The six theorems verify it.
 
 \begin{definition}[AREST]\label{def:arest}
 An \emph{Applicative REpresentational State Transfer} system is an AST system~\cite[Sec.\,14]{backus78} whose state $D$ satisfies:
@@ -196,12 +196,16 @@ Customer(.Name) is an entity type.
 Order was placed by Customer.
   Each Order was placed by exactly one
   Customer.
-Status 'Draft' is initial in
+Status 'In Cart' is initial in
   State Machine Definition 'Order'.
 Transition 'place' is from
-  Status 'Draft'.
+  Status 'In Cart'.
 Transition 'place' is to
   Status 'Placed'.
+Transition 'ship' is from
+  Status 'Placed'.
+Transition 'ship' is to
+  Status 'Shipped'.
 \end{lstlisting}
 
 The constraint reading compiles to a restriction~(\ref{eq:restrict}). $\rho$ yields the following.
@@ -214,20 +218,20 @@ The result is the set of Orders with more than one Customer in $\mathit{placedBy
 \begin{align*}
 P' = P \cup \{&\mathit{Order}(\texttt{ord\text{-}1}),\;
 \mathit{placedBy}(\texttt{ord\text{-}1}, \texttt{acme}),\\
-&\mathit{SM}(\texttt{ord\text{-}1}, \texttt{Draft})\}
+&\mathit{SM}(\texttt{ord\text{-}1}, \texttt{In Cart})\}
 \end{align*}
 
 The response includes links derived from $P'$ (Theorem~\ref{thm:hateoas}).
 \begin{lstlisting}
 { "id": "ord-1", "customer": "acme",
-  "status": "Draft",
+  "status": "In Cart",
   "_links": {
     "place": {
       "href": "/orders/ord-1/transition",
       "method": "POST" } } }
 \end{lstlisting}
 
-Following ``place'' applies~(\ref{eq:sm}). The new representation contains $\{\mathit{ship}\}$, not $\{\mathit{place}\}$. If a second command assigns a different Customer to the same Order, the UC restriction produces a non-empty violation set and the command is rejected. The violation is returned as the original reading (Corollary~\ref{cor:verbalize}).
+Following ``place'' applies~(\ref{eq:sm}). The new representation contains $\{\mathit{ship}\}$, not $\{\mathit{place}\}$, because the status is now Placed and only the outgoing transition from Placed is available. If a second command assigns a different Customer to the same Order, the UC restriction produces a non-empty violation set and the command is rejected. The violation is returned as the original reading (Corollary~\ref{cor:verbalize}).
 
 \section{Execution Semantics}
 
@@ -283,7 +287,7 @@ The router distributes events via $\alpha\,\mathit{RMAP}$~(apply-to-all), and ea
 
 \section{Properties}
 
-The five theorems form a chain. Each depends on the previous one and eliminates one source of failure in the path from domain knowledge to running software.
+The six theorems form a chain. Each depends on the previous one and eliminates one source of failure in the path from domain knowledge to running software.
 
 \begin{theorem}[Grammar Unambiguity]\label{thm:grammar}
 Let $N$ be a declared set of object type names and $F$ a declared set of predicate readings, such that no element of $N$ contains a formal item of the grammar as a substring. Then each FORML\,2 sentence over $(N, F)$ has exactly one parse.
@@ -396,7 +400,7 @@ Let $c \in C_S$ be a constraint object compiled from reading $r \in R$. If $(\rh
 \noindent Each $\theta_1$ primitive has a FORML\,2 verbalization. Projection verbalizes as role selection, join as qualified composition, restriction as constraint predicate, tie as self-reference. Halpin and Curland~\cite{halpin06} give the automated verbalization algorithm for ORM\,2 constraints. Composed $\theta_1$ operations verbalize via FORML\,2 qualified readings (``who\ldots'', ``that\ldots''), which parse unambiguously by Theorem~\ref{thm:grammar}.
 
 \begin{corollary}[Closure Under Self-Modification]\label{cor:closure}
-Let $D' = D$ after applying $\mathit{SYSTEM}$ with operation $\mathit{compile} \circ \mathit{parse}$ to a set of FORML\,2 readings $R'$. Then Theorems~\ref{thm:grammar}--\ref{thm:derive} hold for all subsequent applications of $\mathit{SYSTEM}$ over $D'$.
+Let $D' = D$ after applying $\mathit{SYSTEM}$ with operation $\mathit{compile} \circ \mathit{parse}$ to a set of FORML\,2 readings $R'$. Then Theorems~\ref{thm:grammar}--\ref{thm:derive} hold for all subsequent applications of $\mathit{SYSTEM}$ over~$D'$.
 \end{corollary}
 
 \begin{proof}
@@ -411,9 +415,9 @@ Traditional middleware (authentication, validation, rate limiting, transformatio
 
 \section{Conclusion}
 
-AREST is a Backus AST system~\cite{backus78} whose definitions are compiled FORML\,2 readings~\cite{halpin08} and whose state is Codd's named set~\cite{codd70} of ORM\,2 elementary facts. REST endpoints~\cite{fielding00} are applications of the system function. Ingesting readings is self-modification. Transitions produce hypermedia. The five theorems form a chain: the grammar is unambiguous (Theorem~\ref{thm:grammar}), so specifications compile faithfully to executables (Theorem~\ref{thm:spec}), so state transfer is complete (Theorem~\ref{thm:complete}), so HATEOAS links are projections of the population (Theorem~\ref{thm:hateoas}), so every value in the representation is a $\rho$-application (Theorem~\ref{thm:derive}). Self-modification preserves all five (Corollary~\ref{cor:closure}). The system grows by ingesting facts and never loses its guarantees.
+AREST is a Backus AST system~\cite{backus78} whose definitions are compiled FORML\,2 readings~\cite{halpin08} and whose state is Codd's named set~\cite{codd70} of ORM\,2 elementary facts. REST endpoints~\cite{fielding00} are applications of the system function. Ingesting readings is self-modification. Transitions produce hypermedia. The six theorems form a chain: the grammar is unambiguous (Theorem~\ref{thm:grammar}), so specifications compile faithfully to executables (Theorem~\ref{thm:spec}), so state transfer is complete (Theorem~\ref{thm:complete}), so HATEOAS links are projections of the population (Theorem~\ref{thm:hateoas}), so the entity hierarchy is determined by uniqueness constraints (Theorem~\ref{thm:nav}), so every value in the representation is a $\rho$-application (Theorem~\ref{thm:derive}). Self-modification preserves all six (Corollary~\ref{cor:closure}). The system grows by ingesting facts and never loses its guarantees.
 
-The five properties compose into a guarantee for automated agents, addressing two distinct sources of LLM hallucination. First, the specification-execution gap. An LLM writing FORML\,2 readings produces unambiguous specifications (Theorem~\ref{thm:grammar}) that are the executables (Theorem~\ref{thm:spec}). An LLM consuming the API reads values that are $\rho$-applications over $P$ (Theorem~\ref{thm:derive}) and discovers every valid action via HATEOAS links (Theorem~\ref{thm:hateoas}). There are no undocumented endpoints, no hidden middleware, no informal contracts to hallucinate through. Second, the reasoning chain gap. LLMs do not reliably chain logical inferences, and errors compound over steps. The forward chainer in $\mathit{derive}$~(\ref{eq:create}) evaluates derivation rules to the least fixed point (Theorem~\ref{thm:complete}), and the derived facts appear in the representation (Theorem~\ref{thm:derive}). The LLM reads \emph{conclusions}, not premises. The logical chain that produced them was evaluated deterministically by the engine, outside the LLM's context. The LLM does not reason through the chain; it consumes the result. When the chain itself is needed (for debugging, auditing, or explanation), the derivation trace is available on demand as a sequence of rule applications over $P$, each a $\rho$-application (Theorem~\ref{thm:derive}).
+The six properties compose into a guarantee for automated agents, addressing two distinct sources of LLM hallucination. First, the specification-execution gap. An LLM writing FORML\,2 readings produces unambiguous specifications (Theorem~\ref{thm:grammar}) that are the executables (Theorem~\ref{thm:spec}). An LLM consuming the API reads values that are $\rho$-applications over $P$ (Theorem~\ref{thm:derive}) and discovers every valid action via HATEOAS links (Theorem~\ref{thm:hateoas}). There are no undocumented endpoints, no hidden middleware, no informal contracts to hallucinate through. Second, the reasoning chain gap. LLMs do not reliably chain logical inferences, and errors compound over steps. The forward chainer in $\mathit{derive}$~(\ref{eq:create}) evaluates derivation rules to the least fixed point (Theorem~\ref{thm:complete}), and the derived facts appear in the representation (Theorem~\ref{thm:derive}). The LLM reads \emph{conclusions}, not premises. The logical chain that produced them was evaluated deterministically by the engine, outside the LLM's context. The LLM does not reason through the chain; it consumes the result. When the chain itself is needed (for debugging, auditing, or explanation), the derivation trace is available on demand as a sequence of rule applications over $P$, each a $\rho$-application (Theorem~\ref{thm:derive}).
 
 The gap between domain knowledge and running software is the gap where requirements drift, implementations diverge, and production breaks. AREST eliminates the gap by identifying what was never separate to begin with.
 
