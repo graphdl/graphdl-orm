@@ -127,26 +127,56 @@ fn validation_store() -> &'static Mutex<Option<CompiledModel>> {
     VALIDATION_MODEL.get_or_init(|| Mutex::new(None))
 }
 
-static STATE: OnceLock<Mutex<Option<CompiledState>>> = OnceLock::new();
+static DOMAINS: OnceLock<Mutex<Vec<Option<CompiledState>>>> = OnceLock::new();
 
-fn state_store() -> &'static Mutex<Option<CompiledState>> {
-    STATE.get_or_init(|| Mutex::new(None))
+fn domain_store() -> &'static Mutex<Vec<Option<CompiledState>>> {
+    DOMAINS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+static CURRENT_HANDLE: OnceLock<Mutex<Option<u32>>> = OnceLock::new();
+
+fn current_handle() -> &'static Mutex<Option<u32>> {
+    CURRENT_HANDLE.get_or_init(|| Mutex::new(None))
 }
 
 #[wasm_bindgen]
-pub fn load_ir(ir_json: &str) -> Result<(), JsValue> {
+pub fn compile_domain(ir_json: &str) -> Result<u32, JsValue> {
     let ir: ConstraintIR = serde_json::from_str(ir_json)
         .map_err(|e| JsValue::from_str(&format!("Failed to parse IR: {}", e)))?;
     let model = compile::compile(&ir);
-    let mut store = state_store().lock().unwrap();
-    *store = Some(CompiledState { ir, model });
+    let mut store = domain_store().lock().unwrap();
+    let handle = store.iter().position(|s| s.is_none())
+        .unwrap_or_else(|| { store.push(None); store.len() - 1 });
+    store[handle] = Some(CompiledState { ir, model });
+    Ok(handle as u32)
+}
+
+#[wasm_bindgen]
+pub fn release_domain(handle: u32) {
+    let mut store = domain_store().lock().unwrap();
+    if let Some(slot) = store.get_mut(handle as usize) {
+        *slot = None;
+    }
+}
+
+/// Get the handle from the last load_ir call (compatibility shim).
+#[wasm_bindgen]
+pub fn current_domain_handle() -> Option<u32> {
+    current_handle().lock().unwrap().clone()
+}
+
+/// Compatibility shim: compiles the domain and stores the handle as the current default.
+#[wasm_bindgen]
+pub fn load_ir(ir_json: &str) -> Result<(), JsValue> {
+    let h = compile_domain(ir_json)?;
+    *current_handle().lock().unwrap() = Some(h);
     Ok(())
 }
 
 #[wasm_bindgen]
-pub fn evaluate_response(response_val: JsValue, population_val: JsValue) -> Result<JsValue, JsValue> {
-    let store = state_store().lock().unwrap();
-    let state = match store.as_ref() {
+pub fn evaluate_response(handle: u32, response_val: JsValue, population_val: JsValue) -> Result<JsValue, JsValue> {
+    let store = domain_store().lock().unwrap();
+    let state = match store.get(handle as usize).and_then(|s| s.as_ref()) {
         Some(s) => s,
         None => return Ok(to_js(&Vec::<Violation>::new())),
     };
@@ -160,9 +190,9 @@ pub fn evaluate_response(response_val: JsValue, population_val: JsValue) -> Resu
 }
 
 #[wasm_bindgen]
-pub fn synthesize_noun(noun_name: &str, depth: usize) -> JsValue {
-    let store = state_store().lock().unwrap();
-    let state = match store.as_ref() {
+pub fn synthesize_noun(handle: u32, noun_name: &str, depth: usize) -> JsValue {
+    let store = domain_store().lock().unwrap();
+    let state = match store.get(handle as usize).and_then(|s| s.as_ref()) {
         Some(s) => s,
         None => return to_js(&SynthesisResult::empty(noun_name)),
     };
@@ -172,9 +202,10 @@ pub fn synthesize_noun(noun_name: &str, depth: usize) -> JsValue {
 }
 
 #[wasm_bindgen]
-pub fn forward_chain_population(population_val: JsValue) -> Result<JsValue, JsValue> {
-    let store = state_store().lock().unwrap();
-    let state = store.as_ref().ok_or_else(|| JsValue::from_str("no IR loaded"))?;
+pub fn forward_chain_population(handle: u32, population_val: JsValue) -> Result<JsValue, JsValue> {
+    let store = domain_store().lock().unwrap();
+    let state = store.get(handle as usize).and_then(|s| s.as_ref())
+        .ok_or_else(|| JsValue::from_str("no IR loaded"))?;
 
     let mut population: Population = from_js(&population_val)?;
 
@@ -201,13 +232,15 @@ pub fn query_population_wasm(population_val: JsValue, predicate_val: JsValue) ->
 /// Returns JSON: { "matches": ["value1", "value2", ...], "count": N }
 #[wasm_bindgen]
 pub fn query_schema_wasm(
+    handle: u32,
     schema_id: &str,
     target_role: usize,
     filter_val: JsValue,
     population_val: JsValue,
 ) -> Result<JsValue, JsValue> {
-    let store = state_store().lock().unwrap();
-    let state = store.as_ref().ok_or_else(|| JsValue::from_str("no IR loaded"))?;
+    let store = domain_store().lock().unwrap();
+    let state = store.get(handle as usize).and_then(|s| s.as_ref())
+        .ok_or_else(|| JsValue::from_str("no IR loaded"))?;
 
     let schema = state.model.schemas.get(schema_id)
         .ok_or_else(|| JsValue::from_str("schema not found"))?;
@@ -226,9 +259,10 @@ pub fn query_schema_wasm(
 /// Given observed facts, discover the UC, MC, FC, SS constraints and
 /// derivation rules that govern the data. This is the inverse of evaluation.
 #[wasm_bindgen]
-pub fn induce_from_population(population_val: JsValue) -> Result<JsValue, JsValue> {
-    let store = state_store().lock().unwrap();
-    let state = store.as_ref().ok_or_else(|| JsValue::from_str("no IR loaded"))?;
+pub fn induce_from_population(handle: u32, population_val: JsValue) -> Result<JsValue, JsValue> {
+    let store = domain_store().lock().unwrap();
+    let state = store.get(handle as usize).and_then(|s| s.as_ref())
+        .ok_or_else(|| JsValue::from_str("no IR loaded"))?;
 
     let population: Population = from_js(&population_val)?;
     let result = induce::induce(&state.ir, &population);
@@ -238,9 +272,10 @@ pub fn induce_from_population(population_val: JsValue) -> Result<JsValue, JsValu
 /// Run a compiled state machine by folding events through the transition function.
 /// Events are [(event_name, payload)] pairs. Returns the final state.
 #[wasm_bindgen]
-pub fn run_machine_wasm(noun_name: &str, events_val: JsValue, _population_val: JsValue) -> Result<JsValue, JsValue> {
-    let store = state_store().lock().unwrap();
-    let state = store.as_ref().ok_or_else(|| JsValue::from_str("no IR loaded"))?;
+pub fn run_machine_wasm(handle: u32, noun_name: &str, events_val: JsValue, _population_val: JsValue) -> Result<JsValue, JsValue> {
+    let store = domain_store().lock().unwrap();
+    let state = store.get(handle as usize).and_then(|s| s.as_ref())
+        .ok_or_else(|| JsValue::from_str("no IR loaded"))?;
 
     let events: Vec<(String, String)> = from_js(&events_val)?;
     let event_names: Vec<&str> = events.iter().map(|(e, _)| e.as_str()).collect();
@@ -259,9 +294,9 @@ pub fn run_machine_wasm(noun_name: &str, events_val: JsValue, _population_val: J
 /// Get valid transitions from a given status in a compiled state machine.
 /// Returns JSON: [{ "from": "status", "to": "target", "event": "eventName" }]
 #[wasm_bindgen]
-pub fn get_transitions_wasm(noun_name: &str, current_status: &str) -> JsValue {
-    let store = state_store().lock().unwrap();
-    let state = match store.as_ref() {
+pub fn get_transitions_wasm(handle: u32, noun_name: &str, current_status: &str) -> JsValue {
+    let store = domain_store().lock().unwrap();
+    let state = match store.get(handle as usize).and_then(|s| s.as_ref()) {
         Some(s) => s,
         None => return to_js(&Vec::<Transition>::new()),
     };
@@ -286,9 +321,9 @@ pub fn get_transitions_wasm(noun_name: &str, current_status: &str) -> JsValue {
 /// Given a fact type ID, resolve what event should fire on which state machine.
 /// Returns JSON: { "factTypeId": "...", "eventName": "...", "targetNoun": "..." } or null.
 #[wasm_bindgen]
-pub fn resolve_fact_event(fact_type_id: &str) -> JsValue {
-    let store = state_store().lock().unwrap();
-    let state = match store.as_ref() {
+pub fn resolve_fact_event(handle: u32, fact_type_id: &str) -> JsValue {
+    let store = domain_store().lock().unwrap();
+    let state = match store.get(handle as usize).and_then(|s| s.as_ref()) {
         Some(s) => s,
         None => return JsValue::NULL,
     };
@@ -307,9 +342,9 @@ pub fn resolve_fact_event(fact_type_id: &str) -> JsValue {
 
 /// Debug: return the compiled model state (noun-to-SM mapping)
 #[wasm_bindgen]
-pub fn debug_compiled_state() -> JsValue {
-    let store = state_store().lock().unwrap();
-    match store.as_ref() {
+pub fn debug_compiled_state(handle: u32) -> JsValue {
+    let store = domain_store().lock().unwrap();
+    match store.get(handle as usize).and_then(|s| s.as_ref()) {
         Some(s) => {
             let sm_info: Vec<DebugSmInfo> = s.model.state_machines.iter()
                 .map(|sm| DebugSmInfo {
@@ -335,9 +370,10 @@ pub fn debug_compiled_state() -> JsValue {
 /// One function application. One state transfer.
 /// Returns the complete result: entities, status, transitions, violations, derived facts.
 #[wasm_bindgen]
-pub fn apply_command_wasm(command_val: JsValue, population_val: JsValue) -> Result<JsValue, JsValue> {
-    let store = state_store().lock().unwrap();
-    let state = store.as_ref().ok_or_else(|| JsValue::from_str("no IR loaded"))?;
+pub fn apply_command_wasm(handle: u32, command_val: JsValue, population_val: JsValue) -> Result<JsValue, JsValue> {
+    let store = domain_store().lock().unwrap();
+    let state = store.get(handle as usize).and_then(|s| s.as_ref())
+        .ok_or_else(|| JsValue::from_str("no IR loaded"))?;
 
     let command: arest::Command = from_js(&command_val)?;
     let population: Population = from_js(&population_val)?;
@@ -352,9 +388,10 @@ pub fn apply_command_wasm(command_val: JsValue, population_val: JsValue) -> Resu
 ///
 /// Returns JSON: { initialState: "Draft" | null, violations: [...], derivedFacts: [...] }
 #[wasm_bindgen]
-pub fn prepare_entity(noun_name: &str, _fields_val: JsValue, population_val: JsValue) -> Result<JsValue, JsValue> {
-    let store = state_store().lock().unwrap();
-    let state = store.as_ref().ok_or_else(|| JsValue::from_str("no IR loaded"))?;
+pub fn prepare_entity(handle: u32, noun_name: &str, _fields_val: JsValue, population_val: JsValue) -> Result<JsValue, JsValue> {
+    let store = domain_store().lock().unwrap();
+    let state = store.get(handle as usize).and_then(|s| s.as_ref())
+        .ok_or_else(|| JsValue::from_str("no IR loaded"))?;
 
     // 1. State machine initialization — find initial state for this noun
     let initial_state = state.model.noun_index.noun_to_state_machines.get(noun_name)
@@ -396,11 +433,11 @@ pub fn prepare_entity(noun_name: &str, _fields_val: JsValue, population_val: JsV
 /// Fields that don't match a compiled schema are included with provisional IDs
 /// (the reading format: "Noun has field"). System fields (starting with _) are excluded.
 #[wasm_bindgen]
-pub fn project_entity_wasm(noun_name: &str, entity_id: &str, fields_val: JsValue) -> Result<JsValue, JsValue> {
-    let store = state_store().lock().unwrap();
+pub fn project_entity_wasm(handle: u32, noun_name: &str, entity_id: &str, fields_val: JsValue) -> Result<JsValue, JsValue> {
+    let store = domain_store().lock().unwrap();
     let fields: std::collections::HashMap<String, String> = from_js(&fields_val)?;
 
-    let state = match store.as_ref() {
+    let state = match store.get(handle as usize).and_then(|s| s.as_ref()) {
         Some(s) => s,
         None => {
             // No schema loaded — produce provisional facts (same as entity-do getFacts)
@@ -469,9 +506,9 @@ pub fn project_entity_wasm(noun_name: &str, entity_id: &str, fields_val: JsValue
 /// This is the schema metadata needed by the TypeScript layer to understand
 /// how entity fields map to compiled constructions.
 #[wasm_bindgen]
-pub fn get_noun_schemas_wasm(noun_name: &str) -> JsValue {
-    let store = state_store().lock().unwrap();
-    let state = match store.as_ref() {
+pub fn get_noun_schemas_wasm(handle: u32, noun_name: &str) -> JsValue {
+    let store = domain_store().lock().unwrap();
+    let state = match store.get(handle as usize).and_then(|s| s.as_ref()) {
         Some(s) => s,
         None => return to_js(&Vec::<FieldSchemaMapping>::new()),
     };
@@ -530,9 +567,9 @@ pub fn validate_schema_wasm(domain_ir_json: &str) -> Result<JsValue, JsValue> {
 /// Run RMAP (Relational Mapping Procedure) on the loaded IR.
 /// Returns table definitions as JSON.
 #[wasm_bindgen]
-pub fn rmap_wasm() -> JsValue {
-    let store = state_store().lock().unwrap();
-    let state = match store.as_ref() {
+pub fn rmap_wasm(handle: u32) -> JsValue {
+    let store = domain_store().lock().unwrap();
+    let state = match store.get(handle as usize).and_then(|s| s.as_ref()) {
         Some(s) => s,
         None => return to_js(&Vec::<()>::new()),
     };
@@ -543,9 +580,10 @@ pub fn rmap_wasm() -> JsValue {
 /// Prove a goal fact via backward chaining.
 /// Returns a ProofResult with status (Proven/Disproven/Unknown) and proof tree.
 #[wasm_bindgen]
-pub fn prove_goal(goal: &str, population_val: JsValue, world_assumption: &str) -> Result<JsValue, JsValue> {
-    let store = state_store().lock().unwrap();
-    let state = store.as_ref().ok_or_else(|| JsValue::from_str("no IR loaded"))?;
+pub fn prove_goal(handle: u32, goal: &str, population_val: JsValue, world_assumption: &str) -> Result<JsValue, JsValue> {
+    let store = domain_store().lock().unwrap();
+    let state = store.get(handle as usize).and_then(|s| s.as_ref())
+        .ok_or_else(|| JsValue::from_str("no IR loaded"))?;
 
     let population: Population = from_js(&population_val)?;
     let wa = match world_assumption {
