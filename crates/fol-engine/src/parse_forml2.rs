@@ -105,6 +105,114 @@ fn try_totality(line: &str) -> Option<ParseAction> {
     rest.contains(" or ").then(|| ParseAction::MarkAbstract(rest[..idx].trim().into()))
 }
 
+fn try_ring(line: &str, noun_names: &[String]) -> Option<ParseAction> {
+    let clean = line.trim_end_matches('.');
+
+    // IR: "No A R itself." — simple irreflexive
+    // AC: "No A may cycle back to itself via one or more traversals through R."
+    if let Some(rest) = clean.strip_prefix("No ") {
+        // AC pattern: "No A may cycle back to itself ..."
+        if rest.contains(" may cycle back to itself") {
+            // Extract the entity type (first word(s) matching a noun)
+            let entity = noun_names.iter()
+                .find(|n| rest.starts_with(n.as_str()))
+                .cloned()
+                .unwrap_or_default();
+            return Some(ParseAction::AddConstraint(ConstraintDef {
+                id: String::new(), kind: "AC".into(), modality: "alethic".into(),
+                deontic_operator: None, text: clean.into(),
+                spans: vec![], set_comparison_argument_length: None, clauses: None,
+                entity: if entity.is_empty() { None } else { Some(entity) },
+                min_occurrence: None, max_occurrence: None,
+            }));
+        }
+        // IR pattern: "No A R itself" — must end with " itself" and have a known noun
+        if rest.ends_with(" itself") {
+            let has_noun = noun_names.iter().any(|n| {
+                rest.starts_with(n.as_str())
+            });
+            if has_noun {
+                return Some(ParseAction::AddConstraint(ConstraintDef {
+                    id: String::new(), kind: "IR".into(), modality: "alethic".into(),
+                    deontic_operator: None, text: clean.into(),
+                    spans: vec![], set_comparison_argument_length: None, clauses: None,
+                    entity: None, min_occurrence: None, max_occurrence: None,
+                }));
+            }
+        }
+        return None;
+    }
+
+    // Conditional ring patterns: "If A1 R A2 [and ...] then [it is impossible that] ..."
+    if !clean.starts_with("If ") { return None; }
+    let then_idx = clean.find(" then ")?;
+    let antecedent = &clean[3..then_idx]; // everything after "If " up to " then "
+    let consequent = &clean[then_idx + 6..]; // everything after " then "
+
+    // All role tokens in the antecedent must share the same base noun type.
+    // Extract words that match known nouns (with or without trailing digit subscripts).
+    // We collect all noun-like tokens (noun + optional digit suffix) from the antecedent.
+    let role_bases: Vec<&str> = antecedent
+        .split_whitespace()
+        .filter_map(|word| {
+            // Strip trailing punctuation
+            let w = word.trim_end_matches(',');
+            // Check if base (digits stripped) matches a known noun
+            let (base, _) = parse_role_token(w);
+            noun_names.iter().any(|n| n == base).then_some(base)
+        })
+        .collect();
+
+    // Need at least 2 role tokens in antecedent, all with the same base
+    if role_bases.len() < 2 { return None; }
+    let first_base = role_bases[0];
+    if !role_bases.iter().all(|b| *b == first_base) { return None; }
+
+    // Also check consequent contains the same base noun (subscripted or plain)
+    let consequent_has_same_noun = {
+        let effective = if consequent.starts_with("it is impossible that ") {
+            &consequent["it is impossible that ".len()..]
+        } else {
+            consequent
+        };
+        effective.split_whitespace().any(|word| {
+            let w = word.trim_end_matches(',');
+            let (base, _) = parse_role_token(w);
+            base == first_base
+        })
+    };
+    if !consequent_has_same_noun { return None; }
+
+    let has_and = antecedent.contains(" and ");
+    let impossible = consequent.starts_with("it is impossible that ");
+    let itself_in_consequent = consequent.contains(" itself");
+    let is_not_in_antecedent = antecedent.contains(" is not ");
+
+    let kind = match (has_and, impossible, itself_in_consequent, is_not_in_antecedent) {
+        // AS: no and, impossible, no itself — "If A1 R A2 then it is impossible that A2 R A1"
+        (false, true, false, _)  => "AS",
+        // RF: no and, not impossible, itself in consequent — "If A1 R some A2 then A1 R itself"
+        (false, false, true, _)  => "RF",
+        // SY: no and, not impossible, no itself — "If A1 R A2 then A2 R A1"
+        (false, false, false, _) => "SY",
+        // AT: and, impossible, "is not" in antecedent — "If A1 R A2 and A1 is not A2 then impossible A2 R A1"
+        (true, true, _, true)    => "AT",
+        // IT: and, impossible, no "is not" — "If A1 R A2 and A2 R A3 then impossible A1 R A3"
+        (true, true, _, false)   => "IT",
+        // TR: and, not impossible — "If A1 R A2 and A2 R A3 then A1 R A3"
+        (true, false, _, _)      => "TR",
+        // Unrecognized combination — not a ring constraint
+        _ => return None,
+    };
+
+    Some(ParseAction::AddConstraint(ConstraintDef {
+        id: String::new(), kind: kind.into(), modality: "alethic".into(),
+        deontic_operator: None, text: clean.into(),
+        spans: vec![], set_comparison_argument_length: None, clauses: None,
+        entity: None, min_occurrence: None, max_occurrence: None,
+    }))
+}
+
 fn try_deontic(line: &str) -> Option<ParseAction> {
     let (operator, rest) = line.strip_prefix("It is obligatory that ").map(|r| ("obligatory", r))
         .or_else(|| line.strip_prefix("It is forbidden that ").map(|r| ("forbidden", r)))
@@ -260,7 +368,8 @@ fn parse_into(ir: &mut ConstraintIR, input: &str) -> Result<(), String> {
 
         // Skip lines that belong to Pass 2b (constraints, derivations, deontic)
         // Preserves the original recognizer priority: these recognizers fire before try_fact_type
-        let is_pass2b = try_derivation(line).is_some()
+        let is_pass2b = try_ring(line, &noun_names).is_some()
+            || try_derivation(line).is_some()
             || try_deontic(line).is_some()
             || try_constraint(line, &noun_names).is_some()
             || try_totality(line).is_some();
@@ -319,8 +428,10 @@ fn parse_into(ir: &mut ConstraintIR, input: &str) -> Result<(), String> {
         }
 
         // Try recognizers in original priority order.
+        // Ring constraints fire before derivation (ring patterns match "If...then..." too).
         // Derivations, deontic, and constraints have priority over fact types.
         let action = None
+            .or_else(|| try_ring(line, &noun_names))
             .or_else(|| try_derivation(line))
             .or_else(|| try_deontic(line))
             .or_else(|| try_constraint(line, &noun_names));
@@ -1240,6 +1351,48 @@ mod tests {
             .expect("should have 'is administered by' constraint");
         assert_eq!(admin_constraint.spans[0].fact_type_id, "User_administers_Organization",
             "Inverse voice 'is administered by' should resolve to 'administers' schema");
+    }
+
+    #[test]
+    fn ring_irreflexive() {
+        let input = "Person(.Name) is an entity type.\nPerson is a parent of Person.\nNo Person is a parent of itself.";
+        let ir = parse_markdown(input).unwrap();
+        assert!(ir.constraints.iter().any(|c| c.kind == "IR"), "Expected IR constraint, got: {:?}", ir.constraints);
+    }
+
+    #[test]
+    fn ring_asymmetric() {
+        let input = "Person(.Name) is an entity type.\nPerson is a parent of Person.\nIf Person1 is a parent of Person2 then it is impossible that Person2 is a parent of Person1.";
+        let ir = parse_markdown(input).unwrap();
+        assert!(ir.constraints.iter().any(|c| c.kind == "AS"), "Expected AS constraint, got: {:?}", ir.constraints);
+    }
+
+    #[test]
+    fn ring_symmetric() {
+        let input = "Person(.Name) is an entity type.\nPerson is married to Person.\nIf Person1 is married to Person2 then Person2 is married to Person1.";
+        let ir = parse_markdown(input).unwrap();
+        assert!(ir.constraints.iter().any(|c| c.kind == "SY"), "Expected SY constraint, got: {:?}", ir.constraints);
+    }
+
+    #[test]
+    fn ring_intransitive() {
+        let input = "Person(.Name) is an entity type.\nPerson is a parent of Person.\nIf Person1 is a parent of Person2 and Person2 is a parent of Person3 then it is impossible that Person1 is a parent of Person3.";
+        let ir = parse_markdown(input).unwrap();
+        assert!(ir.constraints.iter().any(|c| c.kind == "IT"), "Expected IT constraint, got: {:?}", ir.constraints);
+    }
+
+    #[test]
+    fn ring_transitive() {
+        let input = "Person(.Name) is an entity type.\nPerson is an ancestor of Person.\nIf Person1 is an ancestor of Person2 and Person2 is an ancestor of Person3 then Person1 is an ancestor of Person3.";
+        let ir = parse_markdown(input).unwrap();
+        assert!(ir.constraints.iter().any(|c| c.kind == "TR"), "Expected TR constraint, got: {:?}", ir.constraints);
+    }
+
+    #[test]
+    fn ring_acyclic() {
+        let input = "Category(.Name) is an entity type.\nCategory contains Category.\nNo Category may cycle back to itself via one or more traversals through contains.";
+        let ir = parse_markdown(input).unwrap();
+        assert!(ir.constraints.iter().any(|c| c.kind == "AC"), "Expected AC constraint, got: {:?}", ir.constraints);
     }
 
     #[test]
