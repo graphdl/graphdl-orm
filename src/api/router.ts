@@ -5,7 +5,7 @@ import { nounToSlug, nounToTable, resolveSlugToNoun } from '../collections'
 import { handleSeed } from './seed'
 import { handleEvaluate, handleSynthesize } from './evaluate'
 import { handleListEntities, handleGetEntity, handleCreateEntity, handleDeleteEntity, buildEntityLinks } from './entity-routes'
-import { loadDomainSchema, loadDomainAndPopulation, buildPopulation, getTransitions, applyCommand, querySchema, forwardChain, getNounSchemas, deriveViewMetadata, deriveNavContext, getTopLevelNouns, computeRMAP, reconstructIR } from './engine'
+import { loadDomainSchema, loadDomainAndPopulation, buildPopulation, getTransitions, applyCommand, querySchema, forwardChain, getNounSchemas, deriveViewMetadata, deriveNavContext, getTopLevelNouns, computeRMAP, getCachedIR } from './engine'
 import { system } from './system'
 import { handleArestRequest } from './arest-router'
 
@@ -521,10 +521,10 @@ router.get('/api/entities/:noun', async (request, env: Env) => {
   const viewMeta = await deriveViewMetadata(registry, getStub, noun, domainId).catch(() => null)
   const navCtx = userEmail ? await deriveNavContext(registry, getStub, userEmail, domainId, noun).catch(() => null) : null
 
-  // When listing Nouns, enrich each doc with _topLevel derived from reconstructed IR
+  // When listing Nouns, enrich each doc with _topLevel derived from cached IR
   let topLevelInfo: { topLevel: Set<string> } | null = null
   if (noun === 'Noun' && domainId) {
-    const irJson = await reconstructIR(registry, getStub, domainId)
+    const irJson = await getCachedIR(getStub, registry, domainId)
     if (irJson) {
       topLevelInfo = getTopLevelNouns(irJson)
     }
@@ -1006,7 +1006,7 @@ async function handleArestRoute(request: Request, env: Env) {
   const irDomain = url.searchParams.get('ir_domain') || 'organizations'
   const getStubLocal = (id: string) => getEntityDO(env, id) as any
   try { await loadDomainSchema(registryDO, getStubLocal, irDomain) } catch {}
-  const irJson = await reconstructIR(registryDO, getStubLocal, irDomain)
+  const irJson = await getCachedIR(getStubLocal, registryDO, irDomain)
   const ir = irJson ? JSON.parse(irJson) : null
 
   if (!ir) return json({ error: 'No schema loaded' }, { status: 500 })

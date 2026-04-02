@@ -6,7 +6,7 @@
  * The entity decides how, not the router.
  */
 
-import { loadDomainSchema, buildPopulation, forwardChain, reconstructIR } from './engine'
+import { loadDomainSchema, buildPopulation, forwardChain } from './engine'
 
 // ── Types ───────────────────────────────────────────────────────────
 
