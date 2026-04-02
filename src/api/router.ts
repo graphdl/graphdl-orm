@@ -120,16 +120,16 @@ router.get('/api/debug/compiled/:domain', async (request, env: Env) => {
   const { domain } = request.params
   const registry = getRegistryDO(env, 'global') as any
   await loadDomainSchema(registry, (id: string) => getEntityDO(env, id) as any, domain)
-  const { debug_compiled_state: debugState } = await import('../../crates/fol-engine/pkg/fol_engine.js')
-  return json(JSON.parse(debugState()))
+  const { debug_compiled_state: debugState, current_domain_handle } = await import('../../crates/fol-engine/pkg/fol_engine.js')
+  return json(JSON.parse(debugState(current_domain_handle() ?? 0)))
 })
 
 router.get('/api/debug/schema/:domain', async (request, env: Env) => {
   const domain = decodeURIComponent(request.params.domain)
   const registry = getRegistryDO(env, 'global') as any
   await loadDomainSchema(registry, (id: string) => getEntityDO(env, id) as any, domain)
-  const { debug_compiled_state } = await import('../../crates/fol-engine/pkg/fol_engine.js')
-  const schema = JSON.parse(debug_compiled_state())
+  const { debug_compiled_state, current_domain_handle: cdh } = await import('../../crates/fol-engine/pkg/fol_engine.js')
+  const schema = JSON.parse(debug_compiled_state(cdh() ?? 0))
   return json({
     domain,
     nounCount: Object.keys(schema.nouns).length,
@@ -181,8 +181,10 @@ router.post('/api/induce', async (request) => {
   if (!body.ir || !body.population) {
     return error(400, { errors: [{ message: 'ir and population are required' }] })
   }
-  const { induce_from_population } = await import('../../crates/fol-engine/pkg/fol_engine.js')
-  const result = induce_from_population(JSON.stringify(body.population))
+  const { induce_from_population, compile_domain, release_domain } = await import('../../crates/fol-engine/pkg/fol_engine.js')
+  const handle = compile_domain(JSON.stringify(body.ir))
+  const result = induce_from_population(handle, JSON.stringify(body.population))
+  release_domain(handle)
   return json(result)
 })
 
@@ -759,8 +761,8 @@ router.all('/api/query', async (request, env: Env) => {
   const populationJson = await loadDomainAndPopulation(registry, getStub, domain)
 
   // Use WASM prove_goal for the query
-  const { prove_goal } = await import('../../crates/fol-engine/pkg/fol_engine.js')
-  const result = prove_goal(query, JSON.parse(populationJson), 'closed')
+  const { prove_goal, current_domain_handle } = await import('../../crates/fol-engine/pkg/fol_engine.js')
+  const result = prove_goal(current_domain_handle() ?? 0, query, JSON.parse(populationJson), 'closed')
 
   return json(result)
 })

@@ -10,7 +10,7 @@
  * All logic lives in the Rust AST. This file is plumbing.
  */
 
-import { initSync, load_ir, evaluate_response, forward_chain_population, run_machine_wasm, query_schema_wasm, get_transitions_wasm, resolve_fact_event, prepare_entity, apply_command_wasm, debug_compiled_state, load_validation_model, validate_schema_wasm, project_entity_wasm, get_noun_schemas_wasm, parse_readings_wasm, parse_readings_with_nouns_wasm, rmap_wasm } from '../../crates/fol-engine/pkg/fol_engine.js'
+import { initSync, load_ir, compile_domain, release_domain, current_domain_handle, evaluate_response, forward_chain_population, run_machine_wasm, query_schema_wasm, get_transitions_wasm, resolve_fact_event, prepare_entity, apply_command_wasm, debug_compiled_state, load_validation_model, validate_schema_wasm, project_entity_wasm, get_noun_schemas_wasm, parse_readings_wasm, parse_readings_with_nouns_wasm, rmap_wasm } from '../../crates/fol-engine/pkg/fol_engine.js'
 import wasmModule from '../../crates/fol-engine/pkg/fol_engine_bg.wasm'
 
 let wasmInitialized = false
@@ -21,6 +21,18 @@ function ensureWasm() {
     wasmInitialized = true
   }
 }
+
+/**
+ * Resolve a domain handle. If an explicit handle is provided, use it.
+ * Otherwise fall back to the current_domain_handle() from the compatibility shim.
+ * Returns -1 if no handle is available (no domain loaded).
+ */
+function resolveHandle(handle?: number): number {
+  if (handle !== undefined && handle >= 0) return handle
+  return current_domain_handle() ?? -1
+}
+
+export { compile_domain, release_domain, current_domain_handle }
 
 /**
  * Reconstruct the ConstraintIR JSON from entity queries.
@@ -191,19 +203,23 @@ export async function reconstructIR(
 
 /**
  * Load a domain's schema into the WASM engine.
- * Reconstructs the ConstraintIR from entity queries and loads it.
+ * Reconstructs the ConstraintIR from entity queries and compiles it.
+ * Returns the domain handle (index into the slab). Also sets this as the
+ * current default handle for backward compatibility.
  */
 export async function loadDomainSchema(
   registry: any,
   getStub: (id: string) => any,
   domainSlug: string,
-): Promise<void> {
+): Promise<number> {
   ensureWasm()
 
   const irJson = await reconstructIR(registry, getStub, domainSlug)
-  if (!irJson) return
+  if (!irJson) return -1
 
+  // Use load_ir which internally calls compile_domain + sets current handle
   load_ir(irJson)
+  return current_domain_handle() ?? -1
 }
 
 /**
@@ -496,6 +512,7 @@ export function prepareEntity(
   nounName: string,
   fields: Record<string, unknown>,
   populationJson: string,
+  handle?: number,
 ): {
   initialState: string | null
   violations: Array<{ constraintId: string; constraintText: string; detail: string }>
@@ -503,7 +520,8 @@ export function prepareEntity(
   factEvent: { eventName: string; factTypeId: string } | null
 } {
   ensureWasm()
-  const resultJson = prepare_entity(nounName, JSON.stringify(fields), populationJson)
+  const h = resolveHandle(handle)
+  const resultJson = prepare_entity(h, nounName, JSON.stringify(fields), populationJson)
   return JSON.parse(resultJson)
 }
 
@@ -514,6 +532,7 @@ export function prepareEntity(
 export function applyCommand(
   command: { type: string; [key: string]: unknown },
   populationJson: string,
+  handle?: number,
 ): {
   entities: Array<{ id: string; type: string; data: Record<string, string> }>
   status: string | null
@@ -524,8 +543,9 @@ export function applyCommand(
   population: any
 } {
   ensureWasm()
+  const h = resolveHandle(handle)
   const population = JSON.parse(populationJson)
-  const result = apply_command_wasm(command, population)
+  const result = apply_command_wasm(h, command, population)
   return result
 }
 
@@ -536,10 +556,12 @@ export function applyCommand(
 export function evaluateConstraints(
   responseText: string,
   populationJson: string,
+  handle?: number,
 ): Array<{ constraintId: string; constraintText: string; detail: string }> {
   ensureWasm()
+  const h = resolveHandle(handle)
   const responseJson = JSON.stringify({ text: responseText, senderIdentity: null, fields: null })
-  const resultJson = evaluate_response(responseJson, populationJson)
+  const resultJson = evaluate_response(h, responseJson, populationJson)
   return JSON.parse(resultJson)
 }
 
@@ -549,9 +571,11 @@ export function evaluateConstraints(
  */
 export function forwardChain(
   populationJson: string,
+  handle?: number,
 ): Array<{ factTypeId: string; reading: string; bindings: Array<[string, string]>; derivedBy: string }> {
   ensureWasm()
-  const resultJson = forward_chain_population(populationJson)
+  const h = resolveHandle(handle)
+  const resultJson = forward_chain_population(h, populationJson)
   return JSON.parse(resultJson)
 }
 
@@ -563,9 +587,11 @@ export function runStateMachine(
   nounName: string,
   events: Array<[string, string]>,
   populationJson: string,
+  handle?: number,
 ): string {
   ensureWasm()
-  const resultJson = run_machine_wasm(nounName, JSON.stringify(events), populationJson)
+  const h = resolveHandle(handle)
+  const resultJson = run_machine_wasm(h, nounName, JSON.stringify(events), populationJson)
   return JSON.parse(resultJson)
 }
 
@@ -576,9 +602,11 @@ export function runStateMachine(
 export function getTransitions(
   nounName: string,
   currentStatus: string,
+  handle?: number,
 ): Array<{ from: string; to: string; event: string }> {
   ensureWasm()
-  const resultJson = get_transitions_wasm(nounName, currentStatus)
+  const h = resolveHandle(handle)
+  const resultJson = get_transitions_wasm(h, nounName, currentStatus)
   return JSON.parse(resultJson)
 }
 
@@ -588,9 +616,11 @@ export function getTransitions(
  */
 export function resolveFactEvent(
   factTypeId: string,
+  handle?: number,
 ): { factTypeId: string; eventName: string; targetNoun: string } | null {
   ensureWasm()
-  const resultJson = resolve_fact_event(factTypeId)
+  const h = resolveHandle(handle)
+  const resultJson = resolve_fact_event(h, factTypeId)
   const result = JSON.parse(resultJson)
   return result === null ? null : result
 }
@@ -604,9 +634,11 @@ export function querySchema(
   targetRole: number,
   filterBindings: Array<[number, string]>,
   populationJson: string,
+  handle?: number,
 ): { matches: string[]; count: number } {
   ensureWasm()
-  const resultJson = query_schema_wasm(schemaId, targetRole, JSON.stringify(filterBindings), populationJson)
+  const h = resolveHandle(handle)
+  const resultJson = query_schema_wasm(h, schemaId, targetRole, JSON.stringify(filterBindings), populationJson)
   return JSON.parse(resultJson)
 }
 
@@ -658,9 +690,11 @@ export function projectEntity(
   nounName: string,
   entityId: string,
   fields: Record<string, string>,
+  handle?: number,
 ): ProjectedFact[] {
   ensureWasm()
-  return project_entity_wasm(nounName, entityId, fields)
+  const h = resolveHandle(handle)
+  return project_entity_wasm(h, nounName, entityId, fields)
 }
 
 /**
@@ -668,9 +702,10 @@ export function projectEntity(
  * Returns all compiled graph schemas where this noun plays role 0,
  * keyed by the field name (role 1's noun name).
  */
-export function getNounSchemas(nounName: string): FieldSchemaMapping[] {
+export function getNounSchemas(nounName: string, handle?: number): FieldSchemaMapping[] {
   ensureWasm()
-  return get_noun_schemas_wasm(nounName)
+  const h = resolveHandle(handle)
+  return get_noun_schemas_wasm(h, nounName)
 }
 
 /**
@@ -805,9 +840,10 @@ export interface RmapTable {
  * Compute RMAP table definitions from the loaded IR.
  * RMAP (Halpin, Ch. 17) determines cell partitioning from UC structure.
  */
-export function computeRMAP(): RmapTable[] {
+export function computeRMAP(handle?: number): RmapTable[] {
   ensureWasm()
-  return rmap_wasm() as unknown as RmapTable[]
+  const h = resolveHandle(handle)
+  return rmap_wasm(h) as unknown as RmapTable[]
 }
 
 // ── Self-Describing Representations ──────────────────────────────────
