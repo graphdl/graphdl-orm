@@ -623,20 +623,21 @@ fn emit_entities(ir: &types::ConstraintIR, domain: &str) -> Result<JsValue, JsVa
         data.insert("name".into(), serde_json::Value::String(name.clone()));
         data.insert("domain".into(), serde_json::Value::String(domain.into()));
         data.insert("objectType".into(), serde_json::Value::String(noun.object_type.clone()));
+        // Noun properties are stored as proper typed values, not serialized
+        // compiler internals. The IR cell is gone; the TS layer reconstructs
+        // the IR from these entity fields when it needs to call load_ir().
         if let Some(ref st) = noun.super_type {
             data.insert("superType".into(), serde_json::Value::String(st.clone()));
         }
         if let Some(ref rs) = noun.ref_scheme {
-            data.insert("referenceScheme".into(),
-                serde_json::Value::String(serde_json::to_string(rs).unwrap_or_default()));
+            data.insert("referenceScheme".into(), serde_json::json!(rs));
         }
         if let Some(ref obj) = noun.objectifies {
             data.insert("objectifies".into(), serde_json::Value::String(obj.clone()));
         }
         if let Some(ref evs) = noun.enum_values {
             if !evs.is_empty() {
-                data.insert("enumValues".into(),
-                    serde_json::Value::String(serde_json::to_string(evs).unwrap_or_default()));
+                data.insert("enumValues".into(), serde_json::json!(evs));
             }
         }
 
@@ -699,17 +700,36 @@ fn emit_entities(ir: &types::ConstraintIR, domain: &str) -> Result<JsValue, JsVa
         } else {
             format!("constraint:{}", i)
         };
+        let spans_json: Vec<serde_json::Value> = c.spans.iter().map(|s| {
+            let mut span = serde_json::Map::new();
+            span.insert("factTypeId".into(), serde_json::Value::String(s.fact_type_id.clone()));
+            span.insert("roleIndex".into(), serde_json::json!(s.role_index));
+            if let Some(autofill) = s.subset_autofill {
+                span.insert("subsetAutofill".into(), serde_json::Value::Bool(autofill));
+            }
+            serde_json::Value::Object(span)
+        }).collect();
+        let mut cdata = serde_json::Map::new();
+        cdata.insert("text".into(), serde_json::Value::String(c.text.clone()));
+        cdata.insert("kind".into(), serde_json::Value::String(c.kind.clone()));
+        cdata.insert("modality".into(), serde_json::Value::String(c.modality.clone()));
+        cdata.insert("reading".into(), serde_json::Value::String(reading_ref));
+        cdata.insert("domain".into(), serde_json::Value::String(domain.into()));
+        cdata.insert("spans".into(), serde_json::Value::Array(spans_json));
+        if let Some(ref entity) = c.entity {
+            cdata.insert("entity".into(), serde_json::Value::String(entity.clone()));
+        }
+        if let Some(min) = c.min_occurrence {
+            cdata.insert("minOccurrence".into(), serde_json::json!(min));
+        }
+        if let Some(max) = c.max_occurrence {
+            cdata.insert("maxOccurrence".into(), serde_json::json!(max));
+        }
         entities.push(serde_json::json!({
             "id": constraint_id,
             "type": "Constraint",
             "domain": domain,
-            "data": {
-                "text": c.text,
-                "kind": c.kind,
-                "modality": c.modality,
-                "reading": reading_ref,
-                "domain": domain,
-            },
+            "data": serde_json::Value::Object(cdata),
         }));
     }
 
@@ -759,11 +779,33 @@ fn emit_entities(ir: &types::ConstraintIR, domain: &str) -> Result<JsValue, JsVa
         } else {
             format!("derivation:{}", i)
         };
+        let mut rdata = serde_json::Map::new();
+        rdata.insert("text".into(), serde_json::Value::String(rule.text.clone()));
+        rdata.insert("domain".into(), serde_json::Value::String(domain.into()));
+        rdata.insert("ruleId".into(), serde_json::Value::String(rule.id.clone()));
+        rdata.insert("antecedentFactTypeIds".into(),
+            serde_json::Value::String(serde_json::to_string(&rule.antecedent_fact_type_ids).unwrap_or_default()));
+        rdata.insert("consequentFactTypeId".into(),
+            serde_json::Value::String(rule.consequent_fact_type_id.clone()));
+        rdata.insert("kind".into(),
+            serde_json::Value::String(serde_json::to_string(&rule.kind).unwrap_or_default()));
+        if !rule.join_on.is_empty() {
+            rdata.insert("joinOn".into(),
+                serde_json::Value::String(serde_json::to_string(&rule.join_on).unwrap_or_default()));
+        }
+        if !rule.match_on.is_empty() {
+            rdata.insert("matchOn".into(),
+                serde_json::Value::String(serde_json::to_string(&rule.match_on).unwrap_or_default()));
+        }
+        if !rule.consequent_bindings.is_empty() {
+            rdata.insert("consequentBindings".into(),
+                serde_json::Value::String(serde_json::to_string(&rule.consequent_bindings).unwrap_or_default()));
+        }
         entities.push(serde_json::json!({
             "id": rule_id,
             "type": "Derivation Rule",
             "domain": domain,
-            "data": { "text": rule.text, "domain": domain },
+            "data": serde_json::Value::Object(rdata),
         }));
     }
 
@@ -815,15 +857,28 @@ fn emit_entities(ir: &types::ConstraintIR, domain: &str) -> Result<JsValue, JsVa
         })
     }));
 
-    // Store the compiled IR as a cell — compile(parse(readings)) is a derived fact.
-    // loadDomainSchema reads this one cell instead of reconstructing from parts.
-    let ir_json = serde_json::to_string(&ir).map_err(|e| JsValue::from_str(&format!("{}", e)))?;
-    entities.push(serde_json::json!({
-        "id": format!("ir:{}", domain),
-        "type": "CompiledSchema",
-        "domain": domain,
-        "data": { "domain": domain, "ir": ir_json },
-    }));
+    // Instance Facts — individual fact tuples for IR reconstruction.
+    // These carry the raw (subjectNoun, subjectValue, fieldName, objectNoun, objectValue)
+    // so the TS layer can rebuild generalInstanceFacts without the IR cell.
+    for (i, fact) in ir.general_instance_facts.iter().enumerate() {
+        entities.push(serde_json::json!({
+            "id": format!("instance-fact:{}:{}", domain, i),
+            "type": "Instance Fact",
+            "domain": domain,
+            "data": {
+                "subjectNoun": fact.subject_noun,
+                "subjectValue": fact.subject_value,
+                "fieldName": fact.field_name,
+                "objectNoun": fact.object_noun,
+                "objectValue": fact.object_value,
+                "domain": domain,
+            },
+        }));
+    }
+
+    // No CompiledSchema/IR cell. The TS layer reconstructs the IR from
+    // entity queries (Noun, Graph Schema, Role, Constraint, etc.) when it
+    // needs to call load_ir(). Compiler internals do not cross the boundary.
 
     let json_str = serde_json::to_string(&entities).map_err(|e| JsValue::from_str(&format!("{}", e)))?;
     Ok(JsValue::from_str(&json_str))

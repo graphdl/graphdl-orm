@@ -5,7 +5,7 @@ import { nounToSlug, nounToTable, resolveSlugToNoun } from '../collections'
 import { handleSeed } from './seed'
 import { handleEvaluate, handleSynthesize } from './evaluate'
 import { handleListEntities, handleGetEntity, handleCreateEntity, handleDeleteEntity, buildEntityLinks } from './entity-routes'
-import { loadDomainSchema, loadDomainAndPopulation, buildPopulation, getTransitions, applyCommand, querySchema, forwardChain, getNounSchemas, deriveViewMetadata, deriveNavContext, getTopLevelNouns, computeRMAP } from './engine'
+import { loadDomainSchema, loadDomainAndPopulation, buildPopulation, getTransitions, applyCommand, querySchema, forwardChain, getNounSchemas, deriveViewMetadata, deriveNavContext, getTopLevelNouns, computeRMAP, reconstructIR } from './engine'
 import { system } from './system'
 import { handleArestRequest } from './arest-router'
 
@@ -521,12 +521,12 @@ router.get('/api/entities/:noun', async (request, env: Env) => {
   const viewMeta = await deriveViewMetadata(registry, getStub, noun, domainId).catch(() => null)
   const navCtx = userEmail ? await deriveNavContext(registry, getStub, userEmail, domainId, noun).catch(() => null) : null
 
-  // When listing Nouns, enrich each doc with _topLevel derived from the compiled IR
+  // When listing Nouns, enrich each doc with _topLevel derived from reconstructed IR
   let topLevelInfo: { topLevel: Set<string> } | null = null
   if (noun === 'Noun' && domainId) {
-    const irCell = await getStub(`ir:${domainId}`).get()
-    if (irCell?.data?.ir) {
-      topLevelInfo = getTopLevelNouns(typeof irCell.data.ir === 'string' ? irCell.data.ir : JSON.stringify(irCell.data.ir))
+    const irJson = await reconstructIR(registry, getStub, domainId)
+    if (irJson) {
+      topLevelInfo = getTopLevelNouns(irJson)
     }
   }
 
@@ -1004,12 +1004,10 @@ async function handleArestRoute(request: Request, env: Env) {
   // Load domain IR for constraint graph (default: organizations)
   const registryDO = getRegistryDO(env, 'global') as any
   const irDomain = url.searchParams.get('ir_domain') || 'organizations'
-  try { await loadDomainSchema(registryDO, (id: string) => getEntityDO(env, id) as any, irDomain) } catch {}
-  const irCell = await (getEntityDO(env, `ir:${irDomain}`) as any).get().catch(() => null)
-  const irRaw = irCell?.data?.ir
-  const ir = irRaw
-    ? JSON.parse(typeof irRaw === 'string' ? irRaw : JSON.stringify(irRaw))
-    : null
+  const getStubLocal = (id: string) => getEntityDO(env, id) as any
+  try { await loadDomainSchema(registryDO, getStubLocal, irDomain) } catch {}
+  const irJson = await reconstructIR(registryDO, getStubLocal, irDomain)
+  const ir = irJson ? JSON.parse(irJson) : null
 
   if (!ir) return json({ error: 'No schema loaded' }, { status: 500 })
 

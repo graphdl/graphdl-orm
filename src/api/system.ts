@@ -6,7 +6,7 @@
  * The entity decides how, not the router.
  */
 
-import { loadDomainSchema, buildPopulation, forwardChain } from './engine'
+import { loadDomainSchema, buildPopulation, forwardChain, reconstructIR } from './engine'
 
 // ── Types ───────────────────────────────────────────────────────────
 
@@ -113,17 +113,23 @@ async function resolveExternalSystem(data: FactData): Promise<{
     ? await data.env.getStub(systemName).get().catch(() => null)
     : null
 
-  // 3. Resolve the noun's URI from the IR instance facts.
+  // 3. Resolve the noun's URI from Instance Fact entities.
   // The readings declare: Noun 'API Product' has URI '/api'.
-  // Parsed as GeneralInstanceFact: { subjectNoun: "Noun", subjectValue: "API Product", fieldName: "uri", objectValue: "/api" }
+  // These are stored as Instance Fact entities with subjectNoun, subjectValue, fieldName, objectValue.
   let uri = `/${encodeURIComponent(data.noun)}`
-  const irCell = await data.env.getStub(`ir:${data.domain}`).get().catch(() => null)
-  if (irCell?.data?.ir) {
-    const ir = typeof irCell.data.ir === 'string' ? JSON.parse(irCell.data.ir) : irCell.data.ir
-    const nounUriFact = (ir.generalInstanceFacts || []).find(
-      (f: any) => f.subjectNoun === 'Noun' && f.subjectValue === data.noun
-        && (f.fieldName === 'uri' || f.fieldName === 'URI')
+  const instanceFactIds: string[] = await data.env.registry.getEntityIds('Instance Fact', data.domain).catch(() => [])
+  if (instanceFactIds.length > 0) {
+    const settled = await Promise.allSettled(
+      instanceFactIds.map(async (id: string) => {
+        const cell = await data.env.getStub(id).get()
+        return cell ? cell.data : null
+      }),
     )
+    const nounUriFact = settled
+      .filter((r): r is PromiseFulfilledResult<any> => r.status === 'fulfilled' && r.value)
+      .map(r => r.value)
+      .find((f: any) => f.subjectNoun === 'Noun' && f.subjectValue === data.noun
+        && (f.fieldName === 'uri' || f.fieldName === 'URI'))
     if (nounUriFact?.objectValue) {
       uri = nounUriFact.objectValue
     }
@@ -290,13 +296,7 @@ export async function system(
   env: SystemEnv,
   body?: unknown,
 ): Promise<SystemOutput> {
-  // ↑entity(x) : D — fetch the IR from the domain cell
-  const irCell = await env.getStub(`ir:${domain}`).get().catch(() => null)
-  const ir = irCell?.data?.ir
-    ? JSON.parse(typeof irCell.data.ir === 'string' ? irCell.data.ir : JSON.stringify(irCell.data.ir))
-    : null
-
-  // ↓DEFS — build definitions from the IR and runtime registrations
+  // ↓DEFS — build definitions from Instance Fact entities and runtime registrations
   const defs: Defs = new Map()
   registerDefault(defs, 'read', read)
   registerDefault(defs, 'readDetail', readDetail)
@@ -305,8 +305,18 @@ export async function system(
   // Register external fetch for nouns backed by External Systems.
   // The instance facts declare: Noun 'X' is backed by External System 'Y'.
   // For backed nouns, the readDetail function in DEFS IS the external fetch.
-  if (ir?.generalInstanceFacts) {
-    for (const fact of ir.generalInstanceFacts) {
+  const instanceFactIds: string[] = await env.registry.getEntityIds('Instance Fact', domain).catch(() => [])
+  if (instanceFactIds.length > 0) {
+    const settled = await Promise.allSettled(
+      instanceFactIds.map(async (id: string) => {
+        const cell = await env.getStub(id).get()
+        return cell ? cell.data : null
+      }),
+    )
+    const instanceFacts = settled
+      .filter((r): r is PromiseFulfilledResult<any> => r.status === 'fulfilled' && r.value)
+      .map(r => r.value)
+    for (const fact of instanceFacts) {
       if (fact.subjectNoun === 'Noun' && fact.objectNoun === 'External System') {
         registerDef(defs, fact.subjectValue, 'readDetail', resolveExternalDetail)
         registerDef(defs, fact.subjectValue, 'read', async (d) => {
