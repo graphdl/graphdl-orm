@@ -23,8 +23,175 @@ function ensureWasm() {
 }
 
 /**
+ * Reconstruct the ConstraintIR JSON from entity queries.
+ *
+ * The IR cell is gone. Instead, the TS layer queries Noun, Graph Schema,
+ * Role, Constraint, Derivation Rule, State Machine Definition, Status,
+ * Transition, and Instance Fact entities to rebuild the IR that the WASM
+ * evaluator expects.
+ */
+export async function reconstructIR(
+  registry: any,
+  getStub: (id: string) => any,
+  domainSlug: string,
+): Promise<string | null> {
+  // Fetch all entity IDs in parallel
+  const [nounIds, schemaIds, roleIds, constraintIds, ruleIds, smIds, statusIds, transitionIds, instanceFactIds] = await Promise.all([
+    registry.getEntityIds('Noun', domainSlug).catch(() => []) as Promise<string[]>,
+    registry.getEntityIds('Graph Schema', domainSlug).catch(() => []) as Promise<string[]>,
+    registry.getEntityIds('Role', domainSlug).catch(() => []) as Promise<string[]>,
+    registry.getEntityIds('Constraint', domainSlug).catch(() => []) as Promise<string[]>,
+    registry.getEntityIds('Derivation Rule', domainSlug).catch(() => []) as Promise<string[]>,
+    registry.getEntityIds('State Machine Definition', domainSlug).catch(() => []) as Promise<string[]>,
+    registry.getEntityIds('Status', domainSlug).catch(() => []) as Promise<string[]>,
+    registry.getEntityIds('Transition', domainSlug).catch(() => []) as Promise<string[]>,
+    registry.getEntityIds('Instance Fact', domainSlug).catch(() => []) as Promise<string[]>,
+  ])
+
+  if (nounIds.length === 0 && schemaIds.length === 0) return null
+
+  // Fetch all entities in parallel
+  const fetchAll = async (ids: string[]) => {
+    const settled = await Promise.allSettled(
+      ids.map(async (id: string) => {
+        const cell = await getStub(id).get()
+        return cell ? { id: cell.id, ...cell.data } : null
+      }),
+    )
+    return settled
+      .filter((r): r is PromiseFulfilledResult<any> => r.status === 'fulfilled' && r.value)
+      .map(r => r.value)
+  }
+
+  const [nouns, schemas, roles, constraints, rules, sms, statuses, transitions, instanceFacts] = await Promise.all([
+    fetchAll(nounIds),
+    fetchAll(schemaIds),
+    fetchAll(roleIds),
+    fetchAll(constraintIds),
+    fetchAll(ruleIds),
+    fetchAll(smIds),
+    fetchAll(statusIds),
+    fetchAll(transitionIds),
+    fetchAll(instanceFactIds),
+  ])
+
+  // Reconstruct nouns: HashMap<String, NounDef>
+  const irNouns: Record<string, any> = {}
+  for (const n of nouns) {
+    const def: any = {
+      objectType: n.objectType || 'entity',
+      enumValues: n.enumValues || null,
+      valueType: null,
+      superType: n.superType || null,
+      worldAssumption: 'closed',
+      refScheme: n.referenceScheme || null,
+      objectifies: n.objectifies || null,
+      subtypeKind: null,
+      rigid: false,
+    }
+    irNouns[n.name || n.id] = def
+  }
+
+  // Reconstruct fact types: HashMap<String, FactTypeDef>
+  // Build role index: schemaId -> sorted roles
+  const rolesBySchema = new Map<string, any[]>()
+  for (const r of roles) {
+    const sid = r.graphSchema
+    if (!sid) continue
+    const list = rolesBySchema.get(sid) || []
+    list.push(r)
+    rolesBySchema.set(sid, list)
+  }
+
+  const irFactTypes: Record<string, any> = {}
+  for (const s of schemas) {
+    const schemaId = s.name || s.id
+    const schemaRoles = (rolesBySchema.get(schemaId) || [])
+      .sort((a: any, b: any) => (a.position ?? 0) - (b.position ?? 0))
+      .map((r: any, i: number) => ({
+        nounName: r.nounName,
+        roleIndex: i,
+      }))
+    irFactTypes[schemaId] = {
+      schemaId,
+      reading: s.reading || schemaId,
+      readings: [],
+      roles: schemaRoles,
+    }
+  }
+
+  // Reconstruct constraints
+  const irConstraints = constraints.map((c: any) => ({
+    id: c.id || '',
+    kind: c.kind || '',
+    modality: c.modality || 'Alethic',
+    deonticOperator: null,
+    text: c.text || '',
+    spans: Array.isArray(c.spans) ? c.spans : [],
+    entity: c.entity || null,
+    minOccurrence: c.minOccurrence ?? null,
+    maxOccurrence: c.maxOccurrence ?? null,
+  }))
+
+  // Reconstruct state machines
+  const irStateMachines: Record<string, any> = {}
+  for (const sm of sms) {
+    const smName = sm.name || sm.id
+    const smStatuses = statuses
+      .filter((s: any) => s.stateMachineDefinition === sm.id)
+      .map((s: any) => s.name)
+    const smTransitions = transitions
+      .filter((t: any) => t.stateMachineDefinition === sm.id)
+      .map((t: any) => ({
+        from: t.from,
+        to: t.to,
+        event: t.event,
+        guard: null,
+      }))
+    irStateMachines[smName] = {
+      nounName: sm.forNoun || smName,
+      statuses: smStatuses,
+      transitions: smTransitions,
+    }
+  }
+
+  // Reconstruct derivation rules
+  const irDerivationRules = rules.map((r: any) => ({
+    id: r.ruleId || r.id || '',
+    text: r.text || '',
+    antecedentFactTypeIds: r.antecedentFactTypeIds ? JSON.parse(r.antecedentFactTypeIds) : [],
+    consequentFactTypeId: r.consequentFactTypeId || '',
+    kind: r.kind ? JSON.parse(r.kind) : 'modusPonens',
+    joinOn: r.joinOn ? JSON.parse(r.joinOn) : [],
+    matchOn: r.matchOn ? JSON.parse(r.matchOn) : [],
+    consequentBindings: r.consequentBindings ? JSON.parse(r.consequentBindings) : [],
+  }))
+
+  // Reconstruct general instance facts
+  const irInstanceFacts = instanceFacts.map((f: any) => ({
+    subjectNoun: f.subjectNoun || '',
+    subjectValue: f.subjectValue || '',
+    fieldName: f.fieldName || '',
+    objectNoun: f.objectNoun || '',
+    objectValue: f.objectValue || '',
+  }))
+
+  const ir = {
+    domain: domainSlug,
+    nouns: irNouns,
+    factTypes: irFactTypes,
+    constraints: irConstraints,
+    stateMachines: irStateMachines,
+    derivationRules: irDerivationRules,
+    generalInstanceFacts: irInstanceFacts,
+  }
+
+  return JSON.stringify(ir)
+}
+
+/**
  * Load a domain's schema into the WASM engine.
- * Builds the ConstraintIR from EntityDB entities via the schema generator.
+ * Reconstructs the ConstraintIR from entity queries and loads it.
  */
 export async function loadDomainSchema(
   registry: any,
@@ -33,13 +200,9 @@ export async function loadDomainSchema(
 ): Promise<void> {
   ensureWasm()
 
-  // Read the compiled IR cell — compile(parse(readings)) stored during seeding.
-  // One cell, one fetch. No reconstruction from parts.
-  const irCellId = `ir:${domainSlug}`
-  const cell = await getStub(irCellId).get()
-  if (!cell?.data?.ir) return
+  const irJson = await reconstructIR(registry, getStub, domainSlug)
+  if (!irJson) return
 
-  const irJson = typeof cell.data.ir === 'string' ? cell.data.ir : JSON.stringify(cell.data.ir)
   load_ir(irJson)
 }
 
@@ -58,36 +221,60 @@ export async function buildPopulation(
   getStub: (id: string) => any,
   domainSlug: string,
 ): Promise<string> {
-  // Build a lookup from (nounType, fieldName) → Graph Schema ID.
-  // The IR has fact types like {id: "User_has_Org_Role", roles: [{nounName: "User"}, {nounName: "Org Role"}]}.
+  // Build a lookup from (nounType, fieldName) -> Graph Schema ID.
+  // Query Graph Schema and Role entities to build the fact type index.
   // Entity fields are camelCase ("orgRole"). Role noun names are title case ("Org Role").
   // We match by normalizing both to lowercase.
-  const irCell = await getStub(`ir:${domainSlug}`).get().catch(() => null)
-  const ir = irCell?.data?.ir
-    ? JSON.parse(typeof irCell.data.ir === 'string' ? irCell.data.ir : JSON.stringify(irCell.data.ir))
-    : null
+  const [schemaIds, roleIds] = await Promise.all([
+    registry.getEntityIds('Graph Schema', domainSlug).catch(() => []) as Promise<string[]>,
+    registry.getEntityIds('Role', domainSlug).catch(() => []) as Promise<string[]>,
+  ])
+
+  const fetchAll = async (ids: string[]) => {
+    const settled = await Promise.allSettled(
+      ids.map(async (id: string) => {
+        const cell = await getStub(id).get()
+        return cell ? { id: cell.id, ...cell.data } : null
+      }),
+    )
+    return settled
+      .filter((r): r is PromiseFulfilledResult<any> => r.status === 'fulfilled' && r.value)
+      .map(r => r.value)
+  }
+
+  const [schemas, roles] = await Promise.all([fetchAll(schemaIds), fetchAll(roleIds)])
+
+  // Build role index: schemaId -> sorted roles
+  const rolesBySchema = new Map<string, any[]>()
+  for (const r of roles) {
+    const sid = r.graphSchema
+    if (!sid) continue
+    const list = rolesBySchema.get(sid) || []
+    list.push(r)
+    rolesBySchema.set(sid, list)
+  }
 
   const ftLookup = new Map<string, string>()
-  Object.entries(ir?.factTypes || {}).forEach(([ftId, ft]: [string, any]) => {
-    const firstRole = (ft.roles?.[0]?.nounName || '').toLowerCase()
+  for (const s of schemas) {
+    const ftId = s.name || s.id
+    const ftRoles = (rolesBySchema.get(ftId) || [])
+      .sort((a: any, b: any) => (a.position ?? 0) - (b.position ?? 0))
+    const firstRole = (ftRoles[0]?.nounName || '').toLowerCase()
     // Index by (firstRole, eachRoleNoun)
-    ;(ft.roles || []).forEach((role: any) => {
-      ftLookup.set(`${firstRole}:${role.nounName.toLowerCase()}`, ftId)
-    })
+    for (const role of ftRoles) {
+      ftLookup.set(`${firstRole}:${(role.nounName || '').toLowerCase()}`, ftId)
+    }
     // Also index by (firstRole, verb) extracted from the reading
-    // Reading format: "NounA verb NounB" → extract verb between first and second noun
-    const reading = (ft.reading || ftId) as string
-    const roles = (ft.roles || []) as Array<{ nounName: string }>
-    if (roles.length >= 2) {
-      const r = reading
-      const first = roles[0].nounName
-      const second = roles[roles.length - 1].nounName
-      const afterFirst = r.indexOf(first) >= 0 ? r.substring(r.indexOf(first) + first.length).trim() : ''
+    const reading = (s.reading || ftId) as string
+    if (ftRoles.length >= 2) {
+      const first = ftRoles[0]?.nounName || ''
+      const second = ftRoles[ftRoles.length - 1]?.nounName || ''
+      const afterFirst = reading.indexOf(first) >= 0 ? reading.substring(reading.indexOf(first) + first.length).trim() : ''
       const beforeSecond = second && afterFirst.indexOf(second) >= 0 ? afterFirst.substring(0, afterFirst.indexOf(second)).trim() : afterFirst
       const verb = beforeSecond.replace(/\.$/, '').trim()
       ftLookup.set(`${firstRole}:${verb.toLowerCase()}`, ftId)
     }
-  })
+  }
 
   const resolveFactTypeId = (nounType: string, fieldName: string): string => {
     // Try exact match: nounType + fieldName as role noun or verb (case-insensitive)
@@ -108,7 +295,7 @@ export async function buildPopulation(
   const facts: Record<string, Array<{ factTypeId: string; bindings: Array<[string, string]> }>> = {}
 
   // Skip schema entities. Only domain entities contribute to the population.
-  const schemaTypes = new Set(['Noun', 'Reading', 'Graph Schema', 'Role', 'Constraint', 'CompiledSchema', 'Derivation Rule', 'State Machine Definition', 'Status', 'Transition', 'External System'])
+  const schemaTypes = new Set(['Noun', 'Reading', 'Graph Schema', 'Role', 'Constraint', 'CompiledSchema', 'Derivation Rule', 'State Machine Definition', 'Status', 'Transition', 'External System', 'Instance Fact'])
   const entitySettled = await Promise.allSettled(
     counts.filter(({ nounType }) => !schemaTypes.has(nounType)).flatMap(({ nounType }) =>
       registry.getEntityIds(nounType, domainSlug).then((ids: string[]) =>
@@ -708,11 +895,9 @@ export async function deriveViewMetadata(
       modality: c.modality || 'Alethic',
     }))
 
-  // Derive hierarchy from compiled IR — one cell fetch, no fan-out.
+  // Derive hierarchy from reconstructed IR.
   // MC constraints determine existential dependency. Subtype chains propagate.
-  const irCellId = `ir:${domainSlug}`
-  const irCell = await getStub(irCellId).get()
-  const irJson = irCell?.data?.ir as string || '{}'
+  const irJson = await reconstructIR(registry, getStub, domainSlug) || '{}'
 
   const { topLevel: topLevelSet, dependsOn } = getTopLevelNouns(irJson)
   const isTopLevel = topLevelSet.has(nounName)

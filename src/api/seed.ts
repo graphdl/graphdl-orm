@@ -106,26 +106,45 @@ async function handleSeedPost(request: Request, env: Env): Promise<Response> {
   const results: Array<{ domain: string; entities: number; nouns: number; readings: number; errors: string[] }> = []
 
   // Domains are NORMA tabs, not separate universes. Nouns are global.
-  // Load existing noun definitions from the IR for cross-domain resolution.
-  // No generated text. The existing IR has the real noun definitions.
+  // Load existing noun definitions from Noun entities for cross-domain resolution.
   let existingNounsJson = '{}'
   try {
     const allDomains: string[] = await registry.listDomains()
-    const irCells = await Promise.allSettled(
+    const mergedNouns: Record<string, any> = {}
+    const nounSets = await Promise.allSettled(
       allDomains.map(async (d: string) => {
-        const stub = env.ENTITY_DB.get(env.ENTITY_DB.idFromName(`ir:${d}`)) as any
-        const cell = await stub.get()
-        return cell?.data?.ir
-          ? JSON.parse(typeof cell.data.ir === 'string' ? cell.data.ir : JSON.stringify(cell.data.ir))
-          : null
+        const nounIds: string[] = await registry.getEntityIds('Noun', d)
+        const settled = await Promise.allSettled(
+          nounIds.map(async (id: string) => {
+            const stub = env.ENTITY_DB.get(env.ENTITY_DB.idFromName(id)) as any
+            const cell = await stub.get()
+            return cell ? { id: cell.id, ...cell.data } : null
+          }),
+        )
+        return settled
+          .filter((r): r is PromiseFulfilledResult<any> => r.status === 'fulfilled' && r.value)
+          .map(r => r.value)
       }),
     )
-    // Merge all noun definitions from all domain IRs
-    const mergedNouns: Record<string, unknown> = {}
-    irCells
-      .filter((r): r is PromiseFulfilledResult<any> => r.status === 'fulfilled' && r.value?.nouns)
-      .map(r => r.value.nouns)
-      .forEach(nouns => Object.assign(mergedNouns, nouns))
+    // Merge all noun definitions from all domains into NounDef-shaped objects
+    nounSets
+      .filter((r): r is PromiseFulfilledResult<any[]> => r.status === 'fulfilled')
+      .flatMap(r => r.value)
+      .forEach((n: any) => {
+        const name = n.name || n.id
+        if (!name) return
+        mergedNouns[name] = {
+          objectType: n.objectType || 'entity',
+          enumValues: n.enumValues || null,
+          valueType: null,
+          superType: n.superType || null,
+          worldAssumption: 'closed',
+          refScheme: n.referenceScheme || null,
+          objectifies: n.objectifies || null,
+          subtypeKind: null,
+          rigid: false,
+        }
+      })
     existingNounsJson = JSON.stringify(mergedNouns)
   } catch {}
 
