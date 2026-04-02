@@ -214,12 +214,18 @@ export async function loadDomainSchema(
 ): Promise<number> {
   ensureWasm()
 
+  // ↑DEFS — try the persisted IR first (stored at seed time, one fetch)
+  const defsCell = await getStub(`defs:${domainSlug}`).get().catch(() => null)
+  const cachedIr = defsCell?.data?.irJson || defsCell?.irJson
+  if (cachedIr) {
+    const irStr = typeof cachedIr === 'string' ? cachedIr : JSON.stringify(cachedIr)
+    return compile_domain(irStr)
+  }
+
+  // Fallback: reconstruct from entities (domains not yet re-seeded)
   const irJson = await reconstructIR(registry, getStub, domainSlug)
   if (!irJson) return -1
-
-  // Use load_ir which internally calls compile_domain + sets current handle
-  load_ir(irJson)
-  return current_domain_handle() ?? -1
+  return compile_domain(irJson)
 }
 
 /**
