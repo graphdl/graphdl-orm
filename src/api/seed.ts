@@ -174,6 +174,24 @@ async function handleSeedPost(request: Request, env: Env): Promise<Response> {
       await registry.materializeBatch(entities)
     }
 
+    // ↓DEFS — persist definitions after seeding
+    const defsData: Record<string, string> = {}
+    // Default operations
+    defsData['*:read'] = 'local'
+    defsData['*:readDetail'] = 'local'
+    defsData['*:create'] = 'local'
+    // Register external fetch for backed nouns from Instance Facts
+    const instanceFactEntities = entities.filter(e => e.type === 'Instance Fact')
+    for (const ife of instanceFactEntities) {
+      const d = ife.data as any
+      if (d.subjectNoun === 'Noun' && d.objectNoun === 'External System') {
+        defsData[`${d.subjectValue}:read`] = 'external'
+        defsData[`${d.subjectValue}:readDetail`] = 'external'
+      }
+    }
+    const defsStub = env.ENTITY_DB.get(env.ENTITY_DB.idFromName(`defs:${slug}`)) as any
+    await defsStub.put({ id: `defs:${slug}`, type: 'Defs', domain: slug, data: defsData })
+
     const readingEntities = entities.filter(e => e.type === 'Reading')
     results.push({
       domain: slug,
