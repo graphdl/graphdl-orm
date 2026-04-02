@@ -105,16 +105,25 @@ The compiled form for each FORML\,2 construct:
 \midrule
 Entity type \texttt{X(.ref)} & $\langle\mathit{CONS}, s_1, \ldots, s_n\rangle$ \\
 Fact type \texttt{X r Y} & $\langle\mathit{CONS}, s_1, s_2\rangle$ (binary) \\
-UC: \texttt{at most one} & $\mathit{Filter}(\mathit{count}(s_i) > 1)$ \\
-MC: \texttt{each\ldots some} & $\mathit{Filter}(\mathit{absent?} \circ s_j)$ \\
-UC$+$MC: \texttt{exactly one} & $\mathit{Filter}(\mathit{count}(s_i) \neq 1)$ \\
-FC: \texttt{at least $k$\ldots} & $\mathit{Filter}(\neg(k \leq \mathit{count}(s_i) \leq m))$ \\
 Derivation rule & $\langle\mathit{COMP}, f, g\rangle$ \\
 State machine & $\mathit{foldl}\;\mathit{transition}\;s_0\;E$ \\
 Instance fact & $\bar{x}$ asserted into $P$ \\
+\midrule
+\multicolumn{2}{@{}l@{}}{\textit{Constraints (all compile to $\mathit{Filter}(p) : P$)}} \\
+\midrule
+\multicolumn{2}{@{}l@{}}{\textit{Cardinality family:} $p = \mathit{count}(\mathit{scope}) \notin [k, m]$} \\
+UC, MC, FC, XC, XO, OR & scope $\in$ \{role, participation\} \\
+\midrule
+\multicolumn{2}{@{}l@{}}{\textit{Membership family:} $p = \mathit{match}(\mathit{target}, \mathit{polarity})$} \\
+IR, AS, SY, AT (self-ref) & target $=$ same population, reversed \\
+IT, TR, AC (path) & target $=$ transitive closure step \\
+SS, EQ (set comparison) & target $=$ cross-fact-type tuples \\
+VC (value) & target $=$ declared value set \\
 \bottomrule
 \end{tabular}
 \end{center}
+
+\noindent Every ORM\,2 constraint compiles to a restriction~(\ref{eq:restrict}) whose predicate belongs to one of two families. The \emph{cardinality} family checks whether a count falls within bounds $[k, m]$: UC sets $[0, 1]$, MC sets $[1, \infty)$, FC sets $[k, m]$. The \emph{membership} family checks whether a tuple exists (or is absent) in a target set. Ring constraints match against the same population with reversed or transitively extended roles. Subset and equality constraints match across distinct fact types. Value constraints match against a declared constant set. Polarity (must exist vs.\ must not exist) is the only parameter distinguishing symmetric (SY, violation when reverse is absent) from asymmetric (AS, violation when reverse is present).
 
 \subsection{Relational Algebra}
 
@@ -281,26 +290,25 @@ Let $N$ be a declared set of object type names and $F$ a declared set of predica
 \end{theorem}
 
 \begin{proof}
-A FORML\,2 sentence has the structure:
-\begin{align*}
-[\mathit{modal}] \;\; [\mathit{quant}_1] \;\; n_1 \;\; r \;\; \mathit{quant}_2 \;\; n_2 \;\; [\mathit{qual}]
-\end{align*}
-where $\mathit{modal} \in \{$``It is obligatory that'', ``It is forbidden that'', ``It is permitted that'', $\varepsilon\}$; $\mathit{quant}_1 \in \{$``Each'', ``For each'', ``the same'', $\varepsilon\}$; $n_1, n_2 \in N$; $r \in F$; $\mathit{quant}_2 \in \{$``at most one'', ``some'', ``exactly one'', ``at least $k$ and at most $m$'', ``more than one'', ``no'', $\varepsilon\}$; $\mathit{qual} \in \{$``who $\ldots$'', ``that $\ldots$'', $\varepsilon\}$.
+FORML\,2 sentences fall into three structural families, each determined by its prefix:
 
-\medskip\noindent
-(1)~The modal prefixes are pairwise non-overlapping strings, so $\mathit{modal}$ is determined by the sentence prefix.
+\smallskip\noindent
+\textit{(a) Quantified constraints.} Structure:
+$[\mathit{modal}] \;\; \mathit{quant}_1 \;\; n_1 \;\; r \;\; \mathit{quant}_2 \;\; n_2 \;\; [\mathit{qual}]$
 
-(2)~After $\mathit{modal}$, the quantifier $\mathit{quant}_1$ is determined: ``Each'' vs.\ ``For each'' vs.\ ``the same'' vs.\ a name from $N$ are distinguishable because no $n \in N$ contains a formal item as a substring (by hypothesis).
+\noindent where $\mathit{modal} \in \{$``It is obligatory that'', ``It is forbidden that'', ``It is permitted that'', ``It is impossible that'', ``It is possible that'', $\varepsilon\}$; $\mathit{quant}_1 \in \{$``Each'', ``For each'', ``the same'', ``No'', $\varepsilon\}$; $\mathit{quant}_2 \in \{$``at most one'', ``some'', ``exactly one'', ``at least $k$ and at most $m$'', ``more than one'', ``no'', $\varepsilon\}$. Noun positions $n_i \in N$ are resolved by longest-first matching. The predicate $r \in F$ is the maximal token sequence between noun positions. Each structural position admits exactly one parse because (i)~modal prefixes are pairwise non-overlapping, (ii)~quantifier phrases are pairwise distinct, (iii)~no $n \in N$ contains a formal item as a substring (by hypothesis), and (iv)~longest-first matching is deterministic. The constraint kind is determined by $(\mathit{quant}_1, \mathit{quant}_2)$: (Each, at most one)$\,\to\,$UC; (Each, some)$\,\to\,$MC; (Each, exactly one)$\,\to\,$UC$+$MC; (Each, at least $k$\ldots)$\,\to\,$FC; (the same, more than one)$\,\to\,$UC$^{-}$; (No, $\varepsilon$)$\,\to\,$XC. This family also generalizes to $n$-ary predicates ($n_1 \ldots n_k$) by the same longest-first procedure.
 
-(3)~$n_1$ is determined by longest-first matching against $N$. Since names do not contain formal items, the boundary between $n_1$ and $r$ is unambiguous.
+\smallskip\noindent
+\textit{(b) Conditional constraints.} Structure:
+$\text{``If''} \;\; \mathit{antecedent} \;\; \text{``then''} \;\; \mathit{consequent}$
 
-(4)~$r$ is the maximal token sequence between $n_1$ and $\mathit{quant}_2$. The quantifier phrases in $\mathit{quant}_2$ are pairwise distinct strings: \{``at most one'', ``some'', ``exactly one'', ``at least'', ``more than one'', ``no''\}. None is a prefix of another in this position. Since no $n \in N$ contains these phrases, the boundary between $r$ and $\mathit{quant}_2$ is unambiguous.
+\noindent The ``If\ldots then'' frame is unambiguous (unique split on ``then''). Ring constraints (IR, AS, SY, AT, IT, TR, AC, RF) are identified by all noun bases being the same type. The kind is determined by polarity (``it is impossible that'' in the consequent) and arity (``and'' in the antecedent). Subset constraints (SS) are identified by existential ``some'' in the antecedent and anaphoric ``that'' in the consequent with mixed noun types. Derivation rules occupy the remainder.
 
-(5)~$n_2$ is determined by longest-first matching against $N$ after $\mathit{quant}_2$.
+\smallskip\noindent
+\textit{(c) Multi-clause constraints.} Keyword-delimited: ``if and only if'' (EQ), ``exactly one of the following holds'' (XO), ``at most one of the following holds'' (XC), ``at least one of the following holds'' (OR). The keyword is unambiguous. Clauses are separated by ``;'' or ``or''.
 
-(6)~$\mathit{qual}$ is determined by ``who'' or ``that'' (personal vs.\ impersonal pronouns per~\cite[Sec.\,1.5]{halpin06b}).
-
-Each structural position admits exactly one parse. The constraint type is determined by the pair $(\mathit{quant}_1, \mathit{quant}_2)$, which maps injectively to constraint kinds: (Each, at most one)~$\to$~UC; (Each, some)~$\to$~MC; (Each, exactly one)~$\to$~UC$+$MC; (Each, at least $k$\ldots)~$\to$~FC; (the same, more than one)~$\to$~UC$^{-}$. No two pairs map to the same kind.
+\smallskip\noindent
+The three families are distinguished by their sentence prefix (quantifier word, ``If'', or keyword), which is determined at position~(1). Within each family, the parse is deterministic by the arguments above. The reference implementation~\cite{norma} constructively demonstrates unambiguous round-trip parsing for all 17 constraint kinds.
 \end{proof}
 
 \noindent The hypothesis on $N$ is enforced by the compiler, which rejects any declared name containing a formal item of the grammar as a substring.
@@ -314,7 +322,7 @@ and $\rho(\mathit{compile}(\mathit{parse}(r)))$ is the executable for every $r \
 \end{theorem}
 
 \begin{proof}
-$\mathit{parse}$ is injective by Theorem~\ref{thm:grammar}: each sentence has one parse, so distinct sentences yield distinct formulas. $\mathit{parse}$ recognizes the structural positions of Theorem~\ref{thm:grammar} and produces the corresponding formula. $\mathit{compile}$ is injective: the $(\mathit{quant}_1, \mathit{quant}_2)$ pair determines the constraint kind (Theorem~\ref{thm:grammar}), and each kind compiles to a restriction~(\ref{eq:restrict}) with a distinct predicate ($\mathit{count} > 1$ for UC, $\mathit{absent?}$ for MC, $\mathit{count} \neq 1$ for UC$+$MC, range predicate for FC). Distinct predicates yield distinct FFP objects. Both $\mathit{parse}$ and $\mathit{compile}$ have left inverses ($\mathit{compile}^{-1}$ is Halpin and Curland's verbalization algorithm~\cite{halpin06}); composing: $\mathit{parse}^{-1} \circ \mathit{compile}^{-1} \circ \mathit{compile} \circ \mathit{parse} = \mathit{id}_R$. Executability: $\rho$ maps the compiled object to a function by~\cite[Sec.\,13.4]{backus78}.
+$\mathit{parse}$ is injective by Theorem~\ref{thm:grammar}: each sentence has one parse, so distinct sentences yield distinct formulas. $\mathit{compile}$ is injective: each constraint kind compiles to a restriction~(\ref{eq:restrict}) with a predicate from one of two families: cardinality predicates parameterized by bounds $[k, m]$, and membership predicates parameterized by target set and polarity. Distinct kinds produce distinct parameter tuples, and thus distinct FFP objects. Both $\mathit{parse}$ and $\mathit{compile}$ have left inverses ($\mathit{compile}^{-1}$ is Halpin and Curland's verbalization algorithm~\cite{halpin06}); composing: $\mathit{parse}^{-1} \circ \mathit{compile}^{-1} \circ \mathit{compile} \circ \mathit{parse} = \mathit{id}_R$. Executability: $\rho$ maps the compiled object to a function by~\cite[Sec.\,13.4]{backus78}.
 \end{proof}
 
 \noindent\textbf{Remark} (Surjectivity). $\mathit{compile}$ is not surjective. There exist FFP objects in $O$ that no FORML\,2 reading produces. This is intentional: runtime-registered functions (Sec.\,5.3) occupy the complement. FORML\,2 readings cover the domain layer. Registered functions cover the platform layer. Together they span the objects in $\mathit{DEFS}$.
@@ -435,6 +443,9 @@ T. Halpin and M. Curland, ``Automated Verbalization for ORM 2,'' in \emph{OTM Wo
 
 \bibitem{halpin06b}
 T. Halpin, M. Curland, and CS445 Class, ``ORM 2 Constraint Verbalization: Part 1,'' Technical Report ORM2-02, Neumont University, 2006.
+
+\bibitem{norma}
+T.~Halpin and M.~Curland, NORMA (Natural Object-Role Modeling Architect), open-source reference implementation, \url{https://github.com/ormsolutions/NORMA}.
 
 \end{thebibliography}
 
