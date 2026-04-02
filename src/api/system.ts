@@ -267,14 +267,51 @@ const readDetail: Operation = async (data) => {
   return resolveLocalDetail(data)
 }
 
-const create: Operation = async (data) => {
+// ── Create pipeline — equation (10): create = emit ∘ validate ∘ derive ∘ resolve
+
+type Stage = (ctx: PipelineContext) => Promise<PipelineContext>
+
+interface PipelineContext {
+  data: FactData
+  entityId: string
+  facts: Record<string, unknown>
+  violations: string[]
+  derived: any[]
+}
+
+const resolveStage: Stage = async (ctx) => {
   const entityId = crypto.randomUUID()
-  const entityDO = data.env.getStub(entityId)
-  await entityDO.put({ id: entityId, type: data.noun, data: data.body || {} })
-  await data.env.registry.materializeBatch([{
-    id: entityId, type: data.noun, domain: data.domain, data: (data.body || {}) as Record<string, unknown>,
+  return { ...ctx, entityId, facts: (ctx.data.body || {}) as Record<string, unknown> }
+}
+
+const deriveStage: Stage = async (ctx) => {
+  // Forward chain will be wired when WASM evaluator is entity-driven
+  return ctx
+}
+
+const validateStage: Stage = async (ctx) => {
+  // Constraint evaluation will be wired when WASM evaluator is entity-driven
+  return ctx
+}
+
+const emitStage: Stage = async (ctx) => {
+  const entityDO = ctx.data.env.getStub(ctx.entityId)
+  await entityDO.put({ id: ctx.entityId, type: ctx.data.noun, data: ctx.facts })
+  await ctx.data.env.registry.materializeBatch([{
+    id: ctx.entityId, type: ctx.data.noun, domain: ctx.data.domain, data: ctx.facts,
   }])
-  const cell = await entityDO.get()
+  return ctx
+}
+
+// create = emit ∘ validate ∘ derive ∘ resolve (equation 10)
+const compose = (...stages: Stage[]): Stage =>
+  stages.reduce((composed, stage) => async (ctx) => stage(await composed(ctx)))
+
+const createPipeline = compose(resolveStage, deriveStage, validateStage, emitStage)
+
+const create: Operation = async (data) => {
+  const ctx = await createPipeline({ data, entityId: '', facts: {}, violations: [], derived: [] })
+  const cell = await data.env.getStub(ctx.entityId).get()
   return { status: 201, body: cell }
 }
 
@@ -296,35 +333,28 @@ export async function system(
   env: SystemEnv,
   body?: unknown,
 ): Promise<SystemOutput> {
-  // ↓DEFS — build definitions from Instance Fact entities and runtime registrations
+  // ↑DEFS — fetch persistent definitions
+  const defsCell = await env.getStub(`defs:${domain}`).get().catch(() => null)
+  const defsData: Record<string, string> = defsCell?.data || {}
+
   const defs: Defs = new Map()
   registerDefault(defs, 'read', read)
   registerDefault(defs, 'readDetail', readDetail)
   registerDefault(defs, 'create', create)
 
-  // Register external fetch for nouns backed by External Systems.
-  // The instance facts declare: Noun 'X' is backed by External System 'Y'.
-  // For backed nouns, the readDetail function in DEFS IS the external fetch.
-  const instanceFactIds: string[] = await env.registry.getEntityIds('Instance Fact', domain).catch(() => [])
-  if (instanceFactIds.length > 0) {
-    const settled = await Promise.allSettled(
-      instanceFactIds.map(async (id: string) => {
-        const cell = await env.getStub(id).get()
-        return cell ? cell.data : null
-      }),
-    )
-    const instanceFacts = settled
-      .filter((r): r is PromiseFulfilledResult<any> => r.status === 'fulfilled' && r.value)
-      .map(r => r.value)
-    for (const fact of instanceFacts) {
-      if (fact.subjectNoun === 'Noun' && fact.objectNoun === 'External System') {
-        registerDef(defs, fact.subjectValue, 'readDetail', resolveExternalDetail)
-        registerDef(defs, fact.subjectValue, 'read', async (d) => {
-          const page = parseInt(d.params.page || '1')
-          const limit = parseInt(d.params.limit || '100')
-          return resolveExternal(d, page, limit)
-        })
-      }
+  // Register noun-specific operations from persisted DEFS
+  for (const [key, value] of Object.entries(defsData)) {
+    const [defNoun, defOp] = key.split(':')
+    if (defNoun === '*') continue  // defaults already registered
+    if (value === 'external' && defOp === 'readDetail') {
+      registerDef(defs, defNoun, 'readDetail', resolveExternalDetail)
+    }
+    if (value === 'external' && defOp === 'read') {
+      registerDef(defs, defNoun, 'read', async (d) => {
+        const page = parseInt(d.params.page || '1')
+        const limit = parseInt(d.params.limit || '100')
+        return resolveExternal(d, page, limit)
+      })
     }
   }
 
