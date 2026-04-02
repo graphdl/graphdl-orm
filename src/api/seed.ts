@@ -12,7 +12,7 @@
 
 import { json, error } from 'itty-router'
 import type { Env } from '../types'
-import { parseReadings, parseReadingsWithNouns } from './engine'
+import { parseReadings, parseReadingsWithNouns, reconstructIR } from './engine'
 
 function getRegistryDO(env: Env) {
   return env.REGISTRY_DB.get(env.REGISTRY_DB.idFromName('global'))
@@ -189,6 +189,16 @@ async function handleSeedPost(request: Request, env: Env): Promise<Response> {
         defsData[`${d.subjectValue}:readDetail`] = 'external'
       }
     }
+    // Build IR JSON once at seed time so loadDomainSchema reads it from DEFS
+    // instead of calling reconstructIR on every request.
+    const getStubFn = (id: string) => env.ENTITY_DB.get(env.ENTITY_DB.idFromName(id)) as any
+    try {
+      const irJson = await reconstructIR(registry, getStubFn, slug)
+      if (irJson) {
+        defsData.irJson = irJson
+      }
+    } catch {}
+
     const defsStub = env.ENTITY_DB.get(env.ENTITY_DB.idFromName(`defs:${slug}`)) as any
     await defsStub.put({ id: `defs:${slug}`, type: 'Defs', domain: slug, data: defsData })
 

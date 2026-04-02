@@ -190,8 +190,30 @@ export async function reconstructIR(
 }
 
 /**
+ * Fetch the cached IR JSON from the DEFS cell (one fetch), falling back
+ * to reconstructIR for domains not yet re-seeded.
+ */
+export async function getCachedIR(
+  getStub: (id: string) => any,
+  registry: any,
+  domainSlug: string,
+): Promise<string | null> {
+  // Try DEFS cell first (one fetch, persisted at seed time)
+  try {
+    const defsCell = await getStub(`defs:${domainSlug}`).get()
+    const irJson = defsCell?.data?.irJson || defsCell?.irJson
+    if (irJson) {
+      return typeof irJson === 'string' ? irJson : JSON.stringify(irJson)
+    }
+  } catch {}
+
+  // Fallback: reconstruct (for domains not yet re-seeded)
+  return reconstructIR(registry, getStub, domainSlug)
+}
+
+/**
  * Load a domain's schema into the WASM engine.
- * Reconstructs the ConstraintIR from entity queries and loads it.
+ * Reads cached IR from DEFS cell (one fetch) or falls back to reconstructIR.
  */
 export async function loadDomainSchema(
   registry: any,
@@ -200,7 +222,7 @@ export async function loadDomainSchema(
 ): Promise<void> {
   ensureWasm()
 
-  const irJson = await reconstructIR(registry, getStub, domainSlug)
+  const irJson = await getCachedIR(getStub, registry, domainSlug)
   if (!irJson) return
 
   load_ir(irJson)
@@ -895,9 +917,9 @@ export async function deriveViewMetadata(
       modality: c.modality || 'Alethic',
     }))
 
-  // Derive hierarchy from reconstructed IR.
+  // Derive hierarchy from cached IR (DEFS cell) or fallback reconstruct.
   // MC constraints determine existential dependency. Subtype chains propagate.
-  const irJson = await reconstructIR(registry, getStub, domainSlug) || '{}'
+  const irJson = await getCachedIR(getStub, registry, domainSlug) || '{}'
 
   const { topLevel: topLevelSet, dependsOn } = getTopLevelNouns(irJson)
   const isTopLevel = topLevelSet.has(nounName)
