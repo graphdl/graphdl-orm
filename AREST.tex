@@ -289,7 +289,7 @@ P &= \textstyle\bigcup_n \uparrow\!\mathit{FILE}\!:\!D_n \label{eq:pop}
 
 The router distributes events via $\alpha\,\mathit{RMAP}$~(apply-to-all), and each cell reduces its partition via $\mathit{foldl}\;\mu_n$. Adding cells to the cluster scales $\mathit{SYSTEM}$ horizontally without changing its definition.
 
-A browser runtime is a node in the same model. Cells replicated locally fold events with zero latency. The event stream syncs to the server asynchronously. Because the fold is pure and deterministic~(\ref{eq:sm}), two nodes folding the same events reach the same state. Constraints that depend only on the local cell (cardinality, value) evaluate immediately. Constraints that span cells (subset, external uniqueness) evaluate against committed state~(\ref{eq:pop}) after sync.
+A browser runtime is a node in the same model. Cells replicated locally fold events with zero latency. The event stream syncs to the server asynchronously. Because the fold is pure and deterministic~(\ref{eq:sm}), two nodes folding the same events reach the same state. Constraints that depend only on the local cell (cardinality, value) evaluate immediately. Constraints that span cells (subset, external uniqueness) evaluate against committed state~(\ref{eq:pop}) after sync. Local cells are untrusted: the server fold is authoritative, and alethic violations on the server reject the event regardless of the local evaluation. Local constraint evaluation is optimistic feedback, not a security boundary.
 
 \section{Properties}
 
