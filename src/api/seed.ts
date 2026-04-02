@@ -12,7 +12,7 @@
 
 import { json, error } from 'itty-router'
 import type { Env } from '../types'
-import { parseReadings, parseReadingsWithNouns } from './engine'
+import { parseReadings, parseReadingsWithNouns, reconstructIR } from './engine'
 
 function getRegistryDO(env: Env) {
   return env.REGISTRY_DB.get(env.REGISTRY_DB.idFromName('global'))
@@ -189,6 +189,13 @@ async function handleSeedPost(request: Request, env: Env): Promise<Response> {
         defsData[`${d.subjectValue}:readDetail`] = 'external'
       }
     }
+    // Store IR JSON in DEFS — the output of parse, input to compile_domain
+    const getStubFn = (id: string) => env.ENTITY_DB.get(env.ENTITY_DB.idFromName(id)) as any
+    const irJson = await reconstructIR(registry, getStubFn, slug).catch(() => null)
+    if (irJson) {
+      (defsData as any).irJson = irJson
+    }
+
     const defsStub = env.ENTITY_DB.get(env.ENTITY_DB.idFromName(`defs:${slug}`)) as any
     await defsStub.put({ id: `defs:${slug}`, type: 'Defs', domain: slug, data: defsData })
 
