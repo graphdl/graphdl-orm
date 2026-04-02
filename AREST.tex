@@ -38,13 +38,9 @@ Domain knowledge enters software as natural language requirements, is re-encoded
 
 \section{Introduction}
 
-Software begins as domain knowledge in someone's head. It enters the system through meetings, documents, and tickets, in natural language that two engineers can read differently. The specification is ambiguous, and nobody finds out until integration.
+Software begins as domain knowledge in someone's head. It is re-encoded as schemas, validation logic, state machines, and API routes. When these are distinct artifacts, their equivalence is not preserved by construction.
 
-The specification is then re-encoded. Schemas capture the data model. Validation logic enforces constraints. State machines govern workflows. API routes expose operations. Each is a separate artifact, maintained by a separate process, and any of them can drift from the others. The schema says one thing, the validation enforces another, the API exposes a third.
-
-At 2am, a constraint that was in the specification never made it into the validation layer. Or it did, but the state machine transition bypasses it. The system is formally specified and informally implemented, and the informal parts are where it breaks.
-
-The cause is the same at every level: domain knowledge and executable code are different artifacts. Every bug lives in the gap between them. AREST eliminates the gap by identifying what was never separate to begin with.
+AREST identifies what was never separate to begin with. A FORML\,2 reading is simultaneously a relation schema, a constraint specification, a resource definition, and an FFP object. The compiler does not translate between representations. It recognizes a single object that already occupies all four roles.
 
 \section{Terminology}
 
@@ -407,7 +403,9 @@ Let $D' = D$ after applying $\mathit{SYSTEM}$ with operation $\mathit{compile} \
 Each new reading $r' \in R'$ parses unambiguously (Theorem~\ref{thm:grammar} depends on the grammar, not on $D$). The compiled objects are faithful to the readings (Theorem~\ref{thm:spec} depends on the injectivity of $\mathit{parse}$ and $\mathit{compile}$, which are stateless). The new constraints and derivation rules enter $\mathit{DEFS}$ via $\downarrow\!\mathit{DEFS}$, joining the existing definitions. Theorem~\ref{thm:complete} evaluates all $c \in C_S$, including the new ones. Theorems~\ref{thm:hateoas} and~\ref{thm:derive} operate over $P$ and $S$, both of which now include the new facts and schemas. No theorem's proof depends on $D$ being fixed at initialization.
 \end{proof}
 
-\noindent The algebraic laws of FP~\cite[Sec.\,12.2]{backus78} are equations between functional forms. Since FFP objects represent the same forms via $\rho$~\cite[Sec.\,13.3.2]{backus78}, an FFP object can be transformed to an equivalent object by applying these laws. Ahead-of-time compilation from objects to optimized evaluation trees is one such transformation.
+\noindent Common operational concerns map directly to the formalism: versioning is the event stream ($E$), migration is ingestion of new readings (Corollary~\ref{cor:closure}), backward compatibility is preserved by construction (no theorem depends on $D$ at initialization), and auditability is the derivation trace (Sec.\,7.2).
+
+The algebraic laws of FP~\cite[Sec.\,12.2]{backus78} are equations between functional forms. Since FFP objects represent the same forms via $\rho$~\cite[Sec.\,13.3.2]{backus78}, an FFP object can be transformed to an equivalent object by applying these laws. Ahead-of-time compilation from objects to optimized evaluation trees is one such transformation.
 
 \section{Middleware Elimination}
 
