@@ -346,5 +346,8 @@ External System 'auth.vin' has Header 'Authorization'.
 External System 'auth.vin' has Prefix 'users API-Key'.
 External System 'auto.dev' has URL 'https://api.auto.dev'.
 External System 'auto.dev' has Header 'X-API-Key'.
+External System 'stripe' has URL 'https://api.stripe.com/v1'.
+External System 'stripe' has Header 'Authorization'.
+External System 'stripe' has Prefix 'Bearer'.
 
 Domain 'core' has Visibility 'public'.

@@ -96,3 +96,20 @@ Noun 'User' is backed by External System 'auth.vin'.
 Noun 'User' has URI '/users'.
 
 Noun 'API Product' is backed by External System 'auto.dev'.
+
+Noun 'Stripe Customer' is backed by External System 'stripe'.
+Noun 'Stripe Customer' has URI '/customers'.
+Noun 'Stripe Subscription' is backed by External System 'stripe'.
+Noun 'Stripe Subscription' has URI '/subscriptions'.
+Noun 'Stripe Invoice' is backed by External System 'stripe'.
+Noun 'Stripe Invoice' has URI '/invoices'.
+Noun 'Stripe Charge' is backed by External System 'stripe'.
+Noun 'Stripe Charge' has URI '/charges'.
+Noun 'Stripe Payment Method' is backed by External System 'stripe'.
+Noun 'Stripe Payment Method' has URI '/payment_methods'.
+Noun 'Stripe Price' is backed by External System 'stripe'.
+Noun 'Stripe Price' has URI '/prices'.
+Noun 'Stripe Product' is backed by External System 'stripe'.
+Noun 'Stripe Product' has URI '/products'.
+Noun 'Stripe Payment Intent' is backed by External System 'stripe'.
+Noun 'Stripe Payment Intent' has URI '/payment_intents'.
