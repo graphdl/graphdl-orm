@@ -142,10 +142,8 @@ pub fn rmap(ir: &ConstraintIR) -> Vec<TableDef> {
     // ── Step 0.3: Subtype absorption ────────────────────────────────
     let mut subtype_to_root: HashMap<String, String> = HashMap::new();
     let mut parent_of: HashMap<String, String> = HashMap::new();
-    for (name, noun) in &ir.nouns {
-        if let Some(ref st) = noun.super_type {
-            parent_of.insert(name.clone(), st.clone());
-        }
+    for (name, st) in &ir.subtypes {
+        parent_of.insert(name.clone(), st.clone());
     }
     for name in parent_of.keys() {
         let mut current = name.clone();
@@ -187,13 +185,11 @@ pub fn rmap(ir: &ConstraintIR) -> Vec<TableDef> {
             "VC" => {
                 if let Some(ref entity) = c.entity {
                     for span in &c.spans {
-                        if let Some(noun) = ir.nouns.get(entity) {
-                            if let Some(ref vals) = noun.enum_values {
-                                vcs_by_ft_role.insert(
-                                    format!("{}:{}", span.fact_type_id, span.role_index),
-                                    vals.clone(),
-                                );
-                            }
+                        if let Some(vals) = ir.enum_values.get(entity) {
+                            vcs_by_ft_role.insert(
+                                format!("{}:{}", span.fact_type_id, span.role_index),
+                                vals.clone(),
+                            );
                         }
                     }
                 }
@@ -420,14 +416,14 @@ mod tests {
             constraints: Vec::new(),
             state_machines: HashMap::new(),
             derivation_rules: Vec::new(), general_instance_facts: Vec::new(),
+            subtypes: HashMap::new(), enum_values: HashMap::new(),
+            ref_schemes: HashMap::new(), objectifications: HashMap::new(),
+            named_spans: HashMap::new(), autofill_spans: vec![],
         };
         for (name, obj_type) in nouns {
             ir.nouns.insert(name.to_string(), NounDef {
                 object_type: obj_type.to_string(),
-                enum_values: None,
-                super_type: None,
                 world_assumption: WorldAssumption::default(),
-                ref_scheme: None, objectifies: None,
             });
         }
         for (id, reading, roles) in fact_types {

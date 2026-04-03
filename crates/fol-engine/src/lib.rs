@@ -625,6 +625,12 @@ fn emit_entities_filtered(ir: &types::ConstraintIR, domain: &str, context_nouns:
         state_machines: ir.state_machines.clone(),
         derivation_rules: ir.derivation_rules.clone(),
         general_instance_facts: ir.general_instance_facts.clone(),
+        subtypes: ir.subtypes.clone(),
+        enum_values: ir.enum_values.clone(),
+        ref_schemes: ir.ref_schemes.clone(),
+        objectifications: ir.objectifications.clone(),
+        named_spans: ir.named_spans.clone(),
+        autofill_spans: ir.autofill_spans.clone(),
     };
     emit_entities(&filtered_ir, domain)
 }
@@ -645,16 +651,16 @@ fn emit_entities(ir: &types::ConstraintIR, domain: &str) -> Result<JsValue, JsVa
         // Noun properties are stored as proper typed values, not serialized
         // compiler internals. The IR cell is gone; the TS layer reconstructs
         // the IR from these entity fields when it needs to call compile_domain().
-        if let Some(ref st) = noun.super_type {
+        if let Some(st) = ir.subtypes.get(name) {
             data.insert("superType".into(), serde_json::Value::String(st.clone()));
         }
-        if let Some(ref rs) = noun.ref_scheme {
+        if let Some(rs) = ir.ref_schemes.get(name) {
             data.insert("referenceScheme".into(), serde_json::json!(rs));
         }
-        if let Some(ref obj) = noun.objectifies {
+        if let Some(obj) = ir.objectifications.get(name) {
             data.insert("objectifies".into(), serde_json::Value::String(obj.clone()));
         }
-        if let Some(ref evs) = noun.enum_values {
+        if let Some(evs) = ir.enum_values.get(name) {
             if !evs.is_empty() {
                 data.insert("enumValues".into(), serde_json::json!(evs));
             }
@@ -840,8 +846,8 @@ fn emit_entities(ir: &types::ConstraintIR, domain: &str) -> Result<JsValue, JsVa
         .iter().copied().collect();
 
     // ρ-lookup: supertype name → subtype name (absorb toward subtype)
-    let absorption: HashMap<&str, &str> = ir.nouns.iter()
-        .filter_map(|(name, noun)| noun.super_type.as_ref().map(|st| (st.as_str(), name.as_str())))
+    let absorption: HashMap<&str, &str> = ir.subtypes.iter()
+        .map(|(child, parent)| (parent.as_str(), child.as_str()))
         .collect();
 
     // Resolve entity ID: absorb supertype IDs into subtype IDs via ρ-lookup

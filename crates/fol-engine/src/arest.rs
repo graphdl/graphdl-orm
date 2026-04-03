@@ -713,12 +713,15 @@ mod tests {
             constraints: vec![],
             state_machines: HashMap::new(),
             derivation_rules: vec![], general_instance_facts: vec![],
+            subtypes: HashMap::new(), enum_values: HashMap::new(),
+            ref_schemes: HashMap::new(), objectifications: HashMap::new(),
+            named_spans: HashMap::new(), autofill_spans: vec![],
         };
         ir.nouns.insert("Order".to_string(), NounDef {
             object_type: "entity".to_string(),
-            enum_values: None, super_type: None,
-            world_assumption: WorldAssumption::default(), ref_scheme: Some(vec!["Order Number".to_string()]), objectifies: None,
+            world_assumption: WorldAssumption::default(),
         });
+        ir.ref_schemes.insert("Order".to_string(), vec!["Order Number".to_string()]);
         ir.state_machines.insert("Order".to_string(), StateMachineDef {
             noun_name: "Order".to_string(),
             statuses: vec!["Draft".to_string(), "Placed".to_string(), "Paid".to_string(), "Cancelled".to_string()],

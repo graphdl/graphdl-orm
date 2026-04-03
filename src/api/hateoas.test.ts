@@ -3,11 +3,11 @@ import { deriveLinks, deriveSchema } from './hateoas'
 
 const mockIR = {
   nouns: {
-    Organization: { objectType: 'entity', enumValues: null, superType: null },
-    App: { objectType: 'entity', enumValues: null, superType: null },
-    Domain: { objectType: 'entity', enumValues: null, superType: null },
-    User: { objectType: 'entity', enumValues: null, superType: null },
-    Name: { objectType: 'value', enumValues: null, superType: null },
+    Organization: { objectType: 'entity' },
+    App: { objectType: 'entity' },
+    Domain: { objectType: 'entity' },
+    User: { objectType: 'entity' },
+    Name: { objectType: 'value' },
   },
   factTypes: {
     App_belongs_to_Organization: {

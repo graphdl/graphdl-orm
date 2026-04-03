@@ -13,16 +13,26 @@
 use crate::types::*;
 use std::collections::HashMap;
 
+/// Metadata for a noun that is stored on ConstraintIR maps, not on NounDef.
+#[derive(Default, Clone)]
+struct NounMeta {
+    super_type: Option<String>,
+    ref_scheme: Option<Vec<String>>,
+    objectifies: Option<String>,
+}
+
 /// What a recognizer produces when it matches a line.
 enum ParseAction {
     SetDomain(String),
-    AddNoun(String, NounDef),
+    AddNoun(String, NounDef, NounMeta),
     MarkAbstract(String),
     AddPartition(String, Vec<String>),
     AddFactType(String, FactTypeDef),
     AddConstraint(ConstraintDef),
     AddDerivation(DerivationRuleDef),
     AddInstanceFact(String), // raw line for instance fact parsing
+    AddNamedSpan(String, Vec<String>), // span_name, role nouns
+    AddAutofillSpan(String),           // span_name
     Skip,
 }
 
@@ -44,19 +54,17 @@ fn try_entity_type(line: &str) -> Option<ParseAction> {
     let before = line.strip_suffix(" is an entity type.")?;
     let (name, ref_scheme) = parse_entity_decl(before.trim())?;
     Some(ParseAction::AddNoun(name, NounDef {
-        object_type: "entity".into(), enum_values: None,
-        super_type: None, world_assumption: WorldAssumption::default(),
-        ref_scheme, objectifies: None,
-    }))
+        object_type: "entity".into(),
+        world_assumption: WorldAssumption::default(),
+    }, NounMeta { ref_scheme, ..Default::default() }))
 }
 
 fn try_value_type(line: &str) -> Option<ParseAction> {
     let name = line.strip_suffix(" is a value type.")?.trim().to_string();
     Some(ParseAction::AddNoun(name, NounDef {
-        object_type: "value".into(), enum_values: None,
-        super_type: None, world_assumption: WorldAssumption::default(),
-        ref_scheme: None, objectifies: None,
-    }))
+        object_type: "value".into(),
+        world_assumption: WorldAssumption::default(),
+    }, NounMeta::default()))
 }
 
 fn try_subtype(line: &str) -> Option<ParseAction> {
@@ -65,10 +73,9 @@ fn try_subtype(line: &str) -> Option<ParseAction> {
     let sub = clean[..idx].trim().to_string();
     let sup = clean[idx + 17..].trim().to_string();
     Some(ParseAction::AddNoun(sub, NounDef {
-        object_type: "entity".into(), enum_values: None,
-        super_type: Some(sup), world_assumption: WorldAssumption::default(),
-        ref_scheme: None, objectifies: None,
-    }))
+        object_type: "entity".into(),
+        world_assumption: WorldAssumption::default(),
+    }, NounMeta { super_type: Some(sup), ..Default::default() }))
 }
 
 fn try_abstract(line: &str) -> Option<ParseAction> {
@@ -224,21 +231,16 @@ fn try_subset(line: &str, noun_names: &[String]) -> Option<ParseAction> {
     if !antecedent.contains("some ") { return None; }
     if !consequent.contains("that ") { return None; }
 
-    // Collect base noun types from antecedent
-    let ant_bases: Vec<&str> = antecedent
-        .split_whitespace()
-        .filter_map(|word| {
-            let w = word.trim_end_matches(',');
-            let (base, _) = parse_role_token(w);
-            noun_names.iter().any(|n| n == base).then_some(base)
-        })
-        .collect();
+    // Collect base noun types from antecedent using find_nouns (handles multi-word nouns)
+    let stripped_ant = antecedent.replace("some ", "").replace("that ", "");
+    let ant_found = find_nouns(&stripped_ant, noun_names);
+    let ant_bases: Vec<&str> = ant_found.iter().map(|(_, _, n)| n.as_str()).collect();
 
     if ant_bases.len() < 2 { return None; }
 
     // Subset has multiple DIFFERENT base noun types (distinguishes from ring which has all same)
     let first = ant_bases[0];
-    let all_same = ant_bases.iter().all(|b| *b == first);
+    let all_same = ant_bases.iter().all(|b| b == &first);
     if all_same { return None; }
 
     // Build spans: [0] = subset (antecedent), [1] = superset (consequent)
@@ -496,6 +498,28 @@ fn try_derivation(line: &str) -> Option<ParseAction> {
     })
 }
 
+/// try_span_naming — "This span with A, B provides the preferred identification scheme for SpanName."
+fn try_span_naming(line: &str) -> Option<ParseAction> {
+    let rest = line.strip_prefix("This span with ")?;
+    let pivot = rest.find(" provides the preferred identification scheme for ")?;
+    let nouns_part = &rest[..pivot];
+    let name_part = &rest[pivot + " provides the preferred identification scheme for ".len()..];
+    let span_name = name_part.trim_end_matches('.').trim().to_string();
+    let role_nouns: Vec<String> = nouns_part.split(',').map(|s| s.trim().to_string()).collect();
+    (!span_name.is_empty() && !role_nouns.is_empty())
+        .then(|| ParseAction::AddNamedSpan(span_name, role_nouns))
+}
+
+/// try_autofill_declaration — "Constraint Span 'SpanName' autofills from superset."
+fn try_autofill_declaration(line: &str) -> Option<ParseAction> {
+    let rest = line.strip_prefix("Constraint Span '")?;
+    let end_quote = rest.find('\'')?;
+    let span_name = rest[..end_quote].to_string();
+    let after = rest[end_quote + 1..].trim();
+    after.strip_prefix("autofills from superset")?;
+    Some(ParseAction::AddAutofillSpan(span_name))
+}
+
 fn try_constraint(line: &str, noun_names: &[String]) -> Option<ParseAction> {
     let starts_ok = line.starts_with("Each ") || line.starts_with("No ");
     starts_ok.then(|| ())?;
@@ -528,6 +552,9 @@ pub fn parse_markdown_with_nouns(input: &str, existing_nouns: &HashMap<String, N
         domain: String::new(), nouns: existing_nouns.clone(), fact_types: HashMap::new(),
         constraints: vec![], state_machines: HashMap::new(), derivation_rules: vec![],
         general_instance_facts: vec![],
+        subtypes: HashMap::new(), enum_values: HashMap::new(),
+        ref_schemes: HashMap::new(), objectifications: HashMap::new(),
+        named_spans: HashMap::new(), autofill_spans: vec![],
     };
     parse_into(&mut ir, input)?;
     Ok(ir)
@@ -538,6 +565,9 @@ pub fn parse_markdown(input: &str) -> Result<ConstraintIR, String> {
         domain: String::new(), nouns: HashMap::new(), fact_types: HashMap::new(),
         constraints: vec![], state_machines: HashMap::new(), derivation_rules: vec![],
         general_instance_facts: vec![],
+        subtypes: HashMap::new(), enum_values: HashMap::new(),
+        ref_schemes: HashMap::new(), objectifications: HashMap::new(),
+        named_spans: HashMap::new(), autofill_spans: vec![],
     };
     parse_into(&mut ir, input)?;
     Ok(ir)
@@ -570,8 +600,8 @@ fn parse_into(ir: &mut ConstraintIR, input: &str) -> Result<(), String> {
                 let next = lines[j].trim();
                 if next.is_empty() { continue; }
                 if next.starts_with("The possible values of") {
-                    if let Some(noun) = ir.nouns.get_mut(name) {
-                        noun.enum_values = parse_enum(next);
+                    if let Some(vals) = parse_enum(next) {
+                        ir.enum_values.insert(name.to_string(), vals);
                     }
                 }
                 break;
@@ -608,6 +638,8 @@ fn parse_into(ir: &mut ConstraintIR, input: &str) -> Result<(), String> {
             || try_set_comparison(line, &noun_names).is_some()
             || try_frequency(line, &noun_names).is_some()
             || try_external_uc(line, &noun_names).is_some()
+            || try_span_naming(line).is_some()
+            || try_autofill_declaration(line).is_some()
             || try_derivation(line).is_some()
             || try_deontic(line).is_some()
             || try_constraint(line, &noun_names).is_some()
@@ -677,6 +709,8 @@ fn parse_into(ir: &mut ConstraintIR, input: &str) -> Result<(), String> {
             .or_else(|| try_set_comparison(line, &noun_names))
             .or_else(|| try_frequency(line, &noun_names))
             .or_else(|| try_external_uc(line, &noun_names))
+            .or_else(|| try_span_naming(line))
+            .or_else(|| try_autofill_declaration(line))
             .or_else(|| try_derivation(line))
             .or_else(|| try_deontic(line))
             .or_else(|| try_constraint(line, &noun_names));
@@ -715,11 +749,9 @@ fn parse_into(ir: &mut ConstraintIR, input: &str) -> Result<(), String> {
     }
 
     // Task 6: Value Constraint (VC) — emit one VC per noun with enum_values.
-    // The compiler (line 2032) reads enum values from the noun's enum_values field;
+    // The compiler reads enum values from ir.enum_values;
     // the ConstraintDef just marks which noun has a value constraint.
-    let vc_nouns: Vec<String> = ir.nouns.iter()
-        .filter_map(|(name, def)| def.enum_values.as_ref().map(|_| name.clone()))
-        .collect();
+    let vc_nouns: Vec<String> = ir.enum_values.keys().cloned().collect();
     for noun_name in vc_nouns {
         ir.constraints.push(ConstraintDef {
             id: String::new(),
@@ -734,6 +766,31 @@ fn parse_into(ir: &mut ConstraintIR, input: &str) -> Result<(), String> {
             min_occurrence: None,
             max_occurrence: None,
         });
+    }
+
+    // Post-processing: resolve autofill spans.
+    // For each autofill span name, find SS constraints whose role nouns
+    // match the named span's role nouns, and set subset_autofill = Some(true).
+    for span_name in &ir.autofill_spans.clone() {
+        let role_nouns = match ir.named_spans.get(span_name) {
+            Some(nouns) => nouns.clone(),
+            None => continue,
+        };
+        let role_set: std::collections::HashSet<&str> = role_nouns.iter().map(|s| s.as_str()).collect();
+        for cdef in &mut ir.constraints {
+            if cdef.kind != "SS" { continue; }
+            // Check if the SS constraint's text references the same role nouns
+            let text_nouns: std::collections::HashSet<&str> = role_set.iter()
+                .filter(|n| cdef.text.contains(**n))
+                .copied()
+                .collect();
+            if text_nouns == role_set {
+                // Set autofill on the first span (subset span)
+                if let Some(span) = cdef.spans.first_mut() {
+                    span.subset_autofill = Some(true);
+                }
+            }
+        }
     }
 
     Ok(())
@@ -821,14 +878,20 @@ fn apply_action(ir: &mut ConstraintIR, action: Option<ParseAction>, lines: &[Str
     let Some(action) = action else { return };
     match action {
         ParseAction::SetDomain(d) => { if ir.domain.is_empty() { ir.domain = d; } }
-        ParseAction::AddNoun(name, def) => {
-            let entry = ir.nouns.entry(name).or_insert_with(|| def.clone());
-            // Merge: subtype/abstract/refscheme/objectifies declarations update existing nouns
-            if def.super_type.is_some() { entry.super_type = def.super_type; }
-            if def.objectifies.is_some() { entry.objectifies = def.objectifies; }
-            if def.ref_scheme.is_some() && entry.ref_scheme.is_none() { entry.ref_scheme = def.ref_scheme; }
-            if def.enum_values.is_some() && entry.enum_values.is_none() { entry.enum_values = def.enum_values; }
+        ParseAction::AddNoun(name, def, meta) => {
+            let entry = ir.nouns.entry(name.clone()).or_insert_with(|| def.clone());
+            // Merge: subtype/abstract declarations update existing nouns
             if def.object_type == "abstract" { entry.object_type = "abstract".into(); }
+            // Populate IR maps from metadata
+            if let Some(st) = meta.super_type {
+                ir.subtypes.insert(name.clone(), st);
+            }
+            if let Some(rs) = meta.ref_scheme {
+                ir.ref_schemes.entry(name.clone()).or_insert(rs);
+            }
+            if let Some(obj) = meta.objectifies {
+                ir.objectifications.insert(name, obj);
+            }
         }
         ParseAction::MarkAbstract(name) => {
             if let Some(noun) = ir.nouns.get_mut(&name) { noun.object_type = "abstract".into(); }
@@ -836,11 +899,11 @@ fn apply_action(ir: &mut ConstraintIR, action: Option<ParseAction>, lines: &[Str
         ParseAction::AddPartition(sup, subs) => {
             if let Some(noun) = ir.nouns.get_mut(&sup) { noun.object_type = "abstract".into(); }
             for sub in subs {
-                ir.nouns.entry(sub).or_insert(NounDef {
-                    object_type: "entity".into(), enum_values: None,
-                    super_type: Some(sup.clone()), world_assumption: WorldAssumption::default(),
-                    ref_scheme: None, objectifies: None,
+                ir.nouns.entry(sub.clone()).or_insert(NounDef {
+                    object_type: "entity".into(),
+                    world_assumption: WorldAssumption::default(),
                 });
+                ir.subtypes.insert(sub, sup.clone());
             }
         }
         ParseAction::AddFactType(id, def) => {
@@ -855,6 +918,12 @@ fn apply_action(ir: &mut ConstraintIR, action: Option<ParseAction>, lines: &[Str
         ParseAction::AddInstanceFact(raw) => {
             let line_refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
             parse_instance_fact(ir, &raw, &line_refs, idx);
+        }
+        ParseAction::AddNamedSpan(name, nouns) => {
+            ir.named_spans.insert(name, nouns);
+        }
+        ParseAction::AddAutofillSpan(name) => {
+            ir.autofill_spans.push(name);
         }
         ParseAction::Skip => {}
     }
@@ -1316,13 +1385,13 @@ mod tests {
     fn value_types_with_enum() {
         let ir = parse_markdown("Priority is a value type.\n  The possible values of Priority are 'low', 'medium', 'high'.").unwrap();
         assert_eq!(ir.nouns["Priority"].object_type, "value");
-        assert_eq!(ir.nouns["Priority"].enum_values.as_ref().unwrap().len(), 3);
+        assert_eq!(ir.enum_values["Priority"].len(), 3);
     }
 
     #[test]
     fn subtypes() {
         let ir = parse_markdown("Request(.id) is an entity type.\nSupport Request is a subtype of Request.").unwrap();
-        assert_eq!(ir.nouns["Support Request"].super_type.as_ref().unwrap(), "Request");
+        assert_eq!(ir.subtypes["Support Request"], "Request");
     }
 
     #[test]
@@ -1335,7 +1404,7 @@ mod tests {
     fn partition_implies_abstract() {
         let ir = parse_markdown("Request(.id) is an entity type.\nRequest is partitioned into Support Request, Feature Request.").unwrap();
         assert_eq!(ir.nouns["Request"].object_type, "abstract");
-        assert_eq!(ir.nouns["Support Request"].super_type.as_ref().unwrap(), "Request");
+        assert_eq!(ir.subtypes["Support Request"], "Request");
     }
 
     #[test]
@@ -1717,5 +1786,39 @@ Auth Session uses Session Strategy.
                     "Constraint span '{}' should not contain spaces", span.fact_type_id);
             }
         }
+    }
+
+    #[test]
+    fn span_naming() {
+        let input = "Customer(.Email) is an entity type.\nSupport Request(.Id) is an entity type.\nCustomer submits Support Request.\nIf some Support Request has some Email Address and some Customer is identified by that Email Address then that Customer submits that Support Request.\nThis span with Customer, Support Request provides the preferred identification scheme for Customer Submission Match.";
+        let ir = parse_markdown(input).unwrap();
+        assert!(ir.named_spans.contains_key("Customer Submission Match"));
+        assert_eq!(ir.named_spans["Customer Submission Match"], vec!["Customer".to_string(), "Support Request".to_string()]);
+    }
+
+    #[test]
+    fn autofill_declaration() {
+        let input = "Customer(.Email) is an entity type.\nSupport Request(.Id) is an entity type.\nEmail Address is a value type.\nCustomer submits Support Request.\nCustomer is identified by Email Address.\nSupport Request has Email Address.\nIf some Support Request has some Email Address and some Customer is identified by that Email Address then that Customer submits that Support Request.\nThis span with Customer, Support Request provides the preferred identification scheme for Customer Submission Match.\nConstraint Span 'Customer Submission Match' autofills from superset.";
+        let ir = parse_markdown(input).unwrap();
+        // The autofill span should be recorded
+        assert!(ir.autofill_spans.contains(&"Customer Submission Match".to_string()));
+        // The SS constraint targeting Customer, Support Request should have autofill enabled
+        let ss = ir.constraints.iter().find(|c| c.kind == "SS").expect("Should have SS constraint");
+        assert_eq!(ss.spans.iter().any(|s| s.subset_autofill == Some(true)), true, "SS constraint should have autofill enabled");
+    }
+
+    #[test]
+    fn subset_autofill_derives_facts() {
+        let input = "\
+Person(.Name) is an entity type.
+Department(.Code) is an entity type.
+Person works in Department.
+Person heads Department.
+If some Person heads some Department then that Person works in that Department.
+This span with Person, Department provides the preferred identification scheme for Department Leadership.
+Constraint Span 'Department Leadership' autofills from superset.";
+        let ir = parse_markdown(input).unwrap();
+        let ss = ir.constraints.iter().find(|c| c.kind == "SS").expect("SS constraint");
+        assert!(ss.spans.iter().any(|s| s.subset_autofill == Some(true)), "autofill should be set");
     }
 }

@@ -80,10 +80,10 @@ pub fn verbalize_constraint(constraint: &ConstraintDef, ir: &ConstraintIR) -> St
 }
 
 /// Verbalize an entity type declaration.
-pub fn verbalize_noun(name: &str, def: &NounDef) -> String {
+pub fn verbalize_noun(name: &str, def: &NounDef, ir: &ConstraintIR) -> String {
     match def.object_type.as_str() {
         "entity" => {
-            if let Some(ref refs) = def.ref_scheme {
+            if let Some(refs) = ir.ref_schemes.get(name) {
                 format!("{}(.{}) is an entity type.", name, refs.join(", "))
             } else {
                 format!("{} is an entity type.", name)
@@ -91,7 +91,7 @@ pub fn verbalize_noun(name: &str, def: &NounDef) -> String {
         }
         "value" => {
             let mut s = format!("{} is a value type.", name);
-            if let Some(ref values) = def.enum_values {
+            if let Some(values) = ir.enum_values.get(name) {
                 let quoted: Vec<String> = values.iter().map(|v| format!("'{}'", v)).collect();
                 s.push_str(&format!("\n  The possible values of {} are {}.", name, quoted.join(", ")));
             }
@@ -102,8 +102,8 @@ pub fn verbalize_noun(name: &str, def: &NounDef) -> String {
 }
 
 /// Verbalize a subtype declaration.
-pub fn verbalize_subtype(name: &str, def: &NounDef) -> Option<String> {
-    def.super_type.as_ref().map(|sup| format!("{} is a subtype of {}.", name, sup))
+pub fn verbalize_subtype(name: &str, ir: &ConstraintIR) -> Option<String> {
+    ir.subtypes.get(name).map(|sup| format!("{} is a subtype of {}.", name, sup))
 }
 
 /// Verbalize a fact type.
@@ -121,26 +121,24 @@ pub fn verbalize_ir(ir: &ConstraintIR) -> String {
         lines.push(String::new());
     }
 
-    // Entity types
+    // Entity types (non-subtypes)
     let entities: Vec<(&String, &NounDef)> = ir.nouns.iter()
-        .filter(|(_, d)| d.object_type == "entity" && d.super_type.is_none())
+        .filter(|(name, d)| d.object_type == "entity" && !ir.subtypes.contains_key(*name))
         .collect();
     if !entities.is_empty() {
         lines.push("## Entity Types".to_string());
         lines.push(String::new());
         for (name, def) in &entities {
-            lines.push(verbalize_noun(name, def));
+            lines.push(verbalize_noun(name, def, ir));
         }
         lines.push(String::new());
     }
 
     // Subtypes
-    let subtypes: Vec<(&String, &NounDef)> = ir.nouns.iter()
-        .filter(|(_, d)| d.super_type.is_some())
-        .collect();
-    if !subtypes.is_empty() {
-        for (name, def) in &subtypes {
-            if let Some(s) = verbalize_subtype(name, def) {
+    let subtype_names: Vec<&String> = ir.subtypes.keys().collect();
+    if !subtype_names.is_empty() {
+        for name in &subtype_names {
+            if let Some(s) = verbalize_subtype(name, ir) {
                 lines.push(s);
             }
         }
@@ -155,7 +153,7 @@ pub fn verbalize_ir(ir: &ConstraintIR) -> String {
         lines.push("## Value Types".to_string());
         lines.push(String::new());
         for (name, def) in &values {
-            lines.push(verbalize_noun(name, def));
+            lines.push(verbalize_noun(name, def, ir));
         }
         lines.push(String::new());
     }
@@ -257,23 +255,22 @@ mod tests {
     fn verbalize_noun_entity() {
         let def = NounDef {
             object_type: "entity".to_string(),
-            enum_values: None, super_type: None,
             world_assumption: WorldAssumption::default(),
-            ref_scheme: Some(vec!["Email".to_string()]), objectifies: None,
         };
-        assert_eq!(verbalize_noun("Customer", &def), "Customer(.Email) is an entity type.");
+        let mut ir = ConstraintIR::default();
+        ir.ref_schemes.insert("Customer".to_string(), vec!["Email".to_string()]);
+        assert_eq!(verbalize_noun("Customer", &def, &ir), "Customer(.Email) is an entity type.");
     }
 
     #[test]
     fn verbalize_noun_value_with_enum() {
         let def = NounDef {
             object_type: "value".to_string(),
-            enum_values: Some(vec!["M".to_string(), "F".to_string()]),
-            super_type: None,
             world_assumption: WorldAssumption::default(),
-            ref_scheme: None, objectifies: None,
         };
-        let v = verbalize_noun("Gender", &def);
+        let mut ir = ConstraintIR::default();
+        ir.enum_values.insert("Gender".to_string(), vec!["M".to_string(), "F".to_string()]);
+        let v = verbalize_noun("Gender", &def, &ir);
         assert!(v.contains("Gender is a value type."), "got: {}", v);
         assert!(v.contains("'M', 'F'"), "got: {}", v);
     }

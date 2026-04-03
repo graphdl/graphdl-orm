@@ -320,14 +320,10 @@ fn collect_enum_values(ir: &ConstraintIR, spans: &[SpanDef]) -> Vec<(String, Vec
         if let Some(ft) = ir.fact_types.get(&span.fact_type_id) {
             for role in &ft.roles {
                 if seen.contains(&role.noun_name) { continue; }
-                if let Some(noun_def) = ir.nouns.get(&role.noun_name) {
-                    if noun_def.object_type == "value" {
-                        if let Some(vals) = &noun_def.enum_values {
-                            if !vals.is_empty() {
-                                seen.insert(role.noun_name.clone());
-                                result.push((role.noun_name.clone(), vals.clone()));
-                            }
-                        }
+                if let Some(vals) = ir.enum_values.get(&role.noun_name) {
+                    if !vals.is_empty() {
+                        seen.insert(role.noun_name.clone());
+                        result.push((role.noun_name.clone(), vals.clone()));
                     }
                 }
             }
@@ -407,19 +403,13 @@ fn build_noun_index(
         .map(|(name, def)| (name.clone(), def.world_assumption.clone()))
         .collect();
 
-    // noun_name -> supertype
-    let mut supertypes: HashMap<String, String> = HashMap::new();
+    // noun_name -> supertype (from IR maps)
+    let supertypes: HashMap<String, String> = ir.subtypes.clone();
     let mut subtypes: HashMap<String, Vec<String>> = HashMap::new();
-    let mut ref_schemes: HashMap<String, Vec<String>> = HashMap::new();
-    for (name, def) in &ir.nouns {
-        if let Some(ref st) = def.super_type {
-            supertypes.insert(name.clone(), st.clone());
-            subtypes.entry(st.clone()).or_default().push(name.clone());
-        }
-        if let Some(ref rs) = def.ref_scheme {
-            ref_schemes.insert(name.clone(), rs.clone());
-        }
+    for (child, parent) in &ir.subtypes {
+        subtypes.entry(parent.clone()).or_default().push(child.clone());
     }
+    let ref_schemes: HashMap<String, Vec<String>> = ir.ref_schemes.clone();
 
     // fact_type_id -> list of constraint IDs spanning it
     let mut fact_type_to_constraints: HashMap<String, Vec<String>> = HashMap::new();
@@ -882,8 +872,8 @@ fn check_match_predicates(combo: &[Vec<(String, String)>], match_pairs: &[(Strin
 fn compile_subtype_inheritance(ir: &ConstraintIR) -> Vec<CompiledDerivation> {
     let mut derivations = Vec::new();
 
-    for (sub_name, noun_def) in &ir.nouns {
-        if let Some(ref super_name) = noun_def.super_type {
+    for (sub_name, super_name) in &ir.subtypes {
+        {
             // Find all fact types where the supertype plays a role
             let super_fact_types: Vec<(String, String, usize)> = ir.fact_types.iter()
                 .flat_map(|(ft_id, ft)| {
@@ -2036,16 +2026,14 @@ fn compile_value_constraint_ast(ir: &ConstraintIR, def: &ConstraintDef) -> Func 
     // Collect allowed values from the nouns in the spanned fact types
     let spans = resolve_spans(ir, &def.spans);
     let allowed: Vec<(String, HashSet<String>)> = spans.iter().filter_map(|span| {
-        let noun_def = ir.nouns.get(&span.noun_name)?;
-        let vals = noun_def.enum_values.as_ref()?;
+        let vals = ir.enum_values.get(&span.noun_name)?;
         if vals.is_empty() { return None; }
         Some((span.noun_name.clone(), vals.iter().cloned().collect::<HashSet<_>>()))
     }).collect();
 
     // If no enum values found on spanned nouns, check all nouns with enum_values
     let all_enum_nouns: Vec<(String, HashSet<String>)> = if allowed.is_empty() {
-        ir.nouns.iter().filter_map(|(name, noun)| {
-            let vals = noun.enum_values.as_ref()?;
+        ir.enum_values.iter().filter_map(|(name, vals)| {
             if vals.is_empty() { return None; }
             Some((name.clone(), vals.iter().cloned().collect::<HashSet<_>>()))
         }).collect()
@@ -2694,6 +2682,9 @@ mod schema_tests {
             constraints: vec![],
             state_machines: HashMap::new(),
             derivation_rules: vec![], general_instance_facts: vec![],
+            subtypes: HashMap::new(), enum_values: HashMap::new(),
+            ref_schemes: HashMap::new(), objectifications: HashMap::new(),
+            named_spans: HashMap::new(), autofill_spans: vec![],
         }
     }
 
@@ -2827,6 +2818,9 @@ mod schema_tests {
             }],
             state_machines: HashMap::new(),
             derivation_rules: vec![], general_instance_facts: vec![],
+            subtypes: HashMap::new(), enum_values: HashMap::new(),
+            ref_schemes: HashMap::new(), objectifications: HashMap::new(),
+            named_spans: HashMap::new(), autofill_spans: vec![],
         };
 
         let model = compile(&ir);
@@ -2894,6 +2888,9 @@ mod schema_tests {
             }],
             state_machines: HashMap::new(),
             derivation_rules: vec![], general_instance_facts: vec![],
+            subtypes: HashMap::new(), enum_values: HashMap::new(),
+            ref_schemes: HashMap::new(), objectifications: HashMap::new(),
+            named_spans: HashMap::new(), autofill_spans: vec![],
         };
 
         let model = compile(&ir);
@@ -2970,10 +2967,7 @@ mod schema_tests {
         for name in &["User", "OrgMembership", "Organization", "Domain"] {
             nouns.insert(name.to_string(), NounDef {
                 object_type: "entity".to_string(),
-                enum_values: None,
-                super_type: None,
                 world_assumption: WorldAssumption::Closed,
-                ref_scheme: None, objectifies: None,
             });
         }
 
@@ -2984,6 +2978,9 @@ mod schema_tests {
             constraints: vec![],
             state_machines: HashMap::new(),
             derivation_rules: vec![], general_instance_facts: vec![],
+            subtypes: HashMap::new(), enum_values: HashMap::new(),
+            ref_schemes: HashMap::new(), objectifications: HashMap::new(),
+            named_spans: HashMap::new(), autofill_spans: vec![],
         };
 
         // Chain: User → (ft1) → OrgMembership → (ft2) → Organization
@@ -3049,6 +3046,9 @@ mod schema_tests {
             constraints: vec![],
             state_machines: HashMap::new(),
             derivation_rules: vec![], general_instance_facts: vec![],
+            subtypes: HashMap::new(), enum_values: HashMap::new(),
+            ref_schemes: HashMap::new(), objectifications: HashMap::new(),
+            named_spans: HashMap::new(), autofill_spans: vec![],
         };
 
         let model = compile(&ir);

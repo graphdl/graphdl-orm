@@ -126,7 +126,8 @@ async function handleSeedPost(request: Request, env: Env): Promise<Response> {
           .map(r => r.value)
       }),
     )
-    // Merge all noun definitions from all domains into NounDef-shaped objects
+    // Merge all noun definitions from all domains into NounDef-shaped objects.
+    // NounDef only has objectType and worldAssumption.
     nounSets
       .filter((r): r is PromiseFulfilledResult<any[]> => r.status === 'fulfilled')
       .flatMap(r => r.value)
@@ -135,14 +136,7 @@ async function handleSeedPost(request: Request, env: Env): Promise<Response> {
         if (!name) return
         mergedNouns[name] = {
           objectType: n.objectType || 'entity',
-          enumValues: n.enumValues || null,
-          valueType: null,
-          superType: n.superType || null,
           worldAssumption: 'closed',
-          refScheme: n.referenceScheme || null,
-          objectifies: n.objectifies || null,
-          subtypeKind: null,
-          rigid: false,
         }
       })
     existingNounsJson = JSON.stringify(mergedNouns)

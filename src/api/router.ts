@@ -1020,7 +1020,7 @@ async function handleArestRoute(request: Request, env: Env) {
       constraintCount: (ir.constraints || []).length,
       nounKeys: Object.keys(ir.nouns || {}),
       nounDetails: Object.fromEntries(
-        Object.entries(ir.nouns || {}).map(([k, v]: [string, any]) => [k, { objectType: v.objectType, superType: v.superType }])
+        Object.entries(ir.nouns || {}).map(([k, v]: [string, any]) => [k, { objectType: v.objectType, superType: (ir.subtypes || {})[k] || null }])
       ),
       instanceFacts: (ir.generalInstanceFacts || []).length,
     })

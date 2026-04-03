@@ -91,17 +91,23 @@ export async function reconstructIR(
   ])
 
   // Reconstruct nouns: HashMap<String, NounDef>
+  // NounDef only has objectType and worldAssumption.
+  // subtypes, enumValues, refSchemes, objectifications are IR-level maps.
   const irNouns: Record<string, any> = {}
+  const irSubtypes: Record<string, string> = {}
+  const irEnumValues: Record<string, string[]> = {}
+  const irRefSchemes: Record<string, string[]> = {}
+  const irObjectifications: Record<string, string> = {}
   for (const n of nouns) {
-    const def: any = {
+    const name = n.name || n.id
+    irNouns[name] = {
       objectType: n.objectType || 'entity',
-      enumValues: n.enumValues || null,
-      superType: n.superType || null,
       worldAssumption: 'closed',
-      refScheme: n.referenceScheme || null,
-      objectifies: n.objectifies || null,
     }
-    irNouns[n.name || n.id] = def
+    if (n.superType) irSubtypes[name] = n.superType
+    if (n.enumValues) irEnumValues[name] = n.enumValues
+    if (n.referenceScheme) irRefSchemes[name] = n.referenceScheme
+    if (n.objectifies) irObjectifications[name] = n.objectifies
   }
 
   // Reconstruct fact types: HashMap<String, FactTypeDef>
@@ -196,6 +202,10 @@ export async function reconstructIR(
     stateMachines: irStateMachines,
     derivationRules: irDerivationRules,
     generalInstanceFacts: irInstanceFacts,
+    subtypes: irSubtypes,
+    enumValues: irEnumValues,
+    refSchemes: irRefSchemes,
+    objectifications: irObjectifications,
   }
 
   return JSON.stringify(ir)
@@ -780,11 +790,10 @@ export function getTopLevelNouns(irJson: string): { topLevel: Set<string>; depen
     }
   }
 
-  // Trace subtype chains
-  for (const [name, def] of Object.entries(ir.nouns || {})) {
-    const superType = (def as any).superType || (def as any).super_type
-    if (superType && dependsOn.has(superType) && !dependsOn.has(name)) {
-      dependsOn.set(name, dependsOn.get(superType)!)
+  // Trace subtype chains (subtypes are an IR-level map, not on NounDef)
+  for (const [name, superType] of Object.entries((ir as any).subtypes || {})) {
+    if (superType && dependsOn.has(superType as string) && !dependsOn.has(name)) {
+      dependsOn.set(name, dependsOn.get(superType as string)!)
     }
   }
 
