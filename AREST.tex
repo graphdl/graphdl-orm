@@ -291,6 +291,8 @@ The router distributes events via $\alpha\,\mathit{RMAP}$~(apply-to-all), and ea
 
 A browser runtime is a node in the same model. Cells replicated locally fold events with zero latency. The event stream syncs to the server asynchronously. Because the fold is pure and deterministic~(\ref{eq:sm}), two nodes folding the same events reach the same state. Constraints that depend only on the local cell (cardinality, value) evaluate immediately. Constraints that span cells (subset, external uniqueness) evaluate against committed state~(\ref{eq:pop}) after sync. Local cells are untrusted: the server fold is authoritative, and alethic violations on the server reject the event regardless of the local evaluation. Local constraint evaluation is optimistic feedback, not a security boundary.
 
+For two peers sharing a cell, the propose-accept protocol applies: one peer proposes an event, the other runs $\mathit{validate}$~(\ref{eq:create}) against $P \cup \mathit{resolve}(S, e)$. The event is accepted iff $V$ contains no alethic violation. The constraint set $C_S$ is the consensus predicate (Corollary~\ref{cor:consensus}). For $n > 2$ peers, a shared event log with total ordering is required. Each event references the hash of its predecessor, forming a chain that guarantees integrity and deterministic replay. Peers compare chain tips and adopt the longest chain on fork. The fold~(\ref{eq:cellfold}) over the shared log produces the same state on every peer.
+
 \section{Properties}
 
 The six theorems form a chain. Each depends on the previous one and eliminates one source of failure in the path from domain knowledge to running software.
@@ -413,6 +415,13 @@ Let $D' = D$ after applying $\mathit{SYSTEM}$ with operation $\mathit{compile} \
 Each new reading $r' \in R'$ parses unambiguously (Theorem~\ref{thm:grammar} depends on the grammar, not on $D$). The compiled objects are faithful to the readings (Theorem~\ref{thm:spec} depends on the injectivity of $\mathit{parse}$ and $\mathit{compile}$, which are stateless). The new constraints and derivation rules enter $\mathit{DEFS}$ via $\downarrow\!\mathit{DEFS}$, joining the existing definitions. Theorem~\ref{thm:complete} evaluates all $c \in C_S$, including the new ones. Theorems~\ref{thm:hateoas} and~\ref{thm:derive} operate over $P$ and $S$, both of which now include the new facts and schemas. No theorem's proof depends on $D$ being fixed at initialization.
 \end{proof}
 
+\begin{corollary}[Constraint Consensus]\label{cor:consensus}
+For two peers $A$ and $B$ sharing population $P$, if $A$ proposes event $e$ and $B$ applies $\mathit{validate}$~(\ref{eq:create}) to $P \cup \mathit{resolve}(S, e)$, the event is accepted iff $V$ contains no alethic violation. The constraint set $C_S$ is the consensus predicate. No external consensus protocol is required.
+\end{corollary}
+
+\noindent For $n = 2$, the constraints are sufficient for consensus. For $n > 2$, a total ordering over the shared event log is additionally required so that all peers fold~(\ref{eq:cellfold}) in the same order.
+
+\medskip
 \noindent Common operational concerns map directly to the formalism: versioning is the event stream ($E$), migration is ingestion of new readings (Corollary~\ref{cor:closure}), backward compatibility is preserved by construction (no theorem depends on $D$ at initialization), and auditability is the derivation trace (Sec.\,7.2).
 
 The algebraic laws of FP~\cite[Sec.\,12.2]{backus78} are equations between functional forms. Since FFP objects represent the same forms via $\rho$~\cite[Sec.\,13.3.2]{backus78}, an FFP object can be transformed to an equivalent object by applying these laws. Ahead-of-time compilation from objects to optimized evaluation trees is one such transformation.
