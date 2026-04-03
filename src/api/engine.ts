@@ -10,8 +10,8 @@
  * All logic lives in the Rust AST. This file is plumbing.
  */
 
-import { initSync, compile_domain, release_domain, evaluate_response, forward_chain_population, run_machine_wasm, query_schema_wasm, get_transitions_wasm, resolve_fact_event, prepare_entity, apply_command_wasm, debug_compiled_state, load_validation_model, validate_schema_wasm, project_entity_wasm, get_noun_schemas_wasm, parse_readings_wasm, parse_readings_with_nouns_wasm, rmap_wasm } from '../../crates/fol-engine/pkg/fol_engine.js'
-import wasmModule from '../../crates/fol-engine/pkg/fol_engine_bg.wasm'
+import { initSync, compile_domain, release_domain, evaluate_response, forward_chain_population, run_machine_wasm, query_schema_wasm, get_transitions_wasm, resolve_fact_event, prepare_entity, apply_command_wasm, debug_compiled_state, load_validation_model, validate_schema_wasm, project_entity_wasm, get_noun_schemas_wasm, parse_readings_wasm, parse_readings_with_nouns_wasm, rmap_wasm } from '../../crates/arest/pkg/arest.js'
+import wasmModule from '../../crates/arest/pkg/arest_bg.wasm'
 
 let wasmInitialized = false
 

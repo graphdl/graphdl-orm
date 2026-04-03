@@ -1,4 +1,4 @@
-// crates/fol-engine/src/query.rs
+// crates/arest/src/query.rs
 //
 // Population query via partial application of graph schemas.
 //

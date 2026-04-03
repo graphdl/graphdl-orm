@@ -1,4 +1,4 @@
-// crates/fol-engine/src/arest.rs
+// crates/arest/src/arest.rs
 //
 // AREST — Applicative REpresentational State Transfer
 //

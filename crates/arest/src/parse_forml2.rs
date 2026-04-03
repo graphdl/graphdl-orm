@@ -1,4 +1,4 @@
-// crates/fol-engine/src/parse_forml2.rs
+// crates/arest/src/parse_forml2.rs
 //
 // FORML 2 Parser — FFP composition of recognizer functions.
 //

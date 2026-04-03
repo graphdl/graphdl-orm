@@ -26,7 +26,7 @@ Two Durable Objects, matching the paper exactly:
 |-----------|-------|----------------|
 | **D** (state) | Sequence of cells `⟨CELL, n, c⟩` | EntityDB — one DO per entity. `↑n` = get(), `↓n` = put(). |
 | **P** (population) | `↑FILE:D` — named set of relations | RegistryDB — population index. Maps (type, id) to cells. |
-| **ρ** (representation function) | Maps FFP objects to executables | Rust/WASM engine (fol-engine). Compiles readings, evaluates constraints, forward-chains derivations. |
+| **ρ** (representation function) | Maps FFP objects to executables | Rust/WASM engine (arest). Compiles readings, evaluates constraints, forward-chains derivations. |
 | **sub** (subsystem dispatch) | Routes inputs to state transitions | itty-router. Dispatches create/update/query/transition/load commands. |
 
 13 TypeScript source files. The complexity lives in ρ (WASM), not in the host.
@@ -146,8 +146,8 @@ npm test             # vitest (67 tests)
 npx tsc --noEmit     # type check
 
 # Rust/WASM engine
-cd crates/fol-engine
-cargo test           # 210 tests
+cd crates/arest
+cargo test           # 236+ tests
 wasm-pack build --target web --out-dir pkg
 
 # Deploy

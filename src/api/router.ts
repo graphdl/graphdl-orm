@@ -120,7 +120,7 @@ router.get('/api/debug/compiled/:domain', async (request, env: Env) => {
   const { domain } = request.params
   const registry = getRegistryDO(env, 'global') as any
   const handle = await loadDomainSchema(registry, (id: string) => getEntityDO(env, id) as any, domain)
-  const { debug_compiled_state: debugState } = await import('../../crates/fol-engine/pkg/fol_engine.js')
+  const { debug_compiled_state: debugState } = await import('../../crates/arest/pkg/arest.js')
   return json(JSON.parse(debugState(handle)))
 })
 
@@ -128,7 +128,7 @@ router.get('/api/debug/schema/:domain', async (request, env: Env) => {
   const domain = decodeURIComponent(request.params.domain)
   const registry = getRegistryDO(env, 'global') as any
   const handle = await loadDomainSchema(registry, (id: string) => getEntityDO(env, id) as any, domain)
-  const { debug_compiled_state } = await import('../../crates/fol-engine/pkg/fol_engine.js')
+  const { debug_compiled_state } = await import('../../crates/arest/pkg/arest.js')
   const schema = JSON.parse(debug_compiled_state(handle))
   return json({
     domain,
@@ -181,7 +181,7 @@ router.post('/api/induce', async (request) => {
   if (!body.ir || !body.population) {
     return error(400, { errors: [{ message: 'ir and population are required' }] })
   }
-  const { induce_from_population, compile_domain, release_domain } = await import('../../crates/fol-engine/pkg/fol_engine.js')
+  const { induce_from_population, compile_domain, release_domain } = await import('../../crates/arest/pkg/arest.js')
   const handle = compile_domain(JSON.stringify(body.ir))
   const result = induce_from_population(handle, JSON.stringify(body.population))
   release_domain(handle)
@@ -761,7 +761,7 @@ router.all('/api/query', async (request, env: Env) => {
   const populationJson = await loadDomainAndPopulation(registry, getStub, domain)
 
   // Use WASM prove_goal for the query
-  const { prove_goal } = await import('../../crates/fol-engine/pkg/fol_engine.js')
+  const { prove_goal } = await import('../../crates/arest/pkg/arest.js')
   const result = prove_goal(handle, query, JSON.parse(populationJson), 'closed')
 
   return json(result)

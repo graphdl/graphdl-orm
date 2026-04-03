@@ -60,7 +60,7 @@ export async function handleSynthesize(request: Request, env: Env): Promise<Resp
     return error(400, { errors: [{ message: `Failed to load schema for domain: ${body.domainId}` }] })
   }
 
-  const { synthesize_noun } = await import('../../crates/fol-engine/pkg/fol_engine.js')
+  const { synthesize_noun } = await import('../../crates/arest/pkg/arest.js')
   const result = synthesize_noun(handle, body.noun, body.depth || 1)
   return json(result)
 }
