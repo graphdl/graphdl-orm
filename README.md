@@ -13,7 +13,7 @@ readings (FORML 2)
     │
     ├─► parse_readings_wasm (Rust/WASM)  ──► entities (cells in D)
     │
-    ├─► load_ir (compile schema from cells)
+    ├─► compile_domain (handle-based, from DEFS cell)
     │
     ├─► apply_command (create = emit ∘ validate ∘ derive ∘ resolve)
     │
@@ -29,7 +29,7 @@ Two Durable Objects, matching the paper exactly:
 | **ρ** (representation function) | Maps FFP objects to executables | Rust/WASM engine (arest). Compiles readings, evaluates constraints, forward-chains derivations. |
 | **sub** (subsystem dispatch) | Routes inputs to state transitions | itty-router. Dispatches create/update/query/transition/load commands. |
 
-13 TypeScript source files. The complexity lives in ρ (WASM), not in the host.
+The complexity lives in ρ (WASM), not in the host.
 
 ## Domains and Apps
 
@@ -98,32 +98,20 @@ Order and indentation do not matter. Each sentence has exactly one parse.
 
 ## API
 
+AREST routes (HATEOAS, constraint-derived navigation):
 ```
-# Entity CRUD (cells in D)
-POST   /api/entities/:type              — create (emit ∘ validate ∘ derive ∘ resolve)
-GET    /api/entities/:type              — list (requires ?domain=)
-GET    /api/entities/:type/:id          — get (includes _view metadata + HATEOAS links)
-PATCH  /api/entities/:type/:id          — update (↓n with merged data)
-DELETE /api/entities/:type/:id          — delete (hard delete from population)
+GET    /arest/:domain                       — domain root with navigable nouns
+GET    /arest/:domain/:noun                 — list entities (cells in D)
+GET    /arest/:domain/:noun/:id             — entity detail with HATEOAS links
+POST   /arest/:domain/:noun                 — create (emit ∘ validate ∘ derive ∘ resolve)
+POST   /arest/:domain/:noun/:id/transition  — fire state machine transition
+```
 
-# State Machine Transitions
-GET    /api/entities/:type/:id/transitions  — available transitions (Theorem 3: links from P)
-POST   /api/entities/:type/:id/transition   — fire transition (state machine fold)
-
-# Query (θ₁ operations on P)
-GET    /api/query?q=...&domain=...      — prove goal via backward chaining
-
-# Seed (parse readings via ρ → cells in D)
-POST   /api/seed                        — parse FORML 2 markdown via WASM → materialize cells
-GET    /api/seed                        — population stats
-DELETE /api/seed                        — wipe population
-
-# Access (derived from readings)
-GET    /api/access                      — user's orgs, apps, domains (derivation rules)
-
-# Evaluation (ρ applied to P)
-POST   /api/evaluate                    — constraint evaluation via WASM
-POST   /api/synthesize                  — noun knowledge synthesis
+Seed and evaluation:
+```
+POST   /seed                                — parse FORML 2 markdown via WASM
+GET    /seed                                — population stats
+POST   /arest/:domain/evaluate              — constraint evaluation
 ```
 
 Self-describing representations include `_view` (view metadata derived from readings) and `_nav` (navigation context from access derivation rules):
@@ -142,12 +130,12 @@ Self-describing representations include `_view` (view metadata derived from read
 ```bash
 npm install
 npm run dev          # wrangler dev
-npm test             # vitest (67 tests)
+npm test             # vitest (161 tests)
 npx tsc --noEmit     # type check
 
 # Rust/WASM engine
 cd crates/arest
-cargo test           # 236+ tests
+cargo test           # 242 tests
 wasm-pack build --target web --out-dir pkg
 
 # Deploy
@@ -159,13 +147,13 @@ curl -X POST https://api.auto.dev/api/seed -F "core=@readings/core.md" -F "suppo
 
 ## Theorems
 
-The [whitepaper](AREST.tex) proves five properties:
+The [whitepaper](AREST.pdf) proves six properties:
 
 1. **Grammar Unambiguity** — each FORML 2 sentence has exactly one parse
 2. **Specification Equivalence** — `parse⁻¹ ∘ compile⁻¹ ∘ compile ∘ parse = id`
-3. **Completeness of State Transfer** — create produces entity + state machine + derived facts + violations + HATEOAS links
-4. **HATEOAS as Projection** — links are θ₁ projections of transition facts in P
-5. **Derivability** — every domain value is `(ρf):P` for some `f ∈ O`
+3. **Completeness of State Transfer** — create reaches the least fixed point with all derived facts and violations
+4. **HATEOAS as Projection** — transition links and entity hierarchy are θ₁ projections of P
+5. **Derivability** — every value in the representation is `(ρf):P` for some `f ∈ O`
 
 ## License
 
