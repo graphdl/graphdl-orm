@@ -98,10 +98,30 @@ describe('Federation end-to-end', () => {
     expect(orgReadings).toContain("Noun 'API Product' is backed by External System 'auto.dev'")
   })
 
-  it('DEFS registers both auth.vin and auto.dev external systems', () => {
+  it('organizations.md declares Stripe nouns backed by stripe', () => {
+    const orgReadings = readFileSync(
+      resolve(__dirname, '../../readings/organizations.md'), 'utf-8'
+    )
+    expect(orgReadings).toContain("Noun 'Stripe Customer' is backed by External System 'stripe'")
+    expect(orgReadings).toContain("Noun 'Stripe Customer' has URI '/customers'")
+    expect(orgReadings).toContain("Noun 'Stripe Subscription' is backed by External System 'stripe'")
+  })
+
+  it('core.md declares stripe External System', () => {
+    const coreReadings = readFileSync(
+      resolve(__dirname, '../../readings/core.md'), 'utf-8'
+    )
+    expect(coreReadings).toContain("External System 'stripe' has URL 'https://api.stripe.com/v1'")
+    expect(coreReadings).toContain("External System 'stripe' has Header 'Authorization'")
+    expect(coreReadings).toContain("External System 'stripe' has Prefix 'Bearer'")
+  })
+
+  it('DEFS registers auth.vin, auto.dev, and stripe external systems', () => {
     const instanceFacts = [
       { subjectNoun: 'Noun', subjectValue: 'User', objectNoun: 'External System', objectValue: 'auth.vin' },
       { subjectNoun: 'Noun', subjectValue: 'API Product', objectNoun: 'External System', objectValue: 'auto.dev' },
+      { subjectNoun: 'Noun', subjectValue: 'Stripe Customer', objectNoun: 'External System', objectValue: 'stripe' },
+      { subjectNoun: 'Noun', subjectValue: 'Stripe Subscription', objectNoun: 'External System', objectValue: 'stripe' },
     ]
 
     const defsData: Record<string, string> = {
@@ -122,6 +142,8 @@ describe('Federation end-to-end', () => {
 
     expect(resolve('User', 'readDetail')).toBe('external')
     expect(resolve('API Product', 'readDetail')).toBe('external')
+    expect(resolve('Stripe Customer', 'readDetail')).toBe('external')
+    expect(resolve('Stripe Subscription', 'readDetail')).toBe('external')
     expect(resolve('Organization', 'readDetail')).toBe('local')
     expect(resolve('Order', 'readDetail')).toBe('local')
   })
