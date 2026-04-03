@@ -94,3 +94,5 @@ Domain 'organizations' has Visibility 'public'.
 
 Noun 'User' is backed by External System 'auth.vin'.
 Noun 'User' has URI '/users'.
+
+Noun 'API Product' is backed by External System 'auto.dev'.

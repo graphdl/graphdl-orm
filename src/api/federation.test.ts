@@ -90,4 +90,39 @@ describe('Federation end-to-end', () => {
     expect(orgReadings).toContain("Noun 'User' is backed by External System 'auth.vin'")
     expect(orgReadings).toContain("Noun 'User' has URI '/users'")
   })
+
+  it('organizations.md declares API Product backed by auto.dev', () => {
+    const orgReadings = readFileSync(
+      resolve(__dirname, '../../readings/organizations.md'), 'utf-8'
+    )
+    expect(orgReadings).toContain("Noun 'API Product' is backed by External System 'auto.dev'")
+  })
+
+  it('DEFS registers both auth.vin and auto.dev external systems', () => {
+    const instanceFacts = [
+      { subjectNoun: 'Noun', subjectValue: 'User', objectNoun: 'External System', objectValue: 'auth.vin' },
+      { subjectNoun: 'Noun', subjectValue: 'API Product', objectNoun: 'External System', objectValue: 'auto.dev' },
+    ]
+
+    const defsData: Record<string, string> = {
+      '*:read': 'local',
+      '*:readDetail': 'local',
+      '*:create': 'local',
+    }
+
+    for (const fact of instanceFacts) {
+      if (fact.subjectNoun === 'Noun' && fact.objectNoun === 'External System') {
+        defsData[`${fact.subjectValue}:read`] = 'external'
+        defsData[`${fact.subjectValue}:readDetail`] = 'external'
+      }
+    }
+
+    const resolve = (noun: string, op: string) =>
+      defsData[`${noun}:${op}`] || defsData[`*:${op}`] || 'local'
+
+    expect(resolve('User', 'readDetail')).toBe('external')
+    expect(resolve('API Product', 'readDetail')).toBe('external')
+    expect(resolve('Organization', 'readDetail')).toBe('local')
+    expect(resolve('Order', 'readDetail')).toBe('local')
+  })
 })
