@@ -268,7 +268,6 @@ mod tests {
         NounDef {
             object_type: object_type.to_string(),
             enum_values: None,
-            value_type: None,
             super_type: None,
             world_assumption: WorldAssumption::default(),
         }
@@ -287,14 +286,12 @@ mod tests {
         ir.nouns.insert("ProhibitedText".to_string(), NounDef {
             object_type: "value".to_string(),
             enum_values: Some(vec!["—".to_string(), "–".to_string()]),
-            value_type: Some("string".to_string()),
             super_type: None,
             world_assumption: WorldAssumption::default(),
         });
         ir.nouns.insert("SupportResponse".to_string(), NounDef {
             object_type: "entity".to_string(),
             enum_values: None,
-            value_type: None,
             super_type: None,
             world_assumption: WorldAssumption::default(),
         });
@@ -335,14 +332,12 @@ mod tests {
         ir.nouns.insert("ProhibitedText".to_string(), NounDef {
             object_type: "value".to_string(),
             enum_values: Some(vec!["—".to_string()]),
-            value_type: Some("string".to_string()),
             super_type: None,
             world_assumption: WorldAssumption::default(),
         });
         ir.nouns.insert("SupportResponse".to_string(), NounDef {
             object_type: "entity".to_string(),
             enum_values: None,
-            value_type: None,
             super_type: None,
             world_assumption: WorldAssumption::default(),
         });
@@ -598,7 +593,6 @@ mod tests {
         ir.nouns.insert("Customer".to_string(), NounDef {
             object_type: "entity".to_string(),
             enum_values: None,
-            value_type: None,
             super_type: None,
             world_assumption: WorldAssumption::default(),
         });
@@ -690,14 +684,12 @@ mod tests {
         ir.nouns.insert("SenderIdentityValue".to_string(), NounDef {
             object_type: "value".to_string(),
             enum_values: Some(vec!["Support Team <support@example.com>".to_string()]),
-            value_type: Some("string".to_string()),
             super_type: None,
             world_assumption: WorldAssumption::default(),
         });
         ir.nouns.insert("SupportResponse".to_string(), NounDef {
             object_type: "entity".to_string(),
             enum_values: None,
-            value_type: None,
             super_type: None,
             world_assumption: WorldAssumption::default(),
         });
@@ -766,18 +758,17 @@ mod tests {
         ir.nouns.insert("FieldName".to_string(), NounDef {
             object_type: "value".to_string(),
             enum_values: Some(vec!["EndpointSlug".to_string(), "Title".to_string()]),
-            value_type: Some("string".to_string()),
             super_type: None,
             world_assumption: WorldAssumption::default(),
         });
         ir.nouns.insert("SupportResponse".to_string(), NounDef {
             object_type: "entity".to_string(),
-            enum_values: None, value_type: None, super_type: None,
+            enum_values: None, super_type: None,
             world_assumption: WorldAssumption::default(),
         });
         ir.nouns.insert("APIProduct".to_string(), NounDef {
             object_type: "entity".to_string(),
-            enum_values: None, value_type: None, super_type: None,
+            enum_values: None, super_type: None,
             world_assumption: WorldAssumption::default(),
         });
         // Three fact types that all reference FieldName — simulates multi-span constraint
@@ -873,7 +864,6 @@ mod tests {
         ir.nouns.insert("Car".to_string(), NounDef {
             object_type: "entity".to_string(),
             enum_values: None,
-            value_type: None,
             super_type: Some("Vehicle".to_string()),
             world_assumption: WorldAssumption::default(),
         });
@@ -990,7 +980,6 @@ mod tests {
         ir.nouns.insert("Permission".to_string(), NounDef {
             object_type: "entity".to_string(),
             enum_values: None,
-            value_type: None,
             super_type: None,
             world_assumption: WorldAssumption::Closed,
         });
@@ -998,7 +987,6 @@ mod tests {
         ir.nouns.insert("Capability".to_string(), NounDef {
             object_type: "entity".to_string(),
             enum_values: None,
-            value_type: None,
             super_type: None,
             world_assumption: WorldAssumption::Open,
         });
@@ -1069,7 +1057,6 @@ mod tests {
         ir.nouns.insert("Customer".to_string(), NounDef {
             object_type: "entity".to_string(),
             enum_values: None,
-            value_type: None,
             super_type: None,
             world_assumption: WorldAssumption::Closed,
         });

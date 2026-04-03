@@ -169,41 +169,10 @@ pub fn check_nary_uc_arity(ir: &ConstraintIR) -> Vec<Violation> {
 }
 
 /// Check that derived subtypes have derivation rules.
-/// A subtype marked as "derived" must have at least one derivation rule
-/// that determines membership. (Halpin, "Subtyping Revisited", 2006)
-pub fn check_subtype_derivation_rules(ir: &ConstraintIR) -> Vec<Violation> {
-    let mut violations = Vec::new();
-
-    for (noun_name, noun_def) in &ir.nouns {
-        // Only check subtypes
-        if noun_def.super_type.is_none() { continue; }
-
-        let is_derived = noun_def.subtype_kind.as_deref() == Some("derived");
-        if !is_derived { continue; }
-
-        // Check if any derivation rule's text mentions this subtype
-        let has_rule = ir.derivation_rules.iter().any(|r| {
-            r.text.contains(noun_name) || r.consequent_fact_type_id.contains(noun_name)
-        });
-
-        if !has_rule {
-            violations.push(Violation {
-                constraint_id: format!("subtype-deriv:{}", noun_name),
-                constraint_text: format!(
-                    "Derived subtype '{}' has no derivation rule",
-                    noun_name
-                ),
-                detail: format!(
-                    "'{}' is marked as a derived subtype of '{}' but no derivation rule \
-                     determines its membership. Add a derivation rule or change to 'asserted'.",
-                    noun_name, noun_def.super_type.as_deref().unwrap_or("?")
-                ),
-                alethic: true,
-            });
-        }
-    }
-
-    violations
+/// Without subtype_kind on NounDef, this check is deferred until the parser
+/// can distinguish derived vs asserted subtypes through derivation rule presence.
+pub fn check_subtype_derivation_rules(_ir: &ConstraintIR) -> Vec<Violation> {
+    Vec::new()
 }
 
 /// Check schema satisfiability — detect contradictory constraints that
@@ -459,13 +428,13 @@ mod tests {
         };
         ir.nouns.insert("Person".to_string(), NounDef {
             object_type: "entity".to_string(),
-            enum_values: None, value_type: None, super_type: None,
-            world_assumption: WorldAssumption::default(), ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
+            enum_values: None, super_type: None,
+            world_assumption: WorldAssumption::default(), ref_scheme: None, objectifies: None,
         });
         ir.nouns.insert("Name".to_string(), NounDef {
             object_type: "value".to_string(),
-            enum_values: None, value_type: None, super_type: None,
-            world_assumption: WorldAssumption::default(), ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
+            enum_values: None, super_type: None,
+            world_assumption: WorldAssumption::default(), ref_scheme: None, objectifies: None,
         });
         ir.fact_types.insert("ft1".to_string(), FactTypeDef {
             schema_id: String::new(),
@@ -614,9 +583,9 @@ mod tests {
         // a UC only on Person (not spanning both roles)
         ir.nouns.insert("Marriage".to_string(), NounDef {
             object_type: "entity".to_string(),
-            enum_values: None, value_type: None, super_type: None,
+            enum_values: None, super_type: None,
             world_assumption: WorldAssumption::default(),
-            ref_scheme: None, objectifies: Some("ft1".to_string()), subtype_kind: None, rigid: false,
+            ref_scheme: None, objectifies: Some("ft1".to_string()),
         });
         ir.constraints.push(ConstraintDef {
             id: "uc-person-name".to_string(),
@@ -639,9 +608,9 @@ mod tests {
         let mut ir = simple_ir();
         ir.nouns.insert("Marriage".to_string(), NounDef {
             object_type: "entity".to_string(),
-            enum_values: None, value_type: None, super_type: None,
+            enum_values: None, super_type: None,
             world_assumption: WorldAssumption::default(),
-            ref_scheme: None, objectifies: Some("ft1".to_string()), subtype_kind: None, rigid: false,
+            ref_scheme: None, objectifies: Some("ft1".to_string()),
         });
         // Spanning UC: spans ALL roles (both role 0 and role 1)
         ir.constraints.push(ConstraintDef {
@@ -727,58 +696,12 @@ mod tests {
     // ── Subtype derivation rules ──────────────────────────────
 
     #[test]
-    fn derived_subtype_without_rule_produces_violation() {
-        let mut ir = simple_ir();
-        ir.nouns.insert("Teacher".to_string(), NounDef {
-            object_type: "entity".to_string(),
-            enum_values: None, value_type: None,
-            super_type: Some("Person".to_string()),
-            world_assumption: WorldAssumption::default(),
-            ref_scheme: None, objectifies: None,
-            subtype_kind: Some("derived".to_string()), rigid: false,
-        });
-        // No derivation rule for Teacher
-        let violations = check_subtype_derivation_rules(&ir);
-        assert_eq!(violations.len(), 1);
-        assert!(violations[0].detail.contains("derivation rule"), "got: {}", violations[0].detail);
-    }
-
-    #[test]
-    fn derived_subtype_with_rule_passes() {
-        let mut ir = simple_ir();
-        ir.nouns.insert("Teacher".to_string(), NounDef {
-            object_type: "entity".to_string(),
-            enum_values: None, value_type: None,
-            super_type: Some("Person".to_string()),
-            world_assumption: WorldAssumption::default(),
-            ref_scheme: None, objectifies: None,
-            subtype_kind: Some("derived".to_string()), rigid: false,
-        });
-        ir.derivation_rules.push(DerivationRuleDef {
-            id: "rule-teacher".to_string(),
-            text: "Each Teacher is a Person who teaches some Subject.".to_string(),
-            antecedent_fact_type_ids: vec![],
-            consequent_fact_type_id: "Teacher".to_string(),
-            kind: DerivationKind::SubtypeInheritance,
-            join_on: vec![], match_on: vec![], consequent_bindings: vec![],
-        });
+    fn subtype_derivation_check_is_deferred() {
+        // subtype_kind was removed from NounDef. The check is a no-op
+        // until derivation rule presence can determine derived vs asserted.
+        let ir = simple_ir();
         let violations = check_subtype_derivation_rules(&ir);
         assert_eq!(violations.len(), 0);
-    }
-
-    #[test]
-    fn asserted_subtype_needs_no_rule() {
-        let mut ir = simple_ir();
-        ir.nouns.insert("Male".to_string(), NounDef {
-            object_type: "entity".to_string(),
-            enum_values: None, value_type: None,
-            super_type: Some("Person".to_string()),
-            world_assumption: WorldAssumption::default(),
-            ref_scheme: None, objectifies: None,
-            subtype_kind: Some("asserted".to_string()), rigid: true,
-        });
-        let violations = check_subtype_derivation_rules(&ir);
-        assert_eq!(violations.len(), 0, "asserted subtypes don't need rules");
     }
 
     #[test]
@@ -903,9 +826,9 @@ mod tests {
         // Add ft2 with roles {Person, Name, Age} — ft1 is a subset
         ir.nouns.insert("Age".to_string(), NounDef {
             object_type: "value".to_string(),
-            enum_values: None, value_type: None, super_type: None,
+            enum_values: None, super_type: None,
             world_assumption: WorldAssumption::default(),
-            ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
+            ref_scheme: None, objectifies: None,
         });
         ir.fact_types.insert("ft2".to_string(), FactTypeDef {
             schema_id: String::new(),
@@ -927,9 +850,9 @@ mod tests {
         let mut ir = simple_ir();
         ir.nouns.insert("Country".to_string(), NounDef {
             object_type: "entity".to_string(),
-            enum_values: None, value_type: None, super_type: None,
+            enum_values: None, super_type: None,
             world_assumption: WorldAssumption::default(),
-            ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
+            ref_scheme: None, objectifies: None,
         });
         ir.fact_types.insert("ft2".to_string(), FactTypeDef {
             schema_id: String::new(),
