@@ -2971,10 +2971,9 @@ mod schema_tests {
             nouns.insert(name.to_string(), NounDef {
                 object_type: "entity".to_string(),
                 enum_values: None,
-                value_type: None,
                 super_type: None,
                 world_assumption: WorldAssumption::Closed,
-                ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
+                ref_scheme: None, objectifies: None,
             });
         }
 

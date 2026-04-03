@@ -3,14 +3,14 @@
  *
  * The TypeScript layer does NOT implement business logic. It:
  * 1. Loads the domain schema from EntityDB into a ConstraintIR
- * 2. Compiles it in the WASM engine (load_ir)
+ * 2. Compiles it in the WASM engine (compile_domain)
  * 3. Calls the appropriate WASM function (evaluate, forward_chain, run_machine, query)
  * 4. Returns the result
  *
  * All logic lives in the Rust AST. This file is plumbing.
  */
 
-import { initSync, load_ir, compile_domain, release_domain, current_domain_handle, evaluate_response, forward_chain_population, run_machine_wasm, query_schema_wasm, get_transitions_wasm, resolve_fact_event, prepare_entity, apply_command_wasm, debug_compiled_state, load_validation_model, validate_schema_wasm, project_entity_wasm, get_noun_schemas_wasm, parse_readings_wasm, parse_readings_with_nouns_wasm, rmap_wasm } from '../../crates/fol-engine/pkg/fol_engine.js'
+import { initSync, compile_domain, release_domain, evaluate_response, forward_chain_population, run_machine_wasm, query_schema_wasm, get_transitions_wasm, resolve_fact_event, prepare_entity, apply_command_wasm, debug_compiled_state, load_validation_model, validate_schema_wasm, project_entity_wasm, get_noun_schemas_wasm, parse_readings_wasm, parse_readings_with_nouns_wasm, rmap_wasm } from '../../crates/fol-engine/pkg/fol_engine.js'
 import wasmModule from '../../crates/fol-engine/pkg/fol_engine_bg.wasm'
 
 let wasmInitialized = false
@@ -22,17 +22,20 @@ function ensureWasm() {
   }
 }
 
-/**
- * Resolve a domain handle. If an explicit handle is provided, use it.
- * Otherwise fall back to the current_domain_handle() from the compatibility shim.
- * Returns -1 if no handle is available (no domain loaded).
- */
+/** Last compiled domain handle. Module-level tracking replaces the removed Rust global. */
+let _currentHandle: number = -1
+
 function resolveHandle(handle?: number): number {
   if (handle !== undefined && handle >= 0) return handle
-  return current_domain_handle() ?? -1
+  return _currentHandle
 }
 
-export { compile_domain, release_domain, current_domain_handle }
+export { compile_domain, release_domain }
+
+/** Get the current domain handle (module-level, not a Rust global). */
+export function currentDomainHandle(): number {
+  return _currentHandle
+}
 
 /**
  * Reconstruct the ConstraintIR JSON from entity queries.
@@ -93,13 +96,10 @@ export async function reconstructIR(
     const def: any = {
       objectType: n.objectType || 'entity',
       enumValues: n.enumValues || null,
-      valueType: null,
       superType: n.superType || null,
       worldAssumption: 'closed',
       refScheme: n.referenceScheme || null,
       objectifies: n.objectifies || null,
-      subtypeKind: null,
-      rigid: false,
     }
     irNouns[n.name || n.id] = def
   }
@@ -204,8 +204,7 @@ export async function reconstructIR(
 /**
  * Load a domain's schema into the WASM engine.
  * Reconstructs the ConstraintIR from entity queries and compiles it.
- * Returns the domain handle (index into the slab). Also sets this as the
- * current default handle for backward compatibility.
+ * Returns the domain handle (index into the slab).
  */
 export async function loadDomainSchema(
   registry: any,
@@ -214,18 +213,23 @@ export async function loadDomainSchema(
 ): Promise<number> {
   ensureWasm()
 
-  // ↑DEFS — try the persisted IR first (stored at seed time, one fetch)
+  // DEFS cell contains the persisted IR (stored at seed time, one fetch)
   const defsCell = await getStub(`defs:${domainSlug}`).get().catch(() => null)
   const cachedIr = defsCell?.data?.irJson || defsCell?.irJson
   if (cachedIr) {
     const irStr = typeof cachedIr === 'string' ? cachedIr : JSON.stringify(cachedIr)
-    return compile_domain(irStr)
+    const h = compile_domain(irStr)
+    _currentHandle = h
+    return h
   }
 
-  // Fallback: reconstruct from entities (domains not yet re-seeded)
+  // No DEFS cell means the domain needs re-seeding.
+  // Reconstruct as a recovery path (domain may have been seeded before DEFS was added).
   const irJson = await reconstructIR(registry, getStub, domainSlug)
   if (!irJson) return -1
-  return compile_domain(irJson)
+  const h = compile_domain(irJson)
+  _currentHandle = h
+  return h
 }
 
 /**
@@ -949,7 +953,7 @@ export async function deriveViewMetadata(
     .map(([child]) => child)
 
   // RMAP: compute cell partitioning from UC structure (Halpin, Ch. 17).
-  // The IR must already be loaded (done above via irCell fetch triggering load_ir).
+  // The IR must already be loaded (done above via compile_domain).
   const rmapTables = computeRMAP()
   const nounTable = rmapTables.find(t => t.name === nounName) ?? null
 

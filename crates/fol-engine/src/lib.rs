@@ -1,7 +1,8 @@
 // crates/fol-engine/src/lib.rs
 //
 // WASM interface. Exports:
-//   load_ir            — parse JSON IR, compile into predicates (once)
+//   compile_domain     — parse JSON IR, compile into predicates, return handle
+//   release_domain     — free a compiled domain handle
 //   evaluate_response  — apply compiled predicates to response + population (per request)
 //   synthesize_noun    — collect all knowledge about a noun from the compiled model
 //   forward_chain      — apply derivation rules to population until fixed point
@@ -133,12 +134,6 @@ fn domain_store() -> &'static Mutex<Vec<Option<CompiledState>>> {
     DOMAINS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-static CURRENT_HANDLE: OnceLock<Mutex<Option<u32>>> = OnceLock::new();
-
-fn current_handle() -> &'static Mutex<Option<u32>> {
-    CURRENT_HANDLE.get_or_init(|| Mutex::new(None))
-}
-
 #[wasm_bindgen]
 pub fn compile_domain(ir_json: &str) -> Result<u32, JsValue> {
     let ir: ConstraintIR = serde_json::from_str(ir_json)
@@ -157,20 +152,6 @@ pub fn release_domain(handle: u32) {
     if let Some(slot) = store.get_mut(handle as usize) {
         *slot = None;
     }
-}
-
-/// Get the handle from the last load_ir call (compatibility shim).
-#[wasm_bindgen]
-pub fn current_domain_handle() -> Option<u32> {
-    current_handle().lock().unwrap().clone()
-}
-
-/// Compatibility shim: compiles the domain and stores the handle as the current default.
-#[wasm_bindgen]
-pub fn load_ir(ir_json: &str) -> Result<(), JsValue> {
-    let h = compile_domain(ir_json)?;
-    *current_handle().lock().unwrap() = Some(h);
-    Ok(())
 }
 
 #[wasm_bindgen]
@@ -663,7 +644,7 @@ fn emit_entities(ir: &types::ConstraintIR, domain: &str) -> Result<JsValue, JsVa
         data.insert("objectType".into(), serde_json::Value::String(noun.object_type.clone()));
         // Noun properties are stored as proper typed values, not serialized
         // compiler internals. The IR cell is gone; the TS layer reconstructs
-        // the IR from these entity fields when it needs to call load_ir().
+        // the IR from these entity fields when it needs to call compile_domain().
         if let Some(ref st) = noun.super_type {
             data.insert("superType".into(), serde_json::Value::String(st.clone()));
         }
@@ -916,7 +897,7 @@ fn emit_entities(ir: &types::ConstraintIR, domain: &str) -> Result<JsValue, JsVa
 
     // No CompiledSchema/IR cell. The TS layer reconstructs the IR from
     // entity queries (Noun, Graph Schema, Role, Constraint, etc.) when it
-    // needs to call load_ir(). Compiler internals do not cross the boundary.
+    // needs to call compile_domain(). Compiler internals do not cross the boundary.
 
     let json_str = serde_json::to_string(&entities).map_err(|e| JsValue::from_str(&format!("{}", e)))?;
     Ok(JsValue::from_str(&json_str))

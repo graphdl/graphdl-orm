@@ -35,7 +35,6 @@ impl Default for WorldAssumption {
 pub struct NounDef {
     pub object_type: String,
     pub enum_values: Option<Vec<String>>,
-    pub value_type: Option<String>,
     pub super_type: Option<String>,
     #[serde(default)]
     pub world_assumption: WorldAssumption,

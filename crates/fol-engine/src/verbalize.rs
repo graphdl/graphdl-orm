@@ -257,9 +257,9 @@ mod tests {
     fn verbalize_noun_entity() {
         let def = NounDef {
             object_type: "entity".to_string(),
-            enum_values: None, value_type: None, super_type: None,
+            enum_values: None, super_type: None,
             world_assumption: WorldAssumption::default(),
-            ref_scheme: Some(vec!["Email".to_string()]), objectifies: None, subtype_kind: None, rigid: false,
+            ref_scheme: Some(vec!["Email".to_string()]), objectifies: None,
         };
         assert_eq!(verbalize_noun("Customer", &def), "Customer(.Email) is an entity type.");
     }
@@ -269,9 +269,9 @@ mod tests {
         let def = NounDef {
             object_type: "value".to_string(),
             enum_values: Some(vec!["M".to_string(), "F".to_string()]),
-            value_type: None, super_type: None,
+            super_type: None,
             world_assumption: WorldAssumption::default(),
-            ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
+            ref_scheme: None, objectifies: None,
         };
         let v = verbalize_noun("Gender", &def);
         assert!(v.contains("Gender is a value type."), "got: {}", v);

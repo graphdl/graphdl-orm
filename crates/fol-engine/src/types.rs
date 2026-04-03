@@ -50,8 +50,6 @@ impl Default for WorldAssumption {
 pub struct NounDef {
     pub object_type: String,
     pub enum_values: Option<Vec<String>>,
-    #[allow(dead_code)]
-    pub value_type: Option<String>,
     pub super_type: Option<String>,
     #[serde(default)]
     pub world_assumption: WorldAssumption,
@@ -63,16 +61,6 @@ pub struct NounDef {
     /// Objectification requires a spanning UC on the objectified fact type.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub objectifies: Option<String>,
-    /// Subtype classification (Halpin, "Subtyping Revisited", 2006):
-    /// - "asserted": declared without derivation rule
-    /// - "derived": fully determined by derivation rule(s)
-    /// - "semi-derived": partially determined
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subtype_kind: Option<String>,
-    /// Whether instances can migrate between subtypes at runtime.
-    /// true = rigid (fixed classification), false = flexible (can change)
-    #[serde(default)]
-    pub rigid: bool,
 }
 
 /// A derivation rule in the IR — compiled to a DeriveFn at compile time.

@@ -716,8 +716,8 @@ mod tests {
         };
         ir.nouns.insert("Order".to_string(), NounDef {
             object_type: "entity".to_string(),
-            enum_values: None, value_type: None, super_type: None,
-            world_assumption: WorldAssumption::default(), ref_scheme: Some(vec!["Order Number".to_string()]), objectifies: None, subtype_kind: None, rigid: false,
+            enum_values: None, super_type: None,
+            world_assumption: WorldAssumption::default(), ref_scheme: Some(vec!["Order Number".to_string()]), objectifies: None,
         });
         ir.state_machines.insert("Order".to_string(), StateMachineDef {
             noun_name: "Order".to_string(),

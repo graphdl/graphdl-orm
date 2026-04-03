@@ -53,13 +53,14 @@ export async function handleSynthesize(request: Request, env: Env): Promise<Resp
   const registry = env.REGISTRY_DB.get(env.REGISTRY_DB.idFromName('global')) as any
   const getStub = (id: string) => getEntityDO(env, id) as any
 
+  let handle: number
   try {
-    await loadDomainSchema(registry, getStub, body.domainId)
+    handle = await loadDomainSchema(registry, getStub, body.domainId)
   } catch {
     return error(400, { errors: [{ message: `Failed to load schema for domain: ${body.domainId}` }] })
   }
 
-  const { synthesize_noun, current_domain_handle } = await import('../../crates/fol-engine/pkg/fol_engine.js')
-  const result = synthesize_noun(current_domain_handle() ?? 0, body.noun, body.depth || 1)
+  const { synthesize_noun } = await import('../../crates/fol-engine/pkg/fol_engine.js')
+  const result = synthesize_noun(handle, body.noun, body.depth || 1)
   return json(result)
 }

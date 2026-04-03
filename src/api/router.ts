@@ -119,17 +119,17 @@ router.post('/api/debug/arest/:domain', async (request, env: Env) => {
 router.get('/api/debug/compiled/:domain', async (request, env: Env) => {
   const { domain } = request.params
   const registry = getRegistryDO(env, 'global') as any
-  await loadDomainSchema(registry, (id: string) => getEntityDO(env, id) as any, domain)
-  const { debug_compiled_state: debugState, current_domain_handle } = await import('../../crates/fol-engine/pkg/fol_engine.js')
-  return json(JSON.parse(debugState(current_domain_handle() ?? 0)))
+  const handle = await loadDomainSchema(registry, (id: string) => getEntityDO(env, id) as any, domain)
+  const { debug_compiled_state: debugState } = await import('../../crates/fol-engine/pkg/fol_engine.js')
+  return json(JSON.parse(debugState(handle)))
 })
 
 router.get('/api/debug/schema/:domain', async (request, env: Env) => {
   const domain = decodeURIComponent(request.params.domain)
   const registry = getRegistryDO(env, 'global') as any
-  await loadDomainSchema(registry, (id: string) => getEntityDO(env, id) as any, domain)
-  const { debug_compiled_state, current_domain_handle: cdh } = await import('../../crates/fol-engine/pkg/fol_engine.js')
-  const schema = JSON.parse(debug_compiled_state(cdh() ?? 0))
+  const handle = await loadDomainSchema(registry, (id: string) => getEntityDO(env, id) as any, domain)
+  const { debug_compiled_state } = await import('../../crates/fol-engine/pkg/fol_engine.js')
+  const schema = JSON.parse(debug_compiled_state(handle))
   return json({
     domain,
     nounCount: Object.keys(schema.nouns).length,
@@ -757,12 +757,12 @@ router.all('/api/query', async (request, env: Env) => {
   const getStub = (id: string) => getEntityDO(env, id) as any
 
   // Load schema + build population, then query via WASM
-  await loadDomainSchema(registry, getStub, domain)
+  const handle = await loadDomainSchema(registry, getStub, domain)
   const populationJson = await loadDomainAndPopulation(registry, getStub, domain)
 
   // Use WASM prove_goal for the query
-  const { prove_goal, current_domain_handle } = await import('../../crates/fol-engine/pkg/fol_engine.js')
-  const result = prove_goal(current_domain_handle() ?? 0, query, JSON.parse(populationJson), 'closed')
+  const { prove_goal } = await import('../../crates/fol-engine/pkg/fol_engine.js')
+  const result = prove_goal(handle, query, JSON.parse(populationJson), 'closed')
 
   return json(result)
 })

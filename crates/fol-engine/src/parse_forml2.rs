@@ -44,18 +44,18 @@ fn try_entity_type(line: &str) -> Option<ParseAction> {
     let before = line.strip_suffix(" is an entity type.")?;
     let (name, ref_scheme) = parse_entity_decl(before.trim())?;
     Some(ParseAction::AddNoun(name, NounDef {
-        object_type: "entity".into(), enum_values: None, value_type: None,
+        object_type: "entity".into(), enum_values: None,
         super_type: None, world_assumption: WorldAssumption::default(),
-        ref_scheme, objectifies: None, subtype_kind: None, rigid: false,
+        ref_scheme, objectifies: None,
     }))
 }
 
 fn try_value_type(line: &str) -> Option<ParseAction> {
     let name = line.strip_suffix(" is a value type.")?.trim().to_string();
     Some(ParseAction::AddNoun(name, NounDef {
-        object_type: "value".into(), enum_values: None, value_type: None,
+        object_type: "value".into(), enum_values: None,
         super_type: None, world_assumption: WorldAssumption::default(),
-        ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
+        ref_scheme: None, objectifies: None,
     }))
 }
 
@@ -65,9 +65,9 @@ fn try_subtype(line: &str) -> Option<ParseAction> {
     let sub = clean[..idx].trim().to_string();
     let sup = clean[idx + 17..].trim().to_string();
     Some(ParseAction::AddNoun(sub, NounDef {
-        object_type: "entity".into(), enum_values: None, value_type: None,
+        object_type: "entity".into(), enum_values: None,
         super_type: Some(sup), world_assumption: WorldAssumption::default(),
-        ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
+        ref_scheme: None, objectifies: None,
     }))
 }
 
@@ -837,9 +837,9 @@ fn apply_action(ir: &mut ConstraintIR, action: Option<ParseAction>, lines: &[Str
             if let Some(noun) = ir.nouns.get_mut(&sup) { noun.object_type = "abstract".into(); }
             for sub in subs {
                 ir.nouns.entry(sub).or_insert(NounDef {
-                    object_type: "entity".into(), enum_values: None, value_type: None,
+                    object_type: "entity".into(), enum_values: None,
                     super_type: Some(sup.clone()), world_assumption: WorldAssumption::default(),
-                    ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
+                    ref_scheme: None, objectifies: None,
                 });
             }
         }

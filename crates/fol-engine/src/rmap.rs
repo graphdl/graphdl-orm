@@ -425,10 +425,9 @@ mod tests {
             ir.nouns.insert(name.to_string(), NounDef {
                 object_type: obj_type.to_string(),
                 enum_values: None,
-                value_type: None,
                 super_type: None,
                 world_assumption: WorldAssumption::default(),
-                ref_scheme: None, objectifies: None, subtype_kind: None, rigid: false,
+                ref_scheme: None, objectifies: None,
             });
         }
         for (id, reading, roles) in fact_types {
