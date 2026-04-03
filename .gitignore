@@ -35,8 +35,7 @@ yarn-error.log*
 
 # Rust
 **/target/
-/crates/constraint-eval/pkg/
-/crates/fol-engine/pkg/
+/crates/arest/pkg/
 
 # legacy build artifacts
 .next/

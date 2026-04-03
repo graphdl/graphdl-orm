@@ -1,8 +1,11 @@
-# crates/fol-engine/Cargo.toml
+# crates/arest/Cargo.toml
 [package]
-name = "fol-engine"
+name = "arest"
 version = "0.1.0"
 edition = "2021"
+description = "AREST engine: FORML2 parser, constraint compiler, evaluator, forward chainer, RMAP, and verbalization"
+repository = "https://github.com/drivly/graphdl-orm"
+license = "MIT"
 
 [lib]
 crate-type = ["cdylib", "rlib"]

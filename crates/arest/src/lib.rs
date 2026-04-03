@@ -1,4 +1,4 @@
-// crates/fol-engine/src/lib.rs
+// crates/arest/src/lib.rs
 //
 // WASM interface. Exports:
 //   compile_domain     — parse JSON IR, compile into predicates, return handle

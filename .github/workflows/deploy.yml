@@ -22,8 +22,8 @@ jobs:
       - name: Install wasm-pack
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
 
-      - name: Build WASM constraint evaluator
-        run: cd crates/constraint-eval && cargo test -- --test-threads=1 && wasm-pack build --target bundler
+      - name: Build WASM AREST engine
+        run: cd crates/arest && cargo test && wasm-pack build --target web --out-dir pkg
 
       - run: yarn install --frozen-lockfile
 

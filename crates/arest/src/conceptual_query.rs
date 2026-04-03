@@ -1,4 +1,4 @@
-// crates/fol-engine/src/conceptual_query.rs
+// crates/arest/src/conceptual_query.rs
 //
 // Conceptual query resolution — natural language query → path of reading hops.
 //

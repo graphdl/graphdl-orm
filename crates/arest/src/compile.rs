@@ -1,4 +1,4 @@
-// crates/fol-engine/src/compile.rs
+// crates/arest/src/compile.rs
 //
 // Compilation: ConstraintIR → CompiledModel
 //

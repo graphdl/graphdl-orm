@@ -1,4 +1,4 @@
-// crates/fol-engine/src/ast.rs
+// crates/arest/src/ast.rs
 //
 // The FP AST — Backus's combining forms as Rust types.
 //

@@ -1,4 +1,4 @@
-// crates/fol-engine/src/induce.rs
+// crates/arest/src/induce.rs
 //
 // Induction engine: given a population of facts, infer the constraints
 // and derivation rules that govern it.

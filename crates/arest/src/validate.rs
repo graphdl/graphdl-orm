@@ -1,4 +1,4 @@
-// crates/fol-engine/src/validate.rs
+// crates/arest/src/validate.rs
 //
 // Schema validation via engine self-evaluation.
 //

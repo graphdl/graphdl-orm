@@ -1,4 +1,4 @@
-// crates/fol-engine/src/parse_rule.rs
+// crates/arest/src/parse_rule.rs
 //
 // Derivation Rule Parser — parses ORM derivation rules of the form:
 //   Consequent := Antecedent1 and Antecedent2 and ...

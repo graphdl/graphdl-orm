@@ -1,4 +1,4 @@
-// crates/fol-engine/src/verbalize.rs
+// crates/arest/src/verbalize.rs
 //
 // compile⁻¹: Recover FORML 2 readings from compiled constraints.
 //

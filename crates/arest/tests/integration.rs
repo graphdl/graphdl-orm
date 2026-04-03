@@ -1,10 +1,10 @@
-// crates/fol-engine/tests/integration.rs
+// crates/arest/tests/integration.rs
 //
 // Integration tests exercise the compile + evaluate pipeline directly,
 // bypassing the wasm_bindgen layer (which requires JsValue).
-use fol_engine::types::{ConstraintIR, ResponseContext, Population};
-use fol_engine::compile;
-use fol_engine::evaluate;
+use arest::types::{ConstraintIR, ResponseContext, Population};
+use arest::compile;
+use arest::evaluate;
 
 #[test]
 fn test_full_pipeline_forbidden_text() {

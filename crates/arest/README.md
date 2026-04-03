@@ -1,4 +1,4 @@
-# constraint-eval
+# arest
 
 A constraint verification and forward inference engine for GraphDL, compiled to WebAssembly.
 
@@ -131,13 +131,13 @@ fn forward_chain_population(population_json: &str) -> String  // → JSON [Deriv
 
 ```bash
 # Verify text against constraints
-graphdl-rules --ir constraints.json --text "response to verify"
+fol --ir constraints.json --text "response to verify"
 
 # Synthesize knowledge about a noun
-graphdl-rules --ir constraints.json --synthesize "AI System" --depth 2
+fol --ir constraints.json --synthesize "AI System" --depth 2
 
 # Forward chain a population
-graphdl-rules --ir constraints.json --forward-chain --population facts.json
+fol --ir constraints.json --forward-chain --population facts.json
 ```
 
 ## Tests

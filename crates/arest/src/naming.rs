@@ -1,4 +1,4 @@
-// crates/fol-engine/src/naming.rs
+// crates/arest/src/naming.rs
 //
 // Convention-based naming — pure functions, no I/O.
 // Noun names are the authority (from readings).

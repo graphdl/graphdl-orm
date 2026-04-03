@@ -1,4 +1,4 @@
-// crates/fol-engine/src/rmap.rs
+// crates/arest/src/rmap.rs
 //
 // RMAP — Relational Mapping Procedure (Halpin, Ch. 10)
 //
