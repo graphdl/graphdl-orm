@@ -14,6 +14,7 @@ Reading(.id) is an entity type.
 Role(.id) is an entity type.
 
 Verb is a subtype of Function.
+  HTTP Method is a subtype of Verb.
 
 Constraint(.id) is an entity type.
   Set Comparison Constraint is a subtype of Constraint.
@@ -32,9 +33,8 @@ Modality Type is a value type.
 World Assumption is a value type.
   The possible values of World Assumption are 'closed', 'open'.
 
-This association with Graph Schema, Verb provides the preferred identification scheme for Activation.
+This association with Graph Schema, Verb provides the preferred identification scheme for API.
 
-This association with Activation, HTTP Method provides the preferred identification scheme for API.
 
 Language(.code) is an entity type.
 
@@ -83,11 +83,6 @@ Permission is a value type.
 Role Relationship is a value type.
   The possible values of Role Relationship are 'many-to-one', 'one-to-many', 'many-to-many', 'one-to-one'.
 
-HTTP Method is a value type.
-  The possible values of HTTP Method are 'GET', 'POST', 'PUT', 'PATCH', 'DELETE'.
-
-Function Type is a value type.
-  The possible values of Function Type are 'httpCallback', 'query', 'agentInvocation', 'transform'.
 
 Scope is a value type.
   The possible values of Scope are 'organization', 'public'.
@@ -100,7 +95,7 @@ Noun has Object Type.
 Noun has Plural.
   Each Noun has at most one Plural.
 Noun has value-type- Name.
-  Each Noun has at most one value-type- Name.
+  Each value-type- Name belongs to at most one Noun.
 Noun has Format.
   Each Noun has at most one Format.
 Noun has Enum Values.
@@ -184,12 +179,9 @@ Verb has Name.
   It is possible that more than one Verb has the same Name.
 Graph Schema is activated by Verb.
   In each population of Graph Schema is activated by Verb, each Graph Schema, Verb combination occurs at most once.
-Verb executes Function.
-  Each Verb executes at most one Function.
-Event Type can be created by Verb.
 Graph is referenced by Verb.
-  Each Graph is referenced by exactly one Verb.
   It is possible that some Verb references more than one Graph.
+  It is possible that more than one Verb references the same Graph.
 Verb is performed during Transition (Mealy semantics).
   For each Transition, at most one Verb is performed during that Transition.
   It is possible that some Verb is performed during more than one Transition.
@@ -200,12 +192,8 @@ Verb is performed in Status (Moore semantics).
 ### Function
 Function has Name.
   Each Function has at most one Name.
-Function has Function Type.
-  Each Function has at most one Function Type.
 Function has callback URI.
   Each Function has at most one callback URI.
-Function has HTTP Method.
-  Each Function has at most one HTTP Method.
 Function has Header.
   Each Function has each Header at most once.
 Function has Scope.
@@ -249,13 +237,9 @@ Stream has Name.
   Each Stream has exactly one Name.
   It is possible that more than one Stream has the same Name.
 
-### Activation (objectification of "Graph Schema is activated by Verb")
-Activation is by HTTP Method.
-
-### API (objectification of "Activation is by HTTP Method")
-API has URI.
-  Each API has exactly one URI.
-  For each URI, at most one API has that URI.
+### API (objectification of "Graph Schema is activated by Verb")
+API accepts Noun as parameter.
+  Each API, Noun combination occurs at most once in the population of API accepts Noun as parameter.
 
 ## Constraints
 
@@ -279,6 +263,7 @@ If some Graph Schema defines some Graph then some Resource that is that Graph is
 If some Verb references some Graph that is of some Graph Schema then that Verb uses some Reading where that Graph Schema has that Reading.
 If some Guard Run is for some Guard and that Guard Run references some Graph then that Guard references some Graph Schema that defines that Graph.
 If some State Machine is currently in some Status then that Status is defined in some State Machine Definition where that State Machine is instance of that State Machine Definition.
+If some API accepts some Noun as parameter and some other Noun is subtype of that Noun then that API accepts that subtype Noun as parameter.
 
 ## Ring Constraints
 
@@ -343,6 +328,18 @@ Constraint Type 'IT' has Name 'Intransitive'.
 Constraint Type 'TR' has Name 'Transitive'.
 Constraint Type 'AC' has Name 'Acyclic'.
 Constraint Type 'VC' has Name 'ValueComparison'.
+
+### HTTP Methods
+
+HTTP Method 'GET' has Name 'GET'.
+HTTP Method 'POST' has Name 'POST'.
+HTTP Method 'PUT' has Name 'PUT'.
+HTTP Method 'PATCH' has Name 'PATCH'.
+HTTP Method 'DELETE' has Name 'DELETE'.
+HTTP Method 'HEAD' has Name 'HEAD'.
+HTTP Method 'OPTIONS' has Name 'OPTIONS'.
+
+### External Systems
 
 External System 'auth.vin' has URL 'https://auth.vin'.
 External System 'auth.vin' has Header 'Authorization'.
