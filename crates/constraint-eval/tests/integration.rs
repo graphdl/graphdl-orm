@@ -8,8 +8,9 @@ fn test_full_pipeline_forbidden_text() {
         "domain": "test",
         "nouns": {
             "SupportResponse": { "objectType": "entity" },
-            "ProhibitedText": { "objectType": "value", "enumValues": ["—", "–"], "valueType": "string" }
+            "ProhibitedText": { "objectType": "value" }
         },
+        "enumValues": { "ProhibitedText": ["—", "–"] },
         "factTypes": {
             "ft1": {
                 "reading": "SupportResponse contains ProhibitedText",
@@ -46,8 +47,9 @@ fn test_full_pipeline_clean_response() {
         "domain": "test",
         "nouns": {
             "SupportResponse": { "objectType": "entity" },
-            "ProhibitedText": { "objectType": "value", "enumValues": ["—"], "valueType": "string" }
+            "ProhibitedText": { "objectType": "value" }
         },
+        "enumValues": { "ProhibitedText": ["—"] },
         "factTypes": {
             "ft1": {
                 "reading": "SupportResponse contains ProhibitedText",

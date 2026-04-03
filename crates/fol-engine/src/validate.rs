@@ -38,10 +38,8 @@ pub fn ir_to_metamodel_population(ir: &ConstraintIR) -> Population {
     }
 
     // Subtypes → "Noun is subtype of Noun"
-    for (name, def) in &ir.nouns {
-        if let Some(ref super_type) = def.super_type {
-            push("Noun is subtype of Noun", vec![("Noun", name), ("Noun", super_type)]);
-        }
+    for (name, super_type) in &ir.subtypes {
+        push("Noun is subtype of Noun", vec![("Noun", name), ("Noun", super_type)]);
     }
 
     // Fact types → "Graph Schema has Reading", "Graph Schema has Role", "Graph Schema has Arity"
@@ -365,48 +363,46 @@ pub fn check_constraint_implication(ir: &ConstraintIR) -> Vec<Violation> {
 pub fn check_objectification_atomicity(ir: &ConstraintIR) -> Vec<Violation> {
     let mut violations = Vec::new();
 
-    for (noun_name, noun_def) in &ir.nouns {
-        if let Some(ref objectified_reading) = noun_def.objectifies {
-            // Find the fact type being objectified
-            let ft = ir.fact_types.get(objectified_reading);
-            if ft.is_none() {
-                violations.push(Violation {
-                    constraint_id: format!("objectification:{}", noun_name),
-                    constraint_text: format!("{} objectifies unknown fact type '{}'", noun_name, objectified_reading),
-                    detail: format!("Fact type '{}' not found in schema", objectified_reading),
-                    alethic: true,
-                });
-                continue;
-            }
-            let ft = ft.unwrap();
-            let arity = ft.roles.len();
-
-            // Check if a spanning UC exists (a UC that spans ALL roles of the fact type)
-            let has_spanning_uc = ir.constraints.iter().any(|c| {
-                if c.kind != "UC" { return false; }
-                // A spanning UC has spans covering all roles of this fact type
-                let spans_this_ft: Vec<&SpanDef> = c.spans.iter()
-                    .filter(|s| s.fact_type_id == *objectified_reading)
-                    .collect();
-                spans_this_ft.len() == arity
+    for (noun_name, objectified_reading) in &ir.objectifications {
+        // Find the fact type being objectified
+        let ft = ir.fact_types.get(objectified_reading);
+        if ft.is_none() {
+            violations.push(Violation {
+                constraint_id: format!("objectification:{}", noun_name),
+                constraint_text: format!("{} objectifies unknown fact type '{}'", noun_name, objectified_reading),
+                detail: format!("Fact type '{}' not found in schema", objectified_reading),
+                alethic: true,
             });
+            continue;
+        }
+        let ft = ft.unwrap();
+        let arity = ft.roles.len();
 
-            if !has_spanning_uc {
-                violations.push(Violation {
-                    constraint_id: format!("objectification:{}", noun_name),
-                    constraint_text: format!(
-                        "Objectification of '{}' by {} requires a spanning uniqueness constraint",
-                        objectified_reading, noun_name
-                    ),
-                    detail: format!(
-                        "{} objectifies '{}' (arity {}) but no UC spans all {} roles. \
-                         Objectification requires a spanning UC to ensure atomicity \
-                         (Halpin, \"Objectification and Atomicity\", 2020).",
-                        noun_name, objectified_reading, arity, arity
-                    ),
-                    alethic: true,
-                });
-            }
+        // Check if a spanning UC exists (a UC that spans ALL roles of the fact type)
+        let has_spanning_uc = ir.constraints.iter().any(|c| {
+            if c.kind != "UC" { return false; }
+            // A spanning UC has spans covering all roles of this fact type
+            let spans_this_ft: Vec<&SpanDef> = c.spans.iter()
+                .filter(|s| s.fact_type_id == *objectified_reading)
+                .collect();
+            spans_this_ft.len() == arity
+        });
+
+        if !has_spanning_uc {
+            violations.push(Violation {
+                constraint_id: format!("objectification:{}", noun_name),
+                constraint_text: format!(
+                    "Objectification of '{}' by {} requires a spanning uniqueness constraint",
+                    objectified_reading, noun_name
+                ),
+                detail: format!(
+                    "{} objectifies '{}' (arity {}) but no UC spans all {} roles. \
+                     Objectification requires a spanning UC to ensure atomicity \
+                     (Halpin, \"Objectification and Atomicity\", 2020).",
+                    noun_name, objectified_reading, arity, arity
+                ),
+                alethic: true,
+            });
         }
     }
 
@@ -425,16 +421,17 @@ mod tests {
             constraints: vec![],
             state_machines: HashMap::new(),
             derivation_rules: vec![], general_instance_facts: vec![],
+            subtypes: HashMap::new(), enum_values: HashMap::new(),
+            ref_schemes: HashMap::new(), objectifications: HashMap::new(),
+            named_spans: HashMap::new(), autofill_spans: vec![],
         };
         ir.nouns.insert("Person".to_string(), NounDef {
             object_type: "entity".to_string(),
-            enum_values: None, super_type: None,
-            world_assumption: WorldAssumption::default(), ref_scheme: None, objectifies: None,
+            world_assumption: WorldAssumption::default(),
         });
         ir.nouns.insert("Name".to_string(), NounDef {
             object_type: "value".to_string(),
-            enum_values: None, super_type: None,
-            world_assumption: WorldAssumption::default(), ref_scheme: None, objectifies: None,
+            world_assumption: WorldAssumption::default(),
         });
         ir.fact_types.insert("ft1".to_string(), FactTypeDef {
             schema_id: String::new(),
@@ -583,10 +580,9 @@ mod tests {
         // a UC only on Person (not spanning both roles)
         ir.nouns.insert("Marriage".to_string(), NounDef {
             object_type: "entity".to_string(),
-            enum_values: None, super_type: None,
             world_assumption: WorldAssumption::default(),
-            ref_scheme: None, objectifies: Some("ft1".to_string()),
         });
+        ir.objectifications.insert("Marriage".to_string(), "ft1".to_string());
         ir.constraints.push(ConstraintDef {
             id: "uc-person-name".to_string(),
             kind: "UC".to_string(),
@@ -608,10 +604,9 @@ mod tests {
         let mut ir = simple_ir();
         ir.nouns.insert("Marriage".to_string(), NounDef {
             object_type: "entity".to_string(),
-            enum_values: None, super_type: None,
             world_assumption: WorldAssumption::default(),
-            ref_scheme: None, objectifies: Some("ft1".to_string()),
         });
+        ir.objectifications.insert("Marriage".to_string(), "ft1".to_string());
         // Spanning UC: spans ALL roles (both role 0 and role 1)
         ir.constraints.push(ConstraintDef {
             id: "uc-spanning".to_string(),
@@ -826,9 +821,7 @@ mod tests {
         // Add ft2 with roles {Person, Name, Age} — ft1 is a subset
         ir.nouns.insert("Age".to_string(), NounDef {
             object_type: "value".to_string(),
-            enum_values: None, super_type: None,
             world_assumption: WorldAssumption::default(),
-            ref_scheme: None, objectifies: None,
         });
         ir.fact_types.insert("ft2".to_string(), FactTypeDef {
             schema_id: String::new(),
@@ -850,9 +843,7 @@ mod tests {
         let mut ir = simple_ir();
         ir.nouns.insert("Country".to_string(), NounDef {
             object_type: "entity".to_string(),
-            enum_values: None, super_type: None,
             world_assumption: WorldAssumption::default(),
-            ref_scheme: None, objectifies: None,
         });
         ir.fact_types.insert("ft2".to_string(), FactTypeDef {
             schema_id: String::new(),

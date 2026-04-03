@@ -14,6 +14,18 @@ pub struct ConstraintIR {
     pub state_machines: HashMap<String, StateMachineDef>,
     #[serde(default)]
     pub derivation_rules: Vec<DerivationRuleDef>,
+    /// child noun → parent noun (subtype relationships)
+    #[serde(default)]
+    pub subtypes: HashMap<String, String>,
+    /// noun name → enum values
+    #[serde(default)]
+    pub enum_values: HashMap<String, Vec<String>>,
+    /// noun name → reference scheme parts
+    #[serde(default)]
+    pub ref_schemes: HashMap<String, Vec<String>>,
+    /// objectified noun → fact type reading
+    #[serde(default)]
+    pub objectifications: HashMap<String, String>,
 }
 
 /// World assumption for a noun — determines how absence of facts is interpreted
@@ -34,8 +46,6 @@ impl Default for WorldAssumption {
 #[serde(rename_all = "camelCase")]
 pub struct NounDef {
     pub object_type: String,
-    pub enum_values: Option<Vec<String>>,
-    pub super_type: Option<String>,
     #[serde(default)]
     pub world_assumption: WorldAssumption,
 }

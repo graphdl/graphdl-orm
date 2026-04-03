@@ -17,6 +17,24 @@ pub struct ConstraintIR {
     pub derivation_rules: Vec<DerivationRuleDef>,
     #[serde(default)]
     pub general_instance_facts: Vec<GeneralInstanceFact>,
+    /// child noun → parent noun (subtype relationships)
+    #[serde(default)]
+    pub subtypes: HashMap<String, String>,
+    /// noun name → enum values
+    #[serde(default)]
+    pub enum_values: HashMap<String, Vec<String>>,
+    /// noun name → reference scheme parts
+    #[serde(default)]
+    pub ref_schemes: HashMap<String, Vec<String>>,
+    /// objectified noun → fact type reading
+    #[serde(default)]
+    pub objectifications: HashMap<String, String>,
+    /// Named constraint spans: span_name → role nouns
+    #[serde(default)]
+    pub named_spans: HashMap<String, Vec<String>>,
+    /// Span names with autofill enabled
+    #[serde(default)]
+    pub autofill_spans: Vec<String>,
 }
 
 /// x̄ — a constant asserted into P.
@@ -49,18 +67,8 @@ impl Default for WorldAssumption {
 #[serde(rename_all = "camelCase")]
 pub struct NounDef {
     pub object_type: String,
-    pub enum_values: Option<Vec<String>>,
-    pub super_type: Option<String>,
     #[serde(default)]
     pub world_assumption: WorldAssumption,
-    /// Reference scheme value type names, e.g. ["Org Slug"] for Organization(.Org Slug).
-    /// When present and not ["id"], entity IDs are derived from the field value.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ref_scheme: Option<Vec<String>>,
-    /// If this noun objectifies a fact type, the fact type reading.
-    /// Objectification requires a spanning UC on the objectified fact type.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub objectifies: Option<String>,
 }
 
 /// A derivation rule in the IR — compiled to a DeriveFn at compile time.

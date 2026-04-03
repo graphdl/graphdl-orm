@@ -424,6 +424,9 @@ mod tests {
             constraints: vec![],
             state_machines: HashMap::new(),
             derivation_rules: vec![], general_instance_facts: vec![],
+            subtypes: HashMap::new(), enum_values: HashMap::new(),
+            ref_schemes: HashMap::new(), objectifications: HashMap::new(),
+            named_spans: HashMap::new(), autofill_spans: vec![],
         }
     }
 
@@ -442,10 +445,7 @@ mod tests {
     fn make_noun(object_type: &str) -> NounDef {
         NounDef {
             object_type: object_type.to_string(),
-            enum_values: None,
-            super_type: None,
             world_assumption: WorldAssumption::default(),
-            ref_scheme: None, objectifies: None,
         }
     }
 
@@ -670,13 +670,8 @@ mod tests {
     #[test]
     fn test_deontic_forbidden_text_via_ast() {
         let mut ir = empty_ir();
-        ir.nouns.insert("Markdown Syntax".to_string(), NounDef {
-            object_type: "value".to_string(),
-            enum_values: Some(vec!["#".to_string(), "##".to_string(), "**".to_string()]),
-            super_type: None,
-            world_assumption: WorldAssumption::default(),
-            ref_scheme: None, objectifies: None,
-        });
+        ir.nouns.insert("Markdown Syntax".to_string(), make_noun("value"));
+        ir.enum_values.insert("Markdown Syntax".to_string(), vec!["#".to_string(), "##".to_string(), "**".to_string()]);
         ir.fact_types.insert("ft1".to_string(), FactTypeDef {
             schema_id: String::new(),
             reading: "Response contains Markdown Syntax".to_string(),
@@ -843,12 +838,8 @@ mod tests {
         // A deontic guard prevents the transition when violated.
         let mut ir = empty_ir();
         ir.nouns.insert("SupportRequest".to_string(), make_noun("entity"));
-        ir.nouns.insert("Prohibited".to_string(), NounDef {
-            object_type: "value".to_string(),
-            enum_values: Some(vec!["internal-details".to_string()]),
-            super_type: None,
-            world_assumption: WorldAssumption::default(), ref_scheme: None, objectifies: None,
-        });
+        ir.nouns.insert("Prohibited".to_string(), make_noun("value"));
+        ir.enum_values.insert("Prohibited".to_string(), vec!["internal-details".to_string()]);
 
         ir.fact_types.insert("ft_resp".to_string(), FactTypeDef {
             schema_id: String::new(),
@@ -1037,11 +1028,8 @@ mod tests {
         // Teacher "T1" exists → should derive Academic participation.
         let mut ir = empty_ir();
         ir.nouns.insert("Academic".to_string(), make_noun("entity"));
-        ir.nouns.insert("Teacher".to_string(), NounDef {
-            object_type: "entity".to_string(), enum_values: None,
-            super_type: Some("Academic".to_string()),
-            world_assumption: WorldAssumption::default(), ref_scheme: None, objectifies: None,
-        });
+        ir.nouns.insert("Teacher".to_string(), make_noun("entity"));
+        ir.subtypes.insert("Teacher".to_string(), "Academic".to_string());
         ir.nouns.insert("Rank".to_string(), make_noun("value"));
         ir.fact_types.insert("ft1".to_string(), FactTypeDef {
             schema_id: String::new(),
@@ -1173,20 +1161,9 @@ mod tests {
     #[test]
     fn test_forbidden_text_detected() {
         let mut ir = empty_ir();
-        ir.nouns.insert("ProhibitedText".to_string(), NounDef {
-            object_type: "value".to_string(),
-            enum_values: Some(vec!["—".to_string(), "–".to_string()]),
-            super_type: None,
-            world_assumption: WorldAssumption::default(),
-            ref_scheme: None, objectifies: None,
-        });
-        ir.nouns.insert("SupportResponse".to_string(), NounDef {
-            object_type: "entity".to_string(),
-            enum_values: None,
-            super_type: None,
-            world_assumption: WorldAssumption::default(),
-            ref_scheme: None, objectifies: None,
-        });
+        ir.nouns.insert("ProhibitedText".to_string(), make_noun("value"));
+        ir.enum_values.insert("ProhibitedText".to_string(), vec!["—".to_string(), "–".to_string()]);
+        ir.nouns.insert("SupportResponse".to_string(), make_noun("entity"));
         ir.fact_types.insert("ft1".to_string(), FactTypeDef {
             schema_id: String::new(),
             reading: "SupportResponse contains ProhibitedText".to_string(),
@@ -1226,20 +1203,9 @@ mod tests {
     #[test]
     fn test_forbidden_text_clean() {
         let mut ir = empty_ir();
-        ir.nouns.insert("ProhibitedText".to_string(), NounDef {
-            object_type: "value".to_string(),
-            enum_values: Some(vec!["—".to_string()]),
-            super_type: None,
-            world_assumption: WorldAssumption::default(),
-            ref_scheme: None, objectifies: None,
-        });
-        ir.nouns.insert("SupportResponse".to_string(), NounDef {
-            object_type: "entity".to_string(),
-            enum_values: None,
-            super_type: None,
-            world_assumption: WorldAssumption::default(),
-            ref_scheme: None, objectifies: None,
-        });
+        ir.nouns.insert("ProhibitedText".to_string(), make_noun("value"));
+        ir.enum_values.insert("ProhibitedText".to_string(), vec!["—".to_string()]);
+        ir.nouns.insert("SupportResponse".to_string(), make_noun("entity"));
         ir.fact_types.insert("ft1".to_string(), FactTypeDef {
             schema_id: String::new(),
             reading: "SupportResponse contains ProhibitedText".to_string(),
@@ -1528,13 +1494,7 @@ mod tests {
     #[test]
     fn test_mandatory_violation() {
         let mut ir = empty_ir();
-        ir.nouns.insert("Customer".to_string(), NounDef {
-            object_type: "entity".to_string(),
-            enum_values: None,
-            super_type: None,
-            world_assumption: WorldAssumption::default(),
-            ref_scheme: None, objectifies: None,
-        });
+        ir.nouns.insert("Customer".to_string(), make_noun("entity"));
         ir.fact_types.insert("ft1".to_string(), FactTypeDef {
             schema_id: String::new(),
             reading: "Customer has Name".to_string(),
@@ -1636,20 +1596,9 @@ mod tests {
     #[test]
     fn test_obligatory_missing_enum_value() {
         let mut ir = empty_ir();
-        ir.nouns.insert("SenderIdentityValue".to_string(), NounDef {
-            object_type: "value".to_string(),
-            enum_values: Some(vec!["Support Team <support@example.com>".to_string()]),
-            super_type: None,
-            world_assumption: WorldAssumption::default(),
-            ref_scheme: None, objectifies: None,
-        });
-        ir.nouns.insert("SupportResponse".to_string(), NounDef {
-            object_type: "entity".to_string(),
-            enum_values: None,
-            super_type: None,
-            world_assumption: WorldAssumption::default(),
-            ref_scheme: None, objectifies: None,
-        });
+        ir.nouns.insert("SenderIdentityValue".to_string(), make_noun("value"));
+        ir.enum_values.insert("SenderIdentityValue".to_string(), vec!["Support Team <support@example.com>".to_string()]);
+        ir.nouns.insert("SupportResponse".to_string(), make_noun("entity"));
         ir.fact_types.insert("ft1".to_string(), FactTypeDef {
             schema_id: String::new(),
             reading: "SupportResponse has SenderIdentityValue".to_string(),
@@ -1720,25 +1669,10 @@ mod tests {
     #[test]
     fn test_no_duplicate_violations_for_multi_span_constraints() {
         let mut ir = empty_ir();
-        ir.nouns.insert("FieldName".to_string(), NounDef {
-            object_type: "value".to_string(),
-            enum_values: Some(vec!["EndpointSlug".to_string(), "Title".to_string()]),
-            super_type: None,
-            world_assumption: WorldAssumption::default(),
-            ref_scheme: None, objectifies: None,
-        });
-        ir.nouns.insert("SupportResponse".to_string(), NounDef {
-            object_type: "entity".to_string(),
-            enum_values: None, super_type: None,
-            world_assumption: WorldAssumption::default(),
-            ref_scheme: None, objectifies: None,
-        });
-        ir.nouns.insert("APIProduct".to_string(), NounDef {
-            object_type: "entity".to_string(),
-            enum_values: None, super_type: None,
-            world_assumption: WorldAssumption::default(),
-            ref_scheme: None, objectifies: None,
-        });
+        ir.nouns.insert("FieldName".to_string(), make_noun("value"));
+        ir.enum_values.insert("FieldName".to_string(), vec!["EndpointSlug".to_string(), "Title".to_string()]);
+        ir.nouns.insert("SupportResponse".to_string(), make_noun("entity"));
+        ir.nouns.insert("APIProduct".to_string(), make_noun("entity"));
         // Three fact types that all reference FieldName — simulates multi-span constraint
         for i in 1..=3 {
             ir.fact_types.insert(format!("ft{}", i), FactTypeDef {
@@ -1841,13 +1775,8 @@ mod tests {
 
         // Vehicle is a supertype, Car is a subtype of Vehicle
         ir.nouns.insert("Vehicle".to_string(), make_noun("entity"));
-        ir.nouns.insert("Car".to_string(), NounDef {
-            object_type: "entity".to_string(),
-            enum_values: None,
-            super_type: Some("Vehicle".to_string()),
-            world_assumption: WorldAssumption::default(),
-            ref_scheme: None, objectifies: None,
-        });
+        ir.nouns.insert("Car".to_string(), make_noun("entity"));
+        ir.subtypes.insert("Car".to_string(), "Vehicle".to_string());
         ir.nouns.insert("License".to_string(), make_noun("entity"));
 
         // Fact type: Vehicle has License
@@ -1968,18 +1897,12 @@ mod tests {
         // CWA noun: Permission (not stated = false)
         ir.nouns.insert("Permission".to_string(), NounDef {
             object_type: "entity".to_string(),
-            enum_values: None,
-            super_type: None,
             world_assumption: WorldAssumption::Closed,
-            ref_scheme: None, objectifies: None,
         });
         // OWA noun: Capability (not stated = unknown)
         ir.nouns.insert("Capability".to_string(), NounDef {
             object_type: "entity".to_string(),
-            enum_values: None,
-            super_type: None,
             world_assumption: WorldAssumption::Open,
-            ref_scheme: None, objectifies: None,
         });
 
         ir.nouns.insert("Resource".to_string(), make_noun("entity"));
@@ -2050,10 +1973,7 @@ mod tests {
 
         ir.nouns.insert("Customer".to_string(), NounDef {
             object_type: "entity".to_string(),
-            enum_values: None,
-            super_type: None,
             world_assumption: WorldAssumption::Closed,
-            ref_scheme: None, objectifies: None,
         });
         ir.nouns.insert("Name".to_string(), make_noun("value"));
         ir.nouns.insert("Email".to_string(), make_noun("value"));
@@ -2312,6 +2232,9 @@ mod tests {
                 consequent_bindings: vec!["A".to_string(), "B".to_string()],
             }],
             general_instance_facts: vec![],
+            subtypes: HashMap::new(), enum_values: HashMap::new(),
+            ref_schemes: HashMap::new(), objectifications: HashMap::new(),
+            named_spans: HashMap::new(), autofill_spans: vec![],
         };
 
         let compiled = crate::compile::compile(&ir);
@@ -2397,6 +2320,9 @@ mod tests {
                 consequent_bindings: vec!["Y".to_string(), "X".to_string()],
             }],
             general_instance_facts: vec![],
+            subtypes: HashMap::new(), enum_values: HashMap::new(),
+            ref_schemes: HashMap::new(), objectifications: HashMap::new(),
+            named_spans: HashMap::new(), autofill_spans: vec![],
         };
 
         let compiled = crate::compile::compile(&ir);
@@ -2473,6 +2399,9 @@ mod tests {
                 consequent_bindings: vec!["B".to_string(), "A".to_string()],
             }],
             general_instance_facts: vec![],
+            subtypes: HashMap::new(), enum_values: HashMap::new(),
+            ref_schemes: HashMap::new(), objectifications: HashMap::new(),
+            named_spans: HashMap::new(), autofill_spans: vec![],
         };
 
         let compiled = crate::compile::compile(&ir);
@@ -2545,6 +2474,9 @@ mod tests {
                 consequent_bindings: vec!["A".to_string(), "B".to_string()],
             }],
             general_instance_facts: vec![],
+            subtypes: HashMap::new(), enum_values: HashMap::new(),
+            ref_schemes: HashMap::new(), objectifications: HashMap::new(),
+            named_spans: HashMap::new(), autofill_spans: vec![],
         };
 
         let compiled = crate::compile::compile(&ir);

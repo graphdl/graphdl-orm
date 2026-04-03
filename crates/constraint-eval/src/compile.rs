@@ -156,14 +156,10 @@ fn collect_enum_values(ir: &ConstraintIR, spans: &[SpanDef]) -> Vec<(String, Vec
         if let Some(ft) = ir.fact_types.get(&span.fact_type_id) {
             for role in &ft.roles {
                 if seen.contains(&role.noun_name) { continue; }
-                if let Some(noun_def) = ir.nouns.get(&role.noun_name) {
-                    if noun_def.object_type == "value" {
-                        if let Some(vals) = &noun_def.enum_values {
-                            if !vals.is_empty() {
-                                seen.insert(role.noun_name.clone());
-                                result.push((role.noun_name.clone(), vals.clone()));
-                            }
-                        }
+                if let Some(vals) = ir.enum_values.get(&role.noun_name) {
+                    if !vals.is_empty() {
+                        seen.insert(role.noun_name.clone());
+                        result.push((role.noun_name.clone(), vals.clone()));
                     }
                 }
             }
@@ -219,14 +215,11 @@ fn build_noun_index(
         .map(|(name, def)| (name.clone(), def.world_assumption.clone()))
         .collect();
 
-    // noun_name -> supertype
-    let mut supertypes: HashMap<String, String> = HashMap::new();
+    // noun_name -> supertype (from IR maps)
+    let supertypes: HashMap<String, String> = ir.subtypes.clone();
     let mut subtypes: HashMap<String, Vec<String>> = HashMap::new();
-    for (name, def) in &ir.nouns {
-        if let Some(ref st) = def.super_type {
-            supertypes.insert(name.clone(), st.clone());
-            subtypes.entry(st.clone()).or_default().push(name.clone());
-        }
+    for (child, parent) in &ir.subtypes {
+        subtypes.entry(parent.clone()).or_default().push(child.clone());
     }
 
     // fact_type_id -> list of constraint IDs spanning it
@@ -345,8 +338,8 @@ fn compile_explicit_derivation(ir: &ConstraintIR, rule: &DerivationRuleDef) -> C
 fn compile_subtype_inheritance(ir: &ConstraintIR) -> Vec<CompiledDerivation> {
     let mut derivations = Vec::new();
 
-    for (sub_name, noun_def) in &ir.nouns {
-        if let Some(ref super_name) = noun_def.super_type {
+    for (sub_name, super_name) in &ir.subtypes {
+        {
             // Find all fact types where the supertype plays a role
             let super_fact_types: Vec<(String, String, usize)> = ir.fact_types.iter()
                 .flat_map(|(ft_id, ft)| {
