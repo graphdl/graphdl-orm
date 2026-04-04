@@ -975,17 +975,69 @@ fn constraint_evaluation_via_application() {
         .expect("Obligatory placed-by constraint");
 
     // Obligatory constraints check that the response text contains required content.
-    // Verify that constraint functions are callable via pure application.
-    // The evaluation context is <response_text, sender_identity, population>.
+    // Per the paper equation (3): V = union of (rho c):P for all c in C_S.
+    // Every constraint is applied to the population. The response text is a
+    // fact in P (Support Response has Body), not a special evaluation mode.
+    //
+    // Alethic constraints (UC, MC) evaluate against P.
+    // Deontic text constraints (forbidden enum values) evaluate against response text in P.
+    // Both are applications of constraint functions to P.
+
+    // Find a UC constraint and verify it's callable against a population object
+    let (_, uc_func) = defs.iter()
+        .find(|(name, _)| name.contains("constraint:") && name.contains("UC"))
+        .expect("Should have a UC constraint");
+
+    // The eval context is <response_text, sender, population>.
+    // For population constraints, the response text is irrelevant.
     let context = Object::seq(vec![
-        Object::atom("Some response text"),
+        Object::phi(),
         Object::phi(),
         Object::phi(),
     ]);
-    let result = ast::apply(constraint_func, &context, &def_map);
-    // The function produces either phi (no violation) or a violation object.
-    // Both are valid applications. The constraint is a Func, evaluation is application.
-    let _ = result;
+    let result = ast::apply(uc_func, &context, &def_map);
+    // UC against empty population: no facts = no violations for UC
+    assert_eq!(result, Object::phi(),
+        "UC constraint against empty population should produce no violations");
+
+    // Now test with a population that has a UC violation.
+    // "Each Order was placed by exactly one Customer" means
+    // an Order with two different Customers should violate.
+    let pop_with_violation = ast::encode_population(&Population {
+        facts: {
+            let mut f = HashMap::new();
+            f.insert("Order_was_placed_by_Customer".to_string(), vec![
+                FactInstance {
+                    fact_type_id: "Order_was_placed_by_Customer".to_string(),
+                    bindings: vec![
+                        ("Order".to_string(), "ord-1".to_string()),
+                        ("Customer".to_string(), "Acme".to_string()),
+                    ],
+                },
+                FactInstance {
+                    fact_type_id: "Order_was_placed_by_Customer".to_string(),
+                    bindings: vec![
+                        ("Order".to_string(), "ord-1".to_string()),
+                        ("Customer".to_string(), "Globex".to_string()),
+                    ],
+                },
+            ]);
+            f
+        },
+    });
+    let context_with_violation = Object::seq(vec![
+        Object::phi(),
+        Object::phi(),
+        pop_with_violation,
+    ]);
+
+    // Find the UC on "placed by" specifically
+    let (_, placed_by_uc) = defs.iter()
+        .find(|(name, _)| name.contains("constraint:UC") && name.contains("placed by"))
+        .expect("UC on placed by");
+    let violation_result = ast::apply(placed_by_uc, &context_with_violation, &def_map);
+    assert_ne!(violation_result, Object::phi(),
+        "UC violation: Order ord-1 placed by two Customers should violate");
 }
 
 // ── Forward Chaining via Pure Application ────────────────────────────
