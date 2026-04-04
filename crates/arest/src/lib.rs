@@ -157,38 +157,31 @@ impl exports::graphdl::arest::engine::Guest for E {
     fn get_deontic_constraints(handle: u32, noun: String) -> Vec<exports::graphdl::arest::engine::DeonticConstraint> {
         let s = ds().lock().unwrap();
         let st = match s.get(handle as usize).and_then(|x| x.as_ref()) { Some(x) => x, None => return vec![] };
+        // Query Constraint facts from Population for deontic constraints on this noun
+        let d = st.domain();
         let mut out = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        if let Some(fts) = st.model.noun_index.noun_to_fact_types.get(&noun) {
-            for (ft_id, _) in fts {
-                if let Some(cids) = st.model.noun_index.fact_type_to_constraints.get(ft_id) {
-                    for cid in cids {
-                        if !seen.insert(cid.clone()) { continue; }
-                        if let Some(&idx) = st.model.noun_index.constraint_index.get(cid) {
-                            if let Some(cc) = st.model.constraints.get(idx) {
-                                let (ok, op) = match &cc.modality {
-                                    compile::Modality::Deontic(compile::DeonticOp::Forbidden) => (true, "forbidden"),
-                                    compile::Modality::Deontic(compile::DeonticOp::Obligatory) => (true, "obligatory"),
-                                    compile::Modality::Deontic(compile::DeonticOp::Permitted) => (true, "permitted"),
-                                    _ => (false, ""),
-                                };
-                                if !ok { continue; }
-                                let d = st.domain();
-                                let cd = d.constraints.iter().find(|c| c.id == *cid);
-                                let ev: Vec<String> = cd.map(|c| compile::collect_enum_values_pub(&d, &c.spans).into_iter().flat_map(|(_, v)| v).collect()).unwrap_or_default();
-                                let wa = if ev.is_empty() { graphdl::arest::types::WorldAssumption::Open } else { graphdl::arest::types::WorldAssumption::Closed };
-                                out.push(exports::graphdl::arest::engine::DeonticConstraint {
-                                    id: cid.clone(), text: cc.text.clone(),
-                                    entity: cd.and_then(|c| c.entity.clone()),
-                                    operator: op.to_string(), enum_values: ev,
-                                    fact_type_id: cd.and_then(|c| c.spans.first().map(|s| s.fact_type_id.clone())),
-                                    assumption: wa,
-                                });
-                            }
-                        }
-                    }
-                }
+        for c in &d.constraints {
+            if c.modality != "deontic" { continue; }
+            // Check if constraint's entity matches the requested noun
+            let entity = c.entity.as_deref().unwrap_or("");
+            if !entity.is_empty() && entity != noun { continue; }
+            // Check if any span references a fact type involving this noun
+            if entity.is_empty() {
+                let involves_noun = c.spans.iter().any(|s| {
+                    d.fact_types.get(&s.fact_type_id).map_or(false, |ft| ft.roles.iter().any(|r| r.noun_name == noun))
+                });
+                if !involves_noun { continue; }
             }
+            let ev: Vec<String> = compile::collect_enum_values_pub(&d, &c.spans).into_iter().flat_map(|(_, v)| v).collect();
+            let wa = if ev.is_empty() { graphdl::arest::types::WorldAssumption::Open } else { graphdl::arest::types::WorldAssumption::Closed };
+            out.push(exports::graphdl::arest::engine::DeonticConstraint {
+                id: c.id.clone(), text: c.text.clone(),
+                entity: c.entity.clone(),
+                operator: c.deontic_operator.clone().unwrap_or_default(),
+                enum_values: ev,
+                fact_type_id: c.spans.first().map(|s| s.fact_type_id.clone()),
+                assumption: wa,
+            });
         }
         out
     }
@@ -199,15 +192,18 @@ impl exports::graphdl::arest::engine::Guest for E {
         let st = match s.get(handle as usize).and_then(|x| x.as_ref()) { Some(x) => x, None => return none };
         let p = ipop(&pop);
         let ctx = ast::encode_eval_context(&text, sender.as_deref(), &p);
-        let defs = HashMap::new();
-        let idx = match st.model.noun_index.constraint_index.get(&cid) { Some(&i) => i, None => return none };
-        let cc = match st.model.constraints.get(idx) { Some(c) => c, None => return none };
-        let result = ast::apply(&cc.func, &ctx, &defs);
+        let def_map: HashMap<String, ast::Func> = st.defs.iter().map(|(n, f)| (n.clone(), f.clone())).collect();
+        let constraint_key = format!("constraint:{}", cid);
+        let func = match st.def(&constraint_key) { Some(f) => f, None => return none };
+        let result = ast::apply(func, &ctx, &def_map);
         let vv = ast::decode_violations(&result);
         if vv.is_empty() { none } else { exports::graphdl::arest::engine::ConstraintResult { violated: true, violation: Some(ovio(&vv[0])) } }
     }
 
     fn forward_chain(handle: u32, pop: exports::graphdl::arest::engine::Population) -> Vec<exports::graphdl::arest::engine::DerivedFact> {
+        // Forward chaining requires iteration to fixed point.
+        // Keep using CompiledModel for now. The derivation funcs in defs
+        // are individual rules. The fixed-point loop is a system-level concern.
         let s = ds().lock().unwrap();
         let st = match s.get(handle as usize).and_then(|x| x.as_ref()) { Some(x) => x, None => return vec![] };
         let mut p = ipop(&pop);
