@@ -265,6 +265,26 @@ impl exports::graphdl::arest::engine::Guest for E {
         serde_json::to_string(&evaluate::prove(&d, &ipop(&pop), &goal, &w)).unwrap_or_else(|_| "{}".into())
     }
 
+    fn rho(handle: u32, fact_type: String, fact_bindings: Vec<exports::graphdl::arest::engine::Binding>, operation: String) -> String {
+        let s = ds().lock().unwrap();
+        let st = match s.get(handle as usize).and_then(|x| x.as_ref()) { Some(x) => x, None => return "{}".into() };
+        let def_map: HashMap<String, ast::Func> = st.defs.iter().map(|(n, f)| (n.clone(), f.clone())).collect();
+        // Build the fact as an Object: <fact_type, binding1, binding2, ...>
+        let mut elements = vec![ast::Object::atom(&fact_type)];
+        for b in &fact_bindings {
+            elements.push(ast::Object::seq(vec![ast::Object::atom(&b.noun), ast::Object::atom(&b.value)]));
+        }
+        let fact = ast::Object::Seq(elements);
+        let op = ast::Object::atom(&operation);
+        // ρ(fact) → Func, then apply(Func, operation)
+        let func = ast::metacompose(&fact, &def_map);
+        let result = ast::apply(&func, &op, &def_map);
+        match result.as_atom() {
+            Some(s) => s.to_string(),
+            None => serde_json::to_string(&format!("{:?}", result)).unwrap_or_else(|_| "{}".into()),
+        }
+    }
+
     fn rmap(handle: u32) -> String {
         let s = ds().lock().unwrap();
         let st = match s.get(handle as usize).and_then(|x| x.as_ref()) { Some(x) => x, None => return "[]".into() };

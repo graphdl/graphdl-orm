@@ -1276,3 +1276,59 @@ fn schema_is_cons_of_roles() {
     // The schema is a CONS (Construction) function
     assert!(schema.0.starts_with("schema:"), "Schema should be a named definition");
 }
+
+// ── ρ (Representation Function) ──────────────────────────────────────
+// Per Backus 13.3.2: (ρ<x1,...,xn>):y = (ρx1):<<x1,...,xn>, y>
+// A fact receives an operation and applies it via ρ.
+
+#[test]
+fn rho_resolves_fact_type_and_applies_operation() {
+    use arest::ast::{self, Func, Object};
+
+    // metacompose resolves an object to a Func via the representation function.
+    // For an atom, it looks up DEFS.
+    // For a sequence, the first element is the controlling operator.
+
+    let mut defs = HashMap::new();
+
+    // Define a handler: when applied to any argument, returns "handled"
+    defs.insert("Customer_has_Email".to_string(), Func::constant(Object::atom("handled")));
+
+    // An atom resolves to its definition
+    let func = ast::metacompose(&Object::atom("Customer_has_Email"), &defs);
+    let result = ast::apply(&func, &Object::atom("read"), &defs);
+    assert_eq!(result.as_atom(), Some("handled"),
+        "metacompose should resolve atom to its definition in DEFS");
+
+    // A fact (sequence) uses the first element as the controlling operator.
+    // Per Backus 13.3.2: (ρ<COMP, f, g>):x = (f∘g):x
+    // We test with CONS: (ρ<CONS, s1, s2>):x = [s1, s2]:x = <s1:x, s2:x>
+    let cons_obj = Object::seq(vec![
+        Object::atom("CONS"),
+        Object::atom("1"),  // selector 1
+        Object::atom("2"),  // selector 2
+    ]);
+    let cons_func = ast::metacompose(&cons_obj, &defs);
+    let input = Object::seq(vec![Object::atom("A"), Object::atom("B"), Object::atom("C")]);
+    let result = ast::apply(&cons_func, &input, &defs);
+    // [s1, s2]:<A, B, C> = <s1:<A,B,C>, s2:<A,B,C>> = <A, B>
+    if let Some(elements) = result.as_seq() {
+        assert_eq!(elements[0].as_atom(), Some("A"));
+        assert_eq!(elements[1].as_atom(), Some("B"));
+    } else {
+        panic!("CONS metacomposition should produce a sequence");
+    }
+}
+
+#[test]
+fn rho_returns_bottom_for_unknown_fact_type() {
+    use arest::ast::{self, Object};
+
+    let defs = HashMap::new();
+    let fact = Object::seq(vec![Object::atom("unknown_type"), Object::atom("value")]);
+    let result = {
+        let func = ast::metacompose(&fact, &defs);
+        ast::apply(&func, &Object::atom("read"), &defs)
+    };
+    assert_eq!(result, Object::Bottom, "ρ should return ⊥ for unknown fact types");
+}
