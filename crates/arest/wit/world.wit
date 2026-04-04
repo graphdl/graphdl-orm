@@ -1,0 +1,143 @@
+/// AREST: Applicative REpresentational State Transfer
+///
+/// The system function: SYSTEM:x = <o, D'>
+/// REST endpoints are applications of SYSTEM with distinct inputs.
+/// Ingesting new readings is self-modification.
+
+package graphdl:arest@0.1.0;
+
+/// A fact is a sequence <ft, o1, ..., on> where ft is the fact type
+/// and o1..on are the objects playing its roles.
+interface types {
+    /// A role binding: noun name and its value.
+    record binding {
+        noun: string,
+        value: string,
+    }
+
+    /// A fact instance in the population.
+    record fact {
+        fact-type-id: string,
+        bindings: list<binding>,
+    }
+
+    /// The population P: a named set of relations (Codd's named set).
+    record population {
+        facts: list<fact>,
+    }
+
+    /// A constraint violation. The message is the original reading
+    /// (Corollary: Violation Verbalization).
+    record violation {
+        constraint-id: string,
+        constraint-text: string,
+        detail: string,
+        alethic: bool,
+    }
+
+    /// A derived fact produced by forward chaining.
+    record derived-fact {
+        fact-type-id: string,
+        reading: string,
+        bindings: list<binding>,
+        derived-by: string,
+    }
+
+    /// A transition in a state machine.
+    record transition {
+        from-status: string,
+        to-status: string,
+        event: string,
+    }
+
+    /// Result of applying a command: <o, D'>
+    record command-result {
+        entity-id: string,
+        status: option<string>,
+        violations: list<violation>,
+        derived-facts: list<derived-fact>,
+        available-transitions: list<transition>,
+    }
+
+    /// A deontic constraint with its evaluation metadata.
+    enum world-assumption {
+        /// Absence = definitively false. Exhaustive enumeration.
+        closed,
+        /// Absence = unknown. Runtime function with incomplete coverage.
+        open,
+    }
+
+    record deontic-constraint {
+        id: string,
+        text: string,
+        entity: option<string>,
+        operator: string,
+        enum-values: list<string>,
+        fact-type-id: option<string>,
+        assumption: world-assumption,
+    }
+
+    /// Single constraint evaluation result.
+    record constraint-result {
+        violated: bool,
+        violation: option<violation>,
+    }
+}
+
+/// The AREST engine. One system function. Everything else is an application of it.
+interface engine {
+    use types.{population, violation, derived-fact, transition, command-result, deontic-constraint, constraint-result, binding, world-assumption};
+
+    /// parse: R -> Phi (Theorem 2).
+    /// Parse FORML 2 markdown and compile directly into DEFS.
+    /// Returns a domain handle.
+    parse-and-compile: func(readings: list<tuple<string, string>>) -> result<u32, string>;
+
+    /// Release a compiled domain handle.
+    release: func(handle: u32);
+
+    /// SYSTEM:x = <o, D'>
+    /// Apply a command to the population. One function application. One state transfer.
+    apply-command: func(handle: u32, noun: string, id: string, operation: string, fields: list<binding>, population: population) -> result<command-result, string>;
+
+    /// sm.func : <status, event> -> status'
+    /// Run a state machine by folding events through the transition function.
+    run-machine: func(handle: u32, noun: string, events: list<string>) -> result<string, string>;
+
+    /// Get valid transitions from a status.
+    get-transitions: func(handle: u32, noun: string, status: string) -> list<transition>;
+
+    /// Filter(p) : P
+    /// Evaluate all constraints over a response and population.
+    evaluate-response: func(handle: u32, text: string, sender-identity: option<string>, population: population) -> list<violation>;
+
+    /// Get deontic constraints for a noun, classified by world assumption.
+    get-deontic-constraints: func(handle: u32, noun: string) -> list<deontic-constraint>;
+
+    /// Evaluate a single constraint by ID.
+    evaluate-constraint: func(handle: u32, constraint-id: string, text: string, sender-identity: option<string>, population: population) -> constraint-result;
+
+    /// Forward chain derivation rules to fixed point.
+    forward-chain: func(handle: u32, population: population) -> list<derived-fact>;
+
+    /// Query a population by partial application of a graph schema.
+    /// Returns matching entity references for the target noun.
+    query: func(handle: u32, fact-type-id: string, target-noun: string, filter: list<binding>, population: population) -> list<string>;
+
+    /// Induce constraints from a population (inverse of evaluation).
+    /// Returns discovered constraints as JSON (pending proper WIT types).
+    induce: func(handle: u32, population: population) -> string;
+
+    /// Synthesize all knowledge about a noun from the compiled model.
+    synthesize: func(handle: u32, noun: string, depth: u32) -> string;
+
+    /// Prove a goal fact via backward chaining.
+    prove: func(handle: u32, goal: string, population: population, world-assumption: world-assumption) -> string;
+
+    /// RMAP: schema -> table definitions.
+    rmap: func(handle: u32) -> string;
+}
+
+world arest {
+    export engine;
+}

@@ -252,7 +252,7 @@ fn apply_update_entity(
     merged_fields.insert("domain".to_string(), domain.to_string());
 
     // Extract existing fields for this entity from population
-    for (ft_id, instances) in &population.facts {
+    for (_ft_id, instances) in &population.facts {
         for inst in instances {
             if inst.bindings.len() >= 2 && inst.bindings[0].1 == entity_id {
                 let field_name = &inst.bindings[1].0;

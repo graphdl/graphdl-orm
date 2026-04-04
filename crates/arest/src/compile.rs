@@ -313,6 +313,10 @@ fn resolve_spans(ir: &ConstraintIR, spans: &[SpanDef]) -> Vec<ResolvedSpan> {
 
 /// Collect (noun_name, enum_values) for value-type nouns in spanned fact types.
 /// Deduplicates by noun name — each noun's enum values appear at most once.
+pub fn collect_enum_values_pub(ir: &ConstraintIR, spans: &[SpanDef]) -> Vec<(String, Vec<String>)> {
+    collect_enum_values(ir, spans)
+}
+
 fn collect_enum_values(ir: &ConstraintIR, spans: &[SpanDef]) -> Vec<(String, Vec<String>)> {
     let mut seen = HashSet::new();
     let mut result = Vec::new();
@@ -332,6 +336,86 @@ fn collect_enum_values(ir: &ConstraintIR, spans: &[SpanDef]) -> Vec<(String, Vec
     result
 }
 
+/// Derive state machines from instance facts in P.
+/// Queries the population for metamodel fact types.
+fn derive_state_machines_from_facts(facts: &[GeneralInstanceFact]) -> HashMap<String, StateMachineDef> {
+    let mut machines: HashMap<String, StateMachineDef> = HashMap::new();
+
+    // Pass 1: State Machine Definition 'X' is for Noun 'Y'
+    // Field name is the graph schema ID from the declared fact type.
+    for f in facts {
+        if f.subject_noun == "State Machine Definition" && f.object_noun == "Noun" {
+            machines.entry(f.subject_value.clone()).or_insert(StateMachineDef {
+                noun_name: f.object_value.clone(),
+                statuses: vec![],
+                transitions: vec![],
+            });
+        }
+    }
+
+    // Pass 2: Status 'S' is initial in State Machine Definition 'X'
+    for f in facts {
+        if f.subject_noun == "Status" && f.object_noun == "State Machine Definition" {
+            if let Some(sm) = machines.get_mut(&f.object_value) {
+                if !sm.statuses.contains(&f.subject_value) {
+                    sm.statuses.insert(0, f.subject_value.clone());
+                }
+            }
+        }
+    }
+
+    // Pass 3: Build transition lookup from instance facts.
+    // Match on object noun type, not field name strings.
+    let mut t_from: HashMap<String, String> = HashMap::new();
+    let mut t_to: HashMap<String, String> = HashMap::new();
+    let mut t_sm: HashMap<String, String> = HashMap::new();
+    let mut t_event: HashMap<String, String> = HashMap::new();
+
+    for f in facts {
+        if f.subject_noun == "Transition" {
+            if f.object_noun == "Status" {
+                // Distinguish "is from" vs "is to" by the field name (graph schema ID)
+                let field_lower = f.field_name.to_lowercase();
+                if field_lower.contains("from") {
+                    t_from.insert(f.subject_value.clone(), f.object_value.clone());
+                } else if field_lower.contains("to") {
+                    t_to.insert(f.subject_value.clone(), f.object_value.clone());
+                }
+            } else if f.object_noun == "State Machine Definition" {
+                t_sm.insert(f.subject_value.clone(), f.object_value.clone());
+            } else if f.object_noun == "Event Type" {
+                t_event.insert(f.subject_value.clone(), f.object_value.clone());
+            }
+        }
+    }
+
+    // Assemble transitions
+    let all_transitions: HashSet<&String> = t_from.keys().chain(t_to.keys()).collect();
+    for t_name in all_transitions {
+        let from = match t_from.get(t_name) { Some(s) => s.clone(), None => continue };
+        let to = match t_to.get(t_name) { Some(s) => s.clone(), None => continue };
+        let event = t_event.get(t_name).cloned().unwrap_or_else(|| t_name.clone());
+
+        // Find which SM this transition belongs to
+        let target_key = if let Some(name) = t_sm.get(t_name) {
+            Some(name.clone())
+        } else {
+            machines.iter()
+                .find(|(_, sm)| sm.statuses.contains(&from) || sm.statuses.contains(&to))
+                .map(|(k, _)| k.clone())
+                .or_else(|| machines.keys().next().cloned())
+        };
+
+        if let Some(sm) = target_key.and_then(|k| machines.get_mut(&k)) {
+            if !sm.statuses.contains(&from) { sm.statuses.push(from.clone()); }
+            if !sm.statuses.contains(&to) { sm.statuses.push(to.clone()); }
+            sm.transitions.push(TransitionDef { from, to, event, guard: None });
+        }
+    }
+
+    machines
+}
+
 // ── Compilation ────────────────────────────────────────────────────
 // The match on kind happens here, once. After this, everything is Func.
 
@@ -341,7 +425,19 @@ pub fn compile(ir: &ConstraintIR) -> CompiledModel {
         .map(|def| compile_constraint(ir, def))
         .collect();
 
-    let state_machines: Vec<CompiledStateMachine> = ir.state_machines.values()
+    // Derive state machines from instance facts in P.
+    // Query the population for metamodel fact types:
+    //   State Machine Definition 'X' is for Noun 'Y'
+    //   Status 'S' is initial in State Machine Definition 'X'
+    //   Transition 'T' is from Status 'A'
+    //   Transition 'T' is to Status 'B'
+    //   Transition 'T' is triggered by Event Type 'E'
+    //   Transition 'T' is defined in State Machine Definition 'X'
+    let sm_defs = derive_state_machines_from_facts(&ir.general_instance_facts);
+    // Fall back to ir.state_machines if instance facts produced nothing
+    // (supports old-style readings that were parsed before this change).
+    let sm_source = if sm_defs.is_empty() { &ir.state_machines } else { &sm_defs };
+    let state_machines: Vec<CompiledStateMachine> = sm_source.values()
         .map(|sm_def| compile_state_machine(sm_def, &constraints))
         .collect();
 
@@ -1322,8 +1418,8 @@ fn compile_sm_initialization(ir: &ConstraintIR) -> Vec<CompiledDerivation> {
 }
 
 fn compile_constraint(ir: &ConstraintIR, def: &ConstraintDef) -> CompiledConstraint {
-    let modality = match def.modality.as_str() {
-        "Deontic" => {
+    let modality = match def.modality.to_lowercase().as_str() {
+        "deontic" => {
             let op = match def.deontic_operator.as_deref() {
                 Some("forbidden") => DeonticOp::Forbidden,
                 Some("obligatory") => DeonticOp::Obligatory,
@@ -2332,19 +2428,28 @@ fn compile_forbidden_ast(ir: &ConstraintIR, def: &ConstraintDef) -> Func {
     let entity_scope = def.entity.clone();
     let text_keywords = extract_constraint_keywords(&text);
 
+    // Deontic response constraints (entity = "Support Response" etc.) always apply
+    // to the response being evaluated. Entity scoping only applies when the constraint
+    // is about a domain entity that may or may not be referenced in the text.
+    let is_response_constraint = def.entity.as_ref()
+        .map_or(false, |e| e.to_lowercase().contains("response"));
+
     Func::Native(Arc::new(move |ctx: &Object| {
         let defs = HashMap::new();
         let response_text = crate::ast::apply(&Func::Selector(1), ctx, &defs);
         let response_str = response_text.as_atom().unwrap_or("").to_string();
         let lower_text = response_str.to_lowercase();
 
-        // Entity scoping: only evaluate when the response references the scoped entity
-        if let Some(ref entity) = entity_scope {
-            let entity_lower = entity.to_lowercase();
-            let entity_compact: String = entity.chars().filter(|c| !c.is_whitespace()).collect();
-            let entity_compact_lower = entity_compact.to_lowercase();
-            if !lower_text.contains(&entity_lower) && !lower_text.contains(&entity_compact_lower) {
-                return Object::phi();
+        // Entity scoping: skip for response constraints (they always apply).
+        // For other constraints, only evaluate when the response references the entity.
+        if !is_response_constraint {
+            if let Some(ref entity) = entity_scope {
+                let entity_lower = entity.to_lowercase();
+                let entity_compact: String = entity.chars().filter(|c| !c.is_whitespace()).collect();
+                let entity_compact_lower = entity_compact.to_lowercase();
+                if !lower_text.contains(&entity_lower) && !lower_text.contains(&entity_compact_lower) {
+                    return Object::phi();
+                }
             }
         }
 
@@ -2414,19 +2519,24 @@ fn compile_obligatory_ast(ir: &ConstraintIR, def: &ConstraintDef) -> Func {
         Vec::new()
     };
 
+    let is_response_constraint = def.entity.as_ref()
+        .map_or(false, |e| e.to_lowercase().contains("response"));
+
     Func::Native(Arc::new(move |ctx: &Object| {
         let defs = HashMap::new();
         let response_text = crate::ast::apply(&Func::Selector(1), ctx, &defs);
         let response_str = response_text.as_atom().unwrap_or("").to_string();
         let lower_text = response_str.to_lowercase();
 
-        // Entity scoping
-        if let Some(ref entity) = entity_scope {
-            let entity_lower = entity.to_lowercase();
-            let entity_compact: String = entity.chars().filter(|c| !c.is_whitespace()).collect();
-            let entity_compact_lower = entity_compact.to_lowercase();
-            if !lower_text.contains(&entity_lower) && !lower_text.contains(&entity_compact_lower) {
-                return Object::phi();
+        // Entity scoping: skip for response constraints (they always apply)
+        if !is_response_constraint {
+            if let Some(ref entity) = entity_scope {
+                let entity_lower = entity.to_lowercase();
+                let entity_compact: String = entity.chars().filter(|c| !c.is_whitespace()).collect();
+                let entity_compact_lower = entity_compact.to_lowercase();
+                if !lower_text.contains(&entity_lower) && !lower_text.contains(&entity_compact_lower) {
+                    return Object::phi();
+                }
             }
         }
 
