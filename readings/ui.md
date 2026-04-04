@@ -1,6 +1,5 @@
 # GraphDL UI — Presentation Layer
 
-Abstract UI interfaces derived from iFactr (Zebra Technologies).
 Platform-agnostic view hierarchy, navigation, and controls.
 Custom renderers registered per platform via the factory pattern.
 

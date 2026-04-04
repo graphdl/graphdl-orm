@@ -453,12 +453,23 @@ fn try_deontic(line: &str) -> Option<ParseAction> {
     let (operator, rest) = line.strip_prefix("It is obligatory that ").map(|r| ("obligatory", r))
         .or_else(|| line.strip_prefix("It is forbidden that ").map(|r| ("forbidden", r)))
         .or_else(|| line.strip_prefix("It is permitted that ").map(|r| ("permitted", r)))?;
+    // Extract the entity noun: first capitalized phrase after the operator prefix.
+    // e.g., "each Support Response uses Dash" → entity = "Support Response"
+    let entity_rest = rest.strip_prefix("each ").or(Some(rest)).unwrap();
+    // The entity is the leading capitalized words before a lowercase verb
+    let entity: String = entity_rest.split_whitespace()
+        .take_while(|w| w.chars().next().map_or(false, |c| c.is_uppercase()))
+        .collect::<Vec<&str>>()
+        .join(" ");
+    let entity_opt = if entity.is_empty() { None } else { Some(entity) };
+    // Create a placeholder span so resolve_constraint_schema can populate it
     Some(ParseAction::AddConstraint(ConstraintDef {
         id: String::new(), kind: operator.into(), modality: "deontic".into(),
         deontic_operator: Some(operator.into()),
         text: line.trim_end_matches('.').into(),
-        spans: vec![], set_comparison_argument_length: None, clauses: None,
-        entity: None, min_occurrence: None, max_occurrence: None,
+        spans: vec![SpanDef { fact_type_id: String::new(), role_index: 0, subset_autofill: None }],
+        set_comparison_argument_length: None, clauses: None,
+        entity: entity_opt, min_occurrence: None, max_occurrence: None,
     }))
 }
 
@@ -731,13 +742,18 @@ fn parse_into(ir: &mut ConstraintIR, input: &str) -> Result<(), String> {
                 let c = match action { ParseAction::AddConstraint(c) => c, _ => unreachable!() };
                 let mut uc = resolve_constraint_schema(c.clone(), &noun_names, &catalog, ir);
                 uc.kind = "UC".into();
+                if uc.id.is_empty() { uc.id = format!("UC:{}", uc.text); }
                 let mut mc = resolve_constraint_schema(c, &noun_names, &catalog, ir);
                 mc.kind = "MC".into();
+                if mc.id.is_empty() { mc.id = format!("MC:{}", mc.text); }
                 ir.constraints.push(uc);
                 ir.constraints.push(mc);
             }
             ParseAction::AddConstraint(c) => {
-                let resolved = resolve_constraint_schema(c, &noun_names, &catalog, ir);
+                let mut resolved = resolve_constraint_schema(c, &noun_names, &catalog, ir);
+                if resolved.id.is_empty() {
+                    resolved.id = resolved.text.clone();
+                }
                 ir.constraints.push(resolved);
             }
             ParseAction::AddDerivation(mut r) => {
@@ -754,7 +770,7 @@ fn parse_into(ir: &mut ConstraintIR, input: &str) -> Result<(), String> {
     let vc_nouns: Vec<String> = ir.enum_values.keys().cloned().collect();
     for noun_name in vc_nouns {
         ir.constraints.push(ConstraintDef {
-            id: String::new(),
+            id: format!("VC:{}", noun_name),
             kind: "VC".into(),
             modality: "alethic".into(),
             deontic_operator: None,
@@ -1025,12 +1041,23 @@ fn resolve_constraint_schema(
     catalog: &SchemaCatalog,
     ir: &ConstraintIR,
 ) -> ConstraintDef {
-    // Extract nouns from the constraint text to find the target schema
-    let stripped = constraint.text
+    // Extract nouns from the constraint text to find the target schema.
+    // Strip quantifiers and quoted values before noun matching.
+    let mut stripped = constraint.text
+        .replace("It is obligatory that ", "").replace("It is forbidden that ", "")
+        .replace("It is permitted that ", "")
         .replace("Each ", "").replace("each ", "")
         .replace("at most one ", "").replace("exactly one ", "")
         .replace("at least one ", "").replace("some ", "")
         .replace("No ", "").replace("no ", "");
+    // Remove quoted values like 'Overnight' that interfere with noun matching
+    while let Some(start) = stripped.find('\'') {
+        if let Some(end) = stripped[start + 1..].find('\'') {
+            stripped = format!("{}{}", &stripped[..start], &stripped[start + 1 + end + 1..]);
+        } else {
+            break;
+        }
+    }
     let found = find_nouns(&stripped, noun_names);
 
     if found.len() >= 2 {
@@ -1071,9 +1098,27 @@ fn resolve_constraint_schema(
                     .map(|(id, _)| id.clone())
             })
         {
-            // Update all spans to reference the resolved schema ID
+            // Update spans to reference the resolved schema ID.
+            // The constrained role is determined by the quantifier position
+            // in the verbalization pattern. "Each A R at most one B" constrains
+            // A's role (the quantified noun). "It is forbidden that A R B"
+            // constrains A's role (the first noun after the prefix).
+            // Per Halpin TechReport ORM2-02: the constrained role is the one
+            // under the quantifier.
+            let resolved_ft = ir.fact_types.get(&schema_id);
             for span in &mut constraint.spans {
                 span.fact_type_id = schema_id.clone();
+                // Set role_index to the first noun's position in the fact type.
+                // The first noun in the constraint text is the quantified noun
+                // ("Each A", "the same A", "A" after deontic prefix).
+                if found.len() >= 2 {
+                    if let Some(ft) = resolved_ft {
+                        let first_noun = &found[0].2;
+                        if let Some(idx) = ft.roles.iter().position(|r| &r.noun_name == first_noun) {
+                            span.role_index = idx;
+                        }
+                    }
+                }
             }
         }
     }
@@ -1205,64 +1250,8 @@ fn find_nouns(text: &str, noun_names: &[String]) -> Vec<(usize, usize, String)> 
 // Instance fact parsing (state machines)
 // =========================================================================
 
-fn parse_instance_fact(ir: &mut ConstraintIR, line: &str, lines: &[&str], idx: usize) {
+fn parse_instance_fact(ir: &mut ConstraintIR, line: &str, _lines: &[&str], _idx: usize) {
     let clean = line.trim_end_matches('.');
-
-    // State Machine Definition
-    if let Some(name) = extract_quoted(clean, "State Machine Definition '") {
-        let sm = ir.state_machines.entry(name.clone()).or_insert(StateMachineDef {
-            noun_name: String::new(), statuses: vec![], transitions: vec![],
-        });
-        if let Some(noun) = extract_quoted(clean, "is for Noun '") {
-            sm.noun_name = noun;
-        }
-        return;
-    }
-
-    // Status (initial)
-    if let (Some(status), Some(sm_name)) = (
-        extract_quoted(clean, "Status '"),
-        extract_quoted(clean, "is initial in State Machine Definition '"),
-    ) {
-        let sm = ir.state_machines.entry(sm_name).or_insert(StateMachineDef {
-            noun_name: String::new(), statuses: vec![], transitions: vec![],
-        });
-        if !sm.statuses.contains(&status) { sm.statuses.insert(0, status); }
-        return;
-    }
-
-    // Transition
-    if let Some(event) = extract_quoted(clean, "Transition '") {
-        let from = extract_quoted(clean, "is from Status '")
-            .or_else(|| look_ahead(lines, idx, &event, "is from Status '"))
-            .or_else(|| extract_quoted(clean, "is from Subscription Status '"))
-            .or_else(|| extract_quoted(clean, "is from Incident Status '"));
-        let to = extract_quoted(clean, "is to Status '")
-            .or_else(|| look_ahead(lines, idx, &event, "is to Status '"))
-            .or_else(|| extract_quoted(clean, "is to Subscription Status '"))
-            .or_else(|| extract_quoted(clean, "is to Incident Status '"));
-
-        if let (Some(from), Some(to)) = (from, to) {
-            for sm in ir.state_machines.values_mut() {
-                if sm.statuses.contains(&from) || sm.statuses.contains(&to) {
-                    if !sm.statuses.contains(&from) { sm.statuses.push(from.clone()); }
-                    if !sm.statuses.contains(&to) { sm.statuses.push(to.clone()); }
-                    sm.transitions.push(TransitionDef { from, to, event, guard: None });
-                    return;
-                }
-            }
-            if let Some(sm) = ir.state_machines.values_mut().next() {
-                if !sm.statuses.contains(&from) { sm.statuses.push(from.clone()); }
-                if !sm.statuses.contains(&to) { sm.statuses.push(to.clone()); }
-                sm.transitions.push(TransitionDef { from, to, event, guard: None });
-            }
-        }
-        return;
-    }
-
-    // General instance fact: NounName 'value' predicate NounName 'value'.
-    // Longest-first matching against declared nouns (Theorem 1).
-    // The fact is x-bar (constant) asserted into P.
     parse_general_instance_fact(ir, clean);
 }
 
@@ -1301,12 +1290,10 @@ fn parse_general_instance_fact(ir: &mut ConstraintIR, line: &str) {
 
     let fact = match object_match {
         Some((predicate, object_noun, object_value)) => {
-            // Field name: drop generic verbs ("has", "is"), keep descriptive predicates.
-            // "has URI" → "uri". "reads from ClickHouse Table" → "readsFrom".
-            let field = match predicate.trim() {
-                "has" | "is" | "belongs to" | "is of" => to_camel_case(&object_noun),
-                _ => to_camel_case(&predicate),
-            };
+            // Resolve field name from declared fact types.
+            // The instance fact "A 'x' predicate B 'y'" should match the
+            // declared fact type "A predicate B" and use its graph schema ID.
+            let field = resolve_instance_field(&ir.fact_types, &subject_noun, &predicate, &object_noun);
             Some(GeneralInstanceFact {
                 subject_noun,
                 subject_value,
@@ -1325,6 +1312,62 @@ fn parse_general_instance_fact(ir: &mut ConstraintIR, line: &str) {
     };
 
     if let Some(f) = fact { ir.general_instance_facts.push(f); }
+}
+
+/// Resolve the field name for an instance fact by looking up the declared fact type.
+/// Matches the subject noun and object noun against fact type roles, using the
+/// predicate for disambiguation when multiple fact types share the same noun pair.
+fn resolve_instance_field(
+    fact_types: &HashMap<String, FactTypeDef>,
+    subject_noun: &str,
+    predicate: &str,
+    object_noun: &str,
+) -> String {
+    // Find fact types where role 0 matches subject and role 1 matches object
+    let candidates: Vec<(&str, &FactTypeDef)> = fact_types.iter()
+        .filter(|(_, ft)| {
+            ft.roles.len() >= 2
+                && ft.roles[0].noun_name == subject_noun
+                && ft.roles[1].noun_name == object_noun
+        })
+        .map(|(id, ft)| (id.as_str(), ft))
+        .collect();
+
+    // Resolve: find the declared fact type and extract the predicate from it.
+    // The predicate in the reading is the canonical field name source.
+    let pred_lower = predicate.to_lowercase();
+    let matched = candidates.iter()
+        .find(|(_, ft)| {
+            let r = ft.reading.to_lowercase();
+            // Check if the reading contains the predicate words
+            pred_lower.split_whitespace().all(|w| r.contains(w))
+        })
+        .or_else(|| candidates.first());
+
+    if let Some((id, _)) = matched {
+        // The field name is the graph schema ID. This is the fact type identity.
+        id.to_string()
+    } else {
+        // No declared fact type. Also try reverse role order.
+        let reverse = fact_types.iter()
+            .find(|(_, ft)| {
+                ft.roles.len() >= 2
+                    && ft.roles[1].noun_name == subject_noun
+                    && ft.roles[0].noun_name == object_noun
+            });
+        if let Some((_, ft)) = reverse {
+            let reading = &ft.reading;
+            let after_obj = reading.find(object_noun)
+                .map(|i| &reading[i + object_noun.len()..])
+                .unwrap_or(reading);
+            let before_subj = after_obj.find(subject_noun)
+                .map(|i| &after_obj[..i])
+                .unwrap_or(after_obj);
+            to_camel_case(before_subj.trim())
+        } else {
+            to_camel_case(predicate)
+        }
+    }
 }
 
 fn extract_value_fact(rest: &str) -> Option<(String, String)> {
@@ -1352,18 +1395,7 @@ fn to_camel_case(s: &str) -> String {
     result
 }
 
-fn extract_quoted(text: &str, prefix: &str) -> Option<String> {
-    let start = text.find(prefix)? + prefix.len();
-    let end = text[start..].find('\'')?;
-    Some(text[start..start + end].into())
-}
 
-fn look_ahead(lines: &[&str], idx: usize, event: &str, pattern: &str) -> Option<String> {
-    lines.iter().skip(idx + 1)
-        .take_while(|l| l.trim().starts_with("Transition"))
-        .find(|l| l.contains(&format!("Transition '{}'", event)) && l.contains(pattern))
-        .and_then(|l| extract_quoted(l.trim().trim_end_matches('.'), pattern))
-}
 
 // =========================================================================
 // Tests
@@ -1820,5 +1852,172 @@ Constraint Span 'Department Leadership' autofills from superset.";
         let ir = parse_markdown(input).unwrap();
         let ss = ir.constraints.iter().find(|c| c.kind == "SS").expect("SS constraint");
         assert!(ss.spans.iter().any(|s| s.subset_autofill == Some(true)), "autofill should be set");
+    }
+
+    // ── Deontic constraint fixes (2026-04-03) ─────────────────────────
+
+    #[test]
+    fn deontic_forbidden_extracts_entity() {
+        let input = "\
+Support Response(.id) is an entity type.
+Dash is a value type.
+  The possible values of Dash are '\u{2014}', '\u{2013}', '--'.
+## Fact Types
+Support Response uses Dash.
+## Deontic Constraints
+It is forbidden that Support Response uses Dash.";
+        let ir = parse_markdown(input).unwrap();
+        let c = ir.constraints.iter()
+            .find(|c| c.text.contains("forbidden") && c.text.contains("Dash"))
+            .expect("Should have forbidden Dash constraint");
+        assert_eq!(c.entity, Some("Support Response".into()),
+            "Deontic constraint should extract entity from text");
+    }
+
+    #[test]
+    fn deontic_constraint_has_nonempty_span() {
+        let input = "\
+Support Response(.id) is an entity type.
+Dash is a value type.
+  The possible values of Dash are '\u{2014}', '\u{2013}', '--'.
+## Fact Types
+Support Response uses Dash.
+## Deontic Constraints
+It is forbidden that Support Response uses Dash.";
+        let ir = parse_markdown(input).unwrap();
+        let c = ir.constraints.iter()
+            .find(|c| c.text.contains("forbidden") && c.text.contains("Dash"))
+            .unwrap();
+        assert!(!c.spans.is_empty(), "Deontic constraint should have at least one span");
+        assert!(!c.spans[0].fact_type_id.is_empty(),
+            "Span fact_type_id should be resolved, got empty");
+        assert_eq!(c.spans[0].fact_type_id, "Support_Response_uses_Dash",
+            "Span should reference the correct fact type");
+    }
+
+    #[test]
+    fn deontic_constraint_has_unique_id() {
+        let input = "\
+Support Response(.id) is an entity type.
+Dash is a value type.
+  The possible values of Dash are '\u{2014}', '\u{2013}', '--'.
+Markdown Syntax is a value type.
+  The possible values of Markdown Syntax are '**', '##'.
+## Fact Types
+Support Response uses Dash.
+Support Response contains Markdown Syntax.
+## Deontic Constraints
+It is forbidden that Support Response uses Dash.
+It is forbidden that Support Response contains Markdown Syntax.";
+        let ir = parse_markdown(input).unwrap();
+        let deontics: Vec<&ConstraintDef> = ir.constraints.iter()
+            .filter(|c| c.modality == "deontic")
+            .collect();
+        assert!(deontics.len() >= 2, "Should have at least 2 deontic constraints");
+        // IDs should be unique (not all empty)
+        let ids: std::collections::HashSet<&str> = deontics.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids.len(), deontics.len(),
+            "Each deontic constraint should have a unique ID");
+        assert!(!ids.contains(""), "No constraint should have an empty ID");
+    }
+
+    #[test]
+    fn deontic_obligatory_extracts_entity() {
+        let input = "\
+Support Response(.id) is an entity type.
+Pricing Model is a value type.
+  The possible values of Pricing Model are 'subscription', 'metered'.
+## Fact Types
+Support Response conforms to Pricing Model.
+## Deontic Constraints
+It is obligatory that each Support Response conforms to Pricing Model.";
+        let ir = parse_markdown(input).unwrap();
+        let c = ir.constraints.iter()
+            .find(|c| c.text.contains("obligatory") && c.text.contains("Pricing Model"))
+            .expect("Should have obligatory Pricing Model constraint");
+        assert_eq!(c.entity, Some("Support Response".into()));
+        assert_eq!(c.modality, "deontic");
+        assert_eq!(c.deontic_operator, Some("obligatory".into()));
+    }
+
+    #[test]
+    fn deontic_forbidden_evaluates_enum_match() {
+        let input = "\
+Support Response(.id) is an entity type.
+Dash is a value type.
+  The possible values of Dash are '\u{2014}', '\u{2013}', '--'.
+## Fact Types
+Support Response uses Dash.
+## Deontic Constraints
+It is forbidden that Support Response uses Dash.";
+        let ir = parse_markdown(input).unwrap();
+        let model = crate::compile::compile(&ir);
+        let response = crate::types::ResponseContext {
+            text: "Hi -- here is your answer".into(),
+            sender_identity: None,
+            fields: None,
+        };
+        let population = crate::types::Population { facts: std::collections::HashMap::new() };
+        let violations = crate::evaluate::evaluate_via_ast(&model, &response, &population);
+        assert!(!violations.is_empty(),
+            "Response containing '--' should violate the forbidden Dash constraint");
+        assert!(violations.iter().any(|v| v.constraint_text.contains("Dash")),
+            "Violation should reference the Dash constraint");
+    }
+
+    #[test]
+    fn deontic_forbidden_clean_response_no_violations() {
+        let input = "\
+Support Response(.id) is an entity type.
+Dash is a value type.
+  The possible values of Dash are '\u{2014}', '\u{2013}', '--'.
+## Fact Types
+Support Response uses Dash.
+## Deontic Constraints
+It is forbidden that Support Response uses Dash.";
+        let ir = parse_markdown(input).unwrap();
+        let model = crate::compile::compile(&ir);
+        let response = crate::types::ResponseContext {
+            text: "Hi, here is your answer with no dashes at all".into(),
+            sender_identity: None,
+            fields: None,
+        };
+        let population = crate::types::Population { facts: std::collections::HashMap::new() };
+        let violations = crate::evaluate::evaluate_via_ast(&model, &response, &population);
+        let dash_violations: Vec<_> = violations.iter()
+            .filter(|v| v.constraint_text.contains("Dash"))
+            .collect();
+        assert!(dash_violations.is_empty(),
+            "Clean response should not trigger Dash violation");
+    }
+
+    #[test]
+    fn deontic_multiple_forbidden_enum_constraints() {
+        let input = "\
+Support Response(.id) is an entity type.
+Dash is a value type.
+  The possible values of Dash are '\u{2014}', '\u{2013}', '--'.
+Markdown Syntax is a value type.
+  The possible values of Markdown Syntax are '**', '##', '###', '```'.
+## Fact Types
+Support Response uses Dash.
+Support Response contains Markdown Syntax.
+## Deontic Constraints
+It is forbidden that Support Response uses Dash.
+It is forbidden that Support Response contains Markdown Syntax.";
+        let ir = parse_markdown(input).unwrap();
+        let model = crate::compile::compile(&ir);
+        // Response with both dashes and markdown
+        let response = crate::types::ResponseContext {
+            text: "## Heading\n\nHere is info -- with **bold** text".into(),
+            sender_identity: None,
+            fields: None,
+        };
+        let population = crate::types::Population { facts: std::collections::HashMap::new() };
+        let violations = crate::evaluate::evaluate_via_ast(&model, &response, &population);
+        assert!(violations.iter().any(|v| v.constraint_text.contains("Dash")),
+            "Should catch dash violation");
+        assert!(violations.iter().any(|v| v.constraint_text.contains("Markdown")),
+            "Should catch markdown violation");
     }
 }
