@@ -87,16 +87,26 @@ $\langle/, f\rangle$ & Insert & Aggregation \\
 $\langle\mathit{bu}, f, x\rangle$ & Binary-to-unary & Query \\
 $\bar{x}$ & Constant & Literal \\
 \midrule
-$\mathit{Filter}(p)$ & Restriction & Constraint \\
 $\mathit{distl}$ & Distribute-left & Join preparation \\
 $\mathit{eq}$ & Equality test & Predicate \\
-$\mathit{foldl}\;f\;z\;E$ & Left fold & Accumulation \\
 \bottomrule
 \end{tabular}
 \caption{FFP primitives with domain interpretations.}\label{tab:ffp}
 \end{table}
 
 A fact type $\langle\mathit{CONS}, s_1, \ldots, s_n\rangle$ (Table~\ref{tab:ffp}) is a function that produces a fact when applied to object instances. Partially applied via $\mathit{bu}$ (Table~\ref{tab:ffp}) it produces a query.
+
+Two derived forms used throughout the paper:
+\begin{align}
+\mathit{Filter}(p) &\equiv \alpha\,(p \to \mathit{id} ;\; \bot) \label{eq:filter-def}
+\end{align}
+$\mathit{Filter}$ is $\alpha$ (apply-to-all) of a condition: keep elements where $p$ holds, replace others with $\bot$.
+
+\begin{align}
+\mathit{foldl}\;f\;z\;\langle\rangle &= z \notag \\
+\mathit{foldl}\;f\;z\;\langle e, E'\rangle &= \mathit{foldl}\;f\;(f\;z\;e)\;E' \label{eq:foldl-def}
+\end{align}
+$\mathit{foldl}$ is a left fold derivable from Backus's $\mathit{while}$~\cite[Sec.\,11.2.4]{backus78}: $\mathit{foldl}\;f\;z\;E \equiv (\mathit{while}\;\mathit{not} \circ \mathit{null} \circ 1\;\;[f \circ [2, 1 \circ 1],\;\mathit{tl} \circ 1]) \circ 2 : \langle E, z\rangle$, where 1 and 2 select the event stream and accumulator from the pair. The right fold $/f$~\cite[Sec.\,11.2.4]{backus78} processes right to left. State machines require left to right (chronological event order), hence $\mathit{foldl}$.
 
 The compiled form for each FORML\,2 construct:
 
@@ -109,10 +119,10 @@ The compiled form for each FORML\,2 construct:
 Entity type \texttt{X(.ref)} & $\langle\mathit{CONS}, s_1, \ldots, s_n\rangle$ \\
 Fact type \texttt{X r Y} & $\langle\mathit{CONS}, s_1, s_2\rangle$ (binary) \\
 Derivation rule & $\langle\mathit{COMP}, f, g\rangle$ \\
-State machine & $\mathit{foldl}\;\mathit{transition}\;s_0\;E$ (Table~\ref{tab:ffp}) \\
+State machine & $\mathit{foldl}\;\mathit{transition}\;s_0\;E$~(\ref{eq:foldl-def}) \\
 Instance fact & $\bar{x}$ asserted into $P$ \\
 \midrule
-\multicolumn{2}{@{}l@{}}{\textit{Constraints (all compile to $\mathit{Filter}(p) : P$, Table~\ref{tab:ffp})}} \\
+\multicolumn{2}{@{}l@{}}{\textit{Constraints (all compile to $\mathit{Filter}(p) : P$~(\ref{eq:filter-def}))}} \\
 \midrule
 \multicolumn{2}{@{}l@{}}{\textit{Cardinality family:} $p = \mathit{count}(\mathit{scope}) \notin [k, m]$} \\
 UC, MC, FC, XC, XO, OR & scope $\in$ \{role, participation\} \\
@@ -130,7 +140,7 @@ VC (value) & target $=$ declared value set \\
 
 \subsection{Relational Algebra}
 
-Codd's adequate $\theta_1$~\cite[Sec.\,2.2]{codd70} as FFP definitions (all primitives from Table~\ref{tab:ffp}):
+Codd's adequate $\theta_1$~\cite[Sec.\,2.2]{codd70} as FFP definitions (primitives from Table~\ref{tab:ffp}, $\mathit{Filter}$ from~(\ref{eq:filter-def})):
 \begin{align}
 \pi_L(R) &\equiv \alpha\,[s_{i_1}, \ldots, s_{i_k}] : R \label{eq:proj} \\
 R \mathbin{*} S &\equiv \mathit{Filter}(\mathit{eq} \circ [s_{\mathit{sh}}]) \circ \mathit{distl} \label{eq:join} \\
@@ -370,8 +380,8 @@ where $p(t) = (s_{\mathit{from}}(t) = s) \lor \mathit{anc}(s_{\mathit{from}}(t),
 \smallskip\noindent
 \textit{(b) Navigation links.} Let $F_B$ be the binary fact types between entity nouns. For each $f \in F_B$, let $r_c$ denote the role constrained by a UC and $\bar{r}_c$ the other role. A UC on $r_c$ establishes a functional dependency from $r_c$ to $\bar{r}_c$, making the $r_c$ noun the child. The navigation links for an entity $e$ of noun $n$ are:
 \begin{align}
-\mathit{children}(n) &= \{\mathit{noun}(r_c) : f \in F_B,\; \mathit{uc}(r_c),\; \mathit{noun}(\bar{r}_c) = n\} \label{eq:children} \\
-\mathit{parent}(n) &= \{\mathit{noun}(\bar{r}_c) : f \in F_B,\; \mathit{uc}(r_c),\; \mathit{noun}(r_c) = n\} \label{eq:parent} \\
+\mathit{children}(n) &= \pi_{\mathit{noun}(r_c)}\!\left(\mathit{Filter}(\mathit{uc}(r_c) \land \mathit{eq} \circ [\mathit{noun}(\bar{r}_c), \bar{n}]) : F_B\right) \label{eq:children} \\
+\mathit{parent}(n) &= \pi_{\mathit{noun}(\bar{r}_c)}\!\left(\mathit{Filter}(\mathit{uc}(r_c) \land \mathit{eq} \circ [\mathit{noun}(r_c), \bar{n}]) : F_B\right) \label{eq:parent} \\
 \mathit{nav}(e, n) &= \mathit{children}(n) \;\cup\; \mathit{parent}(n) \label{eq:nav}
 \end{align}
 
@@ -384,7 +394,7 @@ The full link set combines both:
 
 \begin{proof}
 \textit{(a)} $T \subseteq P$. $\mathit{Filter}$ is restriction~(\ref{eq:restrict}); $\pi$ is projection~(\ref{eq:proj}). Both are $\theta_1$ operations.
-\textit{(b)} $F_B \subseteq S$. Each set comprehension is a projection over a restriction of $F_B$, both $\theta_1$ operations. The UC on $r_c$ makes $r_c$ functionally dependent on $\bar{r}_c$ (RMAP step~2). The entity hierarchy is determined by this projection without external configuration. Both components of $\mathit{links}_{\mathit{full}}$ are $\theta_1$ operations on $S$ and $P$.
+\textit{(b)} $F_B \subseteq S$. $\mathit{children}$ and $\mathit{parent}$ are each a projection~(\ref{eq:proj}) over a restriction~(\ref{eq:restrict}) of $F_B$. $\mathit{Filter}$~(\ref{eq:filter-def}) is derived from $\alpha$ and condition. The predicate composes $\mathit{eq}$ with selector and constant, all primitives from Table~\ref{tab:ffp}. The UC on $r_c$ makes $r_c$ functionally dependent on $\bar{r}_c$ (RMAP step~2). The entity hierarchy is determined by these projections without external configuration. Both components of $\mathit{links}_{\mathit{full}}$ are $\theta_1$ operations on $S$ and $P$.
 \end{proof}
 
 \begin{corollary}[Deletion as Terminal State]\label{cor:delete}
