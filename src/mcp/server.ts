@@ -138,17 +138,17 @@ server.tool(
   },
 )
 
-// ── Seed: ingest readings (self-modification) ───────────────────────
+// ── Parse: compile ∘ parse readings (self-modification) ─────────────
 
 server.tool(
-  'graphdl_seed',
-  'Ingest FORML2 readings into a domain. This is self-modification (Corollary 3).',
+  'graphdl_parse',
+  'Parse FORML2 readings into a domain. compile compose parse. This is self-modification (Corollary 3).',
   {
     domain: z.string().describe('The domain slug'),
     readings: z.string().describe('FORML2 readings as markdown text'),
   },
   async ({ domain, readings }) => {
-    const data = await request('/seed', {
+    const data = await request('/parse', {
       method: 'POST',
       body: JSON.stringify({ domain, text: readings }),
     })

@@ -1,5 +1,5 @@
 /**
- * Seed endpoint — parse readings via ρ (WASM), materialize as cells in D.
+ * Parse endpoint — compile ∘ parse: readings → cells in D.
  *
  * Per the paper:
  *   parse: R → Φ (Theorem 2)
@@ -18,16 +18,16 @@ function getRegistryDO(env: Env) {
   return env.REGISTRY_DB.get(env.REGISTRY_DB.idFromName('global'))
 }
 
-export async function handleSeed(request: Request, env: Env): Promise<Response> {
-  if (request.method === 'GET') return handleSeedGet(env)
-  if (request.method === 'DELETE') return handleSeedDelete(env)
-  if (request.method === 'POST') return handleSeedPost(request, env)
+export async function handleParse(request: Request, env: Env): Promise<Response> {
+  if (request.method === 'GET') return handleParseGet(env)
+  if (request.method === 'DELETE') return handleParseDelete(env)
+  if (request.method === 'POST') return handleParsePost(request, env)
   return error(405, { errors: [{ message: 'Method not allowed' }] })
 }
 
-// ── GET /seed — stats from Registry ─────────────────────────────────
+// ── GET /parse — stats from Registry ─────────────────────────────────
 
-async function handleSeedGet(env: Env): Promise<Response> {
+async function handleParseGet(env: Env): Promise<Response> {
   const registry = getRegistryDO(env) as any
   const domainSlugs: string[] = await registry.listDomains()
 
@@ -63,17 +63,17 @@ async function handleSeedGet(env: Env): Promise<Response> {
   return json({ totals, perDomain })
 }
 
-// ── DELETE /seed — wipe population ──────────────────────────────────
+// ── DELETE /parse — wipe population ──────────────────────────────────
 
-async function handleSeedDelete(env: Env): Promise<Response> {
+async function handleParseDelete(env: Env): Promise<Response> {
   const registry = getRegistryDO(env) as any
   await registry.wipeAll()
   return json({ message: 'All data wiped' })
 }
 
-// ── POST /seed — parse readings via ρ, materialize as cells ─────────
+// ── POST /parse — parse readings via ρ, materialize as cells ─────────
 
-async function handleSeedPost(request: Request, env: Env): Promise<Response> {
+async function handleParsePost(request: Request, env: Env): Promise<Response> {
   const contentType = request.headers.get('content-type') || ''
 
   // Collect raw markdown texts by domain slug
@@ -168,7 +168,7 @@ async function handleSeedPost(request: Request, env: Env): Promise<Response> {
       await registry.materializeBatch(entities)
     }
 
-    // ↓DEFS — persist definitions after seeding
+    // ↓DEFS — persist definitions after parsing
     const defsData: Record<string, string> = {}
     // Default operations
     defsData['*:read'] = 'local'
