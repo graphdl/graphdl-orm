@@ -141,6 +141,13 @@ interface engine {
 
     /// RMAP: schema -> table definitions.
     rmap: func(handle: u32) -> string;
+
+    /// The system function. SYSTEM:x = <o, d>.
+    /// One entry point. Input classification inside.
+    /// key: the operation (parse, command, evaluate, query, machine, transitions, synthesize, rho, rmap)
+    /// input: JSON-encoded operation-specific arguments
+    /// Returns: JSON-encoded result
+    system: func(handle: u32, key: string, input: string) -> string;
 }
 
 world arest {

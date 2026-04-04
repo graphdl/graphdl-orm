@@ -291,6 +291,108 @@ impl exports::graphdl::arest::engine::Guest for E {
         let d = st.domain();
         serde_json::to_string(&rmap::rmap(&d)).unwrap_or_else(|_| "[]".into())
     }
+
+    fn system(handle: u32, key: String, input: String) -> String {
+        let s = ds().lock().unwrap();
+        let st = match s.get(handle as usize).and_then(|x| x.as_ref()) {
+            Some(x) => x,
+            None => return r#"{"error":"no domain loaded"}"#.into(),
+        };
+        let def_map: HashMap<String, ast::Func> = st.defs.iter().map(|(n, f)| (n.clone(), f.clone())).collect();
+
+        match key.as_str() {
+            "evaluate" => {
+                let args: serde_json::Value = serde_json::from_str(&input).unwrap_or_default();
+                let text = args["text"].as_str().unwrap_or("");
+                let sender = args["sender"].as_str();
+                let ctx = ast::encode_eval_context(text, sender, &types::Population::default());
+                let violations: Vec<types::Violation> = st.defs_matching("constraint:").iter().flat_map(|(_, func)| {
+                    let result = ast::apply(func, &ctx, &def_map);
+                    ast::decode_violations(&result)
+                }).collect();
+                serde_json::to_string(&violations).unwrap_or_else(|_| "[]".into())
+            }
+            "machine" => {
+                let args: serde_json::Value = serde_json::from_str(&input).unwrap_or_default();
+                let noun = args["noun"].as_str().unwrap_or("");
+                let events: Vec<&str> = args["events"].as_array()
+                    .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                    .unwrap_or_default();
+                let sm_name = format!("machine:{}", noun);
+                let init_name = format!("machine:{}:initial", noun);
+                let transition = match st.def(&sm_name) { Some(f) => f, None => return r#"{"error":"no machine"}"#.into() };
+                let initial_func = match st.def(&init_name) { Some(f) => f, None => return r#"{"error":"no initial"}"#.into() };
+                let mut state = ast::apply(initial_func, &ast::Object::phi(), &def_map);
+                for event in &events {
+                    let input = ast::Object::seq(vec![state, ast::Object::atom(event)]);
+                    state = ast::apply(transition, &input, &def_map);
+                }
+                format!(r#"{{"state":"{}"}}"#, state.as_atom().unwrap_or(""))
+            }
+            "transitions" => {
+                let args: serde_json::Value = serde_json::from_str(&input).unwrap_or_default();
+                let noun = args["noun"].as_str().unwrap_or("");
+                let status = args["status"].as_str().unwrap_or("");
+                let sm_name = format!("machine:{}", noun);
+                let transition = match st.def(&sm_name) { Some(f) => f, None => return "[]".into() };
+                let events: Vec<String> = st.pop.facts.get("InstanceFact")
+                    .map(|facts| facts.iter()
+                        .filter(|f| f.bindings.iter().any(|(k, v)| k == "subjectNoun" && v == "Transition"))
+                        .filter_map(|f| {
+                            let obj_noun = f.bindings.iter().find(|(k, _)| k == "objectNoun").map(|(_, v)| v.as_str())?;
+                            if obj_noun == "Event Type" { f.bindings.iter().find(|(k, _)| k == "objectValue").map(|(_, v)| v.clone()) } else { None }
+                        })
+                        .collect::<std::collections::HashSet<_>>().into_iter().collect()
+                    ).unwrap_or_default();
+                let mut result = vec![];
+                for event in &events {
+                    let inp = ast::Object::seq(vec![ast::Object::atom(status), ast::Object::atom(event)]);
+                    let next = ast::apply(transition, &inp, &def_map);
+                    if let Some(ns) = next.as_atom() {
+                        if ns != status { result.push(serde_json::json!({"from": status, "to": ns, "event": event})); }
+                    }
+                }
+                serde_json::to_string(&result).unwrap_or_else(|_| "[]".into())
+            }
+            "rho" => {
+                let args: serde_json::Value = serde_json::from_str(&input).unwrap_or_default();
+                let fact_type = args["factType"].as_str().unwrap_or("");
+                let operation = args["operation"].as_str().unwrap_or("");
+                let mut elements = vec![ast::Object::atom(fact_type)];
+                if let Some(bindings) = args["bindings"].as_array() {
+                    for b in bindings {
+                        let noun = b["noun"].as_str().unwrap_or("");
+                        let value = b["value"].as_str().unwrap_or("");
+                        elements.push(ast::Object::seq(vec![ast::Object::atom(noun), ast::Object::atom(value)]));
+                    }
+                }
+                let fact = ast::Object::Seq(elements);
+                let func = ast::metacompose(&fact, &def_map);
+                let result = ast::apply(&func, &ast::Object::atom(operation), &def_map);
+                match result.as_atom() {
+                    Some(s) => s.to_string(),
+                    None => format!("{:?}", result),
+                }
+            }
+            "nav" => {
+                let args: serde_json::Value = serde_json::from_str(&input).unwrap_or_default();
+                let noun = args["noun"].as_str().unwrap_or("");
+                let children_key = format!("nav:{}:children", noun);
+                let parent_key = format!("nav:{}:parent", noun);
+                let children = st.def(&children_key).map(|f| ast::apply(f, &ast::Object::phi(), &def_map));
+                let parents = st.def(&parent_key).map(|f| ast::apply(f, &ast::Object::phi(), &def_map));
+                serde_json::to_string(&serde_json::json!({
+                    "children": format!("{:?}", children.unwrap_or(ast::Object::phi())),
+                    "parent": format!("{:?}", parents.unwrap_or(ast::Object::phi())),
+                })).unwrap_or_else(|_| "{}".into())
+            }
+            "defs" => {
+                let names: Vec<&str> = st.defs.iter().map(|(n, _)| n.as_str()).collect();
+                serde_json::to_string(&names).unwrap_or_else(|_| "[]".into())
+            }
+            _ => format!(r#"{{"error":"unknown key: {}"}}"#, key),
+        }
+    }
 }
 
 fn ipop(p: &exports::graphdl::arest::engine::Population) -> types::Population {
