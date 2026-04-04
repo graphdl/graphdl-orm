@@ -774,21 +774,21 @@ pub fn store(name: &str, contents: Object, state: &Object) -> Object {
 /// - Defined atoms → definitions from D
 /// - Undefined atoms → ⊥̄ (bottom everywhere)
 /// - Sequences → functional forms via controlling operator
-pub fn rho(obj: &Object, defs: &std::collections::HashMap<String, Func>) -> Func {
+pub fn metacompose(obj: &Object, defs: &std::collections::HashMap<String, Func>) -> Func {
     match obj {
         Object::Bottom => Func::Constant(Object::Bottom),
-        Object::Atom(name) => rho_atom(name, defs),
+        Object::Atom(name) => metacompose_atom(name, defs),
         Object::Seq(items) if items.is_empty() => Func::Constant(Object::Bottom),
         Object::Seq(items) => {
             // Metacomposition: the first element determines the form.
             // ρ<x₁,...,xₙ>:y = (ρ x₁):<<x₁,...,xₙ>, y>
             // We resolve the controlling operator and build the Func.
-            rho_sequence(items, defs)
+            metacompose_sequence(items, defs)
         }
     }
 }
 
-fn rho_atom(name: &str, defs: &std::collections::HashMap<String, Func>) -> Func {
+fn metacompose_atom(name: &str, defs: &std::collections::HashMap<String, Func>) -> Func {
     // Check definitions first (Backus 13.3.2: Def n ≡ r)
     if let Some(func) = defs.get(name) {
         return func.clone();
@@ -826,7 +826,7 @@ fn rho_atom(name: &str, defs: &std::collections::HashMap<String, Func>) -> Func 
     }
 }
 
-fn rho_sequence(items: &[Object], defs: &std::collections::HashMap<String, Func>) -> Func {
+fn metacompose_sequence(items: &[Object], defs: &std::collections::HashMap<String, Func>) -> Func {
     if items.is_empty() { return Func::Constant(Object::Bottom); }
 
     // The controlling operator is the first element
@@ -838,47 +838,47 @@ fn rho_sequence(items: &[Object], defs: &std::collections::HashMap<String, Func>
     match controller {
         forms::COMP if items.len() == 3 => {
             // <COMP, f, g> → f ∘ g
-            let f = rho(&items[1], defs);
-            let g = rho(&items[2], defs);
+            let f = metacompose(&items[1], defs);
+            let g = metacompose(&items[2], defs);
             Func::Compose(Box::new(f), Box::new(g))
         }
         forms::CONS if items.len() >= 2 => {
             // <CONS, f₁, ..., fₙ> → [f₁, ..., fₙ]
-            let funcs: Vec<Func> = items[1..].iter().map(|o| rho(o, defs)).collect();
+            let funcs: Vec<Func> = items[1..].iter().map(|o| metacompose(o, defs)).collect();
             Func::Construction(funcs)
         }
         forms::COND if items.len() == 4 => {
             // <COND, p, f, g> → (p → f; g)
-            let p = rho(&items[1], defs);
-            let f = rho(&items[2], defs);
-            let g = rho(&items[3], defs);
+            let p = metacompose(&items[1], defs);
+            let f = metacompose(&items[2], defs);
+            let g = metacompose(&items[3], defs);
             Func::Condition(Box::new(p), Box::new(f), Box::new(g))
         }
         forms::ALPHA if items.len() == 2 => {
             // <ALPHA, f> → αf
-            let f = rho(&items[1], defs);
+            let f = metacompose(&items[1], defs);
             Func::ApplyToAll(Box::new(f))
         }
         forms::INSERT if items.len() == 2 => {
             // <INSERT, f> → /f
-            let f = rho(&items[1], defs);
+            let f = metacompose(&items[1], defs);
             Func::Insert(Box::new(f))
         }
         forms::BU if items.len() == 3 => {
             // <BU, f, x> → (bu f x)
-            let f = rho(&items[1], defs);
+            let f = metacompose(&items[1], defs);
             let x = items[2].clone();
             Func::BinaryToUnary(Box::new(f), x)
         }
         forms::FILTER if items.len() == 2 => {
             // <FILTER, p> → Filter(p)
-            let p = rho(&items[1], defs);
+            let p = metacompose(&items[1], defs);
             Func::Filter(Box::new(p))
         }
         forms::WHILE if items.len() == 3 => {
             // <WHILE, p, f> → (while p f)
-            let p = rho(&items[1], defs);
-            let f = rho(&items[2], defs);
+            let p = metacompose(&items[1], defs);
+            let f = metacompose(&items[2], defs);
             Func::While(Box::new(p), Box::new(f))
         }
         forms::CONST if items.len() == 2 => {
@@ -901,7 +901,7 @@ pub fn apply_ffp(
     operand: &Object,
     defs: &std::collections::HashMap<String, Func>,
 ) -> Object {
-    let func = rho(operator, defs);
+    let func = metacompose(operator, defs);
     apply(&func, operand, defs)
 }
 
@@ -2121,43 +2121,43 @@ mod tests {
     // ── FFP: ρ and metacomposition (Backus 13) ──────────────────
 
     #[test]
-    fn rho_primitive_atom_resolves() {
+    fn metacompose_primitive_atom_resolves() {
         // ρ("+") = Add
         let d = defs();
-        let func = rho(&Object::atom("+"), &d);
+        let func = metacompose(&Object::atom("+"), &d);
         let x = Object::seq(vec![Object::atom("3"), Object::atom("4")]);
         assert_eq!(apply(&func, &x, &d), Object::atom("7"));
     }
 
     #[test]
-    fn rho_selector_atom_resolves() {
+    fn metacompose_selector_atom_resolves() {
         // ρ("2") = Selector(2)
         let d = defs();
-        let func = rho(&Object::atom("2"), &d);
+        let func = metacompose(&Object::atom("2"), &d);
         let x = Object::seq(vec![Object::atom("a"), Object::atom("b"), Object::atom("c")]);
         assert_eq!(apply(&func, &x, &d), Object::atom("b"));
     }
 
     #[test]
-    fn rho_undefined_atom_is_bottom() {
+    fn metacompose_undefined_atom_is_bottom() {
         // ρ("undefined_name") = ⊥̄
         let d = defs();
-        let func = rho(&Object::atom("undefined_name"), &d);
+        let func = metacompose(&Object::atom("undefined_name"), &d);
         assert_eq!(apply(&func, &Object::atom("x"), &d), Object::Bottom);
     }
 
     #[test]
-    fn rho_defined_atom_resolves() {
+    fn metacompose_defined_atom_resolves() {
         // Def "second" ≡ Selector(2)
         let mut d = HashMap::new();
         d.insert("second".to_string(), Func::Selector(2));
-        let func = rho(&Object::atom("second"), &d);
+        let func = metacompose(&Object::atom("second"), &d);
         let x = Object::seq(vec![Object::atom("a"), Object::atom("b")]);
         assert_eq!(apply(&func, &x, &d), Object::atom("b"));
     }
 
     #[test]
-    fn rho_comp_sequence() {
+    fn metacompose_comp_sequence() {
         // ρ<COMP, "1", "tl"> = 1 ∘ tl
         // (1 ∘ tl):<a,b,c> = 1:<b,c> = b
         let d = defs();
@@ -2166,13 +2166,13 @@ mod tests {
             Object::atom("1"),
             Object::atom(primitives::TL),
         ]);
-        let func = rho(&obj, &d);
+        let func = metacompose(&obj, &d);
         let x = Object::seq(vec![Object::atom("a"), Object::atom("b"), Object::atom("c")]);
         assert_eq!(apply(&func, &x, &d), Object::atom("b"));
     }
 
     #[test]
-    fn rho_cons_sequence() {
+    fn metacompose_cons_sequence() {
         // ρ<CONS, "1", "2"> = [1, 2]
         // [1, 2]:<a, b, c> = <a, b>
         let d = defs();
@@ -2181,13 +2181,13 @@ mod tests {
             Object::atom("1"),
             Object::atom("2"),
         ]);
-        let func = rho(&obj, &d);
+        let func = metacompose(&obj, &d);
         let x = Object::seq(vec![Object::atom("a"), Object::atom("b"), Object::atom("c")]);
         assert_eq!(apply(&func, &x, &d), Object::seq(vec![Object::atom("a"), Object::atom("b")]));
     }
 
     #[test]
-    fn rho_cond_sequence() {
+    fn metacompose_cond_sequence() {
         // ρ<COND, "null", <CONST, "empty">, <CONST, "notempty">> = (null → "empty"̄; "notempty"̄)
         let d = defs();
         let obj = Object::Seq(vec![
@@ -2196,13 +2196,13 @@ mod tests {
             Object::Seq(vec![Object::atom(forms::CONST), Object::atom("empty")]),
             Object::Seq(vec![Object::atom(forms::CONST), Object::atom("notempty")]),
         ]);
-        let func = rho(&obj, &d);
+        let func = metacompose(&obj, &d);
         assert_eq!(apply(&func, &Object::phi(), &d), Object::atom("empty"));
         assert_eq!(apply(&func, &Object::seq(vec![Object::atom("x")]), &d), Object::atom("notempty"));
     }
 
     #[test]
-    fn rho_insert_add() {
+    fn metacompose_insert_add() {
         // ρ<INSERT, "+"> = /+
         // /+:<1,2,3> = 6
         let d = defs();
@@ -2210,13 +2210,13 @@ mod tests {
             Object::atom(forms::INSERT),
             Object::atom(primitives::ADD),
         ]);
-        let func = rho(&obj, &d);
+        let func = metacompose(&obj, &d);
         let x = Object::seq(vec![Object::atom("1"), Object::atom("2"), Object::atom("3")]);
         assert_eq!(apply(&func, &x, &d), Object::atom("6"));
     }
 
     #[test]
-    fn rho_alpha_sequence() {
+    fn metacompose_alpha_sequence() {
         // ρ<ALPHA, "1"> = α(1)
         // α(1):<<a,b>,<c,d>> = <a,c>
         let d = defs();
@@ -2224,7 +2224,7 @@ mod tests {
             Object::atom(forms::ALPHA),
             Object::atom("1"),
         ]);
-        let func = rho(&obj, &d);
+        let func = metacompose(&obj, &d);
         let x = Object::seq(vec![
             Object::seq(vec![Object::atom("a"), Object::atom("b")]),
             Object::seq(vec![Object::atom("c"), Object::atom("d")]),
@@ -2233,7 +2233,7 @@ mod tests {
     }
 
     #[test]
-    fn rho_bu_sequence() {
+    fn metacompose_bu_sequence() {
         // ρ<BU, "eq", "owner"> = (bu eq "owner")
         let d = defs();
         let obj = Object::Seq(vec![
@@ -2241,7 +2241,7 @@ mod tests {
             Object::atom(primitives::EQ),
             Object::atom("owner"),
         ]);
-        let func = rho(&obj, &d);
+        let func = metacompose(&obj, &d);
         assert_eq!(apply(&func, &Object::atom("owner"), &d), Object::t());
         assert_eq!(apply(&func, &Object::atom("member"), &d), Object::f());
     }
@@ -2289,7 +2289,7 @@ mod tests {
             ),
         );
         let obj = func_to_object(&original);
-        let recovered = rho(&obj, &d);
+        let recovered = metacompose(&obj, &d);
         let input = Object::seq(vec![
             Object::seq(vec![Object::atom("1"), Object::atom("2"), Object::atom("3")]),
             Object::seq(vec![Object::atom("6"), Object::atom("5"), Object::atom("4")]),

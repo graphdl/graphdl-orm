@@ -134,6 +134,11 @@ interface engine {
     /// Prove a goal fact via backward chaining.
     prove: func(handle: u32, goal: string, population: population, world-assumption: world-assumption) -> string;
 
+    /// Metacomposition: (ρ fact):operation
+    /// The fact's first element (fact type) determines the function via ρ.
+    /// The resolved function receives <fact, operation> as its argument.
+    rho: func(handle: u32, fact-type: string, fact-bindings: list<binding>, operation: string) -> string;
+
     /// RMAP: schema -> table definitions.
     rmap: func(handle: u32) -> string;
 }
