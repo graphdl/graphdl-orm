@@ -327,7 +327,45 @@ impl exports::graphdl::arest::engine::Guest for E {
                     let input = ast::Object::seq(vec![state, ast::Object::atom(event)]);
                     state = ast::apply(transition, &input, &def_map);
                 }
-                format!(r#"{{"state":"{}"}}"#, state.as_atom().unwrap_or(""))
+                // <output, newstate> per Backus 14.3.1
+                // Output: current state + available transitions (HATEOAS)
+                let current = state.as_atom().unwrap_or("").to_string();
+                let mut available = vec![];
+                let events_all: Vec<String> = st.pop.facts.get("InstanceFact")
+                    .map(|facts| facts.iter()
+                        .filter(|f| f.bindings.iter().any(|(k, v)| k == "subjectNoun" && v == "Transition"))
+                        .filter_map(|f| {
+                            let obj_noun = f.bindings.iter().find(|(k, _)| k == "objectNoun").map(|(_, v)| v.as_str())?;
+                            if obj_noun == "Event Type" { f.bindings.iter().find(|(k, _)| k == "objectValue").map(|(_, v)| v.clone()) } else { None }
+                        })
+                        .collect::<std::collections::HashSet<_>>().into_iter().collect()
+                    ).unwrap_or_default();
+                for ev in &events_all {
+                    let inp = ast::Object::seq(vec![ast::Object::atom(&current), ast::Object::atom(ev)]);
+                    let next = ast::apply(transition, &inp, &def_map);
+                    if let Some(ns) = next.as_atom() {
+                        if ns != current { available.push(serde_json::json!({"event": ev, "to": ns})); }
+                    }
+                }
+                // Navigation links
+                let children_key = format!("nav:{}:children", noun);
+                let parent_key = format!("nav:{}:parent", noun);
+                let children = st.def(&children_key).map(|f| {
+                    let r = ast::apply(f, &ast::Object::phi(), &def_map);
+                    r.as_seq().map(|s| s.iter().filter_map(|o| o.as_atom().map(|a| a.to_string())).collect::<Vec<_>>()).unwrap_or_default()
+                }).unwrap_or_default();
+                let parents = st.def(&parent_key).map(|f| {
+                    let r = ast::apply(f, &ast::Object::phi(), &def_map);
+                    r.as_seq().map(|s| s.iter().filter_map(|o| o.as_atom().map(|a| a.to_string())).collect::<Vec<_>>()).unwrap_or_default()
+                }).unwrap_or_default();
+                serde_json::to_string(&serde_json::json!({
+                    "output": {
+                        "state": current,
+                        "transitions": available,
+                        "nav": { "children": children, "parent": parents },
+                    },
+                    "newstate": { "status": current }
+                })).unwrap_or_else(|_| "{}".into())
             }
             "transitions" => {
                 let args: serde_json::Value = serde_json::from_str(&input).unwrap_or_default();
