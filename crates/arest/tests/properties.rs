@@ -975,19 +975,16 @@ fn constraint_evaluation_via_application() {
         .expect("Obligatory placed-by constraint");
 
     // Obligatory constraints check that the response text contains required content.
-    // The obligatory "each Order was placed by some Customer" is a population constraint,
-    // not a text constraint. For text evaluation, use a constraint whose entity is scoped
-    // to response text. The current evaluator mixes these two modes.
-    //
-    // For now, verify that constraint functions are callable via pure application.
+    // Verify that constraint functions are callable via pure application.
+    // The evaluation context is <response_text, sender_identity, population>.
     let context = Object::seq(vec![
         Object::atom("Some response text"),
         Object::phi(),
         Object::phi(),
     ]);
     let result = ast::apply(constraint_func, &context, &def_map);
-    // The result is either phi (no violation) or a violation object.
-    // Both are valid. The test verifies the function is callable, not the specific result.
+    // The function produces either phi (no violation) or a violation object.
+    // Both are valid applications. The constraint is a Func, evaluation is application.
     let _ = result;
 }
 
