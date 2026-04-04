@@ -1,6 +1,6 @@
-// crates/arest/src/naming.rs
+﻿// crates/arest/src/naming.rs
 //
-// Convention-based naming — pure functions, no I/O.
+// Convention-based naming â€” pure functions, no I/O.
 // Noun names are the authority (from readings).
 // Slugs and table names are deterministic projections.
 
@@ -11,21 +11,21 @@ pub fn pluralize(word: &str) -> String {
         return format!("{}es", word);
     }
     if lower.ends_with('z') {
-        return format!("{}zes", word); // Quiz → Quizzes
+        return format!("{}zes", word); // Quiz â†’ Quizzes
     }
     if lower.ends_with('s') {
-        return format!("{}es", word); // Status → Statuses
+        return format!("{}es", word); // Status â†’ Statuses
     }
     if lower.ends_with('y') && !lower.ends_with("ay") && !lower.ends_with("ey") && !lower.ends_with("oy") && !lower.ends_with("uy") && !lower.ends_with("iy") {
-        return format!("{}ies", &word[..word.len() - 1]); // Entity → Entities
+        return format!("{}ies", &word[..word.len() - 1]); // Entity â†’ Entities
     }
     format!("{}s", word)
 }
 
-/// Noun name → REST collection slug (kebab-case, pluralized).
-/// "Organization" → "organizations"
-/// "OrgMembership" → "org-memberships"
-/// "Graph Schema" → "graph-schemas"
+/// Noun name â†’ REST collection slug (kebab-case, pluralized).
+/// "Organization" â†’ "organizations"
+/// "OrgMembership" â†’ "org-memberships"
+/// "Graph Schema" â†’ "graph-schemas"
 pub fn noun_to_slug(name: &str) -> String {
     let words = split_noun(name);
     words.iter().enumerate()
@@ -37,10 +37,10 @@ pub fn noun_to_slug(name: &str) -> String {
         .join("-")
 }
 
-/// Noun name → SQL table name (snake_case, pluralized).
-/// "Organization" → "organizations"
-/// "OrgMembership" → "org_memberships"
-/// "Graph Schema" → "graph_schemas"
+/// Noun name â†’ SQL table name (snake_case, pluralized).
+/// "Organization" â†’ "organizations"
+/// "OrgMembership" â†’ "org_memberships"
+/// "Graph Schema" â†’ "graph_schemas"
 pub fn noun_to_table(name: &str) -> String {
     let words = split_noun(name);
     words.iter().enumerate()
@@ -78,12 +78,12 @@ fn split_noun(name: &str) -> Vec<String> {
 ///
 /// Returns None if no reference scheme, ref scheme is "id", or no matching field.
 pub fn resolve_entity_id(
-    ir: &crate::types::ConstraintIR,
+    ir: &crate::types::Domain,
     noun_name: &str,
     fields: &std::collections::HashMap<String, String>,
 ) -> Option<String> {
     let _noun_def = ir.nouns.get(noun_name)?;
-    // Reference scheme is not stored in the IR nouns directly — it's in the
+    // Reference scheme is not stored in the IR nouns directly â€” it's in the
     // fact types where this noun plays a role with a value-type noun.
     // For now, check if any fact type has this noun as subject with a value-type object.
     // The first value-type role's field value becomes the ID.

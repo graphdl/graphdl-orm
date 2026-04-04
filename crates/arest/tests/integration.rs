@@ -2,7 +2,7 @@
 //
 // Integration tests exercise the compile + evaluate pipeline directly,
 // bypassing the wasm_bindgen layer (which requires JsValue).
-use arest::types::{ConstraintIR, ResponseContext, Population};
+use arest::types::{Domain, ResponseContext, Population};
 use arest::compile;
 use arest::evaluate;
 
@@ -35,7 +35,7 @@ fn test_full_pipeline_forbidden_text() {
         "enumValues": { "ProhibitedText": ["—", "–"] }
     }"#;
 
-    let ir: ConstraintIR = serde_json::from_str(ir_json).unwrap();
+    let ir: Domain = serde_json::from_str(ir_json).unwrap();
     let model = compile::compile(&ir);
 
     let response: ResponseContext = serde_json::from_str(
@@ -76,7 +76,7 @@ fn test_full_pipeline_clean_response() {
         "stateMachines": {}
     }"#;
 
-    let ir: ConstraintIR = serde_json::from_str(ir_json).unwrap();
+    let ir: Domain = serde_json::from_str(ir_json).unwrap();
     let model = compile::compile(&ir);
 
     let response: ResponseContext = serde_json::from_str(
@@ -115,7 +115,7 @@ fn test_full_pipeline_uniqueness_violation() {
         "stateMachines": {}
     }"#;
 
-    let ir: ConstraintIR = serde_json::from_str(ir_json).unwrap();
+    let ir: Domain = serde_json::from_str(ir_json).unwrap();
     let model = compile::compile(&ir);
 
     // Customer c1 has two names -> UC violation
@@ -165,7 +165,7 @@ fn test_dual_instance_convergence_valid() {
         "stateMachines": {}
     }"#;
 
-    let ir: ConstraintIR = serde_json::from_str(ir_json).unwrap();
+    let ir: Domain = serde_json::from_str(ir_json).unwrap();
 
     // Two independent compiled models (server and client)
     let server_model = compile::compile(&ir);
@@ -221,7 +221,7 @@ fn test_dual_instance_concurrent_write_conflict() {
         "stateMachines": {}
     }"#;
 
-    let ir: ConstraintIR = serde_json::from_str(ir_json).unwrap();
+    let ir: Domain = serde_json::from_str(ir_json).unwrap();
     let server_model = compile::compile(&ir);
 
     let response: ResponseContext = serde_json::from_str(
@@ -299,7 +299,7 @@ fn test_dual_instance_forward_chain_convergence() {
         "stateMachines": {}
     }"#;
 
-    let ir: ConstraintIR = serde_json::from_str(ir_json).unwrap();
+    let ir: Domain = serde_json::from_str(ir_json).unwrap();
     let server_model = compile::compile(&ir);
     let client_model = compile::compile(&ir);
 

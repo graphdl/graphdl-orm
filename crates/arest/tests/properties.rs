@@ -140,7 +140,7 @@ Product 'WIDGET-1' has Price '9.99'.
 Product 'GADGET-2' has Price '24.99'.
 "#;
 
-fn compile_orders() -> (arest::types::ConstraintIR, arest::compile::CompiledModel) {
+fn compile_orders() -> (arest::types::Domain, arest::compile::CompiledModel) {
     // Parse metamodel first to get state machine nouns
     let meta = parse_forml2::parse_markdown(STATE_METAMODEL).unwrap();
     // Parse business domain with metamodel nouns in context
@@ -589,4 +589,49 @@ fn rmap_produces_tables_for_entities() {
     let table_names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
     assert!(table_names.iter().any(|n| n.contains("order") || n.contains("Order")),
         "Should have a table related to Order");
+}
+
+// ── Paper Claim: Everything is Facts ─────────────────────────────────
+// The parser should produce a Population. The compiler should accept a
+// Population. There should be no struct between them.
+
+#[test]
+fn paper_claim_parse_produces_population() {
+    // parse_to_population should exist and return Population
+    let pop = parse_forml2::parse_to_population(ORDERS_DOMAIN).unwrap();
+    // The population should contain noun facts
+    assert!(pop.facts.contains_key("Noun"), "Population should contain Noun facts");
+    // The population should contain graph schema facts
+    assert!(pop.facts.contains_key("GraphSchema"), "Population should contain GraphSchema facts");
+    // The population should contain constraint facts
+    assert!(pop.facts.contains_key("Constraint"), "Population should contain Constraint facts");
+}
+
+#[test]
+fn paper_claim_compile_from_population() {
+    let meta_pop = parse_forml2::parse_to_population(STATE_METAMODEL).unwrap();
+    let orders_pop = parse_forml2::parse_to_population_with_nouns(ORDERS_DOMAIN, &meta_pop).unwrap();
+    let mut pop = meta_pop;
+    for (k, v) in orders_pop.facts {
+        pop.facts.entry(k).or_default().extend(v);
+    }
+    let model = compile::compile_from_population(&pop);
+    assert!(!model.state_machines.is_empty(), "Should compile state machines from population");
+}
+
+#[test]
+fn paper_claim_population_round_trip() {
+    // Parse to population, compile, run state machine. Same result as Domain path.
+    let meta_pop = parse_forml2::parse_to_population(STATE_METAMODEL).unwrap();
+    let orders_pop = parse_forml2::parse_to_population_with_nouns(ORDERS_DOMAIN, &meta_pop).unwrap();
+    let mut merged = meta_pop;
+    for (k, v) in orders_pop.facts {
+        merged.facts.entry(k).or_default().extend(v);
+    }
+    let model = compile::compile_from_population(&merged);
+    let sm = model.state_machines.iter()
+        .find(|sm| sm.noun_name == "Order")
+        .expect("Should have Order state machine from population");
+    assert_eq!(sm.initial, "In Cart");
+    assert_eq!(evaluate::run_machine_ast(sm, &["place", "ship", "deliver"]), "Delivered");
 }

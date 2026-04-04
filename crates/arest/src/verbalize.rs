@@ -1,18 +1,18 @@
-// crates/arest/src/verbalize.rs
+﻿// crates/arest/src/verbalize.rs
 //
-// compile⁻¹: Recover FORML 2 readings from compiled constraints.
+// compileâ»Â¹: Recover FORML 2 readings from compiled constraints.
 //
 // Given a ConstraintDef (the IR representation), produce the FORML 2
 // verbalization following Halpin & Curland's patterns (TechReport ORM2-02).
 //
-// This is the inverse of parse_forml2.rs → compile.rs. Together they
+// This is the inverse of parse_forml2.rs â†’ compile.rs. Together they
 // close the specification equivalence loop (Theorem 2 of the AREST paper):
-//   verbalize ∘ compile⁻¹ ∘ compile ∘ parse = id
+//   verbalize âˆ˜ compileâ»Â¹ âˆ˜ compile âˆ˜ parse = id
 
 use crate::types::*;
 
 /// Verbalize a constraint back to its FORML 2 reading.
-pub fn verbalize_constraint(constraint: &ConstraintDef, ir: &ConstraintIR) -> String {
+pub fn verbalize_constraint(constraint: &ConstraintDef, ir: &Domain) -> String {
     let modal = match (constraint.modality.as_str(), constraint.deontic_operator.as_deref()) {
         ("deontic", Some("forbidden")) => "It is forbidden that ",
         ("deontic", Some("obligatory")) => "It is obligatory that ",
@@ -80,7 +80,7 @@ pub fn verbalize_constraint(constraint: &ConstraintDef, ir: &ConstraintIR) -> St
 }
 
 /// Verbalize an entity type declaration.
-pub fn verbalize_noun(name: &str, def: &NounDef, ir: &ConstraintIR) -> String {
+pub fn verbalize_noun(name: &str, def: &NounDef, ir: &Domain) -> String {
     match def.object_type.as_str() {
         "entity" => {
             if let Some(refs) = ir.ref_schemes.get(name) {
@@ -102,7 +102,7 @@ pub fn verbalize_noun(name: &str, def: &NounDef, ir: &ConstraintIR) -> String {
 }
 
 /// Verbalize a subtype declaration.
-pub fn verbalize_subtype(name: &str, ir: &ConstraintIR) -> Option<String> {
+pub fn verbalize_subtype(name: &str, ir: &Domain) -> Option<String> {
     ir.subtypes.get(name).map(|sup| format!("{} is a subtype of {}.", name, sup))
 }
 
@@ -112,7 +112,7 @@ pub fn verbalize_fact_type(ft: &FactTypeDef) -> String {
 }
 
 /// Verbalize an entire IR back to a FORML 2 document.
-pub fn verbalize_ir(ir: &ConstraintIR) -> String {
+pub fn verbalize_ir(ir: &Domain) -> String {
     let mut lines: Vec<String> = Vec::new();
 
     // Domain header
@@ -208,7 +208,7 @@ fn extract_predicate(reading: &str, noun_a: &str, noun_b: &str) -> String {
     reading.split_whitespace().skip(1).collect::<Vec<_>>().join(" ")
 }
 
-// ── Tests ───────────────────────────────────────────────────────────
+// â”€â”€ Tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[cfg(test)]
 mod tests {
@@ -241,7 +241,7 @@ mod tests {
         let ir = parse_forml2::parse_markdown(input).unwrap();
         let uc = ir.constraints.iter().find(|c| c.kind == "UC").unwrap();
         let mc = ir.constraints.iter().find(|c| c.kind == "MC").unwrap();
-        // Both UC and MC split from "exactly one" — verify both exist
+        // Both UC and MC split from "exactly one" â€” verify both exist
         assert_eq!(uc.kind, "UC");
         assert_eq!(mc.kind, "MC");
         // Verbalization returns the constraint text
@@ -257,7 +257,7 @@ mod tests {
             object_type: "entity".to_string(),
             world_assumption: WorldAssumption::default(),
         };
-        let mut ir = ConstraintIR::default();
+        let mut ir = Domain::default();
         ir.ref_schemes.insert("Customer".to_string(), vec!["Email".to_string()]);
         assert_eq!(verbalize_noun("Customer", &def, &ir), "Customer(.Email) is an entity type.");
     }
@@ -268,7 +268,7 @@ mod tests {
             object_type: "value".to_string(),
             world_assumption: WorldAssumption::default(),
         };
-        let mut ir = ConstraintIR::default();
+        let mut ir = Domain::default();
         ir.enum_values.insert("Gender".to_string(), vec!["M".to_string(), "F".to_string()]);
         let v = verbalize_noun("Gender", &def, &ir);
         assert!(v.contains("Gender is a value type."), "got: {}", v);
