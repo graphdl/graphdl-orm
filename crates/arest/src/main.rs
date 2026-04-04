@@ -37,7 +37,7 @@ mod arest;
 #[allow(dead_code)]
 mod validate;
 
-use types::{Domain, ResponseContext, Population};
+use types::{Domain, Population};
 use query::QueryPredicate;
 
 fn main() {
@@ -123,28 +123,20 @@ fn main() {
     }
 
     // â”€â”€ Evaluate mode (default) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    let response: ResponseContext = if let Some(t) = text {
-        ResponseContext { text: t, sender_identity: None, fields: None }
+    let response_text: String = if let Some(t) = text {
+        t
     } else if let Some(p) = response_path {
-        let json = std::fs::read_to_string(&p)
-            .unwrap_or_else(|e| { eprintln!("Failed to read response file: {}", e); std::process::exit(1); });
-        serde_json::from_str(&json)
-            .unwrap_or_else(|e| { eprintln!("Failed to parse response: {}", e); std::process::exit(1); })
+        std::fs::read_to_string(&p)
+            .unwrap_or_else(|e| { eprintln!("Failed to read response file: {}", e); std::process::exit(1); })
     } else {
-        // Read from stdin
         let mut input = String::new();
         std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)
             .unwrap_or_else(|e| { eprintln!("Failed to read stdin: {}", e); std::process::exit(1); });
-        if input.trim().starts_with('{') {
-            serde_json::from_str(&input)
-                .unwrap_or_else(|e| { eprintln!("Failed to parse stdin JSON: {}", e); std::process::exit(1); })
-        } else {
-            ResponseContext { text: input.trim().to_string(), sender_identity: None, fields: None }
-        }
+        input.trim().to_string()
     };
 
     let population = load_population(population_path, false);
-    let violations = evaluate::evaluate_via_ast(&model, &response, &population);
+    let violations = evaluate::evaluate_via_ast(&model, &response_text, None, &population);
 
     if violations.is_empty() {
         println!("OK â€” no violations");

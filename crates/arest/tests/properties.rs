@@ -7,7 +7,7 @@
 use arest::parse_forml2;
 use arest::compile;
 use arest::evaluate;
-use arest::types::{ResponseContext, Population, FactInstance};
+use arest::types::{Population, FactInstance};
 use std::collections::HashMap;
 
 // ── Metamodel ────────────────────────────────────────────────────────
@@ -439,13 +439,8 @@ fn c6_terminal_states_are_derived() {
 #[test]
 fn c7_deontic_violation_returns_reading_text() {
     let (_, model) = compile_orders();
-    let response = ResponseContext {
-        text: "We will ship your order overnight for fast delivery".to_string(),
-        sender_identity: None,
-        fields: None,
-    };
     let pop = Population { facts: HashMap::new() };
-    let violations = evaluate::evaluate_via_ast(&model, &response, &pop);
+    let violations = evaluate::evaluate_via_ast(&model, "We will ship your order overnight for fast delivery", None, &pop);
     let shipping_v = violations.iter()
         .find(|v| v.constraint_text.contains("Prohibited Shipping Method"));
     assert!(shipping_v.is_some(), "Should catch 'Overnight' via Prohibited Shipping Method enum");
@@ -1092,22 +1087,12 @@ It is forbidden that Support Response contains Prohibited Word.
     let model = compile::compile(&ir);
 
     // Bad response: body contains "overnight"
-    let bad = arest::types::ResponseContext {
-        text: "We will ship overnight".to_string(),
-        sender_identity: None,
-        fields: None,
-    };
     let pop = Population { facts: HashMap::new() };
-    let violations = evaluate::evaluate_via_ast(&model, &bad, &pop);
+    let violations = evaluate::evaluate_via_ast(&model, "We will ship overnight", None, &pop);
     assert!(!violations.is_empty(), "Should catch 'overnight' via enum matching");
 
     // Good response: no prohibited words
-    let good = arest::types::ResponseContext {
-        text: "We will ship via standard delivery".to_string(),
-        sender_identity: None,
-        fields: None,
-    };
-    let good_violations = evaluate::evaluate_via_ast(&model, &good, &pop);
+    let good_violations = evaluate::evaluate_via_ast(&model, "We will ship via standard delivery", None, &pop);
     let prohibited_violations: Vec<_> = good_violations.iter()
         .filter(|v| v.constraint_text.contains("Prohibited Word"))
         .collect();

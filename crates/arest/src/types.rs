@@ -232,16 +232,6 @@ impl Population {
     }
 }
 
-/// The response being evaluated (for deontic text constraints).
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ResponseContext {
-    pub text: String,
-    pub sender_identity: Option<String>,
-    #[allow(dead_code)] // deserialized from JSON, read by JS callers
-    pub fields: Option<HashMap<String, String>>,
-}
-
 /// A constraint violation.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]

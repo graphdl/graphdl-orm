@@ -99,17 +99,13 @@ impl fmt::Display for Object {
 // The population is the data. It encodes as an Object for evaluation.
 // Facts become sequences. The population becomes a sequence of tagged sequences.
 
-use crate::types::{Population, ResponseContext, Violation};
+use crate::types::{Population, Violation};
 
-/// Encode an evaluation context (response + population) as a single Object.
+/// Encode an evaluation context as a single Object.
 /// Structure: <response_text, sender_identity, population>
-/// sender_identity: atom if present, φ if None
-/// Each fact_type: <fact_type_id, <fact₁, fact₂, ...>>
-/// Each fact: <binding₁, binding₂, ...>
-/// Each binding: <noun_name, value>
-pub fn encode_eval_context(response: &ResponseContext, population: &Population) -> Object {
-    let response_obj = Object::atom(&response.text);
-    let sender_obj = match &response.sender_identity {
+pub fn encode_eval_context(text: &str, sender: Option<&str>, population: &Population) -> Object {
+    let response_obj = Object::atom(text);
+    let sender_obj = match sender {
         Some(s) => Object::atom(s),
         None => Object::phi(),
     };

@@ -1,8 +1,8 @@
-// crates/arest/tests/integration.rs
+﻿// crates/arest/tests/integration.rs
 //
 // Integration tests exercise the compile + evaluate pipeline directly,
 // bypassing the wasm_bindgen layer (which requires JsValue).
-use arest::types::{Domain, ResponseContext, Population};
+use arest::types::{Domain, Population};
 use arest::compile;
 use arest::evaluate;
 
@@ -32,18 +32,14 @@ fn test_full_pipeline_forbidden_text() {
             "spans": [{ "factTypeId": "ft1", "roleIndex": 0 }]
         }],
         "stateMachines": {},
-        "enumValues": { "ProhibitedText": ["—", "–"] }
+        "enumValues": { "ProhibitedText": ["â€”", "â€“"] }
     }"#;
 
     let ir: Domain = serde_json::from_str(ir_json).unwrap();
     let model = compile::compile(&ir);
 
-    let response: ResponseContext = serde_json::from_str(
-        r#"{"text": "Hello — how are you?", "senderIdentity": null, "fields": null}"#
-    ).unwrap();
-    let population: Population = serde_json::from_str(r#"{"facts": {}}"#).unwrap();
-
-    let violations = evaluate::evaluate_via_ast(&model, &response, &population);
+    let population: Population = serde_json::from_str(r#”{“facts”: {}}”#).unwrap();
+    let violations = evaluate::evaluate_via_ast(&model, “Hello \u{2014} how are you?”, None, &population);
     assert!(!violations.is_empty());
 }
 
@@ -55,7 +51,7 @@ fn test_full_pipeline_clean_response() {
             "SupportResponse": { "objectType": "entity" },
             "ProhibitedText": { "objectType": "value" }
         },
-        "enumValues": { "ProhibitedText": ["—"] },
+        "enumValues": { "ProhibitedText": ["â€”"] },
         "factTypes": {
             "ft1": {
                 "reading": "SupportResponse contains ProhibitedText",
@@ -79,12 +75,9 @@ fn test_full_pipeline_clean_response() {
     let ir: Domain = serde_json::from_str(ir_json).unwrap();
     let model = compile::compile(&ir);
 
-    let response: ResponseContext = serde_json::from_str(
-        r#"{"text": "Hello, how are you today?", "senderIdentity": null, "fields": null}"#
-    ).unwrap();
     let population: Population = serde_json::from_str(r#"{"facts": {}}"#).unwrap();
 
-    let violations = evaluate::evaluate_via_ast(&model, &response, &population);
+    let violations = evaluate::evaluate_via_ast(&model, "", None, &population);
     assert!(violations.is_empty());
 }
 
@@ -119,9 +112,6 @@ fn test_full_pipeline_uniqueness_violation() {
     let model = compile::compile(&ir);
 
     // Customer c1 has two names -> UC violation
-    let response: ResponseContext = serde_json::from_str(
-        r#"{"text": "", "senderIdentity": null, "fields": null}"#
-    ).unwrap();
     let population: Population = serde_json::from_str(r#"{"facts": {
         "ft1": [
             { "factTypeId": "ft1", "bindings": [["Customer", "c1"], ["Name", "Alice"]] },
@@ -129,13 +119,13 @@ fn test_full_pipeline_uniqueness_violation() {
         ]
     }}"#).unwrap();
 
-    let violations = evaluate::evaluate_via_ast(&model, &response, &population);
+    let violations = evaluate::evaluate_via_ast(&model, "", None, &population);
     assert_eq!(violations.len(), 1);
     assert!(violations[0].detail.contains("Uniqueness violation"));
     assert_eq!(violations[0].constraint_id, "c1");
 }
 
-// ── Dual-instance convergence tests (Definition 2) ──────────────────
+// â”€â”€ Dual-instance convergence tests (Definition 2) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// Two compiled models from the same IR produce identical evaluation results.
 #[test]
@@ -171,10 +161,6 @@ fn test_dual_instance_convergence_valid() {
     let server_model = compile::compile(&ir);
     let client_model = compile::compile(&ir);
 
-    let response: ResponseContext = serde_json::from_str(
-        r#"{"text": "", "senderIdentity": null, "fields": null}"#
-    ).unwrap();
-
     // Valid population: each order has one customer
     let population: Population = serde_json::from_str(r#"{"facts": {
         "ft1": [
@@ -183,8 +169,8 @@ fn test_dual_instance_convergence_valid() {
         ]
     }}"#).unwrap();
 
-    let server_violations = evaluate::evaluate_via_ast(&server_model, &response, &population);
-    let client_violations = evaluate::evaluate_via_ast(&client_model, &response, &population);
+    let server_violations = evaluate::evaluate_via_ast(&server_model, "", None, &population);
+    let client_violations = evaluate::evaluate_via_ast(&client_model, "", None, &population);
 
     // Both produce zero violations
     assert!(server_violations.is_empty(), "Server should see no violations");
@@ -224,10 +210,6 @@ fn test_dual_instance_concurrent_write_conflict() {
     let ir: Domain = serde_json::from_str(ir_json).unwrap();
     let server_model = compile::compile(&ir);
 
-    let response: ResponseContext = serde_json::from_str(
-        r#"{"text": "", "senderIdentity": null, "fields": null}"#
-    ).unwrap();
-
     // Client A's local view: ord-1 placed by acme (valid locally)
     let client_a_pop: Population = serde_json::from_str(r#"{"facts": {
         "ft1": [
@@ -243,8 +225,8 @@ fn test_dual_instance_concurrent_write_conflict() {
     }}"#).unwrap();
 
     // Both local views are valid
-    let a_violations = evaluate::evaluate_via_ast(&server_model, &response, &client_a_pop);
-    let b_violations = evaluate::evaluate_via_ast(&server_model, &response, &client_b_pop);
+    let a_violations = evaluate::evaluate_via_ast(&server_model, "", None, &client_a_pop);
+    let b_violations = evaluate::evaluate_via_ast(&server_model, "", None, &client_b_pop);
     assert!(a_violations.is_empty(), "Client A's local view is valid");
     assert!(b_violations.is_empty(), "Client B's local view is valid");
 
@@ -256,7 +238,7 @@ fn test_dual_instance_concurrent_write_conflict() {
         ]
     }}"#).unwrap();
 
-    let server_violations = evaluate::evaluate_via_ast(&server_model, &response, &merged_pop);
+    let server_violations = evaluate::evaluate_via_ast(&server_model, "", None, &merged_pop);
     assert_eq!(server_violations.len(), 1, "Server detects the conflict");
     assert!(server_violations[0].detail.contains("Uniqueness violation"));
 }

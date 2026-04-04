@@ -119,9 +119,8 @@ impl exports::graphdl::arest::engine::Guest for E {
     fn evaluate_response(handle: u32, text: String, sender: Option<String>, pop: exports::graphdl::arest::engine::Population) -> Vec<exports::graphdl::arest::engine::Violation> {
         let s = ds().lock().unwrap();
         let st = match s.get(handle as usize).and_then(|x| x.as_ref()) { Some(x) => x, None => return vec![] };
-        let r = types::ResponseContext { text, sender_identity: sender, fields: None };
         let p = ipop(&pop);
-        evaluate::evaluate_via_ast(&st.model, &r, &p).iter().map(ovio).collect()
+        evaluate::evaluate_via_ast(&st.model, &text, sender.as_deref(), &p).iter().map(ovio).collect()
     }
 
     fn get_deontic_constraints(handle: u32, noun: String) -> Vec<exports::graphdl::arest::engine::DeonticConstraint> {
@@ -166,9 +165,8 @@ impl exports::graphdl::arest::engine::Guest for E {
         let none = exports::graphdl::arest::engine::ConstraintResult { violated: false, violation: None };
         let s = ds().lock().unwrap();
         let st = match s.get(handle as usize).and_then(|x| x.as_ref()) { Some(x) => x, None => return none };
-        let r = types::ResponseContext { text, sender_identity: sender, fields: None };
         let p = ipop(&pop);
-        let ctx = ast::encode_eval_context(&r, &p);
+        let ctx = ast::encode_eval_context(&text, sender.as_deref(), &p);
         let defs = HashMap::new();
         let idx = match st.model.noun_index.constraint_index.get(&cid) { Some(&i) => i, None => return none };
         let cc = match st.model.constraints.get(idx) { Some(c) => c, None => return none };

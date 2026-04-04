@@ -110,8 +110,7 @@ pub fn validate_schema(
     domain_ir: &Domain,
 ) -> Vec<Violation> {
     let population = ir_to_metamodel_population(domain_ir);
-    let response = ResponseContext { text: String::new(), sender_identity: None, fields: None };
-    let mut violations = evaluate::evaluate_via_ast(validation_model, &response, &population);
+    let mut violations = evaluate::evaluate_via_ast(validation_model, "", None, &population);
 
     // Objectification atomicity check (Halpin, "Objectification and Atomicity", 2020):
     // If a noun objectifies a fact type, that fact type must have a spanning UC.

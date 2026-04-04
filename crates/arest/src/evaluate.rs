@@ -15,8 +15,8 @@ use crate::ast;
 /// Evaluate all compiled constraints via AST reduction.
 /// Evaluation = beta reduction: apply(func, object) â†’ violations.
 /// Alethic constraints always reject. Deontic violations are tagged as non-alethic.
-pub fn evaluate_via_ast(model: &CompiledModel, response: &ResponseContext, population: &Population) -> Vec<Violation> {
-    let ctx_obj = ast::encode_eval_context(response, population);
+pub fn evaluate_via_ast(model: &CompiledModel, text: &str, sender: Option<&str>, population: &Population) -> Vec<Violation> {
+    let ctx_obj = ast::encode_eval_context(text, sender, population);
     let defs = std::collections::HashMap::new();
 
     model.constraints.iter()

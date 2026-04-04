@@ -212,8 +212,7 @@ fn apply_create_entity(
 
     // â”€â”€ validate â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     // Evaluate constraints against the complete population (base + derived).
-    let response = ResponseContext { text: String::new(), sender_identity: None, fields: None };
-    let violations = crate::evaluate::evaluate_via_ast(model, &response, &new_pop);
+    let violations = crate::evaluate::evaluate_via_ast(model, "", None, &new_pop);
 
     // Alethic violations are structural impossibilities â€” always reject.
     // Deontic violations are reportable but don't prevent the command.
@@ -293,8 +292,7 @@ fn apply_update_entity(
     let derived = crate::evaluate::forward_chain_ast(model, &mut new_pop);
 
     // validate: evaluate constraints against complete population
-    let response = ResponseContext { text: String::new(), sender_identity: None, fields: None };
-    let violations = crate::evaluate::evaluate_via_ast(model, &response, &new_pop);
+    let violations = crate::evaluate::evaluate_via_ast(model, "", None, &new_pop);
     let rejected = violations.iter().any(|v| v.alethic);
 
     // emit: produce representation
