@@ -727,3 +727,174 @@ fn ffp_evaluation_is_application() {
     assert_eq!(state.as_atom(), Some("Delivered"),
         "State machine evaluation is a fold of the transition function over events");
 }
+
+// ── Algebraic Laws (Backus Section 12.2) ─────────────────────────────
+// The compiled functions must obey the FP algebra.
+// These laws are what make the system provably correct by
+// algebraic manipulation, not by testing individual cases.
+
+#[test]
+fn law_i1_construction_distributes_over_composition() {
+    // [f1,...,fn]∘g = [f1∘g,...,fn∘g]
+    // Construction of composed functions = composition of constructions
+    use arest::ast::{self, Func, Object};
+    let defs = HashMap::new();
+
+    // f1 = selector 1, f2 = selector 2, g = reverse
+    // [s1, s2] ∘ reverse applied to <A, B> should equal [s1∘reverse, s2∘reverse] applied to <A, B>
+    let s1 = Func::Selector(1);
+    let s2 = Func::Selector(2);
+    let input = Object::seq(vec![Object::atom("A"), Object::atom("B")]);
+
+    // Left side: [s1, s2] ∘ reverse : <A, B>
+    // reverse:<A,B> = <B,A>, then [s1,s2]:<B,A> = <B,A>
+    let construction = Func::construction(vec![s1.clone(), s2.clone()]);
+    let reversed_input = Object::seq(vec![Object::atom("B"), Object::atom("A")]);
+    let left = ast::apply(&construction, &reversed_input, &defs);
+
+    // Right side: [s1∘reverse, s2∘reverse] : <A, B>
+    // s1∘reverse:<A,B> = s1:<B,A> = B
+    // s2∘reverse:<A,B> = s2:<B,A> = A
+    let s1_rev = Func::compose(s1.clone(), Func::Reverse);
+    let s2_rev = Func::compose(s2.clone(), Func::Reverse);
+    let right_construction = Func::construction(vec![s1_rev, s2_rev]);
+    let right = ast::apply(&right_construction, &input, &defs);
+
+    assert_eq!(left, right, "Law I.1: [f1,...,fn]∘g = [f1∘g,...,fn∘g]");
+}
+
+#[test]
+fn law_i5_selector_extracts_from_construction() {
+    // s∘[f1,...,fn] ≤ fs (selector s extracts the sth element)
+    use arest::ast::{self, Func, Object};
+    let defs = HashMap::new();
+
+    let input = Object::atom("X");
+
+    // [constant("A"), constant("B"), constant("C")] : X = <A, B, C>
+    let construction = Func::construction(vec![
+        Func::constant(Object::atom("A")),
+        Func::constant(Object::atom("B")),
+        Func::constant(Object::atom("C")),
+    ]);
+    let constructed = ast::apply(&construction, &input, &defs);
+
+    // s2 ∘ [const A, const B, const C] : X should equal const B : X = B
+    let s2_of_construction = Func::compose(Func::Selector(2), construction);
+    let result = ast::apply(&s2_of_construction, &input, &defs);
+
+    assert_eq!(result.as_atom(), Some("B"), "Law I.5: s∘[f1,...,fn] = fs");
+}
+
+#[test]
+fn law_iii4_apply_to_all_distributes_over_composition() {
+    // α(f∘g) = αf ∘ αg
+    use arest::ast::{self, Func, Object};
+    let defs = HashMap::new();
+
+    // f = selector 1, g = reverse
+    // Input: <<1,2>, <3,4>>
+    let input = Object::seq(vec![
+        Object::seq(vec![Object::atom("1"), Object::atom("2")]),
+        Object::seq(vec![Object::atom("3"), Object::atom("4")]),
+    ]);
+
+    // Left: α(s1 ∘ reverse) : <<1,2>,<3,4>>
+    // s1∘reverse:<1,2> = s1:<2,1> = 2
+    // s1∘reverse:<3,4> = s1:<4,3> = 4
+    // Result: <2, 4>
+    let f_comp_g = Func::compose(Func::Selector(1), Func::Reverse);
+    let left = ast::apply(&Func::ApplyToAll(Box::new(f_comp_g)), &input, &defs);
+
+    // Right: αs1 ∘ αreverse : <<1,2>,<3,4>>
+    // αreverse:<<1,2>,<3,4>> = <<2,1>,<4,3>>
+    // αs1:<<2,1>,<4,3>> = <2, 4>
+    let alpha_g = Func::ApplyToAll(Box::new(Func::Reverse));
+    let alpha_f = Func::ApplyToAll(Box::new(Func::Selector(1)));
+    let right_func = Func::compose(alpha_f, alpha_g);
+    let right = ast::apply(&right_func, &input, &defs);
+
+    assert_eq!(left, right, "Law III.4: α(f∘g) = αf ∘ αg");
+}
+
+#[test]
+fn law_iii1_constant_absorbs_composition() {
+    // x̄ ∘ f = x̄ (constant composed with anything is still constant)
+    use arest::ast::{self, Func, Object};
+    let defs = HashMap::new();
+
+    let constant_a = Func::constant(Object::atom("A"));
+    let composed = Func::compose(constant_a.clone(), Func::Selector(1));
+
+    let input = Object::seq(vec![Object::atom("X"), Object::atom("Y")]);
+    let left = ast::apply(&composed, &input, &defs);
+    let right = ast::apply(&constant_a, &input, &defs);
+
+    assert_eq!(left, right, "Law III.1: x̄∘f = x̄");
+}
+
+#[test]
+fn law_iii2_composition_with_identity() {
+    // f∘id = id∘f = f
+    use arest::ast::{self, Func, Object};
+    let defs = HashMap::new();
+
+    let f = Func::Selector(1);
+    let input = Object::seq(vec![Object::atom("A"), Object::atom("B")]);
+
+    let f_id = Func::compose(f.clone(), Func::Id);
+    let id_f = Func::compose(Func::Id, f.clone());
+
+    let result_f = ast::apply(&f, &input, &defs);
+    let result_f_id = ast::apply(&f_id, &input, &defs);
+    let result_id_f = ast::apply(&id_f, &input, &defs);
+
+    assert_eq!(result_f, result_f_id, "Law III.2: f∘id = f");
+    assert_eq!(result_f, result_id_f, "Law III.2: id∘f = f");
+}
+
+#[test]
+fn law_insert_fold_right() {
+    // /f:<x1,...,xn> = f:<x1, /f:<x2,...,xn>>
+    use arest::ast::{self, Func, Object};
+    let defs = HashMap::new();
+
+    // /+:<1,2,3> should equal +:<1, +:<2, 3>> = +:<1, 5> = 6
+    // But we use atoms, so test with a function we can verify.
+    // /[s1, s2]:<A,B,C> = [s1,s2]:<A, [s1,s2]:<B,C>>
+    //                    = [s1,s2]:<A, <B,C>>
+    //                    = <A, <B,C>>
+    let pair = Func::construction(vec![Func::Selector(1), Func::Selector(2)]);
+    let fold = Func::Insert(Box::new(pair));
+    let input = Object::seq(vec![Object::atom("A"), Object::atom("B"), Object::atom("C")]);
+    let result = ast::apply(&fold, &input, &defs);
+
+    // /[s1,s2]:<A,B,C> = [s1,s2]:<A, /[s1,s2]:<B,C>>
+    // /[s1,s2]:<B,C> = [s1,s2]:<B,C> = <B,C> (base case: 2 elements)
+    // [s1,s2]:<A, <B,C>> = <A, <B,C>>
+    let expected = Object::seq(vec![Object::atom("A"), Object::seq(vec![Object::atom("B"), Object::atom("C")])]);
+    assert_eq!(result, expected, "Insert (fold right): /f:<x1,...,xn> = f:<x1, /f:<x2,...,xn>>");
+}
+
+#[test]
+fn law_condition_selects_branch() {
+    // (p → f; g):x = f:x if p:x = T, g:x if p:x = F
+    use arest::ast::{self, Func, Object};
+    let defs = HashMap::new();
+
+    // Predicate: eq∘[s1, s2] (are first two elements equal?)
+    let pred = Func::compose(Func::Eq, Func::construction(vec![Func::Selector(1), Func::Selector(2)]));
+    let f = Func::constant(Object::atom("EQUAL"));
+    let g = Func::constant(Object::atom("NOT_EQUAL"));
+    let cond = Func::condition(pred, f, g);
+
+    // <A, A> should produce "EQUAL"
+    let same = Object::seq(vec![Object::atom("A"), Object::atom("A")]);
+    assert_eq!(ast::apply(&cond, &same, &defs).as_atom(), Some("EQUAL"),
+        "Condition: p:x = T → f:x");
+
+    // <A, B> should produce "NOT_EQUAL"
+    let diff = Object::seq(vec![Object::atom("A"), Object::atom("B")]);
+    assert_eq!(ast::apply(&cond, &diff, &defs).as_atom(), Some("NOT_EQUAL"),
+        "Condition: p:x = F → g:x");
+}
