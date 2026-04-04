@@ -1,12 +1,12 @@
 /**
- * Seed endpoint tests.
+ * Parse endpoint tests.
  *
- * The seed pipeline: raw markdown → parseReadings (WASM) → materializeBatch → cells in D.
+ * The parse pipeline: raw markdown → parseReadings (WASM) → materializeBatch → cells in D.
  * Tests mock the WASM parseReadings and the Registry.
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { handleSeed } from './seed'
+import { handleParse } from './parse'
 import type { Env } from '../types'
 
 // Mock the WASM engine — seed.ts uses parseReadingsWithNouns
@@ -76,13 +76,13 @@ function jsonRequest(method: string, body?: any): Request {
   })
 }
 
-describe('handleSeed', () => {
+describe('handleParse', () => {
   beforeEach(() => { vi.clearAllMocks() })
 
   describe('GET /seed (stats)', () => {
     it('returns zero stats when no domains', async () => {
       const env = createMockEnv()
-      const res = await handleSeed(jsonRequest('GET'), env)
+      const res = await handleParse(jsonRequest('GET'), env)
       expect(res.status).toBe(200)
       const data = await res.json() as any
       expect(data.totals.domains).toBe(0)
@@ -99,7 +99,7 @@ describe('handleSeed', () => {
         wipeAll: vi.fn(async () => {}),
       }
       const env = createMockEnv({ registry })
-      const res = await handleSeed(jsonRequest('GET'), env)
+      const res = await handleParse(jsonRequest('GET'), env)
       const data = await res.json() as any
       expect(data.totals.domains).toBe(2)
       expect(data.totals.nouns).toBe(2)
@@ -112,7 +112,7 @@ describe('handleSeed', () => {
       const wipeAll = vi.fn(async () => {})
       const registry = { listDomains: vi.fn(async () => []), wipeAll }
       const env = createMockEnv({ registry })
-      const res = await handleSeed(jsonRequest('DELETE'), env)
+      const res = await handleParse(jsonRequest('DELETE'), env)
       expect(res.status).toBe(200)
       expect(wipeAll).toHaveBeenCalledOnce()
     })
@@ -130,7 +130,7 @@ describe('handleSeed', () => {
       }
       const env = createMockEnv({ registry })
 
-      const res = await handleSeed(jsonRequest('POST', {
+      const res = await handleParse(jsonRequest('POST', {
         domain: 'test',
         text: 'Student is an entity type.\nCourse is an entity type.\nStudent has Name.',
       }), env)
@@ -147,7 +147,7 @@ describe('handleSeed', () => {
 
     it('returns 400 with no readings', async () => {
       const env = createMockEnv()
-      const res = await handleSeed(jsonRequest('POST', {}), env)
+      const res = await handleParse(jsonRequest('POST', {}), env)
       expect(res.status).toBe(400)
     })
 
@@ -162,7 +162,7 @@ describe('handleSeed', () => {
       }
       const env = createMockEnv({ registry })
 
-      const res = await handleSeed(jsonRequest('POST', {
+      const res = await handleParse(jsonRequest('POST', {
         domains: [
           { slug: 'university', text: 'Student is an entity type.' },
           { slug: 'hr', text: 'Employee is an entity type.' },

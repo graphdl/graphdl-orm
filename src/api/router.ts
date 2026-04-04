@@ -2,7 +2,7 @@ import { AutoRouter, json, error } from 'itty-router'
 import type { Env } from '../types'
 import { parseQueryOptions } from './collections'
 import { nounToSlug, nounToTable, resolveSlugToNoun } from '../collections'
-import { handleSeed } from './seed'
+import { handleParse } from './parse'
 import { handleEvaluate, handleSynthesize } from './evaluate'
 import { handleListEntities, handleGetEntity, handleCreateEntity, handleDeleteEntity, buildEntityLinks } from './entity-routes'
 import { loadDomainSchema, loadDomainAndPopulation, buildPopulation, getTransitions, applyCommand, querySchema, forwardChain, getNounSchemas, deriveViewMetadata, deriveNavContext, getTopLevelNouns, computeRMAP, reconstructIR } from './engine'
@@ -11,7 +11,7 @@ import { handleArestRequest } from './arest-router'
 
 // ── Collection slug → noun type resolution ───────────────────────────
 // Resolved dynamically from the Registry via nounToSlug convention.
-// Noun entities are seeded from readings — no hardcoded maps.
+// Noun entities are materialized from parsed readings — no hardcoded maps.
 
 // ── DO helpers ───────────────────────────────────────────────────────
 
@@ -768,7 +768,7 @@ router.all('/api/query', async (request, env: Env) => {
 })
 
 // Seed is the ONLY ingestion path — readings → WASM parse → cells in D
-router.all('/api/seed', handleSeed)
+router.all('/api/parse', handleParse)
 
 router.get('/api/:collection', async (request, env: Env) => {
   const collection = decodeURIComponent(request.params.collection)
