@@ -1,4 +1,4 @@
-﻿// crates/arest/tests/integration.rs
+// crates/arest/tests/integration.rs
 //
 // Integration tests exercise the compile + evaluate pipeline directly,
 // bypassing the wasm_bindgen layer (which requires JsValue).
@@ -32,14 +32,16 @@ fn test_full_pipeline_forbidden_text() {
             "spans": [{ "factTypeId": "ft1", "roleIndex": 0 }]
         }],
         "stateMachines": {},
-        "enumValues": { "ProhibitedText": ["â€”", "â€“"] }
+        "enumValues": { "ProhibitedText": ["\u2013", "\u2014"] }
     }"#;
 
     let ir: Domain = serde_json::from_str(ir_json).unwrap();
     let model = compile::compile(&ir);
 
-    let population: Population = serde_json::from_str(r#”{“facts”: {}}”#).unwrap();
-    let violations = evaluate::evaluate_via_ast(&model, “Hello \u{2014} how are you?”, None, &population);
+    let population: Population = serde_json::from_str(r#"{"facts": {}}"#).unwrap();
+    let emdash = core::char::from_u32(0x2014).unwrap();
+    let text = format!("Hello {} how are you?", emdash);
+    let violations = evaluate::evaluate_via_ast(&model, &text, None, &population);
     assert!(!violations.is_empty());
 }
 
@@ -51,7 +53,7 @@ fn test_full_pipeline_clean_response() {
             "SupportResponse": { "objectType": "entity" },
             "ProhibitedText": { "objectType": "value" }
         },
-        "enumValues": { "ProhibitedText": ["â€”"] },
+        "enumValues": { "ProhibitedText": ["\u2013"] },
         "factTypes": {
             "ft1": {
                 "reading": "SupportResponse contains ProhibitedText",
@@ -125,7 +127,7 @@ fn test_full_pipeline_uniqueness_violation() {
     assert_eq!(violations[0].constraint_id, "c1");
 }
 
-// â”€â”€ Dual-instance convergence tests (Definition 2) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// --- Dual-instance convergence tests (Definition 2) ---
 
 /// Two compiled models from the same IR produce identical evaluation results.
 #[test]
