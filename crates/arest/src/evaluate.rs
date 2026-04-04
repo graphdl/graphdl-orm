@@ -430,14 +430,6 @@ mod tests {
         }
     }
 
-    fn empty_response() -> ResponseContext {
-        ResponseContext {
-            text: String::new(),
-            sender_identity: None,
-            fields: None,
-        }
-    }
-
     fn empty_population() -> Population {
         Population { facts: HashMap::new() }
     }
@@ -490,7 +482,7 @@ mod tests {
         let pop = Population { facts };
 
         // AST path
-        let violations = evaluate_via_ast(&model, &empty_response(), &pop);
+        let violations = evaluate_via_ast(&model, "", None, &pop);
         assert_eq!(violations.len(), 1);
         assert_eq!(violations[0].constraint_id, "uc1");
 
@@ -532,7 +524,7 @@ mod tests {
         ]);
         let pop = Population { facts };
 
-        let violations = evaluate_via_ast(&model, &empty_response(), &pop);
+        let violations = evaluate_via_ast(&model, "", None, &pop);
         assert_eq!(violations.len(), 0);
     }
 
@@ -690,13 +682,11 @@ mod tests {
         let model = crate::compile::compile(&ir);
 
         // Text with markdown â†’ violations
-        let response = ResponseContext { text: "## Heading here".to_string(), sender_identity: None, fields: None };
-        let violations = evaluate_via_ast(&model, &response, &empty_population());
+        let violations = evaluate_via_ast(&model, "## Heading here", None, &empty_population());
         assert!(violations.len() > 0, "should detect forbidden markdown");
 
         // Clean text â†’ no violations
-        let clean = ResponseContext { text: "No special formatting here.".to_string(), sender_identity: None, fields: None };
-        let clean_violations = evaluate_via_ast(&model, &clean, &empty_population());
+        let clean_violations = evaluate_via_ast(&model, "No special formatting here.", None, &empty_population());
         assert_eq!(clean_violations.len(), 0);
     }
 
@@ -713,15 +703,14 @@ mod tests {
             ..Default::default()
         });
         let model = crate::compile::compile(&ir);
-        let response = ResponseContext { text: "anything".to_string(), sender_identity: None, fields: None };
-        let violations = evaluate_via_ast(&model, &response, &empty_population());
+        let violations = evaluate_via_ast(&model, "anything", None, &empty_population());
         assert_eq!(violations.len(), 0);
     }
 
     #[test]
     fn test_no_constraints_no_violations_via_ast() {
         let model = crate::compile::compile(&empty_ir());
-        let violations = evaluate_via_ast(&model, &empty_response(), &empty_population());
+        let violations = evaluate_via_ast(&model, "", None, &empty_population());
         assert_eq!(violations.len(), 0);
     }
 
@@ -878,21 +867,13 @@ mod tests {
         let machine = &compiled.state_machines[0];
 
         // Response with forbidden content â†’ constraint detects violation
-        let bad_response = ResponseContext {
-            text: "Here are the internal-details of the system".to_string(),
-            sender_identity: None, fields: None,
-        };
         let pop = empty_population();
         // Verify the constraint produces violations via evaluate_via_ast
-        let violations = evaluate_via_ast(&compiled, &bad_response, &pop);
+        let violations = evaluate_via_ast(&compiled, "Here are the internal-details of the system", None, &pop);
         assert!(!violations.is_empty(), "Guard constraint should produce violations");
 
         // Clean response â†’ no constraint violations
-        let clean_response = ResponseContext {
-            text: "Your issue has been resolved. Thank you.".to_string(),
-            sender_identity: None, fields: None,
-        };
-        let clean_violations = evaluate_via_ast(&compiled, &clean_response, &pop);
+        let clean_violations = evaluate_via_ast(&compiled, "Your issue has been resolved. Thank you.", None, &pop);
         assert!(clean_violations.is_empty(), "No guard violations for clean response");
 
         // run_machine_ast evaluates the compiled transition function (guards are
@@ -1154,91 +1135,11 @@ mod tests {
     fn test_no_constraints_no_violations() {
         let ir = empty_ir();
         let compiled = crate::compile::compile(&ir);
-        let result = evaluate_via_ast(&compiled, &empty_response(), &empty_population());
+        let result = evaluate_via_ast(&compiled, "", None, &empty_population());
         assert!(result.is_empty());
     }
 
-    #[test]
-    fn test_forbidden_text_detected() {
-        let mut ir = empty_ir();
-        ir.nouns.insert("ProhibitedText".to_string(), make_noun("value"));
-        ir.enum_values.insert("ProhibitedText".to_string(), vec!["â€”".to_string(), "â€“".to_string()]);
-        ir.nouns.insert("SupportResponse".to_string(), make_noun("entity"));
-        ir.fact_types.insert("ft1".to_string(), FactTypeDef {
-            schema_id: String::new(),
-            reading: "SupportResponse contains ProhibitedText".to_string(),
-            readings: vec![],
-            roles: vec![
-                RoleDef { noun_name: "SupportResponse".to_string(), role_index: 0 },
-                RoleDef { noun_name: "ProhibitedText".to_string(), role_index: 1 },
-            ],
-        });
-        ir.constraints.push(ConstraintDef {
-            id: "c1".to_string(),
-            kind: "UC".to_string(),
-            modality: "Deontic".to_string(),
-            deontic_operator: Some("forbidden".to_string()),
-            text: "It is forbidden that SupportResponse contains ProhibitedText".to_string(),
-            spans: vec![SpanDef { fact_type_id: "ft1".to_string(), role_index: 0, subset_autofill: None }],
-            set_comparison_argument_length: None,
-            clauses: None,
-            entity: None,
-            min_occurrence: None,
-            max_occurrence: None,
-        });
-
-        let response = ResponseContext {
-            text: "Hello â€” how can I help?".to_string(),
-            sender_identity: None,
-            fields: None,
-        };
-
-        let compiled = crate::compile::compile(&ir);
-        let result = evaluate_via_ast(&compiled, &response, &empty_population());
-        assert!(!result.is_empty());
-        assert!(result[0].detail.contains("forbidden"));
-        assert!(result[0].detail.contains("â€”"));
-    }
-
-    #[test]
-    fn test_forbidden_text_clean() {
-        let mut ir = empty_ir();
-        ir.nouns.insert("ProhibitedText".to_string(), make_noun("value"));
-        ir.enum_values.insert("ProhibitedText".to_string(), vec!["â€”".to_string()]);
-        ir.nouns.insert("SupportResponse".to_string(), make_noun("entity"));
-        ir.fact_types.insert("ft1".to_string(), FactTypeDef {
-            schema_id: String::new(),
-            reading: "SupportResponse contains ProhibitedText".to_string(),
-            readings: vec![],
-            roles: vec![
-                RoleDef { noun_name: "SupportResponse".to_string(), role_index: 0 },
-                RoleDef { noun_name: "ProhibitedText".to_string(), role_index: 1 },
-            ],
-        });
-        ir.constraints.push(ConstraintDef {
-            id: "c1".to_string(),
-            kind: "UC".to_string(),
-            modality: "Deontic".to_string(),
-            deontic_operator: Some("forbidden".to_string()),
-            text: "It is forbidden that SupportResponse contains ProhibitedText".to_string(),
-            spans: vec![SpanDef { fact_type_id: "ft1".to_string(), role_index: 0, subset_autofill: None }],
-            set_comparison_argument_length: None,
-            clauses: None,
-            entity: None,
-            min_occurrence: None,
-            max_occurrence: None,
-        });
-
-        let response = ResponseContext {
-            text: "Hello, how can I help you today?".to_string(),
-            sender_identity: None,
-            fields: None,
-        };
-
-        let compiled = crate::compile::compile(&ir);
-        let result = evaluate_via_ast(&compiled, &response, &empty_population());
-        assert!(result.is_empty());
-    }
+    // test_forbidden_text_detected and test_forbidden_text_clean moved to end of module
 
     #[test]
     fn test_uniqueness_violation() {
@@ -1280,7 +1181,7 @@ mod tests {
         let population = Population { facts };
 
         let compiled = crate::compile::compile(&ir);
-        let result = evaluate_via_ast(&compiled, &empty_response(), &population);
+        let result = evaluate_via_ast(&compiled, "", None, &population);
         assert_eq!(result.len(), 1);
         assert!(result[0].detail.contains("Uniqueness violation"));
     }
@@ -1321,7 +1222,7 @@ mod tests {
         let population = Population { facts };
 
         let compiled = crate::compile::compile(&ir);
-        let result = evaluate_via_ast(&compiled, &empty_response(), &population);
+        let result = evaluate_via_ast(&compiled, "", None, &population);
         assert!(!result.is_empty());
         assert!(result[0].detail.contains("Irreflexive"));
     }
@@ -1370,7 +1271,7 @@ mod tests {
         let population = Population { facts };
 
         let compiled = crate::compile::compile(&ir);
-        let result = evaluate_via_ast(&compiled, &empty_response(), &population);
+        let result = evaluate_via_ast(&compiled, "", None, &population);
         assert!(!result.is_empty());
         assert!(result[0].detail.contains("Set-comparison violation"));
     }
@@ -1415,7 +1316,7 @@ mod tests {
         let population = Population { facts };
 
         let compiled = crate::compile::compile(&ir);
-        let result = evaluate_via_ast(&compiled, &empty_response(), &population);
+        let result = evaluate_via_ast(&compiled, "", None, &population);
         assert!(!result.is_empty());
         assert!(result[0].detail.contains("Subset violation"));
     }
@@ -1438,7 +1339,7 @@ mod tests {
         });
 
         let compiled = crate::compile::compile(&ir);
-        let result = evaluate_via_ast(&compiled, &empty_response(), &empty_population());
+        let result = evaluate_via_ast(&compiled, "", None, &empty_population());
         assert!(result.is_empty());
     }
 
@@ -1486,7 +1387,7 @@ mod tests {
         let population = Population { facts };
 
         let compiled = crate::compile::compile(&ir);
-        let result = evaluate_via_ast(&compiled, &empty_response(), &population);
+        let result = evaluate_via_ast(&compiled, "", None, &population);
         assert!(!result.is_empty());
         assert!(result[0].detail.contains("Set-comparison violation"));
     }
@@ -1535,7 +1436,7 @@ mod tests {
         let population = Population { facts };
 
         let compiled = crate::compile::compile(&ir);
-        let result = evaluate_via_ast(&compiled, &empty_response(), &population);
+        let result = evaluate_via_ast(&compiled, "", None, &population);
         assert_eq!(result.len(), 1);
         assert!(result[0].detail.contains("Mandatory violation"));
         assert!(result[0].detail.contains("c1"));
@@ -1587,7 +1488,7 @@ mod tests {
         let population = Population { facts };
 
         let compiled = crate::compile::compile(&ir);
-        let result = evaluate_via_ast(&compiled, &empty_response(), &population);
+        let result = evaluate_via_ast(&compiled, "", None, &population);
         assert_eq!(result.len(), 1);
         assert!(result[0].detail.contains("Set-comparison violation"));
         assert!(result[0].detail.contains("at least one"));
@@ -1622,14 +1523,8 @@ mod tests {
             max_occurrence: None,
         });
 
-        let response = ResponseContext {
-            text: "Here is some help for you.".to_string(),
-            sender_identity: Some(String::new()),
-            fields: None,
-        };
-
         let compiled = crate::compile::compile(&ir);
-        let result = evaluate_via_ast(&compiled, &response, &empty_population());
+        let result = evaluate_via_ast(&compiled, "Here is some help for you.", Some(""), &empty_population());
         assert!(result.len() >= 1);
         let details: Vec<String> = result.iter().map(|v| v.detail.clone()).collect();
         assert!(details.iter().any(|d: &String| d.contains("obligatory")));
@@ -1652,14 +1547,8 @@ mod tests {
             max_occurrence: None,
         });
 
-        let response = ResponseContext {
-            text: "Hello".to_string(),
-            sender_identity: Some(String::new()),
-            fields: None,
-        };
-
         let compiled = crate::compile::compile(&ir);
-        let result = evaluate_via_ast(&compiled, &response, &empty_population());
+        let result = evaluate_via_ast(&compiled, "Hello", Some(""), &empty_population());
         assert_eq!(result.len(), 1);
         assert!(result[0].detail.contains("SenderIdentity"));
     }
@@ -1704,14 +1593,8 @@ mod tests {
             max_occurrence: None,
         });
 
-        let response = ResponseContext {
-            text: "test response without required field names".to_string(),
-            sender_identity: None,
-            fields: None,
-        };
-
         let compiled = crate::compile::compile(&ir);
-        let result = evaluate_via_ast(&compiled, &response, &empty_population());
+        let result = evaluate_via_ast(&compiled, "test response without required field names", None, &empty_population());
         // Should produce exactly 1 violation per unique noun, not 3 duplicates
         let field_name_violations: Vec<_> = result.iter()
             .filter(|v| v.detail.contains("FieldName"))
@@ -1762,7 +1645,7 @@ mod tests {
         let population = Population { facts };
 
         let compiled = crate::compile::compile(&ir);
-        let result = evaluate_via_ast(&compiled, &empty_response(), &population);
+        let result = evaluate_via_ast(&compiled, "", None, &population);
         assert!(!result.is_empty());
         assert!(result[0].detail.contains("Equality violation"));
     }
@@ -2493,5 +2376,59 @@ mod tests {
         forward_chain_ast(&compiled, &mut population);
 
         assert!(population.facts.get("derived").is_none(), "No match should produce no derivation");
+    }
+
+    fn make_forbidden_text_ir(enum_vals: Vec<String>) -> Domain {
+        let mut ir = empty_ir();
+        let pt = "ProhibitedText";
+        let sr = "SupportResponse";
+        ir.nouns.insert(pt.to_string(), make_noun("value"));
+        ir.enum_values.insert(pt.to_string(), enum_vals);
+        ir.nouns.insert(sr.to_string(), make_noun("entity"));
+        ir.fact_types.insert("ft1".to_string(), FactTypeDef {
+            schema_id: String::new(),
+            reading: format!("{} contains {}", sr, pt),
+            readings: vec![],
+            roles: vec![
+                RoleDef { noun_name: sr.to_string(), role_index: 0 },
+                RoleDef { noun_name: pt.to_string(), role_index: 1 },
+            ],
+        });
+        ir.constraints.push(ConstraintDef {
+            id: "c1".to_string(),
+            kind: "UC".to_string(),
+            modality: "Deontic".to_string(),
+            deontic_operator: Some("forbidden".to_string()),
+            text: format!("It is forbidden that {} contains {}", sr, pt),
+            spans: vec![SpanDef { fact_type_id: "ft1".to_string(), role_index: 0, subset_autofill: None }],
+            set_comparison_argument_length: None,
+            clauses: None,
+            entity: None,
+            min_occurrence: None,
+            max_occurrence: None,
+        });
+        ir
+    }
+
+    #[test]
+    fn test_forbidden_text_detected() {
+        let endash = core::char::from_u32(0x2013).unwrap().to_string();
+        let emdash_s = core::char::from_u32(0x2014).unwrap().to_string();
+        let ir = make_forbidden_text_ir(vec![endash, emdash_s]);
+        let compiled = crate::compile::compile(&ir);
+        let emdash = core::char::from_u32(0x2014).unwrap();
+        let text: String = ['H','e','l','l','o',' ',emdash,' ','h','o','w',' ','c','a','n',' ','I',' ','h','e','l','p','?'].iter().collect();
+        let result = evaluate_via_ast(&compiled, &text, None, &empty_population());
+        assert!(!result.is_empty());
+        assert!(result[0].detail.contains(emdash));
+    }
+
+    #[test]
+    fn test_forbidden_text_clean() {
+        let endash = core::char::from_u32(0x2013).unwrap().to_string();
+        let ir = make_forbidden_text_ir(vec![endash]);
+        let compiled = crate::compile::compile(&ir);
+        let result = evaluate_via_ast(&compiled, "Hello, how can I help you today?", None, &empty_population());
+        assert!(result.is_empty());
     }
 }
