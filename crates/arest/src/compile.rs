@@ -450,6 +450,33 @@ pub fn compile_to_defs(pop: &Population) -> Vec<(String, Func)> {
         defs.push((format!("schema:{}", id), schema.construction.clone()));
     }
 
+    // HATEOAS navigation links as FFP projections (Theorem 4b).
+    // For each binary fact type with a UC, the UC role is the child (dependent),
+    // the other role is the parent. Navigation is a constant function returning
+    // the related noun names.
+    let mut children_map: HashMap<String, Vec<String>> = HashMap::new();
+    let mut parent_map: HashMap<String, Vec<String>> = HashMap::new();
+    for c in &domain.constraints {
+        if c.kind != "UC" || c.spans.is_empty() { continue; }
+        let span = &c.spans[0];
+        if let Some(ft) = domain.fact_types.get(&span.fact_type_id) {
+            if ft.roles.len() != 2 { continue; }
+            let constrained_role = span.role_index;
+            let child_noun = &ft.roles[constrained_role].noun_name;
+            let parent_noun = &ft.roles[1 - constrained_role].noun_name;
+            children_map.entry(parent_noun.clone()).or_default().push(child_noun.clone());
+            parent_map.entry(child_noun.clone()).or_default().push(parent_noun.clone());
+        }
+    }
+    for (noun, children) in &children_map {
+        let child_atoms: Vec<Object> = children.iter().map(|c| Object::atom(c)).collect();
+        defs.push((format!("nav:{}:children", noun), Func::constant(Object::Seq(child_atoms))));
+    }
+    for (noun, parents) in &parent_map {
+        let parent_atoms: Vec<Object> = parents.iter().map(|p| Object::atom(p)).collect();
+        defs.push((format!("nav:{}:parent", noun), Func::constant(Object::Seq(parent_atoms))));
+    }
+
     defs
 }
 

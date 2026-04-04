@@ -1330,5 +1330,29 @@ fn rho_returns_bottom_for_unknown_fact_type() {
         let func = ast::metacompose(&fact, &defs);
         ast::apply(&func, &Object::atom("read"), &defs)
     };
-    assert_eq!(result, Object::Bottom, "ρ should return ⊥ for unknown fact types");
+    assert_eq!(result, Object::Bottom, "metacompose should return bottom for unknown fact types");
+}
+
+// ── HATEOAS Navigation as FFP Projections (Theorem 4b) ───────────────
+
+#[test]
+fn hateoas_nav_defs_produced() {
+    use arest::ast::Func;
+
+    let meta = parse_forml2::parse_to_population(STATE_METAMODEL).unwrap();
+    let orders = parse_forml2::parse_to_population_with_nouns(ORDERS_DOMAIN, &meta).unwrap();
+    let mut pop = meta;
+    for (k, v) in orders.facts { pop.facts.entry(k).or_default().extend(v); }
+
+    let defs: Vec<(String, Func)> = compile::compile_to_defs(&pop);
+
+    // "Each Order was placed by exactly one Customer" → UC on Order's role
+    // Order is child, Customer is parent
+    let customer_children = defs.iter()
+        .find(|(n, _)| n == "nav:Customer:children");
+    assert!(customer_children.is_some(), "Customer should have children nav def");
+
+    let order_parent = defs.iter()
+        .find(|(n, _)| n == "nav:Order:parent");
+    assert!(order_parent.is_some(), "Order should have parent nav def");
 }
