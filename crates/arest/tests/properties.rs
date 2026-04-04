@@ -8,7 +8,6 @@ use arest::parse_forml2;
 use arest::compile;
 use arest::evaluate;
 use arest::types::{ResponseContext, Population, FactInstance};
-use arest::verbalize;
 use std::collections::HashMap;
 
 // ── Metamodel ────────────────────────────────────────────────────────
@@ -236,7 +235,7 @@ fn t2_constraint_text_round_trips() {
 
 #[test]
 fn t3_state_machine_initializes() {
-    let (ir, model) = compile_orders();
+    let (_ir, model) = compile_orders();
     // Order should have a state machine with initial state "In Cart"
     let sm = model.state_machines.iter()
         .find(|sm| sm.noun_name == "Order")
@@ -258,7 +257,7 @@ fn t3_forward_chain_reaches_fixed_point() {
 
 #[test]
 fn t3_alethic_violation_rejects_command() {
-    let (ir, model) = compile_orders();
+    let (ir, _model) = compile_orders();
     // UC on "Each Order was placed by exactly one Customer" means
     // an Order with two customers should produce a violation
     let uc = ir.constraints.iter()
@@ -521,7 +520,7 @@ Each Order has at most one Coupon.
 #[test]
 fn remark_cwa_constraint_has_enum_values() {
     let ir = parse_forml2::parse_markdown(ORDERS_DOMAIN).unwrap();
-    let model = compile::compile(&ir);
+    let _model = compile::compile(&ir);
     // The "forbidden Prohibited Shipping Method" constraint spans a fact type
     // whose role noun has declared enum values. This makes it CWA.
     let forbidden = ir.constraints.iter()
@@ -694,7 +693,7 @@ fn ffp_state_machine_is_a_function() {
 
 #[test]
 fn ffp_evaluation_is_application() {
-    use arest::ast::{self, Func, Object};
+    use arest::ast::{self, Object};
 
     let meta = parse_forml2::parse_to_population(STATE_METAMODEL).unwrap();
     let orders = parse_forml2::parse_to_population_with_nouns(ORDERS_DOMAIN, &meta).unwrap();
@@ -777,7 +776,7 @@ fn law_i5_selector_extracts_from_construction() {
         Func::constant(Object::atom("B")),
         Func::constant(Object::atom("C")),
     ]);
-    let constructed = ast::apply(&construction, &input, &defs);
+    let _constructed = ast::apply(&construction, &input, &defs);
 
     // s2 ∘ [const A, const B, const C] : X should equal const B : X = B
     let s2_of_construction = Func::compose(Func::Selector(2), construction);
@@ -970,7 +969,7 @@ fn constraint_evaluation_via_application() {
     let def_map: HashMap<String, Func> = defs.iter().map(|(n, f)| (n.clone(), f.clone())).collect();
 
     // Find the obligatory constraint (these are response-scoped)
-    let (_, constraint_func) = defs.iter()
+    let (_, _constraint_func) = defs.iter()
         .find(|(name, _)| name.contains("constraint:") && name.contains("obligatory") && name.contains("placed by"))
         .expect("Obligatory placed-by constraint");
 
@@ -1046,7 +1045,7 @@ fn constraint_evaluation_via_application() {
 
 #[test]
 fn response_text_is_a_fact_in_population() {
-    use arest::ast::{self, Func, Object};
+    use arest::ast::{self, Object};
 
     // A response body is just a fact: Support Response 'resp-1' has Body 'some text'
     let mut facts = HashMap::new();
@@ -1072,7 +1071,7 @@ fn response_text_is_a_fact_in_population() {
 
 #[test]
 fn deontic_constraint_evaluates_against_population_body() {
-    use arest::ast::{self, Func, Object};
+    
 
     // Parse a domain with a forbidden deontic constraint
     let input = r#"

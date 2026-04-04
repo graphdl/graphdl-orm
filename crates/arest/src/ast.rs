@@ -1852,11 +1852,11 @@ mod tests {
         // compose_rel on col 2 of R = col 1 of S:
         // join gives <<a,x,1>,<b,y,2>>, project out col 2 gives <<a,1>,<b,2>>
         let d = theta1_defs();
-        let r = Object::Seq(vec![
+        let _r = Object::Seq(vec![
             Object::seq(vec![Object::atom("a"), Object::atom("x")]),
             Object::seq(vec![Object::atom("b"), Object::atom("y")]),
         ]);
-        let s = Object::Seq(vec![
+        let _s = Object::Seq(vec![
             Object::seq(vec![Object::atom("x"), Object::atom("1")]),
             Object::seq(vec![Object::atom("y"), Object::atom("2")]),
         ]);
