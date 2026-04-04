@@ -2,11 +2,11 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-// ── IR Types (deserialized from generator JSON) ──────────────────────
+// ── Domain: the parsed result of FORML2 readings ────────────────────
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ConstraintIR {
+pub struct Domain {
     #[allow(dead_code)] // deserialized from JSON, read by JS callers
     pub domain: String,
     pub nouns: HashMap<String, NounDef>,

@@ -1,4 +1,4 @@
-// crates/arest/src/lib.rs — AREST WIT Component
+﻿// crates/arest/src/lib.rs â€” AREST WIT Component
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -20,7 +20,7 @@ pub mod verbalize;
 pub mod arest;
 
 struct CompiledState {
-    ir: types::ConstraintIR,
+    ir: types::Domain,
     model: compile::CompiledModel,
 }
 
@@ -38,7 +38,7 @@ struct E; export!(E);
 
 impl exports::graphdl::arest::engine::Guest for E {
     fn parse_and_compile(readings: Vec<(String, String)>) -> Result<u32, String> {
-        let mut m = types::ConstraintIR::default();
+        let mut m = types::Domain::default();
         for (name, text) in &readings {
             let ir = if m.nouns.is_empty() {
                 parse_forml2::parse_markdown(text)

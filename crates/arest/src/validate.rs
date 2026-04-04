@@ -1,9 +1,9 @@
-// crates/arest/src/validate.rs
+﻿// crates/arest/src/validate.rs
 //
 // Schema validation via engine self-evaluation.
 //
 // Instead of procedural checks (csdp.rs), this module converts a domain's
-// ConstraintIR into a Population of core metamodel facts and evaluates the
+// Domain into a Population of core metamodel facts and evaluates the
 // validation domain's compiled constraints against it.
 //
 // The validation model is compiled from validation.md's readings at startup.
@@ -15,14 +15,14 @@ use crate::types::*;
 use crate::compile::CompiledModel;
 use crate::evaluate;
 
-/// Convert a domain's ConstraintIR into a Population of core metamodel facts.
+/// Convert a domain's Domain into a Population of core metamodel facts.
 ///
 /// Each noun, fact type, role, constraint, and derivation rule in the domain
 /// becomes a fact instance in the metamodel population. The validation model's
 /// constraints are then evaluated against this population.
 ///
 /// Fact type IDs use the reading text from core.md (e.g., "Noun has Object Type").
-pub fn ir_to_metamodel_population(ir: &ConstraintIR) -> Population {
+pub fn ir_to_metamodel_population(ir: &Domain) -> Population {
     let mut facts: HashMap<String, Vec<FactInstance>> = HashMap::new();
 
     let mut push = |ft_id: &str, bindings: Vec<(&str, &str)>| {
@@ -32,17 +32,17 @@ pub fn ir_to_metamodel_population(ir: &ConstraintIR) -> Population {
         });
     };
 
-    // Nouns → "Noun has Object Type"
+    // Nouns â†’ "Noun has Object Type"
     for (name, def) in &ir.nouns {
         push("Noun has Object Type", vec![("Noun", name), ("Object Type", &def.object_type)]);
     }
 
-    // Subtypes → "Noun is subtype of Noun"
+    // Subtypes â†’ "Noun is subtype of Noun"
     for (name, super_type) in &ir.subtypes {
         push("Noun is subtype of Noun", vec![("Noun", name), ("Noun", super_type)]);
     }
 
-    // Fact types → "Graph Schema has Reading", "Graph Schema has Role", "Graph Schema has Arity"
+    // Fact types â†’ "Graph Schema has Reading", "Graph Schema has Role", "Graph Schema has Arity"
     for (ft_id, ft) in &ir.fact_types {
         push("Graph Schema has Reading", vec![("Graph Schema", ft_id), ("Reading", &ft.reading)]);
 
@@ -56,7 +56,7 @@ pub fn ir_to_metamodel_population(ir: &ConstraintIR) -> Population {
         }
     }
 
-    // Constraints → "Constraint is of Constraint Type", "Constraint spans Role"
+    // Constraints â†’ "Constraint is of Constraint Type", "Constraint spans Role"
     for constraint in &ir.constraints {
         push("Constraint is of Constraint Type", vec![
             ("Constraint", &constraint.id), ("Constraint Type", &constraint.kind),
@@ -67,7 +67,7 @@ pub fn ir_to_metamodel_population(ir: &ConstraintIR) -> Population {
         }
     }
 
-    // Derivation rules → dependency facts
+    // Derivation rules â†’ dependency facts
     for rule in &ir.derivation_rules {
         push("Derivation Rule produces Graph Schema", vec![
             ("Derivation Rule", &rule.id), ("Graph Schema", &rule.consequent_fact_type_id),
@@ -107,7 +107,7 @@ pub fn ir_to_metamodel_population(ir: &ConstraintIR) -> Population {
 /// evaluates the validation constraints against it.
 pub fn validate_schema(
     validation_model: &CompiledModel,
-    domain_ir: &ConstraintIR,
+    domain_ir: &Domain,
 ) -> Vec<Violation> {
     let population = ir_to_metamodel_population(domain_ir);
     let response = ResponseContext { text: String::new(), sender_identity: None, fields: None };
@@ -127,7 +127,7 @@ pub fn validate_schema(
 
 /// Check n-ary fact types (3+ roles) have UCs spanning at least n-1 roles.
 /// A simple UC on a single role of a ternary is an arity violation (Halpin TechReport ORM2-02 Sec 2.1.3).
-pub fn check_nary_uc_arity(ir: &ConstraintIR) -> Vec<Violation> {
+pub fn check_nary_uc_arity(ir: &Domain) -> Vec<Violation> {
     let mut violations = Vec::new();
 
     for (ft_id, ft) in &ir.fact_types {
@@ -169,13 +169,13 @@ pub fn check_nary_uc_arity(ir: &ConstraintIR) -> Vec<Violation> {
 /// Check that derived subtypes have derivation rules.
 /// Without subtype_kind on NounDef, this check is deferred until the parser
 /// can distinguish derived vs asserted subtypes through derivation rule presence.
-pub fn check_subtype_derivation_rules(_ir: &ConstraintIR) -> Vec<Violation> {
+pub fn check_subtype_derivation_rules(_ir: &Domain) -> Vec<Violation> {
     Vec::new()
 }
 
-/// Check schema satisfiability — detect contradictory constraints that
+/// Check schema satisfiability â€” detect contradictory constraints that
 /// prevent any valid population from existing (Halpin PhD thesis Ch 6).
-pub fn check_satisfiability(ir: &ConstraintIR) -> Vec<Violation> {
+pub fn check_satisfiability(ir: &Domain) -> Vec<Violation> {
     let mut violations = Vec::new();
 
     // Check 1: Frequency constraint with min > max
@@ -236,7 +236,7 @@ pub fn check_satisfiability(ir: &ConstraintIR) -> Vec<Violation> {
 ///
 /// Practical check: if a fact type's roles are a subset of another fact type's
 /// roles (same nouns), the smaller fact type may be redundant (derivable by projection).
-pub fn check_redundancy(ir: &ConstraintIR) -> Vec<Violation> {
+pub fn check_redundancy(ir: &Domain) -> Vec<Violation> {
     let mut violations = Vec::new();
 
     let ft_entries: Vec<(&String, &FactTypeDef)> = ir.fact_types.iter().collect();
@@ -259,7 +259,7 @@ pub fn check_redundancy(ir: &ConstraintIR) -> Vec<Violation> {
                     ),
                     detail: format!(
                         "The roles of '{}' ({:?}) are a subset of '{}' ({:?}). \
-                         This fact type may be strongly redundant (Codd 1970 Sec 2.2.1) — \
+                         This fact type may be strongly redundant (Codd 1970 Sec 2.2.1) â€” \
                          derivable by projecting the larger relation.",
                         ft_a.reading, nouns_a, ft_b.reading, nouns_b
                     ),
@@ -275,7 +275,7 @@ pub fn check_redundancy(ir: &ConstraintIR) -> Vec<Violation> {
                     detail: format!(
                         "The roles of '{}' ({:?}) are a subset of '{}' ({:?}). \
                          This fact type may be strongly redundant (Codd 1970 Sec 2.2.1) \
-                         — derivable by projecting the larger relation.",
+                         â€” derivable by projecting the larger relation.",
                         ft_b.reading, nouns_b, ft_a.reading, nouns_a
                     ),
                     alethic: false,
@@ -290,11 +290,11 @@ pub fn check_redundancy(ir: &ConstraintIR) -> Vec<Violation> {
 /// Detect redundant constraints via implication rules (Halpin PhD thesis Ch 6).
 ///
 /// Known implications:
-/// - UC on each individual role of a binary fact type → the spanning UC is redundant
+/// - UC on each individual role of a binary fact type â†’ the spanning UC is redundant
 ///   (individual UCs already imply the pair can't repeat)
-/// - Frequency(1,1) ≡ UC + MC (report as combined "exactly one")
-/// - UC on a role where the noun is a subtype → check if supertype UC already covers it
-pub fn check_constraint_implication(ir: &ConstraintIR) -> Vec<Violation> {
+/// - Frequency(1,1) â‰¡ UC + MC (report as combined "exactly one")
+/// - UC on a role where the noun is a subtype â†’ check if supertype UC already covers it
+pub fn check_constraint_implication(ir: &Domain) -> Vec<Violation> {
     let mut violations = Vec::new();
 
     for (ft_id, ft) in &ir.fact_types {
@@ -305,7 +305,7 @@ pub fn check_constraint_implication(ir: &ConstraintIR) -> Vec<Violation> {
             .filter(|c| c.kind == "UC" && c.spans.iter().any(|s| s.fact_type_id == *ft_id))
             .collect();
 
-        // Check: UC on role 0 AND UC on role 1 → spanning UC is implied (1:1)
+        // Check: UC on role 0 AND UC on role 1 â†’ spanning UC is implied (1:1)
         let has_uc_role0 = ucs.iter().any(|c| {
             let spans: Vec<_> = c.spans.iter().filter(|s| s.fact_type_id == *ft_id).collect();
             spans.len() == 1 && spans[0].role_index == 0
@@ -322,7 +322,7 @@ pub fn check_constraint_implication(ir: &ConstraintIR) -> Vec<Violation> {
             violations.push(Violation {
                 constraint_id: format!("implied-spanning:{}", ft_id),
                 constraint_text: format!(
-                    "Spanning UC on '{}' is redundant — implied by individual role UCs (1:1)",
+                    "Spanning UC on '{}' is redundant â€” implied by individual role UCs (1:1)",
                     ft.reading
                 ),
                 detail: format!(
@@ -360,7 +360,7 @@ pub fn check_constraint_implication(ir: &ConstraintIR) -> Vec<Violation> {
 
 /// Check that all objectified fact types have spanning uniqueness constraints.
 /// An objectified fact type without a spanning UC violates atomicity.
-pub fn check_objectification_atomicity(ir: &ConstraintIR) -> Vec<Violation> {
+pub fn check_objectification_atomicity(ir: &Domain) -> Vec<Violation> {
     let mut violations = Vec::new();
 
     for (noun_name, objectified_reading) in &ir.objectifications {
@@ -413,8 +413,8 @@ pub fn check_objectification_atomicity(ir: &ConstraintIR) -> Vec<Violation> {
 mod tests {
     use super::*;
 
-    fn simple_ir() -> ConstraintIR {
-        let mut ir = ConstraintIR {
+    fn simple_ir() -> Domain {
+        let mut ir = Domain {
             domain: "test".to_string(),
             nouns: HashMap::new(),
             fact_types: HashMap::new(),
@@ -563,7 +563,7 @@ mod tests {
         let pop = ir_to_metamodel_population(&ir);
         // Role facts exist for both roles (including undeclared noun)
         let role_facts = pop.facts.get("Noun plays Role").unwrap();
-        // Person plays 3 roles (ft1:0, ft1:1→Name, ft-bad:0, ft-bad:1→Age)
+        // Person plays 3 roles (ft1:0, ft1:1â†’Name, ft-bad:0, ft-bad:1â†’Age)
         // But there's no "Noun has Object Type" for Age
         let noun_facts = pop.facts.get("Noun has Object Type").unwrap();
         assert!(!noun_facts.iter().any(|f| f.bindings.iter().any(|(_, v)| v == "Age")));
@@ -571,12 +571,12 @@ mod tests {
         assert!(role_facts.iter().any(|f| f.bindings.iter().any(|(_, v)| v == "Age")));
     }
 
-    // ── Objectification atomicity ───────────────────────────────
+    // â”€â”€ Objectification atomicity â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn objectification_without_spanning_uc_produces_violation() {
         let mut ir = simple_ir();
-        // "Marriage" objectifies "Person has Name" — but this fact type has
+        // "Marriage" objectifies "Person has Name" â€” but this fact type has
         // a UC only on Person (not spanning both roles)
         ir.nouns.insert("Marriage".to_string(), NounDef {
             object_type: "entity".to_string(),
@@ -588,7 +588,7 @@ mod tests {
             kind: "UC".to_string(),
             modality: "Alethic".to_string(),
             text: "Each Person has at most one Name.".to_string(),
-            // UC on role 0 only — NOT spanning (doesn't cover role 1)
+            // UC on role 0 only â€” NOT spanning (doesn't cover role 1)
             spans: vec![SpanDef { fact_type_id: "ft1".to_string(), role_index: 0, subset_autofill: None }],
             deontic_operator: None, entity: None, clauses: None,
             set_comparison_argument_length: None, min_occurrence: None, max_occurrence: None,
@@ -625,7 +625,7 @@ mod tests {
         assert_eq!(violations.len(), 0, "no violation expected for spanning UC");
     }
 
-    // ── N-ary UC arity check ────────────────────────────────────
+    // â”€â”€ N-ary UC arity check â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn ternary_with_simple_uc_produces_violation() {
@@ -641,7 +641,7 @@ mod tests {
                 RoleDef { noun_name: "Interval".to_string(), role_index: 2 },
             ],
         });
-        // Simple UC on one role — arity violation
+        // Simple UC on one role â€” arity violation
         ir.constraints.push(ConstraintDef {
             id: "uc-bad".to_string(),
             kind: "UC".to_string(),
@@ -670,7 +670,7 @@ mod tests {
                 RoleDef { noun_name: "Interval".to_string(), role_index: 2 },
             ],
         });
-        // UC spanning 2 of 3 roles (n-1) — valid
+        // UC spanning 2 of 3 roles (n-1) â€” valid
         ir.constraints.push(ConstraintDef {
             id: "uc-good".to_string(),
             kind: "UC".to_string(),
@@ -688,7 +688,7 @@ mod tests {
         assert_eq!(violations.len(), 0, "no violation for n-1 UC on ternary");
     }
 
-    // ── Subtype derivation rules ──────────────────────────────
+    // â”€â”€ Subtype derivation rules â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn subtype_derivation_check_is_deferred() {
@@ -717,7 +717,7 @@ mod tests {
         assert_eq!(violations.len(), 0, "binary fact types with simple UC are valid");
     }
 
-    // ── Constraint implication ──────────────────────────────────
+    // â”€â”€ Constraint implication â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn redundant_spanning_uc_detected() {
@@ -738,7 +738,7 @@ mod tests {
             deontic_operator: None, entity: None, clauses: None,
             set_comparison_argument_length: None, min_occurrence: None, max_occurrence: None,
         });
-        // Spanning UC (redundant — implied by the two individual UCs)
+        // Spanning UC (redundant â€” implied by the two individual UCs)
         ir.constraints.push(ConstraintDef {
             id: "uc-spanning".to_string(), kind: "UC".to_string(),
             modality: "Alethic".to_string(), text: "Each Person, Name combination occurs at most once.".to_string(),
@@ -779,7 +779,7 @@ mod tests {
         assert_eq!(violations.len(), 0);
     }
 
-    // ── Satisfiability ──────────────────────────────────────────
+    // â”€â”€ Satisfiability â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn frequency_min_greater_than_max_is_unsatisfiable() {
@@ -812,13 +812,13 @@ mod tests {
         assert_eq!(violations.len(), 0);
     }
 
-    // ── Redundancy ──────────────────────────────────────────────
+    // â”€â”€ Redundancy â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn subset_roles_detected_as_redundant() {
         let mut ir = simple_ir();
         // ft1 has roles {Person, Name}
-        // Add ft2 with roles {Person, Name, Age} — ft1 is a subset
+        // Add ft2 with roles {Person, Name, Age} â€” ft1 is a subset
         ir.nouns.insert("Age".to_string(), NounDef {
             object_type: "value".to_string(),
             world_assumption: WorldAssumption::default(),
@@ -854,7 +854,7 @@ mod tests {
                 RoleDef { noun_name: "Country".to_string(), role_index: 1 },
             ],
         });
-        // {Person, Name} and {Person, Country} — neither is subset of the other
+        // {Person, Name} and {Person, Country} â€” neither is subset of the other
         let violations = check_redundancy(&ir);
         assert_eq!(violations.len(), 0);
     }

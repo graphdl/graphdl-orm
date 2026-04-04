@@ -1,10 +1,10 @@
-// crates/arest/src/evaluate.rs
+﻿// crates/arest/src/evaluate.rs
 //
 // Evaluation is beta reduction. That's it.
 //
-// Constraint verification:  constraints.flat_map(|c| apply(c.func, ctx)) → [Violation]
-// Forward inference:        derivations.flat_map(|d| apply(d.func, pop)) → [DerivedFact]
-// State machine execution:  fold(transition)(initial)(stream) → final_state
+// Constraint verification:  constraints.flat_map(|c| apply(c.func, ctx)) â†’ [Violation]
+// Forward inference:        derivations.flat_map(|d| apply(d.func, pop)) â†’ [DerivedFact]
+// State machine execution:  fold(transition)(initial)(stream) â†’ final_state
 // Synthesis:                collect all knowledge about a noun from the compiled model.
 
 use std::collections::HashSet;
@@ -13,7 +13,7 @@ use crate::compile::CompiledModel;
 use crate::ast;
 
 /// Evaluate all compiled constraints via AST reduction.
-/// Evaluation = beta reduction: apply(func, object) → violations.
+/// Evaluation = beta reduction: apply(func, object) â†’ violations.
 /// Alethic constraints always reject. Deontic violations are tagged as non-alethic.
 pub fn evaluate_via_ast(model: &CompiledModel, response: &ResponseContext, population: &Population) -> Vec<Violation> {
     let ctx_obj = ast::encode_eval_context(response, population);
@@ -32,7 +32,7 @@ pub fn evaluate_via_ast(model: &CompiledModel, response: &ResponseContext, popul
 }
 
 /// Run a state machine via AST reduction.
-/// The machine's func is a transition function: <state, event> → next_state.
+/// The machine's func is a transition function: <state, event> â†’ next_state.
 /// Guards are compiled into the Condition predicates.
 pub fn run_machine_ast(
     machine: &crate::compile::CompiledStateMachine,
@@ -55,7 +55,7 @@ pub fn run_machine_ast(
     state
 }
 
-// ── Forward Chaining ─────────────────────────────────────────────────
+// â”€â”€ Forward Chaining â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 //
 // Correctness: FORML 2 derivation rules are monotonic (add facts, never
 // remove). The population is finite. A monotonic sequence over a finite
@@ -64,7 +64,7 @@ pub fn run_machine_ast(
 //
 // Safety: the iteration bound prevents pathological rule sets from
 // producing unbounded intermediate populations. If the bound is hit,
-// the engine stops and returns what it has — a partial fixed point.
+// the engine stops and returns what it has â€” a partial fixed point.
 
 /// Forward chain via AST reduction to fixed point.
 /// Bounded to prevent pathological rule sets from running unbounded.
@@ -120,7 +120,7 @@ pub fn forward_chain_ast(
             }
         }
 
-        if new_facts.is_empty() { break; } // Fixed point reached — proof complete.
+        if new_facts.is_empty() { break; } // Fixed point reached â€” proof complete.
 
         for fact in &new_facts {
             add_to_population(population, fact);
@@ -160,19 +160,19 @@ fn add_to_population(population: &mut Population, fact: &DerivedFact) {
         .push(instance);
 }
 
-// ── Proof Engine (Backward Chaining) ─────────────────────────────────
+// â”€â”€ Proof Engine (Backward Chaining) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Given a goal fact, work backward through derivation rules to build a proof tree.
 // Each step either finds the fact in the population (axiom), derives it via a rule
 // (recursively proving antecedents), or concludes based on world assumption.
 
 /// Attempt to prove a goal fact.
 ///
-/// `goal` is a string like "Academic has Rank 'P'" — a reading with optional values.
+/// `goal` is a string like "Academic has Rank 'P'" â€” a reading with optional values.
 /// The engine searches the population for a matching fact, then tries derivation
 /// rules whose consequent matches, recursively proving antecedents.
 #[allow(dead_code)] // used by lib.rs WASM export, not by main.rs binary
 pub fn prove(
-    ir: &ConstraintIR,
+    ir: &Domain,
     population: &Population,
     goal: &str,
     world_assumption: &WorldAssumption,
@@ -199,7 +199,7 @@ pub fn prove(
 /// Recursive backward chaining.
 #[allow(dead_code)] // called by prove()
 fn prove_goal(
-    ir: &ConstraintIR,
+    ir: &Domain,
     population: &Population,
     goal: &str,
     visited: &mut HashSet<String>,
@@ -296,13 +296,13 @@ fn fact_text_matches(goal: &str, fact_text: &str, reading: &str) -> bool {
         || goal_lower.contains(&reading_lower)
 }
 
-// ── Synthesis ────────────────────────────────────────────────────────
+// â”€â”€ Synthesis â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Collect all knowledge about a noun from the compiled model.
 
 /// Synthesize: collect all knowledge about a noun from the compiled model.
 pub fn synthesize(
     model: &CompiledModel,
-    ir: &ConstraintIR,
+    ir: &Domain,
     noun_name: &str,
     depth: usize,
 ) -> SynthesisResult {
@@ -416,8 +416,8 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    fn empty_ir() -> ConstraintIR {
-        ConstraintIR {
+    fn empty_ir() -> Domain {
+        Domain {
             domain: "test".to_string(),
             nouns: HashMap::new(),
             fact_types: HashMap::new(),
@@ -449,7 +449,7 @@ mod tests {
         }
     }
 
-    // ── AST evaluation path tests ────────────────────────────────
+    // â”€â”€ AST evaluation path tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn test_evaluate_via_ast_uniqueness_violation() {
@@ -538,7 +538,7 @@ mod tests {
 
     #[test]
     fn test_run_machine_via_ast() {
-        // Domain Change state machine: Proposed → Under Review → Approved → Applied
+        // Domain Change state machine: Proposed â†’ Under Review â†’ Approved â†’ Applied
         let mut ir = empty_ir();
         ir.state_machines.insert("DomainChange".to_string(), StateMachineDef {
             noun_name: "DomainChange".to_string(),
@@ -560,11 +560,11 @@ mod tests {
         let model = crate::compile::compile(&ir);
         let machine = &model.state_machines[0];
 
-        // Happy path: Proposed → Under Review → Approved → Applied
+        // Happy path: Proposed â†’ Under Review â†’ Approved â†’ Applied
         let final_state = run_machine_ast(machine, &["review-requested", "approved", "applied"]);
         assert_eq!(final_state, "Applied");
 
-        // Rejection path: Proposed → Under Review → Rejected
+        // Rejection path: Proposed â†’ Under Review â†’ Rejected
         let final_state = run_machine_ast(machine, &["review-requested", "rejected"]);
         assert_eq!(final_state, "Rejected");
 
@@ -689,12 +689,12 @@ mod tests {
         });
         let model = crate::compile::compile(&ir);
 
-        // Text with markdown → violations
+        // Text with markdown â†’ violations
         let response = ResponseContext { text: "## Heading here".to_string(), sender_identity: None, fields: None };
         let violations = evaluate_via_ast(&model, &response, &empty_population());
         assert!(violations.len() > 0, "should detect forbidden markdown");
 
-        // Clean text → no violations
+        // Clean text â†’ no violations
         let clean = ResponseContext { text: "No special formatting here.".to_string(), sender_identity: None, fields: None };
         let clean_violations = evaluate_via_ast(&model, &clean, &empty_population());
         assert_eq!(clean_violations.len(), 0);
@@ -727,18 +727,18 @@ mod tests {
 
     #[test]
     fn test_fact_creation_triggers_state_transition() {
-        // Full chain: fact creation → Activation → Verb → Transition → state change
+        // Full chain: fact creation â†’ Activation â†’ Verb â†’ Transition â†’ state change
         //
         // Domain: Support
         //   Graph Schema: "Customer submits SupportRequest"
         //   Verb: "submit"
-        //   Activation: (Graph Schema, Verb) — objectified with spanning UC
+        //   Activation: (Graph Schema, Verb) â€” objectified with spanning UC
         //   State Machine: SupportRequest
-        //     Triaging → Investigating (event: "investigate")
+        //     Triaging â†’ Investigating (event: "investigate")
         //   Verb "submit" is performed during Transition "investigate"
         //
         // When a fact "Customer submits SupportRequest" is created,
-        // the engine should recognize the Verb → find the Transition → fire it.
+        // the engine should recognize the Verb â†’ find the Transition â†’ fire it.
 
         let mut ir = empty_ir();
         ir.nouns.insert("Customer".to_string(), make_noun("entity"));
@@ -772,7 +772,7 @@ mod tests {
         assert_eq!(machine.initial, "Triaging");
 
         // When the fact "Customer submits SupportRequest" is created,
-        // the "investigate" event should fire (Verb → Transition mapping).
+        // the "investigate" event should fire (Verb â†’ Transition mapping).
         // For now, verify the state machine can transition:
         let after_investigate = run_machine_ast(machine, &["investigate"]);
         assert_eq!(after_investigate, "Investigating");
@@ -780,11 +780,11 @@ mod tests {
         // The Activation lookup is: given the fact type (ft_submit), find the Verb,
         // then find which Transition the Verb is performed during.
         // This requires the compiled model to have:
-        //   1. Schema → Verb mapping (from "Graph Schema is activated by Verb")
-        //   2. Verb → Transition mapping (from "Verb is performed during Transition")
+        //   1. Schema â†’ Verb mapping (from "Graph Schema is activated by Verb")
+        //   2. Verb â†’ Transition mapping (from "Verb is performed during Transition")
         //
         // The engine should expose: given a fact_type_id, what event fires?
-        // This is compile_derivation_chain: ft_submit → Activation → Verb → Transition → event name
+        // This is compile_derivation_chain: ft_submit â†’ Activation â†’ Verb â†’ Transition â†’ event name
 
         // For now, verify the pieces exist in the compiled model:
         assert!(compiled.schemas.contains_key("ft_submit"), "Schema compiled for submit fact type");
@@ -877,7 +877,7 @@ mod tests {
         let compiled = crate::compile::compile(&ir);
         let machine = &compiled.state_machines[0];
 
-        // Response with forbidden content → constraint detects violation
+        // Response with forbidden content â†’ constraint detects violation
         let bad_response = ResponseContext {
             text: "Here are the internal-details of the system".to_string(),
             sender_identity: None, fields: None,
@@ -887,7 +887,7 @@ mod tests {
         let violations = evaluate_via_ast(&compiled, &bad_response, &pop);
         assert!(!violations.is_empty(), "Guard constraint should produce violations");
 
-        // Clean response → no constraint violations
+        // Clean response â†’ no constraint violations
         let clean_response = ResponseContext {
             text: "Your issue has been resolved. Thank you.".to_string(),
             sender_identity: None, fields: None,
@@ -913,7 +913,7 @@ mod tests {
         // This requires a new compilation step:
         //   For each Graph Schema that is activated by a Verb,
         //   and that Verb is performed during a Transition,
-        //   record: fact_type_id → event_name
+        //   record: fact_type_id â†’ event_name
 
         let mut ir = empty_ir();
         ir.nouns.insert("Customer".to_string(), make_noun("entity"));
@@ -981,7 +981,7 @@ mod tests {
             readings: vec![],
             roles: vec![RoleDef { noun_name: "Person".to_string(), role_index: 0 }],
         });
-        // SS constraint WITHOUT autofill — just validates, doesn't derive
+        // SS constraint WITHOUT autofill â€” just validates, doesn't derive
         ir.constraints.push(ConstraintDef {
             id: "ss_no_auto".to_string(),
             kind: "SS".to_string(),
@@ -1011,12 +1011,12 @@ mod tests {
         let mut population = Population { facts };
         let derived = forward_chain_ast(&compiled, &mut population);
         let mp_derived: Vec<_> = derived.iter().filter(|d| d.fact_type_id == "ft2").collect();
-        // CWA negation may derive "NOT Person hasInsurance" — that's expected.
+        // CWA negation may derive "NOT Person hasInsurance" â€” that's expected.
         // But no POSITIVE modus ponens derivation should exist.
         let positive_mp = mp_derived.iter().filter(|d| !d.reading.contains("NOT")).count();
-        assert_eq!(positive_mp, 0, "No autofill → no positive derived insurance facts");
+        assert_eq!(positive_mp, 0, "No autofill â†’ no positive derived insurance facts");
 
-        // The subset constraint validates the population — violations are produced
+        // The subset constraint validates the population â€” violations are produced
         // by the constraint evaluator (compile_subset) when the superset fact
         // doesn't have a matching consequent fact. This is verified by the
         // existing test_subset_violation test.
@@ -1025,7 +1025,7 @@ mod tests {
     #[test]
     fn test_forward_chain_ast_subtype_inheritance() {
         // Teacher is subtype of Academic. Academic has Rank.
-        // Teacher "T1" exists → should derive Academic participation.
+        // Teacher "T1" exists â†’ should derive Academic participation.
         let mut ir = empty_ir();
         ir.nouns.insert("Academic".to_string(), make_noun("entity"));
         ir.nouns.insert("Teacher".to_string(), make_noun("entity"));
@@ -1081,7 +1081,7 @@ mod tests {
             ],
         });
 
-        // Subset constraint with autofill: heads → automatically derive works for
+        // Subset constraint with autofill: heads â†’ automatically derive works for
         ir.constraints.push(ConstraintDef {
             id: "ss1".to_string(),
             kind: "SS".to_string(),
@@ -1148,7 +1148,7 @@ mod tests {
         assert_eq!(derived.len(), 0);
     }
 
-    // ── Constraint evaluation tests ────────────────────────────
+    // â”€â”€ Constraint evaluation tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn test_no_constraints_no_violations() {
@@ -1162,7 +1162,7 @@ mod tests {
     fn test_forbidden_text_detected() {
         let mut ir = empty_ir();
         ir.nouns.insert("ProhibitedText".to_string(), make_noun("value"));
-        ir.enum_values.insert("ProhibitedText".to_string(), vec!["—".to_string(), "–".to_string()]);
+        ir.enum_values.insert("ProhibitedText".to_string(), vec!["â€”".to_string(), "â€“".to_string()]);
         ir.nouns.insert("SupportResponse".to_string(), make_noun("entity"));
         ir.fact_types.insert("ft1".to_string(), FactTypeDef {
             schema_id: String::new(),
@@ -1188,7 +1188,7 @@ mod tests {
         });
 
         let response = ResponseContext {
-            text: "Hello — how can I help?".to_string(),
+            text: "Hello â€” how can I help?".to_string(),
             sender_identity: None,
             fields: None,
         };
@@ -1197,14 +1197,14 @@ mod tests {
         let result = evaluate_via_ast(&compiled, &response, &empty_population());
         assert!(!result.is_empty());
         assert!(result[0].detail.contains("forbidden"));
-        assert!(result[0].detail.contains("—"));
+        assert!(result[0].detail.contains("â€”"));
     }
 
     #[test]
     fn test_forbidden_text_clean() {
         let mut ir = empty_ir();
         ir.nouns.insert("ProhibitedText".to_string(), make_noun("value"));
-        ir.enum_values.insert("ProhibitedText".to_string(), vec!["—".to_string()]);
+        ir.enum_values.insert("ProhibitedText".to_string(), vec!["â€”".to_string()]);
         ir.nouns.insert("SupportResponse".to_string(), make_noun("entity"));
         ir.fact_types.insert("ft1".to_string(), FactTypeDef {
             schema_id: String::new(),
@@ -1673,7 +1673,7 @@ mod tests {
         ir.enum_values.insert("FieldName".to_string(), vec!["EndpointSlug".to_string(), "Title".to_string()]);
         ir.nouns.insert("SupportResponse".to_string(), make_noun("entity"));
         ir.nouns.insert("APIProduct".to_string(), make_noun("entity"));
-        // Three fact types that all reference FieldName — simulates multi-span constraint
+        // Three fact types that all reference FieldName â€” simulates multi-span constraint
         for i in 1..=3 {
             ir.fact_types.insert(format!("ft{}", i), FactTypeDef {
                 schema_id: String::new(),
@@ -1767,7 +1767,7 @@ mod tests {
         assert!(result[0].detail.contains("Equality violation"));
     }
 
-    // ── Forward Inference & Synthesis Tests ───────────────────────────
+    // â”€â”€ Forward Inference & Synthesis Tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn test_subtype_inheritance_derivation() {
@@ -2074,7 +2074,7 @@ mod tests {
 
         // Should terminate even if derivations produce facts
         let derived = forward_chain_ast(&compiled, &mut population);
-        // Just verify it terminates — the exact count depends on CWA rules
+        // Just verify it terminates â€” the exact count depends on CWA rules
         assert!(derived.len() < 100, "Forward chaining should reach fixed point quickly");
     }
 
@@ -2174,7 +2174,7 @@ mod tests {
             "stateMachines": {}
         }"#;
 
-        let ir: ConstraintIR = serde_json::from_str(json).expect("Should parse old IR format");
+        let ir: Domain = serde_json::from_str(json).expect("Should parse old IR format");
         assert_eq!(ir.domain, "test");
         assert!(ir.derivation_rules.is_empty());
         let customer = ir.nouns.get("Customer").unwrap();
@@ -2184,8 +2184,8 @@ mod tests {
     #[test]
     fn join_derivation_equi_join_on_shared_key() {
         // Generic test: join two fact types on a shared noun name.
-        // A has Key "k1", B has Key "k1" → derive C with both A and B values.
-        // A has Key "k1", B has Key "k2" → no derivation (keys don't match).
+        // A has Key "k1", B has Key "k1" â†’ derive C with both A and B values.
+        // A has Key "k1", B has Key "k2" â†’ no derivation (keys don't match).
         let mut fact_types = HashMap::new();
         fact_types.insert("a_key".to_string(), FactTypeDef {
             schema_id: String::new(),
@@ -2215,7 +2215,7 @@ mod tests {
             ],
         });
 
-        let ir = ConstraintIR {
+        let ir = Domain {
             domain: "test".to_string(),
             nouns: HashMap::new(),
             fact_types,
@@ -2253,7 +2253,7 @@ mod tests {
         forward_chain_ast(&compiled, &mut population);
 
         let derived = population.facts.get("derived").expect("Should derive");
-        // Only a1↔b1 (both Key="k1"). a2 has Key="k2" which doesn't match any B.
+        // Only a1â†”b1 (both Key="k1"). a2 has Key="k2" which doesn't match any B.
         assert_eq!(derived.len(), 1);
         assert!(derived[0].bindings.contains(&("A".to_string(), "a1".to_string())));
         assert!(derived[0].bindings.contains(&("B".to_string(), "b1".to_string())));
@@ -2303,7 +2303,7 @@ mod tests {
             ],
         });
 
-        let ir = ConstraintIR {
+        let ir = Domain {
             domain: "test".to_string(),
             nouns: HashMap::new(),
             fact_types,
@@ -2382,7 +2382,7 @@ mod tests {
             ],
         });
 
-        let ir = ConstraintIR {
+        let ir = Domain {
             domain: "test".to_string(),
             nouns: HashMap::new(),
             fact_types,
@@ -2419,7 +2419,7 @@ mod tests {
         forward_chain_ast(&compiled, &mut population);
 
         let matched = population.facts.get("matched").expect("Should derive");
-        // "Alpha Bravo" contains "Alpha" → a1 matches. "Charlie Delta" doesn't → a2 excluded.
+        // "Alpha Bravo" contains "Alpha" â†’ a1 matches. "Charlie Delta" doesn't â†’ a2 excluded.
         assert_eq!(matched.len(), 1);
         assert!(matched[0].bindings.contains(&("A".to_string(), "a1".to_string())));
         assert!(matched[0].bindings.contains(&("B".to_string(), "b1".to_string())));
@@ -2457,7 +2457,7 @@ mod tests {
             ],
         });
 
-        let ir = ConstraintIR {
+        let ir = Domain {
             domain: "test".to_string(),
             nouns: HashMap::new(),
             fact_types,
