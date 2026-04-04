@@ -20,8 +20,14 @@ pub mod verbalize;
 pub mod arest;
 
 struct CompiledState {
-    ir: types::Domain,
+    pop: types::Population,
     model: compile::CompiledModel,
+}
+
+impl CompiledState {
+    fn domain(&self) -> types::Domain {
+        compile::population_to_domain(&self.pop)
+    }
 }
 
 static DOMAINS: OnceLock<Mutex<Vec<Option<CompiledState>>>> = OnceLock::new();
@@ -58,10 +64,11 @@ impl exports::graphdl::arest::engine::Guest for E {
             m.named_spans.extend(ir.named_spans);
             m.autofill_spans.extend(ir.autofill_spans);
         }
+        let pop = parse_forml2::domain_to_population(&m);
         let model = compile::compile(&m);
         let mut s = ds().lock().unwrap();
         let h = s.iter().position(|x| x.is_none()).unwrap_or_else(|| { s.push(None); s.len() - 1 });
-        s[h] = Some(CompiledState { ir: m, model });
+        s[h] = Some(CompiledState { pop, model });
         Ok(h as u32)
     }
 
@@ -142,8 +149,9 @@ impl exports::graphdl::arest::engine::Guest for E {
                                     _ => (false, ""),
                                 };
                                 if !ok { continue; }
-                                let cd = st.ir.constraints.iter().find(|c| c.id == *cid);
-                                let ev: Vec<String> = cd.map(|c| compile::collect_enum_values_pub(&st.ir, &c.spans).into_iter().flat_map(|(_, v)| v).collect()).unwrap_or_default();
+                                let d = st.domain();
+                                let cd = d.constraints.iter().find(|c| c.id == *cid);
+                                let ev: Vec<String> = cd.map(|c| compile::collect_enum_values_pub(&d, &c.spans).into_iter().flat_map(|(_, v)| v).collect()).unwrap_or_default();
                                 let wa = if ev.is_empty() { graphdl::arest::types::WorldAssumption::Open } else { graphdl::arest::types::WorldAssumption::Closed };
                                 out.push(exports::graphdl::arest::engine::DeonticConstraint {
                                     id: cid.clone(), text: cc.text.clone(),
@@ -195,26 +203,30 @@ impl exports::graphdl::arest::engine::Guest for E {
     fn induce(handle: u32, pop: exports::graphdl::arest::engine::Population) -> String {
         let s = ds().lock().unwrap();
         let st = match s.get(handle as usize).and_then(|x| x.as_ref()) { Some(x) => x, None => return "{}".into() };
-        serde_json::to_string(&induce::induce(&st.ir, &ipop(&pop))).unwrap_or_else(|_| "{}".into())
+        let d = st.domain();
+        serde_json::to_string(&induce::induce(&d, &ipop(&pop))).unwrap_or_else(|_| "{}".into())
     }
 
     fn synthesize(handle: u32, noun: String, depth: u32) -> String {
         let s = ds().lock().unwrap();
         let st = match s.get(handle as usize).and_then(|x| x.as_ref()) { Some(x) => x, None => return "{}".into() };
-        serde_json::to_string(&evaluate::synthesize(&st.model, &st.ir, &noun, depth as usize)).unwrap_or_else(|_| "{}".into())
+        let d = st.domain();
+        serde_json::to_string(&evaluate::synthesize(&st.model, &d, &noun, depth as usize)).unwrap_or_else(|_| "{}".into())
     }
 
     fn prove(handle: u32, goal: String, pop: exports::graphdl::arest::engine::Population, wa: graphdl::arest::types::WorldAssumption) -> String {
         let s = ds().lock().unwrap();
         let st = match s.get(handle as usize).and_then(|x| x.as_ref()) { Some(x) => x, None => return "{}".into() };
         let w = match wa { graphdl::arest::types::WorldAssumption::Open => types::WorldAssumption::Open, graphdl::arest::types::WorldAssumption::Closed => types::WorldAssumption::Closed };
-        serde_json::to_string(&evaluate::prove(&st.ir, &ipop(&pop), &goal, &w)).unwrap_or_else(|_| "{}".into())
+        let d = st.domain();
+        serde_json::to_string(&evaluate::prove(&d, &ipop(&pop), &goal, &w)).unwrap_or_else(|_| "{}".into())
     }
 
     fn rmap(handle: u32) -> String {
         let s = ds().lock().unwrap();
         let st = match s.get(handle as usize).and_then(|x| x.as_ref()) { Some(x) => x, None => return "[]".into() };
-        serde_json::to_string(&rmap::rmap(&st.ir)).unwrap_or_else(|_| "[]".into())
+        let d = st.domain();
+        serde_json::to_string(&rmap::rmap(&d)).unwrap_or_else(|_| "[]".into())
     }
 }
 

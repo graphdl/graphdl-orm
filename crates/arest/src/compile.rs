@@ -463,7 +463,7 @@ pub fn compile_from_population(pop: &Population) -> CompiledModel {
 }
 
 /// Reconstruct a Domain from a Population by querying metamodel fact types.
-fn population_to_domain(pop: &Population) -> Domain {
+pub fn population_to_domain(pop: &Population) -> Domain {
     let mut domain = Domain::default();
 
     // Query Noun facts
