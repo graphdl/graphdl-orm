@@ -635,3 +635,95 @@ fn paper_claim_population_round_trip() {
     assert_eq!(sm.initial, "In Cart");
     assert_eq!(evaluate::run_machine_ast(sm, &["place", "ship", "deliver"]), "Delivered");
 }
+
+// ── Paper Claim: Everything is Func ──────────────────────────────────
+// The compiler produces named definitions (Def name = func).
+// Evaluation is function application (func:object).
+// No structs. No HashMaps at evaluation time.
+
+#[test]
+fn ffp_compile_produces_named_definitions() {
+    // compile_to_defs should return Vec<(String, Func)>
+    let meta = parse_forml2::parse_to_population(STATE_METAMODEL).unwrap();
+    let orders = parse_forml2::parse_to_population_with_nouns(ORDERS_DOMAIN, &meta).unwrap();
+    let mut pop = meta;
+    for (k, v) in orders.facts { pop.facts.entry(k).or_default().extend(v); }
+
+    let defs = compile::compile_to_defs(&pop);
+    assert!(!defs.is_empty(), "Should produce named definitions");
+
+    // Every definition is a (name, Func) pair
+    for (name, func) in &defs {
+        assert!(!name.is_empty(), "Definition name must not be empty");
+        // func is a Func. That's all it can be. No struct, no enum variant wrapping data.
+        let _ = func; // Type system enforces this is Func
+    }
+}
+
+#[test]
+fn ffp_constraint_is_a_function() {
+    let meta = parse_forml2::parse_to_population(STATE_METAMODEL).unwrap();
+    let orders = parse_forml2::parse_to_population_with_nouns(ORDERS_DOMAIN, &meta).unwrap();
+    let mut pop = meta;
+    for (k, v) in orders.facts { pop.facts.entry(k).or_default().extend(v); }
+
+    let defs = compile::compile_to_defs(&pop);
+
+    // There should be constraint definitions
+    let constraint_defs: Vec<_> = defs.iter()
+        .filter(|(name, _)| name.starts_with("constraint:"))
+        .collect();
+    assert!(!constraint_defs.is_empty(), "Should have constraint definitions");
+}
+
+#[test]
+fn ffp_state_machine_is_a_function() {
+    let meta = parse_forml2::parse_to_population(STATE_METAMODEL).unwrap();
+    let orders = parse_forml2::parse_to_population_with_nouns(ORDERS_DOMAIN, &meta).unwrap();
+    let mut pop = meta;
+    for (k, v) in orders.facts { pop.facts.entry(k).or_default().extend(v); }
+
+    let defs = compile::compile_to_defs(&pop);
+
+    // There should be a state machine definition for Order
+    let sm_defs: Vec<_> = defs.iter()
+        .filter(|(name, _)| name.contains("Order") && name.contains("machine"))
+        .collect();
+    assert!(!sm_defs.is_empty(), "Order state machine should be a named definition");
+}
+
+#[test]
+fn ffp_evaluation_is_application() {
+    use arest::ast::{self, Func, Object};
+
+    let meta = parse_forml2::parse_to_population(STATE_METAMODEL).unwrap();
+    let orders = parse_forml2::parse_to_population_with_nouns(ORDERS_DOMAIN, &meta).unwrap();
+    let mut pop = meta;
+    for (k, v) in orders.facts { pop.facts.entry(k).or_default().extend(v); }
+
+    let defs: Vec<(String, arest::ast::Func)> = compile::compile_to_defs(&pop);
+    let def_map: HashMap<String, arest::ast::Func> = defs.iter().map(|(n, f)| (n.clone(), f.clone())).collect();
+
+    // Find the Order state machine transition function and initial state
+    let (_, transition_func) = defs.iter()
+        .find(|(name, _)| name == "machine:Order")
+        .expect("Order transition function");
+    let (_, initial_func) = defs.iter()
+        .find(|(name, _)| name == "machine:Order:initial")
+        .expect("Order initial state");
+
+    // Get initial state by applying the constant function
+    let initial = ast::apply(initial_func, &Object::phi(), &def_map);
+    assert_eq!(initial.as_atom(), Some("In Cart"));
+
+    // Fold the transition function over the event stream.
+    // foldl(transition, state, events): for each event, apply transition to <state, event>
+    let events = ["place", "ship", "deliver"];
+    let mut state = initial;
+    for event in &events {
+        let input = Object::seq(vec![state, Object::atom(event)]);
+        state = ast::apply(transition_func, &input, &def_map);
+    }
+    assert_eq!(state.as_atom(), Some("Delivered"),
+        "State machine evaluation is a fold of the transition function over events");
+}

@@ -419,6 +419,40 @@ fn derive_state_machines_from_facts(facts: &[GeneralInstanceFact]) -> HashMap<St
 // â”€â”€ Compilation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // The match on kind happens here, once. After this, everything is Func.
 
+/// Compile a Population into named FFP definitions.
+/// Readings in, Def name = func out. Nothing else.
+pub fn compile_to_defs(pop: &Population) -> Vec<(String, Func)> {
+    let domain = population_to_domain(pop);
+    let model = compile(&domain);
+    let mut defs: Vec<(String, Func)> = Vec::new();
+
+    // Constraints -> named definitions
+    for c in &model.constraints {
+        defs.push((format!("constraint:{}", c.id), c.func.clone()));
+    }
+
+    // State machines -> named definitions
+    // The func is the transition function: <state, event> -> state'.
+    // The complete machine is foldl(transition, initial, events).
+    // We store the transition function and the initial state as separate cells.
+    for sm in &model.state_machines {
+        defs.push((format!("machine:{}", sm.noun_name), sm.func.clone()));
+        defs.push((format!("machine:{}:initial", sm.noun_name), Func::constant(Object::atom(&sm.initial))));
+    }
+
+    // Derivation rules -> named definitions
+    for d in &model.derivations {
+        defs.push((format!("derivation:{}", d.id), d.func.clone()));
+    }
+
+    // Fact type schemas -> named definitions (CONS of roles)
+    for (id, schema) in &model.schemas {
+        defs.push((format!("schema:{}", id), schema.construction.clone()));
+    }
+
+    defs
+}
+
 /// Compile from a Population of facts. Reconstructs the Domain internally
 /// by querying P for metamodel fact types, then delegates to compile().
 /// This is the target API. The Domain struct is an implementation detail
