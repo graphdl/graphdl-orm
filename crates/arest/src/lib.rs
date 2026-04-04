@@ -21,12 +21,19 @@ pub mod arest;
 
 struct CompiledState {
     pop: types::Population,
+    defs: Vec<(String, ast::Func)>,
     model: compile::CompiledModel,
 }
 
 impl CompiledState {
     fn domain(&self) -> types::Domain {
         compile::population_to_domain(&self.pop)
+    }
+    fn def(&self, name: &str) -> Option<&ast::Func> {
+        self.defs.iter().find(|(n, _)| n == name).map(|(_, f)| f)
+    }
+    fn defs_matching(&self, prefix: &str) -> Vec<(&str, &ast::Func)> {
+        self.defs.iter().filter(|(n, _)| n.starts_with(prefix)).map(|(n, f)| (n.as_str(), f)).collect()
     }
 }
 
@@ -66,9 +73,10 @@ impl exports::graphdl::arest::engine::Guest for E {
         }
         let pop = parse_forml2::domain_to_population(&m);
         let model = compile::compile(&m);
+        let defs = compile::compile_to_defs(&pop);
         let mut s = ds().lock().unwrap();
         let h = s.iter().position(|x| x.is_none()).unwrap_or_else(|| { s.push(None); s.len() - 1 });
-        s[h] = Some(CompiledState { pop, model });
+        s[h] = Some(CompiledState { pop, defs, model });
         Ok(h as u32)
     }
 
@@ -104,15 +112,25 @@ impl exports::graphdl::arest::engine::Guest for E {
     fn run_machine(handle: u32, noun: String, events: Vec<String>) -> Result<String, String> {
         let s = ds().lock().unwrap();
         let st = s.get(handle as usize).and_then(|x| x.as_ref()).ok_or("no domain")?;
-        let refs: Vec<&str> = events.iter().map(|s| s.as_str()).collect();
-        let idx = st.model.noun_index.noun_to_state_machines.get(&noun);
-        match idx.and_then(|&i| st.model.state_machines.get(i)) {
-            Some(sm) => Ok(evaluate::run_machine_ast(sm, &refs)),
-            None => Err(format!("no sm for '{}'", noun)),
+        let sm_name = format!("machine:{}", noun);
+        let init_name = format!("machine:{}:initial", noun);
+        let transition = st.def(&sm_name).ok_or(format!("no sm for '{}'", noun))?;
+        let initial_func = st.def(&init_name).ok_or(format!("no initial for '{}'", noun))?;
+        let def_map: HashMap<String, ast::Func> = st.defs.iter().map(|(n, f)| (n.clone(), f.clone())).collect();
+        // Get initial state
+        let mut state = ast::apply(initial_func, &ast::Object::phi(), &def_map);
+        // Fold transition function over events
+        for event in &events {
+            let input = ast::Object::seq(vec![state, ast::Object::atom(event)]);
+            state = ast::apply(transition, &input, &def_map);
         }
+        Ok(state.as_atom().unwrap_or("").to_string())
     }
 
     fn get_transitions(handle: u32, noun: String, status: String) -> Vec<exports::graphdl::arest::engine::Transition> {
+        // Fall back to CompiledModel for now. The transition table is needed
+        // to enumerate all possible events. With pure FFP, this would query
+        // the transition facts in P and apply the transition function to each.
         let s = ds().lock().unwrap();
         let st = match s.get(handle as usize).and_then(|x| x.as_ref()) { Some(x) => x, None => return vec![] };
         let idx = st.model.noun_index.noun_to_state_machines.get(&noun);
@@ -127,7 +145,13 @@ impl exports::graphdl::arest::engine::Guest for E {
         let s = ds().lock().unwrap();
         let st = match s.get(handle as usize).and_then(|x| x.as_ref()) { Some(x) => x, None => return vec![] };
         let p = ipop(&pop);
-        evaluate::evaluate_via_ast(&st.model, &text, sender.as_deref(), &p).iter().map(ovio).collect()
+        let ctx = ast::encode_eval_context(&text, sender.as_deref(), &p);
+        let def_map: HashMap<String, ast::Func> = st.defs.iter().map(|(n, f)| (n.clone(), f.clone())).collect();
+        // Apply each constraint func to the eval context
+        st.defs_matching("constraint:").iter().flat_map(|(_, func)| {
+            let result = ast::apply(func, &ctx, &def_map);
+            ast::decode_violations(&result)
+        }).map(|v| ovio(&v)).collect()
     }
 
     fn get_deontic_constraints(handle: u32, noun: String) -> Vec<exports::graphdl::arest::engine::DeonticConstraint> {
