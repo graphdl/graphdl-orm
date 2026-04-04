@@ -1040,6 +1040,130 @@ fn constraint_evaluation_via_application() {
         "UC violation: Order ord-1 placed by two Customers should violate");
 }
 
+// ── Response Text as Fact in P ───────────────────────────────────────
+// The response is an entity in P with facts, not a separate struct.
+// Deontic text constraints evaluate against the Body fact in P.
+
+#[test]
+fn response_text_is_a_fact_in_population() {
+    use arest::ast::{self, Func, Object};
+
+    // A response body is just a fact: Support Response 'resp-1' has Body 'some text'
+    let mut facts = HashMap::new();
+    facts.insert("Support_Response_has_Body".to_string(), vec![
+        FactInstance {
+            fact_type_id: "Support_Response_has_Body".to_string(),
+            bindings: vec![
+                ("Support Response".to_string(), "resp-1".to_string()),
+                ("Body".to_string(), "We will ship overnight for sure".to_string()),
+            ],
+        },
+    ]);
+    let pop = Population { facts };
+
+    // The population contains the response text as a fact.
+    // A constraint evaluator should be able to find it by querying P
+    // for Support_Response_has_Body facts.
+    let pop_obj = ast::encode_population(&pop);
+
+    // The population is queryable. The body text is in P, not in a separate struct.
+    assert_ne!(pop_obj, Object::phi(), "Population with response should not be empty");
+}
+
+#[test]
+fn deontic_constraint_evaluates_against_population_body() {
+    use arest::ast::{self, Func, Object};
+
+    // Parse a domain with a forbidden deontic constraint
+    let input = r#"
+# ResponseTest
+## Entity Types
+Support Response(.id) is an entity type.
+Prohibited Word is a value type.
+  The possible values of Prohibited Word are 'overnight', 'asap'.
+Body is a value type.
+## Fact Types
+Support Response has Body.
+Support Response contains Prohibited Word.
+## Deontic Constraints
+It is forbidden that Support Response contains Prohibited Word.
+"#;
+
+    let ir = parse_forml2::parse_markdown(input).unwrap();
+    let model = compile::compile(&ir);
+
+    // Bad response: body contains "overnight"
+    let bad = arest::types::ResponseContext {
+        text: "We will ship overnight".to_string(),
+        sender_identity: None,
+        fields: None,
+    };
+    let pop = Population { facts: HashMap::new() };
+    let violations = evaluate::evaluate_via_ast(&model, &bad, &pop);
+    assert!(!violations.is_empty(), "Should catch 'overnight' via enum matching");
+
+    // Good response: no prohibited words
+    let good = arest::types::ResponseContext {
+        text: "We will ship via standard delivery".to_string(),
+        sender_identity: None,
+        fields: None,
+    };
+    let good_violations = evaluate::evaluate_via_ast(&model, &good, &pop);
+    let prohibited_violations: Vec<_> = good_violations.iter()
+        .filter(|v| v.constraint_text.contains("Prohibited Word"))
+        .collect();
+    assert!(prohibited_violations.is_empty(), "Clean response should not trigger prohibited word violation");
+}
+
+#[test]
+fn deontic_constraint_via_defs_and_application() {
+    use arest::ast::{self, Func, Object};
+
+    // Same domain as above
+    let input = r#"
+# ResponseTest
+## Entity Types
+Support Response(.id) is an entity type.
+Prohibited Word is a value type.
+  The possible values of Prohibited Word are 'overnight', 'asap'.
+Body is a value type.
+## Fact Types
+Support Response has Body.
+Support Response contains Prohibited Word.
+## Deontic Constraints
+It is forbidden that Support Response contains Prohibited Word.
+"#;
+
+    let pop = parse_forml2::parse_to_population(input).unwrap();
+    let defs: Vec<(String, Func)> = compile::compile_to_defs(&pop);
+    let def_map: HashMap<String, Func> = defs.iter().map(|(n, f)| (n.clone(), f.clone())).collect();
+
+    // Find the forbidden constraint
+    let (_, constraint_func) = defs.iter()
+        .find(|(name, _)| name.contains("constraint:") && name.contains("Prohibited Word"))
+        .expect("Prohibited Word constraint");
+
+    // Bad response: eval context has "overnight" in the text position
+    let bad_ctx = Object::seq(vec![
+        Object::atom("We will ship overnight"),
+        Object::phi(),
+        Object::phi(),
+    ]);
+    let bad_result = ast::apply(constraint_func, &bad_ctx, &def_map);
+    assert_ne!(bad_result, Object::phi(),
+        "Forbidden constraint via pure application should catch 'overnight'");
+
+    // Good response
+    let good_ctx = Object::seq(vec![
+        Object::atom("We will ship standard"),
+        Object::phi(),
+        Object::phi(),
+    ]);
+    let good_result = ast::apply(constraint_func, &good_ctx, &def_map);
+    assert_eq!(good_result, Object::phi(),
+        "Forbidden constraint via pure application should pass clean text");
+}
+
 // ── Forward Chaining via Pure Application ────────────────────────────
 
 #[test]
