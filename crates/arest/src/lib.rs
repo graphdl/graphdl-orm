@@ -128,17 +128,40 @@ impl exports::graphdl::arest::engine::Guest for E {
     }
 
     fn get_transitions(handle: u32, noun: String, status: String) -> Vec<exports::graphdl::arest::engine::Transition> {
-        // Fall back to CompiledModel for now. The transition table is needed
-        // to enumerate all possible events. With pure FFP, this would query
-        // the transition facts in P and apply the transition function to each.
         let s = ds().lock().unwrap();
         let st = match s.get(handle as usize).and_then(|x| x.as_ref()) { Some(x) => x, None => return vec![] };
-        let idx = st.model.noun_index.noun_to_state_machines.get(&noun);
-        match idx.and_then(|&i| st.model.state_machines.get(i)) {
-            Some(sm) => sm.transition_table.iter().filter(|(f, _, _)| f == &status)
-                .map(|(f, t, ev)| exports::graphdl::arest::engine::Transition { from_status: f.clone(), to_status: t.clone(), event: ev.clone() }).collect(),
-            None => vec![],
+        let sm_name = format!("machine:{}", noun);
+        let transition = match st.def(&sm_name) { Some(f) => f, None => return vec![] };
+        let def_map: HashMap<String, ast::Func> = st.defs.iter().map(|(n, f)| (n.clone(), f.clone())).collect();
+        // Query instance facts in P for all transition events
+        let events: Vec<String> = st.pop.facts.get("InstanceFact")
+            .map(|facts| facts.iter()
+                .filter(|f| f.bindings.iter().any(|(k, v)| k == "subjectNoun" && v == "Transition")
+                    && f.bindings.iter().any(|(k, _)| k == "objectNoun"))
+                .filter_map(|f| {
+                    let obj_noun = f.bindings.iter().find(|(k, _)| k == "objectNoun").map(|(_, v)| v.as_str())?;
+                    if obj_noun == "Event Type" {
+                        f.bindings.iter().find(|(k, _)| k == "objectValue").map(|(_, v)| v.clone())
+                    } else { None }
+                })
+                .collect::<std::collections::HashSet<_>>().into_iter().collect()
+            ).unwrap_or_default();
+        // Probe each event against the transition function
+        let mut result = vec![];
+        for event in &events {
+            let input = ast::Object::seq(vec![ast::Object::atom(&status), ast::Object::atom(event)]);
+            let next = ast::apply(transition, &input, &def_map);
+            if let Some(next_status) = next.as_atom() {
+                if next_status != status {
+                    result.push(exports::graphdl::arest::engine::Transition {
+                        from_status: status.clone(),
+                        to_status: next_status.to_string(),
+                        event: event.clone(),
+                    });
+                }
+            }
         }
+        result
     }
 
     fn evaluate_response(handle: u32, text: String, sender: Option<String>, pop: exports::graphdl::arest::engine::Population) -> Vec<exports::graphdl::arest::engine::Violation> {
