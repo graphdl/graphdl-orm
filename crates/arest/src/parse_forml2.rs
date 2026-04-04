@@ -2076,13 +2076,8 @@ Support Response uses Dash.
 It is forbidden that Support Response uses Dash.";
         let ir = parse_markdown(input).unwrap();
         let model = crate::compile::compile(&ir);
-        let response = crate::types::ResponseContext {
-            text: "Hi -- here is your answer".into(),
-            sender_identity: None,
-            fields: None,
-        };
         let population = crate::types::Population { facts: std::collections::HashMap::new() };
-        let violations = crate::evaluate::evaluate_via_ast(&model, &response, &population);
+        let violations = crate::evaluate::evaluate_via_ast(&model, "Hi -- here is your answer", None, &population);
         assert!(!violations.is_empty(),
             "Response containing '--' should violate the forbidden Dash constraint");
         assert!(violations.iter().any(|v| v.constraint_text.contains("Dash")),
@@ -2101,13 +2096,8 @@ Support Response uses Dash.
 It is forbidden that Support Response uses Dash.";
         let ir = parse_markdown(input).unwrap();
         let model = crate::compile::compile(&ir);
-        let response = crate::types::ResponseContext {
-            text: "Hi, here is your answer with no dashes at all".into(),
-            sender_identity: None,
-            fields: None,
-        };
         let population = crate::types::Population { facts: std::collections::HashMap::new() };
-        let violations = crate::evaluate::evaluate_via_ast(&model, &response, &population);
+        let violations = crate::evaluate::evaluate_via_ast(&model, "Hi, here is your answer with no dashes at all", None, &population);
         let dash_violations: Vec<_> = violations.iter()
             .filter(|v| v.constraint_text.contains("Dash"))
             .collect();
@@ -2132,13 +2122,8 @@ It is forbidden that Support Response contains Markdown Syntax.";
         let ir = parse_markdown(input).unwrap();
         let model = crate::compile::compile(&ir);
         // Response with both dashes and markdown
-        let response = crate::types::ResponseContext {
-            text: "## Heading\n\nHere is info -- with **bold** text".into(),
-            sender_identity: None,
-            fields: None,
-        };
         let population = crate::types::Population { facts: std::collections::HashMap::new() };
-        let violations = crate::evaluate::evaluate_via_ast(&model, &response, &population);
+        let violations = crate::evaluate::evaluate_via_ast(&model, "## Heading\n\nHere is info -- with **bold** text", None, &population);
         assert!(violations.iter().any(|v| v.constraint_text.contains("Dash")),
             "Should catch dash violation");
         assert!(violations.iter().any(|v| v.constraint_text.contains("Markdown")),

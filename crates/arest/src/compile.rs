@@ -3094,7 +3094,6 @@ mod schema_tests {
         let constraint = &model.constraints[0];
 
         // Create a population WITH a UC violation: Alice has two names
-        let response = ResponseContext { text: String::new(), sender_identity: None, fields: None };
         let mut facts = HashMap::new();
         facts.insert("ft1".to_string(), vec![
             FactInstance {
@@ -3109,7 +3108,7 @@ mod schema_tests {
         let population = Population { facts };
 
         // Evaluate via AST: apply(func, encoded_context)
-        let ctx_obj = crate::ast::encode_eval_context(&response, &population);
+        let ctx_obj = crate::ast::encode_eval_context("", None, &population);
         let defs = HashMap::new();
         let result = crate::ast::apply(&constraint.func, &ctx_obj, &defs);
 
@@ -3164,7 +3163,6 @@ mod schema_tests {
         let constraint = &model.constraints[0];
 
         // No violation: each person has exactly one name
-        let response = ResponseContext { text: String::new(), sender_identity: None, fields: None };
         let mut facts = HashMap::new();
         facts.insert("ft1".to_string(), vec![
             FactInstance {
@@ -3178,7 +3176,7 @@ mod schema_tests {
         ]);
         let population = Population { facts };
 
-        let ctx_obj = crate::ast::encode_eval_context(&response, &population);
+        let ctx_obj = crate::ast::encode_eval_context("", None, &population);
         let defs = HashMap::new();
         let result = crate::ast::apply(&constraint.func, &ctx_obj, &defs);
 
