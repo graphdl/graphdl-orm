@@ -1,13 +1,12 @@
-﻿// CLI for the FOL engine â€” first-order logic reasoning over GraphDL domain models.
+// CLI for the FOL engine -- first-order logic reasoning over GraphDL domain models.
 //
 // Modes:
 //   evaluate       Check text/response against compiled constraint predicates
 //   synthesize     Collect all knowledge about a noun (fact types, constraints, related nouns)
 //   forward-chain  Derive new facts from a population until fixed point
-//   query          Filter a population by a predicate, return matching entities
 //
 // The constraint IR is compiled once at load time. All evaluation is pure
-// function application â€” no dispatch, no branching on kind, no mutable state.
+// function application -- no dispatch, no branching on kind, no mutable state.
 // Implements Backus's FP algebra (1977).
 
 #[allow(dead_code)] // Functions used by WASM lib.rs, not by this binary
@@ -40,7 +39,6 @@ mod validate;
 mod induce;
 
 use types::{Domain, Population};
-use query::QueryPredicate;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -52,7 +50,6 @@ fn main() {
     let mut synthesize_noun: Option<String> = None;
     let mut synthesize_depth: usize = 1;
     let mut do_forward_chain = false;
-    let mut query_path: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -69,7 +66,6 @@ fn main() {
                     .unwrap_or(1);
             }
             "--forward-chain" => { do_forward_chain = true; }
-            "--query" => { i += 1; query_path = args.get(i).cloned(); }
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -93,14 +89,14 @@ fn main() {
         .unwrap_or_else(|e| { eprintln!("Failed to parse IR: {}", e); std::process::exit(1); });
     let model = compile::compile(&ir);
 
-    // â”€â”€ Synthesize mode â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // -- Synthesize mode --
     if let Some(noun_name) = synthesize_noun {
         let result = evaluate::synthesize(&model, &ir, &noun_name, synthesize_depth);
         println!("{}", serde_json::to_string_pretty(&result).unwrap());
         std::process::exit(0);
     }
 
-    // â”€â”€ Forward chain mode â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // -- Forward chain mode --
     if do_forward_chain {
         let mut population = load_population(population_path, true);
         let derived = evaluate::forward_chain_ast(&model, &mut population);
@@ -112,19 +108,7 @@ fn main() {
         std::process::exit(0);
     }
 
-    // â”€â”€ Query mode â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    if let Some(qp) = query_path {
-        let population = load_population(population_path, true);
-        let query_json = std::fs::read_to_string(&qp)
-            .unwrap_or_else(|e| { eprintln!("Failed to read query file: {}", e); std::process::exit(1); });
-        let predicate: QueryPredicate = serde_json::from_str(&query_json)
-            .unwrap_or_else(|e| { eprintln!("Failed to parse query: {}", e); std::process::exit(1); });
-        let result = query::query_population(&population, &predicate);
-        println!("{}", serde_json::to_string_pretty(&result).unwrap());
-        std::process::exit(0);
-    }
-
-    // â”€â”€ Evaluate mode (default) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // -- Evaluate mode (default) --
     let response_text: String = if let Some(t) = text {
         t
     } else if let Some(p) = response_path {
@@ -141,7 +125,7 @@ fn main() {
     let violations = evaluate::evaluate_via_ast(&model, &response_text, None, &population);
 
     if violations.is_empty() {
-        println!("OK â€” no violations");
+        println!("OK -- no violations");
         std::process::exit(0);
     } else {
         println!("{}", serde_json::to_string_pretty(&violations).unwrap());
@@ -166,43 +150,36 @@ fn load_population(path: Option<String>, required: bool) -> Population {
 }
 
 fn print_help() {
-    eprintln!("fol â€” first-order logic reasoning engine for GraphDL domain models");
+    eprintln!("fol -- first-order logic reasoning engine for GraphDL domain models");
     eprintln!();
-    eprintln!("Implements Backus's FP algebra: constraints compile to pure functions,");
+    eprintln!("Implements Backus FP algebra: constraints compile to pure functions,");
     eprintln!("evaluation is function application over whole structures.");
     eprintln!();
     eprintln!("MODES:");
     eprintln!();
-    eprintln!("  Evaluate (default) â€” check text against constraint predicates");
-    eprintln!("    fol --ir <ir.json> --text \"text to verify\"");
+    eprintln!("  Evaluate (default) -- check text against constraint predicates");
+    eprintln!("    fol --ir <ir.json> --text <text to verify>");
     eprintln!("    fol --ir <ir.json> --response <response.json>");
-    eprintln!("    echo '{{\"text\":\"...\"}}' | fol --ir <ir.json>");
     eprintln!();
-    eprintln!("  Synthesize â€” collect all knowledge about a noun");
+    eprintln!("  Synthesize -- collect all knowledge about a noun");
     eprintln!("    fol --ir <ir.json> --synthesize <noun> [--depth <n>]");
     eprintln!("    Returns: fact types, constraints, state machines, related nouns");
     eprintln!();
-    eprintln!("  Forward Chain â€” derive new facts from a population until fixed point");
+    eprintln!("  Forward Chain -- derive new facts from a population until fixed point");
     eprintln!("    fol --ir <ir.json> --forward-chain --population <pop.json>");
     eprintln!("    Derivation rules: subtype inheritance, modus ponens, transitivity,");
     eprintln!("    closed-world negation. Returns all derived facts with proof chains.");
     eprintln!();
-    eprintln!("  Query â€” filter a population by a predicate");
-    eprintln!("    fol --ir <ir.json> --query <predicate.json> --population <pop.json>");
-    eprintln!("    Predicate: {{\"factTypeId\":\"..\",\"targetNoun\":\"..\",\"filterBindings\":[[k,v]]}}");
-    eprintln!("    Returns matching entity references.");
-    eprintln!();
     eprintln!("OPTIONS:");
     eprintln!("  --ir <path>            Constraint IR JSON file (required)");
     eprintln!("  --text <string>        Text to evaluate against constraints");
-    eprintln!("  --response <path>      Response JSON ({{\"text\":\"...\",\"senderIdentity\":\"...\"}})");
-    eprintln!("  --population <path>    Population JSON ({{\"facts\":{{id:[{{factTypeId,bindings}}]}}}})");
+    eprintln!("  --response <path>      Response JSON file");
+    eprintln!("  --population <path>    Population JSON file");
     eprintln!("  --synthesize <noun>    Synthesize knowledge about a noun");
     eprintln!("  --depth <n>            Synthesis depth for related nouns (default: 1)");
     eprintln!("  --forward-chain        Run forward inference on population");
-    eprintln!("  --query <path>         Query predicate JSON file");
     eprintln!();
     eprintln!("EXIT CODES:");
-    eprintln!("  0  Clean â€” no violations / successful operation");
-    eprintln!("  1  Violations found / query returned results");
+    eprintln!("  0  Clean -- no violations / successful operation");
+    eprintln!("  1  Violations found");
 }
