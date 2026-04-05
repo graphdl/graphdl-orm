@@ -1964,49 +1964,63 @@ fn compile_ring_transitive_ast(def: &ConstraintDef) -> Func {
     let ft_ids: Vec<String> = def.spans.iter().map(|s| s.fact_type_id.clone()).collect();
     let facts = extract_facts_multi(&ft_ids);
 
-    let id = def.id.clone();
-    let text = def.text.clone();
+    // TR: same chain pattern as IT, but violation when shortcut is MISSING.
+    let is_chain = Func::compose(Func::And, Func::construction(vec![
+        Func::compose(Func::Eq, Func::construction(vec![
+            Func::compose(role_value(1), Func::Selector(1)),
+            Func::compose(role_value(0), Func::Selector(2)),
+        ])),
+        Func::compose(Func::Not, Func::compose(Func::Eq, Func::construction(vec![
+            Func::compose(role_value(0), Func::Selector(1)),
+            Func::compose(role_value(1), Func::Selector(2)),
+        ]))),
+    ]));
 
-    Func::Native(Arc::new(move |ctx: &Object| {
-        let defs = HashMap::new();
-        let all_facts = crate::ast::apply(&facts, ctx, &defs);
-        let items = match all_facts.as_seq() {
-            Some(items) => items,
-            None => return Object::phi(),
-        };
+    let shortcut_match = Func::compose(Func::And, Func::construction(vec![
+        Func::compose(Func::Eq, Func::construction(vec![
+            Func::compose(role_value(0), Func::Selector(2)),
+            Func::compose(role_value(0), Func::compose(Func::Selector(1), Func::Selector(1))),
+        ])),
+        Func::compose(Func::Eq, Func::construction(vec![
+            Func::compose(role_value(1), Func::Selector(2)),
+            Func::compose(role_value(1), Func::compose(Func::Selector(2), Func::Selector(1))),
+        ])),
+    ]));
 
-        let pairs: Vec<(String, String)> = items.iter().filter_map(|fact| {
-            let v0 = crate::ast::apply(&role_value(0), fact, &defs);
-            let v1 = crate::ast::apply(&role_value(1), fact, &defs);
-            Some((v0.as_atom()?.to_string(), v1.as_atom()?.to_string()))
-        }).collect();
+    // NullTest = shortcut missing = violation (opposite of IT)
+    let no_shortcut = Func::compose(
+        Func::NullTest,
+        Func::compose(Func::filter(shortcut_match), Func::DistL),
+    );
 
-        let set: HashSet<(String, String)> = pairs.iter().cloned().collect();
+    let find_chains_for_f = Func::compose(Func::filter(is_chain), Func::DistL);
 
-        // For each xRy, look for yRz, check if xRz is missing (violation)
-        let mut violations = Vec::new();
-        for (x, y) in &pairs {
-            for (y2, z) in &pairs {
-                if y == y2 && x != z && !set.contains(&(x.clone(), z.clone())) {
-                    violations.push(Object::seq(vec![
-                        Object::atom(&id),
-                        Object::atom(&text),
-                        Object::seq(vec![
-                            Object::atom("Transitive violation:"),
-                            Object::atom(x),
-                            Object::atom("relates to"),
-                            Object::atom(y),
-                            Object::atom("relates to"),
-                            Object::atom(z),
-                            Object::atom("but shortcut is missing"),
-                        ]),
-                    ]));
-                }
-            }
-        }
+    let detail = Func::construction(vec![
+        Func::constant(Object::atom("Transitive violation:")),
+        Func::compose(role_value(0), Func::compose(Func::Selector(1), Func::Selector(1))),
+        Func::constant(Object::atom("relates to")),
+        Func::compose(role_value(1), Func::compose(Func::Selector(1), Func::Selector(1))),
+        Func::constant(Object::atom("relates to")),
+        Func::compose(role_value(1), Func::compose(Func::Selector(2), Func::Selector(1))),
+        Func::constant(Object::atom("but shortcut is missing")),
+    ]);
+    let viol = make_violation_func(&def.id, &def.text, detail);
 
-        if violations.is_empty() { Object::phi() } else { Object::Seq(violations) }
-    }))
+    let check_f = Func::compose(
+        Func::apply_to_all(viol),
+        Func::compose(
+            Func::filter(no_shortcut),
+            Func::compose(Func::DistR, Func::construction(vec![
+                find_chains_for_f,
+                Func::Selector(2),
+            ])),
+        ),
+    );
+
+    Func::compose(
+        Func::apply_to_all(check_f),
+        Func::compose(Func::DistR, Func::construction(vec![facts.clone(), facts])),
+    )
 }
 
 /// AC: no cycle xâ‚Rxâ‚‚...xâ‚™Rxâ‚ â€” DFS cycle detection.
