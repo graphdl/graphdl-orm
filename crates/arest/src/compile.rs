@@ -247,6 +247,23 @@ fn extract_facts_func(ft_id: &str) -> Func {
     Func::compose(get_facts_or_phi, Func::compose(find_ft, Func::Selector(3)))
 }
 
+/// Extract facts from a population Object directly (no eval context wrapper).
+/// Used by derivation compilers which receive population, not ctx.
+fn extract_facts_from_pop(ft_id: &str) -> Func {
+    let find_ft = Func::filter(
+        Func::compose(Func::Eq, Func::construction(vec![
+            Func::Selector(1),
+            Func::constant(Object::atom(ft_id)),
+        ])),
+    );
+    let get_or_phi = Func::condition(
+        Func::NullTest,
+        Func::constant(Object::phi()),
+        Func::compose(Func::Selector(2), Func::Selector(1)),
+    );
+    Func::compose(get_or_phi, find_ft)
+}
+
 /// Build a Func that extracts facts for multiple fact type IDs.
 /// Returns the concatenation of all facts from all matching fact types.
 fn extract_facts_multi(ft_ids: &[String]) -> Func {
@@ -925,42 +942,40 @@ fn compile_explicit_derivation(ir: &Domain, rule: &DerivationRuleDef) -> Compile
         .map(|ft| ft.reading.clone())
         .unwrap_or_default();
 
-    // Operate directly on the population Object â€” no decode/re-encode.
-    let func = crate::ast::Func::Native(Arc::new(move |pop_obj: &crate::ast::Object| {
-        // Check if all antecedent fact types have non-empty fact lists
-        let all_hold = antecedent_ids.iter().all(|ft_id| {
-            !obj_find_ft(pop_obj, ft_id).is_empty()
-        });
+    // Pure Func: check all antecedent FTs non-empty, derive consequent.
+    // For each antecedent: not(null(extract_facts_from_pop(ft_id)))
+    let ant_checks: Vec<Func> = antecedent_ids.iter()
+        .map(|ft_id| Func::compose(Func::compose(Func::Not, Func::NullTest), extract_facts_from_pop(ft_id)))
+        .collect();
 
-        if !all_hold {
-            return crate::ast::Object::phi();
-        }
+    let all_hold = match ant_checks.len() {
+        0 => Func::constant(Object::t()),
+        1 => ant_checks.into_iter().next().unwrap(),
+        _ => ant_checks.into_iter().reduce(|a, b| Func::compose(Func::And, Func::construction(vec![a, b]))).unwrap(),
+    };
 
-        // Collect all unique bindings from antecedent facts
-        let mut bindings: Vec<(String, String)> = Vec::new();
-        for ft_id in &antecedent_ids {
-            for fact in obj_find_ft(pop_obj, ft_id) {
-                if let Some(fact_bindings) = fact.as_seq() {
-                    for binding in fact_bindings {
-                        if let Some(bpair) = binding.as_seq() {
-                            if bpair.len() == 2 {
-                                if let (Some(n), Some(v)) = (bpair[0].as_atom(), bpair[1].as_atom()) {
-                                    let pair = (n.to_string(), v.to_string());
-                                    if !bindings.contains(&pair) {
-                                        bindings.push(pair);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+    // When all antecedents hold, produce a derived fact.
+    // Collect first fact from each antecedent to gather bindings.
+    let binding_extractors: Vec<Func> = antecedent_ids.iter()
+        .map(|ft_id| Func::compose(Func::Selector(1), extract_facts_from_pop(ft_id)))
+        .collect();
 
-        crate::ast::Object::Seq(vec![
-            obj_derived_fact(&consequent_id, &consequent_reading, &bindings),
-        ])
-    }));
+    // Derived fact = <ft_id, reading, <bindings from first antecedent fact>>
+    let derived = Func::construction(vec![
+        Func::constant(Object::atom(&consequent_id)),
+        Func::constant(Object::atom(&consequent_reading)),
+        if binding_extractors.is_empty() {
+            Func::constant(Object::phi())
+        } else {
+            binding_extractors.into_iter().next().unwrap() // bindings from first antecedent
+        },
+    ]);
+
+    let func = Func::condition(
+        all_hold,
+        Func::construction(vec![derived]),
+        Func::constant(Object::phi()),
+    );
     CompiledDerivation { id, text, kind, func }
 }
 
