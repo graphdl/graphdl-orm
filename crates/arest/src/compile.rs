@@ -1860,49 +1860,103 @@ fn compile_ring_intransitive_ast(def: &ConstraintDef) -> Func {
     let ft_ids: Vec<String> = def.spans.iter().map(|s| s.fact_type_id.clone()).collect();
     let facts = extract_facts_multi(&ft_ids);
 
-    let id = def.id.clone();
-    let text = def.text.clone();
+    // IT: xRy ^ yRz -> not xRz. Violation when shortcut exists.
+    //
+    // Step 1: Find chains. distr [facts, facts] -> <f1, all>, distl -> <f1,f2> pairs.
+    //   Filter: role1(f1) = role0(f2) AND role0(f1) != role1(f2) (chain, not self-loop)
+    //   Result: <chain_pair, ...> where chain_pair = <xRy, yRz>
+    //
+    // Step 2: For each chain, check shortcut exists.
+    //   Shortcut = <role0(f1), role1(f2)> = <x, z>
+    //   distr [chains, all_facts], distl, Filter(shortcut matches candidate)
 
-    Func::Native(Arc::new(move |ctx: &Object| {
-        let defs = HashMap::new();
-        let all_facts = crate::ast::apply(&facts, ctx, &defs);
-        let items = match all_facts.as_seq() {
-            Some(items) => items,
-            None => return Object::phi(),
-        };
+    // chain predicate: <f1, f2> -> role1(f1) = role0(f2) AND role0(f1) != role1(f2)
+    let is_chain = Func::compose(Func::And, Func::construction(vec![
+        Func::compose(Func::Eq, Func::construction(vec![
+            Func::compose(role_value(1), Func::Selector(1)), // role1(f1)
+            Func::compose(role_value(0), Func::Selector(2)), // role0(f2)
+        ])),
+        Func::compose(Func::Not, Func::compose(Func::Eq, Func::construction(vec![
+            Func::compose(role_value(0), Func::Selector(1)), // role0(f1) = x
+            Func::compose(role_value(1), Func::Selector(2)), // role1(f2) = z
+        ]))),
+    ]));
 
-        let pairs: Vec<(String, String)> = items.iter().filter_map(|fact| {
-            let v0 = crate::ast::apply(&role_value(0), fact, &defs);
-            let v1 = crate::ast::apply(&role_value(1), fact, &defs);
-            Some((v0.as_atom()?.to_string(), v1.as_atom()?.to_string()))
-        }).collect();
+    // all_pairs: distr [facts, facts] -> <f, all> for each f
+    // then distl + filter(is_chain) finds chains
+    // But we need chains as <f1, f2> pairs AND the full facts for shortcut check.
+    // Structure: for each <f, all>, distl gives <f, f'> pairs, filter chains.
+    // Then for each chain <f1, f2>, pair with all_facts again for shortcut test.
 
-        let set: HashSet<(String, String)> = pairs.iter().cloned().collect();
+    // shortcut_match: <<chain, candidate>> -> role0(candidate) = role0(f1) AND role1(candidate) = role1(f2)
+    // chain is sel1, candidate is sel2
+    // f1 = sel1(sel1), f2 = sel2(sel1)
+    let shortcut_match = Func::compose(Func::And, Func::construction(vec![
+        Func::compose(Func::Eq, Func::construction(vec![
+            Func::compose(role_value(0), Func::Selector(2)),                    // role0(candidate)
+            Func::compose(role_value(0), Func::compose(Func::Selector(1), Func::Selector(1))), // role0(f1)
+        ])),
+        Func::compose(Func::Eq, Func::construction(vec![
+            Func::compose(role_value(1), Func::Selector(2)),                    // role1(candidate)
+            Func::compose(role_value(1), Func::compose(Func::Selector(2), Func::Selector(1))), // role1(f2)
+        ])),
+    ]));
 
-        // For each xRy, look for yRz, check if xRz exists (violation)
-        let mut violations = Vec::new();
-        for (x, y) in &pairs {
-            for (y2, z) in &pairs {
-                if y == y2 && x != z && set.contains(&(x.clone(), z.clone())) {
-                    violations.push(Object::seq(vec![
-                        Object::atom(&id),
-                        Object::atom(&text),
-                        Object::seq(vec![
-                            Object::atom("Intransitive violation:"),
-                            Object::atom(x),
-                            Object::atom("relates to"),
-                            Object::atom(y),
-                            Object::atom("relates to"),
-                            Object::atom(z),
-                            Object::atom("but shortcut also exists"),
-                        ]),
-                    ]));
-                }
-            }
-        }
+    let has_shortcut = Func::compose(
+        Func::compose(Func::Not, Func::NullTest),
+        Func::compose(Func::filter(shortcut_match), Func::DistL),
+    );
 
-        if violations.is_empty() { Object::phi() } else { Object::Seq(violations) }
-    }))
+    let detail = Func::construction(vec![
+        Func::constant(Object::atom("Intransitive violation:")),
+        Func::compose(role_value(0), Func::compose(Func::Selector(1), Func::Selector(1))),
+        Func::constant(Object::atom("relates to")),
+        Func::compose(role_value(1), Func::compose(Func::Selector(1), Func::Selector(1))),
+        Func::constant(Object::atom("relates to")),
+        Func::compose(role_value(1), Func::compose(Func::Selector(2), Func::Selector(1))),
+        Func::constant(Object::atom("but shortcut also exists")),
+    ]);
+    let viol = make_violation_func(&def.id, &def.text, detail);
+
+    // Pipeline:
+    // 1. distr [facts, facts] : ctx -> <f, all> pairs
+    // 2. a(distl) -> <f, f'> nested pairs (but we need to flatten)
+    // 3. Since we can't flatten cleanly, restructure:
+    //    For each <f, all>: filter(is_chain) . distl -> chains for this f
+    //    Then for each chain, pair with all for shortcut test
+    //
+    // Actually: use distr twice. First distr for chains, second distr for shortcut.
+    // This is a three-level composition. Let me use the <fact, all> pattern twice.
+
+    // find_chains: <f, all> -> chains where f is f1
+    let find_chains_for_f = Func::compose(Func::filter(is_chain), Func::DistL);
+
+    // For each <f, all>, find chains, then for each chain check shortcut.
+    // Result per <f, all>: violations for chains starting with f.
+    let check_f = Func::compose(
+        Func::apply_to_all(viol),
+        Func::compose(
+            Func::filter(has_shortcut),
+            // pair each chain with all_facts: distr . [chains, sel2(outer)]
+            // outer = <f, all>, chains = find_chains_for_f(outer)
+            // We need: <chain, all> for each chain. Use distr . [chains, all].
+            // But chains and all come from the same <f, all> input.
+            Func::compose(Func::DistR, Func::construction(vec![
+                find_chains_for_f, // chains for this f
+                Func::Selector(2), // all_facts
+            ])),
+        ),
+    );
+
+    // Top level: a(check_f) . distr . [facts, facts] : ctx
+    Func::compose(
+        // Flatten: the outer a(check_f) produces a seq of seqs (violations per f).
+        // We need Insert(ApndR) or similar. But apndl/apndr don't concat.
+        // For now, nested violations are acceptable (each f produces its own seq).
+        // The decode_violations function handles nested seqs.
+        Func::apply_to_all(check_f),
+        Func::compose(Func::DistR, Func::construction(vec![facts.clone(), facts])),
+    )
 }
 
 /// TR: xRy âˆ§ yRz â†’ xRz â€” violation when transitive chain completion is missing.
