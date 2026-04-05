@@ -2157,11 +2157,8 @@ fn compile_ring_reflexive_ast(ir: &Domain, def: &ConstraintDef) -> Func {
 // Constraint-specific evaluation uses Native where point-free FP
 // would be impractical (grouping, counting, set operations).
 
-/// UC: Uniqueness constraint.
-/// Compose(check_uniqueness, extract_facts) â€” fact type visible in AST.
+/// UC: |bu(fact_type, scope_value) : P| <= 1. Violation when > 1.
 fn compile_uniqueness_ast(_ir: &Domain, def: &ConstraintDef) -> Func {
-    let id = def.id.clone();
-    let text = def.text.clone();
     let spans = resolve_spans(_ir, &def.spans);
 
     let mut groups: HashMap<String, Vec<ResolvedSpan>> = HashMap::new();
@@ -2170,7 +2167,64 @@ fn compile_uniqueness_ast(_ir: &Domain, def: &ConstraintDef) -> Func {
     }
     let span_groups: Vec<(String, Vec<ResolvedSpan>)> = groups.into_iter().collect();
 
-    // Build extractors for each fact type (pure AST)
+    // Single-span UC: pure Func via partial application cardinality check.
+    if span_groups.len() == 1 && span_groups[0].1.len() == 1 {
+        let span = &span_groups[0].1[0];
+        let facts = extract_facts_func(&span_groups[0].0);
+        let scope_idx = span.role_index;
+        let other_idx = if scope_idx == 0 { 1 } else { 0 };
+
+        // same_scope_diff_other on <fact, candidate>
+        let dup_check = Func::compose(Func::And, Func::construction(vec![
+            Func::compose(Func::Eq, Func::construction(vec![
+                Func::compose(role_value(scope_idx), Func::Selector(1)),
+                Func::compose(role_value(scope_idx), Func::Selector(2)),
+            ])),
+            Func::compose(Func::Not, Func::compose(Func::Eq, Func::construction(vec![
+                Func::compose(role_value(other_idx), Func::Selector(1)),
+                Func::compose(role_value(other_idx), Func::Selector(2)),
+            ]))),
+        ]));
+
+        // has_any_dup: <fact, all> -> T if scope is duplicated
+        let has_any_dup = Func::compose(
+            Func::compose(Func::Not, Func::NullTest),
+            Func::compose(Func::filter(dup_check), Func::DistL),
+        );
+
+        // violating_facts = Filter(has_any_dup) . distr . [facts, facts]
+        let violating = Func::compose(
+            Func::filter(has_any_dup),
+            Func::compose(Func::DistR, Func::construction(vec![facts.clone(), facts])),
+        );
+
+        // ONE violation if non-empty (Corollary 2: one per constraint).
+        // Detail uses first violating <fact, all> pair.
+        let noun = span.noun_name.clone();
+        let reading = span.reading.clone();
+        let detail = Func::construction(vec![
+            Func::constant(Object::atom("Uniqueness violation:")),
+            Func::constant(Object::atom(&noun)),
+            Func::compose(role_value(scope_idx), Func::Selector(1)),
+            Func::constant(Object::atom("is not unique in")),
+            Func::constant(Object::atom(&reading)),
+        ]);
+        let viol = make_violation_func(&def.id, &def.text, detail);
+
+        // cond(not.null, viol.sel1, phi) . violating
+        return Func::compose(
+            Func::condition(
+                Func::compose(Func::Not, Func::NullTest),
+                Func::construction(vec![Func::compose(viol, Func::Selector(1))]),
+                Func::constant(Object::phi()),
+            ),
+            violating,
+        );
+    }
+
+    // Multi-span UC: Native fallback
+    let id = def.id.clone();
+    let text = def.text.clone();
     let extractors: Vec<(Func, Vec<ResolvedSpan>)> = span_groups.iter()
         .map(|(ft_id, spans)| (extract_facts_func(ft_id), spans.clone()))
         .collect();
