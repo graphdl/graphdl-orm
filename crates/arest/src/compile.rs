@@ -1430,70 +1430,46 @@ fn compile_transitivity(ir: &Domain) -> Vec<CompiledDerivation> {
             let shared_noun_c = shared_noun.clone();
             let transitive_ft_id = format!("_transitive_{}_{}", ft1_id_c, ft2_id_c);
 
-            // Operate directly on the population Object â€” no decode/re-encode.
-            let func = crate::ast::Func::Native(Arc::new(move |pop_obj: &crate::ast::Object| {
-                let ft1_facts = obj_find_ft(pop_obj, &ft1_id_c);
-                let ft2_facts = obj_find_ft(pop_obj, &ft2_id_c);
+            // Pure Func: equi-join ft1 x ft2 on shared noun.
+            // distr . [ft1_facts, ft2_facts], distl, Filter(join), extract derived.
+            let ft1_facts = extract_facts_from_pop(&ft1_id_c);
+            let ft2_facts = extract_facts_from_pop(&ft2_id_c);
 
-                let mut derived = Vec::new();
+            // join condition: <f1, f2> -> role_value(1)(f1) = role_value(0)(f2)
+            // (shared noun is role 1 of ft1 and role 0 of ft2)
+            let join_cond = Func::compose(Func::Eq, Func::construction(vec![
+                Func::compose(role_value(1), Func::Selector(1)), // shared from f1
+                Func::compose(role_value(0), Func::Selector(2)), // shared from f2
+            ]));
 
-                for f1 in ft1_facts {
-                    if let Some(f1_bindings) = f1.as_seq() {
-                        // Extract shared and src values from f1
-                        let mut shared_val: Option<&str> = None;
-                        let mut src_val: Option<&str> = None;
-                        for b in f1_bindings {
-                            if let Some(bp) = b.as_seq() {
-                                if bp.len() == 2 {
-                                    if let (Some(n), Some(v)) = (bp[0].as_atom(), bp[1].as_atom()) {
-                                        if n == shared_noun_c { shared_val = Some(v); }
-                                        if n == src_noun_c { src_val = Some(v); }
-                                    }
-                                }
-                            }
-                        }
+            // derived fact: <transitive_ft_id, reading, <<src_noun, role_value(0)(f1)>, <dst_noun, role_value(1)(f2)>>>
+            let derived_fact = Func::construction(vec![
+                Func::constant(Object::atom(&transitive_ft_id)),
+                Func::constant(Object::atom(&reading)),
+                Func::construction(vec![
+                    Func::construction(vec![
+                        Func::constant(Object::atom(&src_noun)),
+                        Func::compose(role_value(0), Func::Selector(1)),
+                    ]),
+                    Func::construction(vec![
+                        Func::constant(Object::atom(&dst_noun)),
+                        Func::compose(role_value(1), Func::Selector(2)),
+                    ]),
+                ]),
+            ]);
 
-                        if let (Some(sv), Some(srcv)) = (shared_val, src_val) {
-                            // Find matching ft2 facts where shared noun == sv
-                            for f2 in ft2_facts {
-                                if let Some(f2_bindings) = f2.as_seq() {
-                                    let mut f2_shared: Option<&str> = None;
-                                    let mut dst_val: Option<&str> = None;
-                                    for b in f2_bindings {
-                                        if let Some(bp) = b.as_seq() {
-                                            if bp.len() == 2 {
-                                                if let (Some(n), Some(v)) = (bp[0].as_atom(), bp[1].as_atom()) {
-                                                    if n == shared_noun_c { f2_shared = Some(v); }
-                                                    if n == dst_noun_c { dst_val = Some(v); }
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    if f2_shared == Some(sv) {
-                                        if let Some(dv) = dst_val {
-                                            derived.push(obj_derived_fact(
-                                                &transitive_ft_id,
-                                                &reading_c,
-                                                &[
-                                                    (src_noun_c.clone(), srcv.to_string()),
-                                                    (dst_noun_c.clone(), dv.to_string()),
-                                                ],
-                                            ));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if derived.is_empty() {
-                    crate::ast::Object::phi()
-                } else {
-                    crate::ast::Object::Seq(derived)
-                }
-            }));
+            // a(derived_fact) . Filter(join) . Concat . a(distl) . distr . [ft1, ft2]
+            // Wait: distr gives <f1, ft2_all> pairs. distl gives <f1, f2> pairs. Need Concat to flatten.
+            let func = Func::compose(
+                Func::apply_to_all(derived_fact),
+                Func::compose(
+                    Func::Concat,
+                    Func::compose(
+                        Func::apply_to_all(Func::compose(Func::filter(join_cond), Func::DistL)),
+                        Func::compose(Func::DistR, Func::construction(vec![ft1_facts, ft2_facts])),
+                    ),
+                ),
+            );
             derivations.push(CompiledDerivation {
                 id,
                 text: reading,
