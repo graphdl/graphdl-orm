@@ -520,15 +520,6 @@ pub fn compile_to_defs(pop: &Population) -> Vec<(String, Func)> {
     defs
 }
 
-/// Compile from a Population of facts. Reconstructs the Domain internally
-/// by querying P for metamodel fact types, then delegates to compile().
-/// This is the target API. The Domain struct is an implementation detail
-/// that will be eliminated.
-pub fn compile_from_population(pop: &Population) -> CompiledModel {
-    let domain = population_to_domain(pop);
-    compile(&domain)
-}
-
 /// Reconstruct a Domain from a Population by querying metamodel fact types.
 pub fn population_to_domain(pop: &Population) -> Domain {
     let mut domain = Domain::default();
