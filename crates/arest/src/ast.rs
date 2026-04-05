@@ -245,6 +245,10 @@ pub enum Func {
     /// Length: length:<x₁, ..., xₙ> = n
     Length,
 
+    /// Concat: concat:<<x1,...>, <y1,...>, ...> = <x1,...,y1,...,...>
+    /// Flattens one level of nesting. Each element must be a sequence.
+    Concat,
+
     /// Distribute from left: distl:<y, <z₁,...,zₙ>> = <<y,z₁>,...,<y,zₙ>>
     DistL,
 
@@ -432,6 +436,22 @@ pub fn apply(func: &Func, x: &Object, defs: &std::collections::HashMap<String, F
         Func::Length => {
             match x.as_seq() {
                 Some(items) => Object::Atom(items.len().to_string()),
+                _ => Object::Bottom,
+            }
+        }
+
+        Func::Concat => {
+            match x.as_seq() {
+                Some(items) => {
+                    let mut result = Vec::new();
+                    for item in items {
+                        match item.as_seq() {
+                            Some(sub) => result.extend_from_slice(sub),
+                            None => result.push(item.clone()),
+                        }
+                    }
+                    Object::Seq(result)
+                }
                 _ => Object::Bottom,
             }
         }
@@ -864,6 +884,7 @@ fn metacompose_atom(name: &str, defs: &std::collections::HashMap<String, Func>) 
         primitives::ATOM => Func::AtomTest,
         primitives::EQ => Func::Eq,
         "contains" => Func::Contains,
+        "concat" => Func::Concat,
         "lower" => Func::Lower,
         primitives::NULL => Func::NullTest,
         primitives::REVERSE => Func::Reverse,
@@ -981,6 +1002,7 @@ pub fn func_to_object(func: &Func) -> Object {
         Func::NullTest => Object::atom(primitives::NULL),
         Func::Eq => Object::atom(primitives::EQ),
         Func::Contains => Object::atom("contains"),
+        Func::Concat => Object::atom("concat"),
         Func::Lower => Object::atom("lower"),
         Func::Length => Object::atom(primitives::LENGTH),
         Func::DistL => Object::atom(primitives::DISTL),
@@ -1265,6 +1287,7 @@ impl fmt::Debug for Func {
             Func::NullTest => write!(f, "null"),
             Func::Eq => write!(f, "eq"),
             Func::Contains => write!(f, "contains"),
+            Func::Concat => write!(f, "concat"),
             Func::Lower => write!(f, "lower"),
             Func::Length => write!(f, "length"),
             Func::DistL => write!(f, "distl"),
