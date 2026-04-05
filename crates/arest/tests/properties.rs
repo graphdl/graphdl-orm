@@ -729,6 +729,32 @@ fn ffp_evaluation_is_application() {
         "State machine evaluation is a fold of the transition function over events");
 }
 
+// ── No Native: the entire runtime is Func ───────────────────────────
+// Every compiled definition must be pure Func (no Native closures).
+// Native is a hole in the algebra — you cannot inspect, compose,
+// optimize, or serialize it. The design requires everything is Func.
+
+#[test]
+fn no_native_in_constraint_defs() {
+    let meta = parse_forml2::parse_to_population(STATE_METAMODEL).unwrap();
+    let orders = parse_forml2::parse_to_population_with_nouns(ORDERS_DOMAIN, &meta).unwrap();
+    let mut pop = meta;
+    for (k, v) in orders.facts { pop.facts.entry(k).or_default().extend(v); }
+
+    let defs = compile::compile_to_defs(&pop);
+    let mut native_defs = Vec::new();
+    for (name, func) in &defs {
+        if func.has_native() {
+            native_defs.push(name.clone());
+        }
+    }
+    assert!(
+        native_defs.is_empty(),
+        "These definitions contain Native closures (must be pure Func): {:?}",
+        native_defs,
+    );
+}
+
 // ── Algebraic Laws (Backus Section 12.2) ─────────────────────────────
 // The compiled functions must obey the FP algebra.
 // These laws are what make the system provably correct by

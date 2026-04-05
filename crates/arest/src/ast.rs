@@ -1236,6 +1236,21 @@ impl Func {
     pub fn role(n: usize) -> Func {
         Func::Selector(n)
     }
+
+    /// Returns true if this Func or any sub-Func contains a Native closure.
+    /// Pure Func = no Native anywhere in the tree.
+    pub fn has_native(&self) -> bool {
+        match self {
+            Func::Native(_) => true,
+            Func::Compose(f, g) => f.has_native() || g.has_native(),
+            Func::Construction(fs) => fs.iter().any(|f| f.has_native()),
+            Func::Condition(p, f, g) => p.has_native() || f.has_native() || g.has_native(),
+            Func::ApplyToAll(f) | Func::Insert(f) | Func::Filter(f) => f.has_native(),
+            Func::While(p, f) => p.has_native() || f.has_native(),
+            Func::BinaryToUnary(f, _) => f.has_native(),
+            _ => false,
+        }
+    }
 }
 
 // ── Debug ────────────────────────────────────────────────────────────
