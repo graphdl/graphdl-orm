@@ -1814,44 +1814,45 @@ fn compile_ring_antisymmetric_ast(def: &ConstraintDef) -> Func {
     let ft_ids: Vec<String> = def.spans.iter().map(|s| s.fact_type_id.clone()).collect();
     let facts = extract_facts_multi(&ft_ids);
 
-    let id = def.id.clone();
-    let text = def.text.clone();
+    let match_reversed = Func::compose(Func::And, Func::construction(vec![
+        Func::compose(Func::Eq, Func::construction(vec![
+            Func::compose(role_value(0), Func::Selector(2)),
+            Func::compose(role_value(1), Func::Selector(1)),
+        ])),
+        Func::compose(Func::Eq, Func::construction(vec![
+            Func::compose(role_value(1), Func::Selector(2)),
+            Func::compose(role_value(0), Func::Selector(1)),
+        ])),
+    ]));
 
-    Func::Native(Arc::new(move |ctx: &Object| {
-        let defs = HashMap::new();
-        let all_facts = crate::ast::apply(&facts, ctx, &defs);
-        let items = match all_facts.as_seq() {
-            Some(items) => items,
-            None => return Object::phi(),
-        };
+    let has_reverse = Func::compose(
+        Func::compose(Func::Not, Func::NullTest),
+        Func::compose(Func::filter(match_reversed), Func::DistL),
+    );
 
-        let pairs: Vec<(String, String)> = items.iter().filter_map(|fact| {
-            let v0 = crate::ast::apply(&role_value(0), fact, &defs);
-            let v1 = crate::ast::apply(&role_value(1), fact, &defs);
-            Some((v0.as_atom()?.to_string(), v1.as_atom()?.to_string()))
-        }).collect();
+    let not_self = Func::compose(Func::Not, Func::compose(Func::Eq, Func::construction(vec![
+        Func::compose(role_value(0), Func::Selector(1)),
+        Func::compose(role_value(1), Func::Selector(1)),
+    ])));
 
-        let set: HashSet<(String, String)> = pairs.iter().cloned().collect();
+    let pred = Func::compose(Func::And, Func::construction(vec![has_reverse, not_self]));
 
-        let violations: Vec<Object> = pairs.iter()
-            .filter(|(x, y)| x != y && set.contains(&(y.clone(), x.clone())))
-            .map(|(x, y)| {
-                Object::seq(vec![
-                    Object::atom(&id),
-                    Object::atom(&text),
-                    Object::seq(vec![
-                        Object::atom("Antisymmetric violation:"),
-                        Object::atom(x),
-                        Object::atom("and"),
-                        Object::atom(y),
-                        Object::atom("relate to each other but are not the same"),
-                    ]),
-                ])
-            })
-            .collect();
+    let detail = Func::construction(vec![
+        Func::constant(Object::atom("Antisymmetric violation:")),
+        Func::compose(role_value(0), Func::Selector(1)),
+        Func::constant(Object::atom("and")),
+        Func::compose(role_value(1), Func::Selector(1)),
+        Func::constant(Object::atom("relate to each other but are not the same")),
+    ]);
+    let viol = make_violation_func(&def.id, &def.text, detail);
 
-        if violations.is_empty() { Object::phi() } else { Object::Seq(violations) }
-    }))
+    Func::compose(
+        Func::apply_to_all(viol),
+        Func::compose(
+            Func::filter(pred),
+            Func::compose(Func::DistR, Func::construction(vec![facts.clone(), facts])),
+        ),
+    )
 }
 
 /// IT: xRy âˆ§ yRz â†’ Â¬xRz â€” violation when transitive shortcut exists.
