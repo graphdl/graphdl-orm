@@ -2544,9 +2544,6 @@ fn compile_set_comparison_ast(
 /// For join-path subsets, checks that every tuple in fact type A
 /// also exists in fact type B, matching by common noun names.
 fn compile_subset_ast(ir: &Domain, def: &ConstraintDef) -> Func {
-    let id = def.id.clone();
-    let text = def.text.clone();
-
     if def.spans.len() < 2 {
         return Func::constant(Object::phi());
     }
@@ -2560,78 +2557,68 @@ fn compile_subset_ast(ir: &Domain, def: &ConstraintDef) -> Func {
     let b_nouns: Vec<String> = ir.fact_types.get(&b_ft_id)
         .map(|ft| ft.roles.iter().map(|r| r.noun_name.clone()).collect())
         .unwrap_or_default();
-    let common_nouns: Vec<String> = a_nouns.iter()
-        .filter(|n| b_nouns.contains(n))
-        .cloned()
-        .collect();
 
-    let a_extractor = extract_facts_func(&a_ft_id);
-    let b_extractor = extract_facts_func(&b_ft_id);
+    // Compile-time: find common nouns and their role indices in A and B.
+    let common: Vec<(usize, usize)> = a_nouns.iter().enumerate().filter_map(|(ai, n)| {
+        b_nouns.iter().position(|bn| bn == n).map(|bi| (ai, bi))
+    }).collect();
 
-    Func::Native(Arc::new(move |ctx: &Object| {
-        let defs = HashMap::new();
-        let a_facts_obj = crate::ast::apply(&a_extractor, ctx, &defs);
-        let b_facts_obj = crate::ast::apply(&b_extractor, ctx, &defs);
+    let a_facts = extract_facts_func(&a_ft_id);
+    let b_facts = extract_facts_func(&b_ft_id);
 
-        let a_facts = a_facts_obj.as_seq().map(|s| s.as_ref()).unwrap_or(&[]);
-        let b_facts = b_facts_obj.as_seq().map(|s| s.as_ref()).unwrap_or(&[]);
-
-        // Build a set of common-noun value tuples from B for fast lookup
-        let b_tuples: HashSet<Vec<String>> = b_facts.iter().map(|bf| {
-            common_nouns.iter().map(|noun| {
-                // Each fact is <<noun1, val1>, <noun2, val2>, ...>
-                bf.as_seq().and_then(|bindings| {
-                    bindings.iter().find_map(|b| {
-                        let pair = b.as_seq()?;
-                        if pair.len() == 2 && pair[0].as_atom() == Some(noun) {
-                            pair[1].as_atom().map(|v| v.to_string())
-                        } else {
-                            None
-                        }
-                    })
-                }).unwrap_or_default()
-            }).collect()
+    // match_pred: <a_fact, b_candidate> -> common noun values all equal
+    // For each common noun: Eq . [role_value(a_idx) . Sel(1), role_value(b_idx) . Sel(2)]
+    let match_pred = if common.is_empty() {
+        // No common nouns: every a_fact trivially matches (no violation possible)
+        Func::constant(Object::t())
+    } else {
+        let eqs: Vec<Func> = common.iter().map(|&(ai, bi)| {
+            Func::compose(Func::Eq, Func::construction(vec![
+                Func::compose(role_value(ai), Func::Selector(1)),
+                Func::compose(role_value(bi), Func::Selector(2)),
+            ]))
         }).collect();
+        if eqs.len() == 1 {
+            eqs.into_iter().next().unwrap()
+        } else {
+            eqs.into_iter().reduce(|acc, eq| {
+                Func::compose(Func::And, Func::construction(vec![acc, eq]))
+            }).unwrap()
+        }
+    };
 
-        // Check each fact in A â€” its common-noun tuple must exist in B
-        let violations: Vec<Object> = a_facts.iter().filter_map(|a_fact| {
-            let a_tuple: Vec<String> = common_nouns.iter().map(|noun| {
-                a_fact.as_seq().and_then(|bindings| {
-                    bindings.iter().find_map(|b| {
-                        let pair = b.as_seq()?;
-                        if pair.len() == 2 && pair[0].as_atom() == Some(noun) {
-                            pair[1].as_atom().map(|v| v.to_string())
-                        } else {
-                            None
-                        }
-                    })
-                }).unwrap_or_default()
-            }).collect();
+    // not_in_b: <a_fact, b_facts> -> T when no b_candidate matches a_fact
+    // NullTest . Filter(match_pred) . DistL
+    let not_in_b = Func::compose(
+        Func::NullTest,
+        Func::compose(Func::filter(match_pred), Func::DistL),
+    );
 
-            if !b_tuples.contains(&a_tuple) {
-                let pair_desc = common_nouns.iter().zip(a_tuple.iter())
-                    .map(|(n, v)| format!("{} '{}'", n, v))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                Some(Object::seq(vec![
-                    Object::atom(&id),
-                    Object::atom(&text),
-                    Object::seq(vec![
-                        Object::atom("Subset violation:"),
-                        Object::atom(&format!("({})", pair_desc)),
-                        Object::atom("participates in"),
-                        Object::atom(&a_ft_id),
-                        Object::atom("but not in"),
-                        Object::atom(&b_ft_id),
-                    ]),
-                ]))
-            } else {
-                None
-            }
-        }).collect();
+    // detail: <a_fact, b_facts> -> violation description sequence
+    // Include each common noun name and its value from a_fact.
+    let mut detail_parts: Vec<Func> = vec![
+        Func::constant(Object::atom("Subset violation:")),
+    ];
+    for &(ai, _) in &common {
+        detail_parts.push(Func::constant(Object::atom(&a_nouns[ai])));
+        detail_parts.push(Func::compose(role_value(ai), Func::Selector(1)));
+    }
+    detail_parts.push(Func::constant(Object::atom("participates in")));
+    detail_parts.push(Func::constant(Object::atom(&a_ft_id)));
+    detail_parts.push(Func::constant(Object::atom("but not in")));
+    detail_parts.push(Func::constant(Object::atom(&b_ft_id)));
+    let detail = Func::construction(detail_parts);
 
-        if violations.is_empty() { Object::phi() } else { Object::Seq(violations) }
-    }))
+    let viol = make_violation_func(&def.id, &def.text, detail);
+
+    // apply_to_all(viol) . Filter(not_in_b) . DistR . [a_facts, b_facts]
+    Func::compose(
+        Func::apply_to_all(viol),
+        Func::compose(
+            Func::filter(not_in_b),
+            Func::compose(Func::DistR, Func::construction(vec![a_facts, b_facts])),
+        ),
+    )
 }
 
 /// EQ: Equality constraint â€” pop(rs1) = pop(rs2) (bidirectional subset).
