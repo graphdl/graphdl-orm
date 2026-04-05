@@ -1706,43 +1706,61 @@ fn compile_ring_asymmetric_ast(def: &ConstraintDef) -> Func {
     let id = def.id.clone();
     let text = def.text.clone();
 
-    // Use Native for the cross-product check (distl + filter would need nested apply)
-    Func::Native(Arc::new(move |ctx: &Object| {
-        let defs = HashMap::new();
-        let all_facts = crate::ast::apply(&facts, ctx, &defs);
-        let items = match all_facts.as_seq() {
-            Some(items) => items,
-            None => return Object::phi(),
-        };
+    // AS: xRy → ¬yRx. Violation when both ⟨x,y⟩ and ⟨y,x⟩ exist (and x≠y).
+    //
+    // Pure Func using distl for membership test:
+    //   distr ∘ [facts, facts] : ctx → ⟨⟨f₁, all⟩, ⟨f₂, all⟩, ...⟩
+    //   For each ⟨fact, all⟩:
+    //     distl : ⟨fact, all⟩ → ⟨⟨fact,f₁⟩, ⟨fact,f₂⟩, ...⟩
+    //     Filter(match_reversed) → candidates where role₀(candidate)=role₁(fact) ∧ role₁(candidate)=role₀(fact)
+    //     ¬null → has_reverse
+    //   Filter facts where has_reverse ∧ x≠y, wrap in violations.
 
-        // Extract (val0, val1) pairs
-        let pairs: Vec<(String, String)> = items.iter().filter_map(|fact| {
-            let v0 = crate::ast::apply(&role_value(0), fact, &defs);
-            let v1 = crate::ast::apply(&role_value(1), fact, &defs);
-            Some((v0.as_atom()?.to_string(), v1.as_atom()?.to_string()))
-        }).collect();
+    // match_reversed: ⟨fact, candidate⟩ → role₀(cand) = role₁(fact) ∧ role₁(cand) = role₀(fact)
+    let match_reversed = Func::compose(Func::And, Func::construction(vec![
+        Func::compose(Func::Eq, Func::construction(vec![
+            Func::compose(role_value(0), Func::Selector(2)), // role₀(candidate)
+            Func::compose(role_value(1), Func::Selector(1)), // role₁(fact)
+        ])),
+        Func::compose(Func::Eq, Func::construction(vec![
+            Func::compose(role_value(1), Func::Selector(2)), // role₁(candidate)
+            Func::compose(role_value(0), Func::Selector(1)), // role₀(fact)
+        ])),
+    ]));
 
-        let set: HashSet<(String, String)> = pairs.iter().cloned().collect();
+    // check_one: ⟨fact, all_facts⟩ → T if reverse exists, else F
+    let check_one = Func::compose(
+        Func::compose(Func::Not, Func::NullTest),
+        Func::compose(Func::filter(match_reversed), Func::DistL),
+    );
 
-        let violations: Vec<Object> = pairs.iter()
-            .filter(|(x, y)| x != y && set.contains(&(y.clone(), x.clone())))
-            .map(|(x, y)| {
-                Object::seq(vec![
-                    Object::atom(&id),
-                    Object::atom(&text),
-                    Object::seq(vec![
-                        Object::atom("Asymmetric violation:"),
-                        Object::atom(x),
-                        Object::atom("relates to"),
-                        Object::atom(y),
-                        Object::atom("and vice versa"),
-                    ]),
-                ])
-            })
-            .collect();
+    // not_self on original fact: role₀ ≠ role₁
+    let not_self = Func::compose(Func::Not, Func::compose(Func::Eq, Func::construction(vec![
+        Func::compose(role_value(0), Func::Selector(1)),
+        Func::compose(role_value(1), Func::Selector(1)),
+    ])));
 
-        if violations.is_empty() { Object::phi() } else { Object::Seq(violations) }
-    }))
+    // combined: has_reverse ∧ not_self
+    let pred = Func::compose(Func::And, Func::construction(vec![check_one, not_self]));
+
+    // violation detail from ⟨fact, all_facts⟩ — uses fact (sel₁)
+    let detail = Func::construction(vec![
+        Func::constant(Object::atom("Asymmetric violation:")),
+        Func::compose(role_value(0), Func::Selector(1)),
+        Func::constant(Object::atom("relates to")),
+        Func::compose(role_value(1), Func::Selector(1)),
+        Func::constant(Object::atom("and vice versa")),
+    ]);
+    let viol = make_violation_func(&def.id, &def.text, detail);
+
+    // α(make_viol) ∘ Filter(pred) ∘ distr ∘ [facts, facts] : ctx
+    Func::compose(
+        Func::apply_to_all(viol),
+        Func::compose(
+            Func::filter(pred),
+            Func::compose(Func::DistR, Func::construction(vec![facts.clone(), facts])),
+        ),
+    )
 }
 
 /// SY: xRy â†’ yRx â€” violation when reverse is missing.
