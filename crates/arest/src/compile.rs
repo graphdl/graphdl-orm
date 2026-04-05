@@ -2167,12 +2167,18 @@ fn compile_uniqueness_ast(_ir: &Domain, def: &ConstraintDef) -> Func {
     }
     let span_groups: Vec<(String, Vec<ResolvedSpan>)> = groups.into_iter().collect();
 
-    // Single-span UC: pure Func via partial application cardinality check.
-    if span_groups.len() == 1 && span_groups[0].1.len() == 1 {
-        let span = &span_groups[0].1[0];
+    // Pure Func UC: single fact type, any number of spans.
+    // Scope = first span's role (the "Each" side). Uniqueness on scope means
+    // for each scope value, at most one distinct tuple across the other roles.
+    if span_groups.len() == 1 {
+        let spans_in_group = &span_groups[0].1;
         let facts = extract_facts_func(&span_groups[0].0);
-        let scope_idx = span.role_index;
-        let other_idx = if scope_idx == 0 { 1 } else { 0 };
+        let scope_idx = spans_in_group[0].role_index;
+        // "Other" role: any role not in the scope. For binary, it's the other one.
+        let other_idx = spans_in_group.iter()
+            .map(|s| s.role_index)
+            .find(|&i| i != scope_idx)
+            .unwrap_or(if scope_idx == 0 { 1 } else { 0 });
 
         // same_scope_diff_other on <fact, candidate>
         let dup_check = Func::compose(Func::And, Func::construction(vec![
@@ -2200,8 +2206,8 @@ fn compile_uniqueness_ast(_ir: &Domain, def: &ConstraintDef) -> Func {
 
         // ONE violation if non-empty (Corollary 2: one per constraint).
         // Detail uses first violating <fact, all> pair.
-        let noun = span.noun_name.clone();
-        let reading = span.reading.clone();
+        let noun = spans_in_group[0].noun_name.clone();
+        let reading = spans_in_group[0].reading.clone();
         let detail = Func::construction(vec![
             Func::constant(Object::atom("Uniqueness violation:")),
             Func::constant(Object::atom(&noun)),
