@@ -1,4 +1,4 @@
-﻿// crates/arest/src/compile.rs
+// crates/arest/src/compile.rs
 //
 // Compilation: Domain â†’ CompiledModel
 //
@@ -1389,12 +1389,9 @@ fn compile_modus_ponens(ir: &Domain) -> Vec<CompiledDerivation> {
 /// Transitivity: for fact types that share a noun in different roles (A->B, B->C),
 /// derive the transitive closure A->C. Limited depth to prevent infinite chains.
 ///
-/// Pure AST form would be:
-///   Î±(Î±(construct_pair) âˆ˜ DistL) âˆ˜ Trans âˆ˜ [join_key_matches, src_vals, dst_vals]
-///   where join_key_matches filters the cross-product of ft1 x ft2 on shared noun.
-/// Blocked on: the equi-join (nested loop matching shared noun values) requires
-/// a cross-product (DistL/DistR) followed by a filter, which needs Filter or
-/// a fold-based select. The AST lacks these as first-class primitives.
+/// Pure Func form:
+///   a(derived_fact) . Filter(join_cond) . Concat . a(Filter(join) . DistL) . DistR . [ft1_facts, ft2_facts]
+///   where join_cond checks role_value(1)(f1) = role_value(0)(f2) on the shared noun.
 fn compile_transitivity(ir: &Domain) -> Vec<CompiledDerivation> {
     let mut derivations = Vec::new();
 
@@ -1424,10 +1421,6 @@ fn compile_transitivity(ir: &Domain) -> Vec<CompiledDerivation> {
                 src_noun, dst_noun, shared_noun);
 
             let id = format!("_transitivity_{}_{}",  ft1_id_c, ft2_id_c);
-            let reading_c = reading.clone();
-            let src_noun_c = src_noun.clone();
-            let dst_noun_c = dst_noun.clone();
-            let shared_noun_c = shared_noun.clone();
             let transitive_ft_id = format!("_transitive_{}_{}", ft1_id_c, ft2_id_c);
 
             // Pure Func: equi-join ft1 x ft2 on shared noun.
@@ -1486,13 +1479,9 @@ fn compile_transitivity(ir: &Domain) -> Vec<CompiledDerivation> {
 /// if a fact type involving this noun has no instances for a given entity,
 /// derive the negation. For OWA nouns, absence is unknown, not false.
 ///
-/// Pure AST form would be:
-///   For each relevant fact type:
-///     Î±(Condition(Not âˆ˜ participates_in_ft, construct_negation, Constant(Ï†)))
-///       âˆ˜ all_instances(noun)
-///   Blocked on: all_instances requires a global fold over every fact type in
-///   the population extracting noun bindings, and participates_in_ft requires
-///   a find-by-ID search. Both need Filter/Find primitives not yet in the AST.
+/// Pure Func form (per fact type):
+///   Concat . a(Condition(NullTest . Filter(match) . DistL, [negation], phi)) . DistR . [instances, ft_facts]
+///   where match checks role_value(ri)(fact) = instance on each <instance, fact> pair.
 fn compile_cwa_negation(ir: &Domain) -> Vec<CompiledDerivation> {
     let mut derivations = Vec::new();
 
@@ -1515,33 +1504,74 @@ fn compile_cwa_negation(ir: &Domain) -> Vec<CompiledDerivation> {
         }
 
         let noun = noun_name.clone();
-        let rft = relevant_fts.clone();
         let id = format!("_cwa_negation_{}", noun);
         let text = format!("CWA: absent facts about {} are false", noun);
 
-        // Operate directly on the population Object â€” no decode/re-encode.
-        let func = crate::ast::Func::Native(Arc::new(move |pop_obj: &crate::ast::Object| {
-            let all_instances = obj_instances_of(pop_obj, &noun);
-            let mut derived = Vec::new();
+        // Build per-ft derivation funcs, then Concat results across all fts.
+        let instances = instances_of_noun_func(&noun);
 
-            for (ft_id, reading, _role_idx) in &rft {
-                for instance in &all_instances {
-                    if !obj_participates_in(pop_obj, instance, &noun, ft_id) {
-                        derived.push(obj_derived_fact(
-                            ft_id,
-                            &format!("NOT: {} (CWA negation for {} '{}')", reading, noun, instance),
-                            &[(noun.clone(), instance.clone())],
-                        ));
-                    }
-                }
-            }
+        let mut per_ft_funcs: Vec<Func> = Vec::new();
+        for (ft_id, reading, role_idx) in &relevant_fts {
+            let ft_facts = extract_facts_from_pop(ft_id);
 
-            if derived.is_empty() {
-                crate::ast::Object::phi()
-            } else {
-                crate::ast::Object::Seq(derived)
-            }
-        }));
+            // Match condition for <instance, fact> pair from DistL:
+            // eq . [Sel(1), role_value(role_idx) . Sel(2)]
+            // Sel(1) = instance, Sel(2) = fact, role_value extracts the noun's value from fact
+            let match_cond = Func::compose(Func::Eq, Func::construction(vec![
+                Func::Selector(1),
+                Func::compose(role_value(*role_idx), Func::Selector(2)),
+            ]));
+
+            // For each <instance, all_facts> pair from DistR:
+            //   Filter(match_cond) . DistL gives matching <instance, fact> pairs
+            //   NullTest checks if any matches exist
+            let participation_check = Func::compose(
+                Func::NullTest,
+                Func::compose(Func::filter(match_cond), Func::DistL),
+            );
+
+            // Negation fact: <ft_id, reading, <<noun, instance>>>
+            // Instance is Sel(1) of the <instance, facts> pair
+            let neg_reading = format!("NOT: {} (CWA negation for {})", reading, noun);
+            let negation_fact = Func::construction(vec![
+                Func::constant(Object::atom(ft_id)),
+                Func::constant(Object::atom(&neg_reading)),
+                Func::construction(vec![
+                    Func::construction(vec![
+                        Func::constant(Object::atom(&noun)),
+                        Func::Selector(1),
+                    ]),
+                ]),
+            ]);
+
+            // Condition: if NullTest (no participation) -> wrap negation in singleton for Concat;
+            //            else -> phi (empty, contributes nothing to Concat)
+            let per_instance = Func::condition(
+                participation_check,
+                Func::construction(vec![negation_fact]),
+                Func::constant(Object::phi()),
+            );
+
+            // Full pipeline for this ft:
+            // Concat . a(per_instance) . DistR . [instances, ft_facts]
+            let per_ft = Func::compose(
+                Func::Concat,
+                Func::compose(
+                    Func::apply_to_all(per_instance),
+                    Func::compose(Func::DistR, Func::construction(vec![instances.clone(), ft_facts])),
+                ),
+            );
+            per_ft_funcs.push(per_ft);
+        }
+
+        // Combine all per-ft results: run each on pop, concat results.
+        let func = if per_ft_funcs.len() == 1 {
+            per_ft_funcs.pop().unwrap()
+        } else {
+            // [ft1_func, ft2_func, ...] gives <results1, results2, ...>
+            // Concat flattens into single sequence of derived facts
+            Func::compose(Func::Concat, Func::construction(per_ft_funcs))
+        };
         derivations.push(CompiledDerivation {
             id,
             text,
