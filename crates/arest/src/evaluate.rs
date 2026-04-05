@@ -131,6 +131,60 @@ pub fn forward_chain_ast(
     all_derived
 }
 
+/// Forward chain using named defs instead of CompiledModel.
+/// Each def matching "derivation:" is applied to the population.
+pub fn forward_chain_defs(
+    derivation_defs: &[(&str, &ast::Func)],
+    population: &mut Population,
+) -> Vec<DerivedFact> {
+    let mut all_derived: Vec<DerivedFact> = Vec::new();
+    let max_iterations = 100;
+    let defs = std::collections::HashMap::new();
+
+    for _ in 0..max_iterations {
+        let pop_obj = ast::encode_population(population);
+        let mut new_facts: Vec<DerivedFact> = Vec::new();
+
+        for (name, func) in derivation_defs {
+            let result = ast::apply(func, &pop_obj, &defs);
+            if let Some(items) = result.as_seq() {
+                for item in items {
+                    if let Some(fact_items) = item.as_seq() {
+                        if fact_items.len() >= 3 {
+                            let ft_id = fact_items[0].as_atom().unwrap_or("").to_string();
+                            let reading = fact_items[1].as_atom().unwrap_or("").to_string();
+                            let bindings: Vec<(String, String)> = fact_items[2].as_seq()
+                                .unwrap_or(&[])
+                                .iter()
+                                .filter_map(|b| {
+                                    let pair = b.as_seq()?;
+                                    if pair.len() == 2 {
+                                        Some((pair[0].as_atom()?.to_string(), pair[1].as_atom()?.to_string()))
+                                    } else { None }
+                                })
+                                .collect();
+                            let fact = DerivedFact {
+                                fact_type_id: ft_id, reading, bindings,
+                                derived_by: name.to_string(),
+                                confidence: Confidence::Definitive,
+                            };
+                            if !population_contains(population, &fact)
+                                && !all_derived.iter().any(|d| same_fact(d, &fact))
+                                && !new_facts.iter().any(|d| same_fact(d, &fact))
+                            { new_facts.push(fact); }
+                        }
+                    }
+                }
+            }
+        }
+
+        if new_facts.is_empty() { break; }
+        for fact in &new_facts { add_to_population(population, fact); }
+        all_derived.extend(new_facts);
+    }
+    all_derived
+}
+
 /// Check if a derived fact already exists in the population.
 fn population_contains(population: &Population, fact: &DerivedFact) -> bool {
     population.facts.get(&fact.fact_type_id).map_or(false, |facts| {
@@ -194,6 +248,75 @@ pub fn prove(
         proof,
         world_assumption: world_assumption.clone(),
     }
+}
+
+/// Prove from P directly. No Domain reconstruction.
+pub fn prove_from_pop(
+    population: &Population,
+    goal: &str,
+    world_assumption: &WorldAssumption,
+) -> ProofResult {
+    let b = |f: &FactInstance, key: &str| -> String {
+        f.bindings.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone()).unwrap_or_default()
+    };
+    let mut visited = HashSet::new();
+    let schemas = population.facts.get("GraphSchema").cloned().unwrap_or_default();
+    let rules = population.facts.get("DerivationRule").cloned().unwrap_or_default();
+    let proof = prove_goal_pop(population, goal, &mut visited, &b, &schemas, &rules);
+    let status = match &proof {
+        Some(_) => ProofStatus::Proven,
+        None => match world_assumption {
+            WorldAssumption::Closed => ProofStatus::Disproven,
+            WorldAssumption::Open => ProofStatus::Unknown,
+        },
+    };
+    ProofResult { goal: goal.to_string(), status, proof, world_assumption: world_assumption.clone() }
+}
+
+fn prove_goal_pop(
+    population: &Population, goal: &str, visited: &mut HashSet<String>,
+    b: &dyn Fn(&FactInstance, &str) -> String,
+    schemas: &[FactInstance], rules: &[FactInstance],
+) -> Option<ProofStep> {
+    if visited.contains(goal) { return None; }
+    visited.insert(goal.to_string());
+    for (ft_id, facts) in &population.facts {
+        let reading = schemas.iter().find(|s| b(s, "id") == *ft_id).map(|s| b(s, "reading")).unwrap_or_default();
+        if reading.is_empty() { continue; }
+        for fact in facts {
+            let fact_text = format_fact(&reading, &fact.bindings);
+            if fact_text_matches(goal, &fact_text, &reading) {
+                return Some(ProofStep { fact: fact_text, justification: Justification::Axiom, children: vec![] });
+            }
+        }
+    }
+    for rule in rules {
+        let cons_ft_id = b(rule, "consequentFactTypeId");
+        let cons_reading = schemas.iter().find(|s| b(s, "id") == cons_ft_id).map(|s| b(s, "reading")).unwrap_or_default();
+        if cons_reading.is_empty() { continue; }
+        if goal.contains(&cons_reading) || cons_reading.contains(goal.split(' ').next().unwrap_or("")) {
+            let ant_ids: Vec<String> = b(rule, "antecedentFactTypeIds").split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+            let mut child_proofs = Vec::new();
+            let mut all_proven = true;
+            for ant_id in &ant_ids {
+                let ant_reading = schemas.iter().find(|s| b(s, "id") == *ant_id).map(|s| b(s, "reading")).unwrap_or_default();
+                if ant_reading.is_empty() { all_proven = false; break; }
+                match prove_goal_pop(population, &ant_reading, visited, b, schemas, rules) {
+                    Some(proof) => child_proofs.push(proof),
+                    None => { all_proven = false; break; }
+                }
+            }
+            if all_proven && !child_proofs.is_empty() {
+                return Some(ProofStep {
+                    fact: goal.to_string(),
+                    justification: Justification::Derived { rule_id: b(rule, "id"), rule_text: b(rule, "text") },
+                    children: child_proofs,
+                });
+            }
+        }
+    }
+    visited.remove(goal);
+    None
 }
 
 /// Recursive backward chaining.
@@ -408,6 +531,109 @@ pub fn synthesize(
         state_machines,
         derived_facts,
         related_nouns,
+    }
+}
+
+/// Synthesize from P directly. No Domain reconstruction.
+pub fn synthesize_from_pop(
+    pop: &Population,
+    noun_name: &str,
+    depth: usize,
+) -> SynthesisResult {
+    let binding = |f: &FactInstance, key: &str| -> String {
+        f.bindings.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone()).unwrap_or_default()
+    };
+
+    let wa = WorldAssumption::Closed; // default; could query Noun facts for worldAssumption
+
+    // 1. Find schemas where this noun plays a role (via Role facts)
+    let role_facts = pop.facts.get("Role").map(|v| v.as_slice()).unwrap_or(&[]);
+    let schema_ids_for_noun: Vec<(String, usize)> = role_facts.iter()
+        .filter(|r| binding(r, "nounName") == noun_name)
+        .map(|r| (binding(r, "graphSchema"), binding(r, "position").parse().unwrap_or(0)))
+        .collect();
+
+    let schema_facts = pop.facts.get("GraphSchema").map(|v| v.as_slice()).unwrap_or(&[]);
+    let participates_in: Vec<FactTypeSummary> = schema_ids_for_noun.iter()
+        .filter_map(|(sid, role_idx)| {
+            let reading = schema_facts.iter()
+                .find(|s| binding(s, "id") == *sid)
+                .map(|s| binding(s, "reading"))?;
+            Some(FactTypeSummary { id: sid.clone(), reading, role_index: *role_idx })
+        })
+        .collect();
+
+    // 2. Constraints spanning those fact types
+    let ft_ids: HashSet<&str> = participates_in.iter().map(|f| f.id.as_str()).collect();
+    let constraint_facts = pop.facts.get("Constraint").map(|v| v.as_slice()).unwrap_or(&[]);
+    let mut seen = HashSet::new();
+    let applicable_constraints: Vec<ConstraintSummary> = constraint_facts.iter()
+        .filter(|c| {
+            (0..4).any(|i| {
+                let ft_key = format!("span{}_factTypeId", i);
+                let ft_id = binding(c, &ft_key);
+                !ft_id.is_empty() && ft_ids.contains(ft_id.as_str())
+            })
+        })
+        .filter(|c| seen.insert(binding(c, "id")))
+        .map(|c| ConstraintSummary {
+            id: binding(c, "id"), text: binding(c, "text"), kind: binding(c, "kind"),
+            modality: binding(c, "modality"), deontic_operator: {
+                let op = binding(c, "deonticOperator");
+                if op.is_empty() { None } else { Some(op) }
+            },
+        })
+        .collect();
+
+    // 3. State machines (from InstanceFact: "State Machine Definition 'X' is for Noun 'noun'")
+    let inst_facts = pop.facts.get("InstanceFact").map(|v| v.as_slice()).unwrap_or(&[]);
+    let state_machines: Vec<StateMachineSummary> = inst_facts.iter()
+        .filter(|f| binding(f, "subjectNoun") == "State Machine Definition" && binding(f, "objectNoun") == "Noun" && binding(f, "objectValue") == noun_name)
+        .map(|f| {
+            let sm_name = binding(f, "subjectValue");
+            let statuses: Vec<String> = inst_facts.iter()
+                .filter(|s| binding(s, "subjectNoun") == "Status" && binding(s, "objectNoun") == "State Machine Definition" && binding(s, "objectValue") == sm_name)
+                .map(|s| binding(s, "subjectValue"))
+                .collect();
+            let initial = inst_facts.iter()
+                .find(|s| binding(s, "subjectNoun") == "Status" && binding(s, "fieldName") == "is initial in" && binding(s, "objectValue") == sm_name)
+                .map(|s| binding(s, "subjectValue"))
+                .unwrap_or_else(|| statuses.first().cloned().unwrap_or_default());
+            let valid_transitions: Vec<String> = inst_facts.iter()
+                .filter(|t| binding(t, "subjectNoun") == "Transition" && binding(t, "objectNoun") == "Event Type")
+                .filter(|t| {
+                    let trans_name = binding(t, "subjectValue");
+                    inst_facts.iter().any(|tf| binding(tf, "subjectNoun") == "Transition" && binding(tf, "subjectValue") == trans_name && binding(tf, "objectNoun") == "Status" && binding(tf, "objectValue") == initial && binding(tf, "fieldName").contains("from"))
+                })
+                .map(|t| binding(t, "objectValue"))
+                .collect();
+            StateMachineSummary { noun_name: sm_name, statuses, current_status: Some(initial), valid_transitions }
+        })
+        .collect();
+
+    // 4. Related nouns
+    let mut seen_related = HashSet::new();
+    let related_nouns: Vec<RelatedNoun> = if depth > 0 {
+        participates_in.iter()
+            .flat_map(|fts| {
+                role_facts.iter()
+                    .filter(|r| binding(r, "graphSchema") == fts.id && binding(r, "nounName") != noun_name)
+                    .filter(|r| seen_related.insert(binding(r, "nounName")))
+                    .map(|r| RelatedNoun {
+                        name: binding(r, "nounName"),
+                        via_fact_type: fts.id.clone(),
+                        via_reading: fts.reading.clone(),
+                        world_assumption: WorldAssumption::Closed,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    } else { Vec::new() };
+
+    SynthesisResult {
+        noun_name: noun_name.to_string(), world_assumption: wa,
+        participates_in, applicable_constraints, state_machines,
+        derived_facts: Vec::new(), related_nouns,
     }
 }
 

@@ -6,6 +6,7 @@
  * registers external resolution for the User noun.
  */
 
+/// <reference types="node" />
 import { describe, it, expect, vi } from 'vitest'
 import { readFileSync } from 'fs'
 import { resolve } from 'path'
@@ -36,7 +37,6 @@ vi.mock('./engine', () => {
   return {
     parseReadings: vi.fn(parse),
     parseReadingsWithNouns: vi.fn((md: string, domain: string, _nouns: string) => parse(md, domain)),
-    reconstructIR: vi.fn(async () => '{}'),
     ensureWasm: vi.fn(),
   }
 })

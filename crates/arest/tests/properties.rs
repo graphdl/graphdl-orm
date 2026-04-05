@@ -609,8 +609,8 @@ fn paper_claim_compile_from_population() {
     for (k, v) in orders_pop.facts {
         pop.facts.entry(k).or_default().extend(v);
     }
-    let model = compile::compile_from_population(&pop);
-    assert!(!model.state_machines.is_empty(), "Should compile state machines from population");
+    let defs = compile::compile_to_defs(&pop);
+    assert!(defs.iter().any(|(n, _)| n.starts_with("machine:")), "Should compile state machines from population");
 }
 
 #[test]
@@ -622,12 +622,19 @@ fn paper_claim_population_round_trip() {
     for (k, v) in orders_pop.facts {
         merged.facts.entry(k).or_default().extend(v);
     }
-    let model = compile::compile_from_population(&merged);
-    let sm = model.state_machines.iter()
-        .find(|sm| sm.noun_name == "Order")
-        .expect("Should have Order state machine from population");
-    assert_eq!(sm.initial, "In Cart");
-    assert_eq!(evaluate::run_machine_ast(sm, &["place", "ship", "deliver"]), "Delivered");
+    let defs = compile::compile_to_defs(&merged);
+    let def_map: std::collections::HashMap<String, arest::ast::Func> = defs.iter().map(|(n, f)| (n.clone(), f.clone())).collect();
+    let transition = def_map.get("machine:Order").expect("Should have Order machine from population");
+    let initial = def_map.get("machine:Order:initial").expect("Should have Order initial");
+    let init_state = arest::ast::apply(initial, &arest::ast::Object::phi(), &def_map);
+    assert_eq!(init_state.as_atom().unwrap(), "In Cart");
+    // Fold: In Cart → place → Placed → ship → Shipped → deliver → Delivered
+    let mut state = init_state;
+    for event in &["place", "ship", "deliver"] {
+        let inp = arest::ast::Object::seq(vec![state, arest::ast::Object::atom(event)]);
+        state = arest::ast::apply(transition, &inp, &def_map);
+    }
+    assert_eq!(state.as_atom().unwrap(), "Delivered");
 }
 
 // ── Paper Claim: Everything is Func ──────────────────────────────────

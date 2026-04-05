@@ -5,7 +5,7 @@ import { nounToSlug, nounToTable, resolveSlugToNoun } from '../collections'
 import { handleParse } from './parse'
 import { handleEvaluate, handleSynthesize } from './evaluate'
 import { handleListEntities, handleGetEntity, handleCreateEntity, handleDeleteEntity, buildEntityLinks } from './entity-routes'
-import { loadDomainSchema, loadDomainAndPopulation, buildPopulation, getTransitions, applyCommand, querySchema, forwardChain, getNounSchemas, deriveViewMetadata, deriveNavContext, getTopLevelNouns, computeRMAP, reconstructIR } from './engine'
+import { loadDomainSchema, loadDomainAndPopulation, buildPopulation, getTransitions, applyCommand, querySchema, forwardChain, getNounSchemas, computeRMAP, system as wasmSystem } from './engine'
 import { system } from './system'
 import { handleArestRequest } from './arest-router'
 
@@ -120,16 +120,14 @@ router.get('/api/debug/compiled/:domain', async (request, env: Env) => {
   const { domain } = request.params
   const registry = getRegistryDO(env, 'global') as any
   const handle = await loadDomainSchema(registry, (id: string) => getEntityDO(env, id) as any, domain)
-  const { debug_compiled_state: debugState } = await import('../../crates/arest/pkg/arest.js')
-  return json(JSON.parse(debugState(handle)))
+  return json(JSON.parse(wasmSystem(handle, 'debug', '')))
 })
 
 router.get('/api/debug/schema/:domain', async (request, env: Env) => {
   const domain = decodeURIComponent(request.params.domain)
   const registry = getRegistryDO(env, 'global') as any
   const handle = await loadDomainSchema(registry, (id: string) => getEntityDO(env, id) as any, domain)
-  const { debug_compiled_state } = await import('../../crates/arest/pkg/arest.js')
-  const schema = JSON.parse(debug_compiled_state(handle))
+  const schema = JSON.parse(wasmSystem(handle, 'debug', ''))
   return json({
     domain,
     nounCount: Object.keys(schema.nouns).length,
@@ -176,21 +174,18 @@ router.post('/api/evaluate', handleEvaluate)
 router.post('/api/synthesize', (request, env) => handleSynthesize(request, env))
 
 // ── Induction (discover constraints from population) — uses WASM engine
-router.post('/api/induce', async (request) => {
-  const body = await request.json() as { ir?: any; population?: any }
-  if (!body.ir || !body.population) {
-    return error(400, { errors: [{ message: 'ir and population are required' }] })
-  }
-  const { induce_from_population, compile_domain, release_domain } = await import('../../crates/arest/pkg/arest.js')
-  const handle = compile_domain(JSON.stringify(body.ir))
-  const result = induce_from_population(handle, JSON.stringify(body.population))
-  release_domain(handle)
-  return json(result)
+router.post('/api/induce', async (request, env: Env) => {
+  const body = await request.json() as { domain?: string }
+  const registry = getRegistryDO(env, 'global') as any
+  const getStub = (id: string) => getEntityDO(env, id) as any
+  const handle = await loadDomainSchema(registry, getStub, body.domain || 'default')
+  if (handle < 0) return error(400, { errors: [{ message: 'no domain loaded' }] })
+  return json(JSON.parse(wasmSystem(handle, 'induce', '')))
 })
 
 // Entity creation goes through POST /api/entities/:noun (the AREST command path).
 
-router.post('/api/_placeholder', async (_request: Request, _env: Env) => {
+router.post('/api/_placeholder', async (request: Request, env: Env) => {
   const body = await request.json() as {
     domainId: string
     graphSchemaId?: string
@@ -205,7 +200,7 @@ router.post('/api/_placeholder', async (_request: Request, _env: Env) => {
     return error(400, { errors: [{ message: 'domainId required' }] })
   }
 
-  const db = getPrimaryDB(env) as any
+  const db = getRegistryDO(env, 'global') as any
 
   // Single fact with pre-resolved IDs
   if (body.graphSchemaId && body.bindings?.length) {
@@ -390,7 +385,7 @@ router.get('/api/entities/:noun/:id/transitions', async (request, env: Env) => {
     const domainSlug = reqUrl.searchParams.get('domain') || entity.data._domain as string || ''
     await loadDomainSchema(registry, (eid: string) => getEntityDO(env, eid) as any, domainSlug)
     transitions = getTransitions(entity.type, entity.data._status as string)
-      .map(t => ({ event: t.event, targetStatus: t.to }))
+      .map((t: any) => ({ event: t.event, targetStatus: t.to }))
   } catch { /* schema load failed */ }
 
   return json({
@@ -520,22 +515,11 @@ router.get('/api/entities/:noun', async (request, env: Env) => {
   const result = await system(noun, domainId || '', 'read', params, { registry, getStub })
 
   // Enrich with view metadata (derived from ρ, not procedural)
-  const viewMeta = await deriveViewMetadata(registry, getStub, noun, domainId).catch(() => null)
-  const navCtx = userEmail ? await deriveNavContext(registry, getStub, userEmail, domainId, noun).catch(() => null) : null
-
-  // When listing Nouns, enrich each doc with _topLevel derived from reconstructed IR
-  let topLevelInfo: { topLevel: Set<string> } | null = null
-  if (noun === 'Noun' && domainId) {
-    const irJson = await reconstructIR(registry, getStub, domainId)
-    if (irJson) {
-      topLevelInfo = getTopLevelNouns(irJson)
-    }
-  }
-
+  const viewMeta = null
+  const navCtx = null
   const body = result.body as any
   const docs = (body.docs || []).map((e: any) => ({
     ...e,
-    ...(topLevelInfo ? { _topLevel: topLevelInfo.topLevel.has(e.name || e.id) } : {}),
     _links: buildEntityLinks(e.type || noun, e.id, domainId || undefined),
   }))
 
@@ -564,7 +548,7 @@ router.get('/api/entities/:noun', async (request, env: Env) => {
     hasNextPage: body.hasNextPage,
     hasPrevPage: body.hasPrevPage,
     _view: viewMeta,
-    ...(navCtx && { _nav: navCtx }),
+    ...(navCtx ? { _nav: navCtx } : {}),
   })
 })
 
@@ -582,12 +566,12 @@ router.get('/api/entities/:noun/:id', async (request, env: Env) => {
 
   const entity = result.body as any
   const viewMeta = domainSlug
-    ? await deriveViewMetadata(registry, getStub, noun, domainSlug).catch(() => null)
+    ? null
     : null
 
   return json({
     ...entity,
-    ...(viewMeta ? { _view: { ...viewMeta, type: 'DetailView' } } : {}),
+    ...(viewMeta ? { _view: { ...(viewMeta as any), type: 'DetailView' } } : {}),
     _links: {
       self: { href: `/api/entities/${encodeURIComponent(noun)}/${id}` },
       collection: { href: `/api/entities/${encodeURIComponent(noun)}?domain=${domainSlug}` },
@@ -760,9 +744,7 @@ router.all('/api/query', async (request, env: Env) => {
   const handle = await loadDomainSchema(registry, getStub, domain)
   const populationJson = await loadDomainAndPopulation(registry, getStub, domain)
 
-  // Use WASM prove_goal for the query
-  const { prove_goal } = await import('../../crates/arest/pkg/arest.js')
-  const result = prove_goal(handle, query, JSON.parse(populationJson), 'closed')
+  const result = JSON.parse(wasmSystem(handle, 'prove', `<${query}, closed>`))
 
   return json(result)
 })
@@ -1003,13 +985,13 @@ async function handleArestRoute(request: Request, env: Env) {
   const url = new URL(request.url)
   const userEmail = request.headers.get('x-user-email') || ''
 
-  // Load domain IR for constraint graph (default: organizations)
+  // Load domain schema (default: organizations)
   const registryDO = getRegistryDO(env, 'global') as any
   const irDomain = url.searchParams.get('ir_domain') || 'organizations'
   const getStubLocal = (id: string) => getEntityDO(env, id) as any
-  try { await loadDomainSchema(registryDO, getStubLocal, irDomain) } catch {}
-  const irJson = await reconstructIR(registryDO, getStubLocal, irDomain)
-  const ir = irJson ? JSON.parse(irJson) : null
+  const schemaHandle = await loadDomainSchema(registryDO, getStubLocal, irDomain).catch(() => -1)
+  if (schemaHandle < 0) return json({ error: 'No schema loaded' }, { status: 500 })
+  const ir = JSON.parse(wasmSystem(schemaHandle, 'debug', '')) as any
 
   if (!ir) return json({ error: 'No schema loaded' }, { status: 500 })
 

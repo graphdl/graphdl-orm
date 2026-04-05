@@ -59,6 +59,21 @@ impl Object {
         }
     }
 
+    /// Parse an FFP object from Backus notation.
+    /// Atoms: bare strings. Sequences: <x₁, x₂, ...>. Bottom: ⊥. Empty: φ.
+    pub fn parse(input: &str) -> Object {
+        let s = input.trim();
+        if s.is_empty() || s == "φ" { return Object::phi(); }
+        if s == "⊥" { return Object::Bottom; }
+        if s.starts_with('<') && s.ends_with('>') {
+            let inner = &s[1..s.len()-1];
+            if inner.trim().is_empty() { return Object::phi(); }
+            let items = split_top_level(inner);
+            return Object::Seq(items.into_iter().map(|i| Object::parse(i.trim())).collect());
+        }
+        Object::Atom(s.to_string())
+    }
+
     pub fn is_bottom(&self) -> bool { matches!(self, Object::Bottom) }
     pub fn is_atom(&self) -> bool { matches!(self, Object::Atom(_)) }
 
@@ -75,6 +90,26 @@ impl Object {
             _ => None,
         }
     }
+}
+
+/// Split a string on commas, respecting nested <> brackets.
+fn split_top_level(s: &str) -> Vec<&str> {
+    let mut result = vec![];
+    let mut depth = 0;
+    let mut start = 0;
+    for (i, c) in s.char_indices() {
+        match c {
+            '<' => depth += 1,
+            '>' => depth -= 1,
+            ',' if depth == 0 => {
+                result.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    result.push(&s[start..]);
+    result
 }
 
 impl fmt::Display for Object {

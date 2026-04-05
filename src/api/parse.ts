@@ -12,7 +12,7 @@
 
 import { json, error } from 'itty-router'
 import type { Env } from '../types'
-import { parseReadings, parseReadingsWithNouns, reconstructIR } from './engine'
+import { parseReadings, parseReadingsWithNouns } from './engine'
 
 function getRegistryDO(env: Env) {
   return env.REGISTRY_DB.get(env.REGISTRY_DB.idFromName('global'))
@@ -82,8 +82,8 @@ async function handleParsePost(request: Request, env: Env): Promise<Response> {
   if (contentType.includes('multipart/form-data')) {
     const formData = await request.formData()
     for (const [name, value] of formData.entries()) {
-      if (!(value instanceof File) && typeof value !== 'string') continue
-      const text = value instanceof File ? await value.text() : value
+      if (!((value as any) instanceof File) && typeof value !== 'string') continue
+      const text = (value as any) instanceof File ? await (value as any).text() : value as string
       if (!text.trim()) continue
       rawDomains.push({ slug: name.replace(/\.md$/i, ''), text })
     }
@@ -168,13 +168,12 @@ async function handleParsePost(request: Request, env: Env): Promise<Response> {
       await registry.materializeBatch(entities)
     }
 
-    // ↓DEFS — persist definitions after parsing
+    // ↓DEFS — store raw readings (the source) and runtime bindings
     const defsData: Record<string, string> = {}
-    // Default operations
     defsData['*:read'] = 'local'
     defsData['*:readDetail'] = 'local'
     defsData['*:create'] = 'local'
-    // Register external fetch for backed nouns from Instance Facts
+    defsData['readings'] = text
     const instanceFactEntities = entities.filter(e => e.type === 'Instance Fact')
     for (const ife of instanceFactEntities) {
       const d = ife.data as any
@@ -183,13 +182,6 @@ async function handleParsePost(request: Request, env: Env): Promise<Response> {
         defsData[`${d.subjectValue}:readDetail`] = 'external'
       }
     }
-    // Store IR JSON in DEFS — the output of parse, input to compile_domain
-    const getStubFn = (id: string) => env.ENTITY_DB.get(env.ENTITY_DB.idFromName(id)) as any
-    const irJson = await reconstructIR(registry, getStubFn, slug).catch(() => null)
-    if (irJson) {
-      (defsData as any).irJson = irJson
-    }
-
     const defsStub = env.ENTITY_DB.get(env.ENTITY_DB.idFromName(`defs:${slug}`)) as any
     await defsStub.put({ id: `defs:${slug}`, type: 'Defs', domain: slug, data: defsData })
 
