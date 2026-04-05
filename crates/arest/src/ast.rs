@@ -236,6 +236,12 @@ pub enum Func {
     /// Equals: eq:<x, y> = T if x = y, F otherwise
     Eq,
 
+    /// Contains: contains:<x,y> = T if atom x contains atom y (case-insensitive), else F
+    Contains,
+
+    /// Lower: lower:x = lowercase of atom x
+    Lower,
+
     /// Length: length:<x₁, ..., xₙ> = n
     Length,
 
@@ -400,6 +406,26 @@ pub fn apply(func: &Func, x: &Object, defs: &std::collections::HashMap<String, F
                     if items[0] == items[1] { Object::t() } else { Object::f() }
                 }
                 _ => Object::Bottom,
+            }
+        }
+
+        Func::Contains => {
+            match x.as_seq() {
+                Some(items) if items.len() == 2 => {
+                    match (items[0].as_atom(), items[1].as_atom()) {
+                        (Some(haystack), Some(needle)) =>
+                            if haystack.to_lowercase().contains(&needle.to_lowercase()) { Object::t() } else { Object::f() },
+                        _ => Object::Bottom,
+                    }
+                }
+                _ => Object::Bottom,
+            }
+        }
+
+        Func::Lower => {
+            match x.as_atom() {
+                Some(s) => Object::Atom(s.to_lowercase()),
+                None => Object::Bottom,
             }
         }
 
@@ -837,6 +863,8 @@ fn metacompose_atom(name: &str, defs: &std::collections::HashMap<String, Func>) 
         primitives::TL => Func::Tail,
         primitives::ATOM => Func::AtomTest,
         primitives::EQ => Func::Eq,
+        "contains" => Func::Contains,
+        "lower" => Func::Lower,
         primitives::NULL => Func::NullTest,
         primitives::REVERSE => Func::Reverse,
         primitives::DISTL => Func::DistL,
@@ -952,6 +980,8 @@ pub fn func_to_object(func: &Func) -> Object {
         Func::AtomTest => Object::atom(primitives::ATOM),
         Func::NullTest => Object::atom(primitives::NULL),
         Func::Eq => Object::atom(primitives::EQ),
+        Func::Contains => Object::atom("contains"),
+        Func::Lower => Object::atom("lower"),
         Func::Length => Object::atom(primitives::LENGTH),
         Func::DistL => Object::atom(primitives::DISTL),
         Func::DistR => Object::atom(primitives::DISTR),
@@ -1219,6 +1249,8 @@ impl fmt::Debug for Func {
             Func::AtomTest => write!(f, "atom"),
             Func::NullTest => write!(f, "null"),
             Func::Eq => write!(f, "eq"),
+            Func::Contains => write!(f, "contains"),
+            Func::Lower => write!(f, "lower"),
             Func::Length => write!(f, "length"),
             Func::DistL => write!(f, "distl"),
             Func::DistR => write!(f, "distr"),

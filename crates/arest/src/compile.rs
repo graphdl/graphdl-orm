@@ -2708,85 +2708,101 @@ fn compile_equality_ast(ir: &Domain, def: &ConstraintDef) -> Func {
 /// Uses Func::Selector(1) for response_text and Func::Selector(2) for sender_identity
 /// from the eval context <response_text, sender_identity, population>.
 fn compile_forbidden_ast(ir: &Domain, def: &ConstraintDef) -> Func {
-    let id = def.id.clone();
-    let text = def.text.clone();
     let forbidden_values = collect_enum_values(ir, &def.spans);
-    let entity_scope = def.entity.clone();
-    let text_keywords = extract_constraint_keywords(&text);
-
-    // Deontic response constraints (entity = "Support Response" etc.) always apply
-    // to the response being evaluated. Entity scoping only applies when the constraint
-    // is about a domain entity that may or may not be referenced in the text.
+    let text_keywords = extract_constraint_keywords(&def.text);
     let is_response_constraint = def.entity.as_ref()
         .map_or(false, |e| e.to_lowercase().contains("response"));
 
-    Func::Native(Arc::new(move |ctx: &Object| {
-        let defs = HashMap::new();
-        let response_text = crate::ast::apply(&Func::Selector(1), ctx, &defs);
-        let response_str = response_text.as_atom().unwrap_or("").to_string();
-        let lower_text = response_str.to_lowercase();
+    // response_text = Selector(1) : ctx
+    let response = Func::Selector(1);
 
-        // Entity scoping: skip for response constraints (they always apply).
-        // For other constraints, only evaluate when the response references the entity.
-        if !is_response_constraint {
-            if let Some(ref entity) = entity_scope {
-                let entity_lower = entity.to_lowercase();
-                let entity_compact: String = entity.chars().filter(|c| !c.is_whitespace()).collect();
-                let entity_compact_lower = entity_compact.to_lowercase();
-                if !lower_text.contains(&entity_lower) && !lower_text.contains(&entity_compact_lower) {
-                    return Object::phi();
-                }
-            }
+    // Entity scoping: if not a response constraint and entity is specified,
+    // only evaluate when response text contains the entity name.
+    let entity_gate = match (&def.entity, is_response_constraint) {
+        (Some(entity), false) => {
+            // Contains . [response, entity_name] -> T if entity mentioned
+            Some(Func::compose(Func::Contains, Func::construction(vec![
+                response.clone(),
+                Func::constant(Object::atom(entity)),
+            ])))
         }
+        _ => None,
+    };
 
-        let mut violations = Vec::new();
-        let mut seen = HashSet::new();
+    // CWA path: forbidden enum values as constant sequence, filter for matches.
+    let core = if !forbidden_values.is_empty() {
+        // Build constant seq of <noun, value> pairs
+        let value_atoms: Vec<Object> = forbidden_values.iter()
+            .flat_map(|(noun, vals)| vals.iter().map(move |v| Object::seq(vec![Object::atom(noun), Object::atom(v)])))
+            .collect();
+        let values_const = Func::constant(Object::Seq(value_atoms));
 
-        // Enum-based check (exact value match)
-        for (noun_name, enum_vals) in &forbidden_values {
-            for val in enum_vals {
-                let lower_val = val.to_lowercase();
-                if lower_text.contains(&lower_val) {
-                    let detail_str = format!(
-                        "Response contains forbidden {}: '{}'",
-                        noun_name, val
-                    );
-                    if seen.insert(detail_str.clone()) {
-                        violations.push(Object::seq(vec![
-                            Object::atom(&id),
-                            Object::atom(&text),
-                            Object::seq(vec![
-                                Object::atom("Response contains forbidden"),
-                                Object::atom(noun_name),
-                                Object::atom(&format!("'{}'", val)),
-                            ]),
-                        ]));
-                    }
-                }
-            }
-        }
+        // For each <noun, value>, check contains(response, value)
+        // distr . [values, response] -> <<noun_val, response>, ...>
+        // Filter: contains . [sel2, sel2(sel1)] -- response contains value
+        let text_contains_val = Func::compose(Func::Contains, Func::construction(vec![
+            Func::Selector(2),                                    // response text
+            Func::compose(Func::Selector(2), Func::Selector(1)), // value from pair
+        ]));
 
-        // Text-based check: if no enum values, check keyword co-occurrence
-        if forbidden_values.is_empty() && !text_keywords.is_empty() {
-            let matched: Vec<&str> = text_keywords.iter()
-                .filter(|kw| lower_text.contains(kw.as_str()))
-                .map(|s| s.as_str())
-                .collect();
-            if matched.len() > text_keywords.len() / 2 && matched.len() >= 2 {
-                violations.push(Object::seq(vec![
-                    Object::atom(&id),
-                    Object::atom(&text),
-                    Object::seq(vec![
-                        Object::atom("Response may violate:"),
-                        Object::atom(&text),
-                        Object::atom(&format!("(matched keywords: {})", matched.join(", "))),
-                    ]),
-                ]));
-            }
-        }
+        let detail = Func::construction(vec![
+            Func::constant(Object::atom("Response contains forbidden")),
+            Func::compose(Func::Selector(1), Func::Selector(1)), // noun name
+            Func::compose(Func::Selector(2), Func::Selector(1)), // value
+        ]);
+        let viol = make_violation_func(&def.id, &def.text, detail);
 
-        if violations.is_empty() { Object::phi() } else { Object::Seq(violations) }
-    }))
+        Func::compose(
+            Func::apply_to_all(viol),
+            Func::compose(
+                Func::filter(text_contains_val),
+                Func::compose(Func::DistR, Func::construction(vec![values_const, response.clone()])),
+            ),
+        )
+    } else if !text_keywords.is_empty() {
+        // OWA path: keyword co-occurrence. Build constant keyword seq,
+        // filter for matches, check count threshold.
+        let kw_atoms: Vec<Object> = text_keywords.iter().map(|k| Object::atom(k)).collect();
+        let threshold = text_keywords.len() / 2;
+        let kws_const = Func::constant(Object::Seq(kw_atoms));
+
+        // Filter keywords that appear in response
+        let kw_in_response = Func::compose(Func::Contains, Func::construction(vec![
+            Func::Selector(2), // response text
+            Func::Selector(1), // keyword
+        ]));
+
+        let matched_kws = Func::compose(
+            Func::filter(kw_in_response),
+            Func::compose(Func::DistR, Func::construction(vec![kws_const, response.clone()])),
+        );
+
+        // Violation if matched count > threshold and >= 2
+        let detail = Func::construction(vec![
+            Func::constant(Object::atom("Response may violate:")),
+            Func::constant(Object::atom(&def.text)),
+        ]);
+        let viol = make_violation_func(&def.id, &def.text, detail);
+
+        // Condition: length(matched) > threshold -> violation
+        let threshold_str = threshold.to_string();
+        Func::condition(
+            Func::compose(Func::Not, Func::compose(Func::Eq, Func::construction(vec![
+                Func::compose(Func::Length, matched_kws.clone()),
+                Func::constant(Object::atom("0")),
+            ]))),
+            Func::construction(vec![Func::compose(viol, Func::constant(Object::phi()))]),
+            Func::constant(Object::phi()),
+        )
+    } else {
+        Func::constant(Object::phi())
+    };
+
+    // Apply entity gate if present
+    match entity_gate {
+        Some(gate) => Func::condition(gate, core, Func::constant(Object::phi())),
+        None => core,
+    }
 }
 
 /// Deontic: Obligatory constraint.
