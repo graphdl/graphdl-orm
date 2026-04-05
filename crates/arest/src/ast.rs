@@ -189,7 +189,9 @@ pub fn decode_violation(obj: &Object) -> Option<Violation> {
 /// Decode a sequence of violation Objects.
 pub fn decode_violations(obj: &Object) -> Vec<Violation> {
     match obj.as_seq() {
-        Some(items) => items.iter().filter_map(decode_violation).collect(),
+        Some(items) => items.iter().flat_map(|item|
+            decode_violation(item).map_or_else(|| decode_violations(item), |v| vec![v])
+        ).collect(),
         None => vec![],
     }
 }

@@ -2624,99 +2624,84 @@ fn compile_subset_ast(ir: &Domain, def: &ConstraintDef) -> Func {
 /// EQ: Equality constraint â€” pop(rs1) = pop(rs2) (bidirectional subset).
 /// Uses tuple-based comparison same as compile_subset_ast.
 fn compile_equality_ast(ir: &Domain, def: &ConstraintDef) -> Func {
-    let id = def.id.clone();
-    let text = def.text.clone();
-
     if def.spans.len() < 2 {
         return Func::constant(Object::phi());
     }
 
+    // EQ = SS(A,B) union SS(B,A). Build both subset checks.
     let a_ft_id = def.spans[0].fact_type_id.clone();
     let b_ft_id = def.spans[1].fact_type_id.clone();
 
-    let a_nouns: Vec<String> = ir.fact_types.get(&a_ft_id)
-        .map(|ft| ft.roles.iter().map(|r| r.noun_name.clone()).collect())
+    let a_roles: Vec<(usize, String)> = ir.fact_types.get(&a_ft_id)
+        .map(|ft| ft.roles.iter().enumerate().map(|(i, r)| (i, r.noun_name.clone())).collect())
         .unwrap_or_default();
-    let b_nouns: Vec<String> = ir.fact_types.get(&b_ft_id)
-        .map(|ft| ft.roles.iter().map(|r| r.noun_name.clone()).collect())
+    let b_roles: Vec<(usize, String)> = ir.fact_types.get(&b_ft_id)
+        .map(|ft| ft.roles.iter().enumerate().map(|(i, r)| (i, r.noun_name.clone())).collect())
         .unwrap_or_default();
-    let common_nouns: Vec<String> = a_nouns.iter()
-        .filter(|n| b_nouns.contains(n))
-        .cloned()
-        .collect();
 
-    let a_extractor = extract_facts_func(&a_ft_id);
-    let b_extractor = extract_facts_func(&b_ft_id);
+    let common: Vec<(usize, usize)> = a_roles.iter().filter_map(|(ai, n)| {
+        b_roles.iter().find(|(_, bn)| bn == n).map(|(bi, _)| (*ai, *bi))
+    }).collect();
 
-    Func::Native(Arc::new(move |ctx: &Object| {
-        let defs = HashMap::new();
-        let a_facts_obj = crate::ast::apply(&a_extractor, ctx, &defs);
-        let b_facts_obj = crate::ast::apply(&b_extractor, ctx, &defs);
+    if common.is_empty() {
+        return Func::constant(Object::phi());
+    }
 
-        let a_facts = a_facts_obj.as_seq().map(|s| s.as_ref()).unwrap_or(&[]);
-        let b_facts = b_facts_obj.as_seq().map(|s| s.as_ref()).unwrap_or(&[]);
+    // Build match predicate for <left_fact, right_candidate>
+    let build_match = |left_indices: &[(usize, usize)], swap: bool| -> Func {
+        let eqs: Vec<Func> = left_indices.iter().map(|&(ai, bi)| {
+            let (li, ri) = if swap { (bi, ai) } else { (ai, bi) };
+            Func::compose(Func::Eq, Func::construction(vec![
+                Func::compose(role_value(li), Func::Selector(1)),
+                Func::compose(role_value(ri), Func::Selector(2)),
+            ]))
+        }).collect();
+        if eqs.len() == 1 { eqs.into_iter().next().unwrap() }
+        else { eqs.into_iter().reduce(|a, b| Func::compose(Func::And, Func::construction(vec![a, b]))).unwrap() }
+    };
 
-        // Helper to extract common-noun value tuples from fact Objects
-        let extract_tuples = |facts: &[Object]| -> HashSet<Vec<String>> {
-            facts.iter().map(|f| {
-                common_nouns.iter().map(|noun| {
-                    f.as_seq().and_then(|bindings| {
-                        bindings.iter().find_map(|b| {
-                            let pair = b.as_seq()?;
-                            if pair.len() == 2 && pair[0].as_atom() == Some(noun) {
-                                pair[1].as_atom().map(|v| v.to_string())
-                            } else {
-                                None
-                            }
-                        })
-                    }).unwrap_or_default()
-                }).collect()
-            }).collect()
-        };
+    let a_facts = extract_facts_func(&a_ft_id);
+    let b_facts = extract_facts_func(&b_ft_id);
 
-        let a_tuples = extract_tuples(a_facts);
-        let b_tuples = extract_tuples(b_facts);
+    // A not in B
+    let match_ab = build_match(&common, false);
+    let not_in_b = Func::compose(Func::NullTest, Func::compose(Func::filter(match_ab), Func::DistL));
+    let mut detail_ab: Vec<Func> = vec![Func::constant(Object::atom("Equality violation:"))];
+    for &(ai, _) in &common {
+        detail_ab.push(Func::constant(Object::atom(&a_roles[ai].1)));
+        detail_ab.push(Func::compose(role_value(ai), Func::Selector(1)));
+    }
+    detail_ab.push(Func::constant(Object::atom("in")));
+    detail_ab.push(Func::constant(Object::atom(&a_ft_id)));
+    detail_ab.push(Func::constant(Object::atom("but not in")));
+    detail_ab.push(Func::constant(Object::atom(&b_ft_id)));
+    let viol_ab = make_violation_func(&def.id, &def.text, Func::construction(detail_ab));
+    let check_ab = Func::compose(
+        Func::apply_to_all(viol_ab),
+        Func::compose(Func::filter(not_in_b), Func::compose(Func::DistR, Func::construction(vec![a_facts.clone(), b_facts.clone()]))),
+    );
 
-        let mut violations = Vec::new();
+    // B not in A
+    let match_ba = build_match(&common, true);
+    let not_in_a = Func::compose(Func::NullTest, Func::compose(Func::filter(match_ba), Func::DistL));
+    let mut detail_ba: Vec<Func> = vec![Func::constant(Object::atom("Equality violation:"))];
+    for &(_, bi) in &common {
+        detail_ba.push(Func::constant(Object::atom(&b_roles[bi].1)));
+        detail_ba.push(Func::compose(role_value(bi), Func::Selector(1)));
+    }
+    detail_ba.push(Func::constant(Object::atom("in")));
+    detail_ba.push(Func::constant(Object::atom(&b_ft_id)));
+    detail_ba.push(Func::constant(Object::atom("but not in")));
+    detail_ba.push(Func::constant(Object::atom(&a_ft_id)));
+    let viol_ba = make_violation_func(&def.id, &def.text, Func::construction(detail_ba));
+    let check_ba = Func::compose(
+        Func::apply_to_all(viol_ba),
+        Func::compose(Func::filter(not_in_a), Func::compose(Func::DistR, Func::construction(vec![b_facts, a_facts]))),
+    );
 
-        for tuple in a_tuples.difference(&b_tuples) {
-            let desc = common_nouns.iter().zip(tuple.iter())
-                .map(|(n, v)| format!("{} '{}'", n, v))
-                .collect::<Vec<_>>().join(", ");
-            violations.push(Object::seq(vec![
-                Object::atom(&id),
-                Object::atom(&text),
-                Object::seq(vec![
-                    Object::atom("Equality violation:"),
-                    Object::atom(&format!("({})", desc)),
-                    Object::atom("in"),
-                    Object::atom(&a_ft_id),
-                    Object::atom("but not in"),
-                    Object::atom(&b_ft_id),
-                ]),
-            ]));
-        }
-
-        for tuple in b_tuples.difference(&a_tuples) {
-            let desc = common_nouns.iter().zip(tuple.iter())
-                .map(|(n, v)| format!("{} '{}'", n, v))
-                .collect::<Vec<_>>().join(", ");
-            violations.push(Object::seq(vec![
-                Object::atom(&id),
-                Object::atom(&text),
-                Object::seq(vec![
-                    Object::atom("Equality violation:"),
-                    Object::atom(&format!("({})", desc)),
-                    Object::atom("in"),
-                    Object::atom(&b_ft_id),
-                    Object::atom("but not in"),
-                    Object::atom(&a_ft_id),
-                ]),
-            ]));
-        }
-
-        if violations.is_empty() { Object::phi() } else { Object::Seq(violations) }
-    }))
+    // V = union of both directions (Theorem 3 step 3).
+    // Construction produces nested seqs; decode_violations recurses.
+    Func::construction(vec![check_ab, check_ba])
 }
 
 /// Deontic: Forbidden constraint.
