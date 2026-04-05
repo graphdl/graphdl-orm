@@ -38,7 +38,6 @@ vi.mock('./engine', () => {
   return {
     parseReadings: vi.fn(parse),
     parseReadingsWithNouns: vi.fn((markdown: string, domain: string, _existingNouns: string) => parse(markdown, domain)),
-    reconstructIR: vi.fn(async () => '{}'),
     ensureWasm: vi.fn(),
   }
 })

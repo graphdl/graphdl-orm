@@ -9,7 +9,7 @@ describe('nounToSlug', () => {
   })
 })
 
-const mockIR = {
+const mockSchema = {
   nouns: {
     Organization: { objectType: 'entity' },
     App: { objectType: 'entity' },
@@ -50,7 +50,7 @@ const mockIR = {
 
 describe('buildConstraintGraph', () => {
   it('derives parent-child from UC constraints between entity nouns', () => {
-    const graph = buildConstraintGraph(mockIR)
+    const graph = buildConstraintGraph(mockSchema)
     const orgChildren = graph.children.get('Organization')
     expect(orgChildren).toEqual(
       expect.arrayContaining([
@@ -61,13 +61,13 @@ describe('buildConstraintGraph', () => {
   })
 
   it('excludes value type nouns from graph', () => {
-    const graph = buildConstraintGraph(mockIR)
+    const graph = buildConstraintGraph(mockSchema)
     const orgChildren = graph.children.get('Organization') || []
     expect(orgChildren.every(c => c.noun !== 'Name')).toBe(true)
   })
 
   it('handles multi-level nesting', () => {
-    const graph = buildConstraintGraph(mockIR)
+    const graph = buildConstraintGraph(mockSchema)
     const domainChildren = graph.children.get('Domain')
     expect(domainChildren).toEqual(
       expect.arrayContaining([
@@ -78,7 +78,7 @@ describe('buildConstraintGraph', () => {
 })
 
 describe('resolvePath', () => {
-  const graph = buildConstraintGraph(mockIR)
+  const graph = buildConstraintGraph(mockSchema)
 
   it('resolves root path', () => {
     const result = resolvePath('/arest/', graph)
@@ -174,7 +174,7 @@ describe('handleRoot', () => {
 })
 
 describe('handleArestRequest', () => {
-  const testIR = {
+  const testSchema = {
     nouns: {
       Organization: { objectType: 'entity' },
       App: { objectType: 'entity' },
@@ -223,7 +223,7 @@ describe('handleArestRequest', () => {
     const result = await handleArestRequest({
       path: '/arest/organizations/acme',
       method: 'GET',
-      ir: testIR,
+      ir: testSchema,
       registry: mockRegistry as any,
       getStub: mockGetStub as any,
     })
@@ -239,7 +239,7 @@ describe('handleArestRequest', () => {
     const result = await handleArestRequest({
       path: '/arest/organizations/acme/apps',
       method: 'GET',
-      ir: testIR,
+      ir: testSchema,
       registry: mockRegistry as any,
       getStub: mockGetStub as any,
     })
@@ -253,7 +253,7 @@ describe('handleArestRequest', () => {
     const result = await handleArestRequest({
       path: '/arest/',
       method: 'GET',
-      ir: testIR,
+      ir: testSchema,
       registry: mockRegistry as any,
       getStub: mockGetStub as any,
       userEmail: 'test@example.com',
@@ -274,7 +274,7 @@ describe('handleArestRequest', () => {
     const result = await handleArestRequest({
       path: '/arest/organizations/acme/nonexistent',
       method: 'GET',
-      ir: testIR,
+      ir: testSchema,
       registry: mockRegistry as any,
       getStub: mockGetStub as any,
     })
@@ -283,7 +283,7 @@ describe('handleArestRequest', () => {
 })
 
 describe('HATEOAS walkability', () => {
-  const testIR = {
+  const testSchema = {
     nouns: {
       Organization: { objectType: 'entity' },
       App: { objectType: 'entity' },
@@ -347,7 +347,7 @@ describe('HATEOAS walkability', () => {
     const root = await handleArestRequest({
       path: '/arest/',
       method: 'GET',
-      ir: testIR,
+      ir: testSchema,
       registry: mockRegistry as any,
       getStub: mockGetStub as any,
       userEmail: 'test@example.com',
@@ -364,7 +364,7 @@ describe('HATEOAS walkability', () => {
     const org = await handleArestRequest({
       path: orgHref,
       method: 'GET',
-      ir: testIR,
+      ir: testSchema,
       registry: mockRegistry as any,
       getStub: mockGetStub as any,
     })
@@ -379,7 +379,7 @@ describe('HATEOAS walkability', () => {
     const apps = await handleArestRequest({
       path: appsHref,
       method: 'GET',
-      ir: testIR,
+      ir: testSchema,
       registry: mockRegistry as any,
       getStub: mockGetStub as any,
     })

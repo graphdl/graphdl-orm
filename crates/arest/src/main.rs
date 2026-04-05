@@ -36,6 +36,8 @@ mod verbalize;
 mod arest;
 #[allow(dead_code)]
 mod validate;
+#[allow(dead_code)]
+mod induce;
 
 use types::{Domain, Population};
 use query::QueryPredicate;

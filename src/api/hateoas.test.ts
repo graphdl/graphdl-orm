@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import { deriveLinks, deriveSchema } from './hateoas'
 
-const mockIR = {
+const mockSchema = {
   nouns: {
     Organization: { objectType: 'entity' },
     App: { objectType: 'entity' },
@@ -49,7 +49,7 @@ describe('deriveLinks', () => {
       noun: 'Organization',
       id: 'acme',
       basePath: '/arest/organizations',
-      ir: mockIR,
+      ir: mockSchema,
     })
     expect(links.self).toEqual({ href: '/arest/organizations/acme' })
     expect(links.apps).toEqual({ href: '/arest/organizations/acme/apps', factType: 'App_belongs_to_Organization' })
@@ -61,7 +61,7 @@ describe('deriveLinks', () => {
       noun: 'App',
       id: 'support-app',
       basePath: '/arest/organizations/acme/apps',
-      ir: mockIR,
+      ir: mockSchema,
       parentPath: '/arest/organizations/acme',
     })
     expect(links.self).toEqual({ href: '/arest/organizations/acme/apps/support-app' })
@@ -73,7 +73,7 @@ describe('deriveLinks', () => {
       noun: 'Organization',
       id: 'acme',
       basePath: '/arest/organizations',
-      ir: mockIR,
+      ir: mockSchema,
     })
     expect(links.name).toBeUndefined()
   })
@@ -83,7 +83,7 @@ describe('deriveLinks', () => {
       noun: 'Organization',
       id: 'acme',
       basePath: '/arest/organizations',
-      ir: mockIR,
+      ir: mockSchema,
       transitions: [
         { event: 'archive', targetStatus: 'archived', transitionId: 't1', targetStatusId: 'ts1' },
       ],
@@ -95,7 +95,7 @@ describe('deriveLinks', () => {
     const links = deriveLinks({
       noun: 'Organization',
       basePath: '/arest/organizations',
-      ir: mockIR,
+      ir: mockSchema,
     })
     expect(links.self).toEqual({ href: '/arest/organizations' })
     expect(links.create).toEqual({ href: '/arest/organizations', method: 'POST' })
@@ -104,7 +104,7 @@ describe('deriveLinks', () => {
 
 describe('deriveSchema', () => {
   it('derives fields from fact types involving the noun', () => {
-    const schema = deriveSchema('Organization', mockIR)
+    const schema = deriveSchema('Organization', mockSchema)
     expect(schema.fields).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ name: 'Name', role: 'attribute', factType: 'Organization_has_Name' }),
@@ -114,9 +114,9 @@ describe('deriveSchema', () => {
 
   it('marks fields required when MC constraint exists', () => {
     const irWithMC = {
-      ...mockIR,
+      ...mockSchema,
       constraints: [
-        ...mockIR.constraints,
+        ...mockSchema.constraints,
         { id: 'mc1', kind: 'MC', modality: 'alethic', text: 'Each Organization has at least one Name', spans: [{ factTypeId: 'Organization_has_Name', roleIndex: 0 }], deonticOperator: null, entity: null, minOccurrence: null, maxOccurrence: null },
       ],
     }
@@ -126,14 +126,14 @@ describe('deriveSchema', () => {
   })
 
   it('marks entity-type fields as reference role', () => {
-    const schema = deriveSchema('App', mockIR)
+    const schema = deriveSchema('App', mockSchema)
     const orgField = schema.fields.find((f: any) => f.name === 'Organization')
     expect(orgField?.role).toBe('reference')
     expect(orgField?.factType).toBe('App_belongs_to_Organization')
   })
 
   it('includes applicable constraints', () => {
-    const schema = deriveSchema('App', mockIR)
+    const schema = deriveSchema('App', mockSchema)
     expect(schema.constraints).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ text: 'Each App belongs to at most one Organization', kind: 'UC' }),

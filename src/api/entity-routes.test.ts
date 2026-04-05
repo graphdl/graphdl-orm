@@ -102,8 +102,8 @@ describe('entity-routes', () => {
   // ── handleCreateEntity ──────────────────────────────────────────────
 
   it('handleCreateEntity creates cell and indexes in registry', async () => {
-    const stub = { put: vi.fn().mockResolvedValue({ id: 'new1', type: 'Noun', data: { name: 'Customer' } }) }
-    const registry = { indexEntity: vi.fn().mockResolvedValue(undefined) }
+    const stub = { put: vi.fn().mockResolvedValue({ id: 'new1', type: 'Noun', data: { name: 'Customer' } }), delete: vi.fn() }
+    const registry = { indexEntity: vi.fn().mockResolvedValue(undefined), deindexEntity: vi.fn().mockResolvedValue(undefined) }
     const result = await handleCreateEntity('Noun', 'tickets', { name: 'Customer' }, () => stub, registry)
     expect(result.id).toBeDefined()
     expect(result.type).toBe('Noun')
@@ -114,8 +114,8 @@ describe('entity-routes', () => {
   // ── handleDeleteEntity ──────────────────────────────────────────────
 
   it('handleDeleteEntity removes cell and deindexes', async () => {
-    const stub = { delete: vi.fn().mockResolvedValue({ id: 'e1' }) }
-    const registry = { deindexEntity: vi.fn().mockResolvedValue(undefined) }
+    const stub = { delete: vi.fn().mockResolvedValue({ id: 'e1' }), put: vi.fn() }
+    const registry = { indexEntity: vi.fn().mockResolvedValue(undefined), deindexEntity: vi.fn().mockResolvedValue(undefined) }
     const result = await handleDeleteEntity('e1', stub, registry, 'Noun')
     expect(result).toEqual({ id: 'e1', deleted: true })
     expect(stub.delete).toHaveBeenCalled()
@@ -123,8 +123,8 @@ describe('entity-routes', () => {
   })
 
   it('handleDeleteEntity returns null when cell not found', async () => {
-    const stub = { delete: vi.fn().mockResolvedValue(null) }
-    const registry = { deindexEntity: vi.fn().mockResolvedValue(undefined) }
+    const stub = { delete: vi.fn().mockResolvedValue(null), put: vi.fn() }
+    const registry = { indexEntity: vi.fn().mockResolvedValue(undefined), deindexEntity: vi.fn().mockResolvedValue(undefined) }
     const result = await handleDeleteEntity('e1', stub, registry, 'Noun')
     expect(result).toBeNull()
     expect(registry.deindexEntity).not.toHaveBeenCalled()

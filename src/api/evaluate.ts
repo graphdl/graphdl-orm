@@ -6,7 +6,7 @@
 
 import { json, error } from 'itty-router'
 import type { Env } from '../types'
-import { loadDomainSchema, evaluateConstraints, forwardChain } from './engine'
+import { loadDomainSchema, evaluateConstraints, forwardChain, system } from './engine'
 
 function getEntityDO(env: Env, id: string) {
   return env.ENTITY_DB.get(env.ENTITY_DB.idFromName(id))
@@ -37,7 +37,7 @@ export async function handleEvaluate(request: Request, env: Env): Promise<Respon
   }
 
   // Evaluate constraints against the response
-  const violations = evaluateConstraints(body.response, body.population || { facts: {} })
+  const violations = evaluateConstraints(body.response.text, JSON.stringify(body.population || { facts: {} }))
 
   return json({ violations, evaluated: true })
 }
@@ -60,7 +60,6 @@ export async function handleSynthesize(request: Request, env: Env): Promise<Resp
     return error(400, { errors: [{ message: `Failed to load schema for domain: ${body.domainId}` }] })
   }
 
-  const { synthesize_noun } = await import('../../crates/arest/pkg/arest.js')
-  const result = synthesize_noun(handle, body.noun, body.depth || 1)
-  return json(result)
+  const result = system(handle, 'synthesize', body.noun)
+  return json(JSON.parse(result))
 }

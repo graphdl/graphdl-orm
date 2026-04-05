@@ -6,7 +6,7 @@
  * The entity decides how, not the router.
  */
 
-import { loadDomainSchema, buildPopulation, forwardChain, reconstructIR } from './engine'
+import { loadDomainSchema, buildPopulation, forwardChain } from './engine'
 
 // ── Types ───────────────────────────────────────────────────────────
 
@@ -165,7 +165,7 @@ async function resolveExternal(data: FactData, page: number, limit: number): Pro
     ? await fetch(fetchUrl, { headers }).catch(() => null)
     : null
 
-  const raw = response?.ok ? await response.json().catch(() => null) : null
+  const raw: any = response?.ok ? await response.json().catch(() => null) : null
   const rawDocs = Array.isArray(raw) ? raw : raw?.docs || (raw ? [raw] : [])
   const docs = rawDocs.map((item: any, i: number) => ({
     id: item.id || item._id || String(i),
@@ -200,8 +200,8 @@ async function buildTrace(
   const derived = forwardChain(popJson)
   const entityId = data.id || ''
   return derived
-    .filter(fact => fact.bindings.some(([, v]) => v === entityId))
-    .map(fact => ({ rule: fact.derivedBy, reading: fact.reading, bindings: fact.bindings }))
+    .filter((fact: any) => fact.bindings.some(([, v]: [any, any]) => v === entityId))
+    .map((fact: any) => ({ rule: fact.derivedBy, reading: fact.reading, bindings: fact.bindings }))
 }
 
 async function resolveLocalDetail(data: FactData): Promise<SystemOutput> {

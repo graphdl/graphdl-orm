@@ -695,6 +695,48 @@ pub fn domain_to_population(d: &Domain) -> Population {
     Population { facts }
 }
 
+/// Materialize Domain into entity cells for EntityDB.
+pub fn domain_to_entities(d: &Domain, slug: &str) -> String {
+    let mut e: Vec<serde_json::Value> = vec![];
+    for (n, def) in &d.nouns {
+        let mut data = serde_json::json!({"name": n, "objectType": &def.object_type});
+        if let Some(s) = d.subtypes.get(n) { data["superType"] = serde_json::json!(s); }
+        if let Some(v) = d.enum_values.get(n) { data["enumValues"] = serde_json::json!(v); }
+        if let Some(r) = d.ref_schemes.get(n) { data["referenceScheme"] = serde_json::json!(r); }
+        if let Some(o) = d.objectifications.get(n) { data["objectifies"] = serde_json::json!(o); }
+        e.push(serde_json::json!({"id": format!("noun:{}", n), "type": "Noun", "domain": slug, "data": data}));
+    }
+    for (id, ft) in &d.fact_types {
+        e.push(serde_json::json!({"id": format!("gs:{}", id), "type": "Graph Schema", "domain": slug, "data": {"name": id, "reading": ft.reading}}));
+        for (i, role) in ft.roles.iter().enumerate() {
+            e.push(serde_json::json!({"id": format!("role:{}:{}", id, i), "type": "Role", "domain": slug, "data": {"nounName": role.noun_name, "position": i, "graphSchema": id}}));
+        }
+        e.push(serde_json::json!({"id": format!("reading:{}", id), "type": "Reading", "domain": slug, "data": {"text": ft.reading, "graphSchema": id}}));
+    }
+    for c in &d.constraints {
+        let cid = if c.id.is_empty() { &c.text } else { &c.id };
+        e.push(serde_json::json!({"id": format!("constraint:{}", cid), "type": "Constraint", "domain": slug,
+            "data": {"kind": c.kind, "modality": c.modality, "text": c.text, "spans": c.spans, "entity": c.entity, "minOccurrence": c.min_occurrence, "maxOccurrence": c.max_occurrence}}));
+    }
+    for (n, sm) in &d.state_machines {
+        e.push(serde_json::json!({"id": format!("sm:{}", n), "type": "State Machine Definition", "domain": slug, "data": {"name": n, "forNoun": sm.noun_name}}));
+        for s in &sm.statuses { e.push(serde_json::json!({"id": format!("status:{}:{}", n, s), "type": "Status", "domain": slug, "data": {"name": s, "stateMachineDefinition": n}})); }
+        for t in &sm.transitions { e.push(serde_json::json!({"id": format!("transition:{}:{}:{}", n, t.from, t.event), "type": "Transition", "domain": slug, "data": {"from": t.from, "to": t.to, "event": t.event, "stateMachineDefinition": n}})); }
+    }
+    for r in &d.derivation_rules {
+        e.push(serde_json::json!({"id": format!("rule:{}", r.id), "type": "Derivation Rule", "domain": slug,
+            "data": {"ruleId": r.id, "text": r.text, "antecedentFactTypeIds": serde_json::to_string(&r.antecedent_fact_type_ids).unwrap_or_default(),
+                "consequentFactTypeId": r.consequent_fact_type_id, "kind": serde_json::to_string(&r.kind).unwrap_or_default(),
+                "joinOn": serde_json::to_string(&r.join_on).unwrap_or_default(), "matchOn": serde_json::to_string(&r.match_on).unwrap_or_default(),
+                "consequentBindings": serde_json::to_string(&r.consequent_bindings).unwrap_or_default()}}));
+    }
+    for f in &d.general_instance_facts {
+        e.push(serde_json::json!({"id": format!("instance-fact:{}:{}:{}", f.subject_noun, f.subject_value, f.field_name), "type": "Instance Fact", "domain": slug,
+            "data": {"subjectNoun": f.subject_noun, "subjectValue": f.subject_value, "fieldName": f.field_name, "objectNoun": f.object_noun, "objectValue": f.object_value}}));
+    }
+    serde_json::to_string(&e).unwrap_or_else(|_| "[]".into())
+}
+
 pub fn parse_markdown(input: &str) -> Result<Domain, String> {
     let mut ir = Domain {
         domain: String::new(), nouns: HashMap::new(), fact_types: HashMap::new(),
