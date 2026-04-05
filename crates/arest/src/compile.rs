@@ -264,6 +264,29 @@ fn extract_facts_from_pop(ft_id: &str) -> Func {
     Func::compose(get_or_phi, find_ft)
 }
 
+/// Find all instances of a noun across all fact types in a population Object.
+/// instances_of_noun(noun) : pop -> <val1, val2, ...>
+fn instances_of_noun_func(noun_name: &str) -> Func {
+    // For each ft entry <ft_id, <facts>>, get facts (Selector(2)),
+    // for each fact, filter bindings matching noun, extract values.
+    let match_noun = Func::compose(Func::Eq, Func::construction(vec![
+        Func::Selector(1),
+        Func::constant(Object::atom(noun_name)),
+    ]));
+    let extract_val = Func::compose(
+        Func::apply_to_all(Func::Selector(2)),
+        Func::filter(match_noun),
+    );
+    // For each fact: extract_val applied to the fact's bindings (the fact IS the bindings seq)
+    let vals_per_ft = Func::compose(
+        Func::Concat,
+        Func::compose(Func::apply_to_all(extract_val), Func::Selector(2)),
+    );
+    // For each ft entry in pop: vals_per_ft
+    // Then concat all results
+    Func::compose(Func::Concat, Func::apply_to_all(vals_per_ft))
+}
+
 /// Build a Func that extracts facts for multiple fact type IDs.
 /// Returns the concatenation of all facts from all matching fact types.
 fn extract_facts_multi(ft_ids: &[String]) -> Func {
@@ -1188,32 +1211,59 @@ fn compile_subtype_inheritance(ir: &Domain) -> Vec<CompiledDerivation> {
             let id = format!("_subtype_{}_{}", sub, sup);
             let text = format!("{} is a subtype of {} â€” inherits fact types", sub, sup);
 
-            // Operate directly on the population Object â€” no decode/re-encode.
-            let func = crate::ast::Func::Native(Arc::new(move |pop_obj: &crate::ast::Object| {
-                let mut derived = Vec::new();
+            // Pure Func: for each subtype instance, for each supertype fact type,
+            // check if instance participates. If not, derive inherited fact.
+            let instances = instances_of_noun_func(&sub);
 
-                // Find all instances of the subtype in the population
-                let sub_instances = obj_instances_of(pop_obj, &sub);
+            // For each supertype fact type, build a check-and-derive Func.
+            let mut ft_checks: Vec<Func> = Vec::new();
+            for (ft_id, reading, role_idx) in &sft {
+                let ft_facts = extract_facts_from_pop(ft_id);
 
-                for (ft_id, reading, _role_idx) in &sft {
-                    for instance in &sub_instances {
-                        // Check if this instance already participates in this fact type
-                        if !obj_participates_in(pop_obj, instance, &sup, ft_id) {
-                            derived.push(obj_derived_fact(
-                                ft_id,
-                                reading,
-                                &[(sup.clone(), instance.clone())],
-                            ));
-                        }
-                    }
-                }
+                // participates: <instance, all_ft_facts> -> T if instance found
+                let inst_in_fact = Func::compose(Func::Eq, Func::construction(vec![
+                    Func::compose(role_value(*role_idx), Func::Selector(2)), // candidate's role value
+                    Func::Selector(1),                                       // instance value
+                ]));
+                let participates = Func::compose(
+                    Func::compose(Func::Not, Func::NullTest),
+                    Func::compose(Func::filter(inst_in_fact), Func::DistL),
+                );
 
-                if derived.is_empty() {
-                    crate::ast::Object::phi()
-                } else {
-                    crate::ast::Object::Seq(derived)
-                }
-            }));
+                // Derive fact when NOT participating
+                let not_participates = Func::compose(Func::Not, participates);
+
+                let derived_fact = Func::construction(vec![
+                    Func::constant(Object::atom(ft_id)),
+                    Func::constant(Object::atom(reading)),
+                    Func::construction(vec![Func::construction(vec![
+                        Func::constant(Object::atom(&sup)),
+                        Func::Selector(1), // instance value
+                    ])]),
+                ]);
+
+                // For each <instance, ft_facts>: if not participates, derive
+                let check_one = Func::condition(
+                    not_participates,
+                    Func::construction(vec![derived_fact]),
+                    Func::constant(Object::phi()),
+                );
+
+                // distr . [instances, ft_facts] -> <inst, ft_facts> pairs
+                ft_checks.push(Func::compose(
+                    Func::Concat,
+                    Func::compose(
+                        Func::apply_to_all(check_one),
+                        Func::compose(Func::DistR, Func::construction(vec![instances.clone(), ft_facts])),
+                    ),
+                ));
+            }
+
+            let func = match ft_checks.len() {
+                0 => Func::constant(Object::phi()),
+                1 => ft_checks.into_iter().next().unwrap(),
+                _ => Func::construction(ft_checks),
+            };
             derivations.push(CompiledDerivation {
                 id,
                 text,
