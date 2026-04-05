@@ -2809,80 +2809,91 @@ fn compile_forbidden_ast(ir: &Domain, def: &ConstraintDef) -> Func {
 /// Uses Func::Selector(1) for response_text and Func::Selector(2) for sender_identity
 /// from the eval context <response_text, sender_identity, population>.
 fn compile_obligatory_ast(ir: &Domain, def: &ConstraintDef) -> Func {
-    let id = def.id.clone();
-    let text = def.text.clone();
     let obligatory_values = collect_enum_values(ir, &def.spans);
     let checks_sender = def.text.to_lowercase().contains("senderidentity");
-    let entity_scope = def.entity.clone();
-
-    let text_keywords = if obligatory_values.is_empty() {
-        extract_constraint_keywords(&text)
-    } else {
-        Vec::new()
-    };
-
     let is_response_constraint = def.entity.as_ref()
         .map_or(false, |e| e.to_lowercase().contains("response"));
 
-    Func::Native(Arc::new(move |ctx: &Object| {
-        let defs = HashMap::new();
-        let response_text = crate::ast::apply(&Func::Selector(1), ctx, &defs);
-        let response_str = response_text.as_atom().unwrap_or("").to_string();
-        let lower_text = response_str.to_lowercase();
+    let response = Func::Selector(1);
 
-        // Entity scoping: skip for response constraints (they always apply)
-        if !is_response_constraint {
-            if let Some(ref entity) = entity_scope {
-                let entity_lower = entity.to_lowercase();
-                let entity_compact: String = entity.chars().filter(|c| !c.is_whitespace()).collect();
-                let entity_compact_lower = entity_compact.to_lowercase();
-                if !lower_text.contains(&entity_lower) && !lower_text.contains(&entity_compact_lower) {
-                    return Object::phi();
-                }
-            }
-        }
+    // Entity gate (same as forbidden)
+    let entity_gate = match (&def.entity, is_response_constraint) {
+        (Some(entity), false) => Some(Func::compose(Func::Contains, Func::construction(vec![
+            response.clone(), Func::constant(Object::atom(entity)),
+        ]))),
+        _ => None,
+    };
 
-        let mut violations = Vec::new();
+    // Build checks for each noun's obligatory values.
+    // For each (noun, values): filter values contained in response.
+    // If filter result is empty (NullTest), violation.
+    let mut checks: Vec<Func> = Vec::new();
 
-        // Enum-based check
-        for (noun_name, enum_vals) in &obligatory_values {
-            let found = enum_vals.iter().any(|val| lower_text.contains(&val.to_lowercase()));
-            if !found {
-                violations.push(Object::seq(vec![
-                    Object::atom(&id),
-                    Object::atom(&text),
-                    Object::seq(vec![
-                        Object::atom("Response missing obligatory"),
-                        Object::atom(noun_name),
-                        Object::atom(&format!("expected one of {:?}", enum_vals)),
-                    ]),
-                ]));
-            }
-        }
+    for (noun_name, enum_vals) in &obligatory_values {
+        let val_atoms: Vec<Object> = enum_vals.iter().map(|v| Object::atom(v)).collect();
+        let vals_const = Func::constant(Object::Seq(val_atoms));
 
-        // Sender identity check
-        if checks_sender {
-            let sender_obj = crate::ast::apply(&Func::Selector(2), ctx, &defs);
-            let sender_empty = match sender_obj.as_atom() {
-                Some(s) => s.is_empty(),
-                None => true,
-            };
-            if sender_empty {
-                violations.push(Object::seq(vec![
-                    Object::atom(&id),
-                    Object::atom(&text),
-                    Object::seq(vec![
-                        Object::atom("Response missing obligatory SenderIdentity"),
-                    ]),
-                ]));
-            }
-        }
+        // Filter values found in response: contains . [response, value]
+        let val_in_response = Func::compose(Func::Contains, Func::construction(vec![
+            Func::Selector(2), // response text (from distr pair)
+            Func::Selector(1), // value atom
+        ]));
 
-        // Text-based: include the obligation as metadata
-        let _ = &text_keywords;
+        let found_any = Func::compose(
+            Func::compose(Func::Not, Func::NullTest),
+            Func::compose(
+                Func::filter(val_in_response),
+                Func::compose(Func::DistR, Func::construction(vec![vals_const, response.clone()])),
+            ),
+        );
 
-        if violations.is_empty() { Object::phi() } else { Object::Seq(violations) }
-    }))
+        // Condition: if NOT found_any -> violation
+        let detail = Func::construction(vec![
+            Func::constant(Object::atom("Response missing obligatory")),
+            Func::constant(Object::atom(noun_name)),
+        ]);
+        let viol = make_violation_func(&def.id, &def.text, detail);
+
+        checks.push(Func::condition(
+            found_any,
+            Func::constant(Object::phi()),
+            Func::construction(vec![Func::compose(viol, Func::constant(Object::phi()))]),
+        ));
+    }
+
+    // Sender identity check: NullTest . Selector(2)
+    if checks_sender {
+        let sender_detail = Func::construction(vec![
+            Func::constant(Object::atom("Response missing obligatory SenderIdentity")),
+        ]);
+        let sender_viol = make_violation_func(&def.id, &def.text, sender_detail);
+
+        // Sender empty = Eq . [Selector(2), ""] OR NullTest . Selector(2)
+        let sender_empty = Func::compose(Func::Or, Func::construction(vec![
+            Func::compose(Func::Eq, Func::construction(vec![
+                Func::Selector(2),
+                Func::constant(Object::atom("")),
+            ])),
+            Func::compose(Func::NullTest, Func::Selector(2)),
+        ]));
+
+        checks.push(Func::condition(
+            sender_empty,
+            Func::construction(vec![Func::compose(sender_viol, Func::constant(Object::phi()))]),
+            Func::constant(Object::phi()),
+        ));
+    }
+
+    let core = match checks.len() {
+        0 => Func::constant(Object::phi()),
+        1 => checks.into_iter().next().unwrap(),
+        _ => Func::construction(checks), // nested, decode_violations handles
+    };
+
+    match entity_gate {
+        Some(gate) => Func::condition(gate, core, Func::constant(Object::phi())),
+        None => core,
+    }
 }
 
 /// Extract lowercase keywords from a deontic constraint text.
