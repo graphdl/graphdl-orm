@@ -2386,62 +2386,84 @@ fn compile_uniqueness_ast(_ir: &Domain, def: &ConstraintDef) -> Func {
 /// For each entity instance of the constrained noun, check it participates
 /// in the required fact type.
 fn compile_mandatory_ast(_ir: &Domain, def: &ConstraintDef) -> Func {
-    let id = def.id.clone();
-    let text = def.text.clone();
     let spans = resolve_spans(_ir, &def.spans);
 
-    let span_data: Vec<(Func, String, String)> = spans.iter()
-        .map(|s| (extract_facts_func(&s.fact_type_id), s.noun_name.clone(), s.reading.clone()))
-        .collect();
+    // Build a pure Func check per span, then Concat to flatten.
+    let mut span_checks: Vec<Func> = Vec::new();
 
-    Func::Native(Arc::new(move |ctx: &Object| {
-        let defs = HashMap::new();
+    for span in &spans {
+        let noun_name = &span.noun_name;
+        let reading = &span.reading;
 
-        // Get the full population to find all instances of each noun
-        let pop_obj = crate::ast::apply(&Func::Selector(3), ctx, &defs);
-        let population = decode_population_object(&pop_obj);
+        // instances of this noun from the eval context population
+        // instances_of_noun_func(noun) : pop -> <val1, val2, ...>
+        // Compose with Selector(3) to extract population from ctx.
+        let instances = Func::compose(instances_of_noun_func(noun_name), Func::Selector(3));
 
-        let mut violations = Vec::new();
-        for (extractor, noun_name, reading) in &span_data {
-            let facts_obj = crate::ast::apply(extractor, ctx, &defs);
+        // facts of the constrained fact type from eval context
+        let ft_facts = extract_facts_func(&span.fact_type_id);
 
-            let all_instances = instances_of(noun_name, &population);
+        // binding_match: <instance, <noun, val>> -> T if noun == noun_name AND val == instance
+        let noun_const = Func::constant(Object::atom(noun_name));
+        let binding_match = Func::compose(Func::And, Func::construction(vec![
+            Func::compose(Func::Eq, Func::construction(vec![
+                Func::compose(Func::Selector(1), Func::Selector(2)),  // noun from binding
+                noun_const,
+            ])),
+            Func::compose(Func::Eq, Func::construction(vec![
+                Func::compose(Func::Selector(2), Func::Selector(2)),  // val from binding
+                Func::Selector(1),                                     // instance from outer pair
+            ])),
+        ]));
 
-            for instance in &all_instances {
-                let has_fact = match facts_obj.as_seq() {
-                    Some(facts) => facts.iter().any(|fact| {
-                        match fact.as_seq() {
-                            Some(bindings) => bindings.iter().any(|b| {
-                                match b.as_seq() {
-                                    Some(pair) if pair.len() == 2 =>
-                                        pair[0].as_atom() == Some(noun_name) &&
-                                        pair[1].as_atom() == Some(instance),
-                                    _ => false,
-                                }
-                            }),
-                            None => false,
-                        }
-                    }),
-                    None => false,
-                };
-                if !has_fact {
-                    violations.push(Object::seq(vec![
-                        Object::atom(&id),
-                        Object::atom(&text),
-                        Object::seq(vec![
-                            Object::atom("Mandatory violation:"),
-                            Object::atom(noun_name),
-                            Object::atom(&format!("'{}'", instance)),
-                            Object::atom("does not participate in"),
-                            Object::atom(reading),
-                        ]),
-                    ]));
-                }
-            }
-        }
+        // fact_mentions: <instance, fact> -> T if fact has binding <noun, instance>
+        // DistL on <instance, fact_bindings> -> <<instance, binding1>, ...>
+        // Filter(binding_match) keeps matches
+        // not . NullTest -> T if any match found
+        let fact_mentions = Func::compose(
+            Func::compose(Func::Not, Func::NullTest),
+            Func::compose(Func::filter(binding_match), Func::DistL),
+        );
 
-        if violations.is_empty() { Object::phi() } else { Object::Seq(violations) }
-    }))
+        // not_participating: <instance, all_facts> -> T when NO fact mentions instance
+        // DistL on <instance, all_facts> -> <<instance, fact1>, <instance, fact2>, ...>
+        // Filter(fact_mentions) keeps facts that mention the instance
+        // NullTest -> T if empty (no fact mentions instance)
+        let not_participating = Func::compose(
+            Func::NullTest,
+            Func::compose(Func::filter(fact_mentions), Func::DistL),
+        );
+
+        // detail: <instance, all_facts> -> violation detail sequence
+        let mc_label = String::from("Mandatory violation:");
+        let not_in_msg = String::from("does not participate in");
+        let detail = Func::construction(vec![
+            Func::constant(Object::atom(&mc_label)),
+            Func::constant(Object::atom(noun_name)),
+            Func::Selector(1),  // the instance value
+            Func::constant(Object::atom(&not_in_msg)),
+            Func::constant(Object::atom(reading)),
+        ]);
+        let viol = make_violation_func(&def.id, &def.text, detail);
+
+        // apply_to_all(viol) . Filter(not_participating) . DistR . [instances, ft_facts]
+        // DistR on <instances, ft_facts> -> <<inst1, ft_facts>, <inst2, ft_facts>, ...>
+        let check = Func::compose(
+            Func::apply_to_all(viol),
+            Func::compose(
+                Func::filter(not_participating),
+                Func::compose(Func::DistR, Func::construction(vec![instances, ft_facts])),
+            ),
+        );
+
+        span_checks.push(check);
+    }
+
+    match span_checks.len() {
+        0 => Func::constant(Object::phi()),
+        1 => span_checks.into_iter().next().unwrap(),
+        _ => Func::compose(Func::Concat, Func::construction(span_checks)),
+    }
 }
 
 /// FC: Frequency constraint â€” each value in the constrained role must occur
@@ -2507,9 +2529,6 @@ fn compile_frequency_ast(_ir: &Domain, def: &ConstraintDef) -> Func {
 /// VC: Value constraint â€” each value in the constrained role must be in the
 /// noun's allowed value set (enum_values). Per Halpin Ch 6.3.
 fn compile_value_constraint_ast(ir: &Domain, def: &ConstraintDef) -> Func {
-    let id = def.id.clone();
-    let text = def.text.clone();
-
     // Collect allowed values from the nouns in the spanned fact types
     let spans = resolve_spans(ir, &def.spans);
     let allowed: Vec<(String, HashSet<String>)> = spans.iter().filter_map(|span| {
@@ -2519,49 +2538,69 @@ fn compile_value_constraint_ast(ir: &Domain, def: &ConstraintDef) -> Func {
     }).collect();
 
     // If no enum values found on spanned nouns, check all nouns with enum_values
-    let all_enum_nouns: Vec<(String, HashSet<String>)> = if allowed.is_empty() {
+    let check_nouns: Vec<(String, HashSet<String>)> = if !allowed.is_empty() {
+        allowed
+    } else {
         ir.enum_values.iter().filter_map(|(name, vals)| {
             if vals.is_empty() { return None; }
             Some((name.clone(), vals.iter().cloned().collect::<HashSet<_>>()))
         }).collect()
-    } else {
-        Vec::new()
     };
 
-    Func::Native(Arc::new(move |ctx: &Object| {
-        let defs = HashMap::new();
-        let check_nouns = if !allowed.is_empty() { &allowed } else { &all_enum_nouns };
-        let mut violations = Vec::new();
+    // Build a pure Func check per noun, then Concat to flatten.
+    let mut noun_checks: Vec<Func> = Vec::new();
 
-        // Decode population to scan all facts
-        let pop_obj = crate::ast::apply(&Func::Selector(3), ctx, &defs);
-        let population = decode_population_object(&pop_obj);
+    for (noun_name, valid_values) in &check_nouns {
+        // All instances of this noun from eval context population
+        let instances = Func::compose(instances_of_noun_func(noun_name), Func::Selector(3));
 
-        for (noun_name, valid_values) in check_nouns {
-            for facts in population.facts.values() {
-                for fact in facts {
-                    for (name, val) in &fact.bindings {
-                        if name == noun_name && !valid_values.contains(val) {
-                            let valid_str = valid_values.iter().cloned().collect::<Vec<_>>().join(", ");
-                            violations.push(Object::seq(vec![
-                                Object::atom(&id),
-                                Object::atom(&text),
-                                Object::seq(vec![
-                                    Object::atom("Value constraint violation:"),
-                                    Object::atom(noun_name),
-                                    Object::atom(&format!("'{}'", val)),
-                                    Object::atom("is not in"),
-                                    Object::atom(&format!("{{{}}}", valid_str)),
-                                ]),
-                            ]));
-                        }
-                    }
-                }
-            }
-        }
+        // Allowed values as a constant sequence (compile-time known)
+        let allowed_atoms: Vec<Object> = valid_values.iter()
+            .map(|v| Object::atom(v))
+            .collect();
+        let allowed_const = Func::constant(Object::Seq(allowed_atoms));
 
-        if violations.is_empty() { Object::phi() } else { Object::Seq(violations) }
-    }))
+        // is_allowed: <instance, allowed_seq> -> T if instance is in allowed_seq
+        // DistL on <instance, <v1, v2, ...>> -> <<instance, v1>, <instance, v2>, ...>
+        // Filter(Eq) keeps pairs where instance == vi
+        // NullTest -> T if no match (instance NOT in allowed set)
+        let not_allowed = Func::compose(
+            Func::NullTest,
+            Func::compose(Func::filter(Func::Eq), Func::DistL),
+        );
+
+        // detail: <instance, allowed_seq> -> violation detail
+        let valid_str = valid_values.iter().cloned().collect::<Vec<_>>().join(", ");
+        let vc_label = String::from("Value constraint violation:");
+        let not_in_msg = String::from("is not in");
+        let valid_set_str = format!("{{{}}}", valid_str);
+        let detail = Func::construction(vec![
+            Func::constant(Object::atom(&vc_label)),
+            Func::constant(Object::atom(noun_name)),
+            Func::Selector(1),  // the instance value
+            Func::constant(Object::atom(&not_in_msg)),
+            Func::constant(Object::atom(&valid_set_str)),
+        ]);
+        let viol = make_violation_func(&def.id, &def.text, detail);
+
+        // apply_to_all(viol) . Filter(not_allowed) . DistR . [instances, allowed_const]
+        // DistR on <instances, allowed_const> -> <<inst1, allowed>, <inst2, allowed>, ...>
+        let check = Func::compose(
+            Func::apply_to_all(viol),
+            Func::compose(
+                Func::filter(not_allowed),
+                Func::compose(Func::DistR, Func::construction(vec![instances, allowed_const])),
+            ),
+        );
+
+        noun_checks.push(check);
+    }
+
+    match noun_checks.len() {
+        0 => Func::constant(Object::phi()),
+        1 => noun_checks.into_iter().next().unwrap(),
+        _ => Func::compose(Func::Concat, Func::construction(noun_checks)),
+    }
 }
 
 /// XO/XC/OR: Set-comparison constraint â€” for each entity instance, count how many
