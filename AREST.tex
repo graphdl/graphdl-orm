@@ -388,9 +388,12 @@ where $p(t) = (s_{\mathit{from}}(t) = s) \lor \mathit{anc}(s_{\mathit{from}}(t),
 \end{enumerate}
 Unary fact types ($|R_f| = 1$) are boolean properties with no navigation target. Binary fact types ($|R_f| = 2$) with a single-role UC reduce to the standard parent/child case where the constrained role's noun is the child. For the binary case, the navigation links for an entity $e$ of noun $n$ are:
 \begin{align}
-\mathit{children}(n) &= \pi_{\mathit{noun}(r_c)}\!\left(\mathit{Filter}(\mathit{uc}(r_c) \land \mathit{eq} \circ [\mathit{noun}(\bar{r}_c), \bar{n}]) : F_B\right) \label{eq:children} \\
-\mathit{parent}(n) &= \pi_{\mathit{noun}(\bar{r}_c)}\!\left(\mathit{Filter}(\mathit{uc}(r_c) \land \mathit{eq} \circ [\mathit{noun}(r_c), \bar{n}]) : F_B\right) \label{eq:parent} \\
-\mathit{nav}(e, n) &= \mathit{children}(n) \;\cup\; \mathit{parent}(n) \;\cup\; \mathit{related}(n) \;\cup\; \mathit{peers}(n) \label{eq:nav}
+\mathit{children}(n) &= \pi_{\mathit{noun}(r_c)}\bigl(\mathit{Filter}( \notag \\
+  &\qquad \mathit{uc}(r_c) \land \mathit{eq} \circ [\mathit{noun}(\bar{r}_c), \bar{n}]) : F_B\bigr) \label{eq:children} \\
+\mathit{parent}(n) &= \pi_{\mathit{noun}(\bar{r}_c)}\bigl(\mathit{Filter}( \notag \\
+  &\qquad \mathit{uc}(r_c) \land \mathit{eq} \circ [\mathit{noun}(r_c), \bar{n}]) : F_B\bigr) \label{eq:parent} \\
+\mathit{nav}(e, n) &= \mathit{children}(n) \cup \mathit{parent}(n) \notag \\
+  &\quad \cup\; \mathit{related}(n) \cup \mathit{peers}(n) \label{eq:nav}
 \end{align}
 where $\mathit{related}(n)$ collects all fact types in which $n$ participates as related collections, and $\mathit{peers}(n)$ collects spanning-UC fact types at the appropriate hierarchy level.
 

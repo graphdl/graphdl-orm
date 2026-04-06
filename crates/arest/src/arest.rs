@@ -139,6 +139,16 @@ pub fn apply_command_defs(
         Command::Transition { entity_id, event, domain, current_status } => {
             transition_via_defs(defs, entity_id, event, domain, current_status.as_deref(), population)
         }
+        Command::Query { schema_id, domain: _, target, bindings } => {
+            query_via_defs(defs, schema_id, target, bindings, population)
+        }
+        Command::UpdateEntity { noun, domain, entity_id, fields } => {
+            update_via_defs(defs, noun, domain, entity_id, fields, population)
+        }
+        Command::LoadReadings { markdown, domain } => {
+            apply_load_readings(markdown, domain, population)
+        }
+        #[allow(unreachable_patterns)]
         _ => CommandResult {
             entities: vec![],
             status: None,
@@ -424,6 +434,151 @@ fn transition_via_defs(
         derived_count: 0,
         rejected: false,
         population: new_pop,
+    }
+}
+
+// -- query via DEFS: partial application of graph schema --
+
+fn query_via_defs(
+    defs: &std::collections::HashMap<String, ast::Func>,
+    schema_id: &str,
+    target: &str,
+    bindings: &std::collections::HashMap<String, String>,
+    population: &Population,
+) -> CommandResult {
+    // Look up schema role names from population metadata
+    let role_names: Vec<String> = population.facts.get("Role")
+        .map(|roles| {
+            let mut matched: Vec<(usize, String)> = roles.iter()
+                .filter(|r| r.bindings.iter().any(|(k, v)| k == "graphSchema" && v == schema_id))
+                .filter_map(|r| {
+                    let name = r.bindings.iter().find(|(k, _)| k == "nounName").map(|(_, v)| v.clone())?;
+                    let pos: usize = r.bindings.iter().find(|(k, _)| k == "position").and_then(|(_, v)| v.parse().ok()).unwrap_or(0);
+                    Some((pos, name))
+                })
+                .collect();
+            matched.sort_by_key(|(p, _)| *p);
+            matched.into_iter().map(|(_, n)| n).collect()
+        })
+        .unwrap_or_default();
+
+    let mut filter_pairs: Vec<(usize, String)> = Vec::new();
+    let mut target_role: usize = 0;
+    for (i, name) in role_names.iter().enumerate() {
+        if name == target { target_role = i + 1; }
+        if let Some(value) = bindings.get(name) {
+            filter_pairs.push((i + 1, value.clone()));
+        }
+    }
+
+    let filter_refs: Vec<(usize, &str)> = filter_pairs.iter().map(|(i, v)| (*i, v.as_str())).collect();
+    let schema = crate::compile::CompiledSchema {
+        id: schema_id.to_string(),
+        reading: String::new(),
+        construction: defs.get(&format!("schema:{}", schema_id)).cloned().unwrap_or(ast::Func::Id),
+        role_names: role_names.clone(),
+    };
+    let results = crate::query::query_with_ast(population, &schema, target_role, &filter_refs);
+
+    let mut data = std::collections::HashMap::new();
+    data.insert(String::from("matches"), results.join(","));
+    data.insert(String::from("count"), results.len().to_string());
+
+    CommandResult {
+        entities: vec![EntityResult {
+            id: format!("query:{}", schema_id),
+            entity_type: String::from("QueryResult"),
+            data,
+        }],
+        status: None,
+        transitions: vec![],
+        violations: vec![],
+        derived_count: 0,
+        rejected: false,
+        population: population.clone(),
+    }
+}
+
+// -- update via DEFS: replace fields then create pipeline --
+
+fn update_via_defs(
+    defs: &std::collections::HashMap<String, ast::Func>,
+    noun: &str,
+    domain: &str,
+    entity_id: &str,
+    new_fields: &std::collections::HashMap<String, String>,
+    population: &Population,
+) -> CommandResult {
+    // Read current facts for this entity
+    let mut merged = std::collections::HashMap::new();
+    for (_, facts) in &population.facts {
+        for fact in facts {
+            if fact.bindings.len() >= 2 && fact.bindings[0].1 == entity_id {
+                merged.insert(fact.bindings[1].0.clone(), fact.bindings[1].1.clone());
+            }
+        }
+    }
+    for (k, v) in new_fields {
+        merged.insert(k.clone(), v.clone());
+    }
+
+    // Remove old facts for this entity, insert merged
+    let mut new_pop = population.clone();
+    for (field_name, value) in &merged {
+        let ft_id = resolve_fact_type_id_defs(defs, noun, field_name);
+        if let Some(instances) = new_pop.facts.get_mut(&ft_id) {
+            instances.retain(|inst| {
+                !(inst.bindings.len() >= 2 && inst.bindings[0].1 == entity_id)
+            });
+        }
+        new_pop.facts.entry(ft_id.clone()).or_default().push(
+            FactInstance {
+                fact_type_id: ft_id,
+                bindings: vec![
+                    (noun.to_string(), entity_id.to_string()),
+                    (field_name.clone(), value.clone()),
+                ],
+            }
+        );
+    }
+
+    // derive + validate + emit (same as create)
+    let derivation_defs: Vec<(&str, &ast::Func)> = defs.iter()
+        .filter(|(n, _)| n.starts_with("derivation:"))
+        .map(|(n, f)| (n.as_str(), f))
+        .collect();
+    let derived = crate::evaluate::forward_chain_defs(&derivation_defs, &mut new_pop);
+
+    let ctx_obj = ast::encode_eval_context("", None, &new_pop);
+    let mut violations = Vec::new();
+    for (name, func) in defs {
+        if !name.starts_with("constraint:") { continue; }
+        let result = ast::apply(func, &ctx_obj, defs);
+        let is_deontic = name.contains("obligatory") || name.contains("forbidden");
+        let decoded = ast::decode_violations(&result);
+        for mut v in decoded {
+            v.alethic = !is_deontic;
+            violations.push(v);
+        }
+    }
+
+    let rejected = violations.iter().any(|v| v.alethic);
+    let sm_id = entity_id.to_string();
+    let status = extract_sm_status(&new_pop, &sm_id);
+    let transitions = hateoas_from_population(&new_pop, noun, entity_id, status.as_deref());
+
+    CommandResult {
+        entities: vec![EntityResult {
+            id: entity_id.to_string(),
+            entity_type: noun.to_string(),
+            data: merged,
+        }],
+        status,
+        transitions,
+        violations,
+        derived_count: derived.len(),
+        rejected,
+        population: if rejected { population.clone() } else { new_pop },
     }
 }
 
