@@ -151,73 +151,10 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
         return ast::apply(func, &obj, &def_map).to_string();
     }
 
-    // Keys that need access to P directly (not yet expressible as pure Func).
+    // Two remaining operations that need Rust-level access to P:
+    // rho: metacomposition (one line, used by federation tests)
+    // forward_chain: iterative fixed-point loop over derivation defs
     match key {
-        "machine" => {
-            let items = obj.as_seq().unwrap_or(&[]);
-            let noun = items.first().and_then(|o| o.as_atom()).unwrap_or("");
-            let events: Vec<&str> = items.get(1)
-                .and_then(|o| o.as_seq())
-                .map(|seq| seq.iter().filter_map(|o| o.as_atom()).collect())
-                .unwrap_or_default();
-            let sm_name = format!("machine:{}", noun);
-            let init_name = format!("machine:{}:initial", noun);
-            let transition = match st.def(&sm_name) { Some(f) => f, None => return "⊥".into() };
-            let initial_func = match st.def(&init_name) { Some(f) => f, None => return "⊥".into() };
-            let mut state = ast::apply(initial_func, &ast::Object::phi(), &def_map);
-            for event in &events {
-                let inp = ast::Object::seq(vec![state, ast::Object::atom(event)]);
-                state = ast::apply(transition, &inp, &def_map);
-            }
-            let current = state.as_atom().unwrap_or("").to_string();
-            // HATEOAS: available transitions from current state
-            let events_all: Vec<String> = st.pop.facts.get("InstanceFact")
-                .map(|facts| facts.iter()
-                    .filter(|f| f.bindings.iter().any(|(k, v)| k == "subjectNoun" && v == "Transition"))
-                    .filter_map(|f| {
-                        let obj_noun = f.bindings.iter().find(|(k, _)| k == "objectNoun").map(|(_, v)| v.as_str())?;
-                        if obj_noun == "Event Type" { f.bindings.iter().find(|(k, _)| k == "objectValue").map(|(_, v)| v.clone()) } else { None }
-                    })
-                    .collect::<std::collections::HashSet<_>>().into_iter().collect()
-                ).unwrap_or_default();
-            let mut available = vec![];
-            for ev in &events_all {
-                let inp = ast::Object::seq(vec![ast::Object::atom(&current), ast::Object::atom(ev)]);
-                let next = ast::apply(transition, &inp, &def_map);
-                if let Some(ns) = next.as_atom() {
-                    if ns != current { available.push(ast::Object::seq(vec![ast::Object::atom(ev), ast::Object::atom(ns)])); }
-                }
-            }
-            ast::Object::seq(vec![
-                ast::Object::atom(&current),
-                ast::Object::Seq(available),
-            ]).to_string()
-        }
-        "transitions" => {
-            let items = obj.as_seq().unwrap_or(&[]);
-            let noun = items.first().and_then(|o| o.as_atom()).unwrap_or("");
-            let status = items.get(1).and_then(|o| o.as_atom()).unwrap_or("");
-            let sm_name = format!("machine:{}", noun);
-            let transition = match st.def(&sm_name) { Some(f) => f, None => return "φ".into() };
-            let events: Vec<String> = st.pop.facts.get("InstanceFact")
-                .map(|facts| facts.iter()
-                    .filter(|f| f.bindings.iter().any(|(k, v)| k == "subjectNoun" && v == "Transition"))
-                    .filter_map(|f| {
-                        let obj_noun = f.bindings.iter().find(|(k, _)| k == "objectNoun").map(|(_, v)| v.as_str())?;
-                        if obj_noun == "Event Type" { f.bindings.iter().find(|(k, _)| k == "objectValue").map(|(_, v)| v.clone()) } else { None }
-                    })
-                    .collect::<std::collections::HashSet<_>>().into_iter().collect()
-                ).unwrap_or_default();
-            let mut result = vec![];
-            for event in &events {
-                let inp = ast::Object::seq(vec![ast::Object::atom(status), ast::Object::atom(event)]);
-                let next = ast::apply(transition, &inp, &def_map);
-                if let Some(ns) = next.as_atom() {
-                    if ns != status { result.push(ast::Object::seq(vec![ast::Object::atom(status), ast::Object::atom(ns), ast::Object::atom(event)])); }
-                }
-            }
-            ast::Object::Seq(result).to_string()
-        }
         "rho" => {
             let operation = obj.as_seq().and_then(|s| s.get(1)).and_then(|o| o.as_atom()).unwrap_or("");
             let func = ast::metacompose(&obj, &def_map);
