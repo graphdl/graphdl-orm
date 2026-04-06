@@ -9,27 +9,7 @@
 
 use std::collections::HashSet;
 use crate::types::*;
-use crate::compile::CompiledModel;
 use crate::ast;
-
-/// Evaluate all compiled constraints via AST reduction.
-/// Evaluation = beta reduction: apply(func, object) -> violations.
-/// Alethic constraints always reject. Deontic violations are tagged as non-alethic.
-pub fn evaluate_via_ast(model: &CompiledModel, text: &str, sender: Option<&str>, population: &Population) -> Vec<Violation> {
-    let ctx_obj = ast::encode_eval_context(text, sender, population);
-    let defs = std::collections::HashMap::new();
-
-    model.constraints.iter()
-        .flat_map(|c| {
-            let result = ast::apply(&c.func, &ctx_obj, &defs);
-            let is_alethic = matches!(c.modality, crate::compile::Modality::Alethic);
-            ast::decode_violations(&result).into_iter().map(move |mut v| {
-                v.alethic = is_alethic;
-                v
-            })
-        })
-        .collect()
-}
 
 /// Run a state machine via AST reduction.
 /// The machine's func is a transition function: <state, event> -> next_state.
@@ -66,72 +46,7 @@ pub fn run_machine_ast(
 // producing unbounded intermediate populations. If the bound is hit,
 // the engine stops and returns what it has -- a partial fixed point.
 
-/// Forward chain via AST reduction to fixed point.
-/// Bounded to prevent pathological rule sets from running unbounded.
-pub fn forward_chain_ast(
-    model: &CompiledModel,
-    population: &mut Population,
-) -> Vec<DerivedFact> {
-    let mut all_derived: Vec<DerivedFact> = Vec::new();
-    let max_iterations = 100;
-    let defs = std::collections::HashMap::new();
-
-    for _ in 0..max_iterations {
-        let pop_obj = ast::encode_population(population);
-        let mut new_facts: Vec<DerivedFact> = Vec::new();
-
-        for derivation in &model.derivations {
-            let result = ast::apply(&derivation.func, &pop_obj, &defs);
-            // Decode derived facts from the result Object
-            if let Some(items) = result.as_seq() {
-                for item in items {
-                    if let Some(fact_items) = item.as_seq() {
-                        if fact_items.len() >= 3 {
-                            let ft_id = fact_items[0].as_atom().unwrap_or("").to_string();
-                            let reading = fact_items[1].as_atom().unwrap_or("").to_string();
-                            let bindings: Vec<(String, String)> = fact_items[2].as_seq()
-                                .unwrap_or(&[])
-                                .iter()
-                                .filter_map(|b| {
-                                    let pair = b.as_seq()?;
-                                    if pair.len() == 2 {
-                                        Some((pair[0].as_atom()?.to_string(), pair[1].as_atom()?.to_string()))
-                                    } else { None }
-                                })
-                                .collect();
-
-                            let fact = DerivedFact {
-                                fact_type_id: ft_id,
-                                reading,
-                                bindings,
-                                derived_by: derivation.id.clone(),
-                                confidence: Confidence::Definitive,
-                            };
-
-                            if !population_contains(population, &fact)
-                                && !all_derived.iter().any(|d| same_fact(d, &fact))
-                                && !new_facts.iter().any(|d| same_fact(d, &fact))
-                            {
-                                new_facts.push(fact);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if new_facts.is_empty() { break; } // Fixed point reached -- proof complete.
-
-        for fact in &new_facts {
-            add_to_population(population, fact);
-        }
-        all_derived.extend(new_facts);
-    }
-
-    all_derived
-}
-
-/// Forward chain using named defs instead of CompiledModel.
+/// Forward chain using named defs.
 /// Each def matching "derivation:" is applied to the population.
 pub fn forward_chain_defs(
     derivation_defs: &[(&str, &ast::Func)],
@@ -420,119 +335,6 @@ fn fact_text_matches(goal: &str, fact_text: &str, reading: &str) -> bool {
 }
 
 // -- Synthesis --------------------------------------------------------
-// Collect all knowledge about a noun from the compiled model.
-
-/// Synthesize: collect all knowledge about a noun from the compiled model.
-pub fn synthesize(
-    model: &CompiledModel,
-    ir: &Domain,
-    noun_name: &str,
-    depth: usize,
-) -> SynthesisResult {
-    let index = &model.noun_index;
-
-    let world_assumption = index.world_assumptions.get(noun_name)
-        .cloned()
-        .unwrap_or(WorldAssumption::Closed);
-
-    // 1. Find all fact types where this noun plays a role
-    let participates_in: Vec<FactTypeSummary> = index.noun_to_fact_types
-        .get(noun_name)
-        .map(|fts| fts.iter().filter_map(|(ft_id, role_idx)| {
-            ir.fact_types.get(ft_id).map(|ft| FactTypeSummary {
-                id: ft_id.clone(),
-                reading: ft.reading.clone(),
-                role_index: *role_idx,
-            })
-        }).collect())
-        .unwrap_or_default();
-
-    // 2. Find all constraints spanning those fact types
-    let mut seen_constraint_ids = HashSet::new();
-    let applicable_constraints: Vec<ConstraintSummary> = participates_in.iter()
-        .flat_map(|ft_summary| {
-            index.fact_type_to_constraints.get(&ft_summary.id)
-                .cloned()
-                .unwrap_or_default()
-        })
-        .filter(|cid| seen_constraint_ids.insert(cid.clone()))
-        .filter_map(|cid| {
-            index.constraint_index.get(&cid).and_then(|&idx| {
-                model.constraints.get(idx).map(|cc| {
-                    // Look up the original constraint def for kind info
-                    let cdef = ir.constraints.iter().find(|c| c.id == cid);
-                    ConstraintSummary {
-                        id: cid.clone(),
-                        text: cc.text.clone(),
-                        kind: cdef.map(|c| c.kind.clone()).unwrap_or_default(),
-                        modality: format!("{:?}", cc.modality),
-                        deontic_operator: cdef.and_then(|c| c.deontic_operator.clone()),
-                    }
-                })
-            })
-        })
-        .collect();
-
-    // 3. Find state machines for this noun
-    let state_machines: Vec<StateMachineSummary> = index.noun_to_state_machines
-        .get(noun_name)
-        .and_then(|&idx| model.state_machines.get(idx))
-        .map(|sm| {
-            vec![StateMachineSummary {
-                noun_name: sm.noun_name.clone(),
-                statuses: sm.statuses.clone(),
-                current_status: Some(sm.initial.clone()),
-                valid_transitions: sm.transition_table.iter()
-                    .filter(|(from, _, _)| *from == sm.initial)
-                    .map(|(_, _, event)| event.clone())
-                    .collect(),
-            }]
-        })
-        .unwrap_or_default();
-
-    // 4. Find related nouns (other nouns in shared fact types)
-    let mut seen_related = HashSet::new();
-    let related_nouns: Vec<RelatedNoun> = if depth > 0 {
-        participates_in.iter()
-            .flat_map(|ft_summary| {
-                ir.fact_types.get(&ft_summary.id)
-                    .map(|ft| {
-                        ft.roles.iter()
-                            .filter(|r| r.noun_name != noun_name)
-                            .filter(|r| seen_related.insert(r.noun_name.clone()))
-                            .map(|r| {
-                                let wa = index.world_assumptions.get(&r.noun_name)
-                                    .cloned()
-                                    .unwrap_or(WorldAssumption::Closed);
-                                RelatedNoun {
-                                    name: r.noun_name.clone(),
-                                    via_fact_type: ft_summary.id.clone(),
-                                    via_reading: ft.reading.clone(),
-                                    world_assumption: wa,
-                                }
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default()
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-
-    // 5. Derived facts would need population context; leave empty for static synthesis.
-    let derived_facts = Vec::new();
-
-    SynthesisResult {
-        noun_name: noun_name.to_string(),
-        world_assumption,
-        participates_in,
-        applicable_constraints,
-        state_machines,
-        derived_facts,
-        related_nouns,
-    }
-}
 
 /// Synthesize from P directly. No Domain reconstruction.
 pub fn synthesize_from_pop(

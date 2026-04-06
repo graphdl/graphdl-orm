@@ -11,9 +11,6 @@
 
 use std::collections::HashMap;
 use crate::types::*;
-use crate::compile::CompiledModel;
-use crate::evaluate;
-
 /// Convert a domain's Domain into a Population of core metamodel facts.
 ///
 /// Each noun, fact type, role, constraint, and derivation rule in the domain
@@ -97,19 +94,6 @@ pub fn ir_to_metamodel_population(ir: &Domain) -> Population {
     }
 
     Population { facts }
-}
-
-/// Validate a domain's IR against a compiled validation model.
-///
-/// The validation model is compiled from core.md + validation.md at startup.
-/// This function converts the domain IR to a metamodel population and
-/// evaluates the validation constraints against it.
-pub fn validate_schema(
-    validation_model: &CompiledModel,
-    domain_ir: &Domain,
-) -> Vec<Violation> {
-    let population = ir_to_metamodel_population(domain_ir);
-    evaluate::evaluate_via_ast(validation_model, "", None, &population)
 }
 
 #[cfg(test)]

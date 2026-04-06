@@ -87,11 +87,14 @@ fn main() {
 
     let ir: Domain = serde_json::from_str(&ir_json)
         .unwrap_or_else(|e| { eprintln!("Failed to parse IR: {}", e); std::process::exit(1); });
-    let model = compile::compile(&ir);
+    let pop = parse_forml2::domain_to_population(&ir);
+    let defs = compile::compile_to_defs(&pop);
+    let def_map: std::collections::HashMap<String, ast::Func> =
+        defs.iter().map(|(n, f)| (n.clone(), f.clone())).collect();
 
     // -- Synthesize mode --
     if let Some(noun_name) = synthesize_noun {
-        let result = evaluate::synthesize(&model, &ir, &noun_name, synthesize_depth);
+        let result = evaluate::synthesize_from_pop(&pop, &noun_name, synthesize_depth);
         println!("{}", serde_json::to_string_pretty(&result).unwrap());
         std::process::exit(0);
     }
@@ -99,7 +102,11 @@ fn main() {
     // -- Forward chain mode --
     if do_forward_chain {
         let mut population = load_population(population_path, true);
-        let derived = evaluate::forward_chain_ast(&model, &mut population);
+        let derivation_defs: Vec<(&str, &ast::Func)> = defs.iter()
+            .filter(|(n, _)| n.starts_with("derivation:"))
+            .map(|(n, f)| (n.as_str(), f))
+            .collect();
+        let derived = evaluate::forward_chain_defs(&derivation_defs, &mut population);
         if derived.is_empty() {
             println!("No new facts derived");
         } else {
@@ -122,7 +129,18 @@ fn main() {
     };
 
     let population = load_population(population_path, false);
-    let violations = evaluate::evaluate_via_ast(&model, &response_text, None, &population);
+    let ctx_obj = ast::encode_eval_context(&response_text, None, &population);
+    let violations: Vec<types::Violation> = defs.iter()
+        .filter(|(n, _)| n.starts_with("constraint:"))
+        .flat_map(|(name, func)| {
+            let result = ast::apply(func, &ctx_obj, &def_map);
+            let is_deontic = name.contains("obligatory") || name.contains("forbidden");
+            ast::decode_violations(&result).into_iter().map(move |mut v| {
+                v.alethic = !is_deontic;
+                v
+            })
+        })
+        .collect();
 
     if violations.is_empty() {
         println!("OK -- no violations");

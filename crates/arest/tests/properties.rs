@@ -4,10 +4,11 @@
 // Input: FORML2 readings. Output: system function responses.
 // No IR. No internal types. Readings and named functions.
 
+use arest::ast;
 use arest::parse_forml2;
 use arest::compile;
 use arest::evaluate;
-use arest::types::{Population, FactInstance};
+use arest::types::{Population, FactInstance, Violation};
 use std::collections::HashMap;
 
 // ── Metamodel ────────────────────────────────────────────────────────
@@ -1206,15 +1207,33 @@ It is forbidden that Support Response contains Prohibited Word.
 "#;
 
     let ir = parse_forml2::parse_markdown(input).unwrap();
-    let model = compile::compile(&ir);
+    let meta_pop = parse_forml2::domain_to_population(&ir);
+    let defs = compile::compile_to_defs(&meta_pop);
+    let def_map: HashMap<String, ast::Func> = defs.iter().map(|(n, f)| (n.clone(), f.clone())).collect();
+
+    // Helper: evaluate constraints via defs path
+    let eval = |text: &str| -> Vec<Violation> {
+        let pop = Population { facts: HashMap::new() };
+        let ctx_obj = ast::encode_eval_context(text, None, &pop);
+        defs.iter()
+            .filter(|(n, _)| n.starts_with("constraint:"))
+            .flat_map(|(name, func)| {
+                let result = ast::apply(func, &ctx_obj, &def_map);
+                let is_deontic = name.contains("obligatory") || name.contains("forbidden");
+                ast::decode_violations(&result).into_iter().map(move |mut v| {
+                    v.alethic = !is_deontic;
+                    v
+                })
+            })
+            .collect()
+    };
 
     // Bad response: body contains "overnight"
-    let pop = Population { facts: HashMap::new() };
-    let violations = evaluate::evaluate_via_ast(&model, "We will ship overnight", None, &pop);
+    let violations = eval("We will ship overnight");
     assert!(!violations.is_empty(), "Should catch 'overnight' via enum matching");
 
     // Good response: no prohibited words
-    let good_violations = evaluate::evaluate_via_ast(&model, "We will ship via standard delivery", None, &pop);
+    let good_violations = eval("We will ship via standard delivery");
     let prohibited_violations: Vec<_> = good_violations.iter()
         .filter(|v| v.constraint_text.contains("Prohibited Word"))
         .collect();
