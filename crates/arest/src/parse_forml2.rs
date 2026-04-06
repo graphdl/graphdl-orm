@@ -2106,6 +2106,27 @@ It is obligatory that each Support Response conforms to Pricing Model.";
         assert_eq!(c.deontic_operator, Some("obligatory".into()));
     }
 
+    /// Helper: compile IR to defs, then evaluate constraints via defs path.
+    fn eval_deontic_defs(ir: &crate::types::Domain, text: &str) -> Vec<crate::types::Violation> {
+        let pop = domain_to_population(ir);
+        let defs = crate::compile::compile_to_defs(&pop);
+        let def_map: std::collections::HashMap<String, crate::ast::Func> =
+            defs.iter().map(|(n, f)| (n.clone(), f.clone())).collect();
+        let empty_pop = crate::types::Population { facts: std::collections::HashMap::new() };
+        let ctx_obj = crate::ast::encode_eval_context(text, None, &empty_pop);
+        defs.iter()
+            .filter(|(n, _)| n.starts_with("constraint:"))
+            .flat_map(|(name, func)| {
+                let result = crate::ast::apply(func, &ctx_obj, &def_map);
+                let is_deontic = name.contains("obligatory") || name.contains("forbidden");
+                crate::ast::decode_violations(&result).into_iter().map(move |mut v| {
+                    v.alethic = !is_deontic;
+                    v
+                })
+            })
+            .collect()
+    }
+
     #[test]
     fn deontic_forbidden_evaluates_enum_match() {
         let input = "\
@@ -2117,9 +2138,7 @@ Support Response uses Dash.
 ## Deontic Constraints
 It is forbidden that Support Response uses Dash.";
         let ir = parse_markdown(input).unwrap();
-        let model = crate::compile::compile(&ir);
-        let population = crate::types::Population { facts: std::collections::HashMap::new() };
-        let violations = crate::evaluate::evaluate_via_ast(&model, "Hi -- here is your answer", None, &population);
+        let violations = eval_deontic_defs(&ir, "Hi -- here is your answer");
         assert!(!violations.is_empty(),
             "Response containing '--' should violate the forbidden Dash constraint");
         assert!(violations.iter().any(|v| v.constraint_text.contains("Dash")),
@@ -2137,9 +2156,7 @@ Support Response uses Dash.
 ## Deontic Constraints
 It is forbidden that Support Response uses Dash.";
         let ir = parse_markdown(input).unwrap();
-        let model = crate::compile::compile(&ir);
-        let population = crate::types::Population { facts: std::collections::HashMap::new() };
-        let violations = crate::evaluate::evaluate_via_ast(&model, "Hi, here is your answer with no dashes at all", None, &population);
+        let violations = eval_deontic_defs(&ir, "Hi, here is your answer with no dashes at all");
         let dash_violations: Vec<_> = violations.iter()
             .filter(|v| v.constraint_text.contains("Dash"))
             .collect();
@@ -2162,10 +2179,7 @@ Support Response contains Markdown Syntax.
 It is forbidden that Support Response uses Dash.
 It is forbidden that Support Response contains Markdown Syntax.";
         let ir = parse_markdown(input).unwrap();
-        let model = crate::compile::compile(&ir);
-        // Response with both dashes and markdown
-        let population = crate::types::Population { facts: std::collections::HashMap::new() };
-        let violations = crate::evaluate::evaluate_via_ast(&model, "## Heading\n\nHere is info -- with **bold** text", None, &population);
+        let violations = eval_deontic_defs(&ir, "## Heading\n\nHere is info -- with **bold** text");
         assert!(violations.iter().any(|v| v.constraint_text.contains("Dash")),
             "Should catch dash violation");
         assert!(violations.iter().any(|v| v.constraint_text.contains("Markdown")),
