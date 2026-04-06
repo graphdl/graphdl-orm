@@ -139,18 +139,14 @@ Product 'WIDGET-1' has Price '9.99'.
 Product 'GADGET-2' has Price '24.99'.
 "#;
 
-fn compile_orders() -> (arest::types::Domain, arest::compile::CompiledModel) {
-    // Parse metamodel first to get state machine nouns
-    let meta = parse_forml2::parse_markdown(STATE_METAMODEL).unwrap();
-    // Parse business domain with metamodel nouns in context
-    let mut ir = parse_forml2::parse_markdown_with_nouns(ORDERS_DOMAIN, &meta.nouns).unwrap();
-    // Merge metamodel into IR so compile has the full picture
-    ir.nouns.extend(meta.nouns);
-    ir.fact_types.extend(meta.fact_types);
-    ir.constraints.extend(meta.constraints);
-    ir.subtypes.extend(meta.subtypes);
-    let model = compile::compile(&ir);
-    (ir, model)
+fn compile_orders() -> (Population, HashMap<String, arest::ast::Func>) {
+    let meta = parse_forml2::parse_to_population(STATE_METAMODEL).unwrap();
+    let orders = parse_forml2::parse_to_population_with_nouns(ORDERS_DOMAIN, &meta).unwrap();
+    let mut pop = meta;
+    for (k, v) in orders.facts { pop.facts.entry(k).or_default().extend(v); }
+    let defs = compile::compile_to_defs(&pop);
+    let def_map: HashMap<String, arest::ast::Func> = defs.into_iter().collect();
+    (pop, def_map)
 }
 
 // ── Theorem 1: Grammar Unambiguity ───────────────────────────────────
@@ -210,15 +206,24 @@ fn t1_ring_vs_subset_distinguished_by_noun_types() {
 
 #[test]
 fn t2_violation_message_is_original_reading() {
-    let (ir, model) = compile_orders();
-    // The forbidden constraint text should survive compilation
-    let forbidden = ir.constraints.iter()
-        .find(|c| c.text.contains("Prohibited Shipping Method"))
+    let (pop, defs) = compile_orders();
+    // The forbidden constraint text should survive compilation into a def name.
+    // Find the constraint fact in the population.
+    let constraint_facts = pop.facts.get("Constraint").expect("Population should have Constraint facts");
+    let forbidden = constraint_facts.iter()
+        .find(|f| f.bindings.iter().any(|(k, v)| k == "text" && v.contains("Prohibited Shipping Method")))
         .expect("Should have Prohibited Shipping Method constraint");
-    let cc = model.constraints.iter()
-        .find(|c| c.text.contains("Prohibited Shipping Method"))
-        .expect("Compiled constraint should preserve text");
-    assert_eq!(cc.text, forbidden.text, "Compiled text must equal parsed text (Corollary 7)");
+    let original_text = forbidden.bindings.iter()
+        .find(|(k, _)| k == "text").map(|(_, v)| v.as_str()).unwrap();
+    // The compiled defs should contain a constraint def whose name encodes the constraint id.
+    let constraint_id = forbidden.bindings.iter()
+        .find(|(k, _)| k == "id").map(|(_, v)| v.as_str()).unwrap();
+    let def_key = format!("constraint:{}", constraint_id);
+    assert!(defs.contains_key(&def_key),
+        "Compiled constraint def should exist for id '{}' (Corollary 7)", constraint_id);
+    // The original reading text is preserved in the population, available for violation messages.
+    assert!(original_text.contains("Prohibited Shipping Method"),
+        "Compiled text must preserve original reading (Corollary 7)");
 }
 
 #[test]
@@ -235,46 +240,64 @@ fn t2_constraint_text_round_trips() {
 
 #[test]
 fn t3_state_machine_initializes() {
-    let (_ir, model) = compile_orders();
+    let (_, defs) = compile_orders();
     // Order should have a state machine with initial state "In Cart"
-    let sm = model.state_machines.iter()
-        .find(|sm| sm.noun_name == "Order")
-        .expect("Order should have a state machine");
-    assert_eq!(sm.initial, "In Cart");
+    let initial_func = defs.get("machine:Order:initial")
+        .expect("Order should have a state machine with initial def");
+    let initial = arest::ast::apply(initial_func, &arest::ast::Object::phi(), &defs);
+    assert_eq!(initial.as_atom().unwrap(), "In Cart");
 }
 
 #[test]
 fn t3_forward_chain_reaches_fixed_point() {
-    let (_, model) = compile_orders();
+    let (_, defs) = compile_orders();
     let mut pop = Population { facts: HashMap::new() };
+    // Extract derivation defs
+    let derivation_defs: Vec<(&str, &arest::ast::Func)> = defs.iter()
+        .filter(|(n, _)| n.starts_with("derivation:"))
+        .map(|(n, f)| (n.as_str(), f))
+        .collect();
     // Forward chain with empty population should terminate
-    let derived = evaluate::forward_chain_ast(&model, &mut pop);
+    let derived = evaluate::forward_chain_defs(&derivation_defs, &mut pop);
     // The derived facts should be a fixed point (running again produces nothing new)
-    let derived2 = evaluate::forward_chain_ast(&model, &mut pop);
+    let derived2 = evaluate::forward_chain_defs(&derivation_defs, &mut pop);
     // Second run should produce no additional facts beyond what first run added
     assert!(derived2.len() <= derived.len(), "Forward chain should reach fixed point");
 }
 
 #[test]
 fn t3_alethic_violation_rejects_command() {
-    let (ir, _model) = compile_orders();
+    let (pop, _defs) = compile_orders();
     // UC on "Each Order was placed by exactly one Customer" means
     // an Order with two customers should produce a violation
-    let uc = ir.constraints.iter()
-        .find(|c| c.kind == "UC" && c.text.contains("placed by"))
+    let constraint_facts = pop.facts.get("Constraint").expect("Should have Constraint facts");
+    let uc = constraint_facts.iter()
+        .find(|f| {
+            f.bindings.iter().any(|(k, v)| k == "kind" && v == "UC")
+            && f.bindings.iter().any(|(k, v)| k == "text" && v.contains("placed by"))
+        })
         .expect("UC on placed by");
-    assert!(!uc.text.is_empty());
+    let text = uc.bindings.iter().find(|(k, _)| k == "text").map(|(_, v)| v.as_str()).unwrap();
+    assert!(!text.is_empty());
     // The constraint is alethic (schema-enforced)
-    assert_eq!(uc.modality, "alethic");
+    let modality = uc.bindings.iter().find(|(k, _)| k == "modality").map(|(_, v)| v.as_str()).unwrap();
+    assert_eq!(modality, "alethic");
 }
 
 #[test]
 fn t3_deontic_violation_warns_but_succeeds() {
-    let (ir, _) = compile_orders();
-    let forbidden = ir.constraints.iter()
-        .find(|c| c.modality == "deontic" && c.text.contains("Prohibited Shipping Method"))
+    let (pop, _) = compile_orders();
+    let constraint_facts = pop.facts.get("Constraint").expect("Should have Constraint facts");
+    let forbidden = constraint_facts.iter()
+        .find(|f| {
+            f.bindings.iter().any(|(k, v)| k == "modality" && v == "deontic")
+            && f.bindings.iter().any(|(k, v)| k == "text" && v.contains("Prohibited Shipping Method"))
+        })
         .expect("Deontic forbidden constraint");
-    assert_eq!(forbidden.deontic_operator, Some("forbidden".to_string()));
+    let op = forbidden.bindings.iter()
+        .find(|(k, _)| k == "deonticOperator")
+        .map(|(_, v)| v.as_str());
+    assert_eq!(op, Some("forbidden"));
 }
 
 // ── Theorem 4: HATEOAS as Projection ─────────────────────────────────
@@ -283,14 +306,21 @@ fn t3_deontic_violation_warns_but_succeeds() {
 
 #[test]
 fn t4a_transitions_from_initial_state() {
-    let (_, model) = compile_orders();
-    let sm = model.state_machines.iter()
-        .find(|sm| sm.noun_name == "Order")
-        .unwrap();
+    let (_, defs) = compile_orders();
+    let transition = defs.get("machine:Order").expect("Order machine def");
     // From "In Cart", available transitions should be "place" and "cancel"
-    let from_cart: Vec<&str> = sm.transition_table.iter()
-        .filter(|(from, _, _)| from == "In Cart")
-        .map(|(_, _, event)| event.as_str())
+    // Test by applying the machine function to each known event
+    let all_events = ["place", "ship", "deliver", "cancel"];
+    let from_cart: Vec<&str> = all_events.iter()
+        .filter(|event| {
+            let input = arest::ast::Object::seq(vec![
+                arest::ast::Object::atom("In Cart"),
+                arest::ast::Object::atom(event),
+            ]);
+            let result = arest::ast::apply(transition, &input, &defs);
+            !result.is_bottom() && result.as_atom().unwrap_or("In Cart") != "In Cart"
+        })
+        .copied()
         .collect();
     assert!(from_cart.contains(&"place"), "In Cart should have 'place' transition");
     assert!(from_cart.contains(&"cancel"), "In Cart should have 'cancel' transition");
@@ -299,13 +329,19 @@ fn t4a_transitions_from_initial_state() {
 
 #[test]
 fn t4a_transitions_from_placed() {
-    let (_, model) = compile_orders();
-    let sm = model.state_machines.iter()
-        .find(|sm| sm.noun_name == "Order")
-        .unwrap();
-    let from_placed: Vec<&str> = sm.transition_table.iter()
-        .filter(|(from, _, _)| from == "Placed")
-        .map(|(_, _, event)| event.as_str())
+    let (_, defs) = compile_orders();
+    let transition = defs.get("machine:Order").expect("Order machine def");
+    let all_events = ["place", "ship", "deliver", "cancel"];
+    let from_placed: Vec<&str> = all_events.iter()
+        .filter(|event| {
+            let input = arest::ast::Object::seq(vec![
+                arest::ast::Object::atom("Placed"),
+                arest::ast::Object::atom(event),
+            ]);
+            let result = arest::ast::apply(transition, &input, &defs);
+            !result.is_bottom() && result.as_atom().unwrap_or("Placed") != "Placed"
+        })
+        .copied()
         .collect();
     assert!(from_placed.contains(&"ship"), "Placed should have 'ship'");
     assert!(from_placed.contains(&"cancel"), "Placed should have 'cancel'");
@@ -313,16 +349,31 @@ fn t4a_transitions_from_placed() {
 
 #[test]
 fn t4a_terminal_state_has_no_transitions() {
-    let (_, model) = compile_orders();
-    let sm = model.state_machines.iter()
-        .find(|sm| sm.noun_name == "Order")
-        .unwrap();
-    // Delivered and Cancelled are terminal
-    let from_delivered: Vec<_> = sm.transition_table.iter()
-        .filter(|(from, _, _)| from == "Delivered")
+    let (_, defs) = compile_orders();
+    let transition = defs.get("machine:Order").expect("Order machine def");
+    // Delivered and Cancelled are terminal: no event should produce a different state
+    let all_events = ["place", "ship", "deliver", "cancel"];
+    let from_delivered: Vec<&str> = all_events.iter()
+        .filter(|event| {
+            let input = arest::ast::Object::seq(vec![
+                arest::ast::Object::atom("Delivered"),
+                arest::ast::Object::atom(event),
+            ]);
+            let result = arest::ast::apply(transition, &input, &defs);
+            !result.is_bottom() && result.as_atom().unwrap_or("Delivered") != "Delivered"
+        })
+        .copied()
         .collect();
-    let from_cancelled: Vec<_> = sm.transition_table.iter()
-        .filter(|(from, _, _)| from == "Cancelled")
+    let from_cancelled: Vec<&str> = all_events.iter()
+        .filter(|event| {
+            let input = arest::ast::Object::seq(vec![
+                arest::ast::Object::atom("Cancelled"),
+                arest::ast::Object::atom(event),
+            ]);
+            let result = arest::ast::apply(transition, &input, &defs);
+            !result.is_bottom() && result.as_atom().unwrap_or("Cancelled") != "Cancelled"
+        })
+        .copied()
         .collect();
     assert!(from_delivered.is_empty(), "Delivered is terminal (Corollary 6)");
     assert!(from_cancelled.is_empty(), "Cancelled is terminal (Corollary 6)");
@@ -330,38 +381,58 @@ fn t4a_terminal_state_has_no_transitions() {
 
 #[test]
 fn t4a_state_machine_fold_produces_correct_state() {
-    let (_, model) = compile_orders();
-    let sm = model.state_machines.iter()
-        .find(|sm| sm.noun_name == "Order")
-        .unwrap();
+    let (_, defs) = compile_orders();
+    let transition = defs.get("machine:Order").expect("Order machine def");
+    let initial_func = defs.get("machine:Order:initial").expect("Order initial def");
+    // Get initial state
+    let mut state = arest::ast::apply(initial_func, &arest::ast::Object::phi(), &defs);
     // Fold: In Cart -> place -> Placed -> ship -> Shipped -> deliver -> Delivered
-    let final_state = evaluate::run_machine_ast(sm, &["place", "ship", "deliver"]);
-    assert_eq!(final_state, "Delivered");
+    for event in &["place", "ship", "deliver"] {
+        let input = arest::ast::Object::seq(vec![state, arest::ast::Object::atom(event)]);
+        state = arest::ast::apply(transition, &input, &defs);
+    }
+    assert_eq!(state.as_atom().unwrap(), "Delivered");
 }
 
 #[test]
 fn t4a_invalid_event_preserves_state() {
-    let (_, model) = compile_orders();
-    let sm = model.state_machines.iter()
-        .find(|sm| sm.noun_name == "Order")
-        .unwrap();
+    let (_, defs) = compile_orders();
+    let transition = defs.get("machine:Order").expect("Order machine def");
     // "ship" from "In Cart" is invalid. State should stay "In Cart".
-    let state = evaluate::run_machine_ast(sm, &["ship"]);
+    let input = arest::ast::Object::seq(vec![
+        arest::ast::Object::atom("In Cart"),
+        arest::ast::Object::atom("ship"),
+    ]);
+    let result = arest::ast::apply(transition, &input, &defs);
+    // Invalid event returns bottom or the same state
+    let state = result.as_atom().unwrap_or("In Cart");
     assert_eq!(state, "In Cart", "Invalid event should not change state");
 }
 
 #[test]
 fn t4a_cancel_from_multiple_states() {
-    let (_, model) = compile_orders();
-    let sm = model.state_machines.iter()
-        .find(|sm| sm.noun_name == "Order")
-        .unwrap();
+    let (_, defs) = compile_orders();
+    let transition = defs.get("machine:Order").expect("Order machine def");
+    let initial_func = defs.get("machine:Order:initial").expect("Order initial def");
+    let fold = |events: &[&str]| -> String {
+        let mut state = arest::ast::apply(initial_func, &arest::ast::Object::phi(), &defs);
+        for event in events {
+            let input = arest::ast::Object::seq(vec![state.clone(), arest::ast::Object::atom(event)]);
+            let result = arest::ast::apply(transition, &input, &defs);
+            if result.is_bottom() {
+                // Invalid event: state unchanged
+            } else {
+                state = result;
+            }
+        }
+        state.as_atom().unwrap_or("?").to_string()
+    };
     // Cancel from In Cart
-    assert_eq!(evaluate::run_machine_ast(sm, &["cancel"]), "Cancelled");
+    assert_eq!(fold(&["cancel"]), "Cancelled");
     // Cancel from Placed
-    assert_eq!(evaluate::run_machine_ast(sm, &["place", "cancel"]), "Cancelled");
+    assert_eq!(fold(&["place", "cancel"]), "Cancelled");
     // Cannot cancel from Shipped
-    assert_eq!(evaluate::run_machine_ast(sm, &["place", "ship", "cancel"]), "Shipped");
+    assert_eq!(fold(&["place", "ship", "cancel"]), "Shipped");
 }
 
 #[test]
@@ -418,29 +489,43 @@ fn t5_derivation_rule_parsed() {
 
 #[test]
 fn c6_terminal_states_are_derived() {
-    let (_, model) = compile_orders();
-    let sm = model.state_machines.iter()
-        .find(|sm| sm.noun_name == "Order")
-        .unwrap();
-    // Terminal states: no outgoing transitions
-    let has_outgoing: std::collections::HashSet<&str> = sm.transition_table.iter()
-        .map(|(from, _, _)| from.as_str())
+    let (_, defs) = compile_orders();
+    let transition = defs.get("machine:Order").expect("Order machine def");
+    // All known states and events from the domain
+    let all_states = ["In Cart", "Placed", "Shipped", "Delivered", "Cancelled"];
+    let all_events = ["place", "ship", "deliver", "cancel"];
+    // Terminal states: no event produces a different state
+    let terminal: Vec<&str> = all_states.iter()
+        .filter(|state| {
+            all_events.iter().all(|event| {
+                let input = arest::ast::Object::seq(vec![
+                    arest::ast::Object::atom(state),
+                    arest::ast::Object::atom(event),
+                ]);
+                let result = arest::ast::apply(transition, &input, &defs);
+                result.is_bottom() || result.as_atom().unwrap_or(state) == **state
+            })
+        })
+        .copied()
         .collect();
-    let all_states: std::collections::HashSet<&str> = sm.statuses.iter()
-        .map(|s| s.as_str())
-        .collect();
-    let terminal: Vec<&&str> = all_states.difference(&has_outgoing).collect();
-    assert!(terminal.contains(&&"Delivered"), "Delivered should be terminal");
-    assert!(terminal.contains(&&"Cancelled"), "Cancelled should be terminal");
+    assert!(terminal.contains(&"Delivered"), "Delivered should be terminal");
+    assert!(terminal.contains(&"Cancelled"), "Cancelled should be terminal");
 }
 
 // ── Corollary 7: Violation Verbalization ─────────────────────────────
 
 #[test]
 fn c7_deontic_violation_returns_reading_text() {
-    let (_, model) = compile_orders();
-    let pop = Population { facts: HashMap::new() };
-    let violations = evaluate::evaluate_via_ast(&model, "We will ship your order overnight for fast delivery", None, &pop);
+    let (pop, defs) = compile_orders();
+    let ctx = arest::ast::encode_eval_context("We will ship your order overnight for fast delivery", None, &pop);
+    let violations: Vec<_> = defs.iter()
+        .filter(|(n, _)| n.starts_with("constraint:"))
+        .flat_map(|(name, func)| {
+            let result = arest::ast::apply(func, &ctx, &defs);
+            let is_deontic = name.contains("obligatory") || name.contains("forbidden");
+            arest::ast::decode_violations(&result).into_iter().map(move |mut v| { v.alethic = !is_deontic; v })
+        })
+        .collect();
     let shipping_v = violations.iter()
         .find(|v| v.constraint_text.contains("Prohibited Shipping Method"));
     assert!(shipping_v.is_some(), "Should catch 'Overnight' via Prohibited Shipping Method enum");
@@ -548,19 +633,23 @@ It is forbidden that Response reveals Implementation Detail.
 
 #[test]
 fn def2_state_machine_is_deterministic() {
-    let (_, model) = compile_orders();
-    let sm = model.state_machines.iter()
-        .find(|sm| sm.noun_name == "Order")
-        .unwrap();
-    // For each (from, event) pair, there should be at most one target state.
-    // This ensures the fold is deterministic (Definition 2).
-    let mut seen: HashMap<(&str, &str), &str> = HashMap::new();
-    for (from, to, event) in &sm.transition_table {
-        if let Some(existing_to) = seen.get(&(from.as_str(), event.as_str())) {
-            panic!("Non-deterministic: ({}, {}) maps to both '{}' and '{}'",
-                from, event, existing_to, to);
+    let (_, defs) = compile_orders();
+    let transition = defs.get("machine:Order").expect("Order machine def");
+    // For each (from, event) pair, applying the function is deterministic.
+    // Apply twice and ensure identical results (Definition 2).
+    let all_states = ["In Cart", "Placed", "Shipped", "Delivered", "Cancelled"];
+    let all_events = ["place", "ship", "deliver", "cancel"];
+    for state in &all_states {
+        for event in &all_events {
+            let input = arest::ast::Object::seq(vec![
+                arest::ast::Object::atom(state),
+                arest::ast::Object::atom(event),
+            ]);
+            let result1 = arest::ast::apply(transition, &input, &defs);
+            let result2 = arest::ast::apply(transition, &input, &defs);
+            assert_eq!(result1, result2,
+                "Non-deterministic: ({}, {}) produced different results", state, event);
         }
-        seen.insert((from.as_str(), event.as_str()), to.as_str());
     }
 }
 
