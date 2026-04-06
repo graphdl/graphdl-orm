@@ -191,7 +191,7 @@ fn create_via_defs(
     }];
 
     // Extract SM status from population (derived by forward chaining)
-    let sm_id = format!("sm:{}", entity_id);
+    let sm_id = entity_id.clone();
     let status = extract_sm_status(&new_pop, &sm_id);
 
     if let Some(ref st) = status {
@@ -206,9 +206,48 @@ fn create_via_defs(
         });
     }
 
-    // Inject transition facts from DEFS (Theorem 3: T is in P)
-    // The machine def's transition table is encoded in the population
-    // by the forward chaining derivation. Transition facts already in new_pop.
+    // Inject transition facts from InstanceFact entries (Theorem 3: T is in P)
+    if let Some(inst_facts) = population.facts.get("InstanceFact") {
+        let mut t_from: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut t_to: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut t_event: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for f in inst_facts {
+            let subj_noun = f.bindings.iter().find(|(k, _)| k == "subjectNoun").map(|(_, v)| v.as_str());
+            let subj_val = f.bindings.iter().find(|(k, _)| k == "subjectValue").map(|(_, v)| v.clone());
+            let obj_noun = f.bindings.iter().find(|(k, _)| k == "objectNoun").map(|(_, v)| v.as_str());
+            let obj_val = f.bindings.iter().find(|(k, _)| k == "objectValue").map(|(_, v)| v.clone());
+            let field = f.bindings.iter().find(|(k, _)| k == "fieldName").map(|(_, v)| v.as_str());
+            if subj_noun == Some("Transition") {
+                let sv = subj_val.unwrap_or_default();
+                if obj_noun == Some("Status") {
+                    let fld = field.unwrap_or_default();
+                    if fld.to_lowercase().contains("from") {
+                        t_from.insert(sv, obj_val.unwrap_or_default());
+                    } else if fld.to_lowercase().contains("to") {
+                        t_to.insert(sv, obj_val.unwrap_or_default());
+                    }
+                } else if obj_noun == Some("Event Type") {
+                    t_event.insert(sv, obj_val.unwrap_or_default());
+                }
+            }
+        }
+        for (t_name, from) in &t_from {
+            if let Some(to) = t_to.get(t_name) {
+                let event = t_event.get(t_name).cloned().unwrap_or_else(|| t_name.clone());
+                let ft_key = String::from("Transition");
+                new_pop.facts.entry(ft_key.clone()).or_default().push(
+                    FactInstance {
+                        fact_type_id: ft_key,
+                        bindings: vec![
+                            (String::from("from"), from.clone()),
+                            (String::from("to"), to.clone()),
+                            (String::from("event"), event),
+                        ],
+                    }
+                );
+            }
+        }
+    }
 
     // -- validate --
     let ctx_obj = ast::encode_eval_context("", None, &new_pop);
@@ -306,7 +345,7 @@ fn apply_create_entity(
         data: entity_data,
     }];
 
-    let sm_id = format!("sm:{}", entity_id);
+    let sm_id = entity_id.clone();
     let status = extract_sm_status(&new_pop, &sm_id);
 
     if let Some(ref st) = status {
@@ -434,7 +473,7 @@ fn apply_update_entity(
         data: merged_fields,
     };
 
-    let sm_id = format!("sm:{}", entity_id);
+    let sm_id = entity_id.clone();
     let status = extract_sm_status(&new_pop, &sm_id);
     let transitions = hateoas_from_population(&new_pop, noun, entity_id, status.as_deref());
 
@@ -487,7 +526,7 @@ fn apply_transition(
     if let Some(ref status) = new_status {
         // Pop' = Pop with updated SM status fact.
         // Theorem 3: every observable value must be in the population.
-        let sm_id = format!("sm:{}", entity_id);
+        let sm_id = entity_id.to_string();
         let status_key = "StateMachine_has_currentlyInStatus".to_string();
         if let Some(facts) = new_pop.facts.get_mut(&status_key) {
             // Update existing SM status fact for this entity
@@ -1023,7 +1062,7 @@ mod tests {
         // Population must contain the updated status
         let sm_facts = &result.population.facts["StateMachine_has_currentlyInStatus"];
         let sm_fact = sm_facts.iter().find(|f|
-            f.bindings.iter().any(|(_, v)| v == "sm:ORD-1")
+            f.bindings.iter().any(|(_, v)| v == "ORD-1")
         ).expect("SM fact must exist for ORD-1");
         let status_binding = sm_fact.bindings.iter()
             .find(|(n, _)| n == "currentlyInStatus")
