@@ -719,7 +719,7 @@ pub fn domain_to_entities(d: &Domain, slug: &str) -> String {
             "data": {"kind": c.kind, "modality": c.modality, "text": c.text, "spans": c.spans, "entity": c.entity, "minOccurrence": c.min_occurrence, "maxOccurrence": c.max_occurrence}}));
     }
     for (n, sm) in &d.state_machines {
-        e.push(serde_json::json!({"id": format!("sm:{}", n), "type": "State Machine Definition", "domain": slug, "data": {"name": n, "forNoun": sm.noun_name}}));
+        e.push(serde_json::json!({"id": n, "type": "State Machine Definition", "domain": slug, "data": {"name": n, "forNoun": sm.noun_name}}));
         for s in &sm.statuses { e.push(serde_json::json!({"id": format!("status:{}:{}", n, s), "type": "Status", "domain": slug, "data": {"name": s, "stateMachineDefinition": n}})); }
         for t in &sm.transitions { e.push(serde_json::json!({"id": format!("transition:{}:{}:{}", n, t.from, t.event), "type": "Transition", "domain": slug, "data": {"from": t.from, "to": t.to, "event": t.event, "stateMachineDefinition": n}})); }
     }
