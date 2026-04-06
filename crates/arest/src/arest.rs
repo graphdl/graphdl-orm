@@ -1,6 +1,6 @@
-﻿// crates/arest/src/arest.rs
+// crates/arest/src/arest.rs
 //
-// AREST â€” Applicative REpresentational State Transfer
+// AREST â€" Applicative REpresentational State Transfer
 //
 // Command : Population â†’ (Population', Representation)
 //
@@ -13,7 +13,7 @@ use crate::types::*;
 use crate::compile::CompiledModel;
 use crate::ast;
 
-// â”€â”€ Commands â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// â"€â"€ Commands â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
 
 /// The five input classes from Backus Section 14.4.2.
 /// Each corresponds to an AREST operation.
@@ -44,7 +44,7 @@ pub enum Command {
         target: String,
         bindings: std::collections::HashMap<String, String>,
     },
-    /// is-upd: update entity fields (â†“F âˆ˜ [upd, defs])
+    /// is-upd: update entity fields (â†"F âˆ˜ [upd, defs])
     UpdateEntity {
         noun: String,
         domain: String,
@@ -59,7 +59,7 @@ pub enum Command {
     },
 }
 
-// â”€â”€ Result â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// â"€â"€ Result â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -70,7 +70,7 @@ pub struct CommandResult {
     pub violations: Vec<Violation>,
     pub derived_count: usize,
     pub rejected: bool,
-    /// The transformed population â€” the authoritative state after this command.
+    /// The transformed population â€" the authoritative state after this command.
     pub population: Population,
 }
 
@@ -92,7 +92,7 @@ pub struct TransitionAction {
     pub href: String,
 }
 
-// â”€â”€ Apply â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// â"€â"€ Apply â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
 
 pub fn apply_command(
     model: &CompiledModel,
@@ -123,7 +123,139 @@ pub fn apply_command(
     }
 }
 
-// â”€â”€ create = emit âˆ˜ validate âˆ˜ derive âˆ˜ resolve â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// -- apply_command_defs: DEFS-only path (no CompiledModel) ---------
+// Eq. 12: create = emit . validate . derive . resolve
+// All operations resolve through named Func definitions.
+
+pub fn apply_command_defs(
+    defs: &std::collections::HashMap<String, ast::Func>,
+    command: &Command,
+    population: &Population,
+) -> CommandResult {
+    match command {
+        Command::CreateEntity { noun, domain, id, fields } => {
+            create_via_defs(defs, noun, domain, id.as_deref(), fields, population)
+        }
+        _ => CommandResult {
+            entities: vec![],
+            status: None,
+            transitions: vec![],
+            violations: vec![],
+            derived_count: 0,
+            rejected: false,
+            population: population.clone(),
+        },
+    }
+}
+
+fn create_via_defs(
+    defs: &std::collections::HashMap<String, ast::Func>,
+    noun: &str,
+    domain: &str,
+    explicit_id: Option<&str>,
+    fields: &std::collections::HashMap<String, String>,
+    population: &Population,
+) -> CommandResult {
+    // -- resolve --
+    let entity_id = explicit_id.unwrap_or("").to_string();
+
+    let mut new_pop = population.clone();
+    let mut entity_data = fields.clone();
+    entity_data.insert("domain".to_string(), domain.to_string());
+
+    for (field_name, value) in &entity_data {
+        let ft_id = resolve_fact_type_id_defs(defs, noun, field_name);
+        new_pop.facts.entry(ft_id.clone()).or_default().push(
+            FactInstance {
+                fact_type_id: ft_id,
+                bindings: vec![
+                    (noun.to_string(), entity_id.clone()),
+                    (field_name.clone(), value.clone()),
+                ],
+            }
+        );
+    }
+
+    // -- derive --
+    let derivation_defs: Vec<(&str, &ast::Func)> = defs.iter()
+        .filter(|(n, _)| n.starts_with("derivation:"))
+        .map(|(n, f)| (n.as_str(), f))
+        .collect();
+    let derived = crate::evaluate::forward_chain_defs(&derivation_defs, &mut new_pop);
+
+    // Build entity result
+    let mut entities = vec![EntityResult {
+        id: entity_id.clone(),
+        entity_type: noun.to_string(),
+        data: entity_data,
+    }];
+
+    // Extract SM status from population (derived by forward chaining)
+    let sm_id = format!("sm:{}", entity_id);
+    let status = extract_sm_status(&new_pop, &sm_id);
+
+    if let Some(ref st) = status {
+        let mut sm_data = std::collections::HashMap::new();
+        sm_data.insert("forResource".to_string(), entity_id.clone());
+        sm_data.insert("currentlyInStatus".to_string(), st.clone());
+        sm_data.insert("domain".to_string(), domain.to_string());
+        entities.push(EntityResult {
+            id: sm_id,
+            entity_type: "State Machine".to_string(),
+            data: sm_data,
+        });
+    }
+
+    // Inject transition facts from DEFS (Theorem 3: T is in P)
+    // The machine def's transition table is encoded in the population
+    // by the forward chaining derivation. Transition facts already in new_pop.
+
+    // -- validate --
+    let ctx_obj = ast::encode_eval_context("", None, &new_pop);
+    let mut violations = Vec::new();
+    for (name, func) in defs {
+        if !name.starts_with("constraint:") { continue; }
+        let result = ast::apply(func, &ctx_obj, defs);
+        let is_deontic = name.contains("obligatory") || name.contains("forbidden");
+        let decoded = ast::decode_violations(&result);
+        for mut v in decoded {
+            v.alethic = !is_deontic;
+            violations.push(v);
+        }
+    }
+
+    let rejected = violations.iter().any(|v| v.alethic);
+
+    // -- emit --
+    let transitions = hateoas_from_population(&new_pop, noun, &entity_id, status.as_deref());
+
+    CommandResult {
+        entities,
+        status,
+        transitions,
+        violations,
+        derived_count: derived.len(),
+        rejected,
+        population: if rejected { population.clone() } else { new_pop },
+    }
+}
+
+fn resolve_fact_type_id_defs(
+    defs: &std::collections::HashMap<String, ast::Func>,
+    noun: &str,
+    field: &str,
+) -> String {
+    for (name, _) in defs {
+        if !name.starts_with("schema:") { continue; }
+        let schema_id = &name["schema:".len()..];
+        if schema_id.contains(noun) && schema_id.contains(field) {
+            return schema_id.to_string();
+        }
+    }
+    format!("{}_has_{}", noun, field)
+}
+
+// â"€â"€ create = emit âˆ˜ validate âˆ˜ derive âˆ˜ resolve â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
 // Right-to-left: resolve â†’ derive â†’ validate â†’ emit
 // Validate must see the complete population (base + derived facts).
 
@@ -137,7 +269,7 @@ fn apply_create_entity(
 ) -> CommandResult {
     // create = emit âˆ˜ validate âˆ˜ derive âˆ˜ resolve
     //
-    // â”€â”€ resolve â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // â"€â"€ resolve â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
     // Apply the reference scheme selector to determine entity identity.
     // Insert entity fields as facts: Pop' = Pop âˆª {entity facts}.
     let entity_id = resolve_entity_id(model, noun, explicit_id, fields);
@@ -159,15 +291,15 @@ fn apply_create_entity(
         );
     }
 
-    // â”€â”€ derive â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // â"€â"€ derive â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
     // Forward-chain derivation rules to fixed point.
-    // State machine initialization is NOT a separate step â€” the SM instance
+    // State machine initialization is NOT a separate step â€" the SM instance
     // and its initial status are derived facts produced by forward chaining
     // (compile_sm_initialization derivation rule).
     let derived = crate::evaluate::forward_chain_ast(model, &mut new_pop);
 
     // Build entity results from the population.
-    // The SM instance was derived by forward chaining â€” extract status from population.
+    // The SM instance was derived by forward chaining â€" extract status from population.
     let mut entities = vec![EntityResult {
         id: entity_id.clone(),
         entity_type: noun.to_string(),
@@ -210,15 +342,15 @@ fn apply_create_entity(
         }
     }
 
-    // â”€â”€ validate â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // â"€â"€ validate â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
     // Evaluate constraints against the complete population (base + derived).
     let violations = crate::evaluate::evaluate_via_ast(model, "", None, &new_pop);
 
-    // Alethic violations are structural impossibilities â€” always reject.
+    // Alethic violations are structural impossibilities â€" always reject.
     // Deontic violations are reportable but don't prevent the command.
     let rejected = violations.iter().any(|v| v.alethic);
 
-    // â”€â”€ emit â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // â"€â"€ emit â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
     // Produce the representation: entities, HATEOAS links, violations.
     // If rejected, the population is unchanged (paper Â§4: "The population is unchanged").
     let transitions = hateoas_from_population(&new_pop, noun, &entity_id, status.as_deref());
@@ -234,9 +366,9 @@ fn apply_create_entity(
     }
 }
 
-// â”€â”€ update = emit âˆ˜ validate âˆ˜ derive âˆ˜ (â†“F âˆ˜ [upd, â†‘F]) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-// Per Eq. 6: is-upd âˆ˜ â†‘K â†’ [rpt, â†“F âˆ˜ [upd, defs]] âˆ˜ [â†‘I, â†‘F]
-// Reads current facts (â†‘F), merges new fields (upd), validates, stores (â†“F).
+// â"€â"€ update = emit âˆ˜ validate âˆ˜ derive âˆ˜ (â†"F âˆ˜ [upd, â†‘F]) â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
+// Per Eq. 6: is-upd âˆ˜ â†‘K â†’ [rpt, â†"F âˆ˜ [upd, defs]] âˆ˜ [â†‘I, â†‘F]
+// Reads current facts (â†‘F), merges new fields (upd), validates, stores (â†"F).
 
 fn apply_update_entity(
     model: &CompiledModel,
@@ -266,7 +398,7 @@ fn apply_update_entity(
         merged_fields.insert(k.clone(), v.clone());
     }
 
-    // â†“F: replace entity facts in population
+    // â†"F: replace entity facts in population
     let mut new_pop = population.clone();
     for (field_name, value) in &merged_fields {
         let ft_id = resolve_fact_type_id(model, noun, field_name);
@@ -317,7 +449,7 @@ fn apply_update_entity(
     }
 }
 
-// â”€â”€ transition = sm.func : <status, event> â†’ status' â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// â"€â"€ transition = sm.func : <status, event> â†’ status' â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
 
 fn apply_transition(
     model: &CompiledModel,
@@ -333,7 +465,7 @@ fn apply_transition(
     let defs = std::collections::HashMap::new();
 
     // Apply the SM's AST func to <current_status, event>.
-    // Guards are compiled into the Condition predicates â€”
+    // Guards are compiled into the Condition predicates â€"
     // if a guard fails, the func returns current state (no transition).
     for sm in &model.state_machines {
         let from_status = current_status.unwrap_or(&sm.initial);
@@ -369,7 +501,7 @@ fn apply_transition(
                 }
             }
         } else {
-            // No existing SM facts â€” insert new status fact
+            // No existing SM facts â€" insert new status fact
             new_pop.facts.entry(status_key.clone()).or_default().push(
                 FactInstance {
                     fact_type_id: status_key,
@@ -431,7 +563,7 @@ fn apply_transition(
     }
 }
 
-// â”€â”€ is-qry: query the population â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// â"€â"€ is-qry: query the population â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
 
 fn apply_query(
     model: &CompiledModel,
@@ -502,7 +634,7 @@ fn apply_query(
     }
 }
 
-// â”€â”€ is-chg: install readings â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// â"€â"€ is-chg: install readings â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
 
 fn apply_load_readings(
     markdown: &str,
@@ -553,7 +685,7 @@ fn apply_load_readings(
     }
 }
 
-// â”€â”€ Helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// â"€â"€ Helpers â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
 
 /// Look up the compiled graph schema ID for a noun's field.
 /// Falls back to reading-format ID if no compiled schema matches.
@@ -696,7 +828,7 @@ fn to_camel_case(s: &str) -> String {
         .collect()
 }
 
-// â”€â”€ Tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// â"€â"€ Tests â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
 
 #[cfg(test)]
 mod tests {
@@ -899,7 +1031,7 @@ mod tests {
         assert_eq!(status_binding.1, "Placed", "population must reflect new status");
     }
 
-    // â”€â”€ is-qry: Query command â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // â"€â"€ is-qry: Query command â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
 
     #[test]
     fn query_command_returns_matches() {
@@ -942,7 +1074,7 @@ mod tests {
         assert_eq!(result.entities[0].entity_type, "QueryResult");
     }
 
-    // â”€â”€ is-chg: LoadReadings command â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // â"€â"€ is-chg: LoadReadings command â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
 
     #[test]
     fn load_readings_command_parses_markdown() {
@@ -968,7 +1100,7 @@ mod tests {
         let pop = Population { facts: HashMap::new() };
 
         let cmd = Command::LoadReadings {
-            markdown: "".to_string(), // empty â€” should parse OK (empty domain)
+            markdown: "".to_string(), // empty â€" should parse OK (empty domain)
             domain: "empty".to_string(),
         };
 

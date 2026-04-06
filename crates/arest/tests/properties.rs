@@ -1389,3 +1389,40 @@ fn hateoas_nav_defs_produced() {
         .find(|(n, _)| n == "nav:Order:parent");
     assert!(order_parent.is_some(), "Order should have parent nav def");
 }
+
+// ---- #38+#41: create via DEFS, no CompiledModel ----
+// Eq. 12: create = emit . validate . derive . resolve
+// The function takes (defs, command, population) and returns CommandResult.
+// No CompiledModel in the signature.
+
+#[test]
+fn create_entity_via_defs_produces_entity_and_status() {
+    use arest::ast::Func;
+
+    let meta = parse_forml2::parse_to_population(STATE_METAMODEL).unwrap();
+    let orders = parse_forml2::parse_to_population_with_nouns(ORDERS_DOMAIN, &meta).unwrap();
+    let mut pop = meta;
+    for (k, v) in orders.facts { pop.facts.entry(k).or_default().extend(v); }
+
+    let defs: Vec<(String, Func)> = compile::compile_to_defs(&pop);
+    let def_map: HashMap<String, Func> = defs.iter().map(|(n, f)| (n.clone(), f.clone())).collect();
+
+    let mut fields = HashMap::new();
+    fields.insert("customer".to_string(), "Acme".to_string());
+
+    let command = arest::arest::Command::CreateEntity {
+        noun: "Order".to_string(),
+        domain: "orders".to_string(),
+        id: Some("ord-1".to_string()),
+        fields,
+    };
+
+    let result = arest::arest::apply_command_defs(&def_map, &command, &pop);
+
+    assert!(!result.rejected, "Valid create should not be rejected");
+    assert_eq!(result.entities.len(), 1);
+    assert_eq!(result.entities[0].id, "ord-1");
+    assert_eq!(result.entities[0].entity_type, "Order");
+    assert_eq!(result.status, Some("In Cart".to_string()));
+    assert!(!result.transitions.is_empty(), "Should have transitions from initial state");
+}

@@ -200,6 +200,8 @@ The runtime registers functions into $\mathit{DEFS}$ via $\downarrow\!\mathit{DE
 \end{align*}
 The fact receives a function and applies it to its own objects. Runtime functions that interact with external state execute during $\mathit{resolve}$~(\ref{eq:create}), populating cells before $\mathit{derive}$ runs, and functions that consume the representation execute after $\mathit{emit}$. This keeps $\mathit{derive}$ pure, monotonic, and terminating over $P$. A single $\mathit{SYSTEM}$ serves browser, server, and storage runtimes by varying $\mathit{DEFS}$, not by varying the logic. Because the binding is via $\rho$, it is live: when a cell's contents change via $\downarrow$, the $\rho$-application re-evaluates and the bound function fires, making event streaming the re-evaluation of $\rho$ over updated $D$ rather than a separate subscription mechanism.
 
+The register/resolve pattern ($\downarrow\!\mathit{DEFS}$ to register, $\rho$ to resolve) is inversion of control via $\rho$. Every value in the REST representation is a $\rho$-application, including the serialization format. JSON keys are role names (constants in compiled schemas). HTTP status codes are condition results over the violation set. Media types are platform constants registered in $\mathit{DEFS}$ by the runtime. No value is produced outside $\rho$.
+
 \section{Example}
 
 An order domain is declared in FORML\,2:
@@ -375,15 +377,22 @@ All links in the representation are $\theta_1$ operations on $P$ and $S$.
 \begin{align}
 \mathit{links}(s) &= \pi_{\mathit{event}}\!\left(\mathit{Filter}(p) : T\right) \label{eq:hateoas}
 \end{align}
-where $p(t) = (s_{\mathit{from}}(t) = s) \lor \mathit{anc}(s_{\mathit{from}}(t), s)$ and $\mathit{anc}(s', s)$ holds when $s$ is reachable from $s'$ through the transition graph.
+where $p(t) = (s_{\mathit{from}}(t) = s) \lor \mathit{anc}(s_{\mathit{from}}(t), s)$ and $\mathit{anc}(s', s)$ holds when $s$ is reachable from $s'$ through the transitive closure of the transition graph (computed with a visited set to handle cycles). Transition graphs may contain cycles (e.g.\ a support request moving between investigating and waiting states). It is obligatory that each cycle in the transition graph has some exit Transition. This deontic mandatory constraint ensures liveness without requiring structural acyclicity.
 
 \smallskip\noindent
-\textit{(b) Navigation links.} Let $F_B$ be the binary fact types between entity nouns. For each $f \in F_B$, let $r_c$ denote the role constrained by a UC and $\bar{r}_c$ the other role. A UC on $r_c$ establishes a functional dependency from $r_c$ to $\bar{r}_c$, making the $r_c$ noun the child. The navigation links for an entity $e$ of noun $n$ are:
+\textit{(b) Navigation links.} Let $F$ be the set of all fact types in $S$ and let $U_f$ denote the role set spanned by the UC on fact type $f$. Let $S_f = R_f \setminus U_f$ be the non-spanned roles. For a noun $n$ participating in $f$, the navigation algorithm is:
+\begin{enumerate}
+\item \textbf{Related collection.} For every $f$ in which $n$ participates, $f$ is a related collection on $n$, filtered by $n$. This always applies.
+\item \textbf{Parent/child.} If $S_f \neq \emptyset$, each noun playing a role in $S_f$ is a child of each noun playing a role in $U_f$. The UC establishes a functional dependency from $U_f$ to $S_f$.
+\item \textbf{Peer resource.} If $S_f = \emptyset$ (spanning UC), $f$ appears as a navigable peer resource at the level of its highest participant in the navigation hierarchy.
+\end{enumerate}
+Unary fact types ($|R_f| = 1$) are boolean properties with no navigation target. Binary fact types ($|R_f| = 2$) with a single-role UC reduce to the standard parent/child case where the constrained role's noun is the child. For the binary case, the navigation links for an entity $e$ of noun $n$ are:
 \begin{align}
 \mathit{children}(n) &= \pi_{\mathit{noun}(r_c)}\!\left(\mathit{Filter}(\mathit{uc}(r_c) \land \mathit{eq} \circ [\mathit{noun}(\bar{r}_c), \bar{n}]) : F_B\right) \label{eq:children} \\
 \mathit{parent}(n) &= \pi_{\mathit{noun}(\bar{r}_c)}\!\left(\mathit{Filter}(\mathit{uc}(r_c) \land \mathit{eq} \circ [\mathit{noun}(r_c), \bar{n}]) : F_B\right) \label{eq:parent} \\
-\mathit{nav}(e, n) &= \mathit{children}(n) \;\cup\; \mathit{parent}(n) \label{eq:nav}
+\mathit{nav}(e, n) &= \mathit{children}(n) \;\cup\; \mathit{parent}(n) \;\cup\; \mathit{related}(n) \;\cup\; \mathit{peers}(n) \label{eq:nav}
 \end{align}
+where $\mathit{related}(n)$ collects all fact types in which $n$ participates as related collections, and $\mathit{peers}(n)$ collects spanning-UC fact types at the appropriate hierarchy level.
 
 \smallskip\noindent
 The full link set combines both:
@@ -394,7 +403,7 @@ The full link set combines both:
 
 \begin{proof}
 \textit{(a)} $T \subseteq P$. $\mathit{Filter}$ is restriction~(\ref{eq:restrict}); $\pi$ is projection~(\ref{eq:proj}). Both are $\theta_1$ operations.
-\textit{(b)} $F_B \subseteq S$. $\mathit{children}$ and $\mathit{parent}$ are each a projection~(\ref{eq:proj}) over a restriction~(\ref{eq:restrict}) of $F_B$. $\mathit{Filter}$~(\ref{eq:filter-def}) is derived from $\alpha$ and condition. The predicate composes $\mathit{eq}$ with selector and constant, all primitives from Table~\ref{tab:ffp}. The UC on $r_c$ makes $r_c$ functionally dependent on $\bar{r}_c$ (RMAP step~2). The entity hierarchy is determined by these projections without external configuration. Both components of $\mathit{links}_{\mathit{full}}$ are $\theta_1$ operations on $S$ and $P$.
+\textit{(b)} $F \subseteq S$. Each component of $\mathit{nav}$ is a projection~(\ref{eq:proj}) over a restriction~(\ref{eq:restrict}). $\mathit{Filter}$~(\ref{eq:filter-def}) is derived from $\alpha$ and condition. The predicate composes $\mathit{eq}$ with selector and constant, all primitives from Table~\ref{tab:ffp}. For the parent/child case, the UC on $U_f$ establishes a functional dependency from $U_f$ to $S_f$ (RMAP step~2). Related collections are restrictions of $f$ filtered by the participant noun. Peer resources are fact types whose spanning UC produces no functional dependency, presented at the hierarchy level of their highest participant. The navigation algorithm is a single pass over fact types, computing $S_f$ for each and emitting links accordingly. All components of $\mathit{links}_{\mathit{full}}$ are $\theta_1$ operations on $S$ and $P$.
 \end{proof}
 
 \begin{corollary}[Deletion as Terminal State]\label{cor:delete}
@@ -434,7 +443,7 @@ Each new reading $r' \in R'$ parses unambiguously (Theorem~\ref{thm:grammar} dep
 For two peers $A$ and $B$ sharing population $P$, if $A$ proposes event $e$ and $B$ applies $\mathit{validate}$~(\ref{eq:create}) to $P \cup \mathit{resolve}(S, e)$, the event is accepted iff $V$ contains no alethic violation. The constraint set $C_S$ is the consensus predicate. No external consensus protocol is required.
 \end{corollary}
 
-\noindent For $n = 2$, the constraints are sufficient for consensus. For $n > 2$, a total ordering over the shared event log is additionally required so that all peers fold~(\ref{eq:cellfold}) in the same order.
+\noindent For $n = 2$, the constraints are sufficient for consensus. For $n > 2$, a total ordering over the shared event log is additionally required so that all peers fold~(\ref{eq:cellfold}) in the same order. Safety follows from the formalism: every peer folds the same totally-ordered log with the same deterministic $\mathit{SYSTEM}$, producing the same state. Alethic violations are detected independently by every honest peer. Liveness is provided by the single-writer cell. Each cell (Definition~\ref{def:isolation}) has at most one writer at any time. The platform guarantees this by routing all writes to one instance and electing a new instance on failure (the same mechanism as a single-leader append-only log with leader election under partial synchrony). For the peer-to-peer extension, the shared event log with hash-chained entries is the equivalent of a log partition. Liveness requires leader election via majority vote, the standard result from partially synchronous consensus.
 
 \medskip
 \noindent Common operational concerns map directly to the formalism: versioning is the event stream ($E$), migration is ingestion of new readings (Corollary~\ref{cor:closure}), backward compatibility is preserved by construction (no theorem depends on $D$ at initialization), and auditability is the derivation trace (Sec.\,7.2).
