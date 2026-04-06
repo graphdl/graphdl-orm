@@ -1512,3 +1512,39 @@ fn create_entity_via_defs_produces_entity_and_status() {
     assert_eq!(result.status, Some("In Cart".to_string()));
     assert!(!result.transitions.is_empty(), "Should have transitions from initial state");
 }
+
+#[test]
+fn transition_via_defs_changes_status() {
+    use arest::ast::Func;
+
+    let meta = parse_forml2::parse_to_population(STATE_METAMODEL).unwrap();
+    let orders = parse_forml2::parse_to_population_with_nouns(ORDERS_DOMAIN, &meta).unwrap();
+    let mut pop = meta;
+    for (k, v) in orders.facts { pop.facts.entry(k).or_default().extend(v); }
+
+    let defs: Vec<(String, Func)> = compile::compile_to_defs(&pop);
+    let def_map: HashMap<String, Func> = defs.iter().map(|(n, f)| (n.clone(), f.clone())).collect();
+
+    // First create an entity to get a population with SM status
+    let mut fields = HashMap::new();
+    fields.insert("customer".to_string(), "Acme".to_string());
+    let create_cmd = arest::arest::Command::CreateEntity {
+        noun: "Order".to_string(),
+        domain: "orders".to_string(),
+        id: Some("ord-1".to_string()),
+        fields,
+    };
+    let create_result = arest::arest::apply_command_defs(&def_map, &create_cmd, &pop);
+    assert_eq!(create_result.status, Some("In Cart".to_string()));
+
+    // Now transition: place the order
+    let transition_cmd = arest::arest::Command::Transition {
+        entity_id: "ord-1".to_string(),
+        event: "place".to_string(),
+        domain: "orders".to_string(),
+        current_status: Some("In Cart".to_string()),
+    };
+    let result = arest::arest::apply_command_defs(&def_map, &transition_cmd, &create_result.population);
+
+    assert_eq!(result.status, Some("Placed".to_string()));
+}

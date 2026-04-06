@@ -136,6 +136,9 @@ pub fn apply_command_defs(
         Command::CreateEntity { noun, domain, id, fields } => {
             create_via_defs(defs, noun, domain, id.as_deref(), fields, population)
         }
+        Command::Transition { entity_id, event, domain, current_status } => {
+            transition_via_defs(defs, entity_id, event, domain, current_status.as_deref(), population)
+        }
         _ => CommandResult {
             entities: vec![],
             status: None,
@@ -292,6 +295,136 @@ fn resolve_fact_type_id_defs(
         }
     }
     format!("{}_has_{}", noun, field)
+}
+
+// -- transition via DEFS: machine_func : <status, event> -> status' --
+
+fn transition_via_defs(
+    defs: &std::collections::HashMap<String, ast::Func>,
+    entity_id: &str,
+    event: &str,
+    _domain: &str,
+    current_status: Option<&str>,
+    population: &Population,
+) -> CommandResult {
+    let mut new_pop = population.clone();
+    let mut new_status = None;
+
+    // Try each machine def. machine:{noun} is the transition func.
+    for (name, func) in defs {
+        if !name.starts_with("machine:") || name.contains(":initial") { continue; }
+
+        // Get initial status for this machine if current_status not provided
+        let initial_key = format!("{}:initial", name);
+        let from_status = match current_status {
+            Some(s) => s.to_string(),
+            None => {
+                if let Some(init_func) = defs.get(&initial_key) {
+                    ast::apply(init_func, &ast::Object::phi(), defs)
+                        .as_atom().unwrap_or("").to_string()
+                } else { continue; }
+            }
+        };
+
+        let input = ast::Object::seq(vec![
+            ast::Object::atom(&from_status),
+            ast::Object::atom(event),
+        ]);
+        let result = ast::apply(func, &input, defs);
+        if let Some(next) = result.as_atom() {
+            if next != from_status {
+                new_status = Some(next.to_string());
+                break;
+            }
+        }
+    }
+
+    if let Some(ref status) = new_status {
+        // Update SM status fact in population
+        let status_key = String::from("StateMachine_has_currentlyInStatus");
+        let mut found = false;
+        if let Some(facts) = new_pop.facts.get_mut(&status_key) {
+            for fact in facts.iter_mut() {
+                if fact.bindings.iter().any(|(_, v)| v == entity_id) {
+                    for (noun, val) in fact.bindings.iter_mut() {
+                        if noun == "currentlyInStatus" {
+                            *val = status.clone();
+                            found = true;
+                        }
+                    }
+                }
+            }
+        }
+        if !found {
+            new_pop.facts.entry(status_key.clone()).or_default().push(
+                FactInstance {
+                    fact_type_id: status_key,
+                    bindings: vec![
+                        (String::from("State Machine"), entity_id.to_string()),
+                        (String::from("currentlyInStatus"), status.clone()),
+                    ],
+                }
+            );
+        }
+    }
+
+    let status = new_status.or_else(|| current_status.map(|s| s.to_string()));
+
+    // Inject transition facts for HATEOAS
+    if let Some(inst_facts) = population.facts.get("InstanceFact") {
+        let mut t_from: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut t_to: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut t_event: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for f in inst_facts {
+            let subj_noun = f.bindings.iter().find(|(k, _)| k == "subjectNoun").map(|(_, v)| v.as_str());
+            let subj_val = f.bindings.iter().find(|(k, _)| k == "subjectValue").map(|(_, v)| v.clone());
+            let obj_noun = f.bindings.iter().find(|(k, _)| k == "objectNoun").map(|(_, v)| v.as_str());
+            let obj_val = f.bindings.iter().find(|(k, _)| k == "objectValue").map(|(_, v)| v.clone());
+            let field = f.bindings.iter().find(|(k, _)| k == "fieldName").map(|(_, v)| v.as_str());
+            if subj_noun == Some("Transition") {
+                let sv = subj_val.unwrap_or_default();
+                if obj_noun == Some("Status") {
+                    let fld = field.unwrap_or_default();
+                    if fld.to_lowercase().contains("from") {
+                        t_from.insert(sv, obj_val.unwrap_or_default());
+                    } else if fld.to_lowercase().contains("to") {
+                        t_to.insert(sv, obj_val.unwrap_or_default());
+                    }
+                } else if obj_noun == Some("Event Type") {
+                    t_event.insert(sv, obj_val.unwrap_or_default());
+                }
+            }
+        }
+        for (t_name, from) in &t_from {
+            if let Some(to) = t_to.get(t_name) {
+                let evt = t_event.get(t_name).cloned().unwrap_or_else(|| t_name.clone());
+                let ft_key = String::from("Transition");
+                new_pop.facts.entry(ft_key.clone()).or_default().push(
+                    FactInstance {
+                        fact_type_id: ft_key,
+                        bindings: vec![
+                            (String::from("from"), from.clone()),
+                            (String::from("to"), to.clone()),
+                            (String::from("event"), evt),
+                        ],
+                    }
+                );
+            }
+        }
+    }
+
+    let noun = "";
+    let transitions = hateoas_from_population(&new_pop, noun, entity_id, status.as_deref());
+
+    CommandResult {
+        entities: vec![],
+        status,
+        transitions,
+        violations: vec![],
+        derived_count: 0,
+        rejected: false,
+        population: new_pop,
+    }
 }
 
 // â"€â"€ create = emit âˆ˜ validate âˆ˜ derive âˆ˜ resolve â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
