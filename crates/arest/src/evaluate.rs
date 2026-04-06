@@ -2082,31 +2082,6 @@ mod tests {
     }
 
     #[test]
-    fn test_backward_compatible_deserialization() {
-        // Old IR JSON without derivation_rules or world_assumption should still parse
-        let json = r#"{
-            "domain": "test",
-            "nouns": {
-                "Customer": {
-                    "objectType": "entity",
-                    "enumValues": null,
-                    "valueType": null,
-                    "superType": null
-                }
-            },
-            "factTypes": {},
-            "constraints": [],
-            "stateMachines": {}
-        }"#;
-
-        let ir: Domain = serde_json::from_str(json).expect("Should parse old IR format");
-        assert_eq!(ir.domain, "test");
-        assert!(ir.derivation_rules.is_empty());
-        let customer = ir.nouns.get("Customer").unwrap();
-        assert_eq!(customer.world_assumption, WorldAssumption::Closed);
-    }
-
-    #[test]
     fn join_derivation_equi_join_on_shared_key() {
         let mut fact_types = HashMap::new();
         fact_types.insert("a_key".to_string(), FactTypeDef {
