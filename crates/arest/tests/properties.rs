@@ -1390,6 +1390,81 @@ fn hateoas_nav_defs_produced() {
     assert!(order_parent.is_some(), "Order should have parent nav def");
 }
 
+// ---- SM init derivation debugging ----
+
+#[test]
+fn sm_init_derivation_produces_facts() {
+    use arest::ast::{self, Func, Object};
+
+    let meta = parse_forml2::parse_to_population(STATE_METAMODEL).unwrap();
+    let orders = parse_forml2::parse_to_population_with_nouns(ORDERS_DOMAIN, &meta).unwrap();
+    let mut pop = meta;
+    for (k, v) in orders.facts { pop.facts.entry(k).or_default().extend(v); }
+
+    let defs: Vec<(String, Func)> = compile::compile_to_defs(&pop);
+    let def_map: HashMap<String, Func> = defs.iter().map(|(n, f)| (n.clone(), f.clone())).collect();
+
+    // Find the SM init derivation
+    let sm_init = defs.iter().find(|(n, _)| n.contains("sm_init")).expect("SM init def should exist");
+    eprintln!("SM init def name: {}", sm_init.0);
+
+    // Build a minimal population with one Order entity
+    let mut test_pop = pop.clone();
+    test_pop.facts.entry("Order_has_customer".to_string()).or_default().push(
+        arest::types::FactInstance {
+            fact_type_id: "Order_has_customer".to_string(),
+            bindings: vec![("Order".to_string(), "ord-1".to_string()), ("customer".to_string(), "Acme".to_string())],
+        }
+    );
+
+    // Encode population and apply derivation
+    let pop_obj = ast::encode_population(&test_pop);
+
+    // Debug: test instances_of_noun separately
+    let get_instances = compile::instances_of_noun_func_pub("Order");
+    let instances_result = ast::apply(&get_instances, &pop_obj, &def_map);
+    eprintln!("instances_of_noun(Order): {}", instances_result);
+
+    // Debug: test get_existing separately
+    let get_existing_func = compile::extract_facts_from_pop_pub("StateMachine_has_forResource");
+    let existing_raw = ast::apply(&get_existing_func, &pop_obj, &def_map);
+    eprintln!("extract_facts_from_pop(SM_has_forResource): {}", existing_raw);
+
+    // Test the full pairs construction
+    let pairs_func = ast::Func::construction(vec![get_instances.clone(), compile::extract_facts_from_pop_pub("StateMachine_has_forResource")]);
+    let pairs_result = ast::apply(&pairs_func, &pop_obj, &def_map);
+    eprintln!("pairs result: {}", pairs_result);
+
+    // Test: Condition(null . sel(2), sel(1), ...) : <<ord-1>, phi>
+    let cond_test = ast::Func::condition(
+        ast::Func::compose(ast::Func::NullTest, ast::Func::Selector(2)),
+        ast::Func::Selector(1),
+        ast::Func::Selector(1),
+    );
+    let cond_result = ast::apply(&cond_test, &pairs_result, &def_map);
+    eprintln!("condition(null.sel(2), sel(1), sel(1)) : pairs = {}", cond_result);
+
+    // Test derive_facts on <ord-1>
+    let single = Object::seq(vec![Object::atom("ord-1")]);
+    let make_one_fact = ast::Func::construction(vec![
+        ast::Func::constant(Object::atom("StateMachine_has_forResource")),
+        ast::Func::constant(Object::atom("test")),
+        ast::Func::construction(vec![
+            ast::Func::construction(vec![ast::Func::constant(Object::atom("SM")), ast::Func::Id]),
+            ast::Func::construction(vec![ast::Func::constant(Object::atom("forResource")), ast::Func::Id]),
+        ]),
+    ]);
+    let one_fact_result = ast::apply(&make_one_fact, &Object::atom("ord-1"), &def_map);
+    eprintln!("make_one_fact : ord-1 = {}", one_fact_result);
+
+    let result = ast::apply(&sm_init.1, &pop_obj, &def_map);
+    eprintln!("SM init raw result: {}", result);
+
+    // Check it is not empty
+    assert!(!matches!(result, Object::Seq(ref v) if v.is_empty()), "SM init should produce derived facts");
+    assert!(!matches!(result, Object::Bottom), "SM init should not produce bottom");
+}
+
 // ---- #38+#41: create via DEFS, no CompiledModel ----
 // Eq. 12: create = emit . validate . derive . resolve
 // The function takes (defs, command, population) and returns CommandResult.

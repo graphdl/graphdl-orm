@@ -266,6 +266,10 @@ fn extract_facts_from_pop(ft_id: &str) -> Func {
 
 /// Find all instances of a noun across all fact types in a population Object.
 /// instances_of_noun(noun) : pop -> <val1, val2, ...>
+/// Public access for testing.
+pub fn instances_of_noun_func_pub(noun_name: &str) -> Func { instances_of_noun_func(noun_name) }
+/// Public access for testing.
+pub fn extract_facts_from_pop_pub(ft_id: &str) -> Func { extract_facts_from_pop(ft_id) }
 fn instances_of_noun_func(noun_name: &str) -> Func {
     // For each ft entry <ft_id, <facts>>, get facts (Selector(2)),
     // for each fact, filter bindings matching noun, extract values.
@@ -1602,11 +1606,18 @@ fn compile_sm_initialization(ir: &Domain) -> Vec<CompiledDerivation> {
                 Func::constant(Object::atom("forResource")),
             ]))),
         );
+        // extract_facts_from_pop returns phi when fact type not found.
+        // Guard: if null, return phi. Otherwise Selector(2) extracts facts.
+        let safe_extract = Func::condition(
+            Func::NullTest,
+            Func::constant(Object::phi()),
+            Func::Selector(2),
+        );
         let get_existing = Func::compose(
             Func::Concat,
             Func::compose(
                 Func::apply_to_all(extract_for_resource),
-                Func::compose(Func::Selector(2), extract_facts_from_pop("StateMachine_has_forResource")),
+                Func::compose(safe_extract, extract_facts_from_pop("StateMachine_has_forResource")),
             ),
         );
 
@@ -1623,9 +1634,20 @@ fn compile_sm_initialization(ir: &Domain) -> Vec<CompiledDerivation> {
             ),
         );
 
-        let new_instances = Func::compose(
+        // If existing is empty, all instances are new.
+        // If existing is non-empty, distr pairs each instance with existing, filter for non-membership.
+        // Condition: (null . sel(2) -> sel(1); filter_new) : <instances, existing>
+        let filter_new = Func::compose(
             Func::apply_to_all(Func::Selector(1)),
-            Func::compose(Func::filter(is_new), Func::compose(Func::DistL, pairs)),
+            Func::compose(Func::filter(is_new), Func::DistR),
+        );
+        let new_instances = Func::compose(
+            Func::condition(
+                Func::compose(Func::NullTest, Func::Selector(2)),
+                Func::Selector(1),
+                filter_new,
+            ),
+            pairs,
         );
 
         let sm_noun_obj = Object::atom(&sm_noun);
