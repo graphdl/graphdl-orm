@@ -50,7 +50,7 @@ export function forwardChain(population: string, handle?: number) {
 
 export function getTransitions(noun: string, status: string, handle?: number) {
   ensureWasm()
-  return JSON.parse(system(h(handle), 'transitions', JSON.stringify({ noun, status })))
+  return JSON.parse(system(h(handle), `transitions:${noun}`, status))
 }
 
 export function applyCommand(command: any, population: string, handle?: number) {

@@ -484,6 +484,39 @@ pub fn compile_to_defs(pop: &Population) -> Vec<(String, Func)> {
         defs.push((format!("machine:{}:initial", sm.noun_name), Func::constant(Object::atom(&sm.initial))));
     }
 
+    // Transitions: for each SM, register transitions:{noun} that takes a status
+    // and returns <<from, to, event>, ...> for available transitions.
+    // Uses the machine func and known events to compute available transitions.
+    for sm in &model.state_machines {
+        let machine_def_name = format!("machine:{}", sm.noun_name);
+        let events: Vec<String> = sm.transition_table.iter().map(|(_, _, e)| e.clone()).collect::<std::collections::HashSet<_>>().into_iter().collect();
+        // Build: for each event, apply machine to <status, event>.
+        // If result != status, include <status, result, event>.
+        // Input: status atom. Output: <<from, to, event>, ...>
+        let mut checks: Vec<Func> = Vec::new();
+        for event in &events {
+            // apply machine_def to <status, event>
+            let apply_machine = Func::compose(
+                Func::Def(machine_def_name.clone()),
+                Func::construction(vec![Func::Id, Func::constant(Object::atom(event))]),
+            );
+            // Condition: if result != status, produce <status, result, event>; else phi
+            let check = Func::condition(
+                Func::compose(Func::Not, Func::compose(Func::Eq, Func::construction(vec![Func::Id, apply_machine.clone()]))),
+                Func::construction(vec![Func::Id, apply_machine, Func::constant(Object::atom(event))]),
+                Func::constant(Object::phi()),
+            );
+            checks.push(check);
+        }
+        // Construction applies all checks to status, producing <result_or_phi, ...>
+        // Then filter out phi entries
+        let all_checks = Func::filter(
+            Func::compose(Func::Not, Func::NullTest),
+        );
+        let transitions_func = Func::compose(all_checks, Func::construction(checks));
+        defs.push((format!("transitions:{}", sm.noun_name), transitions_func));
+    }
+
     // Derivation rules -> named definitions
     for d in &model.derivations {
         defs.push((format!("derivation:{}", d.id), d.func.clone()));

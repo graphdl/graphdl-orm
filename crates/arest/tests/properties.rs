@@ -1498,6 +1498,52 @@ fn hateoas_nav_defs_produced() {
     assert!(order_parent.is_some(), "Order should have parent nav def");
 }
 
+// ---- Backus 14.4.2: operand with cells ----
+
+#[test]
+fn system_operand_fetch_retrieves_cells() {
+    use arest::ast::{self, Object};
+
+    let (pop, defs) = compile_orders();
+
+    // Construct operand per Backus 14.4.2: <CELL:KEY, CELL:INPUT, CELL:FILE, ...defs>
+    let key_cell = ast::cell("KEY", Object::atom("machine:Order:initial"));
+    let input_cell = ast::cell("INPUT", Object::phi());
+    let file_cell = ast::cell("FILE", ast::encode_population(&pop));
+    let operand = Object::Seq(vec![key_cell, input_cell, file_cell]);
+
+    // Fetch retrieves cell contents from the operand
+    assert_eq!(ast::fetch("KEY", &operand).as_atom(), Some("machine:Order:initial"));
+    assert!(!matches!(ast::fetch("FILE", &operand), Object::Bottom));
+    assert_eq!(ast::fetch("INPUT", &operand), Object::phi());
+}
+
+#[test]
+fn transitions_def_returns_available_from_status() {
+    use arest::ast::{self, Object};
+
+    let (_, defs) = compile_orders();
+
+    // transitions:Order should be a DEFS entry
+    let transitions_func = defs.get("transitions:Order").expect("Should have transitions:Order def");
+
+    // From "In Cart", place and cancel should be available
+    let result = ast::apply(transitions_func, &Object::atom("In Cart"), &defs);
+    let items = result.as_seq().expect("Should return a sequence");
+    assert!(!items.is_empty(), "Should have transitions from In Cart");
+
+    // Each item is <from, to, event>
+    let events: Vec<&str> = items.iter()
+        .filter_map(|item| item.as_seq().and_then(|s| s.get(2)).and_then(|o| o.as_atom()))
+        .collect();
+    assert!(events.contains(&"place"), "Should have place transition");
+
+    // From "Delivered" (terminal), no transitions
+    let terminal = ast::apply(transitions_func, &Object::atom("Delivered"), &defs);
+    let terminal_items = terminal.as_seq().unwrap_or(&[]);
+    assert!(terminal_items.is_empty(), "Terminal state should have no transitions");
+}
+
 // ---- SM init derivation debugging ----
 
 #[test]
