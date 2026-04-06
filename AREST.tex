@@ -48,18 +48,16 @@ Three terms carry overloaded abbreviations. \emph{AST} follows Backus's usage (A
 
 \section{Definitions}
 
-Each source formalism solved one layer: Backus the evaluation model, Codd the data model, Halpin the constraint language, and Fielding the transfer protocol. The contribution of AREST is identification, not integration. A FORML\,2 reading is simultaneously an FFP object, a relation schema, a constraint specification, and a resource definition, and the compiler recognizes this identity. The five theorems verify it.
-
 \begin{definition}[AREST]\label{def:arest}
 An \emph{Applicative REpresentational State Transfer} system is an AST system~\cite[Sec.\,14]{backus78} whose state $D$ satisfies:
 \begin{itemize}[nosep]
-\item The $\mathit{FILE}$ cell contains a population $P = \uparrow\!\mathit{FILE}\!:\!D$, a named set of relations~\cite[Sec.\,1.6]{codd70} whose elements are ORM\,2 elementary facts~\cite[Ch.\,2]{halpin08}
+\item The $\mathit{FILE}$ cell contains a population $P = \uparrow\!\mathit{FILE}\!:\!D$, a named set of relations~\cite[Sec.\,1.6]{codd70} whose elements are ORM\,2 elementary facts~\cite[Ch.\,3]{halpin08}
 \item The $\mathit{DEFS}$ cells contain FFP objects~\cite[Sec.\,13.2]{backus78}. These are readings compiled from FORML\,2 declarations~\cite{halpin08}, and functions registered by the runtime
 \end{itemize}
 The system function $\mathit{SYSTEM}\!:\!x = \langle o, D'\rangle$~\cite[Sec.\,14.3.1]{backus78} is defined by the definitions in $D$. REST endpoints are applications of $\mathit{SYSTEM}$ with distinct inputs. The representation function $\rho$~\cite[Sec.\,13.3.2]{backus78} maps an object to the function it represents. Given a fact type, $\rho$ looks it up in $\mathit{DEFS}$ and returns the functional form that determines what happens when an operation is applied. The universe of FFP objects $O$ and $\rho$ are inherited from the AST framework.
 \end{definition}
 
-A fact type~\cite[Ch.\,2]{halpin08} is a constructor ($\mathit{CONS}$) of roles~\cite[Sec.\,11.2.4]{backus78}. Populate the roles with object instances and you get a fact. The fact is a sequence $\langle\mathit{ft}, o_1, \ldots, o_n\rangle$ where $\mathit{ft}$ is the fact type and $o_1, \ldots, o_n$ are the objects playing its roles. Metacomposition~\cite[Sec.\,13.3.2]{backus78} resolves the fact by looking up its fact type:
+A fact type~\cite[Ch.\,3]{halpin08} is a constructor ($\mathit{CONS}$) of roles~\cite[Sec.\,11.2.4]{backus78}. Populate the roles with object instances and you get a fact. The fact is a sequence $\langle\mathit{ft}, o_1, \ldots, o_n\rangle$ where $\mathit{ft}$ is the fact type and $o_1, \ldots, o_n$ are the objects playing its roles. Metacomposition~\cite[Sec.\,13.3.2]{backus78} resolves the fact by looking up its fact type:
 \begin{align}
 (\rho\langle x_1, \ldots, x_n\rangle)\!:\!y = (\rho\,x_1)\!:\!\langle\langle x_1, \ldots, x_n\rangle, y\rangle \label{eq:metacomp}
 \end{align}
@@ -106,7 +104,7 @@ $\mathit{Filter}$ is $\alpha$ (apply-to-all) of a condition: keep elements where
 \mathit{foldl}\;f\;z\;\langle\rangle &= z \notag \\
 \mathit{foldl}\;f\;z\;\langle e, E'\rangle &= \mathit{foldl}\;f\;(f\;z\;e)\;E' \label{eq:foldl-def}
 \end{align}
-$\mathit{foldl}$ is a left fold derivable from Backus's $\mathit{while}$~\cite[Sec.\,11.2.4]{backus78}: $\mathit{foldl}\;f\;z\;E \equiv (\mathit{while}\;\mathit{not} \circ \mathit{null} \circ 1\;\;[f \circ [2, 1 \circ 1],\;\mathit{tl} \circ 1]) \circ 2 : \langle E, z\rangle$, where 1 and 2 select the event stream and accumulator from the pair. The right fold $/f$~\cite[Sec.\,11.2.4]{backus78} processes right to left. State machines require left to right (chronological event order), hence $\mathit{foldl}$.
+$\mathit{foldl}$ is a left fold derivable from Backus's $\mathit{while}$~\cite[Sec.\,11.2.4]{backus78}. State machines require left-to-right (chronological) evaluation, hence $\mathit{foldl}$ rather than the right fold $/f$.
 
 The compiled form for each FORML\,2 construct:
 
@@ -154,12 +152,7 @@ R \cdot S &\equiv \pi_{1s}(R \mathbin{*} S) \label{eq:rcomp} \\
 
 \subsection{State and Cells}
 
-The state $D$ is a sequence of cells $\langle\mathit{CELL}, n, c\rangle$~\cite[Sec.\,14.3]{backus78}:
-\begin{align}
-\uparrow\!n\!:\!D &\to c \qquad \text{(fetch)} \label{eq:fetch} \\
-\downarrow\!n\!:\!\langle x, D\rangle &\to D' \quad\; \text{(store)} \label{eq:store}
-\end{align}
-$\mathit{FILE}$ is a cell whose contents is~$P$. RMAP~\cite[Ch.\,17]{halpin08} determines which facts belong to which cell from the schema's uniqueness constraints. The result is a 3NF row: the complete set of facts that depend on one entity's key. Each entity is a cell. The cell stores exactly the facts that RMAP groups under that entity. A cell is what it says it is: a complete object of a type. Cells may contain sub-stores~\cite[Sec.\,14.7]{backus78}. Partitioning is a cell containing a subset of~$P$.
+The state $D$ is a sequence of cells $\langle\mathit{CELL}, n, c\rangle$ with Backus's fetch ($\uparrow\!n\!:\!D \to c$) and store ($\downarrow\!n\!:\!\langle x, D\rangle \to D'$) operators~\cite[Sec.\,14.3]{backus78}. $\mathit{FILE}$ is a cell whose contents is~$P$. RMAP~\cite[Ch.\,10]{halpin08} determines which facts belong to which cell from the schema's uniqueness constraints. The result is a 3NF row: the complete set of facts that depend on one entity's key. Each entity is a cell. The cell stores exactly the facts that RMAP groups under that entity. A cell is what it says it is: a complete object of a type. Cells may contain sub-stores~\cite[Sec.\,14.7]{backus78}. Partitioning is a cell containing a subset of~$P$.
 
 \section{The System Function}
 
@@ -186,7 +179,7 @@ A state machine is a left fold over an event stream:
 \mathit{machine}(s_0, E) &= \mathit{foldl}\;\mathit{transition}\;s_0\;E \label{eq:sm} \\
 \mathit{transition}(s, e) &= (p \to \bar{s'} ;\; \bar{s})\!:\!\langle s, e \rangle \label{eq:trans}
 \end{align}
-where $\mathit{foldl}\;f\;z\;\langle\rangle = z$ and $\mathit{foldl}\;f\;z\;\langle e, E'\rangle = \mathit{foldl}\;f\;(f\;z\;e)\;E'$. The transition function is a chain of Backus conditions~\cite[Sec.\,11.2.4]{backus78}: $(p \to f;\; g)$ where $p$ tests whether $\langle s, e\rangle$ matches a declared transition, $f$ returns the target state, and $g$ tries the next condition or returns the current state~$\bar{s}$ as fallback. Events are stored and processed in chronological order. The fold is pure replay. Applying the event stream to a machine produces the current state without side effects, and no entry verbs or callbacks execute. This is restoration of a hibernating machine. Only a new event, not yet in the stream, causes a real transition where the entry verb fires and effects are produced.
+The transition function is a chain of Backus conditions~\cite[Sec.\,11.2.4]{backus78}: $(p \to f;\; g)$ where $p$ tests whether $\langle s, e\rangle$ matches a declared transition, $f$ returns the target state, and $g$ tries the next condition or returns the current state~$\bar{s}$ as fallback. Events are stored and processed in chronological order. The fold is pure replay. Applying the event stream to a machine produces the current state without side effects, and no entry verbs or callbacks execute. This is restoration of a hibernating machine. Only a new event, not yet in the stream, causes a real transition where the entry verb fires and effects are produced.
 
 Deletion is a transition to a terminal state, not a distinct primitive. The entity receives $\mathit{delete}$ as the operation. It reaches a state with no outgoing transitions and is excluded from query results by restriction~(\ref{eq:restrict}).
 
@@ -260,7 +253,7 @@ $\mu$ evaluates by applicative-order $\beta$-reduction~\cite[Sec.\,13.3.1]{backu
 Three constraints govern execution:
 \begin{enumerate}[nosep]
 \item \textbf{Reduction order:} applicative (call-by-value). All arguments are reduced before the function is applied.
-\item \textbf{Scope:} evaluation is confined to the request-local partition of $D$. RMAP~\cite[Ch.\,17]{halpin08} determines the partition from the schema's uniqueness constraints.
+\item \textbf{Scope:} evaluation is confined to the request-local partition of $D$. RMAP~\cite[Ch.\,10]{halpin08} determines the partition from the schema's uniqueness constraints.
 \item \textbf{Derivation:} forward chaining, monotonic, evaluated to the least fixed point per request. Since $\mathit{derive}$ only adds facts over finite $P_{\mathit{local}}$, the fixed point exists (Knaster-Tarski) and is reached in $\leq |P_{\mathit{local,max}}|$ iterations. The derivation chain (which rules fired, in what order, producing which facts) is recorded and available on demand as part of the representation.
 \end{enumerate}
 The completeness result (Theorem~\ref{thm:complete}) assumes evaluation to the least fixed point under this strategy.
@@ -281,13 +274,13 @@ Backus states this directly: ``the state cannot change during the computation of
 For each cell $\langle\mathit{CELL}, n, c\rangle$ in $D$, at most one $\mu$ application that writes to $n$ may be in progress at any time. Concurrent $\mu$ applications over disjoint cells are permitted.
 \end{definition}
 
-\noindent RMAP~\cite[Ch.\,17]{halpin08} determines which facts belong to which cell from the schema's uniqueness constraints. Each entity is a cell. Its fold is independent of other entities' folds. A single-threaded runtime (e.g.\ a WASM isolate) satisfies Definition~\ref{def:isolation} trivially. A distributed system requires one writer per cell (actor mailbox, partitioned queue, or single-writer lease).
+\noindent RMAP assigns each entity to its own cell whose fold is independent of other entities' folds. A single-threaded runtime (e.g.\ a WASM isolate) satisfies Definition~\ref{def:isolation} trivially. A distributed system requires one writer per cell (actor mailbox, partitioned queue, or single-writer lease).
 
 Theorems~\ref{thm:complete}--\ref{thm:derive} hold under Definition~\ref{def:isolation}. Without it, Theorem~\ref{thm:complete} fails silently. Two concurrent $\mathit{create}$ operations on the same cell may both pass $\mathit{validate}$ against stale $P$ and produce a $D'$ that violates a uniqueness constraint. Unlike a grammar violation (Theorem~\ref{thm:grammar}), which is caught at parse time, a cell isolation violation produces inconsistent state without an error.
 
 \subsection{Distributed Evaluation}
 
-Each cell from Sec.\,4.2 stores the 3NF row, including the state machine's current status as one of its facts. The event stream $E$ is demultiplexed into per-cell streams by RMAP~\cite[Ch.\,17]{halpin08}:
+Each cell stores the 3NF row, including the current status. The event stream $E$ is demultiplexed into per-cell streams by RMAP:
 \begin{align}
 E_n &= \mathit{Filter}(\mathit{eq} \circ [\mathit{RMAP}, \bar{n}]) : E \label{eq:demux}
 \end{align}
@@ -307,7 +300,7 @@ A browser runtime is a node in the same model. Cells replicated locally fold eve
 
 For two peers sharing a cell, one proposes an event and the other runs $\mathit{validate}$~(\ref{eq:create}) against $P \cup \mathit{resolve}(S, e)$. The event is accepted iff $V$ contains no alethic violation. The constraint set $C_S$ is the consensus predicate (Corollary~\ref{cor:consensus}). For $n > 2$ peers, a shared event log with total ordering is required. Each event references the hash of its predecessor, forming a chain that guarantees integrity and deterministic replay. Peers compare chain tips and adopt the longest chain on fork. The fold~(\ref{eq:cellfold}) over the shared log produces the same state on every peer.
 
-For anonymous peers, three additional properties are required. First, each event carries a cryptographic signature identifying the peer that appended it. Second, reading events ($\mathit{compile} \circ \mathit{parse}$ applications that modify $\mathit{DEFS}$) require authorization. This is a deontic constraint evaluated on every fold: a peer not authorized to modify $\mathit{DEFS}$ can append fact events but not reading events. Third, every peer validates independently on fold, so a malicious event that violates an alethic constraint is detected deterministically by every honest peer. No peer trusts another peer's evaluation. The hash chain provides ordering and tamper detection, the constraints provide validity, the signatures provide identity, and the authorization constraints provide permission. These four properties compose from the existing formalism without a separate security layer.
+For anonymous peers, events carry cryptographic signatures for identity, schema modifications ($\mathit{compile} \circ \mathit{parse}$) require authorization (a deontic constraint on the fold), and every peer validates independently. The hash chain provides ordering, constraints provide validity, signatures provide identity, and authorization provides permission---all composed from the existing formalism.
 
 \section{Properties}
 
@@ -446,7 +439,7 @@ Each new reading $r' \in R'$ parses unambiguously (Theorem~\ref{thm:grammar} dep
 For two peers $A$ and $B$ sharing population $P$, if $A$ proposes event $e$ and $B$ applies $\mathit{validate}$~(\ref{eq:create}) to $P \cup \mathit{resolve}(S, e)$, the event is accepted iff $V$ contains no alethic violation. The constraint set $C_S$ is the consensus predicate. No external consensus protocol is required.
 \end{corollary}
 
-\noindent For $n = 2$, the constraints are sufficient for consensus. For $n > 2$, a total ordering over the shared event log is additionally required so that all peers fold~(\ref{eq:cellfold}) in the same order. Safety follows from the formalism: every peer folds the same totally-ordered log with the same deterministic $\mathit{SYSTEM}$, producing the same state. Alethic violations are detected independently by every honest peer. Liveness is provided by the single-writer cell. Each cell (Definition~\ref{def:isolation}) has at most one writer at any time. The platform guarantees this by routing all writes to one instance and electing a new instance on failure (the same mechanism as a single-leader append-only log with leader election under partial synchrony). For the peer-to-peer extension, the shared event log with hash-chained entries is the equivalent of a log partition. Liveness requires leader election via majority vote, the standard result from partially synchronous consensus.
+\noindent For $n > 2$, a total ordering over the shared event log is additionally required so that all peers fold~(\ref{eq:cellfold}) in the same order. Safety follows from deterministic replay; liveness from the single-writer cell (Definition~\ref{def:isolation}).
 
 \medskip
 \noindent Common operational concerns map directly to the formalism: versioning is the event stream ($E$), migration is ingestion of new readings (Corollary~\ref{cor:closure}), backward compatibility is preserved by construction (no theorem depends on $D$ at initialization), and auditability is the derivation trace (Sec.\,7.2).
@@ -459,7 +452,7 @@ Traditional middleware (authentication, validation, rate limiting, transformatio
 
 \section{Conclusion}
 
-AREST is a Backus AST system~\cite{backus78} whose definitions are compiled FORML\,2 readings~\cite{halpin08} and whose state is Codd's named set~\cite{codd70} of ORM\,2 elementary facts. REST endpoints~\cite{fielding00} are applications of the system function. Ingesting readings is self-modification. Transitions produce hypermedia. The five theorems form a chain: the grammar is unambiguous (Theorem~\ref{thm:grammar}), so specifications compile faithfully to executables (Theorem~\ref{thm:spec}), so state transfer is complete (Theorem~\ref{thm:complete}), so all links (transitions and entity hierarchy) are projections of the population (Theorem~\ref{thm:hateoas}), so every value in the representation is a $\rho$-application (Theorem~\ref{thm:derive}). Self-modification preserves all five (Corollary~\ref{cor:closure}). The system grows by ingesting facts and never loses its guarantees.
+Theorems~\ref{thm:grammar}--\ref{thm:derive} form a dependency chain from unambiguous grammar to full derivability, each eliminating one source of failure between domain knowledge and running REST~\cite{fielding00} application. Self-modification preserves all five (Corollary~\ref{cor:closure}). Fielding's remaining architectural constraints follow from the formalism: statelessness holds because each $\mathit{SYSTEM}$ application is a pure transition on $D$; cacheability holds because the representation is a deterministic function of $P$ and $S$ (Theorem~\ref{thm:derive}), valid until the cell changes via $\downarrow$; layered system holds because cells are location-independent (Sec.\,6.3); and code-on-demand is self-modification via ingesting readings (Corollary~\ref{cor:closure}).
 
 The five properties compose into a guarantee for automated agents, addressing two distinct sources of LLM hallucination. First, the specification-execution gap. An LLM writing FORML\,2 readings produces unambiguous specifications (Theorem~\ref{thm:grammar}) that are the executables (Theorem~\ref{thm:spec}). An LLM consuming the API reads values that are $\rho$-applications over $P$ (Theorem~\ref{thm:derive}) and discovers every valid action via HATEOAS links (Theorem~\ref{thm:hateoas}). There are no undocumented endpoints, no hidden middleware, no informal contracts to hallucinate through. Second, the reasoning chain gap. LLMs do not reliably chain logical inferences, and errors compound over steps. The forward chainer in $\mathit{derive}$~(\ref{eq:create}) evaluates derivation rules to the least fixed point (Theorem~\ref{thm:complete}), and the derived facts appear in the representation (Theorem~\ref{thm:derive}). The LLM reads \emph{conclusions}, not premises. The logical chain that produced them was evaluated deterministically by the engine, outside the LLM's context. The LLM does not reason through the chain; it consumes the result. When the chain itself is needed (for debugging, auditing, or explanation), the derivation trace is available on demand as a sequence of rule applications over $P$, each a $\rho$-application (Theorem~\ref{thm:derive}).
 
@@ -485,13 +478,10 @@ E.F. Codd, ``Relational Completeness of Data Base Sublanguages,'' in R. Rustin, 
 R.T. Fielding, ``Architectural Styles and the Design of Network-based Software Architectures,'' Ph.D. dissertation, Univ.\ of California, Irvine, 2000.
 
 \bibitem{halpin08}
-T. Halpin, \emph{Information Modeling and Relational Databases}, 2nd ed. Morgan Kaufmann, 2008.
+T. Halpin, \emph{Information Modeling and Relational Databases}, Morgan Kaufmann, 2001.
 
 \bibitem{halpin06}
 T. Halpin and M. Curland, ``Automated Verbalization for ORM 2,'' in \emph{OTM Workshops}, pp.~1181--1190, 2006.
-
-\bibitem{halpin06b}
-T. Halpin, M. Curland, and CS445 Class, ``ORM 2 Constraint Verbalization: Part 1,'' Technical Report ORM2-02, Neumont University, 2006.
 
 \bibitem{norma}
 T.~Halpin and M.~Curland, NORMA (Natural Object-Role Modeling Architect), open-source reference implementation, \url{https://github.com/ormsolutions/NORMA}.
