@@ -12,7 +12,6 @@
 //   - State machines are folds: run_machine = fold(transition)(initial)(stream)
 //   - No variables, no mutable state during evaluation â€" only reduction
 
-use std::sync::Arc;
 use std::collections::{HashMap, HashSet};
 use crate::types::*;
 
@@ -130,37 +129,7 @@ pub struct FactEvent {
     pub target_noun: String, // which noun's state machine to transition
 }
 
-// â"€â"€ Object â†" Population decoding â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
-// Decode a population Object back to a Population struct.
-// Inverse of ast::encode_population.
-
-fn decode_population_object(obj: &crate::ast::Object) -> Population {
-    let mut facts: HashMap<String, Vec<FactInstance>> = HashMap::new();
-    if let Some(fact_types) = obj.as_seq() {
-        for ft_obj in fact_types {
-            if let Some(ft_items) = ft_obj.as_seq() {
-                if ft_items.len() == 2 {
-                    let ft_id = ft_items[0].as_atom().unwrap_or("").to_string();
-                    if let Some(fact_objs) = ft_items[1].as_seq() {
-                        let instances: Vec<FactInstance> = fact_objs.iter().filter_map(|fact_obj| {
-                            let bindings: Vec<(String, String)> = fact_obj.as_seq()?.iter().filter_map(|b| {
-                                let pair = b.as_seq()?;
-                                if pair.len() == 2 {
-                                    Some((pair[0].as_atom()?.to_string(), pair[1].as_atom()?.to_string()))
-                                } else {
-                                    None
-                                }
-                            }).collect();
-                            Some(FactInstance { fact_type_id: ft_id.clone(), bindings })
-                        }).collect();
-                        facts.insert(ft_id, instances);
-                    }
-                }
-            }
-        }
-    }
-    Population { facts }
-}
+// (decode_population_object removed -- no longer needed after eliminating all Func::Native closures)
 
 // â"€â"€ Schema Compilation â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
 // Compile fact types to Construction functions (CONS of Roles).
@@ -189,27 +158,8 @@ fn compile_schemas(ir: &Domain) -> HashMap<String, CompiledSchema> {
     }).collect()
 }
 
-// â"€â"€ Population Primitives â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
-// Composable building blocks. Each is a pure function over Population.
-
-/// All instances of a noun across the entire population.
-fn instances_of(noun_name: &str, population: &Population) -> HashSet<String> {
-    population.facts.values()
-        .flat_map(|facts| facts.iter())
-        .flat_map(|f| &f.bindings)
-        .filter(|(name, _)| name == noun_name)
-        .map(|(_, val)| val.clone())
-        .collect()
-}
-
-/// Whether an entity instance participates in a specific fact type.
-fn participates_in(entity: &str, noun_name: &str, fact_type_id: &str, population: &Population) -> bool {
-    population.facts.get(fact_type_id).map_or(false, |facts| {
-        facts.iter().any(|f| {
-            f.bindings.iter().any(|(name, val)| name == noun_name && val == entity)
-        })
-    })
-}
+// (Population-struct primitives instances_of/participates_in removed --
+//  replaced by pure Func equivalents instances_of_noun_func/extract_facts_func)
 
 // â"€â"€ AST Constraint Builders â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
 // Pure Func constructors for constraint evaluation.
@@ -872,95 +822,10 @@ fn compile_derivations(ir: &Domain) -> Vec<CompiledDerivation> {
     derivations
 }
 
-// â"€â"€ Object-level population helpers â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
-// These operate directly on the population Object (Seq of <ft_id, <facts>>)
-// without decoding to Population structs. Used by derivation compilers.
-
-/// Find the facts Seq for a specific fact type ID in a population Object.
-/// Population: <E1, E2, ...> where Ei = <ft_id, <facts...>>
-/// Returns the <facts...> Seq if found, or empty Seq.
-fn obj_find_ft<'a>(pop_obj: &'a crate::ast::Object, target_ft_id: &str) -> &'a [crate::ast::Object] {
-    static EMPTY: Vec<crate::ast::Object> = Vec::new();
-    if let Some(entries) = pop_obj.as_seq() {
-        for entry in entries {
-            if let Some(pair) = entry.as_seq() {
-                if pair.len() == 2 {
-                    if let Some(ft_id) = pair[0].as_atom() {
-                        if ft_id == target_ft_id {
-                            return pair[1].as_seq().unwrap_or(&EMPTY);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    &EMPTY
-}
-
-/// Collect all unique values for a noun name across the entire population Object.
-fn obj_instances_of(pop_obj: &crate::ast::Object, noun_name: &str) -> HashSet<String> {
-    let mut result = HashSet::new();
-    if let Some(entries) = pop_obj.as_seq() {
-        for entry in entries {
-            if let Some(pair) = entry.as_seq() {
-                if pair.len() == 2 {
-                    if let Some(facts) = pair[1].as_seq() {
-                        for fact in facts {
-                            if let Some(bindings) = fact.as_seq() {
-                                for binding in bindings {
-                                    if let Some(bpair) = binding.as_seq() {
-                                        if bpair.len() == 2 {
-                                            if let (Some(n), Some(v)) = (bpair[0].as_atom(), bpair[1].as_atom()) {
-                                                if n == noun_name {
-                                                    result.insert(v.to_string());
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    result
-}
-
-/// Check if an entity participates in a specific fact type in the population Object.
-fn obj_participates_in(pop_obj: &crate::ast::Object, entity: &str, noun_name: &str, ft_id: &str) -> bool {
-    let facts = obj_find_ft(pop_obj, ft_id);
-    for fact in facts {
-        if let Some(bindings) = fact.as_seq() {
-            for binding in bindings {
-                if let Some(bpair) = binding.as_seq() {
-                    if bpair.len() == 2 {
-                        if let (Some(n), Some(v)) = (bpair[0].as_atom(), bpair[1].as_atom()) {
-                            if n == noun_name && v == entity {
-                                return true;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    false
-}
-
-/// Build a derived fact Object: <fact_type_id, reading, <bindings>>
-/// where each binding is <noun_name, value>.
-fn obj_derived_fact(ft_id: &str, reading: &str, bindings: &[(String, String)]) -> crate::ast::Object {
-    let binding_objs: Vec<crate::ast::Object> = bindings.iter().map(|(n, v)| {
-        crate::ast::Object::seq(vec![crate::ast::Object::atom(n), crate::ast::Object::atom(v)])
-    }).collect();
-    crate::ast::Object::seq(vec![
-        crate::ast::Object::atom(ft_id),
-        crate::ast::Object::atom(reading),
-        crate::ast::Object::Seq(binding_objs),
-    ])
-}
+// (Object-level population helpers obj_find_ft, obj_instances_of,
+//  obj_participates_in, obj_derived_fact removed -- no longer needed
+//  after eliminating all Func::Native closures. All population
+//  traversal is now via pure Func: extract_facts_from_pop, instances_of_noun_func, etc.)
 
 /// Compile an explicit derivation rule from the IR.
 ///
@@ -1051,150 +916,213 @@ fn compile_join_derivation(ir: &Domain, rule: &DerivationRuleDef) -> CompiledDer
         .map(|ft| ft.reading.clone())
         .unwrap_or_default();
 
-    let func = crate::ast::Func::Native(Arc::new(move |pop_obj: &crate::ast::Object| {
-        // Collect facts per antecedent fact type
-        let mut fact_sets: Vec<Vec<Vec<(String, String)>>> = Vec::new();
-        for ft_id in &antecedent_ids {
-            let raw_facts = obj_find_ft(pop_obj, ft_id);
-            let mut parsed: Vec<Vec<(String, String)>> = Vec::new();
-            for fact in raw_facts {
-                if let Some(bindings) = fact.as_seq() {
-                    let pairs: Vec<(String, String)> = bindings.iter()
-                        .filter_map(|b| {
-                            let bpair = b.as_seq()?;
-                            if bpair.len() == 2 {
-                                Some((bpair[0].as_atom()?.to_string(), bpair[1].as_atom()?.to_string()))
-                            } else { None }
-                        })
-                        .collect();
-                    if !pairs.is_empty() {
-                        parsed.push(pairs);
-                    }
-                }
+    // Build role-index lookup for each antecedent: (ft_idx, noun_name) -> role_index
+    let antecedent_roles: Vec<Vec<(String, usize)>> = antecedent_ids.iter().map(|ft_id| {
+        ir.fact_types.get(ft_id)
+            .map(|ft| ft.roles.iter().map(|r| (r.noun_name.clone(), r.role_index)).collect())
+            .unwrap_or_default()
+    }).collect();
+
+    let n = antecedent_ids.len();
+
+    if n == 0 {
+        return CompiledDerivation {
+            id, text, kind,
+            func: Func::constant(Object::phi()),
+        };
+    }
+
+    // Helper: access path to the i-th fact in a depth-k nested pair structure.
+    // R_1 = f0, R_2 = <f0, f1>, R_3 = <<f0, f1>, f2>, ...
+    // R_k = <R_{k-1}, f_{k-1}>
+    fn access_fact(i: usize, depth: usize) -> Func {
+        if depth == 1 { return Func::Id; }
+        if i == depth - 1 { return Func::Selector(2); }
+        Func::compose(access_fact(i, depth - 1), Func::Selector(1))
+    }
+
+    // Helper: find role index of a noun in a given antecedent FT
+    let find_role = |ft_idx: usize, noun: &str| -> Option<usize> {
+        antecedent_roles[ft_idx].iter()
+            .find(|(n, _)| n == noun)
+            .map(|(_, ri)| *ri)
+    };
+
+    // Extract facts per antecedent
+    let fact_extractors: Vec<Func> = antecedent_ids.iter()
+        .map(|ft_id| extract_facts_from_pop(ft_id))
+        .collect();
+
+    if n == 1 {
+        // Single antecedent: no join, just derive from each fact.
+        let mut binding_parts: Vec<Func> = Vec::new();
+        for noun in &consequent_binding_names {
+            if let Some(ri) = find_role(0, noun) {
+                binding_parts.push(Func::compose(Func::Selector(ri + 1), Func::Id));
             }
-            if parsed.is_empty() {
-                // If any antecedent has no facts, the join produces nothing
-                return crate::ast::Object::phi();
-            }
-            fact_sets.push(parsed);
+        }
+        let derived = Func::construction(vec![
+            Func::constant(Object::atom(&consequent_id)),
+            Func::constant(Object::atom(&consequent_reading)),
+            if binding_parts.is_empty() { Func::Id } else { Func::construction(binding_parts) },
+        ]);
+        let func = Func::apply_to_all(derived);
+        // Compose with extractor (from pop)
+        let func = Func::compose(func, fact_extractors.into_iter().next().unwrap());
+        return CompiledDerivation { id, text, kind, func };
+    }
+
+    // N >= 2: iterative pairwise join.
+    // Start with facts from FT0, then join with FT1, FT2, etc.
+    // After step j (0-indexed), depth = j+1, and each element is a nested structure
+    // containing facts from FTs 0..=j.
+
+    // Step 0: start with ft0_facts (depth 1)
+    let ft0 = fact_extractors[0].clone();
+
+    // For each subsequent FT, build the join step.
+    let mut current = ft0; // current sequence of joined tuples
+    for j in 1..n {
+        let _depth = j + 1; // after joining j+1 FTs
+        let ft_j = fact_extractors[j].clone();
+
+        // Build join condition for this step.
+        // For each join key, find the first previous FT that has it and compare
+        // with FT_j's role. The pair is <accumulated, fj>.
+        let mut join_conds: Vec<Func> = Vec::new();
+
+        for key in &join_keys {
+            // Find FT_j's role for this key
+            let j_role = match find_role(j, key) {
+                Some(ri) => ri,
+                None => continue, // FT_j doesn't have this noun
+            };
+            // Find first previous FT (0..j) that has this key
+            let ref_ft = (0..j).find(|&fi| find_role(fi, key).is_some());
+            let ref_ft = match ref_ft {
+                Some(fi) => fi,
+                None => continue, // No previous FT has this noun
+            };
+            let ref_role = find_role(ref_ft, key).unwrap();
+
+            // <accumulated, fj>: accumulated has depth j, fj is Sel(2)
+            // ref_fact is accessed via access_fact(ref_ft, j) inside accumulated (Sel(1))
+            let ref_val = Func::compose(
+                role_value(ref_role),
+                Func::compose(access_fact(ref_ft, j), Func::Selector(1)),
+            );
+            let new_val = Func::compose(role_value(j_role), Func::Selector(2));
+
+            join_conds.push(Func::compose(Func::Eq, Func::construction(vec![ref_val, new_val])));
         }
 
-        // Perform nested-loop join across all antecedent fact sets.
-        // For each combination, check that join keys have matching values.
-        let mut results: Vec<crate::ast::Object> = Vec::new();
-        join_recursive(
-            &fact_sets,
-            &join_keys,
-            &match_pairs,
-            &consequent_binding_names,
-            &consequent_id,
-            &consequent_reading,
-            &mut Vec::new(),
-            0,
-            &mut results,
-        );
+        // match_on predicates: contains checks
+        for (left_noun, right_noun) in &match_pairs {
+            // Find which FTs (0..=j) have left_noun and right_noun
+            let left_ft = (0..=j).find(|&fi| find_role(fi, left_noun).is_some());
+            let right_ft = (0..=j).find(|&fi| find_role(fi, right_noun).is_some());
 
-        crate::ast::Object::Seq(results)
-    }));
+            let (left_ft, right_ft) = match (left_ft, right_ft) {
+                (Some(l), Some(r)) => (l, r),
+                _ => continue,
+            };
+
+            // Only add this condition if FT_j is involved
+            if left_ft != j && right_ft != j { continue; }
+
+            let left_role = find_role(left_ft, left_noun).unwrap();
+            let right_role = find_role(right_ft, right_noun).unwrap();
+
+            let left_val = if left_ft == j {
+                Func::compose(role_value(left_role), Func::Selector(2))
+            } else {
+                Func::compose(
+                    role_value(left_role),
+                    Func::compose(access_fact(left_ft, j), Func::Selector(1)),
+                )
+            };
+            let right_val = if right_ft == j {
+                Func::compose(role_value(right_role), Func::Selector(2))
+            } else {
+                Func::compose(
+                    role_value(right_role),
+                    Func::compose(access_fact(right_ft, j), Func::Selector(1)),
+                )
+            };
+
+            join_conds.push(Func::compose(Func::Contains, Func::construction(vec![left_val, right_val])));
+        }
+
+        let join_pred = match join_conds.len() {
+            0 => Func::constant(Object::t()), // cross product (no conditions)
+            1 => join_conds.into_iter().next().unwrap(),
+            _ => join_conds.into_iter().reduce(|a, b| {
+                Func::compose(Func::And, Func::construction(vec![a, b]))
+            }).unwrap(),
+        };
+
+        // Pipeline: Filter(join_pred) . Concat . alpha(DistL) . DistR . [current, ft_j]
+        current = Func::compose(
+            Func::filter(join_pred),
+            Func::compose(
+                Func::Concat,
+                Func::compose(
+                    Func::apply_to_all(Func::DistL),
+                    Func::compose(Func::DistR, Func::construction(vec![current, ft_j])),
+                ),
+            ),
+        );
+    }
+
+    // Build the consequent fact from the final joined structure (depth n).
+    // For each consequent binding noun, find which FT has it and extract the value.
+    let mut binding_parts: Vec<Func> = Vec::new();
+    let binding_nouns: Vec<String> = if consequent_binding_names.is_empty() {
+        // Include all unique nouns from all antecedents
+        let mut all_nouns = Vec::new();
+        for roles in &antecedent_roles {
+            for (noun, _) in roles {
+                if !all_nouns.contains(noun) {
+                    all_nouns.push(noun.clone());
+                }
+            }
+        }
+        all_nouns
+    } else {
+        consequent_binding_names
+    };
+
+    for noun in &binding_nouns {
+        // Find first FT that has this noun
+        let ft_idx = (0..n).find(|&fi| find_role(fi, noun).is_some());
+        if let Some(fi) = ft_idx {
+            let ri = find_role(fi, noun).unwrap();
+            // Extract from the nested structure: role_value(ri) . access_fact(fi, n)
+            let extractor = Func::compose(role_value(ri), access_fact(fi, n));
+            binding_parts.push(Func::construction(vec![
+                Func::constant(Object::atom(noun)),
+                extractor,
+            ]));
+        }
+    }
+
+    let derived_fact = Func::construction(vec![
+        Func::constant(Object::atom(&consequent_id)),
+        Func::constant(Object::atom(&consequent_reading)),
+        if binding_parts.is_empty() {
+            Func::constant(Object::phi())
+        } else {
+            Func::construction(binding_parts)
+        },
+    ]);
+
+    let func = Func::compose(Func::apply_to_all(derived_fact), current);
 
     CompiledDerivation { id, text, kind, func }
 }
 
-/// Recursive helper for nested-loop join across N fact sets.
-fn join_recursive(
-    fact_sets: &[Vec<Vec<(String, String)>>],
-    join_keys: &[String],
-    match_pairs: &[(String, String)],
-    consequent_bindings: &[String],
-    consequent_id: &str,
-    consequent_reading: &str,
-    current_combo: &mut Vec<Vec<(String, String)>>,
-    depth: usize,
-    results: &mut Vec<crate::ast::Object>,
-) {
-    if depth == fact_sets.len() {
-        // All fact sets joined â€" check join keys and match predicates
-        if check_join_keys(current_combo, join_keys)
-            && check_match_predicates(current_combo, match_pairs)
-        {
-            // Collect bindings for the consequent
-            let mut merged: Vec<(String, String)> = Vec::new();
-            for fact_bindings in current_combo.iter() {
-                for (n, v) in fact_bindings {
-                    if !merged.iter().any(|(mn, mv)| mn == n && mv == v) {
-                        merged.push((n.clone(), v.clone()));
-                    }
-                }
-            }
-
-            // Filter to consequent_bindings if specified
-            let output = if consequent_bindings.is_empty() {
-                merged
-            } else {
-                merged.into_iter()
-                    .filter(|(n, _)| consequent_bindings.contains(n))
-                    .collect()
-            };
-
-            if !output.is_empty() {
-                results.push(obj_derived_fact(consequent_id, consequent_reading, &output));
-            }
-        }
-        return;
-    }
-
-    for fact in &fact_sets[depth] {
-        current_combo.push(fact.clone());
-        join_recursive(fact_sets, join_keys, match_pairs, consequent_bindings, consequent_id, consequent_reading, current_combo, depth + 1, results);
-        current_combo.pop();
-    }
-}
-
-/// Check that all join keys have consistent values across the fact combination.
-/// A join key matches if every fact that contains a binding for that noun name
-/// has the same value (exact equality).
-fn check_join_keys(combo: &[Vec<(String, String)>], join_keys: &[String]) -> bool {
-    for key in join_keys {
-        let mut values: Vec<&str> = Vec::new();
-        for fact_bindings in combo {
-            for (n, v) in fact_bindings {
-                if n == key {
-                    values.push(v.as_str());
-                }
-            }
-        }
-        if values.len() >= 2 && !values.windows(2).all(|w| w[0] == w[1]) {
-            return false;
-        }
-    }
-    true
-}
-
-/// Check cross-noun match predicates.
-/// Each pair (left, right) requires: the value of noun `left` contains
-/// the value of noun `right` (case-insensitive).
-fn check_match_predicates(combo: &[Vec<(String, String)>], match_pairs: &[(String, String)]) -> bool {
-    for (left_noun, right_noun) in match_pairs {
-        let left_val = combo.iter()
-            .flat_map(|b| b.iter())
-            .find(|(n, _)| n == left_noun)
-            .map(|(_, v)| v.as_str());
-        let right_val = combo.iter()
-            .flat_map(|b| b.iter())
-            .find(|(n, _)| n == right_noun)
-            .map(|(_, v)| v.as_str());
-
-        match (left_val, right_val) {
-            (Some(l), Some(r)) => {
-                if !l.to_lowercase().contains(&r.to_lowercase()) {
-                    return false;
-                }
-            }
-            _ => {} // If either value is missing, predicate is vacuously true
-        }
-    }
-    true
-}
+// (join_recursive, check_join_keys, check_match_predicates removed --
+//  join logic now expressed as pure Func via pairwise DistR/DistL/Filter/Concat.)
 
 /// Subtype inheritance: for each noun with a supertype,
 /// instances of the subtype inherit participation in the supertype's fact types.
@@ -1335,64 +1263,70 @@ fn compile_modus_ponens(ir: &Domain) -> Vec<CompiledDerivation> {
         let id = format!("_modus_ponens_{}", cdef.id);
         let text = format!("Modus ponens from SS constraint: {}", cdef.text);
 
-        // Operate directly on the population Object â€" no decode/re-encode.
-        let func = crate::ast::Func::Native(Arc::new(move |pop_obj: &crate::ast::Object| {
-            let a_facts = obj_find_ft(pop_obj, &a_ft_id);
-            let b_facts = obj_find_ft(pop_obj, &b_ft_id);
+        // Pure Func: for each A-fact not in B, derive a B-fact.
+        // Uses same pattern as compile_subset_ast membership check.
+        let a_role_names: Vec<String> = ir.fact_types.get(&a_ft_id)
+            .map(|ft| ft.roles.iter().map(|r| r.noun_name.clone()).collect())
+            .unwrap_or_default();
 
-            let mut derived = Vec::new();
+        // Common nouns and their role indices in A and B
+        let common: Vec<(usize, usize)> = a_role_names.iter().enumerate().filter_map(|(ai, n)| {
+            b_role_names.iter().position(|bn| bn == n).map(|bi| (ai, bi))
+        }).collect();
 
-            for a_fact in a_facts {
-                if let Some(a_bindings) = a_fact.as_seq() {
-                    // Build the consequent tuple by mapping bindings by noun name
-                    let mut b_bindings: Vec<(String, String)> = Vec::new();
-                    for b_noun in &b_role_names {
-                        for ab in a_bindings {
-                            if let Some(abpair) = ab.as_seq() {
-                                if abpair.len() == 2 {
-                                    if let (Some(n), Some(v)) = (abpair[0].as_atom(), abpair[1].as_atom()) {
-                                        if n == b_noun {
-                                            b_bindings.push((b_noun.clone(), v.to_string()));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+        let a_facts = extract_facts_from_pop(&a_ft_id);
+        let b_facts = extract_facts_from_pop(&b_ft_id);
 
-                    if b_bindings.is_empty() { continue; }
-
-                    // Check if this tuple already exists in the consequent population
-                    let already_exists = b_facts.iter().any(|bf| {
-                        if let Some(bf_bindings) = bf.as_seq() {
-                            b_bindings.iter().all(|(name, val)| {
-                                bf_bindings.iter().any(|bb| {
-                                    if let Some(bbpair) = bb.as_seq() {
-                                        bbpair.len() == 2
-                                            && bbpair[0].as_atom() == Some(name.as_str())
-                                            && bbpair[1].as_atom() == Some(val.as_str())
-                                    } else {
-                                        false
-                                    }
-                                })
-                            })
-                        } else {
-                            false
-                        }
-                    });
-
-                    if !already_exists {
-                        derived.push(obj_derived_fact(&b_ft_id, &b_reading, &b_bindings));
-                    }
-                }
-            }
-
-            if derived.is_empty() {
-                crate::ast::Object::phi()
+        // match_pred: <a_fact, b_candidate> -> common noun values all equal
+        let match_pred = if common.is_empty() {
+            Func::constant(Object::t())
+        } else {
+            let eqs: Vec<Func> = common.iter().map(|&(ai, bi)| {
+                Func::compose(Func::Eq, Func::construction(vec![
+                    Func::compose(role_value(ai), Func::Selector(1)),
+                    Func::compose(role_value(bi), Func::Selector(2)),
+                ]))
+            }).collect();
+            if eqs.len() == 1 {
+                eqs.into_iter().next().unwrap()
             } else {
-                crate::ast::Object::Seq(derived)
+                eqs.into_iter().reduce(|acc, eq| {
+                    Func::compose(Func::And, Func::construction(vec![acc, eq]))
+                }).unwrap()
             }
-        }));
+        };
+
+        // not_in_b: <a_fact, b_facts> -> T when no b_candidate matches a_fact
+        let not_in_b = Func::compose(
+            Func::NullTest,
+            Func::compose(Func::filter(match_pred), Func::DistL),
+        );
+
+        // derived_fact: <a_fact, b_facts> -> <b_ft_id, b_reading, <bindings>>
+        // Project a_fact's common-noun bindings into B's structure.
+        let mut b_binding_funcs: Vec<Func> = Vec::new();
+        for &(ai, _) in &common {
+            b_binding_funcs.push(Func::compose(Func::Selector(ai + 1), Func::Selector(1)));
+        }
+        let derived_fact = Func::construction(vec![
+            Func::constant(Object::atom(&b_ft_id)),
+            Func::constant(Object::atom(&b_reading)),
+            if b_binding_funcs.is_empty() {
+                Func::constant(Object::phi())
+            } else {
+                // Reuse a_fact's bindings directly (already in <<noun, val>> format)
+                Func::Selector(1)
+            },
+        ]);
+
+        // a(derived_fact) . Filter(not_in_b) . DistR . [a_facts, b_facts]
+        let func = Func::compose(
+            Func::apply_to_all(derived_fact),
+            Func::compose(
+                Func::filter(not_in_b),
+                Func::compose(Func::DistR, Func::construction(vec![a_facts, b_facts])),
+            ),
+        );
         derivations.push(CompiledDerivation {
             id,
             text,
@@ -2346,87 +2280,133 @@ fn compile_uniqueness_ast(_ir: &Domain, def: &ConstraintDef) -> Func {
         );
     }
 
-    // Multi-span UC: Native fallback
-    let id = def.id.clone();
-    let text = def.text.clone();
-    let extractors: Vec<(Func, Vec<ResolvedSpan>)> = span_groups.iter()
-        .map(|(ft_id, spans)| (extract_facts_func(ft_id), spans.clone()))
-        .collect();
+    // Multi-span UC: pure Func per group, then Concat.
+    // Each group is checked independently for uniqueness, same as single-FT case.
+    let mut group_checks: Vec<Func> = Vec::new();
 
-    Func::Native(Arc::new(move |ctx: &Object| {
-        let defs = HashMap::new();
-        let mut violations = Vec::new();
+    for (ft_id, group_spans) in &span_groups {
+        let facts = extract_facts_func(ft_id);
 
-        for (extractor, group_spans) in &extractors {
-            let facts_obj = crate::ast::apply(extractor, ctx, &defs);
-            let facts = match facts_obj.as_seq() {
-                Some(f) => f,
-                None => continue,
+        if group_spans.len() == 1 {
+            // Single span in this group: same logic as single-FT UC.
+            let scope_idx = group_spans[0].role_index;
+            let other_idx = group_spans.iter()
+                .map(|s| s.role_index)
+                .find(|&i| i != scope_idx)
+                .unwrap_or(if scope_idx == 0 { 1 } else { 0 });
+
+            let dup_check = Func::compose(Func::And, Func::construction(vec![
+                Func::compose(Func::Eq, Func::construction(vec![
+                    Func::compose(role_value(scope_idx), Func::Selector(1)),
+                    Func::compose(role_value(scope_idx), Func::Selector(2)),
+                ])),
+                Func::compose(Func::Not, Func::compose(Func::Eq, Func::construction(vec![
+                    Func::compose(role_value(other_idx), Func::Selector(1)),
+                    Func::compose(role_value(other_idx), Func::Selector(2)),
+                ]))),
+            ]));
+
+            let has_any_dup = Func::compose(
+                Func::compose(Func::Not, Func::NullTest),
+                Func::compose(Func::filter(dup_check), Func::DistL),
+            );
+
+            let violating = Func::compose(
+                Func::filter(has_any_dup),
+                Func::compose(Func::DistR, Func::construction(vec![facts.clone(), facts])),
+            );
+
+            let noun = group_spans[0].noun_name.clone();
+            let reading = group_spans[0].reading.clone();
+            let detail = Func::construction(vec![
+                Func::constant(Object::atom("Uniqueness violation:")),
+                Func::constant(Object::atom(&noun)),
+                Func::compose(role_value(scope_idx), Func::Selector(1)),
+                Func::constant(Object::atom("is not unique in")),
+                Func::constant(Object::atom(&reading)),
+            ]);
+            let viol = make_violation_func(&def.id, &def.text, detail);
+
+            group_checks.push(Func::compose(
+                Func::condition(
+                    Func::compose(Func::Not, Func::NullTest),
+                    Func::construction(vec![Func::compose(viol, Func::Selector(1))]),
+                    Func::constant(Object::phi()),
+                ),
+                violating,
+            ));
+        } else {
+            // Multi-span in one FT group: composite scope key.
+            // Two facts are "same scope" if ALL constrained roles match,
+            // and are "duplicates" if they are not fully identical.
+            // scope_eq: <f1, f2> -> all constrained roles equal
+            let scope_eqs: Vec<Func> = group_spans.iter().map(|s| {
+                Func::compose(Func::Eq, Func::construction(vec![
+                    Func::compose(role_value(s.role_index), Func::Selector(1)),
+                    Func::compose(role_value(s.role_index), Func::Selector(2)),
+                ]))
+            }).collect();
+            let scope_eq = if scope_eqs.len() == 1 {
+                scope_eqs.into_iter().next().unwrap()
+            } else {
+                scope_eqs.into_iter().reduce(|a, b| {
+                    Func::compose(Func::And, Func::construction(vec![a, b]))
+                }).unwrap()
             };
 
-            if group_spans.len() == 1 {
-                let span = &group_spans[0];
-                let role_sel = role_value(span.role_index);
-                let mut seen: HashMap<String, usize> = HashMap::new();
-                for fact in facts {
-                    if let Some(val) = crate::ast::apply(&role_sel, fact, &defs).as_atom() {
-                        *seen.entry(val.to_string()).or_insert(0) += 1;
-                    }
-                }
-                for (val, count) in seen {
-                    if count > 1 {
-                        violations.push(Object::seq(vec![
-                            Object::atom(&id),
-                            Object::atom(&text),
-                            Object::seq(vec![
-                                Object::atom("Uniqueness violation:"),
-                                Object::atom(&span.noun_name),
-                                Object::atom(&format!("'{}'", val)),
-                                Object::atom(&format!("appears {} times in", count)),
-                                Object::atom(&span.reading),
-                            ]),
-                        ]));
-                    }
-                }
-            } else {
-                let role_sels: Vec<Func> = group_spans.iter()
-                    .map(|s| role_value(s.role_index))
-                    .collect();
-                let role_names: Vec<&str> = group_spans.iter()
-                    .map(|s| s.noun_name.as_str())
-                    .collect();
-                let reading = &group_spans[0].reading;
+            // not_identical: facts differ in at least one role (entire fact differs)
+            let not_identical = Func::compose(Func::Not, Func::compose(Func::Eq, Func::construction(vec![
+                Func::Selector(1),
+                Func::Selector(2),
+            ])));
 
-                let mut seen: HashMap<String, usize> = HashMap::new();
-                for fact in facts {
-                    let tuple_key: String = role_sels.iter()
-                        .map(|sel| crate::ast::apply(sel, fact, &defs)
-                            .as_atom().unwrap_or("").to_string())
-                        .collect::<Vec<_>>()
-                        .join("|");
-                    *seen.entry(tuple_key).or_insert(0) += 1;
-                }
+            let dup_check = Func::compose(Func::And, Func::construction(vec![
+                scope_eq,
+                not_identical,
+            ]));
 
-                let label = role_names.join(", ");
-                for (tuple, count) in seen {
-                    if count > 1 {
-                        violations.push(Object::seq(vec![
-                            Object::atom(&id),
-                            Object::atom(&text),
-                            Object::seq(vec![
-                                Object::atom("Uniqueness violation:"),
-                                Object::atom(&format!("({})", label)),
-                                Object::atom(&format!("combination '{}' appears {} times in", tuple.replace('|', ", "), count)),
-                                Object::atom(reading),
-                            ]),
-                        ]));
-                    }
-                }
+            let has_any_dup = Func::compose(
+                Func::compose(Func::Not, Func::NullTest),
+                Func::compose(Func::filter(dup_check), Func::DistL),
+            );
+
+            let violating = Func::compose(
+                Func::filter(has_any_dup),
+                Func::compose(Func::DistR, Func::construction(vec![facts.clone(), facts])),
+            );
+
+            let label = group_spans.iter().map(|s| s.noun_name.as_str()).collect::<Vec<_>>().join(", ");
+            let reading = group_spans[0].reading.clone();
+            // Detail: extract the composite scope values from the first violating fact.
+            let mut detail_parts: Vec<Func> = vec![
+                Func::constant(Object::atom("Uniqueness violation:")),
+                Func::constant(Object::atom(&format!("({})", label))),
+            ];
+            // Show each scope role value from the violating fact (Sel(1) of <fact, all> pair)
+            for s in group_spans {
+                detail_parts.push(Func::compose(role_value(s.role_index), Func::Selector(1)));
             }
-        }
+            detail_parts.push(Func::constant(Object::atom("is not unique in")));
+            detail_parts.push(Func::constant(Object::atom(&reading)));
+            let detail = Func::construction(detail_parts);
+            let viol = make_violation_func(&def.id, &def.text, detail);
 
-        if violations.is_empty() { Object::phi() } else { Object::Seq(violations) }
-    }))
+            group_checks.push(Func::compose(
+                Func::condition(
+                    Func::compose(Func::Not, Func::NullTest),
+                    Func::construction(vec![Func::compose(viol, Func::Selector(1))]),
+                    Func::constant(Object::phi()),
+                ),
+                violating,
+            ));
+        }
+    }
+
+    match group_checks.len() {
+        0 => Func::constant(Object::phi()),
+        1 => group_checks.into_iter().next().unwrap(),
+        _ => Func::compose(Func::Concat, Func::construction(group_checks)),
+    }
 }
 
 /// MC: Mandatory constraint.
@@ -2517,60 +2497,98 @@ fn compile_mandatory_ast(_ir: &Domain, def: &ConstraintDef) -> Func {
 /// within [min_occurrence, max_occurrence] times in the fact type's population.
 /// Per Halpin Ch 7.2: generalizes UC (FC with max=1 is a UC).
 fn compile_frequency_ast(_ir: &Domain, def: &ConstraintDef) -> Func {
-    let id = def.id.clone();
-    let text = def.text.clone();
     let spans = resolve_spans(_ir, &def.spans);
     let min_occ = def.min_occurrence.unwrap_or(1);
     let max_occ = def.max_occurrence;
 
-    let extractors: Vec<(Func, ResolvedSpan)> = spans.iter()
-        .map(|s| (extract_facts_func(&s.fact_type_id), s.clone()))
-        .collect();
+    let range_str = match max_occ {
+        Some(max) if max == min_occ => format!("exactly {}", min_occ),
+        Some(max) => format!("between {} and {}", min_occ, max),
+        None => format!("at least {}", min_occ),
+    };
 
-    Func::Native(Arc::new(move |ctx: &Object| {
-        let defs = HashMap::new();
-        let mut violations = Vec::new();
+    // Build a pure Func check per span, then Concat to flatten.
+    let mut span_checks: Vec<Func> = Vec::new();
 
-        for (extractor, span) in &extractors {
-            let facts_obj = crate::ast::apply(extractor, ctx, &defs);
-            let facts = match facts_obj.as_seq() {
-                Some(f) => f,
-                None => continue,
-            };
+    for span in &spans {
+        let facts = extract_facts_func(&span.fact_type_id);
+        let scope_idx = span.role_index;
 
-            let role_sel = role_value(span.role_index);
-            let mut counts: HashMap<String, usize> = HashMap::new();
-            for fact in facts {
-                if let Some(val) = crate::ast::apply(&role_sel, fact, &defs).as_atom() {
-                    *counts.entry(val.to_string()).or_insert(0) += 1;
-                }
+        // same_scope: <fact, candidate> -> T if scope values match
+        let same_scope = Func::compose(Func::Eq, Func::construction(vec![
+            Func::compose(role_value(scope_idx), Func::Selector(1)),
+            Func::compose(role_value(scope_idx), Func::Selector(2)),
+        ]));
+
+        // For <fact, all_facts>: DistL gives <<fact, f1>, <fact, f2>, ...>
+        // Filter(same_scope) keeps pairs where scope matches
+        let same_scope_facts = Func::compose(
+            Func::filter(same_scope),
+            Func::DistL,
+        );
+
+        // Build tl^n: compose Tail n times. tl^0 = Id.
+        // too_few: count < min  =>  null . tl^(min-1) . same_scope_facts
+        // too_many: count > max =>  not . null . tl^max . same_scope_facts
+        let tl_n = |n: usize| -> Func {
+            (0..n).fold(Func::Id, |acc, _| Func::compose(Func::Tail, acc))
+        };
+
+        let too_few = if min_occ <= 1 {
+            // count < 1 means count == 0 => NullTest . same_scope_facts
+            Func::compose(Func::NullTest, same_scope_facts.clone())
+        } else {
+            // null . tl^(min-1) . same_scope_facts
+            Func::compose(
+                Func::NullTest,
+                Func::compose(tl_n(min_occ - 1), same_scope_facts.clone()),
+            )
+        };
+
+        let violates = match max_occ {
+            Some(max) => {
+                // too_many: not . null . tl^max . same_scope_facts
+                let too_many = Func::compose(
+                    Func::compose(Func::Not, Func::NullTest),
+                    Func::compose(tl_n(max), same_scope_facts),
+                );
+                Func::compose(Func::Or, Func::construction(vec![too_few, too_many]))
             }
+            None => too_few, // only min bound
+        };
 
-            for (val, count) in counts {
-                if count < min_occ || max_occ.map_or(false, |max| count > max) {
-                    let range = match max_occ {
-                        Some(max) if max == min_occ => format!("exactly {}", min_occ),
-                        Some(max) => format!("between {} and {}", min_occ, max),
-                        None => format!("at least {}", min_occ),
-                    };
-                    violations.push(Object::seq(vec![
-                        Object::atom(&id),
-                        Object::atom(&text),
-                        Object::seq(vec![
-                            Object::atom("Frequency violation:"),
-                            Object::atom(&span.noun_name),
-                            Object::atom(&format!("'{}'", val)),
-                            Object::atom(&format!("occurs {} times in", count)),
-                            Object::atom(&span.reading),
-                            Object::atom(&format!("expected {}", range)),
-                        ]),
-                    ]));
-                }
-            }
-        }
+        // violating_facts = Filter(violates) . DistR . [facts, facts]
+        let violating = Func::compose(
+            Func::filter(violates),
+            Func::compose(Func::DistR, Func::construction(vec![facts.clone(), facts])),
+        );
 
-        if violations.is_empty() { Object::phi() } else { Object::Seq(violations) }
-    }))
+        let detail = Func::construction(vec![
+            Func::constant(Object::atom("Frequency violation:")),
+            Func::constant(Object::atom(&span.noun_name)),
+            Func::compose(role_value(scope_idx), Func::Selector(1)),
+            Func::constant(Object::atom("in")),
+            Func::constant(Object::atom(&span.reading)),
+            Func::constant(Object::atom(&format!("expected {}", range_str))),
+        ]);
+        let viol = make_violation_func(&def.id, &def.text, detail);
+
+        // ONE violation per violating scope value (take first).
+        span_checks.push(Func::compose(
+            Func::condition(
+                Func::compose(Func::Not, Func::NullTest),
+                Func::construction(vec![Func::compose(viol, Func::Selector(1))]),
+                Func::constant(Object::phi()),
+            ),
+            violating,
+        ));
+    }
+
+    match span_checks.len() {
+        0 => Func::constant(Object::phi()),
+        1 => span_checks.into_iter().next().unwrap(),
+        _ => Func::compose(Func::Concat, Func::construction(span_checks)),
+    }
 }
 
 /// VC: Value constraint â€" each value in the constrained role must be in the
@@ -2655,11 +2673,9 @@ fn compile_value_constraint_ast(ir: &Domain, def: &ConstraintDef) -> Func {
 fn compile_set_comparison_ast(
     _ir: &Domain,
     def: &ConstraintDef,
-    violates: fn(usize) -> bool,
+    _violates: fn(usize) -> bool,
     requirement: &'static str,
 ) -> Func {
-    let id = def.id.clone();
-    let text = def.text.clone();
     let entity_name = def.entity.clone().unwrap_or_default();
     let clause_ft_ids: Vec<String> = def.spans.iter()
         .map(|s| s.fact_type_id.clone())
@@ -2667,40 +2683,88 @@ fn compile_set_comparison_ast(
         .into_iter()
         .collect();
 
-    Func::Native(Arc::new(move |ctx: &Object| {
-        let defs = HashMap::new();
-        let pop_obj = crate::ast::apply(&Func::Selector(3), ctx, &defs);
-        let population = decode_population_object(&pop_obj);
+    // All instances of the entity noun from eval context population
+    let instances = Func::compose(instances_of_noun_func(&entity_name), Func::Selector(3));
 
-        let all_instances = instances_of(&entity_name, &population);
-        let clause_count = clause_ft_ids.len();
+    // For each clause FT, build a participation check: <instance, ctx> -> T/F
+    // A fact mentions the entity if any binding has noun == entity_name AND val == instance.
+    let entity_const = Func::constant(Object::atom(&entity_name));
 
-        let violations: Vec<Object> = all_instances.into_iter()
-            .filter_map(|instance| {
-                let holding = clause_ft_ids.iter()
-                    .filter(|ft_id| participates_in(&instance, &entity_name, ft_id, &population))
-                    .count();
+    // binding_match : <instance, <noun, val>> -> T if noun == entity AND val == instance
+    let binding_match = Func::compose(Func::And, Func::construction(vec![
+        Func::compose(Func::Eq, Func::construction(vec![
+            Func::compose(Func::Selector(1), Func::Selector(2)),  // noun from binding
+            entity_const,
+        ])),
+        Func::compose(Func::Eq, Func::construction(vec![
+            Func::compose(Func::Selector(2), Func::Selector(2)),  // val from binding
+            Func::Selector(1),                                     // instance
+        ])),
+    ]));
 
-                if violates(holding) {
-                    Some(Object::seq(vec![
-                        Object::atom(&id),
-                        Object::atom(&text),
-                        Object::seq(vec![
-                            Object::atom("Set-comparison violation:"),
-                            Object::atom(&entity_name),
-                            Object::atom(&format!("'{}'", instance)),
-                            Object::atom(&format!("has {} of {} clause fact types holding", holding, clause_count)),
-                            Object::atom(&format!("expected {}", requirement)),
-                        ]),
-                    ]))
-                } else {
-                    None
-                }
-            })
-            .collect();
+    // fact_mentions : <instance, fact> -> T if fact has matching binding
+    let fact_mentions = Func::compose(
+        Func::compose(Func::Not, Func::NullTest),
+        Func::compose(Func::filter(binding_match), Func::DistL),
+    );
 
-        if violations.is_empty() { Object::phi() } else { Object::Seq(violations) }
-    }))
+    // participates_in_ft(ft_id) : <instance, ctx> -> T/F
+    let per_ft_checks: Vec<Func> = clause_ft_ids.iter().map(|ft_id| {
+        let ft_facts = Func::compose(extract_facts_func(ft_id), Func::Selector(2));
+        Func::compose(
+            Func::compose(Func::Not, Func::NullTest),
+            Func::compose(
+                Func::filter(fact_mentions.clone()),
+                Func::compose(Func::DistL, Func::construction(vec![Func::Selector(1), ft_facts])),
+            ),
+        )
+    }).collect();
+
+    // [check1, check2, ...] : <inst, ctx> -> <T/F, T/F, ...>
+    let all_checks = Func::construction(per_ft_checks);
+    // Filter(Id) keeps T values (truthy)
+    let participating_seq = Func::compose(Func::filter(Func::Id), all_checks);
+
+    // Violation predicate based on requirement:
+    //   "exactly one"  -> n != 1 => null(seq) OR not.null.tl(seq)
+    //   "at most one"  -> n > 1  => not.null.tl(seq)
+    //   "at least one" -> n < 1  => null(seq)
+    let violation_pred = match requirement {
+        "exactly one" => Func::compose(Func::Or, Func::construction(vec![
+            Func::compose(Func::NullTest, participating_seq.clone()),
+            Func::compose(
+                Func::compose(Func::Not, Func::NullTest),
+                Func::compose(Func::Tail, participating_seq),
+            ),
+        ])),
+        "at most one" => Func::compose(
+            Func::compose(Func::Not, Func::NullTest),
+            Func::compose(Func::Tail, participating_seq),
+        ),
+        "at least one" => Func::compose(Func::NullTest, participating_seq),
+        _ => Func::constant(Object::f()),
+    };
+
+    let clause_count = clause_ft_ids.len();
+    let detail = Func::construction(vec![
+        Func::constant(Object::atom("Set-comparison violation:")),
+        Func::constant(Object::atom(&entity_name)),
+        Func::Selector(1), // instance value
+        Func::constant(Object::atom(&format!("expected {}", requirement))),
+        Func::constant(Object::atom(&format!("of {} clause fact types", clause_count))),
+    ]);
+    let viol = make_violation_func(&def.id, &def.text, detail);
+
+    // DistR . [instances, Id] : ctx -> <<inst1, ctx>, <inst2, ctx>, ...>
+    let inst_ctx_pairs = Func::compose(
+        Func::DistR,
+        Func::construction(vec![instances, Func::Id]),
+    );
+
+    Func::compose(
+        Func::apply_to_all(viol),
+        Func::compose(Func::filter(violation_pred), inst_ctx_pairs),
+    )
 }
 
 /// SS: Subset constraint â€" pop(rs1) âŠ† pop(rs2).
