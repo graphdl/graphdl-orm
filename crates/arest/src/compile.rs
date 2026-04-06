@@ -1634,20 +1634,14 @@ fn compile_sm_initialization(ir: &Domain) -> Vec<CompiledDerivation> {
             ),
         );
 
-        // If existing is empty, all instances are new.
-        // If existing is non-empty, distr pairs each instance with existing, filter for non-membership.
-        // Condition: (null . sel(2) -> sel(1); filter_new) : <instances, existing>
-        let filter_new = Func::compose(
-            Func::apply_to_all(Func::Selector(1)),
-            Func::compose(Func::filter(is_new), Func::DistR),
-        );
+        // set_diff = alpha(sel(1)) . Filter(not_member) . distr
+        // not_member = null . Filter(eq) . distl
+        // distr : <R, S> -> <<r1,S>,...,<rn,S>>
+        // For each <ri, S>: distl : <ri, S> -> <<ri,s1>,...> then Filter(eq) finds matches.
+        // null : phi -> T when ri not in S. Handles empty S correctly (distl:<ri,phi>=phi, null:phi=T).
         let new_instances = Func::compose(
-            Func::condition(
-                Func::compose(Func::NullTest, Func::Selector(2)),
-                Func::Selector(1),
-                filter_new,
-            ),
-            pairs,
+            Func::apply_to_all(Func::Selector(1)),
+            Func::compose(Func::filter(is_new), Func::compose(Func::DistR, pairs)),
         );
 
         let sm_noun_obj = Object::atom(&sm_noun);
