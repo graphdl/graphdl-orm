@@ -845,6 +845,45 @@ fn no_native_in_constraint_defs() {
     );
 }
 
+#[test]
+fn no_native_in_multispan_uc_defs() {
+    // Domain with n-ary UC: "For each Customer, Endpoint, VIN, and Date,
+    // at most one Billable Request exists."
+    let input = r#"
+# Billing
+
+## Entity Types
+
+Customer(.Email) is an entity type.
+Meter Endpoint(.Slug) is an entity type.
+VIN(.Code) is an entity type.
+Date(.Value) is a value type.
+Billable Request(.id) is an entity type.
+
+## Fact Types
+
+Billable Request is for Customer at Meter Endpoint for VIN on Date.
+
+## Constraints
+
+For each Customer, Meter Endpoint, VIN, and Date, at most one Billable Request exists.
+"#;
+
+    let pop = parse_forml2::parse_to_population(input).unwrap();
+    let defs = compile::compile_to_defs(&pop);
+    let mut native_defs = Vec::new();
+    for (name, func) in &defs {
+        if func.has_native() {
+            native_defs.push(name.clone());
+        }
+    }
+    assert!(
+        native_defs.is_empty(),
+        "Multi-span UC defs contain Native (must be pure Func): {:?}",
+        native_defs,
+    );
+}
+
 // ── Algebraic Laws (Backus Section 12.2) ─────────────────────────────
 // The compiled functions must obey the FP algebra.
 // These laws are what make the system provably correct by

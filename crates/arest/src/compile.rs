@@ -293,25 +293,13 @@ fn instances_of_noun_func(noun_name: &str) -> Func {
 
 /// Build a Func that extracts facts for multiple fact type IDs.
 /// Returns the concatenation of all facts from all matching fact types.
+/// Concat . [extract_ft1, extract_ft2, ...] : ctx -> <all facts>
 fn extract_facts_multi(ft_ids: &[String]) -> Func {
     if ft_ids.len() == 1 {
         return extract_facts_func(&ft_ids[0]);
     }
-    // For multiple fact type IDs: get facts from each, concatenate.
-    // Use a Native for the concatenation since we don't have a built-in flatten.
-    let ft_ids_owned: Vec<String> = ft_ids.to_vec();
-    Func::Native(Arc::new(move |ctx: &crate::ast::Object| {
-        let defs = HashMap::new();
-        let mut all_facts = Vec::new();
-        for ft_id in &ft_ids_owned {
-            let extractor = extract_facts_func(ft_id);
-            let result = crate::ast::apply(&extractor, ctx, &defs);
-            if let Some(items) = result.as_seq() {
-                all_facts.extend_from_slice(items);
-            }
-        }
-        Object::Seq(all_facts)
-    }))
+    let extractors: Vec<Func> = ft_ids.iter().map(|id| extract_facts_func(id)).collect();
+    Func::compose(Func::Concat, Func::construction(extractors))
 }
 
 /// Build a violation Object from constants and a detail Func.
@@ -2215,58 +2203,70 @@ fn compile_ring_acyclic_ast(def: &ConstraintDef) -> Func {
     Func::construction(vec![direct_loops, depth2_loops])
 }
 
-/// RF: for each entity x, xRx must exist â€" violation when self-reference is missing.
+/// RF: for each entity x, xRx must exist -- violation when self-reference is missing.
+/// Pure Func: set_diff(all_instances, self_refs) then make_violation for each.
 fn compile_ring_reflexive_ast(ir: &Domain, def: &ConstraintDef) -> Func {
     let ft_ids: Vec<String> = def.spans.iter().map(|s| s.fact_type_id.clone()).collect();
     let facts = extract_facts_multi(&ft_ids);
 
-    let id = def.id.clone();
-    let text = def.text.clone();
+    let id_obj = Object::atom(&def.id);
+    let text_obj = Object::atom(&def.text);
 
-    // Find the noun name from spans to know which instances to check
     let noun_name: String = def.spans.first()
         .and_then(|s| ir.fact_types.get(&s.fact_type_id))
         .and_then(|ft| ft.roles.first())
         .map(|r| r.noun_name.clone())
         .unwrap_or_default();
 
-    Func::Native(Arc::new(move |ctx: &Object| {
-        let defs = HashMap::new();
-        let all_facts = crate::ast::apply(&facts, ctx, &defs);
+    // self_refs: instances that DO reference themselves in the ring facts.
+    // Filter(eq . [role(0), role(1)]) : facts -> self-referencing facts
+    // alpha(role(0)) -> just the values
+    let self_refs = Func::compose(
+        Func::apply_to_all(role_value(0)),
+        Func::compose(
+            Func::filter(Func::compose(Func::Eq, Func::construction(vec![role_value(0), role_value(1)]))),
+            facts,
+        ),
+    );
 
-        // Collect self-referencing instances from the ring facts
-        let self_refs: HashSet<String> = match all_facts.as_seq() {
-            Some(items) => items.iter().filter_map(|fact| {
-                let v0 = crate::ast::apply(&role_value(0), fact, &defs);
-                let v1 = crate::ast::apply(&role_value(1), fact, &defs);
-                let s0 = v0.as_atom()?.to_string();
-                let s1 = v1.as_atom()?.to_string();
-                if s0 == s1 { Some(s0) } else { None }
-            }).collect(),
-            None => HashSet::new(),
-        };
+    // all_instances: instances_of_noun_func applied to population (Selector(3) from eval ctx)
+    let all_instances = Func::compose(instances_of_noun_func(&noun_name), Func::Selector(3));
 
-        // Decode population to find all instances of the noun
-        let population = decode_population_object(&crate::ast::apply(&Func::Selector(3), ctx, &defs));
-        let all_instances = instances_of(&noun_name, &population);
+    // set_diff: instances NOT in self_refs
+    // not_member : <inst, self_refs> -> T if inst not in self_refs
+    let not_member = Func::compose(
+        Func::NullTest,
+        Func::compose(
+            Func::filter(Func::compose(Func::Eq, Func::construction(vec![
+                Func::compose(Func::Selector(1), Func::Selector(1)),
+                Func::Id,
+            ]))),
+            Func::Selector(2),
+        ),
+    );
+    // distr : <instances, self_refs> -> <<inst1, self_refs>, ...>
+    // Filter(not_member) keeps instances not in self_refs
+    // alpha(sel(1)) extracts just the instance values
+    let missing = Func::compose(
+        Func::apply_to_all(Func::Selector(1)),
+        Func::compose(
+            Func::filter(not_member),
+            Func::compose(Func::DistR, Func::construction(vec![all_instances, self_refs])),
+        ),
+    );
 
-        let violations: Vec<Object> = all_instances.iter()
-            .filter(|inst| !self_refs.contains(*inst))
-            .map(|inst| {
-                Object::seq(vec![
-                    Object::atom(&id),
-                    Object::atom(&text),
-                    Object::seq(vec![
-                        Object::atom("Reflexive violation:"),
-                        Object::atom(inst),
-                        Object::atom("does not reference itself"),
-                    ]),
-                ])
-            })
-            .collect();
+    // For each missing instance, produce violation
+    let make_viol = Func::apply_to_all(Func::construction(vec![
+        Func::constant(id_obj),
+        Func::constant(text_obj),
+        Func::construction(vec![
+            Func::constant(Object::atom("Reflexive violation:")),
+            Func::Id,
+            Func::constant(Object::atom("does not reference itself")),
+        ]),
+    ]));
 
-        if violations.is_empty() { Object::phi() } else { Object::Seq(violations) }
-    }))
+    Func::compose(make_viol, missing)
 }
 
 // â"€â"€ Alethic Constraint Compilers â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
