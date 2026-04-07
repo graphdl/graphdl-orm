@@ -8,7 +8,7 @@ use arest::ast;
 use arest::parse_forml2;
 use arest::compile;
 use arest::evaluate;
-use arest::types::{Population, FactInstance, Violation};
+use arest::types::Violation;
 use std::collections::HashMap;
 
 // ── Metamodel ────────────────────────────────────────────────────────
@@ -140,14 +140,26 @@ Product 'WIDGET-1' has Price '9.99'.
 Product 'GADGET-2' has Price '24.99'.
 "#;
 
-fn compile_orders() -> (Population, HashMap<String, arest::ast::Func>) {
-    let meta = parse_forml2::parse_to_population(STATE_METAMODEL).unwrap();
-    let orders = parse_forml2::parse_to_population_with_nouns(ORDERS_DOMAIN, &meta).unwrap();
-    let mut pop = meta;
-    for (k, v) in orders.facts { pop.facts.entry(k).or_default().extend(v); }
-    let defs = compile::compile_to_defs(&pop);
+fn merge_state_into(base: &ast::Object, extension: &ast::Object) -> ast::Object {
+    let mut state = base.clone();
+    for (name, contents) in ast::cells_iter(extension) {
+        if let Some(facts) = contents.as_seq() {
+            for fact in facts {
+                state = ast::cell_push(name, fact.clone(), &state);
+            }
+        }
+    }
+    state
+}
+
+fn compile_orders() -> (ast::Object, HashMap<String, arest::ast::Func>) {
+    let meta_ir = parse_forml2::parse_markdown(STATE_METAMODEL).unwrap();
+    let meta_state = parse_forml2::domain_to_state(&meta_ir);
+    let orders_state = parse_forml2::parse_to_state_with_nouns(ORDERS_DOMAIN, &meta_state).unwrap();
+    let state = merge_state_into(&meta_state, &orders_state);
+    let defs = compile::compile_to_defs_state(&state);
     let def_map: HashMap<String, arest::ast::Func> = defs.into_iter().collect();
-    (pop, def_map)
+    (state, def_map)
 }
 
 // ── Theorem 1: Grammar Unambiguity ───────────────────────────────────
@@ -207,22 +219,21 @@ fn t1_ring_vs_subset_distinguished_by_noun_types() {
 
 #[test]
 fn t2_violation_message_is_original_reading() {
-    let (pop, defs) = compile_orders();
+    let (state, defs) = compile_orders();
     // The forbidden constraint text should survive compilation into a def name.
-    // Find the constraint fact in the population.
-    let constraint_facts = pop.facts.get("Constraint").expect("Population should have Constraint facts");
+    // Find the constraint fact in the state.
+    let constraint_cell = ast::fetch_or_phi("Constraint", &state);
+    let constraint_facts = constraint_cell.as_seq().expect("State should have Constraint facts");
     let forbidden = constraint_facts.iter()
-        .find(|f| f.bindings.iter().any(|(k, v)| k == "text" && v.contains("Prohibited Shipping Method")))
+        .find(|f| ast::binding(f, "text").map_or(false, |v| v.contains("Prohibited Shipping Method")))
         .expect("Should have Prohibited Shipping Method constraint");
-    let original_text = forbidden.bindings.iter()
-        .find(|(k, _)| k == "text").map(|(_, v)| v.as_str()).unwrap();
+    let original_text = ast::binding(forbidden, "text").unwrap();
     // The compiled defs should contain a constraint def whose name encodes the constraint id.
-    let constraint_id = forbidden.bindings.iter()
-        .find(|(k, _)| k == "id").map(|(_, v)| v.as_str()).unwrap();
+    let constraint_id = ast::binding(forbidden, "id").unwrap();
     let def_key = format!("constraint:{}", constraint_id);
     assert!(defs.contains_key(&def_key),
         "Compiled constraint def should exist for id '{}' (Corollary 7)", constraint_id);
-    // The original reading text is preserved in the population, available for violation messages.
+    // The original reading text is preserved in the state, available for violation messages.
     assert!(original_text.contains("Prohibited Shipping Method"),
         "Compiled text must preserve original reading (Corollary 7)");
 }
@@ -252,52 +263,52 @@ fn t3_state_machine_initializes() {
 #[test]
 fn t3_forward_chain_reaches_fixed_point() {
     let (_, defs) = compile_orders();
-    let mut pop = Population { facts: HashMap::new() };
+    let empty_state = ast::Object::phi();
     // Extract derivation defs
     let derivation_defs: Vec<(&str, &arest::ast::Func)> = defs.iter()
         .filter(|(n, _)| n.starts_with("derivation:"))
         .map(|(n, f)| (n.as_str(), f))
         .collect();
-    // Forward chain with empty population should terminate
-    let derived = evaluate::forward_chain_defs(&derivation_defs, &mut pop);
+    // Forward chain with empty state should terminate
+    let (state2, derived) = evaluate::forward_chain_defs_state(&derivation_defs, &empty_state);
     // The derived facts should be a fixed point (running again produces nothing new)
-    let derived2 = evaluate::forward_chain_defs(&derivation_defs, &mut pop);
+    let (_state3, derived2) = evaluate::forward_chain_defs_state(&derivation_defs, &state2);
     // Second run should produce no additional facts beyond what first run added
     assert!(derived2.len() <= derived.len(), "Forward chain should reach fixed point");
 }
 
 #[test]
 fn t3_alethic_violation_rejects_command() {
-    let (pop, _defs) = compile_orders();
+    let (state, _defs) = compile_orders();
     // UC on "Each Order was placed by exactly one Customer" means
     // an Order with two customers should produce a violation
-    let constraint_facts = pop.facts.get("Constraint").expect("Should have Constraint facts");
+    let constraint_cell = ast::fetch_or_phi("Constraint", &state);
+    let constraint_facts = constraint_cell.as_seq().expect("Should have Constraint facts");
     let uc = constraint_facts.iter()
         .find(|f| {
-            f.bindings.iter().any(|(k, v)| k == "kind" && v == "UC")
-            && f.bindings.iter().any(|(k, v)| k == "text" && v.contains("placed by"))
+            ast::binding_matches(f, "kind", "UC")
+            && ast::binding(f, "text").map_or(false, |v| v.contains("placed by"))
         })
         .expect("UC on placed by");
-    let text = uc.bindings.iter().find(|(k, _)| k == "text").map(|(_, v)| v.as_str()).unwrap();
+    let text = ast::binding(uc, "text").unwrap();
     assert!(!text.is_empty());
     // The constraint is alethic (schema-enforced)
-    let modality = uc.bindings.iter().find(|(k, _)| k == "modality").map(|(_, v)| v.as_str()).unwrap();
+    let modality = ast::binding(uc, "modality").unwrap();
     assert_eq!(modality, "alethic");
 }
 
 #[test]
 fn t3_deontic_violation_warns_but_succeeds() {
-    let (pop, _) = compile_orders();
-    let constraint_facts = pop.facts.get("Constraint").expect("Should have Constraint facts");
+    let (state, _) = compile_orders();
+    let constraint_cell = ast::fetch_or_phi("Constraint", &state);
+    let constraint_facts = constraint_cell.as_seq().expect("Should have Constraint facts");
     let forbidden = constraint_facts.iter()
         .find(|f| {
-            f.bindings.iter().any(|(k, v)| k == "modality" && v == "deontic")
-            && f.bindings.iter().any(|(k, v)| k == "text" && v.contains("Prohibited Shipping Method"))
+            ast::binding_matches(f, "modality", "deontic")
+            && ast::binding(f, "text").map_or(false, |v| v.contains("Prohibited Shipping Method"))
         })
         .expect("Deontic forbidden constraint");
-    let op = forbidden.bindings.iter()
-        .find(|(k, _)| k == "deonticOperator")
-        .map(|(_, v)| v.as_str());
+    let op = ast::binding(forbidden, "deonticOperator");
     assert_eq!(op, Some("forbidden"));
 }
 
@@ -517,7 +528,8 @@ fn c6_terminal_states_are_derived() {
 
 #[test]
 fn c7_deontic_violation_returns_reading_text() {
-    let (pop, defs) = compile_orders();
+    let (state, defs) = compile_orders();
+    let pop = ast::state_to_population(&state);
     let ctx = arest::ast::encode_eval_context("We will ship your order overnight for fast delivery", None, &pop);
     let violations: Vec<_> = defs.iter()
         .filter(|(n, _)| n.starts_with("constraint:"))
@@ -542,12 +554,7 @@ fn c8_ingesting_new_readings_preserves_properties() {
     use arest::ast::{self, Object};
 
     // Start with orders domain (metamodel + orders, same as compile_orders)
-    let meta = parse_forml2::parse_to_population(STATE_METAMODEL).unwrap();
-    let orders = parse_forml2::parse_to_population_with_nouns(ORDERS_DOMAIN, &meta).unwrap();
-    let mut pop1 = meta;
-    for (k, v) in orders.facts { pop1.facts.entry(k).or_default().extend(v); }
-    let defs1 = compile::compile_to_defs(&pop1);
-    let def_map1: HashMap<String, ast::Func> = defs1.into_iter().collect();
+    let (state1, def_map1) = compile_orders();
 
     // Verify Order machine initial state via the initial def
     let initial1 = ast::apply(
@@ -576,11 +583,10 @@ Each Coupon has exactly one Discount.
 Each Order has at most one Coupon.
 "#;
 
-    // Parse extension and merge populations
-    let ext_pop = parse_forml2::parse_to_population_with_nouns(extension, &pop1).unwrap();
-    let mut pop2 = pop1.clone();
-    for (k, v) in ext_pop.facts { pop2.facts.entry(k).or_default().extend(v); }
-    let defs2 = compile::compile_to_defs(&pop2);
+    // Parse extension and merge states
+    let ext_state = parse_forml2::parse_to_state_with_nouns(extension, &state1).unwrap();
+    let state2 = merge_state_into(&state1, &ext_state);
+    let defs2 = compile::compile_to_defs_state(&state2);
     let def_map2: HashMap<String, ast::Func> = defs2.into_iter().collect();
 
     // Original properties still hold
@@ -698,49 +704,38 @@ fn rmap_produces_tables_for_entities() {
 }
 
 // ── Paper Claim: Everything is Facts ─────────────────────────────────
-// The parser should produce a Population. The compiler should accept a
-// Population. There should be no struct between them.
+// The parser should produce Object state. The compiler should accept
+// Object state. There should be no struct between them.
 
 #[test]
 fn paper_claim_parse_produces_population() {
-    // parse_to_population should exist and return Population
-    let pop = parse_forml2::parse_to_population(ORDERS_DOMAIN).unwrap();
-    // The population should contain noun facts
-    assert!(pop.facts.contains_key("Noun"), "Population should contain Noun facts");
-    // The population should contain graph schema facts
-    assert!(pop.facts.contains_key("GraphSchema"), "Population should contain GraphSchema facts");
-    // The population should contain constraint facts
-    assert!(pop.facts.contains_key("Constraint"), "Population should contain Constraint facts");
+    // parse_markdown + domain_to_state should produce Object state
+    let ir = parse_forml2::parse_markdown(ORDERS_DOMAIN).unwrap();
+    let state = parse_forml2::domain_to_state(&ir);
+    // The state should contain noun facts
+    assert!(!matches!(ast::fetch("Noun", &state), ast::Object::Bottom), "State should contain Noun facts");
+    // The state should contain graph schema facts
+    assert!(!matches!(ast::fetch("GraphSchema", &state), ast::Object::Bottom), "State should contain GraphSchema facts");
+    // The state should contain constraint facts
+    assert!(!matches!(ast::fetch("Constraint", &state), ast::Object::Bottom), "State should contain Constraint facts");
 }
 
 #[test]
 fn paper_claim_compile_from_population() {
-    let meta_pop = parse_forml2::parse_to_population(STATE_METAMODEL).unwrap();
-    let orders_pop = parse_forml2::parse_to_population_with_nouns(ORDERS_DOMAIN, &meta_pop).unwrap();
-    let mut pop = meta_pop;
-    for (k, v) in orders_pop.facts {
-        pop.facts.entry(k).or_default().extend(v);
-    }
-    let defs = compile::compile_to_defs(&pop);
-    assert!(defs.iter().any(|(n, _)| n.starts_with("machine:")), "Should compile state machines from population");
+    let (state, _) = compile_orders();
+    let defs = compile::compile_to_defs_state(&state);
+    assert!(defs.iter().any(|(n, _)| n.starts_with("machine:")), "Should compile state machines from state");
 }
 
 #[test]
 fn paper_claim_population_round_trip() {
-    // Parse to population, compile, run state machine. Same result as Domain path.
-    let meta_pop = parse_forml2::parse_to_population(STATE_METAMODEL).unwrap();
-    let orders_pop = parse_forml2::parse_to_population_with_nouns(ORDERS_DOMAIN, &meta_pop).unwrap();
-    let mut merged = meta_pop;
-    for (k, v) in orders_pop.facts {
-        merged.facts.entry(k).or_default().extend(v);
-    }
-    let defs = compile::compile_to_defs(&merged);
-    let def_map: std::collections::HashMap<String, arest::ast::Func> = defs.iter().map(|(n, f)| (n.clone(), f.clone())).collect();
-    let transition = def_map.get("machine:Order").expect("Should have Order machine from population");
+    // Parse to state, compile, run state machine. Same result as Domain path.
+    let (_, def_map) = compile_orders();
+    let transition = def_map.get("machine:Order").expect("Should have Order machine from state");
     let initial = def_map.get("machine:Order:initial").expect("Should have Order initial");
     let init_state = arest::ast::apply(initial, &arest::ast::Object::phi(), &def_map);
     assert_eq!(init_state.as_atom().unwrap(), "In Cart");
-    // Fold: In Cart → place → Placed → ship → Shipped → deliver → Delivered
+    // Fold: In Cart -> place -> Placed -> ship -> Shipped -> deliver -> Delivered
     let mut state = init_state;
     for event in &["place", "ship", "deliver"] {
         let inp = arest::ast::Object::seq(vec![state, arest::ast::Object::atom(event)]);
@@ -756,13 +751,10 @@ fn paper_claim_population_round_trip() {
 
 #[test]
 fn ffp_compile_produces_named_definitions() {
-    // compile_to_defs should return Vec<(String, Func)>
-    let meta = parse_forml2::parse_to_population(STATE_METAMODEL).unwrap();
-    let orders = parse_forml2::parse_to_population_with_nouns(ORDERS_DOMAIN, &meta).unwrap();
-    let mut pop = meta;
-    for (k, v) in orders.facts { pop.facts.entry(k).or_default().extend(v); }
+    // compile_to_defs_state should return Vec<(String, Func)>
+    let (state, _) = compile_orders();
 
-    let defs = compile::compile_to_defs(&pop);
+    let defs = compile::compile_to_defs_state(&state);
     assert!(!defs.is_empty(), "Should produce named definitions");
 
     // Every definition is a (name, Func) pair
@@ -775,12 +767,9 @@ fn ffp_compile_produces_named_definitions() {
 
 #[test]
 fn ffp_constraint_is_a_function() {
-    let meta = parse_forml2::parse_to_population(STATE_METAMODEL).unwrap();
-    let orders = parse_forml2::parse_to_population_with_nouns(ORDERS_DOMAIN, &meta).unwrap();
-    let mut pop = meta;
-    for (k, v) in orders.facts { pop.facts.entry(k).or_default().extend(v); }
+    let (state, _) = compile_orders();
 
-    let defs = compile::compile_to_defs(&pop);
+    let defs = compile::compile_to_defs_state(&state);
 
     // There should be constraint definitions
     let constraint_defs: Vec<_> = defs.iter()
@@ -791,12 +780,9 @@ fn ffp_constraint_is_a_function() {
 
 #[test]
 fn ffp_state_machine_is_a_function() {
-    let meta = parse_forml2::parse_to_population(STATE_METAMODEL).unwrap();
-    let orders = parse_forml2::parse_to_population_with_nouns(ORDERS_DOMAIN, &meta).unwrap();
-    let mut pop = meta;
-    for (k, v) in orders.facts { pop.facts.entry(k).or_default().extend(v); }
+    let (state, _) = compile_orders();
 
-    let defs = compile::compile_to_defs(&pop);
+    let defs = compile::compile_to_defs_state(&state);
 
     // There should be a state machine definition for Order
     let sm_defs: Vec<_> = defs.iter()
@@ -809,12 +795,9 @@ fn ffp_state_machine_is_a_function() {
 fn ffp_evaluation_is_application() {
     use arest::ast::{self, Object};
 
-    let meta = parse_forml2::parse_to_population(STATE_METAMODEL).unwrap();
-    let orders = parse_forml2::parse_to_population_with_nouns(ORDERS_DOMAIN, &meta).unwrap();
-    let mut pop = meta;
-    for (k, v) in orders.facts { pop.facts.entry(k).or_default().extend(v); }
+    let (state, _) = compile_orders();
 
-    let defs: Vec<(String, arest::ast::Func)> = compile::compile_to_defs(&pop);
+    let defs: Vec<(String, arest::ast::Func)> = compile::compile_to_defs_state(&state);
     let def_map: HashMap<String, arest::ast::Func> = defs.iter().map(|(n, f)| (n.clone(), f.clone())).collect();
 
     // Find the Order state machine transition function and initial state
@@ -848,12 +831,9 @@ fn ffp_evaluation_is_application() {
 
 #[test]
 fn no_native_in_constraint_defs() {
-    let meta = parse_forml2::parse_to_population(STATE_METAMODEL).unwrap();
-    let orders = parse_forml2::parse_to_population_with_nouns(ORDERS_DOMAIN, &meta).unwrap();
-    let mut pop = meta;
-    for (k, v) in orders.facts { pop.facts.entry(k).or_default().extend(v); }
+    let (state, _) = compile_orders();
 
-    let defs = compile::compile_to_defs(&pop);
+    let defs = compile::compile_to_defs_state(&state);
     let mut native_defs = Vec::new();
     for (name, func) in &defs {
         if func.has_native() {
@@ -891,8 +871,9 @@ Billable Request is for Customer at Meter Endpoint for VIN on Date.
 For each Customer, Meter Endpoint, VIN, and Date, at most one Billable Request exists.
 "#;
 
-    let pop = parse_forml2::parse_to_population(input).unwrap();
-    let defs = compile::compile_to_defs(&pop);
+    let ir = parse_forml2::parse_markdown(input).unwrap();
+    let state = parse_forml2::domain_to_state(&ir);
+    let defs = compile::compile_to_defs_state(&state);
     let mut native_defs = Vec::new();
     for (name, func) in &defs {
         if func.has_native() {
@@ -1086,12 +1067,9 @@ fn law_condition_selects_branch() {
 fn hateoas_transition_links_via_application() {
     use arest::ast::{self, Func, Object};
 
-    let meta = parse_forml2::parse_to_population(STATE_METAMODEL).unwrap();
-    let orders = parse_forml2::parse_to_population_with_nouns(ORDERS_DOMAIN, &meta).unwrap();
-    let mut pop = meta;
-    for (k, v) in orders.facts { pop.facts.entry(k).or_default().extend(v); }
+    let (state, _) = compile_orders();
 
-    let defs: Vec<(String, Func)> = compile::compile_to_defs(&pop);
+    let defs: Vec<(String, Func)> = compile::compile_to_defs_state(&state);
     let def_map: HashMap<String, Func> = defs.iter().map(|(n, f)| (n.clone(), f.clone())).collect();
 
     // The transition function applied to <current_state, event> produces next_state.
@@ -1139,12 +1117,9 @@ fn hateoas_transition_links_via_application() {
 fn constraint_evaluation_via_application() {
     use arest::ast::{self, Func, Object};
 
-    let meta = parse_forml2::parse_to_population(STATE_METAMODEL).unwrap();
-    let orders = parse_forml2::parse_to_population_with_nouns(ORDERS_DOMAIN, &meta).unwrap();
-    let mut pop = meta;
-    for (k, v) in orders.facts { pop.facts.entry(k).or_default().extend(v); }
+    let (state, _) = compile_orders();
 
-    let defs: Vec<(String, Func)> = compile::compile_to_defs(&pop);
+    let defs: Vec<(String, Func)> = compile::compile_to_defs_state(&state);
     let def_map: HashMap<String, Func> = defs.iter().map(|(n, f)| (n.clone(), f.clone())).collect();
 
     // Find the obligatory constraint (these are response-scoped)
@@ -1178,31 +1153,18 @@ fn constraint_evaluation_via_application() {
     assert_eq!(result, Object::phi(),
         "UC constraint against empty population should produce no violations");
 
-    // Now test with a population that has a UC violation.
+    // Now test with a state that has a UC violation.
     // "Each Order was placed by exactly one Customer" means
     // an Order with two different Customers should violate.
-    let pop_with_violation = ast::encode_population(&Population {
-        facts: {
-            let mut f = HashMap::new();
-            f.insert("Order_was_placed_by_Customer".to_string(), vec![
-                FactInstance {
-                    fact_type_id: "Order_was_placed_by_Customer".to_string(),
-                    bindings: vec![
-                        ("Order".to_string(), "ord-1".to_string()),
-                        ("Customer".to_string(), "Acme".to_string()),
-                    ],
-                },
-                FactInstance {
-                    fact_type_id: "Order_was_placed_by_Customer".to_string(),
-                    bindings: vec![
-                        ("Order".to_string(), "ord-1".to_string()),
-                        ("Customer".to_string(), "Globex".to_string()),
-                    ],
-                },
-            ]);
-            f
-        },
-    });
+    let violation_state = {
+        let mut s = Object::phi();
+        s = ast::cell_push("Order_was_placed_by_Customer",
+            ast::fact_from_pairs(&[("Order", "ord-1"), ("Customer", "Acme")]), &s);
+        s = ast::cell_push("Order_was_placed_by_Customer",
+            ast::fact_from_pairs(&[("Order", "ord-1"), ("Customer", "Globex")]), &s);
+        s
+    };
+    let pop_with_violation = ast::encode_population(&ast::state_to_population(&violation_state));
     let context_with_violation = Object::seq(vec![
         Object::phi(),
         Object::phi(),
@@ -1227,25 +1189,18 @@ fn response_text_is_a_fact_in_population() {
     use arest::ast::{self, Object};
 
     // A response body is just a fact: Support Response 'resp-1' has Body 'some text'
-    let mut facts = HashMap::new();
-    facts.insert("Support_Response_has_Body".to_string(), vec![
-        FactInstance {
-            fact_type_id: "Support_Response_has_Body".to_string(),
-            bindings: vec![
-                ("Support Response".to_string(), "resp-1".to_string()),
-                ("Body".to_string(), "We will ship overnight for sure".to_string()),
-            ],
-        },
-    ]);
-    let pop = Population { facts };
+    let mut state = Object::phi();
+    state = ast::cell_push("Support_Response_has_Body",
+        ast::fact_from_pairs(&[("Support Response", "resp-1"), ("Body", "We will ship overnight for sure")]),
+        &state);
 
-    // The population contains the response text as a fact.
-    // A constraint evaluator should be able to find it by querying P
+    // The state contains the response text as a fact.
+    // A constraint evaluator should be able to find it by querying the state
     // for Support_Response_has_Body facts.
-    let pop_obj = ast::encode_population(&pop);
+    let state_obj = ast::encode_population(&ast::state_to_population(&state));
 
-    // The population is queryable. The body text is in P, not in a separate struct.
-    assert_ne!(pop_obj, Object::phi(), "Population with response should not be empty");
+    // The state is queryable. The body text is in P, not in a separate struct.
+    assert_ne!(state_obj, Object::phi(), "State with response should not be empty");
 }
 
 #[test]
@@ -1268,14 +1223,14 @@ It is forbidden that Support Response contains Prohibited Word.
 "#;
 
     let ir = parse_forml2::parse_markdown(input).unwrap();
-    let meta_pop = parse_forml2::domain_to_population(&ir);
-    let defs = compile::compile_to_defs(&meta_pop);
+    let domain_state = parse_forml2::domain_to_state(&ir);
+    let defs = compile::compile_to_defs_state(&domain_state);
     let def_map: HashMap<String, ast::Func> = defs.iter().map(|(n, f)| (n.clone(), f.clone())).collect();
 
     // Helper: evaluate constraints via defs path
     let eval = |text: &str| -> Vec<Violation> {
-        let pop = Population { facts: HashMap::new() };
-        let ctx_obj = ast::encode_eval_context(text, None, &pop);
+        let empty_pop = ast::state_to_population(&ast::Object::phi());
+        let ctx_obj = ast::encode_eval_context(text, None, &empty_pop);
         defs.iter()
             .filter(|(n, _)| n.starts_with("constraint:"))
             .flat_map(|(name, func)| {
@@ -1320,8 +1275,9 @@ Support Response contains Prohibited Word.
 It is forbidden that Support Response contains Prohibited Word.
 "#;
 
-    let pop = parse_forml2::parse_to_population(input).unwrap();
-    let defs: Vec<(String, Func)> = compile::compile_to_defs(&pop);
+    let ir = parse_forml2::parse_markdown(input).unwrap();
+    let domain_state = parse_forml2::domain_to_state(&ir);
+    let defs: Vec<(String, Func)> = compile::compile_to_defs_state(&domain_state);
     let def_map: HashMap<String, Func> = defs.iter().map(|(n, f)| (n.clone(), f.clone())).collect();
 
     // Find the forbidden constraint
@@ -1356,12 +1312,9 @@ It is forbidden that Support Response contains Prohibited Word.
 fn derivation_rules_are_functions() {
     use arest::ast::Func;
 
-    let meta = parse_forml2::parse_to_population(STATE_METAMODEL).unwrap();
-    let orders = parse_forml2::parse_to_population_with_nouns(ORDERS_DOMAIN, &meta).unwrap();
-    let mut pop = meta;
-    for (k, v) in orders.facts { pop.facts.entry(k).or_default().extend(v); }
+    let (state, _) = compile_orders();
 
-    let defs: Vec<(String, Func)> = compile::compile_to_defs(&pop);
+    let defs: Vec<(String, Func)> = compile::compile_to_defs_state(&state);
 
     // Derivation rules should exist as named definitions
     let derivation_defs: Vec<_> = defs.iter()
@@ -1380,15 +1333,12 @@ fn derivation_rules_are_functions() {
 
 #[test]
 fn self_modification_extends_definitions() {
-    use arest::ast::Func;
+    use arest::ast::{self, Func, Object};
 
-    let meta = parse_forml2::parse_to_population(STATE_METAMODEL).unwrap();
-    let orders = parse_forml2::parse_to_population_with_nouns(ORDERS_DOMAIN, &meta).unwrap();
-    let mut pop = meta;
-    for (k, v) in orders.facts { pop.facts.entry(k).or_default().extend(v); }
+    let (state, _) = compile_orders();
 
     // D: initial definitions
-    let defs_d: Vec<(String, Func)> = compile::compile_to_defs(&pop);
+    let defs_d: Vec<(String, Func)> = compile::compile_to_defs_state(&state);
     let d_count = defs_d.len();
 
     // Ingest new readings (self-modification via ↓DEFS)
@@ -1406,13 +1356,11 @@ Order has Coupon.
 Each Coupon has exactly one Discount.
 Each Order has at most one Coupon.
 "#;
-    let ext_pop = parse_forml2::parse_to_population_with_nouns(extension, &pop).unwrap();
-    for (k, v) in ext_pop.facts {
-        pop.facts.entry(k).or_default().extend(v);
-    }
+    let ext_state = parse_forml2::parse_to_state_with_nouns(extension, &state).unwrap();
+    let merged_state = merge_state_into(&state, &ext_state);
 
     // D': new definitions after self-modification
-    let defs_d_prime: Vec<(String, Func)> = compile::compile_to_defs(&pop);
+    let defs_d_prime: Vec<(String, Func)> = compile::compile_to_defs_state(&merged_state);
 
     // D' should have more definitions than D
     assert!(defs_d_prime.len() > d_count,
@@ -1463,12 +1411,9 @@ fn metacomposition_fact_receives_operation() {
 fn schema_is_cons_of_roles() {
     use arest::ast::Func;
 
-    let meta = parse_forml2::parse_to_population(STATE_METAMODEL).unwrap();
-    let orders = parse_forml2::parse_to_population_with_nouns(ORDERS_DOMAIN, &meta).unwrap();
-    let mut pop = meta;
-    for (k, v) in orders.facts { pop.facts.entry(k).or_default().extend(v); }
+    let (state, _) = compile_orders();
 
-    let defs: Vec<(String, Func)> = compile::compile_to_defs(&pop);
+    let defs: Vec<(String, Func)> = compile::compile_to_defs_state(&state);
 
     // Find the schema for "Order was placed by Customer"
     let schema = defs.iter()
@@ -1541,12 +1486,9 @@ fn rho_returns_bottom_for_unknown_fact_type() {
 fn hateoas_nav_defs_produced() {
     use arest::ast::Func;
 
-    let meta = parse_forml2::parse_to_population(STATE_METAMODEL).unwrap();
-    let orders = parse_forml2::parse_to_population_with_nouns(ORDERS_DOMAIN, &meta).unwrap();
-    let mut pop = meta;
-    for (k, v) in orders.facts { pop.facts.entry(k).or_default().extend(v); }
+    let (state, _) = compile_orders();
 
-    let defs: Vec<(String, Func)> = compile::compile_to_defs(&pop);
+    let defs: Vec<(String, Func)> = compile::compile_to_defs_state(&state);
 
     // "Each Order was placed by exactly one Customer" → UC on Order's role
     // Order is child, Customer is parent
@@ -1565,11 +1507,12 @@ fn hateoas_nav_defs_produced() {
 fn system_operand_fetch_retrieves_cells() {
     use arest::ast::{self, Object};
 
-    let (pop, defs) = compile_orders();
+    let (state, defs) = compile_orders();
 
     // Construct operand per Backus 14.4.2: <CELL:KEY, CELL:INPUT, CELL:FILE, ...defs>
     let key_cell = ast::cell("KEY", Object::atom("machine:Order:initial"));
     let input_cell = ast::cell("INPUT", Object::phi());
+    let pop = ast::state_to_population(&state);
     let file_cell = ast::cell("FILE", ast::encode_population(&pop));
     let operand = Object::Seq(vec![key_cell, input_cell, file_cell]);
 
@@ -1611,28 +1554,23 @@ fn transitions_def_returns_available_from_status() {
 fn sm_init_derivation_produces_facts() {
     use arest::ast::{self, Func, Object};
 
-    let meta = parse_forml2::parse_to_population(STATE_METAMODEL).unwrap();
-    let orders = parse_forml2::parse_to_population_with_nouns(ORDERS_DOMAIN, &meta).unwrap();
-    let mut pop = meta;
-    for (k, v) in orders.facts { pop.facts.entry(k).or_default().extend(v); }
+    let (state, _) = compile_orders();
 
-    let defs: Vec<(String, Func)> = compile::compile_to_defs(&pop);
+    let defs: Vec<(String, Func)> = compile::compile_to_defs_state(&state);
     let def_map: HashMap<String, Func> = defs.iter().map(|(n, f)| (n.clone(), f.clone())).collect();
 
     // Find the SM init derivation
     let sm_init = defs.iter().find(|(n, _)| n.contains("sm_init")).expect("SM init def should exist");
     eprintln!("SM init def name: {}", sm_init.0);
 
-    // Build a minimal population with one Order entity
-    let mut test_pop = pop.clone();
-    test_pop.facts.entry("Order_has_customer".to_string()).or_default().push(
-        arest::types::FactInstance {
-            fact_type_id: "Order_has_customer".to_string(),
-            bindings: vec![("Order".to_string(), "ord-1".to_string()), ("customer".to_string(), "Acme".to_string())],
-        }
-    );
+    // Build a minimal state with one Order entity
+    let mut test_state = state.clone();
+    test_state = ast::cell_push("Order_has_customer",
+        ast::fact_from_pairs(&[("Order", "ord-1"), ("customer", "Acme")]),
+        &test_state);
 
-    // Encode population and apply derivation
+    // Encode state as population object and apply derivation
+    let test_pop = ast::state_to_population(&test_state);
     let pop_obj = ast::encode_population(&test_pop);
 
     // Test derive_facts on <ord-1>
@@ -1664,13 +1602,9 @@ fn sm_init_derivation_produces_facts() {
 fn create_entity_via_defs_produces_entity_and_status() {
     use arest::ast::Func;
 
-    let meta = parse_forml2::parse_to_population(STATE_METAMODEL).unwrap();
-    let orders = parse_forml2::parse_to_population_with_nouns(ORDERS_DOMAIN, &meta).unwrap();
-    let mut pop = meta;
-    for (k, v) in orders.facts { pop.facts.entry(k).or_default().extend(v); }
+    let (state, def_map) = compile_orders();
 
-    let defs: Vec<(String, Func)> = compile::compile_to_defs(&pop);
-    let def_map: HashMap<String, Func> = defs.iter().map(|(n, f)| (n.clone(), f.clone())).collect();
+    let defs: Vec<(String, Func)> = compile::compile_to_defs_state(&state);
 
     let mut fields = HashMap::new();
     fields.insert("customer".to_string(), "Acme".to_string());
@@ -1682,7 +1616,7 @@ fn create_entity_via_defs_produces_entity_and_status() {
         fields,
     };
 
-    let result = arest::arest::apply_command_defs(&def_map, &command, &pop);
+    let result = arest::arest::apply_command_defs_state(&def_map, &command, &state);
 
     eprintln!("derived_count: {}", result.derived_count);
     eprintln!("status: {:?}", result.status);
@@ -1692,8 +1626,9 @@ fn create_entity_via_defs_produces_entity_and_status() {
     eprintln!("derivation defs: {:?}", derivation_defs);
     let sm_defs: Vec<_> = defs.iter().filter(|(n, _)| n.contains("machine")).map(|(n, _)| n.as_str()).collect();
     eprintln!("machine defs: {:?}", sm_defs);
-    let instance_facts = pop.facts.get("InstanceFact");
-    eprintln!("InstanceFact count: {:?}", instance_facts.map(|f| f.len()));
+    let instance_cell = ast::fetch_or_phi("InstanceFact", &state);
+    let instance_count = instance_cell.as_seq().map(|s| s.len());
+    eprintln!("InstanceFact count: {:?}", instance_count);
 
     assert!(!result.rejected, "Valid create should not be rejected");
     assert!(result.entities.len() >= 1, "Should have at least the entity");
@@ -1707,15 +1642,9 @@ fn create_entity_via_defs_produces_entity_and_status() {
 fn transition_via_defs_changes_status() {
     use arest::ast::Func;
 
-    let meta = parse_forml2::parse_to_population(STATE_METAMODEL).unwrap();
-    let orders = parse_forml2::parse_to_population_with_nouns(ORDERS_DOMAIN, &meta).unwrap();
-    let mut pop = meta;
-    for (k, v) in orders.facts { pop.facts.entry(k).or_default().extend(v); }
+    let (state, def_map) = compile_orders();
 
-    let defs: Vec<(String, Func)> = compile::compile_to_defs(&pop);
-    let def_map: HashMap<String, Func> = defs.iter().map(|(n, f)| (n.clone(), f.clone())).collect();
-
-    // First create an entity to get a population with SM status
+    // First create an entity to get a state with SM status
     let mut fields = HashMap::new();
     fields.insert("customer".to_string(), "Acme".to_string());
     let create_cmd = arest::arest::Command::CreateEntity {
@@ -1724,7 +1653,7 @@ fn transition_via_defs_changes_status() {
         id: Some("ord-1".to_string()),
         fields,
     };
-    let create_result = arest::arest::apply_command_defs(&def_map, &create_cmd, &pop);
+    let create_result = arest::arest::apply_command_defs_state(&def_map, &create_cmd, &state);
     assert_eq!(create_result.status, Some("In Cart".to_string()));
 
     // Now transition: place the order
