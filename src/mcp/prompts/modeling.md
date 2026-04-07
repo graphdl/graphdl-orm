@@ -30,7 +30,7 @@ Every entity has one. Simple: `Customer(.Email)`. Compound: `Account(.Customer +
 Express as FORML2 constraints, not shorthand:
 - Many-to-one: "Each Support Request has at most one Priority."
 - One-to-one: "Each Customer has at most one API Key. Each API Key belongs to at most one Customer."
-- Mandatory: "Each Domain has exactly one Visibility."
+- Mandatory: "Each Domain has exactly one Access."
 
 ## Subtype Constraints
 

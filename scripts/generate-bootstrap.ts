@@ -205,8 +205,8 @@ function buildTables(
       { name: 'organization_id', type: 'TEXT', extra: 'REFERENCES organizations(id)' },
       // "Domain has Label" → label TEXT
       { name: 'label', type: 'TEXT', extra: '' },
-      // "Domain has Visibility" + enum → visibility CHECK
-      { name: 'visibility', type: 'TEXT', extra: "NOT NULL DEFAULT 'private' CHECK (visibility IN ('private', 'public'))" },
+      // "Domain has Access" + enum → access CHECK
+      { name: 'access', type: 'TEXT', extra: "NOT NULL DEFAULT 'private' CHECK (access IN ('private', 'public'))" },
     ],
     tableConstraints: [],
     indexes: [

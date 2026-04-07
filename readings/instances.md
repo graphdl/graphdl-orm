@@ -89,4 +89,4 @@ Guard Run has Result.
 
 ## Instance Facts
 
-Domain 'instances' has Visibility 'public'.
+Domain 'instances' has Access 'public'.

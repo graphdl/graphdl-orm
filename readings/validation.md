@@ -55,4 +55,4 @@ It is obligatory that each variable in a Derivation Rule consequent appears in a
 
 ## Instance Facts
 
-Domain 'validation' has Visibility 'public'.
+Domain 'validation' has Access 'public'.

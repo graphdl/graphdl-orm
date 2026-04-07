@@ -66,4 +66,4 @@ For each State Machine Definition, the initial Status of that State Machine Defi
 
 ## Instance Facts
 
-Domain 'state' has Visibility 'public'.
+Domain 'state' has Access 'public'.

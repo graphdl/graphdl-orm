@@ -12,8 +12,8 @@ External System(.Name) is an entity type.
 
 Slug is a value type.
 Email is a value type.
-Visibility is a value type.
-  The possible values of Visibility are 'private', 'public'.
+Access is a value type.
+  The possible values of Access are 'private', 'public'.
 Label is a value type.
 App Type is a value type.
   The possible values of App Type are 'standard', 'chat'.
@@ -63,8 +63,8 @@ Domain belongs to Organization.
 Domain has Label.
   Each Domain has at most one Label.
 
-Domain has Visibility.
-  Each Domain has exactly one Visibility.
+Domain has Access.
+  Each Domain has exactly one Access.
 
 ### Derived Fact Types
 
@@ -83,14 +83,14 @@ If some User authenticates and that User does not own any Organization then that
 User accesses Domain if User owns Organization and App belongs to that Organization and Domain belongs to that App.
 User accesses Domain if User administers Organization and App belongs to that Organization and Domain belongs to that App.
 User accesses Domain if User belongs to Organization and App belongs to that Organization and Domain belongs to that App.
-User accesses Domain if Domain has Visibility 'public'.
+User accesses Domain if Domain has Access 'public'.
 
 App navigates Domain if App has navigable Domain.
 App displays Noun if App has navigable Domain and Noun is defined in that Domain.
 
 ## Instance Facts
 
-Domain 'organizations' has Visibility 'public'.
+Domain 'organizations' has Access 'public'.
 
 Noun 'User' is backed by External System 'auth.vin'.
 Noun 'User' has URI '/users'.

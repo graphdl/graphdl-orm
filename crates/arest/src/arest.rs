@@ -588,13 +588,12 @@ fn apply_load_readings(
 
 // -- Helpers ----------------------------------------------------------
 
-/// HATEOAS as Projection (Theorem 3):
+/// HATEOAS as Projection (Theorem 4a):
 /// links(s) = pi_event(Filter(p) : T)
-/// where p(t) = (s_from(t) = s)  OR  anc(s_from(t), s)
+/// where p(t) = s_from(t) in {s} union supertypes(s)
 ///
-/// anc(a, b) = true if a is a supertype status that b inherits transitions from.
-/// For flat state machines (no subtyping), only direct matches apply.
-/// When subtype state machines are supported, anc traverses the subtype hierarchy.
+/// Subtypes inherit the transitions of their supertypes (Halpin Ch. 6).
+/// For flat state machines (no subtyping), this reduces to s_from(t) = s.
 fn hateoas_from_population(
     population: &Population,
     noun: &str,

@@ -580,119 +580,108 @@ pub fn parse_to_population(input: &str) -> Result<Population, String> {
 
 /// Parse FORML2 readings into a Population with existing nouns for cross-domain resolution.
 pub fn parse_to_population_with_nouns(input: &str, existing: &Population) -> Result<Population, String> {
-    // Extract noun names from the existing population
-    let existing_nouns: HashMap<String, NounDef> = existing.facts.get("Noun")
-        .map(|facts| facts.iter().filter_map(|f| {
-            let name = f.bindings.iter().find(|(k, _)| k == "name").map(|(_, v)| v.clone())?;
-            let obj_type = f.bindings.iter().find(|(k, _)| k == "objectType").map(|(_, v)| v.clone()).unwrap_or("entity".into());
+    let existing_state = crate::ast::population_to_state(existing);
+    let state = parse_to_state_with_nouns(input, &existing_state)?;
+    Ok(crate::ast::state_to_population(&state))
+}
+
+/// Parse FORML2 readings into an Object state with existing nouns for cross-domain resolution.
+pub fn parse_to_state_with_nouns(input: &str, existing: &crate::ast::Object) -> Result<crate::ast::Object, String> {
+    use crate::ast::{fetch_or_phi, binding};
+    let existing_nouns: HashMap<String, NounDef> = fetch_or_phi("Noun", existing)
+        .as_seq().map(|facts| facts.iter().filter_map(|f| {
+            let name = binding(f, "name")?.to_string();
+            let obj_type = binding(f, "objectType").unwrap_or("entity").to_string();
             Some((name, NounDef { object_type: obj_type, world_assumption: WorldAssumption::default() }))
         }).collect())
         .unwrap_or_default();
     let domain = parse_markdown_with_nouns(input, &existing_nouns)?;
-    Ok(domain_to_population(&domain))
+    Ok(domain_to_state(&domain))
 }
 
-/// Convert a Domain (the legacy struct) to a Population of facts.
-/// Each category of the struct becomes facts keyed by metamodel fact type.
+/// Convert a Domain to a Population (compatibility wrapper).
 pub fn domain_to_population(d: &Domain) -> Population {
-    let mut facts: HashMap<String, Vec<FactInstance>> = HashMap::new();
+    crate::ast::state_to_population(&domain_to_state(d))
+}
 
-    // Nouns -> Noun facts
+/// Convert a Domain to an Object state (sequence of cells).
+/// Each category becomes a cell: <CELL, fact_type_id, <facts...>>
+pub fn domain_to_state(d: &Domain) -> crate::ast::Object {
+    use crate::ast::{Object, cell_push, fact_from_pairs};
+    let mut state = Object::phi();
+
+    // Nouns
     for (name, def) in &d.nouns {
-        let mut bindings = vec![
-            ("name".to_string(), name.clone()),
-            ("objectType".to_string(), def.object_type.clone()),
+        let mut pairs: Vec<(String, String)> = vec![
+            ("name".into(), name.clone()),
+            ("objectType".into(), def.object_type.clone()),
         ];
         if let Some(st) = d.subtypes.get(name) {
-            bindings.push(("superType".to_string(), st.clone()));
+            pairs.push(("superType".into(), st.clone()));
         }
         if let Some(rs) = d.ref_schemes.get(name) {
-            bindings.push(("referenceScheme".to_string(), rs.join(",")));
+            pairs.push(("referenceScheme".into(), rs.join(",")));
         }
         if let Some(evs) = d.enum_values.get(name) {
             if !evs.is_empty() {
-                bindings.push(("enumValues".to_string(), evs.join(",")));
+                pairs.push(("enumValues".into(), evs.join(",")));
             }
         }
-        facts.entry("Noun".to_string()).or_default().push(FactInstance {
-            fact_type_id: "Noun".to_string(),
-            bindings,
-        });
+        let refs: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        state = cell_push("Noun", fact_from_pairs(&refs), &state);
     }
 
-    // Fact types -> GraphSchema + Role facts
+    // Fact types -> GraphSchema + Role
     for (ft_id, ft) in &d.fact_types {
-        facts.entry("GraphSchema".to_string()).or_default().push(FactInstance {
-            fact_type_id: "GraphSchema".to_string(),
-            bindings: vec![
-                ("id".to_string(), ft_id.clone()),
-                ("reading".to_string(), ft.reading.clone()),
-                ("arity".to_string(), ft.roles.len().to_string()),
-            ],
-        });
+        state = cell_push("GraphSchema", fact_from_pairs(&[
+            ("id", ft_id), ("reading", &ft.reading), ("arity", &ft.roles.len().to_string()),
+        ]), &state);
         for role in &ft.roles {
-            facts.entry("Role".to_string()).or_default().push(FactInstance {
-                fact_type_id: "Role".to_string(),
-                bindings: vec![
-                    ("graphSchema".to_string(), ft_id.clone()),
-                    ("nounName".to_string(), role.noun_name.clone()),
-                    ("position".to_string(), role.role_index.to_string()),
-                ],
-            });
+            state = cell_push("Role", fact_from_pairs(&[
+                ("graphSchema", ft_id), ("nounName", &role.noun_name), ("position", &role.role_index.to_string()),
+            ]), &state);
         }
     }
 
-    // Constraints -> Constraint facts
+    // Constraints
     for c in &d.constraints {
-        let mut bindings = vec![
-            ("id".to_string(), c.id.clone()),
-            ("kind".to_string(), c.kind.clone()),
-            ("modality".to_string(), c.modality.clone()),
-            ("text".to_string(), c.text.clone()),
+        let mut pairs: Vec<(String, String)> = vec![
+            ("id".into(), c.id.clone()),
+            ("kind".into(), c.kind.clone()),
+            ("modality".into(), c.modality.clone()),
+            ("text".into(), c.text.clone()),
         ];
         if let Some(ref op) = c.deontic_operator {
-            bindings.push(("deonticOperator".to_string(), op.clone()));
+            pairs.push(("deonticOperator".into(), op.clone()));
         }
         if let Some(ref entity) = c.entity {
-            bindings.push(("entity".to_string(), entity.clone()));
+            pairs.push(("entity".into(), entity.clone()));
         }
         for (i, span) in c.spans.iter().enumerate() {
-            bindings.push((format!("span{}_factTypeId", i), span.fact_type_id.clone()));
-            bindings.push((format!("span{}_roleIndex", i), span.role_index.to_string()));
+            pairs.push((format!("span{}_factTypeId", i), span.fact_type_id.clone()));
+            pairs.push((format!("span{}_roleIndex", i), span.role_index.to_string()));
         }
-        facts.entry("Constraint".to_string()).or_default().push(FactInstance {
-            fact_type_id: "Constraint".to_string(),
-            bindings,
-        });
+        let refs: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        state = cell_push("Constraint", fact_from_pairs(&refs), &state);
     }
 
     // Derivation rules
     for r in &d.derivation_rules {
-        facts.entry("DerivationRule".to_string()).or_default().push(FactInstance {
-            fact_type_id: "DerivationRule".to_string(),
-            bindings: vec![
-                ("id".to_string(), r.id.clone()),
-                ("text".to_string(), r.text.clone()),
-                ("consequentFactTypeId".to_string(), r.consequent_fact_type_id.clone()),
-            ],
-        });
+        state = cell_push("DerivationRule", fact_from_pairs(&[
+            ("id", r.id.as_str()), ("text", r.text.as_str()), ("consequentFactTypeId", r.consequent_fact_type_id.as_str()),
+        ]), &state);
     }
 
     // Instance facts
     for f in &d.general_instance_facts {
-        facts.entry("InstanceFact".to_string()).or_default().push(FactInstance {
-            fact_type_id: "InstanceFact".to_string(),
-            bindings: vec![
-                ("subjectNoun".to_string(), f.subject_noun.clone()),
-                ("subjectValue".to_string(), f.subject_value.clone()),
-                ("fieldName".to_string(), f.field_name.clone()),
-                ("objectNoun".to_string(), f.object_noun.clone()),
-                ("objectValue".to_string(), f.object_value.clone()),
-            ],
-        });
+        state = cell_push("InstanceFact", fact_from_pairs(&[
+            ("subjectNoun", f.subject_noun.as_str()), ("subjectValue", f.subject_value.as_str()),
+            ("fieldName", f.field_name.as_str()), ("objectNoun", f.object_noun.as_str()),
+            ("objectValue", f.object_value.as_str()),
+        ]), &state);
     }
 
-    Population { facts }
+    state
 }
 
 /// Materialize Domain into entity cells for EntityDB.
@@ -1652,7 +1641,7 @@ mod tests {
 
     #[test]
     fn instance_facts_value() {
-        let input = "Domain(.Slug) is an entity type.\nVisibility is a value type.\n  The possible values of Visibility are 'public', 'private'.\n## Fact Types\nDomain has Visibility.\n## Instance Facts\nDomain 'support' has Visibility 'public'.";
+        let input = "Domain(.Slug) is an entity type.\nAccess is a value type.\n  The possible values of Access are 'public', 'private'.\n## Fact Types\nDomain has Access.\n## Instance Facts\nDomain 'support' has Access 'public'.";
         let ir = parse_markdown(input).unwrap();
         assert_eq!(ir.general_instance_facts.len(), 1);
         assert_eq!(ir.general_instance_facts[0].subject_noun, "Domain");
@@ -1673,7 +1662,7 @@ mod tests {
 
     #[test]
     fn instance_facts_multiple() {
-        let input = "Domain(.Slug) is an entity type.\nVisibility is a value type.\nDomain has Visibility.\nDomain 'support' has Visibility 'public'.\nDomain 'core' has Visibility 'private'.";
+        let input = "Domain(.Slug) is an entity type.\nAccess is a value type.\nDomain has Access.\nDomain 'support' has Access 'public'.\nDomain 'core' has Access 'private'.";
         let ir = parse_markdown(input).unwrap();
         assert_eq!(ir.general_instance_facts.len(), 2);
     }

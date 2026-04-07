@@ -190,6 +190,10 @@ pub struct GuardDef {
 
 // ── Evaluation Types ─────────────────────────────────────────────────
 
+/// The AST state D: a sequence of cells (Backus Sec. 14.3).
+/// Population P is ↑FILE:D. DEFS are cells in D.
+pub type State = crate::ast::Object;
+
 /// A snapshot of facts for evaluation. Keys are fact type IDs.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

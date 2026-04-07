@@ -363,4 +363,4 @@ It is obligatory that each Entity List has some Sort Direction.
 
 ## Instance Facts
 
-Domain 'ui' has Visibility 'public'.
+Domain 'ui' has Access 'public'.

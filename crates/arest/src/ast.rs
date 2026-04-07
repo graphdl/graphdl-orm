@@ -145,7 +145,7 @@ impl fmt::Display for Object {
 // The population is the data. It encodes as an Object for evaluation.
 // Facts become sequences. The population becomes a sequence of tagged sequences.
 
-use crate::types::{Population, Violation};
+use crate::types::{Population, FactInstance, Violation};
 
 /// Encode an evaluation context as a single Object.
 /// Structure: <response_text, sender_identity, population>
@@ -171,6 +171,38 @@ pub fn encode_population(population: &Population) -> Object {
         Object::seq(vec![Object::atom(ft_id), Object::Seq(fact_objs)])
     }).collect();
     Object::Seq(fact_types)
+}
+
+/// Convert a Population struct to an Object state (sequence of cells).
+/// Each fact type becomes a cell: <CELL, fact_type_id, <fact_tuples...>>
+/// Each fact tuple is a named-tuple: <<role_name, value>, ...>
+pub fn population_to_state(population: &Population) -> Object {
+    let cells: Vec<Object> = population.facts.iter().map(|(ft_id, facts)| {
+        let fact_objs: Vec<Object> = facts.iter().map(|fact| {
+            fact_from_pairs(&fact.bindings.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect::<Vec<_>>())
+        }).collect();
+        cell(ft_id, Object::Seq(fact_objs))
+    }).collect();
+    Object::Seq(cells)
+}
+
+/// Convert an Object state (sequence of cells) back to a Population struct.
+/// Inverse of population_to_state.
+pub fn state_to_population(state: &Object) -> Population {
+    let mut facts: std::collections::HashMap<String, Vec<FactInstance>> = std::collections::HashMap::new();
+    for (name, contents) in cells_iter(state) {
+        let instances: Vec<FactInstance> = contents.as_seq().map(|fact_objs| {
+            fact_objs.iter().filter_map(|fact_obj| {
+                let bindings: Vec<(String, String)> = fact_obj.as_seq()?.iter().filter_map(|pair| {
+                    let items = pair.as_seq()?;
+                    Some((items.get(0)?.as_atom()?.to_string(), items.get(1)?.as_atom()?.to_string()))
+                }).collect();
+                Some(FactInstance { fact_type_id: name.to_string(), bindings })
+            }).collect()
+        }).unwrap_or_default();
+        facts.insert(name.to_string(), instances);
+    }
+    Population { facts }
 }
 
 /// Decode a violation Object back to a Violation struct.
@@ -913,6 +945,86 @@ pub fn store(name: &str, contents: Object, state: &Object) -> Object {
         result.push(cell(name, contents));
     }
     Object::Seq(result)
+}
+
+// ── State helpers (named-tuple cells for Population-as-Object) ──────
+
+/// Fetch cell contents, defaulting to phi (empty sequence) if not found.
+/// Replaces: population.facts.get("key").map(|v| v.as_slice()).unwrap_or(&[])
+pub fn fetch_or_phi(name: &str, state: &Object) -> Object {
+    match fetch(name, state) {
+        Object::Bottom => Object::phi(),
+        contents => contents,
+    }
+}
+
+/// Append a fact to a named cell. Creates the cell if it does not exist.
+/// Replaces: population.facts.entry("key").or_default().push(fact)
+pub fn cell_push(name: &str, fact: Object, state: &Object) -> Object {
+    let existing = fetch_or_phi(name, state);
+    let new_contents = match existing.as_seq() {
+        Some(items) => {
+            let mut v = items.to_vec();
+            v.push(fact);
+            Object::Seq(v)
+        }
+        None => Object::Seq(vec![fact]),
+    };
+    store(name, new_contents, state)
+}
+
+/// Iterate all cells in state as (name, contents) pairs.
+/// Replaces: population.facts.iter()
+pub fn cells_iter(state: &Object) -> Vec<(&str, &Object)> {
+    state.as_seq().map(|cells| {
+        cells.iter().filter_map(|c| {
+            let items = c.as_seq()?;
+            if items.len() == 3 && items[0].as_atom() == Some(CELL_TAG) {
+                Some((items[1].as_atom()?, &items[2]))
+            } else {
+                None
+            }
+        }).collect()
+    }).unwrap_or_default()
+}
+
+/// Get a binding value by role name from a named-tuple fact.
+/// A named-tuple fact is <<role1, val1>, <role2, val2>, ...>.
+/// Replaces: fact.bindings.iter().find(|(k,_)| k == "name").map(|(_,v)| v)
+pub fn binding<'a>(fact: &'a Object, key: &str) -> Option<&'a str> {
+    fact.as_seq()?.iter().find_map(|pair| {
+        let items = pair.as_seq()?;
+        if items.len() == 2 && items[0].as_atom() == Some(key) {
+            items[1].as_atom()
+        } else {
+            None
+        }
+    })
+}
+
+/// Build a named-tuple fact from (key, value) pairs.
+/// Replaces: FactInstance { fact_type_id, bindings: vec![(k,v), ...] }
+pub fn fact_from_pairs(pairs: &[(&str, &str)]) -> Object {
+    Object::Seq(pairs.iter().map(|(k, v)| {
+        Object::Seq(vec![Object::atom(k), Object::atom(v)])
+    }).collect())
+}
+
+/// Check if a named-tuple fact has a binding matching key=val.
+/// Replaces: fact.bindings.iter().any(|(k, v)| k == key && v == val)
+pub fn binding_matches(fact: &Object, key: &str, val: &str) -> bool {
+    binding(fact, key) == Some(val)
+}
+
+/// Retain only facts in a cell that satisfy a predicate. Pure functional filter.
+/// Replaces: instances.retain(|inst| predicate(inst))
+pub fn cell_filter(name: &str, predicate: impl Fn(&Object) -> bool, state: &Object) -> Object {
+    let existing = fetch_or_phi(name, state);
+    let filtered = match existing.as_seq() {
+        Some(items) => Object::Seq(items.iter().filter(|f| predicate(f)).cloned().collect()),
+        None => Object::phi(),
+    };
+    store(name, filtered, state)
 }
 
 /// The representation function ρ: Object → Func (Backus 13.3.2).
@@ -2646,5 +2758,125 @@ mod tests {
             Object::phi(), // empty sequence
         ]);
         assert_eq!(apply(&foldl_add, &input, &d), Object::atom("42"));
+    }
+
+    // ── State helper tests ──────────────────────────────────────────
+
+    #[test]
+    fn fetch_or_phi_returns_phi_for_missing_cell() {
+        let state = Object::phi();
+        assert_eq!(fetch_or_phi("missing", &state), Object::phi());
+    }
+
+    #[test]
+    fn fetch_or_phi_returns_contents_for_existing_cell() {
+        let state = Object::Seq(vec![cell("nouns", Object::atom("Alice"))]);
+        assert_eq!(fetch_or_phi("nouns", &state), Object::atom("Alice"));
+    }
+
+    #[test]
+    fn cell_push_creates_cell_on_empty_state() {
+        let state = Object::phi();
+        let fact = fact_from_pairs(&[("name", "Alice")]);
+        let state2 = cell_push("Noun", fact.clone(), &state);
+        assert_eq!(fetch_or_phi("Noun", &state2), Object::Seq(vec![fact]));
+    }
+
+    #[test]
+    fn cell_push_appends_to_existing_cell() {
+        let f1 = fact_from_pairs(&[("name", "Alice")]);
+        let f2 = fact_from_pairs(&[("name", "Bob")]);
+        let state = cell_push("Noun", f1.clone(), &Object::phi());
+        let state2 = cell_push("Noun", f2.clone(), &state);
+        assert_eq!(fetch_or_phi("Noun", &state2), Object::Seq(vec![f1, f2]));
+    }
+
+    #[test]
+    fn cells_iter_enumerates_all_cells() {
+        let state = Object::Seq(vec![
+            cell("A", Object::atom("1")),
+            cell("B", Object::atom("2")),
+        ]);
+        let pairs: Vec<(&str, &Object)> = cells_iter(&state);
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0].0, "A");
+        assert_eq!(pairs[1].0, "B");
+    }
+
+    #[test]
+    fn binding_extracts_value_by_key() {
+        let fact = fact_from_pairs(&[("name", "Alice"), ("objectType", "entity")]);
+        assert_eq!(binding(&fact, "name"), Some("Alice"));
+        assert_eq!(binding(&fact, "objectType"), Some("entity"));
+        assert_eq!(binding(&fact, "missing"), None);
+    }
+
+    #[test]
+    fn binding_matches_checks_key_value_pair() {
+        let fact = fact_from_pairs(&[("name", "Alice"), ("objectType", "entity")]);
+        assert!(binding_matches(&fact, "name", "Alice"));
+        assert!(!binding_matches(&fact, "name", "Bob"));
+        assert!(!binding_matches(&fact, "missing", "Alice"));
+    }
+
+    #[test]
+    fn fact_from_pairs_builds_named_tuple() {
+        let fact = fact_from_pairs(&[("k1", "v1"), ("k2", "v2")]);
+        let items = fact.as_seq().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].as_seq().unwrap()[0].as_atom(), Some("k1"));
+        assert_eq!(items[0].as_seq().unwrap()[1].as_atom(), Some("v1"));
+    }
+
+    #[test]
+    fn cell_filter_keeps_matching_facts() {
+        let f1 = fact_from_pairs(&[("name", "Alice")]);
+        let f2 = fact_from_pairs(&[("name", "Bob")]);
+        let state = cell_push("Noun", f1.clone(), &Object::phi());
+        let state = cell_push("Noun", f2, &state);
+        let state = cell_filter("Noun", |f| binding_matches(f, "name", "Alice"), &state);
+        assert_eq!(fetch_or_phi("Noun", &state), Object::Seq(vec![f1]));
+    }
+
+    #[test]
+    #[test]
+    fn population_state_round_trip() {
+        use crate::types::{Population, FactInstance};
+        let mut facts = HashMap::new();
+        facts.insert("Noun".to_string(), vec![
+            FactInstance {
+                fact_type_id: "Noun".to_string(),
+                bindings: vec![("name".to_string(), "Order".to_string()), ("objectType".to_string(), "entity".to_string())],
+            },
+            FactInstance {
+                fact_type_id: "Noun".to_string(),
+                bindings: vec![("name".to_string(), "Customer".to_string()), ("objectType".to_string(), "entity".to_string())],
+            },
+        ]);
+        facts.insert("GraphSchema".to_string(), vec![
+            FactInstance {
+                fact_type_id: "GraphSchema".to_string(),
+                bindings: vec![("id".to_string(), "Order has customer".to_string()), ("reading".to_string(), "Order has customer".to_string())],
+            },
+        ]);
+        let pop = Population { facts };
+        let state = population_to_state(&pop);
+        let pop2 = state_to_population(&state);
+        // Same fact types present
+        assert_eq!(pop.facts.len(), pop2.facts.len());
+        for (ft_id, instances) in &pop.facts {
+            let instances2 = pop2.facts.get(ft_id).unwrap();
+            assert_eq!(instances.len(), instances2.len());
+            for (a, b) in instances.iter().zip(instances2.iter()) {
+                assert_eq!(a.bindings, b.bindings);
+            }
+        }
+    }
+
+    fn cell_push_preserves_other_cells() {
+        let state = cell_push("A", Object::atom("1"), &Object::phi());
+        let state = cell_push("B", Object::atom("2"), &state);
+        assert_eq!(fetch_or_phi("A", &state), Object::Seq(vec![Object::atom("1")]));
+        assert_eq!(fetch_or_phi("B", &state), Object::Seq(vec![Object::atom("2")]));
     }
 }

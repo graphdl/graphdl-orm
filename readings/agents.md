@@ -49,4 +49,4 @@ Verb invokes Agent Definition.
 
 ## Instance Facts
 
-Domain 'agents' has Visibility 'public'.
+Domain 'agents' has Access 'public'.

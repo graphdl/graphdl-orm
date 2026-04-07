@@ -17,13 +17,13 @@
 //   4.   Independent entity -> single-column table
 //   6.   Constraint mapping (UC -> keys, MC -> NOT NULL, VC -> CHECK, SS -> FK)
 
-use serde::Serialize;
+use serde::{Serialize, Deserialize};
 use std::collections::{HashMap, HashSet};
 use crate::types::Domain;
 
 // -- Output types -----------------------------------------------------
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TableColumn {
     pub name: String,
@@ -34,7 +34,7 @@ pub struct TableColumn {
     pub references: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TableDef {
     pub name: String,
@@ -49,7 +49,7 @@ pub struct TableDef {
 
 // -- Helpers ----------------------------------------------------------
 
-fn to_snake(name: &str) -> String {
+pub fn to_snake(name: &str) -> String {
     let mut result = String::new();
     for (i, ch) in name.chars().enumerate() {
         if ch.is_uppercase() && i > 0 {
