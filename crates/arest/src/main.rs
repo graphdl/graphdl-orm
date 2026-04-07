@@ -78,7 +78,7 @@ mod db {
         tx.execute("DELETE FROM defs", [])
             .unwrap_or_else(|e| { eprintln!("Failed to clear defs: {}", e); std::process::exit(1); });
         {
-            let mut stmt = tx.prepare("INSERT INTO defs (name, func) VALUES (?1, ?2)")
+            let mut stmt = tx.prepare("INSERT OR REPLACE INTO defs (name, func) VALUES (?1, ?2)")
                 .unwrap_or_else(|e| { eprintln!("Failed to prepare insert: {}", e); std::process::exit(1); });
             for (name, func) in defs {
                 let obj = ast::func_to_object(func);
@@ -97,7 +97,7 @@ mod db {
         tx.execute("DELETE FROM facts", [])
             .unwrap_or_else(|e| { eprintln!("Failed to clear facts: {}", e); std::process::exit(1); });
         {
-            let mut stmt = tx.prepare("INSERT INTO facts (fact_type_id, bindings) VALUES (?1, ?2)")
+            let mut stmt = tx.prepare("INSERT OR REPLACE INTO facts (fact_type_id, bindings) VALUES (?1, ?2)")
                 .unwrap_or_else(|e| { eprintln!("Failed to prepare insert: {}", e); std::process::exit(1); });
             for (ft_id, instances) in &pop.facts {
                 for inst in instances {
