@@ -450,6 +450,17 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
         );
         let transitions_func = Func::compose(all_checks, Func::construction(checks));
         defs.push((format!("transitions:{}", sm.noun_name), transitions_func));
+
+        // transitions_meta:{noun} = static <from, to, event> triples as Constant.
+        // Replaces inject_transition_facts at runtime.
+        let meta_triples: Vec<Object> = sm.transition_table.iter().map(|(from, to, event)| {
+            Object::seq(vec![
+                Object::seq(vec![Object::atom("from"), Object::atom(from)]),
+                Object::seq(vec![Object::atom("to"), Object::atom(to)]),
+                Object::seq(vec![Object::atom("event"), Object::atom(event)]),
+            ])
+        }).collect();
+        defs.push((format!("transitions_meta:{}", sm.noun_name), Func::constant(Object::Seq(meta_triples))));
     }
 
     // Derivation rules -> named definitions
@@ -460,6 +471,44 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
     // Fact type schemas -> named definitions (CONS of roles)
     for (id, schema) in &model.schemas {
         defs.push((format!("schema:{}", id), schema.construction.clone()));
+    }
+
+    // resolve:{noun} — Condition chain mapping field_name → fact_type_id.
+    // Input: field_name atom. Output: fact_type_id atom.
+    // Compiled from NounIndex: for each fact type involving this noun,
+    // extract the "other" role's noun name as the field key.
+    for noun_name in domain.nouns.keys() {
+        let field_mappings: Vec<(String, String)> = domain.fact_types.iter()
+            .filter(|(_, ft)| ft.roles.iter().any(|r| r.noun_name == *noun_name))
+            .filter_map(|(ft_id, ft)| {
+                // For binary fact types: field = the other role's noun name
+                if ft.roles.len() == 2 {
+                    let other = ft.roles.iter().find(|r| r.noun_name != *noun_name)
+                        .map(|r| r.noun_name.clone())?;
+                    Some((other.to_lowercase(), ft_id.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if field_mappings.is_empty() { continue; }
+
+        // Build Condition chain: (eq . [id, "field1"]) -> "ft_id1"; (eq . [id, "field2"]) -> "ft_id2"; ...
+        let resolve_func = field_mappings.iter().rev().fold(
+            Func::Id, // fallback: return the field name as-is
+            |inner, (field, ft_id)| {
+                Func::condition(
+                    Func::compose(Func::Eq, Func::construction(vec![
+                        Func::Id,
+                        Func::constant(Object::atom(field)),
+                    ])),
+                    Func::constant(Object::atom(ft_id)),
+                    inner,
+                )
+            },
+        );
+        defs.push((format!("resolve:{}", noun_name), resolve_func));
     }
 
     // HATEOAS navigation links as FFP projections (Theorem 4b).
