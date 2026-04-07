@@ -354,34 +354,23 @@ fn transition_via_defs(
     state: &ast::Object,
 ) -> CommandResult {
     let mut new_state = state.clone();
-    let mut new_status = None;
 
-    for (name, func) in defs {
-        if !name.starts_with("machine:") || name.contains(":initial") { continue; }
-
-        let initial_key = format!("{}:initial", name);
-        let from_status = match current_status {
-            Some(s) => s.to_string(),
-            None => {
-                if let Some(init_func) = defs.get(&initial_key) {
-                    ast::apply(init_func, &ast::Object::phi(), defs)
-                        .as_atom().unwrap_or("").to_string()
-                } else { continue; }
-            }
-        };
-
-        let input = ast::Object::seq(vec![
-            ast::Object::atom(&from_status),
-            ast::Object::atom(event),
-        ]);
-        let result = ast::apply(func, &input, defs);
-        if let Some(next) = result.as_atom() {
-            if next != from_status {
-                new_status = Some(next.to_string());
-                break;
-            }
-        }
-    }
+    // Find the machine def and compute transition via find_map (no for loop)
+    let new_status = defs.iter()
+        .filter(|(name, _)| name.starts_with("machine:") && !name.contains(":initial"))
+        .find_map(|(name, func)| {
+            let initial_key = format!("{}:initial", name);
+            let from_status = current_status.map(|s| s.to_string()).or_else(|| {
+                defs.get(&initial_key)
+                    .map(|f| ast::apply(f, &ast::Object::phi(), defs))
+                    .and_then(|o| o.as_atom().map(|s| s.to_string()))
+            })?;
+            let input = ast::Object::seq(vec![ast::Object::atom(&from_status), ast::Object::atom(event)]);
+            let result = ast::apply(func, &input, defs);
+            result.as_atom()
+                .filter(|next| *next != from_status)
+                .map(|next| next.to_string())
+        });
 
     if let Some(ref status) = new_status {
         // Update SM status fact in state
