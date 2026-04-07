@@ -61,6 +61,16 @@ pub(crate) fn run_machine_ast(
 /// though additional derivations may be possible. This is safe because
 /// each derived fact is individually correct; only completeness is
 /// affected.
+/// Forward-chain derivation rules over Object state. Returns (new_state, derived_facts).
+pub fn forward_chain_defs_state(
+    derivation_defs: &[(&str, &ast::Func)],
+    state: &ast::Object,
+) -> (ast::Object, Vec<DerivedFact>) {
+    let mut pop = ast::state_to_population(state);
+    let derived = forward_chain_defs(derivation_defs, &mut pop);
+    (ast::population_to_state(&pop), derived)
+}
+
 pub fn forward_chain_defs(
     derivation_defs: &[(&str, &ast::Func)],
     population: &mut Population,
@@ -152,6 +162,11 @@ fn add_to_population(population: &mut Population, fact: &DerivedFact) {
 /// `goal` is a string like "Academic has Rank 'P'" -- a reading with optional values.
 /// The engine searches the population for a matching fact, then tries derivation
 /// rules whose consequent matches, recursively proving antecedents.
+#[allow(dead_code)]
+pub fn prove_state(ir: &Domain, state: &ast::Object, goal: &str, world_assumption: &WorldAssumption) -> ProofResult {
+    prove(ir, &ast::state_to_population(state), goal, world_assumption)
+}
+
 #[allow(dead_code)] // used by lib.rs WASM export, not by main.rs binary
 pub fn prove(
     ir: &Domain,
@@ -176,6 +191,11 @@ pub fn prove(
         proof,
         world_assumption: world_assumption.clone(),
     }
+}
+
+/// Prove from Object state directly.
+pub fn prove_from_state(state: &ast::Object, goal: &str, world_assumption: &WorldAssumption) -> ProofResult {
+    prove_from_pop(&ast::state_to_population(state), goal, world_assumption)
 }
 
 /// Prove from P directly. No Domain reconstruction.
@@ -348,6 +368,11 @@ fn fact_text_matches(goal: &str, fact_text: &str, reading: &str) -> bool {
 }
 
 // -- Synthesis --------------------------------------------------------
+
+/// Synthesize from Object state directly.
+pub fn synthesize_from_state(state: &ast::Object, noun_name: &str, depth: usize) -> SynthesisResult {
+    synthesize_from_pop(&ast::state_to_population(state), noun_name, depth)
+}
 
 /// Synthesize from P directly. No Domain reconstruction.
 pub fn synthesize_from_pop(
