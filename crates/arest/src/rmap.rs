@@ -8,10 +8,12 @@
 //
 // Steps:
 //   0.1. Binarize exclusive unaries (XO -> status column)
-//   0.3. Subtype absorption (absorb into root supertype)
+//   0.3. Subtype absorption (partitioned if subtype has own facts, else single-table)
 //   1.   Compound UC -> separate table (M:N, ternary+)
 //   2.   Functional roles -> grouped into entity table
-//   3.   1:1 absorption (absorb toward mandatory side)
+//   2.5. External UC -> UNIQUE constraint on cross-fact-type spans
+//   3.   1:1 absorption (mandatory > entity-over-value > larger-table > reading-dir)
+//   3.5. Compound reference scheme -> composite PK
 //   4.   Independent entity -> single-column table
 //   6.   Constraint mapping (UC -> keys, MC -> NOT NULL, VC -> CHECK, SS -> FK)
 
@@ -40,6 +42,9 @@ pub struct TableDef {
     pub primary_key: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checks: Option<Vec<String>>,
+    /// Additional UNIQUE constraints (each inner Vec is a set of column names)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unique_constraints: Option<Vec<Vec<String>>>,
 }
 
 // -- Helpers ----------------------------------------------------------
@@ -140,6 +145,8 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
     }
 
     // -- Step 0.3: Subtype absorption --------------------------------
+    // Determine which subtypes have their own fact types (partitioned strategy)
+    // vs which should be absorbed into the supertype (single-table strategy).
     let mut subtype_to_root: HashMap<String, String> = HashMap::new();
     let mut parent_of: HashMap<String, String> = HashMap::new();
     for (name, st) in &ir.subtypes {
@@ -155,8 +162,24 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
         }
         subtype_to_root.insert(name.clone(), current);
     }
+
+    // Detect subtypes that have their own fact types -> partitioned strategy
+    let mut partitioned_subtypes: HashSet<String> = HashSet::new();
+    for subtype_name in subtype_to_root.keys() {
+        let has_own_facts = ir.fact_types.values().any(|ft| {
+            ft.roles.iter().any(|r| r.noun_name == *subtype_name)
+        });
+        if has_own_facts {
+            partitioned_subtypes.insert(subtype_name.clone());
+        }
+    }
+
     let subtype_names: HashSet<&String> = subtype_to_root.keys().collect();
     let resolve_entity = |name: &str| -> String {
+        // Partitioned subtypes map to themselves, not the root
+        if partitioned_subtypes.contains(name) {
+            return name.to_string();
+        }
         subtype_to_root.get(name).cloned().unwrap_or_else(|| name.to_string())
     };
 
@@ -256,7 +279,7 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
         }
 
         let table_name = compound_table_name(&ft.reading, &ft.roles, &noun_name_set);
-        tables.push(TableDef { name: table_name.clone(), columns, primary_key: pk_cols, checks: None });
+        tables.push(TableDef { name: table_name.clone(), columns, primary_key: pk_cols, checks: None, unique_constraints: None });
         emitted.insert(table_name);
     }
 
@@ -308,7 +331,15 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
         }
     }
 
-    // -- Step 3: 1:1 absorption --------------------------------------
+    // -- Step 3: 1:1 absorption (with direction bias) ------------------
+    // Count fact type participation per noun for "larger table" heuristic
+    let mut noun_ft_count: HashMap<&str, usize> = HashMap::new();
+    for ft in ir.fact_types.values() {
+        for role in &ft.roles {
+            *noun_ft_count.entry(&role.noun_name).or_insert(0) += 1;
+        }
+    }
+
     for ft_id in &one_to_one_ft_ids {
         let ft = &ir.fact_types[ft_id];
         let role0 = &ft.roles[0];
@@ -316,20 +347,49 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
         let mc0 = mc_set.contains(&format!("{}:{}", ft_id, role0.role_index));
         let mc1 = mc_set.contains(&format!("{}:{}", ft_id, role1.role_index));
 
+        // Direction bias priority:
+        // 1. Mandatory constraint (absorb toward mandatory side)
+        // 2. Entity vs value type (absorb toward entity)
+        // 3. Larger table (more fact types)
+        // 4. Reading direction (first noun is parent)
         let (absorb_into, fk_target, is_mandatory) = if mc0 && !mc1 {
             (resolve_entity(&role0.noun_name), &role1.noun_name, true)
         } else if mc1 && !mc0 {
             (resolve_entity(&role1.noun_name), &role0.noun_name, true)
         } else {
-            (resolve_entity(&role0.noun_name), &role1.noun_name, mc0)
+            // No mandatory asymmetry -- apply direction bias
+            let is_entity0 = ir.nouns.get(&role0.noun_name).map_or(false, |n| n.object_type == "entity");
+            let is_entity1 = ir.nouns.get(&role1.noun_name).map_or(false, |n| n.object_type == "entity");
+            let both_mandatory = mc0 && mc1;
+
+            if is_entity0 && !is_entity1 {
+                // Absorb toward entity (role0)
+                (resolve_entity(&role0.noun_name), &role1.noun_name, both_mandatory)
+            } else if is_entity1 && !is_entity0 {
+                // Absorb toward entity (role1)
+                (resolve_entity(&role1.noun_name), &role0.noun_name, both_mandatory)
+            } else {
+                // Both entities (or both values) -- use fact type count
+                let count0 = noun_ft_count.get(role0.noun_name.as_str()).copied().unwrap_or(0);
+                let count1 = noun_ft_count.get(role1.noun_name.as_str()).copied().unwrap_or(0);
+                if count0 > count1 {
+                    (resolve_entity(&role0.noun_name), &role1.noun_name, both_mandatory)
+                } else if count1 > count0 {
+                    (resolve_entity(&role1.noun_name), &role0.noun_name, both_mandatory)
+                } else {
+                    // Equal -- use reading direction (role0 is first in reading)
+                    (resolve_entity(&role0.noun_name), &role1.noun_name, both_mandatory)
+                }
+            }
         };
 
         let entry = entity_columns.entry(absorb_into).or_insert_with(|| (Vec::new(), HashSet::new(), Vec::new()));
+        let is_target_entity = ir.nouns.get(fk_target.as_str()).map_or(false, |n| n.object_type == "entity");
         entry.0.push(TableColumn {
-            name: fk_column_name(fk_target),
+            name: column_name_for_target(ir, fk_target),
             col_type: "TEXT".to_string(),
             nullable: !is_mandatory,
-            references: Some(to_snake(fk_target)),
+            references: if is_target_entity { Some(to_snake(fk_target)) } else { None },
         });
     }
 
@@ -349,18 +409,102 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
         }
     }
 
+    // -- Step 2.5: External UC -> UNIQUE constraints -------------------
+    // External UCs span multiple fact types. Collect them per target entity.
+    let mut external_ucs: HashMap<String, Vec<Vec<String>>> = HashMap::new();
+    for c in &ir.constraints {
+        if c.kind != "UC" { continue }
+        if c.spans.len() < 2 { continue }
+        // Check if spans reference different fact types
+        let ft_ids: HashSet<&str> = c.spans.iter().map(|s| s.fact_type_id.as_str()).collect();
+        if ft_ids.len() < 2 { continue }
+        // This is an external UC. Find the target entity: the noun that plays
+        // the source role in each spanned fact type (the UC'd role's counterpart).
+        // For each span, the UC is on the non-source role; the source role
+        // identifies which entity table the column lives in.
+        let mut uc_cols: Vec<String> = Vec::new();
+        let mut target_entity: Option<String> = None;
+        for span in &c.spans {
+            let ft = match ir.fact_types.get(&span.fact_type_id) {
+                Some(ft) => ft,
+                None => continue,
+            };
+            // The UC'd role is the one at span.role_index -> its column name
+            let uc_role = match ft.roles.iter().find(|r| r.role_index == span.role_index) {
+                Some(r) => r,
+                None => continue,
+            };
+            let col_name = column_name_for_target(ir, &uc_role.noun_name);
+            uc_cols.push(col_name);
+            // The source role is the other role in the binary fact type
+            for role in &ft.roles {
+                if role.role_index != span.role_index {
+                    let resolved = resolve_entity(&role.noun_name);
+                    target_entity = Some(resolved);
+                }
+            }
+        }
+        if let Some(entity) = target_entity {
+            if uc_cols.len() >= 2 {
+                external_ucs.entry(entity).or_default().push(uc_cols);
+            }
+        }
+    }
+
     // -- Emit entity tables ------------------------------------------
     for (entity_name, (columns, _, checks)) in &entity_columns {
-        if subtype_names.contains(entity_name) { continue }
+        // Skip absorbed subtypes (non-partitioned) -- they are in the root table
+        if subtype_names.contains(entity_name) && !partitioned_subtypes.contains(entity_name) {
+            continue;
+        }
         let table_name = to_snake(entity_name);
-        let id_col = TableColumn { name: "id".to_string(), col_type: "TEXT".to_string(), nullable: false, references: None };
-        let mut all_cols = vec![id_col];
-        all_cols.extend(columns.iter().cloned());
+        let is_partitioned_subtype = partitioned_subtypes.contains(entity_name);
+
+        // Feature #59: Compound reference scheme -> composite PK
+        let compound_ref = ir.ref_schemes.get(entity_name)
+            .filter(|parts| parts.len() >= 2);
+
+        let (all_cols, pk) = if let Some(ref_parts) = compound_ref {
+            // Compound reference scheme: use ref parts as composite PK
+            let pk_cols: Vec<String> = ref_parts.iter()
+                .map(|part| column_name_for_target(ir, part))
+                .collect();
+            // No synthetic "id" column; columns are already present from functional absorption
+            (columns.iter().cloned().collect::<Vec<_>>(), pk_cols)
+        } else if is_partitioned_subtype {
+            // Partitioned subtype: id column references parent table
+            let parent_name = subtype_to_root.get(entity_name).unwrap();
+            let id_col = TableColumn {
+                name: "id".to_string(),
+                col_type: "TEXT".to_string(),
+                nullable: false,
+                references: Some(to_snake(parent_name)),
+            };
+            let mut all = vec![id_col];
+            all.extend(columns.iter().cloned());
+            (all, vec!["id".to_string()])
+        } else {
+            // Normal entity: synthetic id PK
+            let id_col = TableColumn {
+                name: "id".to_string(),
+                col_type: "TEXT".to_string(),
+                nullable: false,
+                references: None,
+            };
+            let mut all = vec![id_col];
+            all.extend(columns.iter().cloned());
+            (all, vec!["id".to_string()])
+        };
+
+        // Feature #57: Attach external UC as UNIQUE constraints
+        let ext_ucs = external_ucs.get(entity_name).cloned();
+
         let table = TableDef {
             name: table_name.clone(),
             columns: all_cols,
-            primary_key: vec!["id".to_string()],
+            primary_key: pk,
             checks: if checks.is_empty() { None } else { Some(checks.clone()) },
+            unique_constraints: ext_ucs,
         };
         tables.push(table);
         emitted.insert(table_name);
@@ -379,12 +523,15 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
         if emitted.contains(ref_table) { continue }
         let noun = ir.nouns.iter().find(|(name, def)| to_snake(name) == *ref_table && def.object_type == "entity");
         if noun.is_none() { continue }
-        if subtype_names.contains(&noun.unwrap().0) { continue }
+        let noun_entry = noun.unwrap();
+        // Skip non-partitioned subtypes (they are absorbed into supertype)
+        if subtype_names.contains(&noun_entry.0) && !partitioned_subtypes.contains(noun_entry.0) { continue }
         tables.push(TableDef {
             name: ref_table.clone(),
             columns: vec![TableColumn { name: "id".to_string(), col_type: "TEXT".to_string(), nullable: false, references: None }],
             primary_key: vec!["id".to_string()],
             checks: None,
+            unique_constraints: None,
         });
         emitted.insert(ref_table.clone());
     }
@@ -527,5 +674,251 @@ mod tests {
         let customer = tables.iter().find(|t| t.name == "customer").unwrap();
         assert_eq!(customer.columns.len(), 1); // just id
         assert_eq!(customer.primary_key, vec!["id"]);
+    }
+
+    // ── Feature #57: External Uniqueness Constraint ─────────────────
+
+    #[test]
+    fn external_uc_produces_unique_constraint() {
+        // Room is in Building (UC on Room role -> functional)
+        // Room has RoomNr (UC on Room role -> functional)
+        // External UC spans both fact types on Room roles -> UNIQUE(building_id, room_nr)
+        let ir = make_ir(
+            vec![
+                ("Room", "entity"),
+                ("Building", "entity"),
+                ("RoomNr", "value"),
+            ],
+            vec![
+                ("ft1", "Room is in Building", vec![("Room", 0), ("Building", 1)]),
+                ("ft2", "Room has RoomNr", vec![("Room", 0), ("RoomNr", 1)]),
+            ],
+            vec![
+                ("UC", vec![("ft1", 0)]),   // each Room is in at most one Building
+                ("UC", vec![("ft2", 0)]),   // each Room has at most one RoomNr
+                // External UC: the combination of Building and RoomNr uniquely identifies Room
+                ("UC", vec![("ft1", 1), ("ft2", 1)]),
+            ],
+        );
+        let tables = rmap(&ir);
+        let room = tables.iter().find(|t| t.name == "room").unwrap();
+        // Room table should have columns: id, building_id, room_nr
+        assert!(room.columns.iter().any(|c| c.name == "building_id"));
+        assert!(room.columns.iter().any(|c| c.name == "room_nr"));
+        // Should have a UNIQUE constraint on (building_id, room_nr)
+        let ucs = room.unique_constraints.as_ref().expect("should have unique constraints");
+        assert!(ucs.iter().any(|uc| {
+            uc.len() == 2
+            && uc.contains(&"building_id".to_string())
+            && uc.contains(&"room_nr".to_string())
+        }), "Expected UNIQUE(building_id, room_nr), got {:?}", ucs);
+    }
+
+    // ── Feature #58: Partitioned Subtype Absorption ─────────────────
+
+    fn make_ir_with_subtypes(
+        nouns: Vec<(&str, &str)>,
+        fact_types: Vec<(&str, &str, Vec<(&str, usize)>)>,
+        constraints: Vec<(&str, Vec<(&str, usize)>)>,
+        subtypes: Vec<(&str, &str)>,
+    ) -> Domain {
+        let mut ir = make_ir(nouns, fact_types, constraints);
+        for (child, parent) in subtypes {
+            ir.subtypes.insert(child.to_string(), parent.to_string());
+        }
+        ir
+    }
+
+    #[test]
+    fn partitioned_subtype_gets_own_table() {
+        // Person is the supertype. Employee is a subtype of Person.
+        // Person has Name (functional on Person).
+        // Employee has Salary (functional on Employee -- subtype-specific).
+        // Because Employee has its own fact type, it should get a partitioned table.
+        let ir = make_ir_with_subtypes(
+            vec![
+                ("Person", "entity"),
+                ("Employee", "entity"),
+                ("Name", "value"),
+                ("Salary", "value"),
+            ],
+            vec![
+                ("ft1", "Person has Name", vec![("Person", 0), ("Name", 1)]),
+                ("ft2", "Employee has Salary", vec![("Employee", 0), ("Salary", 1)]),
+            ],
+            vec![
+                ("UC", vec![("ft1", 0)]),
+                ("UC", vec![("ft2", 0)]),
+            ],
+            vec![("Employee", "Person")],
+        );
+        let tables = rmap(&ir);
+        let table_names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
+        // Person table should exist with name column but NOT salary
+        let person = tables.iter().find(|t| t.name == "person").unwrap();
+        assert!(person.columns.iter().any(|c| c.name == "name"), "Person should have name");
+        assert!(!person.columns.iter().any(|c| c.name == "salary"),
+            "Person should NOT have salary (partitioned)");
+        // Employee table should exist with its own PK referencing person
+        assert!(table_names.contains(&"employee"),
+            "Employee should get its own table, got: {:?}", table_names);
+        let employee = tables.iter().find(|t| t.name == "employee").unwrap();
+        assert!(employee.columns.iter().any(|c| c.name == "salary"),
+            "Employee table should have salary column");
+        // Employee PK should reference Person
+        let id_col = employee.columns.iter().find(|c| c.name == "id").unwrap();
+        assert_eq!(id_col.references.as_deref(), Some("person"),
+            "Employee id should FK to person");
+    }
+
+    #[test]
+    fn absorbed_subtype_stays_in_supertype_table() {
+        // Person is the supertype. VIPCustomer is a subtype but has no own fact types.
+        // VIPCustomer should stay absorbed into Person (single-table).
+        let ir = make_ir_with_subtypes(
+            vec![
+                ("Person", "entity"),
+                ("VIPCustomer", "entity"),
+                ("Name", "value"),
+            ],
+            vec![
+                ("ft1", "Person has Name", vec![("Person", 0), ("Name", 1)]),
+            ],
+            vec![
+                ("UC", vec![("ft1", 0)]),
+            ],
+            vec![("VIPCustomer", "Person")],
+        );
+        let tables = rmap(&ir);
+        let table_names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
+        // VIPCustomer should NOT get its own table (no fact types of its own)
+        assert!(!table_names.contains(&"v_i_p_customer") && !table_names.contains(&"vip_customer"),
+            "VIPCustomer should not get its own table: {:?}", table_names);
+        // Person table should still exist
+        assert!(table_names.contains(&"person"));
+    }
+
+    // ── Feature #59: Compound Reference Scheme ──────────────────────
+
+    fn make_ir_with_ref_schemes(
+        nouns: Vec<(&str, &str)>,
+        fact_types: Vec<(&str, &str, Vec<(&str, usize)>)>,
+        constraints: Vec<(&str, Vec<(&str, usize)>)>,
+        ref_schemes: Vec<(&str, Vec<&str>)>,
+    ) -> Domain {
+        let mut ir = make_ir(nouns, fact_types, constraints);
+        for (noun, parts) in ref_schemes {
+            ir.ref_schemes.insert(
+                noun.to_string(),
+                parts.iter().map(|s| s.to_string()).collect(),
+            );
+        }
+        ir
+    }
+
+    #[test]
+    fn compound_ref_scheme_produces_composite_pk() {
+        // Room is in Building (UC on Room), Room has RoomNr (UC on Room)
+        // Compound reference scheme: Room is identified by (Building, RoomNr)
+        let ir = make_ir_with_ref_schemes(
+            vec![
+                ("Room", "entity"),
+                ("Building", "entity"),
+                ("RoomNr", "value"),
+            ],
+            vec![
+                ("ft1", "Room is in Building", vec![("Room", 0), ("Building", 1)]),
+                ("ft2", "Room has RoomNr", vec![("Room", 0), ("RoomNr", 1)]),
+            ],
+            vec![
+                ("UC", vec![("ft1", 0)]),
+                ("UC", vec![("ft2", 0)]),
+            ],
+            vec![("Room", vec!["Building", "RoomNr"])],
+        );
+        let tables = rmap(&ir);
+        let room = tables.iter().find(|t| t.name == "room").unwrap();
+        // PK should be composite: (building_id, room_nr)
+        assert_eq!(room.primary_key.len(), 2,
+            "Expected composite PK, got {:?}", room.primary_key);
+        assert!(room.primary_key.contains(&"building_id".to_string()));
+        assert!(room.primary_key.contains(&"room_nr".to_string()));
+        // Should NOT have an "id" column
+        assert!(!room.columns.iter().any(|c| c.name == "id"),
+            "Should not have synthetic id column with compound ref scheme");
+    }
+
+    // ── Feature #60: Fact Type Direction Bias ────────────────────────
+
+    #[test]
+    fn one_to_one_absorbs_toward_entity_not_value() {
+        // Country has CountryCode (1:1, both UC).
+        // Should absorb CountryCode into Country (entity over value).
+        let ir = make_ir(
+            vec![("Country", "entity"), ("CountryCode", "value")],
+            vec![("ft1", "Country has CountryCode", vec![("Country", 0), ("CountryCode", 1)])],
+            vec![
+                ("UC", vec![("ft1", 0)]),
+                ("UC", vec![("ft1", 1)]),
+            ],
+        );
+        let tables = rmap(&ir);
+        // Country table should absorb country_code
+        let country = tables.iter().find(|t| t.name == "country").unwrap();
+        assert!(country.columns.iter().any(|c| c.name == "country_code"),
+            "Country should absorb country_code, columns: {:?}",
+            country.columns.iter().map(|c| &c.name).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn one_to_one_absorbs_toward_larger_table() {
+        // Person has SSN (1:1), Person has Name (functional on Person)
+        // Person already has more columns -> SSN should be absorbed into Person
+        let ir = make_ir(
+            vec![
+                ("Person", "entity"),
+                ("SSN", "entity"),
+                ("Name", "value"),
+            ],
+            vec![
+                ("ft1", "Person has SSN", vec![("Person", 0), ("SSN", 1)]),
+                ("ft2", "Person has Name", vec![("Person", 0), ("Name", 1)]),
+            ],
+            vec![
+                ("UC", vec![("ft1", 0)]),
+                ("UC", vec![("ft1", 1)]),
+                ("UC", vec![("ft2", 0)]),
+            ],
+        );
+        let tables = rmap(&ir);
+        let person = tables.iter().find(|t| t.name == "person").unwrap();
+        assert!(person.columns.iter().any(|c| c.name == "ssn_id"),
+            "Person should absorb ssn_id, columns: {:?}",
+            person.columns.iter().map(|c| &c.name).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn one_to_one_absorbs_using_reading_direction() {
+        // Husband is married to Wife (1:1, both entities, same number of fact types)
+        // Reading direction: Husband is first -> absorb into Husband
+        let ir = make_ir(
+            vec![("Husband", "entity"), ("Wife", "entity")],
+            vec![("ft1", "Husband is married to Wife", vec![("Husband", 0), ("Wife", 1)])],
+            vec![
+                ("UC", vec![("ft1", 0)]),
+                ("UC", vec![("ft1", 1)]),
+            ],
+        );
+        let tables = rmap(&ir);
+        let husband = tables.iter().find(|t| t.name == "husband").unwrap();
+        assert!(husband.columns.iter().any(|c| c.name == "wife_id"),
+            "Husband should absorb wife_id (reading direction), columns: {:?}",
+            husband.columns.iter().map(|c| &c.name).collect::<Vec<_>>());
+        // Wife should NOT have husband_id
+        let wife = tables.iter().find(|t| t.name == "wife");
+        if let Some(w) = wife {
+            assert!(!w.columns.iter().any(|c| c.name == "husband_id"),
+                "Wife should NOT have husband_id");
+        }
     }
 }
