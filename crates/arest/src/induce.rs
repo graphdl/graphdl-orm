@@ -1,12 +1,12 @@
-﻿// crates/arest/src/induce.rs
+// crates/arest/src/induce.rs
 //
 // Induction engine: given a population of facts, infer the constraints
 // and derivation rules that govern it.
 //
-// This is the inverse of evaluation â€” instead of checking facts against
+// This is the inverse of evaluation -- instead of checking facts against
 // rules, we discover rules from facts. Per Halpin's CSDP:
 //   Step 4: "Add uniqueness constraints and check arity of fact types"
-//   â€” look at the population, check which columns have duplicates.
+//   -- look at the population, check which columns have duplicates.
 //
 // The induction engine implements:
 //   - UC induction: which role combinations have unique values?
@@ -18,7 +18,7 @@
 use std::collections::{HashMap, HashSet};
 use crate::types::*;
 
-/// An induced constraint â€” discovered from population analysis
+/// An induced constraint -- discovered from population analysis
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InducedConstraint {
@@ -30,7 +30,7 @@ pub struct InducedConstraint {
     pub evidence: String,
 }
 
-/// An induced derivation rule â€” discovered from population patterns
+/// An induced derivation rule -- discovered from population patterns
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InducedRule {
@@ -69,7 +69,7 @@ pub fn induce(ir: &Domain, population: &Population) -> InductionResult {
         .flat_map(|facts| facts.iter().flat_map(|f| f.bindings.iter().map(|(_, v)| v.clone())))
         .collect();
 
-    // â”€â”€ UC Induction â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // -- UC Induction -------------------------------------------------
     // For each fact type, check which role combinations have unique values.
     for (ft_id, facts) in &population.facts {
         if facts.is_empty() { continue; }
@@ -165,7 +165,7 @@ pub fn induce(ir: &Domain, population: &Population) -> InductionResult {
         }
     }
 
-    // â”€â”€ MC Induction â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // -- MC Induction -------------------------------------------------
     // For each entity that participates in ANY fact type, check if it
     // participates in ALL instances of other fact types.
     for (ft_id, facts) in &population.facts {
@@ -205,7 +205,7 @@ pub fn induce(ir: &Domain, population: &Population) -> InductionResult {
         }
     }
 
-    // â”€â”€ SS Induction â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // -- SS Induction -------------------------------------------------
     // Check if one fact type's entity population is a subset of another's.
     let ft_entities: HashMap<String, HashSet<String>> = population.facts.iter()
         .filter_map(|(ft_id, facts)| {
@@ -231,7 +231,7 @@ pub fn induce(ir: &Domain, population: &Population) -> InductionResult {
                 constraints.push(InducedConstraint {
                     kind: "SS".to_string(),
                     fact_type_id: ft_ids[i].clone(),
-                    reading: format!("pop('{}') âŠ† pop('{}')", reading_a, reading_b),
+                    reading: format!("pop('{}') subset_of pop('{}')", reading_a, reading_b),
                     roles: vec![0],
                     confidence: 0.7,
                     evidence: format!(
@@ -243,7 +243,7 @@ pub fn induce(ir: &Domain, population: &Population) -> InductionResult {
         }
     }
 
-    // â”€â”€ Derivation Rule Induction â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // -- Derivation Rule Induction ------------------------------------
     // Check if any fact type's population can be fully explained by
     // joining other fact types.
     for (ft_id, facts) in &population.facts {
@@ -276,7 +276,7 @@ pub fn induce(ir: &Domain, population: &Population) -> InductionResult {
 
                 if common.is_empty() { continue; }
 
-                // Join on common noun â€” does the result match our target?
+                // Join on common noun -- does the result match our target?
                 let join_noun = common[0];
                 let mut joined: HashSet<(String, String)> = HashSet::new();
                 for a_fact in other_a_facts {
