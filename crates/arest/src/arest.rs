@@ -258,8 +258,12 @@ fn create_via_defs(
     let mut entity_data = fields.clone();
     entity_data.insert("domain".to_string(), domain.to_string());
 
+    let resolve_key = format!("resolve:{}", noun);
     for (field_name, value) in &entity_data {
-        let ft_id = resolve_fact_type_id_defs(defs, noun, field_name);
+        let ft_id = defs.get(&resolve_key)
+            .map(|f| ast::apply(f, &ast::Object::atom(&field_name.to_lowercase()), defs))
+            .and_then(|o| o.as_atom().map(|s| s.to_string()))
+            .unwrap_or_else(|| resolve_fact_type_id_defs(defs, noun, field_name));
         new_state = ast::cell_push(&ft_id, ast::fact_from_pairs(&[
             (noun, &entity_id),
             (field_name.as_str(), value.as_str()),
@@ -295,8 +299,15 @@ fn create_via_defs(
         });
     }
 
-    // Inject transition facts from InstanceFact entries (Theorem 3: T is in P)
-    let new_state = inject_transition_facts(state, new_state);
+    // Inject transition facts from compiled transitions_meta:{noun} (Theorem 3: T is in P)
+    let new_state = defs.get(&format!("transitions_meta:{}", noun))
+        .map(|f| {
+            let triples = ast::apply(f, &ast::Object::phi(), defs);
+            triples.as_seq().map(|facts| {
+                facts.iter().fold(new_state.clone(), |s, fact| ast::cell_push("Transition", fact.clone(), &s))
+            }).unwrap_or(new_state.clone())
+        })
+        .unwrap_or_else(|| inject_transition_facts(state, new_state));
 
     // -- validate --
     let ctx_obj = ast::encode_eval_context_state("", None, &new_state);

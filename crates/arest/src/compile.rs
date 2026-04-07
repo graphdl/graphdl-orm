@@ -808,6 +808,25 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
         }
     }
 
+    // ── Handler defs: create:{noun}, transition:{noun}, update:{noun} ──
+    // These are Constant markers that tell the dispatch function which noun
+    // to use. The actual handler logic uses the compiled resolve:{noun},
+    // transitions_meta:{noun}, validate, and machine:{noun} defs.
+    // The dispatch mechanism in arest.rs looks up create:{noun} to confirm
+    // the noun exists, then applies the handler pipeline using the compiled defs.
+    for noun_name in domain.nouns.keys() {
+        let noun_obj = Object::atom(noun_name);
+        defs.push((format!("create:{}", noun_name), Func::constant(noun_obj.clone())));
+        defs.push((format!("update:{}", noun_name), Func::constant(noun_obj.clone())));
+    }
+    // Query defs per schema (role name → index mapping)
+    for (id, schema) in &model.schemas {
+        let role_map = Object::Seq(schema.role_names.iter().enumerate().map(|(i, name)| {
+            Object::seq(vec![Object::atom(name), Object::atom(&(i + 1).to_string())])
+        }).collect());
+        defs.push((format!("query:{}", id), Func::constant(role_map)));
+    }
+
     defs
 }
 
