@@ -1506,7 +1506,7 @@ fn rho_resolves_fact_type_and_applies_operation() {
     // Per Backus 13.3.2: (ρ<COMP, f, g>):x = (f∘g):x
     // We test with CONS: (ρ<CONS, s1, s2>):x = [s1, s2]:x = <s1:x, s2:x>
     let cons_obj = Object::seq(vec![
-        Object::atom("CONS"),
+        Object::atom("["),
         Object::atom("1"),  // selector 1
         Object::atom("2"),  // selector 2
     ]);

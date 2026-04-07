@@ -806,18 +806,18 @@ pub fn apply(func: &Func, x: &Object, defs: &std::collections::HashMap<String, F
 pub mod primitives {
     pub const ID: &str = "id";
     pub const TL: &str = "tl";
-    pub const ATOM: &str = "atom";
-    pub const EQ: &str = "eq";
-    pub const NULL: &str = "null";
-    pub const REVERSE: &str = "reverse";
-    pub const DISTL: &str = "distl";
-    pub const DISTR: &str = "distr";
-    pub const LENGTH: &str = "length";
-    pub const TRANS: &str = "trans";
-    pub const APNDL: &str = "apndl";
-    pub const APNDR: &str = "apndr";
-    pub const ROTL: &str = "rotl";
-    pub const ROTR: &str = "rotr";
+    pub const ATOM: &str = "a?";
+    pub const EQ: &str = "=";
+    pub const NULL: &str = "0?";
+    pub const REVERSE: &str = "<>";
+    pub const DISTL: &str = "dl";
+    pub const DISTR: &str = "dr";
+    pub const LENGTH: &str = "#l";
+    pub const TRANS: &str = "tr";
+    pub const APNDL: &str = "al";
+    pub const APNDR: &str = "ar";
+    pub const ROTL: &str = "rl";
+    pub const ROTR: &str = "rr";
     pub const ADD: &str = "+";
     pub const SUB: &str = "-";
     pub const MUL: &str = "*";
@@ -825,22 +825,25 @@ pub mod primitives {
     pub const AND: &str = "and";
     pub const OR: &str = "or";
     pub const NOT: &str = "not";
-    pub const FETCH: &str = "fetch";
-    pub const STORE: &str = "store";
+    pub const FETCH: &str = "^";
+    pub const STORE: &str = "v";
+    pub const CONTAINS: &str = "in";
+    pub const LOWER: &str = "lc";
+    pub const CONCAT: &str = "++";
 }
 
 /// Standard atom names for functional forms (Backus 11.2.4, 13.3.2).
 pub mod forms {
-    pub const COMP: &str = "COMP";
-    pub const CONS: &str = "CONS";
-    pub const COND: &str = "COND";
-    pub const ALPHA: &str = "ALPHA";
-    pub const INSERT: &str = "INSERT";
-    pub const BU: &str = "BU";
-    pub const FILTER: &str = "FILTER";
-    pub const WHILE: &str = "WHILE";
-    pub const FOLDL: &str = "FOLDL";
-    pub const CONST: &str = "CONST";
+    pub const COMP: &str = ".";
+    pub const CONS: &str = "[";
+    pub const COND: &str = "?";
+    pub const ALPHA: &str = "@";
+    pub const INSERT: &str = "/";
+    pub const BU: &str = "bu";
+    pub const FILTER: &str = "#";
+    pub const WHILE: &str = "W";
+    pub const FOLDL: &str = "\\";
+    pub const CONST: &str = "'";
 }
 
 // ── Cells and State (Backus Section 14.3, 14.7) ─────────────────────
@@ -945,9 +948,9 @@ fn metacompose_atom(name: &str, defs: &std::collections::HashMap<String, Func>) 
         primitives::TL => Func::Tail,
         primitives::ATOM => Func::AtomTest,
         primitives::EQ => Func::Eq,
-        "contains" => Func::Contains,
-        "concat" => Func::Concat,
-        "lower" => Func::Lower,
+        primitives::CONTAINS => Func::Contains,
+        primitives::CONCAT => Func::Concat,
+        primitives::LOWER => Func::Lower,
         primitives::NULL => Func::NullTest,
         primitives::REVERSE => Func::Reverse,
         primitives::DISTL => Func::DistL,
@@ -1068,9 +1071,9 @@ pub fn func_to_object(func: &Func) -> Object {
         Func::AtomTest => Object::atom(primitives::ATOM),
         Func::NullTest => Object::atom(primitives::NULL),
         Func::Eq => Object::atom(primitives::EQ),
-        Func::Contains => Object::atom("contains"),
-        Func::Concat => Object::atom("concat"),
-        Func::Lower => Object::atom("lower"),
+        Func::Contains => Object::atom(primitives::CONTAINS),
+        Func::Concat => Object::atom(primitives::CONCAT),
+        Func::Lower => Object::atom(primitives::LOWER),
         Func::Length => Object::atom(primitives::LENGTH),
         Func::DistL => Object::atom(primitives::DISTL),
         Func::DistR => Object::atom(primitives::DISTR),
@@ -2281,12 +2284,12 @@ mod tests {
 
     #[test]
     fn fetch_via_ffp() {
-        // FFP: ("fetch":<"FILE", D>)
+        // FFP: ("^":<"FILE", D>)
         let state = Object::Seq(vec![
             cell("FILE", Object::atom("pop")),
         ]);
         let input = Object::seq(vec![Object::atom("FILE"), state]);
-        assert_eq!(apply_ffp(&Object::atom("fetch"), &input, &defs()), Object::atom("pop"));
+        assert_eq!(apply_ffp(&Object::atom("^"), &input, &defs()), Object::atom("pop"));
     }
 
     #[test]
