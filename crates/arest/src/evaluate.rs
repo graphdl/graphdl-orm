@@ -46,8 +46,21 @@ pub(crate) fn run_machine_ast(
 // producing unbounded intermediate populations. If the bound is hit,
 // the engine stops and returns what it has -- a partial fixed point.
 
-/// Forward chain using named defs.
-/// Each def matching "derivation:" is applied to the population.
+/// Forward-chain derivation rules to a fixed point.
+///
+/// Each derivation def is applied to the current population. New facts
+/// are added, and the process repeats until no new facts are derived
+/// (fixed point reached) or the iteration bound is hit.
+///
+/// Iteration bound: 100 iterations maximum. FORML2 derivation rules are
+/// monotonic (facts are added, never removed) over a finite domain, so
+/// convergence is guaranteed in theory. The 100-iteration bound is a
+/// safety net for pathological rule sets that produce very large
+/// intermediate populations. If the bound is exceeded, the function
+/// returns a partial fixed point -- all facts derived so far, even
+/// though additional derivations may be possible. This is safe because
+/// each derived fact is individually correct; only completeness is
+/// affected.
 pub fn forward_chain_defs(
     derivation_defs: &[(&str, &ast::Func)],
     population: &mut Population,
