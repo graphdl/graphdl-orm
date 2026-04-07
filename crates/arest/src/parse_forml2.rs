@@ -571,18 +571,11 @@ pub fn parse_markdown_with_nouns(input: &str, existing_nouns: &HashMap<String, N
     Ok(ir)
 }
 
-/// Parse FORML2 readings directly into a Population.
-/// Every declaration becomes a fact in P. No intermediate struct.
-pub fn parse_to_population(input: &str) -> Result<Population, String> {
+/// Parse FORML2 readings directly into an Object state.
+/// Every declaration becomes a fact (cell) in state. No intermediate struct.
+pub fn parse_to_state(input: &str) -> Result<crate::ast::Object, String> {
     let domain = parse_markdown(input)?;
-    Ok(domain_to_population(&domain))
-}
-
-/// Parse FORML2 readings into a Population with existing nouns for cross-domain resolution.
-pub fn parse_to_population_with_nouns(input: &str, existing: &Population) -> Result<Population, String> {
-    let existing_state = crate::ast::population_to_state(existing);
-    let state = parse_to_state_with_nouns(input, &existing_state)?;
-    Ok(crate::ast::state_to_population(&state))
+    Ok(domain_to_state(&domain))
 }
 
 /// Parse FORML2 readings into an Object state with existing nouns for cross-domain resolution.
@@ -597,11 +590,6 @@ pub fn parse_to_state_with_nouns(input: &str, existing: &crate::ast::Object) -> 
         .unwrap_or_default();
     let domain = parse_markdown_with_nouns(input, &existing_nouns)?;
     Ok(domain_to_state(&domain))
-}
-
-/// Convert a Domain to a Population (compatibility wrapper).
-pub fn domain_to_population(d: &Domain) -> Population {
-    crate::ast::state_to_population(&domain_to_state(d))
 }
 
 /// Convert a Domain to an Object state (sequence of cells).
@@ -2100,12 +2088,12 @@ It is obligatory that each Support Response conforms to Pricing Model.";
 
     /// Helper: compile IR to defs, then evaluate constraints via defs path.
     fn eval_deontic_defs(ir: &crate::types::Domain, text: &str) -> Vec<crate::types::Violation> {
-        let pop = domain_to_population(ir);
-        let defs = crate::compile::compile_to_defs(&pop);
+        let state = domain_to_state(ir);
+        let defs = crate::compile::compile_to_defs_state(&state);
         let def_map: std::collections::HashMap<String, crate::ast::Func> =
             defs.iter().map(|(n, f)| (n.clone(), f.clone())).collect();
-        let empty_pop = crate::types::Population { facts: std::collections::HashMap::new() };
-        let ctx_obj = crate::ast::encode_eval_context(text, None, &empty_pop);
+        let empty_state = crate::ast::Object::phi();
+        let ctx_obj = crate::ast::encode_eval_context_state(text, None, &empty_state);
         defs.iter()
             .filter(|(n, _)| n.starts_with("constraint:"))
             .flat_map(|(name, func)| {

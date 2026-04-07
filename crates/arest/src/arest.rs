@@ -2,10 +2,10 @@
 //
 // AREST -- Applicative REpresentational State Transfer
 //
-// Command : Population -> (Population', Representation)
+// Command : State -> (State', Representation)
 //
 // The command is compiled from readings. The engine applies it.
-// The result is the new population and a hypermedia representation
+// The result is the new state and a hypermedia representation
 // with HATEOAS links showing valid state transitions.
 
 use serde::{Serialize, Deserialize};
@@ -69,8 +69,9 @@ pub struct CommandResult {
     pub violations: Vec<Violation>,
     pub derived_count: usize,
     pub rejected: bool,
-    /// The transformed population -- the authoritative state after this command.
-    pub population: Population,
+    /// The transformed state -- the authoritative state after this command.
+    #[serde(skip)]
+    pub state: ast::Object,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -93,43 +94,26 @@ pub struct TransitionAction {
 
 // -- Apply ------------------------------------------------------------
 
-// -- apply_command_defs -----------------------------------------------
-// Eq. 12: create = emit . validate . derive . resolve
-// All operations resolve through named Func definitions.
-
-/// Apply a command against Object state. Boundary conversion wrapper.
-pub fn apply_command_defs_state(
+pub fn apply_command_defs(
     defs: &std::collections::HashMap<String, ast::Func>,
     command: &Command,
     state: &ast::Object,
 ) -> CommandResult {
-    let pop = ast::state_to_population(state);
-    let mut result = apply_command_defs(defs, command, &pop);
-    // The result.population is the new state after the command.
-    // Keep it as Population for now — callers can convert.
-    result
-}
-
-pub fn apply_command_defs(
-    defs: &std::collections::HashMap<String, ast::Func>,
-    command: &Command,
-    population: &Population,
-) -> CommandResult {
     match command {
         Command::CreateEntity { noun, domain, id, fields } => {
-            create_via_defs(defs, noun, domain, id.as_deref(), fields, population)
+            create_via_defs(defs, noun, domain, id.as_deref(), fields, state)
         }
         Command::Transition { entity_id, event, domain, current_status } => {
-            transition_via_defs(defs, entity_id, event, domain, current_status.as_deref(), population)
+            transition_via_defs(defs, entity_id, event, domain, current_status.as_deref(), state)
         }
         Command::Query { schema_id, domain: _, target, bindings } => {
-            query_via_defs(defs, schema_id, target, bindings, population)
+            query_via_defs(defs, schema_id, target, bindings, state)
         }
         Command::UpdateEntity { noun, domain, entity_id, fields } => {
-            update_via_defs(defs, noun, domain, entity_id, fields, population)
+            update_via_defs(defs, noun, domain, entity_id, fields, state)
         }
         Command::LoadReadings { markdown, domain } => {
-            apply_load_readings(markdown, domain, population)
+            apply_load_readings(markdown, domain, state)
         }
         #[allow(unreachable_patterns)]
         _ => CommandResult {
@@ -139,7 +123,7 @@ pub fn apply_command_defs(
             violations: vec![],
             derived_count: 0,
             rejected: false,
-            population: population.clone(),
+            state: state.clone(),
         },
     }
 }
@@ -150,26 +134,20 @@ fn create_via_defs(
     domain: &str,
     explicit_id: Option<&str>,
     fields: &std::collections::HashMap<String, String>,
-    population: &Population,
+    state: &ast::Object,
 ) -> CommandResult {
-    // -- resolve --
     let entity_id = explicit_id.unwrap_or("").to_string();
 
-    let mut new_pop = population.clone();
+    let mut new_state = state.clone();
     let mut entity_data = fields.clone();
     entity_data.insert("domain".to_string(), domain.to_string());
 
     for (field_name, value) in &entity_data {
         let ft_id = resolve_fact_type_id_defs(defs, noun, field_name);
-        new_pop.facts.entry(ft_id.clone()).or_default().push(
-            FactInstance {
-                fact_type_id: ft_id,
-                bindings: vec![
-                    (noun.to_string(), entity_id.clone()),
-                    (field_name.clone(), value.clone()),
-                ],
-            }
-        );
+        new_state = ast::cell_push(&ft_id, ast::fact_from_pairs(&[
+            (noun, &entity_id),
+            (field_name.as_str(), value.as_str()),
+        ]), &new_state);
     }
 
     // -- derive --
@@ -177,7 +155,7 @@ fn create_via_defs(
         .filter(|(n, _)| n.starts_with("derivation:"))
         .map(|(n, f)| (n.as_str(), f))
         .collect();
-    let derived = crate::evaluate::forward_chain_defs(&derivation_defs, &mut new_pop);
+    let (new_state, derived) = crate::evaluate::forward_chain_defs_state(&derivation_defs, &new_state);
 
     // Build entity result
     let mut entities = vec![EntityResult {
@@ -186,9 +164,8 @@ fn create_via_defs(
         data: entity_data,
     }];
 
-    // Extract SM status from population (derived by forward chaining)
     let sm_id = entity_id.clone();
-    let status = extract_sm_status(&new_pop, &sm_id);
+    let status = extract_sm_status(&new_state, &sm_id);
 
     if let Some(ref st) = status {
         let mut sm_data = std::collections::HashMap::new();
@@ -203,57 +180,17 @@ fn create_via_defs(
     }
 
     // Inject transition facts from InstanceFact entries (Theorem 3: T is in P)
-    if let Some(inst_facts) = population.facts.get("InstanceFact") {
-        let mut t_from: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-        let mut t_to: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-        let mut t_event: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-        for f in inst_facts {
-            let subj_noun = f.bindings.iter().find(|(k, _)| k == "subjectNoun").map(|(_, v)| v.as_str());
-            let subj_val = f.bindings.iter().find(|(k, _)| k == "subjectValue").map(|(_, v)| v.clone());
-            let obj_noun = f.bindings.iter().find(|(k, _)| k == "objectNoun").map(|(_, v)| v.as_str());
-            let obj_val = f.bindings.iter().find(|(k, _)| k == "objectValue").map(|(_, v)| v.clone());
-            let field = f.bindings.iter().find(|(k, _)| k == "fieldName").map(|(_, v)| v.as_str());
-            if subj_noun == Some("Transition") {
-                let sv = subj_val.unwrap_or_default();
-                if obj_noun == Some("Status") {
-                    let fld = field.unwrap_or_default();
-                    if fld.to_lowercase().contains("from") {
-                        t_from.insert(sv, obj_val.unwrap_or_default());
-                    } else if fld.to_lowercase().contains("to") {
-                        t_to.insert(sv, obj_val.unwrap_or_default());
-                    }
-                } else if obj_noun == Some("Event Type") {
-                    t_event.insert(sv, obj_val.unwrap_or_default());
-                }
-            }
-        }
-        for (t_name, from) in &t_from {
-            if let Some(to) = t_to.get(t_name) {
-                let event = t_event.get(t_name).cloned().unwrap_or_else(|| t_name.clone());
-                let ft_key = String::from("Transition");
-                new_pop.facts.entry(ft_key.clone()).or_default().push(
-                    FactInstance {
-                        fact_type_id: ft_key,
-                        bindings: vec![
-                            (String::from("from"), from.clone()),
-                            (String::from("to"), to.clone()),
-                            (String::from("event"), event),
-                        ],
-                    }
-                );
-            }
-        }
-    }
+    let new_state = inject_transition_facts(state, new_state);
 
-    // -- validate: apply(validate, ctx, defs) --
-    let ctx_obj = ast::encode_eval_context("", None, &new_pop);
+    // -- validate --
+    let ctx_obj = ast::encode_eval_context_state("", None, &new_state);
     let validate_func = defs.get("validate").cloned().unwrap_or(ast::Func::constant(ast::Object::phi()));
     let violation_obj = ast::apply(&validate_func, &ctx_obj, defs);
     let violations = ast::decode_violations(&violation_obj);
     let rejected = violations.iter().any(|v| v.alethic);
 
     // -- emit --
-    let transitions = hateoas_from_population(&new_pop, noun, &entity_id, status.as_deref());
+    let transitions = hateoas_from_state(&new_state, noun, &entity_id, status.as_deref());
 
     CommandResult {
         entities,
@@ -262,7 +199,7 @@ fn create_via_defs(
         violations,
         derived_count: derived.len(),
         rejected,
-        population: if rejected { population.clone() } else { new_pop },
+        state: if rejected { state.clone() } else { new_state },
     }
 }
 
@@ -281,24 +218,20 @@ fn resolve_fact_type_id_defs(
     format!("{}_has_{}", noun, field)
 }
 
-// -- transition via DEFS: machine_func : <status, event> -> status' --
-
 fn transition_via_defs(
     defs: &std::collections::HashMap<String, ast::Func>,
     entity_id: &str,
     event: &str,
     _domain: &str,
     current_status: Option<&str>,
-    population: &Population,
+    state: &ast::Object,
 ) -> CommandResult {
-    let mut new_pop = population.clone();
+    let mut new_state = state.clone();
     let mut new_status = None;
 
-    // Try each machine def. machine:{noun} is the transition func.
     for (name, func) in defs {
         if !name.starts_with("machine:") || name.contains(":initial") { continue; }
 
-        // Get initial status for this machine if current_status not provided
         let initial_key = format!("{}:initial", name);
         let from_status = match current_status {
             Some(s) => s.to_string(),
@@ -324,81 +257,25 @@ fn transition_via_defs(
     }
 
     if let Some(ref status) = new_status {
-        // Update SM status fact in population
-        let status_key = String::from("StateMachine_has_currentlyInStatus");
-        let mut found = false;
-        if let Some(facts) = new_pop.facts.get_mut(&status_key) {
-            for fact in facts.iter_mut() {
-                if fact.bindings.iter().any(|(_, v)| v == entity_id) {
-                    for (noun, val) in fact.bindings.iter_mut() {
-                        if noun == "currentlyInStatus" {
-                            *val = status.clone();
-                            found = true;
-                        }
-                    }
-                }
-            }
-        }
-        if !found {
-            new_pop.facts.entry(status_key.clone()).or_default().push(
-                FactInstance {
-                    fact_type_id: status_key,
-                    bindings: vec![
-                        (String::from("State Machine"), entity_id.to_string()),
-                        (String::from("currentlyInStatus"), status.clone()),
-                    ],
-                }
-            );
-        }
+        // Update SM status fact in state
+        let status_key = "StateMachine_has_currentlyInStatus";
+        // Remove old status fact for this entity, add new one
+        new_state = ast::cell_filter(status_key, |f| {
+            !ast::binding_matches(f, "State Machine", entity_id)
+        }, &new_state);
+        new_state = ast::cell_push(status_key, ast::fact_from_pairs(&[
+            ("State Machine", entity_id),
+            ("currentlyInStatus", status.as_str()),
+        ]), &new_state);
     }
 
     let status = new_status.or_else(|| current_status.map(|s| s.to_string()));
 
     // Inject transition facts for HATEOAS
-    if let Some(inst_facts) = population.facts.get("InstanceFact") {
-        let mut t_from: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-        let mut t_to: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-        let mut t_event: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-        for f in inst_facts {
-            let subj_noun = f.bindings.iter().find(|(k, _)| k == "subjectNoun").map(|(_, v)| v.as_str());
-            let subj_val = f.bindings.iter().find(|(k, _)| k == "subjectValue").map(|(_, v)| v.clone());
-            let obj_noun = f.bindings.iter().find(|(k, _)| k == "objectNoun").map(|(_, v)| v.as_str());
-            let obj_val = f.bindings.iter().find(|(k, _)| k == "objectValue").map(|(_, v)| v.clone());
-            let field = f.bindings.iter().find(|(k, _)| k == "fieldName").map(|(_, v)| v.as_str());
-            if subj_noun == Some("Transition") {
-                let sv = subj_val.unwrap_or_default();
-                if obj_noun == Some("Status") {
-                    let fld = field.unwrap_or_default();
-                    if fld.to_lowercase().contains("from") {
-                        t_from.insert(sv, obj_val.unwrap_or_default());
-                    } else if fld.to_lowercase().contains("to") {
-                        t_to.insert(sv, obj_val.unwrap_or_default());
-                    }
-                } else if obj_noun == Some("Event Type") {
-                    t_event.insert(sv, obj_val.unwrap_or_default());
-                }
-            }
-        }
-        for (t_name, from) in &t_from {
-            if let Some(to) = t_to.get(t_name) {
-                let evt = t_event.get(t_name).cloned().unwrap_or_else(|| t_name.clone());
-                let ft_key = String::from("Transition");
-                new_pop.facts.entry(ft_key.clone()).or_default().push(
-                    FactInstance {
-                        fact_type_id: ft_key,
-                        bindings: vec![
-                            (String::from("from"), from.clone()),
-                            (String::from("to"), to.clone()),
-                            (String::from("event"), evt),
-                        ],
-                    }
-                );
-            }
-        }
-    }
+    let new_state = inject_transition_facts(state, new_state);
 
     let noun = "";
-    let transitions = hateoas_from_population(&new_pop, noun, entity_id, status.as_deref());
+    let transitions = hateoas_from_state(&new_state, noun, entity_id, status.as_deref());
 
     CommandResult {
         entities: vec![],
@@ -407,27 +284,26 @@ fn transition_via_defs(
         violations: vec![],
         derived_count: 0,
         rejected: false,
-        population: new_pop,
+        state: new_state,
     }
 }
-
-// -- query via DEFS: partial application of graph schema --
 
 fn query_via_defs(
     defs: &std::collections::HashMap<String, ast::Func>,
     schema_id: &str,
     target: &str,
     bindings: &std::collections::HashMap<String, String>,
-    population: &Population,
+    state: &ast::Object,
 ) -> CommandResult {
-    // Look up schema role names from population metadata
-    let role_names: Vec<String> = population.facts.get("Role")
+    // Look up schema role names from state metadata
+    let role_cell = ast::fetch_or_phi("Role", state);
+    let role_names: Vec<String> = role_cell.as_seq()
         .map(|roles| {
             let mut matched: Vec<(usize, String)> = roles.iter()
-                .filter(|r| r.bindings.iter().any(|(k, v)| k == "graphSchema" && v == schema_id))
+                .filter(|r| ast::binding_matches(r, "graphSchema", schema_id))
                 .filter_map(|r| {
-                    let name = r.bindings.iter().find(|(k, _)| k == "nounName").map(|(_, v)| v.clone())?;
-                    let pos: usize = r.bindings.iter().find(|(k, _)| k == "position").and_then(|(_, v)| v.parse().ok()).unwrap_or(0);
+                    let name = ast::binding(r, "nounName")?.to_string();
+                    let pos: usize = ast::binding(r, "position").and_then(|v| v.parse().ok()).unwrap_or(0);
                     Some((pos, name))
                 })
                 .collect();
@@ -452,7 +328,7 @@ fn query_via_defs(
         construction: defs.get(&format!("schema:{}", schema_id)).cloned().unwrap_or(ast::Func::Id),
         role_names: role_names.clone(),
     };
-    let results = crate::query::query_with_ast(population, &schema, target_role, &filter_refs);
+    let results = crate::query::query_with_ast(state, &schema, target_role, &filter_refs);
 
     let mut data = std::collections::HashMap::new();
     data.insert(String::from("matches"), results.join(","));
@@ -469,11 +345,9 @@ fn query_via_defs(
         violations: vec![],
         derived_count: 0,
         rejected: false,
-        population: population.clone(),
+        state: state.clone(),
     }
 }
-
-// -- update via DEFS: replace fields then create pipeline --
 
 fn update_via_defs(
     defs: &std::collections::HashMap<String, ast::Func>,
@@ -481,14 +355,25 @@ fn update_via_defs(
     domain: &str,
     entity_id: &str,
     new_fields: &std::collections::HashMap<String, String>,
-    population: &Population,
+    state: &ast::Object,
 ) -> CommandResult {
     // Read current facts for this entity
     let mut merged = std::collections::HashMap::new();
-    for (_, facts) in &population.facts {
-        for fact in facts {
-            if fact.bindings.len() >= 2 && fact.bindings[0].1 == entity_id {
-                merged.insert(fact.bindings[1].0.clone(), fact.bindings[1].1.clone());
+    for (_, contents) in ast::cells_iter(state) {
+        if let Some(facts) = contents.as_seq() {
+            for fact in facts {
+                if let Some(pairs) = fact.as_seq() {
+                    if pairs.len() >= 2 {
+                        let v0 = pairs[0].as_seq().and_then(|p| p.get(1)?.as_atom().map(|s| s.to_string()));
+                        let k1 = pairs[1].as_seq().and_then(|p| p.get(0)?.as_atom().map(|s| s.to_string()));
+                        let v1 = pairs[1].as_seq().and_then(|p| p.get(1)?.as_atom().map(|s| s.to_string()));
+                        if v0.as_deref() == Some(entity_id) {
+                            if let (Some(k), Some(v)) = (k1, v1) {
+                                merged.insert(k, v);
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -497,41 +382,41 @@ fn update_via_defs(
     }
 
     // Remove old facts for this entity, insert merged
-    let mut new_pop = population.clone();
+    let mut new_state = state.clone();
     for (field_name, value) in &merged {
         let ft_id = resolve_fact_type_id_defs(defs, noun, field_name);
-        if let Some(instances) = new_pop.facts.get_mut(&ft_id) {
-            instances.retain(|inst| {
-                !(inst.bindings.len() >= 2 && inst.bindings[0].1 == entity_id)
-            });
-        }
-        new_pop.facts.entry(ft_id.clone()).or_default().push(
-            FactInstance {
-                fact_type_id: ft_id,
-                bindings: vec![
-                    (noun.to_string(), entity_id.to_string()),
-                    (field_name.clone(), value.clone()),
-                ],
+        // Remove old facts for this entity in this fact type
+        new_state = ast::cell_filter(&ft_id, |f| {
+            // Keep facts that are NOT for this entity
+            if let Some(pairs) = f.as_seq() {
+                if pairs.len() >= 2 {
+                    let v0 = pairs[0].as_seq().and_then(|p| p.get(1)?.as_atom());
+                    return v0 != Some(entity_id);
+                }
             }
-        );
+            true
+        }, &new_state);
+        new_state = ast::cell_push(&ft_id, ast::fact_from_pairs(&[
+            (noun, entity_id),
+            (field_name.as_str(), value.as_str()),
+        ]), &new_state);
     }
 
-    // derive + validate + emit (same as create)
+    // derive + validate + emit
     let derivation_defs: Vec<(&str, &ast::Func)> = defs.iter()
         .filter(|(n, _)| n.starts_with("derivation:"))
         .map(|(n, f)| (n.as_str(), f))
         .collect();
-    let derived = crate::evaluate::forward_chain_defs(&derivation_defs, &mut new_pop);
+    let (new_state, derived) = crate::evaluate::forward_chain_defs_state(&derivation_defs, &new_state);
 
-    // -- validate: apply(validate, ctx, defs) --
-    let ctx_obj = ast::encode_eval_context("", None, &new_pop);
+    let ctx_obj = ast::encode_eval_context_state("", None, &new_state);
     let validate_func = defs.get("validate").cloned().unwrap_or(ast::Func::constant(ast::Object::phi()));
     let violation_obj = ast::apply(&validate_func, &ctx_obj, defs);
     let violations = ast::decode_violations(&violation_obj);
     let rejected = violations.iter().any(|v| v.alethic);
     let sm_id = entity_id.to_string();
-    let status = extract_sm_status(&new_pop, &sm_id);
-    let transitions = hateoas_from_population(&new_pop, noun, entity_id, status.as_deref());
+    let status = extract_sm_status(&new_state, &sm_id);
+    let transitions = hateoas_from_state(&new_state, noun, entity_id, status.as_deref());
 
     CommandResult {
         entities: vec![EntityResult {
@@ -544,18 +429,15 @@ fn update_via_defs(
         violations,
         derived_count: derived.len(),
         rejected,
-        population: if rejected { population.clone() } else { new_pop },
+        state: if rejected { state.clone() } else { new_state },
     }
 }
-
-// -- is-chg: install readings ----------------------------------------
 
 fn apply_load_readings(
     markdown: &str,
     domain: &str,
-    population: &Population,
+    state: &ast::Object,
 ) -> CommandResult {
-    // Parse readings via the FORML 2 parser
     match crate::parse_forml2::parse_markdown(markdown) {
         Ok(ir) => {
             let _model = crate::compile::compile(&ir);
@@ -577,7 +459,7 @@ fn apply_load_readings(
                 violations: vec![],
                 derived_count: 0,
                 rejected: false,
-                population: population.clone(),
+                state: state.clone(),
             }
         }
         Err(e) => {
@@ -593,7 +475,7 @@ fn apply_load_readings(
                 }],
                 derived_count: 0,
                 rejected: true,
-                population: population.clone(),
+                state: state.clone(),
             }
         }
     }
@@ -601,14 +483,50 @@ fn apply_load_readings(
 
 // -- Helpers ----------------------------------------------------------
 
-/// HATEOAS as Projection (Theorem 4a):
-/// links(s) = pi_event(Filter(p) : T)
-/// where p(t) = s_from(t) in {s} union supertypes(s)
-///
-/// Subtypes inherit the transitions of their supertypes (Halpin Ch. 6).
-/// For flat state machines (no subtyping), this reduces to s_from(t) = s.
-fn hateoas_from_population(
-    population: &Population,
+/// Inject transition facts from InstanceFact entries into state.
+fn inject_transition_facts(source_state: &ast::Object, mut target_state: ast::Object) -> ast::Object {
+    let inst_cell = ast::fetch_or_phi("InstanceFact", source_state);
+    if let Some(inst_facts) = inst_cell.as_seq() {
+        let mut t_from: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut t_to: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut t_event: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for f in inst_facts {
+            let subj_noun = ast::binding(f, "subjectNoun");
+            let subj_val = ast::binding(f, "subjectValue").map(|s| s.to_string());
+            let obj_noun = ast::binding(f, "objectNoun");
+            let obj_val = ast::binding(f, "objectValue").map(|s| s.to_string());
+            let field = ast::binding(f, "fieldName");
+            if subj_noun == Some("Transition") {
+                let sv = subj_val.unwrap_or_default();
+                if obj_noun == Some("Status") {
+                    let fld = field.unwrap_or("");
+                    if fld.to_lowercase().contains("from") {
+                        t_from.insert(sv, obj_val.unwrap_or_default());
+                    } else if fld.to_lowercase().contains("to") {
+                        t_to.insert(sv, obj_val.unwrap_or_default());
+                    }
+                } else if obj_noun == Some("Event Type") {
+                    t_event.insert(sv, obj_val.unwrap_or_default());
+                }
+            }
+        }
+        for (t_name, from) in &t_from {
+            if let Some(to) = t_to.get(t_name) {
+                let event = t_event.get(t_name).cloned().unwrap_or_else(|| t_name.clone());
+                target_state = ast::cell_push("Transition", ast::fact_from_pairs(&[
+                    ("from", from.as_str()),
+                    ("to", to.as_str()),
+                    ("event", event.as_str()),
+                ]), &target_state);
+            }
+        }
+    }
+    target_state
+}
+
+/// HATEOAS as Projection (Theorem 4a)
+fn hateoas_from_state(
+    state: &ast::Object,
     noun: &str,
     entity_id: &str,
     status: Option<&str>,
@@ -616,39 +534,44 @@ fn hateoas_from_population(
     let Some(status) = status else { return vec![] };
     let encoded = noun.replace(' ', "%20");
 
-    let transition_facts = match population.facts.get("Transition") {
+    let transition_cell = ast::fetch_or_phi("Transition", state);
+    let transition_facts = match transition_cell.as_seq() {
         Some(facts) => facts,
         None => return vec![],
     };
 
-    // Build ancestor set: statuses that the current status inherits from.
-    // For now: check if any Status subtype facts exist in P.
-    // anc(a, s) = true if "Status s is subtype of Status a" in P.
+    // Build ancestor set
     let mut ancestor_statuses: Vec<String> = vec![status.to_string()];
-    if let Some(subtype_facts) = population.facts.get("Status is subtype of Status") {
-        // Traverse upward: if current status is a subtype, include the supertype
+    let subtype_cell = ast::fetch_or_phi("Status is subtype of Status", state);
+    if let Some(subtype_facts) = subtype_cell.as_seq() {
         let mut frontier = vec![status.to_string()];
         while let Some(current) = frontier.pop() {
             for fact in subtype_facts {
-                if fact.bindings.len() >= 2 && fact.bindings[0].1 == current {
-                    let supertype = &fact.bindings[1].1;
-                    if !ancestor_statuses.contains(supertype) {
-                        ancestor_statuses.push(supertype.clone());
-                        frontier.push(supertype.clone());
+                if let Some(pairs) = fact.as_seq() {
+                    if pairs.len() >= 2 {
+                        let v0 = pairs[0].as_seq().and_then(|p| p.get(1)?.as_atom());
+                        let v1 = pairs[1].as_seq().and_then(|p| p.get(1)?.as_atom());
+                        if v0 == Some(&current) {
+                            if let Some(supertype) = v1 {
+                                if !ancestor_statuses.contains(&supertype.to_string()) {
+                                    ancestor_statuses.push(supertype.to_string());
+                                    frontier.push(supertype.to_string());
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
     }
 
-    // Filter(p) : T where p(t) = s_from(t)  in  {status}  union  ancestors(status)
     transition_facts.iter()
         .filter(|fact| {
-            fact.bindings.iter().any(|(k, v)| k == "from" && ancestor_statuses.contains(v))
+            ast::binding(fact, "from").map_or(false, |v| ancestor_statuses.iter().any(|a| a == v))
         })
         .filter_map(|fact| {
-            let event = fact.bindings.iter().find(|(k, _)| k == "event").map(|(_, v)| v.clone())?;
-            let to = fact.bindings.iter().find(|(k, _)| k == "to").map(|(_, v)| v.clone())?;
+            let event = ast::binding(fact, "event")?.to_string();
+            let to = ast::binding(fact, "to")?.to_string();
             Some(TransitionAction {
                 event,
                 target_status: to,
@@ -659,16 +582,21 @@ fn hateoas_from_population(
         .collect()
 }
 
-/// Resolve entity ID from Halpin's reference scheme.
-/// Extract the current status of a State Machine instance from the population.
-fn extract_sm_status(population: &Population, sm_id: &str) -> Option<String> {
-    let status_facts = population.facts.get("StateMachine_has_currentlyInStatus")?;
-    for fact in status_facts {
-        let has_sm = fact.bindings.iter().any(|(_, v)| v == sm_id);
-        if has_sm {
-            return fact.bindings.iter()
-                .find(|(n, _)| n == "currentlyInStatus")
-                .map(|(_, v)| v.clone());
+fn extract_sm_status(state: &ast::Object, sm_id: &str) -> Option<String> {
+    let cell = ast::fetch_or_phi("StateMachine_has_currentlyInStatus", state);
+    let facts = cell.as_seq()?;
+    for fact in facts {
+        if ast::binding_matches(fact, "State Machine", sm_id) {
+            return ast::binding(fact, "currentlyInStatus").map(|s| s.to_string());
+        }
+        // Also check positional: first binding value == sm_id
+        if let Some(pairs) = fact.as_seq() {
+            let has_sm = pairs.iter().any(|pair| {
+                pair.as_seq().and_then(|p| p.get(1)?.as_atom()).map_or(false, |v| v == sm_id)
+            });
+            if has_sm {
+                return ast::binding(fact, "currentlyInStatus").map(|s| s.to_string());
+            }
         }
     }
     None
@@ -753,22 +681,27 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
 "#;
 
     /// Parse state metamodel + order domain readings, compile to defs,
-    /// return (def_map, base_population).
-    fn setup_order_defs() -> (HashMap<String, crate::ast::Func>, Population) {
-        let meta_pop = crate::parse_forml2::parse_to_population(STATE_METAMODEL).unwrap();
-        let orders_pop = crate::parse_forml2::parse_to_population_with_nouns(ORDER_READINGS, &meta_pop).unwrap();
-        let mut pop = meta_pop;
-        for (k, v) in orders_pop.facts {
-            pop.facts.entry(k).or_default().extend(v);
+    /// return (def_map, base_state).
+    fn setup_order_defs() -> (HashMap<String, crate::ast::Func>, ast::Object) {
+        let meta_state = crate::parse_forml2::parse_to_state(STATE_METAMODEL).unwrap();
+        let orders_state = crate::parse_forml2::parse_to_state_with_nouns(ORDER_READINGS, &meta_state).unwrap();
+        // Merge: push all cells from orders_state into meta_state
+        let mut state = meta_state;
+        for (name, contents) in ast::cells_iter(&orders_state) {
+            if let Some(facts) = contents.as_seq() {
+                for fact in facts {
+                    state = ast::cell_push(name, fact.clone(), &state);
+                }
+            }
         }
-        let defs = crate::compile::compile_to_defs(&pop);
+        let defs = crate::compile::compile_to_defs_state(&state);
         let def_map: HashMap<String, crate::ast::Func> = defs.iter().map(|(n, f)| (n.clone(), f.clone())).collect();
-        (def_map, pop)
+        (def_map, state)
     }
 
     #[test]
     fn create_entity_initializes_state_machine() {
-        let (def_map, pop) = setup_order_defs();
+        let (def_map, state) = setup_order_defs();
 
         let mut fields = HashMap::new();
         fields.insert("orderNumber".to_string(), "ORD-100".to_string());
@@ -781,7 +714,7 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
             fields,
         };
 
-        let result = apply_command_defs(&def_map, &cmd, &pop);
+        let result = apply_command_defs(&def_map, &cmd, &state);
 
         assert_eq!(result.entities[0].id, "ORD-100");
         assert_eq!(result.entities[0].entity_type, "Order");
@@ -797,7 +730,7 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
 
     #[test]
     fn create_entity_with_explicit_id() {
-        let (def_map, pop) = setup_order_defs();
+        let (def_map, state) = setup_order_defs();
 
         let mut fields = HashMap::new();
         fields.insert("orderNumber".to_string(), "ORD-REF".to_string());
@@ -810,13 +743,13 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
             fields,
         };
 
-        let result = apply_command_defs(&def_map, &cmd, &pop);
+        let result = apply_command_defs(&def_map, &cmd, &state);
         assert_eq!(result.entities[0].id, "ORD-REF");
     }
 
     #[test]
     fn create_entity_without_state_machine() {
-        let (def_map, pop) = setup_order_defs();
+        let (def_map, state) = setup_order_defs();
 
         let mut fields = HashMap::new();
         fields.insert("name".to_string(), "Electronics".to_string());
@@ -828,7 +761,7 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
             fields,
         };
 
-        let result = apply_command_defs(&def_map, &cmd, &pop);
+        let result = apply_command_defs(&def_map, &cmd, &state);
 
         assert_eq!(result.entities.len(), 1);
         assert!(result.status.is_none());
@@ -837,9 +770,8 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
 
     #[test]
     fn transition_changes_status() {
-        let (def_map, pop) = setup_order_defs();
+        let (def_map, state) = setup_order_defs();
 
-        // Create entity first so population has SM status
         let mut fields = HashMap::new();
         fields.insert("orderNumber".to_string(), "ORD-100".to_string());
         let create_cmd = Command::CreateEntity {
@@ -848,10 +780,9 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
             id: Some("ORD-100".to_string()),
             fields,
         };
-        let created = apply_command_defs(&def_map, &create_cmd, &pop);
+        let created = apply_command_defs(&def_map, &create_cmd, &state);
         assert_eq!(created.status.as_deref(), Some("Draft"));
 
-        // Transition: Draft -> Placed
         let cmd = Command::Transition {
             entity_id: "ORD-100".to_string(),
             event: "place".to_string(),
@@ -859,15 +790,15 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
             current_status: Some("Draft".to_string()),
         };
 
-        let result = apply_command_defs(&def_map, &cmd, &created.population);
+        let result = apply_command_defs(&def_map, &cmd, &created.state);
 
         assert_eq!(result.status.as_deref(), Some("Placed"));
         assert!(result.transitions.iter().any(|t| t.event == "pay"));
     }
 
     #[test]
-    fn population_contains_entity_facts() {
-        let (def_map, pop) = setup_order_defs();
+    fn state_contains_entity_facts() {
+        let (def_map, state) = setup_order_defs();
 
         let mut fields = HashMap::new();
         fields.insert("orderNumber".to_string(), "ORD-1".to_string());
@@ -880,27 +811,24 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
             fields,
         };
 
-        let result = apply_command_defs(&def_map, &cmd, &pop);
+        let result = apply_command_defs(&def_map, &cmd, &state);
 
-        // Entity fields are facts in the population (Graph Schema ID format)
-        assert!(result.population.facts.contains_key("Order_has_customer"));
-        let customer_facts = &result.population.facts["Order_has_customer"];
+        // Entity fields are facts in the state
+        let customer_cell = ast::fetch_or_phi("Order_has_customer", &result.state);
+        let customer_facts = customer_cell.as_seq().unwrap();
         assert_eq!(customer_facts.len(), 1);
-        assert!(customer_facts[0].bindings.iter().any(|(_, v)| v == "acme"));
+        assert!(ast::binding(&customer_facts[0], "customer") == Some("acme"));
 
-        // SM facts are in the population
-        assert!(result.population.facts.contains_key("StateMachine_has_currentlyInStatus"));
-        let sm_facts = &result.population.facts["StateMachine_has_currentlyInStatus"];
-        assert!(sm_facts[0].bindings.iter().any(|(_, v)| v == "Draft"));
+        // SM facts are in the state
+        let sm_cell = ast::fetch_or_phi("StateMachine_has_currentlyInStatus", &result.state);
+        let sm_facts = sm_cell.as_seq().unwrap();
+        assert!(ast::binding(&sm_facts[0], "currentlyInStatus") == Some("Draft"));
     }
 
     #[test]
-    fn transition_updates_population_status() {
-        // Theorem 3: every observable value derivable from population.
-        // Transition must write new status into Pop'.
-        let (def_map, pop) = setup_order_defs();
+    fn transition_updates_state_status() {
+        let (def_map, state) = setup_order_defs();
 
-        // Create entity first to get a population with SM facts
         let mut fields = HashMap::new();
         fields.insert("orderNumber".to_string(), "ORD-1".to_string());
         let create = Command::CreateEntity {
@@ -909,82 +837,63 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
             id: Some("ORD-1".to_string()),
             fields,
         };
-        let created = apply_command_defs(&def_map, &create, &pop);
+        let created = apply_command_defs(&def_map, &create, &state);
         assert_eq!(created.status.as_deref(), Some("Draft"));
 
-        // Transition: Draft -> Placed
         let transition = Command::Transition {
             entity_id: "ORD-1".to_string(),
             event: "place".to_string(),
             domain: "orders".to_string(),
             current_status: Some("Draft".to_string()),
         };
-        let result = apply_command_defs(&def_map, &transition, &created.population);
+        let result = apply_command_defs(&def_map, &transition, &created.state);
 
         assert_eq!(result.status.as_deref(), Some("Placed"));
 
-        // Population must contain the updated status
-        let sm_facts = &result.population.facts["StateMachine_has_currentlyInStatus"];
+        // State must contain the updated status
+        let sm_cell = ast::fetch_or_phi("StateMachine_has_currentlyInStatus", &result.state);
+        let sm_facts = sm_cell.as_seq().unwrap();
         let sm_fact = sm_facts.iter().find(|f|
-            f.bindings.iter().any(|(_, v)| v == "ORD-1")
+            ast::binding_matches(f, "State Machine", "ORD-1")
         ).expect("SM fact must exist for ORD-1");
-        let status_binding = sm_fact.bindings.iter()
-            .find(|(n, _)| n == "currentlyInStatus")
-            .expect("must have currentlyInStatus binding");
-        assert_eq!(status_binding.1, "Placed", "population must reflect new status");
+        assert_eq!(ast::binding(sm_fact, "currentlyInStatus"), Some("Placed"), "state must reflect new status");
     }
-
-    // -- is-qry: Query command -----------------------------------
 
     #[test]
     fn query_command_returns_matches() {
         let (def_map, _) = setup_order_defs();
 
-        // Populate with some facts
-        let mut pop = Population { facts: HashMap::new() };
-        let ft_id = "Order has customer".to_string();
-        pop.facts.insert(ft_id.clone(), vec![
-            FactInstance {
-                fact_type_id: ft_id.clone(),
-                bindings: vec![("Order".to_string(), "ord-1".to_string()), ("customer".to_string(), "acme".to_string())],
-            },
-            FactInstance {
-                fact_type_id: ft_id.clone(),
-                bindings: vec![("Order".to_string(), "ord-2".to_string()), ("customer".to_string(), "acme".to_string())],
-            },
-            FactInstance {
-                fact_type_id: ft_id.clone(),
-                bindings: vec![("Order".to_string(), "ord-3".to_string()), ("customer".to_string(), "beta".to_string())],
-            },
-        ]);
+        let ft_id = "Order has customer";
+        let mut state = ast::Object::phi();
+        state = ast::cell_push(ft_id, ast::fact_from_pairs(&[("Order", "ord-1"), ("customer", "acme")]), &state);
+        state = ast::cell_push(ft_id, ast::fact_from_pairs(&[("Order", "ord-2"), ("customer", "acme")]), &state);
+        state = ast::cell_push(ft_id, ast::fact_from_pairs(&[("Order", "ord-3"), ("customer", "beta")]), &state);
 
         let mut bindings = HashMap::new();
         bindings.insert("customer".to_string(), "acme".to_string());
 
         let cmd = Command::Query {
-            schema_id: ft_id,
+            schema_id: ft_id.to_string(),
             domain: "orders".to_string(),
             target: "Order".to_string(),
             bindings,
         };
 
-        let result = apply_command_defs(&def_map, &cmd, &pop);
+        let result = apply_command_defs(&def_map, &cmd, &state);
         assert!(!result.rejected);
         assert_eq!(result.entities[0].entity_type, "QueryResult");
     }
 
-    // -- is-chg: LoadReadings command ----------------------------
-
     #[test]
     fn load_readings_command_parses_markdown() {
-        let (def_map, pop) = setup_order_defs();
+        let (def_map, state) = setup_order_defs();
 
         let cmd = Command::LoadReadings {
             markdown: "# Test\n\nProduct(.SKU) is an entity type.\nCategory(.Name) is an entity type.\nProduct belongs to Category.\n  Each Product belongs to exactly one Category.".to_string(),
             domain: "catalog".to_string(),
         };
 
-        let result = apply_command_defs(&def_map, &cmd, &pop);
+        let result = apply_command_defs(&def_map, &cmd, &state);
         assert!(!result.rejected);
         assert_eq!(result.entities[0].entity_type, "SchemaLoaded");
         assert_eq!(result.entities[0].data["nouns"], "2");
@@ -992,14 +901,14 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
 
     #[test]
     fn load_readings_command_reports_parse_error() {
-        let (def_map, pop) = setup_order_defs();
+        let (def_map, state) = setup_order_defs();
 
         let cmd = Command::LoadReadings {
-            markdown: "".to_string(), // empty -- should parse OK (empty domain)
+            markdown: "".to_string(),
             domain: "empty".to_string(),
         };
 
-        let result = apply_command_defs(&def_map, &cmd, &pop);
+        let result = apply_command_defs(&def_map, &cmd, &state);
         assert!(!result.rejected); // empty is valid
     }
 }

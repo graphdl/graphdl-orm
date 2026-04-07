@@ -529,8 +529,7 @@ fn c6_terminal_states_are_derived() {
 #[test]
 fn c7_deontic_violation_returns_reading_text() {
     let (state, defs) = compile_orders();
-    let pop = ast::state_to_population(&state);
-    let ctx = arest::ast::encode_eval_context("We will ship your order overnight for fast delivery", None, &pop);
+    let ctx = arest::ast::encode_eval_context_state("We will ship your order overnight for fast delivery", None, &state);
     let violations: Vec<_> = defs.iter()
         .filter(|(n, _)| n.starts_with("constraint:"))
         .flat_map(|(name, func)| {
@@ -1164,7 +1163,7 @@ fn constraint_evaluation_via_application() {
             ast::fact_from_pairs(&[("Order", "ord-1"), ("Customer", "Globex")]), &s);
         s
     };
-    let pop_with_violation = ast::encode_population(&ast::state_to_population(&violation_state));
+    let pop_with_violation = ast::encode_state(&violation_state);
     let context_with_violation = Object::seq(vec![
         Object::phi(),
         Object::phi(),
@@ -1197,7 +1196,7 @@ fn response_text_is_a_fact_in_population() {
     // The state contains the response text as a fact.
     // A constraint evaluator should be able to find it by querying the state
     // for Support_Response_has_Body facts.
-    let state_obj = ast::encode_population(&ast::state_to_population(&state));
+    let state_obj = ast::encode_state(&state);
 
     // The state is queryable. The body text is in P, not in a separate struct.
     assert_ne!(state_obj, Object::phi(), "State with response should not be empty");
@@ -1229,8 +1228,8 @@ It is forbidden that Support Response contains Prohibited Word.
 
     // Helper: evaluate constraints via defs path
     let eval = |text: &str| -> Vec<Violation> {
-        let empty_pop = ast::state_to_population(&ast::Object::phi());
-        let ctx_obj = ast::encode_eval_context(text, None, &empty_pop);
+        let empty_pop = ast::Object::phi();
+        let ctx_obj = ast::encode_eval_context_state(text, None, &empty_pop);
         defs.iter()
             .filter(|(n, _)| n.starts_with("constraint:"))
             .flat_map(|(name, func)| {
@@ -1512,8 +1511,8 @@ fn system_operand_fetch_retrieves_cells() {
     // Construct operand per Backus 14.4.2: <CELL:KEY, CELL:INPUT, CELL:FILE, ...defs>
     let key_cell = ast::cell("KEY", Object::atom("machine:Order:initial"));
     let input_cell = ast::cell("INPUT", Object::phi());
-    let pop = ast::state_to_population(&state);
-    let file_cell = ast::cell("FILE", ast::encode_population(&pop));
+    let pop = state.clone();
+    let file_cell = ast::cell("FILE", ast::encode_state(&pop));
     let operand = Object::Seq(vec![key_cell, input_cell, file_cell]);
 
     // Fetch retrieves cell contents from the operand
@@ -1570,8 +1569,8 @@ fn sm_init_derivation_produces_facts() {
         &test_state);
 
     // Encode state as population object and apply derivation
-    let test_pop = ast::state_to_population(&test_state);
-    let pop_obj = ast::encode_population(&test_pop);
+    let test_pop = test_state.clone();
+    let pop_obj = ast::encode_state(&test_pop);
 
     // Test derive_facts on <ord-1>
     let make_one_fact = ast::Func::construction(vec![
@@ -1616,7 +1615,7 @@ fn create_entity_via_defs_produces_entity_and_status() {
         fields,
     };
 
-    let result = arest::arest::apply_command_defs_state(&def_map, &command, &state);
+    let result = arest::arest::apply_command_defs(&def_map, &command, &state);
 
     eprintln!("derived_count: {}", result.derived_count);
     eprintln!("status: {:?}", result.status);
@@ -1653,7 +1652,7 @@ fn transition_via_defs_changes_status() {
         id: Some("ord-1".to_string()),
         fields,
     };
-    let create_result = arest::arest::apply_command_defs_state(&def_map, &create_cmd, &state);
+    let create_result = arest::arest::apply_command_defs(&def_map, &create_cmd, &state);
     assert_eq!(create_result.status, Some("In Cart".to_string()));
 
     // Now transition: place the order
@@ -1663,7 +1662,7 @@ fn transition_via_defs_changes_status() {
         domain: "orders".to_string(),
         current_status: Some("In Cart".to_string()),
     };
-    let result = arest::arest::apply_command_defs(&def_map, &transition_cmd, &create_result.population);
+    let result = arest::arest::apply_command_defs(&def_map, &transition_cmd, &create_result.state);
 
     assert_eq!(result.status, Some("Placed".to_string()));
 }

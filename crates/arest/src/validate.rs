@@ -11,17 +11,6 @@
 
 use std::collections::HashMap;
 use crate::types::*;
-/// Convert a domain's Domain into a Population of core metamodel facts.
-///
-/// Each noun, fact type, role, constraint, and derivation rule in the domain
-/// becomes a fact instance in the metamodel population. The validation model's
-/// constraints are then evaluated against this population.
-///
-/// Fact type IDs use the reading text from core.md (e.g., "Noun has Object Type").
-/// Convert a domain's Domain into a Population (compatibility wrapper).
-pub fn ir_to_metamodel_population(ir: &Domain) -> Population {
-    crate::ast::state_to_population(&ir_to_metamodel_state(ir))
-}
 
 /// Convert a domain's Domain into an Object state of core metamodel facts.
 pub fn ir_to_metamodel_state(ir: &Domain) -> crate::ast::Object {
@@ -129,48 +118,54 @@ mod tests {
     }
 
     #[test]
-    fn population_contains_noun_facts() {
+    fn state_contains_noun_facts() {
+        use crate::ast::{fetch_or_phi, binding};
         let ir = simple_ir();
-        let pop = ir_to_metamodel_population(&ir);
+        let state = ir_to_metamodel_state(&ir);
 
-        let noun_facts = pop.facts.get("Noun has Object Type").unwrap();
-        assert_eq!(noun_facts.len(), 2);
-        assert!(noun_facts.iter().any(|f|
-            f.bindings.iter().any(|(_, v)| v == "Person")
-        ));
+        let noun_facts = fetch_or_phi("Noun has Object Type", &state);
+        let facts = noun_facts.as_seq().unwrap();
+        assert_eq!(facts.len(), 2);
+        assert!(facts.iter().any(|f| binding(f, "Noun") == Some("Person")));
     }
 
     #[test]
-    fn population_contains_role_facts() {
+    fn state_contains_role_facts() {
+        use crate::ast::fetch_or_phi;
         let ir = simple_ir();
-        let pop = ir_to_metamodel_population(&ir);
+        let state = ir_to_metamodel_state(&ir);
 
-        let role_facts = pop.facts.get("Noun plays Role").unwrap();
-        assert_eq!(role_facts.len(), 2); // one per role in the fact type
+        let role_facts = fetch_or_phi("Noun plays Role", &state);
+        assert_eq!(role_facts.as_seq().unwrap().len(), 2);
     }
 
     #[test]
-    fn population_contains_schema_facts() {
+    fn state_contains_schema_facts() {
+        use crate::ast::{fetch_or_phi, binding};
         let ir = simple_ir();
-        let pop = ir_to_metamodel_population(&ir);
+        let state = ir_to_metamodel_state(&ir);
 
-        let schema_facts = pop.facts.get("Graph Schema has Reading").unwrap();
-        assert_eq!(schema_facts.len(), 1);
-        assert!(schema_facts[0].bindings.iter().any(|(_, v)| v == "Person has Name"));
+        let schema_facts = fetch_or_phi("Graph Schema has Reading", &state);
+        let facts = schema_facts.as_seq().unwrap();
+        assert_eq!(facts.len(), 1);
+        assert!(binding(&facts[0], "Reading") == Some("Person has Name"));
     }
 
     #[test]
-    fn population_contains_arity() {
+    fn state_contains_arity() {
+        use crate::ast::{fetch_or_phi, binding};
         let ir = simple_ir();
-        let pop = ir_to_metamodel_population(&ir);
+        let state = ir_to_metamodel_state(&ir);
 
-        let arity_facts = pop.facts.get("Graph Schema has Arity").unwrap();
-        assert_eq!(arity_facts.len(), 1);
-        assert!(arity_facts[0].bindings.iter().any(|(_, v)| v == "2"));
+        let arity_facts = fetch_or_phi("Graph Schema has Arity", &state);
+        let facts = arity_facts.as_seq().unwrap();
+        assert_eq!(facts.len(), 1);
+        assert!(binding(&facts[0], "Arity") == Some("2"));
     }
 
     #[test]
-    fn population_contains_constraint_facts() {
+    fn state_contains_constraint_facts() {
+        use crate::ast::{fetch_or_phi, binding};
         let mut ir = simple_ir();
         ir.constraints.push(ConstraintDef {
             id: "c1".to_string(),
@@ -182,14 +177,16 @@ mod tests {
             set_comparison_argument_length: None, min_occurrence: None, max_occurrence: None,
         });
 
-        let pop = ir_to_metamodel_population(&ir);
-        let constraint_facts = pop.facts.get("Constraint is of Constraint Type").unwrap();
-        assert_eq!(constraint_facts.len(), 1);
-        assert!(constraint_facts[0].bindings.iter().any(|(_, v)| v == "UC"));
+        let state = ir_to_metamodel_state(&ir);
+        let constraint_facts = fetch_or_phi("Constraint is of Constraint Type", &state);
+        let facts = constraint_facts.as_seq().unwrap();
+        assert_eq!(facts.len(), 1);
+        assert!(binding(&facts[0], "Constraint Type") == Some("UC"));
     }
 
     #[test]
     fn derivation_dependency_computed() {
+        use crate::ast::{fetch_or_phi};
         let mut ir = simple_ir();
         ir.fact_types.insert("ft2".to_string(), FactTypeDef {
             schema_id: String::new(),
@@ -222,34 +219,31 @@ mod tests {
             consequent_bindings: vec![],
         });
 
-        let pop = ir_to_metamodel_population(&ir);
-        let deps = pop.facts.get("Derivation Rule depends on Derivation Rule").unwrap();
-        // rule-b depends on rule-a (antecedent ft2 = rule-a's consequent)
-        // rule-a depends on rule-b (antecedent ft1 = rule-b's consequent)
-        assert_eq!(deps.len(), 2);
+        let state = ir_to_metamodel_state(&ir);
+        let deps = fetch_or_phi("Derivation Rule depends on Derivation Rule", &state);
+        assert_eq!(deps.as_seq().unwrap().len(), 2);
     }
 
     #[test]
     fn undeclared_noun_produces_missing_role_fact() {
+        use crate::ast::{fetch_or_phi, binding};
         let mut ir = simple_ir();
-        // Add a fact type referencing an undeclared noun
         ir.fact_types.insert("ft-bad".to_string(), FactTypeDef {
             schema_id: String::new(),
             reading: "Person has Age".to_string(),
             readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "Person".to_string(), role_index: 0 },
-                RoleDef { noun_name: "Age".to_string(), role_index: 1 }, // Age not declared
+                RoleDef { noun_name: "Age".to_string(), role_index: 1 },
             ],
         });
 
-        let pop = ir_to_metamodel_population(&ir);
-        // Role facts exist for both roles (including undeclared noun)
-        let role_facts = pop.facts.get("Noun plays Role").unwrap();
-        // But there's no "Noun has Object Type" for Age
-        let noun_facts = pop.facts.get("Noun has Object Type").unwrap();
-        assert!(!noun_facts.iter().any(|f| f.bindings.iter().any(|(_, v)| v == "Age")));
-        // The role for Age exists but references an undeclared noun
-        assert!(role_facts.iter().any(|f| f.bindings.iter().any(|(_, v)| v == "Age")));
+        let state = ir_to_metamodel_state(&ir);
+        let role_facts = fetch_or_phi("Noun plays Role", &state);
+        let noun_facts = fetch_or_phi("Noun has Object Type", &state);
+        let roles = role_facts.as_seq().unwrap();
+        let nouns = noun_facts.as_seq().unwrap();
+        assert!(!nouns.iter().any(|f| binding(f, "Noun") == Some("Age")));
+        assert!(roles.iter().any(|f| binding(f, "Noun") == Some("Age")));
     }
 }
