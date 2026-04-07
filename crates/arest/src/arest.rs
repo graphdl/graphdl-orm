@@ -92,6 +92,122 @@ pub struct TransitionAction {
     pub href: String,
 }
 
+// -- Encode/decode bridge (Object ↔ CommandResult) --------------------
+
+/// Encode command input as Object for compiled handler Func.
+/// create: <entity_id, <<field_name, value>, ...>, domain, state>
+pub fn encode_create_input(
+    entity_id: &str, fields: &std::collections::HashMap<String, String>,
+    domain: &str, state: &ast::Object,
+) -> ast::Object {
+    let field_seq = ast::Object::Seq(
+        fields.iter().map(|(k, v)| ast::Object::seq(vec![ast::Object::atom(k), ast::Object::atom(v)])).collect()
+    );
+    ast::Object::seq(vec![ast::Object::atom(entity_id), field_seq, ast::Object::atom(domain), state.clone()])
+}
+
+/// Encode transition input: <entity_id, event, current_status_or_phi, state>
+pub fn encode_transition_input(
+    entity_id: &str, event: &str, current_status: Option<&str>, state: &ast::Object,
+) -> ast::Object {
+    let status_obj = current_status.map(ast::Object::atom).unwrap_or(ast::Object::phi());
+    ast::Object::seq(vec![ast::Object::atom(entity_id), ast::Object::atom(event), status_obj, state.clone()])
+}
+
+/// Encode update input: <entity_id, <<field_name, value>, ...>, noun, domain, state>
+pub fn encode_update_input(
+    entity_id: &str, fields: &std::collections::HashMap<String, String>,
+    noun: &str, domain: &str, state: &ast::Object,
+) -> ast::Object {
+    let field_seq = ast::Object::Seq(
+        fields.iter().map(|(k, v)| ast::Object::seq(vec![ast::Object::atom(k), ast::Object::atom(v)])).collect()
+    );
+    ast::Object::seq(vec![
+        ast::Object::atom(entity_id), field_seq,
+        ast::Object::atom(noun), ast::Object::atom(domain), state.clone(),
+    ])
+}
+
+/// Decode a compiled handler's Object result into CommandResult.
+/// Expected: <entities, status, transitions, violations, derived_count, rejected, new_state>
+pub fn decode_command_result(obj: &ast::Object) -> CommandResult {
+    let items = obj.as_seq().unwrap_or(&[]);
+    let sel = |i: usize| items.get(i);
+
+    let entities = sel(0).and_then(|o| o.as_seq()).map(|es| {
+        es.iter().filter_map(|e| {
+            let parts = e.as_seq()?;
+            let id = parts.get(0)?.as_atom()?.to_string();
+            let entity_type = parts.get(1)?.as_atom()?.to_string();
+            let data = parts.get(2)?.as_seq().map(|pairs| {
+                pairs.iter().filter_map(|p| {
+                    let kv = p.as_seq()?;
+                    Some((kv.get(0)?.as_atom()?.to_string(), kv.get(1)?.as_atom()?.to_string()))
+                }).collect()
+            }).unwrap_or_default();
+            Some(EntityResult { id, entity_type, data })
+        }).collect()
+    }).unwrap_or_default();
+
+    let status = sel(1).and_then(|o| o.as_atom()).map(|s| s.to_string());
+
+    let transitions = sel(2).and_then(|o| o.as_seq()).map(|ts| {
+        ts.iter().filter_map(|t| {
+            let parts = t.as_seq()?;
+            Some(TransitionAction {
+                event: parts.get(0)?.as_atom()?.to_string(),
+                target_status: parts.get(1)?.as_atom()?.to_string(),
+                method: parts.get(2)?.as_atom()?.to_string(),
+                href: parts.get(3)?.as_atom()?.to_string(),
+            })
+        }).collect()
+    }).unwrap_or_default();
+
+    let violations = sel(3).and_then(|o| o.as_seq()).map(|vs| {
+        vs.iter().filter_map(|v| ast::decode_violation(v)).collect()
+    }).unwrap_or_default();
+
+    let derived_count = sel(4).and_then(|o| o.as_atom())
+        .and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+    let rejected = sel(5).and_then(|o| o.as_atom()) == Some("T");
+    let new_state = sel(6).cloned().unwrap_or(ast::Object::phi());
+
+    CommandResult { entities, status, transitions, violations, derived_count, rejected, state: new_state }
+}
+
+/// Encode a CommandResult as an Object (inverse of decode_command_result).
+pub fn encode_command_result(result: &CommandResult) -> ast::Object {
+    let entities = ast::Object::Seq(result.entities.iter().map(|e| {
+        let data = ast::Object::Seq(e.data.iter().map(|(k, v)| {
+            ast::Object::seq(vec![ast::Object::atom(k), ast::Object::atom(v)])
+        }).collect());
+        ast::Object::seq(vec![ast::Object::atom(&e.id), ast::Object::atom(&e.entity_type), data])
+    }).collect());
+
+    let status = result.status.as_ref().map(|s| ast::Object::atom(s)).unwrap_or(ast::Object::phi());
+
+    let transitions = ast::Object::Seq(result.transitions.iter().map(|t| {
+        ast::Object::seq(vec![
+            ast::Object::atom(&t.event), ast::Object::atom(&t.target_status),
+            ast::Object::atom(&t.method), ast::Object::atom(&t.href),
+        ])
+    }).collect());
+
+    let violations = ast::Object::Seq(result.violations.iter().map(|v| {
+        ast::Object::seq(vec![
+            ast::Object::atom(&v.constraint_id), ast::Object::atom(&v.constraint_text),
+            ast::Object::atom(&v.detail), ast::Object::atom(if v.alethic { "T" } else { "F" }),
+        ])
+    }).collect());
+
+    ast::Object::seq(vec![
+        entities, status, transitions, violations,
+        ast::Object::atom(&result.derived_count.to_string()),
+        if result.rejected { ast::Object::t() } else { ast::Object::f() },
+        result.state.clone(),
+    ])
+}
+
 // -- Apply ------------------------------------------------------------
 
 pub fn apply_command_defs(
@@ -624,6 +740,34 @@ fn to_camel_case(s: &str) -> String {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn command_result_round_trips_through_object() {
+        let mut data = HashMap::new();
+        data.insert("customer".to_string(), "acme".to_string());
+        let result = CommandResult {
+            entities: vec![EntityResult { id: "ord-1".into(), entity_type: "Order".into(), data }],
+            status: Some("Draft".into()),
+            transitions: vec![TransitionAction {
+                event: "place".into(), target_status: "Placed".into(),
+                method: "POST".into(), href: "/orders/ord-1/transition".into(),
+            }],
+            violations: vec![],
+            derived_count: 2,
+            rejected: false,
+            state: ast::Object::phi(),
+        };
+        let obj = encode_command_result(&result);
+        let decoded = decode_command_result(&obj);
+        assert_eq!(decoded.entities.len(), 1);
+        assert_eq!(decoded.entities[0].id, "ord-1");
+        assert_eq!(decoded.entities[0].entity_type, "Order");
+        assert_eq!(decoded.status, Some("Draft".into()));
+        assert_eq!(decoded.transitions.len(), 1);
+        assert_eq!(decoded.transitions[0].event, "place");
+        assert_eq!(decoded.derived_count, 2);
+        assert!(!decoded.rejected);
+    }
 
     const STATE_METAMODEL: &str = r#"
 # State
