@@ -58,6 +58,11 @@ pub struct PopulationStats {
     pub entity_count: usize,
 }
 
+/// Induce constraints and rules from an Object state and its schema.
+pub fn induce_state(ir: &Domain, state: &crate::ast::Object) -> InductionResult {
+    induce(ir, &crate::ast::state_to_population(state))
+}
+
 /// Induce constraints and rules from a population and its schema.
 pub fn induce(ir: &Domain, population: &Population) -> InductionResult {
     let mut constraints = Vec::new();
