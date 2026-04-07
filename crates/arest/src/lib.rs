@@ -29,7 +29,7 @@ pub mod arest;
 pub mod cloudflare;
 
 struct CompiledState {
-    pop: types::Population,
+    state: ast::Object,
     defs: Vec<(String, ast::Func)>,
 }
 
@@ -50,10 +50,10 @@ fn ds() -> &'static Mutex<Vec<Option<CompiledState>>> {
     DOMAINS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-fn allocate(pop: types::Population, defs: Vec<(String, ast::Func)>) -> u32 {
+fn allocate(state: ast::Object, defs: Vec<(String, ast::Func)>) -> u32 {
     let mut s = ds().lock().unwrap();
     let h = s.iter().position(|x| x.is_none()).unwrap_or_else(|| { s.push(None); s.len() - 1 });
-    s[h] = Some(CompiledState { pop, defs });
+    s[h] = Some(CompiledState { state, defs });
     h as u32
 }
 
@@ -80,9 +80,9 @@ fn parse_and_compile_impl(readings: Vec<(String, String)>) -> Result<u32, String
         m.named_spans.extend(ir.named_spans);
         m.autofill_spans.extend(ir.autofill_spans);
     }
-    let pop = parse_forml2::domain_to_population(&m);
-    let defs = compile::compile_to_defs(&pop);
-    Ok(allocate(pop, defs))
+    let state = parse_forml2::domain_to_state(&m);
+    let defs = compile::compile_to_defs_state(&state);
+    Ok(allocate(state, defs))
 }
 
 fn release_impl(handle: u32) {
@@ -161,9 +161,8 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
             ast::apply(&func, &ast::Object::atom(operation), &def_map).to_string()
         }
         "forward_chain" => {
-            let mut pop = st.pop.clone();
             let derivation_defs = st.defs_matching("derivation:");
-            let derived = evaluate::forward_chain_defs(&derivation_defs, &mut pop);
+            let (_new_state, derived) = evaluate::forward_chain_defs_state(&derivation_defs, &st.state);
             let items: Vec<ast::Object> = derived.iter().map(|d| {
                 ast::Object::seq(vec![
                     ast::Object::atom(&d.fact_type_id),
