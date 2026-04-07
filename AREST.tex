@@ -33,7 +33,7 @@
 \maketitle
 
 \begin{abstract}
-Domain knowledge enters software as natural language requirements, is re-encoded as schemas, validation logic, state machines, and API routes, and drifts out of sync in production. The informal layer between specification and execution is where bugs live and where automated agents hallucinate. We show that a single set of FORML\,2 declarations can define a database schema, constraint rules, state machine workflows, and a REST API with hypermedia navigation, producing a complete application from domain facts alone. We formalize this as AREST, a Backus AST system~\cite{backus78} whose definitions are compiled FORML\,2 readings~\cite{halpin08} and whose state is Codd's named set~\cite{codd70} of ORM\,2 elementary facts. REST endpoints are applications of a single system function. Ingesting new readings is self-modification. Five theorems establish that the grammar is unambiguous, that specifications and executables are the same object, that state transfer is complete, that HATEOAS links (both transitions and entity hierarchy) are projections of the population, and that every value in the API is derived from facts. Together they eliminate the informal layer entirely.
+Domain knowledge enters software as natural language requirements, is re-encoded as schemas, validation logic, state machines, and API routes, and drifts out of sync in production. The informal layer between specification and execution is where bugs live and where automated agents hallucinate. We show that a single set of FORML\,2 declarations can define a database schema, constraint rules, state machine workflows, and a REST API with hypermedia navigation, producing a complete application from domain facts alone. We formalize this as AREST, a Backus AST system~\cite{backus78} whose definitions are compiled FORML\,2 readings~\cite{halpin01} and whose state is Codd's named set~\cite{codd70} of ORM\,2 elementary facts. REST endpoints are applications of a single system function. Ingesting new readings is self-modification. Five theorems establish that the grammar is unambiguous, that specifications and executables are the same object, that state transfer is complete, that HATEOAS links (both transitions and entity hierarchy) are projections of the population, and that every value in the API is derived from facts. Together they eliminate the informal layer entirely.
 \end{abstract}
 
 \section{Introduction}
@@ -51,13 +51,13 @@ Three terms carry overloaded abbreviations. \emph{AST} follows Backus's usage (A
 \begin{definition}[AREST]\label{def:arest}
 An \emph{Applicative REpresentational State Transfer} system is an AST system~\cite[Sec.\,14]{backus78} whose state $D$ satisfies:
 \begin{itemize}[nosep]
-\item The $\mathit{FILE}$ cell contains a population $P = \uparrow\!\mathit{FILE}\!:\!D$, a named set of relations~\cite[Sec.\,1.6]{codd70} whose elements are ORM\,2 elementary facts~\cite[Ch.\,3]{halpin08}
-\item The $\mathit{DEFS}$ cells contain FFP objects~\cite[Sec.\,13.2]{backus78}. These are readings compiled from FORML\,2 declarations~\cite{halpin08}, and functions registered by the runtime
+\item The $\mathit{FILE}$ cell contains a population $P = \uparrow\!\mathit{FILE}\!:\!D$, a named set of relations~\cite[Sec.\,1.6]{codd70} whose elements are ORM\,2 elementary facts~\cite[Ch.\,3]{halpin01}
+\item The $\mathit{DEFS}$ cells contain FFP objects~\cite[Sec.\,13.2]{backus78}. These are readings compiled from FORML\,2 declarations~\cite{halpin01}, and functions registered by the runtime
 \end{itemize}
 The system function $\mathit{SYSTEM}\!:\!x = \langle o, D'\rangle$~\cite[Sec.\,14.3.1]{backus78} is defined by the definitions in $D$. REST endpoints are applications of $\mathit{SYSTEM}$ with distinct inputs. The representation function $\rho$~\cite[Sec.\,13.3.2]{backus78} maps an object to the function it represents. Given a fact type, $\rho$ looks it up in $\mathit{DEFS}$ and returns the functional form that determines what happens when an operation is applied. The universe of FFP objects $O$ and $\rho$ are inherited from the AST framework.
 \end{definition}
 
-A fact type~\cite[Ch.\,3]{halpin08} is a constructor ($\mathit{CONS}$) of roles~\cite[Sec.\,11.2.4]{backus78}. Populate the roles with object instances and you get a fact. The fact is a sequence $\langle\mathit{ft}, o_1, \ldots, o_n\rangle$ where $\mathit{ft}$ is the fact type and $o_1, \ldots, o_n$ are the objects playing its roles. Metacomposition~\cite[Sec.\,13.3.2]{backus78} resolves the fact by looking up its fact type:
+A fact type~\cite[Ch.\,3]{halpin01} is a constructor ($\mathit{CONS}$) of roles~\cite[Sec.\,11.2.4]{backus78}. Populate the roles with object instances and you get a fact. The fact is a sequence $\langle\mathit{ft}, o_1, \ldots, o_n\rangle$ where $\mathit{ft}$ is the fact type and $o_1, \ldots, o_n$ are the objects playing its roles. Metacomposition~\cite[Sec.\,13.3.2]{backus78} resolves the fact by looking up its fact type:
 \begin{align}
 (\rho\langle x_1, \ldots, x_n\rangle)\!:\!y = (\rho\,x_1)\!:\!\langle\langle x_1, \ldots, x_n\rangle, y\rangle \label{eq:metacomp}
 \end{align}
@@ -87,6 +87,7 @@ $\bar{x}$ & Constant & Literal \\
 \midrule
 $\mathit{distl}$ & Distribute-left & Join preparation \\
 $\mathit{eq}$ & Equality test & Predicate \\
+$\mathit{compact}$ & Remove $\bot$ elements & Set formation \\
 \bottomrule
 \end{tabular}
 \caption{FFP primitives with domain interpretations.}\label{tab:ffp}
@@ -96,9 +97,9 @@ A fact type $\langle\mathit{CONS}, s_1, \ldots, s_n\rangle$ (Table~\ref{tab:ffp}
 
 Two derived forms used throughout the paper:
 \begin{align}
-\mathit{Filter}(p) &\equiv \alpha\,(p \to \mathit{id} ;\; \bot) \label{eq:filter-def}
+\mathit{Filter}(p) &\equiv \mathit{compact} \circ \alpha\,(p \to \mathit{id} ;\; \bot) \label{eq:filter-def}
 \end{align}
-$\mathit{Filter}$ is $\alpha$ (apply-to-all) of a condition: keep elements where $p$ holds, replace others with $\bot$.
+$\alpha$ applies the condition to each element, yielding $\bot$ where $p$ does not hold. Since sequences are $\bot$-preserving~\cite[Sec.\,11.2.1]{backus78}, the intermediate result would collapse. The primitive $\mathit{compact}$ removes $\bot$ elements, producing a proper subsequence. FFP systems choose their primitive set~\cite[Sec.\,11.4.4]{backus78}; $\mathit{compact}$ is an AREST primitive analogous to APL compress.
 
 \begin{align}
 \mathit{foldl}\;f\;z\;\langle\rangle &= z \notag \\
@@ -148,11 +149,11 @@ R \cdot S &\equiv \pi_{1s}(R \mathbin{*} S) \label{eq:rcomp} \\
 \end{align}
 \noindent where $s_{\mathit{sh}}$ selects the roles shared between $R$ and $S$.
 
-\noindent $P$ is a named set of relations in normal form (ORM\,2 elementary facts are 5NF by construction~\cite[Ch.\,12]{halpin08}). Codd shows that $\theta_1 = \{\text{projection, natural join, restriction, tie}\}$ is adequate for the named set~\cite{codd72}. Equations~(\ref{eq:proj})--(\ref{eq:tie}) express each element of $\theta_1$ as an FFP definition. The combining forms that query the population are the same combining forms that evaluate constraints and derive facts. There is no separate query language. The evaluation algebra is the query algebra.
+\noindent $P$ is a named set of relations in normal form (ORM\,2 elementary facts are 5NF by construction~\cite[Ch.\,12]{halpin01}). Codd proves that the relational algebra is at least as expressive as the relational calculus~\cite{codd72}. Halpin shows that the subset $\theta_1 = \{\text{projection, natural join, restriction, tie}\}$ is adequate for the named set of ORM\,2 elementary facts~\cite[Ch.\,12]{halpin01}. Equations~(\ref{eq:proj})--(\ref{eq:tie}) express each element of $\theta_1$ as an FFP definition. The combining forms that query the population are the same combining forms that evaluate constraints and derive facts. There is no separate query language. The evaluation algebra is the query algebra.
 
 \subsection{State and Cells}
 
-The state $D$ is a sequence of cells $\langle\mathit{CELL}, n, c\rangle$ with Backus's fetch ($\uparrow\!n\!:\!D \to c$) and store ($\downarrow\!n\!:\!\langle x, D\rangle \to D'$) operators~\cite[Sec.\,14.3]{backus78}. $\mathit{FILE}$ is a cell whose contents is~$P$. RMAP~\cite[Ch.\,10]{halpin08} determines which facts belong to which cell from the schema's uniqueness constraints. The result is a 3NF row: the complete set of facts that depend on one entity's key. Each entity is a cell. The cell stores exactly the facts that RMAP groups under that entity. A cell is what it says it is: a complete object of a type. Cells may contain sub-stores~\cite[Sec.\,14.7]{backus78}. Partitioning is a cell containing a subset of~$P$.
+The state $D$ is a sequence of cells $\langle\mathit{CELL}, n, c\rangle$ with Backus's fetch ($\uparrow\!n\!:\!D \to c$) and store ($\downarrow\!n\!:\!\langle x, D\rangle \to D'$) operators~\cite[Sec.\,14.3]{backus78}. $\mathit{FILE}$ is a cell whose contents is~$P$. RMAP~\cite[Ch.\,10]{halpin01} determines which facts belong to which cell from the schema's uniqueness constraints. The result is a 3NF row: the complete set of facts that depend on one entity's key. Each entity is a cell. The cell stores exactly the facts that RMAP groups under that entity. A cell is what it says it is: a complete object of a type. Cells may contain sub-stores~\cite[Sec.\,14.7]{backus78}. Partitioning is a cell containing a subset of~$P$.
 
 \section{The System Function}
 
@@ -161,6 +162,8 @@ Each input $x$ addresses an entity and carries an operation. The runtime maps th
 \mathit{SYSTEM}\!:\!x &= (\rho\,(\uparrow\!\mathit{entity}(x)\!:\!D))\!:\!\uparrow\!\mathit{op}(x) \label{eq:sys}
 \end{align}
 The entity is fetched from $D$. $\rho$ resolves it to a functional form determined by its fact type and the definitions in $\mathit{DEFS}$. The operation ($\mathit{read}$, $\mathit{create}$, etc.) is applied as the operand. The entity handles the dispatch, not the system function. In conventional architectures, a router dispatches operations to handlers. Adding a new operation or a new entity type requires changing the router. Here, the entity receives an operation it has never seen before and applies it, because the entity is a $\lambda$-function and the operation is its argument. New operations are registered in $\mathit{DEFS}$ without modifying any entity, and new entity types are added without modifying any operation. This is what makes the system shardable: each entity is self-contained, and two entities on different machines apply the same operation without coordinating.
+
+\smallskip\noindent\textbf{Remark} (Specialization of Backus's subsystem). Backus's subsystem~\cite[Sec.\,14.4.2]{backus78} dispatches on a $\mathit{KEY}$ cell with five clauses (system-change, expression, program, query, update) and a default. AREST collapses the five clauses into a single $\rho$-dispatch~(\ref{eq:sys}): the entity determines the functional form via $\rho$, and the HTTP method determines the operation class. The five input classes become four HTTP methods (\texttt{GET}, \texttt{POST}, \texttt{PUT}, \texttt{DELETE}) registered in $\mathit{DEFS}$ as platform functions, plus schema modification ($\mathit{compile} \circ \mathit{parse}$) as the self-modification case below.
 
 Self-modification is the same mechanism. Ingesting readings~\cite[Sec.\,14.6]{backus78} is an application of $\mathit{SYSTEM}$ where the addressed entity is $\mathit{DEFS}$ and the operation is $\mathit{compile} \circ \mathit{parse}$. The new FFP objects are stored via $\downarrow\!\mathit{DEFS}$. Subsequent applications of $\mathit{SYSTEM}$ evaluate the new constraints and derivation rules. The system extends its own program.
 
@@ -253,14 +256,14 @@ $\mu$ evaluates by applicative-order $\beta$-reduction~\cite[Sec.\,13.3.1]{backu
 Three constraints govern execution:
 \begin{enumerate}[nosep]
 \item \textbf{Reduction order:} applicative (call-by-value). All arguments are reduced before the function is applied.
-\item \textbf{Scope:} evaluation is confined to the request-local partition of $D$. RMAP~\cite[Ch.\,10]{halpin08} determines the partition from the schema's uniqueness constraints.
+\item \textbf{Scope:} evaluation is confined to the request-local partition of $D$. RMAP~\cite[Ch.\,10]{halpin01} determines the partition from the schema's uniqueness constraints.
 \item \textbf{Derivation:} forward chaining, monotonic, evaluated to the least fixed point per request. Since $\mathit{derive}$ only adds facts over finite $P_{\mathit{local}}$, the fixed point exists (Knaster-Tarski) and is reached in $\leq |P_{\mathit{local,max}}|$ iterations. The derivation chain (which rules fired, in what order, producing which facts) is recorded and available on demand as part of the representation.
 \end{enumerate}
 The completeness result (Theorem~\ref{thm:complete}) assumes evaluation to the least fixed point under this strategy.
 
 \subsection{Boundary Conditions}
 
-The system operates over facts~$(P)$, computations~$(O$ via $\rho)$, and inputs~$(I)$, the operand $x$ in $\mu(\mathit{SYSTEM}\!:\!x)$~\cite[Sec.\,14.3.1]{backus78}. Time is an input fact in $x$, not hidden state. Effects are directives in the output $o$. Their outcomes are facts in $D'$. Identity follows from the reference scheme~\cite[Ch.\,5]{halpin08}. $\mathit{resolve}$ in~(\ref{eq:create}) applies it. The world assumption per noun~\cite[Ch.\,7]{halpin08} governs incompleteness. Under CWA, a fact not in $P$ is false. Under OWA, it is unknown. Derivation rules for function invocation operate under OWA because the rules capture known reasons to act, not all possible reasons. When the derived course of action is \emph{unknown}, that is itself a reason to escalate to a human or broader-context agent.
+The system operates over facts~$(P)$, computations~$(O$ via $\rho)$, and inputs~$(I)$, the operand $x$ in $\mu(\mathit{SYSTEM}\!:\!x)$~\cite[Sec.\,14.3.1]{backus78}. Time is an input fact in $x$, not hidden state. Effects are directives in the output $o$. Their outcomes are facts in $D'$. Identity follows from the reference scheme~\cite[Ch.\,5]{halpin01}. $\mathit{resolve}$ in~(\ref{eq:create}) applies it. The world assumption per noun~\cite[Ch.\,7]{halpin01} governs incompleteness. Under CWA, a fact not in $P$ is false. Under OWA, it is unknown. Derivation rules for function invocation operate under OWA because the rules capture known reasons to act, not all possible reasons. When the derived course of action is \emph{unknown}, that is itself a reason to escalate to a human or broader-context agent.
 
 \smallskip\noindent\textbf{Remark} (World assumption on populating functions). The theorems are agnostic to the population source. All populating functions are runtime functions registered in $\mathit{DEFS}$. The world assumption determines the interpretation of absence. A function that exhaustively enumerates its domain operates under CWA: if no matching value is found, the fact is definitively absent. A function that cannot exhaustively enumerate its domain operates under OWA: absence of the fact means unknown, not false. Deontic constraints evaluated over OWA-populated facts are sound but not complete. A reported violation is genuine. The absence of a violation is not a guarantee.
 
@@ -370,7 +373,7 @@ All links in the representation are $\theta_1$ operations on $P$ and $S$.
 \begin{align}
 \mathit{links}(s) &= \pi_{\mathit{event}}\!\left(\mathit{Filter}(p) : T\right) \label{eq:hateoas}
 \end{align}
-where $p(t) = (s_{\mathit{from}}(t) = s) \lor \mathit{anc}(s_{\mathit{from}}(t), s)$ and $\mathit{anc}(s', s)$ holds when $s$ is reachable from $s'$ through the transitive closure of the transition graph (computed with a visited set to handle cycles). Transition graphs may contain cycles (e.g.\ a support request moving between investigating and waiting states). It is obligatory that each cycle in the transition graph has some exit Transition. This deontic mandatory constraint ensures liveness without requiring structural acyclicity.
+where $p(t) = s_{\mathit{from}}(t) \in \{s\} \cup \mathit{supertypes}(s)$: transitions whose origin is the current state or any supertype status from which $s$ inherits. Subtypes inherit the transitions of their supertypes~\cite[Ch.\,6]{halpin01}. For flat state machines (no subtyping), this reduces to $s_{\mathit{from}}(t) = s$. Transition graphs may contain cycles (e.g.\ a support request moving between investigating and waiting states). It is obligatory that each cycle in the transition graph has some exit Transition. This deontic mandatory constraint ensures liveness without requiring structural acyclicity: the client follows immediate links and is guaranteed to eventually reach an exit.
 
 \smallskip\noindent
 \textit{(b) Navigation links.} Let $F$ be the set of all fact types in $S$ and let $U_f$ denote the role set spanned by the UC on fact type $f$. Let $S_f = R_f \setminus U_f$ be the non-spanned roles. For a noun $n$ participating in $f$, the navigation algorithm is:
@@ -477,7 +480,7 @@ E.F. Codd, ``Relational Completeness of Data Base Sublanguages,'' in R. Rustin, 
 \bibitem{fielding00}
 R.T. Fielding, ``Architectural Styles and the Design of Network-based Software Architectures,'' Ph.D. dissertation, Univ.\ of California, Irvine, 2000.
 
-\bibitem{halpin08}
+\bibitem{halpin01}
 T. Halpin, \emph{Information Modeling and Relational Databases}, Morgan Kaufmann, 2001.
 
 \bibitem{halpin06}

@@ -687,16 +687,18 @@ pub fn compile_to_defs(pop: &Population) -> Vec<(String, Func)> {
 
     // ── Generator 3: SQL DDL ────────────────────────────────────────
     // Call rmap() at compile time and produce a def sql:{table} for each table.
+    // All identifiers are double-quoted to handle SQL reserved words.
     {
         let tables = crate::rmap::rmap(&domain);
         for table in &tables {
-            let mut ddl = format!("CREATE TABLE {} (\n", table.name);
+            let q = |s: &str| format!("\"{}\"", s);
+            let mut ddl = format!("CREATE TABLE IF NOT EXISTS {} (\n", q(&table.name));
             for (i, col) in table.columns.iter().enumerate() {
                 let nullable = if col.nullable { "" } else { " NOT NULL" };
                 let refs = col.references.as_ref()
-                    .map(|r| format!(" REFERENCES {}", r))
+                    .map(|r| format!(" REFERENCES {}", q(r)))
                     .unwrap_or_default();
-                ddl.push_str(&format!("  {} {}{}{}", col.name, col.col_type, nullable, refs));
+                ddl.push_str(&format!("  {} {}{}{}", q(&col.name), col.col_type, nullable, refs));
                 if i < table.columns.len() - 1 || !table.primary_key.is_empty()
                     || table.checks.as_ref().map_or(false, |c| !c.is_empty())
                     || table.unique_constraints.as_ref().map_or(false, |u| !u.is_empty())
@@ -712,8 +714,9 @@ pub fn compile_to_defs(pop: &Population) -> Vec<(String, Func)> {
                 {
                     trailing = true;
                 }
+                let pk_cols: Vec<String> = table.primary_key.iter().map(|c| q(c)).collect();
                 ddl.push_str(&format!("  PRIMARY KEY ({}){}\n",
-                    table.primary_key.join(", "),
+                    pk_cols.join(", "),
                     if trailing { "," } else { "" },
                 ));
             }
@@ -728,7 +731,8 @@ pub fn compile_to_defs(pop: &Population) -> Vec<(String, Func)> {
             }
             if let Some(ucs) = &table.unique_constraints {
                 for (i, uc) in ucs.iter().enumerate() {
-                    ddl.push_str(&format!("  UNIQUE ({}){}\n", uc.join(", "),
+                    let uc_cols: Vec<String> = uc.iter().map(|c| q(c)).collect();
+                    ddl.push_str(&format!("  UNIQUE ({}){}\n", uc_cols.join(", "),
                         if i < ucs.len() - 1 { "," } else { "" },
                     ));
                 }

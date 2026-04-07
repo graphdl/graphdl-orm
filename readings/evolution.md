@@ -104,4 +104,4 @@ Transition 'apply' is from Status 'Approved'.
 Transition 'apply' is to Status 'Applied'.
 Transition 'apply' is triggered by Event Type 'applied'.
 
-Domain 'evolution' has Visibility 'public'.
+Domain 'evolution' has Access 'public'.

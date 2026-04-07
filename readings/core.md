@@ -350,4 +350,4 @@ External System 'stripe' has URL 'https://api.stripe.com/v1'.
 External System 'stripe' has Header 'Authorization'.
 External System 'stripe' has Prefix 'Bearer'.
 
-Domain 'core' has Visibility 'public'.
+Domain 'core' has Access 'public'.

@@ -77,4 +77,4 @@ If some Violation occurs before some Transition then that Violation occurred at 
 
 ## Instance Facts
 
-Domain 'outcomes' has Visibility 'public'.
+Domain 'outcomes' has Access 'public'.

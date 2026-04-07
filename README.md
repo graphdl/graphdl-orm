@@ -51,7 +51,7 @@ Access control is expressed as readings in `organizations.md`:
 ```
 User accesses Domain iff User has Org Role in Organization
   and Domain belongs to that Organization.
-User accesses Domain if Domain has Visibility 'public'.
+User accesses Domain if Domain has Access 'public'.
 ```
 
 The engine evaluates these derivation rules — no procedural access control code.
