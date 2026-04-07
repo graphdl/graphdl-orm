@@ -3,16 +3,15 @@
 // Integration tests exercise the compile + evaluate pipeline directly,
 // bypassing the wasm_bindgen layer (which requires JsValue).
 //
-// These tests use the DEFS path (compile_to_defs) instead of the
-// CompiledModel path (compile + evaluate_via_ast).
+// These tests use the DEFS path (compile_to_defs_state) with Object state.
 use std::collections::HashMap;
-use arest::types::{Domain, Population, Violation};
+use arest::types::{Domain, Violation};
 use arest::compile;
 use arest::evaluate;
 use arest::ast;
 use arest::parse_forml2;
 
-/// Helper: build a def_map from compile_to_defs output.
+/// Helper: build a def_map from compile_to_defs_state output.
 fn build_def_map(defs: &[(String, ast::Func)]) -> HashMap<String, ast::Func> {
     defs.iter().map(|(n, f)| (n.clone(), f.clone())).collect()
 }
@@ -23,9 +22,9 @@ fn evaluate_constraints(
     def_map: &HashMap<String, ast::Func>,
     text: &str,
     sender: Option<&str>,
-    population: &Population,
+    state: &ast::Object,
 ) -> Vec<Violation> {
-    let ctx_obj = ast::encode_eval_context(text, sender, population);
+    let ctx_obj = ast::encode_eval_context_state(text, sender, state);
     defs.iter()
         .filter(|(n, _)| n.starts_with("constraint:"))
         .flat_map(|(name, func)| {
@@ -69,14 +68,14 @@ fn test_full_pipeline_forbidden_text() {
     }"#;
 
     let ir: Domain = serde_json::from_str(ir_json).unwrap();
-    let pop = parse_forml2::domain_to_population(&ir);
-    let defs = compile::compile_to_defs(&pop);
+    let state = parse_forml2::domain_to_state(&ir);
+    let defs = compile::compile_to_defs_state(&state);
     let def_map = build_def_map(&defs);
 
-    let population: Population = serde_json::from_str(r#"{"facts": {}}"#).unwrap();
+    let empty_state = ast::Object::phi();
     let emdash = core::char::from_u32(0x2014).unwrap();
     let text = format!("Hello {} how are you?", emdash);
-    let violations = evaluate_constraints(&defs, &def_map, &text, None, &population);
+    let violations = evaluate_constraints(&defs, &def_map, &text, None, &empty_state);
     assert!(!violations.is_empty());
 }
 
@@ -110,13 +109,12 @@ fn test_full_pipeline_clean_response() {
     }"#;
 
     let ir: Domain = serde_json::from_str(ir_json).unwrap();
-    let pop = parse_forml2::domain_to_population(&ir);
-    let defs = compile::compile_to_defs(&pop);
+    let state = parse_forml2::domain_to_state(&ir);
+    let defs = compile::compile_to_defs_state(&state);
     let def_map = build_def_map(&defs);
 
-    let population: Population = serde_json::from_str(r#"{"facts": {}}"#).unwrap();
-
-    let violations = evaluate_constraints(&defs, &def_map, "", None, &population);
+    let empty_state = ast::Object::phi();
+    let violations = evaluate_constraints(&defs, &def_map, "", None, &empty_state);
     assert!(violations.is_empty());
 }
 
@@ -148,19 +146,16 @@ fn test_full_pipeline_uniqueness_violation() {
     }"#;
 
     let ir: Domain = serde_json::from_str(ir_json).unwrap();
-    let pop = parse_forml2::domain_to_population(&ir);
-    let defs = compile::compile_to_defs(&pop);
+    let state = parse_forml2::domain_to_state(&ir);
+    let defs = compile::compile_to_defs_state(&state);
     let def_map = build_def_map(&defs);
 
     // Customer c1 has two names -> UC violation
-    let population: Population = serde_json::from_str(r#"{"facts": {
-        "ft1": [
-            { "factTypeId": "ft1", "bindings": [["Customer", "c1"], ["Name", "Alice"]] },
-            { "factTypeId": "ft1", "bindings": [["Customer", "c1"], ["Name", "Bob"]] }
-        ]
-    }}"#).unwrap();
+    let mut pop_state = ast::Object::phi();
+    pop_state = ast::cell_push("ft1", ast::fact_from_pairs(&[("Customer", "c1"), ("Name", "Alice")]), &pop_state);
+    pop_state = ast::cell_push("ft1", ast::fact_from_pairs(&[("Customer", "c1"), ("Name", "Bob")]), &pop_state);
 
-    let violations = evaluate_constraints(&defs, &def_map, "", None, &population);
+    let violations = evaluate_constraints(&defs, &def_map, "", None, &pop_state);
     assert_eq!(violations.len(), 1);
     assert!(violations[0].detail.contains("Uniqueness violation"));
     assert_eq!(violations[0].constraint_id, "c1");
@@ -168,7 +163,6 @@ fn test_full_pipeline_uniqueness_violation() {
 
 // --- Dual-instance convergence tests (Definition 2) ---
 
-/// Two def_maps compiled from the same IR produce identical evaluation results.
 #[test]
 fn test_dual_instance_convergence_valid() {
     let ir_json = r#"{
@@ -198,34 +192,26 @@ fn test_dual_instance_convergence_valid() {
 
     let ir: Domain = serde_json::from_str(ir_json).unwrap();
 
-    // Two independent def_maps (server and client)
-    let server_pop = parse_forml2::domain_to_population(&ir);
-    let server_defs = compile::compile_to_defs(&server_pop);
+    let server_state = parse_forml2::domain_to_state(&ir);
+    let server_defs = compile::compile_to_defs_state(&server_state);
     let server_def_map = build_def_map(&server_defs);
 
-    let client_pop = parse_forml2::domain_to_population(&ir);
-    let client_defs = compile::compile_to_defs(&client_pop);
+    let client_state = parse_forml2::domain_to_state(&ir);
+    let client_defs = compile::compile_to_defs_state(&client_state);
     let client_def_map = build_def_map(&client_defs);
 
-    // Valid population: each order has one customer
-    let population: Population = serde_json::from_str(r#"{"facts": {
-        "ft1": [
-            { "factTypeId": "ft1", "bindings": [["Order", "ord-1"], ["Customer", "acme"]] },
-            { "factTypeId": "ft1", "bindings": [["Order", "ord-2"], ["Customer", "beta"]] }
-        ]
-    }}"#).unwrap();
+    // Valid state: each order has one customer
+    let mut pop_state = ast::Object::phi();
+    pop_state = ast::cell_push("ft1", ast::fact_from_pairs(&[("Order", "ord-1"), ("Customer", "acme")]), &pop_state);
+    pop_state = ast::cell_push("ft1", ast::fact_from_pairs(&[("Order", "ord-2"), ("Customer", "beta")]), &pop_state);
 
-    let server_violations = evaluate_constraints(&server_defs, &server_def_map, "", None, &population);
-    let client_violations = evaluate_constraints(&client_defs, &client_def_map, "", None, &population);
+    let server_violations = evaluate_constraints(&server_defs, &server_def_map, "", None, &pop_state);
+    let client_violations = evaluate_constraints(&client_defs, &client_def_map, "", None, &pop_state);
 
-    // Both produce zero violations
     assert!(server_violations.is_empty(), "Server should see no violations");
     assert!(client_violations.is_empty(), "Client should see no violations");
 }
 
-/// Server detects violation from concurrent client writes.
-/// Client A assigns ord-1 to acme. Client B assigns ord-1 to beta.
-/// Each client's local view is valid. The merged population violates UC.
 #[test]
 fn test_dual_instance_concurrent_write_conflict() {
     let ir_json = r#"{
@@ -254,44 +240,33 @@ fn test_dual_instance_concurrent_write_conflict() {
     }"#;
 
     let ir: Domain = serde_json::from_str(ir_json).unwrap();
-    let pop = parse_forml2::domain_to_population(&ir);
-    let defs = compile::compile_to_defs(&pop);
+    let ir_state = parse_forml2::domain_to_state(&ir);
+    let defs = compile::compile_to_defs_state(&ir_state);
     let def_map = build_def_map(&defs);
 
-    // Client A's local view: ord-1 placed by acme (valid locally)
-    let client_a_pop: Population = serde_json::from_str(r#"{"facts": {
-        "ft1": [
-            { "factTypeId": "ft1", "bindings": [["Order", "ord-1"], ["Customer", "acme"]] }
-        ]
-    }}"#).unwrap();
+    // Client A's local view
+    let mut client_a_state = ast::Object::phi();
+    client_a_state = ast::cell_push("ft1", ast::fact_from_pairs(&[("Order", "ord-1"), ("Customer", "acme")]), &client_a_state);
 
-    // Client B's local view: ord-1 placed by beta (valid locally)
-    let client_b_pop: Population = serde_json::from_str(r#"{"facts": {
-        "ft1": [
-            { "factTypeId": "ft1", "bindings": [["Order", "ord-1"], ["Customer", "beta"]] }
-        ]
-    }}"#).unwrap();
+    // Client B's local view
+    let mut client_b_state = ast::Object::phi();
+    client_b_state = ast::cell_push("ft1", ast::fact_from_pairs(&[("Order", "ord-1"), ("Customer", "beta")]), &client_b_state);
 
-    // Both local views are valid
-    let a_violations = evaluate_constraints(&defs, &def_map, "", None, &client_a_pop);
-    let b_violations = evaluate_constraints(&defs, &def_map, "", None, &client_b_pop);
+    let a_violations = evaluate_constraints(&defs, &def_map, "", None, &client_a_state);
+    let b_violations = evaluate_constraints(&defs, &def_map, "", None, &client_b_state);
     assert!(a_violations.is_empty(), "Client A's local view is valid");
     assert!(b_violations.is_empty(), "Client B's local view is valid");
 
-    // Server merges both writes: ord-1 has TWO customers -> UC violation
-    let merged_pop: Population = serde_json::from_str(r#"{"facts": {
-        "ft1": [
-            { "factTypeId": "ft1", "bindings": [["Order", "ord-1"], ["Customer", "acme"]] },
-            { "factTypeId": "ft1", "bindings": [["Order", "ord-1"], ["Customer", "beta"]] }
-        ]
-    }}"#).unwrap();
+    // Server merges both writes
+    let mut merged_state = ast::Object::phi();
+    merged_state = ast::cell_push("ft1", ast::fact_from_pairs(&[("Order", "ord-1"), ("Customer", "acme")]), &merged_state);
+    merged_state = ast::cell_push("ft1", ast::fact_from_pairs(&[("Order", "ord-1"), ("Customer", "beta")]), &merged_state);
 
-    let server_violations = evaluate_constraints(&defs, &def_map, "", None, &merged_pop);
+    let server_violations = evaluate_constraints(&defs, &def_map, "", None, &merged_state);
     assert_eq!(server_violations.len(), 1, "Server detects the conflict");
     assert!(server_violations[0].detail.contains("Uniqueness violation"));
 }
 
-/// Server and client produce identical forward chain results.
 #[test]
 fn test_dual_instance_forward_chain_convergence() {
     let ir_json = r#"{
@@ -331,19 +306,14 @@ fn test_dual_instance_forward_chain_convergence() {
 
     let ir: Domain = serde_json::from_str(ir_json).unwrap();
 
-    // Two independent def_maps (server and client)
-    let server_pop = parse_forml2::domain_to_population(&ir);
-    let server_defs = compile::compile_to_defs(&server_pop);
+    let server_state = parse_forml2::domain_to_state(&ir);
+    let server_defs = compile::compile_to_defs_state(&server_state);
 
-    let client_pop = parse_forml2::domain_to_population(&ir);
-    let client_defs = compile::compile_to_defs(&client_pop);
+    let client_state = parse_forml2::domain_to_state(&ir);
+    let client_defs = compile::compile_to_defs_state(&client_state);
 
-    let population: Population = serde_json::from_str(r#"{"facts": {
-        "ft_heads": [
-            { "factTypeId": "ft_heads", "bindings": [["Person", "alice"], ["Department", "eng"]] }
-        ],
-        "ft_works": []
-    }}"#).unwrap();
+    let mut pop_state = ast::Object::phi();
+    pop_state = ast::cell_push("ft_heads", ast::fact_from_pairs(&[("Person", "alice"), ("Department", "eng")]), &pop_state);
 
     let server_derivation_defs: Vec<(&str, &ast::Func)> = server_defs.iter()
         .filter(|(n, _)| n.starts_with("derivation:"))
@@ -354,23 +324,17 @@ fn test_dual_instance_forward_chain_convergence() {
         .map(|(n, f)| (n.as_str(), f))
         .collect();
 
-    let mut server_pop = population.clone();
-    let mut client_pop = population.clone();
-    let server_derived = evaluate::forward_chain_defs(&server_derivation_defs, &mut server_pop);
-    let client_derived = evaluate::forward_chain_defs(&client_derivation_defs, &mut client_pop);
+    let (_server_new, server_derived) = evaluate::forward_chain_defs_state(&server_derivation_defs, &pop_state);
+    let (_client_new, client_derived) = evaluate::forward_chain_defs_state(&client_derivation_defs, &pop_state);
 
-    // Both should derive the same fact: alice works in eng
     assert_eq!(server_derived.len(), client_derived.len(),
         "Server and client derive the same number of facts");
 
     if !server_derived.is_empty() {
-        // Compare by fact content, not debug string (HashMap iteration order may differ)
         let mut s_facts: Vec<String> = server_derived.iter().map(|d| format!("{}:{:?}", d.fact_type_id, d.bindings)).collect();
         let mut c_facts: Vec<String> = client_derived.iter().map(|d| format!("{}:{:?}", d.fact_type_id, d.bindings)).collect();
         s_facts.sort();
         c_facts.sort();
-        assert_eq!(s_facts, c_facts,
-            "Derived facts are identical"
-        );
+        assert_eq!(s_facts, c_facts, "Derived facts are identical");
     }
 }

@@ -45,8 +45,6 @@ mod validate;
 mod induce;
 
 use types::Domain;
-#[cfg(not(feature = "local"))]
-use types::Population;
 
 // =========================================================================
 // SQLite-backed local runtime (feature = "local")
@@ -55,7 +53,6 @@ use types::Population;
 #[cfg(feature = "local")]
 mod db {
     use rusqlite::{Connection, params};
-    use crate::types::{Population, FactInstance};
     use crate::ast;
     use std::collections::HashMap;
 
@@ -105,11 +102,10 @@ mod db {
             .unwrap_or_else(|e| { eprintln!("Failed to commit defs: {}", e); std::process::exit(1); });
     }
 
-    pub fn store_facts(conn: &Connection, pop: &Population, tables: &[crate::rmap::TableDef]) {
+    pub fn store_facts(conn: &Connection, state: &ast::Object, tables: &[crate::rmap::TableDef]) {
         let tx = conn.unchecked_transaction()
             .unwrap_or_else(|e| { eprintln!("Failed to begin transaction: {}", e); std::process::exit(1); });
 
-        // Build lookup: snake_case noun name -> TableDef.
         let mut table_by_snake: HashMap<String, &crate::rmap::TableDef> = HashMap::new();
         for table in tables {
             table_by_snake.insert(table.name.clone(), table);
@@ -118,24 +114,22 @@ mod db {
         let mut domain_rows: usize = 0;
         let mut meta_rows: usize = 0;
 
-        // InstanceFacts are domain data. Unpack into domain table rows.
-        // Each InstanceFact has (subjectNoun, subjectValue, fieldName, objectNoun, objectValue).
-        // Group by (subjectNoun, subjectValue) to build a row per entity instance.
-        if let Some(instance_facts) = pop.facts.get("InstanceFact") {
-            // Group: (subject_table, subject_id) -> Vec<(column_name, value)>
+        // InstanceFacts are domain data.
+        let inst_cell = ast::fetch_or_phi("InstanceFact", state);
+        if let Some(instance_facts) = inst_cell.as_seq() {
             let mut rows: HashMap<(String, String), Vec<(String, String)>> = HashMap::new();
             for inst in instance_facts {
-                let get = |key: &str| inst.bindings.iter().find(|(k,_)| k == key).map(|(_,v)| v.as_str()).unwrap_or("");
+                let get = |key: &str| ast::binding(inst, key).unwrap_or("").to_string();
                 let subject_noun = get("subjectNoun");
                 let subject_value = get("subjectValue");
                 let field_name = get("fieldName");
                 let object_value = get("objectValue");
 
-                let table_name = crate::rmap::to_snake(subject_noun);
-                let col_name = crate::rmap::to_snake(field_name);
+                let table_name = crate::rmap::to_snake(&subject_noun);
+                let col_name = crate::rmap::to_snake(&field_name);
 
-                let key = (table_name, subject_value.to_string());
-                rows.entry(key).or_default().push((col_name, object_value.to_string()));
+                let key = (table_name, subject_value);
+                rows.entry(key).or_default().push((col_name, object_value));
             }
 
             for ((table_name, subject_id), columns) in &rows {
@@ -143,10 +137,7 @@ mod db {
                     Some(t) => t,
                     None => continue,
                 };
-                // Find the PK column name (first PK column).
                 let pk_col = table.primary_key.first().map(|s| s.as_str()).unwrap_or("id");
-
-                // Build column list: PK + all field columns that exist in the table.
                 let table_col_names: Vec<&str> = table.columns.iter().map(|c| c.name.as_str()).collect();
                 let mut col_list = vec![pk_col.to_string()];
                 let mut val_list: Vec<String> = vec![subject_id.clone()];
@@ -170,16 +161,24 @@ mod db {
         }
 
         // All other fact types are metamodel facts. Store in cells.
-        for (ft_id, instances) in &pop.facts {
+        for (ft_id, contents) in ast::cells_iter(state) {
             if ft_id == "InstanceFact" { continue; }
-            for inst in instances {
-                let bindings_json = serde_json::to_string(&inst.bindings)
-                    .unwrap_or_else(|e| { eprintln!("Failed to serialize bindings: {}", e); std::process::exit(1); });
-                tx.execute(
-                    "INSERT OR REPLACE INTO cells (name, contents) VALUES (?1, ?2)",
-                    params![format!("fact:{}:{}", ft_id, bindings_json), bindings_json],
-                ).unwrap_or_else(|e| { eprintln!("Failed to store fact in cells: {}", e); std::process::exit(1); });
-                meta_rows += 1;
+            if let Some(facts) = contents.as_seq() {
+                for fact in facts {
+                    let bindings: Vec<(String, String)> = fact.as_seq().map(|pairs| {
+                        pairs.iter().filter_map(|pair| {
+                            let items = pair.as_seq()?;
+                            Some((items.get(0)?.as_atom()?.to_string(), items.get(1)?.as_atom()?.to_string()))
+                        }).collect()
+                    }).unwrap_or_default();
+                    let bindings_json = serde_json::to_string(&bindings)
+                        .unwrap_or_else(|e| { eprintln!("Failed to serialize bindings: {}", e); std::process::exit(1); });
+                    tx.execute(
+                        "INSERT OR REPLACE INTO cells (name, contents) VALUES (?1, ?2)",
+                        params![format!("fact:{}:{}", ft_id, bindings_json), bindings_json],
+                    ).unwrap_or_else(|e| { eprintln!("Failed to store fact in cells: {}", e); std::process::exit(1); });
+                    meta_rows += 1;
+                }
             }
         }
 
@@ -206,10 +205,6 @@ mod db {
             defs.push((name, func));
         }
         defs
-    }
-
-    pub fn load_population(conn: &Connection, tables: &[crate::rmap::TableDef]) -> Population {
-        ast::state_to_population(&load_state(conn, tables))
     }
 
     pub fn load_state(conn: &Connection, tables: &[crate::rmap::TableDef]) -> ast::Object {
@@ -413,7 +408,6 @@ fn cmd_bootstrap(args: &[String]) {
 
     // Convert to Object state and compile.
     let state = parse_forml2::domain_to_state(&merged);
-    let pop = ast::state_to_population(&state);
     let defs = compile::compile_to_defs_state(&state);
     let tables = rmap::rmap(&merged);
 
@@ -428,7 +422,7 @@ fn cmd_bootstrap(args: &[String]) {
     // Store in SQLite using generated DDL from sql:{table} defs.
     let conn = db::open(&db_path);
     db::create_tables(&conn, &defs);
-    db::store_facts(&conn, &pop, &tables);
+    db::store_facts(&conn, &state, &tables);
     db::store_defs(&conn, &defs);
     db::store_table_meta(&conn, &tables);
 
@@ -529,8 +523,7 @@ fn cmd_forward_chain(args: &[String]) {
         println!("No new facts derived");
     } else {
         // Store derived facts back.
-        let new_pop = ast::state_to_population(&new_state);
-        db::store_facts(&conn, &new_pop, &tables);
+        db::store_facts(&conn, &new_state, &tables);
         println!("{}", serde_json::to_string_pretty(&derived).unwrap());
     }
 }
@@ -612,26 +605,26 @@ fn main() {
 
     let ir: Domain = serde_json::from_str(&ir_json)
         .unwrap_or_else(|e| { eprintln!("Failed to parse IR: {}", e); std::process::exit(1); });
-    let pop = parse_forml2::domain_to_population(&ir);
-    let defs = compile::compile_to_defs(&pop);
+    let ir_state = parse_forml2::domain_to_state(&ir);
+    let defs = compile::compile_to_defs_state(&ir_state);
     let def_map: std::collections::HashMap<String, ast::Func> =
         defs.iter().map(|(n, f)| (n.clone(), f.clone())).collect();
 
     // -- Synthesize mode --
     if let Some(noun_name) = synthesize_noun {
-        let result = evaluate::synthesize_from_pop(&pop, &noun_name, synthesize_depth);
+        let result = evaluate::synthesize_from_state(&ir_state, &noun_name, synthesize_depth);
         println!("{}", serde_json::to_string_pretty(&result).unwrap());
         std::process::exit(0);
     }
 
     // -- Forward chain mode --
     if do_forward_chain {
-        let mut population = load_population(population_path, true);
+        let pop_state = load_state(population_path, true);
         let derivation_defs: Vec<(&str, &ast::Func)> = defs.iter()
             .filter(|(n, _)| n.starts_with("derivation:"))
             .map(|(n, f)| (n.as_str(), f))
             .collect();
-        let derived = evaluate::forward_chain_defs(&derivation_defs, &mut population);
+        let (_new_state, derived) = evaluate::forward_chain_defs_state(&derivation_defs, &pop_state);
         if derived.is_empty() {
             println!("No new facts derived");
         } else {
@@ -653,8 +646,8 @@ fn main() {
         input.trim().to_string()
     };
 
-    let population = load_population(population_path, false);
-    let ctx_obj = ast::encode_eval_context(&response_text, None, &population);
+    let pop_state = load_state(population_path, false);
+    let ctx_obj = ast::encode_eval_context_state(&response_text, None, &pop_state);
     let violations: Vec<types::Violation> = defs.iter()
         .filter(|(n, _)| n.starts_with("constraint:"))
         .flat_map(|(name, func)| {
@@ -677,19 +670,18 @@ fn main() {
 }
 
 #[cfg(not(feature = "local"))]
-fn load_population(path: Option<String>, required: bool) -> Population {
+fn load_state(path: Option<String>, required: bool) -> ast::Object {
     match path {
         Some(p) => {
             let json = std::fs::read_to_string(&p)
-                .unwrap_or_else(|e| { eprintln!("Failed to read population file: {}", e); std::process::exit(1); });
-            serde_json::from_str(&json)
-                .unwrap_or_else(|e| { eprintln!("Failed to parse population: {}", e); std::process::exit(1); })
+                .unwrap_or_else(|e| { eprintln!("Failed to read state file: {}", e); std::process::exit(1); });
+            ast::Object::parse(&json)
         }
         None if required => {
             eprintln!("--population <path> is required for this mode");
             std::process::exit(1);
         }
-        None => Population { facts: std::collections::HashMap::new() },
+        None => ast::Object::phi(),
     }
 }
 

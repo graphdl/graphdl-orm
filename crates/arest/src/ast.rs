@@ -141,68 +141,38 @@ impl fmt::Display for Object {
     }
 }
 
-// ── Population ↔ Object encoding ─────────────────────────────────────
-// The population is the data. It encodes as an Object for evaluation.
-// Facts become sequences. The population becomes a sequence of tagged sequences.
+// ── State encoding for evaluation ────────────────────────────────────
+// State = Object (sequence of cells). No Population struct.
 
-use crate::types::{Population, FactInstance, Violation};
+use crate::types::Violation;
 
 /// Encode an evaluation context as a single Object.
-/// Structure: <response_text, sender_identity, population>
-pub fn encode_eval_context(text: &str, sender: Option<&str>, population: &Population) -> Object {
+/// Structure: <response_text, sender_identity, population_as_object>
+pub fn encode_eval_context_state(text: &str, sender: Option<&str>, state: &Object) -> Object {
     let response_obj = Object::atom(text);
     let sender_obj = match sender {
         Some(s) => Object::atom(s),
         None => Object::phi(),
     };
-    let pop_obj = encode_population(population);
+    let pop_obj = encode_state(state);
     Object::seq(vec![response_obj, sender_obj, pop_obj])
 }
 
-/// Encode a population as an Object.
-pub fn encode_population(population: &Population) -> Object {
-    let fact_types: Vec<Object> = population.facts.iter().map(|(ft_id, facts)| {
-        let fact_objs: Vec<Object> = facts.iter().map(|fact| {
-            let bindings: Vec<Object> = fact.bindings.iter().map(|(noun, val)| {
-                Object::seq(vec![Object::atom(noun), Object::atom(val)])
-            }).collect();
-            Object::Seq(bindings)
-        }).collect();
+/// Encode an Object state in the flat format expected by constraint evaluation.
+/// Each cell becomes <ft_id, <fact_bindings...>> where each fact is <<k,v>, ...>.
+pub fn encode_state(state: &Object) -> Object {
+    let fact_types: Vec<Object> = cells_iter(state).into_iter().map(|(ft_id, contents)| {
+        let fact_objs: Vec<Object> = contents.as_seq().map(|facts| {
+            facts.iter().map(|fact| {
+                let bindings: Vec<Object> = fact.as_seq().map(|pairs| {
+                    pairs.iter().map(|pair: &Object| pair.clone()).collect::<Vec<Object>>()
+                }).unwrap_or_default();
+                Object::Seq(bindings)
+            }).collect::<Vec<Object>>()
+        }).unwrap_or_default();
         Object::seq(vec![Object::atom(ft_id), Object::Seq(fact_objs)])
     }).collect();
     Object::Seq(fact_types)
-}
-
-/// Convert a Population struct to an Object state (sequence of cells).
-/// Each fact type becomes a cell: <CELL, fact_type_id, <fact_tuples...>>
-/// Each fact tuple is a named-tuple: <<role_name, value>, ...>
-pub fn population_to_state(population: &Population) -> Object {
-    let cells: Vec<Object> = population.facts.iter().map(|(ft_id, facts)| {
-        let fact_objs: Vec<Object> = facts.iter().map(|fact| {
-            fact_from_pairs(&fact.bindings.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect::<Vec<_>>())
-        }).collect();
-        cell(ft_id, Object::Seq(fact_objs))
-    }).collect();
-    Object::Seq(cells)
-}
-
-/// Convert an Object state (sequence of cells) back to a Population struct.
-/// Inverse of population_to_state.
-pub fn state_to_population(state: &Object) -> Population {
-    let mut facts: std::collections::HashMap<String, Vec<FactInstance>> = std::collections::HashMap::new();
-    for (name, contents) in cells_iter(state) {
-        let instances: Vec<FactInstance> = contents.as_seq().map(|fact_objs| {
-            fact_objs.iter().filter_map(|fact_obj| {
-                let bindings: Vec<(String, String)> = fact_obj.as_seq()?.iter().filter_map(|pair| {
-                    let items = pair.as_seq()?;
-                    Some((items.get(0)?.as_atom()?.to_string(), items.get(1)?.as_atom()?.to_string()))
-                }).collect();
-                Some(FactInstance { fact_type_id: name.to_string(), bindings })
-            }).collect()
-        }).unwrap_or_default();
-        facts.insert(name.to_string(), instances);
-    }
-    Population { facts }
 }
 
 /// Decode a violation Object back to a Violation struct.
@@ -2839,40 +2809,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
-    fn population_state_round_trip() {
-        use crate::types::{Population, FactInstance};
-        let mut facts = HashMap::new();
-        facts.insert("Noun".to_string(), vec![
-            FactInstance {
-                fact_type_id: "Noun".to_string(),
-                bindings: vec![("name".to_string(), "Order".to_string()), ("objectType".to_string(), "entity".to_string())],
-            },
-            FactInstance {
-                fact_type_id: "Noun".to_string(),
-                bindings: vec![("name".to_string(), "Customer".to_string()), ("objectType".to_string(), "entity".to_string())],
-            },
-        ]);
-        facts.insert("GraphSchema".to_string(), vec![
-            FactInstance {
-                fact_type_id: "GraphSchema".to_string(),
-                bindings: vec![("id".to_string(), "Order has customer".to_string()), ("reading".to_string(), "Order has customer".to_string())],
-            },
-        ]);
-        let pop = Population { facts };
-        let state = population_to_state(&pop);
-        let pop2 = state_to_population(&state);
-        // Same fact types present
-        assert_eq!(pop.facts.len(), pop2.facts.len());
-        for (ft_id, instances) in &pop.facts {
-            let instances2 = pop2.facts.get(ft_id).unwrap();
-            assert_eq!(instances.len(), instances2.len());
-            for (a, b) in instances.iter().zip(instances2.iter()) {
-                assert_eq!(a.bindings, b.bindings);
-            }
-        }
-    }
-
     fn cell_push_preserves_other_cells() {
         let state = cell_push("A", Object::atom("1"), &Object::phi());
         let state = cell_push("B", Object::atom("2"), &state);

@@ -194,47 +194,8 @@ pub struct GuardDef {
 /// Population P is ↑FILE:D. DEFS are cells in D.
 pub type State = crate::ast::Object;
 
-/// A snapshot of facts for evaluation. Keys are fact type IDs.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Population {
-    pub facts: HashMap<String, Vec<FactInstance>>,
-}
-
-/// A single fact instance — binds references to roles in a fact type.
-/// Part of Codd's named set (base facts) or expressible set (derived facts).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct FactInstance {
-    pub fact_type_id: String,
-    /// Vec of (role_noun_name, reference_value)
-    pub bindings: Vec<(String, String)>,
-}
-
-/// Extended fact instance with provenance tracking.
-/// Distinguishes Codd's named set (base) from expressible set (derived).
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ProvenancedFact {
-    pub fact_type_id: String,
-    pub bindings: Vec<(String, String)>,
-    /// true if derived by forward chaining, false if asserted by command
-    pub derived: bool,
-    /// ID of the derivation rule that produced this fact (if derived)
-    pub derived_by: Option<String>,
-}
-
-impl Population {
-    /// Track which fact type IDs contain derived facts.
-    /// Base facts (named set) are those not in this set.
-    /// Derived facts (expressible set) are those produced by forward chaining.
-    pub fn derived_fact_types(&self) -> std::collections::HashSet<String> {
-        // By convention, derived fact types are tracked externally
-        // (by the forward chaining result). This method is a placeholder
-        // for when provenance tracking is integrated into Population.
-        std::collections::HashSet::new()
-    }
-}
+// Population and FactInstance structs deleted.
+// State = Object (sequence of cells). Use ast helpers: fetch_or_phi, cell_push, etc.
 
 /// A constraint violation.
 #[derive(Debug, Clone, Serialize)]

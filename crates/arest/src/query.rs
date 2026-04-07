@@ -12,24 +12,12 @@
 //
 // No Func::Native. No manual iteration. Pure AST throughout.
 
-use crate::types::Population;
 use crate::ast::{self, Func, Object};
 use crate::compile::CompiledSchema;
-#[cfg(test)]
-use crate::types::FactInstance;
 
 // ── Partial application as query ────────────────────────────────────
 // Query = partial application of a graph schema.
 // Given a schema and known bindings, return matching resources from population.
-
-/// Convert a population's facts for a given fact type into an Object sequence
-/// suitable for AST operations.
-///
-/// Each fact becomes a sequence of its bindings (ordered by the schema's role_names).
-/// The population becomes a sequence of these fact sequences.
-pub(crate) fn population_to_object(population: &Population, schema: &CompiledSchema) -> Object {
-    state_to_object(&ast::population_to_state(population), schema)
-}
 
 /// Convert facts from an Object state for a given fact type into a positional Object sequence.
 /// Each fact becomes a sequence ordered by the schema's role_names.
@@ -94,24 +82,14 @@ pub fn build_query(target_role: usize, filter_bindings: &[(usize, &str)]) -> Fun
     )
 }
 
-/// Query a population using partial application of a graph schema.
+/// Query an Object state using partial application of a graph schema.
 ///
 /// Given a compiled schema, a role index to extract (1-indexed), and
 /// filter bindings (role_index, value), returns matching values.
 ///
-/// This is: α(Sel(target)) ∘ Filter(predicate) applied to the population.
+/// This is: α(Sel(target)) ∘ Filter(predicate) applied to the state.
 /// Pure AST — no Native closures, no manual iteration.
 pub(crate) fn query_with_ast(
-    population: &Population,
-    schema: &CompiledSchema,
-    target_role: usize,
-    filter_bindings: &[(usize, &str)],
-) -> Vec<String> {
-    query_with_ast_state(&ast::population_to_state(population), schema, target_role, filter_bindings)
-}
-
-/// Query an Object state using partial application of a graph schema.
-pub(crate) fn query_with_ast_state(
     state: &Object,
     schema: &CompiledSchema,
     target_role: usize,
@@ -134,7 +112,6 @@ pub(crate) fn query_with_ast_state(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
     // ── AST-based query tests (partial application) ─────────────
 
@@ -150,94 +127,56 @@ mod tests {
         }
     }
 
+    fn state_with_facts(ft_id: &str, pairs_list: &[&[(&str, &str)]]) -> ast::Object {
+        let mut state = ast::Object::phi();
+        for pairs in pairs_list {
+            state = ast::cell_push(ft_id, ast::fact_from_pairs(pairs), &state);
+        }
+        state
+    }
+
     #[test]
     fn ast_query_filters_by_single_binding() {
         let schema = make_schema("ft1", vec!["User", "Organization"]);
-        let mut facts = HashMap::new();
-        facts.insert("ft1".to_string(), vec![
-            FactInstance {
-                fact_type_id: "ft1".to_string(),
-                bindings: vec![
-                    ("User".to_string(), "alice".to_string()),
-                    ("Organization".to_string(), "org-1".to_string()),
-                ],
-            },
-            FactInstance {
-                fact_type_id: "ft1".to_string(),
-                bindings: vec![
-                    ("User".to_string(), "bob".to_string()),
-                    ("Organization".to_string(), "org-2".to_string()),
-                ],
-            },
-            FactInstance {
-                fact_type_id: "ft1".to_string(),
-                bindings: vec![
-                    ("User".to_string(), "alice".to_string()),
-                    ("Organization".to_string(), "org-3".to_string()),
-                ],
-            },
+        let state = state_with_facts("ft1", &[
+            &[("User", "alice"), ("Organization", "org-1")],
+            &[("User", "bob"), ("Organization", "org-2")],
+            &[("User", "alice"), ("Organization", "org-3")],
         ]);
-        let pop = Population { facts };
 
-        // Query: find organizations where User = "alice" (role 1 = "alice", extract role 2)
-        let results = query_with_ast(&pop, &schema, 2, &[(1, "alice")]);
+        let results = query_with_ast(&state, &schema, 2, &[(1, "alice")]);
         assert_eq!(results, vec!["org-1", "org-3"]);
     }
 
     #[test]
     fn ast_query_filters_by_multiple_bindings() {
         let schema = make_schema("ft1", vec!["User", "Role", "Organization"]);
-        let mut facts = HashMap::new();
-        facts.insert("ft1".to_string(), vec![
-            FactInstance {
-                fact_type_id: "ft1".to_string(),
-                bindings: vec![
-                    ("User".to_string(), "alice".to_string()),
-                    ("Role".to_string(), "owner".to_string()),
-                    ("Organization".to_string(), "org-1".to_string()),
-                ],
-            },
-            FactInstance {
-                fact_type_id: "ft1".to_string(),
-                bindings: vec![
-                    ("User".to_string(), "alice".to_string()),
-                    ("Role".to_string(), "member".to_string()),
-                    ("Organization".to_string(), "org-2".to_string()),
-                ],
-            },
+        let state = state_with_facts("ft1", &[
+            &[("User", "alice"), ("Role", "owner"), ("Organization", "org-1")],
+            &[("User", "alice"), ("Role", "member"), ("Organization", "org-2")],
         ]);
-        let pop = Population { facts };
 
-        // Query: find orgs where User="alice" AND Role="owner"
-        let results = query_with_ast(&pop, &schema, 3, &[(1, "alice"), (2, "owner")]);
+        let results = query_with_ast(&state, &schema, 3, &[(1, "alice"), (2, "owner")]);
         assert_eq!(results, vec!["org-1"]);
     }
 
     #[test]
     fn ast_query_no_matches_returns_empty() {
         let schema = make_schema("ft1", vec!["A", "B"]);
-        let pop = Population { facts: HashMap::new() };
-        let results = query_with_ast(&pop, &schema, 2, &[(1, "x")]);
+        let state = ast::Object::phi();
+        let results = query_with_ast(&state, &schema, 2, &[(1, "x")]);
         assert!(results.is_empty());
     }
 
     #[test]
     fn ast_query_no_filter_returns_all() {
         let schema = make_schema("ft1", vec!["X", "Y"]);
-        let mut facts = HashMap::new();
-        facts.insert("ft1".to_string(), vec![
-            FactInstance {
-                fact_type_id: "ft1".to_string(),
-                bindings: vec![("X".to_string(), "a".to_string()), ("Y".to_string(), "1".to_string())],
-            },
-            FactInstance {
-                fact_type_id: "ft1".to_string(),
-                bindings: vec![("X".to_string(), "b".to_string()), ("Y".to_string(), "2".to_string())],
-            },
+        let state = state_with_facts("ft1", &[
+            &[("X", "a"), ("Y", "1")],
+            &[("X", "b"), ("Y", "2")],
         ]);
-        let pop = Population { facts };
 
-        let results = query_with_ast(&pop, &schema, 1, &[]);
+        let results = query_with_ast(&state, &schema, 1, &[]);
         assert_eq!(results, vec!["a", "b"]);
     }
 

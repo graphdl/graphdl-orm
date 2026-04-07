@@ -394,14 +394,9 @@ fn derive_state_machines_from_facts(facts: &[GeneralInstanceFact]) -> HashMap<St
 // The match on kind happens here, once. After this, everything is Func.
 
 /// Compile an Object state into named FFP definitions.
-pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> {
-    compile_to_defs(&crate::ast::state_to_population(state))
-}
-
-/// Compile a Population into named FFP definitions.
 /// Readings in, Def name = func out. Nothing else.
-pub fn compile_to_defs(pop: &Population) -> Vec<(String, Func)> {
-    let domain = population_to_domain(pop);
+pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> {
+    let domain = state_to_domain(state);
     let model = compile(&domain);
     let mut defs: Vec<(String, Func)> = Vec::new();
 
@@ -769,21 +764,18 @@ pub fn compile_to_defs(pop: &Population) -> Vec<(String, Func)> {
 
 /// Reconstruct a Domain from an Object state by querying metamodel cells.
 pub fn state_to_domain(state: &crate::ast::Object) -> Domain {
-    population_to_domain(&crate::ast::state_to_population(state))
-}
-
-/// Reconstruct a Domain from a Population by querying metamodel fact types.
-pub fn population_to_domain(pop: &Population) -> Domain {
+    use crate::ast::{fetch_or_phi, binding, cells_iter};
     let mut domain = Domain::default();
 
     // Query Noun facts
-    if let Some(noun_facts) = pop.facts.get("Noun") {
+    let noun_cell = fetch_or_phi("Noun", state);
+    if let Some(noun_facts) = noun_cell.as_seq() {
         for f in noun_facts {
-            let name = f.bindings.iter().find(|(k, _)| k == "name").map(|(_, v)| v.clone()).unwrap_or_default();
-            let obj_type = f.bindings.iter().find(|(k, _)| k == "objectType").map(|(_, v)| v.clone()).unwrap_or("entity".to_string());
-            let super_type = f.bindings.iter().find(|(k, _)| k == "superType").map(|(_, v)| v.clone());
-            let ref_scheme = f.bindings.iter().find(|(k, _)| k == "referenceScheme").map(|(_, v)| v.split(',').map(|s| s.to_string()).collect::<Vec<_>>());
-            let enum_vals = f.bindings.iter().find(|(k, _)| k == "enumValues").map(|(_, v)| v.split(',').map(|s| s.to_string()).collect::<Vec<_>>());
+            let name = binding(f, "name").unwrap_or("").to_string();
+            let obj_type = binding(f, "objectType").unwrap_or("entity").to_string();
+            let super_type = binding(f, "superType").map(|s| s.to_string());
+            let ref_scheme = binding(f, "referenceScheme").map(|v| v.split(',').map(|s| s.to_string()).collect::<Vec<_>>());
+            let enum_vals = binding(f, "enumValues").map(|v| v.split(',').map(|s| s.to_string()).collect::<Vec<_>>());
 
             domain.nouns.insert(name.clone(), NounDef { object_type: obj_type, world_assumption: WorldAssumption::default() });
             if let Some(st) = super_type { domain.subtypes.insert(name.clone(), st); }
@@ -793,18 +785,20 @@ pub fn population_to_domain(pop: &Population) -> Domain {
     }
 
     // Query GraphSchema + Role facts
-    if let Some(schema_facts) = pop.facts.get("GraphSchema") {
+    let schema_cell = fetch_or_phi("GraphSchema", state);
+    let role_cell = fetch_or_phi("Role", state);
+    if let Some(schema_facts) = schema_cell.as_seq() {
         for f in schema_facts {
-            let id = f.bindings.iter().find(|(k, _)| k == "id").map(|(_, v)| v.clone()).unwrap_or_default();
-            let reading = f.bindings.iter().find(|(k, _)| k == "reading").map(|(_, v)| v.clone()).unwrap_or_default();
+            let id = binding(f, "id").unwrap_or("").to_string();
+            let reading = binding(f, "reading").unwrap_or("").to_string();
 
             // Find roles for this schema
-            let roles: Vec<RoleDef> = pop.facts.get("Role")
+            let roles: Vec<RoleDef> = role_cell.as_seq()
                 .map(|role_facts| role_facts.iter()
-                    .filter(|r| r.bindings.iter().any(|(k, v)| k == "graphSchema" && v == &id))
+                    .filter(|r| binding(r, "graphSchema") == Some(&id))
                     .map(|r| {
-                        let noun_name = r.bindings.iter().find(|(k, _)| k == "nounName").map(|(_, v)| v.clone()).unwrap_or_default();
-                        let position = r.bindings.iter().find(|(k, _)| k == "position").and_then(|(_, v)| v.parse().ok()).unwrap_or(0);
+                        let noun_name = binding(r, "nounName").unwrap_or("").to_string();
+                        let position = binding(r, "position").and_then(|v| v.parse().ok()).unwrap_or(0);
                         RoleDef { noun_name, role_index: position }
                     })
                     .collect()
@@ -821,9 +815,10 @@ pub fn population_to_domain(pop: &Population) -> Domain {
     }
 
     // Query Constraint facts
-    if let Some(constraint_facts) = pop.facts.get("Constraint") {
+    let constraint_cell = fetch_or_phi("Constraint", state);
+    if let Some(constraint_facts) = constraint_cell.as_seq() {
         for f in constraint_facts {
-            let get = |key: &str| f.bindings.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
+            let get = |key: &str| binding(f, key).map(|s| s.to_string());
             let mut spans = vec![];
             for i in 0..4 {
                 let ft_key = format!("span{}_factTypeId", i);
@@ -853,9 +848,10 @@ pub fn population_to_domain(pop: &Population) -> Domain {
     }
 
     // Query DerivationRule facts
-    if let Some(rule_facts) = pop.facts.get("DerivationRule") {
+    let rule_cell = fetch_or_phi("DerivationRule", state);
+    if let Some(rule_facts) = rule_cell.as_seq() {
         for f in rule_facts {
-            let get = |key: &str| f.bindings.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone()).unwrap_or_default();
+            let get = |key: &str| binding(f, key).unwrap_or("").to_string();
             domain.derivation_rules.push(DerivationRuleDef {
                 id: get("id"),
                 text: get("text"),
@@ -870,9 +866,10 @@ pub fn population_to_domain(pop: &Population) -> Domain {
     }
 
     // Query InstanceFact facts
-    if let Some(inst_facts) = pop.facts.get("InstanceFact") {
+    let inst_cell = fetch_or_phi("InstanceFact", state);
+    if let Some(inst_facts) = inst_cell.as_seq() {
         for f in inst_facts {
-            let get = |key: &str| f.bindings.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone()).unwrap_or_default();
+            let get = |key: &str| binding(f, key).unwrap_or("").to_string();
             domain.general_instance_facts.push(GeneralInstanceFact {
                 subject_noun: get("subjectNoun"),
                 subject_value: get("subjectValue"),
@@ -3751,22 +3748,13 @@ mod schema_tests {
         let model = compile(&ir);
         let constraint = &model.constraints[0];
 
-        // Create a population WITH a UC violation: Alice has two names
-        let mut facts = HashMap::new();
-        facts.insert("ft1".to_string(), vec![
-            FactInstance {
-                fact_type_id: "ft1".to_string(),
-                bindings: vec![("Person".to_string(), "Alice".to_string()), ("Name".to_string(), "Alice Smith".to_string())],
-            },
-            FactInstance {
-                fact_type_id: "ft1".to_string(),
-                bindings: vec![("Person".to_string(), "Alice".to_string()), ("Name".to_string(), "Alice Jones".to_string())],
-            },
-        ]);
-        let population = Population { facts };
+        // Create state WITH a UC violation: Alice has two names
+        let mut state = crate::ast::Object::phi();
+        state = crate::ast::cell_push("ft1", crate::ast::fact_from_pairs(&[("Person", "Alice"), ("Name", "Alice Smith")]), &state);
+        state = crate::ast::cell_push("ft1", crate::ast::fact_from_pairs(&[("Person", "Alice"), ("Name", "Alice Jones")]), &state);
 
         // Evaluate via AST: apply(func, encoded_context)
-        let ctx_obj = crate::ast::encode_eval_context("", None, &population);
+        let ctx_obj = crate::ast::encode_eval_context_state("", None, &state);
         let defs = HashMap::new();
         let result = crate::ast::apply(&constraint.func, &ctx_obj, &defs);
 
@@ -3821,20 +3809,11 @@ mod schema_tests {
         let constraint = &model.constraints[0];
 
         // No violation: each person has exactly one name
-        let mut facts = HashMap::new();
-        facts.insert("ft1".to_string(), vec![
-            FactInstance {
-                fact_type_id: "ft1".to_string(),
-                bindings: vec![("Person".to_string(), "Alice".to_string()), ("Name".to_string(), "Alice Smith".to_string())],
-            },
-            FactInstance {
-                fact_type_id: "ft1".to_string(),
-                bindings: vec![("Person".to_string(), "Bob".to_string()), ("Name".to_string(), "Bob Jones".to_string())],
-            },
-        ]);
-        let population = Population { facts };
+        let mut state = crate::ast::Object::phi();
+        state = crate::ast::cell_push("ft1", crate::ast::fact_from_pairs(&[("Person", "Alice"), ("Name", "Alice Smith")]), &state);
+        state = crate::ast::cell_push("ft1", crate::ast::fact_from_pairs(&[("Person", "Bob"), ("Name", "Bob Jones")]), &state);
 
-        let ctx_obj = crate::ast::encode_eval_context("", None, &population);
+        let ctx_obj = crate::ast::encode_eval_context_state("", None, &state);
         let defs = HashMap::new();
         let result = crate::ast::apply(&constraint.func, &ctx_obj, &defs);
 

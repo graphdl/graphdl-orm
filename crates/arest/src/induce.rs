@@ -1,6 +1,6 @@
 // crates/arest/src/induce.rs
 //
-// Induction engine: given a population of facts, infer the constraints
+// Induction engine: given a state of facts, infer the constraints
 // and derivation rules that govern it.
 //
 // This is the inverse of evaluation -- instead of checking facts against
@@ -17,6 +17,7 @@
 
 use std::collections::{HashMap, HashSet};
 use crate::types::*;
+use crate::ast::{self, Object};
 
 /// An induced constraint -- discovered from population analysis
 #[derive(Debug, Clone, serde::Serialize)]
@@ -59,24 +60,33 @@ pub struct PopulationStats {
 }
 
 /// Induce constraints and rules from an Object state and its schema.
-pub fn induce_state(ir: &Domain, state: &crate::ast::Object) -> InductionResult {
-    induce(ir, &crate::ast::state_to_population(state))
-}
-
-/// Induce constraints and rules from a population and its schema.
-pub fn induce(ir: &Domain, population: &Population) -> InductionResult {
+pub fn induce_state(ir: &Domain, state: &Object) -> InductionResult {
     let mut constraints = Vec::new();
     let mut rules = Vec::new();
 
-    // Gather population statistics
-    let total_facts: usize = population.facts.values().map(|f| f.len()).sum();
-    let entities: HashSet<String> = population.facts.values()
-        .flat_map(|facts| facts.iter().flat_map(|f| f.bindings.iter().map(|(_, v)| v.clone())))
+    // Gather all cells (fact_type_id -> facts)
+    let cells: Vec<(String, Vec<Vec<(String, String)>>)> = ast::cells_iter(state).into_iter().map(|(ft_id, contents)| {
+        let facts: Vec<Vec<(String, String)>> = contents.as_seq().map(|fact_objs| {
+            fact_objs.iter().map(|fact| {
+                fact.as_seq().map(|pairs| {
+                    pairs.iter().filter_map(|pair| {
+                        let items = pair.as_seq()?;
+                        Some((items.get(0)?.as_atom()?.to_string(), items.get(1)?.as_atom()?.to_string()))
+                    }).collect::<Vec<(String, String)>>()
+                }).unwrap_or_default()
+            }).collect()
+        }).unwrap_or_default();
+        (ft_id.to_string(), facts)
+    }).collect();
+
+    // Population statistics
+    let total_facts: usize = cells.iter().map(|(_, facts)| facts.len()).sum();
+    let entities: HashSet<String> = cells.iter()
+        .flat_map(|(_, facts)| facts.iter().flat_map(|f| f.iter().map(|(_, v)| v.clone())))
         .collect();
 
     // -- UC Induction -------------------------------------------------
-    // For each fact type, check which role combinations have unique values.
-    for (ft_id, facts) in &population.facts {
+    for (ft_id, facts) in &cells {
         if facts.is_empty() { continue; }
         let ft = match ir.fact_types.get(ft_id) {
             Some(ft) => ft,
@@ -88,7 +98,7 @@ pub fn induce(ir: &Domain, population: &Population) -> InductionResult {
         for role_idx in 0..arity {
             let mut values: HashMap<String, usize> = HashMap::new();
             for fact in facts {
-                if let Some((_, val)) = fact.bindings.get(role_idx) {
+                if let Some((_, val)) = fact.get(role_idx) {
                     *values.entry(val.clone()).or_insert(0) += 1;
                 }
             }
@@ -107,7 +117,7 @@ pub fn induce(ir: &Domain, population: &Population) -> InductionResult {
                 });
             }
 
-            // FC induction: check if values occur a fixed number of times
+            // FC induction
             let counts: HashSet<usize> = values.values().cloned().collect();
             if counts.len() == 1 && facts.len() > 2 {
                 let n = *counts.iter().next().unwrap();
@@ -134,15 +144,14 @@ pub fn induce(ir: &Domain, population: &Population) -> InductionResult {
                     let mut tuples: HashSet<(String, String)> = HashSet::new();
                     let mut is_unique = true;
                     for fact in facts {
-                        let a = fact.bindings.get(i).map(|(_, v)| v.clone()).unwrap_or_default();
-                        let b = fact.bindings.get(j).map(|(_, v)| v.clone()).unwrap_or_default();
+                        let a = fact.get(i).map(|(_, v)| v.clone()).unwrap_or_default();
+                        let b = fact.get(j).map(|(_, v)| v.clone()).unwrap_or_default();
                         if !tuples.insert((a, b)) {
                             is_unique = false;
                             break;
                         }
                     }
                     if is_unique && facts.len() > 1 {
-                        // Only report compound UC if neither role is individually unique
                         let role_i_unique = constraints.iter().any(|c|
                             c.kind == "UC" && c.fact_type_id == *ft_id && c.roles == vec![i]
                         );
@@ -171,25 +180,21 @@ pub fn induce(ir: &Domain, population: &Population) -> InductionResult {
     }
 
     // -- MC Induction -------------------------------------------------
-    // For each entity that participates in ANY fact type, check if it
-    // participates in ALL instances of other fact types.
-    for (ft_id, facts) in &population.facts {
+    for (ft_id, facts) in &cells {
         let ft = match ir.fact_types.get(ft_id) {
             Some(ft) => ft,
             None => continue,
         };
         if ft.roles.len() < 2 { continue; }
 
-        // Collect all entity values for the first role
         let role0_noun = &ft.roles[0].noun_name;
         let role0_values: HashSet<String> = facts.iter()
-            .filter_map(|f| f.bindings.first().map(|(_, v)| v.clone()))
+            .filter_map(|f| f.first().map(|(_, v)| v.clone()))
             .collect();
 
-        // Check if ALL known instances of this noun participate in this fact type
-        let all_instances: HashSet<String> = population.facts.values()
-            .flat_map(|fts| fts.iter().flat_map(|f|
-                f.bindings.iter()
+        let all_instances: HashSet<String> = cells.iter()
+            .flat_map(|(_, fts)| fts.iter().flat_map(|f|
+                f.iter()
                     .filter(|(n, _)| n == role0_noun)
                     .map(|(_, v)| v.clone())
             ))
@@ -211,14 +216,12 @@ pub fn induce(ir: &Domain, population: &Population) -> InductionResult {
     }
 
     // -- SS Induction -------------------------------------------------
-    // Check if one fact type's entity population is a subset of another's.
-    let ft_entities: HashMap<String, HashSet<String>> = population.facts.iter()
+    let ft_entities: HashMap<String, HashSet<String>> = cells.iter()
         .filter_map(|(ft_id, facts)| {
             let ft = ir.fact_types.get(ft_id)?;
             if ft.roles.is_empty() { return None; }
-            let _noun = &ft.roles[0].noun_name;
             let vals: HashSet<String> = facts.iter()
-                .filter_map(|f| f.bindings.first().map(|(_, v)| v.clone()))
+                .filter_map(|f| f.first().map(|(_, v)| v.clone()))
                 .collect();
             Some((ft_id.clone(), vals))
         })
@@ -249,48 +252,42 @@ pub fn induce(ir: &Domain, population: &Population) -> InductionResult {
     }
 
     // -- Derivation Rule Induction ------------------------------------
-    // Check if any fact type's population can be fully explained by
-    // joining other fact types.
-    for (ft_id, facts) in &population.facts {
+    for (ft_id, facts) in &cells {
         let ft = match ir.fact_types.get(ft_id) {
             Some(ft) => ft,
             None => continue,
         };
         if ft.roles.len() < 2 || facts.len() < 2 { continue; }
 
-        // For each pair of other fact types, check if joining them
-        // on a common noun produces this fact type's population
-        for (other_a_id, other_a_facts) in &population.facts {
+        for (other_a_id, other_a_facts) in &cells {
             if other_a_id == ft_id { continue; }
             let other_a_ft = match ir.fact_types.get(other_a_id) {
                 Some(f) => f,
                 None => continue,
             };
 
-            for (other_b_id, other_b_facts) in &population.facts {
+            for (other_b_id, other_b_facts) in &cells {
                 if other_b_id == ft_id || other_b_id == other_a_id { continue; }
                 let other_b_ft = match ir.fact_types.get(other_b_id) {
                     Some(f) => f,
                     None => continue,
                 };
 
-                // Find common noun between other_a and other_b
                 let a_nouns: HashSet<&str> = other_a_ft.roles.iter().map(|r| r.noun_name.as_str()).collect();
                 let b_nouns: HashSet<&str> = other_b_ft.roles.iter().map(|r| r.noun_name.as_str()).collect();
                 let common: Vec<&str> = a_nouns.intersection(&b_nouns).cloned().collect();
 
                 if common.is_empty() { continue; }
 
-                // Join on common noun -- does the result match our target?
                 let join_noun = common[0];
                 let mut joined: HashSet<(String, String)> = HashSet::new();
                 for a_fact in other_a_facts {
-                    let a_join_val = a_fact.bindings.iter().find(|(n, _)| n == join_noun).map(|(_, v)| v);
-                    let a_other_val = a_fact.bindings.iter().find(|(n, _)| n != join_noun).map(|(_, v)| v);
+                    let a_join_val = a_fact.iter().find(|(n, _)| n == join_noun).map(|(_, v)| v);
+                    let a_other_val = a_fact.iter().find(|(n, _)| n != join_noun).map(|(_, v)| v);
                     if let (Some(jv), Some(av)) = (a_join_val, a_other_val) {
                         for b_fact in other_b_facts {
-                            let b_join_val = b_fact.bindings.iter().find(|(n, _)| n == join_noun).map(|(_, v)| v);
-                            let b_other_val = b_fact.bindings.iter().find(|(n, _)| n != join_noun).map(|(_, v)| v);
+                            let b_join_val = b_fact.iter().find(|(n, _)| n == join_noun).map(|(_, v)| v);
+                            let b_other_val = b_fact.iter().find(|(n, _)| n != join_noun).map(|(_, v)| v);
                             if let (Some(bjv), Some(bv)) = (b_join_val, b_other_val) {
                                 if jv == bjv {
                                     joined.insert((av.clone(), bv.clone()));
@@ -300,10 +297,9 @@ pub fn induce(ir: &Domain, population: &Population) -> InductionResult {
                     }
                 }
 
-                // Check if joined results match the target fact type
                 let target: HashSet<(String, String)> = facts.iter()
-                    .filter(|f| f.bindings.len() >= 2)
-                    .map(|f| (f.bindings[0].1.clone(), f.bindings[1].1.clone()))
+                    .filter(|f| f.len() >= 2)
+                    .map(|f| (f[0].1.clone(), f[1].1.clone()))
                     .collect();
 
                 if !joined.is_empty() && joined == target {
@@ -330,7 +326,7 @@ pub fn induce(ir: &Domain, population: &Population) -> InductionResult {
         constraints,
         rules,
         population_stats: PopulationStats {
-            fact_type_count: population.facts.len(),
+            fact_type_count: cells.len(),
             total_facts,
             entity_count: entities.len(),
         },
