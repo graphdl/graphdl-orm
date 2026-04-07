@@ -440,7 +440,6 @@ fn apply_load_readings(
 ) -> CommandResult {
     match crate::parse_forml2::parse_markdown(markdown) {
         Ok(ir) => {
-            let _model = crate::compile::compile(&ir);
             let mut data = std::collections::HashMap::new();
             data.insert("domain".to_string(), domain.to_string());
             data.insert("nouns".to_string(), ir.nouns.len().to_string());
