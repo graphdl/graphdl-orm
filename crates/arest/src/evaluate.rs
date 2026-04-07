@@ -14,7 +14,7 @@ use crate::ast;
 /// Run a state machine via AST reduction.
 /// The machine's func is a transition function: <state, event> -> next_state.
 /// Guards are compiled into the Condition predicates.
-pub fn run_machine_ast(
+pub(crate) fn run_machine_ast(
     machine: &crate::compile::CompiledStateMachine,
     events: &[&str],
 ) -> String {
