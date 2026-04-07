@@ -393,6 +393,11 @@ fn derive_state_machines_from_facts(facts: &[GeneralInstanceFact]) -> HashMap<St
 // -- Compilation ----------------------------------------------------
 // The match on kind happens here, once. After this, everything is Func.
 
+/// Compile an Object state into named FFP definitions.
+pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> {
+    compile_to_defs(&crate::ast::state_to_population(state))
+}
+
 /// Compile a Population into named FFP definitions.
 /// Readings in, Def name = func out. Nothing else.
 pub fn compile_to_defs(pop: &Population) -> Vec<(String, Func)> {
@@ -760,6 +765,11 @@ pub fn compile_to_defs(pop: &Population) -> Vec<(String, Func)> {
     }
 
     defs
+}
+
+/// Reconstruct a Domain from an Object state by querying metamodel cells.
+pub fn state_to_domain(state: &crate::ast::Object) -> Domain {
+    population_to_domain(&crate::ast::state_to_population(state))
 }
 
 /// Reconstruct a Domain from a Population by querying metamodel fact types.
