@@ -1738,3 +1738,128 @@ fn transition_via_defs_changes_status() {
 
     assert_eq!(result.status, Some("Placed".to_string()));
 }
+
+// ── Generator DEFS ───────────────────────────────────────────────────
+// Compile-time generators produce constant DEFS entries:
+//   agent:{noun}       - synthesized agent prompt
+//   ilayer:{noun}      - noun information layer
+//   sql:{table}        - DDL for relational mapping
+//   test:{constraint}  - constraint test harness
+
+#[test]
+fn agent_defs_produced_for_nouns_with_facts() {
+    let (_pop, defs) = compile_orders();
+    let agent_defs: Vec<_> = defs.iter()
+        .filter(|(n, _)| n.starts_with("agent:"))
+        .collect();
+    assert!(!agent_defs.is_empty(), "Should produce agent defs");
+    // Order should have an agent def
+    assert!(defs.contains_key("agent:Order"), "Order should have agent def");
+}
+
+#[test]
+fn agent_def_contains_role_and_fact_types() {
+    let (_pop, defs) = compile_orders();
+    let agent_order = defs.get("agent:Order").expect("agent:Order missing");
+    let obj = match agent_order {
+        arest::ast::Func::Constant(obj) => obj,
+        _ => panic!("agent def should be Func::Constant"),
+    };
+    let text = format!("{:?}", obj);
+    assert!(text.contains("role"), "agent prompt should contain role");
+    assert!(text.contains("fact_types"), "agent prompt should contain fact_types");
+    assert!(text.contains("Order"), "agent prompt should reference Order");
+}
+
+#[test]
+fn agent_def_contains_transitions_for_sm_noun() {
+    let (_pop, defs) = compile_orders();
+    let agent_order = defs.get("agent:Order").expect("agent:Order missing");
+    let text = format!("{:?}", agent_order);
+    assert!(text.contains("transitions"), "Order agent should have transitions");
+    assert!(text.contains("place") || text.contains("ship"), "Order agent should list SM events");
+}
+
+#[test]
+fn agent_def_contains_deontic_rules() {
+    let (_pop, defs) = compile_orders();
+    let agent_order = defs.get("agent:Order").expect("agent:Order missing");
+    let text = format!("{:?}", agent_order);
+    assert!(text.contains("deontic"), "Order agent should have deontic section");
+}
+
+#[test]
+fn ilayer_defs_produced_for_nouns() {
+    let (_pop, defs) = compile_orders();
+    let ilayer_defs: Vec<_> = defs.iter()
+        .filter(|(n, _)| n.starts_with("ilayer:"))
+        .collect();
+    assert!(!ilayer_defs.is_empty(), "Should produce ilayer defs");
+    assert!(defs.contains_key("ilayer:Order"), "Order should have ilayer def");
+    assert!(defs.contains_key("ilayer:Customer"), "Customer should have ilayer def");
+}
+
+#[test]
+fn ilayer_def_contains_object_type_and_facts() {
+    let (_pop, defs) = compile_orders();
+    let ilayer = defs.get("ilayer:Order").expect("ilayer:Order missing");
+    let obj = match ilayer {
+        arest::ast::Func::Constant(obj) => obj,
+        _ => panic!("ilayer def should be Func::Constant"),
+    };
+    let text = format!("{:?}", obj);
+    assert!(text.contains("object_type"), "ilayer should contain object_type");
+    assert!(text.contains("fact_types"), "ilayer should contain fact_types");
+}
+
+#[test]
+fn sql_defs_produced_for_tables() {
+    let (_pop, defs) = compile_orders();
+    let sql_defs: Vec<_> = defs.iter()
+        .filter(|(n, _)| n.starts_with("sql:"))
+        .collect();
+    assert!(!sql_defs.is_empty(), "Should produce sql defs");
+}
+
+#[test]
+fn sql_def_contains_create_table() {
+    let (_pop, defs) = compile_orders();
+    let sql_defs: Vec<_> = defs.iter()
+        .filter(|(n, _)| n.starts_with("sql:"))
+        .collect();
+    for (name, func) in &sql_defs {
+        let obj = match func {
+            arest::ast::Func::Constant(obj) => obj,
+            _ => panic!("{} should be Func::Constant", name),
+        };
+        let text = format!("{:?}", obj);
+        assert!(text.contains("CREATE TABLE"), "sql def {} should contain CREATE TABLE DDL", name);
+    }
+}
+
+#[test]
+fn test_defs_produced_for_constraints() {
+    let (_pop, defs) = compile_orders();
+    let test_defs: Vec<_> = defs.iter()
+        .filter(|(n, _)| n.starts_with("test:"))
+        .collect();
+    assert!(!test_defs.is_empty(), "Should produce test defs");
+}
+
+#[test]
+fn test_def_contains_constraint_metadata() {
+    let (_pop, defs) = compile_orders();
+    let test_defs: Vec<_> = defs.iter()
+        .filter(|(n, _)| n.starts_with("test:"))
+        .collect();
+    for (name, func) in &test_defs {
+        let obj = match func {
+            arest::ast::Func::Constant(obj) => obj,
+            _ => panic!("{} should be Func::Constant", name),
+        };
+        let text = format!("{:?}", obj);
+        assert!(text.contains("id"), "test def {} should contain id", name);
+        assert!(text.contains("kind"), "test def {} should contain kind", name);
+        assert!(text.contains("modality"), "test def {} should contain modality", name);
+    }
+}
