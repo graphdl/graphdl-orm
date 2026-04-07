@@ -232,20 +232,11 @@ fn create_via_defs(
         }
     }
 
-    // -- validate --
+    // -- validate: apply(validate, ctx, defs) --
     let ctx_obj = ast::encode_eval_context("", None, &new_pop);
-    let mut violations = Vec::new();
-    for (name, func) in defs {
-        if !name.starts_with("constraint:") { continue; }
-        let result = ast::apply(func, &ctx_obj, defs);
-        let is_deontic = name.contains("obligatory") || name.contains("forbidden");
-        let decoded = ast::decode_violations(&result);
-        for mut v in decoded {
-            v.alethic = !is_deontic;
-            violations.push(v);
-        }
-    }
-
+    let validate_func = defs.get("validate").cloned().unwrap_or(ast::Func::constant(ast::Object::phi()));
+    let violation_obj = ast::apply(&validate_func, &ctx_obj, defs);
+    let violations = ast::decode_violations(&violation_obj);
     let rejected = violations.iter().any(|v| v.alethic);
 
     // -- emit --
@@ -519,19 +510,11 @@ fn update_via_defs(
         .collect();
     let derived = crate::evaluate::forward_chain_defs(&derivation_defs, &mut new_pop);
 
+    // -- validate: apply(validate, ctx, defs) --
     let ctx_obj = ast::encode_eval_context("", None, &new_pop);
-    let mut violations = Vec::new();
-    for (name, func) in defs {
-        if !name.starts_with("constraint:") { continue; }
-        let result = ast::apply(func, &ctx_obj, defs);
-        let is_deontic = name.contains("obligatory") || name.contains("forbidden");
-        let decoded = ast::decode_violations(&result);
-        for mut v in decoded {
-            v.alethic = !is_deontic;
-            violations.push(v);
-        }
-    }
-
+    let validate_func = defs.get("validate").cloned().unwrap_or(ast::Func::constant(ast::Object::phi()));
+    let violation_obj = ast::apply(&validate_func, &ctx_obj, defs);
+    let violations = ast::decode_violations(&violation_obj);
     let rejected = violations.iter().any(|v| v.alethic);
     let sm_id = entity_id.to_string();
     let status = extract_sm_status(&new_pop, &sm_id);

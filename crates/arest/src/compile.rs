@@ -405,6 +405,11 @@ pub fn compile_to_defs(pop: &Population) -> Vec<(String, Func)> {
         defs.push((format!("constraint:{}", c.id), c.func.clone()));
     }
 
+    // validate: Concat . [all constraints] -- single Func that returns all violations.
+    // Empty constraint set produces phi (no violations). The algebra handles it.
+    let all_constraints: Vec<Func> = model.constraints.iter().map(|c| c.func.clone()).collect();
+    defs.push(("validate".to_string(), Func::compose(Func::Concat, Func::construction(all_constraints))));
+
     // State machines -> named definitions
     // The func is the transition function: <state, event> -> state'.
     // The complete machine is foldl(transition, initial, events).
