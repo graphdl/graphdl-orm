@@ -411,9 +411,10 @@ fn cmd_bootstrap(args: &[String]) {
         merged.autofill_spans.extend(ir.autofill_spans);
     }
 
-    // Convert to population and compile.
-    let pop = parse_forml2::domain_to_population(&merged);
-    let defs = compile::compile_to_defs(&pop);
+    // Convert to Object state and compile.
+    let state = parse_forml2::domain_to_state(&merged);
+    let pop = ast::state_to_population(&state);
+    let defs = compile::compile_to_defs_state(&state);
     let tables = rmap::rmap(&merged);
 
     // Count categories.
@@ -463,10 +464,9 @@ fn cmd_system(args: &[String]) {
     // Backus 14.4.2: the operand includes input and FILE (population).
     // Every def receives the same operand. No branching on key.
     let tables = db::load_table_meta(&conn);
-    let pop = db::load_population(&conn, &tables);
+    let state = db::load_state(&conn, &tables);
     let input_obj = ast::Object::parse(input);
-    let pop_obj = ast::encode_population(&pop);
-    let obj = ast::Object::seq(vec![input_obj, ast::Object::phi(), pop_obj]);
+    let obj = ast::Object::seq(vec![input_obj, ast::Object::phi(), state]);
 
     if let Some(func) = def_map.get(key.as_str()) {
         let result = ast::apply(func, &obj, &def_map);
@@ -505,8 +505,8 @@ fn cmd_synthesize(args: &[String]) {
 
     let conn = db::open(&db_path);
     let tables = db::load_table_meta(&conn);
-    let pop = db::load_population(&conn, &tables);
-    let result = evaluate::synthesize_from_pop(&pop, &noun, depth);
+    let state = db::load_state(&conn, &tables);
+    let result = evaluate::synthesize_from_state(&state, &noun, depth);
     println!("{}", serde_json::to_string_pretty(&result).unwrap());
 }
 
@@ -517,22 +517,20 @@ fn cmd_forward_chain(args: &[String]) {
     let conn = db::open(&db_path);
     let defs = db::load_defs(&conn);
     let tables = db::load_table_meta(&conn);
-    let mut pop = db::load_population(&conn, &tables);
-    let def_map: std::collections::HashMap<String, ast::Func> =
-        defs.iter().map(|(n, f)| (n.clone(), f.clone())).collect();
-    let _ = &def_map; // defs used by name matching below
+    let state = db::load_state(&conn, &tables);
 
     let derivation_defs: Vec<(&str, &ast::Func)> = defs.iter()
         .filter(|(n, _)| n.starts_with("derivation:"))
         .map(|(n, f)| (n.as_str(), f))
         .collect();
-    let derived = evaluate::forward_chain_defs(&derivation_defs, &mut pop);
+    let (new_state, derived) = evaluate::forward_chain_defs_state(&derivation_defs, &state);
 
     if derived.is_empty() {
         println!("No new facts derived");
     } else {
         // Store derived facts back.
-        db::store_facts(&conn, &pop, &tables);
+        let new_pop = ast::state_to_population(&new_state);
+        db::store_facts(&conn, &new_pop, &tables);
         println!("{}", serde_json::to_string_pretty(&derived).unwrap());
     }
 }
