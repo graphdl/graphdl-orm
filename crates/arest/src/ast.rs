@@ -62,16 +62,7 @@ impl Object {
     /// Parse an FFP object from Backus notation.
     /// Atoms: bare strings. Sequences: <x₁, x₂, ...>. Bottom: ⊥. Empty: φ.
     pub fn parse(input: &str) -> Object {
-        let s = input.trim();
-        if s.is_empty() || s == "φ" { return Object::phi(); }
-        if s == "⊥" { return Object::Bottom; }
-        if s.starts_with('<') && s.ends_with('>') {
-            let inner = &s[1..s.len()-1];
-            if inner.trim().is_empty() { return Object::phi(); }
-            let items = split_top_level(inner);
-            return Object::Seq(items.into_iter().map(|i| Object::parse(i.trim())).collect());
-        }
-        Object::Atom(s.to_string())
+        parse_with_depth(input, 0)
     }
 
     pub fn is_bottom(&self) -> bool { matches!(self, Object::Bottom) }
@@ -110,6 +101,26 @@ fn split_top_level(s: &str) -> Vec<&str> {
     }
     result.push(&s[start..]);
     result
+}
+
+/// Maximum nesting depth for `Object::parse` to prevent stack overflow on
+/// maliciously crafted inputs (e.g. deeply nested `< < < ... > > >`).
+const MAX_PARSE_DEPTH: usize = 100;
+
+fn parse_with_depth(input: &str, depth: usize) -> Object {
+    let s = input.trim();
+    if s.is_empty() || s == "\u{03C6}" { return Object::phi(); }
+    if s == "\u{22A5}" { return Object::Bottom; }
+    if s.starts_with('<') && s.ends_with('>') {
+        if depth >= MAX_PARSE_DEPTH {
+            return Object::Bottom;
+        }
+        let inner = &s[1..s.len()-1];
+        if inner.trim().is_empty() { return Object::phi(); }
+        let items = split_top_level(inner);
+        return Object::Seq(items.into_iter().map(|i| parse_with_depth(i.trim(), depth + 1)).collect());
+    }
+    Object::Atom(s.to_string())
 }
 
 impl fmt::Display for Object {

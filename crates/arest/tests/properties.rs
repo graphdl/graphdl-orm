@@ -539,18 +539,22 @@ fn c7_deontic_violation_returns_reading_text() {
 
 #[test]
 fn c8_ingesting_new_readings_preserves_properties() {
+    use arest::ast::{self, Object};
+
     // Start with orders domain (metamodel + orders, same as compile_orders)
-    let meta = parse_forml2::parse_markdown(STATE_METAMODEL).unwrap();
-    let mut ir1 = parse_forml2::parse_markdown_with_nouns(ORDERS_DOMAIN, &meta.nouns).unwrap();
-    ir1.nouns.extend(meta.nouns);
-    ir1.fact_types.extend(meta.fact_types);
-    ir1.constraints.extend(meta.constraints);
-    ir1.subtypes.extend(meta.subtypes);
-    let model1 = compile::compile(&ir1);
-    let sm1 = model1.state_machines.iter()
-        .find(|sm| sm.noun_name == "Order")
-        .unwrap();
-    let initial1 = sm1.initial.clone();
+    let meta = parse_forml2::parse_to_population(STATE_METAMODEL).unwrap();
+    let orders = parse_forml2::parse_to_population_with_nouns(ORDERS_DOMAIN, &meta).unwrap();
+    let mut pop1 = meta;
+    for (k, v) in orders.facts { pop1.facts.entry(k).or_default().extend(v); }
+    let defs1 = compile::compile_to_defs(&pop1);
+    let def_map1: HashMap<String, ast::Func> = defs1.into_iter().collect();
+
+    // Verify Order machine initial state via the initial def
+    let initial1 = ast::apply(
+        def_map1.get("machine:Order:initial").expect("Order machine initial"),
+        &Object::phi(),
+        &def_map1,
+    );
 
     // Add a new reading (new entity type + constraint)
     let extension = r#"
@@ -572,28 +576,35 @@ Each Coupon has exactly one Discount.
 Each Order has at most one Coupon.
 "#;
 
-    // Parse extension with existing nouns
-    let ir2 = parse_forml2::parse_markdown_with_nouns(extension, &ir1.nouns).unwrap();
-
-    // Merge
-    let mut merged = ir1.clone();
-    merged.nouns.extend(ir2.nouns);
-    merged.fact_types.extend(ir2.fact_types);
-    merged.constraints.extend(ir2.constraints);
-    let model2 = compile::compile(&merged);
+    // Parse extension and merge populations
+    let ext_pop = parse_forml2::parse_to_population_with_nouns(extension, &pop1).unwrap();
+    let mut pop2 = pop1.clone();
+    for (k, v) in ext_pop.facts { pop2.facts.entry(k).or_default().extend(v); }
+    let defs2 = compile::compile_to_defs(&pop2);
+    let def_map2: HashMap<String, ast::Func> = defs2.into_iter().collect();
 
     // Original properties still hold
-    let sm2 = model2.state_machines.iter()
-        .find(|sm| sm.noun_name == "Order")
-        .unwrap();
-    assert_eq!(sm2.initial, initial1, "Initial state unchanged after self-modification");
+    let initial2 = ast::apply(
+        def_map2.get("machine:Order:initial").expect("Order machine initial after merge"),
+        &Object::phi(),
+        &def_map2,
+    );
+    assert_eq!(initial2.to_string(), initial1.to_string(),
+        "Initial state unchanged after self-modification");
 
     // New constraint is present
-    assert!(merged.constraints.iter().any(|c| c.text.contains("Coupon")),
+    assert!(def_map2.keys().any(|k| k.starts_with("constraint:") && k.contains("Coupon")),
         "New constraint should be present after self-modification");
 
-    // State machine fold still works
-    assert_eq!(evaluate::run_machine_ast(sm2, &["place", "ship"]), "Shipped");
+    // State machine fold still works via defs
+    let machine = def_map2.get("machine:Order").expect("Order machine def");
+    let mut state = initial2.to_string();
+    for event in &["place", "ship"] {
+        let input = Object::seq(vec![Object::atom(&state), Object::atom(event)]);
+        let result = ast::apply(machine, &input, &def_map2);
+        state = result.to_string();
+    }
+    assert_eq!(state, "Shipped");
 }
 
 // ── Remark: World Assumption on Populating Functions ─────────────────
@@ -601,14 +612,19 @@ Each Order has at most one Coupon.
 #[test]
 fn remark_cwa_constraint_has_enum_values() {
     let ir = parse_forml2::parse_markdown(ORDERS_DOMAIN).unwrap();
-    let _model = compile::compile(&ir);
     // The "forbidden Prohibited Shipping Method" constraint spans a fact type
     // whose role noun has declared enum values. This makes it CWA.
     let forbidden = ir.constraints.iter()
         .find(|c| c.text.contains("Prohibited Shipping Method"))
         .expect("Should have Prohibited Shipping Method constraint");
-    let enum_vals = compile::collect_enum_values_pub(&ir, &forbidden.spans);
-    assert!(!enum_vals.is_empty(), "CWA constraint should have enum values for deterministic checking");
+    // Check that at least one role noun in the spanned fact types has enum values
+    let has_enum_vals = forbidden.spans.iter().any(|span| {
+        ir.fact_types.get(&span.fact_type_id)
+            .map_or(false, |ft| ft.roles.iter().any(|role|
+                ir.enum_values.get(&role.noun_name).map_or(false, |vals| !vals.is_empty())
+            ))
+    });
+    assert!(has_enum_vals, "CWA constraint should have enum values for deterministic checking");
 }
 
 #[test]
@@ -626,8 +642,14 @@ It is forbidden that Response reveals Implementation Detail.
     let forbidden = ir.constraints.iter()
         .find(|c| c.text.contains("Implementation Detail"))
         .unwrap();
-    let enum_vals = compile::collect_enum_values_pub(&ir, &forbidden.spans);
-    assert!(enum_vals.is_empty(), "OWA constraint should have no enum values (requires runtime judgment)");
+    // Check that no role noun in the spanned fact types has enum values
+    let has_enum_vals = forbidden.spans.iter().any(|span| {
+        ir.fact_types.get(&span.fact_type_id)
+            .map_or(false, |ft| ft.roles.iter().any(|role|
+                ir.enum_values.get(&role.noun_name).map_or(false, |vals| !vals.is_empty())
+            ))
+    });
+    assert!(!has_enum_vals, "OWA constraint should have no enum values (requires runtime judgment)");
 }
 
 // ── Cell Isolation (Definition 2) ────────────────────────────────────
@@ -1613,32 +1635,7 @@ fn sm_init_derivation_produces_facts() {
     // Encode population and apply derivation
     let pop_obj = ast::encode_population(&test_pop);
 
-    // Debug: test instances_of_noun separately
-    let get_instances = compile::instances_of_noun_func_pub("Order");
-    let instances_result = ast::apply(&get_instances, &pop_obj, &def_map);
-    eprintln!("instances_of_noun(Order): {}", instances_result);
-
-    // Debug: test get_existing separately
-    let get_existing_func = compile::extract_facts_from_pop_pub("StateMachine_has_forResource");
-    let existing_raw = ast::apply(&get_existing_func, &pop_obj, &def_map);
-    eprintln!("extract_facts_from_pop(SM_has_forResource): {}", existing_raw);
-
-    // Test the full pairs construction
-    let pairs_func = ast::Func::construction(vec![get_instances.clone(), compile::extract_facts_from_pop_pub("StateMachine_has_forResource")]);
-    let pairs_result = ast::apply(&pairs_func, &pop_obj, &def_map);
-    eprintln!("pairs result: {}", pairs_result);
-
-    // Test: Condition(null . sel(2), sel(1), ...) : <<ord-1>, phi>
-    let cond_test = ast::Func::condition(
-        ast::Func::compose(ast::Func::NullTest, ast::Func::Selector(2)),
-        ast::Func::Selector(1),
-        ast::Func::Selector(1),
-    );
-    let cond_result = ast::apply(&cond_test, &pairs_result, &def_map);
-    eprintln!("condition(null.sel(2), sel(1), sel(1)) : pairs = {}", cond_result);
-
     // Test derive_facts on <ord-1>
-    let single = Object::seq(vec![Object::atom("ord-1")]);
     let make_one_fact = ast::Func::construction(vec![
         ast::Func::constant(Object::atom("StateMachine_has_forResource")),
         ast::Func::constant(Object::atom("test")),

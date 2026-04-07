@@ -27,7 +27,7 @@ use crate::types::FactInstance;
 ///
 /// Each fact becomes a sequence of its bindings (ordered by the schema's role_names).
 /// The population becomes a sequence of these fact sequences.
-pub fn population_to_object(population: &Population, schema: &CompiledSchema) -> Object {
+pub(crate) fn population_to_object(population: &Population, schema: &CompiledSchema) -> Object {
     let facts = match population.facts.get(&schema.id) {
         Some(f) => f,
         None => return Object::phi(),
@@ -98,7 +98,7 @@ pub fn build_query(target_role: usize, filter_bindings: &[(usize, &str)]) -> Fun
 ///
 /// This is: α(Sel(target)) ∘ Filter(predicate) applied to the population.
 /// Pure AST — no Native closures, no manual iteration.
-pub fn query_with_ast(
+pub(crate) fn query_with_ast(
     population: &Population,
     schema: &CompiledSchema,
     target_role: usize,
