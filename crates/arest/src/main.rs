@@ -209,7 +209,11 @@ mod db {
     }
 
     pub fn load_population(conn: &Connection, tables: &[crate::rmap::TableDef]) -> Population {
-        let mut facts: HashMap<String, Vec<FactInstance>> = HashMap::new();
+        ast::state_to_population(&load_state(conn, tables))
+    }
+
+    pub fn load_state(conn: &Connection, tables: &[crate::rmap::TableDef]) -> ast::Object {
+        let mut state = ast::Object::phi();
 
         // Read facts from domain tables.
         for table in tables {
@@ -222,31 +226,28 @@ mod db {
             };
             let col_count = col_names.len();
             let rows = stmt.query_map([], |row| {
-                let mut bindings = Vec::new();
+                let mut pairs = Vec::new();
                 for i in 0..col_count {
                     let val: Option<String> = row.get(i).ok();
                     if let Some(v) = val {
-                        bindings.push((col_names[i].to_string(), v));
+                        pairs.push((col_names[i].to_string(), v));
                     }
                 }
-                Ok(bindings)
+                Ok(pairs)
             }).unwrap_or_else(|e| { eprintln!("Failed to read {}: {}", table.name, e); std::process::exit(1); });
 
             for row in rows {
-                let bindings = row.unwrap_or_else(|e| { eprintln!("Failed to read row from {}: {}", table.name, e); std::process::exit(1); });
-                if bindings.is_empty() { continue; }
-                let ft_id = table.name.clone();
-                facts.entry(ft_id.clone()).or_default().push(FactInstance {
-                    fact_type_id: ft_id,
-                    bindings,
-                });
+                let pairs = row.unwrap_or_else(|e| { eprintln!("Failed to read row from {}: {}", table.name, e); std::process::exit(1); });
+                if pairs.is_empty() { continue; }
+                let refs: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+                state = ast::cell_push(&table.name, ast::fact_from_pairs(&refs), &state);
             }
         }
 
         // Read overflow facts from cells table.
         let mut stmt = match conn.prepare("SELECT name, contents FROM cells WHERE name LIKE 'fact:%'") {
             Ok(s) => s,
-            Err(_) => return Population { facts },
+            Err(_) => return state,
         };
         let rows = stmt.query_map([], |row| {
             let name: String = row.get(0)?;
@@ -257,17 +258,15 @@ mod db {
             let (name, contents) = row.unwrap_or_else(|e| { eprintln!("Failed to read cell row: {}", e); std::process::exit(1); });
             let parts: Vec<&str> = name.splitn(3, ':').collect();
             if parts.len() >= 2 {
-                let ft_id = parts[1].to_string();
+                let ft_id = parts[1];
                 if let Ok(bindings) = serde_json::from_str::<Vec<(String, String)>>(&contents) {
-                    facts.entry(ft_id.clone()).or_default().push(FactInstance {
-                        fact_type_id: ft_id,
-                        bindings,
-                    });
+                    let refs: Vec<(&str, &str)> = bindings.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+                    state = ast::cell_push(ft_id, ast::fact_from_pairs(&refs), &state);
                 }
             }
         }
 
-        Population { facts }
+        state
     }
 
     pub fn store_table_meta(conn: &Connection, tables: &[crate::rmap::TableDef]) {
