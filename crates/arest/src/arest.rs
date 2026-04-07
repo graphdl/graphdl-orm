@@ -97,6 +97,19 @@ pub struct TransitionAction {
 // Eq. 12: create = emit . validate . derive . resolve
 // All operations resolve through named Func definitions.
 
+/// Apply a command against Object state. Boundary conversion wrapper.
+pub fn apply_command_defs_state(
+    defs: &std::collections::HashMap<String, ast::Func>,
+    command: &Command,
+    state: &ast::Object,
+) -> CommandResult {
+    let pop = ast::state_to_population(state);
+    let mut result = apply_command_defs(defs, command, &pop);
+    // The result.population is the new state after the command.
+    // Keep it as Population for now — callers can convert.
+    result
+}
+
 pub fn apply_command_defs(
     defs: &std::collections::HashMap<String, ast::Func>,
     command: &Command,
