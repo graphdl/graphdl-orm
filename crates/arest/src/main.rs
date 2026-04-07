@@ -320,7 +320,12 @@ fn cmd_system(args: &[String]) {
     let def_map: std::collections::HashMap<String, ast::Func> =
         defs.iter().map(|(n, f)| (n.clone(), f.clone())).collect();
 
-    let obj = ast::Object::parse(input);
+    // Backus 14.4.2: the operand includes input and FILE (population).
+    // Every def receives the same operand. No branching on key.
+    let pop = db::load_population(&conn);
+    let input_obj = ast::Object::parse(input);
+    let pop_obj = ast::encode_population(&pop);
+    let obj = ast::Object::seq(vec![input_obj, ast::Object::phi(), pop_obj]);
 
     if let Some(func) = def_map.get(key.as_str()) {
         let result = ast::apply(func, &obj, &def_map);
