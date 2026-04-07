@@ -2010,31 +2010,39 @@ fn compile_ring_acyclic_ast(def: &ConstraintDef) -> Func {
     let ft_ids: Vec<String> = def.spans.iter().map(|s| s.fact_type_id.clone()).collect();
     let facts = extract_facts_multi(&ft_ids);
 
-    // AC: no cycles. Compute transitive closure, check for self-loops.
+    // AC: no cycles in the graph. Detect cycles of ANY depth via
+    // transitive closure with the While combinator.
     //
-    // Transitive closure: While(has_new)(add_step) starting from the edge set.
-    // add_step: R -> R union {<x,z> | <x,y> in R, <y,z> in R}
-    // Self-loop: Filter(eq . [role0, role1]) on the closure.
+    // Algorithm: starting from the edge set E, repeatedly compute
+    // E' = E union {<x,z> | <x,y> in E, <y,z> in E_original}.
+    // When E stops growing (no new edges), check for self-loops.
     //
-    // The add_step uses the same chain pattern as IT/TR.
-    // Since While + the full chain composition is complex, and AC needs
-    // a fixed-point iteration (unbounded depth), we use a bounded While
-    // with depth = population size (guaranteed termination for finite P).
+    // State for While: <current_edges, original_edges, prev_count>
+    //   - sel(1) = current transitive closure (grows each iteration)
+    //   - sel(2) = original edges (constant, used for one-hop extension)
+    //   - sel(3) = edge count from previous iteration (for convergence check)
+    //
+    // Predicate: length(current_edges) != prev_count
+    //   (i.e., new edges were added in the last iteration)
+    //
+    // Body: extend current_edges by one hop, update prev_count.
+    //
+    // The While combinator has a 1000-iteration safety bound, which is
+    // sufficient for any practical population (transitive closure of N
+    // nodes stabilizes in at most N-1 iterations).
 
-    // is_chain: <f1, f2> -> role1(f1) = role0(f2)
-    let is_chain = Func::compose(Func::Eq, Func::construction(vec![
-        Func::compose(role_value(1), Func::Selector(1)),
-        Func::compose(role_value(0), Func::Selector(2)),
-    ]));
-
-    // new_edge from chain: <f1, f2> -> <role0(f1), role1(f2)>
-    let new_edge = Func::construction(vec![
-        Func::compose(role_value(0), Func::Selector(1)),
-        Func::compose(role_value(1), Func::Selector(2)),
-    ]);
-
-    // self_loop: fact -> role0 = role1
-    let self_loop = Func::compose(Func::Eq, Func::construction(vec![role_value(0), role_value(1)]));
+    // Expressing the full transitive closure fixed-point as pure Func
+    // requires While with state = <edges, original, count>. The one-hop
+    // extension step needs:
+    //   1. Cross product of current_edges x original_edges (via DistR)
+    //   2. Filter for chains: role1(e1) = role0(e2)
+    //   3. Extract new edges: <role0(e1), role1(e2)>
+    //   4. Concat with current_edges (dedup not strictly needed for cycle check)
+    //
+    // This is expressible but deeply nested. For clarity and maintainability,
+    // we use a Native that implements the full algorithm but documents the
+    // pure Func equivalent. The Native computes the transitive closure by
+    // iterating until convergence, bounded by 1000 iterations.
 
     let detail = Func::construction(vec![
         Func::constant(Object::atom("Acyclic violation:")),
@@ -2043,40 +2051,80 @@ fn compile_ring_acyclic_ast(def: &ConstraintDef) -> Func {
     ]);
     let viol = make_violation_func(&def.id, &def.text, detail);
 
-    // The acyclic check: extract facts, check for self-loops directly first (depth 1),
-    // then check for depth-2 cycles via chain composition.
-    // For deeper cycles, we'd need While. For now, depth-2 covers the common case
-    // and matches what the test suite exercises.
+    // The transitive closure step is a Native because the pure Func
+    // equivalent (While over <edges, originals, count> with DistR-based
+    // cross product, Filter for chains, alpha for new edges, Concat for
+    // union, and Length for convergence check) is O(n^2) in Func tree
+    // depth per iteration. A Native closure is clearer and matches the
+    // same semantics:
     //
-    // Full version: add transitive edges once, check self-loops.
-    // depth-2 chains: Filter(is_chain) . distl on <f, all> pairs give chains.
-    // Extract new edges from chains: a(new_edge).
-    // Check self-loops on new edges: Filter(self_loop).
+    //   Pure Func equivalent (pseudocode):
+    //     extend_one_hop = concat . [sel(1),
+    //       alpha(new_edge) . Filter(is_chain) . concat . alpha(distl) .
+    //       distr . [sel(1), sel(2)]]
+    //     body = [extend_one_hop, sel(2), length . sel(1)]
+    //     pred = not . eq . [length . sel(1), sel(3)]
+    //     tc = sel(1) . While(pred, body) . [facts, facts, const(0)]
+    //
+    let tc_func = Func::Native(std::sync::Arc::new(move |edges: &Object| {
+        // edges is the initial edge set (sequence of facts)
+        let initial = match edges.as_seq() {
+            Some(e) => e.to_vec(),
+            None => return Object::Bottom,
+        };
 
-    // Step 1: check direct self-loops in original facts
-    let direct_loops = Func::compose(
-        Func::apply_to_all(viol.clone()),
-        Func::compose(Func::filter(self_loop.clone()), facts.clone()),
-    );
+        // Extract <role0_val, role1_val> pairs from encoded facts.
+        // Fact encoding: <<noun0, val0>, <noun1, val1>, ...>
+        fn edge_pair(fact: &Object) -> Option<(String, String)> {
+            let items = fact.as_seq()?;
+            if items.len() < 2 { return None; }
+            let v0 = items[0].as_seq().and_then(|p| p.get(1)).and_then(|v| v.as_atom())?;
+            let v1 = items[1].as_seq().and_then(|p| p.get(1)).and_then(|v| v.as_atom())?;
+            Some((v0.to_string(), v1.to_string()))
+        }
 
-    // Step 2: find depth-2 cycles via chain + new_edge + self_loop
-    let find_chains = Func::compose(Func::filter(is_chain), Func::DistL);
-    let chain_new_edges = Func::compose(Func::apply_to_all(new_edge), find_chains);
-    let depth2_loops = Func::compose(
+        let original_pairs: Vec<(String, String)> = initial.iter()
+            .filter_map(|f| edge_pair(f))
+            .collect();
+
+        // Build transitive closure as set of (from, to) pairs
+        let mut tc: std::collections::HashSet<(String, String)> = original_pairs.iter().cloned().collect();
+        let max_iterations = 1000;
+        for _ in 0..max_iterations {
+            let mut new_edges = Vec::new();
+            for (a, b) in tc.iter() {
+                for (c, d) in &original_pairs {
+                    if b == c && !tc.contains(&(a.clone(), d.clone())) {
+                        new_edges.push((a.clone(), d.clone()));
+                    }
+                }
+            }
+            if new_edges.is_empty() { break; }
+            for edge in new_edges {
+                tc.insert(edge);
+            }
+        }
+
+        // Find self-loops (cycles): (x, x) in tc
+        let cycle_nodes: Vec<Object> = tc.iter()
+            .filter(|(a, b)| a == b)
+            .map(|(a, _)| {
+                // Reconstruct as a fact-like object for the violation formatter
+                Object::Seq(vec![
+                    Object::Seq(vec![Object::atom("_"), Object::atom(a)]),
+                    Object::Seq(vec![Object::atom("_"), Object::atom(a)]),
+                ])
+            })
+            .collect();
+
+        Object::Seq(cycle_nodes)
+    }));
+
+    // Pipeline: extract facts -> compute transitive closure -> report violations
+    Func::compose(
         Func::apply_to_all(viol),
-        Func::compose(
-            Func::filter(self_loop),
-            // For each <f, all>, find chains, extract new edges, keep self-loops
-            Func::compose(
-                Func::apply_to_all(chain_new_edges),
-                Func::compose(Func::DistR, Func::construction(vec![facts.clone(), facts])),
-            ),
-        ),
-    );
-
-    // Combine: direct loops union depth-2 loops
-    // Construction produces <direct, depth2> -- both are violation sequences
-    Func::construction(vec![direct_loops, depth2_loops])
+        Func::compose(tc_func, facts),
+    )
 }
 
 /// RF: for each entity x, xRx must exist -- violation when self-reference is missing.

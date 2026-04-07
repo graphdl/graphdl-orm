@@ -326,7 +326,18 @@ pub enum Func {
     /// Apply-to-all: αf:<x₁,...,xₙ> = <f:x₁,...,f:xₙ>. Population traversal.
     ApplyToAll(Box<Func>),
 
-    /// Insert (fold right): /f:<x₁,...,xₙ> = f:<x₁, /f:<x₂,...,xₙ>>. Aggregation.
+    /// Insert (RIGHT fold, Backus /f): /f:<x₁,...,xₙ> = f:<x₁, /f:<x₂,...,xₙ>>.
+    ///
+    /// Processes right to left: the last element is the base case,
+    /// then each preceding element is combined with the accumulated result.
+    /// For a single-element sequence, /f:<x> = x (identity).
+    /// For an empty sequence, /f:phi = Bottom (undefined).
+    ///
+    /// Example: /+:<1, 2, 3> = +:<1, +:<2, 3>> = +:<1, 5> = 6.
+    /// For non-commutative f, order matters: /-:<1, 2, 3> = -:<1, -:<2, 3>>
+    /// = -:<1, -1> = 2 (NOT 1-2-3 = -4).
+    ///
+    /// See FoldL for left fold with explicit accumulator.
     Insert(Box<Func>),
 
     /// Binary-to-unary: (bu f x):y = f:<x, y>. Partial application / currying.
@@ -339,7 +350,27 @@ pub enum Func {
     Filter(Box<Func>),
 
     /// While: (while p f):x = if p:x = T then (while p f):(f:x) else x.
+    ///
+    /// Safety bound: iteration is capped at 1000 steps. If the predicate
+    /// still returns T after 1000 iterations, the result is Bottom (not
+    /// an infinite loop). This bound is sufficient for any practical
+    /// population-based computation (transitive closure, fixed-point
+    /// iteration, state machine simulation).
     While(Box<Func>, Box<Func>),
+
+    /// Left fold: FoldL(f):<z, <e₁,...,eₙ>> = foldl f z <e₁,...,eₙ>
+    /// where foldl f z <> = z, foldl f z <e, E'> = foldl f (f:<z,e>) E'.
+    /// Takes a pair <accumulator, sequence>. Returns the final accumulator.
+    ///
+    /// Early termination: if the accumulator becomes Bottom at any step,
+    /// the fold terminates immediately and returns Bottom. This prevents
+    /// wasted computation when an error propagates through the fold.
+    ///
+    /// Contrast with Insert (/f), which is a RIGHT fold (Backus /f):
+    /// /f:<x₁,...,xₙ> processes right to left. FoldL processes left to
+    /// right with an explicit initial accumulator, making it suitable for
+    /// stateful computations (running totals, state machine transitions).
+    FoldL(Box<Func>),
 
     /// Named definition: references a function by name from the definition set.
     Def(String),
@@ -730,6 +761,25 @@ pub fn apply(func: &Func, x: &Object, defs: &std::collections::HashMap<String, F
             Object::Bottom // exceeded iteration limit
         }
 
+        Func::FoldL(f) => {
+            match x.as_seq() {
+                Some(items) if items.len() == 2 => {
+                    let mut acc = items[0].clone();
+                    let seq = match items[1].as_seq() {
+                        Some(s) => s,
+                        None => return Object::Bottom,
+                    };
+                    for element in seq {
+                        let pair = Object::seq(vec![acc, element.clone()]);
+                        acc = apply(f, &pair, defs);
+                        if acc.is_bottom() { return Object::Bottom; }
+                    }
+                    acc
+                }
+                _ => Object::Bottom,
+            }
+        }
+
         Func::Def(name) => {
             match defs.get(name) {
                 Some(func) => apply(func, x, defs),
@@ -789,6 +839,7 @@ pub mod forms {
     pub const BU: &str = "BU";
     pub const FILTER: &str = "FILTER";
     pub const WHILE: &str = "WHILE";
+    pub const FOLDL: &str = "FOLDL";
     pub const CONST: &str = "CONST";
 }
 
@@ -961,6 +1012,11 @@ fn metacompose_sequence(items: &[Object], defs: &std::collections::HashMap<Strin
             let f = metacompose(&items[1], defs);
             Func::Insert(Box::new(f))
         }
+        forms::FOLDL if items.len() == 2 => {
+            // <FOLDL, f> → foldl(f)
+            let f = metacompose(&items[1], defs);
+            Func::FoldL(Box::new(f))
+        }
         forms::BU if items.len() == 3 => {
             // <BU, f, x> → (bu f x)
             let f = metacompose(&items[1], defs);
@@ -1047,6 +1103,7 @@ pub fn func_to_object(func: &Func) -> Object {
         ]),
         Func::ApplyToAll(f) => Object::seq(vec![Object::atom(forms::ALPHA), func_to_object(f)]),
         Func::Insert(f) => Object::seq(vec![Object::atom(forms::INSERT), func_to_object(f)]),
+        Func::FoldL(f) => Object::seq(vec![Object::atom(forms::FOLDL), func_to_object(f)]),
         Func::BinaryToUnary(f, x) => Object::seq(vec![
             Object::atom(forms::BU), func_to_object(f), x.clone(),
         ]),
@@ -1066,14 +1123,35 @@ pub fn func_to_object(func: &Func) -> Object {
 // composed from Backus's primitives and forms. These are registered in
 // the definitions set D so they can be called by name via ρ.
 
-/// Register Codd's θ₁ relational algebra operations as named definitions.
+/// Register Codd's theta-1 relational algebra operations as named definitions.
 /// Call this to populate a defs map with the standard relational operations.
+///
+/// Pure Func analysis: all four operations require dynamic arity handling
+/// (the number of columns per tuple varies at runtime), which cannot be
+/// expressed as a fixed Func tree. Specifically:
+///
+/// - project: must build a Construction from runtime index values.
+///   Pure form would be alpha(Construction(selectors)), but Construction
+///   is a compile-time combinator and the selector list comes from data.
+///
+/// - join: the shared column index determines which selector to compare
+///   and which columns to exclude from the merge. This is data-dependent
+///   column selection that cannot be expressed without dynamic Construction.
+///
+/// - tie: checks first = last column (eq . [sel(1), sel(n)]), but n is
+///   the tuple arity which varies per relation. Pure Func has no "select
+///   last element" primitive (Backus defines selectors as fixed indices).
+///
+/// - compose_rel: combines join + project, inheriting both limitations.
+///
+/// All four remain Native with clear documentation of why.
 pub fn register_theta1(defs: &mut std::collections::HashMap<String, Func>) {
-    // projection: π_L(R) ≡ α[s_{i₁},...,s_{iₖ}] : R
-    // As a definition, "project" takes <indices, R> and projects R onto those columns.
-    // project:<⟨i₁,...,iₖ⟩, R> = α([s_{i₁},...,s_{iₖ}]):R
-    // We define it as a Native that builds the construction dynamically from the indices.
-    // This is acceptable because the indices determine which selectors to use at runtime.
+    // project: pi_L(R) = alpha([s_i1,...,s_ik]) : R
+    // Takes <indices, R> and projects R onto those columns.
+    // NATIVE because: indices are data that determine which Selectors to build.
+    // A pure Func would require alpha(Construction(selectors)) but Construction
+    // is a compile-time combinator -- the selector list is determined by the
+    // index sequence at runtime.
     defs.insert("project".to_string(), Func::Native(Arc::new(|x: &Object| {
         let items = match x.as_seq() {
             Some(items) if items.len() == 2 => items,
@@ -1087,13 +1165,11 @@ pub fn register_theta1(defs: &mut std::collections::HashMap<String, Func>) {
             Some(r) => r,
             None => return Object::Bottom,
         };
-        // Build selectors from indices
         let selectors: Vec<usize> = indices.iter()
             .filter_map(|i| i.as_atom().and_then(|s| s.parse().ok()))
             .collect();
         if selectors.is_empty() { return Object::Bottom; }
 
-        // Apply α[s₁,...,sₖ] to relation, removing duplicate rows
         let mut rows: Vec<Object> = Vec::new();
         for tuple in relation {
             if let Some(cols) = tuple.as_seq() {
@@ -1109,12 +1185,10 @@ pub fn register_theta1(defs: &mut std::collections::HashMap<String, Func>) {
         Object::Seq(rows)
     })));
 
-    // restriction: restrict:<predicate_obj, R> = Filter(ρ predicate_obj) : R
-    // The predicate is an FFP object resolved via ρ at application time.
-    // We use the standard Filter form.
-    // For now, register "restrict" as a synonym for Filter applied to relation.
-
-    // join: join:<shared_col, R, S> = natural join on shared column index
+    // join: join:<shared_col, R, S> = natural join on shared column index.
+    // NATIVE because: shared_col is a runtime value that determines which
+    // Selector to use for comparison and which columns to include in the
+    // merged tuple. Pure Func cannot parameterize Selector indices from data.
     defs.insert("join".to_string(), Func::Native(Arc::new(|x: &Object| {
         let items = match x.as_seq() {
             Some(items) if items.len() == 3 => items,
@@ -1127,8 +1201,6 @@ pub fn register_theta1(defs: &mut std::collections::HashMap<String, Func>) {
         let r = match items[1].as_seq() { Some(r) => r, None => return Object::Bottom };
         let s = match items[2].as_seq() { Some(s) => s, None => return Object::Bottom };
 
-        // Natural join: for each pair (r_tuple, s_tuple) where r[shared] = s[shared],
-        // produce the merged tuple
         let mut result: Vec<Object> = Vec::new();
         for r_tuple in r {
             let r_cols = match r_tuple.as_seq() { Some(c) => c, None => continue };
@@ -1143,7 +1215,6 @@ pub fn register_theta1(defs: &mut std::collections::HashMap<String, Func>) {
                 } else { continue };
 
                 if r_val == s_val {
-                    // Merge: all r columns + s columns excluding shared
                     let mut merged: Vec<Object> = r_cols.to_vec();
                     for (i, col) in s_cols.iter().enumerate() {
                         if i + 1 != shared_col {
@@ -1157,7 +1228,13 @@ pub fn register_theta1(defs: &mut std::collections::HashMap<String, Func>) {
         Object::Seq(result)
     })));
 
-    // tie: γ(R) = Filter(eq∘[s₁, sₙ]) : R — select tuples where first = last
+    // tie: gamma(R) = Filter(eq . [sel(1), sel(n)]) : R
+    // Selects tuples where first column = last column, then removes the last column.
+    // NATIVE because: "last column" requires knowing the tuple arity n at runtime.
+    // Backus's Selector(n) requires a fixed n at compile time. There is no
+    // "select last element" primitive in FP. The Reverse+Selector(1) trick
+    // works for comparison but the "remove last column" step still needs
+    // dynamic-arity Construction to rebuild the tuple without its last element.
     defs.insert("tie".to_string(), Func::Native(Arc::new(|x: &Object| {
         let relation = match x.as_seq() {
             Some(r) => r,
@@ -1167,7 +1244,6 @@ pub fn register_theta1(defs: &mut std::collections::HashMap<String, Func>) {
         for tuple in relation {
             if let Some(cols) = tuple.as_seq() {
                 if cols.len() >= 2 && cols[0] == cols[cols.len() - 1] {
-                    // Remove last column (tied to first)
                     result.push(Object::Seq(cols[..cols.len()-1].to_vec()));
                 }
             }
@@ -1175,7 +1251,11 @@ pub fn register_theta1(defs: &mut std::collections::HashMap<String, Func>) {
         Object::Seq(result)
     })));
 
-    // composition: R·S = π₁ₛ(R*S) — natural composition
+    // compose_rel: R . S = pi_1s(R*S) -- relational composition.
+    // Join R and S on shared column, then project out the shared column.
+    // NATIVE because: inherits both join's dynamic column selection and
+    // project's dynamic Construction building. The shared_col parameter
+    // determines runtime behavior that cannot be fixed at compile time.
     defs.insert("compose_rel".to_string(), Func::Native(Arc::new(|x: &Object| {
         let items = match x.as_seq() {
             Some(items) if items.len() == 3 => items,
@@ -1188,7 +1268,6 @@ pub fn register_theta1(defs: &mut std::collections::HashMap<String, Func>) {
         let r = match items[1].as_seq() { Some(r) => r, None => return Object::Bottom };
         let s = match items[2].as_seq() { Some(s) => s, None => return Object::Bottom };
 
-        // Join then project out the shared column
         let mut result: Vec<Object> = Vec::new();
         for r_tuple in r {
             let r_cols = match r_tuple.as_seq() { Some(c) => c, None => continue };
@@ -1203,7 +1282,6 @@ pub fn register_theta1(defs: &mut std::collections::HashMap<String, Func>) {
                 } else { continue };
 
                 if r_val == s_val {
-                    // Project: r columns (excluding shared) + s columns (excluding shared)
                     let mut projected: Vec<Object> = Vec::new();
                     for (i, col) in r_cols.iter().enumerate() {
                         if i + 1 != shared_col { projected.push(col.clone()); }
@@ -1250,6 +1328,11 @@ impl Func {
         Func::Insert(Box::new(f))
     }
 
+    /// foldl(f)
+    pub fn foldl(f: Func) -> Func {
+        Func::FoldL(Box::new(f))
+    }
+
     /// Filter(p)
     pub fn filter(p: Func) -> Func {
         Func::Filter(Box::new(p))
@@ -1278,7 +1361,7 @@ impl Func {
             Func::Compose(f, g) => f.has_native() || g.has_native(),
             Func::Construction(fs) => fs.iter().any(|f| f.has_native()),
             Func::Condition(p, f, g) => p.has_native() || f.has_native() || g.has_native(),
-            Func::ApplyToAll(f) | Func::Insert(f) | Func::Filter(f) => f.has_native(),
+            Func::ApplyToAll(f) | Func::Insert(f) | Func::Filter(f) | Func::FoldL(f) => f.has_native(),
             Func::While(p, f) => p.has_native() || f.has_native(),
             Func::BinaryToUnary(f, _) => f.has_native(),
             _ => false,
@@ -1331,6 +1414,7 @@ impl fmt::Debug for Func {
             Func::Condition(p, t, e) => write!(f, "({:?} → {:?}; {:?})", p, t, e),
             Func::ApplyToAll(g) => write!(f, "α{:?}", g),
             Func::Insert(g) => write!(f, "/{:?}", g),
+            Func::FoldL(g) => write!(f, "foldl({:?})", g),
             Func::Filter(p) => write!(f, "Filter({:?})", p),
             Func::BinaryToUnary(g, x) => write!(f, "(bu {:?} {:?})", g, x),
             Func::While(p, g) => write!(f, "(while {:?} {:?})", p, g),
@@ -2437,5 +2521,127 @@ mod tests {
             apply_ffp(&filter_obj, &seq, &d),
             Object::seq(vec![Object::atom("owner"), Object::atom("owner")])
         );
+    }
+
+    // ── FoldL tests ─────────────────────────────────────────────
+
+    #[test]
+    fn foldl_sums_left_to_right() {
+        // FoldL(+) : <0, <1, 2, 3>> = ((0+1)+2)+3 = 6
+        let d = defs();
+        let foldl_add = Func::foldl(Func::Add);
+        let input = Object::seq(vec![
+            Object::atom("0"),
+            Object::seq(vec![Object::atom("1"), Object::atom("2"), Object::atom("3")]),
+        ]);
+        assert_eq!(apply(&foldl_add, &input, &d), Object::atom("6"));
+    }
+
+    #[test]
+    fn foldl_state_machine_fold() {
+        // State machine: state is a string, events toggle between "on" and "off".
+        // Transition function: if event = "toggle" then flip state, else keep state.
+        // We model this with: Condition(eq . [sel(2), const("toggle")], flip, sel(1))
+        // where flip = Condition(eq . [sel(1), const("on")], const("off"), const("on"))
+        let d = defs();
+
+        // flip: <state, event> -> if state = "on" then "off" else "on"
+        let flip = Func::condition(
+            Func::compose(Func::Eq, Func::construction(vec![
+                Func::Selector(1),
+                Func::constant(Object::atom("on")),
+            ])),
+            Func::constant(Object::atom("off")),
+            Func::constant(Object::atom("on")),
+        );
+
+        // transition: <state, event> -> if event = "toggle" then flip(state) else state
+        let transition = Func::condition(
+            Func::compose(Func::Eq, Func::construction(vec![
+                Func::Selector(2),
+                Func::constant(Object::atom("toggle")),
+            ])),
+            flip,
+            Func::Selector(1),
+        );
+
+        // FoldL(transition) : <"off", <"toggle", "toggle", "toggle">>
+        // off -> toggle -> on -> toggle -> off -> toggle -> on
+        let foldl_sm = Func::foldl(transition);
+        let input = Object::seq(vec![
+            Object::atom("off"),
+            Object::seq(vec![
+                Object::atom("toggle"),
+                Object::atom("toggle"),
+                Object::atom("toggle"),
+            ]),
+        ]);
+        assert_eq!(apply(&foldl_sm, &input, &d), Object::atom("on"));
+    }
+
+    // ── Edge case tests ─────────────────────────────────────────
+
+    #[test]
+    fn while_exceeding_limit_returns_bottom() {
+        // While with a predicate that always returns T should hit the 1000
+        // iteration safety limit and return Bottom, not loop forever.
+        let d = defs();
+        // predicate: always T (constant T)
+        let always_true = Func::constant(Object::t());
+        // body: identity (state never changes, but predicate always says continue)
+        let w = Func::While(Box::new(always_true), Box::new(Func::Id));
+        let result = apply(&w, &Object::atom("start"), &d);
+        assert_eq!(result, Object::Bottom);
+    }
+
+    #[test]
+    fn parse_deeply_nested_returns_bottom() {
+        // 200 levels of < nesting exceeds MAX_PARSE_DEPTH (100).
+        // At depth 100, parse_with_depth returns Bottom for the inner content.
+        // Note: parse_with_depth uses Object::Seq (not Object::seq), so Bottom
+        // does NOT propagate outward through the nesting. The innermost parsed
+        // level contains Bottom as a leaf element.
+        let opens: String = "<".repeat(200);
+        let closes: String = ">".repeat(200);
+        let input = format!("{}x{}", opens, closes);
+        let result = Object::parse(&input);
+        // Walk down 100 levels of Seq([...]) to reach Bottom
+        let mut current = &result;
+        for _ in 0..100 {
+            match current {
+                Object::Seq(items) if items.len() == 1 => current = &items[0],
+                other => { current = other; break; }
+            }
+        }
+        assert_eq!(*current, Object::Bottom,
+            "At depth 100+, parse should produce Bottom");
+    }
+
+    #[test]
+    fn parse_mismatched_brackets() {
+        // Missing close bracket: <a, <b> -- outer < never closed.
+        // split_top_level sees "a, <b>" as the inner content of <...>
+        // but the outer string does NOT end with > so it parses as an atom.
+        let result1 = Object::parse("<a, <b>");
+        // The string starts with < but ends with > -- the OUTER < matches the
+        // inner >. Inner is "a, <b" which splits into ["a", "<b"]. "<b" does
+        // not end with > so it parses as atom "<b".
+        assert!(result1 != Object::Bottom, "partial parse should not be Bottom");
+
+        // Missing open bracket: "a, b>" -- no < at start, so it is an atom.
+        let result2 = Object::parse("a, b>");
+        assert_eq!(result2, Object::Atom("a, b>".to_string()));
+    }
+
+    #[test]
+    fn foldl_empty_sequence_returns_accumulator() {
+        // FoldL(f) : <z, <>> = z (base case of left fold)
+        let d = defs();
+        let foldl_add = Func::foldl(Func::Add);
+        let input = Object::seq(vec![
+            Object::atom("42"),
+            Object::phi(), // empty sequence
+        ]);
+        assert_eq!(apply(&foldl_add, &input, &d), Object::atom("42"));
     }
 }
