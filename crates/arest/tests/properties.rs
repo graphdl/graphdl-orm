@@ -1163,7 +1163,7 @@ fn constraint_evaluation_via_application() {
 
     // Find a UC constraint and verify it's callable against a population object
     let (_, uc_func) = defs.iter()
-        .find(|(name, _)| name.contains("constraint:") && name.contains("UC"))
+        .find(|(name, _)| name.contains("constraint:") && name.contains("at most one"))
         .expect("Should have a UC constraint");
 
     // The eval context is <response_text, sender, population>.
@@ -1211,7 +1211,7 @@ fn constraint_evaluation_via_application() {
 
     // Find the UC on "placed by" specifically
     let (_, placed_by_uc) = defs.iter()
-        .find(|(name, _)| name.contains("constraint:UC") && name.contains("placed by"))
+        .find(|(name, _)| name.contains("constraint:") && name.contains("at most one") && name.contains("placed by"))
         .expect("UC on placed by");
     let violation_result = ast::apply(placed_by_uc, &context_with_violation, &def_map);
     assert_ne!(violation_result, Object::phi(),

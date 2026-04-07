@@ -906,12 +906,15 @@ fn parse_into(ir: &mut Domain, input: &str) -> Result<(), String> {
                     && !set_comparison_kinds.contains(&c.kind.as_str()) =>
             {
                 let c = match action { ParseAction::AddConstraint(c) => c, _ => unreachable!() };
+                // "exactly one" = UC + MC. Each gets its own reading as id.
                 let mut uc = resolve_constraint_schema(c.clone(), &noun_names, &catalog, ir);
                 uc.kind = "UC".into();
-                if uc.id.is_empty() { uc.id = format!("UC:{}", uc.text); }
+                uc.text = uc.text.replace("exactly one", "at most one");
+                if uc.id.is_empty() { uc.id = uc.text.clone(); }
                 let mut mc = resolve_constraint_schema(c, &noun_names, &catalog, ir);
                 mc.kind = "MC".into();
-                if mc.id.is_empty() { mc.id = format!("MC:{}", mc.text); }
+                mc.text = mc.text.replace("exactly one", "some");
+                if mc.id.is_empty() { mc.id = mc.text.clone(); }
                 ir.constraints.push(uc);
                 ir.constraints.push(mc);
             }
