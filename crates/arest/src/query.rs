@@ -28,21 +28,24 @@ use crate::types::FactInstance;
 /// Each fact becomes a sequence of its bindings (ordered by the schema's role_names).
 /// The population becomes a sequence of these fact sequences.
 pub(crate) fn population_to_object(population: &Population, schema: &CompiledSchema) -> Object {
-    let facts = match population.facts.get(&schema.id) {
-        Some(f) => f,
+    state_to_object(&ast::population_to_state(population), schema)
+}
+
+/// Convert facts from an Object state for a given fact type into a positional Object sequence.
+/// Each fact becomes a sequence ordered by the schema's role_names.
+pub(crate) fn state_to_object(state: &Object, schema: &CompiledSchema) -> Object {
+    let facts = ast::fetch_or_phi(&schema.id, state);
+    let items = match facts.as_seq() {
+        Some(fact_objs) => fact_objs.iter().map(|fact| {
+            let bindings: Vec<Object> = schema.role_names.iter().map(|role_name| {
+                ast::binding(fact, role_name)
+                    .map(Object::atom)
+                    .unwrap_or(Object::Bottom)
+            }).collect();
+            Object::seq(bindings)
+        }).collect(),
         None => return Object::phi(),
     };
-
-    let items: Vec<Object> = facts.iter().map(|fact| {
-        let bindings: Vec<Object> = schema.role_names.iter().map(|role_name| {
-            fact.bindings.iter()
-                .find(|(n, _)| n == role_name)
-                .map(|(_, v)| Object::atom(v))
-                .unwrap_or(Object::Bottom)
-        }).collect();
-        Object::seq(bindings)
-    }).collect();
-
     Object::Seq(items)
 }
 
@@ -104,8 +107,18 @@ pub(crate) fn query_with_ast(
     target_role: usize,
     filter_bindings: &[(usize, &str)],
 ) -> Vec<String> {
+    query_with_ast_state(&ast::population_to_state(population), schema, target_role, filter_bindings)
+}
+
+/// Query an Object state using partial application of a graph schema.
+pub(crate) fn query_with_ast_state(
+    state: &Object,
+    schema: &CompiledSchema,
+    target_role: usize,
+    filter_bindings: &[(usize, &str)],
+) -> Vec<String> {
     let defs = std::collections::HashMap::new();
-    let pop = population_to_object(population, schema);
+    let pop = state_to_object(state, schema);
 
     let query = build_query(target_role, filter_bindings);
     let result = ast::apply(&query, &pop, &defs);
