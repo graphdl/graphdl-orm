@@ -1,8 +1,8 @@
 // crates/arest/src/arest.rs
 //
-// AREST â€" Applicative REpresentational State Transfer
+// AREST -- Applicative REpresentational State Transfer
 //
-// Command : Population â†’ (Population', Representation)
+// Command : Population -> (Population', Representation)
 //
 // The command is compiled from readings. The engine applies it.
 // The result is the new population and a hypermedia representation
@@ -12,7 +12,7 @@ use serde::{Serialize, Deserialize};
 use crate::types::*;
 use crate::ast;
 
-// â"€â"€ Commands â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
+// -- Commands ---------------------------------------------------------
 
 /// The five input classes from Backus Section 14.4.2.
 /// Each corresponds to an AREST operation.
@@ -43,7 +43,7 @@ pub enum Command {
         target: String,
         bindings: std::collections::HashMap<String, String>,
     },
-    /// is-upd: update entity fields (â†"F âˆ˜ [upd, defs])
+    /// is-upd: update entity fields (<->F  .  [upd, defs])
     UpdateEntity {
         noun: String,
         domain: String,
@@ -58,7 +58,7 @@ pub enum Command {
     },
 }
 
-// â"€â"€ Result â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
+// -- Result -----------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -69,7 +69,7 @@ pub struct CommandResult {
     pub violations: Vec<Violation>,
     pub derived_count: usize,
     pub rejected: bool,
-    /// The transformed population â€" the authoritative state after this command.
+    /// The transformed population -- the authoritative state after this command.
     pub population: Population,
 }
 
@@ -91,7 +91,7 @@ pub struct TransitionAction {
     pub href: String,
 }
 
-// â"€â"€ Apply â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
+// -- Apply ------------------------------------------------------------
 
 // -- apply_command_defs -----------------------------------------------
 // Eq. 12: create = emit . validate . derive . resolve
@@ -552,7 +552,7 @@ fn update_via_defs(
     }
 }
 
-// â"€â"€ is-chg: install readings â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
+// -- is-chg: install readings ----------------------------------------
 
 fn apply_load_readings(
     markdown: &str,
@@ -603,11 +603,11 @@ fn apply_load_readings(
     }
 }
 
-// â"€â"€ Helpers â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
+// -- Helpers ----------------------------------------------------------
 
 /// HATEOAS as Projection (Theorem 3):
-/// links(s) = Ï€_event(Filter(p) : T)
-/// where p(t) = (s_from(t) = s) âˆ¨ anc(s_from(t), s)
+/// links(s) = pi_event(Filter(p) : T)
+/// where p(t) = (s_from(t) = s)  OR  anc(s_from(t), s)
 ///
 /// anc(a, b) = true if a is a supertype status that b inherits transitions from.
 /// For flat state machines (no subtyping), only direct matches apply.
@@ -646,7 +646,7 @@ fn hateoas_from_population(
         }
     }
 
-    // Filter(p) : T where p(t) = s_from(t) âˆˆ {status} âˆª ancestors(status)
+    // Filter(p) : T where p(t) = s_from(t)  in  {status}  union  ancestors(status)
     transition_facts.iter()
         .filter(|fact| {
             fact.bindings.iter().any(|(k, v)| k == "from" && ancestor_statuses.contains(v))
@@ -696,7 +696,7 @@ fn to_camel_case(s: &str) -> String {
         .collect()
 }
 
-// â"€â"€ Tests â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
+// -- Tests ------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -917,7 +917,7 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
         let created = apply_command_defs(&def_map, &create, &pop);
         assert_eq!(created.status.as_deref(), Some("Draft"));
 
-        // Transition: Draft â†’ Placed
+        // Transition: Draft -> Placed
         let transition = Command::Transition {
             entity_id: "ORD-1".to_string(),
             event: "place".to_string(),
@@ -939,7 +939,7 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
         assert_eq!(status_binding.1, "Placed", "population must reflect new status");
     }
 
-    // â"€â"€ is-qry: Query command â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
+    // -- is-qry: Query command -----------------------------------
 
     #[test]
     fn query_command_returns_matches() {
@@ -978,7 +978,7 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
         assert_eq!(result.entities[0].entity_type, "QueryResult");
     }
 
-    // â"€â"€ is-chg: LoadReadings command â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
+    // -- is-chg: LoadReadings command ----------------------------
 
     #[test]
     fn load_readings_command_parses_markdown() {
@@ -1000,7 +1000,7 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
         let (def_map, pop) = setup_order_defs();
 
         let cmd = Command::LoadReadings {
-            markdown: "".to_string(), // empty â€" should parse OK (empty domain)
+            markdown: "".to_string(), // empty -- should parse OK (empty domain)
             domain: "empty".to_string(),
         };
 

@@ -1,13 +1,13 @@
-﻿// crates/arest/src/verbalize.rs
+// crates/arest/src/verbalize.rs
 //
-// compileâ»Â¹: Recover FORML 2 readings from compiled constraints.
+// compile-^1: Recover FORML 2 readings from compiled constraints.
 //
 // Given a ConstraintDef (the IR representation), produce the FORML 2
 // verbalization following Halpin & Curland's patterns (TechReport ORM2-02).
 //
-// This is the inverse of parse_forml2.rs â†’ compile.rs. Together they
+// This is the inverse of parse_forml2.rs -> compile.rs. Together they
 // close the specification equivalence loop (Theorem 2 of the AREST paper):
-//   verbalize âˆ˜ compileâ»Â¹ âˆ˜ compile âˆ˜ parse = id
+//   verbalize  .  compile-^1  .  compile  .  parse = id
 
 use crate::types::*;
 
@@ -208,7 +208,7 @@ fn extract_predicate(reading: &str, noun_a: &str, noun_b: &str) -> String {
     reading.split_whitespace().skip(1).collect::<Vec<_>>().join(" ")
 }
 
-// â”€â”€ Tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// -- Tests -----------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -241,7 +241,7 @@ mod tests {
         let ir = parse_forml2::parse_markdown(input).unwrap();
         let uc = ir.constraints.iter().find(|c| c.kind == "UC").unwrap();
         let mc = ir.constraints.iter().find(|c| c.kind == "MC").unwrap();
-        // Both UC and MC split from "exactly one" â€” verify both exist
+        // Both UC and MC split from "exactly one" -- verify both exist
         assert_eq!(uc.kind, "UC");
         assert_eq!(mc.kind, "MC");
         // Verbalization returns the constraint text

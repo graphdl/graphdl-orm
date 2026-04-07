@@ -1,13 +1,13 @@
-﻿// crates/arest/src/parse_forml2.rs
+// crates/arest/src/parse_forml2.rs
 //
-// FORML 2 Parser â€” FFP composition of recognizer functions.
+// FORML 2 Parser -- FFP composition of recognizer functions.
 //
-// Per the paper: parse: R â†’ Î¦ (Theorem 2).
-// parse = Î±(recognize) : lines
-// recognize = tryâ‚ ; tryâ‚‚ ; ... ; tryâ‚™
+// Per the paper: parse: R -> Phi (Theorem 2).
+// parse = alpha(recognize) : lines
+// recognize = try1 ; try2 ; ... ; tryn
 //
-// Each recognizer: &str â†’ Option<ParseAction>
-// The ? operator IS the conditional form âŸ¨COND, is_some, unwrap, âŠ¥âŸ©.
+// Each recognizer: &str -> Option<ParseAction>
+// The ? operator IS the conditional form <COND, is_some, unwrap, _|_>.
 // No if/else chains. Pattern matching via strip_suffix/strip_prefix/find.
 
 use crate::types::*;
@@ -37,7 +37,7 @@ enum ParseAction {
 }
 
 // =========================================================================
-// Recognizers â€” pure functions: &str â†’ Option<ParseAction>
+// Recognizers -- pure functions: &str -> Option<ParseAction>
 // The ? operator replaces all if/else branching.
 // =========================================================================
 
@@ -112,7 +112,7 @@ fn try_totality(line: &str) -> Option<ParseAction> {
 fn try_ring(line: &str, noun_names: &[String]) -> Option<ParseAction> {
     let clean = line.trim_end_matches('.');
 
-    // IR: "No A R itself." â€” simple irreflexive
+    // IR: "No A R itself." -- simple irreflexive
     // AC: "No A may cycle back to itself via one or more traversals through R."
     if let Some(rest) = clean.strip_prefix("No ") {
         // AC pattern: "No A may cycle back to itself ..."
@@ -130,7 +130,7 @@ fn try_ring(line: &str, noun_names: &[String]) -> Option<ParseAction> {
                 min_occurrence: None, max_occurrence: None,
             }));
         }
-        // IR pattern: "No A R itself" â€” must end with " itself" and have a known noun
+        // IR pattern: "No A R itself" -- must end with " itself" and have a known noun
         if rest.ends_with(" itself") {
             let has_noun = noun_names.iter().any(|n| {
                 rest.starts_with(n.as_str())
@@ -193,19 +193,19 @@ fn try_ring(line: &str, noun_names: &[String]) -> Option<ParseAction> {
     let is_not_in_antecedent = antecedent.contains(" is not ");
 
     let kind = match (has_and, impossible, itself_in_consequent, is_not_in_antecedent) {
-        // AS: no and, impossible, no itself â€” "If A1 R A2 then it is impossible that A2 R A1"
+        // AS: no and, impossible, no itself -- "If A1 R A2 then it is impossible that A2 R A1"
         (false, true, false, _)  => "AS",
-        // RF: no and, not impossible, itself in consequent â€” "If A1 R some A2 then A1 R itself"
+        // RF: no and, not impossible, itself in consequent -- "If A1 R some A2 then A1 R itself"
         (false, false, true, _)  => "RF",
-        // SY: no and, not impossible, no itself â€” "If A1 R A2 then A2 R A1"
+        // SY: no and, not impossible, no itself -- "If A1 R A2 then A2 R A1"
         (false, false, false, _) => "SY",
-        // AT: and, impossible, "is not" in antecedent â€” "If A1 R A2 and A1 is not A2 then impossible A2 R A1"
+        // AT: and, impossible, "is not" in antecedent -- "If A1 R A2 and A1 is not A2 then impossible A2 R A1"
         (true, true, _, true)    => "AT",
-        // IT: and, impossible, no "is not" â€” "If A1 R A2 and A2 R A3 then impossible A1 R A3"
+        // IT: and, impossible, no "is not" -- "If A1 R A2 and A2 R A3 then impossible A1 R A3"
         (true, true, _, false)   => "IT",
-        // TR: and, not impossible â€” "If A1 R A2 and A2 R A3 then A1 R A3"
+        // TR: and, not impossible -- "If A1 R A2 and A2 R A3 then A1 R A3"
         (true, false, _, _)      => "TR",
-        // Unrecognized combination â€” not a ring constraint
+        // Unrecognized combination -- not a ring constraint
         _ => return None,
     };
 
@@ -217,7 +217,7 @@ fn try_ring(line: &str, noun_names: &[String]) -> Option<ParseAction> {
     }))
 }
 
-/// try_subset â€” SS: "If some A Râ‚ some B then that A Râ‚‚ that B."
+/// try_subset -- SS: "If some A R1 some B then that A R2 that B."
 /// Distinguishes from ring: subset has multiple different base noun types.
 fn try_subset(line: &str, noun_names: &[String]) -> Option<ParseAction> {
     let clean = line.trim_end_matches('.');
@@ -244,7 +244,7 @@ fn try_subset(line: &str, noun_names: &[String]) -> Option<ParseAction> {
     if all_same { return None; }
 
     // Build spans: [0] = subset (antecedent), [1] = superset (consequent)
-    // SpanDef with empty fact_type_id â€” resolve_constraint_schema fills it in later
+    // SpanDef with empty fact_type_id -- resolve_constraint_schema fills it in later
     let spans = vec![
         SpanDef { fact_type_id: String::new(), role_index: 0, subset_autofill: None },
         SpanDef { fact_type_id: String::new(), role_index: 0, subset_autofill: None },
@@ -258,7 +258,7 @@ fn try_subset(line: &str, noun_names: &[String]) -> Option<ParseAction> {
     }))
 }
 
-/// try_equality â€” EQ: "...if and only if..." or "all or none of the following hold:..."
+/// try_equality -- EQ: "...if and only if..." or "all or none of the following hold:..."
 fn try_equality(line: &str) -> Option<ParseAction> {
     let clean = line.trim_end_matches('.');
     let matches = clean.contains(" if and only if ")
@@ -272,12 +272,12 @@ fn try_equality(line: &str) -> Option<ParseAction> {
     }))
 }
 
-/// try_set_comparison â€” XO, XC, OR
+/// try_set_comparison -- XO, XC, OR
 /// Patterns:
-///   "For each A, exactly one of the following holds: ..." â†’ XO
-///   "For each A, at most one of the following holds: ..."  â†’ XC
-///   "For each A, at least one of the following holds: ..." â†’ OR (inclusive disjunction)
-///   "Each A Râ‚ some Bâ‚ or Râ‚‚ some Bâ‚‚."                   â†’ OR (DMaC disjunctive MC)
+///   "For each A, exactly one of the following holds: ..." -> XO
+///   "For each A, at most one of the following holds: ..."  -> XC
+///   "For each A, at least one of the following holds: ..." -> OR (inclusive disjunction)
+///   "Each A R1 some B1 or R2 some B2."                   -> OR (DMaC disjunctive MC)
 fn try_set_comparison(line: &str, noun_names: &[String]) -> Option<ParseAction> {
     let clean = line.trim_end_matches('.');
 
@@ -312,7 +312,7 @@ fn try_set_comparison(line: &str, noun_names: &[String]) -> Option<ParseAction> 
         }));
     }
 
-    // "Each A Râ‚ some Bâ‚ or Râ‚‚ some Bâ‚‚." â€” DMaC disjunctive MC â†’ OR
+    // "Each A R1 some B1 or R2 some B2." -- DMaC disjunctive MC -> OR
     if let Some(rest) = clean.strip_prefix("Each ") {
         // Must contain " or " and reference known nouns
         if !rest.contains(" or ") { return None; }
@@ -322,7 +322,7 @@ fn try_set_comparison(line: &str, noun_names: &[String]) -> Option<ParseAction> 
         // Must have " or " in the remainder (not " or a/an " as in totality)
         if !after.contains(" or ") { return None; }
         // Exclude totality pattern: "Each X is a Y or a Z" (handled by try_totality)
-        // A disjunctive MC has " or is" or " or has" â€” a verb after "or"
+        // A disjunctive MC has " or is" or " or has" -- a verb after "or"
         let or_idx = after.find(" or ")?;
         let after_or = &after[or_idx + 4..];
         // Totality uses "a " / "an " after "or"; disjunctive MC uses a predicate verb
@@ -346,7 +346,7 @@ fn try_set_comparison(line: &str, noun_names: &[String]) -> Option<ParseAction> 
     None
 }
 
-/// try_frequency â€” FC: "Each A R at least {k} and at most {m} B."
+/// try_frequency -- FC: "Each A R at least {k} and at most {m} B."
 /// MUST fire before try_constraint because "at least 1" (digit) is FC
 /// while "at least one" (word) is MC. try_constraint would misclassify it.
 fn try_frequency(line: &str, noun_names: &[String]) -> Option<ParseAction> {
@@ -397,10 +397,10 @@ fn try_frequency(line: &str, noun_names: &[String]) -> Option<ParseAction> {
     }))
 }
 
-/// try_external_uc â€” UC (external uniqueness and context pattern)
+/// try_external_uc -- UC (external uniqueness and context pattern)
 /// Patterns:
-///   "For each Bâ‚ and Bâ‚‚, at most one A Râ‚ that Bâ‚ and Râ‚‚ that Bâ‚‚."
-///   "Context: Fâ‚; Fâ‚‚. In this context, each Bâ‚, Bâ‚‚ combination is associated with at most one A."
+///   "For each B1 and B2, at most one A R1 that B1 and R2 that B2."
+///   "Context: F1; F2. In this context, each B1, B2 combination is associated with at most one A."
 fn try_external_uc(line: &str, noun_names: &[String]) -> Option<ParseAction> {
     let clean = line.trim_end_matches('.');
 
@@ -422,11 +422,11 @@ fn try_external_uc(line: &str, noun_names: &[String]) -> Option<ParseAction> {
         return None;
     }
 
-    // "For each Bâ‚ and Bâ‚‚, at most one A ..."
+    // "For each B1 and B2, at most one A ..."
     if let Some(rest) = clean.strip_prefix("For each ") {
         // Must have "at most one" in the body
         if !clean.contains("at most one") { return None; }
-        // Must have " and " in the "For each" list (external UC uses "Bâ‚ and Bâ‚‚")
+        // Must have " and " in the "For each" list (external UC uses "B1 and B2")
         let comma_idx = rest.find(',')?;
         let quantified = &rest[..comma_idx];
         if !quantified.contains(" and ") { return None; }
@@ -454,7 +454,7 @@ fn try_deontic(line: &str) -> Option<ParseAction> {
         .or_else(|| line.strip_prefix("It is forbidden that ").map(|r| ("forbidden", r)))
         .or_else(|| line.strip_prefix("It is permitted that ").map(|r| ("permitted", r)))?;
     // Extract the entity noun: first capitalized phrase after the operator prefix.
-    // e.g., "each Support Response uses Dash" â†’ entity = "Support Response"
+    // e.g., "each Support Response uses Dash" -> entity = "Support Response"
     let entity_rest = rest.strip_prefix("each ").or(Some(rest)).unwrap();
     // The entity is the leading capitalized words before a lowercase verb
     let entity: String = entity_rest.split_whitespace()
@@ -509,7 +509,7 @@ fn try_derivation(line: &str) -> Option<ParseAction> {
     })
 }
 
-/// try_span_naming â€” "This span with A, B provides the preferred identification scheme for SpanName."
+/// try_span_naming -- "This span with A, B provides the preferred identification scheme for SpanName."
 fn try_span_naming(line: &str) -> Option<ParseAction> {
     let rest = line.strip_prefix("This span with ")?;
     let pivot = rest.find(" provides the preferred identification scheme for ")?;
@@ -521,7 +521,7 @@ fn try_span_naming(line: &str) -> Option<ParseAction> {
         .then(|| ParseAction::AddNamedSpan(span_name, role_nouns))
 }
 
-/// try_autofill_declaration â€” "Constraint Span 'SpanName' autofills from superset."
+/// try_autofill_declaration -- "Constraint Span 'SpanName' autofills from superset."
 fn try_autofill_declaration(line: &str) -> Option<ParseAction> {
     let rest = line.strip_prefix("Constraint Span '")?;
     let end_quote = rest.find('\'')?;
@@ -553,7 +553,7 @@ fn try_fact_type(line: &str, noun_names: &[String]) -> Option<ParseAction> {
 }
 
 // =========================================================================
-// Main parser â€” fold recognizers over lines
+// Main parser -- fold recognizers over lines
 // =========================================================================
 
 /// Parse with pre-existing nouns from other domains.
@@ -754,7 +754,7 @@ fn parse_into(ir: &mut Domain, input: &str) -> Result<(), String> {
 
     let lines: Vec<String> = input.lines().map(|s| s.to_string()).collect();
 
-    // Pass 1: Î±(recognize_noun) : lines â€” extract nouns and domain
+    // Pass 1: alpha(recognize_noun) : lines -- extract nouns and domain
     for i in 0..lines.len() {
         let line = lines[i].trim();
         let action = None
@@ -870,7 +870,7 @@ fn parse_into(ir: &mut Domain, input: &str) -> Result<(), String> {
             || try_header(line).is_some();
         if is_pass1 { continue; }
 
-        // Totality â†’ mark abstract (but don't skip â€” still parse as constraint)
+        // Totality -> mark abstract (but don't skip -- still parse as constraint)
         if let Some(action) = try_totality(line) {
             apply_action(ir, Some(action), &lines, i);
         }
@@ -930,7 +930,7 @@ fn parse_into(ir: &mut Domain, input: &str) -> Result<(), String> {
         }
     }
 
-    // Task 6: Value Constraint (VC) â€” emit one VC per noun with enum_values.
+    // Task 6: Value Constraint (VC) -- emit one VC per noun with enum_values.
     // The compiler reads enum values from ir.enum_values;
     // the ConstraintDef just marks which noun has a value constraint.
     let vc_nouns: Vec<String> = ir.enum_values.keys().cloned().collect();
@@ -1008,7 +1008,7 @@ fn resolve_derivation_rule(rule: &mut DerivationRuleDef, ir: &Domain, catalog: &
         text.replace("that ", "")
     };
 
-    // Resolve a text fragment to a Graph Schema ID via Ï-lookup through the catalog.
+    // Resolve a text fragment to a Graph Schema ID via rho-lookup through the catalog.
     let resolve_fact_type = |fragment: &str| -> Option<String> {
         let cleaned = strip_anaphora(fragment);
         let found_nouns: Vec<(usize, usize, String)> = find_nouns(&cleaned, &noun_names);
@@ -1020,13 +1020,13 @@ fn resolve_derivation_rule(rule: &mut DerivationRuleDef, ir: &Domain, catalog: &
             .map(|pair| cleaned[pair[0].1..pair[1].0].trim())
             .unwrap_or("");
 
-        // Ï-lookup: try with verb first, then noun set only
+        // rho-lookup: try with verb first, then noun set only
         let verb_opt = (!verb.is_empty()).then_some(verb);
         catalog.resolve(&role_refs, verb_opt)
             .or_else(|| catalog.resolve(&role_refs, None))
     };
 
-    // Detect "that X" anaphoric references â€” nouns preceded by "that " in
+    // Detect "that X" anaphoric references -- nouns preceded by "that " in
     // antecedent parts become join keys.
     let join_keys: Vec<String> = antecedent_parts.iter()
         .flat_map(|part| {
@@ -1112,7 +1112,7 @@ fn apply_action(ir: &mut Domain, action: Option<ParseAction>, lines: &[String], 
 }
 
 // =========================================================================
-// Pure extraction functions (no if/else â€” use ? and strip_prefix/suffix)
+// Pure extraction functions (no if/else -- use ? and strip_prefix/suffix)
 // =========================================================================
 
 fn parse_entity_decl(text: &str) -> Option<(String, Option<Vec<String>>)> {
@@ -1147,10 +1147,10 @@ fn graph_schema_id(role_nouns: &[&str], verb: &str) -> String {
     parts.join("_")
 }
 
-/// Schema catalog for Ï-lookup: noun set â†’ Graph Schema ID.
+/// Schema catalog for rho-lookup: noun set -> Graph Schema ID.
 /// The noun set is the key. The catalog is the DEFS cell.
 struct SchemaCatalog {
-    /// Sorted noun set â†’ vec of (schema_id, verb, reading) for disambiguation
+    /// Sorted noun set -> vec of (schema_id, verb, reading) for disambiguation
     by_noun_set: HashMap<Vec<String>, Vec<(String, String, String)>>,
 }
 
@@ -1171,7 +1171,7 @@ impl SchemaCatalog {
             .push((schema_id.to_string(), verb.to_lowercase(), reading.to_lowercase()));
     }
 
-    /// Ï-lookup: noun set â†’ Graph Schema ID.
+    /// rho-lookup: noun set -> Graph Schema ID.
     /// Resolution strategy (no COND dispatch, just cascading lookup):
     /// 1. Exact verb match
     /// 2. Verb contained in stored reading (handles inverse voice)
@@ -1232,7 +1232,7 @@ fn resolve_constraint_schema(
         let verb_text = stripped[found[0].1..found[1].0].trim();
         let verb = if verb_text.is_empty() { None } else { Some(verb_text) };
 
-        // Primary: Ï-lookup through catalog (exact verb, then reading containment, then unique)
+        // Primary: rho-lookup through catalog (exact verb, then reading containment, then unique)
         // Secondary: verb containment against ir.fact_types readings (handles inverse voice
         // when multiple schemas share the same noun pair)
         if let Some(schema_id) = catalog.resolve(&role_nouns, verb)
@@ -1357,7 +1357,7 @@ fn parse_constraint(line: &str, noun_names: &[String]) -> Option<ConstraintDef> 
         .unwrap_or("UC");
 
     // Derive fact type ID from the nouns in the constraint.
-    // The fact type reading = "Noun1 predicate Noun2" â€” extracted from the stripped text.
+    // The fact type reading = "Noun1 predicate Noun2" -- extracted from the stripped text.
     let ft_id = if found.len() >= 2 {
         let predicate = stripped[found[0].1..found[1].0].trim();
         if !predicate.is_empty() {
@@ -1381,7 +1381,7 @@ fn parse_constraint(line: &str, noun_names: &[String]) -> Option<ConstraintDef> 
     })
 }
 
-/// Find nouns in text â€” longest-first matching with word boundaries.
+/// Find nouns in text -- longest-first matching with word boundaries.
 /// Returns (start, end, name) tuples sorted by position.
 fn find_nouns(text: &str, noun_names: &[String]) -> Vec<(usize, usize, String)> {
     let mut sorted: Vec<&String> = noun_names.iter().collect();
@@ -1426,7 +1426,7 @@ fn parse_general_instance_fact(ir: &mut Domain, line: &str) {
     let mut noun_names: Vec<String> = ir.nouns.keys().cloned().collect();
     noun_names.sort_by(|a, b| b.len().cmp(&a.len()));
 
-    // bu(match_subject, line) â€” find the first noun that matches as subject
+    // bu(match_subject, line) -- find the first noun that matches as subject
     let subject = noun_names.iter()
         .filter_map(|noun| {
             let prefix = format!("{} '", noun);
@@ -1442,7 +1442,7 @@ fn parse_general_instance_fact(ir: &mut Domain, line: &str) {
         None => return,
     };
 
-    // bu(match_object, rest) â€” find the object noun+value in the remainder
+    // bu(match_object, rest) -- find the object noun+value in the remainder
     let object_match = noun_names.iter()
         .filter_map(|noun| {
             let obj_prefix = format!("{} '", noun);
@@ -2020,7 +2020,7 @@ Constraint Span 'Department Leadership' autofills from superset.";
         assert!(ss.spans.iter().any(|s| s.subset_autofill == Some(true)), "autofill should be set");
     }
 
-    // â”€â”€ Deontic constraint fixes (2026-04-03) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // -- Deontic constraint fixes (2026-04-03) -------------------------
 
     #[test]
     fn deontic_forbidden_extracts_entity() {

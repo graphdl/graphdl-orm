@@ -1,25 +1,25 @@
-﻿// crates/arest/src/rmap.rs
+// crates/arest/src/rmap.rs
 //
-// RMAP â€” Relational Mapping Procedure (Halpin, Ch. 10)
+// RMAP -- Relational Mapping Procedure (Halpin, Ch. 10)
 //
-// Pure function: Domain â†’ table definitions.
+// Pure function: Domain -> table definitions.
 // No I/O, no mutable global state. The schema defines what exists;
 // RMAP computes how it maps to relations.
 //
 // Steps:
-//   0.1. Binarize exclusive unaries (XO â†’ status column)
+//   0.1. Binarize exclusive unaries (XO -> status column)
 //   0.3. Subtype absorption (absorb into root supertype)
-//   1.   Compound UC â†’ separate table (M:N, ternary+)
-//   2.   Functional roles â†’ grouped into entity table
+//   1.   Compound UC -> separate table (M:N, ternary+)
+//   2.   Functional roles -> grouped into entity table
 //   3.   1:1 absorption (absorb toward mandatory side)
-//   4.   Independent entity â†’ single-column table
-//   6.   Constraint mapping (UC â†’ keys, MC â†’ NOT NULL, VC â†’ CHECK, SS â†’ FK)
+//   4.   Independent entity -> single-column table
+//   6.   Constraint mapping (UC -> keys, MC -> NOT NULL, VC -> CHECK, SS -> FK)
 
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use crate::types::Domain;
 
-// â”€â”€ Output types â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// -- Output types -----------------------------------------------------
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -42,7 +42,7 @@ pub struct TableDef {
     pub checks: Option<Vec<String>>,
 }
 
-// â”€â”€ Helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// -- Helpers ----------------------------------------------------------
 
 fn to_snake(name: &str) -> String {
     let mut result = String::new();
@@ -87,13 +87,13 @@ fn compound_table_name(reading: &str, roles: &[crate::types::RoleDef], noun_name
     }
 }
 
-// â”€â”€ RMAP core â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// -- RMAP core --------------------------------------------------------
 
 pub fn rmap(ir: &Domain) -> Vec<TableDef> {
     let mut tables: Vec<TableDef> = Vec::new();
     let mut emitted: HashSet<String> = HashSet::new();
 
-    // â”€â”€ Step 0.1: Binarize exclusive unaries â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // -- Step 0.1: Binarize exclusive unaries ------------------------
     let mut binarized_ft_ids: HashSet<String> = HashSet::new();
     let mut xo_columns: HashMap<String, Vec<(String, Vec<String>, bool)>> = HashMap::new();
 
@@ -139,7 +139,7 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
         xo_columns.entry(entity_name.clone()).or_default().push((col_name, values, !is_mandatory));
     }
 
-    // â”€â”€ Step 0.3: Subtype absorption â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // -- Step 0.3: Subtype absorption --------------------------------
     let mut subtype_to_root: HashMap<String, String> = HashMap::new();
     let mut parent_of: HashMap<String, String> = HashMap::new();
     for (name, st) in &ir.subtypes {
@@ -160,7 +160,7 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
         subtype_to_root.get(name).cloned().unwrap_or_else(|| name.to_string())
     };
 
-    // â”€â”€ Index constraints â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // -- Index constraints -------------------------------------------
     let mut ucs_by_ft: HashMap<String, Vec<Vec<usize>>> = HashMap::new();
     let mut mc_set: HashSet<String> = HashSet::new();
     let mut vcs_by_ft_role: HashMap<String, Vec<String>> = HashMap::new();
@@ -171,7 +171,7 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
                 for span in &c.spans {
                     ucs_by_ft.entry(span.fact_type_id.clone()).or_default();
                 }
-                // Group spans by fact type â€” each UC may span multiple roles
+                // Group spans by fact type -- each UC may span multiple roles
                 let roles: Vec<usize> = c.spans.iter().map(|s| s.role_index).collect();
                 if let Some(ft_id) = c.spans.first().map(|s| &s.fact_type_id) {
                     ucs_by_ft.entry(ft_id.clone()).or_default().push(roles);
@@ -198,7 +198,7 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
         }
     }
 
-    // â”€â”€ Classify fact types â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // -- Classify fact types -----------------------------------------
     let mut compound_facts: Vec<&str> = Vec::new();
     let mut functional_facts: Vec<&str> = Vec::new();
 
@@ -217,7 +217,7 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
         if is_functional { functional_facts.push(ft_id) }
     }
 
-    // â”€â”€ Step 3 prep: Detect 1:1 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // -- Step 3 prep: Detect 1:1 -------------------------------------
     let mut one_to_one_ft_ids: HashSet<String> = HashSet::new();
     for ft_id in &functional_facts {
         let ft = &ir.fact_types[*ft_id];
@@ -231,7 +231,7 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
         }
     }
 
-    // â”€â”€ Step 1: Compound UC â†’ separate table â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // -- Step 1: Compound UC -> separate table ------------------------
     let noun_name_set: HashSet<String> = ir.nouns.keys().cloned().collect();
 
     for ft_id in &compound_facts {
@@ -260,7 +260,7 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
         emitted.insert(table_name);
     }
 
-    // â”€â”€ Step 2: Functional roles â†’ entity table â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // -- Step 2: Functional roles -> entity table ---------------------
     let mut entity_columns: HashMap<String, (Vec<TableColumn>, HashSet<String>, Vec<String>)> = HashMap::new();
 
     for ft_id in &functional_facts {
@@ -308,7 +308,7 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
         }
     }
 
-    // â”€â”€ Step 3: 1:1 absorption â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // -- Step 3: 1:1 absorption --------------------------------------
     for ft_id in &one_to_one_ft_ids {
         let ft = &ir.fact_types[ft_id];
         let role0 = &ft.roles[0];
@@ -333,7 +333,7 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
         });
     }
 
-    // â”€â”€ Step 0.1 continued: inject XO columns â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // -- Step 0.1 continued: inject XO columns -----------------------
     for (entity_name, xo_cols) in &xo_columns {
         let resolved = resolve_entity(entity_name);
         let entry = entity_columns.entry(resolved).or_insert_with(|| (Vec::new(), HashSet::new(), Vec::new()));
@@ -349,7 +349,7 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
         }
     }
 
-    // â”€â”€ Emit entity tables â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // -- Emit entity tables ------------------------------------------
     for (entity_name, (columns, _, checks)) in &entity_columns {
         if subtype_names.contains(entity_name) { continue }
         let table_name = to_snake(entity_name);
@@ -366,7 +366,7 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
         emitted.insert(table_name);
     }
 
-    // â”€â”€ Step 4: Independent entity â†’ single-column table â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // -- Step 4: Independent entity -> single-column table ------------
     let mut referenced: HashSet<String> = HashSet::new();
     for t in &tables {
         for col in &t.columns {
@@ -392,7 +392,7 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
     tables
 }
 
-// â”€â”€ WASM export â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// -- WASM export -----------------------------------------------------
 
 /// Run RMAP on the currently loaded IR and return table definitions as JSON.
 pub fn rmap_from_loaded_ir(ir: &Domain) -> Vec<TableDef> {
@@ -456,11 +456,11 @@ mod tests {
 
     #[test]
     fn functional_binary_produces_entity_table() {
-        // Person has Name (UC on Person role â†’ Name absorbed into Person table)
+        // Person has Name (UC on Person role -> Name absorbed into Person table)
         let ir = make_ir(
             vec![("Person", "entity"), ("Name", "value")],
             vec![("ft1", "Person has Name", vec![("Person", 0), ("Name", 1)])],
-            vec![("UC", vec![("ft1", 0)])], // UC on Person â†’ each Person has at most one Name
+            vec![("UC", vec![("ft1", 0)])], // UC on Person -> each Person has at most one Name
         );
         let tables = rmap(&ir);
         assert_eq!(tables.len(), 1);
@@ -472,7 +472,7 @@ mod tests {
 
     #[test]
     fn compound_uc_produces_junction_table() {
-        // Person teaches Course (UC spanning both roles â†’ junction table)
+        // Person teaches Course (UC spanning both roles -> junction table)
         let ir = make_ir(
             vec![("Person", "entity"), ("Course", "entity")],
             vec![("ft1", "Person teaches Course", vec![("Person", 0), ("Course", 1)])],
@@ -486,7 +486,7 @@ mod tests {
 
     #[test]
     fn mandatory_constraint_produces_not_null() {
-        // Person has Name (UC on Person + MC on Person â†’ Name is NOT NULL)
+        // Person has Name (UC on Person + MC on Person -> Name is NOT NULL)
         let ir = make_ir(
             vec![("Person", "entity"), ("Name", "value")],
             vec![("ft1", "Person has Name", vec![("Person", 0), ("Name", 1)])],
@@ -498,7 +498,7 @@ mod tests {
         let tables = rmap(&ir);
         let person = tables.iter().find(|t| t.name == "person").unwrap();
         let name_col = person.columns.iter().find(|c| c.name == "name").unwrap();
-        assert!(!name_col.nullable); // MC â†’ NOT NULL
+        assert!(!name_col.nullable); // MC -> NOT NULL
     }
 
     #[test]
