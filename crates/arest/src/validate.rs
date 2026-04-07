@@ -18,82 +18,78 @@ use crate::types::*;
 /// constraints are then evaluated against this population.
 ///
 /// Fact type IDs use the reading text from core.md (e.g., "Noun has Object Type").
+/// Convert a domain's Domain into a Population (compatibility wrapper).
 pub fn ir_to_metamodel_population(ir: &Domain) -> Population {
-    let mut facts: HashMap<String, Vec<FactInstance>> = HashMap::new();
+    crate::ast::state_to_population(&ir_to_metamodel_state(ir))
+}
 
-    let mut push = |ft_id: &str, bindings: Vec<(&str, &str)>| {
-        facts.entry(ft_id.to_string()).or_default().push(FactInstance {
-            fact_type_id: ft_id.to_string(),
-            bindings: bindings.into_iter().map(|(n, v)| (n.to_string(), v.to_string())).collect(),
-        });
-    };
+/// Convert a domain's Domain into an Object state of core metamodel facts.
+pub fn ir_to_metamodel_state(ir: &Domain) -> crate::ast::Object {
+    use crate::ast::{Object, cell_push, fact_from_pairs};
+    let mut state = Object::phi();
 
-    // Nouns -> "Noun has Object Type"
+    // Nouns
     for (name, def) in &ir.nouns {
-        push("Noun has Object Type", vec![("Noun", name), ("Object Type", &def.object_type)]);
+        state = cell_push("Noun has Object Type", fact_from_pairs(&[("Noun", name), ("Object Type", &def.object_type)]), &state);
     }
 
-    // Subtypes -> "Noun is subtype of Noun"
+    // Subtypes
     for (name, super_type) in &ir.subtypes {
-        push("Noun is subtype of Noun", vec![("Noun", name), ("Noun", super_type)]);
+        state = cell_push("Noun is subtype of Noun", fact_from_pairs(&[("Noun", name), ("Noun", super_type)]), &state);
     }
 
-    // Fact types -> "Graph Schema has Reading", "Graph Schema has Role", "Graph Schema has Arity"
+    // Fact types
     for (ft_id, ft) in &ir.fact_types {
-        push("Graph Schema has Reading", vec![("Graph Schema", ft_id), ("Reading", &ft.reading)]);
-
         let arity = ft.roles.len().to_string();
-        push("Graph Schema has Arity", vec![("Graph Schema", ft_id), ("Arity", &arity)]);
-
+        state = cell_push("Graph Schema has Reading", fact_from_pairs(&[("Graph Schema", ft_id), ("Reading", &ft.reading)]), &state);
+        state = cell_push("Graph Schema has Arity", fact_from_pairs(&[("Graph Schema", ft_id), ("Arity", &arity)]), &state);
         for role in &ft.roles {
             let role_id = format!("{}:{}", ft_id, role.role_index);
-            push("Graph Schema has Role", vec![("Graph Schema", ft_id), ("Role", &role_id)]);
-            push("Noun plays Role", vec![("Noun", &role.noun_name), ("Role", &role_id)]);
+            state = cell_push("Graph Schema has Role", fact_from_pairs(&[("Graph Schema", ft_id), ("Role", &role_id)]), &state);
+            state = cell_push("Noun plays Role", fact_from_pairs(&[("Noun", &role.noun_name), ("Role", &role_id)]), &state);
         }
     }
 
-    // Constraints -> "Constraint is of Constraint Type", "Constraint spans Role"
+    // Constraints
     for constraint in &ir.constraints {
-        push("Constraint is of Constraint Type", vec![
+        state = cell_push("Constraint is of Constraint Type", fact_from_pairs(&[
             ("Constraint", &constraint.id), ("Constraint Type", &constraint.kind),
-        ]);
+        ]), &state);
         for span in &constraint.spans {
             let role_id = format!("{}:{}", span.fact_type_id, span.role_index);
-            push("Constraint spans Role", vec![("Constraint", &constraint.id), ("Role", &role_id)]);
+            state = cell_push("Constraint spans Role", fact_from_pairs(&[("Constraint", &constraint.id), ("Role", &role_id)]), &state);
         }
     }
 
-    // Derivation rules -> dependency facts
+    // Derivation rules
     for rule in &ir.derivation_rules {
-        push("Derivation Rule produces Graph Schema", vec![
+        state = cell_push("Derivation Rule produces Graph Schema", fact_from_pairs(&[
             ("Derivation Rule", &rule.id), ("Graph Schema", &rule.consequent_fact_type_id),
-        ]);
+        ]), &state);
         for antecedent in &rule.antecedent_fact_type_ids {
-            push("Derivation Rule has antecedent Graph Schema", vec![
+            state = cell_push("Derivation Rule has antecedent Graph Schema", fact_from_pairs(&[
                 ("Derivation Rule", &rule.id), ("Graph Schema", antecedent),
-            ]);
+            ]), &state);
         }
     }
 
-    // Derived: "Derivation Rule depends on Derivation Rule"
-    // Rule A depends on Rule B iff A has antecedent G and B produces G.
+    // Derived: rule dependencies
     let produces: HashMap<&str, &str> = ir.derivation_rules.iter()
         .map(|r| (r.consequent_fact_type_id.as_str(), r.id.as_str()))
         .collect();
-
     for rule in &ir.derivation_rules {
         for antecedent in &rule.antecedent_fact_type_ids {
             if let Some(&producer_id) = produces.get(antecedent.as_str()) {
                 if producer_id != rule.id {
-                    push("Derivation Rule depends on Derivation Rule", vec![
+                    state = cell_push("Derivation Rule depends on Derivation Rule", fact_from_pairs(&[
                         ("Derivation Rule", &rule.id), ("Derivation Rule", producer_id),
-                    ]);
+                    ]), &state);
                 }
             }
         }
     }
 
-    Population { facts }
+    state
 }
 
 #[cfg(test)]
