@@ -16,20 +16,14 @@ import {
   compileDomain,
   transitions,
   ORDER_READINGS,
+  STATE_READINGS,
   releaseDomain,
   type CompiledDomain,
 } from '../helpers/domain-fixture'
 
 // ── Extended readings ────────────────────────────────────────────────────────
 
-/**
- * Extend ORDER_READINGS with:
- *   - Warehouse entity type
- *   - Order is shipped from Warehouse fact type
- *   - "Each Order is shipped from at most one Warehouse" UC
- *   - Order state machine: In Cart → place → Placed → ship → Shipped
- */
-const EXTENDED_READINGS = ORDER_READINGS + `
+const WAREHOUSE_READINGS = `
 ## Entity Types
 Warehouse(.WarehouseId) is an entity type.
 
@@ -38,22 +32,12 @@ WarehouseId is a value type.
 
 ## Fact Types
 
-### Order (extended)
+### Order
 Order is shipped from Warehouse.
 
 ## Constraints
 Each Order is shipped from at most one Warehouse.
-
-## State Machines
-
-### Order Status
-Order can be In Cart.
-Order can be Placed.
-Order can be Shipped.
-
-Order transitions from In Cart to Placed by place.
-Order transitions from Placed to Shipped by ship.
-`
+`.trim()
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────
 
@@ -61,8 +45,8 @@ let base: CompiledDomain
 let extended: CompiledDomain
 
 beforeAll(() => {
-  base = compileDomain(ORDER_READINGS, 'orders-base')
-  extended = compileDomain(EXTENDED_READINGS, 'orders-extended')
+  base = compileDomain(ORDER_READINGS, STATE_READINGS)
+  extended = compileDomain(ORDER_READINGS + '\n' + WAREHOUSE_READINGS, STATE_READINGS)
 })
 
 afterAll(() => {
