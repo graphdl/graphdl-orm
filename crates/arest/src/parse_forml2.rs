@@ -582,17 +582,48 @@ pub fn parse_to_state(input: &str) -> Result<crate::ast::Object, String> {
     Ok(domain_to_state(&domain))
 }
 
-/// Parse FORML2 readings into an Object state with existing nouns for cross-domain resolution.
-pub fn parse_to_state_with_nouns(input: &str, existing: &crate::ast::Object) -> Result<crate::ast::Object, String> {
+/// Extract nouns directly from the Noun cell in D.
+pub fn nouns_from_state(state: &crate::ast::Object) -> HashMap<String, NounDef> {
     use crate::ast::{fetch_or_phi, binding};
-    let existing_nouns: HashMap<String, NounDef> = fetch_or_phi("Noun", existing)
+    fetch_or_phi("Noun", state)
         .as_seq().map(|facts| facts.iter().filter_map(|f| {
             let name = binding(f, "name")?.to_string();
             let obj_type = binding(f, "objectType").unwrap_or("entity").to_string();
             Some((name, NounDef { object_type: obj_type, world_assumption: WorldAssumption::default() }))
         }).collect())
-        .unwrap_or_default();
-    let domain = parse_markdown_with_nouns(input, &existing_nouns)?;
+        .unwrap_or_default()
+}
+
+/// Extract fact types directly from the GraphSchema cell in D.
+pub fn fact_types_from_state(state: &crate::ast::Object) -> HashMap<String, FactTypeDef> {
+    use crate::ast::{fetch_or_phi, binding};
+    fetch_or_phi("GraphSchema", state)
+        .as_seq().map(|facts| facts.iter().filter_map(|f| {
+            let id = binding(f, "id")?.to_string();
+            let reading = binding(f, "reading").unwrap_or("").to_string();
+            Some((id, FactTypeDef {
+                schema_id: String::new(),
+                reading,
+                readings: vec![],
+                roles: vec![], // roles resolved separately if needed
+            }))
+        }).collect())
+        .unwrap_or_default()
+}
+
+/// Parse FORML2 readings into an Object state with full context from D.
+/// Extracts nouns and fact types directly from cells — no Domain struct round-trip.
+pub fn parse_to_state_from(input: &str, d: &crate::ast::Object) -> Result<crate::ast::Object, String> {
+    let nouns = nouns_from_state(d);
+    let fact_types = fact_types_from_state(d);
+    let domain = parse_markdown_with_context(input, &nouns, &fact_types)?;
+    Ok(domain_to_state(&domain))
+}
+
+/// Legacy: parse with nouns only (no fact type context).
+pub fn parse_to_state_with_nouns(input: &str, existing: &crate::ast::Object) -> Result<crate::ast::Object, String> {
+    let nouns = nouns_from_state(existing);
+    let domain = parse_markdown_with_nouns(input, &nouns)?;
     Ok(domain_to_state(&domain))
 }
 
