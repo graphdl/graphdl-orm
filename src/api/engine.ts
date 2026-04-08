@@ -1,12 +1,12 @@
 /**
  * AREST engine — SYSTEM:x = ⟨o, D'⟩
  *
- * Three WASM exports: parse_and_compile, release, system.
- * All operations are applications of the system function.
- * This layer is ↑ (fetch from DO) and ↓ (store to DO), not computation.
+ * Two WASM exports: create, system. SYSTEM is the only function.
+ * Self-modification: system(h, 'compile', readings_text) ingests readings.
+ * All other operations: system(h, key, input) dispatches via ρ.
  */
 
-import { initSync, parse_and_compile, release, system } from '../../crates/arest/pkg/arest.js'
+import { initSync, create, release, system } from '../../crates/arest/pkg/arest.js'
 import wasmModule from '../../crates/arest/pkg/arest_bg.wasm'
 
 let _init = false
@@ -15,17 +15,20 @@ function ensureWasm() { if (!_init) { initSync({ module: wasmModule }); _init = 
 let _h = -1
 function h(handle?: number): number { return handle !== undefined && handle >= 0 ? handle : _h }
 
-// ── The three operations, re-exported for callers ───────────────────
-
 export { system }
 
 export function currentDomainHandle(): number { return _h }
 
 export function release_domain(handle: number): void { ensureWasm(); release(handle) }
 
-export function compileDomainReadings(domain: string, readings: string): number {
+/** create + compile: allocate D, ingest readings via self-modification. */
+export function compileDomainReadings(...readings: string[]): number {
   ensureWasm()
-  return parse_and_compile(JSON.stringify([[domain, readings]]))
+  const handle = create()
+  for (const text of readings) {
+    system(handle, 'compile', text)
+  }
+  return handle
 }
 
 export async function loadDomainSchema(
@@ -37,7 +40,7 @@ export async function loadDomainSchema(
   const defsCell = await getStub(`defs:${domainSlug}`).get().catch(() => null)
   const readings = defsCell?.data?.readings
   if (!readings) return -1
-  _h = parse_and_compile(JSON.stringify([[domainSlug, readings]]))
+  _h = compileDomainReadings(readings)
   return _h
 }
 

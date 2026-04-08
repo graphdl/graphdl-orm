@@ -47,32 +47,25 @@ fn allocate(state: ast::Object, defs: Vec<(String, ast::Func)>) -> u32 {
     h as u32
 }
 
-// ── The three operations ────────────────────────────────────────────
+// ── SYSTEM is the only function ─────────────────────────────────────
 
+/// create: allocate empty D. compile ∘ parse is pre-registered in DEFS.
+fn create_impl() -> u32 {
+    let state = ast::Object::phi();
+    let defs = vec![]; // empty — compile is handled by system_impl
+    allocate(state, defs)
+}
+
+/// Legacy: parse_and_compile as create + compile for each readings pair.
 fn parse_and_compile_impl(readings: Vec<(String, String)>) -> Result<u32, String> {
-    let mut m = types::Domain::default();
-    for (name, text) in &readings {
-        let ir = if m.nouns.is_empty() {
-            parse_forml2::parse_markdown(text)
-        } else {
-            parse_forml2::parse_markdown_with_nouns(text, &m.nouns)
-        }.map_err(|e| format!("{}: {}", name, e))?;
-        m.nouns.extend(ir.nouns);
-        m.fact_types.extend(ir.fact_types);
-        m.constraints.extend(ir.constraints);
-        m.state_machines.extend(ir.state_machines);
-        m.derivation_rules.extend(ir.derivation_rules);
-        m.general_instance_facts.extend(ir.general_instance_facts);
-        m.subtypes.extend(ir.subtypes);
-        m.enum_values.extend(ir.enum_values);
-        m.ref_schemes.extend(ir.ref_schemes);
-        m.objectifications.extend(ir.objectifications);
-        m.named_spans.extend(ir.named_spans);
-        m.autofill_spans.extend(ir.autofill_spans);
+    let h = create_impl();
+    for (_name, text) in &readings {
+        let result = system_impl(h, "compile", text);
+        if result.starts_with("⊥") {
+            return Err(result);
+        }
     }
-    let state = parse_forml2::domain_to_state(&m);
-    let defs = compile::compile_to_defs_state(&state);
-    Ok(allocate(state, defs))
+    Ok(h)
 }
 
 fn release_impl(handle: u32) {
@@ -80,55 +73,69 @@ fn release_impl(handle: u32) {
     if let Some(slot) = s.get_mut(handle as usize) { *slot = None; }
 }
 
-/// SYSTEM:x = ⟨o, D'⟩. One function. Input classification inside.
-///
-/// The key is a function name in DEFS. The input is an FFP object.
-/// apply(defs[key], parse(input), defs) → result.
+/// SYSTEM:x = ⟨o, D'⟩. The only function.
 ///
 /// Per Eq. 9: SYSTEM:x = (ρ(↑entity(x):D)):↑op(x).
-/// Parse operations are pre-D bootstrap (compile ∘ parse).
+/// Self-modification: system(h, "compile", readings_text) ingests readings.
+/// All other operations: ρ-dispatch via defs in D.
 fn system_impl(handle: u32, key: &str, input: &str) -> String {
-    // ── Bootstrap: compile ∘ parse (pre-D, creates D) ──────────
-    match key {
-        "parse" => {
-            // input: <markdown, domain>
-            let obj = ast::Object::parse(input);
-            let items = obj.as_seq().unwrap_or(&[]);
-            let markdown = items.first().and_then(|o| o.as_atom()).unwrap_or(input);
-            let domain = items.get(1).and_then(|o| o.as_atom()).unwrap_or("");
-            return match parse_forml2::parse_markdown(markdown) {
-                Ok(d) => parse_forml2::domain_to_entities(&d, domain),
-                Err(e) => format!("⊥ {}", e),
-            };
-        }
-        "parse_with_nouns" => {
-            // input: <markdown, domain, <⟨name, objectType⟩, ...>>
-            let obj = ast::Object::parse(input);
-            let items = obj.as_seq().unwrap_or(&[]);
-            let markdown = items.first().and_then(|o| o.as_atom()).unwrap_or("");
-            let domain = items.get(1).and_then(|o| o.as_atom()).unwrap_or("");
-            let mut existing = HashMap::new();
-            if let Some(nouns_obj) = items.get(2).and_then(|o| o.as_seq()) {
-                for noun_obj in nouns_obj {
-                    if let Some(pair) = noun_obj.as_seq() {
-                        let name = pair.first().and_then(|o| o.as_atom()).unwrap_or("");
-                        let ot = pair.get(1).and_then(|o| o.as_atom()).unwrap_or("entity");
-                        existing.insert(name.to_string(), types::NounDef {
-                            object_type: ot.to_string(),
-                            world_assumption: types::WorldAssumption::Closed,
-                        });
-                    }
-                }
+    // ── Self-modification: compile ∘ parse (Sec. 5.1) ─────────────
+    // The addressed entity is DEFS. The operation is compile ∘ parse.
+    // The input is readings text. D' = D with new defs.
+    if key == "compile" {
+        let mut s = ds().lock().unwrap();
+        let existing_d = s.get(handle as usize)
+            .and_then(|x| x.as_ref())
+            .map(|st| &st.d);
+
+        // Extract existing nouns and fact types from D for cross-domain resolution
+        let (existing_nouns, existing_fact_types) = match existing_d {
+            Some(d) => {
+                let domain = compile::state_to_domain(d);
+                (domain.nouns, domain.fact_types)
             }
-            return match parse_forml2::parse_markdown_with_nouns(markdown, &existing) {
-                Ok(d) => parse_forml2::domain_to_entities(&d, domain),
-                Err(e) => format!("⊥ {}", e),
-            };
-        }
-        _ => {}
+            None => (HashMap::new(), HashMap::new()),
+        };
+
+        // compile ∘ parse: readings → domain → state → defs → D'
+        let ir = if existing_nouns.is_empty() {
+            parse_forml2::parse_markdown(input)
+        } else {
+            parse_forml2::parse_markdown_with_context(input, &existing_nouns, &existing_fact_types)
+        };
+        let domain = match ir {
+            Ok(d) => d,
+            Err(e) => return format!("⊥ {}", e),
+        };
+
+        // Merge with existing domain from D
+        let mut merged = match existing_d {
+            Some(d) => compile::state_to_domain(d),
+            None => types::Domain::default(),
+        };
+        merged.nouns.extend(domain.nouns);
+        merged.fact_types.extend(domain.fact_types);
+        merged.constraints.extend(domain.constraints);
+        merged.state_machines.extend(domain.state_machines);
+        merged.derivation_rules.extend(domain.derivation_rules);
+        merged.general_instance_facts.extend(domain.general_instance_facts);
+        merged.subtypes.extend(domain.subtypes);
+        merged.enum_values.extend(domain.enum_values);
+        merged.ref_schemes.extend(domain.ref_schemes);
+        merged.objectifications.extend(domain.objectifications);
+        merged.named_spans.extend(domain.named_spans);
+        merged.autofill_spans.extend(domain.autofill_spans);
+
+        // ↓DEFS: store new compiled state
+        let state = parse_forml2::domain_to_state(&merged);
+        let defs = compile::compile_to_defs_state(&state);
+        let d = ast::defs_to_state(&defs, &state);
+        s[handle as usize] = Some(CompiledState { d });
+
+        return format!("{}", defs.len());
     }
 
-    // ── SYSTEM:x = (ρ(↑entity(x):D)) ↑ op(x) ────────────────────
+    // ── SYSTEM:x = (ρ(↑entity(x):D)):↑op(x)  (Eq. 9) ────────────
     let s = ds().lock().unwrap();
     let st = match s.get(handle as usize).and_then(|x| x.as_ref()) {
         Some(x) => x,
@@ -136,8 +143,7 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
     };
     let obj = ast::Object::parse(input);
 
-    // SYSTEM:x = (ρ(↑entity(x):D)):↑op(x)  (Eq. 9)
-    // Single ρ-dispatch. No Rust fallback. Every key resolves from D.
+    // Single ρ-dispatch. Every key resolves from D.
     ast::apply(&ast::Func::Def(key.to_string()), &obj, &st.d).to_string()
 }
 

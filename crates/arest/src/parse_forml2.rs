@@ -559,8 +559,12 @@ fn try_fact_type(line: &str, noun_names: &[String]) -> Option<ParseAction> {
 /// Parse with pre-existing nouns from other domains.
 /// Domains are NORMA tabs. Nouns are global across the UoD.
 pub fn parse_markdown_with_nouns(input: &str, existing_nouns: &HashMap<String, NounDef>) -> Result<Domain, String> {
+    parse_markdown_with_context(input, existing_nouns, &HashMap::new())
+}
+
+pub fn parse_markdown_with_context(input: &str, existing_nouns: &HashMap<String, NounDef>, existing_fact_types: &HashMap<String, FactTypeDef>) -> Result<Domain, String> {
     let mut ir = Domain {
-        domain: String::new(), nouns: existing_nouns.clone(), fact_types: HashMap::new(),
+        domain: String::new(), nouns: existing_nouns.clone(), fact_types: existing_fact_types.clone(),
         constraints: vec![], state_machines: HashMap::new(), derivation_rules: vec![],
         general_instance_facts: vec![],
         subtypes: HashMap::new(), enum_values: HashMap::new(),
