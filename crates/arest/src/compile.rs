@@ -399,424 +399,264 @@ fn derive_state_machines_from_facts(facts: &[GeneralInstanceFact]) -> HashMap<St
 pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> {
     let domain = state_to_domain(state);
     let model = compile(&domain);
-    let mut defs: Vec<(String, Func)> = Vec::new();
-
-    // Constraints -> named definitions
-    for c in &model.constraints {
-        defs.push((format!("constraint:{}", c.id), c.func.clone()));
-    }
+    // Constraints -> named definitions — α(constraint → def)
+    let mut defs: Vec<(String, Func)> = model.constraints.iter()
+        .map(|c| (format!("constraint:{}", c.id), c.func.clone()))
+        .collect();
 
     // validate: Concat . [all constraints] -- single Func that returns all violations.
     // Empty constraint set produces phi (no violations). The algebra handles it.
     let all_constraints: Vec<Func> = model.constraints.iter().map(|c| c.func.clone()).collect();
     defs.push(("validate".to_string(), Func::compose(Func::Concat, Func::construction(all_constraints))));
 
-    // State machines -> named definitions
-    // The func is the transition function: <state, event> -> state'.
-    // The complete machine is foldl(transition, initial, events).
-    // We store the transition function and the initial state as separate cells.
-    for sm in &model.state_machines {
-        defs.push((format!("machine:{}", sm.noun_name), sm.func.clone()));
-        defs.push((format!("machine:{}:initial", sm.noun_name), Func::constant(Object::atom(&sm.initial))));
-    }
+    // State machines -> named definitions — α(sm → <func_def, initial_def>)
+    defs.extend(model.state_machines.iter().flat_map(|sm| [
+        (format!("machine:{}", sm.noun_name), sm.func.clone()),
+        (format!("machine:{}:initial", sm.noun_name), Func::constant(Object::atom(&sm.initial))),
+    ]));
 
     // Transitions: for each SM, register transitions:{noun} that takes a status
     // and returns <<from, to, event>, ...> for available transitions.
     // Uses the machine func and known events to compute available transitions.
-    for sm in &model.state_machines {
+    // Transitions + meta — α(sm → <transitions_def, meta_def>)
+    defs.extend(model.state_machines.iter().flat_map(|sm| {
         let machine_def_name = format!("machine:{}", sm.noun_name);
-        let events: Vec<String> = sm.transition_table.iter().map(|(_, _, e)| e.clone()).collect::<std::collections::HashSet<_>>().into_iter().collect();
-        // Build: for each event, apply machine to <status, event>.
-        // If result != status, include <status, result, event>.
-        // Input: status atom. Output: <<from, to, event>, ...>
-        let mut checks: Vec<Func> = Vec::new();
-        for event in &events {
-            // apply machine_def to <status, event>
+        let events: Vec<String> = sm.transition_table.iter().map(|(_, _, e)| e.clone())
+            .collect::<std::collections::HashSet<_>>().into_iter().collect();
+        // α(event → check_func): for each event, build condition that tests transition
+        let checks: Vec<Func> = events.iter().map(|event| {
             let apply_machine = Func::compose(
                 Func::Def(machine_def_name.clone()),
                 Func::construction(vec![Func::Id, Func::constant(Object::atom(event))]),
             );
-            // Condition: if result != status, produce <status, result, event>; else phi
-            let check = Func::condition(
+            Func::condition(
                 Func::compose(Func::Not, Func::compose(Func::Eq, Func::construction(vec![Func::Id, apply_machine.clone()]))),
                 Func::construction(vec![Func::Id, apply_machine, Func::constant(Object::atom(event))]),
                 Func::constant(Object::phi()),
-            );
-            checks.push(check);
-        }
-        // Construction applies all checks to status, producing <result_or_phi, ...>
-        // Then filter out phi entries
-        let all_checks = Func::filter(
-            Func::compose(Func::Not, Func::NullTest),
+            )
+        }).collect();
+        let transitions_func = Func::compose(
+            Func::filter(Func::compose(Func::Not, Func::NullTest)),
+            Func::construction(checks),
         );
-        let transitions_func = Func::compose(all_checks, Func::construction(checks));
-        defs.push((format!("transitions:{}", sm.noun_name), transitions_func));
-
-        // transitions_meta:{noun} = static <from, to, event> triples as Constant.
-        // Replaces inject_transition_facts at runtime.
-        let meta_triples: Vec<Object> = sm.transition_table.iter().map(|(from, to, event)| {
+        let meta_triples = Object::Seq(sm.transition_table.iter().map(|(from, to, event)| {
             Object::seq(vec![
                 Object::seq(vec![Object::atom("from"), Object::atom(from)]),
                 Object::seq(vec![Object::atom("to"), Object::atom(to)]),
                 Object::seq(vec![Object::atom("event"), Object::atom(event)]),
             ])
-        }).collect();
-        defs.push((format!("transitions_meta:{}", sm.noun_name), Func::constant(Object::Seq(meta_triples))));
-    }
+        }).collect());
+        [
+            (format!("transitions:{}", sm.noun_name), transitions_func),
+            (format!("transitions_meta:{}", sm.noun_name), Func::constant(meta_triples)),
+        ]
+    }));
 
-    // Derivation rules -> named definitions
-    for d in &model.derivations {
-        defs.push((format!("derivation:{}", d.id), d.func.clone()));
-    }
+    // Derivation rules — α(derivation → def)
+    defs.extend(model.derivations.iter()
+        .map(|d| (format!("derivation:{}", d.id), d.func.clone())));
 
-    // Fact type schemas -> named definitions (CONS of roles)
-    for (id, schema) in &model.schemas {
-        defs.push((format!("schema:{}", id), schema.construction.clone()));
-    }
+    // Fact type schemas — α(schema → def)
+    defs.extend(model.schemas.iter()
+        .map(|(id, schema)| (format!("schema:{}", id), schema.construction.clone())));
 
     // resolve:{noun} — Condition chain mapping field_name → fact_type_id.
     // Input: field_name atom. Output: fact_type_id atom.
     // Compiled from NounIndex: for each fact type involving this noun,
     // extract the "other" role's noun name as the field key.
-    for noun_name in domain.nouns.keys() {
+    // resolve:{noun} — α(noun → Condition chain mapping field_name → fact_type_id)
+    defs.extend(domain.nouns.keys().filter_map(|noun_name| {
         let field_mappings: Vec<(String, String)> = domain.fact_types.iter()
             .filter(|(_, ft)| ft.roles.iter().any(|r| r.noun_name == *noun_name))
             .filter_map(|(ft_id, ft)| {
-                // For binary fact types: field = the other role's noun name
-                if ft.roles.len() == 2 {
-                    let other = ft.roles.iter().find(|r| r.noun_name != *noun_name)
-                        .map(|r| r.noun_name.clone())?;
-                    Some((other.to_lowercase(), ft_id.clone()))
-                } else {
-                    None
-                }
+                (ft.roles.len() == 2).then(|| ())?;
+                let other = ft.roles.iter().find(|r| r.noun_name != *noun_name)?.noun_name.clone();
+                Some((other.to_lowercase(), ft_id.clone()))
             })
             .collect();
-
-        if field_mappings.is_empty() { continue; }
-
-        // Build Condition chain: (eq . [id, "field1"]) -> "ft_id1"; (eq . [id, "field2"]) -> "ft_id2"; ...
-        let resolve_func = field_mappings.iter().rev().fold(
-            Func::Id, // fallback: return the field name as-is
-            |inner, (field, ft_id)| {
+        (!field_mappings.is_empty()).then(|| {
+            let resolve_func = field_mappings.iter().rev().fold(Func::Id, |inner, (field, ft_id)| {
                 Func::condition(
-                    Func::compose(Func::Eq, Func::construction(vec![
-                        Func::Id,
-                        Func::constant(Object::atom(field)),
-                    ])),
+                    Func::compose(Func::Eq, Func::construction(vec![Func::Id, Func::constant(Object::atom(field))])),
                     Func::constant(Object::atom(ft_id)),
                     inner,
                 )
-            },
-        );
-        defs.push((format!("resolve:{}", noun_name), resolve_func));
-    }
+            });
+            (format!("resolve:{}", noun_name), resolve_func)
+        })
+    }));
 
     // HATEOAS navigation links as FFP projections (Theorem 4b).
     // For each binary fact type with a UC, the UC role is the child (dependent),
     // the other role is the parent. Navigation is a constant function returning
     // the related noun names.
-    let mut children_map: HashMap<String, Vec<String>> = HashMap::new();
-    let mut parent_map: HashMap<String, Vec<String>> = HashMap::new();
-    for c in &domain.constraints {
-        if c.kind != "UC" || c.spans.is_empty() { continue; }
-        let span = &c.spans[0];
-        if let Some(ft) = domain.fact_types.get(&span.fact_type_id) {
-            if ft.roles.len() != 2 { continue; }
-            let constrained_role = span.role_index;
-            let child_noun = &ft.roles[constrained_role].noun_name;
-            let parent_noun = &ft.roles[1 - constrained_role].noun_name;
-            children_map.entry(parent_noun.clone()).or_default().push(child_noun.clone());
-            parent_map.entry(child_noun.clone()).or_default().push(parent_noun.clone());
-        }
-    }
-    for (noun, children) in &children_map {
-        let child_atoms: Vec<Object> = children.iter().map(|c| Object::atom(c)).collect();
-        defs.push((format!("nav:{}:children", noun), Func::constant(Object::Seq(child_atoms))));
-    }
-    for (noun, parents) in &parent_map {
-        let parent_atoms: Vec<Object> = parents.iter().map(|p| Object::atom(p)).collect();
-        defs.push((format!("nav:{}:parent", noun), Func::constant(Object::Seq(parent_atoms))));
-    }
+    // HATEOAS nav links — fold UC constraints into (children_map, parent_map), then α → defs
+    let (children_map, parent_map) = domain.constraints.iter()
+        .filter(|c| c.kind == "UC" && !c.spans.is_empty())
+        .filter_map(|c| {
+            let ft = domain.fact_types.get(&c.spans[0].fact_type_id)?;
+            (ft.roles.len() == 2).then(|| ())?;
+            let idx = c.spans[0].role_index;
+            Some((ft.roles[1 - idx].noun_name.clone(), ft.roles[idx].noun_name.clone()))
+        })
+        .fold(
+            (HashMap::<String, Vec<String>>::new(), HashMap::<String, Vec<String>>::new()),
+            |(mut cm, mut pm), (parent, child)| {
+                cm.entry(parent.clone()).or_default().push(child.clone());
+                pm.entry(child).or_default().push(parent);
+                (cm, pm)
+            },
+        );
+    defs.extend(children_map.iter().map(|(noun, children)|
+        (format!("nav:{}:children", noun), Func::constant(Object::Seq(children.iter().map(|c| Object::atom(c)).collect())))
+    ));
+    defs.extend(parent_map.iter().map(|(noun, parents)|
+        (format!("nav:{}:parent", noun), Func::constant(Object::Seq(parents.iter().map(|p| Object::atom(p)).collect())))
+    ));
 
     // ── Generator 1: Agent Prompts ──────────────────────────────────
     // For each noun that participates in fact types, produce a def
     // agent:{noun} containing a synthesized agent prompt as a constant Object.
-    {
-        // Build noun -> fact type readings map
-        let mut noun_fact_types: HashMap<String, Vec<String>> = HashMap::new();
-        for (_ft_id, ft) in &domain.fact_types {
-            for role in &ft.roles {
-                noun_fact_types.entry(role.noun_name.clone())
-                    .or_default()
-                    .push(ft.reading.clone());
-            }
-        }
+    // Build lookup maps via fold — noun → readings, noun → constraints, noun → events
+    let noun_fact_types: HashMap<String, Vec<String>> = domain.fact_types.values()
+        .flat_map(|ft| ft.roles.iter().map(move |r| (r.noun_name.clone(), ft.reading.clone())))
+        .fold(HashMap::new(), |mut m, (noun, reading)| { m.entry(noun).or_default().push(reading); m });
 
-        // Build noun -> constraints map
-        let mut noun_constraints: HashMap<String, Vec<&ConstraintDef>> = HashMap::new();
-        for c in &domain.constraints {
-            for span in &c.spans {
-                if let Some(ft) = domain.fact_types.get(&span.fact_type_id) {
-                    for role in &ft.roles {
-                        noun_constraints.entry(role.noun_name.clone())
-                            .or_default()
-                            .push(c);
-                    }
-                }
-            }
-        }
+    let ft_ref = &domain.fact_types;
+    let noun_constraint_map: HashMap<String, Vec<&ConstraintDef>> = domain.constraints.iter()
+        .flat_map(|c| c.spans.iter().filter_map(move |s| {
+            ft_ref.get(&s.fact_type_id).map(|ft| (ft, c))
+        }))
+        .flat_map(|(ft, c)| ft.roles.iter().map(move |r| (r.noun_name.clone(), c)))
+        .fold(HashMap::new(), |mut m, (noun, c)| { m.entry(noun).or_default().push(c); m });
 
-        // Build noun -> SM transitions map
-        let mut noun_transitions: HashMap<String, Vec<String>> = HashMap::new();
-        for sm in &model.state_machines {
-            let events: Vec<String> = sm.transition_table.iter()
-                .map(|(_, _, e)| e.clone())
-                .collect::<HashSet<_>>()
-                .into_iter()
-                .collect();
-            noun_transitions.insert(sm.noun_name.clone(), events);
-        }
+    let noun_transitions: HashMap<String, Vec<String>> = model.state_machines.iter()
+        .map(|sm| (sm.noun_name.clone(), sm.transition_table.iter()
+            .map(|(_, _, e)| e.clone()).collect::<HashSet<_>>().into_iter().collect()))
+        .collect();
 
-        for (noun_name, _noun_def) in &domain.nouns {
-            let readings = noun_fact_types.get(noun_name);
-            if readings.map_or(true, |r| r.is_empty()) { continue; }
+    // α(noun → agent_def) — filter nouns with readings, map to prompt Object
+    let deontic_filter = |cs: &[&ConstraintDef], op: &str| -> Vec<Object> {
+        cs.iter().filter(|c| c.modality == "deontic" && c.deontic_operator.as_deref() == Some(op))
+            .map(|c| Object::atom(&c.text)).collect()
+    };
+    let atoms_or_empty = |m: &HashMap<String, Vec<String>>, key: &str| -> Vec<Object> {
+        m.get(key).map(|v| v.iter().map(|s| Object::atom(s)).collect()).unwrap_or_default()
+    };
 
-            // <role, {noun}>
-            let role_pair = Object::Seq(vec![Object::atom("role"), Object::atom(noun_name)]);
-
-            // <fact_types, <reading1, reading2, ...>>
-            let ft_atoms: Vec<Object> = readings.unwrap().iter()
-                .map(|r| Object::atom(r))
-                .collect();
-            let fact_types_pair = Object::Seq(vec![
-                Object::atom("fact_types"),
-                Object::Seq(ft_atoms),
-            ]);
-
-            // <constraints, <text1, text2, ...>>
-            let constraint_texts: Vec<Object> = noun_constraints.get(noun_name)
-                .map(|cs| cs.iter().map(|c| Object::atom(&c.text)).collect())
-                .unwrap_or_default();
-            let constraints_pair = Object::Seq(vec![
-                Object::atom("constraints"),
-                Object::Seq(constraint_texts),
-            ]);
-
-            // <transitions, <event1, event2, ...>>
-            let transition_atoms: Vec<Object> = noun_transitions.get(noun_name)
-                .map(|es| es.iter().map(|e| Object::atom(e)).collect())
-                .unwrap_or_default();
-            let transitions_pair = Object::Seq(vec![
-                Object::atom("transitions"),
-                Object::Seq(transition_atoms),
-            ]);
-
-            // <children, <child1, child2, ...>>
-            let child_atoms: Vec<Object> = children_map.get(noun_name)
-                .map(|cs| cs.iter().map(|c| Object::atom(c)).collect())
-                .unwrap_or_default();
-            let children_pair = Object::Seq(vec![
-                Object::atom("children"),
-                Object::Seq(child_atoms),
-            ]);
-
-            // <parent, <parent1, ...>>
-            let par_atoms: Vec<Object> = parent_map.get(noun_name)
-                .map(|ps| ps.iter().map(|p| Object::atom(p)).collect())
-                .unwrap_or_default();
-            let parent_pair = Object::Seq(vec![
-                Object::atom("parent"),
-                Object::Seq(par_atoms),
-            ]);
-
-            // <deontic, <<obligatory, <...>>, <forbidden, <...>>, <permitted, <...>>>>
-            let mut obligatory: Vec<Object> = Vec::new();
-            let mut forbidden: Vec<Object> = Vec::new();
-            let mut permitted: Vec<Object> = Vec::new();
-            if let Some(cs) = noun_constraints.get(noun_name) {
-                for c in cs {
-                    if c.modality == "deontic" {
-                        match c.deontic_operator.as_deref() {
-                            Some("obligatory") => obligatory.push(Object::atom(&c.text)),
-                            Some("forbidden") => forbidden.push(Object::atom(&c.text)),
-                            Some("permitted") => permitted.push(Object::atom(&c.text)),
-                            _ => {}
-                        }
-                    }
-                }
-            }
-            let deontic_pair = Object::Seq(vec![
-                Object::atom("deontic"),
-                Object::Seq(vec![
-                    Object::Seq(vec![Object::atom("obligatory"), Object::Seq(obligatory)]),
-                    Object::Seq(vec![Object::atom("forbidden"), Object::Seq(forbidden)]),
-                    Object::Seq(vec![Object::atom("permitted"), Object::Seq(permitted)]),
-                ]),
-            ]);
-
+    defs.extend(domain.nouns.keys()
+        .filter(|n| noun_fact_types.get(*n).map_or(false, |r| !r.is_empty()))
+        .map(|noun_name| {
+            let cs = noun_constraint_map.get(noun_name).map(|v| v.as_slice()).unwrap_or(&[]);
             let prompt = Object::Seq(vec![
-                role_pair,
-                fact_types_pair,
-                constraints_pair,
-                transitions_pair,
-                children_pair,
-                parent_pair,
-                deontic_pair,
+                Object::seq(vec![Object::atom("role"), Object::atom(noun_name)]),
+                Object::seq(vec![Object::atom("fact_types"), Object::Seq(atoms_or_empty(&noun_fact_types, noun_name))]),
+                Object::seq(vec![Object::atom("constraints"), Object::Seq(cs.iter().map(|c| Object::atom(&c.text)).collect())]),
+                Object::seq(vec![Object::atom("transitions"), Object::Seq(atoms_or_empty(&noun_transitions, noun_name))]),
+                Object::seq(vec![Object::atom("children"), Object::Seq(
+                    children_map.get(noun_name).map(|v| v.iter().map(|c| Object::atom(c)).collect()).unwrap_or_default())]),
+                Object::seq(vec![Object::atom("parent"), Object::Seq(
+                    parent_map.get(noun_name).map(|v| v.iter().map(|p| Object::atom(p)).collect()).unwrap_or_default())]),
+                Object::seq(vec![Object::atom("deontic"), Object::Seq(vec![
+                    Object::seq(vec![Object::atom("obligatory"), Object::Seq(deontic_filter(cs, "obligatory"))]),
+                    Object::seq(vec![Object::atom("forbidden"), Object::Seq(deontic_filter(cs, "forbidden"))]),
+                    Object::seq(vec![Object::atom("permitted"), Object::Seq(deontic_filter(cs, "permitted"))]),
+                ])]),
             ]);
+            (format!("agent:{}", noun_name), Func::constant(prompt))
+        }));
 
-            defs.push((format!("agent:{}", noun_name), Func::constant(prompt)));
-        }
+    // Shared helper: constraints spanning a noun (fn, not closure, to avoid move conflicts)
+    fn noun_constraints_for<'a>(domain: &'a Domain, noun: &str) -> Vec<&'a ConstraintDef> {
+        domain.constraints.iter()
+            .filter(|c| c.spans.iter().any(|s| {
+                domain.fact_types.get(&s.fact_type_id)
+                    .map_or(false, |ft| ft.roles.iter().any(|r| r.noun_name == noun))
+            })).collect()
     }
 
-    // ── Generator 2: iLayer ─────────────────────────────────────────
-    // For each noun, produce a def ilayer:{noun} with its object type,
-    // fact types with role names, constraints, and reference scheme.
-    {
-        for (noun_name, noun_def) in &domain.nouns {
-            // <object_type, entity|value>
-            let obj_type_pair = Object::Seq(vec![
-                Object::atom("object_type"),
-                Object::atom(&noun_def.object_type),
-            ]);
-
-            // <fact_types, <<reading, <role1, role2, ...>>, ...>>
-            let mut ft_entries: Vec<Object> = Vec::new();
-            for (_ft_id, ft) in &domain.fact_types {
-                let participates = ft.roles.iter().any(|r| r.noun_name == *noun_name);
-                if !participates { continue; }
-                let role_atoms: Vec<Object> = ft.roles.iter()
-                    .map(|r| Object::atom(&r.noun_name))
-                    .collect();
-                ft_entries.push(Object::Seq(vec![
-                    Object::atom(&ft.reading),
-                    Object::Seq(role_atoms),
-                ]));
-            }
-            let fact_types_pair = Object::Seq(vec![
-                Object::atom("fact_types"),
-                Object::Seq(ft_entries),
-            ]);
-
-            // <constraints, <text1, text2, ...>>
-            let mut constraint_texts: Vec<Object> = Vec::new();
-            for c in &domain.constraints {
-                let spans_noun = c.spans.iter().any(|s| {
-                    domain.fact_types.get(&s.fact_type_id)
-                        .map(|ft| ft.roles.iter().any(|r| r.noun_name == *noun_name))
-                        .unwrap_or(false)
-                });
-                if spans_noun {
-                    constraint_texts.push(Object::atom(&c.text));
-                }
-            }
-            let constraints_pair = Object::Seq(vec![
-                Object::atom("constraints"),
-                Object::Seq(constraint_texts),
-            ]);
-
-            // <ref_scheme, <part1, part2, ...>>
-            let ref_parts: Vec<Object> = domain.ref_schemes.get(noun_name)
-                .map(|parts| parts.iter().map(|p| Object::atom(p)).collect())
-                .unwrap_or_default();
-            let ref_scheme_pair = Object::Seq(vec![
-                Object::atom("ref_scheme"),
-                Object::Seq(ref_parts),
-            ]);
-
-            let ilayer = Object::Seq(vec![
-                obj_type_pair,
-                fact_types_pair,
-                constraints_pair,
-                ref_scheme_pair,
-            ]);
-
-            defs.push((format!("ilayer:{}", noun_name), Func::constant(ilayer)));
-        }
-    }
+    // ── Generator 2: iLayer — α(noun → ilayer_def)
+    defs.extend(domain.nouns.iter().map(|(noun_name, noun_def)| {
+        let ft_entries = Object::Seq(domain.fact_types.values()
+            .filter(|ft| ft.roles.iter().any(|r| r.noun_name == *noun_name))
+            .map(|ft| Object::seq(vec![
+                Object::atom(&ft.reading),
+                Object::Seq(ft.roles.iter().map(|r| Object::atom(&r.noun_name)).collect()),
+            ])).collect());
+        let constraint_texts = Object::Seq(noun_constraints_for(&domain, noun_name).iter()
+            .map(|c| Object::atom(&c.text)).collect());
+        let ref_parts = Object::Seq(domain.ref_schemes.get(noun_name)
+            .map(|parts| parts.iter().map(|p| Object::atom(p)).collect()).unwrap_or_default());
+        let ilayer = Object::seq(vec![
+            Object::seq(vec![Object::atom("object_type"), Object::atom(&noun_def.object_type)]),
+            Object::seq(vec![Object::atom("fact_types"), ft_entries]),
+            Object::seq(vec![Object::atom("constraints"), constraint_texts]),
+            Object::seq(vec![Object::atom("ref_scheme"), ref_parts]),
+        ]);
+        (format!("ilayer:{}", noun_name), Func::constant(ilayer))
+    }));
 
     // ── Generator 3: SQL DDL (multi-dialect) ─────────────────────────
     // Call rmap() at compile time and produce dialect-specific defs:
     //   sql:sqlite:{table}, sql:postgresql:{table}, sql:mysql:{table},
     //   sql:sqlserver:{table}, sql:oracle:{table}, sql:db2:{table},
     //   sql:standard:{table}, sql:clickhouse:{table}
-    {
-        let tables = crate::rmap::rmap(&domain);
-        let dialects = [
-            ("sqlite",     SqlDialect::Sqlite),
-            ("postgresql", SqlDialect::PostgreSql),
-            ("mysql",      SqlDialect::MySql),
-            ("sqlserver",  SqlDialect::SqlServer),
-            ("oracle",     SqlDialect::Oracle),
-            ("db2",        SqlDialect::Db2),
-            ("standard",   SqlDialect::Standard),
-            ("clickhouse", SqlDialect::ClickHouse),
-        ];
-        for table in &tables {
-            for (dialect_name, dialect) in &dialects {
-                let ddl = generate_ddl(table, dialect);
-                defs.push((format!("sql:{}:{}", dialect_name, table.name), Func::constant(Object::atom(&ddl))));
-            }
-        }
-    }
+    // ── Generator 3: SQL DDL — α(table × dialect → def)
+    let sql_tables = crate::rmap::rmap(&domain);
+    let dialects = [
+        ("sqlite", SqlDialect::Sqlite), ("postgresql", SqlDialect::PostgreSql),
+        ("mysql", SqlDialect::MySql), ("sqlserver", SqlDialect::SqlServer),
+        ("oracle", SqlDialect::Oracle), ("db2", SqlDialect::Db2),
+        ("standard", SqlDialect::Standard), ("clickhouse", SqlDialect::ClickHouse),
+    ];
+    defs.extend(sql_tables.iter().flat_map(|table|
+        dialects.iter().map(move |(name, dialect)|
+            (format!("sql:{}:{}", name, table.name), Func::constant(Object::atom(&generate_ddl(table, dialect))))
+        )
+    ));
 
-    // ── Generator 4: Test Harness ───────────────────────────────────
-    // For each constraint, produce a def test:{constraint_id} with the
-    // constraint's id, text, kind, and modality.
-    {
-        for c in &domain.constraints {
-            let modality_str = if c.modality == "deontic" { "deontic" } else { "alethic" };
-            let test_obj = Object::Seq(vec![
-                Object::Seq(vec![Object::atom("id"), Object::atom(&c.id)]),
-                Object::Seq(vec![Object::atom("text"), Object::atom(&c.text)]),
-                Object::Seq(vec![Object::atom("kind"), Object::atom(&c.kind)]),
-                Object::Seq(vec![Object::atom("modality"), Object::atom(modality_str)]),
-            ]);
-            defs.push((format!("test:{}", c.id), Func::constant(test_obj)));
-        }
-    }
+    // ── Generator 4: Test Harness — α(constraint → test_def)
+    defs.extend(domain.constraints.iter().map(|c| {
+        let modality_str = match c.modality.as_str() { "deontic" => "deontic", _ => "alethic" };
+        (format!("test:{}", c.id), Func::constant(Object::Seq(vec![
+            Object::seq(vec![Object::atom("id"), Object::atom(&c.id)]),
+            Object::seq(vec![Object::atom("text"), Object::atom(&c.text)]),
+            Object::seq(vec![Object::atom("kind"), Object::atom(&c.kind)]),
+            Object::seq(vec![Object::atom("modality"), Object::atom(modality_str)]),
+        ])))
+    }));
 
-    // ── Handler defs: create:{noun}, transition:{noun}, update:{noun} ──
-    // These are Constant markers that tell the dispatch function which noun
-    // to use. The actual handler logic uses the compiled resolve:{noun},
-    // transitions_meta:{noun}, validate, and machine:{noun} defs.
-    // The dispatch mechanism in arest.rs looks up create:{noun} to confirm
-    // the noun exists, then applies the handler pipeline using the compiled defs.
-    for noun_name in domain.nouns.keys() {
+    // Handler defs — α(noun → <create_def, update_def>)
+    defs.extend(domain.nouns.keys().flat_map(|noun_name| {
         let noun_obj = Object::atom(noun_name);
-        defs.push((format!("create:{}", noun_name), Func::constant(noun_obj.clone())));
-        defs.push((format!("update:{}", noun_name), Func::constant(noun_obj.clone())));
-    }
-    // Query defs per schema (role name → index mapping)
-    for (id, schema) in &model.schemas {
-        let role_map = Object::Seq(schema.role_names.iter().enumerate().map(|(i, name)| {
-            Object::seq(vec![Object::atom(name), Object::atom(&(i + 1).to_string())])
-        }).collect());
-        defs.push((format!("query:{}", id), Func::constant(role_map)));
-    }
+        [
+            (format!("create:{}", noun_name), Func::constant(noun_obj.clone())),
+            (format!("update:{}", noun_name), Func::constant(noun_obj)),
+        ]
+    }));
 
-    // Helper: binary fact types involving a noun (α projection)
-    let binary_fts = |noun: &str| -> Vec<&FactTypeDef> {
+    // Query defs — α(schema → role_map_def)
+    defs.extend(model.schemas.iter().map(|(id, schema)| {
+        let role_map = Object::Seq(schema.role_names.iter().enumerate()
+            .map(|(i, name)| Object::seq(vec![Object::atom(name), Object::atom(&(i + 1).to_string())]))
+            .collect());
+        (format!("query:{}", id), Func::constant(role_map))
+    }));
+
+    // Helpers as fns (not closures) to avoid borrow conflicts with domain
+    fn binary_fts_for<'a>(domain: &'a Domain, noun: &str) -> Vec<&'a FactTypeDef> {
         domain.fact_types.values()
             .filter(|ft| ft.roles.len() == 2 && ft.roles.iter().any(|r| r.noun_name == noun))
             .collect()
-    };
-    let other_role = |ft: &FactTypeDef, noun: &str| -> String {
+    }
+    fn other_role_of(ft: &FactTypeDef, noun: &str) -> String {
         ft.roles.iter().find(|r| r.noun_name != noun)
             .map(|r| r.noun_name.clone()).unwrap_or_default()
-    };
-    let noun_constraints = |noun: &str| -> Vec<&ConstraintDef> {
-        domain.constraints.iter()
-            .filter(|c| c.spans.iter().any(|s| {
-                domain.fact_types.get(&s.fact_type_id)
-                    .map_or(false, |ft| ft.roles.iter().any(|r| r.noun_name == noun))
-            })).collect()
-    };
-
+    }
     // ── Generator 5: XSD — α(noun → xsd_def) ────────────────────────
     defs.extend(domain.nouns.iter().map(|(noun_name, noun_def)| {
-        let fields = Object::Seq(binary_fts(noun_name).iter().map(|ft|
-            Object::seq(vec![Object::atom(&other_role(ft, noun_name)), Object::atom("xs:string")])
+        let fields = Object::Seq(binary_fts_for(&domain, noun_name).iter().map(|ft|
+            Object::seq(vec![Object::atom(&other_role_of(ft, noun_name)), Object::atom("xs:string")])
         ).collect());
         (format!("xsd:{}", noun_name), Func::constant(Object::seq(vec![
             Object::seq(vec![Object::atom("name"), Object::atom(noun_name)]),
@@ -827,8 +667,8 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
 
     // ── Generator 6: DTD — α(noun → dtd_def) ────────────────────────
     defs.extend(domain.nouns.iter().map(|(noun_name, _)| {
-        let children: Vec<String> = binary_fts(noun_name).iter()
-            .map(|ft| other_role(ft, noun_name).to_string()).collect();
+        let children: Vec<String> = binary_fts_for(&domain, noun_name).iter()
+            .map(|ft| other_role_of(ft, noun_name).to_string()).collect();
         let child_list = children.join(", ");
         let dtd_text = format!("<!ELEMENT {} ({})>\n{}",
             noun_name,
@@ -840,8 +680,8 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
 
     // ── Generator 7: OWL — α(noun → owl_def) ──────────────────────────
     defs.extend(domain.nouns.iter().map(|(noun_name, noun_def)| {
-        let properties = Object::Seq(binary_fts(noun_name).iter().map(|ft| {
-            let other = other_role(ft, noun_name);
+        let properties = Object::Seq(binary_fts_for(&domain, noun_name).iter().map(|ft| {
+            let other = other_role_of(ft, noun_name);
             let prop_type = match domain.nouns.get(&other).map(|n| n.object_type.as_str()) {
                 Some("value") => "DatatypeProperty", _ => "ObjectProperty",
             };
@@ -869,8 +709,8 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
 
     // ── Generator 9: EDM — α(noun → edm_def) ──────────────────────────
     defs.extend(domain.nouns.iter().map(|(noun_name, noun_def)| {
-        let properties = Object::Seq(binary_fts(noun_name).iter().map(|ft| {
-            let other = other_role(ft, noun_name);
+        let properties = Object::Seq(binary_fts_for(&domain, noun_name).iter().map(|ft| {
+            let other = other_role_of(ft, noun_name);
             let kind = match domain.nouns.get(&other).map(|n| n.object_type.as_str()) {
                 Some("entity") => "NavigationProperty", _ => "Property",
             };
@@ -888,7 +728,7 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
 
     // ��─ Generator 10: XForms ──────────────────────────────────────────
     defs.extend(domain.nouns.iter().map(|(noun_name, _)| {
-        let bindings = Object::Seq(binary_fts(noun_name).iter().filter_map(|ft| {
+        let bindings = Object::Seq(binary_fts_for(&domain, noun_name).iter().filter_map(|ft| {
             let other = ft.roles.iter().find(|r| r.noun_name != *noun_name)?;
             let control = match domain.nouns.get(&other.noun_name).map(|n| n.object_type.as_str()) {
                 Some("value") => "input", _ => "select1",
@@ -903,10 +743,10 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
 
     // ── Generator 11: HTML Report ─────────────────────────────────────
     defs.extend(domain.nouns.iter().map(|(noun_name, noun_def)| {
-        let fields = Object::Seq(binary_fts(noun_name).iter().map(|ft|
-            Object::seq(vec![Object::atom(&other_role(ft, noun_name)), Object::atom(&ft.reading)])
+        let fields = Object::Seq(binary_fts_for(&domain, noun_name).iter().map(|ft|
+            Object::seq(vec![Object::atom(&other_role_of(ft, noun_name)), Object::atom(&ft.reading)])
         ).collect());
-        let constraints = Object::Seq(noun_constraints(noun_name).iter()
+        let constraints = Object::Seq(noun_constraints_for(&domain, noun_name).iter()
             .map(|c| Object::atom(&c.text)).collect());
         (format!("html:{}", noun_name), Func::constant(Object::seq(vec![
             Object::seq(vec![Object::atom("title"), Object::atom(noun_name)]),
@@ -954,7 +794,7 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
 
     // ── Generator 14: PLiX ────────────────────────────────────────────
     defs.extend(domain.nouns.iter().map(|(noun_name, noun_def)| {
-        let fields = Object::Seq(binary_fts(noun_name).iter().filter_map(|ft| {
+        let fields = Object::Seq(binary_fts_for(&domain, noun_name).iter().filter_map(|ft| {
             let other = ft.roles.iter().find(|r| r.noun_name != *noun_name)?;
             let clr_type = match domain.nouns.get(&other.noun_name).map(|n| n.object_type.as_str()) {
                 Some("value") => "System.String", _ => &other.noun_name,
@@ -973,7 +813,7 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
         let readings = Object::Seq(domain.fact_types.values()
             .filter(|ft| ft.roles.iter().any(|r| r.noun_name == *noun_name))
             .map(|ft| Object::atom(&ft.reading)).collect());
-        let constraints = Object::Seq(noun_constraints(noun_name).iter()
+        let constraints = Object::Seq(noun_constraints_for(&domain, noun_name).iter()
             .map(|c| Object::seq(vec![Object::atom(&c.kind), Object::atom(&c.text)])).collect());
         let transitions = Object::Seq(model.state_machines.iter()
             .filter(|sm| sm.noun_name == *noun_name)
