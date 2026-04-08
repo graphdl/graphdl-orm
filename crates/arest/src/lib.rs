@@ -135,6 +135,29 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
         return format!("{}", defs.len());
     }
 
+    // ── apply: create = emit ∘ validate ∘ derive ∘ resolve (Eq. 10) ──
+    if key == "apply" {
+        let mut s = ds().lock().unwrap();
+        let st = match s.get(handle as usize).and_then(|x| x.as_ref()) {
+            Some(x) => x,
+            None => return "⊥".into(),
+        };
+        let command: arest::Command = match serde_json::from_str(input) {
+            Ok(c) => c,
+            Err(e) => return format!("⊥ {}", e),
+        };
+        let state = compile::state_to_domain(&st.d);
+        let pop_state = parse_forml2::domain_to_state(&state);
+        let result = arest::apply_command_defs(&st.d, &command, &pop_state);
+        // D' = D with updated population if not rejected
+        if !result.rejected {
+            let defs = compile::compile_to_defs_state(&result.state);
+            let d = ast::defs_to_state(&defs, &result.state);
+            s[handle as usize] = Some(CompiledState { d });
+        }
+        return serde_json::to_string(&result).unwrap_or_else(|e| format!("⊥ {}", e));
+    }
+
     // ── SYSTEM:x = (ρ(↑entity(x):D)):↑op(x)  (Eq. 9) ────────────
     let s = ds().lock().unwrap();
     let st = match s.get(handle as usize).and_then(|x| x.as_ref()) {
