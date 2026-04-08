@@ -85,9 +85,10 @@ fn release_impl(handle: u32) {
 /// The key is a function name in DEFS. The input is an FFP object.
 /// apply(defs[key], parse(input), defs) → result.
 ///
-/// Keys not yet in DEFS fall through to legacy dispatch.
+/// Per Eq. 9: SYSTEM:x = (ρ(↑entity(x):D)):↑op(x).
+/// Parse operations are pre-D bootstrap (compile ∘ parse).
 fn system_impl(handle: u32, key: &str, input: &str) -> String {
-    // ── Handle-free operations ──────────────────────────────────
+    // ── Bootstrap: compile ∘ parse (pre-D, creates D) ──────────
     match key {
         "parse" => {
             // input: <markdown, domain>
