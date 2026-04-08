@@ -394,7 +394,8 @@ fn derive_state_machines_from_facts(facts: &[GeneralInstanceFact]) -> HashMap<St
 // The match on kind happens here, once. After this, everything is Func.
 
 /// Compile an Object state into named FFP definitions.
-/// Readings in, Def name = func out. Nothing else.
+/// All generators always produce all defs. Selection is at apply time:
+/// SYSTEM:sql:sqlite:Order returns DDL, SYSTEM:xsd:Order returns XSD.
 pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> {
     let domain = state_to_domain(state);
     let model = compile(&domain);
@@ -793,6 +794,200 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
         }).collect());
         defs.push((format!("query:{}", id), Func::constant(role_map)));
     }
+
+    // Helper: binary fact types involving a noun (α projection)
+    let binary_fts = |noun: &str| -> Vec<&FactTypeDef> {
+        domain.fact_types.values()
+            .filter(|ft| ft.roles.len() == 2 && ft.roles.iter().any(|r| r.noun_name == noun))
+            .collect()
+    };
+    let other_role = |ft: &FactTypeDef, noun: &str| -> String {
+        ft.roles.iter().find(|r| r.noun_name != noun)
+            .map(|r| r.noun_name.clone()).unwrap_or_default()
+    };
+    let noun_constraints = |noun: &str| -> Vec<&ConstraintDef> {
+        domain.constraints.iter()
+            .filter(|c| c.spans.iter().any(|s| {
+                domain.fact_types.get(&s.fact_type_id)
+                    .map_or(false, |ft| ft.roles.iter().any(|r| r.noun_name == noun))
+            })).collect()
+    };
+
+    // ── Generator 5: XSD — α(noun → xsd_def) ────────────────────────
+    defs.extend(domain.nouns.iter().map(|(noun_name, noun_def)| {
+        let fields = Object::Seq(binary_fts(noun_name).iter().map(|ft|
+            Object::seq(vec![Object::atom(&other_role(ft, noun_name)), Object::atom("xs:string")])
+        ).collect());
+        (format!("xsd:{}", noun_name), Func::constant(Object::seq(vec![
+            Object::seq(vec![Object::atom("name"), Object::atom(noun_name)]),
+            Object::seq(vec![Object::atom("object_type"), Object::atom(&noun_def.object_type)]),
+            Object::seq(vec![Object::atom("elements"), fields]),
+        ])))
+    }));
+
+    // ── Generator 6: DTD — α(noun → dtd_def) ────────────────────────
+    defs.extend(domain.nouns.iter().map(|(noun_name, _)| {
+        let children: Vec<String> = binary_fts(noun_name).iter()
+            .map(|ft| other_role(ft, noun_name).to_string()).collect();
+        let child_list = children.join(", ");
+        let dtd_text = format!("<!ELEMENT {} ({})>\n{}",
+            noun_name,
+            if child_list.is_empty() { "#PCDATA".to_string() } else { child_list },
+            children.iter().map(|c| format!("<!ELEMENT {} (#PCDATA)>", c)).collect::<Vec<_>>().join("\n"),
+        );
+        (format!("dtd:{}", noun_name), Func::constant(Object::atom(&dtd_text)))
+    }));
+
+    // ── Generator 7: OWL — α(noun → owl_def) ──────────────────────────
+    defs.extend(domain.nouns.iter().map(|(noun_name, noun_def)| {
+        let properties = Object::Seq(binary_fts(noun_name).iter().map(|ft| {
+            let other = other_role(ft, noun_name);
+            let prop_type = match domain.nouns.get(&other).map(|n| n.object_type.as_str()) {
+                Some("value") => "DatatypeProperty", _ => "ObjectProperty",
+            };
+            Object::seq(vec![Object::atom(&other), Object::atom(prop_type), Object::atom(&ft.reading)])
+        }).collect());
+        (format!("owl:{}", noun_name), Func::constant(Object::seq(vec![
+            Object::seq(vec![Object::atom("class"), Object::atom(noun_name)]),
+            Object::seq(vec![Object::atom("type"), Object::atom(match noun_def.object_type.as_str() { "value" => "Datatype", _ => "Class" })]),
+            Object::seq(vec![Object::atom("properties"), properties]),
+        ])))
+    }));
+
+    // ── Generator 8: WSDL — α(noun → wsdl_def) ─────────────────────
+    defs.extend(domain.nouns.iter().map(|(noun_name, _)| {
+        let has_sm = model.state_machines.iter().any(|sm| sm.noun_name == *noun_name);
+        let ops: Vec<Object> = [("create","POST"), ("query","GET"), ("update","PUT")]
+            .iter().map(|(op,m)| Object::seq(vec![Object::atom(op), Object::atom(m)]))
+            .chain(has_sm.then(|| Object::seq(vec![Object::atom("transition"), Object::atom("POST")])))
+            .collect();
+        (format!("wsdl:{}", noun_name), Func::constant(Object::seq(vec![
+            Object::seq(vec![Object::atom("portType"), Object::atom(noun_name)]),
+            Object::seq(vec![Object::atom("operations"), Object::Seq(ops)]),
+        ])))
+    }));
+
+    // ── Generator 9: EDM — α(noun → edm_def) ──────────────────────────
+    defs.extend(domain.nouns.iter().map(|(noun_name, noun_def)| {
+        let properties = Object::Seq(binary_fts(noun_name).iter().map(|ft| {
+            let other = other_role(ft, noun_name);
+            let kind = match domain.nouns.get(&other).map(|n| n.object_type.as_str()) {
+                Some("entity") => "NavigationProperty", _ => "Property",
+            };
+            Object::seq(vec![Object::atom(&other), Object::atom(kind), Object::atom("Edm.String")])
+        }).collect());
+        let key = Object::Seq(domain.ref_schemes.get(noun_name)
+            .map(|parts| parts.iter().map(|p| Object::atom(p)).collect()).unwrap_or_default());
+        (format!("edm:{}", noun_name), Func::constant(Object::seq(vec![
+            Object::seq(vec![Object::atom("entity_type"), Object::atom(noun_name)]),
+            Object::seq(vec![Object::atom("base_type"), Object::atom(&noun_def.object_type)]),
+            Object::seq(vec![Object::atom("key"), key]),
+            Object::seq(vec![Object::atom("properties"), properties]),
+        ])))
+    }));
+
+    // ��─ Generator 10: XForms ──────────────────────────────────────────
+    defs.extend(domain.nouns.iter().map(|(noun_name, _)| {
+        let bindings = Object::Seq(binary_fts(noun_name).iter().filter_map(|ft| {
+            let other = ft.roles.iter().find(|r| r.noun_name != *noun_name)?;
+            let control = match domain.nouns.get(&other.noun_name).map(|n| n.object_type.as_str()) {
+                Some("value") => "input", _ => "select1",
+            };
+            Some(Object::seq(vec![Object::atom(&other.noun_name), Object::atom(control), Object::atom(&ft.reading)]))
+        }).collect());
+        (format!("xforms:{}", noun_name), Func::constant(Object::seq(vec![
+            Object::seq(vec![Object::atom("model"), Object::atom(noun_name)]),
+            Object::seq(vec![Object::atom("bindings"), bindings]),
+        ])))
+    }));
+
+    // ── Generator 11: HTML Report ─────────────────────────────────────
+    defs.extend(domain.nouns.iter().map(|(noun_name, noun_def)| {
+        let fields = Object::Seq(binary_fts(noun_name).iter().map(|ft|
+            Object::seq(vec![Object::atom(&other_role(ft, noun_name)), Object::atom(&ft.reading)])
+        ).collect());
+        let constraints = Object::Seq(noun_constraints(noun_name).iter()
+            .map(|c| Object::atom(&c.text)).collect());
+        (format!("html:{}", noun_name), Func::constant(Object::seq(vec![
+            Object::seq(vec![Object::atom("title"), Object::atom(noun_name)]),
+            Object::seq(vec![Object::atom("object_type"), Object::atom(&noun_def.object_type)]),
+            Object::seq(vec![Object::atom("fields"), fields]),
+            Object::seq(vec![Object::atom("constraints"), constraints]),
+        ])))
+    }));
+
+    // ─�� Generator 12: NHibernate Mapping ──────────────────────────────
+    let tables = crate::rmap::rmap(&domain);
+    defs.extend(tables.iter().map(|table| {
+        let columns = Object::Seq(table.columns.iter().map(|col| Object::seq(vec![
+            Object::atom(&col.name), Object::atom(&col.col_type),
+            Object::atom(if col.nullable { "true" } else { "false" }),
+            col.references.as_ref().map(|r| Object::atom(r)).unwrap_or(Object::phi()),
+        ])).collect());
+        let pk = Object::Seq(table.primary_key.iter().map(|k| Object::atom(k)).collect());
+        (format!("nhibernate:{}", table.name), Func::constant(Object::seq(vec![
+            Object::seq(vec![Object::atom("class"), Object::atom(&table.name)]),
+            Object::seq(vec![Object::atom("table"), Object::atom(&table.name)]),
+            Object::seq(vec![Object::atom("id"), pk]),
+            Object::seq(vec![Object::atom("properties"), columns]),
+        ])))
+    }));
+
+    // ── Generator 13: LINQ — α(table → linq_def) ────────────────────
+    defs.extend(tables.iter().map(|table| {
+        let members = Object::Seq(table.columns.iter().map(|col| {
+            let db_type = match col.col_type.as_str() {
+                "TEXT" => "NVarChar", "INTEGER" => "Int", "REAL" => "Float",
+                "BOOLEAN" => "Bit", _ => "NVarChar",
+            };
+            Object::seq(vec![
+                Object::atom(&col.name), Object::atom(db_type),
+                Object::atom(if col.nullable { "true" } else { "false" }),
+                Object::atom(if table.primary_key.contains(&col.name) { "true" } else { "false" }),
+            ])
+        }).collect());
+        (format!("linq:{}", table.name), Func::constant(Object::seq(vec![
+            Object::seq(vec![Object::atom("table"), Object::atom(&table.name)]),
+            Object::seq(vec![Object::atom("columns"), members]),
+        ])))
+    }));
+
+    // ── Generator 14: PLiX ────────────────────────────────────────────
+    defs.extend(domain.nouns.iter().map(|(noun_name, noun_def)| {
+        let fields = Object::Seq(binary_fts(noun_name).iter().filter_map(|ft| {
+            let other = ft.roles.iter().find(|r| r.noun_name != *noun_name)?;
+            let clr_type = match domain.nouns.get(&other.noun_name).map(|n| n.object_type.as_str()) {
+                Some("value") => "System.String", _ => &other.noun_name,
+            };
+            Some(Object::seq(vec![Object::atom(&other.noun_name), Object::atom(clr_type)]))
+        }).collect());
+        (format!("plix:{}", noun_name), Func::constant(Object::seq(vec![
+            Object::seq(vec![Object::atom("class"), Object::atom(noun_name)]),
+            Object::seq(vec![Object::atom("base_type"), Object::atom(&noun_def.object_type)]),
+            Object::seq(vec![Object::atom("fields"), fields]),
+        ])))
+    }));
+
+    // ── Generator 15: DSL ─────────────────────────────────────────────
+    defs.extend(domain.nouns.iter().map(|(noun_name, noun_def)| {
+        let readings = Object::Seq(domain.fact_types.values()
+            .filter(|ft| ft.roles.iter().any(|r| r.noun_name == *noun_name))
+            .map(|ft| Object::atom(&ft.reading)).collect());
+        let constraints = Object::Seq(noun_constraints(noun_name).iter()
+            .map(|c| Object::seq(vec![Object::atom(&c.kind), Object::atom(&c.text)])).collect());
+        let transitions = Object::Seq(model.state_machines.iter()
+            .filter(|sm| sm.noun_name == *noun_name)
+            .flat_map(|sm| sm.transition_table.iter().map(|(from, to, event)|
+                Object::seq(vec![Object::atom(from), Object::atom(event), Object::atom(to)])
+            )).collect());
+        (format!("dsl:{}", noun_name), Func::constant(Object::seq(vec![
+            Object::seq(vec![Object::atom("noun"), Object::atom(noun_name)]),
+            Object::seq(vec![Object::atom("object_type"), Object::atom(&noun_def.object_type)]),
+            Object::seq(vec![Object::atom("readings"), readings]),
+            Object::seq(vec![Object::atom("constraints"), constraints]),
+            Object::seq(vec![Object::atom("transitions"), transitions]),
+        ])))
+    }));
 
     defs
 }
