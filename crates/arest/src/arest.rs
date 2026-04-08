@@ -253,6 +253,8 @@ pub fn apply_command_defs(
     }
 }
 
+/// create = emit ∘ validate ∘ derive ∘ resolve (Eq. 5)
+/// Each stage is a ρ-application. The result is an Object, decoded to CommandResult at the boundary.
 fn create_via_defs(
     d: &ast::Object,
     noun: &str,
@@ -263,77 +265,61 @@ fn create_via_defs(
 ) -> CommandResult {
     let entity_id = explicit_id.unwrap_or("").to_string();
 
-    let mut entity_data = fields.clone();
-    entity_data.insert("domain".to_string(), domain.to_string());
-
-    let resolve_key = format!("resolve:{}", noun);
-    let new_state = entity_data.iter().fold(state.clone(), |acc, (field_name, value)| {
-        let ft_id = def_func(&resolve_key, d)
-            .map(|f| ast::apply(&f, &ast::Object::atom(&field_name.to_lowercase()), d))
-            .and_then(|o| o.as_atom().map(|s| s.to_string()))
+    // ── resolve: populate facts via ρ(resolve:{noun}) ──────────────
+    let fields_with_domain: Vec<(&str, &str)> = fields.iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .chain(std::iter::once(("domain", domain)))
+        .collect();
+    let resolved = fields_with_domain.iter().fold(state.clone(), |acc, (field_name, value)| {
+        let ft_id_obj = ast::apply(&ast::Func::Def(format!("resolve:{}", noun)),
+            &ast::Object::atom(&field_name.to_lowercase()), d);
+        let ft_id = ft_id_obj.as_atom().map(|s| s.to_string())
             .unwrap_or_else(|| format!("{}_has_{}", noun, field_name));
-        ast::cell_push(&ft_id, ast::fact_from_pairs(&[(noun, &entity_id), (field_name.as_str(), value.as_str())]), &acc)
+        ast::cell_push(&ft_id, ast::fact_from_pairs(&[(noun, &entity_id), (field_name, value)]), &acc)
     });
 
-    // -- derive --
+    // ── derive: forward chain via ρ(derivation:*) to lfp ───────────
     let derivation_defs_owned: Vec<(String, ast::Func)> = ast::cells_iter(d).into_iter()
         .filter(|(n, _)| n.starts_with("derivation:"))
         .map(|(n, contents)| (n.to_string(), ast::metacompose(contents, d)))
         .collect();
-    let derivation_defs: Vec<(&str, &ast::Func)> = derivation_defs_owned.iter()
+    let derivation_refs: Vec<(&str, &ast::Func)> = derivation_defs_owned.iter()
         .map(|(n, f)| (n.as_str(), f)).collect();
-    let (new_state, derived) = crate::evaluate::forward_chain_defs_state(&derivation_defs, &new_state);
+    let (derived_state, derived) = crate::evaluate::forward_chain_defs_state(&derivation_refs, &resolved);
 
-    // Build entity result
-    let mut entities = vec![EntityResult {
-        id: entity_id.clone(),
-        entity_type: noun.to_string(),
-        data: entity_data,
-    }];
+    // Inject transitions via ρ(transitions_meta:{noun})
+    let with_transitions = ast::apply(
+        &ast::Func::Def(format!("transitions_meta:{}", noun)), &ast::Object::phi(), d,
+    ).as_seq().map(|facts| {
+        facts.iter().fold(derived_state.clone(), |s, fact| ast::cell_push("Transition", fact.clone(), &s))
+    }).unwrap_or(derived_state.clone());
 
-    let sm_id = entity_id.clone();
-    let status = extract_sm_status(&new_state, &sm_id);
-
-    if let Some(ref st) = status {
-        let mut sm_data = std::collections::HashMap::new();
-        sm_data.insert("forResource".to_string(), entity_id.clone());
-        sm_data.insert("currentlyInStatus".to_string(), st.clone());
-        sm_data.insert("domain".to_string(), domain.to_string());
-        entities.push(EntityResult {
-            id: sm_id,
-            entity_type: "State Machine".to_string(),
-            data: sm_data,
-        });
-    }
-
-    // Inject transition facts from compiled transitions_meta:{noun} (Theorem 3: T is in P)
-    let new_state = def_func(&format!("transitions_meta:{}", noun), d)
-        .map(|f| {
-            let triples = ast::apply(&f, &ast::Object::phi(), d);
-            triples.as_seq().map(|facts| {
-                facts.iter().fold(new_state.clone(), |s, fact| ast::cell_push("Transition", fact.clone(), &s))
-            }).unwrap_or(new_state.clone())
-        })
-        .unwrap_or_else(|| inject_transition_facts(state, new_state));
-
-    // -- validate --
-    let ctx_obj = ast::encode_eval_context_state("", None, &new_state);
-    let validate_func = def_func("validate", d).unwrap_or(ast::Func::constant(ast::Object::phi()));
-    let violation_obj = ast::apply(&validate_func, &ctx_obj, d);
+    // ── validate: ρ(validate) applied to population ────────────────
+    let ctx_obj = ast::encode_eval_context_state("", None, &with_transitions);
+    let violation_obj = ast::apply(&ast::Func::Def("validate".to_string()), &ctx_obj, d);
     let violations = ast::decode_violations(&violation_obj);
     let rejected = violations.iter().any(|v| v.alethic);
 
-    // -- emit --
-    let transitions = hateoas_from_state(&new_state, noun, &entity_id, status.as_deref());
+    // ── emit: construct representation via ρ ────────────────────────
+    let status = extract_sm_status(&with_transitions, &entity_id);
+    let transitions = hateoas_from_state(&with_transitions, noun, &entity_id, status.as_deref());
+
+    let entity_data: std::collections::HashMap<String, String> = fields_with_domain.iter()
+        .map(|(k, v)| (k.to_string(), v.to_string())).collect();
+    let entities = std::iter::once(EntityResult {
+        id: entity_id.clone(), entity_type: noun.to_string(), data: entity_data,
+    }).chain(status.as_ref().map(|st| {
+        EntityResult {
+            id: entity_id.clone(), entity_type: "State Machine".to_string(),
+            data: [("forResource", entity_id.as_str()), ("currentlyInStatus", st.as_str()), ("domain", domain)]
+                .iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+        }
+    })).collect();
 
     CommandResult {
-        entities,
-        status,
-        transitions,
-        violations,
-        derived_count: derived.len(),
-        rejected,
-        state: if rejected { state.clone() } else { new_state },
+        entities, status, transitions, violations,
+        derived_count: derived.len(), rejected,
+        state: match rejected { true => state.clone(), false => with_transitions },
     }
 }
 
