@@ -439,17 +439,7 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
             Func::filter(Func::compose(Func::Not, Func::NullTest)),
             Func::construction(checks),
         );
-        let meta_triples = Object::Seq(sm.transition_table.iter().map(|(from, to, event)| {
-            Object::seq(vec![
-                Object::seq(vec![Object::atom("from"), Object::atom(from)]),
-                Object::seq(vec![Object::atom("to"), Object::atom(to)]),
-                Object::seq(vec![Object::atom("event"), Object::atom(event)]),
-            ])
-        }).collect());
-        [
-            (format!("transitions:{}", sm.noun_name), transitions_func),
-            (format!("transitions_meta:{}", sm.noun_name), Func::constant(meta_triples)),
-        ]
+        [(format!("transitions:{}", sm.noun_name), transitions_func)]
     }));
 
     // Derivation rules — α(derivation → def)

@@ -287,22 +287,15 @@ fn create_via_defs(
         .map(|(n, f)| (n.as_str(), f)).collect();
     let (derived_state, derived) = crate::evaluate::forward_chain_defs_state(&derivation_refs, &resolved);
 
-    // Inject transitions via ρ(transitions_meta:{noun})
-    let with_transitions = ast::apply(
-        &ast::Func::Def(format!("transitions_meta:{}", noun)), &ast::Object::phi(), d,
-    ).as_seq().map(|facts| {
-        facts.iter().fold(derived_state.clone(), |s, fact| ast::cell_push("Transition", fact.clone(), &s))
-    }).unwrap_or(derived_state.clone());
-
     // ── validate: ρ(validate) applied to population ────────────────
-    let ctx_obj = ast::encode_eval_context_state("", None, &with_transitions);
+    let ctx_obj = ast::encode_eval_context_state("", None, &derived_state);
     let violation_obj = ast::apply(&ast::Func::Def("validate".to_string()), &ctx_obj, d);
     let violations = ast::decode_violations(&violation_obj);
     let rejected = violations.iter().any(|v| v.alethic);
 
     // ── emit: construct representation via ρ ────────────────────────
-    let status = extract_sm_status(&with_transitions, &entity_id);
-    let transitions = hateoas_from_state(&with_transitions, noun, &entity_id, status.as_deref());
+    let status = extract_sm_status(&derived_state, &entity_id);
+    let transitions = hateoas_via_rho(d, noun, &entity_id, status.as_deref());
 
     let entity_data: std::collections::HashMap<String, String> = fields_with_domain.iter()
         .map(|(k, v)| (k.to_string(), v.to_string())).collect();
@@ -319,7 +312,7 @@ fn create_via_defs(
     CommandResult {
         entities, status, transitions, violations,
         derived_count: derived.len(), rejected,
-        state: match rejected { true => state.clone(), false => with_transitions },
+        state: match rejected { true => state.clone(), false => derived_state },
     }
 }
 
@@ -344,22 +337,27 @@ fn transition_via_defs(
 ) -> CommandResult {
     let mut new_state = state.clone();
 
-    // Find the machine def and compute transition via find_map (no for loop)
-    let new_status = ast::cells_iter(d).into_iter()
+    // Find the machine def, compute transition, capture noun name
+    let transition_result: Option<(String, String)> = ast::cells_iter(d).into_iter()
         .filter(|(name, _)| name.starts_with("machine:") && !name.contains(":initial"))
         .find_map(|(name, contents)| {
+            let noun = name.strip_prefix("machine:")?;
             let func = ast::metacompose(contents, d);
             let initial_key = format!("{}:initial", name);
             let from_status = current_status.map(|s| s.to_string()).or_else(|| {
-                def_func(&initial_key, d)
-                    .map(|f| ast::apply(&f, &ast::Object::phi(), d))
-                    .and_then(|o| o.as_atom().map(|s| s.to_string()))
+                ast::apply(&ast::Func::Def(initial_key), &ast::Object::phi(), d)
+                    .as_atom().map(|s| s.to_string())
             })?;
             let input = ast::Object::seq(vec![ast::Object::atom(&from_status), ast::Object::atom(event)]);
             ast::apply(&func, &input, d).as_atom()
                 .filter(|next| *next != from_status)
-                .map(|next| next.to_string())
+                .map(|next| (noun.to_string(), next.to_string()))
         });
+
+    let (noun, new_status) = match transition_result {
+        Some((n, s)) => (n, Some(s)),
+        None => (String::new(), None),
+    };
 
     if let Some(ref status) = new_status {
         // Update SM status fact in state
@@ -376,11 +374,7 @@ fn transition_via_defs(
 
     let status = new_status.or_else(|| current_status.map(|s| s.to_string()));
 
-    // Inject transition facts for HATEOAS
-    let new_state = inject_transition_facts(state, new_state);
-
-    let noun = "";
-    let transitions = hateoas_from_state(&new_state, noun, entity_id, status.as_deref());
+    let transitions = hateoas_via_rho(d, &noun, entity_id, status.as_deref());
 
     CommandResult {
         entities: vec![],
@@ -505,7 +499,7 @@ fn update_via_defs(
     let rejected = violations.iter().any(|v| v.alethic);
     let sm_id = entity_id.to_string();
     let status = extract_sm_status(&new_state, &sm_id);
-    let transitions = hateoas_from_state(&new_state, noun, entity_id, status.as_deref());
+    let transitions = hateoas_via_rho(d, noun, entity_id, status.as_deref());
 
     CommandResult {
         entities: vec![EntityResult {
@@ -571,47 +565,11 @@ fn apply_load_readings(
 
 // -- Helpers ----------------------------------------------------------
 
-/// Inject transition facts from InstanceFact entries into state.
-fn inject_transition_facts(source_state: &ast::Object, target_state: ast::Object) -> ast::Object {
-    let inst_cell = ast::fetch_or_phi("InstanceFact", source_state);
-    let inst_facts = match inst_cell.as_seq() {
-        Some(facts) => facts,
-        None => return target_state,
-    };
-
-    // Collect three maps via fold, then join and fold into state
-    type SMap = std::collections::HashMap<String, String>;
-    let (t_from, t_to, t_event): (SMap, SMap, SMap) = inst_facts.iter()
-        .filter(|f| ast::binding(f, "subjectNoun") == Some("Transition"))
-        .fold(
-            (SMap::new(), SMap::new(), SMap::new()),
-            |(mut from, mut to, mut event), f| {
-                let sv = ast::binding(f, "subjectValue").unwrap_or("").to_string();
-                let obj_noun = ast::binding(f, "objectNoun");
-                let obj_val = ast::binding(f, "objectValue").unwrap_or("").to_string();
-                let field = ast::binding(f, "fieldName").unwrap_or("");
-                match obj_noun {
-                    Some("Status") if field.to_lowercase().contains("from") => { from.insert(sv, obj_val); }
-                    Some("Status") if field.to_lowercase().contains("to") => { to.insert(sv, obj_val); }
-                    Some("Event Type") => { event.insert(sv, obj_val); }
-                    _ => {}
-                }
-                (from, to, event)
-            },
-        );
-
-    t_from.iter()
-        .filter_map(|(t_name, from)| {
-            let to = t_to.get(t_name)?;
-            let event = t_event.get(t_name).map(|s| s.as_str()).unwrap_or(t_name);
-            Some(ast::fact_from_pairs(&[("from", from.as_str()), ("to", to.as_str()), ("event", event)]))
-        })
-        .fold(target_state, |acc, fact| ast::cell_push("Transition", fact, &acc))
-}
-
-/// HATEOAS as Projection (Theorem 4a)
-fn hateoas_from_state(
-    state: &ast::Object,
+/// HATEOAS as ρ-application (Theorem 4a)
+/// HATEOAS as ρ-application (Theorem 4a):
+/// links(s) = π_event(Filter(p) : T) — computed via transitions:{noun} def.
+fn hateoas_via_rho(
+    d: &ast::Object,
     noun: &str,
     entity_id: &str,
     status: Option<&str>,
@@ -619,52 +577,25 @@ fn hateoas_from_state(
     let Some(status) = status else { return vec![] };
     let encoded = noun.replace(' ', "%20");
 
-    let transition_cell = ast::fetch_or_phi("Transition", state);
-    let transition_facts = match transition_cell.as_seq() {
-        Some(facts) => facts,
-        None => return vec![],
-    };
+    // ρ(transitions:{noun}) : status → <<from, to, event>, ...>
+    let result = ast::apply(
+        &ast::Func::Def(format!("transitions:{}", noun)),
+        &ast::Object::atom(status),
+        d,
+    );
 
-    // Build ancestor set via transitive closure (fixed-point iteration)
-    let subtype_cell = ast::fetch_or_phi("Status is subtype of Status", state);
-    let subtype_edges: Vec<(String, String)> = subtype_cell.as_seq()
-        .into_iter()
-        .flat_map(|facts| facts.iter().filter_map(|fact| {
-            let pairs = fact.as_seq()?;
-            if pairs.len() < 2 { return None; }
-            let child = pairs[0].as_seq().and_then(|p| p.get(1)?.as_atom())?.to_string();
-            let parent = pairs[1].as_seq().and_then(|p| p.get(1)?.as_atom())?.to_string();
-            Some((child, parent))
-        }).collect::<Vec<_>>())
-        .collect();
-
-    // Fixed-point: keep adding ancestors until no new ones found
-    let ancestor_statuses = std::iter::successors(
-        Some(vec![status.to_string()]),
-        |current| {
-            let new: Vec<String> = subtype_edges.iter()
-                .filter(|(child, parent)| current.contains(child) && !current.contains(parent))
-                .map(|(_, parent)| parent.clone())
-                .collect();
-            if new.is_empty() { None } else { Some([current.clone(), new].concat()) }
-        },
-    ).last().unwrap_or_else(|| vec![status.to_string()]);
-
-    transition_facts.iter()
-        .filter(|fact| {
-            ast::binding(fact, "from").map_or(false, |v| ancestor_statuses.iter().any(|a| a == v))
-        })
-        .filter_map(|fact| {
-            let event = ast::binding(fact, "event")?.to_string();
-            let to = ast::binding(fact, "to")?.to_string();
+    result.as_seq().map(|triples| {
+        triples.iter().filter_map(|t| {
+            let items = t.as_seq()?;
+            let _from = items.get(0)?.as_atom()?;
+            let to = items.get(1)?.as_atom()?.to_string();
+            let event = items.get(2)?.as_atom()?.to_string();
             Some(TransitionAction {
-                event,
-                target_status: to,
-                method: "POST".to_string(),
+                event, target_status: to, method: "POST".to_string(),
                 href: format!("/api/entities/{}/{}/transition", encoded, entity_id),
             })
-        })
-        .collect()
+        }).collect()
+    }).unwrap_or_default()
 }
 
 fn extract_sm_status(state: &ast::Object, sm_id: &str) -> Option<String> {
