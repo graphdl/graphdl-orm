@@ -335,14 +335,11 @@ fn resolve_fact_type_id_defs(
     noun: &str,
     field: &str,
 ) -> String {
-    for (name, _) in defs {
-        if !name.starts_with("schema:") { continue; }
-        let schema_id = &name["schema:".len()..];
-        if schema_id.contains(noun) && schema_id.contains(field) {
-            return schema_id.to_string();
-        }
-    }
-    format!("{}_has_{}", noun, field)
+    defs.keys()
+        .filter_map(|name| name.strip_prefix("schema:"))
+        .find(|schema_id| schema_id.contains(noun) && schema_id.contains(field))
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("{}_has_{}", noun, field))
 }
 
 fn transition_via_defs(
@@ -428,14 +425,10 @@ fn query_via_defs(
         })
         .unwrap_or_default();
 
-    let mut filter_pairs: Vec<(usize, String)> = Vec::new();
-    let mut target_role: usize = 0;
-    for (i, name) in role_names.iter().enumerate() {
-        if name == target { target_role = i + 1; }
-        if let Some(value) = bindings.get(name) {
-            filter_pairs.push((i + 1, value.clone()));
-        }
-    }
+    let target_role = role_names.iter().position(|n| n == target).map(|i| i + 1).unwrap_or(0);
+    let filter_pairs: Vec<(usize, String)> = role_names.iter().enumerate()
+        .filter_map(|(i, name)| bindings.get(name).map(|v| (i + 1, v.clone())))
+        .collect();
 
     let filter_refs: Vec<(usize, &str)> = filter_pairs.iter().map(|(i, v)| (*i, v.as_str())).collect();
     let schema = crate::compile::CompiledSchema {
@@ -473,50 +466,36 @@ fn update_via_defs(
     new_fields: &std::collections::HashMap<String, String>,
     state: &ast::Object,
 ) -> CommandResult {
-    // Read current facts for this entity
-    let mut merged = std::collections::HashMap::new();
-    for (_, contents) in ast::cells_iter(state) {
-        if let Some(facts) = contents.as_seq() {
-            for fact in facts {
-                if let Some(pairs) = fact.as_seq() {
-                    if pairs.len() >= 2 {
-                        let v0 = pairs[0].as_seq().and_then(|p| p.get(1)?.as_atom().map(|s| s.to_string()));
-                        let k1 = pairs[1].as_seq().and_then(|p| p.get(0)?.as_atom().map(|s| s.to_string()));
-                        let v1 = pairs[1].as_seq().and_then(|p| p.get(1)?.as_atom().map(|s| s.to_string()));
-                        if v0.as_deref() == Some(entity_id) {
-                            if let (Some(k), Some(v)) = (k1, v1) {
-                                merged.insert(k, v);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    for (k, v) in new_fields {
-        merged.insert(k.clone(), v.clone());
-    }
+    // Read current facts for this entity, merge with new fields
+    let merged: std::collections::HashMap<String, String> = ast::cells_iter(state)
+        .into_iter()
+        .flat_map(|(_, contents)| contents.as_seq().into_iter().flat_map(|facts| facts.to_vec()))
+        .filter_map(|fact| {
+            let pairs = fact.as_seq()?;
+            if pairs.len() < 2 { return None; }
+            let v0 = pairs[0].as_seq().and_then(|p| p.get(1)?.as_atom().map(|s| s.to_string()));
+            if v0.as_deref() != Some(entity_id) { return None; }
+            let k = pairs[1].as_seq().and_then(|p| p.get(0)?.as_atom().map(|s| s.to_string()))?;
+            let v = pairs[1].as_seq().and_then(|p| p.get(1)?.as_atom().map(|s| s.to_string()))?;
+            Some((k, v))
+        })
+        .chain(new_fields.iter().map(|(k, v)| (k.clone(), v.clone())))
+        .collect();
 
-    // Remove old facts for this entity, insert merged
-    let mut new_state = state.clone();
-    for (field_name, value) in &merged {
-        let ft_id = resolve_fact_type_id_defs(defs, noun, field_name);
-        // Remove old facts for this entity in this fact type
-        new_state = ast::cell_filter(&ft_id, |f| {
-            // Keep facts that are NOT for this entity
-            if let Some(pairs) = f.as_seq() {
-                if pairs.len() >= 2 {
-                    let v0 = pairs[0].as_seq().and_then(|p| p.get(1)?.as_atom());
-                    return v0 != Some(entity_id);
-                }
-            }
-            true
-        }, &new_state);
-        new_state = ast::cell_push(&ft_id, ast::fact_from_pairs(&[
-            (noun, entity_id),
-            (field_name.as_str(), value.as_str()),
-        ]), &new_state);
-    }
+    // Remove old facts for this entity, insert merged (fold over fields)
+    let resolve_key = format!("resolve:{}", noun);
+    let new_state = merged.iter().fold(state.clone(), |acc, (field_name, value)| {
+        let ft_id = defs.get(&resolve_key)
+            .map(|f| ast::apply(f, &ast::Object::atom(&field_name.to_lowercase()), defs))
+            .and_then(|o| o.as_atom().map(|s| s.to_string()))
+            .unwrap_or_else(|| resolve_fact_type_id_defs(defs, noun, field_name));
+        let acc = ast::cell_filter(&ft_id, |f| {
+            f.as_seq().map_or(true, |pairs| {
+                pairs.len() < 2 || pairs[0].as_seq().and_then(|p| p.get(1)?.as_atom()) != Some(entity_id)
+            })
+        }, &acc);
+        ast::cell_push(&ft_id, ast::fact_from_pairs(&[(noun, entity_id), (field_name.as_str(), value.as_str())]), &acc)
+    });
 
     // derive + validate + emit
     let derivation_defs: Vec<(&str, &ast::Func)> = defs.iter()
@@ -599,44 +578,41 @@ fn apply_load_readings(
 // -- Helpers ----------------------------------------------------------
 
 /// Inject transition facts from InstanceFact entries into state.
-fn inject_transition_facts(source_state: &ast::Object, mut target_state: ast::Object) -> ast::Object {
+fn inject_transition_facts(source_state: &ast::Object, target_state: ast::Object) -> ast::Object {
     let inst_cell = ast::fetch_or_phi("InstanceFact", source_state);
-    if let Some(inst_facts) = inst_cell.as_seq() {
-        let mut t_from: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-        let mut t_to: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-        let mut t_event: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-        for f in inst_facts {
-            let subj_noun = ast::binding(f, "subjectNoun");
-            let subj_val = ast::binding(f, "subjectValue").map(|s| s.to_string());
-            let obj_noun = ast::binding(f, "objectNoun");
-            let obj_val = ast::binding(f, "objectValue").map(|s| s.to_string());
-            let field = ast::binding(f, "fieldName");
-            if subj_noun == Some("Transition") {
-                let sv = subj_val.unwrap_or_default();
-                if obj_noun == Some("Status") {
-                    let fld = field.unwrap_or("");
-                    if fld.to_lowercase().contains("from") {
-                        t_from.insert(sv, obj_val.unwrap_or_default());
-                    } else if fld.to_lowercase().contains("to") {
-                        t_to.insert(sv, obj_val.unwrap_or_default());
-                    }
-                } else if obj_noun == Some("Event Type") {
-                    t_event.insert(sv, obj_val.unwrap_or_default());
+    let inst_facts = match inst_cell.as_seq() {
+        Some(facts) => facts,
+        None => return target_state,
+    };
+
+    // Collect three maps via fold, then join and fold into state
+    type SMap = std::collections::HashMap<String, String>;
+    let (t_from, t_to, t_event): (SMap, SMap, SMap) = inst_facts.iter()
+        .filter(|f| ast::binding(f, "subjectNoun") == Some("Transition"))
+        .fold(
+            (SMap::new(), SMap::new(), SMap::new()),
+            |(mut from, mut to, mut event), f| {
+                let sv = ast::binding(f, "subjectValue").unwrap_or("").to_string();
+                let obj_noun = ast::binding(f, "objectNoun");
+                let obj_val = ast::binding(f, "objectValue").unwrap_or("").to_string();
+                let field = ast::binding(f, "fieldName").unwrap_or("");
+                match obj_noun {
+                    Some("Status") if field.to_lowercase().contains("from") => { from.insert(sv, obj_val); }
+                    Some("Status") if field.to_lowercase().contains("to") => { to.insert(sv, obj_val); }
+                    Some("Event Type") => { event.insert(sv, obj_val); }
+                    _ => {}
                 }
-            }
-        }
-        for (t_name, from) in &t_from {
-            if let Some(to) = t_to.get(t_name) {
-                let event = t_event.get(t_name).cloned().unwrap_or_else(|| t_name.clone());
-                target_state = ast::cell_push("Transition", ast::fact_from_pairs(&[
-                    ("from", from.as_str()),
-                    ("to", to.as_str()),
-                    ("event", event.as_str()),
-                ]), &target_state);
-            }
-        }
-    }
-    target_state
+                (from, to, event)
+            },
+        );
+
+    t_from.iter()
+        .filter_map(|(t_name, from)| {
+            let to = t_to.get(t_name)?;
+            let event = t_event.get(t_name).map(|s| s.as_str()).unwrap_or(t_name);
+            Some(ast::fact_from_pairs(&[("from", from.as_str()), ("to", to.as_str()), ("event", event)]))
+        })
+        .fold(target_state, |acc, fact| ast::cell_push("Transition", fact, &acc))
 }
 
 /// HATEOAS as Projection (Theorem 4a)
@@ -655,30 +631,30 @@ fn hateoas_from_state(
         None => return vec![],
     };
 
-    // Build ancestor set
-    let mut ancestor_statuses: Vec<String> = vec![status.to_string()];
+    // Build ancestor set via transitive closure (fixed-point iteration)
     let subtype_cell = ast::fetch_or_phi("Status is subtype of Status", state);
-    if let Some(subtype_facts) = subtype_cell.as_seq() {
-        let mut frontier = vec![status.to_string()];
-        while let Some(current) = frontier.pop() {
-            for fact in subtype_facts {
-                if let Some(pairs) = fact.as_seq() {
-                    if pairs.len() >= 2 {
-                        let v0 = pairs[0].as_seq().and_then(|p| p.get(1)?.as_atom());
-                        let v1 = pairs[1].as_seq().and_then(|p| p.get(1)?.as_atom());
-                        if v0 == Some(&current) {
-                            if let Some(supertype) = v1 {
-                                if !ancestor_statuses.contains(&supertype.to_string()) {
-                                    ancestor_statuses.push(supertype.to_string());
-                                    frontier.push(supertype.to_string());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
+    let subtype_edges: Vec<(String, String)> = subtype_cell.as_seq()
+        .into_iter()
+        .flat_map(|facts| facts.iter().filter_map(|fact| {
+            let pairs = fact.as_seq()?;
+            if pairs.len() < 2 { return None; }
+            let child = pairs[0].as_seq().and_then(|p| p.get(1)?.as_atom())?.to_string();
+            let parent = pairs[1].as_seq().and_then(|p| p.get(1)?.as_atom())?.to_string();
+            Some((child, parent))
+        }).collect::<Vec<_>>())
+        .collect();
+
+    // Fixed-point: keep adding ancestors until no new ones found
+    let ancestor_statuses = std::iter::successors(
+        Some(vec![status.to_string()]),
+        |current| {
+            let new: Vec<String> = subtype_edges.iter()
+                .filter(|(child, parent)| current.contains(child) && !current.contains(parent))
+                .map(|(_, parent)| parent.clone())
+                .collect();
+            if new.is_empty() { None } else { Some([current.clone(), new].concat()) }
+        },
+    ).last().unwrap_or_else(|| vec![status.to_string()]);
 
     transition_facts.iter()
         .filter(|fact| {
@@ -699,22 +675,14 @@ fn hateoas_from_state(
 
 fn extract_sm_status(state: &ast::Object, sm_id: &str) -> Option<String> {
     let cell = ast::fetch_or_phi("StateMachine_has_currentlyInStatus", state);
-    let facts = cell.as_seq()?;
-    for fact in facts {
-        if ast::binding_matches(fact, "State Machine", sm_id) {
-            return ast::binding(fact, "currentlyInStatus").map(|s| s.to_string());
-        }
-        // Also check positional: first binding value == sm_id
-        if let Some(pairs) = fact.as_seq() {
-            let has_sm = pairs.iter().any(|pair| {
-                pair.as_seq().and_then(|p| p.get(1)?.as_atom()).map_or(false, |v| v == sm_id)
-            });
-            if has_sm {
-                return ast::binding(fact, "currentlyInStatus").map(|s| s.to_string());
-            }
-        }
-    }
-    None
+    cell.as_seq()?.iter()
+        .find(|fact| {
+            ast::binding_matches(fact, "State Machine", sm_id)
+                || fact.as_seq().map_or(false, |pairs| {
+                    pairs.iter().any(|pair| pair.as_seq().and_then(|p| p.get(1)?.as_atom()) == Some(sm_id))
+                })
+        })
+        .and_then(|fact| ast::binding(fact, "currentlyInStatus").map(|s| s.to_string()))
 }
 
 fn to_camel_case(s: &str) -> String {
