@@ -15,6 +15,32 @@ import {
   release_domain,
 } from '../../api/engine'
 
+// ── Metamodel readings — the system's own vocabulary ───────────────────────
+// Minimal subset of state.md needed to parse state machine instance facts.
+
+export const STATE_READINGS = `# State
+
+## Entity Types
+
+Status(.Name) is an entity type.
+State Machine Definition(.Name) is an entity type.
+Transition(.id) is an entity type.
+Noun(.Name) is an entity type.
+
+## Fact Types
+
+### State Machine Definition
+State Machine Definition is for Noun.
+
+### Status
+Status is initial in State Machine Definition.
+
+### Transition
+Transition is defined in State Machine Definition.
+Transition is from Status.
+Transition is to Status.
+`.trim()
+
 // ── Domain reading strings ──────────────────────────────────────────────────
 
 export const ORDER_READINGS = `# Orders
@@ -42,6 +68,19 @@ Order has Amount.
 Each Order was placed by exactly one Customer.
 Each Order has at most one Priority.
 Each Order has at most one Amount.
+
+## Instance Facts
+State Machine Definition 'Order' is for Noun 'Order'.
+Status 'In Cart' is initial in State Machine Definition 'Order'.
+Transition 'place' is defined in State Machine Definition 'Order'.
+Transition 'place' is from Status 'In Cart'.
+Transition 'place' is to Status 'Placed'.
+Transition 'ship' is defined in State Machine Definition 'Order'.
+Transition 'ship' is from Status 'Placed'.
+Transition 'ship' is to Status 'Shipped'.
+Transition 'deliver' is defined in State Machine Definition 'Order'.
+Transition 'deliver' is from Status 'Shipped'.
+Transition 'deliver' is to Status 'Delivered'.
 `
 
 export const SUPPORT_READINGS = `# Support
@@ -166,9 +205,14 @@ export function evaluate(handle: number, text: string, population: string): any 
   return parseResult(system(handle, 'evaluate', text))
 }
 
-/** Get available transitions for a noun in a given status. */
-export function transitions(handle: number, noun: string, status: string): any {
-  return parseResult(system(handle, `transitions:${noun}`, status))
+/** Get available transitions for a noun in a given status.
+ *  Returns array of { from, to, event } parsed from display notation.
+ *  Terminal status returns empty array (φ). */
+export function transitions(handle: number, noun: string, status: string): Array<{ from: string; to: string; event: string }> {
+  const raw = system(handle, `transitions:${noun}`, status)
+  if (raw === 'φ' || raw === '⊥') return []
+  const matches = [...raw.matchAll(/<([^<>,]+),\s*([^<>,]+),\s*([^<>,]+)>/g)]
+  return matches.map(m => ({ from: m[1].trim(), to: m[2].trim(), event: m[3].trim() }))
 }
 
 /** Run forward chaining over a population. */
