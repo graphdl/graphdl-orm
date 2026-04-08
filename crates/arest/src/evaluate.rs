@@ -53,12 +53,12 @@ pub(crate) fn run_machine_ast(
 /// though additional derivations may be possible. This is safe because
 /// each derived fact is individually correct; only completeness is
 /// affected.
-/// Forward-chain derivation rules over Object state. Returns (new_state, derived_facts).
+/// Forward-chain derivation rules over D to fixed point. Returns (D', derived_facts).
+/// D contains both population cells and def cells (Backus Sec. 14.3).
 pub fn forward_chain_defs_state(
     derivation_defs: &[(&str, &ast::Func)],
-    state: &ast::Object,
+    d: &ast::Object,
 ) -> (ast::Object, Vec<DerivedFact>) {
-    let empty_d = ast::Object::phi();
 
     /// Apply all derivation rules once, returning novel facts.
     fn derive_one_round(
@@ -89,10 +89,10 @@ pub fn forward_chain_defs_state(
 
     // Fixed-point iteration: apply rules until no new facts (or 100 rounds)
     let (final_state, all_derived, _) = (0..100).fold(
-        (state.clone(), Vec::<DerivedFact>::new(), false),
+        (d.clone(), Vec::<DerivedFact>::new(), false),
         |(current_state, all_derived, done), _| {
             if done { return (current_state, all_derived, true); }
-            let new_facts = derive_one_round(derivation_defs, &current_state, &all_derived, &empty_d);
+            let new_facts = derive_one_round(derivation_defs, &current_state, &all_derived, d);
             if new_facts.is_empty() {
                 (current_state, all_derived, true)
             } else {
