@@ -399,6 +399,7 @@ fn derive_state_machines_from_facts(facts: &[GeneralInstanceFact]) -> HashMap<St
 pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> {
     let domain = state_to_domain(state);
     let model = compile(&domain);
+
     // Constraints -> named definitions — α(constraint → def)
     let mut defs: Vec<(String, Func)> = model.constraints.iter()
         .map(|c| (format!("constraint:{}", c.id), c.func.clone()))
@@ -505,8 +506,6 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
     ));
 
     // ── Generator 1: Agent Prompts ──────────────────────────────────
-    // For each noun that participates in fact types, produce a def
-    // agent:{noun} containing a synthesized agent prompt as a constant Object.
     // Build lookup maps via fold — noun → readings, noun → constraints, noun → events
     let noun_fact_types: HashMap<String, Vec<String>> = domain.fact_types.values()
         .flat_map(|ft| ft.roles.iter().map(move |r| (r.noun_name.clone(), ft.reading.clone())))

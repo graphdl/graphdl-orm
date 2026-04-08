@@ -7,6 +7,7 @@ App(.Slug) is an entity type.
 Domain(.Slug) is an entity type.
 User(.Email) is an entity type.
 External System(.Name) is an entity type.
+Generator(.Name) is an entity type.
 
 ## Value Types
 
@@ -48,6 +49,8 @@ App has navigable Domain.
 
 App belongs to Organization.
   Each App belongs to at most one Organization.
+
+App uses Generator.
 
 ### Domain
 
