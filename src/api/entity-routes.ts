@@ -18,7 +18,6 @@ export interface CellRecord {
   id: string
   type: string
   data: Record<string, unknown>
-  _links?: Record<string, { href: string; method?: string }>
 }
 
 export interface EntityReadStub {
@@ -52,7 +51,6 @@ export interface ListResult {
   hasNextPage: boolean
   hasPrevPage: boolean
   warnings?: string[]
-  _links?: Record<string, string>
 }
 
 export interface PaginationOpts {
@@ -61,74 +59,9 @@ export interface PaginationOpts {
   depth?: number
 }
 
-export interface TransitionInfo {
-  transitionId: string
-  event: string
-  targetStatus: string
-  targetStatusId: string
-}
-
 export interface DepthOpts {
   depth?: number
   getStub?: (id: string) => EntityReadStub
-  transitions?: TransitionInfo[]
-  domain?: string
-}
-
-// ---------------------------------------------------------------------------
-// HATEOAS link builders
-// ---------------------------------------------------------------------------
-
-// DEPRECATED: replaced by deriveLinks in hateoas.ts
-export function buildEntityLinks(
-  type: string,
-  id: string,
-  domain?: string,
-  transitions?: TransitionInfo[],
-): Record<string, { href: string; method?: string }> {
-  const encoded = encodeURIComponent(type)
-  const base = `/api/entities/${encoded}/${id}`
-  const qs = domain ? `?domain=${domain}` : ''
-  const links: Record<string, { href: string; method?: string }> = {
-    self: { href: base },
-    collection: { href: `/api/entities/${encoded}${qs}` },
-  }
-
-  if (transitions) {
-    for (const t of transitions) {
-      links[t.event] = { href: `${base}/transition`, method: 'POST' }
-    }
-  }
-
-  return links
-}
-
-// DEPRECATED: replaced by deriveLinks in hateoas.ts
-export function buildListLinks(
-  type: string,
-  domain: string,
-  page: number,
-  limit: number,
-  hasNextPage: boolean,
-  hasPrevPage: boolean,
-): Record<string, string> {
-  const encoded = encodeURIComponent(type)
-  const base = `/api/entities/${encoded}`
-  const qs = (p: number) => {
-    const parts: string[] = []
-    if (domain) parts.push(`domain=${domain}`)
-    parts.push(`page=${p}`)
-    parts.push(`limit=${limit}`)
-    return parts.length > 0 ? `?${parts.join('&')}` : ''
-  }
-  const links: Record<string, string> = {
-    self: `${base}${qs(page)}`,
-    create: base,
-  }
-  if (hasNextPage) links.next = `${base}${qs(page + 1)}`
-  if (hasPrevPage) links.prev = `${base}${qs(page - 1)}`
-  if (domain) links.domain = `/api/entities/Domain?domain=${domain}`
-  return links
 }
 
 // ---------------------------------------------------------------------------
@@ -229,7 +162,6 @@ export async function handleListEntities(
     hasNextPage,
     hasPrevPage,
     ...(warnings.length > 0 && { warnings }),
-    _links: buildListLinks(type, domain, page, limit, hasNextPage, hasPrevPage),
   }
 }
 
@@ -249,8 +181,6 @@ export async function handleGetEntity(
     cell.data = await populateDepthForEntity(cell, depth, opts.getStub)
   }
 
-  cell._links = buildEntityLinks(cell.type, cell.id, opts?.domain, opts?.transitions)
-
   return cell
 }
 
@@ -261,7 +191,6 @@ export async function handleGetEntity(
 export interface CreateEntityResult {
   id: string
   type: string
-  _links?: Record<string, { href: string; method?: string }>
 }
 
 export async function handleCreateEntity(
@@ -276,7 +205,7 @@ export async function handleCreateEntity(
   const stub = getStub(id)
   await stub.put({ id, type, data })
   await registry.indexEntity(type, id, domain)
-  return { id, type, _links: buildEntityLinks(type, id, domain) }
+  return { id, type }
 }
 
 // ---------------------------------------------------------------------------

@@ -1,12 +1,10 @@
 import { AutoRouter, json, error } from 'itty-router'
 import type { Env } from '../types'
-import { parseQueryOptions } from './collections'
 import { nounToSlug, nounToTable, resolveSlugToNoun } from '../collections'
 import { handleParse } from './parse'
 import { handleEvaluate, handleSynthesize } from './evaluate'
-import { handleListEntities, handleGetEntity, handleCreateEntity, handleDeleteEntity, buildEntityLinks } from './entity-routes'
+import { handleCreateEntity, handleDeleteEntity } from './entity-routes'
 import { loadDomainSchema, loadDomainAndPopulation, buildPopulation, getTransitions, applyCommand, querySchema, forwardChain, getNounSchemas, computeRMAP, system as wasmSystem } from './engine'
-import { system } from './system'
 import { handleArestRequest } from './arest-router'
 
 // ── Collection slug → noun type resolution ───────────────────────────
@@ -493,91 +491,10 @@ router.post('/api/entities/:noun', async (request, env: Env) => {
     id: cell.id,
     type: cell.type,
     ...cell.data,
-    _links: buildEntityLinks(noun, entityId, domain),
   }, { status: 201 })
 })
 
-router.get('/api/entities/:noun', async (request, env: Env) => {
-  const noun = decodeURIComponent(request.params.noun)
-  const url = new URL(request.url)
-  const domainId = url.searchParams.get('domain')
-  if (!domainId) return error(400, { errors: [{ message: 'domain query param required' }] })
 
-  const userEmail = request.headers.get('x-user-email') || ''
-
-  const params: Record<string, string> = {}
-  url.searchParams.forEach((v, k) => { params[k] = v })
-
-  const registry = getRegistryDO(env, 'global') as any
-  const getStub = (id: string) => getEntityDO(env, id) as any
-
-  // SYSTEM:x = (ρ (↑entity(x) : D)) : ↑op(x)
-  const result = await system(noun, domainId || '', 'read', params, { registry, getStub })
-
-  // Enrich with view metadata (derived from ρ, not procedural)
-  const viewMeta = null
-  const navCtx = null
-  const body = result.body as any
-  const docs = (body.docs || []).map((e: any) => ({
-    ...e,
-    _links: buildEntityLinks(e.type || noun, e.id, domainId || undefined),
-  }))
-
-  // Where-param filtering
-  const where: Record<string, any> = {}
-  url.searchParams.forEach((val, key) => {
-    const m = key.match(/^where\[(\w+)\](?:\[(\w+)\])?$/)
-    if (m) {
-      where[m[1]] = { [m[2] || 'equals']: val }
-    }
-  })
-  const filtered = Object.entries(where).reduce(
-    (acc, [field, condition]) =>
-      (typeof condition === 'object' && condition !== null && 'equals' in condition)
-        ? acc.filter((doc: any) => doc[field] === condition.equals)
-        : acc,
-    docs,
-  )
-
-  return json({
-    docs: filtered,
-    totalDocs: body.totalDocs,
-    limit: body.limit,
-    page: body.page,
-    totalPages: body.totalPages,
-    hasNextPage: body.hasNextPage,
-    hasPrevPage: body.hasPrevPage,
-    _view: viewMeta,
-    ...(navCtx ? { _nav: navCtx } : {}),
-  })
-})
-
-router.get('/api/entities/:noun/:id', async (request, env: Env) => {
-  const noun = decodeURIComponent(request.params.noun)
-  const id = decodeURIComponent(request.params.id)
-  const url = new URL(request.url)
-  const domainSlug = url.searchParams.get('domain') || ''
-
-  const registry = getRegistryDO(env, 'global') as any
-  const getStub = (eid: string) => getEntityDO(env, eid) as any
-
-  // SYSTEM:x = (ρ (↑entity(x) : D)) : ↑op(x)
-  const result = await system(noun, domainSlug, 'readDetail', { _id: id, domain: domainSlug }, { registry, getStub })
-
-  const entity = result.body as any
-  const viewMeta = domainSlug
-    ? null
-    : null
-
-  return json({
-    ...entity,
-    ...(viewMeta ? { _view: { ...(viewMeta as any), type: 'DetailView' } } : {}),
-    _links: {
-      self: { href: `/api/entities/${encodeURIComponent(noun)}/${id}` },
-      collection: { href: `/api/entities/${encodeURIComponent(noun)}?domain=${domainSlug}` },
-    },
-  }, { status: result.status })
-})
 
 // PATCH on entities: ↓n with merged data (cell store replaces contents)
 router.patch('/api/entities/:noun/:id', async (request, env: Env) => {
@@ -752,98 +669,7 @@ router.all('/api/query', async (request, env: Env) => {
 // Seed is the ONLY ingestion path — readings → WASM parse → cells in D
 router.all('/api/parse', handleParse)
 
-router.get('/api/:collection', async (request, env: Env) => {
-  const collection = decodeURIComponent(request.params.collection)
 
-  // Resolve collection slug to noun type dynamically from Registry
-  const registry = getRegistryDO(env, 'global') as any
-  const entityType = await resolveSlugToNoun(registry, collection)
-  if (!entityType) {
-    return error(404, { errors: [{ message: `Collection "${collection}" not found` }] })
-  }
-
-  const url = new URL(request.url)
-  const { where, limit: qLimit, page: qPage } = parseQueryOptions(url.searchParams)
-  const domainId = where?.domain?.equals || where?.['domain.domainSlug']?.equals || url.searchParams.get('domain') || ''
-  const result = await handleListEntities(
-    entityType,
-    domainId,
-    registry,
-    (id) => getEntityDO(env, id) as any,
-    { limit: qLimit, page: qPage },
-  )
-
-  // Access control: engine evaluates "User can access Domain iff..." derivation rules
-
-  // Flatten cell data into top level
-  const docs = result.docs.map((e) => ({
-    id: e.id,
-    type: e.type,
-    ...e.data,
-    _links: buildEntityLinks(e.type, e.id, domainId || undefined),
-  }))
-
-  // Client-side filtering by where params
-  let filtered = docs
-  if (where) {
-    for (const [field, condition] of Object.entries(where)) {
-      if (field === 'domain' || field === 'domain.domainSlug') continue // already used for routing
-      if (typeof condition === 'object' && condition !== null && 'equals' in condition) {
-        filtered = filtered.filter(doc => (doc as any)[field] === (condition as any).equals)
-      }
-    }
-  }
-
-  return json({
-    docs: filtered,
-    totalDocs: result.totalDocs,
-    limit: result.limit,
-    page: result.page,
-    totalPages: result.totalPages,
-    hasNextPage: result.hasNextPage,
-    hasPrevPage: result.hasPrevPage,
-    pagingCounter: (result.page - 1) * result.limit + 1,
-    ...(result.warnings && { warnings: result.warnings }),
-    ...(result._links && { _links: result._links }),
-  })
-})
-
-/** GET /api/:collection/:id — get by ID */
-router.get('/api/:collection/:id', async (request, env: Env) => {
-  const collection = decodeURIComponent(request.params.collection); const id = decodeURIComponent(request.params.id)
-
-  const registry = getRegistryDO(env, 'global') as any
-  const entityType = await resolveSlugToNoun(registry, collection)
-  if (!entityType) {
-    return error(404, { errors: [{ message: `Collection "${collection}" not found` }] })
-  }
-
-  const url = new URL(request.url)
-  const domainSlug = url.searchParams.get('domain') || undefined
-
-  // Resolve transitions from engine
-  let collTransitions: Array<{ transitionId: string; event: string; targetStatus: string; targetStatusId: string }> = []
-  try {
-    await loadDomainSchema(registry, (eid: string) => getEntityDO(env, eid) as any, domainSlug || '')
-    const raw = await (getEntityDO(env, id) as any).get()
-    if (raw?.data?._status) {
-      collTransitions = getTransitions(raw.type, raw.data._status as string)
-        .map((t: any) => ({ transitionId: '', event: t.event, targetStatus: t.to, targetStatusId: '' }))
-    }
-  } catch { /* best-effort */ }
-
-  const entity = await handleGetEntity(getEntityDO(env, id) as any, {
-    domain: domainSlug,
-    transitions: collTransitions,
-  })
-  if (!entity) return error(404, { errors: [{ message: 'Not Found' }] })
-  return json({
-    id: entity.id,
-    type: entity.type,
-    ...entity.data,
-    ...(entity._links && { _links: entity._links }),
-  })
-})
 
 /** POST /api/:collection — create */
 router.post('/api/:collection', async (request, env: Env) => {
@@ -864,7 +690,7 @@ router.post('/api/:collection', async (request, env: Env) => {
     (id) => getEntityDO(env, id) as any,
     registry,
   )
-  return json({ doc: { id: result.id, ...body }, message: 'Created successfully', ...(result._links && { _links: result._links }) }, { status: 201 })
+  return json({ doc: { id: result.id, ...body }, message: 'Created successfully' }, { status: 201 })
 })
 
 /** PATCH /api/:collection/:id — update */

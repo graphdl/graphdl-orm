@@ -5,9 +5,7 @@ import {
   handleCreateEntity,
   handleDeleteEntity,
   populateDepthForEntity,
-  buildEntityLinks,
 } from './entity-routes'
-type TransitionOption = { transitionId: string; event: string; eventTypeId: string; targetStatus: string; targetStatusId: string }
 
 describe('entity-routes', () => {
   // ── handleListEntities ──────────────────────────────────────────────
@@ -23,14 +21,11 @@ describe('entity-routes', () => {
     expect(result.totalDocs).toBe(2)
   })
 
-  it('handleGetEntity returns single entity by ID with _links', async () => {
+  it('handleGetEntity returns single entity by ID', async () => {
     const stub = { get: vi.fn().mockResolvedValue({ id: 'e1', type: 'Noun', data: { name: 'Customer' } }) }
     const result = await handleGetEntity(stub)
     expect(result).toBeDefined()
     expect(result!.data.name).toBe('Customer')
-    expect(result!._links).toBeDefined()
-    expect(result!._links!.self).toEqual({ href: '/api/entities/Noun/e1' })
-    expect(result!._links!.collection).toEqual({ href: '/api/entities/Noun' })
   })
 
   it('handleListEntities filters by domain', async () => {
@@ -238,89 +233,4 @@ describe('entity-routes', () => {
     expect(result!.data.graphSchema).toEqual({ id: 'gs1', name: 'Tickets' })
   })
 
-  // ── transitions folded into _links (AREST whitepaper) ─────────────
-
-  describe('transitions folded into _links', () => {
-    const mockTransitions = [
-      { transitionId: 't1', event: 'approve', targetStatus: 'Approved', targetStatusId: 'status-approved' },
-      { transitionId: 't2', event: 'reject', targetStatus: 'Rejected', targetStatusId: 'status-rejected' },
-    ]
-
-    it('includes transition events as links when transitions provided', async () => {
-      const stub = {
-        get: vi.fn().mockResolvedValue({
-          id: 'e1', type: 'SupportRequest',
-          data: { title: 'Help', _status: 'Open' },
-        }),
-      }
-
-      const result = await handleGetEntity(stub, { transitions: mockTransitions })
-
-      expect(result!._links!.approve).toEqual({
-        href: '/api/entities/SupportRequest/e1/transition',
-        method: 'POST',
-      })
-      expect(result!._links!.reject).toEqual({
-        href: '/api/entities/SupportRequest/e1/transition',
-        method: 'POST',
-      })
-    })
-
-    it('_links has only navigation links when no transitions', async () => {
-      const stub = {
-        get: vi.fn().mockResolvedValue({ id: 'e1', type: 'Noun', data: { name: 'Customer' } }),
-      }
-
-      const result = await handleGetEntity(stub, {})
-
-      expect(result!._links!.self).toEqual({ href: '/api/entities/Noun/e1' })
-      expect(result!._links!.approve).toBeUndefined()
-    })
-
-    it('transition links include self and collection alongside events', async () => {
-      const stub = {
-        get: vi.fn().mockResolvedValue({
-          id: 'e1', type: 'SupportRequest',
-          data: { title: 'Help', _status: 'Open' },
-        }),
-      }
-      const result = await handleGetEntity(stub, { transitions: mockTransitions })
-
-      expect(result!._links!.self).toEqual({ href: '/api/entities/SupportRequest/e1' })
-      expect(result!._links!.collection).toEqual({ href: '/api/entities/SupportRequest' })
-      expect(result!._links!.approve).toBeDefined()
-      expect(result!._links!.approve.method).toBe('POST')
-    })
-  })
-
-  // ── buildEntityLinks ──────────────────────────────────────────────
-
-  describe('buildEntityLinks', () => {
-    it('returns self and collection links as objects', () => {
-      const links = buildEntityLinks('Order', 'ord-1')
-      expect(links.self).toEqual({ href: '/api/entities/Order/ord-1' })
-      expect(links.collection).toEqual({ href: '/api/entities/Order' })
-    })
-
-    it('includes domain in collection link', () => {
-      const links = buildEntityLinks('Order', 'ord-1', 'orders')
-      expect(links.collection).toEqual({ href: '/api/entities/Order?domain=orders' })
-    })
-
-    it('includes transition events as POST links', () => {
-      const transitions = [
-        { transitionId: 't1', event: 'place', targetStatus: 'Placed', targetStatusId: 's1' },
-        { transitionId: 't2', event: 'cancel', targetStatus: 'Cancelled', targetStatusId: 's2' },
-      ]
-      const links = buildEntityLinks('Order', 'ord-1', 'orders', transitions)
-      expect(links.place).toEqual({
-        href: '/api/entities/Order/ord-1/transition',
-        method: 'POST',
-      })
-      expect(links.cancel).toEqual({
-        href: '/api/entities/Order/ord-1/transition',
-        method: 'POST',
-      })
-    })
-  })
 })
