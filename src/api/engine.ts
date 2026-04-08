@@ -23,6 +23,11 @@ export function currentDomainHandle(): number { return _h }
 
 export function release_domain(handle: number): void { ensureWasm(); release(handle) }
 
+export function compileDomainReadings(domain: string, readings: string): number {
+  ensureWasm()
+  return parse_and_compile(JSON.stringify([[domain, readings]]))
+}
+
 export async function loadDomainSchema(
   registry: any,
   getStub: (id: string) => any,

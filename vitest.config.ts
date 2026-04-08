@@ -1,13 +1,21 @@
 import { defineConfig } from 'vitest/config'
+import { readFileSync } from 'fs'
+import { resolve } from 'path'
 import type { Plugin } from 'vite'
 
-// Stub .wasm imports so Vitest can process modules that use Cloudflare's
-// CompiledWasm import convention (e.g. `import mod from '...bg.wasm'`).
+// Handle .wasm imports for Vitest:
+// - For arest_bg.wasm: export the actual file bytes as a Uint8Array so initSync works.
+// - For all other .wasm files: stub with {} (Cloudflare CompiledWasm convention).
 function wasmStubPlugin(): Plugin {
   return {
     name: 'wasm-stub',
     enforce: 'pre',
     load(id) {
+      if (id.endsWith('arest_bg.wasm')) {
+        const bytes = readFileSync(resolve(id.replace(/\?.*$/, '')))
+        const b64 = bytes.toString('base64')
+        return `const bytes = Uint8Array.from(atob(${JSON.stringify(b64)}), c => c.charCodeAt(0)); export default bytes;`
+      }
       if (id.endsWith('.wasm')) {
         return 'export default {}'
       }
