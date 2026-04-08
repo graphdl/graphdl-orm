@@ -167,8 +167,7 @@ fn same_fact(a: &DerivedFact, b: &DerivedFact) -> bool {
 /// rules whose consequent matches, recursively proving antecedents.
 #[allow(dead_code)]
 pub fn prove_state(ir: &Domain, state: &ast::Object, goal: &str, world_assumption: &WorldAssumption) -> ProofResult {
-    let mut visited = HashSet::new();
-    let proof = prove_goal_state(ir, state, goal, &mut visited);
+    let proof = prove_goal_state(ir, state, goal, &HashSet::new());
 
     let status = match &proof {
         Some(_) => ProofStatus::Proven,
@@ -190,8 +189,7 @@ pub fn prove_state(ir: &Domain, state: &ast::Object, goal: &str, world_assumptio
 pub fn prove_from_state(state: &ast::Object, goal: &str, world_assumption: &WorldAssumption) -> ProofResult {
     let schemas = ast::fetch_or_phi("GraphSchema", state);
     let rules = ast::fetch_or_phi("DerivationRule", state);
-    let mut visited = HashSet::new();
-    let proof = prove_goal_state_pop(state, goal, &mut visited, &schemas, &rules);
+    let proof = prove_goal_state_pop(state, goal, &HashSet::new(), &schemas, &rules);
     let status = match &proof {
         Some(_) => ProofStatus::Proven,
         None => match world_assumption {
@@ -203,71 +201,72 @@ pub fn prove_from_state(state: &ast::Object, goal: &str, world_assumption: &Worl
 }
 
 fn prove_goal_state_pop(
-    state: &ast::Object, goal: &str, visited: &mut HashSet<String>,
+    state: &ast::Object, goal: &str, visited: &HashSet<String>,
     schemas: &ast::Object, rules: &ast::Object,
 ) -> Option<ProofStep> {
     if visited.contains(goal) { return None; }
-    visited.insert(goal.to_string());
-    for (ft_id, contents) in ast::cells_iter(state) {
-        let reading = schemas.as_seq().and_then(|ss| {
-            ss.iter().find(|s| ast::binding(s, "id") == Some(ft_id))
-                .and_then(|s| ast::binding(s, "reading").map(|r| r.to_string()))
-        }).unwrap_or_default();
-        if reading.is_empty() { continue; }
-        if let Some(facts) = contents.as_seq() {
-            for fact in facts {
-                let bindings: Vec<(String, String)> = fact.as_seq().map(|pairs| {
-                    pairs.iter().filter_map(|pair| {
-                        let items = pair.as_seq()?;
-                        Some((items.get(0)?.as_atom()?.to_string(), items.get(1)?.as_atom()?.to_string()))
-                    }).collect()
-                }).unwrap_or_default();
-                let fact_text = format_fact(&reading, &bindings);
-                if fact_text_matches(goal, &fact_text, &reading) {
-                    return Some(ProofStep { fact: fact_text, justification: Justification::Axiom, children: vec![] });
-                }
-            }
-        }
-    }
-    if let Some(rule_list) = rules.as_seq() {
-        for rule in rule_list {
-            let cons_ft_id = ast::binding(rule, "consequentFactTypeId").unwrap_or("").to_string();
-            let cons_reading = schemas.as_seq().and_then(|ss| {
-                ss.iter().find(|s| ast::binding(s, "id") == Some(&cons_ft_id))
-                    .and_then(|s| ast::binding(s, "reading").map(|r| r.to_string()))
-            }).unwrap_or_default();
-            if cons_reading.is_empty() { continue; }
-            if goal.contains(&cons_reading) || cons_reading.contains(goal.split(' ').next().unwrap_or("")) {
-                let ant_ids_str = ast::binding(rule, "antecedentFactTypeIds").unwrap_or("").to_string();
-                let ant_ids: Vec<String> = ant_ids_str.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
-                let mut child_proofs = Vec::new();
-                let mut all_proven = true;
-                for ant_id in &ant_ids {
-                    let ant_reading = schemas.as_seq().and_then(|ss| {
-                        ss.iter().find(|s| ast::binding(s, "id") == Some(ant_id.as_str()))
-                            .and_then(|s| ast::binding(s, "reading").map(|r| r.to_string()))
-                    }).unwrap_or_default();
-                    if ant_reading.is_empty() { all_proven = false; break; }
-                    match prove_goal_state_pop(state, &ant_reading, visited, schemas, rules) {
-                        Some(proof) => child_proofs.push(proof),
-                        None => { all_proven = false; break; }
-                    }
-                }
-                if all_proven && !child_proofs.is_empty() {
-                    return Some(ProofStep {
-                        fact: goal.to_string(),
-                        justification: Justification::Derived {
-                            rule_id: ast::binding(rule, "id").unwrap_or("").to_string(),
-                            rule_text: ast::binding(rule, "text").unwrap_or("").to_string(),
-                        },
-                        children: child_proofs,
-                    });
-                }
-            }
-        }
-    }
-    visited.remove(goal);
-    None
+    let visited = &{ let mut v = visited.clone(); v.insert(goal.to_string()); v };
+
+    let schema_reading = |ft_id: &str| -> Option<String> {
+        schemas.as_seq()?.iter()
+            .find(|s| ast::binding(s, "id") == Some(ft_id))
+            .and_then(|s| ast::binding(s, "reading").map(|r| r.to_string()))
+    };
+
+    // Step 1: axiom search — find goal directly in state
+    let axiom = ast::cells_iter(state).into_iter()
+        .filter_map(|(ft_id, contents)| {
+            let reading = schema_reading(ft_id)?;
+            contents.as_seq()?.iter()
+                .map(|fact| {
+                    let bindings = extract_bindings(fact);
+                    format_fact(&reading, &bindings)
+                })
+                .find(|fact_text| fact_text_matches(goal, fact_text, &reading))
+                .map(|fact_text| ProofStep { fact: fact_text, justification: Justification::Axiom, children: vec![] })
+        })
+        .next();
+    if axiom.is_some() { return axiom; }
+
+    // Step 2: derivation — try rules whose consequent matches goal
+    rules.as_seq().and_then(|rule_list| {
+        rule_list.iter().find_map(|rule| {
+            let cons_ft_id = ast::binding(rule, "consequentFactTypeId")?.to_string();
+            let cons_reading = schema_reading(&cons_ft_id)?;
+            let goal_prefix = goal.split(' ').next().unwrap_or("");
+            if !goal.contains(&cons_reading) && !cons_reading.contains(goal_prefix) { return None; }
+
+            let ant_ids_str = ast::binding(rule, "antecedentFactTypeIds")?.to_string();
+            let child_proofs: Option<Vec<ProofStep>> = ant_ids_str.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .map(|ant_id| {
+                    let ant_reading = schema_reading(&ant_id)?;
+                    prove_goal_state_pop(state, &ant_reading, visited, schemas, rules)
+                })
+                .collect();
+
+            let children = child_proofs.filter(|c| !c.is_empty())?;
+            Some(ProofStep {
+                fact: goal.to_string(),
+                justification: Justification::Derived {
+                    rule_id: ast::binding(rule, "id").unwrap_or("").to_string(),
+                    rule_text: ast::binding(rule, "text").unwrap_or("").to_string(),
+                },
+                children,
+            })
+        })
+    })
+}
+
+/// Extract bindings from a fact Object as (key, value) pairs.
+fn extract_bindings(fact: &ast::Object) -> Vec<(String, String)> {
+    fact.as_seq().map(|pairs| {
+        pairs.iter().filter_map(|pair| {
+            let items = pair.as_seq()?;
+            Some((items.get(0)?.as_atom()?.to_string(), items.get(1)?.as_atom()?.to_string()))
+        }).collect()
+    }).unwrap_or_default()
 }
 
 /// Recursive backward chaining via Domain.
@@ -276,86 +275,53 @@ fn prove_goal_state(
     ir: &Domain,
     state: &ast::Object,
     goal: &str,
-    visited: &mut HashSet<String>,
+    visited: &HashSet<String>,
 ) -> Option<ProofStep> {
-    if visited.contains(goal) {
-        return None;
-    }
-    visited.insert(goal.to_string());
+    if visited.contains(goal) { return None; }
+    let visited = &{ let mut v = visited.clone(); v.insert(goal.to_string()); v };
 
-    // Step 1: Check if the goal is directly in the state (axiom)
-    for (ft_id, contents) in ast::cells_iter(state) {
-        if let Some(ft) = ir.fact_types.get(ft_id) {
-            if let Some(facts) = contents.as_seq() {
-                for fact in facts {
-                    let bindings: Vec<(String, String)> = fact.as_seq().map(|pairs| {
-                        pairs.iter().filter_map(|pair| {
-                            let items = pair.as_seq()?;
-                            Some((items.get(0)?.as_atom()?.to_string(), items.get(1)?.as_atom()?.to_string()))
-                        }).collect()
-                    }).unwrap_or_default();
-                    let fact_text = format_fact(&ft.reading, &bindings);
-                    if fact_text_matches(goal, &fact_text, &ft.reading) {
-                        return Some(ProofStep {
-                            fact: fact_text,
-                            justification: Justification::Axiom,
-                            children: vec![],
-                        });
-                    }
-                }
-            }
-        }
-    }
+    // Step 1: axiom search — find goal directly in state
+    let axiom = ast::cells_iter(state).into_iter()
+        .filter_map(|(ft_id, contents)| {
+            let ft = ir.fact_types.get(ft_id)?;
+            contents.as_seq()?.iter()
+                .map(|fact| format_fact(&ft.reading, &extract_bindings(fact)))
+                .find(|fact_text| fact_text_matches(goal, fact_text, &ft.reading))
+                .map(|fact_text| ProofStep { fact: fact_text, justification: Justification::Axiom, children: vec![] })
+        })
+        .next();
+    if axiom.is_some() { return axiom; }
 
-    // Step 2: Try derivation rules whose consequent could match the goal
-    for rule in &ir.derivation_rules {
-        if let Some(cons_ft) = ir.fact_types.get(&rule.consequent_fact_type_id) {
-            if goal.contains(&cons_ft.reading) || cons_ft.reading.contains(goal.split(' ').next().unwrap_or("")) {
-                let mut child_proofs = Vec::new();
-                let mut all_proven = true;
+    // Step 2: derivation — try rules whose consequent matches goal
+    ir.derivation_rules.iter().find_map(|rule| {
+        let cons_ft = ir.fact_types.get(&rule.consequent_fact_type_id)?;
+        let goal_prefix = goal.split(' ').next().unwrap_or("");
+        if !goal.contains(&cons_ft.reading) && !cons_ft.reading.contains(goal_prefix) { return None; }
 
-                for ant_ft_id in &rule.antecedent_fact_type_ids {
-                    if let Some(ant_ft) = ir.fact_types.get(ant_ft_id) {
-                        match prove_goal_state(ir, state, &ant_ft.reading, visited) {
-                            Some(proof) => child_proofs.push(proof),
-                            None => {
-                                all_proven = false;
-                                break;
-                            }
-                        }
-                    }
-                }
+        let children: Option<Vec<ProofStep>> = rule.antecedent_fact_type_ids.iter()
+            .map(|ant_ft_id| {
+                let ant_ft = ir.fact_types.get(ant_ft_id)?;
+                prove_goal_state(ir, state, &ant_ft.reading, visited)
+            })
+            .collect();
 
-                if all_proven && !child_proofs.is_empty() {
-                    return Some(ProofStep {
-                        fact: goal.to_string(),
-                        justification: Justification::Derived {
-                            rule_id: rule.id.clone(),
-                            rule_text: rule.text.clone(),
-                        },
-                        children: child_proofs,
-                    });
-                }
-            }
-        }
-    }
-
-    visited.remove(goal);
-    None
+        let children = children.filter(|c| !c.is_empty())?;
+        Some(ProofStep {
+            fact: goal.to_string(),
+            justification: Justification::Derived { rule_id: rule.id.clone(), rule_text: rule.text.clone() },
+            children,
+        })
+    })
 }
 
 /// Format a fact from its reading template and bindings
 #[allow(dead_code)] // called by prove_goal()
 fn format_fact(reading: &str, bindings: &[(String, String)]) -> String {
-    let mut result = reading.to_string();
-    for (noun, value) in bindings {
-        // Replace first occurrence of the noun name with the value
-        if let Some(pos) = result.find(noun.as_str()) {
-            result = format!("{}{} '{}'{}",
-                &result[..pos], noun, value, &result[pos + noun.len()..]);
-        }
-    }
-    result
+    bindings.iter().fold(reading.to_string(), |result, (noun, value)| {
+        result.find(noun.as_str())
+            .map(|pos| format!("{}{} '{}'{}",  &result[..pos], noun, value, &result[pos + noun.len()..]))
+            .unwrap_or(result)
+    })
 }
 
 /// Check if a goal string matches a formatted fact
