@@ -136,37 +136,8 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
     let obj = ast::Object::parse(input);
 
     // SYSTEM:x = (ρ(↑entity(x):D)):↑op(x)  (Eq. 9)
-    // Every key resolves via ρ. No short-circuit on Bottom.
-    let result = ast::apply(&ast::Func::Def(key.to_string()), &obj, &st.d);
-    match &result {
-        ast::Object::Bottom => {},
-        _ => return result.to_string(),
-    }
-
-    // Remaining platform operations not yet in D (task #108)
-    match key {
-        "rho" => {
-            let operation = obj.as_seq().and_then(|s| s.get(1)).and_then(|o| o.as_atom()).unwrap_or("");
-            ast::apply(&ast::metacompose(&obj, &st.d), &ast::Object::atom(operation), &st.d).to_string()
-        }
-        "forward_chain" => {
-            // Extract derivation defs from D cells
-            let derivation_defs: Vec<(String, ast::Func)> = ast::cells_iter(&st.d).into_iter()
-                .filter(|(name, _)| name.starts_with("derivation:"))
-                .map(|(name, contents)| (name.to_string(), ast::metacompose(contents, &st.d)))
-                .collect();
-            let refs: Vec<(&str, &ast::Func)> = derivation_defs.iter().map(|(n, f)| (n.as_str(), f)).collect();
-            let (_new_state, derived) = evaluate::forward_chain_defs_state(&refs, &st.d);
-            ast::Object::Seq(derived.iter().map(|d| {
-                ast::Object::seq(vec![
-                    ast::Object::atom(&d.fact_type_id),
-                    ast::Object::atom(&d.reading),
-                    ast::Object::Seq(d.bindings.iter().map(|(k, v)| ast::Object::seq(vec![ast::Object::atom(k), ast::Object::atom(v)])).collect()),
-                ])
-            }).collect()).to_string()
-        }
-        _ => format!("⊥ unknown: {}", key),
-    }
+    // Single ρ-dispatch. No Rust fallback. Every key resolves from D.
+    ast::apply(&ast::Func::Def(key.to_string()), &obj, &st.d).to_string()
 }
 
 // ── WIT Component exports ───────────────────────────────────────────
