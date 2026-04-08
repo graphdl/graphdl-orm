@@ -146,36 +146,39 @@ function parseDebugIR(raw: string): CompiledDomain['ir'] {
  * Note: parseReadings(system(0, 'parse', ...)) returns [] in the current WASM build.
  * The entity/noun list is extracted from the debug IR instead.
  */
-export function compileDomain(readings: string, domain: string): CompiledDomain {
-  const handle: number = compileDomainReadings(domain, readings)
+export function compileDomain(readings: string, ...prereqs: string[]): CompiledDomain {
+  const handle: number = compileDomainReadings(...prereqs, readings)
   const raw: string = system(handle, 'debug', '')
   const ir = parseDebugIR(raw)
-  // entities = noun names from the IR (same as ir.nouns)
   const entities: string[] = ir.nouns
   return { ir, entities, handle }
 }
 
 // ── Utility functions ───────────────────────────────────────────────────────
 
-/**
- * Evaluate constraints against a population.
- */
+/** Try JSON.parse; if not JSON, return the raw display string. */
+function parseResult(raw: string): any {
+  try { return JSON.parse(raw) } catch { return raw }
+}
+
+/** Evaluate constraints against a population. */
 export function evaluate(handle: number, text: string, population: string): any {
-  return JSON.parse(system(handle, 'evaluate', JSON.stringify({ text, population })))
+  return parseResult(system(handle, 'evaluate', text))
 }
 
-/**
- * Get available transitions for a noun in a given status.
- */
+/** Get available transitions for a noun in a given status. */
 export function transitions(handle: number, noun: string, status: string): any {
-  return JSON.parse(system(handle, `transitions:${noun}`, status))
+  return parseResult(system(handle, `transitions:${noun}`, status))
 }
 
-/**
- * Run forward chaining over a population.
- */
+/** Run forward chaining over a population. */
 export function forwardChain(handle: number, population: string): any {
-  return JSON.parse(system(handle, 'forward_chain', population))
+  return parseResult(system(handle, 'forward_chain', population))
+}
+
+/** Raw system call for testing arbitrary def keys. */
+export function systemRaw(handle: number, key: string, input: string): string {
+  return system(handle, key, input)
 }
 
 /**
