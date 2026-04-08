@@ -823,9 +823,13 @@ fn apply_platform(name: &str, x: &Object, d: &Object) -> Object {
 
 /// compile ∘ parse: readings text → new defs merged into D.
 /// Returns the new state D' (caller stores it).
+/// Max input buffer size — platform hardware limit.
+const PLATFORM_MAX_INPUT: usize = 1_024 * 1_024;
+
 fn platform_compile(x: &Object, d: &Object) -> Object {
     let input = match x.as_atom() {
-        Some(s) => s,
+        Some(s) if s.len() <= PLATFORM_MAX_INPUT => s,
+        Some(_) => return Object::atom("⊥ input exceeds platform buffer"),
         None => return Object::Bottom,
     };
 
@@ -860,7 +864,20 @@ fn platform_compile(x: &Object, d: &Object) -> Object {
     // Re-register platform primitives in D' (they must survive state transitions)
     defs.push(("compile".to_string(), Func::Platform("compile".to_string())));
     defs.push(("apply".to_string(), Func::Platform("apply_command".to_string())));
-    defs_to_state(&defs, &state)
+    let new_d = defs_to_state(&defs, &state);
+
+    // validate: apply the compiled constraint set to the merged state.
+    // If alethic violations exist, reject the compile (return violations, not D').
+    let ctx = crate::ast::encode_eval_context_state("", None, &state);
+    let violations = apply(&Func::Def("validate".to_string()), &ctx, &new_d);
+    let decoded = crate::ast::decode_violations(&violations);
+    let has_alethic = decoded.iter().any(|v| v.alethic);
+    // Alethic violation → reject. Return the violation text.
+    match has_alethic {
+        true => Object::atom(&format!("⊥ constraint violation: {}",
+            decoded.iter().filter(|v| v.alethic).map(|v| v.constraint_text.as_str()).collect::<Vec<_>>().join("; "))),
+        false => new_d,
+    }
 }
 
 /// apply command: create = emit ∘ validate ∘ derive ∘ resolve (Eq. 10).
