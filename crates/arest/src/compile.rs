@@ -857,101 +857,65 @@ pub fn state_to_domain(state: &crate::ast::Object) -> Domain {
         }
     }
 
-    // Query GraphSchema + Role facts
-    let schema_cell = fetch_or_phi("GraphSchema", state);
+    // α(schema_fact → fact_type) : GraphSchema cell
     let role_cell = fetch_or_phi("Role", state);
-    if let Some(schema_facts) = schema_cell.as_seq() {
-        for f in schema_facts {
-            let id = binding(f, "id").unwrap_or("").to_string();
+    domain.fact_types = fetch_or_phi("GraphSchema", state).as_seq()
+        .map(|facts| facts.iter().filter_map(|f| {
+            let id = binding(f, "id")?.to_string();
             let reading = binding(f, "reading").unwrap_or("").to_string();
-
-            // Find roles for this schema
             let roles: Vec<RoleDef> = role_cell.as_seq()
-                .map(|role_facts| role_facts.iter()
+                .map(|rs| rs.iter()
                     .filter(|r| binding(r, "graphSchema") == Some(&id))
-                    .map(|r| {
-                        let noun_name = binding(r, "nounName").unwrap_or("").to_string();
-                        let position = binding(r, "position").and_then(|v| v.parse().ok()).unwrap_or(0);
-                        RoleDef { noun_name, role_index: position }
-                    })
-                    .collect()
-                )
+                    .map(|r| RoleDef {
+                        noun_name: binding(r, "nounName").unwrap_or("").to_string(),
+                        role_index: binding(r, "position").and_then(|v| v.parse().ok()).unwrap_or(0),
+                    }).collect())
                 .unwrap_or_default();
+            Some((id, FactTypeDef { schema_id: String::new(), reading, readings: vec![], roles }))
+        }).collect())
+        .unwrap_or_default();
 
-            domain.fact_types.insert(id, FactTypeDef {
-                schema_id: String::new(),
-                reading,
-                readings: vec![],
-                roles,
-            });
-        }
-    }
-
-    // Query Constraint facts
-    let constraint_cell = fetch_or_phi("Constraint", state);
-    if let Some(constraint_facts) = constraint_cell.as_seq() {
-        for f in constraint_facts {
+    // α(constraint_fact → constraint_def) : Constraint cell
+    domain.constraints = fetch_or_phi("Constraint", state).as_seq()
+        .map(|facts| facts.iter().map(|f| {
             let get = |key: &str| binding(f, key).map(|s| s.to_string());
-            let mut spans = vec![];
-            for i in 0..4 {
-                let ft_key = format!("span{}_factTypeId", i);
-                let ri_key = format!("span{}_roleIndex", i);
-                if let (Some(ft_id), Some(ri)) = (get(&ft_key), get(&ri_key)) {
-                    spans.push(SpanDef {
-                        fact_type_id: ft_id,
-                        role_index: ri.parse().unwrap_or(0),
-                        subset_autofill: None,
-                    });
-                }
+            let spans = (0..4).filter_map(|i| {
+                let ft_id = get(&format!("span{}_factTypeId", i))?;
+                let ri = get(&format!("span{}_roleIndex", i))?;
+                Some(SpanDef { fact_type_id: ft_id, role_index: ri.parse().unwrap_or(0), subset_autofill: None })
+            }).collect();
+            ConstraintDef {
+                id: get("id").unwrap_or_default(), kind: get("kind").unwrap_or_default(),
+                modality: get("modality").unwrap_or_default(), deontic_operator: get("deonticOperator"),
+                text: get("text").unwrap_or_default(), spans,
+                set_comparison_argument_length: None, clauses: None, entity: get("entity"),
+                min_occurrence: None, max_occurrence: None,
             }
-            domain.constraints.push(ConstraintDef {
-                id: get("id").unwrap_or_default(),
-                kind: get("kind").unwrap_or_default(),
-                modality: get("modality").unwrap_or_default(),
-                deontic_operator: get("deonticOperator"),
-                text: get("text").unwrap_or_default(),
-                spans,
-                set_comparison_argument_length: None,
-                clauses: None,
-                entity: get("entity"),
-                min_occurrence: None,
-                max_occurrence: None,
-            });
-        }
-    }
+        }).collect())
+        .unwrap_or_default();
 
-    // Query DerivationRule facts
-    let rule_cell = fetch_or_phi("DerivationRule", state);
-    if let Some(rule_facts) = rule_cell.as_seq() {
-        for f in rule_facts {
+    // α(rule_fact → derivation_rule) : DerivationRule cell
+    domain.derivation_rules = fetch_or_phi("DerivationRule", state).as_seq()
+        .map(|facts| facts.iter().map(|f| {
             let get = |key: &str| binding(f, key).unwrap_or("").to_string();
-            domain.derivation_rules.push(DerivationRuleDef {
-                id: get("id"),
-                text: get("text"),
-                antecedent_fact_type_ids: vec![],
+            DerivationRuleDef {
+                id: get("id"), text: get("text"), antecedent_fact_type_ids: vec![],
                 consequent_fact_type_id: get("consequentFactTypeId"),
-                kind: DerivationKind::ModusPonens,
-                join_on: vec![],
-                match_on: vec![],
-                consequent_bindings: vec![],
-            });
-        }
-    }
+                kind: DerivationKind::ModusPonens, join_on: vec![], match_on: vec![], consequent_bindings: vec![],
+            }
+        }).collect())
+        .unwrap_or_default();
 
-    // Query InstanceFact facts
-    let inst_cell = fetch_or_phi("InstanceFact", state);
-    if let Some(inst_facts) = inst_cell.as_seq() {
-        for f in inst_facts {
+    // α(inst_fact → general_instance_fact) : InstanceFact cell
+    domain.general_instance_facts = fetch_or_phi("InstanceFact", state).as_seq()
+        .map(|facts| facts.iter().map(|f| {
             let get = |key: &str| binding(f, key).unwrap_or("").to_string();
-            domain.general_instance_facts.push(GeneralInstanceFact {
-                subject_noun: get("subjectNoun"),
-                subject_value: get("subjectValue"),
-                field_name: get("fieldName"),
-                object_noun: get("objectNoun"),
-                object_value: get("objectValue"),
-            });
-        }
-    }
+            GeneralInstanceFact {
+                subject_noun: get("subjectNoun"), subject_value: get("subjectValue"),
+                field_name: get("fieldName"), object_noun: get("objectNoun"), object_value: get("objectValue"),
+            }
+        }).collect())
+        .unwrap_or_default();
 
     domain.state_machines = derive_state_machines_from_facts(&domain.general_instance_facts);
 
