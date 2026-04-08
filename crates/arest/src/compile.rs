@@ -818,6 +818,33 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
         ])))
     }));
 
+    // debug: constant projection of the compiled state — nouns, fact types, constraints, state machines.
+    // A platform function registered in DEFS. Returns the state as a display string.
+    let noun_atoms: Vec<Object> = domain.nouns.keys().map(|n| Object::atom(n)).collect();
+    let ft_atoms: Vec<Object> = domain.fact_types.iter()
+        .map(|(id, ft)| Object::seq(vec![Object::atom(id), Object::atom(&ft.reading)]))
+        .collect();
+    let constraint_atoms: Vec<Object> = domain.constraints.iter()
+        .map(|c| Object::seq(vec![Object::atom(&c.kind), Object::atom(&c.text)]))
+        .collect();
+    let sm_atoms: Vec<Object> = model.state_machines.iter()
+        .map(|sm| Object::seq(vec![
+            Object::atom(&sm.noun_name),
+            Object::atom(&sm.initial),
+            Object::Seq(sm.transition_table.iter()
+                .map(|(from, to, event)| Object::seq(vec![Object::atom(from), Object::atom(to), Object::atom(event)]))
+                .collect()),
+        ]))
+        .collect();
+    let total_facts = domain.fact_types.len() + domain.constraints.len() + domain.general_instance_facts.len();
+    defs.push(("debug".to_string(), Func::constant(Object::seq(vec![
+        Object::seq(vec![Object::atom("nouns"), Object::Seq(noun_atoms)]),
+        Object::seq(vec![Object::atom("factTypes"), Object::Seq(ft_atoms)]),
+        Object::seq(vec![Object::atom("constraints"), Object::Seq(constraint_atoms)]),
+        Object::seq(vec![Object::atom("stateMachines"), Object::Seq(sm_atoms)]),
+        Object::seq(vec![Object::atom("totalFacts"), Object::atom(&total_facts.to_string())]),
+    ]))));
+
     defs
 }
 
