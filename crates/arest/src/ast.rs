@@ -84,23 +84,16 @@ impl Object {
 }
 
 /// Split a string on commas, respecting nested <> brackets.
+/// foldl over chars, accumulating (depth, start, splits).
 fn split_top_level(s: &str) -> Vec<&str> {
-    let mut result = vec![];
-    let mut depth = 0;
-    let mut start = 0;
-    for (i, c) in s.char_indices() {
-        match c {
-            '<' => depth += 1,
-            '>' => depth -= 1,
-            ',' if depth == 0 => {
-                result.push(&s[start..i]);
-                start = i + 1;
-            }
-            _ => {}
-        }
-    }
-    result.push(&s[start..]);
-    result
+    let (_, start, mut splits) = s.char_indices().fold((0i32, 0usize, vec![]), |(depth, start, mut acc), (i, c)| match c {
+        '<' => (depth + 1, start, acc),
+        '>' => (depth - 1, start, acc),
+        ',' if depth == 0 => { acc.push(&s[start..i]); (depth, i + 1, acc) }
+        _ => (depth, start, acc),
+    });
+    splits.push(&s[start..]);
+    splits
 }
 
 /// Maximum nesting depth for `Object::parse` to prevent stack overflow on
@@ -129,12 +122,8 @@ impl fmt::Display for Object {
             Object::Atom(s) => write!(f, "{}", s),
             Object::Seq(items) if items.is_empty() => write!(f, "φ"),
             Object::Seq(items) => {
-                write!(f, "<")?;
-                for (i, item) in items.iter().enumerate() {
-                    if i > 0 { write!(f, ", ")?; }
-                    write!(f, "{}", item)?;
-                }
-                write!(f, ">")
+                write!(f, "<{}>", items.iter().map(|item| item.to_string())
+                    .collect::<Vec<_>>().join(", "))
             }
             Object::Bottom => write!(f, "⊥"),
         }
@@ -501,16 +490,10 @@ pub fn apply(func: &Func, x: &Object, d: &Object) -> Object {
 
         Func::Concat => {
             match x.as_seq() {
-                Some(items) => {
-                    let mut result = Vec::new();
-                    for item in items {
-                        match item.as_seq() {
-                            Some(sub) => result.extend_from_slice(sub),
-                            None => result.push(item.clone()),
-                        }
-                    }
-                    Object::Seq(result)
-                }
+                Some(items) => Object::Seq(items.iter().flat_map(|item|
+                    item.as_seq().map(|sub| sub.to_vec())
+                        .unwrap_or_else(|| vec![item.clone()])
+                ).collect()),
                 _ => Object::Bottom,
             }
         }
@@ -765,33 +748,35 @@ pub fn apply(func: &Func, x: &Object, d: &Object) -> Object {
         Func::While(p, f) => {
             let mut current = x.clone();
             let max_iterations = 1000; // safety limit
-            for _ in 0..max_iterations {
-                match apply(p, &current, d) {
+            // While = bounded tail recursion (Backus 11.2.4)
+            // Ok = continue iterating, Err = early exit (predicate false or ⊥)
+            match (0..max_iterations).try_fold(current, |acc, _| {
+                match apply(p, &acc, d) {
                     Object::Atom(ref s) if s == "T" => {
-                        current = apply(f, &current, d);
-                        if current.is_bottom() { return Object::Bottom; }
+                        let next = apply(f, &acc, d);
+                        if next.is_bottom() { Err(Object::Bottom) } else { Ok(next) }
                     }
-                    Object::Atom(ref s) if s == "F" => return current,
-                    _ => return Object::Bottom,
+                    Object::Atom(ref s) if s == "F" => Err(acc),
+                    _ => Err(Object::Bottom),
                 }
+            }) {
+                Ok(_) => Object::Bottom,    // limit exceeded
+                Err(result) => result,      // early exit
             }
-            Object::Bottom // exceeded iteration limit
         }
 
         Func::FoldL(f) => {
             match x.as_seq() {
                 Some(items) if items.len() == 2 => {
-                    let mut acc = items[0].clone();
                     let seq = match items[1].as_seq() {
                         Some(s) => s,
                         None => return Object::Bottom,
                     };
-                    for element in seq {
-                        let pair = Object::seq(vec![acc, element.clone()]);
-                        acc = apply(f, &pair, d);
-                        if acc.is_bottom() { return Object::Bottom; }
-                    }
-                    acc
+                    // foldl f z <e₁,...,eₙ> (Backus: left fold with early termination on ⊥)
+                    seq.iter().try_fold(items[0].clone(), |acc, element| {
+                        let result = apply(f, &Object::seq(vec![acc, element.clone()]), d);
+                        if result.is_bottom() { Err(Object::Bottom) } else { Ok(result) }
+                    }).unwrap_or(Object::Bottom)
                 }
                 _ => Object::Bottom,
             }
@@ -981,27 +966,17 @@ pub fn store(name: &str, contents: Object, state: &Object) -> Object {
         Some(cells) => cells,
         None => return Object::Bottom,
     };
-
-    let mut result: Vec<Object> = Vec::new();
-    let mut found = false;
-    for cell_obj in cells {
-        if let Some(items) = cell_obj.as_seq() {
-            if items.len() == 3
-                && items[0].as_atom() == Some(CELL_TAG)
-                && items[1].as_atom() == Some(name)
-            {
-                // Replace contents
-                result.push(cell(name, contents.clone()));
-                found = true;
-                continue;
-            }
-        }
-        result.push(cell_obj.clone());
+    // α(replace_or_keep) : cells
+    let is_target = |c: &Object| c.as_seq().map_or(false, |items|
+        items.len() == 3 && items[0].as_atom() == Some(CELL_TAG) && items[1].as_atom() == Some(name));
+    let found = cells.iter().any(is_target);
+    let replaced: Vec<Object> = cells.iter().map(|c|
+        if is_target(c) { cell(name, contents.clone()) } else { c.clone() }
+    ).collect();
+    match found {
+        true => Object::Seq(replaced),
+        false => Object::Seq([replaced, vec![cell(name, contents)]].concat()),
     }
-    if !found {
-        result.push(cell(name, contents));
-    }
-    Object::Seq(result)
 }
 
 // ── State helpers (named-tuple cells for Population-as-Object) ──────
@@ -1597,12 +1572,8 @@ impl fmt::Debug for Func {
             Func::Constant(obj) => write!(f, "{:?}̄", obj),
             Func::Compose(g, h) => write!(f, "({:?} ∘ {:?})", g, h),
             Func::Construction(funcs) => {
-                write!(f, "[")?;
-                for (i, func) in funcs.iter().enumerate() {
-                    if i > 0 { write!(f, ", ")?; }
-                    write!(f, "{:?}", func)?;
-                }
-                write!(f, "]")
+                write!(f, "[{}]", funcs.iter().map(|func| format!("{:?}", func))
+                    .collect::<Vec<_>>().join(", "))
             }
             Func::Condition(p, t, e) => write!(f, "({:?} → {:?}; {:?})", p, t, e),
             Func::ApplyToAll(g) => write!(f, "α{:?}", g),
