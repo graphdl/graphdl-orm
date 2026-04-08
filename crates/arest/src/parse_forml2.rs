@@ -1069,7 +1069,14 @@ fn apply_action(ir: &mut Domain, action: Option<ParseAction>, lines: &[String], 
     match action {
         ParseAction::SetDomain(d) => { if ir.domain.is_empty() { ir.domain = d; } }
         ParseAction::AddNoun(name, def, meta) => {
+            // Record the declaration faithfully. If the noun already exists with
+            // a different object type, the UC "Each Noun has exactly one Object Type"
+            // will be caught by the validate pipeline during compile.
             let entry = ir.nouns.entry(name.clone()).or_insert_with(|| def.clone());
+            // Explicit redeclaration overwrites (conflict detected in platform_compile)
+            if entry.object_type != def.object_type && def.object_type != "abstract" {
+                *entry = def.clone();
+            }
             // Merge: subtype/abstract declarations update existing nouns
             if def.object_type == "abstract" { entry.object_type = "abstract".into(); }
             // Populate IR maps from metadata

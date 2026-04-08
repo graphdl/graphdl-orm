@@ -845,7 +845,20 @@ fn platform_compile(x: &Object, d: &Object) -> Object {
         Err(e) => return Object::atom(&format!("⊥ {}", e)),
     };
 
+    // UC guard on Noun has Object Type: reject if a noun is redeclared with a different type.
+    // This is what validate would catch if HashMap didn't erase the conflict.
     let mut merged = existing_domain;
+    let noun_conflicts: Vec<String> = domain.nouns.iter()
+        .filter_map(|(name, new_def)| {
+            merged.nouns.get(name)
+                .filter(|existing| existing.object_type != new_def.object_type)
+                .map(|existing| format!("Each Noun has exactly one Object Type. '{}' is {} but redeclared as {}",
+                    name, existing.object_type, new_def.object_type))
+        })
+        .collect();
+    if !noun_conflicts.is_empty() {
+        return Object::atom(&format!("⊥ constraint violation: {}", noun_conflicts.join("; ")));
+    }
     merged.nouns.extend(domain.nouns);
     merged.fact_types.extend(domain.fact_types);
     merged.constraints.extend(domain.constraints);
