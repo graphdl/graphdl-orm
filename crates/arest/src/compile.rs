@@ -734,61 +734,28 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
         }
     }
 
-    // ── Generator 3: SQL DDL ────────────────────────────────────────
-    // Call rmap() at compile time and produce a def sql:{table} for each table.
-    // All identifiers are double-quoted to handle SQL reserved words.
+    // ── Generator 3: SQL DDL (multi-dialect) ─────────────────────────
+    // Call rmap() at compile time and produce dialect-specific defs:
+    //   sql:sqlite:{table}, sql:postgresql:{table}, sql:mysql:{table},
+    //   sql:sqlserver:{table}, sql:oracle:{table}, sql:db2:{table},
+    //   sql:standard:{table}, sql:clickhouse:{table}
     {
         let tables = crate::rmap::rmap(&domain);
+        let dialects = [
+            ("sqlite",     SqlDialect::Sqlite),
+            ("postgresql", SqlDialect::PostgreSql),
+            ("mysql",      SqlDialect::MySql),
+            ("sqlserver",  SqlDialect::SqlServer),
+            ("oracle",     SqlDialect::Oracle),
+            ("db2",        SqlDialect::Db2),
+            ("standard",   SqlDialect::Standard),
+            ("clickhouse", SqlDialect::ClickHouse),
+        ];
         for table in &tables {
-            let q = |s: &str| format!("\"{}\"", s);
-            let mut ddl = format!("CREATE TABLE IF NOT EXISTS {} (\n", q(&table.name));
-            for (i, col) in table.columns.iter().enumerate() {
-                let nullable = if col.nullable { "" } else { " NOT NULL" };
-                let refs = col.references.as_ref()
-                    .map(|r| format!(" REFERENCES {}", q(r)))
-                    .unwrap_or_default();
-                ddl.push_str(&format!("  {} {}{}{}", q(&col.name), col.col_type, nullable, refs));
-                if i < table.columns.len() - 1 || !table.primary_key.is_empty()
-                    || table.checks.as_ref().map_or(false, |c| !c.is_empty())
-                    || table.unique_constraints.as_ref().map_or(false, |u| !u.is_empty())
-                {
-                    ddl.push(',');
-                }
-                ddl.push('\n');
+            for (dialect_name, dialect) in &dialects {
+                let ddl = generate_ddl(table, dialect);
+                defs.push((format!("sql:{}:{}", dialect_name, table.name), Func::constant(Object::atom(&ddl))));
             }
-            if !table.primary_key.is_empty() {
-                let mut trailing = false;
-                if table.checks.as_ref().map_or(false, |c| !c.is_empty())
-                    || table.unique_constraints.as_ref().map_or(false, |u| !u.is_empty())
-                {
-                    trailing = true;
-                }
-                let pk_cols: Vec<String> = table.primary_key.iter().map(|c| q(c)).collect();
-                ddl.push_str(&format!("  PRIMARY KEY ({}){}\n",
-                    pk_cols.join(", "),
-                    if trailing { "," } else { "" },
-                ));
-            }
-            if let Some(checks) = &table.checks {
-                for (i, check) in checks.iter().enumerate() {
-                    ddl.push_str(&format!("  CHECK ({}){}\n", check,
-                        if i < checks.len() - 1 ||
-                           table.unique_constraints.as_ref().map_or(false, |u| !u.is_empty())
-                        { "," } else { "" },
-                    ));
-                }
-            }
-            if let Some(ucs) = &table.unique_constraints {
-                for (i, uc) in ucs.iter().enumerate() {
-                    let uc_cols: Vec<String> = uc.iter().map(|c| q(c)).collect();
-                    ddl.push_str(&format!("  UNIQUE ({}){}\n", uc_cols.join(", "),
-                        if i < ucs.len() - 1 { "," } else { "" },
-                    ));
-                }
-            }
-            ddl.push_str(");");
-
-            defs.push((format!("sql:{}", table.name), Func::constant(Object::atom(&ddl))));
         }
     }
 
@@ -3645,6 +3612,114 @@ fn compile_state_machine(
         transition_table,
         func: sm_func,
     }
+}
+
+// -- SQL Dialect DDL Generation ---------------------------------------
+
+#[derive(Clone, Copy)]
+enum SqlDialect { Sqlite, PostgreSql, MySql, SqlServer, Oracle, Db2, Standard, ClickHouse }
+
+/// Generate DDL for a table in the given SQL dialect.
+fn generate_ddl(table: &crate::rmap::TableDef, dialect: &SqlDialect) -> String {
+    let q = |s: &str| match dialect {
+        SqlDialect::MySql => format!("`{}`", s),
+        SqlDialect::SqlServer => format!("[{}]", s),
+        _ => format!("\"{}\"", s),
+    };
+
+    let map_type = |base: &str| -> &str {
+        match dialect {
+            SqlDialect::Sqlite => match base {
+                "TEXT" => "TEXT", "INTEGER" => "INTEGER", "REAL" => "REAL",
+                "BOOLEAN" => "INTEGER", _ => "TEXT",
+            },
+            SqlDialect::PostgreSql => match base {
+                "TEXT" => "TEXT", "INTEGER" => "INTEGER", "REAL" => "DOUBLE PRECISION",
+                "BOOLEAN" => "BOOLEAN", _ => "TEXT",
+            },
+            SqlDialect::MySql => match base {
+                "TEXT" => "VARCHAR(255)", "INTEGER" => "INT", "REAL" => "DOUBLE",
+                "BOOLEAN" => "TINYINT(1)", _ => "VARCHAR(255)",
+            },
+            SqlDialect::SqlServer => match base {
+                "TEXT" => "NVARCHAR(255)", "INTEGER" => "INT", "REAL" => "FLOAT",
+                "BOOLEAN" => "BIT", _ => "NVARCHAR(255)",
+            },
+            SqlDialect::Oracle => match base {
+                "TEXT" => "VARCHAR2(255)", "INTEGER" => "NUMBER(10)", "REAL" => "NUMBER",
+                "BOOLEAN" => "NUMBER(1)", _ => "VARCHAR2(255)",
+            },
+            SqlDialect::Db2 => match base {
+                "TEXT" => "VARCHAR(255)", "INTEGER" => "INTEGER", "REAL" => "DOUBLE",
+                "BOOLEAN" => "SMALLINT", _ => "VARCHAR(255)",
+            },
+            SqlDialect::ClickHouse => match base {
+                "TEXT" => "String", "INTEGER" => "Int64", "REAL" => "Float64",
+                "BOOLEAN" => "UInt8", _ => "String",
+            },
+            SqlDialect::Standard => match base {
+                "TEXT" => "CHARACTER VARYING(255)", "INTEGER" => "INTEGER", "REAL" => "DOUBLE PRECISION",
+                "BOOLEAN" => "BOOLEAN", _ => "CHARACTER VARYING(255)",
+            },
+        }
+    };
+
+    let create_kw = match dialect {
+        SqlDialect::ClickHouse => format!("CREATE TABLE IF NOT EXISTS {} (\n", q(&table.name)),
+        SqlDialect::Oracle => format!("CREATE TABLE {} (\n", q(&table.name)),
+        _ => format!("CREATE TABLE IF NOT EXISTS {} (\n", q(&table.name)),
+    };
+
+    let has_pk = !table.primary_key.is_empty();
+    let has_checks = table.checks.as_ref().map_or(false, |c| !c.is_empty());
+    let has_ucs = table.unique_constraints.as_ref().map_or(false, |u| !u.is_empty());
+
+    let columns: String = table.columns.iter().enumerate().map(|(i, col)| {
+        let col_type = map_type(&col.col_type);
+        let nullable = if col.nullable {
+            match dialect { SqlDialect::ClickHouse => " Nullable", _ => "" }
+        } else {
+            " NOT NULL"
+        };
+        let refs = col.references.as_ref()
+            .map(|r| match dialect {
+                SqlDialect::ClickHouse => String::new(), // no FK in ClickHouse
+                _ => format!(" REFERENCES {}", q(r)),
+            })
+            .unwrap_or_default();
+        let trailing = if i < table.columns.len() - 1 || has_pk || has_checks || has_ucs { "," } else { "" };
+        format!("  {} {}{}{}{}\n", q(&col.name), col_type, nullable, refs, trailing)
+    }).collect();
+
+    let pk = if has_pk {
+        let pk_cols: Vec<String> = table.primary_key.iter().map(|c| q(c)).collect();
+        let trailing = if has_checks || has_ucs { "," } else { "" };
+        format!("  PRIMARY KEY ({}){}\n", pk_cols.join(", "), trailing)
+    } else { String::new() };
+
+    let checks: String = match (dialect, &table.checks) {
+        (SqlDialect::ClickHouse, _) => String::new(), // no CHECK in ClickHouse
+        (_, Some(checks)) => checks.iter().enumerate().map(|(i, check)| {
+            let trailing = if i < checks.len() - 1 || has_ucs { "," } else { "" };
+            format!("  CHECK ({}){}\n", check, trailing)
+        }).collect(),
+        _ => String::new(),
+    };
+
+    let ucs: String = table.unique_constraints.as_ref().map(|ucs| {
+        ucs.iter().enumerate().map(|(i, uc)| {
+            let uc_cols: Vec<String> = uc.iter().map(|c| q(c)).collect();
+            let trailing = if i < ucs.len() - 1 { "," } else { "" };
+            format!("  UNIQUE ({}){}\n", uc_cols.join(", "), trailing)
+        }).collect::<String>()
+    }).unwrap_or_default();
+
+    let engine = match dialect {
+        SqlDialect::ClickHouse => "\nENGINE = MergeTree()\nORDER BY tuple()",
+        _ => "",
+    };
+
+    format!("{}{}{}{}{});{}", create_kw, columns, pk, checks, ucs, engine)
 }
 
 // -- Schema Compilation Tests -----------------------------------------

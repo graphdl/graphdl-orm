@@ -68,7 +68,7 @@ mod db {
         ).unwrap_or_else(|e| { eprintln!("Failed to create tables: {}", e); std::process::exit(1); });
         let mut ddl_errors = 0;
         for (name, func) in sql_defs {
-            if !name.starts_with("sql:") { continue; }
+            if !name.starts_with("sql:sqlite:") { continue; }
             if let ast::Func::Constant(ref obj) = func {
                 if let Some(ddl) = obj.as_atom() {
                     if let Err(e) = conn.execute_batch(ddl) {
