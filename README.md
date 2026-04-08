@@ -1,159 +1,117 @@
 # graphdl-orm
 
-An implementation of the [AREST whitepaper](AREST.tex) — *Compiling Facts into Applications*.
+An implementation of [AREST](AREST.tex) — *Compiling Facts into Applications*.
 
-Domain knowledge expressed as FORML 2 readings compiles into executable applications via Backus's FFP representation function. The system is a tuple `(O, ρ, D, P, sub)` where readings are FFP objects, ρ maps them to executables, state D is a sequence of cells, population P is Codd's named set, and sub dispatches inputs to state transitions producing REST representations with HATEOAS links.
+FORML 2 readings compile to named lambda functions via Backus's FFP representation function. SYSTEM is the only function. Every operation — compile, create, validate, transition, query — is a def in D resolved via rho. The engine is a beta-reducer targeting WASM (Cloudflare Workers) and eventually FPGA.
 
-Based on the work of [John Backus](https://en.wikipedia.org/wiki/John_Backus) (FFP/AST, 1978), [E.F. Codd](https://en.wikipedia.org/wiki/Edgar_F._Codd) (relational model, 1970), [Terry Halpin](https://en.wikipedia.org/wiki/Terry_Halpin) (ORM 2, 2008), and [Roy Fielding](https://en.wikipedia.org/wiki/Roy_Fielding) (REST, 2000).
+Based on [John Backus](https://en.wikipedia.org/wiki/John_Backus) (FFP/AST, 1978), [E.F. Codd](https://en.wikipedia.org/wiki/Edgar_F._Codd) (relational model, 1970), [Terry Halpin](https://en.wikipedia.org/wiki/Terry_Halpin) (ORM 2, 2008), and [Roy Fielding](https://en.wikipedia.org/wiki/Roy_Fielding) (REST, 2000).
+
+## WASM API
+
+Two exports. SYSTEM is the only function.
+
+```
+create()                              — allocate empty D with platform primitives
+system(handle, key, input) -> string  — SYSTEM:x = (rho(entity(x):D)):op(x)
+```
+
+Self-modification: `system(h, 'compile', readings_text)` ingests readings. All other operations dispatch via rho from defs in D. No match arms, no if-branches. On FPGA, each def is a synthesized circuit.
+
+```javascript
+const h = create()
+system(h, 'compile', coreReadings)
+system(h, 'compile', stateReadings)
+system(h, 'compile', domainReadings)
+system(h, 'transitions:Order', 'In Cart')  // rho-dispatch
+system(h, 'debug', '')                      // rho-dispatch
+system(h, 'apply', JSON.stringify({...}))   // create pipeline
+```
 
 ## Architecture
 
 ```
-readings (FORML 2)
-    │
-    ├─► parse_readings_wasm (Rust/WASM)  ──► entities (cells in D)
-    │
-    ├─► compile_domain (handle-based, from DEFS cell)
-    │
-    ├─► apply_command (create = emit ∘ validate ∘ derive ∘ resolve)
-    │
-    └─► representation (entity data + HATEOAS links + _view metadata)
+readings (FORML 2 text)
+    |
+    compile (Platform primitive)  --> facts in P, defs in DEFS
+    |
+    system(h, key, input)         --> rho-dispatch --> beta-reduce --> D'
 ```
 
-Two Durable Objects, matching the paper exactly:
+| Paper | Implementation |
+|-------|----------------|
+| D (state) | Sequence of cells. EntityDB (one Durable Object per entity). |
+| P (population) | Named set of elementary facts. RegistryDB (population index). |
+| rho | Rust/WASM engine. Compiles readings, evaluates constraints, forward-chains derivations. |
+| SYSTEM | `system_impl`: one line of rho-dispatch + state transition. No routing. |
+| Platform primitives | `Func::Platform("compile")`, `Func::Platform("apply_command")`. Synthesizable gates. |
 
-| Component | Paper | Implementation |
-|-----------|-------|----------------|
-| **D** (state) | Sequence of cells `⟨CELL, n, c⟩` | EntityDB — one DO per entity. `↑n` = get(), `↓n` = put(). |
-| **P** (population) | `↑FILE:D` — named set of relations | RegistryDB — population index. Maps (type, id) to cells. |
-| **ρ** (representation function) | Maps FFP objects to executables | Rust/WASM engine (arest). Compiles readings, evaluates constraints, forward-chains derivations. |
-| **sub** (subsystem dispatch) | Routes inputs to state transitions | itty-router. Dispatches create/update/query/transition/load commands. |
+## Readings
 
-The complexity lives in ρ (WASM), not in the host.
-
-## Domains and Apps
-
-**Domains are NORMA tabs, not partitions.** A domain organizes discourse — which readings are visible in a tab. Fact types are idempotent: "Customer has Name" declared in both "sales" and "support" is the SAME fact type. All domains compile to a single Universe of Discourse.
-
-**Apps lasso domains into databases.** An App determines which domains are navigable and which users can access them. The Support Tickets app navigates the "support" domain. The admin view shows all domains.
+FORML 2 sentences with unambiguous grammar (Theorem 1).
 
 ```
-App "Support Tickets"
-  └── navigable domains: ["support"]
-       └── entity types: Support Request, Support Response, Message, ...
+Order(.OrderId) is an entity type.
+Customer(.Name) is an entity type.
+Order was placed by Customer.
+  Each Order was placed by exactly one Customer.
 
-App "Admin" (all domains)
-  └── navigable domains: ["core", "state", "support", "stripe", ...]
-       └── entity types: Noun, Reading, Constraint, Graph Schema, ...
+State Machine Definition 'Order' is for Noun 'Order'.
+Status 'In Cart' is initial in State Machine Definition 'Order'.
+Transition 'place' is from Status 'In Cart'.
+Transition 'place' is to Status 'Placed'.
 ```
 
-Access control is expressed as readings in `organizations.md`:
+Constraints, state machines, derivation rules, and instance facts are all readings. The compiler recognizes a single object that occupies all four roles (Theorem 2).
+
+## REST API
+
+AREST routes derive navigation from the constraint graph (Theorem 4):
+
 ```
-User accesses Domain iff User has Org Role in Organization
-  and Domain belongs to that Organization.
-User accesses Domain if Domain has Access 'public'.
-```
-
-The engine evaluates these derivation rules — no procedural access control code.
-
-## Writing Readings
-
-Readings are FORML 2 sentences — natural language with unambiguous grammar (Theorem 1).
-
-```markdown
-# Support
-
-## Entity Types
-
-Support Request(.Request Id) is an entity type.
-Category is a value type.
-  The possible values of Category are 'question', 'feature-request', 'incident'.
-
-## Fact Types
-
-Support Request has Subject.
-  Each Support Request has exactly one Subject.
-Support Request has Category.
-  Each Support Request has at most one Category.
-
-## Constraints
-
-It is obligatory that each Support Response is professional.
-
-## State Machine
-
-State Machine Definition 'Support Request' is for Noun 'Support Request'.
-Status 'Received' is initial in State Machine Definition 'Support Request'.
-Transition 'categorize' is from Status 'Received'.
-  Transition 'categorize' is to Status 'Categorized'.
+GET  /arest/                              root resource
+GET  /arest/:collection                   list with _links + _schema
+GET  /arest/:collection/:id              entity with HATEOAS links
 ```
 
-Abstract nouns prevent direct instantiation:
-```
-Request is abstract.
-```
-Or via totality: `Each Request is a Support Request or a Feature Request.`
+Write operations go through the apply command (Eq. 10: create = emit . validate . derive . resolve):
 
-Order and indentation do not matter. Each sentence has exactly one parse.
-
-## API
-
-AREST routes (HATEOAS, constraint-derived navigation):
 ```
-GET    /arest/:domain                       — domain root with navigable nouns
-GET    /arest/:domain/:noun                 — list entities (cells in D)
-GET    /arest/:domain/:noun/:id             — entity detail with HATEOAS links
-POST   /arest/:domain/:noun                 — create (emit ∘ validate ∘ derive ∘ resolve)
-POST   /arest/:domain/:noun/:id/transition  — fire state machine transition
+POST /api/parse                           compile . parse (readings -> D)
+POST /api/entities/:noun                  create entity
+POST /api/entities/:noun/:id/transition   fire state machine event
 ```
 
-Seed and evaluation:
-```
-POST   /seed                                — parse FORML 2 markdown via WASM
-GET    /seed                                — population stats
-POST   /arest/:domain/evaluate              — constraint evaluation
-```
+## Security
 
-Self-describing representations include `_view` (view metadata derived from readings) and `_nav` (navigation context from access derivation rules):
+Authorization is a constraint in the readings, not middleware. The compile operation is gated: after bootstrap, bare compile is rejected. Noun namespace protection via UC on Object Type. Input bounds are platform gates (hardware buffer size). The evolution domain's state machine governs schema modification.
 
-```json
-{
-  "docs": [...],
-  "_view": { "type": "ListView", "title": "Support Request", "fields": [...], "constraints": [...] },
-  "_nav": { "domains": [...], "apps": [...], "breadcrumb": ["support", "Support Request"] },
-  "_links": { "self": "...", "collection": "...", "create": "..." }
-}
-```
+See `src/tests/security/authorization.test.ts` for the threat model.
 
 ## Development
 
 ```bash
-npm install
-npm run dev          # wrangler dev
-npm test             # vitest (161 tests)
-npx tsc --noEmit     # type check
+yarn install
+yarn dev                # wrangler dev
+yarn test               # vitest (265 tests)
+yarn build:wasm         # Rust -> WASM
+npx tsc --noEmit        # type check
 
-# Rust/WASM engine
+# Rust engine
 cd crates/arest
-cargo test           # 242 tests
-wasm-pack build --target web --out-dir pkg
-
-# Deploy
-npx wrangler deploy
-
-# Seed
-curl -X POST https://api.auto.dev/api/seed -F "core=@readings/core.md" -F "support=@readings/support.md"
+cargo test              # 575 tests
 ```
 
 ## Theorems
 
-The [whitepaper](AREST.pdf) proves six properties:
+The [whitepaper](AREST.tex) proves five properties:
 
 1. **Grammar Unambiguity** — each FORML 2 sentence has exactly one parse
-2. **Specification Equivalence** — `parse⁻¹ ∘ compile⁻¹ ∘ compile ∘ parse = id`
-3. **Completeness of State Transfer** — create reaches the least fixed point with all derived facts and violations
-4. **HATEOAS as Projection** — transition links and entity hierarchy are θ₁ projections of P
-5. **Derivability** — every value in the representation is `(ρf):P` for some `f ∈ O`
+2. **Specification Equivalence** — parse and compile are injective; the reading IS the executable
+3. **Completeness of State Transfer** — create reaches the least fixed point with all violations
+4. **HATEOAS as Projection** — all links are theta-1 operations on P and S
+5. **Derivability** — every value in the representation is a rho-application
+
+Self-modification preserves all five (Corollary: Closure). Constraint consensus enables peer-to-peer validation without external protocol (Corollary: Consensus).
 
 ## License
 
