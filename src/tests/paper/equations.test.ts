@@ -8,48 +8,13 @@
  */
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest'
-import { compileDomain, transitions, releaseDomain } from '../helpers/domain-fixture'
+import { compileDomain, transitions, releaseDomain, ORDER_READINGS, STATE_READINGS } from '../helpers/domain-fixture'
 import { system } from '../../api/engine'
-
-// ── Order domain with state machine ────────────────────────────────────────────
-//
-// State machine: In Cart → place → Placed → ship → Shipped → deliver → Delivered
-//
-// The WASM engine reads "## State Machine" sections to register transitions.
-
-const ORDER_SM_READINGS = `# Orders
-
-An Order domain with a state machine for paper verification tests.
-
-## Entity Types
-Order(.OrderId) is an entity type.
-Customer(.Name) is an entity type.
-
-## Value Types
-OrderId is a value type.
-
-## Fact Types
-
-### Order
-Order was placed by Customer.
-
-## Constraints
-Each Order was placed by exactly one Customer.
-
-## State Machine
-
-### Order
-initial: In Cart
-In Cart --place--> Placed
-Placed --ship--> Shipped
-Shipped --deliver--> Delivered
-terminal: Delivered
-`
 
 let handle: number
 
 beforeAll(() => {
-  handle = compileDomain(ORDER_SM_READINGS, 'orders').handle
+  handle = compileDomain(ORDER_READINGS, STATE_READINGS).handle
 })
 
 afterAll(() => {
