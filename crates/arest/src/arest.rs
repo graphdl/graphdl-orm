@@ -12,6 +12,15 @@ use serde::{Serialize, Deserialize};
 use crate::types::*;
 use crate::ast;
 
+/// Resolve a def from D: Fetch + metacompose (Backus 13.3.2: ρ).
+/// Returns the Func if the def exists, or None.
+fn def_func(name: &str, d: &ast::Object) -> Option<ast::Func> {
+    match ast::fetch_or_phi(name, d) {
+        ast::Object::Bottom => None,
+        obj => Some(ast::metacompose(&obj, d)),
+    }
+}
+
 // -- Commands ---------------------------------------------------------
 
 /// The five input classes from Backus Section 14.4.2.
@@ -211,22 +220,22 @@ pub fn encode_command_result(result: &CommandResult) -> ast::Object {
 // -- Apply ------------------------------------------------------------
 
 pub fn apply_command_defs(
-    defs: &std::collections::HashMap<String, ast::Func>,
+    d: &ast::Object,
     command: &Command,
     state: &ast::Object,
 ) -> CommandResult {
     match command {
         Command::CreateEntity { noun, domain, id, fields } => {
-            create_via_defs(defs, noun, domain, id.as_deref(), fields, state)
+            create_via_defs(d, noun, domain, id.as_deref(), fields, state)
         }
         Command::Transition { entity_id, event, domain, current_status } => {
-            transition_via_defs(defs, entity_id, event, domain, current_status.as_deref(), state)
+            transition_via_defs(d, entity_id, event, domain, current_status.as_deref(), state)
         }
         Command::Query { schema_id, domain: _, target, bindings } => {
-            query_via_defs(defs, schema_id, target, bindings, state)
+            query_via_defs(d, schema_id, target, bindings, state)
         }
         Command::UpdateEntity { noun, domain, entity_id, fields } => {
-            update_via_defs(defs, noun, domain, entity_id, fields, state)
+            update_via_defs(d, noun, domain, entity_id, fields, state)
         }
         Command::LoadReadings { markdown, domain } => {
             apply_load_readings(markdown, domain, state)
@@ -245,7 +254,7 @@ pub fn apply_command_defs(
 }
 
 fn create_via_defs(
-    defs: &std::collections::HashMap<String, ast::Func>,
+    d: &ast::Object,
     noun: &str,
     domain: &str,
     explicit_id: Option<&str>,
@@ -259,18 +268,20 @@ fn create_via_defs(
 
     let resolve_key = format!("resolve:{}", noun);
     let new_state = entity_data.iter().fold(state.clone(), |acc, (field_name, value)| {
-        let ft_id = defs.get(&resolve_key)
-            .map(|f| ast::apply(f, &ast::Object::atom(&field_name.to_lowercase()), defs))
+        let ft_id = def_func(&resolve_key, d)
+            .map(|f| ast::apply(&f, &ast::Object::atom(&field_name.to_lowercase()), d))
             .and_then(|o| o.as_atom().map(|s| s.to_string()))
-            .unwrap_or_else(|| resolve_fact_type_id_defs(defs, noun, field_name));
+            .unwrap_or_else(|| format!("{}_has_{}", noun, field_name));
         ast::cell_push(&ft_id, ast::fact_from_pairs(&[(noun, &entity_id), (field_name.as_str(), value.as_str())]), &acc)
     });
 
     // -- derive --
-    let derivation_defs: Vec<(&str, &ast::Func)> = defs.iter()
+    let derivation_defs_owned: Vec<(String, ast::Func)> = ast::cells_iter(d).into_iter()
         .filter(|(n, _)| n.starts_with("derivation:"))
-        .map(|(n, f)| (n.as_str(), f))
+        .map(|(n, contents)| (n.to_string(), ast::metacompose(contents, d)))
         .collect();
+    let derivation_defs: Vec<(&str, &ast::Func)> = derivation_defs_owned.iter()
+        .map(|(n, f)| (n.as_str(), f)).collect();
     let (new_state, derived) = crate::evaluate::forward_chain_defs_state(&derivation_defs, &new_state);
 
     // Build entity result
@@ -296,9 +307,9 @@ fn create_via_defs(
     }
 
     // Inject transition facts from compiled transitions_meta:{noun} (Theorem 3: T is in P)
-    let new_state = defs.get(&format!("transitions_meta:{}", noun))
+    let new_state = def_func(&format!("transitions_meta:{}", noun), d)
         .map(|f| {
-            let triples = ast::apply(f, &ast::Object::phi(), defs);
+            let triples = ast::apply(&f, &ast::Object::phi(), d);
             triples.as_seq().map(|facts| {
                 facts.iter().fold(new_state.clone(), |s, fact| ast::cell_push("Transition", fact.clone(), &s))
             }).unwrap_or(new_state.clone())
@@ -307,8 +318,8 @@ fn create_via_defs(
 
     // -- validate --
     let ctx_obj = ast::encode_eval_context_state("", None, &new_state);
-    let validate_func = defs.get("validate").cloned().unwrap_or(ast::Func::constant(ast::Object::phi()));
-    let violation_obj = ast::apply(&validate_func, &ctx_obj, defs);
+    let validate_func = def_func("validate", d).unwrap_or(ast::Func::constant(ast::Object::phi()));
+    let violation_obj = ast::apply(&validate_func, &ctx_obj, d);
     let violations = ast::decode_violations(&violation_obj);
     let rejected = violations.iter().any(|v| v.alethic);
 
@@ -327,19 +338,18 @@ fn create_via_defs(
 }
 
 fn resolve_fact_type_id_defs(
-    defs: &std::collections::HashMap<String, ast::Func>,
+    d: &ast::Object,
     noun: &str,
     field: &str,
 ) -> String {
-    defs.keys()
-        .filter_map(|name| name.strip_prefix("schema:"))
+    ast::cells_iter(d).into_iter()
+        .filter_map(|(name, _)| name.strip_prefix("schema:").map(|s| s.to_string()))
         .find(|schema_id| schema_id.contains(noun) && schema_id.contains(field))
-        .map(|s| s.to_string())
         .unwrap_or_else(|| format!("{}_has_{}", noun, field))
 }
 
 fn transition_via_defs(
-    defs: &std::collections::HashMap<String, ast::Func>,
+    d: &ast::Object,
     entity_id: &str,
     event: &str,
     _domain: &str,
@@ -349,18 +359,18 @@ fn transition_via_defs(
     let mut new_state = state.clone();
 
     // Find the machine def and compute transition via find_map (no for loop)
-    let new_status = defs.iter()
+    let new_status = ast::cells_iter(d).into_iter()
         .filter(|(name, _)| name.starts_with("machine:") && !name.contains(":initial"))
-        .find_map(|(name, func)| {
+        .find_map(|(name, contents)| {
+            let func = ast::metacompose(contents, d);
             let initial_key = format!("{}:initial", name);
             let from_status = current_status.map(|s| s.to_string()).or_else(|| {
-                defs.get(&initial_key)
-                    .map(|f| ast::apply(f, &ast::Object::phi(), defs))
+                def_func(&initial_key, d)
+                    .map(|f| ast::apply(&f, &ast::Object::phi(), d))
                     .and_then(|o| o.as_atom().map(|s| s.to_string()))
             })?;
             let input = ast::Object::seq(vec![ast::Object::atom(&from_status), ast::Object::atom(event)]);
-            let result = ast::apply(func, &input, defs);
-            result.as_atom()
+            ast::apply(&func, &input, d).as_atom()
                 .filter(|next| *next != from_status)
                 .map(|next| next.to_string())
         });
@@ -398,7 +408,7 @@ fn transition_via_defs(
 }
 
 fn query_via_defs(
-    defs: &std::collections::HashMap<String, ast::Func>,
+    d: &ast::Object,
     schema_id: &str,
     target: &str,
     bindings: &std::collections::HashMap<String, String>,
@@ -430,7 +440,7 @@ fn query_via_defs(
     let schema = crate::compile::CompiledSchema {
         id: schema_id.to_string(),
         reading: String::new(),
-        construction: defs.get(&format!("schema:{}", schema_id)).cloned().unwrap_or(ast::Func::Id),
+        construction: def_func(&format!("schema:{}", schema_id), d).unwrap_or(ast::Func::Id),
         role_names: role_names.clone(),
     };
     let results = crate::query::query_with_ast(state, &schema, target_role, &filter_refs);
@@ -455,7 +465,7 @@ fn query_via_defs(
 }
 
 fn update_via_defs(
-    defs: &std::collections::HashMap<String, ast::Func>,
+    d: &ast::Object,
     noun: &str,
     domain: &str,
     entity_id: &str,
@@ -481,10 +491,10 @@ fn update_via_defs(
     // Remove old facts for this entity, insert merged (fold over fields)
     let resolve_key = format!("resolve:{}", noun);
     let new_state = merged.iter().fold(state.clone(), |acc, (field_name, value)| {
-        let ft_id = defs.get(&resolve_key)
-            .map(|f| ast::apply(f, &ast::Object::atom(&field_name.to_lowercase()), defs))
+        let ft_id = def_func(&resolve_key, d)
+            .map(|f| ast::apply(&f, &ast::Object::atom(&field_name.to_lowercase()), d))
             .and_then(|o| o.as_atom().map(|s| s.to_string()))
-            .unwrap_or_else(|| resolve_fact_type_id_defs(defs, noun, field_name));
+            .unwrap_or_else(|| format!("{}_has_{}", noun, field_name));
         let acc = ast::cell_filter(&ft_id, |f| {
             f.as_seq().map_or(true, |pairs| {
                 pairs.len() < 2 || pairs[0].as_seq().and_then(|p| p.get(1)?.as_atom()) != Some(entity_id)
@@ -494,15 +504,17 @@ fn update_via_defs(
     });
 
     // derive + validate + emit
-    let derivation_defs: Vec<(&str, &ast::Func)> = defs.iter()
+    let derivation_defs_owned: Vec<(String, ast::Func)> = ast::cells_iter(d).into_iter()
         .filter(|(n, _)| n.starts_with("derivation:"))
-        .map(|(n, f)| (n.as_str(), f))
+        .map(|(n, contents)| (n.to_string(), ast::metacompose(contents, d)))
         .collect();
+    let derivation_defs: Vec<(&str, &ast::Func)> = derivation_defs_owned.iter()
+        .map(|(n, f)| (n.as_str(), f)).collect();
     let (new_state, derived) = crate::evaluate::forward_chain_defs_state(&derivation_defs, &new_state);
 
     let ctx_obj = ast::encode_eval_context_state("", None, &new_state);
-    let validate_func = defs.get("validate").cloned().unwrap_or(ast::Func::constant(ast::Object::phi()));
-    let violation_obj = ast::apply(&validate_func, &ctx_obj, defs);
+    let validate_func = def_func("validate", d).unwrap_or(ast::Func::constant(ast::Object::phi()));
+    let violation_obj = ast::apply(&validate_func, &ctx_obj, d);
     let violations = ast::decode_violations(&violation_obj);
     let rejected = violations.iter().any(|v| v.alethic);
     let sm_id = entity_id.to_string();
@@ -788,8 +800,8 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
 "#;
 
     /// Parse state metamodel + order domain readings, compile to defs,
-    /// return (def_map, base_state).
-    fn setup_order_defs() -> (HashMap<String, crate::ast::Func>, ast::Object) {
+    /// return (defs_object, base_state).
+    fn setup_order_defs() -> (ast::Object, ast::Object) {
         let meta_state = crate::parse_forml2::parse_to_state(STATE_METAMODEL).unwrap();
         let orders_state = crate::parse_forml2::parse_to_state_with_nouns(ORDER_READINGS, &meta_state).unwrap();
         // Merge: push all cells from orders_state into meta_state
@@ -802,8 +814,8 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
             }
         }
         let defs = crate::compile::compile_to_defs_state(&state);
-        let def_map: HashMap<String, crate::ast::Func> = defs.iter().map(|(n, f)| (n.clone(), f.clone())).collect();
-        (def_map, state)
+        let def_obj = ast::defs_to_state(&defs, &state);
+        (def_obj, state)
     }
 
     #[test]

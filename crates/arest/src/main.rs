@@ -452,22 +452,24 @@ fn cmd_system(args: &[String]) {
 
     let conn = db::open(&db_path);
     let defs = db::load_defs(&conn);
-    let def_map: std::collections::HashMap<String, ast::Func> =
-        defs.iter().map(|(n, f)| (n.clone(), f.clone())).collect();
 
-    // Backus 14.4.2: the operand includes input and FILE (population).
-    // Every def receives the same operand. No branching on key.
+    // Backus 14.4.2: D contains FILE (population) + DEFS.
     let tables = db::load_table_meta(&conn);
     let state = db::load_state(&conn, &tables);
+    let d = ast::defs_to_state(&defs, &state);
     let input_obj = ast::Object::parse(input);
-    let obj = ast::Object::seq(vec![input_obj, ast::Object::phi(), state]);
+    let obj = ast::Object::seq(vec![input_obj, ast::Object::phi(), d.clone()]);
 
-    if let Some(func) = def_map.get(key.as_str()) {
-        let result = ast::apply(func, &obj, &def_map);
-        println!("{}", result);
-    } else {
-        eprintln!("Key not found in defs: {}", key);
-        std::process::exit(1);
+    let def_obj = ast::fetch_or_phi(key.as_str(), &d);
+    match &def_obj {
+        ast::Object::Bottom => {
+            eprintln!("Key not found in defs: {}", key);
+            std::process::exit(1);
+        }
+        _ => {
+            let result = ast::apply(&ast::metacompose(&def_obj, &d), &obj, &d);
+            println!("{}", result);
+        }
     }
 }
 
@@ -607,8 +609,7 @@ fn main() {
         .unwrap_or_else(|e| { eprintln!("Failed to parse IR: {}", e); std::process::exit(1); });
     let ir_state = parse_forml2::domain_to_state(&ir);
     let defs = compile::compile_to_defs_state(&ir_state);
-    let def_map: std::collections::HashMap<String, ast::Func> =
-        defs.iter().map(|(n, f)| (n.clone(), f.clone())).collect();
+    let d = ast::defs_to_state(&defs, &ir_state);
 
     // -- Synthesize mode --
     if let Some(noun_name) = synthesize_noun {
@@ -651,7 +652,7 @@ fn main() {
     let violations: Vec<types::Violation> = defs.iter()
         .filter(|(n, _)| n.starts_with("constraint:"))
         .flat_map(|(name, func)| {
-            let result = ast::apply(func, &ctx_obj, &def_map);
+            let result = ast::apply(func, &ctx_obj, &d);
             let is_deontic = name.contains("obligatory") || name.contains("forbidden");
             ast::decode_violations(&result).into_iter().map(move |mut v| {
                 v.alethic = !is_deontic;

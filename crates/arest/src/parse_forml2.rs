@@ -2090,14 +2090,13 @@ It is obligatory that each Support Response conforms to Pricing Model.";
     fn eval_deontic_defs(ir: &crate::types::Domain, text: &str) -> Vec<crate::types::Violation> {
         let state = domain_to_state(ir);
         let defs = crate::compile::compile_to_defs_state(&state);
-        let def_map: std::collections::HashMap<String, crate::ast::Func> =
-            defs.iter().map(|(n, f)| (n.clone(), f.clone())).collect();
         let empty_state = crate::ast::Object::phi();
+        let def_obj = crate::ast::defs_to_state(&defs, &empty_state);
         let ctx_obj = crate::ast::encode_eval_context_state(text, None, &empty_state);
         defs.iter()
             .filter(|(n, _)| n.starts_with("constraint:"))
             .flat_map(|(name, func)| {
-                let result = crate::ast::apply(func, &ctx_obj, &def_map);
+                let result = crate::ast::apply(func, &ctx_obj, &def_obj);
                 let is_deontic = name.contains("obligatory") || name.contains("forbidden");
                 crate::ast::decode_violations(&result).into_iter().map(move |mut v| {
                     v.alethic = !is_deontic;

@@ -9,7 +9,6 @@ use arest::parse_forml2;
 use arest::compile;
 use arest::evaluate;
 use arest::types::Violation;
-use std::collections::HashMap;
 
 // ── Metamodel ────────────────────────────────────────────────────────
 // The state machine primitives. Parsed first so business domains
@@ -152,14 +151,14 @@ fn merge_state_into(base: &ast::Object, extension: &ast::Object) -> ast::Object 
     state
 }
 
-fn compile_orders() -> (ast::Object, HashMap<String, arest::ast::Func>) {
+fn compile_orders() -> (ast::Object, ast::Object) {
     let meta_ir = parse_forml2::parse_markdown(STATE_METAMODEL).unwrap();
     let meta_state = parse_forml2::domain_to_state(&meta_ir);
     let orders_state = parse_forml2::parse_to_state_with_nouns(ORDERS_DOMAIN, &meta_state).unwrap();
     let state = merge_state_into(&meta_state, &orders_state);
     let defs = compile::compile_to_defs_state(&state);
-    let def_map: HashMap<String, arest::ast::Func> = defs.into_iter().collect();
-    (state, def_map)
+    let d = ast::defs_to_state(&defs, &state);
+    (state, d)
 }
 
 // ── Theorem 1: Grammar Unambiguity ───────────────────────────────────
@@ -219,7 +218,7 @@ fn t1_ring_vs_subset_distinguished_by_noun_types() {
 
 #[test]
 fn t2_violation_message_is_original_reading() {
-    let (state, defs) = compile_orders();
+    let (state, d) = compile_orders();
     // The forbidden constraint text should survive compilation into a def name.
     // Find the constraint fact in the state.
     let constraint_cell = ast::fetch_or_phi("Constraint", &state);
@@ -231,7 +230,7 @@ fn t2_violation_message_is_original_reading() {
     // The compiled defs should contain a constraint def whose name encodes the constraint id.
     let constraint_id = ast::binding(forbidden, "id").unwrap();
     let def_key = format!("constraint:{}", constraint_id);
-    assert!(defs.contains_key(&def_key),
+    assert!(ast::cells_iter(&d).into_iter().any(|(k, _)| k == def_key),
         "Compiled constraint def should exist for id '{}' (Corollary 7)", constraint_id);
     // The original reading text is preserved in the state, available for violation messages.
     assert!(original_text.contains("Prohibited Shipping Method"),
@@ -252,23 +251,25 @@ fn t2_constraint_text_round_trips() {
 
 #[test]
 fn t3_state_machine_initializes() {
-    let (_, defs) = compile_orders();
+    let (_, d) = compile_orders();
     // Order should have a state machine with initial state "In Cart"
-    let initial_func = defs.get("machine:Order:initial")
-        .expect("Order should have a state machine with initial def");
-    let initial = arest::ast::apply(initial_func, &arest::ast::Object::phi(), &defs);
+    let initial_obj = ast::fetch_or_phi("machine:Order:initial", &d);
+    let initial_func = ast::metacompose(&initial_obj, &d);
+    let initial = arest::ast::apply(&initial_func, &arest::ast::Object::phi(), &d);
     assert_eq!(initial.as_atom().unwrap(), "In Cart");
 }
 
 #[test]
 fn t3_forward_chain_reaches_fixed_point() {
-    let (_, defs) = compile_orders();
+    let (state, d) = compile_orders();
     let empty_state = ast::Object::phi();
-    // Extract derivation defs
-    let derivation_defs: Vec<(&str, &arest::ast::Func)> = defs.iter()
+    // Extract derivation defs from the compiled defs vec (not D)
+    let defs_vec = compile::compile_to_defs_state(&state);
+    let derivation_defs: Vec<(&str, &arest::ast::Func)> = defs_vec.iter()
         .filter(|(n, _)| n.starts_with("derivation:"))
         .map(|(n, f)| (n.as_str(), f))
         .collect();
+    let _ = &d; // d available but forward_chain uses raw defs
     // Forward chain with empty state should terminate
     let (state2, derived) = evaluate::forward_chain_defs_state(&derivation_defs, &empty_state);
     // The derived facts should be a fixed point (running again produces nothing new)
@@ -318,8 +319,8 @@ fn t3_deontic_violation_warns_but_succeeds() {
 
 #[test]
 fn t4a_transitions_from_initial_state() {
-    let (_, defs) = compile_orders();
-    let transition = defs.get("machine:Order").expect("Order machine def");
+    let (_, d) = compile_orders();
+    let transition = ast::metacompose(&ast::fetch_or_phi("machine:Order", &d), &d);
     // From "In Cart", available transitions should be "place" and "cancel"
     // Test by applying the machine function to each known event
     let all_events = ["place", "ship", "deliver", "cancel"];
@@ -329,7 +330,7 @@ fn t4a_transitions_from_initial_state() {
                 arest::ast::Object::atom("In Cart"),
                 arest::ast::Object::atom(event),
             ]);
-            let result = arest::ast::apply(transition, &input, &defs);
+            let result = arest::ast::apply(&transition, &input, &d);
             !result.is_bottom() && result.as_atom().unwrap_or("In Cart") != "In Cart"
         })
         .copied()
@@ -341,8 +342,8 @@ fn t4a_transitions_from_initial_state() {
 
 #[test]
 fn t4a_transitions_from_placed() {
-    let (_, defs) = compile_orders();
-    let transition = defs.get("machine:Order").expect("Order machine def");
+    let (_, d) = compile_orders();
+    let transition = ast::metacompose(&ast::fetch_or_phi("machine:Order", &d), &d);
     let all_events = ["place", "ship", "deliver", "cancel"];
     let from_placed: Vec<&str> = all_events.iter()
         .filter(|event| {
@@ -350,7 +351,7 @@ fn t4a_transitions_from_placed() {
                 arest::ast::Object::atom("Placed"),
                 arest::ast::Object::atom(event),
             ]);
-            let result = arest::ast::apply(transition, &input, &defs);
+            let result = arest::ast::apply(&transition, &input, &d);
             !result.is_bottom() && result.as_atom().unwrap_or("Placed") != "Placed"
         })
         .copied()
@@ -361,8 +362,8 @@ fn t4a_transitions_from_placed() {
 
 #[test]
 fn t4a_terminal_state_has_no_transitions() {
-    let (_, defs) = compile_orders();
-    let transition = defs.get("machine:Order").expect("Order machine def");
+    let (_, d) = compile_orders();
+    let transition = ast::metacompose(&ast::fetch_or_phi("machine:Order", &d), &d);
     // Delivered and Cancelled are terminal: no event should produce a different state
     let all_events = ["place", "ship", "deliver", "cancel"];
     let from_delivered: Vec<&str> = all_events.iter()
@@ -371,7 +372,7 @@ fn t4a_terminal_state_has_no_transitions() {
                 arest::ast::Object::atom("Delivered"),
                 arest::ast::Object::atom(event),
             ]);
-            let result = arest::ast::apply(transition, &input, &defs);
+            let result = arest::ast::apply(&transition, &input, &d);
             !result.is_bottom() && result.as_atom().unwrap_or("Delivered") != "Delivered"
         })
         .copied()
@@ -382,7 +383,7 @@ fn t4a_terminal_state_has_no_transitions() {
                 arest::ast::Object::atom("Cancelled"),
                 arest::ast::Object::atom(event),
             ]);
-            let result = arest::ast::apply(transition, &input, &defs);
+            let result = arest::ast::apply(&transition, &input, &d);
             !result.is_bottom() && result.as_atom().unwrap_or("Cancelled") != "Cancelled"
         })
         .copied()
@@ -393,29 +394,29 @@ fn t4a_terminal_state_has_no_transitions() {
 
 #[test]
 fn t4a_state_machine_fold_produces_correct_state() {
-    let (_, defs) = compile_orders();
-    let transition = defs.get("machine:Order").expect("Order machine def");
-    let initial_func = defs.get("machine:Order:initial").expect("Order initial def");
+    let (_, d) = compile_orders();
+    let transition = ast::metacompose(&ast::fetch_or_phi("machine:Order", &d), &d);
+    let initial_func = ast::metacompose(&ast::fetch_or_phi("machine:Order:initial", &d), &d);
     // Get initial state
-    let mut state = arest::ast::apply(initial_func, &arest::ast::Object::phi(), &defs);
+    let mut state = arest::ast::apply(&initial_func, &arest::ast::Object::phi(), &d);
     // Fold: In Cart -> place -> Placed -> ship -> Shipped -> deliver -> Delivered
     for event in &["place", "ship", "deliver"] {
         let input = arest::ast::Object::seq(vec![state, arest::ast::Object::atom(event)]);
-        state = arest::ast::apply(transition, &input, &defs);
+        state = arest::ast::apply(&transition, &input, &d);
     }
     assert_eq!(state.as_atom().unwrap(), "Delivered");
 }
 
 #[test]
 fn t4a_invalid_event_preserves_state() {
-    let (_, defs) = compile_orders();
-    let transition = defs.get("machine:Order").expect("Order machine def");
+    let (_, d) = compile_orders();
+    let transition = ast::metacompose(&ast::fetch_or_phi("machine:Order", &d), &d);
     // "ship" from "In Cart" is invalid. State should stay "In Cart".
     let input = arest::ast::Object::seq(vec![
         arest::ast::Object::atom("In Cart"),
         arest::ast::Object::atom("ship"),
     ]);
-    let result = arest::ast::apply(transition, &input, &defs);
+    let result = arest::ast::apply(&transition, &input, &d);
     // Invalid event returns bottom or the same state
     let state = result.as_atom().unwrap_or("In Cart");
     assert_eq!(state, "In Cart", "Invalid event should not change state");
@@ -423,14 +424,14 @@ fn t4a_invalid_event_preserves_state() {
 
 #[test]
 fn t4a_cancel_from_multiple_states() {
-    let (_, defs) = compile_orders();
-    let transition = defs.get("machine:Order").expect("Order machine def");
-    let initial_func = defs.get("machine:Order:initial").expect("Order initial def");
+    let (_, d) = compile_orders();
+    let transition = ast::metacompose(&ast::fetch_or_phi("machine:Order", &d), &d);
+    let initial_func = ast::metacompose(&ast::fetch_or_phi("machine:Order:initial", &d), &d);
     let fold = |events: &[&str]| -> String {
-        let mut state = arest::ast::apply(initial_func, &arest::ast::Object::phi(), &defs);
+        let mut state = arest::ast::apply(&initial_func, &arest::ast::Object::phi(), &d);
         for event in events {
             let input = arest::ast::Object::seq(vec![state.clone(), arest::ast::Object::atom(event)]);
-            let result = arest::ast::apply(transition, &input, &defs);
+            let result = arest::ast::apply(&transition, &input, &d);
             if result.is_bottom() {
                 // Invalid event: state unchanged
             } else {
@@ -501,8 +502,8 @@ fn t5_derivation_rule_parsed() {
 
 #[test]
 fn c6_terminal_states_are_derived() {
-    let (_, defs) = compile_orders();
-    let transition = defs.get("machine:Order").expect("Order machine def");
+    let (_, d) = compile_orders();
+    let transition = ast::metacompose(&ast::fetch_or_phi("machine:Order", &d), &d);
     // All known states and events from the domain
     let all_states = ["In Cart", "Placed", "Shipped", "Delivered", "Cancelled"];
     let all_events = ["place", "ship", "deliver", "cancel"];
@@ -514,7 +515,7 @@ fn c6_terminal_states_are_derived() {
                     arest::ast::Object::atom(state),
                     arest::ast::Object::atom(event),
                 ]);
-                let result = arest::ast::apply(transition, &input, &defs);
+                let result = arest::ast::apply(&transition, &input, &d);
                 result.is_bottom() || result.as_atom().unwrap_or(state) == **state
             })
         })
@@ -528,12 +529,13 @@ fn c6_terminal_states_are_derived() {
 
 #[test]
 fn c7_deontic_violation_returns_reading_text() {
-    let (state, defs) = compile_orders();
+    let (state, d) = compile_orders();
+    let defs_vec = compile::compile_to_defs_state(&state);
     let ctx = arest::ast::encode_eval_context_state("We will ship your order overnight for fast delivery", None, &state);
-    let violations: Vec<_> = defs.iter()
+    let violations: Vec<_> = defs_vec.iter()
         .filter(|(n, _)| n.starts_with("constraint:"))
         .flat_map(|(name, func)| {
-            let result = arest::ast::apply(func, &ctx, &defs);
+            let result = arest::ast::apply(func, &ctx, &d);
             let is_deontic = name.contains("obligatory") || name.contains("forbidden");
             arest::ast::decode_violations(&result).into_iter().map(move |mut v| { v.alethic = !is_deontic; v })
         })
@@ -553,14 +555,11 @@ fn c8_ingesting_new_readings_preserves_properties() {
     use arest::ast::{self, Object};
 
     // Start with orders domain (metamodel + orders, same as compile_orders)
-    let (state1, def_map1) = compile_orders();
+    let (state1, d1) = compile_orders();
 
     // Verify Order machine initial state via the initial def
-    let initial1 = ast::apply(
-        def_map1.get("machine:Order:initial").expect("Order machine initial"),
-        &Object::phi(),
-        &def_map1,
-    );
+    let initial1_func = ast::metacompose(&ast::fetch_or_phi("machine:Order:initial", &d1), &d1);
+    let initial1 = ast::apply(&initial1_func, &Object::phi(), &d1);
 
     // Add a new reading (new entity type + constraint)
     let extension = r#"
@@ -586,30 +585,27 @@ Each Order has at most one Coupon.
     let ext_state = parse_forml2::parse_to_state_with_nouns(extension, &state1).unwrap();
     let state2 = merge_state_into(&state1, &ext_state);
     let defs2 = compile::compile_to_defs_state(&state2);
-    let def_map2: HashMap<String, ast::Func> = defs2.into_iter().collect();
+    let d2 = ast::defs_to_state(&defs2, &state2);
 
     // Original properties still hold
-    let initial2 = ast::apply(
-        def_map2.get("machine:Order:initial").expect("Order machine initial after merge"),
-        &Object::phi(),
-        &def_map2,
-    );
+    let initial2_func = ast::metacompose(&ast::fetch_or_phi("machine:Order:initial", &d2), &d2);
+    let initial2 = ast::apply(&initial2_func, &Object::phi(), &d2);
     assert_eq!(initial2.to_string(), initial1.to_string(),
         "Initial state unchanged after self-modification");
 
     // New constraint is present
-    assert!(def_map2.keys().any(|k| k.starts_with("constraint:") && k.contains("Coupon")),
+    assert!(ast::cells_iter(&d2).into_iter().any(|(k, _)| k.starts_with("constraint:") && k.contains("Coupon")),
         "New constraint should be present after self-modification");
 
     // State machine fold still works via defs
-    let machine = def_map2.get("machine:Order").expect("Order machine def");
-    let mut state = initial2.to_string();
+    let machine = ast::metacompose(&ast::fetch_or_phi("machine:Order", &d2), &d2);
+    let mut sm_state = initial2.to_string();
     for event in &["place", "ship"] {
-        let input = Object::seq(vec![Object::atom(&state), Object::atom(event)]);
-        let result = ast::apply(machine, &input, &def_map2);
-        state = result.to_string();
+        let input = Object::seq(vec![Object::atom(&sm_state), Object::atom(event)]);
+        let result = ast::apply(&machine, &input, &d2);
+        sm_state = result.to_string();
     }
-    assert_eq!(state, "Shipped");
+    assert_eq!(sm_state, "Shipped");
 }
 
 // ── Remark: World Assumption on Populating Functions ─────────────────
@@ -661,8 +657,8 @@ It is forbidden that Response reveals Implementation Detail.
 
 #[test]
 fn def2_state_machine_is_deterministic() {
-    let (_, defs) = compile_orders();
-    let transition = defs.get("machine:Order").expect("Order machine def");
+    let (_, d) = compile_orders();
+    let transition = ast::metacompose(&ast::fetch_or_phi("machine:Order", &d), &d);
     // For each (from, event) pair, applying the function is deterministic.
     // Apply twice and ensure identical results (Definition 2).
     let all_states = ["In Cart", "Placed", "Shipped", "Delivered", "Cancelled"];
@@ -673,8 +669,8 @@ fn def2_state_machine_is_deterministic() {
                 arest::ast::Object::atom(state),
                 arest::ast::Object::atom(event),
             ]);
-            let result1 = arest::ast::apply(transition, &input, &defs);
-            let result2 = arest::ast::apply(transition, &input, &defs);
+            let result1 = arest::ast::apply(&transition, &input, &d);
+            let result2 = arest::ast::apply(&transition, &input, &d);
             assert_eq!(result1, result2,
                 "Non-deterministic: ({}, {}) produced different results", state, event);
         }
@@ -729,16 +725,16 @@ fn paper_claim_compile_from_population() {
 #[test]
 fn paper_claim_population_round_trip() {
     // Parse to state, compile, run state machine. Same result as Domain path.
-    let (_, def_map) = compile_orders();
-    let transition = def_map.get("machine:Order").expect("Should have Order machine from state");
-    let initial = def_map.get("machine:Order:initial").expect("Should have Order initial");
-    let init_state = arest::ast::apply(initial, &arest::ast::Object::phi(), &def_map);
+    let (_, d) = compile_orders();
+    let transition = ast::metacompose(&ast::fetch_or_phi("machine:Order", &d), &d);
+    let initial = ast::metacompose(&ast::fetch_or_phi("machine:Order:initial", &d), &d);
+    let init_state = arest::ast::apply(&initial, &arest::ast::Object::phi(), &d);
     assert_eq!(init_state.as_atom().unwrap(), "In Cart");
     // Fold: In Cart -> place -> Placed -> ship -> Shipped -> deliver -> Delivered
     let mut state = init_state;
     for event in &["place", "ship", "deliver"] {
         let inp = arest::ast::Object::seq(vec![state, arest::ast::Object::atom(event)]);
-        state = arest::ast::apply(transition, &inp, &def_map);
+        state = arest::ast::apply(&transition, &inp, &d);
     }
     assert_eq!(state.as_atom().unwrap(), "Delivered");
 }
@@ -794,21 +790,14 @@ fn ffp_state_machine_is_a_function() {
 fn ffp_evaluation_is_application() {
     use arest::ast::{self, Object};
 
-    let (state, _) = compile_orders();
-
-    let defs: Vec<(String, arest::ast::Func)> = compile::compile_to_defs_state(&state);
-    let def_map: HashMap<String, arest::ast::Func> = defs.iter().map(|(n, f)| (n.clone(), f.clone())).collect();
+    let (_, d) = compile_orders();
 
     // Find the Order state machine transition function and initial state
-    let (_, transition_func) = defs.iter()
-        .find(|(name, _)| name == "machine:Order")
-        .expect("Order transition function");
-    let (_, initial_func) = defs.iter()
-        .find(|(name, _)| name == "machine:Order:initial")
-        .expect("Order initial state");
+    let transition_func = ast::metacompose(&ast::fetch_or_phi("machine:Order", &d), &d);
+    let initial_func = ast::metacompose(&ast::fetch_or_phi("machine:Order:initial", &d), &d);
 
     // Get initial state by applying the constant function
-    let initial = ast::apply(initial_func, &Object::phi(), &def_map);
+    let initial = ast::apply(&initial_func, &Object::phi(), &d);
     assert_eq!(initial.as_atom(), Some("In Cart"));
 
     // Fold the transition function over the event stream.
@@ -817,7 +806,7 @@ fn ffp_evaluation_is_application() {
     let mut state = initial;
     for event in &events {
         let input = Object::seq(vec![state, Object::atom(event)]);
-        state = ast::apply(transition_func, &input, &def_map);
+        state = ast::apply(&transition_func, &input, &d);
     }
     assert_eq!(state.as_atom(), Some("Delivered"),
         "State machine evaluation is a fold of the transition function over events");
@@ -896,7 +885,7 @@ fn law_i1_construction_distributes_over_composition() {
     // [f1,...,fn]∘g = [f1∘g,...,fn∘g]
     // Construction of composed functions = composition of constructions
     use arest::ast::{self, Func, Object};
-    let defs = HashMap::new();
+    let defs = ast::Object::phi();
 
     // f1 = selector 1, f2 = selector 2, g = reverse
     // [s1, s2] ∘ reverse applied to <A, B> should equal [s1∘reverse, s2∘reverse] applied to <A, B>
@@ -925,7 +914,7 @@ fn law_i1_construction_distributes_over_composition() {
 fn law_i5_selector_extracts_from_construction() {
     // s∘[f1,...,fn] ≤ fs (selector s extracts the sth element)
     use arest::ast::{self, Func, Object};
-    let defs = HashMap::new();
+    let defs = ast::Object::phi();
 
     let input = Object::atom("X");
 
@@ -948,7 +937,7 @@ fn law_i5_selector_extracts_from_construction() {
 fn law_iii4_apply_to_all_distributes_over_composition() {
     // α(f∘g) = αf ∘ αg
     use arest::ast::{self, Func, Object};
-    let defs = HashMap::new();
+    let defs = ast::Object::phi();
 
     // f = selector 1, g = reverse
     // Input: <<1,2>, <3,4>>
@@ -979,7 +968,7 @@ fn law_iii4_apply_to_all_distributes_over_composition() {
 fn law_iii1_constant_absorbs_composition() {
     // x̄ ∘ f = x̄ (constant composed with anything is still constant)
     use arest::ast::{self, Func, Object};
-    let defs = HashMap::new();
+    let defs = ast::Object::phi();
 
     let constant_a = Func::constant(Object::atom("A"));
     let composed = Func::compose(constant_a.clone(), Func::Selector(1));
@@ -995,7 +984,7 @@ fn law_iii1_constant_absorbs_composition() {
 fn law_iii2_composition_with_identity() {
     // f∘id = id∘f = f
     use arest::ast::{self, Func, Object};
-    let defs = HashMap::new();
+    let defs = ast::Object::phi();
 
     let f = Func::Selector(1);
     let input = Object::seq(vec![Object::atom("A"), Object::atom("B")]);
@@ -1015,7 +1004,7 @@ fn law_iii2_composition_with_identity() {
 fn law_insert_fold_right() {
     // /f:<x1,...,xn> = f:<x1, /f:<x2,...,xn>>
     use arest::ast::{self, Func, Object};
-    let defs = HashMap::new();
+    let defs = ast::Object::phi();
 
     // /+:<1,2,3> should equal +:<1, +:<2, 3>> = +:<1, 5> = 6
     // But we use atoms, so test with a function we can verify.
@@ -1038,7 +1027,7 @@ fn law_insert_fold_right() {
 fn law_condition_selects_branch() {
     // (p → f; g):x = f:x if p:x = T, g:x if p:x = F
     use arest::ast::{self, Func, Object};
-    let defs = HashMap::new();
+    let defs = ast::Object::phi();
 
     // Predicate: eq∘[s1, s2] (are first two elements equal?)
     let pred = Func::compose(Func::Eq, Func::construction(vec![Func::Selector(1), Func::Selector(2)]));
@@ -1064,16 +1053,13 @@ fn law_condition_selects_branch() {
 
 #[test]
 fn hateoas_transition_links_via_application() {
-    use arest::ast::{self, Func, Object};
+    use arest::ast::{self, Object};
 
-    let (state, _) = compile_orders();
-
-    let defs: Vec<(String, Func)> = compile::compile_to_defs_state(&state);
-    let def_map: HashMap<String, Func> = defs.iter().map(|(n, f)| (n.clone(), f.clone())).collect();
+    let (_, d) = compile_orders();
 
     // The transition function applied to <current_state, event> produces next_state.
     // Available links = all events where transition:<current_state, event> != bottom.
-    let transition = def_map.get("machine:Order").expect("Order transition func");
+    let transition = ast::metacompose(&ast::fetch_or_phi("machine:Order", &d), &d);
 
     // From "In Cart", test which events produce a state change.
     // A valid transition changes the state. An invalid one preserves it.
@@ -1083,7 +1069,7 @@ fn hateoas_transition_links_via_application() {
     let mut available_from_cart: Vec<&str> = vec![];
     for event in &events {
         let input = Object::seq(vec![Object::atom(current), Object::atom(event)]);
-        let result = ast::apply(transition, &input, &def_map);
+        let result = ast::apply(&transition, &input, &d);
         if let Some(next) = result.as_atom() {
             if next != current {
                 available_from_cart.push(event);
@@ -1100,7 +1086,7 @@ fn hateoas_transition_links_via_application() {
     let mut available_from_delivered: Vec<&str> = vec![];
     for event in &events {
         let input = Object::seq(vec![Object::atom(current), Object::atom(event)]);
-        let result = ast::apply(transition, &input, &def_map);
+        let result = ast::apply(&transition, &input, &d);
         if let Some(next) = result.as_atom() {
             if next != current {
                 available_from_delivered.push(event);
@@ -1116,10 +1102,9 @@ fn hateoas_transition_links_via_application() {
 fn constraint_evaluation_via_application() {
     use arest::ast::{self, Func, Object};
 
-    let (state, _) = compile_orders();
+    let (state, d) = compile_orders();
 
     let defs: Vec<(String, Func)> = compile::compile_to_defs_state(&state);
-    let def_map: HashMap<String, Func> = defs.iter().map(|(n, f)| (n.clone(), f.clone())).collect();
 
     // Find the obligatory constraint (these are response-scoped)
     let (_, _constraint_func) = defs.iter()
@@ -1147,7 +1132,7 @@ fn constraint_evaluation_via_application() {
         Object::phi(),
         Object::phi(),
     ]);
-    let result = ast::apply(uc_func, &context, &def_map);
+    let result = ast::apply(uc_func, &context, &d);
     // UC against empty population: no facts = no violations for UC
     assert_eq!(result, Object::phi(),
         "UC constraint against empty population should produce no violations");
@@ -1174,7 +1159,7 @@ fn constraint_evaluation_via_application() {
     let (_, placed_by_uc) = defs.iter()
         .find(|(name, _)| name.contains("constraint:") && name.contains("at most one") && name.contains("placed by"))
         .expect("UC on placed by");
-    let violation_result = ast::apply(placed_by_uc, &context_with_violation, &def_map);
+    let violation_result = ast::apply(placed_by_uc, &context_with_violation, &d);
     assert_ne!(violation_result, Object::phi(),
         "UC violation: Order ord-1 placed by two Customers should violate");
 }
@@ -1224,7 +1209,7 @@ It is forbidden that Support Response contains Prohibited Word.
     let ir = parse_forml2::parse_markdown(input).unwrap();
     let domain_state = parse_forml2::domain_to_state(&ir);
     let defs = compile::compile_to_defs_state(&domain_state);
-    let def_map: HashMap<String, ast::Func> = defs.iter().map(|(n, f)| (n.clone(), f.clone())).collect();
+    let d = ast::defs_to_state(&defs, &domain_state);
 
     // Helper: evaluate constraints via defs path
     let eval = |text: &str| -> Vec<Violation> {
@@ -1233,7 +1218,7 @@ It is forbidden that Support Response contains Prohibited Word.
         defs.iter()
             .filter(|(n, _)| n.starts_with("constraint:"))
             .flat_map(|(name, func)| {
-                let result = ast::apply(func, &ctx_obj, &def_map);
+                let result = ast::apply(func, &ctx_obj, &d);
                 let is_deontic = name.contains("obligatory") || name.contains("forbidden");
                 ast::decode_violations(&result).into_iter().map(move |mut v| {
                     v.alethic = !is_deontic;
@@ -1277,7 +1262,7 @@ It is forbidden that Support Response contains Prohibited Word.
     let ir = parse_forml2::parse_markdown(input).unwrap();
     let domain_state = parse_forml2::domain_to_state(&ir);
     let defs: Vec<(String, Func)> = compile::compile_to_defs_state(&domain_state);
-    let def_map: HashMap<String, Func> = defs.iter().map(|(n, f)| (n.clone(), f.clone())).collect();
+    let d = ast::defs_to_state(&defs, &domain_state);
 
     // Find the forbidden constraint
     let (_, constraint_func) = defs.iter()
@@ -1290,7 +1275,7 @@ It is forbidden that Support Response contains Prohibited Word.
         Object::phi(),
         Object::phi(),
     ]);
-    let bad_result = ast::apply(constraint_func, &bad_ctx, &def_map);
+    let bad_result = ast::apply(constraint_func, &bad_ctx, &d);
     assert_ne!(bad_result, Object::phi(),
         "Forbidden constraint via pure application should catch 'overnight'");
 
@@ -1300,7 +1285,7 @@ It is forbidden that Support Response contains Prohibited Word.
         Object::phi(),
         Object::phi(),
     ]);
-    let good_result = ast::apply(constraint_func, &good_ctx, &def_map);
+    let good_result = ast::apply(constraint_func, &good_ctx, &d);
     assert_eq!(good_result, Object::phi(),
         "Forbidden constraint via pure application should pass clean text");
 }
@@ -1332,7 +1317,7 @@ fn derivation_rules_are_functions() {
 
 #[test]
 fn self_modification_extends_definitions() {
-    use arest::ast::{self, Func, Object};
+    use arest::ast::Func;
 
     let (state, _) = compile_orders();
 
@@ -1381,7 +1366,7 @@ Each Order has at most one Coupon.
 #[test]
 fn metacomposition_fact_receives_operation() {
     use arest::ast::{self, Func, Object};
-    let defs = HashMap::new();
+    let defs = ast::Object::phi();
 
     // A fact type CONS(s1, s2) applied to <A, B> produces <A, B> (the fact).
     // The fact is a function: it receives an operation and applies it.
@@ -1435,14 +1420,15 @@ fn rho_resolves_fact_type_and_applies_operation() {
     // For an atom, it looks up DEFS.
     // For a sequence, the first element is the controlling operator.
 
-    let mut defs = HashMap::new();
-
-    // Define a handler: when applied to any argument, returns "handled"
-    defs.insert("Customer_has_Email".to_string(), Func::constant(Object::atom("handled")));
+    // Build D as an Object with a cell for "Customer_has_Email"
+    let defs_vec: Vec<(String, Func)> = vec![
+        ("Customer_has_Email".to_string(), Func::constant(Object::atom("handled"))),
+    ];
+    let d = ast::defs_to_state(&defs_vec, &Object::phi());
 
     // An atom resolves to its definition
-    let func = ast::metacompose(&Object::atom("Customer_has_Email"), &defs);
-    let result = ast::apply(&func, &Object::atom("read"), &defs);
+    let func = ast::metacompose(&Object::atom("Customer_has_Email"), &d);
+    let result = ast::apply(&func, &Object::atom("read"), &d);
     assert_eq!(result.as_atom(), Some("handled"),
         "metacompose should resolve atom to its definition in DEFS");
 
@@ -1454,9 +1440,9 @@ fn rho_resolves_fact_type_and_applies_operation() {
         Object::atom("1"),  // selector 1
         Object::atom("2"),  // selector 2
     ]);
-    let cons_func = ast::metacompose(&cons_obj, &defs);
+    let cons_func = ast::metacompose(&cons_obj, &d);
     let input = Object::seq(vec![Object::atom("A"), Object::atom("B"), Object::atom("C")]);
-    let result = ast::apply(&cons_func, &input, &defs);
+    let result = ast::apply(&cons_func, &input, &d);
     // [s1, s2]:<A, B, C> = <s1:<A,B,C>, s2:<A,B,C>> = <A, B>
     if let Some(elements) = result.as_seq() {
         assert_eq!(elements[0].as_atom(), Some("A"));
@@ -1470,7 +1456,7 @@ fn rho_resolves_fact_type_and_applies_operation() {
 fn rho_returns_bottom_for_unknown_fact_type() {
     use arest::ast::{self, Object};
 
-    let defs = HashMap::new();
+    let defs = ast::Object::phi();
     let fact = Object::seq(vec![Object::atom("unknown_type"), Object::atom("value")]);
     let result = {
         let func = ast::metacompose(&fact, &defs);
@@ -1506,7 +1492,7 @@ fn hateoas_nav_defs_produced() {
 fn system_operand_fetch_retrieves_cells() {
     use arest::ast::{self, Object};
 
-    let (state, defs) = compile_orders();
+    let (state, _d) = compile_orders();
 
     // Construct operand per Backus 14.4.2: <CELL:KEY, CELL:INPUT, CELL:FILE, ...defs>
     let key_cell = ast::cell("KEY", Object::atom("machine:Order:initial"));
@@ -1525,13 +1511,13 @@ fn system_operand_fetch_retrieves_cells() {
 fn transitions_def_returns_available_from_status() {
     use arest::ast::{self, Object};
 
-    let (_, defs) = compile_orders();
+    let (_, d) = compile_orders();
 
     // transitions:Order should be a DEFS entry
-    let transitions_func = defs.get("transitions:Order").expect("Should have transitions:Order def");
+    let transitions_func = ast::metacompose(&ast::fetch_or_phi("transitions:Order", &d), &d);
 
     // From "In Cart", place and cancel should be available
-    let result = ast::apply(transitions_func, &Object::atom("In Cart"), &defs);
+    let result = ast::apply(&transitions_func, &Object::atom("In Cart"), &d);
     let items = result.as_seq().expect("Should return a sequence");
     assert!(!items.is_empty(), "Should have transitions from In Cart");
 
@@ -1542,7 +1528,7 @@ fn transitions_def_returns_available_from_status() {
     assert!(events.contains(&"place"), "Should have place transition");
 
     // From "Delivered" (terminal), no transitions
-    let terminal = ast::apply(transitions_func, &Object::atom("Delivered"), &defs);
+    let terminal = ast::apply(&transitions_func, &Object::atom("Delivered"), &d);
     let terminal_items = terminal.as_seq().unwrap_or(&[]);
     assert!(terminal_items.is_empty(), "Terminal state should have no transitions");
 }
@@ -1553,10 +1539,9 @@ fn transitions_def_returns_available_from_status() {
 fn sm_init_derivation_produces_facts() {
     use arest::ast::{self, Func, Object};
 
-    let (state, _) = compile_orders();
+    let (state, d) = compile_orders();
 
     let defs: Vec<(String, Func)> = compile::compile_to_defs_state(&state);
-    let def_map: HashMap<String, Func> = defs.iter().map(|(n, f)| (n.clone(), f.clone())).collect();
 
     // Find the SM init derivation
     let sm_init = defs.iter().find(|(n, _)| n.contains("sm_init")).expect("SM init def should exist");
@@ -1581,10 +1566,10 @@ fn sm_init_derivation_produces_facts() {
             ast::Func::construction(vec![ast::Func::constant(Object::atom("forResource")), ast::Func::Id]),
         ]),
     ]);
-    let one_fact_result = ast::apply(&make_one_fact, &Object::atom("ord-1"), &def_map);
+    let one_fact_result = ast::apply(&make_one_fact, &Object::atom("ord-1"), &d);
     eprintln!("make_one_fact : ord-1 = {}", one_fact_result);
 
-    let result = ast::apply(&sm_init.1, &pop_obj, &def_map);
+    let result = ast::apply(&sm_init.1, &pop_obj, &d);
     eprintln!("SM init raw result: {}", result);
 
     // Check it is not empty
@@ -1600,8 +1585,9 @@ fn sm_init_derivation_produces_facts() {
 #[test]
 fn create_entity_via_defs_produces_entity_and_status() {
     use arest::ast::Func;
+    use std::collections::HashMap;
 
-    let (state, def_map) = compile_orders();
+    let (state, d) = compile_orders();
 
     let defs: Vec<(String, Func)> = compile::compile_to_defs_state(&state);
 
@@ -1615,7 +1601,7 @@ fn create_entity_via_defs_produces_entity_and_status() {
         fields,
     };
 
-    let result = arest::arest::apply_command_defs(&def_map, &command, &state);
+    let result = arest::arest::apply_command_defs(&d, &command, &state);
 
     eprintln!("derived_count: {}", result.derived_count);
     eprintln!("status: {:?}", result.status);
@@ -1639,9 +1625,9 @@ fn create_entity_via_defs_produces_entity_and_status() {
 
 #[test]
 fn transition_via_defs_changes_status() {
-    use arest::ast::Func;
+    use std::collections::HashMap;
 
-    let (state, def_map) = compile_orders();
+    let (state, d) = compile_orders();
 
     // First create an entity to get a state with SM status
     let mut fields = HashMap::new();
@@ -1652,7 +1638,7 @@ fn transition_via_defs_changes_status() {
         id: Some("ord-1".to_string()),
         fields,
     };
-    let create_result = arest::arest::apply_command_defs(&def_map, &create_cmd, &state);
+    let create_result = arest::arest::apply_command_defs(&d, &create_cmd, &state);
     assert_eq!(create_result.status, Some("In Cart".to_string()));
 
     // Now transition: place the order
@@ -1662,7 +1648,7 @@ fn transition_via_defs_changes_status() {
         domain: "orders".to_string(),
         current_status: Some("In Cart".to_string()),
     };
-    let result = arest::arest::apply_command_defs(&def_map, &transition_cmd, &create_result.state);
+    let result = arest::arest::apply_command_defs(&d, &transition_cmd, &create_result.state);
 
     assert_eq!(result.status, Some("Placed".to_string()));
 }
@@ -1676,20 +1662,21 @@ fn transition_via_defs_changes_status() {
 
 #[test]
 fn agent_defs_produced_for_nouns_with_facts() {
-    let (_pop, defs) = compile_orders();
-    let agent_defs: Vec<_> = defs.iter()
+    let (_pop, d) = compile_orders();
+    let agent_defs: Vec<_> = ast::cells_iter(&d).into_iter()
         .filter(|(n, _)| n.starts_with("agent:"))
         .collect();
     assert!(!agent_defs.is_empty(), "Should produce agent defs");
     // Order should have an agent def
-    assert!(defs.contains_key("agent:Order"), "Order should have agent def");
+    assert!(ast::cells_iter(&d).into_iter().any(|(k, _)| k == "agent:Order"), "Order should have agent def");
 }
 
 #[test]
 fn agent_def_contains_role_and_fact_types() {
-    let (_pop, defs) = compile_orders();
-    let agent_order = defs.get("agent:Order").expect("agent:Order missing");
-    let obj = match agent_order {
+    let (_pop, d) = compile_orders();
+    let agent_order_obj = ast::fetch_or_phi("agent:Order", &d);
+    let agent_order = ast::metacompose(&agent_order_obj, &d);
+    let obj = match &agent_order {
         arest::ast::Func::Constant(obj) => obj,
         _ => panic!("agent def should be Func::Constant"),
     };
@@ -1701,8 +1688,8 @@ fn agent_def_contains_role_and_fact_types() {
 
 #[test]
 fn agent_def_contains_transitions_for_sm_noun() {
-    let (_pop, defs) = compile_orders();
-    let agent_order = defs.get("agent:Order").expect("agent:Order missing");
+    let (_pop, d) = compile_orders();
+    let agent_order = ast::metacompose(&ast::fetch_or_phi("agent:Order", &d), &d);
     let text = format!("{:?}", agent_order);
     assert!(text.contains("transitions"), "Order agent should have transitions");
     assert!(text.contains("place") || text.contains("ship"), "Order agent should list SM events");
@@ -1710,28 +1697,28 @@ fn agent_def_contains_transitions_for_sm_noun() {
 
 #[test]
 fn agent_def_contains_deontic_rules() {
-    let (_pop, defs) = compile_orders();
-    let agent_order = defs.get("agent:Order").expect("agent:Order missing");
+    let (_pop, d) = compile_orders();
+    let agent_order = ast::metacompose(&ast::fetch_or_phi("agent:Order", &d), &d);
     let text = format!("{:?}", agent_order);
     assert!(text.contains("deontic"), "Order agent should have deontic section");
 }
 
 #[test]
 fn ilayer_defs_produced_for_nouns() {
-    let (_pop, defs) = compile_orders();
-    let ilayer_defs: Vec<_> = defs.iter()
+    let (_pop, d) = compile_orders();
+    let ilayer_defs: Vec<_> = ast::cells_iter(&d).into_iter()
         .filter(|(n, _)| n.starts_with("ilayer:"))
         .collect();
     assert!(!ilayer_defs.is_empty(), "Should produce ilayer defs");
-    assert!(defs.contains_key("ilayer:Order"), "Order should have ilayer def");
-    assert!(defs.contains_key("ilayer:Customer"), "Customer should have ilayer def");
+    assert!(ast::cells_iter(&d).into_iter().any(|(k, _)| k == "ilayer:Order"), "Order should have ilayer def");
+    assert!(ast::cells_iter(&d).into_iter().any(|(k, _)| k == "ilayer:Customer"), "Customer should have ilayer def");
 }
 
 #[test]
 fn ilayer_def_contains_object_type_and_facts() {
-    let (_pop, defs) = compile_orders();
-    let ilayer = defs.get("ilayer:Order").expect("ilayer:Order missing");
-    let obj = match ilayer {
+    let (_pop, d) = compile_orders();
+    let ilayer = ast::metacompose(&ast::fetch_or_phi("ilayer:Order", &d), &d);
+    let obj = match &ilayer {
         arest::ast::Func::Constant(obj) => obj,
         _ => panic!("ilayer def should be Func::Constant"),
     };
@@ -1742,8 +1729,8 @@ fn ilayer_def_contains_object_type_and_facts() {
 
 #[test]
 fn sql_defs_produced_for_tables() {
-    let (_pop, defs) = compile_orders();
-    let sql_defs: Vec<_> = defs.iter()
+    let (_pop, d) = compile_orders();
+    let sql_defs: Vec<_> = ast::cells_iter(&d).into_iter()
         .filter(|(n, _)| n.starts_with("sql:"))
         .collect();
     assert!(!sql_defs.is_empty(), "Should produce sql defs");
@@ -1751,13 +1738,15 @@ fn sql_defs_produced_for_tables() {
 
 #[test]
 fn sql_def_contains_create_table() {
-    let (_pop, defs) = compile_orders();
-    let sql_defs: Vec<_> = defs.iter()
+    let (_pop, d) = compile_orders();
+    let sql_cells: Vec<_> = ast::cells_iter(&d).into_iter()
         .filter(|(n, _)| n.starts_with("sql:"))
+        .map(|(n, _)| n.to_string())
         .collect();
-    for (name, func) in &sql_defs {
-        let obj = match func {
-            arest::ast::Func::Constant(obj) => obj,
+    for name in &sql_cells {
+        let func = ast::metacompose(&ast::fetch_or_phi(name, &d), &d);
+        let obj = match &func {
+            arest::ast::Func::Constant(obj) => obj.clone(),
             _ => panic!("{} should be Func::Constant", name),
         };
         let text = format!("{:?}", obj);
@@ -1767,8 +1756,8 @@ fn sql_def_contains_create_table() {
 
 #[test]
 fn test_defs_produced_for_constraints() {
-    let (_pop, defs) = compile_orders();
-    let test_defs: Vec<_> = defs.iter()
+    let (_pop, d) = compile_orders();
+    let test_defs: Vec<_> = ast::cells_iter(&d).into_iter()
         .filter(|(n, _)| n.starts_with("test:"))
         .collect();
     assert!(!test_defs.is_empty(), "Should produce test defs");
@@ -1776,13 +1765,15 @@ fn test_defs_produced_for_constraints() {
 
 #[test]
 fn test_def_contains_constraint_metadata() {
-    let (_pop, defs) = compile_orders();
-    let test_defs: Vec<_> = defs.iter()
+    let (_pop, d) = compile_orders();
+    let test_names: Vec<_> = ast::cells_iter(&d).into_iter()
         .filter(|(n, _)| n.starts_with("test:"))
+        .map(|(n, _)| n.to_string())
         .collect();
-    for (name, func) in &test_defs {
-        let obj = match func {
-            arest::ast::Func::Constant(obj) => obj,
+    for name in &test_names {
+        let func = ast::metacompose(&ast::fetch_or_phi(name, &d), &d);
+        let obj = match &func {
+            arest::ast::Func::Constant(obj) => obj.clone(),
             _ => panic!("{} should be Func::Constant", name),
         };
         let text = format!("{:?}", obj);

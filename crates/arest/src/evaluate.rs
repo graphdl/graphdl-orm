@@ -18,10 +18,10 @@ pub(crate) fn run_machine_ast(
     machine: &crate::compile::CompiledStateMachine,
     events: &[&str],
 ) -> String {
-    let defs = std::collections::HashMap::new();
+    let empty = ast::Object::phi();
     events.iter().fold(machine.initial.clone(), |state, event| {
         let input = ast::Object::seq(vec![ast::Object::atom(&state), ast::Object::atom(event)]);
-        ast::apply(&machine.func, &input, &defs)
+        ast::apply(&machine.func, &input, &empty)
             .as_atom().map(|s| s.to_string())
             .unwrap_or(state)
     })
@@ -58,19 +58,19 @@ pub fn forward_chain_defs_state(
     derivation_defs: &[(&str, &ast::Func)],
     state: &ast::Object,
 ) -> (ast::Object, Vec<DerivedFact>) {
-    let defs = std::collections::HashMap::new();
+    let empty_d = ast::Object::phi();
 
     /// Apply all derivation rules once, returning novel facts.
     fn derive_one_round(
         derivation_defs: &[(&str, &ast::Func)],
         current_state: &ast::Object,
         all_derived: &[DerivedFact],
-        defs: &std::collections::HashMap<String, ast::Func>,
+        d: &ast::Object,
     ) -> Vec<DerivedFact> {
         let pop_obj = ast::encode_state(current_state);
         derivation_defs.iter()
             .flat_map(|(name, func)| {
-                let result = ast::apply(func, &pop_obj, defs);
+                let result = ast::apply(func, &pop_obj, d);
                 let name = name.to_string();
                 result.as_seq().into_iter()
                     .flat_map(move |items| items.iter().cloned().collect::<Vec<_>>())
@@ -92,7 +92,7 @@ pub fn forward_chain_defs_state(
         (state.clone(), Vec::<DerivedFact>::new(), false),
         |(current_state, all_derived, done), _| {
             if done { return (current_state, all_derived, true); }
-            let new_facts = derive_one_round(derivation_defs, &current_state, &all_derived, &defs);
+            let new_facts = derive_one_round(derivation_defs, &current_state, &all_derived, &empty_d);
             if new_facts.is_empty() {
                 (current_state, all_derived, true)
             } else {
@@ -485,8 +485,8 @@ mod tests {
     }
 
     /// Convert an IR Domain to defs by compiling directly.
-    /// Returns (metamodel_state, defs_vec, def_map).
-    fn ir_to_defs(ir: &Domain) -> (ast::Object, Vec<(String, ast::Func)>, HashMap<String, ast::Func>) {
+    /// Returns (metamodel_state, defs_vec, defs_object).
+    fn ir_to_defs(ir: &Domain) -> (ast::Object, Vec<(String, ast::Func)>, ast::Object) {
         let model = crate::compile::compile(ir);
         let mut defs: Vec<(String, ast::Func)> = Vec::new();
 
@@ -508,15 +508,15 @@ mod tests {
             defs.push((format!("schema:{}", id), schema.construction.clone()));
         }
 
-        let def_map: HashMap<String, ast::Func> = defs.iter().map(|(n, f)| (n.clone(), f.clone())).collect();
         let state = crate::parse_forml2::domain_to_state(ir);
+        let def_map = ast::defs_to_state(&defs, &state);
         (state, defs, def_map)
     }
 
     /// Evaluate constraints via defs.
     fn eval_constraints_defs(
         defs: &[(String, ast::Func)],
-        def_map: &HashMap<String, ast::Func>,
+        def_map: &ast::Object,
         text: &str,
         sender: Option<&str>,
         state: &ast::Object,
@@ -538,7 +538,7 @@ mod tests {
     /// Run a state machine from defs (replaces run_machine_ast).
     fn run_machine_defs(
         defs: &[(String, ast::Func)],
-        def_map: &HashMap<String, ast::Func>,
+        def_map: &ast::Object,
         noun_name: &str,
         events: &[&str],
     ) -> String {
