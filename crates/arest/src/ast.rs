@@ -894,7 +894,8 @@ fn platform_compile(x: &Object, d: &Object) -> Object {
 }
 
 /// apply command: create = emit ∘ validate ∘ derive ∘ resolve (Eq. 10).
-/// Input x is the command JSON. Returns the CommandResult as a serialized Object.
+/// Identity is a fact in the input — "Resource is created by User" (instances.md).
+/// Authorization is enforced by the constraint pipeline, not by this function.
 fn platform_apply_command(x: &Object, d: &Object) -> Object {
     let input = match x.as_atom() {
         Some(s) => s,
@@ -908,7 +909,7 @@ fn platform_apply_command(x: &Object, d: &Object) -> Object {
     let pop_state = crate::parse_forml2::domain_to_state(&state);
     let result = crate::arest::apply_command_defs(d, &command, &pop_state);
     match serde_json::to_string(&result) {
-        Ok(json) => Object::atom(&json),
+        Ok(s) => Object::atom(&s),
         Err(e) => Object::atom(&format!("⊥ {}", e)),
     }
 }
