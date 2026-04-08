@@ -95,11 +95,9 @@ pub(crate) fn query_with_ast(
     target_role: usize,
     filter_bindings: &[(usize, &str)],
 ) -> Vec<String> {
-    let defs = std::collections::HashMap::new();
     let pop = state_to_object(state, schema);
-
     let query = build_query(target_role, filter_bindings);
-    let result = ast::apply(&query, &pop, &defs);
+    let result = ast::apply(&query, &pop, &ast::Object::phi());
 
     match result.as_seq() {
         Some(items) => items.iter()

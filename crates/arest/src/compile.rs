@@ -3807,7 +3807,7 @@ mod schema_tests {
             Object::atom("org-123"),
         ]);
 
-        let defs = HashMap::new();
+        let defs = ast::Object::phi();
 
         // Apply construction to a fact -- identity (selects each role)
         let result = ast::apply(&schema.construction, &fact, &defs);
@@ -3826,7 +3826,7 @@ mod schema_tests {
         );
         let model = compile(&ir);
         let _schema = model.schemas.get("ft1").unwrap();
-        let defs = HashMap::new();
+        let defs = ast::Object::phi();
 
         let fact = Object::seq(vec![Object::atom("org-1"), Object::atom("Acme Corp")]);
 
@@ -3848,7 +3848,7 @@ mod schema_tests {
         );
         let model = compile(&ir);
         let _schema = model.schemas.get("ft1").unwrap();
-        let defs = HashMap::new();
+        let defs = ast::Object::phi();
 
         let population = Object::seq(vec![
             Object::seq(vec![Object::atom("mem-1"), Object::atom("alice@example.com")]),
@@ -3869,7 +3869,7 @@ mod schema_tests {
     #[test]
     fn partial_application_via_bu_creates_query() {
         // (bu eq "alice@example.com") applied to each user = membership check
-        let defs = HashMap::new();
+        let defs = ast::Object::phi();
 
         let check_alice = ast::Func::bu(ast::Func::Eq, Object::atom("alice@example.com"));
         assert_eq!(
@@ -3933,7 +3933,7 @@ mod schema_tests {
 
         // Evaluate via AST: apply(func, encoded_context)
         let ctx_obj = crate::ast::encode_eval_context_state("", None, &state);
-        let defs = HashMap::new();
+        let defs = crate::ast::Object::phi();
         let result = crate::ast::apply(&constraint.func, &ctx_obj, &defs);
 
         // Should return a sequence of violation Objects (not phi)
@@ -3992,7 +3992,7 @@ mod schema_tests {
         state = crate::ast::cell_push("ft1", crate::ast::fact_from_pairs(&[("Person", "Bob"), ("Name", "Bob Jones")]), &state);
 
         let ctx_obj = crate::ast::encode_eval_context_state("", None, &state);
-        let defs = HashMap::new();
+        let defs = crate::ast::Object::phi();
         let result = crate::ast::apply(&constraint.func, &ctx_obj, &defs);
 
         // No violations -- should be phi (empty sequence)

@@ -28,21 +28,10 @@ pub mod arest;
 #[cfg(feature = "cloudflare")]
 pub mod cloudflare;
 
+/// D: the unified state — population cells + def cells in one Object.
+/// Backus Sec. 14.3: "the state D of an AST system."
 struct CompiledState {
-    state: ast::Object,
-    defs: Vec<(String, ast::Func)>,
-}
-
-impl CompiledState {
-    fn def(&self, name: &str) -> Option<&ast::Func> {
-        self.defs.iter().find(|(n, _)| n == name).map(|(_, f)| f)
-    }
-    fn defs_matching(&self, prefix: &str) -> Vec<(&str, &ast::Func)> {
-        self.defs.iter().filter(|(n, _)| n.starts_with(prefix)).map(|(n, f)| (n.as_str(), f)).collect()
-    }
-    fn def_map(&self) -> HashMap<String, ast::Func> {
-        self.defs.iter().map(|(n, f)| (n.clone(), f.clone())).collect()
-    }
+    d: ast::Object,
 }
 
 static DOMAINS: OnceLock<Mutex<Vec<Option<CompiledState>>>> = OnceLock::new();
@@ -51,9 +40,10 @@ fn ds() -> &'static Mutex<Vec<Option<CompiledState>>> {
 }
 
 fn allocate(state: ast::Object, defs: Vec<(String, ast::Func)>) -> u32 {
+    let d = ast::defs_to_state(&defs, &state);
     let mut s = ds().lock().unwrap();
     let h = s.iter().position(|x| x.is_none()).unwrap_or_else(|| { s.push(None); s.len() - 1 });
-    s[h] = Some(CompiledState { state, defs });
+    s[h] = Some(CompiledState { d });
     h as u32
 }
 
@@ -143,34 +133,37 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
         Some(x) => x,
         None => return "⊥".into(),
     };
-    let def_map = st.def_map();
     let obj = ast::Object::parse(input);
 
-    // Resolve key in DEFS. Apply. Return.
-    if let Some(func) = def_map.get(key) {
-        return ast::apply(func, &obj, &def_map).to_string();
+    // SYSTEM:x = (ρ(↑entity(x):D)) ↑ op(x)
+    // Resolve key in D via Fetch + metacompose. Apply. Return.
+    let def_obj = ast::fetch_or_phi(key, &st.d);
+    match &def_obj {
+        ast::Object::Bottom => {},
+        _ => return ast::apply(&ast::metacompose(&def_obj, &st.d), &obj, &st.d).to_string(),
     }
 
-    // Two remaining operations that need Rust-level access to P:
-    // rho: metacomposition (one line, used by federation tests)
-    // forward_chain: iterative fixed-point loop over derivation defs
+    // rho and forward_chain: special operations on D
     match key {
         "rho" => {
             let operation = obj.as_seq().and_then(|s| s.get(1)).and_then(|o| o.as_atom()).unwrap_or("");
-            let func = ast::metacompose(&obj, &def_map);
-            ast::apply(&func, &ast::Object::atom(operation), &def_map).to_string()
+            ast::apply(&ast::metacompose(&obj, &st.d), &ast::Object::atom(operation), &st.d).to_string()
         }
         "forward_chain" => {
-            let derivation_defs = st.defs_matching("derivation:");
-            let (_new_state, derived) = evaluate::forward_chain_defs_state(&derivation_defs, &st.state);
-            let items: Vec<ast::Object> = derived.iter().map(|d| {
+            // Extract derivation defs from D cells
+            let derivation_defs: Vec<(String, ast::Func)> = ast::cells_iter(&st.d).into_iter()
+                .filter(|(name, _)| name.starts_with("derivation:"))
+                .map(|(name, contents)| (name.to_string(), ast::metacompose(contents, &st.d)))
+                .collect();
+            let refs: Vec<(&str, &ast::Func)> = derivation_defs.iter().map(|(n, f)| (n.as_str(), f)).collect();
+            let (_new_state, derived) = evaluate::forward_chain_defs_state(&refs, &st.d);
+            ast::Object::Seq(derived.iter().map(|d| {
                 ast::Object::seq(vec![
                     ast::Object::atom(&d.fact_type_id),
                     ast::Object::atom(&d.reading),
                     ast::Object::Seq(d.bindings.iter().map(|(k, v)| ast::Object::seq(vec![ast::Object::atom(k), ast::Object::atom(v)])).collect()),
                 ])
-            }).collect();
-            ast::Object::Seq(items).to_string()
+            }).collect()).to_string()
         }
         _ => format!("⊥ unknown: {}", key),
     }

@@ -410,7 +410,16 @@ fn apply_arithmetic(x: &Object, op: fn(f64, f64) -> Option<f64>) -> Object {
 }
 
 /// Apply a function to an object. The only operation in the FP system.
-pub fn apply(func: &Func, x: &Object, defs: &std::collections::HashMap<String, Func>) -> Object {
+/// Store compiled defs as cells in D. Each def becomes a cell whose name
+/// is the def name and whose contents is the Object representation of the Func.
+/// This is Backus Sec. 13.3.2: definitions map atoms to expressions.
+pub fn defs_to_state(defs: &[(String, Func)], state: &Object) -> Object {
+    defs.iter().fold(state.clone(), |acc, (name, func)| {
+        store(name, func_to_object(func), &acc)
+    })
+}
+
+pub fn apply(func: &Func, x: &Object, d: &Object) -> Object {
     // All functions are bottom-preserving
     if x.is_bottom() {
         return Object::Bottom;
@@ -688,21 +697,21 @@ pub fn apply(func: &Func, x: &Object, defs: &std::collections::HashMap<String, F
         Func::Constant(obj) => obj.clone(),
 
         Func::Compose(f, g) => {
-            let gx = apply(g, x, defs);
-            apply(f, &gx, defs)
+            let gx = apply(g, x, d);
+            apply(f, &gx, d)
         }
 
         Func::Construction(funcs) => {
             let results: Vec<Object> = funcs.iter()
-                .map(|f| apply(f, x, defs))
+                .map(|f| apply(f, x, d))
                 .collect();
             Object::seq(results) // bottom-preserving via Object::seq
         }
 
         Func::Condition(p, f, g) => {
-            match apply(p, x, defs) {
-                Object::Atom(ref s) if s == "T" => apply(f, x, defs),
-                Object::Atom(ref s) if s == "F" => apply(g, x, defs),
+            match apply(p, x, d) {
+                Object::Atom(ref s) if s == "T" => apply(f, x, d),
+                Object::Atom(ref s) if s == "F" => apply(g, x, d),
                 _ => Object::Bottom,
             }
         }
@@ -711,7 +720,7 @@ pub fn apply(func: &Func, x: &Object, defs: &std::collections::HashMap<String, F
             match x.as_seq() {
                 Some(items) if items.is_empty() => Object::phi(),
                 Some(items) => {
-                    Object::seq(items.iter().map(|xi| apply(f, xi, defs)).collect())
+                    Object::seq(items.iter().map(|xi| apply(f, xi, d)).collect())
                 }
                 _ => Object::Bottom,
             }
@@ -722,8 +731,8 @@ pub fn apply(func: &Func, x: &Object, defs: &std::collections::HashMap<String, F
                 Some(items) if items.len() == 1 => items[0].clone(),
                 Some(items) if items.len() >= 2 => {
                     let rest = Object::Seq(items[1..].to_vec());
-                    let reduced = apply(&Func::Insert(f.clone()), &rest, defs);
-                    apply(f, &Object::seq(vec![items[0].clone(), reduced]), defs)
+                    let reduced = apply(&Func::Insert(f.clone()), &rest, d);
+                    apply(f, &Object::seq(vec![items[0].clone(), reduced]), d)
                 }
                 _ => Object::Bottom,
             }
@@ -734,7 +743,7 @@ pub fn apply(func: &Func, x: &Object, defs: &std::collections::HashMap<String, F
                 Some(items) if items.is_empty() => Object::phi(),
                 Some(items) => {
                     let kept: Vec<Object> = items.iter()
-                        .filter(|xi| apply(p, xi, defs) == Object::t())
+                        .filter(|xi| apply(p, xi, d) == Object::t())
                         .cloned()
                         .collect();
                     Object::Seq(kept)
@@ -744,16 +753,16 @@ pub fn apply(func: &Func, x: &Object, defs: &std::collections::HashMap<String, F
         }
 
         Func::BinaryToUnary(f, obj) => {
-            apply(f, &Object::seq(vec![obj.clone(), x.clone()]), defs)
+            apply(f, &Object::seq(vec![obj.clone(), x.clone()]), d)
         }
 
         Func::While(p, f) => {
             let mut current = x.clone();
             let max_iterations = 1000; // safety limit
             for _ in 0..max_iterations {
-                match apply(p, &current, defs) {
+                match apply(p, &current, d) {
                     Object::Atom(ref s) if s == "T" => {
-                        current = apply(f, &current, defs);
+                        current = apply(f, &current, d);
                         if current.is_bottom() { return Object::Bottom; }
                     }
                     Object::Atom(ref s) if s == "F" => return current,
@@ -773,7 +782,7 @@ pub fn apply(func: &Func, x: &Object, defs: &std::collections::HashMap<String, F
                     };
                     for element in seq {
                         let pair = Object::seq(vec![acc, element.clone()]);
-                        acc = apply(f, &pair, defs);
+                        acc = apply(f, &pair, d);
                         if acc.is_bottom() { return Object::Bottom; }
                     }
                     acc
@@ -783,9 +792,10 @@ pub fn apply(func: &Func, x: &Object, defs: &std::collections::HashMap<String, F
         }
 
         Func::Def(name) => {
-            match defs.get(name) {
-                Some(func) => apply(func, x, defs),
-                None => Object::Bottom,
+            let def_obj = fetch(name, d);
+            match def_obj {
+                Object::Bottom => Object::Bottom,
+                obj => apply(&metacompose(&obj, d), x, d),
             }
         }
 
@@ -1004,24 +1014,21 @@ pub fn cell_filter(name: &str, predicate: impl Fn(&Object) -> bool, state: &Obje
 /// - Defined atoms → definitions from D
 /// - Undefined atoms → ⊥̄ (bottom everywhere)
 /// - Sequences → functional forms via controlling operator
-pub fn metacompose(obj: &Object, defs: &std::collections::HashMap<String, Func>) -> Func {
+pub fn metacompose(obj: &Object, d: &Object) -> Func {
     match obj {
         Object::Bottom => Func::Constant(Object::Bottom),
-        Object::Atom(name) => metacompose_atom(name, defs),
+        Object::Atom(name) => metacompose_atom(name, d),
         Object::Seq(items) if items.is_empty() => Func::Constant(Object::Bottom),
-        Object::Seq(items) => {
-            // Metacomposition: the first element determines the form.
-            // ρ<x₁,...,xₙ>:y = (ρ x₁):<<x₁,...,xₙ>, y>
-            // We resolve the controlling operator and build the Func.
-            metacompose_sequence(items, defs)
-        }
+        Object::Seq(items) => metacompose_sequence(items, d),
     }
 }
 
-fn metacompose_atom(name: &str, defs: &std::collections::HashMap<String, Func>) -> Func {
-    // Check definitions first (Backus 13.3.2: Def n ≡ r)
-    if let Some(func) = defs.get(name) {
-        return func.clone();
+fn metacompose_atom(name: &str, d: &Object) -> Func {
+    // Check definitions in D first (Backus 13.3.2: Def n ≡ r)
+    let def_obj = fetch(name, d);
+    match &def_obj {
+        Object::Bottom => {},
+        obj => return metacompose(obj, d),
     }
 
     // Primitive atoms (Backus 11.2.3)
@@ -1059,7 +1066,7 @@ fn metacompose_atom(name: &str, defs: &std::collections::HashMap<String, Func>) 
     }
 }
 
-fn metacompose_sequence(items: &[Object], defs: &std::collections::HashMap<String, Func>) -> Func {
+fn metacompose_sequence(items: &[Object], d: &Object) -> Func {
     if items.is_empty() { return Func::Constant(Object::Bottom); }
 
     // The controlling operator is the first element
@@ -1071,52 +1078,52 @@ fn metacompose_sequence(items: &[Object], defs: &std::collections::HashMap<Strin
     match controller {
         forms::COMP if items.len() == 3 => {
             // <COMP, f, g> → f ∘ g
-            let f = metacompose(&items[1], defs);
-            let g = metacompose(&items[2], defs);
+            let f = metacompose(&items[1], d);
+            let g = metacompose(&items[2], d);
             Func::Compose(Box::new(f), Box::new(g))
         }
         forms::CONS if items.len() >= 2 => {
             // <CONS, f₁, ..., fₙ> → [f₁, ..., fₙ]
-            let funcs: Vec<Func> = items[1..].iter().map(|o| metacompose(o, defs)).collect();
+            let funcs: Vec<Func> = items[1..].iter().map(|o| metacompose(o, d)).collect();
             Func::Construction(funcs)
         }
         forms::COND if items.len() == 4 => {
             // <COND, p, f, g> → (p → f; g)
-            let p = metacompose(&items[1], defs);
-            let f = metacompose(&items[2], defs);
-            let g = metacompose(&items[3], defs);
+            let p = metacompose(&items[1], d);
+            let f = metacompose(&items[2], d);
+            let g = metacompose(&items[3], d);
             Func::Condition(Box::new(p), Box::new(f), Box::new(g))
         }
         forms::ALPHA if items.len() == 2 => {
             // <ALPHA, f> → αf
-            let f = metacompose(&items[1], defs);
+            let f = metacompose(&items[1], d);
             Func::ApplyToAll(Box::new(f))
         }
         forms::INSERT if items.len() == 2 => {
             // <INSERT, f> → /f
-            let f = metacompose(&items[1], defs);
+            let f = metacompose(&items[1], d);
             Func::Insert(Box::new(f))
         }
         forms::FOLDL if items.len() == 2 => {
             // <FOLDL, f> → foldl(f)
-            let f = metacompose(&items[1], defs);
+            let f = metacompose(&items[1], d);
             Func::FoldL(Box::new(f))
         }
         forms::BU if items.len() == 3 => {
             // <BU, f, x> → (bu f x)
-            let f = metacompose(&items[1], defs);
+            let f = metacompose(&items[1], d);
             let x = items[2].clone();
             Func::BinaryToUnary(Box::new(f), x)
         }
         forms::FILTER if items.len() == 2 => {
             // <FILTER, p> → Filter(p)
-            let p = metacompose(&items[1], defs);
+            let p = metacompose(&items[1], d);
             Func::Filter(Box::new(p))
         }
         forms::WHILE if items.len() == 3 => {
             // <WHILE, p, f> → (while p f)
-            let p = metacompose(&items[1], defs);
-            let f = metacompose(&items[2], defs);
+            let p = metacompose(&items[1], d);
+            let f = metacompose(&items[2], d);
             Func::While(Box::new(p), Box::new(f))
         }
         forms::CONST if items.len() == 2 => {
@@ -1137,10 +1144,9 @@ fn metacompose_sequence(items: &[Object], defs: &std::collections::HashMap<Strin
 pub fn apply_ffp(
     operator: &Object,
     operand: &Object,
-    defs: &std::collections::HashMap<String, Func>,
+    d: &Object,
 ) -> Object {
-    let func = metacompose(operator, defs);
-    apply(&func, operand, defs)
+    apply(&metacompose(operator, d), operand, d)
 }
 
 /// Convert a Func back to its FFP object representation.
@@ -1230,14 +1236,19 @@ pub fn func_to_object(func: &Func) -> Object {
 /// - compose_rel: combines join + project, inheriting both limitations.
 ///
 /// All four remain Native with clear documentation of why.
-pub fn register_theta1(defs: &mut std::collections::HashMap<String, Func>) {
+pub fn theta1_defs_vec() -> Vec<(String, Func)> {
+    let mut defs = Vec::new();
+    register_theta1_into(&mut defs);
+    defs
+}
+fn register_theta1_into(defs: &mut Vec<(String, Func)>) {
     // project: pi_L(R) = alpha([s_i1,...,s_ik]) : R
     // Takes <indices, R> and projects R onto those columns.
     // NATIVE because: indices are data that determine which Selectors to build.
     // A pure Func would require alpha(Construction(selectors)) but Construction
     // is a compile-time combinator -- the selector list is determined by the
     // index sequence at runtime.
-    defs.insert("project".to_string(), Func::Native(Arc::new(|x: &Object| {
+    defs.push(("project".to_string(), Func::Native(Arc::new(|x: &Object| {
         let items = match x.as_seq() {
             Some(items) if items.len() == 2 => items,
             _ => return Object::Bottom,
@@ -1268,13 +1279,13 @@ pub fn register_theta1(defs: &mut std::collections::HashMap<String, Func>) {
             }
         }
         Object::Seq(rows)
-    })));
+    }))));
 
     // join: join:<shared_col, R, S> = natural join on shared column index.
     // NATIVE because: shared_col is a runtime value that determines which
     // Selector to use for comparison and which columns to include in the
     // merged tuple. Pure Func cannot parameterize Selector indices from data.
-    defs.insert("join".to_string(), Func::Native(Arc::new(|x: &Object| {
+    defs.push(("join".to_string(), Func::Native(Arc::new(|x: &Object| {
         let items = match x.as_seq() {
             Some(items) if items.len() == 3 => items,
             _ => return Object::Bottom,
@@ -1311,7 +1322,7 @@ pub fn register_theta1(defs: &mut std::collections::HashMap<String, Func>) {
             }
         }
         Object::Seq(result)
-    })));
+    }))));
 
     // tie: gamma(R) = Filter(eq . [sel(1), sel(n)]) : R
     // Selects tuples where first column = last column, then removes the last column.
@@ -1320,7 +1331,7 @@ pub fn register_theta1(defs: &mut std::collections::HashMap<String, Func>) {
     // "select last element" primitive in FP. The Reverse+Selector(1) trick
     // works for comparison but the "remove last column" step still needs
     // dynamic-arity Construction to rebuild the tuple without its last element.
-    defs.insert("tie".to_string(), Func::Native(Arc::new(|x: &Object| {
+    defs.push(("tie".to_string(), Func::Native(Arc::new(|x: &Object| {
         let relation = match x.as_seq() {
             Some(r) => r,
             None => return Object::Bottom,
@@ -1334,14 +1345,14 @@ pub fn register_theta1(defs: &mut std::collections::HashMap<String, Func>) {
             }
         }
         Object::Seq(result)
-    })));
+    }))));
 
     // compose_rel: R . S = pi_1s(R*S) -- relational composition.
     // Join R and S on shared column, then project out the shared column.
     // NATIVE because: inherits both join's dynamic column selection and
     // project's dynamic Construction building. The shared_col parameter
     // determines runtime behavior that cannot be fixed at compile time.
-    defs.insert("compose_rel".to_string(), Func::Native(Arc::new(|x: &Object| {
+    defs.push(("compose_rel".to_string(), Func::Native(Arc::new(|x: &Object| {
         let items = match x.as_seq() {
             Some(items) if items.len() == 3 => items,
             _ => return Object::Bottom,
@@ -1382,7 +1393,7 @@ pub fn register_theta1(defs: &mut std::collections::HashMap<String, Func>) {
             }
         }
         Object::Seq(result)
-    })));
+    }))));
 }
 
 // ── Convenience constructors ─────────────────────────────────────────
@@ -1516,7 +1527,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    fn defs() -> HashMap<String, Func> { HashMap::new() }
+    fn defs() -> Object { Object::phi() }
 
     // ── Object construction ──────────────────────────────────────
 
@@ -1859,9 +1870,7 @@ mod tests {
 
     #[test]
     fn def_resolves_from_definition_set() {
-        let mut d = HashMap::new();
-        // Def second = 2
-        d.insert("second".to_string(), Func::Selector(2));
+        let d = defs_to_state(&[("second".to_string(), Func::Selector(2))], &Object::phi());
 
         let f = Func::Def("second".to_string());
         let seq = Object::seq(vec![Object::atom("a"), Object::atom("b")]);
@@ -2028,17 +2037,27 @@ mod tests {
 
     // ── Codd θ₁ relational operations ─────────────────────────
 
-    fn theta1_defs() -> HashMap<String, Func> {
-        let mut d = HashMap::new();
-        register_theta1(&mut d);
-        d
+    fn theta1_defs() -> Object {
+        defs_to_state(&theta1_defs_vec(), &Object::phi())
+    }
+
+    /// Look up a named def from theta1_defs_vec and apply it directly.
+    /// Native funcs cannot roundtrip through func_to_object/metacompose,
+    /// so theta1 tests must resolve the Func from the vec.
+    fn apply_theta1(name: &str, input: &Object) -> Object {
+        let defs_vec = theta1_defs_vec();
+        let d = theta1_defs();
+        let func = defs_vec.iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, f)| f)
+            .expect(&format!("theta1 def '{}' not found", name));
+        apply(func, input, &d)
     }
 
     #[test]
     fn theta1_projection() {
         // π_{1,3}(R) where R = <<a,b,c>,<d,e,f>>
         // project:<⟨1,3⟩, R> = <<a,c>,<d,f>>
-        let d = theta1_defs();
         let input = Object::seq(vec![
             Object::seq(vec![Object::atom("1"), Object::atom("3")]),
             Object::Seq(vec![
@@ -2046,7 +2065,7 @@ mod tests {
                 Object::seq(vec![Object::atom("d"), Object::atom("e"), Object::atom("f")]),
             ]),
         ]);
-        let result = apply_ffp(&Object::atom("project"), &input, &d);
+        let result = apply_theta1("project", &input);
         assert_eq!(result, Object::Seq(vec![
             Object::Seq(vec![Object::atom("a"), Object::atom("c")]),
             Object::Seq(vec![Object::atom("d"), Object::atom("f")]),
@@ -2056,7 +2075,6 @@ mod tests {
     #[test]
     fn theta1_projection_removes_duplicates() {
         // project:<⟨1⟩, <<a,x>,<b,y>,<a,z>>> = <<a>,<b>> (a appears once)
-        let d = theta1_defs();
         let input = Object::seq(vec![
             Object::seq(vec![Object::atom("1")]),
             Object::Seq(vec![
@@ -2065,7 +2083,7 @@ mod tests {
                 Object::seq(vec![Object::atom("a"), Object::atom("z")]),
             ]),
         ]);
-        let result = apply_ffp(&Object::atom("project"), &input, &d);
+        let result = apply_theta1("project", &input);
         assert_eq!(result, Object::Seq(vec![
             Object::Seq(vec![Object::atom("a")]),
             Object::Seq(vec![Object::atom("b")]),
@@ -2089,7 +2107,6 @@ mod tests {
         // Natural join on "part" (col 2 in R, col 1 in S):
         // Our impl uses same-index join, which is simpler.
         // Use: shared_col=1, R and S both have col 1 as join key
-        let d = theta1_defs();
         let r = Object::Seq(vec![
             Object::seq(vec![Object::atom("a"), Object::atom("x")]),
             Object::seq(vec![Object::atom("b"), Object::atom("y")]),
@@ -2101,7 +2118,7 @@ mod tests {
         ]);
         // join on col 1: a matches a (twice), b has no match, c has no match in R
         let input = Object::seq(vec![Object::atom("1"), r, s]);
-        let result = apply_ffp(&Object::atom("join"), &input, &d);
+        let result = apply_theta1("join", &input);
         // Expected: <<a,x,1>, <a,x,2>> (a matched, x from R, 1/2 from S minus shared)
         // S cols excluding shared col 1: just col 2
         assert_eq!(result, Object::Seq(vec![
@@ -2115,13 +2132,12 @@ mod tests {
         // γ(R): select tuples where first = last, remove last column
         // R = <<a,1,a>,<b,2,c>,<c,3,c>>
         // tie:R = <<a,1>,<c,3>> (first=last for a and c)
-        let d = theta1_defs();
         let r = Object::Seq(vec![
             Object::seq(vec![Object::atom("a"), Object::atom("1"), Object::atom("a")]),
             Object::seq(vec![Object::atom("b"), Object::atom("2"), Object::atom("c")]),
             Object::seq(vec![Object::atom("c"), Object::atom("3"), Object::atom("c")]),
         ]);
-        let result = apply_ffp(&Object::atom("tie"), &r, &d);
+        let result = apply_theta1("tie", &r);
         assert_eq!(result, Object::Seq(vec![
             Object::Seq(vec![Object::atom("a"), Object::atom("1")]),
             Object::Seq(vec![Object::atom("c"), Object::atom("3")]),
@@ -2134,7 +2150,6 @@ mod tests {
         // R = <<a,x>,<b,y>>, S = <<x,1>,<y,2>>
         // compose_rel on col 2 of R = col 1 of S:
         // join gives <<a,x,1>,<b,y,2>>, project out col 2 gives <<a,1>,<b,2>>
-        let d = theta1_defs();
         let _r = Object::Seq(vec![
             Object::seq(vec![Object::atom("a"), Object::atom("x")]),
             Object::seq(vec![Object::atom("b"), Object::atom("y")]),
@@ -2157,7 +2172,7 @@ mod tests {
             Object::seq(vec![Object::atom("y"), Object::atom("2")]),
         ]);
         let input = Object::seq(vec![Object::atom("1"), r2, s2]);
-        let result = apply_ffp(&Object::atom("compose_rel"), &input, &d);
+        let result = apply_theta1("compose_rel", &input);
         // x matches x: project out col 1 → <a, 1>
         // y matches y: project out col 1 → <b, 2>
         assert_eq!(result, Object::Seq(vec![
@@ -2436,8 +2451,7 @@ mod tests {
     #[test]
     fn metacompose_defined_atom_resolves() {
         // Def "second" ≡ Selector(2)
-        let mut d = HashMap::new();
-        d.insert("second".to_string(), Func::Selector(2));
+        let d = defs_to_state(&[("second".to_string(), Func::Selector(2))], &Object::phi());
         let func = metacompose(&Object::atom("second"), &d);
         let x = Object::seq(vec![Object::atom("a"), Object::atom("b")]);
         assert_eq!(apply(&func, &x, &d), Object::atom("b"));

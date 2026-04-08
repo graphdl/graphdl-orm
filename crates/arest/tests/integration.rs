@@ -11,15 +11,15 @@ use arest::evaluate;
 use arest::ast;
 use arest::parse_forml2;
 
-/// Helper: build a def_map from compile_to_defs_state output.
-fn build_def_map(defs: &[(String, ast::Func)]) -> HashMap<String, ast::Func> {
-    defs.iter().map(|(n, f)| (n.clone(), f.clone())).collect()
+/// Helper: build D from compile_to_defs_state output.
+fn build_d(defs: &[(String, ast::Func)], state: &ast::Object) -> ast::Object {
+    ast::defs_to_state(defs, state)
 }
 
 /// Helper: evaluate all constraint defs against a context, returning violations.
 fn evaluate_constraints(
     defs: &[(String, ast::Func)],
-    def_map: &HashMap<String, ast::Func>,
+    d: &ast::Object,
     text: &str,
     sender: Option<&str>,
     state: &ast::Object,
@@ -28,7 +28,7 @@ fn evaluate_constraints(
     defs.iter()
         .filter(|(n, _)| n.starts_with("constraint:"))
         .flat_map(|(name, func)| {
-            let result = ast::apply(func, &ctx_obj, def_map);
+            let result = ast::apply(func, &ctx_obj, d);
             let is_deontic = name.contains("obligatory") || name.contains("forbidden");
             ast::decode_violations(&result).into_iter().map(move |mut v| {
                 v.alethic = !is_deontic;
@@ -70,12 +70,12 @@ fn test_full_pipeline_forbidden_text() {
     let ir: Domain = serde_json::from_str(ir_json).unwrap();
     let state = parse_forml2::domain_to_state(&ir);
     let defs = compile::compile_to_defs_state(&state);
-    let def_map = build_def_map(&defs);
+    let d = build_d(&defs, &ast::Object::phi());
 
     let empty_state = ast::Object::phi();
     let emdash = core::char::from_u32(0x2014).unwrap();
     let text = format!("Hello {} how are you?", emdash);
-    let violations = evaluate_constraints(&defs, &def_map, &text, None, &empty_state);
+    let violations = evaluate_constraints(&defs, &d, &text, None, &empty_state);
     assert!(!violations.is_empty());
 }
 
@@ -111,10 +111,10 @@ fn test_full_pipeline_clean_response() {
     let ir: Domain = serde_json::from_str(ir_json).unwrap();
     let state = parse_forml2::domain_to_state(&ir);
     let defs = compile::compile_to_defs_state(&state);
-    let def_map = build_def_map(&defs);
+    let d = build_d(&defs, &ast::Object::phi());
 
     let empty_state = ast::Object::phi();
-    let violations = evaluate_constraints(&defs, &def_map, "", None, &empty_state);
+    let violations = evaluate_constraints(&defs, &d, "", None, &empty_state);
     assert!(violations.is_empty());
 }
 
@@ -148,14 +148,14 @@ fn test_full_pipeline_uniqueness_violation() {
     let ir: Domain = serde_json::from_str(ir_json).unwrap();
     let state = parse_forml2::domain_to_state(&ir);
     let defs = compile::compile_to_defs_state(&state);
-    let def_map = build_def_map(&defs);
+    let d = build_d(&defs, &ast::Object::phi());
 
     // Customer c1 has two names -> UC violation
     let mut pop_state = ast::Object::phi();
     pop_state = ast::cell_push("ft1", ast::fact_from_pairs(&[("Customer", "c1"), ("Name", "Alice")]), &pop_state);
     pop_state = ast::cell_push("ft1", ast::fact_from_pairs(&[("Customer", "c1"), ("Name", "Bob")]), &pop_state);
 
-    let violations = evaluate_constraints(&defs, &def_map, "", None, &pop_state);
+    let violations = evaluate_constraints(&defs, &d, "", None, &pop_state);
     assert_eq!(violations.len(), 1);
     assert!(violations[0].detail.contains("Uniqueness violation"));
     assert_eq!(violations[0].constraint_id, "c1");
@@ -194,19 +194,19 @@ fn test_dual_instance_convergence_valid() {
 
     let server_state = parse_forml2::domain_to_state(&ir);
     let server_defs = compile::compile_to_defs_state(&server_state);
-    let server_def_map = build_def_map(&server_defs);
+    let server_d = build_d(&server_defs, &ast::Object::phi());
 
     let client_state = parse_forml2::domain_to_state(&ir);
     let client_defs = compile::compile_to_defs_state(&client_state);
-    let client_def_map = build_def_map(&client_defs);
+    let client_d = build_d(&client_defs, &ast::Object::phi());
 
     // Valid state: each order has one customer
     let mut pop_state = ast::Object::phi();
     pop_state = ast::cell_push("ft1", ast::fact_from_pairs(&[("Order", "ord-1"), ("Customer", "acme")]), &pop_state);
     pop_state = ast::cell_push("ft1", ast::fact_from_pairs(&[("Order", "ord-2"), ("Customer", "beta")]), &pop_state);
 
-    let server_violations = evaluate_constraints(&server_defs, &server_def_map, "", None, &pop_state);
-    let client_violations = evaluate_constraints(&client_defs, &client_def_map, "", None, &pop_state);
+    let server_violations = evaluate_constraints(&server_defs, &server_d, "", None, &pop_state);
+    let client_violations = evaluate_constraints(&client_defs, &client_d, "", None, &pop_state);
 
     assert!(server_violations.is_empty(), "Server should see no violations");
     assert!(client_violations.is_empty(), "Client should see no violations");
@@ -242,7 +242,7 @@ fn test_dual_instance_concurrent_write_conflict() {
     let ir: Domain = serde_json::from_str(ir_json).unwrap();
     let ir_state = parse_forml2::domain_to_state(&ir);
     let defs = compile::compile_to_defs_state(&ir_state);
-    let def_map = build_def_map(&defs);
+    let d = build_d(&defs, &ast::Object::phi());
 
     // Client A's local view
     let mut client_a_state = ast::Object::phi();
@@ -252,8 +252,8 @@ fn test_dual_instance_concurrent_write_conflict() {
     let mut client_b_state = ast::Object::phi();
     client_b_state = ast::cell_push("ft1", ast::fact_from_pairs(&[("Order", "ord-1"), ("Customer", "beta")]), &client_b_state);
 
-    let a_violations = evaluate_constraints(&defs, &def_map, "", None, &client_a_state);
-    let b_violations = evaluate_constraints(&defs, &def_map, "", None, &client_b_state);
+    let a_violations = evaluate_constraints(&defs, &d, "", None, &client_a_state);
+    let b_violations = evaluate_constraints(&defs, &d, "", None, &client_b_state);
     assert!(a_violations.is_empty(), "Client A's local view is valid");
     assert!(b_violations.is_empty(), "Client B's local view is valid");
 
@@ -262,7 +262,7 @@ fn test_dual_instance_concurrent_write_conflict() {
     merged_state = ast::cell_push("ft1", ast::fact_from_pairs(&[("Order", "ord-1"), ("Customer", "acme")]), &merged_state);
     merged_state = ast::cell_push("ft1", ast::fact_from_pairs(&[("Order", "ord-1"), ("Customer", "beta")]), &merged_state);
 
-    let server_violations = evaluate_constraints(&defs, &def_map, "", None, &merged_state);
+    let server_violations = evaluate_constraints(&defs, &d, "", None, &merged_state);
     assert_eq!(server_violations.len(), 1, "Server detects the conflict");
     assert!(server_violations[0].detail.contains("Uniqueness violation"));
 }
