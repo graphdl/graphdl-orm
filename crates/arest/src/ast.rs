@@ -833,20 +833,14 @@ fn platform_compile(x: &Object, d: &Object) -> Object {
         None => return Object::Bottom,
     };
 
-    // Parse readings into a state Object (cells)
-    let existing_domain = crate::compile::state_to_domain(d);
-    let parsed = match (if existing_domain.nouns.is_empty() {
-        crate::parse_forml2::parse_markdown(input)
-    } else {
-        crate::parse_forml2::parse_markdown_with_context(input, &existing_domain.nouns, &existing_domain.fact_types)
-    }) {
-        Ok(domain) => crate::parse_forml2::domain_to_state(&domain),
+    // Parse readings into cells, with context from D (nouns + fact types)
+    let parsed = match crate::parse_forml2::parse_to_state_from(input, d) {
+        Ok(s) => s,
         Err(e) => return Object::atom(&format!("⊥ {}", e)),
     };
 
-    // Merge: foldl(concat_cell, existing_state, cells(parsed))
-    let existing_state = crate::parse_forml2::domain_to_state(&existing_domain);
-    let merged_state = merge_states(&existing_state, &parsed);
+    // Merge: foldl(concat_cell, D, cells(parsed))
+    let merged_state = merge_states(d, &parsed);
 
     // Compile defs from merged state + re-register platform primitives
     let mut defs = crate::compile::compile_to_defs_state(&merged_state);
