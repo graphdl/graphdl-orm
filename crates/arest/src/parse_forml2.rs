@@ -1031,6 +1031,30 @@ fn resolve_derivation_rule(rule: &mut DerivationRuleDef, ir: &Domain, catalog: &
         .filter(|k| seen.insert(k.clone()))
         .collect();
 
+    // Classify: if join keys exist AND at least 2 distinct antecedent fact types share
+    // a noun, this is a Join derivation. Rules with "that X" anaphora where X appears
+    // in multiple antecedents need an equi-join on X.
+    if !rule.join_on.is_empty() && rule.antecedent_fact_type_ids.len() >= 2 {
+        // Check that join keys actually appear in multiple antecedent fact types
+        let shared_across_fts = rule.join_on.iter().any(|key| {
+            rule.antecedent_fact_type_ids.iter()
+                .filter(|ft_id| ir.fact_types.get(*ft_id)
+                    .map_or(false, |ft| ft.roles.iter().any(|r| r.noun_name == *key)))
+                .count() >= 2
+        });
+        if shared_across_fts {
+            rule.kind = DerivationKind::Join;
+            // Build match_on: pairs of (noun_a, noun_b) for equality matching
+            rule.match_on = rule.join_on.iter()
+                .map(|key| (key.clone(), key.clone()))
+                .collect();
+            // Consequent bindings: nouns from the consequent fact type
+            if let Some(ft) = ir.fact_types.get(&rule.consequent_fact_type_id) {
+                rule.consequent_bindings = ft.roles.iter().map(|r| r.noun_name.clone()).collect();
+            }
+        }
+    }
+
     // Set rule ID from consequent
     rule.id = rule.consequent_fact_type_id.clone();
 }
