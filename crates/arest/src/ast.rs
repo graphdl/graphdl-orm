@@ -833,60 +833,32 @@ fn platform_compile(x: &Object, d: &Object) -> Object {
         None => return Object::Bottom,
     };
 
+    // Parse readings into a state Object (cells)
     let existing_domain = crate::compile::state_to_domain(d);
-
-    let ir = if existing_domain.nouns.is_empty() {
+    let parsed = match (if existing_domain.nouns.is_empty() {
         crate::parse_forml2::parse_markdown(input)
     } else {
         crate::parse_forml2::parse_markdown_with_context(input, &existing_domain.nouns, &existing_domain.fact_types)
-    };
-    let domain = match ir {
-        Ok(d) => d,
+    }) {
+        Ok(domain) => crate::parse_forml2::domain_to_state(&domain),
         Err(e) => return Object::atom(&format!("⊥ {}", e)),
     };
 
-    // UC guard on Noun has Object Type: reject if a noun is redeclared with a different type.
-    // This is what validate would catch if HashMap didn't erase the conflict.
-    let mut merged = existing_domain;
-    let noun_conflicts: Vec<String> = domain.nouns.iter()
-        .filter_map(|(name, new_def)| {
-            merged.nouns.get(name)
-                .filter(|existing| existing.object_type != new_def.object_type)
-                .map(|existing| format!("Each Noun has exactly one Object Type. '{}' is {} but redeclared as {}",
-                    name, existing.object_type, new_def.object_type))
-        })
-        .collect();
-    if !noun_conflicts.is_empty() {
-        return Object::atom(&format!("⊥ constraint violation: {}", noun_conflicts.join("; ")));
-    }
-    merged.nouns.extend(domain.nouns);
-    merged.fact_types.extend(domain.fact_types);
-    merged.constraints.extend(domain.constraints);
-    merged.state_machines.extend(domain.state_machines);
-    merged.derivation_rules.extend(domain.derivation_rules);
-    merged.general_instance_facts.extend(domain.general_instance_facts);
-    merged.subtypes.extend(domain.subtypes);
-    merged.enum_values.extend(domain.enum_values);
-    merged.ref_schemes.extend(domain.ref_schemes);
-    merged.objectifications.extend(domain.objectifications);
-    merged.named_spans.extend(domain.named_spans);
-    merged.autofill_spans.extend(domain.autofill_spans);
+    // Merge: foldl(concat_cell, existing_state, cells(parsed))
+    let existing_state = crate::parse_forml2::domain_to_state(&existing_domain);
+    let merged_state = merge_states(&existing_state, &parsed);
 
-    let state = crate::parse_forml2::domain_to_state(&merged);
-    let mut defs = crate::compile::compile_to_defs_state(&state);
-    // Re-register platform primitives in D' (they must survive state transitions)
+    // Compile defs from merged state + re-register platform primitives
+    let mut defs = crate::compile::compile_to_defs_state(&merged_state);
     defs.push(("compile".to_string(), Func::Platform("compile".to_string())));
     defs.push(("apply".to_string(), Func::Platform("apply_command".to_string())));
-    let new_d = defs_to_state(&defs, &state);
+    let new_d = defs_to_state(&defs, &merged_state);
 
-    // validate: apply the compiled constraint set to the merged state.
-    // If alethic violations exist, reject the compile (return violations, not D').
-    let ctx = crate::ast::encode_eval_context_state("", None, &state);
+    // Validate: ρ(validate) applied to merged state. Alethic violations reject.
+    let ctx = encode_eval_context_state("", None, &merged_state);
     let violations = apply(&Func::Def("validate".to_string()), &ctx, &new_d);
-    let decoded = crate::ast::decode_violations(&violations);
-    let has_alethic = decoded.iter().any(|v| v.alethic);
-    // Alethic violation → reject. Return the violation text.
-    match has_alethic {
+    let decoded = decode_violations(&violations);
+    match decoded.iter().any(|v| v.alethic) {
         true => Object::atom(&format!("⊥ constraint violation: {}",
             decoded.iter().filter(|v| v.alethic).map(|v| v.constraint_text.as_str()).collect::<Vec<_>>().join("; "))),
         false => new_d,
@@ -1062,6 +1034,23 @@ pub fn cell_push(name: &str, fact: Object, state: &Object) -> Object {
         None => Object::Seq(vec![fact]),
     };
     store(name, new_contents, state)
+}
+
+/// Merge two states: foldl(concat_cell, target, cells(source)).
+/// Each step concatenates one source cell's contents into the target.
+pub fn merge_states(target: &Object, source: &Object) -> Object {
+    cells_iter(source).into_iter().fold(target.clone(), |acc, (name, contents)| {
+        let existing = fetch_or_phi(name, &acc);
+        let merged = concat_seq(&existing, contents);
+        store(name, merged, &acc)
+    })
+}
+
+/// Concatenate two sequences: <a₁,...,aₙ> ++ <b₁,...,bₘ> = <a₁,...,aₙ,b₁,...,bₘ>
+fn concat_seq(a: &Object, b: &Object) -> Object {
+    let mut items = a.as_seq().map(|s| s.to_vec()).unwrap_or_default();
+    items.extend(b.as_seq().map(|s| s.to_vec()).unwrap_or_else(|| vec![b.clone()]));
+    Object::Seq(items)
 }
 
 /// Iterate all cells in state as (name, contents) pairs.
