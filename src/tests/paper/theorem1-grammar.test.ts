@@ -144,7 +144,7 @@ Task has StatusA.
 Task has StatusB.
 
 ## Constraints
-Exactly one of the following holds: Task has StatusA; Task has StatusB.
+For each Task, exactly one of the following holds: that Task has StatusA; that Task has StatusB.
 `
 
 // ── Diagnostic helper ────────────────────────────────────────────────────────
