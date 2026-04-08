@@ -840,22 +840,15 @@ pub fn state_to_domain(state: &crate::ast::Object) -> Domain {
     use crate::ast::{fetch_or_phi, binding, cells_iter};
     let mut domain = Domain::default();
 
-    // Query Noun facts
-    let noun_cell = fetch_or_phi("Noun", state);
-    if let Some(noun_facts) = noun_cell.as_seq() {
-        for f in noun_facts {
-            let name = binding(f, "name").unwrap_or("").to_string();
-            let obj_type = binding(f, "objectType").unwrap_or("entity").to_string();
-            let super_type = binding(f, "superType").map(|s| s.to_string());
-            let ref_scheme = binding(f, "referenceScheme").map(|v| v.split(',').map(|s| s.to_string()).collect::<Vec<_>>());
-            let enum_vals = binding(f, "enumValues").map(|v| v.split(',').map(|s| s.to_string()).collect::<Vec<_>>());
-
-            domain.nouns.insert(name.clone(), NounDef { object_type: obj_type, world_assumption: WorldAssumption::default() });
-            if let Some(st) = super_type { domain.subtypes.insert(name.clone(), st); }
-            if let Some(rs) = ref_scheme { domain.ref_schemes.insert(name.clone(), rs); }
-            if let Some(ev) = enum_vals { domain.enum_values.insert(name.clone(), ev); }
-        }
-    }
+    // α(noun_fact → insert into domain maps) : Noun cell
+    fetch_or_phi("Noun", state).as_seq().into_iter().flat_map(|facts| facts.iter()).for_each(|f| {
+        let name = binding(f, "name").unwrap_or("").to_string();
+        let obj_type = binding(f, "objectType").unwrap_or("entity").to_string();
+        domain.nouns.insert(name.clone(), NounDef { object_type: obj_type, world_assumption: WorldAssumption::default() });
+        binding(f, "superType").map(|st| domain.subtypes.insert(name.clone(), st.to_string()));
+        binding(f, "referenceScheme").map(|v| domain.ref_schemes.insert(name.clone(), v.split(',').map(|s| s.to_string()).collect()));
+        binding(f, "enumValues").map(|v| domain.enum_values.insert(name.clone(), v.split(',').map(|s| s.to_string()).collect()));
+    });
 
     // α(schema_fact → fact_type) : GraphSchema cell
     let role_cell = fetch_or_phi("Role", state);
@@ -957,26 +950,21 @@ pub(crate) fn compile(ir: &Domain) -> CompiledModel {
     // For each fact type, check if any role's noun has a state machine.
     // If so, check if any transition event name appears in the reading.
     // This is a heuristic until the IR carries explicit Activation/Verb links.
-    let mut fact_events: HashMap<String, FactEvent> = HashMap::new();
-    for (ft_id, schema) in &schemas {
-        for role_name in &schema.role_names {
-            if let Some(&sm_idx) = noun_index.noun_to_state_machines.get(role_name) {
-                let sm = &state_machines[sm_idx];
-                let reading_lower = schema.reading.to_lowercase();
-                for (_, to, event) in &sm.transition_table {
-                    if reading_lower.contains(&event.to_lowercase()) ||
-                       reading_lower.contains(&to.to_lowercase()) {
-                        fact_events.insert(ft_id.clone(), FactEvent {
-                            fact_type_id: ft_id.clone(),
-                            event_name: event.clone(),
-                            target_noun: role_name.clone(),
-                        });
-                        break;
-                    }
-                }
-            }
-        }
-    }
+    // α(schema → match event) : schemas — find fact types that activate transitions
+    let ni_ref = &noun_index;
+    let sm_ref = &state_machines;
+    let fact_events: HashMap<String, FactEvent> = schemas.iter()
+        .flat_map(|(ft_id, schema)| schema.role_names.iter().filter_map(move |role_name| {
+            let sm_idx = ni_ref.noun_to_state_machines.get(role_name)?;
+            let sm = &sm_ref[*sm_idx];
+            let reading_lower = schema.reading.to_lowercase();
+            sm.transition_table.iter()
+                .find(|(_, to, event)| reading_lower.contains(&event.to_lowercase()) || reading_lower.contains(&to.to_lowercase()))
+                .map(|(_, _, event)| (ft_id.clone(), FactEvent {
+                    fact_type_id: ft_id.clone(), event_name: event.clone(), target_noun: role_name.clone(),
+                }))
+        }))
+        .collect();
 
     CompiledModel { constraints, derivations, state_machines, noun_index, schemas, fact_events }
 }
@@ -987,15 +975,10 @@ fn build_noun_index(
     constraints: &[CompiledConstraint],
     state_machines: &[CompiledStateMachine],
 ) -> NounIndex {
-    // noun_name -> list of (fact_type_id, role_index)
-    let mut noun_to_fact_types: HashMap<String, Vec<(String, usize)>> = HashMap::new();
-    for (ft_id, ft) in &ir.fact_types {
-        for role in &ft.roles {
-            noun_to_fact_types.entry(role.noun_name.clone())
-                .or_default()
-                .push((ft_id.clone(), role.role_index));
-        }
-    }
+    // α(ft → α(role → entry)) : fact_types — noun_name -> [(fact_type_id, role_index)]
+    let noun_to_fact_types: HashMap<String, Vec<(String, usize)>> = ir.fact_types.iter()
+        .flat_map(|(ft_id, ft)| ft.roles.iter().map(move |role| (role.noun_name.clone(), (ft_id.clone(), role.role_index))))
+        .fold(HashMap::new(), |mut acc, (noun, entry)| { acc.entry(noun).or_default().push(entry); acc });
 
     // noun_name -> world assumption
     let world_assumptions: HashMap<String, WorldAssumption> = ir.nouns.iter()
@@ -1004,21 +987,14 @@ fn build_noun_index(
 
     // noun_name -> supertype (from IR maps)
     let supertypes: HashMap<String, String> = ir.subtypes.clone();
-    let mut subtypes: HashMap<String, Vec<String>> = HashMap::new();
-    for (child, parent) in &ir.subtypes {
-        subtypes.entry(parent.clone()).or_default().push(child.clone());
-    }
+    let subtypes: HashMap<String, Vec<String>> = ir.subtypes.iter()
+        .fold(HashMap::new(), |mut acc, (child, parent)| { acc.entry(parent.clone()).or_default().push(child.clone()); acc });
     let ref_schemes: HashMap<String, Vec<String>> = ir.ref_schemes.clone();
 
     // fact_type_id -> list of constraint IDs spanning it
-    let mut fact_type_to_constraints: HashMap<String, Vec<String>> = HashMap::new();
-    for cdef in &ir.constraints {
-        for span in &cdef.spans {
-            fact_type_to_constraints.entry(span.fact_type_id.clone())
-                .or_default()
-                .push(cdef.id.clone());
-        }
-    }
+    let fact_type_to_constraints: HashMap<String, Vec<String>> = ir.constraints.iter()
+        .flat_map(|cdef| cdef.spans.iter().map(move |span| (span.fact_type_id.clone(), cdef.id.clone())))
+        .fold(HashMap::new(), |mut acc, (ft_id, c_id)| { acc.entry(ft_id).or_default().push(c_id); acc });
 
     // constraint_id -> index
     let constraint_index: HashMap<String, usize> = constraints.iter()
