@@ -135,15 +135,15 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
     };
     let obj = ast::Object::parse(input);
 
-    // SYSTEM:x = (ρ(↑entity(x):D)) ↑ op(x)
-    // Resolve key in D via Fetch + metacompose. Apply. Return.
-    let def_obj = ast::fetch_or_phi(key, &st.d);
-    match &def_obj {
+    // SYSTEM:x = (ρ(↑entity(x):D)):↑op(x)  (Eq. 9)
+    // Every key resolves via ρ. No short-circuit on Bottom.
+    let result = ast::apply(&ast::Func::Def(key.to_string()), &obj, &st.d);
+    match &result {
         ast::Object::Bottom => {},
-        _ => return ast::apply(&ast::metacompose(&def_obj, &st.d), &obj, &st.d).to_string(),
+        _ => return result.to_string(),
     }
 
-    // rho and forward_chain: special operations on D
+    // Remaining platform operations not yet in D (task #108)
     match key {
         "rho" => {
             let operation = obj.as_seq().and_then(|s| s.get(1)).and_then(|o| o.as_atom()).unwrap_or("");
