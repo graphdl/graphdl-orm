@@ -377,8 +377,14 @@ pub enum Func {
     /// Named definition: references a function by name from the definition set.
     Def(String),
 
+    /// Platform primitive: a named operation resolved by the runtime.
+    /// Each name maps to a known function (x, D) → Object.
+    /// On FPGA, each is a synthesized circuit. In Rust, dispatched by name.
+    Platform(String),
+
     /// Opaque: wraps an arbitrary Rust closure. Escape hatch for primitives
     /// that don't fit the AST (arithmetic, string ops, external calls).
+    /// TODO: replace all uses with Platform for FPGA synthesis.
     Native(Fn1),
 }
 
@@ -799,7 +805,81 @@ pub fn apply(func: &Func, x: &Object, d: &Object) -> Object {
             }
         }
 
+        Func::Platform(name) => apply_platform(name, x, d),
+
         Func::Native(f) => f(x),
+    }
+}
+
+/// Platform primitives — known operations resolved by name.
+/// Each is a fixed function (x, D) → Object. Synthesizable to hardware.
+fn apply_platform(name: &str, x: &Object, d: &Object) -> Object {
+    match name {
+        "compile" => platform_compile(x, d),
+        "apply_command" => platform_apply_command(x, d),
+        _ => Object::Bottom,
+    }
+}
+
+/// compile ∘ parse: readings text → new defs merged into D.
+/// Returns the new state D' (caller stores it).
+fn platform_compile(x: &Object, d: &Object) -> Object {
+    let input = match x.as_atom() {
+        Some(s) => s,
+        None => return Object::Bottom,
+    };
+
+    let existing_domain = crate::compile::state_to_domain(d);
+
+    let ir = if existing_domain.nouns.is_empty() {
+        crate::parse_forml2::parse_markdown(input)
+    } else {
+        crate::parse_forml2::parse_markdown_with_context(input, &existing_domain.nouns, &existing_domain.fact_types)
+    };
+    let domain = match ir {
+        Ok(d) => d,
+        Err(e) => return Object::atom(&format!("⊥ {}", e)),
+    };
+
+    let mut merged = existing_domain;
+    merged.nouns.extend(domain.nouns);
+    merged.fact_types.extend(domain.fact_types);
+    merged.constraints.extend(domain.constraints);
+    merged.state_machines.extend(domain.state_machines);
+    merged.derivation_rules.extend(domain.derivation_rules);
+    merged.general_instance_facts.extend(domain.general_instance_facts);
+    merged.subtypes.extend(domain.subtypes);
+    merged.enum_values.extend(domain.enum_values);
+    merged.ref_schemes.extend(domain.ref_schemes);
+    merged.objectifications.extend(domain.objectifications);
+    merged.named_spans.extend(domain.named_spans);
+    merged.autofill_spans.extend(domain.autofill_spans);
+
+    let state = crate::parse_forml2::domain_to_state(&merged);
+    let mut defs = crate::compile::compile_to_defs_state(&state);
+    // Re-register platform primitives in D' (they must survive state transitions)
+    defs.push(("compile".to_string(), Func::Platform("compile".to_string())));
+    defs.push(("apply".to_string(), Func::Platform("apply_command".to_string())));
+    defs_to_state(&defs, &state)
+}
+
+/// apply command: create = emit ∘ validate ∘ derive ∘ resolve (Eq. 10).
+/// Input x is the command JSON. Returns the CommandResult as a serialized Object.
+fn platform_apply_command(x: &Object, d: &Object) -> Object {
+    let input = match x.as_atom() {
+        Some(s) => s,
+        None => return Object::Bottom,
+    };
+    let command: crate::arest::Command = match serde_json::from_str(input) {
+        Ok(c) => c,
+        Err(e) => return Object::atom(&format!("⊥ {}", e)),
+    };
+    let state = crate::compile::state_to_domain(d);
+    let pop_state = crate::parse_forml2::domain_to_state(&state);
+    let result = crate::arest::apply_command_defs(d, &command, &pop_state);
+    match serde_json::to_string(&result) {
+        Ok(json) => Object::atom(&json),
+        Err(e) => Object::atom(&format!("⊥ {}", e)),
     }
 }
 
@@ -1059,6 +1139,8 @@ fn metacompose_atom(name: &str, d: &Object) -> Func {
         primitives::NOT => Func::Not,
         primitives::FETCH => Func::Fetch,
         primitives::STORE => Func::Store,
+        // Platform primitives: "platform:compile", "platform:apply_command", ...
+        s if s.starts_with("platform:") => Func::Platform(s["platform:".len()..].to_string()),
         // Selector atoms: "1", "2", "3", ...
         s if s.parse::<usize>().is_ok() => Func::Selector(s.parse().unwrap()),
         // Undefined atom → ⊥̄
@@ -1203,6 +1285,7 @@ pub fn func_to_object(func: &Func) -> Object {
             Object::atom(forms::WHILE), func_to_object(p), func_to_object(f),
         ]),
         Func::Def(name) => Object::atom(name),
+        Func::Platform(name) => Object::atom(&format!("platform:{}", name)),
         Func::Native(_) => Object::atom("<native>"),
     }
 }
@@ -1453,7 +1536,7 @@ impl Func {
     /// Pure Func = no Native anywhere in the tree.
     pub fn has_native(&self) -> bool {
         match self {
-            Func::Native(_) => true,
+            Func::Native(_) | Func::Platform(_) => true,
             Func::Compose(f, g) => f.has_native() || g.has_native(),
             Func::Construction(fs) => fs.iter().any(|f| f.has_native()),
             Func::Condition(p, f, g) => p.has_native() || f.has_native() || g.has_native(),
@@ -1515,6 +1598,7 @@ impl fmt::Debug for Func {
             Func::BinaryToUnary(g, x) => write!(f, "(bu {:?} {:?})", g, x),
             Func::While(p, g) => write!(f, "(while {:?} {:?})", p, g),
             Func::Def(name) => write!(f, "{}", name),
+            Func::Platform(name) => write!(f, "platform:{}", name),
             Func::Native(_) => write!(f, "<native>"),
         }
     }
