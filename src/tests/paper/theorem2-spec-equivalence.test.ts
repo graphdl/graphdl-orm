@@ -140,8 +140,14 @@ describe('Corollary 1 — Violation Verbalization', () => {
     expect(compiled.handle).toBeGreaterThanOrEqual(0)
   })
 
-  // Engine gap: evaluate def expects population in AST format, not JSON.
-  it.todo('evaluating a response against an empty population returns violations')
+  it('create command returns violations array (Corollary 1: verbalization)', async () => {
+    const { apply } = await import('../helpers/domain-fixture')
+    const result = apply(compiled.handle, {
+      type: 'createEntity', noun: 'Ticket', domain: 'test',
+      fields: { ticketId: 'T1' },
+    })
+    expect(Array.isArray(result.violations)).toBe(true)
+  })
 
   it('violations object has expected shape (array or violations key)', () => {
     const population = JSON.stringify({ facts: {} })

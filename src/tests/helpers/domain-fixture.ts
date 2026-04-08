@@ -220,6 +220,12 @@ export function forwardChain(handle: number, population: string): any {
   return parseResult(system(handle, 'forward_chain', population))
 }
 
+/** Apply a command: create = emit ∘ validate ∘ derive ∘ resolve (Eq. 10).
+ *  Returns the full CommandResult with entities, violations, derivedCount, rejected. */
+export function apply(handle: number, command: { type: string; [k: string]: any }): any {
+  return parseResult(system(handle, 'apply', JSON.stringify(command)))
+}
+
 /** Raw system call for testing arbitrary def keys. */
 export function systemRaw(handle: number, key: string, input: string): string {
   return system(handle, key, input)
