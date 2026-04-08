@@ -196,14 +196,11 @@ mod db {
             Ok((name, text))
         }).unwrap_or_else(|e| { eprintln!("Failed to read defs: {}", e); std::process::exit(1); });
 
-        let mut defs = Vec::new();
-        let empty_defs = HashMap::new();
-        for row in rows {
-            let (name, text) = row.unwrap_or_else(|e| { eprintln!("Failed to read def row: {}", e); std::process::exit(1); });
-            let obj = ast::Object::parse(&text);
-            let func = ast::metacompose(&obj, &empty_defs);
-            defs.push((name, func));
-        }
+        let empty_d = ast::Object::phi();
+        let defs: Vec<(String, ast::Func)> = rows.filter_map(|row| {
+            let (name, text) = row.ok()?;
+            Some((name, ast::metacompose(&ast::Object::parse(&text), &empty_d)))
+        }).collect();
         defs
     }
 
