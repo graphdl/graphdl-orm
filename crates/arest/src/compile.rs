@@ -292,22 +292,17 @@ fn resolve_spans(ir: &Domain, spans: &[SpanDef]) -> Vec<ResolvedSpan> {
 /// Collect (noun_name, enum_values) for value-type nouns in spanned fact types.
 /// Deduplicates by noun name -- each noun's enum values appear at most once.
 fn collect_enum_values(ir: &Domain, spans: &[SpanDef]) -> Vec<(String, Vec<String>)> {
-    let mut seen = HashSet::new();
-    let mut result = Vec::new();
-    for span in spans {
-        if let Some(ft) = ir.fact_types.get(&span.fact_type_id) {
-            for role in &ft.roles {
-                if seen.contains(&role.noun_name) { continue; }
-                if let Some(vals) = ir.enum_values.get(&role.noun_name) {
-                    if !vals.is_empty() {
-                        seen.insert(role.noun_name.clone());
-                        result.push((role.noun_name.clone(), vals.clone()));
-                    }
-                }
-            }
-        }
-    }
-    result
+    // α(span → roles) : spans → flat_map → filter(has_enum ∧ ¬seen) → deduplicate
+    spans.iter()
+        .filter_map(|span| ir.fact_types.get(&span.fact_type_id))
+        .flat_map(|ft| ft.roles.iter())
+        .filter_map(|role| ir.enum_values.get(&role.noun_name)
+            .filter(|vals| !vals.is_empty())
+            .map(|vals| (role.noun_name.clone(), vals.clone())))
+        .fold((HashSet::new(), Vec::new()), |(mut seen, mut result), (name, vals)| {
+            if seen.insert(name.clone()) { result.push((name, vals)); }
+            (seen, result)
+        }).1
 }
 
 /// Derive state machines from instance facts in P.
@@ -315,77 +310,69 @@ fn collect_enum_values(ir: &Domain, spans: &[SpanDef]) -> Vec<(String, Vec<Strin
 fn derive_state_machines_from_facts(facts: &[GeneralInstanceFact]) -> HashMap<String, StateMachineDef> {
     let mut machines: HashMap<String, StateMachineDef> = HashMap::new();
 
-    // Pass 1: State Machine Definition 'X' is for Noun 'Y'
-    // Field name is the graph schema ID from the declared fact type.
-    for f in facts {
-        if f.subject_noun == "State Machine Definition" && f.object_noun == "Noun" {
-            machines.entry(f.subject_value.clone()).or_insert(StateMachineDef {
-                noun_name: f.object_value.clone(),
-                statuses: vec![],
-                transitions: vec![],
+    // Pass 1: fold over facts → machines (SM Definition 'X' is for Noun 'Y')
+    let mut machines = facts.iter()
+        .filter(|f| f.subject_noun == "State Machine Definition" && f.object_noun == "Noun")
+        .fold(machines, |mut acc, f| {
+            acc.entry(f.subject_value.clone()).or_insert(StateMachineDef {
+                noun_name: f.object_value.clone(), statuses: vec![], transitions: vec![],
             });
-        }
-    }
+            acc
+        });
 
-    // Pass 2: Status 'S' is initial in State Machine Definition 'X'
-    for f in facts {
-        if f.subject_noun == "Status" && f.object_noun == "State Machine Definition" {
+    // Pass 2: fold initial statuses (Status 'S' is initial in SM Definition 'X')
+    facts.iter()
+        .filter(|f| f.subject_noun == "Status" && f.object_noun == "State Machine Definition")
+        .for_each(|f| {
             if let Some(sm) = machines.get_mut(&f.object_value) {
                 if !sm.statuses.contains(&f.subject_value) {
                     sm.statuses.insert(0, f.subject_value.clone());
                 }
             }
-        }
-    }
+        });
 
-    // Pass 3: Build transition lookup from instance facts.
-    // Match on object noun type, not field name strings.
-    let mut t_from: HashMap<String, String> = HashMap::new();
-    let mut t_to: HashMap<String, String> = HashMap::new();
-    let mut t_sm: HashMap<String, String> = HashMap::new();
-    let mut t_event: HashMap<String, String> = HashMap::new();
+    // Pass 3: fold transition facts into lookup maps
+    let (t_from, t_to, t_sm, t_event) = facts.iter()
+        .filter(|f| f.subject_noun == "Transition")
+        .fold(
+            (HashMap::new(), HashMap::new(), HashMap::new(), HashMap::<String,String>::new()),
+            |(mut from, mut to, mut sm, mut event), f| {
+                match f.object_noun.as_str() {
+                    "Status" => {
+                        let field_lower = f.field_name.to_lowercase();
+                        if field_lower.contains("from") { from.insert(f.subject_value.clone(), f.object_value.clone()); }
+                        else if field_lower.contains("to") { to.insert(f.subject_value.clone(), f.object_value.clone()); }
+                    }
+                    "State Machine Definition" => { sm.insert(f.subject_value.clone(), f.object_value.clone()); }
+                    "Event Type" => { event.insert(f.subject_value.clone(), f.object_value.clone()); }
+                    _ => {}
+                };
+                (from, to, sm, event)
+            },
+        );
 
-    for f in facts {
-        if f.subject_noun == "Transition" {
-            if f.object_noun == "Status" {
-                // Distinguish "is from" vs "is to" by the field name (graph schema ID)
-                let field_lower = f.field_name.to_lowercase();
-                if field_lower.contains("from") {
-                    t_from.insert(f.subject_value.clone(), f.object_value.clone());
-                } else if field_lower.contains("to") {
-                    t_to.insert(f.subject_value.clone(), f.object_value.clone());
-                }
-            } else if f.object_noun == "State Machine Definition" {
-                t_sm.insert(f.subject_value.clone(), f.object_value.clone());
-            } else if f.object_noun == "Event Type" {
-                t_event.insert(f.subject_value.clone(), f.object_value.clone());
+    // Assemble: α(transition_name → add_to_machine) over unique transition names
+    t_from.keys().chain(t_to.keys()).collect::<HashSet<_>>().into_iter()
+        .filter_map(|t_name| {
+            let from = t_from.get(t_name)?.clone();
+            let to = t_to.get(t_name)?.clone();
+            let event = t_event.get(t_name).cloned().unwrap_or_else(|| t_name.clone());
+            let target = t_sm.get(t_name).cloned()
+                .or_else(|| machines.iter()
+                    .find(|(_, sm)| sm.statuses.contains(&from) || sm.statuses.contains(&to))
+                    .map(|(k, _)| k.clone()))
+                .or_else(|| machines.keys().next().cloned());
+            Some((target?, from, to, event))
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .for_each(|(key, from, to, event)| {
+            if let Some(sm) = machines.get_mut(&key) {
+                if !sm.statuses.contains(&from) { sm.statuses.push(from.clone()); }
+                if !sm.statuses.contains(&to) { sm.statuses.push(to.clone()); }
+                sm.transitions.push(TransitionDef { from, to, event, guard: None });
             }
-        }
-    }
-
-    // Assemble transitions
-    let all_transitions: HashSet<&String> = t_from.keys().chain(t_to.keys()).collect();
-    for t_name in all_transitions {
-        let from = match t_from.get(t_name) { Some(s) => s.clone(), None => continue };
-        let to = match t_to.get(t_name) { Some(s) => s.clone(), None => continue };
-        let event = t_event.get(t_name).cloned().unwrap_or_else(|| t_name.clone());
-
-        // Find which SM this transition belongs to
-        let target_key = if let Some(name) = t_sm.get(t_name) {
-            Some(name.clone())
-        } else {
-            machines.iter()
-                .find(|(_, sm)| sm.statuses.contains(&from) || sm.statuses.contains(&to))
-                .map(|(k, _)| k.clone())
-                .or_else(|| machines.keys().next().cloned())
-        };
-
-        if let Some(sm) = target_key.and_then(|k| machines.get_mut(&k)) {
-            if !sm.statuses.contains(&from) { sm.statuses.push(from.clone()); }
-            if !sm.statuses.contains(&to) { sm.statuses.push(to.clone()); }
-            sm.transitions.push(TransitionDef { from, to, event, guard: None });
-        }
-    }
+        });
 
     machines
 }
