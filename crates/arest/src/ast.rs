@@ -871,9 +871,9 @@ fn platform_apply_command(x: &Object, d: &Object) -> Object {
         Ok(c) => c,
         Err(e) => return Object::atom(&format!("⊥ {}", e)),
     };
-    let state = crate::compile::state_to_domain(d);
-    let pop_state = crate::parse_forml2::domain_to_state(&state);
-    let result = crate::arest::apply_command_defs(d, &command, &pop_state);
+    // D contains both population cells and def cells.
+    // apply_command_defs uses d for ρ-dispatch and state for population.
+    let result = crate::arest::apply_command_defs(d, &command, d);
     match serde_json::to_string(&result) {
         Ok(s) => Object::atom(&s),
         Err(e) => Object::atom(&format!("⊥ {}", e)),
