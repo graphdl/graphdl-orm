@@ -19,20 +19,12 @@ pub(crate) fn run_machine_ast(
     events: &[&str],
 ) -> String {
     let defs = std::collections::HashMap::new();
-    let mut state = machine.initial.clone();
-
-    for event in events {
-        let input = ast::Object::seq(vec![
-            ast::Object::atom(&state),
-            ast::Object::atom(event),
-        ]);
-        let result = ast::apply(&machine.func, &input, &defs);
-        if let Some(next) = result.as_atom() {
-            state = next.to_string();
-        }
-    }
-
-    state
+    events.iter().fold(machine.initial.clone(), |state, event| {
+        let input = ast::Object::seq(vec![ast::Object::atom(&state), ast::Object::atom(event)]);
+        ast::apply(&machine.func, &input, &defs)
+            .as_atom().map(|s| s.to_string())
+            .unwrap_or(state)
+    })
 }
 
 // -- Forward Chaining -------------------------------------------------
@@ -66,56 +58,77 @@ pub fn forward_chain_defs_state(
     derivation_defs: &[(&str, &ast::Func)],
     state: &ast::Object,
 ) -> (ast::Object, Vec<DerivedFact>) {
-    let mut current_state = state.clone();
-    let mut all_derived: Vec<DerivedFact> = Vec::new();
-    let max_iterations = 100;
     let defs = std::collections::HashMap::new();
 
-    for _ in 0..max_iterations {
-        let pop_obj = ast::encode_state(&current_state);
-        let mut new_facts: Vec<DerivedFact> = Vec::new();
-
-        for (name, func) in derivation_defs {
-            let result = ast::apply(func, &pop_obj, &defs);
-            if let Some(items) = result.as_seq() {
-                for item in items {
-                    if let Some(fact_items) = item.as_seq() {
-                        if fact_items.len() >= 3 {
-                            let ft_id = fact_items[0].as_atom().unwrap_or("").to_string();
-                            let reading = fact_items[1].as_atom().unwrap_or("").to_string();
-                            let bindings: Vec<(String, String)> = fact_items[2].as_seq()
-                                .unwrap_or(&[])
-                                .iter()
-                                .filter_map(|b| {
-                                    let pair = b.as_seq()?;
-                                    if pair.len() == 2 {
-                                        Some((pair[0].as_atom()?.to_string(), pair[1].as_atom()?.to_string()))
-                                    } else { None }
-                                })
-                                .collect();
-                            let fact = DerivedFact {
-                                fact_type_id: ft_id, reading, bindings,
-                                derived_by: name.to_string(),
-                                confidence: Confidence::Definitive,
-                            };
-                            if !state_contains_fact(&current_state, &fact)
-                                && !all_derived.iter().any(|d| same_fact(d, &fact))
-                                && !new_facts.iter().any(|d| same_fact(d, &fact))
-                            { new_facts.push(fact); }
-                        }
-                    }
-                }
-            }
-        }
-
-        if new_facts.is_empty() { break; }
-        for fact in &new_facts {
-            let pairs: Vec<(&str, &str)> = fact.bindings.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-            current_state = ast::cell_push(&fact.fact_type_id, ast::fact_from_pairs(&pairs), &current_state);
-        }
-        all_derived.extend(new_facts);
+    /// Apply all derivation rules once, returning novel facts.
+    fn derive_one_round(
+        derivation_defs: &[(&str, &ast::Func)],
+        current_state: &ast::Object,
+        all_derived: &[DerivedFact],
+        defs: &std::collections::HashMap<String, ast::Func>,
+    ) -> Vec<DerivedFact> {
+        let pop_obj = ast::encode_state(current_state);
+        derivation_defs.iter()
+            .flat_map(|(name, func)| {
+                let result = ast::apply(func, &pop_obj, defs);
+                let name = name.to_string();
+                result.as_seq().into_iter()
+                    .flat_map(move |items| items.iter().cloned().collect::<Vec<_>>())
+                    .filter_map(move |item| parse_derived_fact(&item, &name))
+                    .collect::<Vec<_>>()
+            })
+            .filter(|fact| {
+                !state_contains_fact(current_state, fact)
+                    && !all_derived.iter().any(|d| same_fact(d, fact))
+            })
+            .fold(Vec::new(), |mut acc, fact| {
+                if !acc.iter().any(|d| same_fact(d, &fact)) { acc.push(fact); }
+                acc
+            })
     }
-    (current_state, all_derived)
+
+    // Fixed-point iteration: apply rules until no new facts (or 100 rounds)
+    let (final_state, all_derived, _) = (0..100).fold(
+        (state.clone(), Vec::<DerivedFact>::new(), false),
+        |(current_state, all_derived, done), _| {
+            if done { return (current_state, all_derived, true); }
+            let new_facts = derive_one_round(derivation_defs, &current_state, &all_derived, &defs);
+            if new_facts.is_empty() {
+                (current_state, all_derived, true)
+            } else {
+                let new_state = new_facts.iter().fold(current_state, |acc, fact| {
+                    let pairs: Vec<(&str, &str)> = fact.bindings.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+                    ast::cell_push(&fact.fact_type_id, ast::fact_from_pairs(&pairs), &acc)
+                });
+                let all = [all_derived, new_facts].concat();
+                (new_state, all, false)
+            }
+        },
+    );
+    (final_state, all_derived)
+}
+
+/// Parse a derivation result Object into a DerivedFact.
+fn parse_derived_fact(item: &ast::Object, derived_by: &str) -> Option<DerivedFact> {
+    let fact_items = item.as_seq()?;
+    if fact_items.len() < 3 { return None; }
+    let ft_id = fact_items[0].as_atom()?.to_string();
+    let reading = fact_items[1].as_atom()?.to_string();
+    let bindings: Vec<(String, String)> = fact_items[2].as_seq()
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|b| {
+            let pair = b.as_seq()?;
+            if pair.len() == 2 {
+                Some((pair[0].as_atom()?.to_string(), pair[1].as_atom()?.to_string()))
+            } else { None }
+        })
+        .collect();
+    Some(DerivedFact {
+        fact_type_id: ft_id, reading, bindings,
+        derived_by: derived_by.to_string(),
+        confidence: Confidence::Definitive,
+    })
 }
 
 /// Check if a derived fact already exists in the state.

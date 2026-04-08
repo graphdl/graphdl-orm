@@ -254,21 +254,17 @@ fn create_via_defs(
 ) -> CommandResult {
     let entity_id = explicit_id.unwrap_or("").to_string();
 
-    let mut new_state = state.clone();
     let mut entity_data = fields.clone();
     entity_data.insert("domain".to_string(), domain.to_string());
 
     let resolve_key = format!("resolve:{}", noun);
-    for (field_name, value) in &entity_data {
+    let new_state = entity_data.iter().fold(state.clone(), |acc, (field_name, value)| {
         let ft_id = defs.get(&resolve_key)
             .map(|f| ast::apply(f, &ast::Object::atom(&field_name.to_lowercase()), defs))
             .and_then(|o| o.as_atom().map(|s| s.to_string()))
             .unwrap_or_else(|| resolve_fact_type_id_defs(defs, noun, field_name));
-        new_state = ast::cell_push(&ft_id, ast::fact_from_pairs(&[
-            (noun, &entity_id),
-            (field_name.as_str(), value.as_str()),
-        ]), &new_state);
-    }
+        ast::cell_push(&ft_id, ast::fact_from_pairs(&[(noun, &entity_id), (field_name.as_str(), value.as_str())]), &acc)
+    });
 
     // -- derive --
     let derivation_defs: Vec<(&str, &ast::Func)> = defs.iter()
