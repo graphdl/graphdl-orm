@@ -148,29 +148,26 @@ fn try_ring(line: &str, noun_names: &[String]) -> Option<ParseAction> {
     }
 
     // Conditional ring patterns: "If A1 R A2 [and ...] then [it is impossible that] ..."
-    if !clean.starts_with("If ") { return None; }
+    clean.starts_with("If ").then_some(())?;
     let then_idx = clean.find(" then ")?;
     let antecedent = &clean[3..then_idx]; // everything after "If " up to " then "
     let consequent = &clean[then_idx + 6..]; // everything after " then "
 
     // All role tokens in the antecedent must share the same base noun type.
     // Extract words that match known nouns (with or without trailing digit subscripts).
-    // We collect all noun-like tokens (noun + optional digit suffix) from the antecedent.
     let role_bases: Vec<&str> = antecedent
         .split_whitespace()
         .filter_map(|word| {
-            // Strip trailing punctuation
             let w = word.trim_end_matches(',');
-            // Check if base (digits stripped) matches a known noun
             let (base, _) = parse_role_token(w);
             noun_names.iter().any(|n| n == base).then_some(base)
         })
         .collect();
 
     // Need at least 2 role tokens in antecedent, all with the same base
-    if role_bases.len() < 2 { return None; }
+    (role_bases.len() >= 2).then_some(())?;
     let first_base = role_bases[0];
-    if !role_bases.iter().all(|b| *b == first_base) { return None; }
+    role_bases.iter().all(|b| *b == first_base).then_some(())?;
 
     // Also check consequent contains the same base noun (subscripted or plain)
     let consequent_has_same_noun = {
@@ -185,7 +182,7 @@ fn try_ring(line: &str, noun_names: &[String]) -> Option<ParseAction> {
             base == first_base
         })
     };
-    if !consequent_has_same_noun { return None; }
+    consequent_has_same_noun.then_some(())?;
 
     let has_and = antecedent.contains(" and ");
     let impossible = consequent.starts_with("it is impossible that ");
@@ -222,26 +219,25 @@ fn try_ring(line: &str, noun_names: &[String]) -> Option<ParseAction> {
 fn try_subset(line: &str, noun_names: &[String]) -> Option<ParseAction> {
     let clean = line.trim_end_matches('.');
     // Must start with "If " and contain " then "
-    if !clean.starts_with("If ") { return None; }
+    clean.starts_with("If ").then_some(())?;
     let then_idx = clean.find(" then ")?;
     let antecedent = &clean[3..then_idx];
     let consequent = &clean[then_idx + 6..];
 
     // Antecedent must contain "some" (existential), consequent must contain "that" (back-ref)
-    if !antecedent.contains("some ") { return None; }
-    if !consequent.contains("that ") { return None; }
+    antecedent.contains("some ").then_some(())?;
+    consequent.contains("that ").then_some(())?;
 
     // Collect base noun types from antecedent using find_nouns (handles multi-word nouns)
     let stripped_ant = antecedent.replace("some ", "").replace("that ", "");
     let ant_found = find_nouns(&stripped_ant, noun_names);
     let ant_bases: Vec<&str> = ant_found.iter().map(|(_, _, n)| n.as_str()).collect();
 
-    if ant_bases.len() < 2 { return None; }
+    (ant_bases.len() >= 2).then_some(())?;
 
     // Subset has multiple DIFFERENT base noun types (distinguishes from ring which has all same)
     let first = ant_bases[0];
-    let all_same = ant_bases.iter().all(|b| b == &first);
-    if all_same { return None; }
+    (!ant_bases.iter().all(|b| b == &first)).then_some(())?;
 
     // Build spans: [0] = subset (antecedent), [1] = superset (consequent)
     // SpanDef with empty fact_type_id -- resolve_constraint_schema fills it in later
@@ -263,7 +259,7 @@ fn try_equality(line: &str) -> Option<ParseAction> {
     let clean = line.trim_end_matches('.');
     let matches = clean.contains(" if and only if ")
         || clean.to_lowercase().starts_with("all or none of the following hold");
-    if !matches { return None; }
+    matches.then_some(())?;
     Some(ParseAction::AddConstraint(ConstraintDef {
         id: String::new(), kind: "EQ".into(), modality: "alethic".into(),
         deontic_operator: None, text: clean.into(),
@@ -315,19 +311,18 @@ fn try_set_comparison(line: &str, noun_names: &[String]) -> Option<ParseAction> 
     // "Each A R1 some B1 or R2 some B2." -- DMaC disjunctive MC -> OR
     if let Some(rest) = clean.strip_prefix("Each ") {
         // Must contain " or " and reference known nouns
-        if !rest.contains(" or ") { return None; }
+        rest.contains(" or ").then_some(())?;
         // Find a known entity noun at the start
         let entity = noun_names.iter().find(|n| rest.starts_with(n.as_str()))?.clone();
         let after = rest[entity.len()..].trim();
         // Must have " or " in the remainder (not " or a/an " as in totality)
-        if !after.contains(" or ") { return None; }
+        after.contains(" or ").then_some(())?;
         // Exclude totality pattern: "Each X is a Y or a Z" (handled by try_totality)
-        // A disjunctive MC has " or is" or " or has" -- a verb after "or"
         let or_idx = after.find(" or ")?;
         let after_or = &after[or_idx + 4..];
         // Totality uses "a " / "an " after "or"; disjunctive MC uses a predicate verb
         let is_totality = after_or.starts_with("a ") || after_or.starts_with("an ");
-        if is_totality { return None; }
+        (!is_totality).then_some(())?;
 
         let clauses = vec![
             after[..or_idx].trim().to_string(),
@@ -359,7 +354,7 @@ fn try_frequency(line: &str, noun_names: &[String]) -> Option<ParseAction> {
 
     // The digit must come immediately after "at least " (not a word like "one")
     let min_end = after_al.find(|c: char| !c.is_ascii_digit())?;
-    if min_end == 0 { return None; } // no digit found
+    (min_end > 0).then_some(())?; // no digit found
     let min_str = &after_al[..min_end];
     let min_val: usize = min_str.parse().ok()?;
 
@@ -368,7 +363,7 @@ fn try_frequency(line: &str, noun_names: &[String]) -> Option<ParseAction> {
         .and_then(|i| {
             let after_am = &after_al[min_end + i + 8..];
             let max_end = after_am.find(|c: char| !c.is_ascii_digit()).unwrap_or(after_am.len());
-            if max_end == 0 { return None; }
+            (max_end > 0).then_some(())?;
             after_am[..max_end].parse().ok()
         });
 
@@ -425,11 +420,11 @@ fn try_external_uc(line: &str, noun_names: &[String]) -> Option<ParseAction> {
     // "For each B1 and B2, at most one A ..."
     if let Some(rest) = clean.strip_prefix("For each ") {
         // Must have "at most one" in the body
-        if !clean.contains("at most one") { return None; }
+        clean.contains("at most one").then_some(())?;
         // Must have " and " in the "For each" list (external UC uses "B1 and B2")
         let comma_idx = rest.find(',')?;
         let quantified = &rest[..comma_idx];
-        if !quantified.contains(" and ") { return None; }
+        quantified.contains(" and ").then_some(())?;
 
         // Find the entity noun after "at most one"
         let after_amo = clean.find("at most one ")?;
