@@ -13,6 +13,22 @@
 use crate::types::*;
 use std::collections::HashMap;
 
+/// Metamodel-reserved noun names. User domains MUST NOT redeclare these —
+/// the metamodel bootstrap owns them. The FORML2 parser rejects any attempt
+/// by a user domain to shadow these. The first (bootstrap) declaration is
+/// allowed; once present in `existing_nouns`, redeclaration is rejected.
+pub(crate) const METAMODEL_NOUNS: &[&str] = &[
+    "Noun",
+    "Graph Schema",
+    "Role",
+    "Constraint",
+    "State Machine Definition",
+    "Transition",
+    "Status",
+    "Event Type",
+    "Domain Change",
+];
+
 /// Metadata for a noun that is stored on Domain maps, not on NounDef.
 #[derive(Default, Clone)]
 struct NounMeta {
@@ -555,6 +571,27 @@ pub fn parse_markdown_with_nouns(input: &str, existing_nouns: &HashMap<String, N
 }
 
 pub fn parse_markdown_with_context(input: &str, existing_nouns: &HashMap<String, NounDef>, existing_fact_types: &HashMap<String, FactTypeDef>) -> Result<Domain, String> {
+    // Metamodel namespace protection (security #23):
+    // First parse the input in isolation to see which nouns IT actually declares.
+    // If the input declares any metamodel-reserved noun AND that noun is already
+    // present in `existing_nouns` (i.e. this is a user domain layered on top of
+    // the metamodel bootstrap), reject. The bootstrap case (no existing nouns
+    // for those names) is allowed to declare them exactly once.
+    let mut standalone = Domain {
+        domain: String::new(), nouns: HashMap::new(), fact_types: HashMap::new(),
+        constraints: vec![], state_machines: HashMap::new(), derivation_rules: vec![],
+        general_instance_facts: vec![],
+        subtypes: HashMap::new(), enum_values: HashMap::new(),
+        ref_schemes: HashMap::new(), objectifications: HashMap::new(),
+        named_spans: HashMap::new(), autofill_spans: vec![],
+    };
+    parse_into(&mut standalone, input)?;
+    if let Some(reserved) = METAMODEL_NOUNS.iter()
+        .find(|n| standalone.nouns.contains_key(**n) && existing_nouns.contains_key(**n))
+    {
+        return Err(format!("metamodel noun '{}' cannot be redeclared", reserved));
+    }
+
     let mut ir = Domain {
         domain: String::new(), nouns: existing_nouns.clone(), fact_types: existing_fact_types.clone(),
         constraints: vec![], state_machines: HashMap::new(), derivation_rules: vec![],
@@ -565,6 +602,123 @@ pub fn parse_markdown_with_context(input: &str, existing_nouns: &HashMap<String,
     };
     parse_into(&mut ir, input)?;
     Ok(ir)
+}
+
+/// SSRF defense (#25). Reject URLs that point at internal/loopback/link-local
+/// networks, file:// schemes, or internal DNS names. Hardcoded patterns only —
+/// no DNS resolution, no network I/O. Called during platform_compile to
+/// validate External System instance facts before they enter state.
+pub fn is_forbidden_url(url: &str) -> bool {
+    let trimmed = url.trim();
+    let lower = trimmed.to_lowercase();
+
+    // file:// scheme is always forbidden
+    match lower.starts_with("file://") {
+        true => return true,
+        false => {}
+    }
+
+    // Extract the host component from http(s) URLs. Non-http schemes fall
+    // through and are allowed (the check is scoped to federated HTTP URLs).
+    let after_scheme = match lower.strip_prefix("http://")
+        .or_else(|| lower.strip_prefix("https://"))
+    {
+        Some(rest) => rest,
+        None => return false,
+    };
+
+    // Strip userinfo (before '@'), then take host up to ':' '/' '?' or '#'.
+    let no_userinfo = after_scheme.rfind('@').map(|i| &after_scheme[i + 1..]).unwrap_or(after_scheme);
+    let host_end = no_userinfo.find(|c: char| c == ':' || c == '/' || c == '?' || c == '#')
+        .unwrap_or(no_userinfo.len());
+    let host = &no_userinfo[..host_end];
+
+    // Strip IPv6 brackets (e.g. [::1]) so the IPv6 checks see a bare address.
+    let host_bare = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
+
+    // Empty host is bottom-safe — treat as forbidden.
+    match host_bare.is_empty() {
+        true => return true,
+        false => {}
+    }
+
+    // Exact-name checks
+    match host_bare {
+        "localhost" | "::1" | "::" | "0.0.0.0" => return true,
+        _ => {}
+    }
+
+    // Internal DNS suffixes (case-insensitive — lower already applied)
+    let forbidden_suffix = host_bare.ends_with(".local")
+        || host_bare.ends_with(".internal")
+        || host_bare.ends_with(".localhost");
+    match forbidden_suffix {
+        true => return true,
+        false => {}
+    }
+
+    // IPv4 checks: parse dotted-quad octets. Non-numeric hosts fall through.
+    let octets: Vec<u16> = host_bare.split('.')
+        .filter_map(|p| p.parse::<u16>().ok())
+        .collect();
+    let is_ipv4 = octets.len() == 4 && octets.iter().all(|o| *o <= 255);
+    match is_ipv4 {
+        true => {
+            let (a, b) = (octets[0], octets[1]);
+            // 127.*.*.* loopback
+            // 10.*.*.* private
+            // 169.254.*.* link-local (incl. AWS metadata 169.254.169.254)
+            // 192.168.*.* private
+            // 172.16-31.*.* private
+            let forbidden_v4 = a == 127
+                || a == 10
+                || (a == 169 && b == 254)
+                || (a == 192 && b == 168)
+                || (a == 172 && b >= 16 && b <= 31);
+            match forbidden_v4 {
+                true => return true,
+                false => {}
+            }
+        }
+        false => {}
+    }
+
+    // IPv6 link-local: fe80::/10 — first octet of the address
+    // is 0xfe and top two bits of the second are 10 (0x80..0xbf).
+    // Covers fe80: through febf:.
+    let ipv6_linklocal = host_bare.starts_with("fe8")
+        || host_bare.starts_with("fe9")
+        || host_bare.starts_with("fea")
+        || host_bare.starts_with("feb");
+    match ipv6_linklocal {
+        true => return true,
+        false => {}
+    }
+
+    // IPv6 unique-local: fc00::/7 (fc00 through fdff)
+    let ipv6_ula = host_bare.starts_with("fc") || host_bare.starts_with("fd");
+    // Only treat as ULA if the host looks like an IPv6 address (contains ':').
+    match ipv6_ula && host_bare.contains(':') {
+        true => return true,
+        false => {}
+    }
+
+    false
+}
+
+/// Scan the InstanceFact cell in parsed state and return the first
+/// forbidden URL found, if any. Used by platform_compile to reject
+/// External System federation to internal/loopback/link-local hosts.
+pub fn find_forbidden_instance_url(state: &crate::ast::Object) -> Option<String> {
+    use crate::ast::{fetch_or_phi, binding};
+    fetch_or_phi("InstanceFact", state)
+        .as_seq()
+        .and_then(|facts| {
+            facts.iter().find_map(|f| {
+                let object_value = binding(f, "objectValue")?;
+                is_forbidden_url(object_value).then(|| object_value.to_string())
+            })
+        })
 }
 
 /// Parse FORML2 readings directly into an Object state.

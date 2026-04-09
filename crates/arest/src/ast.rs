@@ -826,7 +826,10 @@ fn apply_platform(name: &str, x: &Object, d: &Object) -> Object {
 /// compile ∘ parse: readings text → new defs merged into D.
 /// Returns the new state D' (caller stores it).
 /// Max input buffer size — platform hardware limit.
-const PLATFORM_MAX_INPUT: usize = 1_024 * 1_024;
+pub(crate) const PLATFORM_MAX_INPUT: usize = 1_024 * 1_024;
+
+/// Max per-field value size within a Command — DoS bound.
+pub(crate) const PLATFORM_MAX_FIELD: usize = 64 * 1024;
 
 fn platform_compile(x: &Object, d: &Object) -> Object {
     let input = match x.as_atom() {
@@ -840,6 +843,14 @@ fn platform_compile(x: &Object, d: &Object) -> Object {
         Ok(s) => s,
         Err(e) => return Object::atom(&format!("⊥ {}", e)),
     };
+
+    // SSRF defense (#25): External System federation must not reach
+    // internal/loopback/link-local hosts, file:// URLs, or internal DNS.
+    // Walk the parsed InstanceFact cell and reject any forbidden URL.
+    match crate::parse_forml2::find_forbidden_instance_url(&parsed) {
+        Some(url) => return Object::atom(&format!("⊥ forbidden URL in External System: {}", url)),
+        None => {}
+    }
 
     // Merge: foldl(concat_cell, D, cells(parsed))
     let merged_state = merge_states(d, &parsed);
@@ -866,19 +877,75 @@ fn platform_compile(x: &Object, d: &Object) -> Object {
 /// Authorization is enforced by the constraint pipeline, not by this function.
 fn platform_apply_command(x: &Object, d: &Object) -> Object {
     let input = match x.as_atom() {
-        Some(s) => s,
+        Some(s) if s.len() <= PLATFORM_MAX_INPUT => s,
+        Some(_) => return Object::atom("⊥ input exceeds platform buffer"),
         None => return Object::Bottom,
     };
     let command: crate::arest::Command = match serde_json::from_str(input) {
         Ok(c) => c,
         Err(e) => return Object::atom(&format!("⊥ {}", e)),
     };
+    // Per-field bound: reject commands whose field values exceed the platform limit.
+    match command_field_overflow(&command) {
+        Some(field) => return Object::atom(&format!("⊥ field '{}' exceeds platform buffer", field)),
+        None => {}
+    }
     // D contains both population cells and def cells.
     // apply_command_defs uses d for ρ-dispatch and state for population.
     let result = crate::arest::apply_command_defs(d, &command, d);
     match serde_json::to_string(&result) {
         Ok(s) => Object::atom(&s),
         Err(e) => Object::atom(&format!("⊥ {}", e)),
+    }
+}
+
+/// Walk a Command's string fields and return the name of the first field whose
+/// value exceeds PLATFORM_MAX_FIELD bytes, or None if all values are within bound.
+fn command_field_overflow(command: &crate::arest::Command) -> Option<&'static str> {
+    use crate::arest::Command;
+    let over = |s: &str| s.len() > PLATFORM_MAX_FIELD;
+    let map_over = |m: &std::collections::HashMap<String, String>| -> bool {
+        m.iter().any(|(k, v)| over(k) || over(v))
+    };
+    match command {
+        Command::CreateEntity { noun, domain, id, fields, sender } => {
+            match over(noun) { true => return Some("noun"), false => {} }
+            match over(domain) { true => return Some("domain"), false => {} }
+            match id.as_deref().map(over).unwrap_or(false) { true => return Some("id"), false => {} }
+            match map_over(fields) { true => return Some("fields"), false => {} }
+            match sender.as_deref().map(over).unwrap_or(false) { true => return Some("sender"), false => {} }
+            None
+        }
+        Command::Transition { entity_id, event, domain, current_status, sender } => {
+            match over(entity_id) { true => return Some("entityId"), false => {} }
+            match over(event) { true => return Some("event"), false => {} }
+            match over(domain) { true => return Some("domain"), false => {} }
+            match current_status.as_deref().map(over).unwrap_or(false) { true => return Some("currentStatus"), false => {} }
+            match sender.as_deref().map(over).unwrap_or(false) { true => return Some("sender"), false => {} }
+            None
+        }
+        Command::Query { schema_id, domain, target, bindings, sender } => {
+            match over(schema_id) { true => return Some("schemaId"), false => {} }
+            match over(domain) { true => return Some("domain"), false => {} }
+            match over(target) { true => return Some("target"), false => {} }
+            match map_over(bindings) { true => return Some("bindings"), false => {} }
+            match sender.as_deref().map(over).unwrap_or(false) { true => return Some("sender"), false => {} }
+            None
+        }
+        Command::UpdateEntity { noun, domain, entity_id, fields, sender } => {
+            match over(noun) { true => return Some("noun"), false => {} }
+            match over(domain) { true => return Some("domain"), false => {} }
+            match over(entity_id) { true => return Some("entityId"), false => {} }
+            match map_over(fields) { true => return Some("fields"), false => {} }
+            match sender.as_deref().map(over).unwrap_or(false) { true => return Some("sender"), false => {} }
+            None
+        }
+        Command::LoadReadings { markdown, domain, sender } => {
+            match over(markdown) { true => return Some("markdown"), false => {} }
+            match over(domain) { true => return Some("domain"), false => {} }
+            match sender.as_deref().map(over).unwrap_or(false) { true => return Some("sender"), false => {} }
+            None
+        }
     }
 }
 
