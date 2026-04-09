@@ -1461,86 +1461,53 @@ fn compile_modus_ponens(ir: &Domain) -> Vec<CompiledDerivation> {
 ///   a(derived_fact) . Filter(join_cond) . Concat . a(Filter(join) . DistL) . DistR . [ft1_facts, ft2_facts]
 ///   where join_cond checks role_value(1)(f1) = role_value(0)(f2) on the shared noun.
 fn compile_transitivity(ir: &Domain) -> Vec<CompiledDerivation> {
-    let mut derivations = Vec::new();
-
-    // Find binary fact types (exactly 2 roles) that share a noun
+    // Cross-product of binary fact types, filtered by shared noun (A->B, B->C)
     let binary_fts: Vec<(&String, &FactTypeDef)> = ir.fact_types.iter()
         .filter(|(_, ft)| ft.roles.len() == 2)
         .collect();
 
-    for (i, (ft1_id, ft1)) in binary_fts.iter().enumerate() {
-        for (j, (ft2_id, ft2)) in binary_fts.iter().enumerate() {
-            if i == j { continue; } // skip self-pairing
-            // Check if ft1's role[1] noun == ft2's role[0] noun (A->B, B->C)
-            let ft1_r1 = &ft1.roles[1].noun_name;
-            let ft2_r0 = &ft2.roles[0].noun_name;
+    binary_fts.iter().enumerate()
+        .flat_map(|(i, (ft1_id, ft1))| binary_fts.iter().enumerate()
+            .filter(move |(j, _)| *j != i)
+            .filter_map(move |(_, (ft2_id, ft2))| {
+                // Filter: ft1's role[1] noun == ft2's role[0] noun
+                (ft1.roles[1].noun_name == ft2.roles[0].noun_name).then(|| ())?;
 
-            if ft1_r1 != ft2_r0 {
-                continue;
-            }
+                let shared_noun = ft1.roles[1].noun_name.clone();
+                let src_noun = ft1.roles[0].noun_name.clone();
+                let dst_noun = ft2.roles[1].noun_name.clone();
+                let ft1_id_c = (*ft1_id).clone();
+                let ft2_id_c = (*ft2_id).clone();
+                let reading = format!("{} transitively relates to {} via {}", src_noun, dst_noun, shared_noun);
+                let transitive_ft_id = format!("_transitive_{}_{}", ft1_id_c, ft2_id_c);
 
-            let shared_noun = ft1_r1.clone();
-            let src_noun = ft1.roles[0].noun_name.clone();
-            let dst_noun = ft2.roles[1].noun_name.clone();
+                let ft1_facts = extract_facts_from_pop(&ft1_id_c);
+                let ft2_facts = extract_facts_from_pop(&ft2_id_c);
 
-            let ft1_id_c = (*ft1_id).clone();
-            let ft2_id_c = (*ft2_id).clone();
-            let reading = format!("{} transitively relates to {} via {}",
-                src_noun, dst_noun, shared_noun);
+                let join_cond = Func::compose(Func::Eq, Func::construction(vec![
+                    Func::compose(role_value(1), Func::Selector(1)),
+                    Func::compose(role_value(0), Func::Selector(2)),
+                ]));
 
-            let id = format!("_transitivity_{}_{}",  ft1_id_c, ft2_id_c);
-            let transitive_ft_id = format!("_transitive_{}_{}", ft1_id_c, ft2_id_c);
-
-            // Pure Func: equi-join ft1 x ft2 on shared noun.
-            // distr . [ft1_facts, ft2_facts], distl, Filter(join), extract derived.
-            let ft1_facts = extract_facts_from_pop(&ft1_id_c);
-            let ft2_facts = extract_facts_from_pop(&ft2_id_c);
-
-            // join condition: <f1, f2> -> role_value(1)(f1) = role_value(0)(f2)
-            // (shared noun is role 1 of ft1 and role 0 of ft2)
-            let join_cond = Func::compose(Func::Eq, Func::construction(vec![
-                Func::compose(role_value(1), Func::Selector(1)), // shared from f1
-                Func::compose(role_value(0), Func::Selector(2)), // shared from f2
-            ]));
-
-            // derived fact: <transitive_ft_id, reading, <<src_noun, role_value(0)(f1)>, <dst_noun, role_value(1)(f2)>>>
-            let derived_fact = Func::construction(vec![
-                Func::constant(Object::atom(&transitive_ft_id)),
-                Func::constant(Object::atom(&reading)),
-                Func::construction(vec![
+                let derived_fact = Func::construction(vec![
+                    Func::constant(Object::atom(&transitive_ft_id)),
+                    Func::constant(Object::atom(&reading)),
                     Func::construction(vec![
-                        Func::constant(Object::atom(&src_noun)),
-                        Func::compose(role_value(0), Func::Selector(1)),
+                        Func::construction(vec![Func::constant(Object::atom(&src_noun)), Func::compose(role_value(0), Func::Selector(1))]),
+                        Func::construction(vec![Func::constant(Object::atom(&dst_noun)), Func::compose(role_value(1), Func::Selector(2))]),
                     ]),
-                    Func::construction(vec![
-                        Func::constant(Object::atom(&dst_noun)),
-                        Func::compose(role_value(1), Func::Selector(2)),
-                    ]),
-                ]),
-            ]);
+                ]);
 
-            // a(derived_fact) . Filter(join) . Concat . a(distl) . distr . [ft1, ft2]
-            // Wait: distr gives <f1, ft2_all> pairs. distl gives <f1, f2> pairs. Need Concat to flatten.
-            let func = Func::compose(
-                Func::apply_to_all(derived_fact),
-                Func::compose(
-                    Func::Concat,
-                    Func::compose(
-                        Func::apply_to_all(Func::compose(Func::filter(join_cond), Func::DistL)),
-                        Func::compose(Func::DistR, Func::construction(vec![ft1_facts, ft2_facts])),
-                    ),
-                ),
-            );
-            derivations.push(CompiledDerivation {
-                id,
-                text: reading,
-                kind: DerivationKind::Transitivity,
-                func,
-            });
-        }
-    }
+                let func = Func::compose(Func::apply_to_all(derived_fact), Func::compose(Func::Concat,
+                    Func::compose(Func::apply_to_all(Func::compose(Func::filter(join_cond), Func::DistL)),
+                        Func::compose(Func::DistR, Func::construction(vec![ft1_facts, ft2_facts])))));
 
-    derivations
+                Some(CompiledDerivation {
+                    id: format!("_transitivity_{}_{}", ft1_id_c, ft2_id_c),
+                    text: reading, kind: DerivationKind::Transitivity, func,
+                })
+            }))
+        .collect()
 }
 
 /// CWA negation: for nouns with WorldAssumption::Closed,
