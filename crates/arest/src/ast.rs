@@ -2771,13 +2771,11 @@ mod tests {
         let input = format!("{}x{}", opens, closes);
         let result = Object::parse(&input);
         // Walk down 100 levels of Seq([...]) to reach Bottom
-        let mut current = &result;
-        for _ in 0..100 {
-            match current {
-                Object::Seq(items) if items.len() == 1 => current = &items[0],
-                other => { current = other; break; }
-            }
-        }
+        // (std::iter::successors = Backus's $\mathit{while}$ combining form)
+        let current = std::iter::successors(Some(&result), |c| match c {
+            Object::Seq(items) if items.len() == 1 => Some(&items[0]),
+            _ => None,
+        }).take(101).last().unwrap();
         assert_eq!(*current, Object::Bottom,
             "At depth 100+, parse should produce Bottom");
     }
