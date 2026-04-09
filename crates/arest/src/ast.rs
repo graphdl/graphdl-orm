@@ -423,11 +423,14 @@ pub fn defs_to_state(defs: &[(String, Func)], state: &Object) -> Object {
 }
 
 pub fn apply(func: &Func, x: &Object, d: &Object) -> Object {
-    // All functions are bottom-preserving
-    if x.is_bottom() {
-        return Object::Bottom;
+    // All functions are bottom-preserving: ⊥ propagates unchanged.
+    match x.is_bottom() {
+        true => Object::Bottom,
+        false => apply_nonbottom(func, x, d),
     }
+}
 
+fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
     match func {
         // ── Primitives ───────────────────────────────────────────
 
