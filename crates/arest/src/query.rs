@@ -126,11 +126,8 @@ mod tests {
     }
 
     fn state_with_facts(ft_id: &str, pairs_list: &[&[(&str, &str)]]) -> ast::Object {
-        let mut state = ast::Object::phi();
-        for pairs in pairs_list {
-            state = ast::cell_push(ft_id, ast::fact_from_pairs(pairs), &state);
-        }
-        state
+        pairs_list.iter().fold(ast::Object::phi(), |acc, pairs|
+            ast::cell_push(ft_id, ast::fact_from_pairs(pairs), &acc))
     }
 
     #[test]

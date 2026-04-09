@@ -62,13 +62,10 @@ fn create_impl() -> u32 {
 /// Legacy: parse_and_compile as create + compile for each readings pair.
 fn parse_and_compile_impl(readings: Vec<(String, String)>) -> Result<u32, String> {
     let h = create_impl();
-    for (_name, text) in &readings {
+    readings.iter().try_fold(h, |h, (_name, text)| {
         let result = system_impl(h, "compile", text);
-        if result.starts_with("⊥") {
-            return Err(result);
-        }
-    }
-    Ok(h)
+        if result.starts_with("⊥") { Err(result) } else { Ok(h) }
+    })
 }
 
 fn release_impl(handle: u32) {
