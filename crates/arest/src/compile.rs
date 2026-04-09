@@ -1299,92 +1299,55 @@ fn compile_join_derivation(ir: &Domain, rule: &DerivationRuleDef) -> CompiledDer
 ///   extracting bindings), and participates_in requires a find-by-ID lookup.
 ///   Both need Filter/Find primitives not yet in the AST.
 fn compile_subtype_inheritance(ir: &Domain) -> Vec<CompiledDerivation> {
-    let mut derivations = Vec::new();
+    // α(subtype_pair → derivation) : subtypes — filter out pairs with no supertype fact types
+    ir.subtypes.iter().filter_map(|(sub_name, super_name)| {
+        let sft: Vec<(String, String, usize)> = ir.fact_types.iter()
+            .flat_map(|(ft_id, ft)| ft.roles.iter()
+                .filter(|r| r.noun_name == *super_name)
+                .map(move |r| (ft_id.clone(), ft.reading.clone(), r.role_index)))
+            .collect();
+        if sft.is_empty() { return None; }
 
-    for (sub_name, super_name) in &ir.subtypes {
-        {
-            // Find all fact types where the supertype plays a role
-            let super_fact_types: Vec<(String, String, usize)> = ir.fact_types.iter()
-                .flat_map(|(ft_id, ft)| {
-                    ft.roles.iter()
-                        .filter(|r| r.noun_name == *super_name)
-                        .map(move |r| (ft_id.clone(), ft.reading.clone(), r.role_index))
-                })
-                .collect();
+        let sub = sub_name.clone();
+        let sup = super_name.clone();
+        let instances = instances_of_noun_func(&sub);
 
-            if super_fact_types.is_empty() {
-                continue;
-            }
+        // α(super_ft → check_and_derive) : super_fact_types
+        let ft_checks: Vec<Func> = sft.iter().map(|(ft_id, reading, role_idx)| {
+            let ft_facts = extract_facts_from_pop(ft_id);
+            let inst_in_fact = Func::compose(Func::Eq, Func::construction(vec![
+                Func::compose(role_value(*role_idx), Func::Selector(2)),
+                Func::Selector(1),
+            ]));
+            let participates = Func::compose(
+                Func::compose(Func::Not, Func::NullTest),
+                Func::compose(Func::filter(inst_in_fact), Func::DistL));
+            let derived_fact = Func::construction(vec![
+                Func::constant(Object::atom(ft_id)),
+                Func::constant(Object::atom(reading)),
+                Func::construction(vec![Func::construction(vec![
+                    Func::constant(Object::atom(&sup)), Func::Selector(1)])]),
+            ]);
+            let check_one = Func::condition(
+                Func::compose(Func::Not, participates),
+                Func::construction(vec![derived_fact]),
+                Func::constant(Object::phi()));
+            Func::compose(Func::Concat, Func::compose(
+                Func::apply_to_all(check_one),
+                Func::compose(Func::DistR, Func::construction(vec![instances.clone(), ft_facts]))))
+        }).collect();
 
-            let sub = sub_name.clone();
-            let sup = super_name.clone();
-            let sft = super_fact_types.clone();
-            let id = format!("_subtype_{}_{}", sub, sup);
-            let text = format!("{} is a subtype of {} -- inherits fact types", sub, sup);
-
-            // Pure Func: for each subtype instance, for each supertype fact type,
-            // check if instance participates. If not, derive inherited fact.
-            let instances = instances_of_noun_func(&sub);
-
-            // For each supertype fact type, build a check-and-derive Func.
-            let mut ft_checks: Vec<Func> = Vec::new();
-            for (ft_id, reading, role_idx) in &sft {
-                let ft_facts = extract_facts_from_pop(ft_id);
-
-                // participates: <instance, all_ft_facts> -> T if instance found
-                let inst_in_fact = Func::compose(Func::Eq, Func::construction(vec![
-                    Func::compose(role_value(*role_idx), Func::Selector(2)), // candidate's role value
-                    Func::Selector(1),                                       // instance value
-                ]));
-                let participates = Func::compose(
-                    Func::compose(Func::Not, Func::NullTest),
-                    Func::compose(Func::filter(inst_in_fact), Func::DistL),
-                );
-
-                // Derive fact when NOT participating
-                let not_participates = Func::compose(Func::Not, participates);
-
-                let derived_fact = Func::construction(vec![
-                    Func::constant(Object::atom(ft_id)),
-                    Func::constant(Object::atom(reading)),
-                    Func::construction(vec![Func::construction(vec![
-                        Func::constant(Object::atom(&sup)),
-                        Func::Selector(1), // instance value
-                    ])]),
-                ]);
-
-                // For each <instance, ft_facts>: if not participates, derive
-                let check_one = Func::condition(
-                    not_participates,
-                    Func::construction(vec![derived_fact]),
-                    Func::constant(Object::phi()),
-                );
-
-                // distr . [instances, ft_facts] -> <inst, ft_facts> pairs
-                ft_checks.push(Func::compose(
-                    Func::Concat,
-                    Func::compose(
-                        Func::apply_to_all(check_one),
-                        Func::compose(Func::DistR, Func::construction(vec![instances.clone(), ft_facts])),
-                    ),
-                ));
-            }
-
-            let func = match ft_checks.len() {
-                0 => Func::constant(Object::phi()),
-                1 => ft_checks.into_iter().next().unwrap(),
-                _ => Func::construction(ft_checks),
-            };
-            derivations.push(CompiledDerivation {
-                id,
-                text,
-                kind: DerivationKind::SubtypeInheritance,
-                func,
-            });
-        }
-    }
-
-    derivations
+        let func = match ft_checks.len() {
+            0 => Func::constant(Object::phi()),
+            1 => ft_checks.into_iter().next().unwrap(),
+            _ => Func::construction(ft_checks),
+        };
+        Some(CompiledDerivation {
+            id: format!("_subtype_{}_{}", sub, sup),
+            text: format!("{} is a subtype of {} -- inherits fact types", sub, sup),
+            kind: DerivationKind::SubtypeInheritance, func,
+        })
+    }).collect()
 }
 
 /// Modus ponens on subset constraints: if A subset B (SS constraint),
