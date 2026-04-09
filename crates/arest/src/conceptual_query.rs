@@ -73,16 +73,19 @@ fn find_nouns_in_segment(segment: &str, nouns: &[String]) -> Vec<String> {
     let mut sorted: Vec<&String> = nouns.iter().collect();
     sorted.sort_by(|a, b| b.len().cmp(&a.len()));
 
-    let mut found = Vec::new();
-    let mut remaining = segment.to_lowercase();
-
-    for noun in sorted {
-        let lower = noun.to_lowercase();
-        if remaining.contains(&lower) {
-            found.push(noun.clone());
-            remaining = remaining.replacen(&lower, "", 1);
-        }
-    }
+    let (found, _) = sorted.iter().fold(
+        (Vec::new(), segment.to_lowercase()),
+        |(mut found, remaining), noun| {
+            let lower = noun.to_lowercase();
+            if remaining.contains(&lower) {
+                found.push((*noun).clone());
+                let remaining = remaining.replacen(&lower, "", 1);
+                (found, remaining)
+            } else {
+                (found, remaining)
+            }
+        },
+    );
 
     found
 }
@@ -112,12 +115,9 @@ fn find_reading<'a>(from: &str, to: &str, readings: &'a [Reading]) -> Option<(&'
 }
 
 fn extract_predicate(reading: &Reading) -> String {
-    let mut text = reading.text.clone();
     let mut sorted = reading.nouns.clone();
     sorted.sort_by(|a, b| b.len().cmp(&a.len()));
-    for noun in &sorted {
-        text = text.replace(noun, "");
-    }
+    let text = sorted.iter().fold(reading.text.clone(), |acc, noun| acc.replace(noun, ""));
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
@@ -133,14 +133,15 @@ pub fn resolve_conceptual_query(
         .map(|seg| find_nouns_in_segment(seg, nouns))
         .collect();
 
-    let mut noun_sequence = Vec::new();
-    for seg_nouns in &segment_nouns {
-        for noun in seg_nouns {
-            if noun_sequence.is_empty() || noun_sequence.last().map(|n: &String| n.to_lowercase()) != Some(noun.to_lowercase()) {
-                noun_sequence.push(noun.clone());
+    let noun_sequence: Vec<String> = segment_nouns
+        .iter()
+        .flat_map(|seg_nouns| seg_nouns.iter().cloned())
+        .fold(Vec::new(), |mut acc, noun| {
+            if acc.last().map(|n: &String| n.to_lowercase()) != Some(noun.to_lowercase()) {
+                acc.push(noun);
             }
-        }
-    }
+            acc
+        });
 
     if noun_sequence.is_empty() {
         return ConceptualQueryResult { path: vec![], filters: vec![], root_noun: None };
@@ -149,47 +150,53 @@ pub fn resolve_conceptual_query(
         return ConceptualQueryResult { path: vec![], filters: vec![], root_noun: Some(noun_sequence[0].clone()) };
     }
 
-    let mut path = Vec::new();
     let root_noun = noun_sequence[0].clone();
 
-    for i in 1..noun_sequence.len() {
-        let to = &noun_sequence[i];
-        for j in (0..i).rev() {
-            let from = &noun_sequence[j];
-            if let Some((reading, inverse)) = find_reading(from, to, readings) {
-                let predicate = extract_predicate(reading);
-                path.push(QueryPathStep {
+    let path: Vec<QueryPathStep> = (1..noun_sequence.len())
+        .filter_map(|i| {
+            let to = &noun_sequence[i];
+            (0..i).rev().find_map(|j| {
+                let from = &noun_sequence[j];
+                find_reading(from, to, readings).map(|(reading, inverse)| QueryPathStep {
                     from: from.clone(),
-                    predicate,
+                    predicate: extract_predicate(reading),
                     to: to.clone(),
                     inverse,
-                });
-                break;
-            }
-        }
-    }
+                })
+            })
+        })
+        .collect();
 
     if path.is_empty() {
         return ConceptualQueryResult { path: vec![], filters: vec![], root_noun: None };
     }
 
     // Map filters to target nouns
-    let mut filters = Vec::new();
-    let original_segments: Vec<&str> = query.split(" that ").collect();
-    let mut filter_idx = 0;
-    for seg in &original_segments {
-        let count = seg.matches('\'').count() / 2;
-        if count > 0 {
-            let seg_nouns = find_nouns_in_segment(&seg.replace('\'', ""), nouns);
-            let field = seg_nouns.last().cloned().unwrap_or_default();
-            for _ in 0..count {
-                if filter_idx < filter_values.len() && !field.is_empty() {
-                    filters.push(Filter { field: field.clone(), value: filter_values[filter_idx].clone() });
-                }
-                filter_idx += 1;
+    let filters: Vec<Filter> = query
+        .split(" that ")
+        .scan(0usize, |filter_idx, seg| {
+            let count = seg.matches('\'').count() / 2;
+            if count > 0 {
+                let seg_nouns = find_nouns_in_segment(&seg.replace('\'', ""), nouns);
+                let field = seg_nouns.last().cloned().unwrap_or_default();
+                let seg_filters: Vec<Filter> = (0..count)
+                    .filter_map(|_| {
+                        let idx = *filter_idx;
+                        *filter_idx += 1;
+                        if idx < filter_values.len() && !field.is_empty() {
+                            Some(Filter { field: field.clone(), value: filter_values[idx].clone() })
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                Some(seg_filters)
+            } else {
+                Some(vec![])
             }
-        }
-    }
+        })
+        .flatten()
+        .collect();
 
     ConceptualQueryResult { path, filters, root_noun: Some(root_noun) }
 }

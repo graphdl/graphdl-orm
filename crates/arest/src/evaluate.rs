@@ -542,18 +542,14 @@ mod tests {
             None => return initial,
         };
 
-        let mut state = initial;
-        for event in events {
+        events.into_iter().fold(initial, |state, event| {
             let input = ast::Object::seq(vec![
                 ast::Object::atom(&state),
                 ast::Object::atom(event),
             ]);
             let result = ast::apply(func, &input, def_map);
-            if let Some(next) = result.as_atom() {
-                state = next.to_string();
-            }
-        }
-        state
+            result.as_atom().map(|s| s.to_string()).unwrap_or(state)
+        })
     }
 
     /// Extract derivation defs from the full defs list.
@@ -1549,18 +1545,16 @@ mod tests {
         ir.nouns.insert("SupportResponse".to_string(), make_noun("entity"));
         ir.nouns.insert("APIProduct".to_string(), make_noun("entity"));
         // Three fact types that all reference FieldName -- simulates multi-span constraint
-        for i in 1..=3 {
-            ir.fact_types.insert(format!("ft{}", i), FactTypeDef {
-                schema_id: String::new(),
-                reading: format!("SupportResponse names APIProduct by FieldName ({})", i),
-                readings: vec![],
-                roles: vec![
-                    RoleDef { noun_name: "SupportResponse".to_string(), role_index: 0 },
-                    RoleDef { noun_name: "APIProduct".to_string(), role_index: 1 },
-                    RoleDef { noun_name: "FieldName".to_string(), role_index: 2 },
-                ],
-            });
-        }
+        ir.fact_types.extend((1..=3).map(|i| (format!("ft{}", i), FactTypeDef {
+            schema_id: String::new(),
+            reading: format!("SupportResponse names APIProduct by FieldName ({})", i),
+            readings: vec![],
+            roles: vec![
+                RoleDef { noun_name: "SupportResponse".to_string(), role_index: 0 },
+                RoleDef { noun_name: "APIProduct".to_string(), role_index: 1 },
+                RoleDef { noun_name: "FieldName".to_string(), role_index: 2 },
+            ],
+        })));
         ir.constraints.push(ConstraintDef {
             id: "c1".to_string(),
             kind: "UC".to_string(),
