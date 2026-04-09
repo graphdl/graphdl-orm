@@ -61,22 +61,14 @@ fn find_nouns(text: &str, nouns: &[String]) -> Vec<NounMatch> {
     let mut sorted: Vec<&String> = nouns.iter().collect();
     sorted.sort_by(|a, b| b.len().cmp(&a.len()));
 
-    let mut found = Vec::new();
     let lower = text.to_lowercase();
-
-    for noun in sorted {
-        let noun_lower = noun.to_lowercase();
-        if let Some(start) = lower.find(&noun_lower) {
-            // Check word boundaries
-            let before_ok = start == 0 || !text.as_bytes()[start - 1].is_ascii_alphanumeric();
-            let end = start + noun.len();
-            let after_ok = end >= text.len() || !text.as_bytes()[end].is_ascii_alphanumeric();
-            if before_ok && after_ok {
-                found.push(NounMatch { name: noun.clone(), start, end });
-            }
-        }
-    }
-
+    let mut found: Vec<NounMatch> = sorted.iter().filter_map(|noun| {
+        let start = lower.find(&noun.to_lowercase())?;
+        let before_ok = start == 0 || !text.as_bytes()[start - 1].is_ascii_alphanumeric();
+        let end = start + noun.len();
+        let after_ok = end >= text.len() || !text.as_bytes()[end].is_ascii_alphanumeric();
+        (before_ok && after_ok).then(|| NounMatch { name: noun.to_string(), start, end })
+    }).collect();
     found.sort_by_key(|m| m.start);
     found
 }
@@ -87,22 +79,19 @@ fn split_conjuncts(rhs: &str, nouns: &[String]) -> Vec<String> {
     let mut sorted: Vec<&String> = nouns.iter().filter(|n| n.contains(" and ") || n.contains(" And ")).collect();
     sorted.sort_by(|a, b| b.len().cmp(&a.len()));
 
-    let mut replacements = Vec::new();
-    for noun in sorted {
+    let (masked, replacements) = sorted.iter().fold((masked, Vec::new()), |(mut m, mut r), noun| {
         let placeholder = noun.replace(' ', "\0");
-        if masked.contains(noun.as_str()) {
-            masked = masked.replace(noun.as_str(), &placeholder);
-            replacements.push((noun.clone(), placeholder));
+        if m.contains(noun.as_str()) {
+            m = m.replace(noun.as_str(), &placeholder);
+            r.push((noun.clone(), placeholder));
         }
-    }
+        (m, r)
+    });
 
-    let parts: Vec<String> = masked.split(" and ").map(|s| {
-        let mut result = s.trim().to_string();
-        for (original, placeholder) in &replacements {
-            result = result.replace(placeholder, original);
-        }
-        result
-    }).collect();
+    let parts: Vec<String> = masked.split(" and ").map(|s|
+        replacements.iter().fold(s.trim().to_string(), |result, (original, placeholder)|
+            result.replace(placeholder, original))
+    ).collect();
 
     parts
 }
