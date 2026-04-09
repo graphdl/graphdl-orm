@@ -544,9 +544,8 @@ fn try_fact_type(line: &str, noun_names: &[String]) -> Option<ParseAction> {
     // Fact type readings may contain quotes later (object position) but not
     // right after the first noun. Check by finding the first noun and seeing
     // if a quote follows it.
-    for noun in noun_names {
-        let prefix = format!("{} '", noun);
-        if line.starts_with(&prefix) { return None; }
+    if noun_names.iter().any(|noun| line.starts_with(&format!("{} '", noun))) {
+        return None;
     }
     let (ft_id, ft_def) = parse_fact(line, noun_names)?;
     Some(ParseAction::AddFactType(ft_id, ft_def))
@@ -825,7 +824,7 @@ fn parse_into(ir: &mut Domain, input: &str) -> Result<(), String> {
     // Build schema catalog from collected fact types
     let catalog = {
         let mut cat = SchemaCatalog::new();
-        for (schema_id, ft) in &ir.fact_types {
+        ir.fact_types.iter().for_each(|(schema_id, ft)| {
             let role_nouns: Vec<&str> = ft.roles.iter().map(|r| r.noun_name.as_str()).collect();
             // Extract verb from reading: text between first and last noun
             let verb = ft.roles.first()
@@ -840,7 +839,7 @@ fn parse_into(ir: &mut Domain, input: &str) -> Result<(), String> {
                 })
                 .unwrap_or("");
             cat.register(schema_id, &role_nouns, verb, &ft.reading);
-        }
+        });
         cat
     };
 
@@ -927,47 +926,41 @@ fn parse_into(ir: &mut Domain, input: &str) -> Result<(), String> {
     // Task 6: Value Constraint (VC) -- emit one VC per noun with enum_values.
     // The compiler reads enum values from ir.enum_values;
     // the ConstraintDef just marks which noun has a value constraint.
-    let vc_nouns: Vec<String> = ir.enum_values.keys().cloned().collect();
-    for noun_name in vc_nouns {
-        ir.constraints.push(ConstraintDef {
-            id: format!("VC:{}", noun_name),
-            kind: "VC".into(),
-            modality: "alethic".into(),
-            deontic_operator: None,
-            text: format!("{} has a value constraint", noun_name),
-            spans: vec![],
-            set_comparison_argument_length: None,
-            clauses: None,
-            entity: Some(noun_name),
-            min_occurrence: None,
-            max_occurrence: None,
-        });
-    }
+    ir.constraints.extend(ir.enum_values.keys().cloned().map(|noun_name| ConstraintDef {
+        id: format!("VC:{}", noun_name),
+        kind: "VC".into(),
+        modality: "alethic".into(),
+        deontic_operator: None,
+        text: format!("{} has a value constraint", noun_name),
+        spans: vec![],
+        set_comparison_argument_length: None,
+        clauses: None,
+        entity: Some(noun_name),
+        min_occurrence: None,
+        max_occurrence: None,
+    }));
 
     // Post-processing: resolve autofill spans.
     // For each autofill span name, find SS constraints whose role nouns
     // match the named span's role nouns, and set subset_autofill = Some(true).
-    for span_name in &ir.autofill_spans.clone() {
-        let role_nouns = match ir.named_spans.get(span_name) {
-            Some(nouns) => nouns.clone(),
-            None => continue,
-        };
-        let role_set: std::collections::HashSet<&str> = role_nouns.iter().map(|s| s.as_str()).collect();
-        for cdef in &mut ir.constraints {
-            if cdef.kind != "SS" { continue; }
-            // Check if the SS constraint's text references the same role nouns
-            let text_nouns: std::collections::HashSet<&str> = role_set.iter()
-                .filter(|n| cdef.text.contains(**n))
-                .copied()
-                .collect();
-            if text_nouns == role_set {
+    let autofill_role_sets: Vec<std::collections::HashSet<String>> = ir.autofill_spans.clone()
+        .iter()
+        .filter_map(|span_name| ir.named_spans.get(span_name))
+        .map(|nouns| nouns.iter().cloned().collect())
+        .collect();
+    ir.constraints.iter_mut()
+        .filter(|cdef| cdef.kind == "SS")
+        .for_each(|cdef| {
+            let matches = autofill_role_sets.iter().any(|role_set| {
+                role_set.iter().all(|n| cdef.text.contains(n.as_str()))
+            });
+            if matches {
                 // Set autofill on the first span (subset span)
                 if let Some(span) = cdef.spans.first_mut() {
                     span.subset_autofill = Some(true);
                 }
             }
-        }
-    }
+        });
 
     Ok(())
 }
@@ -1105,13 +1098,13 @@ fn apply_action(ir: &mut Domain, action: Option<ParseAction>, lines: &[String], 
         }
         ParseAction::AddPartition(sup, subs) => {
             if let Some(noun) = ir.nouns.get_mut(&sup) { noun.object_type = "abstract".into(); }
-            for sub in subs {
+            subs.into_iter().for_each(|sub| {
                 ir.nouns.entry(sub.clone()).or_insert(NounDef {
                     object_type: "entity".into(),
                     world_assumption: WorldAssumption::default(),
                 });
                 ir.subtypes.insert(sub, sup.clone());
-            }
+            });
         }
         ParseAction::AddFactType(id, def) => {
             ir.fact_types.entry(id).or_insert(def);
@@ -1297,7 +1290,7 @@ fn resolve_constraint_schema(
             // Per Halpin TechReport ORM2-02: the constrained role is the one
             // under the quantifier.
             let resolved_ft = ir.fact_types.get(&schema_id);
-            for span in &mut constraint.spans {
+            constraint.spans.iter_mut().for_each(|span| {
                 span.fact_type_id = schema_id.clone();
                 // Set role_index to the first noun's position in the fact type.
                 // The first noun in the constraint text is the quantified noun
@@ -1310,7 +1303,7 @@ fn resolve_constraint_schema(
                         }
                     }
                 }
-            }
+            });
         }
     }
     constraint
@@ -1571,19 +1564,19 @@ fn extract_value_fact(rest: &str) -> Option<(String, String)> {
 }
 
 fn to_camel_case(s: &str) -> String {
-    let words: Vec<&str> = s.split_whitespace()
-        .filter(|w| !w.is_empty())
-        .collect();
-    if words.is_empty() { return String::new(); }
-    let mut result = words[0].to_lowercase();
-    for word in &words[1..] {
+    let mut words = s.split_whitespace().filter(|w| !w.is_empty());
+    let first = match words.next() {
+        Some(w) => w.to_lowercase(),
+        None => return String::new(),
+    };
+    words.fold(first, |mut acc, word| {
         let mut chars = word.chars();
-        if let Some(first) = chars.next() {
-            result.push(first.to_uppercase().next().unwrap_or(first));
-            result.extend(chars);
+        if let Some(first_ch) = chars.next() {
+            acc.push(first_ch.to_uppercase().next().unwrap_or(first_ch));
+            acc.extend(chars);
         }
-    }
-    result
+        acc
+    })
 }
 
 
