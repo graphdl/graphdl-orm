@@ -477,36 +477,21 @@ mod tests {
 
     /// Build Object state with facts from pairs.
     fn state_with_facts(ft_id: &str, pairs_list: &[&[(&str, &str)]]) -> ast::Object {
-        let mut state = ast::Object::phi();
-        for pairs in pairs_list {
-            state = ast::cell_push(ft_id, ast::fact_from_pairs(pairs), &state);
-        }
-        state
+        pairs_list.iter().fold(ast::Object::phi(), |acc, pairs|
+            ast::cell_push(ft_id, ast::fact_from_pairs(pairs), &acc))
     }
 
-    /// Convert an IR Domain to defs by compiling directly.
-    /// Returns (metamodel_state, defs_vec, defs_object).
     fn ir_to_defs(ir: &Domain) -> (ast::Object, Vec<(String, ast::Func)>, ast::Object) {
         let model = crate::compile::compile(ir);
-        let mut defs: Vec<(String, ast::Func)> = Vec::new();
-
-        // Constraints
-        for c in &model.constraints {
-            defs.push((format!("constraint:{}", c.id), c.func.clone()));
-        }
-        // State machines
-        for sm in &model.state_machines {
-            defs.push((format!("machine:{}", sm.noun_name), sm.func.clone()));
-            defs.push((format!("machine:{}:initial", sm.noun_name), ast::Func::constant(ast::Object::atom(&sm.initial))));
-        }
-        // Derivation rules
-        for d in &model.derivations {
-            defs.push((format!("derivation:{}", d.id), d.func.clone()));
-        }
-        // Schemas
-        for (id, schema) in &model.schemas {
-            defs.push((format!("schema:{}", id), schema.construction.clone()));
-        }
+        let defs: Vec<(String, ast::Func)> = model.constraints.iter()
+            .map(|c| (format!("constraint:{}", c.id), c.func.clone()))
+            .chain(model.state_machines.iter().flat_map(|sm| [
+                (format!("machine:{}", sm.noun_name), sm.func.clone()),
+                (format!("machine:{}:initial", sm.noun_name), ast::Func::constant(ast::Object::atom(&sm.initial))),
+            ]))
+            .chain(model.derivations.iter().map(|d| (format!("derivation:{}", d.id), d.func.clone())))
+            .chain(model.schemas.iter().map(|(id, schema)| (format!("schema:{}", id), schema.construction.clone())))
+            .collect();
 
         let state = crate::parse_forml2::domain_to_state(ir);
         let def_map = ast::defs_to_state(&defs, &state);
