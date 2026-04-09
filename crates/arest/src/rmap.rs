@@ -148,34 +148,40 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
     };
 
     // -- Index constraints -------------------------------------------
-    let mut ucs_by_ft: HashMap<String, Vec<Vec<usize>>> = HashMap::new();
-    let mut mc_set: HashSet<String> = HashSet::new();
-    let mut vcs_by_ft_role: HashMap<String, Vec<String>> = HashMap::new();
-
-    for c in &ir.constraints {
-        match c.kind.as_str() {
-            "UC" => {
-                c.spans.iter().for_each(|span| { ucs_by_ft.entry(span.fact_type_id.clone()).or_default(); });
-                let roles: Vec<usize> = c.spans.iter().map(|s| s.role_index).collect();
-                if let Some(ft_id) = c.spans.first().map(|s| &s.fact_type_id) {
-                    ucs_by_ft.entry(ft_id.clone()).or_default().push(roles);
+    let (ucs_by_ft, mc_set, vcs_by_ft_role): (
+        HashMap<String, Vec<Vec<usize>>>,
+        HashSet<String>,
+        HashMap<String, Vec<String>>,
+    ) = ir.constraints.iter().fold(
+        (HashMap::new(), HashSet::new(), HashMap::new()),
+        |(mut ucs, mut mc, mut vcs), c| {
+            match c.kind.as_str() {
+                "UC" => {
+                    c.spans.iter().for_each(|span| { ucs.entry(span.fact_type_id.clone()).or_default(); });
+                    let roles: Vec<usize> = c.spans.iter().map(|s| s.role_index).collect();
+                    c.spans.first()
+                        .map(|s| &s.fact_type_id)
+                        .into_iter()
+                        .for_each(|ft_id| { ucs.entry(ft_id.clone()).or_default().push(roles.clone()); });
                 }
-            }
-            "MC" => {
-                mc_set.extend(c.spans.iter().map(|s| format!("{}:{}", s.fact_type_id, s.role_index)));
-            }
-            "VC" => {
-                if let Some(ref entity) = c.entity {
-                    if let Some(vals) = ir.enum_values.get(entity) {
-                        c.spans.iter().for_each(|span| {
-                            vcs_by_ft_role.insert(format!("{}:{}", span.fact_type_id, span.role_index), vals.clone());
+                "MC" => {
+                    mc.extend(c.spans.iter().map(|s| format!("{}:{}", s.fact_type_id, s.role_index)));
+                }
+                "VC" => {
+                    c.entity.as_ref()
+                        .and_then(|e| ir.enum_values.get(e))
+                        .into_iter()
+                        .for_each(|vals| {
+                            c.spans.iter().for_each(|span| {
+                                vcs.insert(format!("{}:{}", span.fact_type_id, span.role_index), vals.clone());
+                            });
                         });
-                    }
                 }
+                _ => {}
             }
-            _ => {}
-        }
-    }
+            (ucs, mc, vcs)
+        },
+    );
 
     // -- Classify fact types -----------------------------------------
     // Classify: Filter(binary ∧ ¬binarized) then partition by UC arity
@@ -203,7 +209,7 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
     // -- Step 1: Compound UC -> separate table ------------------------
     let noun_name_set: HashSet<String> = ir.nouns.keys().cloned().collect();
 
-    for ft_id in &compound_facts {
+    let compound_tables: Vec<TableDef> = compound_facts.iter().map(|ft_id| {
         let ft = &ir.fact_types[*ft_id];
         let ucs = ucs_by_ft.get(*ft_id).unwrap();
         let spanning_uc = ucs.iter().max_by_key(|uc| uc.len()).unwrap();
@@ -224,168 +230,165 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
             .collect();
 
         let table_name = compound_table_name(&ft.reading, &ft.roles, &noun_name_set);
-        tables.push(TableDef { name: table_name.clone(), columns, primary_key: pk_cols, checks: None, unique_constraints: None });
-        emitted.insert(table_name);
-    }
+        TableDef { name: table_name, columns, primary_key: pk_cols, checks: None, unique_constraints: None }
+    }).collect();
+    emitted.extend(compound_tables.iter().map(|t| t.name.clone()));
+    tables.extend(compound_tables);
 
-    // -- Step 2: Functional roles -> entity table ---------------------
-    let mut entity_columns: HashMap<String, (Vec<TableColumn>, HashSet<String>, Vec<String>)> = HashMap::new();
+    // -- Step 2/3: Functional, 1:1 absorption, XO injection ----------
+    //
+    // Three pure data streams of (entity_key, column, Option<check>),
+    // reduced into entity_columns via foldl (Backus insert combining form).
+    // No external state mutation — each stream is computed from inputs only.
 
-    for ft_id in &functional_facts {
-        if one_to_one_ft_ids.contains(*ft_id) { continue }
-        let ft = &ir.fact_types[*ft_id];
-        let ucs = ucs_by_ft.get(*ft_id).cloned().unwrap_or_default();
-
-        for uc in &ucs {
-            if uc.len() != 1 { continue }
-            let source_role_idx = uc[0];
-            let source_role = match ft.roles.iter().find(|r| r.role_index == source_role_idx) {
-                Some(r) => r,
-                None => continue,
-            };
-            let source_noun = match ir.nouns.get(&source_role.noun_name) {
-                Some(n) if n.object_type == "entity" => n,
-                _ => continue,
-            };
-
-            let entity_key = resolve_entity(&source_role.noun_name);
-            let entry = entity_columns.entry(entity_key).or_insert_with(|| (Vec::new(), HashSet::new(), Vec::new()));
-            let is_subtype = subtype_names.contains(&source_role.noun_name);
-
-            ft.roles.iter().filter(|role| role.role_index != source_role_idx).for_each(|role| {
-                let col_name = column_name_for_target(ir, &role.noun_name);
-                let is_mandatory = mc_set.contains(&format!("{}:{}", ft_id, source_role_idx));
-                let is_entity = ir.nouns.get(&role.noun_name).map_or(false, |n| n.object_type == "entity");
-                entry.0.push(TableColumn {
-                    name: col_name.clone(),
-                    col_type: "TEXT".to_string(),
-                    nullable: if is_subtype { true } else { !is_mandatory },
-                    references: if is_entity { Some(to_snake(&role.noun_name)) } else { None },
-                });
-                // VC check
-                let vc_key = format!("{}:{}", ft_id, role.role_index);
-                if let Some(vals) = vcs_by_ft_role.get(&vc_key) {
-                    let quoted = vals.iter().map(|v| format!("'{}'", v)).collect::<Vec<_>>().join(", ");
-                    entry.2.push(format!("{} IN ({})", col_name, quoted));
-                }
-            });
-            let _ = source_noun; // used for type check above
-        }
-    }
-
-    // -- Step 3: 1:1 absorption (with direction bias) ------------------
-    // Count fact type participation per noun for "larger table" heuristic
     let noun_ft_count: HashMap<&str, usize> = ir.fact_types.values()
         .flat_map(|ft| ft.roles.iter().map(|r| r.noun_name.as_str()))
         .fold(HashMap::new(), |mut acc, name| { *acc.entry(name).or_insert(0) += 1; acc });
 
-    for ft_id in &one_to_one_ft_ids {
+    let functional_additions: Vec<(String, TableColumn, Option<String>)> = functional_facts.iter()
+        .filter(|ft_id| !one_to_one_ft_ids.contains(**ft_id))
+        .flat_map(|ft_id| {
+            let ft = &ir.fact_types[*ft_id];
+            ucs_by_ft.get(*ft_id).cloned().unwrap_or_default().into_iter()
+                .filter(|uc| uc.len() == 1)
+                .filter_map(move |uc| {
+                    let source_role_idx = uc[0];
+                    let source_role = ft.roles.iter().find(|r| r.role_index == source_role_idx)?;
+                    ir.nouns.get(&source_role.noun_name)
+                        .filter(|n| n.object_type == "entity")?;
+                    Some((*ft_id, source_role, source_role_idx))
+                })
+                .collect::<Vec<_>>()
+        })
+        .flat_map(|(ft_id, source_role, source_role_idx)| {
+            let ft = &ir.fact_types[ft_id];
+            let entity_key = resolve_entity(&source_role.noun_name);
+            let is_subtype = subtype_names.contains(&source_role.noun_name);
+            let is_mandatory = mc_set.contains(&format!("{}:{}", ft_id, source_role_idx));
+            ft.roles.iter()
+                .filter(|role| role.role_index != source_role_idx)
+                .map(|role| {
+                    let col_name = column_name_for_target(ir, &role.noun_name);
+                    let is_entity = ir.nouns.get(&role.noun_name).map_or(false, |n| n.object_type == "entity");
+                    let column = TableColumn {
+                        name: col_name.clone(),
+                        col_type: "TEXT".to_string(),
+                        nullable: if is_subtype { true } else { !is_mandatory },
+                        references: if is_entity { Some(to_snake(&role.noun_name)) } else { None },
+                    };
+                    let vc_key = format!("{}:{}", ft_id, role.role_index);
+                    let check = vcs_by_ft_role.get(&vc_key).map(|vals| {
+                        let quoted = vals.iter().map(|v| format!("'{}'", v)).collect::<Vec<_>>().join(", ");
+                        format!("{} IN ({})", col_name, quoted)
+                    });
+                    (entity_key.clone(), column, check)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    // 1:1 absorption: direction bias via pure if-expression chain.
+    // (Control flow has no side effects — returns a tuple, inputs → output.)
+    let one_to_one_additions: Vec<(String, TableColumn, Option<String>)> = one_to_one_ft_ids.iter().map(|ft_id| {
         let ft = &ir.fact_types[ft_id];
         let role0 = &ft.roles[0];
         let role1 = &ft.roles[1];
         let mc0 = mc_set.contains(&format!("{}:{}", ft_id, role0.role_index));
         let mc1 = mc_set.contains(&format!("{}:{}", ft_id, role1.role_index));
 
-        // Direction bias priority:
-        // 1. Mandatory constraint (absorb toward mandatory side)
-        // 2. Entity vs value type (absorb toward entity)
-        // 3. Larger table (more fact types)
-        // 4. Reading direction (first noun is parent)
         let (absorb_into, fk_target, is_mandatory) = if mc0 && !mc1 {
             (resolve_entity(&role0.noun_name), &role1.noun_name, true)
         } else if mc1 && !mc0 {
             (resolve_entity(&role1.noun_name), &role0.noun_name, true)
         } else {
-            // No mandatory asymmetry -- apply direction bias
             let is_entity0 = ir.nouns.get(&role0.noun_name).map_or(false, |n| n.object_type == "entity");
             let is_entity1 = ir.nouns.get(&role1.noun_name).map_or(false, |n| n.object_type == "entity");
             let both_mandatory = mc0 && mc1;
-
             if is_entity0 && !is_entity1 {
-                // Absorb toward entity (role0)
                 (resolve_entity(&role0.noun_name), &role1.noun_name, both_mandatory)
             } else if is_entity1 && !is_entity0 {
-                // Absorb toward entity (role1)
                 (resolve_entity(&role1.noun_name), &role0.noun_name, both_mandatory)
             } else {
-                // Both entities (or both values) -- use fact type count
                 let count0 = noun_ft_count.get(role0.noun_name.as_str()).copied().unwrap_or(0);
                 let count1 = noun_ft_count.get(role1.noun_name.as_str()).copied().unwrap_or(0);
-                if count0 > count1 {
-                    (resolve_entity(&role0.noun_name), &role1.noun_name, both_mandatory)
-                } else if count1 > count0 {
+                if count1 > count0 {
                     (resolve_entity(&role1.noun_name), &role0.noun_name, both_mandatory)
                 } else {
-                    // Equal -- use reading direction (role0 is first in reading)
+                    // count0 >= count1 -- default to role0 (reading direction)
                     (resolve_entity(&role0.noun_name), &role1.noun_name, both_mandatory)
                 }
             }
         };
-
-        let entry = entity_columns.entry(absorb_into).or_insert_with(|| (Vec::new(), HashSet::new(), Vec::new()));
         let is_target_entity = ir.nouns.get(fk_target.as_str()).map_or(false, |n| n.object_type == "entity");
-        entry.0.push(TableColumn {
+        let column = TableColumn {
             name: column_name_for_target(ir, fk_target),
             col_type: "TEXT".to_string(),
             nullable: !is_mandatory,
             references: if is_target_entity { Some(to_snake(fk_target)) } else { None },
-        });
-    }
+        };
+        (absorb_into, column, None)
+    }).collect();
 
-    // -- Step 0.1 continued: inject XO columns -----------------------
-    xo_columns.iter().for_each(|(entity_name, xo_cols)| {
-        let resolved = resolve_entity(entity_name);
-        let entry = entity_columns.entry(resolved).or_insert_with(|| (Vec::new(), HashSet::new(), Vec::new()));
-        xo_cols.iter().for_each(|(col_name, values, nullable)| {
-            entry.0.push(TableColumn {
-                name: col_name.clone(),
-                col_type: "TEXT".to_string(),
-                nullable: *nullable,
-                references: None,
+    let xo_additions: Vec<(String, TableColumn, Option<String>)> = xo_columns.iter()
+        .flat_map(|(entity_name, xo_cols)| {
+            let resolved = resolve_entity(entity_name);
+            xo_cols.iter().map(move |(col_name, values, nullable)| {
+                let column = TableColumn {
+                    name: col_name.clone(),
+                    col_type: "TEXT".to_string(),
+                    nullable: *nullable,
+                    references: None,
+                };
+                let quoted = values.iter().map(|v| format!("'{}'", v)).collect::<Vec<_>>().join(", ");
+                let check = format!("{} IN ({})", col_name, quoted);
+                (resolved.clone(), column, Some(check))
+            }).collect::<Vec<_>>()
+        })
+        .collect();
+
+    // Foldl all additions into entity_columns.
+    // fold's accumulator mutation IS the insert combining form (Backus, FP §11).
+    let entity_columns: HashMap<String, (Vec<TableColumn>, HashSet<String>, Vec<String>)> =
+        functional_additions.into_iter()
+            .chain(one_to_one_additions.into_iter())
+            .chain(xo_additions.into_iter())
+            .fold(HashMap::new(), |mut map, (key, col, check)| {
+                let entry = map.entry(key).or_insert_with(|| (Vec::new(), HashSet::new(), Vec::new()));
+                entry.0.push(col);
+                if let Some(chk) = check { entry.2.push(chk); }
+                map
             });
-            let quoted = values.iter().map(|v| format!("'{}'", v)).collect::<Vec<_>>().join(", ");
-            entry.2.push(format!("{} IN ({})", col_name, quoted));
-        });
-    });
 
     // -- Step 2.5: External UC -> UNIQUE constraints -------------------
-    // External UCs span multiple fact types. Collect them per target entity.
-    let mut external_ucs: HashMap<String, Vec<Vec<String>>> = HashMap::new();
-    for c in &ir.constraints {
-        if c.kind != "UC" { continue }
-        if c.spans.len() < 2 { continue }
-        // Check if spans reference different fact types
-        let ft_ids: HashSet<&str> = c.spans.iter().map(|s| s.fact_type_id.as_str()).collect();
-        if ft_ids.len() < 2 { continue }
-        // This is an external UC. Find the target entity: the noun that plays
-        // the source role in each spanned fact type (the UC'd role's counterpart).
-        // For each span, the UC is on the non-source role; the source role
-        // identifies which entity table the column lives in.
-        let mut uc_cols: Vec<String> = Vec::new();
-        let mut target_entity: Option<String> = None;
-        for span in &c.spans {
-            let ft = match ir.fact_types.get(&span.fact_type_id) {
-                Some(ft) => ft,
-                None => continue,
-            };
-            // The UC'd role is the one at span.role_index -> its column name
-            let uc_role = match ft.roles.iter().find(|r| r.role_index == span.role_index) {
-                Some(r) => r,
-                None => continue,
-            };
-            let col_name = column_name_for_target(ir, &uc_role.noun_name);
-            uc_cols.push(col_name);
-            // The source role is the other role in the binary fact type
-            ft.roles.iter()
-                .filter(|role| role.role_index != span.role_index)
-                .for_each(|role| { target_entity = Some(resolve_entity(&role.noun_name)); });
-        }
-        if let Some(entity) = target_entity {
-            if uc_cols.len() >= 2 {
-                external_ucs.entry(entity).or_default().push(uc_cols);
-            }
-        }
-    }
+    // External UCs span multiple fact types. Each span contributes a column
+    // to the target entity's table. Pure iter chain; last span with a
+    // determinable target wins (matches prior semantics).
+    let external_ucs: HashMap<String, Vec<Vec<String>>> = ir.constraints.iter()
+        .filter(|c| c.kind == "UC" && c.spans.len() >= 2)
+        .filter(|c| c.spans.iter().map(|s| s.fact_type_id.as_str()).collect::<HashSet<_>>().len() >= 2)
+        .filter_map(|c| {
+            let (uc_cols, target_entity): (Vec<String>, Option<String>) = c.spans.iter()
+                .filter_map(|span| {
+                    let ft = ir.fact_types.get(&span.fact_type_id)?;
+                    let uc_role = ft.roles.iter().find(|r| r.role_index == span.role_index)?;
+                    let col_name = column_name_for_target(ir, &uc_role.noun_name);
+                    let target = ft.roles.iter()
+                        .filter(|role| role.role_index != span.role_index)
+                        .last()
+                        .map(|role| resolve_entity(&role.noun_name));
+                    Some((col_name, target))
+                })
+                .fold((Vec::new(), None), |(mut cols, target), (col, t)| {
+                    cols.push(col);
+                    (cols, t.or(target))
+                });
+            (uc_cols.len() >= 2).then_some(())
+                .and(target_entity.map(|e| (e, uc_cols)))
+        })
+        .fold(HashMap::new(), |mut m, (entity, uc_cols)| {
+            m.entry(entity).or_insert_with(Vec::new).push(uc_cols);
+            m
+        });
 
     // -- Emit entity tables ------------------------------------------
     for (entity_name, (columns, _, checks)) in &entity_columns {
