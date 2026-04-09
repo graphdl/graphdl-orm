@@ -1361,20 +1361,16 @@ fn compile_subtype_inheritance(ir: &Domain) -> Vec<CompiledDerivation> {
 /// and exists_in_B needs a nested membership check. Both need a fold-based
 /// search primitive (Insert + Condition) not yet ergonomic in the AST.
 fn compile_modus_ponens(ir: &Domain) -> Vec<CompiledDerivation> {
-    let mut derivations = Vec::new();
-
-    for cdef in &ir.constraints {
-        if cdef.kind != "SS" || cdef.spans.len() < 2 {
-            continue;
-        }
+    // α(ss_constraint → derivation) : Filter(kind=SS ∧ spans≥2) : constraints
+    ir.constraints.iter()
+        .filter(|cdef| cdef.kind == "SS" && cdef.spans.len() >= 2)
+        .filter_map(|cdef| {
 
         // Only derive facts when subset_autofill is explicitly true.
         // Otherwise the SS constraint is just a constraint (produces violations,
         // doesn't auto-create facts).
         let has_autofill = cdef.spans.iter().any(|s| s.subset_autofill == Some(true));
-        if !has_autofill {
-            continue;
-        }
+        if !has_autofill { return None; }
 
         let a_ft_id = cdef.spans[0].fact_type_id.clone();
         let b_ft_id = cdef.spans[1].fact_type_id.clone();
@@ -1432,10 +1428,9 @@ fn compile_modus_ponens(ir: &Domain) -> Vec<CompiledDerivation> {
 
         // derived_fact: <a_fact, b_facts> -> <b_ft_id, b_reading, <bindings>>
         // Project a_fact's common-noun bindings into B's structure.
-        let mut b_binding_funcs: Vec<Func> = Vec::new();
-        for &(ai, _) in &common {
-            b_binding_funcs.push(Func::compose(Func::Selector(ai + 1), Func::Selector(1)));
-        }
+        let b_binding_funcs: Vec<Func> = common.iter()
+            .map(|&(ai, _)| Func::compose(Func::Selector(ai + 1), Func::Selector(1)))
+            .collect();
         let derived_fact = Func::construction(vec![
             Func::constant(Object::atom(&b_ft_id)),
             Func::constant(Object::atom(&b_reading)),
@@ -1455,15 +1450,8 @@ fn compile_modus_ponens(ir: &Domain) -> Vec<CompiledDerivation> {
                 Func::compose(Func::DistR, Func::construction(vec![a_facts, b_facts])),
             ),
         );
-        derivations.push(CompiledDerivation {
-            id,
-            text,
-            kind: DerivationKind::ModusPonens,
-            func,
-        });
-    }
-
-    derivations
+        Some(CompiledDerivation { id, text, kind: DerivationKind::ModusPonens, func })
+    }).collect()
 }
 
 /// Transitivity: for fact types that share a noun in different roles (A->B, B->C),
