@@ -49,12 +49,14 @@ fn extract_filters(query: &str) -> (String, Vec<String>) {
     // Backus insert combining form — no external mutation.
     let (values, stripped, _) = query.chars().fold(
         (Vec::<String>::new(), String::new(), (false, String::new())),
-        |(mut values, mut stripped, (in_quote, mut current_val)), ch| {
+        |(values, mut stripped, (in_quote, mut current_val)), ch| {
             if ch == '\'' {
-                if in_quote {
-                    values.push(current_val.clone());
-                    current_val.clear();
-                }
+                let (values, current_val) = if in_quote {
+                    let values = values.into_iter().chain(std::iter::once(current_val)).collect();
+                    (values, String::new())
+                } else {
+                    (values, current_val)
+                };
                 (values, stripped, (!in_quote, current_val))
             } else if in_quote {
                 current_val.push(ch);
@@ -133,40 +135,42 @@ pub fn resolve_conceptual_query(
     let noun_sequence: Vec<String> = segment_nouns
         .iter()
         .flat_map(|seg_nouns| seg_nouns.iter().cloned())
-        .fold(Vec::new(), |mut acc, noun| {
-            if acc.last().map(|n: &String| n.to_lowercase()) != Some(noun.to_lowercase()) {
-                acc.push(noun);
-            }
-            acc
+        .fold(Vec::new(), |acc, noun| {
+            let is_dup = acc.last().map(|n: &String| n.to_lowercase()) == Some(noun.to_lowercase());
+            acc.into_iter()
+                .chain(std::iter::once(noun).filter(|_| !is_dup))
+                .collect()
         });
 
-    if noun_sequence.is_empty() {
-        return ConceptualQueryResult { path: vec![], filters: vec![], root_noun: None };
-    }
-    if noun_sequence.len() == 1 {
-        return ConceptualQueryResult { path: vec![], filters: vec![], root_noun: Some(noun_sequence[0].clone()) };
-    }
-
-    let root_noun = noun_sequence[0].clone();
-
-    let path: Vec<QueryPathStep> = (1..noun_sequence.len())
-        .filter_map(|i| {
-            let to = &noun_sequence[i];
-            (0..i).rev().find_map(|j| {
-                let from = &noun_sequence[j];
-                find_reading(from, to, readings).map(|(reading, inverse)| QueryPathStep {
-                    from: from.clone(),
-                    predicate: extract_predicate(reading),
-                    to: to.clone(),
-                    inverse,
+    // Pure Backus cond: match noun_sequence length, returning either an early result or (root, path).
+    let (root_noun, path) = match noun_sequence.len() {
+        0 => return ConceptualQueryResult { path: vec![], filters: vec![], root_noun: None },
+        1 => return ConceptualQueryResult { path: vec![], filters: vec![], root_noun: Some(noun_sequence[0].clone()) },
+        _ => {
+            let root_noun = noun_sequence[0].clone();
+            let path: Vec<QueryPathStep> = (1..noun_sequence.len())
+                .filter_map(|i| {
+                    let to = &noun_sequence[i];
+                    (0..i).rev().find_map(|j| {
+                        let from = &noun_sequence[j];
+                        find_reading(from, to, readings).map(|(reading, inverse)| QueryPathStep {
+                            from: from.clone(),
+                            predicate: extract_predicate(reading),
+                            to: to.clone(),
+                            inverse,
+                        })
+                    })
                 })
-            })
-        })
-        .collect();
+                .collect();
+            (root_noun, path)
+        }
+    };
 
-    if path.is_empty() {
-        return ConceptualQueryResult { path: vec![], filters: vec![], root_noun: None };
-    }
+    // Empty-path guard as pure expression: map non-empty → carry through, else early result.
+    let path = match path.is_empty() {
+        true => return ConceptualQueryResult { path: vec![], filters: vec![], root_noun: None },
+        false => path,
+    };
 
     // Map filters to target nouns
     let filters: Vec<Filter> = query

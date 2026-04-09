@@ -75,18 +75,18 @@ fn find_nouns(text: &str, nouns: &[String]) -> Vec<NounMatch> {
 
 fn split_conjuncts(rhs: &str, nouns: &[String]) -> Vec<String> {
     // Mask noun names containing "and" to avoid splitting on them
-    let mut masked = rhs.to_string();
+    let masked = rhs.to_string();
     let mut sorted: Vec<&String> = nouns.iter().filter(|n| n.contains(" and ") || n.contains(" And ")).collect();
     sorted.sort_by(|a, b| b.len().cmp(&a.len()));
 
-    let (masked, replacements) = sorted.iter().fold((masked, Vec::new()), |(mut m, mut r), noun| {
-        let placeholder = noun.replace(' ', "\0");
-        if m.contains(noun.as_str()) {
-            m = m.replace(noun.as_str(), &placeholder);
-            r.push((noun.clone(), placeholder));
-        }
-        (m, r)
-    });
+    let (masked, replacements) = sorted.iter()
+        .filter(|noun| rhs.contains(noun.as_str()))
+        .fold((masked, Vec::new()), |(m, mut r), noun| {
+            let placeholder = noun.replace(' ', "\0");
+            let new_m = m.replace(noun.as_str(), &placeholder);
+            r.push(((*noun).clone(), placeholder));
+            (new_m, r)
+        });
 
     let parts: Vec<String> = masked.split(" and ").map(|s|
         replacements.iter().fold(s.trim().to_string(), |result, (original, placeholder)|
@@ -98,25 +98,25 @@ fn split_conjuncts(rhs: &str, nouns: &[String]) -> Vec<String> {
 
 fn extract_comparison(text: &str) -> (String, Option<Comparison>) {
     let re = regex::Regex::new(r"\s*(>=|<=|!=|>|<|=)\s*(-?\d+(?:\.\d+)?)\s*$").unwrap();
-    if let Some(caps) = re.captures(text) {
-        let m = caps.get(0).unwrap();
-        let cleaned = text[..m.start()].trim().to_string();
-        let op = caps[1].to_string();
-        let value: f64 = caps[2].parse().unwrap_or(0.0);
-        return (cleaned, Some(Comparison { op, value }));
-    }
-    (text.to_string(), None)
+    re.captures(text)
+        .map(|caps| {
+            let m = caps.get(0).unwrap();
+            let cleaned = text[..m.start()].trim().to_string();
+            let op = caps[1].to_string();
+            let value: f64 = caps[2].parse().unwrap_or(0.0);
+            (cleaned, Some(Comparison { op, value }))
+        })
+        .unwrap_or_else(|| (text.to_string(), None))
 }
 
 fn extract_literal(text: &str) -> (String, Option<String>) {
-    if let Some(idx) = text.rfind('\'') {
-        if let Some(start) = text[..idx].rfind('\'') {
+    text.rfind('\'')
+        .and_then(|idx| text[..idx].rfind('\'').map(|start| {
             let value = text[start + 1..idx].to_string();
             let cleaned = text[..start].trim().to_string();
-            return (cleaned, Some(value));
-        }
-    }
-    (text.to_string(), None)
+            (cleaned, Some(value))
+        }))
+        .unwrap_or_else(|| (text.to_string(), None))
 }
 
 fn parse_triple(text: &str, nouns: &[String]) -> RuleTriple {
@@ -127,63 +127,58 @@ fn parse_triple(text: &str, nouns: &[String]) -> RuleTriple {
 
     let found = find_nouns(&cleaned, nouns);
 
-    if found.len() < 2 {
-        return RuleTriple {
+    match found.len() {
+        0 | 1 => RuleTriple {
             subject: found.first().map(|m| m.name.clone()).unwrap_or_default(),
             predicate: cleaned,
             object: String::new(),
             qualifier: None,
             comparison,
             literal_value,
-        };
+        },
+        _ => {
+            let subject = found[0].name.clone();
+            let object_match = if found.len() >= 3 { &found[1] } else { found.last().unwrap() };
+            let predicate = cleaned[found[0].end..object_match.start].trim().to_string();
+            let qualifier = (found.len() >= 3).then(|| {
+                let qual = found.last().unwrap();
+                let qual_pred = cleaned[object_match.end..qual.start].trim().to_string();
+                Qualifier { predicate: qual_pred, object: qual.name.clone() }
+            });
+            RuleTriple {
+                subject,
+                predicate,
+                object: object_match.name.clone(),
+                qualifier,
+                comparison,
+                literal_value,
+            }
+        }
     }
-
-    let subject = found[0].name.clone();
-    let object_match = if found.len() >= 3 { &found[1] } else { found.last().unwrap() };
-    let predicate = cleaned[found[0].end..object_match.start].trim().to_string();
-
-    let mut triple = RuleTriple {
-        subject,
-        predicate,
-        object: object_match.name.clone(),
-        qualifier: None,
-        comparison,
-        literal_value,
-    };
-
-    if found.len() >= 3 {
-        let qual = found.last().unwrap();
-        let qual_pred = cleaned[object_match.end..qual.start].trim().to_string();
-        triple.qualifier = Some(Qualifier { predicate: qual_pred, object: qual.name.clone() });
-    }
-
-    triple
 }
 
 pub fn parse_rule(text: &str, nouns: &[String]) -> Result<DerivationRule, String> {
     let cleaned = text.trim_end_matches('.');
 
-    let split_idx = match cleaned.find(":=") {
-        Some(idx) => idx,
-        None => return Err(format!("Derivation rule must contain ':=': {}", text)),
-    };
+    let split_idx = cleaned.find(":=")
+        .ok_or_else(|| format!("Derivation rule must contain ':=': {}", text))?;
 
     let lhs = cleaned[..split_idx].trim();
     let rhs = cleaned[split_idx + 2..].trim();
 
     let consequent = parse_triple(lhs, nouns);
 
-    // Identity: "the same"
-    if rhs.contains("the same") {
+    // Identity: "the same" — pure expression form
+    let identity_rule = rhs.contains("the same").then(|| {
         let antecedent = parse_triple(rhs, nouns);
-        return Ok(DerivationRule {
-            text: text.to_string(), consequent, antecedents: vec![antecedent], kind: "identity".to_string(), aggregate: None,
-        });
-    }
+        DerivationRule {
+            text: text.to_string(), consequent: consequent.clone(), antecedents: vec![antecedent], kind: "identity".to_string(), aggregate: None,
+        }
+    });
 
-    // Aggregate: "count of X where ..."
+    // Aggregate: "count of X where ..." — pure expression form
     let agg_re = regex::Regex::new(r"(?i)^(count|sum|avg|min|max)\s+of\s+(.+?)\s+where\s+(.+)$").unwrap();
-    if let Some(caps) = agg_re.captures(rhs) {
+    let aggregate_rule = || agg_re.captures(rhs).map(|caps| {
         let func = caps[1].to_lowercase();
         let agg_noun_text = caps[2].trim();
         let where_clause = caps[3].trim();
@@ -194,21 +189,24 @@ pub fn parse_rule(text: &str, nouns: &[String]) -> Result<DerivationRule, String
         let conjuncts = split_conjuncts(where_clause, nouns);
         let antecedents: Vec<RuleTriple> = conjuncts.iter().map(|c| parse_triple(c, nouns)).collect();
 
-        return Ok(DerivationRule {
-            text: text.to_string(), consequent, antecedents, kind: "aggregate".to_string(),
+        DerivationRule {
+            text: text.to_string(), consequent: consequent.clone(), antecedents, kind: "aggregate".to_string(),
             aggregate: Some(Aggregate { func, noun: agg_noun }),
-        });
-    }
+        }
+    });
 
     // Default: split on "and"
-    let conjuncts = split_conjuncts(rhs, nouns);
-    let antecedents: Vec<RuleTriple> = conjuncts.iter().map(|c| parse_triple(c, nouns)).collect();
-    let has_comparison = antecedents.iter().any(|a| a.comparison.is_some());
-    let kind = if has_comparison { "comparison" } else { "join" };
+    let default_rule = || {
+        let conjuncts = split_conjuncts(rhs, nouns);
+        let antecedents: Vec<RuleTriple> = conjuncts.iter().map(|c| parse_triple(c, nouns)).collect();
+        let has_comparison = antecedents.iter().any(|a| a.comparison.is_some());
+        let kind = if has_comparison { "comparison" } else { "join" };
+        DerivationRule {
+            text: text.to_string(), consequent: consequent.clone(), antecedents, kind: kind.to_string(), aggregate: None,
+        }
+    };
 
-    Ok(DerivationRule {
-        text: text.to_string(), consequent, antecedents, kind: kind.to_string(), aggregate: None,
-    })
+    Ok(identity_rule.or_else(aggregate_rule).unwrap_or_else(default_rule))
 }
 
 #[cfg(test)]

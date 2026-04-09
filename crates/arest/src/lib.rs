@@ -70,7 +70,7 @@ fn parse_and_compile_impl(readings: Vec<(String, String)>) -> Result<u32, String
 
 fn release_impl(handle: u32) {
     let mut s = ds().lock().unwrap();
-    if let Some(slot) = s.get_mut(handle as usize) { *slot = None; }
+    s.get_mut(handle as usize).into_iter().for_each(|slot| *slot = None);
 }
 
 /// SYSTEM:x = ⟨o, D'⟩. Pure ρ-dispatch + state transition.
@@ -88,13 +88,12 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
     // Single ρ-dispatch (Eq. 9)
     let result = ast::apply(&ast::Func::Def(key.to_string()), &obj, &st.d);
 
-    // AST state transition: if result is a new D, store it (⟨o, D'⟩)
+    // AST state transition: when result is a new D, store it (⟨o, D'⟩).
     // Platform primitives (compile, apply) return D' as their result.
     // Pure query defs return display notation (no state change).
-    if result.as_seq().is_some() && ast::fetch("Noun", &result) != ast::Object::Bottom {
-        // Result contains cells (Noun, GraphSchema, etc.) — it's a new D
-        s[handle as usize] = Some(CompiledState { d: result.clone() });
-    }
+    // Result contains cells (Noun, GraphSchema, etc.) iff it's a new D.
+    let is_new_d = result.as_seq().is_some() && ast::fetch("Noun", &result) != ast::Object::Bottom;
+    is_new_d.then(|| s[handle as usize] = Some(CompiledState { d: result.clone() }));
 
     result.to_string()
 }

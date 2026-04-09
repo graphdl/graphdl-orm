@@ -7,19 +7,18 @@
 /// Simple English pluralization for noun names.
 pub fn pluralize(word: &str) -> String {
     let lower = word.to_lowercase();
-    if lower.ends_with("ss") || lower.ends_with("sh") || lower.ends_with("ch") || lower.ends_with('x') {
-        return format!("{}es", word);
+    let es_suffix = lower.ends_with("ss") || lower.ends_with("sh") || lower.ends_with("ch") || lower.ends_with('x') || lower.ends_with('s');
+    let z_suffix = lower.ends_with('z');
+    let y_consonant = lower.ends_with('y')
+        && !lower.ends_with("ay") && !lower.ends_with("ey")
+        && !lower.ends_with("oy") && !lower.ends_with("uy")
+        && !lower.ends_with("iy");
+    match (es_suffix, z_suffix, y_consonant) {
+        (true, _, _) => format!("{}es", word),             // Status/Box/Match/Bush -> ...es
+        (_, true, _) => format!("{}zes", word),            // Quiz -> Quizzes
+        (_, _, true) => format!("{}ies", &word[..word.len() - 1]), // Entity -> Entities
+        _ => format!("{}s", word),
     }
-    if lower.ends_with('z') {
-        return format!("{}zes", word); // Quiz -> Quizzes
-    }
-    if lower.ends_with('s') {
-        return format!("{}es", word); // Status -> Statuses
-    }
-    if lower.ends_with('y') && !lower.ends_with("ay") && !lower.ends_with("ey") && !lower.ends_with("oy") && !lower.ends_with("uy") && !lower.ends_with("iy") {
-        return format!("{}ies", &word[..word.len() - 1]); // Entity -> Entities
-    }
-    format!("{}s", word)
 }
 
 /// Noun name -> REST collection slug (kebab-case, pluralized).
@@ -57,13 +56,27 @@ fn split_noun(name: &str) -> Vec<String> {
     if name.contains(' ') {
         name.split_whitespace().map(|s| s.to_string()).collect()
     } else {
-        let (mut words, last) = name.chars().fold((Vec::new(), String::new()), |(mut ws, mut cur), ch| {
-            if ch.is_uppercase() && !cur.is_empty() { ws.push(cur); cur = String::new(); }
-            cur.push(ch);
-            (ws, cur)
-        });
-        if !last.is_empty() { words.push(last); }
-        words
+        // Fold chars into (finished_words, current_word). Each char either
+        // starts a new word (uppercase after non-empty current) or extends
+        // the current word -- a pure Backus cond inside the fold.
+        let (words, last) = name.chars().fold(
+            (Vec::<String>::new(), String::new()),
+            |(ws, cur), ch| {
+                let boundary = ch.is_uppercase() && !cur.is_empty();
+                let (ws, cur) = if boundary {
+                    let ws = ws.into_iter().chain(std::iter::once(cur)).collect();
+                    (ws, String::new())
+                } else {
+                    (ws, cur)
+                };
+                let cur = cur + &ch.to_string();
+                (ws, cur)
+            },
+        );
+        // Append trailing word as a pure cond: empty -> words, non-empty -> words + last.
+        last.is_empty()
+            .then(|| words.clone())
+            .unwrap_or_else(|| words.into_iter().chain(std::iter::once(last)).collect())
     }
 }
 
