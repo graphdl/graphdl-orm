@@ -1167,9 +1167,11 @@ fn compile_join_derivation(ir: &Domain, rule: &DerivationRuleDef) -> CompiledDer
     // R_1 = f0, R_2 = <f0, f1>, R_3 = <<f0, f1>, f2>, ...
     // R_k = <R_{k-1}, f_{k-1}>
     fn access_fact(i: usize, depth: usize) -> Func {
-        if depth == 1 { return Func::Id; }
-        if i == depth - 1 { return Func::Selector(2); }
-        Func::compose(access_fact(i, depth - 1), Func::Selector(1))
+        match (depth, i) {
+            (1, _) => Func::Id,
+            (d, i) if i == d - 1 => Func::Selector(2),
+            (d, _) => Func::compose(access_fact(i, d - 1), Func::Selector(1)),
+        }
     }
 
     // Helper: find role index of a noun in a given antecedent FT
@@ -1228,7 +1230,7 @@ fn compile_join_derivation(ir: &Domain, rule: &DerivationRuleDef) -> CompiledDer
         join_conds.extend(match_pairs.iter().filter_map(|(left_noun, right_noun)| {
             let left_ft = (0..=j).find(|&fi| find_role(fi, left_noun).is_some())?;
             let right_ft = (0..=j).find(|&fi| find_role(fi, right_noun).is_some())?;
-            if left_ft != j && right_ft != j { return None; }
+            (left_ft == j || right_ft == j).then_some(())?;
             let left_role = find_role(left_ft, left_noun)?;
             let right_role = find_role(right_ft, right_noun)?;
             let val = |ft: usize, ri: usize| if ft == j {
@@ -1306,7 +1308,7 @@ fn compile_subtype_inheritance(ir: &Domain) -> Vec<CompiledDerivation> {
                 .filter(|r| r.noun_name == *super_name)
                 .map(move |r| (ft_id.clone(), ft.reading.clone(), r.role_index)))
             .collect();
-        if sft.is_empty() { return None; }
+        (!sft.is_empty()).then_some(())?;
 
         let sub = sub_name.clone();
         let sup = super_name.clone();
@@ -1370,7 +1372,7 @@ fn compile_modus_ponens(ir: &Domain) -> Vec<CompiledDerivation> {
         // Otherwise the SS constraint is just a constraint (produces violations,
         // doesn't auto-create facts).
         let has_autofill = cdef.spans.iter().any(|s| s.subset_autofill == Some(true));
-        if !has_autofill { return None; }
+        has_autofill.then_some(())?;
 
         let a_ft_id = cdef.spans[0].fact_type_id.clone();
         let b_ft_id = cdef.spans[1].fact_type_id.clone();
@@ -1526,7 +1528,7 @@ fn compile_cwa_negation(ir: &Domain) -> Vec<CompiledDerivation> {
                     .filter(|r| r.noun_name == *noun_name)
                     .map(move |r| (ft_id.clone(), ft.reading.clone(), r.role_index)))
                 .collect();
-            if relevant_fts.is_empty() { return None; }
+            (!relevant_fts.is_empty()).then_some(())?;
 
             let noun = noun_name.clone();
             let id = format!("_cwa_negation_{}", noun);
@@ -2184,8 +2186,7 @@ fn compile_ring_acyclic_ast(def: &ConstraintDef) -> Func {
         // Extract <role0_val, role1_val> pairs from encoded facts.
         // Fact encoding: <<noun0, val0>, <noun1, val1>, ...>
         fn edge_pair(fact: &Object) -> Option<(String, String)> {
-            let items = fact.as_seq()?;
-            if items.len() < 2 { return None; }
+            let items = fact.as_seq().filter(|i| i.len() >= 2)?;
             let v0 = items[0].as_seq().and_then(|p| p.get(1)).and_then(|v| v.as_atom())?;
             let v1 = items[1].as_seq().and_then(|p| p.get(1)).and_then(|v| v.as_atom())?;
             Some((v0.to_string(), v1.to_string()))
@@ -2687,8 +2688,7 @@ fn compile_value_constraint_ast(ir: &Domain, def: &ConstraintDef) -> Func {
     // Collect allowed values from the nouns in the spanned fact types
     let spans = resolve_spans(ir, &def.spans);
     let allowed: Vec<(String, HashSet<String>)> = spans.iter().filter_map(|span| {
-        let vals = ir.enum_values.get(&span.noun_name)?;
-        if vals.is_empty() { return None; }
+        let vals = ir.enum_values.get(&span.noun_name).filter(|v| !v.is_empty())?;
         Some((span.noun_name.clone(), vals.iter().cloned().collect::<HashSet<_>>()))
     }).collect();
 
@@ -2697,7 +2697,7 @@ fn compile_value_constraint_ast(ir: &Domain, def: &ConstraintDef) -> Func {
         allowed
     } else {
         ir.enum_values.iter().filter_map(|(name, vals)| {
-            if vals.is_empty() { return None; }
+            (!vals.is_empty()).then_some(())?;
             Some((name.clone(), vals.iter().cloned().collect::<HashSet<_>>()))
         }).collect()
     };

@@ -99,12 +99,14 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
 
     ir.constraints.iter()
         .filter(|c| c.kind == "XO" && c.spans.len() >= 2)
-        .for_each(|constraint| {
+        .filter_map(|constraint| {
             let ft_ids: Vec<&str> = constraint.spans.iter().map(|s| s.fact_type_id.as_str()).collect();
             let unary_fts: Vec<_> = ft_ids.iter()
                 .filter_map(|id| ir.fact_types.get(*id))
                 .filter(|ft| ft.roles.len() == 1).collect();
-            if unary_fts.len() < 2 { return; }
+            (unary_fts.len() >= 2).then_some((ft_ids, unary_fts))
+        })
+        .for_each(|(ft_ids, unary_fts)| {
             let entity_name = &unary_fts[0].roles[0].noun_name;
             let values: Vec<String> = unary_fts.iter().map(|ft|
                 ft.reading.split(" is ").last().map(|s| s.trim_end_matches('.').to_string())
@@ -457,7 +459,7 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
         .filter(|ref_table| !emitted.contains(*ref_table))
         .filter_map(|ref_table| {
             let (name, _) = ir.nouns.iter().find(|(name, def)| to_snake(name) == *ref_table && def.object_type == "entity")?;
-            if subtype_names.contains(name) && !partitioned_subtypes.contains(name) { return None; }
+            (!(subtype_names.contains(name) && !partitioned_subtypes.contains(name))).then_some(())?;
             Some(ref_table.clone())
         })
         .collect::<Vec<_>>()

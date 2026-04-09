@@ -110,8 +110,7 @@ pub fn forward_chain_defs_state(
 
 /// Parse a derivation result Object into a DerivedFact.
 fn parse_derived_fact(item: &ast::Object, derived_by: &str) -> Option<DerivedFact> {
-    let fact_items = item.as_seq()?;
-    if fact_items.len() < 3 { return None; }
+    let fact_items = item.as_seq().filter(|f| f.len() >= 3)?;
     let ft_id = fact_items[0].as_atom()?.to_string();
     let reading = fact_items[1].as_atom()?.to_string();
     let bindings: Vec<(String, String)> = fact_items[2].as_seq()
@@ -204,7 +203,7 @@ fn prove_goal_state_pop(
     state: &ast::Object, goal: &str, visited: &HashSet<String>,
     schemas: &ast::Object, rules: &ast::Object,
 ) -> Option<ProofStep> {
-    if visited.contains(goal) { return None; }
+    (!visited.contains(goal)).then_some(())?;
     let visited = &{ let mut v = visited.clone(); v.insert(goal.to_string()); v };
 
     let schema_reading = |ft_id: &str| -> Option<String> {
@@ -213,8 +212,9 @@ fn prove_goal_state_pop(
             .and_then(|s| ast::binding(s, "reading").map(|r| r.to_string()))
     };
 
-    // Step 1: axiom search — find goal directly in state
-    let axiom = ast::cells_iter(state).into_iter()
+    // Axiom search first (Step 1), else derivation search (Step 2).
+    // `or_else` is Backus cond lifted into Option: axiom ? axiom : derive().
+    ast::cells_iter(state).into_iter()
         .filter_map(|(ft_id, contents)| {
             let reading = schema_reading(ft_id)?;
             contents.as_seq()?.iter()
@@ -225,16 +225,13 @@ fn prove_goal_state_pop(
                 .find(|fact_text| fact_text_matches(goal, fact_text, &reading))
                 .map(|fact_text| ProofStep { fact: fact_text, justification: Justification::Axiom, children: vec![] })
         })
-        .next();
-    if axiom.is_some() { return axiom; }
-
-    // Step 2: derivation — try rules whose consequent matches goal
-    rules.as_seq().and_then(|rule_list| {
+        .next()
+        .or_else(|| rules.as_seq().and_then(|rule_list| {
         rule_list.iter().find_map(|rule| {
             let cons_ft_id = ast::binding(rule, "consequentFactTypeId")?.to_string();
             let cons_reading = schema_reading(&cons_ft_id)?;
             let goal_prefix = goal.split(' ').next().unwrap_or("");
-            if !goal.contains(&cons_reading) && !cons_reading.contains(goal_prefix) { return None; }
+            (goal.contains(&cons_reading) || cons_reading.contains(goal_prefix)).then_some(())?;
 
             let ant_ids_str = ast::binding(rule, "antecedentFactTypeIds")?.to_string();
             let child_proofs: Option<Vec<ProofStep>> = ant_ids_str.split(',')
@@ -256,7 +253,7 @@ fn prove_goal_state_pop(
                 children,
             })
         })
-    })
+    }))
 }
 
 /// Extract bindings from a fact Object as (key, value) pairs.
@@ -277,11 +274,11 @@ fn prove_goal_state(
     goal: &str,
     visited: &HashSet<String>,
 ) -> Option<ProofStep> {
-    if visited.contains(goal) { return None; }
+    (!visited.contains(goal)).then_some(())?;
     let visited = &{ let mut v = visited.clone(); v.insert(goal.to_string()); v };
 
-    // Step 1: axiom search — find goal directly in state
-    let axiom = ast::cells_iter(state).into_iter()
+    // Axiom first, then derivation. or_else = Backus cond lifted into Option.
+    ast::cells_iter(state).into_iter()
         .filter_map(|(ft_id, contents)| {
             let ft = ir.fact_types.get(ft_id)?;
             contents.as_seq()?.iter()
@@ -289,14 +286,11 @@ fn prove_goal_state(
                 .find(|fact_text| fact_text_matches(goal, fact_text, &ft.reading))
                 .map(|fact_text| ProofStep { fact: fact_text, justification: Justification::Axiom, children: vec![] })
         })
-        .next();
-    if axiom.is_some() { return axiom; }
-
-    // Step 2: derivation — try rules whose consequent matches goal
-    ir.derivation_rules.iter().find_map(|rule| {
+        .next()
+        .or_else(|| ir.derivation_rules.iter().find_map(|rule| {
         let cons_ft = ir.fact_types.get(&rule.consequent_fact_type_id)?;
         let goal_prefix = goal.split(' ').next().unwrap_or("");
-        if !goal.contains(&cons_ft.reading) && !cons_ft.reading.contains(goal_prefix) { return None; }
+        (goal.contains(&cons_ft.reading) || cons_ft.reading.contains(goal_prefix)).then_some(())?;
 
         let children: Option<Vec<ProofStep>> = rule.antecedent_fact_type_ids.iter()
             .map(|ant_ft_id| {
@@ -311,7 +305,7 @@ fn prove_goal_state(
             justification: Justification::Derived { rule_id: rule.id.clone(), rule_text: rule.text.clone() },
             children,
         })
-    })
+    }))
 }
 
 /// Format a fact from its reading template and bindings
