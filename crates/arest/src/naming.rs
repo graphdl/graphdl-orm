@@ -57,16 +57,12 @@ fn split_noun(name: &str) -> Vec<String> {
     if name.contains(' ') {
         name.split_whitespace().map(|s| s.to_string()).collect()
     } else {
-        let mut words = Vec::new();
-        let mut current = String::new();
-        for ch in name.chars() {
-            if ch.is_uppercase() && !current.is_empty() {
-                words.push(current);
-                current = String::new();
-            }
-            current.push(ch);
-        }
-        if !current.is_empty() { words.push(current) }
+        let (mut words, last) = name.chars().fold((Vec::new(), String::new()), |(mut ws, mut cur), ch| {
+            if ch.is_uppercase() && !cur.is_empty() { ws.push(cur); cur = String::new(); }
+            cur.push(ch);
+            (ws, cur)
+        });
+        if !last.is_empty() { words.push(last); }
         words
     }
 }
@@ -93,16 +89,13 @@ pub fn resolve_entity_id(
 
     // Heuristic: find a field that looks like a reference scheme
     // Common patterns: "slug", "email", "code", "name" for value-type refs
-    for (field, value) in fields {
-        let lower = field.to_lowercase();
-        if lower == "slug" || lower.ends_with("slug") || lower == "email" || lower == "code" || lower == "id" {
-            if !value.is_empty() {
-                return Some(value.clone());
-            }
-        }
-    }
-
-    None
+    fields.iter()
+        .filter(|(field, value)| !value.is_empty() && {
+            let lower = field.to_lowercase();
+            lower == "slug" || lower.ends_with("slug") || lower == "email" || lower == "code" || lower == "id"
+        })
+        .map(|(_, value)| value.clone())
+        .next()
 }
 
 #[cfg(test)]
