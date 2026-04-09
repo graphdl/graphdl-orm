@@ -2196,22 +2196,24 @@ fn compile_ring_acyclic_ast(def: &ConstraintDef) -> Func {
             .collect();
 
         // Build transitive closure as set of (from, to) pairs
-        let mut tc: std::collections::HashSet<(String, String)> = original_pairs.iter().cloned().collect();
-        let max_iterations = 1000;
-        for _ in 0..max_iterations {
-            let mut new_edges = Vec::new();
-            for (a, b) in tc.iter() {
-                for (c, d) in &original_pairs {
-                    if b == c && !tc.contains(&(a.clone(), d.clone())) {
-                        new_edges.push((a.clone(), d.clone()));
-                    }
-                }
-            }
-            if new_edges.is_empty() { break; }
-            for edge in new_edges {
-                tc.insert(edge);
-            }
-        }
+        let tc: std::collections::HashSet<(String, String)> = (0..1000usize).fold(
+            original_pairs.iter().cloned().collect::<std::collections::HashSet<(String, String)>>(),
+            |tc, _| {
+                let new_edges: Vec<(String, String)> = tc.iter()
+                    .flat_map(|(a, b)| original_pairs.iter()
+                        .filter(|(c, _)| b == c)
+                        .filter_map(|(_, d)| {
+                            if tc.contains(&(a.clone(), d.clone())) { None }
+                            else { Some((a.clone(), d.clone())) }
+                        })
+                        .collect::<Vec<_>>())
+                    .collect();
+                if new_edges.is_empty() { return tc; }
+                let mut tc = tc;
+                tc.extend(new_edges);
+                tc
+            },
+        );
 
         // Find self-loops (cycles): (x, x) in tc
         let cycle_nodes: Vec<Object> = tc.iter()
@@ -2311,10 +2313,10 @@ fn compile_ring_reflexive_ast(ir: &Domain, def: &ConstraintDef) -> Func {
 fn compile_uniqueness_ast(_ir: &Domain, def: &ConstraintDef) -> Func {
     let spans = resolve_spans(_ir, &def.spans);
 
-    let mut groups: HashMap<String, Vec<ResolvedSpan>> = HashMap::new();
-    for span in &spans {
-        groups.entry(span.fact_type_id.clone()).or_default().push(span.clone());
-    }
+    let groups: HashMap<String, Vec<ResolvedSpan>> = spans.iter().fold(HashMap::new(), |mut acc, span| {
+        acc.entry(span.fact_type_id.clone()).or_default().push(span.clone());
+        acc
+    });
     let span_groups: Vec<(String, Vec<ResolvedSpan>)> = groups.into_iter().collect();
 
     // Pure Func UC: single fact type, any number of spans.
@@ -2380,9 +2382,7 @@ fn compile_uniqueness_ast(_ir: &Domain, def: &ConstraintDef) -> Func {
 
     // Multi-span UC: pure Func per group, then Concat.
     // Each group is checked independently for uniqueness, same as single-FT case.
-    let mut group_checks: Vec<Func> = Vec::new();
-
-    for (ft_id, group_spans) in &span_groups {
+    let group_checks: Vec<Func> = span_groups.iter().map(|(ft_id, group_spans)| {
         let facts = extract_facts_func(ft_id);
 
         if group_spans.len() == 1 {
@@ -2425,14 +2425,14 @@ fn compile_uniqueness_ast(_ir: &Domain, def: &ConstraintDef) -> Func {
             ]);
             let viol = make_violation_func(&def.id, &def.text, detail);
 
-            group_checks.push(Func::compose(
+            Func::compose(
                 Func::condition(
                     Func::compose(Func::Not, Func::NullTest),
                     Func::construction(vec![Func::compose(viol, Func::Selector(1))]),
                     Func::constant(Object::phi()),
                 ),
                 violating,
-            ));
+            )
         } else {
             // Multi-span in one FT group: composite scope key.
             // Two facts are "same scope" if ALL constrained roles match,
@@ -2481,24 +2481,22 @@ fn compile_uniqueness_ast(_ir: &Domain, def: &ConstraintDef) -> Func {
                 Func::constant(Object::atom(&format!("({})", label))),
             ];
             // Show each scope role value from the violating fact (Sel(1) of <fact, all> pair)
-            for s in group_spans {
-                detail_parts.push(Func::compose(role_value(s.role_index), Func::Selector(1)));
-            }
+            detail_parts.extend(group_spans.iter().map(|s| Func::compose(role_value(s.role_index), Func::Selector(1))));
             detail_parts.push(Func::constant(Object::atom("is not unique in")));
             detail_parts.push(Func::constant(Object::atom(&reading)));
             let detail = Func::construction(detail_parts);
             let viol = make_violation_func(&def.id, &def.text, detail);
 
-            group_checks.push(Func::compose(
+            Func::compose(
                 Func::condition(
                     Func::compose(Func::Not, Func::NullTest),
                     Func::construction(vec![Func::compose(viol, Func::Selector(1))]),
                     Func::constant(Object::phi()),
                 ),
                 violating,
-            ));
+            )
         }
-    }
+    }).collect();
 
     match group_checks.len() {
         0 => Func::constant(Object::phi()),
@@ -2514,9 +2512,7 @@ fn compile_mandatory_ast(_ir: &Domain, def: &ConstraintDef) -> Func {
     let spans = resolve_spans(_ir, &def.spans);
 
     // Build a pure Func check per span, then Concat to flatten.
-    let mut span_checks: Vec<Func> = Vec::new();
-
-    for span in &spans {
+    let span_checks: Vec<Func> = spans.iter().map(|span| {
         let noun_name = &span.noun_name;
         let reading = &span.reading;
 
@@ -2573,16 +2569,14 @@ fn compile_mandatory_ast(_ir: &Domain, def: &ConstraintDef) -> Func {
 
         // apply_to_all(viol) . Filter(not_participating) . DistR . [instances, ft_facts]
         // DistR on <instances, ft_facts> -> <<inst1, ft_facts>, <inst2, ft_facts>, ...>
-        let check = Func::compose(
+        Func::compose(
             Func::apply_to_all(viol),
             Func::compose(
                 Func::filter(not_participating),
                 Func::compose(Func::DistR, Func::construction(vec![instances, ft_facts])),
             ),
-        );
-
-        span_checks.push(check);
-    }
+        )
+    }).collect();
 
     match span_checks.len() {
         0 => Func::constant(Object::phi()),
@@ -2606,9 +2600,7 @@ fn compile_frequency_ast(_ir: &Domain, def: &ConstraintDef) -> Func {
     };
 
     // Build a pure Func check per span, then Concat to flatten.
-    let mut span_checks: Vec<Func> = Vec::new();
-
-    for span in &spans {
+    let span_checks: Vec<Func> = spans.iter().map(|span| {
         let facts = extract_facts_func(&span.fact_type_id);
         let scope_idx = span.role_index;
 
@@ -2672,15 +2664,15 @@ fn compile_frequency_ast(_ir: &Domain, def: &ConstraintDef) -> Func {
         let viol = make_violation_func(&def.id, &def.text, detail);
 
         // ONE violation per violating scope value (take first).
-        span_checks.push(Func::compose(
+        Func::compose(
             Func::condition(
                 Func::compose(Func::Not, Func::NullTest),
                 Func::construction(vec![Func::compose(viol, Func::Selector(1))]),
                 Func::constant(Object::phi()),
             ),
             violating,
-        ));
-    }
+        )
+    }).collect();
 
     match span_checks.len() {
         0 => Func::constant(Object::phi()),
@@ -3300,20 +3292,20 @@ fn compile_state_machine(
         .map(|t| (t.to.clone(), t.event.clone(), t.guard.clone()))
         .collect();
 
-    for (to, event, guard) in &parent_transitions {
-        for status in &defined_statuses {
-            let already_exists = expanded.iter()
-                .any(|t| t.from == *status && t.event == *event);
-            if !already_exists {
-                expanded.push(ExpandedTransition {
+    let new_transitions: Vec<ExpandedTransition> = parent_transitions.iter()
+        .flat_map(|(to, event, guard)| {
+            defined_statuses.iter()
+                .filter(|status| !expanded.iter().any(|t| t.from == **status && t.event == *event))
+                .map(|status| ExpandedTransition {
                     from: status.to_string(),
                     to: to.clone(),
                     event: event.clone(),
                     guard: guard.clone(),
-                });
-            }
-        }
-    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    expanded.extend(new_transitions);
 
     let transition_table: Vec<(String, String, String)> = expanded.iter()
         .map(|t| (t.from.clone(), t.to.clone(), t.event.clone()))
@@ -3328,67 +3320,68 @@ fn compile_state_machine(
     //   (null  .  guard_func  .  ...  AND  eq  .  [id, <from, event>]) -> target; next
     //
     // Guard passes iff the constraint func returns phi (empty = no violations).
-    let mut sm_func = crate::ast::Func::Selector(1); // fallback: return current state
+    let sm_func = expanded.iter().rev().fold(
+        crate::ast::Func::Selector(1), // fallback: return current state
+        |sm_func, t| {
+            // Match predicate: <current_state, event> == <from, event>
+            let match_pred = crate::ast::Func::compose(
+                crate::ast::Func::Eq,
+                crate::ast::Func::construction(vec![
+                    crate::ast::Func::Id,
+                    crate::ast::Func::constant(crate::ast::Object::seq(vec![
+                        crate::ast::Object::atom(&t.from),
+                        crate::ast::Object::atom(&t.event),
+                    ])),
+                ]),
+            );
 
-    for t in expanded.iter().rev() {
-        // Match predicate: <current_state, event> == <from, event>
-        let match_pred = crate::ast::Func::compose(
-            crate::ast::Func::Eq,
-            crate::ast::Func::construction(vec![
-                crate::ast::Func::Id,
-                crate::ast::Func::constant(crate::ast::Object::seq(vec![
-                    crate::ast::Object::atom(&t.from),
-                    crate::ast::Object::atom(&t.event),
-                ])),
-            ]),
-        );
+            // If transition has guards, compose them with the match predicate.
+            // Guard passes iff all constraint funcs produce phi (no violations).
+            let pred = if let Some(ref guard) = t.guard {
+                let guard_funcs: Vec<&crate::ast::Func> = guard.constraint_ids.iter()
+                    .filter_map(|cid| constraint_by_id.get(cid.as_str()).copied())
+                    .collect();
 
-        // If transition has guards, compose them with the match predicate.
-        // Guard passes iff all constraint funcs produce phi (no violations).
-        let pred = if let Some(ref guard) = t.guard {
-            let guard_funcs: Vec<&crate::ast::Func> = guard.constraint_ids.iter()
-                .filter_map(|cid| constraint_by_id.get(cid.as_str()).copied())
-                .collect();
-
-            if guard_funcs.is_empty() {
-                match_pred
-            } else {
-                // Build: null_test  .  guard_func (returns T if guard produces phi)
-                // For multiple guards: all must pass
-                let mut guard_check = crate::ast::Func::compose(
-                    crate::ast::Func::NullTest,
-                    guard_funcs[0].clone(),
-                );
-                for gf in &guard_funcs[1..] {
-                    // AND: both must be true (NullTest returns T/F)
-                    let next_check = crate::ast::Func::compose(
+                if guard_funcs.is_empty() {
+                    match_pred
+                } else {
+                    // Build: null_test  .  guard_func (returns T if guard produces phi)
+                    // For multiple guards: all must pass — fold over tail
+                    let first_check = crate::ast::Func::compose(
                         crate::ast::Func::NullTest,
-                        (*gf).clone(),
+                        guard_funcs[0].clone(),
                     );
-                    // Compose as: if guard1_passes then check guard2+match else id
-                    guard_check = crate::ast::Func::condition(
+                    let guard_check = guard_funcs[1..].iter().fold(first_check, |acc, gf| {
+                        // AND: both must be true (NullTest returns T/F)
+                        let next_check = crate::ast::Func::compose(
+                            crate::ast::Func::NullTest,
+                            (*gf).clone(),
+                        );
+                        // Compose as: if guard_passes then check next else F
+                        crate::ast::Func::condition(
+                            acc,
+                            next_check,
+                            crate::ast::Func::constant(crate::ast::Object::atom("F")),
+                        )
+                    });
+                    // Final: if guards pass AND state+event match -> fire
+                    crate::ast::Func::condition(
                         guard_check,
-                        next_check,
+                        match_pred,
                         crate::ast::Func::constant(crate::ast::Object::atom("F")),
-                    );
+                    )
                 }
-                // Final: if guards pass AND state+event match -> fire
-                crate::ast::Func::condition(
-                    guard_check,
-                    match_pred,
-                    crate::ast::Func::constant(crate::ast::Object::atom("F")),
-                )
-            }
-        } else {
-            match_pred
-        };
+            } else {
+                match_pred
+            };
 
-        sm_func = crate::ast::Func::condition(
-            pred,
-            crate::ast::Func::constant(crate::ast::Object::atom(&t.to)),
-            sm_func,
-        );
-    }
+            crate::ast::Func::condition(
+                pred,
+                crate::ast::Func::constant(crate::ast::Object::atom(&t.to)),
+                sm_func,
+            )
+        },
+    );
 
     CompiledStateMachine {
         noun_name: def.noun_name.clone(),

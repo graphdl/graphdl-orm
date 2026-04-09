@@ -137,9 +137,7 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
     // vs which should be absorbed into the supertype (single-table strategy).
     let mut subtype_to_root: HashMap<String, String> = HashMap::new();
     let mut parent_of: HashMap<String, String> = HashMap::new();
-    for (name, st) in &ir.subtypes {
-        parent_of.insert(name.clone(), st.clone());
-    }
+    ir.subtypes.iter().for_each(|(name, st)| { parent_of.insert(name.clone(), st.clone()); });
     for name in parent_of.keys() {
         let mut current = name.clone();
         let mut visited = HashSet::new();
@@ -227,21 +225,20 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
         let ucs = ucs_by_ft.get(*ft_id).unwrap();
         let spanning_uc = ucs.iter().max_by_key(|uc| uc.len()).unwrap();
 
-        let mut columns = Vec::new();
-        let mut pk_cols = Vec::new();
-        for role in &ft.roles {
+        let columns: Vec<TableColumn> = ft.roles.iter().map(|role| {
             let col_name = column_name_for_target(ir, &role.noun_name);
             let is_entity = ir.nouns.get(&role.noun_name).map_or(false, |n| n.object_type == "entity");
-            columns.push(TableColumn {
-                name: col_name.clone(),
+            TableColumn {
+                name: col_name,
                 col_type: "TEXT".to_string(),
                 nullable: false,
                 references: if is_entity { Some(to_snake(&role.noun_name)) } else { None },
-            });
-            if spanning_uc.contains(&role.role_index) {
-                pk_cols.push(col_name);
             }
-        }
+        }).collect();
+        let pk_cols: Vec<String> = ft.roles.iter()
+            .filter(|role| spanning_uc.contains(&role.role_index))
+            .map(|role| column_name_for_target(ir, &role.noun_name))
+            .collect();
 
         let table_name = compound_table_name(&ft.reading, &ft.roles, &noun_name_set);
         tables.push(TableDef { name: table_name.clone(), columns, primary_key: pk_cols, checks: None, unique_constraints: None });
@@ -272,26 +269,23 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
             let entry = entity_columns.entry(entity_key).or_insert_with(|| (Vec::new(), HashSet::new(), Vec::new()));
             let is_subtype = subtype_names.contains(&source_role.noun_name);
 
-            for role in &ft.roles {
-                if role.role_index == source_role_idx { continue }
+            ft.roles.iter().filter(|role| role.role_index != source_role_idx).for_each(|role| {
                 let col_name = column_name_for_target(ir, &role.noun_name);
                 let is_mandatory = mc_set.contains(&format!("{}:{}", ft_id, source_role_idx));
                 let is_entity = ir.nouns.get(&role.noun_name).map_or(false, |n| n.object_type == "entity");
-
                 entry.0.push(TableColumn {
                     name: col_name.clone(),
                     col_type: "TEXT".to_string(),
                     nullable: if is_subtype { true } else { !is_mandatory },
                     references: if is_entity { Some(to_snake(&role.noun_name)) } else { None },
                 });
-
                 // VC check
                 let vc_key = format!("{}:{}", ft_id, role.role_index);
                 if let Some(vals) = vcs_by_ft_role.get(&vc_key) {
                     let quoted = vals.iter().map(|v| format!("'{}'", v)).collect::<Vec<_>>().join(", ");
                     entry.2.push(format!("{} IN ({})", col_name, quoted));
                 }
-            }
+            });
             let _ = source_noun; // used for type check above
         }
     }
@@ -356,10 +350,10 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
     }
 
     // -- Step 0.1 continued: inject XO columns -----------------------
-    for (entity_name, xo_cols) in &xo_columns {
+    xo_columns.iter().for_each(|(entity_name, xo_cols)| {
         let resolved = resolve_entity(entity_name);
         let entry = entity_columns.entry(resolved).or_insert_with(|| (Vec::new(), HashSet::new(), Vec::new()));
-        for (col_name, values, nullable) in xo_cols {
+        xo_cols.iter().for_each(|(col_name, values, nullable)| {
             entry.0.push(TableColumn {
                 name: col_name.clone(),
                 col_type: "TEXT".to_string(),
@@ -368,8 +362,8 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
             });
             let quoted = values.iter().map(|v| format!("'{}'", v)).collect::<Vec<_>>().join(", ");
             entry.2.push(format!("{} IN ({})", col_name, quoted));
-        }
-    }
+        });
+    });
 
     // -- Step 2.5: External UC -> UNIQUE constraints -------------------
     // External UCs span multiple fact types. Collect them per target entity.
@@ -399,12 +393,9 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
             let col_name = column_name_for_target(ir, &uc_role.noun_name);
             uc_cols.push(col_name);
             // The source role is the other role in the binary fact type
-            for role in &ft.roles {
-                if role.role_index != span.role_index {
-                    let resolved = resolve_entity(&role.noun_name);
-                    target_entity = Some(resolved);
-                }
-            }
+            ft.roles.iter()
+                .filter(|role| role.role_index != span.role_index)
+                .for_each(|role| { target_entity = Some(resolve_entity(&role.noun_name)); });
         }
         if let Some(entity) = target_entity {
             if uc_cols.len() >= 2 {

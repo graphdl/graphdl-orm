@@ -941,19 +941,19 @@ pub fn cell(name: &str, contents: Object) -> Object {
 /// Returns bottom if no cell named n exists.
 pub fn fetch(name: &str, state: &Object) -> Object {
     match state.as_seq() {
-        Some(cells) => {
-            for cell_obj in cells {
-                if let Some(items) = cell_obj.as_seq() {
-                    if items.len() == 3
-                        && items[0].as_atom() == Some(CELL_TAG)
-                        && items[1].as_atom() == Some(name)
-                    {
-                        return items[2].clone();
-                    }
+        Some(cells) => cells.iter()
+            .find_map(|cell_obj| {
+                let items = cell_obj.as_seq()?;
+                if items.len() == 3
+                    && items[0].as_atom() == Some(CELL_TAG)
+                    && items[1].as_atom() == Some(name)
+                {
+                    Some(items[2].clone())
+                } else {
+                    None
                 }
-            }
-            Object::Bottom
-        }
+            })
+            .unwrap_or(Object::Bottom),
         None => Object::Bottom,
     }
 }
@@ -1338,18 +1338,18 @@ fn register_theta1_into(defs: &mut Vec<(String, Func)>) {
             .collect();
         if selectors.is_empty() { return Object::Bottom; }
 
-        let mut rows: Vec<Object> = Vec::new();
-        for tuple in relation {
-            if let Some(cols) = tuple.as_seq() {
+        let rows: Vec<Object> = relation.iter()
+            .filter_map(|tuple| {
+                let cols = tuple.as_seq()?;
                 let projected: Vec<Object> = selectors.iter()
                     .filter_map(|&s| if s >= 1 && s <= cols.len() { Some(cols[s-1].clone()) } else { None })
                     .collect();
-                let row = Object::Seq(projected);
-                if !rows.contains(&row) {
-                    rows.push(row);
-                }
-            }
-        }
+                Some(Object::Seq(projected))
+            })
+            .fold(Vec::new(), |mut acc, row| {
+                if !acc.contains(&row) { acc.push(row); }
+                acc
+            });
         Object::Seq(rows)
     }))));
 
@@ -1369,30 +1369,27 @@ fn register_theta1_into(defs: &mut Vec<(String, Func)>) {
         let r = match items[1].as_seq() { Some(r) => r, None => return Object::Bottom };
         let s = match items[2].as_seq() { Some(s) => s, None => return Object::Bottom };
 
-        let mut result: Vec<Object> = Vec::new();
-        for r_tuple in r {
-            let r_cols = match r_tuple.as_seq() { Some(c) => c, None => continue };
-            let r_val = if shared_col >= 1 && shared_col <= r_cols.len() {
-                &r_cols[shared_col - 1]
-            } else { continue };
-
-            for s_tuple in s {
-                let s_cols = match s_tuple.as_seq() { Some(c) => c, None => continue };
-                let s_val = if shared_col >= 1 && shared_col <= s_cols.len() {
-                    &s_cols[shared_col - 1]
-                } else { continue };
-
-                if r_val == s_val {
+        let result: Vec<Object> = r.iter()
+            .filter_map(|r_tuple| {
+                let r_cols = r_tuple.as_seq()?;
+                if shared_col < 1 || shared_col > r_cols.len() { return None; }
+                Some(r_cols)
+            })
+            .flat_map(|r_cols| {
+                let r_val = r_cols[shared_col - 1].clone();
+                s.iter().filter_map(move |s_tuple| {
+                    let s_cols = s_tuple.as_seq()?;
+                    if shared_col < 1 || shared_col > s_cols.len() { return None; }
+                    let s_val = &s_cols[shared_col - 1];
+                    if r_val != *s_val { return None; }
                     let mut merged: Vec<Object> = r_cols.to_vec();
-                    for (i, col) in s_cols.iter().enumerate() {
-                        if i + 1 != shared_col {
-                            merged.push(col.clone());
-                        }
-                    }
-                    result.push(Object::Seq(merged));
-                }
-            }
-        }
+                    merged.extend(s_cols.iter().enumerate()
+                        .filter(|(i, _)| i + 1 != shared_col)
+                        .map(|(_, col)| col.clone()));
+                    Some(Object::Seq(merged))
+                })
+            })
+            .collect();
         Object::Seq(result)
     }))));
 
@@ -1408,14 +1405,16 @@ fn register_theta1_into(defs: &mut Vec<(String, Func)>) {
             Some(r) => r,
             None => return Object::Bottom,
         };
-        let mut result: Vec<Object> = Vec::new();
-        for tuple in relation {
-            if let Some(cols) = tuple.as_seq() {
+        let result: Vec<Object> = relation.iter()
+            .filter_map(|tuple| {
+                let cols = tuple.as_seq()?;
                 if cols.len() >= 2 && cols[0] == cols[cols.len() - 1] {
-                    result.push(Object::Seq(cols[..cols.len()-1].to_vec()));
+                    Some(Object::Seq(cols[..cols.len()-1].to_vec()))
+                } else {
+                    None
                 }
-            }
-        }
+            })
+            .collect();
         Object::Seq(result)
     }))));
 
@@ -1436,34 +1435,32 @@ fn register_theta1_into(defs: &mut Vec<(String, Func)>) {
         let r = match items[1].as_seq() { Some(r) => r, None => return Object::Bottom };
         let s = match items[2].as_seq() { Some(s) => s, None => return Object::Bottom };
 
-        let mut result: Vec<Object> = Vec::new();
-        for r_tuple in r {
-            let r_cols = match r_tuple.as_seq() { Some(c) => c, None => continue };
-            let r_val = if shared_col >= 1 && shared_col <= r_cols.len() {
-                &r_cols[shared_col - 1]
-            } else { continue };
-
-            for s_tuple in s {
-                let s_cols = match s_tuple.as_seq() { Some(c) => c, None => continue };
-                let s_val = if shared_col >= 1 && shared_col <= s_cols.len() {
-                    &s_cols[shared_col - 1]
-                } else { continue };
-
-                if r_val == s_val {
-                    let mut projected: Vec<Object> = Vec::new();
-                    for (i, col) in r_cols.iter().enumerate() {
-                        if i + 1 != shared_col { projected.push(col.clone()); }
-                    }
-                    for (i, col) in s_cols.iter().enumerate() {
-                        if i + 1 != shared_col { projected.push(col.clone()); }
-                    }
-                    let row = Object::Seq(projected);
-                    if !result.contains(&row) {
-                        result.push(row);
-                    }
-                }
-            }
-        }
+        let result: Vec<Object> = r.iter()
+            .filter_map(|r_tuple| {
+                let r_cols = r_tuple.as_seq()?;
+                if shared_col < 1 || shared_col > r_cols.len() { return None; }
+                Some(r_cols)
+            })
+            .flat_map(|r_cols| {
+                let r_val = r_cols[shared_col - 1].clone();
+                s.iter().filter_map(move |s_tuple| {
+                    let s_cols = s_tuple.as_seq()?;
+                    if shared_col < 1 || shared_col > s_cols.len() { return None; }
+                    if r_val != s_cols[shared_col - 1] { return None; }
+                    let projected: Vec<Object> = r_cols.iter().enumerate()
+                        .filter(|(i, _)| i + 1 != shared_col)
+                        .map(|(_, col)| col.clone())
+                        .chain(s_cols.iter().enumerate()
+                            .filter(|(i, _)| i + 1 != shared_col)
+                            .map(|(_, col)| col.clone()))
+                        .collect();
+                    Some(Object::Seq(projected))
+                })
+            })
+            .fold(Vec::new(), |mut acc, row| {
+                if !acc.contains(&row) { acc.push(row); }
+                acc
+            });
         Object::Seq(result)
     }))));
 }
