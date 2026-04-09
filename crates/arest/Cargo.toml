@@ -15,10 +15,15 @@ name = "fol"
 path = "src/main.rs"
 
 [features]
-default = ["wit"]
+default = ["wit", "debug-def"]
 wit = ["dep:wit-bindgen"]
 cloudflare = ["dep:wasm-bindgen"]
 local = ["dep:rusqlite"]
+# Gates the `debug` def which returns a full projection of the compiled
+# state (nouns, fact types, constraints, state machines). Useful for test
+# introspection but exposes internals in production — leave OFF for
+# release builds. Enabled by default so `cargo test` works out of the box.
+debug-def = []
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

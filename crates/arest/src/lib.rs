@@ -24,6 +24,7 @@ pub mod parse_rule;
 pub mod parse_forml2;
 pub mod verbalize;
 pub mod arest;
+pub mod generators;
 
 #[cfg(feature = "cloudflare")]
 pub mod cloudflare;
