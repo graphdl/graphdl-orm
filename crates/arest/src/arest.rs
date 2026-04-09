@@ -992,4 +992,145 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
         let result = apply_command_defs(&def_map, &cmd, &state);
         assert!(!result.rejected); // empty is valid
     }
+
+    /// #35 regression: creating an Order with a customer field must NOT
+    /// fire MC on "Order was placed by Customer". This was masked by the
+    /// CWA-negation pollution bug; fixing that bug shouldn't regress here.
+    #[test]
+    fn order_with_customer_passes_mc_on_placed_by() {
+        // Mirrors the exact TS fixture (STATE_READINGS + ORDER_READINGS).
+        let state_readings = r#"# State
+
+## Entity Types
+Status(.Name) is an entity type.
+State Machine Definition(.Name) is an entity type.
+Transition(.id) is an entity type.
+Noun(.Name) is an entity type.
+
+## Fact Types
+### State Machine Definition
+State Machine Definition is for Noun.
+
+### Status
+Status is initial in State Machine Definition.
+
+### Transition
+Transition is defined in State Machine Definition.
+Transition is from Status.
+Transition is to Status.
+"#;
+        let order_readings = r#"# Orders
+
+## Entity Types
+Order(.OrderId) is an entity type.
+Customer(.Name) is an entity type.
+Priority(.Label) is an entity type.
+
+## Value Types
+OrderId is a value type.
+Label is a value type.
+Amount is a value type.
+
+## Fact Types
+### Order
+Order was placed by Customer.
+Order has Priority.
+Order has Amount.
+
+## Constraints
+Each Order was placed by exactly one Customer.
+Each Order has at most one Priority.
+Each Order has at most one Amount.
+
+## Instance Facts
+State Machine Definition 'Order' is for Noun 'Order'.
+Status 'In Cart' is initial in State Machine Definition 'Order'.
+Transition 'place' is defined in State Machine Definition 'Order'.
+Transition 'place' is from Status 'In Cart'.
+Transition 'place' is to Status 'Placed'.
+"#;
+        let state_pop = crate::parse_forml2::parse_to_state(state_readings).unwrap();
+        let order_pop = crate::parse_forml2::parse_to_state_with_nouns(order_readings, &state_pop).unwrap();
+        let state = ast::merge_states(&state_pop, &order_pop);
+        let defs = crate::compile::compile_to_defs_state(&state);
+        let def_map = ast::defs_to_state(&defs, &state);
+
+        let mut fields = HashMap::new();
+        fields.insert("customer".to_string(), "Mono".to_string());
+        fields.insert("priority".to_string(), "High".to_string());
+        let cmd = Command::CreateEntity {
+            noun: "Order".to_string(),
+            domain: "test".to_string(),
+            id: None,
+            fields,
+            sender: None,
+        };
+
+        // Match WASM platform_apply_command which passes `d` as both defs and state.
+        let result = apply_command_defs(&def_map, &cmd, &def_map);
+        assert!(!result.rejected,
+            "Order created with customer should not be rejected. violations={:?}",
+            result.violations);
+    }
+
+    /// #35: MC compile must catch entities missing a mandatory role.
+    /// Creating an Order on a domain where "Each Order is created by
+    /// exactly one User" without a sender (no User fact) must produce
+    /// an alethic violation.
+    #[test]
+    fn mc_fires_on_missing_mandatory_role_for_new_entity() {
+        let readings = r#"# Auth
+
+## Entity Types
+Order(.OrderId) is an entity type.
+User(.Email) is an entity type.
+
+## Value Types
+OrderId is a value type.
+Email is a value type.
+
+## Fact Types
+### Order
+Order is created by User.
+
+## Constraints
+Each Order is created by exactly one User.
+"#;
+        let state = crate::parse_forml2::parse_to_state(readings).unwrap();
+        let defs = crate::compile::compile_to_defs_state(&state);
+        let def_map = ast::defs_to_state(&defs, &state);
+
+        // Sanity: the MC constraint exists in the compiled state.
+        let constraints = ast::fetch_or_phi("Constraint", &def_map);
+        let has_mc = constraints.as_seq().map(|cs| {
+            cs.iter().any(|c| {
+                ast::binding(c, "kind") == Some("MC")
+                    && ast::binding(c, "text").map_or(false, |t| t.contains("created by"))
+            })
+        }).unwrap_or(false);
+        assert!(has_mc, "parsed domain should have an MC on 'Order is created by User'");
+
+        // Create an Order without a sender.
+        let mut fields = HashMap::new();
+        fields.insert("OrderId".to_string(), "ord-1".to_string());
+        let cmd = Command::CreateEntity {
+            noun: "Order".to_string(),
+            domain: "test".to_string(),
+            id: Some("ord-1".to_string()),
+            fields,
+            sender: None,
+        };
+
+        let result = apply_command_defs(&def_map, &cmd, &state);
+
+        // The MC must fire on ord-1 having no matching User.
+        let mc_violations: Vec<_> = result.violations.iter()
+            .filter(|v| v.detail.contains("Mandatory") || v.constraint_text.contains("created by"))
+            .collect();
+        assert!(
+            !mc_violations.is_empty(),
+            "MC should fire: ord-1 has no User. violations={:?}", result.violations
+        );
+        assert!(result.rejected, "alethic MC violation should reject the command");
+    }
 }

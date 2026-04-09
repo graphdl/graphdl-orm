@@ -1560,15 +1560,22 @@ fn compile_cwa_negation(ir: &Domain) -> Vec<CompiledDerivation> {
                 Func::compose(Func::filter(match_cond), Func::DistL),
             );
 
-            // Negation fact: <ft_id, reading, <<noun, instance>>>
-            // Instance is Sel(1) of the <instance, facts> pair
+            // Negation fact goes to a SEPARATE cell ("_cwa_negation:<ft_id>")
+            // and its noun binding is prefixed ("_neg_<noun>") so that
+            // presence constraints (MC, FC, …) enumerating positive
+            // noun instances via instances_of_noun_func never see the
+            // "NOT" facts. The backward-chain prover (evaluate.rs)
+            // consults the derived fact list directly; it does not read
+            // this cell.
+            let neg_cell = format!("_cwa_negation:{}", ft_id);
+            let neg_noun = format!("_neg_{}", noun);
             let neg_reading = format!("NOT: {} (CWA negation for {})", reading, noun);
             let negation_fact = Func::construction(vec![
-                Func::constant(Object::atom(ft_id)),
+                Func::constant(Object::atom(&neg_cell)),
                 Func::constant(Object::atom(&neg_reading)),
                 Func::construction(vec![
                     Func::construction(vec![
-                        Func::constant(Object::atom(&noun)),
+                        Func::constant(Object::atom(&neg_noun)),
                         Func::Selector(1),
                     ]),
                 ]),

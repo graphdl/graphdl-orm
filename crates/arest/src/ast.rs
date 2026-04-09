@@ -158,18 +158,26 @@ pub fn encode_eval_context_state(text: &str, sender: Option<&str>, state: &Objec
 
 /// Encode an Object state in the flat format expected by constraint evaluation.
 /// Each cell becomes <ft_id, <fact_bindings...>> where each fact is <<k,v>, ...>.
+///
+/// Def cells (names containing ':' -- schema:, query:, derivation:, constraint:,
+/// machine:, resolve:, transitions:, _cwa_negation:, etc.) are filtered out.
+/// They hold compiled function definitions and template fact structures with
+/// placeholder bindings that must not pollute constraint/derivation evaluation
+/// over the population.
 pub fn encode_state(state: &Object) -> Object {
-    let fact_types: Vec<Object> = cells_iter(state).into_iter().map(|(ft_id, contents)| {
-        let fact_objs: Vec<Object> = contents.as_seq().map(|facts| {
-            facts.iter().map(|fact| {
-                let bindings: Vec<Object> = fact.as_seq().map(|pairs| {
-                    pairs.iter().map(|pair: &Object| pair.clone()).collect::<Vec<Object>>()
-                }).unwrap_or_default();
-                Object::Seq(bindings)
-            }).collect::<Vec<Object>>()
-        }).unwrap_or_default();
-        Object::seq(vec![Object::atom(ft_id), Object::Seq(fact_objs)])
-    }).collect();
+    let fact_types: Vec<Object> = cells_iter(state).into_iter()
+        .filter(|(ft_id, _)| !ft_id.contains(':'))
+        .map(|(ft_id, contents)| {
+            let fact_objs: Vec<Object> = contents.as_seq().map(|facts| {
+                facts.iter().map(|fact| {
+                    let bindings: Vec<Object> = fact.as_seq().map(|pairs| {
+                        pairs.iter().map(|pair: &Object| pair.clone()).collect::<Vec<Object>>()
+                    }).unwrap_or_default();
+                    Object::Seq(bindings)
+                }).collect::<Vec<Object>>()
+            }).unwrap_or_default();
+            Object::seq(vec![Object::atom(ft_id), Object::Seq(fact_objs)])
+        }).collect();
     Object::Seq(fact_types)
 }
 
