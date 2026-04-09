@@ -687,43 +687,44 @@ pub fn domain_to_state(d: &Domain) -> crate::ast::Object {
 
 /// Materialize Domain into entity cells for EntityDB.
 pub fn domain_to_entities(d: &Domain, slug: &str) -> String {
-    let mut e: Vec<serde_json::Value> = vec![];
-    for (n, def) in &d.nouns {
-        let mut data = serde_json::json!({"name": n, "objectType": &def.object_type});
-        if let Some(s) = d.subtypes.get(n) { data["superType"] = serde_json::json!(s); }
-        if let Some(v) = d.enum_values.get(n) { data["enumValues"] = serde_json::json!(v); }
-        if let Some(r) = d.ref_schemes.get(n) { data["referenceScheme"] = serde_json::json!(r); }
-        if let Some(o) = d.objectifications.get(n) { data["objectifies"] = serde_json::json!(o); }
-        e.push(serde_json::json!({"id": format!("noun:{}", n), "type": "Noun", "domain": slug, "data": data}));
-    }
-    for (id, ft) in &d.fact_types {
-        e.push(serde_json::json!({"id": format!("gs:{}", id), "type": "Graph Schema", "domain": slug, "data": {"name": id, "reading": ft.reading}}));
-        for (i, role) in ft.roles.iter().enumerate() {
-            e.push(serde_json::json!({"id": format!("role:{}:{}", id, i), "type": "Role", "domain": slug, "data": {"nounName": role.noun_name, "position": i, "graphSchema": id}}));
-        }
-        e.push(serde_json::json!({"id": format!("reading:{}", id), "type": "Reading", "domain": slug, "data": {"text": ft.reading, "graphSchema": id}}));
-    }
-    for c in &d.constraints {
-        let cid = if c.id.is_empty() { &c.text } else { &c.id };
-        e.push(serde_json::json!({"id": format!("constraint:{}", cid), "type": "Constraint", "domain": slug,
-            "data": {"kind": c.kind, "modality": c.modality, "text": c.text, "spans": c.spans, "entity": c.entity, "minOccurrence": c.min_occurrence, "maxOccurrence": c.max_occurrence}}));
-    }
-    for (n, sm) in &d.state_machines {
-        e.push(serde_json::json!({"id": n, "type": "State Machine Definition", "domain": slug, "data": {"name": n, "forNoun": sm.noun_name}}));
-        for s in &sm.statuses { e.push(serde_json::json!({"id": format!("status:{}:{}", n, s), "type": "Status", "domain": slug, "data": {"name": s, "stateMachineDefinition": n}})); }
-        for t in &sm.transitions { e.push(serde_json::json!({"id": format!("transition:{}:{}:{}", n, t.from, t.event), "type": "Transition", "domain": slug, "data": {"from": t.from, "to": t.to, "event": t.event, "stateMachineDefinition": n}})); }
-    }
-    for r in &d.derivation_rules {
-        e.push(serde_json::json!({"id": format!("rule:{}", r.id), "type": "Derivation Rule", "domain": slug,
+    let e: Vec<serde_json::Value> = [
+        // α(noun → json) : nouns
+        d.nouns.iter().map(|(n, def)| {
+            let mut data = serde_json::json!({"name": n, "objectType": &def.object_type});
+            d.subtypes.get(n).map(|s| data["superType"] = serde_json::json!(s));
+            d.enum_values.get(n).map(|v| data["enumValues"] = serde_json::json!(v));
+            d.ref_schemes.get(n).map(|r| data["referenceScheme"] = serde_json::json!(r));
+            d.objectifications.get(n).map(|o| data["objectifies"] = serde_json::json!(o));
+            serde_json::json!({"id": format!("noun:{}", n), "type": "Noun", "domain": slug, "data": data})
+        }).collect::<Vec<_>>(),
+        // α(ft → [schema, roles..., reading]) : fact_types
+        d.fact_types.iter().flat_map(|(id, ft)| {
+            std::iter::once(serde_json::json!({"id": format!("gs:{}", id), "type": "Graph Schema", "domain": slug, "data": {"name": id, "reading": ft.reading}}))
+                .chain(ft.roles.iter().enumerate().map(move |(i, role)|
+                    serde_json::json!({"id": format!("role:{}:{}", id, i), "type": "Role", "domain": slug, "data": {"nounName": role.noun_name, "position": i, "graphSchema": id}})))
+                .chain(std::iter::once(serde_json::json!({"id": format!("reading:{}", id), "type": "Reading", "domain": slug, "data": {"text": ft.reading, "graphSchema": id}})))
+        }).collect(),
+        // α(constraint → json)
+        d.constraints.iter().map(|c| {
+            let cid = if c.id.is_empty() { &c.text } else { &c.id };
+            serde_json::json!({"id": format!("constraint:{}", cid), "type": "Constraint", "domain": slug,
+                "data": {"kind": c.kind, "modality": c.modality, "text": c.text, "spans": c.spans, "entity": c.entity, "minOccurrence": c.min_occurrence, "maxOccurrence": c.max_occurrence}})
+        }).collect(),
+        // α(sm → [def, statuses..., transitions...])
+        d.state_machines.iter().flat_map(|(n, sm)| {
+            std::iter::once(serde_json::json!({"id": n, "type": "State Machine Definition", "domain": slug, "data": {"name": n, "forNoun": sm.noun_name}}))
+                .chain(sm.statuses.iter().map(move |s| serde_json::json!({"id": format!("status:{}:{}", n, s), "type": "Status", "domain": slug, "data": {"name": s, "stateMachineDefinition": n}})))
+                .chain(sm.transitions.iter().map(move |t| serde_json::json!({"id": format!("transition:{}:{}:{}", n, t.from, t.event), "type": "Transition", "domain": slug, "data": {"from": t.from, "to": t.to, "event": t.event, "stateMachineDefinition": n}})))
+        }).collect(),
+        // α(rule → json) + α(fact → json)
+        d.derivation_rules.iter().map(|r| serde_json::json!({"id": format!("rule:{}", r.id), "type": "Derivation Rule", "domain": slug,
             "data": {"ruleId": r.id, "text": r.text, "antecedentFactTypeIds": serde_json::to_string(&r.antecedent_fact_type_ids).unwrap_or_default(),
                 "consequentFactTypeId": r.consequent_fact_type_id, "kind": serde_json::to_string(&r.kind).unwrap_or_default(),
                 "joinOn": serde_json::to_string(&r.join_on).unwrap_or_default(), "matchOn": serde_json::to_string(&r.match_on).unwrap_or_default(),
-                "consequentBindings": serde_json::to_string(&r.consequent_bindings).unwrap_or_default()}}));
-    }
-    for f in &d.general_instance_facts {
-        e.push(serde_json::json!({"id": format!("instance-fact:{}:{}:{}", f.subject_noun, f.subject_value, f.field_name), "type": "Instance Fact", "domain": slug,
-            "data": {"subjectNoun": f.subject_noun, "subjectValue": f.subject_value, "fieldName": f.field_name, "objectNoun": f.object_noun, "objectValue": f.object_value}}));
-    }
+                "consequentBindings": serde_json::to_string(&r.consequent_bindings).unwrap_or_default()}})).collect(),
+        d.general_instance_facts.iter().map(|f| serde_json::json!({"id": format!("instance-fact:{}:{}:{}", f.subject_noun, f.subject_value, f.field_name), "type": "Instance Fact", "domain": slug,
+            "data": {"subjectNoun": f.subject_noun, "subjectValue": f.subject_value, "fieldName": f.field_name, "objectNoun": f.object_noun, "objectValue": f.object_value}})).collect(),
+    ].concat();
     serde_json::to_string(&e).unwrap_or_else(|_| "[]".into())
 }
 
