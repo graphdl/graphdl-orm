@@ -152,15 +152,10 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
     }
 
     // Detect subtypes that have their own fact types -> partitioned strategy
-    let mut partitioned_subtypes: HashSet<String> = HashSet::new();
-    for subtype_name in subtype_to_root.keys() {
-        let has_own_facts = ir.fact_types.values().any(|ft| {
-            ft.roles.iter().any(|r| r.noun_name == *subtype_name)
-        });
-        if has_own_facts {
-            partitioned_subtypes.insert(subtype_name.clone());
-        }
-    }
+    let partitioned_subtypes: HashSet<String> = subtype_to_root.keys()
+        .filter(|name| ir.fact_types.values().any(|ft| ft.roles.iter().any(|r| &r.noun_name == *name)))
+        .cloned()
+        .collect();
 
     let subtype_names: HashSet<&String> = subtype_to_root.keys().collect();
     let resolve_entity = |name: &str| -> String {
@@ -179,29 +174,21 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
     for c in &ir.constraints {
         match c.kind.as_str() {
             "UC" => {
-                for span in &c.spans {
-                    ucs_by_ft.entry(span.fact_type_id.clone()).or_default();
-                }
-                // Group spans by fact type -- each UC may span multiple roles
+                c.spans.iter().for_each(|span| { ucs_by_ft.entry(span.fact_type_id.clone()).or_default(); });
                 let roles: Vec<usize> = c.spans.iter().map(|s| s.role_index).collect();
                 if let Some(ft_id) = c.spans.first().map(|s| &s.fact_type_id) {
                     ucs_by_ft.entry(ft_id.clone()).or_default().push(roles);
                 }
             }
             "MC" => {
-                for span in &c.spans {
-                    mc_set.insert(format!("{}:{}", span.fact_type_id, span.role_index));
-                }
+                mc_set.extend(c.spans.iter().map(|s| format!("{}:{}", s.fact_type_id, s.role_index)));
             }
             "VC" => {
                 if let Some(ref entity) = c.entity {
-                    for span in &c.spans {
-                        if let Some(vals) = ir.enum_values.get(entity) {
-                            vcs_by_ft_role.insert(
-                                format!("{}:{}", span.fact_type_id, span.role_index),
-                                vals.clone(),
-                            );
-                        }
+                    if let Some(vals) = ir.enum_values.get(entity) {
+                        c.spans.iter().for_each(|span| {
+                            vcs_by_ft_role.insert(format!("{}:{}", span.fact_type_id, span.role_index), vals.clone());
+                        });
                     }
                 }
             }
@@ -210,37 +197,27 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
     }
 
     // -- Classify fact types -----------------------------------------
-    let mut compound_facts: Vec<&str> = Vec::new();
-    let mut functional_facts: Vec<&str> = Vec::new();
+    // Classify: Filter(binary ∧ ¬binarized) then partition by UC arity
+    let classified: Vec<(&str, bool, bool)> = ir.fact_types.iter()
+        .filter(|(ft_id, ft)| !binarized_ft_ids.contains(*ft_id) && ft.roles.len() >= 2)
+        .map(|(ft_id, _)| {
+            let ucs = ucs_by_ft.get(ft_id).cloned().unwrap_or_default();
+            (ft_id.as_str(), ucs.iter().any(|uc| uc.len() >= 2), ucs.iter().any(|uc| uc.len() == 1))
+        }).collect();
+    let compound_facts: Vec<&str> = classified.iter().filter(|(_, c, _)| *c).map(|(id, _, _)| *id).collect();
+    let functional_facts: Vec<&str> = classified.iter().filter(|(_, _, f)| *f).map(|(id, _, _)| *id).collect();
 
-    for (ft_id, ft) in &ir.fact_types {
-        if binarized_ft_ids.contains(ft_id) { continue }
-        if ft.roles.len() < 2 { continue }
-
-        let ucs = ucs_by_ft.get(ft_id).cloned().unwrap_or_default();
-        let mut is_compound = false;
-        let mut is_functional = false;
-        for uc in &ucs {
-            if uc.len() >= 2 { is_compound = true }
-            if uc.len() == 1 { is_functional = true }
-        }
-        if is_compound { compound_facts.push(ft_id) }
-        if is_functional { functional_facts.push(ft_id) }
-    }
-
-    // -- Step 3 prep: Detect 1:1 -------------------------------------
-    let mut one_to_one_ft_ids: HashSet<String> = HashSet::new();
-    for ft_id in &functional_facts {
-        let ft = &ir.fact_types[*ft_id];
-        if ft.roles.len() != 2 { continue }
-        let ucs = ucs_by_ft.get(*ft_id).cloned().unwrap_or_default();
-        let single_uc_roles: Vec<usize> = ucs.iter().filter(|uc| uc.len() == 1).map(|uc| uc[0]).collect();
-        let r0 = ft.roles[0].role_index;
-        let r1 = ft.roles[1].role_index;
-        if single_uc_roles.contains(&r0) && single_uc_roles.contains(&r1) {
-            one_to_one_ft_ids.insert(ft_id.to_string());
-        }
-    }
+    // Detect 1:1: both roles have single-role UCs
+    let one_to_one_ft_ids: HashSet<String> = functional_facts.iter()
+        .filter(|ft_id| ir.fact_types[**ft_id].roles.len() == 2)
+        .filter(|ft_id| {
+            let ucs = ucs_by_ft.get(**ft_id).cloned().unwrap_or_default();
+            let singles: Vec<usize> = ucs.iter().filter(|uc| uc.len() == 1).map(|uc| uc[0]).collect();
+            let ft = &ir.fact_types[**ft_id];
+            singles.contains(&ft.roles[0].role_index) && singles.contains(&ft.roles[1].role_index)
+        })
+        .map(|id| id.to_string())
+        .collect();
 
     // -- Step 1: Compound UC -> separate table ------------------------
     let noun_name_set: HashSet<String> = ir.nouns.keys().cloned().collect();
