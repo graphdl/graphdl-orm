@@ -158,9 +158,6 @@ describe('Input bounds', () => {
 // derive+validate pipeline: sender is pushed as a User fact into the
 // population BEFORE derive runs, and any alethic constraint touching User
 // facts fires during validate. NO procedural auth middleware.
-//
-// This suite verifies the architecture. Constraint-based rejection requires
-// a domain with suitable alethic constraints (a separate concern, #17).
 
 describe('Apply identity', () => {
   const AUTH_DOMAIN = `# Auth
@@ -176,9 +173,12 @@ Email is a value type.
 ## Fact Types
 ### Order
 Order is created by User.
+
+## Constraints
+Each Order is created by exactly one User.
 `.trim()
 
-  it('Command accepts a sender field without rejecting', () => {
+  it('createEntity without identity context is rejected', () => {
     const h = compileDomainReadings(AUTH_DOMAIN)
     const result = apply(h, {
       type: 'createEntity',
@@ -186,26 +186,10 @@ Order is created by User.
       domain: 'test',
       id: 'ord-1',
       fields: { OrderId: 'ord-1' },
-      sender: 'alice@example.com',
     })
-    // The sender field is deserialized cleanly and the command completes.
-    expect(result).toBeDefined()
-    expect(result.entities).toBeDefined()
-    releaseDomain(h)
-  })
-
-  it('Command without sender still runs (architecture is opt-in)', () => {
-    const h = compileDomainReadings(AUTH_DOMAIN)
-    const result = apply(h, {
-      type: 'createEntity',
-      noun: 'Order',
-      domain: 'test',
-      id: 'ord-2',
-      fields: { OrderId: 'ord-2' },
-    })
-    // Backward compatibility: commands without sender still dispatch.
-    // Enforcement is domain-specific via alethic constraints.
-    expect(result).toBeDefined()
+    // Missing sender -> no User fact -> MC fires -> alethic violation -> rejected.
+    expect(result.rejected).toBe(true)
+    expect(result.violations.length).toBeGreaterThan(0)
     releaseDomain(h)
   })
 })
