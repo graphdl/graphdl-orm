@@ -633,76 +633,54 @@ pub fn domain_to_state(d: &Domain) -> crate::ast::Object {
     use crate::ast::{Object, cell_push, fact_from_pairs};
     let mut state = Object::phi();
 
-    // Nouns
-    for (name, def) in &d.nouns {
+    // foldl(cell_push("Noun"), state, α(noun_to_fact) : nouns)
+    state = d.nouns.iter().fold(state, |acc, (name, def)| {
         let mut pairs: Vec<(String, String)> = vec![
-            ("name".into(), name.clone()),
-            ("objectType".into(), def.object_type.clone()),
+            ("name".into(), name.clone()), ("objectType".into(), def.object_type.clone()),
         ];
-        if let Some(st) = d.subtypes.get(name) {
-            pairs.push(("superType".into(), st.clone()));
-        }
-        if let Some(rs) = d.ref_schemes.get(name) {
-            pairs.push(("referenceScheme".into(), rs.join(",")));
-        }
-        if let Some(evs) = d.enum_values.get(name) {
-            if !evs.is_empty() {
-                pairs.push(("enumValues".into(), evs.join(",")));
-            }
-        }
+        d.subtypes.get(name).map(|st| pairs.push(("superType".into(), st.clone())));
+        d.ref_schemes.get(name).map(|rs| pairs.push(("referenceScheme".into(), rs.join(","))));
+        d.enum_values.get(name).filter(|evs| !evs.is_empty()).map(|evs| pairs.push(("enumValues".into(), evs.join(","))));
         let refs: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-        state = cell_push("Noun", fact_from_pairs(&refs), &state);
-    }
+        cell_push("Noun", fact_from_pairs(&refs), &acc)
+    });
 
-    // Fact types -> GraphSchema + Role
-    for (ft_id, ft) in &d.fact_types {
-        state = cell_push("GraphSchema", fact_from_pairs(&[
+    // foldl(cell_push, state, α(ft → schema+roles)) : fact_types
+    state = d.fact_types.iter().fold(state, |acc, (ft_id, ft)| {
+        let with_schema = cell_push("GraphSchema", fact_from_pairs(&[
             ("id", ft_id), ("reading", &ft.reading), ("arity", &ft.roles.len().to_string()),
-        ]), &state);
-        for role in &ft.roles {
-            state = cell_push("Role", fact_from_pairs(&[
-                ("graphSchema", ft_id), ("nounName", &role.noun_name), ("position", &role.role_index.to_string()),
-            ]), &state);
-        }
-    }
+        ]), &acc);
+        ft.roles.iter().fold(with_schema, |a, role| cell_push("Role", fact_from_pairs(&[
+            ("graphSchema", ft_id), ("nounName", &role.noun_name), ("position", &role.role_index.to_string()),
+        ]), &a))
+    });
 
-    // Constraints
-    for c in &d.constraints {
+    // foldl(cell_push("Constraint"), state, α(constraint_to_fact))
+    state = d.constraints.iter().fold(state, |acc, c| {
         let mut pairs: Vec<(String, String)> = vec![
-            ("id".into(), c.id.clone()),
-            ("kind".into(), c.kind.clone()),
-            ("modality".into(), c.modality.clone()),
-            ("text".into(), c.text.clone()),
+            ("id".into(), c.id.clone()), ("kind".into(), c.kind.clone()),
+            ("modality".into(), c.modality.clone()), ("text".into(), c.text.clone()),
         ];
-        if let Some(ref op) = c.deontic_operator {
-            pairs.push(("deonticOperator".into(), op.clone()));
-        }
-        if let Some(ref entity) = c.entity {
-            pairs.push(("entity".into(), entity.clone()));
-        }
-        for (i, span) in c.spans.iter().enumerate() {
-            pairs.push((format!("span{}_factTypeId", i), span.fact_type_id.clone()));
-            pairs.push((format!("span{}_roleIndex", i), span.role_index.to_string()));
-        }
+        c.deontic_operator.as_ref().map(|op| pairs.push(("deonticOperator".into(), op.clone())));
+        c.entity.as_ref().map(|e| pairs.push(("entity".into(), e.clone())));
+        pairs.extend(c.spans.iter().enumerate().flat_map(|(i, span)| [
+            (format!("span{}_factTypeId", i), span.fact_type_id.clone()),
+            (format!("span{}_roleIndex", i), span.role_index.to_string()),
+        ]));
         let refs: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-        state = cell_push("Constraint", fact_from_pairs(&refs), &state);
-    }
+        cell_push("Constraint", fact_from_pairs(&refs), &acc)
+    });
 
-    // Derivation rules
-    for r in &d.derivation_rules {
-        state = cell_push("DerivationRule", fact_from_pairs(&[
-            ("id", r.id.as_str()), ("text", r.text.as_str()), ("consequentFactTypeId", r.consequent_fact_type_id.as_str()),
-        ]), &state);
-    }
+    // foldl(cell_push("DerivationRule")) + foldl(cell_push("InstanceFact"))
+    state = d.derivation_rules.iter().fold(state, |acc, r| cell_push("DerivationRule", fact_from_pairs(&[
+        ("id", r.id.as_str()), ("text", r.text.as_str()), ("consequentFactTypeId", r.consequent_fact_type_id.as_str()),
+    ]), &acc));
 
-    // Instance facts
-    for f in &d.general_instance_facts {
-        state = cell_push("InstanceFact", fact_from_pairs(&[
-            ("subjectNoun", f.subject_noun.as_str()), ("subjectValue", f.subject_value.as_str()),
-            ("fieldName", f.field_name.as_str()), ("objectNoun", f.object_noun.as_str()),
-            ("objectValue", f.object_value.as_str()),
-        ]), &state);
-    }
+    state = d.general_instance_facts.iter().fold(state, |acc, f| cell_push("InstanceFact", fact_from_pairs(&[
+        ("subjectNoun", f.subject_noun.as_str()), ("subjectValue", f.subject_value.as_str()),
+        ("fieldName", f.field_name.as_str()), ("objectNoun", f.object_noun.as_str()),
+        ("objectValue", f.object_value.as_str()),
+    ]), &acc));
 
     state
 }
