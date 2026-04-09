@@ -87,24 +87,22 @@ pub fn forward_chain_defs_state(
             })
     }
 
-    // Fixed-point iteration: apply rules until no new facts (or 100 rounds)
-    let (final_state, all_derived, _) = (0..100).fold(
-        (d.clone(), Vec::<DerivedFact>::new(), false),
-        |(current_state, all_derived, done), _| {
-            if done { return (current_state, all_derived, true); }
-            let new_facts = derive_one_round(derivation_defs, &current_state, &all_derived, d);
-            if new_facts.is_empty() {
-                (current_state, all_derived, true)
-            } else {
-                let new_state = new_facts.iter().fold(current_state, |acc, fact| {
+    // Fixed-point iteration via iter::successors (Backus while form, Knaster-Tarski lfp).
+    // Terminates when derive_one_round produces no new facts (returns None).
+    let (final_state, all_derived) = std::iter::successors(
+        Some((d.clone(), Vec::<DerivedFact>::new())),
+        |(current_state, all_derived)| {
+            let new_facts = derive_one_round(derivation_defs, current_state, all_derived, d);
+            (!new_facts.is_empty()).then(|| {
+                let new_state = new_facts.iter().fold(current_state.clone(), |acc, fact| {
                     let pairs: Vec<(&str, &str)> = fact.bindings.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
                     ast::cell_push(&fact.fact_type_id, ast::fact_from_pairs(&pairs), &acc)
                 });
-                let all = [all_derived, new_facts].concat();
-                (new_state, all, false)
-            }
+                let all = [all_derived.clone(), new_facts].concat();
+                (new_state, all)
+            })
         },
-    );
+    ).take(101).last().unwrap();
     (final_state, all_derived)
 }
 

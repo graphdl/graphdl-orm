@@ -1144,15 +1144,11 @@ fn metacompose_atom(name: &str, d: &Object) -> Func {
 }
 
 fn metacompose_sequence(items: &[Object], d: &Object) -> Func {
-    if items.is_empty() { return Func::Constant(Object::Bottom); }
-
-    // The controlling operator is the first element
-    let controller = match items[0].as_atom() {
-        Some(name) => name,
-        None => return Func::Constant(Object::Bottom),
-    };
-
-    match controller {
+    // Backus dispatch: <controller, args...> -> Func.
+    // Any shape mismatch folds to None -> Func::Constant(Bottom) via unwrap_or.
+    items.first()
+        .and_then(|f| f.as_atom())
+        .map(|controller| match controller {
         forms::COMP if items.len() == 3 => {
             // <COMP, f, g> → f ∘ g
             let f = metacompose(&items[1], d);
@@ -1211,7 +1207,8 @@ fn metacompose_sequence(items: &[Object], d: &Object) -> Func {
             // Unknown controlling operator → ⊥̄
             Func::Constant(Object::Bottom)
         }
-    }
+    })
+    .unwrap_or(Func::Constant(Object::Bottom))
 }
 
 /// FFP application: evaluate (x:y) where x is an object representing
