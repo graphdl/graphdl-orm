@@ -45,24 +45,26 @@ pub struct Reading {
 }
 
 fn extract_filters(query: &str) -> (String, Vec<String>) {
-    let mut values = Vec::new();
-    let mut stripped = String::new();
-    let mut in_quote = false;
-    let mut current_val = String::new();
-
-    for ch in query.chars() {
-        if ch == '\'' {
-            if in_quote {
-                values.push(current_val.clone());
-                current_val.clear();
+    // foldl over chars with (values, stripped, (in_quote, current_val)) accumulator.
+    // Backus insert combining form — no external mutation.
+    let (values, stripped, _) = query.chars().fold(
+        (Vec::<String>::new(), String::new(), (false, String::new())),
+        |(mut values, mut stripped, (in_quote, mut current_val)), ch| {
+            if ch == '\'' {
+                if in_quote {
+                    values.push(current_val.clone());
+                    current_val.clear();
+                }
+                (values, stripped, (!in_quote, current_val))
+            } else if in_quote {
+                current_val.push(ch);
+                (values, stripped, (in_quote, current_val))
+            } else {
+                stripped.push(ch);
+                (values, stripped, (in_quote, current_val))
             }
-            in_quote = !in_quote;
-        } else if in_quote {
-            current_val.push(ch);
-        } else {
-            stripped.push(ch);
-        }
-    }
+        },
+    );
 
     // Normalize whitespace
     let stripped = stripped.split_whitespace().collect::<Vec<_>>().join(" ");

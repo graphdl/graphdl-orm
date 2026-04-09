@@ -745,7 +745,7 @@ fn parse_into(ir: &mut Domain, input: &str) -> Result<(), String> {
     let lines: Vec<String> = input.lines().map(|s| s.to_string()).collect();
 
     // Pass 1: alpha(recognize_noun) : lines -- extract nouns and domain
-    for i in 0..lines.len() {
+    (0..lines.len()).for_each(|i| {
         let line = lines[i].trim();
         let action = None
             .or_else(|| try_domain(line))
@@ -760,66 +760,65 @@ fn parse_into(ir: &mut Domain, input: &str) -> Result<(), String> {
 
         apply_action(ir, action, &lines, i);
 
-        // Look ahead for enum values after value type declaration
+        // Look ahead for enum values after value type declaration:
+        // Filter(non_empty) ∘ skip(i+1) : lines, then match first result.
         if line.ends_with(" is a value type.") {
             let name = line.trim_end_matches(" is a value type.").trim();
-            for j in (i + 1)..lines.len() {
-                let next = lines[j].trim();
-                if next.is_empty() { continue; }
-                if next.starts_with("The possible values of") {
-                    if let Some(vals) = parse_enum(next) {
-                        ir.enum_values.insert(name.to_string(), vals);
-                    }
-                }
-                break;
+            let vals = lines.iter().skip(i + 1)
+                .map(|s| s.trim())
+                .find(|s| !s.is_empty())
+                .filter(|s| s.starts_with("The possible values of"))
+                .and_then(parse_enum);
+            if let Some(vals) = vals {
+                ir.enum_values.insert(name.to_string(), vals);
             }
         }
-    }
+    });
 
     // Pass 2a: collect fact types and instance facts
     // Sorted longest-first for Theorem 1 (unambiguous longest-first matching)
     let mut noun_names: Vec<String> = ir.nouns.keys().cloned().collect();
     noun_names.sort_by(|a, b| b.len().cmp(&a.len()));
 
-    for i in 0..lines.len() {
-        let line = lines[i].trim();
-        if line.is_empty() { continue; }
-
-        // Skip pass 1 lines
-        let is_pass1 = try_entity_type(line).is_some()
-            || try_value_type(line).is_some()
-            || (try_subtype(line).is_some() && !line.starts_with("Each"))
-            || try_abstract(line).is_some()
-            || try_partition(line).is_some()
-            || try_enum_values(line).is_some()
-            || try_exclusive_subtypes(line).is_some()
-            || try_association(line).is_some()
-            || try_header(line).is_some();
-        if is_pass1 { continue; }
-
-        // Skip lines that belong to Pass 2b (constraints, derivations, deontic)
-        // Preserves the original recognizer priority: these recognizers fire before try_fact_type
-        let is_pass2b = try_ring(line, &noun_names).is_some()
-            || try_subset(line, &noun_names).is_some()
-            || try_equality(line).is_some()
-            || try_set_comparison(line, &noun_names).is_some()
-            || try_frequency(line, &noun_names).is_some()
-            || try_external_uc(line, &noun_names).is_some()
-            || try_span_naming(line).is_some()
-            || try_autofill_declaration(line).is_some()
-            || try_derivation(line).is_some()
-            || try_deontic(line).is_some()
-            || try_constraint(line, &noun_names).is_some()
-            || try_totality(line).is_some();
-        if is_pass2b { continue; }
-
-        // Only collect fact types and instance facts in this sub-pass
-        if let Some(action) = try_fact_type(line, &noun_names) {
-            apply_action(ir, Some(action), &lines, i);
-        } else if let Some(action) = try_instance_fact(line) {
-            apply_action(ir, Some(action), &lines, i);
-        }
-    }
+    // Pass 2a: Filter(!pass1 && !pass2b) : lines, then apply fact_type/instance_fact
+    (0..lines.len())
+        .map(|i| (i, lines[i].trim()))
+        .filter(|(_, line)| !line.is_empty())
+        .filter(|(_, line)| {
+            let is_pass1 = try_entity_type(line).is_some()
+                || try_value_type(line).is_some()
+                || (try_subtype(line).is_some() && !line.starts_with("Each"))
+                || try_abstract(line).is_some()
+                || try_partition(line).is_some()
+                || try_enum_values(line).is_some()
+                || try_exclusive_subtypes(line).is_some()
+                || try_association(line).is_some()
+                || try_header(line).is_some();
+            !is_pass1
+        })
+        .filter(|(_, line)| {
+            // Preserves the original recognizer priority: these recognizers fire before try_fact_type
+            let is_pass2b = try_ring(line, &noun_names).is_some()
+                || try_subset(line, &noun_names).is_some()
+                || try_equality(line).is_some()
+                || try_set_comparison(line, &noun_names).is_some()
+                || try_frequency(line, &noun_names).is_some()
+                || try_external_uc(line, &noun_names).is_some()
+                || try_span_naming(line).is_some()
+                || try_autofill_declaration(line).is_some()
+                || try_derivation(line).is_some()
+                || try_deontic(line).is_some()
+                || try_constraint(line, &noun_names).is_some()
+                || try_totality(line).is_some();
+            !is_pass2b
+        })
+        .for_each(|(i, line)| {
+            if let Some(action) = try_fact_type(line, &noun_names) {
+                apply_action(ir, Some(action), &lines, i);
+            } else if let Some(action) = try_instance_fact(line) {
+                apply_action(ir, Some(action), &lines, i);
+            }
+        });
 
     // Build schema catalog from collected fact types
     let catalog = {
@@ -843,85 +842,85 @@ fn parse_into(ir: &mut Domain, input: &str) -> Result<(), String> {
         cat
     };
 
-    // Pass 2b: constraints and derivations (with catalog)
-    for i in 0..lines.len() {
-        let line = lines[i].trim();
-        if line.is_empty() { continue; }
-
-        // Skip pass 1 lines
-        let is_pass1 = try_entity_type(line).is_some()
-            || try_value_type(line).is_some()
-            || (try_subtype(line).is_some() && !line.starts_with("Each"))
-            || try_abstract(line).is_some()
-            || try_partition(line).is_some()
-            || try_enum_values(line).is_some()
-            || try_exclusive_subtypes(line).is_some()
-            || try_association(line).is_some()
-            || try_header(line).is_some();
-        if is_pass1 { continue; }
-
-        // Totality -> mark abstract (but don't skip -- still parse as constraint)
-        if let Some(action) = try_totality(line) {
-            apply_action(ir, Some(action), &lines, i);
-        }
-
-        // Try recognizers in priority order.
-        // Ring and subset fire before derivation (both match "If...then...").
-        // Frequency fires before constraint ("at least 1" digit vs "at least one" word).
-        // External UC fires before constraint to handle "For each B1 and B2, at most one...".
-        let action = None
-            .or_else(|| try_ring(line, &noun_names))
-            .or_else(|| try_subset(line, &noun_names))
-            .or_else(|| try_equality(line))
-            .or_else(|| try_set_comparison(line, &noun_names))
-            .or_else(|| try_frequency(line, &noun_names))
-            .or_else(|| try_external_uc(line, &noun_names))
-            .or_else(|| try_span_naming(line))
-            .or_else(|| try_autofill_declaration(line))
-            .or_else(|| try_derivation(line))
-            .or_else(|| try_deontic(line))
-            .or_else(|| try_constraint(line, &noun_names));
-
-        // If no constraint/derivation/deontic matched, this line was already
-        // handled in Pass 2a (fact type or instance fact). Skip it.
-        let Some(action) = action else { continue; };
-
-        // Split inline "exactly one" constraints into UC + MC.
-        // Skip the split for set-comparison kinds (XO, XC, OR) which carry their own semantics.
-        // Derivation rules resolve through catalog, not through apply_action.
-        let set_comparison_kinds = ["XO", "XC", "OR", "SS", "EQ", "FC"];
-        match action {
-            ParseAction::AddConstraint(ref c)
-                if line.contains("exactly one")
-                    && !set_comparison_kinds.contains(&c.kind.as_str()) =>
-            {
-                let c = match action { ParseAction::AddConstraint(c) => c, _ => unreachable!() };
-                // "exactly one" = UC + MC. Each gets its own reading as id.
-                let mut uc = resolve_constraint_schema(c.clone(), &noun_names, &catalog, ir);
-                uc.kind = "UC".into();
-                uc.text = uc.text.replace("exactly one", "at most one");
-                if uc.id.is_empty() { uc.id = uc.text.clone(); }
-                let mut mc = resolve_constraint_schema(c, &noun_names, &catalog, ir);
-                mc.kind = "MC".into();
-                mc.text = mc.text.replace("exactly one", "some");
-                if mc.id.is_empty() { mc.id = mc.text.clone(); }
-                ir.constraints.push(uc);
-                ir.constraints.push(mc);
+    // Pass 2b: Filter(!pass1) : lines, then apply constraint/derivation/deontic recognizers.
+    (0..lines.len())
+        .map(|i| (i, lines[i].trim()))
+        .filter(|(_, line)| !line.is_empty())
+        .filter(|(_, line)| {
+            let is_pass1 = try_entity_type(line).is_some()
+                || try_value_type(line).is_some()
+                || (try_subtype(line).is_some() && !line.starts_with("Each"))
+                || try_abstract(line).is_some()
+                || try_partition(line).is_some()
+                || try_enum_values(line).is_some()
+                || try_exclusive_subtypes(line).is_some()
+                || try_association(line).is_some()
+                || try_header(line).is_some();
+            !is_pass1
+        })
+        .for_each(|(i, line)| {
+            // Totality -> mark abstract (but don't skip -- still parse as constraint)
+            if let Some(action) = try_totality(line) {
+                apply_action(ir, Some(action), &lines, i);
             }
-            ParseAction::AddConstraint(c) => {
-                let mut resolved = resolve_constraint_schema(c, &noun_names, &catalog, ir);
-                if resolved.id.is_empty() {
-                    resolved.id = resolved.text.clone();
+
+            // Try recognizers in priority order.
+            // Ring and subset fire before derivation (both match "If...then...").
+            // Frequency fires before constraint ("at least 1" digit vs "at least one" word).
+            // External UC fires before constraint to handle "For each B1 and B2, at most one...".
+            let action = None
+                .or_else(|| try_ring(line, &noun_names))
+                .or_else(|| try_subset(line, &noun_names))
+                .or_else(|| try_equality(line))
+                .or_else(|| try_set_comparison(line, &noun_names))
+                .or_else(|| try_frequency(line, &noun_names))
+                .or_else(|| try_external_uc(line, &noun_names))
+                .or_else(|| try_span_naming(line))
+                .or_else(|| try_autofill_declaration(line))
+                .or_else(|| try_derivation(line))
+                .or_else(|| try_deontic(line))
+                .or_else(|| try_constraint(line, &noun_names));
+
+            // If no constraint/derivation/deontic matched, this line was already
+            // handled in Pass 2a (fact type or instance fact). Skip it.
+            let Some(action) = action else { return; };
+
+            // Split inline "exactly one" constraints into UC + MC.
+            // Skip the split for set-comparison kinds (XO, XC, OR) which carry their own semantics.
+            // Derivation rules resolve through catalog, not through apply_action.
+            let set_comparison_kinds = ["XO", "XC", "OR", "SS", "EQ", "FC"];
+            match action {
+                ParseAction::AddConstraint(ref c)
+                    if line.contains("exactly one")
+                        && !set_comparison_kinds.contains(&c.kind.as_str()) =>
+                {
+                    let c = match action { ParseAction::AddConstraint(c) => c, _ => unreachable!() };
+                    // "exactly one" = UC + MC. Each gets its own reading as id.
+                    let mut uc = resolve_constraint_schema(c.clone(), &noun_names, &catalog, ir);
+                    uc.kind = "UC".into();
+                    uc.text = uc.text.replace("exactly one", "at most one");
+                    if uc.id.is_empty() { uc.id = uc.text.clone(); }
+                    let mut mc = resolve_constraint_schema(c, &noun_names, &catalog, ir);
+                    mc.kind = "MC".into();
+                    mc.text = mc.text.replace("exactly one", "some");
+                    if mc.id.is_empty() { mc.id = mc.text.clone(); }
+                    ir.constraints.push(uc);
+                    ir.constraints.push(mc);
                 }
-                ir.constraints.push(resolved);
+                ParseAction::AddConstraint(c) => {
+                    let mut resolved = resolve_constraint_schema(c, &noun_names, &catalog, ir);
+                    if resolved.id.is_empty() {
+                        resolved.id = resolved.text.clone();
+                    }
+                    ir.constraints.push(resolved);
+                }
+                ParseAction::AddDerivation(mut r) => {
+                    resolve_derivation_rule(&mut r, ir, &catalog);
+                    ir.derivation_rules.push(r);
+                }
+                other => { apply_action(ir, Some(other), &lines, i); }
             }
-            ParseAction::AddDerivation(mut r) => {
-                resolve_derivation_rule(&mut r, ir, &catalog);
-                ir.derivation_rules.push(r);
-            }
-            other => { apply_action(ir, Some(other), &lines, i); }
-        }
-    }
+        });
 
     // Task 6: Value Constraint (VC) -- emit one VC per noun with enum_values.
     // The compiler reads enum values from ir.enum_values;
@@ -1405,26 +1404,30 @@ fn find_nouns(text: &str, noun_names: &[String]) -> Vec<(usize, usize, String)> 
     let mut sorted: Vec<&String> = noun_names.iter().collect();
     sorted.sort_by(|a, b| b.len().cmp(&a.len()));
 
-    let mut matches = Vec::new();
-    let mut used: Vec<(usize, usize)> = Vec::new();
+    // Foldl over longest-first noun list. Accumulator is (matches, used_ranges).
+    // Inner loop over occurrences of `name` in `text` uses Backus's `while`
+    // combining form (sequential scan of positions).
+    let (mut matches, _): (Vec<(usize, usize, String)>, Vec<(usize, usize)>) = sorted.iter().fold(
+        (Vec::new(), Vec::new()),
+        |(mut matches, mut used), name| {
+            let mut pos = 0;
+            while let Some(found) = text[pos..].find(name.as_str()) {
+                let start = pos + found;
+                let end = start + name.len();
+                let before_ok = start == 0 || !text.as_bytes()[start - 1].is_ascii_alphanumeric();
+                let after_ok = end >= text.len() || !text.as_bytes()[end].is_ascii_alphanumeric();
+                let no_overlap = !used.iter().any(|&(s, e)| start < e && end > s);
 
-    for name in &sorted {
-        let mut pos = 0;
-        while let Some(found) = text[pos..].find(name.as_str()) {
-            let start = pos + found;
-            let end = start + name.len();
-            let before_ok = start == 0 || !text.as_bytes()[start - 1].is_ascii_alphanumeric();
-            let after_ok = end >= text.len() || !text.as_bytes()[end].is_ascii_alphanumeric();
-            let no_overlap = !used.iter().any(|&(s, e)| start < e && end > s);
-
-            if before_ok && after_ok && no_overlap {
-                matches.push((start, end, name.to_string()));
-                used.push((start, end));
+                if before_ok && after_ok && no_overlap {
+                    matches.push((start, end, name.to_string()));
+                    used.push((start, end));
+                }
+                pos = start + 1;
+                if pos >= text.len() { break; }
             }
-            pos = start + 1;
-            if pos >= text.len() { break; }
-        }
-    }
+            (matches, used)
+        },
+    );
 
     matches.sort_by_key(|m| m.0);
     matches
@@ -1988,20 +1991,17 @@ Auth Session uses Session Strategy.
   Each Auth Session uses exactly one Session Strategy.
 ";
         let ir = parse_markdown(input).unwrap();
-        let keys: Vec<&String> = ir.fact_types.keys().collect();
         // All keys should be underscore format, not reading format
-        for key in &keys {
-            assert!(!key.contains(' '), "Fact type key '{}' should not contain spaces", key);
-        }
+        assert!(ir.fact_types.keys().all(|key| !key.contains(' ')),
+            "Fact type keys should not contain spaces");
         assert!(ir.fact_types.contains_key("Auth_Session_is_for_Customer"));
         assert!(ir.fact_types.contains_key("Auth_Session_uses_Session_Strategy"));
         // Constraints should reference schema IDs
-        for c in &ir.constraints {
-            for span in &c.spans {
-                assert!(!span.fact_type_id.contains(' '),
-                    "Constraint span '{}' should not contain spaces", span.fact_type_id);
-            }
-        }
+        assert!(
+            ir.constraints.iter().flat_map(|c| c.spans.iter())
+                .all(|span| !span.fact_type_id.contains(' ')),
+            "Constraint spans should not contain spaces"
+        );
     }
 
     #[test]
