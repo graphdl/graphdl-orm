@@ -25,6 +25,12 @@ fn def_func(name: &str, d: &ast::Object) -> Option<ast::Func> {
 
 /// The five input classes from Backus Section 14.4.2.
 /// Each corresponds to an AREST operation.
+///
+/// Identity (`sender`) is the reference value of the executing User entity
+/// (typically an email). When present, resolve pushes a User fact and a
+/// "{noun} is created by User" fact into the population BEFORE derive runs.
+/// Authorization enforcement then happens via the existing derive+validate
+/// pipeline -- see AREST.tex §8 (Middleware Elimination).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "type")]
 pub enum Command {
@@ -34,6 +40,8 @@ pub enum Command {
         domain: String,
         id: Option<String>,
         fields: std::collections::HashMap<String, String>,
+        #[serde(default)]
+        sender: Option<String>,
     },
     /// is-cmd: state machine transition
     Transition {
@@ -43,6 +51,8 @@ pub enum Command {
         domain: String,
         #[serde(alias = "currentStatus", default)]
         current_status: Option<String>,
+        #[serde(default)]
+        sender: Option<String>,
     },
     /// is-qry: query the population (partial application of graph schema)
     Query {
@@ -51,6 +61,8 @@ pub enum Command {
         domain: String,
         target: String,
         bindings: std::collections::HashMap<String, String>,
+        #[serde(default)]
+        sender: Option<String>,
     },
     /// is-upd: update entity fields (<->F  .  [upd, defs])
     UpdateEntity {
@@ -59,11 +71,15 @@ pub enum Command {
         #[serde(alias = "entityId")]
         entity_id: String,
         fields: std::collections::HashMap<String, String>,
+        #[serde(default)]
+        sender: Option<String>,
     },
     /// is-chg: install or update readings (modify definitions D)
     LoadReadings {
         markdown: String,
         domain: String,
+        #[serde(default)]
+        sender: Option<String>,
     },
 }
 
@@ -225,19 +241,19 @@ pub fn apply_command_defs(
     state: &ast::Object,
 ) -> CommandResult {
     match command {
-        Command::CreateEntity { noun, domain, id, fields } => {
-            create_via_defs(d, noun, domain, id.as_deref(), fields, state)
+        Command::CreateEntity { noun, domain, id, fields, sender } => {
+            create_via_defs(d, noun, domain, id.as_deref(), fields, sender.as_deref(), state)
         }
-        Command::Transition { entity_id, event, domain, current_status } => {
+        Command::Transition { entity_id, event, domain, current_status, sender: _ } => {
             transition_via_defs(d, entity_id, event, domain, current_status.as_deref(), state)
         }
-        Command::Query { schema_id, domain: _, target, bindings } => {
+        Command::Query { schema_id, domain: _, target, bindings, sender: _ } => {
             query_via_defs(d, schema_id, target, bindings, state)
         }
-        Command::UpdateEntity { noun, domain, entity_id, fields } => {
+        Command::UpdateEntity { noun, domain, entity_id, fields, sender: _ } => {
             update_via_defs(d, noun, domain, entity_id, fields, state)
         }
-        Command::LoadReadings { markdown, domain } => {
+        Command::LoadReadings { markdown, domain, sender: _ } => {
             apply_load_readings(markdown, domain, state)
         }
         #[allow(unreachable_patterns)]
@@ -255,12 +271,20 @@ pub fn apply_command_defs(
 
 /// create = emit ∘ validate ∘ derive ∘ resolve (Eq. 5)
 /// Each stage is a ρ-application. The result is an Object, decoded to CommandResult at the boundary.
+///
+/// Identity: when `sender` is Some, resolve pushes a User entity fact (keyed
+/// by the sender value, typically an email) plus a "{noun} is created by User"
+/// fact. Authorization enforcement then happens via the derive+validate stages
+/// -- any alethic constraint touching User facts (e.g. "Each Order is created
+/// by exactly one User") will fire if identity is missing. No procedural
+/// middleware. Per AREST §8.
 fn create_via_defs(
     d: &ast::Object,
     noun: &str,
     domain: &str,
     explicit_id: Option<&str>,
     fields: &std::collections::HashMap<String, String>,
+    sender: Option<&str>,
     state: &ast::Object,
 ) -> CommandResult {
     let entity_id = explicit_id.unwrap_or("").to_string();
@@ -277,6 +301,24 @@ fn create_via_defs(
             .unwrap_or_else(|| format!("{}_has_{}", noun, field_name));
         ast::cell_push(&ft_id, ast::fact_from_pairs(&[(noun, &entity_id), (field_name, value)]), &acc)
     });
+
+    // ── identity: push User facts when sender is present ──────────
+    // This is the data that auth derivations + alethic constraints evaluate.
+    // Fact type IDs follow parser convention: "Noun_predicate_Target".
+    let resolved = sender.map(|s| {
+        let created_by_ft = format!("{}_is_created_by_User", noun);
+        let user_ref_ft = "User_has_Email".to_string();
+        let with_user = ast::cell_push(
+            &user_ref_ft,
+            ast::fact_from_pairs(&[("User", s), ("Email", s)]),
+            &resolved,
+        );
+        ast::cell_push(
+            &created_by_ft,
+            ast::fact_from_pairs(&[(noun, &entity_id), ("User", s)]),
+            &with_user,
+        )
+    }).unwrap_or(resolved);
 
     // ── derive: forward chain via ρ(derivation:*) to lfp ───────────
     let derivation_defs_owned: Vec<(String, ast::Func)> = ast::cells_iter(d).into_iter()
@@ -740,6 +782,7 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
             domain: "orders".to_string(),
             id: Some("ORD-100".to_string()),
             fields,
+            sender: None,
         };
 
         let result = apply_command_defs(&def_map, &cmd, &state);
@@ -769,6 +812,7 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
             domain: "orders".to_string(),
             id: Some("ORD-REF".to_string()),
             fields,
+            sender: None,
         };
 
         let result = apply_command_defs(&def_map, &cmd, &state);
@@ -787,6 +831,7 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
             domain: "catalog".to_string(),
             id: Some("electronics".to_string()),
             fields,
+            sender: None,
         };
 
         let result = apply_command_defs(&def_map, &cmd, &state);
@@ -807,6 +852,7 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
             domain: "orders".to_string(),
             id: Some("ORD-100".to_string()),
             fields,
+            sender: None,
         };
         let created = apply_command_defs(&def_map, &create_cmd, &state);
         assert_eq!(created.status.as_deref(), Some("Draft"));
@@ -816,6 +862,7 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
             event: "place".to_string(),
             domain: "orders".to_string(),
             current_status: Some("Draft".to_string()),
+            sender: None,
         };
 
         let result = apply_command_defs(&def_map, &cmd, &created.state);
@@ -837,6 +884,7 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
             domain: "orders".to_string(),
             id: Some("ORD-1".to_string()),
             fields,
+            sender: None,
         };
 
         let result = apply_command_defs(&def_map, &cmd, &state);
@@ -864,6 +912,7 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
             domain: "orders".to_string(),
             id: Some("ORD-1".to_string()),
             fields,
+            sender: None,
         };
         let created = apply_command_defs(&def_map, &create, &state);
         assert_eq!(created.status.as_deref(), Some("Draft"));
@@ -873,6 +922,7 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
             event: "place".to_string(),
             domain: "orders".to_string(),
             current_status: Some("Draft".to_string()),
+            sender: None,
         };
         let result = apply_command_defs(&def_map, &transition, &created.state);
 
@@ -905,6 +955,7 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
             domain: "orders".to_string(),
             target: "Order".to_string(),
             bindings,
+            sender: None,
         };
 
         let result = apply_command_defs(&def_map, &cmd, &state);
@@ -919,6 +970,7 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
         let cmd = Command::LoadReadings {
             markdown: "# Test\n\nProduct(.SKU) is an entity type.\nCategory(.Name) is an entity type.\nProduct belongs to Category.\n  Each Product belongs to exactly one Category.".to_string(),
             domain: "catalog".to_string(),
+            sender: None,
         };
 
         let result = apply_command_defs(&def_map, &cmd, &state);
@@ -934,6 +986,7 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
         let cmd = Command::LoadReadings {
             markdown: "".to_string(),
             domain: "empty".to_string(),
+            sender: None,
         };
 
         let result = apply_command_defs(&def_map, &cmd, &state);
