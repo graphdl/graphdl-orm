@@ -66,18 +66,16 @@ mod db {
             "CREATE TABLE IF NOT EXISTS cells (name TEXT PRIMARY KEY, contents TEXT);
              CREATE TABLE IF NOT EXISTS defs (name TEXT PRIMARY KEY, func TEXT);"
         ).unwrap_or_else(|e| { eprintln!("Failed to create tables: {}", e); std::process::exit(1); });
-        let mut ddl_errors = 0;
-        for (name, func) in sql_defs {
-            if !name.starts_with("sql:sqlite:") { continue; }
-            if let ast::Func::Constant(ref obj) = func {
-                if let Some(ddl) = obj.as_atom() {
-                    if let Err(e) = conn.execute_batch(ddl) {
-                        eprintln!("Warning: DDL for {} failed: {}", name, e);
-                        ddl_errors += 1;
-                    }
-                }
-            }
-        }
+        let ddl_errors = sql_defs.iter()
+            .filter(|(name, _)| name.starts_with("sql:sqlite:"))
+            .filter_map(|(name, func)| match func {
+                ast::Func::Constant(ref obj) => obj.as_atom().map(|ddl| (name, ddl.to_string())),
+                _ => None,
+            })
+            .fold(0usize, |errors, (name, ddl)| match conn.execute_batch(&ddl) {
+                Err(e) => { eprintln!("Warning: DDL for {} failed: {}", name, e); errors + 1 }
+                Ok(_) => errors,
+            });
         if ddl_errors > 0 {
             eprintln!("{} DDL statements had errors (duplicate columns from RMAP)", ddl_errors);
         }
@@ -91,12 +89,11 @@ mod db {
         {
             let mut stmt = tx.prepare("INSERT OR REPLACE INTO defs (name, func) VALUES (?1, ?2)")
                 .unwrap_or_else(|e| { eprintln!("Failed to prepare insert: {}", e); std::process::exit(1); });
-            for (name, func) in defs {
-                let obj = ast::func_to_object(func);
-                let text = obj.to_string();
+            defs.iter().for_each(|(name, func)| {
+                let text = ast::func_to_object(func).to_string();
                 stmt.execute(params![name, text])
                     .unwrap_or_else(|e| { eprintln!("Failed to insert def {}: {}", name, e); std::process::exit(1); });
-            }
+            });
         }
         tx.commit()
             .unwrap_or_else(|e| { eprintln!("Failed to commit defs: {}", e); std::process::exit(1); });
@@ -106,10 +103,8 @@ mod db {
         let tx = conn.unchecked_transaction()
             .unwrap_or_else(|e| { eprintln!("Failed to begin transaction: {}", e); std::process::exit(1); });
 
-        let mut table_by_snake: HashMap<String, &crate::rmap::TableDef> = HashMap::new();
-        for table in tables {
-            table_by_snake.insert(table.name.clone(), table);
-        }
+        let table_by_snake: HashMap<String, &crate::rmap::TableDef> = tables.iter()
+            .map(|table| (table.name.clone(), table)).collect();
 
         let mut domain_rows: usize = 0;
         let mut meta_rows: usize = 0;
@@ -117,37 +112,26 @@ mod db {
         // InstanceFacts are domain data.
         let inst_cell = ast::fetch_or_phi("InstanceFact", state);
         if let Some(instance_facts) = inst_cell.as_seq() {
-            let mut rows: HashMap<(String, String), Vec<(String, String)>> = HashMap::new();
-            for inst in instance_facts {
-                let get = |key: &str| ast::binding(inst, key).unwrap_or("").to_string();
-                let subject_noun = get("subjectNoun");
-                let subject_value = get("subjectValue");
-                let field_name = get("fieldName");
-                let object_value = get("objectValue");
+            let rows: HashMap<(String, String), Vec<(String, String)>> = instance_facts.iter()
+                .fold(HashMap::new(), |mut acc, inst| {
+                    let get = |key: &str| ast::binding(inst, key).unwrap_or("").to_string();
+                    let key = (crate::rmap::to_snake(&get("subjectNoun")), get("subjectValue"));
+                    acc.entry(key).or_default().push((crate::rmap::to_snake(&get("fieldName")), get("objectValue")));
+                    acc
+                });
 
-                let table_name = crate::rmap::to_snake(&subject_noun);
-                let col_name = crate::rmap::to_snake(&field_name);
-
-                let key = (table_name, subject_value);
-                rows.entry(key).or_default().push((col_name, object_value));
-            }
-
-            for ((table_name, subject_id), columns) in &rows {
-                let table = match table_by_snake.get(table_name.as_str()) {
-                    Some(t) => t,
-                    None => continue,
-                };
+            rows.iter().filter_map(|((table_name, subject_id), columns)| {
+                let table = table_by_snake.get(table_name.as_str())?;
                 let pk_col = table.primary_key.first().map(|s| s.as_str()).unwrap_or("id");
                 let table_col_names: Vec<&str> = table.columns.iter().map(|c| c.name.as_str()).collect();
-                let mut col_list = vec![pk_col.to_string()];
-                let mut val_list: Vec<String> = vec![subject_id.clone()];
-                for (col, val) in columns {
-                    if table_col_names.contains(&col.as_str()) && col != pk_col {
-                        col_list.push(col.clone());
-                        val_list.push(val.clone());
-                    }
-                }
-
+                let (extra_cols, extra_vals): (Vec<_>, Vec<_>) = columns.iter()
+                    .filter(|(col, _)| table_col_names.contains(&col.as_str()) && col != pk_col)
+                    .map(|(col, val)| (col.clone(), val.clone()))
+                    .unzip();
+                let col_list: Vec<String> = std::iter::once(pk_col.to_string()).chain(extra_cols).collect();
+                let val_list: Vec<String> = std::iter::once(subject_id.clone()).chain(extra_vals).collect();
+                Some((table_name, col_list, val_list))
+            }).for_each(|(table_name, col_list, val_list)| {
                 let quoted_cols: Vec<String> = col_list.iter().map(|c| format!("\"{}\"", c)).collect();
                 let placeholders: Vec<String> = (1..=col_list.len()).map(|i| format!("?{}", i)).collect();
                 let sql = format!("INSERT OR REPLACE INTO \"{}\" ({}) VALUES ({})",
@@ -157,30 +141,30 @@ mod db {
                     Ok(_) => domain_rows += 1,
                     Err(e) => eprintln!("Warning: INSERT into {} failed: {}", table_name, e),
                 }
-            }
+            });
         }
 
         // All other fact types are metamodel facts. Store in cells.
-        for (ft_id, contents) in ast::cells_iter(state) {
-            if ft_id == "InstanceFact" { continue; }
-            if let Some(facts) = contents.as_seq() {
-                for fact in facts {
-                    let bindings: Vec<(String, String)> = fact.as_seq().map(|pairs| {
-                        pairs.iter().filter_map(|pair| {
-                            let items = pair.as_seq()?;
-                            Some((items.get(0)?.as_atom()?.to_string(), items.get(1)?.as_atom()?.to_string()))
-                        }).collect()
-                    }).unwrap_or_default();
-                    let bindings_json = serde_json::to_string(&bindings)
-                        .unwrap_or_else(|e| { eprintln!("Failed to serialize bindings: {}", e); std::process::exit(1); });
-                    tx.execute(
-                        "INSERT OR REPLACE INTO cells (name, contents) VALUES (?1, ?2)",
-                        params![format!("fact:{}:{}", ft_id, bindings_json), bindings_json],
-                    ).unwrap_or_else(|e| { eprintln!("Failed to store fact in cells: {}", e); std::process::exit(1); });
-                    meta_rows += 1;
-                }
-            }
-        }
+        ast::cells_iter(state).into_iter()
+            .filter(|(ft_id, _)| *ft_id != "InstanceFact")
+            .flat_map(|(ft_id, contents)| contents.as_seq()
+                .map(|facts| facts.iter().map(move |fact| (ft_id, fact)).collect::<Vec<_>>())
+                .unwrap_or_default())
+            .for_each(|(ft_id, fact)| {
+                let bindings: Vec<(String, String)> = fact.as_seq().map(|pairs|
+                    pairs.iter().filter_map(|pair| {
+                        let items = pair.as_seq()?;
+                        Some((items.get(0)?.as_atom()?.to_string(), items.get(1)?.as_atom()?.to_string()))
+                    }).collect()
+                ).unwrap_or_default();
+                let bindings_json = serde_json::to_string(&bindings)
+                    .unwrap_or_else(|e| { eprintln!("Failed to serialize bindings: {}", e); std::process::exit(1); });
+                tx.execute(
+                    "INSERT OR REPLACE INTO cells (name, contents) VALUES (?1, ?2)",
+                    params![format!("fact:{}:{}", ft_id, bindings_json), bindings_json],
+                ).unwrap_or_else(|e| { eprintln!("Failed to store fact in cells: {}", e); std::process::exit(1); });
+                meta_rows += 1;
+            });
 
         tx.commit()
             .unwrap_or_else(|e| { eprintln!("Failed to commit facts: {}", e); std::process::exit(1); });
@@ -218,14 +202,9 @@ mod db {
             };
             let col_count = col_names.len();
             let rows = stmt.query_map([], |row| {
-                let mut pairs = Vec::new();
-                for i in 0..col_count {
-                    let val: Option<String> = row.get(i).ok();
-                    if let Some(v) = val {
-                        pairs.push((col_names[i].to_string(), v));
-                    }
-                }
-                Ok(pairs)
+                Ok((0..col_count).filter_map(|i|
+                    row.get::<_, String>(i).ok().map(|v| (col_names[i].to_string(), v))
+                ).collect::<Vec<_>>())
             }).unwrap_or_else(|e| { eprintln!("Failed to read {}: {}", table.name, e); std::process::exit(1); });
 
             for row in rows {
