@@ -126,71 +126,50 @@ pub fn verbalize_ir(ir: &Domain) -> String {
         .filter(|(name, d)| d.object_type == "entity" && !ir.subtypes.contains_key(*name))
         .collect();
     if !entities.is_empty() {
-        lines.push("## Entity Types".to_string());
-        lines.push(String::new());
-        for (name, def) in &entities {
-            lines.push(verbalize_noun(name, def, ir));
-        }
+        lines.extend(["## Entity Types".to_string(), String::new()]);
+        lines.extend(entities.iter().map(|(name, def)| verbalize_noun(name, def, ir)));
         lines.push(String::new());
     }
 
     // Subtypes
-    let subtype_names: Vec<&String> = ir.subtypes.keys().collect();
-    if !subtype_names.is_empty() {
-        for name in &subtype_names {
-            if let Some(s) = verbalize_subtype(name, ir) {
-                lines.push(s);
-            }
-        }
+    let subtype_lines: Vec<String> = ir.subtypes.keys()
+        .filter_map(|name| verbalize_subtype(name, ir)).collect();
+    if !subtype_lines.is_empty() {
+        lines.extend(subtype_lines);
         lines.push(String::new());
     }
 
     // Value types
     let values: Vec<(&String, &NounDef)> = ir.nouns.iter()
-        .filter(|(_, d)| d.object_type == "value")
-        .collect();
+        .filter(|(_, d)| d.object_type == "value").collect();
     if !values.is_empty() {
-        lines.push("## Value Types".to_string());
-        lines.push(String::new());
-        for (name, def) in &values {
-            lines.push(verbalize_noun(name, def, ir));
-        }
+        lines.extend(["## Value Types".to_string(), String::new()]);
+        lines.extend(values.iter().map(|(name, def)| verbalize_noun(name, def, ir)));
         lines.push(String::new());
     }
 
     // Fact types
     if !ir.fact_types.is_empty() {
-        lines.push("## Fact Types".to_string());
-        lines.push(String::new());
-        for ft in ir.fact_types.values() {
-            lines.push(verbalize_fact_type(ft));
-        }
+        lines.extend(["## Fact Types".to_string(), String::new()]);
+        lines.extend(ir.fact_types.values().map(verbalize_fact_type));
         lines.push(String::new());
     }
 
     // Constraints
     let alethic: Vec<&ConstraintDef> = ir.constraints.iter()
-        .filter(|c| c.modality != "deontic")
-        .collect();
+        .filter(|c| c.modality != "deontic").collect();
     if !alethic.is_empty() {
-        lines.push("## Constraints".to_string());
-        lines.push(String::new());
-        for c in &alethic {
-            lines.push(verbalize_constraint(c, ir));
-        }
+        lines.extend(["## Constraints".to_string(), String::new()]);
+        lines.extend(alethic.iter().map(|c| verbalize_constraint(c, ir)));
         lines.push(String::new());
     }
 
     // Deontic constraints
     let deontic: Vec<&ConstraintDef> = ir.constraints.iter()
-        .filter(|c| c.modality == "deontic")
-        .collect();
+        .filter(|c| c.modality == "deontic").collect();
     if !deontic.is_empty() {
-        lines.push("## Deontic Constraints".to_string());
-        lines.push(String::new());
-        for c in &deontic {
-            lines.push(verbalize_constraint(c, ir));
-        }
+        lines.extend(["## Deontic Constraints".to_string(), String::new()]);
+        lines.extend(deontic.iter().map(|c| verbalize_constraint(c, ir)));
         lines.push(String::new());
     }
 
