@@ -2196,25 +2196,27 @@ fn compile_ring_acyclic_ast(def: &ConstraintDef) -> Func {
             .filter_map(|f| edge_pair(f))
             .collect();
 
-        // Build transitive closure as set of (from, to) pairs
-        let tc: std::collections::HashSet<(String, String)> = (0..1000usize).fold(
-            original_pairs.iter().cloned().collect::<std::collections::HashSet<(String, String)>>(),
-            |tc, _| {
+        // Build transitive closure via iter::successors — Backus's while form.
+        // Termination encoded as None (no new edges); max 1001 iterations.
+        let tc: std::collections::HashSet<(String, String)> = std::iter::successors(
+            Some(original_pairs.iter().cloned().collect::<std::collections::HashSet<(String, String)>>()),
+            |tc| {
                 let new_edges: Vec<(String, String)> = tc.iter()
                     .flat_map(|(a, b)| original_pairs.iter()
                         .filter(|(c, _)| b == c)
                         .filter_map(|(_, d)| {
-                            if tc.contains(&(a.clone(), d.clone())) { None }
-                            else { Some((a.clone(), d.clone())) }
+                            (!tc.contains(&(a.clone(), d.clone())))
+                                .then(|| (a.clone(), d.clone()))
                         })
                         .collect::<Vec<_>>())
                     .collect();
-                if new_edges.is_empty() { return tc; }
-                let mut tc = tc;
-                tc.extend(new_edges);
-                tc
+                (!new_edges.is_empty()).then(|| {
+                    let mut next = tc.clone();
+                    next.extend(new_edges);
+                    next
+                })
             },
-        );
+        ).take(1001).last().unwrap();
 
         // Find self-loops (cycles): (x, x) in tc
         let cycle_nodes: Vec<Object> = tc.iter()
