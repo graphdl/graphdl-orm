@@ -97,40 +97,27 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
     let mut binarized_ft_ids: HashSet<String> = HashSet::new();
     let mut xo_columns: HashMap<String, Vec<(String, Vec<String>, bool)>> = HashMap::new();
 
-    for constraint in &ir.constraints {
-        if constraint.kind != "XO" { continue }
-        if constraint.spans.len() < 2 { continue }
-
-        let ft_ids: Vec<&str> = constraint.spans.iter().map(|s| s.fact_type_id.as_str()).collect();
-        let unary_fts: Vec<_> = ft_ids.iter()
-            .filter_map(|id| ir.fact_types.get(*id))
-            .filter(|ft| ft.roles.len() == 1)
-            .collect();
-        if unary_fts.len() < 2 { continue }
-
-        let entity_name = &unary_fts[0].roles[0].noun_name;
-        let values: Vec<String> = unary_fts.iter().map(|ft| {
-            ft.reading.split(" is ").last()
-                .map(|s| s.trim_end_matches('.').to_string())
-                .unwrap_or_else(|| ft.reading.split_whitespace().last().unwrap_or("").to_string())
-        }).collect();
-        binarized_ft_ids.extend(ft_ids.iter().map(|id| id.to_string()));
-
-        let is_mandatory = unary_fts.iter().any(|ft| {
-            let ft_id_str = ft_ids.iter().find(|id| ir.fact_types.get(**id).map(|f| std::ptr::eq(f, *ft)).unwrap_or(false));
-            ft_id_str.map_or(false, |fid| {
-                ir.constraints.iter().any(|c| c.kind == "MC" && c.spans.iter().any(|s| s.fact_type_id == *fid))
-            })
+    ir.constraints.iter()
+        .filter(|c| c.kind == "XO" && c.spans.len() >= 2)
+        .for_each(|constraint| {
+            let ft_ids: Vec<&str> = constraint.spans.iter().map(|s| s.fact_type_id.as_str()).collect();
+            let unary_fts: Vec<_> = ft_ids.iter()
+                .filter_map(|id| ir.fact_types.get(*id))
+                .filter(|ft| ft.roles.len() == 1).collect();
+            if unary_fts.len() < 2 { return; }
+            let entity_name = &unary_fts[0].roles[0].noun_name;
+            let values: Vec<String> = unary_fts.iter().map(|ft|
+                ft.reading.split(" is ").last().map(|s| s.trim_end_matches('.').to_string())
+                    .unwrap_or_else(|| ft.reading.split_whitespace().last().unwrap_or("").to_string())
+            ).collect();
+            binarized_ft_ids.extend(ft_ids.iter().map(|id| id.to_string()));
+            let is_mandatory = unary_fts.iter().any(|ft| {
+                let ft_id_str = ft_ids.iter().find(|id| ir.fact_types.get(**id).map(|f| std::ptr::eq(f, *ft)).unwrap_or(false));
+                ft_id_str.map_or(false, |fid| ir.constraints.iter().any(|c| c.kind == "MC" && c.spans.iter().any(|s| s.fact_type_id == *fid)))
+            });
+            let col_name = if values.iter().any(|v| v.to_lowercase() == "male" || v.to_lowercase() == "female") { "sex" } else { "status" }.to_string();
+            xo_columns.entry(entity_name.clone()).or_default().push((col_name, values, !is_mandatory));
         });
-
-        let col_name = if values.iter().any(|v| v.to_lowercase() == "male" || v.to_lowercase() == "female") {
-            "sex".to_string()
-        } else {
-            "status".to_string()
-        };
-
-        xo_columns.entry(entity_name.clone()).or_default().push((col_name, values, !is_mandatory));
-    }
 
     // -- Step 0.3: Subtype absorption --------------------------------
     // Determine which subtypes have their own fact types (partitioned strategy)
@@ -138,16 +125,12 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
     let mut subtype_to_root: HashMap<String, String> = HashMap::new();
     let mut parent_of: HashMap<String, String> = HashMap::new();
     ir.subtypes.iter().for_each(|(name, st)| { parent_of.insert(name.clone(), st.clone()); });
-    for name in parent_of.keys() {
-        let mut current = name.clone();
-        let mut visited = HashSet::new();
-        while let Some(parent) = parent_of.get(&current) {
-            if visited.contains(&current) { break }
-            visited.insert(current.clone());
-            current = parent.clone();
-        }
-        subtype_to_root.insert(name.clone(), current);
-    }
+    let subtype_to_root: HashMap<String, String> = parent_of.keys().map(|name| {
+        let root = std::iter::successors(Some(name.clone()), |cur| parent_of.get(cur).cloned())
+            .take(100) // cycle guard
+            .last().unwrap_or_else(|| name.clone());
+        (name.clone(), root)
+    }).collect();
 
     // Detect subtypes that have their own fact types -> partitioned strategy
     let partitioned_subtypes: HashSet<String> = subtype_to_root.keys()
