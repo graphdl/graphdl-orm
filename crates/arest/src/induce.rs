@@ -226,8 +226,8 @@ pub fn induce_state(ir: &Domain, state: &Object) -> InductionResult {
     // -- SS Induction -------------------------------------------------
     let ft_entities: HashMap<String, HashSet<String>> = cells.iter()
         .filter_map(|(ft_id, facts)| {
-            let ft = ir.fact_types.get(ft_id)?;
-            if ft.roles.is_empty() { return None; }
+            let ft = ir.fact_types.get(ft_id).filter(|ft| !ft.roles.is_empty())?;
+            let _ = ft;
             let vals: HashSet<String> = facts.iter()
                 .filter_map(|f| f.first().map(|(_, v)| v.clone()))
                 .collect();
@@ -240,7 +240,7 @@ pub fn induce_state(ir: &Domain, state: &Object) -> InductionResult {
     let ft_ids_ref = &ft_ids;
     let ss_new: Vec<InducedConstraint> = (0..ft_ids.len())
         .flat_map(|i| (0..ft_ids_ref.len()).filter_map(move |j| {
-            if i == j { return None; }
+            (i != j).then_some(())?;
             let a = &ft_ent_ref[&ft_ids_ref[i]];
             let b = &ft_ent_ref[&ft_ids_ref[j]];
             if !a.is_empty() && a.is_subset(b) && a != b {
@@ -276,20 +276,20 @@ pub fn induce_state(ir: &Domain, state: &Object) -> InductionResult {
 
             cells.iter()
                 .filter_map(|(other_a_id, other_a_facts)| {
-                    if other_a_id == ft_id { return None; }
+                    (other_a_id != ft_id).then_some(())?;
                     ir.fact_types.get(other_a_id).map(|ft_a| (other_a_id, other_a_facts, ft_a))
                 })
                 .flat_map(|(other_a_id, other_a_facts, other_a_ft)| {
                     cells.iter()
                         .filter_map(|(other_b_id, other_b_facts)| {
-                            if other_b_id == ft_id || other_b_id == other_a_id { return None; }
+                            (other_b_id != ft_id && other_b_id != other_a_id).then_some(())?;
                             ir.fact_types.get(other_b_id).map(|ft_b| (other_b_id, other_b_facts, ft_b))
                         })
                         .filter_map(|(other_b_id, other_b_facts, other_b_ft)| {
                             let a_nouns: HashSet<&str> = other_a_ft.roles.iter().map(|r| r.noun_name.as_str()).collect();
                             let b_nouns: HashSet<&str> = other_b_ft.roles.iter().map(|r| r.noun_name.as_str()).collect();
                             let common: Vec<&str> = a_nouns.intersection(&b_nouns).cloned().collect();
-                            if common.is_empty() { return None; }
+                            (!common.is_empty()).then_some(())?;
 
                             let join_noun = common[0];
                             let joined: HashSet<(String, String)> = other_a_facts.iter()

@@ -457,10 +457,9 @@ fn update_via_defs(
         .into_iter()
         .flat_map(|(_, contents)| contents.as_seq().into_iter().flat_map(|facts| facts.to_vec()))
         .filter_map(|fact| {
-            let pairs = fact.as_seq()?;
-            if pairs.len() < 2 { return None; }
+            let pairs = fact.as_seq().filter(|p| p.len() >= 2)?;
             let v0 = pairs[0].as_seq().and_then(|p| p.get(1)?.as_atom().map(|s| s.to_string()));
-            if v0.as_deref() != Some(entity_id) { return None; }
+            (v0.as_deref() == Some(entity_id)).then_some(())?;
             let k = pairs[1].as_seq().and_then(|p| p.get(0)?.as_atom().map(|s| s.to_string()))?;
             let v = pairs[1].as_seq().and_then(|p| p.get(1)?.as_atom().map(|s| s.to_string()))?;
             Some((k, v))

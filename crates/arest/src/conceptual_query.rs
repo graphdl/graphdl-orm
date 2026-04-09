@@ -96,24 +96,19 @@ fn find_reading<'a>(from: &str, to: &str, readings: &'a [Reading]) -> Option<(&'
     let from_lower = from.to_lowercase();
     let to_lower = to.to_lowercase();
 
-    // Forward: from is first noun
-    let forward = readings.iter().find(|r| {
+    // Forward (from is first noun) first, else inverse (from appears but not first).
+    readings.iter().find(|r| {
         r.nouns.len() >= 2
             && r.nouns[0].to_lowercase() == from_lower
             && r.nouns.iter().any(|n| n.to_lowercase() == to_lower)
-    });
-    if let Some(r) = forward { return Some((r, false)) }
-
-    // Inverse: from appears but is not first
-    let inverse = readings.iter().find(|r| {
+    })
+    .map(|r| (r, false))
+    .or_else(|| readings.iter().find(|r| {
         r.nouns.len() >= 2
             && r.nouns.iter().any(|n| n.to_lowercase() == from_lower)
             && r.nouns.iter().any(|n| n.to_lowercase() == to_lower)
             && r.nouns[0].to_lowercase() != from_lower
-    });
-    if let Some(r) = inverse { return Some((r, true)) }
-
-    None
+    }).map(|r| (r, true)))
 }
 
 fn extract_predicate(reading: &Reading) -> String {
