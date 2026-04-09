@@ -102,18 +102,27 @@ const MAX_PARSE_DEPTH: usize = 100;
 
 fn parse_with_depth(input: &str, depth: usize) -> Object {
     let s = input.trim();
-    if s.is_empty() || s == "\u{03C6}" { return Object::phi(); }
-    if s == "\u{22A5}" { return Object::Bottom; }
-    if s.starts_with('<') && s.ends_with('>') {
-        if depth >= MAX_PARSE_DEPTH {
-            return Object::Bottom;
+    // Single dispatch table — Backus cond combining form over input shape.
+    // No early returns; every branch is a value expression.
+    match s {
+        "" | "\u{03C6}" => Object::phi(),
+        "\u{22A5}" => Object::Bottom,
+        seq if seq.starts_with('<') && seq.ends_with('>') && depth >= MAX_PARSE_DEPTH => {
+            let _ = seq; Object::Bottom
         }
-        let inner = &s[1..s.len()-1];
-        if inner.trim().is_empty() { return Object::phi(); }
-        let items = split_top_level(inner);
-        return Object::Seq(items.into_iter().map(|i| parse_with_depth(i.trim(), depth + 1)).collect());
+        seq if seq.starts_with('<') && seq.ends_with('>') => {
+            let inner = &seq[1..seq.len()-1];
+            match inner.trim().is_empty() {
+                true => Object::phi(),
+                false => Object::Seq(
+                    split_top_level(inner).into_iter()
+                        .map(|i| parse_with_depth(i.trim(), depth + 1))
+                        .collect()
+                ),
+            }
+        }
+        atom => Object::Atom(atom.to_string()),
     }
-    Object::Atom(s.to_string())
 }
 
 impl fmt::Display for Object {
@@ -170,16 +179,15 @@ pub fn encode_state(state: &Object) -> Object {
 /// Expected: <constraint_id, constraint_text, detail>
 /// Detail can be an atom (string) or a sequence of atoms (joined with spaces).
 pub fn decode_violation(obj: &Object) -> Option<Violation> {
-    let items = obj.as_seq()?;
-    if items.len() != 3 { return None; }
-    let detail = match &items[2] {
-        Object::Atom(s) => s.clone(),
-        Object::Seq(parts) => parts.iter()
+    let items = obj.as_seq().filter(|i| i.len() == 3)?;
+    let detail: String = match &items[2] {
+        Object::Atom(s) => Some(s.clone()),
+        Object::Seq(parts) => Some(parts.iter()
             .filter_map(|p| p.as_atom())
             .collect::<Vec<_>>()
-            .join(" "),
-        _ => return None,
-    };
+            .join(" ")),
+        _ => None,
+    }?;
     Some(Violation {
         constraint_id: items[0].as_atom()?.to_string(),
         constraint_text: items[1].as_atom()?.to_string(),
@@ -530,26 +538,24 @@ pub fn apply(func: &Func, x: &Object, d: &Object) -> Object {
             }
         }
 
-        Func::Trans => {
-            match x.as_seq() {
-                Some(rows) if rows.is_empty() => Object::phi(),
-                Some(rows) => {
-                    // All rows must be sequences of the same length
-                    let inner: Vec<&[Object]> = rows.iter()
-                        .filter_map(|r| r.as_seq())
-                        .collect();
-                    if inner.len() != rows.len() { return Object::Bottom; }
-                    if inner.is_empty() { return Object::phi(); }
-                    let cols = inner[0].len();
-                    if inner.iter().any(|r| r.len() != cols) { return Object::Bottom; }
-                    Object::Seq(
+        Func::Trans => match x.as_seq() {
+            Some(rows) if rows.is_empty() => Object::phi(),
+            Some(rows) => {
+                let inner: Vec<&[Object]> = rows.iter()
+                    .filter_map(|r| r.as_seq())
+                    .collect();
+                match (inner.len() == rows.len(), inner.first().map(|r| r.len())) {
+                    (false, _) => Object::Bottom,
+                    (true, None) => Object::phi(),
+                    (true, Some(cols)) if inner.iter().any(|r| r.len() != cols) => Object::Bottom,
+                    (true, Some(cols)) => Object::Seq(
                         (0..cols).map(|c|
                             Object::Seq(inner.iter().map(|r| r[c].clone()).collect())
                         ).collect()
-                    )
+                    ),
                 }
-                _ => Object::Bottom,
             }
+            _ => Object::Bottom,
         }
 
         Func::ApndL => {
@@ -1321,36 +1327,32 @@ fn register_theta1_into(defs: &mut Vec<(String, Func)>) {
     // is a compile-time combinator -- the selector list is determined by the
     // index sequence at runtime.
     defs.push(("project".to_string(), Func::Native(Arc::new(|x: &Object| {
-        let items = match x.as_seq() {
-            Some(items) if items.len() == 2 => items,
-            _ => return Object::Bottom,
-        };
-        let indices = match items[0].as_seq() {
-            Some(idx) => idx,
-            None => return Object::Bottom,
-        };
-        let relation = match items[1].as_seq() {
-            Some(r) => r,
-            None => return Object::Bottom,
-        };
-        let selectors: Vec<usize> = indices.iter()
-            .filter_map(|i| i.as_atom().and_then(|s| s.parse().ok()))
-            .collect();
-        if selectors.is_empty() { return Object::Bottom; }
-
-        let rows: Vec<Object> = relation.iter()
-            .filter_map(|tuple| {
-                let cols = tuple.as_seq()?;
-                let projected: Vec<Object> = selectors.iter()
-                    .filter_map(|&s| if s >= 1 && s <= cols.len() { Some(cols[s-1].clone()) } else { None })
+        // Monadic bind via ? on Option — Backus cond lifted into Option.
+        // Any shape mismatch folds to None, then unwraps to Object::Bottom.
+        x.as_seq()
+            .filter(|items| items.len() == 2)
+            .and_then(|items| {
+                let indices = items[0].as_seq()?;
+                let relation = items[1].as_seq()?;
+                let selectors: Vec<usize> = indices.iter()
+                    .filter_map(|i| i.as_atom().and_then(|s| s.parse().ok()))
                     .collect();
-                Some(Object::Seq(projected))
+                (!selectors.is_empty()).then_some(())?;
+                let rows: Vec<Object> = relation.iter()
+                    .filter_map(|tuple| {
+                        let cols = tuple.as_seq()?;
+                        let projected: Vec<Object> = selectors.iter()
+                            .filter_map(|&s| (s >= 1 && s <= cols.len()).then(|| cols[s-1].clone()))
+                            .collect();
+                        Some(Object::Seq(projected))
+                    })
+                    .fold(Vec::new(), |mut acc, row| {
+                        (!acc.contains(&row)).then(|| acc.push(row));
+                        acc
+                    });
+                Some(Object::Seq(rows))
             })
-            .fold(Vec::new(), |mut acc, row| {
-                if !acc.contains(&row) { acc.push(row); }
-                acc
-            });
-        Object::Seq(rows)
+            .unwrap_or(Object::Bottom)
     }))));
 
     // join: join:<shared_col, R, S> = natural join on shared column index.
@@ -1358,39 +1360,36 @@ fn register_theta1_into(defs: &mut Vec<(String, Func)>) {
     // Selector to use for comparison and which columns to include in the
     // merged tuple. Pure Func cannot parameterize Selector indices from data.
     defs.push(("join".to_string(), Func::Native(Arc::new(|x: &Object| {
-        let items = match x.as_seq() {
-            Some(items) if items.len() == 3 => items,
-            _ => return Object::Bottom,
-        };
-        let shared_col: usize = match items[0].as_atom().and_then(|s| s.parse().ok()) {
-            Some(c) => c,
-            None => return Object::Bottom,
-        };
-        let r = match items[1].as_seq() { Some(r) => r, None => return Object::Bottom };
-        let s = match items[2].as_seq() { Some(s) => s, None => return Object::Bottom };
+        x.as_seq()
+            .filter(|items| items.len() == 3)
+            .and_then(|items| {
+                let shared_col: usize = items[0].as_atom().and_then(|s| s.parse().ok())?;
+                let r = items[1].as_seq()?;
+                let s = items[2].as_seq()?;
 
-        let result: Vec<Object> = r.iter()
-            .filter_map(|r_tuple| {
-                let r_cols = r_tuple.as_seq()?;
-                if shared_col < 1 || shared_col > r_cols.len() { return None; }
-                Some(r_cols)
+                let result: Vec<Object> = r.iter()
+                    .filter_map(|r_tuple| {
+                        r_tuple.as_seq()
+                            .filter(|cols| shared_col >= 1 && shared_col <= cols.len())
+                    })
+                    .flat_map(|r_cols| {
+                        let r_val = r_cols[shared_col - 1].clone();
+                        s.iter().filter_map(move |s_tuple| {
+                            let s_cols = s_tuple.as_seq()
+                                .filter(|cols| shared_col >= 1 && shared_col <= cols.len())?;
+                            (r_val == s_cols[shared_col - 1]).then(|| {
+                                let mut merged: Vec<Object> = r_cols.to_vec();
+                                merged.extend(s_cols.iter().enumerate()
+                                    .filter(|(i, _)| i + 1 != shared_col)
+                                    .map(|(_, col)| col.clone()));
+                                Object::Seq(merged)
+                            })
+                        })
+                    })
+                    .collect();
+                Some(Object::Seq(result))
             })
-            .flat_map(|r_cols| {
-                let r_val = r_cols[shared_col - 1].clone();
-                s.iter().filter_map(move |s_tuple| {
-                    let s_cols = s_tuple.as_seq()?;
-                    if shared_col < 1 || shared_col > s_cols.len() { return None; }
-                    let s_val = &s_cols[shared_col - 1];
-                    if r_val != *s_val { return None; }
-                    let mut merged: Vec<Object> = r_cols.to_vec();
-                    merged.extend(s_cols.iter().enumerate()
-                        .filter(|(i, _)| i + 1 != shared_col)
-                        .map(|(_, col)| col.clone()));
-                    Some(Object::Seq(merged))
-                })
-            })
-            .collect();
-        Object::Seq(result)
+            .unwrap_or(Object::Bottom)
     }))));
 
     // tie: gamma(R) = Filter(eq . [sel(1), sel(n)]) : R
@@ -1401,21 +1400,17 @@ fn register_theta1_into(defs: &mut Vec<(String, Func)>) {
     // works for comparison but the "remove last column" step still needs
     // dynamic-arity Construction to rebuild the tuple without its last element.
     defs.push(("tie".to_string(), Func::Native(Arc::new(|x: &Object| {
-        let relation = match x.as_seq() {
-            Some(r) => r,
-            None => return Object::Bottom,
-        };
-        let result: Vec<Object> = relation.iter()
-            .filter_map(|tuple| {
-                let cols = tuple.as_seq()?;
-                if cols.len() >= 2 && cols[0] == cols[cols.len() - 1] {
-                    Some(Object::Seq(cols[..cols.len()-1].to_vec()))
-                } else {
-                    None
-                }
+        x.as_seq()
+            .map(|relation| {
+                Object::Seq(relation.iter()
+                    .filter_map(|tuple| {
+                        let cols = tuple.as_seq()?;
+                        (cols.len() >= 2 && cols[0] == cols[cols.len() - 1])
+                            .then(|| Object::Seq(cols[..cols.len()-1].to_vec()))
+                    })
+                    .collect())
             })
-            .collect();
-        Object::Seq(result)
+            .unwrap_or(Object::Bottom)
     }))));
 
     // compose_rel: R . S = pi_1s(R*S) -- relational composition.
@@ -1424,44 +1419,42 @@ fn register_theta1_into(defs: &mut Vec<(String, Func)>) {
     // project's dynamic Construction building. The shared_col parameter
     // determines runtime behavior that cannot be fixed at compile time.
     defs.push(("compose_rel".to_string(), Func::Native(Arc::new(|x: &Object| {
-        let items = match x.as_seq() {
-            Some(items) if items.len() == 3 => items,
-            _ => return Object::Bottom,
-        };
-        let shared_col: usize = match items[0].as_atom().and_then(|s| s.parse().ok()) {
-            Some(c) => c,
-            None => return Object::Bottom,
-        };
-        let r = match items[1].as_seq() { Some(r) => r, None => return Object::Bottom };
-        let s = match items[2].as_seq() { Some(s) => s, None => return Object::Bottom };
+        x.as_seq()
+            .filter(|items| items.len() == 3)
+            .and_then(|items| {
+                let shared_col: usize = items[0].as_atom().and_then(|s| s.parse().ok())?;
+                let r = items[1].as_seq()?;
+                let s = items[2].as_seq()?;
 
-        let result: Vec<Object> = r.iter()
-            .filter_map(|r_tuple| {
-                let r_cols = r_tuple.as_seq()?;
-                if shared_col < 1 || shared_col > r_cols.len() { return None; }
-                Some(r_cols)
+                let result: Vec<Object> = r.iter()
+                    .filter_map(|r_tuple| {
+                        r_tuple.as_seq()
+                            .filter(|cols| shared_col >= 1 && shared_col <= cols.len())
+                    })
+                    .flat_map(|r_cols| {
+                        let r_val = r_cols[shared_col - 1].clone();
+                        s.iter().filter_map(move |s_tuple| {
+                            let s_cols = s_tuple.as_seq()
+                                .filter(|cols| shared_col >= 1 && shared_col <= cols.len())?;
+                            (r_val == s_cols[shared_col - 1]).then(|| {
+                                let projected: Vec<Object> = r_cols.iter().enumerate()
+                                    .filter(|(i, _)| i + 1 != shared_col)
+                                    .map(|(_, col)| col.clone())
+                                    .chain(s_cols.iter().enumerate()
+                                        .filter(|(i, _)| i + 1 != shared_col)
+                                        .map(|(_, col)| col.clone()))
+                                    .collect();
+                                Object::Seq(projected)
+                            })
+                        })
+                    })
+                    .fold(Vec::new(), |mut acc, row| {
+                        (!acc.contains(&row)).then(|| acc.push(row));
+                        acc
+                    });
+                Some(Object::Seq(result))
             })
-            .flat_map(|r_cols| {
-                let r_val = r_cols[shared_col - 1].clone();
-                s.iter().filter_map(move |s_tuple| {
-                    let s_cols = s_tuple.as_seq()?;
-                    if shared_col < 1 || shared_col > s_cols.len() { return None; }
-                    if r_val != s_cols[shared_col - 1] { return None; }
-                    let projected: Vec<Object> = r_cols.iter().enumerate()
-                        .filter(|(i, _)| i + 1 != shared_col)
-                        .map(|(_, col)| col.clone())
-                        .chain(s_cols.iter().enumerate()
-                            .filter(|(i, _)| i + 1 != shared_col)
-                            .map(|(_, col)| col.clone()))
-                        .collect();
-                    Some(Object::Seq(projected))
-                })
-            })
-            .fold(Vec::new(), |mut acc, row| {
-                if !acc.contains(&row) { acc.push(row); }
-                acc
-            });
-        Object::Seq(result)
+            .unwrap_or(Object::Bottom)
     }))));
 }
 
