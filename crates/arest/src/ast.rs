@@ -831,6 +831,50 @@ pub(crate) const PLATFORM_MAX_INPUT: usize = 1_024 * 1_024;
 /// Max per-field value size within a Command — DoS bound.
 pub(crate) const PLATFORM_MAX_FIELD: usize = 64 * 1024;
 
+/// Metamodel namespace (security #23): these noun names belong to the
+/// self-describing metamodel bootstrap. Once the bootstrap has declared them,
+/// user domains MUST NOT redeclare (shadow) them on subsequent compiles.
+/// The first compile (empty D) is free to populate the namespace; later
+/// compiles that try to layer a new definition over an existing metamodel
+/// noun are rejected by `platform_compile`.
+pub(crate) const RESERVED_METAMODEL_NOUNS: &[&str] = &[
+    "Noun",
+    "Graph Schema",
+    "Role",
+    "Constraint",
+    "State Machine Definition",
+    "Transition",
+    "Status",
+    "Event Type",
+    "Domain Change",
+    "Derivation Rule",
+];
+
+/// Does the given state's `Noun` cell already declare this name?
+/// Pure scan — no side effects, no allocation beyond the cell walk.
+fn noun_cell_has(state: &Object, name: &str) -> bool {
+    fetch_or_phi("Noun", state)
+        .as_seq()
+        .map(|facts| facts.iter().any(|f| binding(f, "name") == Some(name)))
+        .unwrap_or(false)
+}
+
+/// Find the first reserved metamodel noun that `parsed` declares AND that is
+/// already present in `existing`. Returns None when the check passes (either
+/// because the parsed state does not touch the metamodel namespace, or because
+/// this is the bootstrap compile that legitimately owns the first declaration).
+fn find_metamodel_shadow(parsed: &Object, existing: &Object) -> Option<String> {
+    let parsed_nouns = fetch_or_phi("Noun", parsed);
+    let facts = parsed_nouns.as_seq()?;
+    facts.iter().find_map(|fact| {
+        let name = binding(fact, "name")?;
+        match RESERVED_METAMODEL_NOUNS.contains(&name) && noun_cell_has(existing, name) {
+            true => Some(name.to_string()),
+            false => None,
+        }
+    })
+}
+
 fn platform_compile(x: &Object, d: &Object) -> Object {
     let input = match x.as_atom() {
         Some(s) if s.len() <= PLATFORM_MAX_INPUT => s,
@@ -843,6 +887,15 @@ fn platform_compile(x: &Object, d: &Object) -> Object {
         Ok(s) => s,
         Err(e) => return Object::atom(&format!("⊥ {}", e)),
     };
+
+    // Metamodel namespace protection (security #23). The FORML2 parser also
+    // rejects this at the Domain level, but we re-check at the state-cell
+    // boundary to defend against any future code path that bypasses the
+    // parser's Domain-level guard (e.g. direct state injection).
+    match find_metamodel_shadow(&parsed, d) {
+        Some(name) => return Object::atom(&format!("⊥ metamodel noun '{}' cannot be redeclared", name)),
+        None => {}
+    }
 
     // SSRF defense (#25): External System federation must not reach
     // internal/loopback/link-local hosts, file:// URLs, or internal DNS.
