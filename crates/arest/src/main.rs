@@ -76,9 +76,9 @@ mod db {
                 Err(e) => { eprintln!("Warning: DDL for {} failed: {}", name, e); errors + 1 }
                 Ok(_) => errors,
             });
-        if ddl_errors > 0 {
+        (ddl_errors > 0).then(|| {
             eprintln!("{} DDL statements had errors (duplicate columns from RMAP)", ddl_errors);
-        }
+        });
     }
 
     pub fn store_defs(conn: &Connection, defs: &[(String, ast::Func)]) {
@@ -111,7 +111,7 @@ mod db {
 
         // InstanceFacts are domain data.
         let inst_cell = ast::fetch_or_phi("InstanceFact", state);
-        if let Some(instance_facts) = inst_cell.as_seq() {
+        inst_cell.as_seq().into_iter().flat_map(|instance_facts| {
             let rows: HashMap<(String, String), Vec<(String, String)>> = instance_facts.iter()
                 .fold(HashMap::new(), |mut acc, inst| {
                     let get = |key: &str| ast::binding(inst, key).unwrap_or("").to_string();
@@ -120,7 +120,7 @@ mod db {
                     acc
                 });
 
-            rows.iter().filter_map(|((table_name, subject_id), columns)| {
+            rows.into_iter().filter_map(|((table_name, subject_id), columns)| {
                 let table = table_by_snake.get(table_name.as_str())?;
                 let pk_col = table.primary_key.first().map(|s| s.as_str()).unwrap_or("id");
                 let table_col_names: Vec<&str> = table.columns.iter().map(|c| c.name.as_str()).collect();
@@ -131,18 +131,18 @@ mod db {
                 let col_list: Vec<String> = std::iter::once(pk_col.to_string()).chain(extra_cols).collect();
                 let val_list: Vec<String> = std::iter::once(subject_id.clone()).chain(extra_vals).collect();
                 Some((table_name, col_list, val_list))
-            }).for_each(|(table_name, col_list, val_list)| {
-                let quoted_cols: Vec<String> = col_list.iter().map(|c| format!("\"{}\"", c)).collect();
-                let placeholders: Vec<String> = (1..=col_list.len()).map(|i| format!("?{}", i)).collect();
-                let sql = format!("INSERT OR REPLACE INTO \"{}\" ({}) VALUES ({})",
-                    table_name, quoted_cols.join(", "), placeholders.join(", "));
-                let params: Vec<&dyn rusqlite::ToSql> = val_list.iter().map(|v| v as &dyn rusqlite::ToSql).collect();
-                match tx.execute(&sql, params.as_slice()) {
-                    Ok(_) => domain_rows += 1,
-                    Err(e) => eprintln!("Warning: INSERT into {} failed: {}", table_name, e),
-                }
-            });
-        }
+            }).collect::<Vec<_>>()
+        }).for_each(|(table_name, col_list, val_list)| {
+            let quoted_cols: Vec<String> = col_list.iter().map(|c| format!("\"{}\"", c)).collect();
+            let placeholders: Vec<String> = (1..=col_list.len()).map(|i| format!("?{}", i)).collect();
+            let sql = format!("INSERT OR REPLACE INTO \"{}\" ({}) VALUES ({})",
+                table_name, quoted_cols.join(", "), placeholders.join(", "));
+            let params: Vec<&dyn rusqlite::ToSql> = val_list.iter().map(|v| v as &dyn rusqlite::ToSql).collect();
+            match tx.execute(&sql, params.as_slice()) {
+                Ok(_) => domain_rows += 1,
+                Err(e) => eprintln!("Warning: INSERT into {} failed: {}", table_name, e),
+            }
+        });
 
         // All other fact types are metamodel facts. Store in cells.
         ast::cells_iter(state).into_iter()
@@ -258,12 +258,8 @@ mod db {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
-    if args.len() < 2 || args[1] == "--help" || args[1] == "-h" {
-        print_local_help();
-        std::process::exit(0);
-    }
-
-    match args[1].as_str() {
+    match args.get(1).map(|s| s.as_str()).unwrap_or("--help") {
+        "--help" | "-h" => { print_local_help(); std::process::exit(0); }
         "bootstrap" => cmd_bootstrap(&args[2..]),
         "system" => cmd_system(&args[2..]),
         "synthesize" => cmd_synthesize(&args[2..]),
@@ -278,20 +274,15 @@ fn main() {
 
 #[cfg(feature = "local")]
 fn parse_db_flag(args: &[String]) -> (String, Vec<String>) {
-    let mut db_path = String::from("./app.db");
-    let mut rest = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        if args[i] == "--db" {
-            i += 1;
-            if let Some(p) = args.get(i) {
-                db_path = p.clone();
-            }
-        } else {
-            rest.push(args[i].clone());
+    // foldl over (index, arg) pairs: --db consumes next arg, else push to rest.
+    let (db_path, rest, _skip) = args.iter().enumerate().fold(
+        (String::from("./app.db"), Vec::new(), false),
+        |(db, mut rest, skip), (i, a)| match (skip, a.as_str()) {
+            (true, _) => (a.clone(), rest, false),
+            (false, "--db") => (db, rest, true),
+            (false, _) => { rest.push(args[i].clone()); (db, rest, false) }
         }
-        i += 1;
-    }
+    );
     (db_path, rest)
 }
 
@@ -299,19 +290,16 @@ fn parse_db_flag(args: &[String]) -> (String, Vec<String>) {
 fn cmd_bootstrap(args: &[String]) {
     let (db_path, rest) = parse_db_flag(args);
 
-    if rest.is_empty() {
+    rest.is_empty().then(|| {
         eprintln!("Usage: fol bootstrap <readings_dir> [<readings_dir2> ...] [--db <path>]");
         std::process::exit(1);
-    }
+    });
 
     // Collect all .md files from each directory, sorted alphabetically.
     // If app.md exists in any directory, read it first.
-    let mut readings: Vec<(String, String)> = Vec::new();
-    let mut app_md: Option<(String, String)> = None;
-
     let (readings, app_md) = rest.iter().flat_map(|dir| {
         let dir_path = std::path::Path::new(dir);
-        if !dir_path.is_dir() { eprintln!("Not a directory: {}", dir); std::process::exit(1); }
+        (!dir_path.is_dir()).then(|| { eprintln!("Not a directory: {}", dir); std::process::exit(1); });
         let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(dir_path)
             .unwrap_or_else(|e| { eprintln!("Failed to read directory {}: {}", dir, e); std::process::exit(1); })
             .filter_map(|e| e.ok()).map(|e| e.path())
@@ -323,22 +311,18 @@ fn cmd_bootstrap(args: &[String]) {
                 .unwrap_or_else(|e| { eprintln!("Failed to read {}: {}", path.display(), e); std::process::exit(1); });
             (name, text)
         }).collect::<Vec<_>>()
-    }).fold((Vec::new(), None::<(String, String)>), |(mut readings, mut app), (name, text)| {
-        if name == "app.md" { app = Some((name, text)); } else { readings.push((name, text)); }
-        (readings, app)
+    }).fold((Vec::new(), None::<(String, String)>), |(mut readings, app), (name, text)| match name.as_str() {
+        "app.md" => (readings, Some((name, text))),
+        _ => { readings.push((name, text)); (readings, app) }
     });
 
     // app.md first (for domain ordering), then the rest alphabetically.
-    let mut ordered: Vec<(String, String)> = Vec::new();
-    if let Some(app) = app_md {
-        ordered.push(app);
-    }
-    ordered.extend(readings);
+    let ordered: Vec<(String, String)> = app_md.into_iter().chain(readings).collect();
 
-    if ordered.is_empty() {
+    ordered.is_empty().then(|| {
         eprintln!("No .md files found in specified directories.");
         std::process::exit(1);
-    }
+    });
 
     // Parse readings -- same merge strategy as parse_and_compile_impl in lib.rs.
     let merged = ordered.iter().fold(Domain::default(), |mut merged, (name, text)| {
@@ -398,10 +382,10 @@ fn cmd_bootstrap(args: &[String]) {
 fn cmd_system(args: &[String]) {
     let (db_path, rest) = parse_db_flag(args);
 
-    if rest.len() < 2 {
+    (rest.len() < 2).then(|| {
         eprintln!("Usage: fol system <key> <input> [--db <path>]");
         std::process::exit(1);
-    }
+    });
 
     let key = &rest[0];
     let input = &rest[1];
@@ -433,27 +417,20 @@ fn cmd_system(args: &[String]) {
 fn cmd_synthesize(args: &[String]) {
     let (db_path, rest) = parse_db_flag(args);
 
-    // Parse --depth flag from rest.
-    let mut noun: Option<String> = None;
-    let mut depth: usize = 1;
-    let mut i = 0;
-    while i < rest.len() {
-        if rest[i] == "--depth" {
-            i += 1;
-            depth = rest.get(i).and_then(|s| s.parse().ok()).unwrap_or(1);
-        } else if noun.is_none() {
-            noun = Some(rest[i].clone());
+    // Parse --depth flag via foldl: state = (noun, depth, expect_depth).
+    let (noun, depth, _) = rest.iter().fold(
+        (None::<String>, 1usize, false),
+        |(noun, depth, expect_depth), a| match (expect_depth, a.as_str()) {
+            (true, s) => (noun, s.parse().unwrap_or(1), false),
+            (false, "--depth") => (noun, depth, true),
+            (false, s) => (noun.or_else(|| Some(s.to_string())), depth, false),
         }
-        i += 1;
-    }
+    );
 
-    let noun = match noun {
-        Some(n) => n,
-        None => {
-            eprintln!("Usage: fol synthesize <noun> [--depth <n>] [--db <path>]");
-            std::process::exit(1);
-        }
-    };
+    let noun = noun.unwrap_or_else(|| {
+        eprintln!("Usage: fol synthesize <noun> [--depth <n>] [--db <path>]");
+        std::process::exit(1);
+    });
 
     let conn = db::open(&db_path);
     let tables = db::load_table_meta(&conn);
@@ -477,13 +454,15 @@ fn cmd_forward_chain(args: &[String]) {
         .collect();
     let (new_state, derived) = evaluate::forward_chain_defs_state(&derivation_defs, &state);
 
-    if derived.is_empty() {
-        println!("No new facts derived");
-    } else {
-        // Store derived facts back.
-        db::store_facts(&conn, &new_state, &tables);
-        println!("{}", serde_json::to_string_pretty(&derived).unwrap());
-    }
+    // Non-empty derivation: store the new state, then format derived facts as
+    // JSON. Empty derivation: just report it. Pure cond combining form.
+    let msg = derived.is_empty()
+        .then(|| "No new facts derived".to_string())
+        .unwrap_or_else(|| {
+            db::store_facts(&conn, &new_state, &tables);
+            serde_json::to_string_pretty(&derived).unwrap()
+        });
+    println!("{}", msg);
 }
 
 #[cfg(feature = "local")]
@@ -516,50 +495,66 @@ fn print_local_help() {
 // =========================================================================
 
 #[cfg(not(feature = "local"))]
+#[derive(Default)]
+struct LegacyArgs {
+    ir_path: Option<String>,
+    response_path: Option<String>,
+    text: Option<String>,
+    population_path: Option<String>,
+    synthesize_noun: Option<String>,
+    synthesize_depth: usize,
+    do_forward_chain: bool,
+}
+
+#[cfg(not(feature = "local"))]
+#[derive(Clone, Copy)]
+enum LegacyFlag { Ir, Response, Text, Population, Synthesize, Depth, None }
+
+#[cfg(not(feature = "local"))]
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
-    let mut ir_path: Option<String> = None;
-    let mut response_path: Option<String> = None;
-    let mut text: Option<String> = None;
-    let mut population_path: Option<String> = None;
-    let mut synthesize_noun: Option<String> = None;
-    let mut synthesize_depth: usize = 1;
-    let mut do_forward_chain = false;
-
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--ir" => { i += 1; ir_path = args.get(i).cloned(); }
-            "--response" => { i += 1; response_path = args.get(i).cloned(); }
-            "--text" => { i += 1; text = args.get(i).cloned(); }
-            "--population" => { i += 1; population_path = args.get(i).cloned(); }
-            "--synthesize" => { i += 1; synthesize_noun = args.get(i).cloned(); }
-            "--depth" => {
-                i += 1;
-                synthesize_depth = args.get(i)
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(1);
-            }
-            "--forward-chain" => { do_forward_chain = true; }
-            "--help" | "-h" => {
+    // Parse via fold: state = (LegacyArgs, pending-flag). Each arg either sets a
+    // pending flag for the next arg, or consumes the pending flag as a value.
+    let init = LegacyArgs { synthesize_depth: 1, ..LegacyArgs::default() };
+    let (parsed, _) = args.iter().skip(1).fold(
+        (init, LegacyFlag::None),
+        |(mut a, pending), arg| match (pending, arg.as_str()) {
+            (LegacyFlag::Ir, _) => { a.ir_path = Some(arg.clone()); (a, LegacyFlag::None) }
+            (LegacyFlag::Response, _) => { a.response_path = Some(arg.clone()); (a, LegacyFlag::None) }
+            (LegacyFlag::Text, _) => { a.text = Some(arg.clone()); (a, LegacyFlag::None) }
+            (LegacyFlag::Population, _) => { a.population_path = Some(arg.clone()); (a, LegacyFlag::None) }
+            (LegacyFlag::Synthesize, _) => { a.synthesize_noun = Some(arg.clone()); (a, LegacyFlag::None) }
+            (LegacyFlag::Depth, s) => { a.synthesize_depth = s.parse().unwrap_or(1); (a, LegacyFlag::None) }
+            (LegacyFlag::None, "--ir") => (a, LegacyFlag::Ir),
+            (LegacyFlag::None, "--response") => (a, LegacyFlag::Response),
+            (LegacyFlag::None, "--text") => (a, LegacyFlag::Text),
+            (LegacyFlag::None, "--population") => (a, LegacyFlag::Population),
+            (LegacyFlag::None, "--synthesize") => (a, LegacyFlag::Synthesize),
+            (LegacyFlag::None, "--depth") => (a, LegacyFlag::Depth),
+            (LegacyFlag::None, "--forward-chain") => { a.do_forward_chain = true; (a, LegacyFlag::None) }
+            (LegacyFlag::None, "--help") | (LegacyFlag::None, "-h") => {
                 print_help();
                 std::process::exit(0);
             }
-            _ => {
-                eprintln!("Unknown argument: {}", args[i]);
+            (LegacyFlag::None, other) => {
+                eprintln!("Unknown argument: {}", other);
                 std::process::exit(1);
             }
         }
-        i += 1;
-    }
+    );
+    let LegacyArgs {
+        ir_path, response_path, text, population_path,
+        synthesize_noun, synthesize_depth, do_forward_chain,
+    } = parsed;
 
     // Load IR
-    let ir_json = match ir_path {
-        Some(p) => std::fs::read_to_string(&p)
-            .unwrap_or_else(|e| { eprintln!("Failed to read IR file: {}", e); std::process::exit(1); }),
-        None => { eprintln!("--ir is required. Run with --help for usage."); std::process::exit(1); }
-    };
+    let ir_path = ir_path.unwrap_or_else(|| {
+        eprintln!("--ir is required. Run with --help for usage.");
+        std::process::exit(1);
+    });
+    let ir_json = std::fs::read_to_string(&ir_path)
+        .unwrap_or_else(|e| { eprintln!("Failed to read IR file: {}", e); std::process::exit(1); });
 
     let ir: Domain = serde_json::from_str(&ir_json)
         .unwrap_or_else(|e| { eprintln!("Failed to parse IR: {}", e); std::process::exit(1); });
@@ -568,40 +563,37 @@ fn main() {
     let d = ast::defs_to_state(&defs, &ir_state);
 
     // -- Synthesize mode --
-    if let Some(noun_name) = synthesize_noun {
+    synthesize_noun.map(|noun_name| {
         let result = evaluate::synthesize_from_state(&ir_state, &noun_name, synthesize_depth);
         println!("{}", serde_json::to_string_pretty(&result).unwrap());
         std::process::exit(0);
-    }
+    });
 
     // -- Forward chain mode --
-    if do_forward_chain {
-        let pop_state = load_state(population_path, true);
+    do_forward_chain.then(|| {
+        let pop_state = load_state(population_path.clone(), true);
         let derivation_defs: Vec<(&str, &ast::Func)> = defs.iter()
             .filter(|(n, _)| n.starts_with("derivation:"))
             .map(|(n, f)| (n.as_str(), f))
             .collect();
         let (_new_state, derived) = evaluate::forward_chain_defs_state(&derivation_defs, &pop_state);
-        if derived.is_empty() {
-            println!("No new facts derived");
-        } else {
-            println!("{}", serde_json::to_string_pretty(&derived).unwrap());
-        }
+        let msg = derived.is_empty()
+            .then(|| "No new facts derived".to_string())
+            .unwrap_or_else(|| serde_json::to_string_pretty(&derived).unwrap());
+        println!("{}", msg);
         std::process::exit(0);
-    }
+    });
 
     // -- Evaluate mode (default) --
-    let response_text: String = if let Some(t) = text {
-        t
-    } else if let Some(p) = response_path {
-        std::fs::read_to_string(&p)
-            .unwrap_or_else(|e| { eprintln!("Failed to read response file: {}", e); std::process::exit(1); })
-    } else {
-        let mut input = String::new();
-        std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)
-            .unwrap_or_else(|e| { eprintln!("Failed to read stdin: {}", e); std::process::exit(1); });
-        input.trim().to_string()
-    };
+    let response_text: String = text
+        .or_else(|| response_path.map(|p| std::fs::read_to_string(&p)
+            .unwrap_or_else(|e| { eprintln!("Failed to read response file: {}", e); std::process::exit(1); })))
+        .unwrap_or_else(|| {
+            let mut input = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)
+                .unwrap_or_else(|e| { eprintln!("Failed to read stdin: {}", e); std::process::exit(1); });
+            input.trim().to_string()
+        });
 
     let pop_state = load_state(population_path, false);
     let ctx_obj = ast::encode_eval_context_state(&response_text, None, &pop_state);
@@ -617,13 +609,11 @@ fn main() {
         })
         .collect();
 
-    if violations.is_empty() {
-        println!("OK -- no violations");
-        std::process::exit(0);
-    } else {
-        println!("{}", serde_json::to_string_pretty(&violations).unwrap());
-        std::process::exit(1);
-    }
+    let (msg, code) = violations.is_empty()
+        .then(|| ("OK -- no violations".to_string(), 0))
+        .unwrap_or_else(|| (serde_json::to_string_pretty(&violations).unwrap(), 1));
+    println!("{}", msg);
+    std::process::exit(code);
 }
 
 #[cfg(not(feature = "local"))]

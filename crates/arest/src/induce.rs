@@ -100,46 +100,41 @@ pub fn induce_state(ir: &Domain, state: &Object) -> InductionResult {
 
                 let max_count = values.values().max().copied().unwrap_or(0);
 
-                let mut role_constraints: Vec<InducedConstraint> = Vec::new();
-
-                if max_count <= 1 && facts.len() > 1 {
-                    role_constraints.push(InducedConstraint {
-                        kind: "UC".to_string(),
-                        fact_type_id: ft_id.clone(),
-                        reading: ft.reading.clone(),
-                        roles: vec![role_idx],
-                        confidence: if facts.len() >= 3 { 0.9 } else { 0.6 },
-                        evidence: format!(
-                            "All {} values in role {} are unique across {} facts",
-                            values.len(), ft.roles.get(role_idx).map(|r| r.noun_name.as_str()).unwrap_or("?"), facts.len()
-                        ),
-                    });
-                }
+                let uc_constraint = (max_count <= 1 && facts.len() > 1).then(|| InducedConstraint {
+                    kind: "UC".to_string(),
+                    fact_type_id: ft_id.clone(),
+                    reading: ft.reading.clone(),
+                    roles: vec![role_idx],
+                    confidence: if facts.len() >= 3 { 0.9 } else { 0.6 },
+                    evidence: format!(
+                        "All {} values in role {} are unique across {} facts",
+                        values.len(), ft.roles.get(role_idx).map(|r| r.noun_name.as_str()).unwrap_or("?"), facts.len()
+                    ),
+                });
 
                 // FC induction
                 let counts: HashSet<usize> = values.values().cloned().collect();
-                if counts.len() == 1 && facts.len() > 2 {
-                    let n = *counts.iter().next().unwrap();
-                    if n > 1 {
-                        role_constraints.push(InducedConstraint {
-                            kind: "FC".to_string(),
-                            fact_type_id: ft_id.clone(),
-                            reading: ft.reading.clone(),
-                            roles: vec![role_idx],
-                            confidence: if facts.len() >= 4 { 0.8 } else { 0.5 },
-                            evidence: format!(
-                                "Every {} value occurs exactly {} times across {} facts",
-                                ft.roles.get(role_idx).map(|r| r.noun_name.as_str()).unwrap_or("?"), n, facts.len()
-                            ),
-                        });
-                    }
-                }
+                let fc_constraint = (counts.len() == 1 && facts.len() > 2)
+                    .then(|| counts.iter().next().copied())
+                    .flatten()
+                    .filter(|n| *n > 1)
+                    .map(|n| InducedConstraint {
+                        kind: "FC".to_string(),
+                        fact_type_id: ft_id.clone(),
+                        reading: ft.reading.clone(),
+                        roles: vec![role_idx],
+                        confidence: if facts.len() >= 4 { 0.8 } else { 0.5 },
+                        evidence: format!(
+                            "Every {} value occurs exactly {} times across {} facts",
+                            ft.roles.get(role_idx).map(|r| r.noun_name.as_str()).unwrap_or("?"), n, facts.len()
+                        ),
+                    });
 
-                role_constraints
+                uc_constraint.into_iter().chain(fc_constraint)
             }).collect();
 
             // Check compound uniqueness (pair of roles)
-            let compound: Vec<InducedConstraint> = if arity >= 2 {
+            let compound: Vec<InducedConstraint> = (arity >= 2).then(|| {
                 (0..arity).flat_map(|i| {
                     ((i+1)..arity).filter_map(|j| {
                         let is_unique = facts.iter().try_fold(
@@ -151,35 +146,30 @@ pub fn induce_state(ir: &Domain, state: &Object) -> InductionResult {
                             }
                         ).is_some();
 
-                        if is_unique && facts.len() > 1 {
-                            let role_i_unique = single.iter().any(|c|
-                                c.kind == "UC" && c.fact_type_id == *ft_id && c.roles == vec![i]
-                            );
-                            let role_j_unique = single.iter().any(|c|
-                                c.kind == "UC" && c.fact_type_id == *ft_id && c.roles == vec![j]
-                            );
-                            if !role_i_unique && !role_j_unique {
-                                return Some(InducedConstraint {
-                                    kind: "UC".to_string(),
-                                    fact_type_id: ft_id.clone(),
-                                    reading: ft.reading.clone(),
-                                    roles: vec![i, j],
-                                    confidence: if facts.len() >= 3 { 0.85 } else { 0.5 },
-                                    evidence: format!(
-                                        "All ({}, {}) combinations are unique across {} facts",
-                                        ft.roles.get(i).map(|r| r.noun_name.as_str()).unwrap_or("?"),
-                                        ft.roles.get(j).map(|r| r.noun_name.as_str()).unwrap_or("?"),
-                                        facts.len()
-                                    ),
-                                });
-                            }
-                        }
-                        None
+                        (is_unique && facts.len() > 1).then_some(())?;
+                        let role_i_unique = single.iter().any(|c|
+                            c.kind == "UC" && c.fact_type_id == *ft_id && c.roles == vec![i]
+                        );
+                        let role_j_unique = single.iter().any(|c|
+                            c.kind == "UC" && c.fact_type_id == *ft_id && c.roles == vec![j]
+                        );
+                        (!role_i_unique && !role_j_unique).then_some(())?;
+                        Some(InducedConstraint {
+                            kind: "UC".to_string(),
+                            fact_type_id: ft_id.clone(),
+                            reading: ft.reading.clone(),
+                            roles: vec![i, j],
+                            confidence: if facts.len() >= 3 { 0.85 } else { 0.5 },
+                            evidence: format!(
+                                "All ({}, {}) combinations are unique across {} facts",
+                                ft.roles.get(i).map(|r| r.noun_name.as_str()).unwrap_or("?"),
+                                ft.roles.get(j).map(|r| r.noun_name.as_str()).unwrap_or("?"),
+                                facts.len()
+                            ),
+                        })
                     }).collect::<Vec<_>>()
                 }).collect()
-            } else {
-                Vec::new()
-            };
+            }).unwrap_or_default();
 
             single.into_iter().chain(compound)
         })
