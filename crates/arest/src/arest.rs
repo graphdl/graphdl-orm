@@ -721,15 +721,7 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
     fn setup_order_defs() -> (ast::Object, ast::Object) {
         let meta_state = crate::parse_forml2::parse_to_state(STATE_METAMODEL).unwrap();
         let orders_state = crate::parse_forml2::parse_to_state_with_nouns(ORDER_READINGS, &meta_state).unwrap();
-        // Merge: push all cells from orders_state into meta_state
-        let mut state = meta_state;
-        for (name, contents) in ast::cells_iter(&orders_state) {
-            if let Some(facts) = contents.as_seq() {
-                for fact in facts {
-                    state = ast::cell_push(name, fact.clone(), &state);
-                }
-            }
-        }
+        let state = ast::merge_states(&meta_state, &orders_state);
         let defs = crate::compile::compile_to_defs_state(&state);
         let def_obj = ast::defs_to_state(&defs, &state);
         (def_obj, state)
