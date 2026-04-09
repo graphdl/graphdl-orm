@@ -51,9 +51,8 @@ pub struct TableDef {
 
 pub fn to_snake(name: &str) -> String {
     name.chars().enumerate().fold(String::new(), |mut acc, (i, ch)| {
-        if ch.is_uppercase() && i > 0 && name.chars().nth(i - 1).map_or(false, |p| p.is_lowercase()) {
-            acc.push('_');
-        }
+        (ch.is_uppercase() && i > 0 && name.chars().nth(i - 1).map_or(false, |p| p.is_lowercase()))
+            .then(|| acc.push('_'));
         match ch {
             ' ' | '-' => acc.push('_'),
             _ => acc.push(ch.to_lowercase().next().unwrap_or(ch)),
@@ -142,11 +141,12 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
 
     let subtype_names: HashSet<&String> = subtype_to_root.keys().collect();
     let resolve_entity = |name: &str| -> String {
-        // Partitioned subtypes map to themselves, not the root
+        // Partitioned subtypes map to themselves, not the root (Backus cond).
         if partitioned_subtypes.contains(name) {
-            return name.to_string();
+            name.to_string()
+        } else {
+            subtype_to_root.get(name).cloned().unwrap_or_else(|| name.to_string())
         }
-        subtype_to_root.get(name).cloned().unwrap_or_else(|| name.to_string())
     };
 
     // -- Index constraints -------------------------------------------
@@ -357,7 +357,7 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
             .fold(HashMap::new(), |mut map, (key, col, check)| {
                 let entry = map.entry(key).or_insert_with(|| (Vec::new(), HashSet::new(), Vec::new()));
                 entry.0.push(col);
-                if let Some(chk) = check { entry.2.push(chk); }
+                check.into_iter().for_each(|chk| entry.2.push(chk));
                 map
             });
 
@@ -393,63 +393,68 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
         });
 
     // -- Emit entity tables ------------------------------------------
-    for (entity_name, (columns, _, checks)) in &entity_columns {
-        // Skip absorbed subtypes (non-partitioned) -- they are in the root table
-        if subtype_names.contains(entity_name) && !partitioned_subtypes.contains(entity_name) {
-            continue;
-        }
-        let table_name = to_snake(entity_name);
-        let is_partitioned_subtype = partitioned_subtypes.contains(entity_name);
+    // Pure iter chain: Filter(absorbed-subtypes) then Map(build-TableDef).
+    // Absorbed (non-partitioned) subtypes live in the root table and are
+    // filtered upstream, eliminating the control-flow `continue`.
+    let entity_tables: Vec<TableDef> = entity_columns.iter()
+        .filter(|(entity_name, _)| {
+            let name: &String = *entity_name;
+            !(subtype_names.contains(&name) && !partitioned_subtypes.contains(name))
+        })
+        .map(|(entity_name, (columns, _, checks))| {
+            let table_name = to_snake(entity_name);
+            let is_partitioned_subtype = partitioned_subtypes.contains(entity_name);
 
-        // Feature #59: Compound reference scheme -> composite PK
-        let compound_ref = ir.ref_schemes.get(entity_name)
-            .filter(|parts| parts.len() >= 2);
+            // Feature #59: Compound reference scheme -> composite PK
+            let compound_ref = ir.ref_schemes.get(entity_name)
+                .filter(|parts| parts.len() >= 2);
 
-        let (all_cols, pk) = if let Some(ref_parts) = compound_ref {
-            // Compound reference scheme: use ref parts as composite PK
-            let pk_cols: Vec<String> = ref_parts.iter()
-                .map(|part| column_name_for_target(ir, part))
-                .collect();
-            // No synthetic "id" column; columns are already present from functional absorption
-            (columns.iter().cloned().collect::<Vec<_>>(), pk_cols)
-        } else if is_partitioned_subtype {
-            // Partitioned subtype: id column references parent table
-            let parent_name = subtype_to_root.get(entity_name).unwrap();
-            let id_col = TableColumn {
-                name: "id".to_string(),
-                col_type: "TEXT".to_string(),
-                nullable: false,
-                references: Some(to_snake(parent_name)),
+            let (all_cols, pk) = if let Some(ref_parts) = compound_ref {
+                // Compound reference scheme: use ref parts as composite PK
+                let pk_cols: Vec<String> = ref_parts.iter()
+                    .map(|part| column_name_for_target(ir, part))
+                    .collect();
+                // No synthetic "id" column; columns are already present from functional absorption
+                (columns.iter().cloned().collect::<Vec<_>>(), pk_cols)
+            } else if is_partitioned_subtype {
+                // Partitioned subtype: id column references parent table
+                let parent_name = subtype_to_root.get(entity_name).unwrap();
+                let id_col = TableColumn {
+                    name: "id".to_string(),
+                    col_type: "TEXT".to_string(),
+                    nullable: false,
+                    references: Some(to_snake(parent_name)),
+                };
+                let mut all = vec![id_col];
+                all.extend(columns.iter().cloned());
+                (all, vec!["id".to_string()])
+            } else {
+                // Normal entity: synthetic id PK
+                let id_col = TableColumn {
+                    name: "id".to_string(),
+                    col_type: "TEXT".to_string(),
+                    nullable: false,
+                    references: None,
+                };
+                let mut all = vec![id_col];
+                all.extend(columns.iter().cloned());
+                (all, vec!["id".to_string()])
             };
-            let mut all = vec![id_col];
-            all.extend(columns.iter().cloned());
-            (all, vec!["id".to_string()])
-        } else {
-            // Normal entity: synthetic id PK
-            let id_col = TableColumn {
-                name: "id".to_string(),
-                col_type: "TEXT".to_string(),
-                nullable: false,
-                references: None,
-            };
-            let mut all = vec![id_col];
-            all.extend(columns.iter().cloned());
-            (all, vec!["id".to_string()])
-        };
 
-        // Feature #57: Attach external UC as UNIQUE constraints
-        let ext_ucs = external_ucs.get(entity_name).cloned();
+            // Feature #57: Attach external UC as UNIQUE constraints
+            let ext_ucs = external_ucs.get(entity_name).cloned();
 
-        let table = TableDef {
-            name: table_name.clone(),
-            columns: all_cols,
-            primary_key: pk,
-            checks: if checks.is_empty() { None } else { Some(checks.clone()) },
-            unique_constraints: ext_ucs,
-        };
-        tables.push(table);
-        emitted.insert(table_name);
-    }
+            TableDef {
+                name: table_name,
+                columns: all_cols,
+                primary_key: pk,
+                checks: if checks.is_empty() { None } else { Some(checks.clone()) },
+                unique_constraints: ext_ucs,
+            }
+        })
+        .collect();
+    emitted.extend(entity_tables.iter().map(|t| t.name.clone()));
+    tables.extend(entity_tables);
 
     // -- Step 4: Independent entity -> single-column table ------------
     let referenced: HashSet<String> = tables.iter()

@@ -539,9 +539,7 @@ fn try_fact_type(line: &str, noun_names: &[String]) -> Option<ParseAction> {
     // Fact type readings may contain quotes later (object position) but not
     // right after the first noun. Check by finding the first noun and seeing
     // if a quote follows it.
-    if noun_names.iter().any(|noun| line.starts_with(&format!("{} '", noun))) {
-        return None;
-    }
+    (!noun_names.iter().any(|noun| line.starts_with(&format!("{} '", noun)))).then_some(())?;
     let (ft_id, ft_def) = parse_fact(line, noun_names)?;
     Some(ParseAction::AddFactType(ft_id, ft_def))
 }
@@ -757,17 +755,16 @@ fn parse_into(ir: &mut Domain, input: &str) -> Result<(), String> {
 
         // Look ahead for enum values after value type declaration:
         // Filter(non_empty) ∘ skip(i+1) : lines, then match first result.
-        if line.ends_with(" is a value type.") {
-            let name = line.trim_end_matches(" is a value type.").trim();
-            let vals = lines.iter().skip(i + 1)
+        line.strip_suffix(" is a value type.")
+            .map(|prefix| prefix.trim())
+            .and_then(|name| lines.iter().skip(i + 1)
                 .map(|s| s.trim())
                 .find(|s| !s.is_empty())
                 .filter(|s| s.starts_with("The possible values of"))
-                .and_then(parse_enum);
-            if let Some(vals) = vals {
-                ir.enum_values.insert(name.to_string(), vals);
-            }
-        }
+                .and_then(parse_enum)
+                .map(|vals| (name.to_string(), vals)))
+            .into_iter()
+            .for_each(|(name, vals)| { ir.enum_values.insert(name, vals); });
     });
 
     // Pass 2a: collect fact types and instance facts
@@ -808,11 +805,9 @@ fn parse_into(ir: &mut Domain, input: &str) -> Result<(), String> {
             !is_pass2b
         })
         .for_each(|(i, line)| {
-            if let Some(action) = try_fact_type(line, &noun_names) {
-                apply_action(ir, Some(action), &lines, i);
-            } else if let Some(action) = try_instance_fact(line) {
-                apply_action(ir, Some(action), &lines, i);
-            }
+            let action = try_fact_type(line, &noun_names)
+                .or_else(|| try_instance_fact(line));
+            apply_action(ir, action, &lines, i);
         });
 
     // Build schema catalog from collected fact types
@@ -855,9 +850,7 @@ fn parse_into(ir: &mut Domain, input: &str) -> Result<(), String> {
         })
         .for_each(|(i, line)| {
             // Totality -> mark abstract (but don't skip -- still parse as constraint)
-            if let Some(action) = try_totality(line) {
-                apply_action(ir, Some(action), &lines, i);
-            }
+            apply_action(ir, try_totality(line), &lines, i);
 
             // Try recognizers in priority order.
             // Ring and subset fire before derivation (both match "If...then...").
@@ -894,19 +887,17 @@ fn parse_into(ir: &mut Domain, input: &str) -> Result<(), String> {
                     let mut uc = resolve_constraint_schema(c.clone(), &noun_names, &catalog, ir);
                     uc.kind = "UC".into();
                     uc.text = uc.text.replace("exactly one", "at most one");
-                    if uc.id.is_empty() { uc.id = uc.text.clone(); }
+                    uc.id.is_empty().then(|| uc.id = uc.text.clone());
                     let mut mc = resolve_constraint_schema(c, &noun_names, &catalog, ir);
                     mc.kind = "MC".into();
                     mc.text = mc.text.replace("exactly one", "some");
-                    if mc.id.is_empty() { mc.id = mc.text.clone(); }
+                    mc.id.is_empty().then(|| mc.id = mc.text.clone());
                     ir.constraints.push(uc);
                     ir.constraints.push(mc);
                 }
                 ParseAction::AddConstraint(c) => {
                     let mut resolved = resolve_constraint_schema(c, &noun_names, &catalog, ir);
-                    if resolved.id.is_empty() {
-                        resolved.id = resolved.text.clone();
-                    }
+                    resolved.id.is_empty().then(|| resolved.id = resolved.text.clone());
                     ir.constraints.push(resolved);
                 }
                 ParseAction::AddDerivation(mut r) => {
@@ -944,16 +935,14 @@ fn parse_into(ir: &mut Domain, input: &str) -> Result<(), String> {
         .collect();
     ir.constraints.iter_mut()
         .filter(|cdef| cdef.kind == "SS")
+        .filter(|cdef| autofill_role_sets.iter().any(|role_set| {
+            role_set.iter().all(|n| cdef.text.contains(n.as_str()))
+        }))
         .for_each(|cdef| {
-            let matches = autofill_role_sets.iter().any(|role_set| {
-                role_set.iter().all(|n| cdef.text.contains(n.as_str()))
-            });
-            if matches {
-                // Set autofill on the first span (subset span)
-                if let Some(span) = cdef.spans.first_mut() {
-                    span.subset_autofill = Some(true);
-                }
-            }
+            // Set autofill on the first span (subset span)
+            cdef.spans.first_mut()
+                .into_iter()
+                .for_each(|span| span.subset_autofill = Some(true));
         });
 
     Ok(())
@@ -1035,26 +1024,25 @@ fn resolve_derivation_rule(rule: &mut DerivationRuleDef, ir: &Domain, catalog: &
     // Classify: if join keys exist AND at least 2 distinct antecedent fact types share
     // a noun, this is a Join derivation. Rules with "that X" anaphora where X appears
     // in multiple antecedents need an equi-join on X.
-    if !rule.join_on.is_empty() && rule.antecedent_fact_type_ids.len() >= 2 {
-        // Check that join keys actually appear in multiple antecedent fact types
-        let shared_across_fts = rule.join_on.iter().any(|key| {
+    let is_join = !rule.join_on.is_empty()
+        && rule.antecedent_fact_type_ids.len() >= 2
+        && rule.join_on.iter().any(|key| {
             rule.antecedent_fact_type_ids.iter()
                 .filter(|ft_id| ir.fact_types.get(*ft_id)
                     .map_or(false, |ft| ft.roles.iter().any(|r| r.noun_name == *key)))
                 .count() >= 2
         });
-        if shared_across_fts {
-            rule.kind = DerivationKind::Join;
-            // Build match_on: pairs of (noun_a, noun_b) for equality matching
-            rule.match_on = rule.join_on.iter()
-                .map(|key| (key.clone(), key.clone()))
-                .collect();
-            // Consequent bindings: nouns from the consequent fact type
-            if let Some(ft) = ir.fact_types.get(&rule.consequent_fact_type_id) {
-                rule.consequent_bindings = ft.roles.iter().map(|r| r.noun_name.clone()).collect();
-            }
-        }
-    }
+    is_join.then(|| {
+        rule.kind = DerivationKind::Join;
+        // Build match_on: pairs of (noun_a, noun_b) for equality matching
+        rule.match_on = rule.join_on.iter()
+            .map(|key| (key.clone(), key.clone()))
+            .collect();
+        // Consequent bindings: nouns from the consequent fact type
+        rule.consequent_bindings = ir.fact_types.get(&rule.consequent_fact_type_id)
+            .map(|ft| ft.roles.iter().map(|r| r.noun_name.clone()).collect())
+            .unwrap_or_default();
+    });
 
     // Set rule ID from consequent
     rule.id = rule.consequent_fact_type_id.clone();
@@ -1071,27 +1059,23 @@ fn apply_action(ir: &mut Domain, action: Option<ParseAction>, lines: &[String], 
             // will be caught by the validate pipeline during compile.
             let entry = ir.nouns.entry(name.clone()).or_insert_with(|| def.clone());
             // Explicit redeclaration overwrites (conflict detected in platform_compile)
-            if entry.object_type != def.object_type && def.object_type != "abstract" {
-                *entry = def.clone();
-            }
+            (entry.object_type != def.object_type && def.object_type != "abstract")
+                .then(|| *entry = def.clone());
             // Merge: subtype/abstract declarations update existing nouns
-            if def.object_type == "abstract" { entry.object_type = "abstract".into(); }
+            (def.object_type == "abstract")
+                .then(|| entry.object_type = "abstract".into());
             // Populate IR maps from metadata
-            if let Some(st) = meta.super_type {
-                ir.subtypes.insert(name.clone(), st);
-            }
-            if let Some(rs) = meta.ref_scheme {
-                ir.ref_schemes.entry(name.clone()).or_insert(rs);
-            }
-            if let Some(obj) = meta.objectifies {
-                ir.objectifications.insert(name, obj);
-            }
+            meta.super_type.into_iter().for_each(|st| { ir.subtypes.insert(name.clone(), st); });
+            meta.ref_scheme.into_iter().for_each(|rs| { ir.ref_schemes.entry(name.clone()).or_insert(rs); });
+            meta.objectifies.into_iter().for_each(|obj| { ir.objectifications.insert(name.clone(), obj); });
         }
         ParseAction::MarkAbstract(name) => {
-            if let Some(noun) = ir.nouns.get_mut(&name) { noun.object_type = "abstract".into(); }
+            ir.nouns.get_mut(&name).into_iter()
+                .for_each(|noun| noun.object_type = "abstract".into());
         }
         ParseAction::AddPartition(sup, subs) => {
-            if let Some(noun) = ir.nouns.get_mut(&sup) { noun.object_type = "abstract".into(); }
+            ir.nouns.get_mut(&sup).into_iter()
+                .for_each(|noun| noun.object_type = "abstract".into());
             subs.into_iter().for_each(|sub| {
                 ir.nouns.entry(sub.clone()).or_insert(NounDef {
                     object_type: "entity".into(),
@@ -1238,16 +1222,16 @@ fn resolve_constraint_schema(
     }
     let found = find_nouns(&stripped, noun_names);
 
-    if found.len() >= 2 {
+    let resolved_schema = (found.len() >= 2).then(|| {
         let role_nouns: Vec<&str> = found.iter().map(|(_, _, n)| n.as_str()).collect();
         // Extract verb between first two nouns
         let verb_text = stripped[found[0].1..found[1].0].trim();
-        let verb = if verb_text.is_empty() { None } else { Some(verb_text) };
+        let verb = (!verb_text.is_empty()).then_some(verb_text);
 
         // Primary: rho-lookup through catalog (exact verb, then reading containment, then unique)
         // Secondary: verb containment against ir.fact_types readings (handles inverse voice
         // when multiple schemas share the same noun pair)
-        if let Some(schema_id) = catalog.resolve(&role_nouns, verb)
+        catalog.resolve(&role_nouns, verb)
             .or_else(|| catalog.resolve(&role_nouns, None))
             .or_else(|| {
                 // Inverse voice fallback: find schema where constraint verb appears in reading
@@ -1275,31 +1259,30 @@ fn resolve_constraint_schema(
                     })
                     .map(|(id, _)| id.clone())
             })
-        {
-            // Update spans to reference the resolved schema ID.
-            // The constrained role is determined by the quantifier position
-            // in the verbalization pattern. "Each A R at most one B" constrains
-            // A's role (the quantified noun). "It is forbidden that A R B"
-            // constrains A's role (the first noun after the prefix).
-            // Per Halpin TechReport ORM2-02: the constrained role is the one
-            // under the quantifier.
-            let resolved_ft = ir.fact_types.get(&schema_id);
-            constraint.spans.iter_mut().for_each(|span| {
-                span.fact_type_id = schema_id.clone();
-                // Set role_index to the first noun's position in the fact type.
-                // The first noun in the constraint text is the quantified noun
-                // ("Each A", "the same A", "A" after deontic prefix).
-                if found.len() >= 2 {
-                    if let Some(ft) = resolved_ft {
-                        let first_noun = &found[0].2;
-                        if let Some(idx) = ft.roles.iter().position(|r| &r.noun_name == first_noun) {
-                            span.role_index = idx;
-                        }
-                    }
-                }
+    }).flatten();
+
+    resolved_schema.into_iter().for_each(|schema_id| {
+        // Update spans to reference the resolved schema ID.
+        // The constrained role is determined by the quantifier position
+        // in the verbalization pattern. "Each A R at most one B" constrains
+        // A's role (the quantified noun). "It is forbidden that A R B"
+        // constrains A's role (the first noun after the prefix).
+        // Per Halpin TechReport ORM2-02: the constrained role is the one
+        // under the quantifier.
+        let resolved_ft = ir.fact_types.get(&schema_id);
+        let first_noun_idx = resolved_ft
+            .and_then(|ft| {
+                let first_noun = &found[0].2;
+                ft.roles.iter().position(|r| &r.noun_name == first_noun)
             });
-        }
-    }
+        constraint.spans.iter_mut().for_each(|span| {
+            span.fact_type_id = schema_id.clone();
+            // Set role_index to the first noun's position in the fact type.
+            // The first noun in the constraint text is the quantified noun
+            // ("Each A", "the same A", "A" after deontic prefix).
+            first_noun_idx.into_iter().for_each(|idx| span.role_index = idx);
+        });
+    });
     constraint
 }
 
@@ -1493,7 +1476,7 @@ fn parse_general_instance_fact(ir: &mut Domain, line: &str) {
         }),
     };
 
-    if let Some(f) = fact { ir.general_instance_facts.push(f); }
+    fact.into_iter().for_each(|f| ir.general_instance_facts.push(f));
 }
 
 /// Resolve the field name for an instance fact by looking up the declared fact type.
@@ -1569,10 +1552,10 @@ fn to_camel_case(s: &str) -> String {
     };
     words.fold(first, |mut acc, word| {
         let mut chars = word.chars();
-        if let Some(first_ch) = chars.next() {
+        chars.next().into_iter().for_each(|first_ch| {
             acc.push(first_ch.to_uppercase().next().unwrap_or(first_ch));
-            acc.extend(chars);
-        }
+        });
+        acc.extend(chars);
         acc
     })
 }

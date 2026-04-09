@@ -241,11 +241,11 @@ fn instances_of_noun_func(noun_name: &str) -> Func {
 /// Returns the concatenation of all facts from all matching fact types.
 /// Concat . [extract_ft1, extract_ft2, ...] : ctx -> <all facts>
 fn extract_facts_multi(ft_ids: &[String]) -> Func {
-    if ft_ids.len() == 1 {
-        return extract_facts_func(&ft_ids[0]);
-    }
     let extractors: Vec<Func> = ft_ids.iter().map(|id| extract_facts_func(id)).collect();
-    Func::compose(Func::Concat, Func::construction(extractors))
+    match extractors.len() {
+        1 => extractors.into_iter().next().unwrap(),
+        _ => Func::compose(Func::Concat, Func::construction(extractors)),
+    }
 }
 
 /// Build a violation Object from constants and a detail Func.
@@ -300,7 +300,7 @@ fn collect_enum_values(ir: &Domain, spans: &[SpanDef]) -> Vec<(String, Vec<Strin
             .filter(|vals| !vals.is_empty())
             .map(|vals| (role.noun_name.clone(), vals.clone())))
         .fold((HashSet::new(), Vec::new()), |(mut seen, mut result), (name, vals)| {
-            if seen.insert(name.clone()) { result.push((name, vals)); }
+            seen.insert(name.clone()).then(|| result.push((name, vals)));
             (seen, result)
         }).1
 }
@@ -321,15 +321,16 @@ fn derive_state_machines_from_facts(facts: &[GeneralInstanceFact]) -> HashMap<St
         });
 
     // Pass 2: fold initial statuses (Status 'S' is initial in SM Definition 'X')
-    facts.iter()
+    // α(fact → (sm_key, status)) : filtered_facts → for_each(insert_if_absent)
+    let status_inserts: Vec<(String, String)> = facts.iter()
         .filter(|f| f.subject_noun == "Status" && f.object_noun == "State Machine Definition")
-        .for_each(|f| {
-            if let Some(sm) = machines.get_mut(&f.object_value) {
-                if !sm.statuses.contains(&f.subject_value) {
-                    sm.statuses.insert(0, f.subject_value.clone());
-                }
-            }
-        });
+        .map(|f| (f.object_value.clone(), f.subject_value.clone()))
+        .collect();
+    status_inserts.into_iter().for_each(|(sm_key, status)| {
+        machines.get_mut(&sm_key).into_iter()
+            .filter(|sm| !sm.statuses.contains(&status))
+            .for_each(|sm| sm.statuses.insert(0, status.clone()));
+    });
 
     // Pass 3: fold transition facts into lookup maps
     let (t_from, t_to, t_sm, t_event) = facts.iter()
@@ -340,8 +341,12 @@ fn derive_state_machines_from_facts(facts: &[GeneralInstanceFact]) -> HashMap<St
                 match f.object_noun.as_str() {
                     "Status" => {
                         let field_lower = f.field_name.to_lowercase();
-                        if field_lower.contains("from") { from.insert(f.subject_value.clone(), f.object_value.clone()); }
-                        else if field_lower.contains("to") { to.insert(f.subject_value.clone(), f.object_value.clone()); }
+                        // Mutually exclusive: "from" takes priority, "to" only if no "from"
+                        match (field_lower.contains("from"), field_lower.contains("to")) {
+                            (true, _) => { from.insert(f.subject_value.clone(), f.object_value.clone()); }
+                            (false, true) => { to.insert(f.subject_value.clone(), f.object_value.clone()); }
+                            _ => {}
+                        }
                     }
                     "State Machine Definition" => { sm.insert(f.subject_value.clone(), f.object_value.clone()); }
                     "Event Type" => { event.insert(f.subject_value.clone(), f.object_value.clone()); }
@@ -367,11 +372,11 @@ fn derive_state_machines_from_facts(facts: &[GeneralInstanceFact]) -> HashMap<St
         .collect::<Vec<_>>()
         .into_iter()
         .for_each(|(key, from, to, event)| {
-            if let Some(sm) = machines.get_mut(&key) {
-                if !sm.statuses.contains(&from) { sm.statuses.push(from.clone()); }
-                if !sm.statuses.contains(&to) { sm.statuses.push(to.clone()); }
-                sm.transitions.push(TransitionDef { from, to, event, guard: None });
-            }
+            machines.get_mut(&key).into_iter().for_each(|sm| {
+                (!sm.statuses.contains(&from)).then(|| sm.statuses.push(from.clone()));
+                (!sm.statuses.contains(&to)).then(|| sm.statuses.push(to.clone()));
+                sm.transitions.push(TransitionDef { from: from.clone(), to: to.clone(), event: event.clone(), guard: None });
+            });
         });
 
     machines
@@ -1156,13 +1161,6 @@ fn compile_join_derivation(ir: &Domain, rule: &DerivationRuleDef) -> CompiledDer
 
     let n = antecedent_ids.len();
 
-    if n == 0 {
-        return CompiledDerivation {
-            id, text, kind,
-            func: Func::constant(Object::phi()),
-        };
-    }
-
     // Helper: access path to the i-th fact in a depth-k nested pair structure.
     // R_1 = f0, R_2 = <f0, f1>, R_3 = <<f0, f1>, f2>, ...
     // R_k = <R_{k-1}, f_{k-1}>
@@ -1186,20 +1184,28 @@ fn compile_join_derivation(ir: &Domain, rule: &DerivationRuleDef) -> CompiledDer
         .map(|ft_id| extract_facts_from_pop(ft_id))
         .collect();
 
-    if n == 1 {
-        // Single antecedent: no join, just derive from each fact.
-        let binding_parts: Vec<Func> = consequent_binding_names.iter()
-            .filter_map(|noun| find_role(0, noun).map(|ri| Func::compose(Func::Selector(ri + 1), Func::Id)))
-            .collect();
-        let derived = Func::construction(vec![
-            Func::constant(Object::atom(&consequent_id)),
-            Func::constant(Object::atom(&consequent_reading)),
-            if binding_parts.is_empty() { Func::Id } else { Func::construction(binding_parts) },
-        ]);
-        let func = Func::apply_to_all(derived);
-        // Compose with extractor (from pop)
-        let func = Func::compose(func, fact_extractors.into_iter().next().unwrap());
-        return CompiledDerivation { id, text, kind, func };
+    // Dispatch on antecedent count: 0 → phi, 1 → α(derive), ≥2 → iterative join
+    match n {
+        0 => return CompiledDerivation {
+            id, text, kind,
+            func: Func::constant(Object::phi()),
+        },
+        1 => {
+            // Single antecedent: no join, just derive from each fact.
+            let binding_parts: Vec<Func> = consequent_binding_names.iter()
+                .filter_map(|noun| find_role(0, noun).map(|ri| Func::compose(Func::Selector(ri + 1), Func::Id)))
+                .collect();
+            let derived = Func::construction(vec![
+                Func::constant(Object::atom(&consequent_id)),
+                Func::constant(Object::atom(&consequent_reading)),
+                if binding_parts.is_empty() { Func::Id } else { Func::construction(binding_parts) },
+            ]);
+            return CompiledDerivation {
+                id, text, kind,
+                func: Func::compose(Func::apply_to_all(derived), fact_extractors.into_iter().next().unwrap()),
+            };
+        },
+        _ => {},
     }
 
     // N >= 2: iterative pairwise join.
@@ -2325,7 +2331,8 @@ fn compile_uniqueness_ast(_ir: &Domain, def: &ConstraintDef) -> Func {
     // Pure Func UC: single fact type, any number of spans.
     // Scope = first span's role (the "Each" side). Uniqueness on scope means
     // for each scope value, at most one distinct tuple across the other roles.
-    if span_groups.len() == 1 {
+    match span_groups.len() {
+        1 => {
         let spans_in_group = &span_groups[0].1;
         let facts = extract_facts_func(&span_groups[0].0);
         let scope_idx = spans_in_group[0].role_index;
@@ -2381,6 +2388,8 @@ fn compile_uniqueness_ast(_ir: &Domain, def: &ConstraintDef) -> Func {
             ),
             violating,
         );
+        },
+        _ => {},
     }
 
     // Multi-span UC: pure Func per group, then Concat.
@@ -2863,8 +2872,9 @@ fn compile_set_comparison_ast(
 /// For join-path subsets, checks that every tuple in fact type A
 /// also exists in fact type B, matching by common noun names.
 fn compile_subset_ast(ir: &Domain, def: &ConstraintDef) -> Func {
-    if def.spans.len() < 2 {
-        return Func::constant(Object::phi());
+    match def.spans.len() {
+        0 | 1 => return Func::constant(Object::phi()),
+        _ => {},
     }
 
     let a_ft_id = def.spans[0].fact_type_id.clone();
@@ -2942,8 +2952,9 @@ fn compile_subset_ast(ir: &Domain, def: &ConstraintDef) -> Func {
 /// EQ: Equality constraint -- pop(rs1) = pop(rs2) (bidirectional subset).
 /// Uses tuple-based comparison same as compile_subset_ast.
 fn compile_equality_ast(ir: &Domain, def: &ConstraintDef) -> Func {
-    if def.spans.len() < 2 {
-        return Func::constant(Object::phi());
+    match def.spans.len() {
+        0 | 1 => return Func::constant(Object::phi()),
+        _ => {},
     }
 
     // EQ = SS(A,B) union SS(B,A). Build both subset checks.
@@ -2961,8 +2972,9 @@ fn compile_equality_ast(ir: &Domain, def: &ConstraintDef) -> Func {
         b_roles.iter().find(|(_, bn)| bn == n).map(|(bi, _)| (*ai, *bi))
     }).collect();
 
-    if common.is_empty() {
-        return Func::constant(Object::phi());
+    match common.is_empty() {
+        true => return Func::constant(Object::phi()),
+        false => {},
     }
 
     // Build match predicate for <left_fact, right_candidate>
@@ -3143,9 +3155,8 @@ fn compile_obligatory_ast(ir: &Domain, def: &ConstraintDef) -> Func {
     // Build checks for each noun's obligatory values.
     // For each (noun, values): filter values contained in response.
     // If filter result is empty (NullTest), violation.
-    let mut checks: Vec<Func> = Vec::new();
-
-    for (noun_name, enum_vals) in &obligatory_values {
+    // α(noun_values → condition) : obligatory_values
+    let noun_checks: Vec<Func> = obligatory_values.iter().map(|(noun_name, enum_vals)| {
         let val_atoms: Vec<Object> = enum_vals.iter().map(|v| Object::atom(v)).collect();
         let vals_const = Func::constant(Object::Seq(val_atoms));
 
@@ -3170,15 +3181,16 @@ fn compile_obligatory_ast(ir: &Domain, def: &ConstraintDef) -> Func {
         ]);
         let viol = make_violation_func(&def.id, &def.text, detail);
 
-        checks.push(Func::condition(
+        Func::condition(
             found_any,
             Func::constant(Object::phi()),
             Func::construction(vec![Func::compose(viol, Func::constant(Object::phi()))]),
-        ));
-    }
+        )
+    }).collect();
 
     // Sender identity check: NullTest . Selector(2)
-    if checks_sender {
+    // Use .then() to conditionally produce a check — pure Backus cond without side effects.
+    let sender_check: Option<Func> = checks_sender.then(|| {
         let sender_detail = Func::construction(vec![
             Func::constant(Object::atom("Response missing obligatory SenderIdentity")),
         ]);
@@ -3193,12 +3205,14 @@ fn compile_obligatory_ast(ir: &Domain, def: &ConstraintDef) -> Func {
             Func::compose(Func::NullTest, Func::Selector(2)),
         ]));
 
-        checks.push(Func::condition(
+        Func::condition(
             sender_empty,
             Func::construction(vec![Func::compose(sender_viol, Func::constant(Object::phi()))]),
             Func::constant(Object::phi()),
-        ));
-    }
+        )
+    });
+
+    let checks: Vec<Func> = noun_checks.into_iter().chain(sender_check).collect();
 
     let core = match checks.len() {
         0 => Func::constant(Object::phi()),
@@ -3228,7 +3242,9 @@ fn extract_constraint_keywords(text: &str) -> Vec<String> {
         .flat_map(|clean| {
             // PascalCase split via fold: accumulate chars, emit on uppercase boundary
             let (parts, last) = clean.chars().fold((Vec::new(), String::new()), |(mut parts, mut cur), ch| {
-                if ch.is_uppercase() && !cur.is_empty() { parts.push(cur); cur = String::new(); }
+                // At uppercase boundary (with non-empty accumulator), flush cur into parts
+                (ch.is_uppercase() && !cur.is_empty())
+                    .then(|| parts.push(std::mem::take(&mut cur)));
                 cur.push(ch);
                 (parts, cur)
             });
@@ -3802,16 +3818,17 @@ mod schema_tests {
         assert_eq!(role0_fts.len(), 2, "Customer plays role 0 in 2 schemas");
 
         // Verify we can map fields to schemas via role_names[1]
-        for (ft_id, role_idx) in customer_fts {
-            if *role_idx != 0 { continue; }
-            let schema = model.schemas.get(ft_id).unwrap();
-            assert_eq!(schema.role_names[0], "Customer");
-            // role_names[1] should be "name" or "plan"
-            assert!(
-                schema.role_names[1] == "name" || schema.role_names[1] == "plan",
-                "unexpected role_names[1]: {}", schema.role_names[1]
-            );
-        }
+        customer_fts.iter()
+            .filter(|(_, role_idx)| *role_idx == 0)
+            .for_each(|(ft_id, _)| {
+                let schema = model.schemas.get(ft_id).unwrap();
+                assert_eq!(schema.role_names[0], "Customer");
+                // role_names[1] should be "name" or "plan"
+                assert!(
+                    schema.role_names[1] == "name" || schema.role_names[1] == "plan",
+                    "unexpected role_names[1]: {}", schema.role_names[1]
+                );
+            });
     }
 
     #[test]
