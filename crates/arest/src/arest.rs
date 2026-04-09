@@ -359,18 +359,19 @@ fn transition_via_defs(
         None => (String::new(), None),
     };
 
-    if let Some(ref status) = new_status {
-        // Update SM status fact in state
-        let status_key = "StateMachine_has_currentlyInStatus";
-        // Remove old status fact for this entity, add new one
-        new_state = ast::cell_filter(status_key, |f| {
-            !ast::binding_matches(f, "State Machine", entity_id)
-        }, &new_state);
-        new_state = ast::cell_push(status_key, ast::fact_from_pairs(&[
-            ("State Machine", entity_id),
-            ("currentlyInStatus", status.as_str()),
-        ]), &new_state);
-    }
+    // Update SM status fact in state: remove old, add new (identity when no new_status)
+    let status_key = "StateMachine_has_currentlyInStatus";
+    new_state = new_status.as_ref()
+        .map(|status| {
+            let filtered = ast::cell_filter(status_key, |f| {
+                !ast::binding_matches(f, "State Machine", entity_id)
+            }, &new_state);
+            ast::cell_push(status_key, ast::fact_from_pairs(&[
+                ("State Machine", entity_id),
+                ("currentlyInStatus", status.as_str()),
+            ]), &filtered)
+        })
+        .unwrap_or(new_state);
 
     let status = new_status.or_else(|| current_status.map(|s| s.to_string()));
 
