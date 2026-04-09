@@ -191,53 +191,41 @@ mod db {
     pub fn load_state(conn: &Connection, tables: &[crate::rmap::TableDef]) -> ast::Object {
         let mut state = ast::Object::phi();
 
-        // Read facts from domain tables.
-        for table in tables {
+        // foldl(read_table, state, tables) — each table's rows fold into state
+        let state = tables.iter().fold(state, |acc, table| {
             let col_names: Vec<&str> = table.columns.iter().map(|c| c.name.as_str()).collect();
             let quoted_cols: Vec<String> = col_names.iter().map(|c| format!("\"{}\"", c)).collect();
             let sql = format!("SELECT {} FROM \"{}\"", quoted_cols.join(", "), table.name);
-            let mut stmt = match conn.prepare(&sql) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
+            let mut stmt = match conn.prepare(&sql) { Ok(s) => s, Err(_) => return acc };
             let col_count = col_names.len();
             let rows = stmt.query_map([], |row| {
                 Ok((0..col_count).filter_map(|i|
                     row.get::<_, String>(i).ok().map(|v| (col_names[i].to_string(), v))
                 ).collect::<Vec<_>>())
             }).unwrap_or_else(|e| { eprintln!("Failed to read {}: {}", table.name, e); std::process::exit(1); });
+            rows.filter_map(|r| r.ok()).filter(|pairs| !pairs.is_empty())
+                .fold(acc, |s, pairs| {
+                    let refs: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+                    ast::cell_push(&table.name, ast::fact_from_pairs(&refs), &s)
+                })
+        });
 
-            for row in rows {
-                let pairs = row.unwrap_or_else(|e| { eprintln!("Failed to read row from {}: {}", table.name, e); std::process::exit(1); });
-                if pairs.is_empty() { continue; }
-                let refs: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-                state = ast::cell_push(&table.name, ast::fact_from_pairs(&refs), &state);
-            }
-        }
-
-        // Read overflow facts from cells table.
+        // foldl(read_cell, state, overflow_rows)
         let mut stmt = match conn.prepare("SELECT name, contents FROM cells WHERE name LIKE 'fact:%'") {
-            Ok(s) => s,
-            Err(_) => return state,
+            Ok(s) => s, Err(_) => return state,
         };
         let rows = stmt.query_map([], |row| {
-            let name: String = row.get(0)?;
-            let contents: String = row.get(1)?;
-            Ok((name, contents))
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         }).unwrap_or_else(|e| { eprintln!("Failed to read cells: {}", e); std::process::exit(1); });
-        for row in rows {
-            let (name, contents) = row.unwrap_or_else(|e| { eprintln!("Failed to read cell row: {}", e); std::process::exit(1); });
+        rows.filter_map(|r| r.ok()).fold(state, |acc, (name, contents)| {
             let parts: Vec<&str> = name.splitn(3, ':').collect();
-            if parts.len() >= 2 {
-                let ft_id = parts[1];
-                if let Ok(bindings) = serde_json::from_str::<Vec<(String, String)>>(&contents) {
+            (parts.len() >= 2).then(|| parts[1]).and_then(|ft_id|
+                serde_json::from_str::<Vec<(String, String)>>(&contents).ok().map(|bindings| {
                     let refs: Vec<(&str, &str)> = bindings.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-                    state = ast::cell_push(ft_id, ast::fact_from_pairs(&refs), &state);
-                }
-            }
-        }
-
-        state
+                    ast::cell_push(ft_id, ast::fact_from_pairs(&refs), &acc)
+                })
+            ).unwrap_or(acc)
+        })
     }
 
     pub fn store_table_meta(conn: &Connection, tables: &[crate::rmap::TableDef]) {
@@ -321,31 +309,24 @@ fn cmd_bootstrap(args: &[String]) {
     let mut readings: Vec<(String, String)> = Vec::new();
     let mut app_md: Option<(String, String)> = None;
 
-    for dir in &rest {
+    let (readings, app_md) = rest.iter().flat_map(|dir| {
         let dir_path = std::path::Path::new(dir);
-        if !dir_path.is_dir() {
-            eprintln!("Not a directory: {}", dir);
-            std::process::exit(1);
-        }
+        if !dir_path.is_dir() { eprintln!("Not a directory: {}", dir); std::process::exit(1); }
         let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(dir_path)
             .unwrap_or_else(|e| { eprintln!("Failed to read directory {}: {}", dir, e); std::process::exit(1); })
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("md"))
-            .collect();
+            .filter_map(|e| e.ok()).map(|e| e.path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("md")).collect();
         entries.sort();
-
-        for path in entries {
+        entries.into_iter().map(|path| {
             let name = path.file_name().unwrap().to_string_lossy().to_string();
             let text = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| { eprintln!("Failed to read {}: {}", path.display(), e); std::process::exit(1); });
-            if name == "app.md" {
-                app_md = Some((name, text));
-            } else {
-                readings.push((name, text));
-            }
-        }
-    }
+            (name, text)
+        }).collect::<Vec<_>>()
+    }).fold((Vec::new(), None::<(String, String)>), |(mut readings, mut app), (name, text)| {
+        if name == "app.md" { app = Some((name, text)); } else { readings.push((name, text)); }
+        (readings, app)
+    });
 
     // app.md first (for domain ordering), then the rest alphabetically.
     let mut ordered: Vec<(String, String)> = Vec::new();
@@ -360,14 +341,12 @@ fn cmd_bootstrap(args: &[String]) {
     }
 
     // Parse readings -- same merge strategy as parse_and_compile_impl in lib.rs.
-    let mut merged = Domain::default();
-    for (name, text) in &ordered {
+    let merged = ordered.iter().fold(Domain::default(), |mut merged, (name, text)| {
         let ir = if merged.nouns.is_empty() {
             parse_forml2::parse_markdown(text)
         } else {
             parse_forml2::parse_markdown_with_nouns(text, &merged.nouns)
         }.unwrap_or_else(|e| { eprintln!("{}: {}", name, e); std::process::exit(1); });
-
         merged.nouns.extend(ir.nouns);
         merged.fact_types.extend(ir.fact_types);
         merged.constraints.extend(ir.constraints);
@@ -380,7 +359,8 @@ fn cmd_bootstrap(args: &[String]) {
         merged.objectifications.extend(ir.objectifications);
         merged.named_spans.extend(ir.named_spans);
         merged.autofill_spans.extend(ir.autofill_spans);
-    }
+        merged
+    });
 
     // Convert to Object state and compile.
     let state = parse_forml2::domain_to_state(&merged);
