@@ -1029,17 +1029,11 @@ fn build_noun_index(
 fn compile_derivations(ir: &Domain) -> Vec<CompiledDerivation> {
     let mut derivations = Vec::new();
 
-    // Compile explicit derivation rules from IR
-    for rule in &ir.derivation_rules {
-        let compiled = match rule.kind {
-            DerivationKind::SubtypeInheritance => compile_explicit_derivation(ir, rule),
-            DerivationKind::ModusPonens => compile_explicit_derivation(ir, rule),
-            DerivationKind::Transitivity => compile_explicit_derivation(ir, rule),
-            DerivationKind::ClosedWorldNegation => compile_explicit_derivation(ir, rule),
-            DerivationKind::Join => compile_join_derivation(ir, rule),
-        };
-        derivations.push(compiled);
-    }
+    // α(rule → compiled) : derivation_rules
+    derivations.extend(ir.derivation_rules.iter().map(|rule| match rule.kind {
+        DerivationKind::Join => compile_join_derivation(ir, rule),
+        _ => compile_explicit_derivation(ir, rule),
+    }));
 
     // Implicit: subtype inheritance from noun definitions
     derivations.extend(compile_subtype_inheritance(ir));
@@ -1192,12 +1186,9 @@ fn compile_join_derivation(ir: &Domain, rule: &DerivationRuleDef) -> CompiledDer
 
     if n == 1 {
         // Single antecedent: no join, just derive from each fact.
-        let mut binding_parts: Vec<Func> = Vec::new();
-        for noun in &consequent_binding_names {
-            if let Some(ri) = find_role(0, noun) {
-                binding_parts.push(Func::compose(Func::Selector(ri + 1), Func::Id));
-            }
-        }
+        let binding_parts: Vec<Func> = consequent_binding_names.iter()
+            .filter_map(|noun| find_role(0, noun).map(|ri| Func::compose(Func::Selector(ri + 1), Func::Id)))
+            .collect();
         let derived = Func::construction(vec![
             Func::constant(Object::atom(&consequent_id)),
             Func::constant(Object::atom(&consequent_reading)),
@@ -1218,130 +1209,67 @@ fn compile_join_derivation(ir: &Domain, rule: &DerivationRuleDef) -> CompiledDer
     let ft0 = fact_extractors[0].clone();
 
     // For each subsequent FT, build the join step.
-    let mut current = ft0; // current sequence of joined tuples
-    for j in 1..n {
-        let _depth = j + 1; // after joining j+1 FTs
+    // foldl(join_step, ft0, [1..n]) — iterative pairwise join
+    let current = (1..n).fold(ft0, |current, j| {
         let ft_j = fact_extractors[j].clone();
 
-        // Build join condition for this step.
-        // For each join key, find the first previous FT that has it and compare
-        // with FT_j's role. The pair is <accumulated, fj>.
-        let mut join_conds: Vec<Func> = Vec::new();
-
-        for key in &join_keys {
-            // Find FT_j's role for this key
-            let j_role = match find_role(j, key) {
-                Some(ri) => ri,
-                None => continue, // FT_j doesn't have this noun
-            };
-            // Find first previous FT (0..j) that has this key
-            let ref_ft = (0..j).find(|&fi| find_role(fi, key).is_some());
-            let ref_ft = match ref_ft {
-                Some(fi) => fi,
-                None => continue, // No previous FT has this noun
-            };
-            let ref_role = find_role(ref_ft, key).unwrap();
-
-            // <accumulated, fj>: accumulated has depth j, fj is Sel(2)
-            // ref_fact is accessed via access_fact(ref_ft, j) inside accumulated (Sel(1))
-            let ref_val = Func::compose(
-                role_value(ref_role),
-                Func::compose(access_fact(ref_ft, j), Func::Selector(1)),
-            );
+        // α(key → eq_condition) : join_keys — build join predicates
+        let mut join_conds: Vec<Func> = join_keys.iter().filter_map(|key| {
+            let j_role = find_role(j, key)?;
+            let ref_ft = (0..j).find(|&fi| find_role(fi, key).is_some())?;
+            let ref_role = find_role(ref_ft, key)?;
+            let ref_val = Func::compose(role_value(ref_role),
+                Func::compose(access_fact(ref_ft, j), Func::Selector(1)));
             let new_val = Func::compose(role_value(j_role), Func::Selector(2));
+            Some(Func::compose(Func::Eq, Func::construction(vec![ref_val, new_val])))
+        }).collect();
 
-            join_conds.push(Func::compose(Func::Eq, Func::construction(vec![ref_val, new_val])));
-        }
-
-        // match_on predicates: contains checks
-        for (left_noun, right_noun) in &match_pairs {
-            // Find which FTs (0..=j) have left_noun and right_noun
-            let left_ft = (0..=j).find(|&fi| find_role(fi, left_noun).is_some());
-            let right_ft = (0..=j).find(|&fi| find_role(fi, right_noun).is_some());
-
-            let (left_ft, right_ft) = match (left_ft, right_ft) {
-                (Some(l), Some(r)) => (l, r),
-                _ => continue,
-            };
-
-            // Only add this condition if FT_j is involved
-            if left_ft != j && right_ft != j { continue; }
-
-            let left_role = find_role(left_ft, left_noun).unwrap();
-            let right_role = find_role(right_ft, right_noun).unwrap();
-
-            let left_val = if left_ft == j {
-                Func::compose(role_value(left_role), Func::Selector(2))
+        // α(match_pair → contains_condition) : match_pairs
+        join_conds.extend(match_pairs.iter().filter_map(|(left_noun, right_noun)| {
+            let left_ft = (0..=j).find(|&fi| find_role(fi, left_noun).is_some())?;
+            let right_ft = (0..=j).find(|&fi| find_role(fi, right_noun).is_some())?;
+            if left_ft != j && right_ft != j { return None; }
+            let left_role = find_role(left_ft, left_noun)?;
+            let right_role = find_role(right_ft, right_noun)?;
+            let val = |ft: usize, ri: usize| if ft == j {
+                Func::compose(role_value(ri), Func::Selector(2))
             } else {
-                Func::compose(
-                    role_value(left_role),
-                    Func::compose(access_fact(left_ft, j), Func::Selector(1)),
-                )
+                Func::compose(role_value(ri), Func::compose(access_fact(ft, j), Func::Selector(1)))
             };
-            let right_val = if right_ft == j {
-                Func::compose(role_value(right_role), Func::Selector(2))
-            } else {
-                Func::compose(
-                    role_value(right_role),
-                    Func::compose(access_fact(right_ft, j), Func::Selector(1)),
-                )
-            };
-
-            join_conds.push(Func::compose(Func::Contains, Func::construction(vec![left_val, right_val])));
-        }
+            Some(Func::compose(Func::Contains, Func::construction(vec![val(left_ft, left_role), val(right_ft, right_role)])))
+        }));
 
         let join_pred = match join_conds.len() {
-            0 => Func::constant(Object::t()), // cross product (no conditions)
+            0 => Func::constant(Object::t()),
             1 => join_conds.into_iter().next().unwrap(),
-            _ => join_conds.into_iter().reduce(|a, b| {
-                Func::compose(Func::And, Func::construction(vec![a, b]))
-            }).unwrap(),
+            _ => join_conds.into_iter().reduce(|a, b|
+                Func::compose(Func::And, Func::construction(vec![a, b]))).unwrap(),
         };
 
-        // Pipeline: Filter(join_pred) . Concat . alpha(DistL) . DistR . [current, ft_j]
-        current = Func::compose(
-            Func::filter(join_pred),
-            Func::compose(
-                Func::Concat,
-                Func::compose(
-                    Func::apply_to_all(Func::DistL),
-                    Func::compose(Func::DistR, Func::construction(vec![current, ft_j])),
-                ),
-            ),
-        );
-    }
+        // Pipeline: Filter(join_pred) . Concat . α(DistL) . DistR . [current, ft_j]
+        Func::compose(Func::filter(join_pred), Func::compose(Func::Concat,
+            Func::compose(Func::apply_to_all(Func::DistL),
+                Func::compose(Func::DistR, Func::construction(vec![current, ft_j])))))
+    });
 
     // Build the consequent fact from the final joined structure (depth n).
     // For each consequent binding noun, find which FT has it and extract the value.
-    let mut binding_parts: Vec<Func> = Vec::new();
     let binding_nouns: Vec<String> = if consequent_binding_names.is_empty() {
-        // Include all unique nouns from all antecedents
-        let mut all_nouns = Vec::new();
-        for roles in &antecedent_roles {
-            for (noun, _) in roles {
-                if !all_nouns.contains(noun) {
-                    all_nouns.push(noun.clone());
-                }
-            }
-        }
-        all_nouns
+        // α(roles → nouns) : antecedents — deduplicated
+        antecedent_roles.iter()
+            .flat_map(|roles| roles.iter().map(|(noun, _)| noun.clone()))
+            .fold(Vec::new(), |mut acc, noun| { if !acc.contains(&noun) { acc.push(noun); } acc })
     } else {
         consequent_binding_names
     };
 
-    for noun in &binding_nouns {
-        // Find first FT that has this noun
-        let ft_idx = (0..n).find(|&fi| find_role(fi, noun).is_some());
-        if let Some(fi) = ft_idx {
-            let ri = find_role(fi, noun).unwrap();
-            // Extract from the nested structure: role_value(ri) . access_fact(fi, n)
-            let extractor = Func::compose(role_value(ri), access_fact(fi, n));
-            binding_parts.push(Func::construction(vec![
-                Func::constant(Object::atom(noun)),
-                extractor,
-            ]));
-        }
-    }
+    // α(noun → extractor) : binding_nouns
+    let binding_parts: Vec<Func> = binding_nouns.iter().filter_map(|noun| {
+        let fi = (0..n).find(|&fi| find_role(fi, noun).is_some())?;
+        let ri = find_role(fi, noun)?;
+        let extractor = Func::compose(role_value(ri), access_fact(fi, n));
+        Some(Func::construction(vec![Func::constant(Object::atom(noun)), extractor]))
+    }).collect();
 
     let derived_fact = Func::construction(vec![
         Func::constant(Object::atom(&consequent_id)),
