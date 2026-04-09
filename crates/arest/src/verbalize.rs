@@ -21,60 +21,53 @@ pub fn verbalize_constraint(constraint: &ConstraintDef, ir: &Domain) -> String {
     };
 
     // Resolve fact type reading and role nouns from spans
-    let (reading, role_nouns) = if let Some(span) = constraint.spans.first() {
+    let span_info = constraint.spans.first().map(|span| {
         let ft = ir.fact_types.get(&span.fact_type_id);
         let reading = ft.map(|f| f.reading.as_str()).unwrap_or(&span.fact_type_id);
         let nouns: Vec<&str> = ft.map(|f| f.roles.iter().map(|r| r.noun_name.as_str()).collect())
             .unwrap_or_default();
         (reading.to_string(), nouns)
-    } else {
-        return constraint.text.clone(); // fallback to original text
-    };
+    });
 
-    let (noun_a, noun_b) = if role_nouns.len() >= 2 {
-        (role_nouns[0], role_nouns[1])
-    } else if role_nouns.len() == 1 {
-        (role_nouns[0], "")
-    } else {
-        return format!("{}{}", modal, constraint.text);
-    };
+    // Derive (noun_a, noun_b, reading) via expression combinators; None cases fall through to defaults.
+    let resolved: Option<(String, &str, &str)> = span_info.as_ref().and_then(|(reading, nouns)| {
+        match nouns.len() {
+            0 => None,
+            1 => Some((reading.clone(), nouns[0], "")),
+            _ => Some((reading.clone(), nouns[0], nouns[1])),
+        }
+    });
 
-    // Extract predicate from reading: text between first and second noun
-    let predicate = extract_predicate(&reading, noun_a, noun_b);
-
-    match constraint.kind.as_str() {
-        "UC" => {
-            if constraint.modality == "deontic" && constraint.deontic_operator.as_deref() == Some("forbidden") {
-                format!("It is forbidden that the same {} {} more than one {}.", noun_a, predicate, noun_b)
-            } else {
-                format!("{}Each {} {} at most one {}.", modal, noun_a, predicate, noun_b)
+    match resolved {
+        None if span_info.is_none() => constraint.text.clone(),
+        None => format!("{}{}", modal, constraint.text),
+        Some((reading, noun_a, noun_b)) => {
+            let predicate = extract_predicate(&reading, noun_a, noun_b);
+            match constraint.kind.as_str() {
+                "UC" => {
+                    if constraint.modality == "deontic" && constraint.deontic_operator.as_deref() == Some("forbidden") {
+                        format!("It is forbidden that the same {} {} more than one {}.", noun_a, predicate, noun_b)
+                    } else {
+                        format!("{}Each {} {} at most one {}.", modal, noun_a, predicate, noun_b)
+                    }
+                }
+                "MC" => format!("{}Each {} {} some {}.", modal, noun_a, predicate, noun_b),
+                "FC" => {
+                    let min = constraint.min_occurrence.map(|n| n.to_string()).unwrap_or_default();
+                    let max = constraint.max_occurrence.map(|n| n.to_string()).unwrap_or_default();
+                    if !min.is_empty() && !max.is_empty() {
+                        format!("{}Each {} {} at least {} and at most {} {}.", modal, noun_a, predicate, min, max, noun_b)
+                    } else if !min.is_empty() {
+                        format!("{}Each {} {} at least {} {}.", modal, noun_a, predicate, min, noun_b)
+                    } else {
+                        format!("{}Each {} {} at most {} {}.", modal, noun_a, predicate, max, noun_b)
+                    }
+                }
+                "forbidden" => format!("It is forbidden that {}.", constraint.text.trim_end_matches('.')),
+                "obligatory" => format!("It is obligatory that {}.", constraint.text.trim_end_matches('.')),
+                "permitted" => format!("It is permitted that {}.", constraint.text.trim_end_matches('.')),
+                _ => format!("{}{}", modal, constraint.text),
             }
-        }
-        "MC" => {
-            format!("{}Each {} {} some {}.", modal, noun_a, predicate, noun_b)
-        }
-        "FC" => {
-            let min = constraint.min_occurrence.map(|n| n.to_string()).unwrap_or_default();
-            let max = constraint.max_occurrence.map(|n| n.to_string()).unwrap_or_default();
-            if !min.is_empty() && !max.is_empty() {
-                format!("{}Each {} {} at least {} and at most {} {}.", modal, noun_a, predicate, min, max, noun_b)
-            } else if !min.is_empty() {
-                format!("{}Each {} {} at least {} {}.", modal, noun_a, predicate, min, noun_b)
-            } else {
-                format!("{}Each {} {} at most {} {}.", modal, noun_a, predicate, max, noun_b)
-            }
-        }
-        "forbidden" => {
-            format!("It is forbidden that {}.", constraint.text.trim_end_matches('.'))
-        }
-        "obligatory" => {
-            format!("It is obligatory that {}.", constraint.text.trim_end_matches('.'))
-        }
-        "permitted" => {
-            format!("It is permitted that {}.", constraint.text.trim_end_matches('.'))
-        }
-        _ => {
-            format!("{}{}", modal, constraint.text)
         }
     }
 }
@@ -90,12 +83,12 @@ pub fn verbalize_noun(name: &str, def: &NounDef, ir: &Domain) -> String {
             }
         }
         "value" => {
-            let mut s = format!("{} is a value type.", name);
-            if let Some(values) = ir.enum_values.get(name) {
+            let base = format!("{} is a value type.", name);
+            let enum_suffix = ir.enum_values.get(name).map(|values| {
                 let quoted: Vec<String> = values.iter().map(|v| format!("'{}'", v)).collect();
-                s.push_str(&format!("\n  The possible values of {} are {}.", name, quoted.join(", ")));
-            }
-            s
+                format!("\n  The possible values of {} are {}.", name, quoted.join(", "))
+            }).unwrap_or_default();
+            format!("{}{}", base, enum_suffix)
         }
         _ => format!("{} is an entity type.", name),
     }
@@ -111,80 +104,76 @@ pub fn verbalize_fact_type(ft: &FactTypeDef) -> String {
     format!("{}.", ft.reading)
 }
 
+/// Build a titled section: header lines + body lines + trailing blank, or empty if body is empty.
+fn ir_section(title: Option<&str>, body: Vec<String>) -> Vec<String> {
+    body.is_empty().then(Vec::new).unwrap_or_else(|| {
+        let header: Vec<String> = title
+            .map(|t| vec![format!("## {}", t), String::new()])
+            .unwrap_or_default();
+        header.into_iter()
+            .chain(body.into_iter())
+            .chain(std::iter::once(String::new()))
+            .collect()
+    })
+}
+
 /// Verbalize an entire IR back to a FORML 2 document.
 pub fn verbalize_ir(ir: &Domain) -> String {
-    let mut lines: Vec<String> = Vec::new();
-
-    // Domain header
-    if !ir.domain.is_empty() {
-        lines.push(format!("# {}", ir.domain));
-        lines.push(String::new());
-    }
+    // Domain header as an optional pair of lines.
+    let header: Vec<String> = (!ir.domain.is_empty())
+        .then(|| vec![format!("# {}", ir.domain), String::new()])
+        .unwrap_or_default();
 
     // Entity types (non-subtypes)
-    let entities: Vec<(&String, &NounDef)> = ir.nouns.iter()
+    let entities: Vec<String> = ir.nouns.iter()
         .filter(|(name, d)| d.object_type == "entity" && !ir.subtypes.contains_key(*name))
+        .map(|(name, def)| verbalize_noun(name, def, ir))
         .collect();
-    if !entities.is_empty() {
-        lines.extend(["## Entity Types".to_string(), String::new()]);
-        lines.extend(entities.iter().map(|(name, def)| verbalize_noun(name, def, ir)));
-        lines.push(String::new());
-    }
 
-    // Subtypes
+    // Subtypes (no header section)
     let subtype_lines: Vec<String> = ir.subtypes.keys()
         .filter_map(|name| verbalize_subtype(name, ir)).collect();
-    if !subtype_lines.is_empty() {
-        lines.extend(subtype_lines);
-        lines.push(String::new());
-    }
 
     // Value types
-    let values: Vec<(&String, &NounDef)> = ir.nouns.iter()
-        .filter(|(_, d)| d.object_type == "value").collect();
-    if !values.is_empty() {
-        lines.extend(["## Value Types".to_string(), String::new()]);
-        lines.extend(values.iter().map(|(name, def)| verbalize_noun(name, def, ir)));
-        lines.push(String::new());
-    }
+    let values: Vec<String> = ir.nouns.iter()
+        .filter(|(_, d)| d.object_type == "value")
+        .map(|(name, def)| verbalize_noun(name, def, ir))
+        .collect();
 
     // Fact types
-    if !ir.fact_types.is_empty() {
-        lines.extend(["## Fact Types".to_string(), String::new()]);
-        lines.extend(ir.fact_types.values().map(verbalize_fact_type));
-        lines.push(String::new());
-    }
+    let fact_types: Vec<String> = ir.fact_types.values().map(verbalize_fact_type).collect();
 
-    // Constraints
-    let alethic: Vec<&ConstraintDef> = ir.constraints.iter()
-        .filter(|c| c.modality != "deontic").collect();
-    if !alethic.is_empty() {
-        lines.extend(["## Constraints".to_string(), String::new()]);
-        lines.extend(alethic.iter().map(|c| verbalize_constraint(c, ir)));
-        lines.push(String::new());
-    }
+    // Constraints (alethic)
+    let alethic: Vec<String> = ir.constraints.iter()
+        .filter(|c| c.modality != "deontic")
+        .map(|c| verbalize_constraint(c, ir))
+        .collect();
 
     // Deontic constraints
-    let deontic: Vec<&ConstraintDef> = ir.constraints.iter()
-        .filter(|c| c.modality == "deontic").collect();
-    if !deontic.is_empty() {
-        lines.extend(["## Deontic Constraints".to_string(), String::new()]);
-        lines.extend(deontic.iter().map(|c| verbalize_constraint(c, ir)));
-        lines.push(String::new());
-    }
+    let deontic: Vec<String> = ir.constraints.iter()
+        .filter(|c| c.modality == "deontic")
+        .map(|c| verbalize_constraint(c, ir))
+        .collect();
+
+    let lines: Vec<String> = header.into_iter()
+        .chain(ir_section(Some("Entity Types"), entities))
+        .chain(ir_section(None, subtype_lines))
+        .chain(ir_section(Some("Value Types"), values))
+        .chain(ir_section(Some("Fact Types"), fact_types))
+        .chain(ir_section(Some("Constraints"), alethic))
+        .chain(ir_section(Some("Deontic Constraints"), deontic))
+        .collect();
 
     lines.join("\n")
 }
 
 fn extract_predicate(reading: &str, noun_a: &str, noun_b: &str) -> String {
-    if let Some(start) = reading.find(noun_a) {
-        let after_a = start + noun_a.len();
-        if let Some(b_pos) = reading[after_a..].find(noun_b) {
-            return reading[after_a..after_a + b_pos].trim().to_string();
-        }
-    }
-    // Fallback: return everything after first noun
-    reading.split_whitespace().skip(1).collect::<Vec<_>>().join(" ")
+    reading.find(noun_a)
+        .map(|start| start + noun_a.len())
+        .and_then(|after_a| reading[after_a..].find(noun_b).map(|b_pos| (after_a, b_pos)))
+        .map(|(after_a, b_pos)| reading[after_a..after_a + b_pos].trim().to_string())
+        // Fallback: return everything after first noun
+        .unwrap_or_else(|| reading.split_whitespace().skip(1).collect::<Vec<_>>().join(" "))
 }
 
 // -- Tests -----------------------------------------------------------

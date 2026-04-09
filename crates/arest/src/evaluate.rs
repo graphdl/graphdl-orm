@@ -82,7 +82,7 @@ pub fn forward_chain_defs_state(
                     && !all_derived.iter().any(|d| same_fact(d, fact))
             })
             .fold(Vec::new(), |mut acc, fact| {
-                if !acc.iter().any(|d| same_fact(d, &fact)) { acc.push(fact); }
+                (!acc.iter().any(|d| same_fact(d, &fact))).then(|| acc.push(fact));
                 acc
             })
     }
@@ -319,15 +319,11 @@ fn format_fact(reading: &str, bindings: &[(String, String)]) -> String {
 /// Check if a goal string matches a formatted fact
 #[allow(dead_code)] // called by prove_goal()
 fn fact_text_matches(goal: &str, fact_text: &str, reading: &str) -> bool {
-    // Exact match
-    if goal == fact_text || goal == reading {
-        return true;
-    }
-    // Goal without quotes matches reading
     let goal_lower = goal.to_lowercase();
     let fact_lower = fact_text.to_lowercase();
     let reading_lower = reading.to_lowercase();
-    goal_lower == fact_lower || goal_lower == reading_lower
+    goal == fact_text || goal == reading
+        || goal_lower == fact_lower || goal_lower == reading_lower
         || fact_lower.contains(&goal_lower)
         || goal_lower.contains(&reading_lower)
 }
