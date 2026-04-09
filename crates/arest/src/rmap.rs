@@ -50,21 +50,16 @@ pub struct TableDef {
 // -- Helpers ----------------------------------------------------------
 
 pub fn to_snake(name: &str) -> String {
-    let mut result = String::new();
-    for (i, ch) in name.chars().enumerate() {
-        if ch.is_uppercase() && i > 0 {
-            let prev = name.chars().nth(i - 1).unwrap_or(' ');
-            if prev.is_lowercase() {
-                result.push('_');
-            }
+    name.chars().enumerate().fold(String::new(), |mut acc, (i, ch)| {
+        if ch.is_uppercase() && i > 0 && name.chars().nth(i - 1).map_or(false, |p| p.is_lowercase()) {
+            acc.push('_');
         }
-        if ch == ' ' || ch == '-' {
-            result.push('_');
-        } else {
-            result.push(ch.to_lowercase().next().unwrap_or(ch));
+        match ch {
+            ' ' | '-' => acc.push('_'),
+            _ => acc.push(ch.to_lowercase().next().unwrap_or(ch)),
         }
-    }
-    result
+        acc
+    })
 }
 
 fn fk_column_name(noun_name: &str) -> String {
@@ -114,19 +109,12 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
         if unary_fts.len() < 2 { continue }
 
         let entity_name = &unary_fts[0].roles[0].noun_name;
-        let mut values = Vec::new();
-        for ft in &unary_fts {
-            let reading = &ft.reading;
-            if let Some(caps) = reading.split(" is ").last() {
-                values.push(caps.trim_end_matches('.').to_string());
-            } else {
-                let words: Vec<&str> = reading.split_whitespace().collect();
-                values.push(words.last().unwrap_or(&"").to_string());
-            }
-        }
-        for id in &ft_ids {
-            binarized_ft_ids.insert(id.to_string());
-        }
+        let values: Vec<String> = unary_fts.iter().map(|ft| {
+            ft.reading.split(" is ").last()
+                .map(|s| s.trim_end_matches('.').to_string())
+                .unwrap_or_else(|| ft.reading.split_whitespace().last().unwrap_or("").to_string())
+        }).collect();
+        binarized_ft_ids.extend(ft_ids.iter().map(|id| id.to_string()));
 
         let is_mandatory = unary_fts.iter().any(|ft| {
             let ft_id_str = ft_ids.iter().find(|id| ir.fact_types.get(**id).map(|f| std::ptr::eq(f, *ft)).unwrap_or(false));
