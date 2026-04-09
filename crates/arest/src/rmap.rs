@@ -298,12 +298,9 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
 
     // -- Step 3: 1:1 absorption (with direction bias) ------------------
     // Count fact type participation per noun for "larger table" heuristic
-    let mut noun_ft_count: HashMap<&str, usize> = HashMap::new();
-    for ft in ir.fact_types.values() {
-        for role in &ft.roles {
-            *noun_ft_count.entry(&role.noun_name).or_insert(0) += 1;
-        }
-    }
+    let noun_ft_count: HashMap<&str, usize> = ir.fact_types.values()
+        .flat_map(|ft| ft.roles.iter().map(|r| r.noun_name.as_str()))
+        .fold(HashMap::new(), |mut acc, name| { *acc.entry(name).or_insert(0) += 1; acc });
 
     for ft_id in &one_to_one_ft_ids {
         let ft = &ir.fact_types[ft_id];
@@ -476,30 +473,26 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
     }
 
     // -- Step 4: Independent entity -> single-column table ------------
-    let mut referenced: HashSet<String> = HashSet::new();
-    for t in &tables {
-        for col in &t.columns {
-            if let Some(ref r) = col.references {
-                referenced.insert(r.clone());
-            }
-        }
-    }
-    for ref_table in &referenced {
-        if emitted.contains(ref_table) { continue }
-        let noun = ir.nouns.iter().find(|(name, def)| to_snake(name) == *ref_table && def.object_type == "entity");
-        if noun.is_none() { continue }
-        let noun_entry = noun.unwrap();
-        // Skip non-partitioned subtypes (they are absorbed into supertype)
-        if subtype_names.contains(&noun_entry.0) && !partitioned_subtypes.contains(noun_entry.0) { continue }
-        tables.push(TableDef {
-            name: ref_table.clone(),
-            columns: vec![TableColumn { name: "id".to_string(), col_type: "TEXT".to_string(), nullable: false, references: None }],
-            primary_key: vec!["id".to_string()],
-            checks: None,
-            unique_constraints: None,
+    let referenced: HashSet<String> = tables.iter()
+        .flat_map(|t| t.columns.iter().filter_map(|col| col.references.clone()))
+        .collect();
+    referenced.iter()
+        .filter(|ref_table| !emitted.contains(*ref_table))
+        .filter_map(|ref_table| {
+            let (name, _) = ir.nouns.iter().find(|(name, def)| to_snake(name) == *ref_table && def.object_type == "entity")?;
+            if subtype_names.contains(name) && !partitioned_subtypes.contains(name) { return None; }
+            Some(ref_table.clone())
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .for_each(|ref_table| {
+            tables.push(TableDef {
+                name: ref_table.clone(),
+                columns: vec![TableColumn { name: "id".to_string(), col_type: "TEXT".to_string(), nullable: false, references: None }],
+                primary_key: vec!["id".to_string()], checks: None, unique_constraints: None,
+            });
+            emitted.insert(ref_table);
         });
-        emitted.insert(ref_table.clone());
-    }
 
     tables
 }
