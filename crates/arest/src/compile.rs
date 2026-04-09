@@ -2954,13 +2954,12 @@ fn compile_subset_ast(ir: &Domain, def: &ConstraintDef) -> Func {
 
     // detail: <a_fact, b_facts> -> violation description sequence
     // Include each common noun name and its value from a_fact.
-    let mut detail_parts: Vec<Func> = vec![
-        Func::constant(Object::atom("Subset violation:")),
-    ];
-    for &(ai, _) in &common {
-        detail_parts.push(Func::constant(Object::atom(&a_nouns[ai])));
-        detail_parts.push(Func::compose(role_value(ai), Func::Selector(1)));
-    }
+    let mut detail_parts: Vec<Func> = std::iter::once(Func::constant(Object::atom("Subset violation:")))
+        .chain(common.iter().flat_map(|&(ai, _)| [
+            Func::constant(Object::atom(&a_nouns[ai])),
+            Func::compose(role_value(ai), Func::Selector(1)),
+        ]))
+        .collect();
     detail_parts.push(Func::constant(Object::atom("participates in")));
     detail_parts.push(Func::constant(Object::atom(&a_ft_id)));
     detail_parts.push(Func::constant(Object::atom("but not in")));
@@ -3024,15 +3023,14 @@ fn compile_equality_ast(ir: &Domain, def: &ConstraintDef) -> Func {
     // A not in B
     let match_ab = build_match(&common, false);
     let not_in_b = Func::compose(Func::NullTest, Func::compose(Func::filter(match_ab), Func::DistL));
-    let mut detail_ab: Vec<Func> = vec![Func::constant(Object::atom("Equality violation:"))];
-    for &(ai, _) in &common {
-        detail_ab.push(Func::constant(Object::atom(&a_roles[ai].1)));
-        detail_ab.push(Func::compose(role_value(ai), Func::Selector(1)));
-    }
-    detail_ab.push(Func::constant(Object::atom("in")));
-    detail_ab.push(Func::constant(Object::atom(&a_ft_id)));
-    detail_ab.push(Func::constant(Object::atom("but not in")));
-    detail_ab.push(Func::constant(Object::atom(&b_ft_id)));
+    let detail_ab: Vec<Func> = std::iter::once(Func::constant(Object::atom("Equality violation:")))
+        .chain(common.iter().flat_map(|&(ai, _)| [
+            Func::constant(Object::atom(&a_roles[ai].1)),
+            Func::compose(role_value(ai), Func::Selector(1)),
+        ]))
+        .chain([Func::constant(Object::atom("in")), Func::constant(Object::atom(&a_ft_id)),
+                Func::constant(Object::atom("but not in")), Func::constant(Object::atom(&b_ft_id))])
+        .collect();
     let viol_ab = make_violation_func(&def.id, &def.text, Func::construction(detail_ab));
     let check_ab = Func::compose(
         Func::apply_to_all(viol_ab),
@@ -3042,15 +3040,14 @@ fn compile_equality_ast(ir: &Domain, def: &ConstraintDef) -> Func {
     // B not in A
     let match_ba = build_match(&common, true);
     let not_in_a = Func::compose(Func::NullTest, Func::compose(Func::filter(match_ba), Func::DistL));
-    let mut detail_ba: Vec<Func> = vec![Func::constant(Object::atom("Equality violation:"))];
-    for &(_, bi) in &common {
-        detail_ba.push(Func::constant(Object::atom(&b_roles[bi].1)));
-        detail_ba.push(Func::compose(role_value(bi), Func::Selector(1)));
-    }
-    detail_ba.push(Func::constant(Object::atom("in")));
-    detail_ba.push(Func::constant(Object::atom(&b_ft_id)));
-    detail_ba.push(Func::constant(Object::atom("but not in")));
-    detail_ba.push(Func::constant(Object::atom(&a_ft_id)));
+    let detail_ba: Vec<Func> = std::iter::once(Func::constant(Object::atom("Equality violation:")))
+        .chain(common.iter().flat_map(|&(_, bi)| [
+            Func::constant(Object::atom(&b_roles[bi].1)),
+            Func::compose(role_value(bi), Func::Selector(1)),
+        ]))
+        .chain([Func::constant(Object::atom("in")), Func::constant(Object::atom(&b_ft_id)),
+                Func::constant(Object::atom("but not in")), Func::constant(Object::atom(&a_ft_id))])
+        .collect();
     let viol_ba = make_violation_func(&def.id, &def.text, Func::construction(detail_ba));
     let check_ba = Func::compose(
         Func::apply_to_all(viol_ba),
@@ -3263,25 +3260,22 @@ fn extract_constraint_keywords(text: &str) -> Vec<String> {
         .replace("It is obligatory that ", "")
         .replace("It is permitted that ", "");
 
-    let mut keywords = Vec::new();
-    for word in stripped.split_whitespace() {
-        let clean = word.trim_matches(|c: char| !c.is_alphanumeric());
-        if clean.is_empty() { continue; }
-        // Split PascalCase: AutomotiveData -> automotive, data
-        let mut current = String::new();
-        for ch in clean.chars() {
-            if ch.is_uppercase() && !current.is_empty() {
-                let lower = current.to_lowercase();
-                if lower.len() > 2 { keywords.push(lower); }
-                current.clear();
-            }
-            current.push(ch);
-        }
-        if !current.is_empty() {
-            let lower = current.to_lowercase();
-            if lower.len() > 2 { keywords.push(lower); }
-        }
-    }
+    // α(word → pascal_split → filter(len>2)) : words
+    let mut keywords: Vec<String> = stripped.split_whitespace()
+        .map(|word| word.trim_matches(|c: char| !c.is_alphanumeric()))
+        .filter(|clean| !clean.is_empty())
+        .flat_map(|clean| {
+            // PascalCase split via fold: accumulate chars, emit on uppercase boundary
+            let (parts, last) = clean.chars().fold((Vec::new(), String::new()), |(mut parts, mut cur), ch| {
+                if ch.is_uppercase() && !cur.is_empty() { parts.push(cur); cur = String::new(); }
+                cur.push(ch);
+                (parts, cur)
+            });
+            parts.into_iter().chain(std::iter::once(last))
+                .map(|s| s.to_lowercase())
+                .filter(|s| s.len() > 2)
+        })
+        .collect();
 
     // Deduplicate
     keywords.sort();
