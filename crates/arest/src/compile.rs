@@ -1518,35 +1518,22 @@ fn compile_transitivity(ir: &Domain) -> Vec<CompiledDerivation> {
 ///   Concat . a(Condition(NullTest . Filter(match) . DistL, [negation], phi)) . DistR . [instances, ft_facts]
 ///   where match checks role_value(ri)(fact) = instance on each <instance, fact> pair.
 fn compile_cwa_negation(ir: &Domain) -> Vec<CompiledDerivation> {
-    let mut derivations = Vec::new();
-
-    for (noun_name, noun_def) in &ir.nouns {
-        if noun_def.world_assumption != WorldAssumption::Closed {
-            continue;
-        }
-
-        // Find all fact types where this CWA noun plays a role
-        let relevant_fts: Vec<(String, String, usize)> = ir.fact_types.iter()
-            .flat_map(|(ft_id, ft)| {
-                ft.roles.iter()
+    ir.nouns.iter()
+        .filter(|(_, def)| def.world_assumption == WorldAssumption::Closed)
+        .filter_map(|(noun_name, _)| {
+            let relevant_fts: Vec<(String, String, usize)> = ir.fact_types.iter()
+                .flat_map(|(ft_id, ft)| ft.roles.iter()
                     .filter(|r| r.noun_name == *noun_name)
-                    .map(move |r| (ft_id.clone(), ft.reading.clone(), r.role_index))
-            })
-            .collect();
+                    .map(move |r| (ft_id.clone(), ft.reading.clone(), r.role_index)))
+                .collect();
+            if relevant_fts.is_empty() { return None; }
 
-        if relevant_fts.is_empty() {
-            continue;
-        }
+            let noun = noun_name.clone();
+            let id = format!("_cwa_negation_{}", noun);
+            let text = format!("CWA: absent facts about {} are false", noun);
+            let instances = instances_of_noun_func(&noun);
 
-        let noun = noun_name.clone();
-        let id = format!("_cwa_negation_{}", noun);
-        let text = format!("CWA: absent facts about {} are false", noun);
-
-        // Build per-ft derivation funcs, then Concat results across all fts.
-        let instances = instances_of_noun_func(&noun);
-
-        let mut per_ft_funcs: Vec<Func> = Vec::new();
-        for (ft_id, reading, role_idx) in &relevant_fts {
+            let per_ft_funcs: Vec<Func> = relevant_fts.iter().map(|(ft_id, reading, role_idx)| {
             let ft_facts = extract_facts_from_pop(ft_id);
 
             // Match condition for <instance, fact> pair from DistL:
@@ -1596,26 +1583,15 @@ fn compile_cwa_negation(ir: &Domain) -> Vec<CompiledDerivation> {
                     Func::compose(Func::DistR, Func::construction(vec![instances.clone(), ft_facts])),
                 ),
             );
-            per_ft_funcs.push(per_ft);
-        }
+            per_ft
+        }).collect();
 
-        // Combine all per-ft results: run each on pop, concat results.
-        let func = if per_ft_funcs.len() == 1 {
-            per_ft_funcs.pop().unwrap()
-        } else {
-            // [ft1_func, ft2_func, ...] gives <results1, results2, ...>
-            // Concat flattens into single sequence of derived facts
-            Func::compose(Func::Concat, Func::construction(per_ft_funcs))
-        };
-        derivations.push(CompiledDerivation {
-            id,
-            text,
-            kind: DerivationKind::ClosedWorldNegation,
-            func,
-        });
-    }
-
-    derivations
+            let func = match per_ft_funcs.len() {
+                1 => per_ft_funcs.into_iter().next().unwrap(),
+                _ => Func::compose(Func::Concat, Func::construction(per_ft_funcs)),
+            };
+            Some(CompiledDerivation { id, text, kind: DerivationKind::ClosedWorldNegation, func })
+        }).collect()
 }
 
 /// State machine initialization as a derivation rule.
@@ -1627,9 +1603,7 @@ fn compile_cwa_negation(ir: &Domain) -> Vec<CompiledDerivation> {
 /// exists in the population but no State Machine is for that entity, derive:
 ///   - State Machine instance (instanceOf, forResource, currentlyInStatus = initial)
 fn compile_sm_initialization(ir: &Domain) -> Vec<CompiledDerivation> {
-    let mut derivations = Vec::new();
-
-    for (noun_name, sm_def) in &ir.state_machines {
+    ir.state_machines.iter().map(|(noun_name, sm_def)| {
         let sm_noun = sm_def.noun_name.clone();
         let initial_status = sm_def.statuses.first().cloned().unwrap_or_default();
         let id_str = format!("_sm_init_{}", noun_name);
@@ -1713,15 +1687,8 @@ fn compile_sm_initialization(ir: &Domain) -> Vec<CompiledDerivation> {
 
         let func = Func::compose(Func::Concat, Func::compose(derive_facts, new_instances));
 
-        derivations.push(CompiledDerivation {
-            id: id_str,
-            text: text_str,
-            kind: DerivationKind::SubtypeInheritance,
-            func,
-        });
-    }
-
-    derivations
+        CompiledDerivation { id: id_str, text: text_str, kind: DerivationKind::SubtypeInheritance, func }
+    }).collect()
 }
 
 fn compile_constraint(ir: &Domain, def: &ConstraintDef) -> CompiledConstraint {
