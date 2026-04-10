@@ -1,21 +1,19 @@
-// CLI for the FOL engine -- first-order logic reasoning over GraphDL domain models.
+// AREST CLI — SYSTEM is the only function.
 //
-// Modes (legacy --ir):
-//   evaluate       Check text/response against compiled constraint predicates
-//   synthesize     Collect all knowledge about a noun (fact types, constraints, related nouns)
-//   forward-chain  Derive new facts from a population until fixed point
+// Usage:
+//   arest <readings_dir> [<readings_dir2> ...] [--db <path>]
 //
-// Modes (local SQLite):
-//   bootstrap      Parse readings, compile, store in SQLite
-//   system         Look up a def key and apply to input (includes constraint eval)
-//   synthesize     Collect knowledge about a noun
-//   forward-chain  Derive new facts from population
+// Reads .md files from each directory, feeds them through
+// system(h, 'compile', text), then persists state to SQLite.
+// Subsequent system calls load state from the database.
 //
-// The constraint IR is compiled once at load time. All evaluation is pure
-// function application -- no dispatch, no branching on kind, no mutable state.
-// Implements Backus's FP algebra (1977).
+// Interactive mode (no directories):
+//   arest --db <path> <key> <input>
+//
+// Everything goes through SYSTEM. No separate bootstrap, synthesize,
+// or forward-chain commands. Per AREST paper: SYSTEM:x = ⟨o, D'⟩.
 
-#[allow(dead_code)] // Functions used by WASM lib.rs, not by this binary
+#[allow(dead_code)]
 mod ast;
 #[allow(dead_code)]
 mod types;
@@ -48,10 +46,8 @@ mod crypto;
 #[allow(dead_code)]
 mod generators;
 
-use types::Domain;
-
 // =========================================================================
-// SQLite-backed local runtime (feature = "local")
+// SQLite persistence (feature = "local")
 // =========================================================================
 
 #[cfg(feature = "local")]
@@ -65,249 +61,130 @@ mod db {
             .unwrap_or_else(|e| { eprintln!("Failed to open database {}: {}", path, e); std::process::exit(1); })
     }
 
-    pub fn create_tables(conn: &Connection, sql_defs: &[(String, ast::Func)]) {
+    /// Ensure the cells + defs meta-tables exist.
+    pub fn ensure_meta_tables(conn: &Connection) {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS cells (name TEXT PRIMARY KEY, contents TEXT);
              CREATE TABLE IF NOT EXISTS defs (name TEXT PRIMARY KEY, func TEXT);"
         ).unwrap_or_else(|e| { eprintln!("Failed to create tables: {}", e); std::process::exit(1); });
-        let ddl_errors = sql_defs.iter()
+    }
+
+    /// Execute DDL from sql:sqlite:* defs.
+    pub fn apply_ddl(conn: &Connection, d: &ast::Object) {
+        ast::cells_iter(d).into_iter()
             .filter(|(name, _)| name.starts_with("sql:sqlite:"))
-            .filter_map(|(name, func)| match func {
-                ast::Func::Constant(ref obj) => obj.as_atom().map(|ddl| (name, ddl.to_string())),
-                _ => None,
-            })
-            .fold(0usize, |errors, (name, ddl)| match conn.execute_batch(&ddl) {
-                Err(e) => { eprintln!("Warning: DDL for {} failed: {}", name, e); errors + 1 }
-                Ok(_) => errors,
-            });
-        (ddl_errors > 0).then(|| {
-            eprintln!("{} DDL statements had errors (duplicate columns from RMAP)", ddl_errors);
-        });
-    }
-
-    pub fn store_defs(conn: &Connection, defs: &[(String, ast::Func)]) {
-        let tx = conn.unchecked_transaction()
-            .unwrap_or_else(|e| { eprintln!("Failed to begin transaction: {}", e); std::process::exit(1); });
-        tx.execute("DELETE FROM defs", [])
-            .unwrap_or_else(|e| { eprintln!("Failed to clear defs: {}", e); std::process::exit(1); });
-        {
-            let mut stmt = tx.prepare("INSERT OR REPLACE INTO defs (name, func) VALUES (?1, ?2)")
-                .unwrap_or_else(|e| { eprintln!("Failed to prepare insert: {}", e); std::process::exit(1); });
-            defs.iter().for_each(|(name, func)| {
-                let text = ast::func_to_object(func).to_string();
-                stmt.execute(params![name, text])
-                    .unwrap_or_else(|e| { eprintln!("Failed to insert def {}: {}", name, e); std::process::exit(1); });
-            });
-        }
-        tx.commit()
-            .unwrap_or_else(|e| { eprintln!("Failed to commit defs: {}", e); std::process::exit(1); });
-    }
-
-    pub fn store_facts(conn: &Connection, state: &ast::Object, tables: &[crate::rmap::TableDef]) {
-        let tx = conn.unchecked_transaction()
-            .unwrap_or_else(|e| { eprintln!("Failed to begin transaction: {}", e); std::process::exit(1); });
-
-        let table_by_snake: HashMap<String, &crate::rmap::TableDef> = tables.iter()
-            .map(|table| (table.name.clone(), table)).collect();
-
-        let mut domain_rows: usize = 0;
-        let mut meta_rows: usize = 0;
-
-        // InstanceFacts are domain data.
-        let inst_cell = ast::fetch_or_phi("InstanceFact", state);
-        inst_cell.as_seq().into_iter().flat_map(|instance_facts| {
-            let rows: HashMap<(String, String), Vec<(String, String)>> = instance_facts.iter()
-                .fold(HashMap::new(), |mut acc, inst| {
-                    let get = |key: &str| ast::binding(inst, key).unwrap_or("").to_string();
-                    let key = (crate::rmap::to_snake(&get("subjectNoun")), get("subjectValue"));
-                    acc.entry(key).or_default().push((crate::rmap::to_snake(&get("fieldName")), get("objectValue")));
-                    acc
+            .filter_map(|(_, contents)| contents.as_atom().map(|s| s.to_string()))
+            .for_each(|ddl| {
+                conn.execute_batch(&ddl).unwrap_or_else(|e| {
+                    eprintln!("Warning: DDL failed: {}", e);
                 });
+            });
+    }
 
-            rows.into_iter().filter_map(|((table_name, subject_id), columns)| {
-                let table = table_by_snake.get(table_name.as_str())?;
-                let pk_col = table.primary_key.first().map(|s| s.as_str()).unwrap_or("id");
-                let table_col_names: Vec<&str> = table.columns.iter().map(|c| c.name.as_str()).collect();
-                let (extra_cols, extra_vals): (Vec<_>, Vec<_>) = columns.iter()
-                    .filter(|(col, _)| table_col_names.contains(&col.as_str()) && col != pk_col)
-                    .map(|(col, val)| (col.clone(), val.clone()))
-                    .unzip();
-                let col_list: Vec<String> = std::iter::once(pk_col.to_string()).chain(extra_cols).collect();
-                let val_list: Vec<String> = std::iter::once(subject_id.clone()).chain(extra_vals).collect();
-                Some((table_name, col_list, val_list))
-            }).collect::<Vec<_>>()
-        }).for_each(|(table_name, col_list, val_list)| {
-            let quoted_cols: Vec<String> = col_list.iter().map(|c| format!("\"{}\"", c)).collect();
-            let placeholders: Vec<String> = (1..=col_list.len()).map(|i| format!("?{}", i)).collect();
-            let sql = format!("INSERT OR REPLACE INTO \"{}\" ({}) VALUES ({})",
-                table_name, quoted_cols.join(", "), placeholders.join(", "));
-            let params: Vec<&dyn rusqlite::ToSql> = val_list.iter().map(|v| v as &dyn rusqlite::ToSql).collect();
-            match tx.execute(&sql, params.as_slice()) {
-                Ok(_) => domain_rows += 1,
-                Err(e) => eprintln!("Warning: INSERT into {} failed: {}", table_name, e),
-            }
-        });
+    /// Persist the full state D to SQLite.
+    pub fn persist_state(conn: &Connection, d: &ast::Object) {
+        let tx = conn.unchecked_transaction()
+            .unwrap_or_else(|e| { eprintln!("Transaction failed: {}", e); std::process::exit(1); });
 
-        // All other fact types are metamodel facts. Store in cells.
-        ast::cells_iter(state).into_iter()
-            .filter(|(ft_id, _)| *ft_id != "InstanceFact")
-            .flat_map(|(ft_id, contents)| contents.as_seq()
-                .map(|facts| facts.iter().map(move |fact| (ft_id, fact)).collect::<Vec<_>>())
-                .unwrap_or_default())
-            .for_each(|(ft_id, fact)| {
-                let bindings: Vec<(String, String)> = fact.as_seq().map(|pairs|
-                    pairs.iter().filter_map(|pair| {
-                        let items = pair.as_seq()?;
-                        Some((items.get(0)?.as_atom()?.to_string(), items.get(1)?.as_atom()?.to_string()))
-                    }).collect()
-                ).unwrap_or_default();
-                let bindings_json = serde_json::to_string(&bindings)
-                    .unwrap_or_else(|e| { eprintln!("Failed to serialize bindings: {}", e); std::process::exit(1); });
+        // Store each cell as a JSON blob keyed by cell name.
+        ast::cells_iter(d).into_iter()
+            .filter(|(name, _)| !name.contains(':'))  // skip def cells
+            .for_each(|(name, contents)| {
+                let json = contents.to_string();
                 tx.execute(
                     "INSERT OR REPLACE INTO cells (name, contents) VALUES (?1, ?2)",
-                    params![format!("fact:{}:{}", ft_id, bindings_json), bindings_json],
-                ).unwrap_or_else(|e| { eprintln!("Failed to store fact in cells: {}", e); std::process::exit(1); });
-                meta_rows += 1;
+                    params![name, json],
+                ).unwrap_or_else(|e| { eprintln!("Failed to store cell {}: {}", name, e); std::process::exit(1); });
+            });
+
+        // Store defs.
+        ast::cells_iter(d).into_iter()
+            .filter(|(name, _)| name.contains(':') || ["compile", "apply", "verify_signature", "validate", "debug"].contains(&name))
+            .for_each(|(name, contents)| {
+                let text = contents.to_string();
+                tx.execute(
+                    "INSERT OR REPLACE INTO defs (name, func) VALUES (?1, ?2)",
+                    params![name, text],
+                ).unwrap_or_else(|e| { eprintln!("Failed to store def {}: {}", name, e); std::process::exit(1); });
             });
 
         tx.commit()
-            .unwrap_or_else(|e| { eprintln!("Failed to commit facts: {}", e); std::process::exit(1); });
-        eprintln!("  {} domain rows, {} metamodel rows", domain_rows, meta_rows);
+            .unwrap_or_else(|e| { eprintln!("Commit failed: {}", e); std::process::exit(1); });
     }
 
-    pub fn load_defs(conn: &Connection) -> Vec<(String, ast::Func)> {
-        let mut stmt = conn.prepare("SELECT name, func FROM defs")
-            .unwrap_or_else(|e| { eprintln!("Failed to query defs: {}", e); std::process::exit(1); });
-        let rows = stmt.query_map([], |row| {
-            let name: String = row.get(0)?;
-            let text: String = row.get(1)?;
-            Ok((name, text))
-        }).unwrap_or_else(|e| { eprintln!("Failed to read defs: {}", e); std::process::exit(1); });
-
-        let empty_d = ast::Object::phi();
-        let defs: Vec<(String, ast::Func)> = rows.filter_map(|row| {
-            let (name, text) = row.ok()?;
-            Some((name, ast::metacompose(&ast::Object::parse(&text), &empty_d)))
-        }).collect();
-        defs
-    }
-
-    pub fn load_state(conn: &Connection, tables: &[crate::rmap::TableDef]) -> ast::Object {
+    /// Load state D from SQLite.
+    pub fn load_state(conn: &Connection) -> ast::Object {
         let mut state = ast::Object::phi();
 
-        // foldl(read_table, state, tables) — each table's rows fold into state
-        let state = tables.iter().fold(state, |acc, table| {
-            let col_names: Vec<&str> = table.columns.iter().map(|c| c.name.as_str()).collect();
-            let quoted_cols: Vec<String> = col_names.iter().map(|c| format!("\"{}\"", c)).collect();
-            let sql = format!("SELECT {} FROM \"{}\"", quoted_cols.join(", "), table.name);
-            let mut stmt = match conn.prepare(&sql) { Ok(s) => s, Err(_) => return acc };
-            let col_count = col_names.len();
-            let rows = stmt.query_map([], |row| {
-                Ok((0..col_count).filter_map(|i|
-                    row.get::<_, String>(i).ok().map(|v| (col_names[i].to_string(), v))
-                ).collect::<Vec<_>>())
-            }).unwrap_or_else(|e| { eprintln!("Failed to read {}: {}", table.name, e); std::process::exit(1); });
-            rows.filter_map(|r| r.ok()).filter(|pairs| !pairs.is_empty())
-                .fold(acc, |s, pairs| {
-                    let refs: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-                    ast::cell_push(&table.name, ast::fact_from_pairs(&refs), &s)
-                })
+        // Load cells (population facts).
+        let mut stmt = match conn.prepare("SELECT name, contents FROM cells") {
+            Ok(s) => s,
+            Err(_) => return state,
+        };
+        state = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        }).unwrap_or_else(|e| { eprintln!("Failed to read cells: {}", e); std::process::exit(1); })
+        .filter_map(|r| r.ok())
+        .fold(state, |acc, (name, contents)| {
+            let obj = ast::Object::parse(&contents);
+            ast::store(&name, obj, &acc)
         });
 
-        // foldl(read_cell, state, overflow_rows)
-        let mut stmt = match conn.prepare("SELECT name, contents FROM cells WHERE name LIKE 'fact:%'") {
-            Ok(s) => s, Err(_) => return state,
-        };
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        }).unwrap_or_else(|e| { eprintln!("Failed to read cells: {}", e); std::process::exit(1); });
-        rows.filter_map(|r| r.ok()).fold(state, |acc, (name, contents)| {
-            let parts: Vec<&str> = name.splitn(3, ':').collect();
-            (parts.len() >= 2).then(|| parts[1]).and_then(|ft_id|
-                serde_json::from_str::<Vec<(String, String)>>(&contents).ok().map(|bindings| {
-                    let refs: Vec<(&str, &str)> = bindings.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-                    ast::cell_push(ft_id, ast::fact_from_pairs(&refs), &acc)
-                })
-            ).unwrap_or(acc)
-        })
-    }
-
-    pub fn store_table_meta(conn: &Connection, tables: &[crate::rmap::TableDef]) {
-        let json = serde_json::to_string(tables)
-            .unwrap_or_else(|e| { eprintln!("Failed to serialize table metadata: {}", e); std::process::exit(1); });
-        conn.execute(
-            "INSERT OR REPLACE INTO cells (name, contents) VALUES (?1, ?2)",
-            params!["rmap:tables", json],
-        ).unwrap_or_else(|e| { eprintln!("Failed to store table metadata: {}", e); std::process::exit(1); });
-    }
-
-    pub fn load_table_meta(conn: &Connection) -> Vec<crate::rmap::TableDef> {
-        let mut stmt = match conn.prepare("SELECT contents FROM cells WHERE name = 'rmap:tables'") {
+        // Load defs.
+        let mut stmt = match conn.prepare("SELECT name, func FROM defs") {
             Ok(s) => s,
-            Err(_) => return Vec::new(),
+            Err(_) => return state,
         };
-        let result: Option<String> = stmt.query_row([], |row| row.get(0)).ok();
-        match result {
-            Some(json) => serde_json::from_str(&json).unwrap_or_default(),
-            None => Vec::new(),
-        }
+        state = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        }).unwrap_or_else(|e| { eprintln!("Failed to read defs: {}", e); std::process::exit(1); })
+        .filter_map(|r| r.ok())
+        .fold(state, |acc, (name, contents)| {
+            let obj = ast::Object::parse(&contents);
+            ast::store(&name, obj, &acc)
+        });
+
+        state
     }
 }
 
 // =========================================================================
-// Local CLI (feature = "local") -- subcommand-based interface
+// SYSTEM is the only function
 // =========================================================================
 
-#[cfg(feature = "local")]
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
+/// system(key, input, D) → (output, D')
+/// Pure ρ-dispatch. Same as lib.rs system_impl but operates on an
+/// owned state instead of a global handle registry.
+fn system(key: &str, input: &str, d: &ast::Object) -> (String, ast::Object) {
+    let obj = ast::Object::parse(input);
+    let result = ast::apply(&ast::Func::Def(key.to_string()), &obj, d);
 
-    match args.get(1).map(|s| s.as_str()).unwrap_or("--help") {
-        "--help" | "-h" => { print_local_help(); std::process::exit(0); }
-        "bootstrap" => cmd_bootstrap(&args[2..]),
-        "system" => cmd_system(&args[2..]),
-        "synthesize" => cmd_synthesize(&args[2..]),
-        "forward-chain" => cmd_forward_chain(&args[2..]),
-        other => {
-            eprintln!("Unknown subcommand: {}", other);
-            eprintln!("Run with --help for usage.");
-            std::process::exit(1);
-        }
-    }
+    // State transition: if result contains cells (Noun, GraphSchema, etc.)
+    // it's a new D. Otherwise it's a display-only output.
+    let is_new_d = result.as_seq().is_some()
+        && ast::fetch("Noun", &result) != ast::Object::Bottom;
+
+    let new_d = match is_new_d {
+        true => result.clone(),
+        false => d.clone(),
+    };
+
+    (result.to_string(), new_d)
 }
 
-#[cfg(feature = "local")]
-fn parse_db_flag(args: &[String]) -> (String, Vec<String>) {
-    // foldl over (index, arg) pairs: --db consumes next arg, else push to rest.
-    let (db_path, rest, _skip) = args.iter().enumerate().fold(
-        (String::from("./app.db"), Vec::new(), false),
-        |(db, mut rest, skip), (i, a)| match (skip, a.as_str()) {
-            (true, _) => (a.clone(), rest, false),
-            (false, "--db") => (db, rest, true),
-            (false, _) => { rest.push(args[i].clone()); (db, rest, false) }
-        }
-    );
-    (db_path, rest)
-}
-
-#[cfg(feature = "local")]
-fn cmd_bootstrap(args: &[String]) {
-    let (db_path, rest) = parse_db_flag(args);
-
-    rest.is_empty().then(|| {
-        eprintln!("Usage: fol bootstrap <readings_dir> [<readings_dir2> ...] [--db <path>]");
-        std::process::exit(1);
-    });
-
-    // Collect all .md files from each directory, sorted alphabetically.
-    // If app.md exists in any directory, read it first.
-    let (readings, app_md) = rest.iter().flat_map(|dir| {
+/// Read .md files from directories, sorted alphabetically, app.md first.
+fn read_readings(dirs: &[String]) -> Vec<(String, String)> {
+    let (readings, app_md) = dirs.iter().flat_map(|dir| {
         let dir_path = std::path::Path::new(dir);
-        (!dir_path.is_dir()).then(|| { eprintln!("Not a directory: {}", dir); std::process::exit(1); });
+        (!dir_path.is_dir()).then(|| {
+            eprintln!("Not a directory: {}", dir);
+            std::process::exit(1);
+        });
         let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(dir_path)
-            .unwrap_or_else(|e| { eprintln!("Failed to read directory {}: {}", dir, e); std::process::exit(1); })
+            .unwrap_or_else(|e| { eprintln!("Failed to read {}: {}", dir, e); std::process::exit(1); })
             .filter_map(|e| e.ok()).map(|e| e.path())
-            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("md")).collect();
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("md"))
+            .collect();
         entries.sort();
         entries.into_iter().map(|path| {
             let name = path.file_name().unwrap().to_string_lossy().to_string();
@@ -315,359 +192,149 @@ fn cmd_bootstrap(args: &[String]) {
                 .unwrap_or_else(|e| { eprintln!("Failed to read {}: {}", path.display(), e); std::process::exit(1); });
             (name, text)
         }).collect::<Vec<_>>()
-    }).fold((Vec::new(), None::<(String, String)>), |(mut readings, app), (name, text)| match name.as_str() {
-        "app.md" => (readings, Some((name, text))),
-        _ => { readings.push((name, text)); (readings, app) }
-    });
-
-    // app.md first (for domain ordering), then the rest alphabetically.
-    let ordered: Vec<(String, String)> = app_md.into_iter().chain(readings).collect();
-
-    ordered.is_empty().then(|| {
-        eprintln!("No .md files found in specified directories.");
-        std::process::exit(1);
-    });
-
-    // Parse readings -- same merge strategy as parse_and_compile_impl in lib.rs.
-    let merged = ordered.iter().fold(Domain::default(), |mut merged, (name, text)| {
-        let ir = if merged.nouns.is_empty() {
-            parse_forml2::parse_markdown(text)
-        } else {
-            parse_forml2::parse_markdown_with_nouns(text, &merged.nouns)
-        }.unwrap_or_else(|e| { eprintln!("{}: {}", name, e); std::process::exit(1); });
-        merged.nouns.extend(ir.nouns);
-        merged.fact_types.extend(ir.fact_types);
-        merged.constraints.extend(ir.constraints);
-        merged.state_machines.extend(ir.state_machines);
-        merged.derivation_rules.extend(ir.derivation_rules);
-        merged.general_instance_facts.extend(ir.general_instance_facts);
-        merged.subtypes.extend(ir.subtypes);
-        merged.enum_values.extend(ir.enum_values);
-        merged.ref_schemes.extend(ir.ref_schemes);
-        merged.objectifications.extend(ir.objectifications);
-        merged.named_spans.extend(ir.named_spans);
-        merged.autofill_spans.extend(ir.autofill_spans);
-        merged
-    });
-
-    // Convert to Object state and compile.
-    let state = parse_forml2::domain_to_state(&merged);
-    let defs = compile::compile_to_defs_state(&state);
-    let tables = rmap::rmap(&merged);
-
-    // Count categories.
-    let noun_count = merged.nouns.len();
-    let fact_type_count = merged.fact_types.len();
-    let constraint_count = merged.constraints.len();
-    let derivation_count = merged.derivation_rules.len();
-    let state_machine_count = merged.state_machines.len();
-    let table_count = tables.len();
-
-    // Store in SQLite using generated DDL from sql:{table} defs.
-    let conn = db::open(&db_path);
-    db::create_tables(&conn, &defs);
-    db::store_facts(&conn, &state, &tables);
-    db::store_defs(&conn, &defs);
-    db::store_table_meta(&conn, &tables);
-
-    // Summary.
-    println!("Bootstrapped {} into {}", rest.join(", "), db_path);
-    println!("  {} files parsed", ordered.len());
-    println!("  {} nouns", noun_count);
-    println!("  {} fact types", fact_type_count);
-    println!("  {} constraints", constraint_count);
-    println!("  {} derivation rules", derivation_count);
-    println!("  {} state machines", state_machine_count);
-    println!("  {} tables generated", table_count);
-    println!("  {} defs compiled", defs.len());
-}
-
-#[cfg(feature = "local")]
-fn cmd_system(args: &[String]) {
-    let (db_path, rest) = parse_db_flag(args);
-
-    (rest.len() < 2).then(|| {
-        eprintln!("Usage: fol system <key> <input> [--db <path>]");
-        std::process::exit(1);
-    });
-
-    let key = &rest[0];
-    let input = &rest[1];
-
-    let conn = db::open(&db_path);
-    let defs = db::load_defs(&conn);
-
-    // Backus 14.4.2: D contains FILE (population) + DEFS.
-    let tables = db::load_table_meta(&conn);
-    let state = db::load_state(&conn, &tables);
-    let d = ast::defs_to_state(&defs, &state);
-    let input_obj = ast::Object::parse(input);
-    let obj = ast::Object::seq(vec![input_obj, ast::Object::phi(), d.clone()]);
-
-    let def_obj = ast::fetch_or_phi(key.as_str(), &d);
-    match &def_obj {
-        ast::Object::Bottom => {
-            eprintln!("Key not found in defs: {}", key);
-            std::process::exit(1);
+    }).fold((Vec::new(), None::<(String, String)>), |(mut readings, app), (name, text)| {
+        match name.as_str() {
+            "app.md" => (readings, Some((name, text))),
+            _ => { readings.push((name, text)); (readings, app) }
         }
-        _ => {
-            let result = ast::apply(&ast::metacompose(&def_obj, &d), &obj, &d);
-            println!("{}", result);
-        }
-    }
-}
-
-#[cfg(feature = "local")]
-fn cmd_synthesize(args: &[String]) {
-    let (db_path, rest) = parse_db_flag(args);
-
-    // Parse --depth flag via foldl: state = (noun, depth, expect_depth).
-    let (noun, depth, _) = rest.iter().fold(
-        (None::<String>, 1usize, false),
-        |(noun, depth, expect_depth), a| match (expect_depth, a.as_str()) {
-            (true, s) => (noun, s.parse().unwrap_or(1), false),
-            (false, "--depth") => (noun, depth, true),
-            (false, s) => (noun.or_else(|| Some(s.to_string())), depth, false),
-        }
-    );
-
-    let noun = noun.unwrap_or_else(|| {
-        eprintln!("Usage: fol synthesize <noun> [--depth <n>] [--db <path>]");
-        std::process::exit(1);
     });
 
-    let conn = db::open(&db_path);
-    let tables = db::load_table_meta(&conn);
-    let state = db::load_state(&conn, &tables);
-    let result = evaluate::synthesize_from_state(&state, &noun, depth);
-    println!("{}", serde_json::to_string_pretty(&result).unwrap());
+    app_md.into_iter().chain(readings).collect()
 }
 
-#[cfg(feature = "local")]
-fn cmd_forward_chain(args: &[String]) {
-    let (db_path, _rest) = parse_db_flag(args);
+/// Bundled metamodel readings — same as lib.rs METAMODEL_READINGS.
+const METAMODEL_READINGS: &[(&str, &str)] = &[
+    ("core",          include_str!("../../../readings/core.md")),
+    ("state",         include_str!("../../../readings/state.md")),
+    ("instances",     include_str!("../../../readings/instances.md")),
+    ("outcomes",      include_str!("../../../readings/outcomes.md")),
+    ("validation",    include_str!("../../../readings/validation.md")),
+    ("evolution",     include_str!("../../../readings/evolution.md")),
+    ("organizations", include_str!("../../../readings/organizations.md")),
+    ("agents",        include_str!("../../../readings/agents.md")),
+    ("ui",            include_str!("../../../readings/ui.md")),
+];
 
-    let conn = db::open(&db_path);
-    let defs = db::load_defs(&conn);
-    let tables = db::load_table_meta(&conn);
-    let state = db::load_state(&conn, &tables);
+/// Create D with bundled metamodel cells + platform primitives.
+/// No compile_to_defs_state here — that happens lazily on first
+/// system(h, 'compile', text) via platform_compile. Same strategy
+/// as lib.rs metamodel_state().
+fn create() -> ast::Object {
+    parse_forml2::set_bootstrap_mode(true);
+    let merged = METAMODEL_READINGS.iter().fold(ast::Object::phi(), |acc, (name, text)| {
+        let parsed = parse_forml2::parse_to_state_from(text, &acc)
+            .unwrap_or_else(|e| { eprintln!("metamodel {}.md: {}", name, e); std::process::exit(1); });
+        ast::merge_states(&acc, &parsed)
+    });
+    parse_forml2::set_bootstrap_mode(false);
 
-    let derivation_defs: Vec<(&str, &ast::Func)> = defs.iter()
-        .filter(|(n, _)| n.starts_with("derivation:"))
-        .map(|(n, f)| (n.as_str(), f))
-        .collect();
-    let (new_state, derived) = evaluate::forward_chain_defs_state(&derivation_defs, &state);
-
-    // Non-empty derivation: store the new state, then format derived facts as
-    // JSON. Empty derivation: just report it. Pure cond combining form.
-    let msg = derived.is_empty()
-        .then(|| "No new facts derived".to_string())
-        .unwrap_or_else(|| {
-            db::store_facts(&conn, &new_state, &tables);
-            serde_json::to_string_pretty(&derived).unwrap()
-        });
-    println!("{}", msg);
+    let defs = vec![
+        ("compile".to_string(), ast::Func::Platform("compile".to_string())),
+        ("apply".to_string(), ast::Func::Platform("apply_command".to_string())),
+        ("verify_signature".to_string(), ast::Func::Platform("verify_signature".to_string())),
+    ];
+    ast::defs_to_state(&defs, &merged)
 }
 
-#[cfg(feature = "local")]
-fn print_local_help() {
-    eprintln!("fol -- first-order logic reasoning engine for GraphDL domain models");
-    eprintln!();
-    eprintln!("SUBCOMMANDS:");
-    eprintln!();
-    eprintln!("  bootstrap <readings_dir> [<dir2> ...] [--db <path>]");
-    eprintln!("    Parse .md readings, compile to defs, store in SQLite.");
-    eprintln!("    Default --db: ./app.db");
-    eprintln!();
-    eprintln!("  system <key> <input> [--db <path>]");
-    eprintln!("    Look up key in defs, apply to input, print result.");
-    eprintln!("    Evaluate a constraint: fol system constraint:<id> <text>");
-    eprintln!();
-    eprintln!("  synthesize <noun> [--depth <n>] [--db <path>]");
-    eprintln!("    Collect all knowledge about a noun.");
-    eprintln!();
-    eprintln!("  forward-chain [--db <path>]");
-    eprintln!("    Derive new facts from population until fixed point.");
-    eprintln!();
-    eprintln!("OPTIONS:");
-    eprintln!("  --db <path>   SQLite database path (default: ./app.db)");
-    eprintln!("  --help, -h    Show this help");
-}
-
-// =========================================================================
-// Legacy CLI (no "local" feature) -- --ir based interface
-// =========================================================================
-
-#[cfg(not(feature = "local"))]
-#[derive(Default)]
-struct LegacyArgs {
-    ir_path: Option<String>,
-    response_path: Option<String>,
-    text: Option<String>,
-    population_path: Option<String>,
-    synthesize_noun: Option<String>,
-    synthesize_depth: usize,
-    do_forward_chain: bool,
-}
-
-#[cfg(not(feature = "local"))]
-#[derive(Clone, Copy)]
-enum LegacyFlag { Ir, Response, Text, Population, Synthesize, Depth, None }
-
-#[cfg(not(feature = "local"))]
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
+    let args: Vec<String> = std::env::args().skip(1).collect();
 
-    // Parse via fold: state = (LegacyArgs, pending-flag). Each arg either sets a
-    // pending flag for the next arg, or consumes the pending flag as a value.
-    let init = LegacyArgs { synthesize_depth: 1, ..LegacyArgs::default() };
-    let (parsed, _) = args.iter().skip(1).fold(
-        (init, LegacyFlag::None),
-        |(mut a, pending), arg| match (pending, arg.as_str()) {
-            (LegacyFlag::Ir, _) => { a.ir_path = Some(arg.clone()); (a, LegacyFlag::None) }
-            (LegacyFlag::Response, _) => { a.response_path = Some(arg.clone()); (a, LegacyFlag::None) }
-            (LegacyFlag::Text, _) => { a.text = Some(arg.clone()); (a, LegacyFlag::None) }
-            (LegacyFlag::Population, _) => { a.population_path = Some(arg.clone()); (a, LegacyFlag::None) }
-            (LegacyFlag::Synthesize, _) => { a.synthesize_noun = Some(arg.clone()); (a, LegacyFlag::None) }
-            (LegacyFlag::Depth, s) => { a.synthesize_depth = s.parse().unwrap_or(1); (a, LegacyFlag::None) }
-            (LegacyFlag::None, "--ir") => (a, LegacyFlag::Ir),
-            (LegacyFlag::None, "--response") => (a, LegacyFlag::Response),
-            (LegacyFlag::None, "--text") => (a, LegacyFlag::Text),
-            (LegacyFlag::None, "--population") => (a, LegacyFlag::Population),
-            (LegacyFlag::None, "--synthesize") => (a, LegacyFlag::Synthesize),
-            (LegacyFlag::None, "--depth") => (a, LegacyFlag::Depth),
-            (LegacyFlag::None, "--forward-chain") => { a.do_forward_chain = true; (a, LegacyFlag::None) }
-            (LegacyFlag::None, "--help") | (LegacyFlag::None, "-h") => {
-                print_help();
+    // Parse --db flag.
+    let (db_path, rest, _) = args.iter().fold(
+        ("arest.db".to_string(), Vec::<String>::new(), false),
+        |(db, mut rest, expect_db), arg| match (expect_db, arg.as_str()) {
+            (true, _) => (arg.clone(), rest, false),
+            (false, "--db") => (db, rest, true),
+            (false, "--help" | "-h") => {
+                println!("Usage: arest [<readings_dir> ...] [--db <path>] [<key> <input>]");
+                println!();
+                println!("  No args:           load state from --db, start REPL (not yet implemented)");
+                println!("  <dir> [<dir2>]:    compile readings via SYSTEM, persist to --db");
+                println!("  <key> <input>:     single SYSTEM call against persisted state");
+                println!();
+                println!("  --db <path>        SQLite database path (default: arest.db)");
                 std::process::exit(0);
             }
-            (LegacyFlag::None, other) => {
-                eprintln!("Unknown argument: {}", other);
+            (false, _) => { rest.push(arg.clone()); (db, rest, false) }
+        },
+    );
+
+    #[cfg(not(feature = "local"))]
+    {
+        eprintln!("Build with --features local for SQLite support.");
+        eprintln!("  cargo run --bin arest --features local -- <readings_dir>");
+        std::process::exit(1);
+    }
+
+    #[cfg(feature = "local")]
+    {
+        // Determine mode from arguments.
+        // - Directories → compile readings into DB via SYSTEM
+        // - Two args (neither a dir) → single SYSTEM call
+        // - No args → error (REPL not yet implemented)
+
+        let dirs: Vec<String> = rest.iter()
+            .filter(|a| std::path::Path::new(a).is_dir())
+            .cloned().collect();
+        let non_dirs: Vec<String> = rest.iter()
+            .filter(|a| !std::path::Path::new(a).is_dir())
+            .cloned().collect();
+
+        let conn = db::open(&db_path);
+        db::ensure_meta_tables(&conn);
+
+        match (dirs.is_empty(), non_dirs.len()) {
+            // arest <dir1> [<dir2> ...] — compile readings via SYSTEM
+            (false, _) => {
+                let readings = read_readings(&dirs);
+                readings.is_empty().then(|| {
+                    eprintln!("No .md files found.");
+                    std::process::exit(1);
+                });
+
+                // Concatenate all readings, one SYSTEM compile call.
+                // compile_to_defs_state runs ONCE on the merged state.
+                // Bootstrap mode: user readings may reference metamodel
+                // nouns in instance facts without redeclaring them.
+                let combined = readings.iter()
+                    .map(|(_, text)| text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                let mut d = create();
+                parse_forml2::set_bootstrap_mode(true);
+                let (output, new_d) = system("compile", &combined, &d);
+                parse_forml2::set_bootstrap_mode(false);
+                match output.starts_with("⊥") {
+                    true => { eprintln!("Compile failed: {}", output); std::process::exit(1); }
+                    false => d = new_d,
+                };
+                let compiled = readings.len();
+
+                // Persist state to SQLite.
+                db::apply_ddl(&conn, &d);
+                db::persist_state(&conn, &d);
+
+                eprintln!("Compiled {} readings into {}", compiled, &db_path);
+            }
+
+            // arest <key> <input> — single SYSTEM call
+            (true, n) if n >= 2 => {
+                let d = db::load_state(&conn);
+                let key = &non_dirs[0];
+                let input = &non_dirs[1];
+                let (output, new_d) = system(key, input, &d);
+                println!("{}", output);
+
+                // Persist if state changed.
+                (new_d != d).then(|| db::persist_state(&conn, &new_d));
+            }
+
+            // No args or single non-dir arg
+            _ => {
+                eprintln!("Usage: arest <readings_dir> [--db <path>]");
+                eprintln!("       arest <key> <input> [--db <path>]");
                 std::process::exit(1);
             }
         }
-    );
-    let LegacyArgs {
-        ir_path, response_path, text, population_path,
-        synthesize_noun, synthesize_depth, do_forward_chain,
-    } = parsed;
-
-    // Load IR
-    let ir_path = ir_path.unwrap_or_else(|| {
-        eprintln!("--ir is required. Run with --help for usage.");
-        std::process::exit(1);
-    });
-    let ir_json = std::fs::read_to_string(&ir_path)
-        .unwrap_or_else(|e| { eprintln!("Failed to read IR file: {}", e); std::process::exit(1); });
-
-    let ir: Domain = serde_json::from_str(&ir_json)
-        .unwrap_or_else(|e| { eprintln!("Failed to parse IR: {}", e); std::process::exit(1); });
-    let ir_state = parse_forml2::domain_to_state(&ir);
-    let defs = compile::compile_to_defs_state(&ir_state);
-    let d = ast::defs_to_state(&defs, &ir_state);
-
-    // -- Synthesize mode --
-    synthesize_noun.map(|noun_name| {
-        let result = evaluate::synthesize_from_state(&ir_state, &noun_name, synthesize_depth);
-        println!("{}", serde_json::to_string_pretty(&result).unwrap());
-        std::process::exit(0);
-    });
-
-    // -- Forward chain mode --
-    do_forward_chain.then(|| {
-        let pop_state = load_state(population_path.clone(), true);
-        let derivation_defs: Vec<(&str, &ast::Func)> = defs.iter()
-            .filter(|(n, _)| n.starts_with("derivation:"))
-            .map(|(n, f)| (n.as_str(), f))
-            .collect();
-        let (_new_state, derived) = evaluate::forward_chain_defs_state(&derivation_defs, &pop_state);
-        let msg = derived.is_empty()
-            .then(|| "No new facts derived".to_string())
-            .unwrap_or_else(|| serde_json::to_string_pretty(&derived).unwrap());
-        println!("{}", msg);
-        std::process::exit(0);
-    });
-
-    // -- Evaluate mode (default) --
-    let response_text: String = text
-        .or_else(|| response_path.map(|p| std::fs::read_to_string(&p)
-            .unwrap_or_else(|e| { eprintln!("Failed to read response file: {}", e); std::process::exit(1); })))
-        .unwrap_or_else(|| {
-            let mut input = String::new();
-            std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)
-                .unwrap_or_else(|e| { eprintln!("Failed to read stdin: {}", e); std::process::exit(1); });
-            input.trim().to_string()
-        });
-
-    let pop_state = load_state(population_path, false);
-    let ctx_obj = ast::encode_eval_context_state(&response_text, None, &pop_state);
-    let violations: Vec<types::Violation> = defs.iter()
-        .filter(|(n, _)| n.starts_with("constraint:"))
-        .flat_map(|(name, func)| {
-            let result = ast::apply(func, &ctx_obj, &d);
-            let is_deontic = name.contains("obligatory") || name.contains("forbidden");
-            ast::decode_violations(&result).into_iter().map(move |mut v| {
-                v.alethic = !is_deontic;
-                v
-            })
-        })
-        .collect();
-
-    let (msg, code) = violations.is_empty()
-        .then(|| ("OK -- no violations".to_string(), 0))
-        .unwrap_or_else(|| (serde_json::to_string_pretty(&violations).unwrap(), 1));
-    println!("{}", msg);
-    std::process::exit(code);
-}
-
-#[cfg(not(feature = "local"))]
-fn load_state(path: Option<String>, required: bool) -> ast::Object {
-    match path {
-        Some(p) => {
-            let json = std::fs::read_to_string(&p)
-                .unwrap_or_else(|e| { eprintln!("Failed to read state file: {}", e); std::process::exit(1); });
-            ast::Object::parse(&json)
-        }
-        None if required => {
-            eprintln!("--population <path> is required for this mode");
-            std::process::exit(1);
-        }
-        None => ast::Object::phi(),
     }
-}
-
-#[cfg(not(feature = "local"))]
-fn print_help() {
-    eprintln!("fol -- first-order logic reasoning engine for GraphDL domain models");
-    eprintln!();
-    eprintln!("Implements Backus FP algebra: constraints compile to pure functions,");
-    eprintln!("evaluation is function application over whole structures.");
-    eprintln!();
-    eprintln!("MODES:");
-    eprintln!();
-    eprintln!("  Evaluate (default) -- check text against constraint predicates");
-    eprintln!("    fol --ir <ir.json> --text <text to verify>");
-    eprintln!("    fol --ir <ir.json> --response <response.json>");
-    eprintln!();
-    eprintln!("  Synthesize -- collect all knowledge about a noun");
-    eprintln!("    fol --ir <ir.json> --synthesize <noun> [--depth <n>]");
-    eprintln!("    Returns: fact types, constraints, state machines, related nouns");
-    eprintln!();
-    eprintln!("  Forward Chain -- derive new facts from a population until fixed point");
-    eprintln!("    fol --ir <ir.json> --forward-chain --population <pop.json>");
-    eprintln!("    Derivation rules: subtype inheritance, modus ponens, transitivity,");
-    eprintln!("    closed-world negation. Returns all derived facts with proof chains.");
-    eprintln!();
-    eprintln!("OPTIONS:");
-    eprintln!("  --ir <path>            Constraint IR JSON file (required)");
-    eprintln!("  --text <string>        Text to evaluate against constraints");
-    eprintln!("  --response <path>      Response JSON file");
-    eprintln!("  --population <path>    Population JSON file");
-    eprintln!("  --synthesize <noun>    Synthesize knowledge about a noun");
-    eprintln!("  --depth <n>            Synthesis depth for related nouns (default: 1)");
-    eprintln!("  --forward-chain        Run forward inference on population");
-    eprintln!();
-    eprintln!("EXIT CODES:");
-    eprintln!("  0  Clean -- no violations / successful operation");
-    eprintln!("  1  Violations found");
 }
