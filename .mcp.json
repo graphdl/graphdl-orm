@@ -1,0 +1,24 @@
+{
+  "$schema": "https://raw.githubusercontent.com/modelcontextprotocol/sdk/main/schemas/mcp.json",
+  "mcpServers": {
+    "graphdl": {
+      "description": "GraphDL AREST engine — FORML2 readings → REST API. Exposes create/apply/compile/audit tools for domain modeling, constraint validation, and self-modification.",
+      "command": "npx",
+      "args": ["-y", "tsx", "src/mcp/server.ts"],
+      "env": {
+        "GRAPHDL_MODE": "local",
+        "GRAPHDL_READINGS_DIR": "./readings"
+      }
+    },
+    "graphdl-remote": {
+      "description": "GraphDL AREST engine (remote worker mode). Requires GRAPHDL_URL and GRAPHDL_API_KEY set in your shell.",
+      "command": "npx",
+      "args": ["-y", "tsx", "src/mcp/server.ts"],
+      "env": {
+        "GRAPHDL_MODE": "remote",
+        "GRAPHDL_URL": "${GRAPHDL_URL}",
+        "GRAPHDL_API_KEY": "${GRAPHDL_API_KEY}"
+      }
+    }
+  }
+}

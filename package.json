@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "bin": {
-    "graphdl": "./src/cli/import.ts"
+    "graphdl": "./src/cli/import.ts",
+    "graphdl-mcp": "./src/mcp/server.ts"
   },
   "scripts": {
     "mcp": "tsx src/mcp/server.ts",

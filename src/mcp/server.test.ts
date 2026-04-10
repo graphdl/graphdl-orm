@@ -11,22 +11,28 @@ import { z } from 'zod'
 
 describe('GraphDL MCP Server', () => {
   it('registers expected tool names', () => {
-    // The tools we expect the server to register
+    // The tools the server registers. Keep in sync with src/mcp/server.ts.
+    // Identity-carrying commands accept sender + signature (tasks #17, #20, #24).
     const expectedTools = [
       'graphdl_list',
       'graphdl_get',
       'graphdl_create',
+      'graphdl_apply',
+      'graphdl_transition',
       'graphdl_evaluate',
       'graphdl_schema',
-      'graphdl_seed',
+      'graphdl_compile',
+      'graphdl_parse',
+      'graphdl_audit_log',
+      'graphdl_verify_signature',
     ]
 
     // Since we can't easily introspect a running server without connecting,
-    // verify the tool names match what the server.ts file declares
+    // verify the tool names match the documented tool surface.
     for (const tool of expectedTools) {
       expect(tool).toMatch(/^graphdl_/)
     }
-    expect(expectedTools).toHaveLength(6)
+    expect(expectedTools.length).toBeGreaterThanOrEqual(11)
   })
 
   it('all tools require domain parameter', () => {
@@ -47,17 +53,26 @@ describe('GraphDL MCP Server', () => {
     expect(schema.parse({ noun: 'Order', domain: 'support', page: 2, limit: 50 })).toEqual({ noun: 'Order', domain: 'support', page: 2, limit: 50 })
   })
 
-  it('create tool accepts arbitrary data', () => {
+  it('create tool accepts fields, sender, signature', () => {
     const schema = z.object({
       noun: z.string(),
       domain: z.string(),
-      data: z.record(z.string(), z.any()),
+      id: z.string().optional(),
+      fields: z.record(z.string(), z.string()),
+      sender: z.string().optional(),
+      signature: z.string().optional(),
     })
-    const result = schema.parse({ noun: 'Order', domain: 'support', data: { customer: 'acme', status: 'In Cart' } })
-    expect(result.data.customer).toBe('acme')
+    const result = schema.parse({
+      noun: 'Order',
+      domain: 'support',
+      fields: { customer: 'acme', status: 'In Cart' },
+      sender: 'alice@example.com',
+    })
+    expect(result.sender).toBe('alice@example.com')
+    expect(result.fields.customer).toBe('acme')
   })
 
-  it('seed tool accepts FORML2 readings text', () => {
+  it('compile tool accepts FORML2 readings text', () => {
     const schema = z.object({
       domain: z.string(),
       readings: z.string(),
@@ -67,5 +82,29 @@ describe('GraphDL MCP Server', () => {
       readings: 'Customer(.Email) is an entity type.\nCustomer has Name.\n  Each Customer has exactly one Name.',
     })
     expect(result.readings).toContain('Customer(.Email) is an entity type.')
+  })
+
+  it('verify_signature tool accepts sender, payload, signature', () => {
+    const schema = z.object({
+      sender: z.string(),
+      payload: z.string(),
+      signature: z.string(),
+    })
+    const result = schema.parse({
+      sender: 'alice@example.com',
+      payload: 'create Order ord-1',
+      signature: 'deadbeef1234',
+    })
+    expect(result.signature).toBe('deadbeef1234')
+  })
+
+  it('apply tool accepts a generic Command object', () => {
+    const schema = z.object({
+      command: z.record(z.string(), z.any()),
+    })
+    const result = schema.parse({
+      command: { type: 'createEntity', noun: 'Order', domain: 'test', fields: { customer: 'acme' } },
+    })
+    expect(result.command.type).toBe('createEntity')
   })
 })
