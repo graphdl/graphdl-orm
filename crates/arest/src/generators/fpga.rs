@@ -73,8 +73,18 @@ fn sanitize(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::merge_states;
+    use crate::ast::{fact_from_pairs, merge_states, store, Object};
     use crate::parse_forml2::{parse_to_state, parse_to_state_with_nouns};
+
+    /// Build a state containing a single "Noun" cell populated with the
+    /// given (name, objectType) pairs. Pure FP construction: map + fold.
+    fn state_with_nouns(pairs: &[(&str, &str)]) -> Object {
+        let nouns: Vec<Object> = pairs
+            .iter()
+            .map(|(n, t)| fact_from_pairs(&[("name", n), ("objectType", t)]))
+            .collect();
+        store("Noun", Object::Seq(nouns), &Object::phi())
+    }
 
     /// Minimal Order domain: one entity noun with a reference scheme and one
     /// binary fact type. Compiles to a single Verilog module named `order`.
@@ -115,5 +125,141 @@ Noun has Object Type.
         );
         assert!(verilog.contains("endmodule"));
         assert!(verilog.contains("// Generated from graphdl-orm"));
+    }
+
+    /// Empty state → header comment only, zero modules.
+    /// Compiling φ must not emit any `module` keyword.
+    #[test]
+    fn compile_to_verilog_empty_state_emits_header_only() {
+        let verilog = compile_to_verilog(&Object::phi());
+
+        assert!(verilog.contains("// Generated from graphdl-orm"));
+        assert!(verilog.contains("Backus FP combining forms"));
+        assert!(
+            !verilog.contains("module "),
+            "empty state must not emit any modules, got:\n{}",
+            verilog
+        );
+        assert!(!verilog.contains("endmodule"));
+    }
+
+    /// Multi-entity: three entity nouns produce three module blocks.
+    /// Each module name must appear exactly once.
+    #[test]
+    fn compile_to_verilog_multiple_entities_produce_multiple_modules() {
+        let state = state_with_nouns(&[
+            ("Order", "entity"),
+            ("Customer", "entity"),
+            ("Product", "entity"),
+        ]);
+
+        let verilog = compile_to_verilog(&state);
+
+        let module_count = verilog.matches("module ").count();
+        let endmodule_count = verilog.matches("endmodule").count();
+        assert_eq!(module_count, 3, "expected 3 modules, got:\n{}", verilog);
+        assert_eq!(endmodule_count, 3, "module/endmodule mismatch:\n{}", verilog);
+        assert!(verilog.contains("module order"));
+        assert!(verilog.contains("module customer"));
+        assert!(verilog.contains("module product"));
+    }
+
+    /// Value types must NOT become Verilog modules — only entities do.
+    /// Mixed state with one entity and several values emits exactly one module.
+    #[test]
+    fn compile_to_verilog_skips_non_entity_nouns() {
+        let state = state_with_nouns(&[
+            ("Order", "entity"),
+            ("Amount", "value"),
+            ("Currency Code", "value"),
+            ("Priority", "enum"),
+        ]);
+
+        let verilog = compile_to_verilog(&state);
+
+        assert_eq!(verilog.matches("module ").count(), 1);
+        assert!(verilog.contains("module order"));
+        assert!(!verilog.contains("module amount"));
+        assert!(!verilog.contains("module currency_code"));
+        assert!(!verilog.contains("module priority"));
+    }
+
+    /// Multi-word entity names get sanitized: spaces → underscores,
+    /// uppercase → lowercase. Produces a legal Verilog identifier.
+    #[test]
+    fn compile_to_verilog_sanitizes_multiword_entity_names() {
+        let state = state_with_nouns(&[("State Machine Definition", "entity")]);
+
+        let verilog = compile_to_verilog(&state);
+
+        assert!(
+            verilog.contains("module state_machine_definition"),
+            "expected sanitized module name, got:\n{}",
+            verilog
+        );
+        assert!(!verilog.contains("State Machine Definition"));
+        assert!(!verilog.contains("module State"));
+    }
+
+    /// Verify synthesizable Verilog constructs are present in every emitted
+    /// module: clock input, active-low reset, id bus, valid output, and a
+    /// clocked always block.
+    #[test]
+    fn compile_to_verilog_emits_synthesizable_constructs() {
+        let state = state_with_nouns(&[("Widget", "entity")]);
+
+        let verilog = compile_to_verilog(&state);
+
+        let required = [
+            "module widget",
+            "input wire clk",
+            "input wire rst_n",
+            "input wire [255:0] id_in",
+            "output reg valid",
+            "always @(posedge clk)",
+            "valid <= rst_n",
+            "endmodule",
+        ];
+        required.iter().for_each(|needle| {
+            assert!(
+                verilog.contains(needle),
+                "missing `{}` in emitted Verilog:\n{}",
+                needle,
+                verilog
+            );
+        });
+    }
+
+    /// End-to-end: feed a FORML2 reading through parse_to_state and pipe
+    /// the resulting state straight into compile_to_verilog. Exercises the
+    /// full reading-to-HDL pipeline Backus envisioned in the 1977 lecture.
+    #[test]
+    fn compile_to_verilog_from_parsed_forml2_readings() {
+        let meta = parse_to_state(STATE_METAMODEL).unwrap();
+        let domain = parse_to_state_with_nouns(
+            r#"
+# Inventory
+
+## Entity Types
+
+Widget(.Widget Id) is an entity type.
+Supplier(.Supplier Code) is an entity type.
+
+## Fact Types
+
+Widget has Quantity.
+Supplier supplies Widget.
+"#,
+            &meta,
+        )
+        .unwrap();
+        let state = merge_states(&meta, &domain);
+
+        let verilog = compile_to_verilog(&state);
+
+        assert!(verilog.contains("// Generated from graphdl-orm"));
+        assert!(verilog.contains("module widget"));
+        assert!(verilog.contains("module supplier"));
+        assert_eq!(verilog.matches("endmodule").count(), 2);
     }
 }
