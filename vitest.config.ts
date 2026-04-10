@@ -47,6 +47,11 @@ export default defineConfig({
   test: {
     globals: true,
     include: ['src/**/*.test.ts', 'tests/**/*.test.ts', 'scripts/**/*.test.ts'],
+    // Parallel fork workers are flaky on Windows when each worker loads
+    // the arest WASM module (intermittent "RuntimeError: unreachable" +
+    // "Worker exited unexpectedly" under load). Single-fork serializes
+    // file execution; total wall time is ~10s which is acceptable.
+    fileParallelism: false,
   },
   resolve: {
     alias: {

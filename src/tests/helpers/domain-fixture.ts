@@ -11,9 +11,16 @@
 
 import {
   compileDomainReadings,
+  compileDomainReadingsBare,
   system,
   release_domain,
 } from '../../api/engine'
+
+// Test fixtures pass the metamodel fragments explicitly (STATE_READINGS +
+// ORDER_READINGS / SUPPORT_READINGS / AUTH_DOMAIN), so they MUST use the
+// bare variant — the default `compileDomainReadings` auto-loads the full
+// bundled metamodel and redeclaring it from the fixtures would fail.
+const useBare = true
 
 // ── Metamodel readings — the system's own vocabulary ───────────────────────
 // Minimal subset of state.md needed to parse state machine instance facts.
@@ -186,7 +193,8 @@ function parseDebugIR(raw: string): CompiledDomain['ir'] {
  * The entity/noun list is extracted from the debug IR instead.
  */
 export function compileDomain(readings: string, ...prereqs: string[]): CompiledDomain {
-  const handle: number = compileDomainReadings(...prereqs, readings)
+  const compile = useBare ? compileDomainReadingsBare : compileDomainReadings
+  const handle: number = compile(...prereqs, readings)
   const raw: string = system(handle, 'debug', '')
   const ir = parseDebugIR(raw)
   const entities: string[] = ir.nouns

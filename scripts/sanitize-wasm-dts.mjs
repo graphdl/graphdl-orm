@@ -25,13 +25,17 @@ if (!existsSync(dtsPath)) {
 }
 
 const src = readFileSync(dtsPath, 'utf-8')
-// Valid TS identifier before the colon in `export const <name>:`
-const validIdent = /^[A-Za-z_$][\w$]*$/
+// Drop any export line whose declaration head (before the last `:`) contains
+// WIT-invalid punctuation. WIT component names embed `#`, `@` and `/`
+// (e.g. `cabi_post_graphdl:arest/engine@0.1.0#system`) which break tsc.
 const cleaned = src.split('\n').filter(line => {
   const trimmed = line.trim()
-  const exportMatch = trimmed.match(/^export const ([^:]+):/)
-  if (!exportMatch) return true
-  return validIdent.test(exportMatch[1].trim())
+  if (!trimmed.startsWith('export const ')) return true
+  // Everything up to the last `:` is the declaration name + garbage.
+  // A clean export has exactly `export const <ident>:` so a second `:`
+  // or any of # / @ in the head is a red flag.
+  const head = trimmed.slice('export const '.length).split(/:\s*\(/)[0].split(': ')[0]
+  return !/[#@/]/.test(head) && !head.includes(':')
 }).join('\n')
 
 if (cleaned !== src) {
