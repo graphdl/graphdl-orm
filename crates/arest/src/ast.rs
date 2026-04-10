@@ -12,6 +12,16 @@
 // Functions are the program domain (primitives + combining forms).
 // Application is the single operation: f:x → object.
 //
+// Skip-validate flag: set by CLI --no-validate to bypass constraint
+// evaluation during bulk compile. Validation is O(constraints × population)
+// and should be indexed by affected fact type (TODO). Until then, bulk
+// loads can skip it when the readings are known-good.
+thread_local! {
+    static SKIP_VALIDATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+pub fn set_skip_validate(on: bool) { SKIP_VALIDATE.with(|b| b.set(on)); }
+fn is_skip_validate() -> bool { SKIP_VALIDATE.with(|b| b.get()) }
+//
 // All framework objects compile to these types:
 //   Role        → Selector
 //   Graph Schema → Construction (CONS of roles)
@@ -942,9 +952,15 @@ fn platform_compile(x: &Object, d: &Object) -> Object {
     let new_d = defs_to_state(&defs, &merged_state);
 
     // Validate: ρ(validate) applied to merged state. Alethic violations reject.
-    let ctx = encode_eval_context_state("", None, &merged_state);
-    let violations = apply(&Func::Def("validate".to_string()), &ctx, &new_d);
-    let decoded = decode_violations(&violations);
+    // Skipped when SKIP_VALIDATE is set (--no-validate flag for bulk compile).
+    let decoded = match is_skip_validate() {
+        true => vec![],
+        false => {
+            let ctx = encode_eval_context_state("", None, &merged_state);
+            let violations = apply(&Func::Def("validate".to_string()), &ctx, &new_d);
+            decode_violations(&violations)
+        }
+    };
     match decoded.iter().any(|v| v.alethic) {
         true => Object::atom(&format!("⊥ constraint violation: {}",
             decoded.iter().filter(|v| v.alethic).map(|v| v.constraint_text.as_str()).collect::<Vec<_>>().join("; "))),

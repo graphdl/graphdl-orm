@@ -239,8 +239,11 @@ fn create() -> ast::Object {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
-    // Parse --db flag.
-    let (db_path, rest, _) = args.iter().fold(
+    // Parse flags.
+    let no_validate = args.iter().any(|a| a == "--no-validate");
+    let (db_path, rest, _) = args.iter()
+        .filter(|a| a.as_str() != "--no-validate")
+        .fold(
         ("arest.db".to_string(), Vec::<String>::new(), false),
         |(db, mut rest, expect_db), arg| match (expect_db, arg.as_str()) {
             (true, _) => (arg.clone(), rest, false),
@@ -253,6 +256,7 @@ fn main() {
                 println!("  <key> <input>:     single SYSTEM call against persisted state");
                 println!();
                 println!("  --db <path>        SQLite database path (default: arest.db)");
+                println!("  --no-validate      skip constraint validation during compile");
                 std::process::exit(0);
             }
             (false, _) => { rest.push(arg.clone()); (db, rest, false) }
@@ -302,7 +306,9 @@ fn main() {
                     .join("\n\n");
                 let mut d = create();
                 parse_forml2::set_bootstrap_mode(true);
+                no_validate.then(|| ast::set_skip_validate(true));
                 let (output, new_d) = system("compile", &combined, &d);
+                ast::set_skip_validate(false);
                 parse_forml2::set_bootstrap_mode(false);
                 match output.starts_with("⊥") {
                     true => { eprintln!("Compile failed: {}", output); std::process::exit(1); }
