@@ -1,5 +1,7 @@
 # GraphDL Validation — ORM2 Modeling Rules
 
+## Description
+
 Deontic constraints encoding ORM2/FORML2 modeling discipline at the framework level. These are meta-constraints: constraints about how domain models should be structured. Every domain inherits them.
 
 ## Deontic Constraints

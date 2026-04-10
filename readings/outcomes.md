@@ -1,7 +1,8 @@
 # GraphDL Outcomes — Violations and Failures as Facts
 
-Violations and failures are first-class domain entities, not out-of-band error responses.
-Every evaluation path returns either valid claims, violation facts, failure facts, or a combination. No silent paths.
+## Description
+
+Violations and failures are first-class domain entities, not out-of-band error responses. Every evaluation path returns either valid claims, violation facts, failure facts, or a combination. No silent paths.
 
 ## Entity Types
 
