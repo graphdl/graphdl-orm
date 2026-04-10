@@ -1,7 +1,7 @@
-// Event Replay — Deterministic State Reconstruction via pure foldl
+// DomainEvent Replay — Deterministic State Reconstruction via pure foldl
 // Pure logic tests — no WASM, no engine imports.
 
-interface Event {
+interface DomainEvent {
   type: string
   data: Record<string, unknown>
   timestamp: number
@@ -19,26 +19,26 @@ const transitionMap: Record<string, Record<string, string>> = {
   'Delivered': {},
 }
 
-function transition(state: CellState, event: Event): CellState {
+function transition(state: CellState, event: DomainEvent): CellState {
   const targets = transitionMap[state.status] || {}
   const nextStatus = targets[event.type]
   if (!nextStatus) return state // guard fails
   return { status: nextStatus, data: { ...state.data, ...event.data } }
 }
 
-function replay(events: Event[]): CellState {
+function replay(events: DomainEvent[]): CellState {
   return events.reduce(transition, { status: 'In Cart', data: {} })
 }
 
 // ---------------------------------------------------------------------------
 
-describe('Event Replay — deterministic state reconstruction', () => {
-  const placeEvent: Event = { type: 'place', data: { orderId: 'ord-1' }, timestamp: 1 }
-  const shipEvent: Event = { type: 'ship', data: { trackingId: 'trk-99' }, timestamp: 2 }
-  const deliverEvent: Event = { type: 'deliver', data: { deliveredAt: '2026-04-08' }, timestamp: 3 }
+describe('DomainEvent Replay — deterministic state reconstruction', () => {
+  const placeDomainEvent: DomainEvent = { type: 'place', data: { orderId: 'ord-1' }, timestamp: 1 }
+  const shipDomainEvent: DomainEvent = { type: 'ship', data: { trackingId: 'trk-99' }, timestamp: 2 }
+  const deliverDomainEvent: DomainEvent = { type: 'deliver', data: { deliveredAt: '2026-04-08' }, timestamp: 3 }
 
   it('replaying the same events always produces the same final state (In Cart → place → ship → deliver → Delivered)', () => {
-    const events = [placeEvent, shipEvent, deliverEvent]
+    const events = [placeDomainEvent, shipDomainEvent, deliverDomainEvent]
     const stateA = replay(events)
     const stateB = replay(events)
 
@@ -52,7 +52,7 @@ describe('Event Replay — deterministic state reconstruction', () => {
   })
 
   it('partial replay produces intermediate state (just place → Placed)', () => {
-    const state = replay([placeEvent])
+    const state = replay([placeDomainEvent])
 
     expect(state.status).toBe('Placed')
     expect(state.data).toMatchObject({ orderId: 'ord-1' })
@@ -61,10 +61,10 @@ describe('Event Replay — deterministic state reconstruction', () => {
 
   it('replay after disconnect: catching up from scratch produces same state as continuous', () => {
     // Continuous processing
-    const continuous = replay([placeEvent, shipEvent, deliverEvent])
+    const continuous = replay([placeDomainEvent, shipDomainEvent, deliverDomainEvent])
 
-    // Simulate disconnect after placeEvent, then catch up from scratch
-    const fromScratch = replay([placeEvent, shipEvent, deliverEvent])
+    // Simulate disconnect after placeDomainEvent, then catch up from scratch
+    const fromScratch = replay([placeDomainEvent, shipDomainEvent, deliverDomainEvent])
 
     expect(fromScratch).toEqual(continuous)
     expect(fromScratch.status).toBe('Delivered')
@@ -72,14 +72,14 @@ describe('Event Replay — deterministic state reconstruction', () => {
 
   it('replay after disconnect: catching up from checkpoint (resume from Shipped, apply deliver)', () => {
     // Checkpoint: already at Shipped after processing place + ship
-    const checkpoint: CellState = replay([placeEvent, shipEvent])
+    const checkpoint: CellState = replay([placeDomainEvent, shipDomainEvent])
     expect(checkpoint.status).toBe('Shipped')
 
     // Resume: apply only the remaining event
-    const resumed = transition(checkpoint, deliverEvent)
+    const resumed = transition(checkpoint, deliverDomainEvent)
 
     // Full replay from scratch
-    const full = replay([placeEvent, shipEvent, deliverEvent])
+    const full = replay([placeDomainEvent, shipDomainEvent, deliverDomainEvent])
 
     expect(resumed).toEqual(full)
     expect(resumed.status).toBe('Delivered')
@@ -87,15 +87,15 @@ describe('Event Replay — deterministic state reconstruction', () => {
 
   it('invalid events in stream are no-ops (ship before place is rejected by guard)', () => {
     // ship is only valid from Placed; applying it from In Cart must be a no-op
-    const state = replay([shipEvent])
+    const state = replay([shipDomainEvent])
 
     expect(state.status).toBe('In Cart')
     expect(state.data).toEqual({})
   })
 
   it('event ordering matters: ship then place ≠ place then ship (different final states)', () => {
-    const placeThenShip = replay([placeEvent, shipEvent])
-    const shipThenPlace = replay([shipEvent, placeEvent])
+    const placeThenShip = replay([placeDomainEvent, shipDomainEvent])
+    const shipThenPlace = replay([shipDomainEvent, placeDomainEvent])
 
     // place then ship: In Cart → Placed → Shipped
     expect(placeThenShip.status).toBe('Shipped')
