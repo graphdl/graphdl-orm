@@ -111,7 +111,7 @@ describe('Corollary 2 — State machine transitions survive self-modification', 
   })
 
   it('In Cart status has at least one available transition (place)', () => {
-    const result = transitions(extended.handle, 'Order', 'In Cart')
+    const result = transitions(extended.handle, 'Order', 'In Cart') as any
     // Result is either an array of transition names/objects or an object with a transitions key
     const list: any[] = Array.isArray(result)
       ? result
