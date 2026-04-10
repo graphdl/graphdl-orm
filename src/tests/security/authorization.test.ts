@@ -23,7 +23,7 @@ import {
   STATE_READINGS,
   ORDER_READINGS,
 } from '../helpers/domain-fixture'
-import { compileDomainReadings } from '../../api/engine'
+import { compileDomainReadingsBare as compileDomainReadings } from '../../api/engine'
 
 // ── Handle Isolation (#15) ──────────────────────────────────────────────────
 // Two tenants must not share state through handles.

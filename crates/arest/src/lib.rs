@@ -51,8 +51,29 @@ fn allocate(state: ast::Object, defs: Vec<(String, ast::Func)>) -> u32 {
 
 // ── SYSTEM is the only function ─────────────────────────────────────
 
-/// create: allocate empty D with platform primitives registered in DEFS.
-fn create_impl() -> u32 {
+/// Bundled metamodel readings. Compiled into the binary at build time.
+/// Loaded by `create_impl` so every fresh domain starts with the
+/// self-describing metamodel available. Use `create_bare_impl` to skip
+/// the auto-load when experimenting with a replacement core.
+///
+/// Load order matters: core defines the base object types (Noun, Graph
+/// Schema, Role, Constraint) that every later reading references.
+const METAMODEL_READINGS: &[(&str, &str)] = &[
+    ("core",          include_str!("../../../readings/core.md")),
+    ("state",         include_str!("../../../readings/state.md")),
+    ("instances",     include_str!("../../../readings/instances.md")),
+    ("outcomes",      include_str!("../../../readings/outcomes.md")),
+    ("validation",    include_str!("../../../readings/validation.md")),
+    ("evolution",     include_str!("../../../readings/evolution.md")),
+    ("organizations", include_str!("../../../readings/organizations.md")),
+    ("agents",        include_str!("../../../readings/agents.md")),
+    ("ui",            include_str!("../../../readings/ui.md")),
+];
+
+/// create_bare: allocate empty D with ONLY the platform primitives
+/// registered in DEFS. Use this when testing a new core or rebuilding
+/// the metamodel from scratch. Most apps should use `create_impl`.
+fn create_bare_impl() -> u32 {
     let state = ast::Object::phi();
     let defs = vec![
         ("compile".to_string(), ast::Func::Platform("compile".to_string())),
@@ -60,6 +81,75 @@ fn create_impl() -> u32 {
         ("verify_signature".to_string(), ast::Func::Platform("verify_signature".to_string())),
     ];
     allocate(state, defs)
+}
+
+/// create: allocate D with platform primitives AND the bundled metamodel
+/// readings (core, state, instances, outcomes, validation, evolution,
+/// organizations, agents, ui). One call yields a fully self-describing
+/// engine ready to ingest user domain readings via `system(h, "compile", ...)`.
+///
+/// Use `create_bare_impl` to opt out when experimenting with a new core.
+/// Cached metamodel state — PARSED cells + platform primitives only.
+///
+/// We deliberately skip `compile_to_defs_state` at cache build time because
+/// `platform_compile` already runs it on every user compile, taking the
+/// metamodel cells as context. Pre-compiling would be wasted work and slows
+/// down `create_impl` by seconds. The expensive per-def construction (CWA
+/// negation, per-constraint validate funcs, query/schema/resolve defs)
+/// happens lazily on first user compile.
+///
+/// What IS in the cache:
+///   - Metamodel Noun cell (self-describing types)
+///   - Metamodel Graph Schema cell
+///   - Metamodel Role cell
+///   - Metamodel Constraint cell
+///   - 3 platform primitive defs (compile, apply, verify_signature)
+///
+/// Bootstrap mode (#23 guard bypass) wraps the parse fold.
+static METAMODEL_STATE: OnceLock<ast::Object> = OnceLock::new();
+
+fn metamodel_state() -> &'static ast::Object {
+    METAMODEL_STATE.get_or_init(|| {
+        struct BootstrapGuard;
+        impl BootstrapGuard {
+            fn enter() -> Self {
+                parse_forml2::set_bootstrap_mode(true);
+                BootstrapGuard
+            }
+        }
+        impl Drop for BootstrapGuard {
+            fn drop(&mut self) { parse_forml2::set_bootstrap_mode(false); }
+        }
+        let _guard = BootstrapGuard::enter();
+
+        // Fold all 9 readings into a single merged state (parser only).
+        let merged = METAMODEL_READINGS.iter().fold(ast::Object::phi(), |acc, (name, text)| {
+            let parsed = parse_forml2::parse_to_state_from(text, &acc)
+                .unwrap_or_else(|e| panic!("metamodel parse failed at readings/{}.md: {}", name, e));
+            ast::merge_states(&acc, &parsed)
+        });
+
+        // Register ONLY the platform primitives — no constraint/query/derivation
+        // compilation here. `platform_compile` does the full compile_to_defs_state
+        // on every user compile and will pick up the metamodel cells naturally.
+        let defs = vec![
+            ("compile".to_string(), ast::Func::Platform("compile".to_string())),
+            ("apply".to_string(), ast::Func::Platform("apply_command".to_string())),
+            ("verify_signature".to_string(), ast::Func::Platform("verify_signature".to_string())),
+        ];
+        ast::defs_to_state(&defs, &merged)
+    })
+}
+
+fn create_impl() -> u32 {
+    // Clone the cached metamodel state into a fresh handle. First call
+    // builds the cache; subsequent calls are just a handle allocation +
+    // Object clone.
+    let d = metamodel_state().clone();
+    let mut s = ds().lock().unwrap();
+    let h = s.iter().position(|x| x.is_none()).unwrap_or_else(|| { s.push(None); s.len() - 1 });
+    s[h] = Some(CompiledState { d });
+    h as u32
 }
 
 /// Legacy: parse_and_compile as create + compile for each readings pair.
@@ -170,9 +260,9 @@ mod handle_isolation_tests {
     #[test]
     fn two_creates_return_distinct_handles() {
         let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-        let h1 = create_impl();
-        let h2 = create_impl();
-        assert_ne!(h1, h2, "create_impl must return distinct handle indices");
+        let h1 = create_bare_impl();
+        let h2 = create_bare_impl();
+        assert_ne!(h1, h2, "create must return distinct handle indices");
         release_impl(h1);
         release_impl(h2);
     }
@@ -217,7 +307,7 @@ mod handle_isolation_tests {
     #[test]
     fn released_handle_returns_bottom_for_all_operations() {
         let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-        let h = create_impl();
+        let h = create_bare_impl();
         release_impl(h);
 
         // Every system_impl() dispatch on a released handle must return ⊥.
@@ -230,7 +320,7 @@ mod handle_isolation_tests {
     #[test]
     fn release_is_idempotent_and_bounds_safe() {
         let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-        let h = create_impl();
+        let h = create_bare_impl();
         release_impl(h);
         release_impl(h); // double-release must not panic
         release_impl(u32::MAX); // out-of-bounds index must be a no-op
@@ -241,23 +331,54 @@ mod handle_isolation_tests {
     #[test]
     fn recycled_slot_has_no_residual_state() {
         let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-        // Install a tenant, release it, then create a fresh handle. The new
-        // handle may reuse the same index — it must NOT observe stale state.
+        // Install a tenant, release it, then create a fresh bare handle.
+        // The new handle may reuse the same index — it must NOT observe
+        // stale state from the previous tenant.
         let h_old = alloc_with_noun("leaked-secret");
         let stale = ast::fetch("Noun", &peek(h_old).unwrap());
         assert_eq!(stale, ast::Object::atom("leaked-secret"));
         release_impl(h_old);
 
-        let h_new = create_impl();
+        let h_new = create_bare_impl();
         let fresh_d = peek(h_new).expect("new handle must be live");
-        // create_impl starts from Object::phi() with only platform defs; no
-        // Noun cell should be present.
+        // create_bare_impl starts from Object::phi() with only platform
+        // defs; no Noun cell should be present.
         assert_eq!(
             ast::fetch("Noun", &fresh_d),
             ast::Object::Bottom,
-            "recycled slot must not carry prior tenant's Noun cell",
+            "recycled bare slot must not carry prior tenant's Noun cell",
         );
         release_impl(h_new);
+    }
+
+    /// create_impl loads the bundled metamodel, so a fresh handle MUST
+    /// have a populated Noun cell (from core.md at minimum).
+    #[test]
+    fn create_impl_loads_metamodel() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let h = create_impl();
+        let d = peek(h).expect("handle must be live");
+        let nouns = ast::fetch("Noun", &d);
+        assert_ne!(nouns, ast::Object::Bottom,
+            "create_impl must load the metamodel — Noun cell should be populated");
+        // The metamodel defines at least Noun, Graph Schema, Role, Constraint
+        // as reserved noun names. Verify the cell has multiple entries.
+        let count = nouns.as_seq().map(|s| s.len()).unwrap_or(0);
+        assert!(count > 5,
+            "metamodel should populate at least a handful of noun entries, got {}", count);
+        release_impl(h);
+    }
+
+    #[test]
+    fn create_bare_impl_skips_metamodel() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let h = create_bare_impl();
+        let d = peek(h).expect("handle must be live");
+        // Bare mode: no Noun cell, no metamodel facts at all — just the
+        // three platform primitives.
+        assert_eq!(ast::fetch("Noun", &d), ast::Object::Bottom,
+            "create_bare_impl must NOT load the metamodel");
+        release_impl(h);
     }
 
     #[test]

@@ -4,9 +4,16 @@
 
 use wasm_bindgen::prelude::*;
 
-/// Allocate an empty D with compile ∘ parse pre-registered in DEFS.
+/// Allocate D with the bundled metamodel and platform primitives loaded.
+/// Produces a fully self-describing engine ready for user domain readings.
 #[wasm_bindgen]
 pub fn create() -> u32 { crate::create_impl() }
+
+/// Allocate an empty D with ONLY platform primitives registered in DEFS.
+/// Use this when testing a new core or rebuilding the metamodel from scratch.
+/// Most apps should use `create` instead.
+#[wasm_bindgen]
+pub fn create_bare() -> u32 { crate::create_bare_impl() }
 
 /// SYSTEM:x = ⟨o, D'⟩. The only function.
 /// Ingesting readings: system(handle, "compile", readings_text)

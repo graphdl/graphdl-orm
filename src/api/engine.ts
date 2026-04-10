@@ -6,7 +6,7 @@
  * All other operations: system(h, key, input) dispatches via ρ.
  */
 
-import { initSync, create, release, system } from '../../crates/arest/pkg/arest.js'
+import { initSync, create, create_bare, release, system } from '../../crates/arest/pkg/arest.js'
 import wasmModule from '../../crates/arest/pkg/arest_bg.wasm'
 
 let _init = false
@@ -21,10 +21,29 @@ export function currentDomainHandle(): number { return _h }
 
 export function release_domain(handle: number): void { ensureWasm(); release(handle) }
 
-/** create + compile: allocate D, ingest readings via self-modification. */
+/**
+ * create + compile: allocate D with the bundled metamodel loaded and ingest
+ * user readings on top. Use this for apps — you get a fully self-describing
+ * engine without having to pass metamodel readings yourself.
+ */
 export function compileDomainReadings(...readings: string[]): number {
   ensureWasm()
   const handle = create()
+  for (const text of readings) {
+    system(handle, 'compile', text)
+  }
+  return handle
+}
+
+/**
+ * Bare variant: allocate D with ONLY the platform primitives (compile,
+ * apply, verify_signature) and nothing else. Use this when testing a new
+ * core, or for paper-verification tests that supply the metamodel fragments
+ * explicitly via STATE_READINGS / ORDER_READINGS fixtures.
+ */
+export function compileDomainReadingsBare(...readings: string[]): number {
+  ensureWasm()
+  const handle = create_bare()
   for (const text of readings) {
     system(handle, 'compile', text)
   }

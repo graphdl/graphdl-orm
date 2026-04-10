@@ -17,6 +17,22 @@ use std::collections::HashMap;
 /// the metamodel bootstrap owns them. The FORML2 parser rejects any attempt
 /// by a user domain to shadow these. The first (bootstrap) declaration is
 /// allowed; once present in `existing_nouns`, redeclaration is rejected.
+// Bootstrap mode flag — set by lib::create_impl while loading bundled
+// metamodel readings, so the metamodel namespace guard (#23) is bypassed
+// for cross-file redeclarations within the canonical metamodel. Apps must
+// NOT set this flag; user-domain compiles always hit the guard.
+thread_local! {
+    static BOOTSTRAP_MODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn set_bootstrap_mode(on: bool) {
+    BOOTSTRAP_MODE.with(|b| b.set(on));
+}
+
+fn is_bootstrap_mode() -> bool {
+    BOOTSTRAP_MODE.with(|b| b.get())
+}
+
 pub(crate) const METAMODEL_NOUNS: &[&str] = &[
     "Noun",
     "Graph Schema",
@@ -586,10 +602,15 @@ pub fn parse_markdown_with_context(input: &str, existing_nouns: &HashMap<String,
         named_spans: HashMap::new(), autofill_spans: vec![],
     };
     parse_into(&mut standalone, input)?;
-    if let Some(reserved) = METAMODEL_NOUNS.iter()
-        .find(|n| standalone.nouns.contains_key(**n) && existing_nouns.contains_key(**n))
-    {
-        return Err(format!("metamodel noun '{}' cannot be redeclared", reserved));
+    // Metamodel namespace guard (#23). Skipped during bundled metamodel
+    // bootstrap — the metamodel is loaded as a series of cross-referencing
+    // files and legitimately redeclares the same reserved nouns.
+    if !is_bootstrap_mode() {
+        if let Some(reserved) = METAMODEL_NOUNS.iter()
+            .find(|n| standalone.nouns.contains_key(**n) && existing_nouns.contains_key(**n))
+        {
+            return Err(format!("metamodel noun '{}' cannot be redeclared", reserved));
+        }
     }
 
     let mut ir = Domain {
