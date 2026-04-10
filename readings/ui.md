@@ -58,6 +58,14 @@ Search Box(.id) is an entity type.
 
 ### Layout
 Element(.id) is an entity type.
+
+View is a subtype of Element.
+Control is a subtype of Element.
+Cell is a subtype of Element.
+Menu is a subtype of Element.
+Toolbar is a subtype of Element.
+Search Box is a subtype of Element.
+
 Dashboard(.Name) is an entity type.
 Widget(.Widget Id) is an entity type.
 Entity List(.Noun + Domain) is an entity type.
@@ -136,8 +144,8 @@ View has Color as title color.
   Each View has at most one title Color.
 View has Preferred Orientation.
   Each View has at most one Preferred Orientation.
-Noun is displayed by View.
-  Each Noun is displayed by at most one View.
+Noun is displayed by Element.
+  Each Noun is displayed by at most one Element.
 
 ### List View
 List View has Column Mode.
