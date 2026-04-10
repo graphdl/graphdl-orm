@@ -627,14 +627,30 @@ pub fn is_forbidden_url(url: &str) -> bool {
         None => return false,
     };
 
-    // Strip userinfo (before '@'), then take host up to ':' '/' '?' or '#'.
+    // Strip userinfo (before '@'), then extract the host.
     let no_userinfo = after_scheme.rfind('@').map(|i| &after_scheme[i + 1..]).unwrap_or(after_scheme);
-    let host_end = no_userinfo.find(|c: char| c == ':' || c == '/' || c == '?' || c == '#')
-        .unwrap_or(no_userinfo.len());
-    let host = &no_userinfo[..host_end];
 
-    // Strip IPv6 brackets (e.g. [::1]) so the IPv6 checks see a bare address.
-    let host_bare = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
+    // Bracketed IPv6 literal: [addr]:port/path -- must find the closing ']'
+    // BEFORE searching for ':' (otherwise we split inside the brackets).
+    // Bare host: split on the first '/', '?', or '#' to get the authority,
+    // then heuristically detect bare IPv6 (authority has 2+ colons) vs the
+    // normal host:port form (one colon).
+    let host_bare: &str = match no_userinfo.strip_prefix('[') {
+        Some(rest) => rest.find(']').map(|i| &rest[..i]).unwrap_or(rest),
+        None => {
+            let path_start = no_userinfo.find(|c: char| c == '/' || c == '?' || c == '#')
+                .unwrap_or(no_userinfo.len());
+            let authority = &no_userinfo[..path_start];
+            // Bare IPv6 has multiple ':' in the authority (no port syntax
+            // without brackets is well-defined, so treat the entire authority
+            // as the host). host:port has exactly one ':' which we strip.
+            match authority.matches(':').count() {
+                0 => authority,
+                1 => authority.split(':').next().unwrap_or(authority),
+                _ => authority, // bare IPv6 — keep colons for ULA / link-local checks
+            }
+        }
+    };
 
     // Empty host is bottom-safe — treat as forbidden.
     match host_bare.is_empty() {
@@ -2333,5 +2349,395 @@ It is forbidden that Support Response contains Markdown Syntax.";
             "Should catch dash violation");
         assert!(violations.iter().any(|v| v.constraint_text.contains("Markdown")),
             "Should catch markdown violation");
+    }
+
+    // =====================================================================
+    // Task #25 -- is_forbidden_url SSRF defense coverage.
+    // =====================================================================
+
+    // --- 1. Loopback IPv4 ---
+    #[test]
+    fn forbidden_loopback_ipv4_basic() {
+        assert!(is_forbidden_url("http://127.0.0.1"));
+        assert!(is_forbidden_url("https://127.0.0.1"));
+    }
+
+    #[test]
+    fn forbidden_loopback_ipv4_alt_octets() {
+        assert!(is_forbidden_url("http://127.1.2.3"));
+        assert!(is_forbidden_url("http://127.255.255.254"));
+    }
+
+    #[test]
+    fn forbidden_loopback_ipv4_with_port() {
+        assert!(is_forbidden_url("http://127.0.0.1:8080"));
+        assert!(is_forbidden_url("https://127.0.0.1:443/admin"));
+    }
+
+    #[test]
+    fn forbidden_loopback_ipv4_with_path() {
+        assert!(is_forbidden_url("http://127.0.0.1/admin/debug?x=1"));
+        assert!(is_forbidden_url("https://127.0.0.1/secret#frag"));
+    }
+
+    // --- 2. Loopback IPv6 ---
+    #[test]
+    fn forbidden_loopback_ipv6_bare() {
+        // `http://::1` parses with an empty host (the `::` splits host_end
+        // at the first ':'), and the empty-host branch returns forbidden.
+        assert!(is_forbidden_url("http://::1"));
+    }
+
+    // GAP: bracketed IPv6 literals are NOT detected by the current parser.
+    // `host_end` splits on the first `:` which sits inside the brackets,
+    // so `host` becomes just "[" and the bracket-strip path is never taken.
+    // Documented here as an ignored regression so the gap is visible.
+    #[test]
+fn forbidden_loopback_ipv6_bracketed_with_port() {
+        assert!(is_forbidden_url("http://[::1]:8080"));
+        assert!(is_forbidden_url("https://[::1]:443/api"));
+    }
+
+    // --- 3. Link-local IPv4 (incl. AWS metadata) ---
+    #[test]
+    fn forbidden_link_local_ipv4() {
+        assert!(is_forbidden_url("http://169.254.0.1"));
+        assert!(is_forbidden_url("http://169.254.255.255"));
+    }
+
+    #[test]
+    fn forbidden_aws_metadata_endpoint() {
+        assert!(is_forbidden_url("http://169.254.169.254/latest/meta-data/"));
+        assert!(is_forbidden_url("https://169.254.169.254"));
+    }
+
+    // --- 4. Private IPv4 ranges ---
+    #[test]
+    fn forbidden_private_10_range() {
+        assert!(is_forbidden_url("http://10.0.0.1"));
+        assert!(is_forbidden_url("https://10.255.255.254:8000"));
+    }
+
+    #[test]
+    fn forbidden_private_172_range_lower_boundary() {
+        assert!(is_forbidden_url("http://172.16.0.1"));
+    }
+
+    #[test]
+    fn forbidden_private_172_range_upper_boundary() {
+        assert!(is_forbidden_url("http://172.31.255.255"));
+    }
+
+    #[test]
+    fn forbidden_private_192_168_range() {
+        assert!(is_forbidden_url("http://192.168.1.1"));
+        assert!(is_forbidden_url("https://192.168.0.1:9200/_cluster"));
+    }
+
+    // --- 5. IPv6 link-local ---
+    #[test]
+    fn forbidden_ipv6_link_local_fe80() {
+        assert!(is_forbidden_url("http://fe80::1"));
+    }
+
+    #[test]
+    fn forbidden_ipv6_link_local_febf() {
+        assert!(is_forbidden_url("http://febf::ffff"));
+    }
+
+    // GAP: bracketed IPv6 literals are never detected (see note on
+    // forbidden_loopback_ipv6_bracketed_with_port). Same underlying bug.
+    #[test]
+fn forbidden_ipv6_link_local_bracketed() {
+        assert!(is_forbidden_url("http://[fe80::1]:8080"));
+        assert!(is_forbidden_url("https://[febf::dead:beef]/x"));
+    }
+
+    // --- 6. IPv6 Unique Local (ULA) ---
+    //
+    // GAP: the ULA check requires host_bare.contains(':'), but host_end
+    // splits on the first ':' so bare-form `fc00::1` arrives here as
+    // "fc00" with no colon. The check never fires. Documented as ignored
+    // regressions.
+    #[test]
+fn forbidden_ipv6_ula_fc00() {
+        assert!(is_forbidden_url("http://fc00::1"));
+        assert!(is_forbidden_url("http://[fc00::1]:8080"));
+    }
+
+    #[test]
+fn forbidden_ipv6_ula_fd() {
+        assert!(is_forbidden_url("http://fd12::abcd"));
+        assert!(is_forbidden_url("https://[fd12:3456::1]/api"));
+    }
+
+    // --- 7. file:// scheme ---
+    #[test]
+    fn forbidden_file_scheme_absolute() {
+        assert!(is_forbidden_url("file:///etc/passwd"));
+    }
+
+    #[test]
+    fn forbidden_file_scheme_with_host() {
+        assert!(is_forbidden_url("file://localhost/etc/hosts"));
+    }
+
+    #[test]
+    fn forbidden_file_scheme_case_insensitive() {
+        assert!(is_forbidden_url("FILE:///etc/passwd"));
+        assert!(is_forbidden_url("File:///C:/Windows/System32"));
+    }
+
+    // --- 8. Internal DNS suffixes ---
+    #[test]
+    fn forbidden_local_suffix() {
+        assert!(is_forbidden_url("http://printer.local"));
+        assert!(is_forbidden_url("https://service.local/api"));
+    }
+
+    #[test]
+    fn forbidden_internal_suffix() {
+        assert!(is_forbidden_url("http://api.internal"));
+        assert!(is_forbidden_url("https://vault.corp.internal/secret"));
+    }
+
+    #[test]
+    fn forbidden_localhost_suffix() {
+        assert!(is_forbidden_url("http://dev.localhost"));
+        assert!(is_forbidden_url("https://app.localhost:3000"));
+    }
+
+    // --- 9. Bare localhost ---
+    #[test]
+    fn forbidden_bare_localhost() {
+        assert!(is_forbidden_url("http://localhost"));
+        assert!(is_forbidden_url("https://localhost:8080"));
+        assert!(is_forbidden_url("http://localhost/api/admin"));
+    }
+
+    #[test]
+    fn forbidden_zero_host() {
+        assert!(is_forbidden_url("http://0.0.0.0"));
+        assert!(is_forbidden_url("http://0.0.0.0:8080/"));
+    }
+
+    // --- 10. PUBLIC URLs must NOT be rejected ---
+    #[test]
+    fn allowed_public_https_hostname() {
+        assert!(!is_forbidden_url("https://example.com"));
+        assert!(!is_forbidden_url("https://example.com/path?x=1"));
+    }
+
+    #[test]
+    fn allowed_public_ipv4_dns_resolver() {
+        assert!(!is_forbidden_url("http://8.8.8.8"));
+        assert!(!is_forbidden_url("https://8.8.4.4:443/dns-query"));
+    }
+
+    #[test]
+    fn allowed_public_api_endpoint() {
+        assert!(!is_forbidden_url("https://api.stripe.com/v1/charges"));
+        assert!(!is_forbidden_url("https://api.github.com/repos/anthropic/foo"));
+    }
+
+    #[test]
+    fn allowed_public_172_outside_private_range() {
+        // 172.15.x.x and 172.32.x.x are PUBLIC (private = 172.16-31).
+        assert!(!is_forbidden_url("http://172.15.0.1"));
+        assert!(!is_forbidden_url("http://172.32.0.1"));
+    }
+
+    #[test]
+    fn allowed_169_non_link_local() {
+        // 169.1.0.1 is not link-local (only 169.254.*.* is).
+        assert!(!is_forbidden_url("http://169.1.0.1"));
+    }
+
+    // --- 11. Edge cases ---
+    #[test]
+    fn forbidden_empty_string() {
+        // Empty string has no scheme; is_forbidden_url falls through -> false.
+        // This is documented: non-http schemes are not rejected. The guard is
+        // scoped to federated HTTP URLs only. Ensure at least no panic.
+        let _ = is_forbidden_url("");
+    }
+
+    #[test]
+    fn forbidden_empty_host_in_http_url() {
+        // http:// with no host -> empty host -> treated as forbidden.
+        assert!(is_forbidden_url("http://"));
+        assert!(is_forbidden_url("https://"));
+    }
+
+    #[test]
+    fn forbidden_malformed_url_no_scheme() {
+        // No http(s) scheme -> not rejected (non-http schemes fall through).
+        assert!(!is_forbidden_url("not a url"));
+        assert!(!is_forbidden_url("garbage://////"));
+    }
+
+    #[test]
+    fn forbidden_url_with_userinfo_loopback() {
+        // Userinfo must be stripped before host check.
+        assert!(is_forbidden_url("http://user:pass@127.0.0.1"));
+        assert!(is_forbidden_url("http://admin@localhost:8080/"));
+    }
+
+    #[test]
+    fn forbidden_url_with_userinfo_public_allowed() {
+        // Userinfo stripped and real host is public -> allowed.
+        assert!(!is_forbidden_url("http://user:pass@example.com"));
+    }
+
+    #[test]
+    fn forbidden_url_trims_whitespace() {
+        assert!(is_forbidden_url("  http://127.0.0.1  "));
+        assert!(is_forbidden_url("\thttps://localhost\n"));
+    }
+
+    #[test]
+    fn forbidden_url_is_case_insensitive_host() {
+        assert!(is_forbidden_url("http://LOCALHOST"));
+        assert!(is_forbidden_url("http://Printer.Local"));
+    }
+
+    // =====================================================================
+    // Task #23 -- Metamodel namespace parser guard coverage.
+    // =====================================================================
+    //
+    // The parser-level guard lives in `parse_markdown_with_context`. It
+    // rejects user domains that redeclare a reserved metamodel noun when
+    // that noun is already present in `existing_nouns` (meaning the
+    // metamodel bootstrap has populated it). The bootstrap case (no
+    // pre-existing nouns) is allowed to declare them exactly once.
+
+    fn metamodel_nouns_map() -> HashMap<String, NounDef> {
+        let mut m = HashMap::new();
+        for n in METAMODEL_NOUNS {
+            m.insert((*n).to_string(), NounDef {
+                object_type: "entity".into(),
+                world_assumption: WorldAssumption::default(),
+            });
+        }
+        m
+    }
+
+    #[test]
+    fn metamodel_guard_rejects_noun_redeclaration() {
+        let existing = metamodel_nouns_map();
+        let input = "# UserDomain\nNoun(.Name) is an entity type.";
+        let err = parse_markdown_with_nouns(input, &existing).unwrap_err();
+        assert!(err.contains("metamodel noun 'Noun' cannot be redeclared"),
+            "expected rejection message for 'Noun', got: {}", err);
+    }
+
+    #[test]
+    fn metamodel_guard_rejects_constraint_redeclaration() {
+        let existing = metamodel_nouns_map();
+        let input = "# UserDomain\nConstraint(.Id) is an entity type.";
+        let err = parse_markdown_with_nouns(input, &existing).unwrap_err();
+        assert!(err.contains("metamodel noun 'Constraint' cannot be redeclared"),
+            "expected rejection message for 'Constraint', got: {}", err);
+    }
+
+    #[test]
+    fn metamodel_guard_accepts_non_reserved_names() {
+        let existing = metamodel_nouns_map();
+        let input = "# Sales\n\
+                     Order(.Id) is an entity type.\n\
+                     Customer(.Name) is an entity type.";
+        let ir = parse_markdown_with_nouns(input, &existing)
+            .expect("non-reserved user domain should parse when metamodel is already present");
+        assert!(ir.nouns.contains_key("Order"));
+        assert!(ir.nouns.contains_key("Customer"));
+        // Existing metamodel nouns remain visible in the merged IR.
+        assert!(ir.nouns.contains_key("Noun"));
+    }
+
+    #[test]
+    fn metamodel_guard_bootstrap_first_compile_succeeds() {
+        // Bootstrap case: `existing_nouns` is empty, so the metamodel itself
+        // is being compiled for the first time. Redeclaration guard must NOT
+        // fire; the parse must succeed and populate the reserved nouns.
+        let empty: HashMap<String, NounDef> = HashMap::new();
+        let input = "# Metamodel\n\
+                     Noun(.Name) is an entity type.\n\
+                     Constraint(.Id) is an entity type.\n\
+                     Role(.Id) is an entity type.";
+        let ir = parse_markdown_with_nouns(input, &empty)
+            .expect("bootstrap compile of metamodel nouns must succeed");
+        assert!(ir.nouns.contains_key("Noun"));
+        assert!(ir.nouns.contains_key("Constraint"));
+        assert!(ir.nouns.contains_key("Role"));
+    }
+
+    #[test]
+    fn metamodel_guard_allows_user_domain_not_touching_reserved_before_bootstrap() {
+        // Before the bootstrap has run, `existing_nouns` is empty. A user
+        // domain that only declares its own names must parse fine.
+        let empty: HashMap<String, NounDef> = HashMap::new();
+        let input = "# Sales\nOrder(.Id) is an entity type.";
+        let ir = parse_markdown_with_nouns(input, &empty).unwrap();
+        assert!(ir.nouns.contains_key("Order"));
+    }
+
+    // One test per reserved metamodel noun. Each verifies that redeclaring
+    // that specific noun is rejected by the parser guard.
+
+    fn assert_reserved_rejected(noun: &str, decl: &str) {
+        let existing = metamodel_nouns_map();
+        let input = format!("# UserDomain\n{}", decl);
+        let err = parse_markdown_with_nouns(&input, &existing).unwrap_err();
+        let needle = format!("metamodel noun '{}' cannot be redeclared", noun);
+        assert!(err.contains(&needle),
+            "expected rejection message '{}', got: {}", needle, err);
+    }
+
+    #[test]
+    fn metamodel_guard_rejects_reserved_noun() {
+        assert_reserved_rejected("Noun", "Noun(.Name) is an entity type.");
+    }
+
+    #[test]
+    fn metamodel_guard_rejects_reserved_graph_schema() {
+        assert_reserved_rejected("Graph Schema", "Graph Schema(.Id) is an entity type.");
+    }
+
+    #[test]
+    fn metamodel_guard_rejects_reserved_role() {
+        assert_reserved_rejected("Role", "Role(.Id) is an entity type.");
+    }
+
+    #[test]
+    fn metamodel_guard_rejects_reserved_constraint() {
+        assert_reserved_rejected("Constraint", "Constraint(.Id) is an entity type.");
+    }
+
+    #[test]
+    fn metamodel_guard_rejects_reserved_state_machine_definition() {
+        assert_reserved_rejected(
+            "State Machine Definition",
+            "State Machine Definition(.Id) is an entity type.",
+        );
+    }
+
+    #[test]
+    fn metamodel_guard_rejects_reserved_transition() {
+        assert_reserved_rejected("Transition", "Transition(.Id) is an entity type.");
+    }
+
+    #[test]
+    fn metamodel_guard_rejects_reserved_status() {
+        assert_reserved_rejected("Status", "Status(.Id) is an entity type.");
+    }
+
+    #[test]
+    fn metamodel_guard_rejects_reserved_event_type() {
+        assert_reserved_rejected("Event Type", "Event Type(.Id) is an entity type.");
+    }
+
+    #[test]
+    fn metamodel_guard_rejects_reserved_domain_change() {
+        assert_reserved_rejected("Domain Change", "Domain Change(.Id) is an entity type.");
     }
 }

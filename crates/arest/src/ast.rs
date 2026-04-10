@@ -3161,4 +3161,618 @@ mod tests {
         assert_eq!(binding(&facts[0], "status"), Some("compiled"));
         assert_eq!(binding(&facts[0], "Domain Change"), Some("compile-0"));
     }
+
+    // ── Security #26: audit trail unit tests ─────────────────────
+    //
+    // Direct coverage of the `record_audit` helper that backs every
+    // compile/apply audit push. Test the three shape invariants:
+    //   1. on empty state, first entry gets sequence 0;
+    //   2. on an N-entry state, the next entry gets sequence N;
+    //   3. all four bindings (operation, outcome, sequence, sender)
+    //      are present, with an omitted sender rendering as "".
+
+    #[test]
+    fn record_audit_appends_entry_with_sequence_zero_on_empty_state() {
+        let state = Object::phi();
+        let result = record_audit(&state, "compile", "compiled", Some("root@example"));
+        let log = fetch_or_phi("audit_log", &result);
+        let facts = log.as_seq().expect("audit_log should be a sequence");
+        assert_eq!(facts.len(), 1, "empty state should yield exactly one audit entry");
+        assert_eq!(binding(&facts[0], "operation"), Some("compile"));
+        assert_eq!(binding(&facts[0], "outcome"), Some("compiled"));
+        assert_eq!(binding(&facts[0], "sequence"), Some("0"));
+        assert_eq!(binding(&facts[0], "sender"), Some("root@example"));
+    }
+
+    #[test]
+    fn record_audit_next_entry_uses_cell_length_as_sequence() {
+        // Pre-populate the audit_log with two arbitrary prior entries.
+        let state = record_audit(&Object::phi(), "compile", "compiled", None);
+        let state = record_audit(&state, "apply:create", "ok", Some("u1"));
+        // The third push must observe sequence = 2 (current cell length).
+        let state = record_audit(&state, "apply:create", "rejected", Some("u2"));
+        let log = fetch_or_phi("audit_log", &state);
+        let facts = log.as_seq().expect("audit_log should be a sequence");
+        assert_eq!(facts.len(), 3, "three pushes should yield three entries");
+        assert_eq!(binding(&facts[2], "operation"), Some("apply:create"));
+        assert_eq!(binding(&facts[2], "outcome"), Some("rejected"));
+        assert_eq!(binding(&facts[2], "sequence"), Some("2"));
+        assert_eq!(binding(&facts[2], "sender"), Some("u2"));
+    }
+
+    #[test]
+    fn record_audit_omitted_sender_renders_as_empty_string() {
+        let result = record_audit(&Object::phi(), "compile", "compiled", None);
+        let log = fetch_or_phi("audit_log", &result);
+        let facts = log.as_seq().expect("audit_log should be a sequence");
+        assert_eq!(facts.len(), 1);
+        // `None` sender must materialize as "" so downstream binding
+        // lookups never hit a missing key (totality of the fact schema).
+        assert_eq!(binding(&facts[0], "sender"), Some(""));
+        assert_eq!(binding(&facts[0], "sequence"), Some("0"));
+    }
+
+    // ── Security #19: per-field input bound (PLATFORM_MAX_FIELD) ─────
+    //
+    // `command_field_overflow` walks every Command variant and returns
+    // the first field name whose String value exceeds PLATFORM_MAX_FIELD
+    // (64KB). These tests lock the contract down per variant per field,
+    // including HashMap key/value overflow on fields/bindings, and then
+    // cover the integration path via `platform_apply_command` for both
+    // the PLATFORM_MAX_INPUT (1MB) and PLATFORM_MAX_FIELD gates.
+
+    use crate::arest::Command as ArestCommand;
+
+    fn huge() -> String {
+        "a".repeat(PLATFORM_MAX_FIELD + 1)
+    }
+
+    fn ok_map() -> std::collections::HashMap<String, String> {
+        let mut m = std::collections::HashMap::new();
+        m.insert("k".to_string(), "v".to_string());
+        m
+    }
+
+    // ── CreateEntity variants ────────────────────────────────────
+
+    #[test]
+    fn command_field_overflow_create_noun_oversized() {
+        let cmd = ArestCommand::CreateEntity {
+            noun: huge(),
+            domain: "d".into(),
+            id: None,
+            fields: ok_map(),
+            sender: None,
+            signature: None,
+        };
+        assert_eq!(command_field_overflow(&cmd), Some("noun"));
+    }
+
+    #[test]
+    fn command_field_overflow_create_domain_oversized() {
+        let cmd = ArestCommand::CreateEntity {
+            noun: "n".into(),
+            domain: huge(),
+            id: None,
+            fields: ok_map(),
+            sender: None,
+            signature: None,
+        };
+        assert_eq!(command_field_overflow(&cmd), Some("domain"));
+    }
+
+    #[test]
+    fn command_field_overflow_create_id_oversized() {
+        let cmd = ArestCommand::CreateEntity {
+            noun: "n".into(),
+            domain: "d".into(),
+            id: Some(huge()),
+            fields: ok_map(),
+            sender: None,
+            signature: None,
+        };
+        assert_eq!(command_field_overflow(&cmd), Some("id"));
+    }
+
+    #[test]
+    fn command_field_overflow_create_fields_key_oversized() {
+        let mut fields = std::collections::HashMap::new();
+        fields.insert(huge(), "v".to_string());
+        let cmd = ArestCommand::CreateEntity {
+            noun: "n".into(),
+            domain: "d".into(),
+            id: None,
+            fields,
+            sender: None,
+            signature: None,
+        };
+        assert_eq!(command_field_overflow(&cmd), Some("fields"));
+    }
+
+    #[test]
+    fn command_field_overflow_create_fields_value_oversized() {
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("k".to_string(), huge());
+        let cmd = ArestCommand::CreateEntity {
+            noun: "n".into(),
+            domain: "d".into(),
+            id: None,
+            fields,
+            sender: None,
+            signature: None,
+        };
+        assert_eq!(command_field_overflow(&cmd), Some("fields"));
+    }
+
+    #[test]
+    fn command_field_overflow_create_sender_oversized() {
+        let cmd = ArestCommand::CreateEntity {
+            noun: "n".into(),
+            domain: "d".into(),
+            id: None,
+            fields: ok_map(),
+            sender: Some(huge()),
+            signature: None,
+        };
+        assert_eq!(command_field_overflow(&cmd), Some("sender"));
+    }
+
+    #[test]
+    fn command_field_overflow_create_signature_oversized() {
+        let cmd = ArestCommand::CreateEntity {
+            noun: "n".into(),
+            domain: "d".into(),
+            id: None,
+            fields: ok_map(),
+            sender: None,
+            signature: Some(huge()),
+        };
+        assert_eq!(command_field_overflow(&cmd), Some("signature"));
+    }
+
+    #[test]
+    fn command_field_overflow_create_valid_returns_none() {
+        let cmd = ArestCommand::CreateEntity {
+            noun: "Person".into(),
+            domain: "d".into(),
+            id: Some("p-1".into()),
+            fields: ok_map(),
+            sender: Some("u1".into()),
+            signature: Some("sig".into()),
+        };
+        assert_eq!(command_field_overflow(&cmd), None);
+    }
+
+    // ── Transition variants ──────────────────────────────────────
+
+    #[test]
+    fn command_field_overflow_transition_entity_id_oversized() {
+        let cmd = ArestCommand::Transition {
+            entity_id: huge(),
+            event: "e".into(),
+            domain: "d".into(),
+            current_status: None,
+            sender: None,
+            signature: None,
+        };
+        assert_eq!(command_field_overflow(&cmd), Some("entityId"));
+    }
+
+    #[test]
+    fn command_field_overflow_transition_event_oversized() {
+        let cmd = ArestCommand::Transition {
+            entity_id: "e-1".into(),
+            event: huge(),
+            domain: "d".into(),
+            current_status: None,
+            sender: None,
+            signature: None,
+        };
+        assert_eq!(command_field_overflow(&cmd), Some("event"));
+    }
+
+    #[test]
+    fn command_field_overflow_transition_domain_oversized() {
+        let cmd = ArestCommand::Transition {
+            entity_id: "e-1".into(),
+            event: "e".into(),
+            domain: huge(),
+            current_status: None,
+            sender: None,
+            signature: None,
+        };
+        assert_eq!(command_field_overflow(&cmd), Some("domain"));
+    }
+
+    #[test]
+    fn command_field_overflow_transition_current_status_oversized() {
+        let cmd = ArestCommand::Transition {
+            entity_id: "e-1".into(),
+            event: "e".into(),
+            domain: "d".into(),
+            current_status: Some(huge()),
+            sender: None,
+            signature: None,
+        };
+        assert_eq!(command_field_overflow(&cmd), Some("currentStatus"));
+    }
+
+    #[test]
+    fn command_field_overflow_transition_sender_oversized() {
+        let cmd = ArestCommand::Transition {
+            entity_id: "e-1".into(),
+            event: "e".into(),
+            domain: "d".into(),
+            current_status: None,
+            sender: Some(huge()),
+            signature: None,
+        };
+        assert_eq!(command_field_overflow(&cmd), Some("sender"));
+    }
+
+    #[test]
+    fn command_field_overflow_transition_signature_oversized() {
+        let cmd = ArestCommand::Transition {
+            entity_id: "e-1".into(),
+            event: "e".into(),
+            domain: "d".into(),
+            current_status: None,
+            sender: None,
+            signature: Some(huge()),
+        };
+        assert_eq!(command_field_overflow(&cmd), Some("signature"));
+    }
+
+    #[test]
+    fn command_field_overflow_transition_valid_returns_none() {
+        let cmd = ArestCommand::Transition {
+            entity_id: "e-1".into(),
+            event: "approve".into(),
+            domain: "d".into(),
+            current_status: Some("draft".into()),
+            sender: Some("u1".into()),
+            signature: Some("sig".into()),
+        };
+        assert_eq!(command_field_overflow(&cmd), None);
+    }
+
+    // ── Query variants ───────────────────────────────────────────
+
+    #[test]
+    fn command_field_overflow_query_schema_id_oversized() {
+        let cmd = ArestCommand::Query {
+            schema_id: huge(),
+            domain: "d".into(),
+            target: "t".into(),
+            bindings: ok_map(),
+            sender: None,
+            signature: None,
+        };
+        assert_eq!(command_field_overflow(&cmd), Some("schemaId"));
+    }
+
+    #[test]
+    fn command_field_overflow_query_domain_oversized() {
+        let cmd = ArestCommand::Query {
+            schema_id: "s".into(),
+            domain: huge(),
+            target: "t".into(),
+            bindings: ok_map(),
+            sender: None,
+            signature: None,
+        };
+        assert_eq!(command_field_overflow(&cmd), Some("domain"));
+    }
+
+    #[test]
+    fn command_field_overflow_query_target_oversized() {
+        let cmd = ArestCommand::Query {
+            schema_id: "s".into(),
+            domain: "d".into(),
+            target: huge(),
+            bindings: ok_map(),
+            sender: None,
+            signature: None,
+        };
+        assert_eq!(command_field_overflow(&cmd), Some("target"));
+    }
+
+    #[test]
+    fn command_field_overflow_query_bindings_key_oversized() {
+        let mut bindings = std::collections::HashMap::new();
+        bindings.insert(huge(), "v".to_string());
+        let cmd = ArestCommand::Query {
+            schema_id: "s".into(),
+            domain: "d".into(),
+            target: "t".into(),
+            bindings,
+            sender: None,
+            signature: None,
+        };
+        assert_eq!(command_field_overflow(&cmd), Some("bindings"));
+    }
+
+    #[test]
+    fn command_field_overflow_query_bindings_value_oversized() {
+        let mut bindings = std::collections::HashMap::new();
+        bindings.insert("k".to_string(), huge());
+        let cmd = ArestCommand::Query {
+            schema_id: "s".into(),
+            domain: "d".into(),
+            target: "t".into(),
+            bindings,
+            sender: None,
+            signature: None,
+        };
+        assert_eq!(command_field_overflow(&cmd), Some("bindings"));
+    }
+
+    #[test]
+    fn command_field_overflow_query_sender_oversized() {
+        let cmd = ArestCommand::Query {
+            schema_id: "s".into(),
+            domain: "d".into(),
+            target: "t".into(),
+            bindings: ok_map(),
+            sender: Some(huge()),
+            signature: None,
+        };
+        assert_eq!(command_field_overflow(&cmd), Some("sender"));
+    }
+
+    #[test]
+    fn command_field_overflow_query_signature_oversized() {
+        let cmd = ArestCommand::Query {
+            schema_id: "s".into(),
+            domain: "d".into(),
+            target: "t".into(),
+            bindings: ok_map(),
+            sender: None,
+            signature: Some(huge()),
+        };
+        assert_eq!(command_field_overflow(&cmd), Some("signature"));
+    }
+
+    #[test]
+    fn command_field_overflow_query_valid_returns_none() {
+        let cmd = ArestCommand::Query {
+            schema_id: "s".into(),
+            domain: "d".into(),
+            target: "t".into(),
+            bindings: ok_map(),
+            sender: Some("u1".into()),
+            signature: Some("sig".into()),
+        };
+        assert_eq!(command_field_overflow(&cmd), None);
+    }
+
+    // ── UpdateEntity variants ────────────────────────────────────
+
+    #[test]
+    fn command_field_overflow_update_noun_oversized() {
+        let cmd = ArestCommand::UpdateEntity {
+            noun: huge(),
+            domain: "d".into(),
+            entity_id: "e".into(),
+            fields: ok_map(),
+            sender: None,
+            signature: None,
+        };
+        assert_eq!(command_field_overflow(&cmd), Some("noun"));
+    }
+
+    #[test]
+    fn command_field_overflow_update_domain_oversized() {
+        let cmd = ArestCommand::UpdateEntity {
+            noun: "n".into(),
+            domain: huge(),
+            entity_id: "e".into(),
+            fields: ok_map(),
+            sender: None,
+            signature: None,
+        };
+        assert_eq!(command_field_overflow(&cmd), Some("domain"));
+    }
+
+    #[test]
+    fn command_field_overflow_update_entity_id_oversized() {
+        let cmd = ArestCommand::UpdateEntity {
+            noun: "n".into(),
+            domain: "d".into(),
+            entity_id: huge(),
+            fields: ok_map(),
+            sender: None,
+            signature: None,
+        };
+        assert_eq!(command_field_overflow(&cmd), Some("entityId"));
+    }
+
+    #[test]
+    fn command_field_overflow_update_fields_key_oversized() {
+        let mut fields = std::collections::HashMap::new();
+        fields.insert(huge(), "v".to_string());
+        let cmd = ArestCommand::UpdateEntity {
+            noun: "n".into(),
+            domain: "d".into(),
+            entity_id: "e".into(),
+            fields,
+            sender: None,
+            signature: None,
+        };
+        assert_eq!(command_field_overflow(&cmd), Some("fields"));
+    }
+
+    #[test]
+    fn command_field_overflow_update_fields_value_oversized() {
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("k".to_string(), huge());
+        let cmd = ArestCommand::UpdateEntity {
+            noun: "n".into(),
+            domain: "d".into(),
+            entity_id: "e".into(),
+            fields,
+            sender: None,
+            signature: None,
+        };
+        assert_eq!(command_field_overflow(&cmd), Some("fields"));
+    }
+
+    #[test]
+    fn command_field_overflow_update_sender_oversized() {
+        let cmd = ArestCommand::UpdateEntity {
+            noun: "n".into(),
+            domain: "d".into(),
+            entity_id: "e".into(),
+            fields: ok_map(),
+            sender: Some(huge()),
+            signature: None,
+        };
+        assert_eq!(command_field_overflow(&cmd), Some("sender"));
+    }
+
+    #[test]
+    fn command_field_overflow_update_signature_oversized() {
+        let cmd = ArestCommand::UpdateEntity {
+            noun: "n".into(),
+            domain: "d".into(),
+            entity_id: "e".into(),
+            fields: ok_map(),
+            sender: None,
+            signature: Some(huge()),
+        };
+        assert_eq!(command_field_overflow(&cmd), Some("signature"));
+    }
+
+    #[test]
+    fn command_field_overflow_update_valid_returns_none() {
+        let cmd = ArestCommand::UpdateEntity {
+            noun: "Person".into(),
+            domain: "d".into(),
+            entity_id: "p-1".into(),
+            fields: ok_map(),
+            sender: Some("u1".into()),
+            signature: Some("sig".into()),
+        };
+        assert_eq!(command_field_overflow(&cmd), None);
+    }
+
+    // ── LoadReadings variants ────────────────────────────────────
+
+    #[test]
+    fn command_field_overflow_load_readings_markdown_oversized() {
+        let cmd = ArestCommand::LoadReadings {
+            markdown: huge(),
+            domain: "d".into(),
+            sender: None,
+            signature: None,
+        };
+        assert_eq!(command_field_overflow(&cmd), Some("markdown"));
+    }
+
+    #[test]
+    fn command_field_overflow_load_readings_domain_oversized() {
+        let cmd = ArestCommand::LoadReadings {
+            markdown: "md".into(),
+            domain: huge(),
+            sender: None,
+            signature: None,
+        };
+        assert_eq!(command_field_overflow(&cmd), Some("domain"));
+    }
+
+    #[test]
+    fn command_field_overflow_load_readings_sender_oversized() {
+        let cmd = ArestCommand::LoadReadings {
+            markdown: "md".into(),
+            domain: "d".into(),
+            sender: Some(huge()),
+            signature: None,
+        };
+        assert_eq!(command_field_overflow(&cmd), Some("sender"));
+    }
+
+    #[test]
+    fn command_field_overflow_load_readings_signature_oversized() {
+        let cmd = ArestCommand::LoadReadings {
+            markdown: "md".into(),
+            domain: "d".into(),
+            sender: None,
+            signature: Some(huge()),
+        };
+        assert_eq!(command_field_overflow(&cmd), Some("signature"));
+    }
+
+    #[test]
+    fn command_field_overflow_load_readings_valid_returns_none() {
+        let cmd = ArestCommand::LoadReadings {
+            markdown: "Each Person has a name.".into(),
+            domain: "d".into(),
+            sender: Some("u1".into()),
+            signature: Some("sig".into()),
+        };
+        assert_eq!(command_field_overflow(&cmd), None);
+    }
+
+    // ── platform_apply_command integration ───────────────────────
+
+    #[test]
+    fn platform_apply_command_rejects_oversized_input_buffer() {
+        // Construct an atom whose length strictly exceeds PLATFORM_MAX_INPUT.
+        // The 1MB gate must reject BEFORE serde parsing even runs, so any
+        // content is fine — we just need length > PLATFORM_MAX_INPUT.
+        let oversized = "a".repeat(PLATFORM_MAX_INPUT + 1);
+        let input = Object::atom(&oversized);
+        let result = platform_apply_command(&input, &Object::phi());
+        assert_eq!(
+            result.as_atom(),
+            Some("⊥ input exceeds platform buffer"),
+            "oversized input must be rejected by the PLATFORM_MAX_INPUT gate"
+        );
+    }
+
+    #[test]
+    fn platform_apply_command_rejects_oversized_field_with_field_name() {
+        // Build a JSON command whose "noun" field exceeds PLATFORM_MAX_FIELD
+        // but whose total length stays under PLATFORM_MAX_INPUT (1MB).
+        // Then the input-buffer gate passes, serde parses the command, and
+        // command_field_overflow returns Some("noun"), yielding the
+        // "⊥ field '<name>' exceeds platform buffer" atom.
+        let big_noun = "a".repeat(PLATFORM_MAX_FIELD + 1);
+        let json = format!(
+            r#"{{"type":"createEntity","noun":"{}","domain":"d","fields":{{}}}}"#,
+            big_noun
+        );
+        assert!(
+            json.len() <= PLATFORM_MAX_INPUT,
+            "test fixture must stay within PLATFORM_MAX_INPUT"
+        );
+        let input = Object::atom(&json);
+        let result = platform_apply_command(&input, &Object::phi());
+        assert_eq!(
+            result.as_atom(),
+            Some("⊥ field 'noun' exceeds platform buffer"),
+            "oversized field must be rejected with its name in the error atom"
+        );
+    }
+
+    #[test]
+    fn platform_apply_command_rejects_oversized_fields_map_value() {
+        // HashMap-based fields: oversize a single value in `fields`.
+        // The error atom must name the container field ("fields").
+        let big_val = "a".repeat(PLATFORM_MAX_FIELD + 1);
+        let json = format!(
+            r#"{{"type":"createEntity","noun":"Person","domain":"d","fields":{{"name":"{}"}}}}"#,
+            big_val
+        );
+        assert!(
+            json.len() <= PLATFORM_MAX_INPUT,
+            "test fixture must stay within PLATFORM_MAX_INPUT"
+        );
+        let input = Object::atom(&json);
+        let result = platform_apply_command(&input, &Object::phi());
+        assert_eq!(
+            result.as_atom(),
+            Some("⊥ field 'fields' exceeds platform buffer"),
+        );
+    }
 }

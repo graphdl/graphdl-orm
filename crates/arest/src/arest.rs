@@ -1136,6 +1136,157 @@ Transition 'place' is to Status 'Placed'.
         assert_eq!(ast::binding(first, "sender"), Some("auditor@example.com"));
     }
 
+    /// #26: successful `platform_compile` must push an audit_log fact with
+    /// operation=compile, outcome=compiled. Exercises the ρ-level compile
+    /// primitive — same pattern as the compile_history #22 test.
+    #[test]
+    fn platform_compile_appends_audit_log_entry_on_success() {
+        let readings = "Each Person has a name.";
+        let initial_d = ast::defs_to_state(
+            &vec![("compile".to_string(), ast::Func::Platform("compile".to_string()))],
+            &ast::Object::phi(),
+        );
+        let result = ast::apply(
+            &ast::Func::Platform("compile".to_string()),
+            &ast::Object::atom(readings),
+            &initial_d,
+        );
+        // Must be a successful state, not a ⊥ atom error.
+        assert!(
+            result.as_atom().map(|s| !s.starts_with("⊥")).unwrap_or(true),
+            "compile should not return an error atom, got: {:?}",
+            result
+        );
+        let log = ast::fetch_or_phi("audit_log", &result);
+        let entries = log.as_seq().expect("audit_log cell should exist after successful compile");
+        assert_eq!(entries.len(), 1, "expected exactly one audit_log entry after one compile");
+        assert_eq!(ast::binding(&entries[0], "operation"), Some("compile"));
+        assert_eq!(ast::binding(&entries[0], "outcome"), Some("compiled"));
+        assert_eq!(ast::binding(&entries[0], "sequence"), Some("0"));
+        // Compile has no sender — must render as empty string.
+        assert_eq!(ast::binding(&entries[0], "sender"), Some(""));
+    }
+
+    /// #26: rejected apply (alethic MC violation) must still push an
+    /// audit_log entry with operation=apply:create, outcome=rejected.
+    /// Uses the same AUTH_DOMAIN pattern as
+    /// `mc_fires_on_missing_mandatory_role_for_new_entity`.
+    #[test]
+    fn rejected_create_appends_audit_log_rejected_entry() {
+        let readings = r#"# Auth
+
+## Entity Types
+Order(.OrderId) is an entity type.
+User(.Email) is an entity type.
+
+## Value Types
+OrderId is a value type.
+Email is a value type.
+
+## Fact Types
+### Order
+Order is created by User.
+
+## Constraints
+Each Order is created by exactly one User.
+"#;
+        let state = crate::parse_forml2::parse_to_state(readings).unwrap();
+        let defs = crate::compile::compile_to_defs_state(&state);
+        let def_map = ast::defs_to_state(&defs, &state);
+
+        // Create without a User fact and without a sender — MC must
+        // reject this command (same pattern as the mc_fires_on_... test).
+        let mut fields = HashMap::new();
+        fields.insert("OrderId".to_string(), "ord-rej".to_string());
+        let cmd = Command::CreateEntity {
+            noun: "Order".to_string(),
+            domain: "test".to_string(),
+            id: Some("ord-rej".to_string()),
+            fields,
+            sender: None,
+            signature: None,
+        };
+        let result = apply_command_defs(&def_map, &cmd, &state);
+        assert!(result.rejected, "MC violation must reject the command");
+
+        // Even on rejection, the returned state must carry an audit entry
+        // so a host that chooses to persist for audit-only purposes has
+        // the rejection recorded.
+        let log = ast::fetch_or_phi("audit_log", &result.state);
+        let entries = log.as_seq().expect("audit_log cell must exist after rejected apply");
+        assert_eq!(entries.len(), 1, "rejected apply should still push one audit entry");
+        assert_eq!(ast::binding(&entries[0], "operation"), Some("apply:create"));
+        assert_eq!(ast::binding(&entries[0], "outcome"), Some("rejected"));
+        assert_eq!(ast::binding(&entries[0], "sequence"), Some("0"));
+        // No sender supplied → empty string binding (None materializes as "").
+        assert_eq!(ast::binding(&entries[0], "sender"), Some(""));
+    }
+
+    /// #26: multiple applied commands must yield monotonically increasing
+    /// sequence numbers (0, 1, 2) — the audit trail is totally ordered.
+    #[test]
+    fn multiple_commands_yield_monotonic_audit_sequence() {
+        let (def_map, state) = setup_order_defs();
+
+        let make_create = |id: &str| {
+            let mut fields = HashMap::new();
+            fields.insert("orderNumber".to_string(), id.to_string());
+            Command::CreateEntity {
+                noun: "Order".to_string(),
+                domain: "orders".to_string(),
+                id: Some(id.to_string()),
+                fields,
+                sender: Some(format!("u-{}", id)),
+                signature: None,
+            }
+        };
+
+        // Thread state across three successive creates.
+        let r1 = apply_command_defs(&def_map, &make_create("ORD-SEQ-1"), &state);
+        assert!(!r1.rejected, "create 1 should succeed");
+        let r2 = apply_command_defs(&def_map, &make_create("ORD-SEQ-2"), &r1.state);
+        assert!(!r2.rejected, "create 2 should succeed");
+        let r3 = apply_command_defs(&def_map, &make_create("ORD-SEQ-3"), &r2.state);
+        assert!(!r3.rejected, "create 3 should succeed");
+
+        let log = ast::fetch_or_phi("audit_log", &r3.state);
+        let entries = log.as_seq().expect("audit_log cell must exist after three applies");
+        assert_eq!(entries.len(), 3, "three creates should yield three audit entries");
+        assert_eq!(ast::binding(&entries[0], "sequence"), Some("0"));
+        assert_eq!(ast::binding(&entries[1], "sequence"), Some("1"));
+        assert_eq!(ast::binding(&entries[2], "sequence"), Some("2"));
+        // Each entry carries its per-command sender (shape sanity).
+        assert_eq!(ast::binding(&entries[0], "sender"), Some("u-ORD-SEQ-1"));
+        assert_eq!(ast::binding(&entries[1], "sender"), Some("u-ORD-SEQ-2"));
+        assert_eq!(ast::binding(&entries[2], "sender"), Some("u-ORD-SEQ-3"));
+    }
+
+    /// #26: commands without a sender must still produce a well-formed
+    /// audit entry; the `sender` binding is present as an empty string.
+    #[test]
+    fn create_without_sender_audit_entry_has_empty_sender_binding() {
+        let (def_map, state) = setup_order_defs();
+        let mut fields = HashMap::new();
+        fields.insert("orderNumber".to_string(), "ORD-NOSND".to_string());
+        let cmd = Command::CreateEntity {
+            noun: "Order".to_string(),
+            domain: "orders".to_string(),
+            id: Some("ORD-NOSND".to_string()),
+            fields,
+            sender: None,
+            signature: None,
+        };
+        let result = apply_command_defs(&def_map, &cmd, &state);
+        assert!(!result.rejected, "create without sender should still succeed");
+        let log = ast::fetch_or_phi("audit_log", &result.state);
+        let entries = log.as_seq().expect("audit_log cell must exist after apply");
+        assert_eq!(entries.len(), 1, "one create should yield one audit entry");
+        // Missing sender renders as "" — binding is present, not absent.
+        assert_eq!(ast::binding(&entries[0], "sender"), Some(""));
+        assert_eq!(ast::binding(&entries[0], "operation"), Some("apply:create"));
+        assert_eq!(ast::binding(&entries[0], "outcome"), Some("ok"));
+    }
+
     /// #35: MC compile must catch entities missing a mandatory role.
     /// Creating an Order on a domain where "Each Order is created by
     /// exactly one User" without a sender (no User fact) must produce

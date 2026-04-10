@@ -43,6 +43,10 @@ mod arest;
 mod validate;
 #[allow(dead_code)]
 mod induce;
+#[allow(dead_code)]
+mod crypto;
+#[allow(dead_code)]
+mod generators;
 
 use types::Domain;
 
