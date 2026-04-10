@@ -819,8 +819,26 @@ fn apply_platform(name: &str, x: &Object, d: &Object) -> Object {
     match name {
         "compile" => platform_compile(x, d),
         "apply_command" => platform_apply_command(x, d),
+        "verify_signature" => platform_verify_signature(x),
         _ => Object::Bottom,
     }
+}
+
+/// Platform primitive: signature verification (AREST §5.5).
+/// Input: seq<atom, atom, atom> — (sender, payload, signature).
+/// Output: atom("true"|"false"), or Object::Bottom on malformed input.
+/// Wired through crate::crypto::verify_signature — currently a
+/// DefaultHasher MAC placeholder; swap to HMAC-SHA256 when upgrading.
+fn platform_verify_signature(x: &Object) -> Object {
+    let parts = match x.as_seq() {
+        Some(p) if p.len() == 3 => p,
+        _ => return Object::Bottom,
+    };
+    let sender = match parts[0].as_atom() { Some(s) => s, None => return Object::Bottom };
+    let payload = match parts[1].as_atom() { Some(s) => s, None => return Object::Bottom };
+    let signature = match parts[2].as_atom() { Some(s) => s, None => return Object::Bottom };
+    let ok = crate::crypto::verify_signature(sender, payload, signature);
+    Object::atom(match ok { true => "true", false => "false" })
 }
 
 /// compile ∘ parse: readings text → new defs merged into D.
@@ -912,6 +930,7 @@ fn platform_compile(x: &Object, d: &Object) -> Object {
     let mut defs = crate::compile::compile_to_defs_state(&merged_state);
     defs.push(("compile".to_string(), Func::Platform("compile".to_string())));
     defs.push(("apply".to_string(), Func::Platform("apply_command".to_string())));
+    defs.push(("verify_signature".to_string(), Func::Platform("verify_signature".to_string())));
     let new_d = defs_to_state(&defs, &merged_state);
 
     // Validate: ρ(validate) applied to merged state. Alethic violations reject.
@@ -921,8 +940,34 @@ fn platform_compile(x: &Object, d: &Object) -> Object {
     match decoded.iter().any(|v| v.alethic) {
         true => Object::atom(&format!("⊥ constraint violation: {}",
             decoded.iter().filter(|v| v.alethic).map(|v| v.constraint_text.as_str()).collect::<Vec<_>>().join("; "))),
-        false => new_d,
+        false => record_compile_event(&new_d, "compiled"),
     }
+}
+
+/// Security #22 — Evolution state machine trace.
+///
+/// Records the compile operation as a Domain Change instance fact on the
+/// `compile_history` cell. Each successful compile transitions through the
+/// state machine (proposed → validated → compiled); alethic rejection is
+/// tracked by the error atom return value (no state transition). The
+/// sequence number is derived from the existing cell length — no wall-clock
+/// time needed and safe for WASM.
+///
+/// This is a minimal trace: the goal is to leave an audit record that the
+/// compile event occurred, not to implement full Domain Change identity.
+/// See readings/evolution.md §4.2 and AREST paper §4.2 (Self-modification
+/// is ingesting readings).
+fn record_compile_event(state: &Object, status: &str) -> Object {
+    let seq = fetch_or_phi("compile_history", state)
+        .as_seq()
+        .map(|items| items.len())
+        .unwrap_or(0);
+    let id = format!("compile-{}", seq);
+    let fact = fact_from_pairs(&[
+        ("Domain Change", id.as_str()),
+        ("status", status),
+    ]);
+    cell_push("compile_history", fact, state)
 }
 
 /// apply command: create = emit ∘ validate ∘ derive ∘ resolve (Eq. 10).
@@ -961,42 +1006,47 @@ fn command_field_overflow(command: &crate::arest::Command) -> Option<&'static st
         m.iter().any(|(k, v)| over(k) || over(v))
     };
     match command {
-        Command::CreateEntity { noun, domain, id, fields, sender } => {
+        Command::CreateEntity { noun, domain, id, fields, sender, signature } => {
             match over(noun) { true => return Some("noun"), false => {} }
             match over(domain) { true => return Some("domain"), false => {} }
             match id.as_deref().map(over).unwrap_or(false) { true => return Some("id"), false => {} }
             match map_over(fields) { true => return Some("fields"), false => {} }
             match sender.as_deref().map(over).unwrap_or(false) { true => return Some("sender"), false => {} }
+            match signature.as_deref().map(over).unwrap_or(false) { true => return Some("signature"), false => {} }
             None
         }
-        Command::Transition { entity_id, event, domain, current_status, sender } => {
+        Command::Transition { entity_id, event, domain, current_status, sender, signature } => {
             match over(entity_id) { true => return Some("entityId"), false => {} }
             match over(event) { true => return Some("event"), false => {} }
             match over(domain) { true => return Some("domain"), false => {} }
             match current_status.as_deref().map(over).unwrap_or(false) { true => return Some("currentStatus"), false => {} }
             match sender.as_deref().map(over).unwrap_or(false) { true => return Some("sender"), false => {} }
+            match signature.as_deref().map(over).unwrap_or(false) { true => return Some("signature"), false => {} }
             None
         }
-        Command::Query { schema_id, domain, target, bindings, sender } => {
+        Command::Query { schema_id, domain, target, bindings, sender, signature } => {
             match over(schema_id) { true => return Some("schemaId"), false => {} }
             match over(domain) { true => return Some("domain"), false => {} }
             match over(target) { true => return Some("target"), false => {} }
             match map_over(bindings) { true => return Some("bindings"), false => {} }
             match sender.as_deref().map(over).unwrap_or(false) { true => return Some("sender"), false => {} }
+            match signature.as_deref().map(over).unwrap_or(false) { true => return Some("signature"), false => {} }
             None
         }
-        Command::UpdateEntity { noun, domain, entity_id, fields, sender } => {
+        Command::UpdateEntity { noun, domain, entity_id, fields, sender, signature } => {
             match over(noun) { true => return Some("noun"), false => {} }
             match over(domain) { true => return Some("domain"), false => {} }
             match over(entity_id) { true => return Some("entityId"), false => {} }
             match map_over(fields) { true => return Some("fields"), false => {} }
             match sender.as_deref().map(over).unwrap_or(false) { true => return Some("sender"), false => {} }
+            match signature.as_deref().map(over).unwrap_or(false) { true => return Some("signature"), false => {} }
             None
         }
-        Command::LoadReadings { markdown, domain, sender } => {
+        Command::LoadReadings { markdown, domain, sender, signature } => {
             match over(markdown) { true => return Some("markdown"), false => {} }
             match over(domain) { true => return Some("domain"), false => {} }
             match sender.as_deref().map(over).unwrap_or(false) { true => return Some("sender"), false => {} }
+            match signature.as_deref().map(over).unwrap_or(false) { true => return Some("signature"), false => {} }
             None
         }
     }
@@ -3013,5 +3063,63 @@ mod tests {
         let state = cell_push("B", Object::atom("2"), &state);
         assert_eq!(fetch_or_phi("A", &state), Object::Seq(vec![Object::atom("1")]));
         assert_eq!(fetch_or_phi("B", &state), Object::Seq(vec![Object::atom("2")]));
+    }
+
+    // ── Security #22: Evolution state machine trace ──────────────
+
+    #[test]
+    fn record_compile_event_appends_domain_change_to_empty_state() {
+        let state = Object::phi();
+        let result = record_compile_event(&state, "compiled");
+        let history = fetch_or_phi("compile_history", &result);
+        let facts = history.as_seq().expect("compile_history should be a sequence");
+        assert_eq!(facts.len(), 1);
+        assert_eq!(binding(&facts[0], "Domain Change"), Some("compile-0"));
+        assert_eq!(binding(&facts[0], "status"), Some("compiled"));
+    }
+
+    #[test]
+    fn record_compile_event_appends_with_increasing_sequence() {
+        let state = record_compile_event(&Object::phi(), "compiled");
+        let state = record_compile_event(&state, "compiled");
+        let state = record_compile_event(&state, "compiled");
+        let history = fetch_or_phi("compile_history", &state);
+        let facts = history.as_seq().expect("compile_history should be a sequence");
+        assert_eq!(facts.len(), 3);
+        assert_eq!(binding(&facts[0], "Domain Change"), Some("compile-0"));
+        assert_eq!(binding(&facts[1], "Domain Change"), Some("compile-1"));
+        assert_eq!(binding(&facts[2], "Domain Change"), Some("compile-2"));
+    }
+
+    #[test]
+    fn platform_compile_records_compile_history_entry_on_success() {
+        // Feed platform_compile a minimal valid FORML2 reading via the Func::Platform path.
+        // After success, compile_history should contain a single "compiled" entry.
+        let readings = "Each Person has a name.";
+        let initial_d = defs_to_state(
+            &vec![("compile".to_string(), Func::Platform("compile".to_string()))],
+            &Object::phi(),
+        );
+        let result = apply(
+            &Func::Platform("compile".to_string()),
+            &Object::atom(readings),
+            &initial_d,
+        );
+        // Must be a state (seq), not an atom error starting with "⊥".
+        assert!(
+            result.as_seq().is_some(),
+            "compile should produce a state seq, got: {:?}",
+            result
+        );
+        assert!(
+            result.as_atom().map(|s| !s.starts_with("⊥")).unwrap_or(true),
+            "compile should not return an error atom, got: {:?}",
+            result
+        );
+        let history = fetch_or_phi("compile_history", &result);
+        let facts = history.as_seq().expect("compile_history cell should exist after successful compile");
+        assert_eq!(facts.len(), 1, "expected exactly one compile_history entry");
+        assert_eq!(binding(&facts[0], "status"), Some("compiled"));
+        assert_eq!(binding(&facts[0], "Domain Change"), Some("compile-0"));
     }
 }
