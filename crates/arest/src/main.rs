@@ -86,9 +86,8 @@ mod db {
         let tx = conn.unchecked_transaction()
             .unwrap_or_else(|e| { eprintln!("Transaction failed: {}", e); std::process::exit(1); });
 
-        // Store each cell as a JSON blob keyed by cell name.
+        // Store all cells (population + compiled defs).
         ast::cells_iter(d).into_iter()
-            .filter(|(name, _)| !name.contains(':'))  // skip def cells
             .for_each(|(name, contents)| {
                 let json = contents.to_string();
                 tx.execute(
@@ -387,7 +386,9 @@ fn main() {
                 let loaded = db::load_state(&conn);
                 eprintln!("[profile] load_state: {:?}", t.elapsed());
 
-                let d = match ast::fetch("validate", &loaded) {
+                // Check for compiled defs via a marker cell (not "validate"
+                // which gets persisted but its sub-defs don't).
+                let d = match ast::fetch("_defs_compiled", &loaded) {
                     ast::Object::Bottom => {
                         eprintln!("[profile] no defs cached, compiling...");
                         // Re-extract generators from stored cells
@@ -404,6 +405,7 @@ fn main() {
                         defs.push(("verify_signature".to_string(), ast::Func::Platform("verify_signature".to_string())));
                         eprintln!("[profile] compile_to_defs_state: {:?} ({} defs)", t.elapsed(), defs.len());
 
+                        defs.push(("_defs_compiled".to_string(), ast::Func::constant(ast::Object::t())));
                         let t = std::time::Instant::now();
                         let compiled = ast::defs_to_state(&defs, &loaded);
                         eprintln!("[profile] defs_to_state: {:?}", t.elapsed());
