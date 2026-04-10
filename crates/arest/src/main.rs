@@ -86,8 +86,13 @@ mod db {
         let tx = conn.unchecked_transaction()
             .unwrap_or_else(|e| { eprintln!("Transaction failed: {}", e); std::process::exit(1); });
 
-        // Store all cells (population + compiled defs).
+        // Store population cells only — compiled defs are recomputed
+        // on each session start (452ms). Persisting Func trees as display
+        // strings is slow to reload (Object::parse on thousands of nested
+        // bracket expressions). Population cells are small and fast.
         ast::cells_iter(d).into_iter()
+            .filter(|(name, _)| !name.contains(':') && !["validate", "compile", "apply",
+                "verify_signature", "debug", "_defs_compiled"].contains(name))
             .for_each(|(name, contents)| {
                 let json = contents.to_string();
                 tx.execute(
@@ -245,6 +250,24 @@ fn create() -> ast::Object {
     ast::defs_to_state(&defs, &merged)
 }
 
+/// Load population from SQLite, compile defs in memory.
+/// Defs are never persisted — population cells only on disk.
+/// Compile takes ~500ms and produces the full D for SYSTEM calls.
+#[cfg(feature = "local")]
+fn load_and_compile(conn: &rusqlite::Connection) -> ast::Object {
+    let t = std::time::Instant::now();
+    let loaded = db::load_state(conn);
+    eprintln!("[profile] load_state: {:?}", t.elapsed());
+    let t = std::time::Instant::now();
+    let mut defs = compile::compile_to_defs_state(&loaded);
+    defs.push(("compile".to_string(), ast::Func::Platform("compile".to_string())));
+    defs.push(("apply".to_string(), ast::Func::Platform("apply_command".to_string())));
+    defs.push(("verify_signature".to_string(), ast::Func::Platform("verify_signature".to_string())));
+    let d = ast::defs_to_state(&defs, &loaded);
+    eprintln!("[profile] compile: {:?} ({} defs)", t.elapsed(), defs.len());
+    d
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -380,70 +403,20 @@ fn main() {
             }
 
             // arest <key> <input> — single SYSTEM call
-            // Lazy compile: if defs aren't in state, compile them now.
             (true, n) if n >= 2 => {
-                let t = std::time::Instant::now();
-                let loaded = db::load_state(&conn);
-                eprintln!("[profile] load_state: {:?}", t.elapsed());
-
-                // Check for compiled defs via a marker cell (not "validate"
-                // which gets persisted but its sub-defs don't).
-                let d = match ast::fetch("_defs_compiled", &loaded) {
-                    ast::Object::Bottom => {
-                        eprintln!("[profile] no defs cached, compiling...");
-                        // Re-extract generators from stored cells
-                        let generator_re = regex::Regex::new(r"Generator.+?'([^']+)'").unwrap();
-                        let app_cell = ast::fetch_or_phi("App_uses_Generator", &loaded).to_string();
-                        let gens: std::collections::HashSet<String> = generator_re.captures_iter(&app_cell)
-                            .filter_map(|c| c.get(1).map(|m| m.as_str().to_lowercase()))
-                            .collect();
-                        compile::set_active_generators(gens);
-                        let t = std::time::Instant::now();
-                        let mut defs = compile::compile_to_defs_state(&loaded);
-                        defs.push(("compile".to_string(), ast::Func::Platform("compile".to_string())));
-                        defs.push(("apply".to_string(), ast::Func::Platform("apply_command".to_string())));
-                        defs.push(("verify_signature".to_string(), ast::Func::Platform("verify_signature".to_string())));
-                        eprintln!("[profile] compile_to_defs_state: {:?} ({} defs)", t.elapsed(), defs.len());
-
-                        defs.push(("_defs_compiled".to_string(), ast::Func::constant(ast::Object::t())));
-                        let t = std::time::Instant::now();
-                        let compiled = ast::defs_to_state(&defs, &loaded);
-                        eprintln!("[profile] defs_to_state: {:?}", t.elapsed());
-
-                        let t = std::time::Instant::now();
-                        db::persist_state(&conn, &compiled);
-                        eprintln!("[profile] persist_state: {:?}", t.elapsed());
-                        compiled
-                    }
-                    _ => loaded,
-                };
+                let d = load_and_compile(&conn);
                 let key = &non_dirs[0];
                 let input = &non_dirs[1];
                 let t = std::time::Instant::now();
                 let (output, new_d) = system(key, input, &d);
-                eprintln!("[profile] system({}, ...): {:?}", key, t.elapsed());
+                eprintln!("[{:?}]", t.elapsed());
                 println!("{}", output);
-
                 (new_d != d).then(|| db::persist_state(&conn, &new_d));
             }
 
             // arest --db <path> — REPL mode
-            // Load state once, compile defs, then loop: read key+input, apply SYSTEM, print.
             _ => {
-                let loaded = db::load_state(&conn);
-                let mut d = match ast::fetch("validate", &loaded) {
-                    ast::Object::Bottom => {
-                        eprintln!("Compiling defs...");
-                        let mut defs = compile::compile_to_defs_state(&loaded);
-                        defs.push(("compile".to_string(), ast::Func::Platform("compile".to_string())));
-                        defs.push(("apply".to_string(), ast::Func::Platform("apply_command".to_string())));
-                        defs.push(("verify_signature".to_string(), ast::Func::Platform("verify_signature".to_string())));
-                        let compiled = ast::defs_to_state(&defs, &loaded);
-                        db::persist_state(&conn, &compiled);
-                        compiled
-                    }
-                    _ => loaded,
-                };
+                let mut d = load_and_compile(&conn);
 
                 eprintln!("AREST REPL — SYSTEM is the only function.");
                 eprintln!("  <key> <input>    call system(key, input)");
