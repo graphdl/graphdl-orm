@@ -367,10 +367,21 @@ fn create_via_defs(
         }
     })).collect();
 
+    // Security #26: audit trail — append an audit_log fact to the returned
+    // state so callers who persist the state see the trace. rejected applies
+    // to the pre-audit state; the audit push itself is invisible to the
+    // decision because it only touches the audit_log cell.
+    let outcome = match rejected { true => "rejected", false => "ok" };
+    let final_state = ast::record_audit(
+        match rejected { true => state, false => &derived_state },
+        "apply:create",
+        outcome,
+        sender,
+    );
     CommandResult {
         entities, status, transitions, violations,
         derived_count: derived.len(), rejected,
-        state: match rejected { true => state.clone(), false => derived_state },
+        state: final_state,
     }
 }
 
@@ -1099,6 +1110,30 @@ Transition 'place' is to Status 'Placed'.
         assert!(!result.rejected,
             "Order created with customer should not be rejected. violations={:?}",
             result.violations);
+    }
+
+    /// #26: audit trail — create command pushes an audit_log fact.
+    #[test]
+    fn create_command_appends_audit_log_entry() {
+        let (def_map, state) = setup_order_defs();
+        let mut fields = HashMap::new();
+        fields.insert("orderNumber".to_string(), "ORD-AUD".to_string());
+        let cmd = Command::CreateEntity {
+            noun: "Order".to_string(),
+            domain: "orders".to_string(),
+            id: Some("ORD-AUD".to_string()),
+            fields,
+            sender: Some("auditor@example.com".to_string()),
+            signature: None,
+        };
+        let result = apply_command_defs(&def_map, &cmd, &state);
+        let log = ast::fetch_or_phi("audit_log", &result.state);
+        let entries = log.as_seq().expect("audit_log cell must exist after apply");
+        assert!(!entries.is_empty(), "audit_log must contain at least one entry");
+        let first = &entries[0];
+        assert_eq!(ast::binding(first, "operation"), Some("apply:create"));
+        assert_eq!(ast::binding(first, "outcome"), Some("ok"));
+        assert_eq!(ast::binding(first, "sender"), Some("auditor@example.com"));
     }
 
     /// #35: MC compile must catch entities missing a mandatory role.
