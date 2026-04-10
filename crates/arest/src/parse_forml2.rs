@@ -865,6 +865,44 @@ pub fn domain_to_state(d: &Domain) -> crate::ast::Object {
         ("objectValue", f.object_value.as_str()),
     ]), &acc));
 
+    // Compound reference scheme decomposition.
+    //
+    // Convention: when an entity has a compound ref scheme like
+    // Entity(.Component1, .Component2), instance IDs use '-' as a separator:
+    // 'OSI-3' decomposes to Component1='OSI', Component2='3'.
+    //
+    // For each unique (noun, id) pair where the noun has a compound ref scheme,
+    // split the id on '-' from the right (so multi-word component1 values with
+    // hyphens like 'SPD1' work correctly) and push the component bindings as
+    // additional facts. The cell name follows the convention {Noun}_has_{Component}.
+    //
+    // This lets the engine verify compound uniqueness and allows constraints
+    // and derivation rules to join on individual ref scheme components.
+    state = d.ref_schemes.iter()
+        .filter(|(_, parts)| parts.len() >= 2)
+        .fold(state, |acc, (noun_name, ref_parts)| {
+            // Collect unique instance IDs for this noun from instance facts.
+            let ids: std::collections::HashSet<&str> = d.general_instance_facts.iter()
+                .filter(|f| f.subject_noun == *noun_name)
+                .map(|f| f.subject_value.as_str())
+                .collect();
+            ids.iter().fold(acc, |a, id| {
+                // rsplitn(n, '-') splits from the right, giving the last n-1
+                // parts individually and everything else as the first chunk.
+                let parts: Vec<&str> = id.rsplitn(ref_parts.len(), '-').collect::<Vec<_>>();
+                let parts: Vec<&str> = parts.into_iter().rev().collect();
+                // Only decompose if the split produced the expected number of parts.
+                (parts.len() == ref_parts.len()).then(|| ()).map(|_| {
+                    ref_parts.iter().zip(parts.iter()).fold(a.clone(), |b, (component, value)| {
+                        let cell_name = format!("{}_has_{}", noun_name.replace(' ', "_"), component.replace(' ', "_"));
+                        cell_push(&cell_name, fact_from_pairs(&[
+                            (noun_name, id), (component, value),
+                        ]), &b)
+                    })
+                }).unwrap_or(a)
+            })
+        });
+
     state
 }
 
@@ -2760,5 +2798,60 @@ fn forbidden_ipv6_ula_fd() {
     #[test]
     fn metamodel_guard_rejects_reserved_domain_change() {
         assert_reserved_rejected("Domain Change", "Domain Change(.Id) is an entity type.");
+    }
+
+    #[test]
+    fn compound_ref_scheme_decomposes_instance_ids() {
+        use crate::ast::{fetch_or_phi, binding};
+        let input = r#"
+Thing(.Owner, .Seq) is an entity type.
+Owner is a value type.
+Seq is a value type.
+Color is a value type.
+Thing has Color.
+
+## Instance Facts
+Thing 'alice-1' has Color 'red'.
+Thing 'alice-2' has Color 'blue'.
+Thing 'bob-1' has Color 'green'.
+"#;
+        let ir = parse_markdown(input).unwrap();
+        let state = domain_to_state(&ir);
+
+        // Component cells should exist with decomposed bindings
+        let owner_cell = fetch_or_phi("Thing_has_Owner", &state);
+        let owners = owner_cell.as_seq().expect("Thing_has_Owner cell must exist");
+        assert_eq!(owners.len(), 3, "3 unique instance IDs → 3 owner bindings");
+        assert!(owners.iter().any(|f| binding(f, "Thing") == Some("alice-1") && binding(f, "Owner") == Some("alice")));
+        assert!(owners.iter().any(|f| binding(f, "Thing") == Some("bob-1") && binding(f, "Owner") == Some("bob")));
+
+        let seq_cell = fetch_or_phi("Thing_has_Seq", &state);
+        let seqs = seq_cell.as_seq().expect("Thing_has_Seq cell must exist");
+        assert!(seqs.iter().any(|f| binding(f, "Thing") == Some("alice-2") && binding(f, "Seq") == Some("2")));
+    }
+
+    #[test]
+    fn compound_ref_scheme_handles_multi_hyphen_first_component() {
+        use crate::ast::{fetch_or_phi, binding};
+        let input = r#"
+Widget(.System Name, .Number) is an entity type.
+System Name is a value type.
+Number is a value type.
+Label is a value type.
+Widget has Label.
+
+## Instance Facts
+Widget 'my-system-3' has Label 'foo'.
+"#;
+        let ir = parse_markdown(input).unwrap();
+        let state = domain_to_state(&ir);
+
+        let name_cell = fetch_or_phi("Widget_has_System_Name", &state);
+        let names = name_cell.as_seq().expect("Widget_has_System_Name must exist");
+        // rsplitn(2, '-') on 'my-system-3' → ['my-system', '3']
+        assert!(names.iter().any(|f|
+            binding(f, "Widget") == Some("my-system-3") &&
+            binding(f, "System Name") == Some("my-system")
+        ), "multi-hyphen first component should be preserved");
     }
 }
