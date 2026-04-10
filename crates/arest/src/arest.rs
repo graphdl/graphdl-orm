@@ -31,6 +31,12 @@ fn def_func(name: &str, d: &ast::Object) -> Option<ast::Func> {
 /// "{noun} is created by User" fact into the population BEFORE derive runs.
 /// Authorization enforcement then happens via the existing derive+validate
 /// pipeline -- see AREST.tex §8 (Middleware Elimination).
+///
+/// Signature (`signature`) is an optional MAC over (sender, payload, SECRET)
+/// per AREST §5.5 (Distributed Evaluation): "For anonymous peers, events
+/// carry cryptographic signatures for identity." See `crate::crypto` for
+/// the (placeholder) signing/verification primitives and the platform
+/// primitive `verify_signature` for ρ-level invocation.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "type")]
 pub enum Command {
@@ -42,6 +48,8 @@ pub enum Command {
         fields: std::collections::HashMap<String, String>,
         #[serde(default)]
         sender: Option<String>,
+        #[serde(default)]
+        signature: Option<String>,
     },
     /// is-cmd: state machine transition
     Transition {
@@ -53,6 +61,8 @@ pub enum Command {
         current_status: Option<String>,
         #[serde(default)]
         sender: Option<String>,
+        #[serde(default)]
+        signature: Option<String>,
     },
     /// is-qry: query the population (partial application of graph schema)
     Query {
@@ -63,6 +73,8 @@ pub enum Command {
         bindings: std::collections::HashMap<String, String>,
         #[serde(default)]
         sender: Option<String>,
+        #[serde(default)]
+        signature: Option<String>,
     },
     /// is-upd: update entity fields (<->F  .  [upd, defs])
     UpdateEntity {
@@ -73,6 +85,8 @@ pub enum Command {
         fields: std::collections::HashMap<String, String>,
         #[serde(default)]
         sender: Option<String>,
+        #[serde(default)]
+        signature: Option<String>,
     },
     /// is-chg: install or update readings (modify definitions D)
     LoadReadings {
@@ -80,6 +94,8 @@ pub enum Command {
         domain: String,
         #[serde(default)]
         sender: Option<String>,
+        #[serde(default)]
+        signature: Option<String>,
     },
 }
 
@@ -241,19 +257,19 @@ pub fn apply_command_defs(
     state: &ast::Object,
 ) -> CommandResult {
     match command {
-        Command::CreateEntity { noun, domain, id, fields, sender } => {
+        Command::CreateEntity { noun, domain, id, fields, sender, signature: _ } => {
             create_via_defs(d, noun, domain, id.as_deref(), fields, sender.as_deref(), state)
         }
-        Command::Transition { entity_id, event, domain, current_status, sender: _ } => {
+        Command::Transition { entity_id, event, domain, current_status, sender: _, signature: _ } => {
             transition_via_defs(d, entity_id, event, domain, current_status.as_deref(), state)
         }
-        Command::Query { schema_id, domain: _, target, bindings, sender: _ } => {
+        Command::Query { schema_id, domain: _, target, bindings, sender: _, signature: _ } => {
             query_via_defs(d, schema_id, target, bindings, state)
         }
-        Command::UpdateEntity { noun, domain, entity_id, fields, sender: _ } => {
+        Command::UpdateEntity { noun, domain, entity_id, fields, sender: _, signature: _ } => {
             update_via_defs(d, noun, domain, entity_id, fields, state)
         }
-        Command::LoadReadings { markdown, domain, sender: _ } => {
+        Command::LoadReadings { markdown, domain, sender: _, signature: _ } => {
             apply_load_readings(markdown, domain, state)
         }
         #[allow(unreachable_patterns)]
@@ -783,6 +799,7 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
             id: Some("ORD-100".to_string()),
             fields,
             sender: None,
+            signature: None,
         };
 
         let result = apply_command_defs(&def_map, &cmd, &state);
@@ -813,6 +830,7 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
             id: Some("ORD-REF".to_string()),
             fields,
             sender: None,
+            signature: None,
         };
 
         let result = apply_command_defs(&def_map, &cmd, &state);
@@ -832,6 +850,7 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
             id: Some("electronics".to_string()),
             fields,
             sender: None,
+            signature: None,
         };
 
         let result = apply_command_defs(&def_map, &cmd, &state);
@@ -853,6 +872,7 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
             id: Some("ORD-100".to_string()),
             fields,
             sender: None,
+            signature: None,
         };
         let created = apply_command_defs(&def_map, &create_cmd, &state);
         assert_eq!(created.status.as_deref(), Some("Draft"));
@@ -863,6 +883,7 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
             domain: "orders".to_string(),
             current_status: Some("Draft".to_string()),
             sender: None,
+            signature: None,
         };
 
         let result = apply_command_defs(&def_map, &cmd, &created.state);
@@ -885,6 +906,7 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
             id: Some("ORD-1".to_string()),
             fields,
             sender: None,
+            signature: None,
         };
 
         let result = apply_command_defs(&def_map, &cmd, &state);
@@ -913,6 +935,7 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
             id: Some("ORD-1".to_string()),
             fields,
             sender: None,
+            signature: None,
         };
         let created = apply_command_defs(&def_map, &create, &state);
         assert_eq!(created.status.as_deref(), Some("Draft"));
@@ -923,6 +946,7 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
             domain: "orders".to_string(),
             current_status: Some("Draft".to_string()),
             sender: None,
+            signature: None,
         };
         let result = apply_command_defs(&def_map, &transition, &created.state);
 
@@ -956,6 +980,7 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
             target: "Order".to_string(),
             bindings,
             sender: None,
+            signature: None,
         };
 
         let result = apply_command_defs(&def_map, &cmd, &state);
@@ -971,6 +996,7 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
             markdown: "# Test\n\nProduct(.SKU) is an entity type.\nCategory(.Name) is an entity type.\nProduct belongs to Category.\n  Each Product belongs to exactly one Category.".to_string(),
             domain: "catalog".to_string(),
             sender: None,
+            signature: None,
         };
 
         let result = apply_command_defs(&def_map, &cmd, &state);
@@ -987,6 +1013,7 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
             markdown: "".to_string(),
             domain: "empty".to_string(),
             sender: None,
+            signature: None,
         };
 
         let result = apply_command_defs(&def_map, &cmd, &state);
@@ -1064,6 +1091,7 @@ Transition 'place' is to Status 'Placed'.
             id: None,
             fields,
             sender: None,
+            signature: None,
         };
 
         // Match WASM platform_apply_command which passes `d` as both defs and state.
@@ -1119,6 +1147,7 @@ Each Order is created by exactly one User.
             id: Some("ord-1".to_string()),
             fields,
             sender: None,
+            signature: None,
         };
 
         let result = apply_command_defs(&def_map, &cmd, &state);
@@ -1132,5 +1161,145 @@ Each Order is created by exactly one User.
             "MC should fire: ord-1 has no User. violations={:?}", result.violations
         );
         assert!(result.rejected, "alethic MC violation should reject the command");
+    }
+
+    // ── Security #24: event signing (AREST §5.5) ────────────────────
+    //
+    // Commands can carry an optional `signature` MAC over (sender,
+    // payload, SECRET). The crypto module verifies signatures without
+    // requiring engine integration — create_via_defs still accepts
+    // unsigned commands (signature is Option) so this is an additive
+    // primitive. These tests exercise the verification pipeline:
+    //   1. a valid signature passes
+    //   2. a bogus signature fails
+    //   3. serde_json deserialization accepts commands WITH signatures
+    //   4. the ρ-level platform primitive returns "true"/"false"
+
+    #[test]
+    fn signed_command_valid_signature_passes_verification() {
+        let sender = "alice@orders.example";
+        // Payload is the canonicalized command body minus the signature.
+        // We sign what the receiver will re-canonicalize and check.
+        let payload = r#"{"noun":"Order","id":"ord-42"}"#;
+        let sig = crate::crypto::sign(sender, payload);
+
+        // Construct a Command carrying the signature.
+        let mut fields = HashMap::new();
+        fields.insert("OrderId".to_string(), "ord-42".to_string());
+        let cmd = Command::CreateEntity {
+            noun: "Order".to_string(),
+            domain: "test".to_string(),
+            id: Some("ord-42".to_string()),
+            fields,
+            sender: Some(sender.to_string()),
+            signature: Some(sig.clone()),
+        };
+
+        // Extract the signature back and verify it against the same
+        // payload — this is the engine-side check pattern.
+        match &cmd {
+            Command::CreateEntity { sender: Some(s), signature: Some(sig_in), .. } => {
+                assert!(crate::crypto::verify_signature(s, payload, sig_in),
+                    "valid signature must verify");
+            }
+            _ => panic!("expected CreateEntity with sender + signature"),
+        }
+    }
+
+    #[test]
+    fn signed_command_invalid_signature_fails_verification() {
+        let sender = "alice@orders.example";
+        let payload = r#"{"event":"place","entity_id":"ord-42"}"#;
+
+        // Attacker forges a signature.
+        let forged = "deadbeefcafef00d".to_string();
+        let cmd = Command::Transition {
+            entity_id: "ord-42".to_string(),
+            event: "place".to_string(),
+            domain: "test".to_string(),
+            current_status: Some("Draft".to_string()),
+            sender: Some(sender.to_string()),
+            signature: Some(forged),
+        };
+
+        match &cmd {
+            Command::Transition { sender: Some(s), signature: Some(sig_in), .. } => {
+                assert!(!crate::crypto::verify_signature(s, payload, sig_in),
+                    "forged signature must NOT verify");
+            }
+            _ => panic!("expected Transition with sender + signature"),
+        }
+    }
+
+    #[test]
+    fn command_without_signature_still_deserializes() {
+        // Backward compatibility: legacy JSON has no `signature` field;
+        // serde_default must treat it as None.
+        let json = r#"{"type":"createEntity","noun":"Order","domain":"test","id":"ord-1","fields":{}}"#;
+        let cmd: Command = serde_json::from_str(json).expect("must parse without signature");
+        match cmd {
+            Command::CreateEntity { signature, .. } => {
+                assert!(signature.is_none(), "missing signature must default to None");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn command_with_signature_deserializes() {
+        // Forward compatibility: JSON with `signature` populates the field.
+        let json = r#"{"type":"createEntity","noun":"Order","domain":"test","id":"ord-1","fields":{},"sender":"u@x","signature":"abc123"}"#;
+        let cmd: Command = serde_json::from_str(json).expect("must parse with signature");
+        match cmd {
+            Command::CreateEntity { signature, sender, .. } => {
+                assert_eq!(signature.as_deref(), Some("abc123"));
+                assert_eq!(sender.as_deref(), Some("u@x"));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn verify_signature_platform_primitive_roundtrip() {
+        // Exercises the ρ-level primitive: <sender, payload, sig> → "true"/"false".
+        // Build D with just the verify_signature def registered (no readings needed).
+        let state = ast::Object::phi();
+        let defs = vec![(
+            "verify_signature".to_string(),
+            ast::Func::Platform("verify_signature".to_string()),
+        )];
+        let def_map = ast::defs_to_state(&defs, &state);
+
+        let sender = "alice";
+        let payload = "msg";
+        let good = crate::crypto::sign(sender, payload);
+
+        // Valid: ρ(verify_signature):<sender, payload, sig> => "true"
+        let input_ok = ast::Object::seq(vec![
+            ast::Object::atom(sender),
+            ast::Object::atom(payload),
+            ast::Object::atom(&good),
+        ]);
+        let result_ok = ast::apply(
+            &ast::Func::Def("verify_signature".to_string()),
+            &input_ok,
+            &def_map,
+        );
+        assert_eq!(result_ok.as_atom(), Some("true"),
+            "platform primitive must return 'true' for valid sig");
+
+        // Invalid: swap signature → "false"
+        let input_bad = ast::Object::seq(vec![
+            ast::Object::atom(sender),
+            ast::Object::atom(payload),
+            ast::Object::atom("0000000000000000"),
+        ]);
+        let result_bad = ast::apply(
+            &ast::Func::Def("verify_signature".to_string()),
+            &input_bad,
+            &def_map,
+        );
+        assert_eq!(result_bad.as_atom(), Some("false"),
+            "platform primitive must return 'false' for invalid sig");
     }
 }
