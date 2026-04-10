@@ -36,5 +36,5 @@ rusqlite = { version = "0.31", features = ["bundled"], optional = true }
 [dev-dependencies]
 
 [profile.release]
-opt-level = "s"
-lto = true
+opt-level = 2
+lto = "thin"

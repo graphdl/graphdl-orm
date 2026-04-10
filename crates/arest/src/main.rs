@@ -173,12 +173,22 @@ fn system(key: &str, input: &str, d: &ast::Object) -> (String, ast::Object) {
 }
 
 /// Read .md files from directories, sorted alphabetically, app.md first.
+/// Also checks the parent directory of each readings dir for app.md.
 fn read_readings(dirs: &[String]) -> Vec<(String, String)> {
     let (readings, app_md) = dirs.iter().flat_map(|dir| {
         let dir_path = std::path::Path::new(dir);
         (!dir_path.is_dir()).then(|| {
             eprintln!("Not a directory: {}", dir);
             std::process::exit(1);
+        });
+        // Check parent for app.md (app root vs readings subdir convention)
+        let parent_app = dir_path.parent()
+            .map(|p| p.join("app.md"))
+            .filter(|p| p.exists());
+        let parent_entry = parent_app.map(|path| {
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| { eprintln!("Failed to read {}: {}", path.display(), e); std::process::exit(1); });
+            ("app.md".to_string(), text)
         });
         let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(dir_path)
             .unwrap_or_else(|e| { eprintln!("Failed to read {}: {}", dir, e); std::process::exit(1); })
@@ -191,7 +201,7 @@ fn read_readings(dirs: &[String]) -> Vec<(String, String)> {
             let text = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| { eprintln!("Failed to read {}: {}", path.display(), e); std::process::exit(1); });
             (name, text)
-        }).collect::<Vec<_>>()
+        }).chain(parent_entry).collect::<Vec<_>>()
     }).fold((Vec::new(), None::<(String, String)>), |(mut readings, app), (name, text)| {
         match name.as_str() {
             "app.md" => (readings, Some((name, text))),
@@ -296,6 +306,17 @@ fn main() {
                     std::process::exit(1);
                 });
 
+                // Extract generator opt-ins from raw reading text before parsing.
+                // The parser doesn't handle dual-quoted instance facts like
+                // "App 'X' uses Generator 'sqlite'" — extract via regex.
+                let generator_re = regex::Regex::new(r"uses Generator '([^']+)'").unwrap();
+                let opted_generators: std::collections::HashSet<String> = readings.iter()
+                    .flat_map(|(_, text)| generator_re.captures_iter(text)
+                        .filter_map(|c| c.get(1).map(|m| m.as_str().to_lowercase()))
+                        .collect::<Vec<_>>())
+                    .collect();
+                eprintln!("[load] generators from readings: {:?}", opted_generators);
+
                 // Fast path: fold all readings (metamodel + user) into a
                 // single Domain IR, then convert to Object state ONCE.
                 // No merge_states loop — O(n) in total content.
@@ -309,7 +330,7 @@ fn main() {
                     |mut merged, (name, text)| {
                         let ir = match merged.nouns.is_empty() {
                             true => parse_forml2::parse_markdown(text),
-                            false => parse_forml2::parse_markdown_with_nouns(text, &merged.nouns),
+                            false => parse_forml2::parse_markdown_with_context(text, &merged.nouns, &merged.fact_types),
                         }.unwrap_or_else(|e| { eprintln!("{}: {}", name, e); std::process::exit(1); });
                         merged.nouns.extend(ir.nouns);
                         merged.fact_types.extend(ir.fact_types);
@@ -327,7 +348,23 @@ fn main() {
                     },
                 );
                 parse_forml2::set_bootstrap_mode(false);
-                let state = parse_forml2::domain_to_state(&domain);
+                eprintln!("[load] {} nouns, {} fts, {} instance facts",
+                    domain.nouns.len(), domain.fact_types.len(), domain.general_instance_facts.len());
+                let generator_fts: Vec<_> = domain.fact_types.keys()
+                    .filter(|k| k.to_lowercase().contains("generator") || k.to_lowercase().contains("uses"))
+                    .collect();
+                eprintln!("[load] Generator-related FTs: {:?}", generator_fts);
+                let app_ifs: Vec<_> = domain.general_instance_facts.iter()
+                    .filter(|f| f.subject_noun == "App" || f.object_value.to_lowercase().contains("sqlite"))
+                    .map(|f| format!("{}({}).{}={}({})", f.subject_noun, f.subject_value, f.field_name, f.object_noun, f.object_value))
+                    .collect();
+                eprintln!("[load] App/sqlite instance facts: {:?}", app_ifs);
+                let mut state = parse_forml2::domain_to_state(&domain);
+                // Store generator opt-ins as a cell so the query path can find them.
+                opted_generators.iter().for_each(|g| {
+                    state = ast::cell_push("App_uses_Generator",
+                        ast::fact_from_pairs(&[("Generator", g.as_str())]), &state);
+                });
                 let defs = vec![
                     ("compile".to_string(), ast::Func::Platform("compile".to_string())),
                     ("apply".to_string(), ast::Func::Platform("apply_command".to_string())),
@@ -346,27 +383,45 @@ fn main() {
             // arest <key> <input> — single SYSTEM call
             // Lazy compile: if defs aren't in state, compile them now.
             (true, n) if n >= 2 => {
+                let t = std::time::Instant::now();
                 let loaded = db::load_state(&conn);
+                eprintln!("[profile] load_state: {:?}", t.elapsed());
+
                 let d = match ast::fetch("validate", &loaded) {
                     ast::Object::Bottom => {
-                        // No compiled defs yet — compile now from stored cells.
-                        eprintln!("Compiling defs from stored state...");
+                        eprintln!("[profile] no defs cached, compiling...");
+                        // Re-extract generators from stored cells
+                        let generator_re = regex::Regex::new(r"Generator.+?'([^']+)'").unwrap();
+                        let app_cell = ast::fetch_or_phi("App_uses_Generator", &loaded).to_string();
+                        let gens: std::collections::HashSet<String> = generator_re.captures_iter(&app_cell)
+                            .filter_map(|c| c.get(1).map(|m| m.as_str().to_lowercase()))
+                            .collect();
+                        compile::set_active_generators(gens);
+                        let t = std::time::Instant::now();
                         let mut defs = compile::compile_to_defs_state(&loaded);
                         defs.push(("compile".to_string(), ast::Func::Platform("compile".to_string())));
                         defs.push(("apply".to_string(), ast::Func::Platform("apply_command".to_string())));
                         defs.push(("verify_signature".to_string(), ast::Func::Platform("verify_signature".to_string())));
+                        eprintln!("[profile] compile_to_defs_state: {:?} ({} defs)", t.elapsed(), defs.len());
+
+                        let t = std::time::Instant::now();
                         let compiled = ast::defs_to_state(&defs, &loaded);
+                        eprintln!("[profile] defs_to_state: {:?}", t.elapsed());
+
+                        let t = std::time::Instant::now();
                         db::persist_state(&conn, &compiled);
+                        eprintln!("[profile] persist_state: {:?}", t.elapsed());
                         compiled
                     }
                     _ => loaded,
                 };
                 let key = &non_dirs[0];
                 let input = &non_dirs[1];
+                let t = std::time::Instant::now();
                 let (output, new_d) = system(key, input, &d);
+                eprintln!("[profile] system({}, ...): {:?}", key, t.elapsed());
                 println!("{}", output);
 
-                // Persist if state changed.
                 (new_d != d).then(|| db::persist_state(&conn, &new_d));
             }
 

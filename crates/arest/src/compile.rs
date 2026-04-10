@@ -388,9 +388,25 @@ fn derive_state_machines_from_facts(facts: &[GeneralInstanceFact]) -> HashMap<St
 /// Compile an Object state into named FFP definitions.
 /// All generators always produce all defs. Selection is at apply time:
 /// SYSTEM:sql:sqlite:Order returns DDL, SYSTEM:xsd:Order returns XSD.
+thread_local! {
+    static ACTIVE_GENERATORS: std::cell::RefCell<HashSet<String>> = std::cell::RefCell::new(HashSet::new());
+}
+
+pub fn set_active_generators(gens: HashSet<String>) {
+    ACTIVE_GENERATORS.with(|g| *g.borrow_mut() = gens);
+}
+
+fn active_generators() -> HashSet<String> {
+    ACTIVE_GENERATORS.with(|g| g.borrow().clone())
+}
+
 pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> {
+    let t = std::time::Instant::now();
     let domain = state_to_domain(state);
+    eprintln!("[profile] state_to_domain: {:?} ({} nouns, {} fts, {} constraints)", t.elapsed(), domain.nouns.len(), domain.fact_types.len(), domain.constraints.len());
+    let t = std::time::Instant::now();
     let model = compile(&domain);
+    eprintln!("[profile] compile: {:?}", t.elapsed());
 
     // Constraints -> named definitions — α(constraint → def)
     let mut defs: Vec<(String, Func)> = model.constraints.iter()
@@ -497,7 +513,25 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
         (format!("nav:{}:parent", noun), Func::constant(Object::Seq(parents.iter().map(|p| Object::atom(p)).collect())))
     ));
 
-    // ── Generator 1: Agent Prompts ──────────────────────────────────
+    // ── Generator opt-in ─────────────────────────────────────────────
+    // Check which generators the app opted into via instance facts:
+    //   App 'X' uses Generator 'sqlite'.
+    // If no opt-in found, generate nothing (pure readings mode).
+    // Debug: dump instance fact field names to find how Generator is stored
+    // Generator opt-in: use thread-local override if set (CLI path),
+    // otherwise extract from Domain IR / state cells.
+    let generators = {
+        let active = active_generators();
+        if !active.is_empty() { active } else {
+            domain.general_instance_facts.iter()
+                .filter(|f| f.object_noun == "Generator" || f.field_name == "Generator")
+                .map(|f| f.object_value.to_lowercase())
+                .collect()
+        }
+    };
+    eprintln!("  [profile] generators opted in: {:?}", generators);
+
+    // ── Generator 1: Agent Prompts (opt-in: not gated, always useful) ──
     // Build lookup maps via fold — noun → readings, noun → constraints, noun → events
     let noun_fact_types: HashMap<String, Vec<String>> = domain.fact_types.values()
         .flat_map(|ft| ft.roles.iter().map(move |r| (r.noun_name.clone(), ft.reading.clone())))
@@ -557,6 +591,7 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
     }
 
     // ── Generator 2: iLayer — α(noun → ilayer_def)
+    if generators.contains("ilayer") {
     defs.extend(domain.nouns.iter().map(|(noun_name, noun_def)| {
         let ft_entries = Object::Seq(domain.fact_types.values()
             .filter(|ft| ft.roles.iter().any(|r| r.noun_name == *noun_name))
@@ -576,27 +611,34 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
         ]);
         (format!("ilayer:{}", noun_name), Func::constant(ilayer))
     }));
+    } // end ilayer gate
 
     // ── Generator 3: SQL DDL (multi-dialect) ─────────────────────────
     // Call rmap() at compile time and produce dialect-specific defs:
     //   sql:sqlite:{table}, sql:postgresql:{table}, sql:mysql:{table},
     //   sql:sqlserver:{table}, sql:oracle:{table}, sql:db2:{table},
     //   sql:standard:{table}, sql:clickhouse:{table}
-    // ── Generator 3: SQL DDL — α(table × dialect → def)
-    let sql_tables = crate::rmap::rmap(&domain);
-    let dialects = [
+    // ── Generator 3: SQL DDL — only for opted-in dialects
+    let all_dialects = [
         ("sqlite", SqlDialect::Sqlite), ("postgresql", SqlDialect::PostgreSql),
         ("mysql", SqlDialect::MySql), ("sqlserver", SqlDialect::SqlServer),
         ("oracle", SqlDialect::Oracle), ("db2", SqlDialect::Db2),
         ("standard", SqlDialect::Standard), ("clickhouse", SqlDialect::ClickHouse),
     ];
-    defs.extend(sql_tables.iter().flat_map(|table|
-        dialects.iter().map(move |(name, dialect)|
-            (format!("sql:{}:{}", name, table.name), Func::constant(Object::atom(&generate_ddl(table, dialect))))
-        )
-    ));
+    let active_dialects: Vec<_> = all_dialects.iter()
+        .filter(|(name, _)| generators.contains(*name))
+        .collect();
+    if !active_dialects.is_empty() {
+        let sql_tables = crate::rmap::rmap(&domain);
+        defs.extend(sql_tables.iter().flat_map(|table|
+            active_dialects.iter().map(move |(name, dialect)|
+                (format!("sql:{}:{}", name, table.name), Func::constant(Object::atom(&generate_ddl(table, dialect))))
+            )
+        ));
+    }
 
     // ── Generator 4: Test Harness — α(constraint → test_def)
+    if generators.contains("test") {
     defs.extend(domain.constraints.iter().map(|c| {
         let modality_str = match c.modality.as_str() { "deontic" => "deontic", _ => "alethic" };
         (format!("test:{}", c.id), Func::constant(Object::Seq(vec![
@@ -606,6 +648,7 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
             Object::seq(vec![Object::atom("modality"), Object::atom(modality_str)]),
         ])))
     }));
+    } // end test gate
 
     // Handler defs — α(noun → <create_def, update_def>)
     defs.extend(domain.nouns.keys().flat_map(|noun_name| {
@@ -943,34 +986,31 @@ pub fn state_to_domain(state: &crate::ast::Object) -> Domain {
 
 /// Compile an entire Domain into executable form.
 pub(crate) fn compile(ir: &Domain) -> CompiledModel {
+    let t0 = std::time::Instant::now();
     let constraints: Vec<CompiledConstraint> = ir.constraints.iter()
         .map(|def| compile_constraint(ir, def))
         .collect();
+    eprintln!("  [profile] {} constraints: {:?}", constraints.len(), t0.elapsed());
 
-    // Derive state machines from instance facts in P.
-    // Query the population for metamodel fact types:
-    //   State Machine Definition 'X' is for Noun 'Y'
-    //   Status 'S' is initial in State Machine Definition 'X'
-    //   Transition 'T' is from Status 'A'
-    //   Transition 'T' is to Status 'B'
-    //   Transition 'T' is triggered by Event Type 'E'
-    //   Transition 'T' is defined in State Machine Definition 'X'
+    let t1 = std::time::Instant::now();
     let sm_defs = derive_state_machines_from_facts(&ir.general_instance_facts);
-    // Fall back to ir.state_machines if instance facts produced nothing
-    // (supports old-style readings that were parsed before this change).
     let sm_source = if sm_defs.is_empty() { &ir.state_machines } else { &sm_defs };
     let state_machines: Vec<CompiledStateMachine> = sm_source.values()
         .map(|sm_def| compile_state_machine(sm_def, &constraints))
         .collect();
+    eprintln!("  [profile] {} state machines: {:?}", state_machines.len(), t1.elapsed());
 
-    // Build NounIndex for synthesis queries
+    let t2 = std::time::Instant::now();
     let noun_index = build_noun_index(ir, &constraints, &state_machines);
+    eprintln!("  [profile] noun index: {:?}", t2.elapsed());
 
-    // Compile derivation rules -- both explicit from IR and implicit from structure
+    let t3 = std::time::Instant::now();
     let derivations = compile_derivations(ir);
+    eprintln!("  [profile] {} derivations: {:?}", derivations.len(), t3.elapsed());
 
-    // Compile fact types to Construction functions (CONS of Roles)
+    let t4 = std::time::Instant::now();
     let schemas = compile_schemas(ir);
+    eprintln!("  [profile] {} schemas: {:?}", schemas.len(), t4.elapsed());
 
     // Build fact-to-event mapping from schemas + state machines.
     // For each fact type, check if any role's noun has a state machine.
