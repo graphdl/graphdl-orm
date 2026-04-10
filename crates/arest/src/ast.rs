@@ -434,10 +434,24 @@ fn apply_arithmetic(x: &Object, op: fn(f64, f64) -> Option<f64>) -> Object {
 /// Store compiled defs as cells in D. Each def becomes a cell whose name
 /// is the def name and whose contents is the Object representation of the Func.
 /// This is Backus Sec. 13.3.2: definitions map atoms to expressions.
+/// Build state from defs + existing cells in O(n).
+/// Collects all cells into a HashMap (O(1) per insert), then
+/// constructs the Object sequence in one pass. Replaces the
+/// O(n²) sequential fold over store.
 pub fn defs_to_state(defs: &[(String, Func)], state: &Object) -> Object {
-    defs.iter().fold(state.clone(), |acc, (name, func)| {
-        store(name, func_to_object(func), &acc)
-    })
+    use std::collections::HashMap;
+    // Start with existing cells from state
+    let mut map: HashMap<String, Object> = cells_iter(state).into_iter()
+        .map(|(name, contents)| (name.to_string(), contents.clone()))
+        .collect();
+    // Overlay defs — O(1) per insert
+    defs.iter().for_each(|(name, func)| {
+        map.insert(name.clone(), func_to_object(func));
+    });
+    // Build Object in one pass — O(n)
+    Object::Seq(map.into_iter()
+        .map(|(name, contents)| cell(&name, contents))
+        .collect())
 }
 
 pub fn apply(func: &Func, x: &Object, d: &Object) -> Object {
@@ -1247,14 +1261,20 @@ pub fn cell_push(name: &str, fact: Object, state: &Object) -> Object {
     store(name, new_contents, state)
 }
 
-/// Merge two states: foldl(concat_cell, target, cells(source)).
-/// Each step concatenates one source cell's contents into the target.
+/// Merge two states in O(n): collect all cells into a HashMap,
+/// concatenate overlapping cells, build result in one pass.
 pub fn merge_states(target: &Object, source: &Object) -> Object {
-    cells_iter(source).into_iter().fold(target.clone(), |acc, (name, contents)| {
-        let existing = fetch_or_phi(name, &acc);
-        let merged = concat_seq(&existing, contents);
-        store(name, merged, &acc)
-    })
+    use std::collections::HashMap;
+    let mut map: HashMap<String, Object> = cells_iter(target).into_iter()
+        .map(|(name, contents)| (name.to_string(), contents.clone()))
+        .collect();
+    cells_iter(source).into_iter().for_each(|(name, contents)| {
+        let entry = map.entry(name.to_string()).or_insert_with(Object::phi);
+        *entry = concat_seq(entry, contents);
+    });
+    Object::Seq(map.into_iter()
+        .map(|(name, contents)| cell(&name, contents))
+        .collect())
 }
 
 /// Concatenate two sequences: <a₁,...,aₙ> ++ <b₁,...,bₘ> = <a₁,...,aₙ,b₁,...,bₘ>
