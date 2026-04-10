@@ -261,9 +261,9 @@ fn main() {
             (false, "--help" | "-h") => {
                 println!("Usage: arest [<readings_dir> ...] [--db <path>] [<key> <input>]");
                 println!();
-                println!("  No args:           load state from --db, start REPL (not yet implemented)");
-                println!("  <dir> [<dir2>]:    compile readings via SYSTEM, persist to --db");
+                println!("  <dir> [<dir2>]:    compile readings, persist to --db");
                 println!("  <key> <input>:     single SYSTEM call against persisted state");
+                println!("  (no args):         REPL — load state, interactive system calls");
                 println!();
                 println!("  --db <path>        SQLite database path (default: arest.db)");
                 println!("  --no-validate      skip constraint validation during compile");
@@ -425,11 +425,60 @@ fn main() {
                 (new_d != d).then(|| db::persist_state(&conn, &new_d));
             }
 
-            // No args or single non-dir arg
+            // arest --db <path> — REPL mode
+            // Load state once, compile defs, then loop: read key+input, apply SYSTEM, print.
             _ => {
-                eprintln!("Usage: arest <readings_dir> [--db <path>]");
-                eprintln!("       arest <key> <input> [--db <path>]");
-                std::process::exit(1);
+                let loaded = db::load_state(&conn);
+                let mut d = match ast::fetch("validate", &loaded) {
+                    ast::Object::Bottom => {
+                        eprintln!("Compiling defs...");
+                        let mut defs = compile::compile_to_defs_state(&loaded);
+                        defs.push(("compile".to_string(), ast::Func::Platform("compile".to_string())));
+                        defs.push(("apply".to_string(), ast::Func::Platform("apply_command".to_string())));
+                        defs.push(("verify_signature".to_string(), ast::Func::Platform("verify_signature".to_string())));
+                        let compiled = ast::defs_to_state(&defs, &loaded);
+                        db::persist_state(&conn, &compiled);
+                        compiled
+                    }
+                    _ => loaded,
+                };
+
+                eprintln!("AREST REPL — SYSTEM is the only function.");
+                eprintln!("  <key> <input>    call system(key, input)");
+                eprintln!("  :quit            exit");
+                eprintln!();
+
+                let stdin = std::io::stdin();
+                let mut line = String::new();
+                loop {
+                    eprint!("arest> ");
+                    line.clear();
+                    match stdin.read_line(&mut line) {
+                        Ok(0) => break, // EOF
+                        Err(e) => { eprintln!("Read error: {}", e); break; }
+                        _ => {}
+                    }
+                    let trimmed = line.trim();
+                    match trimmed {
+                        "" => continue,
+                        ":quit" | ":q" | ":exit" => break,
+                        _ => {
+                            // Split on first whitespace: key + rest
+                            let (key, input) = trimmed.split_once(char::is_whitespace)
+                                .map(|(k, i)| (k, i.trim()))
+                                .unwrap_or((trimmed, ""));
+                            let t = std::time::Instant::now();
+                            let (output, new_d) = system(key, input, &d);
+                            eprintln!("[{:?}]", t.elapsed());
+                            println!("{}", output);
+                            // Update in-memory state if changed; persist periodically
+                            (new_d != d).then(|| {
+                                d = new_d;
+                                db::persist_state(&conn, &d);
+                            });
+                        }
+                    }
+                }
             }
         }
     }
