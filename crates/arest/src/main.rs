@@ -296,24 +296,44 @@ fn main() {
                     std::process::exit(1);
                 });
 
-                // Concatenate all readings, one SYSTEM compile call.
-                // compile_to_defs_state runs ONCE on the merged state.
-                // Bootstrap mode: user readings may reference metamodel
-                // nouns in instance facts without redeclaring them.
-                let combined = readings.iter()
-                    .map(|(_, text)| text.as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n\n");
-                let mut d = create();
+                // Fast path: fold all readings (metamodel + user) into a
+                // single Domain IR, then convert to Object state ONCE.
+                // No merge_states loop — O(n) in total content.
                 parse_forml2::set_bootstrap_mode(true);
-                no_validate.then(|| ast::set_skip_validate(true));
-                let (output, new_d) = system("compile", &combined, &d);
-                ast::set_skip_validate(false);
+                let all_readings: Vec<(&str, &str)> = METAMODEL_READINGS.iter()
+                    .map(|(n, t)| (*n, *t))
+                    .chain(readings.iter().map(|(n, t)| (n.as_str(), t.as_str())))
+                    .collect();
+                let domain = all_readings.iter().fold(
+                    types::Domain::default(),
+                    |mut merged, (name, text)| {
+                        let ir = match merged.nouns.is_empty() {
+                            true => parse_forml2::parse_markdown(text),
+                            false => parse_forml2::parse_markdown_with_nouns(text, &merged.nouns),
+                        }.unwrap_or_else(|e| { eprintln!("{}: {}", name, e); std::process::exit(1); });
+                        merged.nouns.extend(ir.nouns);
+                        merged.fact_types.extend(ir.fact_types);
+                        merged.constraints.extend(ir.constraints);
+                        merged.state_machines.extend(ir.state_machines);
+                        merged.derivation_rules.extend(ir.derivation_rules);
+                        merged.general_instance_facts.extend(ir.general_instance_facts);
+                        merged.subtypes.extend(ir.subtypes);
+                        merged.enum_values.extend(ir.enum_values);
+                        merged.ref_schemes.extend(ir.ref_schemes);
+                        merged.objectifications.extend(ir.objectifications);
+                        merged.named_spans.extend(ir.named_spans);
+                        merged.autofill_spans.extend(ir.autofill_spans);
+                        merged
+                    },
+                );
                 parse_forml2::set_bootstrap_mode(false);
-                match output.starts_with("⊥") {
-                    true => { eprintln!("Compile failed: {}", output); std::process::exit(1); }
-                    false => d = new_d,
-                };
+                let state = parse_forml2::domain_to_state(&domain);
+                let defs = vec![
+                    ("compile".to_string(), ast::Func::Platform("compile".to_string())),
+                    ("apply".to_string(), ast::Func::Platform("apply_command".to_string())),
+                    ("verify_signature".to_string(), ast::Func::Platform("verify_signature".to_string())),
+                ];
+                let d = ast::defs_to_state(&defs, &state);
                 let compiled = readings.len();
 
                 // Persist state to SQLite.
@@ -324,8 +344,23 @@ fn main() {
             }
 
             // arest <key> <input> — single SYSTEM call
+            // Lazy compile: if defs aren't in state, compile them now.
             (true, n) if n >= 2 => {
-                let d = db::load_state(&conn);
+                let loaded = db::load_state(&conn);
+                let d = match ast::fetch("validate", &loaded) {
+                    ast::Object::Bottom => {
+                        // No compiled defs yet — compile now from stored cells.
+                        eprintln!("Compiling defs from stored state...");
+                        let mut defs = compile::compile_to_defs_state(&loaded);
+                        defs.push(("compile".to_string(), ast::Func::Platform("compile".to_string())));
+                        defs.push(("apply".to_string(), ast::Func::Platform("apply_command".to_string())));
+                        defs.push(("verify_signature".to_string(), ast::Func::Platform("verify_signature".to_string())));
+                        let compiled = ast::defs_to_state(&defs, &loaded);
+                        db::persist_state(&conn, &compiled);
+                        compiled
+                    }
+                    _ => loaded,
+                };
                 let key = &non_dirs[0];
                 let input = &non_dirs[1];
                 let (output, new_d) = system(key, input, &d);
