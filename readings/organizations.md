@@ -75,9 +75,16 @@ User accesses Domain.
 App navigates Domain.
 App displays Noun.
 
+App extends App.
+
 ## Constraints
 
 If some User owns some Organization and that User is deleted then that Organization is also deleted.
+
+## Ring Constraints
+
+No App extends itself.
+No App may cycle back to itself via one or more traversals through extends.
 
 ## Derivation Rules
 
