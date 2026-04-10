@@ -1,13 +1,10 @@
 # Domain Evolution
 
-How the metamodel modifies itself. A Domain Change proposes new metamodel
-entities (readings, nouns, constraints). The proposed changes are validated
-via CSDP before being applied. This domain is self-referential: it describes
-how new readings get added to GraphDL using GraphDL's own primitives.
+## Description
 
-The Curry-Howard correspondence applies: proposing a new fact type is proposing
-a theorem. CSDP validation is the proof check. Successful ingestion is the proof.
-The system can only evolve by proving something new.
+How the metamodel modifies itself. A Domain Change proposes new metamodel entities (readings, nouns, constraints). The proposed changes are validated via CSDP before being applied. This domain is self-referential: it describes how new readings get added to GraphDL using GraphDL's own primitives.
+
+The Curry-Howard correspondence applies: proposing a new fact type is proposing a theorem. CSDP validation is the proof check. Successful ingestion is the proof. The system can only evolve by proving something new.
 
 ## Entity Types
 

@@ -1,7 +1,8 @@
 # GraphDL UI — Presentation Layer
 
-Platform-agnostic view hierarchy, navigation, and controls.
-Custom renderers registered per platform via the factory pattern.
+## Description
+
+Platform-agnostic view hierarchy, navigation, and controls. Custom renderers registered per platform via the factory pattern.
 
 ## Entity Types
 

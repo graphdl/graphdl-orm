@@ -1,5 +1,8 @@
 # GraphDL Core Metamodel
-# Extracted from NORMA ORM2 model (design/html/)
+
+## Description
+
+Extracted from NORMA ORM2 model (design/html/).
 
 ## Entity Types
 
