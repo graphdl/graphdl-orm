@@ -958,6 +958,12 @@ fn platform_compile(x: &Object, d: &Object) -> Object {
     // Merge: foldl(concat_cell, D, cells(parsed))
     let merged_state = merge_states(d, &parsed);
 
+    // Structural model validation (#48) — catch FORML2 violations.
+    // Warnings only for now — pre-existing metamodel issues need cleanup first.
+    let merged_domain = crate::compile::state_to_domain(&merged_state);
+    let model_errors = crate::compile::validate_model(&merged_domain);
+    model_errors.iter().for_each(|e| eprintln!("[model warning] {}", e));
+
     // Compile defs from merged state + re-register platform primitives
     let mut defs = crate::compile::compile_to_defs_state(&merged_state);
     defs.push(("compile".to_string(), Func::Platform("compile".to_string())));
