@@ -530,6 +530,7 @@ fn try_derivation(line: &str) -> Option<ParseAction> {
     let has_marker = line.contains(" iff ")
         || has_if
         || is_conditional
+        || line.contains(" := ")
         || line.contains(" is derived as ")
         || (line.starts_with("For each ") && line.contains(" = "))
         || line.contains("count each")
@@ -1229,10 +1230,12 @@ fn resolve_derivation_rule(rule: &mut DerivationRuleDef, ir: &Domain, catalog: &
     let mut noun_names: Vec<String> = ir.nouns.keys().cloned().collect();
     noun_names.sort_by(|a, b| b.len().cmp(&a.len()));
 
-    // Split on " iff " or " if " to get (consequent, antecedent_text)
+    // Split on " := ", " iff ", or " if " to get (consequent, antecedent_text)
     let (consequent_text, antecedent_text) = rule.text
-        .find(" iff ")
-        .map(|i| (&rule.text[..i], &rule.text[i + 5..]))
+        .find(" := ")
+        .map(|i| (&rule.text[..i], &rule.text[i + 4..]))
+        .or_else(|| rule.text.find(" iff ")
+            .map(|i| (&rule.text[..i], &rule.text[i + 5..])))
         .or_else(|| rule.text.find(" if ")
             .map(|i| (&rule.text[..i], &rule.text[i + 4..])))
         .unwrap_or((&rule.text, ""));
@@ -1244,9 +1247,12 @@ fn resolve_derivation_rule(rule: &mut DerivationRuleDef, ir: &Domain, catalog: &
         .filter(|s| !s.is_empty())
         .collect();
 
-    // Strip "that " prefix from noun references in a text fragment.
+    // Strip quantifier and anaphoric words from a text fragment.
     let strip_anaphora = |text: &str| -> String {
         text.replace("that ", "")
+            .replace("some ", "")
+            .replace("each ", "")
+            .replace("any ", "")
     };
 
     // Resolve a text fragment to a Graph Schema ID via rho-lookup through the catalog.
