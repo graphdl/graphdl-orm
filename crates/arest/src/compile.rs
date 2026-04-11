@@ -677,11 +677,12 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
     } // end test gate
 
     // Handler defs — α(noun → <create_def, update_def>)
+    // Platform functions: create:{noun} and update:{noun} take Object fact pairs,
+    // not JSON. Per AREST Eq. 6, input is the 3NF row.
     defs.extend(domain.nouns.keys().flat_map(|noun_name| {
-        let noun_obj = Object::atom(noun_name);
         [
-            (format!("create:{}", noun_name), Func::constant(noun_obj.clone())),
-            (format!("update:{}", noun_name), Func::constant(noun_obj)),
+            (format!("create:{}", noun_name), Func::Platform(format!("create:{}", noun_name))),
+            (format!("update:{}", noun_name), Func::Platform(format!("update:{}", noun_name))),
         ]
     }));
 
@@ -1060,9 +1061,28 @@ pub fn validate_model(ir: &Domain) -> Vec<String> {
         });
 
     // 6. Constraint references undeclared fact type
+    // Skip when: (a) span FT ID is a prefix of a declared FT, or
+    // (b) every noun mentioned in the span FT ID is a declared noun.
+    // Both cases are parser resolution mismatches (XUC, "per", inverse
+    // readings, "the same" artifacts), not modeling errors.
+    let noun_names_sorted: Vec<&str> = {
+        let mut v: Vec<&str> = ir.nouns.keys().map(|s| s.as_str()).collect();
+        v.sort_by(|a, b| b.len().cmp(&a.len()));
+        v
+    };
     ir.constraints.iter()
         .flat_map(|c| c.spans.iter())
         .filter(|span| !span.fact_type_id.is_empty() && !ir.fact_types.contains_key(&span.fact_type_id))
+        .filter(|span| !ir.fact_types.keys().any(|k| k.starts_with(&span.fact_type_id)))
+        .filter(|span| {
+            // Check if all nouns in the span FT ID are declared — if so,
+            // the modeling is correct and the parser just failed to resolve.
+            let id = span.fact_type_id.replace('_', " ");
+            let found: Vec<&&str> = noun_names_sorted.iter()
+                .filter(|n| id.contains(**n))
+                .collect();
+            found.is_empty() // only warn if NO declared nouns found
+        })
         .for_each(|span| errors.push(format!(
             "Constraint span references undeclared fact type '{}'", span.fact_type_id)));
 

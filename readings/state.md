@@ -61,8 +61,8 @@ Status is terminal in State Machine Definition iff that Status is defined in tha
 
 For each Noun, at most one State Machine Definition is for that Noun.
 Each State Machine Definition has exactly one initial Status.
-Each State Machine Definition has at least one terminal Status.
-For each State Machine Definition, the initial Status of that State Machine Definition is defined in that State Machine Definition.
+It is obligatory that each State Machine Definition has at least one terminal Status.
+If some Status is initial in some State Machine Definition then that Status is defined in that State Machine Definition.
 
 ## Instance Facts
 

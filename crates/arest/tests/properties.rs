@@ -161,6 +161,14 @@ fn compile_orders() -> (ast::Object, ast::Object) {
     (state, d)
 }
 
+fn compile_orders_with_generators(gens: &[&str]) -> (ast::Object, ast::Object) {
+    let gen_set: std::collections::HashSet<String> = gens.iter().map(|s| s.to_string()).collect();
+    compile::set_active_generators(gen_set);
+    let result = compile_orders();
+    compile::set_active_generators(std::collections::HashSet::new());
+    result
+}
+
 // ── Theorem 1: Grammar Unambiguity ───────────────────────────────────
 // Each FORML2 sentence over (N, F) has exactly one parse.
 
@@ -1599,6 +1607,8 @@ fn create_entity_via_defs_produces_entity_and_status() {
         domain: "orders".to_string(),
         id: Some("ord-1".to_string()),
         fields,
+        sender: None,
+        signature: None,
     };
 
     let result = arest::arest::apply_command_defs(&d, &command, &state);
@@ -1637,6 +1647,8 @@ fn transition_via_defs_changes_status() {
         domain: "orders".to_string(),
         id: Some("ord-1".to_string()),
         fields,
+        sender: None,
+        signature: None,
     };
     let create_result = arest::arest::apply_command_defs(&d, &create_cmd, &state);
     assert_eq!(create_result.status, Some("In Cart".to_string()));
@@ -1647,6 +1659,8 @@ fn transition_via_defs_changes_status() {
         event: "place".to_string(),
         domain: "orders".to_string(),
         current_status: Some("In Cart".to_string()),
+        sender: None,
+        signature: None,
     };
     let result = arest::arest::apply_command_defs(&d, &transition_cmd, &create_result.state);
 
@@ -1705,7 +1719,7 @@ fn agent_def_contains_deontic_rules() {
 
 #[test]
 fn ilayer_defs_produced_for_nouns() {
-    let (_pop, d) = compile_orders();
+    let (_pop, d) = compile_orders_with_generators(&["ilayer"]);
     let ilayer_defs: Vec<_> = ast::cells_iter(&d).into_iter()
         .filter(|(n, _)| n.starts_with("ilayer:"))
         .collect();
@@ -1716,7 +1730,7 @@ fn ilayer_defs_produced_for_nouns() {
 
 #[test]
 fn ilayer_def_contains_object_type_and_facts() {
-    let (_pop, d) = compile_orders();
+    let (_pop, d) = compile_orders_with_generators(&["ilayer"]);
     let ilayer = ast::metacompose(&ast::fetch_or_phi("ilayer:Order", &d), &d);
     let obj = match &ilayer {
         arest::ast::Func::Constant(obj) => obj,
@@ -1729,7 +1743,7 @@ fn ilayer_def_contains_object_type_and_facts() {
 
 #[test]
 fn sql_defs_produced_for_tables() {
-    let (_pop, d) = compile_orders();
+    let (_pop, d) = compile_orders_with_generators(&["sqlite"]);
     let sql_defs: Vec<_> = ast::cells_iter(&d).into_iter()
         .filter(|(n, _)| n.starts_with("sql:"))
         .collect();
@@ -1738,7 +1752,7 @@ fn sql_defs_produced_for_tables() {
 
 #[test]
 fn sql_def_contains_create_table() {
-    let (_pop, d) = compile_orders();
+    let (_pop, d) = compile_orders_with_generators(&["sqlite"]);
     let sql_cells: Vec<_> = ast::cells_iter(&d).into_iter()
         .filter(|(n, _)| n.starts_with("sql:"))
         .map(|(n, _)| n.to_string())
@@ -1756,7 +1770,7 @@ fn sql_def_contains_create_table() {
 
 #[test]
 fn test_defs_produced_for_constraints() {
-    let (_pop, d) = compile_orders();
+    let (_pop, d) = compile_orders_with_generators(&["test"]);
     let test_defs: Vec<_> = ast::cells_iter(&d).into_iter()
         .filter(|(n, _)| n.starts_with("test:"))
         .collect();
@@ -1765,7 +1779,7 @@ fn test_defs_produced_for_constraints() {
 
 #[test]
 fn test_def_contains_constraint_metadata() {
-    let (_pop, d) = compile_orders();
+    let (_pop, d) = compile_orders_with_generators(&["test"]);
     let test_names: Vec<_> = ast::cells_iter(&d).into_iter()
         .filter(|(n, _)| n.starts_with("test:"))
         .map(|(n, _)| n.to_string())
@@ -1781,4 +1795,279 @@ fn test_def_contains_constraint_metadata() {
         assert!(text.contains("kind"), "test def {} should contain kind", name);
         assert!(text.contains("modality"), "test def {} should contain modality", name);
     }
+}
+
+// ── HATEOAS Navigation Links (Theorem 4b) ──────────────────────────
+// nav(e, n) = children(n) ∪ parent(n) — projections from S via UC.
+
+#[test]
+fn hateoas_nav_links_in_create_response() {
+    use std::collections::HashMap;
+    let (state, d) = compile_orders();
+
+    let mut fields = HashMap::new();
+    fields.insert("customer".to_string(), "Acme".to_string());
+
+    let command = arest::arest::Command::CreateEntity {
+        noun: "Order".to_string(),
+        domain: "orders".to_string(),
+        id: Some("ord-nav".to_string()),
+        fields,
+        sender: None,
+        signature: None,
+    };
+
+    let result = arest::arest::apply_command_defs(&d, &command, &state);
+    assert!(!result.rejected);
+
+    // Order has children (Line Item) and parents (Customer) from UC projections
+    let child_nouns: Vec<&str> = result.navigation.iter()
+        .filter(|l| l.rel == "children")
+        .map(|l| l.noun.as_str())
+        .collect();
+    let parent_nouns: Vec<&str> = result.navigation.iter()
+        .filter(|l| l.rel == "parent")
+        .map(|l| l.noun.as_str())
+        .collect();
+
+    // At minimum, Order should have nav links (exact nouns depend on schema)
+    assert!(!result.navigation.is_empty(),
+        "Order should have navigation links from UC projections");
+    eprintln!("Nav links: children={:?}, parents={:?}", child_nouns, parent_nouns);
+}
+
+// ── Compound Reference Scheme E2E ──────────────────────────────────
+// Paper Eq. 6: resolve determines identity from the reference scheme.
+// A compound ref scheme (.Owner, .Seq) should decompose "alice-1" into
+// Owner=alice, Seq=1 as component facts during create.
+
+const COMPOUND_REF_DOMAIN: &str = r#"
+Thing (.Owner, .Seq) is an entity type.
+Owner is a value type.
+Seq is a value type.
+Label is a value type.
+Thing has Label.
+"#;
+
+fn compile_compound_ref() -> (ast::Object, ast::Object) {
+    let ir = parse_forml2::parse_markdown(COMPOUND_REF_DOMAIN).unwrap();
+    let state = parse_forml2::domain_to_state(&ir);
+    let defs = compile::compile_to_defs_state(&state);
+    let d = ast::defs_to_state(&defs, &state);
+    (state, d)
+}
+
+#[test]
+fn compound_ref_scheme_e2e_instance_facts_decompose() {
+    // Parse-time path: instance facts in readings decompose compound IDs.
+    let input = r#"
+Thing (.Owner, .Seq) is an entity type.
+Owner is a value type.
+Seq is a value type.
+Label is a value type.
+Thing has Label.
+
+## Instance Facts
+Thing 'alice-1' has Label 'foo'.
+"#;
+    let ir = parse_forml2::parse_markdown(input).unwrap();
+    let state = parse_forml2::domain_to_state(&ir);
+    let defs = compile::compile_to_defs_state(&state);
+    let d = ast::defs_to_state(&defs, &state);
+
+    // Component facts should exist from parse-time decomposition
+    let owner_cell = ast::fetch_or_phi("Thing_has_Owner", &d);
+    let owner_facts = owner_cell.as_seq().expect("Thing_has_Owner cell should exist");
+    assert!(owner_facts.iter().any(|f|
+        ast::binding(f, "Thing") == Some("alice-1") &&
+        ast::binding(f, "Owner") == Some("alice")
+    ), "Owner component should be decomposed from 'alice-1'");
+
+    let seq_cell = ast::fetch_or_phi("Thing_has_Seq", &d);
+    let seq_facts = seq_cell.as_seq().expect("Thing_has_Seq cell should exist");
+    assert!(seq_facts.iter().any(|f|
+        ast::binding(f, "Thing") == Some("alice-1") &&
+        ast::binding(f, "Seq") == Some("1")
+    ), "Seq component should be decomposed from 'alice-1'");
+}
+
+#[test]
+fn compound_ref_scheme_e2e_create_entity_decomposes() {
+    use std::collections::HashMap;
+    // Runtime path: createEntity with compound ref scheme should decompose the ID.
+    let (state, d) = compile_compound_ref();
+
+    let mut fields = HashMap::new();
+    fields.insert("Label".to_string(), "foo".to_string());
+
+    let command = arest::arest::Command::CreateEntity {
+        noun: "Thing".to_string(),
+        domain: "test".to_string(),
+        id: Some("bob-2".to_string()),
+        fields,
+        sender: None,
+        signature: None,
+    };
+
+    let result = arest::arest::apply_command_defs(&d, &command, &state);
+    assert!(!result.rejected, "Valid create should not be rejected");
+
+    // The resolve step should decompose "bob-2" into Owner=bob, Seq=2
+    let owner_cell = ast::fetch_or_phi("Thing_has_Owner", &result.state);
+    let owner_facts = owner_cell.as_seq().unwrap_or_default();
+    assert!(owner_facts.iter().any(|f|
+        ast::binding(f, "Thing") == Some("bob-2") &&
+        ast::binding(f, "Owner") == Some("bob")
+    ), "Runtime create should decompose compound ID: Owner component missing.\nOwner facts: {:?}", owner_facts);
+
+    let seq_cell = ast::fetch_or_phi("Thing_has_Seq", &result.state);
+    let seq_facts = seq_cell.as_seq().unwrap_or_default();
+    assert!(seq_facts.iter().any(|f|
+        ast::binding(f, "Thing") == Some("bob-2") &&
+        ast::binding(f, "Seq") == Some("2")
+    ), "Runtime create should decompose compound ID: Seq component missing.\nSeq facts: {:?}", seq_facts);
+}
+
+// ── Self-Evolution (Corollary 5) ───────────────────────────────────
+// Closure Under Self-Modification: ingesting new readings at runtime
+// via LoadReadings should merge new nouns/fact types/constraints into
+// the state and compile new defs. Subsequent SYSTEM calls use them.
+
+#[test]
+fn self_evolution_load_readings_extends_schema() {
+    // Start with a compiled domain
+    let (state, d) = compile_orders();
+
+    // Verify "Reason" does NOT exist before loading
+    let noun_cell_before = ast::fetch_or_phi("Noun", &state);
+    let has_reason_before = noun_cell_before.as_seq()
+        .map_or(false, |facts| facts.iter().any(|f| ast::binding(f, "name") == Some("Reason")));
+    assert!(!has_reason_before, "Reason should not exist before LoadReadings");
+
+    // Load new readings that add a NEW noun + fact type
+    let new_readings = r#"
+Reason is a value type.
+Order has Reason.
+  Each Order has at most one Reason.
+"#;
+    let load_cmd = arest::arest::Command::LoadReadings {
+        markdown: new_readings.to_string(),
+        domain: "orders".to_string(),
+        sender: None,
+        signature: None,
+    };
+
+    let load_result = arest::arest::apply_command_defs(&d, &load_cmd, &state);
+    assert!(!load_result.rejected, "Loading valid readings should not be rejected");
+
+    // The state should now contain the new Noun
+    let noun_cell = ast::fetch_or_phi("Noun", &load_result.state);
+    let noun_facts = noun_cell.as_seq().expect("Noun cell should exist");
+    assert!(noun_facts.iter().any(|f| ast::binding(f, "name") == Some("Reason")),
+        "New noun 'Reason' should be in state after LoadReadings");
+
+    // The state should contain the new GraphSchema
+    let schema_cell = ast::fetch_or_phi("GraphSchema", &load_result.state);
+    let schema_facts = schema_cell.as_seq().expect("GraphSchema cell should exist");
+    assert!(schema_facts.iter().any(|f| {
+        ast::binding(f, "reading").map_or(false, |r| r.contains("Reason"))
+    }), "New fact type with Reason should be in state after LoadReadings");
+}
+
+#[test]
+fn self_evolution_new_constraints_enforce_after_load() {
+    use std::collections::HashMap;
+
+    let (state, d) = compile_orders();
+
+    // Load readings that add a mandatory constraint on a new fact type
+    let new_readings = r#"
+Reason is a value type.
+Order has Reason.
+  Each Order has exactly one Reason.
+"#;
+    let load_cmd = arest::arest::Command::LoadReadings {
+        markdown: new_readings.to_string(),
+        domain: "orders".to_string(),
+        sender: None,
+        signature: None,
+    };
+
+    let load_result = arest::arest::apply_command_defs(&d, &load_cmd, &state);
+    assert!(!load_result.rejected, "Loading valid readings should not be rejected");
+
+    // load_result.state is now the full D (state + recompiled defs) — Corollary 5.
+    // No manual recompile needed.
+    let new_d = &load_result.state;
+
+    // The resolve:{Order} def should now include "reason" → specific fact type ID
+    let resolve_result = ast::apply(
+        &ast::Func::Def("resolve:Order".to_string()),
+        &ast::Object::atom("reason"),
+        new_d,
+    );
+    let resolved_ft = resolve_result.as_atom().unwrap_or("");
+    assert!(resolved_ft.contains("Order") && resolved_ft.contains("Reason"),
+        "resolve:Order should map 'reason' to Order_has_Reason (or similar), got: {:?}", resolved_ft);
+
+    // Stronger test: create an entity using the NEW fact type after self-modification.
+    // This proves the recompiled defs are live.
+    let mut fields = HashMap::new();
+    fields.insert("customer".to_string(), "Acme".to_string());
+    fields.insert("Reason".to_string(), "bulk discount".to_string());
+    let create_cmd = arest::arest::Command::CreateEntity {
+        noun: "Order".to_string(),
+        domain: "orders".to_string(),
+        id: Some("ord-99".to_string()),
+        fields,
+        sender: None,
+        signature: None,
+    };
+    let create_result = arest::arest::apply_command_defs(new_d, &create_cmd, new_d);
+    assert!(!create_result.rejected, "Create with new field should succeed after self-evolution");
+
+    // Verify the new fact type has data
+    let reason_cell = ast::fetch_or_phi("Order_has_Reason", &create_result.state);
+    let reason_facts = reason_cell.as_seq().unwrap_or_default();
+    assert!(reason_facts.iter().any(|f|
+        ast::binding(f, "Order") == Some("ord-99") &&
+        ast::binding(f, "Reason") == Some("bulk discount")
+    ), "New fact type should be populated after create: {:?}", reason_facts);
+}
+
+// ── Metamodel Validation ───────────────────────────────────────────
+// validate_model must produce zero warnings on the bundled metamodel.
+
+#[test]
+fn bundled_metamodel_passes_validate_model() {
+    let readings: Vec<(&str, &str)> = vec![
+        ("core", include_str!("../../../readings/core.md")),
+        ("state", include_str!("../../../readings/state.md")),
+        ("instances", include_str!("../../../readings/instances.md")),
+        ("outcomes", include_str!("../../../readings/outcomes.md")),
+        ("validation", include_str!("../../../readings/validation.md")),
+        ("evolution", include_str!("../../../readings/evolution.md")),
+        ("organizations", include_str!("../../../readings/organizations.md")),
+        ("agents", include_str!("../../../readings/agents.md")),
+        ("ui", include_str!("../../../readings/ui.md")),
+    ];
+    // Use parse_markdown (no bootstrap needed — each file parsed standalone,
+    // then IRs merged). Cross-file noun references won't resolve as fact types
+    // but validate_model checks the merged domain.
+    let domain = readings.iter().fold(
+        arest::types::Domain::default(),
+        |mut merged, (_, text)| {
+            let ir = parse_forml2::parse_markdown(text).unwrap();
+            merged.nouns.extend(ir.nouns);
+            merged.fact_types.extend(ir.fact_types);
+            merged.constraints.extend(ir.constraints);
+            merged.subtypes.extend(ir.subtypes);
+            merged
+        },
+    );
+
+    let errors = compile::validate_model(&domain);
+    errors.iter().for_each(|e| eprintln!("[model warning] {}", e));
+    assert!(errors.is_empty(), "Metamodel should have zero validate_model warnings, got {}:\n{}",
+        errors.len(), errors.join("\n"));
 }

@@ -844,6 +844,9 @@ fn apply_platform(name: &str, x: &Object, d: &Object) -> Object {
         "compile" => platform_compile(x, d),
         "apply_command" => platform_apply_command(x, d),
         "verify_signature" => platform_verify_signature(x),
+        s if s.starts_with("create:") => platform_create(&s[7..], x, d),
+        s if s.starts_with("update:") => platform_update(&s[7..], x, d),
+        s if s.starts_with("transition:") => platform_transition(&s[11..], x, d),
         _ => Object::Bottom,
     }
 }
@@ -1070,6 +1073,88 @@ fn platform_apply_command(x: &Object, d: &Object) -> Object {
         Ok(s) => Object::atom(&s),
         Err(e) => Object::atom(&format!("⊥ {}", e)),
     }
+}
+
+/// Platform primitive: create entity from fact pairs (AREST Eq. 6).
+/// Key: "create:{noun}". Input: <<field, value>, ...> or <<id, val>, <field, val>, ...>.
+/// Returns the result as an Object containing the new state.
+fn platform_create(noun: &str, x: &Object, d: &Object) -> Object {
+    let (id, fields) = extract_fact_pairs(x);
+    let command = crate::arest::Command::CreateEntity {
+        noun: noun.to_string(),
+        domain: String::new(),
+        id,
+        fields,
+        sender: None,
+        signature: None,
+    };
+    let result = crate::arest::apply_command_defs(d, &command, d);
+    crate::arest::encode_command_result(&result)
+}
+
+/// Platform primitive: update entity from fact pairs.
+/// Key: "update:{noun}". Input: <<id, val>, <field, val>, ...>.
+fn platform_update(noun: &str, x: &Object, d: &Object) -> Object {
+    let (id, fields) = extract_fact_pairs(x);
+    let entity_id = id.unwrap_or_default();
+    let command = crate::arest::Command::UpdateEntity {
+        noun: noun.to_string(),
+        domain: String::new(),
+        entity_id,
+        fields,
+        sender: None,
+        signature: None,
+    };
+    let result = crate::arest::apply_command_defs(d, &command, d);
+    crate::arest::encode_command_result(&result)
+}
+
+/// Platform primitive: transition entity state machine.
+/// Key: "transition:{noun}". Input: <entity_id, event>.
+fn platform_transition(noun: &str, x: &Object, d: &Object) -> Object {
+    let items = match x.as_seq() {
+        Some(s) => s,
+        None => return Object::Bottom,
+    };
+    let entity_id = items.first().and_then(|o| o.as_atom()).unwrap_or("").to_string();
+    let event = items.get(1).and_then(|o| o.as_atom()).unwrap_or("").to_string();
+    // Extract current status from state for the entity
+    let status_key = "StateMachine_has_currentlyInStatus";
+    let current_status = fetch_or_phi(status_key, d).as_seq()
+        .and_then(|facts| facts.iter()
+            .find(|f| binding_matches(f, "State Machine", &entity_id))
+            .and_then(|f| binding(f, "currentlyInStatus").map(|s| s.to_string())));
+    let command = crate::arest::Command::Transition {
+        entity_id,
+        event,
+        domain: String::new(),
+        current_status,
+        sender: None,
+        signature: None,
+    };
+    let result = crate::arest::apply_command_defs(d, &command, d);
+    crate::arest::encode_command_result(&result)
+}
+
+/// Extract (optional id, field map) from an Object of fact pairs.
+/// Input: <<id, val>, <field1, val1>, ...> or <<field1, val1>, ...>
+fn extract_fact_pairs(x: &Object) -> (Option<String>, std::collections::HashMap<String, String>) {
+    let mut fields = std::collections::HashMap::new();
+    let mut id = None;
+    let items = x.as_seq().unwrap_or_default();
+    items.iter().for_each(|pair| {
+        pair.as_seq().and_then(|kv| {
+            let k = kv.first()?.as_atom()?.to_string();
+            let v = kv.get(1)?.as_atom()?.to_string();
+            Some((k, v))
+        }).map(|(k, v)| {
+            match k.as_str() {
+                "id" => { id = Some(v); }
+                _ => { fields.insert(k, v); }
+            }
+        });
+    });
+    (id, fields)
 }
 
 /// Walk a Command's string fields and return the name of the first field whose
@@ -1774,7 +1859,7 @@ impl Func {
     /// Pure Func = no Native anywhere in the tree.
     pub fn has_native(&self) -> bool {
         match self {
-            Func::Native(_) | Func::Platform(_) => true,
+            Func::Native(_) => true,
             Func::Compose(f, g) => f.has_native() || g.has_native(),
             Func::Construction(fs) => fs.iter().any(|f| f.has_native()),
             Func::Condition(p, f, g) => p.has_native() || f.has_native() || g.has_native(),

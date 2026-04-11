@@ -229,27 +229,6 @@ const METAMODEL_READINGS: &[(&str, &str)] = &[
     ("ui",            include_str!("../../../readings/ui.md")),
 ];
 
-/// Create D with bundled metamodel cells + platform primitives.
-/// No compile_to_defs_state here — that happens lazily on first
-/// system(h, 'compile', text) via platform_compile. Same strategy
-/// as lib.rs metamodel_state().
-fn create() -> ast::Object {
-    parse_forml2::set_bootstrap_mode(true);
-    let merged = METAMODEL_READINGS.iter().fold(ast::Object::phi(), |acc, (name, text)| {
-        let parsed = parse_forml2::parse_to_state_from(text, &acc)
-            .unwrap_or_else(|e| { eprintln!("metamodel {}.md: {}", name, e); std::process::exit(1); });
-        ast::merge_states(&acc, &parsed)
-    });
-    parse_forml2::set_bootstrap_mode(false);
-
-    let defs = vec![
-        ("compile".to_string(), ast::Func::Platform("compile".to_string())),
-        ("apply".to_string(), ast::Func::Platform("apply_command".to_string())),
-        ("verify_signature".to_string(), ast::Func::Platform("verify_signature".to_string())),
-    ];
-    ast::defs_to_state(&defs, &merged)
-}
-
 /// Load population from SQLite, compile defs in memory.
 /// Defs are never persisted — population cells only on disk.
 /// Compile takes ~500ms and produces the full D for SYSTEM calls.
@@ -273,8 +252,9 @@ fn main() {
 
     // Parse flags.
     let no_validate = args.iter().any(|a| a == "--no-validate");
+    let strict = args.iter().any(|a| a == "--strict");
     let (db_path, rest, _) = args.iter()
-        .filter(|a| a.as_str() != "--no-validate")
+        .filter(|a| !matches!(a.as_str(), "--no-validate" | "--strict"))
         .fold(
         ("arest.db".to_string(), Vec::<String>::new(), false),
         |(db, mut rest, expect_db), arg| match (expect_db, arg.as_str()) {
@@ -289,6 +269,7 @@ fn main() {
                 println!();
                 println!("  --db <path>        SQLite database path (default: arest.db)");
                 println!("  --no-validate      skip constraint validation during compile");
+                println!("  --strict           reject undeclared nouns (no auto-creation)");
                 std::process::exit(0);
             }
             (false, _) => { rest.push(arg.clone()); (db, rest, false) }
@@ -343,6 +324,7 @@ fn main() {
                 // single Domain IR, then convert to Object state ONCE.
                 // No merge_states loop — O(n) in total content.
                 parse_forml2::set_bootstrap_mode(true);
+                parse_forml2::set_strict_mode(strict);
                 let all_readings: Vec<(&str, &str)> = METAMODEL_READINGS.iter()
                     .map(|(n, t)| (*n, *t))
                     .chain(readings.iter().map(|(n, t)| (n.as_str(), t.as_str())))
@@ -370,6 +352,7 @@ fn main() {
                     },
                 );
                 parse_forml2::set_bootstrap_mode(false);
+                parse_forml2::set_strict_mode(false);
                 eprintln!("[load] {} nouns, {} fts, {} instance facts",
                     domain.nouns.len(), domain.fact_types.len(), domain.general_instance_facts.len());
                 let generator_fts: Vec<_> = domain.fact_types.keys()
@@ -381,6 +364,7 @@ fn main() {
                     .map(|f| format!("{}({}).{}={}({})", f.subject_noun, f.subject_value, f.field_name, f.object_noun, f.object_value))
                     .collect();
                 eprintln!("[load] App/sqlite instance facts: {:?}", app_ifs);
+                no_validate.then(|| ast::set_skip_validate(true));
                 let mut state = parse_forml2::domain_to_state(&domain);
                 // Store generator opt-ins as a cell so the query path can find them.
                 opted_generators.iter().for_each(|g| {

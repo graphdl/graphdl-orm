@@ -36,7 +36,7 @@ It is forbidden that a Role stores a value that is derivable from existing Graph
 
 ### Subtype Constraint Declaration
 
-It is obligatory that when Noun is a subtype of another Noun, a totality or exclusion Constraint is declared for that subtype relationship.
+It is obligatory that each subtype Noun has some totality or exclusion Constraint declared for its supertype relationship.
 
 ### Reference Scheme Redundancy
 
