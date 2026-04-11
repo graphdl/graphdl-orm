@@ -408,15 +408,57 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
     let model = compile(&domain);
     eprintln!("[profile] compile: {:?}", t.elapsed());
 
+    // Generator opt-in (needed early for validate partitioning).
+    let generators = {
+        let active = active_generators();
+        if !active.is_empty() { active } else {
+            domain.general_instance_facts.iter()
+                .filter(|f| f.object_noun == "Generator" || f.field_name == "Generator")
+                .map(|f| f.object_value.to_lowercase())
+                .collect()
+        }
+    };
+    eprintln!("  [profile] generators opted in: {:?}", generators);
+
     // Constraints -> named definitions — α(constraint → def)
     let mut defs: Vec<(String, Func)> = model.constraints.iter()
         .map(|c| (format!("constraint:{}", c.id), c.func.clone()))
         .collect();
 
-    // validate: Concat . [all constraints] -- single Func that returns all violations.
-    // Empty constraint set produces phi (no violations). The algebra handles it.
-    let all_constraints: Vec<Func> = model.constraints.iter().map(|c| c.func.clone()).collect();
-    defs.push(("validate".to_string(), Func::compose(Func::Concat, Func::construction(all_constraints))));
+    // validate: Concat . [non-DDL constraints] -- only constraints the DB can't enforce.
+    // When a SQL generator is active, UC/MC/VC are enforced by DDL (UNIQUE, NOT NULL, CHECK).
+    // Ring, subset, equality, exclusion, deontic, and frequency stay in validate.
+    let sql_active = generators.iter().any(|g| ["sqlite", "postgresql", "mysql", "sqlserver", "oracle", "db2", "clickhouse"].contains(&g.as_str()));
+    let ddl_kinds: HashSet<&str> = ["UC", "MC", "VC"].into_iter().collect();
+    let app_constraint_ids: HashSet<String> = domain.constraints.iter()
+        .filter(|c| !(sql_active && ddl_kinds.contains(c.kind.as_str())))
+        .map(|c| c.id.clone())
+        .collect();
+    let app_constraints: Vec<Func> = model.constraints.iter()
+        .filter(|c| app_constraint_ids.contains(&c.id))
+        .map(|c| c.func.clone())
+        .collect();
+    eprintln!("  [profile] validate: {} of {} constraints (SQL handles {})",
+        app_constraints.len(), model.constraints.len(), model.constraints.len() - app_constraints.len());
+    defs.push(("validate".to_string(), Func::compose(Func::Concat, Func::construction(app_constraints))));
+
+    // Indexed validate: validate:{fact_type_id} runs only constraints spanning that FT.
+    // Used by platform_compile to validate only what changed.
+    let ft_to_app_constraints: HashMap<String, Vec<Func>> = domain.constraints.iter()
+        .filter(|c| app_constraint_ids.contains(&c.id))
+        .flat_map(|c| {
+            let compiled = model.constraints.iter().find(|cc| cc.id == c.id);
+            c.spans.iter().filter_map(move |span| {
+                compiled.map(|cc| (span.fact_type_id.clone(), cc.func.clone()))
+            })
+        })
+        .fold(HashMap::new(), |mut m, (ft_id, func)| {
+            m.entry(ft_id).or_default().push(func);
+            m
+        });
+    defs.extend(ft_to_app_constraints.into_iter().map(|(ft_id, funcs)| {
+        (format!("validate:{}", ft_id), Func::compose(Func::Concat, Func::construction(funcs)))
+    }));
 
     // State machines -> named definitions — α(sm → <func_def, initial_def>)
     defs.extend(model.state_machines.iter().flat_map(|sm| [
@@ -513,23 +555,7 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
         (format!("nav:{}:parent", noun), Func::constant(Object::Seq(parents.iter().map(|p| Object::atom(p)).collect())))
     ));
 
-    // ── Generator opt-in ─────────────────────────────────────────────
-    // Check which generators the app opted into via instance facts:
-    //   App 'X' uses Generator 'sqlite'.
-    // If no opt-in found, generate nothing (pure readings mode).
-    // Debug: dump instance fact field names to find how Generator is stored
-    // Generator opt-in: use thread-local override if set (CLI path),
-    // otherwise extract from Domain IR / state cells.
-    let generators = {
-        let active = active_generators();
-        if !active.is_empty() { active } else {
-            domain.general_instance_facts.iter()
-                .filter(|f| f.object_noun == "Generator" || f.field_name == "Generator")
-                .map(|f| f.object_value.to_lowercase())
-                .collect()
-        }
-    };
-    eprintln!("  [profile] generators opted in: {:?}", generators);
+    // ── Generator opt-in (resolved above for validate partitioning) ──
 
     // ── Generator 1: Agent Prompts (opt-in: not gated, always useful) ──
     // Build lookup maps via fold — noun → readings, noun → constraints, noun → events
