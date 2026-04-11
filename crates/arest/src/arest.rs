@@ -323,11 +323,13 @@ fn create_via_defs(
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .chain(std::iter::once(("domain", domain)))
         .collect();
+    let mut fact_events: Vec<String> = Vec::new();
     let resolved = fields_with_domain.iter().fold(state.clone(), |acc, (field_name, value)| {
         let ft_id_obj = ast::apply(&ast::Func::Def(format!("resolve:{}", noun)),
             &ast::Object::atom(&field_name.to_lowercase()), d);
         let ft_id = ft_id_obj.as_atom().map(|s| s.to_string())
             .unwrap_or_else(|| format!("{}_has_{}", noun, field_name));
+        fact_events.push(ft_id.clone());
         ast::cell_push(&ft_id, ast::fact_from_pairs(&[(noun, &entity_id), (field_name, value)]), &acc)
     });
 
@@ -385,6 +387,46 @@ fn create_via_defs(
     let derivation_refs: Vec<(&str, &ast::Func)> = derivation_defs_owned.iter()
         .map(|(n, f)| (n.as_str(), f)).collect();
     let (derived_state, derived) = crate::evaluate::forward_chain_defs_state(&derivation_refs, &resolved);
+
+    // Collect fact type IDs from derived facts as additional events.
+    derived.iter().for_each(|d| fact_events.push(d.fact_type_id.clone()));
+
+    // ── SM auto-advance: fold fact-fired events through the machine ──
+    // Facts fire events. The event type is the fact type ID.
+    // The SM fold consumes them in order, advancing status.
+    let derived_state = {
+        let machine_key = format!("machine:{}", noun);
+        let has_machine = ast::fetch_or_phi(&machine_key, d) != ast::Object::Bottom;
+        if has_machine && !fact_events.is_empty() {
+            let mut current = extract_sm_status(&derived_state, &entity_id)
+                .unwrap_or_default();
+            let mut st = derived_state.clone();
+            for event in &fact_events {
+                let input = ast::Object::seq(vec![
+                    ast::Object::atom(&current),
+                    ast::Object::atom(event),
+                ]);
+                let result = ast::apply(&ast::Func::Def(machine_key.clone()), &input, d);
+                let new_status = result.as_atom().unwrap_or(&current).to_string();
+                if new_status != current {
+                    eprintln!("[sm] {} --{}--> {}", current, event, new_status);
+                    // Update SM status in state
+                    let status_key = "StateMachine_has_currentlyInStatus";
+                    let filtered = ast::cell_filter(status_key, |f| {
+                        !ast::binding_matches(f, "State Machine", &entity_id)
+                    }, &st);
+                    st = ast::cell_push(status_key, ast::fact_from_pairs(&[
+                        ("State Machine", &entity_id),
+                        ("currentlyInStatus", &new_status),
+                    ]), &filtered);
+                    current = new_status;
+                }
+            }
+            st
+        } else {
+            derived_state
+        }
+    };
 
     // ── validate: ρ(validate) applied to population ────────────────
     let ctx_obj = ast::encode_eval_context_state("", None, &derived_state);
