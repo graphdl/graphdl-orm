@@ -697,6 +697,64 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
         ]
     }));
 
+    // ── Data Federation: populate:{noun} from "Noun is backed by External System" ──
+    // Compile federation config from instance facts. Each backed noun gets a
+    // populate:{noun} def containing the URL, path, header, and role mappings.
+    // The runtime (MCP server, Cloudflare Worker) reads this def and fetches.
+    {
+        // Build External System config from instance facts.
+        let mut ext_systems: HashMap<String, HashMap<String, String>> = HashMap::new();
+        domain.general_instance_facts.iter()
+            .filter(|f| f.subject_noun == "External System")
+            .for_each(|f| {
+                ext_systems.entry(f.subject_value.clone())
+                    .or_default()
+                    .insert(f.field_name.clone(), f.object_value.clone());
+            });
+
+        // Build noun → external system + URI mappings.
+        let backed_nouns: Vec<(String, String)> = domain.general_instance_facts.iter()
+            .filter(|f| f.field_name.contains("backed") && f.object_noun == "External System")
+            .map(|f| (f.subject_value.clone(), f.object_value.clone()))
+            .collect();
+
+        let noun_uris: HashMap<String, String> = domain.general_instance_facts.iter()
+            .filter(|f| f.subject_noun == "Noun" && f.field_name.contains("URI"))
+            .map(|f| (f.subject_value.clone(), f.object_value.clone()))
+            .collect();
+
+        defs.extend(backed_nouns.iter().filter_map(|(noun_name, ext_name)| {
+            let ext = ext_systems.get(ext_name)?;
+            let url = ext.iter().find(|(k, _)| k.contains("URL")).map(|(_, v)| v.as_str()).unwrap_or("");
+            let header = ext.iter().find(|(k, _)| k.contains("Header")).map(|(_, v)| v.as_str()).unwrap_or("");
+            let prefix = ext.iter().find(|(k, _)| k.contains("Prefix")).map(|(_, v)| v.as_str()).unwrap_or("");
+            let uri = noun_uris.get(noun_name).map(|s| s.as_str()).unwrap_or("");
+
+            // Collect role names for JSON → fact mapping.
+            let role_names: Vec<String> = domain.fact_types.values()
+                .filter(|ft| ft.roles.iter().any(|r| r.noun_name == *noun_name))
+                .filter(|ft| ft.roles.len() == 2)
+                .filter_map(|ft| ft.roles.iter().find(|r| r.noun_name != *noun_name))
+                .map(|r| r.noun_name.clone())
+                .collect();
+
+            let config = Object::seq(vec![
+                Object::seq(vec![Object::atom("system"), Object::atom(ext_name)]),
+                Object::seq(vec![Object::atom("url"), Object::atom(url)]),
+                Object::seq(vec![Object::atom("uri"), Object::atom(uri)]),
+                Object::seq(vec![Object::atom("header"), Object::atom(header)]),
+                Object::seq(vec![Object::atom("prefix"), Object::atom(prefix)]),
+                Object::seq(vec![Object::atom("noun"), Object::atom(noun_name)]),
+                Object::seq(vec![Object::atom("fields"), Object::Seq(
+                    role_names.iter().map(|n| Object::atom(n)).collect()
+                )]),
+            ]);
+
+            Some((format!("populate:{}", noun_name), Func::constant(config)))
+        }));
+        eprintln!("  [profile] {} federation defs", backed_nouns.len());
+    }
+
     // Query defs — α(schema → role_map_def)
     defs.extend(model.schemas.iter().map(|(id, schema)| {
         let role_map = Object::Seq(schema.role_names.iter().enumerate()
