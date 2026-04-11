@@ -107,6 +107,9 @@ pub struct CommandResult {
     pub entities: Vec<EntityResult>,
     pub status: Option<String>,
     pub transitions: Vec<TransitionAction>,
+    /// Theorem 4b: navigation links — parent/child/peer projections from S.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub navigation: Vec<NavigationLink>,
     pub violations: Vec<Violation>,
     pub derived_count: usize,
     pub rejected: bool,
@@ -130,6 +133,15 @@ pub struct TransitionAction {
     pub event: String,
     pub target_status: String,
     pub method: String,
+    pub href: String,
+}
+
+/// Theorem 4b: navigation link — parent/child relationship from UC projections.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NavigationLink {
+    pub rel: String,    // "children" or "parent"
+    pub noun: String,   // target noun name
     pub href: String,
 }
 
@@ -213,7 +225,7 @@ pub fn decode_command_result(obj: &ast::Object) -> CommandResult {
     let rejected = sel(5).and_then(|o| o.as_atom()) == Some("T");
     let new_state = sel(6).cloned().unwrap_or(ast::Object::phi());
 
-    CommandResult { entities, status, transitions, violations, derived_count, rejected, state: new_state }
+    CommandResult { entities, status, transitions, navigation: vec![], violations, derived_count, rejected, state: new_state }
 }
 
 /// Encode a CommandResult as an Object (inverse of decode_command_result).
@@ -270,13 +282,14 @@ pub fn apply_command_defs(
             update_via_defs(d, noun, domain, entity_id, fields, state)
         }
         Command::LoadReadings { markdown, domain, sender: _, signature: _ } => {
-            apply_load_readings(markdown, domain, state)
+            apply_load_readings(markdown, domain, d, state)
         }
         #[allow(unreachable_patterns)]
         _ => CommandResult {
             entities: vec![],
             status: None,
             transitions: vec![],
+            navigation: vec![],
             violations: vec![],
             derived_count: 0,
             rejected: false,
@@ -317,6 +330,34 @@ fn create_via_defs(
             .unwrap_or_else(|| format!("{}_has_{}", noun, field_name));
         ast::cell_push(&ft_id, ast::fact_from_pairs(&[(noun, &entity_id), (field_name, value)]), &acc)
     });
+
+    // ── resolve: compound ref scheme decomposition ──────────────────
+    // Paper Eq. 6: resolve determines identity from the reference scheme.
+    // For compound schemes (.Owner, .Seq), split entity_id on '-' (rsplitn)
+    // and push component facts: Thing_has_Owner, Thing_has_Seq.
+    let resolved = {
+        let noun_cell = ast::fetch_or_phi("Noun", &resolved);
+        let ref_scheme: Option<Vec<String>> = noun_cell.as_seq()
+            .and_then(|facts| facts.iter()
+                .find(|f| ast::binding(f, "name") == Some(noun))
+                .and_then(|f| ast::binding(f, "referenceScheme"))
+                .map(|rs| rs.split(',').map(|s| s.trim().to_string()).collect()));
+        ref_scheme
+            .filter(|parts| parts.len() >= 2 && !entity_id.is_empty())
+            .map(|parts| {
+                let n = parts.len();
+                let splits: Vec<&str> = entity_id.rsplitn(n, '-').collect();
+                // rsplitn returns parts right-to-left; reverse to match left-to-right ref scheme order.
+                // If fewer splits than parts, pad with empty strings.
+                let components: Vec<&str> = splits.into_iter().rev().collect();
+                parts.iter().enumerate().fold(resolved.clone(), |acc, (i, part)| {
+                    let value = components.get(i).unwrap_or(&"");
+                    let ft_id = format!("{}_has_{}", noun, part.replace(' ', "_"));
+                    ast::cell_push(&ft_id, ast::fact_from_pairs(&[(noun, &entity_id), (part, value)]), &acc)
+                })
+            })
+            .unwrap_or(resolved)
+    };
 
     // ── identity: push User facts when sender is present ──────────
     // This is the data that auth derivations + alethic constraints evaluate.
@@ -361,6 +402,7 @@ fn create_via_defs(
     eprintln!("[debug] SM cell: {:?}", sm_cell);
     let status = extract_sm_status(&derived_state, &entity_id);
     let transitions = hateoas_via_rho(d, noun, &entity_id, status.as_deref());
+    let navigation = nav_links_via_rho(d, noun, &entity_id);
 
     let entity_data: std::collections::HashMap<String, String> = fields_with_domain.iter()
         .map(|(k, v)| (k.to_string(), v.to_string())).collect();
@@ -386,7 +428,7 @@ fn create_via_defs(
         sender,
     );
     CommandResult {
-        entities, status, transitions, violations,
+        entities, status, transitions, navigation, violations,
         derived_count: derived.len(), rejected,
         state: final_state,
     }
@@ -452,11 +494,13 @@ fn transition_via_defs(
     let status = new_status.or_else(|| current_status.map(|s| s.to_string()));
 
     let transitions = hateoas_via_rho(d, &noun, entity_id, status.as_deref());
+    let navigation = nav_links_via_rho(d, &noun, entity_id);
 
     CommandResult {
         entities: vec![],
         status,
         transitions,
+        navigation,
         violations: vec![],
         derived_count: 0,
         rejected: false,
@@ -514,6 +558,7 @@ fn query_via_defs(
         }],
         status: None,
         transitions: vec![],
+        navigation: vec![],
         violations: vec![],
         derived_count: 0,
         rejected: false,
@@ -576,6 +621,7 @@ fn update_via_defs(
     let sm_id = entity_id.to_string();
     let status = extract_sm_status(&new_state, &sm_id);
     let transitions = hateoas_via_rho(d, noun, entity_id, status.as_deref());
+    let navigation = nav_links_via_rho(d, noun, entity_id);
 
     CommandResult {
         entities: vec![EntityResult {
@@ -585,6 +631,7 @@ fn update_via_defs(
         }],
         status,
         transitions,
+        navigation,
         violations,
         derived_count: derived.len(),
         rejected,
@@ -592,39 +639,25 @@ fn update_via_defs(
     }
 }
 
+/// Self-modification: compile ∘ parse (Corollary 5).
+/// Ingesting readings is an application of SYSTEM where the operation is
+/// compile ∘ parse. The new FFP objects are stored via ↓DEFS.
+/// Mirrors platform_compile in ast.rs — same pipeline, structured result.
 fn apply_load_readings(
     markdown: &str,
     domain: &str,
+    d: &ast::Object,
     state: &ast::Object,
 ) -> CommandResult {
-    match crate::parse_forml2::parse_markdown(markdown) {
-        Ok(ir) => {
-            let mut data = std::collections::HashMap::new();
-            data.insert("domain".to_string(), domain.to_string());
-            data.insert("nouns".to_string(), ir.nouns.len().to_string());
-            data.insert("factTypes".to_string(), ir.fact_types.len().to_string());
-            data.insert("constraints".to_string(), ir.constraints.len().to_string());
-            data.insert("stateMachines".to_string(), ir.state_machines.len().to_string());
-
-            CommandResult {
-                entities: vec![EntityResult {
-                    id: format!("schema:{}", domain),
-                    entity_type: "SchemaLoaded".to_string(),
-                    data,
-                }],
-                status: None,
-                transitions: vec![],
-                violations: vec![],
-                derived_count: 0,
-                rejected: false,
-                state: state.clone(),
-            }
-        }
+    // Parse with context from D (same as platform_compile)
+    let parsed = match crate::parse_forml2::parse_to_state_from(markdown, d) {
+        Ok(s) => s,
         Err(e) => {
-            CommandResult {
+            return CommandResult {
                 entities: vec![],
                 status: None,
                 transitions: vec![],
+                navigation: vec![],
                 violations: vec![crate::types::Violation {
                     constraint_id: "parse_error".to_string(),
                     constraint_text: "FORML 2 parse error".to_string(),
@@ -634,8 +667,48 @@ fn apply_load_readings(
                 derived_count: 0,
                 rejected: true,
                 state: state.clone(),
-            }
+            };
         }
+    };
+
+    // Count genuinely new nouns (in parsed but not in D)
+    let existing_noun_names: std::collections::HashSet<String> = ast::fetch_or_phi("Noun", d).as_seq()
+        .map(|facts| facts.iter().filter_map(|f| ast::binding(f, "name").map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+    let new_noun_count = ast::fetch_or_phi("Noun", &parsed).as_seq()
+        .map(|facts| facts.iter().filter(|f| {
+            ast::binding(f, "name").map_or(false, |n| !existing_noun_names.contains(n))
+        }).count())
+        .unwrap_or(0);
+
+    // Merge: foldl(concat_cell, D, cells(parsed))
+    let merged_state = ast::merge_states(d, &parsed);
+
+    // Compile defs from merged state + re-register platform primitives
+    let mut defs = crate::compile::compile_to_defs_state(&merged_state);
+    defs.push(("compile".to_string(), ast::Func::Platform("compile".to_string())));
+    defs.push(("apply".to_string(), ast::Func::Platform("apply_command".to_string())));
+    defs.push(("verify_signature".to_string(), ast::Func::Platform("verify_signature".to_string())));
+    let new_d = ast::defs_to_state(&defs, &merged_state);
+
+    let mut data = std::collections::HashMap::new();
+    data.insert("domain".to_string(), domain.to_string());
+    data.insert("nouns".to_string(), new_noun_count.to_string());
+
+    CommandResult {
+        entities: vec![EntityResult {
+            id: format!("schema:{}", domain),
+            entity_type: "SchemaLoaded".to_string(),
+            data,
+        }],
+        status: None,
+        transitions: vec![],
+        navigation: vec![],
+        violations: vec![],
+        derived_count: new_noun_count,
+        rejected: false,
+        // Return full D (state + recompiled defs) — Corollary 5
+        state: new_d,
     }
 }
 
@@ -672,6 +745,47 @@ fn hateoas_via_rho(
             })
         }).collect()
     }).unwrap_or_default()
+}
+
+/// Theorem 4b: nav(e, n) = children(n) ∪ parent(n).
+/// Resolves nav:{noun}:children and nav:{noun}:parent defs from D.
+fn nav_links_via_rho(d: &ast::Object, noun: &str, entity_id: &str) -> Vec<NavigationLink> {
+    let encoded = noun.replace(' ', "%20");
+    let mut links = Vec::new();
+
+    // children(n) — Eq. 13
+    let children = ast::apply(
+        &ast::Func::Def(format!("nav:{}:children", noun)),
+        &ast::Object::phi(),
+        d,
+    );
+    children.as_seq().into_iter().flat_map(|items| items.iter().filter_map(|item| {
+        let child_noun = item.as_atom()?.to_string();
+        let child_encoded = child_noun.replace(' ', "%20");
+        Some(NavigationLink {
+            rel: "children".to_string(),
+            noun: child_noun,
+            href: format!("/api/entities/{}/{}/{}", encoded, entity_id, child_encoded),
+        })
+    }).collect::<Vec<_>>()).for_each(|l| links.push(l));
+
+    // parent(n) — Eq. 14
+    let parents = ast::apply(
+        &ast::Func::Def(format!("nav:{}:parent", noun)),
+        &ast::Object::phi(),
+        d,
+    );
+    parents.as_seq().into_iter().flat_map(|items| items.iter().filter_map(|item| {
+        let parent_noun = item.as_atom()?.to_string();
+        let parent_encoded = parent_noun.replace(' ', "%20");
+        Some(NavigationLink {
+            rel: "parent".to_string(),
+            noun: parent_noun,
+            href: format!("/api/entities/{}", parent_encoded),
+        })
+    }).collect::<Vec<_>>()).for_each(|l| links.push(l));
+
+    links
 }
 
 fn extract_sm_status(state: &ast::Object, sm_id: &str) -> Option<String> {
@@ -721,6 +835,7 @@ mod tests {
                 event: "place".into(), target_status: "Placed".into(),
                 method: "POST".into(), href: "/orders/ord-1/transition".into(),
             }],
+            navigation: vec![],
             violations: vec![],
             derived_count: 2,
             rejected: false,

@@ -32,6 +32,9 @@ regex = "1"
 wit-bindgen = { version = "0.41", default-features = false, features = ["macros"], optional = true }
 wasm-bindgen = { version = "0.2", optional = true }
 rusqlite = { version = "0.31", features = ["bundled"], optional = true }
+hmac = "0.12"
+sha2 = "0.10"
+subtle = "2"
 
 [dev-dependencies]
 

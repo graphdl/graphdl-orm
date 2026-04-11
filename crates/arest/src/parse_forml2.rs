@@ -23,6 +23,7 @@ use std::collections::HashMap;
 // NOT set this flag; user-domain compiles always hit the guard.
 thread_local! {
     static BOOTSTRAP_MODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static STRICT_MODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 pub(crate) fn set_bootstrap_mode(on: bool) {
@@ -31,6 +32,14 @@ pub(crate) fn set_bootstrap_mode(on: bool) {
 
 fn is_bootstrap_mode() -> bool {
     BOOTSTRAP_MODE.with(|b| b.get())
+}
+
+pub(crate) fn set_strict_mode(on: bool) {
+    STRICT_MODE.with(|b| b.set(on));
+}
+
+fn is_strict_mode() -> bool {
+    STRICT_MODE.with(|b| b.get())
 }
 
 pub(crate) const METAMODEL_NOUNS: &[&str] = &[
@@ -822,7 +831,12 @@ pub fn domain_to_state(d: &Domain) -> crate::ast::Object {
             ("name".into(), name.clone()), ("objectType".into(), def.object_type.clone()),
         ];
         d.subtypes.get(name).map(|st| pairs.push(("superType".into(), st.clone())));
-        d.ref_schemes.get(name).map(|rs| pairs.push(("referenceScheme".into(), rs.join(","))));
+        // Default ref_scheme to ["id"] for entity types without an explicit one.
+        // Value types and abstract types don't get reference schemes.
+        let ref_scheme = d.ref_schemes.get(name)
+            .cloned()
+            .or_else(|| (def.object_type == "entity").then(|| vec!["id".into()]));
+        ref_scheme.as_ref().map(|rs| pairs.push(("referenceScheme".into(), rs.join(","))));
         d.enum_values.get(name).filter(|evs| !evs.is_empty()).map(|evs| pairs.push(("enumValues".into(), evs.join(","))));
         let refs: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         cell_push("Noun", fact_from_pairs(&refs), &acc)
@@ -1174,6 +1188,22 @@ fn parse_into(ir: &mut Domain, input: &str) -> Result<(), String> {
                 .for_each(|span| span.subset_autofill = Some(true));
         });
 
+    // Strict mode: reject undeclared nouns (subtype children, fact type roles).
+    if is_strict_mode() {
+        let undeclared: Vec<String> = ir.subtypes.keys()
+            .filter(|sub| !ir.nouns.contains_key(*sub))
+            .cloned()
+            .chain(ir.fact_types.values()
+                .flat_map(|ft| ft.roles.iter().map(|r| r.noun_name.clone()))
+                .filter(|n| !ir.nouns.contains_key(n)))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        if !undeclared.is_empty() {
+            return Err(format!("strict mode: undeclared nouns: {}", undeclared.join(", ")));
+        }
+    }
+
     Ok(())
 }
 
@@ -1306,9 +1336,14 @@ fn apply_action(ir: &mut Domain, action: Option<ParseAction>, lines: &[String], 
             ir.nouns.get_mut(&sup).into_iter()
                 .for_each(|noun| noun.object_type = "abstract".into());
             subs.into_iter().for_each(|sub| {
-                ir.nouns.entry(sub.clone()).or_insert(NounDef {
-                    object_type: "entity".into(),
-                    world_assumption: WorldAssumption::default(),
+                // In strict mode, don't auto-create undeclared nouns.
+                // The post-parse validation will catch them.
+                is_strict_mode().then(|| ()).or_else(|| {
+                    ir.nouns.entry(sub.clone()).or_insert(NounDef {
+                        object_type: "entity".into(),
+                        world_assumption: WorldAssumption::default(),
+                    });
+                    None::<()>
                 });
                 ir.subtypes.insert(sub, sup.clone());
             });
@@ -2853,5 +2888,70 @@ Widget 'my-system-3' has Label 'foo'.
             binding(f, "Widget") == Some("my-system-3") &&
             binding(f, "System Name") == Some("my-system")
         ), "multi-hyphen first component should be preserved");
+    }
+
+    #[test]
+    fn default_ref_scheme_is_id_for_entity_types() {
+        use crate::ast::{fetch_or_phi, binding};
+        let input = "Person is an entity type.\nColor is a value type.\n";
+        let ir = parse_markdown(input).unwrap();
+        let state = domain_to_state(&ir);
+        let nouns = fetch_or_phi("Noun", &state);
+        let facts = nouns.as_seq().expect("Noun cell");
+        let person = facts.iter().find(|f| binding(f, "name") == Some("Person")).unwrap();
+        assert_eq!(binding(person, "referenceScheme"), Some("id"), "entity without explicit ref scheme defaults to id");
+        let color = facts.iter().find(|f| binding(f, "name") == Some("Color")).unwrap();
+        assert_eq!(binding(color, "referenceScheme"), None, "value types get no default ref scheme");
+    }
+
+    #[test]
+    fn explicit_ref_scheme_overrides_default() {
+        use crate::ast::{fetch_or_phi, binding};
+        let input = "Case (.nr) is an entity type.\n";
+        let ir = parse_markdown(input).unwrap();
+        let state = domain_to_state(&ir);
+        let nouns = fetch_or_phi("Noun", &state);
+        let facts = nouns.as_seq().expect("Noun cell");
+        let case = facts.iter().find(|f| binding(f, "name") == Some("Case")).unwrap();
+        assert_eq!(binding(case, "referenceScheme"), Some("nr"), "explicit ref scheme must not be overridden");
+    }
+
+    #[test]
+    fn strict_mode_rejects_undeclared_partition_subtypes() {
+        set_strict_mode(true);
+        let input = "Animal is an entity type.\nAnimal is partitioned into Cat, Dog.\n";
+        let result = parse_markdown(input);
+        set_strict_mode(false);
+        assert!(result.is_err(), "strict mode should reject undeclared partition subtypes");
+        let err = result.unwrap_err();
+        assert!(err.contains("Cat"), "error should mention Cat: {}", err);
+        assert!(err.contains("Dog"), "error should mention Dog: {}", err);
+    }
+
+    #[test]
+    fn loose_mode_auto_creates_partition_subtypes() {
+        let input = "Animal is an entity type.\nAnimal is partitioned into Cat, Dog.\n";
+        let ir = parse_markdown(input).unwrap();
+        assert!(ir.nouns.contains_key("Cat"), "Cat should be auto-created in loose mode");
+        assert!(ir.nouns.contains_key("Dog"), "Dog should be auto-created in loose mode");
+    }
+
+    #[test]
+    fn dual_quoted_binary_instance_fact() {
+        let input = r#"
+App(.Name) is an entity type.
+Generator(.Name) is an entity type.
+App uses Generator.
+## Instance Facts
+App 'sherlock' uses Generator 'sqlite'.
+"#;
+        let ir = parse_markdown(input).unwrap();
+        assert_eq!(ir.general_instance_facts.len(), 1,
+            "Should parse dual-quoted binary instance fact, got: {:?}", ir.general_instance_facts);
+        let f = &ir.general_instance_facts[0];
+        assert_eq!(f.subject_noun, "App");
+        assert_eq!(f.subject_value, "sherlock");
+        assert_eq!(f.object_noun, "Generator");
+        assert_eq!(f.object_value, "sqlite");
     }
 }
