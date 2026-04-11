@@ -32,6 +32,7 @@ fn is_skip_validate() -> bool { SKIP_VALIDATE.with(|b| b.get()) }
 //   Aggregation → Insert (fold)
 //   Population traversal → ApplyToAll (map)
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::fmt;
 
@@ -49,6 +50,11 @@ pub enum Object {
     /// A fact's bindings are a sequence. A population is a sequence of facts.
     /// If any element is Bottom, the whole sequence is Bottom.
     Seq(Vec<Object>),
+
+    /// A named store (Backus §13.3.4): cells indexed by name for O(1) fetch/store.
+    /// Semantically equivalent to Seq of <CELL, name, contents> triples,
+    /// but with HashMap backing for O(1) ↑n:D and ↓n:<x,D> operations.
+    Map(HashMap<String, Object>),
 
     /// Bottom (⊥) — undefined. All functions preserve bottom: f(⊥) = ⊥.
     Bottom,
@@ -89,6 +95,37 @@ impl Object {
         match self {
             Object::Atom(s) => Some(s),
             _ => None,
+        }
+    }
+
+    pub fn as_map(&self) -> Option<&HashMap<String, Object>> {
+        match self {
+            Object::Map(m) => Some(m),
+            _ => None,
+        }
+    }
+
+    /// Convert a Seq-of-cells store to a Map store for O(1) access.
+    /// Backus §13.3.4: fetch scans linearly; Map preserves semantics with O(1).
+    pub fn to_store(&self) -> Object {
+        match self {
+            Object::Map(_) => self.clone(),
+            Object::Seq(cells) => {
+                let mut map = HashMap::new();
+                for cell_obj in cells {
+                    if let Some(items) = cell_obj.as_seq() {
+                        if items.len() == 3
+                            && items[0].as_atom() == Some(CELL_TAG)
+                        {
+                            if let Some(name) = items[1].as_atom() {
+                                map.insert(name.to_string(), items[2].clone());
+                            }
+                        }
+                    }
+                }
+                Object::Map(map)
+            }
+            _ => self.clone(),
         }
     }
 }
@@ -143,6 +180,11 @@ impl fmt::Display for Object {
             Object::Seq(items) => {
                 write!(f, "<{}>", items.iter().map(|item| item.to_string())
                     .collect::<Vec<_>>().join(", "))
+            }
+            Object::Map(map) => {
+                write!(f, "{{{}}}",
+                    map.iter().map(|(k, v)| format!("{}={}", k, v))
+                        .collect::<Vec<_>>().join(", "))
             }
             Object::Bottom => write!(f, "⊥"),
         }
@@ -439,7 +481,6 @@ fn apply_arithmetic(x: &Object, op: fn(f64, f64) -> Option<f64>) -> Object {
 /// constructs the Object sequence in one pass. Replaces the
 /// O(n²) sequential fold over store.
 pub fn defs_to_state(defs: &[(String, Func)], state: &Object) -> Object {
-    use std::collections::HashMap;
     // Start with existing cells from state
     let mut map: HashMap<String, Object> = cells_iter(state).into_iter()
         .map(|(name, contents)| (name.to_string(), contents.clone()))
@@ -448,10 +489,8 @@ pub fn defs_to_state(defs: &[(String, Func)], state: &Object) -> Object {
     defs.iter().for_each(|(name, func)| {
         map.insert(name.clone(), func_to_object(func));
     });
-    // Build Object in one pass — O(n)
-    Object::Seq(map.into_iter()
-        .map(|(name, contents)| cell(&name, contents))
-        .collect())
+    // Return as Map store — O(1) fetch/store for all subsequent operations
+    Object::Map(map)
 }
 
 pub fn apply(func: &Func, x: &Object, d: &Object) -> Object {
@@ -1283,12 +1322,14 @@ pub fn cell(name: &str, contents: Object) -> Object {
     Object::Seq(vec![Object::atom(CELL_TAG), Object::atom(name), contents])
 }
 
-/// Fetch (↑n): retrieve contents of the first cell named n from a sequence of cells.
+/// Fetch (↑n): retrieve contents of the first cell named n from a store.
 /// ↑n:D → c where D contains <CELL, n, c>
 /// Returns bottom if no cell named n exists.
+/// O(1) for Map stores, O(n) fallback for Seq stores.
 pub fn fetch(name: &str, state: &Object) -> Object {
-    match state.as_seq() {
-        Some(cells) => cells.iter()
+    match state {
+        Object::Map(map) => map.get(name).cloned().unwrap_or(Object::Bottom),
+        Object::Seq(cells) => cells.iter()
             .find_map(|cell_obj| {
                 let items = cell_obj.as_seq()?;
                 if items.len() == 3
@@ -1301,28 +1342,34 @@ pub fn fetch(name: &str, state: &Object) -> Object {
                 }
             })
             .unwrap_or(Object::Bottom),
-        None => Object::Bottom,
+        _ => Object::Bottom,
     }
 }
 
 /// Store (↓n): replace or append cell named n with new contents.
 /// ↓n:<x, D> → D' where D' has cell n with contents x.
 /// If cell n exists, its contents are replaced. Otherwise a new cell is appended.
+/// O(1) for Map stores, O(n) fallback for Seq stores.
 pub fn store(name: &str, contents: Object, state: &Object) -> Object {
-    let cells = match state.as_seq() {
-        Some(cells) => cells,
-        None => return Object::Bottom,
-    };
-    // α(replace_or_keep) : cells
-    let is_target = |c: &Object| c.as_seq().map_or(false, |items|
-        items.len() == 3 && items[0].as_atom() == Some(CELL_TAG) && items[1].as_atom() == Some(name));
-    let found = cells.iter().any(is_target);
-    let replaced: Vec<Object> = cells.iter().map(|c|
-        if is_target(c) { cell(name, contents.clone()) } else { c.clone() }
-    ).collect();
-    match found {
-        true => Object::Seq(replaced),
-        false => Object::Seq([replaced, vec![cell(name, contents)]].concat()),
+    match state {
+        Object::Map(map) => {
+            let mut new_map = map.clone();
+            new_map.insert(name.to_string(), contents);
+            Object::Map(new_map)
+        }
+        Object::Seq(cells) => {
+            let is_target = |c: &Object| c.as_seq().map_or(false, |items|
+                items.len() == 3 && items[0].as_atom() == Some(CELL_TAG) && items[1].as_atom() == Some(name));
+            let found = cells.iter().any(is_target);
+            let replaced: Vec<Object> = cells.iter().map(|c|
+                if is_target(c) { cell(name, contents.clone()) } else { c.clone() }
+            ).collect();
+            match found {
+                true => Object::Seq(replaced),
+                false => Object::Seq([replaced, vec![cell(name, contents)]].concat()),
+            }
+        }
+        _ => Object::Bottom,
     }
 }
 
@@ -1353,9 +1400,8 @@ pub fn cell_push(name: &str, fact: Object, state: &Object) -> Object {
 }
 
 /// Merge two states in O(n): collect all cells into a HashMap,
-/// concatenate overlapping cells, build result in one pass.
+/// concatenate overlapping cells, return as Map store.
 pub fn merge_states(target: &Object, source: &Object) -> Object {
-    use std::collections::HashMap;
     let mut map: HashMap<String, Object> = cells_iter(target).into_iter()
         .map(|(name, contents)| (name.to_string(), contents.clone()))
         .collect();
@@ -1363,9 +1409,7 @@ pub fn merge_states(target: &Object, source: &Object) -> Object {
         let entry = map.entry(name.to_string()).or_insert_with(Object::phi);
         *entry = concat_seq(entry, contents);
     });
-    Object::Seq(map.into_iter()
-        .map(|(name, contents)| cell(&name, contents))
-        .collect())
+    Object::Map(map)
 }
 
 /// Concatenate two sequences: <a₁,...,aₙ> ++ <b₁,...,bₘ> = <a₁,...,aₙ,b₁,...,bₘ>
@@ -1378,16 +1422,20 @@ fn concat_seq(a: &Object, b: &Object) -> Object {
 /// Iterate all cells in state as (name, contents) pairs.
 /// Replaces: population.facts.iter()
 pub fn cells_iter(state: &Object) -> Vec<(&str, &Object)> {
-    state.as_seq().map(|cells| {
-        cells.iter().filter_map(|c| {
+    match state {
+        Object::Map(map) => map.iter()
+            .map(|(k, v)| (k.as_str(), v))
+            .collect(),
+        Object::Seq(cells) => cells.iter().filter_map(|c| {
             let items = c.as_seq()?;
             if items.len() == 3 && items[0].as_atom() == Some(CELL_TAG) {
                 Some((items[1].as_atom()?, &items[2]))
             } else {
                 None
             }
-        }).collect()
-    }).unwrap_or_default()
+        }).collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// Get a binding value by role name from a named-tuple fact.
@@ -1442,6 +1490,7 @@ pub fn metacompose(obj: &Object, d: &Object) -> Func {
         Object::Atom(name) => metacompose_atom(name, d),
         Object::Seq(items) if items.is_empty() => Func::Constant(Object::Bottom),
         Object::Seq(items) => metacompose_sequence(items, d),
+        Object::Map(_) => Func::Constant(obj.clone()), // stores are data, not functions
     }
 }
 
@@ -3271,10 +3320,10 @@ mod tests {
             &Object::atom(readings),
             &initial_d,
         );
-        // Must be a state (seq), not an atom error starting with "⊥".
+        // Must be a state (seq or map), not an atom error starting with "⊥".
         assert!(
-            result.as_seq().is_some(),
-            "compile should produce a state seq, got: {:?}",
+            result.as_seq().is_some() || result.as_map().is_some(),
+            "compile should produce a state, got: {:?}",
             result
         );
         assert!(

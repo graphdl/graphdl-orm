@@ -930,7 +930,7 @@ pub fn domain_to_state(d: &Domain) -> crate::ast::Object {
             })
         });
 
-    state
+    state.to_store()
 }
 
 /// Materialize Domain into entity cells for EntityDB.
