@@ -2071,3 +2071,56 @@ fn bundled_metamodel_passes_validate_model() {
     assert!(errors.is_empty(), "Metamodel should have zero validate_model warnings, got {}:\n{}",
         errors.len(), errors.join("\n"));
 }
+
+// ── Join Derivation (:= syntax) ────────────────────────────────────
+
+#[test]
+fn join_derivation_produces_bindings() {
+    let input = r#"
+A(.id) is an entity type.
+B(.id) is an entity type.
+C(.id) is an entity type.
+
+A has B.
+B has C.
+A has C.
+
+A has C := A has some B and that B has some C.
+
+## Instance Facts
+
+A 'a1' has B 'b1'.
+B 'b1' has C 'c1'.
+A 'a2' has B 'b2'.
+B 'b2' has C 'c2'.
+"#;
+    let ir = parse_forml2::parse_markdown(input).unwrap();
+    let state = parse_forml2::domain_to_state(&ir);
+    let defs = compile::compile_to_defs_state(&state);
+    let d = ast::defs_to_state(&defs, &state);
+
+    // Run forward chaining
+    let derivation_defs: Vec<(String, ast::Func)> = ast::cells_iter(&d).into_iter()
+        .filter(|(n, _)| n.starts_with("derivation:"))
+        .map(|(n, contents)| (n.to_string(), ast::metacompose(contents, &d)))
+        .collect();
+    let refs: Vec<(&str, &ast::Func)> = derivation_defs.iter()
+        .map(|(n, f)| (n.as_str(), f)).collect();
+    let (_new_state, derived) = evaluate::forward_chain_defs_state(&refs, &d);
+
+    // Find derived A_has_C facts
+    let a_has_c: Vec<_> = derived.iter()
+        .filter(|f| f.fact_type_id == "A_has_C")
+        .collect();
+    eprintln!("derived A_has_C: {:?}", a_has_c);
+
+    assert!(!a_has_c.is_empty(), "Join derivation should produce A_has_C facts");
+    assert!(a_has_c.iter().any(|f| {
+        f.bindings.iter().any(|(k, v)| k == "A" && v == "a1")
+            && f.bindings.iter().any(|(k, v)| k == "C" && v == "c1")
+    }), "Should derive a1 has c1: {:?}", a_has_c);
+    assert!(a_has_c.iter().any(|f| {
+        f.bindings.iter().any(|(k, v)| k == "A" && v == "a2")
+            && f.bindings.iter().any(|(k, v)| k == "C" && v == "c2")
+    }), "Should derive a2 has c2: {:?}", a_has_c);
+}

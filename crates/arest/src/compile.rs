@@ -1064,6 +1064,11 @@ pub fn state_to_domain(state: &crate::ast::Object) -> Domain {
         }).collect())
         .unwrap_or_default();
 
+    // Re-resolve derivation rules against the reconstructed domain.
+    // The round-trip through state loses antecedent IDs, join keys, and kind.
+    // Re-resolve restores them from the rule text + fact type catalog.
+    crate::parse_forml2::re_resolve_derivation_rules(&mut domain);
+
     // α(inst_fact → general_instance_fact) : InstanceFact cell
     domain.general_instance_facts = fetch_or_phi("InstanceFact", state).as_seq()
         .map(|facts| facts.iter().map(|f| {

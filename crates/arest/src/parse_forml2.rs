@@ -989,6 +989,36 @@ pub fn parse_markdown(input: &str) -> Result<Domain, String> {
     Ok(ir)
 }
 
+/// Re-resolve derivation rules after a state_to_domain round-trip.
+/// The round-trip loses antecedent IDs, join keys, and kind classification.
+/// This rebuilds them from the rule text against the domain's fact types.
+pub fn re_resolve_derivation_rules(domain: &mut Domain) {
+    let mut noun_names: Vec<String> = domain.nouns.keys().cloned().collect();
+    noun_names.sort_by(|a, b| b.len().cmp(&a.len()));
+
+    let mut catalog = SchemaCatalog::new();
+    domain.fact_types.iter().for_each(|(ft_id, ft)| {
+        let role_nouns: Vec<&str> = ft.roles.iter().map(|r| r.noun_name.as_str()).collect();
+        let verb = noun_names.iter()
+            .find(|n| ft.reading.starts_with(n.as_str()))
+            .and_then(|first| {
+                let after = &ft.reading[first.len()..];
+                noun_names.iter().find_map(|second| {
+                    after.find(second.as_str()).map(|pos| after[..pos].trim())
+                })
+            })
+            .unwrap_or("");
+        catalog.register(ft_id, &role_nouns, verb, &ft.reading);
+    });
+
+    // Take rules out, resolve, put back — avoids mutable+immutable borrow conflict.
+    let mut rules = std::mem::take(&mut domain.derivation_rules);
+    rules.iter_mut().for_each(|rule| {
+        resolve_derivation_rule(rule, domain, &catalog);
+    });
+    domain.derivation_rules = rules;
+}
+
 fn parse_into(ir: &mut Domain, input: &str) -> Result<(), String> {
 
     let lines: Vec<String> = input.lines().map(|s| s.to_string()).collect();
