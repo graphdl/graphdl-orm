@@ -6,25 +6,41 @@ FORML 2 readings compile to named lambda functions via Backus's FFP representati
 
 Based on [John Backus](https://en.wikipedia.org/wiki/John_Backus) (FFP/AST, 1978), [E.F. Codd](https://en.wikipedia.org/wiki/Edgar_F._Codd) (relational model, 1970), [Terry Halpin](https://en.wikipedia.org/wiki/Terry_Halpin) (ORM 2, 2008), and [Roy Fielding](https://en.wikipedia.org/wiki/Roy_Fielding) (REST, 2000).
 
+## CLI
+
+```bash
+# Compile readings into SQLite
+arest readings/ --db app.db
+
+# Single SYSTEM call
+arest "transitions:Case" "Open" --db app.db
+
+# Create entity with fact pairs
+arest "create:Order" "<<id, ord-1>, <customer, acme>>" --db app.db
+
+# REPL
+arest --db app.db
+
+# Flags
+arest readings/ --db app.db --strict        # reject undeclared nouns
+arest readings/ --db app.db --no-validate   # skip constraint validation
+```
+
 ## WASM API
 
-Two exports. SYSTEM is the only function.
+One export. SYSTEM is the only function.
 
 ```
-create()                              — allocate empty D with platform primitives
 system(handle, key, input) -> string  — SYSTEM:x = (rho(entity(x):D)):op(x)
 ```
 
-Self-modification: `system(h, 'compile', readings_text)` ingests readings. All other operations dispatch via rho from defs in D. No match arms, no if-branches. On FPGA, each def is a synthesized circuit.
+All operations dispatch via rho from defs in D. On FPGA, each def is a synthesized circuit.
 
 ```javascript
-const h = create()
-system(h, 'compile', coreReadings)
-system(h, 'compile', stateReadings)
-system(h, 'compile', domainReadings)
-system(h, 'transitions:Order', 'In Cart')  // rho-dispatch
-system(h, 'debug', '')                      // rho-dispatch
-system(h, 'apply', JSON.stringify({...}))   // create pipeline
+system(h, 'compile', domainReadings)          // self-modification
+system(h, 'transitions:Order', 'In Cart')     // SM query
+system(h, 'create:Order', '<<id, ord-1>>')    // create with fact pairs
+system(h, 'debug', '')                        // state projection
 ```
 
 ## Architecture
@@ -43,7 +59,7 @@ readings (FORML 2 text)
 | P (population) | Named set of elementary facts. RegistryDB (population index). |
 | rho | Rust/WASM engine. Compiles readings, evaluates constraints, forward-chains derivations. |
 | SYSTEM | `system_impl`: one line of rho-dispatch + state transition. No routing. |
-| Platform primitives | `Func::Platform("compile")`, `Func::Platform("apply_command")`. Synthesizable gates. |
+| Platform primitives | `Func::Platform("compile")`, `Func::Platform("create:Order")`, `Func::Platform("transition:Order")`. Synthesizable gates. |
 
 ## Readings
 
@@ -83,27 +99,47 @@ POST /api/entities/:noun/:id/transition   fire state machine event
 
 ## Security
 
-Authorization is a constraint in the readings, not middleware. The compile operation is gated: after bootstrap, bare compile is rejected. Noun namespace protection via UC on Object Type. Input bounds are platform gates (hardware buffer size). The evolution domain's state machine governs schema modification.
+Authorization is a constraint in the readings, not middleware. Identity (`sender`) is pushed as a User fact during resolve; alethic constraints enforce access. Signing via HMAC-SHA256 (`AREST_HMAC_KEY` env var). SSRF denylist on External System URLs. Metamodel noun namespace protection. Input bounds are platform gates (hardware buffer size). Audit trail in `audit_log` cell.
 
-See `src/tests/security/authorization.test.ts` for the threat model.
+## MCP Server
+
+```json
+{
+  "mcpServers": {
+    "graphdl": {
+      "command": "npx",
+      "args": ["-y", "graphdl-orm", "mcp"],
+      "env": { "GRAPHDL_MODE": "local", "GRAPHDL_READINGS_DIR": "./readings" }
+    }
+  }
+}
+```
+
+Tools: `graphdl_create`, `graphdl_transition`, `graphdl_compile`, `graphdl_list`, `graphdl_get`, `graphdl_schema`, `graphdl_evaluate`, `graphdl_audit_log`, `graphdl_verify_signature`.
+
+Prompts: `graphdl_overview`, `graphdl_entity_modeling`, `graphdl_advanced_constraints`, `graphdl_derivation_deontic`, `graphdl_verbalization`, `graphdl_principles`, `graphdl_api`.
 
 ## Development
 
 ```bash
-yarn install
-yarn dev                # wrangler dev
-yarn test               # vitest (265 tests)
-yarn build:wasm         # Rust -> WASM
-npx tsc --noEmit        # type check
-
 # Rust engine
 cd crates/arest
-cargo test              # 575 tests
+cargo test --features local    # 851 tests
+cargo build --release --features local
+
+# WASM
+cargo build --target wasm32-unknown-unknown --no-default-features --features cloudflare
+cargo build --target wasm32-wasip2 --no-default-features --features wit
+
+# TypeScript
+yarn install
+yarn test               # vitest
+npx tsc --noEmit        # type check
 ```
 
 ## Theorems
 
-The [whitepaper](AREST.tex) proves five properties:
+The [whitepaper](AREST.pdf) proves five properties:
 
 1. **Grammar Unambiguity** — each FORML 2 sentence has exactly one parse
 2. **Specification Equivalence** — parse and compile are injective; the reading IS the executable
