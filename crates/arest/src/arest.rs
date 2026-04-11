@@ -391,16 +391,22 @@ fn create_via_defs(
     // Collect fact type IDs from derived facts as additional events.
     derived.iter().for_each(|d| fact_events.push(d.fact_type_id.clone()));
 
-    // ── SM auto-advance: fold fact-fired events through the machine ──
-    // Facts fire events. The event type is the fact type ID.
-    // The SM fold consumes them in order, advancing status.
+    // ── SM auto-advance: fact events + positive guards ───────────────
+    // Two mechanisms, same fold:
+    // 1. Fact events: facts pushed during resolve/derive fire events.
+    // 2. Positive guards: check P for existing facts of the subscribed
+    //    type. If they exist, the transition fires. Repeat until stable.
+    // This handles both create-time (new facts) and compile-time (all
+    // facts already in P — the investigation doesn't need to happen).
     let derived_state = {
         let machine_key = format!("machine:{}", noun);
         let has_machine = ast::fetch_or_phi(&machine_key, d) != ast::Object::Bottom;
-        if has_machine && !fact_events.is_empty() {
+        if has_machine {
             let mut current = extract_sm_status(&derived_state, &entity_id)
                 .unwrap_or_default();
             let mut st = derived_state.clone();
+
+            // Phase 1: fire events from facts pushed during this call.
             for event in &fact_events {
                 let input = ast::Object::seq(vec![
                     ast::Object::atom(&current),
@@ -410,17 +416,82 @@ fn create_via_defs(
                 let new_status = result.as_atom().unwrap_or(&current).to_string();
                 if new_status != current {
                     eprintln!("[sm] {} --{}--> {}", current, event, new_status);
-                    // Update SM status in state
-                    let status_key = "StateMachine_has_currentlyInStatus";
-                    let filtered = ast::cell_filter(status_key, |f| {
-                        !ast::binding_matches(f, "State Machine", &entity_id)
-                    }, &st);
-                    st = ast::cell_push(status_key, ast::fact_from_pairs(&[
-                        ("State Machine", &entity_id),
-                        ("currentlyInStatus", &new_status),
-                    ]), &filtered);
                     current = new_status;
                 }
+            }
+
+            // Phase 2: positive guards — check P for facts that satisfy
+            // outgoing transitions. Loop until no transition fires.
+            // The transitions:{noun} def returns <<from, to, event>, ...>.
+            let transitions_key = format!("transitions:{}", noun);
+            let mut advanced = true;
+            while advanced {
+                advanced = false;
+                let available = ast::apply(
+                    &ast::Func::Def(transitions_key.clone()),
+                    &ast::Object::atom(&current),
+                    d,
+                );
+                let triples = available.as_seq().unwrap_or_default();
+                for triple in triples {
+                    let items = triple.as_seq().unwrap_or_default();
+                    let event_type = items.get(2).and_then(|o| o.as_atom()).unwrap_or("");
+                    let target = items.get(1).and_then(|o| o.as_atom()).unwrap_or("");
+                    // Positive guard: does a fact of this type exist in P
+                    // where the SM's entity plays the noun's role?
+                    // Look up schema to find which role(s) the SM noun plays,
+                    // then check those specific bindings for entity_id.
+                    if !event_type.is_empty() && !target.is_empty() {
+                        // Resolve role names from the schema for this fact type.
+                        let role_map = ast::apply(
+                            &ast::Func::Def(format!("query:{}", event_type)),
+                            &ast::Object::phi(), d,
+                        );
+                        // Find role names that match the SM noun (handles ring:
+                        // same noun in multiple roles — check each independently).
+                        let noun_roles: Vec<String> = role_map.as_seq()
+                            .map(|pairs| pairs.iter().filter_map(|pair| {
+                                let kv = pair.as_seq()?;
+                                let role_name = kv.first()?.as_atom()?;
+                                (role_name == noun).then(|| role_name.to_string())
+                            }).collect())
+                            .unwrap_or_default();
+                        let cell = ast::fetch_or_phi(event_type, &st);
+                        let has_facts = cell.as_seq().map_or(false, |facts| {
+                            // If the SM noun plays a role in this fact type,
+                            // check that specific role for the entity_id.
+                            if !noun_roles.is_empty() {
+                                facts.iter().any(|f| {
+                                    noun_roles.iter().any(|role| ast::binding_matches(f, role, &entity_id))
+                                })
+                            } else {
+                                // SM noun not in this fact type — the event type
+                                // is not entity-scoped. Don't auto-advance
+                                // (requires explicit event or cross-entity join).
+                                false
+                            }
+                        });
+                        if has_facts {
+                            eprintln!("[sm:guard] {} --{}--> {}", current, event_type, target);
+                            current = target.to_string();
+                            advanced = true;
+                            break; // restart from new status
+                        }
+                    }
+                }
+            }
+
+            // Write final status to state.
+            let init_status = extract_sm_status(&derived_state, &entity_id).unwrap_or_default();
+            if current != init_status {
+                let status_key = "StateMachine_has_currentlyInStatus";
+                let filtered = ast::cell_filter(status_key, |f| {
+                    !ast::binding_matches(f, "State Machine", &entity_id)
+                }, &st);
+                st = ast::cell_push(status_key, ast::fact_from_pairs(&[
+                    ("State Machine", &entity_id),
+                    ("currentlyInStatus", &current),
+                ]), &filtered);
             }
             st
         } else {
