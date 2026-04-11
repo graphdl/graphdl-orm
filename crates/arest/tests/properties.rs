@@ -2075,6 +2075,54 @@ fn bundled_metamodel_passes_validate_model() {
 // ── Join Derivation (:= syntax) ────────────────────────────────────
 
 #[test]
+fn map_store_fetch_is_o1() {
+    // Build a large state with 500 cells as Seq
+    let mut seq_state = ast::Object::phi();
+    for i in 0..500 {
+        let name = format!("cell_{}", i);
+        seq_state = ast::store(&name, ast::Object::atom(&format!("val_{}", i)), &seq_state);
+    }
+
+    // Convert to Map
+    let map_state = seq_state.to_store();
+
+    // Verify fetch returns identical results
+    assert_eq!(ast::fetch("cell_0", &seq_state), ast::fetch("cell_0", &map_state));
+    assert_eq!(ast::fetch("cell_499", &seq_state), ast::fetch("cell_499", &map_state));
+    assert_eq!(ast::fetch("cell_250", &seq_state), ast::fetch("cell_250", &map_state));
+    assert_eq!(ast::fetch("missing", &map_state), ast::Object::Bottom);
+
+    // Verify store on Map returns a Map
+    let updated = ast::store("cell_0", ast::Object::atom("new_val"), &map_state);
+    assert_eq!(ast::fetch("cell_0", &updated), ast::Object::atom("new_val"));
+    assert_eq!(ast::fetch("cell_499", &updated), ast::Object::atom("val_499"));
+    assert!(updated.as_map().is_some(), "store on Map should return Map");
+
+    // Verify cells_iter returns all 500 cells
+    let cells: Vec<_> = ast::cells_iter(&map_state);
+    assert_eq!(cells.len(), 500);
+
+    // Verify cell_push works on Map
+    let pushed = ast::cell_push("new_cell", ast::Object::atom("data"), &map_state);
+    assert_eq!(ast::fetch("new_cell", &pushed), ast::Object::Seq(vec![ast::Object::atom("data")]));
+
+    // Verify merge_states returns Map
+    let merged = ast::merge_states(&map_state, &ast::Object::phi());
+    assert!(merged.as_map().is_some(), "merge_states should return Map");
+}
+
+#[test]
+fn map_store_used_by_defs_to_state() {
+    // defs_to_state should return Map for O(1) metacompose lookups
+    let (_, d) = compile_orders();
+    assert!(d.as_map().is_some(), "defs_to_state should return Map, got Seq");
+
+    // fetch on D should be O(1) and work correctly
+    let validate = ast::fetch("validate", &d);
+    assert_ne!(validate, ast::Object::Bottom, "validate def should exist in D");
+}
+
+#[test]
 fn join_derivation_produces_bindings() {
     let input = r#"
 A(.id) is an entity type.
