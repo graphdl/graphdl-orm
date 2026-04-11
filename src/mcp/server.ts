@@ -132,14 +132,16 @@ const server = new McpServer({
 
 // ── Read: list entities of a noun type ──────────────────────────────
 
-server.tool(
+server.registerTool(
   'graphdl_list',
-  'List entities of a noun type in a domain',
   {
-    noun: z.string().describe('The noun type (e.g. "Order", "Customer")'),
-    domain: z.string().describe('The domain slug (e.g. "support", "core")'),
-    page: z.number().optional().describe('Page number (default 1)'),
-    limit: z.number().optional().describe('Items per page (default 100)'),
+    description: 'List entities of a noun type in a domain',
+    inputSchema: {
+      noun: z.string().describe('The noun type (e.g. "Order", "Customer")'),
+      domain: z.string().describe('The domain slug (e.g. "support", "core")'),
+      page: z.number().optional().describe('Page number (default 1)'),
+      limit: z.number().optional().describe('Items per page (default 100)'),
+    },
   },
   async ({ noun, domain, page, limit }) => {
     if (GRAPHDL_MODE === 'local') {
@@ -159,13 +161,15 @@ server.tool(
 
 // ── Read Detail: get a specific entity ──────────────────────────────
 
-server.tool(
+server.registerTool(
   'graphdl_get',
-  'Get a specific entity by ID',
   {
-    noun: z.string().describe('The noun type'),
-    domain: z.string().describe('The domain slug'),
-    id: z.string().describe('The entity ID'),
+    description: 'Get a specific entity by ID',
+    inputSchema: {
+      noun: z.string().describe('The noun type'),
+      domain: z.string().describe('The domain slug'),
+      id: z.string().describe('The entity ID'),
+    },
   },
   async ({ noun, domain, id }) => {
     if (GRAPHDL_MODE === 'local') {
@@ -181,16 +185,18 @@ server.tool(
 
 // ── Create: create a new entity (AREST create = emit ∘ validate ∘ derive ∘ resolve)
 
-server.tool(
+server.registerTool(
   'graphdl_create',
-  'Create a new entity. Executes the AREST create pipeline (resolve → derive → validate → emit). Returns the created entity with HATEOAS links, or a violation set on rejection. Identity (sender) is pushed as a User fact during resolve; omit to skip identity enforcement.',
   {
-    noun: z.string().describe('The noun type to create'),
-    domain: z.string().describe('The domain slug'),
-    id: z.string().optional().describe('Explicit entity id. If omitted the engine generates one.'),
-    fields: z.record(z.string(), z.string()).describe('Field values keyed by role name'),
-    sender: z.string().optional().describe('Caller identity (typically an email). Pushed as User fact during resolve for constraint-based authorization.'),
-    signature: z.string().optional().describe('Hash-based MAC over sender+payload. Verified via crypto::verify_signature if present.'),
+    description: 'Create a new entity. Executes the AREST create pipeline (resolve → derive → validate → emit). Returns the created entity with HATEOAS links, or a violation set on rejection.',
+    inputSchema: {
+      noun: z.string().describe('The noun type to create'),
+      domain: z.string().describe('The domain slug'),
+      id: z.string().optional().describe('Explicit entity id. If omitted the engine generates one.'),
+      fields: z.record(z.string(), z.string()).describe('Field values keyed by role name'),
+      sender: z.string().optional().describe('Caller identity (typically an email). Pushed as User fact during resolve.'),
+      signature: z.string().optional().describe('HMAC-SHA256 over sender+payload.'),
+    },
   },
   async ({ noun, domain, id, fields, sender, signature }) => {
     const command = { type: 'createEntity', noun, domain, id, fields, sender, signature }
@@ -201,11 +207,13 @@ server.tool(
 
 // ── Apply: generic Command dispatch ──────────────────────────────────
 
-server.tool(
+server.registerTool(
   'graphdl_apply',
-  'Generic command dispatch. One tool exposes all 5 AREST Command variants (createEntity, transition, query, updateEntity, loadReadings). Prefer the specific tools (graphdl_create, graphdl_transition, etc.) when possible.',
   {
-    command: z.record(z.string(), z.any()).describe('Command object with a "type" field and variant-specific fields. See the Command enum in crates/arest/src/arest.rs for exact shape.'),
+    description: 'Generic command dispatch. Exposes all 5 AREST Command variants. Prefer specific tools when possible.',
+    inputSchema: {
+      command: z.record(z.string(), z.any()).describe('Command object with a "type" field and variant-specific fields.'),
+    },
   },
   async ({ command }) => {
     const data = await dispatchCommand(command)
@@ -215,16 +223,18 @@ server.tool(
 
 // ── Transition: state machine event dispatch ────────────────────────
 
-server.tool(
+server.registerTool(
   'graphdl_transition',
-  'Fire a state machine transition event on an entity. Backus foldl transition over the event stream.',
   {
-    entityId: z.string().describe('Target entity id'),
-    event: z.string().describe('Transition event name (e.g. "place", "ship")'),
-    domain: z.string().describe('Domain slug'),
-    currentStatus: z.string().optional().describe('Current status (optional; engine resolves from state if omitted)'),
-    sender: z.string().optional(),
-    signature: z.string().optional(),
+    description: 'Fire a state machine transition on an entity.',
+    inputSchema: {
+      entityId: z.string().describe('Target entity id'),
+      event: z.string().describe('Transition event name (e.g. "place", "ship")'),
+      domain: z.string().describe('Domain slug'),
+      currentStatus: z.string().optional().describe('Current status (optional; engine resolves from state if omitted)'),
+      sender: z.string().optional(),
+      signature: z.string().optional(),
+    },
   },
   async ({ entityId, event, domain, currentStatus, sender, signature }) => {
     const command = { type: 'transition', entityId, event, domain, currentStatus, sender, signature }
@@ -235,12 +245,14 @@ server.tool(
 
 // ── Evaluate: run constraint evaluation ─────────────────────────────
 
-server.tool(
+server.registerTool(
   'graphdl_evaluate',
-  'Evaluate constraints against a response. Returns the violation set.',
   {
-    domain: z.string().describe('The domain slug'),
-    response: z.record(z.string(), z.any()).describe('The response data to evaluate'),
+    description: 'Evaluate constraints against a response. Returns the violation set.',
+    inputSchema: {
+      domain: z.string().describe('The domain slug'),
+      response: z.record(z.string(), z.any()).describe('The response data to evaluate'),
+    },
   },
   async ({ domain, response }) => {
     if (GRAPHDL_MODE === 'local') {
@@ -259,11 +271,13 @@ server.tool(
 
 // ── Schema: get noun/fact/constraint schemas for a domain ───────────
 
-server.tool(
+server.registerTool(
   'graphdl_schema',
-  'Get the schema (nouns, fact types, constraints, state machines) for a domain',
   {
-    domain: z.string().describe('The domain slug'),
+    description: 'Get the schema (nouns, fact types, constraints, state machines) for a domain',
+    inputSchema: {
+      domain: z.string().describe('The domain slug'),
+    },
   },
   async ({ domain }) => {
     if (GRAPHDL_MODE === 'local') {
@@ -277,12 +291,14 @@ server.tool(
 
 // ── Compile: ingest new FORML2 readings (self-modification) ─────────
 
-server.tool(
+server.registerTool(
   'graphdl_compile',
-  'Compile FORML2 readings into the domain. This is AREST self-modification (Corollary 2, Closure Under Self-Modification): the engine extends its own program. Alethic constraint violations in the merged state will reject the compile.',
   {
-    domain: z.string().describe('The domain slug'),
-    readings: z.string().describe('FORML2 readings as markdown text'),
+    description: 'Compile FORML2 readings (self-modification, Corollary 5). Alethic violations reject.',
+    inputSchema: {
+      domain: z.string().describe('The domain slug'),
+      readings: z.string().describe('FORML2 readings as markdown text'),
+    },
   },
   async ({ domain, readings }) => {
     if (GRAPHDL_MODE === 'local') {
@@ -300,12 +316,14 @@ server.tool(
 )
 
 // Back-compat alias for graphdl_parse
-server.tool(
+server.registerTool(
   'graphdl_parse',
-  'Alias for graphdl_compile. Prefer graphdl_compile in new code.',
   {
-    domain: z.string().describe('The domain slug'),
-    readings: z.string().describe('FORML2 readings as markdown text'),
+    description: 'Alias for graphdl_compile. Prefer graphdl_compile.',
+    inputSchema: {
+      domain: z.string().describe('The domain slug'),
+      readings: z.string().describe('FORML2 readings as markdown text'),
+    },
   },
   async ({ domain, readings }) => {
     if (GRAPHDL_MODE === 'local') {
@@ -324,11 +342,13 @@ server.tool(
 
 // ── Audit log: read the compile/apply audit trail (#26) ─────────────
 
-server.tool(
+server.registerTool(
   'graphdl_audit_log',
-  'Read the audit_log cell: (operation, outcome, sequence, sender) for every compile and apply operation. Monotonic sequence per cell. Local mode only — remote mode requires the worker to expose /audit.',
   {
-    limit: z.number().optional().describe('Max entries to return (default: all)'),
+    description: 'Read the audit_log cell. Monotonic sequence per cell. Local mode only.',
+    inputSchema: {
+      limit: z.number().optional().describe('Max entries to return (default: all)'),
+    },
   },
   async ({ limit }) => {
     if (GRAPHDL_MODE !== 'local') {
@@ -348,13 +368,15 @@ server.tool(
 
 // ── Verify signature (#24) ──────────────────────────────────────────
 
-server.tool(
+server.registerTool(
   'graphdl_verify_signature',
-  'Verify a sender/payload/signature tuple against the engine\'s crypto primitive. Returns boolean. Used by anonymous peers per AREST §5.5.',
   {
-    sender: z.string().describe('Claimed sender identity'),
-    payload: z.string().describe('Signed payload'),
-    signature: z.string().describe('Signature to verify'),
+    description: 'Verify HMAC-SHA256 sender/payload/signature tuple.',
+    inputSchema: {
+      sender: z.string().describe('Claimed sender identity'),
+      payload: z.string().describe('Signed payload'),
+      signature: z.string().describe('Signature to verify'),
+    },
   },
   async ({ sender, payload, signature }) => {
     if (GRAPHDL_MODE === 'local') {
@@ -375,10 +397,11 @@ server.tool(
 // ── Debug: state projection (gated by GRAPHDL_DEBUG=1, #18) ─────────
 
 if (GRAPHDL_DEBUG) {
-  server.tool(
+  server.registerTool(
     'graphdl_debug',
-    'Dump the full compiled state (nouns, fact types, constraints, state machines). Development only — enable with GRAPHDL_DEBUG=1.',
-    {},
+    {
+      description: 'Dump the full compiled state. Development only — enable with GRAPHDL_DEBUG=1.',
+    },
     async () => {
       if (GRAPHDL_MODE === 'local') {
         const engine = await getLocalEngine()
@@ -402,22 +425,46 @@ function loadPrompt(name: string): string {
   }
 }
 
-server.prompt(
+server.registerPrompt(
   'graphdl_overview',
-  'GraphDL system overview, constraint types, and FORML2 document structure',
+  { description: 'GraphDL system overview, constraint types, and FORML2 document structure' },
   () => ({ messages: [{ role: 'user', content: { type: 'text', text: loadPrompt('overview') } }] }),
 )
 
-server.prompt(
-  'graphdl_modeling',
-  'Domain modeling guide: entity/value types, multiplicity, subtypes, derivation rules',
-  () => ({ messages: [{ role: 'user', content: { type: 'text', text: loadPrompt('modeling') } }] }),
+server.registerPrompt(
+  'graphdl_entity_modeling',
+  { description: 'Entity/value types, reference schemes, normalization, arity, multiplicity, objectification' },
+  () => ({ messages: [{ role: 'user', content: { type: 'text', text: loadPrompt('entity-modeling') } }] }),
 )
 
-server.prompt(
+server.registerPrompt(
+  'graphdl_advanced_constraints',
+  { description: 'Subtype partitions, subset constraints with autofill, ring constraints' },
+  () => ({ messages: [{ role: 'user', content: { type: 'text', text: loadPrompt('advanced-constraints') } }] }),
+)
+
+server.registerPrompt(
+  'graphdl_derivation_deontic',
+  { description: 'Derivation rules, deontic vs alethic modality, obligatory/forbidden/permitted operators' },
+  () => ({ messages: [{ role: 'user', content: { type: 'text', text: loadPrompt('derivation-deontic') } }] }),
+)
+
+server.registerPrompt(
+  'graphdl_verbalization',
+  { description: 'Full ORM2 verbalization tables: UC, MC, DMaC, SSC, combined patterns from Halpin ORM2-02' },
+  () => ({ messages: [{ role: 'user', content: { type: 'text', text: loadPrompt('verbalization') } }] }),
+)
+
+server.registerPrompt(
   'graphdl_principles',
-  'Design principles: encapsulation, no bridge architecture, no IR, the paper is the spec',
+  { description: 'Design principles: facts all the way down, no bridge architecture, the paper is the spec' },
   () => ({ messages: [{ role: 'user', content: { type: 'text', text: loadPrompt('design-principles') } }] }),
+)
+
+server.registerPrompt(
+  'graphdl_api',
+  { description: 'AREST API reference: CLI keys, MCP tools, HTTP endpoints, identity/signing' },
+  () => ({ messages: [{ role: 'user', content: { type: 'text', text: loadPrompt('api') } }] }),
 )
 
 // ── Start ───────────────────────────────────────────────────────────
