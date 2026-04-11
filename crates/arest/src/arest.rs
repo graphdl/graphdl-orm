@@ -317,7 +317,6 @@ fn create_via_defs(
     state: &ast::Object,
 ) -> CommandResult {
     let entity_id = explicit_id.unwrap_or("").to_string();
-    let t0 = std::time::Instant::now();
 
     // ── resolve: populate facts via ρ(resolve:{noun}) ──────────────
     let fields_with_domain: Vec<(&str, &str)> = fields.iter()
@@ -380,20 +379,34 @@ fn create_via_defs(
         )
     }).unwrap_or(resolved);
 
-    eprintln!("[create] resolve: {:?}", t0.elapsed());
-    let t1 = std::time::Instant::now();
     // ── derive: forward chain via ρ(derivation:*) to lfp ───────────
-    // When SQL triggers handle derivations, only run SM-related rules
-    // (machine init, transitions). The database cascades the rest.
+    // When SQL triggers handle derivations, only run:
+    // 1. SM-related derivations (machine init, transition metadata)
+    // 2. Derivations whose consequent is a fact type referenced by an SM transition
+    //    (the SM needs these derived facts to auto-advance)
     let has_sql_triggers = ast::cells_iter(d).into_iter()
         .any(|(n, _)| n.starts_with("sql:trigger:"));
+    // Collect fact types that SM transitions subscribe to.
+    // Read from Transition_is_triggered_by_Event_Type instance facts in P.
+    let sm_event_types: std::collections::HashSet<String> = if has_sql_triggers {
+        let trigger_cell = ast::fetch_or_phi("Transition_is_triggered_by_Event_Type", d);
+        trigger_cell.as_seq().map(|facts| {
+            facts.iter().filter_map(|f| {
+                ast::binding(f, "Event Type").map(|s| s.to_string())
+            }).collect()
+        }).unwrap_or_default()
+    } else {
+        std::collections::HashSet::new()
+    };
     let derivation_defs_owned: Vec<(String, ast::Func)> = ast::cells_iter(d).into_iter()
         .filter(|(n, _)| n.starts_with("derivation:"))
         .filter(|(n, _)| {
             if has_sql_triggers {
-                // Only SM-related derivations when SQL triggers handle the rest.
+                // SM infrastructure derivations
                 n.contains("StateMachine") || n.contains("machine:") || n.contains("_transitive_Status")
                     || n.contains("_transitive_Transition") || n.contains("sm_init")
+                // Derivations whose consequent is needed by the SM
+                    || sm_event_types.iter().any(|evt| n.contains(evt))
             } else {
                 true
             }
@@ -402,11 +415,7 @@ fn create_via_defs(
         .collect();
     let derivation_refs: Vec<(&str, &ast::Func)> = derivation_defs_owned.iter()
         .map(|(n, f)| (n.as_str(), f)).collect();
-    eprintln!("[create] derive-prep ({} rules, sql_triggers={}): {:?}", derivation_refs.len(), has_sql_triggers, t1.elapsed());
-    let t2 = std::time::Instant::now();
     let (derived_state, derived) = crate::evaluate::forward_chain_defs_state(&derivation_refs, &resolved);
-    eprintln!("[create] derive-chain ({} derived): {:?}", derived.len(), t2.elapsed());
-    let t3 = std::time::Instant::now();
 
     // Collect fact type IDs from derived facts as additional events.
     derived.iter().for_each(|d| fact_events.push(d.fact_type_id.clone()));
@@ -519,14 +528,11 @@ fn create_via_defs(
         }
     };
 
-    eprintln!("[create] sm-advance: {:?}", t3.elapsed());
-    let t4 = std::time::Instant::now();
     // ── validate: ρ(validate) applied to population ────────────────
     let ctx_obj = ast::encode_eval_context_state("", None, &derived_state);
     let violation_obj = ast::apply(&ast::Func::Def("validate".to_string()), &ctx_obj, d);
     let violations = ast::decode_violations(&violation_obj);
     let rejected = violations.iter().any(|v| v.alethic);
-    eprintln!("[create] validate: {:?}", t4.elapsed());
 
     // ── emit: construct representation via ρ ────────────────────────
     let sm_derived: Vec<_> = derived.iter()
