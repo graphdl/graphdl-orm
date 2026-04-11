@@ -352,6 +352,13 @@ fn create_via_defs(
     let rejected = violations.iter().any(|v| v.alethic);
 
     // ── emit: construct representation via ρ ────────────────────────
+    let sm_derived: Vec<_> = derived.iter()
+        .filter(|d| d.fact_type_id.contains("StateMachine") || d.fact_type_id.contains("Machine"))
+        .map(|d| format!("{}:{:?}", d.fact_type_id, d.bindings))
+        .collect();
+    eprintln!("[debug] SM derived facts: {:?}", sm_derived);
+    let sm_cell = ast::fetch_or_phi("StateMachine_has_currentlyInStatus", &derived_state);
+    eprintln!("[debug] SM cell: {:?}", sm_cell);
     let status = extract_sm_status(&derived_state, &entity_id);
     let transitions = hateoas_via_rho(d, noun, &entity_id, status.as_deref());
 
