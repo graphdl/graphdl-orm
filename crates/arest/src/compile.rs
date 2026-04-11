@@ -1005,7 +1005,7 @@ pub(crate) fn compile(ir: &Domain) -> CompiledModel {
     eprintln!("  [profile] noun index: {:?}", t2.elapsed());
 
     let t3 = std::time::Instant::now();
-    let derivations = compile_derivations(ir);
+    let derivations = compile_derivations(ir, sm_source);
     eprintln!("  [profile] {} derivations: {:?}", derivations.len(), t3.elapsed());
 
     let t4 = std::time::Instant::now();
@@ -1092,7 +1092,9 @@ fn build_noun_index(
 // where each step is a partial application over a schema.
 
 /// Compile all derivation rules: explicit from IR + implicit structural rules.
-fn compile_derivations(ir: &Domain) -> Vec<CompiledDerivation> {
+/// `sm_defs` provides state machines (may differ from ir.state_machines when
+/// SMs are derived from instance facts rather than old-style readings).
+fn compile_derivations(ir: &Domain, sm_defs: &HashMap<String, StateMachineDef>) -> Vec<CompiledDerivation> {
     let mut derivations = Vec::new();
 
     // α(rule → compiled) : derivation_rules
@@ -1114,7 +1116,13 @@ fn compile_derivations(ir: &Domain) -> Vec<CompiledDerivation> {
     derivations.extend(compile_cwa_negation(ir));
 
     // Implicit: state machine initialization from SM definitions
-    derivations.extend(compile_sm_initialization(ir));
+    // Uses sm_defs (derived from instance facts) rather than ir.state_machines.
+    let sm_init_derivations: Vec<_> = sm_defs.iter().map(|(noun_name, sm_def)| {
+        eprintln!("  [profile] compiling SM init for noun={} initial={}", noun_name, sm_def.statuses.first().unwrap_or(&String::new()));
+        compile_sm_init_for(noun_name, sm_def)
+    }).collect();
+    eprintln!("  [profile] {} SM init derivations", sm_init_derivations.len());
+    derivations.extend(sm_init_derivations);
 
     derivations
 }
@@ -1679,13 +1687,16 @@ fn compile_cwa_negation(ir: &Domain) -> Vec<CompiledDerivation> {
 /// exists in the population but no State Machine is for that entity, derive:
 ///   - State Machine instance (instanceOf, forResource, currentlyInStatus = initial)
 fn compile_sm_initialization(ir: &Domain) -> Vec<CompiledDerivation> {
-    ir.state_machines.iter().map(|(noun_name, sm_def)| {
+    ir.state_machines.iter().map(|(noun_name, sm_def)| compile_sm_init_for(noun_name, sm_def)).collect()
+}
+
+fn compile_sm_init_for(noun_name: &str, sm_def: &StateMachineDef) -> CompiledDerivation {
         let sm_noun = sm_def.noun_name.clone();
         let initial_status = sm_def.statuses.first().cloned().unwrap_or_default();
         let id_str = format!("_sm_init_{}", noun_name);
         let text_str = format!("SM init for {}", noun_name);
 
-        let get_instances = instances_of_noun_func(noun_name);
+        let get_instances = instances_of_noun_func(&sm_noun);
 
         let extract_for_resource = Func::compose(
             Func::apply_to_all(Func::Selector(2)),
@@ -1764,7 +1775,6 @@ fn compile_sm_initialization(ir: &Domain) -> Vec<CompiledDerivation> {
         let func = Func::compose(Func::Concat, Func::compose(derive_facts, new_instances));
 
         CompiledDerivation { id: id_str, text: text_str, kind: DerivationKind::SubtypeInheritance, func }
-    }).collect()
 }
 
 fn compile_constraint(ir: &Domain, def: &ConstraintDef) -> CompiledConstraint {
