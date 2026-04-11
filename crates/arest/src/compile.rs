@@ -1011,6 +1011,64 @@ pub fn state_to_domain(state: &crate::ast::Object) -> Domain {
 }
 
 /// Compile an entire Domain into executable form.
+/// Structural model validation — catches FORML2 violations at compile time.
+/// Returns a list of error messages. Empty = model is well-formed.
+pub fn validate_model(ir: &Domain) -> Vec<String> {
+    let mut errors = Vec::new();
+
+    // 1. Undeclared nouns in fact type roles
+    ir.fact_types.iter().for_each(|(ft_id, ft)| {
+        ft.roles.iter()
+            .filter(|r| !ir.nouns.contains_key(&r.noun_name))
+            .for_each(|r| errors.push(format!(
+                "Undeclared noun '{}' in fact type '{}'", r.noun_name, ft_id)));
+    });
+
+    // 2. Subtype of undeclared supertype
+    ir.subtypes.iter()
+        .filter(|(_, parent)| !ir.nouns.contains_key(parent.as_str()))
+        .for_each(|(child, parent)| errors.push(format!(
+            "Subtype '{}' declares supertype '{}' which is not a declared noun", child, parent)));
+
+    // 3. Duplicate noun: same name declared as both entity and value
+    // (handled by parser overwrite — but we can warn)
+
+    // 4. UC spans fewer than n-1 roles on n-ary (arity decomposition rule)
+    ir.constraints.iter()
+        .filter(|c| c.kind == "UC" && !c.spans.is_empty())
+        .for_each(|c| {
+            c.spans.first().and_then(|span| ir.fact_types.get(&span.fact_type_id)).map(|ft| {
+                let arity = ft.roles.len();
+                let uc_span = c.spans.len();
+                // For ternary+, UC must span at least n-1 roles
+                (arity >= 3 && uc_span < arity - 1).then(|| errors.push(format!(
+                    "UC '{}' spans {} roles on {}-ary fact type '{}' — must span at least {} (arity decomposition rule)",
+                    c.text, uc_span, arity, ft.reading, arity - 1)));
+            });
+        });
+
+    // 5. Ring constraint on non-self-referential binary
+    ir.constraints.iter()
+        .filter(|c| ["IR", "AS", "SY", "TR", "IT", "AC", "RF", "AT"].contains(&c.kind.as_str()))
+        .for_each(|c| {
+            c.spans.first().and_then(|span| ir.fact_types.get(&span.fact_type_id)).map(|ft| {
+                let role_nouns: HashSet<&str> = ft.roles.iter().map(|r| r.noun_name.as_str()).collect();
+                (ft.roles.len() == 2 && role_nouns.len() != 1).then(|| errors.push(format!(
+                    "Ring constraint '{}' on '{}' requires both roles to be the same type, but found {:?}",
+                    c.kind, ft.reading, role_nouns)));
+            });
+        });
+
+    // 6. Constraint references undeclared fact type
+    ir.constraints.iter()
+        .flat_map(|c| c.spans.iter())
+        .filter(|span| !span.fact_type_id.is_empty() && !ir.fact_types.contains_key(&span.fact_type_id))
+        .for_each(|span| errors.push(format!(
+            "Constraint span references undeclared fact type '{}'", span.fact_type_id)));
+
+    errors
+}
+
 pub(crate) fn compile(ir: &Domain) -> CompiledModel {
     let t0 = std::time::Instant::now();
     let constraints: Vec<CompiledConstraint> = ir.constraints.iter()
