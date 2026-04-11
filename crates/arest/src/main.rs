@@ -194,12 +194,25 @@ fn read_readings(dirs: &[String]) -> Vec<(String, String)> {
                 .unwrap_or_else(|e| { eprintln!("Failed to read {}: {}", path.display(), e); std::process::exit(1); });
             ("app.md".to_string(), text)
         });
-        let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(dir_path)
-            .unwrap_or_else(|e| { eprintln!("Failed to read {}: {}", dir, e); std::process::exit(1); })
-            .filter_map(|e| e.ok()).map(|e| e.path())
-            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("md"))
-            .collect();
-        entries.sort();
+        // Collect .md files recursively (readings may be in subdirectories).
+        fn collect_md(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let entries = std::fs::read_dir(dir)
+                .unwrap_or_else(|e| { eprintln!("Failed to read {}: {}", dir.display(), e); std::process::exit(1); });
+            entries.filter_map(|e| e.ok()).map(|e| e.path()).for_each(|p| {
+                if p.is_dir() { collect_md(&p, out); }
+                else if p.extension().and_then(|e| e.to_str()) == Some("md") { out.push(p); }
+            });
+        }
+        let mut entries: Vec<std::path::PathBuf> = Vec::new();
+        collect_md(dir_path, &mut entries);
+        // Sort: files before subdirectories at each level, then alphabetically.
+        // This ensures parent domain files (cases.md) load before subdirectory
+        // files (cases/speckled-band.md) so nouns are in context.
+        entries.sort_by(|a, b| {
+            let a_depth = a.components().count();
+            let b_depth = b.components().count();
+            a_depth.cmp(&b_depth).then_with(|| a.cmp(b))
+        });
         entries.into_iter().map(|path| {
             let name = path.file_name().unwrap().to_string_lossy().to_string();
             let text = std::fs::read_to_string(&path)
