@@ -125,253 +125,245 @@ async function dispatchRead(path: string): Promise<any> {
   return httpRequest(path)
 }
 
+// ── Local system call helper ──────────────────────────────────────
+
+async function systemCall(key: string, input: string): Promise<string> {
+  const engine = await getLocalEngine()
+  const handle = await getLocalHandle()
+  return engine.system(handle, key, input)
+}
+
 const server = new McpServer({
   name: 'graphdl',
-  version: '0.1.0',
+  version: '0.2.0',
 })
 
-// ── Read: list entities of a noun type ──────────────────────────────
+// =====================================================================
+// TOOLS — 6 core verbs for agent ergonomics
+// =====================================================================
+
+// ── 1. get: retrieve an entity or list entities ──────────────────────
 
 server.registerTool(
-  'graphdl_list',
+  'get',
   {
-    description: 'List entities of a noun type in a domain',
+    description: 'Get an entity by ID, or list all entities of a noun type. Returns the entity with its current state, HATEOAS links, and navigation.',
     inputSchema: {
-      noun: z.string().describe('The noun type (e.g. "Order", "Customer")'),
-      domain: z.string().describe('The domain slug (e.g. "support", "core")'),
-      page: z.number().optional().describe('Page number (default 1)'),
-      limit: z.number().optional().describe('Items per page (default 100)'),
+      id: z.string().optional().describe('Entity ID. If omitted, lists all entities of the noun type.'),
+      noun: z.string().optional().describe('Noun type (e.g. "Order"). Required when listing, optional when getting by ID (inferred from population).'),
     },
   },
-  async ({ noun, domain, page, limit }) => {
+  async ({ id, noun }) => {
     if (GRAPHDL_MODE === 'local') {
-      const engine = await getLocalEngine()
-      const handle = await getLocalHandle()
-      const raw = engine.system(handle, `list:${noun}`, domain)
+      if (id && noun) {
+        const raw = await systemCall(`get:${noun}`, id)
+        try { return textResult(JSON.parse(raw)) } catch { return textResult({ raw }) }
+      } else if (noun) {
+        const raw = await systemCall(`list:${noun}`, '')
+        try { return textResult(JSON.parse(raw)) } catch { return textResult({ raw }) }
+      }
+      return textResult({ error: 'Provide id + noun, or noun to list.' })
+    }
+    if (id && noun) {
+      const data = await httpRequest(`/arest/default/${encodeURIComponent(noun)}/${encodeURIComponent(id)}`)
+      return textResult(data)
+    } else if (noun) {
+      const data = await httpRequest(`/arest/default/${encodeURIComponent(noun)}`)
+      return textResult(data)
+    }
+    return textResult({ error: 'Provide id + noun, or noun to list.' })
+  },
+)
+
+// ── 2. query: query facts across the population ──────────────────────
+
+server.registerTool(
+  'query',
+  {
+    description: 'Query facts by fact type. Returns matching facts from the population. Use to explore relationships between entities.',
+    inputSchema: {
+      fact_type: z.string().describe('Fact type ID (e.g. "Order_was_placed_by_Customer", "Case_has_Observation")'),
+      filter: z.record(z.string(), z.string()).optional().describe('Filter by role bindings (e.g. {"Case": "The Speckled Band"})'),
+    },
+  },
+  async ({ fact_type, filter }) => {
+    if (GRAPHDL_MODE === 'local') {
+      const filterStr = filter ? JSON.stringify(filter) : ''
+      const raw = await systemCall(`query:${fact_type}`, filterStr)
       try { return textResult(JSON.parse(raw)) } catch { return textResult({ raw }) }
     }
-    const params = new URLSearchParams()
-    if (page) params.set('page', String(page))
-    if (limit) params.set('limit', String(limit))
-    const qs = params.toString()
-    const data = await httpRequest(`/arest/${domain}/${encodeURIComponent(noun)}${qs ? '?' + qs : ''}`)
-    return textResult(data)
-  },
-)
-
-// ── Read Detail: get a specific entity ──────────────────────────────
-
-server.registerTool(
-  'graphdl_get',
-  {
-    description: 'Get a specific entity by ID',
-    inputSchema: {
-      noun: z.string().describe('The noun type'),
-      domain: z.string().describe('The domain slug'),
-      id: z.string().describe('The entity ID'),
-    },
-  },
-  async ({ noun, domain, id }) => {
-    if (GRAPHDL_MODE === 'local') {
-      const engine = await getLocalEngine()
-      const handle = await getLocalHandle()
-      const raw = engine.system(handle, `get:${noun}`, id)
-      try { return textResult(JSON.parse(raw)) } catch { return textResult({ raw }) }
-    }
-    const data = await httpRequest(`/arest/${domain}/${encodeURIComponent(noun)}/${encodeURIComponent(id)}`)
-    return textResult(data)
-  },
-)
-
-// ── Create: create a new entity (AREST create = emit ∘ validate ∘ derive ∘ resolve)
-
-server.registerTool(
-  'graphdl_create',
-  {
-    description: 'Create a new entity. Executes the AREST create pipeline (resolve → derive → validate → emit). Returns the created entity with HATEOAS links, or a violation set on rejection.',
-    inputSchema: {
-      noun: z.string().describe('The noun type to create'),
-      domain: z.string().describe('The domain slug'),
-      id: z.string().optional().describe('Explicit entity id. If omitted the engine generates one.'),
-      fields: z.record(z.string(), z.string()).describe('Field values keyed by role name'),
-      sender: z.string().optional().describe('Caller identity (typically an email). Pushed as User fact during resolve.'),
-      signature: z.string().optional().describe('HMAC-SHA256 over sender+payload.'),
-    },
-  },
-  async ({ noun, domain, id, fields, sender, signature }) => {
-    const command = { type: 'createEntity', noun, domain, id, fields, sender, signature }
-    const data = await dispatchCommand(command)
-    return textResult(data)
-  },
-)
-
-// ── Apply: generic Command dispatch ──────────────────────────────────
-
-server.registerTool(
-  'graphdl_apply',
-  {
-    description: 'Generic command dispatch. Exposes all 5 AREST Command variants. Prefer specific tools when possible.',
-    inputSchema: {
-      command: z.record(z.string(), z.any()).describe('Command object with a "type" field and variant-specific fields.'),
-    },
-  },
-  async ({ command }) => {
-    const data = await dispatchCommand(command)
-    return textResult(data)
-  },
-)
-
-// ── Transition: state machine event dispatch ────────────────────────
-
-server.registerTool(
-  'graphdl_transition',
-  {
-    description: 'Fire a state machine transition on an entity.',
-    inputSchema: {
-      entityId: z.string().describe('Target entity id'),
-      event: z.string().describe('Transition event name (e.g. "place", "ship")'),
-      domain: z.string().describe('Domain slug'),
-      currentStatus: z.string().optional().describe('Current status (optional; engine resolves from state if omitted)'),
-      sender: z.string().optional(),
-      signature: z.string().optional(),
-    },
-  },
-  async ({ entityId, event, domain, currentStatus, sender, signature }) => {
-    const command = { type: 'transition', entityId, event, domain, currentStatus, sender, signature }
-    const data = await dispatchCommand(command)
-    return textResult(data)
-  },
-)
-
-// ── Evaluate: run constraint evaluation ─────────────────────────────
-
-server.registerTool(
-  'graphdl_evaluate',
-  {
-    description: 'Evaluate constraints against a response. Returns the violation set.',
-    inputSchema: {
-      domain: z.string().describe('The domain slug'),
-      response: z.record(z.string(), z.any()).describe('The response data to evaluate'),
-    },
-  },
-  async ({ domain, response }) => {
-    if (GRAPHDL_MODE === 'local') {
-      const engine = await getLocalEngine()
-      const handle = await getLocalHandle()
-      const raw = engine.system(handle, 'evaluate', JSON.stringify({ domain, response }))
-      try { return textResult(JSON.parse(raw)) } catch { return textResult({ raw }) }
-    }
-    const data = await httpRequest(`/arest/${domain}/evaluate`, {
+    const data = await httpRequest(`/arest/default/query/${encodeURIComponent(fact_type)}`, {
       method: 'POST',
-      body: JSON.stringify({ response }),
+      body: JSON.stringify({ filter }),
     })
     return textResult(data)
   },
 )
 
-// ── Schema: get noun/fact/constraint schemas for a domain ───────────
+// ── 3. apply: create, update, or transition an entity ────────────────
 
 server.registerTool(
-  'graphdl_schema',
+  'apply',
   {
-    description: 'Get the schema (nouns, fact types, constraints, state machines) for a domain',
+    description: 'Apply an operation to an entity. The operation determines behavior: create (new entity), update (modify fields), transition (fire SM event). Executes the AREST pipeline: resolve → derive → validate → emit.',
     inputSchema: {
-      domain: z.string().describe('The domain slug'),
+      operation: z.enum(['create', 'update', 'transition']).describe('Operation type'),
+      noun: z.string().describe('Entity noun type (e.g. "Order", "Case")'),
+      id: z.string().optional().describe('Entity ID. Required for update/transition. Optional for create (auto-generated).'),
+      fields: z.record(z.string(), z.string()).optional().describe('Fact pairs for create/update (e.g. {"Name": "Acme", "customer": "alice"})'),
+      event: z.string().optional().describe('SM event for transition (e.g. "place", "ship")'),
+      sender: z.string().optional().describe('Caller identity for authorization'),
+      signature: z.string().optional().describe('HMAC-SHA256 signature'),
     },
   },
-  async ({ domain }) => {
+  async ({ operation, noun, id, fields, event, sender, signature }) => {
+    if (GRAPHDL_MODE === 'local') {
+      switch (operation) {
+        case 'create': {
+          const pairs = Object.entries(fields || {}).map(([k, v]) => `<${k}, ${v}>`).join(', ')
+          const idPair = id ? `<id, ${id}>, ` : ''
+          const raw = await systemCall(`create:${noun}`, `<${idPair}${pairs}>`)
+          try { return textResult(JSON.parse(raw)) } catch { return textResult({ raw }) }
+        }
+        case 'update': {
+          const command = { type: 'updateEntity', noun, domain: '', entityId: id, fields: fields || {}, sender, signature }
+          const data = await dispatchCommand(command)
+          return textResult(data)
+        }
+        case 'transition': {
+          const command = { type: 'transition', entityId: id, event, domain: '', sender, signature }
+          const data = await dispatchCommand(command)
+          return textResult(data)
+        }
+      }
+    }
+    // Remote mode: dispatch via HTTP
+    const command = operation === 'create'
+      ? { type: 'createEntity', noun, domain: '', id, fields, sender, signature }
+      : operation === 'update'
+        ? { type: 'updateEntity', noun, domain: '', entityId: id, fields, sender, signature }
+        : { type: 'transition', entityId: id, event, domain: '', sender, signature }
+    const data = await httpRequest('/arest/default/apply', { method: 'POST', body: JSON.stringify(command) })
+    return textResult(data)
+  },
+)
+
+// ── 4. actions: get valid actions for an entity (HATEOAS) ────────────
+
+server.registerTool(
+  'actions',
+  {
+    description: 'Get valid actions for an entity. Returns available SM transitions, navigation links (parent/child), and applicable operations. Pure HATEOAS — the agent discovers what is possible without knowing the schema.',
+    inputSchema: {
+      noun: z.string().describe('Entity noun type'),
+      id: z.string().describe('Entity ID'),
+      status: z.string().optional().describe('Current SM status (resolved from state if omitted)'),
+    },
+  },
+  async ({ noun, id, status }) => {
+    if (GRAPHDL_MODE === 'local') {
+      const transitions = await systemCall(`transitions:${noun}`, status || '')
+      const raw = await systemCall(`get:${noun}`, id)
+      try {
+        return textResult({
+          entity: id,
+          noun,
+          transitions: transitions,
+          // Navigation links are part of the entity representation
+          entity_data: JSON.parse(raw),
+        })
+      } catch {
+        return textResult({ entity: id, transitions, raw })
+      }
+    }
+    const data = await httpRequest(`/arest/default/${encodeURIComponent(noun)}/${encodeURIComponent(id)}/actions`)
+    return textResult(data)
+  },
+)
+
+// ── 5. explain: derivation trace for a fact or entity ────────────────
+
+server.registerTool(
+  'explain',
+  {
+    description: 'Explain how a fact was derived or why an entity is in its current state. Returns the derivation chain: which rules fired, in what order, producing which facts. Also shows the audit trail for the entity.',
+    inputSchema: {
+      id: z.string().describe('Entity ID'),
+      noun: z.string().optional().describe('Entity noun type'),
+      fact: z.string().optional().describe('Specific fact to explain (e.g. "status", "Hypothesis_explains_Observation")'),
+    },
+  },
+  async ({ id, noun, fact }) => {
+    if (GRAPHDL_MODE === 'local') {
+      // Audit trail for this entity
+      const auditRaw = await systemCall('audit_log', '0')
+      let audit: any[] = []
+      try { audit = JSON.parse(auditRaw) } catch {}
+
+      // If a specific fact type is requested, query it
+      let factData = null
+      if (fact) {
+        const raw = await systemCall(`query:${fact}`, JSON.stringify(noun ? { [noun]: id } : {}))
+        try { factData = JSON.parse(raw) } catch { factData = raw }
+      }
+
+      return textResult({
+        entity: id,
+        fact_query: factData,
+        audit_trail: Array.isArray(audit) ? audit.filter((a: any) => a?.entity === id || a?.resource === id) : audit,
+      })
+    }
+    const data = await httpRequest(`/arest/default/explain/${encodeURIComponent(id)}`)
+    return textResult(data)
+  },
+)
+
+// ── 6. compile: ingest FORML2 readings (self-modification) ───────────
+
+server.registerTool(
+  'compile',
+  {
+    description: 'Compile FORML2 readings into the engine (self-modification, Corollary 5). The engine extends its own program. New nouns, fact types, constraints, derivation rules, and state machines become active immediately. Alethic violations reject.',
+    inputSchema: {
+      readings: z.string().describe('FORML2 readings as markdown text'),
+    },
+  },
+  async ({ readings }) => {
+    if (GRAPHDL_MODE === 'local') {
+      const raw = await systemCall('compile', readings)
+      return textResult({ ok: !raw.startsWith('⊥'), result: raw })
+    }
+    const data = await httpRequest('/parse', {
+      method: 'POST',
+      body: JSON.stringify({ text: readings }),
+    })
+    return textResult(data)
+  },
+)
+
+// ── Utility: schema ──────────────────────────────────────────────────
+
+server.registerTool(
+  'schema',
+  {
+    description: 'Get the full schema: nouns, fact types, constraints, state machines, derivation rules.',
+  },
+  async () => {
     if (GRAPHDL_MODE === 'local') {
       const data = await dispatchRead('/schema')
       return textResult(data)
     }
-    const data = await httpRequest(`/arest/${domain}/schema`)
+    const data = await httpRequest('/arest/default/schema')
     return textResult(data)
   },
 )
 
-// ── Compile: ingest new FORML2 readings (self-modification) ─────────
+// ── Utility: verify signature ────────────────────────────────────────
 
 server.registerTool(
-  'graphdl_compile',
+  'verify',
   {
-    description: 'Compile FORML2 readings (self-modification, Corollary 5). Alethic violations reject.',
-    inputSchema: {
-      domain: z.string().describe('The domain slug'),
-      readings: z.string().describe('FORML2 readings as markdown text'),
-    },
-  },
-  async ({ domain, readings }) => {
-    if (GRAPHDL_MODE === 'local') {
-      const engine = await getLocalEngine()
-      const handle = await getLocalHandle()
-      const raw = engine.system(handle, 'compile', readings)
-      return textResult({ ok: !raw.startsWith('⊥'), result: raw })
-    }
-    const data = await httpRequest('/parse', {
-      method: 'POST',
-      body: JSON.stringify({ domain, text: readings }),
-    })
-    return textResult(data)
-  },
-)
-
-// Back-compat alias for graphdl_parse
-server.registerTool(
-  'graphdl_parse',
-  {
-    description: 'Alias for graphdl_compile. Prefer graphdl_compile.',
-    inputSchema: {
-      domain: z.string().describe('The domain slug'),
-      readings: z.string().describe('FORML2 readings as markdown text'),
-    },
-  },
-  async ({ domain, readings }) => {
-    if (GRAPHDL_MODE === 'local') {
-      const engine = await getLocalEngine()
-      const handle = await getLocalHandle()
-      const raw = engine.system(handle, 'compile', readings)
-      return textResult({ ok: !raw.startsWith('⊥'), result: raw })
-    }
-    const data = await httpRequest('/parse', {
-      method: 'POST',
-      body: JSON.stringify({ domain, text: readings }),
-    })
-    return textResult(data)
-  },
-)
-
-// ── Audit log: read the compile/apply audit trail (#26) ─────────────
-
-server.registerTool(
-  'graphdl_audit_log',
-  {
-    description: 'Read the audit_log cell. Monotonic sequence per cell. Local mode only.',
-    inputSchema: {
-      limit: z.number().optional().describe('Max entries to return (default: all)'),
-    },
-  },
-  async ({ limit }) => {
-    if (GRAPHDL_MODE !== 'local') {
-      return textResult({ error: 'audit_log is only available in local mode' })
-    }
-    const engine = await getLocalEngine()
-    const handle = await getLocalHandle()
-    const raw = engine.system(handle, 'audit_log', String(limit ?? 0))
-    try {
-      const data = JSON.parse(raw)
-      return textResult(data)
-    } catch {
-      return textResult({ raw })
-    }
-  },
-)
-
-// ── Verify signature (#24) ──────────────────────────────────────────
-
-server.registerTool(
-  'graphdl_verify_signature',
-  {
-    description: 'Verify HMAC-SHA256 sender/payload/signature tuple.',
+    description: 'Verify an HMAC-SHA256 signature over sender + payload.',
     inputSchema: {
       sender: z.string().describe('Claimed sender identity'),
       payload: z.string().describe('Signed payload'),
@@ -380,11 +372,9 @@ server.registerTool(
   },
   async ({ sender, payload, signature }) => {
     if (GRAPHDL_MODE === 'local') {
-      const engine = await getLocalEngine()
-      const handle = await getLocalHandle()
       const encoded = `<${sender},${payload},${signature}>`
-      const raw = engine.system(handle, 'verify_signature', encoded)
-      return textResult({ valid: raw === 'true', raw })
+      const raw = await systemCall('verify_signature', encoded)
+      return textResult({ valid: raw === 'true' })
     }
     const data = await httpRequest('/crypto/verify', {
       method: 'POST',
@@ -394,19 +384,15 @@ server.registerTool(
   },
 )
 
-// ── Debug: state projection (gated by GRAPHDL_DEBUG=1, #18) ─────────
+// ── Debug (gated) ────────────────────────────────────────────────────
 
 if (GRAPHDL_DEBUG) {
   server.registerTool(
-    'graphdl_debug',
-    {
-      description: 'Dump the full compiled state. Development only — enable with GRAPHDL_DEBUG=1.',
-    },
+    'debug',
+    { description: 'Dump full compiled state. Development only — GRAPHDL_DEBUG=1.' },
     async () => {
       if (GRAPHDL_MODE === 'local') {
-        const engine = await getLocalEngine()
-        const handle = await getLocalHandle()
-        const raw = engine.system(handle, 'debug', '')
+        const raw = await systemCall('debug', '')
         try { return textResult(JSON.parse(raw)) } catch { return textResult({ raw }) }
       }
       const data = await httpRequest('/debug')
