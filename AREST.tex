@@ -165,6 +165,18 @@ Runtime functions that interact with external state execute during $\mathit{reso
 
 The binding is live: when a cell's contents change via $\downarrow$, every $\rho$-application over that cell re-evaluates. This is streaming. There is no separate pub/sub layer, no event bus, no callback registry. A subscriber is a $\rho$-application that has not yet been evaluated against the current $D$. When $D$ changes, it evaluates. A sensor reading, a Kafka message, a derived inference, and a user click are all facts in $P$ or events in $E$. They enter $D$ through the same $\downarrow$ operator, and every bound $\rho$-application sees the update through the same mechanism.
 
+\subsection{Data Federation}
+
+A federated noun is one whose population is resolved by $\rho$ at evaluation time from an external source rather than read from a local cell. The reading ``Noun is backed by External System'' compiles to a populating function $\mathit{populate}_n$ registered in $\mathit{DEFS}$. During $\mathit{resolve}$~(\ref{eq:create}), $\rho(\mathit{populate}_n)$ fetches from the external source and produces facts:
+\begin{align*}
+\rho(\mathit{populate}_n)\!:\!I \;\to\; \{f_1, \ldots, f_k\} \subseteq P_{\mathit{OWA}}
+\end{align*}
+The fetched facts enter $P$ under OWA (absence is unknown, not false). Constraints and derivation rules evaluate over the unified $P$ without distinguishing local from federated facts. A subset constraint can span a local entity and a federated one. No schema translation is required---the fact type declared in the readings IS the response schema, and JSON keys map to role bindings through the compiled schema.
+
+The compile step constructs $\mathit{populate}_n$ from readings: the external system's URL, the noun's URI path, authentication headers, and credential references. SSRF validation rejects internal or loopback URLs at compile time, before any fetch can execute. Cell isolation (Definition~\ref{def:isolation}) ensures federated facts are cached for the request duration---two concurrent $\mu$ applications do not re-fetch.
+
+No ETL. No integration middleware. No separate query language for external data. The external system is a $\rho$-application. The rest of the algebra does not change.
+
 \subsection{State and Cells}
 
 The state $D$ is a sequence of cells $\langle\mathit{CELL}, n, c\rangle$ with Backus's fetch ($\uparrow\!n\!:\!D \to c$) and store ($\downarrow\!n\!:\!\langle x, D\rangle \to D'$) operators~\cite[Sec.\,14.3]{backus78}. $\mathit{FILE}$ is a cell whose contents is~$P$. RMAP~\cite[Ch.\,10]{halpin01} determines which facts belong to which cell from the schema's uniqueness constraints: the result is a 3NF row, the complete set of facts that depend on one entity's key. Each entity is a cell. Cells may contain sub-stores~\cite[Sec.\,14.7]{backus78}.
