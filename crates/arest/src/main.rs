@@ -158,7 +158,7 @@ mod db {
             ast::store(&name, obj, &acc)
         });
 
-        state
+        state.to_store()
     }
 }
 
