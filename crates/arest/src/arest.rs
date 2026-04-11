@@ -465,10 +465,10 @@ fn create_via_defs(
                                     noun_roles.iter().any(|role| ast::binding_matches(f, role, &entity_id))
                                 })
                             } else {
-                                // SM noun not in this fact type — the event type
-                                // is not entity-scoped. Don't auto-advance
-                                // (requires explicit event or cross-entity join).
-                                false
+                                // SM noun not in this fact type — auto-join.
+                                // Walk the schema graph to find a join path from
+                                // the SM noun to a role in the subscribed fact type.
+                                guard_auto_join(noun, &entity_id, event_type, &st, d)
                             }
                         });
                         if has_facts {
@@ -750,6 +750,128 @@ fn update_via_defs(
         rejected,
         state: if rejected { state.clone() } else { new_state },
     }
+}
+
+/// SM guard auto-join: when the SM noun doesn't play a role in the
+/// subscribed fact type, walk the schema graph to find a join path.
+///
+/// BFS from the SM noun through binary fact types. At each hop, the
+/// "other" role's noun is checked against the target fact type's roles.
+/// If found, evaluate the natural join: does a chain of facts exist
+/// from entity_id through the intermediate nouns to a fact in the target?
+///
+/// Example: SM for Case, target = Hypothesis_explains_Observation.
+///   Hop 1: Case_has_Hypothesis → other noun = Hypothesis
+///   Hypothesis appears in Hypothesis_explains_Observation → match.
+///   Join: exists H where Case_has_Hypothesis(Case=entity_id, Hypothesis=H)
+///         AND Hypothesis_explains_Observation(Hypothesis=H, _).
+fn guard_auto_join(
+    sm_noun: &str,
+    entity_id: &str,
+    target_ft: &str,
+    state: &ast::Object,
+    d: &ast::Object,
+) -> bool {
+    // Get target fact type's role names.
+    let target_roles = schema_role_names(target_ft, d);
+    if target_roles.is_empty() { return false; }
+
+    // Collect all schema IDs and their role names from D.
+    let all_schemas: Vec<(String, Vec<String>)> = ast::cells_iter(d).into_iter()
+        .filter(|(name, _)| name.starts_with("query:"))
+        .filter_map(|(name, _)| {
+            let ft_id = name.strip_prefix("query:")?.to_string();
+            let roles = schema_role_names(&ft_id, d);
+            (!roles.is_empty()).then(|| (ft_id, roles))
+        })
+        .collect();
+
+    // BFS: find a path from sm_noun to any role in the target fact type.
+    // Each entry: (current_noun, join_chain: Vec<(ft_id, sm_role, other_role)>)
+    let mut queue: std::collections::VecDeque<(String, Vec<(String, String, String)>)> =
+        std::collections::VecDeque::new();
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    queue.push_back((sm_noun.to_string(), vec![]));
+    visited.insert(sm_noun.to_string());
+
+    while let Some((current_noun, chain)) = queue.pop_front() {
+        // Check if current_noun appears in the target fact type.
+        if target_roles.contains(&current_noun) && !chain.is_empty() {
+            // Found a path. Evaluate the join chain.
+            return evaluate_join_chain(entity_id, &chain, &current_noun, target_ft, state);
+        }
+
+        // Limit depth to avoid runaway traversal.
+        if chain.len() >= 3 { continue; }
+
+        // Expand: find binary fact types where current_noun plays a role.
+        for (ft_id, roles) in &all_schemas {
+            if roles.len() != 2 { continue; }
+            if ft_id == target_ft { continue; }
+            let pos = roles.iter().position(|r| r == &current_noun);
+            let pos = match pos { Some(p) => p, None => continue };
+            let other = &roles[1 - pos];
+            if visited.contains(other) { continue; }
+            visited.insert(other.clone());
+            let mut new_chain = chain.clone();
+            new_chain.push((ft_id.clone(), current_noun.clone(), other.clone()));
+            queue.push_back((other.clone(), new_chain));
+        }
+    }
+    false
+}
+
+/// Evaluate a join chain against the population.
+/// Chain: [(ft1, role_a, role_b), (ft2, role_b, role_c), ...]
+/// Start with entity_id matching role_a in ft1, collect role_b values,
+/// then for each, check role_b in ft2, collect role_c values, etc.
+/// Final: check if any collected value appears in the target fact type.
+fn evaluate_join_chain(
+    entity_id: &str,
+    chain: &[(String, String, String)],
+    final_noun: &str,
+    target_ft: &str,
+    state: &ast::Object,
+) -> bool {
+    // Walk the chain, collecting matching values at each hop.
+    let mut current_values: Vec<String> = vec![entity_id.to_string()];
+
+    for (ft_id, from_role, to_role) in chain {
+        let cell = ast::fetch_or_phi(ft_id, state);
+        let facts = cell.as_seq().unwrap_or_default();
+        let mut next_values = Vec::new();
+        for val in &current_values {
+            for fact in facts {
+                if ast::binding_matches(fact, from_role, val) {
+                    if let Some(other_val) = ast::binding(fact, to_role) {
+                        next_values.push(other_val.to_string());
+                    }
+                }
+            }
+        }
+        current_values = next_values;
+        if current_values.is_empty() { return false; }
+    }
+
+    // Check if any collected value appears in the target fact type.
+    let target_cell = ast::fetch_or_phi(target_ft, state);
+    let target_facts = target_cell.as_seq().unwrap_or_default();
+    current_values.iter().any(|val| {
+        target_facts.iter().any(|f| ast::binding_matches(f, final_noun, val))
+    })
+}
+
+/// Get role names for a fact type from its query:{ft_id} def in D.
+fn schema_role_names(ft_id: &str, d: &ast::Object) -> Vec<String> {
+    let role_map = ast::apply(
+        &ast::Func::Def(format!("query:{}", ft_id)),
+        &ast::Object::phi(), d,
+    );
+    role_map.as_seq()
+        .map(|pairs| pairs.iter().filter_map(|pair| {
+            pair.as_seq()?.first()?.as_atom().map(|s| s.to_string())
+        }).collect())
+        .unwrap_or_default()
 }
 
 /// Self-modification: compile ∘ parse (Corollary 5).
