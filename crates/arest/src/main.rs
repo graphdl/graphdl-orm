@@ -71,12 +71,22 @@ mod db {
 
     /// Execute DDL from sql:sqlite:* defs.
     pub fn apply_ddl(conn: &Connection, d: &ast::Object) {
+        // CREATE TABLE from sql:sqlite:* cells
         ast::cells_iter(d).into_iter()
             .filter(|(name, _)| name.starts_with("sql:sqlite:"))
             .filter_map(|(_, contents)| contents.as_atom().map(|s| s.to_string()))
             .for_each(|ddl| {
                 conn.execute_batch(&ddl).unwrap_or_else(|e| {
                     eprintln!("Warning: DDL failed: {}", e);
+                });
+            });
+        // CREATE TRIGGER from sql:trigger:* cells
+        ast::cells_iter(d).into_iter()
+            .filter(|(name, _)| name.starts_with("sql:trigger:"))
+            .filter_map(|(_, contents)| contents.as_atom().map(|s| s.to_string()))
+            .for_each(|ddl| {
+                conn.execute_batch(&ddl).unwrap_or_else(|e| {
+                    eprintln!("Warning: Trigger failed: {}", e);
                 });
             });
     }
@@ -384,6 +394,19 @@ fn main() {
                     state = ast::cell_push("App_uses_Generator",
                         ast::fact_from_pairs(&[("Generator", g.as_str())]), &state);
                 });
+                // Generate SQL triggers for derivation rules.
+                if opted_generators.iter().any(|g| ["sqlite","postgresql","mysql"].contains(&g.as_str())) {
+                    let sql_tables = crate::rmap::rmap(&domain);
+                    let table_names: std::collections::HashSet<String> = sql_tables.iter()
+                        .map(|t| t.name.clone()).collect();
+                    let triggers = compile::generate_derivation_triggers(&domain, &sql_tables, &table_names);
+                    triggers.iter().for_each(|(name, ddl)| {
+                        state = ast::cell_push(&format!("sql:trigger:{}", name),
+                            ast::Object::atom(ddl), &state);
+                    });
+                    eprintln!("[load] {} SQL triggers generated", triggers.len());
+                }
+
                 let defs = vec![
                     ("compile".to_string(), ast::Func::Platform("compile".to_string())),
                     ("apply".to_string(), ast::Func::Platform("apply_command".to_string())),
@@ -392,7 +415,7 @@ fn main() {
                 let d = ast::defs_to_state(&defs, &state);
                 let compiled = readings.len();
 
-                // Persist state to SQLite.
+                // Persist state to SQLite (tables + triggers).
                 db::apply_ddl(&conn, &d);
                 db::persist_state(&conn, &d);
 

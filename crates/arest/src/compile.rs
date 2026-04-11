@@ -663,6 +663,17 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
         ));
     }
 
+    // ── Generator 3b: SQL Triggers for derivation rules ────────────
+    if !active_dialects.is_empty() {
+        let sql_tables = crate::rmap::rmap(&domain);
+        let table_names: std::collections::HashSet<String> = sql_tables.iter()
+            .map(|t| t.name.clone()).collect();
+        let triggers = generate_derivation_triggers(&domain, &sql_tables, &table_names);
+        defs.extend(triggers.into_iter().map(|(name, ddl)| {
+            (format!("sql:trigger:{}", name), Func::constant(Object::atom(&ddl)))
+        }));
+    }
+
     // ── Generator 4: Test Harness — α(constraint → test_def)
     if generators.contains("test") {
     defs.extend(domain.constraints.iter().map(|c| {
@@ -3698,6 +3709,127 @@ fn generate_ddl(table: &crate::rmap::TableDef, dialect: &SqlDialect) -> String {
     };
 
     format!("{}{}{}{}{});{}", create_kw, columns, pk, checks, ucs, engine)
+}
+
+// -- SQL Trigger Generation -------------------------------------------
+
+/// Generate SQL triggers for derivation rules.
+/// Each rule with resolved antecedents/consequent compiles to a trigger
+/// on each antecedent table that INSERTs into the consequent table.
+/// Returns Vec<(trigger_group_name, ddl_string)>.
+pub fn generate_derivation_triggers(
+    domain: &Domain,
+    sql_tables: &[crate::rmap::TableDef],
+    table_names: &HashSet<String>,
+) -> Vec<(String, String)> {
+    let mut result = Vec::new();
+
+    for rule in &domain.derivation_rules {
+        let consequent = &rule.consequent_fact_type_id;
+        if consequent.is_empty() || rule.antecedent_fact_type_ids.is_empty() { continue; }
+
+        let consequent_table = crate::rmap::to_snake(consequent);
+
+        // Get consequent columns from RMAP table, or derive from fact type roles.
+        let consequent_cols: Vec<String> = sql_tables.iter()
+            .find(|t| t.name == consequent_table)
+            .map(|t| t.columns.iter().map(|c| c.name.clone()).collect())
+            .or_else(|| domain.fact_types.get(consequent).map(|ft|
+                ft.roles.iter().map(|r| crate::rmap::to_snake(&r.noun_name)).collect()))
+            .unwrap_or_default();
+        if consequent_cols.is_empty() { continue; }
+
+        // If RMAP didn't create the table, generate a CREATE TABLE for it.
+        if !table_names.contains(&consequent_table) {
+            let cols_ddl = consequent_cols.iter()
+                .map(|c| format!("\"{}\" TEXT", c))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let unique = consequent_cols.iter()
+                .map(|c| format!("\"{}\"", c))
+                .collect::<Vec<_>>()
+                .join(", ");
+            result.push((
+                format!("table_{}", consequent_table),
+                format!("CREATE TABLE IF NOT EXISTS \"{}\" ({}, UNIQUE({}));", consequent_table, cols_ddl, unique),
+            ));
+        }
+
+        let mut triggers = Vec::new();
+        for (i, ant_ft_id) in rule.antecedent_fact_type_ids.iter().enumerate() {
+            let ant_table = crate::rmap::to_snake(ant_ft_id);
+            if !table_names.contains(&ant_table) { continue; }
+
+            let ant_ft = match domain.fact_types.get(ant_ft_id) { Some(f) => f, None => continue };
+            let cons_ft = match domain.fact_types.get(consequent) { Some(f) => f, None => continue };
+            let ant_nouns: Vec<&str> = ant_ft.roles.iter().map(|r| r.noun_name.as_str()).collect();
+            let cons_nouns: Vec<&str> = cons_ft.roles.iter().map(|r| r.noun_name.as_str()).collect();
+
+            let other_ants: Vec<&str> = rule.antecedent_fact_type_ids.iter()
+                .filter(|id| *id != ant_ft_id)
+                .map(|id| id.as_str())
+                .collect();
+
+            let mut select_cols = Vec::new();
+            let mut join_clauses = Vec::new();
+            let mut ok = true;
+
+            for cons_noun in &cons_nouns {
+                let col = crate::rmap::to_snake(cons_noun);
+                if ant_nouns.contains(cons_noun) {
+                    select_cols.push(format!("NEW.\"{}\"", col));
+                } else {
+                    let joined_ant = other_ants.iter().find(|other_id| {
+                        domain.fact_types.get(**other_id)
+                            .map_or(false, |ft| ft.roles.iter().any(|r| r.noun_name == *cons_noun))
+                    });
+                    if let Some(joined_id) = joined_ant {
+                        let joined_table = crate::rmap::to_snake(joined_id);
+                        select_cols.push(format!("\"{}\".\"{}\"", joined_table, col));
+                        if let Some(joined_ft) = domain.fact_types.get(*joined_id) {
+                            if let Some(shared) = ant_nouns.iter()
+                                .find(|n| joined_ft.roles.iter().any(|r| r.noun_name == **n))
+                            {
+                                let shared_col = crate::rmap::to_snake(shared);
+                                join_clauses.push(format!(
+                                    "INNER JOIN \"{}\" ON \"{}\".\"{}\" = NEW.\"{}\"",
+                                    joined_table, joined_table, shared_col, shared_col
+                                ));
+                            } else { ok = false; break; }
+                        } else { ok = false; break; }
+                    } else { ok = false; break; }
+                }
+            }
+            if !ok { continue; }
+
+            let trigger_name = format!("derive_{}_from_{}_{}", consequent_table, ant_table, i);
+            let joins = join_clauses.join(" ");
+            let select = select_cols.join(", ");
+            let cols = consequent_cols.iter()
+                .filter(|c| *c != "id")
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\", \"");
+
+            let from_clause = if joins.is_empty() {
+                String::new()
+            } else {
+                format!(" FROM (SELECT 1) {}", joins)
+            };
+
+            triggers.push(format!(
+                "CREATE TRIGGER IF NOT EXISTS \"{}\" AFTER INSERT ON \"{}\" BEGIN INSERT OR IGNORE INTO \"{}\" (\"{}\") SELECT {}{} WHERE 1; END;",
+                trigger_name, ant_table, consequent_table, cols, select, from_clause
+            ));
+        }
+
+        if !triggers.is_empty() {
+            result.push((crate::rmap::to_snake(consequent), triggers.join("\n")));
+        }
+    }
+
+    eprintln!("  [trigger] {} SQL triggers from {} derivation rules", result.len(), domain.derivation_rules.len());
+    result
 }
 
 // -- Schema Compilation Tests -----------------------------------------
