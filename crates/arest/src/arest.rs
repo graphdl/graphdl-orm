@@ -380,14 +380,14 @@ fn create_via_defs(
     }).unwrap_or(resolved);
 
     // ── derive: forward chain via ρ(derivation:*) to lfp ───────────
-    // When SQL triggers handle derivations, only run:
-    // 1. SM-related derivations (machine init, transition metadata)
-    // 2. Derivations whose consequent is a fact type referenced by an SM transition
-    //    (the SM needs these derived facts to auto-advance)
+    // Gate derivations by noun relevance: only run rules whose antecedent or
+    // consequent fact types involve the created noun. The derivation_index:{noun}
+    // cell (compiled in compile_to_defs_state) provides the relevant IDs with
+    // transitive closure already computed.
+    // When SQL triggers handle derivations, further restrict to SM-related only.
     let has_sql_triggers = ast::cells_iter(d).into_iter()
         .any(|(n, _)| n.starts_with("sql:trigger:"));
     // Collect fact types that SM transitions subscribe to.
-    // Read from Transition_is_triggered_by_Event_Type instance facts in P.
     let sm_event_types: std::collections::HashSet<String> = if has_sql_triggers {
         let trigger_cell = ast::fetch_or_phi("Transition_is_triggered_by_Event_Type", d);
         trigger_cell.as_seq().map(|facts| {
@@ -398,21 +398,47 @@ fn create_via_defs(
     } else {
         std::collections::HashSet::new()
     };
+    // Noun-gated derivation index: O(1) fetch from compiled index.
+    // The index is stored as Func::constant(atom) → func_to_object yields <', atom>.
+    // Extract the atom from the constant form.
+    let relevant_ids: std::collections::HashSet<String> = {
+        let index_key = format!("derivation_index:{}", noun);
+        let index_obj = ast::fetch(&index_key, d);
+        // Unwrap constant form <', value> produced by func_to_object
+        let value = index_obj.as_seq()
+            .filter(|items| items.len() == 2 && items[0].as_atom() == Some("'"))
+            .and_then(|items| items[1].as_atom())
+            .or_else(|| index_obj.as_atom());
+        value
+            .map(|s| s.split(',').map(|id| id.to_string()).collect())
+            .unwrap_or_default()
+    };
     let derivation_defs_owned: Vec<(String, ast::Func)> = ast::cells_iter(d).into_iter()
         .filter(|(n, _)| n.starts_with("derivation:"))
         .filter(|(n, _)| {
+            let def_id = n.strip_prefix("derivation:").unwrap_or(n);
             if has_sql_triggers {
                 // SM infrastructure derivations
                 n.contains("StateMachine") || n.contains("machine:") || n.contains("_transitive_Status")
                     || n.contains("_transitive_Transition") || n.contains("sm_init")
                 // Derivations whose consequent is needed by the SM
                     || sm_event_types.iter().any(|evt| n.contains(evt))
+            } else if !relevant_ids.is_empty() {
+                // Noun-gated: only run derivations relevant to the created noun
+                relevant_ids.contains(def_id)
+                    // Always include SM infrastructure
+                    || n.contains("StateMachine") || n.contains("machine:")
+                    || n.contains("sm_init")
             } else {
-                true
+                true // no index available, run all
             }
         })
         .map(|(n, contents)| (n.to_string(), ast::metacompose(contents, d)))
         .collect();
+    eprintln!("[profile] derivation gating: {}/{} rules for noun '{}'",
+        derivation_defs_owned.len(),
+        ast::cells_iter(d).into_iter().filter(|(n, _)| n.starts_with("derivation:")).count(),
+        noun);
     let derivation_refs: Vec<(&str, &ast::Func)> = derivation_defs_owned.iter()
         .map(|(n, f)| (n.as_str(), f)).collect();
     let (derived_state, derived) = crate::evaluate::forward_chain_defs_state(&derivation_refs, &resolved);

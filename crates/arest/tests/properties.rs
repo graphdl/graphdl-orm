@@ -2075,6 +2075,31 @@ fn bundled_metamodel_passes_validate_model() {
 // ── Join Derivation (:= syntax) ────────────────────────────────────
 
 #[test]
+fn derivation_index_gates_by_noun() {
+    // Verify derivation_index:{noun} cells are compiled and contain
+    // the correct derivation IDs. CWA negation rules should be indexed
+    // under the nouns whose fact types they negate.
+    let (_, d) = compile_orders();
+
+    // derivation_index:Order should exist (Order participates in fact types)
+    let order_index = ast::fetch("derivation_index:Order", &d);
+    assert_ne!(order_index, ast::Object::Bottom,
+        "derivation_index:Order should exist");
+    // Extract the constant value: <', "id1,id2,...">
+    let order_ids = order_index.as_seq()
+        .filter(|items| items.len() == 2 && items[0].as_atom() == Some("'"))
+        .and_then(|items| items[1].as_atom())
+        .unwrap_or("");
+    assert!(!order_ids.is_empty(),
+        "Order index should have derivation IDs");
+
+    // Customer index should exist (Customer plays a role in placed_by)
+    let cust_index = ast::fetch("derivation_index:Customer", &d);
+    assert_ne!(cust_index, ast::Object::Bottom,
+        "derivation_index:Customer should exist");
+}
+
+#[test]
 fn map_store_fetch_is_o1() {
     // Build a large state with 500 cells as Seq
     let mut seq_state = ast::Object::phi();

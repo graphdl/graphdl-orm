@@ -497,6 +497,64 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
     defs.extend(model.derivations.iter()
         .map(|d| (format!("derivation:{}", d.id), d.func.clone())));
 
+    // Derivation index: derivation_index:{noun} → comma-separated derivation IDs.
+    // For each derivation rule, collect nouns that play roles in its antecedent/
+    // consequent fact types. At runtime, create_via_defs fetches the index for the
+    // created noun to gate which derivations run (O(relevant) instead of O(all)).
+    {
+        let mut noun_to_derivations: HashMap<String, Vec<String>> = HashMap::new();
+        // For each compiled derivation, determine which nouns are involved.
+        // Strategy: check the derivation ID and all fact types in the domain
+        // that the derivation references (via antecedent/consequent for domain rules,
+        // or via ID pattern for synthetic rules).
+        for compiled in &model.derivations {
+            let did = &compiled.id;
+            let mut nouns: HashSet<String> = HashSet::new();
+            // Try to find a matching domain rule (user-defined derivations)
+            let domain_rule = domain.derivation_rules.iter().find(|r| r.id == *did);
+            if let Some(rule) = domain_rule {
+                for ft_id in rule.antecedent_fact_type_ids.iter()
+                    .chain(std::iter::once(&rule.consequent_fact_type_id))
+                    .filter(|s| !s.is_empty())
+                {
+                    if let Some(ft) = domain.fact_types.get(ft_id.as_str()) {
+                        for role in &ft.roles { nouns.insert(role.noun_name.clone()); }
+                    }
+                }
+            }
+            // For rules without a matching domain rule (or empty-id rules),
+            // also check domain rules that have matching antecedents.
+            if nouns.is_empty() {
+                // Match domain rules with empty id by antecedent overlap
+                for rule in &domain.derivation_rules {
+                    if rule.id.is_empty() || rule.id == *did {
+                        for ft_id in &rule.antecedent_fact_type_ids {
+                            if let Some(ft) = domain.fact_types.get(ft_id.as_str()) {
+                                for role in &ft.roles { nouns.insert(role.noun_name.clone()); }
+                            }
+                        }
+                    }
+                }
+            }
+            // Synthetic rules: extract noun from ID pattern
+            if nouns.is_empty() {
+                // _cwa_negation_X, _sm_init_Order, _subtype_A_B, _transitivity_...
+                for noun_name in domain.nouns.keys() {
+                    if did.contains(noun_name) { nouns.insert(noun_name.clone()); }
+                }
+            }
+            for noun in nouns {
+                let entry = noun_to_derivations.entry(noun).or_default();
+                if !entry.contains(did) { entry.push(did.clone()); }
+            }
+        }
+        let index_count: usize = noun_to_derivations.values().map(|v| v.len()).sum();
+        eprintln!("  [profile] derivation index: {} nouns, {} entries", noun_to_derivations.len(), index_count);
+        defs.extend(noun_to_derivations.into_iter().map(|(noun, ids)| {
+            (format!("derivation_index:{}", noun), Func::constant(Object::atom(&ids.join(","))))
+        }));
+    }
+
     // Fact type schemas — α(schema → def)
     defs.extend(model.schemas.iter()
         .map(|(id, schema)| (format!("schema:{}", id), schema.construction.clone())));
