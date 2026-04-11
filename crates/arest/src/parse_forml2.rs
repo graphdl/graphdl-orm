@@ -873,11 +873,23 @@ pub fn domain_to_state(d: &Domain) -> crate::ast::Object {
         ("id", r.id.as_str()), ("text", r.text.as_str()), ("consequentFactTypeId", r.consequent_fact_type_id.as_str()),
     ]), &acc));
 
-    state = d.general_instance_facts.iter().fold(state, |acc, f| cell_push("InstanceFact", fact_from_pairs(&[
-        ("subjectNoun", f.subject_noun.as_str()), ("subjectValue", f.subject_value.as_str()),
-        ("fieldName", f.field_name.as_str()), ("objectNoun", f.object_noun.as_str()),
-        ("objectValue", f.object_value.as_str()),
-    ]), &acc));
+    state = d.general_instance_facts.iter().fold(state, |acc, f| {
+        // Generic InstanceFact cell (for queries and introspection).
+        let with_generic = cell_push("InstanceFact", fact_from_pairs(&[
+            ("subjectNoun", f.subject_noun.as_str()), ("subjectValue", f.subject_value.as_str()),
+            ("fieldName", f.field_name.as_str()), ("objectNoun", f.object_noun.as_str()),
+            ("objectValue", f.object_value.as_str()),
+        ]), &acc);
+        // Fact-type-specific cell (for SM guards and constraint evaluation).
+        // field_name is the resolved fact type ID (e.g. "Case_has_Observation").
+        let ft_cell = &f.field_name;
+        let subject = &f.subject_noun;
+        let object = if f.object_noun.is_empty() { &f.field_name } else { &f.object_noun };
+        cell_push(ft_cell, fact_from_pairs(&[
+            (subject.as_str(), f.subject_value.as_str()),
+            (object.as_str(), f.object_value.as_str()),
+        ]), &with_generic)
+    });
 
     // Compound reference scheme decomposition.
     //
