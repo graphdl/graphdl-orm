@@ -1,25 +1,44 @@
 {
   "name": "arest",
   "version": "0.8.0",
+  "description": "AREST engine: FORML2 readings compile to a database, constraint rules, state machines, and a REST API. One function, one β-reducer over Backus's FFP algebra, WASM-compiled.",
   "private": false,
   "type": "module",
-  "bin": {
-    "arest": "./src/cli/import.ts",
-    "arest-mcp": "./src/mcp/server.ts"
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
   },
+  "files": [
+    "dist",
+    "crates/arest/pkg",
+    "README.md",
+    "AREST.pdf"
+  ],
   "scripts": {
     "mcp": "tsx src/mcp/server.ts",
-    "import": "tsx src/cli/import.ts",
     "build:wasm": "cd crates/arest && wasm-pack build --target bundler --out-dir pkg --no-default-features --features cloudflare,debug-def && cd ../.. && node scripts/sanitize-wasm-dts.mjs",
     "build:wasm:test": "cd crates/arest && cargo test",
-    "build": "yarn build:wasm",
+    "build:lib": "tsc --project tsconfig.lib.json",
+    "build": "yarn build:wasm && yarn build:lib",
     "dev": "wrangler dev",
-    "deploy": "yarn build && wrangler deploy",
+    "deploy": "yarn build:wasm && wrangler deploy",
     "test": "vitest run",
     "test:all": "yarn build:wasm:test && vitest run",
     "test:watch": "vitest",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "yarn build"
   },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/graphdl/arest"
+  },
+  "homepage": "https://github.com/graphdl/arest",
+  "license": "MIT",
+  "keywords": ["orm2", "forml2", "rest", "fact-oriented-modeling", "state-machine", "mcp", "wasm"],
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
     "itty-router": "^5.0.22"

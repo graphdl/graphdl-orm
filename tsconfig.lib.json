@@ -1,0 +1,17 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "declaration": true,
+    "declarationMap": false,
+    "sourceMap": false,
+    "noEmit": false,
+    "rootDir": "src",
+    "types": []
+  },
+  "include": [
+    "src/index.ts",
+    "src/api/engine.ts",
+    "src/mcp/server-factory.ts"
+  ]
+}
