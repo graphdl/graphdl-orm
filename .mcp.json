@@ -16,7 +16,7 @@
       "args": ["-y", "tsx", "src/mcp/server.ts"],
       "env": {
         "GRAPHDL_MODE": "local",
-        "GRAPHDL_READINGS_DIR": "../graphdl-tutor/domains"
+        "GRAPHDL_READINGS_DIR": "./tutor/domains"
       }
     },
     "graphdl-remote": {
