@@ -21,14 +21,14 @@ import { z } from 'zod'
  */
 export function createStreamingServer() {
   const server = new McpServer({
-    name: 'graphdl-streaming',
+    name: 'arest-streaming',
     version: '0.1.0',
   })
 
   // ── Tools (same as stdio server) ──────────────────────────────────
 
   server.tool(
-    'graphdl_list',
+    'arest_list',
     'List entities of a noun type in a domain',
     {
       noun: z.string(),
@@ -42,7 +42,7 @@ export function createStreamingServer() {
   )
 
   server.tool(
-    'graphdl_subscribe',
+    'arest_subscribe',
     'Subscribe to cell events for a noun type. Events stream as notifications when cells change.',
     {
       noun: z.string().describe('The noun type to watch'),
@@ -68,7 +68,7 @@ export function createStreamingServer() {
   )
 
   server.tool(
-    'graphdl_unsubscribe',
+    'arest_unsubscribe',
     'Stop receiving cell events for a noun type',
     {
       noun: z.string(),

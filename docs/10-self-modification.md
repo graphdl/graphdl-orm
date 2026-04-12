@@ -131,4 +131,4 @@ This is the last doc. You have:
 - Learned the frozen MCP verb set ([09](09-mcp-verbs.md))
 - Evolved the system without leaving the algebra ([10](10-self-modification.md))
 
-The next logical step is to build something real. The [graphdl-tutor](https://github.com/graphdl/graphdl-tutor) sample app (in progress) will exercise every feature end to end. If you run into something these docs do not answer, open an issue — the docs are meant to be self-contained.
+The next logical step is to build something real. The [arest-tutor](https://github.com/graphdl/arest-tutor) sample app (in progress) will exercise every feature end to end. If you run into something these docs do not answer, open an issue — the docs are meant to be self-contained.

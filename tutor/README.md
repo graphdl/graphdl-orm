@@ -1,17 +1,17 @@
-# GraphDL Tutor
+# AREST Tutor
 
-A teaching app that exercises every GraphDL framework concept. Each domain demonstrates specific capabilities. Read the readings, run the MCP server, poke at the system from Claude Code, and build intuition for how fact-oriented modeling produces correct-by-construction applications.
+A teaching app that exercises every AREST framework concept. Each domain demonstrates specific capabilities. Read the readings, run the MCP server, poke at the system from Claude Code, and build intuition for how fact-oriented modeling produces correct-by-construction applications.
 
 ## Quick start
 
-This repo uses [graphdl-orm](https://github.com/graphdl/graphdl-orm) as the runtime. Clone both as siblings:
+This repo uses [arest](https://github.com/graphdl/arest) as the runtime. Clone both as siblings:
 
 ```bash
 # From your projects root
-git clone https://github.com/graphdl/graphdl-orm
-git clone https://github.com/graphdl/graphdl-tutor
+git clone https://github.com/graphdl/arest
+git clone https://github.com/graphdl/arest-tutor
 
-cd graphdl-tutor
+cd arest-tutor
 yarn install
 yarn compile   # round-trips every domain through the Rust compiler
 ```
@@ -21,12 +21,12 @@ To use from Claude Code or Claude Desktop, add this to your MCP config:
 ```json
 {
   "mcpServers": {
-    "graphdl-tutor": {
+    "arest-tutor": {
       "command": "yarn",
-      "args": ["--cwd", "/absolute/path/to/graphdl-tutor", "mcp"],
+      "args": ["--cwd", "/absolute/path/to/arest-tutor", "mcp"],
       "env": {
-        "GRAPHDL_MODE": "local",
-        "GRAPHDL_READINGS_DIR": "/absolute/path/to/graphdl-tutor/domains"
+        "AREST_MODE": "local",
+        "AREST_READINGS_DIR": "/absolute/path/to/arest-tutor/domains"
       }
     }
   }

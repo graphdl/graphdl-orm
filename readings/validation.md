@@ -1,4 +1,4 @@
-# GraphDL Validation — ORM2 Modeling Rules
+# AREST Validation — ORM2 Modeling Rules
 
 ## Description
 
@@ -12,15 +12,15 @@ It is obligatory that each Role references exactly one Noun.
 
 ### Arity Decomposition
 
-It is forbidden that a Constraint of Constraint Type 'UC' spans fewer Roles than the arity of its Graph Schema minus one.
+It is forbidden that a Constraint of Constraint Type 'UC' spans fewer Roles than the arity of its Fact Type minus one.
 
 ### Ring Constraint Completeness
 
-It is obligatory that when a Graph Schema has exactly two Roles that both reference the same Noun, some Constraint of Constraint Type 'IR', 'AS', 'AT', 'SY', 'IT', 'TR', or 'AC' spans those Roles.
+It is obligatory that when a Fact Type has exactly two Roles that both reference the same Noun, some Constraint of Constraint Type 'IR', 'AS', 'AT', 'SY', 'IT', 'TR', or 'AC' spans those Roles.
 
 ### Ring Constraint Validity
 
-It is forbidden that a Constraint of Constraint Type 'IR', 'AS', 'AT', 'SY', 'IT', 'TR', or 'AC' spans Roles of a Graph Schema where those Roles reference different Nouns.
+It is forbidden that a Constraint of Constraint Type 'IR', 'AS', 'AT', 'SY', 'IT', 'TR', or 'AC' spans Roles of a Fact Type where those Roles reference different Nouns.
 
 ### Singular Naming
 

@@ -3,7 +3,7 @@
 /// SYSTEM:x = <o, D'>
 /// One function. Readings in, applications out.
 
-package graphdl:arest@0.1.0;
+package arest:engine@0.1.0;
 
 interface types {
     record binding {

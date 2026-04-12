@@ -139,7 +139,7 @@ export interface CompiledDomain {
  *
  * The format is: <<nouns, <N1, N2>>, <factTypes, <<id, reading>>>, <constraints, <...>>, <totalFacts, N>>
  *
- * This is NOT JSON — it is GraphDL's internal display notation.
+ * This is NOT JSON — it is AREST's internal display notation.
  * We extract the sections by finding the named top-level fields.
  */
 function parseDebugIR(raw: string): CompiledDomain['ir'] {

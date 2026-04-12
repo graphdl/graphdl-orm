@@ -9,28 +9,28 @@ import { describe, it, expect } from 'vitest'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
 
-describe('GraphDL MCP Server', () => {
+describe('AREST MCP Server', () => {
   it('registers expected tool names', () => {
     // The tools the server registers. Keep in sync with src/mcp/server.ts.
     // Identity-carrying commands accept sender + signature (tasks #17, #20, #24).
     const expectedTools = [
-      'graphdl_list',
-      'graphdl_get',
-      'graphdl_create',
-      'graphdl_apply',
-      'graphdl_transition',
-      'graphdl_evaluate',
-      'graphdl_schema',
-      'graphdl_compile',
-      'graphdl_parse',
-      'graphdl_audit_log',
-      'graphdl_verify_signature',
+      'arest_list',
+      'arest_get',
+      'arest_create',
+      'arest_apply',
+      'arest_transition',
+      'arest_evaluate',
+      'arest_schema',
+      'arest_compile',
+      'arest_parse',
+      'arest_audit_log',
+      'arest_verify_signature',
     ]
 
     // Since we can't easily introspect a running server without connecting,
     // verify the tool names match the documented tool surface.
     for (const tool of expectedTools) {
-      expect(tool).toMatch(/^graphdl_/)
+      expect(tool).toMatch(/^arest_/)
     }
     expect(expectedTools.length).toBeGreaterThanOrEqual(11)
   })

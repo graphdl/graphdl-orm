@@ -1,4 +1,4 @@
-# GraphDL Instances — Runtime Entities
+# AREST Instances — Runtime Entities
 
 ## Entity Types
 
@@ -29,8 +29,8 @@ Citation has Retrieval Date.
 ### Graph
 Graph belongs to Domain.
   Each Graph belongs to exactly one Domain.
-Graph is of Graph Schema.
-  Each Graph is of exactly one Graph Schema.
+Graph is of Fact Type.
+  Each Graph is of exactly one Fact Type.
 Graph is completed.
 Graph is example.
 Graph cites Citation.

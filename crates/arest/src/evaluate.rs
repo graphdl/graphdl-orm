@@ -168,7 +168,7 @@ pub fn prove_state(ir: &Domain, state: &ast::Object, goal: &str, world_assumptio
 
 /// Prove from Object state directly. No Domain reconstruction.
 pub fn prove_from_state(state: &ast::Object, goal: &str, world_assumption: &WorldAssumption) -> ProofResult {
-    let schemas = ast::fetch_or_phi("GraphSchema", state);
+    let schemas = ast::fetch_or_phi("FactType", state);
     let rules = ast::fetch_or_phi("DerivationRule", state);
     let proof = prove_goal_state_pop(state, goal, &HashSet::new(), &schemas, &rules);
     let status = match &proof {
@@ -327,10 +327,10 @@ pub fn synthesize_from_state(state: &ast::Object, noun_name: &str, depth: usize)
     let role_facts = role_cell.as_seq().unwrap_or(&[]);
     let schema_ids_for_noun: Vec<(String, usize)> = role_facts.iter()
         .filter(|r| b(r, "nounName") == noun_name)
-        .map(|r| (b(r, "graphSchema"), b(r, "position").parse().unwrap_or(0)))
+        .map(|r| (b(r, "factType"), b(r, "position").parse().unwrap_or(0)))
         .collect();
 
-    let schema_cell = ast::fetch_or_phi("GraphSchema", state);
+    let schema_cell = ast::fetch_or_phi("FactType", state);
     let schema_facts = schema_cell.as_seq().unwrap_or(&[]);
     let participates_in: Vec<FactTypeSummary> = schema_ids_for_noun.iter()
         .filter_map(|(sid, role_idx)| {
@@ -397,7 +397,7 @@ pub fn synthesize_from_state(state: &ast::Object, noun_name: &str, depth: usize)
         participates_in.iter()
             .flat_map(|fts| {
                 role_facts.iter()
-                    .filter(|r| b(r, "graphSchema") == fts.id && b(r, "nounName") != noun_name)
+                    .filter(|r| b(r, "factType") == fts.id && b(r, "nounName") != noun_name)
                     .filter(|r| seen_related.insert(b(r, "nounName")))
                     .map(|r| RelatedNoun {
                         name: b(r, "nounName"),
@@ -898,7 +898,7 @@ mod tests {
                     from: "Investigating".to_string(), to: "Resolved".to_string(),
                     event: "resolve".to_string(),
                     guard: Some(GuardDef {
-                        graph_schema_id: "ft_resp".to_string(),
+                        fact_type_id: "ft_resp".to_string(),
                         constraint_ids: vec!["guard1".to_string()],
                     }),
                 },

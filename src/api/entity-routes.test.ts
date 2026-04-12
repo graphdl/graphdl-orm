@@ -128,16 +128,16 @@ describe('entity-routes', () => {
   // ── populateDepthForEntity ──────────────────────────────────────────
 
   it('populateDepthForEntity resolves Id fields at depth=1', async () => {
-    const entity = { id: 'n1', type: 'Noun', data: { name: 'Customer', graphSchemaId: 'gs1' } }
+    const entity = { id: 'n1', type: 'Noun', data: { name: 'Customer', factTypeId: 'gs1' } }
     const refStub = {
-      get: vi.fn().mockResolvedValue({ id: 'gs1', type: 'GraphSchema', data: { name: 'Tickets' } }),
+      get: vi.fn().mockResolvedValue({ id: 'gs1', type: 'FactType', data: { name: 'Tickets' } }),
     }
     const getStub = vi.fn().mockReturnValue(refStub)
 
     const populated = await populateDepthForEntity(entity, 1, getStub)
 
-    expect(populated.graphSchemaId).toBe('gs1')
-    expect(populated.graphSchema).toEqual({ id: 'gs1', name: 'Tickets' })
+    expect(populated.factTypeId).toBe('gs1')
+    expect(populated.factType).toEqual({ id: 'gs1', name: 'Tickets' })
     expect(getStub).toHaveBeenCalledWith('gs1')
   })
 
@@ -152,7 +152,7 @@ describe('entity-routes', () => {
   })
 
   it('populateDepthForEntity leaves ID as-is when reference unreachable', async () => {
-    const entity = { id: 'n1', type: 'Noun', data: { name: 'Customer', graphSchemaId: 'gs-gone' } }
+    const entity = { id: 'n1', type: 'Noun', data: { name: 'Customer', factTypeId: 'gs-gone' } }
     const refStub = {
       get: vi.fn().mockRejectedValue(new Error('DO unreachable')),
     }
@@ -160,18 +160,18 @@ describe('entity-routes', () => {
 
     const populated = await populateDepthForEntity(entity, 1, getStub)
 
-    expect(populated.graphSchemaId).toBe('gs-gone')
-    expect(populated.graphSchema).toBeUndefined()
+    expect(populated.factTypeId).toBe('gs-gone')
+    expect(populated.factType).toBeUndefined()
   })
 
   it('populateDepthForEntity returns data as-is at depth=0', async () => {
-    const entity = { id: 'n1', type: 'Noun', data: { name: 'Customer', graphSchemaId: 'gs1' } }
+    const entity = { id: 'n1', type: 'Noun', data: { name: 'Customer', factTypeId: 'gs1' } }
     const getStub = vi.fn()
 
     const populated = await populateDepthForEntity(entity, 0, getStub)
 
-    expect(populated).toEqual({ name: 'Customer', graphSchemaId: 'gs1' })
-    expect(populated.graphSchema).toBeUndefined()
+    expect(populated).toEqual({ name: 'Customer', factTypeId: 'gs1' })
+    expect(populated.factType).toBeUndefined()
     expect(getStub).not.toHaveBeenCalled()
   })
 
@@ -186,14 +186,14 @@ describe('entity-routes', () => {
   })
 
   it('populateDepthForEntity handles ref returning null (removed cell)', async () => {
-    const entity = { id: 'n1', type: 'Noun', data: { name: 'Customer', graphSchemaId: 'gs-removed' } }
+    const entity = { id: 'n1', type: 'Noun', data: { name: 'Customer', factTypeId: 'gs-removed' } }
     const refStub = { get: vi.fn().mockResolvedValue(null) }
     const getStub = vi.fn().mockReturnValue(refStub)
 
     const populated = await populateDepthForEntity(entity, 1, getStub)
 
-    expect(populated.graphSchemaId).toBe('gs-removed')
-    expect(populated.graphSchema).toBeUndefined()
+    expect(populated.factTypeId).toBe('gs-removed')
+    expect(populated.factType).toBeUndefined()
   })
 
   // ── handleListEntities with depth ───────────────────────────────────
@@ -201,10 +201,10 @@ describe('entity-routes', () => {
   it('handleListEntities populates depth=1 references in docs', async () => {
     const registry = { getEntityIds: vi.fn().mockResolvedValue(['n1']) }
     const nounStub = {
-      get: vi.fn().mockResolvedValue({ id: 'n1', type: 'Noun', data: { name: 'Customer', graphSchemaId: 'gs1' } }),
+      get: vi.fn().mockResolvedValue({ id: 'n1', type: 'Noun', data: { name: 'Customer', factTypeId: 'gs1' } }),
     }
     const schemaStub = {
-      get: vi.fn().mockResolvedValue({ id: 'gs1', type: 'GraphSchema', data: { name: 'Tickets' } }),
+      get: vi.fn().mockResolvedValue({ id: 'gs1', type: 'FactType', data: { name: 'Tickets' } }),
     }
     const stubs = new Map<string, any>([
       ['n1', nounStub],
@@ -213,16 +213,16 @@ describe('entity-routes', () => {
 
     const result = await handleListEntities('Noun', 'tickets', registry, (id) => stubs.get(id)!, { depth: 1 })
 
-    expect(result.docs[0].data.graphSchema).toEqual({ id: 'gs1', name: 'Tickets' })
-    expect(result.docs[0].data.graphSchemaId).toBe('gs1')
+    expect(result.docs[0].data.factType).toEqual({ id: 'gs1', name: 'Tickets' })
+    expect(result.docs[0].data.factTypeId).toBe('gs1')
   })
 
   it('handleGetEntity populates depth=1 references', async () => {
     const nounStub = {
-      get: vi.fn().mockResolvedValue({ id: 'n1', type: 'Noun', data: { name: 'Customer', graphSchemaId: 'gs1' } }),
+      get: vi.fn().mockResolvedValue({ id: 'n1', type: 'Noun', data: { name: 'Customer', factTypeId: 'gs1' } }),
     }
     const schemaStub = {
-      get: vi.fn().mockResolvedValue({ id: 'gs1', type: 'GraphSchema', data: { name: 'Tickets' } }),
+      get: vi.fn().mockResolvedValue({ id: 'gs1', type: 'FactType', data: { name: 'Tickets' } }),
     }
     const stubs = new Map<string, any>([
       ['gs1', schemaStub],
@@ -230,7 +230,7 @@ describe('entity-routes', () => {
 
     const result = await handleGetEntity(nounStub, { depth: 1, getStub: (id) => stubs.get(id)! })
 
-    expect(result!.data.graphSchema).toEqual({ id: 'gs1', name: 'Tickets' })
+    expect(result!.data.factType).toEqual({ id: 'gs1', name: 'Tickets' })
   })
 
 })

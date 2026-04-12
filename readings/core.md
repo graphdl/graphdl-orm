@@ -1,4 +1,4 @@
-# GraphDL Core Metamodel
+# AREST Core Metamodel
 
 ## Description
 
@@ -8,9 +8,9 @@ Extracted from NORMA ORM2 model (design/html/).
 
 Function(.id) is an entity type.
 Noun is a subtype of Function.
-  Graph Schema is a subtype of Noun.
+  Fact Type is a subtype of Noun.
   Status is a subtype of Noun.
-  {Graph Schema, Status} are mutually exclusive subtypes of Noun.
+  {Fact Type, Status} are mutually exclusive subtypes of Noun.
 
 Reading(.id) is an entity type.
 
@@ -36,7 +36,7 @@ Modality Type is a value type.
 World Assumption is a value type.
   The possible values of World Assumption are 'closed', 'open'.
 
-This association with Graph Schema, Verb provides the preferred identification scheme for API.
+This association with Fact Type, Verb provides the preferred identification scheme for API.
 
 
 Language(.code) is an entity type.
@@ -151,23 +151,23 @@ Role is used in Reading.
   Each Role is used in some Reading.
   For each Reading, some Role is used in that Reading.
 
-### Graph Schema (subtype of Noun)
-Graph Schema has Title.
-  Each Graph Schema has at most one Title.
-Graph Schema has Reading.
-  Each Graph Schema has some Reading.
-  For each Reading, exactly one Graph Schema has that Reading.
-  It is possible that some Graph Schema has more than one Reading.
-Graph Schema has Role.
-  Each Graph Schema has some Role.
-  For each Role, exactly one Graph Schema has that Role.
-  It is possible that some Graph Schema has more than one Role.
-Graph Schema has Arity.
-Graph Schema has Order.
-  Each Graph Schema has at most one Order.
-Graph Schema has Role Relationship.
-  Each Graph Schema has at most one Role Relationship.
-Graph Schema is derived.
+### Fact Type (subtype of Noun)
+Fact Type has Title.
+  Each Fact Type has at most one Title.
+Fact Type has Reading.
+  Each Fact Type has some Reading.
+  For each Reading, exactly one Fact Type has that Reading.
+  It is possible that some Fact Type has more than one Reading.
+Fact Type has Role.
+  Each Fact Type has some Role.
+  For each Role, exactly one Fact Type has that Role.
+  It is possible that some Fact Type has more than one Role.
+Fact Type has Arity.
+Fact Type has Order.
+  Each Fact Type has at most one Order.
+Fact Type has Role Relationship.
+  Each Fact Type has at most one Role Relationship.
+Fact Type is derived.
 
 ### Role
 Constraint spans Role.
@@ -180,8 +180,8 @@ Role has Position for Reading.
 Verb has Name.
   Each Verb has exactly one Name.
   It is possible that more than one Verb has the same Name.
-Graph Schema is activated by Verb.
-  In each population of Graph Schema is activated by Verb, each Graph Schema, Verb combination occurs at most once.
+Fact Type is activated by Verb.
+  In each population of Fact Type is activated by Verb, each Fact Type, Verb combination occurs at most once.
 Graph is referenced by Verb.
   It is possible that some Verb references more than one Graph.
   It is possible that more than one Verb references the same Graph.
@@ -240,7 +240,7 @@ Stream has Name.
   Each Stream has exactly one Name.
   It is possible that more than one Stream has the same Name.
 
-### API (objectification of "Graph Schema is activated by Verb")
+### API (objectification of "Fact Type is activated by Verb")
 API accepts Noun as parameter.
   Each API, Noun combination occurs at most once in the population of API accepts Noun as parameter.
 
@@ -259,12 +259,12 @@ For each Status, some Transition is from that Status or some Transition is to th
 
 ## Subset Constraints
 
-If some Role is used in some Reading where some Graph Schema has that Reading then that Graph Schema has that Role.
-If some Graph uses some Resource for some Role then that Graph is of some Graph Schema that has that Role.
+If some Role is used in some Reading where some Fact Type has that Reading then that Fact Type has that Role.
+If some Graph uses some Resource for some Role then that Graph is of some Fact Type that has that Role.
 If some Graph uses some Resource for some Role then that Resource is instance of some Noun that plays that Role.
-If some Graph Schema defines some Graph then some Resource that is that Graph is instance of some Noun that is that Graph Schema.
-If some Verb references some Graph that is of some Graph Schema then that Verb uses some Reading where that Graph Schema has that Reading.
-If some Guard Run is for some Guard and that Guard Run references some Graph then that Guard references some Graph Schema that defines that Graph.
+If some Fact Type defines some Graph then some Resource that is that Graph is instance of some Noun that is that Fact Type.
+If some Verb references some Graph that is of some Fact Type then that Verb uses some Reading where that Fact Type has that Reading.
+If some Guard Run is for some Guard and that Guard Run references some Graph then that Guard references some Fact Type that defines that Graph.
 If some State Machine is currently in some Status then that Status is defined in some State Machine Definition where that State Machine is instance of that State Machine Definition.
 If some API accepts some Noun as parameter and some other Noun is subtype of that Noun then that API accepts that subtype Noun as parameter.
 
@@ -298,16 +298,16 @@ Domain connects to External System with Secret Reference.
 Derivation Rule(.id) is an entity type.
 Derivation Rule has Text.
   Each Derivation Rule has exactly one Text.
-Derivation Rule has antecedent Graph Schema.
-Derivation Rule produces Graph Schema.
-  Each Derivation Rule produces exactly one Graph Schema.
+Derivation Rule has antecedent Fact Type.
+Derivation Rule produces Fact Type.
+  Each Derivation Rule produces exactly one Fact Type.
 Derivation Rule depends on Derivation Rule
-  := Derivation Rule has antecedent Graph Schema
-     and some other Derivation Rule produces that Graph Schema.
+  := Derivation Rule has antecedent Fact Type
+     and some other Derivation Rule produces that Fact Type.
 
 ## Derivation Rules
 
-Graph Schema has Arity := count of Role where Graph Schema has Role.
+Fact Type has Arity := count of Role where Fact Type has Role.
 
 Constraint is semantic iff Constraint has modality of Modality Type 'Deontic' and Constraint spans some Role and that Role is played by some Noun and no Resource is instance of that Noun.
 

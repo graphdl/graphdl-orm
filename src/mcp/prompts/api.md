@@ -50,28 +50,28 @@ The MCP server exposes the engine as tools for AI agents.
 
 | Tool | Description |
 |------|-------------|
-| `graphdl_create` | Create entity (resolve -> derive -> validate -> emit) |
-| `graphdl_list` | List entities of a noun type |
-| `graphdl_get` | Get entity by ID |
-| `graphdl_transition` | Fire SM transition |
-| `graphdl_compile` | Self-modification: ingest FORML2 readings |
-| `graphdl_evaluate` | Run constraint evaluation |
-| `graphdl_schema` | Get domain schema |
-| `graphdl_apply` | Generic command dispatch |
-| `graphdl_audit_log` | Read audit trail |
-| `graphdl_verify_signature` | Verify HMAC-SHA256 signature |
+| `arest_create` | Create entity (resolve -> derive -> validate -> emit) |
+| `arest_list` | List entities of a noun type |
+| `arest_get` | Get entity by ID |
+| `arest_transition` | Fire SM transition |
+| `arest_compile` | Self-modification: ingest FORML2 readings |
+| `arest_evaluate` | Run constraint evaluation |
+| `arest_schema` | Get domain schema |
+| `arest_apply` | Generic command dispatch |
+| `arest_audit_log` | Read audit trail |
+| `arest_verify_signature` | Verify HMAC-SHA256 signature |
 
 ### Configuration
 
 ```json
 {
   "mcpServers": {
-    "graphdl": {
+    "arest": {
       "command": "npx",
-      "args": ["-y", "graphdl-orm", "mcp"],
+      "args": ["-y", "arest", "mcp"],
       "env": {
-        "GRAPHDL_MODE": "local",
-        "GRAPHDL_READINGS_DIR": "/path/to/readings"
+        "AREST_MODE": "local",
+        "AREST_READINGS_DIR": "/path/to/readings"
       }
     }
   }
@@ -80,7 +80,7 @@ The MCP server exposes the engine as tools for AI agents.
 
 ## HTTP API (remote mode)
 
-Base URL: set via `GRAPHDL_URL` env var.
+Base URL: set via `AREST_URL` env var.
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|

@@ -2,7 +2,7 @@
 
 ## Description
 
-How the metamodel modifies itself. A Domain Change proposes new metamodel entities (readings, nouns, constraints). The proposed changes are validated via CSDP before being applied. This domain is self-referential: it describes how new readings get added to GraphDL using GraphDL's own primitives.
+How the metamodel modifies itself. A Domain Change proposes new metamodel entities (readings, nouns, constraints). The proposed changes are validated via CSDP before being applied. This domain is self-referential: it describes how new readings get added to AREST using AREST's own primitives.
 
 The Curry-Howard correspondence applies: proposing a new fact type is proposing a theorem. CSDP validation is the proof check. Successful ingestion is the proof. The system can only evolve by proving something new.
 
@@ -27,7 +27,7 @@ Signal Source is a value type.
 Domain Change proposes Reading.
 Domain Change proposes Noun.
 Domain Change proposes Constraint.
-Domain Change proposes Graph Schema.
+Domain Change proposes Fact Type.
 Domain Change proposes Status.
 Domain Change proposes Transition.
 Domain Change proposes Event Type.
@@ -51,7 +51,7 @@ Signal has Signal Source.
 Model Element is a supertype of Reading.
 Model Element is a supertype of Noun.
 Model Element is a supertype of Constraint.
-Model Element is a supertype of Graph Schema.
+Model Element is a supertype of Fact Type.
 Model Element is a supertype of Status.
 Model Element is a supertype of Transition.
 Model Element is a supertype of Event Type.

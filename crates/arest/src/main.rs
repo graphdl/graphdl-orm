@@ -174,7 +174,7 @@ fn system(key: &str, input: &str, d: &ast::Object) -> (String, ast::Object) {
     let obj = ast::Object::parse(input);
     let result = ast::apply(&ast::Func::Def(key.to_string()), &obj, d);
 
-    // State transition: if result contains cells (Noun, GraphSchema, etc.)
+    // State transition: if result contains cells (Noun, FactType, etc.)
     // it's a new D. Otherwise it's a display-only output.
     let is_new_d = result.as_seq().is_some()
         && ast::fetch("Noun", &result) != ast::Object::Bottom;

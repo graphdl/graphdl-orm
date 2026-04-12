@@ -1,6 +1,6 @@
-# graphdl-orm Developer Docs
+# arest Developer Docs
 
-Self-contained reference for building on graphdl-orm. Does not require reading the [whitepaper](../AREST.tex).
+Self-contained reference for building on arest. Does not require reading the [whitepaper](../AREST.tex).
 
 Read in order if you are new. Jump around if you are looking something up.
 

@@ -3,7 +3,7 @@
  * Post-build sanitizer for the wasm-pack-generated arest_bg.wasm.d.ts.
  *
  * wasm-pack emits the WIT component exports with identifiers like
- *   `cabi_post_graphdl:arest/engine@0.1.0#parse-and-compile`
+ *   `cabi_post_arest:engine/engine@0.1.0#parse-and-compile`
  * which are not valid TypeScript. Those raw exports are internal to the
  * WASM module and not consumed from TypeScript — we only need the high-
  * level API (create, system, release, parse_and_compile, etc.).
@@ -27,7 +27,7 @@ if (!existsSync(dtsPath)) {
 const src = readFileSync(dtsPath, 'utf-8')
 // Drop any export line whose declaration head (before the last `:`) contains
 // WIT-invalid punctuation. WIT component names embed `#`, `@` and `/`
-// (e.g. `cabi_post_graphdl:arest/engine@0.1.0#system`) which break tsc.
+// (e.g. `cabi_post_arest:engine/engine@0.1.0#system`) which break tsc.
 const cleaned = src.split('\n').filter(line => {
   const trimmed = line.trim()
   if (!trimmed.startsWith('export const ')) return true

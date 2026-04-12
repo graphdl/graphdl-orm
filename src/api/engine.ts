@@ -121,7 +121,7 @@ export async function buildPopulation(
 ): Promise<string> {
   const counts = await registry.getEntityCounts(domainSlug) as Array<{ nounType: string; count: number }>
   const facts: Record<string, Array<{ factTypeId: string; bindings: Array<[string, string]> }>> = {}
-  const schemaTypes = new Set(['Noun', 'Reading', 'Graph Schema', 'Role', 'Constraint', 'CompiledSchema', 'Derivation Rule', 'State Machine Definition', 'Status', 'Transition', 'External System', 'Instance Fact'])
+  const schemaTypes = new Set(['Noun', 'Reading', 'Fact Type', 'Role', 'Constraint', 'CompiledSchema', 'Derivation Rule', 'State Machine Definition', 'Status', 'Transition', 'External System', 'Instance Fact'])
   const entitySettled = await Promise.allSettled(
     counts.filter(({ nounType }) => !schemaTypes.has(nounType)).flatMap(({ nounType }) =>
       registry.getEntityIds(nounType, domainSlug).then((ids: string[]) =>

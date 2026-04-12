@@ -125,7 +125,7 @@ pub(crate) struct NounIndex {
 }
 
 /// A compiled graph schema -- a Construction of Selector functions (roles).
-/// Graph Schema = CONS(Role1, ..., Rolen) in Backus's FP algebra.
+/// Fact Type = CONS(Role1, ..., Rolen) in Backus's FP algebra.
 /// Partial application = query. Full application = fact.
 pub(crate) struct CompiledSchema {
     pub(crate) id: String,
@@ -148,7 +148,7 @@ pub(crate) struct CompiledModel {
     pub(crate) schemas: HashMap<String, CompiledSchema>,
     /// Fact-to-event mapping: when a fact of this type is created, fire this event
     /// on the state machine for the target noun. Derived from:
-    ///   Graph Schema is activated by Verb + Verb is performed during Transition.
+    ///   Fact Type is activated by Verb + Verb is performed during Transition.
     pub(crate) fact_events: HashMap<String, FactEvent>,
 }
 
@@ -165,7 +165,7 @@ pub(crate) struct FactEvent {
 
 // -- Schema Compilation -------------------------------------------
 // Compile fact types to Construction functions (CONS of Roles).
-// Role -> Selector. Graph Schema -> Construction [Selector1, ..., Selectorn].
+// Role -> Selector. Fact Type -> Construction [Selector1, ..., Selectorn].
 
 /// Compile all fact types in the IR to CompiledSchema (Construction of Selectors).
 fn compile_schemas(ir: &Domain) -> HashMap<String, CompiledSchema> {
@@ -1177,15 +1177,15 @@ pub fn state_to_domain(state: &crate::ast::Object) -> Domain {
         binding(f, "enumValues").map(|v| domain.enum_values.insert(name.clone(), v.split(',').map(|s| s.to_string()).collect()));
     });
 
-    // α(schema_fact → fact_type) : GraphSchema cell
+    // α(schema_fact → fact_type) : FactType cell
     let role_cell = fetch_or_phi("Role", state);
-    domain.fact_types = fetch_or_phi("GraphSchema", state).as_seq()
+    domain.fact_types = fetch_or_phi("FactType", state).as_seq()
         .map(|facts| facts.iter().filter_map(|f| {
             let id = binding(f, "id")?.to_string();
             let reading = binding(f, "reading").unwrap_or("").to_string();
             let roles: Vec<RoleDef> = role_cell.as_seq()
                 .map(|rs| rs.iter()
-                    .filter(|r| binding(r, "graphSchema") == Some(&id))
+                    .filter(|r| binding(r, "factType") == Some(&id))
                     .map(|r| RoleDef {
                         noun_name: binding(r, "nounName").unwrap_or("").to_string(),
                         role_index: binding(r, "position").and_then(|v| v.parse().ok()).unwrap_or(0),

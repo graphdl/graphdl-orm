@@ -1,6 +1,6 @@
-# graphdl-tutor — the interactive tour
+# arest-tutor — the interactive tour
 
-A hands-on walk through GraphDL. Three tracks, built in the vimtutor spirit: **teach by doing**. You read one lesson, run the embedded blocks, and the tutor flips a ✗ to ✓ when the check passes. Then you move on.
+A hands-on walk through AREST. Three tracks, built in the vimtutor spirit: **teach by doing**. You read one lesson, run the embedded blocks, and the tutor flips a ✗ to ✓ when the check passes. Then you move on.
 
 Every lesson is a single markdown file. You can read them directly, but the intended experience is through the `tutor` MCP tool, which runs the blocks and grades the checks for you.
 

@@ -1,4 +1,4 @@
-﻿# GraphDL Domain Modeling & API
+﻿# AREST Domain Modeling & API
 
 ### Step 1: Check existing verbalizations and business rules
 Before writing any code, ask: "Is this already modeled?" Read the domain's verbalizations. The answer to the user's question may already exist as a fact type, constraint, or derivable from existing facts.
@@ -12,4 +12,4 @@ Ask modeling questions, not implementation questions:
 - YES: "Is 'archived' a state in a lifecycle, or a permanent classification?"
 - NO: "What should the field name be?"
 - NO: "Should this be middleware or a hook?"
-- NO: "Should I add this column to the database?"
+- NO: "Should I add this column to the database?"

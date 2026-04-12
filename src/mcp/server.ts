@@ -1,33 +1,33 @@
 /**
- * GraphDL MCP Server — stdio transport.
+ * AREST MCP Server — stdio transport.
  *
  * Exposes the AREST engine as MCP tools so an AI agent (Claude Desktop,
  * Claude Code, etc.) can list/create/query entities, compile readings,
  * inspect audit trails, and verify identity signatures.
  *
  * Two modes (selected by env):
- *   GRAPHDL_MODE=local     — load readings from $GRAPHDL_READINGS_DIR via
+ *   AREST_MODE=local     — load readings from $AREST_READINGS_DIR via
  *                            the bundled WASM engine. No network. Default
- *                            when GRAPHDL_URL is unset or empty.
- *   GRAPHDL_MODE=remote    — call a deployed Cloudflare Worker at
- *                            $GRAPHDL_URL using $GRAPHDL_API_KEY.
+ *                            when AREST_URL is unset or empty.
+ *   AREST_MODE=remote    — call a deployed Cloudflare Worker at
+ *                            $AREST_URL using $AREST_API_KEY.
  *
  * Usage from a plugin config (Claude Desktop / Claude Code):
  *   {
  *     "mcpServers": {
- *       "graphdl": {
+ *       "arest": {
  *         "command": "npx",
- *         "args": ["-y", "graphdl-orm", "mcp"],
+ *         "args": ["-y", "arest", "mcp"],
  *         "env": {
- *           "GRAPHDL_MODE": "local",
- *           "GRAPHDL_READINGS_DIR": "/absolute/path/to/readings"
+ *           "AREST_MODE": "local",
+ *           "AREST_READINGS_DIR": "/absolute/path/to/readings"
  *         }
  *       }
  *     }
  *   }
  *
  * Or call directly:
- *   GRAPHDL_MODE=local GRAPHDL_READINGS_DIR=./readings npx tsx src/mcp/server.ts
+ *   AREST_MODE=local AREST_READINGS_DIR=./readings npx tsx src/mcp/server.ts
  */
 
 /// <reference types="node" />
@@ -42,11 +42,11 @@ const __dirname = dirname(fileURLToPath(import.meta.url))
 
 // ── Mode selection ──────────────────────────────────────────────────
 
-const GRAPHDL_URL = process.env.GRAPHDL_URL || ''
-const GRAPHDL_API_KEY = process.env.GRAPHDL_API_KEY || ''
-const GRAPHDL_READINGS_DIR = process.env.GRAPHDL_READINGS_DIR || ''
-const GRAPHDL_MODE = (process.env.GRAPHDL_MODE || (GRAPHDL_URL ? 'remote' : 'local')).toLowerCase()
-const GRAPHDL_DEBUG = process.env.GRAPHDL_DEBUG === '1'
+const AREST_URL = process.env.AREST_URL || ''
+const AREST_API_KEY = process.env.AREST_API_KEY || ''
+const AREST_READINGS_DIR = process.env.AREST_READINGS_DIR || ''
+const AREST_MODE = (process.env.AREST_MODE || (AREST_URL ? 'remote' : 'local')).toLowerCase()
+const AREST_DEBUG = process.env.AREST_DEBUG === '1'
 
 // ── Local mode: bundled WASM engine via engine.ts ───────────────────
 // Lazily imported so remote-mode users don't pay the WASM cost.
@@ -63,7 +63,7 @@ async function getLocalEngine() {
 async function getLocalHandle(): Promise<number> {
   if (_localHandle >= 0) return _localHandle
   const engine = await getLocalEngine()
-  const readings = loadReadingsFromDir(GRAPHDL_READINGS_DIR)
+  const readings = loadReadingsFromDir(AREST_READINGS_DIR)
   _localHandle = engine.compileDomainReadings(...readings)
   return _localHandle
 }
@@ -79,13 +79,13 @@ function loadReadingsFromDir(dir: string): string[] {
 // ── Remote mode: HTTP fetch ─────────────────────────────────────────
 
 async function httpRequest(path: string, options?: RequestInit): Promise<any> {
-  const url = `${GRAPHDL_URL}${path}`
+  const url = `${AREST_URL}${path}`
   const headers: Record<string, string> = {
     'Accept': 'application/json',
     'Content-Type': 'application/json',
   }
-  if (GRAPHDL_API_KEY) {
-    headers['Authorization'] = `Bearer ${GRAPHDL_API_KEY}`
+  if (AREST_API_KEY) {
+    headers['Authorization'] = `Bearer ${AREST_API_KEY}`
   }
   const res = await fetch(url, { ...options, headers: { ...headers, ...options?.headers } })
   if (!res.ok) {
@@ -102,7 +102,7 @@ function textResult(data: any) {
 // ── Command dispatch (dual mode) ────────────────────────────────────
 
 async function dispatchCommand(command: any): Promise<any> {
-  if (GRAPHDL_MODE === 'local') {
+  if (AREST_MODE === 'local') {
     const engine = await getLocalEngine()
     const handle = await getLocalHandle()
     const raw = engine.system(handle, 'apply', JSON.stringify(command))
@@ -116,7 +116,7 @@ async function dispatchCommand(command: any): Promise<any> {
 }
 
 async function dispatchRead(path: string): Promise<any> {
-  if (GRAPHDL_MODE === 'local') {
+  if (AREST_MODE === 'local') {
     const engine = await getLocalEngine()
     const handle = await getLocalHandle()
     const raw = engine.system(handle, 'debug', '')
@@ -228,7 +228,7 @@ async function federatedFetch(config: FederationConfig, entityId?: string): Prom
 
 /** Check if a noun has a populate def and return its config. */
 async function getFederationConfig(noun: string): Promise<FederationConfig | null> {
-  if (GRAPHDL_MODE !== 'local') return null
+  if (AREST_MODE !== 'local') return null
   try {
     const raw = await systemCall(`populate:${noun}`, '')
     // ⊥ may surface as FFP glyphs or JSON "null" depending on encoding path.
@@ -244,7 +244,7 @@ async function getFederationConfig(noun: string): Promise<FederationConfig | nul
 }
 
 const server = new McpServer({
-  name: 'graphdl',
+  name: 'arest',
   version: '0.2.0',
 })
 
@@ -270,7 +270,7 @@ const server = new McpServer({
 //   synthesize — facts → derive → verbalize → prose
 //   validate  — text → extract facts → verify
 //
-// All framework primitives (Noun, Graph Schema / Fact Type, Constraint,
+// All framework primitives (Noun, Fact Type / Fact Type, Constraint,
 // Derivation Rule, State Machine Definition, Status, Transition, Event
 // Type, Instance Fact, Verb, Reading, External System, Agent Definition,
 // Generator opt-in) are reachable via these verbs. Runtime functions
@@ -300,7 +300,7 @@ server.registerTool(
     }
 
     // Local population
-    if (GRAPHDL_MODE === 'local') {
+    if (AREST_MODE === 'local') {
       if (id) {
         const raw = await systemCall(`get:${noun}`, id)
         try { return textResult(JSON.parse(raw)) } catch { return textResult({ raw }) }
@@ -328,7 +328,7 @@ server.registerTool(
     },
   },
   async ({ fact_type, filter }) => {
-    if (GRAPHDL_MODE === 'local') {
+    if (AREST_MODE === 'local') {
       const filterStr = filter ? JSON.stringify(filter) : ''
       const raw = await systemCall(`query:${fact_type}`, filterStr)
       try {
@@ -364,7 +364,7 @@ server.registerTool(
     },
   },
   async ({ operation, noun, id, fields, event, sender, signature }) => {
-    if (GRAPHDL_MODE === 'local') {
+    if (AREST_MODE === 'local') {
       switch (operation) {
         case 'create': {
           const pairs = Object.entries(fields || {}).map(([k, v]) => `<${k}, ${v}>`).join(', ')
@@ -408,7 +408,7 @@ server.registerTool(
     },
   },
   async ({ noun, id, status }) => {
-    if (GRAPHDL_MODE === 'local') {
+    if (AREST_MODE === 'local') {
       const parseOr = <T>(raw: string, fallback: T): T | any => {
         try { const v = JSON.parse(raw); return v ?? fallback } catch { return fallback }
       }
@@ -451,7 +451,7 @@ server.registerTool(
     },
   },
   async ({ id, noun, fact }) => {
-    if (GRAPHDL_MODE === 'local') {
+    if (AREST_MODE === 'local') {
       // Audit trail for this entity
       const auditRaw = await systemCall('audit', '0')
       let audit: any[] = []
@@ -492,7 +492,7 @@ server.registerTool(
     },
   },
   async ({ readings }) => {
-    if (GRAPHDL_MODE === 'local') {
+    if (AREST_MODE === 'local') {
       const raw = await systemCall('compile', readings)
       const ok = !raw.startsWith('⊥')
       let result: any = raw
@@ -515,7 +515,7 @@ server.registerTool(
     description: 'Get the full schema: nouns, fact types, constraints, state machines, derivation rules.',
   },
   async () => {
-    if (GRAPHDL_MODE === 'local') {
+    if (AREST_MODE === 'local') {
       const data = await dispatchRead('/schema')
       return textResult(data)
     }
@@ -537,7 +537,7 @@ server.registerTool(
     },
   },
   async ({ sender, payload, signature }) => {
-    if (GRAPHDL_MODE === 'local') {
+    if (AREST_MODE === 'local') {
       const encoded = `<${sender},${payload},${signature}>`
       const raw = await systemCall('verify_signature', encoded)
       return textResult({ valid: raw === 'true' })
@@ -573,7 +573,7 @@ server.registerTool(
     },
   },
   async ({ rationale, target_domain, readings, nouns, constraints, verbs }) => {
-    if (GRAPHDL_MODE !== 'local') return textResult({ error: 'propose requires local mode' })
+    if (AREST_MODE !== 'local') return textResult({ error: 'propose requires local mode' })
 
     // Generate a stable change ID from the rationale + time.
     const changeId = `dc-${Date.now().toString(36)}`
@@ -711,7 +711,7 @@ server.registerTool(
     },
   },
   async ({ question, noun, llm_response }) => {
-    if (GRAPHDL_MODE !== 'local') {
+    if (AREST_MODE !== 'local') {
       return textResult({ error: 'ask requires local mode' })
     }
     const schemaRaw = noun
@@ -783,7 +783,7 @@ server.registerTool(
     },
   },
   async ({ noun, id, llm_response }) => {
-    if (GRAPHDL_MODE !== 'local') {
+    if (AREST_MODE !== 'local') {
       return textResult({ error: 'synthesize requires local mode' })
     }
     const raw = id
@@ -826,7 +826,7 @@ server.registerTool(
     },
   },
   async ({ text, constraint, llm_response }) => {
-    if (GRAPHDL_MODE !== 'local') {
+    if (AREST_MODE !== 'local') {
       return textResult({ error: 'validate requires local mode' })
     }
     const constraintRaw = await systemCall(`constraint:${constraint}`, '').catch(() => '')
@@ -899,12 +899,12 @@ Only include facts clearly stated or strongly implied by the text. Do not invent
 
 // ── Debug (gated) ────────────────────────────────────────────────────
 
-if (GRAPHDL_DEBUG) {
+if (AREST_DEBUG) {
   server.registerTool(
     'debug',
-    { description: 'Dump full compiled state. Development only — GRAPHDL_DEBUG=1.' },
+    { description: 'Dump full compiled state. Development only — AREST_DEBUG=1.' },
     async () => {
-      if (GRAPHDL_MODE === 'local') {
+      if (AREST_MODE === 'local') {
         const raw = await systemCall('debug', '')
         try { return textResult(JSON.parse(raw)) } catch { return textResult({ raw }) }
       }
@@ -925,43 +925,43 @@ function loadPrompt(name: string): string {
 }
 
 server.registerPrompt(
-  'graphdl_overview',
-  { description: 'GraphDL system overview, constraint types, and FORML2 document structure' },
+  'arest_overview',
+  { description: 'AREST system overview, constraint types, and FORML2 document structure' },
   () => ({ messages: [{ role: 'user', content: { type: 'text', text: loadPrompt('overview') } }] }),
 )
 
 server.registerPrompt(
-  'graphdl_entity_modeling',
+  'arest_entity_modeling',
   { description: 'Entity/value types, reference schemes, normalization, arity, multiplicity, objectification' },
   () => ({ messages: [{ role: 'user', content: { type: 'text', text: loadPrompt('entity-modeling') } }] }),
 )
 
 server.registerPrompt(
-  'graphdl_advanced_constraints',
+  'arest_advanced_constraints',
   { description: 'Subtype partitions, subset constraints with autofill, ring constraints' },
   () => ({ messages: [{ role: 'user', content: { type: 'text', text: loadPrompt('advanced-constraints') } }] }),
 )
 
 server.registerPrompt(
-  'graphdl_derivation_deontic',
+  'arest_derivation_deontic',
   { description: 'Derivation rules, deontic vs alethic modality, obligatory/forbidden/permitted operators' },
   () => ({ messages: [{ role: 'user', content: { type: 'text', text: loadPrompt('derivation-deontic') } }] }),
 )
 
 server.registerPrompt(
-  'graphdl_verbalization',
+  'arest_verbalization',
   { description: 'Full ORM2 verbalization tables: UC, MC, DMaC, SSC, combined patterns from Halpin ORM2-02' },
   () => ({ messages: [{ role: 'user', content: { type: 'text', text: loadPrompt('verbalization') } }] }),
 )
 
 server.registerPrompt(
-  'graphdl_principles',
+  'arest_principles',
   { description: 'Design principles: facts all the way down, no bridge architecture, the paper is the spec' },
   () => ({ messages: [{ role: 'user', content: { type: 'text', text: loadPrompt('design-principles') } }] }),
 )
 
 server.registerPrompt(
-  'graphdl_api',
+  'arest_api',
   { description: 'AREST API reference: CLI keys, MCP tools, HTTP endpoints, identity/signing' },
   () => ({ messages: [{ role: 'user', content: { type: 'text', text: loadPrompt('api') } }] }),
 )
@@ -972,10 +972,10 @@ async function main() {
   const transport = new StdioServerTransport()
   await server.connect(transport)
   // eslint-disable-next-line no-console
-  console.error(`GraphDL MCP server started — mode=${GRAPHDL_MODE}${GRAPHDL_MODE === 'remote' ? ` url=${GRAPHDL_URL}` : ''}${GRAPHDL_DEBUG ? ' [DEBUG]' : ''}`)
+  console.error(`AREST MCP server started — mode=${AREST_MODE}${AREST_MODE === 'remote' ? ` url=${AREST_URL}` : ''}${AREST_DEBUG ? ' [DEBUG]' : ''}`)
 }
 
 main().catch((err) => {
-  console.error('GraphDL MCP server failed:', err)
+  console.error('AREST MCP server failed:', err)
   process.exit(1)
 })

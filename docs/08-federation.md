@@ -1,6 +1,6 @@
 # 08 · Federation
 
-Some facts are not yours. Customer records live in your CRM, payments live in Stripe, auth tokens live in an identity provider. Federation is how graphdl-orm treats those external systems as first-class fact sources without copying their data.
+Some facts are not yours. Customer records live in your CRM, payments live in Stripe, auth tokens live in an identity provider. Federation is how arest treats those external systems as first-class fact sources without copying their data.
 
 ## Declaring an external system
 

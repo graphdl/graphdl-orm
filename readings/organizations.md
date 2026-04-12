@@ -1,4 +1,4 @@
-# GraphDL Organizations — Access Control
+# AREST Organizations — Access Control
 
 ## Entity Types
 
