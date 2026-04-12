@@ -10,6 +10,15 @@
         "GRAPHDL_READINGS_DIR": "./readings"
       }
     },
+    "graphdl-tutor": {
+      "description": "GraphDL with the full graphdl-tutor domain bundle loaded (catalog, orders, tasks, content, scheduling, notifications). Use this to exercise every framework feature from Claude.",
+      "command": "npx",
+      "args": ["-y", "tsx", "src/mcp/server.ts"],
+      "env": {
+        "GRAPHDL_MODE": "local",
+        "GRAPHDL_READINGS_DIR": "../graphdl-tutor/domains"
+      }
+    },
     "graphdl-remote": {
       "description": "GraphDL AREST engine (remote worker mode). Requires GRAPHDL_URL and GRAPHDL_API_KEY set in your shell.",
       "command": "npx",

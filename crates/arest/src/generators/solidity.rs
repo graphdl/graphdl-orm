@@ -27,16 +27,32 @@ use crate::ast::{Object, binding, fetch_or_phi};
 use crate::rmap::{self, TableDef, TableColumn};
 use crate::types::{Domain, StateMachineDef};
 
-/// Compile a compiled AREST state into Solidity source code.
+/// Compile every entity noun in `state` into a Solidity contract.
 ///
 /// Reconstructs the domain from state, runs RMAP for typed storage,
 /// and emits one contract per entity with SM transitions and events.
+/// If you want to scope the output to a subset of nouns (for example,
+/// to exclude metamodel entities), use `compile_to_solidity_for_nouns`.
 pub fn compile_to_solidity(state: &Object) -> String {
+    compile_to_solidity_inner(state, None)
+}
+
+/// Compile only the given nouns into Solidity contracts. Use this when
+/// a user domain was parsed on top of a metamodel and you only want
+/// contracts for the user's own entities.
+pub fn compile_to_solidity_for_nouns(state: &Object, include: &[&str]) -> String {
+    let set: std::collections::HashSet<&str> = include.iter().copied().collect();
+    compile_to_solidity_inner(state, Some(set))
+}
+
+fn compile_to_solidity_inner(
+    state: &Object,
+    include: Option<std::collections::HashSet<&str>>,
+) -> String {
     let header = "// SPDX-License-Identifier: MIT\n\
                   // Generated from FORML2 readings by AREST\n\
                   pragma solidity ^0.8.20;\n\n";
 
-    // Reconstruct domain + RMAP tables for typed storage.
     let domain = crate::compile::state_to_domain(state);
     let tables = rmap::rmap(&domain);
     let table_by_name: std::collections::HashMap<String, &TableDef> = tables.iter()
@@ -48,10 +64,13 @@ pub fn compile_to_solidity(state: &Object) -> String {
             let name = binding(n, "name")?.to_string();
             let obj_type = binding(n, "objectType")?;
             if obj_type != "entity" { return None; }
+            if let Some(ref set) = include {
+                if !set.contains(name.as_str()) { return None; }
+            }
             let table_name = rmap::to_snake(&name);
             let table = table_by_name.get(&table_name).copied();
             let sm = domain.state_machines.get(&name);
-            Some(emit_contract(&name, table, sm, &domain))
+            Some(emit_contract(&name, table, sm, &domain, include.as_ref()))
         }).collect()
     }).unwrap_or_default();
 
@@ -59,10 +78,16 @@ pub fn compile_to_solidity(state: &Object) -> String {
 }
 
 /// Emit a full Solidity contract for an entity noun.
-fn emit_contract(name: &str, table: Option<&TableDef>, sm: Option<&StateMachineDef>, domain: &Domain) -> String {
+fn emit_contract(
+    name: &str,
+    table: Option<&TableDef>,
+    sm: Option<&StateMachineDef>,
+    domain: &Domain,
+    scope: Option<&std::collections::HashSet<&str>>,
+) -> String {
     let contract_name = sanitize_name(name);
     let struct_def = emit_struct(table);
-    let events = emit_events(name, domain);
+    let events = emit_events(name, domain, scope);
     let sm_parts = sm.map(emit_state_machine).unwrap_or_default();
     let create_fn = emit_create(name, table, sm);
     let transitions = sm.map(|s| emit_transitions(s)).unwrap_or_default();
@@ -108,12 +133,29 @@ fn solidity_type(col: &TableColumn) -> &'static str {
 
 /// Emit one event per fact type involving this entity noun.
 /// Implements the paper's "Facts as events" concept in Solidity.
-fn emit_events(noun_name: &str, domain: &Domain) -> String {
+///
+/// When `scope` is `Some(set)`, only emit events for fact types whose
+/// every role references a noun in `set` — this keeps metamodel
+/// cross-reference fact types (e.g. `GraphSchema has Order`) out of
+/// user-facing output. When `scope` is `None`, emit for every fact
+/// type involving this noun.
+fn emit_events(
+    noun_name: &str,
+    domain: &Domain,
+    scope: Option<&std::collections::HashSet<&str>>,
+) -> String {
     let events: Vec<String> = domain.fact_types.iter()
         .filter(|(_, ft)| ft.roles.iter().any(|r| r.noun_name == noun_name))
+        .filter(|(_, ft)| match scope {
+            Some(set) => ft.roles.iter().all(|r| set.contains(r.noun_name.as_str())),
+            None => {
+                let distinct: std::collections::HashSet<_> = ft.roles.iter()
+                    .map(|r| r.noun_name.as_str()).collect();
+                distinct.len() > 1 || ft.reading.contains(noun_name)
+            }
+        })
         .filter_map(|(ft_id, ft)| {
             let evt_name = sanitize_name(ft_id);
-            // Event args: first role is always indexed id, rest are params
             let args: Vec<String> = ft.roles.iter().enumerate().map(|(i, r)| {
                 let prefix = if i == 0 { "string indexed " } else { "string " };
                 format!("{}{}", prefix, sanitize_field(&r.noun_name))
@@ -134,7 +176,9 @@ fn emit_state_machine(sm: &StateMachineDef) -> String {
         format!("    // State Machine: {} statuses\n    // Statuses: {}\n",
             statuses.len(), statuses.join(", "))
     };
-    let modifier = "    modifier onlyInStatus(string memory id, bytes32 expected) {\n        require(records[id].status == expected, \"SM: wrong state\");\n        _;\n    }\n";
+    // Forge lint prefers modifier logic wrapped in an internal function
+    // to reduce code size when the modifier is applied to many funcs.
+    let modifier = "    modifier onlyInStatus(string memory id, bytes32 expected) {\n        _onlyInStatus(id, expected);\n        _;\n    }\n\n    function _onlyInStatus(string memory id, bytes32 expected) internal view {\n        require(records[id].status == expected, \"SM: wrong state\");\n    }\n";
     format!("\n{}{}", enum_def, modifier)
 }
 
@@ -151,10 +195,12 @@ fn emit_create(noun_name: &str, table: Option<&TableDef>, sm: Option<&StateMachi
         .map(|s| sanitize_field(s))
         .unwrap_or_else(|| "id".to_string());
 
-    // UC: PK must not already exist
+    // UC: PK must not already exist. Before create, records[id].{pk}
+    // is the empty string; after create it holds the id. Length 0
+    // means "slot is unused" for string primary keys.
     let uc_check = format!(
-        "        require(bytes(records[{}].status == bytes32(0) ? \"_\" : \"\").length == 1, \"UC: {} already exists\");",
-        pk, noun_name
+        "        require(bytes(records[{}].{}).length == 0, \"UC: {} already exists\");",
+        pk, pk, noun_name
     );
 
     // Assign struct fields

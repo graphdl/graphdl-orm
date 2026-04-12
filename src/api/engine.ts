@@ -6,11 +6,13 @@
  * All other operations: system(h, key, input) dispatches via ρ.
  */
 
-import { initSync, create, create_bare, release, system } from '../../crates/arest/pkg/arest.js'
-import wasmModule from '../../crates/arest/pkg/arest_bg.wasm'
+import { create, create_bare, release, system } from '../../crates/arest/pkg/arest.js'
 
-let _init = false
-function ensureWasm() { if (!_init) { initSync({ module: wasmModule }); _init = true } }
+// wasm-pack --target bundler auto-initializes the WASM when arest.js is
+// imported (via wasm.__wbindgen_start() inside the wrapper). No explicit
+// initSync call is needed here — ensureWasm is kept as a no-op so the
+// existing call sites don't need to change.
+function ensureWasm() { /* auto-init via bundler target */ }
 
 let _h = -1
 function h(handle?: number): number { return handle !== undefined && handle >= 0 ? handle : _h }

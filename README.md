@@ -187,6 +187,13 @@ The [whitepaper](AREST.pdf) proves five properties:
 
 Self-modification preserves all five (Corollary: Closure). Constraint consensus enables peer-to-peer validation without an external protocol (Corollary: Consensus).
 
+## Documentation
+
+- [Quick start](#hello-order) — the Order example above
+- [Developer docs](docs/) — 10 numbered files, self-contained reference covering the full feature surface
+- [Smart contracts](contracts/) — Foundry project that compiles, tests, and deploys the generated Solidity
+- [Whitepaper](AREST.pdf) — the five theorems and their proofs
+
 ## Status
 
 Pre-1.0. The verb set is frozen. Core primitives, compile pipeline, state machines, generators, federation, and the MCP bridge are implemented and tested (872 tests). Remaining before 1.0: a live testnet deploy of the Solidity generator, and exercising the MCP bridge against a live agent to confirm tool descriptions and sampling work end-to-end.

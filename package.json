@@ -10,7 +10,7 @@
   "scripts": {
     "mcp": "tsx src/mcp/server.ts",
     "import": "tsx src/cli/import.ts",
-    "build:wasm": "cd crates/arest && wasm-pack build --target web --out-dir pkg --features cloudflare && cd ../.. && node scripts/sanitize-wasm-dts.mjs",
+    "build:wasm": "cd crates/arest && wasm-pack build --target bundler --out-dir pkg --no-default-features --features cloudflare,debug-def && cd ../.. && node scripts/sanitize-wasm-dts.mjs",
     "build:wasm:test": "cd crates/arest && cargo test",
     "build": "yarn build:wasm",
     "dev": "wrangler dev",

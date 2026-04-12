@@ -20,7 +20,7 @@ path = "src/main.rs"
 [features]
 default = ["wit", "debug-def"]
 wit = ["dep:wit-bindgen"]
-cloudflare = ["dep:wasm-bindgen"]
+cloudflare = ["dep:wasm-bindgen", "dep:console_error_panic_hook"]
 local = ["dep:rusqlite"]
 parallel = ["dep:rayon"]
 # Gates the `debug` def which returns a full projection of the compiled
@@ -35,6 +35,7 @@ serde_json = "1"
 regex = "1"
 wit-bindgen = { version = "0.41", default-features = false, features = ["macros"], optional = true }
 wasm-bindgen = { version = "0.2", optional = true }
+console_error_panic_hook = { version = "0.1", optional = true }
 rusqlite = { version = "0.31", features = ["bundled"], optional = true }
 rayon = { version = "1", optional = true }
 hmac = "0.12"
