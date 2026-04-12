@@ -897,6 +897,200 @@ Only include facts clearly stated or strongly implied by the text. Do not invent
   },
 )
 
+// ── tutor: interactive three-track walkthrough ───────────────────────
+//
+// Loads a lesson from tutor/lessons/<track>/<NN>-*.md, returns its
+// narrative, and grades the embedded `~~~ expect` predicate against
+// the live D. Stateless: the caller passes `track` and `num`; the
+// response carries a `next` hint pointing at lesson num+1. The
+// grammar of expect predicates is documented in tutor/lessons/_format.md.
+
+const TUTOR_TRACKS = ['easy', 'medium', 'hard'] as const
+type TutorTrack = typeof TUTOR_TRACKS[number]
+
+function tutorLessonsDir(): string {
+  return resolve(__dirname, '..', '..', 'tutor', 'lessons')
+}
+
+function listTutorLessons(track: TutorTrack): Array<{ num: number; title: string; path: string }> {
+  const dir = resolve(tutorLessonsDir(), track)
+  if (!existsSync(dir)) return []
+  return readdirSync(dir)
+    .filter(f => f.endsWith('.md') && /^\d+/.test(f))
+    .sort()
+    .map(f => {
+      const num = parseInt(f.match(/^(\d+)/)![1], 10)
+      const body = readFileSync(join(dir, f), 'utf-8')
+      const titleLine = body.match(/^#\s+Lesson\s+\S+\s*:\s*(.+)$/m)?.[1]
+        ?? body.match(/^#\s+(.+)$/m)?.[1]
+        ?? f
+      return { num, title: titleLine.trim(), path: join(dir, f) }
+    })
+}
+
+function parseTutorLesson(content: string): { title: string; expect: string; nextLink: string } {
+  const title = (content.match(/^#\s+(.+)$/m)?.[1] ?? '').trim()
+  const expectFence = content.match(/~~~\s*expect\s*\n([\s\S]*?)\n~~~/)?.[1] ?? ''
+  const nextLink = (content.match(/\*\*Next:\*\*\s*(.+?)$/m)?.[1] ?? '').trim()
+  return { title, expect: expectFence.trim(), nextLink }
+}
+
+function matchesSubset(actual: any, expected: any): boolean {
+  if (expected === null || typeof expected !== 'object') return actual === expected
+  if (Array.isArray(expected)) {
+    return Array.isArray(actual)
+      && expected.length === actual.length
+      && expected.every((e, i) => matchesSubset(actual[i], e))
+  }
+  if (actual === null || typeof actual !== 'object') return false
+  return Object.keys(expected).every(k => matchesSubset(actual[k], expected[k]))
+}
+
+function cmpNum(actual: number, op: string, expected: number): boolean {
+  switch (op) {
+    case '==': return actual === expected
+    case '>=': return actual >= expected
+    case '<=': return actual <= expected
+    case '>':  return actual > expected
+    case '<':  return actual < expected
+    default:   return false
+  }
+}
+
+async function evalExpectPredicate(predicate: string): Promise<{ ok: boolean; detail: string }> {
+  const p = predicate.replace(/\\\s/g, ' ').trim()
+  if (!p) return { ok: false, detail: 'empty predicate' }
+  const parseJson = (s: string): any => JSON.parse(s.trim())
+  const safeJson = <T>(raw: string, fallback: T): T | any => {
+    try { const v = JSON.parse(raw); return v ?? fallback } catch { return fallback }
+  }
+
+  // list NOUN contains <json>
+  let m = p.match(/^list\s+([^\s{][^{]*?)\s+contains\s+(\{[\s\S]*\})$/)
+  if (m) {
+    const [, noun, jsonStr] = m
+    const raw = await systemCall(`list:${noun.trim()}`, '')
+    const list = safeJson(raw, [])
+    if (!Array.isArray(list)) return { ok: false, detail: `list:${noun.trim()} -> not an array` }
+    const expected = parseJson(jsonStr)
+    const ok = list.some((item: any) => matchesSubset(item, expected))
+    return { ok, detail: ok ? 'found' : `no match in ${list.length} entries` }
+  }
+
+  // list NOUN count OP N
+  m = p.match(/^list\s+(\S+(?:\s\S+)*?)\s+count\s+(==|>=|<=|>|<)\s+(\d+)$/)
+  if (m) {
+    const [, noun, op, nStr] = m
+    const raw = await systemCall(`list:${noun.trim()}`, '')
+    const list = safeJson(raw, [])
+    const len = Array.isArray(list) ? list.length : 0
+    const ok = cmpNum(len, op, parseInt(nStr, 10))
+    return { ok, detail: `count=${len} ${op} ${nStr}` }
+  }
+
+  // query FT contains <json>
+  m = p.match(/^query\s+(\S+)\s+contains\s+(\{[\s\S]*\})$/)
+  if (m) {
+    const [, ft, jsonStr] = m
+    const raw = await systemCall(`query:${ft}`, '')
+    const rows = safeJson(raw, [])
+    const expected = parseJson(jsonStr)
+    const ok = Array.isArray(rows) && rows.some((r: any) => matchesSubset(r, expected))
+    return { ok, detail: ok ? 'found' : `no match in ${Array.isArray(rows) ? rows.length : 0} facts` }
+  }
+
+  // query FT count OP N
+  m = p.match(/^query\s+(\S+)\s+count\s+(==|>=|<=|>|<)\s+(\d+)$/)
+  if (m) {
+    const [, ft, op, nStr] = m
+    const raw = await systemCall(`query:${ft}`, '')
+    const rows = safeJson(raw, [])
+    const len = Array.isArray(rows) ? rows.length : 0
+    const ok = cmpNum(len, op, parseInt(nStr, 10))
+    return { ok, detail: `count=${len} ${op} ${nStr}` }
+  }
+
+  // get NOUN ID equals <json>
+  m = p.match(/^get\s+(\S+(?:\s\S+)*?)\s+(\S+)\s+equals\s+(\{[\s\S]*\})$/)
+  if (m) {
+    const [, noun, id, jsonStr] = m
+    const raw = await systemCall(`get:${noun.trim()}`, id)
+    const entity = safeJson(raw, null)
+    const expected = parseJson(jsonStr)
+    const ok = entity !== null && matchesSubset(entity, expected)
+    return { ok, detail: ok ? 'matches' : `got ${JSON.stringify(entity)}` }
+  }
+
+  // status NOUN ID is STATUS
+  m = p.match(/^status\s+(\S+(?:\s\S+)*?)\s+(\S+)\s+is\s+(\S+)$/)
+  if (m) {
+    const [, , id, expectedStatus] = m
+    const raw = await systemCall(`get:State Machine`, id)
+    const sm: any = safeJson(raw, null)
+    const actual = sm?.currentlyInStatus ?? null
+    const ok = actual === expectedStatus
+    return { ok, detail: ok ? `status=${actual}` : `expected ${expectedStatus}, got ${actual ?? '(none)'}` }
+  }
+
+  return { ok: false, detail: `unrecognized predicate: ${predicate}` }
+}
+
+server.registerTool(
+  'tutor',
+  {
+    description: 'Interactive three-track AREST walkthrough (easy / medium / hard). Load a lesson by track+num and the response includes its narrative, the check predicate, whether the check currently passes against live D (✓/✗), and a pointer to the next lesson. Use command="list" to enumerate all lessons.',
+    inputSchema: {
+      command: z.enum(['list', 'lesson']).optional().describe('"list" enumerates every lesson. "lesson" (default) loads one.'),
+      track: z.enum(['easy', 'medium', 'hard']).optional().describe('Track. Default: easy.'),
+      num: z.number().optional().describe('Lesson number within the track. Default: 1.'),
+    },
+  },
+  async ({ command, track, num }) => {
+    if (command === 'list') {
+      const out: Record<string, any[]> = {}
+      for (const t of TUTOR_TRACKS) {
+        out[t] = listTutorLessons(t).map(l => ({ num: l.num, title: l.title }))
+      }
+      return textResult(out)
+    }
+    const t: TutorTrack = track ?? 'easy'
+    const n = num ?? 1
+    const lessons = listTutorLessons(t)
+    const lesson = lessons.find(l => l.num === n)
+    if (!lesson) {
+      return textResult({
+        error: `Lesson ${t}/${n} not found`,
+        available: lessons.map(l => l.num),
+      })
+    }
+    const content = readFileSync(lesson.path, 'utf-8')
+    const parsed = parseTutorLesson(content)
+    const check = parsed.expect
+      ? await evalExpectPredicate(parsed.expect)
+      : { ok: null as any, detail: 'no expect predicate in this lesson' }
+    const nextNum = lessons.find(l => l.num > n)?.num
+    const nextInTrack = nextNum ? { track: t, num: nextNum } : null
+    const nextTrackOrder: TutorTrack[] = ['easy', 'medium', 'hard']
+    const nextTrack = !nextInTrack
+      ? nextTrackOrder[nextTrackOrder.indexOf(t) + 1] ?? null
+      : null
+    const next = nextInTrack
+      ? nextInTrack
+      : nextTrack
+        ? { track: nextTrack, num: 1 }
+        : null
+    return textResult({
+      track: t,
+      num: n,
+      title: parsed.title,
+      content,
+      expect: parsed.expect,
+      check,
+      next,
+    })
+  },
+)
+
 // ── Debug (gated) ────────────────────────────────────────────────────
 
 if (AREST_DEBUG) {
