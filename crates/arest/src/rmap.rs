@@ -123,7 +123,6 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
     // -- Step 0.3: Subtype absorption --------------------------------
     // Determine which subtypes have their own fact types (partitioned strategy)
     // vs which should be absorbed into the supertype (single-table strategy).
-    let mut subtype_to_root: HashMap<String, String> = HashMap::new();
     let mut parent_of: HashMap<String, String> = HashMap::new();
     ir.subtypes.iter().for_each(|(name, st)| { parent_of.insert(name.clone(), st.clone()); });
     let subtype_to_root: HashMap<String, String> = parent_of.keys().map(|name| {

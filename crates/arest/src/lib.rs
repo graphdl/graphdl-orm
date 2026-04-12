@@ -6,7 +6,6 @@
 // One function. Readings in, applications out.
 // State = P (facts) + DEFS (named Func).
 
-use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 
@@ -41,6 +40,7 @@ fn ds() -> &'static Mutex<Vec<Option<CompiledState>>> {
     DOMAINS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+#[allow(dead_code)] // used by tests and the cloudflare feature
 fn allocate(state: ast::Object, defs: Vec<(String, ast::Func)>) -> u32 {
     let d = ast::defs_to_state(&defs, &state);
     let mut s = ds().lock().unwrap();
@@ -73,6 +73,7 @@ const METAMODEL_READINGS: &[(&str, &str)] = &[
 /// create_bare: allocate empty D with ONLY the platform primitives
 /// registered in DEFS. Use this when testing a new core or rebuilding
 /// the metamodel from scratch. Most apps should use `create_impl`.
+#[allow(dead_code)] // used by tests and the cloudflare feature
 fn create_bare_impl() -> u32 {
     let state = ast::Object::phi();
     let defs = vec![

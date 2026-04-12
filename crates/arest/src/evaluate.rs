@@ -11,22 +11,6 @@ use std::collections::HashSet;
 use crate::types::*;
 use crate::ast;
 
-/// Run a state machine via AST reduction.
-/// The machine's func is a transition function: <state, event> -> next_state.
-/// Guards are compiled into the Condition predicates.
-pub(crate) fn run_machine_ast(
-    machine: &crate::compile::CompiledStateMachine,
-    events: &[&str],
-) -> String {
-    let empty = ast::Object::phi();
-    events.iter().fold(machine.initial.clone(), |state, event| {
-        let input = ast::Object::seq(vec![ast::Object::atom(&state), ast::Object::atom(event)]);
-        ast::apply(&machine.func, &input, &empty)
-            .as_atom().map(|s| s.to_string())
-            .unwrap_or(state)
-    })
-}
-
 // -- Forward Chaining -------------------------------------------------
 //
 // Correctness: FORML 2 derivation rules are monotonic (add facts, never

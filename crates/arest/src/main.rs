@@ -169,6 +169,7 @@ mod db {
 /// system(key, input, D) → (output, D')
 /// Pure ρ-dispatch. Same as lib.rs system_impl but operates on an
 /// owned state instead of a global handle registry.
+#[cfg(feature = "local")]
 fn system(key: &str, input: &str, d: &ast::Object) -> (String, ast::Object) {
     let obj = ast::Object::parse(input);
     let result = ast::apply(&ast::Func::Def(key.to_string()), &obj, d);
@@ -188,6 +189,7 @@ fn system(key: &str, input: &str, d: &ast::Object) -> (String, ast::Object) {
 
 /// Read .md files from directories, sorted alphabetically, app.md first.
 /// Also checks the parent directory of each readings dir for app.md.
+#[cfg(feature = "local")]
 fn read_readings(dirs: &[String]) -> Vec<(String, String)> {
     let (readings, app_md) = dirs.iter().flat_map(|dir| {
         let dir_path = std::path::Path::new(dir);
@@ -240,6 +242,7 @@ fn read_readings(dirs: &[String]) -> Vec<(String, String)> {
 }
 
 /// Bundled metamodel readings — same as lib.rs METAMODEL_READINGS.
+#[cfg(feature = "local")]
 const METAMODEL_READINGS: &[(&str, &str)] = &[
     ("core",          include_str!("../../../readings/core.md")),
     ("state",         include_str!("../../../readings/state.md")),
@@ -299,8 +302,13 @@ fn main() {
         },
     );
 
+    // Wire parsed flags to their engine-level thread_local toggles.
+    if no_validate { ast::set_skip_validate(true); }
+    if strict { parse_forml2::set_strict_mode(true); }
+
     #[cfg(not(feature = "local"))]
     {
+        let _ = &db_path; let _ = &rest; // flags-only invocation
         eprintln!("Build with --features local for SQLite support.");
         eprintln!("  cargo run --bin arest --features local -- <readings_dir>");
         std::process::exit(1);
