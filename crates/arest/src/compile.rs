@@ -2512,62 +2512,10 @@ fn compile_ring_acyclic_ast(def: &ConstraintDef) -> Func {
     //     pred = not . eq . [length . sel(1), sel(3)]
     //     tc = sel(1) . While(pred, body) . [facts, facts, const(0)]
     //
-    let tc_func = Func::Native(std::sync::Arc::new(move |edges: &Object| {
-        // edges is the initial edge set (sequence of facts)
-        let initial = match edges.as_seq() {
-            Some(e) => e.to_vec(),
-            None => return Object::Bottom,
-        };
-
-        // Extract <role0_val, role1_val> pairs from encoded facts.
-        // Fact encoding: <<noun0, val0>, <noun1, val1>, ...>
-        fn edge_pair(fact: &Object) -> Option<(String, String)> {
-            let items = fact.as_seq().filter(|i| i.len() >= 2)?;
-            let v0 = items[0].as_seq().and_then(|p| p.get(1)).and_then(|v| v.as_atom())?;
-            let v1 = items[1].as_seq().and_then(|p| p.get(1)).and_then(|v| v.as_atom())?;
-            Some((v0.to_string(), v1.to_string()))
-        }
-
-        let original_pairs: Vec<(String, String)> = initial.iter()
-            .filter_map(|f| edge_pair(f))
-            .collect();
-
-        // Build transitive closure via iter::successors — Backus's while form.
-        // Termination encoded as None (no new edges); max 1001 iterations.
-        let tc: std::collections::HashSet<(String, String)> = std::iter::successors(
-            Some(original_pairs.iter().cloned().collect::<std::collections::HashSet<(String, String)>>()),
-            |tc| {
-                let new_edges: Vec<(String, String)> = tc.iter()
-                    .flat_map(|(a, b)| original_pairs.iter()
-                        .filter(|(c, _)| b == c)
-                        .filter_map(|(_, d)| {
-                            (!tc.contains(&(a.clone(), d.clone())))
-                                .then(|| (a.clone(), d.clone()))
-                        })
-                        .collect::<Vec<_>>())
-                    .collect();
-                (!new_edges.is_empty()).then(|| {
-                    let mut next = tc.clone();
-                    next.extend(new_edges);
-                    next
-                })
-            },
-        ).take(1001).last().unwrap();
-
-        // Find self-loops (cycles): (x, x) in tc
-        let cycle_nodes: Vec<Object> = tc.iter()
-            .filter(|(a, b)| a == b)
-            .map(|(a, _)| {
-                // Reconstruct as a fact-like object for the violation formatter
-                Object::Seq(vec![
-                    Object::Seq(vec![Object::atom("_"), Object::atom(a)]),
-                    Object::Seq(vec![Object::atom("_"), Object::atom(a)]),
-                ])
-            })
-            .collect();
-
-        Object::Seq(cycle_nodes)
-    }));
+    // Transitive closure + cycle extraction routed through Platform.
+    // Implementation lives in ast::platform_tc_cycles so FPGA and Solidity
+    // runtimes can provide their own synthesized/contract implementations.
+    let tc_func = Func::Platform("tc_cycles".to_string());
 
     // Pipeline: extract facts -> compute transitive closure -> report violations
     Func::compose(
@@ -3442,16 +3390,15 @@ fn compile_forbidden_ast(ir: &Domain, def: &ConstraintDef) -> Func {
         ]);
         let viol = make_violation_func(&def.id, &def.text, detail);
 
-        // Condition: length(matched) > 0 -> violation.
-        // TODO: the declared `threshold` value is not used; comparison is
-        // against 0 (any match). Wire threshold into the Eq construction
-        // if the spec intends threshold-based evaluation.
-        let _ = threshold;
+        // Condition: length(matched) > threshold -> violation.
+        // "Majority of keywords present" interpretation: threshold = n/2, so
+        // more than n/2 matches is a probable violation. Uses Func::Gt
+        // (added after the original Eq-against-0 placeholder).
         Func::condition(
-            Func::compose(Func::Not, Func::compose(Func::Eq, Func::construction(vec![
+            Func::compose(Func::Gt, Func::construction(vec![
                 Func::compose(Func::Length, matched_kws.clone()),
-                Func::constant(Object::atom("0")),
-            ]))),
+                Func::constant(Object::atom(&threshold.to_string())),
+            ])),
             Func::construction(vec![Func::compose(viol, Func::constant(Object::phi()))]),
             Func::constant(Object::phi()),
         )
