@@ -19,6 +19,7 @@ default = ["wit", "debug-def"]
 wit = ["dep:wit-bindgen"]
 cloudflare = ["dep:wasm-bindgen"]
 local = ["dep:rusqlite"]
+parallel = ["dep:rayon"]
 # Gates the `debug` def which returns a full projection of the compiled
 # state (nouns, fact types, constraints, state machines). Useful for test
 # introspection but exposes internals in production — leave OFF for
@@ -32,6 +33,7 @@ regex = "1"
 wit-bindgen = { version = "0.41", default-features = false, features = ["macros"], optional = true }
 wasm-bindgen = { version = "0.2", optional = true }
 rusqlite = { version = "0.31", features = ["bundled"], optional = true }
+rayon = { version = "1", optional = true }
 hmac = "0.12"
 sha2 = "0.10"
 subtle = "2"

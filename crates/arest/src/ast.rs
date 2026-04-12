@@ -36,6 +36,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::fmt;
 
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+
 // ── Objects (data domain) ────────────────────────────────────────────
 // An object is either an atom, a sequence, or bottom (undefined).
 // Bottom is preserved through all operations: f(⊥) = ⊥.
@@ -771,6 +774,13 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
         }
 
         Func::Construction(funcs) => {
+            #[cfg(feature = "parallel")]
+            if funcs.len() >= 16 {
+                let results: Vec<Object> = funcs.par_iter()
+                    .map(|f| apply(f, x, d))
+                    .collect();
+                return Object::seq(results);
+            }
             let results: Vec<Object> = funcs.iter()
                 .map(|f| apply(f, x, d))
                 .collect();
@@ -789,6 +799,14 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
             match x.as_seq() {
                 Some(items) if items.is_empty() => Object::phi(),
                 Some(items) => {
+                    // Parallel α: Rayon par_iter for large sequences.
+                    // Threshold 64: below this, Rayon spawn overhead exceeds gain.
+                    #[cfg(feature = "parallel")]
+                    if items.len() >= 64 {
+                        return Object::seq(
+                            items.par_iter().map(|xi| apply(f, xi, d)).collect()
+                        );
+                    }
                     Object::seq(items.iter().map(|xi| apply(f, xi, d)).collect())
                 }
                 _ => Object::Bottom,
@@ -811,6 +829,14 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
             match x.as_seq() {
                 Some(items) if items.is_empty() => Object::phi(),
                 Some(items) => {
+                    #[cfg(feature = "parallel")]
+                    if items.len() >= 64 {
+                        let kept: Vec<Object> = items.par_iter()
+                            .filter(|xi| apply(p, xi, d) == Object::t())
+                            .cloned()
+                            .collect();
+                        return Object::Seq(kept);
+                    }
                     let kept: Vec<Object> = items.iter()
                         .filter(|xi| apply(p, xi, d) == Object::t())
                         .cloned()
