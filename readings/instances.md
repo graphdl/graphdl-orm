@@ -3,8 +3,8 @@
 ## Entity Types
 
 Resource(.Reference) is an entity type.
-Graph is an entity type.
-  Graph is a subtype of Resource.
+Fact is an entity type.
+  Fact is a subtype of Resource.
 Event(.id) is an entity type.
 This association with Event, Transition, Resource provides the preferred identification scheme for Event Triggered Transition.
 Guard Run(.Name) is an entity type.
@@ -26,15 +26,15 @@ Citation has URI.
 Citation has Retrieval Date.
   Each Citation has at most one Retrieval Date.
 
-### Graph
-Graph belongs to Domain.
-  Each Graph belongs to exactly one Domain.
-Graph is of Fact Type.
-  Each Graph is of exactly one Fact Type.
-Graph is completed.
-Graph is example.
-Graph cites Citation.
-  For each pair of Graph and Citation, that Graph cites that Citation at most once.
+### Fact
+Fact belongs to Domain.
+  Each Fact belongs to exactly one Domain.
+Fact is of Fact Type.
+  Each Fact is of exactly one Fact Type.
+Fact is completed.
+Fact is example.
+Fact cites Citation.
+  For each pair of Fact and Citation, that Fact cites that Citation at most once.
 
 ### Resource
 Resource belongs to Domain.
@@ -49,10 +49,10 @@ Resource is created by User.
   Each Resource is created by at most one User.
 
 ### Resource Role
-Graph uses Resource for Role.
-  Each Graph uses at most one Resource for each Role.
-  Each Graph uses some Resource for some Role.
-This association with Graph, Resource, Role provides the preferred identification scheme for Resource Role.
+Fact uses Resource for Role.
+  Each Fact uses at most one Resource for each Role.
+  Each Fact uses some Resource for some Role.
+This association with Fact, Resource, Role provides the preferred identification scheme for Resource Role.
 
 ### State (absorbed into Resource cell by RMAP)
 Resource is currently in Status.
@@ -81,9 +81,9 @@ If some Event triggered some Transition for some Resource then that Event is of 
 ### Guard Run
 Guard Run is for Guard.
   Each Guard Run is for exactly one Guard.
-Guard Run references Graph.
-  It is possible that some Guard Run references more than one Graph and that some Graph is referenced by more than one Guard Run.
-  For each combination of Guard Run and Graph, that Guard Run references that Graph at most once.
+Guard Run references Fact.
+  It is possible that some Guard Run references more than one Fact and that some Fact is referenced by more than one Guard Run.
+  For each combination of Guard Run and Fact, that Guard Run references that Fact at most once.
 Guard Run has Result.
   Each Guard Run has at most one Result.
 

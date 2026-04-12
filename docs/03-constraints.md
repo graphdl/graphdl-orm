@@ -91,7 +91,7 @@ Nine constraint kinds check whether a tuple exists (or is absent) in a target se
 One fact type's extension is included in another's.
 
 ```forml2
-If some Graph uses some Resource for some Role then that Resource is instance of some Noun that plays that Role.
+If some Fact uses some Resource for some Role then that Resource is instance of some Noun that plays that Role.
 ```
 
 The compiler detects the conditional `if ... then ...` and generates a subset check that scans every antecedent tuple against the consequent set.

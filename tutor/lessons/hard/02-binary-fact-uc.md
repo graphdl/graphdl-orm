@@ -21,7 +21,7 @@ Order was placed by Customer.
 ## Check
 
 ~~~ expect
-list Graph\ Schema contains {"id": "Order_was_placed_by_Customer"}
+list Fact\ Schema contains {"id": "Order_was_placed_by_Customer"}
 ~~~
 
 **NOTE:** "exactly one" = "at most one" + "at least one". The second clause is the mandatory constraint — every Order MUST have a Customer.

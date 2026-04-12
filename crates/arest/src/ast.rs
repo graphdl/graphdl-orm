@@ -2663,7 +2663,7 @@ mod tests {
 
     #[test]
     fn construction_is_fact_type() {
-        // Graph schema "User has Org Role in Organization" = [Role₁, Role₂, Role₃]
+        // Fact schema "User has Org Role in Organization" = [Role₁, Role₂, Role₃]
         // Applied to a membership fact, selects each role's resource.
         let schema = Func::construction(vec![Func::role(1), Func::role(2), Func::role(3)]);
         let fact = Object::seq(vec![
