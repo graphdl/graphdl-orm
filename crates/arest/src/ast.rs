@@ -1871,12 +1871,6 @@ fn same_identity(a: &Object, b: &Object) -> bool {
 }
 
 /// Concatenate two sequences: <a₁,...,aₙ> ++ <b₁,...,bₘ> = <a₁,...,aₙ,b₁,...,bₘ>
-fn concat_seq(a: &Object, b: &Object) -> Object {
-    let mut items = a.as_seq().map(|s| s.to_vec()).unwrap_or_default();
-    items.extend(b.as_seq().map(|s| s.to_vec()).unwrap_or_else(|| vec![b.clone()]));
-    Object::Seq(items)
-}
-
 /// Iterate all cells in state as (name, contents) pairs.
 /// Replaces: population.facts.iter()
 pub fn cells_iter(state: &Object) -> Vec<(&str, &Object)> {
