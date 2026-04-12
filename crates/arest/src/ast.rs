@@ -986,6 +986,9 @@ fn apply_platform(name: &str, x: &Object, d: &Object) -> Object {
         s if s.starts_with("create:") => platform_create(&s[7..], x, d),
         s if s.starts_with("update:") => platform_update(&s[7..], x, d),
         s if s.starts_with("transition:") => platform_transition(&s[11..], x, d),
+        s if s.starts_with("list_noun:") => platform_list_noun(&s[10..], d),
+        s if s.starts_with("get_noun:") => platform_get_noun(&s[9..], x, d),
+        s if s.starts_with("query_ft:") => platform_query_ft(&s[9..], x, d),
         _ => Object::Bottom,
     }
 }
@@ -1484,6 +1487,132 @@ fn extract_fact_pairs(x: &Object) -> (Option<String>, std::collections::HashMap<
         });
     });
     (id, fields)
+}
+
+/// Platform primitive: list entities of a noun by reading D at apply-time.
+/// Key: "list_noun:{noun}". Input: operand is ignored (may be empty).
+///
+/// Walks every fact cell in D. A fact contributes to an entity summary if
+/// one of its role bindings has a role name equal to the target noun — the
+/// role's value is the entity id. All other bindings on that fact become
+/// field/value entries on the entity summary. Multiple facts about the same
+/// entity merge; later facts overwrite earlier ones for the same field.
+///
+/// Returns an atom holding a JSON array: `[{"id":..., <field>:<value>, ...}, ...]`.
+/// Returns `Bottom` if no matching entities are found.
+fn platform_list_noun(noun: &str, d: &Object) -> Object {
+    use std::collections::HashMap;
+    let mut entities: HashMap<String, HashMap<String, String>> = HashMap::new();
+
+    cells_iter(d).iter().for_each(|(_, contents)| {
+        let facts = contents.as_seq().map(|s| s.to_vec()).unwrap_or_default();
+        facts.iter().for_each(|fact| {
+            let pairs = match fact.as_seq() {
+                Some(p) => p.to_vec(),
+                None => return,
+            };
+            // Find entity id: the pair whose role name matches the noun.
+            let entity_id = pairs.iter().find_map(|pair| {
+                let kv = pair.as_seq()?;
+                let role = kv.first()?.as_atom()?;
+                let val = kv.get(1)?.as_atom()?;
+                (role == noun).then(|| val.to_string())
+            });
+            if let Some(id) = entity_id {
+                let entry = entities.entry(id).or_default();
+                pairs.iter().for_each(|pair| {
+                    let kv = match pair.as_seq() { Some(s) => s, None => return };
+                    let role = match kv.first().and_then(|k| k.as_atom()) { Some(r) => r, None => return };
+                    let val = match kv.get(1).and_then(|v| v.as_atom()) { Some(v) => v, None => return };
+                    (role != noun).then(|| entry.insert(role.to_string(), val.to_string()));
+                });
+            }
+        });
+    });
+
+    if entities.is_empty() { return Object::Bottom; }
+
+    let json_items: Vec<serde_json::Value> = entities.into_iter().map(|(id, fields)| {
+        let mut obj = serde_json::Map::new();
+        obj.insert("id".to_string(), serde_json::Value::String(id));
+        fields.into_iter().for_each(|(k, v)| {
+            obj.insert(k, serde_json::Value::String(v));
+        });
+        serde_json::Value::Object(obj)
+    }).collect();
+    let json = serde_json::to_string(&serde_json::Value::Array(json_items))
+        .unwrap_or_else(|_| "[]".to_string());
+    Object::atom(&json)
+}
+
+/// Platform primitive: query facts of a given fact type from live D.
+/// Key: "query_ft:{fact_type_id}". Input: optional filter JSON atom of
+/// `{role_name: value}` bindings to match (atom is ignored if not a JSON
+/// object). Returns an atom holding a JSON array of facts. Each fact
+/// emits as an object keyed by role name. Returns an empty array when
+/// the cell is absent or no facts match — never Bottom, since "empty
+/// result" is a valid query outcome distinct from "undefined fact type".
+fn platform_query_ft(ft_id: &str, x: &Object, d: &Object) -> Object {
+    let facts = fetch_or_phi(ft_id, d);
+    let facts_seq = facts.as_seq().map(|s| s.to_vec()).unwrap_or_default();
+
+    let filter: std::collections::HashMap<String, String> = x.as_atom()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .and_then(|v| v.as_object().cloned())
+        .map(|obj| obj.iter().filter_map(|(k, v)|
+            v.as_str().map(|s| (k.clone(), s.to_string()))
+        ).collect())
+        .unwrap_or_default();
+
+    let fact_to_json = |fact: &Object| -> Option<serde_json::Value> {
+        let pairs = fact.as_seq()?;
+        let mut map = serde_json::Map::new();
+        pairs.iter().for_each(|pair| {
+            if let Some(kv) = pair.as_seq() {
+                if let (Some(role), Some(val)) = (
+                    kv.first().and_then(|k| k.as_atom()),
+                    kv.get(1).and_then(|v| v.as_atom()),
+                ) {
+                    map.insert(role.to_string(), serde_json::Value::String(val.to_string()));
+                }
+            }
+        });
+        Some(serde_json::Value::Object(map))
+    };
+
+    let matched: Vec<serde_json::Value> = facts_seq.iter()
+        .filter_map(fact_to_json)
+        .filter(|obj| {
+            let m = match obj.as_object() { Some(m) => m, None => return false };
+            filter.iter().all(|(k, v)|
+                m.get(k).and_then(|val| val.as_str()) == Some(v.as_str())
+            )
+        })
+        .collect();
+
+    let json = serde_json::to_string(&serde_json::Value::Array(matched))
+        .unwrap_or_else(|_| "[]".to_string());
+    Object::atom(&json)
+}
+
+/// Platform primitive: get a single entity by id.
+/// Key: "get_noun:{noun}". Input: atom entity id.
+/// Returns the matching entity summary as a JSON atom, or Bottom if absent.
+fn platform_get_noun(noun: &str, x: &Object, d: &Object) -> Object {
+    let id = match x.as_atom() {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return Object::Bottom,
+    };
+    let list = platform_list_noun(noun, d);
+    let list_str = match list.as_atom() { Some(s) => s.to_string(), None => return Object::Bottom };
+    let parsed: serde_json::Value = match serde_json::from_str(&list_str) {
+        Ok(v) => v, Err(_) => return Object::Bottom,
+    };
+    let items = match parsed.as_array() { Some(a) => a.clone(), None => return Object::Bottom };
+    items.into_iter()
+        .find(|item| item.get("id").and_then(|v| v.as_str()) == Some(&id))
+        .map(|item| Object::atom(&serde_json::to_string(&item).unwrap_or_default()))
+        .unwrap_or(Object::Bottom)
 }
 
 /// Walk a Command's string fields and return the name of the first field whose

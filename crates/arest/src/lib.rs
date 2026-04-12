@@ -435,4 +435,44 @@ mod handle_isolation_tests {
         release_impl(h_a);
         release_impl(h_b);
     }
+
+    /// #107: After `create:Order` adds an entity to D via apply, both
+    /// `list:Order` and `get:Order` must see it. Currently those defs
+    /// are compile-time constants baked from Instance Facts, so they
+    /// never observe runtime-created entities.
+    ///
+    /// Per whitepaper Eq 9: SYSTEM:x = (ρ(↑entity(x):D)):↑op(x). The
+    /// read path is a ρ-application that fetches from the live D.
+    #[test]
+    fn list_and_get_see_runtime_created_entities() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let h = create_impl();
+
+        let readings = "\
+Order(.id) is an entity type.
+Order has total.
+  Each Order has at most one total.
+";
+        let compile_out = system_impl(h, "compile", readings);
+        assert!(!compile_out.starts_with('⊥'),
+            "compile must not reject simple Order schema, got: {compile_out}");
+
+        let create_out = system_impl(h, "create:Order", "<<id, ord-1>, <total, 100>>");
+        assert!(!create_out.starts_with('⊥'),
+            "create:Order must not return ⊥, got: {create_out}");
+
+        let list_out = system_impl(h, "list:Order", "");
+        assert!(!list_out.starts_with('⊥'),
+            "list:Order must not return ⊥ after an entity has been created");
+        assert!(list_out.contains("ord-1"),
+            "list:Order must surface the runtime-created entity 'ord-1'; got: {list_out}");
+
+        let get_out = system_impl(h, "get:Order", "ord-1");
+        assert!(!get_out.starts_with('⊥'),
+            "get:Order must not return ⊥ for an entity that was just created");
+        assert!(get_out.contains("ord-1"),
+            "get:Order must return a payload containing the entity id; got: {get_out}");
+
+        release_impl(h);
+    }
 }
