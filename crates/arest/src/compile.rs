@@ -419,10 +419,22 @@ fn derive_state_machines_from_facts(facts: &[GeneralInstanceFact]) -> HashMap<St
             let from = t_from.get(t_name)?.clone();
             let to = t_to.get(t_name)?.clone();
             let event = t_event.get(t_name).cloned().unwrap_or_else(|| t_name.clone());
+            // Prefer the explicit `Transition X is defined in SM Y` fact.
+            // Otherwise infer: require BOTH endpoints in the same SM's declared
+            // statuses — an OR-based match cross-contaminates when two SMs share
+            // a status name. If AND finds nothing, fall back to a unique OR
+            // match; only fall through to the first key as a last resort.
             let target = t_sm.get(t_name).cloned()
                 .or_else(|| machines.iter()
-                    .find(|(_, sm)| sm.statuses.contains(&from) || sm.statuses.contains(&to))
+                    .find(|(_, sm)| sm.statuses.contains(&from) && sm.statuses.contains(&to))
                     .map(|(k, _)| k.clone()))
+                .or_else(|| {
+                    let matches: Vec<String> = machines.iter()
+                        .filter(|(_, sm)| sm.statuses.contains(&from) || sm.statuses.contains(&to))
+                        .map(|(k, _)| k.clone())
+                        .collect();
+                    if matches.len() == 1 { matches.into_iter().next() } else { None }
+                })
                 .or_else(|| machines.keys().next().cloned());
             Some((target?, from, to, event))
         })
@@ -4368,5 +4380,70 @@ mod schema_tests {
 
         assert!(field_map.contains_key("total"), "total should map to ft1");
         assert!(!field_map.contains_key("notes"), "notes should not have a schema mapping");
+    }
+
+    /// Bug #105: When two SMs share a status name (e.g. both Order and
+    /// Notification declare "Delivered"), the old Pass 3 heuristic
+    /// (`from OR to` in sm.statuses) would misassign the Notification
+    /// transition `confirm-delivery (Sent → Delivered)` to the Order SM
+    /// because Delivered is in both, pulling `Sent` into Order's statuses
+    /// and eventually surfacing Sent as Order's initial status.
+    ///
+    /// The fix is to require BOTH endpoints in the same SM's declared
+    /// (Pass 2) statuses — if only one endpoint matches, the heuristic
+    /// abstains and looks elsewhere.
+    #[test]
+    fn sm_transitions_do_not_leak_across_domains_sharing_a_status() {
+        use crate::types::GeneralInstanceFact;
+
+        let fact = |subject_noun: &str, subject_value: &str, field_name: &str,
+                    object_noun: &str, object_value: &str| GeneralInstanceFact {
+            subject_noun: subject_noun.to_string(),
+            subject_value: subject_value.to_string(),
+            field_name: field_name.to_string(),
+            object_noun: object_noun.to_string(),
+            object_value: object_value.to_string(),
+        };
+
+        let facts = vec![
+            // Two SMs, each for its own noun
+            fact("State Machine Definition", "Order", "is for", "Noun", "Order"),
+            fact("State Machine Definition", "Notification", "is for", "Noun", "Notification"),
+
+            // Order SM statuses (declared)
+            fact("Status", "Draft", "is defined in", "State Machine Definition", "Order"),
+            fact("Status", "Placed", "is defined in", "State Machine Definition", "Order"),
+            fact("Status", "Delivered", "is defined in", "State Machine Definition", "Order"),
+
+            // Notification SM statuses (declared) — shares "Delivered"
+            fact("Status", "Sent", "is defined in", "State Machine Definition", "Notification"),
+            fact("Status", "Delivered", "is defined in", "State Machine Definition", "Notification"),
+
+            // Order transitions
+            fact("Transition", "place", "is from", "Status", "Draft"),
+            fact("Transition", "place", "is to", "Status", "Placed"),
+            fact("Transition", "deliver", "is from", "Status", "Placed"),
+            fact("Transition", "deliver", "is to", "Status", "Delivered"),
+
+            // Notification transitions
+            fact("Transition", "confirm-delivery", "is from", "Status", "Sent"),
+            fact("Transition", "confirm-delivery", "is to", "Status", "Delivered"),
+        ];
+
+        let machines = derive_state_machines_from_facts(&facts);
+
+        let order = machines.get("Order").expect("Order SM present");
+        assert!(!order.statuses.contains(&"Sent".to_string()),
+            "Order SM must not contain Notification's 'Sent' status; got {:?}", order.statuses);
+        assert!(!order.transitions.iter().any(|t| t.event == "confirm-delivery"),
+            "Order SM must not contain Notification's 'confirm-delivery' transition");
+        assert_eq!(order.statuses.first().map(String::as_str), Some("Draft"),
+            "Order initial must be Draft; got {:?}", order.statuses.first());
+
+        let notif = machines.get("Notification").expect("Notification SM present");
+        assert!(notif.transitions.iter().any(|t| t.event == "confirm-delivery"),
+            "Notification SM must contain its own 'confirm-delivery' transition");
+        assert_eq!(notif.statuses.first().map(String::as_str), Some("Sent"),
+            "Notification initial must be Sent; got {:?}", notif.statuses.first());
     }
 }
