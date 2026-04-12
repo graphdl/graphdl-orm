@@ -1,53 +1,32 @@
-import { router } from './api/router'
-import type { Env } from './types'
-
-export { EntityDB } from './entity-do'
-export { RegistryDB } from './registry-do'
-
 /**
- * Auth middleware — blocks direct HTTP access without a valid bearer token.
- * Service bindings (apis worker) bypass this entirely (they call DO methods
- * via env.GRAPHDL, not the fetch handler).
+ * `arest` — npm entry point.
  *
- * Set API_SECRET as a Cloudflare secret:
- *   wrangler secret put API_SECRET
+ * Public surface:
  *
- * Callers authenticate with:
- *   Authorization: Bearer <API_SECRET>
+ *   Engine primitives:
+ *     compileDomainReadings, compileDomainReadingsBare, system, release_domain
+ *     (plus lower-level wasm exports: create, create_bare, parse_and_compile)
  *
- * When API_SECRET is not set (local dev), all requests are allowed.
+ *   MCP server factory:
+ *     createArestServer   — returns an unconnected McpServer with the
+ *                           core AREST verbs registered. Attach any
+ *                           transport (stdio, Streamable HTTP, custom).
  */
-function withAuth(request: Request, env: Env): Response | void {
-  const secret = env.API_SECRET
-  if (!secret) return // no secret configured = allow all (local dev)
 
-  // Health check is public
-  const url = new URL(request.url)
-  if (url.pathname === '/health') return
+export {
+  compileDomainReadings,
+  compileDomainReadingsBare,
+  release_domain,
+  system,
+  currentDomainHandle,
+  evaluateConstraints,
+  forwardChain,
+  getTransitions,
+  applyCommand,
+  querySchema,
+  getNounSchemas,
+  computeRMAP,
+} from './api/engine.js'
 
-  const auth = request.headers.get('authorization')
-  if (!auth || !auth.startsWith('Bearer ')) {
-    return new Response(JSON.stringify({ error: 'Missing Authorization header' }), {
-      status: 401,
-      headers: { 'Content-Type': 'application/json' },
-    })
-  }
-
-  const token = auth.slice(7)
-  if (token !== secret) {
-    return new Response(JSON.stringify({ error: 'Invalid token' }), {
-      status: 403,
-      headers: { 'Content-Type': 'application/json' },
-    })
-  }
-}
-
-export default {
-  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    const authResponse = withAuth(request, env)
-    if (authResponse) return authResponse
-    return router.fetch(request, env, ctx)
-  },
-}
-
-export type { Env } from './types'
+export { createArestServer } from './mcp/server-factory.js'
+export type { CreateArestServerOptions } from './mcp/server-factory.js'

@@ -45,3 +45,9 @@ if (cleaned !== src) {
 } else {
   console.log(`sanitize-wasm-dts: no changes needed`)
 }
+
+// The wasm pkg/ directory is .gitignored (regenerated every build) so the
+// `.npmignore` that rescues it from .gitignore during `npm pack` can't be
+// committed. Recreate it after every wasm build so fresh clones ship it too.
+const npmIgnorePath = resolve(__dirname, '..', 'crates', 'arest', 'pkg', '.npmignore')
+writeFileSync(npmIgnorePath, '', 'utf-8')
