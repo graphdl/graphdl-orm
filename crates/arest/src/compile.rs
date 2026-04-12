@@ -124,7 +124,7 @@ pub(crate) struct NounIndex {
     pub(crate) noun_to_state_machines: HashMap<String, usize>,
 }
 
-/// A compiled graph schema -- a Construction of Selector functions (roles).
+/// A compiled fact type -- a Construction of Selector functions (roles).
 /// Fact Type = CONS(Role1, ..., Rolen) in Backus's FP algebra.
 /// Partial application = query. Full application = fact.
 pub(crate) struct CompiledSchema {

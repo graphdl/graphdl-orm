@@ -64,7 +64,7 @@ pub enum Command {
         #[serde(default)]
         signature: Option<String>,
     },
-    /// is-qry: query the population (partial application of graph schema)
+    /// is-qry: query the population (partial application of fact type)
     Query {
         #[serde(alias = "schemaId")]
         schema_id: String,

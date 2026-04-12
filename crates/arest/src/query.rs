@@ -1,8 +1,8 @@
 // crates/arest/src/query.rs
 //
-// Population query via partial application of graph schemas.
+// Population query via partial application of fact types.
 //
-// A query is a partially applied graph schema (Backus 1977):
+// A query is a partially applied fact type (Backus 1977):
 //   Schema     = CONS(Sel(1), ..., Sel(n))       — a Construction
 //   Bind roles = eq ∘ [Sel(i), valuē]             — predicate per bound role
 //   Filter     = Filter(predicate)                — keep matching facts
@@ -16,7 +16,7 @@ use crate::ast::{self, Func, Object};
 use crate::compile::CompiledSchema;
 
 // ── Partial application as query ────────────────────────────────────
-// Query = partial application of a graph schema.
+// Query = partial application of a fact type.
 // Given a schema and known bindings, return matching resources from population.
 
 /// Convert facts from an Object state for a given fact type into a positional Object sequence.
@@ -69,7 +69,7 @@ fn build_predicate(filter_bindings: &[(usize, &str)]) -> Func {
 
 /// Build a query Func: α(Sel(target)) ∘ Filter(predicate).
 ///
-/// This is partial application of a graph schema:
+/// This is partial application of a fact type:
 ///   Schema = CONS(Sel(1), ..., Sel(n))
 ///   Bind some roles to constants → predicate
 ///   Filter(predicate) selects matching facts
@@ -82,7 +82,7 @@ pub fn build_query(target_role: usize, filter_bindings: &[(usize, &str)]) -> Fun
     )
 }
 
-/// Query an Object state using partial application of a graph schema.
+/// Query an Object state using partial application of a fact type.
 ///
 /// Given a compiled schema, a role index to extract (1-indexed), and
 /// filter bindings (role_index, value), returns matching values.

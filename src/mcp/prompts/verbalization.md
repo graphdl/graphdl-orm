@@ -718,7 +718,7 @@ Example: "It is forbidden that Support Response reveals Implementation Detail." 
 
 These constraints apply to every Support Response in support.auto.dev:
 
-Forbidden: dashes, markdown syntax, paragraph titles, protected concepts, prohibited channels (phone, video, Zoom, Teams, live chat), prohibited commercial terms (custom pricing, enterprise deal, volume discount), implementation details (provider names, infrastructure, scraping methods, knowledge graph, state machine, domain model, readings, session caching, listing removal), listing source names, pipeline references, internal API recommendations, graph schema or deontic constraint reveals, naming API Products by endpoint slug.
+Forbidden: dashes, markdown syntax, paragraph titles, protected concepts, prohibited channels (phone, video, Zoom, Teams, live chat), prohibited commercial terms (custom pricing, enterprise deal, volume discount), implementation details (provider names, infrastructure, scraping methods, knowledge graph, state machine, domain model, readings, session caching, listing removal), listing source names, pipeline references, internal API recommendations, fact type or deontic constraint reveals, naming API Products by endpoint slug.
 
 Obligatory: name API Products by Title, deliver via email, conform to pricing model, refer to Free plan as Starter, be natural language, reference Documentation site link for API questions, reference Pricing site link for pricing questions, support every asserted graph with a data source, mention API Product dependencies when the request concerns a dependent product.
 

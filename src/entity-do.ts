@@ -35,7 +35,7 @@ export interface CellContents {
   data: Record<string, unknown>
 }
 
-/** A fact: a graph schema instance with role bindings (projected from the cell). */
+/** A fact: a fact type instance with role bindings (projected from the cell). */
 export interface Fact {
   graphSchemaId: string
   bindings: Array<[string, string]>
@@ -108,7 +108,7 @@ export function removeCell(sql: SqlLike): { id: string } | null {
 // Facts are NOT stored. They are projections of the cell's data.
 // α(project_column) applied to the data record.
 
-/** Project the cell into facts. Each field becomes a graph schema instance. */
+/** Project the cell into facts. Each field becomes a fact type instance. */
 export function getFacts(sql: SqlLike): Fact[] {
   const cell = fetchCell(sql)
   if (!cell) return []
@@ -120,7 +120,7 @@ export function getFacts(sql: SqlLike): Fact[] {
     }))
 }
 
-/** Project facts for a specific graph schema (field). */
+/** Project facts for a specific fact type (field). */
 export function getFactsBySchema(sql: SqlLike, graphSchemaId: string): Fact[] {
   return getFacts(sql).filter(f => f.graphSchemaId === graphSchemaId)
 }

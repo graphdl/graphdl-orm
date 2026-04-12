@@ -1787,7 +1787,7 @@ fn parse_general_instance_fact(ir: &mut Domain, line: &str) {
         Some((predicate, object_noun, object_value)) => {
             // Resolve field name from declared fact types.
             // The instance fact "A 'x' predicate B 'y'" should match the
-            // declared fact type "A predicate B" and use its graph schema ID.
+            // declared fact type "A predicate B" and use its fact type ID.
             let field = resolve_instance_field(&ir.fact_types, &subject_noun, &predicate, &object_noun);
             Some(GeneralInstanceFact {
                 subject_noun,
@@ -1840,7 +1840,7 @@ fn resolve_instance_field(
         .or_else(|| candidates.first());
 
     if let Some((id, _)) = matched {
-        // The field name is the graph schema ID. This is the fact type identity.
+        // The field name is the fact type ID. This is the fact type identity.
         id.to_string()
     } else {
         // No declared fact type. Also try reverse role order.
