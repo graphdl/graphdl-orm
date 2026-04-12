@@ -409,14 +409,26 @@ server.registerTool(
   },
   async ({ noun, id, status }) => {
     if (GRAPHDL_MODE === 'local') {
-      const rawTransitions = await systemCall(`transitions:${noun}`, status || '')
-      const rawEntity = await systemCall(`get:${noun}`, id)
       const parseOr = <T>(raw: string, fallback: T): T | any => {
         try { const v = JSON.parse(raw); return v ?? fallback } catch { return fallback }
       }
+      // Resolve current status from the SM entity keyed by this id when the
+      // caller doesn't pass one — transitions:{noun} needs a status to filter
+      // outgoing edges, otherwise it returns [].
+      let resolvedStatus = status || ''
+      if (!resolvedStatus) {
+        const smRaw = await systemCall(`get:State Machine`, id)
+        const sm = parseOr(smRaw, null)
+        if (sm && typeof sm === 'object' && typeof sm.currentlyInStatus === 'string') {
+          resolvedStatus = sm.currentlyInStatus
+        }
+      }
+      const rawTransitions = await systemCall(`transitions:${noun}`, resolvedStatus)
+      const rawEntity = await systemCall(`get:${noun}`, id)
       return textResult({
         entity: id,
         noun,
+        status: resolvedStatus || null,
         transitions: parseOr(rawTransitions, []),
         entity_data: parseOr(rawEntity, null),
       })
@@ -443,19 +455,25 @@ server.registerTool(
       // Audit trail for this entity
       const auditRaw = await systemCall('audit_log', '0')
       let audit: any[] = []
-      try { audit = JSON.parse(auditRaw) } catch {}
+      try {
+        const parsed = JSON.parse(auditRaw)
+        if (Array.isArray(parsed)) audit = parsed
+      } catch {}
 
       // If a specific fact type is requested, query it
-      let factData = null
+      let factData: any = []
       if (fact) {
         const raw = await systemCall(`query:${fact}`, JSON.stringify(noun ? { [noun]: id } : {}))
-        try { factData = JSON.parse(raw) } catch { factData = raw }
+        try {
+          const parsed = JSON.parse(raw)
+          factData = parsed ?? []
+        } catch { factData = raw }
       }
 
       return textResult({
         entity: id,
         fact_query: factData,
-        audit_trail: Array.isArray(audit) ? audit.filter((a: any) => a?.entity === id || a?.resource === id) : audit,
+        audit_trail: audit.filter((a: any) => a?.entity === id || a?.resource === id),
       })
     }
     const data = await httpRequest(`/arest/default/explain/${encodeURIComponent(id)}`)
