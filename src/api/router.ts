@@ -6,6 +6,7 @@ import { handleEvaluate, handleSynthesize } from './evaluate'
 import { handleCreateEntity, handleDeleteEntity } from './entity-routes'
 import { loadDomainSchema, loadDomainAndPopulation, buildPopulation, getTransitions, applyCommand, querySchema, forwardChain, getNounSchemas, computeRMAP, system as wasmSystem } from './engine'
 import { handleArestRequest } from './arest-router'
+import { handleMcpRequest } from '../mcp/remote'
 
 // ── Collection slug → noun type resolution ───────────────────────────
 // Resolved dynamically from the Registry via nounToSlug convention.
@@ -35,6 +36,12 @@ export const router = AutoRouter()
 
 // ── Health ───────────────────────────────────────────────────────────
 router.get('/health', () => json({ status: 'ok', version: '0.1.0' }))
+
+// ── Remote MCP (ChatGPT / Claude Desktop custom connectors) ──────────
+// Streamable HTTP transport — single endpoint for both POST (client
+// messages) and GET (SSE server stream). Bearer auth happens in
+// src/index.ts before the router sees the request.
+router.all('/mcp', (request: Request) => handleMcpRequest(request))
 
 // ── Domain Connection: store secrets for External System access ──────
 // Per core.md: Domain connects to External System with Secret Reference.
