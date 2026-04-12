@@ -4,29 +4,26 @@ A teaching app that exercises every AREST framework concept. Each domain demonst
 
 ## Quick start
 
-This repo uses [arest](https://github.com/graphdl/arest) as the runtime. Clone both as siblings:
+The tutor ships as a subfolder of the main AREST repo, so one clone covers everything:
 
 ```bash
-# From your projects root
-git clone https://github.com/graphdl/arest
-git clone https://github.com/graphdl/arest-tutor
-
-cd arest-tutor
+git clone https://github.com/drivly/arest
+cd arest/tutor
 yarn install
 yarn compile   # round-trips every domain through the Rust compiler
 ```
 
-To use from Claude Code or Claude Desktop, add this to your MCP config:
+To use from Claude Code or Claude Desktop, add this to your MCP config (the AREST repo already contains a `.mcp.json` with a matching `arest-tutor` entry):
 
 ```json
 {
   "mcpServers": {
     "arest-tutor": {
       "command": "yarn",
-      "args": ["--cwd", "/absolute/path/to/arest-tutor", "mcp"],
+      "args": ["--cwd", "/absolute/path/to/arest/tutor", "mcp"],
       "env": {
         "AREST_MODE": "local",
-        "AREST_READINGS_DIR": "/absolute/path/to/arest-tutor/domains"
+        "AREST_READINGS_DIR": "/absolute/path/to/arest/tutor/domains"
       }
     }
   }
