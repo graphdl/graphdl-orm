@@ -2197,3 +2197,99 @@ B 'b2' has C 'c2'.
             && f.bindings.iter().any(|(k, v)| k == "C" && v == "c2")
     }), "Should derive a2 has c2: {:?}", a_has_c);
 }
+
+// ── Federation: populate:{noun} from "backed by External System" ──
+
+#[test]
+fn federation_populate_defs_compiled_from_readings() {
+    // Build a focused domain with federation readings.
+    // Declares External Systems and "backed by" instance facts.
+    let input = r#"
+## Entity Types
+
+User(.Email) is an entity type.
+Stripe Customer(.Name) is an entity type.
+External System(.Name) is an entity type.
+Noun(.id) is an entity type.
+URL is a value type.
+Header is a value type.
+Prefix is a value type.
+URI is a value type.
+
+## Fact Types
+
+External System has URL.
+  Each External System has exactly one URL.
+External System has Header.
+  Each External System has at most one Header.
+External System has Prefix.
+  Each External System has at most one Prefix.
+Noun is backed by External System.
+  Each Noun is backed by at most one External System.
+Noun has URI.
+  Each Noun has at most one URI.
+User has Stripe Customer.
+
+## Instance Facts
+
+External System 'auth.vin' has URL 'https://auth.vin'.
+External System 'auth.vin' has Header 'Authorization'.
+External System 'auth.vin' has Prefix 'users API-Key'.
+External System 'stripe' has URL 'https://api.stripe.com/v1'.
+External System 'stripe' has Header 'Authorization'.
+External System 'stripe' has Prefix 'Bearer'.
+Noun 'User' is backed by External System 'auth.vin'.
+Noun 'User' has URI '/users'.
+Noun 'Stripe Customer' is backed by External System 'stripe'.
+Noun 'Stripe Customer' has URI '/customers'.
+"#;
+    let ir = parse_forml2::parse_markdown(input).unwrap();
+    let state = parse_forml2::domain_to_state(&ir);
+
+    // Compile: produces populate:{noun} defs for backed nouns.
+    let defs = compile::compile_to_defs_state(&state);
+    let d = ast::defs_to_state(&defs, &state);
+
+    // ── Verify populate:User exists with auth.vin config ──
+    let user_pop = ast::fetch("populate:User", &d);
+    assert_ne!(user_pop, ast::Object::Bottom,
+        "populate:User should exist (User is backed by auth.vin)");
+    // The def is func_to_object(Func::Constant(config)) = <', config>
+    let user_config = user_pop.as_seq()
+        .filter(|items| items.len() == 2 && items[0].as_atom() == Some("'"))
+        .map(|items| &items[1])
+        .unwrap_or(&user_pop);
+    // Config is a seq of pairs: <<system, auth.vin>, <url, https://auth.vin>, ...>
+    let binding = |key: &str| -> Option<String> {
+        user_config.as_seq()?.iter().find_map(|pair| {
+            let items = pair.as_seq()?;
+            (items.len() == 2 && items[0].as_atom() == Some(key))
+                .then(|| items[1].as_atom().unwrap_or("").to_string())
+        })
+    };
+    assert_eq!(binding("system").as_deref(), Some("auth.vin"));
+    assert_eq!(binding("url").as_deref(), Some("https://auth.vin"));
+    assert_eq!(binding("uri").as_deref(), Some("/users"));
+    assert_eq!(binding("header").as_deref(), Some("Authorization"));
+
+    // ── Verify populate:Stripe Customer exists with stripe config ──
+    let stripe_pop = ast::fetch("populate:Stripe Customer", &d);
+    assert_ne!(stripe_pop, ast::Object::Bottom,
+        "populate:Stripe Customer should exist (backed by stripe)");
+    let stripe_config = stripe_pop.as_seq()
+        .filter(|items| items.len() == 2 && items[0].as_atom() == Some("'"))
+        .map(|items| &items[1])
+        .unwrap_or(&stripe_pop);
+    let stripe_binding = |key: &str| -> Option<String> {
+        stripe_config.as_seq()?.iter().find_map(|pair| {
+            let items = pair.as_seq()?;
+            (items.len() == 2 && items[0].as_atom() == Some(key))
+                .then(|| items[1].as_atom().unwrap_or("").to_string())
+        })
+    };
+    assert_eq!(stripe_binding("system").as_deref(), Some("stripe"));
+    assert_eq!(stripe_binding("url").as_deref(), Some("https://api.stripe.com/v1"));
+    assert_eq!(stripe_binding("uri").as_deref(), Some("/customers"));
+    assert_eq!(stripe_binding("prefix").as_deref(), Some("Bearer"));
+    assert_eq!(stripe_binding("noun").as_deref(), Some("Stripe Customer"));
+}
