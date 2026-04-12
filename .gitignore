@@ -49,3 +49,6 @@ media/
 *.bbl
 *.blg
 comment.cut
+
+*.db
+*.db-journal

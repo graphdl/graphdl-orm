@@ -1,6 +1,0 @@
-node_modules/
-.out/
-*.db
-*.db-journal
-.env
-.env.local
