@@ -11,7 +11,10 @@ license = "MIT"
 crate-type = ["cdylib", "rlib"]
 
 [[bin]]
-name = "arest"
+# Named arest-cli (not arest) to avoid a .pdb collision with the
+# lib target on Windows. The CLI behavior is unchanged; invoke via
+#   cargo run --bin arest-cli -- <readings_dir>
+name = "arest-cli"
 path = "src/main.rs"
 
 [features]

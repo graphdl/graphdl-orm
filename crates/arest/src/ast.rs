@@ -13,9 +13,10 @@
 // Application is the single operation: f:x → object.
 //
 // Skip-validate flag: set by CLI --no-validate to bypass constraint
-// evaluation during bulk compile. Validation is O(constraints × population)
-// and should be indexed by affected fact type (TODO). Until then, bulk
-// loads can skip it when the readings are known-good.
+// evaluation during bulk compile. Validation is O(constraints × population);
+// per-fact-type indexing is available via the `validate:{fact_type_id}`
+// defs produced by compile_to_defs_state. Bulk loads may still skip
+// validation entirely when the readings are known-good.
 thread_local! {
     static SKIP_VALIDATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -443,8 +444,9 @@ pub enum Func {
     Platform(String),
 
     /// Opaque: wraps an arbitrary Rust closure. Escape hatch for primitives
-    /// that don't fit the AST (arithmetic, string ops, external calls).
-    /// TODO: replace all uses with Platform for FPGA synthesis.
+    /// that don't fit the AST. The θ₁ relational ops that previously used
+    /// this now route through Platform; Native remains for any future
+    /// Rust-only escape hatches and is not FPGA-synthesizable.
     Native(Fn1),
 }
 
@@ -909,11 +911,159 @@ fn apply_platform(name: &str, x: &Object, d: &Object) -> Object {
         "compile" => platform_compile(x, d),
         "apply_command" => platform_apply_command(x, d),
         "verify_signature" => platform_verify_signature(x),
+        // Codd θ₁ relational operators: take runtime data that cannot be
+        // parameterized in compile-time FFP combining forms. Routing via
+        // Platform lets each runtime (server, FPGA, Solidity) provide its
+        // own implementation of the same named operation.
+        "project" => platform_project(x),
+        "join" => platform_join(x),
+        "tie" => platform_tie(x),
+        "compose_rel" => platform_compose_rel(x),
+        "tc" => platform_tc(x),
         s if s.starts_with("create:") => platform_create(&s[7..], x, d),
         s if s.starts_with("update:") => platform_update(&s[7..], x, d),
         s if s.starts_with("transition:") => platform_transition(&s[11..], x, d),
         _ => Object::Bottom,
     }
+}
+
+/// Codd π: project:<indices, R> → rows of R restricted to the given column indices.
+fn platform_project(x: &Object) -> Object {
+    x.as_seq()
+        .filter(|items| items.len() == 2)
+        .and_then(|items| {
+            let indices = items[0].as_seq()?;
+            let relation = items[1].as_seq()?;
+            let selectors: Vec<usize> = indices.iter()
+                .filter_map(|i| i.as_atom().and_then(|s| s.parse().ok()))
+                .collect();
+            (!selectors.is_empty()).then_some(())?;
+            let rows: Vec<Object> = relation.iter()
+                .filter_map(|tuple| {
+                    let cols = tuple.as_seq()?;
+                    let projected: Vec<Object> = selectors.iter()
+                        .filter_map(|&s| (s >= 1 && s <= cols.len()).then(|| cols[s-1].clone()))
+                        .collect();
+                    Some(Object::Seq(projected))
+                })
+                .fold(Vec::new(), |mut acc, row| {
+                    (!acc.contains(&row)).then(|| acc.push(row));
+                    acc
+                });
+            Some(Object::Seq(rows))
+        })
+        .unwrap_or(Object::Bottom)
+}
+
+/// Codd ⋈: join:<shared_col, R, S> → natural join on shared column index.
+fn platform_join(x: &Object) -> Object {
+    x.as_seq()
+        .filter(|items| items.len() == 3)
+        .and_then(|items| {
+            let shared_col: usize = items[0].as_atom().and_then(|s| s.parse().ok())?;
+            let r = items[1].as_seq()?;
+            let s = items[2].as_seq()?;
+            let result: Vec<Object> = r.iter()
+                .filter_map(|r_tuple| {
+                    r_tuple.as_seq()
+                        .filter(|cols| shared_col >= 1 && shared_col <= cols.len())
+                })
+                .flat_map(|r_cols| {
+                    let r_val = r_cols[shared_col - 1].clone();
+                    s.iter().filter_map(move |s_tuple| {
+                        let s_cols = s_tuple.as_seq()
+                            .filter(|cols| shared_col >= 1 && shared_col <= cols.len())?;
+                        (r_val == s_cols[shared_col - 1]).then(|| {
+                            let mut merged: Vec<Object> = r_cols.to_vec();
+                            merged.extend(s_cols.iter().enumerate()
+                                .filter(|(i, _)| i + 1 != shared_col)
+                                .map(|(_, col)| col.clone()));
+                            Object::Seq(merged)
+                        })
+                    })
+                })
+                .collect();
+            Some(Object::Seq(result))
+        })
+        .unwrap_or(Object::Bottom)
+}
+
+/// Codd γ (tie): tie:R → Filter(eq ∘ [sel(1), sel(n)]) : R, then drop last col.
+fn platform_tie(x: &Object) -> Object {
+    x.as_seq()
+        .map(|relation| {
+            Object::Seq(relation.iter()
+                .filter_map(|tuple| {
+                    let cols = tuple.as_seq()?;
+                    (cols.len() >= 2 && cols[0] == cols[cols.len() - 1])
+                        .then(|| Object::Seq(cols[..cols.len()-1].to_vec()))
+                })
+                .collect())
+        })
+        .unwrap_or(Object::Bottom)
+}
+
+/// Codd ⋅ (compose): compose_rel:<shared_col, R, S> = π₁ₛ(R ⋈ S).
+fn platform_compose_rel(x: &Object) -> Object {
+    x.as_seq()
+        .filter(|items| items.len() == 3)
+        .and_then(|items| {
+            let shared_col: usize = items[0].as_atom().and_then(|s| s.parse().ok())?;
+            let r = items[1].as_seq()?;
+            let s = items[2].as_seq()?;
+            let result: Vec<Object> = r.iter()
+                .filter_map(|r_tuple| {
+                    r_tuple.as_seq()
+                        .filter(|cols| shared_col >= 1 && shared_col <= cols.len())
+                })
+                .flat_map(|r_cols| {
+                    let r_val = r_cols[shared_col - 1].clone();
+                    s.iter().filter_map(move |s_tuple| {
+                        let s_cols = s_tuple.as_seq()
+                            .filter(|cols| shared_col >= 1 && shared_col <= cols.len())?;
+                        (r_val == s_cols[shared_col - 1]).then(|| {
+                            let projected: Vec<Object> = r_cols.iter().enumerate()
+                                .filter(|(i, _)| i + 1 != shared_col)
+                                .map(|(_, col)| col.clone())
+                                .chain(s_cols.iter().enumerate()
+                                    .filter(|(i, _)| i + 1 != shared_col)
+                                    .map(|(_, col)| col.clone()))
+                                .collect();
+                            Object::Seq(projected)
+                        })
+                    })
+                })
+                .collect();
+            Some(Object::Seq(result))
+        })
+        .unwrap_or(Object::Bottom)
+}
+
+/// Transitive closure over an edge relation. Iterates until no new edges are added.
+fn platform_tc(x: &Object) -> Object {
+    let edges = match x.as_seq() {
+        Some(e) => e.to_vec(),
+        None => return Object::Bottom,
+    };
+    let mut closure = edges.clone();
+    loop {
+        let new_edges: Vec<Object> = closure.iter()
+            .filter_map(|a| a.as_seq())
+            .flat_map(|a_cols| closure.iter()
+                .filter_map(move |b| b.as_seq().map(|b_cols| (a_cols, b_cols))))
+            .filter_map(|(a_cols, b_cols)| {
+                (a_cols.len() >= 2 && b_cols.len() >= 2 && a_cols[1] == b_cols[0])
+                    .then(|| Object::Seq(vec![a_cols[0].clone(), b_cols[1].clone()]))
+            })
+            .filter(|edge| !closure.contains(edge))
+            .fold(Vec::new(), |mut acc, e| {
+                (!acc.contains(&e)).then(|| acc.push(e));
+                acc
+            });
+        if new_edges.is_empty() { break; }
+        closure.extend(new_edges);
+    }
+    Object::Seq(closure)
 }
 
 /// Platform primitive: signature verification (AREST §5.5).
@@ -1747,13 +1897,27 @@ pub fn func_to_object(func: &Func) -> Object {
 ///
 /// - compose_rel: combines join + project, inheriting both limitations.
 ///
-/// All four remain Native with clear documentation of why.
+/// All four route through Platform dispatch so each runtime (Rust, FPGA,
+/// Solidity) can provide its own implementation of the named operation.
 pub fn theta1_defs_vec() -> Vec<(String, Func)> {
     let mut defs = Vec::new();
     register_theta1_into(&mut defs);
     defs
 }
 fn register_theta1_into(defs: &mut Vec<(String, Func)>) {
+    // Codd θ₁ operators are Platform ops. Each runtime (server, FPGA,
+    // Solidity) resolves the named operation to its own implementation.
+    // The Rust runtime dispatches to platform_project/join/tie/compose_rel
+    // in apply_platform. Previously these were Func::Native(closure),
+    // which couldn't be synthesized. See paper §"Relational Algebra".
+    defs.push(("project".to_string(), Func::Platform("project".to_string())));
+    defs.push(("join".to_string(), Func::Platform("join".to_string())));
+    defs.push(("tie".to_string(), Func::Platform("tie".to_string())));
+    defs.push(("compose_rel".to_string(), Func::Platform("compose_rel".to_string())));
+}
+
+#[allow(dead_code)] // reference implementations kept for docs; dispatch goes via Platform
+fn _register_theta1_native_legacy(defs: &mut Vec<(String, Func)>) {
     // project: pi_L(R) = alpha([s_i1,...,s_ik]) : R
     // Takes <indices, R> and projects R onto those columns.
     // NATIVE because: indices are data that determine which Selectors to build.
