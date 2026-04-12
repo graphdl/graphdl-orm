@@ -231,8 +231,13 @@ async function getFederationConfig(noun: string): Promise<FederationConfig | nul
   if (GRAPHDL_MODE !== 'local') return null
   try {
     const raw = await systemCall(`populate:${noun}`, '')
-    if (raw.startsWith('⊥') || raw === 'φ') return null
-    return parseFederationConfig(raw)
+    // ⊥ may surface as FFP glyphs or JSON "null" depending on encoding path.
+    if (!raw || raw === 'null' || raw === '"null"' || raw.startsWith('⊥') || raw === 'φ') return null
+    const config = parseFederationConfig(raw)
+    // A populate def must have a non-empty url to be considered federated;
+    // otherwise fall back to local population.
+    if (!config || !config.url) return null
+    return config
   } catch {
     return null
   }
@@ -326,7 +331,13 @@ server.registerTool(
     if (GRAPHDL_MODE === 'local') {
       const filterStr = filter ? JSON.stringify(filter) : ''
       const raw = await systemCall(`query:${fact_type}`, filterStr)
-      try { return textResult(JSON.parse(raw)) } catch { return textResult({ raw }) }
+      try {
+        const parsed = JSON.parse(raw)
+        // Query returns a list of matching facts; null/undefined means nothing matched.
+        return textResult(parsed ?? [])
+      } catch {
+        return textResult({ raw })
+      }
     }
     const data = await httpRequest(`/arest/default/query/${encodeURIComponent(fact_type)}`, {
       method: 'POST',
@@ -398,19 +409,17 @@ server.registerTool(
   },
   async ({ noun, id, status }) => {
     if (GRAPHDL_MODE === 'local') {
-      const transitions = await systemCall(`transitions:${noun}`, status || '')
-      const raw = await systemCall(`get:${noun}`, id)
-      try {
-        return textResult({
-          entity: id,
-          noun,
-          transitions: transitions,
-          // Navigation links are part of the entity representation
-          entity_data: JSON.parse(raw),
-        })
-      } catch {
-        return textResult({ entity: id, transitions, raw })
+      const rawTransitions = await systemCall(`transitions:${noun}`, status || '')
+      const rawEntity = await systemCall(`get:${noun}`, id)
+      const parseOr = <T>(raw: string, fallback: T): T | any => {
+        try { const v = JSON.parse(raw); return v ?? fallback } catch { return fallback }
       }
+      return textResult({
+        entity: id,
+        noun,
+        transitions: parseOr(rawTransitions, []),
+        entity_data: parseOr(rawEntity, null),
+      })
     }
     const data = await httpRequest(`/arest/default/${encodeURIComponent(noun)}/${encodeURIComponent(id)}/actions`)
     return textResult(data)
@@ -467,7 +476,10 @@ server.registerTool(
   async ({ readings }) => {
     if (GRAPHDL_MODE === 'local') {
       const raw = await systemCall('compile', readings)
-      return textResult({ ok: !raw.startsWith('⊥'), result: raw })
+      const ok = !raw.startsWith('⊥')
+      let result: any = raw
+      try { result = JSON.parse(raw) } catch {}
+      return textResult({ ok, result })
     }
     const data = await httpRequest('/parse', {
       method: 'POST',
