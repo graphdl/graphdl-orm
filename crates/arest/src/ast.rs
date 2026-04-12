@@ -310,6 +310,18 @@ pub enum Func {
     /// Equals: eq:<x, y> = T if x = y, F otherwise
     Eq,
 
+    /// Greater than: gt:<x, y> = T if x > y (numeric), F otherwise. ⊥ on non-numeric.
+    Gt,
+
+    /// Less than: lt:<x, y> = T if x < y (numeric), F otherwise. ⊥ on non-numeric.
+    Lt,
+
+    /// Greater or equal: ge:<x, y> = T if x ≥ y (numeric), F otherwise.
+    Ge,
+
+    /// Less or equal: le:<x, y> = T if x ≤ y (numeric), F otherwise.
+    Le,
+
     /// Contains: contains:<x,y> = T if atom x contains atom y (case-insensitive), else F
     Contains,
 
@@ -454,6 +466,22 @@ pub enum Func {
 // f:x → Object. This is beta reduction.
 
 /// Parse a pair of number atoms, apply an arithmetic operation (Backus +,-,×,÷).
+/// Numeric comparison helper for Gt/Lt/Ge/Le primitives.
+/// Parses both operands as f64. Returns T/F/Bottom.
+fn apply_compare(x: &Object, op: fn(f64, f64) -> bool) -> Object {
+    match x.as_seq() {
+        Some(items) if items.len() == 2 => {
+            let a = items[0].as_atom().and_then(|s| s.parse::<f64>().ok());
+            let b = items[1].as_atom().and_then(|s| s.parse::<f64>().ok());
+            match (a, b) {
+                (Some(a), Some(b)) => if op(a, b) { Object::t() } else { Object::f() },
+                _ => Object::Bottom,
+            }
+        }
+        _ => Object::Bottom,
+    }
+}
+
 fn apply_arithmetic(x: &Object, op: fn(f64, f64) -> Option<f64>) -> Object {
     match x.as_seq() {
         Some(items) if items.len() == 2 => {
@@ -547,6 +575,11 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
                 _ => Object::Bottom,
             }
         }
+
+        Func::Gt => apply_compare(x, |a, b| a > b),
+        Func::Lt => apply_compare(x, |a, b| a < b),
+        Func::Ge => apply_compare(x, |a, b| a >= b),
+        Func::Le => apply_compare(x, |a, b| a <= b),
 
         Func::Contains => {
             match x.as_seq() {
@@ -920,6 +953,7 @@ fn apply_platform(name: &str, x: &Object, d: &Object) -> Object {
         "tie" => platform_tie(x),
         "compose_rel" => platform_compose_rel(x),
         "tc" => platform_tc(x),
+        "tc_cycles" => platform_tc_cycles(x),
         s if s.starts_with("create:") => platform_create(&s[7..], x, d),
         s if s.starts_with("update:") => platform_update(&s[7..], x, d),
         s if s.starts_with("transition:") => platform_transition(&s[11..], x, d),
@@ -1037,6 +1071,57 @@ fn platform_compose_rel(x: &Object) -> Object {
             Some(Object::Seq(result))
         })
         .unwrap_or(Object::Bottom)
+}
+
+/// Transitive closure over encoded facts, returning self-loops (cycles)
+/// as violation-shaped objects. Input shape: sequence of
+/// <<noun0, val0>, <noun1, val1>> encoded facts. Output shape: sequence
+/// of fact-like objects for nodes that participate in a cycle.
+/// Used by the acyclic (AC) ring constraint compiler.
+fn platform_tc_cycles(x: &Object) -> Object {
+    let initial = match x.as_seq() {
+        Some(e) => e.to_vec(),
+        None => return Object::Bottom,
+    };
+    // Extract <role0_val, role1_val> from each encoded fact.
+    fn edge_pair(fact: &Object) -> Option<(String, String)> {
+        let items = fact.as_seq().filter(|i| i.len() >= 2)?;
+        let v0 = items[0].as_seq().and_then(|p| p.get(1)).and_then(|v| v.as_atom())?;
+        let v1 = items[1].as_seq().and_then(|p| p.get(1)).and_then(|v| v.as_atom())?;
+        Some((v0.to_string(), v1.to_string()))
+    }
+    let original_pairs: Vec<(String, String)> = initial.iter()
+        .filter_map(|f| edge_pair(f))
+        .collect();
+    // Fixed point: extend with one-hop reachable edges until stable.
+    let tc: std::collections::HashSet<(String, String)> = std::iter::successors(
+        Some(original_pairs.iter().cloned().collect::<std::collections::HashSet<_>>()),
+        |tc| {
+            let new_edges: Vec<(String, String)> = tc.iter()
+                .flat_map(|(a, b)| original_pairs.iter()
+                    .filter(|(c, _)| b == c)
+                    .filter_map(|(_, d)| {
+                        (!tc.contains(&(a.clone(), d.clone())))
+                            .then(|| (a.clone(), d.clone()))
+                    })
+                    .collect::<Vec<_>>())
+                .collect();
+            (!new_edges.is_empty()).then(|| {
+                let mut next = tc.clone();
+                next.extend(new_edges);
+                next
+            })
+        },
+    ).take(1001).last().unwrap_or_default();
+    // Self-loops → violation-shaped objects.
+    let cycle_nodes: Vec<Object> = tc.iter()
+        .filter(|(a, b)| a == b)
+        .map(|(a, _)| Object::Seq(vec![
+            Object::Seq(vec![Object::atom("_"), Object::atom(a)]),
+            Object::Seq(vec![Object::atom("_"), Object::atom(a)]),
+        ]))
+        .collect();
+    Object::Seq(cycle_nodes)
 }
 
 /// Transitive closure over an edge relation. Iterates until no new edges are added.
@@ -1444,6 +1529,10 @@ pub mod primitives {
     pub const TL: &str = "tl";
     pub const ATOM: &str = "a?";
     pub const EQ: &str = "=";
+    pub const GT: &str = ">";
+    pub const LT: &str = "<";
+    pub const GE: &str = ">=";
+    pub const LE: &str = "<=";
     pub const NULL: &str = "0?";
     pub const REVERSE: &str = "<>";
     pub const DISTL: &str = "dl";
@@ -1699,6 +1788,10 @@ fn metacompose_atom(name: &str, d: &Object) -> Func {
         primitives::TL => Func::Tail,
         primitives::ATOM => Func::AtomTest,
         primitives::EQ => Func::Eq,
+        primitives::GT => Func::Gt,
+        primitives::LT => Func::Lt,
+        primitives::GE => Func::Ge,
+        primitives::LE => Func::Le,
         primitives::CONTAINS => Func::Contains,
         primitives::CONCAT => Func::Concat,
         primitives::LOWER => Func::Lower,
@@ -1820,6 +1913,10 @@ pub fn func_to_object(func: &Func) -> Object {
         Func::AtomTest => Object::atom(primitives::ATOM),
         Func::NullTest => Object::atom(primitives::NULL),
         Func::Eq => Object::atom(primitives::EQ),
+        Func::Gt => Object::atom(primitives::GT),
+        Func::Lt => Object::atom(primitives::LT),
+        Func::Ge => Object::atom(primitives::GE),
+        Func::Le => Object::atom(primitives::LE),
         Func::Contains => Object::atom(primitives::CONTAINS),
         Func::Concat => Object::atom(primitives::CONCAT),
         Func::Lower => Object::atom(primitives::LOWER),
@@ -2136,6 +2233,10 @@ impl fmt::Debug for Func {
             Func::AtomTest => write!(f, "atom"),
             Func::NullTest => write!(f, "null"),
             Func::Eq => write!(f, "eq"),
+            Func::Gt => write!(f, ">"),
+            Func::Lt => write!(f, "<"),
+            Func::Ge => write!(f, "≥"),
+            Func::Le => write!(f, "≤"),
             Func::Contains => write!(f, "contains"),
             Func::Concat => write!(f, "concat"),
             Func::Lower => write!(f, "lower"),
@@ -2235,6 +2336,47 @@ mod tests {
         let diff = Object::seq(vec![Object::atom("x"), Object::atom("y")]);
         assert_eq!(apply(&Func::Eq, &same, &defs()), Object::t());
         assert_eq!(apply(&Func::Eq, &diff, &defs()), Object::f());
+    }
+
+    #[test]
+    fn numeric_comparisons() {
+        let three_two = Object::seq(vec![Object::atom("3"), Object::atom("2")]);
+        let two_two = Object::seq(vec![Object::atom("2"), Object::atom("2")]);
+        let two_three = Object::seq(vec![Object::atom("2"), Object::atom("3")]);
+        // Gt: 3 > 2 true, 2 > 2 false, 2 > 3 false
+        assert_eq!(apply(&Func::Gt, &three_two, &defs()), Object::t());
+        assert_eq!(apply(&Func::Gt, &two_two, &defs()), Object::f());
+        assert_eq!(apply(&Func::Gt, &two_three, &defs()), Object::f());
+        // Lt: inverse of Gt
+        assert_eq!(apply(&Func::Lt, &three_two, &defs()), Object::f());
+        assert_eq!(apply(&Func::Lt, &two_three, &defs()), Object::t());
+        // Ge: 3 >= 2 true, 2 >= 2 true, 2 >= 3 false
+        assert_eq!(apply(&Func::Ge, &three_two, &defs()), Object::t());
+        assert_eq!(apply(&Func::Ge, &two_two, &defs()), Object::t());
+        assert_eq!(apply(&Func::Ge, &two_three, &defs()), Object::f());
+        // Le: inverse of Ge
+        assert_eq!(apply(&Func::Le, &two_two, &defs()), Object::t());
+        assert_eq!(apply(&Func::Le, &two_three, &defs()), Object::t());
+        assert_eq!(apply(&Func::Le, &three_two, &defs()), Object::f());
+        // Non-numeric: Bottom
+        let strings = Object::seq(vec![Object::atom("x"), Object::atom("y")]);
+        assert_eq!(apply(&Func::Gt, &strings, &defs()), Object::Bottom);
+    }
+
+    #[test]
+    fn numeric_comparisons_roundtrip_through_metacompose() {
+        // Each comparator must round-trip: Func → Object → metacompose → Func
+        for (variant, name) in [
+            (Func::Gt, "gt"), (Func::Lt, "lt"),
+            (Func::Ge, "ge"), (Func::Le, "le"),
+        ] {
+            let obj = func_to_object(&variant);
+            let recovered = metacompose(&obj, &defs());
+            let input = Object::seq(vec![Object::atom("5"), Object::atom("3")]);
+            assert_eq!(apply(&variant, &input, &defs()),
+                       apply(&recovered, &input, &defs()),
+                       "{} round-trip failed", name);
+        }
     }
 
     // ── Combining forms ──────────────────────────────────────────

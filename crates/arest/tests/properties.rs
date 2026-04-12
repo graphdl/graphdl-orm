@@ -2158,22 +2158,36 @@ P has Name := P has some Q and that Q has some Name.
 #[test]
 #[ignore] // Run with: cargo test --release -- --ignored scale_test
 fn scale_test_10k_entities_100_fact_types() {
-    // Generate a domain with 100 entity types, each with 10 field facts.
-    // Then create 10K entities total (100 per type).
+    // Schema: 100 entity types × 1 fact type each (Entity{i} has Name).
+    // Instances: 100 entities per type = 10,000 total instance facts.
+    // Measures: parse, compile, fetch. Surfaces bottlenecks at production scale.
     let mut readings = String::from("## Entity Types\n\n");
     for i in 0..100 {
         readings.push_str(&format!("Entity{}(.id) is an entity type.\n", i));
     }
-    readings.push_str("Name is a value type.\nValue is a value type.\n");
+    readings.push_str("Name is a value type.\n");
     readings.push_str("\n## Fact Types\n\n");
     for i in 0..100 {
         readings.push_str(&format!("Entity{} has Name.\n  Each Entity{} has exactly one Name.\n", i, i));
     }
 
+    // 10K instance facts: 100 entities × 100 types.
+    readings.push_str("\n## Instance Facts\n\n");
+    for type_idx in 0..100 {
+        for entity_idx in 0..100 {
+            readings.push_str(&format!(
+                "Entity{} 'e{}-{}' has Name 'name-{}-{}'.\n",
+                type_idx, type_idx, entity_idx, type_idx, entity_idx
+            ));
+        }
+    }
+
+    eprintln!("[scale] input size: {} bytes", readings.len());
+
     let t = std::time::Instant::now();
     let ir = parse_forml2::parse_markdown(&readings).unwrap();
-    eprintln!("[scale] parse: {:?} ({} nouns, {} fts)",
-        t.elapsed(), ir.nouns.len(), ir.fact_types.len());
+    eprintln!("[scale] parse: {:?} ({} nouns, {} fts, {} instance facts)",
+        t.elapsed(), ir.nouns.len(), ir.fact_types.len(), ir.general_instance_facts.len());
 
     let t = std::time::Instant::now();
     let state = parse_forml2::domain_to_state(&ir);
@@ -2196,6 +2210,17 @@ fn scale_test_10k_entities_100_fact_types() {
     }
     eprintln!("[scale] 1000 fetches on D: {:?}", t.elapsed());
 
+    // Fetch per-cell instance facts: should be O(1) per cell, each cell has ~100 facts.
+    let t = std::time::Instant::now();
+    let mut total_facts = 0usize;
+    for i in 0..100 {
+        let key = format!("Entity{}_has_Name", i);
+        let cell = ast::fetch(&key, &d);
+        total_facts += cell.as_seq().map(|s| s.len()).unwrap_or(0);
+    }
+    eprintln!("[scale] 100 instance-cell fetches: {:?} ({} facts total)",
+        t.elapsed(), total_facts);
+
     // Verify shard map and derivation index scale
     let shard_count = ast::cells_iter(&d).into_iter()
         .filter(|(n, _)| n.starts_with("shard:")).count();
@@ -2204,8 +2229,12 @@ fn scale_test_10k_entities_100_fact_types() {
     eprintln!("[scale] {} shard entries, {} derivation index entries",
         shard_count, index_count);
 
-    assert!(ir.nouns.len() >= 100, "Should have 100+ entity types");
-    assert!(shard_count >= 100, "Should have 100+ shard entries");
+    assert_eq!(ir.general_instance_facts.len(), 10_000,
+        "Should parse 10K instance facts");
+    assert_eq!(total_facts, 10_000,
+        "All 10K facts should be reachable via per-cell fetch");
+    assert!(ir.nouns.len() >= 100);
+    assert!(shard_count >= 100);
 }
 
 #[test]
