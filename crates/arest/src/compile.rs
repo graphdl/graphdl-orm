@@ -559,6 +559,15 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
     defs.extend(model.schemas.iter()
         .map(|(id, schema)| (format!("schema:{}", id), schema.construction.clone())));
 
+    // Cell sharding: shard:{fact_type_id} → cell_owner (paper Eq. demux).
+    // RMAP determines which entity cell owns each fact type.
+    // Enables: E_n = Filter(eq ∘ [RMAP, n̄]) : E for per-cell event demux.
+    let shard_map = crate::rmap::rmap_cell_map(&domain);
+    eprintln!("  [profile] shard map: {} fact types partitioned", shard_map.len());
+    defs.extend(shard_map.iter().map(|(ft_id, cell)| {
+        (format!("shard:{}", ft_id), Func::constant(Object::atom(cell)))
+    }));
+
     // resolve:{noun} — Condition chain mapping field_name → fact_type_id.
     // Input: field_name atom. Output: fact_type_id atom.
     // Compiled from NounIndex: for each fact type involving this noun,
