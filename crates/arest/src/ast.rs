@@ -25,7 +25,7 @@ fn is_skip_validate() -> bool { SKIP_VALIDATE.with(|b| b.get()) }
 //
 // All framework objects compile to these types:
 //   Role        → Selector
-//   Graph Schema → Construction (CONS of roles)
+//   Fact Type → Construction (CONS of roles)
 //   Query       → partial application (some roles bound)
 //   Fact        → fully applied Construction (all roles bound)
 //   Derivation  → Composition chain
@@ -420,7 +420,7 @@ pub enum Func {
     /// Composition: (f ∘ g):x = f:(g:x). Derivation rule chains.
     Compose(Box<Func>, Box<Func>),
 
-    /// Construction: [f₁,...,fₙ]:x = <f₁:x,...,fₙ:x>. Graph Schema = CONS of Roles.
+    /// Construction: [f₁,...,fₙ]:x = <f₁:x,...,fₙ:x>. Fact Type = CONS of Roles.
     Construction(Vec<Func>),
 
     /// Condition: (p → f; g):x = if p:x = T then f:x, if F then g:x, else ⊥.
@@ -1245,7 +1245,7 @@ pub(crate) const PLATFORM_MAX_FIELD: usize = 64 * 1024;
 /// noun are rejected by `platform_compile`.
 pub(crate) const RESERVED_METAMODEL_NOUNS: &[&str] = &[
     "Noun",
-    "Graph Schema",
+    "Fact Type",
     "Role",
     "Constraint",
     "State Machine Definition",
@@ -1422,7 +1422,7 @@ fn platform_apply_command(x: &Object, d: &Object) -> Object {
         Some(_) => return Object::atom("⊥ input exceeds platform buffer"),
         None => return Object::Bottom,
     };
-    let command: crate::arest::Command = match serde_json::from_str(input) {
+    let command: crate::command::Command = match serde_json::from_str(input) {
         Ok(c) => c,
         Err(e) => return Object::atom(&format!("⊥ {}", e)),
     };
@@ -1433,7 +1433,7 @@ fn platform_apply_command(x: &Object, d: &Object) -> Object {
     }
     // D contains both population cells and def cells.
     // apply_command_defs uses d for ρ-dispatch and state for population.
-    let result = crate::arest::apply_command_defs(d, &command, d);
+    let result = crate::command::apply_command_defs(d, &command, d);
     match serde_json::to_string(&result) {
         Ok(s) => Object::atom(&s),
         Err(e) => Object::atom(&format!("⊥ {}", e)),
@@ -1445,7 +1445,7 @@ fn platform_apply_command(x: &Object, d: &Object) -> Object {
 /// Returns the result as an Object containing the new state.
 fn platform_create(noun: &str, x: &Object, d: &Object) -> Object {
     let (id, fields) = extract_fact_pairs(x);
-    let command = crate::arest::Command::CreateEntity {
+    let command = crate::command::Command::CreateEntity {
         noun: noun.to_string(),
         domain: String::new(),
         id,
@@ -1453,8 +1453,8 @@ fn platform_create(noun: &str, x: &Object, d: &Object) -> Object {
         sender: None,
         signature: None,
     };
-    let result = crate::arest::apply_command_defs(d, &command, d);
-    crate::arest::encode_command_result(&result)
+    let result = crate::command::apply_command_defs(d, &command, d);
+    crate::command::encode_command_result(&result)
 }
 
 /// Platform primitive: update entity from fact pairs.
@@ -1462,7 +1462,7 @@ fn platform_create(noun: &str, x: &Object, d: &Object) -> Object {
 fn platform_update(noun: &str, x: &Object, d: &Object) -> Object {
     let (id, fields) = extract_fact_pairs(x);
     let entity_id = id.unwrap_or_default();
-    let command = crate::arest::Command::UpdateEntity {
+    let command = crate::command::Command::UpdateEntity {
         noun: noun.to_string(),
         domain: String::new(),
         entity_id,
@@ -1470,8 +1470,8 @@ fn platform_update(noun: &str, x: &Object, d: &Object) -> Object {
         sender: None,
         signature: None,
     };
-    let result = crate::arest::apply_command_defs(d, &command, d);
-    crate::arest::encode_command_result(&result)
+    let result = crate::command::apply_command_defs(d, &command, d);
+    crate::command::encode_command_result(&result)
 }
 
 /// Platform primitive: transition entity state machine.
@@ -1489,7 +1489,7 @@ fn platform_transition(_noun: &str, x: &Object, d: &Object) -> Object {
         .and_then(|facts| facts.iter()
             .find(|f| binding_matches(f, "State Machine", &entity_id))
             .and_then(|f| binding(f, "currentlyInStatus").map(|s| s.to_string())));
-    let command = crate::arest::Command::Transition {
+    let command = crate::command::Command::Transition {
         entity_id,
         event,
         domain: String::new(),
@@ -1497,8 +1497,8 @@ fn platform_transition(_noun: &str, x: &Object, d: &Object) -> Object {
         sender: None,
         signature: None,
     };
-    let result = crate::arest::apply_command_defs(d, &command, d);
-    crate::arest::encode_command_result(&result)
+    let result = crate::command::apply_command_defs(d, &command, d);
+    crate::command::encode_command_result(&result)
 }
 
 /// Extract (optional id, field map) from an Object of fact pairs.
@@ -1650,8 +1650,8 @@ fn platform_get_noun(noun: &str, x: &Object, d: &Object) -> Object {
 
 /// Walk a Command's string fields and return the name of the first field whose
 /// value exceeds PLATFORM_MAX_FIELD bytes, or None if all values are within bound.
-fn command_field_overflow(command: &crate::arest::Command) -> Option<&'static str> {
-    use crate::arest::Command;
+fn command_field_overflow(command: &crate::command::Command) -> Option<&'static str> {
+    use crate::command::Command;
     let over = |s: &str| s.len() > PLATFORM_MAX_FIELD;
     let map_over = |m: &std::collections::HashMap<String, String>| -> bool {
         m.iter().any(|(k, v)| over(k) || over(v))
@@ -2662,7 +2662,7 @@ mod tests {
     }
 
     #[test]
-    fn construction_is_graph_schema() {
+    fn construction_is_fact_type() {
         // Graph schema "User has Org Role in Organization" = [Role₁, Role₂, Role₃]
         // Applied to a membership fact, selects each role's resource.
         let schema = Func::construction(vec![Func::role(1), Func::role(2), Func::role(3)]);
@@ -4015,7 +4015,7 @@ mod tests {
     // cover the integration path via `platform_apply_command` for both
     // the PLATFORM_MAX_INPUT (1MB) and PLATFORM_MAX_FIELD gates.
 
-    use crate::arest::Command as ArestCommand;
+    use crate::command::Command as ArestCommand;
 
     fn huge() -> String {
         "a".repeat(PLATFORM_MAX_FIELD + 1)

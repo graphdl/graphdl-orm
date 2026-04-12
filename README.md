@@ -1,4 +1,4 @@
-# graphdl-orm
+# arest
 
 An implementation of [AREST](AREST.tex) — *Compiling Facts into Applications*.
 
@@ -80,10 +80,10 @@ The engine is exposed to agents via MCP with a frozen v1.0 verb set.
 ```json
 {
   "mcpServers": {
-    "graphdl": {
+    "arest": {
       "command": "npx",
-      "args": ["-y", "graphdl-orm", "mcp"],
-      "env": { "GRAPHDL_MODE": "local", "GRAPHDL_READINGS_DIR": "./readings" }
+      "args": ["-y", "arest", "mcp"],
+      "env": { "AREST_MODE": "local", "AREST_READINGS_DIR": "./readings" }
     }
   }
 }
@@ -102,7 +102,7 @@ The engine is exposed to agents via MCP with a frozen v1.0 verb set.
 - `synthesize` — facts plus forward-chained derivations → prose
 - `validate` — raw text → LLM-extracted facts → constraint check
 
-Every framework primitive (Noun, Graph Schema, Fact Type, Constraint, Derivation Rule, State Machine Definition, Status, Transition, Event Type, Instance Fact, Verb, Reading, External System, Agent Definition, Generator opt-in) is reachable via these verbs. Runtime Platform functions are registered server-side and are intentionally not LLM-exposed.
+Every framework primitive (Noun, Fact Type, Fact Type, Constraint, Derivation Rule, State Machine Definition, Status, Transition, Event Type, Instance Fact, Verb, Reading, External System, Agent Definition, Generator opt-in) is reachable via these verbs. Runtime Platform functions are registered server-side and are intentionally not LLM-exposed.
 
 ## Federation
 

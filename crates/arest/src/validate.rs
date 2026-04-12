@@ -24,11 +24,11 @@ pub fn ir_to_metamodel_state(ir: &Domain) -> crate::ast::Object {
 
     let state = ir.fact_types.iter().fold(state, |acc, (ft_id, ft)| {
         let arity = ft.roles.len().to_string();
-        let acc = cell_push("Graph Schema has Reading", fact_from_pairs(&[("Graph Schema", ft_id), ("Reading", &ft.reading)]), &acc);
-        let acc = cell_push("Graph Schema has Arity", fact_from_pairs(&[("Graph Schema", ft_id), ("Arity", &arity)]), &acc);
+        let acc = cell_push("Fact Type has Reading", fact_from_pairs(&[("Fact Type", ft_id), ("Reading", &ft.reading)]), &acc);
+        let acc = cell_push("Fact Type has Arity", fact_from_pairs(&[("Fact Type", ft_id), ("Arity", &arity)]), &acc);
         ft.roles.iter().fold(acc, |a, role| {
             let role_id = format!("{}:{}", ft_id, role.role_index);
-            let a = cell_push("Graph Schema has Role", fact_from_pairs(&[("Graph Schema", ft_id), ("Role", &role_id)]), &a);
+            let a = cell_push("Fact Type has Role", fact_from_pairs(&[("Fact Type", ft_id), ("Role", &role_id)]), &a);
             cell_push("Noun plays Role", fact_from_pairs(&[("Noun", &role.noun_name), ("Role", &role_id)]), &a)
         })
     });
@@ -43,11 +43,11 @@ pub fn ir_to_metamodel_state(ir: &Domain) -> crate::ast::Object {
     });
 
     let state = ir.derivation_rules.iter().fold(state, |acc, rule| {
-        let acc = cell_push("Derivation Rule produces Graph Schema", fact_from_pairs(&[
-            ("Derivation Rule", &rule.id), ("Graph Schema", &rule.consequent_fact_type_id)]), &acc);
+        let acc = cell_push("Derivation Rule produces Fact Type", fact_from_pairs(&[
+            ("Derivation Rule", &rule.id), ("Fact Type", &rule.consequent_fact_type_id)]), &acc);
         rule.antecedent_fact_type_ids.iter().fold(acc, |a, antecedent|
-            cell_push("Derivation Rule has antecedent Graph Schema", fact_from_pairs(&[
-                ("Derivation Rule", &rule.id), ("Graph Schema", antecedent)]), &a))
+            cell_push("Derivation Rule has antecedent Fact Type", fact_from_pairs(&[
+                ("Derivation Rule", &rule.id), ("Fact Type", antecedent)]), &a))
     });
 
     // Derived: rule dependencies
@@ -128,7 +128,7 @@ mod tests {
         let ir = simple_ir();
         let state = ir_to_metamodel_state(&ir);
 
-        let schema_facts = fetch_or_phi("Graph Schema has Reading", &state);
+        let schema_facts = fetch_or_phi("Fact Type has Reading", &state);
         let facts = schema_facts.as_seq().unwrap();
         assert_eq!(facts.len(), 1);
         assert!(binding(&facts[0], "Reading") == Some("Person has Name"));
@@ -140,7 +140,7 @@ mod tests {
         let ir = simple_ir();
         let state = ir_to_metamodel_state(&ir);
 
-        let arity_facts = fetch_or_phi("Graph Schema has Arity", &state);
+        let arity_facts = fetch_or_phi("Fact Type has Arity", &state);
         let facts = arity_facts.as_seq().unwrap();
         assert_eq!(facts.len(), 1);
         assert!(binding(&facts[0], "Arity") == Some("2"));

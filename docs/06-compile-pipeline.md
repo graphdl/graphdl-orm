@@ -1,6 +1,6 @@
 # 06 · The Compile Pipeline
 
-This doc walks through what happens between the moment you hand the engine a directory of readings and the moment it is ready to answer queries. You do not need to understand every step to use graphdl-orm, but understanding the pipeline helps when debugging, optimizing, or extending the system.
+This doc walks through what happens between the moment you hand the engine a directory of readings and the moment it is ready to answer queries. You do not need to understand every step to use arest, but understanding the pipeline helps when debugging, optimizing, or extending the system.
 
 ## One-line summary
 
@@ -33,7 +33,7 @@ Parse is currently the slowest step at scale (~58 µs per fact type or instance 
 
 ## Step 2: `domain_to_state`
 
-The `Domain` struct is turned into a single `Object::Map` where each cell holds a sequence of facts. One cell per category (Noun, GraphSchema, Constraint, DerivationRule, ...) plus one cell per declared fact type ID (for instance facts).
+The `Domain` struct is turned into a single `Object::Map` where each cell holds a sequence of facts. One cell per category (Noun, FactType, Constraint, DerivationRule, ...) plus one cell per declared fact type ID (for instance facts).
 
 This step is O(n) in the number of facts. Cells are built mutably and wrapped in a `Map` once at the end — cheaper than the equivalent fold over `cell_push` which would be O(n²).
 

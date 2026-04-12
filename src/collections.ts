@@ -40,7 +40,7 @@ export function pluralize(word: string): string {
  *
  * "Organization"             → "organizations"
  * "OrgMembership"            → "org-memberships"
- * "Graph Schema"             → "graph-schemas"
+ * "Fact Type"             → "graph-schemas"
  * "State Machine Definition" → "state-machine-definitions"
  * "Status"                   → "statuses"
  */
@@ -63,7 +63,7 @@ export function nounToSlug(name: string): string {
  *
  * "Organization"    → "organizations"
  * "OrgMembership"   → "org_memberships"
- * "Graph Schema"    → "graph_schemas"
+ * "Fact Type"    → "fact_types"
  * "Support Request" → "support_requests"
  * "Status"          → "statuses"
  */

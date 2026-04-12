@@ -1,6 +1,6 @@
 # 01 · Introduction
 
-graphdl-orm turns plain-English business rules into running applications. You write sentences like
+arest turns plain-English business rules into running applications. You write sentences like
 
 ```
 Order was placed by Customer.
@@ -20,7 +20,7 @@ AREST is the composition: a FORML 2 reading is simultaneously a relation schema,
 
 ## When to use it
 
-graphdl-orm is a fit when:
+arest is a fit when:
 
 - **Your domain is fact-oriented.** You can describe what you want in sentences like "Each Order was placed by exactly one Customer" rather than pseudo-code.
 - **You want the spec to be the implementation.** Business analysts write readings; developers do not translate them into models and controllers.
@@ -34,7 +34,7 @@ It is not a fit when:
 
 - **Your core logic is arithmetic or optimization.** Statistical scoring, ML inference, numerical simulation — those are opaque to ρ. Use a Platform function with a named implementation the runtime resolves.
 - **You need to evolve aggressively without review.** `compile` is immediate self-modification; `propose` is governed. Teams that want neither workflow should not use this system.
-- **Your performance budget is microseconds end-to-end.** The compile step is ~50 ms at 100 fact types. Per-command create is sub-millisecond, but adding graphdl-orm to a hot path where every microsecond counts is the wrong trade.
+- **Your performance budget is microseconds end-to-end.** The compile step is ~50 ms at 100 fact types. Per-command create is sub-millisecond, but adding arest to a hot path where every microsecond counts is the wrong trade.
 
 ## What you will learn in these docs
 

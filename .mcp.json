@@ -1,32 +1,32 @@
 {
   "$schema": "https://raw.githubusercontent.com/modelcontextprotocol/sdk/main/schemas/mcp.json",
   "mcpServers": {
-    "graphdl": {
-      "description": "GraphDL AREST engine — FORML2 readings → REST API. Exposes create/apply/compile/audit tools for domain modeling, constraint validation, and self-modification.",
+    "arest": {
+      "description": "AREST engine — FORML2 readings → REST API. Exposes create/apply/compile/audit tools for domain modeling, constraint validation, and self-modification.",
       "command": "npx",
       "args": ["-y", "tsx", "src/mcp/server.ts"],
       "env": {
-        "GRAPHDL_MODE": "local",
-        "GRAPHDL_READINGS_DIR": "./readings"
+        "AREST_MODE": "local",
+        "AREST_READINGS_DIR": "./readings"
       }
     },
-    "graphdl-tutor": {
-      "description": "GraphDL with the full graphdl-tutor domain bundle loaded (catalog, orders, tasks, content, scheduling, notifications). Use this to exercise every framework feature from Claude.",
+    "arest-tutor": {
+      "description": "AREST with the full arest-tutor domain bundle loaded (catalog, orders, tasks, content, scheduling, notifications). Use this to exercise every framework feature from Claude.",
       "command": "npx",
       "args": ["-y", "tsx", "src/mcp/server.ts"],
       "env": {
-        "GRAPHDL_MODE": "local",
-        "GRAPHDL_READINGS_DIR": "./tutor/domains"
+        "AREST_MODE": "local",
+        "AREST_READINGS_DIR": "./tutor/domains"
       }
     },
-    "graphdl-remote": {
-      "description": "GraphDL AREST engine (remote worker mode). Requires GRAPHDL_URL and GRAPHDL_API_KEY set in your shell.",
+    "arest-remote": {
+      "description": "AREST engine (remote worker mode). Requires AREST_URL and AREST_API_KEY set in your shell.",
       "command": "npx",
       "args": ["-y", "tsx", "src/mcp/server.ts"],
       "env": {
-        "GRAPHDL_MODE": "remote",
-        "GRAPHDL_URL": "${GRAPHDL_URL}",
-        "GRAPHDL_API_KEY": "${GRAPHDL_API_KEY}"
+        "AREST_MODE": "remote",
+        "AREST_URL": "${AREST_URL}",
+        "AREST_API_KEY": "${AREST_API_KEY}"
       }
     }
   }

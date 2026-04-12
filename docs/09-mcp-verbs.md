@@ -1,6 +1,6 @@
 # 09 · MCP Verbs
 
-The MCP (Model Context Protocol) server is how agents interact with graphdl-orm. The v1.0 verb set is frozen in four tiers: **primitive** (the algebra requires them), **entity sugar** (ergonomic shortcuts), **introspection** (read-only metadata), **evolution** (governed self-modification), and **LLM bridge** (natural-language to formal-fact translation via client sampling).
+The MCP (Model Context Protocol) server is how agents interact with arest. The v1.0 verb set is frozen in four tiers: **primitive** (the algebra requires them), **entity sugar** (ergonomic shortcuts), **introspection** (read-only metadata), **evolution** (governed self-modification), and **LLM bridge** (natural-language to formal-fact translation via client sampling).
 
 ## Configuration
 
@@ -9,12 +9,12 @@ The MCP (Model Context Protocol) server is how agents interact with graphdl-orm.
 ```json
 {
   "mcpServers": {
-    "graphdl": {
+    "arest": {
       "command": "npx",
-      "args": ["-y", "graphdl-orm", "mcp"],
+      "args": ["-y", "arest", "mcp"],
       "env": {
-        "GRAPHDL_MODE": "local",
-        "GRAPHDL_READINGS_DIR": "/absolute/path/to/readings"
+        "AREST_MODE": "local",
+        "AREST_READINGS_DIR": "/absolute/path/to/readings"
       }
     }
   }
@@ -26,13 +26,13 @@ The MCP (Model Context Protocol) server is how agents interact with graphdl-orm.
 ```json
 {
   "mcpServers": {
-    "graphdl": {
+    "arest": {
       "command": "npx",
-      "args": ["-y", "graphdl-orm", "mcp"],
+      "args": ["-y", "arest", "mcp"],
       "env": {
-        "GRAPHDL_MODE": "remote",
-        "GRAPHDL_URL": "https://your-domain.com",
-        "GRAPHDL_API_KEY": "secret"
+        "AREST_MODE": "remote",
+        "AREST_URL": "https://your-domain.com",
+        "AREST_API_KEY": "secret"
       }
     }
   }

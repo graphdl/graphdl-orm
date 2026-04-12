@@ -171,7 +171,7 @@ export interface RootResource {
  * Build the root resource for an authenticated user.
  *
  * Projects org membership facts from the population.
- * Each org link carries the factType (Graph Schema ID).
+ * Each org link carries the factType (Fact Type ID).
  */
 export async function handleRoot(
   userEmail: string,

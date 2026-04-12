@@ -1,7 +1,7 @@
 /**
  * domain-fixture.test.ts — Verifies that compileDomain returns real IR from the WASM engine.
  *
- * The WASM system(handle, 'debug', '') returns a display string in GraphDL's internal notation.
+ * The WASM system(handle, 'debug', '') returns a display string in AREST's internal notation.
  * compileDomain parses this into { nouns, factTypes, constraints, totalFacts, raw }.
  */
 

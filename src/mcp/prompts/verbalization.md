@@ -603,7 +603,7 @@ EntityA 'foo' has ValueX 'bar'.
 
 ## Parser-Recognized FORML2 Syntax
 
-The GraphDL FORML2 parser recognizes the following constraint patterns. These are the exact sentence forms the parser matches. Using different phrasing will cause the constraint to be misclassified or skipped.
+The AREST FORML2 parser recognizes the following constraint patterns. These are the exact sentence forms the parser matches. Using different phrasing will cause the constraint to be misclassified or skipped.
 
 ### Uniqueness (UC)
 ```

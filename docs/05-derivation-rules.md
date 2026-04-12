@@ -65,7 +65,7 @@ Three-way join on `Organization` and `App`. Fires whenever the chain lights up, 
 ### Arity
 
 ```forml2
-Graph Schema has Arity := count of Role where Graph Schema has Role.
+Fact Type has Arity := count of Role where Fact Type has Role.
 ```
 
 Aggregate form (`count of ... where ...`). Compiles to `length(Filter(...))` over the Role fact type.
@@ -106,4 +106,4 @@ The engine detects SQL triggers at compile time and gates its own forward-chain 
 
 ## What's next
 
-You have declared types, constraints, workflows, and inferences. [The compile pipeline](06-compile-pipeline.md) shows what happens when you hand all that to graphdl-orm.
+You have declared types, constraints, workflows, and inferences. [The compile pipeline](06-compile-pipeline.md) shows what happens when you hand all that to arest.

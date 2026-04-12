@@ -41,7 +41,7 @@ fn is_strict_mode() -> bool {
 
 pub(crate) const METAMODEL_NOUNS: &[&str] = &[
     "Noun",
-    "Graph Schema",
+    "Fact Type",
     "Role",
     "Constraint",
     "State Machine Definition",
@@ -784,10 +784,10 @@ pub fn nouns_from_state(state: &crate::ast::Object) -> HashMap<String, NounDef> 
         .unwrap_or_default()
 }
 
-/// Extract fact types directly from the GraphSchema cell in D.
+/// Extract fact types directly from the FactType cell in D.
 pub fn fact_types_from_state(state: &crate::ast::Object) -> HashMap<String, FactTypeDef> {
     use crate::ast::{fetch_or_phi, binding};
-    fetch_or_phi("GraphSchema", state)
+    fetch_or_phi("FactType", state)
         .as_seq().map(|facts| facts.iter().filter_map(|f| {
             let id = binding(f, "id")?.to_string();
             let reading = binding(f, "reading").unwrap_or("").to_string();
@@ -850,12 +850,12 @@ pub fn domain_to_state(d: &Domain) -> crate::ast::Object {
 
     // Fact types: schemas + roles
     for (ft_id, ft) in &d.fact_types {
-        push(&mut cells, "GraphSchema", fact_from_pairs(&[
+        push(&mut cells, "FactType", fact_from_pairs(&[
             ("id", ft_id), ("reading", &ft.reading), ("arity", &ft.roles.len().to_string()),
         ]));
         for role in &ft.roles {
             push(&mut cells, "Role", fact_from_pairs(&[
-                ("graphSchema", ft_id), ("nounName", &role.noun_name),
+                ("factType", ft_id), ("nounName", &role.noun_name),
                 ("position", &role.role_index.to_string()),
             ]));
         }
@@ -944,10 +944,10 @@ pub fn domain_to_entities(d: &Domain, slug: &str) -> String {
         }).collect::<Vec<_>>(),
         // α(ft → [schema, roles..., reading]) : fact_types
         d.fact_types.iter().flat_map(|(id, ft)| {
-            std::iter::once(serde_json::json!({"id": format!("gs:{}", id), "type": "Graph Schema", "domain": slug, "data": {"name": id, "reading": ft.reading}}))
+            std::iter::once(serde_json::json!({"id": format!("gs:{}", id), "type": "Fact Type", "domain": slug, "data": {"name": id, "reading": ft.reading}}))
                 .chain(ft.roles.iter().enumerate().map(move |(i, role)|
-                    serde_json::json!({"id": format!("role:{}:{}", id, i), "type": "Role", "domain": slug, "data": {"nounName": role.noun_name, "position": i, "graphSchema": id}})))
-                .chain(std::iter::once(serde_json::json!({"id": format!("reading:{}", id), "type": "Reading", "domain": slug, "data": {"text": ft.reading, "graphSchema": id}})))
+                    serde_json::json!({"id": format!("role:{}:{}", id, i), "type": "Role", "domain": slug, "data": {"nounName": role.noun_name, "position": i, "factType": id}})))
+                .chain(std::iter::once(serde_json::json!({"id": format!("reading:{}", id), "type": "Reading", "domain": slug, "data": {"text": ft.reading, "factType": id}})))
         }).collect(),
         // α(constraint → json)
         d.constraints.iter().map(|c| {
@@ -1282,7 +1282,7 @@ fn resolve_derivation_rule(rule: &mut DerivationRuleDef, ir: &Domain, catalog: &
             .replace("any ", "")
     };
 
-    // Resolve a text fragment to a Graph Schema ID via rho-lookup through the catalog.
+    // Resolve a text fragment to a Fact Type ID via rho-lookup through the catalog.
     let resolve_fact_type = |fragment: &str| -> Option<String> {
         let cleaned = strip_anaphora(fragment);
         let found_nouns: Vec<(usize, usize, String)> = find_nouns(&cleaned, &noun_names);
@@ -1462,10 +1462,10 @@ fn parse_enum(line: &str) -> Option<Vec<String>> {
     Some(after.trim_end_matches('.').split(", ").map(|s| s.trim().trim_matches('\'').into()).collect())
 }
 
-/// Canonical Graph Schema ID from role nouns and verb.
+/// Canonical Fact Type ID from role nouns and verb.
 /// The ID is the key in DEFS. Two readings with the same roles and verb
 /// (just different voice) produce the same ID.
-fn graph_schema_id(role_nouns: &[&str], verb: &str) -> String {
+fn fact_type_id(role_nouns: &[&str], verb: &str) -> String {
     let verb_part = verb.to_lowercase().replace(' ', "_");
     let noun_parts: Vec<String> = role_nouns.iter().map(|n| n.replace(' ', "_")).collect();
     let mut parts: Vec<&str> = vec![&noun_parts[0], &verb_part];
@@ -1473,7 +1473,7 @@ fn graph_schema_id(role_nouns: &[&str], verb: &str) -> String {
     parts.join("_")
 }
 
-/// Schema catalog for rho-lookup: noun set -> Graph Schema ID.
+/// Schema catalog for rho-lookup: noun set -> Fact Type ID.
 /// The noun set is the key. The catalog is the DEFS cell.
 struct SchemaCatalog {
     /// Sorted noun set -> vec of (schema_id, verb, reading) for disambiguation
@@ -1497,7 +1497,7 @@ impl SchemaCatalog {
             .push((schema_id.to_string(), verb.to_lowercase(), reading.to_lowercase()));
     }
 
-    /// rho-lookup: noun set -> Graph Schema ID.
+    /// rho-lookup: noun set -> Fact Type ID.
     /// Resolution strategy (no COND dispatch, just cascading lookup):
     /// 1. Exact verb match
     /// 2. Verb contained in stored reading (handles inverse voice)
@@ -1644,7 +1644,7 @@ fn parse_fact(line: &str, noun_names: &[String]) -> Option<(String, FactTypeDef)
 
     // Build role tokens for schema ID (preserving subscript digits from the source text)
     let role_refs: Vec<&str> = found.iter().map(|(_, _, name)| name.as_str()).collect();
-    let schema_id = graph_schema_id(&role_refs, predicate);
+    let schema_id = fact_type_id(&role_refs, predicate);
 
     let active_reading = ReadingDef {
         text: reading.clone(),
@@ -2037,30 +2037,30 @@ mod tests {
     }
 
     #[test]
-    fn graph_schema_id_from_roles_and_verb() {
+    fn fact_type_id_from_roles_and_verb() {
         // Binary fact type: "User owns Organization"
         assert_eq!(
-            graph_schema_id(&["User", "Organization"], "owns"),
+            fact_type_id(&["User", "Organization"], "owns"),
             "User_owns_Organization"
         );
         // Verb with spaces: "was placed by"
         assert_eq!(
-            graph_schema_id(&["Order", "Customer"], "was placed by"),
+            fact_type_id(&["Order", "Customer"], "was placed by"),
             "Order_was_placed_by_Customer"
         );
         // Ring constraint with subscripts
         assert_eq!(
-            graph_schema_id(&["Person1", "Person2"], "is parent of"),
+            fact_type_id(&["Person1", "Person2"], "is parent of"),
             "Person1_is_parent_of_Person2"
         );
         // Unary: "Customer is active"
         assert_eq!(
-            graph_schema_id(&["Customer"], "is active"),
+            fact_type_id(&["Customer"], "is active"),
             "Customer_is_active"
         );
         // Multi-word nouns: "Auth Session uses Session Strategy"
         assert_eq!(
-            graph_schema_id(&["Auth Session", "Session Strategy"], "uses"),
+            fact_type_id(&["Auth Session", "Session Strategy"], "uses"),
             "Auth_Session_uses_Session_Strategy"
         );
     }
@@ -2133,14 +2133,14 @@ mod tests {
             ## Constraints\n\
             Each Organization is owned by at most one User.\n";
         let ir = parse_markdown(input).unwrap();
-        // Fact type keyed by Graph Schema ID
+        // Fact type keyed by Fact Type ID
         assert!(ir.fact_types.contains_key("User_owns_Organization"));
         assert!(!ir.fact_types.contains_key("User owns Organization"));
         // The constraint's spans should reference the same schema ID
         assert!(!ir.constraints.is_empty());
         let c = &ir.constraints[0];
         assert_eq!(c.spans[0].fact_type_id, "User_owns_Organization",
-            "Constraint span should reference Graph Schema ID, not reading text");
+            "Constraint span should reference Fact Type ID, not reading text");
     }
 
     #[test]
@@ -2859,8 +2859,8 @@ fn forbidden_ipv6_ula_fd() {
     }
 
     #[test]
-    fn metamodel_guard_rejects_reserved_graph_schema() {
-        assert_reserved_rejected("Graph Schema", "Graph Schema(.Id) is an entity type.");
+    fn metamodel_guard_rejects_reserved_fact_type() {
+        assert_reserved_rejected("Fact Type", "Fact Type(.Id) is an entity type.");
     }
 
     #[test]

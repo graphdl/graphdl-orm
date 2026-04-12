@@ -24,7 +24,7 @@ pub fn pluralize(word: &str) -> String {
 /// Noun name -> REST collection slug (kebab-case, pluralized).
 /// "Organization" -> "organizations"
 /// "OrgMembership" -> "org-memberships"
-/// "Graph Schema" -> "graph-schemas"
+/// "Fact Type" -> "fact-types"
 pub fn noun_to_slug(name: &str) -> String {
     let words = split_noun(name);
     words.iter().enumerate()
@@ -39,7 +39,7 @@ pub fn noun_to_slug(name: &str) -> String {
 /// Noun name -> SQL table name (snake_case, pluralized).
 /// "Organization" -> "organizations"
 /// "OrgMembership" -> "org_memberships"
-/// "Graph Schema" -> "graph_schemas"
+/// "Fact Type" -> "fact_types"
 pub fn noun_to_table(name: &str) -> String {
     let words = split_noun(name);
     words.iter().enumerate()
@@ -131,7 +131,7 @@ mod tests {
     fn test_noun_to_slug() {
         assert_eq!(noun_to_slug("Organization"), "organizations");
         assert_eq!(noun_to_slug("OrgMembership"), "org-memberships");
-        assert_eq!(noun_to_slug("Graph Schema"), "graph-schemas");
+        assert_eq!(noun_to_slug("Fact Type"), "fact-types");
         assert_eq!(noun_to_slug("State Machine Definition"), "state-machine-definitions");
         assert_eq!(noun_to_slug("Status"), "statuses");
     }
@@ -140,7 +140,7 @@ mod tests {
     fn test_noun_to_table() {
         assert_eq!(noun_to_table("Organization"), "organizations");
         assert_eq!(noun_to_table("OrgMembership"), "org_memberships");
-        assert_eq!(noun_to_table("Graph Schema"), "graph_schemas");
+        assert_eq!(noun_to_table("Fact Type"), "fact_types");
         assert_eq!(noun_to_table("SupportRequest"), "support_requests");
         assert_eq!(noun_to_table("Status"), "statuses");
     }

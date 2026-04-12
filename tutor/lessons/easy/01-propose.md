@@ -5,7 +5,7 @@
 
 You don't model your app. You describe it. The engine does the modeling, and the description you give becomes the app's source of truth.
 
-In GraphDL, `propose` takes an English rationale plus whatever nouns and readings come to mind, creates a Domain Change, and hands you the next steps. Once you `apply` the change, the schema is live. No migration, no codegen step — you go from "I want to track orders with customers and totals" to a working CRUD app in one round trip.
+In AREST, `propose` takes an English rationale plus whatever nouns and readings come to mind, creates a Domain Change, and hands you the next steps. Once you `apply` the change, the schema is live. No migration, no codegen step — you go from "I want to track orders with customers and totals" to a working CRUD app in one round trip.
 
 ## Do it
 

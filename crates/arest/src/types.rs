@@ -184,7 +184,7 @@ pub struct TransitionDef {
 #[serde(rename_all = "camelCase")]
 pub struct GuardDef {
     #[allow(dead_code)] // deserialized from JSON, read by JS callers
-    pub graph_schema_id: String,
+    pub fact_type_id: String,
     pub constraint_ids: Vec<String>,
 }
 

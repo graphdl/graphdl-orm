@@ -1,6 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "graphdl-orm",
+  "name": "arest",
   "main": "src/index.ts",
   "compatibility_date": "2026-03-09",
   "compatibility_flags": ["nodejs_compat"],
@@ -11,9 +11,9 @@
     ]
   },
   "migrations": [
-    { "tag": "v1", "new_sqlite_classes": ["GraphDLDB"] },
+    { "tag": "v1", "new_sqlite_classes": ["ARESTDB"] },
     { "tag": "v2", "new_sqlite_classes": ["EntityDB", "DomainDB", "RegistryDB"] },
-    { "tag": "v3", "deleted_classes": ["GraphDLDB"] },
+    { "tag": "v3", "deleted_classes": ["ARESTDB"] },
     { "tag": "v4" },
     { "tag": "v5", "deleted_classes": ["DomainDB"] }
   ],

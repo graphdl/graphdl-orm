@@ -718,7 +718,7 @@ fn paper_claim_parse_produces_population() {
     // The state should contain noun facts
     assert!(!matches!(ast::fetch("Noun", &state), ast::Object::Bottom), "State should contain Noun facts");
     // The state should contain graph schema facts
-    assert!(!matches!(ast::fetch("GraphSchema", &state), ast::Object::Bottom), "State should contain GraphSchema facts");
+    assert!(!matches!(ast::fetch("FactType", &state), ast::Object::Bottom), "State should contain FactType facts");
     // The state should contain constraint facts
     assert!(!matches!(ast::fetch("Constraint", &state), ast::Object::Bottom), "State should contain Constraint facts");
 }
@@ -1966,9 +1966,9 @@ Order has Reason.
     assert!(noun_facts.iter().any(|f| ast::binding(f, "name") == Some("Reason")),
         "New noun 'Reason' should be in state after LoadReadings");
 
-    // The state should contain the new GraphSchema
-    let schema_cell = ast::fetch_or_phi("GraphSchema", &load_result.state);
-    let schema_facts = schema_cell.as_seq().expect("GraphSchema cell should exist");
+    // The state should contain the new FactType
+    let schema_cell = ast::fetch_or_phi("FactType", &load_result.state);
+    let schema_facts = schema_cell.as_seq().expect("FactType cell should exist");
     assert!(schema_facts.iter().any(|f| {
         ast::binding(f, "reading").map_or(false, |r| r.contains("Reason"))
     }), "New fact type with Reason should be in state after LoadReadings");

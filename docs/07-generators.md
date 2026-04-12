@@ -1,6 +1,6 @@
 # 07 · Generators
 
-graphdl-orm produces runtime artifacts for several targets from the same readings. Each target is called a **generator** and must be opted in by an instance fact in your readings. A generator that is not opted in produces nothing.
+arest produces runtime artifacts for several targets from the same readings. Each target is called a **generator** and must be opted in by an instance fact in your readings. A generator that is not opted in produces nothing.
 
 ## Opt-in
 
@@ -56,7 +56,7 @@ When a SQL generator is active, the validator only runs non-DDL constraints (Rin
 
 ## iLayer
 
-iLayer is the UI layer format: one def per entity noun describing object type, facts, and transitions. Used by the graphdl Next.js / iOS / Android frontends.
+iLayer is the UI layer format: one def per entity noun describing object type, facts, and transitions. Used by the AREST Next.js / iOS / Android frontends.
 
 ```forml2
 App 'myapp' uses Generator 'ilayer'.

@@ -163,33 +163,33 @@ pub mod exports {
                     ) -> _rt::String;
                 }
                 #[doc(hidden)]
-                macro_rules! __export_graphdl_arest_engine_0_1_0_cabi {
+                macro_rules! __export_arest_arest_engine_0_1_0_cabi {
                     ($ty:ident with_types_in $($path_to_types:tt)*) => {
                         const _ : () = { #[unsafe (export_name =
-                        "graphdl:arest/engine@0.1.0#parse-and-compile")] unsafe extern
+                        "arest:engine/engine@0.1.0#parse-and-compile")] unsafe extern
                         "C" fn export_parse_and_compile(arg0 : * mut u8, arg1 : usize,)
                         -> * mut u8 { unsafe { $($path_to_types)*::
                         _export_parse_and_compile_cabi::<$ty > (arg0, arg1) } } #[unsafe
                         (export_name =
-                        "cabi_post_graphdl:arest/engine@0.1.0#parse-and-compile")] unsafe
+                        "cabi_post_arest:engine/engine@0.1.0#parse-and-compile")] unsafe
                         extern "C" fn _post_return_parse_and_compile(arg0 : * mut u8,) {
                         unsafe { $($path_to_types)*::
                         __post_return_parse_and_compile::<$ty > (arg0) } } #[unsafe
-                        (export_name = "graphdl:arest/engine@0.1.0#release")] unsafe
+                        (export_name = "arest:engine/engine@0.1.0#release")] unsafe
                         extern "C" fn export_release(arg0 : i32,) { unsafe {
                         $($path_to_types)*:: _export_release_cabi::<$ty > (arg0) } }
-                        #[unsafe (export_name = "graphdl:arest/engine@0.1.0#system")]
+                        #[unsafe (export_name = "arest:engine/engine@0.1.0#system")]
                         unsafe extern "C" fn export_system(arg0 : i32, arg1 : * mut u8,
                         arg2 : usize, arg3 : * mut u8, arg4 : usize,) -> * mut u8 {
                         unsafe { $($path_to_types)*:: _export_system_cabi::<$ty > (arg0,
                         arg1, arg2, arg3, arg4) } } #[unsafe (export_name =
-                        "cabi_post_graphdl:arest/engine@0.1.0#system")] unsafe extern "C"
+                        "cabi_post_arest:engine/engine@0.1.0#system")] unsafe extern "C"
                         fn _post_return_system(arg0 : * mut u8,) { unsafe {
                         $($path_to_types)*:: __post_return_system::<$ty > (arg0) } } };
                     };
                 }
                 #[doc(hidden)]
-                pub(crate) use __export_graphdl_arest_engine_0_1_0_cabi;
+                pub(crate) use __export_arest_arest_engine_0_1_0_cabi;
                 #[cfg_attr(target_pointer_width = "64", repr(align(8)))]
                 #[cfg_attr(target_pointer_width = "32", repr(align(4)))]
                 struct _RetArea(
@@ -314,7 +314,7 @@ macro_rules! __export_arest_impl {
     };
     ($ty:ident with_types_in $($path_to_types_root:tt)*) => {
         $($path_to_types_root)*::
-        exports::graphdl::arest::engine::__export_graphdl_arest_engine_0_1_0_cabi!($ty
+        exports::graphdl::arest::engine::__export_arest_arest_engine_0_1_0_cabi!($ty
         with_types_in $($path_to_types_root)*:: exports::graphdl::arest::engine);
     };
 }
@@ -322,7 +322,7 @@ macro_rules! __export_arest_impl {
 pub(crate) use __export_arest_impl as export;
 #[cfg(target_arch = "wasm32")]
 #[unsafe(
-    link_section = "component-type:wit-bindgen:0.41.0:graphdl:arest@0.1.0:arest:encoded world"
+    link_section = "component-type:wit-bindgen:0.41.0:arest:engine@0.1.0:arest:encoded world"
 )]
 #[doc(hidden)]
 #[allow(clippy::octal_escapes)]
@@ -333,7 +333,7 @@ phdl:arest/types@0.1.0\x05\0\x02\x03\0\0\x07binding\x01B\x0b\x02\x03\x02\x01\x01
 \x04\0\x07binding\x03\0\0\x01o\x02ss\x01p\x02\x01j\x01y\x01s\x01@\x01\x08reading\
 s\x03\0\x04\x04\0\x11parse-and-compile\x01\x05\x01@\x01\x06handley\x01\0\x04\0\x07\
 release\x01\x06\x01@\x03\x06handley\x03keys\x05inputs\0s\x04\0\x06system\x01\x07\
-\x04\0\x1agraphdl:arest/engine@0.1.0\x05\x02\x04\0\x19graphdl:arest/arest@0.1.0\x04\
+\x04\0\x1aarest:engine/engine@0.1.0\x05\x02\x04\0\x19arest:engine/arest@0.1.0\x04\
 \0\x0b\x0b\x01\0\x05arest\x03\0\0\0G\x09producers\x01\x0cprocessed-by\x02\x0dwit\
 -component\x070.227.1\x10wit-bindgen-rust\x060.41.0";
 #[inline(never)]

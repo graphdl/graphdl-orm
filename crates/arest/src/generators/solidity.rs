@@ -136,7 +136,7 @@ fn solidity_type(col: &TableColumn) -> &'static str {
 ///
 /// When `scope` is `Some(set)`, only emit events for fact types whose
 /// every role references a noun in `set` — this keeps metamodel
-/// cross-reference fact types (e.g. `GraphSchema has Order`) out of
+/// cross-reference fact types (e.g. `FactType has Order`) out of
 /// user-facing output. When `scope` is `None`, emit for every fact
 /// type involving this noun.
 fn emit_events(

@@ -1,6 +1,6 @@
 # arest
 
-A constraint verification and forward inference engine for GraphDL, compiled to WebAssembly.
+A constraint verification and forward inference engine for AREST, compiled to WebAssembly.
 
 ## Theoretical Foundation
 

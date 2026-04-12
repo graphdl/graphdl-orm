@@ -1,6 +1,6 @@
 # 04 · State Machines
 
-A state machine describes how an entity transitions between statuses. In graphdl-orm, state machines are first-class FORML 2: you declare them in readings, the compiler produces a transition function, and every call to `create` or `transition` folds the current status over the new event.
+A state machine describes how an entity transitions between statuses. In arest, state machines are first-class FORML 2: you declare them in readings, the compiler produces a transition function, and every call to `create` or `transition` folds the current status over the new event.
 
 ## Declaring a machine
 

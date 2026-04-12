@@ -1,6 +1,6 @@
 # 03 · Constraints
 
-Constraints are the facts your data must satisfy. graphdl-orm supports seventeen constraint kinds from ORM 2, every one of which compiles to the same shape: a restriction `Filter(p) : P` over the population. When the restriction produces a non-empty set, you have a violation, and the compiler returns the original reading as the error message.
+Constraints are the facts your data must satisfy. arest supports seventeen constraint kinds from ORM 2, every one of which compiles to the same shape: a restriction `Filter(p) : P` over the population. When the restriction produces a non-empty set, you have a violation, and the compiler returns the original reading as the error message.
 
 ## Alethic vs deontic
 

@@ -22,7 +22,7 @@ pub mod conceptual_query;
 pub mod parse_rule;
 pub mod parse_forml2;
 pub mod verbalize;
-pub mod arest;
+pub mod command;
 pub mod crypto;
 pub mod generators;
 
@@ -102,7 +102,7 @@ fn create_bare_impl() -> u32 {
 ///
 /// What IS in the cache:
 ///   - Metamodel Noun cell (self-describing types)
-///   - Metamodel Graph Schema cell
+///   - Metamodel Fact Type cell
 ///   - Metamodel Role cell
 ///   - Metamodel Constraint cell
 ///   - 3 platform primitive defs (compile, apply, verify_signature)
@@ -241,7 +241,7 @@ struct E;
 export!(E);
 
 #[cfg(feature = "wit")]
-impl exports::graphdl::arest::engine::Guest for E {
+impl exports::arest::engine::engine::Guest for E {
     fn parse_and_compile(readings: Vec<(String, String)>) -> Result<u32, String> {
         parse_and_compile_impl(readings)
     }
@@ -399,7 +399,7 @@ mod handle_isolation_tests {
         let nouns = ast::fetch("Noun", &d);
         assert_ne!(nouns, ast::Object::Bottom,
             "create_impl must load the metamodel — Noun cell should be populated");
-        // The metamodel defines at least Noun, Graph Schema, Role, Constraint
+        // The metamodel defines at least Noun, Fact Type, Role, Constraint
         // as reserved noun names. Verify the cell has multiple entries.
         let count = nouns.as_seq().map(|s| s.len()).unwrap_or(0);
         assert!(count > 5,

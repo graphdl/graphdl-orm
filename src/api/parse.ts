@@ -3,7 +3,7 @@
  *
  * Per the paper:
  *   parse: R → Φ (Theorem 2)
- *   Each reading becomes entities (Noun, Reading, Constraint, Graph Schema, Role)
+ *   Each reading becomes entities (Noun, Reading, Constraint, Fact Type, Role)
  *   Entities are cells in D, indexed in Registry (P = ↑FILE:D)
  *
  * The Rust WASM engine (parse_forml2.rs) is the ONLY parser.
@@ -33,7 +33,7 @@ async function handleParseGet(env: Env): Promise<Response> {
 
   if (!domainSlugs.length) {
     return json({
-      totals: { domains: 0, nouns: 0, readings: 0, graphSchemas: 0, constraints: 0 },
+      totals: { domains: 0, nouns: 0, readings: 0, factTypes: 0, constraints: 0 },
       perDomain: {},
     })
   }
@@ -43,19 +43,19 @@ async function handleParseGet(env: Env): Promise<Response> {
       const [nounIds, readingIds, schemaIds, constraintIds] = await Promise.all([
         registry.getEntityIds('Noun', slug) as Promise<string[]>,
         registry.getEntityIds('Reading', slug) as Promise<string[]>,
-        registry.getEntityIds('Graph Schema', slug) as Promise<string[]>,
+        registry.getEntityIds('Fact Type', slug) as Promise<string[]>,
         registry.getEntityIds('Constraint', slug) as Promise<string[]>,
       ])
-      return { slug, nouns: nounIds.length, readings: readingIds.length, graphSchemas: schemaIds.length, constraints: constraintIds.length }
+      return { slug, nouns: nounIds.length, readings: readingIds.length, factTypes: schemaIds.length, constraints: constraintIds.length }
     })
   )
 
-  const totals = { domains: domainSlugs.length, nouns: 0, readings: 0, graphSchemas: 0, constraints: 0 }
+  const totals = { domains: domainSlugs.length, nouns: 0, readings: 0, factTypes: 0, constraints: 0 }
   const perDomain: Record<string, { nouns: number; readings: number }> = {}
   for (const e of perDomainEntries) {
     totals.nouns += e.nouns
     totals.readings += e.readings
-    totals.graphSchemas += e.graphSchemas
+    totals.factTypes += e.factTypes
     totals.constraints += e.constraints
     perDomain[e.slug] = { nouns: e.nouns, readings: e.readings }
   }

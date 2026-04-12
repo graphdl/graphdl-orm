@@ -1,4 +1,4 @@
-# GraphDL State — Behavioral Entities
+# AREST State — Behavioral Entities
 
 ## Entity Types
 
@@ -44,9 +44,9 @@ Status is initial in State Machine Definition.
 Status is terminal in State Machine Definition.
 
 ### Guard
-Guard references Graph Schema.
-  It is possible that some Guard references more than one Graph Schema and that for some Graph Schema, more than one Guard references that Graph Schema.
-  For each combination of Guard and Graph Schema, that Guard references that Graph Schema at most once.
+Guard references Fact Type.
+  It is possible that some Guard references more than one Fact Type and that for some Fact Type, more than one Guard references that Fact Type.
+  For each combination of Guard and Fact Type, that Guard references that Fact Type at most once.
 Guard prevents Transition.
   Each Guard prevents at most one Transition.
   It is possible that more than one Guard prevents the same Transition.

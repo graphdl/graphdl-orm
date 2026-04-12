@@ -22,7 +22,7 @@ use crate::rmap::{self, TableDef};
 /// from RMAP columns. Non-entity nouns (value types, enums) become wire
 /// widths on the entity modules that reference them.
 pub fn compile_to_verilog(state: &Object) -> String {
-    let header = "// Generated from graphdl-orm FORML2 readings\n\
+    let header = "// Generated from arest FORML2 readings\n\
                   // Backus FP combining forms synthesize to parallel hardware\n\n";
 
     let nouns = fetch_or_phi("Noun", state);
@@ -155,7 +155,7 @@ Noun has Object Type.
             verilog
         );
         assert!(verilog.contains("endmodule"));
-        assert!(verilog.contains("// Generated from graphdl-orm"));
+        assert!(verilog.contains("// Generated from arest"));
     }
 
     /// Empty state → header comment only, zero modules.
@@ -164,7 +164,7 @@ Noun has Object Type.
     fn compile_to_verilog_empty_state_emits_header_only() {
         let verilog = compile_to_verilog(&Object::phi());
 
-        assert!(verilog.contains("// Generated from graphdl-orm"));
+        assert!(verilog.contains("// Generated from arest"));
         assert!(verilog.contains("Backus FP combining forms"));
         assert!(
             !verilog.contains("module "),
@@ -288,7 +288,7 @@ Supplier supplies Widget.
 
         let verilog = compile_to_verilog(&state);
 
-        assert!(verilog.contains("// Generated from graphdl-orm"));
+        assert!(verilog.contains("// Generated from arest"));
         assert!(verilog.contains("module widget"));
         assert!(verilog.contains("module supplier"));
         assert_eq!(verilog.matches("endmodule").count(), 2);
