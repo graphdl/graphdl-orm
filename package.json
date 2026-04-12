@@ -1,7 +1,7 @@
 {
   "name": "arest",
-  "version": "0.7.0",
-  "private": true,
+  "version": "0.8.0",
+  "private": false,
   "type": "module",
   "bin": {
     "arest": "./src/cli/import.ts",
@@ -22,10 +22,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
-    "hono": "4.12.12",
-    "itty-router": "^5.0.22",
-    "picomatch": "4.0.4",
-    "vite": "7.3.2"
+    "itty-router": "^5.0.22"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20250124.0",
@@ -33,7 +30,7 @@
     "tsx": "^4.0.0",
     "typescript": "^5.7.2",
     "vitest": "^4.0.18",
-    "wrangler": "^4.77.0"
+    "wrangler": "^4.81.1"
   },
   "resolutions": {
     "hono": "4.12.12",
