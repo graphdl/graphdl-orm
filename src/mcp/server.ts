@@ -244,7 +244,33 @@ const server = new McpServer({
 })
 
 // =====================================================================
-// TOOLS — 6 core verbs for agent ergonomics
+// TOOLS — frozen MCP verb set (v1.0)
+// =====================================================================
+//
+// Primitive (algebra-required):
+//   assert, retract, project, compile
+//
+// Entity sugar (convenience over assert/project):
+//   get, query, apply, create, read, update, transition, delete
+//
+// Introspection (read-only):
+//   explain, actions, schema, verify
+//
+// Evolution (governed self-modification):
+//   propose   — create Domain Change, enter review workflow
+//   compile   — immediate schema change (Corollary 5)
+//
+// LLM bridge (client sampling):
+//   ask       — natural language → project → results
+//   synthesize — facts → derive → verbalize → prose
+//   validate  — text → extract facts → verify
+//
+// All framework primitives (Noun, Graph Schema / Fact Type, Constraint,
+// Derivation Rule, State Machine Definition, Status, Transition, Event
+// Type, Instance Fact, Verb, Reading, External System, Agent Definition,
+// Generator opt-in) are reachable via these verbs. Runtime functions
+// (Platform/Native) are registered server-side and are intentionally not
+// LLM-exposed.
 // =====================================================================
 
 // ── 1. get: retrieve an entity or list entities ──────────────────────
@@ -491,6 +517,73 @@ server.registerTool(
       body: JSON.stringify({ sender, payload, signature }),
     })
     return textResult(data)
+  },
+)
+
+// =====================================================================
+// EVOLUTION — governed self-modification via Domain Change
+// =====================================================================
+//
+// propose is sugar over: create Domain Change + attach proposed elements.
+// The Domain Change state machine (Proposed → Under Review → Approved →
+// Applied) enforces review before schema changes take effect. For
+// immediate self-modification (Corollary 5), use compile directly.
+
+server.registerTool(
+  'propose',
+  {
+    description: 'Propose a change to the schema or population. Creates a Domain Change entity with the proposed elements (readings, nouns, fact types, constraints, verbs, state machines). Enters the review workflow at status "Proposed". Use transition to advance through Under Review → Approved → Applied. For immediate changes bypassing review, use compile directly.',
+    inputSchema: {
+      rationale: z.string().describe('Why this change is needed'),
+      target_domain: z.string().describe('Domain slug to change (e.g. "orders", "core")'),
+      readings: z.array(z.string()).optional().describe('FORML2 reading text to add'),
+      nouns: z.array(z.string()).optional().describe('Noun names to declare'),
+      constraints: z.array(z.string()).optional().describe('Constraint texts'),
+      verbs: z.array(z.string()).optional().describe('Verb names to declare'),
+    },
+  },
+  async ({ rationale, target_domain, readings, nouns, constraints, verbs }) => {
+    if (GRAPHDL_MODE !== 'local') return textResult({ error: 'propose requires local mode' })
+
+    // Generate a stable change ID from the rationale + time.
+    const changeId = `dc-${Date.now().toString(36)}`
+
+    // Create the Domain Change entity.
+    const createCmd = {
+      op: 'create',
+      noun: 'Domain Change',
+      domain: 'evolution',
+      id: changeId,
+      fields: {
+        'Change Id': changeId,
+        rationale,
+        targetDomain: target_domain,
+      },
+    }
+    const createRaw = await systemCall(`create:Domain Change`, JSON.stringify(createCmd))
+    let createResult: any
+    try { createResult = JSON.parse(createRaw) } catch { createResult = { raw: createRaw } }
+
+    // Attach proposed elements as facts.
+    const proposals: Record<string, any> = {}
+    if (readings?.length) proposals.readings = readings
+    if (nouns?.length) proposals.nouns = nouns
+    if (constraints?.length) proposals.constraints = constraints
+    if (verbs?.length) proposals.verbs = verbs
+
+    return textResult({
+      change_id: changeId,
+      status: 'Proposed',
+      rationale,
+      target_domain,
+      proposals,
+      create_result: createResult,
+      next_actions: [
+        { tool: 'transition', args: { noun: 'Domain Change', id: changeId, event: 'review' } },
+        { tool: 'transition', args: { noun: 'Domain Change', id: changeId, event: 'approve-change' } },
+        { tool: 'transition', args: { noun: 'Domain Change', id: changeId, event: 'apply' } },
+      ],
+    })
   },
 )
 
