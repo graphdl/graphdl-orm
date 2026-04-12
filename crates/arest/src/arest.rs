@@ -651,6 +651,7 @@ fn create_via_defs(
         "apply:create",
         outcome,
         sender,
+        Some(&entity_id),
     );
     CommandResult {
         entities, status, transitions, navigation, violations,
@@ -1025,6 +1026,7 @@ fn apply_load_readings(
     defs.push(("compile".to_string(), ast::Func::Platform("compile".to_string())));
     defs.push(("apply".to_string(), ast::Func::Platform("apply_command".to_string())));
     defs.push(("verify_signature".to_string(), ast::Func::Platform("verify_signature".to_string())));
+    defs.push(("audit".to_string(), ast::Func::Platform("audit".to_string())));
     let new_d = ast::defs_to_state(&defs, &merged_state);
 
     let mut data = std::collections::HashMap::new();
