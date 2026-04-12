@@ -13,10 +13,6 @@
 use crate::types::*;
 use std::collections::HashMap;
 
-/// Metamodel-reserved noun names. User domains MUST NOT redeclare these —
-/// the metamodel bootstrap owns them. The FORML2 parser rejects any attempt
-/// by a user domain to shadow these. The first (bootstrap) declaration is
-/// allowed; once present in `existing_nouns`, redeclaration is rejected.
 // Bootstrap mode flag — set by lib::create_impl while loading bundled
 // metamodel readings, so the metamodel namespace guard (#23) is bypassed
 // for cross-file redeclarations within the canonical metamodel. Apps must
@@ -34,6 +30,7 @@ fn is_bootstrap_mode() -> bool {
     BOOTSTRAP_MODE.with(|b| b.get())
 }
 
+#[allow(dead_code)] // used by tests and --strict CLI flag
 pub(crate) fn set_strict_mode(on: bool) {
     STRICT_MODE.with(|b| b.set(on));
 }

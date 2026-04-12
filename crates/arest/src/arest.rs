@@ -602,17 +602,6 @@ fn create_via_defs(
     }
 }
 
-fn resolve_fact_type_id_defs(
-    d: &ast::Object,
-    noun: &str,
-    field: &str,
-) -> String {
-    ast::cells_iter(d).into_iter()
-        .filter_map(|(name, _)| name.strip_prefix("schema:").map(|s| s.to_string()))
-        .find(|schema_id| schema_id.contains(noun) && schema_id.contains(field))
-        .unwrap_or_else(|| format!("{}_has_{}", noun, field))
-}
-
 fn transition_via_defs(
     d: &ast::Object,
     entity_id: &str,
@@ -737,7 +726,7 @@ fn query_via_defs(
 fn update_via_defs(
     d: &ast::Object,
     noun: &str,
-    domain: &str,
+    _domain: &str,
     entity_id: &str,
     new_fields: &std::collections::HashMap<String, String>,
     state: &ast::Object,
@@ -1088,23 +1077,6 @@ fn extract_sm_status(state: &ast::Object, sm_id: &str) -> Option<String> {
                 })
         })
         .and_then(|fact| ast::binding(fact, "currentlyInStatus").map(|s| s.to_string()))
-}
-
-fn to_camel_case(s: &str) -> String {
-    s.split(' ')
-        .enumerate()
-        .map(|(i, w)| {
-            if i == 0 {
-                w.to_lowercase()
-            } else {
-                let mut c = w.chars();
-                match c.next() {
-                    Some(f) => f.to_uppercase().collect::<String>() + &c.as_str().to_lowercase(),
-                    None => String::new(),
-                }
-            }
-        })
-        .collect()
 }
 
 // -- Tests ------------------------------------------------------------

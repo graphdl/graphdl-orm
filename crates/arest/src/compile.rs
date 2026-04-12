@@ -49,6 +49,8 @@ pub(crate) enum DeonticOp {
 }
 
 /// A compiled constraint. Evaluation is apply(func, eval_context_object) -> violations.
+/// text/modality retained for introspection (used by explain, verify).
+#[allow(dead_code)]
 pub(crate) struct CompiledConstraint {
     pub(crate) id: String,
     pub(crate) text: String,
@@ -58,6 +60,8 @@ pub(crate) struct CompiledConstraint {
 
 
 /// A compiled derivation rule. Evaluation is apply(func, population_object) -> derived facts.
+/// text/kind retained for introspection and rule classification.
+#[allow(dead_code)]
 pub(crate) struct CompiledDerivation {
     pub(crate) id: String,
     pub(crate) text: String,
@@ -66,6 +70,8 @@ pub(crate) struct CompiledDerivation {
 }
 
 /// A compiled state machine. func is the transition function: <state, event> -> state'.
+/// statuses retained for introspection (machine:{noun}:statuses could expose it).
+#[allow(dead_code)]
 pub(crate) struct CompiledStateMachine {
     pub(crate) noun_name: String,
     pub(crate) statuses: Vec<String>,
@@ -75,6 +81,9 @@ pub(crate) struct CompiledStateMachine {
 }
 
 /// Index for fast noun lookups during synthesis.
+/// Several fields populated for potential use by downstream passes;
+/// not all are consumed today.
+#[allow(dead_code)]
 pub(crate) struct NounIndex {
     /// noun_name -> list of (fact_type_id, role_index) where noun plays a role
     pub(crate) noun_to_fact_types: HashMap<String, Vec<(String, usize)>>,
@@ -109,6 +118,8 @@ pub(crate) struct CompiledSchema {
 }
 
 /// The compiled model -- all constraints, derivations, state machines, and schemas as executable functions.
+/// noun_index / fact_events populated for introspection.
+#[allow(dead_code)]
 pub(crate) struct CompiledModel {
     pub(crate) constraints: Vec<CompiledConstraint>,
     pub(crate) derivations: Vec<CompiledDerivation>,
@@ -123,6 +134,8 @@ pub(crate) struct CompiledModel {
 }
 
 /// When a fact is created in this schema, fire this event on the entity's state machine.
+/// Populated by compile_fact_events; consumed by the SM dispatch layer (future).
+#[allow(dead_code)]
 pub(crate) struct FactEvent {
     pub(crate) fact_type_id: String,
     pub(crate) event_name: String,
@@ -308,7 +321,7 @@ fn collect_enum_values(ir: &Domain, spans: &[SpanDef]) -> Vec<(String, Vec<Strin
 /// Derive state machines from instance facts in P.
 /// Queries the population for metamodel fact types.
 fn derive_state_machines_from_facts(facts: &[GeneralInstanceFact]) -> HashMap<String, StateMachineDef> {
-    let mut machines: HashMap<String, StateMachineDef> = HashMap::new();
+    let machines: HashMap<String, StateMachineDef> = HashMap::new();
 
     // Pass 1: fold over facts → machines (SM Definition 'X' is for Noun 'Y')
     let mut machines = facts.iter()
@@ -385,9 +398,9 @@ fn derive_state_machines_from_facts(facts: &[GeneralInstanceFact]) -> HashMap<St
 // -- Compilation ----------------------------------------------------
 // The match on kind happens here, once. After this, everything is Func.
 
-/// Compile an Object state into named FFP definitions.
-/// All generators always produce all defs. Selection is at apply time:
-/// SYSTEM:sql:sqlite:Order returns DDL, SYSTEM:xsd:Order returns XSD.
+// Compile an Object state into named FFP definitions.
+// All generators always produce all defs. Selection is at apply time:
+// SYSTEM:sql:sqlite:Order returns DDL, SYSTEM:xsd:Order returns XSD.
 thread_local! {
     static ACTIVE_GENERATORS: std::cell::RefCell<HashSet<String>> = std::cell::RefCell::new(HashSet::new());
 }
@@ -1069,7 +1082,7 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
 
 /// Reconstruct a Domain from an Object state by querying metamodel cells.
 pub fn state_to_domain(state: &crate::ast::Object) -> Domain {
-    use crate::ast::{fetch_or_phi, binding, cells_iter};
+    use crate::ast::{fetch_or_phi, binding};
     let mut domain = Domain::default();
 
     // α(noun_fact → insert into domain maps) : Noun cell
@@ -1931,10 +1944,6 @@ fn compile_cwa_negation(ir: &Domain) -> Vec<CompiledDerivation> {
 /// For each noun with a state machine definition, when an entity of that noun
 /// exists in the population but no State Machine is for that entity, derive:
 ///   - State Machine instance (instanceOf, forResource, currentlyInStatus = initial)
-fn compile_sm_initialization(ir: &Domain) -> Vec<CompiledDerivation> {
-    ir.state_machines.iter().map(|(noun_name, sm_def)| compile_sm_init_for(noun_name, sm_def)).collect()
-}
-
 fn compile_sm_init_for(noun_name: &str, sm_def: &StateMachineDef) -> CompiledDerivation {
         let sm_noun = sm_def.noun_name.clone();
         let initial_status = sm_def.statuses.first().cloned().unwrap_or_default();
@@ -2124,8 +2133,6 @@ fn compile_ring_asymmetric_ast(def: &ConstraintDef) -> Func {
 
     // For each pair (x,y) where x!=y, check if (y,x) also exists.
     // This is O(n^2) but populations are entity-scoped (bounded).
-    let id = def.id.clone();
-    let text = def.text.clone();
 
     // AS: xRy -> not yRx. Violation when both <x,y> and <y,x> exist (and x!=y).
     //
@@ -3435,8 +3442,11 @@ fn compile_forbidden_ast(ir: &Domain, def: &ConstraintDef) -> Func {
         ]);
         let viol = make_violation_func(&def.id, &def.text, detail);
 
-        // Condition: length(matched) > threshold -> violation
-        let threshold_str = threshold.to_string();
+        // Condition: length(matched) > 0 -> violation.
+        // TODO: the declared `threshold` value is not used; comparison is
+        // against 0 (any match). Wire threshold into the Eq construction
+        // if the spec intends threshold-based evaluation.
+        let _ = threshold;
         Func::condition(
             Func::compose(Func::Not, Func::compose(Func::Eq, Func::construction(vec![
                 Func::compose(Func::Length, matched_kws.clone()),

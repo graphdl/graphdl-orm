@@ -852,7 +852,7 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
         }
 
         Func::While(p, f) => {
-            let mut current = x.clone();
+            let current = x.clone();
             let max_iterations = 1000; // safety limit
             // While = bounded tail recursion (Backus 11.2.4)
             // Ok = continue iterating, Err = early exit (predicate false or ⊥)
@@ -1176,7 +1176,7 @@ fn platform_update(noun: &str, x: &Object, d: &Object) -> Object {
 
 /// Platform primitive: transition entity state machine.
 /// Key: "transition:{noun}". Input: <entity_id, event>.
-fn platform_transition(noun: &str, x: &Object, d: &Object) -> Object {
+fn platform_transition(_noun: &str, x: &Object, d: &Object) -> Object {
     let items = match x.as_seq() {
         Some(s) => s,
         None => return Object::Bottom,
@@ -2018,7 +2018,6 @@ impl fmt::Debug for Func {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
     fn defs() -> Object { Object::phi() }
 

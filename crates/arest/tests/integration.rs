@@ -4,7 +4,6 @@
 // bypassing the wasm_bindgen layer (which requires JsValue).
 //
 // These tests use the DEFS path (compile_to_defs_state) with Object state.
-use std::collections::HashMap;
 use arest::types::{Domain, Violation};
 use arest::compile;
 use arest::evaluate;
