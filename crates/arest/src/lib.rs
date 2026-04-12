@@ -182,16 +182,49 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
     // Single ρ-dispatch (Eq. 9)
     let result = ast::apply(&ast::Func::Def(key.to_string()), &obj, &st.d);
 
-    // AST state transition: when result is a new D, store it (⟨o, D'⟩).
-    // Platform primitives (compile, apply) return D' as their result.
-    // Pure query defs return display notation (no state change).
-    // A new D is a store — either Seq-of-cells or Map — containing cells.
-    // The Noun cell must exist for it to qualify as a compiled state.
+    // AST state transition (⟨o, D'⟩) — three result shapes to handle:
+    //
+    // 1. CommandResult carrier: Object::Map with __state + __result keys,
+    //    emitted by encode_command_result for create/update/transition.
+    //    Persist __state into the handle; return the __result JSON atom.
+    //
+    // 2. New D directly: a store (Map or Seq) containing a Noun cell —
+    //    emitted by platform_compile. Persist it; return the default
+    //    display representation (FFP). Callers that need JSON should use
+    //    dedicated defs (debug, list:{noun}, get:{noun}, query:{ft_id}).
+    //
+    // 3. Anything else: a pure query result. Return display, don't persist.
+    if let Some(map) = result.as_map() {
+        if map.contains_key("__state") && map.contains_key("__result") {
+            let new_state = map.get("__state").cloned().unwrap_or(ast::Object::Bottom);
+            let response = map.get("__result").cloned().unwrap_or(ast::Object::Bottom);
+            let new_state_looks_valid =
+                (new_state.as_map().is_some() || new_state.as_seq().is_some())
+                && ast::fetch("Noun", &new_state) != ast::Object::Bottom;
+            if new_state_looks_valid {
+                s[handle as usize] = Some(CompiledState { d: new_state });
+            }
+            return response.as_atom().map(|s| s.to_string())
+                .unwrap_or_else(|| response.to_string());
+        }
+    }
     let looks_like_store = result.as_seq().is_some() || result.as_map().is_some();
     let is_new_d = looks_like_store && ast::fetch("Noun", &result) != ast::Object::Bottom;
-    is_new_d.then(|| s[handle as usize] = Some(CompiledState { d: result.clone() }));
 
-    result.to_string()
+    if is_new_d {
+        // Platform compile returns a full D. Persist it; respond with a
+        // tiny JSON summary rather than dumping the store (which can be
+        // megabytes at realistic scale). Call `debug` to query the full
+        // schema if needed.
+        s[handle as usize] = Some(CompiledState { d: result.clone() });
+        return r#"{"ok":true,"compiled":true}"#.to_string();
+    }
+
+    // Non-D results: serialize as JSON. Atoms that already parse as JSON
+    // are passed through; other atoms become JSON strings; seqs → arrays;
+    // maps → objects; bottom → null. MCP and HTTP callers can always
+    // JSON.parse the response.
+    result.to_json_string()
 }
 
 // ── WIT Component exports ───────────────────────────────────────────

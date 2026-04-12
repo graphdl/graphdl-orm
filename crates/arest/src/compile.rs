@@ -337,6 +337,31 @@ fn collect_enum_values(ir: &Domain, spans: &[SpanDef]) -> Vec<(String, Vec<Strin
         }).1
 }
 
+/// Group instance facts by entity id for a given noun. Each returned
+/// map is `{id, <field_name>: <value>, ...}` — the entity's ref-scheme
+/// identifier plus every binding where the entity is the subject. Used
+/// by list:{noun} and get:{noun} to emit JSON entity summaries.
+fn collect_entity_facts(
+    domain: &crate::types::Domain,
+    noun_name: &str,
+) -> Vec<serde_json::Map<String, serde_json::Value>> {
+    let mut by_id: std::collections::BTreeMap<String, serde_json::Map<String, serde_json::Value>> =
+        std::collections::BTreeMap::new();
+    for f in &domain.general_instance_facts {
+        if f.subject_noun != noun_name { continue; }
+        let entry = by_id.entry(f.subject_value.clone()).or_insert_with(|| {
+            let mut m = serde_json::Map::new();
+            m.insert("id".to_string(), serde_json::Value::String(f.subject_value.clone()));
+            m
+        });
+        // Pick a friendly key: if object_noun is non-empty, use it; else
+        // fall back to field_name (often the parsed verb).
+        let key = if !f.object_noun.is_empty() { &f.object_noun } else { &f.field_name };
+        entry.insert(key.clone(), serde_json::Value::String(f.object_value.clone()));
+    }
+    by_id.into_values().collect()
+}
+
 /// Derive state machines from instance facts in P.
 /// Queries the population for metamodel fact types.
 fn derive_state_machines_from_facts(facts: &[GeneralInstanceFact]) -> HashMap<String, StateMachineDef> {
@@ -410,6 +435,42 @@ fn derive_state_machines_from_facts(facts: &[GeneralInstanceFact]) -> HashMap<St
                 sm.transitions.push(TransitionDef { from: from.clone(), to: to.clone(), event: event.clone(), guard: None });
             });
         });
+
+    // Pass 4: resolve initial status by graph topology.
+    //
+    // A status is "initial" if it appears as the source of some transition
+    // but never as a target — there is no way to reach it from any other
+    // status, so it must be where the machine starts. The dual ("terminal")
+    // appears only as a target.
+    //
+    // If the graph gives exactly one initial, trust it. If it gives several,
+    // prefer the explicitly declared `Status 'X' is initial in SM 'Y'` if it
+    // is in the set. If neither — all statuses are reachable from each other
+    // (cyclic) — fall back to the first declared status.
+    //
+    // This replaces the brittle insertion-order convention that used to put
+    // the LAST explicitly-declared initial at statuses[0].
+    for sm in machines.values_mut() {
+        if sm.transitions.is_empty() { continue; }
+        let sources: HashSet<&str> = sm.transitions.iter().map(|t| t.from.as_str()).collect();
+        let targets: HashSet<&str> = sm.transitions.iter().map(|t| t.to.as_str()).collect();
+        let graph_initials: Vec<String> = sm.statuses.iter()
+            .filter(|s| sources.contains(s.as_str()) && !targets.contains(s.as_str()))
+            .cloned()
+            .collect();
+        let declared_initial = sm.statuses.first().cloned();
+        let chosen = match graph_initials.len() {
+            1 => graph_initials[0].clone(),
+            0 => declared_initial.unwrap_or_default(),
+            _ => declared_initial
+                .filter(|d| graph_initials.contains(d))
+                .unwrap_or_else(|| graph_initials[0].clone()),
+        };
+        if !chosen.is_empty() {
+            sm.statuses.retain(|s| s != &chosen);
+            sm.statuses.insert(0, chosen);
+        }
+    }
 
     machines
 }
@@ -625,6 +686,38 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
             (format!("resolve:{}", noun_name), resolve_func)
         })
     }));
+
+    // list:{noun} — JSON array of every entity of this noun, with its field
+    // bindings, snapshotted from instance facts at compile time.
+    // get:{noun} — Condition chain mapping id → JSON of that entity's fields.
+    //
+    // These are the MCP-facing read paths. They complement query:{ft_id}
+    // (which projects a specific fact type) by providing entity-level views
+    // that bundle a subject's fields into one JSON document. Without them,
+    // `get noun=Order` returns ⊥.
+    for (noun_name, _) in &domain.nouns {
+        let entities = collect_entity_facts(&domain, noun_name);
+        if entities.is_empty() { continue; }
+
+        // list: always returns the same JSON array
+        let list_json = serde_json::to_string(&entities).unwrap_or_else(|_| "[]".into());
+        defs.push((format!("list:{}", noun_name), Func::constant(Object::atom(&list_json))));
+
+        // get: one Condition per id. Falls through to ⊥ if no id matches.
+        let get_func = entities.iter().rev().fold(Func::constant(Object::Bottom), |inner, entity| {
+            let id = entity.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let entity_json = serde_json::to_string(entity).unwrap_or_else(|_| "{}".into());
+            Func::condition(
+                Func::compose(Func::Eq, Func::construction(vec![
+                    Func::Id,
+                    Func::constant(Object::atom(&id)),
+                ])),
+                Func::constant(Object::atom(&entity_json)),
+                inner,
+            )
+        });
+        defs.push((format!("get:{}", noun_name), get_func));
+    }
 
     // HATEOAS navigation links as FFP projections (Theorem 4b).
     // For each binary fact type with a UC, the UC role is the child (dependent),
