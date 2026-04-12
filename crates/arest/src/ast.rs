@@ -989,8 +989,37 @@ fn apply_platform(name: &str, x: &Object, d: &Object) -> Object {
         s if s.starts_with("list_noun:") => platform_list_noun(&s[10..], d),
         s if s.starts_with("get_noun:") => platform_get_noun(&s[9..], x, d),
         s if s.starts_with("query_ft:") => platform_query_ft(&s[9..], x, d),
+        "audit" => platform_audit_log(d),
         _ => Object::Bottom,
     }
+}
+
+/// Platform primitive: return the audit_log cell as a JSON array.
+/// Key: "audit_log". Input: ignored. Each entry renders as
+/// `{operation, outcome, sequence, sender, entity}`. Empty cell or
+/// missing cell yields `[]` — never Bottom.
+fn platform_audit_log(d: &Object) -> Object {
+    let log = fetch_or_phi("audit_log", d);
+    let items: Vec<serde_json::Value> = log.as_seq()
+        .map(|facts| facts.iter().filter_map(|fact| {
+            let pairs = fact.as_seq()?;
+            let mut map = serde_json::Map::new();
+            pairs.iter().for_each(|pair| {
+                if let Some(kv) = pair.as_seq() {
+                    if let (Some(role), Some(val)) = (
+                        kv.first().and_then(|k| k.as_atom()),
+                        kv.get(1).and_then(|v| v.as_atom()),
+                    ) {
+                        map.insert(role.to_string(), serde_json::Value::String(val.to_string()));
+                    }
+                }
+            });
+            Some(serde_json::Value::Object(map))
+        }).collect())
+        .unwrap_or_default();
+    let json = serde_json::to_string(&serde_json::Value::Array(items))
+        .unwrap_or_else(|_| "[]".to_string());
+    Object::atom(&json)
 }
 
 /// Codd π: project:<indices, R> → rows of R restricted to the given column indices.
@@ -1304,6 +1333,7 @@ fn platform_compile(x: &Object, d: &Object) -> Object {
     defs.push(("compile".to_string(), Func::Platform("compile".to_string())));
     defs.push(("apply".to_string(), Func::Platform("apply_command".to_string())));
     defs.push(("verify_signature".to_string(), Func::Platform("verify_signature".to_string())));
+    defs.push(("audit".to_string(), Func::Platform("audit".to_string())));
     let new_d = defs_to_state(&defs, &merged_state);
 
     // Validate: ρ(validate) applied to merged state. Alethic violations reject.
@@ -1347,7 +1377,7 @@ fn record_compile_event(state: &Object, status: &str) -> Object {
         ("status", status),
     ]);
     let with_history = cell_push("compile_history", fact, state);
-    record_audit(&with_history, "compile", status, None)
+    record_audit(&with_history, "compile", status, None, None)
 }
 
 /// Security #26 — Audit trail for compile and apply operations.
@@ -1364,6 +1394,7 @@ pub(crate) fn record_audit(
     operation: &str,
     outcome: &str,
     sender: Option<&str>,
+    entity: Option<&str>,
 ) -> Object {
     let seq = fetch_or_phi("audit_log", state)
         .as_seq()
@@ -1371,11 +1402,13 @@ pub(crate) fn record_audit(
         .unwrap_or(0);
     let seq_str = seq.to_string();
     let sender_val = sender.unwrap_or("");
+    let entity_val = entity.unwrap_or("");
     let fact = fact_from_pairs(&[
         ("operation", operation),
         ("outcome", outcome),
         ("sequence", seq_str.as_str()),
         ("sender", sender_val),
+        ("entity", entity_val),
     ]);
     cell_push("audit_log", fact, state)
 }
@@ -3932,7 +3965,7 @@ mod tests {
     #[test]
     fn record_audit_appends_entry_with_sequence_zero_on_empty_state() {
         let state = Object::phi();
-        let result = record_audit(&state, "compile", "compiled", Some("root@example"));
+        let result = record_audit(&state, "compile", "compiled", Some("root@example"), None);
         let log = fetch_or_phi("audit_log", &result);
         let facts = log.as_seq().expect("audit_log should be a sequence");
         assert_eq!(facts.len(), 1, "empty state should yield exactly one audit entry");
@@ -3940,15 +3973,16 @@ mod tests {
         assert_eq!(binding(&facts[0], "outcome"), Some("compiled"));
         assert_eq!(binding(&facts[0], "sequence"), Some("0"));
         assert_eq!(binding(&facts[0], "sender"), Some("root@example"));
+        assert_eq!(binding(&facts[0], "entity"), Some(""));
     }
 
     #[test]
     fn record_audit_next_entry_uses_cell_length_as_sequence() {
         // Pre-populate the audit_log with two arbitrary prior entries.
-        let state = record_audit(&Object::phi(), "compile", "compiled", None);
-        let state = record_audit(&state, "apply:create", "ok", Some("u1"));
+        let state = record_audit(&Object::phi(), "compile", "compiled", None, None);
+        let state = record_audit(&state, "apply:create", "ok", Some("u1"), Some("ord-1"));
         // The third push must observe sequence = 2 (current cell length).
-        let state = record_audit(&state, "apply:create", "rejected", Some("u2"));
+        let state = record_audit(&state, "apply:create", "rejected", Some("u2"), Some("ord-2"));
         let log = fetch_or_phi("audit_log", &state);
         let facts = log.as_seq().expect("audit_log should be a sequence");
         assert_eq!(facts.len(), 3, "three pushes should yield three entries");
@@ -3956,11 +3990,12 @@ mod tests {
         assert_eq!(binding(&facts[2], "outcome"), Some("rejected"));
         assert_eq!(binding(&facts[2], "sequence"), Some("2"));
         assert_eq!(binding(&facts[2], "sender"), Some("u2"));
+        assert_eq!(binding(&facts[2], "entity"), Some("ord-2"));
     }
 
     #[test]
     fn record_audit_omitted_sender_renders_as_empty_string() {
-        let result = record_audit(&Object::phi(), "compile", "compiled", None);
+        let result = record_audit(&Object::phi(), "compile", "compiled", None, None);
         let log = fetch_or_phi("audit_log", &result);
         let facts = log.as_seq().expect("audit_log should be a sequence");
         assert_eq!(facts.len(), 1);
@@ -3968,6 +4003,7 @@ mod tests {
         // lookups never hit a missing key (totality of the fact schema).
         assert_eq!(binding(&facts[0], "sender"), Some(""));
         assert_eq!(binding(&facts[0], "sequence"), Some("0"));
+        assert_eq!(binding(&facts[0], "entity"), Some(""));
     }
 
     // ── Security #19: per-field input bound (PLATFORM_MAX_FIELD) ─────

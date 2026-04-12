@@ -80,6 +80,7 @@ fn create_bare_impl() -> u32 {
         ("compile".to_string(), ast::Func::Platform("compile".to_string())),
         ("apply".to_string(), ast::Func::Platform("apply_command".to_string())),
         ("verify_signature".to_string(), ast::Func::Platform("verify_signature".to_string())),
+        ("audit".to_string(), ast::Func::Platform("audit".to_string())),
     ];
     allocate(state, defs)
 }
@@ -137,6 +138,7 @@ fn metamodel_state() -> &'static ast::Object {
             ("compile".to_string(), ast::Func::Platform("compile".to_string())),
             ("apply".to_string(), ast::Func::Platform("apply_command".to_string())),
             ("verify_signature".to_string(), ast::Func::Platform("verify_signature".to_string())),
+            ("audit".to_string(), ast::Func::Platform("audit".to_string())),
         ];
         ast::defs_to_state(&defs, &merged)
     })
@@ -434,6 +436,38 @@ mod handle_isolation_tests {
 
         release_impl(h_a);
         release_impl(h_b);
+    }
+
+    /// #108: `audit_log` must be reachable as a system def — return the
+    /// audit trail as a JSON array, and each entry for an entity-scoped
+    /// apply must carry the entity id so `explain` can filter by it.
+    #[test]
+    fn audit_log_reachable_via_system_and_carries_entity_id() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let h = create_impl();
+
+        let _ = system_impl(h, "compile", "\
+Order(.id) is an entity type.
+Order has total.
+");
+        let create_out = system_impl(h, "create:Order", "<<id, audit-ord-1>, <total, 7>>");
+        assert!(!create_out.starts_with('⊥'), "create:Order must succeed, got: {create_out}");
+
+        // Pass "0" as the (unused) input because apply() short-circuits on
+        // Object::Bottom — an empty string parses to ⊥. The def is named
+        // `audit` (not `audit_log`) to avoid shadowing the `audit_log` data
+        // cell that cell_push overwrites on every create.
+        let audit_out = system_impl(h, "audit", "0");
+        assert!(!audit_out.starts_with('⊥'),
+            "system('audit', '0') must not return ⊥; got: {audit_out}");
+        assert!(audit_out.starts_with('['),
+            "audit must return a JSON array; got: {audit_out}");
+        assert!(audit_out.contains("apply:create"),
+            "audit must record the apply:create operation; got: {audit_out}");
+        assert!(audit_out.contains("audit-ord-1"),
+            "audit entries for entity-scoped applies must carry the entity id; got: {audit_out}");
+
+        release_impl(h);
     }
 
     /// #107: After `create:Order` adds an entity to D via apply, both

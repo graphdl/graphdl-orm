@@ -453,7 +453,7 @@ server.registerTool(
   async ({ id, noun, fact }) => {
     if (GRAPHDL_MODE === 'local') {
       // Audit trail for this entity
-      const auditRaw = await systemCall('audit_log', '0')
+      const auditRaw = await systemCall('audit', '0')
       let audit: any[] = []
       try {
         const parsed = JSON.parse(auditRaw)
