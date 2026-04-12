@@ -645,22 +645,75 @@ function parseJsonFromLlm(text: string): any {
   return JSON.parse(clean)
 }
 
+/**
+ * Try MCP client sampling; on failure return the prompt for manual execution.
+ * Callers that already have a sampled response (e.g. the outer agent ran the
+ * prompt itself) can pass it in `precomputed` to skip the sampling roundtrip
+ * entirely. This keeps the tools composable with agents that do their own
+ * sampling, and ensures clients without sampling get a useful payload rather
+ * than an error blob.
+ */
+async function tryLlmSample(
+  prompt: string,
+  maxTokens: number,
+  precomputed?: string,
+): Promise<{ ok: boolean; text: string; reason: string; details: string }> {
+  if (precomputed && precomputed.trim()) {
+    return { ok: true, text: precomputed, reason: '', details: '' }
+  }
+  try {
+    const response = await (server as any).server.createMessage({
+      messages: [{ role: 'user', content: { type: 'text', text: prompt } }],
+      maxTokens,
+    })
+    return { ok: true, text: samplingText(response), reason: '', details: '' }
+  } catch (e: any) {
+    return {
+      ok: false,
+      text: '',
+      reason: 'client does not support MCP sampling (or sampling failed)',
+      details: String(e?.message || e),
+    }
+  }
+}
+
+/**
+ * Build a uniform prompt-only fallback payload. Surfaces the prompt the tool
+ * would have sampled, plus a `next_step` telling the caller how to proceed:
+ * run the prompt against any LLM and re-invoke the tool with the result in
+ * the `llm_response` arg.
+ */
+function promptOnlyFallback(
+  toolName: string,
+  prompt: string,
+  reason: string,
+  context: Record<string, any> = {},
+) {
+  return textResult({
+    mode: 'prompt-only',
+    reason,
+    prompt,
+    next_step: `Run the prompt against any LLM, then re-invoke \`${toolName}\` with the result passed as \`llm_response\` to complete the operation.`,
+    ...context,
+  })
+}
+
 // ── ask: natural-language query → project → results ──────────────────
 
 server.registerTool(
   'ask',
   {
-    description: 'Ask a natural-language question. The engine uses the client LLM to translate the question into a θ₁ projection, executes it against the population, and returns results. Single-call query experience.',
+    description: 'Translate a natural-language question into a projection query (fact_type + filter), execute it against the population, and return matching facts. Use for read-only questions answered directly from facts. For prose answers use synthesize. If the caller has already run the projection prompt elsewhere, pass the JSON result in llm_response to skip sampling.',
     inputSchema: {
       question: z.string().describe('Natural language question, e.g. "How many orders did acme place this month?"'),
       noun: z.string().optional().describe('Optional scope hint: fact type or entity noun name'),
+      llm_response: z.string().optional().describe('Pre-sampled JSON projection spec (skip client sampling). Shape: {"fact_type":..., "filter":{...}}'),
     },
   },
-  async ({ question, noun }) => {
+  async ({ question, noun, llm_response }) => {
     if (GRAPHDL_MODE !== 'local') {
       return textResult({ error: 'ask requires local mode' })
     }
-    // Gather schema context for the LLM
     const schemaRaw = noun
       ? await systemCall(`schema:${noun}`, '')
       : await systemCall('list:Noun', '')
@@ -677,36 +730,41 @@ Respond with JSON ONLY in this format:
 
 Use the exact fact_type names from the schema. Leave filter empty {} if no specific constraint. Do not include explanations.`
 
-    let llmResponse
-    try {
-      llmResponse = await (server as any).server.createMessage({
-        messages: [{ role: 'user', content: { type: 'text', text: prompt } }],
-        maxTokens: 500,
-      })
-    } catch (e: any) {
-      return textResult({
-        error: 'LLM sampling unavailable. Client may not support sampling.',
-        details: String(e?.message || e),
+    const sample = await tryLlmSample(prompt, 500, llm_response)
+    if (!sample.ok) {
+      return promptOnlyFallback('ask', prompt, sample.reason, {
+        question,
+        schema_excerpt_len: schemaRaw.length,
+        details: sample.details,
       })
     }
 
-    const specText = samplingText(llmResponse)
     let spec
     try {
-      spec = parseJsonFromLlm(specText)
+      spec = parseJsonFromLlm(sample.text)
     } catch {
       return textResult({
         error: 'LLM did not return valid JSON projection spec',
-        llm_response: specText,
+        expected_shape: '{"fact_type":"Fact_Type_Name","filter":{"role":"value"}}',
+        llm_response: sample.text,
       })
     }
 
-    // Execute the projection
+    if (!spec?.fact_type || typeof spec.fact_type !== 'string') {
+      return textResult({
+        error: 'Projection spec missing fact_type',
+        llm_response: sample.text,
+      })
+    }
+
     const filterStr = Object.entries(spec.filter || {})
       .map(([k, v]) => `<${k},${v}>`).join('')
     const raw = await systemCall(`query:${spec.fact_type}`, filterStr)
     let results: any
-    try { results = JSON.parse(raw) } catch { results = { raw } }
+    try {
+      const parsed = JSON.parse(raw)
+      results = parsed ?? []
+    } catch { results = { raw } }
 
     return textResult({ question, query: spec, results })
   },
@@ -717,17 +775,17 @@ Use the exact fact_type names from the schema. Leave filter empty {} if no speci
 server.registerTool(
   'synthesize',
   {
-    description: 'Turn facts about an entity into natural-language prose. Runs the full pipeline (resolve + derive to LFP + validate) to include implicit/derived facts, then verbalizes via the client LLM. The engine guarantees content correctness; the LLM shapes the prose.',
+    description: 'Turn entity facts into concise natural-language prose. Engine first runs the full pipeline (resolve + derive to LFP + validate) so the prose reflects implicit/derived facts, then the client LLM shapes the prose. Engine guarantees content correctness; LLM only shapes wording. Pass llm_response to supply pre-written prose and skip sampling.',
     inputSchema: {
       noun: z.string().describe('Entity noun, e.g. "Order"'),
       id: z.string().optional().describe('Specific entity ID, or synthesize all entities of the noun if omitted'),
+      llm_response: z.string().optional().describe('Pre-sampled prose (skip client sampling). Used verbatim as the `prose` field.'),
     },
   },
-  async ({ noun, id }) => {
+  async ({ noun, id, llm_response }) => {
     if (GRAPHDL_MODE !== 'local') {
       return textResult({ error: 'synthesize requires local mode' })
     }
-    // Fetch entity data (includes derived facts — get uses the full pipeline)
     const raw = id
       ? await systemCall(`get:${noun}`, id)
       : await systemCall(`list:${noun}`, '')
@@ -741,22 +799,17 @@ Entity: ${noun}${id ? ` "${id}"` : ' (all instances)'}
 Facts:
 ${JSON.stringify(data, null, 2)}`
 
-    let llmResponse
-    try {
-      llmResponse = await (server as any).server.createMessage({
-        messages: [{ role: 'user', content: { type: 'text', text: prompt } }],
-        maxTokens: 1000,
-      })
-    } catch (e: any) {
-      return textResult({
-        error: 'LLM sampling unavailable. Client may not support sampling.',
-        details: String(e?.message || e),
+    const sample = await tryLlmSample(prompt, 1000, llm_response)
+    if (!sample.ok) {
+      return promptOnlyFallback('synthesize', prompt, sample.reason, {
+        noun,
+        id,
         facts: data,
+        details: sample.details,
       })
     }
 
-    const prose = samplingText(llmResponse)
-    return textResult({ noun, id, facts: data, prose })
+    return textResult({ noun, id, facts: data, prose: sample.text })
   },
 )
 
@@ -765,17 +818,17 @@ ${JSON.stringify(data, null, 2)}`
 server.registerTool(
   'validate',
   {
-    description: 'Check whether raw text violates a deontic OWA constraint. The client LLM extracts fact instances from the text matching the constraint\'s fact types, then the engine verifies those facts against the constraint. Useful for document review and content moderation.',
+    description: 'Check whether raw text violates a deontic OWA constraint. The client LLM extracts fact instances from the text that match the constraint\'s fact types; the engine then verifies those facts against the constraint without mutating state. Useful for document review and content moderation. Pass llm_response to supply pre-extracted facts (JSON array) and skip sampling.',
     inputSchema: {
       text: z.string().describe('Raw text to check'),
       constraint: z.string().describe('Constraint ID (from compiled defs) or the constraint reading text'),
+      llm_response: z.string().optional().describe('Pre-sampled JSON facts array (skip client sampling). Shape: [{"fact_type":..., "bindings":{...}}, ...]'),
     },
   },
-  async ({ text, constraint }) => {
+  async ({ text, constraint, llm_response }) => {
     if (GRAPHDL_MODE !== 'local') {
       return textResult({ error: 'validate requires local mode' })
     }
-    // Get constraint context (fact types it spans, reading text)
     const constraintRaw = await systemCall(`constraint:${constraint}`, '').catch(() => '')
 
     const prompt = `Extract fact instances from the text that are relevant to the given constraint.
@@ -790,34 +843,36 @@ Respond with JSON ONLY as an array of facts:
 
 Only include facts clearly stated or strongly implied by the text. Do not invent. Return [] if no relevant facts are present.`
 
-    let llmResponse
-    try {
-      llmResponse = await (server as any).server.createMessage({
-        messages: [{ role: 'user', content: { type: 'text', text: prompt } }],
-        maxTokens: 1500,
-      })
-    } catch (e: any) {
-      return textResult({
-        error: 'LLM sampling unavailable. Client may not support sampling.',
-        details: String(e?.message || e),
+    const sample = await tryLlmSample(prompt, 1500, llm_response)
+    if (!sample.ok) {
+      return promptOnlyFallback('validate', prompt, sample.reason, {
+        text,
+        constraint,
+        details: sample.details,
       })
     }
 
-    const extractedText = samplingText(llmResponse)
     let facts: any
     try {
-      facts = parseJsonFromLlm(extractedText)
+      facts = parseJsonFromLlm(sample.text)
     } catch {
       return textResult({
         error: 'LLM did not return valid JSON facts array',
-        llm_response: extractedText,
+        expected_shape: '[{"fact_type":"Fact_Type_Name","bindings":{"role":"value"}}, ...]',
+        llm_response: sample.text,
       })
     }
 
-    // Run verify (dry-run) against each extracted fact.
-    // The engine returns violations without mutating state.
+    if (!Array.isArray(facts)) {
+      return textResult({
+        error: 'LLM response must be a JSON array of facts',
+        llm_response: sample.text,
+      })
+    }
+
     const violations: any[] = []
-    for (const fact of Array.isArray(facts) ? facts : []) {
+    for (const fact of facts) {
+      if (!fact?.fact_type || typeof fact.fact_type !== 'string') continue
       const bindings = fact.bindings || {}
       const factStr = Object.entries(bindings)
         .map(([k, v]) => `<${k},${v}>`).join('')
