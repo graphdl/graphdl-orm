@@ -21,7 +21,7 @@ Plan has Price per Interval.
 ## Check
 
 ~~~ expect
-list Graph\ Schema contains {"id": "Plan_has_Price_per_Interval"}
+list Fact\ Schema contains {"id": "Plan_has_Price_per_Interval"}
 ~~~
 
 **NOTE:** If you objectify a ternary — promote it to an entity type — it must have a SPANNING UC (across all three roles) or an independent reference scheme. We'll see that in Lesson H6.

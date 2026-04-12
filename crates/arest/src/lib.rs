@@ -56,7 +56,7 @@ fn allocate(state: ast::Object, defs: Vec<(String, ast::Func)>) -> u32 {
 /// self-describing metamodel available. Use `create_bare_impl` to skip
 /// the auto-load when experimenting with a replacement core.
 ///
-/// Load order matters: core defines the base object types (Noun, Graph
+/// Load order matters: core defines the base object types (Noun, Fact
 /// Schema, Role, Constraint) that every later reading references.
 const METAMODEL_READINGS: &[(&str, &str)] = &[
     ("core",          include_str!("../../../readings/core.md")),

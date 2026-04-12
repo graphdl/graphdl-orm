@@ -32,7 +32,7 @@ It is forbidden that a Constraint has Modality Type 'Deontic' when that Constrai
 
 ### Derivation Over Storage
 
-It is forbidden that a Role stores a value that is derivable from existing Graph instances and Constraint spans.
+It is forbidden that a Role stores a value that is derivable from existing Fact instances and Constraint spans.
 
 ### Subtype Constraint Declaration
 
