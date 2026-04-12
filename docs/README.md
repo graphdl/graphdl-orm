@@ -12,7 +12,7 @@ Read in order if you are new. Jump around if you are looking something up.
 6. [The Compile Pipeline](06-compile-pipeline.md) — what happens between readings and runnable state.
 7. [Generators](07-generators.md) — SQL, iLayer, XSD, Verilog, Solidity; opt-in mechanism.
 8. [Federation](08-federation.md) — external systems, credentials, populate functions.
-9. [MCP Verbs](09-mcp-verbs.md) — the frozen v1.0 tool surface.
+9. [MCP Verbs](09-mcp-verbs.md) — the v1.0 tool surface.
 10. [Self-Modification](10-self-modification.md) — `compile`, `propose`, Domain Change workflow.
 
 For a quick start, see the [top-level README](../README.md). For the formal foundations, the [whitepaper](../AREST.pdf) has the five theorems and their proofs.

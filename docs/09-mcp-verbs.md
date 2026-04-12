@@ -1,6 +1,6 @@
 # 09 · MCP Verbs
 
-The MCP (Model Context Protocol) server is how agents interact with arest. The v1.0 verb set is frozen in four tiers: **primitive** (the algebra requires them), **entity sugar** (ergonomic shortcuts), **introspection** (read-only metadata), **evolution** (governed self-modification), and **LLM bridge** (natural-language to formal-fact translation via client sampling).
+The MCP (Model Context Protocol) server is how agents interact with arest. The v1.0 verb set has four tiers: **primitive** (the algebra requires them), **entity sugar** (ergonomic shortcuts), **introspection** (read-only metadata), **evolution** (governed self-modification), and **LLM bridge** (natural-language to formal-fact translation via client sampling).
 
 ## Configuration
 

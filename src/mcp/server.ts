@@ -249,7 +249,7 @@ const server = new McpServer({
 })
 
 // =====================================================================
-// TOOLS — frozen MCP verb set (v1.0)
+// TOOLS — MCP verb set (v1.0)
 // =====================================================================
 //
 // Primitive (algebra-required):

@@ -128,7 +128,7 @@ This is the last doc. You have:
 - Walked through the compile pipeline ([06](06-compile-pipeline.md))
 - Opted into generators for SQL, Solidity, and more ([07](07-generators.md))
 - Federated data from external systems ([08](08-federation.md))
-- Learned the frozen MCP verb set ([09](09-mcp-verbs.md))
+- Learned the MCP verb set ([09](09-mcp-verbs.md))
 - Evolved the system without leaving the algebra ([10](10-self-modification.md))
 
 The next logical step is to build something real. The [tutor](../tutor/) subfolder ships a sample app and three progressive lesson tracks (easy / medium / hard) that exercise every feature end to end. If you run into something these docs do not answer, open an issue — the docs are meant to be self-contained.

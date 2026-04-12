@@ -75,7 +75,7 @@ Opt in by asserting `App 'myapp' uses Generator 'sqlite'` as an instance fact. G
 
 ## MCP server
 
-The engine is exposed to agents via MCP with a frozen v1.0 verb set.
+The engine is exposed to agents via MCP with a v1.0 verb set.
 
 ```json
 {
@@ -196,7 +196,7 @@ Self-modification preserves all five (Corollary: Closure). Constraint consensus 
 
 ## Status
 
-Pre-1.0. The verb set is frozen. Core primitives, compile pipeline, state machines, generators, federation, and the MCP bridge are implemented and tested (872 tests). Remaining before 1.0: a live testnet deploy of the Solidity generator, and exercising the MCP bridge against a live agent to confirm tool descriptions and sampling work end-to-end.
+Pre-1.0. Core primitives, compile pipeline, state machines, generators, federation, and the MCP bridge are implemented and tested (872 tests). Remaining before 1.0: a live testnet deploy of the Solidity generator, and exercising the MCP bridge against a live agent to confirm tool descriptions and sampling work end-to-end.
 
 ## License
 
