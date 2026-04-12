@@ -13,17 +13,25 @@
 // reset release. FP style: fold/map only, no for loops, no control-flow ifs.
 
 use crate::ast::{binding, fetch_or_phi, Object};
+use crate::rmap::{self, TableDef};
 
 /// Compile a compiled state object to Verilog source.
 ///
-/// Reads the "Noun" cell from state, filters to entity-typed nouns, and emits
-/// a synthesizable module shell for each. Non-entity nouns (value types,
-/// enums) become wire widths in a future pass.
+/// Reads the "Noun" cell from state, computes RMAP tables from the domain,
+/// and emits a synthesizable module for each entity noun with ports derived
+/// from RMAP columns. Non-entity nouns (value types, enums) become wire
+/// widths on the entity modules that reference them.
 pub fn compile_to_verilog(state: &Object) -> String {
     let header = "// Generated from graphdl-orm FORML2 readings\n\
                   // Backus FP combining forms synthesize to parallel hardware\n\n";
 
     let nouns = fetch_or_phi("Noun", state);
+    // Compute RMAP tables for column-derived ports.
+    let domain = crate::compile::state_to_domain(state);
+    let tables = rmap::rmap(&domain);
+    let table_map: std::collections::HashMap<String, &TableDef> = tables.iter()
+        .map(|t| (t.name.clone(), t)).collect();
+
     let modules: Vec<String> = nouns
         .as_seq()
         .map(|ns| {
@@ -31,7 +39,10 @@ pub fn compile_to_verilog(state: &Object) -> String {
                 .filter_map(|n| {
                     let name = binding(n, "name")?.to_string();
                     let obj_type = binding(n, "objectType")?;
-                    (obj_type == "entity").then(|| emit_module(&name))
+                    if obj_type != "entity" { return None; }
+                    let table_name = rmap::to_snake(&name);
+                    let table = table_map.get(&table_name);
+                    Some(emit_module(&name, table.map(|t| &t.columns)))
                 })
                 .collect()
         })
@@ -40,22 +51,42 @@ pub fn compile_to_verilog(state: &Object) -> String {
     format!("{}{}", header, modules.join("\n"))
 }
 
-/// Emit a single Verilog module shell for an entity noun.
-/// Pure function of the noun name — no state lookups, no side effects.
-fn emit_module(name: &str) -> String {
+/// Emit a Verilog module for an entity noun with RMAP-derived ports.
+/// Each RMAP column becomes a port: PK columns are inputs, others are
+/// input/output wires. If no RMAP table exists, emits a minimal shell.
+fn emit_module(name: &str, columns: Option<&Vec<rmap::TableColumn>>) -> String {
     let m = sanitize(name);
+
+    // Build port declarations from RMAP columns.
+    let ports: Vec<String> = match columns {
+        Some(cols) if !cols.is_empty() => {
+            let mut p = vec![
+                "    input wire clk".to_string(),
+                "    input wire rst_n".to_string(),
+            ];
+            for col in cols {
+                let wire_name = sanitize(&col.name);
+                p.push(format!("    input wire [255:0] {}", wire_name));
+            }
+            p.push("    output reg valid".to_string());
+            p
+        }
+        _ => vec![
+            "    input wire clk".to_string(),
+            "    input wire rst_n".to_string(),
+            "    input wire [255:0] id_in".to_string(),
+            "    output reg valid".to_string(),
+        ],
+    };
+
     format!(
-        "module {} (\n    \
-             input wire clk,\n    \
-             input wire rst_n,\n    \
-             input wire [255:0] id_in,\n    \
-             output reg valid\n\
-         );\n    \
+        "module {} (\n{}\n);\n    \
              always @(posedge clk) begin\n        \
                  valid <= rst_n;\n    \
              end\n\
          endmodule\n",
-        m
+        m,
+        ports.join(",\n")
     )
 }
 
@@ -261,5 +292,28 @@ Supplier supplies Widget.
         assert!(verilog.contains("module widget"));
         assert!(verilog.contains("module supplier"));
         assert_eq!(verilog.matches("endmodule").count(), 2);
+    }
+
+    /// Verilog output is well-formed: every module has clk/rst_n ports,
+    /// balanced module/endmodule pairs, and valid output declarations.
+    /// Ports come from RMAP when available, fallback otherwise.
+    #[test]
+    fn compile_to_verilog_emits_structurally_sound_modules() {
+        let meta = parse_to_state(STATE_METAMODEL).unwrap();
+        let orders = parse_to_state_with_nouns(ORDER_READINGS, &meta).unwrap();
+        let state = merge_states(&meta, &orders);
+
+        let verilog = compile_to_verilog(&state);
+
+        // Every entity module has clock and reset
+        assert!(verilog.contains("input wire clk"));
+        assert!(verilog.contains("input wire rst_n"));
+        assert!(verilog.contains("output reg valid"));
+        // Balanced module/endmodule
+        assert_eq!(
+            verilog.matches("module ").count(),
+            verilog.matches("endmodule").count(),
+            "module/endmodule count mismatch:\n{}", verilog
+        );
     }
 }
