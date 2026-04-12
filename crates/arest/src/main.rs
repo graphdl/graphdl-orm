@@ -1,14 +1,14 @@
 // AREST CLI — SYSTEM is the only function.
 //
 // Usage:
-//   arest <readings_dir> [<readings_dir2> ...] [--db <path>]
+//   arest-cli <readings_dir> [<readings_dir2> ...] [--db <path>]
 //
 // Reads .md files from each directory, feeds them through
 // system(h, 'compile', text), then persists state to SQLite.
 // Subsequent system calls load state from the database.
 //
 // Interactive mode (no directories):
-//   arest --db <path> <key> <input>
+//   arest-cli --db <path> <key> <input>
 //
 // Everything goes through SYSTEM. No separate bootstrap, synthesize,
 // or forward-chain commands. Per AREST paper: SYSTEM:x = ⟨o, D'⟩.
@@ -287,7 +287,7 @@ fn main() {
             (true, _) => (arg.clone(), rest, false),
             (false, "--db") => (db, rest, true),
             (false, "--help" | "-h") => {
-                println!("Usage: arest [<readings_dir> ...] [--db <path>] [<key> <input>]");
+                println!("Usage: arest-cli [<readings_dir> ...] [--db <path>] [<key> <input>]");
                 println!();
                 println!("  <dir> [<dir2>]:    compile readings, persist to --db");
                 println!("  <key> <input>:     single SYSTEM call against persisted state");
@@ -310,7 +310,7 @@ fn main() {
     {
         let _ = &db_path; let _ = &rest; // flags-only invocation
         eprintln!("Build with --features local for SQLite support.");
-        eprintln!("  cargo run --bin arest --features local -- <readings_dir>");
+        eprintln!("  cargo run --bin arest-cli --features local -- <readings_dir>");
         std::process::exit(1);
     }
 
