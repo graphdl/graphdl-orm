@@ -1,6 +1,13 @@
 /**
  * RegistryDB — the FILE cell's directory.
  *
+ * One DO instance per scope (app / org / global). Holds cross-entity
+ * state that would otherwise require a global lock: the population
+ * index, compiled schema cache, domain → External System secret
+ * references, federation configs. Per-entity facts live in EntityDB
+ * (one DO per entity id); the two DOs split so entity writes don't
+ * contend against registry reads.
+ *
  * The population P = ↑FILE : D is the named set of all entity cells.
  * The registry knows which cells exist and where — it IS the population index.
  *

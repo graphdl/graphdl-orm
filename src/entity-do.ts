@@ -1,6 +1,14 @@
 /**
  * EntityDB — a Durable Object that IS a cell: ⟨CELL, id, contents⟩.
  *
+ * One DO instance per entity id. This is what gives per-entity
+ * writer isolation (Definition 2, cell isolation): commands on
+ * different entities land on different DOs and run concurrently;
+ * commands on the same entity serialize through its DO. Cross-entity
+ * metadata (the population index, schema cache, domain secrets)
+ * lives in RegistryDB — one per scope — so it isn't contended
+ * against entity writes.
+ *
  * Per the AREST whitepaper (Sec. 14.3):
  *   - Each entity is a cell in state D
  *   - ↑n : D → c  (fetch — get the cell's contents)

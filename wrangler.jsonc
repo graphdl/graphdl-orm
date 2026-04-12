@@ -4,6 +4,13 @@
   "main": "src/worker.ts",
   "compatibility_date": "2026-03-09",
   "compatibility_flags": ["nodejs_compat"],
+  // Two DO classes by design:
+  //   EntityDB    — one instance per entity id (cell isolation, §4.3
+  //                 Definition 2). Per-entity writes run in parallel.
+  //   RegistryDB  — one instance per scope (app/org/global). Holds
+  //                 cross-entity state: population index, schema cache,
+  //                 domain secrets. Isn't contended by entity writes.
+  // Local mode has neither — a single in-memory D serves everything.
   "durable_objects": {
     "bindings": [
       { "name": "ENTITY_DB", "class_name": "EntityDB" },
