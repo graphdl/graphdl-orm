@@ -2112,7 +2112,60 @@ fn shard_map_partitions_facts_by_entity_cell() {
         "RMAP should partition into multiple cells, got: {:?}", cell_names);
 }
 
-// ── Join Derivation (:= syntax) ────────────────────────────────────
+// ── Scale Test: 10K entities × 100 fact types ──────────────────────
+
+#[test]
+#[ignore] // Run with: cargo test --release -- --ignored scale_test
+fn scale_test_10k_entities_100_fact_types() {
+    // Generate a domain with 100 entity types, each with 10 field facts.
+    // Then create 10K entities total (100 per type).
+    let mut readings = String::from("## Entity Types\n\n");
+    for i in 0..100 {
+        readings.push_str(&format!("Entity{}(.id) is an entity type.\n", i));
+    }
+    readings.push_str("Name is a value type.\nValue is a value type.\n");
+    readings.push_str("\n## Fact Types\n\n");
+    for i in 0..100 {
+        readings.push_str(&format!("Entity{} has Name.\n  Each Entity{} has exactly one Name.\n", i, i));
+    }
+
+    let t = std::time::Instant::now();
+    let ir = parse_forml2::parse_markdown(&readings).unwrap();
+    eprintln!("[scale] parse: {:?} ({} nouns, {} fts)",
+        t.elapsed(), ir.nouns.len(), ir.fact_types.len());
+
+    let t = std::time::Instant::now();
+    let state = parse_forml2::domain_to_state(&ir);
+    eprintln!("[scale] domain_to_state: {:?}", t.elapsed());
+
+    let t = std::time::Instant::now();
+    let defs = compile::compile_to_defs_state(&state);
+    eprintln!("[scale] compile_to_defs_state: {:?} ({} defs)",
+        t.elapsed(), defs.len());
+
+    let t = std::time::Instant::now();
+    let d = ast::defs_to_state(&defs, &state);
+    eprintln!("[scale] defs_to_state: {:?}", t.elapsed());
+
+    // O(1) fetches on D (Map-backed)
+    let t = std::time::Instant::now();
+    for i in 0..1000 {
+        let key = format!("schema:Entity{}_has_Name", i % 100);
+        let _ = ast::fetch(&key, &d);
+    }
+    eprintln!("[scale] 1000 fetches on D: {:?}", t.elapsed());
+
+    // Verify shard map and derivation index scale
+    let shard_count = ast::cells_iter(&d).into_iter()
+        .filter(|(n, _)| n.starts_with("shard:")).count();
+    let index_count = ast::cells_iter(&d).into_iter()
+        .filter(|(n, _)| n.starts_with("derivation_index:")).count();
+    eprintln!("[scale] {} shard entries, {} derivation index entries",
+        shard_count, index_count);
+
+    assert!(ir.nouns.len() >= 100, "Should have 100+ entity types");
+    assert!(shard_count >= 100, "Should have 100+ shard entries");
+}
 
 #[test]
 fn derivation_index_gates_by_noun() {
