@@ -1,0 +1,21 @@
+{
+  "name": "graphdl-tutor",
+  "version": "0.1.0",
+  "description": "A teaching app that exercises every GraphDL framework concept. Browse the domains to learn the framework — each one demonstrates specific capabilities.",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "mcp": "tsx ../src/mcp/server.ts",
+    "compile": "cd ../crates/arest && cargo run --example gen_solidity --quiet -- ../../tutor/domains | tee ../../tutor/.out/Generated.sol",
+    "check": "cd ../crates/arest && cargo test --quiet"
+  },
+  "config": {
+    "note": "`yarn mcp` runs the graphdl MCP server pointed at this repo's domains/. Add to your Claude Desktop / Claude Code config with GRAPHDL_READINGS_DIR set to this directory's absolute path."
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "tsx": "^4.0.0"
+  }
+}

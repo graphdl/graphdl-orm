@@ -5,7 +5,7 @@ import { readdirSync, readFileSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { compileDomainReadings, system } from '../src/api/engine.ts'
 
-const dir = process.argv[2] || 'C:/Users/lippe/Repos/graphdl-tutor/domains'
+const dir = process.argv[2] || new URL('../tutor/domains/', import.meta.url).pathname
 console.error(`READINGS_DIR=${dir}`)
 console.error(`exists=${existsSync(dir)}`)
 
