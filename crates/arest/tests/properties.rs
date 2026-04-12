@@ -2072,6 +2072,46 @@ fn bundled_metamodel_passes_validate_model() {
         errors.len(), errors.join("\n"));
 }
 
+// ── Cell Sharding: RMAP partitions to independent folds ────────────
+
+#[test]
+fn shard_map_partitions_facts_by_entity_cell() {
+    // Order domain: RMAP partitions fact types into entity cells.
+    let (_, d) = compile_orders();
+
+    // Extract shard map from D: shard:{ft_id} → <', cell_name>
+    let shard_map: std::collections::HashMap<String, String> = ast::cells_iter(&d).into_iter()
+        .filter(|(n, _)| n.starts_with("shard:"))
+        .filter_map(|(n, v)| {
+            let ft_id = n.strip_prefix("shard:")?.to_string();
+            let cell = v.as_seq()
+                .filter(|items| items.len() == 2 && items[0].as_atom() == Some("'"))
+                .and_then(|items| items[1].as_atom())
+                .map(|s| s.to_string())?;
+            Some((ft_id, cell))
+        })
+        .collect();
+
+    assert!(!shard_map.is_empty(), "shard map should have entries");
+
+    // Every fact type in the domain should have a shard assignment
+    assert!(shard_map.contains_key("Order_was_placed_by_Customer"),
+        "placed_by fact type should be partitioned, got: {:?}", shard_map.keys().collect::<Vec<_>>());
+
+    // Verify demux: split events by cell
+    let events = vec![
+        ("Order_was_placed_by_Customer".to_string(), ast::Object::atom("fact1")),
+        ("Order_has_Status".to_string(), ast::Object::atom("fact2")),
+    ];
+    let demuxed = ast::demux(&events, &shard_map);
+    assert!(!demuxed.is_empty(), "demux should partition events into cells");
+
+    // Distinct cell names should exist (not all facts in one cell)
+    let cell_names: std::collections::HashSet<_> = shard_map.values().collect();
+    assert!(cell_names.len() >= 2,
+        "RMAP should partition into multiple cells, got: {:?}", cell_names);
+}
+
 // ── Join Derivation (:= syntax) ────────────────────────────────────
 
 #[test]

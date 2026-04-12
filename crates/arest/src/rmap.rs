@@ -488,6 +488,82 @@ pub fn rmap_from_loaded_ir(ir: &Domain) -> Vec<TableDef> {
     rmap(ir)
 }
 
+/// Cell assignment: fact_type_id → owning cell name (paper Eq. demux).
+///
+/// RMAP determines which entity table absorbs each fact type:
+/// - Compound UC (M:N, ternary+) → own table/cell
+/// - Single-role UC (functional) → absorbed into the UC role's entity cell
+/// - Unary facts → entity cell
+///
+/// The returned map enables event demultiplexing:
+///   E_n = Filter(eq ∘ [RMAP, n̄]) : E
+pub fn rmap_cell_map(ir: &Domain) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    let noun_name_set: HashSet<String> = ir.nouns.keys().cloned().collect();
+
+    // Index UCs by fact type (same as RMAP step classification)
+    let ucs_by_ft: HashMap<String, Vec<Vec<usize>>> = ir.constraints.iter()
+        .filter(|c| c.kind == "UC")
+        .fold(HashMap::new(), |mut acc, c| {
+            let roles: Vec<usize> = c.spans.iter().map(|s| s.role_index).collect();
+            c.spans.first().into_iter().for_each(|s| {
+                acc.entry(s.fact_type_id.clone()).or_default().push(roles.clone());
+            });
+            acc
+        });
+
+    // Subtype resolution
+    let parent_of: HashMap<&str, &str> = ir.subtypes.iter()
+        .map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let resolve_root = |name: &str| -> String {
+        let mut cur = name.to_string();
+        for _ in 0..100 {
+            match parent_of.get(cur.as_str()) {
+                Some(p) => cur = p.to_string(),
+                None => break,
+            }
+        }
+        cur
+    };
+
+    for (ft_id, ft) in &ir.fact_types {
+        if ft.roles.is_empty() { continue; }
+
+        // Unary: entity cell
+        if ft.roles.len() == 1 {
+            let entity = resolve_root(&ft.roles[0].noun_name);
+            map.insert(ft_id.clone(), to_snake(&entity));
+            continue;
+        }
+
+        let ucs = ucs_by_ft.get(ft_id).cloned().unwrap_or_default();
+        let has_compound = ucs.iter().any(|uc| uc.len() >= 2);
+        let single_ucs: Vec<usize> = ucs.iter()
+            .filter(|uc| uc.len() == 1).map(|uc| uc[0]).collect();
+
+        if has_compound {
+            // Compound UC → own cell (M:N table)
+            let cell = compound_table_name(&ft.reading, &ft.roles, &noun_name_set);
+            map.insert(ft_id.clone(), cell);
+        } else if !single_ucs.is_empty() {
+            // Functional → absorbed into the entity cell of the identifying role.
+            // The UC constrains the dependent role; the other role identifies the row.
+            // E.g. UC on Customer in "Order was placed by Customer" means
+            // each Order has one Customer, so the fact is absorbed into Order's cell.
+            let id_role = ft.roles.iter()
+                .find(|r| !single_ucs.contains(&r.role_index))
+                .unwrap_or(&ft.roles[0]);
+            let entity = resolve_root(&id_role.noun_name);
+            map.insert(ft_id.clone(), to_snake(&entity));
+        } else {
+            // No UC → own cell (junction table)
+            let cell = compound_table_name(&ft.reading, &ft.roles, &noun_name_set);
+            map.insert(ft_id.clone(), cell);
+        }
+    }
+    map
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

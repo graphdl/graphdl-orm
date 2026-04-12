@@ -1464,6 +1464,21 @@ pub fn cells_iter(state: &Object) -> Vec<(&str, &Object)> {
     }
 }
 
+/// Demultiplex events by cell assignment (paper Eq. demux).
+/// E_n = Filter(eq ∘ [RMAP, n̄]) : E
+/// Splits a sequence of (fact_type_id, fact) pairs into per-cell groups
+/// using the shard map (fact_type_id → cell_name).
+pub fn demux<'a>(events: &'a [(String, Object)], shard_map: &HashMap<String, String>) -> HashMap<String, Vec<&'a (String, Object)>> {
+    let mut cells: HashMap<String, Vec<&(String, Object)>> = HashMap::new();
+    for event in events {
+        let cell = shard_map.get(&event.0)
+            .cloned()
+            .unwrap_or_else(|| event.0.clone());
+        cells.entry(cell).or_default().push(event);
+    }
+    cells
+}
+
 /// Get a binding value by role name from a named-tuple fact.
 /// A named-tuple fact is <<role1, val1>, <role2, val2>, ...>.
 /// Replaces: fact.bindings.iter().find(|(k,_)| k == "name").map(|(_,v)| v)
