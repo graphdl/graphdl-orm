@@ -182,8 +182,67 @@ pub fn encode_update_input(
 }
 
 /// Decode a compiled handler's Object result into CommandResult.
-/// Expected: <entities, status, transitions, violations, derived_count, rejected, new_state>
+///
+/// Two shapes supported:
+/// 1. New (Map carrier): `{__state: Object, __result: JSON string atom}`
+///    — emit by encode_command_result. Parses the JSON back into fields.
+/// 2. Legacy (seq): `<entities, status, transitions, violations, derived_count, rejected, new_state>`
+///    — older encode format, kept for callers that haven't migrated.
 pub fn decode_command_result(obj: &ast::Object) -> CommandResult {
+    // Try the Map carrier first.
+    if let Some(map) = obj.as_map() {
+        let state = map.get("__state").cloned().unwrap_or_else(ast::Object::phi);
+        let result_json = map.get("__result").and_then(|o| o.as_atom()).unwrap_or("");
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(result_json) {
+            let entities = parsed.get("entities").and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|e| {
+                    let id = e.get("id")?.as_str()?.to_string();
+                    let entity_type = e.get("type").or_else(|| e.get("entityType"))
+                        .and_then(|v| v.as_str())?.to_string();
+                    let data: std::collections::HashMap<String, String> = e.get("data")
+                        .and_then(|v| v.as_object())
+                        .map(|m| m.iter().filter_map(|(k, v)|
+                            Some((k.clone(), v.as_str()?.to_string()))).collect())
+                        .unwrap_or_default();
+                    Some(EntityResult { id, entity_type, data })
+                }).collect()).unwrap_or_default();
+            let status = parsed.get("status").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let rejected = parsed.get("rejected").and_then(|v| v.as_bool()).unwrap_or(false);
+            let derived_count = parsed.get("derivedCount").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let transitions = parsed.get("transitions").and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|t| {
+                    Some(TransitionAction {
+                        event: t.get("event")?.as_str()?.to_string(),
+                        target_status: t.get("targetStatus")?.as_str()?.to_string(),
+                        method: t.get("method")?.as_str()?.to_string(),
+                        href: t.get("href")?.as_str()?.to_string(),
+                    })
+                }).collect()).unwrap_or_default();
+            let violations = parsed.get("violations").and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| {
+                    Some(crate::types::Violation {
+                        constraint_id: v.get("constraintId")?.as_str()?.to_string(),
+                        constraint_text: v.get("constraintText")?.as_str()?.to_string(),
+                        detail: v.get("detail")?.as_str()?.to_string(),
+                        alethic: v.get("alethic")?.as_bool().unwrap_or(false),
+                    })
+                }).collect()).unwrap_or_default();
+            let navigation = parsed.get("navigation").and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|n| {
+                    Some(NavigationLink {
+                        rel: n.get("rel")?.as_str()?.to_string(),
+                        noun: n.get("noun")?.as_str()?.to_string(),
+                        href: n.get("href")?.as_str()?.to_string(),
+                    })
+                }).collect()).unwrap_or_default();
+            return CommandResult {
+                entities, status, transitions, navigation, violations,
+                derived_count, rejected,
+                state,
+            };
+        }
+    }
+    // Legacy seq shape.
     let items = obj.as_seq().unwrap_or(&[]);
     let sel = |i: usize| items.get(i);
 
@@ -228,37 +287,25 @@ pub fn decode_command_result(obj: &ast::Object) -> CommandResult {
     CommandResult { entities, status, transitions, navigation: vec![], violations, derived_count, rejected, state: new_state }
 }
 
-/// Encode a CommandResult as an Object (inverse of decode_command_result).
+/// Encode a CommandResult as an Object for the dispatch layer.
+///
+/// Returns a state-carrier Object: the new state is stored (keyed by
+/// CELL name "__state") alongside a JSON summary under "__result".
+/// system_impl recognizes the carrier shape, persists the state into
+/// the handle, and returns the JSON atom as the response body.
+///
+/// The JSON is compact — entities + status + transitions + violations
+/// + derived_count + rejected — *without* dumping the full D. That
+/// keeps MCP/HTTP responses small and JSON-parseable. Previous encoding
+/// embedded the entire state (often megabytes) in the response.
 pub fn encode_command_result(result: &CommandResult) -> ast::Object {
-    let entities = ast::Object::Seq(result.entities.iter().map(|e| {
-        let data = ast::Object::Seq(e.data.iter().map(|(k, v)| {
-            ast::Object::seq(vec![ast::Object::atom(k), ast::Object::atom(v)])
-        }).collect());
-        ast::Object::seq(vec![ast::Object::atom(&e.id), ast::Object::atom(&e.entity_type), data])
-    }).collect());
-
-    let status = result.status.as_ref().map(|s| ast::Object::atom(s)).unwrap_or(ast::Object::phi());
-
-    let transitions = ast::Object::Seq(result.transitions.iter().map(|t| {
-        ast::Object::seq(vec![
-            ast::Object::atom(&t.event), ast::Object::atom(&t.target_status),
-            ast::Object::atom(&t.method), ast::Object::atom(&t.href),
-        ])
-    }).collect());
-
-    let violations = ast::Object::Seq(result.violations.iter().map(|v| {
-        ast::Object::seq(vec![
-            ast::Object::atom(&v.constraint_id), ast::Object::atom(&v.constraint_text),
-            ast::Object::atom(&v.detail), ast::Object::atom(if v.alethic { "T" } else { "F" }),
-        ])
-    }).collect());
-
-    ast::Object::seq(vec![
-        entities, status, transitions, violations,
-        ast::Object::atom(&result.derived_count.to_string()),
-        if result.rejected { ast::Object::t() } else { ast::Object::f() },
-        result.state.clone(),
-    ])
+    let summary = serde_json::to_string(&result).unwrap_or_else(|_| "{}".into());
+    // Two-cell Map: __state carries the post-command D so the handle can
+    // persist it; __result is the JSON-string atom the caller sees.
+    let mut cells = std::collections::HashMap::new();
+    cells.insert("__state".to_string(), result.state.clone());
+    cells.insert("__result".to_string(), ast::Object::atom(&summary));
+    ast::Object::Map(cells)
 }
 
 // -- Apply ------------------------------------------------------------
@@ -494,9 +541,19 @@ fn create_via_defs(
                     let target = items.get(1).and_then(|o| o.as_atom()).unwrap_or("");
                     // Positive guard: does a fact of this type exist in P
                     // where the SM's entity plays the noun's role?
-                    // Look up schema to find which role(s) the SM noun plays,
-                    // then check those specific bindings for entity_id.
-                    if !event_type.is_empty() && !target.is_empty() {
+                    //
+                    // Only fire when the transition's event_type corresponds
+                    // to a real fact type in the schema. Named events that
+                    // aren't themselves facts (like the tutor's "place" /
+                    // "pay" / "ship") produce no fact in P and must not
+                    // auto-advance from mere create — they need an explicit
+                    // `transition` call. Previously the fall-through to
+                    // guard_auto_join was firing on every creation, chaining
+                    // the SM through to its terminal state.
+                    let schema_known = !ast::fetch_or_phi(
+                        &format!("schema:{}", event_type), d
+                    ).is_bottom();
+                    if !event_type.is_empty() && !target.is_empty() && schema_known {
                         // Resolve role names from the schema for this fact type.
                         let role_map = ast::apply(
                             &ast::Func::Def(format!("query:{}", event_type)),

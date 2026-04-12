@@ -132,6 +132,35 @@ impl Object {
             _ => self.clone(),
         }
     }
+
+    /// Serialize this Object as a JSON string. Inverse bias: atoms that
+    /// already parse as JSON (e.g. the `debug` def's JSON-atom payload)
+    /// are passed through verbatim; other atoms become JSON strings.
+    /// Seqs become arrays, Maps become objects, Bottom becomes null.
+    ///
+    /// Used by system_impl to serve every tool response as JSON so MCP
+    /// and HTTP callers can parse uniformly — no mixed FFP/JSON handling.
+    pub fn to_json_string(&self) -> String {
+        self.to_json_value().to_string()
+    }
+
+    fn to_json_value(&self) -> serde_json::Value {
+        match self {
+            Object::Bottom => serde_json::Value::Null,
+            Object::Atom(s) => {
+                // Pass-through for atoms that are already JSON documents
+                // (e.g. the debug / list:{noun} / get:{noun} / __result defs).
+                serde_json::from_str::<serde_json::Value>(s)
+                    .unwrap_or_else(|_| serde_json::Value::String(s.clone()))
+            }
+            Object::Seq(items) => serde_json::Value::Array(
+                items.iter().map(|i| i.to_json_value()).collect()
+            ),
+            Object::Map(m) => serde_json::Value::Object(
+                m.iter().map(|(k, v)| (k.clone(), v.to_json_value())).collect()
+            ),
+        }
+    }
 }
 
 /// Split a string on commas, respecting nested <> brackets.
