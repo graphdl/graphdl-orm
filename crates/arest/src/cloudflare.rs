@@ -4,6 +4,14 @@
 
 use wasm_bindgen::prelude::*;
 
+/// Install console_error_panic_hook so Rust panics across the WASM
+/// boundary surface as console.error messages instead of opaque
+/// `unreachable` traps. Runs once at module load via #[wasm_bindgen(start)].
+#[wasm_bindgen(start)]
+pub fn __wasm_init() {
+    console_error_panic_hook::set_once();
+}
+
 /// Allocate D with the bundled metamodel and platform primitives loaded.
 /// Produces a fully self-describing engine ready for user domain readings.
 #[wasm_bindgen]

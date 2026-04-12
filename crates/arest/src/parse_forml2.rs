@@ -22,7 +22,7 @@ thread_local! {
     static STRICT_MODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-pub(crate) fn set_bootstrap_mode(on: bool) {
+pub fn set_bootstrap_mode(on: bool) {
     BOOTSTRAP_MODE.with(|b| b.set(on));
 }
 

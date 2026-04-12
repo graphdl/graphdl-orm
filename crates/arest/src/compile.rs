@@ -13,6 +13,25 @@
 //   - No variables, no mutable state during evaluation -- only reduction
 
 use std::collections::{HashMap, HashSet};
+
+// WASM-safe timing shim. The wasm32-unknown-unknown target panics on
+// std::time::Instant::now() (the Rust stdlib has no clock there). On
+// native builds we use real timing; on WASM we return a zero-duration
+// stub so the profile eprintlns still print but with 0ns.
+#[cfg(not(target_arch = "wasm32"))]
+mod profile_timer {
+    pub type Timer = std::time::Instant;
+    pub fn now() -> Timer { std::time::Instant::now() }
+}
+#[cfg(target_arch = "wasm32")]
+mod profile_timer {
+    #[derive(Clone, Copy)]
+    pub struct Timer;
+    impl Timer {
+        pub fn elapsed(&self) -> std::time::Duration { std::time::Duration::ZERO }
+    }
+    pub fn now() -> Timer { Timer }
+}
 use crate::types::*;
 
 // Re-export DerivedFact-related types used by derivation compilers
@@ -414,10 +433,10 @@ fn active_generators() -> HashSet<String> {
 }
 
 pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> {
-    let t = std::time::Instant::now();
+    let t = profile_timer::now();
     let domain = state_to_domain(state);
     eprintln!("[profile] state_to_domain: {:?} ({} nouns, {} fts, {} constraints)", t.elapsed(), domain.nouns.len(), domain.fact_types.len(), domain.constraints.len());
-    let t = std::time::Instant::now();
+    let t = profile_timer::now();
     let model = compile(&domain);
     eprintln!("[profile] compile: {:?}", t.elapsed());
 
@@ -1036,30 +1055,29 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
     // so callers can still sanity-check cardinalities without exposing schema.
     #[cfg(feature = "debug-def")]
     {
-        let noun_atoms: Vec<Object> = domain.nouns.keys().map(|n| Object::atom(n)).collect();
-        let ft_atoms: Vec<Object> = domain.fact_types.iter()
-            .map(|(id, ft)| Object::seq(vec![Object::atom(id), Object::atom(&ft.reading)]))
-            .collect();
-        let constraint_atoms: Vec<Object> = domain.constraints.iter()
-            .map(|c| Object::seq(vec![Object::atom(&c.kind), Object::atom(&c.text)]))
-            .collect();
-        let sm_atoms: Vec<Object> = model.state_machines.iter()
-            .map(|sm| Object::seq(vec![
-                Object::atom(&sm.noun_name),
-                Object::atom(&sm.initial),
-                Object::Seq(sm.transition_table.iter()
-                    .map(|(from, to, event)| Object::seq(vec![Object::atom(from), Object::atom(to), Object::atom(event)]))
-                    .collect()),
-            ]))
-            .collect();
+        // Emit as a JSON string atom so MCP / HTTP consumers can JSON.parse
+        // the response directly. FFP display notation is not JSON-compatible.
         let total_facts = domain.fact_types.len() + domain.constraints.len() + domain.general_instance_facts.len();
-        defs.push(("debug".to_string(), Func::constant(Object::seq(vec![
-            Object::seq(vec![Object::atom("nouns"), Object::Seq(noun_atoms)]),
-            Object::seq(vec![Object::atom("factTypes"), Object::Seq(ft_atoms)]),
-            Object::seq(vec![Object::atom("constraints"), Object::Seq(constraint_atoms)]),
-            Object::seq(vec![Object::atom("stateMachines"), Object::Seq(sm_atoms)]),
-            Object::seq(vec![Object::atom("totalFacts"), Object::atom(&total_facts.to_string())]),
-        ]))));
+        let json = serde_json::json!({
+            "nouns": domain.nouns.keys().collect::<Vec<_>>(),
+            "factTypes": domain.fact_types.iter().map(|(id, ft)| {
+                serde_json::json!({ "id": id, "reading": ft.reading })
+            }).collect::<Vec<_>>(),
+            "constraints": domain.constraints.iter().map(|c| {
+                serde_json::json!({ "kind": c.kind, "text": c.text, "modality": c.modality })
+            }).collect::<Vec<_>>(),
+            "stateMachines": model.state_machines.iter().map(|sm| {
+                serde_json::json!({
+                    "noun": sm.noun_name,
+                    "initial": sm.initial,
+                    "transitions": sm.transition_table.iter().map(|(from, to, event)| {
+                        serde_json::json!({ "from": from, "to": to, "event": event })
+                    }).collect::<Vec<_>>(),
+                })
+            }).collect::<Vec<_>>(),
+            "totalFacts": total_facts,
+        });
+        defs.push(("debug".to_string(), Func::constant(Object::atom(&json.to_string()))));
     }
     #[cfg(not(feature = "debug-def"))]
     {
@@ -1244,13 +1262,13 @@ pub fn validate_model(ir: &Domain) -> Vec<String> {
 }
 
 pub(crate) fn compile(ir: &Domain) -> CompiledModel {
-    let t0 = std::time::Instant::now();
+    let t0 = profile_timer::now();
     let constraints: Vec<CompiledConstraint> = ir.constraints.iter()
         .map(|def| compile_constraint(ir, def))
         .collect();
     eprintln!("  [profile] {} constraints: {:?}", constraints.len(), t0.elapsed());
 
-    let t1 = std::time::Instant::now();
+    let t1 = profile_timer::now();
     let sm_defs = derive_state_machines_from_facts(&ir.general_instance_facts);
     let sm_source = if sm_defs.is_empty() { &ir.state_machines } else { &sm_defs };
     let state_machines: Vec<CompiledStateMachine> = sm_source.values()
@@ -1258,15 +1276,15 @@ pub(crate) fn compile(ir: &Domain) -> CompiledModel {
         .collect();
     eprintln!("  [profile] {} state machines: {:?}", state_machines.len(), t1.elapsed());
 
-    let t2 = std::time::Instant::now();
+    let t2 = profile_timer::now();
     let noun_index = build_noun_index(ir, &constraints, &state_machines);
     eprintln!("  [profile] noun index: {:?}", t2.elapsed());
 
-    let t3 = std::time::Instant::now();
+    let t3 = profile_timer::now();
     let derivations = compile_derivations(ir, sm_source);
     eprintln!("  [profile] {} derivations: {:?}", derivations.len(), t3.elapsed());
 
-    let t4 = std::time::Instant::now();
+    let t4 = profile_timer::now();
     let schemas = compile_schemas(ir);
     eprintln!("  [profile] {} schemas: {:?}", schemas.len(), t4.elapsed());
 

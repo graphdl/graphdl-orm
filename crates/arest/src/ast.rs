@@ -1672,9 +1672,44 @@ pub fn merge_states(target: &Object, source: &Object) -> Object {
         .collect();
     cells_iter(source).into_iter().for_each(|(name, contents)| {
         let entry = map.entry(name.to_string()).or_insert_with(Object::phi);
-        *entry = concat_seq(entry, contents);
+        *entry = concat_dedup(entry, contents);
     });
     Object::Map(map)
+}
+
+/// Concatenate two sequences and drop duplicates, identity-aware.
+/// Preserves first-occurrence order. When two facts share an identity
+/// key (`id`, `name`, or `ruleId`), the first is kept and the second
+/// dropped — this handles the case where one file declares a noun fully
+/// and another references it, producing two Noun facts that differ in
+/// bindings but represent the same entity.
+fn concat_dedup(a: &Object, b: &Object) -> Object {
+    let a_items: Vec<Object> = a.as_seq().map(|s| s.to_vec()).unwrap_or_default();
+    let b_items: Vec<Object> = b.as_seq()
+        .map(|s| s.to_vec())
+        .unwrap_or_else(|| vec![b.clone()]);
+    let mut out = a_items;
+    for item in b_items {
+        if out.iter().any(|existing| same_identity(existing, &item)) { continue; }
+        out.push(item);
+    }
+    Object::Seq(out)
+}
+
+/// Two facts share identity when they have the same value at a canonical
+/// identity binding (`id`, `name`, or `ruleId`), or — falling back —
+/// when they are structurally equal.
+fn same_identity(a: &Object, b: &Object) -> bool {
+    if a == b { return true; }
+    const IDENTITY_KEYS: &[&str] = &["id", "name", "ruleId", "Change Id", "Signal Id"];
+    for key in IDENTITY_KEYS {
+        let av = binding(a, key);
+        let bv = binding(b, key);
+        if let (Some(av), Some(bv)) = (av, bv) {
+            return av == bv;
+        }
+    }
+    false
 }
 
 /// Concatenate two sequences: <a₁,...,aₙ> ++ <b₁,...,bₘ> = <a₁,...,aₙ,b₁,...,bₘ>
@@ -2377,6 +2412,55 @@ mod tests {
                        apply(&recovered, &input, &defs()),
                        "{} round-trip failed", name);
         }
+    }
+
+    #[test]
+    fn merge_states_dedupes_by_identity() {
+        // Two states declaring Brand — one full (with refScheme), one
+        // reference-only (minimal). merge_states should keep just one.
+        let rich = fact_from_pairs(&[
+            ("name", "Brand"),
+            ("objectType", "entity"),
+            ("referenceScheme", "Brand Name"),
+        ]);
+        let reference_only = fact_from_pairs(&[
+            ("name", "Brand"),
+            ("objectType", "entity"),
+        ]);
+        let state_a = store("Noun", Object::Seq(vec![rich.clone()]), &Object::phi());
+        let state_b = store("Noun", Object::Seq(vec![reference_only]), &Object::phi());
+        let merged = merge_states(&state_a, &state_b);
+        let nouns = fetch("Noun", &merged);
+        let facts = nouns.as_seq().expect("Noun cell should be a seq");
+        assert_eq!(facts.len(), 1, "duplicate Brand should dedupe, got {:?}", facts);
+        // First-occurrence wins: the rich one with refScheme is kept.
+        assert_eq!(facts[0], rich);
+    }
+
+    #[test]
+    fn merge_states_dedupes_by_structural_equality() {
+        // Identical facts in both states collapse to one.
+        let fact = fact_from_pairs(&[("name", "Order"), ("objectType", "entity")]);
+        let state_a = store("Noun", Object::Seq(vec![fact.clone()]), &Object::phi());
+        let state_b = store("Noun", Object::Seq(vec![fact.clone()]), &Object::phi());
+        let merged = merge_states(&state_a, &state_b);
+        let nouns = fetch("Noun", &merged);
+        assert_eq!(nouns.as_seq().map(|s| s.len()), Some(1));
+    }
+
+    #[test]
+    fn merge_states_preserves_distinct_facts() {
+        // Two different nouns in separate states both survive.
+        let order = fact_from_pairs(&[("name", "Order"), ("objectType", "entity")]);
+        let customer = fact_from_pairs(&[("name", "Customer"), ("objectType", "entity")]);
+        let state_a = store("Noun", Object::Seq(vec![order.clone()]), &Object::phi());
+        let state_b = store("Noun", Object::Seq(vec![customer.clone()]), &Object::phi());
+        let merged = merge_states(&state_a, &state_b);
+        let nouns = fetch("Noun", &merged);
+        let facts = nouns.as_seq().unwrap();
+        assert_eq!(facts.len(), 2);
+        assert!(facts.contains(&order));
+        assert!(facts.contains(&customer));
     }
 
     // ── Combining forms ──────────────────────────────────────────

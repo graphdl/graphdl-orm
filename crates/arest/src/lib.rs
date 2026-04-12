@@ -185,8 +185,10 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
     // AST state transition: when result is a new D, store it (⟨o, D'⟩).
     // Platform primitives (compile, apply) return D' as their result.
     // Pure query defs return display notation (no state change).
-    // Result contains cells (Noun, GraphSchema, etc.) iff it's a new D.
-    let is_new_d = result.as_seq().is_some() && ast::fetch("Noun", &result) != ast::Object::Bottom;
+    // A new D is a store — either Seq-of-cells or Map — containing cells.
+    // The Noun cell must exist for it to qualify as a compiled state.
+    let looks_like_store = result.as_seq().is_some() || result.as_map().is_some();
+    let is_new_d = looks_like_store && ast::fetch("Noun", &result) != ast::Object::Bottom;
     is_new_d.then(|| s[handle as usize] = Some(CompiledState { d: result.clone() }));
 
     result.to_string()
