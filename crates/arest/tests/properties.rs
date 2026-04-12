@@ -2115,6 +2115,47 @@ fn shard_map_partitions_facts_by_entity_cell() {
 // ── Scale Test: 10K entities × 100 fact types ──────────────────────
 
 #[test]
+fn derivation_rules_get_distinct_ids_when_consequent_unresolved() {
+    // Two := rules with consequents not declared as fact types.
+    // Before the fix, both got empty IDs and stored as `derivation:` —
+    // last one wins, first one silently lost. Now each gets a stable
+    // sanitized ID from its consequent text.
+    let input = r#"
+X(.id) is an entity type.
+Y(.id) is an entity type.
+P(.id) is an entity type.
+Q(.id) is an entity type.
+Name is a value type.
+
+X has Y.
+Y has Name.
+P has Q.
+Q has Name.
+
+X has Name := X has some Y and that Y has some Name.
+P has Name := P has some Q and that Q has some Name.
+"#;
+    let ir = parse_forml2::parse_markdown(input).unwrap();
+    let state = parse_forml2::domain_to_state(&ir);
+    let defs = compile::compile_to_defs_state(&state);
+    let d = ast::defs_to_state(&defs, &state);
+
+    // Count unique derivation cells in D. Must have BOTH rules, not one.
+    let derivation_cells: Vec<String> = ast::cells_iter(&d).into_iter()
+        .filter(|(n, _)| n.starts_with("derivation:") && !n.contains("_cwa_negation"))
+        .map(|(n, _)| n.to_string())
+        .collect();
+
+    assert!(derivation_cells.len() >= 2,
+        "Expected at least 2 distinct derivation cells for 2 := rules, got: {:?}",
+        derivation_cells);
+
+    // No empty-ID cell
+    assert!(!derivation_cells.contains(&"derivation:".to_string()),
+        "Empty-ID derivation cell should not exist, got: {:?}", derivation_cells);
+}
+
+#[test]
 #[ignore] // Run with: cargo test --release -- --ignored scale_test
 fn scale_test_10k_entities_100_fact_types() {
     // Generate a domain with 100 entity types, each with 10 field facts.

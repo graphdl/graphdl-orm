@@ -1351,8 +1351,29 @@ fn resolve_derivation_rule(rule: &mut DerivationRuleDef, ir: &Domain, catalog: &
             .unwrap_or_default();
     });
 
-    // Set rule ID from consequent
-    rule.id = rule.consequent_fact_type_id.clone();
+    // Set rule ID: prefer resolved consequent FT ID, fall back to a
+    // sanitized form of the consequent text, then to a hash of rule text.
+    // A non-empty ID prevents multiple := rules from sharing the cell
+    // `derivation:` in DEFS and clobbering each other.
+    rule.id = if !rule.consequent_fact_type_id.is_empty() {
+        rule.consequent_fact_type_id.clone()
+    } else {
+        let cleaned = strip_anaphora(consequent_text);
+        let sanitized: String = cleaned.trim().trim_end_matches('.').trim().chars()
+            .map(|c| if c.is_alphanumeric() { c } else { '_' })
+            .collect::<String>()
+            .split('_').filter(|s| !s.is_empty())
+            .collect::<Vec<_>>().join("_");
+        if !sanitized.is_empty() {
+            sanitized
+        } else {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut h = DefaultHasher::new();
+            rule.text.hash(&mut h);
+            format!("_rule_{:x}", h.finish())
+        }
+    };
 }
 
 /// Apply a parse action to the IR accumulator.
