@@ -449,7 +449,7 @@ pub enum Func {
 
     /// Filter: Filter(p):<x₁,...,xₙ> = <xᵢ | p:xᵢ = T>.
     /// The missing primitive for queries as partial application.
-    /// Partial apply a graph schema (bind some roles) → predicate falls out.
+    /// Partial apply a fact type (bind some roles) → predicate falls out.
     /// Filter(predicate) applied to population → matching facts.
     Filter(Box<Func>),
 
@@ -2663,7 +2663,7 @@ mod tests {
 
     #[test]
     fn construction_is_fact_type() {
-        // Fact schema "User has Org Role in Organization" = [Role₁, Role₂, Role₃]
+        // Fact type "User has Org Role in Organization" = [Role₁, Role₂, Role₃]
         // Applied to a membership fact, selects each role's resource.
         let schema = Func::construction(vec![Func::role(1), Func::role(2), Func::role(3)]);
         let fact = Object::seq(vec![
@@ -4000,7 +4000,7 @@ mod tests {
         let facts = log.as_seq().expect("audit_log should be a sequence");
         assert_eq!(facts.len(), 1);
         // `None` sender must materialize as "" so downstream binding
-        // lookups never hit a missing key (totality of the fact schema).
+        // lookups never hit a missing key (totality of the fact type).
         assert_eq!(binding(&facts[0], "sender"), Some(""));
         assert_eq!(binding(&facts[0], "sequence"), Some("0"));
         assert_eq!(binding(&facts[0], "entity"), Some(""));

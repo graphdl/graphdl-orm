@@ -717,7 +717,7 @@ fn paper_claim_parse_produces_population() {
     let state = parse_forml2::domain_to_state(&ir);
     // The state should contain noun facts
     assert!(!matches!(ast::fetch("Noun", &state), ast::Object::Bottom), "State should contain Noun facts");
-    // The state should contain graph schema facts
+    // The state should contain fact type facts
     assert!(!matches!(ast::fetch("FactType", &state), ast::Object::Bottom), "State should contain FactType facts");
     // The state should contain constraint facts
     assert!(!matches!(ast::fetch("Constraint", &state), ast::Object::Bottom), "State should contain Constraint facts");

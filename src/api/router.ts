@@ -522,7 +522,7 @@ router.delete('/api/entities/:noun/:id', async (request, env: Env) => {
 
 // ── Collection CRUD ──────────────────────────────────────────────────
 
-// ── Fact Query: partial application of graph schemas ────────────────
+// ── Fact Query: partial application of fact types ────────────────
 // GET /api/facts/:schema?domain=X&bind[NounA]=value&target=NounB
 // A query IS a partially applied Construction. Bind some roles, get the free roles.
 // The engine loads the domain schema, federates to populate facts, forward-chains
@@ -568,7 +568,7 @@ router.get('/api/facts/:schema', async (request, env: Env) => {
     const enrichedPopJson = JSON.stringify(population)
 
     // Resolve the schema ID — try exact match, then reading-format match
-    // The schema param can be a graph schema ID or a reading like "Vehicle is resolved to Chrome Style Candidate"
+    // The schema param can be a fact type ID or a reading like "Vehicle is resolved to Chrome Style Candidate"
     const schemaId = decodeURIComponent(schema)
 
     // Resolve role names to 1-indexed role positions using the compiled schema.
@@ -635,7 +635,7 @@ router.get('/api/facts/:schema', async (request, env: Env) => {
 
 // ── Conceptual Query — θ₁ operations on P via WASM ─────────────────
 // GET/POST /api/query?domain=X&q=<natural language query>
-// Uses query_schema_wasm to evaluate partial application of graph schemas.
+// Uses query_schema_wasm to evaluate partial application of fact types.
 router.all('/api/query', async (request, env: Env) => {
   const url = new URL(request.url)
   let domain: string | undefined

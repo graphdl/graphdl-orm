@@ -43,7 +43,7 @@ A fact is **elementary** if it can't be decomposed into simpler facts.
 - **And-test**: if a reading uses "and" to conjoin two independent assertions (e.g., "Customer has Name and submits Request"), it encodes two facts and must be split. "And" joining roles in a single predicate (e.g., "Plan charges Price for Product") is fine.
 - **Arity check**: a uniqueness constraint on an n-ary fact type must span at least nâˆ’1 roles. If it spans fewer, the fact MUST be split into smaller facts. No elementary ternary can have a simple (single-role) UC.
 
-**UCs ARE multiplicity** â€” they are the same thing expressed differently. A graph schema has a SET of UCs, not one "relationship type".
+**UCs ARE multiplicity** â€” they are the same thing expressed differently. A fact type has a SET of UCs, not one "relationship type".
 
 **Inline vs section placement**: When writing FORML2 documents, constraints go in the `## Constraints` section (or `## Mandatory Constraints`, `## Deontic Constraints`). The indented-beneath-reading style shown below is for quick illustration and discussion â€” it shows which reading a constraint belongs to. In a formal document, the reading goes under `## Fact Types` and the constraint goes under `## Constraints`.
 
