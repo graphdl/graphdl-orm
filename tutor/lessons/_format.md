@@ -10,11 +10,11 @@ Every lesson is a single markdown file named `NN-kebab-title.md`. Lessons are co
 **Goal:** <one-sentence outcome stated as a fact in the running app>
 **Prereqs:** <comma-separated prior lessons, or "none">
 
-<narrative — 2–4 short paragraphs. What the learner is about to do and why. Teach by doing; keep theory to a NOTE callout.>
+<narrative: 2 to 4 short paragraphs. State what the learner is about to do and why. Teach by doing; keep theory to a NOTE callout.>
 
 ## Do it
 
-<Optionally one or more runnable fences — see "Runnable fences" below.>
+<Optionally one or more runnable fences. See "Runnable fences" below for the syntax.>
 
 ## Check
 
@@ -27,8 +27,8 @@ Every lesson is a single markdown file named `NN-kebab-title.md`. Lessons are co
 
 Optional sections that may appear between `## Do it` and `## Check`:
 
-- `## Why` — one paragraph of theory. Always optional. Cite the whitepaper by theorem or equation when relevant.
-- `## NOTE` — a single callout, italicized or quoted. Matches the vimtutor convention.
+- `## Why` is an optional single paragraph of theory. Cite the whitepaper by theorem or equation when that helps.
+- `## NOTE` is a single callout, either italicized or quoted. It matches the vimtutor convention.
 
 ## Runnable fences
 
@@ -73,9 +73,9 @@ list Order contains {"id": "o1", "total": "100"}
 
 ## Track conventions
 
-- **Easy** — LLM-driven. Most fences are `propose`, `ask`, `synthesize`, or conversational `apply`. The learner edits prose, not FORML2.
-- **Medium** — Tool-call literacy. Fences are explicit `apply`, `get`, `query`, `actions`, `explain`.
-- **Hard** — FORML2 authorship. Fences are `compile` blocks the learner writes from scratch.
+- **Easy** is LLM-driven. Most fences are `propose`, `ask`, `synthesize`, or conversational `apply`. The learner edits prose rather than FORML2.
+- **Medium** is about tool-call literacy. Fences are explicit `apply`, `get`, `query`, `actions`, and `explain`.
+- **Hard** is about FORML2 authorship. Fences are `compile` blocks the learner writes from scratch.
 
 ## Non-goals
 
