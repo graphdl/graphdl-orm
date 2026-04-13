@@ -40,7 +40,7 @@
   },
   "homepage": "https://github.com/graphdl/arest",
   "license": "MIT",
-  "keywords": ["orm2", "forml2", "rest", "fact-oriented-modeling", "state-machine", "mcp", "wasm"],
+  "keywords": ["rest", "hateoas", "state-machine", "mcp", "wasm"],
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
     "itty-router": "^5.0.22"
