@@ -1,4 +1,4 @@
-# AREST State — Behavioral Entities
+# AREST State: Behavioral Entities
 
 ## Entity Types
 
