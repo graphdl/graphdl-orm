@@ -40,7 +40,7 @@
   },
   "homepage": "https://github.com/graphdl/arest",
   "license": "MIT",
-  "keywords": ["rest", "hateoas", "state-machine", "mcp", "wasm"],
+  "keywords": ["rest", "hateoas", "state-machine", "workflow", "code-generation", "mcp", "wasm", "cloudflare-workers"],
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
     "itty-router": "^5.0.22"
