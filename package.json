@@ -1,6 +1,6 @@
 {
   "name": "arest-hateoas",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "AREST engine: FORML2 readings compile to a database schema, constraint rules, state machines, and a REST API with HATEOAS. The readings become the application with zero glue code",
   "type": "module",
   "publishConfig": {
