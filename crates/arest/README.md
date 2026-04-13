@@ -139,7 +139,7 @@ fol --ir constraints.json --forward-chain --population facts.json
 
 ## Tests
 
-There are 27 tests, covering:
+There are 400 lib tests, covering:
 
 - All constraint kinds (UC, MC, RC, XO, XC, OR, SS, EQ).
 - Deontic modalities (forbidden, obligatory, permitted).
