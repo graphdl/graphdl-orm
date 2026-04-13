@@ -3,7 +3,7 @@
 **Goal:** Advance an entity through its state machine using plain language.
 **Prereqs:** Lesson E3
 
-State machines in AREST are declared via readings — "Transition 'place' is from Status 'Draft'..." — and they're already compiled. You don't have to remember the event name: ask the engine what actions are legal right now and pick one.
+State machines in AREST are declared via readings (for example, "Transition 'place' is from Status 'Draft'..."), and they are already compiled. You do not have to remember the event name: ask the engine which actions are legal right now and pick one.
 
 In Easy mode the agent picks for you. You say "place it" and the agent translates to the right `apply transition` call.
 
