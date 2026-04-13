@@ -26,6 +26,6 @@ User is backed by External System 'auth.vin'.
 Stripe Customer is backed by External System 'stripe'.
 
 These declarations live in the bundled metamodel's organizations.md.
-This file surfaces them for tutor learners so federation works out
-of the box. No credentials are checked in — set AREST_SECRET_STRIPE
+This file surfaces them for tutor learners so that federation works out
+of the box. No credentials are checked in. Set AREST_SECRET_STRIPE
 and AREST_SECRET_AUTH_VIN in your environment if you want live fetches.

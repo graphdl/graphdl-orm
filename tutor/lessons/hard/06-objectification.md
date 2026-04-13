@@ -1,11 +1,11 @@
 # Lesson H6: OBJECTIFICATION
 
-**Goal:** Promote a fact type into an entity type — legally, with a spanning UC — and attach facts to the relationship itself.
+**Goal:** Promote a fact type into an entity type (legally, with a spanning UC) and attach facts to the relationship itself.
 **Prereqs:** Lesson H5
 
 Objectification turns a fact into a thing. `CurrentMarriage` isn't just "Person married Person"; it's an entity with its own facts (date, location, officiant). You objectify a fact type when you want to say things ABOUT the relationship, not just that it holds.
 
-The rule: you may only objectify a fact type if it has a UC spanning all its roles. Without a spanning UC, the objectified entity has no coherent identity — there's no way to know which instance you're talking about. If your fact type doesn't have a spanning UC, either add one or flatten into binaries.
+The rule is simple: you may only objectify a fact type if it has a UC spanning all its roles. Without a spanning UC, the objectified entity has no coherent identity, so there is no way to know which instance the reference names. If your fact type does not have a spanning UC, either add one or flatten the fact into binaries.
 
 ## Do it
 

@@ -1,11 +1,11 @@
 # Lesson H7: A DECLARED STATE MACHINE
 
-**Goal:** Write a state machine as a set of facts — no code, no DSL — and fire a transition.
+**Goal:** Write a state machine as a set of facts (with no code and no DSL) and fire a transition.
 **Prereqs:** Lesson H6
 
 A state machine in FORML2 is declared exactly like anything else: facts about SM Definitions, Statuses, Transitions, and Event Types. The metamodel spec (`readings/state.md`) says each Transition belongs to exactly one SM, each SM is for exactly one Noun, and the initial status is derivable from graph topology (sources never targeted).
 
-Always include `Transition 'X' is defined in State Machine Definition 'Y'` — without it, the compiler falls back to a heuristic that can pick the wrong SM when two SMs share a status name.
+Always include `Transition 'X' is defined in State Machine Definition 'Y'`. Without that fact, the compiler falls back to a heuristic that can pick the wrong SM when two SMs share a status name.
 
 ## Do it
 
