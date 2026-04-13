@@ -1,8 +1,8 @@
 # arest
 
-An implementation of [AREST](AREST.tex), the system described in *Compiling Facts into Applications*.
+An implementation of [AREST](AREST.pdf), the system described in *Compiling Facts into Applications*.
 
-A single FORML 2 reading compiles to a database schema, a set of constraint rules, a state machine, and a REST API. The compile step is recognition rather than translation, so the reading IS the application in all four roles at once. The engine runs as a β-reducer over Backus's FFP algebra, targeting WASM today and FPGA eventually.
+A single FORML 2 reading compiles to a database schema, a set of constraint rules, a state machine, and a REST API. The compile step is recognition rather than translation, so the reading IS the application in all four roles at once. The engine runs in WASM today and is designed to lower to FPGA gates eventually. The formal underpinning (a β-reducer over Backus's FFP algebra) is in the architecture section below for the curious.
 
 The design builds on [John Backus](https://en.wikipedia.org/wiki/John_Backus) (FFP/AST, 1978), [E.F. Codd](https://en.wikipedia.org/wiki/Edgar_F._Codd) (relational model, 1970), [Terry Halpin](https://en.wikipedia.org/wiki/Terry_Halpin) (ORM 2, 2008), and [Roy Fielding](https://en.wikipedia.org/wiki/Roy_Fielding) (REST, 2000).
 
