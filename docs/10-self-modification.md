@@ -131,4 +131,4 @@ This is the last doc. You have:
 - Learned the MCP verb set ([09](09-mcp-verbs.md))
 - Evolved the system without leaving the algebra ([10](10-self-modification.md))
 
-The next logical step is to build something real. The [tutor](../tutor/) subfolder ships a sample app and three progressive lesson tracks (easy, medium, and hard) that exercise every feature end to end. If you run into something these docs do not answer, open an issue, since the docs are meant to be self-contained.
+The next logical step is to build something real. The [tutor](https://github.com/graphdl/arest/tree/main/tutor) subfolder ships a sample app and three progressive lesson tracks (easy, medium, and hard) that exercise every feature end to end. If you run into something these docs do not answer, open an issue, since the docs are meant to be self-contained.

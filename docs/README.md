@@ -1,6 +1,6 @@
 # arest Developer Docs
 
-These pages form a self-contained reference for building on arest, and they do not require reading the [whitepaper](../AREST.tex).
+These pages form a self-contained reference for building on arest, and they do not require reading the [whitepaper](https://github.com/graphdl/arest/blob/main/AREST.pdf).
 
 Read them in order if you are new. If you are looking up a particular topic, jump to the relevant chapter.
 
@@ -15,4 +15,4 @@ Read them in order if you are new. If you are looking up a particular topic, jum
 9. [MCP Verbs](09-mcp-verbs.md): the v1.0 tool surface.
 10. [Self-Modification](10-self-modification.md): `compile`, `propose`, and the Domain Change workflow.
 
-For a quick start, see the [top-level README](../README.md). For the formal foundations, the [whitepaper](../AREST.pdf) presents the five theorems and their proofs.
+For a quick start, see the [top-level README](https://github.com/graphdl/arest#readme). For the formal foundations, the [whitepaper](https://github.com/graphdl/arest/blob/main/AREST.pdf) presents the five theorems and their proofs.
