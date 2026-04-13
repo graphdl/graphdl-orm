@@ -4,7 +4,7 @@ name = "arest"
 version = "0.9.0"
 edition = "2021"
 description = "AREST engine: FORML2 parser, constraint compiler, evaluator, forward chainer, RMAP, and verbalization"
-repository = "https://github.com/drivly/arest"
+repository = "https://github.com/graphdl/arest"
 license = "MIT"
 
 [lib]
