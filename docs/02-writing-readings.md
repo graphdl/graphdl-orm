@@ -1,6 +1,6 @@
 # 02 · Writing Readings
 
-A reading is a single FORML 2 sentence. Readings are grouped into markdown files under `readings/` and compiled together. Each file may declare entity types, value types, fact types, constraints, state machines, derivation rules, and instance facts. The order within a file is flexible — the parser accumulates declarations and resolves cross-references at compile time.
+A reading is a single FORML 2 sentence. Readings are grouped into markdown files under `readings/` and compiled together. Each file may declare entity types, value types, fact types, constraints, state machines, derivation rules, and instance facts. The order within a file is flexible, since the parser accumulates declarations and resolves cross-references at compile time.
 
 ## Minimal file structure
 
@@ -131,7 +131,7 @@ Resource 'myapp-orders' has Title 'Order management'.
 -- → Resource.Domain = 'myapp', Resource.Slug = 'orders'
 ```
 
-Instance facts accumulate in the population `P`. At create time via the MCP API, they reach `P` by the same path — ultimately `assert` pushes facts into the FILE cell.
+Instance facts accumulate in the population `P`. At create time via the MCP API, they reach `P` by the same path; ultimately, `assert` pushes facts into the FILE cell.
 
 ## Subtyping
 
@@ -158,4 +158,4 @@ RMAP chooses between partitioned tables (each subtype gets its own) and single-t
 
 ## What's next
 
-You now have entity types, fact types, and the reading grammar. Next: [Constraints](03-constraints.md) — all 17 kinds and how to use them to keep your data honest.
+You now have entity types, fact types, and the reading grammar. The next chapter, [Constraints](03-constraints.md), covers all 17 kinds and shows how to use them to keep your data honest.
