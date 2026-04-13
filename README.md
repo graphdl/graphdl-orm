@@ -161,7 +161,7 @@ flowchart LR
 ```bash
 # Rust engine
 cd crates/arest
-cargo test                                   # 872 tests
+cargo test                                   # 400 lib tests
 cargo build --release --features local       # CLI with SQLite
 cargo build --release --features parallel    # opt-in Rayon for α/Filter/Construction
 
@@ -196,7 +196,7 @@ Self-modification preserves all five properties (Corollary: Closure). Constraint
 
 ## Status
 
-Pre-1.0. The core primitives, compile pipeline, state machines, generators, federation, and MCP bridge are all implemented and tested (872 tests). Remaining before 1.0: a live testnet deploy of the Solidity generator, plus exercising the MCP bridge against a live agent to confirm that tool descriptions and sampling work end-to-end.
+1.0 surface complete. The core primitives, compile pipeline, state machines, generators, federation, and MCP bridge are implemented and exercised against live agents. The npm package ships as [`arest-hateoas`](https://www.npmjs.com/package/arest-hateoas), the Cloudflare Worker deploys to `https://arest.dotdo.workers.dev` with both `/mcp` and `/sse` endpoints, the Solidity generator round-trips through Foundry to a live testnet, and the [tutor](tutor/) ships seventeen lessons across three difficulty tracks.
 
 ## License
 
