@@ -3,7 +3,7 @@
 **Goal:** Move an entity's status by applying a declared transition event.
 **Prereqs:** Lesson M3
 
-`apply operation=transition` takes an `id` and an `event` (the name from `actions`'s response), then folds the event over the machine. The SM is `foldl transition s₀ E` — a pure replay. Firing an event that isn't legal from the current status is rejected with a violation; it is not silently dropped.
+`apply operation=transition` takes an `id` and an `event` (the name from `actions`'s response), then folds the event over the machine. The SM is `foldl transition s₀ E`, which is a pure replay. Firing an event that is not legal from the current status is rejected with a violation rather than silently dropped.
 
 Transitions are facts too: each fire appends to the audit log (`audit` tool) with the entity id, operation, and outcome.
 

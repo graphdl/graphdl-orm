@@ -5,7 +5,7 @@
 
 `synthesize` runs the full pipeline (resolve + derive to LFP + validate) so every implicit fact is materialized, then hands the fact bag to the client LLM with a prompt that says "verbalize these, don't invent." The engine guarantees content correctness; the LLM only shapes wording.
 
-This is how you'd build an "AI summary" panel on a dashboard without any hallucination budget — everything in the prose is grounded in a fact that passed constraints.
+This is how you would build an "AI summary" panel on a dashboard without any hallucination budget. Every claim in the prose is grounded in a fact that passed constraints.
 
 ## Do it
 
