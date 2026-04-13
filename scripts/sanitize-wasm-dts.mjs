@@ -51,3 +51,21 @@ if (cleaned !== src) {
 // committed. Recreate it after every wasm build so fresh clones ship it too.
 const npmIgnorePath = resolve(__dirname, '..', 'crates', 'arest', 'pkg', '.npmignore')
 writeFileSync(npmIgnorePath, '', 'utf-8')
+
+// Cloudflare Workers' WASM runtime doesn't expose `__wbindgen_start` on
+// every instantiation path. wasm-pack's bundler target unconditionally
+// invokes it at module load, which crashes the Worker on deploy with
+// `TypeError: wasm2.__wbindgen_start is not a function`. Guard the call
+// so the module loads whether or not the runtime surfaces the start hook.
+const arestJsPath = resolve(__dirname, '..', 'crates', 'arest', 'pkg', 'arest.js')
+if (existsSync(arestJsPath)) {
+  const jsSrc = readFileSync(arestJsPath, 'utf-8')
+  const guarded = jsSrc.replace(
+    /^wasm\.__wbindgen_start\(\);$/m,
+    'if (typeof wasm.__wbindgen_start === "function") wasm.__wbindgen_start();',
+  )
+  if (guarded !== jsSrc) {
+    writeFileSync(arestJsPath, guarded, 'utf-8')
+    console.log('sanitize-wasm-dts: guarded __wbindgen_start() call for CF Workers')
+  }
+}
