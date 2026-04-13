@@ -1,16 +1,16 @@
-# arest-tutor — the interactive tour
+# arest-tutor: the interactive tour
 
-A hands-on walk through AREST. Three tracks, built in the vimtutor spirit: **teach by doing**. You read one lesson, run the embedded blocks, and the tutor flips a ✗ to ✓ when the check passes. Then you move on.
+The tutor is a hands-on walk through AREST, organized into three tracks and built in the vimtutor spirit: **teach by doing**. You read one lesson, run the embedded blocks, and the tutor flips a ✗ to ✓ when the check passes. Then you move on to the next.
 
-Every lesson is a single markdown file. You can read them directly, but the intended experience is through the `tutor` MCP tool, which runs the blocks and grades the checks for you.
+Every lesson is a single markdown file. You can read them directly, but the intended experience runs through the `tutor` MCP tool, which executes the blocks and grades the checks for you.
 
 ## Tracks
 
-**[Easy](./easy/)** — zero-to-app in ~5 minutes. You describe what you want in plain English and watch the app materialize. Uses `propose`, `ask`, `synthesize`, and conversational `apply`. Four lessons.
+**[Easy](./easy/)** takes you from zero to a running app in about five minutes. You describe what you want in plain English and watch the app materialize. The lessons use `propose`, `ask`, `synthesize`, and conversational `apply`. There are four lessons in this track.
 
-**[Medium](./medium/)** — drive the engine yourself. Tool-call literacy: explicit `apply`, `get`, `query`, `actions`, `explain`. Five lessons. Prereq: Easy (or a working mental model of entities + fact types).
+**[Medium](./medium/)** asks you to drive the engine yourself. The lessons cover tool-call literacy with explicit `apply`, `get`, `query`, `actions`, and `explain`. There are five lessons. The prerequisite is the Easy track, or a working mental model of entities and fact types.
 
-**[Hard](./hard/)** — author the schema directly. Write FORML2 readings by hand, add constraints, derivation rules, a state machine, and end with self-modification at runtime. Eight lessons. Prereq: Medium.
+**[Hard](./hard/)** has you author the schema directly. You write FORML2 readings by hand, add constraints, derivation rules, and a state machine, and you finish with self-modification at runtime. There are eight lessons. The prerequisite is the Medium track.
 
 ## Start
 
@@ -20,11 +20,11 @@ Every lesson is a single markdown file. You can read them directly, but the inte
 ~~~
 ```
 
-The tutor loads the first lesson, renders it, and waits. You run the fences, it grades the check, it hands you `next`.
+The tutor loads the first lesson, renders it, and waits. You run the fences, the tutor grades the check, and it hands you a `next` pointer.
 
 ## For contributors
 
-See [_format.md](./_format.md) for the lesson file format and fence grammar.
+See [_format.md](./_format.md) for the lesson file format and the fence grammar.
 
 ## Lesson index
 
