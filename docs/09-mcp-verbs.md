@@ -241,7 +241,7 @@ All three verbs degrade gracefully when the client does not support sampling. In
 
 ## ChatGPT compatibility
 
-OpenAI's ChatGPT apps, deep research, and company knowledge modes require two specifically-named tools, `search` and `fetch`, with a fixed JSON-in-text-content shape documented at https://developers.openai.com/apps-sdk/build/mcp-server. The remote AREST worker registers both as thin adapters over the entity model so a ChatGPT custom connector pointed at `https://<your-worker>/mcp` (or the `/sse` alias) sees its expected verbs.
+OpenAI's ChatGPT apps, deep research, and company knowledge modes require two specifically-named tools, `search` and `fetch`, with a fixed JSON-in-text-content shape documented at https://developers.openai.com/apps-sdk/build/mcp-server. The remote AREST worker registers both as thin adapters over the entity model. Self-host the worker with `wrangler deploy` and point ChatGPT custom connectors at `https://<your-worker>/mcp` or the `/sse` alias.
 
 ### `search`
 
