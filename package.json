@@ -1,5 +1,5 @@
 {
-  "name": "arest",
+  "name": "arest-hateoas",
   "version": "0.8.0",
   "description": "AREST engine: FORML2 readings compile to a database, constraint rules, state machines, and a REST API. One function, one β-reducer over Backus's FFP algebra, WASM-compiled.",
   "type": "module",
