@@ -1,0 +1,15 @@
+title: AREST Developer Docs
+description: >-
+  Self-contained reference for building on arest. FORML 2 readings compile
+  to a database schema, constraint rules, state machines, and a REST API
+  with HATEOAS, all from one β-reducer over Backus's FFP algebra.
+theme: jekyll-theme-minimal
+url: https://graphdl.github.io
+baseurl: /arest
+github:
+  repository_url: https://github.com/graphdl/arest
+markdown: kramdown
+kramdown:
+  syntax_highlighter: rouge
+exclude:
+  - _config.yml
