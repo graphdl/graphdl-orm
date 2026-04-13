@@ -58,7 +58,7 @@ transition({ noun: "Domain Change", id: "dc-lx9f4", event: "approve-change" })  
 transition({ noun: "Domain Change", id: "dc-lx9f4", event: "apply" })           // → Applied
 ```
 
-On `apply`, the engine runs `compile` on the proposed readings, which means the change actually takes effect only when the state machine reaches `Applied`. Between Proposed and Applied, the proposed elements exist only as data on the Domain Change entity — they are not yet in `DEFS`.
+On `apply`, the engine runs `compile` on the proposed readings, which means the change actually takes effect only when the state machine reaches `Applied`. Between Proposed and Applied, the proposed elements exist only as data on the Domain Change entity, and they are not yet in `DEFS`.
 
 ## Human gates
 
@@ -70,7 +70,7 @@ It is forbidden that a Domain Change targeting Domain 'organizations' is applied
 It is forbidden that a Domain Change targeting Domain 'core' is applied without Signal Source 'Human'.
 ```
 
-Changes to the metamodel itself (`core`, `evolution`, `organizations`) cannot be applied unless a Human signal source is attached. An autonomous agent proposing a metamodel change gets a deontic violation and the change stays in Approved state — waiting for human sign-off.
+Changes to the metamodel itself (`core`, `evolution`, `organizations`) cannot be applied unless a Human signal source is attached. An autonomous agent proposing a metamodel change gets a deontic violation, and the change stays in the Approved state while it waits for human sign-off.
 
 You can extend this pattern to your own domains:
 
@@ -99,7 +99,7 @@ Corollary: Closure says all five theorems hold after self-modification:
 2. **Specification Equivalence** depends on `parse` and `compile` being injective stateless functions. Unaffected.
 3. **Completeness of State Transfer** operates over `P` and `S`, both of which now include the new content. Still holds.
 4. **HATEOAS as Projection** operates over `P` and `S`. Still holds.
-5. **Derivability** — every value in the representation is a ρ-application, regardless of when the definitions entered `DEFS`.
+5. **Derivability** holds because every value in the representation is a ρ-application, regardless of when the definitions entered `DEFS`.
 
 The Curry-Howard correspondence applies: proposing a new fact type is proposing a theorem. CSDP validation is the proof check. Successful ingestion is the proof. The system can only evolve by proving something new.
 
@@ -131,4 +131,4 @@ This is the last doc. You have:
 - Learned the MCP verb set ([09](09-mcp-verbs.md))
 - Evolved the system without leaving the algebra ([10](10-self-modification.md))
 
-The next logical step is to build something real. The [tutor](../tutor/) subfolder ships a sample app and three progressive lesson tracks (easy / medium / hard) that exercise every feature end to end. If you run into something these docs do not answer, open an issue — the docs are meant to be self-contained.
+The next logical step is to build something real. The [tutor](../tutor/) subfolder ships a sample app and three progressive lesson tracks (easy, medium, and hard) that exercise every feature end to end. If you run into something these docs do not answer, open an issue, since the docs are meant to be self-contained.

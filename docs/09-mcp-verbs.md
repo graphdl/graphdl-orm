@@ -53,7 +53,7 @@ assert({ fact_type: "Order_was_placed_by_Customer", bindings: { Order: "ord-1", 
 
 ### `retract`
 
-Remove a specific fact from `P`. Distinct from deletion (which is transition to a terminal status — see `delete`).
+Remove a specific fact from `P`. This is distinct from deletion, which transitions the entity to a terminal status (see `delete`).
 
 ```typescript
 retract({ fact_type: "Order_was_placed_by_Customer", bindings: { Order: "ord-1", Customer: "acme" } })
@@ -69,7 +69,7 @@ project({ fact_type: "Order", filter: { status: "Placed" } })
 
 ### `compile`
 
-Ingest new readings. Immediate self-modification — the new definitions are merged into `DEFS` and every subsequent call evaluates them. See [self-modification](10-self-modification.md).
+Ingest new readings. This is immediate self-modification: the new definitions merge into `DEFS`, and every subsequent call evaluates them. See [self-modification](10-self-modification.md) for details.
 
 ```typescript
 compile({ readings: "Order(.Order Id) is an entity type.\n..." })
@@ -123,7 +123,7 @@ Same as `get` but name-aligned with CRUD expectations. Returns the full RMAP row
 
 ### `update`
 
-Assert new field facts. Old facts are superseded by new assertions via derivation rules — there is no implicit delete.
+Assert new field facts. Old facts are superseded by new assertions via derivation rules, so there is no implicit delete.
 
 ### `transition`
 
@@ -237,7 +237,7 @@ validate({ text: "Customer Bob placed 3 orders in 5 minutes.", constraint: "rate
 3. Engine runs `verify` on each extracted fact.
 4. Response lists any violations.
 
-All three verbs degrade gracefully when the client does not support sampling — they return a prompt the caller can execute itself.
+All three verbs degrade gracefully when the client does not support sampling. In that case they return a prompt that the caller can execute itself.
 
 ## What is not in the verb set
 
@@ -245,4 +245,4 @@ Runtime function registration (adding new Platform names to the engine's dispatc
 
 ## What's next
 
-The last doc. [Self-modification](10-self-modification.md) explains how the system can evolve itself — compile for immediate changes, propose for reviewed ones — without losing the theorems.
+The final chapter, [Self-modification](10-self-modification.md), explains how the system can evolve itself without losing the theorems. It covers `compile` for immediate changes and `propose` for reviewed ones.
