@@ -2,8 +2,10 @@
   "name": "arest",
   "version": "0.8.0",
   "description": "AREST engine: FORML2 readings compile to a database, constraint rules, state machines, and a REST API. One function, one β-reducer over Backus's FFP algebra, WASM-compiled.",
-  "private": false,
   "type": "module",
+  "publishConfig": {
+    "access": "public"
+  },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
