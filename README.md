@@ -1,10 +1,10 @@
 # arest
 
-An implementation of [AREST](AREST.tex) — *Compiling Facts into Applications*.
+An implementation of [AREST](AREST.tex), the system described in *Compiling Facts into Applications*.
 
-A single FORML 2 reading compiles to a database schema, constraint rules, a state machine, and a REST API. Not a translation between representations; the reading is all four at once. The engine is a β-reducer over Backus's FFP algebra targeting WASM and eventually FPGA.
+A single FORML 2 reading compiles to a database schema, a set of constraint rules, a state machine, and a REST API. The compile step is recognition rather than translation, so the reading IS the application in all four roles at once. The engine runs as a β-reducer over Backus's FFP algebra, targeting WASM today and FPGA eventually.
 
-Based on [John Backus](https://en.wikipedia.org/wiki/John_Backus) (FFP/AST, 1978), [E.F. Codd](https://en.wikipedia.org/wiki/Edgar_F._Codd) (relational model, 1970), [Terry Halpin](https://en.wikipedia.org/wiki/Terry_Halpin) (ORM 2, 2008), and [Roy Fielding](https://en.wikipedia.org/wiki/Roy_Fielding) (REST, 2000).
+The design builds on [John Backus](https://en.wikipedia.org/wiki/John_Backus) (FFP/AST, 1978), [E.F. Codd](https://en.wikipedia.org/wiki/Edgar_F._Codd) (relational model, 1970), [Terry Halpin](https://en.wikipedia.org/wiki/Terry_Halpin) (ORM 2, 2008), and [Roy Fielding](https://en.wikipedia.org/wiki/Roy_Fielding) (REST, 2000).
 
 ## Hello, Order
 
@@ -47,35 +47,35 @@ arest-cli "transition:Order" "<ord-1, place>" --db app.db
 #   "_links": { "ship": { ... } } }
 ```
 
-That's it. The schema, the uniqueness constraint, the three-state machine, and the REST surface all came from the nine readings. No translation step, no ORM boilerplate, no handler registration.
+That is the full setup. The schema, the uniqueness constraint, the three-state machine, and the REST surface all come from the nine readings above. There is no translation step, no ORM boilerplate, and no handler registration.
 
-## What you get from readings
+## What readings compile into
 
 | FORML 2 construct | Compiled artifact |
 |---|---|
-| Entity type | Relation + primary key (RMAP Ch. 10) |
-| Fact type | Column, foreign key, or junction table (absorbed via UC) |
-| Constraint | Restriction `Filter(p) : P` — Eq. restrict |
-| State machine | `foldl transition s₀ E` — Eq. sm |
-| Derivation rule | Forward-chained to the least fixed point on every create |
-| Instance fact | Row in the appropriate RMAP table, event that can fire an SM transition |
+| Entity type | A relation plus its primary key (RMAP Ch. 10). |
+| Fact type | A column, foreign key, or junction table, absorbed via the UC. |
+| Constraint | A restriction `Filter(p) : P`, per the restrict equation. |
+| State machine | A fold `foldl transition s₀ E`, per the SM equation. |
+| Derivation rule | Forward-chained to the least fixed point on every create. |
+| Instance fact | A row in the appropriate RMAP table plus an event that can fire an SM transition. |
 
-Every compiled artifact is reachable via one named function stored in DEFS. `SYSTEM:x = (ρ(↑entity(x):D)):↑op(x)` is the only routing primitive.
+Every compiled artifact becomes reachable via one named function stored in DEFS. The routing primitive is a single equation: `SYSTEM:x = (ρ(↑entity(x):D)):↑op(x)`.
 
 ## Generators
 
 The same readings can drive multiple runtimes:
 
-- **SQL** — DDL + triggers for SQLite, PostgreSQL, MySQL, and friends
-- **Solidity** — smart contract with typed struct, events per fact type, state machine modifier
-- **Verilog** — entity modules with RMAP-derived ports for FPGA synthesis
-- **iLayer / XSD / JSON Schema** — API and data interchange surfaces
+- **SQL**: DDL and triggers for SQLite, PostgreSQL, MySQL, and similar engines.
+- **Solidity**: a smart contract with a typed struct, events per fact type, and a state machine modifier.
+- **Verilog**: entity modules with RMAP-derived ports for FPGA synthesis.
+- **iLayer / XSD / JSON Schema**: API and data-interchange surfaces.
 
-Opt in by asserting `App 'myapp' uses Generator 'sqlite'` as an instance fact. Generators that aren't opted in produce nothing.
+A domain opts in by asserting `App 'myapp' uses Generator 'sqlite'` as an instance fact. Generators that are not opted in produce nothing.
 
 ## MCP server
 
-The engine is exposed to agents via MCP with a v1.0 verb set.
+The engine exposes a v1.0 verb set to agents via MCP.
 
 ```json
 {
@@ -89,20 +89,20 @@ The engine is exposed to agents via MCP with a v1.0 verb set.
 }
 ```
 
-**Primitive** (algebra-required): `assert`, `retract`, `project`, `compile`
+**Primitives required by the algebra:** `assert`, `retract`, `project`, `compile`.
 
-**Entity sugar**: `get`, `query`, `apply`, `create`, `read`, `update`, `transition`, `delete`
+**Entity sugar over those primitives:** `get`, `query`, `apply`, `create`, `read`, `update`, `transition`, `delete`.
 
-**Introspection**: `explain`, `actions`, `schema`, `verify`
+**Introspection:** `explain`, `actions`, `schema`, `verify`.
 
-**Evolution**: `propose` (creates a Domain Change for governed review), `compile` (immediate self-modification — Corollary 5)
+**Evolution:** `propose` creates a Domain Change for governed review, and `compile` performs immediate self-modification per Corollary 5.
 
-**LLM bridge** (uses client sampling via MCP `createMessage`):
-- `ask` — natural-language question → projection spec → executed results
-- `synthesize` — facts plus forward-chained derivations → prose
-- `validate` — raw text → LLM-extracted facts → constraint check
+**LLM bridge using client sampling via MCP `createMessage`:**
+- `ask` translates a natural-language question into a projection spec and executes the resulting query.
+- `synthesize` takes facts plus their forward-chained derivations and produces prose.
+- `validate` takes raw text, has the LLM extract facts, and runs a constraint check on them.
 
-Every framework primitive (Noun, Fact Type, Fact Type, Constraint, Derivation Rule, State Machine Definition, Status, Transition, Event Type, Instance Fact, Verb, Reading, External System, Agent Definition, Generator opt-in) is reachable via these verbs. Runtime Platform functions are registered server-side and are intentionally not LLM-exposed.
+Every framework primitive (Noun, Fact Type, Constraint, Derivation Rule, State Machine Definition, Status, Transition, Event Type, Instance Fact, Verb, Reading, External System, Agent Definition, and Generator opt-in) is reachable via these verbs. Runtime Platform functions are registered on the server and are intentionally not exposed to the LLM.
 
 ## Federation
 
@@ -116,11 +116,11 @@ Noun 'Stripe Customer' is backed by External System 'stripe'.
 Noun 'Stripe Customer' has URI '/customers'.
 ```
 
-Federated nouns are resolved by ρ at evaluation time. Constraints and derivation rules evaluate over the unified population without distinguishing local from federated facts. Credentials come from `AREST_SECRET_{SYSTEM}` environment variables. SSRF validation rejects internal and loopback URLs at compile time.
+Federated nouns are resolved by ρ at evaluation time. Constraints and derivation rules evaluate over the unified population, and they do not distinguish local facts from federated facts. Credentials come from `AREST_SECRET_{SYSTEM}` environment variables. SSRF validation rejects internal and loopback URLs at compile time.
 
 ## Scale
 
-At 102 entity types, 100 fact types, 10,000 instance facts (414 KB of readings), release build:
+At 102 entity types, 100 fact types, and 10,000 instance facts (414 KB of readings), a release build performs as follows.
 
 | Phase | Time |
 |---|---|
@@ -128,9 +128,9 @@ At 102 entity types, 100 fact types, 10,000 instance facts (414 KB of readings),
 | domain_to_state | 20 ms (O(n) confirmed) |
 | compile_to_defs_state | 53 ms (2,024 defs produced) |
 | defs_to_state | 39 ms |
-| 1,000 fetches on D | 337 µs (0.34 µs per fetch — Map is O(1)) |
+| 1,000 fetches on D | 337 µs (0.34 µs per fetch, since Map is O(1)) |
 
-Parser is the bulk-compile bottleneck; per-command `create` parses single facts and is negligible.
+The parser is the bulk-compile bottleneck. Per-command `create` parses single facts and is negligible.
 
 ## Architecture
 
@@ -149,12 +149,12 @@ flowchart LR
 
 | Paper | Implementation |
 |---|---|
-| D (state) | Sequence or Map of cells. `Object::Map(HashMap)` gives O(1) fetch. |
-| P (population) | Named set of elementary facts. One cell per RMAP table. |
-| S (schema) | Compiled objects in DEFS: fact types, constraints, derivation rules, state machines. |
-| ρ | β-reducer in Rust/WASM. Compiles readings, evaluates constraints, forward-chains derivations. |
-| SYSTEM | One line of ρ-dispatch + state transition. No routing layer. |
-| Platform primitives | `Func::Platform("compile")`, `Func::Platform("create:Order")`, `Func::Platform("project")`, etc. Synthesizable gates. |
+| D (state) | A sequence or map of cells. `Object::Map(HashMap)` gives O(1) fetch. |
+| P (population) | The named set of elementary facts. One cell per RMAP table. |
+| S (schema) | The compiled objects in DEFS: fact types, constraints, derivation rules, and state machines. |
+| ρ | A β-reducer in Rust/WASM. It compiles readings, evaluates constraints, and forward-chains derivations. |
+| SYSTEM | One line of ρ-dispatch plus a state transition. There is no routing layer. |
+| Platform primitives | `Func::Platform("compile")`, `Func::Platform("create:Order")`, `Func::Platform("project")`, and so on. Each is a synthesizable gate. |
 
 ## Development
 
@@ -179,24 +179,24 @@ yarn typecheck
 
 The [whitepaper](AREST.pdf) proves five properties:
 
-1. **Grammar Unambiguity** — each FORML 2 sentence has exactly one parse.
-2. **Specification Equivalence** — parse and compile are injective; the reading IS the executable.
-3. **Completeness of State Transfer** — every create reaches the least fixed point and collects all violations.
-4. **HATEOAS as Projection** — every link in the representation is a θ₁ operation on P and S.
-5. **Derivability** — every value in the representation is a ρ-application.
+1. **Grammar Unambiguity.** Each FORML 2 sentence has exactly one parse.
+2. **Specification Equivalence.** Parse and compile are both injective, so the reading IS the executable.
+3. **Completeness of State Transfer.** Every create reaches the least fixed point and collects every violation.
+4. **HATEOAS as Projection.** Every link in the representation is a θ₁ operation on P and S.
+5. **Derivability.** Every value in the representation is a ρ-application.
 
-Self-modification preserves all five (Corollary: Closure). Constraint consensus enables peer-to-peer validation without an external protocol (Corollary: Consensus).
+Self-modification preserves all five properties (Corollary: Closure). Constraint consensus enables peer-to-peer validation without an external protocol (Corollary: Consensus).
 
 ## Documentation
 
-- [Quick start](#hello-order) — the Order example above
-- [Developer docs](docs/) — 10 numbered files, self-contained reference covering the full feature surface
-- [Smart contracts](contracts/) — Foundry project that compiles, tests, and deploys the generated Solidity
-- [Whitepaper](AREST.pdf) — the five theorems and their proofs
+- [Quick start](#hello-order): the Order example above.
+- [Developer docs](docs/): 10 numbered files, a self-contained reference covering the full feature surface.
+- [Smart contracts](contracts/): a Foundry project that compiles, tests, and deploys the generated Solidity.
+- [Whitepaper](AREST.pdf): the five theorems and their proofs.
 
 ## Status
 
-Pre-1.0. Core primitives, compile pipeline, state machines, generators, federation, and the MCP bridge are implemented and tested (872 tests). Remaining before 1.0: a live testnet deploy of the Solidity generator, and exercising the MCP bridge against a live agent to confirm tool descriptions and sampling work end-to-end.
+Pre-1.0. The core primitives, compile pipeline, state machines, generators, federation, and MCP bridge are all implemented and tested (872 tests). Remaining before 1.0: a live testnet deploy of the Solidity generator, plus exercising the MCP bridge against a live agent to confirm that tool descriptions and sampling work end-to-end.
 
 ## License
 
