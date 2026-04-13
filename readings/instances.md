@@ -1,4 +1,4 @@
-# AREST Instances — Runtime Entities
+# AREST Instances: Runtime Entities
 
 ## Entity Types
 

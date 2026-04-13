@@ -1,4 +1,4 @@
-# AREST Outcomes — Violations and Failures as Facts
+# AREST Outcomes: Violations and Failures as Facts
 
 ## Description
 

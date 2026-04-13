@@ -1,4 +1,4 @@
-# AREST Agents — AI Behavioral Entities
+# AREST Agents: AI Behavioral Entities
 
 ## Entity Types
 

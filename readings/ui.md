@@ -1,4 +1,4 @@
-# AREST UI — Presentation Layer
+# AREST UI: Presentation Layer
 
 ## Description
 

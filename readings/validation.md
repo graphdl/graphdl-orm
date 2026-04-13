@@ -1,4 +1,4 @@
-# AREST Validation — ORM2 Modeling Rules
+# AREST Validation: ORM2 Modeling Rules
 
 ## Description
 
