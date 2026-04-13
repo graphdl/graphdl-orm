@@ -239,6 +239,32 @@ validate({ text: "Customer Bob placed 3 orders in 5 minutes.", constraint: "rate
 
 All three verbs degrade gracefully when the client does not support sampling. In that case they return a prompt that the caller can execute itself.
 
+## ChatGPT compatibility
+
+OpenAI's ChatGPT apps, deep research, and company knowledge modes require two specifically-named tools, `search` and `fetch`, with a fixed JSON-in-text-content shape documented at https://developers.openai.com/apps-sdk/build/mcp-server. The remote AREST worker registers both as thin adapters over the entity model so a ChatGPT custom connector pointed at `https://<your-worker>/mcp` (or the `/sse` alias) sees its expected verbs.
+
+### `search`
+
+Scans every noun's entity list, filters by substring match across all field values, and returns at most fifty matches.
+
+```typescript
+search({ query: "acme" })
+// → { results: [{ id: "Order:o-1", title: "Order o-1", url: "/api/entities/Order/o-1" }, ...] }
+```
+
+The id round-trips into `fetch` as `"Noun:entityId"`, so the server stays stateless between calls.
+
+### `fetch`
+
+Resolves a `"Noun:entityId"` id, reads the entity through `get:{Noun}`, and returns the OpenAI-compatible document shape including the entity's current SM status as metadata.
+
+```typescript
+fetch({ id: "Order:o-1" })
+// → { id, title, text: <entity JSON>, url, metadata: { noun, entityId, status } }
+```
+
+Both tools are registered alongside the rest of the AREST verbs. ChatGPT in deep-research mode ignores everything else; ChatGPT-as-app sees the whole surface.
+
 ## What is not in the verb set
 
 Runtime function registration (adding new Platform names to the engine's dispatch table) is **not** an MCP verb. Runtime functions are registered server-side at build time. If you need a new named operation, register it as a Platform function in the engine and redeploy; do not expose arbitrary code execution to agents.
