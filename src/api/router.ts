@@ -38,10 +38,13 @@ export const router = AutoRouter()
 router.get('/health', () => json({ status: 'ok', version: '0.1.0' }))
 
 // ── Remote MCP (ChatGPT / Claude Desktop custom connectors) ──────────
-// Streamable HTTP transport — single endpoint for both POST (client
+// Streamable HTTP transport, a single endpoint for both POST (client
 // messages) and GET (SSE server stream). Bearer auth happens in
-// src/index.ts before the router sees the request.
+// src/worker.ts before the router sees the request. The `/sse` alias
+// matches OpenAI's example URLs that end in `/sse/`.
 router.all('/mcp', (request: Request) => handleMcpRequest(request))
+router.all('/sse', (request: Request) => handleMcpRequest(request))
+router.all('/sse/', (request: Request) => handleMcpRequest(request))
 
 // ── Domain Connection: store secrets for External System access ──────
 // Per core.md: Domain connects to External System with Secret Reference.

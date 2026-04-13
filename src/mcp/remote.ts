@@ -71,6 +71,95 @@ export function createRemoteServer(): McpServer {
     },
   )
 
+  // ── ChatGPT compatibility (search + fetch) ────────────────────────────
+  // OpenAI's deep research, company knowledge, and ChatGPT-as-app modes
+  // require these two specific tools. The contract is documented at
+  // https://developers.openai.com/apps-sdk/build/mcp-server. The
+  // implementations adapt AREST's entity model: ids round-trip as
+  // "Noun:entityId" so fetch can route by noun without state.
+
+  function chatgptResult(payload: any) {
+    return { content: [{ type: 'text' as const, text: JSON.stringify(payload) }] }
+  }
+
+  function knownNouns(): string[] {
+    const dump = safeJson(systemCallSync('debug', ''), {})
+    return Object.keys((dump as any).nouns ?? {})
+  }
+
+  // systemCall is async, but for search we want to fan out lookups in
+  // parallel without churning through `await` in a loop. Engine calls are
+  // in-process (WASM in the same isolate), so a sync wrapper is fine.
+  function systemCallSync(key: string, input: string): string {
+    if (!_engine) throw new Error('engine not initialized')
+    if (_handle === null) throw new Error('handle not allocated')
+    return _engine.system(_handle, key, input)
+  }
+
+  server.registerTool(
+    'search',
+    {
+      description: 'Search the population for entities whose fields match a query string. Returns ChatGPT-compatible {results: [{id, title, url}]}. The id is "Noun:entityId" and round-trips into `fetch`.',
+      inputSchema: { query: z.string() },
+    },
+    async ({ query }) => {
+      await getHandle() // ensure engine warm
+      const needle = (query ?? '').trim().toLowerCase()
+      if (!needle) return chatgptResult({ results: [] })
+
+      const nouns = knownNouns()
+      const results: Array<{ id: string; title: string; url: string }> = []
+      const cap = 50
+
+      for (const noun of nouns) {
+        if (results.length >= cap) break
+        const list = safeJson(systemCallSync(`list:${noun}`, ''), [])
+        if (!Array.isArray(list)) continue
+        for (const entity of list) {
+          if (results.length >= cap) break
+          if (!entity || typeof entity !== 'object') continue
+          const flat = JSON.stringify(entity).toLowerCase()
+          if (!flat.includes(needle) && !noun.toLowerCase().includes(needle)) continue
+          const entityId = (entity as any).id ?? ''
+          if (!entityId) continue
+          results.push({
+            id: `${noun}:${entityId}`,
+            title: `${noun} ${entityId}`,
+            url: `/api/entities/${encodeURIComponent(noun)}/${encodeURIComponent(entityId)}`,
+          })
+        }
+      }
+      return chatgptResult({ results })
+    },
+  )
+
+  server.registerTool(
+    'fetch',
+    {
+      description: 'Fetch one entity by id (the "Noun:entityId" form returned by `search`). Returns ChatGPT-compatible {id, title, text, url, metadata}.',
+      inputSchema: { id: z.string() },
+    },
+    async ({ id }) => {
+      await getHandle()
+      const sep = id.indexOf(':')
+      if (sep < 0) {
+        return chatgptResult({ id, title: id, text: '', url: '', metadata: { error: 'id must be of the form "Noun:entityId"' } })
+      }
+      const noun = id.slice(0, sep)
+      const entityId = id.slice(sep + 1)
+      const entity = safeJson(systemCallSync(`get:${noun}`, entityId), null)
+      const sm = safeJson(systemCallSync('get:State Machine', entityId), null) as any
+      const status = sm && typeof sm.currentlyInStatus === 'string' ? sm.currentlyInStatus : null
+      return chatgptResult({
+        id,
+        title: `${noun} ${entityId}`,
+        text: entity ? JSON.stringify(entity, null, 2) : 'No entity found.',
+        url: `/api/entities/${encodeURIComponent(noun)}/${encodeURIComponent(entityId)}`,
+        metadata: { noun, entityId, status },
+      })
+    },
+  )
+
   server.registerTool(
     'get',
     {
