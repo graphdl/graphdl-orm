@@ -198,7 +198,7 @@ Self-modification preserves all five properties (Corollary: Closure). Constraint
 
 ## Status
 
-1.0 surface complete. The core primitives, compile pipeline, state machines, generators, federation, and MCP bridge are implemented and exercised against live agents. The npm package ships as [`arest-hateoas`](https://www.npmjs.com/package/arest-hateoas), the Cloudflare Worker deploys to `https://arest.dotdo.workers.dev` with both `/mcp` and `/sse` endpoints, the Solidity generator round-trips through Foundry to a live testnet, and the [tutor](tutor/) ships seventeen lessons across three difficulty tracks.
+1.0 surface complete. The core primitives, compile pipeline, state machines, generators, federation, and MCP bridge are implemented and exercised against live agents. The npm package ships as [`arest-hateoas`](https://www.npmjs.com/package/arest-hateoas). Self-hosting on Cloudflare takes one `wrangler deploy` and the Worker exposes both `/mcp` and `/sse` for any MCP client. The Solidity generator round-trips through Foundry to a live testnet, and the [tutor](tutor/) ships seventeen lessons across three difficulty tracks.
 
 ## License
 
