@@ -1,6 +1,6 @@
 # 05 · Derivation Rules
 
-A derivation rule says "when these facts are present, this fact is also present." The rule is forward-chained on every `create` until the population reaches a fixed point — no new derived facts are produced. Derivation is monotonic (rules only add facts, never remove them) and terminating (the population is finite).
+A derivation rule says "when these facts are present, this fact is also present." The rule is forward-chained on every `create` until the population reaches a fixed point at which no new derived facts are produced. Derivation is monotonic (rules only add facts, never remove them) and terminating (the population is finite).
 
 ## Syntax
 
@@ -32,17 +32,17 @@ A has C := A has some B and that B has some C.
 
 Here `B` is the join key: the rule fires when you can find an `A has B` fact and a `B has C` fact sharing the same `B` value.
 
-Multiple anaphors — the more you use, the tighter the join.
+Multiple anaphors are allowed; the more you use, the tighter the join becomes.
 
 ## Kinds of derivation
 
 The compiler classifies rules and emits different Func shapes:
 
-- **Modus ponens** — no join key, one antecedent. Lift every antecedent tuple to the consequent shape.
-- **Join** — one or more `that` anaphors. Compute an equi-join on the shared nouns, then derive.
-- **Subtype inheritance** — automatic for subtype hierarchies. Inherit all fact types from the supertype.
-- **Transitivity** — when two fact types share a role structure (`A → B`, `B → C`), the compiler can derive `A → C`.
-- **CWA negation** — for nouns under the closed-world assumption, the compiler generates negation-by-failure: `NOT A has B iff A is instance of Noun and no B exists for A`.
+- **Modus ponens** applies when there is no join key and a single antecedent. The compiler lifts every antecedent tuple into the consequent shape.
+- **Join** applies when there is one or more `that` anaphor. The compiler computes an equi-join on the shared nouns, then derives the consequent.
+- **Subtype inheritance** is automatic for subtype hierarchies. The subtype inherits every fact type that the supertype declares.
+- **Transitivity** applies when two fact types share a role structure (`A → B` and `B → C`). The compiler can derive `A → C` from the pair.
+- **CWA negation** is generated for nouns under the closed-world assumption. The compiler produces a negation-by-failure rule of the form `NOT A has B iff A is instance of Noun and no B exists for A`.
 
 ## Examples
 
@@ -96,7 +96,7 @@ Every derived fact is traced. Call `explain` on a fact to see the chain of rules
 explain { fact_type: "User_accesses_Domain", bindings: { User: "alice", Domain: "core" } }
 ```
 
-Returns the derivation chain: which rule fired, which antecedent facts it consumed, and for each antecedent whether it was asserted or itself derived. This is the audit trail — no black-box authorization decisions.
+It returns the derivation chain: which rule fired, which antecedent facts the rule consumed, and for each antecedent whether the fact was asserted or itself derived. This is the audit trail, so no authorization decision is a black box.
 
 ## SQL triggers for derivations
 

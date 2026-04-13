@@ -6,7 +6,7 @@ Constraints are the facts your data must satisfy. arest supports seventeen const
 
 Every constraint carries a modality.
 
-An **alethic** constraint is a rule the data must satisfy. Violations reject the command outright. These are your business invariants — the ones where the bad state should not exist, not for a moment.
+An **alethic** constraint is a rule the data must satisfy. Violations reject the command outright. These are your business invariants, meaning the ones where the bad state should not exist even for a moment.
 
 ```forml2
 Each Order was placed by exactly one Customer.
@@ -35,7 +35,7 @@ Each Order has at most one Amount.
 
 `exactly one` means UC + MC (one and only one). `at most one` means UC only (zero or one).
 
-Compound uniqueness — the combination of two roles is unique, but neither alone:
+Compound uniqueness applies when the combination of two roles is unique, though neither role alone is:
 
 ```forml2
 Each Employee earns at most one Salary in each Year.
@@ -108,7 +108,7 @@ Person is registered iff Person has verified Email and Person accepted Terms.
 
 ### Irreflexive (IR)
 
-No self-reference. Ring constraint — both roles played by the same noun.
+Irreflexive constraints forbid self-reference. They are a form of ring constraint, which applies when both roles are played by the same noun.
 
 ```forml2
 No Person is a parent of themselves.
@@ -178,7 +178,7 @@ Declared implicitly when you give a value type its possible values.
 
 ## Textual / deontic keyword constraints
 
-For deontic text constraints — rules over free-form text — the OWA path looks for keyword co-occurrence and fires when more than half the keywords are present. Use this sparingly:
+For deontic text constraints, which are rules over free-form text, the OWA path looks for keyword co-occurrence and fires when more than half the keywords are present. Use this sparingly:
 
 ```forml2
 It is forbidden that a response contains hate, violence, or slur.
@@ -188,7 +188,7 @@ This produces a `Filter(Gt(Length(matched), threshold))` restriction over any re
 
 ## Violation messages
 
-When a constraint fires, the response includes the original reading as the error. This is Corollary: Verbalization — `compile⁻¹(c) = reading` by injectivity of parse and compile.
+When a constraint fires, the response includes the original reading as the error. This is Corollary: Verbalization, which states that `compile⁻¹(c) = reading` by the injectivity of parse and compile.
 
 ```json
 {
