@@ -75,7 +75,7 @@ Produces defs named `ilayer:{Noun}` returning a structured object:
 
 ## XSD
 
-XML Schema Definition — generates type definitions for each noun. Useful for SOAP / XML interchange systems.
+XSD generates an XML Schema Definition with type definitions for each noun. It is useful for SOAP and XML interchange systems.
 
 ```forml2
 App 'myapp' uses Generator 'xsd'.
@@ -150,7 +150,7 @@ or a set of defs pushed during `compile_to_defs_state`. The conventions:
 - Read schema information from the state or the reconstructed domain.
 - Use RMAP tables (`rmap::rmap(&domain)`) for typed output.
 - Gate with `generators.contains("foo")` so the generator is only active when opted in.
-- Prefer pure FP style — iterator combinators, no mutable accumulators unless the output is a single string.
+- Prefer a pure functional style with iterator combinators. Avoid mutable accumulators unless the output is a single string.
 
 See `crates/arest/src/generators/solidity.rs` or `fpga.rs` for a current example.
 

@@ -35,7 +35,7 @@ When an MCP `get Stripe Customer` request arrives:
 5. It issues the HTTPS GET.
 6. It maps the JSON response fields to role bindings using the noun's fact types.
 
-The fetched facts enter `P` under OWA (Open World Assumption). Their absence is not a violation — only their presence against a deontic constraint is. Alethic constraints that span an OWA noun are treated as sound-but-not-complete.
+The fetched facts enter `P` under OWA (Open World Assumption). Their absence is not a violation; only their presence against a deontic constraint counts as a violation. Alethic constraints that span an OWA noun are treated as sound-but-not-complete.
 
 ## Credentials
 
@@ -86,9 +86,9 @@ The engine does not distinguish local from federated at query time. It fetches t
 
 The bundled metamodel includes `organizations.md` which declares:
 
-- `auth.vin` — identity provider at `https://auth.vin` with `users API-Key` prefix
-- `auto.dev` — automotive data API
-- `stripe` — billing, with all eight standard resources (customer, subscription, invoice, charge, payment_method, price, product, payment_intent)
+- `auth.vin` is an identity provider at `https://auth.vin` with the `users API-Key` prefix.
+- `auto.dev` is an automotive data API.
+- `stripe` is a billing system, exposed with all eight standard resources (customer, subscription, invoice, charge, payment_method, price, product, payment_intent).
 
 You get these for free when you import the metamodel. Add your own External Systems in your domain readings.
 
@@ -105,4 +105,4 @@ No middleware, no schema translation, no separate query language. The fact type 
 
 ## What's next
 
-Your readings now reach everything — schema, constraints, workflows, derivations, and external systems. [The MCP verb set](09-mcp-verbs.md) is how agents and tools talk to all of it.
+Your readings now reach everything: schema, constraints, workflows, derivations, and external systems. The next chapter, [The MCP verb set](09-mcp-verbs.md), shows how agents and tools talk to the whole surface.
