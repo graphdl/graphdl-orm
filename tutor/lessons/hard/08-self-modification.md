@@ -5,7 +5,7 @@
 
 `compile` is an application of `SYSTEM` whose addressed entity is `DEFS` and whose operation is `compile ∘ parse`. Parsed readings become FFP objects, stored into DEFS via `↓DEFS`. Every subsequent `SYSTEM` call evaluates the new definitions. Migration, versioning, and schema evolution are the same mechanism.
 
-All the guarantees that hold at startup still hold after self-modification — the new D is still unambiguous, still specification-equivalent, still complete, still HATEOAS-projective, still fully derivable. Migration is ingestion.
+All the guarantees that hold at startup still hold after self-modification. The new D is still unambiguous, still specification-equivalent, still complete, still HATEOAS-projective, and still fully derivable. Migration is ingestion.
 
 ## Do it
 

@@ -1,8 +1,8 @@
 # Notifications
 
-Exercises: event-driven fact creation, channels (OR constraint — at least one),
-delivery tracking state machine, user preferences, deontic permissions,
-open world assumption.
+Exercises: event-driven fact creation, channels (an OR constraint requiring at least one),
+delivery-tracking state machine, user preferences, deontic permissions,
+and the open-world assumption.
 
 ## Entity Types
 
