@@ -7,7 +7,7 @@ This is a teaching app that exercises every AREST framework concept. Each domain
 The tutor ships as a subfolder of the main AREST repo, so one clone covers everything:
 
 ```bash
-git clone https://github.com/drivly/arest
+git clone https://github.com/graphdl/arest
 cd arest/tutor
 yarn install
 yarn compile   # round-trips every domain through the Rust compiler
