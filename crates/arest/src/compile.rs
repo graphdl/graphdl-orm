@@ -1217,7 +1217,18 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
         ]))));
     }
 
-    defs
+    // Algebraic rewrite pass (Backus §12). Normalize every emitted Func
+    // to its smallest equivalent form before it enters D. Rewrites are
+    // observational equivalences, so runtime semantics are unchanged;
+    // interpretation is faster because the reducer walks fewer nodes.
+    // See crate::ast::normalize for the rule set.
+    let t = profile_timer::now();
+    let normalized: Vec<(String, Func)> = defs.into_iter()
+        .map(|(name, func)| (name, crate::ast::normalize(&func)))
+        .collect();
+    eprintln!("[profile] normalize pass: {:?} ({} defs)", t.elapsed(), normalized.len());
+
+    normalized
 }
 
 /// Reconstruct a Domain from an Object state by querying metamodel cells.
