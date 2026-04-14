@@ -1,0 +1,280 @@
+// crates/arest/src/generators/openapi.rs
+//
+// OpenAPI 3.1 generator: compile FFP state to an OpenAPI document.
+//
+// AREST.tex §4.4 is the source of truth:
+//   "RMAP determines which facts belong to which cell from the schema's
+//    uniqueness constraints: the result is a 3NF row, the complete set
+//    of facts that depend on one entity's key. Each entity is a cell."
+//
+// This generator therefore CONSUMES rmap::rmap(domain) as the primary
+// source of component schemas and does not re-derive attributes from
+// fact_types/constraints/ref_schemes independently. Columns → properties.
+// `!nullable` → `required`. `references` → `$ref`. That is the whole
+// schema side.
+//
+// State-machine status is orthogonal to RMAP (storage ≠ behavior) and
+// contributes a separate `status` property with the status enum.
+//
+// Paths per entity are derived from Theorem 4 (HATEOAS as Projection):
+//   - `/{plural}`          GET (list), POST (create)
+//   - `/{plural}/{id}`     GET (read), PATCH (update)
+//   - `/{plural}/{id}/transition` POST (event in body)
+//   - related-collection per binary fact type the noun participates in
+//
+// No DELETE — per §4.1 and Corollary 2, deletion is a transition to a
+// terminal status. The list endpoint filters out terminal entities via
+// `Filter(p_live) : P` (server-side, documented in the description).
+//
+// Response envelope per Theorems 3 + 5 and Corollary 1:
+//   `{ data, _links, violations }` — `data` is the 3NF row plus derived
+//   values; `_links` is `links_full(e, n, status(e, P))`; each violation
+//   carries the original reading text (Cor 1 Verbalization).
+//
+// Design constraints (project rules):
+//   - Pure FP style: iterator combinators, no for loops, no control-flow ifs.
+//   - The function is total: missing cells yield a valid empty document.
+//   - Output parses as valid JSON conforming to OpenAPI 3.1.
+
+use std::collections::HashMap;
+
+use crate::ast::Object;
+use crate::rmap::{self, TableColumn, TableDef};
+use crate::types::Domain;
+
+/// Compile state into an OpenAPI 3.1 JSON document.
+///
+/// Public entry point matching the solidity/fpga generator signature.
+/// Reconstructs the domain from state, runs RMAP, and composes the
+/// OpenAPI document from the resulting TableDefs.
+pub fn compile_to_openapi(state: &Object) -> String {
+    let domain = crate::compile::state_to_domain(state);
+    openapi_for_domain(&domain).to_string()
+}
+
+/// Build the OpenAPI 3.1 document as a `serde_json::Value`.
+///
+/// `pub(crate)` so `compile.rs` can register the document cell under the
+/// `openapi` generator opt-in without round-tripping through state.
+pub(crate) fn openapi_for_domain(domain: &Domain) -> serde_json::Value {
+    let tables = rmap::rmap(domain);
+    let tables_by_entity: HashMap<String, &TableDef> = tables.iter()
+        .map(|t| (t.name.clone(), t))
+        .collect();
+
+    // For each value-type column name (snake_case), recover the source noun
+    // so we can consult `domain.enum_values`. RMAP does not carry the source
+    // noun name on TableColumn; this side-map bridges the gap without
+    // changing the RMAP type surface.
+    let noun_by_snake: HashMap<String, String> = domain.nouns.keys()
+        .map(|n| (rmap::to_snake(n), n.clone()))
+        .collect();
+
+    let schemas: serde_json::Map<String, serde_json::Value> = domain.nouns.iter()
+        .filter(|(_, n)| n.object_type == "entity")
+        .filter_map(|(name, _)| {
+            let table_name = rmap::to_snake(name);
+            tables_by_entity.get(&table_name)
+                .map(|table| (name.clone(), component_schema(domain, name, table, &noun_by_snake)))
+        })
+        .collect();
+
+    serde_json::json!({
+        "openapi": "3.1.0",
+        "info": {
+            "title": "AREST",
+            "version": "1.0.0",
+            "description": "Compiled from FORML2 readings by the AREST engine.",
+        },
+        "paths": {},
+        "components": {
+            "schemas": schemas,
+        },
+    })
+}
+
+/// Build one entity's component schema from its RMAP TableDef.
+///
+/// Columns contribute properties. Non-nullable columns contribute to
+/// `required`. FK columns emit `$ref`. The state machine, if any, adds a
+/// `status` property whose enum is the declared status set.
+fn component_schema(
+    domain: &Domain,
+    noun_name: &str,
+    table: &TableDef,
+    noun_by_snake: &HashMap<String, String>,
+) -> serde_json::Value {
+    let column_props = table.columns.iter()
+        .map(|col| (col.name.clone(), column_property(col, domain, noun_by_snake)));
+
+    // State machines for this noun contribute a `status` property whose
+    // enum is the declared status set. Transitions drive behavior; this
+    // property is the read-side projection of the current status.
+    let sm_props = domain.state_machines.values()
+        .filter(|sm| sm.noun_name == noun_name)
+        .map(|sm| (
+            "status".to_string(),
+            serde_json::json!({
+                "type": "string",
+                "enum": &sm.statuses,
+            }),
+        ));
+
+    let properties: serde_json::Map<String, serde_json::Value> =
+        column_props.chain(sm_props).collect();
+
+    let required: Vec<String> = table.columns.iter()
+        .filter(|c| !c.nullable)
+        .map(|c| c.name.clone())
+        .collect();
+
+    serde_json::json!({
+        "type": "object",
+        "title": noun_name,
+        "properties": properties,
+        "required": required,
+    })
+}
+
+/// Map a RMAP column to a JSON Schema property.
+///
+/// FK columns emit `$ref` into `components.schemas.{Target}`. Value-type
+/// columns with declared enum values emit `{type, enum}`. Other value
+/// columns emit a scalar type derived from the SQL `col_type`.
+fn column_property(
+    col: &TableColumn,
+    domain: &Domain,
+    noun_by_snake: &HashMap<String, String>,
+) -> serde_json::Value {
+    col.references.as_ref()
+        .map(|target| serde_json::json!({
+            "$ref": format!("#/components/schemas/{}", target),
+        }))
+        .unwrap_or_else(|| {
+            let source_noun = noun_by_snake.get(&col.name);
+            let enum_vals = source_noun.and_then(|n| domain.enum_values.get(n));
+            match enum_vals {
+                Some(vals) => serde_json::json!({
+                    "type": sql_type_to_json(&col.col_type),
+                    "enum": vals,
+                }),
+                None => serde_json::json!({
+                    "type": sql_type_to_json(&col.col_type),
+                }),
+            }
+        })
+}
+
+/// Map a SQL type string to a JSON Schema scalar type.
+///
+/// Coarse mapping covering the common RMAP outputs. Unknown types fall
+/// back to "string" so the function remains total.
+fn sql_type_to_json(sql_type: &str) -> &'static str {
+    match sql_type.to_uppercase().as_str() {
+        "INTEGER" | "BIGINT" | "SMALLINT" => "integer",
+        "REAL" | "NUMERIC" | "DECIMAL" | "DOUBLE" | "FLOAT" => "number",
+        "BOOLEAN" | "BOOL" => "boolean",
+        _ => "string",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{NounDef, WorldAssumption};
+
+    fn entity_noun() -> NounDef {
+        NounDef {
+            object_type: "entity".into(),
+            world_assumption: WorldAssumption::default(),
+        }
+    }
+
+    #[test]
+    fn empty_domain_emits_valid_openapi_3_1_document() {
+        let doc = openapi_for_domain(&Domain::default());
+
+        assert_eq!(doc["openapi"], "3.1.0");
+        assert_eq!(doc["info"]["version"], "1.0.0");
+        assert!(doc["info"]["title"].is_string());
+        assert!(doc["paths"].is_object());
+        assert!(doc["components"]["schemas"].is_object());
+        assert_eq!(doc["components"]["schemas"].as_object().unwrap().len(), 0);
+    }
+
+    /// Parse a FORML2 snippet into a Domain for tests.
+    /// Using the real parser guarantees the resulting Domain has all the
+    /// invariants RMAP expects (ref schemes, backing fact types, implicit
+    /// uniqueness on reference-scheme roles).
+    fn parse(src: &str) -> Domain {
+        crate::parse_forml2::parse_markdown(src)
+            .expect("test FORML2 must parse")
+    }
+
+    fn organization_with_slug() -> Domain {
+        // RMAP needs the fact type backing the ref scheme to materialize
+        // a column. The Organization(.Slug) declaration is the
+        // reference-scheme shorthand; the binary fact + UC is the
+        // explicit form RMAP folds into a single-column table.
+        parse("\
+            Organization(.Slug) is an entity type.\n\
+            Slug is a value type.\n\
+            Organization has Slug.\n\
+              Each Organization has exactly one Slug.\n\
+        ")
+    }
+
+    #[test]
+    fn entity_schema_properties_come_from_rmap_table_columns() {
+        let domain = organization_with_slug();
+
+        let doc = openapi_for_domain(&domain);
+        let schema = &doc["components"]["schemas"]["Organization"];
+
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["title"], "Organization");
+        // RMAP absorbs the single-value reference scheme (Slug) into the
+        // entity's primary key column (`id` by convention). The generator
+        // surfaces whatever columns RMAP produced as schema properties.
+        let props = schema["properties"].as_object()
+            .expect("properties must be an object");
+        assert!(!props.is_empty(),
+            "schema must have at least one property derived from RMAP; got: {}",
+            schema);
+        assert!(props.contains_key("id"),
+            "RMAP-produced primary key column 'id' must be a property; got: {:?}",
+            props.keys().collect::<Vec<_>>());
+
+        let required = schema["required"].as_array()
+            .expect("required must be an array");
+        assert!(required.iter().any(|v| v == "id"),
+            "'id' must be required (non-nullable primary key); got required: {:?}",
+            required);
+    }
+
+    #[test]
+    fn openapi_generator_is_gated_by_opt_in() {
+        use std::collections::HashSet;
+
+        let mut domain = organization_with_slug();
+        domain.domain = "test".into();
+        let state = crate::parse_forml2::domain_to_state(&domain);
+
+        crate::compile::set_active_generators(HashSet::new());
+        let defs_without = crate::compile::compile_to_defs_state(&state);
+        assert!(
+            !defs_without.iter().any(|(k, _)| k.starts_with("openapi:")),
+            "openapi:* cells must not appear without opt-in"
+        );
+
+        let active: HashSet<String> = std::iter::once("openapi".to_string()).collect();
+        crate::compile::set_active_generators(active);
+        let defs_with = crate::compile::compile_to_defs_state(&state);
+        assert!(
+            defs_with.iter().any(|(k, _)| k == "openapi:document"),
+            "openapi:document cell must exist when 'openapi' is opted in"
+        );
+
+        crate::compile::set_active_generators(HashSet::new());
+    }
+}

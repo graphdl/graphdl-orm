@@ -9,3 +9,4 @@
 
 pub mod solidity;
 pub mod fpga;
+pub mod openapi;
