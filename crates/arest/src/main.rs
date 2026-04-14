@@ -342,15 +342,29 @@ fn main() {
                 });
 
                 // Extract generator opt-ins from raw reading text before parsing.
-                // The parser doesn't handle dual-quoted instance facts like
+                // The parser doesn't yet handle dual-quoted instance facts like
                 // "App 'X' uses Generator 'sqlite'" — extract via regex.
-                let generator_re = regex::Regex::new(r"uses Generator '([^']+)'").unwrap();
-                let opted_generators: std::collections::HashSet<String> = readings.iter()
-                    .flat_map(|(_, text)| generator_re.captures_iter(text)
-                        .filter_map(|c| c.get(1).map(|m| m.as_str().to_lowercase()))
+                //
+                // Generators are App-scoped (`App 'X' uses Generator 'Y'.`):
+                // we keep the (App, Generator) pair so downstream generators
+                // can emit per-App cells. The set-of-generators view is
+                // derived from the pairs for backward-compat paths (SQL
+                // trigger emission still keys off generator names only).
+                let opt_in_re = regex::Regex::new(r"App '([^']+)' uses Generator '([^']+)'").unwrap();
+                let opt_in_pairs: Vec<(String, String)> = readings.iter()
+                    .flat_map(|(_, text)| opt_in_re.captures_iter(text)
+                        .filter_map(|c| {
+                            let app = c.get(1)?.as_str().to_string();
+                            let gen = c.get(2)?.as_str().to_lowercase();
+                            Some((app, gen))
+                        })
                         .collect::<Vec<_>>())
                     .collect();
-                eprintln!("[load] generators from readings: {:?}", opted_generators);
+                let opted_generators: std::collections::HashSet<String> = opt_in_pairs.iter()
+                    .map(|(_, g)| g.clone())
+                    .collect();
+                eprintln!("[load] opt-in (App, Generator) pairs: {:?}", opt_in_pairs);
+                eprintln!("[load] generators (set view): {:?}", opted_generators);
 
                 // Fast path: fold all readings (metamodel + user) into a
                 // single Domain IR, then convert to Object state ONCE.
@@ -398,10 +412,12 @@ fn main() {
                 eprintln!("[load] App/sqlite instance facts: {:?}", app_ifs);
                 no_validate.then(|| ast::set_skip_validate(true));
                 let mut state = parse_forml2::domain_to_state(&domain);
-                // Store generator opt-ins as a cell so the query path can find them.
-                opted_generators.iter().for_each(|g| {
+                // Store (App, Generator) opt-ins as a cell so compile can
+                // emit per-App artifacts (openapi, eventually sqlite/etc.).
+                opt_in_pairs.iter().for_each(|(app, g)| {
                     state = ast::cell_push("App_uses_Generator",
-                        ast::fact_from_pairs(&[("Generator", g.as_str())]), &state);
+                        ast::fact_from_pairs(&[("App", app.as_str()), ("Generator", g.as_str())]),
+                        &state);
                 });
                 // Generate SQL triggers for derivation rules.
                 if opted_generators.iter().any(|g| ["sqlite","postgresql","mysql"].contains(&g.as_str())) {

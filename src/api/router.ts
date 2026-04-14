@@ -177,6 +177,65 @@ router.get('/debug/table/:table', async (request, env: Env) => {
   return json({ table, domain: domain || 'all', counts })
 })
 
+// ── OpenAPI 3.1 schema exposure (per App) ───────────────────────────
+//
+// Generators are App-scoped: `App 'X' uses Generator 'openapi'.` is
+// the opt-in assertion. The compiler emits one cell per opted-in App,
+// keyed `openapi:{snake(app-slug)}`; this route plumbs that cell to
+// the wire. Without an opt-in the cell is absent; the route reports
+// 404 with guidance so callers see a clear remediation rather than a
+// silent empty response.
+//
+// `?app=X` selects the App. `?domain=X` (optional, defaults to
+// 'organizations') selects which compiled domain to query — the cell
+// is looked up on that domain's state. A single compile may contain
+// several Apps across many domains.
+
+/// Mirrors rmap::to_snake in the Rust crate: insert `_` before an
+/// uppercase letter that follows a lowercase one, replace space and
+/// hyphen with `_`, lowercase everything. Used to form the cell key
+/// from an App slug so the TS route lands on the same key the
+/// compile gate emitted.
+function appCellSuffix(app: string): string {
+  let out = ''
+  for (let i = 0; i < app.length; i++) {
+    const ch = app[i]
+    const prev = i > 0 ? app[i - 1] : ''
+    if (/[A-Z]/.test(ch) && /[a-z]/.test(prev)) out += '_'
+    out += ch === ' ' || ch === '-' ? '_' : ch.toLowerCase()
+  }
+  return out
+}
+
+router.get('/api/openapi.json', async (request, env: Env) => {
+  const url = new URL(request.url)
+  const app = url.searchParams.get('app')
+  if (!app) {
+    return error(400, {
+      errors: [{ message: "'app' query parameter required (e.g. ?app=my-app)" }],
+    })
+  }
+  const domain = url.searchParams.get('domain') || 'organizations'
+  const cellKey = `openapi:${appCellSuffix(app)}`
+
+  const registry = getRegistryDO(env, 'global') as any
+  const handle = await loadDomainSchema(registry, (id: string) => getEntityDO(env, id) as any, domain)
+  const raw = wasmSystem(handle, cellKey, '')
+
+  let doc: any = null
+  try { doc = JSON.parse(raw) } catch { /* empty/bottom → doc stays null */ }
+
+  if (!doc || typeof doc !== 'object' || !doc.openapi) {
+    return error(404, {
+      errors: [{
+        message: `No OpenAPI document for App '${app}'. ` +
+          `Add "App '${app}' uses Generator 'openapi'." to the App's readings to enable this endpoint.`,
+      }],
+    })
+  }
+  return json(doc)
+})
+
 // ── Evaluate / Synthesize (WASM engine) ─────────────────────────────
 router.post('/api/evaluate', handleEvaluate)
 router.post('/api/synthesize', (request, env) => handleSynthesize(request, env))
