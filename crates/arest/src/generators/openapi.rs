@@ -40,7 +40,7 @@ use std::collections::HashMap;
 
 use crate::ast::Object;
 use crate::rmap::{self, TableColumn, TableDef};
-use crate::types::Domain;
+use crate::types::{Domain, StateMachineDef};
 
 /// Compile state into an OpenAPI 3.1 JSON document.
 ///
@@ -90,7 +90,8 @@ pub(crate) fn openapi_for_domain(domain: &Domain) -> serde_json::Value {
         })
         .flat_map(|(name, _)| {
             let plural = plural_for_noun(domain, name);
-            paths_for_noun(name, &plural)
+            let sm = domain.state_machines.get(name);
+            paths_for_noun(name, &plural, sm)
         })
         .collect();
 
@@ -123,15 +124,26 @@ fn plural_for_noun(domain: &Domain, noun_name: &str) -> String {
         .unwrap_or_else(|| format!("{}s", rmap::to_snake(noun_name)))
 }
 
-/// Emit the canonical CRUD path pair for one entity noun per Theorem 4.
+/// Emit the canonical path items for one entity noun per Theorem 4.
 ///
-/// `/{plural}`          GET (list Filter(p_live):P per Cor 2), POST (create)
-/// `/{plural}/{id}`     GET (read), PATCH (update)
+/// Always (navigation + Cor 2 soft-delete):
+///   `/{plural}`          GET (list Filter(p_live):P), POST (create)
+///   `/{plural}/{id}`     GET (read), PATCH (update)
 ///
-/// Request/response bodies `$ref` the noun's component schema. Transition
-/// routes, related-collection routes, and the `{data, derived, violations,
-/// _links}` response envelope (Thm 5 repr) are follow-up scope.
-fn paths_for_noun(noun_name: &str, plural: &str) -> Vec<(String, serde_json::Value)> {
+/// Only when the noun has a State Machine Definition (Theorem 4a —
+/// transition links are a projection over transitions filtered to
+/// `from ∈ {current} ∪ supertypes(current)`):
+///   `/{plural}/{id}/transition`   POST (fire event)
+///   `/{plural}/{id}/transitions`  GET  (events valid from current status)
+///
+/// Related-collection routes (Theorem 4b navigation) and the full
+/// `{data, derived, violations, _links}` response envelope (Thm 5 repr +
+/// Cor 1 violation verbalization) are follow-up scope.
+fn paths_for_noun(
+    noun_name: &str,
+    plural: &str,
+    sm: Option<&StateMachineDef>,
+) -> Vec<(String, serde_json::Value)> {
     let schema_ref = serde_json::json!({
         "$ref": format!("#/components/schemas/{}", noun_name),
     });
@@ -166,17 +178,67 @@ fn paths_for_noun(noun_name: &str, plural: &str) -> Vec<(String, serde_json::Val
         "schema": { "type": "string" },
     });
 
-    vec![
+    let crud = vec![
         (format!("/{}", plural), serde_json::json!({
             "get":  { "summary": format!("List {}.", noun_name),   "responses": list_response },
             "post": { "summary": format!("Create {}.", noun_name), "requestBody": request_body, "responses": item_response },
         })),
         (format!("/{}/{{id}}", plural), serde_json::json!({
-            "parameters": [id_param],
+            "parameters": [id_param.clone()],
             "get":   { "summary": format!("Read {}.", noun_name),   "responses": item_response },
             "patch": { "summary": format!("Update {}.", noun_name), "requestBody": request_body, "responses": item_response },
         })),
-    ]
+    ];
+
+    let transitions = sm.into_iter().flat_map(|sm| {
+        let events: Vec<&str> = sm.transitions.iter().map(|t| t.event.as_str()).collect();
+        let fire_request = serde_json::json!({
+            "required": true,
+            "description": "Fire a transition by event name. The event is \
+                            a no-op when it is not valid from the entity's \
+                            current status.",
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "required": ["event"],
+                        "properties": {
+                            "event": { "type": "string", "enum": events },
+                        },
+                    },
+                },
+            },
+        });
+        let events_response = serde_json::json!({
+            "200": {
+                "description": format!("Events valid from the current status of this {}.", noun_name),
+                "content": {
+                    "application/json": {
+                        "schema": { "type": "array", "items": { "type": "string" } },
+                    },
+                },
+            },
+        });
+        vec![
+            (format!("/{}/{{id}}/transition", plural), serde_json::json!({
+                "parameters": [id_param.clone()],
+                "post": {
+                    "summary": format!("Fire a transition on a {}.", noun_name),
+                    "requestBody": fire_request,
+                    "responses": item_response,
+                },
+            })),
+            (format!("/{}/{{id}}/transitions", plural), serde_json::json!({
+                "parameters": [id_param.clone()],
+                "get": {
+                    "summary": format!("Transitions available from the current status of a {}.", noun_name),
+                    "responses": events_response,
+                },
+            })),
+        ]
+    });
+
+    crud.into_iter().chain(transitions).collect()
 }
 
 /// Build one entity's component schema from its RMAP TableDef.
@@ -267,14 +329,6 @@ fn sql_type_to_json(sql_type: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{NounDef, WorldAssumption};
-
-    fn entity_noun() -> NounDef {
-        NounDef {
-            object_type: "entity".into(),
-            world_assumption: WorldAssumption::default(),
-        }
-    }
 
     #[test]
     fn empty_domain_emits_valid_openapi_3_1_document() {
@@ -398,6 +452,66 @@ mod tests {
         assert!(!paths.contains_key("/organizations"),
             "fallback path /organizations must not exist once Plural is \
              declared — the declaration wins; got: {:?}",
+            paths.keys().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn noun_with_state_machine_has_transition_routes() {
+        // Theorem 4a: transition links are a projection over the transition
+        // fact set filtered to `from ∈ {current} ∪ supertypes(current)`.
+        // At the OpenAPI surface that projection materializes as two
+        // routes on the entity: POST /transition to fire an event, and
+        // GET /transitions to list the events valid from the current
+        // status. They only exist when the noun has a State Machine
+        // Definition; a status-less noun has no transitions to project.
+        use crate::types::{StateMachineDef, TransitionDef};
+        let mut domain = organization_with_slug();
+        domain.state_machines.insert("Organization".into(), StateMachineDef {
+            noun_name: "Organization".into(),
+            statuses: vec!["active".into(), "archived".into()],
+            transitions: vec![TransitionDef {
+                from: "active".into(),
+                to: "archived".into(),
+                event: "archive".into(),
+                guard: None,
+            }],
+        });
+
+        let doc = openapi_for_domain(&domain);
+        let paths = doc["paths"].as_object()
+            .expect("paths must be an object");
+
+        let fire_key = "/organizations/{id}/transition";
+        assert!(paths.contains_key(fire_key),
+            "POST transition path must exist for SM-bearing noun; got: {:?}",
+            paths.keys().collect::<Vec<_>>());
+        assert!(paths[fire_key]["post"].is_object(),
+            "POST {} (fire transition) must be defined", fire_key);
+
+        let list_key = "/organizations/{id}/transitions";
+        assert!(paths.contains_key(list_key),
+            "GET transitions path must exist for SM-bearing noun; got: {:?}",
+            paths.keys().collect::<Vec<_>>());
+        assert!(paths[list_key]["get"].is_object(),
+            "GET {} (available transitions) must be defined", list_key);
+    }
+
+    #[test]
+    fn noun_without_state_machine_has_no_transition_routes() {
+        // A status-less noun has no transition fact set to project (Thm 4a).
+        // Emitting transition routes in that case would advertise an API
+        // that cannot be fulfilled — the handler would 404 on every call.
+        let domain = organization_with_slug();
+
+        let doc = openapi_for_domain(&domain);
+        let paths = doc["paths"].as_object()
+            .expect("paths must be an object");
+
+        assert!(!paths.contains_key("/organizations/{id}/transition"),
+            "transition route must be absent without an SM; got: {:?}",
+            paths.keys().collect::<Vec<_>>());
+        assert!(!paths.contains_key("/organizations/{id}/transitions"),
+            "transitions route must be absent without an SM; got: {:?}",
             paths.keys().collect::<Vec<_>>());
     }
 
