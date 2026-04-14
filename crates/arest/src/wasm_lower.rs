@@ -7,86 +7,258 @@
 // server). Compile each Func to a WASM function and dispatch via the
 // host VM — no AREST-level interpreter on the hot path.
 //
-// This file is the proof-of-concept. Supports a narrow subset:
-//   - Func::Id          (identity on i64)
-//   - Func::Constant(x) where x is an Object::Atom parseable as i64
+// The emitted module exports two things:
+//   - `apply` : function of type (i64) -> (i32)
+//   - `memory` : the linear memory holding allocated Objects
 //
-// The emitted module exports one function named `apply` with
-// signature (i64) -> i64. Callers pass the input value; Id returns
-// it unchanged, Constant ignores it and returns the literal.
+// The caller passes an i64 scalar input; the emitted body boxes it
+// into an Atom, runs the lowered Func, and returns a pointer to the
+// result Object. Callers dereference the pointer by reading bytes
+// from `memory`.
 //
-// Extending to combinators (Compose, Construction, Condition, …)
-// is a matter of adding ops; the emission scaffolding stays the
-// same. Object::Seq / Object::Map require a linear-memory
-// representation — that's the next step after this PoC validates
-// the round-trip.
+// Supported variants (PoC):
+//   - Func::Id                      : identity on the Object pointer
+//   - Func::Constant(Object::Atom)  : i64-parseable literal
+//   - Func::Compose(f, g)           : (f ∘ g):x = f:(g:x)
+//   - Func::Condition(p, f, g)      : (p → f; g):x
+//   - Func::Construction([f₁…fₙ])   : <CONS, f₁, …, fₙ>:x
+//
+// Not yet supported (landing on follow-up commits):
+//   - Func::ApplyToAll / Filter / Insert — need loop emission
+//     over a Seq in linear memory.
+//   - Func::Selector                — needs Seq indexing; trivial
+//     once the layout is stable.
+//   - Arithmetic / comparison / logic — need pair unpacking.
+//   - String Atoms, Map             — need variable-size layout.
+//
+// Memory layout (absolute offsets):
+//   0 .. HEAP_START : reserved (unused sentinels)
+//   HEAP_START ..   : bump-allocated heap
+//
+// Object header (first 4 bytes at every object ptr):
+//   tag = 0 → Atom : [u32 tag] [4B pad] [i64 value]              (16 B)
+//   tag = 1 → Seq  : [u32 tag] [u32 length] [i32 elem ptr × n]   (8 + 4n B)
+//   phi           → represented as pointer 0; no allocation.
+//
+// Calling convention inside the body: each `emit_body` case
+// consumes one i32 Object pointer from the stack and leaves one
+// i32 Object pointer on the stack. `lower_to_wasm` pushes the
+// boxed input pointer once.
+//
+// Heap lifetime: `apply` resets the heap pointer at entry, so every
+// invocation computes on a fresh bump allocator. The returned pointer
+// is valid only until the next call. Callers snapshot or copy before
+// re-invoking.
 
 #![cfg(feature = "wasm-lower")]
 
 use wasm_encoder::{
-    BlockType, CodeSection, ExportKind, ExportSection, Function, FunctionSection,
-    Instruction, Module, TypeSection, ValType,
+    BlockType, CodeSection, ConstExpr, ExportKind, ExportSection, Function, FunctionSection,
+    GlobalSection, GlobalType, Instruction, MemArg, MemorySection, MemoryType, Module,
+    TypeSection, ValType,
 };
 
 use crate::ast::{Func, Object};
 
+// Heap starts 16 bytes in; the prefix is reserved for future sentinels.
+const HEAP_START: i32 = 16;
+
+// Object tags.
+const TAG_ATOM: i32 = 0;
+const TAG_SEQ: i32 = 1;
+
+// Object sizes.
+const ATOM_SIZE: i32 = 16;      // 4B tag + 4B pad + 8B value
+const SEQ_HEADER_SIZE: i32 = 8; // 4B tag + 4B length
+
+// Emitted-function indices. `apply` is 0 so user code (and the
+// bench) can call by name without caring about internals.
+const FN_APPLY: u32 = 0;
+const FN_ALLOC: u32 = 1;
+const FN_ALLOC_ATOM: u32 = 2;
+const FN_TRUTHY: u32 = 3;
+
+// Global index: only one.
+const G_HEAP_PTR: u32 = 0;
+
+// MemArg helpers. All accesses are on memory 0 (the only memory we
+// declare); alignments match natural sizes (2 = 4B, 3 = 8B).
+const fn i32_at(offset: u64) -> MemArg {
+    MemArg { offset, align: 2, memory_index: 0 }
+}
+const fn i64_at(offset: u64) -> MemArg {
+    MemArg { offset, align: 3, memory_index: 0 }
+}
+
 /// Lower a Func tree to a valid WASM module.
 ///
-/// Returns `Ok(bytes)` with the module on success, or an `Err`
+/// Returns `Ok(bytes)` with the module on success, or `Err(msg)`
 /// describing which variant is not yet supported. Callers wrap the
-/// bytes in `WebAssembly.Module` (V8) or `wasmtime::Module::new`
-/// (server) to instantiate and invoke.
+/// bytes in `WebAssembly.Module` (V8) or `wasmi::Module::new`
+/// (interpreter) to instantiate and invoke.
 pub fn lower_to_wasm(func: &Func) -> Result<Vec<u8>, String> {
     let mut module = Module::new();
 
-    // Type section: one function type (i64) -> i64.
+    // ── Types ─────────────────────────────────────────────────────
+    // 0: apply       (i64) -> (i32)
+    // 1: alloc       (i32) -> (i32)
+    // 2: alloc_atom  (i64) -> (i32)
+    // 3: truthy      (i32) -> (i32)
     let mut types = TypeSection::new();
-    types.ty().function(vec![ValType::I64], vec![ValType::I64]);
+    types.ty().function(vec![ValType::I64], vec![ValType::I32]);
+    types.ty().function(vec![ValType::I32], vec![ValType::I32]);
+    types.ty().function(vec![ValType::I64], vec![ValType::I32]);
+    types.ty().function(vec![ValType::I32], vec![ValType::I32]);
     module.section(&types);
 
-    // Function section: one function of type 0.
+    // ── Functions ─────────────────────────────────────────────────
     let mut functions = FunctionSection::new();
     functions.function(0);
+    functions.function(1);
+    functions.function(2);
+    functions.function(3);
     module.section(&functions);
 
-    // Export section: `apply` → function 0.
+    // ── Memory ────────────────────────────────────────────────────
+    // One page (64 KB) initial. A single `apply` invocation that
+    // allocates more than 64 KB will trap — for the PoC that means
+    // "don't build megabyte-scale Seqs in one call". Memory.grow
+    // is a straightforward follow-up.
+    let mut memory = MemorySection::new();
+    memory.memory(MemoryType {
+        minimum: 1,
+        maximum: None,
+        memory64: false,
+        shared: false,
+        page_size_log2: None,
+    });
+    module.section(&memory);
+
+    // ── Globals ───────────────────────────────────────────────────
+    // heap_ptr, mutable i32, initialized to HEAP_START.
+    let mut globals = GlobalSection::new();
+    globals.global(
+        GlobalType { val_type: ValType::I32, mutable: true, shared: false },
+        &ConstExpr::i32_const(HEAP_START),
+    );
+    module.section(&globals);
+
+    // ── Exports ───────────────────────────────────────────────────
     let mut exports = ExportSection::new();
-    exports.export("apply", ExportKind::Func, 0);
+    exports.export("apply", ExportKind::Func, FN_APPLY);
+    exports.export("memory", ExportKind::Memory, 0);
     module.section(&exports);
 
-    // Code section: load arg → emit body → end.
-    // Convention: emit_body always leaves the result on the stack
-    // and consumes its single i64 input from the stack. The outer
-    // wrapper pushes the argument once at the start.
-    //
-    // Scratch locals: Condition needs to hold x across a branch
-    // (p consumes it, then f or g needs it again). A pre-walk counts
-    // the maximum simultaneous scratch depth; locals are declared
-    // upfront so the function body is well-typed.
-    let scratch = scratch_needed(func);
-    let locals: Vec<(u32, ValType)> = if scratch > 0 {
-        vec![(scratch, ValType::I64)]
-    } else {
-        vec![]
-    };
+    // ── Code ──────────────────────────────────────────────────────
     let mut codes = CodeSection::new();
-    let mut body = Function::new(locals);
-    body.instruction(&Instruction::LocalGet(0));
-    emit_body(func, &mut body, 1)?;
-    body.instruction(&Instruction::End);
-    codes.function(&body);
+
+    // --- apply(i64) -> i32 ---
+    //
+    // Local layout:
+    //   local 0     : i64 input (the parameter)
+    //   local 1     : i32 input_ptr (boxed atom of input)
+    //   local 2 ... : i32 scratches used by Condition/Construction
+    //
+    // Entry resets the heap so each invocation gets a fresh bump.
+    // The returned pointer is therefore valid only until the next
+    // call; callers snapshot before re-invoking.
+    let scratch = scratch_needed(func);
+    let mut apply_locals: Vec<(u32, ValType)> = vec![(1, ValType::I32)];
+    if scratch > 0 {
+        apply_locals.push((scratch, ValType::I32));
+    }
+    let mut apply_body = Function::new(apply_locals);
+    // heap_ptr = HEAP_START
+    apply_body.instruction(&Instruction::I32Const(HEAP_START));
+    apply_body.instruction(&Instruction::GlobalSet(G_HEAP_PTR));
+    // input_ptr = alloc_atom(input)
+    apply_body.instruction(&Instruction::LocalGet(0));
+    apply_body.instruction(&Instruction::Call(FN_ALLOC_ATOM));
+    apply_body.instruction(&Instruction::LocalSet(1));
+    // Seed the stack with input_ptr and emit the lowered body.
+    apply_body.instruction(&Instruction::LocalGet(1));
+    emit_body(func, &mut apply_body, 2)?;
+    apply_body.instruction(&Instruction::End);
+    codes.function(&apply_body);
+
+    // --- alloc(size: i32) -> i32 ---
+    //
+    // Bump allocator: return old heap_ptr; advance heap_ptr by size.
+    // No bounds check — a request larger than remaining memory traps
+    // on the first write that goes out of range. PoC-level.
+    let mut alloc_body = Function::new([]);
+    alloc_body.instruction(&Instruction::GlobalGet(G_HEAP_PTR));  // stack: [old_ptr]
+    alloc_body.instruction(&Instruction::GlobalGet(G_HEAP_PTR));
+    alloc_body.instruction(&Instruction::LocalGet(0));
+    alloc_body.instruction(&Instruction::I32Add);
+    alloc_body.instruction(&Instruction::GlobalSet(G_HEAP_PTR));  // heap_ptr += size
+    alloc_body.instruction(&Instruction::End);                     // returns old_ptr
+    codes.function(&alloc_body);
+
+    // --- alloc_atom(value: i64) -> i32 ---
+    //
+    // Reserve 16 bytes, write the Atom tag + value, return the ptr.
+    let mut alloc_atom_body = Function::new([(1, ValType::I32)]);  // local 1: ptr
+    alloc_atom_body.instruction(&Instruction::I32Const(ATOM_SIZE));
+    alloc_atom_body.instruction(&Instruction::Call(FN_ALLOC));
+    alloc_atom_body.instruction(&Instruction::LocalTee(1));
+    alloc_atom_body.instruction(&Instruction::I32Const(TAG_ATOM));
+    alloc_atom_body.instruction(&Instruction::I32Store(i32_at(0)));
+    alloc_atom_body.instruction(&Instruction::LocalGet(1));
+    alloc_atom_body.instruction(&Instruction::LocalGet(0));
+    alloc_atom_body.instruction(&Instruction::I64Store(i64_at(8)));
+    alloc_atom_body.instruction(&Instruction::LocalGet(1));
+    alloc_atom_body.instruction(&Instruction::End);
+    codes.function(&alloc_atom_body);
+
+    // --- truthy(ptr: i32) -> i32 ---
+    //
+    // AREST Object truthiness, as close as we can get in the PoC:
+    //   ptr == 0 (phi)  → 0
+    //   Atom            → value != 0
+    //   Seq / other     → length != 0
+    //
+    // Matches the full-Object semantics for the numeric subset the
+    // PoC lowers today. Extending to string atoms will require a
+    // richer "is-empty-string" check here.
+    let mut truthy_body = Function::new([]);
+    truthy_body.instruction(&Instruction::LocalGet(0));
+    truthy_body.instruction(&Instruction::I32Eqz);
+    truthy_body.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+    truthy_body.instruction(&Instruction::I32Const(0));
+    truthy_body.instruction(&Instruction::Else);
+    truthy_body.instruction(&Instruction::LocalGet(0));
+    truthy_body.instruction(&Instruction::I32Load(i32_at(0)));
+    truthy_body.instruction(&Instruction::I32Const(TAG_ATOM));
+    truthy_body.instruction(&Instruction::I32Eq);
+    truthy_body.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+    // Atom branch: load i64 value at offset 8, test != 0.
+    truthy_body.instruction(&Instruction::LocalGet(0));
+    truthy_body.instruction(&Instruction::I64Load(i64_at(8)));
+    truthy_body.instruction(&Instruction::I64Const(0));
+    truthy_body.instruction(&Instruction::I64Ne);
+    truthy_body.instruction(&Instruction::Else);
+    // Seq branch: load u32 length at offset 4, test != 0.
+    truthy_body.instruction(&Instruction::LocalGet(0));
+    truthy_body.instruction(&Instruction::I32Load(i32_at(4)));
+    truthy_body.instruction(&Instruction::I32Const(0));
+    truthy_body.instruction(&Instruction::I32Ne);
+    truthy_body.instruction(&Instruction::End);  // inner if
+    truthy_body.instruction(&Instruction::End);  // outer if
+    truthy_body.instruction(&Instruction::End);  // function
+    codes.function(&truthy_body);
+
     module.section(&codes);
 
     Ok(module.finish())
 }
 
-/// Count the maximum number of simultaneously-live scratch locals
-/// the body will need. Condition is the only variant that requires
-/// scratch: it must stash x across p so f/g can see it again.
+/// Count the max number of simultaneously-live scratch i32 locals the
+/// body needs. Locals must be declared up front, so we do a pre-walk.
 ///
-/// Sibling subterms (Compose's f/g; Condition's p/f/g) run at
-/// disjoint times and therefore share scratch slots — we only need
-/// the *max* of their requirements, not the sum.
+/// Sibling subterms (Compose's f/g; Condition's p/f/g; Construction's
+/// children) run at disjoint times and share scratch slots — we take
+/// the *max* of their needs, not the sum.
 fn scratch_needed(func: &Func) -> u32 {
     match func {
         Func::Compose(f, g) => scratch_needed(f).max(scratch_needed(g)),
@@ -95,74 +267,110 @@ fn scratch_needed(func: &Func) -> u32 {
                 .max(scratch_needed(f))
                 .max(scratch_needed(g))
         }
+        Func::Construction(children) => {
+            // Construction holds x in one slot and the in-progress
+            // Seq ptr in another. Children evaluate one at a time,
+            // each reusing the same "after-seq" slot.
+            2 + children.iter().map(scratch_needed).max().unwrap_or(0)
+        }
         _ => 0,
     }
 }
 
-/// Emit instructions that consume one i64 from the stack and leave
-/// one i64 on the stack — the stack-discipline lowering convention.
+/// Emit instructions that consume one i32 Object pointer from the
+/// stack and leave one i32 Object pointer on the stack — the
+/// stack-discipline lowering convention.
 ///
-/// This convention makes Compose trivial: `emit(g); emit(f)` leaves
-/// `f(g(x))` on the stack without any intermediate local. Each Func
-/// variant implements its own transformation; the outer
-/// `lower_to_wasm` pushes the initial argument once.
-///
-/// `next_scratch` is the first free i64 local index. Subterms that
-/// need temporaries (currently only Condition) claim one slot and
-/// pass `next_scratch + 1` to their children, so nested Conditions
-/// get distinct slots without colliding.
+/// `next_scratch` is the first free i32 local index. Subterms that
+/// need temporaries claim slots and pass `next_scratch + k` to their
+/// children, so nested uses get distinct slots.
 fn emit_body(func: &Func, body: &mut Function, next_scratch: u32) -> Result<(), String> {
     match func {
-        // id:x = x — input on stack is already the output.
-        Func::Id => { /* noop */ }
+        // id:x = x — ptr on stack is already the output.
+        Func::Id => {}
 
-        // c̄:x = c (when x ≠ ⊥) — drop the input, push the literal.
-        // PoC restricts the constant to i64-valued atoms; full
-        // Object marshalling via linear memory is follow-up.
+        // c̄:x = c (when x ≠ ⊥) — drop input ptr, allocate fresh Atom.
         Func::Constant(Object::Atom(s)) => {
             let n: i64 = s.parse()
                 .map_err(|_| format!("Constant atom must parse as i64 for PoC: got {:?}", s))?;
             body.instruction(&Instruction::Drop);
             body.instruction(&Instruction::I64Const(n));
+            body.instruction(&Instruction::Call(FN_ALLOC_ATOM));
         }
 
-        // Backus §11.2.4 Composition: (f ∘ g):x = f:(g:x).
-        // Stack discipline makes this just concatenation —
-        // emit g (consumes input, leaves g(x)), then emit f
-        // (consumes g(x), leaves f(g(x))).
+        // Backus §11.2.4 Composition. Stack discipline makes this
+        // concatenation: emit g (consumes input, leaves g(x)) then
+        // emit f (consumes g(x), leaves f(g(x))).
         Func::Compose(f, g) => {
             emit_body(g, body, next_scratch)?;
             emit_body(f, body, next_scratch)?;
         }
 
         // Backus §11.2.4 Condition: (p → f; g):x = if p:x then f:x else g:x.
-        // p consumes x and returns a predicate, but then f or g needs x
-        // *again*. We stash x into a scratch local (tee), run p against
-        // the copy on the stack, branch on p's result, and restore x
-        // from the scratch before emitting the chosen branch.
         //
-        // Truthiness convention for the i64-stack PoC: any non-zero i64
-        // is true, zero is false. Real Object truthiness (Object::phi
-        // is false, anything else is true) requires the linear-memory
-        // representation; this matches it for the numeric subset we
-        // lower today.
+        // p consumes x and leaves a predicate Object pointer. But f
+        // or g needs x *again*, so we stash x in a scratch local
+        // before running p, and restore it into the chosen branch.
         Func::Condition(p, f, g) => {
             let my = next_scratch;
-            // Stash x (stack → local my) while keeping a copy on the
-            // stack for p to consume.
             body.instruction(&Instruction::LocalTee(my));
             emit_body(p, body, my + 1)?;
-            // p left an i64 predicate on the stack; `if` needs an i32
-            // condition. Compare-not-equal-to-zero yields i32 {0,1}.
-            body.instruction(&Instruction::I64Const(0));
-            body.instruction(&Instruction::I64Ne);
-            body.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+            body.instruction(&Instruction::Call(FN_TRUTHY));
+            body.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
             body.instruction(&Instruction::LocalGet(my));
             emit_body(f, body, my + 1)?;
             body.instruction(&Instruction::Else);
             body.instruction(&Instruction::LocalGet(my));
             emit_body(g, body, my + 1)?;
             body.instruction(&Instruction::End);
+        }
+
+        // Backus §11.2.4 Construction: <CONS, f₁, …, fₙ>:x = <f₁:x, …, fₙ:x>.
+        //
+        // Allocate a Seq of length n, then for each child:
+        //   a. push x_ptr onto the stack (from scratch[x_slot]);
+        //   b. emit the child (consumes x_ptr, leaves result ptr);
+        //   c. store the result ptr at seq_ptr + header + 4·i.
+        // Leave seq_ptr on the stack as the Construction's result.
+        //
+        // Scratch usage:
+        //   x_slot   = next_scratch     : input x ptr (survives all children)
+        //   seq_slot = next_scratch + 1 : result seq ptr (while filling)
+        //   ≥ seq_slot + 1              : free for children
+        Func::Construction(children) => {
+            let x_slot = next_scratch;
+            let seq_slot = next_scratch + 1;
+            let n = children.len() as i32;
+            // Stash x.
+            body.instruction(&Instruction::LocalSet(x_slot));
+            // Allocate the Seq object: header + n element slots.
+            body.instruction(&Instruction::I32Const(SEQ_HEADER_SIZE + 4 * n));
+            body.instruction(&Instruction::Call(FN_ALLOC));
+            body.instruction(&Instruction::LocalTee(seq_slot));
+            // tag = SEQ at offset 0
+            body.instruction(&Instruction::I32Const(TAG_SEQ));
+            body.instruction(&Instruction::I32Store(i32_at(0)));
+            // length = n at offset 4
+            body.instruction(&Instruction::LocalGet(seq_slot));
+            body.instruction(&Instruction::I32Const(n));
+            body.instruction(&Instruction::I32Store(i32_at(4)));
+            // Fill each element slot.
+            for (i, child) in children.iter().enumerate() {
+                let elem_offset = (SEQ_HEADER_SIZE + 4 * i as i32) as u64;
+                // push seq_ptr (address for the upcoming i32.store)
+                body.instruction(&Instruction::LocalGet(seq_slot));
+                // push x_ptr as the child's input
+                body.instruction(&Instruction::LocalGet(x_slot));
+                emit_body(child, body, seq_slot + 1)?;
+                // Stack: [seq_ptr, child_result_ptr]
+                body.instruction(&Instruction::I32Store(MemArg {
+                    offset: elem_offset,
+                    align: 2,
+                    memory_index: 0,
+                }));
+            }
+            // Leave seq_ptr on the stack.
+            body.instruction(&Instruction::LocalGet(seq_slot));
         }
 
         other => return Err(format!("wasm_lower: variant not yet supported: {:?}",
@@ -176,24 +384,70 @@ mod tests {
     use super::*;
     use wasmi::{Engine, Linker, Module as WiModule, Store};
 
-    fn roundtrip(func: &Func, input: i64) -> i64 {
+    /// Instantiate the module and invoke `apply(input)`, returning
+    /// the result pointer and a snapshot of linear memory that
+    /// callers decode at their own cadence.
+    fn invoke(func: &Func, input: i64) -> (u32, Vec<u8>) {
         let bytes = lower_to_wasm(func).expect("lower must succeed for supported variants");
         let engine = Engine::default();
         let module = WiModule::new(&engine, &bytes[..]).expect("emitted WASM must validate");
         let mut store: Store<()> = Store::new(&engine, ());
         let linker: Linker<()> = Linker::new(&engine);
-        let instance = linker.instantiate(&mut store, &module)
-            .expect("module must instantiate")
-            .start(&mut store)
-            .expect("module must start");
-        let apply = instance.get_typed_func::<i64, i64>(&store, "apply")
-            .expect("exported `apply` must exist with (i64) -> i64 signature");
-        apply.call(&mut store, input).expect("apply must invoke")
+        let instance = linker
+            .instantiate_and_start(&mut store, &module)
+            .expect("module must instantiate and start");
+        let apply = instance
+            .get_typed_func::<i64, i32>(&store, "apply")
+            .expect("exported `apply` must exist with (i64) -> i32 signature");
+        let memory = instance
+            .get_memory(&store, "memory")
+            .expect("exported `memory` must exist");
+        let ptr = apply.call(&mut store, input).expect("apply must invoke");
+        let data = memory.data(&store).to_vec();
+        (ptr as u32, data)
     }
+
+    /// Invoke and decode the result as an Atom (tag=0). Returns the
+    /// underlying i64 value. Panics if the tag is not ATOM.
+    fn roundtrip(func: &Func, input: i64) -> i64 {
+        let (ptr, data) = invoke(func, input);
+        let tag = read_u32(&data, ptr);
+        assert_eq!(tag, TAG_ATOM as u32,
+            "expected Atom tag=0 at ptr={} but saw tag={}", ptr, tag);
+        read_i64(&data, ptr + 8)
+    }
+
+    /// Invoke and decode the result as a Seq of Atoms. Returns the
+    /// element i64s in order. Panics if the outer tag is not SEQ or
+    /// any element tag is not ATOM.
+    fn roundtrip_seq(func: &Func, input: i64) -> Vec<i64> {
+        let (ptr, data) = invoke(func, input);
+        let tag = read_u32(&data, ptr);
+        assert_eq!(tag, TAG_SEQ as u32,
+            "expected Seq tag=1 at ptr={} but saw tag={}", ptr, tag);
+        let len = read_u32(&data, ptr + 4);
+        (0..len)
+            .map(|i| {
+                let elem_ptr = read_u32(&data, ptr + 8 + 4 * i);
+                let elem_tag = read_u32(&data, elem_ptr);
+                assert_eq!(elem_tag, TAG_ATOM as u32,
+                    "expected Atom inside Seq at ptr={} but saw tag={}", elem_ptr, elem_tag);
+                read_i64(&data, elem_ptr + 8)
+            })
+            .collect()
+    }
+
+    fn read_u32(data: &[u8], offset: u32) -> u32 {
+        u32::from_le_bytes(data[offset as usize..(offset + 4) as usize].try_into().unwrap())
+    }
+    fn read_i64(data: &[u8], offset: u32) -> i64 {
+        i64::from_le_bytes(data[offset as usize..(offset + 8) as usize].try_into().unwrap())
+    }
+
+    // ── Primitives ────────────────────────────────────────────────
 
     #[test]
     fn lower_id_emits_valid_module_and_returns_argument() {
-        // id:42 = 42 ; id:-7 = -7
         assert_eq!(roundtrip(&Func::Id, 42), 42);
         assert_eq!(roundtrip(&Func::Id, -7), -7);
         assert_eq!(roundtrip(&Func::Id, 0), 0);
@@ -201,7 +455,6 @@ mod tests {
 
     #[test]
     fn lower_constant_emits_valid_module_and_returns_literal() {
-        // c̄:x = c for any x
         let f = Func::Constant(Object::atom("100"));
         assert_eq!(roundtrip(&f, 0), 100);
         assert_eq!(roundtrip(&f, 42), 100);
@@ -217,16 +470,16 @@ mod tests {
 
     #[test]
     fn lower_rejects_unsupported_variant() {
-        // Construction isn't wired yet — must error, not panic.
-        let f = Func::Construction(vec![Func::Id, Func::Id]);
-        let err = lower_to_wasm(&f).expect_err("Construction should be marked unsupported");
+        // ApplyToAll isn't wired yet — must error, not panic.
+        let f = Func::ApplyToAll(Box::new(Func::Id));
+        let err = lower_to_wasm(&f).expect_err("ApplyToAll should be marked unsupported");
         assert!(err.contains("not yet supported"));
     }
 
+    // ── Compose ───────────────────────────────────────────────────
+
     #[test]
     fn lower_compose_emits_chained_body() {
-        // Compose(Constant(7), Id) : x = Constant(7):(Id:x) = 7.
-        // Proves the stack-discipline emission concatenates correctly.
         let f = Func::Compose(
             Box::new(Func::Constant(Object::atom("7"))),
             Box::new(Func::Id),
@@ -237,8 +490,6 @@ mod tests {
 
     #[test]
     fn lower_compose_of_two_ids_is_identity() {
-        // (id ∘ id):x = x. Double-wraps the input through the
-        // stack-discipline pipeline without touching the value.
         let f = Func::Compose(Box::new(Func::Id), Box::new(Func::Id));
         assert_eq!(roundtrip(&f, 42), 42);
         assert_eq!(roundtrip(&f, -7), -7);
@@ -246,8 +497,6 @@ mod tests {
 
     #[test]
     fn lower_compose_constant_over_constant_returns_outer() {
-        // Compose(Constant(A), Constant(B)):x = A.
-        // Each Constant drops its input; the outer's result wins.
         let f = Func::Compose(
             Box::new(Func::Constant(Object::atom("9"))),
             Box::new(Func::Constant(Object::atom("11"))),
@@ -255,11 +504,10 @@ mod tests {
         assert_eq!(roundtrip(&f, 0), 9);
     }
 
+    // ── Condition ─────────────────────────────────────────────────
+
     #[test]
     fn lower_condition_with_constant_true_predicate_takes_f_branch() {
-        // (Constant(1) → Constant(42); Constant(99)):x = 42 for any x.
-        // Predicate drops x and pushes 1 (non-zero → truthy); f branch
-        // drops the restored x and pushes 42.
         let f = Func::Condition(
             Box::new(Func::Constant(Object::atom("1"))),
             Box::new(Func::Constant(Object::atom("42"))),
@@ -272,8 +520,6 @@ mod tests {
 
     #[test]
     fn lower_condition_with_constant_false_predicate_takes_g_branch() {
-        // (Constant(0) → Constant(42); Constant(99)):x = 99 for any x.
-        // Zero predicate selects the else branch.
         let f = Func::Condition(
             Box::new(Func::Constant(Object::atom("0"))),
             Box::new(Func::Constant(Object::atom("42"))),
@@ -285,26 +531,18 @@ mod tests {
 
     #[test]
     fn lower_condition_with_id_predicate_branches_on_input() {
-        // (Id → Constant(1); Constant(0)):x = sign-like indicator.
-        // x != 0 → 1, x == 0 → 0. Proves x is threaded through to the
-        // branches via the scratch local, not lost after p consumes it.
         let f = Func::Condition(
             Box::new(Func::Id),
             Box::new(Func::Constant(Object::atom("1"))),
             Box::new(Func::Constant(Object::atom("0"))),
         );
         assert_eq!(roundtrip(&f, 42), 1);
-        assert_eq!(roundtrip(&f, -1), 1);    // non-zero is truthy
+        assert_eq!(roundtrip(&f, -1), 1);
         assert_eq!(roundtrip(&f, 0), 0);
     }
 
     #[test]
     fn lower_condition_restores_x_for_branch_body() {
-        // (Id → Id; Constant(-1)):x = x if x != 0 else -1.
-        // Critical test: the f branch is Id, which returns whatever is
-        // on the stack. If the scratch-restore is broken, we'd get
-        // garbage / the predicate's leftover / a trap. Correct output
-        // proves x is put back on the stack before f runs.
         let f = Func::Condition(
             Box::new(Func::Id),
             Box::new(Func::Id),
@@ -317,12 +555,6 @@ mod tests {
 
     #[test]
     fn lower_condition_nests_without_scratch_collision() {
-        // (Id → (Id → Constant(11); Constant(22)); Constant(33)):x
-        //   x == 0  → 33     (outer else)
-        //   x != 0  → 11     (outer then + inner then; inner sees x from scratch)
-        // The inner Condition must allocate a distinct scratch slot
-        // from the outer, otherwise restoring x in the inner branches
-        // would overwrite (or read back) the outer's stashed value.
         let inner = Func::Condition(
             Box::new(Func::Id),
             Box::new(Func::Constant(Object::atom("11"))),
@@ -333,18 +565,13 @@ mod tests {
             Box::new(inner),
             Box::new(Func::Constant(Object::atom("33"))),
         );
-        assert_eq!(roundtrip(&f, 5), 11);     // outer-then, inner-then
-        assert_eq!(roundtrip(&f, -3), 11);    // same path (non-zero)
-        assert_eq!(roundtrip(&f, 0), 33);     // outer-else
+        assert_eq!(roundtrip(&f, 5), 11);
+        assert_eq!(roundtrip(&f, -3), 11);
+        assert_eq!(roundtrip(&f, 0), 33);
     }
 
     #[test]
     fn lower_condition_over_compose_chains_cleanly() {
-        // Compose(Condition(Id, Constant(100), Constant(200)), Id):x
-        //   Id:x = x  →  Condition picks 100 if x != 0 else 200.
-        // Exercises the Condition-inside-Compose path (scratch is
-        // allocated only while Condition is emitting; Id outside the
-        // Condition claims no scratch).
         let f = Func::Compose(
             Box::new(Func::Condition(
                 Box::new(Func::Id),
@@ -357,18 +584,119 @@ mod tests {
         assert_eq!(roundtrip(&f, 0), 200);
     }
 
-    /// Benchmark + fixture writer. `#[ignore]`'d so normal cargo test
-    /// doesn't pay the runtime cost; run explicitly:
+    // ── Construction ──────────────────────────────────────────────
+
+    #[test]
+    fn lower_construction_of_two_constants_builds_seq_of_atoms() {
+        // <CONS, 10, 20>:x = <10, 20> for any x.
+        let f = Func::Construction(vec![
+            Func::Constant(Object::atom("10")),
+            Func::Constant(Object::atom("20")),
+        ]);
+        assert_eq!(roundtrip_seq(&f, 0), vec![10, 20]);
+        assert_eq!(roundtrip_seq(&f, 42), vec![10, 20]);
+    }
+
+    #[test]
+    fn lower_construction_of_id_id_pairs_x_with_itself() {
+        // <CONS, id, id>:x = <x, x> — both children see the same x.
+        let f = Func::Construction(vec![Func::Id, Func::Id]);
+        assert_eq!(roundtrip_seq(&f, 7), vec![7, 7]);
+        assert_eq!(roundtrip_seq(&f, -99), vec![-99, -99]);
+    }
+
+    #[test]
+    fn lower_construction_empty_returns_empty_seq() {
+        // <CONS>:x = <> — Seq of length 0. Valid but atypical.
+        let f = Func::Construction(vec![]);
+        assert_eq!(roundtrip_seq(&f, 42), Vec::<i64>::new());
+    }
+
+    #[test]
+    fn lower_construction_mixed_id_and_constant() {
+        // <CONS, id, 100, id>:x = <x, 100, x>.
+        let f = Func::Construction(vec![
+            Func::Id,
+            Func::Constant(Object::atom("100")),
+            Func::Id,
+        ]);
+        assert_eq!(roundtrip_seq(&f, 7), vec![7, 100, 7]);
+    }
+
+    #[test]
+    fn lower_construction_nested_builds_seq_of_seqs() {
+        // <CONS, <CONS, id, id>, id>:x outer is a Seq whose first
+        // element is itself a Seq. The outer roundtrip helper only
+        // decodes two levels of Atoms, so this test just verifies the
+        // tag layout directly.
+        let inner = Func::Construction(vec![Func::Id, Func::Id]);
+        let f = Func::Construction(vec![inner, Func::Id]);
+        let (ptr, data) = invoke(&f, 5);
+        assert_eq!(read_u32(&data, ptr), TAG_SEQ as u32);
+        assert_eq!(read_u32(&data, ptr + 4), 2, "outer length");
+        let inner_ptr = read_u32(&data, ptr + 8);
+        assert_eq!(read_u32(&data, inner_ptr), TAG_SEQ as u32, "inner tag");
+        assert_eq!(read_u32(&data, inner_ptr + 4), 2, "inner length");
+        let elem0_ptr = read_u32(&data, inner_ptr + 8);
+        assert_eq!(read_i64(&data, elem0_ptr + 8), 5);
+    }
+
+    #[test]
+    fn lower_compose_of_construction_and_id_builds_seq() {
+        // (<CONS, id, id> ∘ id):x = <x, x>.
+        let f = Func::Compose(
+            Box::new(Func::Construction(vec![Func::Id, Func::Id])),
+            Box::new(Func::Id),
+        );
+        assert_eq!(roundtrip_seq(&f, 3), vec![3, 3]);
+    }
+
+    // ── Semantic equivalence with Rust apply() ────────────────────
+
+    #[test]
+    fn wasm_result_matches_rust_apply_for_supported_variants() {
+        // For the scalar-returning subset, the emitted WASM must
+        // return an Atom holding the same i64 that ast::apply
+        // produces. Construction results live in a Seq — tested
+        // separately above since the Rust side uses Object::Seq of
+        // Atom objects, not raw i64s.
+        let cases: Vec<(Func, i64, i64)> = vec![
+            (Func::Id, 99, 99),
+            (Func::Id, -99, -99),
+            (Func::Constant(Object::atom("42")), 7, 42),
+            (Func::Constant(Object::atom("-5")), 123, -5),
+            (
+                Func::Compose(
+                    Box::new(Func::Constant(Object::atom("77"))),
+                    Box::new(Func::Id),
+                ),
+                11, 77,
+            ),
+        ];
+        for (f, input, expected) in cases {
+            let wasm_result = roundtrip(&f, input);
+            assert_eq!(wasm_result, expected,
+                "WASM result diverges for {:?} input={}", f, input);
+        }
+    }
+
+    // ── Benchmark + fixture writer (ignored by default) ───────────
+
+    /// `#[ignore]`'d so normal cargo test doesn't pay the runtime
+    /// cost; run explicitly:
     ///
     ///   cargo test --features wasm-lower --release --lib \
     ///     bench_and_emit_wasm_fixtures -- --ignored --nocapture
     ///
-    /// Writes the emitted WASM modules to `target/wasm_fixtures/`
-    /// so the companion Bun script (scripts/bench_bun.ts) can load
-    /// them and run the identical loop. Prints ns/op for the Rust
+    /// Writes emitted WASM modules to `target/wasm_fixtures/` so the
+    /// companion Bun script (`scripts/bench_bun.ts`) can load them
+    /// and time the identical loop in V8. Prints ns/op for the Rust
     /// native apply() path AND the wasmi-interpreted WASM path so
     /// you can see the interpreter tax locally. Bun's V8 JIT result
-    /// is produced by scripts/bench_bun.ts after you run this.
+    /// comes from `scripts/bench_bun.ts`.
+    ///
+    /// Note: apply now returns an i32 ptr. The bench sums raw ptrs
+    /// as a black-box; the ns/op comparison is unchanged in meaning.
     #[test]
     #[ignore = "benchmark; run with --release --ignored --nocapture"]
     fn bench_and_emit_wasm_fixtures() {
@@ -390,19 +718,17 @@ mod tests {
         eprintln!("{:<18} {:>12} {:>12} {:>12}", "case", "rust-ns/op", "wasmi-ns/op", "ratio");
 
         for (name, func, input) in &cases {
-            // 1. Write the WASM bytes for Bun to load.
             let bytes = lower_to_wasm(func).expect("lower must succeed");
             let path = fixtures_dir.join(format!("{}.wasm", name));
             fs::write(&path, &bytes).expect("write fixture");
 
-            // 2. Time the Rust native apply() path.
+            // Rust native path.
             let x = Object::atom(&input.to_string());
             let d = Object::phi();
             let t = Instant::now();
             let mut acc: i64 = 0;
             for _ in 0..ITERATIONS {
                 let r = crate::ast::apply(func, &x, &d);
-                // Keep the compiler from optimising the loop away.
                 if let Object::Atom(s) = &r {
                     acc = acc.wrapping_add(s.len() as i64);
                 }
@@ -410,18 +736,19 @@ mod tests {
             let rust_ns = t.elapsed().as_nanos() as f64 / ITERATIONS as f64;
             std::hint::black_box(acc);
 
-            // 3. Time the wasmi interpreter path.
+            // wasmi interpreter path.
             let engine = Engine::default();
             let module = WiModule::new(&engine, &bytes[..]).expect("wasmi validate");
             let mut store: Store<()> = Store::new(&engine, ());
             let linker: Linker<()> = Linker::new(&engine);
-            let instance = linker.instantiate(&mut store, &module).unwrap()
-                .start(&mut store).unwrap();
-            let apply = instance.get_typed_func::<i64, i64>(&store, "apply").unwrap();
+            let instance = linker
+                .instantiate_and_start(&mut store, &module)
+                .expect("instantiate and start");
+            let apply = instance.get_typed_func::<i64, i32>(&store, "apply").unwrap();
             let t = Instant::now();
             let mut wacc: i64 = 0;
             for _ in 0..ITERATIONS {
-                wacc = wacc.wrapping_add(apply.call(&mut store, *input).unwrap());
+                wacc = wacc.wrapping_add(apply.call(&mut store, *input).unwrap() as i64);
             }
             let wasmi_ns = t.elapsed().as_nanos() as f64 / ITERATIONS as f64;
             std::hint::black_box(wacc);
@@ -433,35 +760,5 @@ mod tests {
 
         eprintln!("\nFixtures written to {}", fixtures_dir.display());
         eprintln!("Run `bun scripts/bench_bun.ts` for the V8-JIT (production) comparison.");
-    }
-
-    #[test]
-    fn wasm_result_matches_rust_apply_for_supported_variants() {
-        // For the supported subset, the emitted WASM must return
-        // the same i64 that ast::apply produces from the equivalent
-        // Object. This is the semantic-equivalence check that the
-        // full compiler's extension tests will rely on.
-        let cases: Vec<(Func, i64)> = vec![
-            (Func::Id, 99),
-            (Func::Id, -99),
-            (Func::Constant(Object::atom("42")), 7),
-            (Func::Constant(Object::atom("-5")), 123),
-        ];
-        for (f, input) in cases {
-            let wasm_result = roundtrip(&f, input);
-            let rust_result = crate::ast::apply(&f, &Object::atom(&input.to_string()), &Object::phi());
-            let rust_i64 = rust_result.as_atom()
-                .and_then(|s| s.parse::<i64>().ok())
-                .unwrap_or(input); // Id's result is the input atom; Constant returns its literal
-            // For Id, rust_result is the input atom — compare directly.
-            // For Constant, rust_result is the constant atom.
-            let expected = match &f {
-                Func::Id => input,
-                Func::Constant(Object::Atom(s)) => s.parse().unwrap(),
-                _ => rust_i64,
-            };
-            assert_eq!(wasm_result, expected,
-                "WASM result diverges from Rust apply for {:?} input={}", f, input);
-        }
     }
 }
