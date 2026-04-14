@@ -167,6 +167,14 @@ fn create_impl() -> u32 {
     // Clone the cached metamodel state into a fresh handle. First call
     // builds the cache; subsequent calls are just a handle allocation +
     // Object clone.
+    //
+    // We tried pre-compiling metamodel defs into this cached state
+    // (#146 attempt) but the clone-on-create cost outweighs the saved
+    // compile time — a 5487-def Object is ~MB of deep-cloneable state.
+    // Real incremental compile requires detecting deltas in
+    // platform_compile, not precomputing the full image up front.
+    // Task #146 re-scoped: the compile-state cache awaits Arc-backed
+    // Object::Seq (#151) so clones become refcount bumps.
     let d = metamodel_state().clone();
     let mut s = ds().lock().unwrap();
     let h = s.iter().position(|x| x.is_none()).unwrap_or_else(|| { s.push(None); s.len() - 1 });
