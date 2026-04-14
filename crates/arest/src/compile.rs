@@ -851,6 +851,18 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
     }));
     } // end test gate
 
+    // ── Generator 10: OpenAPI 3.1 — one document cell ─────────────
+    // components.schemas comes from rmap(domain); paths come from the
+    // entity cell structure + state machines per Theorem 4. See
+    // crate::generators::openapi for the full derivation.
+    if generators.contains("openapi") {
+        let openapi_doc = crate::generators::openapi::openapi_for_domain(&domain);
+        defs.push((
+            "openapi:document".to_string(),
+            Func::constant(Object::atom(&openapi_doc.to_string())),
+        ));
+    }
+
     // Handler defs — α(noun → <create_def, update_def>)
     // Platform functions: create:{noun} and update:{noun} take Object fact pairs,
     // not JSON. Per AREST Eq. 6, input is the 3NF row.
