@@ -26,6 +26,7 @@ pub mod verbalize;
 pub mod command;
 pub mod crypto;
 pub mod generators;
+pub mod quota;
 
 #[cfg(feature = "cloudflare")]
 pub mod cloudflare;
