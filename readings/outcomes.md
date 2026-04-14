@@ -1,9 +1,5 @@
 # AREST Outcomes: Violations and Failures as Facts
 
-## Description
-
-Violations and failures are first-class domain entities, not out-of-band error responses. Every evaluation path returns either valid claims, violation facts, failure facts, or a combination. No silent paths.
-
 ## Entity Types
 
 Violation(.id) is an entity type.
@@ -79,3 +75,4 @@ If some Violation occurs before some Transition then that Violation occurred at 
 ## Instance Facts
 
 Domain 'outcomes' has Access 'public'.
+Domain 'outcomes' has Description 'Violations and failures as first-class facts. Every evaluation path returns valid claims, violation facts, failure facts, or a combination. No silent paths.'.

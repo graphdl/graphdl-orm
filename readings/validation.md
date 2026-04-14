@@ -1,9 +1,5 @@
 # AREST Validation: ORM2 Modeling Rules
 
-## Description
-
-Deontic constraints encoding ORM2/FORML2 modeling discipline at the framework level. These are meta-constraints: constraints about how domain models should be structured. Every domain inherits them.
-
 ## Deontic Constraints
 
 ### Noun Declaration
@@ -58,3 +54,4 @@ It is obligatory that each variable in a Derivation Rule consequent appears in a
 ## Instance Facts
 
 Domain 'validation' has Access 'public'.
+Domain 'validation' has Description 'Deontic constraints encoding ORM 2 / FORML 2 modeling discipline at the framework level. Meta-constraints about how domain models should be structured. Every domain inherits them.'.

@@ -1,9 +1,5 @@
 # AREST UI: Presentation Layer
 
-## Description
-
-Platform-agnostic view hierarchy, navigation, and controls. Custom renderers registered per platform via the factory pattern.
-
 ## Entity Types
 
 ### Views
@@ -373,3 +369,4 @@ It is obligatory that each Entity List has some Sort Direction.
 ## Instance Facts
 
 Domain 'ui' has Access 'public'.
+Domain 'ui' has Description 'Platform-agnostic view hierarchy, navigation, and controls. Custom renderers registered per platform via the factory pattern.'.
