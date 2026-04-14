@@ -4,6 +4,7 @@ import { nounToSlug, nounToTable, resolveSlugToNoun } from '../collections'
 import { handleParse } from './parse'
 import { handleEvaluate, handleSynthesize } from './evaluate'
 import { handleCreateEntity, handleDeleteEntity } from './entity-routes'
+import { envelope } from './envelope'
 import { loadDomainSchema, loadDomainAndPopulation, buildPopulation, getTransitions, applyCommand, querySchema, forwardChain, getNounSchemas, computeRMAP, system as wasmSystem } from './engine'
 import { handleArestRequest } from './arest-router'
 import { handleMcpRequest } from '../mcp/remote'
@@ -573,11 +574,11 @@ router.post('/api/entities/:noun', async (request, env: Env) => {
   await registry.indexEntity(noun, entityId, domain)
 
   const cell = await entityDO.get()
-  return json({
+  return json(envelope({
     id: cell.id,
     type: cell.type,
     ...cell.data,
-  }, { status: 201 })
+  }), { status: 201 })
 })
 
 
@@ -593,7 +594,7 @@ router.patch('/api/entities/:noun/:id', async (request, env: Env) => {
 
   const merged = { ...existing.data, ...body }
   const result = await entityDO.put({ id: existing.id, type: existing.type, data: merged })
-  return json({ id: result.id, type: result.type, ...result.data })
+  return json(envelope({ id: result.id, type: result.type, ...result.data }))
 })
 
 router.delete('/api/entities/:noun/:id', async (request, env: Env) => {
@@ -605,7 +606,7 @@ router.delete('/api/entities/:noun/:id', async (request, env: Env) => {
   const result = await handleDeleteEntity(id, getEntityDO(env, id) as any, registry, noun, domain, broadcast)
 
   if (!result) return error(404, { errors: [{ message: 'Not Found' }] })
-  return json(result)
+  return json(envelope(result))
 })
 
 // ── Collection CRUD ──────────────────────────────────────────────────
