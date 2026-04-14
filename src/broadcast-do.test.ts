@@ -245,6 +245,54 @@ describe('BroadcastDO registry', () => {
       // The abort handler runs synchronously on dispatch.
       expect(listSubscribers(reg)).toHaveLength(0)
     })
+
+    // ── Cross-origin SSE through a proxy (#131 apis catch-all) ─────
+    //
+    // The apis worker wraps every /arest/* response:
+    //   const wrapped = new Response(response.body, response)
+    //   for (const [k, v] of Object.entries(cors)) wrapped.headers.set(k, v)
+    // For an SSE body (a ReadableStream), the wrapping must preserve
+    // the stream — if the body were consumed by the wrapper, events
+    // would never reach the browser. This test simulates that proxy
+    // wrapping against a real openSseStream response and verifies
+    // data frames still arrive after published events.
+    it('SSE response body survives proxy-style Response wrapping with CORS headers', async () => {
+      const reg = createRegistry()
+      const req = new Request('https://arest/events?domain=organizations')
+      const res = await openSseStream(reg, req)
+
+      // Simulate the apis catch-all: wrap the streaming response and
+      // set credentialed-CORS headers (per apis/index.ts corsHeaders).
+      const wrapped = new Response(res.body, res)
+      wrapped.headers.set('Access-Control-Allow-Origin', 'https://ui.auto.dev')
+      wrapped.headers.set('Access-Control-Allow-Credentials', 'true')
+
+      expect(wrapped.headers.get('Content-Type')).toBe('text/event-stream')
+      expect(wrapped.headers.get('Access-Control-Allow-Origin')).toBe('https://ui.auto.dev')
+      expect(wrapped.headers.get('Access-Control-Allow-Credentials')).toBe('true')
+
+      // Publish after the wrap; the stream under the wrapped response
+      // must still receive events.
+      publish(reg, {
+        domain: 'organizations',
+        noun: 'Organization',
+        entityId: 'proxied-1',
+        operation: 'create',
+        facts: {},
+        timestamp: 0,
+      })
+
+      const reader = wrapped.body!.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      while (!buffer.includes('data: ')) {
+        const { value, done } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+      }
+      await reader.cancel().catch(() => {})
+      expect(buffer).toContain('"entityId":"proxied-1"')
+    })
   })
 
   describe('formatSseFrame', () => {
