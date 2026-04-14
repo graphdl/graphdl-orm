@@ -90,6 +90,9 @@ Role Relationship is a value type.
 Scope is a value type.
   The possible values of Scope are 'organization', 'public'.
 
+Derivation Mode is a value type.
+  The possible values of Derivation Mode are 'fully-derived', 'derived-and-stored', 'semi-derived'.
+
 ## Fact Types
 
 ### Noun
@@ -167,7 +170,8 @@ Fact Type has Order.
   Each Fact Type has at most one Order.
 Fact Type has Role Relationship.
   Each Fact Type has at most one Role Relationship.
-Fact Type is derived.
+Fact Type has Derivation Mode.
+  Each Fact Type has at most one Derivation Mode.
 
 ### Role
 Constraint spans Role.

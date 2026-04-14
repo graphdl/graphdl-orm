@@ -2722,6 +2722,55 @@ fn forbidden_ipv6_ula_fd() {
         let _ = is_forbidden_url("");
     }
 
+    // --- 12. Metamodel invariants (readings/core.md) ---
+    //
+    // These tests assert that the authoritative metamodel file exposes the
+    // concepts the engine depends on. The canonical ORM 2 derivation markers
+    // (*, **, +) attach a Derivation Mode onto a Fact Type; the metamodel
+    // must therefore declare the Derivation Mode value type with its three
+    // enum values AND a `Fact Type has Derivation Mode` binary fact type.
+    //
+    // Cites: Halpin, ORM 2 (ORM2.pdf p. 8) — iff-rule for full derivation,
+    // if-rule for partial; graphical markers * / ** / + for fully-derived /
+    // derived-and-stored / semi-derived respectively.
+
+    #[test]
+    fn metamodel_declares_derivation_mode_value_type() {
+        let core_md = include_str!("../../../readings/core.md");
+        let domain = parse_markdown(core_md)
+            .expect("metamodel readings/core.md must parse");
+
+        let noun = domain.nouns.get("Derivation Mode")
+            .expect("core.md must declare 'Derivation Mode' as a noun");
+        assert_eq!(noun.object_type, "value",
+            "'Derivation Mode' must be a value type");
+
+        let vals = domain.enum_values.get("Derivation Mode")
+            .expect("'Derivation Mode' must have declared enum values");
+        assert!(vals.iter().any(|v| v == "fully-derived"),
+            "Derivation Mode enum must include 'fully-derived'; got: {:?}", vals);
+        assert!(vals.iter().any(|v| v == "derived-and-stored"),
+            "Derivation Mode enum must include 'derived-and-stored'; got: {:?}", vals);
+        assert!(vals.iter().any(|v| v == "semi-derived"),
+            "Derivation Mode enum must include 'semi-derived'; got: {:?}", vals);
+    }
+
+    #[test]
+    fn metamodel_declares_fact_type_has_derivation_mode() {
+        let core_md = include_str!("../../../readings/core.md");
+        let domain = parse_markdown(core_md)
+            .expect("metamodel readings/core.md must parse");
+
+        let ft_exists = domain.fact_types.values().any(|ft| {
+            ft.reading == "Fact Type has Derivation Mode"
+        });
+        assert!(ft_exists,
+            "core.md must declare 'Fact Type has Derivation Mode.' so the parser \
+             can emit a Fact Type's derivation modality when the */**/+ marker \
+             is applied. Got fact type readings: {:?}",
+            domain.fact_types.values().map(|ft| ft.reading.as_str()).collect::<Vec<_>>());
+    }
+
     #[test]
     fn forbidden_empty_host_in_http_url() {
         // http:// with no host -> empty host -> treated as forbidden.
