@@ -585,7 +585,7 @@ It is forbidden that EntityA has ValueX 'BadValue'.
 It is permitted that EntityA does Optional Thing.
 
 ## Derivation Rules
-EntityA has Derived Value := [derivation expression].
+* EntityA has Derived Value iff [derivation body using 'some' and 'that' anaphora, or an aggregate expression].
 
 ## Instance Facts
 EntityA 'foo' has ValueX 'bar'.
