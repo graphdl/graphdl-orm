@@ -493,7 +493,99 @@ fn paths_for_noun(
         })
         .collect();
 
-    crud.into_iter().chain(transitions).chain(related_routes).collect()
+    // Introspection routes per Theorem 5 (task #148).
+    //
+    // /{plural}/{id}/actions  — events valid from current status.
+    //   Mirrors /{plural}/{id}/transitions; emitted only when the noun
+    //   has an SM. The name matches the `actions` MCP verb so clients
+    //   can navigate between the two surfaces with one mental model.
+    //
+    // /{plural}/{id}/explain  — derivation chain for all derived facts
+    //   on this entity. Always emitted; returns the Thm 5 provenance
+    //   trace (which rules fired, which facts they consumed, whether
+    //   each antecedent was asserted or derived).
+    let actions_route = sm.into_iter().map(|sm| {
+        let events: Vec<&str> = sm.transitions.iter().map(|t| t.event.as_str()).collect();
+        let events_response = serde_json::json!({
+            "200": {
+                "description": format!("Events (actions) valid from the current status of this {}.", noun_name),
+                "content": {
+                    "application/json": {
+                        "schema": { "type": "array", "items": { "type": "string", "enum": &events } },
+                    },
+                },
+            },
+        });
+        (
+            format!("/{}/{{id}}/actions", plural),
+            serde_json::json!({
+                "parameters": [id_param.clone()],
+                "get": {
+                    "summary": format!("List valid actions (SM events) for a {}.", noun_name),
+                    "description": "Alias of /transitions; named to match the MCP `actions` verb.",
+                    "responses": events_response,
+                },
+            }),
+        )
+    }).collect::<Vec<_>>();
+
+    let explain_response = serde_json::json!({
+        "200": {
+            "description": format!(
+                "Derivation chain for all derived facts on this {}. \
+                 Theorem 5: every value in the representation is a ρ-application \
+                 over P; /explain surfaces the chain of rules and antecedents \
+                 that produced each derived fact.",
+                noun_name),
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "factTypeId": { "type": "string" },
+                                "rule":       { "type": "string" },
+                                "bindings":   { "type": "object", "additionalProperties": true },
+                                "antecedents": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "factTypeId": { "type": "string" },
+                                            "bindings":   { "type": "object", "additionalProperties": true },
+                                            "source":     { "type": "string", "enum": ["asserted", "derived"] },
+                                        },
+                                    },
+                                },
+                            },
+                            "required": ["factTypeId", "rule"],
+                        },
+                    },
+                },
+            },
+        },
+    });
+    let explain_route = (
+        format!("/{}/{{id}}/explain", plural),
+        serde_json::json!({
+            "parameters": [id_param.clone()],
+            "get": {
+                "summary": format!("Explain derived facts on a {}.", noun_name),
+                "description": "Returns the derivation chain per Theorem 5 — rule name, \
+                                bindings, and antecedents (asserted or derived) for every \
+                                derived fact the entity participates in.",
+                "responses": explain_response,
+            },
+        }),
+    );
+
+    crud.into_iter()
+        .chain(transitions)
+        .chain(related_routes)
+        .chain(actions_route)
+        .chain(std::iter::once(explain_route))
+        .collect()
 }
 
 /// Extract a kebab-case verb slug from a binary fact type's reading.
@@ -969,6 +1061,44 @@ mod tests {
         assert!(paths.contains_key("/customers/{id}/bills-accounts"),
             "verb-slugged route for 'bills' must exist; got: {:?}",
             paths.keys().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn introspection_routes_emit_explain_always_and_actions_when_sm_present(){
+        // /explain always. /actions only when the noun has an SM.
+        use crate::types::{StateMachineDef, TransitionDef};
+        let mut domain = organization_with_slug();
+        domain.state_machines.insert("Organization".into(), StateMachineDef {
+            noun_name: "Organization".into(),
+            statuses: vec!["active".into(), "archived".into()],
+            transitions: vec![TransitionDef {
+                from: "active".into(),
+                to: "archived".into(),
+                event: "archive".into(),
+                guard: None,
+            }],
+        });
+
+        let doc = openapi_for_app(&domain, "test-app");
+        let paths = doc["paths"].as_object().unwrap();
+        assert!(paths.contains_key("/organizations/{id}/explain"),
+            "GET /explain must exist per Thm 5; got: {:?}",
+            paths.keys().collect::<Vec<_>>());
+        assert!(paths.contains_key("/organizations/{id}/actions"),
+            "GET /actions must exist for SM-bearing noun; got: {:?}",
+            paths.keys().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn explain_route_exists_for_noun_without_state_machine() {
+        // No SM: /actions is absent, /explain still present because
+        // derivations can exist on any entity regardless of SM.
+        let domain = organization_with_slug();
+        let doc = openapi_for_app(&domain, "test-app");
+        let paths = doc["paths"].as_object().unwrap();
+        assert!(paths.contains_key("/organizations/{id}/explain"));
+        assert!(!paths.contains_key("/organizations/{id}/actions"),
+            "/actions must be absent without an SM");
     }
 
     #[test]
