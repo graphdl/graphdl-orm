@@ -1,11 +1,5 @@
 # Domain Evolution
 
-## Description
-
-How the metamodel modifies itself. A Domain Change proposes new metamodel entities (readings, nouns, constraints). The proposed changes are validated via CSDP before being applied. This domain is self-referential: it describes how new readings get added to AREST using AREST's own primitives.
-
-The Curry-Howard correspondence applies: proposing a new fact type is proposing a theorem. CSDP validation is the proof check. Successful ingestion is the proof. The system can only evolve by proving something new.
-
 ## Entity Types
 
 Domain Change(.Change Id) is an entity type.
@@ -102,3 +96,4 @@ Transition 'apply' is to Status 'Applied'.
 Transition 'apply' is triggered by Event Type 'applied'.
 
 Domain 'evolution' has Access 'public'.
+Domain 'evolution' has Description 'Self-modification as a Domain Change state machine. Proposing a new fact type is proposing a theorem (Curry-Howard). CSDP validation is the proof check, successful ingestion is the proof.'.

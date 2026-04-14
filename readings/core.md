@@ -1,9 +1,5 @@
 # AREST Core Metamodel
 
-## Description
-
-Extracted from NORMA ORM2 model (design/html/).
-
 ## Entity Types
 
 Function(.id) is an entity type.
@@ -359,3 +355,4 @@ External System 'stripe' has Header 'Authorization'.
 External System 'stripe' has Prefix 'Bearer'.
 
 Domain 'core' has Access 'public'.
+Domain 'core' has Description 'Extracted from NORMA ORM2 model (design/html/). The canonical FORML 2 metamodel against which every user domain is a subtype binding.'.
