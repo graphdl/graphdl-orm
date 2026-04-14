@@ -4,9 +4,25 @@
 
 A derived fact is one whose population is computed from other facts rather than directly asserted. In FORML2:
 
+Every derived fact type carries a **Derivation Mode** marker on the reading plus a matching marker as a prefix on the rule body. Halpin ORM 2 (ORM2.pdf p. 8):
+
+| Marker | Mode | Semantics |
+|---|---|---|
+| `*` | fully derived | Never asserted; always computed from the rule. |
+| `**` | derived and stored | Same as `*` but materialized (SQL trigger, etc.). |
+| `+` | semi-derived | May be computed from the rule OR asserted directly. |
+
+The rule body uses `iff` for full derivation (rule IS the definition) or `if` for partial (rule is one sufficient condition; others may also populate).
+
 ```
-Person has FullName := Person has FirstName + ' ' + Person has LastName.
+## Fact Types
+Person has Full Name *.
+
+## Derivation Rules
+* Person has Full Name iff Person has First Name and Person has Last Name and Full Name is First Name concatenated with Last Name.
 ```
+
+The `:=` form from pre-ORM 1 BNF grammar is retired.
 
 Derivation rules belong in the `## Derivation Rules` section of a FORML2 document. A derived fact should never be stored as an independent field â€” it is a query over the base facts.
 
