@@ -369,6 +369,39 @@ mod tests {
     }
 
     #[test]
+    fn plural_instance_fact_overrides_fallback() {
+        // `Noun 'X' has Plural 'ys'` is how irregular plurals ("policies",
+        // "categories", "children") reach the path surface. Without this
+        // override, snake(noun) + "s" mangles most non-regular nouns.
+        // The instance fact lives as a GeneralInstanceFact against the
+        // metamodel's `Noun has Plural` binary — facts all the way down.
+        let mut domain = organization_with_slug();
+        domain.general_instance_facts.push(crate::types::GeneralInstanceFact {
+            subject_noun: "Noun".into(),
+            subject_value: "Organization".into(),
+            field_name: "Plural".into(),
+            object_noun: "Plural".into(),
+            object_value: "orgs".into(),
+        });
+
+        let doc = openapi_for_domain(&domain);
+        let paths = doc["paths"].as_object()
+            .expect("paths must be an object");
+
+        assert!(paths.contains_key("/orgs"),
+            "plural-fact path /orgs must exist when 'Noun has Plural orgs' is \
+             declared; got: {:?}",
+            paths.keys().collect::<Vec<_>>());
+        assert!(paths.contains_key("/orgs/{id}"),
+            "plural-fact item path /orgs/{{id}} must exist; got: {:?}",
+            paths.keys().collect::<Vec<_>>());
+        assert!(!paths.contains_key("/organizations"),
+            "fallback path /organizations must not exist once Plural is \
+             declared — the declaration wins; got: {:?}",
+            paths.keys().collect::<Vec<_>>());
+    }
+
+    #[test]
     fn openapi_generator_is_gated_by_opt_in() {
         use std::collections::HashSet;
 
