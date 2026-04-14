@@ -13,6 +13,7 @@
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
+import { systemCall, safeJson } from './engine-bridge.js'
 
 /**
  * Minimal shape of the BroadcastDO stub the streaming tools need.
@@ -61,18 +62,39 @@ export function createStreamingServer(env?: StreamingEnv) {
 
   server.tool(
     'arest_list',
-    'List entities of a noun type in a domain',
+    'List entities of a noun type. Returns the full population via the shared ' +
+    'WASM engine handle; page/limit are client-side pagination hints carried ' +
+    'through to the response for the caller to apply.',
     {
-      noun: z.string(),
-      domain: z.string(),
+      noun: z.string().describe('Entity noun to enumerate (e.g. "Order").'),
+      domain: z.string().describe('Domain slug for namespacing — today informational; the engine serves one D per isolate.'),
       page: z.number().optional(),
       limit: z.number().optional(),
     },
     async ({ noun, domain, page, limit }) => {
-      // Real entity listing is task #120 — needs a wasm engine handle
-      // reachable from the MCP tool context. For now, returns the
-      // query echo so the wire-level shape is stable for clients.
-      return { content: [{ type: 'text' as const, text: JSON.stringify({ noun, domain, page, limit, _note: 'wired to AREST handler' }) }] }
+      const raw = await systemCall(`list:${noun}`, '')
+      const parsed = safeJson(raw, null as unknown)
+      const entities = Array.isArray(parsed) ? parsed : []
+      // Pagination is applied here on the materialised array. The
+      // engine's list:{noun} returns the full set today; future work
+      // can push pagination into the generator for large populations.
+      const start = typeof page === 'number' && typeof limit === 'number'
+        ? page * limit : 0
+      const end = typeof limit === 'number' ? start + limit : entities.length
+      const pageItems = entities.slice(start, end)
+      return {
+        content: [{
+          type: 'text' as const,
+          text: JSON.stringify({
+            noun,
+            domain,
+            total: entities.length,
+            page: typeof page === 'number' ? page : 0,
+            limit: typeof limit === 'number' ? limit : entities.length,
+            entities: pageItems,
+          }),
+        }],
+      }
     },
   )
 
