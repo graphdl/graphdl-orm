@@ -4,21 +4,27 @@
   "main": "src/worker.ts",
   "compatibility_date": "2026-03-09",
   "compatibility_flags": ["nodejs_compat"],
-  // Two DO classes by design:
+  // Three DO classes by design:
   //   EntityDB    — one instance per entity id (cell isolation, §4.3
   //                 Definition 2). Per-entity writes run in parallel.
   //   RegistryDB  — one instance per scope (app/org/global). Holds
   //                 cross-entity state: population index, schema cache,
   //                 domain secrets. Isn't contended by entity writes.
-  // Local mode has neither — a single in-memory D serves everything.
+  //   BroadcastDO — one instance per scope. Subscriber registry for the
+  //                 kernel's signal-delivery layer (docs/11 §Signals).
+  //                 In-memory only; drops subscribers on restart by
+  //                 design (client connections break on restart anyway).
+  // Local mode has none — a single in-memory D serves everything.
   "durable_objects": {
     "bindings": [
       { "name": "ENTITY_DB", "class_name": "EntityDB" },
-      { "name": "REGISTRY_DB", "class_name": "RegistryDB" }
+      { "name": "REGISTRY_DB", "class_name": "RegistryDB" },
+      { "name": "BROADCAST", "class_name": "BroadcastDO" }
     ]
   },
   "migrations": [
-    { "tag": "v1", "new_sqlite_classes": ["EntityDB", "RegistryDB"] }
+    { "tag": "v1", "new_sqlite_classes": ["EntityDB", "RegistryDB"] },
+    { "tag": "v2", "new_classes": ["BroadcastDO"] }
   ],
   "vars": {
     "ENVIRONMENT": "production"
