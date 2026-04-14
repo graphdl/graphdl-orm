@@ -310,6 +310,28 @@ fn emit_body(func: &Func, body: &mut Function, next_scratch: u32) -> Result<(), 
         // id:x = x — ptr on stack is already the output.
         Func::Id => {}
 
+        // Backus §11.2.4 Selector: s_i:<x₁, …, xₙ> = xᵢ (1-indexed).
+        // Input is a Seq ptr; the element at index i-1 lives at
+        // byte offset 8 + 4*(i-1). One i32.load does the whole job —
+        // this is the cheapest lowering in the PoC.
+        //
+        // Out-of-bounds selection (i > length) reads undefined heap
+        // contents in linear memory; we do not bounds-check at
+        // emit time. Callers are expected to compose Selector with
+        // constructions of sufficient arity — FORML 2 role positions
+        // always do.
+        Func::Selector(i) => {
+            if *i < 1 {
+                return Err(format!("Selector index must be ≥ 1, got {}", i));
+            }
+            let offset = (SEQ_HEADER_SIZE as u64) + 4 * (*i as u64 - 1);
+            body.instruction(&Instruction::I32Load(MemArg {
+                offset,
+                align: 2,
+                memory_index: 0,
+            }));
+        }
+
         // c̄:x = c (when x ≠ ⊥) — drop input ptr, allocate fresh Atom.
         Func::Constant(Object::Atom(s)) => {
             let n: i64 = s.parse()
@@ -772,12 +794,18 @@ mod tests {
 
     #[test]
     fn lower_rejects_unsupported_variant() {
-        // Selector is the next natural addition (1-indexed tuple
-        // projection) — currently still unsupported, so it's the
-        // sentinel for this test.
-        let f = Func::Selector(1);
-        let err = lower_to_wasm(&f).expect_err("Selector should be marked unsupported");
+        // Add isn't wired yet — binary arithmetic on pair input is
+        // the next pattern (unpack, i64 op, alloc_atom).
+        let f = Func::Add;
+        let err = lower_to_wasm(&f).expect_err("Add should be marked unsupported");
         assert!(err.contains("not yet supported"));
+    }
+
+    #[test]
+    fn lower_selector_rejects_zero_index() {
+        let f = Func::Selector(0);
+        let err = lower_to_wasm(&f).expect_err("Selector(0) must fail at emit time");
+        assert!(err.contains("≥ 1"));
     }
 
     // ── Compose ───────────────────────────────────────────────────
@@ -1079,6 +1107,62 @@ mod tests {
             Box::new(Func::Construction(vec![])),
         );
         assert_eq!(roundtrip_seq(&f, 0), Vec::<i64>::new());
+    }
+
+    // ── Selector ──────────────────────────────────────────────────
+
+    #[test]
+    fn lower_selector_first_of_pair() {
+        // s₁:<x, y> = x. Compose with Construction to produce the
+        // pair from the apply's i64 input.
+        let f = Func::Compose(
+            Box::new(Func::Selector(1)),
+            Box::new(Func::Construction(vec![
+                Func::Constant(Object::atom("42")),
+                Func::Constant(Object::atom("99")),
+            ])),
+        );
+        assert_eq!(roundtrip(&f, 0), 42);
+    }
+
+    #[test]
+    fn lower_selector_second_of_pair() {
+        // s₂:<x, y> = y. Exercises the non-zero offset path.
+        let f = Func::Compose(
+            Box::new(Func::Selector(2)),
+            Box::new(Func::Construction(vec![
+                Func::Constant(Object::atom("42")),
+                Func::Constant(Object::atom("99")),
+            ])),
+        );
+        assert_eq!(roundtrip(&f, 0), 99);
+    }
+
+    #[test]
+    fn lower_selector_threads_input_via_id() {
+        // s₁:<x, x> — both components echo the apply input, selector
+        // picks the first. Result = x itself.
+        let f = Func::Compose(
+            Box::new(Func::Selector(1)),
+            Box::new(Func::Construction(vec![Func::Id, Func::Id])),
+        );
+        assert_eq!(roundtrip(&f, 7), 7);
+        assert_eq!(roundtrip(&f, -13), -13);
+    }
+
+    #[test]
+    fn lower_selector_out_of_triple() {
+        // s₃:<a, b, c> = c. Confirms the offset math scales past
+        // the fixed-pair case.
+        let f = Func::Compose(
+            Box::new(Func::Selector(3)),
+            Box::new(Func::Construction(vec![
+                Func::Constant(Object::atom("100")),
+                Func::Constant(Object::atom("200")),
+                Func::Constant(Object::atom("300")),
+            ])),
+        );
+        assert_eq!(roundtrip(&f, 0), 300);
     }
 
     // ── Insert ────────────────────────────────────────────────────
