@@ -47,3 +47,13 @@ subtle = "2"
 [profile.release]
 opt-level = 2
 lto = "thin"
+
+# Test profile: optimize the code under test because the suite is
+# interpreter-heavy (every ast::apply call goes through a match on
+# ~40 Func variants). At opt-level = 0 these match arms don't inline,
+# so the interpreter pays match-overhead per reduction step. opt-level
+# = 2 collapses them. Debug info is on by default for stack traces.
+# Compile cost goes up on the first test run after a code change;
+# runtime drops by 100× on interpreter workloads.
+[profile.test]
+opt-level = 2
