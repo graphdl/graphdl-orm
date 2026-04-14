@@ -23,36 +23,10 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js'
 import { z } from 'zod'
 
-let _engine: typeof import('../api/engine.js') | null = null
-let _handle: number | null = null
-
-async function getEngine() {
-  if (_engine) return _engine
-  _engine = await import('../api/engine.js')
-  return _engine
-}
-
-async function getHandle(): Promise<number> {
-  if (_handle !== null) return _handle
-  const engine = await getEngine()
-  // Start with the metamodel only. Clients ingest their own domain
-  // via the `compile` tool.
-  _handle = engine.compileDomainReadings()
-  return _handle
-}
+import { getEngine, getHandle, systemCall, safeJson } from './engine-bridge.js'
 
 function textResult(data: any) {
   return { content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }] }
-}
-
-async function systemCall(key: string, input: string): Promise<string> {
-  const engine = await getEngine()
-  const handle = await getHandle()
-  return engine.system(handle, key, input)
-}
-
-function safeJson<T>(raw: string, fallback: T): T | any {
-  try { const v = JSON.parse(raw); return v ?? fallback } catch { return fallback }
 }
 
 /** Build a fresh McpServer bound to the shared Worker engine handle. */
