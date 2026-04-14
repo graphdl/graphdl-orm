@@ -28,6 +28,12 @@ parallel = ["dep:rayon"]
 # introspection but exposes internals in production — leave OFF for
 # release builds. Enabled by default so `cargo test` works out of the box.
 debug-def = []
+# Gates the apply-variant profiler in ast.rs. When OFF (default),
+# ast::apply pays zero overhead. When ON, every apply records its
+# variant's call count and cumulative nanoseconds; ast::profile_enable
+# / profile_dump become meaningful. Enable via:
+#   cargo test --features profile --lib profile_create_order -- --ignored --nocapture
+profile = []
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

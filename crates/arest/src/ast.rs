@@ -634,17 +634,16 @@ fn normalize_step(f: &Func) -> Func {
 
 // ── Apply-variant profiler ──────────────────────────────────────────
 //
-// Opt-in, thread-local accounting of Func::apply calls. Off by default
-// so normal callers pay a single TLS read per apply. When enabled, each
-// apply records its variant name, call count, and cumulative wall-clock
-// nanoseconds. Consumers call `profile_enable`, run a representative
-// workload, then `profile_snapshot` to read a descending-by-time
-// histogram. `profile_reset` clears the counters between measurements.
+// Opt-in, thread-local accounting of Func::apply calls. Gated behind
+// the `profile` Cargo feature so default/release builds pay zero
+// overhead in apply(). When the feature is off, profile_enable/etc.
+// stub out and apply() is a two-line function.
 //
-// Wall-clock is measured with std::time::Instant (panics on wasm32);
-// profiling is therefore a no-op on the wasm target via cfg gating.
+// Enable via:
+//   cargo test --features profile --lib profile_create_order -- \
+//              --ignored --nocapture
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "profile", not(target_arch = "wasm32")))]
 mod profile {
     use std::cell::{Cell, RefCell};
     use std::collections::HashMap;
@@ -656,15 +655,7 @@ mod profile {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-#[inline]
-fn profile_enabled() -> bool { profile::ENABLED.with(|c| c.get()) }
-
-#[cfg(target_arch = "wasm32")]
-#[inline]
-fn profile_enabled() -> bool { false }
-
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "profile", not(target_arch = "wasm32")))]
 fn profile_record(variant: &'static str, ns: u64) {
     profile::STATS.with(|m| {
         let mut map = m.borrow_mut();
@@ -674,27 +665,29 @@ fn profile_record(variant: &'static str, ns: u64) {
     });
 }
 
-/// Turn on the apply-variant profiler for this thread.
-#[cfg(not(target_arch = "wasm32"))]
+/// Turn on the apply-variant profiler for this thread. No-op unless
+/// the `profile` feature is enabled at build time.
+#[cfg(all(feature = "profile", not(target_arch = "wasm32")))]
 pub fn profile_enable() { profile::ENABLED.with(|c| c.set(true)); }
-#[cfg(target_arch = "wasm32")]
+#[cfg(not(all(feature = "profile", not(target_arch = "wasm32"))))]
 pub fn profile_enable() {}
 
-/// Turn off the apply-variant profiler for this thread.
-#[cfg(not(target_arch = "wasm32"))]
+/// Turn off the apply-variant profiler for this thread. No-op unless
+/// the `profile` feature is enabled at build time.
+#[cfg(all(feature = "profile", not(target_arch = "wasm32")))]
 pub fn profile_disable() { profile::ENABLED.with(|c| c.set(false)); }
-#[cfg(target_arch = "wasm32")]
+#[cfg(not(all(feature = "profile", not(target_arch = "wasm32"))))]
 pub fn profile_disable() {}
 
 /// Clear accumulated apply counts for this thread.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "profile", not(target_arch = "wasm32")))]
 pub fn profile_reset() { profile::STATS.with(|m| m.borrow_mut().clear()); }
-#[cfg(target_arch = "wasm32")]
+#[cfg(not(all(feature = "profile", not(target_arch = "wasm32"))))]
 pub fn profile_reset() {}
 
 /// Read a `(variant, count, total_ns)` histogram sorted descending by
-/// total_ns. Empty on wasm or when the profiler was never enabled.
-#[cfg(not(target_arch = "wasm32"))]
+/// total_ns. Empty under the default build (no `profile` feature).
+#[cfg(all(feature = "profile", not(target_arch = "wasm32")))]
 pub fn profile_snapshot() -> Vec<(&'static str, u64, u64)> {
     profile::STATS.with(|m| {
         let mut v: Vec<_> = m.borrow().iter().map(|(k, (c, t))| (*k, *c, *t)).collect();
@@ -702,11 +695,10 @@ pub fn profile_snapshot() -> Vec<(&'static str, u64, u64)> {
         v
     })
 }
-#[cfg(target_arch = "wasm32")]
+#[cfg(not(all(feature = "profile", not(target_arch = "wasm32"))))]
 pub fn profile_snapshot() -> Vec<(&'static str, u64, u64)> { Vec::new() }
 
-/// Pretty-print the current snapshot to stderr. Useful inside tests
-/// after running a representative workload.
+/// Pretty-print the current snapshot to stderr.
 pub fn profile_dump() {
     let snap = profile_snapshot();
     let total_ns: u64 = snap.iter().map(|(_, _, t)| t).sum();
@@ -724,6 +716,7 @@ pub fn profile_dump() {
 /// Readable discriminant for a Func variant. Used by the profiler so
 /// histogram entries are grouped by variant rather than by the boxed
 /// children they carry.
+#[cfg(all(feature = "profile", not(target_arch = "wasm32")))]
 fn variant_name(f: &Func) -> &'static str {
     match f {
         Func::Id => "Id",
@@ -773,35 +766,30 @@ fn variant_name(f: &Func) -> &'static str {
     }
 }
 
+#[cfg(all(feature = "profile", not(target_arch = "wasm32")))]
 pub fn apply(func: &Func, x: &Object, d: &Object) -> Object {
-    // All functions are bottom-preserving: ⊥ propagates unchanged.
-    // The profiler wraps the body when enabled. The TLS-read branch is
-    // one predictable load per call — measured no-op overhead on the
-    // hot path when profiling is off.
-    if !profile_enabled() {
+    if !profile::ENABLED.with(|c| c.get()) {
         return match x.is_bottom() {
             true => Object::Bottom,
             false => apply_nonbottom(func, x, d),
         };
     }
+    let name = variant_name(func);
+    let t = std::time::Instant::now();
+    let result = match x.is_bottom() {
+        true => Object::Bottom,
+        false => apply_nonbottom(func, x, d),
+    };
+    profile_record(name, t.elapsed().as_nanos() as u64);
+    result
+}
 
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let name = variant_name(func);
-        let t = std::time::Instant::now();
-        let result = match x.is_bottom() {
-            true => Object::Bottom,
-            false => apply_nonbottom(func, x, d),
-        };
-        profile_record(name, t.elapsed().as_nanos() as u64);
-        result
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        match x.is_bottom() {
-            true => Object::Bottom,
-            false => apply_nonbottom(func, x, d),
-        }
+#[cfg(not(all(feature = "profile", not(target_arch = "wasm32"))))]
+pub fn apply(func: &Func, x: &Object, d: &Object) -> Object {
+    // All functions are bottom-preserving: ⊥ propagates unchanged.
+    match x.is_bottom() {
+        true => Object::Bottom,
+        false => apply_nonbottom(func, x, d),
     }
 }
 
@@ -4891,6 +4879,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "profile")]
     #[test]
     fn profile_snapshot_records_apply_variants() {
         // Smoke test for the apply-variant profiler. Enable, run a

@@ -516,8 +516,9 @@ Order has total.
     ///
     /// Read the dump to decide where each remaining perf cycle goes
     /// (task #146 and onward).
+    #[cfg(feature = "profile")]
     #[test]
-    #[ignore = "profiling run; invoke with --ignored --nocapture"]
+    #[ignore = "profiling run; invoke with --features profile --ignored --nocapture"]
     fn profile_create_order_dump_histogram() {
         ast::profile_reset();
         ast::profile_enable();
