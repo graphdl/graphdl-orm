@@ -480,6 +480,48 @@ fn active_generators() -> HashSet<String> {
     ACTIVE_GENERATORS.with(|g| g.borrow().clone())
 }
 
+/// Return every App that opted into `generator` ("openapi", "sqlite", …).
+///
+/// Generators are App-scoped in FORML 2 (`App 'X' uses Generator 'Y'.`).
+/// The fact may reach the compile via two paths:
+///   1. The parser emits a GeneralInstanceFact with `subject_noun="App"`
+///      and `object_noun="Generator"`. This is the authoritative path
+///      when the dual-quoted instance fact parses cleanly.
+///   2. main.rs extracts opt-ins via regex and pushes `{App, Generator}`
+///      facts into the `App_uses_Generator` cell. This is the fallback
+///      for readings where path 1 does not yet parse.
+///
+/// We read both and union the results. Callers receive each App at
+/// most once regardless of how the opt-in reached the state.
+fn apps_opted_into_generator(
+    state: &crate::ast::Object,
+    domain: &Domain,
+    generator: &str,
+) -> Vec<String> {
+    let target = generator.to_lowercase();
+
+    let from_gifs: HashSet<String> = domain.general_instance_facts.iter()
+        .filter(|f| f.subject_noun == "App"
+                 && (f.object_noun == "Generator" || f.field_name == "Generator")
+                 && f.object_value.to_lowercase() == target)
+        .map(|f| f.subject_value.clone())
+        .collect();
+
+    let from_cell: HashSet<String> = crate::ast::fetch_or_phi("App_uses_Generator", state)
+        .as_seq()
+        .map(|facts| facts.iter()
+            .filter_map(|fact| {
+                let app = crate::ast::binding(fact, "App")?;
+                let gen = crate::ast::binding(fact, "Generator")?;
+                (gen.to_lowercase() == target).then(|| app.to_string())
+            })
+            .collect())
+        .unwrap_or_default();
+
+    from_gifs.into_iter().chain(from_cell).collect::<HashSet<_>>()
+        .into_iter().collect()
+}
+
 pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> {
     let t = profile_timer::now();
     let domain = state_to_domain(state);
@@ -851,17 +893,21 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
     }));
     } // end test gate
 
-    // ── Generator 10: OpenAPI 3.1 — one document cell ─────────────
-    // components.schemas comes from rmap(domain); paths come from the
-    // entity cell structure + state machines per Theorem 4. See
-    // crate::generators::openapi for the full derivation.
-    if generators.contains("openapi") {
-        let openapi_doc = crate::generators::openapi::openapi_for_domain(&domain);
+    // ── Generator 10: OpenAPI 3.1 — one document per App ───────────
+    // Generators are App-scoped (`App 'X' uses Generator 'openapi'.`):
+    // a single compile may contain several Apps, each with its own
+    // opt-in decision. Emit one cell per App that opted in, keyed
+    // `openapi:{snake(app-slug)}`. The per-App cell contains the full
+    // OpenAPI 3.1 document with the App's identity in `info`.
+    //
+    // See crate::generators::openapi for the schema/path derivation.
+    apps_opted_into_generator(state, &domain, "openapi").iter().for_each(|app| {
+        let openapi_doc = crate::generators::openapi::openapi_for_app(&domain, app);
         defs.push((
-            "openapi:document".to_string(),
+            format!("openapi:{}", crate::rmap::to_snake(app)),
             Func::constant(Object::atom(&openapi_doc.to_string())),
         ));
-    }
+    });
 
     // Handler defs — α(noun → <create_def, update_def>)
     // Platform functions: create:{noun} and update:{noun} take Object fact pairs,

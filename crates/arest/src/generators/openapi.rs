@@ -2,13 +2,20 @@
 //
 // OpenAPI 3.1 generator: compile FFP state to an OpenAPI document.
 //
-// AREST.tex §4.4 is the source of truth:
+// Scope is App-keyed, not Domain-keyed. An App lassos one or more
+// Domains (organizations.md: `Domain belongs to App`). The FORML 2
+// opt-in `App 'X' uses Generator 'openapi'.` is an assertion ON the
+// App; a single compile may contain multiple Apps, each with its own
+// opt-in decision. The generator therefore emits one document per App
+// that opted in, keyed `openapi:{snake(app-slug)}`.
+//
+// AREST.tex §4.4 is the source of truth for what a document contains:
 //   "RMAP determines which facts belong to which cell from the schema's
 //    uniqueness constraints: the result is a 3NF row, the complete set
 //    of facts that depend on one entity's key. Each entity is a cell."
 //
-// This generator therefore CONSUMES rmap::rmap(domain) as the primary
-// source of component schemas and does not re-derive attributes from
+// This generator CONSUMES rmap::rmap(domain) as the primary source of
+// component schemas and does not re-derive attributes from
 // fact_types/constraints/ref_schemes independently. Columns → properties.
 // `!nullable` → `required`. `references` → `$ref`. That is the whole
 // schema side.
@@ -19,17 +26,16 @@
 // Paths per entity are derived from Theorem 4 (HATEOAS as Projection):
 //   - `/{plural}`          GET (list), POST (create)
 //   - `/{plural}/{id}`     GET (read), PATCH (update)
-//   - `/{plural}/{id}/transition` POST (event in body)
+//   - `/{plural}/{id}/transition` POST (event in body) — only if SM
 //   - related-collection per binary fact type the noun participates in
+//     (follow-up scope)
 //
 // No DELETE — per §4.1 and Corollary 2, deletion is a transition to a
 // terminal status. The list endpoint filters out terminal entities via
-// `Filter(p_live) : P` (server-side, documented in the description).
+// `Filter(p_live) : P` (server-side).
 //
 // Response envelope per Theorems 3 + 5 and Corollary 1:
-//   `{ data, _links, violations }` — `data` is the 3NF row plus derived
-//   values; `_links` is `links_full(e, n, status(e, P))`; each violation
-//   carries the original reading text (Cor 1 Verbalization).
+//   `{ data, derived, violations, _links }` — follow-up scope.
 //
 // Design constraints (project rules):
 //   - Pure FP style: iterator combinators, no for loops, no control-flow ifs.
@@ -42,21 +48,30 @@ use crate::ast::Object;
 use crate::rmap::{self, TableColumn, TableDef};
 use crate::types::{Domain, StateMachineDef};
 
-/// Compile state into an OpenAPI 3.1 JSON document.
+/// Compile state into an OpenAPI 3.1 JSON document for one App.
 ///
 /// Public entry point matching the solidity/fpga generator signature.
 /// Reconstructs the domain from state, runs RMAP, and composes the
-/// OpenAPI document from the resulting TableDefs.
-pub fn compile_to_openapi(state: &Object) -> String {
+/// OpenAPI document from the resulting TableDefs, with the App's
+/// identity baked into the document's `info` section.
+pub fn compile_to_openapi(state: &Object, app_name: &str) -> String {
     let domain = crate::compile::state_to_domain(state);
-    openapi_for_domain(&domain).to_string()
+    openapi_for_app(&domain, app_name).to_string()
 }
 
-/// Build the OpenAPI 3.1 document as a `serde_json::Value`.
+/// Build the OpenAPI 3.1 document for one App as a `serde_json::Value`.
 ///
-/// `pub(crate)` so `compile.rs` can register the document cell under the
-/// `openapi` generator opt-in without round-tripping through state.
-pub(crate) fn openapi_for_domain(domain: &Domain) -> serde_json::Value {
+/// An App is the unit of API product identity — the `info.title` is the
+/// App, the `info.description` comes from the App's instance facts when
+/// declared. Nouns and paths are drawn from the full compile: today
+/// there is no structured noun→domain mapping, so every entity in the
+/// compile contributes to every App's document. Future work can narrow
+/// this via `Domain belongs to App` + a noun→domain trace, at which
+/// point the per-App cell will specialize further.
+///
+/// `pub(crate)` so `compile.rs` can register the document cell without
+/// round-tripping through state for every App.
+pub(crate) fn openapi_for_app(domain: &Domain, app_name: &str) -> serde_json::Value {
     let tables = rmap::rmap(domain);
     let tables_by_entity: HashMap<String, &TableDef> = tables.iter()
         .map(|t| (t.name.clone(), t))
@@ -81,7 +96,8 @@ pub(crate) fn openapi_for_domain(domain: &Domain) -> serde_json::Value {
 
     // Paths per Theorem 4 (HATEOAS as Projection). For each entity with a
     // RMAP-derived table, emit the canonical CRUD routes. Follow-up work
-    // adds transition routes (Theorem 4a) and navigation links.
+    // adds related-collection routes (Theorem 4b navigation) and the
+    // `{data, derived, violations, _links}` response envelope.
     let paths: serde_json::Map<String, serde_json::Value> = domain.nouns.iter()
         .filter(|(_, n)| n.object_type == "entity")
         .filter(|(name, _)| {
@@ -95,18 +111,32 @@ pub(crate) fn openapi_for_domain(domain: &Domain) -> serde_json::Value {
         })
         .collect();
 
+    let app_description = app_description(domain, app_name)
+        .unwrap_or_else(|| format!("Compiled from FORML2 readings for App '{}'.", app_name));
+
     serde_json::json!({
         "openapi": "3.1.0",
         "info": {
-            "title": "AREST",
+            "title": app_name,
             "version": "1.0.0",
-            "description": "Compiled from FORML2 readings by the AREST engine.",
+            "description": app_description,
         },
         "paths": paths,
         "components": {
             "schemas": schemas,
         },
     })
+}
+
+/// Look up an App's description from `App has Description` instance
+/// facts. Returns `None` when no description fact is present; the
+/// caller chooses its own fallback sentence.
+fn app_description(domain: &Domain, app_name: &str) -> Option<String> {
+    domain.general_instance_facts.iter()
+        .find(|f| f.subject_noun == "App"
+            && f.subject_value == app_name
+            && f.field_name == "Description")
+        .map(|f| f.object_value.clone())
 }
 
 /// Resolve the plural slug for a noun.
@@ -332,7 +362,7 @@ mod tests {
 
     #[test]
     fn empty_domain_emits_valid_openapi_3_1_document() {
-        let doc = openapi_for_domain(&Domain::default());
+        let doc = openapi_for_app(&Domain::default(), "test-app");
 
         assert_eq!(doc["openapi"], "3.1.0");
         assert_eq!(doc["info"]["version"], "1.0.0");
@@ -368,7 +398,7 @@ mod tests {
     fn entity_schema_properties_come_from_rmap_table_columns() {
         let domain = organization_with_slug();
 
-        let doc = openapi_for_domain(&domain);
+        let doc = openapi_for_app(&domain, "test-app");
         let schema = &doc["components"]["schemas"]["Organization"];
 
         assert_eq!(schema["type"], "object");
@@ -399,7 +429,7 @@ mod tests {
         // `Noun has Plural` instance fact overrides it.
         let domain = organization_with_slug();
 
-        let doc = openapi_for_domain(&domain);
+        let doc = openapi_for_app(&domain, "test-app");
         let paths = doc["paths"].as_object()
             .expect("paths must be an object");
 
@@ -438,7 +468,7 @@ mod tests {
             object_value: "orgs".into(),
         });
 
-        let doc = openapi_for_domain(&domain);
+        let doc = openapi_for_app(&domain, "test-app");
         let paths = doc["paths"].as_object()
             .expect("paths must be an object");
 
@@ -477,7 +507,7 @@ mod tests {
             }],
         });
 
-        let doc = openapi_for_domain(&domain);
+        let doc = openapi_for_app(&domain, "test-app");
         let paths = doc["paths"].as_object()
             .expect("paths must be an object");
 
@@ -503,7 +533,7 @@ mod tests {
         // that cannot be fulfilled — the handler would 404 on every call.
         let domain = organization_with_slug();
 
-        let doc = openapi_for_domain(&domain);
+        let doc = openapi_for_app(&domain, "test-app");
         let paths = doc["paths"].as_object()
             .expect("paths must be an object");
 
@@ -516,28 +546,38 @@ mod tests {
     }
 
     #[test]
-    fn openapi_generator_is_gated_by_opt_in() {
-        use std::collections::HashSet;
-
+    fn openapi_generator_is_app_scoped_opt_in() {
+        // Generators are App-scoped: `App 'X' uses Generator 'openapi'.`
+        // The opt-in is an instance fact on the App, carried through the
+        // compile as a fact in the `App_uses_Generator` cell. Without
+        // that fact, no openapi:* cells are emitted. With it, exactly one
+        // `openapi:{snake(app-slug)}` cell is emitted per opted-in App.
         let mut domain = organization_with_slug();
         domain.domain = "test".into();
-        let state = crate::parse_forml2::domain_to_state(&domain);
+        let base_state = crate::parse_forml2::domain_to_state(&domain);
 
-        crate::compile::set_active_generators(HashSet::new());
-        let defs_without = crate::compile::compile_to_defs_state(&state);
+        let defs_without = crate::compile::compile_to_defs_state(&base_state);
         assert!(
             !defs_without.iter().any(|(k, _)| k.starts_with("openapi:")),
-            "openapi:* cells must not appear without opt-in"
+            "openapi:* cells must not appear without an App opt-in fact; got keys: {:?}",
+            defs_without.iter().filter(|(k, _)| k.starts_with("openapi:")).map(|(k, _)| k).collect::<Vec<_>>()
         );
 
-        let active: HashSet<String> = std::iter::once("openapi".to_string()).collect();
-        crate::compile::set_active_generators(active);
-        let defs_with = crate::compile::compile_to_defs_state(&state);
+        // Opt in: push `{App: 'sherlock', Generator: 'openapi'}` into
+        // the `App_uses_Generator` cell that main.rs populates from the
+        // raw `App 'X' uses Generator 'Y'` regex capture.
+        let opt_in_state = crate::ast::cell_push(
+            "App_uses_Generator",
+            crate::ast::fact_from_pairs(&[("App", "sherlock"), ("Generator", "openapi")]),
+            &base_state,
+        );
+
+        let defs_with = crate::compile::compile_to_defs_state(&opt_in_state);
         assert!(
-            defs_with.iter().any(|(k, _)| k == "openapi:document"),
-            "openapi:document cell must exist when 'openapi' is opted in"
+            defs_with.iter().any(|(k, _)| k == "openapi:sherlock"),
+            "openapi:sherlock cell must exist when 'App sherlock uses Generator openapi' \
+             is asserted; got openapi:* keys: {:?}",
+            defs_with.iter().filter(|(k, _)| k.starts_with("openapi:")).map(|(k, _)| k).collect::<Vec<_>>()
         );
-
-        crate::compile::set_active_generators(HashSet::new());
     }
 }
