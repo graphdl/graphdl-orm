@@ -308,6 +308,10 @@ fn scratch_needed(func: &Func) -> u32 {
         // lower_to_wasm) to stash the divisor across the zero-check
         // branch — it doesn't count toward the i32 scratch budget.
         Func::Add | Func::Sub | Func::Mul | Func::Div => 1,
+        // Comparisons share the arithmetic unpack: one pair_slot,
+        // both operands on the WASM stack, i64 compare, extend to
+        // i64, alloc_atom.
+        Func::Eq | Func::Gt | Func::Lt | Func::Ge | Func::Le => 1,
         _ => 0,
     }
 }
@@ -329,6 +333,24 @@ fn emit_binary_i64_arith(body: &mut Function, pair_slot: u32, op: Instruction<'s
     body.instruction(&Instruction::I64Load(i64_at(8)));
     // stack: [a, b] — apply op.
     body.instruction(&op);
+    body.instruction(&Instruction::Call(FN_ALLOC_ATOM));
+}
+
+/// Emit a binary i64 comparison (Eq, Gt, Lt, Ge, Le). Consumes the
+/// pair Seq, loads both operands, applies the i64 compare (which
+/// returns i32 0/1), zero-extends to i64, and wraps as an Atom so
+/// the result can flow into Compose/Condition/ApplyToAll like any
+/// other Object.
+fn emit_binary_i64_compare(body: &mut Function, pair_slot: u32, cmp: Instruction<'static>) {
+    body.instruction(&Instruction::LocalSet(pair_slot));
+    body.instruction(&Instruction::LocalGet(pair_slot));
+    body.instruction(&Instruction::I32Load(i32_at(8)));
+    body.instruction(&Instruction::I64Load(i64_at(8)));
+    body.instruction(&Instruction::LocalGet(pair_slot));
+    body.instruction(&Instruction::I32Load(i32_at(12)));
+    body.instruction(&Instruction::I64Load(i64_at(8)));
+    body.instruction(&cmp);
+    body.instruction(&Instruction::I64ExtendI32U);
     body.instruction(&Instruction::Call(FN_ALLOC_ATOM));
 }
 
@@ -421,6 +443,15 @@ fn emit_body(
         Func::Sub => emit_binary_i64_arith(body, next_scratch, Instruction::I64Sub),
         Func::Mul => emit_binary_i64_arith(body, next_scratch, Instruction::I64Mul),
         Func::Div => emit_binary_i64_div(body, next_scratch, div_i64_slot),
+
+        // Backus §11.2.3 comparisons — all signed, all on pair Atoms.
+        // Result is an i64 Atom holding 0 (false) or 1 (true); this
+        // slots naturally into Condition/Filter's truthy check.
+        Func::Eq => emit_binary_i64_compare(body, next_scratch, Instruction::I64Eq),
+        Func::Gt => emit_binary_i64_compare(body, next_scratch, Instruction::I64GtS),
+        Func::Lt => emit_binary_i64_compare(body, next_scratch, Instruction::I64LtS),
+        Func::Ge => emit_binary_i64_compare(body, next_scratch, Instruction::I64GeS),
+        Func::Le => emit_binary_i64_compare(body, next_scratch, Instruction::I64LeS),
 
         // c̄:x = c (when x ≠ ⊥) — drop input ptr, allocate fresh Atom.
         Func::Constant(Object::Atom(s)) => {
@@ -884,10 +915,10 @@ mod tests {
 
     #[test]
     fn lower_rejects_unsupported_variant() {
-        // Eq isn't wired yet — comparison on pair is the next
-        // pattern (unpack, i64 compare, alloc_atom with 0 or 1).
-        let f = Func::Eq;
-        let err = lower_to_wasm(&f).expect_err("Eq should be marked unsupported");
+        // And isn't wired yet — logical ops over pair/unary Atoms
+        // (same pattern as comparisons but through truthy() first).
+        let f = Func::And;
+        let err = lower_to_wasm(&f).expect_err("And should be marked unsupported");
         assert!(err.contains("not yet supported"));
     }
 
@@ -1326,6 +1357,75 @@ mod tests {
         ]);
         let f = Func::Compose(Box::new(Func::Add), Box::new(outer_pair));
         assert_eq!(roundtrip(&f, 0), 6);
+    }
+
+    // ── Comparisons (binary on pair) ──────────────────────────────
+
+    #[test]
+    fn lower_eq_returns_one_for_equal_pair_zero_otherwise() {
+        let eq_pair = |a: i64, b: i64| Func::Compose(Box::new(Func::Eq), Box::new(pair(a, b)));
+        assert_eq!(roundtrip(&eq_pair(5, 5), 0), 1);
+        assert_eq!(roundtrip(&eq_pair(5, 6), 0), 0);
+        assert_eq!(roundtrip(&eq_pair(-3, -3), 0), 1);
+    }
+
+    #[test]
+    fn lower_gt_is_signed_strictly_greater_than() {
+        let gt = |a: i64, b: i64| Func::Compose(Box::new(Func::Gt), Box::new(pair(a, b)));
+        assert_eq!(roundtrip(&gt(10, 3), 0), 1);
+        assert_eq!(roundtrip(&gt(3, 10), 0), 0);
+        assert_eq!(roundtrip(&gt(5, 5), 0), 0);       // strict
+        assert_eq!(roundtrip(&gt(-1, -2), 0), 1);     // signed compare
+    }
+
+    #[test]
+    fn lower_lt_is_signed_strictly_less_than() {
+        let lt = |a: i64, b: i64| Func::Compose(Box::new(Func::Lt), Box::new(pair(a, b)));
+        assert_eq!(roundtrip(&lt(3, 10), 0), 1);
+        assert_eq!(roundtrip(&lt(10, 3), 0), 0);
+        assert_eq!(roundtrip(&lt(5, 5), 0), 0);
+        assert_eq!(roundtrip(&lt(-2, -1), 0), 1);
+    }
+
+    #[test]
+    fn lower_ge_is_signed_greater_or_equal() {
+        let ge = |a: i64, b: i64| Func::Compose(Box::new(Func::Ge), Box::new(pair(a, b)));
+        assert_eq!(roundtrip(&ge(10, 3), 0), 1);
+        assert_eq!(roundtrip(&ge(5, 5), 0), 1);       // equal is true
+        assert_eq!(roundtrip(&ge(3, 10), 0), 0);
+    }
+
+    #[test]
+    fn lower_le_is_signed_less_or_equal() {
+        let le = |a: i64, b: i64| Func::Compose(Box::new(Func::Le), Box::new(pair(a, b)));
+        assert_eq!(roundtrip(&le(3, 10), 0), 1);
+        assert_eq!(roundtrip(&le(5, 5), 0), 1);
+        assert_eq!(roundtrip(&le(10, 3), 0), 0);
+    }
+
+    #[test]
+    fn lower_comparison_feeds_condition_naturally() {
+        // Condition(Gt, Constant 100, Constant 200) ∘ <input, threshold>
+        // Returns 100 if input > threshold else 200. Proves the {0,1}
+        // Atom produced by Gt flows through Condition's truthy check.
+        let f = Func::Compose(
+            Box::new(Func::Condition(
+                Box::new(Func::Gt),
+                Box::new(Func::Constant(Object::atom("100"))),
+                Box::new(Func::Constant(Object::atom("200"))),
+            )),
+            Box::new(pair(7, 5)),
+        );
+        assert_eq!(roundtrip(&f, 0), 100);
+        let f2 = Func::Compose(
+            Box::new(Func::Condition(
+                Box::new(Func::Gt),
+                Box::new(Func::Constant(Object::atom("100"))),
+                Box::new(Func::Constant(Object::atom("200"))),
+            )),
+            Box::new(pair(3, 5)),
+        );
+        assert_eq!(roundtrip(&f2, 0), 200);
     }
 
     // ── Insert ────────────────────────────────────────────────────
