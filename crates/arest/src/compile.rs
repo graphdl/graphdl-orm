@@ -582,6 +582,37 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
         (format!("validate:{}", ft_id), Func::compose(Func::Concat, Func::construction(funcs)))
     }));
 
+    // Per-noun aggregate validate — concat only the per-FT validates for
+    // fact types the noun participates in. Lets create/update/transition
+    // handlers pay O(FTs-touching-noun) instead of O(all constraints).
+    // For the metamodel that's ~5–10 FTs per noun vs 345 bulk constraints.
+    //
+    // Key is `validate:{noun}`. Collision with `validate:{ft_id}` is
+    // avoided because FT ids are reading-derived snake_case strings
+    // (e.g. `Order_was_placed_by_Customer`) while noun names are single
+    // terms (possibly with spaces). Fallback path in callers still
+    // resolves to the bulk `validate` def when the per-noun key is
+    // absent — safe under any future compile that skips this step.
+    let noun_to_fts: HashMap<String, HashSet<String>> = domain.fact_types.iter()
+        .flat_map(|(ft_id, ft)| ft.roles.iter()
+            .map(|r| (r.noun_name.clone(), ft_id.clone()))
+            .collect::<Vec<_>>())
+        .fold(HashMap::new(), |mut m, (n, ft)| {
+            m.entry(n).or_default().insert(ft);
+            m
+        });
+    defs.extend(noun_to_fts.into_iter().map(|(noun, fts)| {
+        let calls: Vec<Func> = fts.into_iter()
+            .map(|ft| Func::Def(format!("validate:{}", ft)))
+            .collect();
+        let func = match calls.len() {
+            0 => Func::constant(Object::phi()),
+            1 => calls.into_iter().next().unwrap(),
+            _ => Func::compose(Func::Concat, Func::construction(calls)),
+        };
+        (format!("validate:{}", noun), func)
+    }));
+
     // State machines -> named definitions — α(sm → <func_def, initial_def>)
     defs.extend(model.state_machines.iter().flat_map(|sm| [
         (format!("machine:{}", sm.noun_name), sm.func.clone()),

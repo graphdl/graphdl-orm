@@ -611,9 +611,18 @@ fn create_via_defs(
         }
     };
 
-    // ── validate: ρ(validate) applied to population ────────────────
+    // ── validate: ρ(validate:{noun}) applied to population ─────────
+    // Prefer the per-noun aggregate that runs only the constraints
+    // spanning fact types this noun participates in. Bulk `validate`
+    // remains as a fallback for compile-states that haven't emitted
+    // the per-noun def (e.g. older cached state).
     let ctx_obj = ast::encode_eval_context_state("", None, &derived_state);
-    let violation_obj = ast::apply(&ast::Func::Def("validate".to_string()), &ctx_obj, d);
+    let validate_key = format!("validate:{}", noun);
+    let validate_fn = match ast::fetch(&validate_key, d) {
+        ast::Object::Bottom => ast::Func::Def("validate".to_string()),
+        _                   => ast::Func::Def(validate_key),
+    };
+    let violation_obj = ast::apply(&validate_fn, &ctx_obj, d);
     let violations = ast::decode_violations(&violation_obj);
     let rejected = violations.iter().any(|v| v.alethic);
 
@@ -828,8 +837,14 @@ fn update_via_defs(
         .map(|(n, f)| (n.as_str(), f)).collect();
     let (new_state, derived) = crate::evaluate::forward_chain_defs_state(&derivation_defs, &new_state);
 
+    // Prefer per-noun validate aggregate (O(FTs-touching-noun)) over the
+    // bulk validate (O(all constraints)). Falls back to bulk when the
+    // per-noun def is absent.
     let ctx_obj = ast::encode_eval_context_state("", None, &new_state);
-    let validate_func = def_func("validate", d).unwrap_or(ast::Func::constant(ast::Object::phi()));
+    let validate_key = format!("validate:{}", noun);
+    let validate_func = def_func(&validate_key, d)
+        .or_else(|| def_func("validate", d))
+        .unwrap_or(ast::Func::constant(ast::Object::phi()));
     let violation_obj = ast::apply(&validate_func, &ctx_obj, d);
     let violations = ast::decode_violations(&violation_obj);
     let rejected = violations.iter().any(|v| v.alethic);
