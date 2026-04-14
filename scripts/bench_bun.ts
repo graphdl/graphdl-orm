@@ -37,23 +37,27 @@ for (const fx of FIXTURES) {
   const bytes = readFileSync(path)
   const mod = new WebAssembly.Module(bytes)
   const instance = new WebAssembly.Instance(mod)
-  const apply = instance.exports.apply as (x: bigint) => bigint
+  // apply returns an i32 pointer into linear memory. Each call resets
+  // the heap at entry, so the returned ptr is valid until the next call.
+  // The bench treats the ptr as a black-box scalar for timing; the
+  // memory export is unused here.
+  const apply = instance.exports.apply as (x: bigint) => number
 
   // Warmup to let V8 JIT-optimise the call path.
-  let warmup = 0n
+  let warmup = 0
   for (let i = 0; i < 100_000; i++) {
     warmup += apply(fx.input)
   }
   // Black-box the warmup result so the compiler can't dead-code it.
-  if (warmup === 999999999999n) console.log('should never hit')
+  if (warmup === 999999999) console.log('should never hit')
 
   const t0 = Bun.nanoseconds()
-  let acc = 0n
+  let acc = 0
   for (let i = 0; i < ITERATIONS; i++) {
     acc += apply(fx.input)
   }
   const dt = Bun.nanoseconds() - t0
-  if (acc === 999999999999n) console.log('should never hit')
+  if (acc === 999999999) console.log('should never hit')
 
   const ns_per_op = dt / ITERATIONS
   const ops_per_sec = 1_000_000_000 / ns_per_op
