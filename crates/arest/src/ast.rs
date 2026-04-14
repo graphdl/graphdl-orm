@@ -632,11 +632,176 @@ fn normalize_step(f: &Func) -> Func {
     }
 }
 
+// ── Apply-variant profiler ──────────────────────────────────────────
+//
+// Opt-in, thread-local accounting of Func::apply calls. Off by default
+// so normal callers pay a single TLS read per apply. When enabled, each
+// apply records its variant name, call count, and cumulative wall-clock
+// nanoseconds. Consumers call `profile_enable`, run a representative
+// workload, then `profile_snapshot` to read a descending-by-time
+// histogram. `profile_reset` clears the counters between measurements.
+//
+// Wall-clock is measured with std::time::Instant (panics on wasm32);
+// profiling is therefore a no-op on the wasm target via cfg gating.
+
+#[cfg(not(target_arch = "wasm32"))]
+mod profile {
+    use std::cell::{Cell, RefCell};
+    use std::collections::HashMap;
+
+    thread_local! {
+        pub(super) static ENABLED: Cell<bool> = const { Cell::new(false) };
+        pub(super) static STATS: RefCell<HashMap<&'static str, (u64, u64)>> =
+            RefCell::new(HashMap::new());
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[inline]
+fn profile_enabled() -> bool { profile::ENABLED.with(|c| c.get()) }
+
+#[cfg(target_arch = "wasm32")]
+#[inline]
+fn profile_enabled() -> bool { false }
+
+#[cfg(not(target_arch = "wasm32"))]
+fn profile_record(variant: &'static str, ns: u64) {
+    profile::STATS.with(|m| {
+        let mut map = m.borrow_mut();
+        let e = map.entry(variant).or_insert((0u64, 0u64));
+        e.0 += 1;
+        e.1 += ns;
+    });
+}
+
+/// Turn on the apply-variant profiler for this thread.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn profile_enable() { profile::ENABLED.with(|c| c.set(true)); }
+#[cfg(target_arch = "wasm32")]
+pub fn profile_enable() {}
+
+/// Turn off the apply-variant profiler for this thread.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn profile_disable() { profile::ENABLED.with(|c| c.set(false)); }
+#[cfg(target_arch = "wasm32")]
+pub fn profile_disable() {}
+
+/// Clear accumulated apply counts for this thread.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn profile_reset() { profile::STATS.with(|m| m.borrow_mut().clear()); }
+#[cfg(target_arch = "wasm32")]
+pub fn profile_reset() {}
+
+/// Read a `(variant, count, total_ns)` histogram sorted descending by
+/// total_ns. Empty on wasm or when the profiler was never enabled.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn profile_snapshot() -> Vec<(&'static str, u64, u64)> {
+    profile::STATS.with(|m| {
+        let mut v: Vec<_> = m.borrow().iter().map(|(k, (c, t))| (*k, *c, *t)).collect();
+        v.sort_by(|a, b| b.2.cmp(&a.2));
+        v
+    })
+}
+#[cfg(target_arch = "wasm32")]
+pub fn profile_snapshot() -> Vec<(&'static str, u64, u64)> { Vec::new() }
+
+/// Pretty-print the current snapshot to stderr. Useful inside tests
+/// after running a representative workload.
+pub fn profile_dump() {
+    let snap = profile_snapshot();
+    let total_ns: u64 = snap.iter().map(|(_, _, t)| t).sum();
+    let total_n:  u64 = snap.iter().map(|(_, c, _)| c).sum();
+    eprintln!("[profile] apply-variant histogram ({} calls, {}ms total):",
+        total_n, total_ns / 1_000_000);
+    snap.iter().for_each(|(name, count, ns)| {
+        let pct = if total_ns > 0 { *ns as f64 * 100.0 / total_ns as f64 } else { 0.0 };
+        let avg_ns = if *count > 0 { ns / count } else { 0 };
+        eprintln!("  {:<18} {:>10} calls   {:>10}µs   {:>6.2}%   avg {}ns",
+            name, count, ns / 1_000, pct, avg_ns);
+    });
+}
+
+/// Readable discriminant for a Func variant. Used by the profiler so
+/// histogram entries are grouped by variant rather than by the boxed
+/// children they carry.
+fn variant_name(f: &Func) -> &'static str {
+    match f {
+        Func::Id => "Id",
+        Func::Selector(_) => "Selector",
+        Func::Tail => "Tail",
+        Func::AtomTest => "AtomTest",
+        Func::NullTest => "NullTest",
+        Func::Eq => "Eq",
+        Func::Gt => "Gt",
+        Func::Lt => "Lt",
+        Func::Ge => "Ge",
+        Func::Le => "Le",
+        Func::Contains => "Contains",
+        Func::Lower => "Lower",
+        Func::Length => "Length",
+        Func::Concat => "Concat",
+        Func::DistL => "DistL",
+        Func::DistR => "DistR",
+        Func::Trans => "Trans",
+        Func::ApndL => "ApndL",
+        Func::Reverse => "Reverse",
+        Func::ApndR => "ApndR",
+        Func::RotL => "RotL",
+        Func::RotR => "RotR",
+        Func::Add => "Add",
+        Func::Sub => "Sub",
+        Func::Mul => "Mul",
+        Func::Div => "Div",
+        Func::And => "And",
+        Func::Or => "Or",
+        Func::Not => "Not",
+        Func::Fetch => "Fetch",
+        Func::Store => "Store",
+        Func::Constant(_) => "Constant",
+        Func::Compose(_, _) => "Compose",
+        Func::Construction(_) => "Construction",
+        Func::Condition(_, _, _) => "Condition",
+        Func::ApplyToAll(_) => "ApplyToAll",
+        Func::Insert(_) => "Insert",
+        Func::BinaryToUnary(_, _) => "BinaryToUnary",
+        Func::Filter(_) => "Filter",
+        Func::While(_, _) => "While",
+        Func::FoldL(_) => "FoldL",
+        Func::Def(_) => "Def",
+        Func::Platform(_) => "Platform",
+        Func::Native(_) => "Native",
+    }
+}
+
 pub fn apply(func: &Func, x: &Object, d: &Object) -> Object {
     // All functions are bottom-preserving: ⊥ propagates unchanged.
-    match x.is_bottom() {
-        true => Object::Bottom,
-        false => apply_nonbottom(func, x, d),
+    // The profiler wraps the body when enabled. The TLS-read branch is
+    // one predictable load per call — measured no-op overhead on the
+    // hot path when profiling is off.
+    if !profile_enabled() {
+        return match x.is_bottom() {
+            true => Object::Bottom,
+            false => apply_nonbottom(func, x, d),
+        };
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let name = variant_name(func);
+        let t = std::time::Instant::now();
+        let result = match x.is_bottom() {
+            true => Object::Bottom,
+            false => apply_nonbottom(func, x, d),
+        };
+        profile_record(name, t.elapsed().as_nanos() as u64);
+        result
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        match x.is_bottom() {
+            true => Object::Bottom,
+            false => apply_nonbottom(func, x, d),
+        }
     }
 }
 
@@ -4724,6 +4889,37 @@ mod tests {
             }
             other => panic!("all-constants Construction must fold to Constant(Seq), got {:?}", other),
         }
+    }
+
+    #[test]
+    fn profile_snapshot_records_apply_variants() {
+        // Smoke test for the apply-variant profiler. Enable, run a
+        // tiny workload that exercises at least three variants
+        // (Selector, Construction, Constant), then read the snapshot
+        // and assert each variant appears. Disable cleanly so later
+        // tests aren't polluted.
+        profile_reset();
+        profile_enable();
+        let d = Object::phi();
+        let x = Object::Seq(vec![Object::atom("a"), Object::atom("b")]);
+        // Each of these triggers the corresponding apply-branch once.
+        let _ = apply(&Func::Selector(1), &x, &d);
+        let _ = apply(&Func::Constant(Object::atom("c")), &x, &d);
+        let _ = apply(
+            &Func::Construction(vec![Func::Selector(1), Func::Selector(2)]),
+            &x, &d,
+        );
+        profile_disable();
+        let snap = profile_snapshot();
+        let seen: std::collections::HashSet<&str> = snap.iter().map(|(n, _, _)| *n).collect();
+        assert!(seen.contains("Selector"),  "Selector must appear in histogram; got {:?}", seen);
+        assert!(seen.contains("Constant"),  "Constant must appear in histogram; got {:?}", seen);
+        assert!(seen.contains("Construction"), "Construction must appear; got {:?}", seen);
+        let total_calls: u64 = snap.iter().map(|(_, c, _)| c).sum();
+        assert!(total_calls >= 5,
+            "at least 5 apply calls expected (Construction triggers recursion); got {}",
+            total_calls);
+        profile_reset();
     }
 
     #[test]
