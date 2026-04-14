@@ -140,13 +140,32 @@ export function publish(reg: Registry, event: Omit<CellEvent, 'sequence'>): Cell
   return full
 }
 
+// ── Server-Sent Events encoding ────────────────────────────────────────
+
+/**
+ * Format a CellEvent as an SSE frame.
+ *
+ * `data: <json>\n\n` per the SSE spec. The browser's EventSource API
+ * calls onmessage with the parsed-or-raw JSON on each frame.
+ */
+export function formatSseFrame(event: CellEvent): string {
+  return `data: ${JSON.stringify(event)}\n\n`
+}
+
 // ── Durable Object wrapper ─────────────────────────────────────────────
 
 /**
  * BroadcastDO — the runtime wrapper around the pure registry.
  *
- * A single instance per scope. Callers interact via the methods below;
- * the DO runtime serialises access so the registry itself does not
+ * A single instance per scope. Exposes two entry points:
+ * - RPC methods (subscribe/unsubscribe/publish/listSubscribers) for
+ *   in-process code that wants programmatic access.
+ * - A fetch() handler that opens an SSE response stream bound to a
+ *   freshly-created subscription. When the client disconnects
+ *   (request.signal.abort), the subscription is dropped and the
+ *   stream is closed.
+ *
+ * The DO runtime serialises access so the registry itself does not
  * need internal locking.
  */
 export class BroadcastDO extends DurableObject {
@@ -155,6 +174,62 @@ export class BroadcastDO extends DurableObject {
   constructor(ctx: DurableObjectState, env: unknown) {
     super(ctx, env)
     this.registry = createRegistry()
+  }
+
+  /**
+   * GET /events?domain=X&noun=Y&entityId=Z
+   *
+   * Opens an SSE stream bound to a subscription matching the query
+   * filter. Closes the stream and unsubscribes on client disconnect.
+   * The worker's /api/events route forwards here via doStub.fetch().
+   */
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url)
+    const domain = url.searchParams.get('domain')
+    if (!domain) {
+      return new Response('domain query parameter required', { status: 400 })
+    }
+    const noun = url.searchParams.get('noun') ?? undefined
+    const entityId = url.searchParams.get('entityId') ?? undefined
+
+    const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>()
+    const writer = writable.getWriter()
+    const encoder = new TextEncoder()
+
+    // Callback: encode the event as an SSE frame and write to the
+    // stream. If the write fails (stream closed by client), drop the
+    // subscription — best-effort cleanup since the abort handler
+    // below also catches most cases.
+    let subscriptionId = ''
+    const callback: SubscriberCallback = (event) => {
+      writer.write(encoder.encode(formatSseFrame(event))).catch(() => {
+        if (subscriptionId) unsubscribe(this.registry, subscriptionId)
+      })
+    }
+
+    subscriptionId = subscribe(this.registry, { domain, noun, entityId }, callback)
+
+    // Open-stream comment so the browser EventSource receives the
+    // connection event immediately, before any data frames arrive.
+    writer.write(encoder.encode(`: connected sub=${subscriptionId}\n\n`))
+      .catch(() => { /* client already gone */ })
+
+    // Client disconnect: the request's abort signal fires. Drop the
+    // subscription and close the writer so the transform stream
+    // ends. Multiple disconnect signals are idempotent.
+    request.signal.addEventListener('abort', () => {
+      unsubscribe(this.registry, subscriptionId)
+      writer.close().catch(() => {})
+    })
+
+    return new Response(readable, {
+      headers: {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache, no-transform',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no',
+      },
+    })
   }
 
   /** Register a subscriber; returns the subscription id. */

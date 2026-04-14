@@ -6,6 +6,7 @@ import {
   listSubscribers,
   matches,
   publish,
+  formatSseFrame,
   type CellEvent,
   type SubscriptionFilter,
 } from './broadcast-do'
@@ -154,6 +155,27 @@ describe('BroadcastDO registry', () => {
       unsubscribe(reg, id)
       publish(reg, makeEvent())
       expect(received).toEqual([0])
+    })
+  })
+
+  describe('formatSseFrame', () => {
+    it('emits a single data frame with trailing blank line per SSE spec', () => {
+      const evt: CellEvent = { ...makeEvent(), sequence: 7 }
+      const frame = formatSseFrame(evt)
+      expect(frame.startsWith('data: ')).toBe(true)
+      expect(frame.endsWith('\n\n')).toBe(true)
+      // Single data line — no multi-line splits on newlines in JSON
+      const dataLines = frame.split('\n').filter(l => l.startsWith('data:'))
+      expect(dataLines).toHaveLength(1)
+    })
+
+    it('encodes the CellEvent as JSON in the data field', () => {
+      const evt: CellEvent = { ...makeEvent({ entityId: 'sherlock' }), sequence: 2 }
+      const frame = formatSseFrame(evt)
+      const jsonPart = frame.replace(/^data: /, '').replace(/\n\n$/, '')
+      const parsed = JSON.parse(jsonPart)
+      expect(parsed.entityId).toBe('sherlock')
+      expect(parsed.sequence).toBe(2)
     })
   })
 })

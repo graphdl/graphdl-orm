@@ -207,6 +207,23 @@ function appCellSuffix(app: string): string {
   return out
 }
 
+// ── Live event stream (SSE) per docs/11 §Signals ──────────────────────
+//
+// GET /api/events?domain=X&noun=Y&entityId=Z opens a persistent
+// text/event-stream. The worker forwards the request to BroadcastDO,
+// which opens the stream and registers a subscription matching the
+// query filter. Every post-mutation hook (#114) publishes into the DO;
+// matching subscribers receive data frames.
+//
+// Narrower filters receive fewer events. `domain` is required; `noun`
+// restricts to one noun type; `entityId` restricts to one entity.
+router.get('/api/events', (request, env: Env) => {
+  const broadcast = env.BROADCAST.get(env.BROADCAST.idFromName('global')) as unknown as {
+    fetch(req: Request): Promise<Response>
+  }
+  return broadcast.fetch(request)
+})
+
 router.get('/api/openapi.json', async (request, env: Env) => {
   const url = new URL(request.url)
   const app = url.searchParams.get('app')
