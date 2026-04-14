@@ -24,8 +24,8 @@
 #![cfg(feature = "wasm-lower")]
 
 use wasm_encoder::{
-    CodeSection, ExportKind, ExportSection, Function, FunctionSection, Instruction,
-    Module, TypeSection, ValType,
+    BlockType, CodeSection, ExportKind, ExportSection, Function, FunctionSection,
+    Instruction, Module, TypeSection, ValType,
 };
 
 use crate::ast::{Func, Object};
@@ -58,15 +58,45 @@ pub fn lower_to_wasm(func: &Func) -> Result<Vec<u8>, String> {
     // Convention: emit_body always leaves the result on the stack
     // and consumes its single i64 input from the stack. The outer
     // wrapper pushes the argument once at the start.
+    //
+    // Scratch locals: Condition needs to hold x across a branch
+    // (p consumes it, then f or g needs it again). A pre-walk counts
+    // the maximum simultaneous scratch depth; locals are declared
+    // upfront so the function body is well-typed.
+    let scratch = scratch_needed(func);
+    let locals: Vec<(u32, ValType)> = if scratch > 0 {
+        vec![(scratch, ValType::I64)]
+    } else {
+        vec![]
+    };
     let mut codes = CodeSection::new();
-    let mut body = Function::new([]);
+    let mut body = Function::new(locals);
     body.instruction(&Instruction::LocalGet(0));
-    emit_body(func, &mut body)?;
+    emit_body(func, &mut body, 1)?;
     body.instruction(&Instruction::End);
     codes.function(&body);
     module.section(&codes);
 
     Ok(module.finish())
+}
+
+/// Count the maximum number of simultaneously-live scratch locals
+/// the body will need. Condition is the only variant that requires
+/// scratch: it must stash x across p so f/g can see it again.
+///
+/// Sibling subterms (Compose's f/g; Condition's p/f/g) run at
+/// disjoint times and therefore share scratch slots — we only need
+/// the *max* of their requirements, not the sum.
+fn scratch_needed(func: &Func) -> u32 {
+    match func {
+        Func::Compose(f, g) => scratch_needed(f).max(scratch_needed(g)),
+        Func::Condition(p, f, g) => {
+            1 + scratch_needed(p)
+                .max(scratch_needed(f))
+                .max(scratch_needed(g))
+        }
+        _ => 0,
+    }
 }
 
 /// Emit instructions that consume one i64 from the stack and leave
@@ -76,7 +106,12 @@ pub fn lower_to_wasm(func: &Func) -> Result<Vec<u8>, String> {
 /// `f(g(x))` on the stack without any intermediate local. Each Func
 /// variant implements its own transformation; the outer
 /// `lower_to_wasm` pushes the initial argument once.
-fn emit_body(func: &Func, body: &mut Function) -> Result<(), String> {
+///
+/// `next_scratch` is the first free i64 local index. Subterms that
+/// need temporaries (currently only Condition) claim one slot and
+/// pass `next_scratch + 1` to their children, so nested Conditions
+/// get distinct slots without colliding.
+fn emit_body(func: &Func, body: &mut Function, next_scratch: u32) -> Result<(), String> {
     match func {
         // id:x = x — input on stack is already the output.
         Func::Id => { /* noop */ }
@@ -96,8 +131,38 @@ fn emit_body(func: &Func, body: &mut Function) -> Result<(), String> {
         // emit g (consumes input, leaves g(x)), then emit f
         // (consumes g(x), leaves f(g(x))).
         Func::Compose(f, g) => {
-            emit_body(g, body)?;
-            emit_body(f, body)?;
+            emit_body(g, body, next_scratch)?;
+            emit_body(f, body, next_scratch)?;
+        }
+
+        // Backus §11.2.4 Condition: (p → f; g):x = if p:x then f:x else g:x.
+        // p consumes x and returns a predicate, but then f or g needs x
+        // *again*. We stash x into a scratch local (tee), run p against
+        // the copy on the stack, branch on p's result, and restore x
+        // from the scratch before emitting the chosen branch.
+        //
+        // Truthiness convention for the i64-stack PoC: any non-zero i64
+        // is true, zero is false. Real Object truthiness (Object::phi
+        // is false, anything else is true) requires the linear-memory
+        // representation; this matches it for the numeric subset we
+        // lower today.
+        Func::Condition(p, f, g) => {
+            let my = next_scratch;
+            // Stash x (stack → local my) while keeping a copy on the
+            // stack for p to consume.
+            body.instruction(&Instruction::LocalTee(my));
+            emit_body(p, body, my + 1)?;
+            // p left an i64 predicate on the stack; `if` needs an i32
+            // condition. Compare-not-equal-to-zero yields i32 {0,1}.
+            body.instruction(&Instruction::I64Const(0));
+            body.instruction(&Instruction::I64Ne);
+            body.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+            body.instruction(&Instruction::LocalGet(my));
+            emit_body(f, body, my + 1)?;
+            body.instruction(&Instruction::Else);
+            body.instruction(&Instruction::LocalGet(my));
+            emit_body(g, body, my + 1)?;
+            body.instruction(&Instruction::End);
         }
 
         other => return Err(format!("wasm_lower: variant not yet supported: {:?}",
@@ -188,6 +253,108 @@ mod tests {
             Box::new(Func::Constant(Object::atom("11"))),
         );
         assert_eq!(roundtrip(&f, 0), 9);
+    }
+
+    #[test]
+    fn lower_condition_with_constant_true_predicate_takes_f_branch() {
+        // (Constant(1) → Constant(42); Constant(99)):x = 42 for any x.
+        // Predicate drops x and pushes 1 (non-zero → truthy); f branch
+        // drops the restored x and pushes 42.
+        let f = Func::Condition(
+            Box::new(Func::Constant(Object::atom("1"))),
+            Box::new(Func::Constant(Object::atom("42"))),
+            Box::new(Func::Constant(Object::atom("99"))),
+        );
+        assert_eq!(roundtrip(&f, 0), 42);
+        assert_eq!(roundtrip(&f, -7), 42);
+        assert_eq!(roundtrip(&f, 1_000_000), 42);
+    }
+
+    #[test]
+    fn lower_condition_with_constant_false_predicate_takes_g_branch() {
+        // (Constant(0) → Constant(42); Constant(99)):x = 99 for any x.
+        // Zero predicate selects the else branch.
+        let f = Func::Condition(
+            Box::new(Func::Constant(Object::atom("0"))),
+            Box::new(Func::Constant(Object::atom("42"))),
+            Box::new(Func::Constant(Object::atom("99"))),
+        );
+        assert_eq!(roundtrip(&f, 0), 99);
+        assert_eq!(roundtrip(&f, 42), 99);
+    }
+
+    #[test]
+    fn lower_condition_with_id_predicate_branches_on_input() {
+        // (Id → Constant(1); Constant(0)):x = sign-like indicator.
+        // x != 0 → 1, x == 0 → 0. Proves x is threaded through to the
+        // branches via the scratch local, not lost after p consumes it.
+        let f = Func::Condition(
+            Box::new(Func::Id),
+            Box::new(Func::Constant(Object::atom("1"))),
+            Box::new(Func::Constant(Object::atom("0"))),
+        );
+        assert_eq!(roundtrip(&f, 42), 1);
+        assert_eq!(roundtrip(&f, -1), 1);    // non-zero is truthy
+        assert_eq!(roundtrip(&f, 0), 0);
+    }
+
+    #[test]
+    fn lower_condition_restores_x_for_branch_body() {
+        // (Id → Id; Constant(-1)):x = x if x != 0 else -1.
+        // Critical test: the f branch is Id, which returns whatever is
+        // on the stack. If the scratch-restore is broken, we'd get
+        // garbage / the predicate's leftover / a trap. Correct output
+        // proves x is put back on the stack before f runs.
+        let f = Func::Condition(
+            Box::new(Func::Id),
+            Box::new(Func::Id),
+            Box::new(Func::Constant(Object::atom("-1"))),
+        );
+        assert_eq!(roundtrip(&f, 7), 7);
+        assert_eq!(roundtrip(&f, 999), 999);
+        assert_eq!(roundtrip(&f, 0), -1);
+    }
+
+    #[test]
+    fn lower_condition_nests_without_scratch_collision() {
+        // (Id → (Id → Constant(11); Constant(22)); Constant(33)):x
+        //   x == 0  → 33     (outer else)
+        //   x != 0  → 11     (outer then + inner then; inner sees x from scratch)
+        // The inner Condition must allocate a distinct scratch slot
+        // from the outer, otherwise restoring x in the inner branches
+        // would overwrite (or read back) the outer's stashed value.
+        let inner = Func::Condition(
+            Box::new(Func::Id),
+            Box::new(Func::Constant(Object::atom("11"))),
+            Box::new(Func::Constant(Object::atom("22"))),
+        );
+        let f = Func::Condition(
+            Box::new(Func::Id),
+            Box::new(inner),
+            Box::new(Func::Constant(Object::atom("33"))),
+        );
+        assert_eq!(roundtrip(&f, 5), 11);     // outer-then, inner-then
+        assert_eq!(roundtrip(&f, -3), 11);    // same path (non-zero)
+        assert_eq!(roundtrip(&f, 0), 33);     // outer-else
+    }
+
+    #[test]
+    fn lower_condition_over_compose_chains_cleanly() {
+        // Compose(Condition(Id, Constant(100), Constant(200)), Id):x
+        //   Id:x = x  →  Condition picks 100 if x != 0 else 200.
+        // Exercises the Condition-inside-Compose path (scratch is
+        // allocated only while Condition is emitting; Id outside the
+        // Condition claims no scratch).
+        let f = Func::Compose(
+            Box::new(Func::Condition(
+                Box::new(Func::Id),
+                Box::new(Func::Constant(Object::atom("100"))),
+                Box::new(Func::Constant(Object::atom("200"))),
+            )),
+            Box::new(Func::Id),
+        );
+        assert_eq!(roundtrip(&f, 1), 100);
+        assert_eq!(roundtrip(&f, 0), 200);
     }
 
     /// Benchmark + fixture writer. `#[ignore]`'d so normal cargo test
