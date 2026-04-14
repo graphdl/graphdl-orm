@@ -207,26 +207,20 @@ use crate::ast::{Func, Object};
 /// Input: eval context <response, sender, population>
 /// Output: <fact1, fact2, ...> or phi
 fn extract_facts_func(ft_id: &str) -> Func {
-    // sel(3) -> population
-    // Filter(eq  .  [sel(1), ft_id]) -> matching fact type entries
-    // (null -> phi; sel(2)  .  sel(1)) -> get facts from first match, or phi
-    let find_ft = Func::filter(
-        Func::compose(
-            Func::Eq,
-            Func::construction(vec![
-                Func::Selector(1),
-                Func::constant(Object::atom(ft_id)),
-            ]),
-        ),
-    );
-
-    let get_facts_or_phi = Func::condition(
-        Func::NullTest,
-        Func::constant(Object::phi()),
-        Func::compose(Func::Selector(2), Func::Selector(1)),
-    );
-
-    Func::compose(get_facts_or_phi, Func::compose(find_ft, Func::Selector(3)))
+    // sel(4) -> indexed population (Object::Map keyed by ft_id)
+    // FetchOrPhi:<ft_id, indexed_pop> -> facts seq, or phi if absent
+    //
+    // Replaces the old Filter+Eq linear scan over Selector(3) with a
+    // single O(1) HashMap lookup. The old form fired ~5M times per
+    // create on metamodel-scale workloads (profile 0ea23a9); the new
+    // form is a constant-time Fetch.
+    Func::compose(
+        Func::FetchOrPhi,
+        Func::construction(vec![
+            Func::constant(Object::atom(ft_id)),
+            Func::Selector(4),
+        ]),
+    )
 }
 
 /// Extract facts from a population Object directly (no eval context wrapper).

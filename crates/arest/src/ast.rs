@@ -238,7 +238,36 @@ pub fn encode_eval_context_state(text: &str, sender: Option<&str>, state: &Objec
         None => Object::phi(),
     };
     let pop_obj = encode_state(state);
-    Object::seq(vec![response_obj, sender_obj, pop_obj])
+    // O(1)-lookup form of the population. Walks the same cells as
+    // pop_obj (filtering out def cells) but emits an Object::Map keyed
+    // by ft_id. Used by extract_facts_func via Func::FetchOrPhi at
+    // Selector(4). The Seq form at Selector(3) is preserved verbatim
+    // so existing constraint funcs and tests that read it keep working.
+    let pop_indexed = encode_state_indexed(state);
+    Object::seq(vec![response_obj, sender_obj, pop_obj, pop_indexed])
+}
+
+/// Indexed form of the population for O(1) cell access.
+///
+/// Same filtering and per-fact encoding as `encode_state`, but emitted
+/// as `Object::Map` keyed by ft_id. Constraint funcs that look up a
+/// specific fact type pay one HashMap lookup instead of scanning the
+/// full Seq.
+pub fn encode_state_indexed(state: &Object) -> Object {
+    let map: HashMap<String, Object> = cells_iter(state).into_iter()
+        .filter(|(ft_id, _)| !ft_id.contains(':'))
+        .map(|(ft_id, contents)| {
+            let fact_objs: Vec<Object> = contents.as_seq().map(|facts| {
+                facts.iter().map(|fact| {
+                    let bindings: Vec<Object> = fact.as_seq().map(|pairs| {
+                        pairs.iter().cloned().collect::<Vec<Object>>()
+                    }).unwrap_or_default();
+                    Object::Seq(bindings)
+                }).collect::<Vec<Object>>()
+            }).unwrap_or_default();
+            (ft_id.to_string(), Object::Seq(fact_objs))
+        }).collect();
+    Object::Map(map)
 }
 
 /// Encode an Object state in the flat format expected by constraint evaluation.
@@ -408,7 +437,16 @@ pub enum Func {
 
     // ── Cells (Backus 14.3) ─────────────────────────────────────
     /// Fetch: ↑n:<name, D> → contents of cell named name in D
+    /// Returns ⊥ for missing names. Use FetchOrPhi when downstream code
+    /// must not propagate ⊥ through Construction (which would void
+    /// unrelated computations sharing the parent expression).
     Fetch,
+    /// FetchOrPhi: like Fetch but returns φ (empty seq) when the name is
+    /// absent. Used by indexed fact-type lookup so a missing FT cell
+    /// (no instances of that type yet) yields an empty fact list rather
+    /// than ⊥. Drops the Filter+Eq linear scan that extract_facts_func
+    /// previously needed.
+    FetchOrPhi,
     /// Store: ↓n:<name, contents, D> → D' with cell name updated
     Store,
 
@@ -749,6 +787,7 @@ fn variant_name(f: &Func) -> &'static str {
         Func::Or => "Or",
         Func::Not => "Not",
         Func::Fetch => "Fetch",
+        Func::FetchOrPhi => "FetchOrPhi",
         Func::Store => "Store",
         Func::Constant(_) => "Constant",
         Func::Compose(_, _) => "Compose",
@@ -997,6 +1036,18 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
         Func::Sub => apply_arithmetic(x, |a, b| Some(a - b)),
         Func::Mul => apply_arithmetic(x, |a, b| Some(a * b)),
         Func::Div => apply_arithmetic(x, |a, b| if b == 0.0 { None } else { Some(a / b) }),
+
+        Func::FetchOrPhi => {
+            // fetch_or_phi:<name, D> → fetch with phi fallback for absent.
+            // O(1) on Object::Map, O(n) scan on Object::Seq.
+            match x.as_seq() {
+                Some(items) if items.len() == 2 => match items[0].as_atom() {
+                    Some(name) => fetch_or_phi(name, &items[1]),
+                    None => Object::Bottom,
+                },
+                _ => Object::Bottom,
+            }
+        }
 
         Func::Fetch => {
             // fetch:<name, D> → contents of cell named name in D
@@ -1972,6 +2023,7 @@ pub mod primitives {
     pub const OR: &str = "or";
     pub const NOT: &str = "not";
     pub const FETCH: &str = "^";
+    pub const FETCH_OR_PHI: &str = "^?";
     pub const STORE: &str = "v";
     pub const CONTAINS: &str = "in";
     pub const LOWER: &str = "lc";
@@ -2263,6 +2315,7 @@ fn metacompose_atom(name: &str, d: &Object) -> Func {
         primitives::OR => Func::Or,
         primitives::NOT => Func::Not,
         primitives::FETCH => Func::Fetch,
+        primitives::FETCH_OR_PHI => Func::FetchOrPhi,
         primitives::STORE => Func::Store,
         // Platform primitives: "platform:compile", "platform:apply_command", ...
         s if s.starts_with("platform:") => Func::Platform(s["platform:".len()..].to_string()),
@@ -2387,6 +2440,7 @@ pub fn func_to_object(func: &Func) -> Object {
         Func::Or => Object::atom(primitives::OR),
         Func::Not => Object::atom(primitives::NOT),
         Func::Fetch => Object::atom(primitives::FETCH),
+        Func::FetchOrPhi => Object::atom(primitives::FETCH_OR_PHI),
         Func::Store => Object::atom(primitives::STORE),
         Func::Constant(x) => Object::seq(vec![Object::atom(forms::CONST), x.clone()]),
         Func::Compose(f, g) => Object::seq(vec![
@@ -2707,6 +2761,7 @@ impl fmt::Debug for Func {
             Func::Or => write!(f, "or"),
             Func::Not => write!(f, "not"),
             Func::Fetch => write!(f, "↑"),
+            Func::FetchOrPhi => write!(f, "↑?"),
             Func::Store => write!(f, "↓"),
             Func::Constant(obj) => write!(f, "{:?}̄", obj),
             Func::Compose(g, h) => write!(f, "({:?} ∘ {:?})", g, h),
