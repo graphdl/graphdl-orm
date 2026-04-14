@@ -54,10 +54,14 @@ pub fn lower_to_wasm(func: &Func) -> Result<Vec<u8>, String> {
     exports.export("apply", ExportKind::Func, 0);
     module.section(&exports);
 
-    // Code section: emit the body for this Func.
+    // Code section: load arg → emit body → end.
+    // Convention: emit_body always leaves the result on the stack
+    // and consumes its single i64 input from the stack. The outer
+    // wrapper pushes the argument once at the start.
     let mut codes = CodeSection::new();
     let mut body = Function::new([]);
-    emit_func(func, &mut body)?;
+    body.instruction(&Instruction::LocalGet(0));
+    emit_body(func, &mut body)?;
     body.instruction(&Instruction::End);
     codes.function(&body);
     module.section(&codes);
@@ -65,27 +69,37 @@ pub fn lower_to_wasm(func: &Func) -> Result<Vec<u8>, String> {
     Ok(module.finish())
 }
 
-/// Emit the WASM instructions for a single Func into `body`.
-/// Assumes the argument (input x) is locals[0] — the WASM param
-/// auto-populated from the caller's argument. Leaves the result
-/// on the stack; the caller adds the End instruction.
-fn emit_func(func: &Func, body: &mut Function) -> Result<(), String> {
+/// Emit instructions that consume one i64 from the stack and leave
+/// one i64 on the stack — the stack-discipline lowering convention.
+///
+/// This convention makes Compose trivial: `emit(g); emit(f)` leaves
+/// `f(g(x))` on the stack without any intermediate local. Each Func
+/// variant implements its own transformation; the outer
+/// `lower_to_wasm` pushes the initial argument once.
+fn emit_body(func: &Func, body: &mut Function) -> Result<(), String> {
     match func {
-        // id:x = x — load the argument, leave on the stack.
-        Func::Id => {
-            body.instruction(&Instruction::LocalGet(0));
-        }
-        // c̄:x = c (when x ≠ ⊥) — discard input, push the constant.
-        // PoC restricts the constant to an Object::Atom that parses
-        // as i64 (the only value type the emitted function type
-        // supports today). Anything else is an error the caller
-        // surfaces; the production compiler will have richer
-        // marshalling via linear memory.
+        // id:x = x — input on stack is already the output.
+        Func::Id => { /* noop */ }
+
+        // c̄:x = c (when x ≠ ⊥) — drop the input, push the literal.
+        // PoC restricts the constant to i64-valued atoms; full
+        // Object marshalling via linear memory is follow-up.
         Func::Constant(Object::Atom(s)) => {
             let n: i64 = s.parse()
                 .map_err(|_| format!("Constant atom must parse as i64 for PoC: got {:?}", s))?;
+            body.instruction(&Instruction::Drop);
             body.instruction(&Instruction::I64Const(n));
         }
+
+        // Backus §11.2.4 Composition: (f ∘ g):x = f:(g:x).
+        // Stack discipline makes this just concatenation —
+        // emit g (consumes input, leaves g(x)), then emit f
+        // (consumes g(x), leaves f(g(x))).
+        Func::Compose(f, g) => {
+            emit_body(g, body)?;
+            emit_body(f, body)?;
+        }
+
         other => return Err(format!("wasm_lower: variant not yet supported: {:?}",
             std::mem::discriminant(other))),
     }
@@ -138,10 +152,42 @@ mod tests {
 
     #[test]
     fn lower_rejects_unsupported_variant() {
-        // Compose isn't wired yet — must error, not panic.
-        let f = Func::Compose(Box::new(Func::Id), Box::new(Func::Id));
-        let err = lower_to_wasm(&f).expect_err("Compose should be marked unsupported");
+        // Construction isn't wired yet — must error, not panic.
+        let f = Func::Construction(vec![Func::Id, Func::Id]);
+        let err = lower_to_wasm(&f).expect_err("Construction should be marked unsupported");
         assert!(err.contains("not yet supported"));
+    }
+
+    #[test]
+    fn lower_compose_emits_chained_body() {
+        // Compose(Constant(7), Id) : x = Constant(7):(Id:x) = 7.
+        // Proves the stack-discipline emission concatenates correctly.
+        let f = Func::Compose(
+            Box::new(Func::Constant(Object::atom("7"))),
+            Box::new(Func::Id),
+        );
+        assert_eq!(roundtrip(&f, 42), 7);
+        assert_eq!(roundtrip(&f, -1), 7);
+    }
+
+    #[test]
+    fn lower_compose_of_two_ids_is_identity() {
+        // (id ∘ id):x = x. Double-wraps the input through the
+        // stack-discipline pipeline without touching the value.
+        let f = Func::Compose(Box::new(Func::Id), Box::new(Func::Id));
+        assert_eq!(roundtrip(&f, 42), 42);
+        assert_eq!(roundtrip(&f, -7), -7);
+    }
+
+    #[test]
+    fn lower_compose_constant_over_constant_returns_outer() {
+        // Compose(Constant(A), Constant(B)):x = A.
+        // Each Constant drops its input; the outer's result wins.
+        let f = Func::Compose(
+            Box::new(Func::Constant(Object::atom("9"))),
+            Box::new(Func::Constant(Object::atom("11"))),
+        );
+        assert_eq!(roundtrip(&f, 0), 9);
     }
 
     /// Benchmark + fixture writer. `#[ignore]`'d so normal cargo test
