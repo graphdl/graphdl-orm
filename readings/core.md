@@ -165,7 +165,8 @@ Fact Type has Role.
   Each Fact Type has some Role.
   For each Role, exactly one Fact Type has that Role.
   It is possible that some Fact Type has more than one Role.
-Fact Type has Arity.
+Fact Type has Arity *.
+  Each Fact Type has exactly one Arity.
 Fact Type has Order.
   Each Fact Type has at most one Order.
 Fact Type has Role Relationship.
@@ -305,13 +306,13 @@ Derivation Rule has Text.
 Derivation Rule has antecedent Fact Type.
 Derivation Rule produces Fact Type.
   Each Derivation Rule produces exactly one Fact Type.
-Derivation Rule depends on Derivation Rule
-  := Derivation Rule has antecedent Fact Type
-     and some other Derivation Rule produces that Fact Type.
+Derivation Rule depends on Derivation Rule *.
 
 ## Derivation Rules
 
-Fact Type has Arity := count of Role where Fact Type has Role.
+* Fact Type has Arity iff Arity is the count of Role where Fact Type has Role.
+
+* Derivation Rule depends on Derivation Rule iff Derivation Rule has antecedent Fact Type and some other Derivation Rule produces that Fact Type.
 
 Constraint is semantic iff Constraint has modality of Modality Type 'Deontic' and Constraint spans some Role and that Role is played by some Noun and no Resource is instance of that Noun.
 
