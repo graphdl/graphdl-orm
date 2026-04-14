@@ -280,6 +280,13 @@ fn scratch_needed(func: &Func) -> u32 {
             // slot.
             4 + scratch_needed(f)
         }
+        Func::Filter(p) => {
+            // Filter needs six slots: index, length, input seq ptr,
+            // output seq ptr, kept count, and a stash for the current
+            // element (since p consumes it but we also need it to
+            // store into the output on the truthy branch).
+            6 + scratch_needed(p)
+        }
         _ => 0,
     }
 }
@@ -464,6 +471,105 @@ fn emit_body(func: &Func, body: &mut Function, next_scratch: u32) -> Result<(), 
             body.instruction(&Instruction::LocalGet(out_slot));
         }
 
+        // AREST.tex eq. (filter-def): Filter(p) ≡ compact ∘ α(p → id; ⊥).
+        // Keep only elements where p is truthy.
+        //
+        // Strategy: over-allocate an output Seq at the upper bound
+        // (len of input), write tag immediately, then loop and
+        // append kept elements. After the loop, patch the length
+        // field to the kept count. The heap tail beyond the length
+        // is leaked but correct — a future compact pass can reclaim
+        // by decrementing heap_ptr. PoC-level.
+        //
+        // Scratch usage:
+        //   i_slot    = next_scratch     : loop index
+        //   len_slot  = next_scratch + 1 : input length
+        //   in_slot   = next_scratch + 2 : input seq ptr
+        //   out_slot  = next_scratch + 3 : output seq ptr
+        //   kept_slot = next_scratch + 4 : count of kept elements
+        //   elem_slot = next_scratch + 5 : current element ptr (stashed
+        //                                  so both p(elem) and the
+        //                                  truthy-branch store can see it)
+        //   ≥ next_scratch + 6           : free for child p
+        Func::Filter(p) => {
+            let i_slot = next_scratch;
+            let len_slot = next_scratch + 1;
+            let in_slot = next_scratch + 2;
+            let out_slot = next_scratch + 3;
+            let kept_slot = next_scratch + 4;
+            let elem_slot = next_scratch + 5;
+            // Stash input seq ptr.
+            body.instruction(&Instruction::LocalSet(in_slot));
+            // len = input.length
+            body.instruction(&Instruction::LocalGet(in_slot));
+            body.instruction(&Instruction::I32Load(i32_at(4)));
+            body.instruction(&Instruction::LocalSet(len_slot));
+            // Alloc upper bound: header + 4 * len.
+            body.instruction(&Instruction::I32Const(SEQ_HEADER_SIZE));
+            body.instruction(&Instruction::LocalGet(len_slot));
+            body.instruction(&Instruction::I32Const(4));
+            body.instruction(&Instruction::I32Mul);
+            body.instruction(&Instruction::I32Add);
+            body.instruction(&Instruction::Call(FN_ALLOC));
+            body.instruction(&Instruction::LocalTee(out_slot));
+            // tag = SEQ (still have out_slot on stack from tee).
+            body.instruction(&Instruction::I32Const(TAG_SEQ));
+            body.instruction(&Instruction::I32Store(i32_at(0)));
+            // kept = 0, i = 0
+            body.instruction(&Instruction::I32Const(0));
+            body.instruction(&Instruction::LocalSet(kept_slot));
+            body.instruction(&Instruction::I32Const(0));
+            body.instruction(&Instruction::LocalSet(i_slot));
+            // Loop
+            body.instruction(&Instruction::Block(BlockType::Empty));
+            body.instruction(&Instruction::Loop(BlockType::Empty));
+            body.instruction(&Instruction::LocalGet(i_slot));
+            body.instruction(&Instruction::LocalGet(len_slot));
+            body.instruction(&Instruction::I32GeS);
+            body.instruction(&Instruction::BrIf(1));
+            // Load elem_ptr = in_seq[i]; stash to elem_slot and keep
+            // on stack for p to consume.
+            body.instruction(&Instruction::LocalGet(in_slot));
+            body.instruction(&Instruction::LocalGet(i_slot));
+            body.instruction(&Instruction::I32Const(4));
+            body.instruction(&Instruction::I32Mul);
+            body.instruction(&Instruction::I32Add);
+            body.instruction(&Instruction::I32Load(i32_at(SEQ_HEADER_SIZE as u64)));
+            body.instruction(&Instruction::LocalTee(elem_slot));
+            // emit p : consumes elem ptr, leaves predicate Object ptr.
+            emit_body(p, body, next_scratch + 6)?;
+            body.instruction(&Instruction::Call(FN_TRUTHY));
+            body.instruction(&Instruction::If(BlockType::Empty));
+            // Store elem at out[kept].
+            body.instruction(&Instruction::LocalGet(out_slot));
+            body.instruction(&Instruction::LocalGet(kept_slot));
+            body.instruction(&Instruction::I32Const(4));
+            body.instruction(&Instruction::I32Mul);
+            body.instruction(&Instruction::I32Add);
+            body.instruction(&Instruction::LocalGet(elem_slot));
+            body.instruction(&Instruction::I32Store(i32_at(SEQ_HEADER_SIZE as u64)));
+            // kept += 1
+            body.instruction(&Instruction::LocalGet(kept_slot));
+            body.instruction(&Instruction::I32Const(1));
+            body.instruction(&Instruction::I32Add);
+            body.instruction(&Instruction::LocalSet(kept_slot));
+            body.instruction(&Instruction::End); // end if
+            // i += 1
+            body.instruction(&Instruction::LocalGet(i_slot));
+            body.instruction(&Instruction::I32Const(1));
+            body.instruction(&Instruction::I32Add);
+            body.instruction(&Instruction::LocalSet(i_slot));
+            body.instruction(&Instruction::Br(0));
+            body.instruction(&Instruction::End); // end loop
+            body.instruction(&Instruction::End); // end block
+            // Patch length: out.length = kept
+            body.instruction(&Instruction::LocalGet(out_slot));
+            body.instruction(&Instruction::LocalGet(kept_slot));
+            body.instruction(&Instruction::I32Store(i32_at(4)));
+            // Leave out_seq on stack.
+            body.instruction(&Instruction::LocalGet(out_slot));
+        }
+
         other => return Err(format!("wasm_lower: variant not yet supported: {:?}",
             std::mem::discriminant(other))),
     }
@@ -561,12 +667,11 @@ mod tests {
 
     #[test]
     fn lower_rejects_unsupported_variant() {
-        // Filter isn't wired yet — must error, not panic. (The
-        // compact+α(p→id;⊥) pattern from AREST.tex needs a way to
-        // allocate a shorter output seq than the input, which our
-        // one-pass loop doesn't yet emit.)
-        let f = Func::Filter(Box::new(Func::Id));
-        let err = lower_to_wasm(&f).expect_err("Filter should be marked unsupported");
+        // Insert isn't wired yet — must error, not panic. Backus's
+        // /f fold requires building a 2-elem pair each iteration
+        // to feed to the binary f, which we haven't emitted yet.
+        let f = Func::Insert(Box::new(Func::Id));
+        let err = lower_to_wasm(&f).expect_err("Insert should be marked unsupported");
         assert!(err.contains("not yet supported"));
     }
 
@@ -812,6 +917,81 @@ mod tests {
         assert_eq!(read_u32(&data, ptr), TAG_SEQ as u32, "result is a Seq");
         assert_eq!(read_u32(&data, ptr + 4), 3, "length=3");
         assert_eq!(roundtrip_seq(&f, 0), vec![10, 20, 30]);
+    }
+
+    // ── Filter ────────────────────────────────────────────────────
+
+    #[test]
+    fn lower_filter_constant_true_predicate_keeps_all() {
+        // Filter(Constant 1) ∘ <10, 20, 30>:x = <10, 20, 30>.
+        let f = Func::Compose(
+            Box::new(Func::Filter(Box::new(Func::Constant(Object::atom("1"))))),
+            Box::new(Func::Construction(vec![
+                Func::Constant(Object::atom("10")),
+                Func::Constant(Object::atom("20")),
+                Func::Constant(Object::atom("30")),
+            ])),
+        );
+        assert_eq!(roundtrip_seq(&f, 0), vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn lower_filter_constant_false_predicate_keeps_none() {
+        // Filter(Constant 0) ∘ <10, 20>:x = <>. length patches to 0.
+        let f = Func::Compose(
+            Box::new(Func::Filter(Box::new(Func::Constant(Object::atom("0"))))),
+            Box::new(Func::Construction(vec![
+                Func::Constant(Object::atom("10")),
+                Func::Constant(Object::atom("20")),
+            ])),
+        );
+        assert_eq!(roundtrip_seq(&f, 0), Vec::<i64>::new());
+    }
+
+    #[test]
+    fn lower_filter_id_keeps_nonzero_atoms() {
+        // Filter(Id) ∘ <0, 7, 0, 5, 0>:x = <7, 5>.
+        // Id passes the Atom through to truthy, which checks value != 0.
+        // Exercises partial-keep + length patch-back to 2.
+        let f = Func::Compose(
+            Box::new(Func::Filter(Box::new(Func::Id))),
+            Box::new(Func::Construction(vec![
+                Func::Constant(Object::atom("0")),
+                Func::Constant(Object::atom("7")),
+                Func::Constant(Object::atom("0")),
+                Func::Constant(Object::atom("5")),
+                Func::Constant(Object::atom("0")),
+            ])),
+        );
+        assert_eq!(roundtrip_seq(&f, 0), vec![7, 5]);
+    }
+
+    #[test]
+    fn lower_filter_empty_seq() {
+        // Filter(p):<> = <> regardless of p.
+        let f = Func::Compose(
+            Box::new(Func::Filter(Box::new(Func::Id))),
+            Box::new(Func::Construction(vec![])),
+        );
+        assert_eq!(roundtrip_seq(&f, 0), Vec::<i64>::new());
+    }
+
+    #[test]
+    fn lower_filter_patches_length_field_correctly() {
+        // After Filter, tag must be SEQ and length must equal kept
+        // count. Direct layout check so a bug in the length
+        // patch-back doesn't hide behind roundtrip_seq.
+        let f = Func::Compose(
+            Box::new(Func::Filter(Box::new(Func::Id))),
+            Box::new(Func::Construction(vec![
+                Func::Constant(Object::atom("0")),
+                Func::Constant(Object::atom("1")),
+                Func::Constant(Object::atom("2")),
+            ])),
+        );
+        let (ptr, data) = invoke(&f, 0);
+        assert_eq!(read_u32(&data, ptr), TAG_SEQ as u32);
+        assert_eq!(read_u32(&data, ptr + 4), 2, "exactly two truthy atoms");
     }
 
     #[test]
