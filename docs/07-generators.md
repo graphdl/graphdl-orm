@@ -73,6 +73,128 @@ Produces defs named `ilayer:{Noun}` returning a structured object:
 }
 ```
 
+## OpenAPI
+
+OpenAPI 3.1 is the interchange format for REST clients — Swagger/Redoc viewers, typed client generators (openapi-typescript, openapi-generator), and IDE autocompletion. The generator derives the entire document from RMAP output plus the metamodel's fact types and state machines. No hand-written schema, no drift.
+
+Opt in:
+
+```forml2
+App 'myapp' uses Generator 'openapi'.
+```
+
+Produces one def per opted-in App, keyed `openapi:{snake(app-slug)}`. Exposed publicly at:
+
+```
+GET /api/openapi.json?app={app-slug}
+```
+
+### What the document contains
+
+**`components.schemas`** — one entry per entity noun in the compile, plus a shared `Violation` component. Each entity's schema is built from `rmap::rmap(domain)`:
+
+- Columns become `properties`.
+- `!nullable` columns become `required`.
+- Columns with a `references` target emit `$ref: "#/components/schemas/{Target}"` instead of a scalar type.
+- SQL column types map to JSON Schema scalar types (`INTEGER`/`BIGINT`/`SMALLINT` → `integer`, `REAL`/`NUMERIC`/`DECIMAL` → `number`, `BOOLEAN` → `boolean`, everything else → `string`).
+- Value types with declared enum values add `enum` to the property.
+- State machines contribute a `status` property whose enum is the declared status set (read-side projection of `Status is defined in State Machine Definition` — storage is the RMAP column, behaviour lives in the SM).
+
+**`paths`** — two-to-four routes per entity noun per Theorem 4 (HATEOAS as Projection):
+
+Always emitted:
+
+- `GET  /{plural}`         — list, with `Filter(p_live):P` server-side per Corollary 2 (deletion-as-terminal-state).
+- `POST /{plural}`         — create. Request body `$ref`s the noun schema.
+- `GET  /{plural}/{id}`    — read.
+- `PATCH /{plural}/{id}`   — update.
+
+No `DELETE`: per AREST §4.1 and Corollary 2, deletion is a transition to a terminal status, not an erase. The list endpoint filters terminal entities out server-side.
+
+Emitted only when the noun has a State Machine Definition (Theorem 4a — transition links as θ₁ projection):
+
+- `POST /{plural}/{id}/transition`   — fire an event. Request body enumerates every declared transition event; the server no-ops on events invalid from the entity's current status (paper §"machine fold").
+- `GET  /{plural}/{id}/transitions`  — available events from the current status.
+
+Emitted per binary fact type `f` the noun participates in (Theorem 4b navigation):
+
+- `GET  /{plural}/{id}/{other-plural}` — related collection of the co-participating noun. Currently skips ring fact types (same noun on both roles) and collapses multiple binaries between the same pair into one route; #147 adds verb-based disambiguation.
+
+### Plural slug resolution
+
+The path slug defaults to `snake(noun) + "s"` — fine for regular English plurals ("Organization" → "organizations"). Irregulars are declared explicitly:
+
+```forml2
+Noun 'Policy' has Plural 'policies'.
+Noun 'Category' has Plural 'categories'.
+Noun 'Child' has Plural 'children'.
+```
+
+The generator prefers an explicit `Noun has Plural` instance fact over the fallback — facts-all-the-way-down, no dedicated struct field.
+
+### Response envelope — Theorem 5
+
+Every operation's response declares the same four-key envelope per the paper's `repr(e, P, S)`:
+
+```json
+{
+  "data": <noun-row or array of noun-rows>,
+  "derived": { "<rule-name>": <value>, ... },
+  "violations": [ <Violation>, ... ],
+  "_links": {
+    "transitions": [{"event": "...", "href": "...", "method": "POST"}, ...],
+    "navigation": {"<relation>": "<uri>", ...}
+  }
+}
+```
+
+- `data` — the 3NF row (item responses) or an array of rows (list responses). `$ref` to the noun's component schema.
+- `derived` — derivation-rule outputs for this entity. Only on single-entity reads; `additionalProperties: true` so new rules surface without regenerating clients.
+- `violations` — array of `Violation` objects. The `reading` field carries the original FORML 2 sentence verbatim per Corollary 1 — clients can surface the reading to users as an explanation.
+- `_links` — Theorem 4's `links_full(e, n, status(e, P))`: valid transitions plus the navigation URIs.
+
+`data` and `_links` are required; `derived` and `violations` are optional because not every response carries them (paginated list pages often carry neither).
+
+### Violation schema
+
+Declared unconditionally under `components.schemas.Violation`:
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "reading":      { "type": "string" },   // original FORML2 per Cor 1
+    "constraintId": { "type": "string" },
+    "modality":     { "type": "string", "enum": ["alethic", "deontic"] },
+    "detail":       { "type": "string" }
+  },
+  "required": ["reading", "constraintId", "modality"]
+}
+```
+
+When an App's readings load `readings/outcomes.md`, the user's own RMAP-derived `Violation` schema overrides this default — first insertion wins.
+
+### Live updates
+
+Every OpenAPI response represents the state at the moment of the request. For long-lived UIs that want to react to changes, subscribe to the event stream alongside:
+
+```
+GET /api/events?domain={domain}&noun={noun}&entityId={entityId}
+```
+
+Every field is optional (except `domain`) — narrower filters receive fewer events. Server-Sent Events frames carry the `CellEvent` JSON (one event per matching mutation). Wire this to TanStack Query cache invalidation, or a Redux middleware, or an EventSource directly.
+
+Post-mutation hooks in the entity CRUD handlers fire a publish for every committed create/delete; the transition write path fires a `transition` event too. See `src/broadcast-do.ts` and docs/11-system-as-os-kernel.md §Signals.
+
+### Known limitations
+
+Tracked as tasks and explicitly noted in the doc so consumers don't assume they're bugs:
+
+- **#147** Ring binary fact types (e.g. `Employee reports to Employee`) don't emit navigation routes — direction disambiguation needs the verb text. Both sides currently skipped.
+- **#147** Multiple binaries between the same noun pair collapse to one related-collection route via HashSet dedupe. Pick the reading you want to expose first, or follow the task for full disambiguation.
+- **#148** `/{plural}/{id}/explain` (derivation trace) and `/{plural}/{id}/actions` (transition link list as a standalone endpoint) are not yet emitted.
+- **#149** Server handlers still return bare entities. The envelope is the declared contract; handlers catch up as part of #149.
+
 ## XSD
 
 XSD generates an XML Schema Definition with type definitions for each noun. It is useful for SOAP and XML interchange systems.
