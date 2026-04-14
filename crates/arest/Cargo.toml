@@ -34,6 +34,11 @@ debug-def = []
 # / profile_dump become meaningful. Enable via:
 #   cargo test --features profile --lib profile_create_order -- --ignored --nocapture
 profile = []
+# WASM-lowering PoC — gates src/wasm_lower.rs and its wasm-encoder /
+# wasmtime deps. Off by default because wasmtime pulls in a large
+# native-code dependency tree. Run the PoC with:
+#   cargo test --features wasm-lower --lib wasm_lower
+wasm-lower = ["dep:wasm-encoder", "dep:wasmi"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -47,6 +52,19 @@ rayon = { version = "1", optional = true }
 hmac = "0.12"
 sha2 = "0.10"
 subtle = "2"
+# WASM-lowering PoC (task #152). wasm-encoder emits bytes; wasmtime
+# hosts them for the roundtrip test so we can prove semantic
+# equivalence with Rust apply() before investing in the full
+# Func → WASM compiler. Both are opt-in via the `wasm-lower` feature
+# — they pull large native-code dep trees and we don't want every
+# cargo test to pay for them.
+wasm-encoder = { version = "0.230", optional = true }
+# wasmi is a pure-Rust WASM interpreter. Small compile footprint (no
+# cranelift JIT), fine for correctness tests. For performance
+# comparisons use the real V8 / wasmer host at the benchmark site —
+# the wasmi result here only validates that the emitted bytes are
+# semantically equivalent to Rust apply().
+wasmi = { version = "0.50", optional = true }
 
 [dev-dependencies]
 

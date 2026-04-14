@@ -28,6 +28,9 @@ pub mod crypto;
 pub mod generators;
 pub mod quota;
 
+#[cfg(feature = "wasm-lower")]
+pub mod wasm_lower;
+
 #[cfg(feature = "cloudflare")]
 pub mod cloudflare;
 
