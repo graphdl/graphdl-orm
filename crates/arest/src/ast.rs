@@ -555,6 +555,83 @@ pub fn defs_to_state(defs: &[(String, Func)], state: &Object) -> Object {
     Object::Map(map)
 }
 
+/// Rewrite a Func to a smaller equivalent form before reduction.
+///
+/// Implements a subset of Backus (1978) §12 algebraic laws. Each rule is
+/// an observational equivalence: `apply(normalize(f), x, d) == apply(f,
+/// x, d)` for every x and d. The pass is bottom-up — children are
+/// normalized first, then local rewrites are applied once at the root.
+///
+/// Rules implemented:
+///   (III.1)   `id ∘ f → f`  and  `f ∘ id → f`
+///   (fusion)  `α(f) ∘ α(g) → α(f ∘ g)`           — map fusion
+///   (fusion)  `Filter(p) ∘ Filter(q) → Filter(and ∘ [p,q])`
+///   (fold)    `[c̄₁, …, c̄ₙ] → c̄⟨c₁,…,cₙ⟩`         — constant folding
+///
+/// Rules deliberately NOT applied:
+///   - `α(id) → id`                   (differs on atoms: α(id):atom = ⊥, id:atom = atom)
+///   - `c̄ ∘ f → c̄`                   (differs when f:x = ⊥ with x ≠ ⊥)
+/// The paper proves these equivalences but they rely on ⊥-preservation
+/// bounds that the full-domain Func embedding does not respect.
+pub fn normalize(f: &Func) -> Func {
+    let recur = normalize_children(f);
+    normalize_step(&recur)
+}
+
+fn normalize_children(f: &Func) -> Func {
+    match f {
+        Func::Compose(a, b) =>
+            Func::Compose(Box::new(normalize(a)), Box::new(normalize(b))),
+        Func::Construction(fs) =>
+            Func::Construction(fs.iter().map(normalize).collect()),
+        Func::Condition(p, t, e) =>
+            Func::Condition(Box::new(normalize(p)), Box::new(normalize(t)), Box::new(normalize(e))),
+        Func::ApplyToAll(inner) =>
+            Func::ApplyToAll(Box::new(normalize(inner))),
+        Func::Insert(inner) =>
+            Func::Insert(Box::new(normalize(inner))),
+        Func::Filter(p) =>
+            Func::Filter(Box::new(normalize(p))),
+        Func::BinaryToUnary(g, x) =>
+            Func::BinaryToUnary(Box::new(normalize(g)), x.clone()),
+        Func::While(p, body) =>
+            Func::While(Box::new(normalize(p)), Box::new(normalize(body))),
+        Func::FoldL(g) =>
+            Func::FoldL(Box::new(normalize(g))),
+        leaf => leaf.clone(),
+    }
+}
+
+fn normalize_step(f: &Func) -> Func {
+    match f {
+        Func::Compose(a, b) => match (a.as_ref(), b.as_ref()) {
+            (Func::Id, _) => (**b).clone(),
+            (_, Func::Id) => (**a).clone(),
+            (Func::ApplyToAll(inner_f), Func::ApplyToAll(inner_g)) => {
+                let fused = normalize(&Func::Compose(inner_f.clone(), inner_g.clone()));
+                Func::ApplyToAll(Box::new(fused))
+            }
+            (Func::Filter(p), Func::Filter(q)) => {
+                let pred = Func::Compose(
+                    Box::new(Func::And),
+                    Box::new(Func::Construction(vec![(**p).clone(), (**q).clone()])),
+                );
+                Func::Filter(Box::new(normalize(&pred)))
+            }
+            _ => f.clone(),
+        },
+        Func::Construction(fs) if !fs.is_empty()
+            && fs.iter().all(|g| matches!(g, Func::Constant(x) if !matches!(x, Object::Bottom))) => {
+            let items: Vec<Object> = fs.iter().map(|g| match g {
+                Func::Constant(x) => x.clone(),
+                _ => unreachable!(),
+            }).collect();
+            Func::Constant(Object::Seq(items))
+        }
+        _ => f.clone(),
+    }
+}
+
 pub fn apply(func: &Func, x: &Object, d: &Object) -> Object {
     // All functions are bottom-preserving: ⊥ propagates unchanged.
     match x.is_bottom() {
@@ -4568,5 +4645,130 @@ mod tests {
             result.as_atom(),
             Some("⊥ field 'fields' exceeds platform buffer"),
         );
+    }
+
+    // ── normalize() — Backus §12 algebraic rewrite pass ─────────────
+
+    fn sel1() -> Func { Func::Selector(1) }
+    fn sel2() -> Func { Func::Selector(2) }
+
+    #[test]
+    fn normalize_strips_left_identity() {
+        let input = Func::Compose(Box::new(Func::Id), Box::new(sel1()));
+        let out = normalize(&input);
+        assert!(matches!(out, Func::Selector(1)),
+            "id ∘ f must rewrite to f, got {:?}", out);
+    }
+
+    #[test]
+    fn normalize_strips_right_identity() {
+        let input = Func::Compose(Box::new(sel1()), Box::new(Func::Id));
+        let out = normalize(&input);
+        assert!(matches!(out, Func::Selector(1)),
+            "f ∘ id must rewrite to f, got {:?}", out);
+    }
+
+    #[test]
+    fn normalize_fuses_map_composition() {
+        // α(f) ∘ α(g) → α(f ∘ g)
+        let input = Func::Compose(
+            Box::new(Func::ApplyToAll(Box::new(sel1()))),
+            Box::new(Func::ApplyToAll(Box::new(sel2()))),
+        );
+        let out = normalize(&input);
+        match out {
+            Func::ApplyToAll(inner) => match *inner {
+                Func::Compose(_, _) => { /* expected */ }
+                other => panic!("fused map must hold a Compose, got {:?}", other),
+            },
+            other => panic!("map fusion must produce ApplyToAll, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn normalize_fuses_filter_composition() {
+        // Filter(p) ∘ Filter(q) → Filter(and ∘ [p, q])
+        let input = Func::Compose(
+            Box::new(Func::Filter(Box::new(sel1()))),
+            Box::new(Func::Filter(Box::new(sel2()))),
+        );
+        let out = normalize(&input);
+        match out {
+            Func::Filter(inner) => match *inner {
+                Func::Compose(ref a, ref b) => {
+                    assert!(matches!(**a, Func::And), "fused predicate must be and ∘ …");
+                    assert!(matches!(**b, Func::Construction(_)),
+                        "fused predicate must pair the two predicates in a Construction");
+                }
+                other => panic!("fused filter must wrap a Compose, got {:?}", other),
+            },
+            other => panic!("filter fusion must produce Filter, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn normalize_folds_all_constant_construction() {
+        // [c̄₁, c̄₂, c̄₃] → c̄⟨c₁, c₂, c₃⟩
+        let input = Func::Construction(vec![
+            Func::Constant(Object::atom("a")),
+            Func::Constant(Object::atom("b")),
+            Func::Constant(Object::atom("c")),
+        ]);
+        let out = normalize(&input);
+        match out {
+            Func::Constant(Object::Seq(items)) => {
+                assert_eq!(items.len(), 3);
+                assert_eq!(items[0], Object::atom("a"));
+                assert_eq!(items[1], Object::atom("b"));
+                assert_eq!(items[2], Object::atom("c"));
+            }
+            other => panic!("all-constants Construction must fold to Constant(Seq), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn normalize_preserves_semantics_under_apply() {
+        // Observational equivalence: apply(normalize(f), x, d) == apply(f, x, d)
+        // on representative inputs for each rewrite rule.
+        let d = Object::phi();
+        let x_seq3 = Object::Seq(vec![
+            Object::Seq(vec![Object::atom("a0"), Object::atom("a1")]),
+            Object::Seq(vec![Object::atom("b0"), Object::atom("b1")]),
+            Object::Seq(vec![Object::atom("c0"), Object::atom("c1")]),
+        ]);
+        let x_pair = Object::Seq(vec![Object::atom("x"), Object::atom("y")]);
+
+        let cases: Vec<(Func, Object)> = vec![
+            (Func::Compose(Box::new(Func::Id), Box::new(sel1())), x_pair.clone()),
+            (Func::Compose(Box::new(sel1()), Box::new(Func::Id)), x_pair.clone()),
+            (Func::Compose(
+                Box::new(Func::ApplyToAll(Box::new(sel1()))),
+                Box::new(Func::ApplyToAll(Box::new(sel2()))),
+             ), Object::Seq(vec![
+                Object::Seq(vec![Object::Seq(vec![Object::atom("inner-a0"), Object::atom("inner-a1")])]),
+                Object::Seq(vec![Object::Seq(vec![Object::atom("inner-b0"), Object::atom("inner-b1")])]),
+             ])),
+            (Func::Construction(vec![
+                Func::Constant(Object::atom("k1")),
+                Func::Constant(Object::atom("k2")),
+             ]), x_pair.clone()),
+        ];
+
+        for (f, x) in cases {
+            let original = apply(&f, &x, &d);
+            let normalized = apply(&normalize(&f), &x, &d);
+            assert_eq!(original, normalized,
+                "normalize must preserve observational equivalence; f={:?} x={:?}",
+                f, x);
+        }
+        // Also verify the ApplyToAll case with x_seq3 independently — just
+        // asserting it doesn't produce Bottom rules out a class of bugs.
+        let map_comp = Func::Compose(
+            Box::new(Func::ApplyToAll(Box::new(sel1()))),
+            Box::new(Func::ApplyToAll(Box::new(sel2()))),
+        );
+        let before = apply(&map_comp, &x_seq3, &d);
+        let after = apply(&normalize(&map_comp), &x_seq3, &d);
+        assert_eq!(before, after);
     }
 }
