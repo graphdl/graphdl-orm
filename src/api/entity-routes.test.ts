@@ -125,6 +125,60 @@ describe('entity-routes', () => {
     expect(registry.deindexEntity).not.toHaveBeenCalled()
   })
 
+  // ── Broadcast hooks (#114) ──────────────────────────────────────────
+
+  it('handleCreateEntity fires a create event on broadcast when provided', async () => {
+    const stub = { put: vi.fn().mockResolvedValue({ id: 'ord-1', type: 'Order', data: { total: 10 } }), delete: vi.fn() }
+    const registry = { indexEntity: vi.fn().mockResolvedValue(undefined), deindexEntity: vi.fn().mockResolvedValue(undefined) }
+    const broadcast = { publish: vi.fn().mockResolvedValue(undefined) }
+    await handleCreateEntity('Order', 'orders', { total: 10 }, () => stub, registry, 'ord-1', broadcast)
+    expect(broadcast.publish).toHaveBeenCalledWith(expect.objectContaining({
+      domain: 'orders',
+      noun: 'Order',
+      entityId: 'ord-1',
+      operation: 'create',
+      facts: { total: 10 },
+    }))
+  })
+
+  it('handleCreateEntity tolerates broadcast failure — mutation still succeeds', async () => {
+    const stub = { put: vi.fn().mockResolvedValue({ id: 'x', type: 'Noun', data: {} }), delete: vi.fn() }
+    const registry = { indexEntity: vi.fn().mockResolvedValue(undefined), deindexEntity: vi.fn().mockResolvedValue(undefined) }
+    const broadcast = { publish: vi.fn().mockRejectedValue(new Error('do down')) }
+    const result = await handleCreateEntity('Noun', 'tickets', {}, () => stub, registry, 'x', broadcast)
+    expect(result).toEqual({ id: 'x', type: 'Noun' })
+  })
+
+  it('handleCreateEntity skips broadcast when the stub is omitted', async () => {
+    const stub = { put: vi.fn().mockResolvedValue({ id: 'a', type: 'Noun', data: {} }), delete: vi.fn() }
+    const registry = { indexEntity: vi.fn().mockResolvedValue(undefined), deindexEntity: vi.fn().mockResolvedValue(undefined) }
+    // No broadcast arg. Code path must not reference it.
+    const result = await handleCreateEntity('Noun', 'x', {}, () => stub, registry)
+    expect(result.type).toBe('Noun')
+    expect(typeof result.id).toBe('string')
+  })
+
+  it('handleDeleteEntity fires a delete event on broadcast when provided', async () => {
+    const stub = { delete: vi.fn().mockResolvedValue({ id: 'gone' }), put: vi.fn() }
+    const registry = { indexEntity: vi.fn().mockResolvedValue(undefined), deindexEntity: vi.fn().mockResolvedValue(undefined) }
+    const broadcast = { publish: vi.fn().mockResolvedValue(undefined) }
+    await handleDeleteEntity('gone', stub, registry, 'Ticket', 'support', broadcast)
+    expect(broadcast.publish).toHaveBeenCalledWith(expect.objectContaining({
+      domain: 'support',
+      noun: 'Ticket',
+      entityId: 'gone',
+      operation: 'delete',
+    }))
+  })
+
+  it('handleDeleteEntity does NOT publish when cell was not found', async () => {
+    const stub = { delete: vi.fn().mockResolvedValue(null), put: vi.fn() }
+    const registry = { indexEntity: vi.fn().mockResolvedValue(undefined), deindexEntity: vi.fn().mockResolvedValue(undefined) }
+    const broadcast = { publish: vi.fn().mockResolvedValue(undefined) }
+    await handleDeleteEntity('nope', stub, registry, 'Noun', 'x', broadcast)
+    expect(broadcast.publish).not.toHaveBeenCalled()
+  })
+
   // ── populateDepthForEntity ──────────────────────────────────────────
 
   it('populateDepthForEntity resolves Id fields at depth=1', async () => {
