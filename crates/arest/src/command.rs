@@ -829,8 +829,32 @@ fn update_via_defs(
     });
 
     // derive + validate + emit
+    // Noun-gated derivation chain: only run the rules the compile-time
+    // derivation_index says are relevant to this noun. Mirrors create's
+    // gating at L451. For the metamodel that's 8/808 rules vs 808 bulk.
+    let relevant_ids: std::collections::HashSet<String> = {
+        let index_key = format!("derivation_index:{}", noun);
+        let index_obj = ast::fetch(&index_key, d);
+        let value = index_obj.as_seq()
+            .filter(|items| items.len() == 2 && items[0].as_atom() == Some("'"))
+            .and_then(|items| items[1].as_atom())
+            .or_else(|| index_obj.as_atom());
+        value
+            .map(|s| s.split(',').map(|id| id.to_string()).collect())
+            .unwrap_or_default()
+    };
     let derivation_defs_owned: Vec<(String, ast::Func)> = ast::cells_iter(d).into_iter()
         .filter(|(n, _)| n.starts_with("derivation:"))
+        .filter(|(n, _)| {
+            let def_id = n.strip_prefix("derivation:").unwrap_or(n);
+            if !relevant_ids.is_empty() {
+                relevant_ids.contains(def_id)
+                    || n.contains("StateMachine") || n.contains("machine:")
+                    || n.contains("sm_init")
+            } else {
+                true
+            }
+        })
         .map(|(n, contents)| (n.to_string(), ast::metacompose(contents, d)))
         .collect();
     let derivation_defs: Vec<(&str, &ast::Func)> = derivation_defs_owned.iter()
