@@ -3,6 +3,7 @@ import type { Env } from './types'
 
 export { EntityDB } from './entity-do'
 export { RegistryDB } from './registry-do'
+export { BroadcastDO } from './broadcast-do'
 
 /**
  * Auth middleware — blocks direct HTTP access without a valid bearer token.
