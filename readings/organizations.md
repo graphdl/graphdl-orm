@@ -77,14 +77,22 @@ App displays Noun.
 
 App extends App.
 
+Domain depends on Domain.
+
 ## Constraints
 
 If some User owns some Organization and that User is deleted then that Organization is also deleted.
+
+Each App, App combination occurs at most once in the population of App extends App.
+Each Domain, Domain combination occurs at most once in the population of Domain depends on Domain.
 
 ## Ring Constraints
 
 No App extends itself.
 No App may cycle back to itself via one or more traversals through extends.
+
+No Domain depends on itself.
+No Domain may cycle back to itself via one or more traversals through depends on.
 
 ## Derivation Rules
 
