@@ -287,6 +287,13 @@ fn scratch_needed(func: &Func) -> u32 {
             // store into the output on the truthy branch).
             6 + scratch_needed(p)
         }
+        Func::Insert(f) => {
+            // Insert needs five slots: index, length, input seq ptr,
+            // accumulator (the running fold result), and a temporary
+            // pair ptr built fresh each iteration for the binary f
+            // to consume.
+            5 + scratch_needed(f)
+        }
         _ => 0,
     }
 }
@@ -570,6 +577,104 @@ fn emit_body(func: &Func, body: &mut Function, next_scratch: u32) -> Result<(), 
             body.instruction(&Instruction::LocalGet(out_slot));
         }
 
+        // Backus §11.2.4 Insert: (/f):<x₁, …, xₙ> left-folds the Seq
+        // with the binary function f.
+        //
+        //   /f:<>              = φ (null ptr; Backus specifies e(f),
+        //                           an identity we don't know at
+        //                           compile time — use phi for PoC)
+        //   /f:<x>             = x
+        //   /f:<x₁, …, xₙ>     = fold: acc = x₁; for i in 1..n:
+        //                        acc = f:<acc, xᵢ>
+        //
+        // Each iteration allocates a fresh 2-element Seq (the "pair")
+        // to feed to f. The pair lives on the heap arena and is never
+        // reclaimed within a single apply — fine because the arena
+        // resets on the next call.
+        //
+        // Scratch usage:
+        //   i_slot    = next_scratch     : loop index (starts at 1)
+        //   len_slot  = next_scratch + 1 : input length
+        //   in_slot   = next_scratch + 2 : input seq ptr
+        //   acc_slot  = next_scratch + 3 : accumulator ptr
+        //   pair_slot = next_scratch + 4 : scratch 2-elem Seq ptr
+        //   ≥ next_scratch + 5           : free for child f
+        //
+        // Note: len==1 is handled naturally — we init acc to in[0]
+        // and start the loop with i=1, which fails the i<len guard
+        // and falls through, returning acc.
+        Func::Insert(f) => {
+            let i_slot = next_scratch;
+            let len_slot = next_scratch + 1;
+            let in_slot = next_scratch + 2;
+            let acc_slot = next_scratch + 3;
+            let pair_slot = next_scratch + 4;
+            // Stash input, read length.
+            body.instruction(&Instruction::LocalSet(in_slot));
+            body.instruction(&Instruction::LocalGet(in_slot));
+            body.instruction(&Instruction::I32Load(i32_at(4)));
+            body.instruction(&Instruction::LocalSet(len_slot));
+            // len == 0 → return phi; else run the fold and return acc.
+            body.instruction(&Instruction::LocalGet(len_slot));
+            body.instruction(&Instruction::I32Eqz);
+            body.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+            body.instruction(&Instruction::I32Const(0)); // phi
+            body.instruction(&Instruction::Else);
+            // acc = in[0]
+            body.instruction(&Instruction::LocalGet(in_slot));
+            body.instruction(&Instruction::I32Load(i32_at(SEQ_HEADER_SIZE as u64)));
+            body.instruction(&Instruction::LocalSet(acc_slot));
+            // i = 1
+            body.instruction(&Instruction::I32Const(1));
+            body.instruction(&Instruction::LocalSet(i_slot));
+            // Loop: for i in 1..len, acc = f:<acc, in[i]>.
+            body.instruction(&Instruction::Block(BlockType::Empty));
+            body.instruction(&Instruction::Loop(BlockType::Empty));
+            body.instruction(&Instruction::LocalGet(i_slot));
+            body.instruction(&Instruction::LocalGet(len_slot));
+            body.instruction(&Instruction::I32GeS);
+            body.instruction(&Instruction::BrIf(1));
+            // Allocate a 2-element pair. 8 header + 4 * 2 elements = 16 bytes.
+            body.instruction(&Instruction::I32Const(SEQ_HEADER_SIZE + 8));
+            body.instruction(&Instruction::Call(FN_ALLOC));
+            body.instruction(&Instruction::LocalTee(pair_slot));
+            // tag = SEQ
+            body.instruction(&Instruction::I32Const(TAG_SEQ));
+            body.instruction(&Instruction::I32Store(i32_at(0)));
+            // length = 2
+            body.instruction(&Instruction::LocalGet(pair_slot));
+            body.instruction(&Instruction::I32Const(2));
+            body.instruction(&Instruction::I32Store(i32_at(4)));
+            // pair[0] = acc
+            body.instruction(&Instruction::LocalGet(pair_slot));
+            body.instruction(&Instruction::LocalGet(acc_slot));
+            body.instruction(&Instruction::I32Store(i32_at(SEQ_HEADER_SIZE as u64)));
+            // pair[1] = in[i]  (load in_seq + 8 + 4*i)
+            body.instruction(&Instruction::LocalGet(pair_slot));
+            body.instruction(&Instruction::LocalGet(in_slot));
+            body.instruction(&Instruction::LocalGet(i_slot));
+            body.instruction(&Instruction::I32Const(4));
+            body.instruction(&Instruction::I32Mul);
+            body.instruction(&Instruction::I32Add);
+            body.instruction(&Instruction::I32Load(i32_at(SEQ_HEADER_SIZE as u64)));
+            body.instruction(&Instruction::I32Store(i32_at((SEQ_HEADER_SIZE + 4) as u64)));
+            // acc = f(pair)
+            body.instruction(&Instruction::LocalGet(pair_slot));
+            emit_body(f, body, next_scratch + 5)?;
+            body.instruction(&Instruction::LocalSet(acc_slot));
+            // i += 1
+            body.instruction(&Instruction::LocalGet(i_slot));
+            body.instruction(&Instruction::I32Const(1));
+            body.instruction(&Instruction::I32Add);
+            body.instruction(&Instruction::LocalSet(i_slot));
+            body.instruction(&Instruction::Br(0));
+            body.instruction(&Instruction::End); // end loop
+            body.instruction(&Instruction::End); // end block
+            // Return acc.
+            body.instruction(&Instruction::LocalGet(acc_slot));
+            body.instruction(&Instruction::End); // end if/else
+        }
+
         other => return Err(format!("wasm_lower: variant not yet supported: {:?}",
             std::mem::discriminant(other))),
     }
@@ -667,11 +772,11 @@ mod tests {
 
     #[test]
     fn lower_rejects_unsupported_variant() {
-        // Insert isn't wired yet — must error, not panic. Backus's
-        // /f fold requires building a 2-elem pair each iteration
-        // to feed to the binary f, which we haven't emitted yet.
-        let f = Func::Insert(Box::new(Func::Id));
-        let err = lower_to_wasm(&f).expect_err("Insert should be marked unsupported");
+        // Selector is the next natural addition (1-indexed tuple
+        // projection) — currently still unsupported, so it's the
+        // sentinel for this test.
+        let f = Func::Selector(1);
+        let err = lower_to_wasm(&f).expect_err("Selector should be marked unsupported");
         assert!(err.contains("not yet supported"));
     }
 
@@ -974,6 +1079,92 @@ mod tests {
             Box::new(Func::Construction(vec![])),
         );
         assert_eq!(roundtrip_seq(&f, 0), Vec::<i64>::new());
+    }
+
+    // ── Insert ────────────────────────────────────────────────────
+
+    #[test]
+    fn lower_insert_of_single_element_returns_that_element() {
+        // /f:<x> = x regardless of f. Loop body never executes
+        // because i starts at 1 and len == 1.
+        let f = Func::Compose(
+            Box::new(Func::Insert(Box::new(Func::Id))),
+            Box::new(Func::Construction(vec![
+                Func::Constant(Object::atom("42")),
+            ])),
+        );
+        assert_eq!(roundtrip(&f, 0), 42);
+    }
+
+    #[test]
+    fn lower_insert_of_empty_seq_returns_phi() {
+        // /f:<> = phi (null ptr) in the PoC. Verify the return is
+        // pointer 0 — a meaningful sentinel the caller can detect.
+        let f = Func::Compose(
+            Box::new(Func::Insert(Box::new(Func::Id))),
+            Box::new(Func::Construction(vec![])),
+        );
+        let (ptr, _data) = invoke(&f, 0);
+        assert_eq!(ptr, 0, "Insert over empty Seq must return phi (0)");
+    }
+
+    #[test]
+    fn lower_insert_constant_ignores_accumulator_and_returns_const() {
+        // Constant(99):<acc, elem> = atom 99 for every fold step, so
+        // the final acc = 99 regardless of sequence contents.
+        let f = Func::Compose(
+            Box::new(Func::Insert(Box::new(Func::Constant(Object::atom("99"))))),
+            Box::new(Func::Construction(vec![
+                Func::Constant(Object::atom("5")),
+                Func::Constant(Object::atom("10")),
+                Func::Constant(Object::atom("20")),
+            ])),
+        );
+        assert_eq!(roundtrip(&f, 0), 99);
+    }
+
+    #[test]
+    fn lower_insert_id_over_pair_returns_the_pair_itself() {
+        // /Id:<x, y> runs one fold step: pair = <x, y>, Id(pair) = pair.
+        // Final acc = <x, y>.
+        let f = Func::Compose(
+            Box::new(Func::Insert(Box::new(Func::Id))),
+            Box::new(Func::Construction(vec![
+                Func::Constant(Object::atom("5")),
+                Func::Constant(Object::atom("10")),
+            ])),
+        );
+        assert_eq!(roundtrip_seq(&f, 0), vec![5, 10]);
+    }
+
+    #[test]
+    fn lower_insert_id_over_three_nests_left_associatively() {
+        // /Id:<5, 10, 20> = <<5, 10>, 20> with Id-as-fold-step.
+        // Verifies the fold is left-associative (acc rebinds each
+        // iteration) and that nested Seqs survive the pair-alloc
+        // path without corruption.
+        let f = Func::Compose(
+            Box::new(Func::Insert(Box::new(Func::Id))),
+            Box::new(Func::Construction(vec![
+                Func::Constant(Object::atom("5")),
+                Func::Constant(Object::atom("10")),
+                Func::Constant(Object::atom("20")),
+            ])),
+        );
+        let (ptr, data) = invoke(&f, 0);
+        assert_eq!(read_u32(&data, ptr), TAG_SEQ as u32);
+        assert_eq!(read_u32(&data, ptr + 4), 2, "outer length = 2");
+        // Outer[0] is <5, 10>
+        let inner = read_u32(&data, ptr + 8);
+        assert_eq!(read_u32(&data, inner), TAG_SEQ as u32);
+        assert_eq!(read_u32(&data, inner + 4), 2);
+        let inner0 = read_u32(&data, inner + 8);
+        assert_eq!(read_i64(&data, inner0 + 8), 5);
+        let inner1 = read_u32(&data, inner + 12);
+        assert_eq!(read_i64(&data, inner1 + 8), 10);
+        // Outer[1] is atom 20
+        let outer1 = read_u32(&data, ptr + 12);
+        assert_eq!(read_i64(&data, outer1 + 8), 20);
     }
 
     #[test]
