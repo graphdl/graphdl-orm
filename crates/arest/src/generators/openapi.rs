@@ -85,7 +85,7 @@ pub(crate) fn openapi_for_app(domain: &Domain, app_name: &str) -> serde_json::Va
         .map(|n| (rmap::to_snake(n), n.clone()))
         .collect();
 
-    let schemas: serde_json::Map<String, serde_json::Value> = domain.nouns.iter()
+    let mut schemas: serde_json::Map<String, serde_json::Value> = domain.nouns.iter()
         .filter(|(_, n)| n.object_type == "entity")
         .filter_map(|(name, _)| {
             let table_name = rmap::to_snake(name);
@@ -93,6 +93,14 @@ pub(crate) fn openapi_for_app(domain: &Domain, app_name: &str) -> serde_json::Va
                 .map(|table| (name.clone(), component_schema(domain, name, table, &noun_by_snake)))
         })
         .collect();
+    // Violation component is the wire representation of a failed constraint
+    // (Theorem 3 violations + Corollary 1 verbalization). Declared
+    // unconditionally so the envelope reference always resolves even in
+    // compiles that do not load outcomes.md. A real Violation entity from
+    // outcomes.md, when loaded, overrides this default via the user's own
+    // RMAP-derived schema.
+    schemas.entry("Violation".to_string())
+        .or_insert_with(violation_component_schema);
 
     // Paths per Theorem 4 (HATEOAS as Projection). For each entity with a
     // RMAP-derived table, emit the canonical CRUD routes. Follow-up work
@@ -154,6 +162,115 @@ fn plural_for_noun(domain: &Domain, noun_name: &str) -> String {
         .unwrap_or_else(|| format!("{}s", rmap::to_snake(noun_name)))
 }
 
+/// Default Violation component schema — the wire shape of a failed
+/// constraint. Corollary 1 guarantees that `reading` carries the
+/// original FORML 2 sentence verbatim. A loaded `readings/outcomes.md`
+/// produces its own Violation schema via RMAP; that one wins when the
+/// user's app lassos outcomes.
+fn violation_component_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "title": "Violation",
+        "description": "A constraint violation. The `reading` field is the original \
+                        FORML 2 sentence per Corollary 1 (Violation Verbalization).",
+        "properties": {
+            "reading": {
+                "type": "string",
+                "description": "The original FORML 2 reading whose compiled constraint \
+                                this violation reports. Round-trips parse ∘ compile.",
+            },
+            "constraintId": {
+                "type": "string",
+                "description": "The compiled constraint identifier.",
+            },
+            "modality": {
+                "type": "string",
+                "enum": ["alethic", "deontic"],
+                "description": "Alethic violations reject the command; deontic \
+                                violations are reported alongside the accepted \
+                                command (paper §4.1).",
+            },
+            "detail": {
+                "type": "string",
+                "description": "Optional tuple-level detail: which instance triggered the \
+                                violation. Empty when the constraint is over the \
+                                schema rather than a specific fact.",
+            },
+        },
+        "required": ["reading", "constraintId", "modality"],
+    })
+}
+
+/// Shared `_links` sub-schema for response envelopes.
+///
+/// Theorem 4 projects two link sets: transitions (SM events valid from
+/// the current status) and navigation (related/parent/child/peer
+/// references as θ₁ projections). Clients drive action from this
+/// sub-structure; the envelope always carries it.
+fn links_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "description": "HATEOAS links per Theorem 4 — all are θ₁ projections over P and S.",
+        "properties": {
+            "transitions": {
+                "type": "array",
+                "description": "Events valid from the entity's current status. \
+                                Theorem 4a: π_event(Filter(s_from ∈ {current} ∪ \
+                                supertypes):T).",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "event": { "type": "string" },
+                        "href":  { "type": "string", "format": "uri-reference" },
+                        "method": { "type": "string", "enum": ["POST"] },
+                    },
+                    "required": ["event", "href", "method"],
+                },
+            },
+            "navigation": {
+                "type": "object",
+                "description": "Related/parent/child/peer URIs per Theorem 4b.",
+                "additionalProperties": {
+                    "type": "string",
+                    "format": "uri-reference",
+                },
+            },
+        },
+    })
+}
+
+/// Wrap a data schema in the Theorem 5 representation envelope.
+///
+/// `repr(e, P, S) = {ρ(s):facts} ∪ {ρ(r):P} ∪ {ρ(c):P} ∪ links_full`.
+/// Four keys: `data` (the 3NF row or list), `derived` (rule outputs —
+/// only for single-entity reads), `violations` (Cor 1-verbalized),
+/// `_links` (Theorem 4). `_links` and `data` are required; `derived`
+/// and `violations` are optional because not every response carries
+/// them (pagination pages, for instance, may have neither).
+fn envelope_schema(data_schema: serde_json::Value, include_derived: bool) -> serde_json::Value {
+    let violation_ref = serde_json::json!({
+        "type": "array",
+        "items": { "$ref": "#/components/schemas/Violation" },
+    });
+    let mut props = serde_json::Map::new();
+    props.insert("data".to_string(), data_schema);
+    if include_derived {
+        props.insert("derived".to_string(), serde_json::json!({
+            "type": "object",
+            "description": "Derivation-rule outputs for this entity — every value is a \
+                            ρ-application of a derivation rule over P (Theorem 5).",
+            "additionalProperties": true,
+        }));
+    }
+    props.insert("violations".to_string(), violation_ref);
+    props.insert("_links".to_string(), links_schema());
+    serde_json::json!({
+        "type": "object",
+        "properties": props,
+        "required": ["data", "_links"],
+    })
+}
+
 /// Emit the canonical path items for one entity noun per Theorem 4.
 ///
 /// Always (navigation + Cor 2 soft-delete):
@@ -177,21 +294,24 @@ fn paths_for_noun(
     let schema_ref = serde_json::json!({
         "$ref": format!("#/components/schemas/{}", noun_name),
     });
+    let list_envelope = envelope_schema(
+        serde_json::json!({ "type": "array", "items": schema_ref }),
+        false, // no per-entity `derived` on a list response
+    );
+    let item_envelope = envelope_schema(schema_ref.clone(), true);
     let list_response = serde_json::json!({
         "200": {
-            "description": format!("List of {}.", noun_name),
+            "description": format!("List of {}. Envelope per Theorem 5.", noun_name),
             "content": {
-                "application/json": {
-                    "schema": { "type": "array", "items": schema_ref },
-                },
+                "application/json": { "schema": list_envelope },
             },
         },
     });
     let item_response = serde_json::json!({
         "200": {
-            "description": format!("One {}.", noun_name),
+            "description": format!("One {}. Envelope per Theorem 5.", noun_name),
             "content": {
-                "application/json": { "schema": schema_ref },
+                "application/json": { "schema": item_envelope },
             },
         },
     });
@@ -368,8 +488,12 @@ mod tests {
         assert_eq!(doc["info"]["version"], "1.0.0");
         assert!(doc["info"]["title"].is_string());
         assert!(doc["paths"].is_object());
-        assert!(doc["components"]["schemas"].is_object());
-        assert_eq!(doc["components"]["schemas"].as_object().unwrap().len(), 0);
+        let schemas = doc["components"]["schemas"].as_object()
+            .expect("components.schemas must be an object");
+        // Violation is unconditional — every envelope references it.
+        assert_eq!(schemas.keys().cloned().collect::<Vec<_>>(), vec!["Violation"],
+            "empty domain emits only the Violation envelope type; got: {:?}",
+            schemas.keys().collect::<Vec<_>>());
     }
 
     /// Parse a FORML2 snippet into a Domain for tests.
@@ -543,6 +667,82 @@ mod tests {
         assert!(!paths.contains_key("/organizations/{id}/transitions"),
             "transitions route must be absent without an SM; got: {:?}",
             paths.keys().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn doc_includes_violation_component_with_reading_text() {
+        // Theorem 5 / Corollary 1: every operation response may carry
+        // violations, and each violation's body IS the original FORML 2
+        // reading (by the injectivity of parse ∘ compile). The OpenAPI
+        // document must therefore declare a Violation component schema
+        // that exposes the reading text as a field so tools generate
+        // clients capable of surfacing the original sentence.
+        let domain = organization_with_slug();
+        let doc = openapi_for_app(&domain, "test-app");
+        let schemas = doc["components"]["schemas"].as_object()
+            .expect("components.schemas must be an object");
+        assert!(schemas.contains_key("Violation"),
+            "Violation component schema must be declared; got: {:?}",
+            schemas.keys().collect::<Vec<_>>());
+        let violation = &schemas["Violation"];
+        assert_eq!(violation["type"], "object");
+        let props = violation["properties"].as_object()
+            .expect("Violation.properties must be an object");
+        assert!(props.contains_key("reading"),
+            "Violation must carry a 'reading' field per Cor 1; got: {:?}",
+            props.keys().collect::<Vec<_>>());
+        assert!(props.contains_key("constraintId"),
+            "Violation must carry 'constraintId' so clients can correlate; \
+             got: {:?}", props.keys().collect::<Vec<_>>());
+        assert!(props.contains_key("modality"),
+            "Violation must carry 'modality' (alethic|deontic) so clients \
+             know whether the violation rejected the command or merely \
+             warned; got: {:?}", props.keys().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn item_response_wraps_entity_in_envelope_per_theorem_5() {
+        // Theorem 5 repr(e, P, S) = {ρ(s):f | facts} ∪ {ρ(r):P | rules}
+        //                        ∪ {ρ(c):P | constraints} ∪ links_full.
+        // Four top-level keys: data, derived, violations, _links.
+        // Not three, not collapsed. This matches the Backus §13.3.2
+        // representation function and preserves provenance.
+        let domain = organization_with_slug();
+        let doc = openapi_for_app(&domain, "test-app");
+        let item_schema = &doc["paths"]["/organizations/{id}"]["get"]
+            ["responses"]["200"]["content"]["application/json"]["schema"];
+        assert_eq!(item_schema["type"], "object",
+            "item response envelope must be an object, got: {}", item_schema);
+        let props = item_schema["properties"].as_object()
+            .expect("envelope must have properties");
+        ["data", "derived", "violations", "_links"].iter().for_each(|k| {
+            assert!(props.contains_key(*k),
+                "envelope must carry '{}' per Theorem 5; got: {:?}",
+                k, props.keys().collect::<Vec<_>>());
+        });
+        // data is the 3NF row — a ref to the noun schema
+        let data = &item_schema["properties"]["data"];
+        assert!(data.get("$ref").is_some() || data["type"] == "object",
+            "envelope.data must be the noun row (schema $ref or inline object); got: {}", data);
+    }
+
+    #[test]
+    fn list_response_wraps_array_in_envelope_per_theorem_5() {
+        // List responses carry the same envelope; `data` is an array.
+        // Pagination + query-level violations are reported alongside.
+        let domain = organization_with_slug();
+        let doc = openapi_for_app(&domain, "test-app");
+        let list_schema = &doc["paths"]["/organizations"]["get"]
+            ["responses"]["200"]["content"]["application/json"]["schema"];
+        assert_eq!(list_schema["type"], "object");
+        let props = list_schema["properties"].as_object()
+            .expect("list envelope must have properties");
+        assert!(props.contains_key("data"));
+        assert!(props.contains_key("violations"));
+        assert!(props.contains_key("_links"));
+        assert_eq!(list_schema["properties"]["data"]["type"], "array",
+            "list envelope's data must be an array of entity rows; got: {}",
+            list_schema);
     }
 
     #[test]
