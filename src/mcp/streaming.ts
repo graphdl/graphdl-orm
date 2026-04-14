@@ -15,17 +15,49 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
 
 /**
- * Create an MCP server instance configured for streaming cell events.
- * The server exposes the same AREST tools as the stdio server, plus
- * cell subscription notifications.
+ * Minimal shape of the BroadcastDO stub the streaming tools need.
+ * Matches the RPC subset used here so a vi.fn()-based mock can stand
+ * in for tests without importing the DO runtime.
  */
-export function createStreamingServer() {
+export interface BroadcastStreamingStub {
+  registerFilter(filter: { domain: string; noun?: string; entityId?: string }): Promise<string>
+  unsubscribe(id: string): Promise<boolean>
+  listSubscribers(): Promise<readonly string[]>
+}
+
+/**
+ * Create an MCP server instance configured for streaming cell events.
+ *
+ * `env` exposes `BROADCAST` — the BroadcastDO namespace (see
+ * src/broadcast-do.ts + wrangler.jsonc). When supplied, subscribe/
+ * unsubscribe/list calls go through the real DO; when absent (e.g.
+ * local stdio mode with no DO runtime), the tools return a
+ * degraded-but-honest response.
+ *
+ * Event delivery: subscriptions registered via MCP go into the DO's
+ * registry with a no-op callback. Clients receive actual CellEvent
+ * frames by opening the companion `/api/events` SSE stream with the
+ * same filter shape. MCP-transport notifications are deferred — the
+ * streamable-HTTP wiring for server→client pushes is a separate
+ * concern tracked in the ui.do chain.
+ */
+export interface StreamingEnv {
+  BROADCAST?: {
+    idFromName(name: string): unknown
+    get(id: unknown): BroadcastStreamingStub
+  }
+}
+
+export function createStreamingServer(env?: StreamingEnv) {
   const server = new McpServer({
     name: 'arest-streaming',
     version: '0.1.0',
   })
 
-  // ── Tools (same as stdio server) ──────────────────────────────────
+  function broadcastStub(): BroadcastStreamingStub | null {
+    if (!env?.BROADCAST) return null
+    return env.BROADCAST.get(env.BROADCAST.idFromName('global'))
+  }
 
   server.tool(
     'arest_list',
@@ -37,30 +69,73 @@ export function createStreamingServer() {
       limit: z.number().optional(),
     },
     async ({ noun, domain, page, limit }) => {
+      // Real entity listing is task #120 — needs a wasm engine handle
+      // reachable from the MCP tool context. For now, returns the
+      // query echo so the wire-level shape is stable for clients.
       return { content: [{ type: 'text' as const, text: JSON.stringify({ noun, domain, page, limit, _note: 'wired to AREST handler' }) }] }
     },
   )
 
   server.tool(
-    'arest_subscribe',
-    'Subscribe to cell events for a noun type. Events stream as notifications when cells change.',
-    {
-      noun: z.string().describe('The noun type to watch'),
-      domain: z.string().describe('The domain slug'),
+    'arest_subscriptions',
+    'List active event subscription ids on the BroadcastDO registry.',
+    {},
+    async () => {
+      const stub = broadcastStub()
+      if (!stub) {
+        return {
+          content: [{
+            type: 'text' as const,
+            text: JSON.stringify({
+              subscribers: [],
+              _note: 'BroadcastDO binding unavailable; returning empty list',
+            }),
+          }],
+        }
+      }
+      const subscribers = await stub.listSubscribers()
+      return {
+        content: [{
+          type: 'text' as const,
+          text: JSON.stringify({ subscribers }),
+        }],
+      }
     },
-    async ({ noun, domain }) => {
-      // In the full implementation, this registers the client for
-      // notifications when entities of this noun type change.
-      // The notification payload is the event (fact change) that
-      // the client's local WASM engine folds.
+  )
+
+  server.tool(
+    'arest_subscribe',
+    'Register a cell-event subscription filter. Returns a subscription id; ' +
+    'open GET /api/events with the same filter to receive CellEvent frames.',
+    {
+      domain: z.string().describe('Required. The domain slug to scope the subscription.'),
+      noun: z.string().optional().describe('Narrow to a single noun type.'),
+      entityId: z.string().optional().describe('Narrow to a single entity id.'),
+    },
+    async ({ domain, noun, entityId }) => {
+      const stub = broadcastStub()
+      if (!stub) {
+        return {
+          content: [{
+            type: 'text' as const,
+            text: JSON.stringify({
+              subscribed: false,
+              error: 'BroadcastDO binding unavailable',
+            }),
+          }],
+        }
+      }
+      const id = await stub.registerFilter({ domain, noun, entityId })
       return {
         content: [{
           type: 'text' as const,
           text: JSON.stringify({
             subscribed: true,
-            noun,
-            domain,
-            message: 'Cell events will be streamed as notifications',
+            subscriptionId: id,
+            filter: { domain, noun, entityId },
+            eventsUrl: `/api/events?domain=${encodeURIComponent(domain)}` +
+              (noun ? `&noun=${encodeURIComponent(noun)}` : '') +
+              (entityId ? `&entityId=${encodeURIComponent(entityId)}` : ''),
           }),
         }],
       }
@@ -69,16 +144,28 @@ export function createStreamingServer() {
 
   server.tool(
     'arest_unsubscribe',
-    'Stop receiving cell events for a noun type',
+    'Remove a subscription by id.',
     {
-      noun: z.string(),
-      domain: z.string(),
+      id: z.string().describe('The subscription id returned by arest_subscribe.'),
     },
-    async ({ noun, domain }) => {
+    async ({ id }) => {
+      const stub = broadcastStub()
+      if (!stub) {
+        return {
+          content: [{
+            type: 'text' as const,
+            text: JSON.stringify({
+              unsubscribed: false,
+              error: 'BroadcastDO binding unavailable',
+            }),
+          }],
+        }
+      }
+      const removed = await stub.unsubscribe(id)
       return {
         content: [{
           type: 'text' as const,
-          text: JSON.stringify({ unsubscribed: true, noun, domain }),
+          text: JSON.stringify({ unsubscribed: removed, id }),
         }],
       }
     },

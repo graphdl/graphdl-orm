@@ -237,6 +237,22 @@ export class BroadcastDO extends DurableObject {
     return subscribe(this.registry, filter, callback)
   }
 
+  /**
+   * RPC-friendly subscription registration — registers a filter with
+   * a no-op callback. The subscription is tracked in listSubscribers
+   * and removable via unsubscribe, but events never reach the caller
+   * through this subscription because callbacks don't cross the DO
+   * RPC boundary (they are function references, not serialisable).
+   *
+   * Used by MCP tools that want to register a client's interest and
+   * track its lifecycle, but deliver events via a separate transport
+   * (today: /api/events SSE). The filter can be re-used to attach an
+   * SSE stream by making the same query on /api/events.
+   */
+  async registerFilter(filter: SubscriptionFilter): Promise<string> {
+    return subscribe(this.registry, filter, () => { /* no-op across RPC */ })
+  }
+
   /** Remove a subscription. Returns true if it existed. */
   async unsubscribe(id: string): Promise<boolean> {
     return unsubscribe(this.registry, id)
