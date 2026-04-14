@@ -185,6 +185,27 @@ export async function handleGetEntity(
 }
 
 // ---------------------------------------------------------------------------
+// Broadcast write stub — post-mutation signal delivery.
+// ---------------------------------------------------------------------------
+
+/**
+ * Minimal interface the create/delete handlers need from BroadcastDO.
+ * Accepts any object with the same shape so tests can pass a mock
+ * without importing the DO runtime. The full DO type lives in
+ * src/broadcast-do.ts.
+ */
+export interface BroadcastWriteStub {
+  publish(event: {
+    domain: string
+    noun: string
+    entityId: string
+    operation: 'create' | 'update' | 'delete' | 'transition'
+    facts: Record<string, unknown>
+    timestamp: number
+  }): Promise<unknown>
+}
+
+// ---------------------------------------------------------------------------
 // handleCreateEntity
 // ---------------------------------------------------------------------------
 
@@ -200,11 +221,23 @@ export async function handleCreateEntity(
   getStub: (id: string) => EntityWriteStub,
   registry: RegistryWriteStub,
   explicitId?: string,
+  broadcast?: BroadcastWriteStub,
 ): Promise<CreateEntityResult> {
   const id = explicitId || crypto.randomUUID()
   const stub = getStub(id)
   await stub.put({ id, type, data })
   await registry.indexEntity(type, id, domain)
+  // Kernel signal: fan out a 'create' event to any subscriber whose
+  // filter matches. Best-effort — a broadcast failure must not roll
+  // back the mutation (Definition 3-style: the write is committed).
+  if (broadcast) {
+    try {
+      await broadcast.publish({
+        domain, noun: type, entityId: id, operation: 'create',
+        facts: data, timestamp: Date.now(),
+      })
+    } catch { /* signal-delivery is best-effort */ }
+  }
   return { id, type }
 }
 
@@ -217,9 +250,19 @@ export async function handleDeleteEntity(
   stub: EntityWriteStub,
   registry: RegistryWriteStub,
   type: string,
+  domain?: string,
+  broadcast?: BroadcastWriteStub,
 ): Promise<{ id: string; deleted: boolean } | null> {
   const result = await stub.delete()
   if (!result) return null
   await registry.deindexEntity(type, id)
+  if (broadcast && domain) {
+    try {
+      await broadcast.publish({
+        domain, noun: type, entityId: id, operation: 'delete',
+        facts: {}, timestamp: Date.now(),
+      })
+    } catch { /* signal-delivery is best-effort */ }
+  }
   return { id: result.id, deleted: true }
 }

@@ -581,9 +581,11 @@ router.patch('/api/entities/:noun/:id', async (request, env: Env) => {
 
 router.delete('/api/entities/:noun/:id', async (request, env: Env) => {
   const noun = decodeURIComponent(request.params.noun); const id = decodeURIComponent(request.params.id)
+  const domain = new URL(request.url).searchParams.get('domain') || undefined
 
   const registry = getRegistryDO(env, 'global') as any
-  const result = await handleDeleteEntity(id, getEntityDO(env, id) as any, registry, noun)
+  const broadcast = env.BROADCAST.get(env.BROADCAST.idFromName('global')) as any
+  const result = await handleDeleteEntity(id, getEntityDO(env, id) as any, registry, noun, domain, broadcast)
 
   if (!result) return error(404, { errors: [{ message: 'Not Found' }] })
   return json(result)
@@ -752,12 +754,15 @@ router.post('/api/:collection', async (request, env: Env) => {
   }
 
   const domain = body.domain || ''
+  const broadcast = env.BROADCAST.get(env.BROADCAST.idFromName('global')) as any
   const result = await handleCreateEntity(
     entityType,
     domain,
     body,
     (id) => getEntityDO(env, id) as any,
     registry,
+    undefined,
+    broadcast,
   )
   return json({ doc: { id: result.id, ...body }, message: 'Created successfully' }, { status: 201 })
 })
@@ -791,7 +796,9 @@ router.delete('/api/:collection/:id', async (request, env: Env) => {
     return error(404, { errors: [{ message: `Collection "${collection}" not found` }] })
   }
 
-  const result = await handleDeleteEntity(id, getEntityDO(env, id) as any, registry, entityType)
+  const domain = new URL(request.url).searchParams.get('domain') || undefined
+  const broadcast = env.BROADCAST.get(env.BROADCAST.idFromName('global')) as any
+  const result = await handleDeleteEntity(id, getEntityDO(env, id) as any, registry, entityType, domain, broadcast)
   if (!result) return error(404, { errors: [{ message: 'Not Found' }] })
   return json({ id, message: 'Deleted successfully' })
 })
