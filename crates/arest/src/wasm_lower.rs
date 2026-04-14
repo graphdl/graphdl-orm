@@ -162,11 +162,19 @@ pub fn lower_to_wasm(func: &Func) -> Result<Vec<u8>, String> {
     // Entry resets the heap so each invocation gets a fresh bump.
     // The returned pointer is therefore valid only until the next
     // call; callers snapshot before re-invoking.
+    // Local layout (declared in declaration order):
+    //   local 0            : i64 input (parameter)
+    //   local 1            : i32 input_ptr
+    //   locals 2..2+scratch: i32 scratches (Condition/Construction/…)
+    //   local 2+scratch    : i64 scratch for Div's zero-check stash
+    //                        (always declared; costs ~1 byte if unused)
     let scratch = scratch_needed(func);
+    let div_i64_slot: u32 = 2 + scratch;
     let mut apply_locals: Vec<(u32, ValType)> = vec![(1, ValType::I32)];
     if scratch > 0 {
         apply_locals.push((scratch, ValType::I32));
     }
+    apply_locals.push((1, ValType::I64));
     let mut apply_body = Function::new(apply_locals);
     // heap_ptr = HEAP_START
     apply_body.instruction(&Instruction::I32Const(HEAP_START));
@@ -177,7 +185,7 @@ pub fn lower_to_wasm(func: &Func) -> Result<Vec<u8>, String> {
     apply_body.instruction(&Instruction::LocalSet(1));
     // Seed the stack with input_ptr and emit the lowered body.
     apply_body.instruction(&Instruction::LocalGet(1));
-    emit_body(func, &mut apply_body, 2)?;
+    emit_body(func, &mut apply_body, 2, div_i64_slot)?;
     apply_body.instruction(&Instruction::End);
     codes.function(&apply_body);
 
@@ -294,8 +302,59 @@ fn scratch_needed(func: &Func) -> u32 {
             // to consume.
             5 + scratch_needed(f)
         }
+        // Binary arithmetic consumes a pair Seq and needs one i32
+        // scratch for pair_ptr. Div additionally uses the
+        // function-level i64 slot (allocated unconditionally by
+        // lower_to_wasm) to stash the divisor across the zero-check
+        // branch — it doesn't count toward the i32 scratch budget.
+        Func::Add | Func::Sub | Func::Mul | Func::Div => 1,
         _ => 0,
     }
+}
+
+/// Emit a binary i64 arithmetic op (Add, Sub, Mul). Consumes the
+/// pair Seq ptr on the stack, loads both Atom i64 values onto the
+/// operand stack in order (a then b), invokes `op`, and wraps the
+/// result in a fresh Atom. No i64 local needed — operands stay on
+/// the WASM operand stack between the two loads.
+fn emit_binary_i64_arith(body: &mut Function, pair_slot: u32, op: Instruction<'static>) {
+    body.instruction(&Instruction::LocalSet(pair_slot));
+    // a = pair[0].value
+    body.instruction(&Instruction::LocalGet(pair_slot));
+    body.instruction(&Instruction::I32Load(i32_at(8)));
+    body.instruction(&Instruction::I64Load(i64_at(8)));
+    // b = pair[1].value
+    body.instruction(&Instruction::LocalGet(pair_slot));
+    body.instruction(&Instruction::I32Load(i32_at(12)));
+    body.instruction(&Instruction::I64Load(i64_at(8)));
+    // stack: [a, b] — apply op.
+    body.instruction(&op);
+    body.instruction(&Instruction::Call(FN_ALLOC_ATOM));
+}
+
+/// Emit signed i64 division with Backus's ÷ semantics: b == 0 yields
+/// φ (null ptr) rather than trapping. Uses the function-level i64
+/// scratch `div_i64_slot` to stash b across the zero-check branch.
+fn emit_binary_i64_div(body: &mut Function, pair_slot: u32, div_i64_slot: u32) {
+    body.instruction(&Instruction::LocalSet(pair_slot));
+    // Load b, stash it in the i64 slot, test for zero.
+    body.instruction(&Instruction::LocalGet(pair_slot));
+    body.instruction(&Instruction::I32Load(i32_at(12)));
+    body.instruction(&Instruction::I64Load(i64_at(8)));
+    body.instruction(&Instruction::LocalTee(div_i64_slot));
+    body.instruction(&Instruction::I64Eqz);
+    body.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+    // b == 0 : phi.
+    body.instruction(&Instruction::I32Const(0));
+    body.instruction(&Instruction::Else);
+    // a / b, alloc_atom.
+    body.instruction(&Instruction::LocalGet(pair_slot));
+    body.instruction(&Instruction::I32Load(i32_at(8)));
+    body.instruction(&Instruction::I64Load(i64_at(8)));
+    body.instruction(&Instruction::LocalGet(div_i64_slot));
+    body.instruction(&Instruction::I64DivS);
+    body.instruction(&Instruction::Call(FN_ALLOC_ATOM));
+    body.instruction(&Instruction::End);
 }
 
 /// Emit instructions that consume one i32 Object pointer from the
@@ -305,7 +364,12 @@ fn scratch_needed(func: &Func) -> u32 {
 /// `next_scratch` is the first free i32 local index. Subterms that
 /// need temporaries claim slots and pass `next_scratch + k` to their
 /// children, so nested uses get distinct slots.
-fn emit_body(func: &Func, body: &mut Function, next_scratch: u32) -> Result<(), String> {
+fn emit_body(
+    func: &Func,
+    body: &mut Function,
+    next_scratch: u32,
+    div_i64_slot: u32,
+) -> Result<(), String> {
     match func {
         // id:x = x — ptr on stack is already the output.
         Func::Id => {}
@@ -332,6 +396,32 @@ fn emit_body(func: &Func, body: &mut Function, next_scratch: u32) -> Result<(), 
             }));
         }
 
+        // Backus §11.2.3 arithmetic on a pair Atom.
+        //
+        //   +:<y, z>  = y + z
+        //   -:<y, z>  = y - z
+        //   ×:<y, z>  = y × z
+        //   ÷:<y, z>  = y ÷ z,  φ if z = 0
+        //
+        // Shared shape (pair_slot holds the Seq ptr, b_slot holds the
+        // i64 rhs so we can load both operands and invoke the op):
+        //
+        //   local.set pair                ; stash Seq ptr
+        //   local.get pair ; i32.load 12 ; i64.load 8   ; load b
+        //   local.set b
+        //   local.get pair ; i32.load  8 ; i64.load 8   ; load a
+        //   local.get b
+        //   <i64 op>
+        //   call alloc_atom
+        //
+        // Div adds a zero-check on b before the op, returning phi
+        // (ptr 0) if b == 0 so we never trap on division. This
+        // matches Backus's ÷ and AREST's Object::Bottom propagation.
+        Func::Add => emit_binary_i64_arith(body, next_scratch, Instruction::I64Add),
+        Func::Sub => emit_binary_i64_arith(body, next_scratch, Instruction::I64Sub),
+        Func::Mul => emit_binary_i64_arith(body, next_scratch, Instruction::I64Mul),
+        Func::Div => emit_binary_i64_div(body, next_scratch, div_i64_slot),
+
         // c̄:x = c (when x ≠ ⊥) — drop input ptr, allocate fresh Atom.
         Func::Constant(Object::Atom(s)) => {
             let n: i64 = s.parse()
@@ -345,8 +435,8 @@ fn emit_body(func: &Func, body: &mut Function, next_scratch: u32) -> Result<(), 
         // concatenation: emit g (consumes input, leaves g(x)) then
         // emit f (consumes g(x), leaves f(g(x))).
         Func::Compose(f, g) => {
-            emit_body(g, body, next_scratch)?;
-            emit_body(f, body, next_scratch)?;
+            emit_body(g, body, next_scratch, div_i64_slot)?;
+            emit_body(f, body, next_scratch, div_i64_slot)?;
         }
 
         // Backus §11.2.4 Condition: (p → f; g):x = if p:x then f:x else g:x.
@@ -357,14 +447,14 @@ fn emit_body(func: &Func, body: &mut Function, next_scratch: u32) -> Result<(), 
         Func::Condition(p, f, g) => {
             let my = next_scratch;
             body.instruction(&Instruction::LocalTee(my));
-            emit_body(p, body, my + 1)?;
+            emit_body(p, body, my + 1, div_i64_slot)?;
             body.instruction(&Instruction::Call(FN_TRUTHY));
             body.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
             body.instruction(&Instruction::LocalGet(my));
-            emit_body(f, body, my + 1)?;
+            emit_body(f, body, my + 1, div_i64_slot)?;
             body.instruction(&Instruction::Else);
             body.instruction(&Instruction::LocalGet(my));
-            emit_body(g, body, my + 1)?;
+            emit_body(g, body, my + 1, div_i64_slot)?;
             body.instruction(&Instruction::End);
         }
 
@@ -404,7 +494,7 @@ fn emit_body(func: &Func, body: &mut Function, next_scratch: u32) -> Result<(), 
                 body.instruction(&Instruction::LocalGet(seq_slot));
                 // push x_ptr as the child's input
                 body.instruction(&Instruction::LocalGet(x_slot));
-                emit_body(child, body, seq_slot + 1)?;
+                emit_body(child, body, seq_slot + 1, div_i64_slot)?;
                 // Stack: [seq_ptr, child_result_ptr]
                 body.instruction(&Instruction::I32Store(MemArg {
                     offset: elem_offset,
@@ -484,7 +574,7 @@ fn emit_body(func: &Func, body: &mut Function, next_scratch: u32) -> Result<(), 
             body.instruction(&Instruction::I32Add);
             body.instruction(&Instruction::I32Load(i32_at(SEQ_HEADER_SIZE as u64)));
             // emit f : consumes elem ptr, leaves result ptr.
-            emit_body(f, body, next_scratch + 4)?;
+            emit_body(f, body, next_scratch + 4, div_i64_slot)?;
             // Store result at out_seq + 4*i + 8.
             body.instruction(&Instruction::I32Store(i32_at(SEQ_HEADER_SIZE as u64)));
             // i += 1
@@ -566,7 +656,7 @@ fn emit_body(func: &Func, body: &mut Function, next_scratch: u32) -> Result<(), 
             body.instruction(&Instruction::I32Load(i32_at(SEQ_HEADER_SIZE as u64)));
             body.instruction(&Instruction::LocalTee(elem_slot));
             // emit p : consumes elem ptr, leaves predicate Object ptr.
-            emit_body(p, body, next_scratch + 6)?;
+            emit_body(p, body, next_scratch + 6, div_i64_slot)?;
             body.instruction(&Instruction::Call(FN_TRUTHY));
             body.instruction(&Instruction::If(BlockType::Empty));
             // Store elem at out[kept].
@@ -682,7 +772,7 @@ fn emit_body(func: &Func, body: &mut Function, next_scratch: u32) -> Result<(), 
             body.instruction(&Instruction::I32Store(i32_at((SEQ_HEADER_SIZE + 4) as u64)));
             // acc = f(pair)
             body.instruction(&Instruction::LocalGet(pair_slot));
-            emit_body(f, body, next_scratch + 5)?;
+            emit_body(f, body, next_scratch + 5, div_i64_slot)?;
             body.instruction(&Instruction::LocalSet(acc_slot));
             // i += 1
             body.instruction(&Instruction::LocalGet(i_slot));
@@ -794,10 +884,10 @@ mod tests {
 
     #[test]
     fn lower_rejects_unsupported_variant() {
-        // Add isn't wired yet — binary arithmetic on pair input is
-        // the next pattern (unpack, i64 op, alloc_atom).
-        let f = Func::Add;
-        let err = lower_to_wasm(&f).expect_err("Add should be marked unsupported");
+        // Eq isn't wired yet — comparison on pair is the next
+        // pattern (unpack, i64 compare, alloc_atom with 0 or 1).
+        let f = Func::Eq;
+        let err = lower_to_wasm(&f).expect_err("Eq should be marked unsupported");
         assert!(err.contains("not yet supported"));
     }
 
@@ -1163,6 +1253,79 @@ mod tests {
             ])),
         );
         assert_eq!(roundtrip(&f, 0), 300);
+    }
+
+    // ── Arithmetic (binary on pair) ───────────────────────────────
+
+    /// Build a pair Seq of two constant Atoms. Used by arithmetic tests
+    /// to feed Add/Sub/Mul/Div without relying on the apply's i64 input.
+    fn pair(a: i64, b: i64) -> Func {
+        Func::Construction(vec![
+            Func::Constant(Object::atom(&a.to_string())),
+            Func::Constant(Object::atom(&b.to_string())),
+        ])
+    }
+
+    #[test]
+    fn lower_add_pair_returns_sum_atom() {
+        // +:<3, 4> = 7
+        let f = Func::Compose(Box::new(Func::Add), Box::new(pair(3, 4)));
+        assert_eq!(roundtrip(&f, 0), 7);
+        let f2 = Func::Compose(Box::new(Func::Add), Box::new(pair(-10, 3)));
+        assert_eq!(roundtrip(&f2, 0), -7);
+    }
+
+    #[test]
+    fn lower_sub_pair_returns_difference_atom() {
+        // -:<10, 3> = 7. Order matters — confirms we read pair[0] as
+        // the LHS and pair[1] as the RHS, not the other way around.
+        let f = Func::Compose(Box::new(Func::Sub), Box::new(pair(10, 3)));
+        assert_eq!(roundtrip(&f, 0), 7);
+        let f2 = Func::Compose(Box::new(Func::Sub), Box::new(pair(3, 10)));
+        assert_eq!(roundtrip(&f2, 0), -7);
+    }
+
+    #[test]
+    fn lower_mul_pair_returns_product_atom() {
+        // ×:<6, 7> = 42
+        let f = Func::Compose(Box::new(Func::Mul), Box::new(pair(6, 7)));
+        assert_eq!(roundtrip(&f, 0), 42);
+        let f2 = Func::Compose(Box::new(Func::Mul), Box::new(pair(-3, -4)));
+        assert_eq!(roundtrip(&f2, 0), 12);
+    }
+
+    #[test]
+    fn lower_div_pair_returns_quotient_atom() {
+        // ÷:<100, 4> = 25 ; signed.
+        let f = Func::Compose(Box::new(Func::Div), Box::new(pair(100, 4)));
+        assert_eq!(roundtrip(&f, 0), 25);
+        let f2 = Func::Compose(Box::new(Func::Div), Box::new(pair(-20, 5)));
+        assert_eq!(roundtrip(&f2, 0), -4);
+    }
+
+    #[test]
+    fn lower_div_by_zero_returns_phi_not_trap() {
+        // ÷:<10, 0> must return phi (ptr 0), not trap. Backus's ÷
+        // plus AREST's Object::Bottom propagation require this — a
+        // naive I64DivS would abort the instance.
+        let f = Func::Compose(Box::new(Func::Div), Box::new(pair(10, 0)));
+        let (ptr, _) = invoke(&f, 0);
+        assert_eq!(ptr, 0, "divide by zero must return phi");
+    }
+
+    #[test]
+    fn lower_arithmetic_composes_with_itself() {
+        // +:<+:<1, 2>, 3> = 6. Exercises arithmetic inside a pair
+        // slot — one arithmetic op produces an Atom that becomes
+        // element 0 of another pair, which another arithmetic op
+        // consumes. Pure computation through the alloc arena.
+        let inner = Func::Compose(Box::new(Func::Add), Box::new(pair(1, 2)));
+        let outer_pair = Func::Construction(vec![
+            inner,
+            Func::Constant(Object::atom("3")),
+        ]);
+        let f = Func::Compose(Box::new(Func::Add), Box::new(outer_pair));
+        assert_eq!(roundtrip(&f, 0), 6);
     }
 
     // ── Insert ────────────────────────────────────────────────────
