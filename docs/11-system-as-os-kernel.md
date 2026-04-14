@@ -188,8 +188,30 @@ New tasks that emerge:
 - **Snapshot/rollback as a verb**: explicit `snapshot:{handle}` and `rollback:{handle, snapshot_id}` ops backed by COW cells.
 - **Resource quotas per App**: CPU time, memory bytes, audit-log entries per `app:{slug}`.
 
+## Don't reinvent the VM — WASM IS the bytecode
+
+Observation: the Rust crate compiles to WASM. WASM is bytecode that runs in a VM. Writing an in-process bytecode interpreter inside `apply()` is re-implementing something that's already there.
+
+**Convergence**: lower `Func` trees directly to WASM functions at AREST compile time. Store compiled `WebAssembly.Module` references in `D` instead of `Func` data. `apply(Def, x, d)` becomes `instance.exports.f(x, d)` — a direct VM dispatch with zero AREST-level interpretation overhead. Algebraic normalize (Backus §12) still runs before lowering.
+
+Pipeline:
+
+```
+Func (normalized)  →  WASM  →  { V8, wasmer, wasmtime, FPGA silicon }
+```
+
+This unifies three things we used to model separately:
+
+- **JIT interpreter speedup** (formerly #152 in-process bytecode) — runtime WASM compilation in Workers is supported via `new WebAssembly.Module(bytes)`. V8 + wasmer + wasmtime all expose the same contract.
+- **FPGA kernel** (formerly #154 hand-rolled hardware compiler) — WASM-to-silicon pipelines exist (Wasmachine, FACE-WASM). AREST emits WASM; the silicon backend is someone else's problem.
+- **Multi-backend deployment** — latency-critical tenants run on silicon, batch tenants on a server VM, dev runs in V8. Same IR.
+
+Under the kernel lens, WASM IS our "machine code". Platform funcs are syscalls. Def-keyed WASM modules are user processes. `compile` is `exec()`. `fetch/store` on cells are memory-mapped I/O.
+
+Tasks #152 and #154 are rescoped around this convergence.
+
 ## What's next
 
 Start with the lens, not the code. Frame the next perf, concurrency, and multi-tenant work in OS terms — the right abstractions become obvious, the wrong ones reveal themselves quickly. Concrete code lands under tasks #146, #149, #151, #152, #154 and the new concurrency tasks above.
 
-The algebra is the spec. The kernel is the implementation.
+The algebra is the spec. The kernel is the implementation. WASM is the machine code.
