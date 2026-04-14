@@ -6,6 +6,7 @@
 // One function. Readings in, applications out.
 // State = P (facts) + DEFS (named Func).
 
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 
@@ -35,9 +36,27 @@ struct CompiledState {
     d: ast::Object,
 }
 
-static DOMAINS: OnceLock<Mutex<Vec<Option<CompiledState>>>> = OnceLock::new();
-fn ds() -> &'static Mutex<Vec<Option<CompiledState>>> {
+// Per docs/11-system-as-os-kernel.md: the process table.
+//
+// Outer Mutex protects slot allocation/recycling (Vec mutations).
+// Inner Mutex<CompiledState> protects per-tenant state, held only for
+// the duration of one operation. Two tenants run concurrently — the
+// outer lock is held only for slot lookup, then dropped; the inner
+// lock is per-Arc, so different tenants don't contend.
+//
+// This realises Cell Isolation (Definition 2) at the per-tenant
+// granularity. Per-cell concurrency within a tenant is task #156.
+static DOMAINS: OnceLock<Mutex<Vec<Option<Arc<Mutex<CompiledState>>>>>> = OnceLock::new();
+fn ds() -> &'static Mutex<Vec<Option<Arc<Mutex<CompiledState>>>>> {
     DOMAINS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Look up a slot's tenant lock by handle. Returns None for invalid
+/// handles or freed slots. The outer Vec mutex is held only for the
+/// duration of the lookup and Arc clone, then released.
+fn tenant_lock(handle: u32) -> Option<Arc<Mutex<CompiledState>>> {
+    let s = ds().lock().unwrap();
+    s.get(handle as usize).and_then(|x| x.as_ref()).map(Arc::clone)
 }
 
 #[allow(dead_code)] // used by tests and the cloudflare feature
@@ -45,7 +64,7 @@ fn allocate(state: ast::Object, defs: Vec<(String, ast::Func)>) -> u32 {
     let d = ast::defs_to_state(&defs, &state);
     let mut s = ds().lock().unwrap();
     let h = s.iter().position(|x| x.is_none()).unwrap_or_else(|| { s.push(None); s.len() - 1 });
-    s[h] = Some(CompiledState { d });
+    s[h] = Some(Arc::new(Mutex::new(CompiledState { d })));
     h as u32
 }
 
@@ -151,7 +170,7 @@ fn create_impl() -> u32 {
     let d = metamodel_state().clone();
     let mut s = ds().lock().unwrap();
     let h = s.iter().position(|x| x.is_none()).unwrap_or_else(|| { s.push(None); s.len() - 1 });
-    s[h] = Some(CompiledState { d });
+    s[h] = Some(Arc::new(Mutex::new(CompiledState { d })));
     h as u32
 }
 
@@ -173,12 +192,18 @@ fn release_impl(handle: u32) {
 ///
 /// The FPGA core: look up key in D via ρ, beta-reduce, update state.
 /// No match arms. No if-branches. Every operation is a def in D.
+///
+/// Concurrency: the outer process-table mutex is held only briefly to
+/// fetch this tenant's Arc<Mutex<CompiledState>>. The per-tenant inner
+/// mutex is held for the full ρ-dispatch + state mutation. Two tenants
+/// run concurrently; same tenant's operations remain serialized
+/// (Definition 2 cell isolation at per-tenant granularity).
 fn system_impl(handle: u32, key: &str, input: &str) -> String {
-    let mut s = ds().lock().unwrap();
-    let st = match s.get(handle as usize).and_then(|x| x.as_ref()) {
-        Some(x) => x,
+    let tenant = match tenant_lock(handle) {
+        Some(t) => t,
         None => return "⊥".into(),
     };
+    let mut st = tenant.lock().unwrap();
     let obj = ast::Object::parse(input);
 
     // Single ρ-dispatch (Eq. 9)
@@ -204,7 +229,7 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
                 (new_state.as_map().is_some() || new_state.as_seq().is_some())
                 && ast::fetch("Noun", &new_state) != ast::Object::Bottom;
             if new_state_looks_valid {
-                s[handle as usize] = Some(CompiledState { d: new_state });
+                st.d = new_state;
             }
             return response.as_atom().map(|s| s.to_string())
                 .unwrap_or_else(|| response.to_string());
@@ -218,7 +243,7 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
         // tiny JSON summary rather than dumping the store (which can be
         // megabytes at realistic scale). Call `debug` to query the full
         // schema if needed.
-        s[handle as usize] = Some(CompiledState { d: result.clone() });
+        st.d = result.clone();
         return r#"{"ok":true,"compiled":true}"#.to_string();
     }
 
@@ -280,11 +305,13 @@ impl exports::arest::engine::engine::Guest for E {
 mod handle_isolation_tests {
     use super::*;
 
-    /// Test-only peek at a handle's compiled state. Clones D under the lock
-    /// so the caller holds no reference to DOMAINS.
+    /// Test-only peek at a handle's compiled state. Clones D under the
+    /// per-tenant inner lock so the caller holds no reference to DOMAINS
+    /// nor to the per-tenant guard.
     fn peek(handle: u32) -> Option<ast::Object> {
-        let s = ds().lock().unwrap();
-        s.get(handle as usize).and_then(|x| x.as_ref()).map(|cs| cs.d.clone())
+        let tenant = tenant_lock(handle)?;
+        let st = tenant.lock().unwrap();
+        Some(st.d.clone())
     }
 
     /// Install a Noun cell with the given payload directly, bypassing the
@@ -317,13 +344,14 @@ mod handle_isolation_tests {
         // Mutate A's slot directly (simulating what system_impl does on a
         // state-transition def) and re-check B to prove no aliasing.
         {
-            let mut s = ds().lock().unwrap();
+            let tenant_a = tenant_lock(h_a).expect("handle A must be live");
+            let mut st = tenant_a.lock().unwrap();
             let new_d = ast::store(
                 "Noun",
                 ast::Object::atom("tenant-a-mutated"),
-                &s[h_a as usize].as_ref().unwrap().d.clone(),
+                &st.d.clone(),
             );
-            s[h_a as usize] = Some(CompiledState { d: new_d });
+            st.d = new_d;
         }
 
         let d_a2 = peek(h_a).unwrap();
@@ -420,17 +448,17 @@ mod handle_isolation_tests {
 
     #[test]
     fn no_static_aliasing_across_handles() {
-        // Pointer-identity check: the two Objects stored under distinct
-        // handles must not share the same heap address. This catches any
-        // accidental Arc::clone() or shared-reference leak.
+        // Pointer-identity check: the two tenants stored under distinct
+        // handles must not share the same Arc — distinct allocations.
+        // The per-tenant inner Mutex is per-Arc; if the Arcs aliased,
+        // tenant A's lock would also block tenant B.
         let h_a = alloc_with_noun("alpha");
         let h_b = alloc_with_noun("beta");
 
-        let s = ds().lock().unwrap();
-        let d_a = &s[h_a as usize].as_ref().unwrap().d as *const ast::Object;
-        let d_b = &s[h_b as usize].as_ref().unwrap().d as *const ast::Object;
-        assert_ne!(d_a, d_b, "each handle must own a distinct CompiledState");
-        drop(s);
+        let arc_a = tenant_lock(h_a).expect("h_a must be live");
+        let arc_b = tenant_lock(h_b).expect("h_b must be live");
+        assert!(!Arc::ptr_eq(&arc_a, &arc_b),
+            "each handle must own a distinct tenant Arc<Mutex<CompiledState>>");
 
         release_impl(h_a);
         release_impl(h_b);
