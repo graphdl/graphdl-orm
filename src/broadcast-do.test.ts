@@ -7,6 +7,7 @@ import {
   matches,
   publish,
   formatSseFrame,
+  openSseStream,
   type CellEvent,
   type SubscriptionFilter,
 } from './broadcast-do'
@@ -155,6 +156,94 @@ describe('BroadcastDO registry', () => {
       unsubscribe(reg, id)
       publish(reg, makeEvent())
       expect(received).toEqual([0])
+    })
+  })
+
+  describe('openSseStream — end-to-end smoke (#116)', () => {
+    it('returns 400 without a domain query param', async () => {
+      const reg = createRegistry()
+      const req = new Request('https://do/events')
+      const res = await openSseStream(reg, req)
+      expect(res.status).toBe(400)
+    })
+
+    it('returns text/event-stream with a connected comment and deliver published events', async () => {
+      const reg = createRegistry()
+      const req = new Request('https://do/events?domain=organizations&noun=Organization')
+      const res = await openSseStream(reg, req)
+
+      expect(res.status).toBe(200)
+      expect(res.headers.get('Content-Type')).toBe('text/event-stream')
+      expect(res.headers.get('Cache-Control')).toBe('no-cache, no-transform')
+      expect(res.headers.get('Connection')).toBe('keep-alive')
+      expect(res.headers.get('X-Accel-Buffering')).toBe('no')
+
+      // The registry now has one subscription for the filter.
+      expect(listSubscribers(reg)).toHaveLength(1)
+
+      // Publish a matching event and read the next frame from the body.
+      publish(reg, {
+        domain: 'organizations',
+        noun: 'Organization',
+        entityId: 'org-1',
+        operation: 'create',
+        facts: { name: 'Acme' },
+        timestamp: 1000,
+      })
+
+      const reader = res.body!.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      // Read until we accumulate both the connected-comment and the
+      // first data frame. SSE frames are delimited by "\n\n".
+      while (!buffer.includes('data: ')) {
+        const { value, done } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+      }
+      await reader.cancel().catch(() => {})
+
+      expect(buffer).toMatch(/^: connected sub=/m)
+      expect(buffer).toMatch(/data: \{.*"entityId":"org-1"/)
+      expect(buffer).toMatch(/"operation":"create"/)
+    })
+
+    it('skips non-matching events per the subscription filter', async () => {
+      const reg = createRegistry()
+      const req = new Request('https://do/events?domain=organizations&entityId=org-42')
+      const res = await openSseStream(reg, req)
+
+      // Publish events with different entityIds; only org-42 matches.
+      publish(reg, { domain: 'organizations', noun: 'Organization', entityId: 'org-1',  operation: 'create', facts: {}, timestamp: 0 })
+      publish(reg, { domain: 'organizations', noun: 'Organization', entityId: 'org-42', operation: 'create', facts: { hit: true }, timestamp: 0 })
+      publish(reg, { domain: 'organizations', noun: 'Organization', entityId: 'org-7',  operation: 'create', facts: {}, timestamp: 0 })
+
+      const reader = res.body!.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      while (!buffer.includes('"hit":true')) {
+        const { value, done } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+      }
+      await reader.cancel().catch(() => {})
+
+      // Only the org-42 frame appears in the stream.
+      expect(buffer).toContain('"entityId":"org-42"')
+      expect(buffer).not.toContain('"entityId":"org-1"')
+      expect(buffer).not.toContain('"entityId":"org-7"')
+    })
+
+    it('unsubscribes when the request signal aborts', async () => {
+      const reg = createRegistry()
+      const controller = new AbortController()
+      const req = new Request('https://do/events?domain=organizations', { signal: controller.signal })
+      await openSseStream(reg, req)
+      expect(listSubscribers(reg)).toHaveLength(1)
+
+      controller.abort()
+      // The abort handler runs synchronously on dispatch.
+      expect(listSubscribers(reg)).toHaveLength(0)
     })
   })
 

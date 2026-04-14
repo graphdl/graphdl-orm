@@ -152,6 +152,62 @@ export function formatSseFrame(event: CellEvent): string {
   return `data: ${JSON.stringify(event)}\n\n`
 }
 
+/**
+ * Open an SSE response stream bound to a subscription on `reg`.
+ *
+ * Extracted from BroadcastDO.fetch() so tests can drive the full
+ * subscribe → publish → stream-frame pipeline against a plain
+ * Registry without needing the DurableObject runtime. The DO
+ * class's fetch() is a thin wrapper.
+ *
+ * Contract:
+ * - `?domain=X` required; `noun` and `entityId` optional narrowers.
+ * - Returns `text/event-stream` with a 200 response.
+ * - Emits `: connected sub=<id>\n\n` immediately so a client
+ *   EventSource sees the connection open.
+ * - Every subsequent matching publish arrives as `data: <json>\n\n`.
+ * - request.signal.abort → unsubscribes and closes the writer.
+ */
+export async function openSseStream(reg: Registry, request: Request): Promise<Response> {
+  const url = new URL(request.url)
+  const domain = url.searchParams.get('domain')
+  if (!domain) {
+    return new Response('domain query parameter required', { status: 400 })
+  }
+  const noun = url.searchParams.get('noun') ?? undefined
+  const entityId = url.searchParams.get('entityId') ?? undefined
+
+  const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>()
+  const writer = writable.getWriter()
+  const encoder = new TextEncoder()
+
+  let subscriptionId = ''
+  const callback: SubscriberCallback = (event) => {
+    writer.write(encoder.encode(formatSseFrame(event))).catch(() => {
+      if (subscriptionId) unsubscribe(reg, subscriptionId)
+    })
+  }
+
+  subscriptionId = subscribe(reg, { domain, noun, entityId }, callback)
+
+  writer.write(encoder.encode(`: connected sub=${subscriptionId}\n\n`))
+    .catch(() => { /* client already gone */ })
+
+  request.signal.addEventListener('abort', () => {
+    unsubscribe(reg, subscriptionId)
+    writer.close().catch(() => {})
+  })
+
+  return new Response(readable, {
+    headers: {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache, no-transform',
+      'Connection': 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    },
+  })
+}
+
 // ── Durable Object wrapper ─────────────────────────────────────────────
 
 /**
@@ -184,52 +240,7 @@ export class BroadcastDO extends DurableObject {
    * The worker's /api/events route forwards here via doStub.fetch().
    */
   async fetch(request: Request): Promise<Response> {
-    const url = new URL(request.url)
-    const domain = url.searchParams.get('domain')
-    if (!domain) {
-      return new Response('domain query parameter required', { status: 400 })
-    }
-    const noun = url.searchParams.get('noun') ?? undefined
-    const entityId = url.searchParams.get('entityId') ?? undefined
-
-    const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>()
-    const writer = writable.getWriter()
-    const encoder = new TextEncoder()
-
-    // Callback: encode the event as an SSE frame and write to the
-    // stream. If the write fails (stream closed by client), drop the
-    // subscription — best-effort cleanup since the abort handler
-    // below also catches most cases.
-    let subscriptionId = ''
-    const callback: SubscriberCallback = (event) => {
-      writer.write(encoder.encode(formatSseFrame(event))).catch(() => {
-        if (subscriptionId) unsubscribe(this.registry, subscriptionId)
-      })
-    }
-
-    subscriptionId = subscribe(this.registry, { domain, noun, entityId }, callback)
-
-    // Open-stream comment so the browser EventSource receives the
-    // connection event immediately, before any data frames arrive.
-    writer.write(encoder.encode(`: connected sub=${subscriptionId}\n\n`))
-      .catch(() => { /* client already gone */ })
-
-    // Client disconnect: the request's abort signal fires. Drop the
-    // subscription and close the writer so the transform stream
-    // ends. Multiple disconnect signals are idempotent.
-    request.signal.addEventListener('abort', () => {
-      unsubscribe(this.registry, subscriptionId)
-      writer.close().catch(() => {})
-    })
-
-    return new Response(readable, {
-      headers: {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache, no-transform',
-        'Connection': 'keep-alive',
-        'X-Accel-Buffering': 'no',
-      },
-    })
+    return openSseStream(this.registry, request)
   }
 
   /** Register a subscriber; returns the subscription id. */
