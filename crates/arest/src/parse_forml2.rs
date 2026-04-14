@@ -65,7 +65,7 @@ enum ParseAction {
     AddNoun(String, NounDef, NounMeta),
     MarkAbstract(String),
     AddPartition(String, Vec<String>),
-    AddFactType(String, FactTypeDef),
+    AddFactType(String, FactTypeDef, Option<String>),
     AddConstraint(ConstraintDef),
     AddDerivation(DerivationRuleDef),
     AddInstanceFact(String), // raw line for instance fact parsing
@@ -519,21 +519,33 @@ fn try_instance_fact(line: &str) -> Option<ParseAction> {
 }
 
 fn try_derivation(line: &str) -> Option<ParseAction> {
+    // ORM 2 derivation markers (* / ** / +) may prefix a derivation rule
+    // to visually signal the derivation mode that was already declared by
+    // the suffix on the corresponding fact-type reading. The mode itself
+    // is carried via the `Fact Type has Derivation Mode` instance fact
+    // emitted at reading-parse time; the prefix here is a readability aid
+    // that the parser tolerates and strips.
+    let stripped = line
+        .strip_prefix("** ")
+        .or_else(|| line.strip_prefix("* "))
+        .or_else(|| line.strip_prefix("+ "))
+        .unwrap_or(line);
+
     // " if " mid-sentence is a derivation rule (Consequent if Antecedent).
     // Lines starting with "If ... then ..." are conditional derivation rules.
     // Lines starting with "If " without " then " are constraints.
-    let has_if = line.contains(" if ") && !line.starts_with("If ");
-    let is_conditional = line.starts_with("If ") && line.contains(" then ");
-    let has_marker = line.contains(" iff ")
+    let has_if = stripped.contains(" if ") && !stripped.starts_with("If ");
+    let is_conditional = stripped.starts_with("If ") && stripped.contains(" then ");
+    let has_marker = stripped.contains(" iff ")
         || has_if
         || is_conditional
-        || line.contains(" := ")
-        || line.contains(" is derived as ")
-        || (line.starts_with("For each ") && line.contains(" = "))
-        || line.contains("count each")
-        || line.contains("sum(");
+        || stripped.contains(" := ")
+        || stripped.contains(" is derived as ")
+        || (stripped.starts_with("For each ") && stripped.contains(" = "))
+        || stripped.contains("count each")
+        || stripped.contains("sum(");
     has_marker.then(|| {
-        let clean = line.trim_end_matches('.');
+        let clean = stripped.trim_end_matches('.');
         ParseAction::AddDerivation(DerivationRuleDef {
             id: String::new(), text: clean.into(),
             antecedent_fact_type_ids: vec![], consequent_fact_type_id: String::new(),
@@ -579,8 +591,8 @@ fn try_fact_type(line: &str, noun_names: &[String]) -> Option<ParseAction> {
     // right after the first noun. Check by finding the first noun and seeing
     // if a quote follows it.
     (!noun_names.iter().any(|noun| line.starts_with(&format!("{} '", noun)))).then_some(())?;
-    let (ft_id, ft_def) = parse_fact(line, noun_names)?;
-    Some(ParseAction::AddFactType(ft_id, ft_def))
+    let (ft_id, ft_def, mode) = parse_fact(line, noun_names)?;
+    Some(ParseAction::AddFactType(ft_id, ft_def, mode))
 }
 
 // =========================================================================
@@ -1414,7 +1426,23 @@ fn apply_action(ir: &mut Domain, action: Option<ParseAction>, lines: &[String], 
                 ir.subtypes.insert(sub, sup.clone());
             });
         }
-        ParseAction::AddFactType(id, def) => {
+        ParseAction::AddFactType(id, def, mode) => {
+            // `mode` is Some("fully-derived" | "derived-and-stored" | "semi-derived")
+            // when the reading terminated with a `*` / `**` / `+` marker.
+            // Emit as a GeneralInstanceFact against the metamodel's
+            // `Fact Type has Derivation Mode` binary — facts all the way
+            // down, no separate Domain field for what is already expressible
+            // as an instance fact.
+            let reading_for_mode = def.reading.clone();
+            mode.into_iter().for_each(|m| {
+                ir.general_instance_facts.push(crate::types::GeneralInstanceFact {
+                    subject_noun: "Fact Type".to_string(),
+                    subject_value: reading_for_mode.clone(),
+                    field_name: "Derivation Mode".to_string(),
+                    object_noun: "Derivation Mode".to_string(),
+                    object_value: m,
+                });
+            });
             ir.fact_types.entry(id).or_insert(def);
         }
         ParseAction::AddConstraint(c) => { ir.constraints.push(c); }
@@ -1629,7 +1657,7 @@ fn parse_role_token(token: &str) -> (&str, &str) {
     (&token[..boundary], token)
 }
 
-fn parse_fact(line: &str, noun_names: &[String]) -> Option<(String, FactTypeDef)> {
+fn parse_fact(line: &str, noun_names: &[String]) -> Option<(String, FactTypeDef, Option<String>)> {
     let clean = line.trim_end_matches('.');
     let found = find_nouns(clean, noun_names);
     (found.len() >= 2).then(|| ())?;
@@ -1641,6 +1669,21 @@ fn parse_fact(line: &str, noun_names: &[String]) -> Option<(String, FactTypeDef)
     let roles: Vec<RoleDef> = found.iter().enumerate()
         .map(|(i, (_, _, name))| RoleDef { noun_name: name.clone(), role_index: i })
         .collect();
+
+    // ORM 2 derivation marker (Halpin ORM2.pdf p. 8). The trailing
+    // text after the last noun — trimmed of whitespace — is compared
+    // to the three markers. User convention requires whitespace
+    // between the verbalization and the marker, so "Full Name *."
+    // is accepted and "Full Name*." is not recognized as a marker.
+    // The caller folds the resulting Some(mode) into the Domain's
+    // `derivation_modes` map keyed by the schema id.
+    let after_last_noun = clean.get(found.last().unwrap().1..).unwrap_or("").trim();
+    let derivation_mode = match after_last_noun {
+        "**" => Some("derived-and-stored".to_string()),
+        "*"  => Some("fully-derived".to_string()),
+        "+"  => Some("semi-derived".to_string()),
+        _    => None,
+    };
 
     // Build role tokens for schema ID (preserving subscript digits from the source text)
     let role_refs: Vec<&str> = found.iter().map(|(_, _, name)| name.as_str()).collect();
@@ -1659,6 +1702,7 @@ fn parse_fact(line: &str, noun_names: &[String]) -> Option<(String, FactTypeDef)
             readings: vec![active_reading],
             roles,
         },
+        derivation_mode,
     ))
 }
 
@@ -2078,7 +2122,7 @@ mod tests {
     #[test]
     fn parse_fact_produces_schema_id() {
         let nouns = vec!["User".to_string(), "Organization".to_string()];
-        let (id, ft) = parse_fact("User owns Organization.", &nouns).unwrap();
+        let (id, ft, _mode) = parse_fact("User owns Organization.", &nouns).unwrap();
         assert_eq!(id, "User_owns_Organization");
         assert_eq!(ft.schema_id, "User_owns_Organization");
         assert_eq!(ft.reading, "User owns Organization");
@@ -2753,6 +2797,152 @@ fn forbidden_ipv6_ula_fd() {
             "Derivation Mode enum must include 'derived-and-stored'; got: {:?}", vals);
         assert!(vals.iter().any(|v| v == "semi-derived"),
             "Derivation Mode enum must include 'semi-derived'; got: {:?}", vals);
+    }
+
+    // --- Derivation mode markers on fact type readings ---
+    //
+    // Halpin ORM 2 attaches graphical markers to derived fact types: `*`
+    // for fully derived, `**` for derived and stored, `+` for semi-derived.
+    // In the FORML 2 textual form, the marker follows the reading, separated
+    // by a space, before the sentence-terminating period. The parser
+    // recognizes the marker and stores the corresponding Derivation Mode on
+    // the FactTypeDef.
+
+    fn mode_for(domain: &Domain, reading: &str) -> Option<String> {
+        domain.general_instance_facts.iter()
+            .find(|f| f.subject_noun == "Fact Type"
+                   && f.subject_value == reading
+                   && f.field_name == "Derivation Mode")
+            .map(|f| f.object_value.clone())
+    }
+
+    #[test]
+    fn double_star_marker_attaches_derived_and_stored_mode() {
+        let input = "\
+Order(.Order Id) is an entity type.
+Line Item(.id) is an entity type.
+Amount is a value type.
+Total is a value type.
+Line Item has Amount.
+  Each Line Item has at most one Amount.
+Order has Total **.
+";
+        let domain = parse_markdown(input).expect("parse");
+        assert_eq!(mode_for(&domain, "Order has Total").as_deref(), Some("derived-and-stored"),
+            "`**` marker must attach Derivation Mode 'derived-and-stored'");
+    }
+
+    #[test]
+    fn plus_marker_attaches_semi_derived_mode() {
+        let input = "\
+Person(.Name) is an entity type.
+Grandparent is a value type.
+Person has Grandparent +.
+";
+        let domain = parse_markdown(input).expect("parse");
+        assert_eq!(mode_for(&domain, "Person has Grandparent").as_deref(), Some("semi-derived"),
+            "`+` marker must attach Derivation Mode 'semi-derived'");
+    }
+
+    #[test]
+    fn derivation_rule_with_star_prefix_is_parsed() {
+        let input = "\
+Customer(.Name) is an entity type.
+First Name is a value type.
+Last Name is a value type.
+Full Name is a value type.
+Customer has First Name.
+Customer has Last Name.
+Customer has Full Name *.
+
+## Derivation Rules
+* Customer has Full Name iff Customer has First Name and Customer has Last Name.
+";
+        let domain = parse_markdown(input).expect("parse");
+        let has_rule = domain.derivation_rules.iter()
+            .any(|r| r.text.contains("Customer has Full Name") && r.text.contains(" iff "));
+        assert!(has_rule,
+            "rule with `*` prefix must be captured (prefix is stripped, body parsed normally); \
+             derivation_rules = {:?}", domain.derivation_rules);
+        // Prefix must have been stripped from the stored rule text.
+        assert!(!domain.derivation_rules.iter().any(|r| r.text.starts_with("* ")),
+            "the leading `*` marker must be stripped from the rule text");
+    }
+
+    #[test]
+    fn derivation_rule_with_double_star_prefix_is_parsed() {
+        let input = "\
+Order(.Order Id) is an entity type.
+Line Item(.id) is an entity type.
+Amount is a value type.
+Total is a value type.
+Order has Total **.
+
+## Derivation Rules
+** Order has Total iff Order has Line Item and that Line Item has Amount.
+";
+        let domain = parse_markdown(input).expect("parse");
+        let has_rule = domain.derivation_rules.iter()
+            .any(|r| r.text.starts_with("Order has Total") && r.text.contains(" iff "));
+        assert!(has_rule,
+            "`**` prefix must be stripped; derivation_rules = {:?}", domain.derivation_rules);
+    }
+
+    #[test]
+    fn derivation_rule_with_plus_prefix_is_parsed() {
+        let input = "\
+Person(.Name) is an entity type.
+
+## Derivation Rules
++ Person is Grandparent if Person is parent of some Person that is parent of some Person.
+";
+        let domain = parse_markdown(input).expect("parse");
+        let has_rule = domain.derivation_rules.iter()
+            .any(|r| r.text.contains("Grandparent") && r.text.contains(" if "));
+        assert!(has_rule,
+            "`+` prefix must be stripped; derivation_rules = {:?}", domain.derivation_rules);
+    }
+
+    #[test]
+    fn no_marker_does_not_attach_derivation_mode() {
+        let input = "\
+Customer(.Name) is an entity type.
+Email is a value type.
+Customer has Email.
+";
+        let domain = parse_markdown(input).expect("parse");
+        assert!(mode_for(&domain, "Customer has Email").is_none(),
+            "a reading without a marker must not emit a Derivation Mode fact; \
+             instance_facts = {:?}", domain.general_instance_facts);
+    }
+
+    #[test]
+    fn star_marker_attaches_fully_derived_mode() {
+        let input = "\
+Customer(.Name) is an entity type.
+First Name is a value type.
+Last Name is a value type.
+Full Name is a value type.
+Customer has First Name.
+  Each Customer has at most one First Name.
+Customer has Last Name.
+  Each Customer has at most one Last Name.
+Customer has Full Name *.
+";
+        let domain = parse_markdown(input).expect("parse");
+        assert!(
+            domain.fact_types.values().any(|ft| ft.reading == "Customer has Full Name"),
+            "'Customer has Full Name' fact type must be present"
+        );
+
+        let mode_fact = domain.general_instance_facts.iter()
+            .find(|f| f.subject_noun == "Fact Type"
+                   && f.subject_value == "Customer has Full Name"
+                   && f.field_name == "Derivation Mode");
+        assert!(mode_fact.is_some(),
+            "`*` marker must emit a 'Fact Type has Derivation Mode' instance fact; \
+             general_instance_facts = {:?}", domain.general_instance_facts);
+        assert_eq!(mode_fact.unwrap().object_value, "fully-derived");
     }
 
     #[test]
