@@ -505,4 +505,36 @@ Order has total.
 
         release_impl(h);
     }
+
+    /// Profiling invocation — runs the same create/list/get workload as
+    /// `list_and_get_see_runtime_created_entities` with the apply-
+    /// variant profiler enabled, then dumps the histogram to stderr.
+    /// #[ignore]'d by default because profiling adds ~20% overhead and
+    /// clutters ordinary test runs. Invoke explicitly:
+    ///
+    ///   cargo test --lib profile_create_order -- --ignored --nocapture
+    ///
+    /// Read the dump to decide where each remaining perf cycle goes
+    /// (task #146 and onward).
+    #[test]
+    #[ignore = "profiling run; invoke with --ignored --nocapture"]
+    fn profile_create_order_dump_histogram() {
+        ast::profile_reset();
+        ast::profile_enable();
+
+        let h = create_impl();
+        let readings = "\
+Order(.id) is an entity type.
+Order has total.
+  Each Order has at most one total.
+";
+        let _ = system_impl(h, "compile", readings);
+        let _ = system_impl(h, "create:Order", "<<id, ord-1>, <total, 100>>");
+        let _ = system_impl(h, "list:Order", "");
+        let _ = system_impl(h, "get:Order", "ord-1");
+        release_impl(h);
+
+        ast::profile_disable();
+        ast::profile_dump();
+    }
 }
