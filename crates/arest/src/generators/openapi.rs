@@ -115,7 +115,7 @@ pub(crate) fn openapi_for_app(domain: &Domain, app_name: &str) -> serde_json::Va
         .flat_map(|(name, _)| {
             let plural = plural_for_noun(domain, name);
             let sm = domain.state_machines.get(name);
-            paths_for_noun(name, &plural, sm)
+            paths_for_noun(name, &plural, sm, domain)
         })
         .collect();
 
@@ -290,6 +290,7 @@ fn paths_for_noun(
     noun_name: &str,
     plural: &str,
     sm: Option<&StateMachineDef>,
+    domain: &Domain,
 ) -> Vec<(String, serde_json::Value)> {
     let schema_ref = serde_json::json!({
         "$ref": format!("#/components/schemas/{}", noun_name),
@@ -388,7 +389,68 @@ fn paths_for_noun(
         ]
     });
 
-    crud.into_iter().chain(transitions).collect()
+    // Theorem 4b navigation: every binary fact type the noun participates
+    // in contributes a related-collection endpoint on the noun's path
+    // space. The projection is
+    //   π_noun(other) ∘ Filter(eq ∘ [noun(r_c), n̄]) : f
+    // which at the OpenAPI surface materializes as GET
+    // `/{plural}/{id}/{other-plural}`. Only entity-typed co-participants
+    // contribute — value types are absorbed into the noun row per RMAP.
+    //
+    // Rings (same noun on both roles, e.g. `Employee reports to Employee`)
+    // are skipped for now because disambiguating the two directions
+    // needs the verb/reading text; tracked as follow-up.
+    let related_entities: std::collections::HashSet<String> = domain.fact_types.values()
+        .filter(|ft| ft.roles.len() == 2)
+        .filter(|ft| ft.roles.iter().any(|r| r.noun_name == noun_name))
+        .filter(|ft| {
+            // Skip rings for now.
+            ft.roles[0].noun_name != ft.roles[1].noun_name
+        })
+        .flat_map(|ft| ft.roles.iter()
+            .filter(|r| r.noun_name != noun_name)
+            .map(|r| r.noun_name.clone())
+            .collect::<Vec<_>>())
+        .filter(|other| domain.nouns.get(other)
+            .map(|n| n.object_type == "entity")
+            .unwrap_or(false))
+        .collect();
+
+    let related_routes: Vec<(String, serde_json::Value)> = related_entities.iter()
+        .map(|other_noun| {
+            let other_plural = plural_for_noun(domain, other_noun);
+            let other_ref = serde_json::json!({
+                "$ref": format!("#/components/schemas/{}", other_noun),
+            });
+            let list_env = envelope_schema(
+                serde_json::json!({ "type": "array", "items": other_ref }),
+                false,
+            );
+            (
+                format!("/{}/{{id}}/{}", plural, other_plural),
+                serde_json::json!({
+                    "parameters": [id_param.clone()],
+                    "get": {
+                        "summary": format!("List {} related to this {} (Theorem 4b).",
+                            other_noun, noun_name),
+                        "responses": {
+                            "200": {
+                                "description": format!(
+                                    "{} entities participating in a binary fact type with this {}. \
+                                     Envelope per Theorem 5.",
+                                    other_noun, noun_name),
+                                "content": {
+                                    "application/json": { "schema": list_env },
+                                },
+                            },
+                        },
+                    },
+                }),
+            )
+        })
+        .collect();
+
+    crud.into_iter().chain(transitions).chain(related_routes).collect()
 }
 
 /// Build one entity's component schema from its RMAP TableDef.
@@ -743,6 +805,43 @@ mod tests {
         assert_eq!(list_schema["properties"]["data"]["type"], "array",
             "list envelope's data must be an array of entity rows; got: {}",
             list_schema);
+    }
+
+    #[test]
+    fn binary_fact_types_emit_related_collection_routes_per_theorem_4b() {
+        // Theorem 4b: for each binary fact type f that noun n participates
+        // in, f contributes a "related collection on n, filtered by n"
+        // (always applies). The OpenAPI surface is
+        // `/{plural-n}/{id}/{plural-other}` GET listing the other-side
+        // entities participating with the given n instance.
+        //
+        // `Customer owns Account` — Customer and Account each get a
+        // navigation toward the other in its path space.
+        let domain = parse("\
+            Customer(.Slug) is an entity type.\n\
+            Account(.Slug) is an entity type.\n\
+            Slug is a value type.\n\
+            Customer has Slug.\n\
+              Each Customer has exactly one Slug.\n\
+            Account has Slug.\n\
+              Each Account has exactly one Slug.\n\
+            Customer owns Account.\n\
+        ");
+        let doc = openapi_for_app(&domain, "test-app");
+        let paths = doc["paths"].as_object().expect("paths must be object");
+
+        let c_to_a = "/customers/{id}/accounts";
+        let a_to_c = "/accounts/{id}/customers";
+        assert!(paths.contains_key(c_to_a),
+            "Customer's related-collection for Account must exist; got: {:?}",
+            paths.keys().collect::<Vec<_>>());
+        assert!(paths[c_to_a]["get"].is_object(),
+            "GET {} must be defined", c_to_a);
+        assert!(paths.contains_key(a_to_c),
+            "Account's related-collection for Customer must exist; got: {:?}",
+            paths.keys().collect::<Vec<_>>());
+        assert!(paths[a_to_c]["get"].is_object(),
+            "GET {} must be defined", a_to_c);
     }
 
     #[test]
