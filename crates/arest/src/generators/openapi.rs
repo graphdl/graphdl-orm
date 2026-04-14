@@ -79,6 +79,21 @@ pub(crate) fn openapi_for_domain(domain: &Domain) -> serde_json::Value {
         })
         .collect();
 
+    // Paths per Theorem 4 (HATEOAS as Projection). For each entity with a
+    // RMAP-derived table, emit the canonical CRUD routes. Follow-up work
+    // adds transition routes (Theorem 4a) and navigation links.
+    let paths: serde_json::Map<String, serde_json::Value> = domain.nouns.iter()
+        .filter(|(_, n)| n.object_type == "entity")
+        .filter(|(name, _)| {
+            let table_name = rmap::to_snake(name);
+            tables_by_entity.contains_key(&table_name)
+        })
+        .flat_map(|(name, _)| {
+            let plural = plural_for_noun(domain, name);
+            paths_for_noun(name, &plural)
+        })
+        .collect();
+
     serde_json::json!({
         "openapi": "3.1.0",
         "info": {
@@ -86,11 +101,82 @@ pub(crate) fn openapi_for_domain(domain: &Domain) -> serde_json::Value {
             "version": "1.0.0",
             "description": "Compiled from FORML2 readings by the AREST engine.",
         },
-        "paths": {},
+        "paths": paths,
         "components": {
             "schemas": schemas,
         },
     })
+}
+
+/// Resolve the plural slug for a noun.
+///
+/// First consults `Noun has Plural` instance facts — facts-all-the-way-
+/// down, no dedicated struct field. Falls back to `snake(noun) + "s"`
+/// when no plural was declared. Users override the fallback by writing
+/// `Noun 'Entity' has Plural 'entities'.` in their readings.
+fn plural_for_noun(domain: &Domain, noun_name: &str) -> String {
+    domain.general_instance_facts.iter()
+        .find(|f| f.subject_noun == "Noun"
+            && f.subject_value == noun_name
+            && f.field_name == "Plural")
+        .map(|f| f.object_value.clone())
+        .unwrap_or_else(|| format!("{}s", rmap::to_snake(noun_name)))
+}
+
+/// Emit the canonical CRUD path pair for one entity noun per Theorem 4.
+///
+/// `/{plural}`          GET (list Filter(p_live):P per Cor 2), POST (create)
+/// `/{plural}/{id}`     GET (read), PATCH (update)
+///
+/// Request/response bodies `$ref` the noun's component schema. Transition
+/// routes, related-collection routes, and the `{data, derived, violations,
+/// _links}` response envelope (Thm 5 repr) are follow-up scope.
+fn paths_for_noun(noun_name: &str, plural: &str) -> Vec<(String, serde_json::Value)> {
+    let schema_ref = serde_json::json!({
+        "$ref": format!("#/components/schemas/{}", noun_name),
+    });
+    let list_response = serde_json::json!({
+        "200": {
+            "description": format!("List of {}.", noun_name),
+            "content": {
+                "application/json": {
+                    "schema": { "type": "array", "items": schema_ref },
+                },
+            },
+        },
+    });
+    let item_response = serde_json::json!({
+        "200": {
+            "description": format!("One {}.", noun_name),
+            "content": {
+                "application/json": { "schema": schema_ref },
+            },
+        },
+    });
+    let request_body = serde_json::json!({
+        "required": true,
+        "content": {
+            "application/json": { "schema": schema_ref },
+        },
+    });
+    let id_param = serde_json::json!({
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "schema": { "type": "string" },
+    });
+
+    vec![
+        (format!("/{}", plural), serde_json::json!({
+            "get":  { "summary": format!("List {}.", noun_name),   "responses": list_response },
+            "post": { "summary": format!("Create {}.", noun_name), "requestBody": request_body, "responses": item_response },
+        })),
+        (format!("/{}/{{id}}", plural), serde_json::json!({
+            "parameters": [id_param],
+            "get":   { "summary": format!("Read {}.", noun_name),   "responses": item_response },
+            "patch": { "summary": format!("Update {}.", noun_name), "requestBody": request_body, "responses": item_response },
+        })),
+    ]
 }
 
 /// Build one entity's component schema from its RMAP TableDef.
@@ -250,6 +336,36 @@ mod tests {
         assert!(required.iter().any(|v| v == "id"),
             "'id' must be required (non-nullable primary key); got required: {:?}",
             required);
+    }
+
+    #[test]
+    fn entity_produces_list_and_item_paths() {
+        // Theorem 4 (HATEOAS as Projection) mandates per-entity CRUD routes.
+        // The plural slug falls back to snake(noun) + "s" when no
+        // `Noun has Plural` instance fact overrides it.
+        let domain = organization_with_slug();
+
+        let doc = openapi_for_domain(&domain);
+        let paths = doc["paths"].as_object()
+            .expect("paths must be an object");
+
+        let list_key = "/organizations";
+        assert!(paths.contains_key(list_key),
+            "list path {:?} must exist; got: {:?}",
+            list_key, paths.keys().collect::<Vec<_>>());
+        assert!(paths[list_key]["get"].is_object(),
+            "GET {} (list) must be defined", list_key);
+        assert!(paths[list_key]["post"].is_object(),
+            "POST {} (create) must be defined", list_key);
+
+        let item_key = "/organizations/{id}";
+        assert!(paths.contains_key(item_key),
+            "item path {:?} must exist; got: {:?}",
+            item_key, paths.keys().collect::<Vec<_>>());
+        assert!(paths[item_key]["get"].is_object(),
+            "GET {} (read) must be defined", item_key);
+        assert!(paths[item_key]["patch"].is_object(),
+            "PATCH {} (update) must be defined", item_key);
     }
 
     #[test]
