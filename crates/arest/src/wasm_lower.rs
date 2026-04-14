@@ -273,6 +273,13 @@ fn scratch_needed(func: &Func) -> u32 {
             // each reusing the same "after-seq" slot.
             2 + children.iter().map(scratch_needed).max().unwrap_or(0)
         }
+        Func::ApplyToAll(f) => {
+            // ApplyToAll needs four slots simultaneously across its
+            // loop: index i, length, input seq ptr, output seq ptr.
+            // The child f sees next_scratch + 4 as its first free
+            // slot.
+            4 + scratch_needed(f)
+        }
         _ => 0,
     }
 }
@@ -373,6 +380,90 @@ fn emit_body(func: &Func, body: &mut Function, next_scratch: u32) -> Result<(), 
             body.instruction(&Instruction::LocalGet(seq_slot));
         }
 
+        // Backus §11.2.4 Apply-to-all: (αf):<x₁, …, xₙ> = <f:x₁, …, f:xₙ>.
+        //
+        // Input is a Seq pointer on the stack. We allocate an output
+        // Seq of the same length and loop over the input, applying f
+        // to each element and storing the result. The loop is a
+        // standard WASM block/loop with br_if as the exit guard.
+        //
+        // Scratch usage:
+        //   i_slot   = next_scratch     : loop index
+        //   len_slot = next_scratch + 1 : input length (read once)
+        //   in_slot  = next_scratch + 2 : input seq ptr
+        //   out_slot = next_scratch + 3 : output seq ptr (also result)
+        //   ≥ next_scratch + 4          : free for child f
+        //
+        // Empty-seq input: len = 0, the br_if fires on the first
+        // iteration, and we return the freshly allocated 8-byte Seq.
+        Func::ApplyToAll(f) => {
+            let i_slot = next_scratch;
+            let len_slot = next_scratch + 1;
+            let in_slot = next_scratch + 2;
+            let out_slot = next_scratch + 3;
+            // Stash input seq ptr.
+            body.instruction(&Instruction::LocalSet(in_slot));
+            // len = in_seq.length
+            body.instruction(&Instruction::LocalGet(in_slot));
+            body.instruction(&Instruction::I32Load(i32_at(4)));
+            body.instruction(&Instruction::LocalSet(len_slot));
+            // Alloc output: header + 4 * len.
+            body.instruction(&Instruction::I32Const(SEQ_HEADER_SIZE));
+            body.instruction(&Instruction::LocalGet(len_slot));
+            body.instruction(&Instruction::I32Const(4));
+            body.instruction(&Instruction::I32Mul);
+            body.instruction(&Instruction::I32Add);
+            body.instruction(&Instruction::Call(FN_ALLOC));
+            body.instruction(&Instruction::LocalTee(out_slot));
+            // Write tag = SEQ at offset 0 (out_slot still on stack from tee).
+            body.instruction(&Instruction::I32Const(TAG_SEQ));
+            body.instruction(&Instruction::I32Store(i32_at(0)));
+            // Write length at offset 4.
+            body.instruction(&Instruction::LocalGet(out_slot));
+            body.instruction(&Instruction::LocalGet(len_slot));
+            body.instruction(&Instruction::I32Store(i32_at(4)));
+            // i = 0
+            body.instruction(&Instruction::I32Const(0));
+            body.instruction(&Instruction::LocalSet(i_slot));
+            // Loop over i in 0..len.
+            body.instruction(&Instruction::Block(BlockType::Empty));
+            body.instruction(&Instruction::Loop(BlockType::Empty));
+            // if i >= len: break (depth 1 → exits the Block).
+            body.instruction(&Instruction::LocalGet(i_slot));
+            body.instruction(&Instruction::LocalGet(len_slot));
+            body.instruction(&Instruction::I32GeS);
+            body.instruction(&Instruction::BrIf(1));
+            // Push store addr = out_seq + 4*i; the I32Store below
+            // adds its own SEQ_HEADER_SIZE offset to land at elem i.
+            body.instruction(&Instruction::LocalGet(out_slot));
+            body.instruction(&Instruction::LocalGet(i_slot));
+            body.instruction(&Instruction::I32Const(4));
+            body.instruction(&Instruction::I32Mul);
+            body.instruction(&Instruction::I32Add);
+            // Push child input = in_seq elem i (load at in_seq + 4*i + 8).
+            body.instruction(&Instruction::LocalGet(in_slot));
+            body.instruction(&Instruction::LocalGet(i_slot));
+            body.instruction(&Instruction::I32Const(4));
+            body.instruction(&Instruction::I32Mul);
+            body.instruction(&Instruction::I32Add);
+            body.instruction(&Instruction::I32Load(i32_at(SEQ_HEADER_SIZE as u64)));
+            // emit f : consumes elem ptr, leaves result ptr.
+            emit_body(f, body, next_scratch + 4)?;
+            // Store result at out_seq + 4*i + 8.
+            body.instruction(&Instruction::I32Store(i32_at(SEQ_HEADER_SIZE as u64)));
+            // i += 1
+            body.instruction(&Instruction::LocalGet(i_slot));
+            body.instruction(&Instruction::I32Const(1));
+            body.instruction(&Instruction::I32Add);
+            body.instruction(&Instruction::LocalSet(i_slot));
+            // continue (depth 0 → back to loop start).
+            body.instruction(&Instruction::Br(0));
+            body.instruction(&Instruction::End); // end loop
+            body.instruction(&Instruction::End); // end block
+            // Leave out_seq on stack.
+            body.instruction(&Instruction::LocalGet(out_slot));
+        }
+
         other => return Err(format!("wasm_lower: variant not yet supported: {:?}",
             std::mem::discriminant(other))),
     }
@@ -470,9 +561,12 @@ mod tests {
 
     #[test]
     fn lower_rejects_unsupported_variant() {
-        // ApplyToAll isn't wired yet — must error, not panic.
-        let f = Func::ApplyToAll(Box::new(Func::Id));
-        let err = lower_to_wasm(&f).expect_err("ApplyToAll should be marked unsupported");
+        // Filter isn't wired yet — must error, not panic. (The
+        // compact+α(p→id;⊥) pattern from AREST.tex needs a way to
+        // allocate a shorter output seq than the input, which our
+        // one-pass loop doesn't yet emit.)
+        let f = Func::Filter(Box::new(Func::Id));
+        let err = lower_to_wasm(&f).expect_err("Filter should be marked unsupported");
         assert!(err.contains("not yet supported"));
     }
 
@@ -649,6 +743,102 @@ mod tests {
             Box::new(Func::Id),
         );
         assert_eq!(roundtrip_seq(&f, 3), vec![3, 3]);
+    }
+
+    // ── ApplyToAll ────────────────────────────────────────────────
+
+    #[test]
+    fn lower_apply_to_all_constant_produces_uniform_seq() {
+        // (α(Constant 1) ∘ <id, id>):x = <1, 1> for any x.
+        let f = Func::Compose(
+            Box::new(Func::ApplyToAll(Box::new(Func::Constant(Object::atom("1"))))),
+            Box::new(Func::Construction(vec![Func::Id, Func::Id])),
+        );
+        assert_eq!(roundtrip_seq(&f, 42), vec![1, 1]);
+        assert_eq!(roundtrip_seq(&f, 0), vec![1, 1]);
+    }
+
+    #[test]
+    fn lower_apply_to_all_id_is_identity_on_seq() {
+        // (α(id) ∘ <id, id>):x = <x, x>. Verifies the loop faithfully
+        // threads element ptrs through without corruption.
+        let f = Func::Compose(
+            Box::new(Func::ApplyToAll(Box::new(Func::Id))),
+            Box::new(Func::Construction(vec![Func::Id, Func::Id])),
+        );
+        assert_eq!(roundtrip_seq(&f, 7), vec![7, 7]);
+        assert_eq!(roundtrip_seq(&f, -3), vec![-3, -3]);
+    }
+
+    #[test]
+    fn lower_apply_to_all_empty_seq_short_circuits() {
+        // α(f):<> = <> — br_if fires on the first iteration with i=0
+        // and len=0, exiting cleanly.
+        let f = Func::Compose(
+            Box::new(Func::ApplyToAll(Box::new(Func::Constant(Object::atom("99"))))),
+            Box::new(Func::Construction(vec![])),
+        );
+        assert_eq!(roundtrip_seq(&f, 42), Vec::<i64>::new());
+    }
+
+    #[test]
+    fn lower_apply_to_all_over_four_elements() {
+        // α(Constant 5) ∘ <id, id, id, id>:x = <5, 5, 5, 5>.
+        // Confirms the loop iterates the correct number of times —
+        // if br_if fires too early we'd see a shorter Seq; if too
+        // late we'd trap on out-of-bounds load.
+        let f = Func::Compose(
+            Box::new(Func::ApplyToAll(Box::new(Func::Constant(Object::atom("5"))))),
+            Box::new(Func::Construction(vec![
+                Func::Id, Func::Id, Func::Id, Func::Id,
+            ])),
+        );
+        assert_eq!(roundtrip_seq(&f, 42), vec![5, 5, 5, 5]);
+    }
+
+    #[test]
+    fn lower_apply_to_all_preserves_seq_shape() {
+        // α(id) ∘ <10, 20, 30>:x — result must be a Seq, tag=1,
+        // length=3, elements are Atoms [10, 20, 30] regardless of x.
+        let f = Func::Compose(
+            Box::new(Func::ApplyToAll(Box::new(Func::Id))),
+            Box::new(Func::Construction(vec![
+                Func::Constant(Object::atom("10")),
+                Func::Constant(Object::atom("20")),
+                Func::Constant(Object::atom("30")),
+            ])),
+        );
+        let (ptr, data) = invoke(&f, 0);
+        assert_eq!(read_u32(&data, ptr), TAG_SEQ as u32, "result is a Seq");
+        assert_eq!(read_u32(&data, ptr + 4), 3, "length=3");
+        assert_eq!(roundtrip_seq(&f, 0), vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn lower_apply_to_all_nested_does_not_collide_scratches() {
+        // α(α(Constant 7)) over <<id, id>, <id>> — inner ApplyToAll
+        // claims scratch slots at next_scratch+4 (inside outer's
+        // body), so the outer's i/len/in/out at slots 0..3 must not
+        // overlap. Confirms the scratch math is correct.
+        let inner_alpha = Func::ApplyToAll(Box::new(Func::Constant(Object::atom("7"))));
+        let f = Func::Compose(
+            Box::new(Func::ApplyToAll(Box::new(inner_alpha))),
+            Box::new(Func::Construction(vec![
+                Func::Construction(vec![Func::Id, Func::Id]),
+                Func::Construction(vec![Func::Id]),
+            ])),
+        );
+        // Outer result: <<7,7>, <7>>. Decode manually.
+        let (ptr, data) = invoke(&f, 42);
+        assert_eq!(read_u32(&data, ptr), TAG_SEQ as u32);
+        assert_eq!(read_u32(&data, ptr + 4), 2);
+        let first = read_u32(&data, ptr + 8);
+        assert_eq!(read_u32(&data, first), TAG_SEQ as u32);
+        assert_eq!(read_u32(&data, first + 4), 2);
+        let first_first = read_u32(&data, first + 8);
+        assert_eq!(read_i64(&data, first_first + 8), 7);
+        let second = read_u32(&data, ptr + 12);
+        assert_eq!(read_u32(&data, second + 4), 1);
     }
 
     // ── Semantic equivalence with Rust apply() ────────────────────
