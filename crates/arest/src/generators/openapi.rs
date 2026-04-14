@@ -394,63 +394,142 @@ fn paths_for_noun(
     // space. The projection is
     //   π_noun(other) ∘ Filter(eq ∘ [noun(r_c), n̄]) : f
     // which at the OpenAPI surface materializes as GET
-    // `/{plural}/{id}/{other-plural}`. Only entity-typed co-participants
+    // `/{plural}/{id}/{slug}`. Only entity-typed co-participants
     // contribute — value types are absorbed into the noun row per RMAP.
     //
-    // Rings (same noun on both roles, e.g. `Employee reports to Employee`)
-    // are skipped for now because disambiguating the two directions
-    // needs the verb/reading text; tracked as follow-up.
-    let related_entities: std::collections::HashSet<String> = domain.fact_types.values()
+    // Slug rules (disambiguation per task #147):
+    //   - Single FT for a (this_noun, other_noun) pair, non-ring:
+    //     `/{plural}/{id}/{other-plural}`.
+    //   - Multiple FTs for the same (this_noun, other_noun) pair:
+    //     `/{plural}/{id}/{verb-slug}-{other-plural}` so parallel
+    //     relationships (Customer owns Account, Customer bills Account)
+    //     each get their own route.
+    //   - Ring (same noun on both roles, e.g. Employee reports to
+    //     Employee): `/{plural}/{id}/{verb-slug}` — the verb alone,
+    //     since the other side is this plural and would collide.
+    //
+    // `verb_slug_from_reading` lowercases and kebab-cases the
+    // non-noun tokens in the reading.
+
+    // Collect this noun's binary-FT participations into (other_noun,
+    // reading) tuples. Rings list twice (once per role) but we
+    // dedupe below via reading identity.
+    let participations: Vec<(String, String)> = domain.fact_types.values()
         .filter(|ft| ft.roles.len() == 2)
         .filter(|ft| ft.roles.iter().any(|r| r.noun_name == noun_name))
         .filter(|ft| {
-            // Skip rings for now.
-            ft.roles[0].noun_name != ft.roles[1].noun_name
+            // The "other" side must be an entity. For rings, both sides
+            // are the same noun which IS an entity — so rings pass.
+            let other_role = ft.roles.iter().find(|r| r.noun_name != noun_name)
+                .unwrap_or(&ft.roles[0]);
+            domain.nouns.get(&other_role.noun_name)
+                .map(|n| n.object_type == "entity")
+                .unwrap_or(false)
         })
-        .flat_map(|ft| ft.roles.iter()
-            .filter(|r| r.noun_name != noun_name)
-            .map(|r| r.noun_name.clone())
-            .collect::<Vec<_>>())
-        .filter(|other| domain.nouns.get(other)
-            .map(|n| n.object_type == "entity")
-            .unwrap_or(false))
+        .map(|ft| {
+            let other_name = ft.roles.iter()
+                .find(|r| r.noun_name != noun_name)
+                .map(|r| r.noun_name.clone())
+                .unwrap_or_else(|| ft.roles[0].noun_name.clone()); // ring case
+            (other_name, ft.reading.clone())
+        })
         .collect();
 
-    let related_routes: Vec<(String, serde_json::Value)> = related_entities.iter()
-        .map(|other_noun| {
+    // Group by other_noun so we can tell single vs multi.
+    let mut by_other: HashMap<String, Vec<String>> = HashMap::new();
+    participations.into_iter().for_each(|(other, reading)| {
+        by_other.entry(other).or_default().push(reading);
+    });
+
+    let noun_names: Vec<&str> = domain.nouns.keys().map(|s| s.as_str()).collect();
+    // Rebind id_param to a fresh clone so the closure below owns it
+    // independently of the transitions closure above (both are lazy
+    // and composed in a chain; the borrow checker otherwise sees
+    // overlapping uses of the outer binding).
+    let id_param_for_related = id_param.clone();
+
+    let related_routes: Vec<(String, serde_json::Value)> = by_other.iter()
+        .flat_map(|(other_noun, readings)| {
             let other_plural = plural_for_noun(domain, other_noun);
-            let other_ref = serde_json::json!({
-                "$ref": format!("#/components/schemas/{}", other_noun),
-            });
-            let list_env = envelope_schema(
-                serde_json::json!({ "type": "array", "items": other_ref }),
-                false,
-            );
-            (
-                format!("/{}/{{id}}/{}", plural, other_plural),
-                serde_json::json!({
-                    "parameters": [id_param.clone()],
-                    "get": {
-                        "summary": format!("List {} related to this {} (Theorem 4b).",
-                            other_noun, noun_name),
-                        "responses": {
-                            "200": {
-                                "description": format!(
-                                    "{} entities participating in a binary fact type with this {}. \
-                                     Envelope per Theorem 5.",
-                                    other_noun, noun_name),
-                                "content": {
-                                    "application/json": { "schema": list_env },
+            let is_ring = other_noun == noun_name;
+            let multiple = readings.len() > 1;
+            readings.iter().map(|reading| {
+                let slug = if is_ring {
+                    verb_slug_from_reading(reading, &noun_names)
+                } else if multiple {
+                    format!("{}-{}",
+                        verb_slug_from_reading(reading, &noun_names),
+                        other_plural)
+                } else {
+                    other_plural.clone()
+                };
+                let other_ref = serde_json::json!({
+                    "$ref": format!("#/components/schemas/{}", other_noun),
+                });
+                let list_env = envelope_schema(
+                    serde_json::json!({ "type": "array", "items": other_ref }),
+                    false,
+                );
+                (
+                    format!("/{}/{{id}}/{}", plural, slug),
+                    serde_json::json!({
+                        "parameters": [id_param_for_related.clone()],
+                        "get": {
+                            "summary": format!("{} (Theorem 4b).", reading),
+                            "responses": {
+                                "200": {
+                                    "description": format!(
+                                        "{} entities reached via `{}`. Envelope per Theorem 5.",
+                                        other_noun, reading),
+                                    "content": {
+                                        "application/json": { "schema": list_env },
+                                    },
                                 },
                             },
                         },
-                    },
-                }),
-            )
+                    }),
+                )
+            }).collect::<Vec<_>>()
         })
         .collect();
 
     crud.into_iter().chain(transitions).chain(related_routes).collect()
+}
+
+/// Extract a kebab-case verb slug from a binary fact type's reading.
+///
+/// Strategy: tokenize the reading, drop the longest-first noun matches,
+/// keep what's left, lowercase-kebab-case the residue. Handles
+/// compound nouns ("State Machine Definition") via longest-match.
+///
+/// "Customer owns Account"        → "owns"
+/// "Order was placed by Customer" → "was-placed-by"
+/// "Employee reports to Employee" → "reports-to"
+fn verb_slug_from_reading(reading: &str, noun_names: &[&str]) -> String {
+    // Sort noun_names descending by whitespace-token count so longer
+    // names match before shorter prefixes of themselves.
+    let mut sorted: Vec<&str> = noun_names.to_vec();
+    sorted.sort_by_key(|n| std::cmp::Reverse(n.split_whitespace().count()));
+
+    let tokens: Vec<&str> = reading.split_whitespace().collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        let matched = sorted.iter().find(|noun| {
+            let noun_tokens: Vec<&str> = noun.split_whitespace().collect();
+            i + noun_tokens.len() <= tokens.len()
+                && tokens[i..i + noun_tokens.len()].iter()
+                    .zip(noun_tokens.iter()).all(|(a, b)| a == b)
+        });
+        match matched {
+            Some(noun) => { i += noun.split_whitespace().count(); }
+            None => {
+                out.push(tokens[i].trim_end_matches('.').to_lowercase());
+                i += 1;
+            }
+        }
+    }
+    out.join("-")
 }
 
 /// Build one entity's component schema from its RMAP TableDef.
@@ -842,6 +921,54 @@ mod tests {
             paths.keys().collect::<Vec<_>>());
         assert!(paths[a_to_c]["get"].is_object(),
             "GET {} must be defined", a_to_c);
+    }
+
+    #[test]
+    fn ring_fact_type_emits_verb_slug_path_per_theorem_4b() {
+        // `Employee reports to Employee` — both roles on Employee.
+        // The forward direction gets a verb-slug path because the
+        // other-plural would collide with this plural.
+        let domain = parse("\
+            Employee(.Slug) is an entity type.\n\
+            Slug is a value type.\n\
+            Employee has Slug.\n\
+              Each Employee has exactly one Slug.\n\
+            Employee reports to Employee.\n\
+        ");
+        let doc = openapi_for_app(&domain, "test-app");
+        let paths = doc["paths"].as_object().expect("paths must be object");
+        let ring_key = "/employees/{id}/reports-to";
+        assert!(paths.contains_key(ring_key),
+            "ring FT must emit verb-slug path; got: {:?}",
+            paths.keys().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn multiple_fts_same_pair_disambiguate_via_verb_slug() {
+        // Two binary FTs between Customer and Account:
+        //   Customer owns Account
+        //   Customer bills Account
+        // Each must emit its own route; the dedupe trap would have
+        // dropped one. Verb slug distinguishes them.
+        let domain = parse("\
+            Customer(.Slug) is an entity type.\n\
+            Account(.Slug) is an entity type.\n\
+            Slug is a value type.\n\
+            Customer has Slug.\n\
+              Each Customer has exactly one Slug.\n\
+            Account has Slug.\n\
+              Each Account has exactly one Slug.\n\
+            Customer owns Account.\n\
+            Customer bills Account.\n\
+        ");
+        let doc = openapi_for_app(&domain, "test-app");
+        let paths = doc["paths"].as_object().expect("paths must be object");
+        assert!(paths.contains_key("/customers/{id}/owns-accounts"),
+            "verb-slugged route for 'owns' must exist; got: {:?}",
+            paths.keys().collect::<Vec<_>>());
+        assert!(paths.contains_key("/customers/{id}/bills-accounts"),
+            "verb-slugged route for 'bills' must exist; got: {:?}",
+            paths.keys().collect::<Vec<_>>());
     }
 
     #[test]
