@@ -77,7 +77,7 @@ If some User has Email and some Stripe Customer has Email that matches then that
 Derivation rules join across:
 
 ```forml2
-User has payment method := User owns Stripe Customer and that Stripe Customer has some Payment Method.
+* User has payment method iff User owns Stripe Customer and that Stripe Customer has some Payment Method.
 ```
 
 The engine does not distinguish local from federated at query time. It fetches the federated data when needed, joins it with the local population, and evaluates the rule as usual.

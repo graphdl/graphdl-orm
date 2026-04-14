@@ -4,30 +4,56 @@ A derivation rule says "when these facts are present, this fact is also present.
 
 ## Syntax
 
-Two operators: `:=` for an equivalence by definition, and `iff` for a logical biconditional. Both produce the same compiled form; use whichever reads better.
+A derived fact type has two things: a **mode** that declares how the derivation relates to assertion, and a **rule body** that specifies the condition.
+
+### Mode (marker on the fact type)
+
+Halpin ORM 2 uses three graphical markers on derived fact types. In FORML 2 textual form the marker is a separate token, whitespace-separated, suffixed to the reading in `## Fact Types` and prefixed to the rule in `## Derivation Rules`.
+
+| Marker | Mode | Semantics |
+|---|---|---|
+| `*` | fully derived | The fact type is always computed from the rule. Asserting directly is a violation. |
+| `**` | derived and stored | Same as `*`, but materialized for performance (e.g., a SQL trigger produces the stored column). |
+| `+` | semi-derived | The fact type can be computed from the rule, AND may be asserted directly. Used where the rule is a sufficient condition but not the only path. |
+
+The parser translates the marker into a `Fact Type has Derivation Mode` instance fact against the metamodel (see `readings/core.md`). Downstream generators read the mode and decide whether to emit storage, a trigger, or a view.
+
+### Rule body (iff for full, if for partial)
+
+The body uses `iff` for a full derivation (the rule is both necessary AND sufficient) or `if` for a partial derivation (the rule is sufficient; other paths may also populate the fact). Halpin ORM 2 (ORM2.pdf, p. 8): "Iff-rules are used for full derivation, and if-rules for partial derivation."
 
 ```forml2
-A has Name := A has some B and that B has some Name.
+## Fact Types
+Customer has Full Name *.
+
+## Derivation Rules
+* Customer has Full Name iff Customer has First Name and Customer has Last Name.
 ```
 
-or
+Partial derivation pairs `+` with `if`:
 
 ```forml2
-A has Name iff A has some B and that B has some Name.
+## Fact Types
+Person is Grandparent +.
+
+## Derivation Rules
++ Person1 is Grandparent if Person1 is parent of some Person2 and that Person2 is parent of some Person3.
 ```
 
-The conditional form `if ... then ...` also works:
+The conditional form `If ... then ...` is also recognized for rules whose consequent introduces a new entity:
 
 ```forml2
 If some User authenticates and that User does not own any Organization then that User owns some Organization.
 ```
+
+`:=` is retired. It came from pre-ORM 1 BNF-style grammar derivations and is no longer accepted as canonical syntax for new readings. The parser still tolerates it for backward compatibility during migration, but new rules should use the marker + iff/if form.
 
 ## Anaphora
 
 The word `that` inside a rule is anaphoric: it refers to an instance introduced earlier by `some`. The rule's join keys are the nouns appearing after `that`.
 
 ```forml2
-A has C := A has some B and that B has some C.
+* A has C iff A has some B and that B has some C.
 ```
 
 Here `B` is the join key: the rule fires when you can find an `A has B` fact and a `B has C` fact sharing the same `B` value.
@@ -46,29 +72,44 @@ The compiler classifies rules and emits different Func shapes:
 
 ## Examples
 
-### Grandparent
+### Grandparent (semi-derived)
 
 ```forml2
-Person is a grandparent of Person2 := Person is a parent of some Person3 and that Person3 is a parent of Person2.
+## Fact Types
+Person is Grandparent +.
+
+## Derivation Rules
++ Person1 is Grandparent if Person1 is parent of some Person2 and that Person2 is parent of some Person3.
 ```
 
-Classified as Join (shared `Person3`). The derivation scans the `parent of` fact type for all pairs, matches the middle person, and writes a grandparent fact.
+Classified as Join (shared `Person2`, `Person3`). The `+` mode lets you ALSO assert Grandparent directly when the parent chain is not in the population.
 
-### Access control
+### Access control (semi-derived)
 
 ```forml2
-User accesses Domain if User owns Organization and App belongs to that Organization and Domain belongs to that App.
+## Fact Types
+User accesses Domain +.
+
+## Derivation Rules
++ User accesses Domain if User owns Organization and App belongs to that Organization and Domain belongs to that App.
++ User accesses Domain if User administers Organization and App belongs to that Organization and Domain belongs to that App.
++ User accesses Domain if User belongs to Organization and App belongs to that Organization and Domain belongs to that App.
++ User accesses Domain if Domain has Access 'public'.
 ```
 
-Three-way join on `Organization` and `App`. Fires whenever the chain lights up, producing `User accesses Domain` facts that the authorization constraints can check.
+Four partial derivations unioned into the same consequent. Semi-derived because the access check fires whenever any one path holds; no single path is necessary.
 
-### Arity
+### Arity (fully derived, aggregate)
 
 ```forml2
-Fact Type has Arity := count of Role where Fact Type has Role.
+## Fact Types
+Fact Type has Arity *.
+
+## Derivation Rules
+* Fact Type has Arity iff Arity is the count of Role where Fact Type has Role.
 ```
 
-Aggregate form (`count of ... where ...`). Compiles to `length(Filter(...))` over the Role fact type.
+Aggregate form with `count of ... where ...`. Fully derived: arity is never asserted, only computed.
 
 ### Derivation chain
 
@@ -101,6 +142,8 @@ It returns the derivation chain: which rule fired, which antecedent facts the ru
 ## SQL triggers for derivations
 
 When a SQL generator is opted in (see [generators](07-generators.md)), the compiler emits `CREATE TRIGGER` statements that materialize derived facts into their own tables. This moves the forward-chain from the engine into the database, which is often faster at scale.
+
+The `**` marker explicitly requests this: a fact type declared `derived and stored` gets a materialized column backed by a trigger. `*` and `+` modes leave the storage decision to the generator's defaults.
 
 The engine detects SQL triggers at compile time and gates its own forward-chain accordingly: only SM-related derivations (the ones needed for status auto-advance) still run in Rust. Everything else is the database's job.
 
