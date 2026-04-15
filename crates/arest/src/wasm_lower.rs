@@ -3111,13 +3111,61 @@ mod tests {
         }
     }
 
+    // ── Composed-primitives smoke (fast, always runs) ─────────────
+
+    #[test]
+    fn wasm_composed_primitives_smoke() {
+        // Exercise a rich Func tree that mixes ~15 lowered primitives in
+        // one pipeline. If any single variant regresses such that its
+        // interaction with composition breaks, this one tree catches it
+        // cheaper than the full per-variant suite.
+        //
+        //   f(x) = sum(map(doubled_if_positive, <1, -2, 3, -4, 5>))
+        //
+        //   doubled_if_positive(y) = Condition(Gt(y, 0), 2*y, 0)
+        //   sum = /Add
+        //
+        // For the Seq <1, -2, 3, -4, 5>:
+        //   doubled_if_positive mapped → <2, 0, 6, 0, 10>
+        //   sum                         → 18
+        let pred_positive = Func::Compose(
+            Box::new(Func::Gt),
+            Box::new(Func::Construction(vec![
+                Func::Id,
+                Func::Constant(Object::atom("0")),
+            ])),
+        );
+        let doubled = Func::Compose(
+            Box::new(Func::Mul),
+            Box::new(Func::Construction(vec![
+                Func::Id,
+                Func::Constant(Object::atom("2")),
+            ])),
+        );
+        let doubled_if_positive = Func::Condition(
+            Box::new(pred_positive),
+            Box::new(doubled),
+            Box::new(Func::Constant(Object::atom("0"))),
+        );
+        let input_seq = seq_of_atoms(&[1, -2, 3, -4, 5]);
+        let pipeline = Func::Compose(
+            Box::new(Func::Insert(Box::new(Func::Add))),
+            Box::new(Func::Compose(
+                Box::new(Func::ApplyToAll(Box::new(doubled_if_positive))),
+                Box::new(input_seq),
+            )),
+        );
+        assert_eq!(roundtrip(&pipeline, 0), 18,
+            "composed-primitives smoke: sum(map(doubled_if_positive, <1,-2,3,-4,5>)) = 18");
+    }
+
     // ── Benchmark + fixture writer (ignored by default) ───────────
 
     /// `#[ignore]`'d so normal cargo test doesn't pay the runtime
     /// cost; run explicitly:
     ///
     ///   cargo test --features wasm-lower --release --lib \
-    ///     bench_and_emit_wasm_fixtures -- --ignored --nocapture
+    ///     bench_wasm_fixtures_and_write -- --ignored --nocapture
     ///
     /// Writes emitted WASM modules to `target/wasm_fixtures/` so the
     /// companion Bun script (`scripts/bench_bun.ts`) can load them
@@ -3126,11 +3174,13 @@ mod tests {
     /// you can see the interpreter tax locally. Bun's V8 JIT result
     /// comes from `scripts/bench_bun.ts`.
     ///
-    /// Note: apply now returns an i32 ptr. The bench sums raw ptrs
-    /// as a black-box; the ns/op comparison is unchanged in meaning.
+    /// Note: apply returns an i32 ptr. The bench sums raw ptrs as a
+    /// black-box; the ns/op comparison is unchanged in meaning. The
+    /// `_and_write` in the name is a warning — the test has a file-
+    /// write side effect, so it's intentionally ignored by default.
     #[test]
     #[ignore = "benchmark; run with --release --ignored --nocapture"]
-    fn bench_and_emit_wasm_fixtures() {
+    fn bench_wasm_fixtures_and_write() {
         use std::fs;
         use std::path::Path;
         use std::time::Instant;

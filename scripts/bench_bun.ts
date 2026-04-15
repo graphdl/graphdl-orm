@@ -4,7 +4,7 @@
  * comparison. Pair with:
  *
  *   cargo test --features wasm-lower --release --lib \
- *     bench_and_emit_wasm_fixtures -- --ignored --nocapture
+ *     bench_wasm_fixtures_and_write -- --ignored --nocapture
  *
  * That command writes target/wasm_fixtures/*.wasm. This script loads
  * each fixture into V8's WASM JIT via Bun, runs the identical tight
@@ -15,9 +15,13 @@
  * code thereafter. Expect results within ~2× of the Rust native row
  * — that's the real "WASM+Bun vs Rust exe" story, not the
  * interpreter-tax that wasmi shows.
+ *
+ * If the fixture files are missing, this script exits with a clear
+ * pointer to the cargo command that creates them — running Bun
+ * without fixtures would otherwise surface as a cryptic ENOENT.
  */
 
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 const ITERATIONS = 10_000_000
@@ -26,14 +30,27 @@ const FIXTURES = [
   { name: 'constant_seven', input: 42n },
 ]
 
+// Existence check before we start so the failure mode is actionable.
+// The cargo test writes into crates/arest/target/wasm_fixtures; this
+// script is expected to run from the repo root.
+const FIXTURE_DIR = join('crates', 'arest', 'target', 'wasm_fixtures')
+const missing = FIXTURES
+  .map(fx => join(FIXTURE_DIR, `${fx.name}.wasm`))
+  .filter(p => !existsSync(p))
+if (missing.length > 0) {
+  console.error('Missing WASM fixtures — generate them first:')
+  console.error('  cargo test --features wasm-lower --release --lib \\')
+  console.error('    bench_wasm_fixtures_and_write -- --ignored --nocapture')
+  console.error('\nMissing paths:')
+  for (const p of missing) console.error(`  ${p}`)
+  process.exit(1)
+}
+
 console.log(`\n=== WASM+Bun benchmark — ${ITERATIONS.toLocaleString()} iterations ===`)
 console.log(`${'case'.padEnd(18)} ${'bun-ns/op'.padStart(12)} ${'ops/sec'.padStart(16)}`)
 
 for (const fx of FIXTURES) {
-  // Fixtures are written by the cargo test from crates/arest, so
-  // they land in crates/arest/target/wasm_fixtures. Run this script
-  // from the repo root.
-  const path = join('crates', 'arest', 'target', 'wasm_fixtures', `${fx.name}.wasm`)
+  const path = join(FIXTURE_DIR, `${fx.name}.wasm`)
   const bytes = readFileSync(path)
   const mod = new WebAssembly.Module(bytes)
   const instance = new WebAssembly.Instance(mod)
