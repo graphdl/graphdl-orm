@@ -21,6 +21,14 @@ use crate::rmap::{self, TableDef};
 /// and emits a synthesizable module for each entity noun with ports derived
 /// from RMAP columns. Non-entity nouns (value types, enums) become wire
 /// widths on the entity modules that reference them.
+///
+/// A `top` module wires all entity modules together with shared clock /
+/// reset and an AND-reduction of their `valid` outputs. The per-entity
+/// column inputs are tied to zero in `top`; an external synthesis
+/// driver replaces those constants with real wires when integrating
+/// with storage (BRAM / LUT-RAM per Backus §14.3 cell layout). Emitting
+/// `top` turns the output from a loose bag of modules into a single
+/// buildable unit.
 pub fn compile_to_verilog(state: &Object) -> String {
     let header = "// Generated from arest FORML2 readings\n\
                   // Backus FP combining forms synthesize to parallel hardware\n\n";
@@ -32,23 +40,81 @@ pub fn compile_to_verilog(state: &Object) -> String {
     let table_map: std::collections::HashMap<String, &TableDef> = tables.iter()
         .map(|t| (t.name.clone(), t)).collect();
 
-    let modules: Vec<String> = nouns
-        .as_seq()
-        .map(|ns| {
-            ns.iter()
-                .filter_map(|n| {
-                    let name = binding(n, "name")?.to_string();
-                    let obj_type = binding(n, "objectType")?;
-                    if obj_type != "entity" { return None; }
-                    let table_name = rmap::to_snake(&name);
-                    let table = table_map.get(&table_name);
-                    Some(emit_module(&name, table.map(|t| &t.columns)))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    // Single pass: build each entity module and capture its top-
+    // module wiring spec at the same time. The RMAP key is
+    // `to_snake(name)` (which inserts underscores at camelCase
+    // boundaries); the Verilog identifier is `sanitize(name)` (pure
+    // lowercase + spaces→underscores). Preserving that distinction
+    // keeps `emit_module`'s behaviour unchanged.
+    let mut modules: Vec<String> = Vec::new();
+    let mut entities: Vec<(String, Vec<String>)> = Vec::new();
+    if let Some(ns) = nouns.as_seq() {
+        for n in ns.iter() {
+            let Some(name_str) = binding(n, "name") else { continue };
+            let Some(obj_type) = binding(n, "objectType") else { continue };
+            if obj_type != "entity" { continue; }
+            let name = name_str.to_string();
+            let table = table_map.get(&rmap::to_snake(&name));
+            let columns: Vec<String> = table
+                .map(|t| t.columns.iter().map(|c| sanitize(&c.name)).collect())
+                .unwrap_or_else(|| vec!["id_in".to_string()]);
+            modules.push(emit_module(&name, table.map(|t| &t.columns)));
+            entities.push((sanitize(&name), columns));
+        }
+    }
 
-    format!("{}{}", header, modules.join("\n"))
+    let top = emit_top_module(&entities);
+
+    format!("{}{}\n{}", header, modules.join("\n"), top)
+}
+
+/// Emit a `top` Verilog module that instantiates every entity module,
+/// wires the shared clock / reset fan-out, ties per-entity column
+/// inputs to zero, and AND-reduces the `valid` outputs into a single
+/// `all_valid` system signal.
+///
+/// Tying inputs to `{N{1'b0}}` keeps the output synthesizable as-is —
+/// a downstream integrator replaces those constants with real drivers
+/// (memory ports, pipeline registers) when wiring the module into a
+/// larger design.
+///
+/// Returns an empty string if no entities are present (so the
+/// caller's `format!` produces just the header).
+fn emit_top_module(entities: &[(String, Vec<String>)]) -> String {
+    if entities.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    out.push_str("module top (\n");
+    out.push_str("    input wire clk,\n");
+    out.push_str("    input wire rst_n,\n");
+    out.push_str("    output reg all_valid\n");
+    out.push_str(");\n");
+    // Per-entity valid wires.
+    for (name, _) in entities {
+        out.push_str(&format!("    wire {}_valid;\n", name));
+    }
+    out.push('\n');
+    // Instantiate each entity with clk/rst_n + zero inputs + valid out.
+    for (name, cols) in entities {
+        out.push_str(&format!("    {} {}_inst (\n", name, name));
+        out.push_str("        .clk(clk),\n");
+        out.push_str("        .rst_n(rst_n),\n");
+        for col in cols {
+            out.push_str(&format!("        .{}({{256{{1'b0}}}}),\n", col));
+        }
+        out.push_str(&format!("        .valid({}_valid)\n", name));
+        out.push_str("    );\n");
+    }
+    // AND-reduce valids after reset release.
+    out.push_str("\n    always @(posedge clk) begin\n");
+    out.push_str("        all_valid <= rst_n");
+    for (name, _) in entities {
+        out.push_str(&format!(" & {}_valid", name));
+    }
+    out.push_str(";\n    end\n");
+    out.push_str("endmodule\n");
+    out
 }
 
 /// Emit a Verilog module for an entity noun with RMAP-derived ports.
@@ -174,8 +240,9 @@ Noun has Object Type.
         assert!(!verilog.contains("endmodule"));
     }
 
-    /// Multi-entity: three entity nouns produce three module blocks.
-    /// Each module name must appear exactly once.
+    /// Multi-entity: three entity nouns produce three module blocks
+    /// plus one `top` module that instantiates and AND-reduces them.
+    /// Each module declaration must appear exactly once.
     #[test]
     fn compile_to_verilog_multiple_entities_produce_multiple_modules() {
         let state = state_with_nouns(&[
@@ -188,11 +255,13 @@ Noun has Object Type.
 
         let module_count = verilog.matches("module ").count();
         let endmodule_count = verilog.matches("endmodule").count();
-        assert_eq!(module_count, 3, "expected 3 modules, got:\n{}", verilog);
-        assert_eq!(endmodule_count, 3, "module/endmodule mismatch:\n{}", verilog);
+        // 3 entity modules + 1 top module = 4.
+        assert_eq!(module_count, 4, "expected 4 module decls, got:\n{}", verilog);
+        assert_eq!(endmodule_count, 4, "module/endmodule mismatch:\n{}", verilog);
         assert!(verilog.contains("module order"));
         assert!(verilog.contains("module customer"));
         assert!(verilog.contains("module product"));
+        assert!(verilog.contains("module top"));
     }
 
     /// Value types must NOT become Verilog modules — only entities do.
@@ -208,8 +277,10 @@ Noun has Object Type.
 
         let verilog = compile_to_verilog(&state);
 
-        assert_eq!(verilog.matches("module ").count(), 1);
+        // 1 entity module + 1 top module = 2.
+        assert_eq!(verilog.matches("module ").count(), 2);
         assert!(verilog.contains("module order"));
+        assert!(verilog.contains("module top"));
         assert!(!verilog.contains("module amount"));
         assert!(!verilog.contains("module currency_code"));
         assert!(!verilog.contains("module priority"));
@@ -291,7 +362,9 @@ Supplier supplies Widget.
         assert!(verilog.contains("// Generated from arest"));
         assert!(verilog.contains("module widget"));
         assert!(verilog.contains("module supplier"));
-        assert_eq!(verilog.matches("endmodule").count(), 2);
+        assert!(verilog.contains("module top"));
+        // 2 entity modules + 1 top module = 3 endmodule markers.
+        assert_eq!(verilog.matches("endmodule").count(), 3);
     }
 
     /// Verilog output is well-formed: every module has clk/rst_n ports,
@@ -315,5 +388,98 @@ Supplier supplies Widget.
             verilog.matches("endmodule").count(),
             "module/endmodule count mismatch:\n{}", verilog
         );
+    }
+
+    // ── Top-level module wiring ────────────────────────────────────
+
+    /// Single-entity compile produces a `top` module that instantiates
+    /// the entity with clk/rst_n fan-out and names the per-entity
+    /// `valid` wire.
+    #[test]
+    fn top_module_instantiates_single_entity_with_clock_reset_fanout() {
+        let state = state_with_nouns(&[("Widget", "entity")]);
+        let verilog = compile_to_verilog(&state);
+        assert!(verilog.contains("module top ("),
+            "top module header missing:\n{}", verilog);
+        // Top declares clk / rst_n inputs and all_valid output.
+        assert!(verilog.contains("module top (\n    input wire clk,\n    input wire rst_n,\n    output reg all_valid\n);"));
+        // Declares the widget_valid wire.
+        assert!(verilog.contains("wire widget_valid;"));
+        // Instantiates the widget module.
+        assert!(verilog.contains("widget widget_inst ("),
+            "top must instantiate widget:\n{}", verilog);
+        // Wires clk / rst_n through.
+        assert!(verilog.contains(".clk(clk)"));
+        assert!(verilog.contains(".rst_n(rst_n)"));
+        // The AND-reduction includes this entity's valid.
+        assert!(verilog.contains("all_valid <= rst_n & widget_valid;"));
+    }
+
+    /// Multi-entity: top instantiates every entity, ANDs all their
+    /// valids, and uses sanitized names consistently.
+    #[test]
+    fn top_module_and_reduces_valid_across_entities() {
+        let state = state_with_nouns(&[
+            ("Alpha", "entity"),
+            ("Beta", "entity"),
+            ("Gamma", "entity"),
+        ]);
+        let verilog = compile_to_verilog(&state);
+        assert!(verilog.contains("module top ("));
+        // All three valid wires declared.
+        for name in ["alpha", "beta", "gamma"] {
+            assert!(verilog.contains(&format!("wire {}_valid;", name)),
+                "missing `wire {}_valid;` in:\n{}", name, verilog);
+            assert!(verilog.contains(&format!("{} {}_inst (", name, name)),
+                "missing instantiation for {}", name);
+        }
+        // AND-reduce includes each entity's valid.
+        assert!(verilog.contains("all_valid <= rst_n & alpha_valid & beta_valid & gamma_valid;"),
+            "AND-reduction shape wrong:\n{}", verilog);
+    }
+
+    /// Column inputs on instantiated entities are tied to zero in
+    /// `top` — the default driver. A downstream integrator replaces
+    /// these with real wires (memory ports, pipeline registers) when
+    /// integrating with storage. Without the zero-ties, unconnected
+    /// input ports would generate synthesis warnings.
+    #[test]
+    fn top_module_ties_entity_column_inputs_to_zero() {
+        let state = state_with_nouns(&[("Widget", "entity")]);
+        let verilog = compile_to_verilog(&state);
+        // Widget has no RMAP table in this synthetic fixture, so the
+        // default port list is [id_in]. The top must wire it to zero.
+        assert!(verilog.contains(".id_in({256{1'b0}})"),
+            "missing zero-tie for widget.id_in:\n{}", verilog);
+    }
+
+    /// Empty state: no entities to wire, so top must be elided. The
+    /// output is just the header — nothing that looks like a module
+    /// declaration at all.
+    #[test]
+    fn top_module_absent_on_empty_state() {
+        let verilog = compile_to_verilog(&Object::phi());
+        assert!(!verilog.contains("module top"),
+            "top must be elided when no entities present:\n{}", verilog);
+        assert_eq!(verilog.matches("module ").count(), 0);
+    }
+
+    /// Sanity: counts stay balanced even with the top module in the
+    /// mix. An N-entity state produces N+1 `module` declarations and
+    /// N+1 `endmodule`s.
+    #[test]
+    fn top_module_preserves_module_endmodule_balance() {
+        let state = state_with_nouns(&[
+            ("One", "entity"),
+            ("Two", "entity"),
+            ("Three", "entity"),
+            ("Four", "entity"),
+        ]);
+        let verilog = compile_to_verilog(&state);
+        let modules = verilog.matches("module ").count();
+        let endmodules = verilog.matches("endmodule").count();
+        assert_eq!(modules, 5, "4 entities + 1 top = 5 module decls");
+        assert_eq!(endmodules, 5);
+        assert_eq!(modules, endmodules);
     }
 }
