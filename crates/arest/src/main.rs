@@ -35,8 +35,13 @@ mod parse_rule;
 mod parse_forml2;
 #[allow(dead_code)]
 mod verbalize;
+// mod arest was deleted in 5aa1f7e (GraphDL → AREST rebrand).
+// The Command enum + apply_command_defs entry points moved to
+// crate::command; this target pulls command in alongside ast so
+// `use crate::command::Command;` inside ast.rs resolves for the
+// bin target as well as the lib.
 #[allow(dead_code)]
-mod arest;
+mod command;
 #[allow(dead_code)]
 mod validate;
 #[allow(dead_code)]

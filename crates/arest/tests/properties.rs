@@ -1141,9 +1141,14 @@ fn constraint_evaluation_via_application() {
         Object::phi(),
     ]);
     let result = ast::apply(uc_func, &context, &d);
-    // UC against empty population: no facts = no violations for UC
-    assert_eq!(result, Object::phi(),
-        "UC constraint against empty population should produce no violations");
+    // UC against empty population: no facts = no violations for UC.
+    // The constraint is compiled to Filter(p):P — Filter over an
+    // empty P returns an empty Seq (Object::Seq(vec![])) rather than
+    // φ, so check the decoded violation list rather than comparing
+    // Objects literally.
+    assert!(ast::decode_violations(&result).is_empty(),
+        "UC constraint against empty population should produce no violations, got {:?}",
+        result);
 
     // Now test with a state that has a UC violation.
     // "Each Order was placed by exactly one Customer" means
@@ -1602,7 +1607,7 @@ fn create_entity_via_defs_produces_entity_and_status() {
     let mut fields = HashMap::new();
     fields.insert("customer".to_string(), "Acme".to_string());
 
-    let command = arest::arest::Command::CreateEntity {
+    let command = arest::command::Command::CreateEntity {
         noun: "Order".to_string(),
         domain: "orders".to_string(),
         id: Some("ord-1".to_string()),
@@ -1611,7 +1616,7 @@ fn create_entity_via_defs_produces_entity_and_status() {
         signature: None,
     };
 
-    let result = arest::arest::apply_command_defs(&d, &command, &state);
+    let result = arest::command::apply_command_defs(&d, &command, &state);
 
     eprintln!("derived_count: {}", result.derived_count);
     eprintln!("status: {:?}", result.status);
@@ -1642,7 +1647,7 @@ fn transition_via_defs_changes_status() {
     // First create an entity to get a state with SM status
     let mut fields = HashMap::new();
     fields.insert("customer".to_string(), "Acme".to_string());
-    let create_cmd = arest::arest::Command::CreateEntity {
+    let create_cmd = arest::command::Command::CreateEntity {
         noun: "Order".to_string(),
         domain: "orders".to_string(),
         id: Some("ord-1".to_string()),
@@ -1650,11 +1655,11 @@ fn transition_via_defs_changes_status() {
         sender: None,
         signature: None,
     };
-    let create_result = arest::arest::apply_command_defs(&d, &create_cmd, &state);
+    let create_result = arest::command::apply_command_defs(&d, &create_cmd, &state);
     assert_eq!(create_result.status, Some("In Cart".to_string()));
 
     // Now transition: place the order
-    let transition_cmd = arest::arest::Command::Transition {
+    let transition_cmd = arest::command::Command::Transition {
         entity_id: "ord-1".to_string(),
         event: "place".to_string(),
         domain: "orders".to_string(),
@@ -1662,7 +1667,7 @@ fn transition_via_defs_changes_status() {
         sender: None,
         signature: None,
     };
-    let result = arest::arest::apply_command_defs(&d, &transition_cmd, &create_result.state);
+    let result = arest::command::apply_command_defs(&d, &transition_cmd, &create_result.state);
 
     assert_eq!(result.status, Some("Placed".to_string()));
 }
@@ -1808,7 +1813,7 @@ fn hateoas_nav_links_in_create_response() {
     let mut fields = HashMap::new();
     fields.insert("customer".to_string(), "Acme".to_string());
 
-    let command = arest::arest::Command::CreateEntity {
+    let command = arest::command::Command::CreateEntity {
         noun: "Order".to_string(),
         domain: "orders".to_string(),
         id: Some("ord-nav".to_string()),
@@ -1817,7 +1822,7 @@ fn hateoas_nav_links_in_create_response() {
         signature: None,
     };
 
-    let result = arest::arest::apply_command_defs(&d, &command, &state);
+    let result = arest::command::apply_command_defs(&d, &command, &state);
     assert!(!result.rejected);
 
     // Order has children (Line Item) and parents (Customer) from UC projections
@@ -1900,7 +1905,7 @@ fn compound_ref_scheme_e2e_create_entity_decomposes() {
     let mut fields = HashMap::new();
     fields.insert("Label".to_string(), "foo".to_string());
 
-    let command = arest::arest::Command::CreateEntity {
+    let command = arest::command::Command::CreateEntity {
         noun: "Thing".to_string(),
         domain: "test".to_string(),
         id: Some("bob-2".to_string()),
@@ -1909,7 +1914,7 @@ fn compound_ref_scheme_e2e_create_entity_decomposes() {
         signature: None,
     };
 
-    let result = arest::arest::apply_command_defs(&d, &command, &state);
+    let result = arest::command::apply_command_defs(&d, &command, &state);
     assert!(!result.rejected, "Valid create should not be rejected");
 
     // The resolve step should decompose "bob-2" into Owner=bob, Seq=2
@@ -1950,14 +1955,14 @@ Reason is a value type.
 Order has Reason.
   Each Order has at most one Reason.
 "#;
-    let load_cmd = arest::arest::Command::LoadReadings {
+    let load_cmd = arest::command::Command::LoadReadings {
         markdown: new_readings.to_string(),
         domain: "orders".to_string(),
         sender: None,
         signature: None,
     };
 
-    let load_result = arest::arest::apply_command_defs(&d, &load_cmd, &state);
+    let load_result = arest::command::apply_command_defs(&d, &load_cmd, &state);
     assert!(!load_result.rejected, "Loading valid readings should not be rejected");
 
     // The state should now contain the new Noun
@@ -1986,14 +1991,14 @@ Reason is a value type.
 Order has Reason.
   Each Order has exactly one Reason.
 "#;
-    let load_cmd = arest::arest::Command::LoadReadings {
+    let load_cmd = arest::command::Command::LoadReadings {
         markdown: new_readings.to_string(),
         domain: "orders".to_string(),
         sender: None,
         signature: None,
     };
 
-    let load_result = arest::arest::apply_command_defs(&d, &load_cmd, &state);
+    let load_result = arest::command::apply_command_defs(&d, &load_cmd, &state);
     assert!(!load_result.rejected, "Loading valid readings should not be rejected");
 
     // load_result.state is now the full D (state + recompiled defs) — Corollary 5.
@@ -2015,7 +2020,7 @@ Order has Reason.
     let mut fields = HashMap::new();
     fields.insert("customer".to_string(), "Acme".to_string());
     fields.insert("Reason".to_string(), "bulk discount".to_string());
-    let create_cmd = arest::arest::Command::CreateEntity {
+    let create_cmd = arest::command::Command::CreateEntity {
         noun: "Order".to_string(),
         domain: "orders".to_string(),
         id: Some("ord-99".to_string()),
@@ -2023,7 +2028,7 @@ Order has Reason.
         sender: None,
         signature: None,
     };
-    let create_result = arest::arest::apply_command_defs(new_d, &create_cmd, new_d);
+    let create_result = arest::command::apply_command_defs(new_d, &create_cmd, new_d);
     assert!(!create_result.rejected, "Create with new field should succeed after self-evolution");
 
     // Verify the new fact type has data
