@@ -1657,9 +1657,17 @@ fn compile_aggregate_derivation(ir: &Domain, rule: &DerivationRuleDef) -> Compil
         .and_then(|ft| ft.roles.iter().find(|r| r.noun_name == agg.group_key_role))
         .map(|r| r.role_index)
         .unwrap_or(0);
+    // Target-role index: for sum/avg/min/max, the role whose values we
+    // fold over. For count, only group membership matters — target is
+    // informational so any row match is fine.
+    let target_idx = source_ft
+        .and_then(|ft| ft.roles.iter().find(|r| r.noun_name == agg.target_role))
+        .map(|r| r.role_index)
+        .unwrap_or(1);
 
     let source_facts = extract_facts_from_pop(&agg.source_fact_type_id);
     let g_key = role_value(group_key_idx);
+    let t_val = role_value(target_idx);
 
     // Codd image-set: pair outer fact's group key with every inner fact.
     // DistL . [g_key_of_outer, all_facts] : <outer, all> → <<k, f1>, ..., <k, fn>>
@@ -1681,20 +1689,53 @@ fn compile_aggregate_derivation(ir: &Domain, rule: &DerivationRuleDef) -> Compil
     );
     let filtered = Func::compose(Func::filter(key_matches), image_pairs);
 
-    // Fold over the filtered image set. Count uses Length directly
-    // (Backus §11.2.3 primitive); sum/min/max/avg wire via Insert below.
-    let fold = match agg.op.as_str() {
-        "count" => Func::Length,
-        // Sum folds /Add over projected target-role values. For target
-        // lookup we need the target role's index on the source FT.
-        _ => {
-            // Unknown/unsupported ops collapse to count so the rule still
-            // fires with a sane value. Follow-up commits wire sum/min/max.
-            Func::Length
+    // Fold over the filtered image set. Count uses Length on the filtered
+    // <key, fact> pair Seq directly. Sum/Min/Max/Avg first project the
+    // target-role value out of each <key, fact> pair, then fold the
+    // appropriate binary op via Backus's Insert (§11.2.4).
+    //
+    // Min/Max aren't Backus primitives; derived as:
+    //   min_pair = Condition(Lt, Selector(1), Selector(2))
+    //   max_pair = Condition(Gt, Selector(1), Selector(2))
+    //
+    // Avg = sum / count. Both sub-folds evaluate over the same filtered
+    // image, wrapped as a pair and fed to Func::Div.
+    let project_values = |filt: Func| Func::compose(
+        Func::apply_to_all(Func::compose(t_val.clone(), Func::Selector(2))),
+        filt,
+    );
+    let agg_value = match agg.op.as_str() {
+        "count" => Func::compose(Func::Length, filtered),
+        "sum" => Func::compose(
+            Func::Insert(Box::new(Func::Add)),
+            project_values(filtered),
+        ),
+        "min" => Func::compose(
+            Func::Insert(Box::new(Func::condition(
+                Func::Lt,
+                Func::Selector(1),
+                Func::Selector(2),
+            ))),
+            project_values(filtered),
+        ),
+        "max" => Func::compose(
+            Func::Insert(Box::new(Func::condition(
+                Func::Gt,
+                Func::Selector(1),
+                Func::Selector(2),
+            ))),
+            project_values(filtered),
+        ),
+        "avg" => {
+            let values = project_values(filtered);
+            let sum = Func::compose(Func::Insert(Box::new(Func::Add)), values.clone());
+            let count = Func::compose(Func::Length, values);
+            Func::compose(Func::Div, Func::construction(vec![sum, count]))
         }
+        // Unknown ops collapse to count so the rule still fires with a
+        // sane value rather than φ.
+        _ => Func::compose(Func::Length, filtered),
     };
-
-    let agg_value = Func::compose(fold, filtered);
 
     // Derived fact: <derived_id, reading, <<group_key_role, key>, <agg_role, value>>>
     let derive_with_context = Func::construction(vec![
