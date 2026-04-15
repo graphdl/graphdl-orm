@@ -2536,6 +2536,26 @@ mod tests {
     // parent."). Both forms MUST compile to the same constraint kind.
 
     #[test]
+    fn subset_with_equal_to_clause_parses_as_ss() {
+        // Halpin's canonical subset-constraint uses `that is` to assert
+        // two roles carry the same value:
+        //   If some Customer places some Order then that Order has
+        //   Shipping Address that is that Customer's Shipping Address.
+        //
+        // `equal to` is a natural-English alias for the same clause.
+        // Both forms should parse as an SS constraint.
+        for linker in ["that is", "equal to"] {
+            let input = format!(
+                "Customer(.Name) is an entity type.\nOrder(.Id) is an entity type.\nShipping Address is a value type.\n## Fact Types\nCustomer places Order.\nCustomer has Shipping Address.\nOrder has Shipping Address.\n## Constraints\nIf some Customer places some Order then that Order has Shipping Address {linker} that Customer's Shipping Address.");
+            let ir = parse_markdown(&input).unwrap_or_else(|e| panic!("linker={linker:?}: {e:?}"));
+            let ss: Vec<_> = ir.constraints.iter().filter(|c| c.kind == "SS").collect();
+            assert!(!ss.is_empty(),
+                "linker={linker:?}: expected at least one SS, got kinds {:?}",
+                ir.constraints.iter().map(|c| &c.kind).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
     fn ring_shorthand_acyclic_emits_ac_constraint() {
         let input = "Category(.Name) is an entity type.\n## Fact Types\nCategory has parent Category.\nCategory has parent Category is acyclic.";
         let ir = parse_markdown(input).unwrap();
