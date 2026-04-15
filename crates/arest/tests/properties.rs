@@ -1512,7 +1512,7 @@ fn system_operand_fetch_retrieves_cells() {
     let input_cell = ast::cell("INPUT", Object::phi());
     let pop = state.clone();
     let file_cell = ast::cell("FILE", ast::encode_state(&pop));
-    let operand = Object::Seq(vec![key_cell, input_cell, file_cell]);
+    let operand = Object::seq(vec![key_cell, input_cell, file_cell]);
 
     // Fetch retrieves cell contents from the operand
     assert_eq!(ast::fetch("KEY", &operand).as_atom(), Some("machine:Order:initial"));
@@ -2297,7 +2297,7 @@ fn map_store_fetch_is_o1() {
 
     // Verify cell_push works on Map
     let pushed = ast::cell_push("new_cell", ast::Object::atom("data"), &map_state);
-    assert_eq!(ast::fetch("new_cell", &pushed), ast::Object::Seq(vec![ast::Object::atom("data")]));
+    assert_eq!(ast::fetch("new_cell", &pushed), ast::Object::seq(vec![ast::Object::atom("data")]));
 
     // Verify merge_states returns Map
     let merged = ast::merge_states(&map_state, &ast::Object::phi());

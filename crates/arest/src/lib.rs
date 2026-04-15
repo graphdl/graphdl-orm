@@ -154,31 +154,43 @@ fn metamodel_state() -> &'static ast::Object {
             ast::merge_states(&acc, &parsed)
         });
 
-        // Register ONLY the platform primitives — no constraint/query/derivation
-        // compilation here. `platform_compile` does the full compile_to_defs_state
-        // on every user compile and will pick up the metamodel cells naturally.
-        let defs = vec![
+        // Compile the metamodel once and bake the full def set into the
+        // cached state. Post-#151 (Arc<[Object]>), cloning this fat
+        // state on every `create_impl` is a ref-count bump per cell
+        // instead of a deep Object copy — the cost that blocked the
+        // previous #146 attempt is gone.
+        //
+        // Fresh handles now start with all metamodel constraint /
+        // derivation / per-noun-validate defs already compiled; the
+        // first `compile` command on a new handle incurs zero
+        // metamodel re-compile cost. User readings still trigger a
+        // full recompile when added (future optimization: splitting
+        // the compile pipeline so the metamodel pass is a no-op when
+        // the cached defs are already present).
+        let mut defs = crate::compile::compile_to_defs_state(&merged);
+        defs.extend([
             ("compile".to_string(), ast::Func::Platform("compile".to_string())),
             ("apply".to_string(), ast::Func::Platform("apply_command".to_string())),
             ("verify_signature".to_string(), ast::Func::Platform("verify_signature".to_string())),
             ("audit".to_string(), ast::Func::Platform("audit".to_string())),
-        ];
+        ]);
         ast::defs_to_state(&defs, &merged)
     })
 }
 
 fn create_impl() -> u32 {
     // Clone the cached metamodel state into a fresh handle. First call
-    // builds the cache; subsequent calls are just a handle allocation +
-    // Object clone.
+    // builds the cache (parses 9 metamodel readings + runs the full
+    // compile pipeline to bake every constraint/derivation/per-noun-
+    // validate def into the state); subsequent calls are just a handle
+    // allocation + Object clone.
     //
-    // We tried pre-compiling metamodel defs into this cached state
-    // (#146 attempt) but the clone-on-create cost outweighs the saved
-    // compile time — a 5487-def Object is ~MB of deep-cloneable state.
-    // Real incremental compile requires detecting deltas in
-    // platform_compile, not precomputing the full image up front.
-    // Task #146 re-scoped: the compile-state cache awaits Arc-backed
-    // Object::Seq (#151) so clones become refcount bumps.
+    // The clone is cheap because Object::Seq is now Arc<[Object]>
+    // (#151) — each cell clone is a ref-count bump, not a deep copy.
+    // Before #151, the prior #146 attempt at baking defs into this
+    // cache was slower net because the ~MB state paid a Vec deep-copy
+    // per handle create. With #151 that tax is gone and #146 lands
+    // naturally: new handles start with zero metamodel compile cost.
     let d = metamodel_state().clone();
     let mut s = ds().lock().unwrap();
     let h = s.iter().position(|x| x.is_none()).unwrap_or_else(|| { s.push(None); s.len() - 1 });
