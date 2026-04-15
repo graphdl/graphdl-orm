@@ -1640,8 +1640,7 @@ fn compile_explicit_derivation(ir: &Domain, rule: &DerivationRuleDef) -> Compile
     // Per-antecedent inline-comparison filters (Halpin FORML Example 5:
     // `has Population >= 1000000`). Each filter wraps its antecedent's
     // extract_facts_from_pop in Func::filter so only facts whose role
-    // value satisfies the comparator survive. The existence-of-fact
-    // check below then sees the filtered Seq.
+    // value satisfies the comparator survive.
     let filter_by_idx: std::collections::HashMap<usize, Func> = rule.antecedent_filters.iter()
         .filter_map(|af| {
             let ft_id = antecedent_ids.get(af.antecedent_index)?;
@@ -1659,43 +1658,72 @@ fn compile_explicit_derivation(ir: &Domain, rule: &DerivationRuleDef) -> Compile
         }
     };
 
-    // Pure Func: check all antecedent FTs non-empty (after filters), derive
-    // consequent. For each antecedent: not(null(filtered_extract(ft_id)))
-    let ant_checks: Vec<Func> = antecedent_ids.iter().enumerate()
-        .map(|(i, ft_id)| Func::compose(
-            Func::compose(Func::Not, Func::NullTest),
-            extract(i, ft_id),
-        ))
-        .collect();
-
-    let all_hold = match ant_checks.len() {
-        0 => Func::constant(Object::t()),
-        1 => ant_checks.into_iter().next().unwrap(),
-        _ => ant_checks.into_iter().reduce(|a, b| Func::compose(Func::And, Func::construction(vec![a, b]))).unwrap(),
+    // Three shapes based on antecedent count:
+    //
+    // 0 antecedents — unconditional single derivation. Rare; mostly bootstrap
+    // rules that assert a constant fact.
+    //
+    // 1 antecedent — per-fact fanout. For each antecedent fact surviving the
+    // filter, produce one consequent fact whose bindings are the antecedent
+    // fact's bindings. Func shape:
+    //   α(<cons_id, cons_reading, bindings>) : Filter(p)? : a_facts
+    // This is the Halpin-aligned derivation semantic: one derived fact per
+    // matching antecedent tuple, not a single existence-check emit.
+    //
+    // 2+ antecedents — existence check across all antecedents. Rules that
+    // want per-tuple semantics over multiple antecedents are classified as
+    // DerivationKind::Join during resolve_derivation_rule and routed to
+    // compile_join_derivation instead. This explicit path handles the
+    // rare multi-antecedent rules without `that` anaphora.
+    let func = match antecedent_ids.len() {
+        0 => {
+            let derived = Func::construction(vec![
+                Func::constant(Object::atom(&consequent_id)),
+                Func::constant(Object::atom(&consequent_reading)),
+                Func::constant(Object::phi()),
+            ]);
+            Func::construction(vec![derived])
+        }
+        1 => {
+            let ft_id = &antecedent_ids[0];
+            // Per-fact derived: input is one antecedent fact (already in
+            // <<noun, val>, ...> binding-seq shape); output is
+            //   <consequent_id, consequent_reading, antecedent_bindings>.
+            // Identity on the bindings position reuses the antecedent's
+            // binding seq verbatim — same behaviour the old existence path
+            // used for its single emit, now applied to each fact.
+            let derive_one = Func::construction(vec![
+                Func::constant(Object::atom(&consequent_id)),
+                Func::constant(Object::atom(&consequent_reading)),
+                Func::Id,
+            ]);
+            Func::compose(Func::apply_to_all(derive_one), extract(0, ft_id))
+        }
+        _ => {
+            // Multi-antecedent existence check (legacy shape).
+            let ant_checks: Vec<Func> = antecedent_ids.iter().enumerate()
+                .map(|(i, ft_id)| Func::compose(
+                    Func::compose(Func::Not, Func::NullTest),
+                    extract(i, ft_id),
+                ))
+                .collect();
+            let all_hold = ant_checks.into_iter()
+                .reduce(|a, b| Func::compose(Func::And, Func::construction(vec![a, b])))
+                .unwrap();
+            // Bindings: first fact from first antecedent.
+            let bindings = Func::compose(Func::Selector(1), extract(0, &antecedent_ids[0]));
+            let derived = Func::construction(vec![
+                Func::constant(Object::atom(&consequent_id)),
+                Func::constant(Object::atom(&consequent_reading)),
+                bindings,
+            ]);
+            Func::condition(
+                all_hold,
+                Func::construction(vec![derived]),
+                Func::constant(Object::phi()),
+            )
+        }
     };
-
-    // When all antecedents hold, produce a derived fact.
-    // Collect first (post-filter) fact from each antecedent to gather bindings.
-    let binding_extractors: Vec<Func> = antecedent_ids.iter().enumerate()
-        .map(|(i, ft_id)| Func::compose(Func::Selector(1), extract(i, ft_id)))
-        .collect();
-
-    // Derived fact = <ft_id, reading, <bindings from first antecedent fact>>
-    let derived = Func::construction(vec![
-        Func::constant(Object::atom(&consequent_id)),
-        Func::constant(Object::atom(&consequent_reading)),
-        if binding_extractors.is_empty() {
-            Func::constant(Object::phi())
-        } else {
-            binding_extractors.into_iter().next().unwrap() // bindings from first antecedent
-        },
-    ]);
-
-    let func = Func::condition(
-        all_hold,
-        Func::construction(vec![derived]),
-        Func::constant(Object::phi()),
-    );
     CompiledDerivation { id, text, kind, func }
 }
 
