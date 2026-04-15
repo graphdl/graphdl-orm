@@ -820,19 +820,19 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
         .filter(|n| noun_fact_types.get(*n).map_or(false, |r| !r.is_empty()))
         .map(|noun_name| {
             let cs = noun_constraint_map.get(noun_name).map(|v| v.as_slice()).unwrap_or(&[]);
-            let prompt = Object::Seq(vec![
+            let prompt = Object::seq(vec![
                 Object::seq(vec![Object::atom("role"), Object::atom(noun_name)]),
-                Object::seq(vec![Object::atom("fact_types"), Object::Seq(atoms_or_empty(&noun_fact_types, noun_name))]),
-                Object::seq(vec![Object::atom("constraints"), Object::Seq(cs.iter().map(|c| Object::atom(&c.text)).collect())]),
-                Object::seq(vec![Object::atom("transitions"), Object::Seq(atoms_or_empty(&noun_transitions, noun_name))]),
+                Object::seq(vec![Object::atom("fact_types"), Object::Seq(atoms_or_empty(&noun_fact_types, noun_name).into())]),
+                Object::seq(vec![Object::atom("constraints"), Object::Seq(cs.iter().map(|c| Object::atom(&c.text)).collect::<Vec<_>>().into())]),
+                Object::seq(vec![Object::atom("transitions"), Object::Seq(atoms_or_empty(&noun_transitions, noun_name).into())]),
                 Object::seq(vec![Object::atom("children"), Object::Seq(
                     children_map.get(noun_name).map(|v| v.iter().map(|c| Object::atom(c)).collect()).unwrap_or_default())]),
                 Object::seq(vec![Object::atom("parent"), Object::Seq(
                     parent_map.get(noun_name).map(|v| v.iter().map(|p| Object::atom(p)).collect()).unwrap_or_default())]),
-                Object::seq(vec![Object::atom("deontic"), Object::Seq(vec![
-                    Object::seq(vec![Object::atom("obligatory"), Object::Seq(deontic_filter(cs, "obligatory"))]),
-                    Object::seq(vec![Object::atom("forbidden"), Object::Seq(deontic_filter(cs, "forbidden"))]),
-                    Object::seq(vec![Object::atom("permitted"), Object::Seq(deontic_filter(cs, "permitted"))]),
+                Object::seq(vec![Object::atom("deontic"), Object::seq(vec![
+                    Object::seq(vec![Object::atom("obligatory"), Object::Seq(deontic_filter(cs, "obligatory").into())]),
+                    Object::seq(vec![Object::atom("forbidden"), Object::Seq(deontic_filter(cs, "forbidden").into())]),
+                    Object::seq(vec![Object::atom("permitted"), Object::Seq(deontic_filter(cs, "permitted").into())]),
                 ])]),
             ]);
             (format!("agent:{}", noun_name), Func::constant(prompt))
@@ -909,7 +909,7 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
     if generators.contains("test") {
     defs.extend(domain.constraints.iter().map(|c| {
         let modality_str = match c.modality.as_str() { "deontic" => "deontic", _ => "alethic" };
-        (format!("test:{}", c.id), Func::constant(Object::Seq(vec![
+        (format!("test:{}", c.id), Func::constant(Object::seq(vec![
             Object::seq(vec![Object::atom("id"), Object::atom(&c.id)]),
             Object::seq(vec![Object::atom("text"), Object::atom(&c.text)]),
             Object::seq(vec![Object::atom("kind"), Object::atom(&c.kind)]),
@@ -1069,7 +1069,7 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
             .collect();
         (format!("wsdl:{}", noun_name), Func::constant(Object::seq(vec![
             Object::seq(vec![Object::atom("portType"), Object::atom(noun_name)]),
-            Object::seq(vec![Object::atom("operations"), Object::Seq(ops)]),
+            Object::seq(vec![Object::atom("operations"), Object::Seq(ops.into())]),
         ])))
     }));
 
@@ -3178,7 +3178,7 @@ fn compile_value_constraint_ast(ir: &Domain, def: &ConstraintDef) -> Func {
         let allowed_atoms: Vec<Object> = valid_values.iter()
             .map(|v| Object::atom(v))
             .collect();
-        let allowed_const = Func::constant(Object::Seq(allowed_atoms));
+        let allowed_const = Func::constant(Object::Seq(allowed_atoms.into()));
 
         // is_allowed: <instance, allowed_seq> -> T if instance is in allowed_seq
         // DistL on <instance, <v1, v2, ...>> -> <<instance, v1>, <instance, v2>, ...>
@@ -3517,7 +3517,7 @@ fn compile_forbidden_ast(ir: &Domain, def: &ConstraintDef) -> Func {
         let value_atoms: Vec<Object> = forbidden_values.iter()
             .flat_map(|(noun, vals)| vals.iter().map(move |v| Object::seq(vec![Object::atom(noun), Object::atom(v)])))
             .collect();
-        let values_const = Func::constant(Object::Seq(value_atoms));
+        let values_const = Func::constant(Object::Seq(value_atoms.into()));
 
         // For each <noun, value>, check contains(response, value)
         // distr . [values, response] -> <<noun_val, response>, ...>
@@ -3546,7 +3546,7 @@ fn compile_forbidden_ast(ir: &Domain, def: &ConstraintDef) -> Func {
         // filter for matches, check count threshold.
         let kw_atoms: Vec<Object> = text_keywords.iter().map(|k| Object::atom(k)).collect();
         let threshold = text_keywords.len() / 2;
-        let kws_const = Func::constant(Object::Seq(kw_atoms));
+        let kws_const = Func::constant(Object::Seq(kw_atoms.into()));
 
         // Filter keywords that appear in response
         let kw_in_response = Func::compose(Func::Contains, Func::construction(vec![
@@ -3614,7 +3614,7 @@ fn compile_obligatory_ast(ir: &Domain, def: &ConstraintDef) -> Func {
     // α(noun_values → condition) : obligatory_values
     let noun_checks: Vec<Func> = obligatory_values.iter().map(|(noun_name, enum_vals)| {
         let val_atoms: Vec<Object> = enum_vals.iter().map(|v| Object::atom(v)).collect();
-        let vals_const = Func::constant(Object::Seq(val_atoms));
+        let vals_const = Func::constant(Object::Seq(val_atoms.into()));
 
         // Filter values found in response: contains . [response, value]
         let val_in_response = Func::compose(Func::Contains, Func::construction(vec![

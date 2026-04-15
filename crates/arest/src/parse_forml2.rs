@@ -937,7 +937,7 @@ pub fn domain_to_state(d: &Domain) -> crate::ast::Object {
 
     // Wrap into Object::Map in one pass: each cell becomes Object::Seq(facts).
     let map: HashMap<String, Object> = cells.into_iter()
-        .map(|(k, v)| (k, Object::Seq(v)))
+        .map(|(k, v)| (k, Object::Seq(v.into())))
         .collect();
     Object::Map(map)
 }
