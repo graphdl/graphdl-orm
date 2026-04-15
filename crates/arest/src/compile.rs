@@ -1566,6 +1566,56 @@ fn compile_derivations(ir: &Domain, sm_defs: &HashMap<String, StateMachineDef>) 
 //  after eliminating all Func::Native closures. All population
 //  traversal is now via pure Func: extract_facts_from_pop, instances_of_noun_func, etc.)
 
+/// Map a Halpin-comparator string to the FFP primitive that tests it on an
+/// atom pair. The pair is constructed as `<role_value, rhs_literal>` — the
+/// resulting predicate returns T when the comparison holds, F otherwise.
+///
+///   ">="  → Func::Ge          "<="  → Func::Le
+///   ">"   → Func::Gt          "<"   → Func::Lt
+///   "="   → Func::Eq          "!="  → Not . Eq
+///
+/// Any unexpected op falls back to Func::Eq so the derivation degrades to
+/// a plain equality rather than silently dropping facts. The parser
+/// normalises `<>` to `!=` so we don't need both here.
+fn comparator_primitive(op: &str) -> Func {
+    match op {
+        ">=" => Func::Ge,
+        "<=" => Func::Le,
+        ">"  => Func::Gt,
+        "<"  => Func::Lt,
+        "!=" => Func::compose(Func::Not, Func::Eq),
+        "="  => Func::Eq,
+        _    => Func::Eq,
+    }
+}
+
+/// Format a parsed numeric literal back into an atom for the generated Func.
+/// Integers round-trip without the `.0` suffix so atoms stay stable against
+/// string-encoded ids (e.g. `"100"` not `"100.0"`).
+fn format_numeric_atom(v: f64) -> String {
+    if v.is_finite() && v == v.trunc() && v.abs() < 1e16 {
+        format!("{}", v as i64)
+    } else {
+        format!("{}", v)
+    }
+}
+
+/// Build the predicate that Func::filter will apply to each fact of an
+/// antecedent Seq to enforce an AntecedentFilter (Halpin Example 5's
+/// `has Population >= 1000000`). Returns `None` if the filter's `role`
+/// doesn't resolve against the fact type's roles — in that case the
+/// filter is silently dropped rather than failing the whole rule.
+fn build_antecedent_filter_pred(af: &crate::types::AntecedentFilter, ft: &crate::types::FactTypeDef) -> Option<Func> {
+    let role_idx = ft.roles.iter().find(|r| r.noun_name == af.role).map(|r| r.role_index)?;
+    Some(Func::compose(
+        comparator_primitive(&af.op),
+        Func::construction(vec![
+            role_value(role_idx),
+            Func::constant(Object::atom(&format_numeric_atom(af.value))),
+        ]),
+    ))
+}
+
 /// Compile an explicit derivation rule from the IR.
 ///
 /// Pure AST form would be:
@@ -1587,10 +1637,35 @@ fn compile_explicit_derivation(ir: &Domain, rule: &DerivationRuleDef) -> Compile
         .map(|ft| ft.reading.clone())
         .unwrap_or_default();
 
-    // Pure Func: check all antecedent FTs non-empty, derive consequent.
-    // For each antecedent: not(null(extract_facts_from_pop(ft_id)))
-    let ant_checks: Vec<Func> = antecedent_ids.iter()
-        .map(|ft_id| Func::compose(Func::compose(Func::Not, Func::NullTest), extract_facts_from_pop(ft_id)))
+    // Per-antecedent inline-comparison filters (Halpin FORML Example 5:
+    // `has Population >= 1000000`). Each filter wraps its antecedent's
+    // extract_facts_from_pop in Func::filter so only facts whose role
+    // value satisfies the comparator survive. The existence-of-fact
+    // check below then sees the filtered Seq.
+    let filter_by_idx: std::collections::HashMap<usize, Func> = rule.antecedent_filters.iter()
+        .filter_map(|af| {
+            let ft_id = antecedent_ids.get(af.antecedent_index)?;
+            let ft = ir.fact_types.get(ft_id)?;
+            build_antecedent_filter_pred(af, ft).map(|p| (af.antecedent_index, p))
+        })
+        .collect();
+
+    // Wrap the raw extractor in Filter when this antecedent has a filter;
+    // otherwise return the bare extractor.
+    let extract = |idx: usize, ft_id: &str| -> Func {
+        match filter_by_idx.get(&idx) {
+            Some(pred) => Func::compose(Func::filter(pred.clone()), extract_facts_from_pop(ft_id)),
+            None => extract_facts_from_pop(ft_id),
+        }
+    };
+
+    // Pure Func: check all antecedent FTs non-empty (after filters), derive
+    // consequent. For each antecedent: not(null(filtered_extract(ft_id)))
+    let ant_checks: Vec<Func> = antecedent_ids.iter().enumerate()
+        .map(|(i, ft_id)| Func::compose(
+            Func::compose(Func::Not, Func::NullTest),
+            extract(i, ft_id),
+        ))
         .collect();
 
     let all_hold = match ant_checks.len() {
@@ -1600,9 +1675,9 @@ fn compile_explicit_derivation(ir: &Domain, rule: &DerivationRuleDef) -> Compile
     };
 
     // When all antecedents hold, produce a derived fact.
-    // Collect first fact from each antecedent to gather bindings.
-    let binding_extractors: Vec<Func> = antecedent_ids.iter()
-        .map(|ft_id| Func::compose(Func::Selector(1), extract_facts_from_pop(ft_id)))
+    // Collect first (post-filter) fact from each antecedent to gather bindings.
+    let binding_extractors: Vec<Func> = antecedent_ids.iter().enumerate()
+        .map(|(i, ft_id)| Func::compose(Func::Selector(1), extract(i, ft_id)))
         .collect();
 
     // Derived fact = <ft_id, reading, <bindings from first antecedent fact>>

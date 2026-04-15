@@ -1953,6 +1953,161 @@ mod tests {
         assert_eq!(WorldAssumption::default(), WorldAssumption::Closed);
     }
 
+    // ── Inline-comparator filter end-to-end (Halpin FORML Example 5) ──
+    //
+    // Each AntecedentFilter on a DerivationRuleDef wraps the antecedent's
+    // fact-extraction in Func::filter, so only facts whose role value
+    // satisfies the comparator reach the existence check. With the current
+    // existence-based semantics: if every antecedent fact is filtered out,
+    // NullTest on the filtered Seq returns true and the rule stops firing.
+    // If at least one fact passes, the rule fires and the binding
+    // extractor pulls from the first post-filter fact.
+
+    fn city_population_ir(filter: Option<crate::types::AntecedentFilter>) -> Domain {
+        let mut fact_types = HashMap::new();
+        fact_types.insert("city_has_population".to_string(), FactTypeDef {
+            schema_id: String::new(),
+            reading: "City has Population".to_string(),
+            readings: vec![],
+            roles: vec![
+                RoleDef { noun_name: "City".to_string(), role_index: 0 },
+                RoleDef { noun_name: "Population".to_string(), role_index: 1 },
+            ],
+        });
+        fact_types.insert("big_city".to_string(), FactTypeDef {
+            schema_id: String::new(),
+            reading: "Big City has City".to_string(),
+            readings: vec![],
+            roles: vec![
+                RoleDef { noun_name: "Big City".to_string(), role_index: 0 },
+                RoleDef { noun_name: "City".to_string(), role_index: 1 },
+            ],
+        });
+        Domain {
+            domain: "test".to_string(),
+            nouns: HashMap::new(),
+            fact_types,
+            constraints: vec![],
+            state_machines: HashMap::new(),
+            derivation_rules: vec![DerivationRuleDef {
+                id: "big-city".to_string(),
+                text: "* Big City has City iff City has Population >= 1000000".to_string(),
+                antecedent_fact_type_ids: vec!["city_has_population".to_string()],
+                consequent_fact_type_id: "big_city".to_string(),
+                kind: DerivationKind::ModusPonens,
+                join_on: vec![],
+                match_on: vec![],
+                consequent_bindings: vec![],
+                antecedent_filters: filter.into_iter().collect(),
+            }],
+            general_instance_facts: vec![],
+            subtypes: HashMap::new(), enum_values: HashMap::new(),
+            ref_schemes: HashMap::new(), objectifications: HashMap::new(),
+            named_spans: HashMap::new(), autofill_spans: vec![],
+        }
+    }
+
+    #[test]
+    fn inline_ge_filter_suppresses_derivation_when_no_fact_matches() {
+        // Both cities well below the 1M threshold → filter strips every
+        // antecedent fact → rule's existence check fails → no derivation.
+        let ir = city_population_ir(Some(crate::types::AntecedentFilter {
+            antecedent_index: 0,
+            role: "Population".to_string(),
+            op: ">=".to_string(),
+            value: 1_000_000.0,
+        }));
+        let (_meta_pop, defs, _def_map) = ir_to_defs(&ir);
+
+        let mut pop_state = ast::Object::phi();
+        pop_state = ast::cell_push("city_has_population",
+            ast::fact_from_pairs(&[("City", "SmallTown"), ("Population", "500000")]), &pop_state);
+        pop_state = ast::cell_push("city_has_population",
+            ast::fact_from_pairs(&[("City", "MidVille"), ("Population", "250000")]), &pop_state);
+
+        let dd = derivation_defs_from(&defs);
+        let (_new_state, derived) = forward_chain_defs_state(&dd, &pop_state);
+
+        let big: Vec<_> = derived.iter().filter(|d| d.fact_type_id == "big_city").collect();
+        assert!(big.is_empty(), "expected no big_city derivations, got {:?}", big);
+    }
+
+    #[test]
+    fn inline_ge_filter_allows_derivation_when_a_fact_matches() {
+        // One city below the threshold, one above. The filter keeps only
+        // the big one, the existence check passes, and the rule fires with
+        // the matching city's bindings.
+        let ir = city_population_ir(Some(crate::types::AntecedentFilter {
+            antecedent_index: 0,
+            role: "Population".to_string(),
+            op: ">=".to_string(),
+            value: 1_000_000.0,
+        }));
+        let (_meta_pop, defs, _def_map) = ir_to_defs(&ir);
+
+        let mut pop_state = ast::Object::phi();
+        pop_state = ast::cell_push("city_has_population",
+            ast::fact_from_pairs(&[("City", "SmallTown"), ("Population", "500000")]), &pop_state);
+        pop_state = ast::cell_push("city_has_population",
+            ast::fact_from_pairs(&[("City", "Megapolis"), ("Population", "2000000")]), &pop_state);
+
+        let dd = derivation_defs_from(&defs);
+        let (_new_state, derived) = forward_chain_defs_state(&dd, &pop_state);
+
+        let big: Vec<_> = derived.iter().filter(|d| d.fact_type_id == "big_city").collect();
+        assert_eq!(big.len(), 1, "expected exactly one big_city derivation, got {:?}", big);
+        // Bindings must come from the matching (post-filter) fact, not the
+        // small-town one whose Population is below the cutoff.
+        assert!(big[0].bindings.iter().any(|(k, v)| k == "City" && v == "Megapolis"),
+            "expected Megapolis as the derived binding, got {:?}", big[0].bindings);
+    }
+
+    #[test]
+    fn inline_lt_filter_keeps_only_smaller_values() {
+        // Flip direction: derivation should fire only when some fact's
+        // Population is strictly less than 1M. Exercises Func::Lt path in
+        // comparator_primitive.
+        let ir = city_population_ir(Some(crate::types::AntecedentFilter {
+            antecedent_index: 0,
+            role: "Population".to_string(),
+            op: "<".to_string(),
+            value: 1_000_000.0,
+        }));
+        let (_meta_pop, defs, _def_map) = ir_to_defs(&ir);
+
+        let mut pop_state = ast::Object::phi();
+        pop_state = ast::cell_push("city_has_population",
+            ast::fact_from_pairs(&[("City", "Megapolis"), ("Population", "2000000")]), &pop_state);
+        pop_state = ast::cell_push("city_has_population",
+            ast::fact_from_pairs(&[("City", "Hamlet"), ("Population", "400")]), &pop_state);
+
+        let dd = derivation_defs_from(&defs);
+        let (_new_state, derived) = forward_chain_defs_state(&dd, &pop_state);
+
+        let big: Vec<_> = derived.iter().filter(|d| d.fact_type_id == "big_city").collect();
+        assert_eq!(big.len(), 1);
+        assert!(big[0].bindings.iter().any(|(k, v)| k == "City" && v == "Hamlet"),
+            "expected Hamlet (pop<1M), got {:?}", big[0].bindings);
+    }
+
+    #[test]
+    fn rule_without_filter_fires_for_any_fact_regression() {
+        // Regression: when antecedent_filters is empty, behavior is
+        // unchanged from pre-#192 — any fact makes the rule fire.
+        let ir = city_population_ir(None);
+        let (_meta_pop, defs, _def_map) = ir_to_defs(&ir);
+
+        let mut pop_state = ast::Object::phi();
+        pop_state = ast::cell_push("city_has_population",
+            ast::fact_from_pairs(&[("City", "SmallTown"), ("Population", "500000")]), &pop_state);
+
+        let dd = derivation_defs_from(&defs);
+        let (_new_state, derived) = forward_chain_defs_state(&dd, &pop_state);
+
+        let big: Vec<_> = derived.iter().filter(|d| d.fact_type_id == "big_city").collect();
+        assert_eq!(big.len(), 1, "unfiltered rule must still fire");
+    }
+
     #[test]
     fn join_derivation_equi_join_on_shared_key() {
         let mut fact_types = HashMap::new();
