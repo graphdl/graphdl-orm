@@ -113,7 +113,7 @@ If some Customer places some Order then that Order has Shipping Address that is 
 
 ## Derivation Rules
 
-Order has Amount := sum of LineItem Amount where LineItem belongs to that Order.
+* Order has Amount iff Amount is the sum of LineItem Amount where some LineItem belongs to that Order.
 
 If some Coupon is applied to some Order and that Coupon has Discount Percent then that Order has Amount that is reduced by that Discount Percent.
 

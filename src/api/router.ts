@@ -208,12 +208,12 @@ function appCellSuffix(app: string): string {
   return out
 }
 
-// ── Live event stream (SSE) per docs/11 §Signals ──────────────────────
+// ── Live event stream (SSE) ────────────────────────────────────────
 //
 // GET /api/events?domain=X&noun=Y&entityId=Z opens a persistent
 // text/event-stream. The worker forwards the request to BroadcastDO,
 // which opens the stream and registers a subscription matching the
-// query filter. Every post-mutation hook (#114) publishes into the DO;
+// query filter. Every post-mutation hook publishes into the DO;
 // matching subscribers receive data frames.
 //
 // Narrower filters receive fewer events. `domain` is required; `noun`

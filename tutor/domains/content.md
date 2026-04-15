@@ -91,7 +91,7 @@ It is obligatory that each Article has Content Body before Content Status is 'pu
 
 ## Derivation Rules
 
-Article has Word Count := count of words in that Article's Content Body.
+* Article has Word Count iff Article has Content Body and Word Count is the count of words in that Content Body.
 
 ## Instance Facts
 

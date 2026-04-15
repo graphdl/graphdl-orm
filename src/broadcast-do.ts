@@ -5,19 +5,12 @@
  * multi-tenant ones). Holds a transient subscriber registry and fans
  * out cell-change events to matching subscribers.
  *
- * This module exposes the pure registry functions; the DO class at the
- * bottom wires them to the Cloudflare DurableObject runtime.
+ * This module exposes the pure registry functions; the DO class at
+ * the bottom wires them to the Cloudflare DurableObject runtime.
+ * Tests exercise every branch without touching the DO runtime.
  *
- * Scope of task #112: the in-memory registry + pure operations. Tests
- * exercise every branch without touching the DO runtime.
- * - #113 wires the /api/events SSE route that opens a subscriber conn
- * - #114 post-mutation hooks publish CellEvents
- * - #115 adds the BROADCAST binding + v2 migration to wrangler.jsonc
- * - #116 end-to-end smoke through the apis catch-all
- *
- * Under the OS-kernel reframe (docs/11): subscribe = sigaction,
- * unsubscribe = signal(SIG_DFL), publish = kill(), match = signal
- * mask lookup.
+ * Signal-delivery analogy: subscribe = sigaction, unsubscribe =
+ * signal(SIG_DFL), publish = kill(), match = signal-mask lookup.
  */
 
 import { DurableObject } from 'cloudflare:workers'

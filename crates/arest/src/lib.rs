@@ -40,23 +40,24 @@ pub mod cloudflare;
 ///
 /// `snapshots` holds named captures of `d` taken via `system(h,
 /// "snapshot", "")` and restorable via `system(h, "rollback", id)`.
-/// Cheap in memory because `d` is `Arc`-shared internally (#151) —
+/// Cheap in memory because `d` is `Arc`-shared internally —
 /// a snapshot is one map insert plus an Arc ref bump per cell.
 struct CompiledState {
     d: ast::Object,
     snapshots: std::collections::HashMap<String, ast::Object>,
 }
 
-// Per docs/11-system-as-os-kernel.md: the process table.
+// The per-handle process table:
 //
 // Outer Mutex protects slot allocation/recycling (Vec mutations).
-// Inner RwLock<CompiledState> protects per-tenant state, held only for
-// the duration of one operation. Two tenants run concurrently — the
-// outer lock is held only for slot lookup, then dropped; the inner
-// lock is per-Arc, so different tenants don't contend.
+// Inner RwLock<CompiledState> protects per-tenant state, held only
+// for the duration of one operation. Two tenants run concurrently —
+// the outer lock is held only for slot lookup, then dropped; the
+// inner lock is per-Arc, so different tenants don't contend.
 //
 // This realises Cell Isolation (Definition 2) at the per-tenant
-// granularity. Per-cell concurrency within a tenant is task #156.
+// granularity. Per-cell concurrency within a tenant is a follow-up
+// that needs apply() to acquire cell-level locks just-in-time.
 static DOMAINS: OnceLock<Mutex<Vec<Option<Arc<RwLock<CompiledState>>>>>> = OnceLock::new();
 fn ds() -> &'static Mutex<Vec<Option<Arc<RwLock<CompiledState>>>>> {
     DOMAINS.get_or_init(|| Mutex::new(Vec::new()))
@@ -162,10 +163,10 @@ fn metamodel_state() -> &'static ast::Object {
         });
 
         // Compile the metamodel once and bake the full def set into the
-        // cached state. Post-#151 (Arc<[Object]>), cloning this fat
-        // state on every `create_impl` is a ref-count bump per cell
+        // cached state. With `Object::Seq(Arc<[Object]>)`, cloning this
+        // fat state on every `create_impl` is a ref-count bump per cell
         // instead of a deep Object copy — the cost that blocked the
-        // previous #146 attempt is gone.
+        // previous baked-defs attempt is gone.
         //
         // Fresh handles now start with all metamodel constraint /
         // derivation / per-noun-validate defs already compiled; the
@@ -192,12 +193,13 @@ fn create_impl() -> u32 {
     // validate def into the state); subsequent calls are just a handle
     // allocation + Object clone.
     //
-    // The clone is cheap because Object::Seq is now Arc<[Object]>
-    // (#151) — each cell clone is a ref-count bump, not a deep copy.
-    // Before #151, the prior #146 attempt at baking defs into this
-    // cache was slower net because the ~MB state paid a Vec deep-copy
-    // per handle create. With #151 that tax is gone and #146 lands
-    // naturally: new handles start with zero metamodel compile cost.
+    // The clone is cheap because Object::Seq is Arc<[Object]> — each
+    // cell clone is a ref-count bump, not a deep copy. Before the Arc
+    // refactor, an earlier attempt at baking defs into this cache was
+    // slower net because the ~MB state paid a Vec deep-copy per handle
+    // create. With Arc-sharing that tax is gone and the baked-defs
+    // approach lands naturally: new handles start with zero metamodel
+    // compile cost.
     let d = metamodel_state().clone();
     let mut s = ds().lock().unwrap();
     let h = s.iter().position(|x| x.is_none()).unwrap_or_else(|| { s.push(None); s.len() - 1 });
@@ -575,7 +577,7 @@ mod handle_isolation_tests {
         release_impl(h_b);
     }
 
-    /// #108: `audit_log` must be reachable as a system def — return the
+    /// `audit_log` must be reachable as a system def — return the
     /// audit trail as a JSON array, and each entry for an entity-scoped
     /// apply must carry the entity id so `explain` can filter by it.
     #[test]
@@ -606,7 +608,7 @@ Order has total.
         release_impl(h);
     }
 
-    /// #107: After `create:Order` adds an entity to D via apply, both
+    /// After `create:Order` adds an entity to D via apply, both
     /// `list:Order` and `get:Order` must see it. Currently those defs
     /// are compile-time constants baked from Instance Facts, so they
     /// never observe runtime-created entities.
@@ -653,8 +655,7 @@ Order has total.
     ///
     ///   cargo test --lib profile_create_order -- --ignored --nocapture
     ///
-    /// Read the dump to decide where each remaining perf cycle goes
-    /// (task #146 and onward).
+    /// Read the dump to decide where each remaining perf cycle goes.
     #[cfg(feature = "profile")]
     #[test]
     #[ignore = "profiling run; invoke with --features profile --ignored --nocapture"]
@@ -678,7 +679,7 @@ Order has total.
         ast::profile_dump();
     }
 
-    // ── Snapshot / rollback (#158) ──────────────────────────────
+    // ── Snapshot / rollback ─────────────────────────────────────
 
     #[test]
     fn snapshot_returns_auto_id_when_input_empty() {
@@ -795,7 +796,7 @@ Order has total.
         assert_eq!(system_impl(u32::MAX, "snapshots", ""), "⊥");
     }
 
-    // ── Per-tenant read/write lock classification (#156) ────────────
+    // ── Per-tenant read/write lock classification ──────────────────
 
     #[test]
     fn read_only_op_classification_covers_query_verbs() {

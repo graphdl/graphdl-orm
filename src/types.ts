@@ -5,7 +5,7 @@ export interface Env {
    * Subscriber registry for the kernel's signal-delivery layer. One
    * instance per scope — routes fetch `idFromName('global')` (or
    * per-App). Post-mutation hooks publish CellEvents; the /api/events
-   * SSE route subscribes. See src/broadcast-do.ts and docs/11.
+   * SSE route subscribes. See src/broadcast-do.ts.
    */
   BROADCAST: DurableObjectNamespace
   ENVIRONMENT: string

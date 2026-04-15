@@ -52,7 +52,7 @@ rayon = { version = "1", optional = true }
 hmac = "0.12"
 sha2 = "0.10"
 subtle = "2"
-# WASM-lowering PoC (task #152). wasm-encoder emits bytes; wasmtime
+# WASM-lowering PoC. wasm-encoder emits bytes; wasmtime
 # hosts them for the roundtrip test so we can prove semantic
 # equivalence with Rust apply() before investing in the full
 # Func → WASM compiler. Both are opt-in via the `wasm-lower` feature

@@ -397,7 +397,7 @@ fn paths_for_noun(
     // `/{plural}/{id}/{slug}`. Only entity-typed co-participants
     // contribute — value types are absorbed into the noun row per RMAP.
     //
-    // Slug rules (disambiguation per task #147):
+    // Slug rules (ring + multi-FT disambiguation):
     //   - Single FT for a (this_noun, other_noun) pair, non-ring:
     //     `/{plural}/{id}/{other-plural}`.
     //   - Multiple FTs for the same (this_noun, other_noun) pair:
@@ -493,7 +493,7 @@ fn paths_for_noun(
         })
         .collect();
 
-    // Introspection routes per Theorem 5 (task #148).
+    // Introspection routes per Theorem 5.
     //
     // /{plural}/{id}/actions  — events valid from current status.
     //   Mirrors /{plural}/{id}/transitions; emitted only when the noun
