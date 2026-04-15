@@ -9,6 +9,7 @@
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
+use std::sync::RwLock;
 
 pub mod ast;
 pub mod types;
@@ -49,22 +50,22 @@ struct CompiledState {
 // Per docs/11-system-as-os-kernel.md: the process table.
 //
 // Outer Mutex protects slot allocation/recycling (Vec mutations).
-// Inner Mutex<CompiledState> protects per-tenant state, held only for
+// Inner RwLock<CompiledState> protects per-tenant state, held only for
 // the duration of one operation. Two tenants run concurrently — the
 // outer lock is held only for slot lookup, then dropped; the inner
 // lock is per-Arc, so different tenants don't contend.
 //
 // This realises Cell Isolation (Definition 2) at the per-tenant
 // granularity. Per-cell concurrency within a tenant is task #156.
-static DOMAINS: OnceLock<Mutex<Vec<Option<Arc<Mutex<CompiledState>>>>>> = OnceLock::new();
-fn ds() -> &'static Mutex<Vec<Option<Arc<Mutex<CompiledState>>>>> {
+static DOMAINS: OnceLock<Mutex<Vec<Option<Arc<RwLock<CompiledState>>>>>> = OnceLock::new();
+fn ds() -> &'static Mutex<Vec<Option<Arc<RwLock<CompiledState>>>>> {
     DOMAINS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 /// Look up a slot's tenant lock by handle. Returns None for invalid
 /// handles or freed slots. The outer Vec mutex is held only for the
 /// duration of the lookup and Arc clone, then released.
-fn tenant_lock(handle: u32) -> Option<Arc<Mutex<CompiledState>>> {
+fn tenant_lock(handle: u32) -> Option<Arc<RwLock<CompiledState>>> {
     let s = ds().lock().unwrap();
     s.get(handle as usize).and_then(|x| x.as_ref()).map(Arc::clone)
 }
@@ -74,7 +75,7 @@ fn allocate(state: ast::Object, defs: Vec<(String, ast::Func)>) -> u32 {
     let d = ast::defs_to_state(&defs, &state);
     let mut s = ds().lock().unwrap();
     let h = s.iter().position(|x| x.is_none()).unwrap_or_else(|| { s.push(None); s.len() - 1 });
-    s[h] = Some(Arc::new(Mutex::new(CompiledState { d, snapshots: std::collections::HashMap::new() })));
+    s[h] = Some(Arc::new(RwLock::new(CompiledState { d, snapshots: std::collections::HashMap::new() })));
     h as u32
 }
 
@@ -200,7 +201,7 @@ fn create_impl() -> u32 {
     let d = metamodel_state().clone();
     let mut s = ds().lock().unwrap();
     let h = s.iter().position(|x| x.is_none()).unwrap_or_else(|| { s.push(None); s.len() - 1 });
-    s[h] = Some(Arc::new(Mutex::new(CompiledState { d, snapshots: std::collections::HashMap::new() })));
+    s[h] = Some(Arc::new(RwLock::new(CompiledState { d, snapshots: std::collections::HashMap::new() })));
     h as u32
 }
 
@@ -218,37 +219,56 @@ fn release_impl(handle: u32) {
     s.get_mut(handle as usize).into_iter().for_each(|slot| *slot = None);
 }
 
+/// Classify an op as read-only by key prefix. Read-only ops take the
+/// per-tenant RwLock in shared (read) mode, so two concurrent `list:X`
+/// or `debug` calls on the same handle don't block each other.
+///
+/// Conservative list — when in doubt, a key falls through to the write
+/// path, which is still correct (just serializes). Extending this list
+/// is the right way to unlock more per-tenant concurrency.
+fn is_read_only_op(key: &str) -> bool {
+    matches!(
+        key,
+        "debug" | "audit" | "verify_signature" | "snapshots"
+    )
+    || key.starts_with("list:")
+    || key.starts_with("get:")
+    || key.starts_with("query:")
+    || key.starts_with("explain:")
+}
+
 /// SYSTEM:x = ⟨o, D'⟩. Pure ρ-dispatch + state transition.
 ///
 /// The FPGA core: look up key in D via ρ, beta-reduce, update state.
 /// No match arms. No if-branches. Every operation is a def in D.
 ///
-/// Concurrency: the outer process-table mutex is held only briefly to
-/// fetch this tenant's Arc<Mutex<CompiledState>>. The per-tenant inner
-/// mutex is held for the full ρ-dispatch + state mutation. Two tenants
-/// run concurrently; same tenant's operations remain serialized
-/// (Definition 2 cell isolation at per-tenant granularity).
+/// Concurrency:
+///   - Outer process-table mutex: held briefly to clone the per-tenant
+///     Arc<RwLock<CompiledState>>. Two tenants run concurrently.
+///   - Per-tenant RwLock: read-only ops take `read()` (shared);
+///     write-path ops take `write()` (exclusive). Licenses Definition 2
+///     at the tenant granularity — parallel queries on a handle don't
+///     contend with each other, only with writers. Full per-cell
+///     concurrency (parallel disjoint writes within one handle) is a
+///     follow-up; it needs apply() to acquire cell locks just-in-time.
 fn system_impl(handle: u32, key: &str, input: &str) -> String {
     let tenant = match tenant_lock(handle) {
         Some(t) => t,
         None => return "⊥".into(),
     };
-    let mut st = tenant.lock().unwrap();
 
-    // `snapshot` and `rollback` operate on CompiledState (the handle's
-    // whole state + its snapshot map), which the Func::Platform dispatch
-    // path can't reach — apply() has access to D but not CompiledState.
-    // Intercept them here before the ρ-dispatch.
+    // ── CompiledState-level intercepts ──────────────────────────────
+    //
+    // `snapshot` and `rollback` mutate the tenant's snapshot map or
+    // replace `d`; they need a write lock. `snapshots` only reads the
+    // map and can share with concurrent readers.
     //
     //   system(h, "snapshot", "")      → <snap-id>                (fresh id)
     //   system(h, "snapshot", "label") → label                    (caller-named)
     //   system(h, "rollback", "id")    → id on success, ⊥ on miss
     //   system(h, "snapshots", "")     → <id₁, id₂, ...> FFP seq
-    //
-    // Input to snapshot is optional: empty string means "auto-generate a
-    // label of the form snap-N"; a non-empty input becomes the label
-    // verbatim (overwriting any existing snapshot with that label).
     if key == "snapshot" {
+        let mut st = tenant.write().unwrap();
         let label = if input.is_empty() {
             format!("snap-{}", st.snapshots.len())
         } else {
@@ -259,6 +279,7 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
         return label;
     }
     if key == "rollback" {
+        let mut st = tenant.write().unwrap();
         return match st.snapshots.get(input).cloned() {
             Some(snap) => {
                 st.d = snap;
@@ -268,8 +289,7 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
         };
     }
     if key == "snapshots" {
-        // FFP-style sequence literal: <id1, id2, ...>. Deterministic
-        // order (sorted) so tests can diff against a fixed string.
+        let st = tenant.read().unwrap();
         let mut ids: Vec<&String> = st.snapshots.keys().collect();
         ids.sort();
         return format!(
@@ -278,6 +298,22 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
         );
     }
 
+    // ── Read-only dispatch path ─────────────────────────────────────
+    //
+    // Known-read ops (list / get / query / debug / audit / explain /
+    // verify_signature) take a shared lock. Result can never be a
+    // "new D"; if apply() somehow returns a store-shaped Object for
+    // one of these keys we silently don't persist it — that's a bug
+    // in the op's definition, not a concurrency issue.
+    if is_read_only_op(key) {
+        let st = tenant.read().unwrap();
+        let obj = ast::Object::parse(input);
+        let result = ast::apply(&ast::Func::Def(key.to_string()), &obj, &st.d);
+        return result.to_json_string();
+    }
+
+    // ── Write dispatch path ─────────────────────────────────────────
+    let mut st = tenant.write().unwrap();
     let obj = ast::Object::parse(input);
 
     // Single ρ-dispatch (Eq. 9)
@@ -379,12 +415,13 @@ impl exports::arest::engine::engine::Guest for E {
 mod handle_isolation_tests {
     use super::*;
 
-    /// Test-only peek at a handle's compiled state. Clones D under the
-    /// per-tenant inner lock so the caller holds no reference to DOMAINS
-    /// nor to the per-tenant guard.
+    /// Test-only peek at a handle's compiled state. Clones D under a
+    /// shared (read) lock so the caller holds no reference to DOMAINS
+    /// nor to the per-tenant guard. Read-only; doesn't block other
+    /// readers on the same handle.
     fn peek(handle: u32) -> Option<ast::Object> {
         let tenant = tenant_lock(handle)?;
-        let st = tenant.lock().unwrap();
+        let st = tenant.read().unwrap();
         Some(st.d.clone())
     }
 
@@ -419,7 +456,7 @@ mod handle_isolation_tests {
         // state-transition def) and re-check B to prove no aliasing.
         {
             let tenant_a = tenant_lock(h_a).expect("handle A must be live");
-            let mut st = tenant_a.lock().unwrap();
+            let mut st = tenant_a.write().unwrap();
             let new_d = ast::store(
                 "Noun",
                 ast::Object::atom("tenant-a-mutated"),
@@ -532,7 +569,7 @@ mod handle_isolation_tests {
         let arc_a = tenant_lock(h_a).expect("h_a must be live");
         let arc_b = tenant_lock(h_b).expect("h_b must be live");
         assert!(!Arc::ptr_eq(&arc_a, &arc_b),
-            "each handle must own a distinct tenant Arc<Mutex<CompiledState>>");
+            "each handle must own a distinct tenant Arc<RwLock<CompiledState>>");
 
         release_impl(h_a);
         release_impl(h_b);
@@ -688,7 +725,7 @@ Order has total.
         // Mutate the Noun cell by replacing the whole state.
         {
             let tenant = tenant_lock(h).unwrap();
-            let mut st = tenant.lock().unwrap();
+            let mut st = tenant.write().unwrap();
             st.d = ast::store("Noun", ast::Object::atom("after"), &ast::Object::phi());
         }
         assert_eq!(
@@ -715,7 +752,7 @@ Order has total.
         for round in 0..3 {
             {
                 let tenant = tenant_lock(h).unwrap();
-                let mut st = tenant.lock().unwrap();
+                let mut st = tenant.write().unwrap();
                 st.d = ast::store(
                     "Noun",
                     ast::Object::atom(&format!("mutation-{round}")),
@@ -756,5 +793,76 @@ Order has total.
         assert_eq!(system_impl(u32::MAX, "snapshot", ""), "⊥");
         assert_eq!(system_impl(u32::MAX, "rollback", "whatever"), "⊥");
         assert_eq!(system_impl(u32::MAX, "snapshots", ""), "⊥");
+    }
+
+    // ── Per-tenant read/write lock classification (#156) ────────────
+
+    #[test]
+    fn read_only_op_classification_covers_query_verbs() {
+        assert!(is_read_only_op("debug"));
+        assert!(is_read_only_op("audit"));
+        assert!(is_read_only_op("verify_signature"));
+        assert!(is_read_only_op("snapshots"));
+        assert!(is_read_only_op("list:Order"));
+        assert!(is_read_only_op("get:Customer"));
+        assert!(is_read_only_op("query:order_has_total"));
+        assert!(is_read_only_op("explain:123"));
+        // Mutating ops stay on the write path.
+        assert!(!is_read_only_op("compile"));
+        assert!(!is_read_only_op("create:Order"));
+        assert!(!is_read_only_op("update:Order"));
+        assert!(!is_read_only_op("transition:Order"));
+        assert!(!is_read_only_op("snapshot"));
+        assert!(!is_read_only_op("rollback"));
+    }
+
+    #[test]
+    fn two_concurrent_readers_hold_the_tenant_lock_simultaneously() {
+        // The per-tenant RwLock should let two readers hold the shared
+        // guard at the same instant. A Barrier(2) forces both threads
+        // to be inside the read guard concurrently — under the prior
+        // Mutex this would deadlock (wait would block the second
+        // reader since the first hasn't released yet).
+        use std::sync::Barrier;
+        use std::thread;
+
+        let h = alloc_with_noun("shared-payload");
+        let barrier = Arc::new(Barrier::new(2));
+
+        let reader = |h: u32, barrier: Arc<Barrier>| move || -> ast::Object {
+            let tenant = tenant_lock(h).unwrap();
+            let st = tenant.read().unwrap();
+            // Both readers reach the barrier while holding their read
+            // guards. If the lock doesn't allow sharing, only one will
+            // ever get here and the test hangs.
+            barrier.wait();
+            let d = st.d.clone();
+            drop(st);
+            d
+        };
+
+        let t1 = thread::spawn(reader(h, barrier.clone()));
+        let t2 = thread::spawn(reader(h, barrier.clone()));
+        let (d1, d2) = (t1.join().unwrap(), t2.join().unwrap());
+        assert_eq!(d1, d2, "both readers saw the same state");
+        release_impl(h);
+    }
+
+    #[test]
+    fn concurrent_read_ops_via_system_impl_both_return() {
+        // End-to-end: two `debug` calls on the same handle, both on
+        // the read-path (is_read_only_op == true), both succeed. No
+        // mutation happens, so neither thread's result shadows the
+        // other.
+        use std::thread;
+
+        let h = create_bare_impl();
+        let t1 = thread::spawn(move || system_impl(h, "debug", ""));
+        let t2 = thread::spawn(move || system_impl(h, "debug", ""));
+        let r1 = t1.join().unwrap();
+        let r2 = t2.join().unwrap();
+        assert!(!r1.is_empty(), "first reader got a debug projection");
+        assert!(!r2.is_empty(), "second reader got a debug projection");
+        release_impl(h);
     }
 }
