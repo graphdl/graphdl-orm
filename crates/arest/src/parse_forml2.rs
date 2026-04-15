@@ -252,6 +252,65 @@ fn try_ring(line: &str, noun_names: &[String]) -> Option<ParseAction> {
     }))
 }
 
+/// try_ring_shorthand — ORM 2 intuitive-icon parity for ring constraints.
+///
+/// Accepts terse adjectival form appended to a ring fact-type reading:
+///   `Category has parent Category is acyclic.`
+///   `Task blocks Task is irreflexive.`
+///   `Person is sibling of Person is symmetric.`
+/// instead of Halpin's canonical prose ("No Category may cycle back to
+/// itself via one or more traversals through has parent."). Maps the
+/// adjective 1-to-1 to the existing 8 ring constraint kinds
+/// (IR/AS/AT/SY/IT/TR/AC/RF) that compile.rs already knows how to
+/// evaluate, so no compile-side change is needed.
+///
+/// Discrimination vs non-ring "X is Y" sentences: the reading LHS must
+/// mention the same base noun at least twice (before and after the
+/// verb). That rules out `Noun is irreflexive` as a bare adjective
+/// claim about a noun.
+fn try_ring_shorthand(line: &str, noun_names: &[String]) -> Option<ParseAction> {
+    let clean = line.trim_end_matches('.').trim();
+    let re = regex::Regex::new(
+        r"^(.+?)\s+is\s+(irreflexive|asymmetric|antisymmetric|symmetric|intransitive|transitive|acyclic|reflexive)$"
+    ).expect("static regex compiles");
+    let caps = re.captures(clean)?;
+    let reading = caps.get(1)?.as_str().trim();
+    let adj = caps.get(2)?.as_str();
+    let kind = match adj {
+        "irreflexive"   => "IR",
+        "asymmetric"    => "AS",
+        "antisymmetric" => "AT",
+        "symmetric"     => "SY",
+        "intransitive"  => "IT",
+        "transitive"    => "TR",
+        "acyclic"       => "AC",
+        "reflexive"     => "RF",
+        _               => return None,
+    };
+    // Ring-shorthand requires the reading to mention the same base noun
+    // at least twice — otherwise it's ambiguous with a bare-adjective
+    // claim (`X is symmetric` on some non-fact-type X).
+    let base_counts: std::collections::HashMap<&str, usize> = reading
+        .split_whitespace()
+        .filter_map(|w| {
+            let w = w.trim_end_matches(',').trim_end_matches('.');
+            let (base, _) = parse_role_token(w);
+            noun_names.iter().any(|n| n == base).then_some(base)
+        })
+        .fold(std::collections::HashMap::new(), |mut acc, b| {
+            *acc.entry(b).or_insert(0) += 1;
+            acc
+        });
+    let (&ring_noun, _) = base_counts.iter().find(|(_, &c)| c >= 2)?;
+    Some(ParseAction::AddConstraint(ConstraintDef {
+        id: String::new(), kind: kind.into(), modality: "alethic".into(),
+        deontic_operator: None, text: clean.into(),
+        spans: vec![], set_comparison_argument_length: None, clauses: None,
+        entity: Some(ring_noun.to_string()),
+        min_occurrence: None, max_occurrence: None,
+    }))
+}
+
 /// try_subset -- SS: "If some A R1 some B then that A R2 that B."
 /// Distinguishes from ring: subset has multiple different base noun types.
 fn try_subset(line: &str, noun_names: &[String]) -> Option<ParseAction> {
@@ -1086,6 +1145,7 @@ fn parse_into(ir: &mut Domain, input: &str) -> Result<(), String> {
         .filter(|(_, line)| {
             // Preserves the original recognizer priority: these recognizers fire before try_fact_type
             let is_pass2b = try_ring(line, &noun_names).is_some()
+                || try_ring_shorthand(line, &noun_names).is_some()
                 || try_subset(line, &noun_names).is_some()
                 || try_equality(line).is_some()
                 || try_set_comparison(line, &noun_names).is_some()
@@ -1153,6 +1213,7 @@ fn parse_into(ir: &mut Domain, input: &str) -> Result<(), String> {
             // External UC fires before constraint to handle "For each B1 and B2, at most one...".
             let action = None
                 .or_else(|| try_ring(line, &noun_names))
+                .or_else(|| try_ring_shorthand(line, &noun_names))
                 .or_else(|| try_subset(line, &noun_names))
                 .or_else(|| try_equality(line))
                 .or_else(|| try_set_comparison(line, &noun_names))
@@ -2458,6 +2519,63 @@ mod tests {
             "join_on should include Manager, got {:?}", rule.join_on);
         assert_eq!(rule.antecedent_fact_type_ids.len(), 2,
             "two antecedents, got {:?}", rule.antecedent_fact_type_ids);
+    }
+
+    // ── Ring-constraint shorthand (ORM 2 intuitive-icon parity) ──
+    //
+    // ORM 2 §2.6 (Halpin 2005) renders ring constraints as icons ("ir",
+    // "ac", "as", …) attached to the fact-type shape. In textual form,
+    // the equivalent shorthand appends the adjective directly to the
+    // reading:
+    //
+    //   Category has parent Category is acyclic.
+    //   Task blocks Task is irreflexive.
+    //
+    // This is a terser alternative to the canonical prose ("No Category
+    // may cycle back to itself via one or more traversals through has
+    // parent."). Both forms MUST compile to the same constraint kind.
+
+    #[test]
+    fn ring_shorthand_acyclic_emits_ac_constraint() {
+        let input = "Category(.Name) is an entity type.\n## Fact Types\nCategory has parent Category.\nCategory has parent Category is acyclic.";
+        let ir = parse_markdown(input).unwrap();
+        let ac: Vec<_> = ir.constraints.iter()
+            .filter(|c| c.kind == "AC")
+            .collect();
+        assert_eq!(ac.len(), 1, "expected one AC constraint, got {:?}",
+            ir.constraints.iter().map(|c| &c.kind).collect::<Vec<_>>());
+        assert_eq!(ac[0].entity, Some("Category".to_string()));
+    }
+
+    #[test]
+    fn ring_shorthand_irreflexive_emits_ir_constraint() {
+        let input = "Person(.Name) is an entity type.\n## Fact Types\nPerson is parent of Person.\nPerson is parent of Person is irreflexive.";
+        let ir = parse_markdown(input).unwrap();
+        let irref: Vec<_> = ir.constraints.iter().filter(|c| c.kind == "IR").collect();
+        assert_eq!(irref.len(), 1, "expected one IR, got {:?}",
+            ir.constraints.iter().map(|c| &c.kind).collect::<Vec<_>>());
+        assert_eq!(irref[0].entity, Some("Person".to_string()));
+    }
+
+    #[test]
+    fn ring_shorthand_covers_all_eight_kinds() {
+        for (adj, want_kind) in [
+            ("irreflexive", "IR"),
+            ("asymmetric", "AS"),
+            ("antisymmetric", "AT"),
+            ("symmetric", "SY"),
+            ("intransitive", "IT"),
+            ("transitive", "TR"),
+            ("acyclic", "AC"),
+            ("reflexive", "RF"),
+        ] {
+            let input = format!(
+                "Person(.Name) is an entity type.\n## Fact Types\nPerson is parent of Person.\nPerson is parent of Person is {adj}.");
+            let ir = parse_markdown(&input).unwrap_or_else(|e| panic!("parse {adj}: {e:?}"));
+            let hits: Vec<_> = ir.constraints.iter().filter(|c| c.kind == want_kind).collect();
+            assert_eq!(hits.len(), 1, "adj={adj}: expected {want_kind}, got {:?}",
+                ir.constraints.iter().map(|c| &c.kind).collect::<Vec<_>>());
+        }
     }
 
     #[test]
