@@ -65,9 +65,9 @@
 #![cfg(feature = "wasm-lower")]
 
 use wasm_encoder::{
-    BlockType, CodeSection, ConstExpr, ExportKind, ExportSection, Function, FunctionSection,
-    GlobalSection, GlobalType, Instruction, MemArg, MemorySection, MemoryType, Module,
-    TypeSection, ValType,
+    BlockType, CodeSection, ConstExpr, EntityType, ExportKind, ExportSection, Function,
+    FunctionSection, GlobalSection, GlobalType, ImportSection, Instruction, MemArg,
+    MemorySection, MemoryType, Module, TypeSection, ValType,
 };
 
 use crate::ast::{Func, Object};
@@ -85,13 +85,29 @@ const ATOM_SIZE: i32 = 16;      // 4B tag + 4B pad + 8B value
 const SEQ_HEADER_SIZE: i32 = 8; // 4B tag + 4B length
 // StringAtom header: 4B tag + 4B byte length. Payload follows at offset 8.
 
-// Emitted-function indices. `apply` is 0 so user code (and the
-// bench) can call by name without caring about internals.
-const FN_APPLY: u32 = 0;
-const FN_ALLOC: u32 = 1;
-const FN_ALLOC_ATOM: u32 = 2;
-const FN_TRUTHY: u32 = 3;
-const FN_ALLOC_STRING_ATOM: u32 = 4;
+// Host imports: the runtime functions the module pulls in from the
+// embedder so that D-access primitives (Fetch, Store, Def, Platform)
+// have somewhere to dispatch. Imports occupy the first N slots of
+// the function index space; regular function indices shift past
+// them. Embedders bind the imports via `install_host_imports`
+// (below) or an equivalent linker call.
+const IMPORT_CELL_FETCH:       u32 = 0; // (name_ptr)          → value_ptr
+const IMPORT_CELL_FETCH_OR_PHI:u32 = 1; // (name_ptr)          → value_ptr | phi
+const IMPORT_CELL_STORE:       u32 = 2; // (name_ptr, val_ptr) → new_state_ptr
+const IMPORT_DEF_DISPATCH:     u32 = 3; // (name_ptr, x_ptr)   → result_ptr
+const IMPORT_PLATFORM_DISPATCH:u32 = 4; // (name_ptr, x_ptr)   → result_ptr
+const NUM_IMPORTS: u32 = 5;
+
+// Emitted-function indices. `apply` comes first among the
+// module-defined functions (so the export still resolves to its
+// natural position) but sits AT offset NUM_IMPORTS in the function
+// namespace because all imports are numbered before locally defined
+// functions in WebAssembly.
+const FN_APPLY:             u32 = NUM_IMPORTS;
+const FN_ALLOC:             u32 = NUM_IMPORTS + 1;
+const FN_ALLOC_ATOM:        u32 = NUM_IMPORTS + 2;
+const FN_TRUTHY:            u32 = NUM_IMPORTS + 3;
+const FN_ALLOC_STRING_ATOM: u32 = NUM_IMPORTS + 4;
 
 // Global index: only one.
 const G_HEAP_PTR: u32 = 0;
@@ -115,33 +131,55 @@ pub fn lower_to_wasm(func: &Func) -> Result<Vec<u8>, String> {
     let mut module = Module::new();
 
     // ── Types ─────────────────────────────────────────────────────
-    // 0: apply             (i64) -> (i32)
-    // 1: alloc             (i32) -> (i32)
-    // 2: alloc_atom        (i64) -> (i32)
-    // 3: truthy            (i32) -> (i32)
-    // 4: alloc_string_atom (i32) -> (i32)   [byte_length → ptr]
-    //
-    // Types 1 and 3 and 4 all have signature (i32) -> (i32); they
-    // share type index 1 below. alloc_atom needs its own index for
-    // the i64 parameter. apply has type 0.
+    // 0: (i64) → (i32)           — apply, alloc_atom
+    // 1: (i32) → (i32)           — alloc, truthy, alloc_string_atom,
+    //                              cell_fetch, cell_fetch_or_phi
+    // 2: (i32, i32) → (i32)       — cell_store, def_dispatch,
+    //                              platform_dispatch
     let mut types = TypeSection::new();
-    types.ty().function(vec![ValType::I64], vec![ValType::I32]); // type 0
-    types.ty().function(vec![ValType::I32], vec![ValType::I32]); // type 1
-    types.ty().function(vec![ValType::I64], vec![ValType::I32]); // type 2
-    types.ty().function(vec![ValType::I32], vec![ValType::I32]); // type 3
-    // type 4 reuses the (i32)->(i32) shape but it's declared
-    // explicitly so every FN_* has a 1:1 type index; wasm-encoder
-    // happily dedupes at the section level.
-    types.ty().function(vec![ValType::I32], vec![ValType::I32]); // type 4
+    types.ty().function(vec![ValType::I64], vec![ValType::I32]);                    // 0
+    types.ty().function(vec![ValType::I32], vec![ValType::I32]);                    // 1
+    types.ty().function(vec![ValType::I32, ValType::I32], vec![ValType::I32]);      // 2
     module.section(&types);
 
+    // ── Imports ───────────────────────────────────────────────────
+    // Five host functions live in the "arest" namespace. Each reads
+    // pointers to Objects in linear memory (name, argument),
+    // dispatches on the host side, and returns a pointer (allocated
+    // via the module's exported alloc helpers) to the result Object.
+    //
+    // cell_fetch / cell_fetch_or_phi: read-only access to D.
+    //   cell_fetch returns φ (null ptr) when the cell is absent;
+    //   cell_fetch_or_phi returns an empty-Seq ptr — the convention
+    //   used by AREST's eval context to avoid ⊥-propagation through
+    //   Construction on missing FT cells.
+    //
+    // cell_store: name + value → new D representation. Returns a
+    //   placeholder; the host updates its externally-held D and the
+    //   WASM program continues with its own snapshot.
+    //
+    // def_dispatch / platform_dispatch: higher-order — name a Def
+    //   or Platform primitive and apply it to x. The host runs
+    //   `ast::apply(Func::Def(name), x, &d)` (or Platform) and
+    //   serialises the result back into WASM memory.
+    let mut imports = ImportSection::new();
+    imports.import("arest", "cell_fetch",        EntityType::Function(1));
+    imports.import("arest", "cell_fetch_or_phi", EntityType::Function(1));
+    imports.import("arest", "cell_store",        EntityType::Function(2));
+    imports.import("arest", "def_dispatch",      EntityType::Function(2));
+    imports.import("arest", "platform_dispatch", EntityType::Function(2));
+    module.section(&imports);
+
     // ── Functions ─────────────────────────────────────────────────
+    // Each `functions.function(N)` says "the next module-defined
+    // function has type N". Their function indices in the final
+    // namespace start at NUM_IMPORTS (= 5).
     let mut functions = FunctionSection::new();
-    functions.function(0); // apply
-    functions.function(1); // alloc
-    functions.function(2); // alloc_atom
-    functions.function(3); // truthy
-    functions.function(4); // alloc_string_atom
+    functions.function(0); // apply             (type 0)
+    functions.function(1); // alloc             (type 1)
+    functions.function(0); // alloc_atom        (type 0)
+    functions.function(1); // truthy            (type 1)
+    functions.function(1); // alloc_string_atom (type 1)
     module.section(&functions);
 
     // ── Memory ────────────────────────────────────────────────────
@@ -171,6 +209,13 @@ pub fn lower_to_wasm(func: &Func) -> Result<Vec<u8>, String> {
     // ── Exports ───────────────────────────────────────────────────
     let mut exports = ExportSection::new();
     exports.export("apply", ExportKind::Func, FN_APPLY);
+    // The host calls these when encoding an Object back into the
+    // module's linear memory (so imports like cell_fetch can return
+    // a freshly-built value without the host reinventing the
+    // allocator).
+    exports.export("alloc", ExportKind::Func, FN_ALLOC);
+    exports.export("alloc_atom", ExportKind::Func, FN_ALLOC_ATOM);
+    exports.export("alloc_string_atom", ExportKind::Func, FN_ALLOC_STRING_ATOM);
     exports.export("memory", ExportKind::Memory, 0);
     module.section(&exports);
 
@@ -390,6 +435,15 @@ fn scratch_needed(func: &Func) -> u32 {
         // dst, i (loop index), b (per-byte scratch for the branchless
         // ASCII-case fold).
         Func::Lower => 5,
+        // Fetch / FetchOrPhi: single host call consuming the name
+        // atom on the stack and leaving the value atom. Zero scratch.
+        Func::Fetch | Func::FetchOrPhi => 0,
+        // Store: pair input → host call. One slot for the pair ptr.
+        Func::Store => 1,
+        // Def(name) / Platform(name): two slots (x stash + name
+        // StringAtom ptr). The name string is emitted inline byte by
+        // byte into its fresh atom.
+        Func::Def(_) | Func::Platform(_) => 2,
         // Unary Seq transformers allocate a new Seq of derived
         // length and copy elements with an index mapping. Five slots:
         // i, in_len, in_seq, out_seq, out_len.
@@ -985,6 +1039,81 @@ fn emit_body(
             body.instruction(&Instruction::End); // end loop
             body.instruction(&Instruction::End); // end block
             body.instruction(&Instruction::LocalGet(dst_slot));
+        }
+
+        // ── Backus §14.3 cell access via host imports ───────────────
+        //
+        //   ↑n:D        = host cell_fetch(n)           (Fetch)
+        //   ↑n:D (soft) = host cell_fetch_or_phi(n)    (FetchOrPhi)
+        //   ↓n:<x,D>    = host cell_store(n, x)        (Store)
+        //
+        // The PoC keeps D on the host side — it's the tenant's
+        // CompiledState, not something that fits neatly in WASM
+        // linear memory. Each operation marshals its name and
+        // optional value through imported host functions which read
+        // from / write to D and allocate the result back into the
+        // module's arena via the exported alloc helpers.
+        Func::Fetch => {
+            // x on stack IS the name atom. Host reads its bytes,
+            // looks up in D, and returns a freshly-allocated value
+            // pointer (or 0 for φ on miss).
+            body.instruction(&Instruction::Call(IMPORT_CELL_FETCH));
+        }
+        Func::FetchOrPhi => {
+            // Same shape as Fetch; the host returns an empty-Seq
+            // pointer (`<>`) on miss instead of φ, matching AREST's
+            // indexed fact-type convention that avoids ⊥-propagation.
+            body.instruction(&Instruction::Call(IMPORT_CELL_FETCH_OR_PHI));
+        }
+        Func::Store => {
+            // Pair input `<name, value>`. Unpack, call the host.
+            // Returns the stored value's pointer so Store composes
+            // as a pass-through write.
+            let pair_slot = next_scratch;
+            body.instruction(&Instruction::LocalSet(pair_slot));
+            body.instruction(&Instruction::LocalGet(pair_slot));
+            body.instruction(&Instruction::I32Load(i32_at(8)));
+            body.instruction(&Instruction::LocalGet(pair_slot));
+            body.instruction(&Instruction::I32Load(i32_at(12)));
+            body.instruction(&Instruction::Call(IMPORT_CELL_STORE));
+        }
+
+        // ── Def / Platform dispatch via host imports ────────────────
+        //
+        //   Func::Def(name):x      = host def_dispatch(name, x)
+        //   Func::Platform(name):x = host platform_dispatch(name, x)
+        //
+        // The name is compile-time known; emit an inline StringAtom
+        // for it at the call site. The host function receives (name,
+        // x) pointers and runs `ast::apply(Func::Def(name), x, &d)`
+        // (or Platform) against the host-side D, marshaling the
+        // result back into linear memory.
+        Func::Def(name) | Func::Platform(name) => {
+            let import_idx = match func {
+                Func::Def(_) => IMPORT_DEF_DISPATCH,
+                _ => IMPORT_PLATFORM_DISPATCH,
+            };
+            let x_slot = next_scratch;
+            let name_slot = next_scratch + 1;
+            // Stash x.
+            body.instruction(&Instruction::LocalSet(x_slot));
+            // Allocate a StringAtom for the name.
+            body.instruction(&Instruction::I32Const(name.len() as i32));
+            body.instruction(&Instruction::Call(FN_ALLOC_STRING_ATOM));
+            body.instruction(&Instruction::LocalSet(name_slot));
+            for (i, byte) in name.as_bytes().iter().enumerate() {
+                body.instruction(&Instruction::LocalGet(name_slot));
+                body.instruction(&Instruction::I32Const(*byte as i32));
+                body.instruction(&Instruction::I32Store8(MemArg {
+                    offset: (SEQ_HEADER_SIZE as u64) + i as u64,
+                    align: 0,
+                    memory_index: 0,
+                }));
+            }
+            // Call import(name, x) → result.
+            body.instruction(&Instruction::LocalGet(name_slot));
+            body.instruction(&Instruction::LocalGet(x_slot));
+            body.instruction(&Instruction::Call(import_idx));
         }
 
         // Backus §11.2.3 unary Seq transformers. All four share the
@@ -2078,17 +2207,39 @@ fn emit_body(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wasmi::{Engine, Linker, Module as WiModule, Store};
+    use crate::ast;
+    use wasmi::{Caller, Engine, Linker, Module as WiModule, Store};
+
+    /// Bind the five host-import functions as φ-returning stubs.
+    /// Tests that don't exercise D-access (the majority) use these so
+    /// the module still instantiates. Tests that do hit Fetch / Store
+    /// etc. use `invoke_with_host` below, which swaps the stubs for
+    /// real handlers that dispatch against an `ast::Object` D.
+    fn bind_phi_stubs<T: 'static>(linker: &mut Linker<T>) {
+        linker.func_wrap("arest", "cell_fetch",
+            |_: Caller<'_, T>, _name: i32| -> i32 { 0 }).unwrap();
+        linker.func_wrap("arest", "cell_fetch_or_phi",
+            |_: Caller<'_, T>, _name: i32| -> i32 { 0 }).unwrap();
+        linker.func_wrap("arest", "cell_store",
+            |_: Caller<'_, T>, _name: i32, val: i32| -> i32 { val }).unwrap();
+        linker.func_wrap("arest", "def_dispatch",
+            |_: Caller<'_, T>, _name: i32, _x: i32| -> i32 { 0 }).unwrap();
+        linker.func_wrap("arest", "platform_dispatch",
+            |_: Caller<'_, T>, _name: i32, _x: i32| -> i32 { 0 }).unwrap();
+    }
 
     /// Instantiate the module and invoke `apply(input)`, returning
     /// the result pointer and a snapshot of linear memory that
-    /// callers decode at their own cadence.
+    /// callers decode at their own cadence. Host imports are bound
+    /// to φ-returning stubs — sufficient for tests that don't
+    /// exercise D-access.
     fn invoke(func: &Func, input: i64) -> (u32, Vec<u8>) {
         let bytes = lower_to_wasm(func).expect("lower must succeed for supported variants");
         let engine = Engine::default();
         let module = WiModule::new(&engine, &bytes[..]).expect("emitted WASM must validate");
         let mut store: Store<()> = Store::new(&engine, ());
-        let linker: Linker<()> = Linker::new(&engine);
+        let mut linker: Linker<()> = Linker::new(&engine);
+        bind_phi_stubs(&mut linker);
         let instance = linker
             .instantiate_and_start(&mut store, &module)
             .expect("module must instantiate and start");
@@ -2140,6 +2291,222 @@ mod tests {
         i64::from_le_bytes(data[offset as usize..(offset + 8) as usize].try_into().unwrap())
     }
 
+    // ── Host-import test harness ────────────────────────────────────
+
+    /// Decode an Object from linear memory at `ptr`. `ptr == 0` is
+    /// treated as φ (empty Seq) per the PoC's null-pointer convention.
+    /// Recurses on Seq children.
+    fn read_object_from_memory(data: &[u8], ptr: u32) -> ast::Object {
+        if ptr == 0 {
+            return ast::Object::phi();
+        }
+        let tag = read_u32(data, ptr);
+        match tag {
+            0 => ast::Object::atom(&read_i64(data, ptr + 8).to_string()),
+            1 => {
+                let len = read_u32(data, ptr + 4);
+                let items: Vec<ast::Object> = (0..len)
+                    .map(|i| read_object_from_memory(data, read_u32(data, ptr + 8 + 4 * i)))
+                    .collect();
+                ast::Object::seq(items)
+            }
+            2 => {
+                let n = read_u32(data, ptr + 4) as usize;
+                let bytes = &data[(ptr + 8) as usize..(ptr + 8) as usize + n];
+                ast::Object::atom(&String::from_utf8_lossy(bytes))
+            }
+            _ => ast::Object::Bottom,
+        }
+    }
+
+    /// Encode an Object back into the module's linear memory by
+    /// calling the exported alloc helpers. Returns the pointer.
+    /// Non-encodable shapes (Map, Bottom) return 0 = φ.
+    fn write_object_to_memory(
+        caller: &mut Caller<'_, HostState>,
+        obj: &ast::Object,
+    ) -> i32 {
+        match obj {
+            ast::Object::Bottom => 0,
+            ast::Object::Atom(s) => {
+                if let Ok(n) = s.parse::<i64>() {
+                    let f = caller.get_export("alloc_atom")
+                        .and_then(|e| e.into_func())
+                        .expect("alloc_atom export");
+                    let typed = f.typed::<i64, i32>(&*caller)
+                        .expect("alloc_atom type");
+                    typed.call(&mut *caller, n).expect("alloc_atom call")
+                } else {
+                    let f = caller.get_export("alloc_string_atom")
+                        .and_then(|e| e.into_func())
+                        .expect("alloc_string_atom export");
+                    let typed = f.typed::<i32, i32>(&*caller)
+                        .expect("alloc_string_atom type");
+                    let ptr = typed.call(&mut *caller, s.len() as i32)
+                        .expect("alloc_string_atom call");
+                    let memory = caller.get_export("memory")
+                        .and_then(|e| e.into_memory())
+                        .expect("memory export");
+                    memory.write(&mut *caller, (ptr + 8) as usize, s.as_bytes())
+                        .expect("memory write (string payload)");
+                    ptr
+                }
+            }
+            ast::Object::Seq(items) => {
+                // Recurse first — each child needs its own allocation
+                // before we can write the parent Seq's element ptrs.
+                let child_ptrs: Vec<i32> = items
+                    .iter()
+                    .map(|c| write_object_to_memory(caller, c))
+                    .collect();
+                let alloc = caller.get_export("alloc")
+                    .and_then(|e| e.into_func())
+                    .expect("alloc export");
+                let typed = alloc.typed::<i32, i32>(&*caller).expect("alloc type");
+                let total = SEQ_HEADER_SIZE + 4 * items.len() as i32;
+                let ptr = typed.call(&mut *caller, total).expect("alloc call");
+                let memory = caller.get_export("memory")
+                    .and_then(|e| e.into_memory())
+                    .expect("memory export");
+                memory.write(&mut *caller, ptr as usize,
+                    &(TAG_SEQ as u32).to_le_bytes()).unwrap();
+                memory.write(&mut *caller, (ptr + 4) as usize,
+                    &(items.len() as u32).to_le_bytes()).unwrap();
+                for (i, cptr) in child_ptrs.iter().enumerate() {
+                    let off = (ptr + SEQ_HEADER_SIZE + 4 * i as i32) as usize;
+                    memory.write(&mut *caller, off,
+                        &(*cptr as u32).to_le_bytes()).unwrap();
+                }
+                ptr
+            }
+            ast::Object::Map(_) => 0,
+        }
+    }
+
+    /// Thin HostState for the tests: a named-cell store. Production
+    /// hosts would plug in CompiledState or whatever context their
+    /// runtime carries.
+    struct HostState {
+        cells: std::collections::HashMap<String, ast::Object>,
+    }
+
+    /// Build a synthetic `&Object` D for `ast::apply` from the
+    /// cells map, so def_dispatch / platform_dispatch can run
+    /// `ast::apply(Func::Def(name), x, &d)` with realistic state.
+    fn build_d_from_cells(
+        cells: &std::collections::HashMap<String, ast::Object>,
+    ) -> ast::Object {
+        ast::Object::Map(cells.clone())
+    }
+
+    /// Decode a name StringAtom (or numeric atom) at `ptr` and return
+    /// its text form. Returns None if the Object at `ptr` isn't an
+    /// atom shape.
+    fn name_from_memory(data: &[u8], ptr: u32) -> Option<String> {
+        let obj = read_object_from_memory(data, ptr);
+        obj.as_atom().map(|s| s.to_string())
+    }
+
+    /// Instantiate with real Fetch / FetchOrPhi / Store / Def /
+    /// Platform handlers that read and write a `HashMap<String,
+    /// Object>` held in `HostState`. Returns the result pointer, a
+    /// memory snapshot, and the final cells map (so Store can be
+    /// asserted against).
+    fn invoke_with_host(
+        func: &Func,
+        input: i64,
+        initial_cells: std::collections::HashMap<String, ast::Object>,
+    ) -> (u32, Vec<u8>, std::collections::HashMap<String, ast::Object>) {
+        let bytes = lower_to_wasm(func).expect("lower must succeed");
+        let engine = Engine::default();
+        let module = WiModule::new(&engine, &bytes[..]).expect("validate");
+        let mut store: Store<HostState> = Store::new(&engine, HostState { cells: initial_cells });
+        let mut linker: Linker<HostState> = Linker::new(&engine);
+
+        linker.func_wrap("arest", "cell_fetch",
+            |mut caller: Caller<'_, HostState>, name_ptr: i32| -> i32 {
+                let memory = caller.get_export("memory")
+                    .and_then(|e| e.into_memory()).unwrap();
+                let name = {
+                    let data = memory.data(&caller);
+                    name_from_memory(data, name_ptr as u32)
+                };
+                let Some(name) = name else { return 0; };
+                let value = caller.data().cells.get(&name).cloned()
+                    .unwrap_or(ast::Object::Bottom);
+                write_object_to_memory(&mut caller, &value)
+            }).unwrap();
+
+        linker.func_wrap("arest", "cell_fetch_or_phi",
+            |mut caller: Caller<'_, HostState>, name_ptr: i32| -> i32 {
+                let memory = caller.get_export("memory")
+                    .and_then(|e| e.into_memory()).unwrap();
+                let name = {
+                    let data = memory.data(&caller);
+                    name_from_memory(data, name_ptr as u32)
+                };
+                let Some(name) = name else { return 0; };
+                let value = caller.data().cells.get(&name).cloned()
+                    .unwrap_or_else(ast::Object::phi);
+                write_object_to_memory(&mut caller, &value)
+            }).unwrap();
+
+        linker.func_wrap("arest", "cell_store",
+            |mut caller: Caller<'_, HostState>, name_ptr: i32, val_ptr: i32| -> i32 {
+                let memory = caller.get_export("memory")
+                    .and_then(|e| e.into_memory()).unwrap();
+                let (name, value) = {
+                    let data = memory.data(&caller);
+                    let name = name_from_memory(data, name_ptr as u32);
+                    let value = read_object_from_memory(data, val_ptr as u32);
+                    (name, value)
+                };
+                let Some(name) = name else { return 0; };
+                caller.data_mut().cells.insert(name, value);
+                val_ptr // pass-through
+            }).unwrap();
+
+        linker.func_wrap("arest", "def_dispatch",
+            |mut caller: Caller<'_, HostState>, name_ptr: i32, x_ptr: i32| -> i32 {
+                let memory = caller.get_export("memory")
+                    .and_then(|e| e.into_memory()).unwrap();
+                let (name, x) = {
+                    let data = memory.data(&caller);
+                    let name = name_from_memory(data, name_ptr as u32);
+                    let x = read_object_from_memory(data, x_ptr as u32);
+                    (name, x)
+                };
+                let Some(name) = name else { return 0; };
+                let d = build_d_from_cells(&caller.data().cells);
+                let result = ast::apply(&ast::Func::Def(name), &x, &d);
+                write_object_to_memory(&mut caller, &result)
+            }).unwrap();
+
+        linker.func_wrap("arest", "platform_dispatch",
+            |mut caller: Caller<'_, HostState>, name_ptr: i32, x_ptr: i32| -> i32 {
+                let memory = caller.get_export("memory")
+                    .and_then(|e| e.into_memory()).unwrap();
+                let (name, x) = {
+                    let data = memory.data(&caller);
+                    let name = name_from_memory(data, name_ptr as u32);
+                    let x = read_object_from_memory(data, x_ptr as u32);
+                    (name, x)
+                };
+                let Some(name) = name else { return 0; };
+                let d = build_d_from_cells(&caller.data().cells);
+                let result = ast::apply(&ast::Func::Platform(name), &x, &d);
+                write_object_to_memory(&mut caller, &result)
+            }).unwrap();
+
+        let instance = linker.instantiate_and_start(&mut store, &module).expect("instantiate");
+        let apply = instance.get_typed_func::<i64, i32>(&store, "apply").expect("apply");
+        let memory = instance.get_memory(&store, "memory").expect("memory");
+        let ptr = apply.call(&mut store, input).expect("apply");
+        let snapshot = memory.data(&store).to_vec();
+        let final_cells = store.data().cells.clone();
+        (ptr as u32, snapshot, final_cells)
+    }
+
     // ── Primitives ────────────────────────────────────────────────
 
     #[test]
@@ -2171,30 +2538,177 @@ mod tests {
     }
 
     #[test]
-    fn lower_rejects_unsupported_variant_fetch() {
-        // Cell ops are intentionally NOT lowered: they need access
-        // to D (the runtime state), which the PoC's pure-i64 apply
-        // has no way to plumb through.
-        let f = Func::Fetch;
-        let err = lower_to_wasm(&f).expect_err("Fetch should be unsupported");
+    fn lower_rejects_unsupported_variant_native() {
+        // Func::Native wraps a Rust closure — truly impossible to
+        // ship across the FFI boundary. Left as the only remaining
+        // unsupported-variant sentinel.
+        let f = Func::Native(std::sync::Arc::new(|x| x.clone()));
+        let err = lower_to_wasm(&f).expect_err("Native should be unsupported");
         assert!(err.contains("not yet supported"));
     }
 
+    // ── Host imports: Fetch / FetchOrPhi / Store / Def / Platform ──
+
     #[test]
-    fn lower_rejects_unsupported_variant_def() {
-        // Dispatch ops likewise resolve names in DEFS at runtime.
-        let f = Func::Def("noun:create".into());
-        let err = lower_to_wasm(&f).expect_err("Def should be unsupported");
-        assert!(err.contains("not yet supported"));
+    fn lower_fetch_returns_numeric_cell_value_from_host() {
+        // Host D has `pi = "314"`; Fetch("pi") returns Atom(314).
+        let mut cells = std::collections::HashMap::new();
+        cells.insert("pi".to_string(), ast::Object::atom("314"));
+        let f = Func::Compose(
+            Box::new(Func::Fetch),
+            Box::new(Func::Constant(ast::Object::atom("pi"))),
+        );
+        let (ptr, data, _) = invoke_with_host(&f, 0, cells);
+        assert_eq!(read_u32(&data, ptr), TAG_ATOM as u32, "result is a numeric Atom");
+        assert_eq!(read_i64(&data, ptr + 8), 314);
     }
 
     #[test]
-    fn lower_rejects_unsupported_variant_store() {
-        // Store writes into D (the runtime state), which the PoC's
-        // pure-i64 apply has no way to plumb through.
-        let f = Func::Store;
-        let err = lower_to_wasm(&f).expect_err("Store should be unsupported");
-        assert!(err.contains("not yet supported"));
+    fn lower_fetch_returns_string_cell_value_from_host() {
+        // Non-numeric cells come back as StringAtoms.
+        let mut cells = std::collections::HashMap::new();
+        cells.insert("motto".to_string(), ast::Object::atom("carpe diem"));
+        let f = Func::Compose(
+            Box::new(Func::Fetch),
+            Box::new(Func::Constant(ast::Object::atom("motto"))),
+        );
+        let (ptr, data, _) = invoke_with_host(&f, 0, cells);
+        assert_eq!(read_u32(&data, ptr), TAG_STRING_ATOM as u32);
+        let len = read_u32(&data, ptr + 4) as usize;
+        let bytes = &data[(ptr + 8) as usize..(ptr + 8) as usize + len];
+        assert_eq!(bytes, b"carpe diem");
+    }
+
+    #[test]
+    fn lower_fetch_returns_seq_cell_value_from_host() {
+        // Cells holding Seqs round-trip: each element is encoded
+        // recursively as a child Atom, and a fresh outer Seq
+        // collects the element ptrs.
+        let mut cells = std::collections::HashMap::new();
+        cells.insert(
+            "scores".to_string(),
+            ast::Object::seq(vec![
+                ast::Object::atom("10"),
+                ast::Object::atom("20"),
+                ast::Object::atom("30"),
+            ]),
+        );
+        let f = Func::Compose(
+            Box::new(Func::Fetch),
+            Box::new(Func::Constant(ast::Object::atom("scores"))),
+        );
+        let (ptr, data, _) = invoke_with_host(&f, 0, cells);
+        assert_eq!(read_u32(&data, ptr), TAG_SEQ as u32);
+        assert_eq!(read_u32(&data, ptr + 4), 3);
+        for (i, expected) in [10i64, 20, 30].iter().enumerate() {
+            let cptr = read_u32(&data, ptr + 8 + 4 * i as u32);
+            assert_eq!(read_u32(&data, cptr), TAG_ATOM as u32);
+            assert_eq!(read_i64(&data, cptr + 8), *expected);
+        }
+    }
+
+    #[test]
+    fn lower_fetch_missing_cell_returns_null_phi() {
+        // AREST's bottom-propagating Fetch returns φ as a null ptr.
+        let f = Func::Compose(
+            Box::new(Func::Fetch),
+            Box::new(Func::Constant(ast::Object::atom("nonexistent"))),
+        );
+        let (ptr, _, _) = invoke_with_host(&f, 0, std::collections::HashMap::new());
+        assert_eq!(ptr, 0, "missing cell → null ptr (φ)");
+    }
+
+    #[test]
+    fn lower_fetch_or_phi_missing_cell_returns_empty_seq() {
+        // FetchOrPhi avoids ⊥-propagation on missing cells — returns
+        // an empty Seq instead of null ptr.
+        let f = Func::Compose(
+            Box::new(Func::FetchOrPhi),
+            Box::new(Func::Constant(ast::Object::atom("nonexistent"))),
+        );
+        let (ptr, data, _) = invoke_with_host(&f, 0, std::collections::HashMap::new());
+        assert_eq!(read_u32(&data, ptr), TAG_SEQ as u32,
+            "miss → empty Seq, not null ptr");
+        assert_eq!(read_u32(&data, ptr + 4), 0);
+    }
+
+    #[test]
+    fn lower_store_writes_through_to_host_cells() {
+        // Compose(Store, <name, value>) commits `value` to cell
+        // `name` in the host's D. The WASM module returns the
+        // value ptr as a pass-through.
+        let f = Func::Compose(
+            Box::new(Func::Store),
+            Box::new(Func::Construction(vec![
+                Func::Constant(ast::Object::atom("result")),
+                Func::Constant(ast::Object::atom("42")),
+            ])),
+        );
+        let (_ptr, _, cells) = invoke_with_host(&f, 0, std::collections::HashMap::new());
+        assert_eq!(cells.get("result"), Some(&ast::Object::atom("42")),
+            "Store landed the value in the host's cells map");
+    }
+
+    #[test]
+    fn lower_store_then_fetch_round_trips_through_host() {
+        // A two-step compose: first store value to cell, then fetch
+        // back. Proves Store's pass-through return threads into a
+        // following Fetch by cell name with no intermediate leak.
+        // The final WASM result is the fetched value.
+        //
+        // Note: Compose runs the RHS first; so this is:
+        //   fetch("result") on the post-store state.
+        // The Store happens inside its own composition branch.
+        let store_branch = Func::Compose(
+            Box::new(Func::Store),
+            Box::new(Func::Construction(vec![
+                Func::Constant(ast::Object::atom("result")),
+                Func::Constant(ast::Object::atom("777")),
+            ])),
+        );
+        let fetch_branch = Func::Compose(
+            Box::new(Func::Fetch),
+            Box::new(Func::Constant(ast::Object::atom("result"))),
+        );
+        // Apply store, discard, then fetch — Compose is right-to-left
+        // so inner happens first.
+        let f = Func::Compose(
+            Box::new(fetch_branch),
+            Box::new(store_branch),
+        );
+        let (ptr, data, cells) = invoke_with_host(&f, 0, std::collections::HashMap::new());
+        assert_eq!(cells.get("result"), Some(&ast::Object::atom("777")));
+        assert_eq!(read_u32(&data, ptr), TAG_ATOM as u32);
+        assert_eq!(read_i64(&data, ptr + 8), 777);
+    }
+
+    #[test]
+    fn lower_def_dispatch_runs_host_side_apply() {
+        // Wire a simple Def("echo_noun") at the host side by
+        // pre-populating the cells map with a "DEFS" cell whose
+        // echo_noun def is `Func::Id`. The WASM call:
+        //   Func::Def("echo_noun") applied to x
+        // dispatches to the host, which runs ast::apply on the
+        // matching Func, returning x unchanged.
+        //
+        // For this PoC the host has a cells map, not a full DEFS
+        // lookup — so we instead test by naming a Func variant
+        // whose behavior doesn't actually need a real DEFS lookup:
+        // Func::Def("anything_not_resolvable") against ast::apply
+        // produces Object::Bottom, which we encode as null ptr.
+        // The test asserts the dispatch path itself is wired —
+        // that the import is called and yields SOMETHING the
+        // module accepts.
+        let f = Func::Compose(
+            Box::new(Func::Def("not_in_defs".to_string())),
+            Box::new(Func::Constant(ast::Object::atom("42"))),
+        );
+        let (ptr, _, _) = invoke_with_host(&f, 0, std::collections::HashMap::new());
+        // No DEFS resolution available → Bottom → ptr 0. The point
+        // is that the module didn't trap; the host import fired
+        // and returned a valid pointer value.
+        assert_eq!(ptr, 0,
+            "def_dispatch against a name with no backing Def returns φ (0)");
     }
 
     // ── String Atom helpers + tests ────────────────────────────────
