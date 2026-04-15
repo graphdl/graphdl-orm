@@ -325,6 +325,13 @@ fn scratch_needed(func: &Func) -> u32 {
         // length and copy elements with an index mapping. Five slots:
         // i, in_len, in_seq, out_seq, out_len.
         Func::Tail | Func::Reverse | Func::RotL | Func::RotR => 5,
+        // ApndL/ApndR: pair in, Seq out of length inner.length + 1.
+        // Five slots: pair, inner, inner_len, out, i.
+        Func::ApndL | Func::ApndR => 5,
+        // Concat: Seq-of-Seqs flatten. Two passes — first to sum
+        // total length, then to copy. Nine slots: outer, outer_len,
+        // i, total_len, out, out_pos, inner, inner_len, j.
+        Func::Concat => 9,
         _ => 0,
     }
 }
@@ -756,6 +763,276 @@ fn emit_body(
                 body.instruction(&Instruction::I32RemU);
             },
         ),
+
+        // Backus §11.2.3 binary Seq builders.
+        //
+        //   apndl:<y, <z₁,...,zₙ>> = <y, z₁,...,zₙ>        (prepend head)
+        //   apndr:<<z₁,...,zₙ>, y> = <z₁,...,zₙ, y>        (append tail)
+        //   concat:<<a₁...>, <b₁...>, ...> = <a₁..., b₁..., ...> (flatten)
+        //
+        // ApndL/ApndR take a pair input. Inner Seq's length dictates
+        // output length minus 1. The scalar element goes to the
+        // appropriate end (head or tail); the rest is a straight copy.
+        Func::ApndL => {
+            let pair_slot = next_scratch;
+            let inner_slot = next_scratch + 1;
+            let inner_len_slot = next_scratch + 2;
+            let out_slot = next_scratch + 3;
+            let i_slot = next_scratch + 4;
+            body.instruction(&Instruction::LocalSet(pair_slot));
+            // inner = pair[1], inner_len = inner.length
+            body.instruction(&Instruction::LocalGet(pair_slot));
+            body.instruction(&Instruction::I32Load(i32_at(12)));
+            body.instruction(&Instruction::LocalTee(inner_slot));
+            body.instruction(&Instruction::I32Load(i32_at(4)));
+            body.instruction(&Instruction::LocalSet(inner_len_slot));
+            // Alloc out: header + 4 * (inner_len + 1)
+            body.instruction(&Instruction::I32Const(SEQ_HEADER_SIZE + 4));
+            body.instruction(&Instruction::LocalGet(inner_len_slot));
+            body.instruction(&Instruction::I32Const(4));
+            body.instruction(&Instruction::I32Mul);
+            body.instruction(&Instruction::I32Add);
+            body.instruction(&Instruction::Call(FN_ALLOC));
+            body.instruction(&Instruction::LocalTee(out_slot));
+            body.instruction(&Instruction::I32Const(TAG_SEQ));
+            body.instruction(&Instruction::I32Store(i32_at(0)));
+            body.instruction(&Instruction::LocalGet(out_slot));
+            body.instruction(&Instruction::LocalGet(inner_len_slot));
+            body.instruction(&Instruction::I32Const(1));
+            body.instruction(&Instruction::I32Add);
+            body.instruction(&Instruction::I32Store(i32_at(4)));
+            // out[0] = pair[0] = y
+            body.instruction(&Instruction::LocalGet(out_slot));
+            body.instruction(&Instruction::LocalGet(pair_slot));
+            body.instruction(&Instruction::I32Load(i32_at(8)));
+            body.instruction(&Instruction::I32Store(i32_at(SEQ_HEADER_SIZE as u64)));
+            // Loop: for i in 0..inner_len, out[i+1] = inner[i]
+            body.instruction(&Instruction::I32Const(0));
+            body.instruction(&Instruction::LocalSet(i_slot));
+            body.instruction(&Instruction::Block(BlockType::Empty));
+            body.instruction(&Instruction::Loop(BlockType::Empty));
+            body.instruction(&Instruction::LocalGet(i_slot));
+            body.instruction(&Instruction::LocalGet(inner_len_slot));
+            body.instruction(&Instruction::I32GeS);
+            body.instruction(&Instruction::BrIf(1));
+            // Store addr = out + 4 * (i + 1) = out + 4 + 4*i ; I32Store adds SEQ_HEADER_SIZE.
+            body.instruction(&Instruction::LocalGet(out_slot));
+            body.instruction(&Instruction::LocalGet(i_slot));
+            body.instruction(&Instruction::I32Const(1));
+            body.instruction(&Instruction::I32Add);
+            body.instruction(&Instruction::I32Const(4));
+            body.instruction(&Instruction::I32Mul);
+            body.instruction(&Instruction::I32Add);
+            // Load elem = inner[i]
+            body.instruction(&Instruction::LocalGet(inner_slot));
+            body.instruction(&Instruction::LocalGet(i_slot));
+            body.instruction(&Instruction::I32Const(4));
+            body.instruction(&Instruction::I32Mul);
+            body.instruction(&Instruction::I32Add);
+            body.instruction(&Instruction::I32Load(i32_at(SEQ_HEADER_SIZE as u64)));
+            body.instruction(&Instruction::I32Store(i32_at(SEQ_HEADER_SIZE as u64)));
+            body.instruction(&Instruction::LocalGet(i_slot));
+            body.instruction(&Instruction::I32Const(1));
+            body.instruction(&Instruction::I32Add);
+            body.instruction(&Instruction::LocalSet(i_slot));
+            body.instruction(&Instruction::Br(0));
+            body.instruction(&Instruction::End);
+            body.instruction(&Instruction::End);
+            body.instruction(&Instruction::LocalGet(out_slot));
+        }
+        Func::ApndR => {
+            // Mirror of ApndL: inner is pair[0], tail element is pair[1].
+            // Copy inner → out[0..n], then out[n] = y.
+            let pair_slot = next_scratch;
+            let inner_slot = next_scratch + 1;
+            let inner_len_slot = next_scratch + 2;
+            let out_slot = next_scratch + 3;
+            let i_slot = next_scratch + 4;
+            body.instruction(&Instruction::LocalSet(pair_slot));
+            body.instruction(&Instruction::LocalGet(pair_slot));
+            body.instruction(&Instruction::I32Load(i32_at(8)));
+            body.instruction(&Instruction::LocalTee(inner_slot));
+            body.instruction(&Instruction::I32Load(i32_at(4)));
+            body.instruction(&Instruction::LocalSet(inner_len_slot));
+            body.instruction(&Instruction::I32Const(SEQ_HEADER_SIZE + 4));
+            body.instruction(&Instruction::LocalGet(inner_len_slot));
+            body.instruction(&Instruction::I32Const(4));
+            body.instruction(&Instruction::I32Mul);
+            body.instruction(&Instruction::I32Add);
+            body.instruction(&Instruction::Call(FN_ALLOC));
+            body.instruction(&Instruction::LocalTee(out_slot));
+            body.instruction(&Instruction::I32Const(TAG_SEQ));
+            body.instruction(&Instruction::I32Store(i32_at(0)));
+            body.instruction(&Instruction::LocalGet(out_slot));
+            body.instruction(&Instruction::LocalGet(inner_len_slot));
+            body.instruction(&Instruction::I32Const(1));
+            body.instruction(&Instruction::I32Add);
+            body.instruction(&Instruction::I32Store(i32_at(4)));
+            // Loop: for i in 0..inner_len, out[i] = inner[i]
+            body.instruction(&Instruction::I32Const(0));
+            body.instruction(&Instruction::LocalSet(i_slot));
+            body.instruction(&Instruction::Block(BlockType::Empty));
+            body.instruction(&Instruction::Loop(BlockType::Empty));
+            body.instruction(&Instruction::LocalGet(i_slot));
+            body.instruction(&Instruction::LocalGet(inner_len_slot));
+            body.instruction(&Instruction::I32GeS);
+            body.instruction(&Instruction::BrIf(1));
+            body.instruction(&Instruction::LocalGet(out_slot));
+            body.instruction(&Instruction::LocalGet(i_slot));
+            body.instruction(&Instruction::I32Const(4));
+            body.instruction(&Instruction::I32Mul);
+            body.instruction(&Instruction::I32Add);
+            body.instruction(&Instruction::LocalGet(inner_slot));
+            body.instruction(&Instruction::LocalGet(i_slot));
+            body.instruction(&Instruction::I32Const(4));
+            body.instruction(&Instruction::I32Mul);
+            body.instruction(&Instruction::I32Add);
+            body.instruction(&Instruction::I32Load(i32_at(SEQ_HEADER_SIZE as u64)));
+            body.instruction(&Instruction::I32Store(i32_at(SEQ_HEADER_SIZE as u64)));
+            body.instruction(&Instruction::LocalGet(i_slot));
+            body.instruction(&Instruction::I32Const(1));
+            body.instruction(&Instruction::I32Add);
+            body.instruction(&Instruction::LocalSet(i_slot));
+            body.instruction(&Instruction::Br(0));
+            body.instruction(&Instruction::End);
+            body.instruction(&Instruction::End);
+            // out[inner_len] = y
+            body.instruction(&Instruction::LocalGet(out_slot));
+            body.instruction(&Instruction::LocalGet(inner_len_slot));
+            body.instruction(&Instruction::I32Const(4));
+            body.instruction(&Instruction::I32Mul);
+            body.instruction(&Instruction::I32Add);
+            body.instruction(&Instruction::LocalGet(pair_slot));
+            body.instruction(&Instruction::I32Load(i32_at(12)));
+            body.instruction(&Instruction::I32Store(i32_at(SEQ_HEADER_SIZE as u64)));
+            body.instruction(&Instruction::LocalGet(out_slot));
+        }
+        Func::Concat => {
+            // Two-pass: sum inner lengths, then flatten. The bump
+            // allocator can't grow an existing region, so we must
+            // know the total up front.
+            let outer_slot = next_scratch;
+            let outer_len_slot = next_scratch + 1;
+            let i_slot = next_scratch + 2;
+            let total_len_slot = next_scratch + 3;
+            let out_slot = next_scratch + 4;
+            let out_pos_slot = next_scratch + 5;
+            let inner_slot = next_scratch + 6;
+            let inner_len_slot = next_scratch + 7;
+            let j_slot = next_scratch + 8;
+            body.instruction(&Instruction::LocalSet(outer_slot));
+            body.instruction(&Instruction::LocalGet(outer_slot));
+            body.instruction(&Instruction::I32Load(i32_at(4)));
+            body.instruction(&Instruction::LocalSet(outer_len_slot));
+            // Pass 1: total_len = Σ outer[i].length
+            body.instruction(&Instruction::I32Const(0));
+            body.instruction(&Instruction::LocalSet(total_len_slot));
+            body.instruction(&Instruction::I32Const(0));
+            body.instruction(&Instruction::LocalSet(i_slot));
+            body.instruction(&Instruction::Block(BlockType::Empty));
+            body.instruction(&Instruction::Loop(BlockType::Empty));
+            body.instruction(&Instruction::LocalGet(i_slot));
+            body.instruction(&Instruction::LocalGet(outer_len_slot));
+            body.instruction(&Instruction::I32GeS);
+            body.instruction(&Instruction::BrIf(1));
+            // total_len += outer[i].length
+            body.instruction(&Instruction::LocalGet(total_len_slot));
+            body.instruction(&Instruction::LocalGet(outer_slot));
+            body.instruction(&Instruction::LocalGet(i_slot));
+            body.instruction(&Instruction::I32Const(4));
+            body.instruction(&Instruction::I32Mul);
+            body.instruction(&Instruction::I32Add);
+            body.instruction(&Instruction::I32Load(i32_at(SEQ_HEADER_SIZE as u64)));
+            body.instruction(&Instruction::I32Load(i32_at(4)));
+            body.instruction(&Instruction::I32Add);
+            body.instruction(&Instruction::LocalSet(total_len_slot));
+            body.instruction(&Instruction::LocalGet(i_slot));
+            body.instruction(&Instruction::I32Const(1));
+            body.instruction(&Instruction::I32Add);
+            body.instruction(&Instruction::LocalSet(i_slot));
+            body.instruction(&Instruction::Br(0));
+            body.instruction(&Instruction::End);
+            body.instruction(&Instruction::End);
+            // Alloc out = header + 4 * total_len
+            body.instruction(&Instruction::I32Const(SEQ_HEADER_SIZE));
+            body.instruction(&Instruction::LocalGet(total_len_slot));
+            body.instruction(&Instruction::I32Const(4));
+            body.instruction(&Instruction::I32Mul);
+            body.instruction(&Instruction::I32Add);
+            body.instruction(&Instruction::Call(FN_ALLOC));
+            body.instruction(&Instruction::LocalTee(out_slot));
+            body.instruction(&Instruction::I32Const(TAG_SEQ));
+            body.instruction(&Instruction::I32Store(i32_at(0)));
+            body.instruction(&Instruction::LocalGet(out_slot));
+            body.instruction(&Instruction::LocalGet(total_len_slot));
+            body.instruction(&Instruction::I32Store(i32_at(4)));
+            // Pass 2: copy inner elements to out[out_pos++]
+            body.instruction(&Instruction::I32Const(0));
+            body.instruction(&Instruction::LocalSet(out_pos_slot));
+            body.instruction(&Instruction::I32Const(0));
+            body.instruction(&Instruction::LocalSet(i_slot));
+            body.instruction(&Instruction::Block(BlockType::Empty));
+            body.instruction(&Instruction::Loop(BlockType::Empty));
+            body.instruction(&Instruction::LocalGet(i_slot));
+            body.instruction(&Instruction::LocalGet(outer_len_slot));
+            body.instruction(&Instruction::I32GeS);
+            body.instruction(&Instruction::BrIf(1));
+            // inner = outer[i]
+            body.instruction(&Instruction::LocalGet(outer_slot));
+            body.instruction(&Instruction::LocalGet(i_slot));
+            body.instruction(&Instruction::I32Const(4));
+            body.instruction(&Instruction::I32Mul);
+            body.instruction(&Instruction::I32Add);
+            body.instruction(&Instruction::I32Load(i32_at(SEQ_HEADER_SIZE as u64)));
+            body.instruction(&Instruction::LocalTee(inner_slot));
+            body.instruction(&Instruction::I32Load(i32_at(4)));
+            body.instruction(&Instruction::LocalSet(inner_len_slot));
+            // Inner loop: for j in 0..inner_len: out[out_pos++] = inner[j]
+            body.instruction(&Instruction::I32Const(0));
+            body.instruction(&Instruction::LocalSet(j_slot));
+            body.instruction(&Instruction::Block(BlockType::Empty));
+            body.instruction(&Instruction::Loop(BlockType::Empty));
+            body.instruction(&Instruction::LocalGet(j_slot));
+            body.instruction(&Instruction::LocalGet(inner_len_slot));
+            body.instruction(&Instruction::I32GeS);
+            body.instruction(&Instruction::BrIf(1));
+            // Store addr = out + 4 * out_pos
+            body.instruction(&Instruction::LocalGet(out_slot));
+            body.instruction(&Instruction::LocalGet(out_pos_slot));
+            body.instruction(&Instruction::I32Const(4));
+            body.instruction(&Instruction::I32Mul);
+            body.instruction(&Instruction::I32Add);
+            // Elem = inner[j]
+            body.instruction(&Instruction::LocalGet(inner_slot));
+            body.instruction(&Instruction::LocalGet(j_slot));
+            body.instruction(&Instruction::I32Const(4));
+            body.instruction(&Instruction::I32Mul);
+            body.instruction(&Instruction::I32Add);
+            body.instruction(&Instruction::I32Load(i32_at(SEQ_HEADER_SIZE as u64)));
+            body.instruction(&Instruction::I32Store(i32_at(SEQ_HEADER_SIZE as u64)));
+            // out_pos += 1
+            body.instruction(&Instruction::LocalGet(out_pos_slot));
+            body.instruction(&Instruction::I32Const(1));
+            body.instruction(&Instruction::I32Add);
+            body.instruction(&Instruction::LocalSet(out_pos_slot));
+            // j += 1
+            body.instruction(&Instruction::LocalGet(j_slot));
+            body.instruction(&Instruction::I32Const(1));
+            body.instruction(&Instruction::I32Add);
+            body.instruction(&Instruction::LocalSet(j_slot));
+            body.instruction(&Instruction::Br(0));
+            body.instruction(&Instruction::End); // inner loop
+            body.instruction(&Instruction::End); // inner block
+            // i += 1
+            body.instruction(&Instruction::LocalGet(i_slot));
+            body.instruction(&Instruction::I32Const(1));
+            body.instruction(&Instruction::I32Add);
+            body.instruction(&Instruction::LocalSet(i_slot));
+            body.instruction(&Instruction::Br(0));
+            body.instruction(&Instruction::End); // outer loop
+            body.instruction(&Instruction::End); // outer block
+            body.instruction(&Instruction::LocalGet(out_slot));
+        }
 
         // c̄:x = c (when x ≠ ⊥) — drop input ptr, allocate fresh Atom.
         Func::Constant(Object::Atom(s)) => {
@@ -1219,10 +1496,10 @@ mod tests {
 
     #[test]
     fn lower_rejects_unsupported_variant() {
-        // ApndL isn't wired yet — pair → new Seq. Binary seq ops
-        // (ApndL/ApndR/Concat) are the next group.
-        let f = Func::ApndL;
-        let err = lower_to_wasm(&f).expect_err("ApndL should be marked unsupported");
+        // DistL isn't wired yet — distribution ops (DistL/DistR/Trans)
+        // allocate N pair-seqs in one pass; next group.
+        let f = Func::DistL;
+        let err = lower_to_wasm(&f).expect_err("DistL should be marked unsupported");
         assert!(err.contains("not yet supported"));
     }
 
@@ -1730,6 +2007,99 @@ mod tests {
             Box::new(pair(3, 5)),
         );
         assert_eq!(roundtrip(&f2, 0), 200);
+    }
+
+    // ── Binary Seq builders (ApndL, ApndR, Concat) ────────────────
+
+    #[test]
+    fn lower_apndl_prepends_head_to_inner_seq() {
+        // apndl:<99, <1, 2, 3>> = <99, 1, 2, 3>.
+        let f = Func::Compose(
+            Box::new(Func::ApndL),
+            Box::new(Func::Construction(vec![
+                Func::Constant(Object::atom("99")),
+                seq_of_atoms(&[1, 2, 3]),
+            ])),
+        );
+        assert_eq!(roundtrip_seq(&f, 0), vec![99, 1, 2, 3]);
+    }
+
+    #[test]
+    fn lower_apndl_onto_empty_seq_produces_singleton() {
+        // apndl:<99, <>> = <99>.
+        let f = Func::Compose(
+            Box::new(Func::ApndL),
+            Box::new(Func::Construction(vec![
+                Func::Constant(Object::atom("99")),
+                seq_of_atoms(&[]),
+            ])),
+        );
+        assert_eq!(roundtrip_seq(&f, 0), vec![99]);
+    }
+
+    #[test]
+    fn lower_apndr_appends_tail_to_inner_seq() {
+        // apndr:<<1, 2, 3>, 99> = <1, 2, 3, 99>.
+        let f = Func::Compose(
+            Box::new(Func::ApndR),
+            Box::new(Func::Construction(vec![
+                seq_of_atoms(&[1, 2, 3]),
+                Func::Constant(Object::atom("99")),
+            ])),
+        );
+        assert_eq!(roundtrip_seq(&f, 0), vec![1, 2, 3, 99]);
+    }
+
+    #[test]
+    fn lower_apndr_onto_empty_seq_produces_singleton() {
+        // apndr:<<>, 99> = <99>.
+        let f = Func::Compose(
+            Box::new(Func::ApndR),
+            Box::new(Func::Construction(vec![
+                seq_of_atoms(&[]),
+                Func::Constant(Object::atom("99")),
+            ])),
+        );
+        assert_eq!(roundtrip_seq(&f, 0), vec![99]);
+    }
+
+    #[test]
+    fn lower_concat_flattens_seq_of_seqs() {
+        // concat:<<1,2>, <3,4,5>, <6>> = <1,2,3,4,5,6>.
+        let f = Func::Compose(
+            Box::new(Func::Concat),
+            Box::new(Func::Construction(vec![
+                seq_of_atoms(&[1, 2]),
+                seq_of_atoms(&[3, 4, 5]),
+                seq_of_atoms(&[6]),
+            ])),
+        );
+        assert_eq!(roundtrip_seq(&f, 0), vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn lower_concat_handles_empty_inner_seqs() {
+        // concat:<<>, <1>, <>, <2, 3>, <>> = <1, 2, 3>.
+        // Empty inner seqs contribute nothing to total length and the
+        // inner-loop exit condition handles length-0 cleanly.
+        let f = Func::Compose(
+            Box::new(Func::Concat),
+            Box::new(Func::Construction(vec![
+                seq_of_atoms(&[]),
+                seq_of_atoms(&[1]),
+                seq_of_atoms(&[]),
+                seq_of_atoms(&[2, 3]),
+                seq_of_atoms(&[]),
+            ])),
+        );
+        assert_eq!(roundtrip_seq(&f, 0), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn lower_concat_of_empty_outer_is_empty() {
+        // concat:<> = <>.
+        let f = Func::Compose(Box::new(Func::Concat), Box::new(seq_of_atoms(&[])));
+        assert_eq!(roundtrip_seq(&f, 0), Vec::<i64>::new());
     }
 
     // ── Unary Seq transformers (Tail, Reverse, RotL, RotR) ────────
