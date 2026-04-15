@@ -219,7 +219,7 @@ Call `compile_to_solidity(state)` from Rust or use the MCP `compile` tool target
 
 Each entity noun becomes a synthesizable Verilog module with:
 
-- Clock and reset ports
+- Clock and reset ports (`clk`, `rst_n`)
 - Input wires for each RMAP column (e.g. `amount`, `customer_id`)
 - An output `valid` register
 - A clocked always block
@@ -228,7 +228,35 @@ Each entity noun becomes a synthesizable Verilog module with:
 App 'myapp' uses Generator 'fpga'.
 ```
 
-The emitted Verilog is a first-pass module shell. Constraint enforcement and state-machine transitions as synthesizable circuits are future work; the current generator proves the pipeline is in place.
+### Top module
+
+Alongside the per-entity modules, the generator emits a `top` module that wires them together so the output is a self-contained buildable unit:
+
+```verilog
+module top (
+    input wire clk,
+    input wire rst_n,
+    output reg all_valid
+);
+    wire order_valid;
+    wire customer_valid;
+
+    order    order_inst    (.clk(clk), .rst_n(rst_n),
+                            .id_in({256{1'b0}}), .valid(order_valid));
+    customer customer_inst (.clk(clk), .rst_n(rst_n),
+                            .name_in({256{1'b0}}), .valid(customer_valid));
+
+    always @(posedge clk) begin
+        all_valid <= rst_n & order_valid & customer_valid;
+    end
+endmodule
+```
+
+`clk` and `rst_n` fan out to every entity; each entity's `valid` is AND-reduced into a single system-level `all_valid`. Column inputs are tied to `{256{1'b0}}` so synthesis tools do not flag unconnected input ports — integrators replace those zero drivers with real wires (BRAM ports, pipeline stages) when integrating with storage. If the compile has no entity nouns, `top` is elided entirely — no entities, nothing to wire, just the header line.
+
+### What's still future work
+
+Constraint enforcement (UC/MC/FC as synthesizable comparators) and state-machine transitions as signal dispatch are not yet emitted. The current generator proves the pipeline and the top-level wiring are in place; the reduction engine inside each module is still a shell.
 
 ## Test
 

@@ -5,10 +5,10 @@ This doc walks through what happens between the moment you hand the engine a dir
 ## One-line summary
 
 ```
-readings text → parse → Domain → domain_to_state → P (Map) → compile_to_defs_state → defs (Vec) → defs_to_state → D (Map)
+readings text → parse → Domain → domain_to_state → P (Map) → compile_to_defs_state → defs (Vec) → defs_to_state → D (Map) → split into cells
 ```
 
-`P` is the population (facts). `D` is the state, meaning `P` plus all compiled defs in a single keyed Map. Every MCP call operates over `D`.
+`P` is the population (facts). `D` is the state, meaning `P` plus all compiled defs. At rest, `D` is held as a `HashMap<String, Arc<RwLock<Object>>>` — one independently-lockable cell per key, with Backus's fetch / store operators mapped onto per-cell read and write locks. Every MCP call operates against that cells map through a snapshot / diff / commit cycle (see "Concurrency" below).
 
 ## Step 1: Parse
 
@@ -93,6 +93,41 @@ Fetches against `D` are O(1) (backed by `HashMap`). At scale (100 fact types, 2,
 ## Incremental compile
 
 `compile` can be called on a running system to add new readings (Corollary 5: Closure Under Self-Modification). The new definitions merge into `DEFS` via `↓DEFS`, and subsequent `SYSTEM` applications see them. This is how `propose` eventually lands: a Domain Change transitioning to Applied invokes `compile` on the proposed readings.
+
+## Metamodel cache
+
+The metamodel (`readings/core.md` and the rest of the bundled domains) does not change between tenants. It compiles once per process: the first call through `OnceLock` runs parse + `compile_to_defs_state` over the merged metamodel and caches the resulting defs. Every tenant init after that seeds its cells from that cache and layers the tenant's own readings on top, paying only the user-readings delta.
+
+In practice this turns a 150-ms cold compile into a 5-ms per-tenant seed. The cache is a module-global, so long-lived processes (Cloudflare Workers warmed up, native daemons) amortize it across every request.
+
+## Concurrency: per-cell isolation
+
+Paper Definition 2 (Cell Isolation) permits concurrent `μ` applications over disjoint cells. The engine implements that by moving per-cell state into `Arc<RwLock<Object>>`, one lock per key in D. Writers follow a two-tier path:
+
+1. **Shared-lock fast path.** Take the outer tenant read lock, snapshot the cells into an `Object::Map`, run `apply()` against that snapshot, then `try_commit_diff`: for each cell whose contents differ, acquire that cell's write lock, CAS against the snapshot value, and commit. Two writers that touch disjoint cells never block each other.
+2. **Structural-change escalation.** If the new state adds or removes cells (for example, `compile` introducing new defs), the cells map itself must mutate. The writer drops its read lock, takes the outer write lock, re-snapshots, re-applies, and calls `replace_d`, which rebuilds the cells map while reusing existing locks where keys are unchanged.
+
+A concurrent writer whose CAS check fails (someone else committed a change to a cell it depends on) re-runs from step 1. The scheduler (see `src/scheduler.rs`) orders submissions into three priority lanes — Alethic before Deontic before ReadOnly — so a flood of queries never starves an invariant-critical write.
+
+Snapshots (the MCP `snapshot` / `rollback` verbs) piggy-back on this representation. A capture is one map insert plus an `Arc` ref bump per cell; restoring is `replace_d` against the captured map. Snapshots are per-tenant, so captures in one MCP session do not leak into another.
+
+## WASM lowering (optional)
+
+The evaluator has a second backend. Enable the `wasm-lower` cargo feature and each compiled `Func` can be lowered to a standalone WebAssembly module that executes inside `wasmi`. The lowering covers Backus §11.2.4 combining forms (Id, Compose, Condition, Construction, ApplyToAll, Filter, Insert, While), §11.2.3 primitives (arithmetic, comparisons, logic, sequence builders, distribution, Contains / Lower over string atoms), the Selector family, and host-imported D-access (`Fetch`, `FetchOrPhi`, `Store`, `Def`, `Platform`). `Func::Native` — Rust closures that cannot cross the FFI boundary — is the only intentional gap.
+
+```bash
+cargo test --features wasm-lower --lib wasm_lower
+```
+
+Object layout in WASM linear memory uses a tag-based encoding: `Atom` = 16 bytes, `Seq` = 8-byte header + 4 bytes per element pointer, `StringAtom` = 8-byte header + length-prefixed bytes. A bump allocator resets between `apply()` calls so each evaluation starts with a fresh heap.
+
+The feature is there for three reasons:
+
+- A buildable artefact for FPGA deployment (see [Generators](07-generators.md) §Verilog — the FPGA bundle plan packages the lowered WASM alongside the synthesized modules).
+- Portable dispatch across runtimes where embedding `wasmi` is cheaper than embedding the whole engine.
+- Ahead-of-time optimization of Func trees per the FP algebraic laws (paper §Conclusion), since a lowered module is a flat instruction stream amenable to standard compiler passes.
+
+Without the feature flag, the engine evaluates `Func` trees directly in Rust and the WASM path is not included in the binary. Production deployments can run either backend against the same compiled defs.
 
 ## What's next
 
