@@ -111,6 +111,28 @@ pub fn resolve_entity_id(
         .next()
 }
 
+/// Atom IDs — entity reference values, enum members, slugs — must be
+/// ASCII-only and case-insensitive-equivalent under ASCII fold. Free-form
+/// text fields (Description, Violation message bodies, Reading text) keep
+/// full Unicode since their identity is byte-exact, not case-folded.
+///
+/// Why the constraint:
+///   - `Func::Lower` (#162) case-folds ASCII only. Adding Unicode case
+///     mapping costs an i18n table in every WASM module we emit.
+///   - FPGA fact-ingress ports (#168) allocate fixed-width name wires;
+///     length-bounded ASCII fits a 32-byte port, full Unicode doesn't.
+///   - SQL collation + OpenAPI path-parameter matching both rely on
+///     byte-level equality or ASCII fold, so non-ASCII IDs round-trip
+///     through the stack inconsistently.
+///
+/// Returns true if every byte of `s` is in the printable ASCII range
+/// 0x20..=0x7E and the string is non-empty. Rejects control characters,
+/// NUL bytes, and any multi-byte UTF-8 sequence.
+pub fn atom_id_is_valid(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes().all(|b| (0x20..=0x7E).contains(&b))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,5 +165,49 @@ mod tests {
         assert_eq!(noun_to_table("Fact Type"), "fact_types");
         assert_eq!(noun_to_table("SupportRequest"), "support_requests");
         assert_eq!(noun_to_table("Status"), "statuses");
+    }
+
+    #[test]
+    fn atom_id_accepts_printable_ascii() {
+        // Canonical atom IDs across AREST.
+        assert!(atom_id_is_valid("acme"));
+        assert!(atom_id_is_valid("ord-1"));
+        assert!(atom_id_is_valid("Order 42"));
+        assert!(atom_id_is_valid("user@example.com"));
+        assert!(atom_id_is_valid("Fact_Type_has_Role"));
+        assert!(atom_id_is_valid("Widget Id")); // space is printable ASCII
+        assert!(atom_id_is_valid("!#$%&()*+,./"));
+    }
+
+    #[test]
+    fn atom_id_rejects_empty() {
+        assert!(!atom_id_is_valid(""));
+    }
+
+    #[test]
+    fn atom_id_rejects_control_characters() {
+        assert!(!atom_id_is_valid("line1\nline2"));
+        assert!(!atom_id_is_valid("tab\there"));
+        assert!(!atom_id_is_valid("null\0byte"));
+        assert!(!atom_id_is_valid("bell\x07"));
+    }
+
+    #[test]
+    fn atom_id_rejects_non_ascii_bytes() {
+        // Multi-byte UTF-8: each sequence has at least one byte >= 0x80.
+        assert!(!atom_id_is_valid("café"));
+        assert!(!atom_id_is_valid("naïve"));
+        assert!(!atom_id_is_valid("Москва"));
+        assert!(!atom_id_is_valid("東京"));
+        assert!(!atom_id_is_valid("emoji\u{1F600}here"));
+    }
+
+    #[test]
+    fn atom_id_rejects_del_and_boundary_bytes() {
+        // 0x7F is DEL — printable-ASCII range excludes it.
+        assert!(!atom_id_is_valid("\x7F"));
+        // 0x1F is Unit Separator — below the printable range.
+        assert!(!atom_id_is_valid("\x1F"));
+        assert!(!atom_id_is_valid("ok\x1Funit_sep"));
     }
 }
