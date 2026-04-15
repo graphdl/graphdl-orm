@@ -30,8 +30,6 @@ mod naming;
 #[allow(dead_code)]
 mod conceptual_query;
 #[allow(dead_code)]
-mod parse_rule;
-#[allow(dead_code)]
 mod parse_forml2;
 #[allow(dead_code)]
 mod verbalize;

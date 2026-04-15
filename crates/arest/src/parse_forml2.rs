@@ -550,7 +550,7 @@ fn try_derivation(line: &str) -> Option<ParseAction> {
             id: String::new(), text: clean.into(),
             antecedent_fact_type_ids: vec![], consequent_fact_type_id: String::new(),
             kind: DerivationKind::ModusPonens,
-            join_on: vec![], match_on: vec![], consequent_bindings: vec![],
+            join_on: vec![], match_on: vec![], consequent_bindings: vec![], antecedent_filters: vec![],
         })
     })
 }
@@ -1259,11 +1259,40 @@ fn parse_into(ir: &mut Domain, input: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Strip a trailing numeric comparator (Halpin FORML Example 5: `has Population >= 1000000`)
+/// from an antecedent fragment. Returns `(stripped_text, Option<(op, value)>)`.
+///
+/// Accepts `>=`, `<=`, `>`, `<`, `=`, `!=`, and `<>` — the last is normalised
+/// to `!=` so compile-time dispatch sees one canonical form. Longer operators
+/// (`>=`, `<=`, `!=`, `<>`) are listed first in the alternation so the engine
+/// prefers `>=` over `>` on input like `has Amount >= 100`.
+fn split_antecedent_comparator(text: &str) -> (String, Option<(String, f64)>) {
+    let re = regex::Regex::new(
+        r"\s*(>=|<=|!=|<>|>|<|=)\s*(-?\d+(?:\.\d+)?)\s*$"
+    ).expect("static regex compiles");
+    match re.captures(text) {
+        Some(caps) => {
+            let whole = caps.get(0).unwrap();
+            let stripped = text[..whole.start()].trim_end().to_string();
+            let raw_op = caps.get(1).unwrap().as_str();
+            let op = if raw_op == "<>" { "!=".to_string() } else { raw_op.to_string() };
+            let value: f64 = caps.get(2).unwrap().as_str().parse().unwrap_or(0.0);
+            (stripped, Some((op, value)))
+        }
+        None => (text.to_string(), None),
+    }
+}
+
 /// Resolve a derivation rule's text into structured fact type references.
 ///
 /// Splits on " if "/" iff " to get consequent and antecedent parts,
 /// then matches each part's nouns against ir.fact_types by role noun names.
 /// Anaphoric "that X" references are stripped to bare noun name "X".
+///
+/// Per-antecedent inline numeric comparisons (Halpin FORML Example 5) are
+/// extracted via `split_antecedent_comparator` BEFORE fact-type resolution,
+/// so `has Population >= 1000000` resolves to the base FT `has Population`
+/// with an AntecedentFilter attached restricting that antecedent's population.
 fn resolve_derivation_rule(rule: &mut DerivationRuleDef, ir: &Domain, catalog: &SchemaCatalog) {
     // Longest-first noun list for Theorem 1 matching
     let mut noun_names: Vec<String> = ir.nouns.keys().cloned().collect();
@@ -1326,10 +1355,38 @@ fn resolve_derivation_rule(rule: &mut DerivationRuleDef, ir: &Domain, catalog: &
     // Resolve consequent
     rule.consequent_fact_type_id = resolve_fact_type(consequent_text).unwrap_or_default();
 
-    // Resolve antecedents
-    rule.antecedent_fact_type_ids = antecedent_parts.iter()
-        .filter_map(|part| resolve_fact_type(part))
-        .collect();
+    // Resolve antecedents, carrying inline-comparator filters alongside.
+    // A part like `Order has Amount >= 100` resolves to `Order has Amount`
+    // plus an AntecedentFilter { op: ">=", value: 100.0 } indexed to the
+    // resolved antecedent's position. We walk parts and push into ids and
+    // filters together so their indices stay aligned when some parts fail
+    // to resolve.
+    let mut resolved_ids: Vec<String> = Vec::new();
+    let mut filters: Vec<crate::types::AntecedentFilter> = Vec::new();
+    for part in antecedent_parts.iter() {
+        let (stripped, comparator) = split_antecedent_comparator(part);
+        let Some(ft_id) = resolve_fact_type(&stripped) else { continue };
+        if let Some((op, value)) = comparator {
+            // Role = the last-role noun of the resolved fact type. For a
+            // `has X` binary it's the value-carrier; for ternaries the
+            // convention is the numeric-valued role sitting last in the
+            // reading (e.g. `Employee earns Salary in Year` → role=Year is
+            // the outermost, but `Order has Amount >= 100` → role=Amount).
+            let role = ir.fact_types.get(&ft_id)
+                .and_then(|ft| ft.roles.last())
+                .map(|r| r.noun_name.clone())
+                .unwrap_or_default();
+            filters.push(crate::types::AntecedentFilter {
+                antecedent_index: resolved_ids.len(),
+                role,
+                op,
+                value,
+            });
+        }
+        resolved_ids.push(ft_id);
+    }
+    rule.antecedent_fact_type_ids = resolved_ids;
+    rule.antecedent_filters = filters;
 
     // Deduplicate join keys
     let mut seen = std::collections::HashSet::new();
@@ -2078,6 +2135,83 @@ mod tests {
         let ir = parse_markdown(input).unwrap();
         let rule = &ir.derivation_rules[0];
         assert!(rule.join_on.contains(&"Organization".to_string()), "Organization should be a join key (referenced with 'that')");
+    }
+
+    // ── Inline comparisons on antecedent roles (Halpin FORML Example 5) ──
+    //
+    // `Each LargeUSCity is a City that is in Country 'US' and has Population >= 1000000.`
+    // The parser should:
+    //   (1) resolve the base fact type (`has Population` → FT_Population)
+    //       without being confused by the trailing comparator;
+    //   (2) capture `>=`, `1000000` into DerivationRuleDef::antecedent_filters
+    //       pinned to the antecedent's index; and
+    //   (3) accept the full Halpin operator set: `>=`, `<=`, `>`, `<`, `=`,
+    //       `!=`, and `<>` (which is normalized to `!=`).
+
+    #[test]
+    fn derivation_rule_captures_inline_ge_comparison() {
+        let input = "City(.Name) is an entity type.\nBig City(.Name) is an entity type.\nPopulation is a value type.\n## Fact Types\nCity has Population.\nBig City has City.\n## Derivation Rules\n* Big City has City iff City has Population >= 1000000.";
+        let ir = parse_markdown(input).unwrap();
+        let rule = ir.derivation_rules.iter()
+            .find(|r| r.text.contains("Big City has City"))
+            .expect("derivation rule present");
+        assert_eq!(rule.antecedent_filters.len(), 1,
+            "one inline comparison expected, got {:#?}", rule.antecedent_filters);
+        let f = &rule.antecedent_filters[0];
+        assert_eq!(f.op, ">=");
+        assert_eq!(f.value, 1_000_000.0);
+        assert_eq!(f.role, "Population");
+        // Antecedent still resolves to the base fact type — the comparator
+        // is a filter on it, not a replacement.
+        assert!(rule.antecedent_fact_type_ids.iter().any(|id| id.contains("Population")),
+            "base FT should still resolve: {:?}", rule.antecedent_fact_type_ids);
+    }
+
+    #[test]
+    fn derivation_rule_accepts_all_comparison_operators() {
+        // Parametric sweep over the six Halpin operators. `<>` normalizes to
+        // `!=` at parse time so downstream compile can dispatch on one form.
+        for (op_in, op_out) in [
+            (">=", ">="), ("<=", "<="),
+            (">",  ">"),  ("<",  "<"),
+            ("=",  "="),  ("!=", "!="),
+            ("<>", "!="),
+        ] {
+            let input = format!(
+                "City(.Name) is an entity type.\nBig City(.Name) is an entity type.\nPopulation is a value type.\n## Fact Types\nCity has Population.\nBig City has City.\n## Derivation Rules\n* Big City has City iff City has Population {op_in} 100.");
+            let ir = parse_markdown(&input).expect("parse ok");
+            let rule = ir.derivation_rules.iter()
+                .find(|r| r.text.contains("Big City has City"))
+                .unwrap_or_else(|| panic!("rule missing for op {op_in}"));
+            assert_eq!(rule.antecedent_filters.len(), 1, "op {op_in}: filters = {:?}", rule.antecedent_filters);
+            assert_eq!(rule.antecedent_filters[0].op, op_out,
+                "op {op_in} should normalize to {op_out}, got {}", rule.antecedent_filters[0].op);
+            assert_eq!(rule.antecedent_filters[0].value, 100.0, "op {op_in} value");
+        }
+    }
+
+    #[test]
+    fn derivation_rule_handles_float_and_negative_literals() {
+        // Float + negative literal should parse; irrelevant whitespace too.
+        let input = "Reading(.Name) is an entity type.\nWarm Reading(.Name) is an entity type.\nTemperature is a value type.\n## Fact Types\nReading has Temperature.\nWarm Reading has Reading.\n## Derivation Rules\n* Warm Reading has Reading iff Reading has Temperature > -273.15.";
+        let ir = parse_markdown(input).unwrap();
+        let rule = ir.derivation_rules.iter()
+            .find(|r| r.text.contains("Warm Reading has Reading"))
+            .expect("rule present");
+        assert_eq!(rule.antecedent_filters.len(), 1);
+        assert_eq!(rule.antecedent_filters[0].op, ">");
+        assert!((rule.antecedent_filters[0].value - (-273.15)).abs() < 1e-9,
+            "expected -273.15, got {}", rule.antecedent_filters[0].value);
+    }
+
+    #[test]
+    fn derivation_rule_without_comparison_leaves_filters_empty() {
+        // Regression: a plain join rule must not accidentally produce filters.
+        let input = "User(.Email) is an entity type.\nDomain(.Slug) is an entity type.\nOrganization(.Slug) is an entity type.\n## Fact Types\nUser belongs to Organization.\nDomain belongs to Organization.\nUser accesses Domain.\n## Derivation Rules\n+ User accesses Domain if User belongs to Organization and Domain belongs to that Organization.";
+        let ir = parse_markdown(input).unwrap();
+        let rule = &ir.derivation_rules[0];
+        assert!(rule.antecedent_filters.is_empty(),
+            "expected no filters on plain join rule, got {:?}", rule.antecedent_filters);
     }
 
     #[test]

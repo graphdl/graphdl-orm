@@ -99,6 +99,32 @@ pub struct DerivationRuleDef {
     /// If empty, all bindings from the joined facts are included.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub consequent_bindings: Vec<String>,
+    /// Inline numeric comparisons attached to individual antecedents.
+    ///
+    /// Halpin FORML Example 5 (W3C position paper):
+    ///   Each LargeUSCity is a City that is in Country 'US'
+    ///                    and has Population >= 1000000.
+    /// The `>= 1000000` is recorded as an AntecedentFilter pinned to the
+    /// `has Population` antecedent. At compile time the rule becomes
+    /// Filter(p) : P over the filtered antecedent facts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub antecedent_filters: Vec<AntecedentFilter>,
+}
+
+/// Numeric comparison that further restricts a derivation antecedent.
+/// See `DerivationRuleDef::antecedent_filters`.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AntecedentFilter {
+    /// Index into `antecedent_fact_type_ids` that this filter restricts.
+    pub antecedent_index: usize,
+    /// Role name whose value is compared (e.g., "Population").
+    pub role: String,
+    /// Comparison op: one of `">="`, `"<="`, `">"`, `"<"`, `"="`, `"!="`.
+    /// `<>` input is normalized to `!=`.
+    pub op: String,
+    /// Numeric RHS literal.
+    pub value: f64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
