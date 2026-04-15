@@ -16,20 +16,32 @@
 // result Object. Callers dereference the pointer by reading bytes
 // from `memory`.
 //
-// Supported variants (PoC):
-//   - Func::Id                      : identity on the Object pointer
-//   - Func::Constant(Object::Atom)  : i64-parseable literal
-//   - Func::Compose(f, g)           : (f ∘ g):x = f:(g:x)
-//   - Func::Condition(p, f, g)      : (p → f; g):x
-//   - Func::Construction([f₁…fₙ])   : <CONS, f₁, …, fₙ>:x
+// Supported variants:
+//   Primitives                : Id
+//   Literal                   : Constant(Object::Atom) (i64-parseable)
+//   Combining forms (§11.2.4) : Compose, Condition, Construction,
+//                               ApplyToAll, Filter, Insert, While
+//   Structural (§11.2.3)      : Selector, Tail, Reverse, RotL, RotR
+//                               ApndL, ApndR, Concat,
+//                               DistL, DistR, Trans
+//   Arithmetic (§11.2.3)      : Add, Sub, Mul, Div  (÷ protects
+//                               against divide-by-zero → φ)
+//   Comparison (§11.2.3)      : Eq, Gt, Lt, Ge, Le  (signed i64)
+//   Logic (§11.2.3)           : And, Or, Not
+//   Predicates (§11.2.3)      : AtomTest, NullTest, Length
 //
-// Not yet supported (landing on follow-up commits):
-//   - Func::ApplyToAll / Filter / Insert — need loop emission
-//     over a Seq in linear memory.
-//   - Func::Selector                — needs Seq indexing; trivial
-//     once the layout is stable.
-//   - Arithmetic / comparison / logic — need pair unpacking.
-//   - String Atoms, Map             — need variable-size layout.
+// Intentionally NOT supported (out of scope for this PoC):
+//   - Fetch / FetchOrPhi / Store : need access to D (runtime state).
+//     The PoC's pure `(i64) → i32` contract has no way to plumb D
+//     through; a production lowering would import a cell-access
+//     host function.
+//   - Def(name) / Platform(name) / Native : dispatch through DEFS.
+//     Same issue — these resolve names in D at runtime.
+//   - Contains / Lower                   : need string Atom layout
+//     (length + UTF-8 bytes). Every other variant works on i64
+//     atoms + Seqs of pointers, avoiding the string-width question.
+//   - Constant(Object::Seq / Map)        : literal Seqs/Maps would
+//     need data-section layout; currently only i64 atoms literally.
 //
 // Memory layout (absolute offsets):
 //   0 .. HEAP_START : reserved (unused sentinels)
@@ -341,6 +353,10 @@ fn scratch_needed(func: &Func) -> u32 {
         // inner_len, out, i (output row), pair_i (scratch per-row),
         // j (input-row iterator).
         Func::Trans => 7,
+        // While: two function-level slots (acc, counter) plus whatever
+        // the pred and body subterms need. Pred and body alternate —
+        // they can share the slot range, so only take the max.
+        Func::While(p, f) => 2 + scratch_needed(p).max(scratch_needed(f)),
         _ => 0,
     }
 }
@@ -1212,6 +1228,55 @@ fn emit_body(
             body.instruction(&Instruction::End); // end if/else
         }
 
+        // Backus §11.2.4 While (bounded iteration):
+        //
+        //   while:(p, f):x = if p:x then while:(p, f):(f:x) else x
+        //
+        // Evaluate p on the current accumulator; if truthy, replace
+        // the accumulator with f:acc and repeat. We cap at 1_000_000
+        // iterations as a safety net — AREST derivation rules are
+        // monotonic-bounded in principle, but emitting silicon and
+        // running under malicious-input conditions makes a hard cap
+        // worth the handful of extra instructions per iteration.
+        //
+        // Scratch:
+        //   acc_slot     = next_scratch     : current value
+        //   counter_slot = next_scratch + 1 : safety counter
+        //   ≥ next_scratch + 2              : shared by p and f
+        Func::While(p, f) => {
+            let acc_slot = next_scratch;
+            let counter_slot = next_scratch + 1;
+            body.instruction(&Instruction::LocalSet(acc_slot));
+            body.instruction(&Instruction::I32Const(0));
+            body.instruction(&Instruction::LocalSet(counter_slot));
+            body.instruction(&Instruction::Block(BlockType::Empty));
+            body.instruction(&Instruction::Loop(BlockType::Empty));
+            // Evaluate p on acc; exit if falsy.
+            body.instruction(&Instruction::LocalGet(acc_slot));
+            emit_body(p, body, next_scratch + 2, div_i64_slot)?;
+            body.instruction(&Instruction::Call(FN_TRUTHY));
+            body.instruction(&Instruction::I32Eqz);
+            body.instruction(&Instruction::BrIf(1));
+            // Safety cap: exit if counter ≥ 1_000_000.
+            body.instruction(&Instruction::LocalGet(counter_slot));
+            body.instruction(&Instruction::I32Const(1_000_000));
+            body.instruction(&Instruction::I32GeS);
+            body.instruction(&Instruction::BrIf(1));
+            // acc = f(acc)
+            body.instruction(&Instruction::LocalGet(acc_slot));
+            emit_body(f, body, next_scratch + 2, div_i64_slot)?;
+            body.instruction(&Instruction::LocalSet(acc_slot));
+            // counter += 1
+            body.instruction(&Instruction::LocalGet(counter_slot));
+            body.instruction(&Instruction::I32Const(1));
+            body.instruction(&Instruction::I32Add);
+            body.instruction(&Instruction::LocalSet(counter_slot));
+            body.instruction(&Instruction::Br(0));
+            body.instruction(&Instruction::End); // end loop
+            body.instruction(&Instruction::End); // end block
+            body.instruction(&Instruction::LocalGet(acc_slot));
+        }
+
         Func::Concat => {
             // Two-pass: sum inner lengths, then flatten. The bump
             // allocator can't grow an existing region, so we must
@@ -1800,14 +1865,28 @@ mod tests {
     }
 
     #[test]
-    fn lower_rejects_unsupported_variant() {
-        // While is the next natural addition — bounded iteration.
-        // Cell ops (Fetch/Store/Def/Platform/Native) are
-        // intentionally NOT lowered: they need access to D (the
-        // runtime state), which the PoC's pure-i64 `apply` has no
-        // way to plumb through.
-        let f = Func::While(Box::new(Func::Id), Box::new(Func::Id));
-        let err = lower_to_wasm(&f).expect_err("While should be marked unsupported");
+    fn lower_rejects_unsupported_variant_fetch() {
+        // Cell ops are intentionally NOT lowered: they need access
+        // to D (the runtime state), which the PoC's pure-i64 apply
+        // has no way to plumb through.
+        let f = Func::Fetch;
+        let err = lower_to_wasm(&f).expect_err("Fetch should be unsupported");
+        assert!(err.contains("not yet supported"));
+    }
+
+    #[test]
+    fn lower_rejects_unsupported_variant_def() {
+        // Dispatch ops likewise resolve names in DEFS at runtime.
+        let f = Func::Def("noun:create".into());
+        let err = lower_to_wasm(&f).expect_err("Def should be unsupported");
+        assert!(err.contains("not yet supported"));
+    }
+
+    #[test]
+    fn lower_rejects_unsupported_variant_contains() {
+        // String ops need string Atom layout we don't emit yet.
+        let f = Func::Contains;
+        let err = lower_to_wasm(&f).expect_err("Contains should be unsupported");
         assert!(err.contains("not yet supported"));
     }
 
@@ -2315,6 +2394,58 @@ mod tests {
             Box::new(pair(3, 5)),
         );
         assert_eq!(roundtrip(&f2, 0), 200);
+    }
+
+    // ── While (bounded iteration) ─────────────────────────────────
+
+    #[test]
+    fn lower_while_with_constant_false_predicate_is_identity() {
+        // (while (Constant 0; f)) : x = x — pred never fires, body
+        // never runs.
+        let f = Func::While(
+            Box::new(Func::Constant(Object::atom("0"))),
+            Box::new(Func::Id),
+        );
+        assert_eq!(roundtrip(&f, 42), 42);
+        assert_eq!(roundtrip(&f, -7), -7);
+    }
+
+    #[test]
+    fn lower_while_iterates_until_predicate_falsifies() {
+        // (while (x → f; x)) where f = pair<x, -1> → Add = x - 1.
+        // Starts truthy (Atom(n) with n ≠ 0), decrements each
+        // iteration, stops when acc reaches 0. For n=5 → 0 in 5
+        // iterations.
+        //
+        // The body: pair<id, Constant(-1)> → Add = x + (-1) = x - 1.
+        // The pred: Id — truthy iff acc is non-zero Atom.
+        let decrement = Func::Compose(
+            Box::new(Func::Add),
+            Box::new(Func::Construction(vec![
+                Func::Id,
+                Func::Constant(Object::atom("-1")),
+            ])),
+        );
+        let f = Func::While(Box::new(Func::Id), Box::new(decrement));
+        assert_eq!(roundtrip(&f, 5), 0);
+        assert_eq!(roundtrip(&f, 0), 0);      // already zero → skip
+        assert_eq!(roundtrip(&f, 1), 0);
+    }
+
+    #[test]
+    fn lower_while_cap_prevents_runaway() {
+        // Pathological case: predicate never falsifies AND body is
+        // identity. Without the safety counter, this would infinite-
+        // loop. With the counter, we bail out at 1M iterations and
+        // return whatever acc holds. Using Id for both pred and body
+        // means no per-iteration heap allocation — the single 64 KB
+        // memory page is enough even at full cap.
+        //
+        // Pred = Id : truthy iff acc is a non-null non-zero Atom.
+        // Body = Id : acc never changes.
+        //   => 1M iterations, then exit, acc = Atom(42).
+        let f = Func::While(Box::new(Func::Id), Box::new(Func::Id));
+        assert_eq!(roundtrip(&f, 42), 42);
     }
 
     // ── Distribution (DistL, DistR, Trans) ────────────────────────
