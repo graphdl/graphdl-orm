@@ -316,6 +316,11 @@ fn scratch_needed(func: &Func) -> u32 {
         // Not is unary-truthy → i32.eqz. Only And/Or need pair_slot.
         Func::And | Func::Or => 1,
         Func::Not => 0,
+        // Structural predicates need one scratch to stash the ptr
+        // across the null-guard branch (dereferencing a null ptr
+        // would load sentinel bytes from memory[0..3], silently
+        // misclassifying φ as Atom).
+        Func::AtomTest | Func::NullTest | Func::Length => 1,
         _ => 0,
     }
 }
@@ -500,6 +505,80 @@ fn emit_body(
             body.instruction(&Instruction::I32Eqz);
             body.instruction(&Instruction::I64ExtendI32U);
             body.instruction(&Instruction::Call(FN_ALLOC_ATOM));
+        }
+
+        // Backus §11.2.3 structural predicates. All unary, all produce
+        // a {0, 1} Atom. They inspect the Object tag rather than
+        // value, so they require a null-pointer guard — dereferencing
+        // address 0 would silently load sentinel bytes.
+        //
+        //   atom:x  = 1 if x is a non-null Atom else 0
+        //   null:x  = 1 if x = φ (null ptr or empty Seq) else 0
+        //   length:x = the Seq length as an Atom (φ if x is an Atom)
+        Func::AtomTest => {
+            let elem_slot = next_scratch;
+            body.instruction(&Instruction::LocalTee(elem_slot));
+            body.instruction(&Instruction::I32Eqz);
+            body.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+            body.instruction(&Instruction::I32Const(0)); // null is not atom
+            body.instruction(&Instruction::Else);
+            body.instruction(&Instruction::LocalGet(elem_slot));
+            body.instruction(&Instruction::I32Load(i32_at(0)));
+            body.instruction(&Instruction::I32Const(TAG_ATOM));
+            body.instruction(&Instruction::I32Eq);
+            body.instruction(&Instruction::End);
+            body.instruction(&Instruction::I64ExtendI32U);
+            body.instruction(&Instruction::Call(FN_ALLOC_ATOM));
+        }
+        Func::NullTest => {
+            // φ in the PoC is either a null ptr (from Insert on empty
+            // Seq) or a Seq of length 0 (from Filter/empty
+            // Construction). Both must test positive here.
+            let elem_slot = next_scratch;
+            body.instruction(&Instruction::LocalTee(elem_slot));
+            body.instruction(&Instruction::I32Eqz);
+            body.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+            body.instruction(&Instruction::I32Const(1)); // null ptr → φ
+            body.instruction(&Instruction::Else);
+            body.instruction(&Instruction::LocalGet(elem_slot));
+            body.instruction(&Instruction::I32Load(i32_at(0)));
+            body.instruction(&Instruction::I32Const(TAG_SEQ));
+            body.instruction(&Instruction::I32Eq);
+            body.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+            // Seq: φ iff length == 0
+            body.instruction(&Instruction::LocalGet(elem_slot));
+            body.instruction(&Instruction::I32Load(i32_at(4)));
+            body.instruction(&Instruction::I32Eqz);
+            body.instruction(&Instruction::Else);
+            // Atom: not φ
+            body.instruction(&Instruction::I32Const(0));
+            body.instruction(&Instruction::End);
+            body.instruction(&Instruction::End);
+            body.instruction(&Instruction::I64ExtendI32U);
+            body.instruction(&Instruction::Call(FN_ALLOC_ATOM));
+        }
+        Func::Length => {
+            // length on an Atom is φ per Backus (bottom-on-type-error).
+            // length on a Seq is the u32 length field, widened to i64.
+            let elem_slot = next_scratch;
+            body.instruction(&Instruction::LocalTee(elem_slot));
+            body.instruction(&Instruction::I32Eqz);
+            body.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+            body.instruction(&Instruction::I32Const(0)); // null → φ
+            body.instruction(&Instruction::Else);
+            body.instruction(&Instruction::LocalGet(elem_slot));
+            body.instruction(&Instruction::I32Load(i32_at(0)));
+            body.instruction(&Instruction::I32Const(TAG_SEQ));
+            body.instruction(&Instruction::I32Eq);
+            body.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+            body.instruction(&Instruction::LocalGet(elem_slot));
+            body.instruction(&Instruction::I32Load(i32_at(4)));
+            body.instruction(&Instruction::I64ExtendI32U);
+            body.instruction(&Instruction::Call(FN_ALLOC_ATOM));
+            body.instruction(&Instruction::Else);
+            body.instruction(&Instruction::I32Const(0)); // Atom → φ
+            body.instruction(&Instruction::End);
+            body.instruction(&Instruction::End);
         }
 
         // c̄:x = c (when x ≠ ⊥) — drop input ptr, allocate fresh Atom.
@@ -964,11 +1043,10 @@ mod tests {
 
     #[test]
     fn lower_rejects_unsupported_variant() {
-        // AtomTest isn't wired yet — structural predicates (AtomTest,
-        // NullTest) need a lookup on the Object tag rather than the
-        // truthiness of the value.
-        let f = Func::AtomTest;
-        let err = lower_to_wasm(&f).expect_err("AtomTest should be marked unsupported");
+        // Tail isn't wired yet — loop-based unary seq transformers
+        // are the next group (Tail/Reverse/RotL/RotR).
+        let f = Func::Tail;
+        let err = lower_to_wasm(&f).expect_err("Tail should be marked unsupported");
         assert!(err.contains("not yet supported"));
     }
 
@@ -1476,6 +1554,116 @@ mod tests {
             Box::new(pair(3, 5)),
         );
         assert_eq!(roundtrip(&f2, 0), 200);
+    }
+
+    // ── Structural predicates (AtomTest, NullTest, Length) ────────
+
+    #[test]
+    fn lower_atom_test_on_atom_returns_one() {
+        // atom:x=1 when x is a non-null Atom. The boxed i64 input
+        // becomes an Atom at apply entry, so Id preserves atomness.
+        let f = Func::Compose(Box::new(Func::AtomTest), Box::new(Func::Id));
+        assert_eq!(roundtrip(&f, 42), 1);
+        assert_eq!(roundtrip(&f, 0), 1);      // Atom(0) is still an Atom
+        assert_eq!(roundtrip(&f, -1), 1);
+    }
+
+    #[test]
+    fn lower_atom_test_on_seq_returns_zero() {
+        // atom:<a, b> = 0 — Construction produces a Seq.
+        let f = Func::Compose(
+            Box::new(Func::AtomTest),
+            Box::new(Func::Construction(vec![Func::Id, Func::Id])),
+        );
+        assert_eq!(roundtrip(&f, 42), 0);
+    }
+
+    #[test]
+    fn lower_atom_test_on_null_returns_zero() {
+        // atom:φ = 0 — Insert on empty Seq returns null ptr, which
+        // must classify as non-Atom despite potential memory-zero
+        // masquerade at ptr=0.
+        let f = Func::Compose(
+            Box::new(Func::AtomTest),
+            Box::new(Func::Compose(
+                Box::new(Func::Insert(Box::new(Func::Id))),
+                Box::new(Func::Construction(vec![])),
+            )),
+        );
+        assert_eq!(roundtrip(&f, 0), 0);
+    }
+
+    #[test]
+    fn lower_null_test_on_atom_returns_zero() {
+        // null:Atom = 0 — an Atom (even Atom(0)) is not φ.
+        let f = Func::Compose(Box::new(Func::NullTest), Box::new(Func::Id));
+        assert_eq!(roundtrip(&f, 42), 0);
+        assert_eq!(roundtrip(&f, 0), 0);    // critical: Atom(0) ≠ φ
+    }
+
+    #[test]
+    fn lower_null_test_on_empty_seq_returns_one() {
+        // null:<> = 1 — an empty Seq matches φ.
+        let f = Func::Compose(
+            Box::new(Func::NullTest),
+            Box::new(Func::Construction(vec![])),
+        );
+        assert_eq!(roundtrip(&f, 0), 1);
+    }
+
+    #[test]
+    fn lower_null_test_on_null_ptr_returns_one() {
+        // null:φ = 1 — null-ptr form of φ from /Id:<> (fold on empty).
+        let f = Func::Compose(
+            Box::new(Func::NullTest),
+            Box::new(Func::Compose(
+                Box::new(Func::Insert(Box::new(Func::Id))),
+                Box::new(Func::Construction(vec![])),
+            )),
+        );
+        assert_eq!(roundtrip(&f, 0), 1);
+    }
+
+    #[test]
+    fn lower_null_test_on_nonempty_seq_returns_zero() {
+        // null:<x> = 0 for any non-empty Seq.
+        let f = Func::Compose(
+            Box::new(Func::NullTest),
+            Box::new(Func::Construction(vec![Func::Id])),
+        );
+        assert_eq!(roundtrip(&f, 42), 0);
+    }
+
+    #[test]
+    fn lower_length_of_seq_returns_element_count_atom() {
+        // length:<a, b, c> = 3.
+        let f = Func::Compose(
+            Box::new(Func::Length),
+            Box::new(Func::Construction(vec![
+                Func::Constant(Object::atom("10")),
+                Func::Constant(Object::atom("20")),
+                Func::Constant(Object::atom("30")),
+            ])),
+        );
+        assert_eq!(roundtrip(&f, 0), 3);
+    }
+
+    #[test]
+    fn lower_length_of_empty_seq_is_zero() {
+        // length:<> = 0.
+        let f = Func::Compose(
+            Box::new(Func::Length),
+            Box::new(Func::Construction(vec![])),
+        );
+        assert_eq!(roundtrip(&f, 0), 0);
+    }
+
+    #[test]
+    fn lower_length_of_atom_returns_phi() {
+        // length:Atom = φ per Backus bottom-on-type-error.
+        let f = Func::Compose(Box::new(Func::Length), Box::new(Func::Id));
+        let (ptr, _) = invoke(&f, 42);
+        assert_eq!(ptr, 0, "length on Atom must return null ptr (φ)");
     }
 
     // ── Logic (And/Or pair, Not unary) ────────────────────────────
