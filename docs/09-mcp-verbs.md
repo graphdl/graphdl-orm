@@ -1,6 +1,6 @@
 # 09 · MCP Verbs
 
-The MCP (Model Context Protocol) server is how agents interact with arest. The v1.0 verb set has four tiers: **primitive** (the algebra requires them), **entity sugar** (ergonomic shortcuts), **introspection** (read-only metadata), **evolution** (governed self-modification), and **LLM bridge** (natural-language to formal-fact translation via client sampling).
+The MCP (Model Context Protocol) server is how agents interact with arest. The v1.0 verb set has six tiers: **primitive** (the algebra requires them), **entity sugar** (ergonomic shortcuts), **introspection** (read-only metadata), **persistence** (capture and restore tenant state), **evolution** (governed self-modification), and **LLM bridge** (natural-language to formal-fact translation via client sampling).
 
 ## Configuration
 
@@ -172,6 +172,38 @@ Run constraint evaluation against proposed facts without asserting. Useful for d
 
 ```typescript
 verify({ fact_type: "Order_was_placed_by_Customer", bindings: { Order: "ord-1", Customer: "acme" } })
+```
+
+## Persistence
+
+Capture the current tenant state and restore it later. Useful before a risky migration, before applying a `propose` that turned out badly, or between tutorial exercises where you want a clean slate.
+
+Snapshots are per-tenant (the MCP handle): one client's captures are invisible to another. They live in memory alongside the cells map. Each snapshot is cheap because cell contents share `Arc` storage — capture is one map insert plus an Arc ref bump per cell, not a deep clone.
+
+### `snapshot`
+
+Capture the full D — every cell, including P and DEFS — under an ID you can pass back to `rollback`. Pass an empty input to let the engine auto-assign an ID (`snap-N`), or pass a label and the engine uses it verbatim. Re-using a label overwrites the prior capture, so `"before-migration"` is a stable anchor across retries.
+
+```typescript
+snapshot({ label: "" })                 // → "snap-0"
+snapshot({ label: "before-migration" }) // → "before-migration"
+```
+
+### `rollback`
+
+Restore a previously captured snapshot. The cells map is rebuilt from the snapshot contents; subsequent calls see the restored state. Rollback does not drain the snapshot — you can roll back to the same anchor many times. Passing an unknown ID returns `⊥` (bottom) and leaves state untouched.
+
+```typescript
+rollback({ id: "before-migration" }) // → "before-migration"
+rollback({ id: "never-captured" })   // → ⊥
+```
+
+### `snapshots`
+
+List every capture held by this tenant. Sorted alphabetically, returned as an FFP sequence so it parses with the same tooling as any other projection result.
+
+```typescript
+snapshots({}) // → <a, b, c>
 ```
 
 ## Evolution
