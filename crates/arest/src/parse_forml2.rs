@@ -550,7 +550,7 @@ fn try_derivation(line: &str) -> Option<ParseAction> {
             id: String::new(), text: clean.into(),
             antecedent_fact_type_ids: vec![], consequent_fact_type_id: String::new(),
             kind: DerivationKind::ModusPonens,
-            join_on: vec![], match_on: vec![], consequent_bindings: vec![], antecedent_filters: vec![], consequent_computed_bindings: vec![],
+            join_on: vec![], match_on: vec![], consequent_bindings: vec![], antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![],
         })
     })
 }
@@ -1259,6 +1259,33 @@ fn parse_into(ir: &mut Domain, input: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Recognize a Halpin aggregate antecedent of form
+///   `<role> is the <op> of <target> where <where-clause>`
+/// where <op> ∈ {count, sum, avg, min, max}. The where-clause is a fact-
+/// type reading that will be resolved separately against the catalog.
+///
+/// Returns (consequent_role, op, target_role, where_clause_text). The
+/// caller then resolves the where-clause to a source FT id and pins the
+/// group_key_role on it.
+fn try_parse_aggregate_clause(text: &str, noun_names: &[String]) -> Option<(String, String, String, String)> {
+    let t = text.trim().trim_end_matches('.').trim();
+    let t = t.strip_prefix("that ").unwrap_or(t);
+    let re = regex::Regex::new(
+        r"^(.+?) is the (count|sum|avg|min|max) of (.+?) where (.+)$"
+    ).expect("static regex compiles");
+    let caps = re.captures(t)?;
+    let role = caps.get(1)?.as_str().trim().to_string();
+    let op = caps.get(2)?.as_str().to_string();
+    let target = caps.get(3)?.as_str().trim().to_string();
+    let where_clause = caps.get(4)?.as_str().trim().to_string();
+    // Consequent role and target must be declared nouns. Without that
+    // check, free text accidentally matches the regex and pollutes the
+    // aggregate list.
+    if !noun_names.iter().any(|n| n == &role) { return None; }
+    if !noun_names.iter().any(|n| n == &target) { return None; }
+    Some((role, op, target, where_clause))
+}
+
 /// Parse an arithmetic antecedent clause of Halpin FORML attribute-style
 /// form: `<RoleName> is <expr>` (e.g. `Volume is Size * Size * Size`).
 ///
@@ -1425,7 +1452,34 @@ fn resolve_derivation_rule(rule: &mut DerivationRuleDef, ir: &Domain, catalog: &
     let mut resolved_ids: Vec<String> = Vec::new();
     let mut filters: Vec<crate::types::AntecedentFilter> = Vec::new();
     let mut computed: Vec<crate::types::ConsequentComputedBinding> = Vec::new();
+    let mut aggregates: Vec<crate::types::ConsequentAggregate> = Vec::new();
     for part in antecedent_parts.iter() {
+        // Aggregate clauses (Halpin `<role> is the <op> of <target> where …`).
+        // They resolve the where-clause to a source FT and record the
+        // group-key role — the non-target role on that FT. Match ahead of
+        // the generic definitional path so `… is the count of …` isn't
+        // mistaken for arithmetic.
+        if let Some((role, op, target, where_clause)) =
+            try_parse_aggregate_clause(part, &noun_names)
+        {
+            // Resolve where-clause to an FT id via the catalog.
+            let (stripped, _) = split_antecedent_comparator(&where_clause);
+            if let Some(ft_id) = resolve_fact_type(&stripped) {
+                // Group-key role = any role on source FT other than target.
+                let group_key_role = ir.fact_types.get(&ft_id)
+                    .and_then(|ft| ft.roles.iter().find(|r| r.noun_name != target))
+                    .map(|r| r.noun_name.clone())
+                    .unwrap_or_default();
+                aggregates.push(crate::types::ConsequentAggregate {
+                    role,
+                    op,
+                    target_role: target,
+                    source_fact_type_id: ft_id,
+                    group_key_role,
+                });
+            }
+            continue;
+        }
         // Definitional clauses claim the part outright — they bind a
         // consequent role's value and don't belong in antecedent FTs.
         if let Some((role, expr)) = try_parse_computed_binding(part, &noun_names) {
@@ -1456,6 +1510,7 @@ fn resolve_derivation_rule(rule: &mut DerivationRuleDef, ir: &Domain, catalog: &
     rule.antecedent_fact_type_ids = resolved_ids;
     rule.antecedent_filters = filters;
     rule.consequent_computed_bindings = computed;
+    rule.consequent_aggregates = aggregates;
 
     // Deduplicate join keys
     let mut seen = std::collections::HashSet::new();
@@ -2360,6 +2415,38 @@ mod tests {
             ArithExpr::Op("+".to_string(),
                 Box::new(ArithExpr::RoleRef("Val".to_string())),
                 Box::new(ArithExpr::Literal(1.0))));
+    }
+
+    // ── Aggregate clauses (Codd §2.3.4 image set + Backus Insert) ──
+    //
+    // Halpin's attribute-style aggregate reads as:
+    //   `<role> is the <op> of <target> where <where-clause>`
+    // where <op> is one of count/sum/avg/min/max and <where-clause>
+    // resolves to a source fact type. The consequent's non-aggregate role
+    // becomes the group key (the image-set index in Codd's terms).
+
+    #[test]
+    fn derivation_rule_captures_count_aggregate() {
+        let input = "Thing(.Name) is an entity type.\nPart(.Name) is an entity type.\nArity is a value type.\n## Fact Types\nThing has Part.\nThing has Arity.\n## Derivation Rules\n* Thing has Arity iff Arity is the count of Part where Thing has Part.";
+        let ir = parse_markdown(input).unwrap();
+        let rule = ir.derivation_rules.iter()
+            .find(|r| r.text.contains("Thing has Arity"))
+            .expect("rule present");
+        assert_eq!(rule.consequent_aggregates.len(), 1,
+            "expected one aggregate, got {:?}", rule.consequent_aggregates);
+        let a = &rule.consequent_aggregates[0];
+        assert_eq!(a.role, "Arity");
+        assert_eq!(a.op, "count");
+        assert_eq!(a.target_role, "Part");
+        assert!(a.source_fact_type_id.contains("Thing") && a.source_fact_type_id.contains("Part"),
+            "source_fact_type_id should reference Thing and Part, got {:?}", a.source_fact_type_id);
+        assert_eq!(a.group_key_role, "Thing");
+        // The where-clause IS the source fact type; it belongs only in the
+        // aggregate metadata, not in antecedent_fact_type_ids (otherwise
+        // the compile path would double-count it).
+        assert!(rule.antecedent_fact_type_ids.is_empty(),
+            "aggregate clause must consume the whole antecedent list, got {:?}",
+            rule.antecedent_fact_type_ids);
     }
 
     #[test]

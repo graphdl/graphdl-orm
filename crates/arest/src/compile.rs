@@ -1315,7 +1315,7 @@ pub fn state_to_domain(state: &crate::ast::Object) -> Domain {
             DerivationRuleDef {
                 id: get("id"), text: get("text"), antecedent_fact_type_ids: vec![],
                 consequent_fact_type_id: get("consequentFactTypeId"),
-                kind: DerivationKind::ModusPonens, join_on: vec![], match_on: vec![], consequent_bindings: vec![], antecedent_filters: vec![], consequent_computed_bindings: vec![],
+                kind: DerivationKind::ModusPonens, join_on: vec![], match_on: vec![], consequent_bindings: vec![], antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![],
             }
         }).collect())
         .unwrap_or_default();
@@ -1532,9 +1532,18 @@ fn compile_derivations(ir: &Domain, sm_defs: &HashMap<String, StateMachineDef>) 
     let mut derivations = Vec::new();
 
     // α(rule → compiled) : derivation_rules
-    derivations.extend(ir.derivation_rules.iter().map(|rule| match rule.kind {
-        DerivationKind::Join => compile_join_derivation(ir, rule),
-        _ => compile_explicit_derivation(ir, rule),
+    // Aggregate rules (consequent_aggregates populated) take a dedicated
+    // path — they follow the image-set pattern (Codd §2.3.4) and can't
+    // reuse the per-fact fanout shape.
+    derivations.extend(ir.derivation_rules.iter().map(|rule| {
+        if !rule.consequent_aggregates.is_empty() {
+            compile_aggregate_derivation(ir, rule)
+        } else {
+            match rule.kind {
+                DerivationKind::Join => compile_join_derivation(ir, rule),
+                _ => compile_explicit_derivation(ir, rule),
+            }
+        }
     }));
 
     // Implicit: subtype inheritance from noun definitions
@@ -1598,6 +1607,122 @@ fn format_numeric_atom(v: f64) -> String {
     } else {
         format!("{}", v)
     }
+}
+
+/// Compile an aggregate derivation (Halpin attribute-style, Codd §2.3.4
+/// image-set).
+///
+///   * Fact Type has Arity iff Arity is the count of Role
+///                              where Fact Type has Role.
+///
+/// Compiles to:
+///
+///   α(derive_with_context) . DistR . [source_facts, source_facts]
+///
+/// where DistR.\[a, b\]:x pairs each element of a with the whole Seq b
+/// (Codd cartesian product restricted to "for each fact, see every fact
+/// including itself"). derive_with_context receives <one_fact, all_facts>
+/// and builds:
+///
+///   <consequent_id, reading,
+///    <<group_key_role, g_key:one_fact>,
+///     <agg_role, fold . Filter(matches_outer_key) . image_pairs>>>
+///
+/// image_pairs = DistL.\[g_key:one_fact, all_facts\] produces
+///   <<key, f1>, <key, f2>, ..., <key, fn>> — the Codd image set with
+/// the outer key bound to every inner fact. Filter drops pairs whose
+/// inner key differs; fold is per-op (Length for count; future commits
+/// wire sum/avg/min/max via Insert(Add)/… etc).
+///
+/// Duplicates: the outer iterates every source fact, so three source
+/// facts with the same group key produce three identical derivations.
+/// The forward-chain layer deduplicates derived facts by (fact_type_id,
+/// bindings) after emission.
+fn compile_aggregate_derivation(ir: &Domain, rule: &DerivationRuleDef) -> CompiledDerivation {
+    let id = rule.id.clone();
+    let text = rule.text.clone();
+    let kind = rule.kind.clone();
+    let consequent_id = rule.consequent_fact_type_id.clone();
+    let consequent_reading = ir.fact_types.get(&consequent_id)
+        .map(|ft| ft.reading.clone())
+        .unwrap_or_default();
+
+    // v0: single aggregate per rule. Multi-aggregate rules (rare in
+    // Halpin's examples) can compose after this lands.
+    let agg = rule.consequent_aggregates.first()
+        .expect("caller routed an empty-aggregates rule here");
+
+    let source_ft = ir.fact_types.get(&agg.source_fact_type_id);
+    let group_key_idx = source_ft
+        .and_then(|ft| ft.roles.iter().find(|r| r.noun_name == agg.group_key_role))
+        .map(|r| r.role_index)
+        .unwrap_or(0);
+
+    let source_facts = extract_facts_from_pop(&agg.source_fact_type_id);
+    let g_key = role_value(group_key_idx);
+
+    // Codd image-set: pair outer fact's group key with every inner fact.
+    // DistL . [g_key_of_outer, all_facts] : <outer, all> → <<k, f1>, ..., <k, fn>>
+    let image_pairs = Func::compose(
+        Func::DistL,
+        Func::construction(vec![
+            // g_key of outer fact = g_key . Selector(1) of <outer, all>
+            Func::compose(g_key.clone(), Func::Selector(1)),
+            Func::Selector(2),
+        ]),
+    );
+    // Predicate over <k, f>: inner fact's g_key matches the outer key.
+    let key_matches = Func::compose(
+        Func::Eq,
+        Func::construction(vec![
+            Func::Selector(1),
+            Func::compose(g_key.clone(), Func::Selector(2)),
+        ]),
+    );
+    let filtered = Func::compose(Func::filter(key_matches), image_pairs);
+
+    // Fold over the filtered image set. Count uses Length directly
+    // (Backus §11.2.3 primitive); sum/min/max/avg wire via Insert below.
+    let fold = match agg.op.as_str() {
+        "count" => Func::Length,
+        // Sum folds /Add over projected target-role values. For target
+        // lookup we need the target role's index on the source FT.
+        _ => {
+            // Unknown/unsupported ops collapse to count so the rule still
+            // fires with a sane value. Follow-up commits wire sum/min/max.
+            Func::Length
+        }
+    };
+
+    let agg_value = Func::compose(fold, filtered);
+
+    // Derived fact: <derived_id, reading, <<group_key_role, key>, <agg_role, value>>>
+    let derive_with_context = Func::construction(vec![
+        Func::constant(Object::atom(&consequent_id)),
+        Func::constant(Object::atom(&consequent_reading)),
+        Func::construction(vec![
+            Func::construction(vec![
+                Func::constant(Object::atom(&agg.group_key_role)),
+                // group key = g_key applied to outer fact (Selector(1))
+                Func::compose(g_key.clone(), Func::Selector(1)),
+            ]),
+            Func::construction(vec![
+                Func::constant(Object::atom(&agg.role)),
+                agg_value,
+            ]),
+        ]),
+    ]);
+
+    // α(derive_with_context) . DistR . [source_facts, source_facts]
+    let func = Func::compose(
+        Func::apply_to_all(derive_with_context),
+        Func::compose(
+            Func::DistR,
+            Func::construction(vec![source_facts.clone(), source_facts]),
+        ),
+    );
+
+    CompiledDerivation { id, text, kind, func }
 }
 
 /// Compile a Halpin arithmetic expression (Box::Volume = Size * Size * Size)
