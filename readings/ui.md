@@ -241,6 +241,7 @@ Slider has Max Value.
 
 ### Select List
 Select List has items.
+  Each Select List has at most one items.
 
 ### Menu
 Menu has Title.
@@ -257,7 +258,9 @@ Menu Button has Image Path.
 
 ### Toolbar
 Toolbar has Toolbar Item as primary.
+  Each Toolbar has at most one Toolbar Item as primary.
 Toolbar has Toolbar Item as secondary.
+  Each Toolbar has at most one Toolbar Item as secondary.
 
 ### Toolbar Button
 Toolbar Button has Title.
@@ -355,10 +358,10 @@ No View Renderer is for the same View on the same Platform more than once.
 
 ## Derivation Rules
 
-List Item has display- Text if List Item displays Resource and that Resource has Reference and display- Text is that Reference.
-List Item has display- Text if List Item displays Resource and that Resource has Value and that Resource has no Reference and display- Text is that Value.
-List Item has display-sub- Text if List Item displays Resource and that Resource has Reference and that Resource has Value and display-sub- Text is that Value.
-List Item has Display Status if List Item displays Resource and some State Machine is for that Resource and that State Machine is currently in some Status and Display Status is that Status.
++ List Item has display- Text if List Item displays Resource and that Resource has Reference and display- Text is that Reference.
++ List Item has display- Text if List Item displays Resource and that Resource has Value and that Resource has no Reference and display- Text is that Value.
++ List Item has display-sub- Text if List Item displays Resource and that Resource has Reference and that Resource has Value and display-sub- Text is that Value.
++ List Item has Display Status if List Item displays Resource and some State Machine is for that Resource and that State Machine is currently in some Status and Display Status is that Status.
 
 ## Deontic Constraints
 
