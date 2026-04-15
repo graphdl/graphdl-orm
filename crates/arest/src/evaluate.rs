@@ -2091,6 +2091,42 @@ mod tests {
     }
 
     #[test]
+    fn per_fact_fanout_produces_one_derivation_per_matching_fact() {
+        // Four cities, three above the 1M threshold. Per-fact semantic
+        // demands one derived fact per matching antecedent tuple — the
+        // old existence-check semantic would have produced one regardless.
+        let ir = city_population_ir(Some(crate::types::AntecedentFilter {
+            antecedent_index: 0,
+            role: "Population".to_string(),
+            op: ">=".to_string(),
+            value: 1_000_000.0,
+        }));
+        let (_meta_pop, defs, _def_map) = ir_to_defs(&ir);
+
+        let mut pop_state = ast::Object::phi();
+        for (name, pop) in [("Alpha", "2000000"), ("Bravo", "5000000"), ("Charlie", "800000"), ("Delta", "3000000")] {
+            pop_state = ast::cell_push("city_has_population",
+                ast::fact_from_pairs(&[("City", name), ("Population", pop)]), &pop_state);
+        }
+
+        let dd = derivation_defs_from(&defs);
+        let (_new_state, derived) = forward_chain_defs_state(&dd, &pop_state);
+
+        let big: Vec<_> = derived.iter().filter(|d| d.fact_type_id == "big_city").collect();
+        assert_eq!(big.len(), 3, "expected 3 big cities (Alpha/Bravo/Delta), got {:?}", big);
+
+        let names: std::collections::HashSet<&str> = big.iter()
+            .flat_map(|d| d.bindings.iter()
+                .filter(|(k, _)| k == "City")
+                .map(|(_, v)| v.as_str()))
+            .collect();
+        assert!(names.contains("Alpha"));
+        assert!(names.contains("Bravo"));
+        assert!(names.contains("Delta"));
+        assert!(!names.contains("Charlie"), "sub-threshold city must not derive");
+    }
+
+    #[test]
     fn rule_without_filter_fires_for_any_fact_regression() {
         // Regression: when antecedent_filters is empty, behavior is
         // unchanged from pre-#192 — any fact makes the rule fire.
