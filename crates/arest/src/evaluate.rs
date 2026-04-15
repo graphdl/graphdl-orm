@@ -1999,7 +1999,7 @@ mod tests {
                 match_on: vec![],
                 consequent_bindings: vec![],
                 antecedent_filters: filter.into_iter().collect(),
-                consequent_computed_bindings: vec![],
+                consequent_computed_bindings: vec![], consequent_aggregates: vec![],
             }],
             general_instance_facts: vec![],
             subtypes: HashMap::new(), enum_values: HashMap::new(),
@@ -2174,6 +2174,7 @@ mod tests {
                     role: derived_role.to_string(),
                     expr,
                 }],
+                consequent_aggregates: vec![],
             }],
             general_instance_facts: vec![],
             subtypes: HashMap::new(), enum_values: HashMap::new(),
@@ -2281,6 +2282,98 @@ mod tests {
         ]);
     }
 
+    // ── Aggregate derivations, end-to-end (Codd image-set) ──
+
+    fn thing_part_arity_ir() -> Domain {
+        let mut fact_types = HashMap::new();
+        fact_types.insert("thing_has_part".to_string(), FactTypeDef {
+            schema_id: String::new(),
+            reading: "Thing has Part".to_string(),
+            readings: vec![],
+            roles: vec![
+                RoleDef { noun_name: "Thing".to_string(), role_index: 0 },
+                RoleDef { noun_name: "Part".to_string(), role_index: 1 },
+            ],
+        });
+        fact_types.insert("thing_has_arity".to_string(), FactTypeDef {
+            schema_id: String::new(),
+            reading: "Thing has Arity".to_string(),
+            readings: vec![],
+            roles: vec![
+                RoleDef { noun_name: "Thing".to_string(), role_index: 0 },
+                RoleDef { noun_name: "Arity".to_string(), role_index: 1 },
+            ],
+        });
+        Domain {
+            domain: "test".to_string(),
+            nouns: HashMap::new(),
+            fact_types,
+            constraints: vec![],
+            state_machines: HashMap::new(),
+            derivation_rules: vec![DerivationRuleDef {
+                id: "thing-arity".to_string(),
+                text: "* Thing has Arity iff Arity is the count of Part where Thing has Part.".to_string(),
+                antecedent_fact_type_ids: vec![],
+                consequent_fact_type_id: "thing_has_arity".to_string(),
+                kind: DerivationKind::ModusPonens,
+                join_on: vec![],
+                match_on: vec![],
+                consequent_bindings: vec![],
+                antecedent_filters: vec![],
+                consequent_computed_bindings: vec![],
+                consequent_aggregates: vec![crate::types::ConsequentAggregate {
+                    role: "Arity".to_string(),
+                    op: "count".to_string(),
+                    target_role: "Part".to_string(),
+                    source_fact_type_id: "thing_has_part".to_string(),
+                    group_key_role: "Thing".to_string(),
+                }],
+            }],
+            general_instance_facts: vec![],
+            subtypes: HashMap::new(), enum_values: HashMap::new(),
+            ref_schemes: HashMap::new(), objectifications: HashMap::new(),
+            named_spans: HashMap::new(), autofill_spans: vec![],
+        }
+    }
+
+    #[test]
+    fn count_aggregate_computes_image_set_size_per_group() {
+        // Three Parts belong to T1, one to T2. Expect two derived rows:
+        // T1 has Arity=3, T2 has Arity=1.
+        let ir = thing_part_arity_ir();
+        let (_meta_pop, defs, _def_map) = ir_to_defs(&ir);
+
+        let mut pop_state = ast::Object::phi();
+        for (thing, part) in [("T1", "P1"), ("T1", "P2"), ("T1", "P3"), ("T2", "PX")] {
+            pop_state = ast::cell_push("thing_has_part",
+                ast::fact_from_pairs(&[("Thing", thing), ("Part", part)]), &pop_state);
+        }
+
+        let dd = derivation_defs_from(&defs);
+        let (_new_state, derived) = forward_chain_defs_state(&dd, &pop_state);
+
+        let arity: Vec<_> = derived.iter().filter(|d| d.fact_type_id == "thing_has_arity").collect();
+        // Collect distinct (Thing, Arity) pairs — the outer iteration emits
+        // duplicates per group, which forward_chain is expected to dedup.
+        let mut pairs: std::collections::BTreeSet<(String, String)> = arity.iter().map(|d| {
+            let t = d.bindings.iter().find(|(k, _)| k == "Thing").map(|(_, v)| v.clone()).unwrap_or_default();
+            let a = d.bindings.iter().find(|(k, _)| k == "Arity").map(|(_, v)| v.clone()).unwrap_or_default();
+            (t, a)
+        }).collect();
+        let expected: std::collections::BTreeSet<(String, String)> = [
+            ("T1".to_string(), "3".to_string()),
+            ("T2".to_string(), "1".to_string()),
+        ].into_iter().collect();
+        assert_eq!(pairs, expected,
+            "distinct (Thing, Arity) derivations expected T1→3 and T2→1, got {:?} (raw count = {})", pairs, arity.len());
+        // Sanity — if dedup isn't happening, the raw list still contains
+        // the right pairs somewhere.
+        assert!(arity.iter().any(|d|
+            d.bindings.iter().any(|(k, v)| k == "Thing" && v == "T1") &&
+            d.bindings.iter().any(|(k, v)| k == "Arity" && v == "3")));
+        pairs.clear();  // avoid unused warning via reset
+    }
+
     #[test]
     fn rule_without_filter_fires_for_any_fact_regression() {
         // Regression: when antecedent_filters is empty, behavior is
@@ -2345,7 +2438,7 @@ mod tests {
                 join_on: vec!["Key".to_string()],
                 match_on: vec![],
                 consequent_bindings: vec!["A".to_string(), "B".to_string()],
-                antecedent_filters: vec![], consequent_computed_bindings: vec![],
+                antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![],
             }],
             general_instance_facts: vec![],
             subtypes: HashMap::new(), enum_values: HashMap::new(),
@@ -2426,7 +2519,7 @@ mod tests {
                 join_on: vec!["Key".to_string(), "X".to_string()],
                 match_on: vec![],
                 consequent_bindings: vec!["Y".to_string(), "X".to_string()],
-                antecedent_filters: vec![], consequent_computed_bindings: vec![],
+                antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![],
             }],
             general_instance_facts: vec![],
             subtypes: HashMap::new(), enum_values: HashMap::new(),
@@ -2496,7 +2589,7 @@ mod tests {
                 join_on: vec![],
                 match_on: vec![("Full Name".to_string(), "Short Name".to_string())],
                 consequent_bindings: vec!["B".to_string(), "A".to_string()],
-                antecedent_filters: vec![], consequent_computed_bindings: vec![],
+                antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![],
             }],
             general_instance_facts: vec![],
             subtypes: HashMap::new(), enum_values: HashMap::new(),
@@ -2566,7 +2659,7 @@ mod tests {
                 join_on: vec!["Key".to_string()],
                 match_on: vec![],
                 consequent_bindings: vec!["A".to_string(), "B".to_string()],
-                antecedent_filters: vec![], consequent_computed_bindings: vec![],
+                antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![],
             }],
             general_instance_facts: vec![],
             subtypes: HashMap::new(), enum_values: HashMap::new(),

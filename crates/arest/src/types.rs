@@ -116,6 +116,12 @@ pub struct DerivationRuleDef {
     /// ConsequentComputedBinding { role: "Volume", expr: ... }.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub consequent_computed_bindings: Vec<ConsequentComputedBinding>,
+    /// Consequent roles whose values come from aggregating an image set
+    /// (Codd §2.3.4 + Backus Insert). Halpin FORML:
+    ///   * Fact Type has Arity iff Arity is the count of Role where Fact
+    ///     Type has Role.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub consequent_aggregates: Vec<ConsequentAggregate>,
 }
 
 /// Numeric comparison that further restricts a derivation antecedent.
@@ -162,6 +168,38 @@ pub struct ConsequentComputedBinding {
     pub role: String,
     /// Expression tree to evaluate against antecedent bindings.
     pub expr: ArithExpr,
+}
+
+/// A consequent-role binding whose value is an aggregate over an image set
+/// (Codd 1972 §2.3.4: g_T(x) = {y : (x,y) ∈ T}). Halpin attribute-style:
+///   `Arity is the count of Role where Fact Type has Role.`
+///   `Order Amount is the sum of Line Item Amount where some Line Item
+///    belongs to that Order.`
+///
+/// Classical relational algebra θ₁ is adequate for queries but not for
+/// counting/summing (Codd p.1); AREST closes the gap with Backus's Insert
+/// (`/`) and Length, so every aggregate lowers to θ₁ restriction + a fold.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConsequentAggregate {
+    /// Consequent role name to receive the aggregate value (e.g. "Arity").
+    pub role: String,
+    /// Operator: one of `"count"`, `"sum"`, `"avg"`, `"min"`, `"max"`.
+    pub op: String,
+    /// Name of the role being aggregated over in the source FT. For
+    /// `count`, this is the entity counted per group — often a noun that
+    /// doesn't carry numeric value. For sum/avg/min/max it names the
+    /// numeric role whose values are folded.
+    pub target_role: String,
+    /// Resolved source fact type id extracted from the `where` clause
+    /// (e.g., `Fact_Type_has_Role`). Populated during
+    /// `resolve_derivation_rule`.
+    pub source_fact_type_id: String,
+    /// Role name on the source FT that identifies group membership — the
+    /// noun that also appears in the consequent as the non-aggregate role.
+    /// For `Fact Type has Arity iff Arity is the count of Role where Fact
+    /// Type has Role`, this is `"Fact Type"`.
+    pub group_key_role: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
