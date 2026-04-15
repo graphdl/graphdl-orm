@@ -550,7 +550,7 @@ fn try_derivation(line: &str) -> Option<ParseAction> {
             id: String::new(), text: clean.into(),
             antecedent_fact_type_ids: vec![], consequent_fact_type_id: String::new(),
             kind: DerivationKind::ModusPonens,
-            join_on: vec![], match_on: vec![], consequent_bindings: vec![], antecedent_filters: vec![],
+            join_on: vec![], match_on: vec![], consequent_bindings: vec![], antecedent_filters: vec![], consequent_computed_bindings: vec![],
         })
     })
 }
@@ -1259,6 +1259,67 @@ fn parse_into(ir: &mut Domain, input: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Parse an arithmetic antecedent clause of Halpin FORML attribute-style
+/// form: `<RoleName> is <expr>` (e.g. `Volume is Size * Size * Size`).
+///
+/// Returns `Some((role_name, expr))` when the clause matches that shape
+/// AND the role name is a declared noun AND the RHS parses cleanly;
+/// otherwise `None` so the caller can fall through to fact-type
+/// resolution. Aggregate forms (`… is the sum of …`) are explicitly
+/// excluded — they're parsed by a later pipeline stage.
+fn try_parse_computed_binding(text: &str, noun_names: &[String]) -> Option<(String, crate::types::ArithExpr)> {
+    let t = text.trim().trim_end_matches('.').trim();
+    let t = t.strip_prefix("that ").unwrap_or(t);
+    // Aggregates use `is the <op> of …` — skip them here.
+    if t.contains(" is the ") { return None; }
+    let idx = t.find(" is ")?;
+    let lhs = t[..idx].trim();
+    let rhs = t[idx + 4..].trim();
+    // LHS must be a declared noun (role name).
+    if !noun_names.iter().any(|n| n == lhs) { return None; }
+    let expr = parse_arithmetic_expr(rhs, noun_names)?;
+    Some((lhs.to_string(), expr))
+}
+
+/// Tokenize a whitespace-flexible arithmetic expression on `+ - * /` and
+/// build a left-associative tree. Operands are either numeric literals
+/// (f64::from_str) or declared noun names. No precedence yet — `A + B * C`
+/// parses as `((A + B) * C)`. Parentheses are not yet supported either.
+/// Returns `None` if any token fails to parse as an operand or operator.
+fn parse_arithmetic_expr(text: &str, noun_names: &[String]) -> Option<crate::types::ArithExpr> {
+    use crate::types::ArithExpr;
+    let re = regex::Regex::new(r"\s*([+\-*/])\s*").expect("static regex compiles");
+    let mut tokens: Vec<String> = Vec::new();
+    let mut cursor = 0usize;
+    for m in re.find_iter(text) {
+        let head = text[cursor..m.start()].trim();
+        if !head.is_empty() { tokens.push(head.to_string()); }
+        tokens.push(m.as_str().trim().to_string());
+        cursor = m.end();
+    }
+    let tail = text[cursor..].trim();
+    if !tail.is_empty() { tokens.push(tail.to_string()); }
+    if tokens.is_empty() { return None; }
+
+    let parse_atom = |token: &str| -> Option<ArithExpr> {
+        if let Ok(n) = token.parse::<f64>() { return Some(ArithExpr::Literal(n)); }
+        if noun_names.iter().any(|n| n == token) { return Some(ArithExpr::RoleRef(token.to_string())); }
+        None
+    };
+
+    let mut iter = tokens.into_iter();
+    let first = iter.next()?;
+    let mut result = parse_atom(&first)?;
+    loop {
+        let Some(op) = iter.next() else { break };
+        if !matches!(op.as_str(), "+" | "-" | "*" | "/") { return None; }
+        let next = iter.next()?;
+        let rhs = parse_atom(&next)?;
+        result = ArithExpr::Op(op, Box::new(result), Box::new(rhs));
+    }
+    Some(result)
+}
+
 /// Strip a trailing numeric comparator (Halpin FORML Example 5: `has Population >= 1000000`)
 /// from an antecedent fragment. Returns `(stripped_text, Option<(op, value)>)`.
 ///
@@ -1355,15 +1416,22 @@ fn resolve_derivation_rule(rule: &mut DerivationRuleDef, ir: &Domain, catalog: &
     // Resolve consequent
     rule.consequent_fact_type_id = resolve_fact_type(consequent_text).unwrap_or_default();
 
-    // Resolve antecedents, carrying inline-comparator filters alongside.
-    // A part like `Order has Amount >= 100` resolves to `Order has Amount`
-    // plus an AntecedentFilter { op: ">=", value: 100.0 } indexed to the
-    // resolved antecedent's position. We walk parts and push into ids and
-    // filters together so their indices stay aligned when some parts fail
-    // to resolve.
+    // Resolve antecedents, carrying inline-comparator filters AND
+    // arithmetic-definitional clauses alongside. A definitional clause
+    // like `Volume is Size * Size * Size` does not resolve to a fact
+    // type — it populates consequent_computed_bindings instead. Filter
+    // clauses like `has Population >= 1000000` resolve to the base FT
+    // with an AntecedentFilter pinned to that antecedent's position.
     let mut resolved_ids: Vec<String> = Vec::new();
     let mut filters: Vec<crate::types::AntecedentFilter> = Vec::new();
+    let mut computed: Vec<crate::types::ConsequentComputedBinding> = Vec::new();
     for part in antecedent_parts.iter() {
+        // Definitional clauses claim the part outright — they bind a
+        // consequent role's value and don't belong in antecedent FTs.
+        if let Some((role, expr)) = try_parse_computed_binding(part, &noun_names) {
+            computed.push(crate::types::ConsequentComputedBinding { role, expr });
+            continue;
+        }
         let (stripped, comparator) = split_antecedent_comparator(part);
         let Some(ft_id) = resolve_fact_type(&stripped) else { continue };
         if let Some((op, value)) = comparator {
@@ -1387,6 +1455,7 @@ fn resolve_derivation_rule(rule: &mut DerivationRuleDef, ir: &Domain, catalog: &
     }
     rule.antecedent_fact_type_ids = resolved_ids;
     rule.antecedent_filters = filters;
+    rule.consequent_computed_bindings = computed;
 
     // Deduplicate join keys
     let mut seen = std::collections::HashSet::new();
@@ -2202,6 +2271,95 @@ mod tests {
         assert_eq!(rule.antecedent_filters[0].op, ">");
         assert!((rule.antecedent_filters[0].value - (-273.15)).abs() < 1e-9,
             "expected -273.15, got {}", rule.antecedent_filters[0].value);
+    }
+
+    // ── Arithmetic definitional clauses (Halpin attribute style) ──
+    //
+    // An antecedent clause of shape `<RoleName> is <arith-expr>` defines a
+    // consequent role's value from other role values or numeric literals.
+    // Supports `+`, `-`, `*`, `/`; left-associative; parentheses not yet
+    // supported. These clauses populate `consequent_computed_bindings` and
+    // are stripped from `antecedent_fact_type_ids` since they aren't fact
+    // types to resolve.
+
+    fn single_op(op: &str, lhs: &str, rhs: &str) -> crate::types::ArithExpr {
+        use crate::types::ArithExpr;
+        ArithExpr::Op(op.to_string(),
+            Box::new(ArithExpr::RoleRef(lhs.to_string())),
+            Box::new(ArithExpr::RoleRef(rhs.to_string())))
+    }
+
+    #[test]
+    fn derivation_rule_captures_computed_binding_with_plus() {
+        let input = "Foo(.id) is an entity type.\nVal is a value type.\nDoubled is a value type.\n## Fact Types\nFoo has Val.\nFoo has Doubled.\n## Derivation Rules\n* Foo has Doubled iff Foo has Val and Doubled is Val + Val.";
+        let ir = parse_markdown(input).unwrap();
+        let rule = ir.derivation_rules.iter()
+            .find(|r| r.text.contains("Foo has Doubled"))
+            .expect("rule present");
+        assert_eq!(rule.consequent_computed_bindings.len(), 1,
+            "expected one computed binding, got {:?}", rule.consequent_computed_bindings);
+        let cb = &rule.consequent_computed_bindings[0];
+        assert_eq!(cb.role, "Doubled");
+        assert_eq!(cb.expr, single_op("+", "Val", "Val"));
+        // The definitional antecedent doesn't resolve to a fact type;
+        // only `Foo has Val` should remain in antecedent_fact_type_ids.
+        assert_eq!(rule.antecedent_fact_type_ids.len(), 1,
+            "definitional clause must be stripped from antecedents, got {:?}",
+            rule.antecedent_fact_type_ids);
+    }
+
+    #[test]
+    fn derivation_rule_accepts_all_arithmetic_operators() {
+        use crate::types::ArithExpr;
+        for op in ["+", "-", "*", "/"] {
+            let input = format!(
+                "Foo(.id) is an entity type.\nA is a value type.\nB is a value type.\nC is a value type.\n## Fact Types\nFoo has A.\nFoo has B.\nFoo has C.\n## Derivation Rules\n* Foo has C iff Foo has A and Foo has B and C is A {op} B.");
+            let ir = parse_markdown(&input).expect("parse ok");
+            let rule = ir.derivation_rules.iter()
+                .find(|r| r.text.contains("Foo has C"))
+                .unwrap_or_else(|| panic!("rule missing for op {op}"));
+            assert_eq!(rule.consequent_computed_bindings.len(), 1, "op {op} missed");
+            let cb = &rule.consequent_computed_bindings[0];
+            assert_eq!(cb.role, "C");
+            assert_eq!(cb.expr,
+                ArithExpr::Op(op.to_string(),
+                    Box::new(ArithExpr::RoleRef("A".to_string())),
+                    Box::new(ArithExpr::RoleRef("B".to_string()))),
+                "op {op}");
+        }
+    }
+
+    #[test]
+    fn derivation_rule_chained_operators_are_left_associative() {
+        use crate::types::ArithExpr;
+        let input = "Box(.id) is an entity type.\nSize is a value type.\nVolume is a value type.\n## Fact Types\nBox has Size.\nBox has Volume.\n## Derivation Rules\n* Box has Volume iff Box has Size and Volume is Size * Size * Size.";
+        let ir = parse_markdown(input).unwrap();
+        let rule = ir.derivation_rules.iter()
+            .find(|r| r.text.contains("Box has Volume"))
+            .expect("rule present");
+        assert_eq!(rule.consequent_computed_bindings.len(), 1);
+        let cb = &rule.consequent_computed_bindings[0];
+        // Size * Size * Size parses as ((Size * Size) * Size).
+        let size = || ArithExpr::RoleRef("Size".to_string());
+        let inner = ArithExpr::Op("*".to_string(), Box::new(size()), Box::new(size()));
+        let outer = ArithExpr::Op("*".to_string(), Box::new(inner), Box::new(size()));
+        assert_eq!(cb.expr, outer);
+    }
+
+    #[test]
+    fn derivation_rule_accepts_numeric_literal_operands() {
+        use crate::types::ArithExpr;
+        let input = "Foo(.id) is an entity type.\nVal is a value type.\nNext is a value type.\n## Fact Types\nFoo has Val.\nFoo has Next.\n## Derivation Rules\n* Foo has Next iff Foo has Val and Next is Val + 1.";
+        let ir = parse_markdown(input).unwrap();
+        let rule = ir.derivation_rules.iter()
+            .find(|r| r.text.contains("Foo has Next"))
+            .expect("rule present");
+        let cb = &rule.consequent_computed_bindings[0];
+        assert_eq!(cb.role, "Next");
+        assert_eq!(cb.expr,
+            ArithExpr::Op("+".to_string(),
+                Box::new(ArithExpr::RoleRef("Val".to_string())),
+                Box::new(ArithExpr::Literal(1.0))));
     }
 
     #[test]
