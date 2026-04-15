@@ -63,36 +63,101 @@ pub fn compile_to_verilog(state: &Object) -> String {
         }
     }
 
-    let top = emit_top_module(&entities);
+    // Constraint check modules (UC / MC / FC). Each constraint in state
+    // becomes one Verilog module with a `violation` output. v0 emits the
+    // module skeleton — the actual hardware logic (UC: N² comparator
+    // tree across the spanning fact type's stored rows; MC: sentinel-
+    // value comparator on the reference-scheme column; FC: bounded
+    // population counter) lands as a follow-up. The pipeline-level
+    // contract — Constraint cell → per-constraint module → violation
+    // output threaded into top — is what's exercised here.
+    let (constraint_modules, constraint_names) = emit_constraint_modules(state);
+    modules.extend(constraint_modules);
+
+    let top = emit_top_module(&entities, &constraint_names);
 
     format!("{}{}\n{}", header, modules.join("\n"), top)
+}
+
+/// Emit one stub Verilog module per alethic cardinality constraint
+/// (UC / MC / FC) found in the `Constraint` cell. Each module has the
+/// canonical port shape (`clk`, `rst_n`, `output reg violation`) so the
+/// `top` module can instantiate it and AND-reduce its violation signal
+/// into an aggregate `constraint_ok` line. Body is a placeholder
+/// (`violation <= 1'b0`) — the comparator-tree / sentinel / counter
+/// logic is the next deliverable on this path.
+///
+/// Other constraint kinds (SS, EQ, IR/AS/AT/SY/IT/TR/AC, VC) are skipped
+/// here; they need their own emitters covering set-comparison, ring,
+/// and value-domain shapes.
+///
+/// Returns (module_text, module_name) pairs so the top emitter can
+/// instantiate each by name without re-parsing the constraint list.
+fn emit_constraint_modules(state: &Object) -> (Vec<String>, Vec<String>) {
+    let constraints = fetch_or_phi("Constraint", state);
+    let mut modules: Vec<String> = Vec::new();
+    let mut names: Vec<String> = Vec::new();
+    if let Some(cs) = constraints.as_seq() {
+        for c in cs.iter() {
+            let Some(id) = binding(c, "id") else { continue };
+            let Some(kind) = binding(c, "kind") else { continue };
+            if !matches!(kind, "UC" | "MC" | "FC") { continue; }
+            let module_name = sanitize(&format!("constraint_{}_{}", kind.to_ascii_lowercase(), id));
+            modules.push(format!(
+                "module {name} (\n    \
+                    input wire clk,\n    \
+                    input wire rst_n,\n    \
+                    output reg violation\n\
+                );\n    \
+                // {kind} stub — comparator/sentinel/counter logic is future work.\n    \
+                always @(posedge clk) begin\n        \
+                    violation <= 1'b0;\n    \
+                end\n\
+                endmodule\n",
+                name = module_name,
+                kind = kind,
+            ));
+            names.push(module_name);
+        }
+    }
+    (modules, names)
 }
 
 /// Emit a `top` Verilog module that instantiates every entity module,
 /// wires the shared clock / reset fan-out, ties per-entity column
 /// inputs to zero, and AND-reduces the `valid` outputs into a single
-/// `all_valid` system signal.
+/// `all_valid` system signal. Constraint check modules are
+/// instantiated alongside; their `violation` outputs AND-reduce
+/// (after inversion) into an aggregate `constraint_ok` signal so the
+/// commit path can gate on a single line.
 ///
-/// Tying inputs to `{N{1'b0}}` keeps the output synthesizable as-is —
-/// a downstream integrator replaces those constants with real drivers
-/// (memory ports, pipeline registers) when wiring the module into a
-/// larger design.
+/// Tying entity inputs to `{N{1'b0}}` keeps the output synthesizable
+/// as-is — a downstream integrator replaces those constants with real
+/// drivers (memory ports, pipeline registers) when wiring the module
+/// into a larger design.
 ///
-/// Returns an empty string if no entities are present (so the
-/// caller's `format!` produces just the header).
-fn emit_top_module(entities: &[(String, Vec<String>)]) -> String {
-    if entities.is_empty() {
+/// Returns an empty string if no entities AND no constraints are
+/// present. With at least one entity OR constraint, `top` is emitted
+/// with the relevant ports and instantiations.
+fn emit_top_module(entities: &[(String, Vec<String>)], constraints: &[String]) -> String {
+    if entities.is_empty() && constraints.is_empty() {
         return String::new();
     }
     let mut out = String::new();
     out.push_str("module top (\n");
     out.push_str("    input wire clk,\n");
     out.push_str("    input wire rst_n,\n");
-    out.push_str("    output reg all_valid\n");
+    out.push_str("    output reg all_valid,\n");
+    out.push_str("    output reg constraint_ok\n");
     out.push_str(");\n");
     // Per-entity valid wires.
     for (name, _) in entities {
         out.push_str(&format!("    wire {}_valid;\n", name));
+    }
+    // Per-constraint violation wires. `_v` suffix to keep them visually
+    // distinct from entity `_valid` lines.
+    for cname in constraints {
+        out.push_str(&format!("    wire {}_v;\n", cname));
     }
     out.push('\n');
     // Instantiate each entity with clk/rst_n + zero inputs + valid out.
@@ -106,11 +171,34 @@ fn emit_top_module(entities: &[(String, Vec<String>)]) -> String {
         out.push_str(&format!("        .valid({}_valid)\n", name));
         out.push_str("    );\n");
     }
-    // AND-reduce valids after reset release.
+    // Instantiate each constraint module — clk/rst_n + violation out.
+    for cname in constraints {
+        out.push_str(&format!("    {} {}_inst (\n", cname, cname));
+        out.push_str("        .clk(clk),\n");
+        out.push_str("        .rst_n(rst_n),\n");
+        out.push_str(&format!("        .violation({}_v)\n", cname));
+        out.push_str("    );\n");
+    }
+    // AND-reduce valids after reset release. Empty-entity edge case:
+    // emit `1'b1` as the identity so the expression stays well-formed.
     out.push_str("\n    always @(posedge clk) begin\n");
     out.push_str("        all_valid <= rst_n");
-    for (name, _) in entities {
-        out.push_str(&format!(" & {}_valid", name));
+    if entities.is_empty() {
+        out.push_str(" & 1'b1");
+    } else {
+        for (name, _) in entities {
+            out.push_str(&format!(" & {}_valid", name));
+        }
+    }
+    out.push_str(";\n");
+    // constraint_ok = !any_violation. AND-reduce inverted violations.
+    out.push_str("        constraint_ok <= rst_n");
+    if constraints.is_empty() {
+        out.push_str(" & 1'b1");
+    } else {
+        for cname in constraints {
+            out.push_str(&format!(" & ~{}_v", cname));
+        }
     }
     out.push_str(";\n    end\n");
     out.push_str("endmodule\n");
@@ -401,8 +489,9 @@ Supplier supplies Widget.
         let verilog = compile_to_verilog(&state);
         assert!(verilog.contains("module top ("),
             "top module header missing:\n{}", verilog);
-        // Top declares clk / rst_n inputs and all_valid output.
-        assert!(verilog.contains("module top (\n    input wire clk,\n    input wire rst_n,\n    output reg all_valid\n);"));
+        // Top declares clk / rst_n inputs and all_valid + constraint_ok outputs.
+        assert!(verilog.contains("module top (\n    input wire clk,\n    input wire rst_n,\n    output reg all_valid,\n    output reg constraint_ok\n);"),
+            "top module header missing expected ports:\n{}", verilog);
         // Declares the widget_valid wire.
         assert!(verilog.contains("wire widget_valid;"));
         // Instantiates the widget module.
@@ -413,6 +502,83 @@ Supplier supplies Widget.
         assert!(verilog.contains(".rst_n(rst_n)"));
         // The AND-reduction includes this entity's valid.
         assert!(verilog.contains("all_valid <= rst_n & widget_valid;"));
+    }
+
+    /// State with explicit Constraint cell entries: each UC/MC/FC
+    /// constraint produces one stub Verilog module wired into top's
+    /// `constraint_ok` aggregate. SS / EQ / ring / VC are intentionally
+    /// not emitted yet — separate emitters per family.
+    fn state_with_constraints(specs: &[(&str, &str)]) -> Object {
+        let constraints: Vec<Object> = specs.iter().map(|(id, kind)| {
+            fact_from_pairs(&[
+                ("id", id),
+                ("kind", kind),
+                ("modality", "alethic"),
+                ("text", "test constraint"),
+            ])
+        }).collect();
+        store("Constraint", Object::Seq(constraints.into()), &Object::phi())
+    }
+
+    #[test]
+    fn constraint_modules_emitted_per_alethic_cardinality_kind() {
+        let state = state_with_constraints(&[
+            ("c1", "UC"),
+            ("c2", "MC"),
+            ("c3", "FC"),
+            ("c4", "SS"),  // skipped — set-comparison emitter is future work
+            ("c5", "IR"),  // skipped — ring emitter is future work
+        ]);
+        let verilog = compile_to_verilog(&state);
+
+        assert!(verilog.contains("module constraint_uc_c1"),
+            "expected UC stub module:\n{}", verilog);
+        assert!(verilog.contains("module constraint_mc_c2"),
+            "expected MC stub module:\n{}", verilog);
+        assert!(verilog.contains("module constraint_fc_c3"),
+            "expected FC stub module:\n{}", verilog);
+        // SS and IR are NOT emitted yet — separate task per family.
+        assert!(!verilog.contains("constraint_ss_c4"),
+            "SS not yet supported, should not emit");
+        assert!(!verilog.contains("constraint_ir_c5"),
+            "ring not yet supported, should not emit");
+    }
+
+    #[test]
+    fn constraint_modules_have_canonical_port_shape() {
+        let state = state_with_constraints(&[("c1", "UC")]);
+        let verilog = compile_to_verilog(&state);
+        assert!(verilog.contains("input wire clk"));
+        assert!(verilog.contains("input wire rst_n"));
+        assert!(verilog.contains("output reg violation"));
+    }
+
+    #[test]
+    fn top_aggregates_constraint_violations_into_constraint_ok() {
+        let state = state_with_constraints(&[("c_a", "UC"), ("c_b", "MC")]);
+        let verilog = compile_to_verilog(&state);
+        // top has constraint wires + instantiations + AND-reduction of
+        // inverted violations.
+        assert!(verilog.contains("wire constraint_uc_c_a_v;"));
+        assert!(verilog.contains("wire constraint_mc_c_b_v;"));
+        assert!(verilog.contains("constraint_uc_c_a constraint_uc_c_a_inst ("));
+        assert!(verilog.contains("constraint_ok <= rst_n"));
+        assert!(verilog.contains("& ~constraint_uc_c_a_v"));
+        assert!(verilog.contains("& ~constraint_mc_c_b_v"));
+    }
+
+    /// Constraint-only state (no entities) must still emit a top with
+    /// constraint plumbing — the all_valid AND-reduce uses 1'b1 as
+    /// identity to keep the expression well-formed.
+    #[test]
+    fn constraint_only_state_emits_top_without_entities() {
+        let state = state_with_constraints(&[("c1", "UC")]);
+        let verilog = compile_to_verilog(&state);
+        assert!(verilog.contains("module top ("),
+            "top must be emitted when constraints exist:\n{}", verilog);
+        assert!(verilog.contains("all_valid <= rst_n & 1'b1"),
+            "no entities → all_valid identity 1'b1:\n{}", verilog);
+        assert!(verilog.contains("constraint_ok <= rst_n & ~constraint_uc_c1_v"));
     }
 
     /// Multi-entity: top instantiates every entity, ANDs all their
