@@ -76,12 +76,14 @@ use crate::ast::{Func, Object};
 const HEAP_START: i32 = 16;
 
 // Object tags.
-const TAG_ATOM: i32 = 0;
-const TAG_SEQ: i32 = 1;
+const TAG_ATOM: i32 = 0;        // i64 atom        : [tag=0, pad, i64 value]
+const TAG_SEQ: i32 = 1;         // seq of Objects  : [tag=1, length, i32 elem ptr × n]
+const TAG_STRING_ATOM: i32 = 2; // string atom     : [tag=2, byte_length, n bytes]
 
 // Object sizes.
 const ATOM_SIZE: i32 = 16;      // 4B tag + 4B pad + 8B value
 const SEQ_HEADER_SIZE: i32 = 8; // 4B tag + 4B length
+// StringAtom header: 4B tag + 4B byte length. Payload follows at offset 8.
 
 // Emitted-function indices. `apply` is 0 so user code (and the
 // bench) can call by name without caring about internals.
@@ -89,6 +91,7 @@ const FN_APPLY: u32 = 0;
 const FN_ALLOC: u32 = 1;
 const FN_ALLOC_ATOM: u32 = 2;
 const FN_TRUTHY: u32 = 3;
+const FN_ALLOC_STRING_ATOM: u32 = 4;
 
 // Global index: only one.
 const G_HEAP_PTR: u32 = 0;
@@ -112,23 +115,33 @@ pub fn lower_to_wasm(func: &Func) -> Result<Vec<u8>, String> {
     let mut module = Module::new();
 
     // ── Types ─────────────────────────────────────────────────────
-    // 0: apply       (i64) -> (i32)
-    // 1: alloc       (i32) -> (i32)
-    // 2: alloc_atom  (i64) -> (i32)
-    // 3: truthy      (i32) -> (i32)
+    // 0: apply             (i64) -> (i32)
+    // 1: alloc             (i32) -> (i32)
+    // 2: alloc_atom        (i64) -> (i32)
+    // 3: truthy            (i32) -> (i32)
+    // 4: alloc_string_atom (i32) -> (i32)   [byte_length → ptr]
+    //
+    // Types 1 and 3 and 4 all have signature (i32) -> (i32); they
+    // share type index 1 below. alloc_atom needs its own index for
+    // the i64 parameter. apply has type 0.
     let mut types = TypeSection::new();
-    types.ty().function(vec![ValType::I64], vec![ValType::I32]);
-    types.ty().function(vec![ValType::I32], vec![ValType::I32]);
-    types.ty().function(vec![ValType::I64], vec![ValType::I32]);
-    types.ty().function(vec![ValType::I32], vec![ValType::I32]);
+    types.ty().function(vec![ValType::I64], vec![ValType::I32]); // type 0
+    types.ty().function(vec![ValType::I32], vec![ValType::I32]); // type 1
+    types.ty().function(vec![ValType::I64], vec![ValType::I32]); // type 2
+    types.ty().function(vec![ValType::I32], vec![ValType::I32]); // type 3
+    // type 4 reuses the (i32)->(i32) shape but it's declared
+    // explicitly so every FN_* has a 1:1 type index; wasm-encoder
+    // happily dedupes at the section level.
+    types.ty().function(vec![ValType::I32], vec![ValType::I32]); // type 4
     module.section(&types);
 
     // ── Functions ─────────────────────────────────────────────────
     let mut functions = FunctionSection::new();
-    functions.function(0);
-    functions.function(1);
-    functions.function(2);
-    functions.function(3);
+    functions.function(0); // apply
+    functions.function(1); // alloc
+    functions.function(2); // alloc_atom
+    functions.function(3); // truthy
+    functions.function(4); // alloc_string_atom
     module.section(&functions);
 
     // ── Memory ────────────────────────────────────────────────────
@@ -233,14 +246,14 @@ pub fn lower_to_wasm(func: &Func) -> Result<Vec<u8>, String> {
 
     // --- truthy(ptr: i32) -> i32 ---
     //
-    // AREST Object truthiness, as close as we can get in the PoC:
+    // AREST Object truthiness:
     //   ptr == 0 (phi)  → 0
-    //   Atom            → value != 0
-    //   Seq / other     → length != 0
-    //
-    // Matches the full-Object semantics for the numeric subset the
-    // PoC lowers today. Extending to string atoms will require a
-    // richer "is-empty-string" check here.
+    //   Atom (tag 0)    → i64 value != 0
+    //   Seq (tag 1)     → length != 0
+    //   StringAtom      → byte_length != 0  (falls through the "else"
+    //     (tag 2)         arm — the length field is at offset 4 for
+    //                     both Seq and StringAtom, so a single
+    //                     `i32.load offset=4` serves both)
     let mut truthy_body = Function::new([]);
     truthy_body.instruction(&Instruction::LocalGet(0));
     truthy_body.instruction(&Instruction::I32Eqz);
@@ -268,6 +281,35 @@ pub fn lower_to_wasm(func: &Func) -> Result<Vec<u8>, String> {
     truthy_body.instruction(&Instruction::End);  // function
     codes.function(&truthy_body);
 
+    // --- alloc_string_atom(byte_length: i32) -> i32 ---
+    //
+    // Reserve space for a StringAtom: 4B tag + 4B length + n bytes,
+    // rounded up to a 4-byte multiple so the next bump-alloc starts
+    // at an aligned address (i32 loads from the heap assume 4-byte
+    // alignment; wasmi tolerates unaligned but trapping runtimes
+    // wouldn't). Writes tag=2 and length; the caller fills the n
+    // payload bytes via i32.store8 at offset 8+i.
+    let mut alloc_string_atom_body = Function::new([(1, ValType::I32)]);
+    // aligned_size = (8 + length + 3) & -4
+    alloc_string_atom_body.instruction(&Instruction::I32Const(8 + 3));
+    alloc_string_atom_body.instruction(&Instruction::LocalGet(0));
+    alloc_string_atom_body.instruction(&Instruction::I32Add);
+    alloc_string_atom_body.instruction(&Instruction::I32Const(-4));
+    alloc_string_atom_body.instruction(&Instruction::I32And);
+    alloc_string_atom_body.instruction(&Instruction::Call(FN_ALLOC));
+    alloc_string_atom_body.instruction(&Instruction::LocalTee(1));
+    // Write tag at offset 0.
+    alloc_string_atom_body.instruction(&Instruction::I32Const(TAG_STRING_ATOM));
+    alloc_string_atom_body.instruction(&Instruction::I32Store(i32_at(0)));
+    // Write byte length at offset 4.
+    alloc_string_atom_body.instruction(&Instruction::LocalGet(1));
+    alloc_string_atom_body.instruction(&Instruction::LocalGet(0));
+    alloc_string_atom_body.instruction(&Instruction::I32Store(i32_at(4)));
+    // Return ptr.
+    alloc_string_atom_body.instruction(&Instruction::LocalGet(1));
+    alloc_string_atom_body.instruction(&Instruction::End);
+    codes.function(&alloc_string_atom_body);
+
     module.section(&codes);
 
     Ok(module.finish())
@@ -281,6 +323,12 @@ pub fn lower_to_wasm(func: &Func) -> Result<Vec<u8>, String> {
 /// the *max* of their needs, not the sum.
 fn scratch_needed(func: &Func) -> u32 {
     match func {
+        // Numeric literals take no scratch; string literals stash
+        // the freshly-allocated StringAtom pointer while we write
+        // bytes into its payload.
+        Func::Constant(Object::Atom(s)) => {
+            if s.parse::<i64>().is_ok() { 0 } else { 1 }
+        }
         Func::Compose(f, g) => scratch_needed(f).max(scratch_needed(g)),
         Func::Condition(p, f, g) => {
             1 + scratch_needed(p)
@@ -333,6 +381,15 @@ fn scratch_needed(func: &Func) -> u32 {
         // would load sentinel bytes from memory[0..3], silently
         // misclassifying φ as Atom).
         Func::AtomTest | Func::NullTest | Func::Length => 1,
+        // Contains: pair → bool atom. Byte-level substring search
+        // with nested loops. Nine slots: pair, haystack, needle,
+        // haystack_len, needle_len, i (outer), j (inner), match,
+        // and result.
+        Func::Contains => 9,
+        // Lower: unary string → new string. Five slots: src, src_len,
+        // dst, i (loop index), b (per-byte scratch for the branchless
+        // ASCII-case fold).
+        Func::Lower => 5,
         // Unary Seq transformers allocate a new Seq of derived
         // length and copy elements with an index mapping. Five slots:
         // i, in_len, in_seq, out_seq, out_len.
@@ -649,6 +706,10 @@ fn emit_body(
         //   null:x  = 1 if x = φ (null ptr or empty Seq) else 0
         //   length:x = the Seq length as an Atom (φ if x is an Atom)
         Func::AtomTest => {
+            // Both numeric atoms (tag 0) and string atoms (tag 2) are
+            // "atom" per Backus — the test predicate recognizes them
+            // both, rejecting only sequences (tag 1). `tag != TAG_SEQ`
+            // captures the full atomhood check with a single compare.
             let elem_slot = next_scratch;
             body.instruction(&Instruction::LocalTee(elem_slot));
             body.instruction(&Instruction::I32Eqz);
@@ -657,8 +718,8 @@ fn emit_body(
             body.instruction(&Instruction::Else);
             body.instruction(&Instruction::LocalGet(elem_slot));
             body.instruction(&Instruction::I32Load(i32_at(0)));
-            body.instruction(&Instruction::I32Const(TAG_ATOM));
-            body.instruction(&Instruction::I32Eq);
+            body.instruction(&Instruction::I32Const(TAG_SEQ));
+            body.instruction(&Instruction::I32Ne);
             body.instruction(&Instruction::End);
             body.instruction(&Instruction::I64ExtendI32U);
             body.instruction(&Instruction::Call(FN_ALLOC_ATOM));
@@ -712,6 +773,218 @@ fn emit_body(
             body.instruction(&Instruction::I32Const(0)); // Atom → φ
             body.instruction(&Instruction::End);
             body.instruction(&Instruction::End);
+        }
+
+        // Backus §11.2.3 string predicate.
+        //
+        //   contains:<haystack, needle> = 1 if haystack contains needle else 0
+        //
+        // Both inputs are string atoms (tag 2). Brute-force byte-
+        // level substring search: outer loop tries each offset i in
+        // haystack; inner loop compares needle bytes against
+        // haystack[i..i+needle_len]. Early-exits on first match.
+        //
+        // Bounds: pre-check needle_len > haystack_len and return 0
+        // immediately so the subtracted outer bound `haystack_len -
+        // needle_len` stays non-negative. Empty needle is treated as
+        // "always present" — matches the common string-contains
+        // contract (0 chars trivially appear at position 0).
+        Func::Contains => {
+            let pair_slot = next_scratch;
+            let haystack_slot = next_scratch + 1;
+            let needle_slot = next_scratch + 2;
+            let haystack_len_slot = next_scratch + 3;
+            let needle_len_slot = next_scratch + 4;
+            let i_slot = next_scratch + 5;
+            let j_slot = next_scratch + 6;
+            let match_slot = next_scratch + 7;
+            let result_slot = next_scratch + 8;
+
+            body.instruction(&Instruction::LocalSet(pair_slot));
+            // haystack = pair[0]
+            body.instruction(&Instruction::LocalGet(pair_slot));
+            body.instruction(&Instruction::I32Load(i32_at(8)));
+            body.instruction(&Instruction::LocalTee(haystack_slot));
+            // haystack_len = haystack.length (offset 4 of StringAtom)
+            body.instruction(&Instruction::I32Load(i32_at(4)));
+            body.instruction(&Instruction::LocalSet(haystack_len_slot));
+            // needle = pair[1]
+            body.instruction(&Instruction::LocalGet(pair_slot));
+            body.instruction(&Instruction::I32Load(i32_at(12)));
+            body.instruction(&Instruction::LocalTee(needle_slot));
+            body.instruction(&Instruction::I32Load(i32_at(4)));
+            body.instruction(&Instruction::LocalSet(needle_len_slot));
+            // result = 0 initially
+            body.instruction(&Instruction::I32Const(0));
+            body.instruction(&Instruction::LocalSet(result_slot));
+            // If needle_len > haystack_len → skip search (result stays 0).
+            body.instruction(&Instruction::LocalGet(needle_len_slot));
+            body.instruction(&Instruction::LocalGet(haystack_len_slot));
+            body.instruction(&Instruction::I32GtS);
+            body.instruction(&Instruction::If(BlockType::Empty));
+            body.instruction(&Instruction::Else);
+            // i = 0
+            body.instruction(&Instruction::I32Const(0));
+            body.instruction(&Instruction::LocalSet(i_slot));
+            body.instruction(&Instruction::Block(BlockType::Empty));
+            body.instruction(&Instruction::Loop(BlockType::Empty));
+            // if i > haystack_len - needle_len: break outer
+            body.instruction(&Instruction::LocalGet(i_slot));
+            body.instruction(&Instruction::LocalGet(haystack_len_slot));
+            body.instruction(&Instruction::LocalGet(needle_len_slot));
+            body.instruction(&Instruction::I32Sub);
+            body.instruction(&Instruction::I32GtS);
+            body.instruction(&Instruction::BrIf(1));
+            // match = 1
+            body.instruction(&Instruction::I32Const(1));
+            body.instruction(&Instruction::LocalSet(match_slot));
+            // j = 0
+            body.instruction(&Instruction::I32Const(0));
+            body.instruction(&Instruction::LocalSet(j_slot));
+            body.instruction(&Instruction::Block(BlockType::Empty));
+            body.instruction(&Instruction::Loop(BlockType::Empty));
+            // if j >= needle_len: break inner
+            body.instruction(&Instruction::LocalGet(j_slot));
+            body.instruction(&Instruction::LocalGet(needle_len_slot));
+            body.instruction(&Instruction::I32GeS);
+            body.instruction(&Instruction::BrIf(1));
+            // Load haystack byte at [8 + i + j]
+            body.instruction(&Instruction::LocalGet(haystack_slot));
+            body.instruction(&Instruction::LocalGet(i_slot));
+            body.instruction(&Instruction::I32Add);
+            body.instruction(&Instruction::LocalGet(j_slot));
+            body.instruction(&Instruction::I32Add);
+            body.instruction(&Instruction::I32Load8U(MemArg {
+                offset: SEQ_HEADER_SIZE as u64,
+                align: 0,
+                memory_index: 0,
+            }));
+            // Load needle byte at [8 + j]
+            body.instruction(&Instruction::LocalGet(needle_slot));
+            body.instruction(&Instruction::LocalGet(j_slot));
+            body.instruction(&Instruction::I32Add);
+            body.instruction(&Instruction::I32Load8U(MemArg {
+                offset: SEQ_HEADER_SIZE as u64,
+                align: 0,
+                memory_index: 0,
+            }));
+            body.instruction(&Instruction::I32Ne);
+            body.instruction(&Instruction::If(BlockType::Empty));
+            // Mismatch: clear match flag and break inner.
+            body.instruction(&Instruction::I32Const(0));
+            body.instruction(&Instruction::LocalSet(match_slot));
+            body.instruction(&Instruction::Br(2)); // exit inner block
+            body.instruction(&Instruction::End);
+            // j += 1
+            body.instruction(&Instruction::LocalGet(j_slot));
+            body.instruction(&Instruction::I32Const(1));
+            body.instruction(&Instruction::I32Add);
+            body.instruction(&Instruction::LocalSet(j_slot));
+            body.instruction(&Instruction::Br(0)); // continue inner
+            body.instruction(&Instruction::End); // end inner loop
+            body.instruction(&Instruction::End); // end inner block
+            // Post-inner: if match was still 1, record success and exit outer.
+            body.instruction(&Instruction::LocalGet(match_slot));
+            body.instruction(&Instruction::If(BlockType::Empty));
+            body.instruction(&Instruction::I32Const(1));
+            body.instruction(&Instruction::LocalSet(result_slot));
+            body.instruction(&Instruction::Br(2)); // exit outer block
+            body.instruction(&Instruction::End);
+            // i += 1; continue outer
+            body.instruction(&Instruction::LocalGet(i_slot));
+            body.instruction(&Instruction::I32Const(1));
+            body.instruction(&Instruction::I32Add);
+            body.instruction(&Instruction::LocalSet(i_slot));
+            body.instruction(&Instruction::Br(0));
+            body.instruction(&Instruction::End); // end outer loop
+            body.instruction(&Instruction::End); // end outer block
+            body.instruction(&Instruction::End); // end if (needle_len <= haystack_len)
+            // Wrap result as numeric Atom.
+            body.instruction(&Instruction::LocalGet(result_slot));
+            body.instruction(&Instruction::I64ExtendI32U);
+            body.instruction(&Instruction::Call(FN_ALLOC_ATOM));
+        }
+
+        // Backus §11.2.3 unary string transformer.
+        //
+        //   lower:x = lowercase(x)   for string x
+        //
+        // ASCII-only case fold: bytes in [A-Z] (65..=90) get +32.
+        // Everything else copies through unchanged, so multi-byte
+        // UTF-8 sequences pass through byte-identical. Branchless
+        // delta: `in_range ? 32 : 0` via bitmask + shift.
+        Func::Lower => {
+            let src_slot = next_scratch;
+            let src_len_slot = next_scratch + 1;
+            let dst_slot = next_scratch + 2;
+            let i_slot = next_scratch + 3;
+            let b_slot = next_scratch + 4;
+            body.instruction(&Instruction::LocalSet(src_slot));
+            // src_len = src.length
+            body.instruction(&Instruction::LocalGet(src_slot));
+            body.instruction(&Instruction::I32Load(i32_at(4)));
+            body.instruction(&Instruction::LocalSet(src_len_slot));
+            // dst = alloc_string_atom(src_len)
+            body.instruction(&Instruction::LocalGet(src_len_slot));
+            body.instruction(&Instruction::Call(FN_ALLOC_STRING_ATOM));
+            body.instruction(&Instruction::LocalSet(dst_slot));
+            // i = 0
+            body.instruction(&Instruction::I32Const(0));
+            body.instruction(&Instruction::LocalSet(i_slot));
+            body.instruction(&Instruction::Block(BlockType::Empty));
+            body.instruction(&Instruction::Loop(BlockType::Empty));
+            // if i >= src_len: break
+            body.instruction(&Instruction::LocalGet(i_slot));
+            body.instruction(&Instruction::LocalGet(src_len_slot));
+            body.instruction(&Instruction::I32GeS);
+            body.instruction(&Instruction::BrIf(1));
+            // b = src[8 + i]
+            body.instruction(&Instruction::LocalGet(src_slot));
+            body.instruction(&Instruction::LocalGet(i_slot));
+            body.instruction(&Instruction::I32Add);
+            body.instruction(&Instruction::I32Load8U(MemArg {
+                offset: SEQ_HEADER_SIZE as u64,
+                align: 0,
+                memory_index: 0,
+            }));
+            body.instruction(&Instruction::LocalSet(b_slot));
+            // Branchless lowercase delta:
+            //   in_range = (b >= 65) & (b <= 90)
+            //   delta    = in_range << 5      ; 0 or 32
+            //   lowered  = b + delta
+            body.instruction(&Instruction::LocalGet(b_slot));
+            body.instruction(&Instruction::I32Const(65));
+            body.instruction(&Instruction::I32GeS);
+            body.instruction(&Instruction::LocalGet(b_slot));
+            body.instruction(&Instruction::I32Const(90));
+            body.instruction(&Instruction::I32LeS);
+            body.instruction(&Instruction::I32And);
+            body.instruction(&Instruction::I32Const(5));
+            body.instruction(&Instruction::I32Shl);
+            body.instruction(&Instruction::LocalGet(b_slot));
+            body.instruction(&Instruction::I32Add);
+            // Store dst[8 + i] = lowered_b
+            // Pull the result off the stack into b_slot so we can
+            // position the store-address without losing it.
+            body.instruction(&Instruction::LocalSet(b_slot));
+            body.instruction(&Instruction::LocalGet(dst_slot));
+            body.instruction(&Instruction::LocalGet(i_slot));
+            body.instruction(&Instruction::I32Add);
+            body.instruction(&Instruction::LocalGet(b_slot));
+            body.instruction(&Instruction::I32Store8(MemArg {
+                offset: SEQ_HEADER_SIZE as u64,
+                align: 0,
+                memory_index: 0,
+            }));
+            // i += 1
+            body.instruction(&Instruction::LocalGet(i_slot));
+            body.instruction(&Instruction::I32Const(1));
+            body.instruction(&Instruction::I32Add);
+            body.instruction(&Instruction::LocalSet(i_slot));
+            body.instruction(&Instruction::Br(0));
+            body.instruction(&Instruction::End); // end loop
+            body.instruction(&Instruction::End); // end block
+            body.instruction(&Instruction::LocalGet(dst_slot));
         }
 
         // Backus §11.2.3 unary Seq transformers. All four share the
@@ -1405,12 +1678,39 @@ fn emit_body(
         }
 
         // c̄:x = c (when x ≠ ⊥) — drop input ptr, allocate fresh Atom.
+        //
+        // Two shapes: atoms that parse as `i64` go through the
+        // numeric fast path (`alloc_atom` → 16B, zero scratch).
+        // Anything else becomes a StringAtom — variable-sized heap
+        // object holding the raw UTF-8 bytes.
         Func::Constant(Object::Atom(s)) => {
-            let n: i64 = s.parse()
-                .map_err(|_| format!("Constant atom must parse as i64 for PoC: got {:?}", s))?;
-            body.instruction(&Instruction::Drop);
-            body.instruction(&Instruction::I64Const(n));
-            body.instruction(&Instruction::Call(FN_ALLOC_ATOM));
+            if let Ok(n) = s.parse::<i64>() {
+                body.instruction(&Instruction::Drop);
+                body.instruction(&Instruction::I64Const(n));
+                body.instruction(&Instruction::Call(FN_ALLOC_ATOM));
+            } else {
+                // Drop x, allocate a fresh StringAtom, write bytes
+                // one at a time into the payload region at offset 8.
+                // The `str_slot` scratch holds the pointer across
+                // the byte-writes; per-byte stores use i32.store8
+                // with unaligned access (align=0) since the payload
+                // is a byte array with no alignment guarantee.
+                let str_slot = next_scratch;
+                body.instruction(&Instruction::Drop);
+                body.instruction(&Instruction::I32Const(s.len() as i32));
+                body.instruction(&Instruction::Call(FN_ALLOC_STRING_ATOM));
+                body.instruction(&Instruction::LocalSet(str_slot));
+                for (i, byte) in s.as_bytes().iter().enumerate() {
+                    body.instruction(&Instruction::LocalGet(str_slot));
+                    body.instruction(&Instruction::I32Const(*byte as i32));
+                    body.instruction(&Instruction::I32Store8(MemArg {
+                        offset: (SEQ_HEADER_SIZE as u64) + i as u64,
+                        align: 0,
+                        memory_index: 0,
+                    }));
+                }
+                body.instruction(&Instruction::LocalGet(str_slot));
+            }
         }
 
         // Backus §11.2.4 Composition. Stack discipline makes this
@@ -1858,10 +2158,16 @@ mod tests {
     }
 
     #[test]
-    fn lower_constant_with_non_numeric_atom_errors() {
+    fn lower_constant_with_non_numeric_atom_emits_string_atom() {
+        // Atoms that don't parse as i64 are emitted as StringAtom
+        // (tag 2, byte length prefix, raw UTF-8 payload).
         let f = Func::Constant(Object::atom("hello"));
-        let err = lower_to_wasm(&f).expect_err("non-numeric atom must fail cleanly");
-        assert!(err.contains("i64"));
+        let (ptr, data) = invoke(&f, 0);
+        assert_eq!(read_u32(&data, ptr), TAG_STRING_ATOM as u32,
+            "result is a StringAtom");
+        assert_eq!(read_u32(&data, ptr + 4), 5, "byte length of \"hello\"");
+        let bytes = &data[(ptr + 8) as usize..(ptr + 8 + 5) as usize];
+        assert_eq!(bytes, b"hello");
     }
 
     #[test]
@@ -1883,11 +2189,239 @@ mod tests {
     }
 
     #[test]
-    fn lower_rejects_unsupported_variant_contains() {
-        // String ops need string Atom layout we don't emit yet.
-        let f = Func::Contains;
-        let err = lower_to_wasm(&f).expect_err("Contains should be unsupported");
+    fn lower_rejects_unsupported_variant_store() {
+        // Store writes into D (the runtime state), which the PoC's
+        // pure-i64 apply has no way to plumb through.
+        let f = Func::Store;
+        let err = lower_to_wasm(&f).expect_err("Store should be unsupported");
         assert!(err.contains("not yet supported"));
+    }
+
+    // ── String Atom helpers + tests ────────────────────────────────
+
+    /// Decode the result as a StringAtom; panic on any other shape.
+    fn roundtrip_string(func: &Func, input: i64) -> String {
+        let (ptr, data) = invoke(func, input);
+        let tag = read_u32(&data, ptr);
+        assert_eq!(tag, TAG_STRING_ATOM as u32,
+            "expected StringAtom tag=2 at ptr={} but saw tag={}", ptr, tag);
+        let len = read_u32(&data, ptr + 4) as usize;
+        let bytes = &data[(ptr + 8) as usize..(ptr + 8) as usize + len];
+        String::from_utf8(bytes.to_vec())
+            .expect("string atom payload must be valid UTF-8")
+    }
+
+    #[test]
+    fn lower_string_constant_roundtrips() {
+        // Round-trip several string literals through the emitter:
+        // ASCII-only, mixed-case, UTF-8 multi-byte, and an empty
+        // string. All should come back byte-identical.
+        for s in ["hello", "HeLLo World", "résumé", ""] {
+            let f = Func::Constant(Object::atom(s));
+            let got = roundtrip_string(&f, 0);
+            assert_eq!(got, s, "string constant {:?} round-tripped", s);
+        }
+    }
+
+    #[test]
+    fn lower_atom_test_on_string_atom_returns_one() {
+        // `atom:"hello"` must report true — StringAtoms are atoms.
+        // The predicate checks `tag != TAG_SEQ`, so both numeric
+        // and string atoms classify as atomhood-positive.
+        let f = Func::Compose(
+            Box::new(Func::AtomTest),
+            Box::new(Func::Constant(Object::atom("hello"))),
+        );
+        assert_eq!(roundtrip(&f, 0), 1);
+    }
+
+    #[test]
+    fn lower_null_test_distinguishes_empty_string_from_phi() {
+        // Empty-string StringAtom is still an atom, not φ.
+        let empty = Func::Compose(
+            Box::new(Func::NullTest),
+            Box::new(Func::Constant(Object::atom(""))),
+        );
+        assert_eq!(roundtrip(&empty, 0), 0,
+            "null:\"\" = 0 — an empty-string atom is not φ");
+
+        // Non-empty string atom also not φ.
+        let hello = Func::Compose(
+            Box::new(Func::NullTest),
+            Box::new(Func::Constant(Object::atom("hello"))),
+        );
+        assert_eq!(roundtrip(&hello, 0), 0);
+    }
+
+    #[test]
+    fn lower_truthy_on_string_atom_follows_byte_length() {
+        // Empty string is falsy; non-empty is truthy. Exercised via
+        // Condition.
+        let if_empty = Func::Compose(
+            Box::new(Func::Condition(
+                Box::new(Func::Id),
+                Box::new(Func::Constant(Object::atom("42"))),
+                Box::new(Func::Constant(Object::atom("99"))),
+            )),
+            Box::new(Func::Constant(Object::atom(""))),
+        );
+        assert_eq!(roundtrip(&if_empty, 0), 99, "empty string → false");
+
+        let if_nonempty = Func::Compose(
+            Box::new(Func::Condition(
+                Box::new(Func::Id),
+                Box::new(Func::Constant(Object::atom("42"))),
+                Box::new(Func::Constant(Object::atom("99"))),
+            )),
+            Box::new(Func::Constant(Object::atom("x"))),
+        );
+        assert_eq!(roundtrip(&if_nonempty, 0), 42, "non-empty string → true");
+    }
+
+    // ── Contains (byte substring) ───────────────────────────────────
+
+    #[test]
+    fn lower_contains_finds_substring() {
+        // contains:<"hello world", "world"> = 1
+        let f = Func::Compose(
+            Box::new(Func::Contains),
+            Box::new(Func::Construction(vec![
+                Func::Constant(Object::atom("hello world")),
+                Func::Constant(Object::atom("world")),
+            ])),
+        );
+        assert_eq!(roundtrip(&f, 0), 1);
+    }
+
+    #[test]
+    fn lower_contains_returns_zero_for_absent_needle() {
+        let f = Func::Compose(
+            Box::new(Func::Contains),
+            Box::new(Func::Construction(vec![
+                Func::Constant(Object::atom("alpha beta")),
+                Func::Constant(Object::atom("gamma")),
+            ])),
+        );
+        assert_eq!(roundtrip(&f, 0), 0);
+    }
+
+    #[test]
+    fn lower_contains_returns_zero_when_needle_longer_than_haystack() {
+        let f = Func::Compose(
+            Box::new(Func::Contains),
+            Box::new(Func::Construction(vec![
+                Func::Constant(Object::atom("ab")),
+                Func::Constant(Object::atom("abcdef")),
+            ])),
+        );
+        assert_eq!(roundtrip(&f, 0), 0);
+    }
+
+    #[test]
+    fn lower_contains_matches_at_start_middle_and_end() {
+        // Start
+        let start = Func::Compose(
+            Box::new(Func::Contains),
+            Box::new(Func::Construction(vec![
+                Func::Constant(Object::atom("prefix-rest")),
+                Func::Constant(Object::atom("prefix")),
+            ])),
+        );
+        assert_eq!(roundtrip(&start, 0), 1);
+        // Middle
+        let middle = Func::Compose(
+            Box::new(Func::Contains),
+            Box::new(Func::Construction(vec![
+                Func::Constant(Object::atom("a-mid-b")),
+                Func::Constant(Object::atom("mid")),
+            ])),
+        );
+        assert_eq!(roundtrip(&middle, 0), 1);
+        // End
+        let end = Func::Compose(
+            Box::new(Func::Contains),
+            Box::new(Func::Construction(vec![
+                Func::Constant(Object::atom("leading-tail")),
+                Func::Constant(Object::atom("tail")),
+            ])),
+        );
+        assert_eq!(roundtrip(&end, 0), 1);
+    }
+
+    #[test]
+    fn lower_contains_whole_string_matches_itself() {
+        let f = Func::Compose(
+            Box::new(Func::Contains),
+            Box::new(Func::Construction(vec![
+                Func::Constant(Object::atom("same")),
+                Func::Constant(Object::atom("same")),
+            ])),
+        );
+        assert_eq!(roundtrip(&f, 0), 1);
+    }
+
+    // ── Lower (ASCII case fold) ─────────────────────────────────────
+
+    #[test]
+    fn lower_lowercases_ascii_string() {
+        let f = Func::Compose(
+            Box::new(Func::Lower),
+            Box::new(Func::Constant(Object::atom("HeLLo WoRLD"))),
+        );
+        assert_eq!(roundtrip_string(&f, 0), "hello world");
+    }
+
+    #[test]
+    fn lower_preserves_already_lowercase_and_non_letters() {
+        // Punctuation, digits, and lowercase letters pass through.
+        let f = Func::Compose(
+            Box::new(Func::Lower),
+            Box::new(Func::Constant(Object::atom("abc123-_.!@#"))),
+        );
+        assert_eq!(roundtrip_string(&f, 0), "abc123-_.!@#");
+    }
+
+    #[test]
+    fn lower_of_empty_string_is_empty_string() {
+        let f = Func::Compose(
+            Box::new(Func::Lower),
+            Box::new(Func::Constant(Object::atom(""))),
+        );
+        assert_eq!(roundtrip_string(&f, 0), "");
+    }
+
+    #[test]
+    fn lower_preserves_non_ascii_utf8_bytes() {
+        // Multi-byte UTF-8 sequences should pass through unchanged
+        // because their bytes (all ≥ 0x80) fall outside the [A-Z]
+        // ASCII case-fold range. Happens to produce valid UTF-8
+        // output for any valid UTF-8 input — a freebie of byte-level
+        // ASCII-only folding.
+        let f = Func::Compose(
+            Box::new(Func::Lower),
+            Box::new(Func::Constant(Object::atom("RÉSUMÉ"))),
+        );
+        // The leading R → r, but É bytes (0xC3 0x89) are untouched,
+        // so the result is "rÉsumÉ" not "résumé". That's the
+        // documented ASCII-only contract.
+        assert_eq!(roundtrip_string(&f, 0), "rÉsumÉ");
+    }
+
+    #[test]
+    fn lower_composes_with_contains() {
+        // contains:<lower:"Hello", "hello"> = 1 — case-insensitive
+        // substring check built from two primitives.
+        let f = Func::Compose(
+            Box::new(Func::Contains),
+            Box::new(Func::Construction(vec![
+                Func::Compose(
+                    Box::new(Func::Lower),
+                    Box::new(Func::Constant(Object::atom("Hello"))),
+                ),
+                Func::Constant(Object::atom("hello")),
+            ])),
+        );
+        assert_eq!(roundtrip(&f, 0), 1);
     }
 
     #[test]
