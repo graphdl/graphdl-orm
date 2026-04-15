@@ -128,8 +128,12 @@ ProductVariant has Stock Count.
 ## Constraints
 
 Each Category has at most one parent Category.
-No Category has the same Category as parent. (irreflexive)
-If some Category has parent some Category1 and that Category1 has parent some Category2 then it is not the case that Category2 has parent that Category. (acyclic)
+
+-- Ring constraints on "Category has parent Category" are declared as tagged
+-- shorthands on the binary fact type, not as long prose. Each shorthand maps
+-- to one elementary assertion about the role pair.
+Category has parent Category is irreflexive.
+Category has parent Category is acyclic.
 
 It is obligatory that each Product has exactly one Price.
 It is forbidden that a Review has Rating less than 1.

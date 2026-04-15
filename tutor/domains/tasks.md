@@ -108,15 +108,29 @@ Task targets Milestone.
 
 ## Constraints
 
-If some Task blocks some Task1 and that Task1 blocks some Task2 then it is not the case that Task2 blocks that Task. (acyclic)
+-- Prefer the tagged ring-constraint shorthand to prose reasoning. The
+-- shorthand is a single elementary assertion about the fact type.
+Task blocks Task is acyclic.
 
+-- Subset constraint between two binary fact types, stated elementally.
 If some Task is assigned to some Person then that Task belongs to some Project.
 
 It is obligatory that each Task has exactly one Priority.
 
 ## Derivation Rules
 
-* Milestone has Completion Percent iff Completion Percent is the count of Task where Task targets that Milestone and Task has Status 'Done' divided by the count of Task where Task targets that Milestone.
+-- A compound aggregate stated as a single prose sentence is hard to read.
+-- Decompose into named intermediates so each line is an elementary fact.
+* Milestone has done Task Count iff done Task Count is the count of Task
+  where Task targets that Milestone
+  and Task has Status 'Done'.
+
+* Milestone has total Task Count iff total Task Count is the count of Task
+  where Task targets that Milestone.
+
+* Milestone has Completion Percent iff Milestone has done Task Count
+  and Milestone has total Task Count
+  and Completion Percent is that done Task Count divided by that total Task Count.
 
 ## Instance Facts
 

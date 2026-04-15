@@ -16,6 +16,9 @@ Reference is a value type.
 Value is a value type.
 Retrieval Date is a value type.
 
+Authority Type is a value type.
+  The possible values of Authority Type are 'Constitutional', 'Statute', 'Regulation', 'Case', 'Rule-of-Court', 'Executive-Order', 'Treaty', 'Agency-Guidance', 'Industry-Standard', 'Administrative-Ruling'.
+
 ## Readings
 
 ### Citation
@@ -25,6 +28,12 @@ Citation has URI.
   Each Citation has at most one URI.
 Citation has Retrieval Date.
   Each Citation has at most one Retrieval Date.
+Citation has Authority Type.
+  Each Citation has at most one Authority Type.
+  It is possible that more than one Citation has the same Authority Type.
+Citation is backed by External System.
+  Each Citation is backed by at most one External System.
+  It is possible that more than one Citation is backed by the same External System.
 
 ### Fact
 Fact belongs to Domain.
