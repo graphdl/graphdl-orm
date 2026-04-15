@@ -321,6 +321,10 @@ fn scratch_needed(func: &Func) -> u32 {
         // would load sentinel bytes from memory[0..3], silently
         // misclassifying φ as Atom).
         Func::AtomTest | Func::NullTest | Func::Length => 1,
+        // Unary Seq transformers allocate a new Seq of derived
+        // length and copy elements with an index mapping. Five slots:
+        // i, in_len, in_seq, out_seq, out_len.
+        Func::Tail | Func::Reverse | Func::RotL | Func::RotR => 5,
         _ => 0,
     }
 }
@@ -361,6 +365,103 @@ fn emit_binary_i64_compare(body: &mut Function, pair_slot: u32, cmp: Instruction
     body.instruction(&cmp);
     body.instruction(&Instruction::I64ExtendI32U);
     body.instruction(&Instruction::Call(FN_ALLOC_ATOM));
+}
+
+/// Emit a unary Seq → Seq transformer whose output length is a
+/// function of the input length and whose element i is a function
+/// of (i, in_len). Used by Tail, Reverse, RotL, RotR — they share
+/// 95 % of their emission, differing only in:
+///
+///   - `compute_out_len(body, in_len_slot)` : leaves the output
+///     Seq's length on the operand stack.
+///   - `compute_src_idx(body, i_slot, in_len_slot)` : leaves the
+///     source-element index on the stack.
+///
+/// Null-pointer input is handled gracefully by returning an empty
+/// Seq; this keeps the PoC usable with φ-producing subterms
+/// (Insert on empty, Filter that keeps nothing) feeding into
+/// subsequent Seq ops.
+///
+/// Scratch usage: 5 slots (i, in_len, in_seq, out_seq, out_len).
+fn emit_unary_seq_map(
+    body: &mut Function,
+    next_scratch: u32,
+    compute_out_len: impl Fn(&mut Function, u32),
+    compute_src_idx: impl Fn(&mut Function, u32, u32),
+) {
+    let i_slot = next_scratch;
+    let in_len_slot = next_scratch + 1;
+    let in_slot = next_scratch + 2;
+    let out_slot = next_scratch + 3;
+    let out_len_slot = next_scratch + 4;
+
+    // Stash input ptr, null-check.
+    body.instruction(&Instruction::LocalTee(in_slot));
+    body.instruction(&Instruction::I32Eqz);
+    body.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+    // Null input: allocate empty Seq and return.
+    body.instruction(&Instruction::I32Const(SEQ_HEADER_SIZE));
+    body.instruction(&Instruction::Call(FN_ALLOC));
+    body.instruction(&Instruction::LocalTee(out_slot));
+    body.instruction(&Instruction::I32Const(TAG_SEQ));
+    body.instruction(&Instruction::I32Store(i32_at(0)));
+    body.instruction(&Instruction::LocalGet(out_slot));
+    body.instruction(&Instruction::I32Const(0));
+    body.instruction(&Instruction::I32Store(i32_at(4)));
+    body.instruction(&Instruction::LocalGet(out_slot));
+    body.instruction(&Instruction::Else);
+    // Non-null: read in_len, derive out_len, alloc out_seq.
+    body.instruction(&Instruction::LocalGet(in_slot));
+    body.instruction(&Instruction::I32Load(i32_at(4)));
+    body.instruction(&Instruction::LocalSet(in_len_slot));
+    compute_out_len(body, in_len_slot);
+    body.instruction(&Instruction::LocalSet(out_len_slot));
+    // alloc = header + 4 * out_len
+    body.instruction(&Instruction::I32Const(SEQ_HEADER_SIZE));
+    body.instruction(&Instruction::LocalGet(out_len_slot));
+    body.instruction(&Instruction::I32Const(4));
+    body.instruction(&Instruction::I32Mul);
+    body.instruction(&Instruction::I32Add);
+    body.instruction(&Instruction::Call(FN_ALLOC));
+    body.instruction(&Instruction::LocalTee(out_slot));
+    body.instruction(&Instruction::I32Const(TAG_SEQ));
+    body.instruction(&Instruction::I32Store(i32_at(0)));
+    body.instruction(&Instruction::LocalGet(out_slot));
+    body.instruction(&Instruction::LocalGet(out_len_slot));
+    body.instruction(&Instruction::I32Store(i32_at(4)));
+    // i = 0 ; loop body copies in[src_idx(i, in_len)] → out[i]
+    body.instruction(&Instruction::I32Const(0));
+    body.instruction(&Instruction::LocalSet(i_slot));
+    body.instruction(&Instruction::Block(BlockType::Empty));
+    body.instruction(&Instruction::Loop(BlockType::Empty));
+    body.instruction(&Instruction::LocalGet(i_slot));
+    body.instruction(&Instruction::LocalGet(out_len_slot));
+    body.instruction(&Instruction::I32GeS);
+    body.instruction(&Instruction::BrIf(1));
+    // Store addr = out_seq + 4*i (the I32Store adds SEQ_HEADER_SIZE).
+    body.instruction(&Instruction::LocalGet(out_slot));
+    body.instruction(&Instruction::LocalGet(i_slot));
+    body.instruction(&Instruction::I32Const(4));
+    body.instruction(&Instruction::I32Mul);
+    body.instruction(&Instruction::I32Add);
+    // Load source element address = in_seq + 4 * src_idx.
+    body.instruction(&Instruction::LocalGet(in_slot));
+    compute_src_idx(body, i_slot, in_len_slot);
+    body.instruction(&Instruction::I32Const(4));
+    body.instruction(&Instruction::I32Mul);
+    body.instruction(&Instruction::I32Add);
+    body.instruction(&Instruction::I32Load(i32_at(SEQ_HEADER_SIZE as u64)));
+    body.instruction(&Instruction::I32Store(i32_at(SEQ_HEADER_SIZE as u64)));
+    // i += 1
+    body.instruction(&Instruction::LocalGet(i_slot));
+    body.instruction(&Instruction::I32Const(1));
+    body.instruction(&Instruction::I32Add);
+    body.instruction(&Instruction::LocalSet(i_slot));
+    body.instruction(&Instruction::Br(0));
+    body.instruction(&Instruction::End); // end loop
+    body.instruction(&Instruction::End); // end block
+    body.instruction(&Instruction::LocalGet(out_slot));
+    body.instruction(&Instruction::End); // end else (null-guard)
 }
 
 /// Emit signed i64 division with Backus's ÷ semantics: b == 0 yields
@@ -580,6 +681,81 @@ fn emit_body(
             body.instruction(&Instruction::End);
             body.instruction(&Instruction::End);
         }
+
+        // Backus §11.2.3 unary Seq transformers. All four share the
+        // allocate-and-copy skeleton in `emit_unary_seq_map`; they
+        // differ only in out_len and the src_idx mapping.
+        //
+        //   tl:<x₁,...,xₙ>       = <x₂,...,xₙ>       (out_len = max(in_len-1, 0))
+        //   reverse:<x₁,...,xₙ>  = <xₙ,...,x₁>       (out_len = in_len)
+        //   rotl:<x₁,...,xₙ>     = <x₂,...,xₙ,x₁>    (out_len = in_len)
+        //   rotr:<x₁,...,xₙ>     = <xₙ,x₁,...,xₙ₋₁> (out_len = in_len)
+        //
+        // Empty/null input yields an empty Seq. Rot's modulo uses
+        // i32.rem_u which would trap on divisor 0 — safe because
+        // the loop never executes when in_len == 0.
+        Func::Tail => emit_unary_seq_map(
+            body, next_scratch,
+            // out_len = in_len - (in_len > 0 ? 1 : 0)  (saturated subtract)
+            |body, in_len_slot| {
+                body.instruction(&Instruction::LocalGet(in_len_slot));
+                body.instruction(&Instruction::LocalGet(in_len_slot));
+                body.instruction(&Instruction::I32Const(0));
+                body.instruction(&Instruction::I32GtS);
+                body.instruction(&Instruction::I32Sub);
+            },
+            // src_idx = i + 1
+            |body, i_slot, _in_len_slot| {
+                body.instruction(&Instruction::LocalGet(i_slot));
+                body.instruction(&Instruction::I32Const(1));
+                body.instruction(&Instruction::I32Add);
+            },
+        ),
+        Func::Reverse => emit_unary_seq_map(
+            body, next_scratch,
+            // out_len = in_len
+            |body, in_len_slot| {
+                body.instruction(&Instruction::LocalGet(in_len_slot));
+            },
+            // src_idx = in_len - 1 - i
+            |body, i_slot, in_len_slot| {
+                body.instruction(&Instruction::LocalGet(in_len_slot));
+                body.instruction(&Instruction::I32Const(1));
+                body.instruction(&Instruction::I32Sub);
+                body.instruction(&Instruction::LocalGet(i_slot));
+                body.instruction(&Instruction::I32Sub);
+            },
+        ),
+        Func::RotL => emit_unary_seq_map(
+            body, next_scratch,
+            |body, in_len_slot| {
+                body.instruction(&Instruction::LocalGet(in_len_slot));
+            },
+            // src_idx = (i + 1) % in_len
+            |body, i_slot, in_len_slot| {
+                body.instruction(&Instruction::LocalGet(i_slot));
+                body.instruction(&Instruction::I32Const(1));
+                body.instruction(&Instruction::I32Add);
+                body.instruction(&Instruction::LocalGet(in_len_slot));
+                body.instruction(&Instruction::I32RemU);
+            },
+        ),
+        Func::RotR => emit_unary_seq_map(
+            body, next_scratch,
+            |body, in_len_slot| {
+                body.instruction(&Instruction::LocalGet(in_len_slot));
+            },
+            // src_idx = (i + in_len - 1) % in_len
+            |body, i_slot, in_len_slot| {
+                body.instruction(&Instruction::LocalGet(i_slot));
+                body.instruction(&Instruction::LocalGet(in_len_slot));
+                body.instruction(&Instruction::I32Add);
+                body.instruction(&Instruction::I32Const(1));
+                body.instruction(&Instruction::I32Sub);
+                body.instruction(&Instruction::LocalGet(in_len_slot));
+                body.instruction(&Instruction::I32RemU);
+            },
+        ),
 
         // c̄:x = c (when x ≠ ⊥) — drop input ptr, allocate fresh Atom.
         Func::Constant(Object::Atom(s)) => {
@@ -1043,10 +1219,10 @@ mod tests {
 
     #[test]
     fn lower_rejects_unsupported_variant() {
-        // Tail isn't wired yet — loop-based unary seq transformers
-        // are the next group (Tail/Reverse/RotL/RotR).
-        let f = Func::Tail;
-        let err = lower_to_wasm(&f).expect_err("Tail should be marked unsupported");
+        // ApndL isn't wired yet — pair → new Seq. Binary seq ops
+        // (ApndL/ApndR/Concat) are the next group.
+        let f = Func::ApndL;
+        let err = lower_to_wasm(&f).expect_err("ApndL should be marked unsupported");
         assert!(err.contains("not yet supported"));
     }
 
@@ -1554,6 +1730,104 @@ mod tests {
             Box::new(pair(3, 5)),
         );
         assert_eq!(roundtrip(&f2, 0), 200);
+    }
+
+    // ── Unary Seq transformers (Tail, Reverse, RotL, RotR) ────────
+
+    /// Small helper to build a Seq literal from an i64 list for test setup.
+    fn seq_of_atoms(values: &[i64]) -> Func {
+        Func::Construction(
+            values.iter()
+                .map(|v| Func::Constant(Object::atom(&v.to_string())))
+                .collect()
+        )
+    }
+
+    #[test]
+    fn lower_tail_drops_first_element() {
+        // tl:<10, 20, 30> = <20, 30>.
+        let f = Func::Compose(
+            Box::new(Func::Tail),
+            Box::new(seq_of_atoms(&[10, 20, 30])),
+        );
+        assert_eq!(roundtrip_seq(&f, 0), vec![20, 30]);
+    }
+
+    #[test]
+    fn lower_tail_of_single_element_returns_empty_seq() {
+        // tl:<x> = <>.
+        let f = Func::Compose(
+            Box::new(Func::Tail),
+            Box::new(seq_of_atoms(&[99])),
+        );
+        assert_eq!(roundtrip_seq(&f, 0), Vec::<i64>::new());
+    }
+
+    #[test]
+    fn lower_tail_of_empty_is_empty() {
+        // tl:<> = <> via saturated subtract on in_len.
+        let f = Func::Compose(
+            Box::new(Func::Tail),
+            Box::new(seq_of_atoms(&[])),
+        );
+        assert_eq!(roundtrip_seq(&f, 0), Vec::<i64>::new());
+    }
+
+    #[test]
+    fn lower_reverse_flips_element_order() {
+        // reverse:<1, 2, 3, 4> = <4, 3, 2, 1>.
+        let f = Func::Compose(
+            Box::new(Func::Reverse),
+            Box::new(seq_of_atoms(&[1, 2, 3, 4])),
+        );
+        assert_eq!(roundtrip_seq(&f, 0), vec![4, 3, 2, 1]);
+    }
+
+    #[test]
+    fn lower_reverse_of_empty_is_empty() {
+        let f = Func::Compose(Box::new(Func::Reverse), Box::new(seq_of_atoms(&[])));
+        assert_eq!(roundtrip_seq(&f, 0), Vec::<i64>::new());
+    }
+
+    #[test]
+    fn lower_reverse_of_single_is_self() {
+        let f = Func::Compose(Box::new(Func::Reverse), Box::new(seq_of_atoms(&[7])));
+        assert_eq!(roundtrip_seq(&f, 0), vec![7]);
+    }
+
+    #[test]
+    fn lower_rotl_shifts_head_to_tail() {
+        // rotl:<1, 2, 3> = <2, 3, 1>.
+        let f = Func::Compose(Box::new(Func::RotL), Box::new(seq_of_atoms(&[1, 2, 3])));
+        assert_eq!(roundtrip_seq(&f, 0), vec![2, 3, 1]);
+    }
+
+    #[test]
+    fn lower_rotl_preserves_empty_and_singleton() {
+        assert_eq!(roundtrip_seq(&Func::Compose(Box::new(Func::RotL), Box::new(seq_of_atoms(&[]))), 0),
+            Vec::<i64>::new());
+        assert_eq!(roundtrip_seq(&Func::Compose(Box::new(Func::RotL), Box::new(seq_of_atoms(&[7]))), 0),
+            vec![7]);
+    }
+
+    #[test]
+    fn lower_rotr_shifts_tail_to_head() {
+        // rotr:<1, 2, 3> = <3, 1, 2>.
+        let f = Func::Compose(Box::new(Func::RotR), Box::new(seq_of_atoms(&[1, 2, 3])));
+        assert_eq!(roundtrip_seq(&f, 0), vec![3, 1, 2]);
+    }
+
+    #[test]
+    fn lower_rotr_is_inverse_of_rotl() {
+        // rotr ∘ rotl:<1,2,3,4,5> = <1,2,3,4,5>.
+        let f = Func::Compose(
+            Box::new(Func::RotR),
+            Box::new(Func::Compose(
+                Box::new(Func::RotL),
+                Box::new(seq_of_atoms(&[1, 2, 3, 4, 5])),
+            )),
+        );
+        assert_eq!(roundtrip_seq(&f, 0), vec![1, 2, 3, 4, 5]);
     }
 
     // ── Structural predicates (AtomTest, NullTest, Length) ────────
