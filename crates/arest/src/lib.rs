@@ -35,16 +35,196 @@ pub mod wasm_lower;
 #[cfg(feature = "cloudflare")]
 pub mod cloudflare;
 
-/// D: the unified state — population cells + def cells in one Object.
-/// Backus Sec. 14.3: "the state D of an AST system."
+/// D: the unified state — population cells + def cells, split into
+/// per-cell `Arc<RwLock<Object>>`. Backus Sec. 14.3 state-as-cells,
+/// but with each cell independently lockable so disjoint writers
+/// don't serialize through a single tenant-wide lock.
+///
+/// Access patterns:
+///   - Reads:  `snapshot_d(&self)` builds a consistent Object::Map
+///             view by acquiring every cell's read lock briefly.
+///   - Whole-state writes (compile, rollback): `replace_d(&mut self,
+///             new_d)` rebuilds the cells map. Requires the outer
+///             `RwLock<CompiledState>::write()` guard.
+///   - Targeted writes (create/update/transition): `try_commit_diff(
+///             &self, snapshot, new_d)` acquires per-cell write
+///             locks for only the cells that changed. CAS-checks
+///             each against the snapshot; returns an error if any
+///             cell changed meanwhile (caller retries) or if new
+///             cells must be added (caller escalates to `write()`).
+///             Needs only the outer `read()` guard, so two disjoint-
+///             cell writers run in parallel.
 ///
 /// `snapshots` holds named captures of `d` taken via `system(h,
 /// "snapshot", "")` and restorable via `system(h, "rollback", id)`.
-/// Cheap in memory because `d` is `Arc`-shared internally —
-/// a snapshot is one map insert plus an Arc ref bump per cell.
+/// Cheap in memory because cells share `Arc` storage — a snapshot
+/// is one map insert plus an Arc ref bump per cell.
 struct CompiledState {
-    d: ast::Object,
+    cells: std::collections::HashMap<String, Arc<RwLock<ast::Object>>>,
     snapshots: std::collections::HashMap<String, ast::Object>,
+}
+
+/// Outcome of a targeted-write attempt via `try_commit_diff`.
+enum CommitOutcome {
+    /// All cell-level CAS checks passed; the writes have been applied.
+    Committed,
+    /// One or more cells changed between snapshot and commit. The
+    /// caller should re-snapshot, re-run apply(), and retry.
+    StaleSnapshot,
+    /// The new state introduces cells that don't exist yet, or
+    /// removes existing cells. The cells map itself must be mutated,
+    /// which requires the outer write guard. Caller should escalate.
+    StructuralChange,
+}
+
+impl CompiledState {
+    fn new(initial_d: ast::Object) -> Self {
+        let mut s = Self {
+            cells: std::collections::HashMap::new(),
+            snapshots: std::collections::HashMap::new(),
+        };
+        s.replace_d(initial_d);
+        s
+    }
+
+    /// Assemble an `Object::Map` view of the full state. Each cell's
+    /// read lock is held briefly for the clone; readers don't block
+    /// each other, but a writer on that cell will block the snapshot
+    /// momentarily.
+    fn snapshot_d(&self) -> ast::Object {
+        let mut map = std::collections::HashMap::with_capacity(self.cells.len());
+        for (name, lock) in &self.cells {
+            map.insert(name.clone(), lock.read().unwrap().clone());
+        }
+        ast::Object::Map(map)
+    }
+
+    /// Wholesale rebuild the cell map from a new D. Reuses existing
+    /// cell locks where possible (so concurrent readers still see a
+    /// live `Arc<RwLock>` rather than a freed one), then prunes any
+    /// cells absent from the new state.
+    fn replace_d(&mut self, new_d: ast::Object) {
+        let new_map: std::collections::HashMap<String, ast::Object> = match new_d {
+            ast::Object::Map(m) => m,
+            ast::Object::Seq(seq) => {
+                // CELL-triple representation: <<CELL, name, contents>, …>.
+                // Fall through to an empty map if the shape doesn't match.
+                let mut m = std::collections::HashMap::new();
+                for cell in seq.iter() {
+                    if let Some(items) = cell.as_seq() {
+                        if items.len() == 3 {
+                            if let (Some(_), Some(name)) = (
+                                items[0].as_atom(),
+                                items[1].as_atom(),
+                            ) {
+                                m.insert(name.to_string(), items[2].clone());
+                            }
+                        }
+                    }
+                }
+                m
+            }
+            ast::Object::Bottom => std::collections::HashMap::new(),
+            other => {
+                // Unexpected shape — store the whole thing under a
+                // sentinel cell so we don't silently drop it.
+                let mut m = std::collections::HashMap::new();
+                m.insert("__unshaped__".to_string(), other);
+                m
+            }
+        };
+        // Reuse existing locks where possible; replace contents under
+        // the per-cell write lock.
+        let mut next_cells: std::collections::HashMap<String, Arc<RwLock<ast::Object>>> =
+            std::collections::HashMap::with_capacity(new_map.len());
+        for (name, value) in new_map {
+            match self.cells.remove(&name) {
+                Some(existing) => {
+                    *existing.write().unwrap() = value;
+                    next_cells.insert(name, existing);
+                }
+                None => {
+                    next_cells.insert(name, Arc::new(RwLock::new(value)));
+                }
+            }
+        }
+        // Any cell still in self.cells was removed by the new state;
+        // dropped implicitly.
+        self.cells = next_cells;
+    }
+
+    /// Targeted commit: write only the cells whose contents differ
+    /// between `snapshot` (what apply() saw) and `new_d` (what apply()
+    /// returned). Each changed cell is CAS-checked against the
+    /// snapshot value before writing to detect stale snapshots.
+    ///
+    /// Requires only `&self` because the cells-map structure isn't
+    /// mutated — only per-cell contents. Callers should therefore
+    /// hold `RwLock<CompiledState>::read()`, which lets concurrent
+    /// writers to disjoint cells proceed without contending on the
+    /// outer lock.
+    ///
+    /// Returns `Committed` on success, `StaleSnapshot` when another
+    /// writer modified one of the target cells between snapshot and
+    /// commit (caller should retry), or `StructuralChange` when new
+    /// cells must be introduced or existing cells removed (caller
+    /// must escalate to `write()` and use `replace_d`).
+    fn try_commit_diff(&self, snapshot: &ast::Object, new_d: &ast::Object) -> CommitOutcome {
+        let snap_map = match snapshot.as_map() {
+            Some(m) => m,
+            None => return CommitOutcome::StructuralChange,
+        };
+        let new_map = match new_d.as_map() {
+            Some(m) => m,
+            None => return CommitOutcome::StructuralChange,
+        };
+        // Detect structural change: added or removed cells require
+        // the outer write lock to mutate the cells map.
+        for key in new_map.keys() {
+            if !self.cells.contains_key(key) {
+                return CommitOutcome::StructuralChange;
+            }
+        }
+        for key in self.cells.keys() {
+            if !new_map.contains_key(key) {
+                return CommitOutcome::StructuralChange;
+            }
+        }
+        // Collect changed cells.
+        let mut changed: Vec<&String> = new_map
+            .iter()
+            .filter(|(k, v)| snap_map.get(*k) != Some(*v))
+            .map(|(k, _)| k)
+            .collect();
+        if changed.is_empty() {
+            return CommitOutcome::Committed; // no-op
+        }
+        // Sort for deterministic lock acquisition (deadlock avoidance
+        // between concurrent writers with overlapping cell sets).
+        changed.sort();
+        // Acquire write locks in order.
+        let mut guards: Vec<(&String, std::sync::RwLockWriteGuard<'_, ast::Object>)> =
+            Vec::with_capacity(changed.len());
+        for key in changed {
+            let lock = self.cells.get(key).expect("membership was checked above");
+            let guard = lock.write().unwrap();
+            guards.push((key, guard));
+        }
+        // CAS: every changed cell's current contents must still match
+        // the snapshot; otherwise someone committed under us.
+        for (key, guard) in &guards {
+            let expected = snap_map.get(*key);
+            if Some(&**guard) != expected {
+                return CommitOutcome::StaleSnapshot;
+            }
+        }
+        // Apply the writes under the already-held guards.
+        for (key, guard) in guards.iter_mut() {
+            let new_value = new_map.get(*key).expect("membership was checked above").clone();
+            **guard = new_value;
+        }
+        CommitOutcome::Committed
+    }
 }
 
 // The per-handle process table:
@@ -76,7 +256,7 @@ fn allocate(state: ast::Object, defs: Vec<(String, ast::Func)>) -> u32 {
     let d = ast::defs_to_state(&defs, &state);
     let mut s = ds().lock().unwrap();
     let h = s.iter().position(|x| x.is_none()).unwrap_or_else(|| { s.push(None); s.len() - 1 });
-    s[h] = Some(Arc::new(RwLock::new(CompiledState { d, snapshots: std::collections::HashMap::new() })));
+    s[h] = Some(Arc::new(RwLock::new(CompiledState::new(d))));
     h as u32
 }
 
@@ -203,7 +383,7 @@ fn create_impl() -> u32 {
     let d = metamodel_state().clone();
     let mut s = ds().lock().unwrap();
     let h = s.iter().position(|x| x.is_none()).unwrap_or_else(|| { s.push(None); s.len() - 1 });
-    s[h] = Some(Arc::new(RwLock::new(CompiledState { d, snapshots: std::collections::HashMap::new() })));
+    s[h] = Some(Arc::new(RwLock::new(CompiledState::new(d))));
     h as u32
 }
 
@@ -276,7 +456,7 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
         } else {
             input.to_string()
         };
-        let snap = st.d.clone();
+        let snap = st.snapshot_d();
         st.snapshots.insert(label.clone(), snap);
         return label;
     }
@@ -284,7 +464,7 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
         let mut st = tenant.write().unwrap();
         return match st.snapshots.get(input).cloned() {
             Some(snap) => {
-                st.d = snap;
+                st.replace_d(snap);
                 input.to_string()
             }
             None => "⊥".into(),
@@ -310,60 +490,111 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
     if is_read_only_op(key) {
         let st = tenant.read().unwrap();
         let obj = ast::Object::parse(input);
-        let result = ast::apply(&ast::Func::Def(key.to_string()), &obj, &st.d);
+        let snapshot = st.snapshot_d();
+        let result = ast::apply(&ast::Func::Def(key.to_string()), &obj, &snapshot);
         return result.to_json_string();
     }
 
     // ── Write dispatch path ─────────────────────────────────────────
-    let mut st = tenant.write().unwrap();
+    //
+    // Two-tier commit:
+    //   Tier 1 (shared-lock fast path): acquire tenant.read(), snapshot,
+    //     apply, classify the result, and try `try_commit_diff` — this
+    //     writes only the cells whose contents actually changed, each
+    //     under its own per-cell write lock. Two disjoint-cell writers
+    //     run in parallel; same-cell writers serialize on the cell lock.
+    //   Tier 2 (exclusive-lock escalation): on Stale/Structural outcome,
+    //     drop the read, take tenant.write(), re-snapshot + re-apply +
+    //     `replace_d`. Structural = new or removed cells; Stale = a
+    //     concurrent writer's CAS check detected that our snapshot is
+    //     no longer current.
+    //
+    // Re-running apply() on the escalated path is idempotent: apply is
+    // functional on `&Object`; the cost is the second evaluation, paid
+    // only on contention.
     let obj = ast::Object::parse(input);
 
-    // Single ρ-dispatch (Eq. 9)
-    let result = ast::apply(&ast::Func::Def(key.to_string()), &obj, &st.d);
+    // Tier 1: shared-lock fast path.
+    {
+        let st = tenant.read().unwrap();
+        let snapshot = st.snapshot_d();
+        let apply_result = ast::apply(&ast::Func::Def(key.to_string()), &obj, &snapshot);
+        match classify_writer_result(&apply_result) {
+            WriterResult::NoCommit { response } => return response,
+            WriterResult::Commit { ref new_d, .. } => {
+                match st.try_commit_diff(&snapshot, new_d) {
+                    CommitOutcome::Committed => {
+                        if let WriterResult::Commit { response, .. } = classify_writer_result(&apply_result) {
+                            return response;
+                        }
+                        unreachable!("classify is deterministic");
+                    }
+                    CommitOutcome::StaleSnapshot | CommitOutcome::StructuralChange => {
+                        // fall through to Tier 2
+                    }
+                }
+            }
+        }
+    }
 
-    // AST state transition (⟨o, D'⟩) — three result shapes to handle:
-    //
-    // 1. CommandResult carrier: Object::Map with __state + __result keys,
-    //    emitted by encode_command_result for create/update/transition.
-    //    Persist __state into the handle; return the __result JSON atom.
-    //
-    // 2. New D directly: a store (Map or Seq) containing a Noun cell —
-    //    emitted by platform_compile. Persist it; return the default
-    //    display representation (FFP). Callers that need JSON should use
-    //    dedicated defs (debug, list:{noun}, get:{noun}, query:{ft_id}).
-    //
-    // 3. Anything else: a pure query result. Return display, don't persist.
+    // Tier 2: exclusive-lock escalation.
+    let mut st = tenant.write().unwrap();
+    let snapshot = st.snapshot_d();
+    let apply_result = ast::apply(&ast::Func::Def(key.to_string()), &obj, &snapshot);
+    match classify_writer_result(&apply_result) {
+        WriterResult::NoCommit { response } => response,
+        WriterResult::Commit { new_d, response } => {
+            st.replace_d(new_d);
+            response
+        }
+    }
+}
+
+/// Outcome of classifying an `ast::apply` result in the write path.
+enum WriterResult {
+    /// Result is a full new D (possibly extracted from a `__state`
+    /// carrier), to be persisted.
+    Commit { new_d: ast::Object, response: String },
+    /// Result is a query / non-D response; nothing to persist.
+    NoCommit { response: String },
+}
+
+/// Classify an apply() result according to the three writer-path
+/// shapes the system recognises. Pure: no tenant mutation; callers
+/// decide whether to commit under Tier-1 or Tier-2 locks.
+///
+/// Shapes:
+///   1. CommandResult carrier `{__state, __result}` — used by
+///      create/update/transition. Commit __state if it looks like a
+///      valid store; return __result as the response.
+///   2. Bare store with a Noun cell — used by platform_compile.
+///      Commit the result; return a compact summary.
+///   3. Anything else — pure query result; return as JSON.
+fn classify_writer_result(result: &ast::Object) -> WriterResult {
     if let Some(map) = result.as_map() {
         if map.contains_key("__state") && map.contains_key("__result") {
             let new_state = map.get("__state").cloned().unwrap_or(ast::Object::Bottom);
-            let response = map.get("__result").cloned().unwrap_or(ast::Object::Bottom);
-            let new_state_looks_valid =
-                (new_state.as_map().is_some() || new_state.as_seq().is_some())
+            let response_obj = map.get("__result").cloned().unwrap_or(ast::Object::Bottom);
+            let response = response_obj.as_atom().map(|s| s.to_string())
+                .unwrap_or_else(|| response_obj.to_string());
+            let valid = (new_state.as_map().is_some() || new_state.as_seq().is_some())
                 && ast::fetch("Noun", &new_state) != ast::Object::Bottom;
-            if new_state_looks_valid {
-                st.d = new_state;
+            if valid {
+                return WriterResult::Commit { new_d: new_state, response };
             }
-            return response.as_atom().map(|s| s.to_string())
-                .unwrap_or_else(|| response.to_string());
+            return WriterResult::NoCommit { response };
         }
     }
     let looks_like_store = result.as_seq().is_some() || result.as_map().is_some();
-    let is_new_d = looks_like_store && ast::fetch("Noun", &result) != ast::Object::Bottom;
-
+    let is_new_d = looks_like_store
+        && ast::fetch("Noun", result) != ast::Object::Bottom;
     if is_new_d {
-        // Platform compile returns a full D. Persist it; respond with a
-        // tiny JSON summary rather than dumping the store (which can be
-        // megabytes at realistic scale). Call `debug` to query the full
-        // schema if needed.
-        st.d = result.clone();
-        return r#"{"ok":true,"compiled":true}"#.to_string();
+        return WriterResult::Commit {
+            new_d: result.clone(),
+            response: r#"{"ok":true,"compiled":true}"#.to_string(),
+        };
     }
-
-    // Non-D results: serialize as JSON. Atoms that already parse as JSON
-    // are passed through; other atoms become JSON strings; seqs → arrays;
-    // maps → objects; bottom → null. MCP and HTTP callers can always
-    // JSON.parse the response.
-    result.to_json_string()
+    WriterResult::NoCommit { response: result.to_json_string() }
 }
 
 // ── WIT Component exports ───────────────────────────────────────────
@@ -394,7 +625,7 @@ impl exports::arest::engine::engine::Guest for E {
 // Each create_impl() call allocates a fresh slot (reusing holes left by
 // release_impl) and returns its index as the opaque handle. State is stored
 // by-value (ast::Object is owned — no Arc, no &'static references escape),
-// and every system_impl() read scopes its &st.d reference to the lifetime of
+// and every system_impl() read scopes its snapshot to the lifetime of
 // the Mutex guard, so no cross-handle aliasing is possible.
 //
 // Invariants verified below:
@@ -417,14 +648,15 @@ impl exports::arest::engine::engine::Guest for E {
 mod handle_isolation_tests {
     use super::*;
 
-    /// Test-only peek at a handle's compiled state. Clones D under a
-    /// shared (read) lock so the caller holds no reference to DOMAINS
-    /// nor to the per-tenant guard. Read-only; doesn't block other
-    /// readers on the same handle.
+    /// Test-only peek at a handle's compiled state. Takes a shared
+    /// (read) lock and assembles an Object::Map snapshot from the
+    /// per-cell locks; no DOMAINS / tenant references held after
+    /// return. Read-only; doesn't block other readers on the same
+    /// handle.
     fn peek(handle: u32) -> Option<ast::Object> {
         let tenant = tenant_lock(handle)?;
         let st = tenant.read().unwrap();
-        Some(st.d.clone())
+        Some(st.snapshot_d())
     }
 
     /// Install a Noun cell with the given payload directly, bypassing the
@@ -459,12 +691,13 @@ mod handle_isolation_tests {
         {
             let tenant_a = tenant_lock(h_a).expect("handle A must be live");
             let mut st = tenant_a.write().unwrap();
+            let snapshot = st.snapshot_d();
             let new_d = ast::store(
                 "Noun",
                 ast::Object::atom("tenant-a-mutated"),
-                &st.d.clone(),
+                &snapshot,
             );
-            st.d = new_d;
+            st.replace_d(new_d);
         }
 
         let d_a2 = peek(h_a).unwrap();
@@ -727,7 +960,7 @@ Order has total.
         {
             let tenant = tenant_lock(h).unwrap();
             let mut st = tenant.write().unwrap();
-            st.d = ast::store("Noun", ast::Object::atom("after"), &ast::Object::phi());
+            st.replace_d(ast::store("Noun", ast::Object::atom("after"), &ast::Object::phi()));
         }
         assert_eq!(
             ast::fetch("Noun", &peek(h).unwrap()),
@@ -754,11 +987,11 @@ Order has total.
             {
                 let tenant = tenant_lock(h).unwrap();
                 let mut st = tenant.write().unwrap();
-                st.d = ast::store(
+                st.replace_d(ast::store(
                     "Noun",
                     ast::Object::atom(&format!("mutation-{round}")),
                     &ast::Object::phi(),
-                );
+                ));
             }
             assert_eq!(system_impl(h, "rollback", "anchor"), "anchor");
             assert_eq!(
@@ -837,7 +1070,7 @@ Order has total.
             // guards. If the lock doesn't allow sharing, only one will
             // ever get here and the test hangs.
             barrier.wait();
-            let d = st.d.clone();
+            let d = st.snapshot_d();
             drop(st);
             d
         };
@@ -846,6 +1079,130 @@ Order has total.
         let t2 = thread::spawn(reader(h, barrier.clone()));
         let (d1, d2) = (t1.join().unwrap(), t2.join().unwrap());
         assert_eq!(d1, d2, "both readers saw the same state");
+        release_impl(h);
+    }
+
+    // ── Per-cell write locks: parallel disjoint-cell writes ────────
+
+    #[test]
+    fn disjoint_cell_writers_run_in_parallel_via_try_commit_diff() {
+        // Two threads attempt to write to DIFFERENT cells on the same
+        // handle. Under the per-cell-lock design, both should hold
+        // tenant.read() simultaneously (via a Barrier synchronization
+        // point), then each writes only its target cell through
+        // try_commit_diff. No tenant.write() escalation; both commit.
+        use std::sync::Barrier;
+        use std::thread;
+
+        // Seed the handle with cells Order + Customer alongside the
+        // Noun sentinel that `alloc_with_noun` installs. We need the
+        // cells to pre-exist so try_commit_diff's structural-change
+        // detector passes.
+        let h = alloc_with_noun("seed");
+        {
+            let tenant = tenant_lock(h).unwrap();
+            let mut st = tenant.write().unwrap();
+            let state = {
+                let s = ast::store("Noun", ast::Object::atom("seed"), &ast::Object::phi());
+                let s = ast::store("Order", ast::Object::atom("o0"), &s);
+                ast::store("Customer", ast::Object::atom("c0"), &s)
+            };
+            st.replace_d(state);
+        }
+
+        let barrier = Arc::new(Barrier::new(2));
+        let write = |h: u32, b: Arc<Barrier>, cell: &'static str, val: &'static str| move || -> CommitOutcome {
+            let tenant = tenant_lock(h).unwrap();
+            let st = tenant.read().unwrap();
+            let snapshot = st.snapshot_d();
+            let new_d = ast::store(cell, ast::Object::atom(val), &snapshot);
+            // Both writers reach the barrier while holding the shared
+            // tenant lock. If per-cell commit didn't work, either the
+            // snapshot or the commit would deadlock/serialize.
+            b.wait();
+            st.try_commit_diff(&snapshot, &new_d)
+        };
+
+        let t1 = thread::spawn(write(h, barrier.clone(), "Order", "o1"));
+        let t2 = thread::spawn(write(h, barrier.clone(), "Customer", "c1"));
+        let o1 = t1.join().unwrap();
+        let o2 = t2.join().unwrap();
+        assert!(matches!(o1, CommitOutcome::Committed),
+            "Order writer committed (got {:?})", o1 as u8);
+        assert!(matches!(o2, CommitOutcome::Committed),
+            "Customer writer committed (got {:?})", o2 as u8);
+
+        let d = peek(h).unwrap();
+        assert_eq!(ast::fetch("Order", &d), ast::Object::atom("o1"));
+        assert_eq!(ast::fetch("Customer", &d), ast::Object::atom("c1"));
+        assert_eq!(ast::fetch("Noun", &d), ast::Object::atom("seed"),
+            "untouched cell preserved");
+        release_impl(h);
+    }
+
+    #[test]
+    fn same_cell_cas_rejects_stale_snapshot() {
+        // Write contention on the same cell must NOT silently lose an
+        // update. Simulate: thread A snapshots at v0 and holds its
+        // snapshot while thread B completes a full v0 → v1 write. A
+        // then tries to commit v2 based on its stale snapshot.
+        // try_commit_diff must return StaleSnapshot so A retries (or
+        // escalates) rather than clobbering B's v1.
+        let h = alloc_with_noun("v0");
+
+        // A's snapshot, captured before B's write.
+        let stale_snapshot = {
+            let tenant = tenant_lock(h).unwrap();
+            let st = tenant.read().unwrap();
+            st.snapshot_d()
+        };
+
+        // B commits a full replacement to "v1-other".
+        {
+            let tenant = tenant_lock(h).unwrap();
+            let mut st = tenant.write().unwrap();
+            st.replace_d(ast::store(
+                "Noun",
+                ast::Object::atom("v1-other"),
+                &ast::Object::phi(),
+            ));
+        }
+
+        // A builds a new_d from its stale snapshot and tries to commit.
+        let attempted_new_d = ast::store(
+            "Noun",
+            ast::Object::atom("v2-us"),
+            &stale_snapshot,
+        );
+        let outcome = {
+            let tenant = tenant_lock(h).unwrap();
+            let st = tenant.read().unwrap();
+            st.try_commit_diff(&stale_snapshot, &attempted_new_d)
+        };
+        assert!(matches!(outcome, CommitOutcome::StaleSnapshot),
+            "stale snapshot must be rejected by CAS check");
+
+        // Noun still holds B's write; A's attempt was refused.
+        let d = peek(h).unwrap();
+        assert_eq!(ast::fetch("Noun", &d), ast::Object::atom("v1-other"));
+        release_impl(h);
+    }
+
+    #[test]
+    fn try_commit_diff_flags_structural_change_for_new_cells() {
+        // A commit that introduces a cell name not present in the
+        // current state must return StructuralChange — the cells map
+        // itself needs mutation, which requires tenant.write().
+        let h = alloc_with_noun("seed");
+        let tenant = tenant_lock(h).unwrap();
+        let st = tenant.read().unwrap();
+        let snapshot = st.snapshot_d();
+        // Add a NEW cell not in the snapshot.
+        let new_d = ast::store("Fresh", ast::Object::atom("unseen"), &snapshot);
+        let outcome = st.try_commit_diff(&snapshot, &new_d);
+        assert!(matches!(outcome, CommitOutcome::StructuralChange),
+            "adding a cell requires the outer write lock");
+        drop(st);
         release_impl(h);
     }
 
