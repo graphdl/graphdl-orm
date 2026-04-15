@@ -312,6 +312,10 @@ fn scratch_needed(func: &Func) -> u32 {
         // both operands on the WASM stack, i64 compare, extend to
         // i64, alloc_atom.
         Func::Eq | Func::Gt | Func::Lt | Func::Ge | Func::Le => 1,
+        // Logic: And/Or are pair-unary-truthy → i32.and/or;
+        // Not is unary-truthy → i32.eqz. Only And/Or need pair_slot.
+        Func::And | Func::Or => 1,
+        Func::Not => 0,
         _ => 0,
     }
 }
@@ -452,6 +456,51 @@ fn emit_body(
         Func::Lt => emit_binary_i64_compare(body, next_scratch, Instruction::I64LtS),
         Func::Ge => emit_binary_i64_compare(body, next_scratch, Instruction::I64GeS),
         Func::Le => emit_binary_i64_compare(body, next_scratch, Instruction::I64LeS),
+
+        // Backus §11.2.3 logic.
+        //
+        //   and:<y, z>  = 1 if truthy(y) ∧ truthy(z) else 0
+        //   or:<y, z>   = 1 if truthy(y) ∨ truthy(z) else 0
+        //   not:y       = 1 if ¬truthy(y) else 0
+        //
+        // For {0, 1} i32 values produced by truthy(), bitwise
+        // i32.and/or coincide with logical and/or. The result Atom
+        // can feed another logical op or flow through Condition.
+        Func::And => {
+            let pair_slot = next_scratch;
+            body.instruction(&Instruction::LocalSet(pair_slot));
+            body.instruction(&Instruction::LocalGet(pair_slot));
+            body.instruction(&Instruction::I32Load(i32_at(8)));
+            body.instruction(&Instruction::Call(FN_TRUTHY));
+            body.instruction(&Instruction::LocalGet(pair_slot));
+            body.instruction(&Instruction::I32Load(i32_at(12)));
+            body.instruction(&Instruction::Call(FN_TRUTHY));
+            body.instruction(&Instruction::I32And);
+            body.instruction(&Instruction::I64ExtendI32U);
+            body.instruction(&Instruction::Call(FN_ALLOC_ATOM));
+        }
+        Func::Or => {
+            let pair_slot = next_scratch;
+            body.instruction(&Instruction::LocalSet(pair_slot));
+            body.instruction(&Instruction::LocalGet(pair_slot));
+            body.instruction(&Instruction::I32Load(i32_at(8)));
+            body.instruction(&Instruction::Call(FN_TRUTHY));
+            body.instruction(&Instruction::LocalGet(pair_slot));
+            body.instruction(&Instruction::I32Load(i32_at(12)));
+            body.instruction(&Instruction::Call(FN_TRUTHY));
+            body.instruction(&Instruction::I32Or);
+            body.instruction(&Instruction::I64ExtendI32U);
+            body.instruction(&Instruction::Call(FN_ALLOC_ATOM));
+        }
+        Func::Not => {
+            // Unary: stack has one Object ptr. Call truthy (i32 0/1),
+            // invert via i32.eqz (which maps 0→1 and nonzero→0),
+            // extend, alloc Atom.
+            body.instruction(&Instruction::Call(FN_TRUTHY));
+            body.instruction(&Instruction::I32Eqz);
+            body.instruction(&Instruction::I64ExtendI32U);
+            body.instruction(&Instruction::Call(FN_ALLOC_ATOM));
+        }
 
         // c̄:x = c (when x ≠ ⊥) — drop input ptr, allocate fresh Atom.
         Func::Constant(Object::Atom(s)) => {
@@ -915,10 +964,11 @@ mod tests {
 
     #[test]
     fn lower_rejects_unsupported_variant() {
-        // And isn't wired yet — logical ops over pair/unary Atoms
-        // (same pattern as comparisons but through truthy() first).
-        let f = Func::And;
-        let err = lower_to_wasm(&f).expect_err("And should be marked unsupported");
+        // AtomTest isn't wired yet — structural predicates (AtomTest,
+        // NullTest) need a lookup on the Object tag rather than the
+        // truthiness of the value.
+        let f = Func::AtomTest;
+        let err = lower_to_wasm(&f).expect_err("AtomTest should be marked unsupported");
         assert!(err.contains("not yet supported"));
     }
 
@@ -1426,6 +1476,81 @@ mod tests {
             Box::new(pair(3, 5)),
         );
         assert_eq!(roundtrip(&f2, 0), 200);
+    }
+
+    // ── Logic (And/Or pair, Not unary) ────────────────────────────
+
+    #[test]
+    fn lower_and_returns_logical_conjunction_atom() {
+        // and:<y, z>: {0,0}→0, {0,1}→0, {1,0}→0, {1,1}→1. Exercises
+        // both-zero, one-zero, both-non-zero paths. Nonzero counts
+        // as truthy regardless of magnitude.
+        let and = |a: i64, b: i64| Func::Compose(Box::new(Func::And), Box::new(pair(a, b)));
+        assert_eq!(roundtrip(&and(0, 0), 0), 0);
+        assert_eq!(roundtrip(&and(1, 0), 0), 0);
+        assert_eq!(roundtrip(&and(0, 1), 0), 0);
+        assert_eq!(roundtrip(&and(1, 1), 0), 1);
+        assert_eq!(roundtrip(&and(42, -7), 0), 1);  // both nonzero → truthy
+    }
+
+    #[test]
+    fn lower_or_returns_logical_disjunction_atom() {
+        let or = |a: i64, b: i64| Func::Compose(Box::new(Func::Or), Box::new(pair(a, b)));
+        assert_eq!(roundtrip(&or(0, 0), 0), 0);
+        assert_eq!(roundtrip(&or(1, 0), 0), 1);
+        assert_eq!(roundtrip(&or(0, 1), 0), 1);
+        assert_eq!(roundtrip(&or(-5, 0), 0), 1);    // negative nonzero → truthy
+    }
+
+    #[test]
+    fn lower_not_flips_truthiness_of_unary_atom() {
+        // not:x = 1 if x is falsy, 0 if truthy. Unary input, no pair.
+        let f = Func::Compose(Box::new(Func::Not), Box::new(Func::Id));
+        assert_eq!(roundtrip(&f, 0), 1);    // Atom 0 is falsy
+        assert_eq!(roundtrip(&f, 42), 0);   // Atom 42 is truthy
+        assert_eq!(roundtrip(&f, -1), 0);   // nonzero is truthy
+    }
+
+    #[test]
+    fn lower_double_negation_restores_truthiness() {
+        // not ∘ not = truthy-indicator. Identity on {0, 1} inputs,
+        // coerces any nonzero to 1.
+        let f = Func::Compose(Box::new(Func::Not), Box::new(Func::Not));
+        assert_eq!(roundtrip(&f, 0), 0);
+        assert_eq!(roundtrip(&f, 1), 1);
+        assert_eq!(roundtrip(&f, 42), 1);   // coerces
+    }
+
+    #[test]
+    fn lower_logic_composes_with_comparisons() {
+        // (Gt ∘ <id, 5>) and (Lt ∘ <id, 10>) then And:
+        // Accept input iff 5 < input < 10.
+        // The chain:
+        //   pair = <Gt(x, 5), Lt(x, 10)>
+        //   result = And(pair)
+        let in_range = Func::Compose(
+            Box::new(Func::And),
+            Box::new(Func::Construction(vec![
+                Func::Compose(
+                    Box::new(Func::Gt),
+                    Box::new(Func::Construction(vec![
+                        Func::Id,
+                        Func::Constant(Object::atom("5")),
+                    ])),
+                ),
+                Func::Compose(
+                    Box::new(Func::Lt),
+                    Box::new(Func::Construction(vec![
+                        Func::Id,
+                        Func::Constant(Object::atom("10")),
+                    ])),
+                ),
+            ])),
+        );
+        assert_eq!(roundtrip(&in_range, 7), 1);
+        assert_eq!(roundtrip(&in_range, 5), 0);    // boundary (Gt is strict)
+        assert_eq!(roundtrip(&in_range, 10), 0);
+        assert_eq!(roundtrip(&in_range, 42), 0);
     }
 
     // ── Insert ────────────────────────────────────────────────────
