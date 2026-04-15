@@ -159,7 +159,7 @@ describe('BroadcastDO registry', () => {
     })
   })
 
-  describe('openSseStream — end-to-end smoke (#116)', () => {
+  describe('openSseStream — end-to-end smoke', () => {
     it('returns 400 without a domain query param', async () => {
       const reg = createRegistry()
       const req = new Request('https://do/events')
@@ -246,7 +246,7 @@ describe('BroadcastDO registry', () => {
       expect(listSubscribers(reg)).toHaveLength(0)
     })
 
-    // ── Cross-origin SSE through a proxy (#131 apis catch-all) ─────
+    // ── Cross-origin SSE through a proxy (apis catch-all) ─────────
     //
     // The apis worker wraps every /arest/* response:
     //   const wrapped = new Response(response.body, response)

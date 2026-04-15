@@ -4435,7 +4435,7 @@ mod schema_tests {
         assert!(!field_map.contains_key("notes"), "notes should not have a schema mapping");
     }
 
-    /// Bug #105: When two SMs share a status name (e.g. both Order and
+    /// When two SMs share a status name (e.g. both Order and
     /// Notification declare "Delivered"), the old Pass 3 heuristic
     /// (`from OR to` in sm.statuses) would misassign the Notification
     /// transition `confirm-delivery (Sent → Delivered)` to the Order SM

@@ -118,7 +118,7 @@ Emitted only when the noun has a State Machine Definition (Theorem 4a — transi
 
 Emitted per binary fact type `f` the noun participates in (Theorem 4b navigation):
 
-- `GET  /{plural}/{id}/{other-plural}` — related collection of the co-participating noun. Currently skips ring fact types (same noun on both roles) and collapses multiple binaries between the same pair into one route; #147 adds verb-based disambiguation.
+- `GET  /{plural}/{id}/{other-plural}` — related collection of the co-participating noun. Ring fact types and multiple binaries between the same noun pair are disambiguated by a verb-derived slug.
 
 ### Plural slug resolution
 
@@ -184,16 +184,7 @@ GET /api/events?domain={domain}&noun={noun}&entityId={entityId}
 
 Every field is optional (except `domain`) — narrower filters receive fewer events. Server-Sent Events frames carry the `CellEvent` JSON (one event per matching mutation). Wire this to TanStack Query cache invalidation, or a Redux middleware, or an EventSource directly.
 
-Post-mutation hooks in the entity CRUD handlers fire a publish for every committed create/delete; the transition write path fires a `transition` event too. See `src/broadcast-do.ts` and docs/11-system-as-os-kernel.md §Signals.
-
-### Known limitations
-
-Tracked as tasks and explicitly noted in the doc so consumers don't assume they're bugs:
-
-- **#147** Ring binary fact types (e.g. `Employee reports to Employee`) don't emit navigation routes — direction disambiguation needs the verb text. Both sides currently skipped.
-- **#147** Multiple binaries between the same noun pair collapse to one related-collection route via HashSet dedupe. Pick the reading you want to expose first, or follow the task for full disambiguation.
-- **#148** `/{plural}/{id}/explain` (derivation trace) and `/{plural}/{id}/actions` (transition link list as a standalone endpoint) are not yet emitted.
-- **#149** Server handlers still return bare entities. The envelope is the declared contract; handlers catch up as part of #149.
+Post-mutation hooks in the entity CRUD handlers fire a publish for every committed create/delete; the transition write path fires a `transition` event too. See `src/broadcast-do.ts`.
 
 ## XSD
 

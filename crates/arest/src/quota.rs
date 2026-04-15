@@ -2,9 +2,9 @@
 //
 // Per-App resource quotas — the kernel's cgroup-equivalent.
 //
-// Per docs/11-system-as-os-kernel.md §Per-App namespacing: Apps are
-// containers. A noisy App's runaway derivation chain shouldn't be
-// able to starve other Apps; the kernel enforces ceilings.
+// Per-App namespacing: Apps are containers. A noisy App's runaway
+// derivation chain shouldn't be able to starve other Apps; the
+// kernel enforces ceilings.
 //
 // Three accountable resources:
 //   - audit-log entries  (count of audit_log cell entries)

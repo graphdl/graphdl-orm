@@ -116,7 +116,7 @@ It is obligatory that each Task has exactly one Priority.
 
 ## Derivation Rules
 
-Milestone has Completion Percent := count of Task where Task targets that Milestone and Task has Status 'Done' divided by count of Task where Task targets that Milestone.
+* Milestone has Completion Percent iff Completion Percent is the count of Task where Task targets that Milestone and Task has Status 'Done' divided by the count of Task where Task targets that Milestone.
 
 ## Instance Facts
 

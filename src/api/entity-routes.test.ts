@@ -125,7 +125,7 @@ describe('entity-routes', () => {
     expect(registry.deindexEntity).not.toHaveBeenCalled()
   })
 
-  // ── Broadcast hooks (#114) ──────────────────────────────────────────
+  // ── Broadcast hooks ─────────────────────────────────────────────────
 
   it('handleCreateEntity fires a create event on broadcast when provided', async () => {
     const stub = { put: vi.fn().mockResolvedValue({ id: 'ord-1', type: 'Order', data: { total: 10 } }), delete: vi.fn() }

@@ -55,7 +55,7 @@ Every response is a ρ-application over the facts. No handler code was written; 
 If you are new to fact-oriented modeling, read the domains in this order.
 
 1. **catalog** is the simplest domain. It shows how entity types, value types, and constraints fit together. Notice the ring constraint on the category hierarchy.
-2. **orders** adds state machines and derivation rules. Watch the `:=` aggregate sum compute the order total from line items automatically.
+2. **orders** adds state machines and derivation rules. Watch the `*` iff aggregate sum compute the order total from line items automatically.
 3. **tasks** brings in a ternary fact type (Assignment) and an acyclic ring (task blocking). Note the difference between irreflexive, asymmetric, and acyclic constraints.
 4. **content** shows a symmetric ring constraint (related articles work in both directions).
 5. **scheduling** demonstrates objectification with a spanning uniqueness constraint. The Booking entity IS the fact about who booked what when.
@@ -65,8 +65,8 @@ If you are new to fact-oriented modeling, read the domains in this order.
 
 - **Alethic constraints**: `Each Order has exactly one Amount.` (orders)
 - **Deontic constraints**: `It is obligatory that each Product has exactly one Price.` (catalog), and `It is forbidden that a Review has Rating less than 1.` (catalog).
-- **Derivation rules, aggregate**: `Order has Amount := sum of LineItem Amount where LineItem belongs to that Order.` (orders)
-- **Derivation rules, join**: `User accesses Domain := User owns Organization and App belongs to that Organization and Domain belongs to that App.` (metamodel, used via federation)
+- **Derivation rules, aggregate**: `* Order has Amount iff Amount is the sum of LineItem Amount where some LineItem belongs to that Order.` (orders)
+- **Derivation rules, join**: `+ User accesses Domain if User owns Organization and App belongs to that Organization and Domain belongs to that App.` (metamodel, used via federation)
 - **Subset with autofill**: `If some Customer places some Order then that Order has Shipping Address that is that Customer's Shipping Address.` (orders)
 - **Compound reference scheme**: `ProductVariant(.id) is an entity type where Product has Size and Color.` (catalog)
 - **State machines**: Order has seven statuses and seven transitions (orders).

@@ -36,6 +36,12 @@ Fact is example.
 Fact cites Citation.
   For each pair of Fact and Citation, that Fact cites that Citation at most once.
 
+### Fact Type Citation
+Fact Type cites Citation.
+  For each pair of Fact Type and Citation, that Fact Type cites that Citation at most once.
+  It is possible that some Fact Type cites more than one Citation.
+  It is possible that more than one Fact Type cites the same Citation.
+
 ### Resource
 Resource belongs to Domain.
   Each Resource belongs to exactly one Domain.

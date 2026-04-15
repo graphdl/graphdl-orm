@@ -80,7 +80,7 @@ If some Attendee is required for some Meeting then that Attendee is invited to t
 
 ## Derivation Rules
 
-Meeting has Duration := that Meeting's End Time minus that Meeting's Start Time.
+* Meeting has Duration iff Meeting has End Time and Meeting has Start Time and Duration is that End Time minus that Start Time.
 
 If some Meeting is organized by some Attendee then that Attendee is invited to that Meeting.
 

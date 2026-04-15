@@ -1,11 +1,11 @@
 // crates/arest/src/wasm_lower.rs
 //
-// Lower Func trees to WASM functions (task #152 prototype).
+// Lower Func trees to WASM functions (prototype).
 //
-// Per docs/11-system-as-os-kernel.md §"Don't reinvent the VM": we
-// already run inside a WASM VM (V8 in Workers, wasmer/wasmtime on
-// server). Compile each Func to a WASM function and dispatch via the
-// host VM — no AREST-level interpreter on the hot path.
+// Don't reinvent the VM: we already run inside a WASM VM (V8 in
+// Workers, wasmer/wasmtime on server). Compile each Func to a WASM
+// function and dispatch via the host VM — no AREST-level interpreter
+// on the hot path.
 //
 // The emitted module exports two things:
 //   - `apply` : function of type (i64) -> (i32)

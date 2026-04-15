@@ -11,9 +11,9 @@
   //                 cross-entity state: population index, schema cache,
   //                 domain secrets. Isn't contended by entity writes.
   //   BroadcastDO — one instance per scope. Subscriber registry for the
-  //                 kernel's signal-delivery layer (docs/11 §Signals).
-  //                 In-memory only; drops subscribers on restart by
-  //                 design (client connections break on restart anyway).
+  //                 kernel's signal-delivery layer. In-memory only;
+  //                 drops subscribers on restart by design (client
+  //                 connections break on restart anyway).
   // Local mode has none — a single in-memory D serves everything.
   "durable_objects": {
     "bindings": [
