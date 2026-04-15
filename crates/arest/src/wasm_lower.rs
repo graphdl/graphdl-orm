@@ -332,6 +332,15 @@ fn scratch_needed(func: &Func) -> u32 {
         // total length, then to copy. Nine slots: outer, outer_len,
         // i, total_len, out, out_pos, inner, inner_len, j.
         Func::Concat => 9,
+        // Distribution: pair in, Seq-of-pairs out. Each output
+        // element is itself an allocated 2-elem Seq. Seven slots:
+        // pair, inner, inner_len, out, i, pair_i (scratch pair),
+        // scalar (stashed head for DistL or tail for DistR).
+        Func::DistL | Func::DistR => 7,
+        // Trans: Seq-of-Seqs transpose. Seven slots: outer, outer_len,
+        // inner_len, out, i (output row), pair_i (scratch per-row),
+        // j (input-row iterator).
+        Func::Trans => 7,
         _ => 0,
     }
 }
@@ -907,6 +916,302 @@ fn emit_body(
             body.instruction(&Instruction::I32Store(i32_at(SEQ_HEADER_SIZE as u64)));
             body.instruction(&Instruction::LocalGet(out_slot));
         }
+        // Backus §11.2.3 distribution.
+        //
+        //   distl:<y, <z₁,...,zₙ>> = <<y,z₁>, <y,z₂>, ..., <y,zₙ>>
+        //   distr:<<y₁,...,yₙ>, z> = <<y₁,z>, <y₂,z>, ..., <yₙ,z>>
+        //
+        // Allocate an outer Seq of length n, and in each iteration
+        // allocate a fresh 2-element inner pair <scalar, inner_elem>
+        // (for DistL) or <inner_elem, scalar> (for DistR).
+        Func::DistL => {
+            let pair_slot = next_scratch;
+            let inner_slot = next_scratch + 1;
+            let inner_len_slot = next_scratch + 2;
+            let out_slot = next_scratch + 3;
+            let i_slot = next_scratch + 4;
+            let pair_i_slot = next_scratch + 5;
+            let scalar_slot = next_scratch + 6;
+            body.instruction(&Instruction::LocalSet(pair_slot));
+            // scalar = pair[0]
+            body.instruction(&Instruction::LocalGet(pair_slot));
+            body.instruction(&Instruction::I32Load(i32_at(8)));
+            body.instruction(&Instruction::LocalSet(scalar_slot));
+            // inner = pair[1] ; inner_len = inner.length
+            body.instruction(&Instruction::LocalGet(pair_slot));
+            body.instruction(&Instruction::I32Load(i32_at(12)));
+            body.instruction(&Instruction::LocalTee(inner_slot));
+            body.instruction(&Instruction::I32Load(i32_at(4)));
+            body.instruction(&Instruction::LocalSet(inner_len_slot));
+            // Alloc out = header + 4 * inner_len
+            body.instruction(&Instruction::I32Const(SEQ_HEADER_SIZE));
+            body.instruction(&Instruction::LocalGet(inner_len_slot));
+            body.instruction(&Instruction::I32Const(4));
+            body.instruction(&Instruction::I32Mul);
+            body.instruction(&Instruction::I32Add);
+            body.instruction(&Instruction::Call(FN_ALLOC));
+            body.instruction(&Instruction::LocalTee(out_slot));
+            body.instruction(&Instruction::I32Const(TAG_SEQ));
+            body.instruction(&Instruction::I32Store(i32_at(0)));
+            body.instruction(&Instruction::LocalGet(out_slot));
+            body.instruction(&Instruction::LocalGet(inner_len_slot));
+            body.instruction(&Instruction::I32Store(i32_at(4)));
+            // Loop: for i in 0..inner_len, allocate <scalar, inner[i]> and store at out[i].
+            body.instruction(&Instruction::I32Const(0));
+            body.instruction(&Instruction::LocalSet(i_slot));
+            body.instruction(&Instruction::Block(BlockType::Empty));
+            body.instruction(&Instruction::Loop(BlockType::Empty));
+            body.instruction(&Instruction::LocalGet(i_slot));
+            body.instruction(&Instruction::LocalGet(inner_len_slot));
+            body.instruction(&Instruction::I32GeS);
+            body.instruction(&Instruction::BrIf(1));
+            // pair_i = alloc 16 (header + 2 elements)
+            body.instruction(&Instruction::I32Const(SEQ_HEADER_SIZE + 8));
+            body.instruction(&Instruction::Call(FN_ALLOC));
+            body.instruction(&Instruction::LocalTee(pair_i_slot));
+            body.instruction(&Instruction::I32Const(TAG_SEQ));
+            body.instruction(&Instruction::I32Store(i32_at(0)));
+            body.instruction(&Instruction::LocalGet(pair_i_slot));
+            body.instruction(&Instruction::I32Const(2));
+            body.instruction(&Instruction::I32Store(i32_at(4)));
+            // pair_i[0] = scalar
+            body.instruction(&Instruction::LocalGet(pair_i_slot));
+            body.instruction(&Instruction::LocalGet(scalar_slot));
+            body.instruction(&Instruction::I32Store(i32_at(SEQ_HEADER_SIZE as u64)));
+            // pair_i[1] = inner[i]
+            body.instruction(&Instruction::LocalGet(pair_i_slot));
+            body.instruction(&Instruction::LocalGet(inner_slot));
+            body.instruction(&Instruction::LocalGet(i_slot));
+            body.instruction(&Instruction::I32Const(4));
+            body.instruction(&Instruction::I32Mul);
+            body.instruction(&Instruction::I32Add);
+            body.instruction(&Instruction::I32Load(i32_at(SEQ_HEADER_SIZE as u64)));
+            body.instruction(&Instruction::I32Store(i32_at((SEQ_HEADER_SIZE + 4) as u64)));
+            // out[i] = pair_i
+            body.instruction(&Instruction::LocalGet(out_slot));
+            body.instruction(&Instruction::LocalGet(i_slot));
+            body.instruction(&Instruction::I32Const(4));
+            body.instruction(&Instruction::I32Mul);
+            body.instruction(&Instruction::I32Add);
+            body.instruction(&Instruction::LocalGet(pair_i_slot));
+            body.instruction(&Instruction::I32Store(i32_at(SEQ_HEADER_SIZE as u64)));
+            body.instruction(&Instruction::LocalGet(i_slot));
+            body.instruction(&Instruction::I32Const(1));
+            body.instruction(&Instruction::I32Add);
+            body.instruction(&Instruction::LocalSet(i_slot));
+            body.instruction(&Instruction::Br(0));
+            body.instruction(&Instruction::End);
+            body.instruction(&Instruction::End);
+            body.instruction(&Instruction::LocalGet(out_slot));
+        }
+        Func::DistR => {
+            // Mirror of DistL: inner is pair[0], scalar is pair[1],
+            // output pair's layout is <inner_elem, scalar>.
+            let pair_slot = next_scratch;
+            let inner_slot = next_scratch + 1;
+            let inner_len_slot = next_scratch + 2;
+            let out_slot = next_scratch + 3;
+            let i_slot = next_scratch + 4;
+            let pair_i_slot = next_scratch + 5;
+            let scalar_slot = next_scratch + 6;
+            body.instruction(&Instruction::LocalSet(pair_slot));
+            body.instruction(&Instruction::LocalGet(pair_slot));
+            body.instruction(&Instruction::I32Load(i32_at(12)));
+            body.instruction(&Instruction::LocalSet(scalar_slot));
+            body.instruction(&Instruction::LocalGet(pair_slot));
+            body.instruction(&Instruction::I32Load(i32_at(8)));
+            body.instruction(&Instruction::LocalTee(inner_slot));
+            body.instruction(&Instruction::I32Load(i32_at(4)));
+            body.instruction(&Instruction::LocalSet(inner_len_slot));
+            body.instruction(&Instruction::I32Const(SEQ_HEADER_SIZE));
+            body.instruction(&Instruction::LocalGet(inner_len_slot));
+            body.instruction(&Instruction::I32Const(4));
+            body.instruction(&Instruction::I32Mul);
+            body.instruction(&Instruction::I32Add);
+            body.instruction(&Instruction::Call(FN_ALLOC));
+            body.instruction(&Instruction::LocalTee(out_slot));
+            body.instruction(&Instruction::I32Const(TAG_SEQ));
+            body.instruction(&Instruction::I32Store(i32_at(0)));
+            body.instruction(&Instruction::LocalGet(out_slot));
+            body.instruction(&Instruction::LocalGet(inner_len_slot));
+            body.instruction(&Instruction::I32Store(i32_at(4)));
+            body.instruction(&Instruction::I32Const(0));
+            body.instruction(&Instruction::LocalSet(i_slot));
+            body.instruction(&Instruction::Block(BlockType::Empty));
+            body.instruction(&Instruction::Loop(BlockType::Empty));
+            body.instruction(&Instruction::LocalGet(i_slot));
+            body.instruction(&Instruction::LocalGet(inner_len_slot));
+            body.instruction(&Instruction::I32GeS);
+            body.instruction(&Instruction::BrIf(1));
+            body.instruction(&Instruction::I32Const(SEQ_HEADER_SIZE + 8));
+            body.instruction(&Instruction::Call(FN_ALLOC));
+            body.instruction(&Instruction::LocalTee(pair_i_slot));
+            body.instruction(&Instruction::I32Const(TAG_SEQ));
+            body.instruction(&Instruction::I32Store(i32_at(0)));
+            body.instruction(&Instruction::LocalGet(pair_i_slot));
+            body.instruction(&Instruction::I32Const(2));
+            body.instruction(&Instruction::I32Store(i32_at(4)));
+            // pair_i[0] = inner[i]
+            body.instruction(&Instruction::LocalGet(pair_i_slot));
+            body.instruction(&Instruction::LocalGet(inner_slot));
+            body.instruction(&Instruction::LocalGet(i_slot));
+            body.instruction(&Instruction::I32Const(4));
+            body.instruction(&Instruction::I32Mul);
+            body.instruction(&Instruction::I32Add);
+            body.instruction(&Instruction::I32Load(i32_at(SEQ_HEADER_SIZE as u64)));
+            body.instruction(&Instruction::I32Store(i32_at(SEQ_HEADER_SIZE as u64)));
+            // pair_i[1] = scalar
+            body.instruction(&Instruction::LocalGet(pair_i_slot));
+            body.instruction(&Instruction::LocalGet(scalar_slot));
+            body.instruction(&Instruction::I32Store(i32_at((SEQ_HEADER_SIZE + 4) as u64)));
+            // out[i] = pair_i
+            body.instruction(&Instruction::LocalGet(out_slot));
+            body.instruction(&Instruction::LocalGet(i_slot));
+            body.instruction(&Instruction::I32Const(4));
+            body.instruction(&Instruction::I32Mul);
+            body.instruction(&Instruction::I32Add);
+            body.instruction(&Instruction::LocalGet(pair_i_slot));
+            body.instruction(&Instruction::I32Store(i32_at(SEQ_HEADER_SIZE as u64)));
+            body.instruction(&Instruction::LocalGet(i_slot));
+            body.instruction(&Instruction::I32Const(1));
+            body.instruction(&Instruction::I32Add);
+            body.instruction(&Instruction::LocalSet(i_slot));
+            body.instruction(&Instruction::Br(0));
+            body.instruction(&Instruction::End);
+            body.instruction(&Instruction::End);
+            body.instruction(&Instruction::LocalGet(out_slot));
+        }
+
+        // Backus §11.2.3 transpose.
+        //
+        //   trans:<<x₁₁,...,x₁ₘ>, <x₂₁,...,x₂ₘ>, ..., <xₙ₁,...,xₙₘ>>
+        //     = <<x₁₁, x₂₁, ..., xₙ₁>, ..., <x₁ₘ, x₂ₘ, ..., xₙₘ>>
+        //
+        // Preconditions: outer has length ≥ 1 and every inner Seq has
+        // the same length m (= outer[0].length). Output has length m,
+        // each element is a Seq of length n (= outer length).
+        //
+        // Empty outer or m == 0 → empty output.
+        Func::Trans => {
+            let outer_slot = next_scratch;
+            let outer_len_slot = next_scratch + 1;
+            let inner_len_slot = next_scratch + 2;
+            let out_slot = next_scratch + 3;
+            let i_slot = next_scratch + 4;
+            let pair_i_slot = next_scratch + 5;
+            let j_slot = next_scratch + 6;
+            body.instruction(&Instruction::LocalSet(outer_slot));
+            body.instruction(&Instruction::LocalGet(outer_slot));
+            body.instruction(&Instruction::I32Load(i32_at(4)));
+            body.instruction(&Instruction::LocalTee(outer_len_slot));
+            // Handle empty-outer edge: allocate empty Seq and return.
+            body.instruction(&Instruction::I32Eqz);
+            body.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+            body.instruction(&Instruction::I32Const(SEQ_HEADER_SIZE));
+            body.instruction(&Instruction::Call(FN_ALLOC));
+            body.instruction(&Instruction::LocalTee(out_slot));
+            body.instruction(&Instruction::I32Const(TAG_SEQ));
+            body.instruction(&Instruction::I32Store(i32_at(0)));
+            body.instruction(&Instruction::LocalGet(out_slot));
+            body.instruction(&Instruction::I32Const(0));
+            body.instruction(&Instruction::I32Store(i32_at(4)));
+            body.instruction(&Instruction::LocalGet(out_slot));
+            body.instruction(&Instruction::Else);
+            // inner_len = outer[0].length
+            body.instruction(&Instruction::LocalGet(outer_slot));
+            body.instruction(&Instruction::I32Load(i32_at(SEQ_HEADER_SIZE as u64)));
+            body.instruction(&Instruction::I32Load(i32_at(4)));
+            body.instruction(&Instruction::LocalSet(inner_len_slot));
+            // Alloc out = header + 4 * inner_len
+            body.instruction(&Instruction::I32Const(SEQ_HEADER_SIZE));
+            body.instruction(&Instruction::LocalGet(inner_len_slot));
+            body.instruction(&Instruction::I32Const(4));
+            body.instruction(&Instruction::I32Mul);
+            body.instruction(&Instruction::I32Add);
+            body.instruction(&Instruction::Call(FN_ALLOC));
+            body.instruction(&Instruction::LocalTee(out_slot));
+            body.instruction(&Instruction::I32Const(TAG_SEQ));
+            body.instruction(&Instruction::I32Store(i32_at(0)));
+            body.instruction(&Instruction::LocalGet(out_slot));
+            body.instruction(&Instruction::LocalGet(inner_len_slot));
+            body.instruction(&Instruction::I32Store(i32_at(4)));
+            // Outer loop: for i in 0..inner_len, build out[i] = <outer[0][i], ..., outer[n-1][i]>
+            body.instruction(&Instruction::I32Const(0));
+            body.instruction(&Instruction::LocalSet(i_slot));
+            body.instruction(&Instruction::Block(BlockType::Empty));
+            body.instruction(&Instruction::Loop(BlockType::Empty));
+            body.instruction(&Instruction::LocalGet(i_slot));
+            body.instruction(&Instruction::LocalGet(inner_len_slot));
+            body.instruction(&Instruction::I32GeS);
+            body.instruction(&Instruction::BrIf(1));
+            // pair_i = alloc header + 4 * outer_len
+            body.instruction(&Instruction::I32Const(SEQ_HEADER_SIZE));
+            body.instruction(&Instruction::LocalGet(outer_len_slot));
+            body.instruction(&Instruction::I32Const(4));
+            body.instruction(&Instruction::I32Mul);
+            body.instruction(&Instruction::I32Add);
+            body.instruction(&Instruction::Call(FN_ALLOC));
+            body.instruction(&Instruction::LocalTee(pair_i_slot));
+            body.instruction(&Instruction::I32Const(TAG_SEQ));
+            body.instruction(&Instruction::I32Store(i32_at(0)));
+            body.instruction(&Instruction::LocalGet(pair_i_slot));
+            body.instruction(&Instruction::LocalGet(outer_len_slot));
+            body.instruction(&Instruction::I32Store(i32_at(4)));
+            // Inner loop: for j in 0..outer_len, pair_i[j] = outer[j][i]
+            body.instruction(&Instruction::I32Const(0));
+            body.instruction(&Instruction::LocalSet(j_slot));
+            body.instruction(&Instruction::Block(BlockType::Empty));
+            body.instruction(&Instruction::Loop(BlockType::Empty));
+            body.instruction(&Instruction::LocalGet(j_slot));
+            body.instruction(&Instruction::LocalGet(outer_len_slot));
+            body.instruction(&Instruction::I32GeS);
+            body.instruction(&Instruction::BrIf(1));
+            // Store addr = pair_i + 4*j
+            body.instruction(&Instruction::LocalGet(pair_i_slot));
+            body.instruction(&Instruction::LocalGet(j_slot));
+            body.instruction(&Instruction::I32Const(4));
+            body.instruction(&Instruction::I32Mul);
+            body.instruction(&Instruction::I32Add);
+            // Load outer[j][i]: first outer[j], then that Seq's elem i.
+            body.instruction(&Instruction::LocalGet(outer_slot));
+            body.instruction(&Instruction::LocalGet(j_slot));
+            body.instruction(&Instruction::I32Const(4));
+            body.instruction(&Instruction::I32Mul);
+            body.instruction(&Instruction::I32Add);
+            body.instruction(&Instruction::I32Load(i32_at(SEQ_HEADER_SIZE as u64)));
+            // Now have outer[j] on stack; read its elem i.
+            body.instruction(&Instruction::LocalGet(i_slot));
+            body.instruction(&Instruction::I32Const(4));
+            body.instruction(&Instruction::I32Mul);
+            body.instruction(&Instruction::I32Add);
+            body.instruction(&Instruction::I32Load(i32_at(SEQ_HEADER_SIZE as u64)));
+            body.instruction(&Instruction::I32Store(i32_at(SEQ_HEADER_SIZE as u64)));
+            body.instruction(&Instruction::LocalGet(j_slot));
+            body.instruction(&Instruction::I32Const(1));
+            body.instruction(&Instruction::I32Add);
+            body.instruction(&Instruction::LocalSet(j_slot));
+            body.instruction(&Instruction::Br(0));
+            body.instruction(&Instruction::End); // inner loop
+            body.instruction(&Instruction::End); // inner block
+            // out[i] = pair_i
+            body.instruction(&Instruction::LocalGet(out_slot));
+            body.instruction(&Instruction::LocalGet(i_slot));
+            body.instruction(&Instruction::I32Const(4));
+            body.instruction(&Instruction::I32Mul);
+            body.instruction(&Instruction::I32Add);
+            body.instruction(&Instruction::LocalGet(pair_i_slot));
+            body.instruction(&Instruction::I32Store(i32_at(SEQ_HEADER_SIZE as u64)));
+            body.instruction(&Instruction::LocalGet(i_slot));
+            body.instruction(&Instruction::I32Const(1));
+            body.instruction(&Instruction::I32Add);
+            body.instruction(&Instruction::LocalSet(i_slot));
+            body.instruction(&Instruction::Br(0));
+            body.instruction(&Instruction::End); // outer loop
+            body.instruction(&Instruction::End); // outer block
+            body.instruction(&Instruction::LocalGet(out_slot));
+            body.instruction(&Instruction::End); // end if/else
+        }
+
         Func::Concat => {
             // Two-pass: sum inner lengths, then flatten. The bump
             // allocator can't grow an existing region, so we must
@@ -1496,10 +1801,13 @@ mod tests {
 
     #[test]
     fn lower_rejects_unsupported_variant() {
-        // DistL isn't wired yet — distribution ops (DistL/DistR/Trans)
-        // allocate N pair-seqs in one pass; next group.
-        let f = Func::DistL;
-        let err = lower_to_wasm(&f).expect_err("DistL should be marked unsupported");
+        // While is the next natural addition — bounded iteration.
+        // Cell ops (Fetch/Store/Def/Platform/Native) are
+        // intentionally NOT lowered: they need access to D (the
+        // runtime state), which the PoC's pure-i64 `apply` has no
+        // way to plumb through.
+        let f = Func::While(Box::new(Func::Id), Box::new(Func::Id));
+        let err = lower_to_wasm(&f).expect_err("While should be marked unsupported");
         assert!(err.contains("not yet supported"));
     }
 
@@ -2007,6 +2315,133 @@ mod tests {
             Box::new(pair(3, 5)),
         );
         assert_eq!(roundtrip(&f2, 0), 200);
+    }
+
+    // ── Distribution (DistL, DistR, Trans) ────────────────────────
+
+    #[test]
+    fn lower_distl_pairs_scalar_with_each_element() {
+        // distl:<9, <1, 2, 3>> = <<9,1>, <9,2>, <9,3>>.
+        // Decode manually since roundtrip_seq is flat; we need
+        // Seq-of-Seqs.
+        let f = Func::Compose(
+            Box::new(Func::DistL),
+            Box::new(Func::Construction(vec![
+                Func::Constant(Object::atom("9")),
+                seq_of_atoms(&[1, 2, 3]),
+            ])),
+        );
+        let (ptr, data) = invoke(&f, 0);
+        assert_eq!(read_u32(&data, ptr), TAG_SEQ as u32);
+        assert_eq!(read_u32(&data, ptr + 4), 3);
+        for (i, expected_tail) in [1i64, 2, 3].iter().enumerate() {
+            let pair_ptr = read_u32(&data, ptr + 8 + 4 * i as u32);
+            assert_eq!(read_u32(&data, pair_ptr), TAG_SEQ as u32);
+            assert_eq!(read_u32(&data, pair_ptr + 4), 2);
+            let head_ptr = read_u32(&data, pair_ptr + 8);
+            let tail_ptr = read_u32(&data, pair_ptr + 12);
+            assert_eq!(read_i64(&data, head_ptr + 8), 9, "pair {i} head = 9");
+            assert_eq!(read_i64(&data, tail_ptr + 8), *expected_tail,
+                "pair {i} tail = {expected_tail}");
+        }
+    }
+
+    #[test]
+    fn lower_distl_over_empty_inner_is_empty() {
+        let f = Func::Compose(
+            Box::new(Func::DistL),
+            Box::new(Func::Construction(vec![
+                Func::Constant(Object::atom("9")),
+                seq_of_atoms(&[]),
+            ])),
+        );
+        let (ptr, data) = invoke(&f, 0);
+        assert_eq!(read_u32(&data, ptr), TAG_SEQ as u32);
+        assert_eq!(read_u32(&data, ptr + 4), 0);
+    }
+
+    #[test]
+    fn lower_distr_pairs_each_element_with_scalar() {
+        // distr:<<1, 2, 3>, 9> = <<1,9>, <2,9>, <3,9>>.
+        let f = Func::Compose(
+            Box::new(Func::DistR),
+            Box::new(Func::Construction(vec![
+                seq_of_atoms(&[1, 2, 3]),
+                Func::Constant(Object::atom("9")),
+            ])),
+        );
+        let (ptr, data) = invoke(&f, 0);
+        assert_eq!(read_u32(&data, ptr), TAG_SEQ as u32);
+        assert_eq!(read_u32(&data, ptr + 4), 3);
+        for (i, expected_head) in [1i64, 2, 3].iter().enumerate() {
+            let pair_ptr = read_u32(&data, ptr + 8 + 4 * i as u32);
+            let head_ptr = read_u32(&data, pair_ptr + 8);
+            let tail_ptr = read_u32(&data, pair_ptr + 12);
+            assert_eq!(read_i64(&data, head_ptr + 8), *expected_head);
+            assert_eq!(read_i64(&data, tail_ptr + 8), 9);
+        }
+    }
+
+    #[test]
+    fn lower_trans_transposes_uniform_seq_of_seqs() {
+        // trans:<<1,2,3>, <4,5,6>> = <<1,4>, <2,5>, <3,6>>.
+        let f = Func::Compose(
+            Box::new(Func::Trans),
+            Box::new(Func::Construction(vec![
+                seq_of_atoms(&[1, 2, 3]),
+                seq_of_atoms(&[4, 5, 6]),
+            ])),
+        );
+        let (ptr, data) = invoke(&f, 0);
+        assert_eq!(read_u32(&data, ptr), TAG_SEQ as u32);
+        assert_eq!(read_u32(&data, ptr + 4), 3, "output length = inner length 3");
+        let expected = [[1i64, 4], [2, 5], [3, 6]];
+        for (i, row) in expected.iter().enumerate() {
+            let pair_ptr = read_u32(&data, ptr + 8 + 4 * i as u32);
+            assert_eq!(read_u32(&data, pair_ptr + 4), 2, "each row length = outer length 2");
+            for (j, &expected_val) in row.iter().enumerate() {
+                let elem_ptr = read_u32(&data, pair_ptr + 8 + 4 * j as u32);
+                assert_eq!(read_i64(&data, elem_ptr + 8), expected_val,
+                    "row {i} col {j} = {expected_val}");
+            }
+        }
+    }
+
+    #[test]
+    fn lower_trans_is_its_own_inverse() {
+        // trans ∘ trans on a 2×3 matrix returns a 2×3 matrix.
+        // Concretely: <<1,2,3>, <4,5,6>> → <<1,4>,<2,5>,<3,6>>
+        //          → <<1,2,3>, <4,5,6>>.
+        let matrix = Func::Construction(vec![
+            seq_of_atoms(&[1, 2, 3]),
+            seq_of_atoms(&[4, 5, 6]),
+        ]);
+        let f = Func::Compose(
+            Box::new(Func::Trans),
+            Box::new(Func::Compose(Box::new(Func::Trans), Box::new(matrix))),
+        );
+        let (ptr, data) = invoke(&f, 0);
+        assert_eq!(read_u32(&data, ptr + 4), 2);
+        let row0 = read_u32(&data, ptr + 8);
+        let row1 = read_u32(&data, ptr + 12);
+        // Row 0 should be <1,2,3>
+        for (j, &v) in [1i64, 2, 3].iter().enumerate() {
+            let elem = read_u32(&data, row0 + 8 + 4 * j as u32);
+            assert_eq!(read_i64(&data, elem + 8), v);
+        }
+        // Row 1 should be <4,5,6>
+        for (j, &v) in [4i64, 5, 6].iter().enumerate() {
+            let elem = read_u32(&data, row1 + 8 + 4 * j as u32);
+            assert_eq!(read_i64(&data, elem + 8), v);
+        }
+    }
+
+    #[test]
+    fn lower_trans_on_empty_outer_returns_empty() {
+        let f = Func::Compose(Box::new(Func::Trans), Box::new(seq_of_atoms(&[])));
+        let (ptr, data) = invoke(&f, 0);
+        assert_eq!(read_u32(&data, ptr), TAG_SEQ as u32);
+        assert_eq!(read_u32(&data, ptr + 4), 0);
     }
 
     // ── Binary Seq builders (ApndL, ApndR, Concat) ────────────────
