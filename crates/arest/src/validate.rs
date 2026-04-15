@@ -189,7 +189,7 @@ mod tests {
             kind: DerivationKind::ModusPonens,
             join_on: vec![],
             match_on: vec![],
-            consequent_bindings: vec![],
+            consequent_bindings: vec![], antecedent_filters: vec![],
         });
         ir.derivation_rules.push(DerivationRuleDef {
             id: "rule-b".to_string(),
@@ -199,7 +199,7 @@ mod tests {
             kind: DerivationKind::ModusPonens,
             join_on: vec![],
             match_on: vec![],
-            consequent_bindings: vec![],
+            consequent_bindings: vec![], antecedent_filters: vec![],
         });
 
         let state = ir_to_metamodel_state(&ir);

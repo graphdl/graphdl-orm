@@ -1315,7 +1315,7 @@ pub fn state_to_domain(state: &crate::ast::Object) -> Domain {
             DerivationRuleDef {
                 id: get("id"), text: get("text"), antecedent_fact_type_ids: vec![],
                 consequent_fact_type_id: get("consequentFactTypeId"),
-                kind: DerivationKind::ModusPonens, join_on: vec![], match_on: vec![], consequent_bindings: vec![],
+                kind: DerivationKind::ModusPonens, join_on: vec![], match_on: vec![], consequent_bindings: vec![], antecedent_filters: vec![],
             }
         }).collect())
         .unwrap_or_default();
