@@ -2425,6 +2425,41 @@ mod tests {
     // resolves to a source fact type. The consequent's non-aggregate role
     // becomes the group key (the image-set index in Codd's terms).
 
+    // ── Halpin's "attribute style" reduces to relational style + Join ──
+    //
+    // Halpin FORML Example 6 gives two equivalent forms of the uncle rule:
+    //
+    //   Relational:  Define Person1 is an uncle of Person2 as
+    //                Person1 is a brother of some Person3 who is a parent
+    //                of Person2.
+    //
+    //   Attribute:   For each Person: uncle = brother of parent.
+    //
+    // Both assert the same implication. AREST takes the relational form
+    // (with `that <join-noun>` anaphora) and routes it through
+    // compile_join_derivation — so attribute style is structurally
+    // redundant. This test uses non-ring fact types (no subscripts) to
+    // demonstrate the pattern that makes attribute style unnecessary.
+
+    #[test]
+    fn path_composition_via_relational_join_parses_as_join() {
+        // "Worker reports up via Manager" - the classic 2-hop path.
+        // Attribute form would be: For each Worker: up_line = reports_to of reports_to.
+        // We write the relational equivalent, which the existing Join
+        // path handles natively.
+        let input = "Worker(.Id) is an entity type.\nManager(.Id) is an entity type.\nVP(.Id) is an entity type.\n## Fact Types\nWorker reports to Manager.\nManager reports to VP.\nWorker reports up to VP.\n## Derivation Rules\n+ Worker reports up to VP if Worker reports to some Manager and that Manager reports to VP.";
+        let ir = parse_markdown(input).unwrap();
+        let rule = ir.derivation_rules.iter()
+            .find(|r| r.text.contains("reports up to VP"))
+            .expect("rule present");
+        assert_eq!(rule.kind, crate::types::DerivationKind::Join,
+            "two-antecedent rule with `that Manager` should be Join, got {:?}", rule.kind);
+        assert!(rule.join_on.iter().any(|k| k == "Manager"),
+            "join_on should include Manager, got {:?}", rule.join_on);
+        assert_eq!(rule.antecedent_fact_type_ids.len(), 2,
+            "two antecedents, got {:?}", rule.antecedent_fact_type_ids);
+    }
+
     #[test]
     fn derivation_rule_captures_count_aggregate() {
         let input = "Thing(.Name) is an entity type.\nPart(.Name) is an entity type.\nArity is a value type.\n## Fact Types\nThing has Part.\nThing has Arity.\n## Derivation Rules\n* Thing has Arity iff Arity is the count of Part where Thing has Part.";
