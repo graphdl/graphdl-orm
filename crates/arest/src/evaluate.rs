@@ -2374,6 +2374,173 @@ mod tests {
         pairs.clear();  // avoid unused warning via reset
     }
 
+    fn order_line_item_sum_ir() -> Domain {
+        // `LineItem has Amount for Order` is ternary-ish in Halpin's
+        // example; for testing we use a simpler binary form
+        // `Order has LineItem Amount`, with Order as group key and
+        // Amount as target.
+        let mut fact_types = HashMap::new();
+        fact_types.insert("order_has_line_amount".to_string(), FactTypeDef {
+            schema_id: String::new(),
+            reading: "Order has LineItem Amount".to_string(),
+            readings: vec![],
+            roles: vec![
+                RoleDef { noun_name: "Order".to_string(), role_index: 0 },
+                RoleDef { noun_name: "LineItem Amount".to_string(), role_index: 1 },
+            ],
+        });
+        fact_types.insert("order_has_total".to_string(), FactTypeDef {
+            schema_id: String::new(),
+            reading: "Order has Amount".to_string(),
+            readings: vec![],
+            roles: vec![
+                RoleDef { noun_name: "Order".to_string(), role_index: 0 },
+                RoleDef { noun_name: "Amount".to_string(), role_index: 1 },
+            ],
+        });
+        Domain {
+            domain: "test".to_string(),
+            nouns: HashMap::new(),
+            fact_types,
+            constraints: vec![],
+            state_machines: HashMap::new(),
+            derivation_rules: vec![DerivationRuleDef {
+                id: "order-total".to_string(),
+                text: "* Order has Amount iff Amount is the sum of LineItem Amount where Order has LineItem Amount.".to_string(),
+                antecedent_fact_type_ids: vec![],
+                consequent_fact_type_id: "order_has_total".to_string(),
+                kind: DerivationKind::ModusPonens,
+                join_on: vec![],
+                match_on: vec![],
+                consequent_bindings: vec![],
+                antecedent_filters: vec![],
+                consequent_computed_bindings: vec![],
+                consequent_aggregates: vec![crate::types::ConsequentAggregate {
+                    role: "Amount".to_string(),
+                    op: "sum".to_string(),
+                    target_role: "LineItem Amount".to_string(),
+                    source_fact_type_id: "order_has_line_amount".to_string(),
+                    group_key_role: "Order".to_string(),
+                }],
+            }],
+            general_instance_facts: vec![],
+            subtypes: HashMap::new(), enum_values: HashMap::new(),
+            ref_schemes: HashMap::new(), objectifications: HashMap::new(),
+            named_spans: HashMap::new(), autofill_spans: vec![],
+        }
+    }
+
+    #[test]
+    fn sum_aggregate_folds_add_over_projected_target_values() {
+        // Order O1: 10 + 25 + 5 = 40; Order O2: 7 = 7.
+        let ir = order_line_item_sum_ir();
+        let (_meta_pop, defs, _def_map) = ir_to_defs(&ir);
+
+        let mut pop_state = ast::Object::phi();
+        for (order, amt) in [("O1", "10"), ("O1", "25"), ("O1", "5"), ("O2", "7")] {
+            pop_state = ast::cell_push("order_has_line_amount",
+                ast::fact_from_pairs(&[("Order", order), ("LineItem Amount", amt)]), &pop_state);
+        }
+
+        let dd = derivation_defs_from(&defs);
+        let (_new_state, derived) = forward_chain_defs_state(&dd, &pop_state);
+
+        let totals: Vec<_> = derived.iter().filter(|d| d.fact_type_id == "order_has_total").collect();
+        let pairs: std::collections::BTreeSet<(String, String)> = totals.iter().map(|d| {
+            let o = d.bindings.iter().find(|(k, _)| k == "Order").map(|(_, v)| v.clone()).unwrap_or_default();
+            let a = d.bindings.iter().find(|(k, _)| k == "Amount").map(|(_, v)| v.clone()).unwrap_or_default();
+            (o, a)
+        }).collect();
+        let expected: std::collections::BTreeSet<(String, String)> = [
+            ("O1".to_string(), "40".to_string()),
+            ("O2".to_string(), "7".to_string()),
+        ].into_iter().collect();
+        assert_eq!(pairs, expected,
+            "expected O1=40, O2=7; got {:?} (raw count={})", pairs, totals.len());
+    }
+
+    fn order_amount_agg_ir(op: &str) -> Domain {
+        // Reuse order_line_item_sum_ir's shape but parameterise the op.
+        let mut ir = order_line_item_sum_ir();
+        ir.derivation_rules[0].consequent_aggregates[0].op = op.to_string();
+        ir.derivation_rules[0].id = format!("order-{}", op);
+        ir
+    }
+
+    #[test]
+    fn min_aggregate_folds_pairwise_minimum() {
+        let ir = order_amount_agg_ir("min");
+        let (_meta_pop, defs, _def_map) = ir_to_defs(&ir);
+        let mut pop_state = ast::Object::phi();
+        for (o, a) in [("O1", "10"), ("O1", "4"), ("O1", "25"), ("O2", "7")] {
+            pop_state = ast::cell_push("order_has_line_amount",
+                ast::fact_from_pairs(&[("Order", o), ("LineItem Amount", a)]), &pop_state);
+        }
+        let dd = derivation_defs_from(&defs);
+        let (_new_state, derived) = forward_chain_defs_state(&dd, &pop_state);
+        let totals: Vec<_> = derived.iter().filter(|d| d.fact_type_id == "order_has_total").collect();
+        let pairs: std::collections::BTreeSet<(String, String)> = totals.iter().map(|d| {
+            let o = d.bindings.iter().find(|(k, _)| k == "Order").map(|(_, v)| v.clone()).unwrap_or_default();
+            let a = d.bindings.iter().find(|(k, _)| k == "Amount").map(|(_, v)| v.clone()).unwrap_or_default();
+            (o, a)
+        }).collect();
+        let expected: std::collections::BTreeSet<(String, String)> = [
+            ("O1".to_string(), "4".to_string()),
+            ("O2".to_string(), "7".to_string()),
+        ].into_iter().collect();
+        assert_eq!(pairs, expected, "min: expected O1=4 O2=7, got {:?}", pairs);
+    }
+
+    #[test]
+    fn max_aggregate_folds_pairwise_maximum() {
+        let ir = order_amount_agg_ir("max");
+        let (_meta_pop, defs, _def_map) = ir_to_defs(&ir);
+        let mut pop_state = ast::Object::phi();
+        for (o, a) in [("O1", "10"), ("O1", "4"), ("O1", "25"), ("O2", "7")] {
+            pop_state = ast::cell_push("order_has_line_amount",
+                ast::fact_from_pairs(&[("Order", o), ("LineItem Amount", a)]), &pop_state);
+        }
+        let dd = derivation_defs_from(&defs);
+        let (_new_state, derived) = forward_chain_defs_state(&dd, &pop_state);
+        let totals: Vec<_> = derived.iter().filter(|d| d.fact_type_id == "order_has_total").collect();
+        let pairs: std::collections::BTreeSet<(String, String)> = totals.iter().map(|d| {
+            let o = d.bindings.iter().find(|(k, _)| k == "Order").map(|(_, v)| v.clone()).unwrap_or_default();
+            let a = d.bindings.iter().find(|(k, _)| k == "Amount").map(|(_, v)| v.clone()).unwrap_or_default();
+            (o, a)
+        }).collect();
+        let expected: std::collections::BTreeSet<(String, String)> = [
+            ("O1".to_string(), "25".to_string()),
+            ("O2".to_string(), "7".to_string()),
+        ].into_iter().collect();
+        assert_eq!(pairs, expected, "max: expected O1=25 O2=7, got {:?}", pairs);
+    }
+
+    #[test]
+    fn avg_aggregate_divides_sum_by_count() {
+        let ir = order_amount_agg_ir("avg");
+        let (_meta_pop, defs, _def_map) = ir_to_defs(&ir);
+        let mut pop_state = ast::Object::phi();
+        // O1: (9 + 12 + 15) / 3 = 12.
+        for (o, a) in [("O1", "9"), ("O1", "12"), ("O1", "15"), ("O2", "7")] {
+            pop_state = ast::cell_push("order_has_line_amount",
+                ast::fact_from_pairs(&[("Order", o), ("LineItem Amount", a)]), &pop_state);
+        }
+        let dd = derivation_defs_from(&defs);
+        let (_new_state, derived) = forward_chain_defs_state(&dd, &pop_state);
+        let totals: Vec<_> = derived.iter().filter(|d| d.fact_type_id == "order_has_total").collect();
+        let pairs: std::collections::BTreeSet<(String, String)> = totals.iter().map(|d| {
+            let o = d.bindings.iter().find(|(k, _)| k == "Order").map(|(_, v)| v.clone()).unwrap_or_default();
+            let a = d.bindings.iter().find(|(k, _)| k == "Amount").map(|(_, v)| v.clone()).unwrap_or_default();
+            (o, a)
+        }).collect();
+        // Accept either integer or float formatting for the averaged value.
+        let has_pair = |o: &str, expected_nums: &[&str]| -> bool {
+            pairs.iter().any(|(actual_o, v)| actual_o == o && expected_nums.iter().any(|e| v == e))
+        };
+        assert!(has_pair("O1", &["12", "12.0"]), "avg: expected O1 to average to 12, got {:?}", pairs);
+        assert!(has_pair("O2", &["7", "7.0"]), "avg: expected O2=7, got {:?}", pairs);
+    }
+
     #[test]
     fn rule_without_filter_fires_for_any_fact_regression() {
         // Regression: when antecedent_filters is empty, behavior is
