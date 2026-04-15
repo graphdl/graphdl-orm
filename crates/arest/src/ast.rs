@@ -53,7 +53,15 @@ pub enum Object {
     /// A sequence of objects: <x₁, ..., xₙ>.
     /// A fact's bindings are a sequence. A population is a sequence of facts.
     /// If any element is Bottom, the whole sequence is Bottom.
-    Seq(Vec<Object>),
+    ///
+    /// Arc-wrapped slice for cheap clones: most Seq operations in
+    /// AREST's evaluator are read-only (iteration, indexing,
+    /// destructuring), and apply() clones freely to avoid aliasing
+    /// concerns. `Arc<[Object]>` makes that a ref-count bump instead
+    /// of a Vec deep copy, while giving us free `From<Vec<Object>>`
+    /// and `FromIterator<Object>` so construction sites stay terse:
+    /// `Object::Seq(vec.into())` or `iter.collect()` both work.
+    Seq(Arc<[Object]>),
 
     /// A named store (Backus §13.3.4): cells indexed by name for O(1) fetch/store.
     /// Semantically equivalent to Seq of <CELL, name, contents> triples,
@@ -68,14 +76,14 @@ impl Object {
     pub fn atom(s: &str) -> Self { Object::Atom(s.to_string()) }
     pub fn t() -> Self { Object::Atom("T".to_string()) }
     pub fn f() -> Self { Object::Atom("F".to_string()) }
-    pub fn phi() -> Self { Object::Seq(vec![]) }
+    pub fn phi() -> Self { Object::Seq(Arc::from([])) }
 
     pub fn seq(items: Vec<Object>) -> Self {
         // Bottom-preserving: if any element is Bottom, whole sequence is Bottom.
         if items.iter().any(|x| matches!(x, Object::Bottom)) {
             Object::Bottom
         } else {
-            Object::Seq(items)
+            Object::Seq(items.into())
         }
     }
 
@@ -116,7 +124,7 @@ impl Object {
             Object::Map(_) => self.clone(),
             Object::Seq(cells) => {
                 let mut map = HashMap::new();
-                for cell_obj in cells {
+                for cell_obj in cells.iter() {
                     if let Some(items) = cell_obj.as_seq() {
                         if items.len() == 3
                             && items[0].as_atom() == Some(CELL_TAG)
@@ -197,7 +205,8 @@ fn parse_with_depth(input: &str, depth: usize) -> Object {
                 false => Object::Seq(
                     split_top_level(inner).into_iter()
                         .map(|i| parse_with_depth(i.trim(), depth + 1))
-                        .collect()
+                        .collect::<Vec<_>>()
+                        .into()
                 ),
             }
         }
@@ -262,10 +271,10 @@ pub fn encode_state_indexed(state: &Object) -> Object {
                     let bindings: Vec<Object> = fact.as_seq().map(|pairs| {
                         pairs.iter().cloned().collect::<Vec<Object>>()
                     }).unwrap_or_default();
-                    Object::Seq(bindings)
+                    Object::Seq(Arc::from(bindings))
                 }).collect::<Vec<Object>>()
             }).unwrap_or_default();
-            (ft_id.to_string(), Object::Seq(fact_objs))
+            (ft_id.to_string(), Object::Seq(Arc::from(fact_objs)))
         }).collect();
     Object::Map(map)
 }
@@ -287,12 +296,12 @@ pub fn encode_state(state: &Object) -> Object {
                     let bindings: Vec<Object> = fact.as_seq().map(|pairs| {
                         pairs.iter().map(|pair: &Object| pair.clone()).collect::<Vec<Object>>()
                     }).unwrap_or_default();
-                    Object::Seq(bindings)
+                    Object::Seq(Arc::from(bindings))
                 }).collect::<Vec<Object>>()
             }).unwrap_or_default();
-            Object::seq(vec![Object::atom(ft_id), Object::Seq(fact_objs)])
+            Object::seq(vec![Object::atom(ft_id), Object::Seq(Arc::from(fact_objs))])
         }).collect();
-    Object::Seq(fact_types)
+    Object::Seq(fact_types.into())
 }
 
 /// Decode a violation Object back to a Violation struct.
@@ -664,7 +673,7 @@ fn normalize_step(f: &Func) -> Func {
                 Func::Constant(x) => x.clone(),
                 _ => unreachable!(),
             }).collect();
-            Func::Constant(Object::Seq(items))
+            Func::Constant(Object::Seq(Arc::from(items)))
         }
         _ => f.clone(),
     }
@@ -849,7 +858,7 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
             match x.as_seq() {
                 Some(items) if items.is_empty() => Object::Bottom,
                 Some(items) if items.len() == 1 => Object::phi(),
-                Some(items) => Object::Seq(items[1..].to_vec()),
+                Some(items) => Object::Seq(Arc::from(items[1..].to_vec())),
                 _ => Object::Bottom,
             }
         }
@@ -908,7 +917,7 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
 
         Func::Concat => {
             match x.as_seq() {
-                Some(items) => Object::Seq(items.iter().flat_map(|item|
+                Some(items) => Object::seq(items.iter().flat_map(|item|
                     item.as_seq().map(|sub| sub.to_vec())
                         .unwrap_or_else(|| vec![item.clone()])
                 ).collect()),
@@ -922,7 +931,7 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
                     let y = &items[0];
                     match items[1].as_seq() {
                         Some(zs) if zs.is_empty() => Object::phi(),
-                        Some(zs) => Object::Seq(
+                        Some(zs) => Object::seq(
                             zs.iter().map(|z| Object::seq(vec![y.clone(), z.clone()])).collect()
                         ),
                         _ => Object::Bottom,
@@ -938,7 +947,7 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
                     let z = &items[1];
                     match items[0].as_seq() {
                         Some(ys) if ys.is_empty() => Object::phi(),
-                        Some(ys) => Object::Seq(
+                        Some(ys) => Object::seq(
                             ys.iter().map(|y| Object::seq(vec![y.clone(), z.clone()])).collect()
                         ),
                         _ => Object::Bottom,
@@ -976,7 +985,7 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
                         Some(zs) => {
                             let mut result = vec![y.clone()];
                             result.extend_from_slice(zs);
-                            Object::Seq(result)
+                            Object::Seq(result.into())
                         }
                         _ => Object::Bottom,
                     }
@@ -999,7 +1008,7 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
                         Some(ys) => {
                             let mut result = ys.to_vec();
                             result.push(items[1].clone());
-                            Object::Seq(result)
+                            Object::Seq(result.into())
                         }
                         _ => Object::Bottom,
                     }
@@ -1013,7 +1022,7 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
                 Some(items) if items.len() >= 2 => {
                     let mut result = items[1..].to_vec();
                     result.push(items[0].clone());
-                    Object::Seq(result)
+                    Object::Seq(result.into())
                 }
                 Some(_) => x.clone(),
                 _ => Object::Bottom,
@@ -1025,7 +1034,7 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
                 Some(items) if items.len() >= 2 => {
                     let mut result = vec![items[items.len() - 1].clone()];
                     result.extend_from_slice(&items[..items.len() - 1]);
-                    Object::Seq(result)
+                    Object::Seq(result.into())
                 }
                 Some(_) => x.clone(),
                 _ => Object::Bottom,
@@ -1162,7 +1171,7 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
             match x.as_seq() {
                 Some(items) if items.len() == 1 => items[0].clone(),
                 Some(items) if items.len() >= 2 => {
-                    let rest = Object::Seq(items[1..].to_vec());
+                    let rest = Object::Seq(items[1..].into());
                     let reduced = apply(&Func::Insert(f.clone()), &rest, d);
                     apply(f, &Object::seq(vec![items[0].clone(), reduced]), d)
                 }
@@ -1180,13 +1189,13 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
                             .filter(|xi| apply(p, xi, d) == Object::t())
                             .cloned()
                             .collect();
-                        return Object::Seq(kept);
+                        return Object::Seq(kept.into());
                     }
                     let kept: Vec<Object> = items.iter()
                         .filter(|xi| apply(p, xi, d) == Object::t())
                         .cloned()
                         .collect();
-                    Object::Seq(kept)
+                    Object::Seq(kept.into())
                 }
                 _ => Object::Bottom,
             }
@@ -1320,13 +1329,13 @@ fn platform_project(x: &Object) -> Object {
                     let projected: Vec<Object> = selectors.iter()
                         .filter_map(|&s| (s >= 1 && s <= cols.len()).then(|| cols[s-1].clone()))
                         .collect();
-                    Some(Object::Seq(projected))
+                    Some(Object::Seq(projected.into()))
                 })
                 .fold(Vec::new(), |mut acc, row| {
                     (!acc.contains(&row)).then(|| acc.push(row));
                     acc
                 });
-            Some(Object::Seq(rows))
+            Some(Object::Seq(rows.into()))
         })
         .unwrap_or(Object::Bottom)
 }
@@ -1354,12 +1363,12 @@ fn platform_join(x: &Object) -> Object {
                             merged.extend(s_cols.iter().enumerate()
                                 .filter(|(i, _)| i + 1 != shared_col)
                                 .map(|(_, col)| col.clone()));
-                            Object::Seq(merged)
+                            Object::Seq(merged.into())
                         })
                     })
                 })
                 .collect();
-            Some(Object::Seq(result))
+            Some(Object::Seq(result.into()))
         })
         .unwrap_or(Object::Bottom)
 }
@@ -1372,7 +1381,7 @@ fn platform_tie(x: &Object) -> Object {
                 .filter_map(|tuple| {
                     let cols = tuple.as_seq()?;
                     (cols.len() >= 2 && cols[0] == cols[cols.len() - 1])
-                        .then(|| Object::Seq(cols[..cols.len()-1].to_vec()))
+                        .then(|| Object::Seq(cols[..cols.len()-1].into()))
                 })
                 .collect())
         })
@@ -1405,12 +1414,12 @@ fn platform_compose_rel(x: &Object) -> Object {
                                     .filter(|(i, _)| i + 1 != shared_col)
                                     .map(|(_, col)| col.clone()))
                                 .collect();
-                            Object::Seq(projected)
+                            Object::Seq(projected.into())
                         })
                     })
                 })
                 .collect();
-            Some(Object::Seq(result))
+            Some(Object::Seq(result.into()))
         })
         .unwrap_or(Object::Bottom)
 }
@@ -1458,12 +1467,12 @@ fn platform_tc_cycles(x: &Object) -> Object {
     // Self-loops → violation-shaped objects.
     let cycle_nodes: Vec<Object> = tc.iter()
         .filter(|(a, b)| a == b)
-        .map(|(a, _)| Object::Seq(vec![
-            Object::Seq(vec![Object::atom("_"), Object::atom(a)]),
-            Object::Seq(vec![Object::atom("_"), Object::atom(a)]),
+        .map(|(a, _)| Object::seq(vec![
+            Object::seq(vec![Object::atom("_"), Object::atom(a)]),
+            Object::seq(vec![Object::atom("_"), Object::atom(a)]),
         ]))
         .collect();
-    Object::Seq(cycle_nodes)
+    Object::Seq(cycle_nodes.into())
 }
 
 /// Transitive closure over an edge relation. Iterates until no new edges are added.
@@ -1480,7 +1489,7 @@ fn platform_tc(x: &Object) -> Object {
                 .filter_map(move |b| b.as_seq().map(|b_cols| (a_cols, b_cols))))
             .filter_map(|(a_cols, b_cols)| {
                 (a_cols.len() >= 2 && b_cols.len() >= 2 && a_cols[1] == b_cols[0])
-                    .then(|| Object::Seq(vec![a_cols[0].clone(), b_cols[1].clone()]))
+                    .then(|| Object::seq(vec![a_cols[0].clone(), b_cols[1].clone()]))
             })
             .filter(|edge| !closure.contains(edge))
             .fold(Vec::new(), |mut acc, e| {
@@ -1490,7 +1499,7 @@ fn platform_tc(x: &Object) -> Object {
         if new_edges.is_empty() { break; }
         closure.extend(new_edges);
     }
-    Object::Seq(closure)
+    Object::Seq(closure.into())
 }
 
 /// Platform primitive: signature verification (AREST §5.5).
@@ -2057,7 +2066,7 @@ pub const CELL_TAG: &str = "CELL";
 
 /// Create a cell object: <CELL, name, contents>
 pub fn cell(name: &str, contents: Object) -> Object {
-    Object::Seq(vec![Object::atom(CELL_TAG), Object::atom(name), contents])
+    Object::seq(vec![Object::atom(CELL_TAG), Object::atom(name), contents])
 }
 
 /// Fetch (↑n): retrieve contents of the first cell named n from a store.
@@ -2103,8 +2112,8 @@ pub fn store(name: &str, contents: Object, state: &Object) -> Object {
                 if is_target(c) { cell(name, contents.clone()) } else { c.clone() }
             ).collect();
             match found {
-                true => Object::Seq(replaced),
-                false => Object::Seq([replaced, vec![cell(name, contents)]].concat()),
+                true => Object::Seq(replaced.into()),
+                false => Object::Seq([replaced, vec![cell(name, contents)]].concat().into()),
             }
         }
         _ => Object::Bottom,
@@ -2130,9 +2139,9 @@ pub fn cell_push(name: &str, fact: Object, state: &Object) -> Object {
         Some(items) => {
             let mut v = items.to_vec();
             v.push(fact);
-            Object::Seq(v)
+            Object::Seq(v.into())
         }
-        None => Object::Seq(vec![fact]),
+        None => Object::seq(vec![fact]),
     };
     store(name, new_contents, state)
 }
@@ -2166,7 +2175,7 @@ fn concat_dedup(a: &Object, b: &Object) -> Object {
         if out.iter().any(|existing| same_identity(existing, &item)) { continue; }
         out.push(item);
     }
-    Object::Seq(out)
+    Object::Seq(out.into())
 }
 
 /// Two facts share identity when they have the same value at a canonical
@@ -2238,7 +2247,7 @@ pub fn binding<'a>(fact: &'a Object, key: &str) -> Option<&'a str> {
 /// Replaces: FactInstance { fact_type_id, bindings: vec![(k,v), ...] }
 pub fn fact_from_pairs(pairs: &[(&str, &str)]) -> Object {
     Object::Seq(pairs.iter().map(|(k, v)| {
-        Object::Seq(vec![Object::atom(k), Object::atom(v)])
+        Object::seq(vec![Object::atom(k), Object::atom(v)])
     }).collect())
 }
 
@@ -2449,7 +2458,7 @@ pub fn func_to_object(func: &Func) -> Object {
         Func::Construction(funcs) => {
             let mut items = vec![Object::atom(forms::CONS)];
             items.extend(funcs.iter().map(func_to_object));
-            Object::Seq(items) // not bottom-preserving — these are form objects
+            Object::Seq(items.into()) // not bottom-preserving — these are form objects
         }
         Func::Condition(p, f, g) => Object::seq(vec![
             Object::atom(forms::COND), func_to_object(p), func_to_object(f), func_to_object(g),
@@ -2543,13 +2552,13 @@ fn _register_theta1_native_legacy(defs: &mut Vec<(String, Func)>) {
                         let projected: Vec<Object> = selectors.iter()
                             .filter_map(|&s| (s >= 1 && s <= cols.len()).then(|| cols[s-1].clone()))
                             .collect();
-                        Some(Object::Seq(projected))
+                        Some(Object::Seq(projected.into()))
                     })
                     .fold(Vec::new(), |mut acc, row| {
                         (!acc.contains(&row)).then(|| acc.push(row));
                         acc
                     });
-                Some(Object::Seq(rows))
+                Some(Object::Seq(rows.into()))
             })
             .unwrap_or(Object::Bottom)
     }))));
@@ -2581,12 +2590,12 @@ fn _register_theta1_native_legacy(defs: &mut Vec<(String, Func)>) {
                                 merged.extend(s_cols.iter().enumerate()
                                     .filter(|(i, _)| i + 1 != shared_col)
                                     .map(|(_, col)| col.clone()));
-                                Object::Seq(merged)
+                                Object::Seq(merged.into())
                             })
                         })
                     })
                     .collect();
-                Some(Object::Seq(result))
+                Some(Object::Seq(result.into()))
             })
             .unwrap_or(Object::Bottom)
     }))));
@@ -2605,7 +2614,7 @@ fn _register_theta1_native_legacy(defs: &mut Vec<(String, Func)>) {
                     .filter_map(|tuple| {
                         let cols = tuple.as_seq()?;
                         (cols.len() >= 2 && cols[0] == cols[cols.len() - 1])
-                            .then(|| Object::Seq(cols[..cols.len()-1].to_vec()))
+                            .then(|| Object::Seq(cols[..cols.len()-1].into()))
                     })
                     .collect())
             })
@@ -2643,7 +2652,7 @@ fn _register_theta1_native_legacy(defs: &mut Vec<(String, Func)>) {
                                         .filter(|(i, _)| i + 1 != shared_col)
                                         .map(|(_, col)| col.clone()))
                                     .collect();
-                                Object::Seq(projected)
+                                Object::Seq(projected.into())
                             })
                         })
                     })
@@ -2651,7 +2660,7 @@ fn _register_theta1_native_legacy(defs: &mut Vec<(String, Func)>) {
                         (!acc.contains(&row)).then(|| acc.push(row));
                         acc
                     });
-                Some(Object::Seq(result))
+                Some(Object::Seq(result.into()))
             })
             .unwrap_or(Object::Bottom)
     }))));
@@ -2801,7 +2810,7 @@ mod tests {
 
     #[test]
     fn phi_is_empty_sequence() {
-        assert_eq!(Object::phi(), Object::Seq(vec![]));
+        assert_eq!(Object::phi(), Object::seq(vec![]));
     }
 
     // ── Primitives ───────────────────────────────────────────────
@@ -2897,8 +2906,8 @@ mod tests {
             ("name", "Brand"),
             ("objectType", "entity"),
         ]);
-        let state_a = store("Noun", Object::Seq(vec![rich.clone()]), &Object::phi());
-        let state_b = store("Noun", Object::Seq(vec![reference_only]), &Object::phi());
+        let state_a = store("Noun", Object::seq(vec![rich.clone()]), &Object::phi());
+        let state_b = store("Noun", Object::seq(vec![reference_only]), &Object::phi());
         let merged = merge_states(&state_a, &state_b);
         let nouns = fetch("Noun", &merged);
         let facts = nouns.as_seq().expect("Noun cell should be a seq");
@@ -2911,8 +2920,8 @@ mod tests {
     fn merge_states_dedupes_by_structural_equality() {
         // Identical facts in both states collapse to one.
         let fact = fact_from_pairs(&[("name", "Order"), ("objectType", "entity")]);
-        let state_a = store("Noun", Object::Seq(vec![fact.clone()]), &Object::phi());
-        let state_b = store("Noun", Object::Seq(vec![fact.clone()]), &Object::phi());
+        let state_a = store("Noun", Object::seq(vec![fact.clone()]), &Object::phi());
+        let state_b = store("Noun", Object::seq(vec![fact.clone()]), &Object::phi());
         let merged = merge_states(&state_a, &state_b);
         let nouns = fetch("Noun", &merged);
         assert_eq!(nouns.as_seq().map(|s| s.len()), Some(1));
@@ -2923,8 +2932,8 @@ mod tests {
         // Two different nouns in separate states both survive.
         let order = fact_from_pairs(&[("name", "Order"), ("objectType", "entity")]);
         let customer = fact_from_pairs(&[("name", "Customer"), ("objectType", "entity")]);
-        let state_a = store("Noun", Object::Seq(vec![order.clone()]), &Object::phi());
-        let state_b = store("Noun", Object::Seq(vec![customer.clone()]), &Object::phi());
+        let state_a = store("Noun", Object::seq(vec![order.clone()]), &Object::phi());
+        let state_b = store("Noun", Object::seq(vec![customer.clone()]), &Object::phi());
         let merged = merge_states(&state_a, &state_b);
         let nouns = fetch("Noun", &merged);
         let facts = nouns.as_seq().unwrap();
@@ -3412,15 +3421,15 @@ mod tests {
         // project:<⟨1,3⟩, R> = <<a,c>,<d,f>>
         let input = Object::seq(vec![
             Object::seq(vec![Object::atom("1"), Object::atom("3")]),
-            Object::Seq(vec![
+            Object::seq(vec![
                 Object::seq(vec![Object::atom("a"), Object::atom("b"), Object::atom("c")]),
                 Object::seq(vec![Object::atom("d"), Object::atom("e"), Object::atom("f")]),
             ]),
         ]);
         let result = apply_theta1("project", &input);
-        assert_eq!(result, Object::Seq(vec![
-            Object::Seq(vec![Object::atom("a"), Object::atom("c")]),
-            Object::Seq(vec![Object::atom("d"), Object::atom("f")]),
+        assert_eq!(result, Object::seq(vec![
+            Object::seq(vec![Object::atom("a"), Object::atom("c")]),
+            Object::seq(vec![Object::atom("d"), Object::atom("f")]),
         ]));
     }
 
@@ -3429,16 +3438,16 @@ mod tests {
         // project:<⟨1⟩, <<a,x>,<b,y>,<a,z>>> = <<a>,<b>> (a appears once)
         let input = Object::seq(vec![
             Object::seq(vec![Object::atom("1")]),
-            Object::Seq(vec![
+            Object::seq(vec![
                 Object::seq(vec![Object::atom("a"), Object::atom("x")]),
                 Object::seq(vec![Object::atom("b"), Object::atom("y")]),
                 Object::seq(vec![Object::atom("a"), Object::atom("z")]),
             ]),
         ]);
         let result = apply_theta1("project", &input);
-        assert_eq!(result, Object::Seq(vec![
-            Object::Seq(vec![Object::atom("a")]),
-            Object::Seq(vec![Object::atom("b")]),
+        assert_eq!(result, Object::seq(vec![
+            Object::seq(vec![Object::atom("a")]),
+            Object::seq(vec![Object::atom("b")]),
         ]));
     }
 
@@ -3459,11 +3468,11 @@ mod tests {
         // Natural join on "part" (col 2 in R, col 1 in S):
         // Our impl uses same-index join, which is simpler.
         // Use: shared_col=1, R and S both have col 1 as join key
-        let r = Object::Seq(vec![
+        let r = Object::seq(vec![
             Object::seq(vec![Object::atom("a"), Object::atom("x")]),
             Object::seq(vec![Object::atom("b"), Object::atom("y")]),
         ]);
-        let s = Object::Seq(vec![
+        let s = Object::seq(vec![
             Object::seq(vec![Object::atom("a"), Object::atom("1")]),
             Object::seq(vec![Object::atom("a"), Object::atom("2")]),
             Object::seq(vec![Object::atom("c"), Object::atom("3")]),
@@ -3473,9 +3482,9 @@ mod tests {
         let result = apply_theta1("join", &input);
         // Expected: <<a,x,1>, <a,x,2>> (a matched, x from R, 1/2 from S minus shared)
         // S cols excluding shared col 1: just col 2
-        assert_eq!(result, Object::Seq(vec![
-            Object::Seq(vec![Object::atom("a"), Object::atom("x"), Object::atom("1")]),
-            Object::Seq(vec![Object::atom("a"), Object::atom("x"), Object::atom("2")]),
+        assert_eq!(result, Object::seq(vec![
+            Object::seq(vec![Object::atom("a"), Object::atom("x"), Object::atom("1")]),
+            Object::seq(vec![Object::atom("a"), Object::atom("x"), Object::atom("2")]),
         ]));
     }
 
@@ -3484,15 +3493,15 @@ mod tests {
         // γ(R): select tuples where first = last, remove last column
         // R = <<a,1,a>,<b,2,c>,<c,3,c>>
         // tie:R = <<a,1>,<c,3>> (first=last for a and c)
-        let r = Object::Seq(vec![
+        let r = Object::seq(vec![
             Object::seq(vec![Object::atom("a"), Object::atom("1"), Object::atom("a")]),
             Object::seq(vec![Object::atom("b"), Object::atom("2"), Object::atom("c")]),
             Object::seq(vec![Object::atom("c"), Object::atom("3"), Object::atom("c")]),
         ]);
         let result = apply_theta1("tie", &r);
-        assert_eq!(result, Object::Seq(vec![
-            Object::Seq(vec![Object::atom("a"), Object::atom("1")]),
-            Object::Seq(vec![Object::atom("c"), Object::atom("3")]),
+        assert_eq!(result, Object::seq(vec![
+            Object::seq(vec![Object::atom("a"), Object::atom("1")]),
+            Object::seq(vec![Object::atom("c"), Object::atom("3")]),
         ]));
     }
 
@@ -3502,11 +3511,11 @@ mod tests {
         // R = <<a,x>,<b,y>>, S = <<x,1>,<y,2>>
         // compose_rel on col 2 of R = col 1 of S:
         // join gives <<a,x,1>,<b,y,2>>, project out col 2 gives <<a,1>,<b,2>>
-        let _r = Object::Seq(vec![
+        let _r = Object::seq(vec![
             Object::seq(vec![Object::atom("a"), Object::atom("x")]),
             Object::seq(vec![Object::atom("b"), Object::atom("y")]),
         ]);
-        let _s = Object::Seq(vec![
+        let _s = Object::seq(vec![
             Object::seq(vec![Object::atom("x"), Object::atom("1")]),
             Object::seq(vec![Object::atom("y"), Object::atom("2")]),
         ]);
@@ -3515,11 +3524,11 @@ mod tests {
         // Our impl uses same index for both, so use col 1:
         // Actually our compose_rel joins on shared_col in both, then removes it.
         // R' = <<x,a>>, S' = <<x,1>> with shared on col 1:
-        let r2 = Object::Seq(vec![
+        let r2 = Object::seq(vec![
             Object::seq(vec![Object::atom("x"), Object::atom("a")]),
             Object::seq(vec![Object::atom("y"), Object::atom("b")]),
         ]);
-        let s2 = Object::Seq(vec![
+        let s2 = Object::seq(vec![
             Object::seq(vec![Object::atom("x"), Object::atom("1")]),
             Object::seq(vec![Object::atom("y"), Object::atom("2")]),
         ]);
@@ -3527,9 +3536,9 @@ mod tests {
         let result = apply_theta1("compose_rel", &input);
         // x matches x: project out col 1 → <a, 1>
         // y matches y: project out col 1 → <b, 2>
-        assert_eq!(result, Object::Seq(vec![
-            Object::Seq(vec![Object::atom("a"), Object::atom("1")]),
-            Object::Seq(vec![Object::atom("b"), Object::atom("2")]),
+        assert_eq!(result, Object::seq(vec![
+            Object::seq(vec![Object::atom("a"), Object::atom("1")]),
+            Object::seq(vec![Object::atom("b"), Object::atom("2")]),
         ]));
     }
 
@@ -3680,7 +3689,7 @@ mod tests {
     fn cell_fetch_retrieves_contents() {
         // D = <<CELL, "FILE", <a,b>>, <CELL, "defs", <c>>>
         // ↑FILE:D = <a,b>
-        let state = Object::Seq(vec![
+        let state = Object::seq(vec![
             cell("FILE", Object::seq(vec![Object::atom("a"), Object::atom("b")])),
             cell("defs", Object::seq(vec![Object::atom("c")])),
         ]);
@@ -3691,7 +3700,7 @@ mod tests {
 
     #[test]
     fn cell_store_replaces_contents() {
-        let state = Object::Seq(vec![
+        let state = Object::seq(vec![
             cell("FILE", Object::seq(vec![Object::atom("old")])),
             cell("defs", Object::seq(vec![Object::atom("c")])),
         ]);
@@ -3702,7 +3711,7 @@ mod tests {
 
     #[test]
     fn cell_store_appends_new_cell() {
-        let state = Object::Seq(vec![
+        let state = Object::seq(vec![
             cell("FILE", Object::atom("data")),
         ]);
         let new_state = store("defs", Object::atom("rules"), &state);
@@ -3713,7 +3722,7 @@ mod tests {
     #[test]
     fn fetch_via_func_apply() {
         // fetch:<"FILE", D> via Func::Fetch
-        let state = Object::Seq(vec![
+        let state = Object::seq(vec![
             cell("FILE", Object::atom("population")),
         ]);
         let input = Object::seq(vec![Object::atom("FILE"), state]);
@@ -3723,7 +3732,7 @@ mod tests {
     #[test]
     fn store_via_func_apply() {
         // store:<"FILE", new_contents, D> via Func::Store
-        let state = Object::Seq(vec![
+        let state = Object::seq(vec![
             cell("FILE", Object::atom("old")),
         ]);
         let input = Object::seq(vec![Object::atom("FILE"), Object::atom("new"), state]);
@@ -3734,7 +3743,7 @@ mod tests {
     #[test]
     fn fetch_via_ffp() {
         // FFP: ("^":<"FILE", D>)
-        let state = Object::Seq(vec![
+        let state = Object::seq(vec![
             cell("FILE", Object::atom("pop")),
         ]);
         let input = Object::seq(vec![Object::atom("FILE"), state]);
@@ -3753,7 +3762,7 @@ mod tests {
             Object::atom("create"),
             Object::atom("validate"),
         ]);
-        let d = Object::Seq(vec![
+        let d = Object::seq(vec![
             cell("FILE", population.clone()),
             cell("defs", definitions.clone()),
         ]);
@@ -3814,7 +3823,7 @@ mod tests {
         // ρ<COMP, "1", "tl"> = 1 ∘ tl
         // (1 ∘ tl):<a,b,c> = 1:<b,c> = b
         let d = defs();
-        let obj = Object::Seq(vec![
+        let obj = Object::seq(vec![
             Object::atom(forms::COMP),
             Object::atom("1"),
             Object::atom(primitives::TL),
@@ -3829,7 +3838,7 @@ mod tests {
         // ρ<CONS, "1", "2"> = [1, 2]
         // [1, 2]:<a, b, c> = <a, b>
         let d = defs();
-        let obj = Object::Seq(vec![
+        let obj = Object::seq(vec![
             Object::atom(forms::CONS),
             Object::atom("1"),
             Object::atom("2"),
@@ -3843,11 +3852,11 @@ mod tests {
     fn metacompose_cond_sequence() {
         // ρ<COND, "null", <CONST, "empty">, <CONST, "notempty">> = (null → "empty"̄; "notempty"̄)
         let d = defs();
-        let obj = Object::Seq(vec![
+        let obj = Object::seq(vec![
             Object::atom(forms::COND),
             Object::atom(primitives::NULL),
-            Object::Seq(vec![Object::atom(forms::CONST), Object::atom("empty")]),
-            Object::Seq(vec![Object::atom(forms::CONST), Object::atom("notempty")]),
+            Object::seq(vec![Object::atom(forms::CONST), Object::atom("empty")]),
+            Object::seq(vec![Object::atom(forms::CONST), Object::atom("notempty")]),
         ]);
         let func = metacompose(&obj, &d);
         assert_eq!(apply(&func, &Object::phi(), &d), Object::atom("empty"));
@@ -3859,7 +3868,7 @@ mod tests {
         // ρ<INSERT, "+"> = /+
         // /+:<1,2,3> = 6
         let d = defs();
-        let obj = Object::Seq(vec![
+        let obj = Object::seq(vec![
             Object::atom(forms::INSERT),
             Object::atom(primitives::ADD),
         ]);
@@ -3873,7 +3882,7 @@ mod tests {
         // ρ<ALPHA, "1"> = α(1)
         // α(1):<<a,b>,<c,d>> = <a,c>
         let d = defs();
-        let obj = Object::Seq(vec![
+        let obj = Object::seq(vec![
             Object::atom(forms::ALPHA),
             Object::atom("1"),
         ]);
@@ -3889,7 +3898,7 @@ mod tests {
     fn metacompose_bu_sequence() {
         // ρ<BU, "eq", "owner"> = (bu eq "owner")
         let d = defs();
-        let obj = Object::Seq(vec![
+        let obj = Object::seq(vec![
             Object::atom(forms::BU),
             Object::atom(primitives::EQ),
             Object::atom("owner"),
@@ -3914,12 +3923,12 @@ mod tests {
         // Better: (<COMP, <INSERT, "+">, <ALPHA, "*">>:<<1,2,3>,<6,5,4>>) = 28
         // This is the inner product as an FFP object
         let d = defs();
-        let ip_obj = Object::Seq(vec![
+        let ip_obj = Object::seq(vec![
             Object::atom(forms::COMP),
-            Object::Seq(vec![Object::atom(forms::INSERT), Object::atom(primitives::ADD)]),
-            Object::Seq(vec![
+            Object::seq(vec![Object::atom(forms::INSERT), Object::atom(primitives::ADD)]),
+            Object::seq(vec![
                 Object::atom(forms::COMP),
-                Object::Seq(vec![Object::atom(forms::ALPHA), Object::atom(primitives::MUL)]),
+                Object::seq(vec![Object::atom(forms::ALPHA), Object::atom(primitives::MUL)]),
                 Object::atom(primitives::TRANS),
             ]),
         ]);
@@ -3955,9 +3964,9 @@ mod tests {
     fn filter_as_ffp_object() {
         // ρ<FILTER, <BU, "eq", "owner">> applied to sequence
         let d = defs();
-        let filter_obj = Object::Seq(vec![
+        let filter_obj = Object::seq(vec![
             Object::atom(forms::FILTER),
-            Object::Seq(vec![
+            Object::seq(vec![
                 Object::atom(forms::BU),
                 Object::atom(primitives::EQ),
                 Object::atom("owner"),
@@ -4104,7 +4113,7 @@ mod tests {
 
     #[test]
     fn fetch_or_phi_returns_contents_for_existing_cell() {
-        let state = Object::Seq(vec![cell("nouns", Object::atom("Alice"))]);
+        let state = Object::seq(vec![cell("nouns", Object::atom("Alice"))]);
         assert_eq!(fetch_or_phi("nouns", &state), Object::atom("Alice"));
     }
 
@@ -4113,7 +4122,7 @@ mod tests {
         let state = Object::phi();
         let fact = fact_from_pairs(&[("name", "Alice")]);
         let state2 = cell_push("Noun", fact.clone(), &state);
-        assert_eq!(fetch_or_phi("Noun", &state2), Object::Seq(vec![fact]));
+        assert_eq!(fetch_or_phi("Noun", &state2), Object::seq(vec![fact]));
     }
 
     #[test]
@@ -4122,12 +4131,12 @@ mod tests {
         let f2 = fact_from_pairs(&[("name", "Bob")]);
         let state = cell_push("Noun", f1.clone(), &Object::phi());
         let state2 = cell_push("Noun", f2.clone(), &state);
-        assert_eq!(fetch_or_phi("Noun", &state2), Object::Seq(vec![f1, f2]));
+        assert_eq!(fetch_or_phi("Noun", &state2), Object::seq(vec![f1, f2]));
     }
 
     #[test]
     fn cells_iter_enumerates_all_cells() {
-        let state = Object::Seq(vec![
+        let state = Object::seq(vec![
             cell("A", Object::atom("1")),
             cell("B", Object::atom("2")),
         ]);
@@ -4169,15 +4178,15 @@ mod tests {
         let state = cell_push("Noun", f1.clone(), &Object::phi());
         let state = cell_push("Noun", f2, &state);
         let state = cell_filter("Noun", |f| binding_matches(f, "name", "Alice"), &state);
-        assert_eq!(fetch_or_phi("Noun", &state), Object::Seq(vec![f1]));
+        assert_eq!(fetch_or_phi("Noun", &state), Object::seq(vec![f1]));
     }
 
     #[test]
     fn cell_push_preserves_other_cells() {
         let state = cell_push("A", Object::atom("1"), &Object::phi());
         let state = cell_push("B", Object::atom("2"), &state);
-        assert_eq!(fetch_or_phi("A", &state), Object::Seq(vec![Object::atom("1")]));
-        assert_eq!(fetch_or_phi("B", &state), Object::Seq(vec![Object::atom("2")]));
+        assert_eq!(fetch_or_phi("A", &state), Object::seq(vec![Object::atom("1")]));
+        assert_eq!(fetch_or_phi("B", &state), Object::seq(vec![Object::atom("2")]));
     }
 
     // ── Security #22: Evolution state machine trace ──────────────
@@ -4945,7 +4954,7 @@ mod tests {
         profile_reset();
         profile_enable();
         let d = Object::phi();
-        let x = Object::Seq(vec![Object::atom("a"), Object::atom("b")]);
+        let x = Object::seq(vec![Object::atom("a"), Object::atom("b")]);
         // Each of these triggers the corresponding apply-branch once.
         let _ = apply(&Func::Selector(1), &x, &d);
         let _ = apply(&Func::Constant(Object::atom("c")), &x, &d);
@@ -4971,12 +4980,12 @@ mod tests {
         // Observational equivalence: apply(normalize(f), x, d) == apply(f, x, d)
         // on representative inputs for each rewrite rule.
         let d = Object::phi();
-        let x_seq3 = Object::Seq(vec![
-            Object::Seq(vec![Object::atom("a0"), Object::atom("a1")]),
-            Object::Seq(vec![Object::atom("b0"), Object::atom("b1")]),
-            Object::Seq(vec![Object::atom("c0"), Object::atom("c1")]),
+        let x_seq3 = Object::seq(vec![
+            Object::seq(vec![Object::atom("a0"), Object::atom("a1")]),
+            Object::seq(vec![Object::atom("b0"), Object::atom("b1")]),
+            Object::seq(vec![Object::atom("c0"), Object::atom("c1")]),
         ]);
-        let x_pair = Object::Seq(vec![Object::atom("x"), Object::atom("y")]);
+        let x_pair = Object::seq(vec![Object::atom("x"), Object::atom("y")]);
 
         let cases: Vec<(Func, Object)> = vec![
             (Func::Compose(Box::new(Func::Id), Box::new(sel1())), x_pair.clone()),
@@ -4984,9 +4993,9 @@ mod tests {
             (Func::Compose(
                 Box::new(Func::ApplyToAll(Box::new(sel1()))),
                 Box::new(Func::ApplyToAll(Box::new(sel2()))),
-             ), Object::Seq(vec![
-                Object::Seq(vec![Object::Seq(vec![Object::atom("inner-a0"), Object::atom("inner-a1")])]),
-                Object::Seq(vec![Object::Seq(vec![Object::atom("inner-b0"), Object::atom("inner-b1")])]),
+             ), Object::seq(vec![
+                Object::seq(vec![Object::seq(vec![Object::atom("inner-a0"), Object::atom("inner-a1")])]),
+                Object::seq(vec![Object::seq(vec![Object::atom("inner-b0"), Object::atom("inner-b1")])]),
              ])),
             (Func::Construction(vec![
                 Func::Constant(Object::atom("k1")),

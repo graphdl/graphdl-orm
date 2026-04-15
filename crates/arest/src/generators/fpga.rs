@@ -114,7 +114,7 @@ mod tests {
             .iter()
             .map(|(n, t)| fact_from_pairs(&[("name", n), ("objectType", t)]))
             .collect();
-        store("Noun", Object::Seq(nouns), &Object::phi())
+        store("Noun", Object::Seq(nouns.into()), &Object::phi())
     }
 
     /// Minimal Order domain: one entity noun with a reference scheme and one
