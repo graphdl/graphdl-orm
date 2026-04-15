@@ -109,6 +109,13 @@ pub struct DerivationRuleDef {
     /// Filter(p) : P over the filtered antecedent facts.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub antecedent_filters: Vec<AntecedentFilter>,
+    /// Consequent roles whose values are computed from arithmetic over
+    /// antecedent role values. Halpin FORML attribute-style definitions:
+    ///   * Box has Volume iff Box has Size and Volume is Size * Size * Size.
+    /// The `Volume is Size * Size * Size` clause populates this with one
+    /// ConsequentComputedBinding { role: "Volume", expr: ... }.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub consequent_computed_bindings: Vec<ConsequentComputedBinding>,
 }
 
 /// Numeric comparison that further restricts a derivation antecedent.
@@ -125,6 +132,36 @@ pub struct AntecedentFilter {
     pub op: String,
     /// Numeric RHS literal.
     pub value: f64,
+}
+
+/// Halpin FORML arithmetic expression used in attribute-style definitions
+/// such as `Duration is End Time - Start Time`. Left-associative and flat
+/// (no explicit precedence between + - * /): operators evaluate in the
+/// order they appear. Parentheses aren't supported yet.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum ArithExpr {
+    /// Reference to a role by name; resolved at compile time against the
+    /// antecedent fact type's role list.
+    RoleRef(String),
+    /// Numeric literal baked in at parse time.
+    Literal(f64),
+    /// Binary operator — op is one of `"+"`, `"-"`, `"*"`, `"/"`.
+    Op(String, Box<ArithExpr>, Box<ArithExpr>),
+}
+
+/// A consequent-role binding whose value is computed from an arithmetic
+/// expression over antecedent role values, e.g. Halpin's
+///   `Duration is End Time - Start Time`
+/// where `Duration` is the computed role and `End Time - Start Time` is
+/// the expression evaluated against each antecedent fact.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConsequentComputedBinding {
+    /// Consequent role name (e.g., "Duration").
+    pub role: String,
+    /// Expression tree to evaluate against antecedent bindings.
+    pub expr: ArithExpr,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]

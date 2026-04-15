@@ -1315,7 +1315,7 @@ pub fn state_to_domain(state: &crate::ast::Object) -> Domain {
             DerivationRuleDef {
                 id: get("id"), text: get("text"), antecedent_fact_type_ids: vec![],
                 consequent_fact_type_id: get("consequentFactTypeId"),
-                kind: DerivationKind::ModusPonens, join_on: vec![], match_on: vec![], consequent_bindings: vec![], antecedent_filters: vec![],
+                kind: DerivationKind::ModusPonens, join_on: vec![], match_on: vec![], consequent_bindings: vec![], antecedent_filters: vec![], consequent_computed_bindings: vec![],
             }
         }).collect())
         .unwrap_or_default();
@@ -1600,6 +1600,40 @@ fn format_numeric_atom(v: f64) -> String {
     }
 }
 
+/// Compile a Halpin arithmetic expression (Box::Volume = Size * Size * Size)
+/// into a Func that, given a single antecedent fact, produces the value.
+///
+/// Role references lower to `role_value(i)` against the antecedent FT's
+/// role list; numeric literals become constant atoms via format_numeric_atom
+/// (so `1.0` stays `"1"` and round-trips through apply_compare / apply_arith
+/// unambiguously). Binary ops wrap `Func::Add|Sub|Mul|Div` around a pair
+/// construction of the two sides — `op . [lhs, rhs]`. Unknown ops fall back
+/// to Add rather than panicking so a misbuilt IR still compiles.
+fn compile_arith_expr(expr: &crate::types::ArithExpr, ft: &crate::types::FactTypeDef) -> Func {
+    use crate::types::ArithExpr;
+    match expr {
+        ArithExpr::Literal(v) => Func::constant(Object::atom(&format_numeric_atom(*v))),
+        ArithExpr::RoleRef(name) => {
+            let idx = ft.roles.iter().find(|r| r.noun_name == *name)
+                .map(|r| r.role_index)
+                .unwrap_or(0);
+            role_value(idx)
+        }
+        ArithExpr::Op(op, lhs, rhs) => {
+            let l = compile_arith_expr(lhs, ft);
+            let r = compile_arith_expr(rhs, ft);
+            let op_func = match op.as_str() {
+                "+" => Func::Add,
+                "-" => Func::Sub,
+                "*" => Func::Mul,
+                "/" => Func::Div,
+                _   => Func::Add,
+            };
+            Func::compose(op_func, Func::construction(vec![l, r]))
+        }
+    }
+}
+
 /// Build the predicate that Func::filter will apply to each fact of an
 /// antecedent Seq to enforce an AntecedentFilter (Halpin Example 5's
 /// `has Population >= 1000000`). Returns `None` if the filter's `role`
@@ -1688,14 +1722,38 @@ fn compile_explicit_derivation(ir: &Domain, rule: &DerivationRuleDef) -> Compile
             let ft_id = &antecedent_ids[0];
             // Per-fact derived: input is one antecedent fact (already in
             // <<noun, val>, ...> binding-seq shape); output is
-            //   <consequent_id, consequent_reading, antecedent_bindings>.
-            // Identity on the bindings position reuses the antecedent's
-            // binding seq verbatim — same behaviour the old existence path
-            // used for its single emit, now applied to each fact.
+            //   <consequent_id, consequent_reading, consequent_bindings>.
+            //
+            // consequent_bindings starts as the antecedent's bindings
+            // (Func::Id passes them through unchanged). If the rule has
+            // arithmetic definitions on consequent roles (Halpin's
+            // `Volume is Size * Size * Size`), each computed binding is
+            // built as a <role_name, computed_value> pair and appended
+            // via Concat . [Id, <p1, p2, ...>]. Evaluation order ensures
+            // the computed values see the antecedent fact's raw bindings.
+            let bindings_func: Func = if rule.consequent_computed_bindings.is_empty() {
+                Func::Id
+            } else if let Some(ft) = ir.fact_types.get(ft_id) {
+                let computed_pairs: Vec<Func> = rule.consequent_computed_bindings.iter().map(|cb| {
+                    Func::construction(vec![
+                        Func::constant(Object::atom(&cb.role)),
+                        compile_arith_expr(&cb.expr, ft),
+                    ])
+                }).collect();
+                Func::compose(
+                    Func::Concat,
+                    Func::construction(vec![
+                        Func::Id,
+                        Func::construction(computed_pairs),
+                    ]),
+                )
+            } else {
+                Func::Id
+            };
             let derive_one = Func::construction(vec![
                 Func::constant(Object::atom(&consequent_id)),
                 Func::constant(Object::atom(&consequent_reading)),
-                Func::Id,
+                bindings_func,
             ]);
             Func::compose(Func::apply_to_all(derive_one), extract(0, ft_id))
         }

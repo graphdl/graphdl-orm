@@ -1999,6 +1999,7 @@ mod tests {
                 match_on: vec![],
                 consequent_bindings: vec![],
                 antecedent_filters: filter.into_iter().collect(),
+                consequent_computed_bindings: vec![],
             }],
             general_instance_facts: vec![],
             subtypes: HashMap::new(), enum_values: HashMap::new(),
@@ -2126,6 +2127,160 @@ mod tests {
         assert!(!names.contains("Charlie"), "sub-threshold city must not derive");
     }
 
+    // ── Arithmetic definitional clauses, end-to-end ──
+    //
+    // A rule like `* Foo has Doubled iff Foo has Val and Doubled is Val + Val.`
+    // records a ConsequentComputedBinding { role: "Doubled", expr: Val + Val }
+    // which the compile side turns into a per-fact Func that appends the
+    // computed pair to the antecedent's bindings.
+
+    fn val_derived_ir(expr: crate::types::ArithExpr, derived_role: &str) -> Domain {
+        let mut fact_types = HashMap::new();
+        fact_types.insert("foo_has_val".to_string(), FactTypeDef {
+            schema_id: String::new(),
+            reading: "Foo has Val".to_string(),
+            readings: vec![],
+            roles: vec![
+                RoleDef { noun_name: "Foo".to_string(), role_index: 0 },
+                RoleDef { noun_name: "Val".to_string(), role_index: 1 },
+            ],
+        });
+        fact_types.insert("foo_has_derived".to_string(), FactTypeDef {
+            schema_id: String::new(),
+            reading: format!("Foo has {}", derived_role),
+            readings: vec![],
+            roles: vec![
+                RoleDef { noun_name: "Foo".to_string(), role_index: 0 },
+                RoleDef { noun_name: derived_role.to_string(), role_index: 1 },
+            ],
+        });
+        Domain {
+            domain: "test".to_string(),
+            nouns: HashMap::new(),
+            fact_types,
+            constraints: vec![],
+            state_machines: HashMap::new(),
+            derivation_rules: vec![DerivationRuleDef {
+                id: "arith-rule".to_string(),
+                text: format!("* Foo has {} iff Foo has Val and ...", derived_role),
+                antecedent_fact_type_ids: vec!["foo_has_val".to_string()],
+                consequent_fact_type_id: "foo_has_derived".to_string(),
+                kind: DerivationKind::ModusPonens,
+                join_on: vec![],
+                match_on: vec![],
+                consequent_bindings: vec![],
+                antecedent_filters: vec![],
+                consequent_computed_bindings: vec![crate::types::ConsequentComputedBinding {
+                    role: derived_role.to_string(),
+                    expr,
+                }],
+            }],
+            general_instance_facts: vec![],
+            subtypes: HashMap::new(), enum_values: HashMap::new(),
+            ref_schemes: HashMap::new(), objectifications: HashMap::new(),
+            named_spans: HashMap::new(), autofill_spans: vec![],
+        }
+    }
+
+    fn val_ref() -> crate::types::ArithExpr {
+        crate::types::ArithExpr::RoleRef("Val".to_string())
+    }
+
+    fn lit(n: f64) -> crate::types::ArithExpr {
+        crate::types::ArithExpr::Literal(n)
+    }
+
+    fn bin(op: &str, l: crate::types::ArithExpr, r: crate::types::ArithExpr) -> crate::types::ArithExpr {
+        crate::types::ArithExpr::Op(op.to_string(), Box::new(l), Box::new(r))
+    }
+
+    #[test]
+    fn arithmetic_add_computes_role_plus_role() {
+        let ir = val_derived_ir(bin("+", val_ref(), val_ref()), "Doubled");
+        let (_meta_pop, defs, _def_map) = ir_to_defs(&ir);
+
+        let mut pop_state = ast::Object::phi();
+        pop_state = ast::cell_push("foo_has_val",
+            ast::fact_from_pairs(&[("Foo", "f1"), ("Val", "7")]), &pop_state);
+
+        let dd = derivation_defs_from(&defs);
+        let (_new_state, derived) = forward_chain_defs_state(&dd, &pop_state);
+
+        let out: Vec<_> = derived.iter().filter(|d| d.fact_type_id == "foo_has_derived").collect();
+        assert_eq!(out.len(), 1);
+        assert!(out[0].bindings.iter().any(|(k, v)| k == "Doubled" && v == "14"),
+            "expected ('Doubled','14'), got {:?}", out[0].bindings);
+    }
+
+    #[test]
+    fn arithmetic_sub_computes_role_minus_literal() {
+        let ir = val_derived_ir(bin("-", val_ref(), lit(3.0)), "Less");
+        let (_meta_pop, defs, _def_map) = ir_to_defs(&ir);
+
+        let mut pop_state = ast::Object::phi();
+        pop_state = ast::cell_push("foo_has_val",
+            ast::fact_from_pairs(&[("Foo", "f1"), ("Val", "10")]), &pop_state);
+
+        let dd = derivation_defs_from(&defs);
+        let (_new_state, derived) = forward_chain_defs_state(&dd, &pop_state);
+
+        let out: Vec<_> = derived.iter().filter(|d| d.fact_type_id == "foo_has_derived").collect();
+        assert_eq!(out.len(), 1);
+        assert!(out[0].bindings.iter().any(|(k, v)| k == "Less" && v == "7"),
+            "expected ('Less','7'), got {:?}", out[0].bindings);
+    }
+
+    #[test]
+    fn arithmetic_mul_and_div_chain_left_associative() {
+        // (Val * 3) / 2 applied to Val=10 → 15.
+        let expr = bin("/", bin("*", val_ref(), lit(3.0)), lit(2.0));
+        let ir = val_derived_ir(expr, "Scaled");
+        let (_meta_pop, defs, _def_map) = ir_to_defs(&ir);
+
+        let mut pop_state = ast::Object::phi();
+        pop_state = ast::cell_push("foo_has_val",
+            ast::fact_from_pairs(&[("Foo", "f1"), ("Val", "10")]), &pop_state);
+
+        let dd = derivation_defs_from(&defs);
+        let (_new_state, derived) = forward_chain_defs_state(&dd, &pop_state);
+
+        let out: Vec<_> = derived.iter().filter(|d| d.fact_type_id == "foo_has_derived").collect();
+        assert_eq!(out.len(), 1);
+        assert!(out[0].bindings.iter().any(|(k, v)| k == "Scaled" && v == "15"),
+            "expected ('Scaled','15'), got {:?}", out[0].bindings);
+    }
+
+    #[test]
+    fn arithmetic_fanout_computes_per_fact_independently() {
+        // Three Foo facts with different Vals → three derivations, each
+        // carrying its own computed value.
+        let ir = val_derived_ir(bin("*", val_ref(), lit(2.0)), "Twice");
+        let (_meta_pop, defs, _def_map) = ir_to_defs(&ir);
+
+        let mut pop_state = ast::Object::phi();
+        for (id, val) in [("a", "3"), ("b", "5"), ("c", "11")] {
+            pop_state = ast::cell_push("foo_has_val",
+                ast::fact_from_pairs(&[("Foo", id), ("Val", val)]), &pop_state);
+        }
+
+        let dd = derivation_defs_from(&defs);
+        let (_new_state, derived) = forward_chain_defs_state(&dd, &pop_state);
+
+        let out: Vec<_> = derived.iter().filter(|d| d.fact_type_id == "foo_has_derived").collect();
+        assert_eq!(out.len(), 3);
+        let mut pairs: Vec<(String, String)> = out.iter().map(|d| {
+            let foo = d.bindings.iter().find(|(k, _)| k == "Foo").map(|(_, v)| v.clone()).unwrap_or_default();
+            let tw  = d.bindings.iter().find(|(k, _)| k == "Twice").map(|(_, v)| v.clone()).unwrap_or_default();
+            (foo, tw)
+        }).collect();
+        pairs.sort();
+        assert_eq!(pairs, vec![
+            ("a".to_string(), "6".to_string()),
+            ("b".to_string(), "10".to_string()),
+            ("c".to_string(), "22".to_string()),
+        ]);
+    }
+
     #[test]
     fn rule_without_filter_fires_for_any_fact_regression() {
         // Regression: when antecedent_filters is empty, behavior is
@@ -2190,7 +2345,7 @@ mod tests {
                 join_on: vec!["Key".to_string()],
                 match_on: vec![],
                 consequent_bindings: vec!["A".to_string(), "B".to_string()],
-                antecedent_filters: vec![],
+                antecedent_filters: vec![], consequent_computed_bindings: vec![],
             }],
             general_instance_facts: vec![],
             subtypes: HashMap::new(), enum_values: HashMap::new(),
@@ -2271,7 +2426,7 @@ mod tests {
                 join_on: vec!["Key".to_string(), "X".to_string()],
                 match_on: vec![],
                 consequent_bindings: vec!["Y".to_string(), "X".to_string()],
-                antecedent_filters: vec![],
+                antecedent_filters: vec![], consequent_computed_bindings: vec![],
             }],
             general_instance_facts: vec![],
             subtypes: HashMap::new(), enum_values: HashMap::new(),
@@ -2341,7 +2496,7 @@ mod tests {
                 join_on: vec![],
                 match_on: vec![("Full Name".to_string(), "Short Name".to_string())],
                 consequent_bindings: vec!["B".to_string(), "A".to_string()],
-                antecedent_filters: vec![],
+                antecedent_filters: vec![], consequent_computed_bindings: vec![],
             }],
             general_instance_facts: vec![],
             subtypes: HashMap::new(), enum_values: HashMap::new(),
@@ -2411,7 +2566,7 @@ mod tests {
                 join_on: vec!["Key".to_string()],
                 match_on: vec![],
                 consequent_bindings: vec!["A".to_string(), "B".to_string()],
-                antecedent_filters: vec![],
+                antecedent_filters: vec![], consequent_computed_bindings: vec![],
             }],
             general_instance_facts: vec![],
             subtypes: HashMap::new(), enum_values: HashMap::new(),
