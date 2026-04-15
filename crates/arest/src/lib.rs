@@ -28,6 +28,7 @@ pub mod command;
 pub mod crypto;
 pub mod generators;
 pub mod quota;
+pub mod scheduler;
 
 #[cfg(feature = "wasm-lower")]
 pub mod wasm_lower;

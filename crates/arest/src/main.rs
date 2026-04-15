@@ -43,6 +43,8 @@ mod verbalize;
 #[allow(dead_code)]
 mod command;
 #[allow(dead_code)]
+mod scheduler;
+#[allow(dead_code)]
 mod validate;
 #[allow(dead_code)]
 mod induce;
