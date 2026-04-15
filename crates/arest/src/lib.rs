@@ -36,8 +36,14 @@ pub mod cloudflare;
 
 /// D: the unified state — population cells + def cells in one Object.
 /// Backus Sec. 14.3: "the state D of an AST system."
+///
+/// `snapshots` holds named captures of `d` taken via `system(h,
+/// "snapshot", "")` and restorable via `system(h, "rollback", id)`.
+/// Cheap in memory because `d` is `Arc`-shared internally (#151) —
+/// a snapshot is one map insert plus an Arc ref bump per cell.
 struct CompiledState {
     d: ast::Object,
+    snapshots: std::collections::HashMap<String, ast::Object>,
 }
 
 // Per docs/11-system-as-os-kernel.md: the process table.
@@ -68,7 +74,7 @@ fn allocate(state: ast::Object, defs: Vec<(String, ast::Func)>) -> u32 {
     let d = ast::defs_to_state(&defs, &state);
     let mut s = ds().lock().unwrap();
     let h = s.iter().position(|x| x.is_none()).unwrap_or_else(|| { s.push(None); s.len() - 1 });
-    s[h] = Some(Arc::new(Mutex::new(CompiledState { d })));
+    s[h] = Some(Arc::new(Mutex::new(CompiledState { d, snapshots: std::collections::HashMap::new() })));
     h as u32
 }
 
@@ -194,7 +200,7 @@ fn create_impl() -> u32 {
     let d = metamodel_state().clone();
     let mut s = ds().lock().unwrap();
     let h = s.iter().position(|x| x.is_none()).unwrap_or_else(|| { s.push(None); s.len() - 1 });
-    s[h] = Some(Arc::new(Mutex::new(CompiledState { d })));
+    s[h] = Some(Arc::new(Mutex::new(CompiledState { d, snapshots: std::collections::HashMap::new() })));
     h as u32
 }
 
@@ -228,6 +234,50 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
         None => return "⊥".into(),
     };
     let mut st = tenant.lock().unwrap();
+
+    // `snapshot` and `rollback` operate on CompiledState (the handle's
+    // whole state + its snapshot map), which the Func::Platform dispatch
+    // path can't reach — apply() has access to D but not CompiledState.
+    // Intercept them here before the ρ-dispatch.
+    //
+    //   system(h, "snapshot", "")      → <snap-id>                (fresh id)
+    //   system(h, "snapshot", "label") → label                    (caller-named)
+    //   system(h, "rollback", "id")    → id on success, ⊥ on miss
+    //   system(h, "snapshots", "")     → <id₁, id₂, ...> FFP seq
+    //
+    // Input to snapshot is optional: empty string means "auto-generate a
+    // label of the form snap-N"; a non-empty input becomes the label
+    // verbatim (overwriting any existing snapshot with that label).
+    if key == "snapshot" {
+        let label = if input.is_empty() {
+            format!("snap-{}", st.snapshots.len())
+        } else {
+            input.to_string()
+        };
+        let snap = st.d.clone();
+        st.snapshots.insert(label.clone(), snap);
+        return label;
+    }
+    if key == "rollback" {
+        return match st.snapshots.get(input).cloned() {
+            Some(snap) => {
+                st.d = snap;
+                input.to_string()
+            }
+            None => "⊥".into(),
+        };
+    }
+    if key == "snapshots" {
+        // FFP-style sequence literal: <id1, id2, ...>. Deterministic
+        // order (sorted) so tests can diff against a fixed string.
+        let mut ids: Vec<&String> = st.snapshots.keys().collect();
+        ids.sort();
+        return format!(
+            "<{}>",
+            ids.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+        );
+    }
+
     let obj = ast::Object::parse(input);
 
     // Single ρ-dispatch (Eq. 9)
@@ -589,5 +639,122 @@ Order has total.
 
         ast::profile_disable();
         ast::profile_dump();
+    }
+
+    // ── Snapshot / rollback (#158) ──────────────────────────────
+
+    #[test]
+    fn snapshot_returns_auto_id_when_input_empty() {
+        let h = create_bare_impl();
+        let id1 = system_impl(h, "snapshot", "");
+        let id2 = system_impl(h, "snapshot", "");
+        assert_eq!(id1, "snap-0", "first auto id");
+        assert_eq!(id2, "snap-1", "second auto id — monotonic counter");
+        release_impl(h);
+    }
+
+    #[test]
+    fn snapshot_accepts_caller_label_verbatim() {
+        let h = create_bare_impl();
+        assert_eq!(system_impl(h, "snapshot", "before-migrate"), "before-migrate");
+        assert_eq!(system_impl(h, "snapshot", "before-migrate"), "before-migrate",
+            "same label is idempotent — overwrites the prior snapshot");
+        release_impl(h);
+    }
+
+    #[test]
+    fn snapshots_listing_is_sorted_and_ffp_sequence() {
+        let h = create_bare_impl();
+        let _ = system_impl(h, "snapshot", "b");
+        let _ = system_impl(h, "snapshot", "a");
+        let _ = system_impl(h, "snapshot", "c");
+        assert_eq!(system_impl(h, "snapshots", ""), "<a, b, c>");
+        release_impl(h);
+    }
+
+    #[test]
+    fn rollback_to_missing_snapshot_returns_bottom() {
+        let h = create_bare_impl();
+        assert_eq!(system_impl(h, "rollback", "nonexistent"), "⊥");
+        release_impl(h);
+    }
+
+    #[test]
+    fn rollback_restores_state_to_snapshot() {
+        // Snapshot a known-good state; mutate it via direct cell write;
+        // rollback; confirm the cell is back to its pre-mutation content.
+        let h = alloc_with_noun("before");
+        let _ = system_impl(h, "snapshot", "v1");
+        // Mutate the Noun cell by replacing the whole state.
+        {
+            let tenant = tenant_lock(h).unwrap();
+            let mut st = tenant.lock().unwrap();
+            st.d = ast::store("Noun", ast::Object::atom("after"), &ast::Object::phi());
+        }
+        assert_eq!(
+            ast::fetch("Noun", &peek(h).unwrap()),
+            ast::Object::atom("after"),
+            "mutation landed"
+        );
+        // Roll back to v1.
+        assert_eq!(system_impl(h, "rollback", "v1"), "v1");
+        assert_eq!(
+            ast::fetch("Noun", &peek(h).unwrap()),
+            ast::Object::atom("before"),
+            "rollback restored the v1 payload"
+        );
+        release_impl(h);
+    }
+
+    #[test]
+    fn rollback_is_repeatable_from_same_snapshot() {
+        // One snapshot can be rolled back to many times — the snapshot
+        // map is not drained on rollback.
+        let h = alloc_with_noun("origin");
+        let _ = system_impl(h, "snapshot", "anchor");
+        for round in 0..3 {
+            {
+                let tenant = tenant_lock(h).unwrap();
+                let mut st = tenant.lock().unwrap();
+                st.d = ast::store(
+                    "Noun",
+                    ast::Object::atom(&format!("mutation-{round}")),
+                    &ast::Object::phi(),
+                );
+            }
+            assert_eq!(system_impl(h, "rollback", "anchor"), "anchor");
+            assert_eq!(
+                ast::fetch("Noun", &peek(h).unwrap()),
+                ast::Object::atom("origin"),
+                "round {round} rollback lands"
+            );
+        }
+        release_impl(h);
+    }
+
+    #[test]
+    fn snapshots_are_per_handle_not_shared() {
+        // h1's snapshot must be invisible to h2. Taking snapshots under
+        // the same label in different handles must not cross-contaminate.
+        let h1 = alloc_with_noun("h1-payload");
+        let h2 = alloc_with_noun("h2-payload");
+        let _ = system_impl(h1, "snapshot", "shared-label");
+
+        // h2 has no snapshot called "shared-label".
+        assert_eq!(system_impl(h2, "rollback", "shared-label"), "⊥");
+        assert_eq!(system_impl(h2, "snapshots", ""), "<>");
+
+        // h1 still sees its own snapshot.
+        assert_eq!(system_impl(h1, "snapshots", ""), "<shared-label>");
+        release_impl(h1);
+        release_impl(h2);
+    }
+
+    #[test]
+    fn snapshot_and_rollback_on_invalid_handle_return_bottom() {
+        // Invalid handles must not panic and must yield ⊥.
+        assert_eq!(system_impl(u32::MAX, "snapshot", ""), "⊥");
+        assert_eq!(system_impl(u32::MAX, "rollback", "whatever"), "⊥");
+        assert_eq!(system_impl(u32::MAX, "snapshots", ""), "⊥");
     }
 }
