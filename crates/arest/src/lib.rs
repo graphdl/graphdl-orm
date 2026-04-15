@@ -21,7 +21,6 @@ pub mod rmap;
 pub mod naming;
 pub mod validate;
 pub mod conceptual_query;
-pub mod parse_rule;
 pub mod parse_forml2;
 pub mod verbalize;
 pub mod command;
