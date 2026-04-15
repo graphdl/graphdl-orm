@@ -32,6 +32,8 @@ Domain Change has Rationale.
 Domain Change targets Domain.
   Each Domain Change targets exactly one Domain.
 
+Domain Change is valid *.
+
 ### Signal
 
 Signal leads to Domain Change.
@@ -63,7 +65,7 @@ It is forbidden that a Domain Change targeting Domain 'core' is applied without 
 
 ## Derivation Rules
 
-Domain Change is valid iff all proposed Model Elements are parseable as FORML 2 and the proposed population is consistent with the existing population in the target Domain and the proposed Constraints are satisfiable with the existing Constraints in the target Domain.
+* Domain Change is valid iff all proposed Model Elements are parseable as FORML 2 and the proposed population is consistent with the existing population in the target Domain and the proposed Constraints are satisfiable with the existing Constraints in the target Domain.
 
 ## Instance Facts
 

@@ -71,9 +71,9 @@ Domain has Access.
 
 ### Derived Fact Types
 
-User accesses Domain.
-App navigates Domain.
-App displays Noun.
+User accesses Domain +.
+App navigates Domain +.
+App displays Noun +.
 
 App extends App.
 
@@ -98,12 +98,12 @@ No Domain may cycle back to itself via one or more traversals through depends on
 
 If some User authenticates and that User does not own any Organization then that User owns some Organization and that Organization has Name that is that User's Email.
 
-User accesses Domain if User owns Organization and App belongs to that Organization and Domain belongs to that App.
-User accesses Domain if User administers Organization and App belongs to that Organization and Domain belongs to that App.
-User accesses Domain if User belongs to Organization and App belongs to that Organization and Domain belongs to that App.
-User accesses Domain if Domain has Access 'public'.
++ User accesses Domain if User owns Organization and App belongs to that Organization and Domain belongs to that App.
++ User accesses Domain if User administers Organization and App belongs to that Organization and Domain belongs to that App.
++ User accesses Domain if User belongs to Organization and App belongs to that Organization and Domain belongs to that App.
++ User accesses Domain if Domain has Access 'public'.
 
-App navigates Domain if App has navigable Domain.
++ App navigates Domain if App has navigable Domain.
 App uses Generator 'ilayer' if some Noun is displayed by some Element and that App contains some Domain and that Noun is defined in that Domain.
 
 ## Instance Facts
