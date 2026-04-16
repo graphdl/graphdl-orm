@@ -1214,6 +1214,87 @@ Supplier supplies Widget.
 
     // ── Audit-log Verilog ring buffer (#167) ──
 
+    // ── Counter domain end-to-end (#173) ──
+    //
+    // A single entity "Counter" with one integer "Count" column,
+    // walked through the whole FPGA pipeline: parse readings →
+    // compile_to_bundle → verify every family of emitted module
+    // shows up in the Verilog + every pipeline artefact
+    // (bundle.rom, manifest entries) lines up. Synthesizable
+    // under Icarus Verilog / Verilator via the testbench from #172.
+
+    #[test]
+    fn counter_domain_produces_all_fpga_module_families() {
+        let meta = parse_to_state(STATE_METAMODEL).unwrap();
+        let counter_readings = r#"
+# Counter
+
+## Entity Types
+
+Counter(.Counter Id) is an entity type.
+
+## Fact Types
+
+Counter has Count.
+"#;
+        let domain = parse_to_state_with_nouns(counter_readings, &meta).unwrap();
+        let state = merge_states(&meta, &domain);
+
+        let bundle = compile_to_bundle(&state);
+        let v = &bundle.verilog;
+
+        // Entity module for the Counter noun.
+        assert!(v.contains("module counter ("),
+            "counter entity module missing:\n{}", v);
+        // Per-noun BRAM bank (#166).
+        assert!(v.contains("module counter_bram "),
+            "counter_bram module missing");
+        // Audit log (#167).
+        assert!(v.contains("module audit_log "),
+            "audit_log module missing");
+        // Fact ingress / egress (#168).
+        assert!(v.contains("module fact_ingress ("));
+        assert!(v.contains("module fact_egress ("));
+        // Boot FSM (#170).
+        assert!(v.contains("module boot_fsm ("));
+        // Top aggregation (base + #164/#165 constraint + SM folds).
+        assert!(v.contains("module top ("));
+
+        // Bundle ROM carries the metamodel freeze image.
+        assert!(bundle.rom.starts_with(b"AREST"),
+            "freeze-image ROM magic must be present");
+
+        // Manifest lists the entity.
+        assert!(bundle.manifest.contains("\"Counter\""),
+            "manifest entities must name Counter:\n{}", bundle.manifest);
+    }
+
+    #[test]
+    fn counter_domain_with_testbench_is_self_simulating() {
+        let meta = parse_to_state(STATE_METAMODEL).unwrap();
+        let counter_readings = r#"
+# Counter
+
+## Entity Types
+
+Counter(.Counter Id) is an entity type.
+
+## Fact Types
+
+Counter has Count.
+"#;
+        let domain = parse_to_state_with_nouns(counter_readings, &meta).unwrap();
+        let state = merge_states(&meta, &domain);
+
+        let verilog = compile_to_verilog_with_testbench(&state);
+        // tb_top wraps top; iverilog + vvp terminate via $finish at
+        // cycle 20 so the full Counter pipeline simulates without
+        // external stimulus.
+        assert!(verilog.contains("module tb_top"));
+        assert!(verilog.contains("top dut ("));
+        assert!(verilog.contains("$finish"));
+    }
+
     // ── compile_to_bundle packaging (#171) ──
 
     #[test]
