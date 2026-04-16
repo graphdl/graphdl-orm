@@ -18,17 +18,20 @@ use hashbrown::{HashMap, HashSet};
 // std::time::Instant::now() (the Rust stdlib has no clock there). On
 // native builds we use real timing; on WASM we return a zero-duration
 // stub so the profile eprintlns still print but with 0ns.
-#[cfg(not(target_arch = "wasm32"))]
+// Timing shim. Real clock on native std builds; zero-duration stub on
+// WASM (no clock) and no_std (no std::time). The profile eprintlns
+// still compile but report 0ns where no clock is available.
+#[cfg(all(not(target_arch = "wasm32"), not(feature = "no_std")))]
 mod profile_timer {
     pub type Timer = std::time::Instant;
     pub fn now() -> Timer { std::time::Instant::now() }
 }
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", feature = "no_std"))]
 mod profile_timer {
     #[derive(Clone, Copy)]
     pub struct Timer;
     impl Timer {
-        pub fn elapsed(&self) -> std::time::Duration { std::time::Duration::ZERO }
+        pub fn elapsed(&self) -> core::time::Duration { core::time::Duration::ZERO }
     }
     pub fn now() -> Timer { Timer }
 }
@@ -462,17 +465,21 @@ fn derive_state_machines_from_facts(facts: &[GeneralInstanceFact]) -> HashMap<St
 // Compile an Object state into named FFP definitions.
 // All generators always produce all defs. Selection is at apply time:
 // SYSTEM:sql:sqlite:Order returns DDL, SYSTEM:xsd:Order returns XSD.
+#[cfg(not(feature = "no_std"))]
 thread_local! {
     static ACTIVE_GENERATORS: core::cell::RefCell<HashSet<String>> = core::cell::RefCell::new(HashSet::new());
 }
+#[cfg(not(feature = "no_std"))]
+pub fn set_active_generators(gens: HashSet<String>) { ACTIVE_GENERATORS.with(|g| *g.borrow_mut() = gens); }
+#[cfg(not(feature = "no_std"))]
+fn active_generators() -> HashSet<String> { ACTIVE_GENERATORS.with(|g| g.borrow().clone()) }
 
-pub fn set_active_generators(gens: HashSet<String>) {
-    ACTIVE_GENERATORS.with(|g| *g.borrow_mut() = gens);
-}
-
-fn active_generators() -> HashSet<String> {
-    ACTIVE_GENERATORS.with(|g| g.borrow().clone())
-}
+#[cfg(feature = "no_std")]
+static ACTIVE_GENERATORS_GLOBAL: crate::sync::Mutex<Option<HashSet<String>>> = crate::sync::Mutex::new(None);
+#[cfg(feature = "no_std")]
+pub fn set_active_generators(gens: HashSet<String>) { *ACTIVE_GENERATORS_GLOBAL.lock() = Some(gens); }
+#[cfg(feature = "no_std")]
+fn active_generators() -> HashSet<String> { ACTIVE_GENERATORS_GLOBAL.lock().clone().unwrap_or_default() }
 
 /// Return every App that opted into `generator` ("openapi", "sqlite", …).
 ///
@@ -519,10 +526,10 @@ fn apps_opted_into_generator(
 pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> {
     let t = profile_timer::now();
     let domain = state_to_domain(state);
-    eprintln!("[profile] state_to_domain: {:?} ({} nouns, {} fts, {} constraints)", t.elapsed(), domain.nouns.len(), domain.fact_types.len(), domain.constraints.len());
+    diag!("[profile] state_to_domain: {:?} ({} nouns, {} fts, {} constraints)", t.elapsed(), domain.nouns.len(), domain.fact_types.len(), domain.constraints.len());
     let t = profile_timer::now();
     let model = compile(&domain);
-    eprintln!("[profile] compile: {:?}", t.elapsed());
+    diag!("[profile] compile: {:?}", t.elapsed());
 
     // Generator opt-in (needed early for validate partitioning).
     let generators = {
@@ -534,7 +541,7 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
                 .collect()
         }
     };
-    eprintln!("  [profile] generators opted in: {:?}", generators);
+    diag!("  [profile] generators opted in: {:?}", generators);
 
     // Constraints -> named definitions — α(constraint → def)
     let mut defs: Vec<(String, Func)> = model.constraints.iter()
@@ -554,7 +561,7 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
         .filter(|c| app_constraint_ids.contains(&c.id))
         .map(|c| c.func.clone())
         .collect();
-    eprintln!("  [profile] validate: {} of {} constraints (SQL handles {})",
+    diag!("  [profile] validate: {} of {} constraints (SQL handles {})",
         app_constraints.len(), model.constraints.len(), model.constraints.len() - app_constraints.len());
     defs.push(("validate".to_string(), Func::compose(Func::Concat, Func::construction(app_constraints))));
 
@@ -696,7 +703,7 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
             }
         }
         let index_count: usize = noun_to_derivations.values().map(|v| v.len()).sum();
-        eprintln!("  [profile] derivation index: {} nouns, {} entries", noun_to_derivations.len(), index_count);
+        diag!("  [profile] derivation index: {} nouns, {} entries", noun_to_derivations.len(), index_count);
         defs.extend(noun_to_derivations.into_iter().map(|(noun, ids)| {
             (format!("derivation_index:{}", noun), Func::constant(Object::atom(&ids.join(","))))
         }));
@@ -710,7 +717,7 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
     // RMAP determines which entity cell owns each fact type.
     // Enables: E_n = Filter(eq ∘ [RMAP, n̄]) : E for per-cell event demux.
     let shard_map = crate::rmap::rmap_cell_map(&domain);
-    eprintln!("  [profile] shard map: {} fact types partitioned", shard_map.len());
+    diag!("  [profile] shard map: {} fact types partitioned", shard_map.len());
     defs.extend(shard_map.iter().map(|(ft_id, cell)| {
         (format!("shard:{}", ft_id), Func::constant(Object::atom(cell)))
     }));
@@ -999,7 +1006,7 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
 
             Some((format!("populate:{}", noun_name), Func::constant(config)))
         }));
-        eprintln!("  [profile] {} federation defs", backed_nouns.len());
+        diag!("  [profile] {} federation defs", backed_nouns.len());
     }
 
     // Query defs — α(schema → Platform dispatch). query:{ft_id} reads
@@ -1251,7 +1258,7 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
     let normalized: Vec<(String, Func)> = defs.into_iter()
         .map(|(name, func)| (name, crate::ast::normalize(&func)))
         .collect();
-    eprintln!("[profile] normalize pass: {:?} ({} defs)", t.elapsed(), normalized.len());
+    diag!("[profile] normalize pass: {:?} ({} defs)", t.elapsed(), normalized.len());
 
     normalized
 }
@@ -1424,7 +1431,7 @@ pub(crate) fn compile(ir: &Domain) -> CompiledModel {
     let constraints: Vec<CompiledConstraint> = ir.constraints.iter()
         .map(|def| compile_constraint(ir, def))
         .collect();
-    eprintln!("  [profile] {} constraints: {:?}", constraints.len(), t0.elapsed());
+    diag!("  [profile] {} constraints: {:?}", constraints.len(), t0.elapsed());
 
     let t1 = profile_timer::now();
     let sm_defs = derive_state_machines_from_facts(&ir.general_instance_facts);
@@ -1432,19 +1439,19 @@ pub(crate) fn compile(ir: &Domain) -> CompiledModel {
     let state_machines: Vec<CompiledStateMachine> = sm_source.values()
         .map(|sm_def| compile_state_machine(sm_def, &constraints))
         .collect();
-    eprintln!("  [profile] {} state machines: {:?}", state_machines.len(), t1.elapsed());
+    diag!("  [profile] {} state machines: {:?}", state_machines.len(), t1.elapsed());
 
     let t2 = profile_timer::now();
     let noun_index = build_noun_index(ir, &constraints, &state_machines);
-    eprintln!("  [profile] noun index: {:?}", t2.elapsed());
+    diag!("  [profile] noun index: {:?}", t2.elapsed());
 
     let t3 = profile_timer::now();
     let derivations = compile_derivations(ir, sm_source);
-    eprintln!("  [profile] {} derivations: {:?}", derivations.len(), t3.elapsed());
+    diag!("  [profile] {} derivations: {:?}", derivations.len(), t3.elapsed());
 
     let t4 = profile_timer::now();
     let schemas = compile_schemas(ir);
-    eprintln!("  [profile] {} schemas: {:?}", schemas.len(), t4.elapsed());
+    diag!("  [profile] {} schemas: {:?}", schemas.len(), t4.elapsed());
 
     // Build fact-to-event mapping from schemas + state machines.
     // For each fact type, check if any role's noun has a state machine.
@@ -1561,10 +1568,10 @@ fn compile_derivations(ir: &Domain, sm_defs: &HashMap<String, StateMachineDef>) 
     // Implicit: state machine initialization from SM definitions
     // Uses sm_defs (derived from instance facts) rather than ir.state_machines.
     let sm_init_derivations: Vec<_> = sm_defs.iter().map(|(noun_name, sm_def)| {
-        eprintln!("  [profile] compiling SM init for noun={} initial={}", noun_name, sm_def.statuses.first().unwrap_or(&String::new()));
+        diag!("  [profile] compiling SM init for noun={} initial={}", noun_name, sm_def.statuses.first().unwrap_or(&String::new()));
         compile_sm_init_for(noun_name, sm_def)
     }).collect();
-    eprintln!("  [profile] {} SM init derivations", sm_init_derivations.len());
+    diag!("  [profile] {} SM init derivations", sm_init_derivations.len());
     derivations.extend(sm_init_derivations);
 
     derivations
@@ -4418,7 +4425,7 @@ pub fn generate_derivation_triggers(
         }
     }
 
-    eprintln!("  [trigger] {} SQL triggers from {} derivation rules", result.len(), domain.derivation_rules.len());
+    diag!("  [trigger] {} SQL triggers from {} derivation rules", result.len(), domain.derivation_rules.len());
     result
 }
 
