@@ -17,10 +17,10 @@
 //                 └─> SERIAL banner
 //                 └─> hlt loop (waits for IRQs)
 //
-// With the PIC live, the `hlt` loop now wakes on every keyboard
-// scancode and echoes the decoded character over serial. That is
-// the interactive baseline the REPL (#183) will replace with a
-// line-buffered dispatch into system_impl.
+// With the PIC live the `hlt` loop wakes on every keyboard scancode.
+// The REPL (#183) accumulates keystrokes into a line buffer and
+// dispatches commands on Enter. The arest engine is not yet linked
+// so all non-built-in input returns a stub message.
 
 #![no_std]
 #![no_main]
@@ -32,6 +32,7 @@ mod allocator;
 mod gdt;
 mod interrupts;
 mod memory;
+mod repl;
 mod serial;
 
 use alloc::string::ToString;
@@ -69,8 +70,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     x86_64::instructions::interrupts::int3();
     println!("  idt:   int3 round-tripped through breakpoint handler");
 
+    println!("  repl:   line-buffered keyboard REPL online (#183)");
     println!();
-    println!("type on the keyboard — every keypress echoes over serial.");
+
+    // Print initial prompt — REPL is now live.
+    repl::init();
 
     halt_forever();
 }
