@@ -245,6 +245,75 @@ fn emit_sm_modules(sms: &std::collections::HashMap<String, crate::types::StateMa
     (modules, specs)
 }
 
+/// Compile state to Verilog AND append a self-contained `tb_top`
+/// testbench module so the output can feed Icarus Verilog or Verilator
+/// without external stimulus. Identical to `compile_to_verilog` for
+/// non-simulation use.
+///
+/// The testbench:
+///   - Generates a 100 MHz clock (period = 10 time-units).
+///   - Asserts reset for 2 cycles, then releases.
+///   - Runs for 20 clock cycles observing `all_valid` and
+///     `constraint_ok`.
+///   - Emits a `$display` line on every clock edge.
+///   - Calls `$finish` at cycle 20 so `iverilog + vvp` terminate.
+///
+/// Usage:
+///   iverilog -o sim.vvp generated.v
+///   vvp sim.vvp
+///
+/// The testbench is a module by convention — adding it doesn't break
+/// downstream synth tools (they reject `tb_*` modules by convention or
+/// the integrator strips them at packaging time).
+pub fn compile_to_verilog_with_testbench(state: &Object) -> String {
+    let core = compile_to_verilog(state);
+    // No testbench when there's nothing to simulate.
+    if !core.contains("module top") {
+        return core;
+    }
+    format!("{}\n{}", core, emit_testbench_module())
+}
+
+/// The canonical testbench wrapping the emitted `top` module.
+fn emit_testbench_module() -> String {
+    r#"// Simulation testbench — consumed by Icarus Verilog or Verilator.
+// Drives clk + rst_n, observes top-level valid / constraint signals,
+// exits after a bounded cycle count so the simulator terminates.
+module tb_top;
+    reg clk;
+    reg rst_n;
+    wire all_valid;
+    wire constraint_ok;
+
+    top dut (
+        .clk(clk),
+        .rst_n(rst_n),
+        .all_valid(all_valid),
+        .constraint_ok(constraint_ok)
+    );
+
+    // 100 MHz clock (period 10 time-units).
+    initial clk = 1'b0;
+    always #5 clk = ~clk;
+
+    integer cycle;
+    initial begin
+        rst_n = 1'b0;
+        cycle = 0;
+        #20;          // hold reset for 2 full cycles
+        rst_n = 1'b1;
+    end
+
+    always @(posedge clk) begin
+        cycle = cycle + 1;
+        $display("t=%0t cycle=%0d rst_n=%b all_valid=%b constraint_ok=%b",
+                 $time, cycle, rst_n, all_valid, constraint_ok);
+        if (cycle >= 20) $finish;
+    end
+endmodule
+"#.to_string()
+}
+
 /// Emit the fact-ingress Verilog module — the on-chip entry point for
 /// external fact assertions (webhook → FPGA, peer-to-peer message
 /// stream, Kafka topic fanned to fabric). Single-fact valid/accepted
@@ -880,6 +949,50 @@ Supplier supplies Widget.
     }
 
     // ── Audit-log Verilog ring buffer (#167) ──
+
+    // ── Testbench harness (#172) ──
+
+    #[test]
+    fn testbench_appended_only_when_top_is_emitted() {
+        let with_state = compile_to_verilog_with_testbench(&state_with_nouns(&[("W", "entity")]));
+        assert!(with_state.contains("module tb_top"),
+            "testbench must be present when state is non-empty");
+        // Empty state emits only the header line — no top, no tb_top.
+        let empty = compile_to_verilog_with_testbench(&Object::phi());
+        assert!(!empty.contains("tb_top"),
+            "empty state must not carry a testbench:\n{}", empty);
+    }
+
+    #[test]
+    fn testbench_instantiates_top_as_dut() {
+        let verilog = compile_to_verilog_with_testbench(&state_with_nouns(&[("Widget", "entity")]));
+        assert!(verilog.contains("top dut ("),
+            "testbench must instantiate top as dut:\n{}", verilog);
+        assert!(verilog.contains(".all_valid(all_valid)"));
+        assert!(verilog.contains(".constraint_ok(constraint_ok)"));
+    }
+
+    #[test]
+    fn testbench_generates_clock_and_resets() {
+        let verilog = compile_to_verilog_with_testbench(&state_with_nouns(&[("Widget", "entity")]));
+        // Clock: toggled every 5 time-units (100 MHz with period 10).
+        assert!(verilog.contains("always #5 clk = ~clk;"));
+        // Reset held low, then raised after 20 time-units.
+        assert!(verilog.contains("rst_n = 1'b0;"));
+        assert!(verilog.contains("rst_n = 1'b1;"));
+        // Bounded simulation: $finish after cycle count.
+        assert!(verilog.contains("$finish"));
+        assert!(verilog.contains("cycle >= 20"));
+    }
+
+    #[test]
+    fn plain_compile_to_verilog_omits_testbench() {
+        // The non-testbench entry point must not accidentally include
+        // tb_top — synth tools reject unknown top-level modules.
+        let verilog = compile_to_verilog(&state_with_nouns(&[("Widget", "entity")]));
+        assert!(!verilog.contains("tb_top"),
+            "compile_to_verilog must not emit testbench:\n{}", verilog);
+    }
 
     // ── Fact ingress / egress ports (#168) ──
 
