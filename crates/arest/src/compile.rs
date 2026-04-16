@@ -463,7 +463,7 @@ fn derive_state_machines_from_facts(facts: &[GeneralInstanceFact]) -> HashMap<St
 // All generators always produce all defs. Selection is at apply time:
 // SYSTEM:sql:sqlite:Order returns DDL, SYSTEM:xsd:Order returns XSD.
 thread_local! {
-    static ACTIVE_GENERATORS: std::cell::RefCell<HashSet<String>> = std::cell::RefCell::new(HashSet::new());
+    static ACTIVE_GENERATORS: core::cell::RefCell<HashSet<String>> = core::cell::RefCell::new(HashSet::new());
 }
 
 pub fn set_active_generators(gens: HashSet<String>) {
@@ -620,7 +620,7 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
     defs.extend(model.state_machines.iter().flat_map(|sm| {
         let machine_def_name = format!("machine:{}", sm.noun_name);
         let events: Vec<String> = sm.transition_table.iter().map(|(_, _, e)| e.clone())
-            .collect::<std::collections::HashSet<_>>().into_iter().collect();
+            .collect::<hashbrown::HashSet<_>>().into_iter().collect();
         // α(event → check_func): for each event, build condition that tests transition
         let checks: Vec<Func> = events.iter().map(|event| {
             let apply_machine = Func::compose(
@@ -661,7 +661,7 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
             let domain_rule = domain.derivation_rules.iter().find(|r| r.id == *did);
             if let Some(rule) = domain_rule {
                 for ft_id in rule.antecedent_fact_type_ids.iter()
-                    .chain(std::iter::once(&rule.consequent_fact_type_id))
+                    .chain(core::iter::once(&rule.consequent_fact_type_id))
                     .filter(|s| !s.is_empty())
                 {
                     if let Some(ft) = domain.fact_types.get(ft_id.as_str()) {
@@ -3706,7 +3706,7 @@ fn compile_subset_ast(ir: &Domain, def: &ConstraintDef) -> Func {
 
     // detail: <a_fact, b_facts> -> violation description sequence
     // Include each common noun name and its value from a_fact.
-    let mut detail_parts: Vec<Func> = std::iter::once(Func::constant(Object::atom("Subset violation:")))
+    let mut detail_parts: Vec<Func> = core::iter::once(Func::constant(Object::atom("Subset violation:")))
         .chain(common.iter().flat_map(|&(ai, _)| [
             Func::constant(Object::atom(&a_nouns[ai])),
             Func::compose(role_value(ai), Func::Selector(1)),
@@ -3777,7 +3777,7 @@ fn compile_equality_ast(ir: &Domain, def: &ConstraintDef) -> Func {
     // A not in B
     let match_ab = build_match(&common, false);
     let not_in_b = Func::compose(Func::NullTest, Func::compose(Func::filter(match_ab), Func::DistL));
-    let detail_ab: Vec<Func> = std::iter::once(Func::constant(Object::atom("Equality violation:")))
+    let detail_ab: Vec<Func> = core::iter::once(Func::constant(Object::atom("Equality violation:")))
         .chain(common.iter().flat_map(|&(ai, _)| [
             Func::constant(Object::atom(&a_roles[ai].1)),
             Func::compose(role_value(ai), Func::Selector(1)),
@@ -3794,7 +3794,7 @@ fn compile_equality_ast(ir: &Domain, def: &ConstraintDef) -> Func {
     // B not in A
     let match_ba = build_match(&common, true);
     let not_in_a = Func::compose(Func::NullTest, Func::compose(Func::filter(match_ba), Func::DistL));
-    let detail_ba: Vec<Func> = std::iter::once(Func::constant(Object::atom("Equality violation:")))
+    let detail_ba: Vec<Func> = core::iter::once(Func::constant(Object::atom("Equality violation:")))
         .chain(common.iter().flat_map(|&(_, bi)| [
             Func::constant(Object::atom(&b_roles[bi].1)),
             Func::compose(role_value(bi), Func::Selector(1)),
@@ -4027,11 +4027,11 @@ fn extract_constraint_keywords(text: &str) -> Vec<String> {
             let (parts, last) = clean.chars().fold((Vec::new(), String::new()), |(mut parts, mut cur), ch| {
                 // At uppercase boundary (with non-empty accumulator), flush cur into parts
                 (ch.is_uppercase() && !cur.is_empty())
-                    .then(|| parts.push(std::mem::take(&mut cur)));
+                    .then(|| parts.push(core::mem::take(&mut cur)));
                 cur.push(ch);
                 (parts, cur)
             });
-            parts.into_iter().chain(std::iter::once(last))
+            parts.into_iter().chain(core::iter::once(last))
                 .map(|s| s.to_lowercase())
                 .filter(|s| s.len() > 2)
         })

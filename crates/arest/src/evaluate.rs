@@ -7,7 +7,7 @@
 // State machine execution:  fold(transition)(initial)(stream) -> final_state
 // Synthesis:                collect all knowledge about a noun from the compiled model.
 
-use std::collections::HashSet;
+use hashbrown::HashSet;
 use crate::types::*;
 use crate::ast;
 
@@ -73,7 +73,7 @@ pub fn forward_chain_defs_state(
 
     // Fixed-point iteration via iter::successors (Backus while form, Knaster-Tarski lfp).
     // Terminates when derive_one_round produces no new facts (returns None).
-    let (final_state, all_derived) = std::iter::successors(
+    let (final_state, all_derived) = core::iter::successors(
         Some((d.clone(), Vec::<DerivedFact>::new())),
         |(current_state, all_derived)| {
             let new_facts = derive_one_round(derivation_defs, current_state, all_derived, d);
@@ -342,27 +342,31 @@ pub fn synthesize_from_state(state: &ast::Object, noun_name: &str, depth: usize)
         .collect();
 
     // 2. Constraints spanning those fact types
-    let ft_ids: HashSet<&str> = participates_in.iter().map(|f| f.id.as_str()).collect();
-    let constraint_cell = ast::fetch_or_phi("Constraint", state);
-    let constraint_facts = constraint_cell.as_seq().unwrap_or(&[]);
-    let mut seen = HashSet::new();
-    let applicable_constraints: Vec<ConstraintSummary> = constraint_facts.iter()
-        .filter(|c| {
-            (0..4).any(|i| {
-                let ft_key = format!("span{}_factTypeId", i);
-                let ft_id = b(c, &ft_key);
-                !ft_id.is_empty() && ft_ids.contains(ft_id.as_str())
+    // Block-scoped ft_ids so its borrow on participates_in ends
+    // before the move into SynthesisResult at end of function.
+    let applicable_constraints: Vec<ConstraintSummary> = {
+        let ft_ids: HashSet<&str> = participates_in.iter().map(|f| f.id.as_str()).collect();
+        let constraint_cell = ast::fetch_or_phi("Constraint", state);
+        let constraint_facts = constraint_cell.as_seq().unwrap_or(&[]);
+        let mut seen = HashSet::new();
+        constraint_facts.iter()
+            .filter(|c| {
+                (0..4).any(|i| {
+                    let ft_key = format!("span{}_factTypeId", i);
+                    let ft_id = b(c, &ft_key);
+                    !ft_id.is_empty() && ft_ids.contains(ft_id.as_str())
+                })
             })
-        })
-        .filter(|c| seen.insert(b(c, "id")))
-        .map(|c| ConstraintSummary {
-            id: b(c, "id"), text: b(c, "text"), kind: b(c, "kind"),
-            modality: b(c, "modality"), deontic_operator: {
-                let op = b(c, "deonticOperator");
-                if op.is_empty() { None } else { Some(op) }
-            },
-        })
-        .collect();
+            .filter(|c| seen.insert(b(c, "id")))
+            .map(|c| ConstraintSummary {
+                id: b(c, "id"), text: b(c, "text"), kind: b(c, "kind"),
+                modality: b(c, "modality"), deontic_operator: {
+                    let op = b(c, "deonticOperator");
+                    if op.is_empty() { None } else { Some(op) }
+                },
+            })
+            .collect()
+    };
 
     // 3. State machines (from InstanceFact: "State Machine Definition 'X' is for Noun 'noun'")
     let inst_cell = ast::fetch_or_phi("InstanceFact", state);
@@ -2116,7 +2120,7 @@ mod tests {
         let big: Vec<_> = derived.iter().filter(|d| d.fact_type_id == "big_city").collect();
         assert_eq!(big.len(), 3, "expected 3 big cities (Alpha/Bravo/Delta), got {:?}", big);
 
-        let names: std::collections::HashSet<&str> = big.iter()
+        let names: hashbrown::HashSet<&str> = big.iter()
             .flat_map(|d| d.bindings.iter()
                 .filter(|(k, _)| k == "City")
                 .map(|(_, v)| v.as_str()))
@@ -2355,12 +2359,12 @@ mod tests {
         let arity: Vec<_> = derived.iter().filter(|d| d.fact_type_id == "thing_has_arity").collect();
         // Collect distinct (Thing, Arity) pairs — the outer iteration emits
         // duplicates per group, which forward_chain is expected to dedup.
-        let mut pairs: std::collections::BTreeSet<(String, String)> = arity.iter().map(|d| {
+        let mut pairs: alloc::collections::BTreeSet<(String, String)> = arity.iter().map(|d| {
             let t = d.bindings.iter().find(|(k, _)| k == "Thing").map(|(_, v)| v.clone()).unwrap_or_default();
             let a = d.bindings.iter().find(|(k, _)| k == "Arity").map(|(_, v)| v.clone()).unwrap_or_default();
             (t, a)
         }).collect();
-        let expected: std::collections::BTreeSet<(String, String)> = [
+        let expected: alloc::collections::BTreeSet<(String, String)> = [
             ("T1".to_string(), "3".to_string()),
             ("T2".to_string(), "1".to_string()),
         ].into_iter().collect();
@@ -2446,12 +2450,12 @@ mod tests {
         let (_new_state, derived) = forward_chain_defs_state(&dd, &pop_state);
 
         let totals: Vec<_> = derived.iter().filter(|d| d.fact_type_id == "order_has_total").collect();
-        let pairs: std::collections::BTreeSet<(String, String)> = totals.iter().map(|d| {
+        let pairs: alloc::collections::BTreeSet<(String, String)> = totals.iter().map(|d| {
             let o = d.bindings.iter().find(|(k, _)| k == "Order").map(|(_, v)| v.clone()).unwrap_or_default();
             let a = d.bindings.iter().find(|(k, _)| k == "Amount").map(|(_, v)| v.clone()).unwrap_or_default();
             (o, a)
         }).collect();
-        let expected: std::collections::BTreeSet<(String, String)> = [
+        let expected: alloc::collections::BTreeSet<(String, String)> = [
             ("O1".to_string(), "40".to_string()),
             ("O2".to_string(), "7".to_string()),
         ].into_iter().collect();
@@ -2479,12 +2483,12 @@ mod tests {
         let dd = derivation_defs_from(&defs);
         let (_new_state, derived) = forward_chain_defs_state(&dd, &pop_state);
         let totals: Vec<_> = derived.iter().filter(|d| d.fact_type_id == "order_has_total").collect();
-        let pairs: std::collections::BTreeSet<(String, String)> = totals.iter().map(|d| {
+        let pairs: alloc::collections::BTreeSet<(String, String)> = totals.iter().map(|d| {
             let o = d.bindings.iter().find(|(k, _)| k == "Order").map(|(_, v)| v.clone()).unwrap_or_default();
             let a = d.bindings.iter().find(|(k, _)| k == "Amount").map(|(_, v)| v.clone()).unwrap_or_default();
             (o, a)
         }).collect();
-        let expected: std::collections::BTreeSet<(String, String)> = [
+        let expected: alloc::collections::BTreeSet<(String, String)> = [
             ("O1".to_string(), "4".to_string()),
             ("O2".to_string(), "7".to_string()),
         ].into_iter().collect();
@@ -2503,12 +2507,12 @@ mod tests {
         let dd = derivation_defs_from(&defs);
         let (_new_state, derived) = forward_chain_defs_state(&dd, &pop_state);
         let totals: Vec<_> = derived.iter().filter(|d| d.fact_type_id == "order_has_total").collect();
-        let pairs: std::collections::BTreeSet<(String, String)> = totals.iter().map(|d| {
+        let pairs: alloc::collections::BTreeSet<(String, String)> = totals.iter().map(|d| {
             let o = d.bindings.iter().find(|(k, _)| k == "Order").map(|(_, v)| v.clone()).unwrap_or_default();
             let a = d.bindings.iter().find(|(k, _)| k == "Amount").map(|(_, v)| v.clone()).unwrap_or_default();
             (o, a)
         }).collect();
-        let expected: std::collections::BTreeSet<(String, String)> = [
+        let expected: alloc::collections::BTreeSet<(String, String)> = [
             ("O1".to_string(), "25".to_string()),
             ("O2".to_string(), "7".to_string()),
         ].into_iter().collect();
@@ -2528,7 +2532,7 @@ mod tests {
         let dd = derivation_defs_from(&defs);
         let (_new_state, derived) = forward_chain_defs_state(&dd, &pop_state);
         let totals: Vec<_> = derived.iter().filter(|d| d.fact_type_id == "order_has_total").collect();
-        let pairs: std::collections::BTreeSet<(String, String)> = totals.iter().map(|d| {
+        let pairs: alloc::collections::BTreeSet<(String, String)> = totals.iter().map(|d| {
             let o = d.bindings.iter().find(|(k, _)| k == "Order").map(|(_, v)| v.clone()).unwrap_or_default();
             let a = d.bindings.iter().find(|(k, _)| k == "Amount").map(|(_, v)| v.clone()).unwrap_or_default();
             (o, a)

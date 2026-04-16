@@ -18,7 +18,7 @@
 // defs produced by compile_to_defs_state. Bulk loads may still skip
 // validation entirely when the readings are known-good.
 thread_local! {
-    static SKIP_VALIDATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static SKIP_VALIDATE: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
 }
 pub fn set_skip_validate(on: bool) { SKIP_VALIDATE.with(|b| b.set(on)); }
 fn is_skip_validate() -> bool { SKIP_VALIDATE.with(|b| b.get()) }
@@ -35,7 +35,7 @@ fn is_skip_validate() -> bool { SKIP_VALIDATE.with(|b| b.get()) }
 
 use hashbrown::HashMap;
 use crate::sync::Arc;
-use std::fmt;
+use core::fmt;
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
@@ -692,7 +692,7 @@ fn normalize_step(f: &Func) -> Func {
 
 #[cfg(all(feature = "profile", not(target_arch = "wasm32")))]
 mod profile {
-    use std::cell::{Cell, RefCell};
+    use core::cell::{Cell, RefCell};
     use hashbrown::HashMap;
 
     thread_local! {
@@ -1445,8 +1445,8 @@ fn platform_tc_cycles(x: &Object) -> Object {
         .filter_map(|f| edge_pair(f))
         .collect();
     // Fixed point: extend with one-hop reachable edges until stable.
-    let tc: std::collections::HashSet<(String, String)> = std::iter::successors(
-        Some(original_pairs.iter().cloned().collect::<std::collections::HashSet<_>>()),
+    let tc: hashbrown::HashSet<(String, String)> = core::iter::successors(
+        Some(original_pairs.iter().cloned().collect::<hashbrown::HashSet<_>>()),
         |tc| {
             let new_edges: Vec<(String, String)> = tc.iter()
                 .flat_map(|(a, b)| original_pairs.iter()
@@ -4066,8 +4066,8 @@ mod tests {
         let input = format!("{}x{}", opens, closes);
         let result = Object::parse(&input);
         // Walk down 100 levels of Seq([...]) to reach Bottom
-        // (std::iter::successors = Backus's $\mathit{while}$ combining form)
-        let current = std::iter::successors(Some(&result), |c| match c {
+        // (core::iter::successors = Backus's $\mathit{while}$ combining form)
+        let current = core::iter::successors(Some(&result), |c| match c {
             Object::Seq(items) if items.len() == 1 => Some(&items[0]),
             _ => None,
         }).take(101).last().unwrap();
@@ -4964,7 +4964,7 @@ mod tests {
         );
         profile_disable();
         let snap = profile_snapshot();
-        let seen: std::collections::HashSet<&str> = snap.iter().map(|(n, _, _)| *n).collect();
+        let seen: hashbrown::HashSet<&str> = snap.iter().map(|(n, _, _)| *n).collect();
         assert!(seen.contains("Selector"),  "Selector must appear in histogram; got {:?}", seen);
         assert!(seen.contains("Constant"),  "Constant must appear in histogram; got {:?}", seen);
         assert!(seen.contains("Construction"), "Construction must appear; got {:?}", seen);
