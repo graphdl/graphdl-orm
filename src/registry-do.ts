@@ -228,6 +228,24 @@ export function getRegisteredNouns(sql: SqlLike): string[] {
 }
 
 // =========================================================================
+// Domain-level sharding helpers (#205)
+// =========================================================================
+
+/**
+ * Return the DurableObjectId for the registry scoped to a (scope, domain) pair.
+ * Falls back to 'global' when domain is empty/undefined so existing callers
+ * that already use idFromName('global') are unaffected.
+ */
+export function registryIdForDomain(
+  ns: DurableObjectNamespace,
+  scope: string,
+  domain?: string,
+): DurableObjectId {
+  const key = domain ? `${scope}:${domain}` : scope
+  return ns.idFromName(key)
+}
+
+// =========================================================================
 // Durable Object class
 // =========================================================================
 

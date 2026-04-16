@@ -1445,6 +1445,82 @@ fn split_antecedent_comparator(text: &str) -> (String, Option<(String, f64)>) {
     }
 }
 
+/// Expand possessive syntax in a derivation body clause.
+///
+/// Pattern: `<Noun1>'s <Noun2>` is syntactic sugar for a join through Noun2:
+///   `<Noun1>'s <Noun2> has <X>` → `<Noun1> has <Noun2> and that <Noun2> has <X>`
+///
+/// This is a pre-processing step applied to the antecedent text before
+/// fact-type resolution.  Each possessive token is replaced with an
+/// explicit two-clause join so that the anaphora detector in
+/// `resolve_derivation_rule` can find the `that <Noun2>` join key.
+///
+/// Returns `Some(expanded)` when at least one possessive was expanded,
+/// `None` when the text contains no `'s` pattern.
+///
+/// # Examples
+/// ```text
+/// // Input antecedent clause:
+/// "Order's Customer has Age"
+/// // Expanded:
+/// "Order has Customer and that Customer has Age"
+/// ```
+pub(crate) fn try_expand_possessive(text: &str, noun_names: &[String]) -> Option<String> {
+    // Quick exit — no apostrophe means nothing to expand.
+    if !text.contains("'s ") {
+        return None;
+    }
+
+    // Walk the text looking for `<Noun>'s <Noun2>` sequences.
+    // We use a simple left-to-right scan: find the first `'s `, identify the
+    // noun that ends just before the apostrophe, identify the noun that begins
+    // just after the space, then emit the expanded two-clause form.
+    let mut result = text.to_string();
+    let mut changed = false;
+
+    // Iterate until no more `'s ` tokens remain (handles chained possessives).
+    loop {
+        let Some(apos_pos) = result.find("'s ") else { break };
+
+        // Find noun1: the longest known noun ending at apos_pos.
+        let prefix = &result[..apos_pos];
+        let noun1 = noun_names.iter()
+            .filter(|n| prefix.ends_with(n.as_str()))
+            .max_by_key(|n| n.len())
+            .cloned();
+
+        // Find noun2: the longest known noun starting at apos_pos + 3.
+        let after = &result[apos_pos + 3..]; // skip `'s `
+        let noun2 = noun_names.iter()
+            .filter(|n| after.starts_with(n.as_str()))
+            .max_by_key(|n| n.len())
+            .cloned();
+
+        match (noun1, noun2) {
+            (Some(n1), Some(n2)) => {
+                // Build the expanded form:
+                //   "<prefix-without-n1><n1> has <n2> and that <n2><suffix-without-n2>"
+                let n1_start = apos_pos - n1.len();
+                let n2_end = apos_pos + 3 + n2.len();
+                let before_n1 = &result[..n1_start];
+                let after_n2 = &result[n2_end..];
+                result = format!(
+                    "{}{} has {} and that {}{}",
+                    before_n1, n1, n2, n2, after_n2
+                );
+                changed = true;
+            }
+            _ => {
+                // Unknown noun around the apostrophe — leave as-is to avoid
+                // corrupting input the parser can't understand.
+                break;
+            }
+        }
+    }
+
+    changed.then_some(result)
+}
+
 /// Resolve a derivation rule's text into structured fact type references.
 ///
 /// Splits on " if "/" iff " to get consequent and antecedent parts,
@@ -1459,6 +1535,27 @@ fn resolve_derivation_rule(rule: &mut DerivationRuleDef, ir: &Domain, catalog: &
     // Longest-first noun list for Theorem 1 matching
     let mut noun_names: Vec<String> = ir.nouns.keys().cloned().collect();
     noun_names.sort_by(|a, b| b.len().cmp(&a.len()));
+
+    // Pre-process: expand possessive syntax (`X's Y`) into explicit join form
+    // (`X has Y and that Y`) so the anaphora detector below can classify the
+    // rule as a Join derivation.  Only the antecedent portion is rewritten;
+    // the consequent is left unchanged.
+    if rule.text.contains("'s ") {
+        // Split off everything up to and including the iff/if/`:=` keyword,
+        // expand only the antecedent portion, then reassemble.
+        let sep_offset = rule.text.find(" := ")
+            .map(|i| (i, i + 4))
+            .or_else(|| rule.text.find(" iff ").map(|i| (i, i + 5)))
+            .or_else(|| rule.text.find(" if ").map(|i| (i, i + 4)));
+        if let Some((sep_start, sep_end)) = sep_offset {
+            let consequent_part = &rule.text[..sep_start];
+            let sep_word = &rule.text[sep_start..sep_end];
+            let antecedent_part = &rule.text[sep_end..];
+            if let Some(expanded) = try_expand_possessive(antecedent_part, &noun_names) {
+                rule.text = format!("{}{}{}", consequent_part, sep_word, expanded);
+            }
+        }
+    }
 
     // Split on " := ", " iff ", or " if " to get (consequent, antecedent_text)
     let (consequent_text, antecedent_text) = rule.text
@@ -3929,5 +4026,72 @@ App 'sherlock' uses Generator 'sqlite'.
         assert_eq!(f.subject_value, "sherlock");
         assert_eq!(f.object_noun, "Generator");
         assert_eq!(f.object_value, "sqlite");
+    }
+
+    // ── Task #198: Possessive join syntax in derivation bodies ──────────────
+    //
+    // "Order has Customer Age iff Order's Customer has Age"
+    // should resolve to a Join through Customer, equivalent to:
+    //   "Order has Customer Age iff Order has Customer and that Customer has Age"
+    //
+    // The possessive `Order's Customer` is syntactic sugar for a two-clause
+    // anaphoric join; `try_expand_possessive` rewrites it before resolution.
+
+    #[test]
+    fn try_expand_possessive_rewrites_possessive_to_join_clauses() {
+        // Unit-test the helper directly with a known noun list.
+        let nouns = vec!["Order".to_string(), "Customer".to_string(), "Age".to_string()];
+        let input = "Order's Customer has Age";
+        let expanded = super::try_expand_possessive(input, &nouns)
+            .expect("possessive should be expanded");
+        assert_eq!(
+            expanded,
+            "Order has Customer and that Customer has Age",
+            "unexpected expansion: {}", expanded
+        );
+    }
+
+    #[test]
+    fn try_expand_possessive_returns_none_when_no_possessive() {
+        let nouns = vec!["Order".to_string(), "Customer".to_string()];
+        let result = super::try_expand_possessive("Order has Customer", &nouns);
+        assert!(result.is_none(), "should return None for text without possessive");
+    }
+
+    #[test]
+    fn possessive_join_in_derivation_resolves() {
+        // "Order has Customer Age iff Order's Customer has Age"
+        // The possessive sugar is expanded to:
+        //   "Order has Customer Age iff Order has Customer and that Customer has Age"
+        // which the resolver classifies as a Join on Customer.
+        let input = "\
+Order(.Id) is an entity type.\n\
+Customer(.Name) is an entity type.\n\
+Age is a value type.\n\
+Order has Customer.\n\
+Customer has Age.\n\
+Order has Customer Age.\n\
+## Derivation Rules\n\
+Order has Customer Age iff Order's Customer has Age.\n";
+        let ir = parse_markdown(input).unwrap();
+        let rule = ir.derivation_rules.iter()
+            .find(|r| r.text.contains("Customer Age"))
+            .expect("derivation rule for Customer Age must be present");
+        assert_eq!(
+            rule.antecedent_fact_type_ids.len(), 2,
+            "possessive join rule must have 2 antecedents (Order has Customer + Customer has Age), got {:?}",
+            rule.antecedent_fact_type_ids
+        );
+        assert_eq!(
+            rule.kind,
+            crate::types::DerivationKind::Join,
+            "possessive join rule must be classified as Join, got {:?}",
+            rule.kind
+        );
+        assert!(
+            rule.join_on.iter().any(|k| k == "Customer"),
+            "join_on must include 'Customer', got {:?}",
+            rule.join_on
+        );
     }
 }
