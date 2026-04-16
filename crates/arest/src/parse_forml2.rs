@@ -2925,6 +2925,48 @@ mod tests {
     }
 
     #[test]
+    fn uncle_rule_subscripted_ring_join_resolves_antecedents() {
+        // #197: derivation rule with 3 subscripted Person references across
+        // two ring fact types — the "uncle" pattern from Halpin FORML Example 6.
+        //
+        //   Person1 is uncle of Person2 iff
+        //     Person1 is brother of some Person3 and
+        //     that Person3 is parent of Person2.
+        //
+        // The anaphoric `that Person3` uses a subscripted noun.  The join-key
+        // detector must recognise "that Person3" as referring to the base noun
+        // "Person" and classify the rule as Join with two resolved antecedent
+        // fact-type IDs.
+        let input = "\
+Person(.Name) is an entity type.\n\
+Person is brother of Person.\n\
+Person is parent of Person.\n\
+Person is uncle of Person.\n\
+## Derivation Rules\n\
++ Person1 is uncle of Person2 iff Person1 is brother of some Person3 and that Person3 is parent of Person2.\n";
+        let ir = parse_markdown(input).unwrap();
+        let rule = ir.derivation_rules.iter()
+            .find(|r| r.text.contains("uncle"))
+            .expect("uncle derivation rule must be present");
+        assert_eq!(
+            rule.antecedent_fact_type_ids.len(), 2,
+            "uncle rule must have 2 antecedents (brother + parent), got {:?}",
+            rule.antecedent_fact_type_ids
+        );
+        assert_eq!(
+            rule.kind,
+            crate::types::DerivationKind::Join,
+            "uncle rule with `that Person3` must be classified as Join, got {:?}",
+            rule.kind
+        );
+        assert!(
+            rule.join_on.iter().any(|k| k == "Person"),
+            "join_on must include base noun 'Person', got {:?}",
+            rule.join_on
+        );
+    }
+
+    #[test]
     fn frequency_constraint() {
         let input = "Customer(.Name) is an entity type.\nOrder(.Id) is an entity type.\nCustomer places Order.\nEach Customer places at least 1 and at most 5 Order.";
         let ir = parse_markdown(input).unwrap();

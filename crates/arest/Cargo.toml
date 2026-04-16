@@ -18,7 +18,7 @@ name = "arest-cli"
 path = "src/main.rs"
 
 [features]
-default = ["wit", "debug-def"]
+default = ["wit", "debug-def", "std-deps"]
 wit = ["dep:wit-bindgen"]
 cloudflare = ["dep:wasm-bindgen", "dep:console_error_panic_hook"]
 local = ["dep:rusqlite"]
@@ -39,6 +39,10 @@ profile = []
 # native-code dependency tree. Run the PoC with:
 #   cargo test --features wasm-lower --lib wasm_lower
 wasm-lower = ["dep:wasm-encoder", "dep:wasmi"]
+# std-deps bundles serde, serde_json, regex, hmac, sha2, subtle — all
+# require std and are excluded from the no_std / kernel build. Included
+# in `default` so all normal (std) builds keep working without changes.
+std-deps = ["dep:serde", "dep:serde_json", "dep:regex", "dep:hmac", "dep:sha2", "dep:subtle", "hashbrown/serde"]
 # no_std build target — gates every `use std::*` behind a
 # `std`/`no_std` split so the crate can be embedded in bare-metal
 # contexts (FPGA soft-cores, x86_64 kernel via #175+). Enable via:
@@ -49,17 +53,22 @@ wasm-lower = ["dep:wasm-encoder", "dep:wasmi"]
 no_std = []
 
 [dependencies]
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-regex = "1"
+# serde / serde_json / regex require std — made optional so the no_std
+# build (kernel, FPGA) can exclude them. The `std-deps` feature bundles
+# them; it is on by default and disabled under `no_std`.
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+regex = { version = "1", optional = true }
 wit-bindgen = { version = "0.41", default-features = false, features = ["macros"], optional = true }
 wasm-bindgen = { version = "0.2", optional = true }
 console_error_panic_hook = { version = "0.1", optional = true }
 rusqlite = { version = "0.31", features = ["bundled"], optional = true }
 rayon = { version = "1", optional = true }
-hmac = "0.12"
-sha2 = "0.10"
-subtle = "2"
+# hmac / sha2 / subtle are used only by crypto.rs which is gated on
+# `not(no_std)` — make them optional so the no_std build skips them.
+hmac = { version = "0.12", optional = true }
+sha2 = { version = "0.10", optional = true }
+subtle = { version = "2", optional = true }
 # WASM-lowering PoC. wasm-encoder emits bytes; wasmtime
 # hosts them for the roundtrip test so we can prove semantic
 # equivalence with Rust apply() before investing in the full
@@ -77,7 +86,10 @@ wasmi = { version = "0.50", optional = true }
 # enabling it under no_std gives us the same API without linking `std`.
 # spin provides Mutex / RwLock / Once on bare metal where `std::sync`
 # isn't available (no OS to block against — spin-locks instead).
-hashbrown = { version = "0.14", features = ["serde"] }
+# hashbrown's serde feature is only needed when serde itself is present.
+# It is activated via `std-deps` feature (see above) — not here directly,
+# so the no_std / kernel build doesn't pull in serde through hashbrown.
+hashbrown = { version = "0.14" }
 spin = { version = "0.9", default-features = false, features = ["mutex", "spin_mutex", "rwlock", "once"] }
 
 [dev-dependencies]

@@ -161,10 +161,12 @@ impl Object {
     ///
     /// Used by system_impl to serve every tool response as JSON so MCP
     /// and HTTP callers can parse uniformly — no mixed FFP/JSON handling.
+    #[cfg(not(feature = "no_std"))]
     pub fn to_json_string(&self) -> String {
         self.to_json_value().to_string()
     }
 
+    #[cfg(not(feature = "no_std"))]
     fn to_json_value(&self) -> serde_json::Value {
         match self {
             Object::Bottom => serde_json::Value::Null,
@@ -1263,7 +1265,12 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
             }
         }
 
+        // Platform primitives require serde_json + std modules; not available
+        // in the no_std kernel build. Return Bottom so apply() stays total.
+        #[cfg(not(feature = "no_std"))]
         Func::Platform(name) => apply_platform(name, x, d),
+        #[cfg(feature = "no_std")]
+        Func::Platform(_) => Object::Bottom,
 
         Func::Native(f) => f(x),
     }
@@ -1271,6 +1278,8 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
 
 /// Platform primitives — known operations resolved by name.
 /// Each is a fixed function (x, D) → Object. Synthesizable to hardware.
+/// Requires serde_json + std modules; excluded from no_std builds.
+#[cfg(not(feature = "no_std"))]
 fn apply_platform(name: &str, x: &Object, d: &Object) -> Object {
     match name {
         "compile" => platform_compile(x, d),
@@ -1584,6 +1593,7 @@ fn find_metamodel_shadow(parsed: &Object, existing: &Object) -> Option<String> {
     })
 }
 
+#[cfg(not(feature = "no_std"))]
 fn platform_compile(x: &Object, d: &Object) -> Object {
     let input = match x.as_atom() {
         Some(s) if s.len() <= PLATFORM_MAX_INPUT => s,
@@ -1719,6 +1729,7 @@ pub(crate) fn record_audit(
 /// apply command: create = emit ∘ validate ∘ derive ∘ resolve (Eq. 10).
 /// Identity is a fact in the input — "Resource is created by User" (instances.md).
 /// Authorization is enforced by the constraint pipeline, not by this function.
+#[cfg(not(feature = "no_std"))]
 fn platform_apply_command(x: &Object, d: &Object) -> Object {
     let input = match x.as_atom() {
         Some(s) if s.len() <= PLATFORM_MAX_INPUT => s,
@@ -1836,6 +1847,7 @@ fn extract_fact_pairs(x: &Object) -> (Option<String>, hashbrown::HashMap<String,
 ///
 /// Returns an atom holding a JSON array: `[{"id":..., <field>:<value>, ...}, ...]`.
 /// Returns `Bottom` if no matching entities are found.
+#[cfg(not(feature = "no_std"))]
 fn platform_list_noun(noun: &str, d: &Object) -> Object {
     use hashbrown::HashMap;
     let mut entities: HashMap<String, HashMap<String, String>> = HashMap::new();
@@ -1933,6 +1945,7 @@ fn platform_query_ft(ft_id: &str, x: &Object, d: &Object) -> Object {
 
 /// Platform primitive: get a single entity by id.
 /// Key: "get_noun:{noun}". Input: atom entity id.
+#[cfg(not(feature = "no_std"))]
 /// Returns the matching entity summary as a JSON atom, or Bottom if absent.
 fn platform_get_noun(noun: &str, x: &Object, d: &Object) -> Object {
     let id = match x.as_atom() {
