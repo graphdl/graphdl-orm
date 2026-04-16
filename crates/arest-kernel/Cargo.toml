@@ -50,6 +50,15 @@ linked_list_allocator = "0.10"
 # pulls in the descriptor / interrupt plumbing; no scheduler or
 # driver stack.
 x86_64 = "0.15"
+# Legacy 8259 PIC driver. Needed to route hardware IRQs (keyboard,
+# timer) to IDT vectors — without PIC remap, the firmware-default
+# IRQ 0-7 collide with CPU exception vectors 8-15 and a timer tick
+# would fire the same vector as #DF.
+pic8259 = "0.11"
+# PS/2 keyboard decoder. Takes raw scancodes (set 1 by default on
+# QEMU) and emits typed `DecodedKey` events — lets us ignore every
+# detail of make/break codes and modifier tracking.
+pc-keyboard = "0.7"
 
 [profile.dev]
 panic = "abort"
