@@ -50,6 +50,44 @@ export function initRegistrySchema(sql: SqlLike): void {
   // SQLite doesn't support DROP COLUMN before 3.35.0, so we just ignore it
   // and never query it. New tables won't have it.
   try { sql.exec('ALTER TABLE entity_index ADD COLUMN domain_slug TEXT') } catch { /* already exists */ }
+
+  initSnapshotSchema(sql)
+}
+
+// =========================================================================
+// Snapshot storage (freeze/thaw ↔ DO persistence, #203)
+// =========================================================================
+
+export function initSnapshotSchema(sql: SqlLike): void {
+  sql.exec(`CREATE TABLE IF NOT EXISTS snapshots (
+    label TEXT PRIMARY KEY,
+    frozen_hex TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    byte_length INTEGER NOT NULL DEFAULT 0
+  )`)
+}
+
+export function storeSnapshot(sql: SqlLike, label: string, frozenHex: string): void {
+  sql.exec(
+    `INSERT OR REPLACE INTO snapshots (label, frozen_hex, byte_length) VALUES (?, ?, ?)`,
+    label, frozenHex, Math.floor(frozenHex.length / 2),
+  )
+}
+
+export function fetchSnapshot(sql: SqlLike, label: string): string | null {
+  const rows = sql.exec(`SELECT frozen_hex FROM snapshots WHERE label = ?`, label).toArray()
+  return rows.length ? (rows[0] as any).frozen_hex : null
+}
+
+export function listSnapshots(sql: SqlLike): Array<{ label: string; createdAt: string; byteLength: number }> {
+  return sql.exec(`SELECT label, created_at, byte_length FROM snapshots ORDER BY created_at DESC`).toArray()
+    .map((r: any) => ({ label: r.label, createdAt: r.created_at, byteLength: r.byte_length }))
+}
+
+export function deleteSnapshot(sql: SqlLike, label: string): boolean {
+  const before = sql.exec(`SELECT count(*) as c FROM snapshots WHERE label = ?`, label).toArray()[0] as any
+  sql.exec(`DELETE FROM snapshots WHERE label = ?`, label)
+  return (before?.c ?? 0) > 0
 }
 
 // =========================================================================
@@ -311,5 +349,27 @@ export class RegistryDB extends DurableObject {
     }
 
     return { materialized, failed }
+  }
+
+  // ── Freeze/thaw snapshot persistence (#203) ───────────────────────
+
+  async storeSnapshot(label: string, frozenHex: string): Promise<void> {
+    this.ensureInit()
+    storeSnapshot(this.ctx.storage.sql, label, frozenHex)
+  }
+
+  async fetchSnapshot(label: string): Promise<string | null> {
+    this.ensureInit()
+    return fetchSnapshot(this.ctx.storage.sql, label)
+  }
+
+  async listSnapshots(): Promise<Array<{ label: string; createdAt: string; byteLength: number }>> {
+    this.ensureInit()
+    return listSnapshots(this.ctx.storage.sql)
+  }
+
+  async deleteSnapshot(label: string): Promise<boolean> {
+    this.ensureInit()
+    return deleteSnapshot(this.ctx.storage.sql, label)
   }
 }

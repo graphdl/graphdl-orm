@@ -5,7 +5,7 @@ import { handleParse } from './parse'
 import { handleEvaluate, handleSynthesize } from './evaluate'
 import { handleCreateEntity, handleDeleteEntity } from './entity-routes'
 import { envelope } from './envelope'
-import { loadDomainSchema, loadDomainAndPopulation, buildPopulation, getTransitions, applyCommand, querySchema, forwardChain, getNounSchemas, computeRMAP, system as wasmSystem } from './engine'
+import { loadDomainSchema, loadDomainAndPopulation, buildPopulation, getTransitions, applyCommand, querySchema, forwardChain, getNounSchemas, computeRMAP, system as wasmSystem, currentDomainHandle } from './engine'
 import { handleArestRequest } from './arest-router'
 import { handleMcpRequest } from '../mcp/remote'
 import { dispatchVerb, UNIFIED_VERBS } from './verb-dispatcher'
@@ -263,7 +263,7 @@ router.get('/api/openapi.json', async (request, env: Env) => {
 // clients thereby see the same input/output contract regardless of
 // transport.
 for (const verb of UNIFIED_VERBS) {
-  router.post(`/api/${verb}`, async (request: Request) => {
+  router.post(`/api/${verb}`, async (request: Request, env: Env) => {
     let body: Record<string, unknown>
     try {
       body = (await request.json()) as Record<string, unknown>
@@ -272,6 +272,22 @@ for (const verb of UNIFIED_VERBS) {
     }
     try {
       const result = await dispatchVerb(verb, body)
+
+      // #203: persist snapshot bytes to RegistryDB so they survive
+      // worker restarts. The engine's in-memory snapshot store is
+      // ephemeral; the DO copy is durable.
+      if (verb === 'snapshot' && (env as any).REGISTRY) {
+        try {
+          const frozen = wasmSystem(currentDomainHandle(), 'freeze', '')
+          if (frozen && frozen !== '⊥') {
+            const label = (body.label as string) || new Date().toISOString()
+            const registryId = ((env as any).REGISTRY as DurableObjectNamespace).idFromName('global')
+            const registry = ((env as any).REGISTRY as DurableObjectNamespace).get(registryId) as any
+            await registry.storeSnapshot(label, frozen)
+          }
+        } catch { /* best-effort — snapshot still succeeded in-memory */ }
+      }
+
       return json(result)
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e)
@@ -279,6 +295,36 @@ for (const verb of UNIFIED_VERBS) {
     }
   })
 }
+
+// #203: export frozen state bytes from DO storage
+router.get('/api/export/:label', async (request: Request, env: Env) => {
+  if (!(env as any).REGISTRY) return error(501, 'no REGISTRY binding')
+  const label = new URL(request.url).pathname.split('/').pop() || ''
+  const registryId = ((env as any).REGISTRY as DurableObjectNamespace).idFromName('global')
+  const registry = ((env as any).REGISTRY as DurableObjectNamespace).get(registryId) as any
+  const hex = await registry.fetchSnapshot(label)
+  if (!hex) return error(404, `snapshot '${label}' not found`)
+  return json({ label, frozen_hex: hex, byte_length: Math.floor(hex.length / 2) })
+})
+
+// #203: import frozen state bytes into the engine + persist to DO
+router.post('/api/import', async (request: Request, env: Env) => {
+  const body = (await request.json()) as { label?: string; frozen_hex?: string }
+  if (!body.frozen_hex) return error(400, 'frozen_hex required')
+  const label = body.label || new Date().toISOString()
+  try {
+    const raw = wasmSystem(currentDomainHandle(), 'thaw', body.frozen_hex)
+    if (raw.startsWith('⊥')) return error(400, `thaw failed: ${raw}`)
+    if ((env as any).REGISTRY) {
+      const registryId = ((env as any).REGISTRY as DurableObjectNamespace).idFromName('global')
+      const registry = ((env as any).REGISTRY as DurableObjectNamespace).get(registryId) as any
+      await registry.storeSnapshot(label, body.frozen_hex)
+    }
+    return json({ ok: true, label, result: raw })
+  } catch (e) {
+    return error(500, e instanceof Error ? e.message : String(e))
+  }
+})
 
 // ── Evaluate / Synthesize (WASM engine) ─────────────────────────────
 router.post('/api/evaluate', handleEvaluate)
