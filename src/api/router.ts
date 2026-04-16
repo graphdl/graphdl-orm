@@ -8,6 +8,7 @@ import { envelope } from './envelope'
 import { loadDomainSchema, loadDomainAndPopulation, buildPopulation, getTransitions, applyCommand, querySchema, forwardChain, getNounSchemas, computeRMAP, system as wasmSystem } from './engine'
 import { handleArestRequest } from './arest-router'
 import { handleMcpRequest } from '../mcp/remote'
+import { dispatchVerb, UNIFIED_VERBS } from './verb-dispatcher'
 
 // ── Collection slug → noun type resolution ───────────────────────────
 // Resolved dynamically from the Registry via nounToSlug convention.
@@ -253,6 +254,31 @@ router.get('/api/openapi.json', async (request, env: Env) => {
   }
   return json(doc)
 })
+
+// ── Unified MCP verb → HTTP route mapping (#200) ─────────────────────
+// Every MCP tool registered in src/mcp/server-factory.ts gets a
+// 1:1 HTTP route here via the shared `dispatchVerb` bridge. Body
+// shape matches the MCP tool's inputSchema; response is a Theorem 5
+// envelope per src/api/envelope.ts. CLI, local MCP (stdio), and HTTP
+// clients thereby see the same input/output contract regardless of
+// transport.
+for (const verb of UNIFIED_VERBS) {
+  router.post(`/api/${verb}`, async (request: Request) => {
+    let body: Record<string, unknown>
+    try {
+      body = (await request.json()) as Record<string, unknown>
+    } catch {
+      body = {}
+    }
+    try {
+      const result = await dispatchVerb(verb, body)
+      return json(result)
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e)
+      return error(400, message)
+    }
+  })
+}
 
 // ── Evaluate / Synthesize (WASM engine) ─────────────────────────────
 router.post('/api/evaluate', handleEvaluate)
