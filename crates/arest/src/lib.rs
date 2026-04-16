@@ -30,6 +30,7 @@ pub mod quota;
 pub mod scheduler;
 pub mod ring;
 pub mod freeze;
+pub mod declared_writes;
 
 #[cfg(feature = "wasm-lower")]
 pub mod wasm_lower;
