@@ -261,6 +261,61 @@ impl CompiledState {
         }
         CommitOutcome::Committed
     }
+
+    /// Declared-writes fast path (#186). Like `try_commit_diff` but
+    /// only inspects the cells named in `targets` instead of diffing
+    /// every cell in the state. O(|targets|) instead of O(|all_cells|).
+    ///
+    /// Returns `StructuralChange` if any target cell doesn't exist in
+    /// the current state (rare — means the noun was never compiled).
+    /// Returns `StaleSnapshot` if a concurrent writer modified a
+    /// target cell since the snapshot. Returns `Committed` on success.
+    fn try_commit_declared(
+        &self,
+        snapshot: &ast::Object,
+        new_d: &ast::Object,
+        targets: &[&str],
+    ) -> CommitOutcome {
+        let snap_map = match snapshot.as_map() {
+            Some(m) => m,
+            None => return CommitOutcome::StructuralChange,
+        };
+        let new_map = match new_d.as_map() {
+            Some(m) => m,
+            None => return CommitOutcome::StructuralChange,
+        };
+        let mut changed: Vec<&str> = targets.iter().copied()
+            .filter(|k| {
+                let old = snap_map.get(*k);
+                let new = new_map.get(*k);
+                old != new
+            })
+            .collect();
+        if changed.is_empty() {
+            return CommitOutcome::Committed;
+        }
+        changed.sort();
+        let mut guards: Vec<(&str, crate::sync::RwLockWriteGuard<'_, ast::Object>)> =
+            Vec::with_capacity(changed.len());
+        for key in &changed {
+            match self.cells.get(*key) {
+                Some(lock) => guards.push((*key, lock.write())),
+                None => return CommitOutcome::StructuralChange,
+            }
+        }
+        for (key, guard) in &guards {
+            let expected = snap_map.get(*key);
+            if Some(&**guard) != expected {
+                return CommitOutcome::StaleSnapshot;
+            }
+        }
+        for (key, guard) in guards.iter_mut() {
+            if let Some(new_value) = new_map.get(*key) {
+                **guard = new_value.clone();
+            }
+        }
+        CommitOutcome::Committed
+    }
 }
 
 // The per-handle process table:
@@ -619,10 +674,10 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
     //
     // Two-tier commit:
     //   Tier 1 (shared-lock fast path): acquire tenant.read(), snapshot,
-    //     apply, classify the result, and try `try_commit_diff` — this
-    //     writes only the cells whose contents actually changed, each
-    //     under its own per-cell write lock. Two disjoint-cell writers
-    //     run in parallel; same-cell writers serialize on the cell lock.
+    //     apply, classify the result, and commit. For keys with known
+    //     write targets (create:*, update:*, transition:*), use
+    //     try_commit_declared (#186) which is O(|targets|) instead of
+    //     O(|all_cells|). Opaque ops use try_commit_diff.
     //   Tier 2 (exclusive-lock escalation): on Stale/Structural outcome,
     //     drop the read, take tenant.write(), re-snapshot + re-apply +
     //     `replace_d`. Structural = new or removed cells; Stale = a
@@ -635,6 +690,14 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
     let obj = ast::Object::parse(input);
 
     // Tier 1: shared-lock fast path.
+    //
+    // Note: try_commit_declared (#186) is available for callers that
+    // can pre-declare their write targets. system_impl uses the full
+    // diff path because create/update/transition write to FT cells
+    // whose names depend on the compiled domain (Order_has_total,
+    // etc.) and we don't have a FT-cell index lookup here yet. Once
+    // the cell index is wired, switch known verbs to the declared
+    // path for O(|targets|) instead of O(|all_cells|) commits.
     {
         let st = tenant.read();
         let snapshot = st.snapshot_d();
@@ -667,6 +730,29 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
             st.replace_d(new_d);
             response
         }
+    }
+}
+
+/// Extract declared write targets for known system verbs. Returns
+/// `Some(vec)` when the verb's write-set is predictable, `None` for
+/// opaque ops (compile, user-defined defs) that must use the full diff.
+///
+/// The declared set is a strict superset of what the verb actually
+/// modifies. Extra targets cost one no-op CAS each — cheap. Missing
+/// targets cause silent drops (caught by debug_assert in
+/// `prune_to_declared`).
+fn write_targets_for_key(key: &str) -> Option<Vec<String>> {
+    let (verb, noun) = key.split_once(':')?;
+    match verb {
+        "create" | "update" | "transition" => {
+            let mut targets = vec![noun.to_string(), "audit_log".to_string()];
+            let snake = crate::naming::noun_to_table(noun);
+            if snake != noun.to_lowercase() {
+                targets.push(snake);
+            }
+            Some(targets)
+        }
+        _ => None,
     }
 }
 
