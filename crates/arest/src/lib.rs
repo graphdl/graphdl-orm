@@ -514,6 +514,60 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
         }).collect::<Vec<_>>().join("\n");
     }
 
+    // `freeze` / `thaw` (#203) — byte-level state round-trip through
+    // the system bridge. Encodes `freeze(snapshot_d())` bytes as hex
+    // for string-only transport (wasm-bindgen + MCP both hand strings);
+    // hex is chosen over base64 to avoid adding a dep. DO storage,
+    // HTTP export/import, and FPGA ROM burn all read the same bytes.
+    //
+    //   system(h, "freeze", "")     → hex-encoded freeze image
+    //   system(h, "thaw", "<hex>")  → replaces d; returns "ok" / "⊥"
+    if key == "freeze" {
+        let st = tenant.read().unwrap();
+        let d = st.snapshot_d();
+        let bytes = crate::freeze::freeze(&d);
+        // Lowercase hex, no separators. Stable, byte-deterministic.
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for b in &bytes {
+            use std::fmt::Write;
+            let _ = write!(&mut out, "{:02x}", b);
+        }
+        return out;
+    }
+    if key == "thaw" {
+        // Parse hex input → bytes → thaw → Object → replace_d.
+        let nibble = |b: u8| -> Option<u8> {
+            match b {
+                b'0'..=b'9' => Some(b - b'0'),
+                b'a'..=b'f' => Some(b - b'a' + 10),
+                b'A'..=b'F' => Some(b - b'A' + 10),
+                _ => None,
+            }
+        };
+        let clean: String = input.chars().filter(|c| !c.is_whitespace()).collect();
+        if clean.len() % 2 != 0 {
+            return "⊥".into();
+        }
+        let mut bytes: Vec<u8> = Vec::with_capacity(clean.len() / 2);
+        let bs = clean.as_bytes();
+        let mut i = 0;
+        while i + 1 < bs.len() {
+            match (nibble(bs[i]), nibble(bs[i + 1])) {
+                (Some(h), Some(l)) => bytes.push((h << 4) | l),
+                _ => return "⊥".into(),
+            }
+            i += 2;
+        }
+        return match crate::freeze::thaw(&bytes) {
+            Ok(obj) => {
+                let mut st = tenant.write().unwrap();
+                st.replace_d(obj);
+                "ok".into()
+            }
+            Err(_) => "⊥".into(),
+        };
+    }
+
     // ── Read-only dispatch path ─────────────────────────────────────
     //
     // Known-read ops (list / get / query / debug / audit / explain /
@@ -1061,6 +1115,75 @@ Order has total.
         assert_eq!(system_impl(u32::MAX, "snapshot", ""), "⊥");
         assert_eq!(system_impl(u32::MAX, "rollback", "whatever"), "⊥");
         assert_eq!(system_impl(u32::MAX, "snapshots", ""), "⊥");
+    }
+
+    // ── freeze / thaw round-trip through system bridge (#203) ──────
+
+    #[test]
+    fn freeze_produces_hex_with_arest_magic() {
+        let h = alloc_with_noun("payload");
+        let hex = system_impl(h, "freeze", "");
+        // Magic "AREST\x01" → first 12 hex chars "4152455354" + "01".
+        assert!(hex.starts_with("41524553540"),
+            "freeze output must begin with the AREST magic header, got: {}",
+            &hex[..hex.len().min(32)]);
+        // All hex-valid bytes, no whitespace.
+        assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
+        release_impl(h);
+    }
+
+    #[test]
+    fn thaw_restores_frozen_state_across_handles() {
+        // Snapshot on h1, freeze to hex, thaw into a fresh h2,
+        // confirm h2 sees the same Noun cell payload. This is the
+        // portability contract: the bytes alone reconstruct the tenant.
+        let h1 = alloc_with_noun("original-payload");
+        let hex = system_impl(h1, "freeze", "");
+        assert!(!hex.is_empty());
+        release_impl(h1);
+
+        let h2 = create_bare_impl();
+        assert_eq!(system_impl(h2, "thaw", &hex), "ok");
+        // h2's Noun cell now carries the h1 payload.
+        let noun_cell_after_thaw = {
+            let tenant = tenant_lock(h2).unwrap();
+            let st = tenant.read().unwrap();
+            st.snapshot_d()
+        };
+        let s = format!("{:?}", noun_cell_after_thaw);
+        assert!(s.contains("original-payload"),
+            "thawed state must carry the h1 payload, got: {}", s);
+        release_impl(h2);
+    }
+
+    #[test]
+    fn thaw_rejects_malformed_hex() {
+        let h = create_bare_impl();
+        assert_eq!(system_impl(h, "thaw", "not-hex-bytes"), "⊥");
+        assert_eq!(system_impl(h, "thaw", "xyz"), "⊥");
+        assert_eq!(system_impl(h, "thaw", "a"), "⊥",
+            "odd-length hex must reject");
+        release_impl(h);
+    }
+
+    #[test]
+    fn thaw_rejects_non_arest_bytes() {
+        // Even well-formed hex must produce an AREST freeze image
+        // under the magic header — arbitrary bytes fail thaw cleanly.
+        let h = create_bare_impl();
+        assert_eq!(system_impl(h, "thaw", "deadbeef"), "⊥");
+        release_impl(h);
+    }
+
+    #[test]
+    fn freeze_is_byte_deterministic_across_snapshots() {
+        // Two freezes of the same state must be byte-identical.
+        // Required for reproducible DO storage (#203) and ROM hashing (#171).
+        let h = alloc_with_noun("deterministic");
+        let a = system_impl(h, "freeze", "");
+        let b = system_impl(h, "freeze", "");
+        assert_eq!(a, b);
+        release_impl(h);
     }
 
     // ── Per-tenant read/write lock classification ──────────────────
