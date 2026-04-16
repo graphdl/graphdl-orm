@@ -4,6 +4,11 @@
  * Claude Desktop / Claude Code, Streamable HTTP for remote, or something
  * you write yourself).
  *
+ * All tools except `ask` delegate to `dispatchVerb` (#200) so the MCP
+ * surface and the HTTP surface share a single implementation. `ask` is
+ * the exception because it uses MCP client sampling, which has no HTTP
+ * equivalent.
+ *
  * Consumers on npm:
  *
  *   import { createArestServer } from 'arest'
@@ -16,15 +21,12 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
 import * as engine from '../api/engine.js'
+import { dispatchVerb } from '../api/verb-dispatcher.js'
 
 export interface CreateArestServerOptions {
-  /** Existing engine handle to use. Omit to allocate a fresh one with the metamodel loaded. */
   handle?: number
-  /** FORML2 readings to compile into the engine on startup. Appended to the metamodel. */
   readings?: string[]
-  /** MCP server name (shown to clients). Default: "arest". */
   name?: string
-  /** MCP server version (shown to clients). Default: "0.7.0". */
   version?: string
 }
 
@@ -40,19 +42,23 @@ function safeJson<T>(raw: string, fallback: T): T | any {
  * Create an MCP server with the core AREST verbs registered. Returns the
  * server unconnected; the caller attaches a transport.
  *
- * Verbs registered: schema, get, query, apply, actions, compile, explain,
- * ask. The LLM-bridge verb (ask) attempts MCP client sampling and falls
- * back to returning the prompt for manual execution if sampling isn't
- * available on the connected transport.
+ * Every tool (except `ask`) delegates to `dispatchVerb(verb, body, handle)`
+ * so behaviour is identical to the HTTP `/api/<verb>` routes (#200).
  */
 export function createArestServer(options: CreateArestServerOptions = {}): McpServer {
   const handle = options.handle ?? engine.compileDomainReadings(...(options.readings ?? []))
-  const sys = (key: string, input: string) => engine.system(handle, key, input)
+
+  const dispatch = async (verb: string, body: Record<string, unknown>) => {
+    const envelope = await dispatchVerb(verb, body, handle)
+    return textResult(envelope.data)
+  }
 
   const server = new McpServer({
     name: options.name ?? 'arest',
     version: options.version ?? '0.7.0',
   })
+
+  // ── Introspection ─────────────────────────────────────────────────
 
   server.registerTool(
     'schema',
@@ -60,8 +66,28 @@ export function createArestServer(options: CreateArestServerOptions = {}): McpSe
       description: 'Get the full schema: nouns, fact types, constraints, state machines, derivation rules.',
       inputSchema: {},
     },
-    async () => textResult(safeJson(sys('debug', ''), { raw: sys('debug', '') })),
+    async () => dispatch('schema', {}),
   )
+
+  server.registerTool(
+    'explain',
+    {
+      description: 'Derivation chain and audit trail for an entity.',
+      inputSchema: { id: z.string(), noun: z.string().optional(), fact: z.string().optional() },
+    },
+    async (input) => dispatch('explain', input),
+  )
+
+  server.registerTool(
+    'actions',
+    {
+      description: 'Valid SM transitions and navigation links for an entity. Pure HATEOAS.',
+      inputSchema: { noun: z.string(), id: z.string(), status: z.string().optional() },
+    },
+    async (input) => dispatch('actions', input),
+  )
+
+  // ── Entity CRUD ───────────────────────────────────────────────────
 
   server.registerTool(
     'get',
@@ -72,11 +98,7 @@ export function createArestServer(options: CreateArestServerOptions = {}): McpSe
         id: z.string().optional(),
       },
     },
-    async ({ noun, id }) => {
-      if (!noun) return textResult({ error: 'Provide a noun to get or list.' })
-      const raw = id ? sys(`get:${noun}`, id) : sys(`list:${noun}`, '')
-      return textResult(safeJson(raw, { raw }))
-    },
+    async (input) => dispatch('get', input),
   )
 
   server.registerTool(
@@ -88,10 +110,7 @@ export function createArestServer(options: CreateArestServerOptions = {}): McpSe
         filter: z.record(z.string(), z.string()).optional(),
       },
     },
-    async ({ fact_type, filter }) => {
-      const filterStr = filter ? JSON.stringify(filter) : ''
-      return textResult(safeJson(sys(`query:${fact_type}`, filterStr), []) ?? [])
-    },
+    async (input) => dispatch('query', input),
   )
 
   server.registerTool(
@@ -106,35 +125,10 @@ export function createArestServer(options: CreateArestServerOptions = {}): McpSe
         fields: z.record(z.string(), z.string()).optional(),
       },
     },
-    async ({ operation, noun, id, event, fields }) => {
-      if (operation === 'transition') {
-        if (!id || !event) return textResult({ error: 'transition requires id and event' })
-        return textResult(safeJson(sys(`transition:${noun}`, `<${id}, ${event}>`), { raw: '' }))
-      }
-      const pairs = Object.entries(fields || {}).map(([k, v]) => `<${k}, ${v}>`).join(', ')
-      const idPair = id ? `<id, ${id}>, ` : ''
-      const key = operation === 'create' ? `create:${noun}` : `update:${noun}`
-      return textResult(safeJson(sys(key, `<${idPair}${pairs}>`), { raw: '' }))
-    },
+    async (input) => dispatch('apply', input),
   )
 
-  server.registerTool(
-    'actions',
-    {
-      description: 'Valid SM transitions and navigation links for an entity. Pure HATEOAS.',
-      inputSchema: { noun: z.string(), id: z.string(), status: z.string().optional() },
-    },
-    async ({ noun, id, status }) => {
-      let resolvedStatus = status ?? ''
-      if (!resolvedStatus) {
-        const sm: any = safeJson(sys('get:State Machine', id), null)
-        if (sm && typeof sm.currentlyInStatus === 'string') resolvedStatus = sm.currentlyInStatus
-      }
-      const transitions = safeJson(sys(`transitions:${noun}`, resolvedStatus), []) ?? []
-      const entity = safeJson(sys(`get:${noun}`, id), null)
-      return textResult({ entity: id, noun, status: resolvedStatus || null, transitions, entity_data: entity })
-    },
-  )
+  // ── Self-modification ─────────────────────────────────────────────
 
   server.registerTool(
     'compile',
@@ -142,59 +136,58 @@ export function createArestServer(options: CreateArestServerOptions = {}): McpSe
       description: 'Compile FORML2 readings into the running engine (self-modification).',
       inputSchema: { readings: z.string() },
     },
-    async ({ readings }) => {
-      const raw = sys('compile', readings)
-      return textResult({ ok: !raw.startsWith('⊥'), result: safeJson(raw, raw) })
-    },
+    async (input) => dispatch('compile', input),
   )
 
   server.registerTool(
     'check',
     {
       description:
-        'Diagnose FORML2 readings before compiling. Runs parse, resolve, and deontic layers. Empty diagnostics means the readings are clean. Read-only; no engine state change. Call before `compile` to self-correct common syntax issues (dropped antecedents, non-ASCII atom IDs, ring fact types missing their ring constraint).',
+        'Diagnose FORML2 readings before compiling. Runs parse, resolve, and deontic layers. Empty diagnostics means the readings are clean. Read-only; no engine state change.',
       inputSchema: { readings: z.string() },
     },
-    async ({ readings }) => {
-      const raw = sys('check', readings)
-      if (!raw) return textResult({ ok: true, diagnostics: [] })
-      // Each line is "[LEVEL source] reading: message (suggestion: ...)".
-      const diagnostics = raw.split('\n').map((line) => {
-        const m = /^\[(ERROR|WARN|HINT) (parse|resolve|deontic)\] (.*?): (.*?)(?: \(suggestion: (.*?)\))?$/.exec(line)
-        if (!m) return { level: 'unknown', raw: line }
-        return {
-          level: m[1].toLowerCase(),
-          source: m[2],
-          reading: m[3],
-          message: m[4],
-          suggestion: m[5] ?? null,
-        }
-      })
-      const hasError = diagnostics.some((d) => d.level === 'error')
-      return textResult({ ok: !hasError, diagnostics })
-    },
+    async (input) => dispatch('check', input),
   )
 
   server.registerTool(
-    'explain',
+    'verify',
     {
-      description: 'Derivation chain and audit trail for an entity.',
-      inputSchema: { id: z.string(), noun: z.string().optional(), fact: z.string().optional() },
+      description: 'Verify the current domain state for structural soundness.',
+      inputSchema: { domain: z.string().optional() },
     },
-    async ({ id, noun, fact }) => {
-      const audit = safeJson(sys('audit', '0'), [])
-      const factData = fact
-        ? (safeJson(sys(`query:${fact}`, JSON.stringify(noun ? { [noun]: id } : {})), []) ?? [])
-        : []
-      return textResult({
-        entity: id,
-        fact_query: factData,
-        audit_trail: Array.isArray(audit)
-          ? audit.filter((a: any) => a?.entity === id || a?.resource === id)
-          : [],
-      })
-    },
+    async (input) => dispatch('verify', input),
   )
+
+  // ── Persistence ───────────────────────────────────────────────────
+
+  server.registerTool(
+    'snapshot',
+    {
+      description: 'Take a named snapshot of the current engine state.',
+      inputSchema: { label: z.string().optional() },
+    },
+    async (input) => dispatch('snapshot', input),
+  )
+
+  server.registerTool(
+    'rollback',
+    {
+      description: 'Rollback the engine to a named snapshot.',
+      inputSchema: { label: z.string().optional() },
+    },
+    async (input) => dispatch('rollback', input),
+  )
+
+  server.registerTool(
+    'snapshots',
+    {
+      description: 'List available snapshots.',
+      inputSchema: {},
+    },
+    async () => dispatch('snapshots', {}),
+  )
+
+  // ── LLM bridge (MCP-specific — uses client sampling) ──────────────
 
   server.registerTool(
     'ask',
@@ -207,6 +200,7 @@ export function createArestServer(options: CreateArestServerOptions = {}): McpSe
       },
     },
     async ({ question, noun, llm_response }) => {
+      const sys = (key: string, input: string) => engine.system(handle, key, input)
       const schemaRaw = noun ? sys(`schema:${noun}`, '') : sys('list:Noun', '')
       const prompt = `Translate the question into a projection query.\n\nSchema:\n${schemaRaw}\n\nQuestion: ${question}\n\nRespond with JSON ONLY: {"fact_type": "...", "filter": {...}}`
 
@@ -230,13 +224,15 @@ export function createArestServer(options: CreateArestServerOptions = {}): McpSe
         }
       }
 
-      if (!answer) return textResult({ error: 'No LLM response available' })
-      let spec: any
-      try { spec = JSON.parse(answer.replace(/^```(?:json)?\s*/m, '').replace(/\s*```\s*$/m, '')) }
-      catch { return textResult({ error: 'LLM did not return valid JSON projection spec', llm_response: answer }) }
-      const filterStr = Object.entries(spec.filter || {}).map(([k, v]) => `<${k},${v}>`).join('')
-      const raw = sys(`query:${spec.fact_type}`, filterStr)
-      return textResult({ question, query: spec, results: safeJson(raw, []) ?? [] })
+      const parsed = safeJson(answer!, null)
+      if (!parsed || !parsed.fact_type) {
+        return textResult({ mode: 'error', reason: 'LLM response did not parse', raw: answer })
+      }
+      const queryResult = await dispatchVerb('query', {
+        fact_type: parsed.fact_type,
+        filter: parsed.filter,
+      }, handle)
+      return textResult(queryResult.data)
     },
   )
 
