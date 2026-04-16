@@ -9,21 +9,27 @@
 //   BIOS / UEFI
 //     └─> bootloader (Multiboot2 stage, built by arest-kernel-image)
 //           └─> kernel_main(&'static mut BootInfo) -> !
-//                 └─> allocator::init() — 1 MiB static heap
-//                 └─> SERIAL.lock() banner
+//                 └─> allocator::init()   — 1 MiB static heap
+//                 └─> gdt::init()         — GDT + TSS + IST
+//                 └─> interrupts::init_idt()
+//                 └─> SERIAL banner
+//                 └─> int3 smoke test     — proves IDT routes
 //                 └─> hlt loop
 //
 // Today this is MVP plumbing — a kernel that wakes up, brings up the
-// allocator and serial console, prints a banner, and halts. No AREST
-// engine integration yet; that follows #174 landing no_std-clean
+// allocator, installs its own GDT and IDT, prints a banner, and
+// halts. AREST engine integration follows #174 landing no_std-clean
 // versions of the core modules (#182 baked metamodel, #183 REPL).
 
 #![no_std]
 #![no_main]
+#![feature(abi_x86_interrupt)]
 
 extern crate alloc;
 
 mod allocator;
+mod gdt;
+mod interrupts;
 mod serial;
 
 use alloc::string::ToString;
@@ -39,15 +45,23 @@ entry_point!(kernel_main);
 /// proves the toolchain and image pipeline work end-to-end."
 fn kernel_main(_boot_info: &'static mut BootInfo) -> ! {
     allocator::init();
+    gdt::init();
+    interrupts::init_idt();
 
     println!("AREST kernel online");
     println!("  target: x86_64-unknown-none");
     println!("  heap:   1 MiB static (#178)");
+    println!("  gdt:    loaded with TSS + double-fault IST (#179)");
+    println!("  idt:    breakpoint + double-fault installed (#179)");
 
     // Prove the allocator works — allocate a String and echo it.
-    // Once #182 lands this becomes the baked-metamodel thaw path.
     let greeting = "heap is live".to_string();
     println!("  alloc: {greeting}");
+
+    // Prove the IDT routes — `int3` should land in our breakpoint
+    // handler, print a frame, and return cleanly to this function.
+    x86_64::instructions::interrupts::int3();
+    println!("  idt:   int3 round-tripped through breakpoint handler");
 
     halt_forever();
 }
@@ -57,9 +71,7 @@ fn kernel_main(_boot_info: &'static mut BootInfo) -> ! {
 /// pinning a host thread at 100% while waiting for interrupts.
 fn halt_forever() -> ! {
     loop {
-        unsafe {
-            core::arch::asm!("hlt", options(nomem, nostack, preserves_flags));
-        }
+        x86_64::instructions::hlt();
     }
 }
 
