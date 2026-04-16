@@ -286,12 +286,18 @@ for (const verb of UNIFIED_VERBS) {
       // #203: persist snapshot bytes to RegistryDB so they survive
       // worker restarts. The engine's in-memory snapshot store is
       // ephemeral; the DO copy is durable.
+      // #205: use domain-scoped registry when a domain is present in body.
       if (verb === 'snapshot' && (env as any).REGISTRY) {
         try {
           const frozen = wasmSystem(currentDomainHandle(), 'freeze', '')
           if (frozen && frozen !== '⊥') {
             const label = (body.label as string) || new Date().toISOString()
-            const registryId = ((env as any).REGISTRY as DurableObjectNamespace).idFromName('global')
+            const snapshotDomain = (body.domain as string | undefined)
+            const registryId = registryIdForDomain(
+              (env as any).REGISTRY as DurableObjectNamespace,
+              'global',
+              snapshotDomain,
+            )
             const registry = ((env as any).REGISTRY as DurableObjectNamespace).get(registryId) as any
             await registry.storeSnapshot(label, frozen)
           }
@@ -307,10 +313,17 @@ for (const verb of UNIFIED_VERBS) {
 }
 
 // #203: export frozen state bytes from DO storage
+// #205: ?domain=<slug> selects the domain-scoped registry shard
 router.get('/api/export/:label', async (request: Request, env: Env) => {
   if (!(env as any).REGISTRY) return error(501, 'no REGISTRY binding')
-  const label = new URL(request.url).pathname.split('/').pop() || ''
-  const registryId = ((env as any).REGISTRY as DurableObjectNamespace).idFromName('global')
+  const url = new URL(request.url)
+  const label = url.pathname.split('/').pop() || ''
+  const domain = url.searchParams.get('domain') || undefined
+  const registryId = registryIdForDomain(
+    (env as any).REGISTRY as DurableObjectNamespace,
+    'global',
+    domain,
+  )
   const registry = ((env as any).REGISTRY as DurableObjectNamespace).get(registryId) as any
   const hex = await registry.fetchSnapshot(label)
   if (!hex) return error(404, `snapshot '${label}' not found`)
@@ -318,15 +331,20 @@ router.get('/api/export/:label', async (request: Request, env: Env) => {
 })
 
 // #203: import frozen state bytes into the engine + persist to DO
+// #205: body.domain selects the domain-scoped registry shard
 router.post('/api/import', async (request: Request, env: Env) => {
-  const body = (await request.json()) as { label?: string; frozen_hex?: string }
+  const body = (await request.json()) as { label?: string; frozen_hex?: string; domain?: string }
   if (!body.frozen_hex) return error(400, 'frozen_hex required')
   const label = body.label || new Date().toISOString()
   try {
     const raw = wasmSystem(currentDomainHandle(), 'thaw', body.frozen_hex)
     if (raw.startsWith('⊥')) return error(400, `thaw failed: ${raw}`)
     if ((env as any).REGISTRY) {
-      const registryId = ((env as any).REGISTRY as DurableObjectNamespace).idFromName('global')
+      const registryId = registryIdForDomain(
+        (env as any).REGISTRY as DurableObjectNamespace,
+        'global',
+        body.domain,
+      )
       const registry = ((env as any).REGISTRY as DurableObjectNamespace).get(registryId) as any
       await registry.storeSnapshot(label, body.frozen_hex)
     }
@@ -1067,6 +1085,13 @@ router.post('/arest/extract', async (request: Request) => {
   } catch (e) {
     return error(400, e instanceof Error ? e.message : String(e))
   }
+})
+
+// ── #205: List all known domains from the global registry ────────────
+router.get('/api/domains', async (_request: Request, env: Env) => {
+  const registry = getRegistryDO(env, 'global') as any
+  const domains: string[] = await registry.listDomains()
+  return json({ domains })
 })
 
 // ── 404 fallback ─────────────────────────────────────────────────────

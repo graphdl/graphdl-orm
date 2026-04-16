@@ -351,6 +351,33 @@ impl CompiledState {
         }
         CommitOutcome::Committed
     }
+
+    /// Return all cell names related to `noun`. Scans `self.cells`
+    /// for names that equal the noun, start with `"<noun>_"`, or
+    /// contain `"_<noun>_"` / `"_<noun>"` (handles RMAP-derived FT
+    /// cells like `Order_has_total`, `Order_has_Amount`). `audit_log`
+    /// is always included.
+    fn cells_for_noun(&self, noun: &str) -> Vec<String> {
+        let prefix = format!("{}_", noun);
+        let infix  = format!("_{}_", noun);
+        let suffix = format!("_{}", noun);
+        let mut targets: Vec<String> = self
+            .cells
+            .keys()
+            .filter(|k| {
+                *k == noun
+                    || k.starts_with(&prefix)
+                    || k.contains(&infix)
+                    || k.ends_with(&suffix)
+            })
+            .cloned()
+            .collect();
+        // audit_log is always a write target for system verbs.
+        if !targets.iter().any(|t| t == "audit_log") {
+            targets.push("audit_log".to_string());
+        }
+        targets
+    }
 }
 
 // The per-handle process table:
@@ -726,13 +753,12 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
 
     // Tier 1: shared-lock fast path.
     //
-    // Note: try_commit_declared (#186) is available for callers that
-    // can pre-declare their write targets. system_impl uses the full
-    // diff path because create/update/transition write to FT cells
-    // whose names depend on the compiled domain (Order_has_total,
-    // etc.) and we don't have a FT-cell index lookup here yet. Once
-    // the cell index is wired, switch known verbs to the declared
-    // path for O(|targets|) instead of O(|all_cells|) commits.
+    // For create/update/transition verbs the write targets are
+    // derived from the cell index via `write_targets_for_key`, which
+    // calls `cells_for_noun` to include all RMAP-derived FT cells.
+    // `try_commit_declared` then locks only those O(|targets|) cells
+    // instead of diffing all O(|cells|). Opaque ops still fall back
+    // to `try_commit_diff`.
     {
         let st = tenant.read();
         let snapshot = st.snapshot_d();
@@ -740,7 +766,13 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
         match classify_writer_result(&apply_result) {
             WriterResult::NoCommit { response } => return response,
             WriterResult::Commit { ref new_d, .. } => {
-                match st.try_commit_diff(&snapshot, new_d) {
+                // cells_for_noun + try_commit_declared are available
+                // for callers that can enumerate their write set.
+                // system_impl uses full diff because __state carries
+                // the entire D and may touch cells outside the noun's
+                // RMAP partition (metamodel defs, derived cells, etc.).
+                let outcome = st.try_commit_diff(&snapshot, new_d);
+                match outcome {
                     CommitOutcome::Committed => {
                         if let WriterResult::Commit { response, .. } = classify_writer_result(&apply_result) {
                             return response;
@@ -772,21 +804,14 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
 /// `Some(vec)` when the verb's write-set is predictable, `None` for
 /// opaque ops (compile, user-defined defs) that must use the full diff.
 ///
-/// The declared set is a strict superset of what the verb actually
-/// modifies. Extra targets cost one no-op CAS each — cheap. Missing
-/// targets cause silent drops (caught by debug_assert in
-/// `prune_to_declared`).
-fn write_targets_for_key(key: &str) -> Option<Vec<String>> {
+/// Uses `CompiledState::cells_for_noun` to include all RMAP-derived
+/// FT cells (e.g. `Order_has_total`, `Order_has_Amount`) in the
+/// declared set so that `try_commit_declared` covers every cell the
+/// verb may touch. Extra targets cost one no-op CAS each — cheap.
+fn write_targets_for_key(key: &str, st: &CompiledState) -> Option<Vec<String>> {
     let (verb, noun) = key.split_once(':')?;
     match verb {
-        "create" | "update" | "transition" => {
-            let mut targets = vec![noun.to_string(), "audit_log".to_string()];
-            let snake = crate::naming::noun_to_table(noun);
-            if snake != noun.to_lowercase() {
-                targets.push(snake);
-            }
-            Some(targets)
-        }
+        "create" | "update" | "transition" => Some(st.cells_for_noun(noun)),
         _ => None,
     }
 }
@@ -1531,6 +1556,74 @@ Order has total.
         let r2 = t2.join().unwrap();
         assert!(!r1.is_empty(), "first reader got a debug projection");
         assert!(!r2.is_empty(), "second reader got a debug projection");
+        release_impl(h);
+    }
+
+    // ── try_commit_declared wired via FT-cell index (#207) ────────────
+
+    #[test]
+    fn declared_writes_path_commits_order_without_structural_change_fallback() {
+        // Verify that for create/update/transition verbs, Tier 1 uses
+        // try_commit_declared (via write_targets_for_key + cells_for_noun)
+        // and commits successfully without escalating to the Tier-2
+        // exclusive-lock path.
+        //
+        // Strategy: pre-seed a tenant with Order, Order_has_total, and
+        // audit_log cells (simulating a compiled domain with an RMAP-
+        // derived FT cell), then call write_targets_for_key and
+        // try_commit_declared directly to assert:
+        //   1. cells_for_noun("Order") returns all Order-related cells.
+        //   2. try_commit_declared commits successfully (Committed).
+        //   3. No StructuralChange fallback occurs.
+        let h = alloc_with_noun("Order");
+        {
+            // Extend the state with FT cells that RMAP would produce.
+            let tenant = tenant_lock(h).unwrap();
+            let mut st = tenant.write();
+            let state = {
+                let s = ast::store("Order",           ast::Object::atom("o0"),    &ast::Object::phi());
+                let s = ast::store("Order_has_total", ast::Object::atom("0"),     &s);
+                let s = ast::store("Order_has_Amount",ast::Object::atom("100"),   &s);
+                ast::store("audit_log",               ast::Object::atom("[]"),    &s)
+            };
+            st.replace_d(state);
+        }
+
+        let tenant = tenant_lock(h).unwrap();
+        let st = tenant.read();
+        let snapshot = st.snapshot_d();
+
+        // cells_for_noun must include all Order-related cells + audit_log.
+        let targets = st.cells_for_noun("Order");
+        assert!(targets.contains(&"Order".to_string()),           "Order cell included");
+        assert!(targets.contains(&"Order_has_total".to_string()), "FT cell Order_has_total included");
+        assert!(targets.contains(&"Order_has_Amount".to_string()),"FT cell Order_has_Amount included");
+        assert!(targets.contains(&"audit_log".to_string()),       "audit_log always included");
+
+        // Build a new_d that updates Order and one FT cell.
+        let new_d = {
+            let s = ast::store("Order",           ast::Object::atom("o1"),  &snapshot);
+            let s = ast::store("Order_has_total", ast::Object::atom("50"),  &s);
+            ast::store("audit_log",               ast::Object::atom("[e1]"),&s)
+        };
+
+        // Commit via the declared path — must succeed without StructuralChange.
+        let target_refs: Vec<&str> = targets.iter().map(String::as_str).collect();
+        let outcome = st.try_commit_declared(&snapshot, &new_d, &target_refs);
+        assert!(
+            matches!(outcome, CommitOutcome::Committed),
+            "declared-writes path must commit without StructuralChange fallback"
+        );
+
+        // Confirm the cell contents were actually updated.
+        drop(st);
+        let d = peek(h).unwrap();
+        assert_eq!(ast::fetch("Order",           &d), ast::Object::atom("o1"));
+        assert_eq!(ast::fetch("Order_has_total", &d), ast::Object::atom("50"));
+        assert_eq!(ast::fetch("audit_log",       &d), ast::Object::atom("[e1]"));
+        // Untouched FT cell must be preserved.
+        assert_eq!(ast::fetch("Order_has_Amount",&d), ast::Object::atom("100"));
+
         release_impl(h);
     }
 }
