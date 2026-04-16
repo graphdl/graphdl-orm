@@ -1623,11 +1623,16 @@ fn resolve_derivation_rule(rule: &mut DerivationRuleDef, ir: &Domain, catalog: &
         if !sanitized.is_empty() {
             sanitized
         } else {
-            use std::collections::hash_map::DefaultHasher;
-            use std::hash::{Hash, Hasher};
-            let mut h = DefaultHasher::new();
-            rule.text.hash(&mut h);
-            format!("_rule_{:x}", h.finish())
+            // FNV-1a 64-bit over the rule text — no hasher dep, no
+            // allocation, stable output. Only used as a fallback rule
+            // name when the sanitized text collapses to empty, so
+            // collisions matter only inside a single domain's rules.
+            let mut h: u64 = 0xcbf29ce484222325;
+            for b in rule.text.as_bytes() {
+                h ^= *b as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+            format!("_rule_{h:x}")
         }
     };
 }

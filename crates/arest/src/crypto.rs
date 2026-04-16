@@ -22,11 +22,21 @@ const DEV_KEY: &[u8] = b"AREST-DEV-KEY-NOT-FOR-PRODUCTION";
 /// Separator between sender and payload in the pre-image.
 const SEP: &str = "::";
 
-/// Get the signing key from env or fall back to dev key.
+/// Get the signing key from env or fall back to dev key. Under
+/// `no_std` there is no environment — the kernel-side caller sets
+/// the key via a different channel (baked constant, tenant record),
+/// so we just return the dev key there and trust the caller to
+/// override at a higher layer.
+#[cfg(not(feature = "no_std"))]
 fn key() -> Vec<u8> {
     std::env::var("AREST_HMAC_KEY")
         .map(|k| k.into_bytes())
         .unwrap_or_else(|_| DEV_KEY.to_vec())
+}
+
+#[cfg(feature = "no_std")]
+fn key() -> Vec<u8> {
+    DEV_KEY.to_vec()
 }
 
 /// Compute HMAC-SHA256 over (sender || SEP || payload).

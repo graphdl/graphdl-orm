@@ -29,7 +29,7 @@
 // transaction coordinator that knows this write enforces an alethic
 // invariant) can override at enqueue time.
 
-use std::collections::VecDeque;
+use alloc::collections::VecDeque;
 
 /// Priority lane. Variants are declared in descending-priority order:
 /// `Alethic` drains before `Deontic`, which drains before `ReadOnly`.
@@ -294,7 +294,7 @@ mod tests {
         }
         // Expected drain order: A1 (alethic) → W1, W2 (deontic FIFO)
         // → L1, L2, L3 (readonly FIFO).
-        let drained: Vec<&str> = std::iter::from_fn(|| q.pop().map(|(_, v)| v)).collect();
+        let drained: Vec<&str> = core::iter::from_fn(|| q.pop().map(|(_, v)| v)).collect();
         assert_eq!(drained, vec!["A1", "W1", "W2", "L1", "L2", "L3"]);
     }
 }
