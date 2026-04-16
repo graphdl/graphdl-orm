@@ -262,6 +262,67 @@ fn emit_sm_modules(sms: &std::collections::HashMap<String, crate::types::StateMa
     (modules, specs)
 }
 
+/// Bundle produced by `compile_to_bundle` — everything a downstream
+/// synthesis pipeline needs to build an AREST FPGA image.
+#[derive(Debug, Clone)]
+pub struct FpgaBundle {
+    /// Generated Verilog source (entity modules + constraint/SM/
+    /// audit/fact-io/boot_fsm + top).
+    pub verilog: String,
+    /// Freeze-image ROM bytes (metamodel baked via crate::freeze).
+    /// Empty until a real metamodel state is supplied.
+    pub rom: Vec<u8>,
+    /// Manifest — JSON with bundle metadata: entity list, Verilog
+    /// module list, ROM size, build timestamp placeholder.
+    pub manifest: String,
+}
+
+/// Produce a complete FPGA deliverable bundle from compiled state:
+/// Verilog source + freeze-image ROM + manifest. Downstream
+/// integrators (Vivado / Yosys) consume the Verilog for synthesis and
+/// burn the ROM bytes via their toolchain's BRAM-init hooks.
+///
+/// The manifest is plain JSON so it's readable by any downstream
+/// toolchain without bringing in an AREST dependency.
+pub fn compile_to_bundle(state: &Object) -> FpgaBundle {
+    let verilog = compile_to_verilog(state);
+    let rom = crate::freeze::freeze(state);
+    let manifest = build_bundle_manifest(state, &verilog, &rom);
+    FpgaBundle { verilog, rom, manifest }
+}
+
+/// Build the JSON manifest — minimal shape to keep downstream
+/// consumers simple. No serde dep outside what the crate already uses.
+fn build_bundle_manifest(state: &Object, verilog: &str, rom: &[u8]) -> String {
+    let nouns = fetch_or_phi("Noun", state);
+    let entity_names: Vec<String> = nouns.as_seq()
+        .map(|ns| ns.iter()
+            .filter_map(|n| {
+                let obj_type = binding(n, "objectType")?;
+                if obj_type != "entity" { return None; }
+                binding(n, "name").map(|s| s.to_string())
+            })
+            .collect())
+        .unwrap_or_default();
+    let module_count = verilog.matches("module ").count();
+    // Hand-rolled JSON to avoid pulling in serde_json in every bundle
+    // caller. The manifest is small and well-known; the syntax is
+    // deterministic for reproducible bundle hashing.
+    let entities_json = entity_names.iter()
+        .map(|n| format!("\"{}\"", n.replace('"', "\\\"")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "{{\n  \
+            \"arest_bundle_version\": 1,\n  \
+            \"entities\": [{}],\n  \
+            \"verilog_module_count\": {},\n  \
+            \"rom_bytes\": {}\n\
+        }}\n",
+        entities_json, module_count, rom.len(),
+    )
+}
+
 /// Compile state to Verilog AND append a self-contained `tb_top`
 /// testbench module so the output can feed Icarus Verilog or Verilator
 /// without external stimulus. Identical to `compile_to_verilog` for
@@ -1152,6 +1213,47 @@ Supplier supplies Widget.
     }
 
     // ── Audit-log Verilog ring buffer (#167) ──
+
+    // ── compile_to_bundle packaging (#171) ──
+
+    #[test]
+    fn bundle_packs_verilog_rom_and_manifest() {
+        let state = state_with_nouns(&[("Widget", "entity"), ("Gadget", "entity")]);
+        let bundle = compile_to_bundle(&state);
+        assert!(bundle.verilog.contains("module widget"),
+            "bundle.verilog must carry entity modules");
+        assert!(!bundle.rom.is_empty(),
+            "bundle.rom must contain the freeze-image bytes");
+        assert!(bundle.rom.starts_with(b"AREST"),
+            "rom must carry the freeze magic header");
+        assert!(bundle.manifest.contains("\"arest_bundle_version\": 1"));
+        assert!(bundle.manifest.contains("\"Widget\""));
+        assert!(bundle.manifest.contains("\"Gadget\""));
+    }
+
+    #[test]
+    fn bundle_manifest_reports_rom_size_and_module_count() {
+        let state = state_with_nouns(&[("Widget", "entity")]);
+        let bundle = compile_to_bundle(&state);
+        // rom_bytes in manifest matches actual rom length.
+        let expected = format!("\"rom_bytes\": {}", bundle.rom.len());
+        assert!(bundle.manifest.contains(&expected),
+            "manifest must report rom size ({}):\n{}", bundle.rom.len(), bundle.manifest);
+        // module_count matches actual Verilog module count.
+        let actual_count = bundle.verilog.matches("module ").count();
+        let expected_mc = format!("\"verilog_module_count\": {}", actual_count);
+        assert!(bundle.manifest.contains(&expected_mc));
+    }
+
+    #[test]
+    fn bundle_empty_state_still_produces_valid_manifest() {
+        let bundle = compile_to_bundle(&Object::phi());
+        // No entities, no modules, but a valid manifest.
+        assert!(bundle.manifest.contains("\"arest_bundle_version\": 1"));
+        assert!(bundle.manifest.contains("\"entities\": []"));
+        // ROM still has the magic header even for empty state.
+        assert!(bundle.rom.starts_with(b"AREST"));
+    }
 
     // ── Boot-sequence FSM (#170) ──
 
