@@ -38,33 +38,62 @@ macro_rules! diag {
 }
 
 pub mod sync;
+#[cfg(not(feature = "no_std"))]
 use crate::sync::Arc;
+#[cfg(not(feature = "no_std"))]
 use crate::sync::Mutex;
+#[cfg(not(feature = "no_std"))]
 use crate::sync::OnceLock;
+#[cfg(not(feature = "no_std"))]
 use crate::sync::RwLock;
 #[allow(unused_imports)]
 use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 
 pub mod ast;
+// types.rs uses serde Serialize/Deserialize — excluded from no_std build
+#[cfg(not(feature = "no_std"))]
 pub mod types;
-pub mod compile;
-pub mod evaluate;
-pub mod query;
-pub mod induce;
-pub mod rmap;
-pub mod naming;
-pub mod validate;
-pub mod conceptual_query;
-pub mod parse_forml2;
-pub mod verbalize;
-pub mod command;
-pub mod crypto;
-pub mod generators;
-pub mod quota;
-pub mod scheduler;
-pub mod ring;
 pub mod freeze;
+pub mod row_shape;
+
+// Modules that depend on serde / serde_json / regex / hmac / std are
+// excluded from the no_std (kernel) build. The kernel only needs
+// `ast` (Object + Func + apply) and `freeze` (thaw from baked bytes).
+#[cfg(not(feature = "no_std"))]
+pub mod compile;
+#[cfg(not(feature = "no_std"))]
+pub mod evaluate;
+#[cfg(not(feature = "no_std"))]
+pub mod query;
+#[cfg(not(feature = "no_std"))]
+pub mod induce;
+#[cfg(not(feature = "no_std"))]
+pub mod rmap;
+#[cfg(not(feature = "no_std"))]
+pub mod naming;
+#[cfg(not(feature = "no_std"))]
+pub mod validate;
+#[cfg(not(feature = "no_std"))]
+pub mod conceptual_query;
+#[cfg(not(feature = "no_std"))]
+pub mod parse_forml2;
+#[cfg(not(feature = "no_std"))]
+pub mod verbalize;
+#[cfg(not(feature = "no_std"))]
+pub mod command;
+#[cfg(not(feature = "no_std"))]
+pub mod crypto;
+#[cfg(not(feature = "no_std"))]
+pub mod generators;
+#[cfg(not(feature = "no_std"))]
+pub mod quota;
+#[cfg(not(feature = "no_std"))]
+pub mod scheduler;
+#[cfg(not(feature = "no_std"))]
+pub mod ring;
+#[cfg(not(feature = "no_std"))]
 pub mod declared_writes;
+#[cfg(not(feature = "no_std"))]
 pub mod check;
 
 #[cfg(feature = "wasm-lower")]
@@ -72,6 +101,10 @@ pub mod wasm_lower;
 
 #[cfg(feature = "cloudflare")]
 pub mod cloudflare;
+
+// The DOMAINS / CompiledState / system_impl machinery requires serde,
+// serde_json, regex, and std — excluded from the no_std kernel build.
+// The kernel uses only `ast` and `freeze` directly.
 
 /// D: the unified state — population cells + def cells, split into
 /// per-cell `Arc<RwLock<Object>>`. Backus Sec. 14.3 state-as-cells,
