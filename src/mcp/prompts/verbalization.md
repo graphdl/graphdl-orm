@@ -599,7 +599,7 @@ EntityA 'foo' has ValueX 'bar'.
 2. **Reference scheme facts are implicit** â€” `Listing(.VIN)` already declares the identifying value. Don't write "Listing has VIN" as a separate reading.
 3. **Value type enum values encode domain knowledge** â€” use them to express the set of valid/prohibited values instead of prose lists.
 4. **Object type names are singular** â€” "SupportRequest" not "SupportRequests", "APIProduct" not "APIProducts".
-5. **Never redeclare nouns** â€” reference cross-domain nouns by name, never redeclare them. Duplicate declarations create duplicate records in the metamodel. The domain system resolves cross-domain references.
+5. **Never redeclare nouns** â€” Nouns and Fact Types are globally visible within an Organization. Use any Noun that has been declared anywhere in the Org. No `## Cross-domain References` annotation is required or meaningful.
 6. **Fact types are grouped by subject entity** â€” use `### Entity Name` subsection headers under `## Fact Types`.
 7. **Constraints follow fact types** â€” a constraint references a reading, so the reading must appear first.
 
