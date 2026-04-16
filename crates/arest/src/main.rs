@@ -45,6 +45,8 @@ mod scheduler;
 #[allow(dead_code)]
 mod ring;
 #[allow(dead_code)]
+mod freeze;
+#[allow(dead_code)]
 mod validate;
 #[allow(dead_code)]
 mod induce;

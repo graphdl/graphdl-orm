@@ -29,6 +29,7 @@ pub mod generators;
 pub mod quota;
 pub mod scheduler;
 pub mod ring;
+pub mod freeze;
 
 #[cfg(feature = "wasm-lower")]
 pub mod wasm_lower;
