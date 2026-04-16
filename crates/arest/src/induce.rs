@@ -18,6 +18,8 @@
 use hashbrown::{HashMap, HashSet};
 use crate::types::*;
 use crate::ast::{self, Object};
+#[allow(unused_imports)]
+use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 
 /// An induced constraint -- discovered from population analysis
 #[derive(Debug, Clone, serde::Serialize)]

@@ -47,6 +47,8 @@ use hashbrown::HashMap;
 use crate::ast::Object;
 use crate::rmap::{self, TableColumn, TableDef};
 use crate::types::{Domain, StateMachineDef};
+#[allow(unused_imports)]
+use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 
 /// Compile state into an OpenAPI 3.1 JSON document for one App.
 ///
@@ -584,7 +586,7 @@ fn paths_for_noun(
         .chain(transitions)
         .chain(related_routes)
         .chain(actions_route)
-        .chain(std::iter::once(explain_route))
+        .chain(core::iter::once(explain_route))
         .collect()
 }
 
@@ -601,7 +603,7 @@ fn verb_slug_from_reading(reading: &str, noun_names: &[&str]) -> String {
     // Sort noun_names descending by whitespace-token count so longer
     // names match before shorter prefixes of themselves.
     let mut sorted: Vec<&str> = noun_names.to_vec();
-    sorted.sort_by_key(|n| std::cmp::Reverse(n.split_whitespace().count()));
+    sorted.sort_by_key(|n| core::cmp::Reverse(n.split_whitespace().count()));
 
     let tokens: Vec<&str> = reading.split_whitespace().collect();
     let mut out: Vec<String> = Vec::new();

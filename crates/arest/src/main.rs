@@ -1,3 +1,4 @@
+// CLI driver — requires std (env, fs, process).
 // AREST CLI — SYSTEM is the only function.
 //
 // Usage:

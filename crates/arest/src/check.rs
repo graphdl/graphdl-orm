@@ -21,6 +21,8 @@
 
 use crate::parse_forml2::parse_markdown;
 use crate::naming::atom_id_is_valid;
+#[allow(unused_imports)]
+use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Level { Error, Warning, Hint }
@@ -124,7 +126,7 @@ pub fn check_readings(text: &str) -> Vec<ReadingDiagnostic> {
             // one FT — we look up that FT and check both roles.
             if let Some(span) = c.spans.first() {
                 if let Some(ft) = ir.fact_types.get(&span.fact_type_id) {
-                    let nouns: std::collections::HashSet<&str> = ft.roles.iter()
+                    let nouns: hashbrown::HashSet<&str> = ft.roles.iter()
                         .map(|r| r.noun_name.as_str())
                         .collect();
                     if nouns.len() > 1 {

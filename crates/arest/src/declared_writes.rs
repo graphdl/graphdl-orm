@@ -18,6 +18,8 @@
 // user-defined Defs) keep using the existing diff path.
 
 use crate::ast::{self, Func, Object};
+#[allow(unused_imports)]
+use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 
 /// Run `apply(func, x, d)` and return an Object containing ONLY the
 /// cells named in `write_targets`. Other cells in the apply result

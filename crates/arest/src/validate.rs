@@ -11,6 +11,8 @@
 
 use hashbrown::HashMap;
 use crate::types::*;
+#[allow(unused_imports)]
+use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 
 /// Convert a domain's Domain into an Object state of core metamodel facts.
 pub fn ir_to_metamodel_state(ir: &Domain) -> crate::ast::Object {

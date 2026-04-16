@@ -10,6 +10,8 @@
 use hashbrown::HashSet;
 use crate::types::*;
 use crate::ast;
+#[allow(unused_imports)]
+use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 
 // -- Forward Chaining -------------------------------------------------
 //

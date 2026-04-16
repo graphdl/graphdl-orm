@@ -13,6 +13,8 @@
 //   - No variables, no mutable state during evaluation -- only reduction
 
 use hashbrown::{HashMap, HashSet};
+#[allow(unused_imports)]
+use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 
 // WASM-safe timing shim. The wasm32-unknown-unknown target panics on
 // std::time::Instant::now() (the Rust stdlib has no clock there). On

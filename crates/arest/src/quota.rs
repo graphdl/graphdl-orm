@@ -28,6 +28,8 @@
 
 use crate::ast::{fetch, Object};
 use crate::types::Domain;
+#[allow(unused_imports)]
+use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 
 /// A resource dimension under quota.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

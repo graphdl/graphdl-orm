@@ -14,6 +14,8 @@
 // 5. Build path + associate filters with target nouns
 
 use serde::Serialize;
+#[allow(unused_imports)]
+use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -52,7 +54,7 @@ fn extract_filters(query: &str) -> (String, Vec<String>) {
         |(values, mut stripped, (in_quote, mut current_val)), ch| {
             if ch == '\'' {
                 let (values, current_val) = if in_quote {
-                    let values = values.into_iter().chain(std::iter::once(current_val)).collect();
+                    let values = values.into_iter().chain(core::iter::once(current_val)).collect();
                     (values, String::new())
                 } else {
                     (values, current_val)
@@ -138,7 +140,7 @@ pub fn resolve_conceptual_query(
         .fold(Vec::new(), |acc, noun| {
             let is_dup = acc.last().map(|n: &String| n.to_lowercase()) == Some(noun.to_lowercase());
             acc.into_iter()
-                .chain(std::iter::once(noun).filter(|_| !is_dup))
+                .chain(core::iter::once(noun).filter(|_| !is_dup))
                 .collect()
         });
 

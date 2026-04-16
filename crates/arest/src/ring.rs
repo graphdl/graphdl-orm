@@ -19,6 +19,8 @@
 // the authority regardless of whether it runs in software or silicon.
 
 use alloc::collections::VecDeque;
+#[allow(unused_imports)]
+use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 
 /// Append-only ring with a compile-time-unknown but fixed-per-instance
 /// capacity. `cap == 0` is rejected at construction — a zero-capacity

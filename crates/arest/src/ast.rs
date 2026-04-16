@@ -17,6 +17,9 @@
 // per-fact-type indexing is available via the `validate:{fact_type_id}`
 // defs produced by compile_to_defs_state. Bulk loads may still skip
 // validation entirely when the readings are known-good.
+#[allow(unused_imports)]
+use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
+
 #[cfg(not(feature = "no_std"))]
 thread_local! {
     static SKIP_VALIDATE: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
@@ -1626,7 +1629,7 @@ fn platform_compile(x: &Object, d: &Object) -> Object {
     // Warnings only for now — pre-existing metamodel issues need cleanup first.
     let merged_domain = crate::compile::state_to_domain(&merged_state);
     let model_errors = crate::compile::validate_model(&merged_domain);
-    model_errors.iter().for_each(|e| diag!("[model warning] {}", e));
+    model_errors.iter().for_each(|e| { diag!("[model warning] {}", e); });
 
     // Compile defs from merged state + re-register platform primitives
     let mut defs = crate::compile::compile_to_defs_state(&merged_state);
