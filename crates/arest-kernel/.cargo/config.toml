@@ -1,0 +1,14 @@
+# crates/arest-kernel/.cargo/config.toml
+#
+# Default build for arest-kernel is bare-metal x86_64 under the stable
+# `x86_64-unknown-none` target (no std, no libc, no host OS). The
+# target comes with rustup via `rustup target add x86_64-unknown-none`
+# and works on the stable toolchain.
+#
+# Override per-invocation with --target for a host build — useful
+# during development for quick `cargo check` on unit tests, though
+# the kernel's core logic is no_std and most checks only make sense
+# on the bare-metal target.
+
+[build]
+target = "x86_64-unknown-none"
