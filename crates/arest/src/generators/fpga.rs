@@ -106,6 +106,14 @@ pub fn compile_to_verilog(state: &Object) -> String {
         // direction so the integrator wires each independently.
         modules.push(emit_fact_ingress_module());
         modules.push(emit_fact_egress_module());
+        // WASM reducer loader / dispatcher stub (#169). Interface-only
+        // module documenting the ports a future hardware WASM
+        // interpreter will drive. Body is empty — dispatch logic is
+        // post-1.0 work (1-2 weeks of HDL + verification). Emitting
+        // the stub keeps the bundle structurally complete so `top`
+        // can wire BRAM + host-import ports even before the real
+        // interpreter lands.
+        modules.push(emit_wasm_reducer_stub());
         // Boot-sequence FSM (#170). Sequences post-reset bring-up:
         // LOAD_ROM -> INIT_BRAM -> READY. Back-pressures ingress
         // until BRAMs are warm.
@@ -387,6 +395,89 @@ module tb_top;
         $display("t=%0t cycle=%0d rst_n=%b all_valid=%b constraint_ok=%b",
                  $time, cycle, rst_n, all_valid, constraint_ok);
         if (cycle >= 20) $finish;
+    end
+endmodule
+"#.to_string()
+}
+
+/// Emit the WASM reducer loader / dispatcher stub (#169).
+///
+/// Post-1.0 placeholder. A real implementation interprets the lowered
+/// AREST-Func WASM emitted by `wasm_lower.rs` (#152) against on-chip
+/// BRAM via the host-import bridge (#161) and the per-noun BRAM map
+/// (#166). Because AREST's lowered WASM is structurally bounded
+/// (every `Func::While` emits a max-iteration counter at compile
+/// time), the dispatcher needs no gas metering — just decode +
+/// dispatch + host-import routing.
+///
+/// Shipped interface pins the ABI future work must honour:
+///
+///   Inputs:
+///     clk, rst_n                  — standard clock / active-low reset
+///     start                       — caller raises for one cycle to
+///                                    request evaluation of the
+///                                    top-level `apply`
+///     wasm_rom_data [7:0]         — one byte from ROM at
+///                                    wasm_rom_addr; ROM is the
+///                                    image baked via #171
+///   Outputs:
+///     wasm_rom_addr [15:0]        — byte-addressed ROM read port
+///     cell_fetch_name / _data /   — host-import passthrough to #166
+///       _req / _ack
+///     cell_store_name / _data /   — same direction for writes
+///       _we
+///     result [255:0]              — atom encoding of top-level return
+///     done                        — latches high when evaluation
+///                                    completes; caller resets via
+///                                    rst_n to dispatch the next op
+///
+/// Body: zero-driver stubs so the module is synthesizable but inert.
+/// A real dispatcher replaces the always blocks with a decoded
+/// microcontroller state machine.
+fn emit_wasm_reducer_stub() -> String {
+    r#"module wasm_reducer (
+    input  wire clk,
+    input  wire rst_n,
+    input  wire start,
+    // WASM ROM read port (byte-addressed; ROM is the bundle image #171).
+    output reg  [15:0] wasm_rom_addr,
+    input  wire [7:0]  wasm_rom_data,
+    // Host-import: cell_fetch (read from per-noun BRAM #166).
+    output reg  [255:0] cell_fetch_name,
+    input  wire [255:0] cell_fetch_data,
+    output reg          cell_fetch_req,
+    input  wire         cell_fetch_ack,
+    // Host-import: cell_store (write into per-noun BRAM).
+    output reg  [255:0] cell_store_name,
+    output reg  [255:0] cell_store_data,
+    output reg          cell_store_we,
+    // Evaluation result — atom encoding of the top-level return.
+    output reg  [255:0] result,
+    output reg          done
+);
+    // STUB (#169). Real dispatch logic is post-1.0:
+    //   decoder  — maps WASM opcode bytes to dispatch-state encoding
+    //   stack    — operand + control stack machine per WASM spec
+    //   branches — routes `call` of host-imports to the fetch/store
+    //              ports above
+    //   halt     — on return-from-top-level, raise `done`
+    //
+    // Until then, the shell stays inert: every output holds its
+    // reset value so synthesis leaves no unconnected-port warnings
+    // and downstream integrators can wire the top file without the
+    // real interpreter in place.
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            wasm_rom_addr    <= 16'd0;
+            cell_fetch_name  <= {256{1'b0}};
+            cell_fetch_req   <= 1'b0;
+            cell_store_name  <= {256{1'b0}};
+            cell_store_data  <= {256{1'b0}};
+            cell_store_we    <= 1'b0;
+            result           <= {256{1'b0}};
+            done             <= 1'b0;
+        end
+        // Intentionally no else branch — stubs hold their reset state.
     end
 endmodule
 "#.to_string()
@@ -970,9 +1061,9 @@ Noun has Object Type.
 
         let module_count = verilog.matches("module ").count();
         let endmodule_count = verilog.matches("endmodule").count();
-        // 3 entity + 3 bram + audit + ingress + egress + boot_fsm + top = 11.
-        assert_eq!(module_count, 11, "expected 11 module decls, got:\n{}", verilog);
-        assert_eq!(endmodule_count, 11, "module/endmodule mismatch:\n{}", verilog);
+        // 3 entity + 3 bram + audit + ingress + egress + wasm_reducer + boot_fsm + top = 12.
+        assert_eq!(module_count, 12, "expected 12 module decls, got:\n{}", verilog);
+        assert_eq!(endmodule_count, 12, "module/endmodule mismatch:\n{}", verilog);
         assert!(verilog.contains("module order"));
         assert!(verilog.contains("module customer"));
         assert!(verilog.contains("module product"));
@@ -992,8 +1083,8 @@ Noun has Object Type.
 
         let verilog = compile_to_verilog(&state);
 
-        // 1 entity + 1 bram + audit + ingress + egress + boot_fsm + top = 7.
-        assert_eq!(verilog.matches("module ").count(), 7);
+        // 1 entity + 1 bram + audit + ingress + egress + wasm_reducer + boot_fsm + top = 8.
+        assert_eq!(verilog.matches("module ").count(), 8);
         assert!(verilog.contains("module order"));
         assert!(verilog.contains("module order_bram"));
         assert!(verilog.contains("module top"));
@@ -1082,8 +1173,8 @@ Supplier supplies Widget.
         assert!(verilog.contains("module widget"));
         assert!(verilog.contains("module supplier"));
         assert!(verilog.contains("module top"));
-        // 2 entity + 2 bram + audit + ingress + egress + boot_fsm + top = 9.
-        assert_eq!(verilog.matches("endmodule").count(), 9);
+        // 2 entity + 2 bram + audit + ingress + egress + wasm_reducer + boot_fsm + top = 10.
+        assert_eq!(verilog.matches("endmodule").count(), 10);
     }
 
     /// Verilog output is well-formed: every module has clk/rst_n ports,
@@ -1334,6 +1425,33 @@ Counter has Count.
         assert!(bundle.manifest.contains("\"entities\": []"));
         // ROM still has the magic header even for empty state.
         assert!(bundle.rom.starts_with(b"AREST"));
+    }
+
+    // ── WASM reducer stub (#169) ──
+
+    #[test]
+    fn wasm_reducer_stub_emitted_with_state() {
+        let state = state_with_nouns(&[("Widget", "entity")]);
+        let verilog = compile_to_verilog(&state);
+        assert!(verilog.contains("module wasm_reducer "),
+            "wasm_reducer stub must be emitted with state:\n{}", verilog);
+    }
+
+    #[test]
+    fn wasm_reducer_stub_pins_the_host_import_abi() {
+        let state = state_with_nouns(&[("Widget", "entity")]);
+        let verilog = compile_to_verilog(&state);
+        // ROM read port the future dispatcher consumes.
+        assert!(verilog.contains("output reg  [15:0] wasm_rom_addr"));
+        assert!(verilog.contains("input  wire [7:0]  wasm_rom_data"));
+        // Host-import fetch / store passthrough to #166 BRAMs.
+        assert!(verilog.contains("output reg  [255:0] cell_fetch_name"));
+        assert!(verilog.contains("output reg  [255:0] cell_store_name"));
+        assert!(verilog.contains("input  wire         cell_fetch_ack"));
+        assert!(verilog.contains("output reg          cell_store_we"));
+        // Top-level result + done latch.
+        assert!(verilog.contains("output reg  [255:0] result"));
+        assert!(verilog.contains("output reg          done"));
     }
 
     // ── Boot-sequence FSM (#170) ──
@@ -1750,9 +1868,9 @@ Counter has Count.
         let verilog = compile_to_verilog(&state);
         let modules = verilog.matches("module ").count();
         let endmodules = verilog.matches("endmodule").count();
-        // 4 entity + 4 bram + audit + ingress + egress + boot_fsm + top = 13.
-        assert_eq!(modules, 13);
-        assert_eq!(endmodules, 13);
+        // 4 entity + 4 bram + audit + ingress + egress + wasm_reducer + boot_fsm + top = 14.
+        assert_eq!(modules, 14);
+        assert_eq!(endmodules, 14);
         assert_eq!(modules, endmodules);
     }
 }
