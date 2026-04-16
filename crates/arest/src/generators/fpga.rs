@@ -80,9 +80,75 @@ pub fn compile_to_verilog(state: &Object) -> String {
     let (sm_modules, sm_specs) = emit_sm_modules(&domain.state_machines);
     modules.extend(sm_modules);
 
+    // Audit-log ring buffer. Mirrors the CPU-side crate::ring::RingBuffer
+    // (#188) in synthesizable form: fixed-depth BRAM with write-pointer
+    // + wrap-around overflow flag. Emitted only when the state has any
+    // entities / constraints / SMs — empty states produce just the
+    // header line (preserving the "empty compile = empty output" rule).
+    let has_any = !entities.is_empty() || !constraint_names.is_empty() || !sm_specs.is_empty();
+    if has_any {
+        modules.push(emit_audit_log_module());
+    }
+
     let top = emit_top_module(&entities, &constraint_names, &sm_specs);
 
     format!("{}{}\n{}", header, modules.join("\n"), top)
+}
+
+/// Emit the audit-log ring-buffer Verilog module. Depth and entry width
+/// are exposed as `parameter`s so downstream integrators override the
+/// defaults via instantiation-time values.
+///
+/// Mirrors the CPU-side `crate::ring::RingBuffer` (#188):
+///   - append-only, bounded depth, oldest-out-on-overflow
+///   - `overflow` flag latches high after the first wrap so the commit
+///     path can react (SM transition, secondary-storage drain)
+///
+/// The storage vector `mem[]` is inferred as BRAM on most synthesis
+/// tools because the access pattern is one-port read + one-port write
+/// with a sequential address. Tools that need an explicit dual-port
+/// BRAM swap can replace `mem` with a vendor macro.
+fn emit_audit_log_module() -> String {
+    r#"module audit_log #(
+    parameter DEPTH = 1024,
+    parameter ENTRY_WIDTH = 256
+) (
+    input wire clk,
+    input wire rst_n,
+    input wire wr_en,
+    input wire [ENTRY_WIDTH-1:0] wr_data,
+    input wire [$clog2(DEPTH)-1:0] rd_addr,
+    output reg [ENTRY_WIDTH-1:0] rd_data,
+    output reg [$clog2(DEPTH):0] count,
+    output reg overflow
+);
+    // Ring storage — BRAM-inferred by synth tools.
+    reg [ENTRY_WIDTH-1:0] mem [0:DEPTH-1];
+    reg [$clog2(DEPTH)-1:0] head;
+
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            head     <= 0;
+            count    <= 0;
+            overflow <= 1'b0;
+        end else if (wr_en) begin
+            mem[head] <= wr_data;
+            head      <= (head == DEPTH-1) ? 0 : head + 1;
+            // Saturating count + overflow latch on first wrap.
+            if (count < DEPTH) begin
+                count <= count + 1;
+            end else begin
+                overflow <= 1'b1;
+            end
+        end
+    end
+
+    // Read port: registered for BRAM inference.
+    always @(posedge clk) begin
+        rd_data <= mem[rd_addr];
+    end
+endmodule
+"#.to_string()
 }
 
 /// Emit one synthesizable Verilog module per state machine in the
@@ -304,6 +370,23 @@ fn emit_top_module(
         out.push_str(&format!("        .status({}_status)\n", sm_name));
         out.push_str("    );\n");
     }
+    // Audit-log singleton. Write port tied-off to zero by default;
+    // downstream integrators replace with real commit-path drivers.
+    // Count width is $clog2(DEPTH)+1 for the saturating-count form,
+    // so DEPTH=1024 → 11-bit count. rd_addr width matches DEPTH.
+    out.push_str("    wire [10:0] audit_count;\n");
+    out.push_str("    wire audit_overflow;\n");
+    out.push_str("    wire [255:0] audit_rd_data;\n");
+    out.push_str("    audit_log #(.DEPTH(1024), .ENTRY_WIDTH(256)) audit_log_inst (\n");
+    out.push_str("        .clk(clk),\n");
+    out.push_str("        .rst_n(rst_n),\n");
+    out.push_str("        .wr_en(1'b0),\n");
+    out.push_str("        .wr_data({256{1'b0}}),\n");
+    out.push_str("        .rd_addr({10{1'b0}}),\n");
+    out.push_str("        .rd_data(audit_rd_data),\n");
+    out.push_str("        .count(audit_count),\n");
+    out.push_str("        .overflow(audit_overflow)\n");
+    out.push_str("    );\n");
     // AND-reduce valids after reset release. Empty-entity edge case:
     // emit `1'b1` as the identity so the expression stays well-formed.
     out.push_str("\n    always @(posedge clk) begin\n");
@@ -468,9 +551,9 @@ Noun has Object Type.
 
         let module_count = verilog.matches("module ").count();
         let endmodule_count = verilog.matches("endmodule").count();
-        // 3 entity modules + 1 top module = 4.
-        assert_eq!(module_count, 4, "expected 4 module decls, got:\n{}", verilog);
-        assert_eq!(endmodule_count, 4, "module/endmodule mismatch:\n{}", verilog);
+        // 3 entity modules + 1 audit_log + 1 top = 5.
+        assert_eq!(module_count, 5, "expected 5 module decls, got:\n{}", verilog);
+        assert_eq!(endmodule_count, 5, "module/endmodule mismatch:\n{}", verilog);
         assert!(verilog.contains("module order"));
         assert!(verilog.contains("module customer"));
         assert!(verilog.contains("module product"));
@@ -490,10 +573,11 @@ Noun has Object Type.
 
         let verilog = compile_to_verilog(&state);
 
-        // 1 entity module + 1 top module = 2.
-        assert_eq!(verilog.matches("module ").count(), 2);
+        // 1 entity + 1 audit_log + 1 top = 3.
+        assert_eq!(verilog.matches("module ").count(), 3);
         assert!(verilog.contains("module order"));
         assert!(verilog.contains("module top"));
+        assert!(verilog.contains("module audit_log"));
         assert!(!verilog.contains("module amount"));
         assert!(!verilog.contains("module currency_code"));
         assert!(!verilog.contains("module priority"));
@@ -576,8 +660,8 @@ Supplier supplies Widget.
         assert!(verilog.contains("module widget"));
         assert!(verilog.contains("module supplier"));
         assert!(verilog.contains("module top"));
-        // 2 entity modules + 1 top module = 3 endmodule markers.
-        assert_eq!(verilog.matches("endmodule").count(), 3);
+        // 2 entity modules + 1 audit_log + 1 top = 4 endmodule markers.
+        assert_eq!(verilog.matches("endmodule").count(), 4);
     }
 
     /// Verilog output is well-formed: every module has clk/rst_n ports,
@@ -704,6 +788,62 @@ Supplier supplies Widget.
         assert!(verilog.contains("all_valid <= rst_n & 1'b1"),
             "no entities → all_valid identity 1'b1:\n{}", verilog);
         assert!(verilog.contains("constraint_ok <= rst_n & ~constraint_uc_c1_v"));
+    }
+
+    // ── Audit-log Verilog ring buffer (#167) ──
+
+    #[test]
+    fn audit_log_emitted_when_state_has_entities() {
+        // audit_log rides along with any non-empty compile. Empty state
+        // still produces just the header, preserving the "empty compile
+        // = empty output" rule.
+        let state = state_with_nouns(&[("Widget", "entity")]);
+        let verilog = compile_to_verilog(&state);
+        assert!(verilog.contains("module audit_log"),
+            "audit_log module must accompany non-empty compile:\n{}", verilog);
+    }
+
+    #[test]
+    fn audit_log_absent_for_empty_state() {
+        let verilog = compile_to_verilog(&Object::phi());
+        assert!(!verilog.contains("audit_log"),
+            "empty state must emit no modules, got:\n{}", verilog);
+    }
+
+    #[test]
+    fn audit_log_has_parameterised_depth_and_entry_width() {
+        let state = state_with_nouns(&[("Widget", "entity")]);
+        let verilog = compile_to_verilog(&state);
+        assert!(verilog.contains("parameter DEPTH = 1024"));
+        assert!(verilog.contains("parameter ENTRY_WIDTH = 256"));
+    }
+
+    #[test]
+    fn audit_log_shape_matches_cpu_ring_semantics() {
+        // The FPGA audit log mirrors crate::ring::RingBuffer:
+        // append-only, saturating count, latched overflow flag.
+        let state = state_with_nouns(&[("Widget", "entity")]);
+        let verilog = compile_to_verilog(&state);
+        assert!(verilog.contains("input wire wr_en"));
+        assert!(verilog.contains("input wire [ENTRY_WIDTH-1:0] wr_data"));
+        assert!(verilog.contains("output reg [ENTRY_WIDTH-1:0] rd_data"));
+        assert!(verilog.contains("output reg overflow"));
+        // Overflow latches on first wrap (count saturates).
+        assert!(verilog.contains("overflow <= 1'b1"));
+        // Head wraps at DEPTH-1.
+        assert!(verilog.contains("head == DEPTH-1"));
+    }
+
+    #[test]
+    fn top_instantiates_audit_log_with_tied_off_write_port() {
+        let state = state_with_nouns(&[("Widget", "entity")]);
+        let verilog = compile_to_verilog(&state);
+        assert!(verilog.contains("audit_log #(.DEPTH(1024), .ENTRY_WIDTH(256)) audit_log_inst"),
+            "audit_log must be instantiated with explicit params in top:\n{}", verilog);
+        assert!(verilog.contains(".wr_en(1'b0)"),
+            "write-enable tied off by default:\n{}", verilog);
+        assert!(verilog.contains(".wr_data({256{1'b0}})"),
+            "write data tied to zero:\n{}", verilog);
     }
 
     #[test]
@@ -859,8 +999,9 @@ Supplier supplies Widget.
         let verilog = compile_to_verilog(&state);
         let modules = verilog.matches("module ").count();
         let endmodules = verilog.matches("endmodule").count();
-        assert_eq!(modules, 5, "4 entities + 1 top = 5 module decls");
-        assert_eq!(endmodules, 5);
+        // 4 entity modules + 1 audit_log + 1 top = 6.
+        assert_eq!(modules, 6, "4 entities + 1 audit_log + 1 top = 6 module decls");
+        assert_eq!(endmodules, 6);
         assert_eq!(modules, endmodules);
     }
 }
