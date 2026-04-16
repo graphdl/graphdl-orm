@@ -31,6 +31,7 @@ extern crate alloc;
 mod allocator;
 mod gdt;
 mod interrupts;
+mod memory;
 mod serial;
 
 use alloc::string::ToString;
@@ -40,11 +41,16 @@ use core::panic::PanicInfo;
 entry_point!(kernel_main);
 
 /// Called by the bootloader the moment we land in 64-bit long mode.
-fn kernel_main(_boot_info: &'static mut BootInfo) -> ! {
+fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     allocator::init();
     gdt::init();
     interrupts::init_idt();
     interrupts::init_pic();
+    memory::init(boot_info);
+
+    // Collect memory stats for the banner.
+    let frame_count = memory::usable_frame_count();
+    let usable_mib  = (frame_count * 4096) / (1024 * 1024);
 
     println!("AREST kernel online");
     println!("  target: x86_64-unknown-none");
@@ -52,6 +58,7 @@ fn kernel_main(_boot_info: &'static mut BootInfo) -> ! {
     println!("  gdt:    loaded with TSS + double-fault IST (#179)");
     println!("  idt:    breakpoint + double-fault + keyboard (#181)");
     println!("  pic:    remapped to 32+, keyboard (IRQ 1) unmasked");
+    println!("  memory: {usable_mib} MiB usable RAM ({frame_count} x 4 KiB frames) (#180)");
 
     // Prove the allocator works — allocate a String and echo it.
     let greeting = "heap is live".to_string();
