@@ -50,9 +50,9 @@ query Customer_is_premium contains {"Customer": "vip"}
 
 **When to use each mode:**
 
-- `*` (fully derived) — the rule is the complete definition. No manual override possible. Use for computed attributes like `Fact Type has Arity *.` or `User accesses Domain *.` when every access path is captured in the rules.
+- `*` (fully derived) — the rule is the complete definition. No manual override possible. Use for computed attributes like `Fact Type has Arity. *` or `User accesses Domain. *` when every access path is captured in the rules.
 - `**` (derived and stored) — fully derived AND materialized. Use when the derivation is expensive and a SQL trigger can keep a column in sync.
-- `+` (semi-derived) — the rule is a sufficient condition but not necessary. Use when a business override is allowed: `Customer is VIP +.` with `+ Customer is VIP if lifetime orders > 100.` leaves room for sales to also mark small customers as VIPs by hand.
+- `+` (semi-derived) — the rule is a sufficient condition but not necessary. Use when a business override is allowed: `Customer is VIP. +` with `+ Customer is VIP if lifetime orders > 100.` leaves room for sales to also mark small customers as VIPs by hand.
 
 The `:=` form from pre-ORM 1 BNF grammar is retired. The parser still tolerates it during migration, but new rules should use the marker + iff/if form.
 
