@@ -47,6 +47,8 @@ mod ring;
 #[allow(dead_code)]
 mod freeze;
 #[allow(dead_code)]
+mod declared_writes;
+#[allow(dead_code)]
 mod validate;
 #[allow(dead_code)]
 mod induce;
