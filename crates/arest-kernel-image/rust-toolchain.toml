@@ -1,0 +1,10 @@
+# crates/arest-kernel-image/rust-toolchain.toml
+#
+# bootloader 0.11's build.rs compiles its BIOS/UEFI stages using
+# nightly-only `-Z build-std` invocations, so this specific crate is
+# pinned to nightly. The rest of the workspace — arest-cli, the
+# arest library, arest-kernel itself — stays on stable.
+
+[toolchain]
+channel = "nightly"
+components = ["rust-src"]
