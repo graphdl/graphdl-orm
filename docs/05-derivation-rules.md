@@ -24,7 +24,7 @@ The body uses `iff` for a full derivation (the rule is both necessary AND suffic
 
 ```forml2
 ## Fact Types
-Customer has Full Name *.
+Customer has Full Name. *
 
 ## Derivation Rules
 * Customer has Full Name iff Customer has First Name and Customer has Last Name.
@@ -34,7 +34,7 @@ Partial derivation pairs `+` with `if`:
 
 ```forml2
 ## Fact Types
-Person is Grandparent +.
+Person is Grandparent. +
 
 ## Derivation Rules
 + Person1 is Grandparent if Person1 is parent of some Person2 and that Person2 is parent of some Person3.
@@ -76,7 +76,7 @@ The compiler classifies rules and emits different Func shapes:
 
 ```forml2
 ## Fact Types
-Person is Grandparent +.
+Person is Grandparent. +
 
 ## Derivation Rules
 + Person1 is Grandparent if Person1 is parent of some Person2 and that Person2 is parent of some Person3.
@@ -88,7 +88,7 @@ Classified as Join (shared `Person2`, `Person3`). The `+` mode lets you ALSO ass
 
 ```forml2
 ## Fact Types
-User accesses Domain +.
+User accesses Domain. +
 
 ## Derivation Rules
 + User accesses Domain if User owns Organization and App belongs to that Organization and Domain belongs to that App.
@@ -103,7 +103,7 @@ Four partial derivations unioned into the same consequent. Semi-derived because 
 
 ```forml2
 ## Fact Types
-Fact Type has Arity *.
+Fact Type has Arity. *
 
 ## Derivation Rules
 * Fact Type has Arity iff Arity is the count of Role where Fact Type has Role.
