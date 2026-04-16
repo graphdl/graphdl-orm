@@ -484,6 +484,36 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
         );
     }
 
+    // `check` (#199) — run the readings diagnostic pass without
+    // committing. Input is the readings text; output is a pretty-
+    // printed diagnostic list (one line per diagnostic, newline-
+    // separated). Empty output means the readings parse cleanly AND
+    // every reference resolves AND no deontic rule fires. Read-only;
+    // no tenant-state mutation. LLM agents call this before `compile`
+    // to self-correct schema authoring.
+    if key == "check" {
+        let diags = crate::check::check_readings(input);
+        if diags.is_empty() {
+            return String::new();
+        }
+        return diags.iter().map(|d| {
+            let lvl = match d.level {
+                crate::check::Level::Error => "ERROR",
+                crate::check::Level::Warning => "WARN",
+                crate::check::Level::Hint => "HINT",
+            };
+            let src = match d.source {
+                crate::check::Source::Parse => "parse",
+                crate::check::Source::Resolve => "resolve",
+                crate::check::Source::Deontic => "deontic",
+            };
+            let suffix = d.suggestion.as_deref()
+                .map(|s| format!(" (suggestion: {s})"))
+                .unwrap_or_default();
+            format!("[{lvl} {src}] {}: {}{}", d.reading, d.message, suffix)
+        }).collect::<Vec<_>>().join("\n");
+    }
+
     // ── Read-only dispatch path ─────────────────────────────────────
     //
     // Known-read ops (list / get / query / debug / audit / explain /

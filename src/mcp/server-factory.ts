@@ -149,6 +149,33 @@ export function createArestServer(options: CreateArestServerOptions = {}): McpSe
   )
 
   server.registerTool(
+    'check',
+    {
+      description:
+        'Diagnose FORML2 readings before compiling. Runs parse, resolve, and deontic layers. Empty diagnostics means the readings are clean. Read-only; no engine state change. Call before `compile` to self-correct common syntax issues (dropped antecedents, non-ASCII atom IDs, ring fact types missing their ring constraint).',
+      inputSchema: { readings: z.string() },
+    },
+    async ({ readings }) => {
+      const raw = sys('check', readings)
+      if (!raw) return textResult({ ok: true, diagnostics: [] })
+      // Each line is "[LEVEL source] reading: message (suggestion: ...)".
+      const diagnostics = raw.split('\n').map((line) => {
+        const m = /^\[(ERROR|WARN|HINT) (parse|resolve|deontic)\] (.*?): (.*?)(?: \(suggestion: (.*?)\))?$/.exec(line)
+        if (!m) return { level: 'unknown', raw: line }
+        return {
+          level: m[1].toLowerCase(),
+          source: m[2],
+          reading: m[3],
+          message: m[4],
+          suggestion: m[5] ?? null,
+        }
+      })
+      const hasError = diagnostics.some((d) => d.level === 'error')
+      return textResult({ ok: !hasError, diagnostics })
+    },
+  )
+
+  server.registerTool(
     'explain',
     {
       description: 'Derivation chain and audit trail for an entity.',
