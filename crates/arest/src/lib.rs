@@ -6,6 +6,16 @@
 // One function. Readings in, applications out.
 // State = P (facts) + DEFS (named Func).
 
+#![cfg_attr(feature = "no_std", no_std)]
+
+// Under `no_std`, `alloc` brings back Vec / String / Box / Arc via
+// core's allocator — the crate still depends on heap allocation,
+// just not on the full libstd runtime. Every site that reaches into
+// `std::*` is migrating to `core::*` / `alloc::*` / `hashbrown::*` /
+// `spin::*` during the staged conversion (#174).
+#[cfg(feature = "no_std")]
+extern crate alloc;
+
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
