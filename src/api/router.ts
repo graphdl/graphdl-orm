@@ -1,5 +1,6 @@
 import { AutoRouter, json, error } from 'itty-router'
 import type { Env } from '../types'
+import { registryIdForDomain, listDomains } from '../registry-do'
 import { nounToSlug, nounToTable, resolveSlugToNoun } from '../collections'
 import { handleParse } from './parse'
 import { handleEvaluate, handleSynthesize } from './evaluate'
@@ -30,6 +31,15 @@ function decodeId(params: Record<string, string>): string {
 /** Get a RegistryDB DO stub for the given scope (e.g. app/org/global). */
 function getRegistryDO(env: Env, scope: string): DurableObjectStub {
   const id = env.REGISTRY_DB.idFromName(scope)
+  return env.REGISTRY_DB.get(id)
+}
+
+/**
+ * Get a RegistryDB DO stub scoped to a (scope, domain) pair (#205).
+ * When domain is absent falls back to the legacy 'global' shard.
+ */
+function getRegistryForDomain(env: Env, scope: string, domain?: string): DurableObjectStub {
+  const id = registryIdForDomain(env.REGISTRY_DB, scope, domain)
   return env.REGISTRY_DB.get(id)
 }
 
@@ -1030,6 +1040,33 @@ router.get('/arest', async (request, env: Env) => {
 
 router.get('/arest/*', async (request, env: Env) => {
   return handleArestRoute(request, env)
+})
+
+// ── MCP-verb proxies for /arest/chat and /arest/extract (#201) ───────
+// Thin POST proxies that delegate through dispatchVerb so CLI, local
+// MCP (stdio), and HTTP clients share the same input/output contract.
+//   /arest/chat    → dispatchVerb('query', body)  — natural-language query
+//   /arest/extract → dispatchVerb('compile', body) — readings → compiled state
+router.post('/arest/chat', async (request: Request) => {
+  let body: Record<string, unknown>
+  try { body = (await request.json()) as Record<string, unknown> } catch { body = {} }
+  try {
+    const result = await dispatchVerb('query', body)
+    return json(result)
+  } catch (e) {
+    return error(400, e instanceof Error ? e.message : String(e))
+  }
+})
+
+router.post('/arest/extract', async (request: Request) => {
+  let body: Record<string, unknown>
+  try { body = (await request.json()) as Record<string, unknown> } catch { body = {} }
+  try {
+    const result = await dispatchVerb('compile', body)
+    return json(result)
+  } catch (e) {
+    return error(400, e instanceof Error ? e.message : String(e))
+  }
 })
 
 // ── 404 fallback ─────────────────────────────────────────────────────
