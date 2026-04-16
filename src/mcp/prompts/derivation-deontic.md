@@ -16,7 +16,7 @@ The rule body uses `iff` for full derivation (rule IS the definition) or `if` fo
 
 ```
 ## Fact Types
-Person has Full Name *.
+Person has Full Name. *
 
 ## Derivation Rules
 * Person has Full Name iff Person has First Name and Person has Last Name and Full Name is First Name concatenated with Last Name.

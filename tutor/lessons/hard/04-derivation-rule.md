@@ -22,7 +22,7 @@ Rules are monotonic, so the fixed point exists and is unique (Theorem 3: Complet
 Declare `Customer is premium` as fully derived — a customer IS premium exactly when the rule holds, never otherwise:
 
 ~~~ compile
-Customer is premium *.
+Customer is premium. *
 
 ## Derivation Rules
 * Customer is premium iff Customer placed at least 3 Orders and each Order has Amount greater than 100.
