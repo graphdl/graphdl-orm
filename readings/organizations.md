@@ -71,9 +71,9 @@ Domain has Access.
 
 ### Derived Fact Types
 
-User accesses Domain +.
-App navigates Domain +.
-App displays Noun +.
+User accesses Domain. +
+App navigates Domain. +
+App displays Noun. +
 
 App extends App.
 
