@@ -14,6 +14,8 @@
 
 use crate::ast::{binding, fetch_or_phi, Object};
 use crate::rmap::{self, TableDef};
+#[allow(unused_imports)]
+use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 
 /// Compile a compiled state object to Verilog source.
 ///
@@ -211,7 +213,7 @@ fn emit_sm_modules(sms: &hashbrown::HashMap<String, crate::types::StateMachineDe
         let module_name = sanitize(&format!("sm_{}", sm.noun_name));
         let status_count = sm.statuses.len();
         // Width = ceil(log2(max(count, 2))). Needs at least 1 bit.
-        let status_width = std::cmp::max(
+        let status_width = core::cmp::max(
             1,
             (status_count.max(2) as f64).log2().ceil() as usize,
         );
@@ -238,8 +240,8 @@ fn emit_sm_modules(sms: &hashbrown::HashMap<String, crate::types::StateMachineDe
             m.push_str("            status <= status;\n");
         } else {
             // Group transitions by from-status.
-            let mut by_from: std::collections::BTreeMap<&str, Vec<&crate::types::TransitionDef>>
-                = std::collections::BTreeMap::new();
+            let mut by_from: alloc::collections::BTreeMap<&str, Vec<&crate::types::TransitionDef>>
+                = alloc::collections::BTreeMap::new();
             for t in &sm.transitions {
                 by_from.entry(t.from.as_str()).or_default().push(t);
             }

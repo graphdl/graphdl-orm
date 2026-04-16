@@ -10,6 +10,8 @@
 //   verbalize  .  compile-^1  .  compile  .  parse = id
 
 use crate::types::*;
+#[allow(unused_imports)]
+use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 
 /// Verbalize a constraint back to its FORML 2 reading.
 pub fn verbalize_constraint(constraint: &ConstraintDef, ir: &Domain) -> String {
@@ -112,7 +114,7 @@ fn ir_section(title: Option<&str>, body: Vec<String>) -> Vec<String> {
             .unwrap_or_default();
         header.into_iter()
             .chain(body.into_iter())
-            .chain(std::iter::once(String::new()))
+            .chain(core::iter::once(String::new()))
             .collect()
     })
 }

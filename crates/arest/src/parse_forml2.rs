@@ -12,6 +12,8 @@
 
 use crate::types::*;
 use hashbrown::HashMap;
+#[allow(unused_imports)]
+use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 
 // Bootstrap mode flag — set by lib::create_impl while loading bundled
 // metamodel readings, so the metamodel namespace guard (#23) is bypassed

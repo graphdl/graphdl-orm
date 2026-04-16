@@ -24,6 +24,8 @@
 // the WASM heap without an intermediate conversion.
 
 use crate::ast::Object;
+#[allow(unused_imports)]
+use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 
 const MAGIC: &[u8] = b"AREST\x01";
 const TAG_ATOM: u8 = 0x00;

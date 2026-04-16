@@ -42,6 +42,8 @@ use crate::sync::Arc;
 use crate::sync::Mutex;
 use crate::sync::OnceLock;
 use crate::sync::RwLock;
+#[allow(unused_imports)]
+use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 
 pub mod ast;
 pub mod types;

@@ -20,6 +20,8 @@
 use serde::{Serialize, Deserialize};
 use hashbrown::{HashMap, HashSet};
 use crate::types::Domain;
+#[allow(unused_imports)]
+use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 
 // -- Output types -----------------------------------------------------
 
@@ -113,7 +115,7 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
             ).collect();
             binarized_ft_ids.extend(ft_ids.iter().map(|id| id.to_string()));
             let is_mandatory = unary_fts.iter().any(|ft| {
-                let ft_id_str = ft_ids.iter().find(|id| ir.fact_types.get(**id).map(|f| std::ptr::eq(f, *ft)).unwrap_or(false));
+                let ft_id_str = ft_ids.iter().find(|id| ir.fact_types.get(**id).map(|f| core::ptr::eq(f, *ft)).unwrap_or(false));
                 ft_id_str.map_or(false, |fid| ir.constraints.iter().any(|c| c.kind == "MC" && c.spans.iter().any(|s| s.fact_type_id == *fid)))
             });
             let col_name = if values.iter().any(|v| v.to_lowercase() == "male" || v.to_lowercase() == "female") { "sex" } else { "status" }.to_string();
@@ -126,7 +128,7 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
     let mut parent_of: HashMap<String, String> = HashMap::new();
     ir.subtypes.iter().for_each(|(name, st)| { parent_of.insert(name.clone(), st.clone()); });
     let subtype_to_root: HashMap<String, String> = parent_of.keys().map(|name| {
-        let root = std::iter::successors(Some(name.clone()), |cur| parent_of.get(cur).cloned())
+        let root = core::iter::successors(Some(name.clone()), |cur| parent_of.get(cur).cloned())
             .take(100) // cycle guard
             .last().unwrap_or_else(|| name.clone());
         (name.clone(), root)

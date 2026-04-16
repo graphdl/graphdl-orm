@@ -4,6 +4,9 @@
 // Noun names are the authority (from readings).
 // Slugs and table names are deterministic projections.
 
+#[allow(unused_imports)]
+use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
+
 /// Simple English pluralization for noun names.
 pub fn pluralize(word: &str) -> String {
     let lower = word.to_lowercase();
@@ -64,7 +67,7 @@ fn split_noun(name: &str) -> Vec<String> {
             |(ws, cur), ch| {
                 let boundary = ch.is_uppercase() && !cur.is_empty();
                 let (ws, cur) = if boundary {
-                    let ws = ws.into_iter().chain(std::iter::once(cur)).collect();
+                    let ws = ws.into_iter().chain(core::iter::once(cur)).collect();
                     (ws, String::new())
                 } else {
                     (ws, cur)
@@ -76,7 +79,7 @@ fn split_noun(name: &str) -> Vec<String> {
         // Append trailing word as a pure cond: empty -> words, non-empty -> words + last.
         last.is_empty()
             .then(|| words.clone())
-            .unwrap_or_else(|| words.into_iter().chain(std::iter::once(last)).collect())
+            .unwrap_or_else(|| words.into_iter().chain(core::iter::once(last)).collect())
     }
 }
 

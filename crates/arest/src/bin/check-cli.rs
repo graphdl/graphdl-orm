@@ -1,3 +1,4 @@
+// CLI driver — requires std (env, fs, process).
 // crates/arest/src/bin/check-cli.rs
 //
 // Standalone invoker for arest::check::check_readings. Reads every

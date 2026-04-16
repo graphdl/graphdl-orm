@@ -14,6 +14,8 @@
 
 use crate::ast::{self, Func, Object};
 use crate::compile::CompiledSchema;
+#[allow(unused_imports)]
+use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 
 // ── Partial application as query ────────────────────────────────────
 // Query = partial application of a fact type.

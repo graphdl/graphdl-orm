@@ -11,6 +11,8 @@
 use serde::{Serialize, Deserialize};
 use crate::types::*;
 use crate::ast;
+#[allow(unused_imports)]
+use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 
 /// Resolve a def from D: Fetch + metacompose (Backus 13.3.2: ρ).
 /// Returns the Func if the def exists, or None.
@@ -368,7 +370,7 @@ fn create_via_defs(
     // ── resolve: populate facts via ρ(resolve:{noun}) ──────────────
     let fields_with_domain: Vec<(&str, &str)> = fields.iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
-        .chain(std::iter::once(("domain", domain)))
+        .chain(core::iter::once(("domain", domain)))
         .collect();
     let mut fact_events: Vec<String> = Vec::new();
     let resolved = fields_with_domain.iter().fold(state.clone(), |acc, (field_name, value)| {
@@ -435,7 +437,7 @@ fn create_via_defs(
     let has_sql_triggers = ast::cells_iter(d).into_iter()
         .any(|(n, _)| n.starts_with("sql:trigger:"));
     // Collect fact types that SM transitions subscribe to.
-    let sm_event_types: std::collections::HashSet<String> = if has_sql_triggers {
+    let sm_event_types: hashbrown::HashSet<String> = if has_sql_triggers {
         let trigger_cell = ast::fetch_or_phi("Transition_is_triggered_by_Event_Type", d);
         trigger_cell.as_seq().map(|facts| {
             facts.iter().filter_map(|f| {
@@ -443,12 +445,12 @@ fn create_via_defs(
             }).collect()
         }).unwrap_or_default()
     } else {
-        std::collections::HashSet::new()
+        hashbrown::HashSet::new()
     };
     // Noun-gated derivation index: O(1) fetch from compiled index.
     // The index is stored as Func::constant(atom) → func_to_object yields <', atom>.
     // Extract the atom from the constant form.
-    let relevant_ids: std::collections::HashSet<String> = {
+    let relevant_ids: hashbrown::HashSet<String> = {
         let index_key = format!("derivation_index:{}", noun);
         let index_obj = ast::fetch(&index_key, d);
         // Unwrap constant form <', value> produced by func_to_object
@@ -640,7 +642,7 @@ fn create_via_defs(
 
     let entity_data: hashbrown::HashMap<String, String> = fields_with_domain.iter()
         .map(|(k, v)| (k.to_string(), v.to_string())).collect();
-    let entities = std::iter::once(EntityResult {
+    let entities = core::iter::once(EntityResult {
         id: entity_id.clone(), entity_type: noun.to_string(), data: entity_data,
     }).chain(status.as_ref().map(|st| {
         EntityResult {
@@ -832,7 +834,7 @@ fn update_via_defs(
     // Noun-gated derivation chain: only run the rules the compile-time
     // derivation_index says are relevant to this noun. Mirrors create's
     // gating at L451. For the metamodel that's 8/808 rules vs 808 bulk.
-    let relevant_ids: std::collections::HashSet<String> = {
+    let relevant_ids: hashbrown::HashSet<String> = {
         let index_key = format!("derivation_index:{}", noun);
         let index_obj = ast::fetch(&index_key, d);
         let value = index_obj.as_seq()
@@ -929,9 +931,9 @@ fn guard_auto_join(
 
     // BFS: find a path from sm_noun to any role in the target fact type.
     // Each entry: (current_noun, join_chain: Vec<(ft_id, sm_role, other_role)>)
-    let mut queue: std::collections::VecDeque<(String, Vec<(String, String, String)>)> =
-        std::collections::VecDeque::new();
-    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut queue: alloc::collections::VecDeque<(String, Vec<(String, String, String)>)> =
+        alloc::collections::VecDeque::new();
+    let mut visited: hashbrown::HashSet<String> = hashbrown::HashSet::new();
     queue.push_back((sm_noun.to_string(), vec![]));
     visited.insert(sm_noun.to_string());
 
@@ -1048,7 +1050,7 @@ fn apply_load_readings(
     };
 
     // Count genuinely new nouns (in parsed but not in D)
-    let existing_noun_names: std::collections::HashSet<String> = ast::fetch_or_phi("Noun", d).as_seq()
+    let existing_noun_names: hashbrown::HashSet<String> = ast::fetch_or_phi("Noun", d).as_seq()
         .map(|facts| facts.iter().filter_map(|f| ast::binding(f, "name").map(|s| s.to_string())).collect())
         .unwrap_or_default();
     let new_noun_count = ast::fetch_or_phi("Noun", &parsed).as_seq()

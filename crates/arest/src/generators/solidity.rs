@@ -26,6 +26,8 @@
 use crate::ast::{Object, binding, fetch_or_phi};
 use crate::rmap::{self, TableDef, TableColumn};
 use crate::types::{Domain, StateMachineDef};
+#[allow(unused_imports)]
+use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 
 /// Compile every entity noun in `state` into a Solidity contract.
 ///
@@ -41,13 +43,13 @@ pub fn compile_to_solidity(state: &Object) -> String {
 /// a user domain was parsed on top of a metamodel and you only want
 /// contracts for the user's own entities.
 pub fn compile_to_solidity_for_nouns(state: &Object, include: &[&str]) -> String {
-    let set: std::collections::HashSet<&str> = include.iter().copied().collect();
+    let set: hashbrown::HashSet<&str> = include.iter().copied().collect();
     compile_to_solidity_inner(state, Some(set))
 }
 
 fn compile_to_solidity_inner(
     state: &Object,
-    include: Option<std::collections::HashSet<&str>>,
+    include: Option<hashbrown::HashSet<&str>>,
 ) -> String {
     let header = "// SPDX-License-Identifier: MIT\n\
                   // Generated from FORML2 readings by AREST\n\
@@ -83,7 +85,7 @@ fn emit_contract(
     table: Option<&TableDef>,
     sm: Option<&StateMachineDef>,
     domain: &Domain,
-    scope: Option<&std::collections::HashSet<&str>>,
+    scope: Option<&hashbrown::HashSet<&str>>,
 ) -> String {
     let contract_name = sanitize_name(name);
     let struct_def = emit_struct(table);
@@ -142,14 +144,14 @@ fn solidity_type(col: &TableColumn) -> &'static str {
 fn emit_events(
     noun_name: &str,
     domain: &Domain,
-    scope: Option<&std::collections::HashSet<&str>>,
+    scope: Option<&hashbrown::HashSet<&str>>,
 ) -> String {
     let events: Vec<String> = domain.fact_types.iter()
         .filter(|(_, ft)| ft.roles.iter().any(|r| r.noun_name == noun_name))
         .filter(|(_, ft)| match scope {
             Some(set) => ft.roles.iter().all(|r| set.contains(r.noun_name.as_str())),
             None => {
-                let distinct: std::collections::HashSet<_> = ft.roles.iter()
+                let distinct: hashbrown::HashSet<_> = ft.roles.iter()
                     .map(|r| r.noun_name.as_str()).collect();
                 distinct.len() > 1 || ft.reading.contains(noun_name)
             }
