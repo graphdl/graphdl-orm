@@ -71,42 +71,19 @@ pub fn check_readings(text: &str) -> Vec<ReadingDiagnostic> {
     };
 
     // Layer 2a: Derivation rules whose antecedents didn't all resolve.
-    // parse_forml2 filter_maps unresolved antecedents silently today;
-    // we detect the loss by comparing antecedent_fact_type_ids.len()
-    // against the number of clauses after splitting on " and " / " or ".
-    // Value-comparison predicates (starts with, exceeds, in range,
-    // within, equals, contains, matches) are inherently non-FT — they
-    // resolve through the arithmetic/comparison pipeline, not through
-    // fact-type lookup. We count them as implicitly resolved.
+    // The parser tracks unresolved clauses directly in
+    // DerivationRuleDef::unresolved_clauses — no heuristic needed.
     for rule in &ir.derivation_rules {
-        let antecedent_text = rule.text
-            .find(" iff ").map(|i| &rule.text[i + 5..])
-            .or_else(|| rule.text.find(" if ").map(|i| &rule.text[i + 4..]))
-            .unwrap_or("");
-        // Split on both " and " and " or " — FORML 2 derivation
-        // bodies use both connectives.
-        let clauses: Vec<&str> = split_connectives(antecedent_text);
-        let part_count = clauses.len();
-        // Value-comparison clauses resolve through the comparison
-        // pipeline, not fact-type lookup. Don't count them as
-        // unresolved.
-        let comparison_count = clauses.iter()
-            .filter(|c| is_implicitly_resolved_clause(c))
-            .count();
-        let resolved_count = rule.antecedent_fact_type_ids.len()
-            + rule.consequent_aggregates.len()
-            + rule.consequent_computed_bindings.len()
-            + comparison_count;
-        if part_count > 0 && resolved_count < part_count {
+        for clause in &rule.unresolved_clauses {
             diags.push(ReadingDiagnostic {
                 line: 0,
                 reading: rule.text.clone(),
                 level: Level::Warning,
                 source: Source::Resolve,
                 message: format!(
-                    "derivation rule has {part_count} antecedent clause(s) but only {resolved_count} resolved to a fact type, aggregate, computed binding, or value comparison",
+                    "antecedent clause did not resolve to a declared fact type: `{clause}`",
                 ),
-                suggestion: Some("check that every clause references a declared fact type, uses a known comparison (starts with, exceeds, in range), or uses an arithmetic / aggregate shape".to_string()),
+                suggestion: Some("check that the clause references a declared fact type, or uses a recognised form (comparison, aggregate, computed binding)".to_string()),
             });
         }
     }
@@ -258,132 +235,6 @@ pub fn check_readings(text: &str) -> Vec<ReadingDiagnostic> {
     diags
 }
 
-/// Split a derivation-rule body on both `" and "` and `" or "`
-/// connectives, returning individual clauses. FORML 2 bodies use
-/// both (e.g., `X iff A and B or C`).
-fn split_connectives(text: &str) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let mut rest = text;
-    while !rest.is_empty() {
-        // Find the earliest connective.
-        let and_pos = rest.find(" and ");
-        let or_pos = rest.find(" or ");
-        match (and_pos, or_pos) {
-            (Some(a), Some(o)) if a <= o => {
-                let chunk = rest[..a].trim();
-                if !chunk.is_empty() { parts.push(chunk); }
-                rest = &rest[a + 5..];
-            }
-            (Some(_), Some(o)) | (None, Some(o)) => {
-                let chunk = rest[..o].trim();
-                if !chunk.is_empty() { parts.push(chunk); }
-                rest = &rest[o + 4..];
-            }
-            (Some(a), None) => {
-                let chunk = rest[..a].trim();
-                if !chunk.is_empty() { parts.push(chunk); }
-                rest = &rest[a + 5..];
-            }
-            (None, None) => {
-                let chunk = rest.trim();
-                if !chunk.is_empty() { parts.push(chunk); }
-                break;
-            }
-        }
-    }
-    parts
-}
-
-/// Recognize clauses that resolve through built-in pipelines rather
-/// than fact-type lookup. Six categories:
-///
-/// 1. **that-anaphora chains** — "that X has Y", "that X is Y".
-///    Back-references to a previously-bound noun; the FT was already
-///    resolved in the prior clause. Dropping ~350 false warnings.
-///
-/// 2. **String/value comparison** — "starts with", "ends with",
-///    "contains", "matches", "exceeds", "in range", "equals", etc.
-///    Resolved through the comparison pipeline (#192).
-///
-/// 3. **Temporal predicates** — "now is before X", "is in the past",
-///    "is in the future". Runtime clock checks, not FT lookups.
-///
-/// 4. **Aggregate where-sub-clauses** — "sum of X where Y". The
-///    where-body contains sub-predicates the top-level resolver
-///    can't descend into; count the whole clause as resolved.
-///
-/// 5. **Negation** — "no X has Y", "has no X". The positive FT
-///    exists; the negation is a filter, not a separate FT.
-///
-/// 6. **Generative/computed** — "is generated as", "is extracted
-///    from", "is the earliest/latest". Runtime operations that
-///    produce values without FT lookup.
-fn is_implicitly_resolved_clause(clause: &str) -> bool {
-    let lower = clause.to_lowercase();
-    let trimmed = lower.trim();
-
-    // Cat 1: that-anaphora — clause starts with "that " and contains
-    // a verb (has/is/was/does/plays/spans/belongs/sends/triggers/etc.)
-    if trimmed.starts_with("that ") {
-        return true;
-    }
-
-    // Cat 2: value/string comparison operators
-    let comparison_verbs = [
-        " starts with ", " ends with ", " contains ",
-        " matches ", " exceeds ", " in range ",
-        " within ", " equals ", " greater than ",
-        " less than ", " not equal ", " at least ",
-        " at most ", " before ", " after ",
-        " above ", " below ",
-    ];
-    if comparison_verbs.iter().any(|v| lower.contains(v)) {
-        return true;
-    }
-    // Quoted-value predicate: `X has Y 'literal'`
-    if (clause.contains('\'') || clause.contains('"')) && lower.contains(" has ") {
-        return true;
-    }
-
-    // Cat 3: temporal predicates
-    if lower.contains("now is ") || lower.contains(" in the past")
-        || lower.contains(" in the future") || lower.contains("is current")
-    {
-        return true;
-    }
-
-    // Cat 4: aggregate where-clause bodies — the top-level clause
-    // is "X is the count/sum/avg/min/max of Y where Z"; the whole
-    // thing resolves through the aggregate pipeline.
-    if lower.contains(" where ") && (
-        lower.contains(" count of ") || lower.contains(" sum of ")
-        || lower.contains(" avg of ") || lower.contains(" min of ")
-        || lower.contains(" max of ") || lower.contains(" total of ")
-    ) {
-        return true;
-    }
-
-    // Cat 5: negation — "no X has Y" or "has no X" or "does not"
-    if trimmed.starts_with("no ") || lower.contains(" has no ")
-        || lower.contains(" does not ") || lower.contains(" is not ")
-        || lower.contains(" not own ") || lower.contains(" not have ")
-    {
-        return true;
-    }
-
-    // Cat 6: generative/computed-binding keywords
-    let computed_verbs = [
-        " is generated as ", " is extracted from ",
-        " is the earliest ", " is the latest ",
-        " is computed as ", " is derived from ",
-        " plus ", " minus ",
-    ];
-    if computed_verbs.iter().any(|v| lower.contains(v)) {
-        return true;
-    }
-
-    false
-}
 
 #[cfg(test)]
 mod tests {

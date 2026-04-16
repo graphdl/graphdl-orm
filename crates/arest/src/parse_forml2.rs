@@ -622,7 +622,7 @@ fn try_derivation(line: &str) -> Option<ParseAction> {
             id: String::new(), text: clean.into(),
             antecedent_fact_type_ids: vec![], consequent_fact_type_id: String::new(),
             kind: DerivationKind::ModusPonens,
-            join_on: vec![], match_on: vec![], consequent_bindings: vec![], antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![],
+            join_on: vec![], match_on: vec![], consequent_bindings: vec![], antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![], unresolved_clauses: vec![],
         })
     })
 }
@@ -1663,7 +1663,10 @@ fn resolve_derivation_rule(rule: &mut DerivationRuleDef, ir: &Domain, catalog: &
             continue;
         }
         let (stripped, comparator) = split_antecedent_comparator(part);
-        let Some(ft_id) = resolve_fact_type(&stripped) else { continue };
+        let Some(ft_id) = resolve_fact_type(&stripped) else {
+            rule.unresolved_clauses.push(part.to_string());
+            continue;
+        };
         if let Some((op, value)) = comparator {
             // Role = the last-role noun of the resolved fact type. For a
             // `has X` binary it's the value-carrier; for ternaries the
