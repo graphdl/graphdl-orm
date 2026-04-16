@@ -46,8 +46,11 @@ pub fn compile_to_verilog(state: &Object) -> String {
     // boundaries); the Verilog identifier is `sanitize(name)` (pure
     // lowercase + spaces→underscores). Preserving that distinction
     // keeps `emit_module`'s behaviour unchanged.
+    // Entity specs carry (sanitised-name, [(col-name, col-width-bits)]) so
+    // the top emitter can tie each per-column input to a matching-width
+    // zero literal instead of the pre-#187 blanket {256{1'b0}} default.
     let mut modules: Vec<String> = Vec::new();
-    let mut entities: Vec<(String, Vec<String>)> = Vec::new();
+    let mut entities: Vec<(String, Vec<(String, usize)>)> = Vec::new();
     if let Some(ns) = nouns.as_seq() {
         for n in ns.iter() {
             let Some(name_str) = binding(n, "name") else { continue };
@@ -55,9 +58,11 @@ pub fn compile_to_verilog(state: &Object) -> String {
             if obj_type != "entity" { continue; }
             let name = name_str.to_string();
             let table = table_map.get(&rmap::to_snake(&name));
-            let columns: Vec<String> = table
-                .map(|t| t.columns.iter().map(|c| sanitize(&c.name)).collect())
-                .unwrap_or_else(|| vec!["id_in".to_string()]);
+            let columns: Vec<(String, usize)> = table
+                .map(|t| t.columns.iter()
+                    .map(|c| (sanitize(&c.name), verilog_width_for(&c.col_type)))
+                    .collect())
+                .unwrap_or_else(|| vec![("id_in".to_string(), 256)]);
             modules.push(emit_module(&name, table.map(|t| &t.columns)));
             entities.push((sanitize(&name), columns));
         }
@@ -446,7 +451,7 @@ fn emit_constraint_modules(state: &Object) -> (Vec<String>, Vec<String>) {
 /// present. With at least one entity OR constraint, `top` is emitted
 /// with the relevant ports and instantiations.
 fn emit_top_module(
-    entities: &[(String, Vec<String>)],
+    entities: &[(String, Vec<(String, usize)>)],
     constraints: &[String],
     sms: &[(String, usize)],
 ) -> String {
@@ -475,12 +480,14 @@ fn emit_top_module(
     }
     out.push('\n');
     // Instantiate each entity with clk/rst_n + zero inputs + valid out.
+    // Per-column zero width matches the entity module's declared port
+    // width (#187), so synthesis doesn't warn about width mismatches.
     for (name, cols) in entities {
         out.push_str(&format!("    {} {}_inst (\n", name, name));
         out.push_str("        .clk(clk),\n");
         out.push_str("        .rst_n(rst_n),\n");
-        for col in cols {
-            out.push_str(&format!("        .{}({{256{{1'b0}}}}),\n", col));
+        for (col, width) in cols {
+            out.push_str(&format!("        .{}({{{}{{1'b0}}}}),\n", col, width));
         }
         out.push_str(&format!("        .valid({}_valid)\n", name));
         out.push_str("    );\n");
@@ -584,7 +591,11 @@ fn emit_module(name: &str, columns: Option<&Vec<rmap::TableColumn>>) -> String {
             ];
             for col in cols {
                 let wire_name = sanitize(&col.name);
-                p.push(format!("    input wire [255:0] {}", wire_name));
+                // Per-column width from the RMAP type (#187) — INTEGER
+                // → 32 bits, BIGINT → 64, TEXT → 256, etc. Replaces the
+                // pre-#187 blanket 256-bit default.
+                let width = verilog_width_for(&col.col_type);
+                p.push(format!("    input wire [{}:0] {}", width.saturating_sub(1), wire_name));
             }
             p.push("    output reg valid".to_string());
             p
@@ -606,6 +617,44 @@ fn emit_module(name: &str, columns: Option<&Vec<rmap::TableColumn>>) -> String {
         m,
         ports.join(",\n")
     )
+}
+
+/// Map a SQL column type to its Verilog bit width (#187 — typed row
+/// shape on Seq). Drives both the entity module's per-column port
+/// width and top's tied-zero instantiation.
+///
+/// Width choices follow the narrowest SQL family that round-trips the
+/// value without truncation; callers that need wider columns supply
+/// `VARCHAR(N)` / `CHAR(N)` forms and the mapper returns `8 * N`.
+/// Unknown types fall back to 256 bits (the pre-#187 default) so the
+/// generator stays backwards-compatible with any schema the SQL
+/// emitter produces today.
+fn verilog_width_for(col_type: &str) -> usize {
+    let up = col_type.to_ascii_uppercase();
+    // VARCHAR(N) / CHAR(N) → 8*N bits, capped at 256 so the silicon
+    // footprint stays reasonable for long identifiers.
+    if let Some(start) = up.find('(') {
+        if up.starts_with("VARCHAR") || up.starts_with("CHAR") {
+            let rest = &up[start + 1..];
+            if let Some(end) = rest.find(')') {
+                if let Ok(n) = rest[..end].trim().parse::<usize>() {
+                    return core::cmp::min(8 * n, 256);
+                }
+            }
+        }
+    }
+    match up.as_str() {
+        "BOOLEAN" | "BOOL" => 1,
+        "TINYINT" => 8,
+        "SMALLINT" => 16,
+        "INTEGER" | "INT" => 32,
+        "BIGINT" => 64,
+        "REAL" => 32,
+        "DOUBLE" | "NUMERIC" | "DECIMAL" => 64,
+        // TEXT / VARCHAR-without-length / unknown → 256 (backwards
+        // compatible). Narrows as per-type schemas land.
+        _ => 256,
+    }
 }
 
 /// Sanitize a noun name into a Verilog identifier: lowercase, spaces to
@@ -949,6 +998,37 @@ Supplier supplies Widget.
     }
 
     // ── Audit-log Verilog ring buffer (#167) ──
+
+    // ── Typed-row column widths (#187) ──
+
+    #[test]
+    fn verilog_width_for_sql_types() {
+        // Narrow integer family
+        assert_eq!(verilog_width_for("BOOLEAN"), 1);
+        assert_eq!(verilog_width_for("BOOL"), 1);
+        assert_eq!(verilog_width_for("TINYINT"), 8);
+        assert_eq!(verilog_width_for("SMALLINT"), 16);
+        assert_eq!(verilog_width_for("INTEGER"), 32);
+        assert_eq!(verilog_width_for("INT"), 32);
+        assert_eq!(verilog_width_for("BIGINT"), 64);
+        // Floating / numeric
+        assert_eq!(verilog_width_for("REAL"), 32);
+        assert_eq!(verilog_width_for("DOUBLE"), 64);
+        assert_eq!(verilog_width_for("NUMERIC"), 64);
+        assert_eq!(verilog_width_for("DECIMAL"), 64);
+        // Character types
+        assert_eq!(verilog_width_for("VARCHAR(4)"), 32);
+        assert_eq!(verilog_width_for("CHAR(8)"), 64);
+        assert_eq!(verilog_width_for("VARCHAR(100)"), 256, "caps at 256");
+        // Case insensitive
+        assert_eq!(verilog_width_for("integer"), 32);
+        assert_eq!(verilog_width_for("Integer"), 32);
+        // Unknown / bare TEXT falls back to 256
+        assert_eq!(verilog_width_for("TEXT"), 256);
+        assert_eq!(verilog_width_for("VARCHAR"), 256);
+        assert_eq!(verilog_width_for("JSON"), 256);
+        assert_eq!(verilog_width_for(""), 256);
+    }
 
     // ── Testbench harness (#172) ──
 
