@@ -17,9 +17,10 @@
 //   41-47    PIC secondary (IRQ 9-15) — unused
 //
 // The keyboard handler reads a raw scancode from port 0x60, pipes
-// it through `pc-keyboard` to get a decoded Unicode character, and
-// prints it to serial so we can prove IRQ delivery works end-to-end
-// from QEMU. Buffering + the REPL wiring land in #183.
+// it through `pc-keyboard` to get a decoded Unicode character, then
+// forwards it to `repl::process_key` for line buffering and dispatch
+// (#183). EOI is sent before calling process_key so the PIC is not
+// held while dispatch runs.
 
 use crate::gdt::DOUBLE_FAULT_IST_INDEX;
 use crate::println;
@@ -121,25 +122,38 @@ extern "x86-interrupt" fn keyboard_handler(_stack_frame: InterruptStackFrame) {
     let mut port = Port::<u8>::new(0x60);
     let scancode: u8 = unsafe { port.read() };
 
-    if let Some(keyboard) = KEYBOARD.get() {
+    // Decode the scancode first so we can determine whether this is
+    // an Enter key before deciding when to send EOI.
+    let decoded_ch: Option<char> = if let Some(keyboard) = KEYBOARD.get() {
         let mut kb = keyboard.lock();
         if let Ok(Some(event)) = kb.add_byte(scancode) {
             if let Some(key) = kb.process_keyevent(event) {
                 match key {
-                    DecodedKey::Unicode(ch) => {
-                        use crate::print;
-                        print!("{ch}");
-                    }
-                    DecodedKey::RawKey(_) => {}
+                    DecodedKey::Unicode(ch) => Some(ch),
+                    DecodedKey::RawKey(_) => None,
                 }
+            } else {
+                None
             }
+        } else {
+            None
         }
-    }
+    } else {
+        None
+    };
 
-    // PIC EOI: every hardware IRQ must acknowledge the PIC or the
-    // same vector will never fire again.
+    // PIC EOI: acknowledge the PIC *before* calling dispatch so the
+    // keyboard IRQ can fire again while dispatch is printing output.
+    // This is safe because we are still in the ISR frame — interrupts
+    // are automatically re-enabled by the `iretq` at the end.
     unsafe {
         PICS.lock()
             .notify_end_of_interrupt(InterruptIndex::Keyboard.as_u8());
+    }
+
+    // Forward the decoded character to the REPL. process_key handles
+    // buffering, echoing, and (on Enter) dispatch.
+    if let Some(ch) = decoded_ch {
+        crate::repl::process_key(ch);
     }
 }
