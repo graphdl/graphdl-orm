@@ -24,16 +24,11 @@ Constraint Type(.code) is an entity type.
 
 Derivation Rule(.id) is an entity type.
 
-This association with Constraint, Role provides the preferred identification scheme for Constraint Span.
-
 Modality Type is a value type.
   The possible values of Modality Type are 'Alethic', 'Deontic'.
 
 World Assumption is a value type.
   The possible values of World Assumption are 'closed', 'open'.
-
-This association with Fact Type, Verb provides the preferred identification scheme for API.
-
 
 Language(.code) is an entity type.
 
@@ -161,7 +156,7 @@ Fact Type has Role.
   Each Fact Type has some Role.
   For each Role, exactly one Fact Type has that Role.
   It is possible that some Fact Type has more than one Role.
-Fact Type has Arity *.
+Fact Type has Arity. *
   Each Fact Type has exactly one Arity.
 Fact Type has Order.
   Each Fact Type has at most one Order.
@@ -173,6 +168,7 @@ Fact Type has Derivation Mode.
 ### Role
 Constraint spans Role.
   Each Constraint spans some Role.
+  This association with Constraint, Role provides the preferred identification scheme for Constraint Span.
 Role is used in Reading.
 Role has Position for Reading.
   For each Role and Reading that Role has that Reading at most one Position.
@@ -183,6 +179,7 @@ Verb has Name.
   It is possible that more than one Verb has the same Name.
 Fact Type is activated by Verb.
   In each population of Fact Type is activated by Verb, each Fact Type, Verb combination occurs at most once.
+  This association with Fact Type, Verb provides the preferred identification scheme for API.
 Fact is referenced by Verb.
   It is possible that some Verb references more than one Fact.
   It is possible that more than one Verb references the same Fact.
@@ -302,7 +299,7 @@ Derivation Rule has Text.
 Derivation Rule has antecedent Fact Type.
 Derivation Rule produces Fact Type.
   Each Derivation Rule produces exactly one Fact Type.
-Derivation Rule depends on Derivation Rule *.
+Derivation Rule depends on Derivation Rule. *
 
 ## Derivation Rules
 

@@ -41,8 +41,8 @@ Event Type has Pattern.
 ### Status
 Status is initial in State Machine Definition.
   Each State Machine Definition has at most one initial Status.
-Status is defined in State Machine Definition *.
-Status is terminal in State Machine Definition *.
+Status is defined in State Machine Definition. *
+Status is terminal in State Machine Definition. *
 
 ### Guard
 Guard references Fact Type.

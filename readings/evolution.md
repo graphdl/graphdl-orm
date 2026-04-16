@@ -32,7 +32,7 @@ Domain Change has Rationale.
 Domain Change targets Domain.
   Each Domain Change targets exactly one Domain.
 
-Domain Change is valid *.
+Domain Change is valid. *
 
 ### Signal
 
