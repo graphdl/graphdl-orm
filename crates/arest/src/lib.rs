@@ -31,6 +31,7 @@ pub mod scheduler;
 pub mod ring;
 pub mod freeze;
 pub mod declared_writes;
+pub mod check;
 
 #[cfg(feature = "wasm-lower")]
 pub mod wasm_lower;
