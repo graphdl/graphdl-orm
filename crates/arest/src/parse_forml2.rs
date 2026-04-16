@@ -18,8 +18,8 @@ use hashbrown::HashMap;
 // for cross-file redeclarations within the canonical metamodel. Apps must
 // NOT set this flag; user-domain compiles always hit the guard.
 thread_local! {
-    static BOOTSTRAP_MODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    static STRICT_MODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static BOOTSTRAP_MODE: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    static STRICT_MODE: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
 }
 
 pub fn set_bootstrap_mode(on: bool) {
@@ -1015,10 +1015,10 @@ pub fn domain_to_entities(d: &Domain, slug: &str) -> String {
         }).collect::<Vec<_>>(),
         // α(ft → [schema, roles..., reading]) : fact_types
         d.fact_types.iter().flat_map(|(id, ft)| {
-            std::iter::once(serde_json::json!({"id": format!("gs:{}", id), "type": "Fact Type", "domain": slug, "data": {"name": id, "reading": ft.reading}}))
+            core::iter::once(serde_json::json!({"id": format!("gs:{}", id), "type": "Fact Type", "domain": slug, "data": {"name": id, "reading": ft.reading}}))
                 .chain(ft.roles.iter().enumerate().map(move |(i, role)|
                     serde_json::json!({"id": format!("role:{}:{}", id, i), "type": "Role", "domain": slug, "data": {"nounName": role.noun_name, "position": i, "factType": id}})))
-                .chain(std::iter::once(serde_json::json!({"id": format!("reading:{}", id), "type": "Reading", "domain": slug, "data": {"text": ft.reading, "factType": id}})))
+                .chain(core::iter::once(serde_json::json!({"id": format!("reading:{}", id), "type": "Reading", "domain": slug, "data": {"text": ft.reading, "factType": id}})))
         }).collect(),
         // α(constraint → json)
         d.constraints.iter().map(|c| {
@@ -1028,7 +1028,7 @@ pub fn domain_to_entities(d: &Domain, slug: &str) -> String {
         }).collect(),
         // α(sm → [def, statuses..., transitions...])
         d.state_machines.iter().flat_map(|(n, sm)| {
-            std::iter::once(serde_json::json!({"id": n, "type": "State Machine Definition", "domain": slug, "data": {"name": n, "forNoun": sm.noun_name}}))
+            core::iter::once(serde_json::json!({"id": n, "type": "State Machine Definition", "domain": slug, "data": {"name": n, "forNoun": sm.noun_name}}))
                 .chain(sm.statuses.iter().map(move |s| serde_json::json!({"id": format!("status:{}:{}", n, s), "type": "Status", "domain": slug, "data": {"name": s, "stateMachineDefinition": n}})))
                 .chain(sm.transitions.iter().map(move |t| serde_json::json!({"id": format!("transition:{}:{}:{}", n, t.from, t.event), "type": "Transition", "domain": slug, "data": {"from": t.from, "to": t.to, "event": t.event, "stateMachineDefinition": n}})))
         }).collect(),
@@ -1080,7 +1080,7 @@ pub fn re_resolve_derivation_rules(domain: &mut Domain) {
     });
 
     // Take rules out, resolve, put back — avoids mutable+immutable borrow conflict.
-    let mut rules = std::mem::take(&mut domain.derivation_rules);
+    let mut rules = core::mem::take(&mut domain.derivation_rules);
     rules.iter_mut().for_each(|rule| {
         resolve_derivation_rule(rule, domain, &catalog);
     });
@@ -1284,7 +1284,7 @@ fn parse_into(ir: &mut Domain, input: &str) -> Result<(), String> {
     // Post-processing: resolve autofill spans.
     // For each autofill span name, find SS constraints whose role nouns
     // match the named span's role nouns, and set subset_autofill = Some(true).
-    let autofill_role_sets: Vec<std::collections::HashSet<String>> = ir.autofill_spans.clone()
+    let autofill_role_sets: Vec<hashbrown::HashSet<String>> = ir.autofill_spans.clone()
         .iter()
         .filter_map(|span_name| ir.named_spans.get(span_name))
         .map(|nouns| nouns.iter().cloned().collect())
@@ -1309,7 +1309,7 @@ fn parse_into(ir: &mut Domain, input: &str) -> Result<(), String> {
             .chain(ir.fact_types.values()
                 .flat_map(|ft| ft.roles.iter().map(|r| r.noun_name.clone()))
                 .filter(|n| !ir.nouns.contains_key(n)))
-            .collect::<std::collections::BTreeSet<_>>()
+            .collect::<alloc::collections::BTreeSet<_>>()
             .into_iter()
             .collect();
         if !undeclared.is_empty() {
@@ -1579,7 +1579,7 @@ fn resolve_derivation_rule(rule: &mut DerivationRuleDef, ir: &Domain, catalog: &
     rule.consequent_aggregates = aggregates;
 
     // Deduplicate join keys
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = hashbrown::HashSet::new();
     rule.join_on = join_keys.into_iter()
         .filter(|k| seen.insert(k.clone()))
         .collect();
@@ -1841,10 +1841,10 @@ fn resolve_constraint_schema(
             .or_else(|| {
                 // Inverse voice fallback: find schema where constraint verb appears in reading
                 // or reading verb appears in constraint text
-                let noun_set: std::collections::HashSet<&str> = role_nouns.iter().copied().collect();
+                let noun_set: hashbrown::HashSet<&str> = role_nouns.iter().copied().collect();
                 ir.fact_types.iter()
                     .filter(|(_, ft)| {
-                        let ft_nouns: std::collections::HashSet<&str> = ft.roles.iter()
+                        let ft_nouns: hashbrown::HashSet<&str> = ft.roles.iter()
                             .map(|r| r.noun_name.as_str()).collect();
                         ft_nouns == noun_set
                     })
@@ -3062,7 +3062,7 @@ It is forbidden that Support Response contains Markdown Syntax.";
             .collect();
         assert!(deontics.len() >= 2, "Should have at least 2 deontic constraints");
         // IDs should be unique (not all empty)
-        let ids: std::collections::HashSet<&str> = deontics.iter().map(|c| c.id.as_str()).collect();
+        let ids: hashbrown::HashSet<&str> = deontics.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(ids.len(), deontics.len(),
             "Each deontic constraint should have a unique ID");
         assert!(!ids.contains(""), "No constraint should have an empty ID");
