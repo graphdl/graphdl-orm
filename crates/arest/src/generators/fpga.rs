@@ -37,7 +37,7 @@ pub fn compile_to_verilog(state: &Object) -> String {
     // Compute RMAP tables for column-derived ports.
     let domain = crate::compile::state_to_domain(state);
     let tables = rmap::rmap(&domain);
-    let table_map: std::collections::HashMap<String, &TableDef> = tables.iter()
+    let table_map: hashbrown::HashMap<String, &TableDef> = tables.iter()
         .map(|t| (t.name.clone(), t)).collect();
 
     // Single pass: build each entity module and capture its top-
@@ -201,7 +201,7 @@ endmodule
 ///
 /// Returns (module_text, (name, status_width)) pairs so the top
 /// emitter can size the status wire it declares for each SM.
-fn emit_sm_modules(sms: &std::collections::HashMap<String, crate::types::StateMachineDef>) -> (Vec<String>, Vec<(String, usize)>) {
+fn emit_sm_modules(sms: &hashbrown::HashMap<String, crate::types::StateMachineDef>) -> (Vec<String>, Vec<(String, usize)>) {
     let mut entries: Vec<(&String, &crate::types::StateMachineDef)> = sms.iter().collect();
     entries.sort_by(|a, b| a.0.cmp(b.0));
     let mut modules: Vec<String> = Vec::new();
@@ -215,7 +215,7 @@ fn emit_sm_modules(sms: &std::collections::HashMap<String, crate::types::StateMa
             1,
             (status_count.max(2) as f64).log2().ceil() as usize,
         );
-        let status_codes: std::collections::HashMap<&str, usize> = sm.statuses.iter()
+        let status_codes: hashbrown::HashMap<&str, usize> = sm.statuses.iter()
             .enumerate().map(|(i, s)| (s.as_str(), i)).collect();
         let initial_code = status_codes.get(sm.statuses[0].as_str()).copied().unwrap_or(0);
 
@@ -1718,7 +1718,7 @@ Counter has Count.
     #[test]
     fn sm_module_emits_case_dispatch_with_status_codes() {
         use crate::types::{StateMachineDef, TransitionDef};
-        let mut sms = std::collections::HashMap::new();
+        let mut sms = hashbrown::HashMap::new();
         sms.insert("Order".to_string(), StateMachineDef {
             noun_name: "Order".to_string(),
             statuses: vec!["Draft".to_string(), "Placed".to_string(), "Shipped".to_string()],
@@ -1759,7 +1759,7 @@ Counter has Count.
     #[test]
     fn sm_module_with_two_statuses_uses_1bit_width() {
         use crate::types::{StateMachineDef, TransitionDef};
-        let mut sms = std::collections::HashMap::new();
+        let mut sms = hashbrown::HashMap::new();
         sms.insert("Door".to_string(), StateMachineDef {
             noun_name: "Door".to_string(),
             statuses: vec!["Closed".to_string(), "Open".to_string()],
@@ -1773,7 +1773,7 @@ Counter has Count.
 
     #[test]
     fn sm_module_empty_sms_map_produces_nothing() {
-        let (modules, specs) = emit_sm_modules(&std::collections::HashMap::new());
+        let (modules, specs) = emit_sm_modules(&hashbrown::HashMap::new());
         assert!(modules.is_empty());
         assert!(specs.is_empty());
     }
@@ -1781,7 +1781,7 @@ Counter has Count.
     #[test]
     fn sm_module_without_transitions_holds_initial() {
         use crate::types::StateMachineDef;
-        let mut sms = std::collections::HashMap::new();
+        let mut sms = hashbrown::HashMap::new();
         sms.insert("Frozen".to_string(), StateMachineDef {
             noun_name: "Frozen".to_string(),
             statuses: vec!["Only".to_string()],

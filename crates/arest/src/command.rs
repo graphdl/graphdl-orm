@@ -45,7 +45,7 @@ pub enum Command {
         noun: String,
         domain: String,
         id: Option<String>,
-        fields: std::collections::HashMap<String, String>,
+        fields: hashbrown::HashMap<String, String>,
         #[serde(default)]
         sender: Option<String>,
         #[serde(default)]
@@ -70,7 +70,7 @@ pub enum Command {
         schema_id: String,
         domain: String,
         target: String,
-        bindings: std::collections::HashMap<String, String>,
+        bindings: hashbrown::HashMap<String, String>,
         #[serde(default)]
         sender: Option<String>,
         #[serde(default)]
@@ -82,7 +82,7 @@ pub enum Command {
         domain: String,
         #[serde(alias = "entityId")]
         entity_id: String,
-        fields: std::collections::HashMap<String, String>,
+        fields: hashbrown::HashMap<String, String>,
         #[serde(default)]
         sender: Option<String>,
         #[serde(default)]
@@ -124,7 +124,7 @@ pub struct EntityResult {
     pub id: String,
     #[serde(rename = "type")]
     pub entity_type: String,
-    pub data: std::collections::HashMap<String, String>,
+    pub data: hashbrown::HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -150,7 +150,7 @@ pub struct NavigationLink {
 /// Encode command input as Object for compiled handler Func.
 /// create: <entity_id, <<field_name, value>, ...>, domain, state>
 pub fn encode_create_input(
-    entity_id: &str, fields: &std::collections::HashMap<String, String>,
+    entity_id: &str, fields: &hashbrown::HashMap<String, String>,
     domain: &str, state: &ast::Object,
 ) -> ast::Object {
     let field_seq = ast::Object::Seq(
@@ -169,7 +169,7 @@ pub fn encode_transition_input(
 
 /// Encode update input: <entity_id, <<field_name, value>, ...>, noun, domain, state>
 pub fn encode_update_input(
-    entity_id: &str, fields: &std::collections::HashMap<String, String>,
+    entity_id: &str, fields: &hashbrown::HashMap<String, String>,
     noun: &str, domain: &str, state: &ast::Object,
 ) -> ast::Object {
     let field_seq = ast::Object::Seq(
@@ -199,7 +199,7 @@ pub fn decode_command_result(obj: &ast::Object) -> CommandResult {
                     let id = e.get("id")?.as_str()?.to_string();
                     let entity_type = e.get("type").or_else(|| e.get("entityType"))
                         .and_then(|v| v.as_str())?.to_string();
-                    let data: std::collections::HashMap<String, String> = e.get("data")
+                    let data: hashbrown::HashMap<String, String> = e.get("data")
                         .and_then(|v| v.as_object())
                         .map(|m| m.iter().filter_map(|(k, v)|
                             Some((k.clone(), v.as_str()?.to_string()))).collect())
@@ -302,7 +302,7 @@ pub fn encode_command_result(result: &CommandResult) -> ast::Object {
     let summary = serde_json::to_string(&result).unwrap_or_else(|_| "{}".into());
     // Two-cell Map: __state carries the post-command D so the handle can
     // persist it; __result is the JSON-string atom the caller sees.
-    let mut cells = std::collections::HashMap::new();
+    let mut cells = hashbrown::HashMap::new();
     cells.insert("__state".to_string(), result.state.clone());
     cells.insert("__result".to_string(), ast::Object::atom(&summary));
     ast::Object::Map(cells)
@@ -359,7 +359,7 @@ fn create_via_defs(
     noun: &str,
     domain: &str,
     explicit_id: Option<&str>,
-    fields: &std::collections::HashMap<String, String>,
+    fields: &hashbrown::HashMap<String, String>,
     sender: Option<&str>,
     state: &ast::Object,
 ) -> CommandResult {
@@ -638,7 +638,7 @@ fn create_via_defs(
     let transitions = hateoas_via_rho(d, noun, &entity_id, status.as_deref());
     let navigation = nav_links_via_rho(d, noun, &entity_id);
 
-    let entity_data: std::collections::HashMap<String, String> = fields_with_domain.iter()
+    let entity_data: hashbrown::HashMap<String, String> = fields_with_domain.iter()
         .map(|(k, v)| (k.to_string(), v.to_string())).collect();
     let entities = std::iter::once(EntityResult {
         id: entity_id.clone(), entity_type: noun.to_string(), data: entity_data,
@@ -736,7 +736,7 @@ fn query_via_defs(
     d: &ast::Object,
     schema_id: &str,
     target: &str,
-    bindings: &std::collections::HashMap<String, String>,
+    bindings: &hashbrown::HashMap<String, String>,
     state: &ast::Object,
 ) -> CommandResult {
     // Look up schema role names from state metadata
@@ -770,7 +770,7 @@ fn query_via_defs(
     };
     let results = crate::query::query_with_ast(state, &schema, target_role, &filter_refs);
 
-    let mut data = std::collections::HashMap::new();
+    let mut data = hashbrown::HashMap::new();
     data.insert(String::from("matches"), results.join(","));
     data.insert(String::from("count"), results.len().to_string());
 
@@ -795,11 +795,11 @@ fn update_via_defs(
     noun: &str,
     _domain: &str,
     entity_id: &str,
-    new_fields: &std::collections::HashMap<String, String>,
+    new_fields: &hashbrown::HashMap<String, String>,
     state: &ast::Object,
 ) -> CommandResult {
     // Read current facts for this entity, merge with new fields
-    let merged: std::collections::HashMap<String, String> = ast::cells_iter(state)
+    let merged: hashbrown::HashMap<String, String> = ast::cells_iter(state)
         .into_iter()
         .flat_map(|(_, contents)| contents.as_seq().into_iter().flat_map(|facts| facts.to_vec()))
         .filter_map(|fact| {
@@ -1068,7 +1068,7 @@ fn apply_load_readings(
     defs.push(("audit".to_string(), ast::Func::Platform("audit".to_string())));
     let new_d = ast::defs_to_state(&defs, &merged_state);
 
-    let mut data = std::collections::HashMap::new();
+    let mut data = hashbrown::HashMap::new();
     data.insert("domain".to_string(), domain.to_string());
     data.insert("nouns".to_string(), new_noun_count.to_string());
 
@@ -1182,7 +1182,7 @@ fn extract_sm_status(state: &ast::Object, sm_id: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use hashbrown::HashMap;
 
     #[test]
     fn command_result_round_trips_through_object() {

@@ -11,7 +11,7 @@
 // No if/else chains. Pattern matching via strip_suffix/strip_prefix/find.
 
 use crate::types::*;
-use std::collections::HashMap;
+use hashbrown::HashMap;
 
 // Bootstrap mode flag — set by lib::create_impl while loading bundled
 // metamodel readings, so the metamodel namespace guard (#23) is bypassed
@@ -290,14 +290,14 @@ fn try_ring_shorthand(line: &str, noun_names: &[String]) -> Option<ParseAction> 
     // Ring-shorthand requires the reading to mention the same base noun
     // at least twice — otherwise it's ambiguous with a bare-adjective
     // claim (`X is symmetric` on some non-fact-type X).
-    let base_counts: std::collections::HashMap<&str, usize> = reading
+    let base_counts: hashbrown::HashMap<&str, usize> = reading
         .split_whitespace()
         .filter_map(|w| {
             let w = w.trim_end_matches(',').trim_end_matches('.');
             let (base, _) = parse_role_token(w);
             noun_names.iter().any(|n| n == base).then_some(base)
         })
-        .fold(std::collections::HashMap::new(), |mut acc, b| {
+        .fold(hashbrown::HashMap::new(), |mut acc, b| {
             *acc.entry(b).or_insert(0) += 1;
             acc
         });
@@ -892,7 +892,7 @@ pub fn parse_to_state_with_nouns(input: &str, existing: &crate::ast::Object) -> 
 /// Each category becomes a cell: <CELL, fact_type_id, <facts...>>
 pub fn domain_to_state(d: &Domain) -> crate::ast::Object {
     use crate::ast::{Object, fact_from_pairs};
-    use std::collections::{HashMap, HashSet};
+    use hashbrown::{HashMap, HashSet};
     // Build cells mutably into a HashMap<String, Vec<Object>>, then wrap
     // in Object::Map at the end. This is O(n) total instead of the
     // O(n²) that cell_push fold would produce (each push clones the

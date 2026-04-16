@@ -63,7 +63,7 @@ pub fn prune_to_declared(result: &Object, snapshot: &Object, write_targets: &[&s
         }
     }
 
-    let mut out = std::collections::HashMap::with_capacity(write_targets.len());
+    let mut out = hashbrown::HashMap::with_capacity(write_targets.len());
     for target in write_targets {
         let val = result_map
             .get(*target)
@@ -79,7 +79,7 @@ mod tests {
     use super::*;
 
     fn map_of(pairs: &[(&str, Object)]) -> Object {
-        let m: std::collections::HashMap<String, Object> = pairs.iter()
+        let m: hashbrown::HashMap<String, Object> = pairs.iter()
             .map(|(k, v)| (k.to_string(), v.clone()))
             .collect();
         Object::Map(m)

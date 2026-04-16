@@ -30,6 +30,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "allocator-api2"
+version = "0.2.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
+
+[[package]]
 name = "anyhow"
 version = "1.0.102"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -40,6 +46,7 @@ name = "arest"
 version = "0.9.0"
 dependencies = [
  "console_error_panic_hook",
+ "hashbrown 0.14.5",
  "hmac",
  "rayon",
  "regex",
@@ -47,6 +54,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "spin",
  "subtle",
  "wasm-bindgen",
  "wasm-encoder 0.230.0",
@@ -260,6 +268,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e5274423e17b7c9fc20b6e7e208532f9b19825d82dfd615708b70edd83df41f1"
 dependencies = [
  "ahash",
+ "allocator-api2",
+ "serde",
 ]
 
 [[package]]

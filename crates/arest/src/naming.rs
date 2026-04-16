@@ -89,7 +89,7 @@ fn split_noun(name: &str) -> Vec<String> {
 pub fn resolve_entity_id(
     ir: &crate::types::Domain,
     noun_name: &str,
-    fields: &std::collections::HashMap<String, String>,
+    fields: &hashbrown::HashMap<String, String>,
 ) -> Option<String> {
     let _noun_def = ir.nouns.get(noun_name)?;
     // Reference scheme is not stored in the IR nouns directly -- it's in the

@@ -226,7 +226,7 @@ mod tests {
     fn cell_count_ignores_def_cells() {
         // `schema:` / `validate:` / etc are kernel-internal and
         // shouldn't count against the App's memory budget.
-        let mut m = std::collections::HashMap::new();
+        let mut m = hashbrown::HashMap::new();
         m.insert("Noun".to_string(), Object::phi());
         m.insert("FactType".to_string(), Object::phi());
         m.insert("schema:Order".to_string(), Object::phi()); // def — excluded

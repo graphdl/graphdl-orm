@@ -33,7 +33,7 @@ fn is_skip_validate() -> bool { SKIP_VALIDATE.with(|b| b.get()) }
 //   Aggregation → Insert (fold)
 //   Population traversal → ApplyToAll (map)
 
-use std::collections::HashMap;
+use hashbrown::HashMap;
 use std::sync::Arc;
 use std::fmt;
 
@@ -693,7 +693,7 @@ fn normalize_step(f: &Func) -> Func {
 #[cfg(all(feature = "profile", not(target_arch = "wasm32")))]
 mod profile {
     use std::cell::{Cell, RefCell};
-    use std::collections::HashMap;
+    use hashbrown::HashMap;
 
     thread_local! {
         pub(super) static ENABLED: Cell<bool> = const { Cell::new(false) };
@@ -1793,8 +1793,8 @@ fn platform_transition(_noun: &str, x: &Object, d: &Object) -> Object {
 
 /// Extract (optional id, field map) from an Object of fact pairs.
 /// Input: <<id, val>, <field1, val1>, ...> or <<field1, val1>, ...>
-fn extract_fact_pairs(x: &Object) -> (Option<String>, std::collections::HashMap<String, String>) {
-    let mut fields = std::collections::HashMap::new();
+fn extract_fact_pairs(x: &Object) -> (Option<String>, hashbrown::HashMap<String, String>) {
+    let mut fields = hashbrown::HashMap::new();
     let mut id = None;
     let items = x.as_seq().unwrap_or_default();
     items.iter().for_each(|pair| {
@@ -1824,7 +1824,7 @@ fn extract_fact_pairs(x: &Object) -> (Option<String>, std::collections::HashMap<
 /// Returns an atom holding a JSON array: `[{"id":..., <field>:<value>, ...}, ...]`.
 /// Returns `Bottom` if no matching entities are found.
 fn platform_list_noun(noun: &str, d: &Object) -> Object {
-    use std::collections::HashMap;
+    use hashbrown::HashMap;
     let mut entities: HashMap<String, HashMap<String, String>> = HashMap::new();
 
     cells_iter(d).iter().for_each(|(_, contents)| {
@@ -1879,7 +1879,7 @@ fn platform_query_ft(ft_id: &str, x: &Object, d: &Object) -> Object {
     let facts = fetch_or_phi(ft_id, d);
     let facts_seq = facts.as_seq().map(|s| s.to_vec()).unwrap_or_default();
 
-    let filter: std::collections::HashMap<String, String> = x.as_atom()
+    let filter: hashbrown::HashMap<String, String> = x.as_atom()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
         .and_then(|v| v.as_object().cloned())
         .map(|obj| obj.iter().filter_map(|(k, v)|
@@ -1943,7 +1943,7 @@ fn platform_get_noun(noun: &str, x: &Object, d: &Object) -> Object {
 fn command_field_overflow(command: &crate::command::Command) -> Option<&'static str> {
     use crate::command::Command;
     let over = |s: &str| s.len() > PLATFORM_MAX_FIELD;
-    let map_over = |m: &std::collections::HashMap<String, String>| -> bool {
+    let map_over = |m: &hashbrown::HashMap<String, String>| -> bool {
         m.iter().any(|(k, v)| over(k) || over(v))
     };
     match command {
@@ -4315,8 +4315,8 @@ mod tests {
         "a".repeat(PLATFORM_MAX_FIELD + 1)
     }
 
-    fn ok_map() -> std::collections::HashMap<String, String> {
-        let mut m = std::collections::HashMap::new();
+    fn ok_map() -> hashbrown::HashMap<String, String> {
+        let mut m = hashbrown::HashMap::new();
         m.insert("k".to_string(), "v".to_string());
         m
     }
@@ -4364,7 +4364,7 @@ mod tests {
 
     #[test]
     fn command_field_overflow_create_fields_key_oversized() {
-        let mut fields = std::collections::HashMap::new();
+        let mut fields = hashbrown::HashMap::new();
         fields.insert(huge(), "v".to_string());
         let cmd = ArestCommand::CreateEntity {
             noun: "n".into(),
@@ -4379,7 +4379,7 @@ mod tests {
 
     #[test]
     fn command_field_overflow_create_fields_value_oversized() {
-        let mut fields = std::collections::HashMap::new();
+        let mut fields = hashbrown::HashMap::new();
         fields.insert("k".to_string(), huge());
         let cmd = ArestCommand::CreateEntity {
             noun: "n".into(),
@@ -4567,7 +4567,7 @@ mod tests {
 
     #[test]
     fn command_field_overflow_query_bindings_key_oversized() {
-        let mut bindings = std::collections::HashMap::new();
+        let mut bindings = hashbrown::HashMap::new();
         bindings.insert(huge(), "v".to_string());
         let cmd = ArestCommand::Query {
             schema_id: "s".into(),
@@ -4582,7 +4582,7 @@ mod tests {
 
     #[test]
     fn command_field_overflow_query_bindings_value_oversized() {
-        let mut bindings = std::collections::HashMap::new();
+        let mut bindings = hashbrown::HashMap::new();
         bindings.insert("k".to_string(), huge());
         let cmd = ArestCommand::Query {
             schema_id: "s".into(),
@@ -4677,7 +4677,7 @@ mod tests {
 
     #[test]
     fn command_field_overflow_update_fields_key_oversized() {
-        let mut fields = std::collections::HashMap::new();
+        let mut fields = hashbrown::HashMap::new();
         fields.insert(huge(), "v".to_string());
         let cmd = ArestCommand::UpdateEntity {
             noun: "n".into(),
@@ -4692,7 +4692,7 @@ mod tests {
 
     #[test]
     fn command_field_overflow_update_fields_value_oversized() {
-        let mut fields = std::collections::HashMap::new();
+        let mut fields = hashbrown::HashMap::new();
         fields.insert("k".to_string(), huge());
         let cmd = ArestCommand::UpdateEntity {
             noun: "n".into(),

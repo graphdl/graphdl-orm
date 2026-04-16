@@ -45,7 +45,7 @@ wasm-lower = ["dep:wasm-encoder", "dep:wasmi"]
 #   cargo check --no-default-features --features no_std
 # Pulls `hashbrown` for HashMap replacement and `spin` for
 # RwLock/Mutex/OnceLock replacements.
-no_std = ["dep:hashbrown", "dep:spin"]
+no_std = ["dep:spin"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -76,7 +76,7 @@ wasmi = { version = "0.50", optional = true }
 # enabling it under no_std gives us the same API without linking `std`.
 # spin provides Mutex / RwLock / Once on bare metal where `std::sync`
 # isn't available (no OS to block against — spin-locks instead).
-hashbrown = { version = "0.14", default-features = false, optional = true }
+hashbrown = { version = "0.14", features = ["serde"] }
 spin = { version = "0.9", default-features = false, features = ["mutex", "spin_mutex", "rwlock", "once"], optional = true }
 
 [dev-dependencies]

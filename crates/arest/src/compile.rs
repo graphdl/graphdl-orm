@@ -12,7 +12,7 @@
 //   - State machines are folds: run_machine = fold(transition)(initial)(stream)
 //   - No variables, no mutable state during evaluation -- only reduction
 
-use std::collections::{HashMap, HashSet};
+use hashbrown::{HashMap, HashSet};
 
 // WASM-safe timing shim. The wasm32-unknown-unknown target panics on
 // std::time::Instant::now() (the Rust stdlib has no clock there). On
@@ -897,7 +897,7 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
     // ── Generator 3b: SQL Triggers for derivation rules ────────────
     if !active_dialects.is_empty() {
         let sql_tables = crate::rmap::rmap(&domain);
-        let table_names: std::collections::HashSet<String> = sql_tables.iter()
+        let table_names: hashbrown::HashSet<String> = sql_tables.iter()
             .map(|t| t.name.clone()).collect();
         let triggers = generate_derivation_triggers(&domain, &sql_tables, &table_names);
         defs.extend(triggers.into_iter().map(|(name, ddl)| {
@@ -1841,7 +1841,7 @@ fn compile_explicit_derivation(ir: &Domain, rule: &DerivationRuleDef) -> Compile
     // `has Population >= 1000000`). Each filter wraps its antecedent's
     // extract_facts_from_pop in Func::filter so only facts whose role
     // value satisfies the comparator survive.
-    let filter_by_idx: std::collections::HashMap<usize, Func> = rule.antecedent_filters.iter()
+    let filter_by_idx: hashbrown::HashMap<usize, Func> = rule.antecedent_filters.iter()
         .filter_map(|af| {
             let ft_id = antecedent_ids.get(af.antecedent_index)?;
             let ft = ir.fact_types.get(ft_id)?;

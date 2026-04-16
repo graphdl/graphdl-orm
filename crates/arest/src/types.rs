@@ -1,6 +1,6 @@
 // crates/arest/src/types.rs
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use hashbrown::HashMap;
 
 // ── Domain: the parsed result of FORML2 readings ────────────────────
 

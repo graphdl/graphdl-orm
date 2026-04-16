@@ -18,7 +18,7 @@
 //   6.   Constraint mapping (UC -> keys, MC -> NOT NULL, VC -> CHECK, SS -> FK)
 
 use serde::{Serialize, Deserialize};
-use std::collections::{HashMap, HashSet};
+use hashbrown::{HashMap, HashSet};
 use crate::types::Domain;
 
 // -- Output types -----------------------------------------------------

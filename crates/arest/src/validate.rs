@@ -9,7 +9,7 @@
 // The engine validates schemas using the same constraint evaluator it uses
 // for domain logic. The readings ARE the validation rules.
 
-use std::collections::HashMap;
+use hashbrown::HashMap;
 use crate::types::*;
 
 /// Convert a domain's Domain into an Object state of core metamodel facts.

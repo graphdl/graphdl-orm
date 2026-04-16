@@ -42,7 +42,7 @@
 //   - The function is total: missing cells yield a valid empty document.
 //   - Output parses as valid JSON conforming to OpenAPI 3.1.
 
-use std::collections::HashMap;
+use hashbrown::HashMap;
 
 use crate::ast::Object;
 use crate::rmap::{self, TableColumn, TableDef};
