@@ -85,6 +85,13 @@ pub fn compile_to_verilog(state: &Object) -> String {
     let (sm_modules, sm_specs) = emit_sm_modules(&domain.state_machines);
     modules.extend(sm_modules);
 
+    // Per-noun BRAM cell memory map (#166). One dual-port bank per
+    // entity, width = sum of per-column Verilog widths from #187.
+    // Emitted before the top module so top can instantiate with
+    // matching-width address / data ports.
+    let (bram_modules, bram_specs) = emit_bram_modules(&entities);
+    modules.extend(bram_modules);
+
     // Audit-log ring buffer. Mirrors the CPU-side crate::ring::RingBuffer
     // (#188) in synthesizable form: fixed-depth BRAM with write-pointer
     // + wrap-around overflow flag. Emitted only when the state has any
@@ -100,6 +107,7 @@ pub fn compile_to_verilog(state: &Object) -> String {
         modules.push(emit_fact_ingress_module());
         modules.push(emit_fact_egress_module());
     }
+    let _ = bram_specs;  // reserved for later top-level wiring work
 
     let top = emit_top_module(&entities, &constraint_names, &sm_specs);
 
@@ -317,6 +325,74 @@ module tb_top;
     end
 endmodule
 "#.to_string()
+}
+
+/// Emit per-noun BRAM cell memory map (#166). One dual-port BRAM bank
+/// per entity, row width = sum of the entity's column widths (from
+/// #187), depth defaulted to 1024 rows (configurable per instance via
+/// the `DEPTH` parameter).
+///
+/// Dual-port layout: port A is the read side (lookups / queries via
+/// `cell_fetch`), port B is the write side (create / update). On
+/// silicon the per-cell locks from #163 translate to per-bank
+/// write-enable gating — disjoint-cell writes are trivially parallel.
+///
+/// Returns (module_text, (module_name, row_width_bits, depth)) so
+/// downstream steps can address-decode + route.
+fn emit_bram_modules(
+    entities: &[(String, Vec<(String, usize)>)],
+) -> (Vec<String>, Vec<(String, usize, usize)>) {
+    let mut modules: Vec<String> = Vec::new();
+    let mut specs: Vec<(String, usize, usize)> = Vec::new();
+    for (name, cols) in entities {
+        let row_width: usize = cols.iter().map(|(_, w)| *w).sum::<usize>().max(1);
+        let depth: usize = 1024;
+        let module_name = format!("{}_bram", name);
+        let addr_bits = (depth as f64).log2().ceil() as usize;
+        let addr_bits = addr_bits.max(1);
+        let mut m = String::new();
+        m.push_str(&format!(
+            "module {module_name} #(\n    \
+                parameter DEPTH = {depth},\n    \
+                parameter ROW_WIDTH = {row_width}\n\
+            ) (\n    \
+                input  wire clk,\n    \
+                input  wire rst_n,\n    \
+                // Port A (read).\n    \
+                input  wire [{addr_bits_minus_one}:0] addr_a,\n    \
+                output reg  [ROW_WIDTH-1:0] rdata_a,\n    \
+                // Port B (write).\n    \
+                input  wire [{addr_bits_minus_one}:0] addr_b,\n    \
+                input  wire [ROW_WIDTH-1:0] wdata_b,\n    \
+                input  wire we_b,\n    \
+                // Monotonic row counter — the 3NF cardinality.\n    \
+                output reg  [{addr_bits}:0] row_count\n\
+            );\n    \
+                reg [ROW_WIDTH-1:0] mem [0:DEPTH-1];\n\n    \
+                // Port A: registered read (BRAM-inferrable).\n    \
+                always @(posedge clk) begin\n        \
+                    rdata_a <= mem[addr_a];\n    \
+                end\n\n    \
+                // Port B: conditional write + row counter.\n    \
+                always @(posedge clk) begin\n        \
+                    if (!rst_n) begin\n            \
+                        row_count <= 0;\n        \
+                    end else if (we_b) begin\n            \
+                        mem[addr_b] <= wdata_b;\n            \
+                        if (row_count < DEPTH) row_count <= row_count + 1;\n        \
+                    end\n    \
+                end\n\
+            endmodule\n",
+            module_name = module_name,
+            depth = depth,
+            row_width = row_width,
+            addr_bits = addr_bits,
+            addr_bits_minus_one = addr_bits.saturating_sub(1),
+        ));
+        modules.push(m);
+        specs.push((module_name, row_width, depth));
+    }
+    (modules, specs)
 }
 
 /// Emit the fact-ingress Verilog module — the on-chip entry point for
@@ -756,9 +832,9 @@ Noun has Object Type.
 
         let module_count = verilog.matches("module ").count();
         let endmodule_count = verilog.matches("endmodule").count();
-        // 3 entity + audit_log + fact_ingress + fact_egress + top = 7.
-        assert_eq!(module_count, 7, "expected 7 module decls, got:\n{}", verilog);
-        assert_eq!(endmodule_count, 7, "module/endmodule mismatch:\n{}", verilog);
+        // 3 entity + 3 bram + audit + ingress + egress + top = 10.
+        assert_eq!(module_count, 10, "expected 10 module decls, got:\n{}", verilog);
+        assert_eq!(endmodule_count, 10, "module/endmodule mismatch:\n{}", verilog);
         assert!(verilog.contains("module order"));
         assert!(verilog.contains("module customer"));
         assert!(verilog.contains("module product"));
@@ -778,9 +854,10 @@ Noun has Object Type.
 
         let verilog = compile_to_verilog(&state);
 
-        // 1 entity + audit_log + fact_ingress + fact_egress + top = 5.
-        assert_eq!(verilog.matches("module ").count(), 5);
+        // 1 entity + 1 bram + audit_log + fact_ingress + fact_egress + top = 6.
+        assert_eq!(verilog.matches("module ").count(), 6);
         assert!(verilog.contains("module order"));
+        assert!(verilog.contains("module order_bram"));
         assert!(verilog.contains("module top"));
         assert!(verilog.contains("module audit_log"));
         assert!(verilog.contains("module fact_ingress"));
@@ -867,8 +944,8 @@ Supplier supplies Widget.
         assert!(verilog.contains("module widget"));
         assert!(verilog.contains("module supplier"));
         assert!(verilog.contains("module top"));
-        // 2 entity + audit_log + fact_ingress + fact_egress + top = 6.
-        assert_eq!(verilog.matches("endmodule").count(), 6);
+        // 2 entity + 2 bram + audit_log + fact_ingress + fact_egress + top = 8.
+        assert_eq!(verilog.matches("endmodule").count(), 8);
     }
 
     /// Verilog output is well-formed: every module has clk/rst_n ports,
@@ -998,6 +1075,56 @@ Supplier supplies Widget.
     }
 
     // ── Audit-log Verilog ring buffer (#167) ──
+
+    // ── Per-noun BRAM cell memory map (#166) ──
+
+    #[test]
+    fn bram_module_emitted_per_entity() {
+        let state = state_with_nouns(&[("Widget", "entity"), ("Gadget", "entity")]);
+        let verilog = compile_to_verilog(&state);
+        assert!(verilog.contains("module widget_bram"), "widget_bram module absent:\n{}", verilog);
+        assert!(verilog.contains("module gadget_bram"), "gadget_bram module absent:\n{}", verilog);
+    }
+
+    #[test]
+    fn bram_module_has_dual_port_layout() {
+        let state = state_with_nouns(&[("Widget", "entity")]);
+        let verilog = compile_to_verilog(&state);
+        // Port A: read side.
+        assert!(verilog.contains("input  wire [9:0] addr_a"));
+        assert!(verilog.contains("output reg  [ROW_WIDTH-1:0] rdata_a"));
+        // Port B: write side with write-enable.
+        assert!(verilog.contains("input  wire [9:0] addr_b"));
+        assert!(verilog.contains("input  wire [ROW_WIDTH-1:0] wdata_b"));
+        assert!(verilog.contains("input  wire we_b"));
+        // Row counter exposing the 3NF cardinality.
+        assert!(verilog.contains("output reg  [10:0] row_count"));
+    }
+
+    #[test]
+    fn bram_module_parameterises_depth_and_row_width() {
+        let state = state_with_nouns(&[("Widget", "entity")]);
+        let verilog = compile_to_verilog(&state);
+        assert!(verilog.contains("parameter DEPTH = 1024"),
+            "depth parameter missing:\n{}", verilog);
+        // Without an RMAP table the noun falls back to the single-
+        // id_in column of width 256.
+        assert!(verilog.contains("parameter ROW_WIDTH = 256"));
+    }
+
+    #[test]
+    fn bram_module_has_registered_read_and_conditional_write() {
+        let state = state_with_nouns(&[("Widget", "entity")]);
+        let verilog = compile_to_verilog(&state);
+        // Port A read is a registered clocked assignment (BRAM-inferrable).
+        assert!(verilog.contains("rdata_a <= mem[addr_a]"));
+        // Port B write is guarded on we_b AND reset, with counter bump.
+        assert!(verilog.contains("if (we_b)"));
+        assert!(verilog.contains("mem[addr_b] <= wdata_b"));
+        assert!(verilog.contains("row_count <= row_count + 1"));
+        // Reset clears row_count to 0.
+        assert!(verilog.contains("row_count <= 0"));
+    }
 
     // ── Typed-row column widths (#187) ──
 
@@ -1330,9 +1457,9 @@ Supplier supplies Widget.
         let verilog = compile_to_verilog(&state);
         let modules = verilog.matches("module ").count();
         let endmodules = verilog.matches("endmodule").count();
-        // 4 entity + audit_log + fact_ingress + fact_egress + top = 8.
-        assert_eq!(modules, 8, "4 entities + audit + ingress + egress + top = 8");
-        assert_eq!(endmodules, 8);
+        // 4 entity + 4 bram + audit + ingress + egress + top = 12.
+        assert_eq!(modules, 12, "4 entities + 4 bram + audit + ingress + egress + top = 12");
+        assert_eq!(endmodules, 12);
         assert_eq!(modules, endmodules);
     }
 }
