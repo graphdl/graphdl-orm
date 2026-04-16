@@ -39,6 +39,13 @@ profile = []
 # native-code dependency tree. Run the PoC with:
 #   cargo test --features wasm-lower --lib wasm_lower
 wasm-lower = ["dep:wasm-encoder", "dep:wasmi"]
+# no_std build target — gates every `use std::*` behind a
+# `std`/`no_std` split so the crate can be embedded in bare-metal
+# contexts (FPGA soft-cores, x86_64 kernel via #175+). Enable via:
+#   cargo check --no-default-features --features no_std
+# Pulls `hashbrown` for HashMap replacement and `spin` for
+# RwLock/Mutex/OnceLock replacements.
+no_std = ["dep:hashbrown", "dep:spin"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -65,6 +72,12 @@ wasm-encoder = { version = "0.230", optional = true }
 # the wasmi result here only validates that the emitted bytes are
 # semantically equivalent to Rust apply().
 wasmi = { version = "0.50", optional = true }
+# no_std replacements. hashbrown is the std HashMap source since 1.36;
+# enabling it under no_std gives us the same API without linking `std`.
+# spin provides Mutex / RwLock / Once on bare metal where `std::sync`
+# isn't available (no OS to block against — spin-locks instead).
+hashbrown = { version = "0.14", default-features = false, optional = true }
+spin = { version = "0.9", default-features = false, features = ["mutex", "spin_mutex", "rwlock", "once"], optional = true }
 
 [dev-dependencies]
 
