@@ -420,7 +420,7 @@ pub fn synthesize_from_state(state: &ast::Object, noun_name: &str, depth: usize)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use hashbrown::HashMap;
 
     fn empty_ir() -> Domain {
         Domain {

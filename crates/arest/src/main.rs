@@ -67,7 +67,7 @@ mod generators;
 mod db {
     use rusqlite::{Connection, params};
     use crate::ast;
-    use std::collections::HashMap;
+    use hashbrown::HashMap;
 
     pub fn open(path: &str) -> Connection {
         Connection::open(path)

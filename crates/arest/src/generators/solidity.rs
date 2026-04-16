@@ -55,7 +55,7 @@ fn compile_to_solidity_inner(
 
     let domain = crate::compile::state_to_domain(state);
     let tables = rmap::rmap(&domain);
-    let table_by_name: std::collections::HashMap<String, &TableDef> = tables.iter()
+    let table_by_name: hashbrown::HashMap<String, &TableDef> = tables.iter()
         .map(|t| (t.name.clone(), t)).collect();
 
     let nouns = fetch_or_phi("Noun", state);

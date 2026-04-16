@@ -74,8 +74,8 @@ pub mod cloudflare;
 /// Cheap in memory because cells share `Arc` storage — a snapshot
 /// is one map insert plus an Arc ref bump per cell.
 struct CompiledState {
-    cells: std::collections::HashMap<String, Arc<RwLock<ast::Object>>>,
-    snapshots: std::collections::HashMap<String, ast::Object>,
+    cells: hashbrown::HashMap<String, Arc<RwLock<ast::Object>>>,
+    snapshots: hashbrown::HashMap<String, ast::Object>,
 }
 
 /// Outcome of a targeted-write attempt via `try_commit_diff`.
@@ -94,8 +94,8 @@ enum CommitOutcome {
 impl CompiledState {
     fn new(initial_d: ast::Object) -> Self {
         let mut s = Self {
-            cells: std::collections::HashMap::new(),
-            snapshots: std::collections::HashMap::new(),
+            cells: hashbrown::HashMap::new(),
+            snapshots: hashbrown::HashMap::new(),
         };
         s.replace_d(initial_d);
         s
@@ -106,7 +106,7 @@ impl CompiledState {
     /// each other, but a writer on that cell will block the snapshot
     /// momentarily.
     fn snapshot_d(&self) -> ast::Object {
-        let mut map = std::collections::HashMap::with_capacity(self.cells.len());
+        let mut map = hashbrown::HashMap::with_capacity(self.cells.len());
         for (name, lock) in &self.cells {
             map.insert(name.clone(), lock.read().unwrap().clone());
         }
@@ -118,12 +118,12 @@ impl CompiledState {
     /// live `Arc<RwLock>` rather than a freed one), then prunes any
     /// cells absent from the new state.
     fn replace_d(&mut self, new_d: ast::Object) {
-        let new_map: std::collections::HashMap<String, ast::Object> = match new_d {
+        let new_map: hashbrown::HashMap<String, ast::Object> = match new_d {
             ast::Object::Map(m) => m,
             ast::Object::Seq(seq) => {
                 // CELL-triple representation: <<CELL, name, contents>, …>.
                 // Fall through to an empty map if the shape doesn't match.
-                let mut m = std::collections::HashMap::new();
+                let mut m = hashbrown::HashMap::new();
                 for cell in seq.iter() {
                     if let Some(items) = cell.as_seq() {
                         if items.len() == 3 {
@@ -138,19 +138,19 @@ impl CompiledState {
                 }
                 m
             }
-            ast::Object::Bottom => std::collections::HashMap::new(),
+            ast::Object::Bottom => hashbrown::HashMap::new(),
             other => {
                 // Unexpected shape — store the whole thing under a
                 // sentinel cell so we don't silently drop it.
-                let mut m = std::collections::HashMap::new();
+                let mut m = hashbrown::HashMap::new();
                 m.insert("__unshaped__".to_string(), other);
                 m
             }
         };
         // Reuse existing locks where possible; replace contents under
         // the per-cell write lock.
-        let mut next_cells: std::collections::HashMap<String, Arc<RwLock<ast::Object>>> =
-            std::collections::HashMap::with_capacity(new_map.len());
+        let mut next_cells: hashbrown::HashMap<String, Arc<RwLock<ast::Object>>> =
+            hashbrown::HashMap::with_capacity(new_map.len());
         for (name, value) in new_map {
             match self.cells.remove(&name) {
                 Some(existing) => {

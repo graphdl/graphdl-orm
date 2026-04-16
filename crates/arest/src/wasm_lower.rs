@@ -2387,14 +2387,14 @@ mod tests {
     /// hosts would plug in CompiledState or whatever context their
     /// runtime carries.
     struct HostState {
-        cells: std::collections::HashMap<String, ast::Object>,
+        cells: hashbrown::HashMap<String, ast::Object>,
     }
 
     /// Build a synthetic `&Object` D for `ast::apply` from the
     /// cells map, so def_dispatch / platform_dispatch can run
     /// `ast::apply(Func::Def(name), x, &d)` with realistic state.
     fn build_d_from_cells(
-        cells: &std::collections::HashMap<String, ast::Object>,
+        cells: &hashbrown::HashMap<String, ast::Object>,
     ) -> ast::Object {
         ast::Object::Map(cells.clone())
     }
@@ -2415,8 +2415,8 @@ mod tests {
     fn invoke_with_host(
         func: &Func,
         input: i64,
-        initial_cells: std::collections::HashMap<String, ast::Object>,
-    ) -> (u32, Vec<u8>, std::collections::HashMap<String, ast::Object>) {
+        initial_cells: hashbrown::HashMap<String, ast::Object>,
+    ) -> (u32, Vec<u8>, hashbrown::HashMap<String, ast::Object>) {
         let bytes = lower_to_wasm(func).expect("lower must succeed");
         let engine = Engine::default();
         let module = WiModule::new(&engine, &bytes[..]).expect("validate");
@@ -2552,7 +2552,7 @@ mod tests {
     #[test]
     fn lower_fetch_returns_numeric_cell_value_from_host() {
         // Host D has `pi = "314"`; Fetch("pi") returns Atom(314).
-        let mut cells = std::collections::HashMap::new();
+        let mut cells = hashbrown::HashMap::new();
         cells.insert("pi".to_string(), ast::Object::atom("314"));
         let f = Func::Compose(
             Box::new(Func::Fetch),
@@ -2566,7 +2566,7 @@ mod tests {
     #[test]
     fn lower_fetch_returns_string_cell_value_from_host() {
         // Non-numeric cells come back as StringAtoms.
-        let mut cells = std::collections::HashMap::new();
+        let mut cells = hashbrown::HashMap::new();
         cells.insert("motto".to_string(), ast::Object::atom("carpe diem"));
         let f = Func::Compose(
             Box::new(Func::Fetch),
@@ -2584,7 +2584,7 @@ mod tests {
         // Cells holding Seqs round-trip: each element is encoded
         // recursively as a child Atom, and a fresh outer Seq
         // collects the element ptrs.
-        let mut cells = std::collections::HashMap::new();
+        let mut cells = hashbrown::HashMap::new();
         cells.insert(
             "scores".to_string(),
             ast::Object::seq(vec![
@@ -2614,7 +2614,7 @@ mod tests {
             Box::new(Func::Fetch),
             Box::new(Func::Constant(ast::Object::atom("nonexistent"))),
         );
-        let (ptr, _, _) = invoke_with_host(&f, 0, std::collections::HashMap::new());
+        let (ptr, _, _) = invoke_with_host(&f, 0, hashbrown::HashMap::new());
         assert_eq!(ptr, 0, "missing cell → null ptr (φ)");
     }
 
@@ -2626,7 +2626,7 @@ mod tests {
             Box::new(Func::FetchOrPhi),
             Box::new(Func::Constant(ast::Object::atom("nonexistent"))),
         );
-        let (ptr, data, _) = invoke_with_host(&f, 0, std::collections::HashMap::new());
+        let (ptr, data, _) = invoke_with_host(&f, 0, hashbrown::HashMap::new());
         assert_eq!(read_u32(&data, ptr), TAG_SEQ as u32,
             "miss → empty Seq, not null ptr");
         assert_eq!(read_u32(&data, ptr + 4), 0);
@@ -2644,7 +2644,7 @@ mod tests {
                 Func::Constant(ast::Object::atom("42")),
             ])),
         );
-        let (_ptr, _, cells) = invoke_with_host(&f, 0, std::collections::HashMap::new());
+        let (_ptr, _, cells) = invoke_with_host(&f, 0, hashbrown::HashMap::new());
         assert_eq!(cells.get("result"), Some(&ast::Object::atom("42")),
             "Store landed the value in the host's cells map");
     }
@@ -2676,7 +2676,7 @@ mod tests {
             Box::new(fetch_branch),
             Box::new(store_branch),
         );
-        let (ptr, data, cells) = invoke_with_host(&f, 0, std::collections::HashMap::new());
+        let (ptr, data, cells) = invoke_with_host(&f, 0, hashbrown::HashMap::new());
         assert_eq!(cells.get("result"), Some(&ast::Object::atom("777")));
         assert_eq!(read_u32(&data, ptr), TAG_ATOM as u32);
         assert_eq!(read_i64(&data, ptr + 8), 777);
@@ -2703,7 +2703,7 @@ mod tests {
             Box::new(Func::Def("not_in_defs".to_string())),
             Box::new(Func::Constant(ast::Object::atom("42"))),
         );
-        let (ptr, _, _) = invoke_with_host(&f, 0, std::collections::HashMap::new());
+        let (ptr, _, _) = invoke_with_host(&f, 0, hashbrown::HashMap::new());
         // No DEFS resolution available → Bottom → ptr 0. The point
         // is that the module didn't trap; the host import fired
         // and returned a valid pointer value.

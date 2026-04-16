@@ -107,7 +107,7 @@ fn read_object(bytes: &[u8], cursor: &mut usize) -> Result<Object, String> {
         }
         TAG_MAP => {
             let n = read_u32(bytes, cursor)? as usize;
-            let mut m = std::collections::HashMap::with_capacity(n);
+            let mut m = hashbrown::HashMap::with_capacity(n);
             for _ in 0..n {
                 let klen = read_u32(bytes, cursor)? as usize;
                 let kend = cursor.checked_add(klen).ok_or("key length overflow")?;
@@ -180,7 +180,7 @@ mod tests {
 
     #[test]
     fn map_round_trips() {
-        let mut m = std::collections::HashMap::new();
+        let mut m = hashbrown::HashMap::new();
         m.insert("one".to_string(), Object::Atom("1".to_string()));
         m.insert("two".to_string(), Object::Atom("2".to_string()));
         m.insert("list".to_string(), Object::Seq(vec![Object::Atom("a".to_string())].into()));
@@ -198,11 +198,11 @@ mod tests {
         // Two maps with same (k,v) pairs in different insertion order
         // must produce byte-identical freeze images. Required for ROM
         // hashing and reproducible boot images.
-        let mut a = std::collections::HashMap::new();
+        let mut a = hashbrown::HashMap::new();
         a.insert("alpha".to_string(), Object::Atom("1".to_string()));
         a.insert("bravo".to_string(), Object::Atom("2".to_string()));
         a.insert("charlie".to_string(), Object::Atom("3".to_string()));
-        let mut b = std::collections::HashMap::new();
+        let mut b = hashbrown::HashMap::new();
         b.insert("charlie".to_string(), Object::Atom("3".to_string()));
         b.insert("alpha".to_string(), Object::Atom("1".to_string()));
         b.insert("bravo".to_string(), Object::Atom("2".to_string()));
