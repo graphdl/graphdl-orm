@@ -88,6 +88,12 @@ pub fn compile_to_verilog(state: &Object) -> String {
     let has_any = !entities.is_empty() || !constraint_names.is_empty() || !sm_specs.is_empty();
     if has_any {
         modules.push(emit_audit_log_module());
+        // Fact ingress / egress ports (#168). Streaming I/O using the
+        // ASCII-atom-ID convention (#189): fact-type name is a fixed
+        // 32-byte = 256-bit wire, payload is 256 bits. One module per
+        // direction so the integrator wires each independently.
+        modules.push(emit_fact_ingress_module());
+        modules.push(emit_fact_egress_module());
     }
 
     let top = emit_top_module(&entities, &constraint_names, &sm_specs);
@@ -239,6 +245,65 @@ fn emit_sm_modules(sms: &std::collections::HashMap<String, crate::types::StateMa
     (modules, specs)
 }
 
+/// Emit the fact-ingress Verilog module — the on-chip entry point for
+/// external fact assertions (webhook → FPGA, peer-to-peer message
+/// stream, Kafka topic fanned to fabric). Single-fact valid/accepted
+/// handshake; the real commit path downstream drives `accepted` based
+/// on constraint-check outputs.
+///
+/// Wire widths follow the ASCII-atom-ID convention (#189): fact-type
+/// name is fixed-width 32 bytes = 256 bits. Payload is 256 bits to
+/// match the existing entity-module column width.
+fn emit_fact_ingress_module() -> String {
+    r#"module fact_ingress (
+    input wire clk,
+    input wire rst_n,
+    input wire valid_in,
+    input wire [255:0] name,
+    input wire [255:0] payload,
+    output reg accepted
+);
+    // Stub commit path: latch accepted on valid_in after reset release.
+    // Real hardware replaces this with constraint-gated commit logic
+    // (see constraint_ok from top-level constraint aggregation).
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            accepted <= 1'b0;
+        end else begin
+            accepted <= valid_in;
+        end
+    end
+endmodule
+"#.to_string()
+}
+
+/// Emit the fact-egress Verilog module — the on-chip exit point for
+/// fact streams leaving the fabric (audit sync, replicate-to-peer,
+/// downstream SQL writer). Single-fact valid/ready handshake matching
+/// AXI-Stream discipline.
+fn emit_fact_egress_module() -> String {
+    r#"module fact_egress (
+    input wire clk,
+    input wire rst_n,
+    input wire ready_in,
+    output reg valid_out,
+    output reg [255:0] name,
+    output reg [255:0] payload
+);
+    // Stub: holds valid_out low until a real derivation-output source
+    // is wired. Integrators replace with the publish-side driver (for
+    // example the audit_log read port for log streaming).
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            valid_out <= 1'b0;
+            name      <= {256{1'b0}};
+            payload   <= {256{1'b0}};
+        end
+    end
+endmodule
+"#.to_string()
+}
+
 /// FNV-1a 32-bit hash. Used for event-code encoding in SM Verilog
 /// modules so external drivers and the SM case statement agree on
 /// the numeric code for every declared event name.
@@ -386,6 +451,28 @@ fn emit_top_module(
     out.push_str("        .rd_data(audit_rd_data),\n");
     out.push_str("        .count(audit_count),\n");
     out.push_str("        .overflow(audit_overflow)\n");
+    out.push_str("    );\n");
+    // Fact-ingress / egress ports. Ingress write-enabled off by
+    // default; egress ready held high so downstream sinks don't stall.
+    out.push_str("    wire ingress_accepted;\n");
+    out.push_str("    fact_ingress fact_ingress_inst (\n");
+    out.push_str("        .clk(clk),\n");
+    out.push_str("        .rst_n(rst_n),\n");
+    out.push_str("        .valid_in(1'b0),\n");
+    out.push_str("        .name({256{1'b0}}),\n");
+    out.push_str("        .payload({256{1'b0}}),\n");
+    out.push_str("        .accepted(ingress_accepted)\n");
+    out.push_str("    );\n");
+    out.push_str("    wire egress_valid_out;\n");
+    out.push_str("    wire [255:0] egress_name;\n");
+    out.push_str("    wire [255:0] egress_payload;\n");
+    out.push_str("    fact_egress fact_egress_inst (\n");
+    out.push_str("        .clk(clk),\n");
+    out.push_str("        .rst_n(rst_n),\n");
+    out.push_str("        .ready_in(1'b1),\n");
+    out.push_str("        .valid_out(egress_valid_out),\n");
+    out.push_str("        .name(egress_name),\n");
+    out.push_str("        .payload(egress_payload)\n");
     out.push_str("    );\n");
     // AND-reduce valids after reset release. Empty-entity edge case:
     // emit `1'b1` as the identity so the expression stays well-formed.
@@ -551,9 +638,9 @@ Noun has Object Type.
 
         let module_count = verilog.matches("module ").count();
         let endmodule_count = verilog.matches("endmodule").count();
-        // 3 entity modules + 1 audit_log + 1 top = 5.
-        assert_eq!(module_count, 5, "expected 5 module decls, got:\n{}", verilog);
-        assert_eq!(endmodule_count, 5, "module/endmodule mismatch:\n{}", verilog);
+        // 3 entity + audit_log + fact_ingress + fact_egress + top = 7.
+        assert_eq!(module_count, 7, "expected 7 module decls, got:\n{}", verilog);
+        assert_eq!(endmodule_count, 7, "module/endmodule mismatch:\n{}", verilog);
         assert!(verilog.contains("module order"));
         assert!(verilog.contains("module customer"));
         assert!(verilog.contains("module product"));
@@ -573,11 +660,13 @@ Noun has Object Type.
 
         let verilog = compile_to_verilog(&state);
 
-        // 1 entity + 1 audit_log + 1 top = 3.
-        assert_eq!(verilog.matches("module ").count(), 3);
+        // 1 entity + audit_log + fact_ingress + fact_egress + top = 5.
+        assert_eq!(verilog.matches("module ").count(), 5);
         assert!(verilog.contains("module order"));
         assert!(verilog.contains("module top"));
         assert!(verilog.contains("module audit_log"));
+        assert!(verilog.contains("module fact_ingress"));
+        assert!(verilog.contains("module fact_egress"));
         assert!(!verilog.contains("module amount"));
         assert!(!verilog.contains("module currency_code"));
         assert!(!verilog.contains("module priority"));
@@ -660,8 +749,8 @@ Supplier supplies Widget.
         assert!(verilog.contains("module widget"));
         assert!(verilog.contains("module supplier"));
         assert!(verilog.contains("module top"));
-        // 2 entity modules + 1 audit_log + 1 top = 4 endmodule markers.
-        assert_eq!(verilog.matches("endmodule").count(), 4);
+        // 2 entity + audit_log + fact_ingress + fact_egress + top = 6.
+        assert_eq!(verilog.matches("endmodule").count(), 6);
     }
 
     /// Verilog output is well-formed: every module has clk/rst_n ports,
@@ -791,6 +880,55 @@ Supplier supplies Widget.
     }
 
     // ── Audit-log Verilog ring buffer (#167) ──
+
+    // ── Fact ingress / egress ports (#168) ──
+
+    #[test]
+    fn fact_ingress_and_egress_emitted_with_state() {
+        let state = state_with_nouns(&[("Widget", "entity")]);
+        let verilog = compile_to_verilog(&state);
+        assert!(verilog.contains("module fact_ingress"),
+            "missing fact_ingress module:\n{}", verilog);
+        assert!(verilog.contains("module fact_egress"),
+            "missing fact_egress module:\n{}", verilog);
+    }
+
+    #[test]
+    fn fact_ingress_uses_fixed_width_ascii_name_port() {
+        // ASCII atom ID convention (#189): name is a fixed-width 256-bit
+        // (32-byte) port, matching the atom_id_is_valid runtime guard.
+        let state = state_with_nouns(&[("Widget", "entity")]);
+        let verilog = compile_to_verilog(&state);
+        assert!(verilog.contains("input wire [255:0] name"),
+            "fact_ingress must expose a 256-bit name port:\n{}", verilog);
+        assert!(verilog.contains("input wire valid_in"));
+        assert!(verilog.contains("output reg accepted"));
+    }
+
+    #[test]
+    fn fact_egress_provides_axis_style_streaming() {
+        let state = state_with_nouns(&[("Widget", "entity")]);
+        let verilog = compile_to_verilog(&state);
+        // Valid/ready handshake + name/payload data bus.
+        assert!(verilog.contains("input wire ready_in"));
+        assert!(verilog.contains("output reg valid_out"));
+        assert!(verilog.contains("output reg [255:0] name"));
+        assert!(verilog.contains("output reg [255:0] payload"));
+    }
+
+    #[test]
+    fn top_instantiates_fact_io_modules() {
+        let state = state_with_nouns(&[("Widget", "entity")]);
+        let verilog = compile_to_verilog(&state);
+        assert!(verilog.contains("fact_ingress fact_ingress_inst ("),
+            "top must instantiate fact_ingress:\n{}", verilog);
+        assert!(verilog.contains("fact_egress fact_egress_inst ("),
+            "top must instantiate fact_egress:\n{}", verilog);
+        // Integrator-replaceable defaults: ingress valid tied low,
+        // egress ready tied high.
+        assert!(verilog.contains(".valid_in(1'b0)"));
+        assert!(verilog.contains(".ready_in(1'b1)"));
+    }
 
     #[test]
     fn audit_log_emitted_when_state_has_entities() {
@@ -999,9 +1137,9 @@ Supplier supplies Widget.
         let verilog = compile_to_verilog(&state);
         let modules = verilog.matches("module ").count();
         let endmodules = verilog.matches("endmodule").count();
-        // 4 entity modules + 1 audit_log + 1 top = 6.
-        assert_eq!(modules, 6, "4 entities + 1 audit_log + 1 top = 6 module decls");
-        assert_eq!(endmodules, 6);
+        // 4 entity + audit_log + fact_ingress + fact_egress + top = 8.
+        assert_eq!(modules, 8, "4 entities + audit + ingress + egress + top = 8");
+        assert_eq!(endmodules, 8);
         assert_eq!(modules, endmodules);
     }
 }
