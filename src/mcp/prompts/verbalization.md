@@ -534,9 +534,11 @@ Front text (text before the first object placeholder) is also supported:
 
 **(Halpin & Curland, "Automated Verbalization for ORM 2", Proc. CAiSE'06 Workshops)**
 
-### Cross-Domain Noun References
+### Global Noun Visibility
 
-**Never redeclare nouns.** If a noun is defined in another domain, reference it by name. Redeclaring creates duplicate records in the metamodel. The domain system resolves cross-domain references automatically.
+**Nouns and fact types are globally visible within an Organization.** A Noun declared in one Domain is automatically available in every other Domain of the same Org — no `## Cross-domain References` block is needed, and references cannot be scoped to a particular Domain. If you find yourself writing `Customer (from customer-auth)`, drop the `(from ...)` part; it is pure documentation with no semantic effect.
+
+**Never redeclare nouns.** If a noun is already declared anywhere in the Org, use its name. Redeclaring creates duplicate records in the metamodel and confuses the compiler's RMAP step.
 
 ## FORML2 Document Structure
 
