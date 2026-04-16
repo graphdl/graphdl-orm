@@ -1,0 +1,40 @@
+# crates/arest-kernel/Cargo.toml
+#
+# x86_64 bare-metal kernel for AREST. Builds for the stable built-in
+# target `x86_64-unknown-none` (no std, no libc). Uses the rust-osdev
+# `bootloader` crate to wrap the kernel into a bootable disk image —
+# the bootloader handles Multiboot2 internally and hands the kernel a
+# populated `BootInfo` at entry time.
+#
+# Build:
+#   cargo build --release
+# Run:
+#   (follow-up commit — needs the bootloader image-builder task to
+#   produce an .img and a qemu-system-x86_64 launch script)
+
+[package]
+name = "arest-kernel"
+version = "0.1.0"
+edition = "2021"
+description = "AREST bare-metal kernel for x86_64"
+license = "MIT"
+
+[[bin]]
+name = "arest-kernel"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+# Public ABI with the bootloader crate. Just the trait / entry_point
+# macro / BootInfo struct — no code that touches the host OS. Works
+# on x86_64-unknown-none without any feature gymnastics.
+bootloader_api = "0.11"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = 3
+lto = "thin"
