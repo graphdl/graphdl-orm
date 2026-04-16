@@ -12,10 +12,14 @@
 // `alloc::boxed::Box` / `alloc::vec::Vec` resolve in both default
 // (std) and `no_std` builds. Under std, `alloc` is part of the
 // sysroot and re-exported through `std::*`; under `no_std` the same
-// crate is the only source of heap-allocated types. Every AREST
-// site that used to reach `std::sync::*` now goes through
-// `crate::sync::*` (spin-based, see sync.rs) during the staged
-// conversion (#174).
+// crate is the only source of heap-allocated types.
+//
+// `#[macro_use]` pulls the `vec!` and `format!` macros into the
+// crate root so call sites can use them bare. Under std these are
+// also in the prelude (via `std::vec` / `std::format`), so the
+// macro_use import is a no-op there; under `no_std` it is the only
+// way to get those macros without a per-file `use alloc::vec;`.
+#[macro_use]
 extern crate alloc;
 
 pub mod sync;

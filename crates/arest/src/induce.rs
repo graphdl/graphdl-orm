@@ -15,7 +15,7 @@
 //   - SS induction: is one fact type's population a subset of another's?
 //   - Pattern induction: can one fact type be derived from others?
 
-use std::collections::{HashMap, HashSet};
+use hashbrown::{HashMap, HashSet};
 use crate::types::*;
 use crate::ast::{self, Object};
 

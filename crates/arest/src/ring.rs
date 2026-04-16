@@ -18,7 +18,7 @@
 // (capacity, element-shape) pair, so the source-level definition is
 // the authority regardless of whether it runs in software or silicon.
 
-use std::collections::VecDeque;
+use alloc::collections::VecDeque;
 
 /// Append-only ring with a compile-time-unknown but fixed-per-instance
 /// capacity. `cap == 0` is rejected at construction — a zero-capacity
