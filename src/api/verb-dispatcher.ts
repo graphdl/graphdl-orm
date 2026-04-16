@@ -67,15 +67,41 @@ export async function dispatchVerb(
 
     case 'check':
     case 'verify': {
-      // `verify` aliases `check` for the readings-string path. The
-      // domain-compiled-state path lands with #202 (needs validation.md
-      // wired through the engine).
-      const { readings } = body as { readings?: string }
-      if (readings === undefined) throw new Error(`${verb} requires \`readings\``)
-      const raw = engine.system(h, 'check', readings)
-      const diagnostics: Diagnostic[] = raw ? raw.split('\n').map(parseDiagLine) : []
-      const hasError = diagnostics.some((d) => d.level === 'error')
-      return envelope({ ok: !hasError, diagnostics })
+      // #202: dispatch on body shape.
+      // - body has `readings`: run check (diagnostics path)
+      // - body has `domain`: run structural verification against compiled domain state
+      // - default (no fields): return current domain health summary
+      const { readings, domain } = body as { readings?: string; domain?: string }
+
+      if (readings !== undefined) {
+        // readings-string path (original behaviour)
+        const raw = engine.system(h, 'check', readings)
+        const diagnostics: Diagnostic[] = raw ? raw.split('\n').map(parseDiagLine) : []
+        const hasError = diagnostics.some((d) => d.level === 'error')
+        return envelope({ ok: !hasError, diagnostics })
+      }
+
+      if (domain !== undefined) {
+        // structural verification: validate compiled state for the named domain
+        const raw = engine.system(h, 'verify', domain)
+        const diagnostics: Diagnostic[] = raw ? raw.split('\n').map(parseDiagLine) : []
+        const hasError = diagnostics.some((d) => d.level === 'error')
+        return envelope({ ok: !hasError, domain, diagnostics })
+      }
+
+      // default: current domain health summary
+      const debugRaw = engine.system(h, 'debug', '')
+      const schema = safeJson(debugRaw) as Record<string, unknown> | null
+      const nounCount = schema ? Object.keys((schema as any).nouns ?? {}).length : 0
+      const factTypeCount = schema ? Object.keys((schema as any).factTypes ?? {}).length : 0
+      const constraintCount = schema ? ((schema as any).constraints ?? []).length : 0
+      return envelope({
+        ok: true,
+        handle: h,
+        nounCount,
+        factTypeCount,
+        constraintCount,
+      })
     }
 
     case 'explain': {
