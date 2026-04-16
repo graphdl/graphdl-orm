@@ -73,20 +73,30 @@ pub fn check_readings(text: &str) -> Vec<ReadingDiagnostic> {
     // Layer 2a: Derivation rules whose antecedents didn't all resolve.
     // parse_forml2 filter_maps unresolved antecedents silently today;
     // we detect the loss by comparing antecedent_fact_type_ids.len()
-    // against the number of " and "-joined parts after the if/iff
-    // split. A drop is a Resolve-layer Warning.
+    // against the number of clauses after splitting on " and " / " or ".
+    // Value-comparison predicates (starts with, exceeds, in range,
+    // within, equals, contains, matches) are inherently non-FT — they
+    // resolve through the arithmetic/comparison pipeline, not through
+    // fact-type lookup. We count them as implicitly resolved.
     for rule in &ir.derivation_rules {
         let antecedent_text = rule.text
             .find(" iff ").map(|i| &rule.text[i + 5..])
             .or_else(|| rule.text.find(" if ").map(|i| &rule.text[i + 4..]))
             .unwrap_or("");
-        let part_count = antecedent_text.split(" and ")
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
+        // Split on both " and " and " or " — FORML 2 derivation
+        // bodies use both connectives.
+        let clauses: Vec<&str> = split_connectives(antecedent_text);
+        let part_count = clauses.len();
+        // Value-comparison clauses resolve through the comparison
+        // pipeline, not fact-type lookup. Don't count them as
+        // unresolved.
+        let comparison_count = clauses.iter()
+            .filter(|c| is_value_comparison_clause(c))
             .count();
         let resolved_count = rule.antecedent_fact_type_ids.len()
             + rule.consequent_aggregates.len()
-            + rule.consequent_computed_bindings.len();
+            + rule.consequent_computed_bindings.len()
+            + comparison_count;
         if part_count > 0 && resolved_count < part_count {
             diags.push(ReadingDiagnostic {
                 line: 0,
@@ -94,9 +104,9 @@ pub fn check_readings(text: &str) -> Vec<ReadingDiagnostic> {
                 level: Level::Warning,
                 source: Source::Resolve,
                 message: format!(
-                    "derivation rule has {part_count} antecedent clause(s) but only {resolved_count} resolved to a fact type, aggregate, or computed binding",
+                    "derivation rule has {part_count} antecedent clause(s) but only {resolved_count} resolved to a fact type, aggregate, computed binding, or value comparison",
                 ),
-                suggestion: Some("check that every `and`-joined clause references a declared fact type or uses a known arithmetic / aggregate shape".to_string()),
+                suggestion: Some("check that every clause references a declared fact type, uses a known comparison (starts with, exceeds, in range), or uses an arithmetic / aggregate shape".to_string()),
             });
         }
     }
@@ -246,6 +256,67 @@ pub fn check_readings(text: &str) -> Vec<ReadingDiagnostic> {
     }
 
     diags
+}
+
+/// Split a derivation-rule body on both `" and "` and `" or "`
+/// connectives, returning individual clauses. FORML 2 bodies use
+/// both (e.g., `X iff A and B or C`).
+fn split_connectives(text: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        // Find the earliest connective.
+        let and_pos = rest.find(" and ");
+        let or_pos = rest.find(" or ");
+        match (and_pos, or_pos) {
+            (Some(a), Some(o)) if a <= o => {
+                let chunk = rest[..a].trim();
+                if !chunk.is_empty() { parts.push(chunk); }
+                rest = &rest[a + 5..];
+            }
+            (Some(_), Some(o)) | (None, Some(o)) => {
+                let chunk = rest[..o].trim();
+                if !chunk.is_empty() { parts.push(chunk); }
+                rest = &rest[o + 4..];
+            }
+            (Some(a), None) => {
+                let chunk = rest[..a].trim();
+                if !chunk.is_empty() { parts.push(chunk); }
+                rest = &rest[a + 5..];
+            }
+            (None, None) => {
+                let chunk = rest.trim();
+                if !chunk.is_empty() { parts.push(chunk); }
+                break;
+            }
+        }
+    }
+    parts
+}
+
+/// Recognize value-comparison predicates that resolve through the
+/// comparison pipeline rather than fact-type lookup. These appear in
+/// derivation-rule bodies as inline predicates:
+///   - "URI starts with 'https://'"
+///   - "amount exceeds threshold"
+///   - "HTTP Status in range 200"
+///   - "Timestamp within Interval"
+///   - "Email Address Domain equals 'driv.ly'"
+///   - "Name contains 'pattern'"
+///   - "Code matches 'regex'"
+fn is_value_comparison_clause(clause: &str) -> bool {
+    let lower = clause.to_lowercase();
+    let comparison_verbs = [
+        " starts with ", " ends with ", " contains ",
+        " matches ", " exceeds ", " in range ",
+        " within ", " equals ", " greater than ",
+        " less than ", " not equal ", " at least ",
+        " at most ", " before ", " after ",
+    ];
+    // Quoted-value predicates: `X has Y 'literal'` or `X 'literal'`
+    let has_quoted_value = clause.contains('\'') || clause.contains('"');
+    comparison_verbs.iter().any(|v| lower.contains(v))
+        || (has_quoted_value && lower.contains(" has "))
 }
 
 #[cfg(test)]
