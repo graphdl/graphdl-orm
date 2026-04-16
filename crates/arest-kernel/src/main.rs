@@ -7,24 +7,26 @@
 //
 // Current boot pipeline:
 //   BIOS / UEFI
-//     └─> bootloader (Multiboot2 stage, GRUB-compatible, built by the
-//         arest-kernel-image crate in a follow-up commit)
+//     └─> bootloader (Multiboot2 stage, built by arest-kernel-image)
 //           └─> kernel_main(&'static mut BootInfo) -> !
+//                 └─> allocator::init() — 1 MiB static heap
 //                 └─> SERIAL.lock() banner
 //                 └─> hlt loop
 //
-// Today this is MVP plumbing — a kernel that wakes up, writes a
-// banner over the 8250 UART (COM1 @ 0x3F8), and halts. No AREST
+// Today this is MVP plumbing — a kernel that wakes up, brings up the
+// allocator and serial console, prints a banner, and halts. No AREST
 // engine integration yet; that follows #174 landing no_std-clean
 // versions of the core modules (#182 baked metamodel, #183 REPL).
-// Uses only `core` primitives plus `uart_16550` (serial driver) and
-// `spin` (lock) — `alloc` enters once the allocator is wired (#178).
 
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
+mod allocator;
 mod serial;
 
+use alloc::string::ToString;
 use bootloader_api::{BootInfo, entry_point};
 use core::panic::PanicInfo;
 
@@ -36,9 +38,17 @@ entry_point!(kernel_main);
 /// ignore it for now — the MVP goal is "a running kernel that
 /// proves the toolchain and image pipeline work end-to-end."
 fn kernel_main(_boot_info: &'static mut BootInfo) -> ! {
+    allocator::init();
+
     println!("AREST kernel online");
     println!("  target: x86_64-unknown-none");
-    println!("  stage:  MVP boot, no engine wired yet (#182)");
+    println!("  heap:   1 MiB static (#178)");
+
+    // Prove the allocator works — allocate a String and echo it.
+    // Once #182 lands this becomes the baked-metamodel thaw path.
+    let greeting = "heap is live".to_string();
+    println!("  alloc: {greeting}");
+
     halt_forever();
 }
 
@@ -55,9 +65,6 @@ fn halt_forever() -> ! {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    // Best-effort panic banner over serial. Use the raw writer
-    // (bypassing the lock) in case the panic fired while the lock
-    // was held — a poisoned lock would deadlock the panic path.
     println!("\n!! AREST kernel panic !!");
     println!("{info}");
     halt_forever();
