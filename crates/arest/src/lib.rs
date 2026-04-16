@@ -305,6 +305,7 @@ impl CompiledState {
     /// the current state (rare — means the noun was never compiled).
     /// Returns `StaleSnapshot` if a concurrent writer modified a
     /// target cell since the snapshot. Returns `Committed` on success.
+    #[allow(dead_code)]
     fn try_commit_declared(
         &self,
         snapshot: &ast::Object,
@@ -357,6 +358,7 @@ impl CompiledState {
     /// contain `"_<noun>_"` / `"_<noun>"` (handles RMAP-derived FT
     /// cells like `Order_has_total`, `Order_has_Amount`). `audit_log`
     /// is always included.
+    #[allow(dead_code)]
     fn cells_for_noun(&self, noun: &str) -> Vec<String> {
         let prefix = format!("{}_", noun);
         let infix  = format!("_{}_", noun);
@@ -808,6 +810,7 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
 /// FT cells (e.g. `Order_has_total`, `Order_has_Amount`) in the
 /// declared set so that `try_commit_declared` covers every cell the
 /// verb may touch. Extra targets cost one no-op CAS each — cheap.
+#[allow(dead_code)]
 fn write_targets_for_key(key: &str, st: &CompiledState) -> Option<Vec<String>> {
     let (verb, noun) = key.split_once(':')?;
     match verb {
