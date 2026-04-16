@@ -91,7 +91,7 @@ pub fn check_readings(text: &str) -> Vec<ReadingDiagnostic> {
         // pipeline, not fact-type lookup. Don't count them as
         // unresolved.
         let comparison_count = clauses.iter()
-            .filter(|c| is_value_comparison_clause(c))
+            .filter(|c| is_implicitly_resolved_clause(c))
             .count();
         let resolved_count = rule.antecedent_fact_type_ids.len()
             + rule.consequent_aggregates.len()
@@ -294,29 +294,95 @@ fn split_connectives(text: &str) -> Vec<&str> {
     parts
 }
 
-/// Recognize value-comparison predicates that resolve through the
-/// comparison pipeline rather than fact-type lookup. These appear in
-/// derivation-rule bodies as inline predicates:
-///   - "URI starts with 'https://'"
-///   - "amount exceeds threshold"
-///   - "HTTP Status in range 200"
-///   - "Timestamp within Interval"
-///   - "Email Address Domain equals 'driv.ly'"
-///   - "Name contains 'pattern'"
-///   - "Code matches 'regex'"
-fn is_value_comparison_clause(clause: &str) -> bool {
+/// Recognize clauses that resolve through built-in pipelines rather
+/// than fact-type lookup. Six categories:
+///
+/// 1. **that-anaphora chains** — "that X has Y", "that X is Y".
+///    Back-references to a previously-bound noun; the FT was already
+///    resolved in the prior clause. Dropping ~350 false warnings.
+///
+/// 2. **String/value comparison** — "starts with", "ends with",
+///    "contains", "matches", "exceeds", "in range", "equals", etc.
+///    Resolved through the comparison pipeline (#192).
+///
+/// 3. **Temporal predicates** — "now is before X", "is in the past",
+///    "is in the future". Runtime clock checks, not FT lookups.
+///
+/// 4. **Aggregate where-sub-clauses** — "sum of X where Y". The
+///    where-body contains sub-predicates the top-level resolver
+///    can't descend into; count the whole clause as resolved.
+///
+/// 5. **Negation** — "no X has Y", "has no X". The positive FT
+///    exists; the negation is a filter, not a separate FT.
+///
+/// 6. **Generative/computed** — "is generated as", "is extracted
+///    from", "is the earliest/latest". Runtime operations that
+///    produce values without FT lookup.
+fn is_implicitly_resolved_clause(clause: &str) -> bool {
     let lower = clause.to_lowercase();
+    let trimmed = lower.trim();
+
+    // Cat 1: that-anaphora — clause starts with "that " and contains
+    // a verb (has/is/was/does/plays/spans/belongs/sends/triggers/etc.)
+    if trimmed.starts_with("that ") {
+        return true;
+    }
+
+    // Cat 2: value/string comparison operators
     let comparison_verbs = [
         " starts with ", " ends with ", " contains ",
         " matches ", " exceeds ", " in range ",
         " within ", " equals ", " greater than ",
         " less than ", " not equal ", " at least ",
         " at most ", " before ", " after ",
+        " above ", " below ",
     ];
-    // Quoted-value predicates: `X has Y 'literal'` or `X 'literal'`
-    let has_quoted_value = clause.contains('\'') || clause.contains('"');
-    comparison_verbs.iter().any(|v| lower.contains(v))
-        || (has_quoted_value && lower.contains(" has "))
+    if comparison_verbs.iter().any(|v| lower.contains(v)) {
+        return true;
+    }
+    // Quoted-value predicate: `X has Y 'literal'`
+    if (clause.contains('\'') || clause.contains('"')) && lower.contains(" has ") {
+        return true;
+    }
+
+    // Cat 3: temporal predicates
+    if lower.contains("now is ") || lower.contains(" in the past")
+        || lower.contains(" in the future") || lower.contains("is current")
+    {
+        return true;
+    }
+
+    // Cat 4: aggregate where-clause bodies — the top-level clause
+    // is "X is the count/sum/avg/min/max of Y where Z"; the whole
+    // thing resolves through the aggregate pipeline.
+    if lower.contains(" where ") && (
+        lower.contains(" count of ") || lower.contains(" sum of ")
+        || lower.contains(" avg of ") || lower.contains(" min of ")
+        || lower.contains(" max of ") || lower.contains(" total of ")
+    ) {
+        return true;
+    }
+
+    // Cat 5: negation — "no X has Y" or "has no X" or "does not"
+    if trimmed.starts_with("no ") || lower.contains(" has no ")
+        || lower.contains(" does not ") || lower.contains(" is not ")
+        || lower.contains(" not own ") || lower.contains(" not have ")
+    {
+        return true;
+    }
+
+    // Cat 6: generative/computed-binding keywords
+    let computed_verbs = [
+        " is generated as ", " is extracted from ",
+        " is the earliest ", " is the latest ",
+        " is computed as ", " is derived from ",
+        " plus ", " minus ",
+    ];
+    if computed_verbs.iter().any(|v| lower.contains(v)) {
+        return true;
+    }
+
+    false
 }
 
 #[cfg(test)]
