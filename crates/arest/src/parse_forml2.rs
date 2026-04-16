@@ -1473,10 +1473,15 @@ fn resolve_derivation_rule(rule: &mut DerivationRuleDef, ir: &Domain, catalog: &
     };
 
     // Resolve a text fragment to a Fact Type ID via rho-lookup through the catalog.
+    // Strips subscripts (Person1 → Person) before catalog lookup — find_nouns
+    // captures the subscripted token, but the catalog keys are base nouns.
     let resolve_fact_type = |fragment: &str| -> Option<String> {
         let cleaned = strip_anaphora(fragment);
         let found_nouns: Vec<(usize, usize, String)> = find_nouns(&cleaned, &noun_names);
-        let role_refs: Vec<&str> = found_nouns.iter().map(|(_, _, n)| n.as_str()).collect();
+        let base_refs: Vec<String> = found_nouns.iter()
+            .map(|(_, _, n)| parse_role_token(n).0.to_string())
+            .collect();
+        let role_refs: Vec<&str> = base_refs.iter().map(|s| s.as_str()).collect();
 
         // Extract the verb: text between the first and second noun
         let verb = found_nouns.windows(2)
@@ -2001,19 +2006,39 @@ fn find_nouns(text: &str, noun_names: &[String]) -> Vec<(usize, usize, String)> 
     // Foldl over longest-first noun list. Accumulator is (matches, used_ranges).
     // Inner loop over occurrences of `name` in `text` uses Backus's `while`
     // combining form (sequential scan of positions).
+    //
+    // Halpin ring rules distinguish same-type roles by numeric subscripts
+    // (Person1, Person2, Person3 — see Example 6 in the FORML position
+    // paper). When the match is followed by ASCII digits we treat them
+    // as a subscript and extend the captured range to include them; the
+    // returned token ("Person3") preserves subscript identity so join-
+    // key detection downstream works, and parse_role_token strips it to
+    // the base ("Person") before catalog lookup.
     let (mut matches, _): (Vec<(usize, usize, String)>, Vec<(usize, usize)>) = sorted.iter().fold(
         (Vec::new(), Vec::new()),
         |(mut matches, mut used), name| {
             let mut pos = 0;
             while let Some(found) = text[pos..].find(name.as_str()) {
                 let start = pos + found;
-                let end = start + name.len();
+                let mut end = start + name.len();
                 let before_ok = start == 0 || !text.as_bytes()[start - 1].is_ascii_alphanumeric();
+                // Extend end past any trailing ASCII digit subscript.
+                while end < text.len() && text.as_bytes()[end].is_ascii_digit() {
+                    end += 1;
+                }
+                // After the (possibly-extended) end, the next byte must
+                // not be alphanumeric — otherwise the match was part of
+                // a longer identifier.
                 let after_ok = end >= text.len() || !text.as_bytes()[end].is_ascii_alphanumeric();
                 let no_overlap = !used.iter().any(|&(s, e)| start < e && end > s);
 
                 if before_ok && after_ok && no_overlap {
-                    matches.push((start, end, name.to_string()));
+                    // Capture the subscripted token (e.g. "Person3") so
+                    // callers distinguish the ring positions. The base
+                    // name is recovered via parse_role_token at the
+                    // resolve site.
+                    let captured = &text[start..end];
+                    matches.push((start, end, captured.to_string()));
                     used.push((start, end));
                 }
                 pos = start + 1;
@@ -2501,6 +2526,40 @@ mod tests {
     // compile_join_derivation — so attribute style is structurally
     // redundant. This test uses non-ring fact types (no subscripts) to
     // demonstrate the pattern that makes attribute style unnecessary.
+
+    #[test]
+    fn find_nouns_captures_subscripted_tokens() {
+        // #197 fix: find_nouns now captures the subscripted form
+        // ("Person3") rather than rejecting the match because of the
+        // trailing digit. The base noun is recoverable via
+        // parse_role_token.
+        let noun_names = vec!["Person".to_string()];
+        let matches = find_nouns("Person1 is brother of Person3", &noun_names);
+        assert_eq!(matches.len(), 2, "two ring positions, got {:?}", matches);
+        assert_eq!(matches[0].2, "Person1");
+        assert_eq!(matches[1].2, "Person3");
+        // Base recovery preserves subscript-free form.
+        assert_eq!(parse_role_token(&matches[0].2).0, "Person");
+        assert_eq!(parse_role_token(&matches[1].2).0, "Person");
+    }
+
+    #[test]
+    fn find_nouns_still_rejects_alphanumeric_overruns() {
+        // Regression: `Person` in `Personal` is still NOT a match —
+        // only trailing digits count as subscripts; letters don't.
+        let noun_names = vec!["Person".to_string()];
+        let matches = find_nouns("Personal belongings", &noun_names);
+        assert_eq!(matches.len(), 0, "`Personal` must not match `Person`");
+    }
+
+    #[test]
+    fn find_nouns_rejects_leading_alphanumeric() {
+        // Regression: `Super Person` doesn't match `Person` either —
+        // the before-boundary check stays strict.
+        let noun_names = vec!["Person".to_string()];
+        let matches = find_nouns("SuperPerson rules", &noun_names);
+        assert_eq!(matches.len(), 0);
+    }
 
     #[test]
     fn path_composition_via_relational_join_parses_as_join() {
