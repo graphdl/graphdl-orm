@@ -38,6 +38,13 @@ uart_16550 = "0.3"
 # be locked from any context including the panic handler. spin::Mutex
 # never blocks the way std::sync::Mutex would; fine on bare metal.
 spin = "0.9"
+# Global allocator for `alloc` (Box / Vec / String / format!). The
+# `LockedHeap` type is a spin-guarded linked-list free-list allocator
+# that can be placed in a `static`. We initialise it from a fixed
+# static-buffer heap in allocator::init() at boot. Once the bootloader
+# memory map handling lands (#180) this will switch to a dynamic
+# region picked from `BootInfo.memory_regions`.
+linked_list_allocator = "0.10"
 
 [profile.dev]
 panic = "abort"
