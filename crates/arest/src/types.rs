@@ -124,6 +124,12 @@ pub struct DerivationRuleDef {
     ///     Type has Role.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub consequent_aggregates: Vec<ConsequentAggregate>,
+    /// Clauses the parser saw in the derivation body but could not
+    /// classify into any known form (FT reference, comparison,
+    /// aggregate, computed binding, anaphora, negation). The checker
+    /// reports these directly — no parallel heuristic needed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unresolved_clauses: Vec<String>,
 }
 
 /// Numeric comparison that further restricts a derivation antecedent.
