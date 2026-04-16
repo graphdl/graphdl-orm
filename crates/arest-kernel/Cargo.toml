@@ -30,6 +30,14 @@ bench = false
 # macro / BootInfo struct — no code that touches the host OS. Works
 # on x86_64-unknown-none without any feature gymnastics.
 bootloader_api = "0.11"
+# 8250 / 16550 UART driver. Gives us a `SerialPort` struct with
+# `core::fmt::Write` implemented — that's what lets `write!` and
+# `writeln!` format directly into serial output.
+uart_16550 = "0.3"
+# Spin-based Mutex so SERIAL (the global SerialPort singleton) can
+# be locked from any context including the panic handler. spin::Mutex
+# never blocks the way std::sync::Mutex would; fine on bare metal.
+spin = "0.9"
 
 [profile.dev]
 panic = "abort"
