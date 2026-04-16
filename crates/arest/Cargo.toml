@@ -43,9 +43,10 @@ wasm-lower = ["dep:wasm-encoder", "dep:wasmi"]
 # `std`/`no_std` split so the crate can be embedded in bare-metal
 # contexts (FPGA soft-cores, x86_64 kernel via #175+). Enable via:
 #   cargo check --no-default-features --features no_std
-# Pulls `hashbrown` for HashMap replacement and `spin` for
-# RwLock/Mutex/OnceLock replacements.
-no_std = ["dep:spin"]
+# Pulls `hashbrown` (HashMap) and `spin` (RwLock/Mutex/OnceLock),
+# both of which are unconditional deps — the feature flag only
+# toggles std / core / alloc selection in the crate itself.
+no_std = []
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -77,7 +78,7 @@ wasmi = { version = "0.50", optional = true }
 # spin provides Mutex / RwLock / Once on bare metal where `std::sync`
 # isn't available (no OS to block against — spin-locks instead).
 hashbrown = { version = "0.14", features = ["serde"] }
-spin = { version = "0.9", default-features = false, features = ["mutex", "spin_mutex", "rwlock", "once"], optional = true }
+spin = { version = "0.9", default-features = false, features = ["mutex", "spin_mutex", "rwlock", "once"] }
 
 [dev-dependencies]
 

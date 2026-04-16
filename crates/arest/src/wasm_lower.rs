@@ -2542,7 +2542,7 @@ mod tests {
         // Func::Native wraps a Rust closure — truly impossible to
         // ship across the FFI boundary. Left as the only remaining
         // unsupported-variant sentinel.
-        let f = Func::Native(std::sync::Arc::new(|x| x.clone()));
+        let f = Func::Native(crate::sync::Arc::new(|x| x.clone()));
         let err = lower_to_wasm(&f).expect_err("Native should be unsupported");
         assert!(err.contains("not yet supported"));
     }
