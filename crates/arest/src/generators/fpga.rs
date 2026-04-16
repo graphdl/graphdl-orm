@@ -106,6 +106,10 @@ pub fn compile_to_verilog(state: &Object) -> String {
         // direction so the integrator wires each independently.
         modules.push(emit_fact_ingress_module());
         modules.push(emit_fact_egress_module());
+        // Boot-sequence FSM (#170). Sequences post-reset bring-up:
+        // LOAD_ROM -> INIT_BRAM -> READY. Back-pressures ingress
+        // until BRAMs are warm.
+        modules.push(emit_boot_fsm_module());
     }
     let _ = bram_specs;  // reserved for later top-level wiring work
 
@@ -322,6 +326,79 @@ module tb_top;
         $display("t=%0t cycle=%0d rst_n=%b all_valid=%b constraint_ok=%b",
                  $time, cycle, rst_n, all_valid, constraint_ok);
         if (cycle >= 20) $finish;
+    end
+endmodule
+"#.to_string()
+}
+
+/// Emit the top-level boot-sequence state machine (#170). Sequences
+/// post-reset bring-up across every other FPGA-generator module:
+///
+///   RESET (rst_n low)
+///     → LOAD_ROM (stream the freeze/thaw metamodel image from ROM)
+///       → INIT_BRAM (zero / preload each per-noun BRAM bank)
+///         → READY (reducer + constraint pipeline accepting events)
+///
+/// The FSM holds `ready` low through LOAD_ROM and INIT_BRAM so the
+/// fact-ingress port (#168) back-pressures until BRAMs are warm. Once
+/// READY, `ready` latches high for the life of the tenant.
+///
+/// Per-phase cycle counts are conservative defaults (16 cycles per
+/// phase) — downstream integrators replace with real
+/// ROM-size-derived values. The state encoding is 2 bits so the FSM
+/// synthesizes down to two FFs + a few comparators.
+fn emit_boot_fsm_module() -> String {
+    r#"module boot_fsm (
+    input wire clk,
+    input wire rst_n,
+    output reg ready,
+    output reg [1:0] phase,
+    // Phase progress counter — flips LOAD_ROM -> INIT_BRAM -> READY
+    // after a conservative default cycle budget. Integrators override.
+    input wire [7:0] phase_cycles
+);
+    // Phase codes — 2 bits so the synthesiser collapses to two FFs.
+    localparam [1:0] PHASE_RESET    = 2'd0;
+    localparam [1:0] PHASE_LOAD_ROM = 2'd1;
+    localparam [1:0] PHASE_INIT_BRAM = 2'd2;
+    localparam [1:0] PHASE_READY    = 2'd3;
+
+    reg [7:0] counter;
+
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            phase   <= PHASE_RESET;
+            counter <= 8'd0;
+            ready   <= 1'b0;
+        end else begin
+            case (phase)
+                PHASE_RESET: begin
+                    phase   <= PHASE_LOAD_ROM;
+                    counter <= 8'd0;
+                end
+                PHASE_LOAD_ROM: begin
+                    if (counter >= phase_cycles) begin
+                        phase   <= PHASE_INIT_BRAM;
+                        counter <= 8'd0;
+                    end else begin
+                        counter <= counter + 1;
+                    end
+                end
+                PHASE_INIT_BRAM: begin
+                    if (counter >= phase_cycles) begin
+                        phase   <= PHASE_READY;
+                        ready   <= 1'b1;
+                    end else begin
+                        counter <= counter + 1;
+                    end
+                end
+                PHASE_READY: begin
+                    // Latched — stays high for the tenant's lifetime.
+                    ready <= 1'b1;
+                end
+                default: phase <= PHASE_RESET;
+            endcase
+        end
     end
 endmodule
 "#.to_string()
@@ -832,9 +909,9 @@ Noun has Object Type.
 
         let module_count = verilog.matches("module ").count();
         let endmodule_count = verilog.matches("endmodule").count();
-        // 3 entity + 3 bram + audit + ingress + egress + top = 10.
-        assert_eq!(module_count, 10, "expected 10 module decls, got:\n{}", verilog);
-        assert_eq!(endmodule_count, 10, "module/endmodule mismatch:\n{}", verilog);
+        // 3 entity + 3 bram + audit + ingress + egress + boot_fsm + top = 11.
+        assert_eq!(module_count, 11, "expected 11 module decls, got:\n{}", verilog);
+        assert_eq!(endmodule_count, 11, "module/endmodule mismatch:\n{}", verilog);
         assert!(verilog.contains("module order"));
         assert!(verilog.contains("module customer"));
         assert!(verilog.contains("module product"));
@@ -854,8 +931,8 @@ Noun has Object Type.
 
         let verilog = compile_to_verilog(&state);
 
-        // 1 entity + 1 bram + audit_log + fact_ingress + fact_egress + top = 6.
-        assert_eq!(verilog.matches("module ").count(), 6);
+        // 1 entity + 1 bram + audit + ingress + egress + boot_fsm + top = 7.
+        assert_eq!(verilog.matches("module ").count(), 7);
         assert!(verilog.contains("module order"));
         assert!(verilog.contains("module order_bram"));
         assert!(verilog.contains("module top"));
@@ -944,8 +1021,8 @@ Supplier supplies Widget.
         assert!(verilog.contains("module widget"));
         assert!(verilog.contains("module supplier"));
         assert!(verilog.contains("module top"));
-        // 2 entity + 2 bram + audit_log + fact_ingress + fact_egress + top = 8.
-        assert_eq!(verilog.matches("endmodule").count(), 8);
+        // 2 entity + 2 bram + audit + ingress + egress + boot_fsm + top = 9.
+        assert_eq!(verilog.matches("endmodule").count(), 9);
     }
 
     /// Verilog output is well-formed: every module has clk/rst_n ports,
@@ -1075,6 +1152,39 @@ Supplier supplies Widget.
     }
 
     // ── Audit-log Verilog ring buffer (#167) ──
+
+    // ── Boot-sequence FSM (#170) ──
+
+    #[test]
+    fn boot_fsm_emitted_with_state() {
+        let state = state_with_nouns(&[("Widget", "entity")]);
+        let verilog = compile_to_verilog(&state);
+        assert!(verilog.contains("module boot_fsm"),
+            "boot_fsm module missing:\n{}", verilog);
+    }
+
+    #[test]
+    fn boot_fsm_has_four_phase_state_machine() {
+        let state = state_with_nouns(&[("Widget", "entity")]);
+        let verilog = compile_to_verilog(&state);
+        // Four canonical phases as 2-bit codes.
+        assert!(verilog.contains("PHASE_RESET    = 2'd0"));
+        assert!(verilog.contains("PHASE_LOAD_ROM = 2'd1"));
+        assert!(verilog.contains("PHASE_INIT_BRAM = 2'd2"));
+        assert!(verilog.contains("PHASE_READY    = 2'd3"));
+    }
+
+    #[test]
+    fn boot_fsm_holds_ready_low_until_init_complete() {
+        let state = state_with_nouns(&[("Widget", "entity")]);
+        let verilog = compile_to_verilog(&state);
+        // Reset clears ready; transition to READY latches it high.
+        assert!(verilog.contains("ready   <= 1'b0"),
+            "reset must clear ready:\n{}", verilog);
+        assert!(verilog.contains("ready   <= 1'b1"));
+        // READY phase is terminal — ready stays high.
+        assert!(verilog.contains("PHASE_READY: begin"));
+    }
 
     // ── Per-noun BRAM cell memory map (#166) ──
 
@@ -1457,9 +1567,9 @@ Supplier supplies Widget.
         let verilog = compile_to_verilog(&state);
         let modules = verilog.matches("module ").count();
         let endmodules = verilog.matches("endmodule").count();
-        // 4 entity + 4 bram + audit + ingress + egress + top = 12.
-        assert_eq!(modules, 12, "4 entities + 4 bram + audit + ingress + egress + top = 12");
-        assert_eq!(endmodules, 12);
+        // 4 entity + 4 bram + audit + ingress + egress + boot_fsm + top = 13.
+        assert_eq!(modules, 13);
+        assert_eq!(endmodules, 13);
         assert_eq!(modules, endmodules);
     }
 }
