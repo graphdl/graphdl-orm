@@ -22,6 +22,21 @@
 #[macro_use]
 extern crate alloc;
 
+/// Conditional diagnostic macro. Under std, forwards to `eprintln!`.
+/// Under no_std, it's a no-op — kernel callers wire their own serial
+/// sink via the `check` system verb instead of relying on stderr.
+#[cfg(not(feature = "no_std"))]
+#[macro_export]
+macro_rules! diag {
+    ($($arg:tt)*) => { eprintln!($($arg)*) }
+}
+
+#[cfg(feature = "no_std")]
+#[macro_export]
+macro_rules! diag {
+    ($($arg:tt)*) => { }
+}
+
 pub mod sync;
 use crate::sync::Arc;
 use crate::sync::Mutex;
@@ -546,7 +561,7 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
         // Lowercase hex, no separators. Stable, byte-deterministic.
         let mut out = String::with_capacity(bytes.len() * 2);
         for b in &bytes {
-            use std::fmt::Write;
+            use core::fmt::Write;
             let _ = write!(&mut out, "{:02x}", b);
         }
         return out;

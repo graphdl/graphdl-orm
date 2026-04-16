@@ -17,11 +17,21 @@
 // per-fact-type indexing is available via the `validate:{fact_type_id}`
 // defs produced by compile_to_defs_state. Bulk loads may still skip
 // validation entirely when the readings are known-good.
+#[cfg(not(feature = "no_std"))]
 thread_local! {
     static SKIP_VALIDATE: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
 }
+#[cfg(not(feature = "no_std"))]
 pub fn set_skip_validate(on: bool) { SKIP_VALIDATE.with(|b| b.set(on)); }
+#[cfg(not(feature = "no_std"))]
 fn is_skip_validate() -> bool { SKIP_VALIDATE.with(|b| b.get()) }
+
+#[cfg(feature = "no_std")]
+static SKIP_VALIDATE_ATOMIC: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "no_std")]
+pub fn set_skip_validate(on: bool) { SKIP_VALIDATE_ATOMIC.store(on, core::sync::atomic::Ordering::Relaxed); }
+#[cfg(feature = "no_std")]
+fn is_skip_validate() -> bool { SKIP_VALIDATE_ATOMIC.load(core::sync::atomic::Ordering::Relaxed) }
 //
 // All framework objects compile to these types:
 //   Role        → Selector
@@ -750,12 +760,12 @@ pub fn profile_dump() {
     let snap = profile_snapshot();
     let total_ns: u64 = snap.iter().map(|(_, _, t)| t).sum();
     let total_n:  u64 = snap.iter().map(|(_, c, _)| c).sum();
-    eprintln!("[profile] apply-variant histogram ({} calls, {}ms total):",
+    diag!("[profile] apply-variant histogram ({} calls, {}ms total):",
         total_n, total_ns / 1_000_000);
     snap.iter().for_each(|(name, count, ns)| {
         let pct = if total_ns > 0 { *ns as f64 * 100.0 / total_ns as f64 } else { 0.0 };
         let avg_ns = if *count > 0 { ns / count } else { 0 };
-        eprintln!("  {:<18} {:>10} calls   {:>10}µs   {:>6.2}%   avg {}ns",
+        diag!("  {:<18} {:>10} calls   {:>10}µs   {:>6.2}%   avg {}ns",
             name, count, ns / 1_000, pct, avg_ns);
     });
 }
@@ -1616,7 +1626,7 @@ fn platform_compile(x: &Object, d: &Object) -> Object {
     // Warnings only for now — pre-existing metamodel issues need cleanup first.
     let merged_domain = crate::compile::state_to_domain(&merged_state);
     let model_errors = crate::compile::validate_model(&merged_domain);
-    model_errors.iter().for_each(|e| eprintln!("[model warning] {}", e));
+    model_errors.iter().for_each(|e| diag!("[model warning] {}", e));
 
     // Compile defs from merged state + re-register platform primitives
     let mut defs = crate::compile::compile_to_defs_state(&merged_state);

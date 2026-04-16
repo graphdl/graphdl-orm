@@ -17,27 +17,38 @@ use hashbrown::HashMap;
 // metamodel readings, so the metamodel namespace guard (#23) is bypassed
 // for cross-file redeclarations within the canonical metamodel. Apps must
 // NOT set this flag; user-domain compiles always hit the guard.
+// Under std, thread_local keeps bootstrap/strict flags per-thread so
+// parallel test threads don't collide. Under no_std (single-core
+// kernel), AtomicBool is fine — there are no parallel test runners.
+#[cfg(not(feature = "no_std"))]
 thread_local! {
     static BOOTSTRAP_MODE: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
     static STRICT_MODE: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
 }
 
-pub fn set_bootstrap_mode(on: bool) {
-    BOOTSTRAP_MODE.with(|b| b.set(on));
-}
+#[cfg(not(feature = "no_std"))]
+pub fn set_bootstrap_mode(on: bool) { BOOTSTRAP_MODE.with(|b| b.set(on)); }
+#[cfg(not(feature = "no_std"))]
+fn is_bootstrap_mode() -> bool { BOOTSTRAP_MODE.with(|b| b.get()) }
+#[cfg(not(feature = "no_std"))]
+#[allow(dead_code)]
+pub(crate) fn set_strict_mode(on: bool) { STRICT_MODE.with(|b| b.set(on)); }
+#[cfg(not(feature = "no_std"))]
+fn is_strict_mode() -> bool { STRICT_MODE.with(|b| b.get()) }
 
-fn is_bootstrap_mode() -> bool {
-    BOOTSTRAP_MODE.with(|b| b.get())
-}
-
-#[allow(dead_code)] // used by tests and --strict CLI flag
-pub(crate) fn set_strict_mode(on: bool) {
-    STRICT_MODE.with(|b| b.set(on));
-}
-
-fn is_strict_mode() -> bool {
-    STRICT_MODE.with(|b| b.get())
-}
+#[cfg(feature = "no_std")]
+static BOOTSTRAP_MODE_ATOMIC: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "no_std")]
+static STRICT_MODE_ATOMIC: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "no_std")]
+pub fn set_bootstrap_mode(on: bool) { BOOTSTRAP_MODE_ATOMIC.store(on, core::sync::atomic::Ordering::Relaxed); }
+#[cfg(feature = "no_std")]
+fn is_bootstrap_mode() -> bool { BOOTSTRAP_MODE_ATOMIC.load(core::sync::atomic::Ordering::Relaxed) }
+#[cfg(feature = "no_std")]
+#[allow(dead_code)]
+pub(crate) fn set_strict_mode(on: bool) { STRICT_MODE_ATOMIC.store(on, core::sync::atomic::Ordering::Relaxed); }
+#[cfg(feature = "no_std")]
+fn is_strict_mode() -> bool { STRICT_MODE_ATOMIC.load(core::sync::atomic::Ordering::Relaxed) }
 
 pub(crate) const METAMODEL_NOUNS: &[&str] = &[
     "Noun",
@@ -2326,7 +2337,7 @@ mod tests {
         let ir = parse_markdown(input).unwrap();
         assert_eq!(ir.general_instance_facts.len(), 1);
         let f = &ir.general_instance_facts[0];
-        eprintln!("subject_noun={} subject_value={} field_name={} object_noun={} object_value={}",
+        diag!("subject_noun={} subject_value={} field_name={} object_noun={} object_value={}",
             f.subject_noun, f.subject_value, f.field_name, f.object_noun, f.object_value);
         assert_eq!(f.subject_noun, "Noun");
         assert_eq!(f.subject_value, "API Product");

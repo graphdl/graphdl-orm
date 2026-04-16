@@ -482,7 +482,7 @@ fn create_via_defs(
         })
         .map(|(n, contents)| (n.to_string(), ast::metacompose(contents, d)))
         .collect();
-    eprintln!("[profile] derivation gating: {}/{} rules for noun '{}'",
+    diag!("[profile] derivation gating: {}/{} rules for noun '{}'",
         derivation_defs_owned.len(),
         ast::cells_iter(d).into_iter().filter(|(n, _)| n.starts_with("derivation:")).count(),
         noun);
@@ -517,7 +517,7 @@ fn create_via_defs(
                 let result = ast::apply(&ast::Func::Def(machine_key.clone()), &input, d);
                 let new_status = result.as_atom().unwrap_or(&current).to_string();
                 if new_status != current {
-                    eprintln!("[sm] {} --{}--> {}", current, event, new_status);
+                    diag!("[sm] {} --{}--> {}", current, event, new_status);
                     current = new_status;
                 }
             }
@@ -584,7 +584,7 @@ fn create_via_defs(
                             }
                         });
                         if has_facts {
-                            eprintln!("[sm:guard] {} --{}--> {}", current, event_type, target);
+                            diag!("[sm:guard] {} --{}--> {}", current, event_type, target);
                             current = target.to_string();
                             advanced = true;
                             break; // restart from new status
@@ -631,9 +631,9 @@ fn create_via_defs(
         .filter(|d| d.fact_type_id.contains("StateMachine") || d.fact_type_id.contains("Machine"))
         .map(|d| format!("{}:{:?}", d.fact_type_id, d.bindings))
         .collect();
-    eprintln!("[debug] SM derived facts: {:?}", sm_derived);
+    diag!("[debug] SM derived facts: {:?}", sm_derived);
     let sm_cell = ast::fetch_or_phi("StateMachine_has_currentlyInStatus", &derived_state);
-    eprintln!("[debug] SM cell: {:?}", sm_cell);
+    diag!("[debug] SM cell: {:?}", sm_cell);
     let status = extract_sm_status(&derived_state, &entity_id);
     let transitions = hateoas_via_rho(d, noun, &entity_id, status.as_deref());
     let navigation = nav_links_via_rho(d, noun, &entity_id);
