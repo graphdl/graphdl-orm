@@ -1,25 +1,26 @@
 // crates/arest-kernel/src/main.rs
 //
 // AREST bare-metal kernel entry point. Runs under `x86_64-unknown-none`
-// (stable) with the rust-osdev `bootloader` crate supplying a
-// Multiboot2-compatible stub that drops us into 64-bit long mode with
-// paging already turned on and a populated `BootInfo` on the stack.
+// (nightly for `abi_x86_interrupt`) with the rust-osdev `bootloader`
+// crate supplying a Multiboot2-compatible stub that drops us into
+// 64-bit long mode with paging already turned on and a populated
+// `BootInfo` on the stack.
 //
 // Current boot pipeline:
 //   BIOS / UEFI
 //     └─> bootloader (Multiboot2 stage, built by arest-kernel-image)
 //           └─> kernel_main(&'static mut BootInfo) -> !
-//                 └─> allocator::init()   — 1 MiB static heap
-//                 └─> gdt::init()         — GDT + TSS + IST
+//                 └─> allocator::init()        — 1 MiB static heap
+//                 └─> gdt::init()              — GDT + TSS + IST
 //                 └─> interrupts::init_idt()
+//                 └─> interrupts::init_pic()   — remap + unmask KB
 //                 └─> SERIAL banner
-//                 └─> int3 smoke test     — proves IDT routes
-//                 └─> hlt loop
+//                 └─> hlt loop (waits for IRQs)
 //
-// Today this is MVP plumbing — a kernel that wakes up, brings up the
-// allocator, installs its own GDT and IDT, prints a banner, and
-// halts. AREST engine integration follows #174 landing no_std-clean
-// versions of the core modules (#182 baked metamodel, #183 REPL).
+// With the PIC live, the `hlt` loop now wakes on every keyboard
+// scancode and echoes the decoded character over serial. That is
+// the interactive baseline the REPL (#183) will replace with a
+// line-buffered dispatch into system_impl.
 
 #![no_std]
 #![no_main]
@@ -39,36 +40,37 @@ use core::panic::PanicInfo;
 entry_point!(kernel_main);
 
 /// Called by the bootloader the moment we land in 64-bit long mode.
-/// `boot_info` carries the memory map, framebuffer handle, and other
-/// platform detail the bootloader gathered from the firmware. We
-/// ignore it for now — the MVP goal is "a running kernel that
-/// proves the toolchain and image pipeline work end-to-end."
 fn kernel_main(_boot_info: &'static mut BootInfo) -> ! {
     allocator::init();
     gdt::init();
     interrupts::init_idt();
+    interrupts::init_pic();
 
     println!("AREST kernel online");
     println!("  target: x86_64-unknown-none");
     println!("  heap:   1 MiB static (#178)");
     println!("  gdt:    loaded with TSS + double-fault IST (#179)");
-    println!("  idt:    breakpoint + double-fault installed (#179)");
+    println!("  idt:    breakpoint + double-fault + keyboard (#181)");
+    println!("  pic:    remapped to 32+, keyboard (IRQ 1) unmasked");
 
     // Prove the allocator works — allocate a String and echo it.
     let greeting = "heap is live".to_string();
     println!("  alloc: {greeting}");
 
     // Prove the IDT routes — `int3` should land in our breakpoint
-    // handler, print a frame, and return cleanly to this function.
+    // handler, print a frame, and return cleanly.
     x86_64::instructions::interrupts::int3();
     println!("  idt:   int3 round-tripped through breakpoint handler");
+
+    println!();
+    println!("type on the keyboard — every keypress echoes over serial.");
 
     halt_forever();
 }
 
-/// Park the CPU in a `hlt` loop. Using `hlt` (vs. a busy spin) drops
-/// the core into the C1 halt state so QEMU reports 0% CPU instead of
-/// pinning a host thread at 100% while waiting for interrupts.
+/// Park the CPU in a `hlt` loop. With interrupts enabled, `hlt`
+/// wakes on any IRQ (keyboard, timer once added) so per-keypress
+/// latency is measured in microseconds instead of busy-spin cycles.
 fn halt_forever() -> ! {
     loop {
         x86_64::instructions::hlt();
