@@ -8,18 +8,21 @@
 
 #![cfg_attr(feature = "no_std", no_std)]
 
-// Under `no_std`, `alloc` brings back Vec / String / Box / Arc via
-// core's allocator — the crate still depends on heap allocation,
-// just not on the full libstd runtime. Every site that reaches into
-// `std::*` is migrating to `core::*` / `alloc::*` / `hashbrown::*` /
-// `spin::*` during the staged conversion (#174).
-#[cfg(feature = "no_std")]
+// `alloc` is brought in unconditionally so `alloc::sync::Arc` /
+// `alloc::boxed::Box` / `alloc::vec::Vec` resolve in both default
+// (std) and `no_std` builds. Under std, `alloc` is part of the
+// sysroot and re-exported through `std::*`; under `no_std` the same
+// crate is the only source of heap-allocated types. Every AREST
+// site that used to reach `std::sync::*` now goes through
+// `crate::sync::*` (spin-based, see sync.rs) during the staged
+// conversion (#174).
 extern crate alloc;
 
-use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::OnceLock;
-use std::sync::RwLock;
+pub mod sync;
+use crate::sync::Arc;
+use crate::sync::Mutex;
+use crate::sync::OnceLock;
+use crate::sync::RwLock;
 
 pub mod ast;
 pub mod types;
@@ -108,7 +111,7 @@ impl CompiledState {
     fn snapshot_d(&self) -> ast::Object {
         let mut map = hashbrown::HashMap::with_capacity(self.cells.len());
         for (name, lock) in &self.cells {
-            map.insert(name.clone(), lock.read().unwrap().clone());
+            map.insert(name.clone(), lock.read().clone());
         }
         ast::Object::Map(map)
     }
@@ -154,7 +157,7 @@ impl CompiledState {
         for (name, value) in new_map {
             match self.cells.remove(&name) {
                 Some(existing) => {
-                    *existing.write().unwrap() = value;
+                    *existing.write() = value;
                     next_cells.insert(name, existing);
                 }
                 None => {
@@ -217,11 +220,11 @@ impl CompiledState {
         // between concurrent writers with overlapping cell sets).
         changed.sort();
         // Acquire write locks in order.
-        let mut guards: Vec<(&String, std::sync::RwLockWriteGuard<'_, ast::Object>)> =
+        let mut guards: Vec<(&String, crate::sync::RwLockWriteGuard<'_, ast::Object>)> =
             Vec::with_capacity(changed.len());
         for key in changed {
             let lock = self.cells.get(key).expect("membership was checked above");
-            let guard = lock.write().unwrap();
+            let guard = lock.write();
             guards.push((key, guard));
         }
         // CAS: every changed cell's current contents must still match
@@ -261,14 +264,14 @@ fn ds() -> &'static Mutex<Vec<Option<Arc<RwLock<CompiledState>>>>> {
 /// handles or freed slots. The outer Vec mutex is held only for the
 /// duration of the lookup and Arc clone, then released.
 fn tenant_lock(handle: u32) -> Option<Arc<RwLock<CompiledState>>> {
-    let s = ds().lock().unwrap();
+    let s = ds().lock();
     s.get(handle as usize).and_then(|x| x.as_ref()).map(Arc::clone)
 }
 
 #[allow(dead_code)] // used by tests and the cloudflare feature
 fn allocate(state: ast::Object, defs: Vec<(String, ast::Func)>) -> u32 {
     let d = ast::defs_to_state(&defs, &state);
-    let mut s = ds().lock().unwrap();
+    let mut s = ds().lock();
     let h = s.iter().position(|x| x.is_none()).unwrap_or_else(|| { s.push(None); s.len() - 1 });
     s[h] = Some(Arc::new(RwLock::new(CompiledState::new(d))));
     h as u32
@@ -395,7 +398,7 @@ fn create_impl() -> u32 {
     // approach lands naturally: new handles start with zero metamodel
     // compile cost.
     let d = metamodel_state().clone();
-    let mut s = ds().lock().unwrap();
+    let mut s = ds().lock();
     let h = s.iter().position(|x| x.is_none()).unwrap_or_else(|| { s.push(None); s.len() - 1 });
     s[h] = Some(Arc::new(RwLock::new(CompiledState::new(d))));
     h as u32
@@ -411,7 +414,7 @@ fn parse_and_compile_impl(readings: Vec<(String, String)>) -> Result<u32, String
 }
 
 fn release_impl(handle: u32) {
-    let mut s = ds().lock().unwrap();
+    let mut s = ds().lock();
     s.get_mut(handle as usize).into_iter().for_each(|slot| *slot = None);
 }
 
@@ -464,7 +467,7 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
     //   system(h, "rollback", "id")    → id on success, ⊥ on miss
     //   system(h, "snapshots", "")     → <id₁, id₂, ...> FFP seq
     if key == "snapshot" {
-        let mut st = tenant.write().unwrap();
+        let mut st = tenant.write();
         let label = if input.is_empty() {
             format!("snap-{}", st.snapshots.len())
         } else {
@@ -475,7 +478,7 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
         return label;
     }
     if key == "rollback" {
-        let mut st = tenant.write().unwrap();
+        let mut st = tenant.write();
         return match st.snapshots.get(input).cloned() {
             Some(snap) => {
                 st.replace_d(snap);
@@ -485,7 +488,7 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
         };
     }
     if key == "snapshots" {
-        let st = tenant.read().unwrap();
+        let st = tenant.read();
         let mut ids: Vec<&String> = st.snapshots.keys().collect();
         ids.sort();
         return format!(
@@ -533,7 +536,7 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
     //   system(h, "freeze", "")     → hex-encoded freeze image
     //   system(h, "thaw", "<hex>")  → replaces d; returns "ok" / "⊥"
     if key == "freeze" {
-        let st = tenant.read().unwrap();
+        let st = tenant.read();
         let d = st.snapshot_d();
         let bytes = crate::freeze::freeze(&d);
         // Lowercase hex, no separators. Stable, byte-deterministic.
@@ -570,7 +573,7 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
         }
         return match crate::freeze::thaw(&bytes) {
             Ok(obj) => {
-                let mut st = tenant.write().unwrap();
+                let mut st = tenant.write();
                 st.replace_d(obj);
                 "ok".into()
             }
@@ -586,7 +589,7 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
     // one of these keys we silently don't persist it — that's a bug
     // in the op's definition, not a concurrency issue.
     if is_read_only_op(key) {
-        let st = tenant.read().unwrap();
+        let st = tenant.read();
         let obj = ast::Object::parse(input);
         let snapshot = st.snapshot_d();
         let result = ast::apply(&ast::Func::Def(key.to_string()), &obj, &snapshot);
@@ -614,7 +617,7 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
 
     // Tier 1: shared-lock fast path.
     {
-        let st = tenant.read().unwrap();
+        let st = tenant.read();
         let snapshot = st.snapshot_d();
         let apply_result = ast::apply(&ast::Func::Def(key.to_string()), &obj, &snapshot);
         match classify_writer_result(&apply_result) {
@@ -636,7 +639,7 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
     }
 
     // Tier 2: exclusive-lock escalation.
-    let mut st = tenant.write().unwrap();
+    let mut st = tenant.write();
     let snapshot = st.snapshot_d();
     let apply_result = ast::apply(&ast::Func::Def(key.to_string()), &obj, &snapshot);
     match classify_writer_result(&apply_result) {
@@ -753,7 +756,7 @@ mod handle_isolation_tests {
     /// handle.
     fn peek(handle: u32) -> Option<ast::Object> {
         let tenant = tenant_lock(handle)?;
-        let st = tenant.read().unwrap();
+        let st = tenant.read();
         Some(st.snapshot_d())
     }
 
@@ -788,7 +791,7 @@ mod handle_isolation_tests {
         // state-transition def) and re-check B to prove no aliasing.
         {
             let tenant_a = tenant_lock(h_a).expect("handle A must be live");
-            let mut st = tenant_a.write().unwrap();
+            let mut st = tenant_a.write();
             let snapshot = st.snapshot_d();
             let new_d = ast::store(
                 "Noun",
@@ -1057,7 +1060,7 @@ Order has total.
         // Mutate the Noun cell by replacing the whole state.
         {
             let tenant = tenant_lock(h).unwrap();
-            let mut st = tenant.write().unwrap();
+            let mut st = tenant.write();
             st.replace_d(ast::store("Noun", ast::Object::atom("after"), &ast::Object::phi()));
         }
         assert_eq!(
@@ -1084,7 +1087,7 @@ Order has total.
         for round in 0..3 {
             {
                 let tenant = tenant_lock(h).unwrap();
-                let mut st = tenant.write().unwrap();
+                let mut st = tenant.write();
                 st.replace_d(ast::store(
                     "Noun",
                     ast::Object::atom(&format!("mutation-{round}")),
@@ -1157,7 +1160,7 @@ Order has total.
         // h2's Noun cell now carries the h1 payload.
         let noun_cell_after_thaw = {
             let tenant = tenant_lock(h2).unwrap();
-            let st = tenant.read().unwrap();
+            let st = tenant.read();
             st.snapshot_d()
         };
         let s = format!("{:?}", noun_cell_after_thaw);
@@ -1232,7 +1235,7 @@ Order has total.
 
         let reader = |h: u32, barrier: Arc<Barrier>| move || -> ast::Object {
             let tenant = tenant_lock(h).unwrap();
-            let st = tenant.read().unwrap();
+            let st = tenant.read();
             // Both readers reach the barrier while holding their read
             // guards. If the lock doesn't allow sharing, only one will
             // ever get here and the test hangs.
@@ -1268,7 +1271,7 @@ Order has total.
         let h = alloc_with_noun("seed");
         {
             let tenant = tenant_lock(h).unwrap();
-            let mut st = tenant.write().unwrap();
+            let mut st = tenant.write();
             let state = {
                 let s = ast::store("Noun", ast::Object::atom("seed"), &ast::Object::phi());
                 let s = ast::store("Order", ast::Object::atom("o0"), &s);
@@ -1280,7 +1283,7 @@ Order has total.
         let barrier = Arc::new(Barrier::new(2));
         let write = |h: u32, b: Arc<Barrier>, cell: &'static str, val: &'static str| move || -> CommitOutcome {
             let tenant = tenant_lock(h).unwrap();
-            let st = tenant.read().unwrap();
+            let st = tenant.read();
             let snapshot = st.snapshot_d();
             let new_d = ast::store(cell, ast::Object::atom(val), &snapshot);
             // Both writers reach the barrier while holding the shared
@@ -1320,14 +1323,14 @@ Order has total.
         // A's snapshot, captured before B's write.
         let stale_snapshot = {
             let tenant = tenant_lock(h).unwrap();
-            let st = tenant.read().unwrap();
+            let st = tenant.read();
             st.snapshot_d()
         };
 
         // B commits a full replacement to "v1-other".
         {
             let tenant = tenant_lock(h).unwrap();
-            let mut st = tenant.write().unwrap();
+            let mut st = tenant.write();
             st.replace_d(ast::store(
                 "Noun",
                 ast::Object::atom("v1-other"),
@@ -1343,7 +1346,7 @@ Order has total.
         );
         let outcome = {
             let tenant = tenant_lock(h).unwrap();
-            let st = tenant.read().unwrap();
+            let st = tenant.read();
             st.try_commit_diff(&stale_snapshot, &attempted_new_d)
         };
         assert!(matches!(outcome, CommitOutcome::StaleSnapshot),
@@ -1362,7 +1365,7 @@ Order has total.
         // itself needs mutation, which requires tenant.write().
         let h = alloc_with_noun("seed");
         let tenant = tenant_lock(h).unwrap();
-        let st = tenant.read().unwrap();
+        let st = tenant.read();
         let snapshot = st.snapshot_d();
         // Add a NEW cell not in the snapshot.
         let new_d = ast::store("Fresh", ast::Object::atom("unseen"), &snapshot);

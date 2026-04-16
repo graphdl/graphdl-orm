@@ -34,7 +34,7 @@ fn is_skip_validate() -> bool { SKIP_VALIDATE.with(|b| b.get()) }
 //   Population traversal → ApplyToAll (map)
 
 use hashbrown::HashMap;
-use std::sync::Arc;
+use crate::sync::Arc;
 use std::fmt;
 
 #[cfg(feature = "parallel")]
