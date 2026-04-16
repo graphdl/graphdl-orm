@@ -74,9 +74,115 @@ pub fn compile_to_verilog(state: &Object) -> String {
     let (constraint_modules, constraint_names) = emit_constraint_modules(state);
     modules.extend(constraint_modules);
 
-    let top = emit_top_module(&entities, &constraint_names);
+    // State-machine modules. Each SM declared in state gets a module
+    // with (clk, rst_n, event_code, status) ports and a case-dispatch
+    // transition table keyed on (current status, event code).
+    let (sm_modules, sm_specs) = emit_sm_modules(&domain.state_machines);
+    modules.extend(sm_modules);
+
+    let top = emit_top_module(&entities, &constraint_names, &sm_specs);
 
     format!("{}{}\n{}", header, modules.join("\n"), top)
+}
+
+/// Emit one synthesizable Verilog module per state machine in the
+/// compiled domain. Each SM module takes (clk, rst_n, event_code)
+/// and outputs `status` (a register wide enough to hold every declared
+/// status code). On reset, status falls back to the initial status's
+/// code; otherwise a two-level case dispatch on `(current_status,
+/// event_code)` either advances to the destination status or holds.
+///
+/// Status codes are assigned by position in `StateMachineDef::statuses`
+/// (compile-time deterministic per SM). Event codes are FNV-1a 32-bit
+/// hashes of the event string, so external drivers encode events the
+/// same way when pushing into `event_code`.
+///
+/// Unknown events from the current status are held (default arm) —
+/// matching the AREST machine fold's "invalid events are no-ops"
+/// semantic (paper §"machine fold", transition function's fallthrough
+/// to `s`).
+///
+/// Returns (module_text, (name, status_width)) pairs so the top
+/// emitter can size the status wire it declares for each SM.
+fn emit_sm_modules(sms: &std::collections::HashMap<String, crate::types::StateMachineDef>) -> (Vec<String>, Vec<(String, usize)>) {
+    let mut entries: Vec<(&String, &crate::types::StateMachineDef)> = sms.iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    let mut modules: Vec<String> = Vec::new();
+    let mut specs: Vec<(String, usize)> = Vec::new();
+    for (_, sm) in entries {
+        if sm.statuses.is_empty() { continue; }
+        let module_name = sanitize(&format!("sm_{}", sm.noun_name));
+        let status_count = sm.statuses.len();
+        // Width = ceil(log2(max(count, 2))). Needs at least 1 bit.
+        let status_width = std::cmp::max(
+            1,
+            (status_count.max(2) as f64).log2().ceil() as usize,
+        );
+        let status_codes: std::collections::HashMap<&str, usize> = sm.statuses.iter()
+            .enumerate().map(|(i, s)| (s.as_str(), i)).collect();
+        let initial_code = status_codes.get(sm.statuses[0].as_str()).copied().unwrap_or(0);
+
+        let mut m = String::new();
+        m.push_str(&format!("module {module_name} (\n"));
+        m.push_str("    input wire clk,\n");
+        m.push_str("    input wire rst_n,\n");
+        m.push_str("    input wire [31:0] event_code,\n");
+        m.push_str(&format!("    output reg [{}:0] status\n", status_width.saturating_sub(1)));
+        m.push_str(");\n");
+        m.push_str("    // Status codes (position in SM definition):\n");
+        for (i, s) in sm.statuses.iter().enumerate() {
+            m.push_str(&format!("    //   {status_width}'d{i} = {s}\n"));
+        }
+        m.push_str("    always @(posedge clk) begin\n");
+        m.push_str("        if (!rst_n) begin\n");
+        m.push_str(&format!("            status <= {status_width}'d{initial_code};\n"));
+        m.push_str("        end else begin\n");
+        if sm.transitions.is_empty() {
+            m.push_str("            status <= status;\n");
+        } else {
+            // Group transitions by from-status.
+            let mut by_from: std::collections::BTreeMap<&str, Vec<&crate::types::TransitionDef>>
+                = std::collections::BTreeMap::new();
+            for t in &sm.transitions {
+                by_from.entry(t.from.as_str()).or_default().push(t);
+            }
+            m.push_str("            case (status)\n");
+            for (from, ts) in &by_from {
+                let from_code = status_codes.get(from).copied().unwrap_or(0);
+                m.push_str(&format!("                {status_width}'d{from_code}: case (event_code)\n"));
+                for t in ts {
+                    let to_code = status_codes.get(t.to.as_str()).copied().unwrap_or(0);
+                    let event_code = fnv1a_32(&t.event);
+                    m.push_str(&format!(
+                        "                    32'd{event_code}: status <= {status_width}'d{to_code};  // {}\n",
+                        t.event,
+                    ));
+                }
+                m.push_str("                    default: status <= status;\n");
+                m.push_str("                endcase\n");
+            }
+            m.push_str("                default: status <= status;\n");
+            m.push_str("            endcase\n");
+        }
+        m.push_str("        end\n");
+        m.push_str("    end\n");
+        m.push_str("endmodule\n");
+        modules.push(m);
+        specs.push((module_name, status_width));
+    }
+    (modules, specs)
+}
+
+/// FNV-1a 32-bit hash. Used for event-code encoding in SM Verilog
+/// modules so external drivers and the SM case statement agree on
+/// the numeric code for every declared event name.
+fn fnv1a_32(s: &str) -> u32 {
+    let mut h: u32 = 0x811c9dc5;
+    for b in s.bytes() {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h
 }
 
 /// Emit one stub Verilog module per alethic cardinality constraint
@@ -139,8 +245,12 @@ fn emit_constraint_modules(state: &Object) -> (Vec<String>, Vec<String>) {
 /// Returns an empty string if no entities AND no constraints are
 /// present. With at least one entity OR constraint, `top` is emitted
 /// with the relevant ports and instantiations.
-fn emit_top_module(entities: &[(String, Vec<String>)], constraints: &[String]) -> String {
-    if entities.is_empty() && constraints.is_empty() {
+fn emit_top_module(
+    entities: &[(String, Vec<String>)],
+    constraints: &[String],
+    sms: &[(String, usize)],
+) -> String {
+    if entities.is_empty() && constraints.is_empty() && sms.is_empty() {
         return String::new();
     }
     let mut out = String::new();
@@ -158,6 +268,10 @@ fn emit_top_module(entities: &[(String, Vec<String>)], constraints: &[String]) -
     // distinct from entity `_valid` lines.
     for cname in constraints {
         out.push_str(&format!("    wire {}_v;\n", cname));
+    }
+    // Per-SM status wires, each sized to its declared status code width.
+    for (sm_name, width) in sms {
+        out.push_str(&format!("    wire [{}:0] {}_status;\n", width.saturating_sub(1), sm_name));
     }
     out.push('\n');
     // Instantiate each entity with clk/rst_n + zero inputs + valid out.
@@ -177,6 +291,17 @@ fn emit_top_module(entities: &[(String, Vec<String>)], constraints: &[String]) -
         out.push_str("        .clk(clk),\n");
         out.push_str("        .rst_n(rst_n),\n");
         out.push_str(&format!("        .violation({}_v)\n", cname));
+        out.push_str("    );\n");
+    }
+    // Instantiate each SM — clk/rst_n + tied-low event_code + status out.
+    // The integrator replaces `{32{1'b0}}` with the real event driver
+    // when wiring events into the system.
+    for (sm_name, _width) in sms {
+        out.push_str(&format!("    {} {}_inst (\n", sm_name, sm_name));
+        out.push_str("        .clk(clk),\n");
+        out.push_str("        .rst_n(rst_n),\n");
+        out.push_str("        .event_code({32{1'b0}}),\n");
+        out.push_str(&format!("        .status({}_status)\n", sm_name));
         out.push_str("    );\n");
     }
     // AND-reduce valids after reset release. Empty-entity edge case:
@@ -579,6 +704,96 @@ Supplier supplies Widget.
         assert!(verilog.contains("all_valid <= rst_n & 1'b1"),
             "no entities → all_valid identity 1'b1:\n{}", verilog);
         assert!(verilog.contains("constraint_ok <= rst_n & ~constraint_uc_c1_v"));
+    }
+
+    #[test]
+    fn sm_module_emits_case_dispatch_with_status_codes() {
+        use crate::types::{StateMachineDef, TransitionDef};
+        let mut sms = std::collections::HashMap::new();
+        sms.insert("Order".to_string(), StateMachineDef {
+            noun_name: "Order".to_string(),
+            statuses: vec!["Draft".to_string(), "Placed".to_string(), "Shipped".to_string()],
+            transitions: vec![
+                TransitionDef { from: "Draft".to_string(), to: "Placed".to_string(), event: "place".to_string(), guard: None },
+                TransitionDef { from: "Placed".to_string(), to: "Shipped".to_string(), event: "ship".to_string(), guard: None },
+            ],
+        });
+        let (modules, specs) = emit_sm_modules(&sms);
+        assert_eq!(modules.len(), 1);
+        assert_eq!(specs[0].0, "sm_order");
+        assert_eq!(specs[0].1, 2, "3 statuses → 2-bit width");
+
+        let m = &modules[0];
+        assert!(m.contains("module sm_order ("), "module header:\n{}", m);
+        assert!(m.contains("input wire [31:0] event_code"));
+        assert!(m.contains("output reg [1:0] status"));
+        // Status code comments
+        assert!(m.contains("2'd0 = Draft"));
+        assert!(m.contains("2'd1 = Placed"));
+        assert!(m.contains("2'd2 = Shipped"));
+        // Transition case dispatch
+        assert!(m.contains("2'd0: case (event_code)"),
+            "missing from-Draft case:\n{}", m);
+        assert!(m.contains("2'd1: case (event_code)"),
+            "missing from-Placed case:\n{}", m);
+        // FNV-1a hashes for specific events encode correctly
+        let place_hash = fnv1a_32("place");
+        let ship_hash = fnv1a_32("ship");
+        assert!(m.contains(&format!("32'd{place_hash}: status <= 2'd1")),
+            "place → Placed transition missing:\n{}", m);
+        assert!(m.contains(&format!("32'd{ship_hash}: status <= 2'd2")),
+            "ship → Shipped transition missing:\n{}", m);
+        // Reset holds initial
+        assert!(m.contains("status <= 2'd0;"), "reset to initial missing:\n{}", m);
+    }
+
+    #[test]
+    fn sm_module_with_two_statuses_uses_1bit_width() {
+        use crate::types::{StateMachineDef, TransitionDef};
+        let mut sms = std::collections::HashMap::new();
+        sms.insert("Door".to_string(), StateMachineDef {
+            noun_name: "Door".to_string(),
+            statuses: vec!["Closed".to_string(), "Open".to_string()],
+            transitions: vec![
+                TransitionDef { from: "Closed".to_string(), to: "Open".to_string(), event: "open".to_string(), guard: None },
+            ],
+        });
+        let (_modules, specs) = emit_sm_modules(&sms);
+        assert_eq!(specs[0].1, 1, "2 statuses → 1-bit width");
+    }
+
+    #[test]
+    fn sm_module_empty_sms_map_produces_nothing() {
+        let (modules, specs) = emit_sm_modules(&std::collections::HashMap::new());
+        assert!(modules.is_empty());
+        assert!(specs.is_empty());
+    }
+
+    #[test]
+    fn sm_module_without_transitions_holds_initial() {
+        use crate::types::StateMachineDef;
+        let mut sms = std::collections::HashMap::new();
+        sms.insert("Frozen".to_string(), StateMachineDef {
+            noun_name: "Frozen".to_string(),
+            statuses: vec!["Only".to_string()],
+            transitions: vec![],
+        });
+        let (modules, _specs) = emit_sm_modules(&sms);
+        // Transition table absent → always holds status.
+        assert!(modules[0].contains("status <= status;"),
+            "no-transition SM must hold status:\n{}", modules[0]);
+        assert!(!modules[0].contains("case (status)"));
+    }
+
+    #[test]
+    fn fnv1a_32_is_stable_for_common_events() {
+        // Regression: the hash encoding is part of the SM ABI — events
+        // drive the FPGA at the same codes the emitter assigns. These
+        // constants pin the exact FNV-1a 32-bit output for strings the
+        // SM emitter sees in the tutor domain.
+        assert_eq!(fnv1a_32("place"), 0xc8d632fc);
+        assert_eq!(fnv1a_32("ship"), 0xac56f17f);
+        assert_eq!(fnv1a_32(""), 0x811c9dc5);
     }
 
     /// Multi-entity: top instantiates every entity, ANDs all their
