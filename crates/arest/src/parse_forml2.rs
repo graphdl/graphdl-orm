@@ -13,37 +13,40 @@
 use crate::types::*;
 use hashbrown::HashMap;
 
-/// Parse-time accumulator. NOT a public type. Lives here because
-/// the parser is the only producer; every consumer reads Object state.
+/// Parse-time accumulator. MODULE-PRIVATE. The parser is the only
+/// producer; every external consumer reads Object state via
+/// `parse_to_state`. This struct is NOT IR — it is the parser's
+/// working memory and vanishes as soon as parse completes.
+///
+/// Invariant: `domain_to_state` is a private conversion helper that
+/// wraps `cells` in `Object::Map`. Callers outside this module see
+/// only `Object` per Thm 2 (parse: R → Φ).
 #[derive(Debug, Clone, Default)]
 #[cfg_attr(feature = "std-deps", derive(serde::Deserialize, serde::Serialize))]
 #[cfg_attr(feature = "std-deps", serde(rename_all = "camelCase"))]
-pub(crate) struct Domain {
-    pub(crate) nouns: HashMap<String, NounDef>,
-    pub(crate) fact_types: HashMap<String, FactTypeDef>,
-    pub(crate) constraints: Vec<ConstraintDef>,
-    pub(crate) state_machines: HashMap<String, StateMachineDef>,
+struct Domain {
+    nouns: HashMap<String, NounDef>,
+    fact_types: HashMap<String, FactTypeDef>,
+    constraints: Vec<ConstraintDef>,
+    state_machines: HashMap<String, StateMachineDef>,
     #[cfg_attr(feature = "std-deps", serde(default))]
-    pub(crate) derivation_rules: Vec<DerivationRuleDef>,
+    derivation_rules: Vec<DerivationRuleDef>,
     #[cfg_attr(feature = "std-deps", serde(default))]
-    pub(crate) general_instance_facts: Vec<GeneralInstanceFact>,
+    general_instance_facts: Vec<GeneralInstanceFact>,
     #[cfg_attr(feature = "std-deps", serde(default))]
-    pub(crate) subtypes: HashMap<String, String>,
+    subtypes: HashMap<String, String>,
     #[cfg_attr(feature = "std-deps", serde(default))]
-    pub(crate) enum_values: HashMap<String, Vec<String>>,
+    enum_values: HashMap<String, Vec<String>>,
     #[cfg_attr(feature = "std-deps", serde(default))]
-    pub(crate) ref_schemes: HashMap<String, Vec<String>>,
+    ref_schemes: HashMap<String, Vec<String>>,
     #[cfg_attr(feature = "std-deps", serde(default))]
-    pub(crate) named_spans: HashMap<String, Vec<String>>,
+    named_spans: HashMap<String, Vec<String>>,
     #[cfg_attr(feature = "std-deps", serde(default))]
-    pub(crate) autofill_spans: Vec<String>,
-    /// Object cells produced by apply_action. When non-empty, this is the
-    /// authoritative output of parse â€” the Î¦ of `parse: R â†’ Î¦` (Thm 2).
-    /// Test fixtures that construct Domain literals via Default leave this
-    /// empty; domain_to_state falls back to computing cells from typed
-    /// fields in that case.
+    autofill_spans: Vec<String>,
+    /// Object cells produced by apply_action. This IS the parse output;
+    /// the typed fields above are parse-time lookup caches.
     #[cfg_attr(feature = "std-deps", serde(skip))]
-    pub(crate) cells: HashMap<String, Vec<crate::ast::Object>>,
+    cells: HashMap<String, Vec<crate::ast::Object>>,
 }
 #[allow(unused_imports)]
 use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
@@ -700,11 +703,11 @@ fn try_fact_type(line: &str, noun_names: &[String]) -> Option<ParseAction> {
 
 /// Parse with pre-existing nouns from other domains.
 /// Domains are NORMA tabs. Nouns are global across the UoD.
-pub(crate) fn parse_markdown_with_nouns(input: &str, existing_nouns: &HashMap<String, NounDef>) -> Result<Domain, String> {
+fn parse_markdown_with_nouns(input: &str, existing_nouns: &HashMap<String, NounDef>) -> Result<Domain, String> {
     parse_markdown_with_context(input, existing_nouns, &HashMap::new())
 }
 
-pub(crate) fn parse_markdown_with_context(input: &str, existing_nouns: &HashMap<String, NounDef>, existing_fact_types: &HashMap<String, FactTypeDef>) -> Result<Domain, String> {
+fn parse_markdown_with_context(input: &str, existing_nouns: &HashMap<String, NounDef>, existing_fact_types: &HashMap<String, FactTypeDef>) -> Result<Domain, String> {
     // Metamodel namespace protection (security #23):
     // First parse the input in isolation to see which nouns IT actually declares.
     // If the input declares any metamodel-reserved noun AND that noun is already
@@ -932,7 +935,7 @@ pub fn parse_to_state_with_nouns(input: &str, existing: &crate::ast::Object) -> 
 
 /// Convert a Domain to an Object state (sequence of cells).
 /// Each category becomes a cell: <CELL, fact_type_id, <facts...>>
-pub(crate) fn domain_to_state(d: &Domain) -> crate::ast::Object {
+fn domain_to_state(d: &Domain) -> crate::ast::Object {
     use crate::ast::{Object, fact_from_pairs};
     use hashbrown::{HashMap, HashSet};
     // Seed with cells already emitted by apply_action (Constraint,
@@ -1094,7 +1097,7 @@ pub(crate) fn domain_to_state(d: &Domain) -> crate::ast::Object {
 }
 
 
-pub(crate) fn parse_markdown(input: &str) -> Result<Domain, String> {
+fn parse_markdown(input: &str) -> Result<Domain, String> {
     let mut ir = Domain {
         nouns: HashMap::new(), fact_types: HashMap::new(),
         constraints: vec![], state_machines: HashMap::new(), derivation_rules: vec![],
