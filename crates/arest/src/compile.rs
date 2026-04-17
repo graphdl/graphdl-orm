@@ -1353,95 +1353,18 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
     normalized
 }
 
-/// Reconstruct a Domain from an Object state by querying metamodel cells.
-pub fn state_to_domain(state: &crate::ast::Object) -> Domain {
-    use crate::ast::{fetch_or_phi, binding};
-    let mut domain = Domain::default();
-
-    // α(noun_fact → insert into domain maps) : Noun cell
-    fetch_or_phi("Noun", state).as_seq().into_iter().flat_map(|facts| facts.iter()).for_each(|f| {
-        let name = binding(f, "name").unwrap_or("").to_string();
-        let obj_type = binding(f, "objectType").unwrap_or("entity").to_string();
-        domain.nouns.insert(name.clone(), NounDef { object_type: obj_type, world_assumption: WorldAssumption::default() });
-        binding(f, "superType").map(|st| domain.subtypes.insert(name.clone(), st.to_string()));
-        binding(f, "referenceScheme").map(|v| domain.ref_schemes.insert(name.clone(), v.split(',').map(|s| s.to_string()).collect()));
-        binding(f, "enumValues").map(|v| domain.enum_values.insert(name.clone(), v.split(',').map(|s| s.to_string()).collect()));
-    });
-
-    // α(schema_fact → fact_type) : FactType cell
-    let role_cell = fetch_or_phi("Role", state);
-    domain.fact_types = fetch_or_phi("FactType", state).as_seq()
-        .map(|facts| facts.iter().filter_map(|f| {
-            let id = binding(f, "id")?.to_string();
-            let reading = binding(f, "reading").unwrap_or("").to_string();
-            let roles: Vec<RoleDef> = role_cell.as_seq()
-                .map(|rs| rs.iter()
-                    .filter(|r| binding(r, "factType") == Some(&id))
-                    .map(|r| RoleDef {
-                        noun_name: binding(r, "nounName").unwrap_or("").to_string(),
-                        role_index: binding(r, "position").and_then(|v| v.parse().ok()).unwrap_or(0),
-                    }).collect())
-                .unwrap_or_default();
-            Some((id, FactTypeDef { schema_id: String::new(), reading, readings: vec![], roles }))
-        }).collect())
-        .unwrap_or_default();
-
-    // α(constraint_fact → constraint_def) : Constraint cell
-    domain.constraints = fetch_or_phi("Constraint", state).as_seq()
-        .map(|facts| facts.iter().map(|f| {
-            let get = |key: &str| binding(f, key).map(|s| s.to_string());
-            let spans = (0..4).filter_map(|i| {
-                let ft_id = get(&format!("span{}_factTypeId", i))?;
-                let ri = get(&format!("span{}_roleIndex", i))?;
-                Some(SpanDef { fact_type_id: ft_id, role_index: ri.parse().unwrap_or(0), subset_autofill: None })
-            }).collect();
-            ConstraintDef {
-                id: get("id").unwrap_or_default(), kind: get("kind").unwrap_or_default(),
-                modality: get("modality").unwrap_or_default(), deontic_operator: get("deonticOperator"),
-                text: get("text").unwrap_or_default(), spans,
-                set_comparison_argument_length: None, clauses: None, entity: get("entity"),
-                min_occurrence: None, max_occurrence: None,
-            }
-        }).collect())
-        .unwrap_or_default();
-
-    // α(rule_fact → derivation_rule) : DerivationRule cell
-    domain.derivation_rules = fetch_or_phi("DerivationRule", state).as_seq()
-        .map(|facts| facts.iter().map(|f| {
-            let get = |key: &str| binding(f, key).unwrap_or("").to_string();
-            DerivationRuleDef {
-                id: get("id"), text: get("text"), antecedent_fact_type_ids: vec![],
-                consequent_fact_type_id: get("consequentFactTypeId"),
-                kind: DerivationKind::ModusPonens, join_on: vec![], match_on: vec![], consequent_bindings: vec![], antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![], unresolved_clauses: vec![],
-            }
-        }).collect())
-        .unwrap_or_default();
-
-    // Re-resolve derivation rules against the reconstructed domain.
-    // The round-trip through state loses antecedent IDs, join keys, and kind.
-    // Re-resolve restores them from the rule text + fact type catalog.
-    crate::parse_forml2::re_resolve_derivation_rules(&mut domain);
-
-    // α(inst_fact → general_instance_fact) : InstanceFact cell
-    domain.general_instance_facts = fetch_or_phi("InstanceFact", state).as_seq()
-        .map(|facts| facts.iter().map(|f| {
-            let get = |key: &str| binding(f, key).unwrap_or("").to_string();
-            GeneralInstanceFact {
-                subject_noun: get("subjectNoun"), subject_value: get("subjectValue"),
-                field_name: get("fieldName"), object_noun: get("objectNoun"), object_value: get("objectValue"),
-            }
-        }).collect())
-        .unwrap_or_default();
-
-    domain.state_machines = derive_state_machines_from_facts(&domain.general_instance_facts);
-
-    domain
-}
+// state_to_domain deleted (#211). All callers now use
+// domain_data_from_state or read cells directly.
 
 /// Compile an entire Domain into executable form.
 /// Structural model validation — catches FORML2 violations at compile time.
 /// Returns a list of error messages. Empty = model is well-formed.
-pub fn validate_model(ir: &Domain) -> Vec<String> {
+pub fn validate_model_from_state(state: &crate::ast::Object) -> Vec<String> {
+    let data = domain_data_from_state(state);
+    validate_model_data(&data)
+}
+
+pub fn validate_model_data(ir: &DomainData) -> Vec<String> {
     let mut errors = Vec::new();
 
     // 1. Undeclared nouns in fact type roles
@@ -1531,21 +1454,94 @@ pub(crate) struct DomainData {
 }
 
 /// Build typed DomainData from an Object state.
-/// Uses `state_to_domain` internally for derivation-rule re-resolution,
-/// then moves all fields into the lighter struct.
+/// Builds DomainData directly from Object state cells. No state_to_domain.
+/// Constructs a temporary Domain only for re_resolve_derivation_rules
+/// (which needs &mut Domain for the resolver's &Domain borrow). The
+/// temporary is discarded immediately after re-resolution.
 pub(crate) fn domain_data_from_state(state: &crate::ast::Object) -> DomainData {
-    let domain = state_to_domain(state);
-    DomainData {
-        nouns: domain.nouns,
-        fact_types: domain.fact_types,
-        constraints: domain.constraints,
-        derivation_rules: domain.derivation_rules,
-        subtypes: domain.subtypes,
-        ref_schemes: domain.ref_schemes,
-        enum_values: domain.enum_values,
-        general_instance_facts: domain.general_instance_facts,
-        state_machines: domain.state_machines,
+    use crate::ast::{fetch_or_phi, binding};
+
+    let mut nouns: HashMap<String, NounDef> = HashMap::new();
+    let mut subtypes: HashMap<String, String> = HashMap::new();
+    let mut ref_schemes: HashMap<String, Vec<String>> = HashMap::new();
+    let mut enum_values: HashMap<String, Vec<String>> = HashMap::new();
+    if let Some(ns) = fetch_or_phi("Noun", state).as_seq() {
+        for f in ns.iter() {
+            let name = binding(f, "name").unwrap_or("").to_string();
+            let obj_type = binding(f, "objectType").unwrap_or("entity").to_string();
+            nouns.insert(name.clone(), NounDef { object_type: obj_type, world_assumption: WorldAssumption::default() });
+            if let Some(st) = binding(f, "superType") { subtypes.insert(name.clone(), st.to_string()); }
+            if let Some(v) = binding(f, "referenceScheme") { ref_schemes.insert(name.clone(), v.split(',').map(|s| s.to_string()).collect()); }
+            if let Some(v) = binding(f, "enumValues") { enum_values.insert(name.clone(), v.split(',').map(|s| s.to_string()).collect()); }
+        }
     }
+    let role_cell = fetch_or_phi("Role", state);
+    let fact_types: HashMap<String, FactTypeDef> = fetch_or_phi("FactType", state).as_seq()
+        .map(|facts| facts.iter().filter_map(|f| {
+            let id = binding(f, "id")?.to_string();
+            let reading = binding(f, "reading").unwrap_or("").to_string();
+            let roles: Vec<RoleDef> = role_cell.as_seq()
+                .map(|rs| rs.iter()
+                    .filter(|r| binding(r, "factType") == Some(&id))
+                    .map(|r| RoleDef {
+                        noun_name: binding(r, "nounName").unwrap_or("").to_string(),
+                        role_index: binding(r, "position").and_then(|v| v.parse().ok()).unwrap_or(0),
+                    }).collect()).unwrap_or_default();
+            Some((id, FactTypeDef { schema_id: String::new(), reading, readings: vec![], roles }))
+        }).collect()).unwrap_or_default();
+    let constraints: Vec<ConstraintDef> = fetch_or_phi("Constraint", state).as_seq()
+        .map(|facts| facts.iter().map(|f| {
+            let get = |key: &str| binding(f, key).map(|s| s.to_string());
+            let spans = (0..4).filter_map(|i| {
+                let ft_id = get(&format!("span{}_factTypeId", i))?;
+                let ri = get(&format!("span{}_roleIndex", i))?;
+                Some(SpanDef { fact_type_id: ft_id, role_index: ri.parse().unwrap_or(0), subset_autofill: None })
+            }).collect();
+            ConstraintDef {
+                id: get("id").unwrap_or_default(), kind: get("kind").unwrap_or_default(),
+                modality: get("modality").unwrap_or_default(), deontic_operator: get("deonticOperator"),
+                text: get("text").unwrap_or_default(), spans,
+                set_comparison_argument_length: None, clauses: None, entity: get("entity"),
+                min_occurrence: None, max_occurrence: None,
+            }
+        }).collect()).unwrap_or_default();
+    let derivation_rules: Vec<DerivationRuleDef> = fetch_or_phi("DerivationRule", state).as_seq()
+        .map(|facts| facts.iter().map(|f| {
+            let get = |key: &str| binding(f, key).unwrap_or("").to_string();
+            DerivationRuleDef {
+                id: get("id"), text: get("text"), antecedent_fact_type_ids: vec![],
+                consequent_fact_type_id: get("consequentFactTypeId"),
+                kind: DerivationKind::ModusPonens, join_on: vec![], match_on: vec![],
+                consequent_bindings: vec![], antecedent_filters: vec![],
+                consequent_computed_bindings: vec![], consequent_aggregates: vec![],
+                unresolved_clauses: vec![],
+            }
+        }).collect()).unwrap_or_default();
+    let general_instance_facts: Vec<GeneralInstanceFact> = fetch_or_phi("InstanceFact", state).as_seq()
+        .map(|facts| facts.iter().map(|f| {
+            let get = |key: &str| binding(f, key).unwrap_or("").to_string();
+            GeneralInstanceFact {
+                subject_noun: get("subjectNoun"), subject_value: get("subjectValue"),
+                field_name: get("fieldName"), object_noun: get("objectNoun"), object_value: get("objectValue"),
+            }
+        }).collect()).unwrap_or_default();
+    let state_machines = derive_state_machines_from_facts(&general_instance_facts);
+
+    // Temporary Domain for re-resolve only. Dies at end of this block.
+    let resolved_rules = {
+        let mut tmp = Domain {
+            domain: String::new(), nouns: nouns.clone(), fact_types: fact_types.clone(),
+            constraints: vec![], derivation_rules, subtypes: subtypes.clone(),
+            ref_schemes: ref_schemes.clone(), enum_values: enum_values.clone(),
+            state_machines: HashMap::new(), general_instance_facts: vec![],
+            objectifications: HashMap::new(), named_spans: HashMap::new(), autofill_spans: vec![],
+        };
+        crate::parse_forml2::re_resolve_derivation_rules(&mut tmp);
+        tmp.derivation_rules
+    };
+
+    DomainData { nouns, fact_types, constraints, derivation_rules: resolved_rules,
+        subtypes, ref_schemes, enum_values, general_instance_facts, state_machines }
 }
 
 /// Compile from a Domain directly (used by tests that build Domain structs).
