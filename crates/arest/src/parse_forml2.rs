@@ -34,8 +34,6 @@ pub(crate) struct Domain {
     #[cfg_attr(feature = "std-deps", serde(default))]
     pub(crate) ref_schemes: HashMap<String, Vec<String>>,
     #[cfg_attr(feature = "std-deps", serde(default))]
-    pub(crate) objectifications: HashMap<String, String>,
-    #[cfg_attr(feature = "std-deps", serde(default))]
     pub(crate) named_spans: HashMap<String, Vec<String>>,
     #[cfg_attr(feature = "std-deps", serde(default))]
     pub(crate) autofill_spans: Vec<String>,
@@ -104,7 +102,6 @@ pub(crate) const METAMODEL_NOUNS: &[&str] = &[
 struct NounMeta {
     super_type: Option<String>,
     ref_scheme: Option<Vec<String>>,
-    objectifies: Option<String>,
 }
 
 /// What a recognizer produces when it matches a line.
@@ -719,7 +716,7 @@ pub(crate) fn parse_markdown_with_context(input: &str, existing_nouns: &HashMap<
         constraints: vec![], state_machines: HashMap::new(), derivation_rules: vec![],
         general_instance_facts: vec![],
         subtypes: HashMap::new(), enum_values: HashMap::new(),
-        ref_schemes: HashMap::new(), objectifications: HashMap::new(),
+        ref_schemes: HashMap::new(),
         named_spans: HashMap::new(), autofill_spans: vec![],
         cells: HashMap::new(),
     };
@@ -740,7 +737,7 @@ pub(crate) fn parse_markdown_with_context(input: &str, existing_nouns: &HashMap<
         constraints: vec![], state_machines: HashMap::new(), derivation_rules: vec![],
         general_instance_facts: vec![],
         subtypes: HashMap::new(), enum_values: HashMap::new(),
-        ref_schemes: HashMap::new(), objectifications: HashMap::new(),
+        ref_schemes: HashMap::new(),
         named_spans: HashMap::new(), autofill_spans: vec![],
         cells: HashMap::new(),
     };
@@ -1103,7 +1100,7 @@ pub(crate) fn parse_markdown(input: &str) -> Result<Domain, String> {
         constraints: vec![], state_machines: HashMap::new(), derivation_rules: vec![],
         general_instance_facts: vec![],
         subtypes: HashMap::new(), enum_values: HashMap::new(),
-        ref_schemes: HashMap::new(), objectifications: HashMap::new(),
+        ref_schemes: HashMap::new(),
         named_spans: HashMap::new(), autofill_spans: vec![],
         cells: HashMap::new(),
     };
@@ -2046,7 +2043,6 @@ fn apply_action(ir: &mut Domain, action: Option<ParseAction>, lines: &[String], 
             // Populate IR maps from metadata
             meta.super_type.into_iter().for_each(|st| { ir.subtypes.insert(name.clone(), st); });
             meta.ref_scheme.into_iter().for_each(|rs| { ir.ref_schemes.entry(name.clone()).or_insert(rs); });
-            meta.objectifies.into_iter().for_each(|obj| { ir.objectifications.insert(name.clone(), obj); });
         }
         ParseAction::MarkAbstract(name) => {
             ir.nouns.get_mut(&name).into_iter()
