@@ -25,9 +25,58 @@
 
 use crate::ast::{Object, binding, fetch_or_phi};
 use crate::rmap::{self, TableDef, TableColumn};
-use crate::types::{Domain, StateMachineDef};
+use crate::types::StateMachineDef;
 #[allow(unused_imports)]
 use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
+
+/// Extract state machines directly from InstanceFact cells in state.
+/// No Domain round-trip — reads the same cells domain_to_state would.
+fn state_machines_from_state(state: &Object) -> hashbrown::HashMap<String, StateMachineDef> {
+    let inst = fetch_or_phi("InstanceFact", state);
+    let facts = inst.as_seq().unwrap_or(&[]);
+    let b = |f: &Object, k: &str| binding(f, k).unwrap_or("").to_string();
+
+    let mut sms: hashbrown::HashMap<String, StateMachineDef> = hashbrown::HashMap::new();
+    // "State Machine Definition 'X' is for Noun 'Y'"
+    for f in facts.iter().filter(|f| b(f, "subjectNoun") == "State Machine Definition" && b(f, "fieldName").contains("is for")) {
+        let sm_name = b(f, "subjectValue");
+        let noun = b(f, "objectValue");
+        sms.entry(noun).or_insert_with(|| StateMachineDef {
+            noun_name: sm_name, statuses: vec![], transitions: vec![],
+        });
+    }
+    // "Status 'Z' is defined in State Machine Definition 'X'"
+    for f in facts.iter().filter(|f| b(f, "subjectNoun") == "Status" && b(f, "fieldName").contains("defined in")) {
+        let status = b(f, "subjectValue");
+        let sm_name = b(f, "objectValue");
+        if let Some(sm) = sms.values_mut().find(|s| s.noun_name == sm_name) {
+            if !sm.statuses.contains(&status) { sm.statuses.push(status); }
+        }
+    }
+    // Transitions
+    for f in facts.iter().filter(|f| b(f, "subjectNoun") == "Transition") {
+        let trans_name = b(f, "subjectValue");
+        let field = b(f, "fieldName");
+        let value = b(f, "objectValue");
+        for sm in sms.values_mut() {
+            let t = sm.transitions.iter_mut().find(|t| t.event == trans_name);
+            match t {
+                Some(t) => {
+                    if field.contains("from") { t.from = value.clone(); }
+                    if field.contains("to") { t.to = value.clone(); }
+                }
+                None => {
+                    let mut td = crate::types::TransitionDef { event: trans_name.clone(), from: String::new(), to: String::new(), guard: None };
+                    if field.contains("from") { td.from = value.clone(); }
+                    if field.contains("to") { td.to = value.clone(); }
+                    if field.contains("triggered") { td.event = value.clone(); }
+                    sm.transitions.push(td);
+                }
+            }
+        }
+    }
+    sms
+}
 
 /// Compile every entity noun in `state` into a Solidity contract.
 ///
@@ -55,10 +104,10 @@ fn compile_to_solidity_inner(
                   // Generated from FORML2 readings by AREST\n\
                   pragma solidity ^0.8.20;\n\n";
 
-    let domain = crate::compile::state_to_domain(state);
-    let tables = rmap::rmap(&domain);
+    let tables = rmap::rmap_from_state(state);
     let table_by_name: hashbrown::HashMap<String, &TableDef> = tables.iter()
         .map(|t| (t.name.clone(), t)).collect();
+    let sms = state_machines_from_state(state);
 
     let nouns = fetch_or_phi("Noun", state);
     let contracts: Vec<String> = nouns.as_seq().map(|ns| {
@@ -71,8 +120,8 @@ fn compile_to_solidity_inner(
             }
             let table_name = rmap::to_snake(&name);
             let table = table_by_name.get(&table_name).copied();
-            let sm = domain.state_machines.get(&name);
-            Some(emit_contract(&name, table, sm, &domain, include.as_ref()))
+            let sm = sms.get(&name);
+            Some(emit_contract(&name, table, sm, state, include.as_ref()))
         }).collect()
     }).unwrap_or_default();
 
@@ -84,12 +133,12 @@ fn emit_contract(
     name: &str,
     table: Option<&TableDef>,
     sm: Option<&StateMachineDef>,
-    domain: &Domain,
+    state: &Object,
     scope: Option<&hashbrown::HashSet<&str>>,
 ) -> String {
     let contract_name = sanitize_name(name);
     let struct_def = emit_struct(table);
-    let events = emit_events(name, domain, scope);
+    let events = emit_events(name, state, scope);
     let sm_parts = sm.map(emit_state_machine).unwrap_or_default();
     let create_fn = emit_create(name, table, sm);
     let transitions = sm.map(|s| emit_transitions(s)).unwrap_or_default();
@@ -143,27 +192,36 @@ fn solidity_type(col: &TableColumn) -> &'static str {
 /// type involving this noun.
 fn emit_events(
     noun_name: &str,
-    domain: &Domain,
+    state: &Object,
     scope: Option<&hashbrown::HashSet<&str>>,
 ) -> String {
-    let events: Vec<String> = domain.fact_types.iter()
-        .filter(|(_, ft)| ft.roles.iter().any(|r| r.noun_name == noun_name))
-        .filter(|(_, ft)| match scope {
-            Some(set) => ft.roles.iter().all(|r| set.contains(r.noun_name.as_str())),
+    let ft_cell = fetch_or_phi("FactType", state);
+    let role_cell = fetch_or_phi("Role", state);
+    let fts = ft_cell.as_seq().unwrap_or(&[]);
+    let roles = role_cell.as_seq().unwrap_or(&[]);
+
+    let events: Vec<String> = fts.iter().filter_map(|f| {
+        let ft_id = binding(f, "id")?;
+        let reading = binding(f, "reading").unwrap_or("");
+        let ft_roles: Vec<&str> = roles.iter()
+            .filter(|r| binding(r, "factType") == Some(ft_id))
+            .filter_map(|r| binding(r, "nounName"))
+            .collect();
+        if !ft_roles.iter().any(|r| *r == noun_name) { return None; }
+        match scope {
+            Some(set) => { if !ft_roles.iter().all(|r| set.contains(r)) { return None; } }
             None => {
-                let distinct: hashbrown::HashSet<_> = ft.roles.iter()
-                    .map(|r| r.noun_name.as_str()).collect();
-                distinct.len() > 1 || ft.reading.contains(noun_name)
+                let distinct: hashbrown::HashSet<&str> = ft_roles.iter().copied().collect();
+                if distinct.len() <= 1 && !reading.contains(noun_name) { return None; }
             }
-        })
-        .filter_map(|(ft_id, ft)| {
-            let evt_name = sanitize_name(ft_id);
-            let args: Vec<String> = ft.roles.iter().enumerate().map(|(i, r)| {
-                let prefix = if i == 0 { "string indexed " } else { "string " };
-                format!("{}{}", prefix, sanitize_field(&r.noun_name))
-            }).collect();
-            Some(format!("    event {}({});", evt_name, args.join(", ")))
+        }
+        let evt_name = sanitize_name(ft_id);
+        let args: Vec<String> = ft_roles.iter().enumerate().map(|(i, r)| {
+            let prefix = if i == 0 { "string indexed " } else { "string " };
+            format!("{}{}", prefix, sanitize_field(r))
         }).collect();
+        Some(format!("    event {}({});", evt_name, args.join(", ")))
+    }).collect();
     if events.is_empty() { String::new() } else { format!("{}\n", events.join("\n")) }
 }
 
