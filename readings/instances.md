@@ -5,6 +5,7 @@
 Resource(.Reference) is an entity type.
 Fact is an entity type.
   Fact is a subtype of Resource.
+State Machine(.id) is an entity type.
 Event(.id) is an entity type.
 Guard Run(.Name) is an entity type.
 Citation(.id) is an entity type.
@@ -67,6 +68,15 @@ Fact uses Resource for Role.
   Each Fact uses at most one Resource for each Role.
   Each Fact uses some Resource for some Role.
 This association with Fact, Resource, Role provides the preferred identification scheme for Resource Role.
+
+### State Machine (runtime instance of State Machine Definition)
+State Machine is instance of State Machine Definition.
+  Each State Machine is instance of exactly one State Machine Definition.
+State Machine is for Resource.
+  Each Resource has at most one State Machine.
+State Machine is for Resource. *
+
+* State Machine is for Resource iff Resource is instance of Noun and some State Machine Definition is for that Noun.
 
 ### State (absorbed into Resource cell by RMAP)
 Resource is currently in Status.

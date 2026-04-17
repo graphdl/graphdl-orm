@@ -272,6 +272,9 @@ No Noun is subtype of itself.
 If Noun1 is subtype of Noun2, then Noun2 is not subtype of Noun1.
 If Noun1 is subtype of Noun2 and Noun2 is subtype of Noun3, then Noun1 is subtype of Noun3.
 
+No Derivation Rule depends on itself.
+If Derivation Rule 1 depends on Derivation Rule 2 and Derivation Rule 2 depends on Derivation Rule 3, then Derivation Rule 1 does not depend on Derivation Rule 3.
+
 ### External System
 External System has URL.
   Each External System has exactly one URL.
