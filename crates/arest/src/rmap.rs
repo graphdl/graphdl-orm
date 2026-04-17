@@ -19,7 +19,6 @@
 
 use serde::{Serialize, Deserialize};
 use hashbrown::{HashMap, HashSet};
-use crate::types::Domain;
 #[allow(unused_imports)]
 use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 
@@ -71,8 +70,8 @@ fn value_column_name(noun_name: &str) -> String {
     to_snake(noun_name)
 }
 
-fn column_name_for_target(ir: &Domain, noun_name: &str) -> String {
-    match ir.nouns.get(noun_name) {
+fn column_name_for_target(nouns: &HashMap<String, crate::types::NounDef>, noun_name: &str) -> String {
+    match nouns.get(noun_name) {
         Some(noun) if noun.object_type == "value" => value_column_name(noun_name),
         _ => fk_column_name(noun_name),
     }
@@ -90,14 +89,66 @@ fn compound_table_name(reading: &str, roles: &[crate::types::RoleDef], noun_name
 
 // -- RMAP core --------------------------------------------------------
 
-/// RMAP from Object state — the public API. Reconstructs Domain
-/// internally for now (#211 will eliminate this round-trip).
+/// RMAP from Object state — reads cells directly. No Domain round-trip.
 pub fn rmap_from_state(state: &crate::ast::Object) -> Vec<TableDef> {
-    let domain = crate::compile::state_to_domain(state);
-    rmap(&domain)
+    rmap(state)
 }
 
-pub fn rmap(ir: &Domain) -> Vec<TableDef> {
+pub fn rmap(state: &crate::ast::Object) -> Vec<TableDef> {
+    use crate::ast::{fetch_or_phi, binding};
+    use crate::types::*;
+
+    // Build typed lookups from cells — same data state_to_domain
+    // produced, without the Domain struct.
+    let noun_cell = fetch_or_phi("Noun", state);
+    let mut nouns: HashMap<String, NounDef> = HashMap::new();
+    let mut subtypes: HashMap<String, String> = HashMap::new();
+    let mut ref_schemes: HashMap<String, Vec<String>> = HashMap::new();
+    let mut enum_values: HashMap<String, Vec<String>> = HashMap::new();
+    if let Some(ns) = noun_cell.as_seq() {
+        for f in ns.iter() {
+            let name = binding(f, "name").unwrap_or("").to_string();
+            let obj_type = binding(f, "objectType").unwrap_or("entity").to_string();
+            nouns.insert(name.clone(), NounDef { object_type: obj_type, world_assumption: WorldAssumption::default() });
+            if let Some(st) = binding(f, "superType") { subtypes.insert(name.clone(), st.to_string()); }
+            if let Some(v) = binding(f, "referenceScheme") { ref_schemes.insert(name.clone(), v.split(',').map(|s| s.to_string()).collect()); }
+            if let Some(v) = binding(f, "enumValues") { enum_values.insert(name.clone(), v.split(',').map(|s| s.to_string()).collect()); }
+        }
+    }
+    let role_cell = fetch_or_phi("Role", state);
+    let fact_types: HashMap<String, FactTypeDef> = fetch_or_phi("FactType", state).as_seq()
+        .map(|facts| facts.iter().filter_map(|f| {
+            let id = binding(f, "id")?.to_string();
+            let reading = binding(f, "reading").unwrap_or("").to_string();
+            let roles: Vec<RoleDef> = role_cell.as_seq()
+                .map(|rs| rs.iter()
+                    .filter(|r| binding(r, "factType") == Some(&id))
+                    .map(|r| RoleDef {
+                        noun_name: binding(r, "nounName").unwrap_or("").to_string(),
+                        role_index: binding(r, "position").and_then(|v| v.parse().ok()).unwrap_or(0),
+                    }).collect())
+                .unwrap_or_default();
+            Some((id, FactTypeDef { schema_id: String::new(), reading, readings: vec![], roles }))
+        }).collect())
+        .unwrap_or_default();
+    let constraints: Vec<ConstraintDef> = fetch_or_phi("Constraint", state).as_seq()
+        .map(|facts| facts.iter().map(|f| {
+            let get = |key: &str| binding(f, key).map(|s| s.to_string());
+            let spans = (0..4).filter_map(|i| {
+                let ft_id = get(&format!("span{}_factTypeId", i))?;
+                let ri = get(&format!("span{}_roleIndex", i))?;
+                Some(SpanDef { fact_type_id: ft_id, role_index: ri.parse().unwrap_or(0), subset_autofill: None })
+            }).collect();
+            ConstraintDef {
+                id: get("id").unwrap_or_default(), kind: get("kind").unwrap_or_default(),
+                modality: get("modality").unwrap_or_default(), deontic_operator: get("deonticOperator"),
+                text: get("text").unwrap_or_default(), spans,
+                set_comparison_argument_length: None, clauses: None, entity: get("entity"),
+                min_occurrence: None, max_occurrence: None,
+            }
+        }).collect())
+        .unwrap_or_default();
+
     let mut tables: Vec<TableDef> = Vec::new();
     let mut emitted: HashSet<String> = HashSet::new();
 
@@ -105,12 +156,12 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
     let mut binarized_ft_ids: HashSet<String> = HashSet::new();
     let mut xo_columns: HashMap<String, Vec<(String, Vec<String>, bool)>> = HashMap::new();
 
-    ir.constraints.iter()
+    constraints.iter()
         .filter(|c| c.kind == "XO" && c.spans.len() >= 2)
         .filter_map(|constraint| {
             let ft_ids: Vec<&str> = constraint.spans.iter().map(|s| s.fact_type_id.as_str()).collect();
             let unary_fts: Vec<_> = ft_ids.iter()
-                .filter_map(|id| ir.fact_types.get(*id))
+                .filter_map(|id| fact_types.get(*id))
                 .filter(|ft| ft.roles.len() == 1).collect();
             (unary_fts.len() >= 2).then_some((ft_ids, unary_fts))
         })
@@ -122,8 +173,8 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
             ).collect();
             binarized_ft_ids.extend(ft_ids.iter().map(|id| id.to_string()));
             let is_mandatory = unary_fts.iter().any(|ft| {
-                let ft_id_str = ft_ids.iter().find(|id| ir.fact_types.get(**id).map(|f| core::ptr::eq(f, *ft)).unwrap_or(false));
-                ft_id_str.map_or(false, |fid| ir.constraints.iter().any(|c| c.kind == "MC" && c.spans.iter().any(|s| s.fact_type_id == *fid)))
+                let ft_id_str = ft_ids.iter().find(|id| fact_types.get(**id).map(|f| core::ptr::eq(f, *ft)).unwrap_or(false));
+                ft_id_str.map_or(false, |fid| constraints.iter().any(|c| c.kind == "MC" && c.spans.iter().any(|s| s.fact_type_id == *fid)))
             });
             let col_name = if values.iter().any(|v| v.to_lowercase() == "male" || v.to_lowercase() == "female") { "sex" } else { "status" }.to_string();
             xo_columns.entry(entity_name.clone()).or_default().push((col_name, values, !is_mandatory));
@@ -133,7 +184,7 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
     // Determine which subtypes have their own fact types (partitioned strategy)
     // vs which should be absorbed into the supertype (single-table strategy).
     let mut parent_of: HashMap<String, String> = HashMap::new();
-    ir.subtypes.iter().for_each(|(name, st)| { parent_of.insert(name.clone(), st.clone()); });
+    subtypes.iter().for_each(|(name, st)| { parent_of.insert(name.clone(), st.clone()); });
     let subtype_to_root: HashMap<String, String> = parent_of.keys().map(|name| {
         let root = core::iter::successors(Some(name.clone()), |cur| parent_of.get(cur).cloned())
             .take(100) // cycle guard
@@ -143,7 +194,7 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
 
     // Detect subtypes that have their own fact types -> partitioned strategy
     let partitioned_subtypes: HashSet<String> = subtype_to_root.keys()
-        .filter(|name| ir.fact_types.values().any(|ft| ft.roles.iter().any(|r| &r.noun_name == *name)))
+        .filter(|name| fact_types.values().any(|ft| ft.roles.iter().any(|r| &r.noun_name == *name)))
         .cloned()
         .collect();
 
@@ -162,7 +213,7 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
         HashMap<String, Vec<Vec<usize>>>,
         HashSet<String>,
         HashMap<String, Vec<String>>,
-    ) = ir.constraints.iter().fold(
+    ) = constraints.iter().fold(
         (HashMap::new(), HashSet::new(), HashMap::new()),
         |(mut ucs, mut mc, mut vcs), c| {
             match c.kind.as_str() {
@@ -179,7 +230,7 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
                 }
                 "VC" => {
                     c.entity.as_ref()
-                        .and_then(|e| ir.enum_values.get(e))
+                        .and_then(|e| enum_values.get(e))
                         .into_iter()
                         .for_each(|vals| {
                             c.spans.iter().for_each(|span| {
@@ -195,7 +246,7 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
 
     // -- Classify fact types -----------------------------------------
     // Classify: Filter(binary ∧ ¬binarized) then partition by UC arity
-    let classified: Vec<(&str, bool, bool)> = ir.fact_types.iter()
+    let classified: Vec<(&str, bool, bool)> = fact_types.iter()
         .filter(|(ft_id, ft)| !binarized_ft_ids.contains(*ft_id) && ft.roles.len() >= 2)
         .map(|(ft_id, _)| {
             let ucs = ucs_by_ft.get(ft_id).cloned().unwrap_or_default();
@@ -206,27 +257,27 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
 
     // Detect 1:1: both roles have single-role UCs
     let one_to_one_ft_ids: HashSet<String> = functional_facts.iter()
-        .filter(|ft_id| ir.fact_types[**ft_id].roles.len() == 2)
+        .filter(|ft_id| fact_types[**ft_id].roles.len() == 2)
         .filter(|ft_id| {
             let ucs = ucs_by_ft.get(**ft_id).cloned().unwrap_or_default();
             let singles: Vec<usize> = ucs.iter().filter(|uc| uc.len() == 1).map(|uc| uc[0]).collect();
-            let ft = &ir.fact_types[**ft_id];
+            let ft = &fact_types[**ft_id];
             singles.contains(&ft.roles[0].role_index) && singles.contains(&ft.roles[1].role_index)
         })
         .map(|id| id.to_string())
         .collect();
 
     // -- Step 1: Compound UC -> separate table ------------------------
-    let noun_name_set: HashSet<String> = ir.nouns.keys().cloned().collect();
+    let noun_name_set: HashSet<String> = nouns.keys().cloned().collect();
 
     let compound_tables: Vec<TableDef> = compound_facts.iter().map(|ft_id| {
-        let ft = &ir.fact_types[*ft_id];
+        let ft = &fact_types[*ft_id];
         let ucs = ucs_by_ft.get(*ft_id).unwrap();
         let spanning_uc = ucs.iter().max_by_key(|uc| uc.len()).unwrap();
 
         let columns: Vec<TableColumn> = ft.roles.iter().map(|role| {
-            let col_name = column_name_for_target(ir, &role.noun_name);
-            let is_entity = ir.nouns.get(&role.noun_name).map_or(false, |n| n.object_type == "entity");
+            let col_name = column_name_for_target(&nouns, &role.noun_name);
+            let is_entity = nouns.get(&role.noun_name).map_or(false, |n| n.object_type == "entity");
             TableColumn {
                 name: col_name,
                 col_type: "TEXT".to_string(),
@@ -236,7 +287,7 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
         }).collect();
         let pk_cols: Vec<String> = ft.roles.iter()
             .filter(|role| spanning_uc.contains(&role.role_index))
-            .map(|role| column_name_for_target(ir, &role.noun_name))
+            .map(|role| column_name_for_target(&nouns, &role.noun_name))
             .collect();
 
         let table_name = compound_table_name(&ft.reading, &ft.roles, &noun_name_set);
@@ -251,35 +302,35 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
     // reduced into entity_columns via foldl (Backus insert combining form).
     // No external state mutation — each stream is computed from inputs only.
 
-    let noun_ft_count: HashMap<&str, usize> = ir.fact_types.values()
+    let noun_ft_count: HashMap<&str, usize> = fact_types.values()
         .flat_map(|ft| ft.roles.iter().map(|r| r.noun_name.as_str()))
         .fold(HashMap::new(), |mut acc, name| { *acc.entry(name).or_insert(0) += 1; acc });
 
     let functional_additions: Vec<(String, TableColumn, Option<String>)> = functional_facts.iter()
         .filter(|ft_id| !one_to_one_ft_ids.contains(**ft_id))
         .flat_map(|ft_id| {
-            let ft = &ir.fact_types[*ft_id];
+            let ft = &fact_types[*ft_id];
             ucs_by_ft.get(*ft_id).cloned().unwrap_or_default().into_iter()
                 .filter(|uc| uc.len() == 1)
-                .filter_map(move |uc| {
+                .filter_map(|uc| {
                     let source_role_idx = uc[0];
                     let source_role = ft.roles.iter().find(|r| r.role_index == source_role_idx)?;
-                    ir.nouns.get(&source_role.noun_name)
+                    nouns.get(&source_role.noun_name)
                         .filter(|n| n.object_type == "entity")?;
                     Some((*ft_id, source_role, source_role_idx))
                 })
                 .collect::<Vec<_>>()
         })
         .flat_map(|(ft_id, source_role, source_role_idx)| {
-            let ft = &ir.fact_types[ft_id];
+            let ft = &fact_types[ft_id];
             let entity_key = resolve_entity(&source_role.noun_name);
             let is_subtype = subtype_names.contains(&source_role.noun_name);
             let is_mandatory = mc_set.contains(&format!("{}:{}", ft_id, source_role_idx));
             ft.roles.iter()
                 .filter(|role| role.role_index != source_role_idx)
                 .map(|role| {
-                    let col_name = column_name_for_target(ir, &role.noun_name);
-                    let is_entity = ir.nouns.get(&role.noun_name).map_or(false, |n| n.object_type == "entity");
+                    let col_name = column_name_for_target(&nouns, &role.noun_name);
+                    let is_entity = nouns.get(&role.noun_name).map_or(false, |n| n.object_type == "entity");
                     let column = TableColumn {
                         name: col_name.clone(),
                         col_type: "TEXT".to_string(),
@@ -300,7 +351,7 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
     // 1:1 absorption: direction bias via pure if-expression chain.
     // (Control flow has no side effects — returns a tuple, inputs → output.)
     let one_to_one_additions: Vec<(String, TableColumn, Option<String>)> = one_to_one_ft_ids.iter().map(|ft_id| {
-        let ft = &ir.fact_types[ft_id];
+        let ft = &fact_types[ft_id];
         let role0 = &ft.roles[0];
         let role1 = &ft.roles[1];
         let mc0 = mc_set.contains(&format!("{}:{}", ft_id, role0.role_index));
@@ -311,8 +362,8 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
         } else if mc1 && !mc0 {
             (resolve_entity(&role1.noun_name), &role0.noun_name, true)
         } else {
-            let is_entity0 = ir.nouns.get(&role0.noun_name).map_or(false, |n| n.object_type == "entity");
-            let is_entity1 = ir.nouns.get(&role1.noun_name).map_or(false, |n| n.object_type == "entity");
+            let is_entity0 = nouns.get(&role0.noun_name).map_or(false, |n| n.object_type == "entity");
+            let is_entity1 = nouns.get(&role1.noun_name).map_or(false, |n| n.object_type == "entity");
             let both_mandatory = mc0 && mc1;
             if is_entity0 && !is_entity1 {
                 (resolve_entity(&role0.noun_name), &role1.noun_name, both_mandatory)
@@ -329,9 +380,9 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
                 }
             }
         };
-        let is_target_entity = ir.nouns.get(fk_target.as_str()).map_or(false, |n| n.object_type == "entity");
+        let is_target_entity = nouns.get(fk_target.as_str()).map_or(false, |n| n.object_type == "entity");
         let column = TableColumn {
-            name: column_name_for_target(ir, fk_target),
+            name: column_name_for_target(&nouns, fk_target),
             col_type: "TEXT".to_string(),
             nullable: !is_mandatory,
             references: if is_target_entity { Some(to_snake(fk_target)) } else { None },
@@ -373,15 +424,15 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
     // External UCs span multiple fact types. Each span contributes a column
     // to the target entity's table. Pure iter chain; last span with a
     // determinable target wins (matches prior semantics).
-    let external_ucs: HashMap<String, Vec<Vec<String>>> = ir.constraints.iter()
+    let external_ucs: HashMap<String, Vec<Vec<String>>> = constraints.iter()
         .filter(|c| c.kind == "UC" && c.spans.len() >= 2)
         .filter(|c| c.spans.iter().map(|s| s.fact_type_id.as_str()).collect::<HashSet<_>>().len() >= 2)
         .filter_map(|c| {
             let (uc_cols, target_entity): (Vec<String>, Option<String>) = c.spans.iter()
                 .filter_map(|span| {
-                    let ft = ir.fact_types.get(&span.fact_type_id)?;
+                    let ft = fact_types.get(&span.fact_type_id)?;
                     let uc_role = ft.roles.iter().find(|r| r.role_index == span.role_index)?;
-                    let col_name = column_name_for_target(ir, &uc_role.noun_name);
+                    let col_name = column_name_for_target(&nouns, &uc_role.noun_name);
                     let target = ft.roles.iter()
                         .filter(|role| role.role_index != span.role_index)
                         .last()
@@ -414,13 +465,13 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
             let is_partitioned_subtype = partitioned_subtypes.contains(entity_name);
 
             // Feature #59: Compound reference scheme -> composite PK
-            let compound_ref = ir.ref_schemes.get(entity_name)
+            let compound_ref = ref_schemes.get(entity_name)
                 .filter(|parts| parts.len() >= 2);
 
             let (all_cols, pk) = if let Some(ref_parts) = compound_ref {
                 // Compound reference scheme: use ref parts as composite PK
                 let pk_cols: Vec<String> = ref_parts.iter()
-                    .map(|part| column_name_for_target(ir, part))
+                    .map(|part| column_name_for_target(&nouns, part))
                     .collect();
                 // No synthetic "id" column; columns are already present from functional absorption
                 (columns.iter().cloned().collect::<Vec<_>>(), pk_cols)
@@ -471,7 +522,7 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
     referenced.iter()
         .filter(|ref_table| !emitted.contains(*ref_table))
         .filter_map(|ref_table| {
-            let (name, _) = ir.nouns.iter().find(|(name, def)| to_snake(name) == *ref_table && def.object_type == "entity")?;
+            let (name, _) = nouns.iter().find(|(name, def)| to_snake(name) == *ref_table && def.object_type == "entity")?;
             (!(subtype_names.contains(name) && !partitioned_subtypes.contains(name))).then_some(())?;
             Some(ref_table.clone())
         })
@@ -491,10 +542,6 @@ pub fn rmap(ir: &Domain) -> Vec<TableDef> {
 
 // -- WASM export -----------------------------------------------------
 
-/// Run RMAP on the currently loaded IR and return table definitions as JSON.
-pub fn rmap_from_loaded_ir(ir: &Domain) -> Vec<TableDef> {
-    rmap(ir)
-}
 
 /// Cell assignment: fact_type_id → owning cell name (paper Eq. demux).
 ///
@@ -507,16 +554,60 @@ pub fn rmap_from_loaded_ir(ir: &Domain) -> Vec<TableDef> {
 ///   E_n = Filter(eq ∘ [RMAP, n̄]) : E
 /// rmap_cell_map from Object state — no Domain round-trip.
 pub fn rmap_cell_map_from_state(state: &crate::ast::Object) -> HashMap<String, String> {
-    let domain = crate::compile::state_to_domain(state);
-    rmap_cell_map(&domain)
+    rmap_cell_map(state)
 }
 
-pub fn rmap_cell_map(ir: &Domain) -> HashMap<String, String> {
+pub fn rmap_cell_map(state: &crate::ast::Object) -> HashMap<String, String> {
+    use crate::ast::{fetch_or_phi, binding};
+    use crate::types::*;
+    let mut nouns: HashMap<String, NounDef> = HashMap::new();
+    let mut subtypes: HashMap<String, String> = HashMap::new();
+    if let Some(ns) = fetch_or_phi("Noun", state).as_seq() {
+        for f in ns.iter() {
+            let name = binding(f, "name").unwrap_or("").to_string();
+            let obj_type = binding(f, "objectType").unwrap_or("entity").to_string();
+            nouns.insert(name.clone(), NounDef { object_type: obj_type, world_assumption: WorldAssumption::default() });
+            if let Some(st) = binding(f, "superType") { subtypes.insert(name.clone(), st.to_string()); }
+        }
+    }
+    let role_cell = fetch_or_phi("Role", state);
+    let fact_types: HashMap<String, FactTypeDef> = fetch_or_phi("FactType", state).as_seq()
+        .map(|facts| facts.iter().filter_map(|f| {
+            let id = binding(f, "id")?.to_string();
+            let reading = binding(f, "reading").unwrap_or("").to_string();
+            let roles: Vec<RoleDef> = role_cell.as_seq()
+                .map(|rs| rs.iter()
+                    .filter(|r| binding(r, "factType") == Some(&id))
+                    .map(|r| RoleDef {
+                        noun_name: binding(r, "nounName").unwrap_or("").to_string(),
+                        role_index: binding(r, "position").and_then(|v| v.parse().ok()).unwrap_or(0),
+                    }).collect())
+                .unwrap_or_default();
+            Some((id, FactTypeDef { schema_id: String::new(), reading, readings: vec![], roles }))
+        }).collect())
+        .unwrap_or_default();
+    let constraints: Vec<ConstraintDef> = fetch_or_phi("Constraint", state).as_seq()
+        .map(|facts| facts.iter().map(|f| {
+            let get = |key: &str| binding(f, key).map(|s| s.to_string());
+            let spans = (0..4).filter_map(|i| {
+                let ft_id = get(&format!("span{}_factTypeId", i))?;
+                let ri = get(&format!("span{}_roleIndex", i))?;
+                Some(SpanDef { fact_type_id: ft_id, role_index: ri.parse().unwrap_or(0), subset_autofill: None })
+            }).collect();
+            ConstraintDef {
+                id: get("id").unwrap_or_default(), kind: get("kind").unwrap_or_default(),
+                modality: get("modality").unwrap_or_default(), deontic_operator: get("deonticOperator"),
+                text: get("text").unwrap_or_default(), spans,
+                set_comparison_argument_length: None, clauses: None, entity: get("entity"),
+                min_occurrence: None, max_occurrence: None,
+            }
+        }).collect())
+        .unwrap_or_default();
     let mut map = HashMap::new();
-    let noun_name_set: HashSet<String> = ir.nouns.keys().cloned().collect();
+    let noun_name_set: HashSet<String> = nouns.keys().cloned().collect();
 
     // Index UCs by fact type (same as RMAP step classification)
-    let ucs_by_ft: HashMap<String, Vec<Vec<usize>>> = ir.constraints.iter()
+    let ucs_by_ft: HashMap<String, Vec<Vec<usize>>> = constraints.iter()
         .filter(|c| c.kind == "UC")
         .fold(HashMap::new(), |mut acc, c| {
             let roles: Vec<usize> = c.spans.iter().map(|s| s.role_index).collect();
@@ -527,7 +618,7 @@ pub fn rmap_cell_map(ir: &Domain) -> HashMap<String, String> {
         });
 
     // Subtype resolution
-    let parent_of: HashMap<&str, &str> = ir.subtypes.iter()
+    let parent_of: HashMap<&str, &str> = subtypes.iter()
         .map(|(k, v)| (k.as_str(), v.as_str())).collect();
     let resolve_root = |name: &str| -> String {
         let mut cur = name.to_string();
@@ -540,7 +631,7 @@ pub fn rmap_cell_map(ir: &Domain) -> HashMap<String, String> {
         cur
     };
 
-    for (ft_id, ft) in &ir.fact_types {
+    for (ft_id, ft) in &fact_types {
         if ft.roles.is_empty() { continue; }
 
         // Unary: entity cell
@@ -582,6 +673,10 @@ pub fn rmap_cell_map(ir: &Domain) -> HashMap<String, String> {
 mod tests {
     use super::*;
     use crate::types::*;
+
+    fn to_state(ir: &Domain) -> crate::ast::Object {
+        crate::parse_forml2::domain_to_state(ir)
+    }
 
     fn make_ir(
         nouns: Vec<(&str, &str)>,
@@ -641,7 +736,7 @@ mod tests {
             vec![("ft1", "Person has Name", vec![("Person", 0), ("Name", 1)])],
             vec![("UC", vec![("ft1", 0)])], // UC on Person -> each Person has at most one Name
         );
-        let tables = rmap(&ir);
+        let tables = rmap(&to_state(&ir));
         assert_eq!(tables.len(), 1);
         assert_eq!(tables[0].name, "person");
         assert_eq!(tables[0].columns.len(), 2); // id + name
@@ -657,7 +752,7 @@ mod tests {
             vec![("ft1", "Person teaches Course", vec![("Person", 0), ("Course", 1)])],
             vec![("UC", vec![("ft1", 0), ("ft1", 1)])], // compound UC
         );
-        let tables = rmap(&ir);
+        let tables = rmap(&to_state(&ir));
         assert!(tables.iter().any(|t| t.name == "person_teaches_course"));
         let jt = tables.iter().find(|t| t.name == "person_teaches_course").unwrap();
         assert_eq!(jt.primary_key.len(), 2);
@@ -674,7 +769,7 @@ mod tests {
                 ("MC", vec![("ft1", 0)]),
             ],
         );
-        let tables = rmap(&ir);
+        let tables = rmap(&to_state(&ir));
         let person = tables.iter().find(|t| t.name == "person").unwrap();
         let name_col = person.columns.iter().find(|c| c.name == "name").unwrap();
         assert!(!name_col.nullable); // MC -> NOT NULL
@@ -688,7 +783,7 @@ mod tests {
             vec![("ft1", "Order belongs to Customer", vec![("Order", 0), ("Customer", 1)])],
             vec![("UC", vec![("ft1", 0)])],
         );
-        let tables = rmap(&ir);
+        let tables = rmap(&to_state(&ir));
         let order = tables.iter().find(|t| t.name == "order").unwrap();
         let cust_col = order.columns.iter().find(|c| c.name == "customer_id").unwrap();
         assert_eq!(cust_col.references.as_deref(), Some("customer"));
@@ -702,7 +797,7 @@ mod tests {
             vec![("ft1", "Order belongs to Customer", vec![("Order", 0), ("Customer", 1)])],
             vec![("UC", vec![("ft1", 0)])],
         );
-        let tables = rmap(&ir);
+        let tables = rmap(&to_state(&ir));
         let customer = tables.iter().find(|t| t.name == "customer").unwrap();
         assert_eq!(customer.columns.len(), 1); // just id
         assert_eq!(customer.primary_key, vec!["id"]);
@@ -732,7 +827,7 @@ mod tests {
                 ("UC", vec![("ft1", 1), ("ft2", 1)]),
             ],
         );
-        let tables = rmap(&ir);
+        let tables = rmap(&to_state(&ir));
         let room = tables.iter().find(|t| t.name == "room").unwrap();
         // Room table should have columns: id, building_id, room_nr
         assert!(room.columns.iter().any(|c| c.name == "building_id"));
@@ -784,7 +879,7 @@ mod tests {
             ],
             vec![("Employee", "Person")],
         );
-        let tables = rmap(&ir);
+        let tables = rmap(&to_state(&ir));
         let table_names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
         // Person table should exist with name column but NOT salary
         let person = tables.iter().find(|t| t.name == "person").unwrap();
@@ -821,7 +916,7 @@ mod tests {
             ],
             vec![("VIPCustomer", "Person")],
         );
-        let tables = rmap(&ir);
+        let tables = rmap(&to_state(&ir));
         let table_names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
         // VIPCustomer should NOT get its own table (no fact types of its own)
         assert!(!table_names.contains(&"v_i_p_customer") && !table_names.contains(&"vip_customer"),
@@ -868,7 +963,7 @@ mod tests {
             ],
             vec![("Room", vec!["Building", "RoomNr"])],
         );
-        let tables = rmap(&ir);
+        let tables = rmap(&to_state(&ir));
         let room = tables.iter().find(|t| t.name == "room").unwrap();
         // PK should be composite: (building_id, room_nr)
         assert_eq!(room.primary_key.len(), 2,
@@ -894,7 +989,7 @@ mod tests {
                 ("UC", vec![("ft1", 1)]),
             ],
         );
-        let tables = rmap(&ir);
+        let tables = rmap(&to_state(&ir));
         // Country table should absorb country_code
         let country = tables.iter().find(|t| t.name == "country").unwrap();
         assert!(country.columns.iter().any(|c| c.name == "country_code"),
@@ -922,7 +1017,7 @@ mod tests {
                 ("UC", vec![("ft2", 0)]),
             ],
         );
-        let tables = rmap(&ir);
+        let tables = rmap(&to_state(&ir));
         let person = tables.iter().find(|t| t.name == "person").unwrap();
         assert!(person.columns.iter().any(|c| c.name == "ssn_id"),
             "Person should absorb ssn_id, columns: {:?}",
@@ -941,7 +1036,7 @@ mod tests {
                 ("UC", vec![("ft1", 1)]),
             ],
         );
-        let tables = rmap(&ir);
+        let tables = rmap(&to_state(&ir));
         let husband = tables.iter().find(|t| t.name == "husband").unwrap();
         assert!(husband.columns.iter().any(|c| c.name == "wife_id"),
             "Husband should absorb wife_id (reading direction), columns: {:?}",

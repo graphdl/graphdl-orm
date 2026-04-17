@@ -212,7 +212,8 @@ fn openapi_from_state(state: &Object, app_name: &str) -> serde_json::Value {
 /// `pub(crate)` so `compile.rs` can register the document cell without
 /// round-tripping through state for every App.
 pub(crate) fn openapi_for_app(domain: &Domain, app_name: &str) -> serde_json::Value {
-    let tables = rmap::rmap(domain);
+    let state_obj = crate::parse_forml2::domain_to_state(domain);
+    let tables = rmap::rmap(&state_obj);
     let tables_by_entity: HashMap<String, &TableDef> = tables.iter()
         .map(|t| (t.name.clone(), t))
         .collect();
