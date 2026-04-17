@@ -1580,13 +1580,6 @@ pub(crate) fn cell_index_from_state(state: &crate::ast::Object) -> CellIndex {
         subtypes, ref_schemes, enum_values, general_instance_facts, state_machines }
 }
 
-/// Test-only convenience: compile a Domain via Object state (Thm 2 pipeline).
-/// Per #211, there is no direct Domainâ†’CompiledModel path â€” only via Î¦.
-#[cfg(test)]
-pub(crate) fn compile_from_domain(ir: &crate::parse_forml2::Domain) -> CompiledModel {
-    compile(&crate::parse_forml2::domain_to_state(ir))
-}
-
 pub(crate) fn compile(state: &crate::ast::Object) -> CompiledModel {
     let td = profile_timer::now();
     let data = cell_index_from_state(state);
@@ -1595,8 +1588,6 @@ pub(crate) fn compile(state: &crate::ast::Object) -> CompiledModel {
 }
 
 /// Core compilation: CellIndex -> CompiledModel.
-/// Both `compile` (from Object state) and `compile_from_domain` (from Domain)
-/// delegate here after building CellIndex.
 fn compile_data(data: &CellIndex) -> CompiledModel {
     let t0 = profile_timer::now();
     let constraints: Vec<CompiledConstraint> = data.constraints.iter()
