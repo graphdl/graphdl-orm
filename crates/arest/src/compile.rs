@@ -346,22 +346,42 @@ fn derive_state_machines_from_facts(facts: &[GeneralInstanceFact]) -> HashMap<St
     let mut machines = facts.iter()
         .filter(|f| f.subject_noun == "State Machine Definition" && f.object_noun == "Noun")
         .fold(machines, |mut acc, f| {
-            acc.entry(f.subject_value.clone()).or_insert(StateMachineDef {
-                noun_name: f.object_value.clone(), statuses: vec![], transitions: vec![],
+            acc.entry(f.subject_value.clone()).or_insert_with(|| StateMachineDef {
+                noun_name: f.object_value.clone(), ..Default::default()
             });
             acc
         });
 
-    // Pass 2: fold initial statuses (Status 'S' is initial in SM Definition 'X')
-    // Î±(fact â†’ (sm_key, status)) : filtered_facts â†’ for_each(insert_if_absent)
-    let status_inserts: Vec<(String, String)> = facts.iter()
-        .filter(|f| f.subject_noun == "Status" && f.object_noun == "State Machine Definition")
+    // Pass 2: set sm.initial explicitly from declared facts of the form
+    // `Status 'S' is initial in State Machine Definition 'X'` and append
+    // S to the status set. This is the paper's §4 declaration; the
+    // assignment goes to sm.initial, not to statuses[0] — position-in-
+    // list is not initial-hood.
+    let initial_decls: Vec<(String, String)> = facts.iter()
+        .filter(|f| f.subject_noun == "Status"
+            && f.object_noun == "State Machine Definition"
+            && f.field_name.to_lowercase().contains("initial"))
         .map(|f| (f.object_value.clone(), f.subject_value.clone()))
         .collect();
-    status_inserts.into_iter().for_each(|(sm_key, status)| {
+    initial_decls.into_iter().for_each(|(sm_key, status)| {
+        if let Some(sm) = machines.get_mut(&sm_key) {
+            if !sm.statuses.contains(&status) { sm.statuses.push(status.clone()); }
+            if sm.initial.is_empty() { sm.initial = status; }
+        }
+    });
+
+    // Pass 2b: non-initial `Status 'S' is defined in SM 'X'` facts just
+    // register the status; they do not set initial.
+    let status_decls: Vec<(String, String)> = facts.iter()
+        .filter(|f| f.subject_noun == "Status"
+            && f.object_noun == "State Machine Definition"
+            && !f.field_name.to_lowercase().contains("initial"))
+        .map(|f| (f.object_value.clone(), f.subject_value.clone()))
+        .collect();
+    status_decls.into_iter().for_each(|(sm_key, status)| {
         machines.get_mut(&sm_key).into_iter()
             .filter(|sm| !sm.statuses.contains(&status))
-            .for_each(|sm| sm.statuses.insert(0, status.clone()));
+            .for_each(|sm| sm.statuses.push(status.clone()));
     });
 
     // Pass 3: fold transition facts into lookup maps
@@ -423,21 +443,22 @@ fn derive_state_machines_from_facts(facts: &[GeneralInstanceFact]) -> HashMap<St
             });
         });
 
-    // Pass 4: resolve initial status by graph topology.
+    // Pass 4: derive initial status from transition facts only when no
+    // explicit declaration was asserted. A status is "initial" by graph
+    // topology if it appears as the source of some transition but never
+    // as a target — no other status can reach it, so it must be where
+    // the fold starts. Both endpoints are transition facts per §5.1, so
+    // this is a derivation from facts (Thm 5), not a positional fallback.
     //
-    // A status is "initial" if it appears as the source of some transition
-    // but never as a target â€” there is no way to reach it from any other
-    // status, so it must be where the machine starts. The dual ("terminal")
-    // appears only as a target.
-    //
-    // If the graph gives exactly one initial, trust it. If it gives several,
-    // prefer the explicitly declared `Status 'X' is initial in SM 'Y'` if it
-    // is in the set. If neither â€” all statuses are reachable from each other
-    // (cyclic) â€” fall back to the first declared status.
-    //
-    // This replaces the brittle insertion-order convention that used to put
-    // the LAST explicitly-declared initial at statuses[0].
+    // If sm.initial was set in Pass 2, leave it. Otherwise set it only
+    // when graph topology gives a UNIQUE source-never-target. When
+    // ambiguous (multiple or cyclic), leave sm.initial empty: the
+    // machine has no declared start, and compile_state_machine will
+    // emit an empty initial that fails visibly at the first SM call.
+    // No insertion-order / first-declared fallback — that was the
+    // "hardcoded init" this task rejects.
     for sm in machines.values_mut() {
+        if !sm.initial.is_empty() { continue; }
         if sm.transitions.is_empty() { continue; }
         let sources: HashSet<&str> = sm.transitions.iter().map(|t| t.from.as_str()).collect();
         let targets: HashSet<&str> = sm.transitions.iter().map(|t| t.to.as_str()).collect();
@@ -445,17 +466,8 @@ fn derive_state_machines_from_facts(facts: &[GeneralInstanceFact]) -> HashMap<St
             .filter(|s| sources.contains(s.as_str()) && !targets.contains(s.as_str()))
             .cloned()
             .collect();
-        let declared_initial = sm.statuses.first().cloned();
-        let chosen = match graph_initials.len() {
-            1 => graph_initials[0].clone(),
-            0 => declared_initial.unwrap_or_default(),
-            _ => declared_initial
-                .filter(|d| graph_initials.contains(d))
-                .unwrap_or_else(|| graph_initials[0].clone()),
-        };
-        if !chosen.is_empty() {
-            sm.statuses.retain(|s| s != &chosen);
-            sm.statuses.insert(0, chosen);
+        if graph_initials.len() == 1 {
+            sm.initial = graph_initials.into_iter().next().unwrap();
         }
     }
 
@@ -4227,7 +4239,23 @@ fn compile_state_machine(
         .map(|c| (c.id.as_str(), &c.func))
         .collect();
 
-    let initial = def.statuses.first().cloned().unwrap_or_default();
+    // s_0 for the fold (Thm 3, §5.1). Comes from the explicit
+    // `Status 'X' is initial in SM 'Y'` declaration, or from unique
+    // source-never-target graph inference when no declaration exists.
+    // Empty if neither path resolved — compile emits the empty string
+    // and the runtime fails explicitly at first SM call. No insertion-
+    // order fallback: position in the status list does not make a
+    // status initial.
+    let initial = if !def.initial.is_empty() {
+        def.initial.clone()
+    } else {
+        let sources: HashSet<&str> = def.transitions.iter().map(|t| t.from.as_str()).collect();
+        let targets: HashSet<&str> = def.transitions.iter().map(|t| t.to.as_str()).collect();
+        let graph_initials: Vec<&String> = def.statuses.iter()
+            .filter(|s| sources.contains(s.as_str()) && !targets.contains(s.as_str()))
+            .collect();
+        if graph_initials.len() == 1 { graph_initials[0].clone() } else { String::new() }
+    };
 
     // -- Hierarchical composition (Harel statecharts) ----------------
     // If a transition's source is the SM Definition name (which IS a Status

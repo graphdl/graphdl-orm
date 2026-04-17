@@ -239,12 +239,19 @@ pub struct SpanDef {
     pub subset_autofill: Option<bool>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StateMachineDef {
     pub noun_name: String,
     pub statuses: Vec<String>,
     pub transitions: Vec<TransitionDef>,
+    /// Explicitly declared initial status. Empty when neither
+    /// `Status 'X' is initial in SM Definition 'Y'` was asserted nor
+    /// graph-topology inference (source-never-target) gave a unique
+    /// answer. The compiled machine fails visibly at first SM call
+    /// when empty — per Thm 3, the fold needs s_0.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub initial: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

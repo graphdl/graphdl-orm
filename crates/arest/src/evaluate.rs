@@ -687,6 +687,7 @@ mod tests {
                 TransitionDef { from: "Under Review".to_string(), to: "Rejected".to_string(), event: "rejected".to_string(), guard: None },
                 TransitionDef { from: "Approved".to_string(), to: "Applied".to_string(), event: "applied".to_string(), guard: None },
             ],
+            initial: String::new(),
         });
 
         let (_meta_state, defs, def_map) = compile_cells(cells);
@@ -709,7 +710,10 @@ mod tests {
     }
 
     #[test]
-    fn test_initial_state_is_first_status() {
+    fn test_initial_status_from_graph_topology() {
+        // No explicit `Status is initial in SM` fact. Graph topology has a
+        // unique source-never-target ("Pending" is never a transition
+        // target), so compile derives initial from the transition facts.
         let mut cells = empty_cells();
         cells = with_state_machine(cells, "SM", &StateMachineDef {
             noun_name: "Order".to_string(),
@@ -718,6 +722,7 @@ mod tests {
                 TransitionDef { from: "Pending".to_string(), to: "Shipped".to_string(), event: "ship".to_string(), guard: None },
                 TransitionDef { from: "Shipped".to_string(), to: "Delivered".to_string(), event: "deliver".to_string(), guard: None },
             ],
+            initial: String::new(),
         });
         let (_meta_state, defs, def_map) = compile_cells(cells);
         let initial_key = "machine:Order:initial";
@@ -727,7 +732,54 @@ mod tests {
                 r.as_atom().map(|s| s.to_string())
             })
             .unwrap_or_default();
-        assert_eq!(initial, "Pending");
+        assert_eq!(initial, "Pending", "graph topology: Pending is source-never-target");
+    }
+
+    #[test]
+    fn test_initial_status_from_explicit_declaration() {
+        // Explicit `initial: "Shipped"` on the SM def (mirrors
+        // `Status 'Shipped' is initial in SM 'Order'.` instance fact).
+        // Even though graph topology would suggest "Pending" (source-
+        // never-target), the explicit declaration wins.
+        let mut cells = empty_cells();
+        cells = with_state_machine(cells, "SM", &StateMachineDef {
+            noun_name: "Order".to_string(),
+            statuses: vec!["Pending".to_string(), "Shipped".to_string(), "Delivered".to_string()],
+            transitions: vec![
+                TransitionDef { from: "Pending".to_string(), to: "Shipped".to_string(), event: "ship".to_string(), guard: None },
+                TransitionDef { from: "Shipped".to_string(), to: "Delivered".to_string(), event: "deliver".to_string(), guard: None },
+            ],
+            initial: "Shipped".to_string(),
+        });
+        let (_meta_state, defs, def_map) = compile_cells(cells);
+        let initial = defs.iter().find(|(n, _)| n == "machine:Order:initial")
+            .and_then(|(_, f)| ast::apply(f, &ast::Object::phi(), &def_map).as_atom().map(|s| s.to_string()))
+            .unwrap_or_default();
+        assert_eq!(initial, "Shipped", "explicit declaration overrides graph topology");
+    }
+
+    #[test]
+    fn test_initial_status_empty_when_cyclic() {
+        // Fully cyclic machine: every status is both source and target.
+        // No explicit declaration. Graph topology yields no
+        // source-never-target. Per §5.1, the fold needs s_0; when one
+        // cannot be derived, compile emits an empty initial and the
+        // runtime fails explicitly at first SM call.
+        let mut cells = empty_cells();
+        cells = with_state_machine(cells, "SM", &StateMachineDef {
+            noun_name: "Cycle".to_string(),
+            statuses: vec!["A".to_string(), "B".to_string()],
+            transitions: vec![
+                TransitionDef { from: "A".to_string(), to: "B".to_string(), event: "forward".to_string(), guard: None },
+                TransitionDef { from: "B".to_string(), to: "A".to_string(), event: "back".to_string(), guard: None },
+            ],
+            initial: String::new(),
+        });
+        let (_meta_state, defs, def_map) = compile_cells(cells);
+        let initial = defs.iter().find(|(n, _)| n == "machine:Cycle:initial")
+            .and_then(|(_, f)| ast::apply(f, &ast::Object::phi(), &def_map).as_atom().map(|s| s.to_string()))
+            .unwrap_or_default();
+        assert!(initial.is_empty(), "cyclic machine with no explicit initial -> empty (no insertion-order fallback)");
     }
 
     #[test]
@@ -749,6 +801,7 @@ mod tests {
                 TransitionDef { from: "Triaging".to_string(), to: "Resolved".to_string(), event: "quick-resolve".to_string(), guard: None },
                 TransitionDef { from: "Investigating".to_string(), to: "Resolved".to_string(), event: "resolve".to_string(), guard: None },
             ],
+            initial: String::new(),
         });
         let (_meta_state, defs, def_map) = compile_cells(cells);
 
@@ -779,6 +832,7 @@ mod tests {
                 TransitionDef { from: "WaitingOnCustomer".to_string(), to: "Investigating".to_string(), event: "customer-replied".to_string(), guard: None },
                 TransitionDef { from: "Investigating".to_string(), to: "Resolved".to_string(), event: "resolve".to_string(), guard: None },
             ],
+            initial: String::new(),
         });
         let (_meta_state, defs, def_map) = compile_cells(cells);
 
@@ -874,6 +928,7 @@ mod tests {
                 TransitionDef { from: "Triaging".to_string(), to: "Investigating".to_string(), event: "investigate".to_string(), guard: None },
                 TransitionDef { from: "Investigating".to_string(), to: "Resolved".to_string(), event: "resolve".to_string(), guard: None },
             ],
+            initial: String::new(),
         });
 
         let (_meta_state, defs, def_map) = compile_cells(cells);
@@ -919,6 +974,7 @@ mod tests {
             transitions: vec![
                 TransitionDef { from: "Triaging".to_string(), to: "Investigating".to_string(), event: "submit".to_string(), guard: None },
             ],
+            initial: String::new(),
         });
 
         let (_meta_state, defs, def_map) = compile_cells(cells);
@@ -965,6 +1021,7 @@ mod tests {
                     }),
                 },
             ],
+            initial: String::new(),
         });
 
         let (_meta_state, defs, def_map) = compile_cells(cells);
@@ -1017,6 +1074,7 @@ mod tests {
                 TransitionDef { from: "Triaging".to_string(), to: "Investigating".to_string(), event: "investigate".to_string(), guard: None },
                 TransitionDef { from: "Investigating".to_string(), to: "Resolved".to_string(), event: "resolve".to_string(), guard: None },
             ],
+            initial: String::new(),
         });
 
         let (_meta_state, defs, def_map) = compile_cells(cells);

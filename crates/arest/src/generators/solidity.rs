@@ -43,6 +43,7 @@ fn state_machines_from_state(state: &Object) -> hashbrown::HashMap<String, State
         let noun = b(f, "objectValue");
         sms.entry(noun).or_insert_with(|| StateMachineDef {
             noun_name: sm_name, statuses: vec![], transitions: vec![],
+            initial: String::new(),
         });
     }
     // "Status 'Z' is defined in State Machine Definition 'X'"
