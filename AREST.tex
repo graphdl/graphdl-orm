@@ -67,7 +67,7 @@ An \emph{Applicative REpresentational State Transfer} system is an AST system~\c
 The \emph{schema} $S$ is the set of compiled objects in $\mathit{DEFS}$: fact type constructors, constraint objects, derivation rules, and state machine definitions. The representation function $\rho$~\cite[Sec.\,13.3.2]{backus78} maps an object to the function it represents. Given a fact type, $\rho$ looks it up in $\mathit{DEFS}$ and returns the functional form. The system function $\mathit{SYSTEM}\!:\!x = \langle o, D'\rangle$~\cite[Sec.\,14.3.1]{backus78} is defined by the definitions in $D$. REST endpoints are applications of $\mathit{SYSTEM}$ with distinct inputs. A reference implementation is available~\cite{arest}.
 \end{definition}
 
-\section{Example}
+\section{Example}\label{sec:example}
 
 An order domain is declared in FORML\,2:
 
@@ -118,7 +118,7 @@ The constraint, the state machine, the API response, and the HATEOAS links above
 \begin{align}
 (\rho\langle x_1, \ldots, x_n\rangle)\!:\!y = (\rho\,x_1)\!:\!\langle\langle x_1, \ldots, x_n\rangle, y\rangle \label{eq:metacomp}
 \end{align}
-The fact is a function: $\lambda f.\, f(o_1, \ldots, o_n)$, accepting an operation and applying it to its own objects. The constraint reading, the state machine transition, and the API response above are all $\rho$-applications over the same facts.
+The fact is a function: $\lambda f.\, f(o_1, \ldots, o_n)$, accepting an operation and applying it to its own objects. The constraint reading, the state machine transition, and the API response above are all $\rho$-applications over the same facts. The sections that follow show why they cannot be anything else.
 
 % =====================================================================
 % ACT 3: THE MACHINE
@@ -194,6 +194,8 @@ For each cell $\langle\mathit{CELL}, n, c\rangle$ in $D$, at most one $\mu$ appl
 % =====================================================================
 
 \section{Formal Foundations}
+
+Section~\ref{sec:example}'s metacomposition identity~(\ref{eq:metacomp}) is the domain interpretation of one FFP primitive. This section enumerates the correspondence that made the four views of Section~\ref{sec:example} necessarily the same object.
 
 \subsection{Domain Primitives}
 
