@@ -90,6 +90,13 @@ fn compound_table_name(reading: &str, roles: &[crate::types::RoleDef], noun_name
 
 // -- RMAP core --------------------------------------------------------
 
+/// RMAP from Object state — the public API. Reconstructs Domain
+/// internally for now (#211 will eliminate this round-trip).
+pub fn rmap_from_state(state: &crate::ast::Object) -> Vec<TableDef> {
+    let domain = crate::compile::state_to_domain(state);
+    rmap(&domain)
+}
+
 pub fn rmap(ir: &Domain) -> Vec<TableDef> {
     let mut tables: Vec<TableDef> = Vec::new();
     let mut emitted: HashSet<String> = HashSet::new();
