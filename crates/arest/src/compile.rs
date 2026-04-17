@@ -1527,18 +1527,11 @@ pub(crate) fn domain_data_from_state(state: &crate::ast::Object) -> DomainData {
         }).collect()).unwrap_or_default();
     let state_machines = derive_state_machines_from_facts(&general_instance_facts);
 
-    // Temporary Domain for re-resolve only. Dies at end of this block.
+    // Re-resolve against cell data directly — no Domain struct (#211).
     let resolved_rules = {
-        use crate::parse_forml2::Domain;
-        let mut tmp = Domain {
-            domain: String::new(), nouns: nouns.clone(), fact_types: fact_types.clone(),
-            constraints: vec![], derivation_rules, subtypes: subtypes.clone(),
-            ref_schemes: ref_schemes.clone(), enum_values: enum_values.clone(),
-            state_machines: HashMap::new(), general_instance_facts: vec![],
-            objectifications: HashMap::new(), named_spans: HashMap::new(), autofill_spans: vec![],
-        };
-        crate::parse_forml2::re_resolve_derivation_rules(&mut tmp);
-        tmp.derivation_rules
+        let mut rules = derivation_rules;
+        crate::parse_forml2::re_resolve_rules(&mut rules, &nouns, &fact_types);
+        rules
     };
 
     DomainData { nouns, fact_types, constraints, derivation_rules: resolved_rules,

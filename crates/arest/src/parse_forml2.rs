@@ -1105,11 +1105,23 @@ pub fn parse_markdown(input: &str) -> Result<Domain, String> {
 /// The round-trip loses antecedent IDs, join keys, and kind classification.
 /// This rebuilds them from the rule text against the domain's fact types.
 pub fn re_resolve_derivation_rules(domain: &mut Domain) {
-    let mut noun_names: Vec<String> = domain.nouns.keys().cloned().collect();
+    let mut rules = core::mem::take(&mut domain.derivation_rules);
+    re_resolve_rules(&mut rules, &domain.nouns, &domain.fact_types);
+    domain.derivation_rules = rules;
+}
+
+/// Re-resolve a rules vec given just the typed lookups it needs.
+/// No Domain struct required — callers pass their HashMaps directly.
+pub(crate) fn re_resolve_rules(
+    rules: &mut Vec<DerivationRuleDef>,
+    nouns: &HashMap<String, NounDef>,
+    fact_types: &HashMap<String, FactTypeDef>,
+) {
+    let mut noun_names: Vec<String> = nouns.keys().cloned().collect();
     noun_names.sort_by(|a, b| b.len().cmp(&a.len()));
 
     let mut catalog = SchemaCatalog::new();
-    domain.fact_types.iter().for_each(|(ft_id, ft)| {
+    fact_types.iter().for_each(|(ft_id, ft)| {
         let role_nouns: Vec<&str> = ft.roles.iter().map(|r| r.noun_name.as_str()).collect();
         let verb = noun_names.iter()
             .find(|n| ft.reading.starts_with(n.as_str()))
@@ -1123,12 +1135,9 @@ pub fn re_resolve_derivation_rules(domain: &mut Domain) {
         catalog.register(ft_id, &role_nouns, verb, &ft.reading);
     });
 
-    // Take rules out, resolve, put back — avoids mutable+immutable borrow conflict.
-    let mut rules = core::mem::take(&mut domain.derivation_rules);
     rules.iter_mut().for_each(|rule| {
-        resolve_derivation_rule(rule, domain, &catalog);
+        resolve_derivation_rule(rule, nouns, fact_types, &catalog);
     });
-    domain.derivation_rules = rules;
 }
 
 fn parse_into(ir: &mut Domain, input: &str) -> Result<(), String> {
@@ -1301,7 +1310,7 @@ fn parse_into(ir: &mut Domain, input: &str) -> Result<(), String> {
                     ir.constraints.push(resolved);
                 }
                 ParseAction::AddDerivation(mut r) => {
-                    resolve_derivation_rule(&mut r, ir, &catalog);
+                    resolve_derivation_rule(&mut r, &ir.nouns, &ir.fact_types, &catalog);
                     ir.derivation_rules.push(r);
                 }
                 other => { apply_action(ir, Some(other), &lines, i); }
@@ -1570,7 +1579,19 @@ fn is_temporal_predicate(clause: &str) -> bool {
         || l.contains("is fresh") || l.contains("is stale")
 }
 
-fn resolve_derivation_rule(rule: &mut DerivationRuleDef, ir: &Domain, catalog: &SchemaCatalog) {
+fn resolve_derivation_rule(
+    rule: &mut DerivationRuleDef,
+    nouns_map: &HashMap<String, NounDef>,
+    fact_types_map: &HashMap<String, FactTypeDef>,
+    catalog: &SchemaCatalog,
+) {
+    // Shim: old code paths referred to `ir.nouns` / `ir.fact_types`.
+    // Rebind so the body below compiles unchanged.
+    struct IrShim<'a> {
+        nouns: &'a HashMap<String, NounDef>,
+        fact_types: &'a HashMap<String, FactTypeDef>,
+    }
+    let ir = IrShim { nouns: nouns_map, fact_types: fact_types_map };
     // Longest-first noun list for Theorem 1 matching
     let mut noun_names: Vec<String> = ir.nouns.keys().cloned().collect();
     noun_names.sort_by(|a, b| b.len().cmp(&a.len()));
