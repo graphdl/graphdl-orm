@@ -183,15 +183,16 @@ fn try_ring(line: &str, noun_names: &[String]) -> Option<ParseAction> {
         }
         // IR pattern: "No A R itself" -- must end with " itself" and have a known noun
         if rest.ends_with(" itself") {
-            let has_noun = noun_names.iter().any(|n| {
-                rest.starts_with(n.as_str())
-            });
-            if has_noun {
+            let entity = noun_names.iter()
+                .find(|n| rest.starts_with(n.as_str()))
+                .cloned()
+                .unwrap_or_default();
+            if !entity.is_empty() {
                 return Some(ParseAction::AddConstraint(ConstraintDef {
                     id: String::new(), kind: "IR".into(), modality: "alethic".into(),
                     deontic_operator: None, text: clean.into(),
                     spans: vec![], set_comparison_argument_length: None, clauses: None,
-                    entity: None, min_occurrence: None, max_occurrence: None,
+                    entity: Some(entity), min_occurrence: None, max_occurrence: None,
                 }));
             }
         }
@@ -1717,11 +1718,14 @@ fn resolve_derivation_rule(rule: &mut DerivationRuleDef, ir: &Domain, catalog: &
         if try_parse_computed_binding(part, &noun_names).is_some() { continue; }
 
         // (5) that-anaphora: back-reference to a noun bound in a
-        //     prior clause. The join-key detector above already
-        //     collected these; here we just prevent the false warning.
+        //     prior clause. Two shapes:
+        //     a) "that X has Y" — join continuation
+        //     b) "X is that Y" — anaphoric value assignment
+        //        (e.g., "display- Text is that Reference")
         if part.trim().starts_with("that ") && noun_names.iter()
             .any(|n| part.to_lowercase().contains(&n.to_lowercase()))
         { continue; }
+        if part.contains(" is that ") || part.contains(" is some ") { continue; }
 
         // (6) Temporal predicates — genuinely new, no existing fn.
         if is_temporal_predicate(part) { continue; }
