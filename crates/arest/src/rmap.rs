@@ -617,18 +617,17 @@ pub fn rmap_cell_map(state: &crate::ast::Object) -> HashMap<String, String> {
             acc
         });
 
-    // Subtype resolution
+    // Subtype resolution. Backus's `while (p f)` combining form lifted
+    // into Rust as iter::successors — walk the parent chain until fixed.
+    // 100-step bound is a belt-and-braces cycle defence; the checker
+    // (#199) rejects subtype cycles before we get here.
     let parent_of: HashMap<&str, &str> = subtypes.iter()
         .map(|(k, v)| (k.as_str(), v.as_str())).collect();
     let resolve_root = |name: &str| -> String {
-        let mut cur = name.to_string();
-        for _ in 0..100 {
-            match parent_of.get(cur.as_str()) {
-                Some(p) => cur = p.to_string(),
-                None => break,
-            }
-        }
-        cur
+        core::iter::successors(
+            Some(name.to_string()),
+            |cur| parent_of.get(cur.as_str()).map(|p| p.to_string()),
+        ).take(100).last().unwrap_or_default()
     };
 
     for (ft_id, ft) in &fact_types {
