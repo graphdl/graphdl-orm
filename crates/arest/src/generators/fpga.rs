@@ -205,6 +205,7 @@ fn state_machines_from_state(state: &Object) -> hashbrown::HashMap<String, State
         let noun = b(f, "objectValue");
         sms.entry(noun).or_insert_with(|| StateMachineDef {
             noun_name: sm_name, statuses: vec![], transitions: vec![],
+            initial: String::new(),
         });
     }
     // "Status 'Z' is defined in State Machine Definition 'X'"
@@ -1777,6 +1778,7 @@ Counter has Count.
                 TransitionDef { from: "Draft".to_string(), to: "Placed".to_string(), event: "place".to_string(), guard: None },
                 TransitionDef { from: "Placed".to_string(), to: "Shipped".to_string(), event: "ship".to_string(), guard: None },
             ],
+            initial: String::new(),
         });
         let (modules, specs) = emit_sm_modules(&sms);
         assert_eq!(modules.len(), 1);
@@ -1817,6 +1819,7 @@ Counter has Count.
             transitions: vec![
                 TransitionDef { from: "Closed".to_string(), to: "Open".to_string(), event: "open".to_string(), guard: None },
             ],
+            initial: String::new(),
         });
         let (_modules, specs) = emit_sm_modules(&sms);
         assert_eq!(specs[0].1, 1, "2 statuses → 1-bit width");
@@ -1837,6 +1840,7 @@ Counter has Count.
             noun_name: "Frozen".to_string(),
             statuses: vec!["Only".to_string()],
             transitions: vec![],
+            initial: String::new(),
         });
         let (modules, _specs) = emit_sm_modules(&sms);
         // Transition table absent → always holds status.
