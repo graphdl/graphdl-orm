@@ -65,7 +65,10 @@ It is forbidden that a Domain Change targeting Domain 'core' is applied without 
 
 ## Derivation Rules
 
-* Domain Change is valid iff all proposed Model Elements are parseable as FORML 2 and the proposed population is consistent with the existing population in the target Domain and the proposed Constraints are satisfiable with the existing Constraints in the target Domain.
+### Domain Change is valid is implemented by the compile pipeline:
+### (1) all proposed Model Elements are parseable as FORML 2
+### (2) the proposed population is consistent with the existing population in the target Domain
+### (3) the proposed Constraints are satisfiable with the existing Constraints in the target Domain
 
 ## Instance Facts
 
