@@ -1289,12 +1289,17 @@ fn parse_into(ir: &mut Domain, input: &str) -> Result<(), String> {
                     mc.kind = "MC".into();
                     mc.text = mc.text.replace("exactly one", "some");
                     mc.id.is_empty().then(|| mc.id = mc.text.clone());
+                    #[cfg(feature = "std-deps")]
+                    { push_cell(ir, "Constraint", constraint_to_fact(&uc));
+                      push_cell(ir, "Constraint", constraint_to_fact(&mc)); }
                     ir.constraints.push(uc);
                     ir.constraints.push(mc);
                 }
                 ParseAction::AddConstraint(c) => {
                     let mut resolved = resolve_constraint_schema(c, &noun_names, &catalog, ir);
                     resolved.id.is_empty().then(|| resolved.id = resolved.text.clone());
+                    #[cfg(feature = "std-deps")]
+                    push_cell(ir, "Constraint", constraint_to_fact(&resolved));
                     ir.constraints.push(resolved);
                 }
                 ParseAction::AddDerivation(mut r) => {
@@ -1308,7 +1313,7 @@ fn parse_into(ir: &mut Domain, input: &str) -> Result<(), String> {
     // Task 6: Value Constraint (VC) -- emit one VC per noun with enum_values.
     // The compiler reads enum values from ir.enum_values;
     // the ConstraintDef just marks which noun has a value constraint.
-    ir.constraints.extend(ir.enum_values.keys().cloned().map(|noun_name| ConstraintDef {
+    let vcs: Vec<ConstraintDef> = ir.enum_values.keys().cloned().map(|noun_name| ConstraintDef {
         id: format!("VC:{}", noun_name),
         kind: "VC".into(),
         modality: "alethic".into(),
@@ -1320,7 +1325,10 @@ fn parse_into(ir: &mut Domain, input: &str) -> Result<(), String> {
         entity: Some(noun_name),
         min_occurrence: None,
         max_occurrence: None,
-    }));
+    }).collect();
+    #[cfg(feature = "std-deps")]
+    for c in &vcs { push_cell(ir, "Constraint", constraint_to_fact(c)); }
+    ir.constraints.extend(vcs);
 
     // Post-processing: resolve autofill spans.
     // For each autofill span name, find SS constraints whose role nouns
@@ -1341,6 +1349,15 @@ fn parse_into(ir: &mut Domain, input: &str) -> Result<(), String> {
                 .into_iter()
                 .for_each(|span| span.subset_autofill = Some(true));
         });
+
+    // Rebuild Constraint cells from typed fields to reflect post-parse
+    // mutations (VC extension above, autofill span post-processing). This
+    // replaces any stale cells emitted during apply_action / Pass 2b.
+    #[cfg(feature = "std-deps")]
+    {
+        let facts: Vec<crate::ast::Object> = ir.constraints.iter().map(constraint_to_fact).collect();
+        ir.cells.insert("Constraint".to_string(), facts);
+    }
 
     // Strict mode: reject undeclared nouns (subtype children, fact type roles).
     if is_strict_mode() {
