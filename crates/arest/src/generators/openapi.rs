@@ -44,21 +44,159 @@
 
 use hashbrown::HashMap;
 
-use crate::ast::Object;
+use crate::ast::{Object, binding, fetch_or_phi};
 use crate::rmap::{self, TableColumn, TableDef};
 use crate::types::{Domain, StateMachineDef};
 #[allow(unused_imports)]
 use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 
+/// Extract state machines directly from InstanceFact cells in state.
+/// Mirrors the same helper in solidity.rs — no Domain round-trip.
+fn state_machines_from_state(state: &Object) -> hashbrown::HashMap<String, StateMachineDef> {
+    let inst = fetch_or_phi("InstanceFact", state);
+    let facts = inst.as_seq().unwrap_or(&[]);
+    let b = |f: &Object, k: &str| binding(f, k).unwrap_or("").to_string();
+
+    let mut sms: hashbrown::HashMap<String, StateMachineDef> = hashbrown::HashMap::new();
+    // "State Machine Definition 'X' is for Noun 'Y'"
+    for f in facts.iter().filter(|f| b(f, "subjectNoun") == "State Machine Definition" && b(f, "fieldName").contains("is for")) {
+        let sm_name = b(f, "subjectValue");
+        let noun = b(f, "objectValue");
+        sms.entry(noun).or_insert_with(|| StateMachineDef {
+            noun_name: sm_name, statuses: vec![], transitions: vec![],
+        });
+    }
+    // "Status 'Z' is defined in State Machine Definition 'X'"
+    for f in facts.iter().filter(|f| b(f, "subjectNoun") == "Status" && b(f, "fieldName").contains("defined in")) {
+        let status = b(f, "subjectValue");
+        let sm_name = b(f, "objectValue");
+        if let Some(sm) = sms.values_mut().find(|s| s.noun_name == sm_name) {
+            if !sm.statuses.contains(&status) { sm.statuses.push(status); }
+        }
+    }
+    // Transitions
+    for f in facts.iter().filter(|f| b(f, "subjectNoun") == "Transition") {
+        let trans_name = b(f, "subjectValue");
+        let field = b(f, "fieldName");
+        let value = b(f, "objectValue");
+        for sm in sms.values_mut() {
+            let t = sm.transitions.iter_mut().find(|t| t.event == trans_name);
+            match t {
+                Some(t) => {
+                    if field.contains("from") { t.from = value.clone(); }
+                    if field.contains("to") { t.to = value.clone(); }
+                }
+                None => {
+                    let mut td = crate::types::TransitionDef { event: trans_name.clone(), from: String::new(), to: String::new(), guard: None };
+                    if field.contains("from") { td.from = value.clone(); }
+                    if field.contains("to") { td.to = value.clone(); }
+                    if field.contains("triggered") { td.event = value.clone(); }
+                    sm.transitions.push(td);
+                }
+            }
+        }
+    }
+    sms
+}
+
 /// Compile state into an OpenAPI 3.1 JSON document for one App.
 ///
 /// Public entry point matching the solidity/fpga generator signature.
-/// Reconstructs the domain from state, runs RMAP, and composes the
-/// OpenAPI document from the resulting TableDefs, with the App's
-/// identity baked into the document's `info` section.
+/// Reads directly from state cells via `rmap_from_state` and
+/// `state_machines_from_state` — no `state_to_domain` round-trip.
 pub fn compile_to_openapi(state: &Object, app_name: &str) -> String {
-    let domain = crate::compile::state_to_domain(state);
-    openapi_for_app(&domain, app_name).to_string()
+    openapi_from_state(state, app_name).to_string()
+}
+
+/// Build the OpenAPI 3.1 document for one App from raw state (no Domain).
+///
+/// Used by `compile_to_openapi`. Reads nouns, fact types, instance facts,
+/// enum values, and state machines directly from state cells.
+fn openapi_from_state(state: &Object, app_name: &str) -> serde_json::Value {
+    let tables = rmap::rmap_from_state(state);
+    let tables_by_entity: HashMap<String, &TableDef> = tables.iter()
+        .map(|t| (t.name.clone(), t))
+        .collect();
+
+    let nouns_cell = fetch_or_phi("Noun", state);
+    let nouns_seq = nouns_cell.as_seq().unwrap_or(&[]);
+
+    // noun_name -> objectType map
+    let noun_types: HashMap<String, String> = nouns_seq.iter()
+        .filter_map(|n| {
+            let name = binding(n, "name")?.to_string();
+            let obj_type = binding(n, "objectType").unwrap_or("entity").to_string();
+            Some((name, obj_type))
+        })
+        .collect();
+
+    // noun_name -> enum values (from "enumValues" binding on Noun cell)
+    let enum_values: HashMap<String, Vec<String>> = nouns_seq.iter()
+        .filter_map(|n| {
+            let name = binding(n, "name")?.to_string();
+            let vals = binding(n, "enumValues")?;
+            let v: Vec<String> = vals.split(',').map(|s| s.to_string()).collect();
+            Some((name, v))
+        })
+        .collect();
+
+    // snake(noun_name) -> noun_name for enum lookup in column_property
+    let noun_by_snake: HashMap<String, String> = noun_types.keys()
+        .map(|n| (rmap::to_snake(n), n.clone()))
+        .collect();
+
+    let sms = state_machines_from_state(state);
+
+    // InstanceFact cell for general_instance_facts (plural / app description)
+    let inst_cell = fetch_or_phi("InstanceFact", state);
+    let inst_seq = inst_cell.as_seq().unwrap_or(&[]);
+
+    let mut schemas: serde_json::Map<String, serde_json::Value> = noun_types.iter()
+        .filter(|(_, obj_type)| obj_type.as_str() == "entity")
+        .filter_map(|(name, _)| {
+            let table_name = rmap::to_snake(name);
+            tables_by_entity.get(&table_name)
+                .map(|table| (name.clone(), component_schema_from_state(name, table, &noun_by_snake, &enum_values, &sms)))
+        })
+        .collect();
+
+    schemas.entry("Violation".to_string())
+        .or_insert_with(violation_component_schema);
+
+    // FactType + Role cells for Theorem 4b navigation
+    let ft_cell = fetch_or_phi("FactType", state);
+    let ft_seq = ft_cell.as_seq().unwrap_or(&[]);
+    let role_cell = fetch_or_phi("Role", state);
+    let role_seq = role_cell.as_seq().unwrap_or(&[]);
+
+    let paths: serde_json::Map<String, serde_json::Value> = noun_types.iter()
+        .filter(|(_, obj_type)| obj_type.as_str() == "entity")
+        .filter(|(name, _)| {
+            let table_name = rmap::to_snake(name);
+            tables_by_entity.contains_key(&table_name)
+        })
+        .flat_map(|(name, _)| {
+            let plural = plural_for_noun_from_state(name, inst_seq);
+            let sm = sms.get(name);
+            paths_for_noun_from_state(name, &plural, sm, &noun_types, inst_seq, ft_seq, role_seq)
+        })
+        .collect();
+
+    let app_description = app_description_from_state(inst_seq, app_name)
+        .unwrap_or_else(|| format!("Compiled from FORML2 readings for App '{}'.", app_name));
+
+    serde_json::json!({
+        "openapi": "3.1.0",
+        "info": {
+            "title": app_name,
+            "version": "1.0.0",
+            "description": app_description,
+        },
+        "paths": paths,
+        "components": {
+            "schemas": schemas,
+        },
+    })
 }
 
 /// Build the OpenAPI 3.1 document for one App as a `serde_json::Value`.
@@ -149,6 +287,16 @@ fn app_description(domain: &Domain, app_name: &str) -> Option<String> {
         .map(|f| f.object_value.clone())
 }
 
+/// State-based variant of `app_description`. Reads from the InstanceFact
+/// cell slice directly — no Domain round-trip.
+fn app_description_from_state(inst_seq: &[Object], app_name: &str) -> Option<String> {
+    inst_seq.iter()
+        .find(|f| binding(f, "subjectNoun") == Some("App")
+            && binding(f, "subjectValue") == Some(app_name)
+            && binding(f, "fieldName") == Some("Description"))
+        .and_then(|f| binding(f, "objectValue").map(|s| s.to_string()))
+}
+
 /// Resolve the plural slug for a noun.
 ///
 /// First consults `Noun has Plural` instance facts — facts-all-the-way-
@@ -161,6 +309,17 @@ fn plural_for_noun(domain: &Domain, noun_name: &str) -> String {
             && f.subject_value == noun_name
             && f.field_name == "Plural")
         .map(|f| f.object_value.clone())
+        .unwrap_or_else(|| format!("{}s", rmap::to_snake(noun_name)))
+}
+
+/// State-based variant of `plural_for_noun`. Reads from the InstanceFact
+/// cell slice directly.
+fn plural_for_noun_from_state(noun_name: &str, inst_seq: &[Object]) -> String {
+    inst_seq.iter()
+        .find(|f| binding(f, "subjectNoun") == Some("Noun")
+            && binding(f, "subjectValue") == Some(noun_name)
+            && binding(f, "fieldName") == Some("Plural"))
+        .and_then(|f| binding(f, "objectValue").map(|s| s.to_string()))
         .unwrap_or_else(|| format!("{}s", rmap::to_snake(noun_name)))
 }
 
@@ -271,6 +430,268 @@ fn envelope_schema(data_schema: serde_json::Value, include_derived: bool) -> ser
         "properties": props,
         "required": ["data", "_links"],
     })
+}
+
+/// State-based variant of `paths_for_noun`. Takes noun_types, inst_seq,
+/// ft_seq, and role_seq slices directly — no Domain round-trip.
+fn paths_for_noun_from_state(
+    noun_name: &str,
+    plural: &str,
+    sm: Option<&StateMachineDef>,
+    noun_types: &HashMap<String, String>,
+    inst_seq: &[Object],
+    ft_seq: &[Object],
+    role_seq: &[Object],
+) -> Vec<(String, serde_json::Value)> {
+    let schema_ref = serde_json::json!({
+        "$ref": format!("#/components/schemas/{}", noun_name),
+    });
+    let list_envelope = envelope_schema(
+        serde_json::json!({ "type": "array", "items": schema_ref }),
+        false,
+    );
+    let item_envelope = envelope_schema(schema_ref.clone(), true);
+    let list_response = serde_json::json!({
+        "200": {
+            "description": format!("List of {}. Envelope per Theorem 5.", noun_name),
+            "content": {
+                "application/json": { "schema": list_envelope },
+            },
+        },
+    });
+    let item_response = serde_json::json!({
+        "200": {
+            "description": format!("One {}. Envelope per Theorem 5.", noun_name),
+            "content": {
+                "application/json": { "schema": item_envelope },
+            },
+        },
+    });
+    let request_body = serde_json::json!({
+        "required": true,
+        "content": {
+            "application/json": { "schema": schema_ref },
+        },
+    });
+    let id_param = serde_json::json!({
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "schema": { "type": "string" },
+    });
+
+    let crud = vec![
+        (format!("/{}", plural), serde_json::json!({
+            "get":  { "summary": format!("List {}.", noun_name),   "responses": list_response },
+            "post": { "summary": format!("Create {}.", noun_name), "requestBody": request_body, "responses": item_response },
+        })),
+        (format!("/{}/{{id}}", plural), serde_json::json!({
+            "parameters": [id_param.clone()],
+            "get":   { "summary": format!("Read {}.", noun_name),   "responses": item_response },
+            "patch": { "summary": format!("Update {}.", noun_name), "requestBody": request_body, "responses": item_response },
+        })),
+    ];
+
+    let transitions = sm.into_iter().flat_map(|sm| {
+        let events: Vec<&str> = sm.transitions.iter().map(|t| t.event.as_str()).collect();
+        let fire_request = serde_json::json!({
+            "required": true,
+            "description": "Fire a transition by event name.",
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "required": ["event"],
+                        "properties": {
+                            "event": { "type": "string", "enum": events },
+                        },
+                    },
+                },
+            },
+        });
+        let events_response = serde_json::json!({
+            "200": {
+                "description": format!("Events valid from the current status of this {}.", noun_name),
+                "content": {
+                    "application/json": {
+                        "schema": { "type": "array", "items": { "type": "string" } },
+                    },
+                },
+            },
+        });
+        vec![
+            (format!("/{}/{{id}}/transition", plural), serde_json::json!({
+                "parameters": [id_param.clone()],
+                "post": {
+                    "summary": format!("Fire a transition on a {}.", noun_name),
+                    "requestBody": fire_request,
+                    "responses": item_response,
+                },
+            })),
+            (format!("/{}/{{id}}/transitions", plural), serde_json::json!({
+                "parameters": [id_param.clone()],
+                "get": {
+                    "summary": format!("Transitions available from the current status of a {}.", noun_name),
+                    "responses": events_response,
+                },
+            })),
+        ]
+    });
+
+    // Theorem 4b navigation from state cells
+    let participations: Vec<(String, String)> = ft_seq.iter().filter_map(|f| {
+        let ft_id = binding(f, "id")?;
+        let reading = binding(f, "reading").unwrap_or("").to_string();
+        let ft_roles: Vec<&str> = role_seq.iter()
+            .filter(|r| binding(r, "factType") == Some(ft_id))
+            .filter_map(|r| binding(r, "nounName"))
+            .collect();
+        if ft_roles.len() != 2 { return None; }
+        if !ft_roles.iter().any(|r| *r == noun_name) { return None; }
+        let other_name = ft_roles.iter()
+            .find(|r| **r != noun_name)
+            .map(|r| r.to_string())
+            .unwrap_or_else(|| ft_roles[0].to_string());
+        // other must be an entity
+        if noun_types.get(&other_name).map(|t| t.as_str()) != Some("entity") { return None; }
+        Some((other_name, reading))
+    }).collect();
+
+    let mut by_other: HashMap<String, Vec<String>> = HashMap::new();
+    participations.into_iter().for_each(|(other, reading)| {
+        by_other.entry(other).or_default().push(reading);
+    });
+
+    let noun_names: Vec<&str> = noun_types.keys().map(|s| s.as_str()).collect();
+    let id_param_for_related = id_param.clone();
+
+    let related_routes: Vec<(String, serde_json::Value)> = by_other.iter()
+        .flat_map(|(other_noun, readings)| {
+            let other_plural = plural_for_noun_from_state(other_noun, inst_seq);
+            let is_ring = other_noun == noun_name;
+            let multiple = readings.len() > 1;
+            readings.iter().map(|reading| {
+                let slug = if is_ring {
+                    verb_slug_from_reading(reading, &noun_names)
+                } else if multiple {
+                    format!("{}-{}",
+                        verb_slug_from_reading(reading, &noun_names),
+                        other_plural)
+                } else {
+                    other_plural.clone()
+                };
+                let other_ref = serde_json::json!({
+                    "$ref": format!("#/components/schemas/{}", other_noun),
+                });
+                let list_env = envelope_schema(
+                    serde_json::json!({ "type": "array", "items": other_ref }),
+                    false,
+                );
+                (
+                    format!("/{}/{{id}}/{}", plural, slug),
+                    serde_json::json!({
+                        "parameters": [id_param_for_related.clone()],
+                        "get": {
+                            "summary": format!("{} (Theorem 4b).", reading),
+                            "responses": {
+                                "200": {
+                                    "description": format!(
+                                        "{} entities reached via `{}`. Envelope per Theorem 5.",
+                                        other_noun, reading),
+                                    "content": {
+                                        "application/json": { "schema": list_env },
+                                    },
+                                },
+                            },
+                        },
+                    }),
+                )
+            }).collect::<Vec<_>>()
+        })
+        .collect();
+
+    let actions_route = sm.into_iter().map(|sm| {
+        let events: Vec<&str> = sm.transitions.iter().map(|t| t.event.as_str()).collect();
+        let events_response = serde_json::json!({
+            "200": {
+                "description": format!("Events (actions) valid from the current status of this {}.", noun_name),
+                "content": {
+                    "application/json": {
+                        "schema": { "type": "array", "items": { "type": "string", "enum": &events } },
+                    },
+                },
+            },
+        });
+        (
+            format!("/{}/{{id}}/actions", plural),
+            serde_json::json!({
+                "parameters": [id_param.clone()],
+                "get": {
+                    "summary": format!("List valid actions (SM events) for a {}.", noun_name),
+                    "description": "Alias of /transitions; named to match the MCP `actions` verb.",
+                    "responses": events_response,
+                },
+            }),
+        )
+    }).collect::<Vec<_>>();
+
+    let explain_response = serde_json::json!({
+        "200": {
+            "description": format!(
+                "Derivation chain for all derived facts on this {}. \
+                 Theorem 5: every value in the representation is a ρ-application \
+                 over P; /explain surfaces the chain of rules and antecedents \
+                 that produced each derived fact.",
+                noun_name),
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "factTypeId": { "type": "string" },
+                                "rule":       { "type": "string" },
+                                "bindings":   { "type": "object", "additionalProperties": true },
+                                "antecedents": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "factTypeId": { "type": "string" },
+                                            "bindings":   { "type": "object", "additionalProperties": true },
+                                            "source":     { "type": "string", "enum": ["asserted", "derived"] },
+                                        },
+                                    },
+                                },
+                            },
+                            "required": ["factTypeId", "rule"],
+                        },
+                    },
+                },
+            },
+        },
+    });
+    let explain_route = (
+        format!("/{}/{{id}}/explain", plural),
+        serde_json::json!({
+            "parameters": [id_param.clone()],
+            "get": {
+                "summary": format!("Explain derived facts on a {}.", noun_name),
+                "description": "Returns the derivation chain per Theorem 5 — rule name, \
+                                bindings, and antecedents (asserted or derived) for every \
+                                derived fact the entity participates in.",
+                "responses": explain_response,
+            },
+        }),
+    );
+
+    crud.into_iter()
+        .chain(transitions)
+        .chain(related_routes)
+        .chain(actions_route)
+        .chain(core::iter::once(explain_route))
+        .collect()
 }
 
 /// Emit the canonical path items for one entity noun per Theorem 4.
@@ -669,6 +1090,44 @@ fn component_schema(
     })
 }
 
+/// State-based variant of `component_schema`. Uses enum_values and sms
+/// HashMaps derived from state cells rather than `&Domain`.
+fn component_schema_from_state(
+    noun_name: &str,
+    table: &TableDef,
+    noun_by_snake: &HashMap<String, String>,
+    enum_values: &HashMap<String, Vec<String>>,
+    sms: &hashbrown::HashMap<String, StateMachineDef>,
+) -> serde_json::Value {
+    let column_props = table.columns.iter()
+        .map(|col| (col.name.clone(), column_property_from_state(col, noun_by_snake, enum_values)));
+
+    let sm_props = sms.values()
+        .filter(|sm| sm.noun_name == noun_name)
+        .map(|sm| (
+            "status".to_string(),
+            serde_json::json!({
+                "type": "string",
+                "enum": &sm.statuses,
+            }),
+        ));
+
+    let properties: serde_json::Map<String, serde_json::Value> =
+        column_props.chain(sm_props).collect();
+
+    let required: Vec<String> = table.columns.iter()
+        .filter(|c| !c.nullable)
+        .map(|c| c.name.clone())
+        .collect();
+
+    serde_json::json!({
+        "type": "object",
+        "title": noun_name,
+        "properties": properties,
+        "required": required,
+    })
+}
+
 /// Map a RMAP column to a JSON Schema property.
 ///
 /// FK columns emit `$ref` into `components.schemas.{Target}`. Value-type
@@ -686,6 +1145,32 @@ fn column_property(
         .unwrap_or_else(|| {
             let source_noun = noun_by_snake.get(&col.name);
             let enum_vals = source_noun.and_then(|n| domain.enum_values.get(n));
+            match enum_vals {
+                Some(vals) => serde_json::json!({
+                    "type": sql_type_to_json(&col.col_type),
+                    "enum": vals,
+                }),
+                None => serde_json::json!({
+                    "type": sql_type_to_json(&col.col_type),
+                }),
+            }
+        })
+}
+
+/// State-based variant of `column_property`. Uses `enum_values` HashMap
+/// derived directly from the Noun cell rather than `domain.enum_values`.
+fn column_property_from_state(
+    col: &TableColumn,
+    noun_by_snake: &HashMap<String, String>,
+    enum_values: &HashMap<String, Vec<String>>,
+) -> serde_json::Value {
+    col.references.as_ref()
+        .map(|target| serde_json::json!({
+            "$ref": format!("#/components/schemas/{}", target),
+        }))
+        .unwrap_or_else(|| {
+            let source_noun = noun_by_snake.get(&col.name);
+            let enum_vals = source_noun.and_then(|n| enum_values.get(n));
             match enum_vals {
                 Some(vals) => serde_json::json!({
                     "type": sql_type_to_json(&col.col_type),
