@@ -4629,6 +4629,7 @@ mod schema_tests {
             subtypes: HashMap::new(), enum_values: HashMap::new(),
             ref_schemes: HashMap::new(), objectifications: HashMap::new(),
             named_spans: HashMap::new(), autofill_spans: vec![],
+            cells: HashMap::new(),
         }
     }
 
@@ -4764,6 +4765,7 @@ mod schema_tests {
             subtypes: HashMap::new(), enum_values: HashMap::new(),
             ref_schemes: HashMap::new(), objectifications: HashMap::new(),
             named_spans: HashMap::new(), autofill_spans: vec![],
+            cells: HashMap::new(),
         };
 
         let model = compile_from_domain(&ir);
@@ -4823,6 +4825,7 @@ mod schema_tests {
             subtypes: HashMap::new(), enum_values: HashMap::new(),
             ref_schemes: HashMap::new(), objectifications: HashMap::new(),
             named_spans: HashMap::new(), autofill_spans: vec![],
+            cells: HashMap::new(),
         };
 
         let model = compile_from_domain(&ir);
@@ -4885,6 +4888,7 @@ mod schema_tests {
             subtypes: HashMap::new(), enum_values: HashMap::new(),
             ref_schemes: HashMap::new(), objectifications: HashMap::new(),
             named_spans: HashMap::new(), autofill_spans: vec![],
+            cells: HashMap::new(),
         };
 
         let model = compile_from_domain(&ir);
