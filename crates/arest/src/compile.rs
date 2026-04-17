@@ -4621,7 +4621,6 @@ mod schema_tests {
             }).collect(),
         });
         Domain {
-            domain: "test".to_string(),
             nouns: HashMap::new(),
             fact_types,
             constraints: vec![],
@@ -4741,7 +4740,6 @@ mod schema_tests {
             ],
         });
         let ir = Domain {
-            domain: "test".to_string(),
             nouns: HashMap::new(),
             fact_types,
             constraints: vec![ConstraintDef {
@@ -4801,7 +4799,6 @@ mod schema_tests {
             ],
         });
         let ir = Domain {
-            domain: "test".to_string(),
             nouns: HashMap::new(),
             fact_types,
             constraints: vec![ConstraintDef {
@@ -4880,7 +4877,6 @@ mod schema_tests {
             ],
         });
         let ir = Domain {
-            domain: "test".to_string(),
             nouns: HashMap::new(),
             fact_types,
             constraints: vec![],
