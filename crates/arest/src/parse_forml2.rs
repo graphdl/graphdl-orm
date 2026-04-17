@@ -18,7 +18,7 @@ use hashbrown::HashMap;
 /// `parse_to_state`. This struct is NOT IR — it is the parser's
 /// working memory and vanishes as soon as parse completes.
 ///
-/// Invariant: `domain_to_state` is a private conversion helper that
+/// Invariant: `ctx_to_state` is a private conversion helper that
 /// wraps `cells` in `Object::Map`. Callers outside this module see
 /// only `Object` per Thm 2 (parse: R → Φ).
 #[derive(Debug, Clone, Default)]
@@ -884,7 +884,7 @@ pub fn find_forbidden_instance_url(state: &crate::ast::Object) -> Option<String>
 /// Every declaration becomes a fact (cell) in state. No intermediate struct.
 pub fn parse_to_state(input: &str) -> Result<crate::ast::Object, String> {
     let domain = parse_markdown(input)?;
-    Ok(domain_to_state(&domain))
+    Ok(ctx_to_state(&domain))
 }
 
 /// Extract nouns directly from the Noun cell in D.
@@ -922,19 +922,19 @@ pub fn parse_to_state_from(input: &str, d: &crate::ast::Object) -> Result<crate:
     let nouns = nouns_from_state(d);
     let fact_types = fact_types_from_state(d);
     let domain = parse_markdown_with_context(input, &nouns, &fact_types)?;
-    Ok(domain_to_state(&domain))
+    Ok(ctx_to_state(&domain))
 }
 
 /// Legacy: parse with nouns only (no fact type context).
 pub fn parse_to_state_with_nouns(input: &str, existing: &crate::ast::Object) -> Result<crate::ast::Object, String> {
     let nouns = nouns_from_state(existing);
     let domain = parse_markdown_with_nouns(input, &nouns)?;
-    Ok(domain_to_state(&domain))
+    Ok(ctx_to_state(&domain))
 }
 
 /// Convert a ParseCtx to an Object state (sequence of cells).
 /// Each category becomes a cell: <CELL, fact_type_id, <facts...>>
-fn domain_to_state(d: &ParseCtx) -> crate::ast::Object {
+fn ctx_to_state(d: &ParseCtx) -> crate::ast::Object {
     use crate::ast::{Object, fact_from_pairs};
     use hashbrown::{HashMap, HashSet};
     // Seed with cells already emitted by apply_action (Constraint,
@@ -2015,7 +2015,7 @@ fn constraint_to_fact(c: &ConstraintDef) -> crate::ast::Object {
 /// For write-only kinds (Constraint, DerivationRule, NamedSpan,
 /// AutofillSpan), this emits Object cells directly — parse produces Φ
 /// per Thm 2. Kinds that need in-parse mutation/lookup (Noun, FactType)
-/// still accumulate typed fields; domain_to_state serializes them to
+/// still accumulate typed fields; ctx_to_state serializes them to
 /// cells at finalize.
 fn apply_action(ir: &mut ParseCtx, action: Option<ParseAction>, lines: &[String], idx: usize) {
     let Some(action) = action else { return };
@@ -3516,7 +3516,7 @@ It is obligatory that each Support Response conforms to Pricing Model.";
 
     /// Helper: compile IR to defs, then evaluate constraints via defs path.
     fn eval_deontic_defs(ir: &ParseCtx, text: &str) -> Vec<crate::types::Violation> {
-        let state = domain_to_state(ir);
+        let state = ctx_to_state(ir);
         let defs = crate::compile::compile_to_defs_state(&state);
         let empty_state = crate::ast::Object::phi();
         let def_obj = crate::ast::defs_to_state(&defs, &empty_state);
@@ -4194,7 +4194,7 @@ Thing 'alice-2' has Color 'blue'.
 Thing 'bob-1' has Color 'green'.
 "#;
         let ir = parse_markdown(input).unwrap();
-        let state = domain_to_state(&ir);
+        let state = ctx_to_state(&ir);
 
         // Component cells should exist with decomposed bindings
         let owner_cell = fetch_or_phi("Thing_has_Owner", &state);
@@ -4222,7 +4222,7 @@ Widget has Label.
 Widget 'my-system-3' has Label 'foo'.
 "#;
         let ir = parse_markdown(input).unwrap();
-        let state = domain_to_state(&ir);
+        let state = ctx_to_state(&ir);
 
         let name_cell = fetch_or_phi("Widget_has_System_Name", &state);
         let names = name_cell.as_seq().expect("Widget_has_System_Name must exist");
@@ -4238,7 +4238,7 @@ Widget 'my-system-3' has Label 'foo'.
         use crate::ast::{fetch_or_phi, binding};
         let input = "Person is an entity type.\nColor is a value type.\n";
         let ir = parse_markdown(input).unwrap();
-        let state = domain_to_state(&ir);
+        let state = ctx_to_state(&ir);
         let nouns = fetch_or_phi("Noun", &state);
         let facts = nouns.as_seq().expect("Noun cell");
         let person = facts.iter().find(|f| binding(f, "name") == Some("Person")).unwrap();
@@ -4252,7 +4252,7 @@ Widget 'my-system-3' has Label 'foo'.
         use crate::ast::{fetch_or_phi, binding};
         let input = "Case (.nr) is an entity type.\n";
         let ir = parse_markdown(input).unwrap();
-        let state = domain_to_state(&ir);
+        let state = ctx_to_state(&ir);
         let nouns = fetch_or_phi("Noun", &state);
         let facts = nouns.as_seq().expect("Noun cell");
         let case = facts.iter().find(|f| binding(f, "name") == Some("Case")).unwrap();
