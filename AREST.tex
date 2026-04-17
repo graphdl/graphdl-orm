@@ -151,7 +151,7 @@ A state machine processes events chronologically:
 \end{align}
 The transition function is a chain of conditions~\cite[Sec.\,11.2.4]{backus78}: $p$ tests whether $\langle s, e\rangle$ matches a declared transition, $f$ returns the target state, $g$ tries the next or returns $\bar{s}$ as fallback. The fold is pure replay. Applying the event stream produces the current state without side effects.
 
-\smallskip\noindent\textbf{Facts as events.} Creating a fact fires an event. The event type is the fact type; the event arguments are the role bindings. A transition that declares its trigger as a fact type fires automatically when that fact enters $P$. During $\mathit{create}$~(\ref{eq:create}), $\mathit{resolve}$ and $\mathit{derive}$ push facts into $P$; each produces an event that the machine fold~(\ref{eq:sm}) consumes. An entity whose facts satisfy all outgoing transition guards advances from its initial status to its terminal status in a single $\mathit{SYSTEM}$ call. External events from a message queue, a webhook, or a peer enter the same stream without requiring a local fact. The machine does not distinguish between fact-fired and externally fired events; both are elements of $E$.
+\smallskip\noindent\textbf{Facts as events.} Creating a fact fires an event. The event type is the fact type; the event arguments are the role bindings. A transition that declares its trigger as a fact type fires automatically when that fact enters $P$. During $\mathit{create}$~(\ref{eq:create}), $\mathit{resolve}$ and $\mathit{derive}$ push facts into $P$; each produces an event that the machine fold~(\ref{eq:sm}) consumes. An entity whose facts satisfy all outgoing transition guards advances from its initial status to its terminal status in a single $\mathit{SYSTEM}$ call. External events from a message queue, a webhook, or a peer enter the same stream without requiring a local fact. The machine does not distinguish between fact-fired and externally fired events; both are elements of $E$ in the fold~(\ref{eq:sm}).
 
 Deletion is a transition to a terminal state. The entity reaches a state with no outgoing transitions and is excluded from query results by restriction.
 
@@ -175,7 +175,7 @@ A federated noun is one whose population is resolved by $\rho$ at evaluation tim
 \end{align*}
 The fetched facts enter $P$ under OWA (absence is unknown, not false). Constraints and derivation rules evaluate over the unified $P$ without distinguishing local from federated facts. A subset constraint can span a local entity and a federated one. No schema translation is required because the fact type declared in the readings is the response schema, and JSON keys map to role bindings through the compiled schema.
 
-The compile step constructs $\mathit{populate}_n$ from readings: the external system's URL, the noun's URI path, authentication headers, and credential references. SSRF validation rejects internal or loopback URLs at compile time, before any fetch can execute. Cell isolation (Definition~\ref{def:isolation}) ensures federated facts are cached for the request duration so that two concurrent $\mu$ applications do not re-fetch.
+The compile step constructs $\mathit{populate}_n$ from readings: the external system's URL, the noun's URI path, authentication headers, and credential references. SSRF validation rejects internal or loopback URLs at compile time, before any fetch can execute~\cite{arest}. Cell isolation (Definition~\ref{def:isolation}) ensures federated facts are cached for the request duration so that two concurrent $\mu$ applications do not re-fetch.
 
 The approach requires no ETL, no integration middleware, and no separate query language for external data. The external system is a $\rho$-application, and the rest of the algebra does not change.
 
@@ -455,9 +455,9 @@ P &= \textstyle\bigcup_n \uparrow\!\mathit{FILE}\!:\!D_n \label{eq:pop}
 \end{align}
 Adding cells to the cluster scales $\mathit{SYSTEM}$ horizontally without changing its definition.
 
-A browser runtime is a node in the same model. Cells replicated locally fold events with zero latency, syncing asynchronously. Because the fold is deterministic, two nodes folding the same events reach the same state. Local constraints (cardinality, value) evaluate immediately. Cross-cell constraints (subset, external uniqueness) evaluate against committed state after sync. Local evaluation is optimistic feedback, not a security boundary.
+A browser runtime is a node in the same model. Cells replicated locally fold events with zero latency, syncing asynchronously. Because the fold is deterministic, two nodes folding the same events reach the same state (Corollary~\ref{cor:consensus}). Local constraints (cardinality, value) evaluate immediately. Cross-cell constraints (subset, external uniqueness) evaluate against committed state after sync. Local evaluation is optimistic feedback, not a security boundary: acceptance is decided at commit, where $\mathit{validate}$ runs against the authoritative $P$ (Corollary~\ref{cor:consensus}).
 
-For anonymous peers, events carry cryptographic signatures for identity, schema modifications require authorization (a deontic constraint), and every peer validates independently. The hash chain provides ordering, constraints provide validity, signatures provide identity, and authorization provides permission, all composed from the existing formalism.
+For anonymous peers, events carry cryptographic signatures for identity, schema modifications require authorization (a deontic constraint), and every peer validates independently (Corollary~\ref{cor:consensus}). The hash chain provides ordering, constraints provide validity, signatures provide identity, and authorization provides permission, all composed from the existing formalism: validity is Theorem~\ref{thm:complete}, representation is Theorem~\ref{thm:derive}.
 
 \section{Middleware Elimination}
 
