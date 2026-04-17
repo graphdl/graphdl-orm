@@ -1,4 +1,4 @@
-// crates/arest/src/evaluate.rs
+﻿// crates/arest/src/evaluate.rs
 //
 // Evaluation is beta reduction. That's it.
 //
@@ -368,7 +368,6 @@ mod tests {
 
     fn empty_ir() -> Domain {
         Domain {
-            domain: "test".to_string(),
             nouns: HashMap::new(),
             fact_types: HashMap::new(),
             constraints: vec![],
@@ -398,7 +397,7 @@ mod tests {
     }
 
     fn ir_to_defs(ir: &Domain) -> (ast::Object, Vec<(String, ast::Func)>, ast::Object) {
-        // Via Object state: the AREST pipeline per Thm 2 (parse R→Φ, compile Φ→O).
+        // Via Object state: the AREST pipeline per Thm 2 (parse Râ†’Î¦, compile Î¦â†’O).
         let state = crate::parse_forml2::domain_to_state(ir);
         let model = crate::compile::compile(&state);
         let defs: Vec<(String, ast::Func)> = model.constraints.iter()
@@ -1897,7 +1896,7 @@ mod tests {
         assert_eq!(WorldAssumption::default(), WorldAssumption::Closed);
     }
 
-    // ── Inline-comparator filter end-to-end (Halpin FORML Example 5) ──
+    // â”€â”€ Inline-comparator filter end-to-end (Halpin FORML Example 5) â”€â”€
     //
     // Each AntecedentFilter on a DerivationRuleDef wraps the antecedent's
     // fact-extraction in Func::filter, so only facts whose role value
@@ -1928,7 +1927,6 @@ mod tests {
             ],
         });
         Domain {
-            domain: "test".to_string(),
             nouns: HashMap::new(),
             fact_types,
             constraints: vec![],
@@ -1954,8 +1952,8 @@ mod tests {
 
     #[test]
     fn inline_ge_filter_suppresses_derivation_when_no_fact_matches() {
-        // Both cities well below the 1M threshold → filter strips every
-        // antecedent fact → rule's existence check fails → no derivation.
+        // Both cities well below the 1M threshold â†’ filter strips every
+        // antecedent fact â†’ rule's existence check fails â†’ no derivation.
         let ir = city_population_ir(Some(crate::types::AntecedentFilter {
             antecedent_index: 0,
             role: "Population".to_string(),
@@ -2038,7 +2036,7 @@ mod tests {
     #[test]
     fn per_fact_fanout_produces_one_derivation_per_matching_fact() {
         // Four cities, three above the 1M threshold. Per-fact semantic
-        // demands one derived fact per matching antecedent tuple — the
+        // demands one derived fact per matching antecedent tuple â€” the
         // old existence-check semantic would have produced one regardless.
         let ir = city_population_ir(Some(crate::types::AntecedentFilter {
             antecedent_index: 0,
@@ -2071,7 +2069,7 @@ mod tests {
         assert!(!names.contains("Charlie"), "sub-threshold city must not derive");
     }
 
-    // ── Arithmetic definitional clauses, end-to-end ──
+    // â”€â”€ Arithmetic definitional clauses, end-to-end â”€â”€
     //
     // A rule like `* Foo has Doubled iff Foo has Val and Doubled is Val + Val.`
     // records a ConsequentComputedBinding { role: "Doubled", expr: Val + Val }
@@ -2099,7 +2097,6 @@ mod tests {
             ],
         });
         Domain {
-            domain: "test".to_string(),
             nouns: HashMap::new(),
             fact_types,
             constraints: vec![],
@@ -2177,7 +2174,7 @@ mod tests {
 
     #[test]
     fn arithmetic_mul_and_div_chain_left_associative() {
-        // (Val * 3) / 2 applied to Val=10 → 15.
+        // (Val * 3) / 2 applied to Val=10 â†’ 15.
         let expr = bin("/", bin("*", val_ref(), lit(3.0)), lit(2.0));
         let ir = val_derived_ir(expr, "Scaled");
         let (_meta_pop, defs, _def_map) = ir_to_defs(&ir);
@@ -2197,7 +2194,7 @@ mod tests {
 
     #[test]
     fn arithmetic_fanout_computes_per_fact_independently() {
-        // Three Foo facts with different Vals → three derivations, each
+        // Three Foo facts with different Vals â†’ three derivations, each
         // carrying its own computed value.
         let ir = val_derived_ir(bin("*", val_ref(), lit(2.0)), "Twice");
         let (_meta_pop, defs, _def_map) = ir_to_defs(&ir);
@@ -2226,7 +2223,7 @@ mod tests {
         ]);
     }
 
-    // ── Aggregate derivations, end-to-end (Codd image-set) ──
+    // â”€â”€ Aggregate derivations, end-to-end (Codd image-set) â”€â”€
 
     fn thing_part_arity_ir() -> Domain {
         let mut fact_types = HashMap::new();
@@ -2249,7 +2246,6 @@ mod tests {
             ],
         });
         Domain {
-            domain: "test".to_string(),
             nouns: HashMap::new(),
             fact_types,
             constraints: vec![],
@@ -2298,7 +2294,7 @@ mod tests {
         let (_new_state, derived) = forward_chain_defs_state(&dd, &pop_state);
 
         let arity: Vec<_> = derived.iter().filter(|d| d.fact_type_id == "thing_has_arity").collect();
-        // Collect distinct (Thing, Arity) pairs — the outer iteration emits
+        // Collect distinct (Thing, Arity) pairs â€” the outer iteration emits
         // duplicates per group, which forward_chain is expected to dedup.
         let mut pairs: alloc::collections::BTreeSet<(String, String)> = arity.iter().map(|d| {
             let t = d.bindings.iter().find(|(k, _)| k == "Thing").map(|(_, v)| v.clone()).unwrap_or_default();
@@ -2310,8 +2306,8 @@ mod tests {
             ("T2".to_string(), "1".to_string()),
         ].into_iter().collect();
         assert_eq!(pairs, expected,
-            "distinct (Thing, Arity) derivations expected T1→3 and T2→1, got {:?} (raw count = {})", pairs, arity.len());
-        // Sanity — if dedup isn't happening, the raw list still contains
+            "distinct (Thing, Arity) derivations expected T1â†’3 and T2â†’1, got {:?} (raw count = {})", pairs, arity.len());
+        // Sanity â€” if dedup isn't happening, the raw list still contains
         // the right pairs somewhere.
         assert!(arity.iter().any(|d|
             d.bindings.iter().any(|(k, v)| k == "Thing" && v == "T1") &&
@@ -2344,7 +2340,6 @@ mod tests {
             ],
         });
         Domain {
-            domain: "test".to_string(),
             nouns: HashMap::new(),
             fact_types,
             constraints: vec![],
@@ -2490,7 +2485,7 @@ mod tests {
     #[test]
     fn rule_without_filter_fires_for_any_fact_regression() {
         // Regression: when antecedent_filters is empty, behavior is
-        // unchanged from pre-#192 — any fact makes the rule fire.
+        // unchanged from pre-#192 â€” any fact makes the rule fire.
         let ir = city_population_ir(None);
         let (_meta_pop, defs, _def_map) = ir_to_defs(&ir);
 
@@ -2537,7 +2532,6 @@ mod tests {
         });
 
         let ir = Domain {
-            domain: "test".to_string(),
             nouns: HashMap::new(),
             fact_types,
             constraints: vec![],
@@ -2618,7 +2612,6 @@ mod tests {
         });
 
         let ir = Domain {
-            domain: "test".to_string(),
             nouns: HashMap::new(),
             fact_types,
             constraints: vec![],
@@ -2688,7 +2681,6 @@ mod tests {
         });
 
         let ir = Domain {
-            domain: "test".to_string(),
             nouns: HashMap::new(),
             fact_types,
             constraints: vec![],
@@ -2758,7 +2750,6 @@ mod tests {
         });
 
         let ir = Domain {
-            domain: "test".to_string(),
             nouns: HashMap::new(),
             fact_types,
             constraints: vec![],

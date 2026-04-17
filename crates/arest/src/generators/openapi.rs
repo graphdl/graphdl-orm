@@ -1144,8 +1144,7 @@ mod tests {
         // compile as a fact in the `App_uses_Generator` cell. Without
         // that fact, no openapi:* cells are emitted. With it, exactly one
         // `openapi:{snake(app-slug)}` cell is emitted per opted-in App.
-        let mut domain = organization_with_slug();
-        domain.domain = "test".into();
+        let domain = organization_with_slug();
         let base_state = crate::parse_forml2::domain_to_state(&domain);
 
         let defs_without = crate::compile::compile_to_defs_state(&base_state);

@@ -19,8 +19,6 @@ use hashbrown::HashMap;
 #[cfg_attr(feature = "std-deps", derive(serde::Deserialize, serde::Serialize))]
 #[cfg_attr(feature = "std-deps", serde(rename_all = "camelCase"))]
 pub(crate) struct Domain {
-    #[allow(dead_code)]
-    pub(crate) domain: String,
     pub(crate) nouns: HashMap<String, NounDef>,
     pub(crate) fact_types: HashMap<String, FactTypeDef>,
     pub(crate) constraints: Vec<ConstraintDef>,
@@ -104,7 +102,6 @@ struct NounMeta {
 
 /// What a recognizer produces when it matches a line.
 enum ParseAction {
-    SetDomain(String),
     AddNoun(String, NounDef, NounMeta),
     MarkAbstract(String),
     AddPartition(String, Vec<String>),
@@ -121,11 +118,6 @@ enum ParseAction {
 // Recognizers -- pure functions: &str -> Option<ParseAction>
 // The ? operator replaces all if/else branching.
 // =========================================================================
-
-fn try_domain(line: &str) -> Option<ParseAction> {
-    let rest = line.strip_prefix("# ")?;
-    (!rest.starts_with('#')).then(|| ParseAction::SetDomain(rest.trim().into()))
-}
 
 fn try_header(line: &str) -> Option<ParseAction> {
     line.starts_with('#').then_some(ParseAction::Skip)
@@ -716,7 +708,7 @@ pub(crate) fn parse_markdown_with_context(input: &str, existing_nouns: &HashMap<
     // the metamodel bootstrap), reject. The bootstrap case (no existing nouns
     // for those names) is allowed to declare them exactly once.
     let mut standalone = Domain {
-        domain: String::new(), nouns: HashMap::new(), fact_types: HashMap::new(),
+        nouns: HashMap::new(), fact_types: HashMap::new(),
         constraints: vec![], state_machines: HashMap::new(), derivation_rules: vec![],
         general_instance_facts: vec![],
         subtypes: HashMap::new(), enum_values: HashMap::new(),
@@ -736,7 +728,7 @@ pub(crate) fn parse_markdown_with_context(input: &str, existing_nouns: &HashMap<
     }
 
     let mut ir = Domain {
-        domain: String::new(), nouns: existing_nouns.clone(), fact_types: existing_fact_types.clone(),
+        nouns: existing_nouns.clone(), fact_types: existing_fact_types.clone(),
         constraints: vec![], state_machines: HashMap::new(), derivation_rules: vec![],
         general_instance_facts: vec![],
         subtypes: HashMap::new(), enum_values: HashMap::new(),
@@ -1083,7 +1075,7 @@ pub(crate) fn domain_to_state(d: &Domain) -> crate::ast::Object {
 
 pub(crate) fn parse_markdown(input: &str) -> Result<Domain, String> {
     let mut ir = Domain {
-        domain: String::new(), nouns: HashMap::new(), fact_types: HashMap::new(),
+        nouns: HashMap::new(), fact_types: HashMap::new(),
         constraints: vec![], state_machines: HashMap::new(), derivation_rules: vec![],
         general_instance_facts: vec![],
         subtypes: HashMap::new(), enum_values: HashMap::new(),
@@ -1132,7 +1124,6 @@ fn parse_into(ir: &mut Domain, input: &str) -> Result<(), String> {
     (0..lines.len()).for_each(|i| {
         let line = lines[i].trim();
         let action = None
-            .or_else(|| try_domain(line))
             .or_else(|| try_header(line))
             .or_else(|| try_entity_type(line))
             .or_else(|| try_value_type(line))
@@ -1840,7 +1831,6 @@ fn resolve_derivation_rule(
 fn apply_action(ir: &mut Domain, action: Option<ParseAction>, lines: &[String], idx: usize) {
     let Some(action) = action else { return };
     match action {
-        ParseAction::SetDomain(d) => { if ir.domain.is_empty() { ir.domain = d; } }
         ParseAction::AddNoun(name, def, meta) => {
             // Record the declaration faithfully. If the noun already exists with
             // a different object type, the UC "Each Noun has exactly one Object Type"
@@ -2476,12 +2466,6 @@ mod tests {
         let input = "Response(.id) is an entity type.\nIt is obligatory that each Response is professional.";
         let ir = parse_markdown(input).unwrap();
         assert!(ir.constraints.iter().any(|c| c.modality == "deontic"));
-    }
-
-    #[test]
-    fn domain_from_h1() {
-        let ir = parse_markdown("# Support\n\nCustomer(.Name) is an entity type.").unwrap();
-        assert_eq!(ir.domain, "Support");
     }
 
     #[test]

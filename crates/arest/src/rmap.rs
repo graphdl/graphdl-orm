@@ -1,4 +1,4 @@
-// crates/arest/src/rmap.rs
+﻿// crates/arest/src/rmap.rs
 //
 // RMAP -- Relational Mapping Procedure (Halpin, Ch. 10)
 //
@@ -89,7 +89,7 @@ fn compound_table_name(reading: &str, roles: &[crate::types::RoleDef], noun_name
 
 // -- RMAP core --------------------------------------------------------
 
-/// RMAP from Object state — reads cells directly. No Domain round-trip.
+/// RMAP from Object state â€” reads cells directly. No Domain round-trip.
 pub fn rmap_from_state(state: &crate::ast::Object) -> Vec<TableDef> {
     rmap(state)
 }
@@ -98,7 +98,7 @@ pub fn rmap(state: &crate::ast::Object) -> Vec<TableDef> {
     use crate::ast::{fetch_or_phi, binding};
     use crate::types::*;
 
-    // Build typed lookups from cells — same data state_to_domain
+    // Build typed lookups from cells â€” same data state_to_domain
     // produced, without the Domain struct.
     let noun_cell = fetch_or_phi("Noun", state);
     let mut nouns: HashMap<String, NounDef> = HashMap::new();
@@ -245,7 +245,7 @@ pub fn rmap(state: &crate::ast::Object) -> Vec<TableDef> {
     );
 
     // -- Classify fact types -----------------------------------------
-    // Classify: Filter(binary ∧ ¬binarized) then partition by UC arity
+    // Classify: Filter(binary âˆ§ Â¬binarized) then partition by UC arity
     let classified: Vec<(&str, bool, bool)> = fact_types.iter()
         .filter(|(ft_id, ft)| !binarized_ft_ids.contains(*ft_id) && ft.roles.len() >= 2)
         .map(|(ft_id, _)| {
@@ -300,7 +300,7 @@ pub fn rmap(state: &crate::ast::Object) -> Vec<TableDef> {
     //
     // Three pure data streams of (entity_key, column, Option<check>),
     // reduced into entity_columns via foldl (Backus insert combining form).
-    // No external state mutation — each stream is computed from inputs only.
+    // No external state mutation â€” each stream is computed from inputs only.
 
     let noun_ft_count: HashMap<&str, usize> = fact_types.values()
         .flat_map(|ft| ft.roles.iter().map(|r| r.noun_name.as_str()))
@@ -349,7 +349,7 @@ pub fn rmap(state: &crate::ast::Object) -> Vec<TableDef> {
         .collect();
 
     // 1:1 absorption: direction bias via pure if-expression chain.
-    // (Control flow has no side effects — returns a tuple, inputs → output.)
+    // (Control flow has no side effects â€” returns a tuple, inputs â†’ output.)
     let one_to_one_additions: Vec<(String, TableColumn, Option<String>)> = one_to_one_ft_ids.iter().map(|ft_id| {
         let ft = &fact_types[ft_id];
         let role0 = &ft.roles[0];
@@ -408,7 +408,7 @@ pub fn rmap(state: &crate::ast::Object) -> Vec<TableDef> {
         .collect();
 
     // Foldl all additions into entity_columns.
-    // fold's accumulator mutation IS the insert combining form (Backus, FP §11).
+    // fold's accumulator mutation IS the insert combining form (Backus, FP Â§11).
     let entity_columns: HashMap<String, (Vec<TableColumn>, HashSet<String>, Vec<String>)> =
         functional_additions.into_iter()
             .chain(one_to_one_additions.into_iter())
@@ -543,16 +543,16 @@ pub fn rmap(state: &crate::ast::Object) -> Vec<TableDef> {
 // -- WASM export -----------------------------------------------------
 
 
-/// Cell assignment: fact_type_id → owning cell name (paper Eq. demux).
+/// Cell assignment: fact_type_id â†’ owning cell name (paper Eq. demux).
 ///
 /// RMAP determines which entity table absorbs each fact type:
-/// - Compound UC (M:N, ternary+) → own table/cell
-/// - Single-role UC (functional) → absorbed into the UC role's entity cell
-/// - Unary facts → entity cell
+/// - Compound UC (M:N, ternary+) â†’ own table/cell
+/// - Single-role UC (functional) â†’ absorbed into the UC role's entity cell
+/// - Unary facts â†’ entity cell
 ///
 /// The returned map enables event demultiplexing:
-///   E_n = Filter(eq ∘ [RMAP, n̄]) : E
-/// rmap_cell_map from Object state — no Domain round-trip.
+///   E_n = Filter(eq âˆ˜ [RMAP, nÌ„]) : E
+/// rmap_cell_map from Object state â€” no Domain round-trip.
 pub fn rmap_cell_map_from_state(state: &crate::ast::Object) -> HashMap<String, String> {
     rmap_cell_map(state)
 }
@@ -647,11 +647,11 @@ pub fn rmap_cell_map(state: &crate::ast::Object) -> HashMap<String, String> {
             .filter(|uc| uc.len() == 1).map(|uc| uc[0]).collect();
 
         if has_compound {
-            // Compound UC → own cell (M:N table)
+            // Compound UC â†’ own cell (M:N table)
             let cell = compound_table_name(&ft.reading, &ft.roles, &noun_name_set);
             map.insert(ft_id.clone(), cell);
         } else if !single_ucs.is_empty() {
-            // Functional → absorbed into the entity cell of the identifying role.
+            // Functional â†’ absorbed into the entity cell of the identifying role.
             // The UC constrains the dependent role; the other role identifies the row.
             // E.g. UC on Customer in "Order was placed by Customer" means
             // each Order has one Customer, so the fact is absorbed into Order's cell.
@@ -661,7 +661,7 @@ pub fn rmap_cell_map(state: &crate::ast::Object) -> HashMap<String, String> {
             let entity = resolve_root(&id_role.noun_name);
             map.insert(ft_id.clone(), to_snake(&entity));
         } else {
-            // No UC → own cell (junction table)
+            // No UC â†’ own cell (junction table)
             let cell = compound_table_name(&ft.reading, &ft.roles, &noun_name_set);
             map.insert(ft_id.clone(), cell);
         }
@@ -685,7 +685,6 @@ mod tests {
         constraints: Vec<(&str, Vec<(&str, usize)>)>,
     ) -> Domain {
         let mut ir = Domain {
-            domain: "test".to_string(),
             nouns: HashMap::new(),
             fact_types: HashMap::new(),
             constraints: Vec::new(),
@@ -804,7 +803,7 @@ mod tests {
         assert_eq!(customer.primary_key, vec!["id"]);
     }
 
-    // ── Feature #57: External Uniqueness Constraint ─────────────────
+    // â”€â”€ Feature #57: External Uniqueness Constraint â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn external_uc_produces_unique_constraint() {
@@ -842,7 +841,7 @@ mod tests {
         }), "Expected UNIQUE(building_id, room_nr), got {:?}", ucs);
     }
 
-    // ── Feature #58: Partitioned Subtype Absorption ─────────────────
+    // â”€â”€ Feature #58: Partitioned Subtype Absorption â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     fn make_ir_with_subtypes(
         nouns: Vec<(&str, &str)>,
@@ -926,7 +925,7 @@ mod tests {
         assert!(table_names.contains(&"person"));
     }
 
-    // ── Feature #59: Compound Reference Scheme ──────────────────────
+    // â”€â”€ Feature #59: Compound Reference Scheme â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     fn make_ir_with_ref_schemes(
         nouns: Vec<(&str, &str)>,
@@ -976,7 +975,7 @@ mod tests {
             "Should not have synthetic id column with compound ref scheme");
     }
 
-    // ── Feature #60: Fact Type Direction Bias ────────────────────────
+    // â”€â”€ Feature #60: Fact Type Direction Bias â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn one_to_one_absorbs_toward_entity_not_value() {
