@@ -20,27 +20,27 @@ use hashbrown::HashMap;
 #[cfg_attr(feature = "std-deps", serde(rename_all = "camelCase"))]
 pub(crate) struct Domain {
     #[allow(dead_code)]
-    pub domain: String,
-    pub nouns: HashMap<String, NounDef>,
-    pub fact_types: HashMap<String, FactTypeDef>,
-    pub constraints: Vec<ConstraintDef>,
-    pub state_machines: HashMap<String, StateMachineDef>,
+    pub(crate) domain: String,
+    pub(crate) nouns: HashMap<String, NounDef>,
+    pub(crate) fact_types: HashMap<String, FactTypeDef>,
+    pub(crate) constraints: Vec<ConstraintDef>,
+    pub(crate) state_machines: HashMap<String, StateMachineDef>,
     #[cfg_attr(feature = "std-deps", serde(default))]
-    pub derivation_rules: Vec<DerivationRuleDef>,
+    pub(crate) derivation_rules: Vec<DerivationRuleDef>,
     #[cfg_attr(feature = "std-deps", serde(default))]
-    pub general_instance_facts: Vec<GeneralInstanceFact>,
+    pub(crate) general_instance_facts: Vec<GeneralInstanceFact>,
     #[cfg_attr(feature = "std-deps", serde(default))]
-    pub subtypes: HashMap<String, String>,
+    pub(crate) subtypes: HashMap<String, String>,
     #[cfg_attr(feature = "std-deps", serde(default))]
-    pub enum_values: HashMap<String, Vec<String>>,
+    pub(crate) enum_values: HashMap<String, Vec<String>>,
     #[cfg_attr(feature = "std-deps", serde(default))]
-    pub ref_schemes: HashMap<String, Vec<String>>,
+    pub(crate) ref_schemes: HashMap<String, Vec<String>>,
     #[cfg_attr(feature = "std-deps", serde(default))]
-    pub objectifications: HashMap<String, String>,
+    pub(crate) objectifications: HashMap<String, String>,
     #[cfg_attr(feature = "std-deps", serde(default))]
-    pub named_spans: HashMap<String, Vec<String>>,
+    pub(crate) named_spans: HashMap<String, Vec<String>>,
     #[cfg_attr(feature = "std-deps", serde(default))]
-    pub autofill_spans: Vec<String>,
+    pub(crate) autofill_spans: Vec<String>,
 }
 #[allow(unused_imports)]
 use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
