@@ -150,7 +150,7 @@ fn same_fact(a: &DerivedFact, b: &DerivedFact) -> bool {
 /// rules whose consequent matches, recursively proving antecedents.
 #[cfg(test)]
 #[allow(dead_code)]
-pub fn prove_state(ir: &crate::parse_forml2::Domain, state: &ast::Object, goal: &str, world_assumption: &WorldAssumption) -> ProofResult {
+pub(crate) fn prove_state(ir: &crate::parse_forml2::Domain, state: &ast::Object, goal: &str, world_assumption: &WorldAssumption) -> ProofResult {
     let proof = prove_goal_state(ir, state, goal, &HashSet::new());
 
     let status = match &proof {

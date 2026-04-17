@@ -1364,7 +1364,7 @@ pub fn validate_model_from_state(state: &crate::ast::Object) -> Vec<String> {
     validate_model_data(&data)
 }
 
-pub fn validate_model_data(ir: &DomainData) -> Vec<String> {
+pub(crate) fn validate_model_data(ir: &DomainData) -> Vec<String> {
     let mut errors = Vec::new();
 
     // 1. Undeclared nouns in fact type roles
