@@ -147,28 +147,6 @@ fn same_fact(a: &DerivedFact, b: &DerivedFact) -> bool {
 ///
 /// `goal` is a string like "Academic has Rank 'P'" -- a reading with optional values.
 /// The engine searches the population for a matching fact, then tries derivation
-/// rules whose consequent matches, recursively proving antecedents.
-#[cfg(test)]
-#[allow(dead_code)]
-pub(crate) fn prove_state(ir: &crate::parse_forml2::Domain, state: &ast::Object, goal: &str, world_assumption: &WorldAssumption) -> ProofResult {
-    let proof = prove_goal_state(ir, state, goal, &HashSet::new());
-
-    let status = match &proof {
-        Some(_) => ProofStatus::Proven,
-        None => match world_assumption {
-            WorldAssumption::Closed => ProofStatus::Disproven,
-            WorldAssumption::Open => ProofStatus::Unknown,
-        },
-    };
-
-    ProofResult {
-        goal: goal.to_string(),
-        status,
-        proof,
-        world_assumption: world_assumption.clone(),
-    }
-}
-
 /// Prove from Object state directly. No Domain reconstruction.
 pub fn prove_from_state(state: &ast::Object, goal: &str, world_assumption: &WorldAssumption) -> ProofResult {
     let schemas = ast::fetch_or_phi("FactType", state);
@@ -249,49 +227,6 @@ fn extract_bindings(fact: &ast::Object) -> Vec<(String, String)> {
             Some((items.get(0)?.as_atom()?.to_string(), items.get(1)?.as_atom()?.to_string()))
         }).collect()
     }).unwrap_or_default()
-}
-
-/// Recursive backward chaining via Domain.
-#[cfg(test)]
-#[allow(dead_code)]
-fn prove_goal_state(
-    ir: &crate::parse_forml2::Domain,
-    state: &ast::Object,
-    goal: &str,
-    visited: &HashSet<String>,
-) -> Option<ProofStep> {
-    (!visited.contains(goal)).then_some(())?;
-    let visited = &{ let mut v = visited.clone(); v.insert(goal.to_string()); v };
-
-    // Axiom first, then derivation. or_else = Backus cond lifted into Option.
-    ast::cells_iter(state).into_iter()
-        .filter_map(|(ft_id, contents)| {
-            let ft = ir.fact_types.get(ft_id)?;
-            contents.as_seq()?.iter()
-                .map(|fact| format_fact(&ft.reading, &extract_bindings(fact)))
-                .find(|fact_text| fact_text_matches(goal, fact_text, &ft.reading))
-                .map(|fact_text| ProofStep { fact: fact_text, justification: Justification::Axiom, children: vec![] })
-        })
-        .next()
-        .or_else(|| ir.derivation_rules.iter().find_map(|rule| {
-        let cons_ft = ir.fact_types.get(&rule.consequent_fact_type_id)?;
-        let goal_prefix = goal.split(' ').next().unwrap_or("");
-        (goal.contains(&cons_ft.reading) || cons_ft.reading.contains(goal_prefix)).then_some(())?;
-
-        let children: Option<Vec<ProofStep>> = rule.antecedent_fact_type_ids.iter()
-            .map(|ant_ft_id| {
-                let ant_ft = ir.fact_types.get(ant_ft_id)?;
-                prove_goal_state(ir, state, &ant_ft.reading, visited)
-            })
-            .collect();
-
-        let children = children.filter(|c| !c.is_empty())?;
-        Some(ProofStep {
-            fact: goal.to_string(),
-            justification: Justification::Derived { rule_id: rule.id.clone(), rule_text: rule.text.clone() },
-            children,
-        })
-    }))
 }
 
 /// Format a fact from its reading template and bindings
