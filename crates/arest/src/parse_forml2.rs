@@ -947,37 +947,41 @@ pub(crate) fn domain_to_state(d: &Domain) -> crate::ast::Object {
         cells.entry(name.to_string()).or_default().push(fact);
     };
 
-    // Nouns
-    for (name, def) in &d.nouns {
-        let wa = match def.world_assumption {
-            WorldAssumption::Closed => "closed",
-            WorldAssumption::Open => "open",
-        };
-        let mut pairs: Vec<(String, String)> = vec![
-            ("name".into(), name.clone()), ("objectType".into(), def.object_type.clone()),
-            ("worldAssumption".into(), wa.into()),
-        ];
-        d.subtypes.get(name).map(|st| pairs.push(("superType".into(), st.clone())));
-        let ref_scheme = d.ref_schemes.get(name)
-            .cloned()
-            .or_else(|| (def.object_type == "entity").then(|| vec!["id".into()]));
-        ref_scheme.as_ref().map(|rs| pairs.push(("referenceScheme".into(), rs.join(","))));
-        d.enum_values.get(name).filter(|evs| !evs.is_empty())
-            .map(|evs| pairs.push(("enumValues".into(), evs.join(","))));
-        let refs: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-        push(&mut cells, "Noun", fact_from_pairs(&refs));
+    // Nouns (fallback — parse_into's finalize seeds cells directly).
+    if !cells.contains_key("Noun") {
+        for (name, def) in &d.nouns {
+            let wa = match def.world_assumption {
+                WorldAssumption::Closed => "closed",
+                WorldAssumption::Open => "open",
+            };
+            let mut pairs: Vec<(String, String)> = vec![
+                ("name".into(), name.clone()), ("objectType".into(), def.object_type.clone()),
+                ("worldAssumption".into(), wa.into()),
+            ];
+            d.subtypes.get(name).map(|st| pairs.push(("superType".into(), st.clone())));
+            let ref_scheme = d.ref_schemes.get(name)
+                .cloned()
+                .or_else(|| (def.object_type == "entity").then(|| vec!["id".into()]));
+            ref_scheme.as_ref().map(|rs| pairs.push(("referenceScheme".into(), rs.join(","))));
+            d.enum_values.get(name).filter(|evs| !evs.is_empty())
+                .map(|evs| pairs.push(("enumValues".into(), evs.join(","))));
+            let refs: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            push(&mut cells, "Noun", fact_from_pairs(&refs));
+        }
     }
 
-    // Fact types: schemas + roles
-    for (ft_id, ft) in &d.fact_types {
-        push(&mut cells, "FactType", fact_from_pairs(&[
-            ("id", ft_id), ("reading", &ft.reading), ("arity", &ft.roles.len().to_string()),
-        ]));
-        for role in &ft.roles {
-            push(&mut cells, "Role", fact_from_pairs(&[
-                ("factType", ft_id), ("nounName", &role.noun_name),
-                ("position", &role.role_index.to_string()),
+    // Fact types: schemas + roles (fallback).
+    if !cells.contains_key("FactType") {
+        for (ft_id, ft) in &d.fact_types {
+            push(&mut cells, "FactType", fact_from_pairs(&[
+                ("id", ft_id), ("reading", &ft.reading), ("arity", &ft.roles.len().to_string()),
             ]));
+            for role in &ft.roles {
+                push(&mut cells, "Role", fact_from_pairs(&[
+                    ("factType", ft_id), ("nounName", &role.noun_name),
+                    ("position", &role.role_index.to_string()),
+                ]));
+            }
         }
     }
 
@@ -1007,58 +1011,65 @@ pub(crate) fn domain_to_state(d: &Domain) -> crate::ast::Object {
         }
     }
 
-    // Derivation rules + unresolved-clause diagnostics
-    for r in &d.derivation_rules {
-        let mut pairs: Vec<(&str, &str)> = vec![
-            ("id", r.id.as_str()), ("text", r.text.as_str()),
-            ("consequentFactTypeId", r.consequent_fact_type_id.as_str()),
-        ];
-        // Lossless: full rule as JSON. Read back by domain_data_from_state.
-        #[cfg(feature = "std-deps")]
-        let json_blob = serde_json::to_string(r).unwrap_or_default();
-        #[cfg(feature = "std-deps")]
-        pairs.push(("json", json_blob.as_str()));
-        push(&mut cells, "DerivationRule", fact_from_pairs(&pairs));
-        for clause in &r.unresolved_clauses {
-            push(&mut cells, "UnresolvedClause", fact_from_pairs(&[
-                ("ruleId", r.id.as_str()), ("ruleText", r.text.as_str()),
-                ("clause", clause.as_str()),
+    // Derivation rules + unresolved-clause diagnostics.
+    // apply_action / parse_into's finalize step emits these to d.cells;
+    // the fallback path below handles test fixtures built from typed
+    // fields only (e.g. Domain literals in evaluate.rs).
+    if !cells.contains_key("DerivationRule") {
+        for r in &d.derivation_rules {
+            let mut pairs: Vec<(&str, &str)> = vec![
+                ("id", r.id.as_str()), ("text", r.text.as_str()),
+                ("consequentFactTypeId", r.consequent_fact_type_id.as_str()),
+            ];
+            #[cfg(feature = "std-deps")]
+            let json_blob = serde_json::to_string(r).unwrap_or_default();
+            #[cfg(feature = "std-deps")]
+            pairs.push(("json", json_blob.as_str()));
+            push(&mut cells, "DerivationRule", fact_from_pairs(&pairs));
+            for clause in &r.unresolved_clauses {
+                push(&mut cells, "UnresolvedClause", fact_from_pairs(&[
+                    ("ruleId", r.id.as_str()), ("ruleText", r.text.as_str()),
+                    ("clause", clause.as_str()),
+                ]));
+            }
+        }
+    }
+
+    // State machines — full struct as JSON per machine (fallback path).
+    #[cfg(feature = "std-deps")]
+    if !cells.contains_key("StateMachine") {
+        for (name, sm) in &d.state_machines {
+            let json_blob = serde_json::to_string(sm).unwrap_or_default();
+            push(&mut cells, "StateMachine", fact_from_pairs(&[
+                ("name", name.as_str()), ("json", json_blob.as_str()),
             ]));
         }
     }
 
-    // State machines â€” full struct as JSON per machine. Tests build
-    // StateMachineDef directly (bypassing instance-fact path); without
-    // this cell, domain_data_from_state rebuilds from instance facts only
-    // and loses the hand-built SMs.
-    #[cfg(feature = "std-deps")]
-    for (name, sm) in &d.state_machines {
-        let json_blob = serde_json::to_string(sm).unwrap_or_default();
-        push(&mut cells, "StateMachine", fact_from_pairs(&[
-            ("name", name.as_str()), ("json", json_blob.as_str()),
-        ]));
+    // Instance facts: generic cell + fact-type-specific cell (fallback).
+    if !cells.contains_key("InstanceFact") {
+        for f in &d.general_instance_facts {
+            push(&mut cells, "InstanceFact", fact_from_pairs(&[
+                ("subjectNoun", f.subject_noun.as_str()), ("subjectValue", f.subject_value.as_str()),
+                ("fieldName", f.field_name.as_str()), ("objectNoun", f.object_noun.as_str()),
+                ("objectValue", f.object_value.as_str()),
+            ]));
+            let ft_cell = &f.field_name;
+            let subject = &f.subject_noun;
+            let object = if f.object_noun.is_empty() { &f.field_name } else { &f.object_noun };
+            push(&mut cells, ft_cell, fact_from_pairs(&[
+                (subject.as_str(), f.subject_value.as_str()),
+                (object.as_str(), f.object_value.as_str()),
+            ]));
+        }
     }
 
-    // Instance facts: generic cell + fact-type-specific cell
-    for f in &d.general_instance_facts {
-        push(&mut cells, "InstanceFact", fact_from_pairs(&[
-            ("subjectNoun", f.subject_noun.as_str()), ("subjectValue", f.subject_value.as_str()),
-            ("fieldName", f.field_name.as_str()), ("objectNoun", f.object_noun.as_str()),
-            ("objectValue", f.object_value.as_str()),
-        ]));
-        let ft_cell = &f.field_name;
-        let subject = &f.subject_noun;
-        let object = if f.object_noun.is_empty() { &f.field_name } else { &f.object_noun };
-        push(&mut cells, ft_cell, fact_from_pairs(&[
-            (subject.as_str(), f.subject_value.as_str()),
-            (object.as_str(), f.object_value.as_str()),
-        ]));
-    }
-
-    // Compound reference scheme decomposition.
+    // Compound reference scheme decomposition (fallback — parse_into's
+    // finalize handles this when InstanceFact cell is populated).
     // For each entity with a compound ref scheme, split instance IDs on '-'
     // from the right and push component facts to {Noun}_has_{Component} cells.
-    for (noun_name, ref_parts) in d.ref_schemes.iter().filter(|(_, p)| p.len() >= 2) {
+    if !cells.contains_key("InstanceFact") {
+      for (noun_name, ref_parts) in d.ref_schemes.iter().filter(|(_, p)| p.len() >= 2) {
         let ids: HashSet<&str> = d.general_instance_facts.iter()
             .filter(|f| f.subject_noun == *noun_name)
             .map(|f| f.subject_value.as_str())
@@ -1075,6 +1086,7 @@ pub(crate) fn domain_to_state(d: &Domain) -> crate::ast::Object {
                 ]));
             }
         }
+      }
     }
 
     // Wrap into Object::Map in one pass: each cell becomes Object::Seq(facts).
@@ -1350,13 +1362,136 @@ fn parse_into(ir: &mut Domain, input: &str) -> Result<(), String> {
                 .for_each(|span| span.subset_autofill = Some(true));
         });
 
-    // Rebuild Constraint cells from typed fields to reflect post-parse
-    // mutations (VC extension above, autofill span post-processing). This
-    // replaces any stale cells emitted during apply_action / Pass 2b.
+    // Finalize cells from typed fields after all post-processing. This
+    // captures mutations applied after the per-arm emission (VC
+    // extension, autofill span marking, derivation re-resolution, etc.)
+    // and keeps the parse output Object-native per Thm 2.
     #[cfg(feature = "std-deps")]
     {
-        let facts: Vec<crate::ast::Object> = ir.constraints.iter().map(constraint_to_fact).collect();
-        ir.cells.insert("Constraint".to_string(), facts);
+        use crate::ast::{Object, fact_from_pairs};
+
+        // Noun: ir.nouns + ir.subtypes + ir.ref_schemes + ir.enum_values
+        let n_facts: Vec<Object> = ir.nouns.iter().map(|(name, def)| {
+            let wa = match def.world_assumption {
+                WorldAssumption::Closed => "closed", WorldAssumption::Open => "open",
+            };
+            let mut pairs: Vec<(String, String)> = vec![
+                ("name".into(), name.clone()),
+                ("objectType".into(), def.object_type.clone()),
+                ("worldAssumption".into(), wa.into()),
+            ];
+            ir.subtypes.get(name).map(|st| pairs.push(("superType".into(), st.clone())));
+            let ref_scheme = ir.ref_schemes.get(name)
+                .cloned()
+                .or_else(|| (def.object_type == "entity").then(|| vec!["id".into()]));
+            ref_scheme.as_ref().map(|rs| pairs.push(("referenceScheme".into(), rs.join(","))));
+            ir.enum_values.get(name).filter(|evs| !evs.is_empty())
+                .map(|evs| pairs.push(("enumValues".into(), evs.join(","))));
+            let refs: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            fact_from_pairs(&refs)
+        }).collect();
+        ir.cells.insert("Noun".to_string(), n_facts);
+
+        // FactType + Role from ir.fact_types
+        let mut ft_facts: Vec<Object> = Vec::with_capacity(ir.fact_types.len());
+        let mut role_facts: Vec<Object> = Vec::new();
+        for (ft_id, ft) in &ir.fact_types {
+            ft_facts.push(fact_from_pairs(&[
+                ("id", ft_id.as_str()), ("reading", ft.reading.as_str()),
+                ("arity", &ft.roles.len().to_string()),
+            ]));
+            for role in &ft.roles {
+                role_facts.push(fact_from_pairs(&[
+                    ("factType", ft_id.as_str()), ("nounName", role.noun_name.as_str()),
+                    ("position", &role.role_index.to_string()),
+                ]));
+            }
+        }
+        ir.cells.insert("FactType".to_string(), ft_facts);
+        ir.cells.insert("Role".to_string(), role_facts);
+
+        // Constraint: ir.constraints → Constraint cell
+        let c_facts: Vec<Object> = ir.constraints.iter().map(constraint_to_fact).collect();
+        ir.cells.insert("Constraint".to_string(), c_facts);
+
+        // DerivationRule + UnresolvedClause: ir.derivation_rules → cells
+        let mut dr_facts: Vec<Object> = Vec::with_capacity(ir.derivation_rules.len());
+        let mut uc_facts: Vec<Object> = Vec::new();
+        for r in &ir.derivation_rules {
+            let json = serde_json::to_string(r).unwrap_or_default();
+            dr_facts.push(fact_from_pairs(&[
+                ("id", r.id.as_str()), ("text", r.text.as_str()),
+                ("consequentFactTypeId", r.consequent_fact_type_id.as_str()),
+                ("json", json.as_str()),
+            ]));
+            for clause in &r.unresolved_clauses {
+                uc_facts.push(fact_from_pairs(&[
+                    ("ruleId", r.id.as_str()), ("ruleText", r.text.as_str()),
+                    ("clause", clause.as_str()),
+                ]));
+            }
+        }
+        ir.cells.insert("DerivationRule".to_string(), dr_facts);
+        if !uc_facts.is_empty() {
+            ir.cells.insert("UnresolvedClause".to_string(), uc_facts);
+        }
+
+        // StateMachine: ir.state_machines → StateMachine cell
+        let sm_facts: Vec<Object> = ir.state_machines.iter().map(|(name, sm)| {
+            let json = serde_json::to_string(sm).unwrap_or_default();
+            fact_from_pairs(&[("name", name.as_str()), ("json", json.as_str())])
+        }).collect();
+        if !sm_facts.is_empty() {
+            ir.cells.insert("StateMachine".to_string(), sm_facts);
+        }
+
+        // InstanceFact + per-field cells from ir.general_instance_facts.
+        let mut inst_facts: Vec<Object> = Vec::with_capacity(ir.general_instance_facts.len());
+        let mut by_field: hashbrown::HashMap<String, Vec<Object>> = hashbrown::HashMap::new();
+        for f in &ir.general_instance_facts {
+            inst_facts.push(fact_from_pairs(&[
+                ("subjectNoun", f.subject_noun.as_str()),
+                ("subjectValue", f.subject_value.as_str()),
+                ("fieldName", f.field_name.as_str()),
+                ("objectNoun", f.object_noun.as_str()),
+                ("objectValue", f.object_value.as_str()),
+            ]));
+            let object = if f.object_noun.is_empty() { f.field_name.as_str() } else { f.object_noun.as_str() };
+            by_field.entry(f.field_name.clone()).or_default().push(fact_from_pairs(&[
+                (f.subject_noun.as_str(), f.subject_value.as_str()),
+                (object, f.object_value.as_str()),
+            ]));
+        }
+        if !inst_facts.is_empty() {
+            ir.cells.insert("InstanceFact".to_string(), inst_facts);
+        }
+        for (name, facts) in by_field {
+            ir.cells.insert(name, facts);
+        }
+
+        // Compound reference-scheme decomposition: for each entity with
+        // ≥2 ref parts, split instance IDs on '-' from the right and
+        // push component facts to {Noun}_has_{Component} cells.
+        use hashbrown::HashSet as HBSet;
+        for (noun_name, ref_parts) in ir.ref_schemes.iter().filter(|(_, p)| p.len() >= 2) {
+            let ids: HBSet<&str> = ir.general_instance_facts.iter()
+                .filter(|f| f.subject_noun == *noun_name)
+                .map(|f| f.subject_value.as_str())
+                .collect();
+            for id in &ids {
+                let parts: Vec<&str> = id.rsplitn(ref_parts.len(), '-').collect::<Vec<_>>();
+                let parts: Vec<&str> = parts.into_iter().rev().collect();
+                if parts.len() != ref_parts.len() { continue; }
+                for (component, value) in ref_parts.iter().zip(parts.iter()) {
+                    let cell_name = format!("{}_has_{}",
+                        noun_name.replace(' ', "_"), component.replace(' ', "_"));
+                    ir.cells.entry(cell_name).or_default().push(fact_from_pairs(&[
+                        (noun_name.as_str(), *id),
+                        (component.as_str(), *value),
+                    ]));
+                }
+            }
+        }
     }
 
     // Strict mode: reject undeclared nouns (subtype children, fact type roles).
