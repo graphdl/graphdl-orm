@@ -8,7 +8,7 @@ use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct Domain {
+pub(crate) struct Domain {
     #[allow(dead_code)] // deserialized from JSON, read by JS callers
     pub domain: String,
     pub nouns: HashMap<String, NounDef>,
