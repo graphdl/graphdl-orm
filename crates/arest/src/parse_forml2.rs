@@ -28,7 +28,6 @@ struct ParseCtx {
     nouns: HashMap<String, NounDef>,
     fact_types: HashMap<String, FactTypeDef>,
     constraints: Vec<ConstraintDef>,
-    state_machines: HashMap<String, StateMachineDef>,
     #[cfg_attr(feature = "std-deps", serde(default))]
     derivation_rules: Vec<DerivationRuleDef>,
     #[cfg_attr(feature = "std-deps", serde(default))]
@@ -716,7 +715,7 @@ fn parse_markdown_with_context(input: &str, existing_nouns: &HashMap<String, Nou
     // for those names) is allowed to declare them exactly once.
     let mut standalone = ParseCtx {
         nouns: HashMap::new(), fact_types: HashMap::new(),
-        constraints: vec![], state_machines: HashMap::new(), derivation_rules: vec![],
+        constraints: vec![], derivation_rules: vec![],
         general_instance_facts: vec![],
         subtypes: HashMap::new(), enum_values: HashMap::new(),
         ref_schemes: HashMap::new(),
@@ -737,7 +736,7 @@ fn parse_markdown_with_context(input: &str, existing_nouns: &HashMap<String, Nou
 
     let mut ir = ParseCtx {
         nouns: existing_nouns.clone(), fact_types: existing_fact_types.clone(),
-        constraints: vec![], state_machines: HashMap::new(), derivation_rules: vec![],
+        constraints: vec![], derivation_rules: vec![],
         general_instance_facts: vec![],
         subtypes: HashMap::new(), enum_values: HashMap::new(),
         ref_schemes: HashMap::new(),
@@ -1035,16 +1034,9 @@ fn domain_to_state(d: &ParseCtx) -> crate::ast::Object {
         }
     }
 
-    // State machines — full struct as JSON per machine (fallback path).
-    #[cfg(feature = "std-deps")]
-    if !cells.contains_key("StateMachine") {
-        for (name, sm) in &d.state_machines {
-            let json_blob = serde_json::to_string(sm).unwrap_or_default();
-            push(&mut cells, "StateMachine", fact_from_pairs(&[
-                ("name", name.as_str()), ("json", json_blob.as_str()),
-            ]));
-        }
-    }
+    // State machines are derived from instance facts at compile time
+    // (derive_state_machines_from_facts in compile.rs). The parser does
+    // not carry a separate state_machines index.
 
     // Instance facts: generic cell + fact-type-specific cell (fallback).
     if !cells.contains_key("InstanceFact") {
@@ -1100,7 +1092,7 @@ fn domain_to_state(d: &ParseCtx) -> crate::ast::Object {
 fn parse_markdown(input: &str) -> Result<ParseCtx, String> {
     let mut ir = ParseCtx {
         nouns: HashMap::new(), fact_types: HashMap::new(),
-        constraints: vec![], state_machines: HashMap::new(), derivation_rules: vec![],
+        constraints: vec![], derivation_rules: vec![],
         general_instance_facts: vec![],
         subtypes: HashMap::new(), enum_values: HashMap::new(),
         ref_schemes: HashMap::new(),
@@ -1436,14 +1428,10 @@ fn parse_into(ir: &mut ParseCtx, input: &str) -> Result<(), String> {
             ir.cells.insert("UnresolvedClause".to_string(), uc_facts);
         }
 
-        // StateMachine: ir.state_machines → StateMachine cell
-        let sm_facts: Vec<Object> = ir.state_machines.iter().map(|(name, sm)| {
-            let json = serde_json::to_string(sm).unwrap_or_default();
-            fact_from_pairs(&[("name", name.as_str()), ("json", json.as_str())])
-        }).collect();
-        if !sm_facts.is_empty() {
-            ir.cells.insert("StateMachine".to_string(), sm_facts);
-        }
+        // StateMachine cells are derived at compile time from instance
+        // facts ("State Machine Definition 'X' is for Noun 'Y'" etc.) by
+        // derive_state_machines_from_facts. The parser never writes
+        // ir.state_machines, so there's nothing to emit here.
 
         // InstanceFact + per-field cells from ir.general_instance_facts.
         let mut inst_facts: Vec<Object> = Vec::with_capacity(ir.general_instance_facts.len());
