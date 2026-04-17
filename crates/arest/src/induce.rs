@@ -16,7 +16,7 @@
 //   - Pattern induction: can one fact type be derived from others?
 
 use hashbrown::{HashMap, HashSet};
-use crate::types::*;
+// types used transitively via crate::types::{FactTypeDef, RoleDef}
 use crate::ast::{self, Object};
 #[allow(unused_imports)]
 use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
@@ -62,7 +62,23 @@ pub struct PopulationStats {
 }
 
 /// Induce constraints and rules from an Object state and its schema.
-pub fn induce_state(ir: &Domain, state: &Object) -> InductionResult {
+pub fn induce_state(state: &Object) -> InductionResult {
+    // Build local fact_types map from state cells (no Domain needed).
+    let role_cell = ast::fetch_or_phi("Role", state);
+    let fact_types: HashMap<String, crate::types::FactTypeDef> = ast::fetch_or_phi("FactType", state).as_seq()
+        .map(|facts| facts.iter().filter_map(|f| {
+            let id = ast::binding(f, "id")?.to_string();
+            let reading = ast::binding(f, "reading").unwrap_or("").to_string();
+            let roles: Vec<crate::types::RoleDef> = role_cell.as_seq()
+                .map(|rs| rs.iter()
+                    .filter(|r| ast::binding(r, "factType") == Some(&id))
+                    .map(|r| crate::types::RoleDef {
+                        noun_name: ast::binding(r, "nounName").unwrap_or("").to_string(),
+                        role_index: ast::binding(r, "position").and_then(|v| v.parse().ok()).unwrap_or(0),
+                    }).collect()).unwrap_or_default();
+            Some((id, crate::types::FactTypeDef { schema_id: String::new(), reading, readings: vec![], roles }))
+        }).collect()).unwrap_or_default();
+
     let mut constraints = Vec::new();
     let mut rules = Vec::new();
 
@@ -87,10 +103,12 @@ pub fn induce_state(ir: &Domain, state: &Object) -> InductionResult {
         .flat_map(|(_, facts)| facts.iter().flat_map(|f| f.iter().map(|(_, v)| v.clone())))
         .collect();
 
+    let ft_ref = &fact_types;
+
     // -- UC Induction -------------------------------------------------
     let uc_new: Vec<InducedConstraint> = cells.iter()
         .filter(|(_, facts)| !facts.is_empty())
-        .filter_map(|(ft_id, facts)| ir.fact_types.get(ft_id).map(|ft| (ft_id, facts, ft)))
+        .filter_map(|(ft_id, facts)| ft_ref.get(ft_id).map(|ft| (ft_id, facts, ft)))
         .flat_map(|(ft_id, facts, ft)| {
             let arity = ft.roles.len();
 
@@ -180,7 +198,7 @@ pub fn induce_state(ir: &Domain, state: &Object) -> InductionResult {
 
     // -- MC Induction -------------------------------------------------
     let mc_new: Vec<InducedConstraint> = cells.iter()
-        .filter_map(|(ft_id, facts)| ir.fact_types.get(ft_id).map(|ft| (ft_id, facts, ft)))
+        .filter_map(|(ft_id, facts)| ft_ref.get(ft_id).map(|ft| (ft_id, facts, ft)))
         .filter(|(_, _, ft)| ft.roles.len() >= 2)
         .filter_map(|(ft_id, facts, ft)| {
             let role0_noun = &ft.roles[0].noun_name;
@@ -218,7 +236,7 @@ pub fn induce_state(ir: &Domain, state: &Object) -> InductionResult {
     // -- SS Induction -------------------------------------------------
     let ft_entities: HashMap<String, HashSet<String>> = cells.iter()
         .filter_map(|(ft_id, facts)| {
-            let ft = ir.fact_types.get(ft_id).filter(|ft| !ft.roles.is_empty())?;
+            let ft = ft_ref.get(ft_id).filter(|ft| !ft.roles.is_empty())?;
             let _ = ft;
             let vals: HashSet<String> = facts.iter()
                 .filter_map(|f| f.first().map(|(_, v)| v.clone()))
@@ -236,8 +254,8 @@ pub fn induce_state(ir: &Domain, state: &Object) -> InductionResult {
             let a = &ft_ent_ref[&ft_ids_ref[i]];
             let b = &ft_ent_ref[&ft_ids_ref[j]];
             if !a.is_empty() && a.is_subset(b) && a != b {
-                let reading_a = ir.fact_types.get(&ft_ids_ref[i]).map(|f| f.reading.as_str()).unwrap_or("?");
-                let reading_b = ir.fact_types.get(&ft_ids_ref[j]).map(|f| f.reading.as_str()).unwrap_or("?");
+                let reading_a = ft_ref.get(&ft_ids_ref[i]).map(|f| f.reading.as_str()).unwrap_or("?");
+                let reading_b = ft_ref.get(&ft_ids_ref[j]).map(|f| f.reading.as_str()).unwrap_or("?");
                 Some(InducedConstraint {
                     kind: "SS".to_string(),
                     fact_type_id: ft_ids_ref[i].clone(),
@@ -258,7 +276,7 @@ pub fn induce_state(ir: &Domain, state: &Object) -> InductionResult {
 
     // -- Derivation Rule Induction ------------------------------------
     let new_rules: Vec<InducedRule> = cells.iter()
-        .filter_map(|(ft_id, facts)| ir.fact_types.get(ft_id).map(|ft| (ft_id, facts, ft)))
+        .filter_map(|(ft_id, facts)| ft_ref.get(ft_id).map(|ft| (ft_id, facts, ft)))
         .filter(|(_, facts, ft)| ft.roles.len() >= 2 && facts.len() >= 2)
         .flat_map(|(ft_id, facts, ft)| {
             let target: HashSet<(String, String)> = facts.iter()
@@ -269,13 +287,13 @@ pub fn induce_state(ir: &Domain, state: &Object) -> InductionResult {
             cells.iter()
                 .filter_map(|(other_a_id, other_a_facts)| {
                     (other_a_id != ft_id).then_some(())?;
-                    ir.fact_types.get(other_a_id).map(|ft_a| (other_a_id, other_a_facts, ft_a))
+                    ft_ref.get(other_a_id).map(|ft_a| (other_a_id, other_a_facts, ft_a))
                 })
                 .flat_map(|(other_a_id, other_a_facts, other_a_ft)| {
                     cells.iter()
                         .filter_map(|(other_b_id, other_b_facts)| {
                             (other_b_id != ft_id && other_b_id != other_a_id).then_some(())?;
-                            ir.fact_types.get(other_b_id).map(|ft_b| (other_b_id, other_b_facts, ft_b))
+                            ft_ref.get(other_b_id).map(|ft_b| (other_b_id, other_b_facts, ft_b))
                         })
                         .filter_map(|(other_b_id, other_b_facts, other_b_ft)| {
                             let a_nouns: HashSet<&str> = other_a_ft.roles.iter().map(|r| r.noun_name.as_str()).collect();

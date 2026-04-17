@@ -14,7 +14,8 @@ use crate::types::*;
 use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 
 /// Verbalize a constraint back to its FORML 2 reading.
-pub fn verbalize_constraint(constraint: &ConstraintDef, ir: &Domain) -> String {
+#[cfg(test)]
+pub fn verbalize_constraint(constraint: &ConstraintDef, ir: &crate::parse_forml2::Domain) -> String {
     let modal = match (constraint.modality.as_str(), constraint.deontic_operator.as_deref()) {
         ("deontic", Some("forbidden")) => "It is forbidden that ",
         ("deontic", Some("obligatory")) => "It is obligatory that ",
@@ -75,7 +76,8 @@ pub fn verbalize_constraint(constraint: &ConstraintDef, ir: &Domain) -> String {
 }
 
 /// Verbalize an entity type declaration.
-pub fn verbalize_noun(name: &str, def: &NounDef, ir: &Domain) -> String {
+#[cfg(test)]
+pub fn verbalize_noun(name: &str, def: &NounDef, ir: &crate::parse_forml2::Domain) -> String {
     match def.object_type.as_str() {
         "entity" => {
             if let Some(refs) = ir.ref_schemes.get(name) {
@@ -97,7 +99,8 @@ pub fn verbalize_noun(name: &str, def: &NounDef, ir: &Domain) -> String {
 }
 
 /// Verbalize a subtype declaration.
-pub fn verbalize_subtype(name: &str, ir: &Domain) -> Option<String> {
+#[cfg(test)]
+pub fn verbalize_subtype(name: &str, ir: &crate::parse_forml2::Domain) -> Option<String> {
     ir.subtypes.get(name).map(|sup| format!("{} is a subtype of {}.", name, sup))
 }
 
@@ -107,6 +110,7 @@ pub fn verbalize_fact_type(ft: &FactTypeDef) -> String {
 }
 
 /// Build a titled section: header lines + body lines + trailing blank, or empty if body is empty.
+#[cfg(test)]
 fn ir_section(title: Option<&str>, body: Vec<String>) -> Vec<String> {
     body.is_empty().then(Vec::new).unwrap_or_else(|| {
         let header: Vec<String> = title
@@ -120,7 +124,8 @@ fn ir_section(title: Option<&str>, body: Vec<String>) -> Vec<String> {
 }
 
 /// Verbalize an entire IR back to a FORML 2 document.
-pub fn verbalize_ir(ir: &Domain) -> String {
+#[cfg(test)]
+pub fn verbalize_ir(ir: &crate::parse_forml2::Domain) -> String {
     // Domain header as an optional pair of lines.
     let header: Vec<String> = (!ir.domain.is_empty())
         .then(|| vec![format!("# {}", ir.domain), String::new()])
@@ -169,6 +174,7 @@ pub fn verbalize_ir(ir: &Domain) -> String {
     lines.join("\n")
 }
 
+#[cfg(test)]
 fn extract_predicate(reading: &str, noun_a: &str, noun_b: &str) -> String {
     reading.find(noun_a)
         .map(|start| start + noun_a.len())
@@ -184,6 +190,7 @@ fn extract_predicate(reading: &str, noun_a: &str, noun_b: &str) -> String {
 mod tests {
     use super::*;
     use crate::parse_forml2;
+    use crate::parse_forml2::Domain;
 
     #[test]
     fn verbalize_uc() {

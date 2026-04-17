@@ -27,7 +27,7 @@
 // reject the mutation, emit a deontic warning, or just record.
 
 use crate::ast::{fetch, Object};
-use crate::types::Domain;
+use crate::ast::binding;
 #[allow(unused_imports)]
 use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 
@@ -99,8 +99,8 @@ pub fn cpu_nanos_used(state: &Object) -> u64 {
     }
 }
 
-/// Look up an App's declared quota for `resource` from the domain's
-/// instance facts. Returns None when no limit is declared —
+/// Look up an App's declared quota for `resource` from InstanceFact
+/// cells in state. Returns None when no limit is declared —
 /// callers decide the default policy (enforce a system-wide
 /// ceiling, fail open, etc.).
 ///
@@ -108,17 +108,19 @@ pub fn cpu_nanos_used(state: &Object) -> u64 {
 ///   App '<slug>' has Audit Log Limit '<n>'.
 ///   App '<slug>' has Cpu Ms Quota '<ms>'.
 ///   App '<slug>' has Memory Cells Limit '<n>'.
-pub fn app_quota_limit(domain: &Domain, app: &str, resource: Resource) -> Option<u64> {
+pub fn app_quota_limit(state: &Object, app: &str, resource: Resource) -> Option<u64> {
     let field = match resource {
         Resource::AuditLogEntries => "Audit Log Limit",
         Resource::CpuNanos        => "Cpu Ms Quota",
         Resource::MemoryCells     => "Memory Cells Limit",
     };
-    domain.general_instance_facts.iter()
-        .find(|f| f.subject_noun == "App"
-              && f.subject_value == app
-              && f.field_name == field)
-        .and_then(|f| f.object_value.parse::<u64>().ok())
+    let inst = crate::ast::fetch_or_phi("InstanceFact", state);
+    inst.as_seq()
+        .and_then(|facts| facts.iter()
+            .find(|f| binding(f, "subjectNoun") == Some("App")
+                  && binding(f, "subjectValue") == Some(app)
+                  && binding(f, "fieldName") == Some(field)))
+        .and_then(|f| binding(f, "objectValue").and_then(|v| v.parse::<u64>().ok()))
         .map(|raw| match resource {
             // Cpu Ms Quota is declared in milliseconds; convert to ns
             // so the usage & limit are in the same unit.
@@ -132,7 +134,6 @@ pub fn app_quota_limit(domain: &Domain, app: &str, resource: Resource) -> Option
 /// usage has met or exceeded the limit.
 pub fn check_quota(
     state: &Object,
-    domain: &Domain,
     app: &str,
     resource: Resource,
 ) -> QuotaStatus {
@@ -141,7 +142,7 @@ pub fn check_quota(
         Resource::CpuNanos        => cpu_nanos_used(state),
         Resource::MemoryCells     => cell_count(state),
     };
-    let limit = app_quota_limit(domain, app, resource).unwrap_or(u64::MAX);
+    let limit = app_quota_limit(state, app, resource).unwrap_or(u64::MAX);
     let exceeded = usage >= limit && limit != u64::MAX;
     QuotaStatus { resource, usage, limit, exceeded }
 }
@@ -150,18 +151,13 @@ pub fn check_quota(
 mod tests {
     use super::*;
     use crate::ast::{cell_push, fact_from_pairs, Object};
-    use crate::types::{Domain, GeneralInstanceFact};
 
-    fn domain_with_app_quota(app: &str, field: &str, value: &str) -> Domain {
-        let mut d = Domain::default();
-        d.general_instance_facts.push(GeneralInstanceFact {
-            subject_noun: "App".into(),
-            subject_value: app.into(),
-            field_name: field.into(),
-            object_noun: "Quota".into(),
-            object_value: value.into(),
-        });
-        d
+    /// Build a state with an InstanceFact cell containing one quota fact.
+    fn state_with_app_quota(app: &str, field: &str, value: &str) -> Object {
+        cell_push("InstanceFact", fact_from_pairs(&[
+            ("subjectNoun", "App"), ("subjectValue", app),
+            ("fieldName", field), ("objectNoun", "Quota"), ("objectValue", value),
+        ]), &Object::phi())
     }
 
     #[test]
@@ -183,24 +179,24 @@ mod tests {
 
     #[test]
     fn app_quota_limit_reads_audit_log_limit_fact() {
-        let d = domain_with_app_quota("sherlock", "Audit Log Limit", "1000");
-        assert_eq!(app_quota_limit(&d, "sherlock", Resource::AuditLogEntries), Some(1000));
-        assert_eq!(app_quota_limit(&d, "other", Resource::AuditLogEntries), None);
+        let s = state_with_app_quota("sherlock", "Audit Log Limit", "1000");
+        assert_eq!(app_quota_limit(&s, "sherlock", Resource::AuditLogEntries), Some(1000));
+        assert_eq!(app_quota_limit(&s, "other", Resource::AuditLogEntries), None);
     }
 
     #[test]
     fn app_quota_limit_converts_cpu_ms_to_ns() {
-        let d = domain_with_app_quota("sherlock", "Cpu Ms Quota", "5");
+        let s = state_with_app_quota("sherlock", "Cpu Ms Quota", "5");
         // 5ms = 5_000_000 ns
-        assert_eq!(app_quota_limit(&d, "sherlock", Resource::CpuNanos), Some(5_000_000));
+        assert_eq!(app_quota_limit(&s, "sherlock", Resource::CpuNanos), Some(5_000_000));
     }
 
     #[test]
     fn check_quota_reports_under_at_over() {
-        let d = domain_with_app_quota("sherlock", "Audit Log Limit", "2");
+        let base = state_with_app_quota("sherlock", "Audit Log Limit", "2");
 
         // Under: 0 entries < 2
-        let status = check_quota(&Object::phi(), &d, "sherlock", Resource::AuditLogEntries);
+        let status = check_quota(&base, "sherlock", Resource::AuditLogEntries);
         assert_eq!(status.usage, 0);
         assert_eq!(status.limit, 2);
         assert!(!status.exceeded);
@@ -208,17 +204,16 @@ mod tests {
         // At limit: 2 entries >= 2 — exceeded
         let state = cell_push("audit_log",
             fact_from_pairs(&[("op", "a")]),
-            &cell_push("audit_log", fact_from_pairs(&[("op", "b")]), &Object::phi()));
-        let status = check_quota(&state, &d, "sherlock", Resource::AuditLogEntries);
+            &cell_push("audit_log", fact_from_pairs(&[("op", "b")]), &base));
+        let status = check_quota(&state, "sherlock", Resource::AuditLogEntries);
         assert_eq!(status.usage, 2);
         assert!(status.exceeded);
     }
 
     #[test]
     fn check_quota_no_declared_limit_never_exceeds() {
-        let d = Domain::default();
         let state = cell_push("audit_log", fact_from_pairs(&[("op", "a")]), &Object::phi());
-        let status = check_quota(&state, &d, "sherlock", Resource::AuditLogEntries);
+        let status = check_quota(&state, "sherlock", Resource::AuditLogEntries);
         assert_eq!(status.usage, 1);
         assert_eq!(status.limit, u64::MAX);
         assert!(!status.exceeded);

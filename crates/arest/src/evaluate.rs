@@ -148,8 +148,9 @@ fn same_fact(a: &DerivedFact, b: &DerivedFact) -> bool {
 /// `goal` is a string like "Academic has Rank 'P'" -- a reading with optional values.
 /// The engine searches the population for a matching fact, then tries derivation
 /// rules whose consequent matches, recursively proving antecedents.
+#[cfg(test)]
 #[allow(dead_code)]
-pub fn prove_state(ir: &Domain, state: &ast::Object, goal: &str, world_assumption: &WorldAssumption) -> ProofResult {
+pub fn prove_state(ir: &crate::parse_forml2::Domain, state: &ast::Object, goal: &str, world_assumption: &WorldAssumption) -> ProofResult {
     let proof = prove_goal_state(ir, state, goal, &HashSet::new());
 
     let status = match &proof {
@@ -251,9 +252,10 @@ fn extract_bindings(fact: &ast::Object) -> Vec<(String, String)> {
 }
 
 /// Recursive backward chaining via Domain.
+#[cfg(test)]
 #[allow(dead_code)]
 fn prove_goal_state(
-    ir: &Domain,
+    ir: &crate::parse_forml2::Domain,
     state: &ast::Object,
     goal: &str,
     visited: &HashSet<String>,
@@ -427,6 +429,7 @@ pub fn synthesize_from_state(state: &ast::Object, noun_name: &str, depth: usize)
 mod tests {
     use super::*;
     use hashbrown::HashMap;
+    use crate::parse_forml2::Domain;
 
     fn empty_ir() -> Domain {
         Domain {

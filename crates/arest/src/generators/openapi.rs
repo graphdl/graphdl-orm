@@ -46,7 +46,9 @@ use hashbrown::HashMap;
 
 use crate::ast::{Object, binding, fetch_or_phi};
 use crate::rmap::{self, TableColumn, TableDef};
-use crate::types::{Domain, StateMachineDef};
+#[cfg(test)]
+use crate::parse_forml2::Domain;
+use crate::types::StateMachineDef;
 #[allow(unused_imports)]
 use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 
@@ -211,6 +213,7 @@ fn openapi_from_state(state: &Object, app_name: &str) -> serde_json::Value {
 ///
 /// `pub(crate)` so `compile.rs` can register the document cell without
 /// round-tripping through state for every App.
+#[cfg(test)]
 pub(crate) fn openapi_for_app(domain: &Domain, app_name: &str) -> serde_json::Value {
     let state_obj = crate::parse_forml2::domain_to_state(domain);
     let tables = rmap::rmap(&state_obj);
@@ -280,6 +283,7 @@ pub(crate) fn openapi_for_app(domain: &Domain, app_name: &str) -> serde_json::Va
 /// Look up an App's description from `App has Description` instance
 /// facts. Returns `None` when no description fact is present; the
 /// caller chooses its own fallback sentence.
+#[cfg(test)]
 fn app_description(domain: &Domain, app_name: &str) -> Option<String> {
     domain.general_instance_facts.iter()
         .find(|f| f.subject_noun == "App"
@@ -304,6 +308,7 @@ fn app_description_from_state(inst_seq: &[Object], app_name: &str) -> Option<Str
 /// down, no dedicated struct field. Falls back to `snake(noun) + "s"`
 /// when no plural was declared. Users override the fallback by writing
 /// `Noun 'Entity' has Plural 'entities'.` in their readings.
+#[cfg(test)]
 fn plural_for_noun(domain: &Domain, noun_name: &str) -> String {
     domain.general_instance_facts.iter()
         .find(|f| f.subject_noun == "Noun"
@@ -710,6 +715,7 @@ fn paths_for_noun_from_state(
 /// Related-collection routes (Theorem 4b navigation) and the full
 /// `{data, derived, violations, _links}` response envelope (Thm 5 repr +
 /// Cor 1 violation verbalization) are follow-up scope.
+#[cfg(test)]
 fn paths_for_noun(
     noun_name: &str,
     plural: &str,
@@ -1053,6 +1059,7 @@ fn verb_slug_from_reading(reading: &str, noun_names: &[&str]) -> String {
 /// Columns contribute properties. Non-nullable columns contribute to
 /// `required`. FK columns emit `$ref`. The state machine, if any, adds a
 /// `status` property whose enum is the declared status set.
+#[cfg(test)]
 fn component_schema(
     domain: &Domain,
     noun_name: &str,
@@ -1134,6 +1141,7 @@ fn component_schema_from_state(
 /// FK columns emit `$ref` into `components.schemas.{Target}`. Value-type
 /// columns with declared enum values emit `{type, enum}`. Other value
 /// columns emit a scalar type derived from the SQL `col_type`.
+#[cfg(test)]
 fn column_property(
     col: &TableColumn,
     domain: &Domain,
