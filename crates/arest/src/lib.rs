@@ -72,7 +72,7 @@ pub mod rmap;
 #[cfg(not(feature = "no_std"))]
 pub mod naming;
 #[cfg(not(feature = "no_std"))]
-pub mod validate;
+// validate.rs deleted — zero production callers, tests were self-referential.
 #[cfg(not(feature = "no_std"))]
 pub mod conceptual_query;
 #[cfg(not(feature = "no_std"))]

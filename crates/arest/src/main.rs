@@ -52,7 +52,7 @@ mod declared_writes;
 #[allow(dead_code)]
 mod check;
 #[allow(dead_code)]
-mod validate;
+// validate module deleted (#211)
 #[allow(dead_code)]
 // induce module deleted (#211)
 #[allow(dead_code)]
