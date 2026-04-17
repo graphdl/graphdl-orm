@@ -24,7 +24,7 @@ use hashbrown::HashMap;
 #[derive(Debug, Clone, Default)]
 #[cfg_attr(feature = "std-deps", derive(serde::Deserialize, serde::Serialize))]
 #[cfg_attr(feature = "std-deps", serde(rename_all = "camelCase"))]
-struct Domain {
+struct ParseCtx {
     nouns: HashMap<String, NounDef>,
     fact_types: HashMap<String, FactTypeDef>,
     constraints: Vec<ConstraintDef>,
@@ -100,7 +100,7 @@ pub(crate) const METAMODEL_NOUNS: &[&str] = &[
     "Domain Change",
 ];
 
-/// Metadata for a noun that is stored on Domain maps, not on NounDef.
+/// Metadata for a noun that is stored on ParseCtx maps, not on NounDef.
 #[derive(Default, Clone)]
 struct NounMeta {
     super_type: Option<String>,
@@ -703,18 +703,18 @@ fn try_fact_type(line: &str, noun_names: &[String]) -> Option<ParseAction> {
 
 /// Parse with pre-existing nouns from other domains.
 /// Domains are NORMA tabs. Nouns are global across the UoD.
-fn parse_markdown_with_nouns(input: &str, existing_nouns: &HashMap<String, NounDef>) -> Result<Domain, String> {
+fn parse_markdown_with_nouns(input: &str, existing_nouns: &HashMap<String, NounDef>) -> Result<ParseCtx, String> {
     parse_markdown_with_context(input, existing_nouns, &HashMap::new())
 }
 
-fn parse_markdown_with_context(input: &str, existing_nouns: &HashMap<String, NounDef>, existing_fact_types: &HashMap<String, FactTypeDef>) -> Result<Domain, String> {
+fn parse_markdown_with_context(input: &str, existing_nouns: &HashMap<String, NounDef>, existing_fact_types: &HashMap<String, FactTypeDef>) -> Result<ParseCtx, String> {
     // Metamodel namespace protection (security #23):
     // First parse the input in isolation to see which nouns IT actually declares.
     // If the input declares any metamodel-reserved noun AND that noun is already
     // present in `existing_nouns` (i.e. this is a user domain layered on top of
     // the metamodel bootstrap), reject. The bootstrap case (no existing nouns
     // for those names) is allowed to declare them exactly once.
-    let mut standalone = Domain {
+    let mut standalone = ParseCtx {
         nouns: HashMap::new(), fact_types: HashMap::new(),
         constraints: vec![], state_machines: HashMap::new(), derivation_rules: vec![],
         general_instance_facts: vec![],
@@ -735,7 +735,7 @@ fn parse_markdown_with_context(input: &str, existing_nouns: &HashMap<String, Nou
         }
     }
 
-    let mut ir = Domain {
+    let mut ir = ParseCtx {
         nouns: existing_nouns.clone(), fact_types: existing_fact_types.clone(),
         constraints: vec![], state_machines: HashMap::new(), derivation_rules: vec![],
         general_instance_facts: vec![],
@@ -918,7 +918,7 @@ pub fn fact_types_from_state(state: &crate::ast::Object) -> HashMap<String, Fact
 }
 
 /// Parse FORML2 readings into an Object state with full context from D.
-/// Extracts nouns and fact types directly from cells â€” no Domain struct round-trip.
+/// Extracts nouns and fact types directly from cells â€” no ParseCtx struct round-trip.
 pub fn parse_to_state_from(input: &str, d: &crate::ast::Object) -> Result<crate::ast::Object, String> {
     let nouns = nouns_from_state(d);
     let fact_types = fact_types_from_state(d);
@@ -933,9 +933,9 @@ pub fn parse_to_state_with_nouns(input: &str, existing: &crate::ast::Object) -> 
     Ok(domain_to_state(&domain))
 }
 
-/// Convert a Domain to an Object state (sequence of cells).
+/// Convert a ParseCtx to an Object state (sequence of cells).
 /// Each category becomes a cell: <CELL, fact_type_id, <facts...>>
-fn domain_to_state(d: &Domain) -> crate::ast::Object {
+fn domain_to_state(d: &ParseCtx) -> crate::ast::Object {
     use crate::ast::{Object, fact_from_pairs};
     use hashbrown::{HashMap, HashSet};
     // Seed with cells already emitted by apply_action (Constraint,
@@ -986,7 +986,7 @@ fn domain_to_state(d: &Domain) -> crate::ast::Object {
     }
 
     // Constraints: apply_action already emitted these to d.cells during
-    // parse. Test fixtures building Domain literals with non-empty
+    // parse. Test fixtures building ParseCtx literals with non-empty
     // d.constraints but empty d.cells fall back to serializing here.
     if !cells.contains_key("Constraint") {
         for c in &d.constraints {
@@ -1014,7 +1014,7 @@ fn domain_to_state(d: &Domain) -> crate::ast::Object {
     // Derivation rules + unresolved-clause diagnostics.
     // apply_action / parse_into's finalize step emits these to d.cells;
     // the fallback path below handles test fixtures built from typed
-    // fields only (e.g. Domain literals in evaluate.rs).
+    // fields only (e.g. ParseCtx literals in evaluate.rs).
     if !cells.contains_key("DerivationRule") {
         for r in &d.derivation_rules {
             let mut pairs: Vec<(&str, &str)> = vec![
@@ -1097,8 +1097,8 @@ fn domain_to_state(d: &Domain) -> crate::ast::Object {
 }
 
 
-fn parse_markdown(input: &str) -> Result<Domain, String> {
-    let mut ir = Domain {
+fn parse_markdown(input: &str) -> Result<ParseCtx, String> {
+    let mut ir = ParseCtx {
         nouns: HashMap::new(), fact_types: HashMap::new(),
         constraints: vec![], state_machines: HashMap::new(), derivation_rules: vec![],
         general_instance_facts: vec![],
@@ -1112,7 +1112,7 @@ fn parse_markdown(input: &str) -> Result<Domain, String> {
 }
 
 /// Re-resolve a rules vec given just the typed lookups it needs.
-/// No Domain struct required â€” callers pass their HashMaps directly.
+/// No ParseCtx struct required â€” callers pass their HashMaps directly.
 pub(crate) fn re_resolve_rules(
     rules: &mut Vec<DerivationRuleDef>,
     nouns: &HashMap<String, NounDef>,
@@ -1141,7 +1141,7 @@ pub(crate) fn re_resolve_rules(
     });
 }
 
-fn parse_into(ir: &mut Domain, input: &str) -> Result<(), String> {
+fn parse_into(ir: &mut ParseCtx, input: &str) -> Result<(), String> {
 
     let lines: Vec<String> = input.lines().map(|s| s.to_string()).collect();
 
@@ -1992,8 +1992,8 @@ fn resolve_derivation_rule(
     };
 }
 
-/// Append a fact to a cell in the Domain's Object-state accumulator.
-fn push_cell(ir: &mut Domain, cell: &str, fact: crate::ast::Object) {
+/// Append a fact to a cell in the ParseCtx's Object-state accumulator.
+fn push_cell(ir: &mut ParseCtx, cell: &str, fact: crate::ast::Object) {
     ir.cells.entry(cell.to_string()).or_default().push(fact);
 }
 
@@ -2029,7 +2029,7 @@ fn constraint_to_fact(c: &ConstraintDef) -> crate::ast::Object {
 /// per Thm 2. Kinds that need in-parse mutation/lookup (Noun, FactType)
 /// still accumulate typed fields; domain_to_state serializes them to
 /// cells at finalize.
-fn apply_action(ir: &mut Domain, action: Option<ParseAction>, lines: &[String], idx: usize) {
+fn apply_action(ir: &mut ParseCtx, action: Option<ParseAction>, lines: &[String], idx: usize) {
     let Some(action) = action else { return };
     match action {
         ParseAction::AddNoun(name, def, meta) => {
@@ -2072,7 +2072,7 @@ fn apply_action(ir: &mut Domain, action: Option<ParseAction>, lines: &[String], 
             // when the reading terminated with a `*` / `**` / `+` marker.
             // Emit as a GeneralInstanceFact against the metamodel's
             // `Fact Type has Derivation Mode` binary â€” facts all the way
-            // down, no separate Domain field for what is already expressible
+            // down, no separate ParseCtx field for what is already expressible
             // as an instance fact.
             let reading_for_mode = def.reading.clone();
             mode.into_iter().for_each(|m| {
@@ -2209,7 +2209,7 @@ fn resolve_constraint_schema(
     mut constraint: ConstraintDef,
     noun_names: &[String],
     catalog: &SchemaCatalog,
-    ir: &Domain,
+    ir: &ParseCtx,
 ) -> ConstraintDef {
     // Extract nouns from the constraint text to find the target schema.
     // Strip quantifiers and quoted values before noun matching.
@@ -2325,7 +2325,7 @@ fn parse_fact(line: &str, noun_names: &[String]) -> Option<(String, FactTypeDef,
     // to the three markers. User convention requires whitespace
     // between the verbalization and the marker, so "Full Name *."
     // is accepted and "Full Name*." is not recognized as a marker.
-    // The caller folds the resulting Some(mode) into the Domain's
+    // The caller folds the resulting Some(mode) into the ParseCtx's
     // `derivation_modes` map keyed by the schema id.
     let after_last_noun = clean.get(found.last().unwrap().1..).unwrap_or("").trim();
     let derivation_mode = match after_last_noun {
@@ -2459,12 +2459,12 @@ fn find_nouns(text: &str, noun_names: &[String]) -> Vec<(usize, usize, String)> 
 // Instance fact parsing (state machines)
 // =========================================================================
 
-fn parse_instance_fact(ir: &mut Domain, line: &str, _lines: &[&str], _idx: usize) {
+fn parse_instance_fact(ir: &mut ParseCtx, line: &str, _lines: &[&str], _idx: usize) {
     let clean = line.trim_end_matches('.');
     parse_general_instance_fact(ir, clean);
 }
 
-fn parse_general_instance_fact(ir: &mut Domain, line: &str) {
+fn parse_general_instance_fact(ir: &mut ParseCtx, line: &str) {
     // Longest-first noun matching (Theorem 1, step 3)
     let mut noun_names: Vec<String> = ir.nouns.keys().cloned().collect();
     noun_names.sort_by(|a, b| b.len().cmp(&a.len()));
@@ -3527,7 +3527,7 @@ It is obligatory that each Support Response conforms to Pricing Model.";
     }
 
     /// Helper: compile IR to defs, then evaluate constraints via defs path.
-    fn eval_deontic_defs(ir: &Domain, text: &str) -> Vec<crate::types::Violation> {
+    fn eval_deontic_defs(ir: &ParseCtx, text: &str) -> Vec<crate::types::Violation> {
         let state = domain_to_state(ir);
         let defs = crate::compile::compile_to_defs_state(&state);
         let empty_state = crate::ast::Object::phi();
@@ -3858,7 +3858,7 @@ fn forbidden_ipv6_ula_fd() {
     // recognizes the marker and stores the corresponding Derivation Mode on
     // the FactTypeDef.
 
-    fn mode_for(domain: &Domain, reading: &str) -> Option<String> {
+    fn mode_for(domain: &ParseCtx, reading: &str) -> Option<String> {
         domain.general_instance_facts.iter()
             .find(|f| f.subject_noun == "Fact Type"
                    && f.subject_value == reading
