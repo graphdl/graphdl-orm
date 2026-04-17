@@ -364,21 +364,10 @@ pub fn synthesize_from_state(state: &ast::Object, noun_name: &str, depth: usize)
 mod tests {
     use super::*;
     use hashbrown::HashMap;
-    use crate::parse_forml2::Domain;
-
-    fn empty_ir() -> Domain {
-        Domain {
-            nouns: HashMap::new(),
-            fact_types: HashMap::new(),
-            constraints: vec![],
-            state_machines: HashMap::new(),
-            derivation_rules: vec![], general_instance_facts: vec![],
-            subtypes: HashMap::new(), enum_values: HashMap::new(),
-            ref_schemes: HashMap::new(),
-            named_spans: HashMap::new(), autofill_spans: vec![],
-            cells: HashMap::new(),
-        }
-    }
+    use crate::types::{
+        ConstraintDef, DerivationRuleDef, FactTypeDef, GeneralInstanceFact, NounDef,
+        RoleDef, SpanDef, StateMachineDef, WorldAssumption,
+    };
 
     fn empty_state() -> ast::Object {
         ast::Object::phi()
@@ -397,10 +386,139 @@ mod tests {
             ast::cell_push(ft_id, ast::fact_from_pairs(pairs), &acc))
     }
 
-    fn ir_to_defs(ir: &Domain) -> (ast::Object, Vec<(String, ast::Func)>, ast::Object) {
-        // Via Object state: the AREST pipeline per Thm 2 (parse Râ†’Î¦, compile Î¦â†’O).
-        let state = crate::parse_forml2::domain_to_state(ir);
-        let model = crate::compile::compile(&state);
+    // ── Cell-push test builders (no Domain IR) ──────────────────────────
+    //
+    // Tests build Object cells directly via these helpers. All helpers take
+    // and return Object — facts all the way down. The `S` alias is a
+    // convenience for the working map; terminate with `build(cells)`.
+
+    type S = HashMap<String, Vec<ast::Object>>;
+
+    fn empty_cells() -> S { HashMap::new() }
+
+    fn build(cells: S) -> ast::Object {
+        ast::Object::Map(cells.into_iter()
+            .map(|(k, v)| (k, ast::Object::Seq(v.into())))
+            .collect())
+    }
+
+    fn with_noun(mut cells: S, name: &str, def: &NounDef) -> S {
+        let wa = match def.world_assumption {
+            WorldAssumption::Closed => "closed", WorldAssumption::Open => "open",
+        };
+        let ref_scheme = (def.object_type == "entity").then(|| "id");
+        let mut pairs: Vec<(&str, &str)> = vec![
+            ("name", name), ("objectType", def.object_type.as_str()),
+            ("worldAssumption", wa),
+        ];
+        if let Some(rs) = ref_scheme { pairs.push(("referenceScheme", rs)); }
+        cells.entry("Noun".into()).or_default().push(ast::fact_from_pairs(&pairs));
+        cells
+    }
+
+    fn with_ft(mut cells: S, id: &str, ft: &FactTypeDef) -> S {
+        let arity = ft.roles.len().to_string();
+        cells.entry("FactType".into()).or_default().push(ast::fact_from_pairs(&[
+            ("id", id), ("reading", ft.reading.as_str()), ("arity", arity.as_str()),
+        ]));
+        for role in &ft.roles {
+            let pos = role.role_index.to_string();
+            cells.entry("Role".into()).or_default().push(ast::fact_from_pairs(&[
+                ("factType", id), ("nounName", role.noun_name.as_str()), ("position", pos.as_str()),
+            ]));
+        }
+        cells
+    }
+
+    fn with_constraint(mut cells: S, c: &ConstraintDef) -> S {
+        cells.entry("Constraint".into()).or_default()
+            .push(crate::parse_forml2::constraint_to_fact_test(c));
+        cells
+    }
+
+    fn with_derivation(mut cells: S, r: &DerivationRuleDef) -> S {
+        let json = serde_json::to_string(r).unwrap_or_default();
+        cells.entry("DerivationRule".into()).or_default().push(ast::fact_from_pairs(&[
+            ("id", r.id.as_str()), ("text", r.text.as_str()),
+            ("consequentFactTypeId", r.consequent_fact_type_id.as_str()),
+            ("json", json.as_str()),
+        ]));
+        cells
+    }
+
+    fn with_state_machine(mut cells: S, name: &str, sm: &StateMachineDef) -> S {
+        let json = serde_json::to_string(sm).unwrap_or_default();
+        cells.entry("StateMachine".into()).or_default().push(ast::fact_from_pairs(&[
+            ("name", name), ("json", json.as_str()),
+        ]));
+        cells
+    }
+
+    #[allow(dead_code)]
+    fn with_instance_fact(mut cells: S, f: &GeneralInstanceFact) -> S {
+        cells.entry("InstanceFact".into()).or_default().push(ast::fact_from_pairs(&[
+            ("subjectNoun", f.subject_noun.as_str()),
+            ("subjectValue", f.subject_value.as_str()),
+            ("fieldName", f.field_name.as_str()),
+            ("objectNoun", f.object_noun.as_str()),
+            ("objectValue", f.object_value.as_str()),
+        ]));
+        let object = if f.object_noun.is_empty() { f.field_name.as_str() } else { f.object_noun.as_str() };
+        cells.entry(f.field_name.clone()).or_default().push(ast::fact_from_pairs(&[
+            (f.subject_noun.as_str(), f.subject_value.as_str()),
+            (object, f.object_value.as_str()),
+        ]));
+        cells
+    }
+
+    fn with_subtype(mut cells: S, sub: &str, sup: &str) -> S {
+        // Patch existing Noun fact for `sub`: add/update superType field.
+        // If the Noun wasn't declared, push a new one.
+        let nouns = cells.entry("Noun".into()).or_default();
+        let pos = nouns.iter().position(|f| ast::binding(f, "name") == Some(sub));
+        let name = sub;
+        let old = pos.map(|i| nouns[i].clone());
+        let obj_type = old.as_ref().and_then(|f| ast::binding(f, "objectType")).unwrap_or("entity").to_string();
+        let wa = old.as_ref().and_then(|f| ast::binding(f, "worldAssumption")).unwrap_or("closed").to_string();
+        let rs = old.as_ref().and_then(|f| ast::binding(f, "referenceScheme")).map(|s| s.to_string());
+        let mut pairs: Vec<(&str, &str)> = vec![
+            ("name", name), ("objectType", obj_type.as_str()),
+            ("worldAssumption", wa.as_str()), ("superType", sup),
+        ];
+        if let Some(ref rs_s) = rs { pairs.push(("referenceScheme", rs_s.as_str())); }
+        let new_fact = ast::fact_from_pairs(&pairs);
+        match pos {
+            Some(i) => nouns[i] = new_fact,
+            None => nouns.push(new_fact),
+        }
+        cells
+    }
+
+    fn with_enum_values(mut cells: S, name: &str, obj_type: &str, values: &[String]) -> S {
+        let wa = "closed";
+        let ref_scheme = (obj_type == "entity").then(|| "id");
+        let joined = values.join(",");
+        let mut pairs: Vec<(&str, &str)> = vec![
+            ("name", name), ("objectType", obj_type),
+            ("worldAssumption", wa),
+            ("enumValues", joined.as_str()),
+        ];
+        if let Some(rs) = ref_scheme { pairs.push(("referenceScheme", rs)); }
+        cells.entry("Noun".into()).or_default().push(ast::fact_from_pairs(&pairs));
+        cells
+    }
+
+    /// Compile a cell map into (state, defs, def_map). Mirrors the old
+    /// ir_to_defs API but takes cell-push-built state, not a typed Domain.
+    fn compile_cells(cells: S) -> (ast::Object, Vec<(String, ast::Func)>, ast::Object) {
+        let state = build(cells);
+        let (defs, def_map) = state_to_defs(&state);
+        (state, defs, def_map)
+    }
+
+    /// Compile the Object state into defs + def_map.
+    fn state_to_defs(state: &ast::Object) -> (Vec<(String, ast::Func)>, ast::Object) {
+        let model = crate::compile::compile(state);
         let defs: Vec<(String, ast::Func)> = model.constraints.iter()
             .map(|c| (format!("constraint:{}", c.id), c.func.clone()))
             .chain(model.state_machines.iter().flat_map(|sm| [
@@ -410,8 +528,8 @@ mod tests {
             .chain(model.derivations.iter().map(|d| (format!("derivation:{}", d.id), d.func.clone())))
             .chain(model.schemas.iter().map(|(id, schema)| (format!("schema:{}", id), schema.construction.clone())))
             .collect();
-        let def_map = ast::defs_to_state(&defs, &state);
-        (state, defs, def_map)
+        let def_map = ast::defs_to_state(&defs, state);
+        (defs, def_map)
     }
 
     /// Evaluate constraints via defs.
@@ -480,8 +598,8 @@ mod tests {
 
     #[test]
     fn test_evaluate_via_ast_uniqueness_violation() {
-        let mut ir = empty_ir();
-        ir.fact_types.insert("ft1".to_string(), FactTypeDef {
+        let mut cells = empty_cells();
+        cells = with_ft(cells, "ft1", &FactTypeDef {
             schema_id: String::new(),
             reading: "Person has Name".to_string(),
             readings: vec![],
@@ -490,7 +608,7 @@ mod tests {
                 RoleDef { noun_name: "Name".to_string(), role_index: 1 },
             ],
         });
-        ir.constraints.push(ConstraintDef {
+        cells = with_constraint(cells, &ConstraintDef {
             id: "uc1".to_string(),
             kind: "UC".to_string(),
             modality: "Alethic".to_string(),
@@ -503,7 +621,7 @@ mod tests {
             ..Default::default()
         });
 
-        let (_meta_state, defs, def_map) = ir_to_defs(&ir);
+        let (_meta_state, defs, def_map) = compile_cells(cells);
 
         let state = state_with_facts("ft1", &[
             &[("Person", "Alice"), ("Name", "A")],
@@ -517,8 +635,8 @@ mod tests {
 
     #[test]
     fn test_evaluate_via_ast_no_violations() {
-        let mut ir = empty_ir();
-        ir.fact_types.insert("ft1".to_string(), FactTypeDef {
+        let mut cells = empty_cells();
+        cells = with_ft(cells, "ft1", &FactTypeDef {
             schema_id: String::new(),
             reading: "Person has Name".to_string(),
             readings: vec![],
@@ -527,7 +645,7 @@ mod tests {
                 RoleDef { noun_name: "Name".to_string(), role_index: 1 },
             ],
         });
-        ir.constraints.push(ConstraintDef {
+        cells = with_constraint(cells, &ConstraintDef {
             id: "uc1".to_string(),
             kind: "UC".to_string(),
             modality: "Alethic".to_string(),
@@ -540,7 +658,7 @@ mod tests {
             ..Default::default()
         });
 
-        let (_meta_state, defs, def_map) = ir_to_defs(&ir);
+        let (_meta_state, defs, def_map) = compile_cells(cells);
 
         let state = state_with_facts("ft1", &[
             &[("Person", "Alice"), ("Name", "A")],
@@ -553,8 +671,8 @@ mod tests {
     #[test]
     fn test_run_machine_via_ast() {
         // Domain Change state machine: Proposed -> Under Review -> Approved -> Applied
-        let mut ir = empty_ir();
-        ir.state_machines.insert("DomainChange".to_string(), StateMachineDef {
+        let mut cells = empty_cells();
+        cells = with_state_machine(cells, "DomainChange", &StateMachineDef {
             noun_name: "DomainChange".to_string(),
             statuses: vec![
                 "Proposed".to_string(),
@@ -571,7 +689,7 @@ mod tests {
             ],
         });
 
-        let (_meta_state, defs, def_map) = ir_to_defs(&ir);
+        let (_meta_state, defs, def_map) = compile_cells(cells);
 
         // Happy path: Proposed -> Under Review -> Approved -> Applied
         let final_state = run_machine_defs(&defs, &def_map, "DomainChange", &["review-requested", "approved", "applied"]);
@@ -592,8 +710,8 @@ mod tests {
 
     #[test]
     fn test_initial_state_is_first_status() {
-        let mut ir = empty_ir();
-        ir.state_machines.insert("SM".to_string(), StateMachineDef {
+        let mut cells = empty_cells();
+        cells = with_state_machine(cells, "SM", &StateMachineDef {
             noun_name: "Order".to_string(),
             statuses: vec!["Pending".to_string(), "Shipped".to_string(), "Delivered".to_string()],
             transitions: vec![
@@ -601,7 +719,7 @@ mod tests {
                 TransitionDef { from: "Shipped".to_string(), to: "Delivered".to_string(), event: "deliver".to_string(), guard: None },
             ],
         });
-        let (_meta_state, defs, def_map) = ir_to_defs(&ir);
+        let (_meta_state, defs, def_map) = compile_cells(cells);
         let initial_key = "machine:Order:initial";
         let initial = defs.iter().find(|(n, _)| n == initial_key)
             .and_then(|(_, f)| {
@@ -614,16 +732,16 @@ mod tests {
 
     #[test]
     fn test_noun_without_state_machine() {
-        let ir = empty_ir(); // no state machines
-        let (_meta_pop, defs, _def_map) = ir_to_defs(&ir);
+        let cells = empty_cells(); // no state machines
+        let (_meta_pop, defs, _def_map) = compile_cells(cells);
         let has_machine = defs.iter().any(|(n, _)| n.starts_with("machine:Customer"));
         assert!(!has_machine);
     }
 
     #[test]
     fn test_valid_transitions_from_status() {
-        let mut ir = empty_ir();
-        ir.state_machines.insert("SM".to_string(), StateMachineDef {
+        let mut cells = empty_cells();
+        cells = with_state_machine(cells, "SM", &StateMachineDef {
             noun_name: "SupportRequest".to_string(),
             statuses: vec!["Triaging".to_string(), "Investigating".to_string(), "Resolved".to_string()],
             transitions: vec![
@@ -632,7 +750,7 @@ mod tests {
                 TransitionDef { from: "Investigating".to_string(), to: "Resolved".to_string(), event: "resolve".to_string(), guard: None },
             ],
         });
-        let (_meta_state, defs, def_map) = ir_to_defs(&ir);
+        let (_meta_state, defs, def_map) = compile_cells(cells);
 
         // From Triaging: two valid transitions
         let after_investigate = run_machine_defs(&defs, &def_map, "SupportRequest", &["investigate"]);
@@ -651,8 +769,8 @@ mod tests {
 
     #[test]
     fn test_run_machine_support_request_lifecycle() {
-        let mut ir = empty_ir();
-        ir.state_machines.insert("SM".to_string(), StateMachineDef {
+        let mut cells = empty_cells();
+        cells = with_state_machine(cells, "SM", &StateMachineDef {
             noun_name: "SupportRequest".to_string(),
             statuses: vec!["Triaging".to_string(), "Investigating".to_string(), "WaitingOnCustomer".to_string(), "Resolved".to_string()],
             transitions: vec![
@@ -662,7 +780,7 @@ mod tests {
                 TransitionDef { from: "Investigating".to_string(), to: "Resolved".to_string(), event: "resolve".to_string(), guard: None },
             ],
         });
-        let (_meta_state, defs, def_map) = ir_to_defs(&ir);
+        let (_meta_state, defs, def_map) = compile_cells(cells);
 
         // Full lifecycle with back-and-forth
         let final_state = run_machine_defs(&defs, &def_map, "SupportRequest", &[
@@ -680,16 +798,16 @@ mod tests {
 
     #[test]
     fn test_deontic_forbidden_text_via_ast() {
-        let mut ir = empty_ir();
-        ir.nouns.insert("Markdown Syntax".to_string(), make_noun("value"));
-        ir.enum_values.insert("Markdown Syntax".to_string(), vec!["#".to_string(), "##".to_string(), "**".to_string()]);
-        ir.fact_types.insert("ft1".to_string(), FactTypeDef {
+        let mut cells = empty_cells();
+        cells = with_noun(cells, "Markdown Syntax", &make_noun("value"));
+        cells = with_enum_values(cells, "Markdown Syntax", "value", &vec!["#".to_string(), "##".to_string(), "**".to_string()]);
+        cells = with_ft(cells, "ft1", &FactTypeDef {
             schema_id: String::new(),
             reading: "Response contains Markdown Syntax".to_string(),
             readings: vec![],
             roles: vec![RoleDef { noun_name: "Markdown Syntax".to_string(), role_index: 0 }],
         });
-        ir.constraints.push(ConstraintDef {
+        cells = with_constraint(cells, &ConstraintDef {
             id: "dc1".to_string(),
             kind: "FC".to_string(),
             modality: "Deontic".to_string(),
@@ -698,7 +816,7 @@ mod tests {
             spans: vec![SpanDef { fact_type_id: "ft1".to_string(), role_index: 0, subset_autofill: None }],
             ..Default::default()
         });
-        let (_meta_state, defs, def_map) = ir_to_defs(&ir);
+        let (_meta_state, defs, def_map) = compile_cells(cells);
 
         // Text with markdown -> violations
         let violations = eval_constraints_defs(&defs, &def_map, "## Heading here", None, &empty_state());
@@ -711,8 +829,8 @@ mod tests {
 
     #[test]
     fn test_deontic_permitted_never_violates_via_ast() {
-        let mut ir = empty_ir();
-        ir.constraints.push(ConstraintDef {
+        let mut cells = empty_cells();
+        cells = with_constraint(cells, &ConstraintDef {
             id: "pc1".to_string(),
             kind: "FC".to_string(),
             modality: "Deontic".to_string(),
@@ -721,25 +839,25 @@ mod tests {
             spans: vec![],
             ..Default::default()
         });
-        let (_meta_state, defs, def_map) = ir_to_defs(&ir);
+        let (_meta_state, defs, def_map) = compile_cells(cells);
         let violations = eval_constraints_defs(&defs, &def_map, "anything", None, &empty_state());
         assert_eq!(violations.len(), 0);
     }
 
     #[test]
     fn test_no_constraints_no_violations_via_ast() {
-        let (_meta_pop, defs, def_map) = ir_to_defs(&empty_ir());
+        let (_meta_pop, defs, def_map) = compile_cells(empty_cells());
         let violations = eval_constraints_defs(&defs, &def_map, "", None, &empty_state());
         assert_eq!(violations.len(), 0);
     }
 
     #[test]
     fn test_fact_creation_triggers_state_transition() {
-        let mut ir = empty_ir();
-        ir.nouns.insert("Customer".to_string(), make_noun("entity"));
-        ir.nouns.insert("SupportRequest".to_string(), make_noun("entity"));
+        let mut cells = empty_cells();
+        cells = with_noun(cells, "Customer", &make_noun("entity"));
+        cells = with_noun(cells, "SupportRequest", &make_noun("entity"));
 
-        ir.fact_types.insert("ft_submit".to_string(), FactTypeDef {
+        cells = with_ft(cells, "ft_submit", &FactTypeDef {
             schema_id: String::new(),
             reading: "Customer submits SupportRequest".to_string(),
             readings: vec![],
@@ -749,7 +867,7 @@ mod tests {
             ],
         });
 
-        ir.state_machines.insert("SupportRequest".to_string(), StateMachineDef {
+        cells = with_state_machine(cells, "SupportRequest", &StateMachineDef {
             noun_name: "SupportRequest".to_string(),
             statuses: vec!["Triaging".to_string(), "Investigating".to_string(), "Resolved".to_string()],
             transitions: vec![
@@ -758,7 +876,7 @@ mod tests {
             ],
         });
 
-        let (_meta_state, defs, def_map) = ir_to_defs(&ir);
+        let (_meta_state, defs, def_map) = compile_cells(cells);
 
         // The state machine starts at "Triaging"
         let initial_key = "machine:SupportRequest:initial";
@@ -781,11 +899,11 @@ mod tests {
 
     #[test]
     fn test_fact_event_mapping_compiled() {
-        let mut ir = empty_ir();
-        ir.nouns.insert("Customer".to_string(), make_noun("entity"));
-        ir.nouns.insert("SupportRequest".to_string(), make_noun("entity"));
+        let mut cells = empty_cells();
+        cells = with_noun(cells, "Customer", &make_noun("entity"));
+        cells = with_noun(cells, "SupportRequest", &make_noun("entity"));
 
-        ir.fact_types.insert("ft_submit".to_string(), FactTypeDef {
+        cells = with_ft(cells, "ft_submit", &FactTypeDef {
             schema_id: String::new(),
             reading: "Customer submits SupportRequest".to_string(),
             readings: vec![],
@@ -795,7 +913,7 @@ mod tests {
             ],
         });
 
-        ir.state_machines.insert("SM".to_string(), StateMachineDef {
+        cells = with_state_machine(cells, "SM", &StateMachineDef {
             noun_name: "SupportRequest".to_string(),
             statuses: vec!["Triaging".to_string(), "Investigating".to_string()],
             transitions: vec![
@@ -803,7 +921,7 @@ mod tests {
             ],
         });
 
-        let (_meta_state, defs, def_map) = ir_to_defs(&ir);
+        let (_meta_state, defs, def_map) = compile_cells(cells);
 
         // Verify the state machine transitions on "submit"
         let final_state = run_machine_defs(&defs, &def_map, "SupportRequest", &["submit"]);
@@ -812,19 +930,19 @@ mod tests {
 
     #[test]
     fn test_guarded_transition_blocks_on_violation() {
-        let mut ir = empty_ir();
-        ir.nouns.insert("SupportRequest".to_string(), make_noun("entity"));
-        ir.nouns.insert("Prohibited".to_string(), make_noun("value"));
-        ir.enum_values.insert("Prohibited".to_string(), vec!["internal-details".to_string()]);
+        let mut cells = empty_cells();
+        cells = with_noun(cells, "SupportRequest", &make_noun("entity"));
+        cells = with_noun(cells, "Prohibited", &make_noun("value"));
+        cells = with_enum_values(cells, "Prohibited", "value", &vec!["internal-details".to_string()]);
 
-        ir.fact_types.insert("ft_resp".to_string(), FactTypeDef {
+        cells = with_ft(cells, "ft_resp", &FactTypeDef {
             schema_id: String::new(),
             reading: "Response contains Prohibited".to_string(),
             readings: vec![],
             roles: vec![RoleDef { noun_name: "Prohibited".to_string(), role_index: 0 }],
         });
 
-        ir.constraints.push(ConstraintDef {
+        cells = with_constraint(cells, &ConstraintDef {
             id: "guard1".to_string(),
             kind: "FC".to_string(),
             modality: "Deontic".to_string(),
@@ -834,7 +952,7 @@ mod tests {
             ..Default::default()
         });
 
-        ir.state_machines.insert("SM".to_string(), StateMachineDef {
+        cells = with_state_machine(cells, "SM", &StateMachineDef {
             noun_name: "SupportRequest".to_string(),
             statuses: vec!["Investigating".to_string(), "Resolved".to_string()],
             transitions: vec![
@@ -849,7 +967,7 @@ mod tests {
             ],
         });
 
-        let (_meta_state, defs, def_map) = ir_to_defs(&ir);
+        let (_meta_state, defs, def_map) = compile_cells(cells);
 
         // Response with forbidden content -> constraint detects violation
         let pop = empty_state();
@@ -868,12 +986,12 @@ mod tests {
 
     #[test]
     fn test_fact_driven_event_resolution() {
-        let mut ir = empty_ir();
-        ir.nouns.insert("Customer".to_string(), make_noun("entity"));
-        ir.nouns.insert("SupportRequest".to_string(), make_noun("entity"));
-        ir.nouns.insert("Agent".to_string(), make_noun("entity"));
+        let mut cells = empty_cells();
+        cells = with_noun(cells, "Customer", &make_noun("entity"));
+        cells = with_noun(cells, "SupportRequest", &make_noun("entity"));
+        cells = with_noun(cells, "Agent", &make_noun("entity"));
 
-        ir.fact_types.insert("ft_submit".to_string(), FactTypeDef {
+        cells = with_ft(cells, "ft_submit", &FactTypeDef {
             schema_id: String::new(),
             reading: "Customer submits SupportRequest".to_string(),
             readings: vec![],
@@ -882,7 +1000,7 @@ mod tests {
                 RoleDef { noun_name: "SupportRequest".to_string(), role_index: 1 },
             ],
         });
-        ir.fact_types.insert("ft_resolve".to_string(), FactTypeDef {
+        cells = with_ft(cells, "ft_resolve", &FactTypeDef {
             schema_id: String::new(),
             reading: "Agent resolves SupportRequest".to_string(),
             readings: vec![],
@@ -892,7 +1010,7 @@ mod tests {
             ],
         });
 
-        ir.state_machines.insert("SupportRequest".to_string(), StateMachineDef {
+        cells = with_state_machine(cells, "SupportRequest", &StateMachineDef {
             noun_name: "SupportRequest".to_string(),
             statuses: vec!["Triaging".to_string(), "Investigating".to_string(), "Resolved".to_string()],
             transitions: vec![
@@ -901,7 +1019,7 @@ mod tests {
             ],
         });
 
-        let (_meta_state, defs, def_map) = ir_to_defs(&ir);
+        let (_meta_state, defs, def_map) = compile_cells(cells);
 
         // Both schemas should compile
         let has_submit = defs.iter().any(|(n, _)| n == "schema:ft_submit");
@@ -916,22 +1034,22 @@ mod tests {
 
     #[test]
     fn test_subset_constraint_without_autofill_produces_violation() {
-        let mut ir = empty_ir();
-        ir.nouns.insert("Person".to_string(), make_noun("entity"));
-        ir.fact_types.insert("ft1".to_string(), FactTypeDef {
+        let mut cells = empty_cells();
+        cells = with_noun(cells, "Person", &make_noun("entity"));
+        cells = with_ft(cells, "ft1", &FactTypeDef {
             schema_id: String::new(),
             reading: "Person hasLicense".to_string(),
             readings: vec![],
             roles: vec![RoleDef { noun_name: "Person".to_string(), role_index: 0 }],
         });
-        ir.fact_types.insert("ft2".to_string(), FactTypeDef {
+        cells = with_ft(cells, "ft2", &FactTypeDef {
             schema_id: String::new(),
             reading: "Person hasInsurance".to_string(),
             readings: vec![],
             roles: vec![RoleDef { noun_name: "Person".to_string(), role_index: 0 }],
         });
         // SS constraint WITHOUT autofill -- just validates, doesn't derive
-        ir.constraints.push(ConstraintDef {
+        cells = with_constraint(cells, &ConstraintDef {
             id: "ss_no_auto".to_string(),
             kind: "SS".to_string(),
             modality: "Alethic".to_string(),
@@ -943,7 +1061,7 @@ mod tests {
             ..Default::default()
         });
 
-        let (_meta_pop, defs, _def_map) = ir_to_defs(&ir);
+        let (_meta_pop, defs, _def_map) = compile_cells(cells);
 
         // No modus ponens derivation should be compiled
         let mp_count = defs.iter()
@@ -966,12 +1084,12 @@ mod tests {
     fn test_forward_chain_ast_subtype_inheritance() {
         // Teacher is subtype of Academic. Academic has Rank.
         // Forward chaining should terminate without panicking.
-        let mut ir = empty_ir();
-        ir.nouns.insert("Academic".to_string(), make_noun("entity"));
-        ir.nouns.insert("Teacher".to_string(), make_noun("entity"));
-        ir.subtypes.insert("Teacher".to_string(), "Academic".to_string());
-        ir.nouns.insert("Rank".to_string(), make_noun("value"));
-        ir.fact_types.insert("ft1".to_string(), FactTypeDef {
+        let mut cells = empty_cells();
+        cells = with_noun(cells, "Academic", &make_noun("entity"));
+        cells = with_noun(cells, "Teacher", &make_noun("entity"));
+        cells = with_subtype(cells, "Teacher", "Academic");
+        cells = with_noun(cells, "Rank", &make_noun("value"));
+        cells = with_ft(cells, "ft1", &FactTypeDef {
             schema_id: String::new(),
             reading: "Academic has Rank".to_string(),
             readings: vec![],
@@ -980,7 +1098,7 @@ mod tests {
                 RoleDef { noun_name: "Rank".to_string(), role_index: 1 },
             ],
         });
-        let (_meta_pop, defs, _def_map) = ir_to_defs(&ir);
+        let (_meta_pop, defs, _def_map) = compile_cells(cells);
 
         // Verify subtype inheritance derivation was compiled
         let subtype_derivations = defs.iter()
@@ -1000,11 +1118,11 @@ mod tests {
 
     #[test]
     fn test_forward_chain_ast_modus_ponens() {
-        let mut ir = empty_ir();
-        ir.nouns.insert("Academic".to_string(), make_noun("entity"));
-        ir.nouns.insert("Department".to_string(), make_noun("entity"));
+        let mut cells = empty_cells();
+        cells = with_noun(cells, "Academic", &make_noun("entity"));
+        cells = with_noun(cells, "Department", &make_noun("entity"));
 
-        ir.fact_types.insert("ft_heads".to_string(), FactTypeDef {
+        cells = with_ft(cells, "ft_heads", &FactTypeDef {
             schema_id: String::new(),
             reading: "Academic heads Department".to_string(),
             readings: vec![],
@@ -1013,7 +1131,7 @@ mod tests {
                 RoleDef { noun_name: "Department".to_string(), role_index: 1 },
             ],
         });
-        ir.fact_types.insert("ft_works".to_string(), FactTypeDef {
+        cells = with_ft(cells, "ft_works", &FactTypeDef {
             schema_id: String::new(),
             reading: "Academic works for Department".to_string(),
             readings: vec![],
@@ -1024,7 +1142,7 @@ mod tests {
         });
 
         // Subset constraint with autofill: heads -> automatically derive works for
-        ir.constraints.push(ConstraintDef {
+        cells = with_constraint(cells, &ConstraintDef {
             id: "ss1".to_string(),
             kind: "SS".to_string(),
             modality: "Alethic".to_string(),
@@ -1041,7 +1159,7 @@ mod tests {
             deontic_operator: None,
         });
 
-        let (_meta_pop, defs, _def_map) = ir_to_defs(&ir);
+        let (_meta_pop, defs, _def_map) = compile_cells(cells);
 
         // Academic A1 heads Department D1
         let state = state_with_facts("ft_heads", &[&[("Academic", "A1"), ("Department", "D1")]]);
@@ -1059,8 +1177,8 @@ mod tests {
 
     #[test]
     fn test_forward_chain_ast_no_rules_no_derivations() {
-        let ir = empty_ir();
-        let (_meta_state, defs, _def_map) = ir_to_defs(&ir);
+        let cells = empty_cells();
+        let (_meta_state, defs, _def_map) = compile_cells(cells);
         let dd = derivation_defs_from(&defs);
         let (_new_state, derived) = forward_chain_defs_state(&dd, &empty_state());
         assert_eq!(derived.len(), 0);
@@ -1070,16 +1188,16 @@ mod tests {
 
     #[test]
     fn test_no_constraints_no_violations() {
-        let ir = empty_ir();
-        let (_meta_state, defs, def_map) = ir_to_defs(&ir);
+        let cells = empty_cells();
+        let (_meta_state, defs, def_map) = compile_cells(cells);
         let result = eval_constraints_defs(&defs, &def_map, "", None, &empty_state());
         assert!(result.is_empty());
     }
 
     #[test]
     fn test_uniqueness_violation() {
-        let mut ir = empty_ir();
-        ir.fact_types.insert("ft1".to_string(), FactTypeDef {
+        let mut cells = empty_cells();
+        cells = with_ft(cells, "ft1", &FactTypeDef {
             schema_id: String::new(),
             reading: "Customer has Name".to_string(),
             readings: vec![],
@@ -1088,7 +1206,7 @@ mod tests {
                 RoleDef { noun_name: "Name".to_string(), role_index: 1 },
             ],
         });
-        ir.constraints.push(ConstraintDef {
+        cells = with_constraint(cells, &ConstraintDef {
             id: "c1".to_string(),
             kind: "UC".to_string(),
             modality: "Alethic".to_string(),
@@ -1104,7 +1222,7 @@ mod tests {
 
         let state = state_with_facts("ft1", &[&[("Customer", "c1"), ("Name", "Alice")], &[("Customer", "c1"), ("Name", "Bob")]]);
 
-        let (_meta_state, defs, def_map) = ir_to_defs(&ir);
+        let (_meta_state, defs, def_map) = compile_cells(cells);
         let result = eval_constraints_defs(&defs, &def_map, "", None, &state);
         assert_eq!(result.len(), 1);
         assert!(result[0].detail.contains("Uniqueness violation"));
@@ -1112,8 +1230,8 @@ mod tests {
 
     #[test]
     fn test_ring_irreflexive_violation() {
-        let mut ir = empty_ir();
-        ir.fact_types.insert("ft1".to_string(), FactTypeDef {
+        let mut cells = empty_cells();
+        cells = with_ft(cells, "ft1", &FactTypeDef {
             schema_id: String::new(),
             reading: "Person manages Person".to_string(),
             readings: vec![],
@@ -1122,7 +1240,7 @@ mod tests {
                 RoleDef { noun_name: "Person".to_string(), role_index: 1 },
             ],
         });
-        ir.constraints.push(ConstraintDef {
+        cells = with_constraint(cells, &ConstraintDef {
             id: "c1".to_string(),
             kind: "IR".to_string(),
             modality: "Alethic".to_string(),
@@ -1140,7 +1258,7 @@ mod tests {
         pop_state = ast::cell_push("ft1", ast::fact_from_pairs(&[("Person", "p1"), ("Person", "p1")]), &pop_state);
         let state = pop_state;
 
-        let (_meta_state, defs, def_map) = ir_to_defs(&ir);
+        let (_meta_state, defs, def_map) = compile_cells(cells);
         let result = eval_constraints_defs(&defs, &def_map, "", None, &state);
         assert!(!result.is_empty());
         assert!(result[0].detail.contains("Irreflexive"));
@@ -1148,20 +1266,20 @@ mod tests {
 
     #[test]
     fn test_exclusive_or_violation() {
-        let mut ir = empty_ir();
-        ir.fact_types.insert("ft1".to_string(), FactTypeDef {
+        let mut cells = empty_cells();
+        cells = with_ft(cells, "ft1", &FactTypeDef {
             schema_id: String::new(),
             reading: "Order isPaid".to_string(),
             readings: vec![],
             roles: vec![RoleDef { noun_name: "Order".to_string(), role_index: 0 }],
         });
-        ir.fact_types.insert("ft2".to_string(), FactTypeDef {
+        cells = with_ft(cells, "ft2", &FactTypeDef {
             schema_id: String::new(),
             reading: "Order isPending".to_string(),
             readings: vec![],
             roles: vec![RoleDef { noun_name: "Order".to_string(), role_index: 0 }],
         });
-        ir.constraints.push(ConstraintDef {
+        cells = with_constraint(cells, &ConstraintDef {
             id: "c1".to_string(),
             kind: "XO".to_string(),
             modality: "Alethic".to_string(),
@@ -1183,7 +1301,7 @@ mod tests {
         pop_state = ast::cell_push("ft2", ast::fact_from_pairs(&[("Order", "o1")]), &pop_state);
         let state = pop_state;
 
-        let (_meta_state, defs, def_map) = ir_to_defs(&ir);
+        let (_meta_state, defs, def_map) = compile_cells(cells);
         let result = eval_constraints_defs(&defs, &def_map, "", None, &state);
         assert!(!result.is_empty());
         assert!(result[0].detail.contains("Set-comparison violation"));
@@ -1191,20 +1309,20 @@ mod tests {
 
     #[test]
     fn test_subset_violation() {
-        let mut ir = empty_ir();
-        ir.fact_types.insert("ft1".to_string(), FactTypeDef {
+        let mut cells = empty_cells();
+        cells = with_ft(cells, "ft1", &FactTypeDef {
             schema_id: String::new(),
             reading: "Person hasLicense".to_string(),
             readings: vec![],
             roles: vec![RoleDef { noun_name: "Person".to_string(), role_index: 0 }],
         });
-        ir.fact_types.insert("ft2".to_string(), FactTypeDef {
+        cells = with_ft(cells, "ft2", &FactTypeDef {
             schema_id: String::new(),
             reading: "Person hasInsurance".to_string(),
             readings: vec![],
             roles: vec![RoleDef { noun_name: "Person".to_string(), role_index: 0 }],
         });
-        ir.constraints.push(ConstraintDef {
+        cells = with_constraint(cells, &ConstraintDef {
             id: "c1".to_string(),
             kind: "SS".to_string(),
             modality: "Alethic".to_string(),
@@ -1225,7 +1343,7 @@ mod tests {
         pop_state = ast::cell_push("ft1", ast::fact_from_pairs(&[("Person", "p1")]), &pop_state);
         let state = pop_state;
 
-        let (_meta_state, defs, def_map) = ir_to_defs(&ir);
+        let (_meta_state, defs, def_map) = compile_cells(cells);
         let result = eval_constraints_defs(&defs, &def_map, "", None, &state);
         assert!(!result.is_empty());
         assert!(result[0].detail.contains("Subset violation"));
@@ -1233,8 +1351,8 @@ mod tests {
 
     #[test]
     fn test_permitted_never_violates() {
-        let mut ir = empty_ir();
-        ir.constraints.push(ConstraintDef {
+        let mut cells = empty_cells();
+        cells = with_constraint(cells, &ConstraintDef {
             id: "c1".to_string(),
             kind: "UC".to_string(),
             modality: "Deontic".to_string(),
@@ -1248,27 +1366,27 @@ mod tests {
             max_occurrence: None,
         });
 
-        let (_meta_state, defs, def_map) = ir_to_defs(&ir);
+        let (_meta_state, defs, def_map) = compile_cells(cells);
         let result = eval_constraints_defs(&defs, &def_map, "", None, &empty_state());
         assert!(result.is_empty());
     }
 
     #[test]
     fn test_exclusive_choice_violation() {
-        let mut ir = empty_ir();
-        ir.fact_types.insert("ft1".to_string(), FactTypeDef {
+        let mut cells = empty_cells();
+        cells = with_ft(cells, "ft1", &FactTypeDef {
             schema_id: String::new(),
             reading: "Order isPaid".to_string(),
             readings: vec![],
             roles: vec![RoleDef { noun_name: "Order".to_string(), role_index: 0 }],
         });
-        ir.fact_types.insert("ft2".to_string(), FactTypeDef {
+        cells = with_ft(cells, "ft2", &FactTypeDef {
             schema_id: String::new(),
             reading: "Order isPending".to_string(),
             readings: vec![],
             roles: vec![RoleDef { noun_name: "Order".to_string(), role_index: 0 }],
         });
-        ir.constraints.push(ConstraintDef {
+        cells = with_constraint(cells, &ConstraintDef {
             id: "c1".to_string(),
             kind: "XC".to_string(),
             modality: "Alethic".to_string(),
@@ -1290,7 +1408,7 @@ mod tests {
         pop_state = ast::cell_push("ft2", ast::fact_from_pairs(&[("Order", "o1")]), &pop_state);
         let state = pop_state;
 
-        let (_meta_state, defs, def_map) = ir_to_defs(&ir);
+        let (_meta_state, defs, def_map) = compile_cells(cells);
         let result = eval_constraints_defs(&defs, &def_map, "", None, &state);
         assert!(!result.is_empty());
         assert!(result[0].detail.contains("Set-comparison violation"));
@@ -1298,9 +1416,9 @@ mod tests {
 
     #[test]
     fn test_mandatory_violation() {
-        let mut ir = empty_ir();
-        ir.nouns.insert("Customer".to_string(), make_noun("entity"));
-        ir.fact_types.insert("ft1".to_string(), FactTypeDef {
+        let mut cells = empty_cells();
+        cells = with_noun(cells, "Customer", &make_noun("entity"));
+        cells = with_ft(cells, "ft1", &FactTypeDef {
             schema_id: String::new(),
             reading: "Customer has Name".to_string(),
             readings: vec![],
@@ -1309,7 +1427,7 @@ mod tests {
                 RoleDef { noun_name: "Name".to_string(), role_index: 1 },
             ],
         });
-        ir.fact_types.insert("ft2".to_string(), FactTypeDef {
+        cells = with_ft(cells, "ft2", &FactTypeDef {
             schema_id: String::new(),
             reading: "Customer has Email".to_string(),
             readings: vec![],
@@ -1318,7 +1436,7 @@ mod tests {
                 RoleDef { noun_name: "Email".to_string(), role_index: 1 },
             ],
         });
-        ir.constraints.push(ConstraintDef {
+        cells = with_constraint(cells, &ConstraintDef {
             id: "c1".to_string(),
             kind: "MC".to_string(),
             modality: "Alethic".to_string(),
@@ -1336,7 +1454,7 @@ mod tests {
         pop_state = ast::cell_push("ft2", ast::fact_from_pairs(&[("Customer", "c1"), ("Email", "a@b.com")]), &pop_state);
         let state = pop_state;
 
-        let (_meta_state, defs, def_map) = ir_to_defs(&ir);
+        let (_meta_state, defs, def_map) = compile_cells(cells);
         let result = eval_constraints_defs(&defs, &def_map, "", None, &state);
         assert_eq!(result.len(), 1);
         assert!(result[0].detail.contains("Mandatory violation"));
@@ -1345,20 +1463,20 @@ mod tests {
 
     #[test]
     fn test_inclusive_or_violation() {
-        let mut ir = empty_ir();
-        ir.fact_types.insert("ft1".to_string(), FactTypeDef {
+        let mut cells = empty_cells();
+        cells = with_ft(cells, "ft1", &FactTypeDef {
             schema_id: String::new(),
             reading: "Customer hasPhone".to_string(),
             readings: vec![],
             roles: vec![RoleDef { noun_name: "Customer".to_string(), role_index: 0 }],
         });
-        ir.fact_types.insert("ft2".to_string(), FactTypeDef {
+        cells = with_ft(cells, "ft2", &FactTypeDef {
             schema_id: String::new(),
             reading: "Customer hasEmail".to_string(),
             readings: vec![],
             roles: vec![RoleDef { noun_name: "Customer".to_string(), role_index: 0 }],
         });
-        ir.constraints.push(ConstraintDef {
+        cells = with_constraint(cells, &ConstraintDef {
             id: "c1".to_string(),
             kind: "OR".to_string(),
             modality: "Alethic".to_string(),
@@ -1375,7 +1493,7 @@ mod tests {
             max_occurrence: None,
         });
 
-        ir.fact_types.insert("ft3".to_string(), FactTypeDef {
+        cells = with_ft(cells, "ft3", &FactTypeDef {
             schema_id: String::new(),
             reading: "Customer hasName".to_string(),
             readings: vec![],
@@ -1385,7 +1503,7 @@ mod tests {
         pop_state = ast::cell_push("ft3", ast::fact_from_pairs(&[("Customer", "c1")]), &pop_state);
         let state = pop_state;
 
-        let (_meta_state, defs, def_map) = ir_to_defs(&ir);
+        let (_meta_state, defs, def_map) = compile_cells(cells);
         let result = eval_constraints_defs(&defs, &def_map, "", None, &state);
         assert_eq!(result.len(), 1);
         assert!(result[0].detail.contains("Set-comparison violation"));
@@ -1394,11 +1512,11 @@ mod tests {
 
     #[test]
     fn test_obligatory_missing_enum_value() {
-        let mut ir = empty_ir();
-        ir.nouns.insert("SenderIdentityValue".to_string(), make_noun("value"));
-        ir.enum_values.insert("SenderIdentityValue".to_string(), vec!["Support Team <support@example.com>".to_string()]);
-        ir.nouns.insert("SupportResponse".to_string(), make_noun("entity"));
-        ir.fact_types.insert("ft1".to_string(), FactTypeDef {
+        let mut cells = empty_cells();
+        cells = with_noun(cells, "SenderIdentityValue", &make_noun("value"));
+        cells = with_enum_values(cells, "SenderIdentityValue", "value", &vec!["Support Team <support@example.com>".to_string()]);
+        cells = with_noun(cells, "SupportResponse", &make_noun("entity"));
+        cells = with_ft(cells, "ft1", &FactTypeDef {
             schema_id: String::new(),
             reading: "SupportResponse has SenderIdentityValue".to_string(),
             readings: vec![],
@@ -1407,7 +1525,7 @@ mod tests {
                 RoleDef { noun_name: "SenderIdentityValue".to_string(), role_index: 1 },
             ],
         });
-        ir.constraints.push(ConstraintDef {
+        cells = with_constraint(cells, &ConstraintDef {
             id: "c1".to_string(),
             kind: "UC".to_string(),
             modality: "Deontic".to_string(),
@@ -1421,7 +1539,7 @@ mod tests {
             max_occurrence: None,
         });
 
-        let (_meta_state, defs, def_map) = ir_to_defs(&ir);
+        let (_meta_state, defs, def_map) = compile_cells(cells);
         let result = eval_constraints_defs(&defs, &def_map, "Here is some help for you.", Some(""), &empty_state());
         assert!(result.len() >= 1);
         let details: Vec<String> = result.iter().map(|v| v.detail.clone()).collect();
@@ -1430,8 +1548,8 @@ mod tests {
 
     #[test]
     fn test_obligatory_sender_identity_empty() {
-        let mut ir = empty_ir();
-        ir.constraints.push(ConstraintDef {
+        let mut cells = empty_cells();
+        cells = with_constraint(cells, &ConstraintDef {
             id: "c1".to_string(),
             kind: "UC".to_string(),
             modality: "Deontic".to_string(),
@@ -1445,7 +1563,7 @@ mod tests {
             max_occurrence: None,
         });
 
-        let (_meta_state, defs, def_map) = ir_to_defs(&ir);
+        let (_meta_state, defs, def_map) = compile_cells(cells);
         let result = eval_constraints_defs(&defs, &def_map, "Hello", Some(""), &empty_state());
         assert_eq!(result.len(), 1);
         assert!(result[0].detail.contains("SenderIdentity"));
@@ -1455,23 +1573,25 @@ mod tests {
     /// must not produce duplicate violations. collect_enum_values deduplicates by noun name.
     #[test]
     fn test_no_duplicate_violations_for_multi_span_constraints() {
-        let mut ir = empty_ir();
-        ir.nouns.insert("FieldName".to_string(), make_noun("value"));
-        ir.enum_values.insert("FieldName".to_string(), vec!["EndpointSlug".to_string(), "Title".to_string()]);
-        ir.nouns.insert("SupportResponse".to_string(), make_noun("entity"));
-        ir.nouns.insert("APIProduct".to_string(), make_noun("entity"));
+        let mut cells = empty_cells();
+        cells = with_noun(cells, "FieldName", &make_noun("value"));
+        cells = with_enum_values(cells, "FieldName", "value", &vec!["EndpointSlug".to_string(), "Title".to_string()]);
+        cells = with_noun(cells, "SupportResponse", &make_noun("entity"));
+        cells = with_noun(cells, "APIProduct", &make_noun("entity"));
         // Three fact types that all reference FieldName -- simulates multi-span constraint
-        ir.fact_types.extend((1..=3).map(|i| (format!("ft{}", i), FactTypeDef {
-            schema_id: String::new(),
-            reading: format!("SupportResponse names APIProduct by FieldName ({})", i),
-            readings: vec![],
-            roles: vec![
-                RoleDef { noun_name: "SupportResponse".to_string(), role_index: 0 },
-                RoleDef { noun_name: "APIProduct".to_string(), role_index: 1 },
-                RoleDef { noun_name: "FieldName".to_string(), role_index: 2 },
-            ],
-        })));
-        ir.constraints.push(ConstraintDef {
+        for i in 1..=3 {
+            cells = with_ft(cells, &format!("ft{}", i), &FactTypeDef {
+                schema_id: String::new(),
+                reading: format!("SupportResponse names APIProduct by FieldName ({})", i),
+                readings: vec![],
+                roles: vec![
+                    RoleDef { noun_name: "SupportResponse".to_string(), role_index: 0 },
+                    RoleDef { noun_name: "APIProduct".to_string(), role_index: 1 },
+                    RoleDef { noun_name: "FieldName".to_string(), role_index: 2 },
+                ],
+            });
+        }
+        cells = with_constraint(cells, &ConstraintDef {
             id: "c1".to_string(),
             kind: "UC".to_string(),
             modality: "Deontic".to_string(),
@@ -1489,7 +1609,7 @@ mod tests {
             max_occurrence: None,
         });
 
-        let (_meta_state, defs, def_map) = ir_to_defs(&ir);
+        let (_meta_state, defs, def_map) = compile_cells(cells);
         let result = eval_constraints_defs(&defs, &def_map, "test response without required field names", None, &empty_state());
         // Should produce exactly 1 violation per unique noun, not 3 duplicates
         let field_name_violations: Vec<_> = result.iter()
@@ -1503,20 +1623,20 @@ mod tests {
 
     #[test]
     fn test_equality_violation() {
-        let mut ir = empty_ir();
-        ir.fact_types.insert("ft1".to_string(), FactTypeDef {
+        let mut cells = empty_cells();
+        cells = with_ft(cells, "ft1", &FactTypeDef {
             schema_id: String::new(),
             reading: "Person isEmployee".to_string(),
             readings: vec![],
             roles: vec![RoleDef { noun_name: "Person".to_string(), role_index: 0 }],
         });
-        ir.fact_types.insert("ft2".to_string(), FactTypeDef {
+        cells = with_ft(cells, "ft2", &FactTypeDef {
             schema_id: String::new(),
             reading: "Person hasBadge".to_string(),
             readings: vec![],
             roles: vec![RoleDef { noun_name: "Person".to_string(), role_index: 0 }],
         });
-        ir.constraints.push(ConstraintDef {
+        cells = with_constraint(cells, &ConstraintDef {
             id: "c1".to_string(),
             kind: "EQ".to_string(),
             modality: "Alethic".to_string(),
@@ -1537,7 +1657,7 @@ mod tests {
         pop_state = ast::cell_push("ft1", ast::fact_from_pairs(&[("Person", "p1")]), &pop_state);
         let state = pop_state;
 
-        let (_meta_state, defs, def_map) = ir_to_defs(&ir);
+        let (_meta_state, defs, def_map) = compile_cells(cells);
         let result = eval_constraints_defs(&defs, &def_map, "", None, &state);
         assert!(!result.is_empty());
         assert!(result[0].detail.contains("Equality violation"));
@@ -1547,14 +1667,14 @@ mod tests {
 
     #[test]
     fn test_subtype_inheritance_derivation() {
-        let mut ir = empty_ir();
+        let mut cells = empty_cells();
 
-        ir.nouns.insert("Vehicle".to_string(), make_noun("entity"));
-        ir.nouns.insert("Car".to_string(), make_noun("entity"));
-        ir.subtypes.insert("Car".to_string(), "Vehicle".to_string());
-        ir.nouns.insert("License".to_string(), make_noun("entity"));
+        cells = with_noun(cells, "Vehicle", &make_noun("entity"));
+        cells = with_noun(cells, "Car", &make_noun("entity"));
+        cells = with_subtype(cells, "Car", "Vehicle");
+        cells = with_noun(cells, "License", &make_noun("entity"));
 
-        ir.fact_types.insert("ft_vehicle_license".to_string(), FactTypeDef {
+        cells = with_ft(cells, "ft_vehicle_license", &FactTypeDef {
             schema_id: String::new(),
             reading: "Vehicle has License".to_string(),
             readings: vec![],
@@ -1564,7 +1684,7 @@ mod tests {
             ],
         });
 
-        ir.fact_types.insert("ft_car_color".to_string(), FactTypeDef {
+        cells = with_ft(cells, "ft_car_color", &FactTypeDef {
             schema_id: String::new(),
             reading: "Car has Color".to_string(),
             readings: vec![],
@@ -1573,7 +1693,7 @@ mod tests {
             ],
         });
 
-        let (_meta_pop, defs, _def_map) = ir_to_defs(&ir);
+        let (_meta_pop, defs, _def_map) = compile_cells(cells);
 
         // Verify subtype inheritance derivation was compiled
         let subtype_derivations = defs.iter()
@@ -1599,23 +1719,23 @@ mod tests {
 
     #[test]
     fn test_modus_ponens_from_subset() {
-        let mut ir = empty_ir();
+        let mut cells = empty_cells();
 
-        ir.nouns.insert("Person".to_string(), make_noun("entity"));
-        ir.fact_types.insert("ft1".to_string(), FactTypeDef {
+        cells = with_noun(cells, "Person", &make_noun("entity"));
+        cells = with_ft(cells, "ft1", &FactTypeDef {
             schema_id: String::new(),
             reading: "Person hasLicense".to_string(),
             readings: vec![],
             roles: vec![RoleDef { noun_name: "Person".to_string(), role_index: 0 }],
         });
-        ir.fact_types.insert("ft2".to_string(), FactTypeDef {
+        cells = with_ft(cells, "ft2", &FactTypeDef {
             schema_id: String::new(),
             reading: "Person hasInsurance".to_string(),
             readings: vec![],
             roles: vec![RoleDef { noun_name: "Person".to_string(), role_index: 0 }],
         });
         // SS constraint with autofill: hasLicense -> automatically derive hasInsurance
-        ir.constraints.push(ConstraintDef {
+        cells = with_constraint(cells, &ConstraintDef {
             id: "c1".to_string(),
             kind: "SS".to_string(),
             modality: "Alethic".to_string(),
@@ -1632,7 +1752,7 @@ mod tests {
             max_occurrence: None,
         });
 
-        let (_meta_pop, defs, _def_map) = ir_to_defs(&ir);
+        let (_meta_pop, defs, _def_map) = compile_cells(cells);
 
         // Verify modus ponens derivation was compiled
         let mp_derivations = defs.iter()
@@ -1660,22 +1780,22 @@ mod tests {
 
     #[test]
     fn test_cwa_vs_owa_negation() {
-        let mut ir = empty_ir();
+        let mut cells = empty_cells();
 
         // CWA noun: Permission (not stated = false)
-        ir.nouns.insert("Permission".to_string(), NounDef {
+        cells = with_noun(cells, "Permission", &NounDef {
             object_type: "entity".to_string(),
             world_assumption: WorldAssumption::Closed,
         });
         // OWA noun: Capability (not stated = unknown)
-        ir.nouns.insert("Capability".to_string(), NounDef {
+        cells = with_noun(cells, "Capability", &NounDef {
             object_type: "entity".to_string(),
             world_assumption: WorldAssumption::Open,
         });
 
-        ir.nouns.insert("Resource".to_string(), make_noun("entity"));
+        cells = with_noun(cells, "Resource", &make_noun("entity"));
 
-        ir.fact_types.insert("ft_perm".to_string(), FactTypeDef {
+        cells = with_ft(cells, "ft_perm", &FactTypeDef {
             schema_id: String::new(),
             reading: "Permission grants access to Resource".to_string(),
             readings: vec![],
@@ -1684,7 +1804,7 @@ mod tests {
                 RoleDef { noun_name: "Resource".to_string(), role_index: 1 },
             ],
         });
-        ir.fact_types.insert("ft_cap".to_string(), FactTypeDef {
+        cells = with_ft(cells, "ft_cap", &FactTypeDef {
             schema_id: String::new(),
             reading: "Capability enables Resource".to_string(),
             readings: vec![],
@@ -1694,7 +1814,7 @@ mod tests {
             ],
         });
 
-        let (_meta_pop, defs, _def_map) = ir_to_defs(&ir);
+        let (_meta_pop, defs, _def_map) = compile_cells(cells);
 
         // CWA derivation should exist for Permission
         let cwa_for_perm = defs.iter()
@@ -1728,16 +1848,16 @@ mod tests {
 
     #[test]
     fn test_synthesis_basic() {
-        let mut ir = empty_ir();
+        let mut cells = empty_cells();
 
-        ir.nouns.insert("Customer".to_string(), NounDef {
+        cells = with_noun(cells, "Customer", &NounDef {
             object_type: "entity".to_string(),
             world_assumption: WorldAssumption::Closed,
         });
-        ir.nouns.insert("Name".to_string(), make_noun("value"));
-        ir.nouns.insert("Email".to_string(), make_noun("value"));
+        cells = with_noun(cells, "Name", &make_noun("value"));
+        cells = with_noun(cells, "Email", &make_noun("value"));
 
-        ir.fact_types.insert("ft1".to_string(), FactTypeDef {
+        cells = with_ft(cells, "ft1", &FactTypeDef {
             schema_id: String::new(),
             reading: "Customer has Name".to_string(),
             readings: vec![],
@@ -1746,7 +1866,7 @@ mod tests {
                 RoleDef { noun_name: "Name".to_string(), role_index: 1 },
             ],
         });
-        ir.fact_types.insert("ft2".to_string(), FactTypeDef {
+        cells = with_ft(cells, "ft2", &FactTypeDef {
             schema_id: String::new(),
             reading: "Customer has Email".to_string(),
             readings: vec![],
@@ -1756,7 +1876,7 @@ mod tests {
             ],
         });
 
-        ir.constraints.push(ConstraintDef {
+        cells = with_constraint(cells, &ConstraintDef {
             id: "c1".to_string(),
             kind: "MC".to_string(),
             modality: "Alethic".to_string(),
@@ -1770,7 +1890,7 @@ mod tests {
             max_occurrence: None,
         });
 
-        let (meta_pop, _defs, _def_map) = ir_to_defs(&ir);
+        let (meta_pop, _defs, _def_map) = compile_cells(cells);
         let result = synthesize_from_state(&meta_pop, "Customer", 1);
 
         assert_eq!(result.noun_name, "Customer");
@@ -1798,7 +1918,7 @@ mod tests {
 
     #[test]
     fn test_synthesis_empty_noun() {
-        let (meta_pop, _defs, _def_map) = ir_to_defs(&empty_ir());
+        let (meta_pop, _defs, _def_map) = compile_cells(empty_cells());
         let result = synthesize_from_state(&meta_pop, "NonExistent", 1);
 
         assert_eq!(result.noun_name, "NonExistent");
@@ -1811,16 +1931,16 @@ mod tests {
     #[test]
     fn test_forward_chain_fixed_point() {
         // Verify forward chaining reaches a fixed point (no infinite loops)
-        let mut ir = empty_ir();
-        ir.nouns.insert("A".to_string(), make_noun("entity"));
-        ir.fact_types.insert("ft1".to_string(), FactTypeDef {
+        let mut cells = empty_cells();
+        cells = with_noun(cells, "A", &make_noun("entity"));
+        cells = with_ft(cells, "ft1", &FactTypeDef {
             schema_id: String::new(),
             reading: "A exists".to_string(),
             readings: vec![],
             roles: vec![RoleDef { noun_name: "A".to_string(), role_index: 0 }],
         });
 
-        let (_meta_pop, defs, _def_map) = ir_to_defs(&ir);
+        let (_meta_pop, defs, _def_map) = compile_cells(cells);
 
         let mut pop_state = ast::Object::phi();
         pop_state = ast::cell_push("ft1", ast::fact_from_pairs(&[("A", "a1")]), &pop_state);
@@ -1835,13 +1955,13 @@ mod tests {
 
     #[test]
     fn test_transitivity_derivation() {
-        let mut ir = empty_ir();
+        let mut cells = empty_cells();
 
-        ir.nouns.insert("City".to_string(), make_noun("entity"));
-        ir.nouns.insert("State".to_string(), make_noun("entity"));
-        ir.nouns.insert("Country".to_string(), make_noun("entity"));
+        cells = with_noun(cells, "City", &make_noun("entity"));
+        cells = with_noun(cells, "State", &make_noun("entity"));
+        cells = with_noun(cells, "Country", &make_noun("entity"));
 
-        ir.fact_types.insert("ft_city_state".to_string(), FactTypeDef {
+        cells = with_ft(cells, "ft_city_state", &FactTypeDef {
             schema_id: String::new(),
             reading: "City isIn State".to_string(),
             readings: vec![],
@@ -1850,7 +1970,7 @@ mod tests {
                 RoleDef { noun_name: "State".to_string(), role_index: 1 },
             ],
         });
-        ir.fact_types.insert("ft_state_country".to_string(), FactTypeDef {
+        cells = with_ft(cells, "ft_state_country", &FactTypeDef {
             schema_id: String::new(),
             reading: "State isIn Country".to_string(),
             readings: vec![],
@@ -1860,7 +1980,7 @@ mod tests {
             ],
         });
 
-        let (_meta_pop, defs, _def_map) = ir_to_defs(&ir);
+        let (_meta_pop, defs, _def_map) = compile_cells(cells);
 
         // Should have a transitivity derivation
         let trans_derivations = defs.iter()
@@ -1907,9 +2027,8 @@ mod tests {
     // If at least one fact passes, the rule fires and the binding
     // extractor pulls from the first post-filter fact.
 
-    fn city_population_ir(filter: Option<crate::types::AntecedentFilter>) -> Domain {
-        let mut fact_types = HashMap::new();
-        fact_types.insert("city_has_population".to_string(), FactTypeDef {
+    fn city_population_cells(filter: Option<crate::types::AntecedentFilter>) -> S {
+        let ft1 = FactTypeDef {
             schema_id: String::new(),
             reading: "City has Population".to_string(),
             readings: vec![],
@@ -1917,8 +2036,8 @@ mod tests {
                 RoleDef { noun_name: "City".to_string(), role_index: 0 },
                 RoleDef { noun_name: "Population".to_string(), role_index: 1 },
             ],
-        });
-        fact_types.insert("big_city".to_string(), FactTypeDef {
+        };
+        let ft2 = FactTypeDef {
             schema_id: String::new(),
             reading: "Big City has City".to_string(),
             readings: vec![],
@@ -1926,43 +2045,37 @@ mod tests {
                 RoleDef { noun_name: "Big City".to_string(), role_index: 0 },
                 RoleDef { noun_name: "City".to_string(), role_index: 1 },
             ],
-        });
-        Domain {
-            nouns: HashMap::new(),
-            fact_types,
-            constraints: vec![],
-            state_machines: HashMap::new(),
-            derivation_rules: vec![DerivationRuleDef {
-                id: "big-city".to_string(),
-                text: "* Big City has City iff City has Population >= 1000000".to_string(),
-                antecedent_fact_type_ids: vec!["city_has_population".to_string()],
-                consequent_fact_type_id: "big_city".to_string(),
-                kind: DerivationKind::ModusPonens,
-                join_on: vec![],
-                match_on: vec![],
-                consequent_bindings: vec![],
-                antecedent_filters: filter.into_iter().collect(),
-                consequent_computed_bindings: vec![], consequent_aggregates: vec![], unresolved_clauses: vec![],
-            }],
-            general_instance_facts: vec![],
-            subtypes: HashMap::new(), enum_values: HashMap::new(),
-            ref_schemes: HashMap::new(),
-            named_spans: HashMap::new(), autofill_spans: vec![],
-            cells: HashMap::new(),
-        }
+        };
+        let rule = DerivationRuleDef {
+            id: "big-city".to_string(),
+            text: "* Big City has City iff City has Population >= 1000000".to_string(),
+            antecedent_fact_type_ids: vec!["city_has_population".to_string()],
+            consequent_fact_type_id: "big_city".to_string(),
+            kind: DerivationKind::ModusPonens,
+            join_on: vec![],
+            match_on: vec![],
+            consequent_bindings: vec![],
+            antecedent_filters: filter.into_iter().collect(),
+            consequent_computed_bindings: vec![], consequent_aggregates: vec![], unresolved_clauses: vec![],
+        };
+        let mut cells = empty_cells();
+        cells = with_ft(cells, "city_has_population", &ft1);
+        cells = with_ft(cells, "big_city", &ft2);
+        cells = with_derivation(cells, &rule);
+        cells
     }
 
     #[test]
     fn inline_ge_filter_suppresses_derivation_when_no_fact_matches() {
         // Both cities well below the 1M threshold â†’ filter strips every
         // antecedent fact â†’ rule's existence check fails â†’ no derivation.
-        let ir = city_population_ir(Some(crate::types::AntecedentFilter {
+        let cells = city_population_cells(Some(crate::types::AntecedentFilter {
             antecedent_index: 0,
             role: "Population".to_string(),
             op: ">=".to_string(),
             value: 1_000_000.0,
         }));
-        let (_meta_pop, defs, _def_map) = ir_to_defs(&ir);
+        let (_meta_pop, defs, _def_map) = compile_cells(cells);
 
         let mut pop_state = ast::Object::phi();
         pop_state = ast::cell_push("city_has_population",
@@ -1982,13 +2095,13 @@ mod tests {
         // One city below the threshold, one above. The filter keeps only
         // the big one, the existence check passes, and the rule fires with
         // the matching city's bindings.
-        let ir = city_population_ir(Some(crate::types::AntecedentFilter {
+        let cells = city_population_cells(Some(crate::types::AntecedentFilter {
             antecedent_index: 0,
             role: "Population".to_string(),
             op: ">=".to_string(),
             value: 1_000_000.0,
         }));
-        let (_meta_pop, defs, _def_map) = ir_to_defs(&ir);
+        let (_meta_pop, defs, _def_map) = compile_cells(cells);
 
         let mut pop_state = ast::Object::phi();
         pop_state = ast::cell_push("city_has_population",
@@ -2012,13 +2125,13 @@ mod tests {
         // Flip direction: derivation should fire only when some fact's
         // Population is strictly less than 1M. Exercises Func::Lt path in
         // comparator_primitive.
-        let ir = city_population_ir(Some(crate::types::AntecedentFilter {
+        let cells = city_population_cells(Some(crate::types::AntecedentFilter {
             antecedent_index: 0,
             role: "Population".to_string(),
             op: "<".to_string(),
             value: 1_000_000.0,
         }));
-        let (_meta_pop, defs, _def_map) = ir_to_defs(&ir);
+        let (_meta_pop, defs, _def_map) = compile_cells(cells);
 
         let mut pop_state = ast::Object::phi();
         pop_state = ast::cell_push("city_has_population",
@@ -2040,13 +2153,13 @@ mod tests {
         // Four cities, three above the 1M threshold. Per-fact semantic
         // demands one derived fact per matching antecedent tuple â€” the
         // old existence-check semantic would have produced one regardless.
-        let ir = city_population_ir(Some(crate::types::AntecedentFilter {
+        let cells = city_population_cells(Some(crate::types::AntecedentFilter {
             antecedent_index: 0,
             role: "Population".to_string(),
             op: ">=".to_string(),
             value: 1_000_000.0,
         }));
-        let (_meta_pop, defs, _def_map) = ir_to_defs(&ir);
+        let (_meta_pop, defs, _def_map) = compile_cells(cells);
 
         let mut pop_state = ast::Object::phi();
         for (name, pop) in [("Alpha", "2000000"), ("Bravo", "5000000"), ("Charlie", "800000"), ("Delta", "3000000")] {
@@ -2078,53 +2191,40 @@ mod tests {
     // which the compile side turns into a per-fact Func that appends the
     // computed pair to the antecedent's bindings.
 
-    fn val_derived_ir(expr: crate::types::ArithExpr, derived_role: &str) -> Domain {
-        let mut fact_types = HashMap::new();
-        fact_types.insert("foo_has_val".to_string(), FactTypeDef {
-            schema_id: String::new(),
-            reading: "Foo has Val".to_string(),
-            readings: vec![],
+    fn val_derived_cells(expr: crate::types::ArithExpr, derived_role: &str) -> S {
+        let ft1 = FactTypeDef {
+            schema_id: String::new(), reading: "Foo has Val".to_string(), readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "Foo".to_string(), role_index: 0 },
                 RoleDef { noun_name: "Val".to_string(), role_index: 1 },
             ],
-        });
-        fact_types.insert("foo_has_derived".to_string(), FactTypeDef {
+        };
+        let ft2 = FactTypeDef {
             schema_id: String::new(),
-            reading: format!("Foo has {}", derived_role),
-            readings: vec![],
+            reading: format!("Foo has {}", derived_role), readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "Foo".to_string(), role_index: 0 },
                 RoleDef { noun_name: derived_role.to_string(), role_index: 1 },
             ],
-        });
-        Domain {
-            nouns: HashMap::new(),
-            fact_types,
-            constraints: vec![],
-            state_machines: HashMap::new(),
-            derivation_rules: vec![DerivationRuleDef {
-                id: "arith-rule".to_string(),
-                text: format!("* Foo has {} iff Foo has Val and ...", derived_role),
-                antecedent_fact_type_ids: vec!["foo_has_val".to_string()],
-                consequent_fact_type_id: "foo_has_derived".to_string(),
-                kind: DerivationKind::ModusPonens,
-                join_on: vec![],
-                match_on: vec![],
-                consequent_bindings: vec![],
-                antecedent_filters: vec![],
-                consequent_computed_bindings: vec![crate::types::ConsequentComputedBinding {
-                    role: derived_role.to_string(),
-                    expr,
-                }],
-                consequent_aggregates: vec![], unresolved_clauses: vec![],
+        };
+        let rule = DerivationRuleDef {
+            id: "arith-rule".to_string(),
+            text: format!("* Foo has {} iff Foo has Val and ...", derived_role),
+            antecedent_fact_type_ids: vec!["foo_has_val".to_string()],
+            consequent_fact_type_id: "foo_has_derived".to_string(),
+            kind: DerivationKind::ModusPonens,
+            join_on: vec![], match_on: vec![], consequent_bindings: vec![],
+            antecedent_filters: vec![],
+            consequent_computed_bindings: vec![crate::types::ConsequentComputedBinding {
+                role: derived_role.to_string(), expr,
             }],
-            general_instance_facts: vec![],
-            subtypes: HashMap::new(), enum_values: HashMap::new(),
-            ref_schemes: HashMap::new(),
-            named_spans: HashMap::new(), autofill_spans: vec![],
-            cells: HashMap::new(),
-        }
+            consequent_aggregates: vec![], unresolved_clauses: vec![],
+        };
+        let mut cells = empty_cells();
+        cells = with_ft(cells, "foo_has_val", &ft1);
+        cells = with_ft(cells, "foo_has_derived", &ft2);
+        cells = with_derivation(cells, &rule);
+        cells
     }
 
     fn val_ref() -> crate::types::ArithExpr {
@@ -2141,8 +2241,8 @@ mod tests {
 
     #[test]
     fn arithmetic_add_computes_role_plus_role() {
-        let ir = val_derived_ir(bin("+", val_ref(), val_ref()), "Doubled");
-        let (_meta_pop, defs, _def_map) = ir_to_defs(&ir);
+        let cells = val_derived_cells(bin("+", val_ref(), val_ref()), "Doubled");
+        let (_meta_pop, defs, _def_map) = compile_cells(cells);
 
         let mut pop_state = ast::Object::phi();
         pop_state = ast::cell_push("foo_has_val",
@@ -2159,8 +2259,8 @@ mod tests {
 
     #[test]
     fn arithmetic_sub_computes_role_minus_literal() {
-        let ir = val_derived_ir(bin("-", val_ref(), lit(3.0)), "Less");
-        let (_meta_pop, defs, _def_map) = ir_to_defs(&ir);
+        let cells = val_derived_cells(bin("-", val_ref(), lit(3.0)), "Less");
+        let (_meta_pop, defs, _def_map) = compile_cells(cells);
 
         let mut pop_state = ast::Object::phi();
         pop_state = ast::cell_push("foo_has_val",
@@ -2179,8 +2279,8 @@ mod tests {
     fn arithmetic_mul_and_div_chain_left_associative() {
         // (Val * 3) / 2 applied to Val=10 â†’ 15.
         let expr = bin("/", bin("*", val_ref(), lit(3.0)), lit(2.0));
-        let ir = val_derived_ir(expr, "Scaled");
-        let (_meta_pop, defs, _def_map) = ir_to_defs(&ir);
+        let cells = val_derived_cells(expr, "Scaled");
+        let (_meta_pop, defs, _def_map) = compile_cells(cells);
 
         let mut pop_state = ast::Object::phi();
         pop_state = ast::cell_push("foo_has_val",
@@ -2199,8 +2299,8 @@ mod tests {
     fn arithmetic_fanout_computes_per_fact_independently() {
         // Three Foo facts with different Vals â†’ three derivations, each
         // carrying its own computed value.
-        let ir = val_derived_ir(bin("*", val_ref(), lit(2.0)), "Twice");
-        let (_meta_pop, defs, _def_map) = ir_to_defs(&ir);
+        let cells = val_derived_cells(bin("*", val_ref(), lit(2.0)), "Twice");
+        let (_meta_pop, defs, _def_map) = compile_cells(cells);
 
         let mut pop_state = ast::Object::phi();
         for (id, val) in [("a", "3"), ("b", "5"), ("c", "11")] {
@@ -2228,65 +2328,51 @@ mod tests {
 
     // â”€â”€ Aggregate derivations, end-to-end (Codd image-set) â”€â”€
 
-    fn thing_part_arity_ir() -> Domain {
-        let mut fact_types = HashMap::new();
-        fact_types.insert("thing_has_part".to_string(), FactTypeDef {
-            schema_id: String::new(),
-            reading: "Thing has Part".to_string(),
-            readings: vec![],
+    fn thing_part_arity_cells() -> S {
+        let ft1 = FactTypeDef {
+            schema_id: String::new(), reading: "Thing has Part".to_string(), readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "Thing".to_string(), role_index: 0 },
                 RoleDef { noun_name: "Part".to_string(), role_index: 1 },
             ],
-        });
-        fact_types.insert("thing_has_arity".to_string(), FactTypeDef {
-            schema_id: String::new(),
-            reading: "Thing has Arity".to_string(),
-            readings: vec![],
+        };
+        let ft2 = FactTypeDef {
+            schema_id: String::new(), reading: "Thing has Arity".to_string(), readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "Thing".to_string(), role_index: 0 },
                 RoleDef { noun_name: "Arity".to_string(), role_index: 1 },
             ],
-        });
-        Domain {
-            nouns: HashMap::new(),
-            fact_types,
-            constraints: vec![],
-            state_machines: HashMap::new(),
-            derivation_rules: vec![DerivationRuleDef {
-                id: "thing-arity".to_string(),
-                text: "* Thing has Arity iff Arity is the count of Part where Thing has Part.".to_string(),
-                antecedent_fact_type_ids: vec![],
-                consequent_fact_type_id: "thing_has_arity".to_string(),
-                kind: DerivationKind::ModusPonens,
-                join_on: vec![],
-                match_on: vec![],
-                consequent_bindings: vec![],
-                antecedent_filters: vec![],
-                consequent_computed_bindings: vec![],
-                consequent_aggregates: vec![crate::types::ConsequentAggregate {
-                    role: "Arity".to_string(),
-                    op: "count".to_string(),
-                    target_role: "Part".to_string(),
-                    source_fact_type_id: "thing_has_part".to_string(),
-                    group_key_role: "Thing".to_string(),
-                }],
-                unresolved_clauses: vec![],
+        };
+        let rule = DerivationRuleDef {
+            id: "thing-arity".to_string(),
+            text: "* Thing has Arity iff Arity is the count of Part where Thing has Part.".to_string(),
+            antecedent_fact_type_ids: vec![],
+            consequent_fact_type_id: "thing_has_arity".to_string(),
+            kind: DerivationKind::ModusPonens,
+            join_on: vec![], match_on: vec![], consequent_bindings: vec![],
+            antecedent_filters: vec![], consequent_computed_bindings: vec![],
+            consequent_aggregates: vec![crate::types::ConsequentAggregate {
+                role: "Arity".to_string(),
+                op: "count".to_string(),
+                target_role: "Part".to_string(),
+                source_fact_type_id: "thing_has_part".to_string(),
+                group_key_role: "Thing".to_string(),
             }],
-            general_instance_facts: vec![],
-            subtypes: HashMap::new(), enum_values: HashMap::new(),
-            ref_schemes: HashMap::new(),
-            named_spans: HashMap::new(), autofill_spans: vec![],
-            cells: HashMap::new(),
-        }
+            unresolved_clauses: vec![],
+        };
+        let mut cells = empty_cells();
+        cells = with_ft(cells, "thing_has_part", &ft1);
+        cells = with_ft(cells, "thing_has_arity", &ft2);
+        cells = with_derivation(cells, &rule);
+        cells
     }
 
     #[test]
     fn count_aggregate_computes_image_set_size_per_group() {
         // Three Parts belong to T1, one to T2. Expect two derived rows:
         // T1 has Arity=3, T2 has Arity=1.
-        let ir = thing_part_arity_ir();
-        let (_meta_pop, defs, _def_map) = ir_to_defs(&ir);
+        let cells = thing_part_arity_cells();
+        let (_meta_pop, defs, _def_map) = compile_cells(cells);
 
         let mut pop_state = ast::Object::phi();
         for (thing, part) in [("T1", "P1"), ("T1", "P2"), ("T1", "P3"), ("T2", "PX")] {
@@ -2319,68 +2405,54 @@ mod tests {
         pairs.clear();  // avoid unused warning via reset
     }
 
-    fn order_line_item_sum_ir() -> Domain {
+    fn order_line_item_sum_cells() -> S {
         // `LineItem has Amount for Order` is ternary-ish in Halpin's
         // example; for testing we use a simpler binary form
         // `Order has LineItem Amount`, with Order as group key and
         // Amount as target.
-        let mut fact_types = HashMap::new();
-        fact_types.insert("order_has_line_amount".to_string(), FactTypeDef {
-            schema_id: String::new(),
-            reading: "Order has LineItem Amount".to_string(),
-            readings: vec![],
+        let ft1 = FactTypeDef {
+            schema_id: String::new(), reading: "Order has LineItem Amount".to_string(), readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "Order".to_string(), role_index: 0 },
                 RoleDef { noun_name: "LineItem Amount".to_string(), role_index: 1 },
             ],
-        });
-        fact_types.insert("order_has_total".to_string(), FactTypeDef {
-            schema_id: String::new(),
-            reading: "Order has Amount".to_string(),
-            readings: vec![],
+        };
+        let ft2 = FactTypeDef {
+            schema_id: String::new(), reading: "Order has Amount".to_string(), readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "Order".to_string(), role_index: 0 },
                 RoleDef { noun_name: "Amount".to_string(), role_index: 1 },
             ],
-        });
-        Domain {
-            nouns: HashMap::new(),
-            fact_types,
-            constraints: vec![],
-            state_machines: HashMap::new(),
-            derivation_rules: vec![DerivationRuleDef {
-                id: "order-total".to_string(),
-                text: "* Order has Amount iff Amount is the sum of LineItem Amount where Order has LineItem Amount.".to_string(),
-                antecedent_fact_type_ids: vec![],
-                consequent_fact_type_id: "order_has_total".to_string(),
-                kind: DerivationKind::ModusPonens,
-                join_on: vec![],
-                match_on: vec![],
-                consequent_bindings: vec![],
-                antecedent_filters: vec![],
-                consequent_computed_bindings: vec![],
-                consequent_aggregates: vec![crate::types::ConsequentAggregate {
-                    role: "Amount".to_string(),
-                    op: "sum".to_string(),
-                    target_role: "LineItem Amount".to_string(),
-                    source_fact_type_id: "order_has_line_amount".to_string(),
-                    group_key_role: "Order".to_string(),
-                }],
-                unresolved_clauses: vec![],
+        };
+        let rule = DerivationRuleDef {
+            id: "order-total".to_string(),
+            text: "* Order has Amount iff Amount is the sum of LineItem Amount where Order has LineItem Amount.".to_string(),
+            antecedent_fact_type_ids: vec![],
+            consequent_fact_type_id: "order_has_total".to_string(),
+            kind: DerivationKind::ModusPonens,
+            join_on: vec![], match_on: vec![], consequent_bindings: vec![],
+            antecedent_filters: vec![], consequent_computed_bindings: vec![],
+            consequent_aggregates: vec![crate::types::ConsequentAggregate {
+                role: "Amount".to_string(),
+                op: "sum".to_string(),
+                target_role: "LineItem Amount".to_string(),
+                source_fact_type_id: "order_has_line_amount".to_string(),
+                group_key_role: "Order".to_string(),
             }],
-            general_instance_facts: vec![],
-            subtypes: HashMap::new(), enum_values: HashMap::new(),
-            ref_schemes: HashMap::new(),
-            named_spans: HashMap::new(), autofill_spans: vec![],
-            cells: HashMap::new(),
-        }
+            unresolved_clauses: vec![],
+        };
+        let mut cells = empty_cells();
+        cells = with_ft(cells, "order_has_line_amount", &ft1);
+        cells = with_ft(cells, "order_has_total", &ft2);
+        cells = with_derivation(cells, &rule);
+        cells
     }
 
     #[test]
     fn sum_aggregate_folds_add_over_projected_target_values() {
         // Order O1: 10 + 25 + 5 = 40; Order O2: 7 = 7.
-        let ir = order_line_item_sum_ir();
-        let (_meta_pop, defs, _def_map) = ir_to_defs(&ir);
+        let cells = order_line_item_sum_cells();
+        let (_meta_pop, defs, _def_map) = compile_cells(cells);
 
         let mut pop_state = ast::Object::phi();
         for (order, amt) in [("O1", "10"), ("O1", "25"), ("O1", "5"), ("O2", "7")] {
@@ -2405,18 +2477,51 @@ mod tests {
             "expected O1=40, O2=7; got {:?} (raw count={})", pairs, totals.len());
     }
 
-    fn order_amount_agg_ir(op: &str) -> Domain {
-        // Reuse order_line_item_sum_ir's shape but parameterise the op.
-        let mut ir = order_line_item_sum_ir();
-        ir.derivation_rules[0].consequent_aggregates[0].op = op.to_string();
-        ir.derivation_rules[0].id = format!("order-{}", op);
-        ir
+    fn order_amount_agg_cells(op: &str) -> S {
+        // Same shape as order_line_item_sum_cells; this rebuilds with the
+        // requested op in the derivation rule's aggregate clause.
+        let ft1 = FactTypeDef {
+            schema_id: String::new(), reading: "Order has LineItem Amount".to_string(), readings: vec![],
+            roles: vec![
+                RoleDef { noun_name: "Order".to_string(), role_index: 0 },
+                RoleDef { noun_name: "LineItem Amount".to_string(), role_index: 1 },
+            ],
+        };
+        let ft2 = FactTypeDef {
+            schema_id: String::new(), reading: "Order has Amount".to_string(), readings: vec![],
+            roles: vec![
+                RoleDef { noun_name: "Order".to_string(), role_index: 0 },
+                RoleDef { noun_name: "Amount".to_string(), role_index: 1 },
+            ],
+        };
+        let rule = DerivationRuleDef {
+            id: format!("order-{}", op),
+            text: format!("* Order has Amount iff Amount is the {} of LineItem Amount where Order has LineItem Amount.", op),
+            antecedent_fact_type_ids: vec![],
+            consequent_fact_type_id: "order_has_total".to_string(),
+            kind: DerivationKind::ModusPonens,
+            join_on: vec![], match_on: vec![], consequent_bindings: vec![],
+            antecedent_filters: vec![], consequent_computed_bindings: vec![],
+            consequent_aggregates: vec![crate::types::ConsequentAggregate {
+                role: "Amount".to_string(),
+                op: op.to_string(),
+                target_role: "LineItem Amount".to_string(),
+                source_fact_type_id: "order_has_line_amount".to_string(),
+                group_key_role: "Order".to_string(),
+            }],
+            unresolved_clauses: vec![],
+        };
+        let mut cells = empty_cells();
+        cells = with_ft(cells, "order_has_line_amount", &ft1);
+        cells = with_ft(cells, "order_has_total", &ft2);
+        cells = with_derivation(cells, &rule);
+        cells
     }
 
     #[test]
     fn min_aggregate_folds_pairwise_minimum() {
-        let ir = order_amount_agg_ir("min");
-        let (_meta_pop, defs, _def_map) = ir_to_defs(&ir);
+        let cells = order_amount_agg_cells("min");
+        let (_meta_pop, defs, _def_map) = compile_cells(cells);
         let mut pop_state = ast::Object::phi();
         for (o, a) in [("O1", "10"), ("O1", "4"), ("O1", "25"), ("O2", "7")] {
             pop_state = ast::cell_push("order_has_line_amount",
@@ -2439,8 +2544,8 @@ mod tests {
 
     #[test]
     fn max_aggregate_folds_pairwise_maximum() {
-        let ir = order_amount_agg_ir("max");
-        let (_meta_pop, defs, _def_map) = ir_to_defs(&ir);
+        let cells = order_amount_agg_cells("max");
+        let (_meta_pop, defs, _def_map) = compile_cells(cells);
         let mut pop_state = ast::Object::phi();
         for (o, a) in [("O1", "10"), ("O1", "4"), ("O1", "25"), ("O2", "7")] {
             pop_state = ast::cell_push("order_has_line_amount",
@@ -2463,8 +2568,8 @@ mod tests {
 
     #[test]
     fn avg_aggregate_divides_sum_by_count() {
-        let ir = order_amount_agg_ir("avg");
-        let (_meta_pop, defs, _def_map) = ir_to_defs(&ir);
+        let cells = order_amount_agg_cells("avg");
+        let (_meta_pop, defs, _def_map) = compile_cells(cells);
         let mut pop_state = ast::Object::phi();
         // O1: (9 + 12 + 15) / 3 = 12.
         for (o, a) in [("O1", "9"), ("O1", "12"), ("O1", "15"), ("O2", "7")] {
@@ -2491,8 +2596,8 @@ mod tests {
     fn rule_without_filter_fires_for_any_fact_regression() {
         // Regression: when antecedent_filters is empty, behavior is
         // unchanged from pre-#192 â€” any fact makes the rule fire.
-        let ir = city_population_ir(None);
-        let (_meta_pop, defs, _def_map) = ir_to_defs(&ir);
+        let cells = city_population_cells(None);
+        let (_meta_pop, defs, _def_map) = compile_cells(cells);
 
         let mut pop_state = ast::Object::phi();
         pop_state = ast::cell_push("city_has_population",
@@ -2507,59 +2612,41 @@ mod tests {
 
     #[test]
     fn join_derivation_equi_join_on_shared_key() {
-        let mut fact_types = HashMap::new();
-        fact_types.insert("a_key".to_string(), FactTypeDef {
-            schema_id: String::new(),
-            reading: "A has Key".to_string(),
-            readings: vec![],
+        let mut cells = empty_cells();
+        cells = with_ft(cells, "a_key", &FactTypeDef {
+            schema_id: String::new(), reading: "A has Key".to_string(), readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "A".to_string(), role_index: 0 },
                 RoleDef { noun_name: "Key".to_string(), role_index: 1 },
             ],
         });
-        fact_types.insert("b_key".to_string(), FactTypeDef {
-            schema_id: String::new(),
-            reading: "B has Key".to_string(),
-            readings: vec![],
+        cells = with_ft(cells, "b_key", &FactTypeDef {
+            schema_id: String::new(), reading: "B has Key".to_string(), readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "B".to_string(), role_index: 0 },
                 RoleDef { noun_name: "Key".to_string(), role_index: 1 },
             ],
         });
-        fact_types.insert("derived".to_string(), FactTypeDef {
-            schema_id: String::new(),
-            reading: "A is matched to B".to_string(),
-            readings: vec![],
+        cells = with_ft(cells, "derived", &FactTypeDef {
+            schema_id: String::new(), reading: "A is matched to B".to_string(), readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "A".to_string(), role_index: 0 },
                 RoleDef { noun_name: "B".to_string(), role_index: 1 },
             ],
         });
+        cells = with_derivation(cells, &DerivationRuleDef {
+            id: "join1".to_string(),
+            text: "A matches B on Key".to_string(),
+            antecedent_fact_type_ids: vec!["a_key".to_string(), "b_key".to_string()],
+            consequent_fact_type_id: "derived".to_string(),
+            kind: DerivationKind::Join,
+            join_on: vec!["Key".to_string()],
+            match_on: vec![],
+            consequent_bindings: vec!["A".to_string(), "B".to_string()],
+            antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![], unresolved_clauses: vec![],
+        });
 
-        let ir = Domain {
-            nouns: HashMap::new(),
-            fact_types,
-            constraints: vec![],
-            state_machines: HashMap::new(),
-            derivation_rules: vec![DerivationRuleDef {
-                id: "join1".to_string(),
-                text: "A matches B on Key".to_string(),
-                antecedent_fact_type_ids: vec!["a_key".to_string(), "b_key".to_string()],
-                consequent_fact_type_id: "derived".to_string(),
-                kind: DerivationKind::Join,
-                join_on: vec!["Key".to_string()],
-                match_on: vec![],
-                consequent_bindings: vec!["A".to_string(), "B".to_string()],
-                antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![], unresolved_clauses: vec![],
-            }],
-            general_instance_facts: vec![],
-            subtypes: HashMap::new(), enum_values: HashMap::new(),
-            ref_schemes: HashMap::new(),
-            named_spans: HashMap::new(), autofill_spans: vec![],
-            cells: HashMap::new(),
-        };
-
-        let (_meta_pop, defs, _def_map) = ir_to_defs(&ir);
+        let (_meta_pop, defs, _def_map) = compile_cells(cells);
 
         let mut pop_state = ast::Object::phi();
         pop_state = ast::cell_push("a_key", ast::fact_from_pairs(&[("A", "a1"), ("Key", "k1")]), &pop_state);
@@ -2579,68 +2666,48 @@ mod tests {
 
     #[test]
     fn join_derivation_entity_consistency_across_fact_types() {
-        let mut fact_types = HashMap::new();
-        fact_types.insert("x_key".to_string(), FactTypeDef {
-            schema_id: String::new(),
-            reading: "X has Key".to_string(),
-            readings: vec![],
+        let mut cells = empty_cells();
+        cells = with_ft(cells, "x_key", &FactTypeDef {
+            schema_id: String::new(), reading: "X has Key".to_string(), readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "X".to_string(), role_index: 0 },
                 RoleDef { noun_name: "Key".to_string(), role_index: 1 },
             ],
         });
-        fact_types.insert("x_label".to_string(), FactTypeDef {
-            schema_id: String::new(),
-            reading: "X has Label".to_string(),
-            readings: vec![],
+        cells = with_ft(cells, "x_label", &FactTypeDef {
+            schema_id: String::new(), reading: "X has Label".to_string(), readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "X".to_string(), role_index: 0 },
                 RoleDef { noun_name: "Label".to_string(), role_index: 1 },
             ],
         });
-        fact_types.insert("y_key".to_string(), FactTypeDef {
-            schema_id: String::new(),
-            reading: "Y has Key".to_string(),
-            readings: vec![],
+        cells = with_ft(cells, "y_key", &FactTypeDef {
+            schema_id: String::new(), reading: "Y has Key".to_string(), readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "Y".to_string(), role_index: 0 },
                 RoleDef { noun_name: "Key".to_string(), role_index: 1 },
             ],
         });
-        fact_types.insert("result".to_string(), FactTypeDef {
-            schema_id: String::new(),
-            reading: "Y is resolved to X".to_string(),
-            readings: vec![],
+        cells = with_ft(cells, "result", &FactTypeDef {
+            schema_id: String::new(), reading: "Y is resolved to X".to_string(), readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "Y".to_string(), role_index: 0 },
                 RoleDef { noun_name: "X".to_string(), role_index: 1 },
             ],
         });
+        cells = with_derivation(cells, &DerivationRuleDef {
+            id: "join2".to_string(),
+            text: "Y resolves to X via Key".to_string(),
+            antecedent_fact_type_ids: vec!["y_key".to_string(), "x_key".to_string(), "x_label".to_string()],
+            consequent_fact_type_id: "result".to_string(),
+            kind: DerivationKind::Join,
+            join_on: vec!["Key".to_string(), "X".to_string()],
+            match_on: vec![],
+            consequent_bindings: vec!["Y".to_string(), "X".to_string()],
+            antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![], unresolved_clauses: vec![],
+        });
 
-        let ir = Domain {
-            nouns: HashMap::new(),
-            fact_types,
-            constraints: vec![],
-            state_machines: HashMap::new(),
-            derivation_rules: vec![DerivationRuleDef {
-                id: "join2".to_string(),
-                text: "Y resolves to X via Key".to_string(),
-                antecedent_fact_type_ids: vec!["y_key".to_string(), "x_key".to_string(), "x_label".to_string()],
-                consequent_fact_type_id: "result".to_string(),
-                kind: DerivationKind::Join,
-                join_on: vec!["Key".to_string(), "X".to_string()],
-                match_on: vec![],
-                consequent_bindings: vec!["Y".to_string(), "X".to_string()],
-                antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![], unresolved_clauses: vec![],
-            }],
-            general_instance_facts: vec![],
-            subtypes: HashMap::new(), enum_values: HashMap::new(),
-            ref_schemes: HashMap::new(),
-            named_spans: HashMap::new(), autofill_spans: vec![],
-            cells: HashMap::new(),
-        };
-
-        let (_meta_pop, defs, _def_map) = ir_to_defs(&ir);
+        let (_meta_pop, defs, _def_map) = compile_cells(cells);
 
         let mut pop_state = ast::Object::phi();
         pop_state = ast::cell_push("x_key", ast::fact_from_pairs(&[("X", "x1"), ("Key", "k1")]), &pop_state);
@@ -2658,59 +2725,41 @@ mod tests {
 
     #[test]
     fn join_derivation_match_on_containment() {
-        let mut fact_types = HashMap::new();
-        fact_types.insert("a_name".to_string(), FactTypeDef {
-            schema_id: String::new(),
-            reading: "A has Full Name".to_string(),
-            readings: vec![],
+        let mut cells = empty_cells();
+        cells = with_ft(cells, "a_name", &FactTypeDef {
+            schema_id: String::new(), reading: "A has Full Name".to_string(), readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "A".to_string(), role_index: 0 },
                 RoleDef { noun_name: "Full Name".to_string(), role_index: 1 },
             ],
         });
-        fact_types.insert("b_name".to_string(), FactTypeDef {
-            schema_id: String::new(),
-            reading: "B has Short Name".to_string(),
-            readings: vec![],
+        cells = with_ft(cells, "b_name", &FactTypeDef {
+            schema_id: String::new(), reading: "B has Short Name".to_string(), readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "B".to_string(), role_index: 0 },
                 RoleDef { noun_name: "Short Name".to_string(), role_index: 1 },
             ],
         });
-        fact_types.insert("matched".to_string(), FactTypeDef {
-            schema_id: String::new(),
-            reading: "B is matched to A".to_string(),
-            readings: vec![],
+        cells = with_ft(cells, "matched", &FactTypeDef {
+            schema_id: String::new(), reading: "B is matched to A".to_string(), readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "B".to_string(), role_index: 0 },
                 RoleDef { noun_name: "A".to_string(), role_index: 1 },
             ],
         });
+        cells = with_derivation(cells, &DerivationRuleDef {
+            id: "match1".to_string(),
+            text: "B matches A by name containment".to_string(),
+            antecedent_fact_type_ids: vec!["a_name".to_string(), "b_name".to_string()],
+            consequent_fact_type_id: "matched".to_string(),
+            kind: DerivationKind::Join,
+            join_on: vec![],
+            match_on: vec![("Full Name".to_string(), "Short Name".to_string())],
+            consequent_bindings: vec!["B".to_string(), "A".to_string()],
+            antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![], unresolved_clauses: vec![],
+        });
 
-        let ir = Domain {
-            nouns: HashMap::new(),
-            fact_types,
-            constraints: vec![],
-            state_machines: HashMap::new(),
-            derivation_rules: vec![DerivationRuleDef {
-                id: "match1".to_string(),
-                text: "B matches A by name containment".to_string(),
-                antecedent_fact_type_ids: vec!["a_name".to_string(), "b_name".to_string()],
-                consequent_fact_type_id: "matched".to_string(),
-                kind: DerivationKind::Join,
-                join_on: vec![],
-                match_on: vec![("Full Name".to_string(), "Short Name".to_string())],
-                consequent_bindings: vec!["B".to_string(), "A".to_string()],
-                antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![], unresolved_clauses: vec![],
-            }],
-            general_instance_facts: vec![],
-            subtypes: HashMap::new(), enum_values: HashMap::new(),
-            ref_schemes: HashMap::new(),
-            named_spans: HashMap::new(), autofill_spans: vec![],
-            cells: HashMap::new(),
-        };
-
-        let (_meta_pop, defs, _def_map) = ir_to_defs(&ir);
+        let (_meta_pop, defs, _def_map) = compile_cells(cells);
 
         let mut pop_state = ast::Object::phi();
         pop_state = ast::cell_push("a_name", ast::fact_from_pairs(&[("A", "a1"), ("Full Name", "Alpha Bravo")]), &pop_state);
@@ -2728,59 +2777,41 @@ mod tests {
 
     #[test]
     fn join_derivation_no_match_produces_nothing() {
-        let mut fact_types = HashMap::new();
-        fact_types.insert("a_key".to_string(), FactTypeDef {
-            schema_id: String::new(),
-            reading: "A has Key".to_string(),
-            readings: vec![],
+        let mut cells = empty_cells();
+        cells = with_ft(cells, "a_key", &FactTypeDef {
+            schema_id: String::new(), reading: "A has Key".to_string(), readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "A".to_string(), role_index: 0 },
                 RoleDef { noun_name: "Key".to_string(), role_index: 1 },
             ],
         });
-        fact_types.insert("b_key".to_string(), FactTypeDef {
-            schema_id: String::new(),
-            reading: "B has Key".to_string(),
-            readings: vec![],
+        cells = with_ft(cells, "b_key", &FactTypeDef {
+            schema_id: String::new(), reading: "B has Key".to_string(), readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "B".to_string(), role_index: 0 },
                 RoleDef { noun_name: "Key".to_string(), role_index: 1 },
             ],
         });
-        fact_types.insert("derived".to_string(), FactTypeDef {
-            schema_id: String::new(),
-            reading: "A matches B".to_string(),
-            readings: vec![],
+        cells = with_ft(cells, "derived", &FactTypeDef {
+            schema_id: String::new(), reading: "A matches B".to_string(), readings: vec![],
             roles: vec![
                 RoleDef { noun_name: "A".to_string(), role_index: 0 },
                 RoleDef { noun_name: "B".to_string(), role_index: 1 },
             ],
         });
+        cells = with_derivation(cells, &DerivationRuleDef {
+            id: "j".to_string(),
+            text: "join".to_string(),
+            antecedent_fact_type_ids: vec!["a_key".to_string(), "b_key".to_string()],
+            consequent_fact_type_id: "derived".to_string(),
+            kind: DerivationKind::Join,
+            join_on: vec!["Key".to_string()],
+            match_on: vec![],
+            consequent_bindings: vec!["A".to_string(), "B".to_string()],
+            antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![], unresolved_clauses: vec![],
+        });
 
-        let ir = Domain {
-            nouns: HashMap::new(),
-            fact_types,
-            constraints: vec![],
-            state_machines: HashMap::new(),
-            derivation_rules: vec![DerivationRuleDef {
-                id: "j".to_string(),
-                text: "join".to_string(),
-                antecedent_fact_type_ids: vec!["a_key".to_string(), "b_key".to_string()],
-                consequent_fact_type_id: "derived".to_string(),
-                kind: DerivationKind::Join,
-                join_on: vec!["Key".to_string()],
-                match_on: vec![],
-                consequent_bindings: vec!["A".to_string(), "B".to_string()],
-                antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![], unresolved_clauses: vec![],
-            }],
-            general_instance_facts: vec![],
-            subtypes: HashMap::new(), enum_values: HashMap::new(),
-            ref_schemes: HashMap::new(),
-            named_spans: HashMap::new(), autofill_spans: vec![],
-            cells: HashMap::new(),
-        };
-
-        let (_meta_pop, defs, _def_map) = ir_to_defs(&ir);
+        let (_meta_pop, defs, _def_map) = compile_cells(cells);
 
         let mut pop_state = ast::Object::phi();
         pop_state = ast::cell_push("a_key", ast::fact_from_pairs(&[("A", "a1"), ("Key", "k1")]), &pop_state);
@@ -2793,14 +2824,13 @@ mod tests {
         assert_eq!(derived_count, 0, "No match should produce no derivation");
     }
 
-    fn make_forbidden_text_ir(enum_vals: Vec<String>) -> Domain {
-        let mut ir = empty_ir();
+    fn make_forbidden_text_cells(enum_vals: Vec<String>) -> S {
+        let mut cells = empty_cells();
         let pt = "ProhibitedText";
         let sr = "SupportResponse";
-        ir.nouns.insert(pt.to_string(), make_noun("value"));
-        ir.enum_values.insert(pt.to_string(), enum_vals);
-        ir.nouns.insert(sr.to_string(), make_noun("entity"));
-        ir.fact_types.insert("ft1".to_string(), FactTypeDef {
+        cells = with_enum_values(cells, pt, "value", &enum_vals);
+        cells = with_noun(cells, sr, &make_noun("entity"));
+        cells = with_ft(cells, "ft1", &FactTypeDef {
             schema_id: String::new(),
             reading: format!("{} contains {}", sr, pt),
             readings: vec![],
@@ -2809,7 +2839,7 @@ mod tests {
                 RoleDef { noun_name: pt.to_string(), role_index: 1 },
             ],
         });
-        ir.constraints.push(ConstraintDef {
+        cells = with_constraint(cells, &ConstraintDef {
             id: "c1".to_string(),
             kind: "UC".to_string(),
             modality: "Deontic".to_string(),
@@ -2822,15 +2852,15 @@ mod tests {
             min_occurrence: None,
             max_occurrence: None,
         });
-        ir
+        cells
     }
 
     #[test]
     fn test_forbidden_text_detected() {
         let endash = core::char::from_u32(0x2013).unwrap().to_string();
         let emdash_s = core::char::from_u32(0x2014).unwrap().to_string();
-        let ir = make_forbidden_text_ir(vec![endash, emdash_s]);
-        let (_meta_state, defs, def_map) = ir_to_defs(&ir);
+        let cells = make_forbidden_text_cells(vec![endash, emdash_s]);
+        let (_meta_state, defs, def_map) = compile_cells(cells);
         let emdash = core::char::from_u32(0x2014).unwrap();
         let text: String = ['H','e','l','l','o',' ',emdash,' ','h','o','w',' ','c','a','n',' ','I',' ','h','e','l','p','?'].iter().collect();
         let result = eval_constraints_defs(&defs, &def_map, &text, None, &empty_state());
@@ -2841,8 +2871,8 @@ mod tests {
     #[test]
     fn test_forbidden_text_clean() {
         let endash = core::char::from_u32(0x2013).unwrap().to_string();
-        let ir = make_forbidden_text_ir(vec![endash]);
-        let (_meta_state, defs, def_map) = ir_to_defs(&ir);
+        let cells = make_forbidden_text_cells(vec![endash]);
+        let (_meta_state, defs, def_map) = compile_cells(cells);
         let result = eval_constraints_defs(&defs, &def_map, "Hello, how can I help you today?", None, &empty_state());
         assert!(result.is_empty());
     }
