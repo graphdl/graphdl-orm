@@ -1529,6 +1529,7 @@ pub(crate) fn domain_data_from_state(state: &crate::ast::Object) -> DomainData {
 
     // Temporary Domain for re-resolve only. Dies at end of this block.
     let resolved_rules = {
+        use crate::parse_forml2::Domain;
         let mut tmp = Domain {
             domain: String::new(), nouns: nouns.clone(), fact_types: fact_types.clone(),
             constraints: vec![], derivation_rules, subtypes: subtypes.clone(),
@@ -1546,7 +1547,8 @@ pub(crate) fn domain_data_from_state(state: &crate::ast::Object) -> DomainData {
 
 /// Compile from a Domain directly (used by tests that build Domain structs).
 /// Converts Domain fields into DomainData without a state round-trip.
-pub(crate) fn compile_from_domain(ir: &Domain) -> CompiledModel {
+#[cfg(test)]
+pub(crate) fn compile_from_domain(ir: &crate::parse_forml2::Domain) -> CompiledModel {
     let data = DomainData {
         nouns: ir.nouns.clone(),
         fact_types: ir.fact_types.clone(),
@@ -4581,6 +4583,7 @@ pub fn generate_derivation_triggers(
 mod schema_tests {
     use super::*;
     use crate::ast::{self, Object};
+    use crate::parse_forml2::Domain;
 
     fn make_ir_with_fact_type(id: &str, reading: &str, roles: Vec<(&str, usize)>) -> Domain {
         let mut fact_types = HashMap::new();

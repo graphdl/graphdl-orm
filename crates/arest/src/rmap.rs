@@ -673,6 +673,7 @@ pub fn rmap_cell_map(state: &crate::ast::Object) -> HashMap<String, String> {
 mod tests {
     use super::*;
     use crate::types::*;
+    use crate::parse_forml2::Domain;
 
     fn to_state(ir: &Domain) -> crate::ast::Object {
         crate::parse_forml2::domain_to_state(ir)

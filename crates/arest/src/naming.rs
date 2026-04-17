@@ -86,15 +86,18 @@ fn split_noun(name: &str) -> Vec<String> {
 /// Resolve an entity ID from its data using the noun's reference scheme.
 ///
 /// Given a noun name and entity data fields, looks up the noun's reference
-/// scheme in the compiled IR and extracts the matching field value as the ID.
+/// scheme in the compiled state and extracts the matching field value as the ID.
 ///
 /// Returns None if no reference scheme, ref scheme is "id", or no matching field.
 pub fn resolve_entity_id(
-    ir: &crate::types::Domain,
+    state: &crate::ast::Object,
     noun_name: &str,
     fields: &hashbrown::HashMap<String, String>,
 ) -> Option<String> {
-    let _noun_def = ir.nouns.get(noun_name)?;
+    // Guard: noun must exist in the Noun cell.
+    let noun_cell = crate::ast::fetch_or_phi("Noun", state);
+    let _noun_def = noun_cell.as_seq()?.iter()
+        .find(|n| crate::ast::binding(n, "name") == Some(noun_name))?;
     // Reference scheme is not stored in the IR nouns directly -- it's in the
     // fact types where this noun plays a role with a value-type noun.
     // For now, check if any fact type has this noun as subject with a value-type object.

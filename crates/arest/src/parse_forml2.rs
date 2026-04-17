@@ -12,6 +12,36 @@
 
 use crate::types::*;
 use hashbrown::HashMap;
+
+/// Parse-time accumulator. NOT a public type. Lives here because
+/// the parser is the only producer; every consumer reads Object state.
+#[derive(Debug, Clone, Default)]
+#[cfg_attr(feature = "std-deps", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "std-deps", serde(rename_all = "camelCase"))]
+pub(crate) struct Domain {
+    #[allow(dead_code)]
+    pub domain: String,
+    pub nouns: HashMap<String, NounDef>,
+    pub fact_types: HashMap<String, FactTypeDef>,
+    pub constraints: Vec<ConstraintDef>,
+    pub state_machines: HashMap<String, StateMachineDef>,
+    #[cfg_attr(feature = "std-deps", serde(default))]
+    pub derivation_rules: Vec<DerivationRuleDef>,
+    #[cfg_attr(feature = "std-deps", serde(default))]
+    pub general_instance_facts: Vec<GeneralInstanceFact>,
+    #[cfg_attr(feature = "std-deps", serde(default))]
+    pub subtypes: HashMap<String, String>,
+    #[cfg_attr(feature = "std-deps", serde(default))]
+    pub enum_values: HashMap<String, Vec<String>>,
+    #[cfg_attr(feature = "std-deps", serde(default))]
+    pub ref_schemes: HashMap<String, Vec<String>>,
+    #[cfg_attr(feature = "std-deps", serde(default))]
+    pub objectifications: HashMap<String, String>,
+    #[cfg_attr(feature = "std-deps", serde(default))]
+    pub named_spans: HashMap<String, Vec<String>>,
+    #[cfg_attr(feature = "std-deps", serde(default))]
+    pub autofill_spans: Vec<String>,
+}
 #[allow(unused_imports)]
 use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 
@@ -3299,7 +3329,7 @@ It is obligatory that each Support Response conforms to Pricing Model.";
     }
 
     /// Helper: compile IR to defs, then evaluate constraints via defs path.
-    fn eval_deontic_defs(ir: &crate::types::Domain, text: &str) -> Vec<crate::types::Violation> {
+    fn eval_deontic_defs(ir: &Domain, text: &str) -> Vec<crate::types::Violation> {
         let state = domain_to_state(ir);
         let defs = crate::compile::compile_to_defs_state(&state);
         let empty_state = crate::ast::Object::phi();

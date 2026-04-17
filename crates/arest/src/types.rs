@@ -4,40 +4,8 @@ use hashbrown::HashMap;
 #[allow(unused_imports)]
 use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 
-// ── Domain: the parsed result of FORML2 readings ────────────────────
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct Domain {
-    #[allow(dead_code)] // deserialized from JSON, read by JS callers
-    pub domain: String,
-    pub nouns: HashMap<String, NounDef>,
-    pub fact_types: HashMap<String, FactTypeDef>,
-    pub constraints: Vec<ConstraintDef>,
-    pub state_machines: HashMap<String, StateMachineDef>,
-    #[serde(default)]
-    pub derivation_rules: Vec<DerivationRuleDef>,
-    #[serde(default)]
-    pub general_instance_facts: Vec<GeneralInstanceFact>,
-    /// child noun → parent noun (subtype relationships)
-    #[serde(default)]
-    pub subtypes: HashMap<String, String>,
-    /// noun name → enum values
-    #[serde(default)]
-    pub enum_values: HashMap<String, Vec<String>>,
-    /// noun name → reference scheme parts
-    #[serde(default)]
-    pub ref_schemes: HashMap<String, Vec<String>>,
-    /// objectified noun → fact type reading
-    #[serde(default)]
-    pub objectifications: HashMap<String, String>,
-    /// Named constraint spans: span_name → role nouns
-    #[serde(default)]
-    pub named_spans: HashMap<String, Vec<String>>,
-    /// Span names with autofill enabled
-    #[serde(default)]
-    pub autofill_spans: Vec<String>,
-}
+// Domain struct moved to parse_forml2.rs (#211) — it is a parse-time
+// accumulator, not a public type. Re-exported as pub(crate) from there.
 
 /// x̄ — a constant asserted into P.
 /// Subject noun 'value' predicate object 'value'.

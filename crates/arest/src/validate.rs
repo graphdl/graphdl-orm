@@ -9,14 +9,15 @@
 // The engine validates schemas using the same constraint evaluator it uses
 // for domain logic. The readings ARE the validation rules.
 
-use hashbrown::HashMap;
-use crate::types::*;
+// types used in test-only code via crate::parse_forml2::Domain
 #[allow(unused_imports)]
 use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 
 /// Convert a domain's Domain into an Object state of core metamodel facts.
-pub fn ir_to_metamodel_state(ir: &Domain) -> crate::ast::Object {
+#[cfg(test)]
+pub fn ir_to_metamodel_state(ir: &crate::parse_forml2::Domain) -> crate::ast::Object {
     use crate::ast::{Object, cell_push, fact_from_pairs};
+    use hashbrown::HashMap;
     // foldl(cell_push, phi, α(noun → fact)) for each category
     let state = ir.nouns.iter().fold(Object::phi(), |acc, (name, def)|
         cell_push("Noun has Object Type", fact_from_pairs(&[("Noun", name), ("Object Type", &def.object_type)]), &acc));
@@ -69,6 +70,9 @@ pub fn ir_to_metamodel_state(ir: &Domain) -> crate::ast::Object {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hashbrown::HashMap;
+    use crate::types::*;
+    use crate::parse_forml2::Domain;
 
     fn simple_ir() -> Domain {
         let mut ir = Domain {
