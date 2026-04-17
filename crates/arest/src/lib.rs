@@ -66,7 +66,7 @@ pub mod evaluate;
 #[cfg(not(feature = "no_std"))]
 pub mod query;
 #[cfg(not(feature = "no_std"))]
-pub mod induce;
+// induce.rs deleted — zero production callers, tests were self-referential.
 #[cfg(not(feature = "no_std"))]
 pub mod rmap;
 #[cfg(not(feature = "no_std"))]
@@ -78,7 +78,7 @@ pub mod conceptual_query;
 #[cfg(not(feature = "no_std"))]
 pub mod parse_forml2;
 #[cfg(not(feature = "no_std"))]
-pub mod verbalize;
+// verbalize.rs deleted — zero production callers, tests were self-referential.
 #[cfg(not(feature = "no_std"))]
 pub mod command;
 #[cfg(not(feature = "no_std"))]

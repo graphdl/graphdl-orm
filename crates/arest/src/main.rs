@@ -33,7 +33,7 @@ mod conceptual_query;
 #[allow(dead_code)]
 mod parse_forml2;
 #[allow(dead_code)]
-mod verbalize;
+// verbalize module deleted (#211)
 // mod arest was deleted in 5aa1f7e (GraphDL → AREST rebrand).
 // The Command enum + apply_command_defs entry points moved to
 // crate::command; this target pulls command in alongside ast so
@@ -54,7 +54,7 @@ mod check;
 #[allow(dead_code)]
 mod validate;
 #[allow(dead_code)]
-mod induce;
+// induce module deleted (#211)
 #[allow(dead_code)]
 mod crypto;
 #[allow(dead_code)]
