@@ -4627,7 +4627,7 @@ mod schema_tests {
             state_machines: HashMap::new(),
             derivation_rules: vec![], general_instance_facts: vec![],
             subtypes: HashMap::new(), enum_values: HashMap::new(),
-            ref_schemes: HashMap::new(), objectifications: HashMap::new(),
+            ref_schemes: HashMap::new(),
             named_spans: HashMap::new(), autofill_spans: vec![],
             cells: HashMap::new(),
         }
@@ -4763,7 +4763,7 @@ mod schema_tests {
             state_machines: HashMap::new(),
             derivation_rules: vec![], general_instance_facts: vec![],
             subtypes: HashMap::new(), enum_values: HashMap::new(),
-            ref_schemes: HashMap::new(), objectifications: HashMap::new(),
+            ref_schemes: HashMap::new(),
             named_spans: HashMap::new(), autofill_spans: vec![],
             cells: HashMap::new(),
         };
@@ -4823,7 +4823,7 @@ mod schema_tests {
             state_machines: HashMap::new(),
             derivation_rules: vec![], general_instance_facts: vec![],
             subtypes: HashMap::new(), enum_values: HashMap::new(),
-            ref_schemes: HashMap::new(), objectifications: HashMap::new(),
+            ref_schemes: HashMap::new(),
             named_spans: HashMap::new(), autofill_spans: vec![],
             cells: HashMap::new(),
         };
@@ -4886,7 +4886,7 @@ mod schema_tests {
             state_machines: HashMap::new(),
             derivation_rules: vec![], general_instance_facts: vec![],
             subtypes: HashMap::new(), enum_values: HashMap::new(),
-            ref_schemes: HashMap::new(), objectifications: HashMap::new(),
+            ref_schemes: HashMap::new(),
             named_spans: HashMap::new(), autofill_spans: vec![],
             cells: HashMap::new(),
         };
