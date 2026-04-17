@@ -1531,6 +1531,14 @@ pub(crate) fn try_expand_possessive(text: &str, noun_names: &[String]) -> Option
 /// extracted via `split_antecedent_comparator` BEFORE fact-type resolution,
 /// so `has Population >= 1000000` resolves to the base FT `has Population`
 /// with an AntecedentFilter attached restricting that antecedent's population.
+/// Temporal predicates are runtime clock checks with no declared FT.
+fn is_temporal_predicate(clause: &str) -> bool {
+    let l = clause.to_lowercase();
+    l.contains("now is ") || l.contains(" in the past") || l.contains(" in the future")
+        || l.contains("is current") || l.contains("is expired")
+        || l.contains("is fresh") || l.contains("is stale")
+}
+
 fn resolve_derivation_rule(rule: &mut DerivationRuleDef, ir: &Domain, catalog: &SchemaCatalog) {
     // Longest-first noun list for Theorem 1 matching
     let mut noun_names: Vec<String> = ir.nouns.keys().cloned().collect();
@@ -1662,32 +1670,25 @@ fn resolve_derivation_rule(rule: &mut DerivationRuleDef, ir: &Domain, catalog: &
             computed.push(crate::types::ConsequentComputedBinding { role, expr });
             continue;
         }
+        // ── Classify the clause through existing pipelines ───────
+        // Each pipeline already knows its own patterns. We call them
+        // in order; the first match wins. No keyword arrays here.
+
+        // (1) Comparator-stripped FT lookup (direct + hyphen fallback + negation fallback)
         let (stripped, comparator) = split_antecedent_comparator(part);
-
-        // ── Fallback classification for non-FT clause forms ────────
-        // Each check recognizes a valid FORML 2 pattern that doesn't
-        // resolve through the FT catalog. Classified clauses skip the
-        // unresolved list — the checker never sees them.
-
-        // (1) Hyphen-binding: "cached- Timestamp" → "cached Timestamp"
         let dehyphenated = stripped.replace("- ", " ").replace(" -", " ");
         let ft_resolved = resolve_fact_type(&stripped)
-            .or_else(|| if dehyphenated != stripped { resolve_fact_type(&dehyphenated) } else { None });
-
-        // (2) Negation: strip "no "/"not "/"is not "/"has no " and retry
-        let ft_resolved = ft_resolved.or_else(|| {
-            let neg = strip_anaphora(part);
-            let pos = neg.trim_start_matches("no ")
-                .trim_start_matches("not ");
-            let pos2 = neg.replace(" is not ", " is ")
-                .replace(" has no ", " has ")
-                .replace(" does not ", " ");
-            resolve_fact_type(pos)
-                .or_else(|| resolve_fact_type(&pos2))
-        });
+            .or_else(|| (dehyphenated != stripped).then(|| resolve_fact_type(&dehyphenated)).flatten())
+            .or_else(|| {
+                let pos = strip_anaphora(part)
+                    .replace(" is not ", " is ")
+                    .replace(" has no ", " has ")
+                    .replace(" does not ", " ");
+                let pos = pos.trim_start_matches("no ").trim_start_matches("not ");
+                resolve_fact_type(pos)
+            });
 
         if let Some(ft_id) = ft_resolved {
-            // FT resolved (possibly via hyphen/negation fallback)
             if let Some((op, value)) = comparator.clone() {
                 let role = ir.fact_types.get(&ft_id)
                     .and_then(|ft| ft.roles.last())
@@ -1702,51 +1703,30 @@ fn resolve_derivation_rule(rule: &mut DerivationRuleDef, ir: &Domain, catalog: &
             continue;
         }
 
-        // (3) that-anaphora back-reference: "that X has Y" — the FT
-        // was resolved in a prior clause; this clause is a join
-        // continuation, not a new FT reference.
-        let lower = part.to_lowercase();
-        if lower.starts_with("that ") && noun_names.iter().any(|n| lower.contains(&n.to_lowercase())) {
-            continue;
-        }
+        // (2) Comparator already split off a comparison operator —
+        //     split_antecedent_comparator recognized it, even though
+        //     the base FT didn't resolve. The clause IS a comparison.
+        if comparator.is_some() { continue; }
 
-        // (4) Temporal predicates: runtime clock checks
-        if lower.contains("now is ") || lower.contains(" in the past")
-            || lower.contains(" in the future") || lower.contains("is current")
-            || lower.contains("is expired") || lower.contains("is fresh")
-            || lower.contains("is not fresh") || lower.contains("is stale")
-        {
-            continue;
-        }
+        // (3) Aggregate: try_parse_aggregate_clause already knows
+        //     count/sum/avg/min/max + where-clause patterns.
+        if try_parse_aggregate_clause(part, &noun_names).is_some() { continue; }
 
-        // (5) Value-comparison verbs beyond split_antecedent_comparator
-        let cmp_verbs = [" exceeds ", " falls below ", " is within ",
-            " starts with ", " ends with ", " contains ", " matches ",
-            " equals ", " differs from "];
-        if cmp_verbs.iter().any(|v| lower.contains(v)) {
-            continue;
-        }
+        // (4) Computed binding: try_parse_computed_binding already
+        //     knows arithmetic and role-assignment patterns.
+        if try_parse_computed_binding(part, &noun_names).is_some() { continue; }
 
-        // (6) Computed-binding keywords
-        let comp_kw = [" is the concatenation of ", " is composed of ",
-            " is generated as ", " is extracted from ",
-            " is the earliest ", " is the latest ",
-            " is the first ", " is the last ",
-            " plus ", " minus "];
-        if comp_kw.iter().any(|v| lower.contains(v)) {
-            continue;
-        }
+        // (5) that-anaphora: back-reference to a noun bound in a
+        //     prior clause. The join-key detector above already
+        //     collected these; here we just prevent the false warning.
+        if part.trim().starts_with("that ") && noun_names.iter()
+            .any(|n| part.to_lowercase().contains(&n.to_lowercase()))
+        { continue; }
 
-        // (7) Aggregate predicates: "more than one X", "at least N X"
-        if lower.starts_with("more than ") || lower.starts_with("fewer than ")
-            || lower.starts_with("at least ") || lower.starts_with("at most ")
-            || lower.contains(" is the count of ") || lower.contains(" is the sum of ")
-            || lower.contains(" is the avg of ") || lower.contains(" is the min of ")
-            || lower.contains(" is the max of ")
-        {
-            continue;
-        }
+        // (6) Temporal predicates — genuinely new, no existing fn.
+        if is_temporal_predicate(part) { continue; }
 
+        // Nothing classified this clause.
         rule.unresolved_clauses.push(part.to_string());
     }
     rule.antecedent_fact_type_ids = resolved_ids;
