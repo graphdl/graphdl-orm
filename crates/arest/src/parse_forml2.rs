@@ -949,8 +949,13 @@ pub(crate) fn domain_to_state(d: &Domain) -> crate::ast::Object {
 
     // Nouns
     for (name, def) in &d.nouns {
+        let wa = match def.world_assumption {
+            WorldAssumption::Closed => "closed",
+            WorldAssumption::Open => "open",
+        };
         let mut pairs: Vec<(String, String)> = vec![
             ("name".into(), name.clone()), ("objectType".into(), def.object_type.clone()),
+            ("worldAssumption".into(), wa.into()),
         ];
         d.subtypes.get(name).map(|st| pairs.push(("superType".into(), st.clone())));
         let ref_scheme = d.ref_schemes.get(name)
@@ -988,22 +993,46 @@ pub(crate) fn domain_to_state(d: &Domain) -> crate::ast::Object {
             (format!("span{}_factTypeId", i), span.fact_type_id.clone()),
             (format!("span{}_roleIndex", i), span.role_index.to_string()),
         ]));
+        // Lossless: full constraint as JSON (preserves subset_autofill,
+        // min/max_occurrence, clauses, set_comparison_argument_length).
+        #[cfg(feature = "std-deps")]
+        let json_blob = serde_json::to_string(c).unwrap_or_default();
+        #[cfg(feature = "std-deps")]
+        pairs.push(("json".into(), json_blob));
         let refs: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         push(&mut cells, "Constraint", fact_from_pairs(&refs));
     }
 
     // Derivation rules + unresolved-clause diagnostics
     for r in &d.derivation_rules {
-        push(&mut cells, "DerivationRule", fact_from_pairs(&[
+        let mut pairs: Vec<(&str, &str)> = vec![
             ("id", r.id.as_str()), ("text", r.text.as_str()),
             ("consequentFactTypeId", r.consequent_fact_type_id.as_str()),
-        ]));
+        ];
+        // Lossless: full rule as JSON. Read back by domain_data_from_state.
+        #[cfg(feature = "std-deps")]
+        let json_blob = serde_json::to_string(r).unwrap_or_default();
+        #[cfg(feature = "std-deps")]
+        pairs.push(("json", json_blob.as_str()));
+        push(&mut cells, "DerivationRule", fact_from_pairs(&pairs));
         for clause in &r.unresolved_clauses {
             push(&mut cells, "UnresolvedClause", fact_from_pairs(&[
                 ("ruleId", r.id.as_str()), ("ruleText", r.text.as_str()),
                 ("clause", clause.as_str()),
             ]));
         }
+    }
+
+    // State machines — full struct as JSON per machine. Tests build
+    // StateMachineDef directly (bypassing instance-fact path); without
+    // this cell, domain_data_from_state rebuilds from instance facts only
+    // and loses the hand-built SMs.
+    #[cfg(feature = "std-deps")]
+    for (name, sm) in &d.state_machines {
+        let json_blob = serde_json::to_string(sm).unwrap_or_default();
+        push(&mut cells, "StateMachine", fact_from_pairs(&[
+            ("name", name.as_str()), ("json", json_blob.as_str()),
+        ]));
     }
 
     // Instance facts: generic cell + fact-type-specific cell
