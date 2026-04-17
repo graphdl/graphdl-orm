@@ -380,52 +380,55 @@ fn main() {
                 eprintln!("[load] opt-in (App, Generator) pairs: {:?}", opt_in_pairs);
                 eprintln!("[load] generators (set view): {:?}", opted_generators);
 
-                // Fast path: fold all readings (metamodel + user) into a
-                // single Domain IR, then convert to Object state ONCE.
-                // No merge_states loop — O(n) in total content.
+                // Fold all readings (metamodel + user) into Object state.
+                // Each reading parses to its own state; consecutive states
+                // merge via cell concatenation. No Domain struct.
                 parse_forml2::set_bootstrap_mode(true);
                 parse_forml2::set_strict_mode(strict);
                 let all_readings: Vec<(&str, &str)> = METAMODEL_READINGS.iter()
                     .map(|(n, t)| (*n, *t))
                     .chain(readings.iter().map(|(n, t)| (n.as_str(), t.as_str())))
                     .collect();
-                let domain = all_readings.iter().fold(
-                    types::Domain::default(),
-                    |mut merged, (name, text)| {
-                        let ir = match merged.nouns.is_empty() {
-                            true => parse_forml2::parse_markdown(text),
-                            false => parse_forml2::parse_markdown_with_context(text, &merged.nouns, &merged.fact_types),
-                        }.unwrap_or_else(|e| { eprintln!("{}: {}", name, e); std::process::exit(1); });
-                        merged.nouns.extend(ir.nouns);
-                        merged.fact_types.extend(ir.fact_types);
-                        merged.constraints.extend(ir.constraints);
-                        merged.state_machines.extend(ir.state_machines);
-                        merged.derivation_rules.extend(ir.derivation_rules);
-                        merged.general_instance_facts.extend(ir.general_instance_facts);
-                        merged.subtypes.extend(ir.subtypes);
-                        merged.enum_values.extend(ir.enum_values);
-                        merged.ref_schemes.extend(ir.ref_schemes);
-                        merged.objectifications.extend(ir.objectifications);
-                        merged.named_spans.extend(ir.named_spans);
-                        merged.autofill_spans.extend(ir.autofill_spans);
-                        merged
+                let state = all_readings.iter().fold(
+                    ast::Object::phi(),
+                    |merged, (name, text)| {
+                        let this = parse_forml2::parse_to_state_from(text, &merged)
+                            .unwrap_or_else(|e| { eprintln!("{}: {}", name, e); std::process::exit(1); });
+                        ast::merge_states(&merged, &this)
                     },
                 );
                 parse_forml2::set_bootstrap_mode(false);
                 parse_forml2::set_strict_mode(false);
+
+                // Diagnostics: read cell sizes from the Object state.
+                let cell_len = |name: &str| ast::fetch_or_phi(name, &state)
+                    .as_seq().map(|s| s.len()).unwrap_or(0);
                 eprintln!("[load] {} nouns, {} fts, {} instance facts",
-                    domain.nouns.len(), domain.fact_types.len(), domain.general_instance_facts.len());
-                let generator_fts: Vec<_> = domain.fact_types.keys()
-                    .filter(|k| k.to_lowercase().contains("generator") || k.to_lowercase().contains("uses"))
-                    .collect();
+                    cell_len("Noun"), cell_len("FactType"), cell_len("InstanceFact"));
+                let ft_cell = ast::fetch_or_phi("FactType", &state);
+                let generator_fts: Vec<String> = ft_cell.as_seq()
+                    .map(|facts| facts.iter()
+                        .filter_map(|f| ast::binding(f, "id").map(|s| s.to_string()))
+                        .filter(|k| k.to_lowercase().contains("generator") || k.to_lowercase().contains("uses"))
+                        .collect())
+                    .unwrap_or_default();
                 eprintln!("[load] Generator-related FTs: {:?}", generator_fts);
-                let app_ifs: Vec<_> = domain.general_instance_facts.iter()
-                    .filter(|f| f.subject_noun == "App" || f.object_value.to_lowercase().contains("sqlite"))
-                    .map(|f| format!("{}({}).{}={}({})", f.subject_noun, f.subject_value, f.field_name, f.object_noun, f.object_value))
-                    .collect();
+                let inst_cell = ast::fetch_or_phi("InstanceFact", &state);
+                let app_ifs: Vec<String> = inst_cell.as_seq()
+                    .map(|facts| facts.iter()
+                        .filter(|f| ast::binding(f, "subjectNoun") == Some("App")
+                            || ast::binding(f, "objectValue").map(|v| v.to_lowercase().contains("sqlite")).unwrap_or(false))
+                        .map(|f| format!("{}({}).{}={}({})",
+                            ast::binding(f, "subjectNoun").unwrap_or(""),
+                            ast::binding(f, "subjectValue").unwrap_or(""),
+                            ast::binding(f, "fieldName").unwrap_or(""),
+                            ast::binding(f, "objectNoun").unwrap_or(""),
+                            ast::binding(f, "objectValue").unwrap_or("")))
+                        .collect())
+                    .unwrap_or_default();
                 eprintln!("[load] App/sqlite instance facts: {:?}", app_ifs);
                 no_validate.then(|| ast::set_skip_validate(true));
-                let mut state = parse_forml2::domain_to_state(&domain);
+                let mut state = state;
                 // Store (App, Generator) opt-ins as a cell so compile can
                 // emit per-App artifacts (openapi, eventually sqlite/etc.).
                 opt_in_pairs.iter().for_each(|(app, g)| {
@@ -433,12 +436,46 @@ fn main() {
                         ast::fact_from_pairs(&[("App", app.as_str()), ("Generator", g.as_str())]),
                         &state);
                 });
-                // Generate SQL triggers for derivation rules.
+                // Generate SQL triggers for derivation rules. Build the
+                // typed inputs generate_derivation_triggers needs directly
+                // from Object cells — no Domain struct.
                 if opted_generators.iter().any(|g| ["sqlite","postgresql","mysql"].contains(&g.as_str())) {
-                    let sql_tables = crate::rmap::rmap(&domain);
+                    let sql_tables = crate::rmap::rmap(&state);
                     let table_names: std::collections::HashSet<String> = sql_tables.iter()
                         .map(|t| t.name.clone()).collect();
-                    let triggers = compile::generate_derivation_triggers(&domain, &sql_tables, &table_names);
+                    // Derivation rules from cell (id, text, consequentFactTypeId).
+                    // Antecedent resolution happens at compile time — triggers
+                    // only need the consequent FT to key the trigger group.
+                    let rule_cell = ast::fetch_or_phi("DerivationRule", &state);
+                    let derivation_rules: Vec<types::DerivationRuleDef> = rule_cell.as_seq()
+                        .map(|facts| facts.iter().map(|f| types::DerivationRuleDef {
+                            id: ast::binding(f, "id").unwrap_or("").to_string(),
+                            text: ast::binding(f, "text").unwrap_or("").to_string(),
+                            consequent_fact_type_id: ast::binding(f, "consequentFactTypeId").unwrap_or("").to_string(),
+                            antecedent_fact_type_ids: vec![], kind: types::DerivationKind::ModusPonens,
+                            join_on: vec![], match_on: vec![], consequent_bindings: vec![],
+                            antecedent_filters: vec![], consequent_computed_bindings: vec![],
+                            consequent_aggregates: vec![], unresolved_clauses: vec![],
+                        }).collect())
+                        .unwrap_or_default();
+                    // Fact types built from FactType + Role cells.
+                    let role_cell = ast::fetch_or_phi("Role", &state);
+                    let fact_types: hashbrown::HashMap<String, types::FactTypeDef> = ast::fetch_or_phi("FactType", &state).as_seq()
+                        .map(|facts| facts.iter().filter_map(|f| {
+                            let id = ast::binding(f, "id")?.to_string();
+                            let reading = ast::binding(f, "reading").unwrap_or("").to_string();
+                            let roles: Vec<types::RoleDef> = role_cell.as_seq()
+                                .map(|rs| rs.iter()
+                                    .filter(|r| ast::binding(r, "factType") == Some(&id))
+                                    .map(|r| types::RoleDef {
+                                        noun_name: ast::binding(r, "nounName").unwrap_or("").to_string(),
+                                        role_index: ast::binding(r, "position").and_then(|v| v.parse().ok()).unwrap_or(0),
+                                    }).collect())
+                                .unwrap_or_default();
+                            Some((id, types::FactTypeDef { schema_id: String::new(), reading, readings: vec![], roles }))
+                        }).collect())
+                        .unwrap_or_default();
+                    let triggers = compile::generate_derivation_triggers(&derivation_rules, &fact_types, &sql_tables, &table_names);
                     triggers.iter().for_each(|(name, ddl)| {
                         state = ast::cell_push(&format!("sql:trigger:{}", name),
                             ast::Object::atom(ddl), &state);
