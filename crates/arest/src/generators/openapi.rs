@@ -46,8 +46,6 @@ use hashbrown::HashMap;
 
 use crate::ast::{Object, binding, fetch_or_phi};
 use crate::rmap::{self, TableColumn, TableDef};
-#[cfg(test)]
-use crate::parse_forml2::Domain;
 use crate::types::StateMachineDef;
 #[allow(unused_imports)]
 use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
@@ -227,10 +225,8 @@ fn openapi_from_state(state: &Object, app_name: &str) -> serde_json::Value {
 /// `pub(crate)` so `compile.rs` can register the document cell without
 /// round-tripping through state for every App.
 #[cfg(test)]
-pub(crate) fn openapi_for_app(domain: &Domain, app_name: &str) -> serde_json::Value {
-    // Test-only convenience: go through the production Object-state path.
-    // Per #211 there is no separate Domain pipeline.
-    openapi_from_state(&crate::parse_forml2::domain_to_state(domain), app_name)
+pub(crate) fn openapi_for_app(state: &Object, app_name: &str) -> serde_json::Value {
+    openapi_from_state(state, app_name)
 }
 
 /// State-based variant of `app_description`. Reads from the InstanceFact
@@ -751,7 +747,7 @@ mod tests {
 
     #[test]
     fn empty_domain_emits_valid_openapi_3_1_document() {
-        let doc = openapi_for_app(&Domain::default(), "test-app");
+        let doc = openapi_for_app(&Object::phi(), "test-app");
 
         assert_eq!(doc["openapi"], "3.1.0");
         assert_eq!(doc["info"]["version"], "1.0.0");
@@ -765,16 +761,51 @@ mod tests {
             schemas.keys().collect::<Vec<_>>());
     }
 
-    /// Parse a FORML2 snippet into a Domain for tests.
-    /// Using the real parser guarantees the resulting Domain has all the
-    /// invariants RMAP expects (ref schemes, backing fact types, implicit
-    /// uniqueness on reference-scheme roles).
-    fn parse(src: &str) -> Domain {
-        crate::parse_forml2::parse_markdown(src)
+    use crate::ast::fact_from_pairs;
+
+    /// Parse a FORML2 snippet into Object state for tests.
+    fn parse(src: &str) -> Object {
+        crate::parse_forml2::parse_to_state(src)
             .expect("test FORML2 must parse")
     }
 
-    fn organization_with_slug() -> Domain {
+    fn push_instance_fact(
+        mut state: Object, subject_noun: &str, subject_value: &str,
+        field_name: &str, object_noun: &str, object_value: &str,
+    ) -> Object {
+        let inst = fact_from_pairs(&[
+            ("subjectNoun", subject_noun), ("subjectValue", subject_value),
+            ("fieldName", field_name), ("objectNoun", object_noun),
+            ("objectValue", object_value),
+        ]);
+        if let Object::Map(ref mut m) = state {
+            let mut v: Vec<Object> = m.get("InstanceFact")
+                .and_then(|o| o.as_seq())
+                .map(|s| s.to_vec())
+                .unwrap_or_default();
+            v.push(inst);
+            m.insert("InstanceFact".into(), Object::Seq(v.into()));
+        }
+        state
+    }
+
+    fn push_state_machine(
+        mut state: Object, name: &str, sm: &crate::types::StateMachineDef,
+    ) -> Object {
+        let json = serde_json::to_string(sm).unwrap_or_default();
+        let fact = fact_from_pairs(&[("name", name), ("json", json.as_str())]);
+        if let Object::Map(ref mut m) = state {
+            let mut v: Vec<Object> = m.get("StateMachine")
+                .and_then(|o| o.as_seq())
+                .map(|s| s.to_vec())
+                .unwrap_or_default();
+            v.push(fact);
+            m.insert("StateMachine".into(), Object::Seq(v.into()));
+        }
+        state
+    }
+
+    fn organization_with_slug() -> Object {
         // RMAP needs the fact type backing the ref scheme to materialize
         // a column. The Organization(.Slug) declaration is the
         // reference-scheme shorthand; the binary fact + UC is the
@@ -789,9 +820,9 @@ mod tests {
 
     #[test]
     fn entity_schema_properties_come_from_rmap_table_columns() {
-        let domain = organization_with_slug();
+        let state = organization_with_slug();
 
-        let doc = openapi_for_app(&domain, "test-app");
+        let doc = openapi_for_app(&state, "test-app");
         let schema = &doc["components"]["schemas"]["Organization"];
 
         assert_eq!(schema["type"], "object");
@@ -820,9 +851,9 @@ mod tests {
         // Theorem 4 (HATEOAS as Projection) mandates per-entity CRUD routes.
         // The plural slug falls back to snake(noun) + "s" when no
         // `Noun has Plural` instance fact overrides it.
-        let domain = organization_with_slug();
+        let state = organization_with_slug();
 
-        let doc = openapi_for_app(&domain, "test-app");
+        let doc = openapi_for_app(&state, "test-app");
         let paths = doc["paths"].as_object()
             .expect("paths must be an object");
 
@@ -852,16 +883,12 @@ mod tests {
         // override, snake(noun) + "s" mangles most non-regular nouns.
         // The instance fact lives as a GeneralInstanceFact against the
         // metamodel's `Noun has Plural` binary â€” facts all the way down.
-        let mut domain = organization_with_slug();
-        domain.general_instance_facts.push(crate::types::GeneralInstanceFact {
-            subject_noun: "Noun".into(),
-            subject_value: "Organization".into(),
-            field_name: "Plural".into(),
-            object_noun: "Plural".into(),
-            object_value: "orgs".into(),
-        });
+        let state = push_instance_fact(
+            organization_with_slug(),
+            "Noun", "Organization", "Plural", "Plural", "orgs",
+        );
 
-        let doc = openapi_for_app(&domain, "test-app");
+        let doc = openapi_for_app(&state, "test-app");
         let paths = doc["paths"].as_object()
             .expect("paths must be an object");
 
@@ -888,8 +915,7 @@ mod tests {
         // status. They only exist when the noun has a State Machine
         // Definition; a status-less noun has no transitions to project.
         use crate::types::{StateMachineDef, TransitionDef};
-        let mut domain = organization_with_slug();
-        domain.state_machines.insert("Organization".into(), StateMachineDef {
+        let sm = StateMachineDef {
             noun_name: "Organization".into(),
             statuses: vec!["active".into(), "archived".into()],
             transitions: vec![TransitionDef {
@@ -898,9 +924,10 @@ mod tests {
                 event: "archive".into(),
                 guard: None,
             }],
-        });
+        };
+        let state = push_state_machine(organization_with_slug(), "Organization", &sm);
 
-        let doc = openapi_for_app(&domain, "test-app");
+        let doc = openapi_for_app(&state, "test-app");
         let paths = doc["paths"].as_object()
             .expect("paths must be an object");
 
@@ -924,9 +951,9 @@ mod tests {
         // A status-less noun has no transition fact set to project (Thm 4a).
         // Emitting transition routes in that case would advertise an API
         // that cannot be fulfilled â€” the handler would 404 on every call.
-        let domain = organization_with_slug();
+        let state = organization_with_slug();
 
-        let doc = openapi_for_app(&domain, "test-app");
+        let doc = openapi_for_app(&state, "test-app");
         let paths = doc["paths"].as_object()
             .expect("paths must be an object");
 
@@ -946,8 +973,8 @@ mod tests {
         // document must therefore declare a Violation component schema
         // that exposes the reading text as a field so tools generate
         // clients capable of surfacing the original sentence.
-        let domain = organization_with_slug();
-        let doc = openapi_for_app(&domain, "test-app");
+        let state = organization_with_slug();
+        let doc = openapi_for_app(&state, "test-app");
         let schemas = doc["components"]["schemas"].as_object()
             .expect("components.schemas must be an object");
         assert!(schemas.contains_key("Violation"),
@@ -976,8 +1003,8 @@ mod tests {
         // Four top-level keys: data, derived, violations, _links.
         // Not three, not collapsed. This matches the Backus Â§13.3.2
         // representation function and preserves provenance.
-        let domain = organization_with_slug();
-        let doc = openapi_for_app(&domain, "test-app");
+        let state = organization_with_slug();
+        let doc = openapi_for_app(&state, "test-app");
         let item_schema = &doc["paths"]["/organizations/{id}"]["get"]
             ["responses"]["200"]["content"]["application/json"]["schema"];
         assert_eq!(item_schema["type"], "object",
@@ -999,8 +1026,8 @@ mod tests {
     fn list_response_wraps_array_in_envelope_per_theorem_5() {
         // List responses carry the same envelope; `data` is an array.
         // Pagination + query-level violations are reported alongside.
-        let domain = organization_with_slug();
-        let doc = openapi_for_app(&domain, "test-app");
+        let state = organization_with_slug();
+        let doc = openapi_for_app(&state, "test-app");
         let list_schema = &doc["paths"]["/organizations"]["get"]
             ["responses"]["200"]["content"]["application/json"]["schema"];
         assert_eq!(list_schema["type"], "object");
@@ -1024,7 +1051,7 @@ mod tests {
         //
         // `Customer owns Account` â€” Customer and Account each get a
         // navigation toward the other in its path space.
-        let domain = parse("\
+        let state = parse("\
             Customer(.Slug) is an entity type.\n\
             Account(.Slug) is an entity type.\n\
             Slug is a value type.\n\
@@ -1034,7 +1061,7 @@ mod tests {
               Each Account has exactly one Slug.\n\
             Customer owns Account.\n\
         ");
-        let doc = openapi_for_app(&domain, "test-app");
+        let doc = openapi_for_app(&state, "test-app");
         let paths = doc["paths"].as_object().expect("paths must be object");
 
         let c_to_a = "/customers/{id}/accounts";
@@ -1056,14 +1083,14 @@ mod tests {
         // `Employee reports to Employee` â€” both roles on Employee.
         // The forward direction gets a verb-slug path because the
         // other-plural would collide with this plural.
-        let domain = parse("\
+        let state = parse("\
             Employee(.Slug) is an entity type.\n\
             Slug is a value type.\n\
             Employee has Slug.\n\
               Each Employee has exactly one Slug.\n\
             Employee reports to Employee.\n\
         ");
-        let doc = openapi_for_app(&domain, "test-app");
+        let doc = openapi_for_app(&state, "test-app");
         let paths = doc["paths"].as_object().expect("paths must be object");
         let ring_key = "/employees/{id}/reports-to";
         assert!(paths.contains_key(ring_key),
@@ -1078,7 +1105,7 @@ mod tests {
         //   Customer bills Account
         // Each must emit its own route; the dedupe trap would have
         // dropped one. Verb slug distinguishes them.
-        let domain = parse("\
+        let state = parse("\
             Customer(.Slug) is an entity type.\n\
             Account(.Slug) is an entity type.\n\
             Slug is a value type.\n\
@@ -1089,7 +1116,7 @@ mod tests {
             Customer owns Account.\n\
             Customer bills Account.\n\
         ");
-        let doc = openapi_for_app(&domain, "test-app");
+        let doc = openapi_for_app(&state, "test-app");
         let paths = doc["paths"].as_object().expect("paths must be object");
         assert!(paths.contains_key("/customers/{id}/owns-accounts"),
             "verb-slugged route for 'owns' must exist; got: {:?}",
@@ -1103,8 +1130,7 @@ mod tests {
     fn introspection_routes_emit_explain_always_and_actions_when_sm_present(){
         // /explain always. /actions only when the noun has an SM.
         use crate::types::{StateMachineDef, TransitionDef};
-        let mut domain = organization_with_slug();
-        domain.state_machines.insert("Organization".into(), StateMachineDef {
+        let sm = StateMachineDef {
             noun_name: "Organization".into(),
             statuses: vec!["active".into(), "archived".into()],
             transitions: vec![TransitionDef {
@@ -1113,9 +1139,10 @@ mod tests {
                 event: "archive".into(),
                 guard: None,
             }],
-        });
+        };
+        let state = push_state_machine(organization_with_slug(), "Organization", &sm);
 
-        let doc = openapi_for_app(&domain, "test-app");
+        let doc = openapi_for_app(&state, "test-app");
         let paths = doc["paths"].as_object().unwrap();
         assert!(paths.contains_key("/organizations/{id}/explain"),
             "GET /explain must exist per Thm 5; got: {:?}",
@@ -1129,8 +1156,8 @@ mod tests {
     fn explain_route_exists_for_noun_without_state_machine() {
         // No SM: /actions is absent, /explain still present because
         // derivations can exist on any entity regardless of SM.
-        let domain = organization_with_slug();
-        let doc = openapi_for_app(&domain, "test-app");
+        let state = organization_with_slug();
+        let doc = openapi_for_app(&state, "test-app");
         let paths = doc["paths"].as_object().unwrap();
         assert!(paths.contains_key("/organizations/{id}/explain"));
         assert!(!paths.contains_key("/organizations/{id}/actions"),
@@ -1144,8 +1171,7 @@ mod tests {
         // compile as a fact in the `App_uses_Generator` cell. Without
         // that fact, no openapi:* cells are emitted. With it, exactly one
         // `openapi:{snake(app-slug)}` cell is emitted per opted-in App.
-        let domain = organization_with_slug();
-        let base_state = crate::parse_forml2::domain_to_state(&domain);
+        let base_state = organization_with_slug();
 
         let defs_without = crate::compile::compile_to_defs_state(&base_state);
         assert!(
