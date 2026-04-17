@@ -42,7 +42,9 @@ Domain knowledge enters software as natural language requirements, is re-encoded
 
 \section{Introduction}
 
-Software begins as domain knowledge in someone's head. It is re-encoded as schemas, validation logic, state machines, and API routes. When these are distinct artifacts, their equivalence is not preserved by construction.
+Software is increasingly written and consumed by agents. An LLM writing code produces a specification it cannot verify against the resulting executable; an LLM reading an API navigates documentation that may have drifted from the endpoints. In both cases the informal layer between specification and execution is where the agent hallucinates. The rest of this paper shows why that layer need not exist.
+
+Domain knowledge begins in someone's head. It is re-encoded as schemas, validation logic, state machines, and API routes. When these are distinct artifacts, their equivalence is not preserved by construction.
 
 AREST identifies what was never separate to begin with. A FORML\,2 reading is simultaneously a relation schema, a constraint specification, a resource definition, and an FFP object. The compiler does not translate between representations. It recognizes a single object that already occupies all four roles.
 
@@ -62,7 +64,7 @@ An \emph{Applicative REpresentational State Transfer} system is an AST system~\c
 \item The $\mathit{FILE}$ cell contains a population $P = \uparrow\!\mathit{FILE}\!:\!D$, a named set of relations~\cite[Sec.\,1.6]{codd70} whose elements are ORM\,2 elementary facts~\cite[Ch.\,3]{halpin01}
 \item The $\mathit{DEFS}$ cells contain FFP objects~\cite[Sec.\,13.2]{backus78}: readings compiled from FORML\,2 declarations~\cite{halpin01}, and functions registered by the runtime
 \end{itemize}
-The \emph{schema} $S$ is the set of compiled objects in $\mathit{DEFS}$: fact type constructors, constraint objects, derivation rules, and state machine definitions. The representation function $\rho$~\cite[Sec.\,13.3.2]{backus78} maps an object to the function it represents. Given a fact type, $\rho$ looks it up in $\mathit{DEFS}$ and returns the functional form. The system function $\mathit{SYSTEM}\!:\!x = \langle o, D'\rangle$~\cite[Sec.\,14.3.1]{backus78} is defined by the definitions in $D$. REST endpoints are applications of $\mathit{SYSTEM}$ with distinct inputs.
+The \emph{schema} $S$ is the set of compiled objects in $\mathit{DEFS}$: fact type constructors, constraint objects, derivation rules, and state machine definitions. The representation function $\rho$~\cite[Sec.\,13.3.2]{backus78} maps an object to the function it represents. Given a fact type, $\rho$ looks it up in $\mathit{DEFS}$ and returns the functional form. The system function $\mathit{SYSTEM}\!:\!x = \langle o, D'\rangle$~\cite[Sec.\,14.3.1]{backus78} is defined by the definitions in $D$. REST endpoints are applications of $\mathit{SYSTEM}$ with distinct inputs. A reference implementation is available~\cite{arest}.
 \end{definition}
 
 \section{Example}
@@ -396,7 +398,7 @@ Define the \emph{representation} of an entity $e$ in population $P$ under schema
 \cup\; &\{(\rho\,c)\!:\!P \mid c \in S_{\mathit{constraints}}\} \\
 \cup\; &\mathit{links}_{\mathit{full}}(e, n, \mathit{status}(e, P))
 \end{align*}
-Then for every $v \in \mathit{repr}(e, P, S)$, there exists $f \in O$ such that $v = (\rho\,f)\!:\!P$.
+Then for every $v \in \mathit{repr}(e, P, S)$, there exists $f \in O$ such that $v = (\rho\,f)\!:\!P$. Equivalently: no value in the REST representation is produced outside $\rho$.
 \end{theorem}
 
 \begin{proof}
@@ -420,6 +422,10 @@ After applying $\mathit{SYSTEM}$ with operation $\mathit{compile} \circ \mathit{
 \begin{proof}
 Theorem~\ref{thm:grammar} depends on the grammar, not on $D$. Theorem~\ref{thm:spec} depends on injective stateless functions. New definitions enter $\mathit{DEFS}$ via $\downarrow\!\mathit{DEFS}$. Theorems~\ref{thm:complete}--\ref{thm:derive} operate over $P$ and $S$, both of which include the new content. No theorem's proof depends on $D$ being fixed at initialization.
 \end{proof}
+
+\smallskip\noindent\textbf{Remark} (Self-hosting). This is the property the formalism turns on: AREST ingests schemas that extend its own schema, and every theorem in the chain continues to apply. The system is not merely specified by readings; it is extended by them.
+
+\smallskip\noindent\textbf{Remark} (Migration). The compile op is itself a $\mathit{SYSTEM}$ application and subject to $\mathit{validate}$~(\ref{eq:create}). If an ingested schema introduces an alethic constraint that $P$ violates, the ingestion is rejected ($D' = D$). Migration readings that transform $P$ must therefore land in the same ingestion --- as derivation rules, transition triggers, or deontic rather than alethic constraints --- or as a staged sequence whose intermediate readings produce compliant $P$ before the stricter constraint is introduced.
 
 \begin{corollary}[Constraint Consensus]\label{cor:consensus}
 For two peers sharing population $P$, one proposes event $e$ and the other applies $\mathit{validate}$~(\ref{eq:create}) to $P \cup \mathit{resolve}(S, e)$. The event is accepted iff $V$ contains no alethic violation. The constraint set $C_S$ is the consensus predicate.
@@ -494,6 +500,9 @@ T. Halpin and M. Curland, ``Automated Verbalization for ORM 2,'' in \emph{OTM Wo
 
 \bibitem{norma}
 T.~Halpin and M.~Curland, NORMA (Natural Object-Role Modeling Architect), open-source reference implementation, \url{https://github.com/ormsolutions/NORMA}.
+
+\bibitem{arest}
+S.~Lippert, AREST, open-source reference implementation, \url{https://github.com/graphdl/arest}.
 
 \end{thebibliography}
 
