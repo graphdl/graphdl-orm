@@ -992,12 +992,18 @@ pub(crate) fn domain_to_state(d: &Domain) -> crate::ast::Object {
         push(&mut cells, "Constraint", fact_from_pairs(&refs));
     }
 
-    // Derivation rules
+    // Derivation rules + unresolved-clause diagnostics
     for r in &d.derivation_rules {
         push(&mut cells, "DerivationRule", fact_from_pairs(&[
             ("id", r.id.as_str()), ("text", r.text.as_str()),
             ("consequentFactTypeId", r.consequent_fact_type_id.as_str()),
         ]));
+        for clause in &r.unresolved_clauses {
+            push(&mut cells, "UnresolvedClause", fact_from_pairs(&[
+                ("ruleId", r.id.as_str()), ("ruleText", r.text.as_str()),
+                ("clause", clause.as_str()),
+            ]));
+        }
     }
 
     // Instance facts: generic cell + fact-type-specific cell
