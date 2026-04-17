@@ -499,12 +499,12 @@ fn active_generators() -> HashSet<String> { ACTIVE_GENERATORS_GLOBAL.lock().clon
 /// most once regardless of how the opt-in reached the state.
 fn apps_opted_into_generator(
     state: &crate::ast::Object,
-    domain: &Domain,
+    instance_facts: &[crate::types::GeneralInstanceFact],
     generator: &str,
 ) -> Vec<String> {
     let target = generator.to_lowercase();
 
-    let from_gifs: HashSet<String> = domain.general_instance_facts.iter()
+    let from_gifs: HashSet<String> = instance_facts.iter()
         .filter(|f| f.subject_noun == "App"
                  && (f.object_noun == "Generator" || f.field_name == "Generator")
                  && f.object_value.to_lowercase() == target)
@@ -531,11 +531,9 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
     let model = compile(state);
     diag!("[profile] compile: {:?}", t.elapsed());
 
-    // Domain still needed by downstream generators (rmap, openapi, etc.).
-    // compile() builds its own DomainData internally; this is a separate
-    // construction for the generator path. Will be eliminated when
-    // generators migrate to DomainData / direct state access.
-    let domain = state_to_domain(state);
+    // Domain eliminated (#211): all generators below read from cell-based
+    // collections (c_nouns, c_fact_types, c_constraints, etc.) or call
+    // state-based shims (rmap_from_state, rmap_cell_map_from_state).
 
     // ── Cell-based lookups (read from state, not domain) ──────────────
     let noun_cell = fetch_or_phi("Noun", state);
@@ -808,7 +806,7 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
     // Cell sharding: shard:{fact_type_id} → cell_owner (paper Eq. demux).
     // RMAP determines which entity cell owns each fact type.
     // Enables: E_n = Filter(eq ∘ [RMAP, n̄]) : E for per-cell event demux.
-    let shard_map = crate::rmap::rmap_cell_map(&domain);
+    let shard_map = crate::rmap::rmap_cell_map_from_state(state);
     diag!("  [profile] shard map: {} fact types partitioned", shard_map.len());
     defs.extend(shard_map.iter().map(|(ft_id, cell)| {
         (format!("shard:{}", ft_id), Func::constant(Object::atom(cell)))
@@ -938,10 +936,10 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
         }));
 
     // Shared helper: constraints spanning a noun (fn, not closure, to avoid move conflicts)
-    fn noun_constraints_for<'a>(domain: &'a Domain, noun: &str) -> Vec<&'a ConstraintDef> {
-        domain.constraints.iter()
+    fn noun_constraints_for<'a>(constraints: &'a [ConstraintDef], fact_types: &HashMap<String, FactTypeDef>, noun: &str) -> Vec<&'a ConstraintDef> {
+        constraints.iter()
             .filter(|c| c.spans.iter().any(|s| {
-                domain.fact_types.get(&s.fact_type_id)
+                fact_types.get(&s.fact_type_id)
                     .map_or(false, |ft| ft.roles.iter().any(|r| r.noun_name == noun))
             })).collect()
     }
@@ -955,7 +953,7 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
                 Object::atom(&ft.reading),
                 Object::Seq(ft.roles.iter().map(|r| Object::atom(&r.noun_name)).collect()),
             ])).collect());
-        let constraint_texts = Object::Seq(noun_constraints_for(&domain, noun_name).iter()
+        let constraint_texts = Object::Seq(noun_constraints_for(&c_constraints, &c_fact_types, noun_name).iter()
             .map(|c| Object::atom(&c.text)).collect());
         let ref_parts = Object::Seq(c_ref_schemes.get(noun_name)
             .map(|parts| parts.iter().map(|p| Object::atom(p)).collect()).unwrap_or_default());
@@ -985,7 +983,7 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
         .filter(|(name, _)| generators.contains(*name))
         .collect();
     if !active_dialects.is_empty() {
-        let sql_tables = crate::rmap::rmap(&domain);
+        let sql_tables = crate::rmap::rmap_from_state(state);
         defs.extend(sql_tables.iter().flat_map(|table|
             active_dialects.iter().map(move |(name, dialect)|
                 (format!("sql:{}:{}", name, table.name), Func::constant(Object::atom(&generate_ddl(table, dialect))))
@@ -995,10 +993,10 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
 
     // ── Generator 3b: SQL Triggers for derivation rules ────────────
     if !active_dialects.is_empty() {
-        let sql_tables = crate::rmap::rmap(&domain);
+        let sql_tables = crate::rmap::rmap_from_state(state);
         let table_names: hashbrown::HashSet<String> = sql_tables.iter()
             .map(|t| t.name.clone()).collect();
-        let triggers = generate_derivation_triggers(&domain, &sql_tables, &table_names);
+        let triggers = generate_derivation_triggers(&c_derivation_rules, &c_fact_types, &sql_tables, &table_names);
         defs.extend(triggers.into_iter().map(|(name, ddl)| {
             (format!("sql:trigger:{}", name), Func::constant(Object::atom(&ddl)))
         }));
@@ -1025,8 +1023,8 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
     // OpenAPI 3.1 document with the App's identity in `info`.
     //
     // See crate::generators::openapi for the schema/path derivation.
-    apps_opted_into_generator(state, &domain, "openapi").iter().for_each(|app| {
-        let openapi_doc = crate::generators::openapi::openapi_for_app(&domain, app);
+    apps_opted_into_generator(state, &c_instance_facts, "openapi").iter().for_each(|app| {
+        let openapi_doc = crate::generators::openapi::compile_to_openapi(state, app);
         defs.push((
             format!("openapi:{}", crate::rmap::to_snake(app)),
             Func::constant(Object::atom(&openapi_doc.to_string())),
@@ -1108,9 +1106,9 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
         (format!("query:{}", id), Func::Platform(format!("query_ft:{}", id)))
     }));
 
-    // Helpers as fns (not closures) to avoid borrow conflicts with domain
-    fn binary_fts_for<'a>(domain: &'a Domain, noun: &str) -> Vec<&'a FactTypeDef> {
-        domain.fact_types.values()
+    // Helpers as fns (not closures) to avoid borrow conflicts
+    fn binary_fts_for<'a>(fact_types: &'a HashMap<String, FactTypeDef>, noun: &str) -> Vec<&'a FactTypeDef> {
+        fact_types.values()
             .filter(|ft| ft.roles.len() == 2 && ft.roles.iter().any(|r| r.noun_name == noun))
             .collect()
     }
@@ -1120,7 +1118,7 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
     }
     // ── Generator 5: XSD — α(noun → xsd_def) ────────────────────────
     defs.extend(c_nouns.iter().map(|(noun_name, noun_def)| {
-        let fields = Object::Seq(binary_fts_for(&domain, noun_name).iter().map(|ft|
+        let fields = Object::Seq(binary_fts_for(&c_fact_types, noun_name).iter().map(|ft|
             Object::seq(vec![Object::atom(&other_role_of(ft, noun_name)), Object::atom("xs:string")])
         ).collect());
         (format!("xsd:{}", noun_name), Func::constant(Object::seq(vec![
@@ -1132,7 +1130,7 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
 
     // ── Generator 6: DTD — α(noun → dtd_def) ────────────────────────
     defs.extend(c_nouns.iter().map(|(noun_name, _)| {
-        let children: Vec<String> = binary_fts_for(&domain, noun_name).iter()
+        let children: Vec<String> = binary_fts_for(&c_fact_types, noun_name).iter()
             .map(|ft| other_role_of(ft, noun_name).to_string()).collect();
         let child_list = children.join(", ");
         let dtd_text = format!("<!ELEMENT {} ({})>\n{}",
@@ -1145,7 +1143,7 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
 
     // ── Generator 7: OWL — α(noun → owl_def) ──────────────────────────
     defs.extend(c_nouns.iter().map(|(noun_name, noun_def)| {
-        let properties = Object::Seq(binary_fts_for(&domain, noun_name).iter().map(|ft| {
+        let properties = Object::Seq(binary_fts_for(&c_fact_types, noun_name).iter().map(|ft| {
             let other = other_role_of(ft, noun_name);
             let prop_type = match c_nouns.get(&other).map(|n| n.object_type.as_str()) {
                 Some("value") => "DatatypeProperty", _ => "ObjectProperty",
@@ -1174,7 +1172,7 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
 
     // ── Generator 9: EDM — α(noun → edm_def) ──────────────────────────
     defs.extend(c_nouns.iter().map(|(noun_name, noun_def)| {
-        let properties = Object::Seq(binary_fts_for(&domain, noun_name).iter().map(|ft| {
+        let properties = Object::Seq(binary_fts_for(&c_fact_types, noun_name).iter().map(|ft| {
             let other = other_role_of(ft, noun_name);
             let kind = match c_nouns.get(&other).map(|n| n.object_type.as_str()) {
                 Some("entity") => "NavigationProperty", _ => "Property",
@@ -1193,7 +1191,7 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
 
     // ��─ Generator 10: XForms ──────────────────────────────────────────
     defs.extend(c_nouns.iter().map(|(noun_name, _)| {
-        let bindings = Object::Seq(binary_fts_for(&domain, noun_name).iter().filter_map(|ft| {
+        let bindings = Object::Seq(binary_fts_for(&c_fact_types, noun_name).iter().filter_map(|ft| {
             let other = ft.roles.iter().find(|r| r.noun_name != *noun_name)?;
             let control = match c_nouns.get(&other.noun_name).map(|n| n.object_type.as_str()) {
                 Some("value") => "input", _ => "select1",
@@ -1208,10 +1206,10 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
 
     // ── Generator 11: HTML Report ─────────────────────────────────────
     defs.extend(c_nouns.iter().map(|(noun_name, noun_def)| {
-        let fields = Object::Seq(binary_fts_for(&domain, noun_name).iter().map(|ft|
+        let fields = Object::Seq(binary_fts_for(&c_fact_types, noun_name).iter().map(|ft|
             Object::seq(vec![Object::atom(&other_role_of(ft, noun_name)), Object::atom(&ft.reading)])
         ).collect());
-        let constraints = Object::Seq(noun_constraints_for(&domain, noun_name).iter()
+        let constraints = Object::Seq(noun_constraints_for(&c_constraints, &c_fact_types, noun_name).iter()
             .map(|c| Object::atom(&c.text)).collect());
         (format!("html:{}", noun_name), Func::constant(Object::seq(vec![
             Object::seq(vec![Object::atom("title"), Object::atom(noun_name)]),
@@ -1222,7 +1220,7 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
     }));
 
     // ─�� Generator 12: NHibernate Mapping ──────────────────────────────
-    let tables = crate::rmap::rmap(&domain);
+    let tables = crate::rmap::rmap_from_state(state);
     defs.extend(tables.iter().map(|table| {
         let columns = Object::Seq(table.columns.iter().map(|col| Object::seq(vec![
             Object::atom(&col.name), Object::atom(&col.col_type),
@@ -1259,7 +1257,7 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
 
     // ── Generator 14: PLiX ────────────────────────────────────────────
     defs.extend(c_nouns.iter().map(|(noun_name, noun_def)| {
-        let fields = Object::Seq(binary_fts_for(&domain, noun_name).iter().filter_map(|ft| {
+        let fields = Object::Seq(binary_fts_for(&c_fact_types, noun_name).iter().filter_map(|ft| {
             let other = ft.roles.iter().find(|r| r.noun_name != *noun_name)?;
             let clr_type = match c_nouns.get(&other.noun_name).map(|n| n.object_type.as_str()) {
                 Some("value") => "System.String", _ => &other.noun_name,
@@ -1278,7 +1276,7 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
         let readings = Object::Seq(c_fact_types.values()
             .filter(|ft| ft.roles.iter().any(|r| r.noun_name == *noun_name))
             .map(|ft| Object::atom(&ft.reading)).collect());
-        let constraints = Object::Seq(noun_constraints_for(&domain, noun_name).iter()
+        let constraints = Object::Seq(noun_constraints_for(&c_constraints, &c_fact_types, noun_name).iter()
             .map(|c| Object::seq(vec![Object::atom(&c.kind), Object::atom(&c.text)])).collect());
         let transitions = Object::Seq(model.state_machines.iter()
             .filter(|sm| sm.noun_name == *noun_name)
@@ -4466,13 +4464,14 @@ fn generate_ddl(table: &crate::rmap::TableDef, dialect: &SqlDialect) -> String {
 /// on each antecedent table that INSERTs into the consequent table.
 /// Returns Vec<(trigger_group_name, ddl_string)>.
 pub fn generate_derivation_triggers(
-    domain: &Domain,
+    derivation_rules: &[DerivationRuleDef],
+    fact_types: &HashMap<String, FactTypeDef>,
     sql_tables: &[crate::rmap::TableDef],
     table_names: &HashSet<String>,
 ) -> Vec<(String, String)> {
     let mut result = Vec::new();
 
-    for rule in &domain.derivation_rules {
+    for rule in derivation_rules {
         let consequent = &rule.consequent_fact_type_id;
         if consequent.is_empty() || rule.antecedent_fact_type_ids.is_empty() { continue; }
 
@@ -4482,7 +4481,7 @@ pub fn generate_derivation_triggers(
         let consequent_cols: Vec<String> = sql_tables.iter()
             .find(|t| t.name == consequent_table)
             .map(|t| t.columns.iter().map(|c| c.name.clone()).collect())
-            .or_else(|| domain.fact_types.get(consequent).map(|ft|
+            .or_else(|| fact_types.get(consequent).map(|ft|
                 ft.roles.iter().map(|r| crate::rmap::to_snake(&r.noun_name)).collect()))
             .unwrap_or_default();
         if consequent_cols.is_empty() { continue; }
@@ -4508,8 +4507,8 @@ pub fn generate_derivation_triggers(
             let ant_table = crate::rmap::to_snake(ant_ft_id);
             if !table_names.contains(&ant_table) { continue; }
 
-            let ant_ft = match domain.fact_types.get(ant_ft_id) { Some(f) => f, None => continue };
-            let cons_ft = match domain.fact_types.get(consequent) { Some(f) => f, None => continue };
+            let ant_ft = match fact_types.get(ant_ft_id) { Some(f) => f, None => continue };
+            let cons_ft = match fact_types.get(consequent) { Some(f) => f, None => continue };
             let ant_nouns: Vec<&str> = ant_ft.roles.iter().map(|r| r.noun_name.as_str()).collect();
             let cons_nouns: Vec<&str> = cons_ft.roles.iter().map(|r| r.noun_name.as_str()).collect();
 
@@ -4528,13 +4527,13 @@ pub fn generate_derivation_triggers(
                     select_cols.push(format!("NEW.\"{}\"", col));
                 } else {
                     let joined_ant = other_ants.iter().find(|other_id| {
-                        domain.fact_types.get(**other_id)
+                        fact_types.get(**other_id)
                             .map_or(false, |ft| ft.roles.iter().any(|r| r.noun_name == *cons_noun))
                     });
                     if let Some(joined_id) = joined_ant {
                         let joined_table = crate::rmap::to_snake(joined_id);
                         select_cols.push(format!("\"{}\".\"{}\"", joined_table, col));
-                        if let Some(joined_ft) = domain.fact_types.get(*joined_id) {
+                        if let Some(joined_ft) = fact_types.get(*joined_id) {
                             if let Some(shared) = ant_nouns.iter()
                                 .find(|n| joined_ft.roles.iter().any(|r| r.noun_name == **n))
                             {
@@ -4576,7 +4575,7 @@ pub fn generate_derivation_triggers(
         }
     }
 
-    diag!("  [trigger] {} SQL triggers from {} derivation rules", result.len(), domain.derivation_rules.len());
+    diag!("  [trigger] {} SQL triggers from {} derivation rules", result.len(), derivation_rules.len());
     result
 }
 

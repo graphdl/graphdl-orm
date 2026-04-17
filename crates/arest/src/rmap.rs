@@ -505,6 +505,12 @@ pub fn rmap_from_loaded_ir(ir: &Domain) -> Vec<TableDef> {
 ///
 /// The returned map enables event demultiplexing:
 ///   E_n = Filter(eq ∘ [RMAP, n̄]) : E
+/// rmap_cell_map from Object state — no Domain round-trip.
+pub fn rmap_cell_map_from_state(state: &crate::ast::Object) -> HashMap<String, String> {
+    let domain = crate::compile::state_to_domain(state);
+    rmap_cell_map(&domain)
+}
+
 pub fn rmap_cell_map(ir: &Domain) -> HashMap<String, String> {
     let mut map = HashMap::new();
     let noun_name_set: HashSet<String> = ir.nouns.keys().cloned().collect();
