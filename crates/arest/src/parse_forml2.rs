@@ -1663,28 +1663,91 @@ fn resolve_derivation_rule(rule: &mut DerivationRuleDef, ir: &Domain, catalog: &
             continue;
         }
         let (stripped, comparator) = split_antecedent_comparator(part);
-        let Some(ft_id) = resolve_fact_type(&stripped) else {
-            rule.unresolved_clauses.push(part.to_string());
+
+        // ── Fallback classification for non-FT clause forms ────────
+        // Each check recognizes a valid FORML 2 pattern that doesn't
+        // resolve through the FT catalog. Classified clauses skip the
+        // unresolved list — the checker never sees them.
+
+        // (1) Hyphen-binding: "cached- Timestamp" → "cached Timestamp"
+        let dehyphenated = stripped.replace("- ", " ").replace(" -", " ");
+        let ft_resolved = resolve_fact_type(&stripped)
+            .or_else(|| if dehyphenated != stripped { resolve_fact_type(&dehyphenated) } else { None });
+
+        // (2) Negation: strip "no "/"not "/"is not "/"has no " and retry
+        let ft_resolved = ft_resolved.or_else(|| {
+            let neg = strip_anaphora(part);
+            let pos = neg.trim_start_matches("no ")
+                .trim_start_matches("not ");
+            let pos2 = neg.replace(" is not ", " is ")
+                .replace(" has no ", " has ")
+                .replace(" does not ", " ");
+            resolve_fact_type(pos)
+                .or_else(|| resolve_fact_type(&pos2))
+        });
+
+        if let Some(ft_id) = ft_resolved {
+            // FT resolved (possibly via hyphen/negation fallback)
+            if let Some((op, value)) = comparator.clone() {
+                let role = ir.fact_types.get(&ft_id)
+                    .and_then(|ft| ft.roles.last())
+                    .map(|r| r.noun_name.clone())
+                    .unwrap_or_default();
+                filters.push(crate::types::AntecedentFilter {
+                    antecedent_index: resolved_ids.len(),
+                    role, op, value,
+                });
+            }
+            resolved_ids.push(ft_id);
             continue;
-        };
-        if let Some((op, value)) = comparator {
-            // Role = the last-role noun of the resolved fact type. For a
-            // `has X` binary it's the value-carrier; for ternaries the
-            // convention is the numeric-valued role sitting last in the
-            // reading (e.g. `Employee earns Salary in Year` → role=Year is
-            // the outermost, but `Order has Amount >= 100` → role=Amount).
-            let role = ir.fact_types.get(&ft_id)
-                .and_then(|ft| ft.roles.last())
-                .map(|r| r.noun_name.clone())
-                .unwrap_or_default();
-            filters.push(crate::types::AntecedentFilter {
-                antecedent_index: resolved_ids.len(),
-                role,
-                op,
-                value,
-            });
         }
-        resolved_ids.push(ft_id);
+
+        // (3) that-anaphora back-reference: "that X has Y" — the FT
+        // was resolved in a prior clause; this clause is a join
+        // continuation, not a new FT reference.
+        let lower = part.to_lowercase();
+        if lower.starts_with("that ") && noun_names.iter().any(|n| lower.contains(&n.to_lowercase())) {
+            continue;
+        }
+
+        // (4) Temporal predicates: runtime clock checks
+        if lower.contains("now is ") || lower.contains(" in the past")
+            || lower.contains(" in the future") || lower.contains("is current")
+            || lower.contains("is expired") || lower.contains("is fresh")
+            || lower.contains("is not fresh") || lower.contains("is stale")
+        {
+            continue;
+        }
+
+        // (5) Value-comparison verbs beyond split_antecedent_comparator
+        let cmp_verbs = [" exceeds ", " falls below ", " is within ",
+            " starts with ", " ends with ", " contains ", " matches ",
+            " equals ", " differs from "];
+        if cmp_verbs.iter().any(|v| lower.contains(v)) {
+            continue;
+        }
+
+        // (6) Computed-binding keywords
+        let comp_kw = [" is the concatenation of ", " is composed of ",
+            " is generated as ", " is extracted from ",
+            " is the earliest ", " is the latest ",
+            " is the first ", " is the last ",
+            " plus ", " minus "];
+        if comp_kw.iter().any(|v| lower.contains(v)) {
+            continue;
+        }
+
+        // (7) Aggregate predicates: "more than one X", "at least N X"
+        if lower.starts_with("more than ") || lower.starts_with("fewer than ")
+            || lower.starts_with("at least ") || lower.starts_with("at most ")
+            || lower.contains(" is the count of ") || lower.contains(" is the sum of ")
+            || lower.contains(" is the avg of ") || lower.contains(" is the min of ")
+            || lower.contains(" is the max of ")
+        {
+            continue;
+        }
+
+        rule.unresolved_clauses.push(part.to_string());
     }
     rule.antecedent_fact_type_ids = resolved_ids;
     rule.antecedent_filters = filters;
