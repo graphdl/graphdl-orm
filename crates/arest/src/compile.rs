@@ -4606,40 +4606,32 @@ pub fn generate_derivation_triggers(
 #[cfg(test)]
 mod schema_tests {
     use super::*;
-    use crate::ast::{self, Object};
-    use crate::parse_forml2::Domain;
+    use crate::ast::{self, Object, fact_from_pairs};
 
-    fn make_ir_with_fact_type(id: &str, reading: &str, roles: Vec<(&str, usize)>) -> Domain {
-        let mut fact_types = HashMap::new();
-        fact_types.insert(id.to_string(), FactTypeDef {
-            schema_id: String::new(),
-            reading: reading.to_string(),
-            readings: vec![],
-            roles: roles.iter().map(|(name, idx)| RoleDef {
-                noun_name: name.to_string(),
-                role_index: *idx,
-            }).collect(),
-        });
-        Domain {
-            nouns: HashMap::new(),
-            fact_types,
-            constraints: vec![],
-            state_machines: HashMap::new(),
-            derivation_rules: vec![], general_instance_facts: vec![],
-            subtypes: HashMap::new(), enum_values: HashMap::new(),
-            ref_schemes: HashMap::new(),
-            named_spans: HashMap::new(), autofill_spans: vec![],
-            cells: HashMap::new(),
+    /// Build Object state with a single fact type + its roles. Emits
+    /// FactType + Role cells directly (no Domain intermediate).
+    fn make_state_with_fact_type(id: &str, reading: &str, roles: Vec<(&str, usize)>) -> Object {
+        let mut cells: HashMap<String, Vec<Object>> = HashMap::new();
+        let arity = roles.len().to_string();
+        cells.entry("FactType".into()).or_default().push(fact_from_pairs(&[
+            ("id", id), ("reading", reading), ("arity", arity.as_str()),
+        ]));
+        for (name, idx) in &roles {
+            let pos = idx.to_string();
+            cells.entry("Role".into()).or_default().push(fact_from_pairs(&[
+                ("factType", id), ("nounName", *name), ("position", pos.as_str()),
+            ]));
         }
+        Object::Map(cells.into_iter().map(|(k, v)| (k, Object::Seq(v.into()))).collect())
     }
 
     #[test]
     fn role_compiles_to_selector() {
-        let ir = make_ir_with_fact_type(
+        let state = make_state_with_fact_type(
             "ft1", "User has Org Role in Organization",
             vec![("User", 0), ("Org Role", 1), ("Organization", 2)],
         );
-        let model = compile_from_domain(&ir);
+        let model = compile(&state);
         let schema = model.schemas.get("ft1").unwrap();
 
         // Each role becomes a Selector (1-indexed)
@@ -4665,11 +4657,11 @@ mod schema_tests {
 
     #[test]
     fn selector_extracts_individual_role() {
-        let ir = make_ir_with_fact_type(
+        let state = make_state_with_fact_type(
             "ft1", "Organization has Name",
             vec![("Organization", 0), ("Name", 1)],
         );
-        let model = compile_from_domain(&ir);
+        let model = compile(&state);
         let _schema = model.schemas.get("ft1").unwrap();
         let defs = ast::Object::phi();
 
@@ -4687,11 +4679,11 @@ mod schema_tests {
     #[test]
     fn construction_applied_to_population_via_apply_to_all() {
         // alpha(Selector(2)) over a population extracts role 2 from each fact
-        let ir = make_ir_with_fact_type(
+        let state = make_state_with_fact_type(
             "ft1", "OrgMembership is for User",
             vec![("OrgMembership", 0), ("User", 1)],
         );
-        let model = compile_from_domain(&ir);
+        let model = compile(&state);
         let _schema = model.schemas.get("ft1").unwrap();
         let defs = ast::Object::phi();
 
@@ -4727,48 +4719,31 @@ mod schema_tests {
         );
     }
 
+    /// Build Object state with one fact type + one UC constraint on role 0.
+    fn person_has_name_with_uc() -> Object {
+        let mut state = make_state_with_fact_type(
+            "ft1", "Person has Name",
+            vec![("Person", 0), ("Name", 1)],
+        );
+        let uc = ConstraintDef {
+            id: "uc1".into(), kind: "UC".into(), modality: "Alethic".into(),
+            text: "Each Person has at most one Name".into(),
+            spans: vec![SpanDef { fact_type_id: "ft1".into(), role_index: 0, subset_autofill: None }],
+            ..Default::default()
+        };
+        if let Object::Map(ref mut m) = state {
+            m.insert("Constraint".into(), Object::Seq(vec![
+                crate::parse_forml2::constraint_to_fact_test(&uc),
+            ].into()));
+        }
+        state
+    }
+
     #[test]
     fn constraint_func_evaluates_via_ast_apply() {
         // Compile a UC constraint and verify the func field works via ast::apply
-        let mut fact_types = HashMap::new();
-        fact_types.insert("ft1".to_string(), FactTypeDef {
-            schema_id: String::new(),
-            reading: "Person has Name".to_string(),
-            readings: vec![],
-            roles: vec![
-                RoleDef { noun_name: "Person".to_string(), role_index: 0 },
-                RoleDef { noun_name: "Name".to_string(), role_index: 1 },
-            ],
-        });
-        let ir = Domain {
-            nouns: HashMap::new(),
-            fact_types,
-            constraints: vec![ConstraintDef {
-                id: "uc1".to_string(),
-                kind: "UC".to_string(),
-                modality: "Alethic".to_string(),
-                deontic_operator: None,
-                text: "Each Person has at most one Name".to_string(),
-                spans: vec![SpanDef {
-                    fact_type_id: "ft1".to_string(),
-                    role_index: 0,
-                    subset_autofill: None,
-                }],
-                set_comparison_argument_length: None,
-                clauses: None,
-                entity: None,
-                min_occurrence: None,
-                max_occurrence: None,
-            }],
-            state_machines: HashMap::new(),
-            derivation_rules: vec![], general_instance_facts: vec![],
-            subtypes: HashMap::new(), enum_values: HashMap::new(),
-            ref_schemes: HashMap::new(),
-            named_spans: HashMap::new(), autofill_spans: vec![],
-            cells: HashMap::new(),
-        };
-
-        let model = compile_from_domain(&ir);
+        let compile_state = person_has_name_with_uc();
+        let model = compile(&compile_state);
         let constraint = &model.constraints[0];
 
         // Create state WITH a UC violation: Alice has two names
@@ -4790,45 +4765,8 @@ mod schema_tests {
 
     #[test]
     fn constraint_func_no_violation_returns_phi() {
-        let mut fact_types = HashMap::new();
-        fact_types.insert("ft1".to_string(), FactTypeDef {
-            schema_id: String::new(),
-            reading: "Person has Name".to_string(),
-            readings: vec![],
-            roles: vec![
-                RoleDef { noun_name: "Person".to_string(), role_index: 0 },
-                RoleDef { noun_name: "Name".to_string(), role_index: 1 },
-            ],
-        });
-        let ir = Domain {
-            nouns: HashMap::new(),
-            fact_types,
-            constraints: vec![ConstraintDef {
-                id: "uc1".to_string(),
-                kind: "UC".to_string(),
-                modality: "Alethic".to_string(),
-                deontic_operator: None,
-                text: "Each Person has at most one Name".to_string(),
-                spans: vec![SpanDef {
-                    fact_type_id: "ft1".to_string(),
-                    role_index: 0,
-                    subset_autofill: None,
-                }],
-                set_comparison_argument_length: None,
-                clauses: None,
-                entity: None,
-                min_occurrence: None,
-                max_occurrence: None,
-            }],
-            state_machines: HashMap::new(),
-            derivation_rules: vec![], general_instance_facts: vec![],
-            subtypes: HashMap::new(), enum_values: HashMap::new(),
-            ref_schemes: HashMap::new(),
-            named_spans: HashMap::new(), autofill_spans: vec![],
-            cells: HashMap::new(),
-        };
-
-        let model = compile_from_domain(&ir);
+        let compile_state = person_has_name_with_uc();
+        let model = compile(&compile_state);
         let constraint = &model.constraints[0];
 
         // No violation: each person has exactly one name
@@ -4840,18 +4778,17 @@ mod schema_tests {
         let defs = crate::ast::Object::phi();
         let result = crate::ast::apply(&constraint.func, &ctx_obj, &defs);
 
-        // No violations -- should be phi (empty sequence)
         let violations = crate::ast::decode_violations(&result);
         assert_eq!(violations.len(), 0);
     }
 
     #[test]
     fn schema_reading_preserved() {
-        let ir = make_ir_with_fact_type(
+        let state = make_state_with_fact_type(
             "ft1", "Domain Change proposes Reading",
             vec![("Domain Change", 0), ("Reading", 1)],
         );
-        let model = compile_from_domain(&ir);
+        let model = compile(&state);
         let schema = model.schemas.get("ft1").unwrap();
         assert_eq!(schema.reading, "Domain Change proposes Reading");
     }
@@ -4860,38 +4797,20 @@ mod schema_tests {
     fn project_entity_maps_fields_to_schemas() {
         // Simulate an entity with fields that correspond to compiled schemas.
         // The entity "Customer" has fields "name" and "plan".
-        let mut fact_types = HashMap::new();
-        fact_types.insert("schema-uuid-1".to_string(), FactTypeDef {
-            schema_id: String::new(),
-            reading: "Customer has name".to_string(),
-            readings: vec![],
-            roles: vec![
-                RoleDef { noun_name: "Customer".to_string(), role_index: 0 },
-                RoleDef { noun_name: "name".to_string(), role_index: 1 },
-            ],
-        });
-        fact_types.insert("schema-uuid-2".to_string(), FactTypeDef {
-            schema_id: String::new(),
-            reading: "Customer has plan".to_string(),
-            readings: vec![],
-            roles: vec![
-                RoleDef { noun_name: "Customer".to_string(), role_index: 0 },
-                RoleDef { noun_name: "plan".to_string(), role_index: 1 },
-            ],
-        });
-        let ir = Domain {
-            nouns: HashMap::new(),
-            fact_types,
-            constraints: vec![],
-            state_machines: HashMap::new(),
-            derivation_rules: vec![], general_instance_facts: vec![],
-            subtypes: HashMap::new(), enum_values: HashMap::new(),
-            ref_schemes: HashMap::new(),
-            named_spans: HashMap::new(), autofill_spans: vec![],
-            cells: HashMap::new(),
-        };
+        let mut cells: HashMap<String, Vec<Object>> = HashMap::new();
+        cells.insert("FactType".into(), vec![
+            fact_from_pairs(&[("id", "schema-uuid-1"), ("reading", "Customer has name"), ("arity", "2")]),
+            fact_from_pairs(&[("id", "schema-uuid-2"), ("reading", "Customer has plan"), ("arity", "2")]),
+        ]);
+        cells.insert("Role".into(), vec![
+            fact_from_pairs(&[("factType", "schema-uuid-1"), ("nounName", "Customer"), ("position", "0")]),
+            fact_from_pairs(&[("factType", "schema-uuid-1"), ("nounName", "name"), ("position", "1")]),
+            fact_from_pairs(&[("factType", "schema-uuid-2"), ("nounName", "Customer"), ("position", "0")]),
+            fact_from_pairs(&[("factType", "schema-uuid-2"), ("nounName", "plan"), ("position", "1")]),
+        ]);
+        let state = Object::Map(cells.into_iter().map(|(k, v)| (k, Object::Seq(v.into()))).collect());
 
-        let model = compile_from_domain(&ir);
+        let model = compile(&state);
 
         // Verify noun_to_fact_types has both schemas for "Customer" at role 0
         let customer_fts = model.noun_index.noun_to_fact_types.get("Customer").unwrap();
@@ -4919,11 +4838,11 @@ mod schema_tests {
     fn project_entity_unmatched_fields_remain_provisional() {
         // An entity with a field that has no compiled schema should still
         // be projectable (with a provisional string-concatenated ID).
-        let ir = make_ir_with_fact_type(
+        let state = make_state_with_fact_type(
             "ft1", "Order has total",
             vec![("Order", 0), ("total", 1)],
         );
-        let model = compile_from_domain(&ir);
+        let model = compile(&state);
 
         // "total" matches schema ft1. "notes" has no schema.
         let order_fts = model.noun_index.noun_to_fact_types.get("Order").unwrap();
