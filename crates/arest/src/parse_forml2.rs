@@ -1,4 +1,4 @@
-// crates/arest/src/parse_forml2.rs
+﻿// crates/arest/src/parse_forml2.rs
 //
 // FORML 2 Parser -- FFP composition of recognizer functions.
 //
@@ -39,17 +39,24 @@ pub(crate) struct Domain {
     pub(crate) named_spans: HashMap<String, Vec<String>>,
     #[cfg_attr(feature = "std-deps", serde(default))]
     pub(crate) autofill_spans: Vec<String>,
+    /// Object cells produced by apply_action. When non-empty, this is the
+    /// authoritative output of parse â€” the Î¦ of `parse: R â†’ Î¦` (Thm 2).
+    /// Test fixtures that construct Domain literals via Default leave this
+    /// empty; domain_to_state falls back to computing cells from typed
+    /// fields in that case.
+    #[cfg_attr(feature = "std-deps", serde(skip))]
+    pub(crate) cells: HashMap<String, Vec<crate::ast::Object>>,
 }
 #[allow(unused_imports)]
 use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 
-// Bootstrap mode flag — set by lib::create_impl while loading bundled
+// Bootstrap mode flag â€” set by lib::create_impl while loading bundled
 // metamodel readings, so the metamodel namespace guard (#23) is bypassed
 // for cross-file redeclarations within the canonical metamodel. Apps must
 // NOT set this flag; user-domain compiles always hit the guard.
 // Under std, thread_local keeps bootstrap/strict flags per-thread so
 // parallel test threads don't collide. Under no_std (single-core
-// kernel), AtomicBool is fine — there are no parallel test runners.
+// kernel), AtomicBool is fine â€” there are no parallel test runners.
 #[cfg(not(feature = "no_std"))]
 thread_local! {
     static BOOTSTRAP_MODE: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
@@ -288,7 +295,7 @@ fn try_ring(line: &str, noun_names: &[String]) -> Option<ParseAction> {
     }))
 }
 
-/// try_ring_shorthand — ORM 2 intuitive-icon parity for ring constraints.
+/// try_ring_shorthand â€” ORM 2 intuitive-icon parity for ring constraints.
 ///
 /// Accepts terse adjectival form appended to a ring fact-type reading:
 ///   `Category has parent Category is acyclic.`
@@ -324,7 +331,7 @@ fn try_ring_shorthand(line: &str, noun_names: &[String]) -> Option<ParseAction> 
         _               => return None,
     };
     // Ring-shorthand requires the reading to mention the same base noun
-    // at least twice — otherwise it's ambiguous with a bare-adjective
+    // at least twice â€” otherwise it's ambiguous with a bare-adjective
     // claim (`X is symmetric` on some non-fact-type X).
     let base_counts: hashbrown::HashMap<&str, usize> = reading
         .split_whitespace()
@@ -714,10 +721,11 @@ pub(crate) fn parse_markdown_with_context(input: &str, existing_nouns: &HashMap<
         subtypes: HashMap::new(), enum_values: HashMap::new(),
         ref_schemes: HashMap::new(), objectifications: HashMap::new(),
         named_spans: HashMap::new(), autofill_spans: vec![],
+        cells: HashMap::new(),
     };
     parse_into(&mut standalone, input)?;
     // Metamodel namespace guard (#23). Skipped during bundled metamodel
-    // bootstrap — the metamodel is loaded as a series of cross-referencing
+    // bootstrap â€” the metamodel is loaded as a series of cross-referencing
     // files and legitimately redeclares the same reserved nouns.
     if !is_bootstrap_mode() {
         if let Some(reserved) = METAMODEL_NOUNS.iter()
@@ -734,13 +742,14 @@ pub(crate) fn parse_markdown_with_context(input: &str, existing_nouns: &HashMap<
         subtypes: HashMap::new(), enum_values: HashMap::new(),
         ref_schemes: HashMap::new(), objectifications: HashMap::new(),
         named_spans: HashMap::new(), autofill_spans: vec![],
+        cells: HashMap::new(),
     };
     parse_into(&mut ir, input)?;
     Ok(ir)
 }
 
 /// SSRF defense (#25). Reject URLs that point at internal/loopback/link-local
-/// networks, file:// schemes, or internal DNS names. Hardcoded patterns only —
+/// networks, file:// schemes, or internal DNS names. Hardcoded patterns only â€”
 /// no DNS resolution, no network I/O. Called during platform_compile to
 /// validate External System instance facts before they enter state.
 pub fn is_forbidden_url(url: &str) -> bool {
@@ -782,12 +791,12 @@ pub fn is_forbidden_url(url: &str) -> bool {
             match authority.matches(':').count() {
                 0 => authority,
                 1 => authority.split(':').next().unwrap_or(authority),
-                _ => authority, // bare IPv6 — keep colons for ULA / link-local checks
+                _ => authority, // bare IPv6 â€” keep colons for ULA / link-local checks
             }
         }
     };
 
-    // Empty host is bottom-safe — treat as forbidden.
+    // Empty host is bottom-safe â€” treat as forbidden.
     match host_bare.is_empty() {
         true => return true,
         false => {}
@@ -799,7 +808,7 @@ pub fn is_forbidden_url(url: &str) -> bool {
         _ => {}
     }
 
-    // Internal DNS suffixes (case-insensitive — lower already applied)
+    // Internal DNS suffixes (case-insensitive â€” lower already applied)
     let forbidden_suffix = host_bare.ends_with(".local")
         || host_bare.ends_with(".internal")
         || host_bare.ends_with(".localhost");
@@ -834,7 +843,7 @@ pub fn is_forbidden_url(url: &str) -> bool {
         false => {}
     }
 
-    // IPv6 link-local: fe80::/10 — first octet of the address
+    // IPv6 link-local: fe80::/10 â€” first octet of the address
     // is 0xfe and top two bits of the second are 10 (0x80..0xbf).
     // Covers fe80: through febf:.
     let ipv6_linklocal = host_bare.starts_with("fe8")
@@ -909,7 +918,7 @@ pub fn fact_types_from_state(state: &crate::ast::Object) -> HashMap<String, Fact
 }
 
 /// Parse FORML2 readings into an Object state with full context from D.
-/// Extracts nouns and fact types directly from cells — no Domain struct round-trip.
+/// Extracts nouns and fact types directly from cells â€” no Domain struct round-trip.
 pub fn parse_to_state_from(input: &str, d: &crate::ast::Object) -> Result<crate::ast::Object, String> {
     let nouns = nouns_from_state(d);
     let fact_types = fact_types_from_state(d);
@@ -929,12 +938,11 @@ pub fn parse_to_state_with_nouns(input: &str, existing: &crate::ast::Object) -> 
 pub(crate) fn domain_to_state(d: &Domain) -> crate::ast::Object {
     use crate::ast::{Object, fact_from_pairs};
     use hashbrown::{HashMap, HashSet};
-    // Build cells mutably into a HashMap<String, Vec<Object>>, then wrap
-    // in Object::Map at the end. This is O(n) total instead of the
-    // O(n²) that cell_push fold would produce (each push clones the
-    // whole HashMap). At 100+ fact types this drops build time from
-    // ~370ms to single-digit ms.
-    let mut cells: HashMap<String, Vec<Object>> = HashMap::new();
+    // Seed with cells already emitted by apply_action (Constraint,
+    // DerivationRule, etc.). Kinds that need cross-ref resolution (Noun,
+    // FactType, Role, compound-ref-scheme) are emitted below from typed
+    // fields; for write-only kinds already in d.cells, skip re-emission.
+    let mut cells: HashMap<String, Vec<Object>> = d.cells.clone();
     let push = |cells: &mut HashMap<String, Vec<Object>>, name: &str, fact: Object| {
         cells.entry(name.to_string()).or_default().push(fact);
     };
@@ -973,26 +981,30 @@ pub(crate) fn domain_to_state(d: &Domain) -> crate::ast::Object {
         }
     }
 
-    // Constraints
-    for c in &d.constraints {
-        let mut pairs: Vec<(String, String)> = vec![
-            ("id".into(), c.id.clone()), ("kind".into(), c.kind.clone()),
-            ("modality".into(), c.modality.clone()), ("text".into(), c.text.clone()),
-        ];
-        c.deontic_operator.as_ref().map(|op| pairs.push(("deonticOperator".into(), op.clone())));
-        c.entity.as_ref().map(|e| pairs.push(("entity".into(), e.clone())));
-        pairs.extend(c.spans.iter().enumerate().flat_map(|(i, span)| [
-            (format!("span{}_factTypeId", i), span.fact_type_id.clone()),
-            (format!("span{}_roleIndex", i), span.role_index.to_string()),
-        ]));
-        // Lossless: full constraint as JSON (preserves subset_autofill,
-        // min/max_occurrence, clauses, set_comparison_argument_length).
-        #[cfg(feature = "std-deps")]
-        let json_blob = serde_json::to_string(c).unwrap_or_default();
-        #[cfg(feature = "std-deps")]
-        pairs.push(("json".into(), json_blob));
-        let refs: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-        push(&mut cells, "Constraint", fact_from_pairs(&refs));
+    // Constraints: apply_action already emitted these to d.cells during
+    // parse. Test fixtures building Domain literals with non-empty
+    // d.constraints but empty d.cells fall back to serializing here.
+    if !cells.contains_key("Constraint") {
+        for c in &d.constraints {
+            let mut pairs: Vec<(String, String)> = vec![
+                ("id".into(), c.id.clone()), ("kind".into(), c.kind.clone()),
+                ("modality".into(), c.modality.clone()), ("text".into(), c.text.clone()),
+            ];
+            c.deontic_operator.as_ref().map(|op| pairs.push(("deonticOperator".into(), op.clone())));
+            c.entity.as_ref().map(|e| pairs.push(("entity".into(), e.clone())));
+            pairs.extend(c.spans.iter().enumerate().flat_map(|(i, span)| [
+                (format!("span{}_factTypeId", i), span.fact_type_id.clone()),
+                (format!("span{}_roleIndex", i), span.role_index.to_string()),
+            ]));
+            // Lossless: full constraint as JSON (preserves subset_autofill,
+            // min/max_occurrence, clauses, set_comparison_argument_length).
+            #[cfg(feature = "std-deps")]
+            let json_blob = serde_json::to_string(c).unwrap_or_default();
+            #[cfg(feature = "std-deps")]
+            pairs.push(("json".into(), json_blob));
+            let refs: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            push(&mut cells, "Constraint", fact_from_pairs(&refs));
+        }
     }
 
     // Derivation rules + unresolved-clause diagnostics
@@ -1015,7 +1027,7 @@ pub(crate) fn domain_to_state(d: &Domain) -> crate::ast::Object {
         }
     }
 
-    // State machines — full struct as JSON per machine. Tests build
+    // State machines â€” full struct as JSON per machine. Tests build
     // StateMachineDef directly (bypassing instance-fact path); without
     // this cell, domain_data_from_state rebuilds from instance facts only
     // and loses the hand-built SMs.
@@ -1081,13 +1093,14 @@ pub(crate) fn parse_markdown(input: &str) -> Result<Domain, String> {
         subtypes: HashMap::new(), enum_values: HashMap::new(),
         ref_schemes: HashMap::new(), objectifications: HashMap::new(),
         named_spans: HashMap::new(), autofill_spans: vec![],
+        cells: HashMap::new(),
     };
     parse_into(&mut ir, input)?;
     Ok(ir)
 }
 
 /// Re-resolve a rules vec given just the typed lookups it needs.
-/// No Domain struct required — callers pass their HashMaps directly.
+/// No Domain struct required â€” callers pass their HashMaps directly.
 pub(crate) fn re_resolve_rules(
     rules: &mut Vec<DerivationRuleDef>,
     nouns: &HashMap<String, NounDef>,
@@ -1136,7 +1149,7 @@ fn parse_into(ir: &mut Domain, input: &str) -> Result<(), String> {
         apply_action(ir, action, &lines, i);
 
         // Look ahead for enum values after value type declaration:
-        // Filter(non_empty) ∘ skip(i+1) : lines, then match first result.
+        // Filter(non_empty) âˆ˜ skip(i+1) : lines, then match first result.
         line.strip_suffix(" is a value type.")
             .map(|prefix| prefix.trim())
             .and_then(|name| lines.iter().skip(i + 1)
@@ -1350,7 +1363,7 @@ fn parse_into(ir: &mut Domain, input: &str) -> Result<(), String> {
 
 /// Recognize a Halpin aggregate antecedent of form
 ///   `<role> is the <op> of <target> where <where-clause>`
-/// where <op> ∈ {count, sum, avg, min, max}. The where-clause is a fact-
+/// where <op> âˆˆ {count, sum, avg, min, max}. The where-clause is a fact-
 /// type reading that will be resolved separately against the catalog.
 ///
 /// Returns (consequent_role, op, target_role, where_clause_text). The
@@ -1381,12 +1394,12 @@ fn try_parse_aggregate_clause(text: &str, noun_names: &[String]) -> Option<(Stri
 /// Returns `Some((role_name, expr))` when the clause matches that shape
 /// AND the role name is a declared noun AND the RHS parses cleanly;
 /// otherwise `None` so the caller can fall through to fact-type
-/// resolution. Aggregate forms (`… is the sum of …`) are explicitly
-/// excluded — they're parsed by a later pipeline stage.
+/// resolution. Aggregate forms (`â€¦ is the sum of â€¦`) are explicitly
+/// excluded â€” they're parsed by a later pipeline stage.
 fn try_parse_computed_binding(text: &str, noun_names: &[String]) -> Option<(String, crate::types::ArithExpr)> {
     let t = text.trim().trim_end_matches('.').trim();
     let t = t.strip_prefix("that ").unwrap_or(t);
-    // Aggregates use `is the <op> of …` — skip them here.
+    // Aggregates use `is the <op> of â€¦` â€” skip them here.
     if t.contains(" is the ") { return None; }
     let idx = t.find(" is ")?;
     let lhs = t[..idx].trim();
@@ -1399,7 +1412,7 @@ fn try_parse_computed_binding(text: &str, noun_names: &[String]) -> Option<(Stri
 
 /// Tokenize a whitespace-flexible arithmetic expression on `+ - * /` and
 /// build a left-associative tree. Operands are either numeric literals
-/// (f64::from_str) or declared noun names. No precedence yet — `A + B * C`
+/// (f64::from_str) or declared noun names. No precedence yet â€” `A + B * C`
 /// parses as `((A + B) * C)`. Parentheses are not yet supported either.
 /// Returns `None` if any token fails to parse as an operand or operator.
 fn parse_arithmetic_expr(text: &str, noun_names: &[String]) -> Option<crate::types::ArithExpr> {
@@ -1439,7 +1452,7 @@ fn parse_arithmetic_expr(text: &str, noun_names: &[String]) -> Option<crate::typ
 /// Strip a trailing numeric comparator (Halpin FORML Example 5: `has Population >= 1000000`)
 /// from an antecedent fragment. Returns `(stripped_text, Option<(op, value)>)`.
 ///
-/// Accepts `>=`, `<=`, `>`, `<`, `=`, `!=`, and `<>` — the last is normalised
+/// Accepts `>=`, `<=`, `>`, `<`, `=`, `!=`, and `<>` â€” the last is normalised
 /// to `!=` so compile-time dispatch sees one canonical form. Longer operators
 /// (`>=`, `<=`, `!=`, `<>`) are listed first in the alternation so the engine
 /// prefers `>=` over `>` on input like `has Amount >= 100`.
@@ -1463,7 +1476,7 @@ fn split_antecedent_comparator(text: &str) -> (String, Option<(String, f64)>) {
 /// Expand possessive syntax in a derivation body clause.
 ///
 /// Pattern: `<Noun1>'s <Noun2>` is syntactic sugar for a join through Noun2:
-///   `<Noun1>'s <Noun2> has <X>` → `<Noun1> has <Noun2> and that <Noun2> has <X>`
+///   `<Noun1>'s <Noun2> has <X>` â†’ `<Noun1> has <Noun2> and that <Noun2> has <X>`
 ///
 /// This is a pre-processing step applied to the antecedent text before
 /// fact-type resolution.  Each possessive token is replaced with an
@@ -1481,7 +1494,7 @@ fn split_antecedent_comparator(text: &str) -> (String, Option<(String, f64)>) {
 /// "Order has Customer and that Customer has Age"
 /// ```
 pub(crate) fn try_expand_possessive(text: &str, noun_names: &[String]) -> Option<String> {
-    // Quick exit — no apostrophe means nothing to expand.
+    // Quick exit â€” no apostrophe means nothing to expand.
     if !text.contains("'s ") {
         return None;
     }
@@ -1526,7 +1539,7 @@ pub(crate) fn try_expand_possessive(text: &str, noun_names: &[String]) -> Option
                 changed = true;
             }
             _ => {
-                // Unknown noun around the apostrophe — leave as-is to avoid
+                // Unknown noun around the apostrophe â€” leave as-is to avoid
                 // corrupting input the parser can't understand.
                 break;
             }
@@ -1618,7 +1631,7 @@ fn resolve_derivation_rule(
     };
 
     // Resolve a text fragment to a Fact Type ID via rho-lookup through the catalog.
-    // Strips subscripts (Person1 → Person) before catalog lookup — find_nouns
+    // Strips subscripts (Person1 â†’ Person) before catalog lookup â€” find_nouns
     // captures the subscripted token, but the catalog keys are base nouns.
     let resolve_fact_type = |fragment: &str| -> Option<String> {
         let cleaned = strip_anaphora(fragment);
@@ -1657,7 +1670,7 @@ fn resolve_derivation_rule(
     // Resolve antecedents, carrying inline-comparator filters AND
     // arithmetic-definitional clauses alongside. A definitional clause
     // like `Volume is Size * Size * Size` does not resolve to a fact
-    // type — it populates consequent_computed_bindings instead. Filter
+    // type â€” it populates consequent_computed_bindings instead. Filter
     // clauses like `has Population >= 1000000` resolve to the base FT
     // with an AntecedentFilter pinned to that antecedent's position.
     let mut resolved_ids: Vec<String> = Vec::new();
@@ -1665,10 +1678,10 @@ fn resolve_derivation_rule(
     let mut computed: Vec<crate::types::ConsequentComputedBinding> = Vec::new();
     let mut aggregates: Vec<crate::types::ConsequentAggregate> = Vec::new();
     for part in antecedent_parts.iter() {
-        // Aggregate clauses (Halpin `<role> is the <op> of <target> where …`).
+        // Aggregate clauses (Halpin `<role> is the <op> of <target> where â€¦`).
         // They resolve the where-clause to a source FT and record the
-        // group-key role — the non-target role on that FT. Match ahead of
-        // the generic definitional path so `… is the count of …` isn't
+        // group-key role â€” the non-target role on that FT. Match ahead of
+        // the generic definitional path so `â€¦ is the count of â€¦` isn't
         // mistaken for arithmetic.
         if let Some((role, op, target, where_clause)) =
             try_parse_aggregate_clause(part, &noun_names)
@@ -1691,13 +1704,13 @@ fn resolve_derivation_rule(
             }
             continue;
         }
-        // Definitional clauses claim the part outright — they bind a
+        // Definitional clauses claim the part outright â€” they bind a
         // consequent role's value and don't belong in antecedent FTs.
         if let Some((role, expr)) = try_parse_computed_binding(part, &noun_names) {
             computed.push(crate::types::ConsequentComputedBinding { role, expr });
             continue;
         }
-        // ── Classify the clause through existing pipelines ───────
+        // â”€â”€ Classify the clause through existing pipelines â”€â”€â”€â”€â”€â”€â”€
         // Each pipeline already knows its own patterns. We call them
         // in order; the first match wins. No keyword arrays here.
 
@@ -1712,7 +1725,7 @@ fn resolve_derivation_rule(
                     .replace(" has no ", " has ")
                     .replace(" does not ", " ");
                 let pos = pos.trim_start_matches("no ").trim_start_matches("not ");
-                // Strip " where ..." suffix — negated clauses with
+                // Strip " where ..." suffix â€” negated clauses with
                 // where-filters ("no X is defined in Y where Z")
                 // need the base FT without the filter tail.
                 let pos = pos.split(" where ").next().unwrap_or(pos);
@@ -1734,7 +1747,7 @@ fn resolve_derivation_rule(
             continue;
         }
 
-        // (2) Comparator already split off a comparison operator —
+        // (2) Comparator already split off a comparison operator â€”
         //     split_antecedent_comparator recognized it, even though
         //     the base FT didn't resolve. The clause IS a comparison.
         if comparator.is_some() { continue; }
@@ -1749,15 +1762,15 @@ fn resolve_derivation_rule(
 
         // (5) that-anaphora: back-reference to a noun bound in a
         //     prior clause. Two shapes:
-        //     a) "that X has Y" — join continuation
-        //     b) "X is that Y" — anaphoric value assignment
+        //     a) "that X has Y" â€” join continuation
+        //     b) "X is that Y" â€” anaphoric value assignment
         //        (e.g., "display- Text is that Reference")
         if part.trim().starts_with("that ") && noun_names.iter()
             .any(|n| part.to_lowercase().contains(&n.to_lowercase()))
         { continue; }
         if part.contains(" is that ") || part.contains(" is some ") { continue; }
 
-        // (6) Temporal predicates — genuinely new, no existing fn.
+        // (6) Temporal predicates â€” genuinely new, no existing fn.
         if is_temporal_predicate(part) { continue; }
 
         // Nothing classified this clause.
@@ -1813,7 +1826,7 @@ fn resolve_derivation_rule(
         if !sanitized.is_empty() {
             sanitized
         } else {
-            // FNV-1a 64-bit over the rule text — no hasher dep, no
+            // FNV-1a 64-bit over the rule text â€” no hasher dep, no
             // allocation, stable output. Only used as a fallback rule
             // name when the sanitized text collapses to empty, so
             // collisions matter only inside a single domain's rules.
@@ -1827,7 +1840,39 @@ fn resolve_derivation_rule(
     };
 }
 
+/// Append a fact to a cell in the Domain's Object-state accumulator.
+fn push_cell(ir: &mut Domain, cell: &str, fact: crate::ast::Object) {
+    ir.cells.entry(cell.to_string()).or_default().push(fact);
+}
+
+/// Emit a Constraint cell fact with the full constraint JSON (lossless)
+/// plus flat fields for check.rs and no_std fallbacks.
+#[cfg(feature = "std-deps")]
+fn constraint_to_fact(c: &ConstraintDef) -> crate::ast::Object {
+    use crate::ast::fact_from_pairs;
+    let json = serde_json::to_string(c).unwrap_or_default();
+    let mut pairs: Vec<(String, String)> = vec![
+        ("id".into(), c.id.clone()), ("kind".into(), c.kind.clone()),
+        ("modality".into(), c.modality.clone()), ("text".into(), c.text.clone()),
+        ("json".into(), json),
+    ];
+    c.deontic_operator.as_ref().map(|op| pairs.push(("deonticOperator".into(), op.clone())));
+    c.entity.as_ref().map(|e| pairs.push(("entity".into(), e.clone())));
+    pairs.extend(c.spans.iter().enumerate().flat_map(|(i, span)| [
+        (format!("span{}_factTypeId", i), span.fact_type_id.clone()),
+        (format!("span{}_roleIndex", i), span.role_index.to_string()),
+    ]));
+    let refs: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    fact_from_pairs(&refs)
+}
+
 /// Apply a parse action to the IR accumulator.
+///
+/// For write-only kinds (Constraint, DerivationRule, NamedSpan,
+/// AutofillSpan), this emits Object cells directly — parse produces Φ
+/// per Thm 2. Kinds that need in-parse mutation/lookup (Noun, FactType)
+/// still accumulate typed fields; domain_to_state serializes them to
+/// cells at finalize.
 fn apply_action(ir: &mut Domain, action: Option<ParseAction>, lines: &[String], idx: usize) {
     let Some(action) = action else { return };
     match action {
@@ -1871,7 +1916,7 @@ fn apply_action(ir: &mut Domain, action: Option<ParseAction>, lines: &[String], 
             // `mode` is Some("fully-derived" | "derived-and-stored" | "semi-derived")
             // when the reading terminated with a `*` / `**` / `+` marker.
             // Emit as a GeneralInstanceFact against the metamodel's
-            // `Fact Type has Derivation Mode` binary — facts all the way
+            // `Fact Type has Derivation Mode` binary â€” facts all the way
             // down, no separate Domain field for what is already expressible
             // as an instance fact.
             let reading_for_mode = def.reading.clone();
@@ -1886,10 +1931,19 @@ fn apply_action(ir: &mut Domain, action: Option<ParseAction>, lines: &[String], 
             });
             ir.fact_types.entry(id).or_insert(def);
         }
-        ParseAction::AddConstraint(c) => { ir.constraints.push(c); }
+        ParseAction::AddConstraint(c) => {
+            // Emit Constraint cell fact directly. Pass 2b does not revisit
+            // constraints, so this is the final form.
+            #[cfg(feature = "std-deps")]
+            push_cell(ir, "Constraint", constraint_to_fact(&c));
+            ir.constraints.push(c);
+        }
         ParseAction::AddDerivation(r) => {
-            // Derivation rule resolution happens in Pass 2b with the catalog.
-            // This path stores the unresolved rule for later resolution.
+            // Pass 2b (re_resolve_rules) re-populates structured fields on
+            // the typed Vec; the corresponding cell fact is (re-)emitted
+            // at finalize. Here we only push the typed representation —
+            // no cell emission yet, because the rule's JSON shape will
+            // change after resolution.
             ir.derivation_rules.push(r);
         }
         ParseAction::AddInstanceFact(raw) => {
@@ -2112,7 +2166,7 @@ fn parse_fact(line: &str, noun_names: &[String]) -> Option<(String, FactTypeDef,
         .collect();
 
     // ORM 2 derivation marker (Halpin ORM2.pdf p. 8). The trailing
-    // text after the last noun — trimmed of whitespace — is compared
+    // text after the last noun â€” trimmed of whitespace â€” is compared
     // to the three markers. User convention requires whitespace
     // between the verbalization and the marker, so "Full Name *."
     // is accepted and "Full Name*." is not recognized as a marker.
@@ -2202,7 +2256,7 @@ fn find_nouns(text: &str, noun_names: &[String]) -> Vec<(usize, usize, String)> 
     // combining form (sequential scan of positions).
     //
     // Halpin ring rules distinguish same-type roles by numeric subscripts
-    // (Person1, Person2, Person3 — see Example 6 in the FORML position
+    // (Person1, Person2, Person3 â€” see Example 6 in the FORML position
     // paper). When the match is followed by ASCII digits we treat them
     // as a subscript and extend the captured range to include them; the
     // returned token ("Person3") preserves subscript identity so join-
@@ -2221,7 +2275,7 @@ fn find_nouns(text: &str, noun_names: &[String]) -> Vec<(usize, usize, String)> 
                     end += 1;
                 }
                 // After the (possibly-extended) end, the next byte must
-                // not be alphanumeric — otherwise the match was part of
+                // not be alphanumeric â€” otherwise the match was part of
                 // a longer identifier.
                 let after_ok = end >= text.len() || !text.as_bytes()[end].is_ascii_alphanumeric();
                 let no_overlap = !used.iter().any(|&(s, e)| start < e && end > s);
@@ -2535,11 +2589,11 @@ mod tests {
         assert!(rule.join_on.contains(&"Organization".to_string()), "Organization should be a join key (referenced with 'that')");
     }
 
-    // ── Inline comparisons on antecedent roles (Halpin FORML Example 5) ──
+    // â”€â”€ Inline comparisons on antecedent roles (Halpin FORML Example 5) â”€â”€
     //
     // `Each LargeUSCity is a City that is in Country 'US' and has Population >= 1000000.`
     // The parser should:
-    //   (1) resolve the base fact type (`has Population` → FT_Population)
+    //   (1) resolve the base fact type (`has Population` â†’ FT_Population)
     //       without being confused by the trailing comparator;
     //   (2) capture `>=`, `1000000` into DerivationRuleDef::antecedent_filters
     //       pinned to the antecedent's index; and
@@ -2559,7 +2613,7 @@ mod tests {
         assert_eq!(f.op, ">=");
         assert_eq!(f.value, 1_000_000.0);
         assert_eq!(f.role, "Population");
-        // Antecedent still resolves to the base fact type — the comparator
+        // Antecedent still resolves to the base fact type â€” the comparator
         // is a filter on it, not a replacement.
         assert!(rule.antecedent_fact_type_ids.iter().any(|id| id.contains("Population")),
             "base FT should still resolve: {:?}", rule.antecedent_fact_type_ids);
@@ -2602,7 +2656,7 @@ mod tests {
             "expected -273.15, got {}", rule.antecedent_filters[0].value);
     }
 
-    // ── Arithmetic definitional clauses (Halpin attribute style) ──
+    // â”€â”€ Arithmetic definitional clauses (Halpin attribute style) â”€â”€
     //
     // An antecedent clause of shape `<RoleName> is <arith-expr>` defines a
     // consequent role's value from other role values or numeric literals.
@@ -2691,7 +2745,7 @@ mod tests {
                 Box::new(ArithExpr::Literal(1.0))));
     }
 
-    // ── Aggregate clauses (Codd §2.3.4 image set + Backus Insert) ──
+    // â”€â”€ Aggregate clauses (Codd Â§2.3.4 image set + Backus Insert) â”€â”€
     //
     // Halpin's attribute-style aggregate reads as:
     //   `<role> is the <op> of <target> where <where-clause>`
@@ -2699,7 +2753,7 @@ mod tests {
     // resolves to a source fact type. The consequent's non-aggregate role
     // becomes the group key (the image-set index in Codd's terms).
 
-    // ── Halpin's "attribute style" reduces to relational style + Join ──
+    // â”€â”€ Halpin's "attribute style" reduces to relational style + Join â”€â”€
     //
     // Halpin FORML Example 6 gives two equivalent forms of the uncle rule:
     //
@@ -2711,7 +2765,7 @@ mod tests {
     //
     // Both assert the same implication. AREST takes the relational form
     // (with `that <join-noun>` anaphora) and routes it through
-    // compile_join_derivation — so attribute style is structurally
+    // compile_join_derivation â€” so attribute style is structurally
     // redundant. This test uses non-ring fact types (no subscripts) to
     // demonstrate the pattern that makes attribute style unnecessary.
 
@@ -2733,7 +2787,7 @@ mod tests {
 
     #[test]
     fn find_nouns_still_rejects_alphanumeric_overruns() {
-        // Regression: `Person` in `Personal` is still NOT a match —
+        // Regression: `Person` in `Personal` is still NOT a match â€”
         // only trailing digits count as subscripts; letters don't.
         let noun_names = vec!["Person".to_string()];
         let matches = find_nouns("Personal belongings", &noun_names);
@@ -2742,7 +2796,7 @@ mod tests {
 
     #[test]
     fn find_nouns_rejects_leading_alphanumeric() {
-        // Regression: `Super Person` doesn't match `Person` either —
+        // Regression: `Super Person` doesn't match `Person` either â€”
         // the before-boundary check stays strict.
         let noun_names = vec!["Person".to_string()];
         let matches = find_nouns("SuperPerson rules", &noun_names);
@@ -2768,10 +2822,10 @@ mod tests {
             "two antecedents, got {:?}", rule.antecedent_fact_type_ids);
     }
 
-    // ── Ring-constraint shorthand (ORM 2 intuitive-icon parity) ──
+    // â”€â”€ Ring-constraint shorthand (ORM 2 intuitive-icon parity) â”€â”€
     //
-    // ORM 2 §2.6 (Halpin 2005) renders ring constraints as icons ("ir",
-    // "ac", "as", …) attached to the fact-type shape. In textual form,
+    // ORM 2 Â§2.6 (Halpin 2005) renders ring constraints as icons ("ir",
+    // "ac", "as", â€¦) attached to the fact-type shape. In textual form,
     // the equivalent shorthand appends the adjective directly to the
     // reading:
     //
@@ -3097,7 +3151,7 @@ mod tests {
     #[test]
     fn uncle_rule_subscripted_ring_join_resolves_antecedents() {
         // #197: derivation rule with 3 subscripted Person references across
-        // two ring fact types — the "uncle" pattern from Halpin FORML Example 6.
+        // two ring fact types â€” the "uncle" pattern from Halpin FORML Example 6.
         //
         //   Person1 is uncle of Person2 iff
         //     Person1 is brother of some Person3 and
@@ -3615,7 +3669,7 @@ fn forbidden_ipv6_ula_fd() {
     // must therefore declare the Derivation Mode value type with its three
     // enum values AND a `Fact Type has Derivation Mode` binary fact type.
     //
-    // Cites: Halpin, ORM 2 (ORM2.pdf p. 8) — iff-rule for full derivation,
+    // Cites: Halpin, ORM 2 (ORM2.pdf p. 8) â€” iff-rule for full derivation,
     // if-rule for partial; graphical markers * / ** / + for fully-derived /
     // derived-and-stored / semi-derived respectively.
 
@@ -4002,7 +4056,7 @@ Thing 'bob-1' has Color 'green'.
         // Component cells should exist with decomposed bindings
         let owner_cell = fetch_or_phi("Thing_has_Owner", &state);
         let owners = owner_cell.as_seq().expect("Thing_has_Owner cell must exist");
-        assert_eq!(owners.len(), 3, "3 unique instance IDs → 3 owner bindings");
+        assert_eq!(owners.len(), 3, "3 unique instance IDs â†’ 3 owner bindings");
         assert!(owners.iter().any(|f| binding(f, "Thing") == Some("alice-1") && binding(f, "Owner") == Some("alice")));
         assert!(owners.iter().any(|f| binding(f, "Thing") == Some("bob-1") && binding(f, "Owner") == Some("bob")));
 
@@ -4029,7 +4083,7 @@ Widget 'my-system-3' has Label 'foo'.
 
         let name_cell = fetch_or_phi("Widget_has_System_Name", &state);
         let names = name_cell.as_seq().expect("Widget_has_System_Name must exist");
-        // rsplitn(2, '-') on 'my-system-3' → ['my-system', '3']
+        // rsplitn(2, '-') on 'my-system-3' â†’ ['my-system', '3']
         assert!(names.iter().any(|f|
             binding(f, "Widget") == Some("my-system-3") &&
             binding(f, "System Name") == Some("my-system")
@@ -4101,7 +4155,7 @@ App 'sherlock' uses Generator 'sqlite'.
         assert_eq!(f.object_value, "sqlite");
     }
 
-    // ── Task #198: Possessive join syntax in derivation bodies ──────────────
+    // â”€â”€ Task #198: Possessive join syntax in derivation bodies â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     //
     // "Order has Customer Age iff Order's Customer has Age"
     // should resolve to a Join through Customer, equivalent to:

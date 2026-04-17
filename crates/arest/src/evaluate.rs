@@ -376,6 +376,7 @@ mod tests {
             subtypes: HashMap::new(), enum_values: HashMap::new(),
             ref_schemes: HashMap::new(), objectifications: HashMap::new(),
             named_spans: HashMap::new(), autofill_spans: vec![],
+            cells: HashMap::new(),
         }
     }
 
@@ -1947,6 +1948,7 @@ mod tests {
             subtypes: HashMap::new(), enum_values: HashMap::new(),
             ref_schemes: HashMap::new(), objectifications: HashMap::new(),
             named_spans: HashMap::new(), autofill_spans: vec![],
+            cells: HashMap::new(),
         }
     }
 
@@ -2121,6 +2123,7 @@ mod tests {
             subtypes: HashMap::new(), enum_values: HashMap::new(),
             ref_schemes: HashMap::new(), objectifications: HashMap::new(),
             named_spans: HashMap::new(), autofill_spans: vec![],
+            cells: HashMap::new(),
         }
     }
 
@@ -2274,6 +2277,7 @@ mod tests {
             subtypes: HashMap::new(), enum_values: HashMap::new(),
             ref_schemes: HashMap::new(), objectifications: HashMap::new(),
             named_spans: HashMap::new(), autofill_spans: vec![],
+            cells: HashMap::new(),
         }
     }
 
@@ -2368,6 +2372,7 @@ mod tests {
             subtypes: HashMap::new(), enum_values: HashMap::new(),
             ref_schemes: HashMap::new(), objectifications: HashMap::new(),
             named_spans: HashMap::new(), autofill_spans: vec![],
+            cells: HashMap::new(),
         }
     }
 
@@ -2551,6 +2556,7 @@ mod tests {
             subtypes: HashMap::new(), enum_values: HashMap::new(),
             ref_schemes: HashMap::new(), objectifications: HashMap::new(),
             named_spans: HashMap::new(), autofill_spans: vec![],
+            cells: HashMap::new(),
         };
 
         let (_meta_pop, defs, _def_map) = ir_to_defs(&ir);
@@ -2631,6 +2637,7 @@ mod tests {
             subtypes: HashMap::new(), enum_values: HashMap::new(),
             ref_schemes: HashMap::new(), objectifications: HashMap::new(),
             named_spans: HashMap::new(), autofill_spans: vec![],
+            cells: HashMap::new(),
         };
 
         let (_meta_pop, defs, _def_map) = ir_to_defs(&ir);
@@ -2700,6 +2707,7 @@ mod tests {
             subtypes: HashMap::new(), enum_values: HashMap::new(),
             ref_schemes: HashMap::new(), objectifications: HashMap::new(),
             named_spans: HashMap::new(), autofill_spans: vec![],
+            cells: HashMap::new(),
         };
 
         let (_meta_pop, defs, _def_map) = ir_to_defs(&ir);
@@ -2769,6 +2777,7 @@ mod tests {
             subtypes: HashMap::new(), enum_values: HashMap::new(),
             ref_schemes: HashMap::new(), objectifications: HashMap::new(),
             named_spans: HashMap::new(), autofill_spans: vec![],
+            cells: HashMap::new(),
         };
 
         let (_meta_pop, defs, _def_map) = ir_to_defs(&ir);

@@ -693,6 +693,7 @@ mod tests {
             subtypes: HashMap::new(), enum_values: HashMap::new(),
             ref_schemes: HashMap::new(), objectifications: HashMap::new(),
             named_spans: HashMap::new(), autofill_spans: vec![],
+            cells: HashMap::new(),
         };
         for (name, obj_type) in nouns {
             ir.nouns.insert(name.to_string(), NounDef {
