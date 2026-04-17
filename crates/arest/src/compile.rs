@@ -1,6 +1,6 @@
 ﻿// crates/arest/src/compile.rs
 //
-// Compilation: Domain -> CompiledModel
+// Compilation: Object -> CompiledModel
 //
 // Constraints ARE predicates, not data that gets matched.
 // The match on constraint kind happens once at compile time. After compilation,
@@ -1356,7 +1356,7 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
 // state_to_domain deleted (#211). All callers now use
 // cell_index_from_state or read cells directly.
 
-/// Compile an entire Domain into executable form.
+/// Compile Object state into executable form (CompiledModel).
 /// Structural model validation â€” catches FORML2 violations at compile time.
 /// Returns a list of error messages. Empty = model is well-formed.
 pub fn validate_model_from_state(state: &crate::ast::Object) -> Vec<String> {

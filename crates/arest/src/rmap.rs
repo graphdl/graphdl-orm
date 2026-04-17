@@ -2,7 +2,7 @@
 //
 // RMAP -- Relational Mapping Procedure (Halpin, Ch. 10)
 //
-// Pure function: Domain -> table definitions.
+// Pure function: Object state -> table definitions.
 // No I/O, no mutable global state. The schema defines what exists;
 // RMAP computes how it maps to relations.
 //
