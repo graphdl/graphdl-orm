@@ -1,0 +1,13 @@
+refactor(#211): rmap tests build Object state directly (no Domain)
+
+Replace make_ir / make_ir_with_subtypes / make_ir_with_ref_schemes
+(which built typed Domain then called domain_to_state) with:
+- make_state: emits Noun, FactType, Role, Constraint cells directly
+- make_state_with_subtypes: patches Noun facts with superType field
+- make_state_with_ref_schemes: patches Noun facts with referenceScheme
+
+Exposes constraint_to_fact_test as a pub(crate) test helper in
+parse_forml2. Test callers now pass `&state` to rmap() directly
+instead of `&to_state(&ir)`. rmap.rs no longer imports Domain.
+
+12/12 rmap tests pass, 577/577 lib tests pass overall.

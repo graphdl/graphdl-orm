@@ -1999,6 +1999,10 @@ fn push_cell(ir: &mut Domain, cell: &str, fact: crate::ast::Object) {
 
 /// Emit a Constraint cell fact with the full constraint JSON (lossless)
 /// plus flat fields for check.rs and no_std fallbacks.
+#[cfg(all(test, feature = "std-deps"))]
+pub(crate) fn constraint_to_fact_test(c: &ConstraintDef) -> crate::ast::Object {
+    constraint_to_fact(c)
+}
 #[cfg(feature = "std-deps")]
 fn constraint_to_fact(c: &ConstraintDef) -> crate::ast::Object {
     use crate::ast::fact_from_pairs;

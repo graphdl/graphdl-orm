@@ -672,50 +672,41 @@ pub fn rmap_cell_map(state: &crate::ast::Object) -> HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::{self, Object, fact_from_pairs};
     use crate::types::*;
-    use crate::parse_forml2::Domain;
 
-    fn to_state(ir: &Domain) -> crate::ast::Object {
-        crate::parse_forml2::domain_to_state(ir)
-    }
-
-    fn make_ir(
+    /// Build Object state for rmap input. Emits Noun, FactType, Role,
+    /// Constraint cells directly — no Domain intermediate (#211).
+    fn make_state(
         nouns: Vec<(&str, &str)>,
         fact_types: Vec<(&str, &str, Vec<(&str, usize)>)>,
         constraints: Vec<(&str, Vec<(&str, usize)>)>,
-    ) -> Domain {
-        let mut ir = Domain {
-            nouns: HashMap::new(),
-            fact_types: HashMap::new(),
-            constraints: Vec::new(),
-            state_machines: HashMap::new(),
-            derivation_rules: Vec::new(), general_instance_facts: Vec::new(),
-            subtypes: HashMap::new(), enum_values: HashMap::new(),
-            ref_schemes: HashMap::new(), objectifications: HashMap::new(),
-            named_spans: HashMap::new(), autofill_spans: vec![],
-            cells: HashMap::new(),
-        };
-        for (name, obj_type) in nouns {
-            ir.nouns.insert(name.to_string(), NounDef {
-                object_type: obj_type.to_string(),
-                world_assumption: WorldAssumption::default(),
-            });
+    ) -> ast::Object {
+        let mut cells: HashMap<String, Vec<Object>> = HashMap::new();
+        for (name, obj_type) in &nouns {
+            let ref_scheme = (*obj_type == "entity").then(|| "id");
+            let mut pairs: Vec<(&str, &str)> = vec![
+                ("name", *name), ("objectType", *obj_type), ("worldAssumption", "closed"),
+            ];
+            if let Some(rs) = ref_scheme { pairs.push(("referenceScheme", rs)); }
+            cells.entry("Noun".into()).or_default().push(fact_from_pairs(&pairs));
         }
-        for (id, reading, roles) in fact_types {
-            ir.fact_types.insert(id.to_string(), FactTypeDef {
-                schema_id: String::new(),
-                reading: reading.to_string(),
-                readings: vec![],
-                roles: roles.iter().map(|(name, idx)| RoleDef {
-                    noun_name: name.to_string(),
-                    role_index: *idx,
-                }).collect(),
-            });
+        for (id, reading, roles) in &fact_types {
+            let arity = roles.len().to_string();
+            cells.entry("FactType".into()).or_default().push(fact_from_pairs(&[
+                ("id", *id), ("reading", *reading), ("arity", arity.as_str()),
+            ]));
+            for (name, idx) in roles {
+                let pos = idx.to_string();
+                cells.entry("Role".into()).or_default().push(fact_from_pairs(&[
+                    ("factType", *id), ("nounName", *name), ("position", pos.as_str()),
+                ]));
+            }
         }
-        for (kind, spans) in constraints {
-            ir.constraints.push(ConstraintDef {
-                id: format!("c_{}", ir.constraints.len()),
-                kind: kind.to_string(),
+        for (i, (kind, spans)) in constraints.iter().enumerate() {
+            let cdef = ConstraintDef {
+                id: format!("c_{}", i),
+                kind: (*kind).to_string(),
                 modality: "Alethic".to_string(),
                 text: String::new(),
                 spans: spans.iter().map(|(ft_id, role_idx)| SpanDef {
@@ -724,20 +715,22 @@ mod tests {
                     subset_autofill: None,
                 }).collect(),
                 ..Default::default()
-            });
+            };
+            cells.entry("Constraint".into()).or_default()
+                .push(crate::parse_forml2::constraint_to_fact_test(&cdef));
         }
-        ir
+        Object::Map(cells.into_iter().map(|(k, v)| (k, Object::Seq(v.into()))).collect())
     }
 
     #[test]
     fn functional_binary_produces_entity_table() {
         // Person has Name (UC on Person role -> Name absorbed into Person table)
-        let ir = make_ir(
+        let state = make_state(
             vec![("Person", "entity"), ("Name", "value")],
             vec![("ft1", "Person has Name", vec![("Person", 0), ("Name", 1)])],
             vec![("UC", vec![("ft1", 0)])], // UC on Person -> each Person has at most one Name
         );
-        let tables = rmap(&to_state(&ir));
+        let tables = rmap(&state);
         assert_eq!(tables.len(), 1);
         assert_eq!(tables[0].name, "person");
         assert_eq!(tables[0].columns.len(), 2); // id + name
@@ -748,12 +741,12 @@ mod tests {
     #[test]
     fn compound_uc_produces_junction_table() {
         // Person teaches Course (UC spanning both roles -> junction table)
-        let ir = make_ir(
+        let state = make_state(
             vec![("Person", "entity"), ("Course", "entity")],
             vec![("ft1", "Person teaches Course", vec![("Person", 0), ("Course", 1)])],
             vec![("UC", vec![("ft1", 0), ("ft1", 1)])], // compound UC
         );
-        let tables = rmap(&to_state(&ir));
+        let tables = rmap(&state);
         assert!(tables.iter().any(|t| t.name == "person_teaches_course"));
         let jt = tables.iter().find(|t| t.name == "person_teaches_course").unwrap();
         assert_eq!(jt.primary_key.len(), 2);
@@ -762,7 +755,7 @@ mod tests {
     #[test]
     fn mandatory_constraint_produces_not_null() {
         // Person has Name (UC on Person + MC on Person -> Name is NOT NULL)
-        let ir = make_ir(
+        let state = make_state(
             vec![("Person", "entity"), ("Name", "value")],
             vec![("ft1", "Person has Name", vec![("Person", 0), ("Name", 1)])],
             vec![
@@ -770,7 +763,7 @@ mod tests {
                 ("MC", vec![("ft1", 0)]),
             ],
         );
-        let tables = rmap(&to_state(&ir));
+        let tables = rmap(&state);
         let person = tables.iter().find(|t| t.name == "person").unwrap();
         let name_col = person.columns.iter().find(|c| c.name == "name").unwrap();
         assert!(!name_col.nullable); // MC -> NOT NULL
@@ -779,12 +772,12 @@ mod tests {
     #[test]
     fn entity_fk_gets_references() {
         // Order belongs to Customer (UC on Order)
-        let ir = make_ir(
+        let state = make_state(
             vec![("Order", "entity"), ("Customer", "entity")],
             vec![("ft1", "Order belongs to Customer", vec![("Order", 0), ("Customer", 1)])],
             vec![("UC", vec![("ft1", 0)])],
         );
-        let tables = rmap(&to_state(&ir));
+        let tables = rmap(&state);
         let order = tables.iter().find(|t| t.name == "order").unwrap();
         let cust_col = order.columns.iter().find(|c| c.name == "customer_id").unwrap();
         assert_eq!(cust_col.references.as_deref(), Some("customer"));
@@ -793,12 +786,12 @@ mod tests {
     #[test]
     fn independent_entity_gets_id_table() {
         // Customer referenced by Order but has no own fact types with UC
-        let ir = make_ir(
+        let state = make_state(
             vec![("Order", "entity"), ("Customer", "entity")],
             vec![("ft1", "Order belongs to Customer", vec![("Order", 0), ("Customer", 1)])],
             vec![("UC", vec![("ft1", 0)])],
         );
-        let tables = rmap(&to_state(&ir));
+        let tables = rmap(&state);
         let customer = tables.iter().find(|t| t.name == "customer").unwrap();
         assert_eq!(customer.columns.len(), 1); // just id
         assert_eq!(customer.primary_key, vec!["id"]);
@@ -811,7 +804,7 @@ mod tests {
         // Room is in Building (UC on Room role -> functional)
         // Room has RoomNr (UC on Room role -> functional)
         // External UC spans both fact types on Room roles -> UNIQUE(building_id, room_nr)
-        let ir = make_ir(
+        let state = make_state(
             vec![
                 ("Room", "entity"),
                 ("Building", "entity"),
@@ -828,7 +821,7 @@ mod tests {
                 ("UC", vec![("ft1", 1), ("ft2", 1)]),
             ],
         );
-        let tables = rmap(&to_state(&ir));
+        let tables = rmap(&state);
         let room = tables.iter().find(|t| t.name == "room").unwrap();
         // Room table should have columns: id, building_id, room_nr
         assert!(room.columns.iter().any(|c| c.name == "building_id"));
@@ -844,17 +837,38 @@ mod tests {
 
     // â”€â”€ Feature #58: Partitioned Subtype Absorption â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-    fn make_ir_with_subtypes(
+    fn make_state_with_subtypes(
         nouns: Vec<(&str, &str)>,
         fact_types: Vec<(&str, &str, Vec<(&str, usize)>)>,
         constraints: Vec<(&str, Vec<(&str, usize)>)>,
         subtypes: Vec<(&str, &str)>,
-    ) -> Domain {
-        let mut ir = make_ir(nouns, fact_types, constraints);
-        for (child, parent) in subtypes {
-            ir.subtypes.insert(child.to_string(), parent.to_string());
+    ) -> ast::Object {
+        let mut state = make_state(nouns, fact_types, constraints);
+        // Patch existing Noun facts with superType where applicable.
+        let sub_map: HashMap<&str, &str> = subtypes.iter().copied().collect();
+        if let Object::Map(ref mut m) = state {
+            if let Some(Object::Seq(ref mut arc)) = m.get_mut("Noun") {
+                let updated: Vec<Object> = arc.iter().map(|f| {
+                    let name = ast::binding(f, "name").unwrap_or("").to_string();
+                    match sub_map.get(name.as_str()) {
+                        Some(parent) => {
+                            // Re-emit this Noun fact with superType appended.
+                            let obj_type = ast::binding(f, "objectType").unwrap_or("entity").to_string();
+                            let wa = ast::binding(f, "worldAssumption").unwrap_or("closed").to_string();
+                            let mut pairs: Vec<(&str, &str)> = vec![
+                                ("name", name.as_str()), ("objectType", obj_type.as_str()),
+                                ("worldAssumption", wa.as_str()), ("superType", *parent),
+                            ];
+                            if let Some(rs) = ast::binding(f, "referenceScheme") { pairs.push(("referenceScheme", rs)); }
+                            fact_from_pairs(&pairs)
+                        }
+                        None => f.clone(),
+                    }
+                }).collect();
+                *arc = updated.into();
+            }
         }
-        ir
+        state
     }
 
     #[test]
@@ -863,7 +877,7 @@ mod tests {
         // Person has Name (functional on Person).
         // Employee has Salary (functional on Employee -- subtype-specific).
         // Because Employee has its own fact type, it should get a partitioned table.
-        let ir = make_ir_with_subtypes(
+        let state = make_state_with_subtypes(
             vec![
                 ("Person", "entity"),
                 ("Employee", "entity"),
@@ -880,7 +894,7 @@ mod tests {
             ],
             vec![("Employee", "Person")],
         );
-        let tables = rmap(&to_state(&ir));
+        let tables = rmap(&state);
         let table_names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
         // Person table should exist with name column but NOT salary
         let person = tables.iter().find(|t| t.name == "person").unwrap();
@@ -903,7 +917,7 @@ mod tests {
     fn absorbed_subtype_stays_in_supertype_table() {
         // Person is the supertype. VIPCustomer is a subtype but has no own fact types.
         // VIPCustomer should stay absorbed into Person (single-table).
-        let ir = make_ir_with_subtypes(
+        let state = make_state_with_subtypes(
             vec![
                 ("Person", "entity"),
                 ("VIPCustomer", "entity"),
@@ -917,7 +931,7 @@ mod tests {
             ],
             vec![("VIPCustomer", "Person")],
         );
-        let tables = rmap(&to_state(&ir));
+        let tables = rmap(&state);
         let table_names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
         // VIPCustomer should NOT get its own table (no fact types of its own)
         assert!(!table_names.contains(&"v_i_p_customer") && !table_names.contains(&"vip_customer"),
@@ -928,27 +942,44 @@ mod tests {
 
     // â”€â”€ Feature #59: Compound Reference Scheme â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-    fn make_ir_with_ref_schemes(
+    fn make_state_with_ref_schemes(
         nouns: Vec<(&str, &str)>,
         fact_types: Vec<(&str, &str, Vec<(&str, usize)>)>,
         constraints: Vec<(&str, Vec<(&str, usize)>)>,
         ref_schemes: Vec<(&str, Vec<&str>)>,
-    ) -> Domain {
-        let mut ir = make_ir(nouns, fact_types, constraints);
-        for (noun, parts) in ref_schemes {
-            ir.ref_schemes.insert(
-                noun.to_string(),
-                parts.iter().map(|s| s.to_string()).collect(),
-            );
+    ) -> ast::Object {
+        let mut state = make_state(nouns, fact_types, constraints);
+        let rs_map: HashMap<&str, String> = ref_schemes.iter()
+            .map(|(n, p)| (*n, p.join(",")))
+            .collect();
+        if let Object::Map(ref mut m) = state {
+            if let Some(Object::Seq(ref mut arc)) = m.get_mut("Noun") {
+                let updated: Vec<Object> = arc.iter().map(|f| {
+                    let name = ast::binding(f, "name").unwrap_or("").to_string();
+                    match rs_map.get(name.as_str()) {
+                        Some(rs_joined) => {
+                            let obj_type = ast::binding(f, "objectType").unwrap_or("entity").to_string();
+                            let wa = ast::binding(f, "worldAssumption").unwrap_or("closed").to_string();
+                            fact_from_pairs(&[
+                                ("name", name.as_str()), ("objectType", obj_type.as_str()),
+                                ("worldAssumption", wa.as_str()),
+                                ("referenceScheme", rs_joined.as_str()),
+                            ])
+                        }
+                        None => f.clone(),
+                    }
+                }).collect();
+                *arc = updated.into();
+            }
         }
-        ir
+        state
     }
 
     #[test]
     fn compound_ref_scheme_produces_composite_pk() {
         // Room is in Building (UC on Room), Room has RoomNr (UC on Room)
         // Compound reference scheme: Room is identified by (Building, RoomNr)
-        let ir = make_ir_with_ref_schemes(
+        let state = make_state_with_ref_schemes(
             vec![
                 ("Room", "entity"),
                 ("Building", "entity"),
@@ -964,7 +995,7 @@ mod tests {
             ],
             vec![("Room", vec!["Building", "RoomNr"])],
         );
-        let tables = rmap(&to_state(&ir));
+        let tables = rmap(&state);
         let room = tables.iter().find(|t| t.name == "room").unwrap();
         // PK should be composite: (building_id, room_nr)
         assert_eq!(room.primary_key.len(), 2,
@@ -982,7 +1013,7 @@ mod tests {
     fn one_to_one_absorbs_toward_entity_not_value() {
         // Country has CountryCode (1:1, both UC).
         // Should absorb CountryCode into Country (entity over value).
-        let ir = make_ir(
+        let state = make_state(
             vec![("Country", "entity"), ("CountryCode", "value")],
             vec![("ft1", "Country has CountryCode", vec![("Country", 0), ("CountryCode", 1)])],
             vec![
@@ -990,7 +1021,7 @@ mod tests {
                 ("UC", vec![("ft1", 1)]),
             ],
         );
-        let tables = rmap(&to_state(&ir));
+        let tables = rmap(&state);
         // Country table should absorb country_code
         let country = tables.iter().find(|t| t.name == "country").unwrap();
         assert!(country.columns.iter().any(|c| c.name == "country_code"),
@@ -1002,7 +1033,7 @@ mod tests {
     fn one_to_one_absorbs_toward_larger_table() {
         // Person has SSN (1:1), Person has Name (functional on Person)
         // Person already has more columns -> SSN should be absorbed into Person
-        let ir = make_ir(
+        let state = make_state(
             vec![
                 ("Person", "entity"),
                 ("SSN", "entity"),
@@ -1018,7 +1049,7 @@ mod tests {
                 ("UC", vec![("ft2", 0)]),
             ],
         );
-        let tables = rmap(&to_state(&ir));
+        let tables = rmap(&state);
         let person = tables.iter().find(|t| t.name == "person").unwrap();
         assert!(person.columns.iter().any(|c| c.name == "ssn_id"),
             "Person should absorb ssn_id, columns: {:?}",
@@ -1029,7 +1060,7 @@ mod tests {
     fn one_to_one_absorbs_using_reading_direction() {
         // Husband is married to Wife (1:1, both entities, same number of fact types)
         // Reading direction: Husband is first -> absorb into Husband
-        let ir = make_ir(
+        let state = make_state(
             vec![("Husband", "entity"), ("Wife", "entity")],
             vec![("ft1", "Husband is married to Wife", vec![("Husband", 0), ("Wife", 1)])],
             vec![
@@ -1037,7 +1068,7 @@ mod tests {
                 ("UC", vec![("ft1", 1)]),
             ],
         );
-        let tables = rmap(&to_state(&ir));
+        let tables = rmap(&state);
         let husband = tables.iter().find(|t| t.name == "husband").unwrap();
         assert!(husband.columns.iter().any(|c| c.name == "wife_id"),
             "Husband should absorb wife_id (reading direction), columns: {:?}",
