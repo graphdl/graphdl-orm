@@ -1,6 +1,5 @@
 // crates/arest/src/types.rs
 use serde::{Deserialize, Serialize};
-use hashbrown::HashMap;
 #[allow(unused_imports)]
 use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 

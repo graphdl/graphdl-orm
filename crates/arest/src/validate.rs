@@ -15,7 +15,7 @@ use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 
 /// Convert a domain's Domain into an Object state of core metamodel facts.
 #[cfg(test)]
-pub fn ir_to_metamodel_state(ir: &crate::parse_forml2::Domain) -> crate::ast::Object {
+pub(crate) fn ir_to_metamodel_state(ir: &crate::parse_forml2::Domain) -> crate::ast::Object {
     use crate::ast::{Object, cell_push, fact_from_pairs};
     use hashbrown::HashMap;
     // foldl(cell_push, phi, α(noun → fact)) for each category

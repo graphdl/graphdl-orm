@@ -704,11 +704,11 @@ fn try_fact_type(line: &str, noun_names: &[String]) -> Option<ParseAction> {
 
 /// Parse with pre-existing nouns from other domains.
 /// Domains are NORMA tabs. Nouns are global across the UoD.
-pub fn parse_markdown_with_nouns(input: &str, existing_nouns: &HashMap<String, NounDef>) -> Result<Domain, String> {
+pub(crate) fn parse_markdown_with_nouns(input: &str, existing_nouns: &HashMap<String, NounDef>) -> Result<Domain, String> {
     parse_markdown_with_context(input, existing_nouns, &HashMap::new())
 }
 
-pub fn parse_markdown_with_context(input: &str, existing_nouns: &HashMap<String, NounDef>, existing_fact_types: &HashMap<String, FactTypeDef>) -> Result<Domain, String> {
+pub(crate) fn parse_markdown_with_context(input: &str, existing_nouns: &HashMap<String, NounDef>, existing_fact_types: &HashMap<String, FactTypeDef>) -> Result<Domain, String> {
     // Metamodel namespace protection (security #23):
     // First parse the input in isolation to see which nouns IT actually declares.
     // If the input declares any metamodel-reserved noun AND that noun is already
@@ -934,7 +934,7 @@ pub fn parse_to_state_with_nouns(input: &str, existing: &crate::ast::Object) -> 
 
 /// Convert a Domain to an Object state (sequence of cells).
 /// Each category becomes a cell: <CELL, fact_type_id, <facts...>>
-pub fn domain_to_state(d: &Domain) -> crate::ast::Object {
+pub(crate) fn domain_to_state(d: &Domain) -> crate::ast::Object {
     use crate::ast::{Object, fact_from_pairs};
     use hashbrown::{HashMap, HashSet};
     // Build cells mutably into a HashMap<String, Vec<Object>>, then wrap
@@ -1045,50 +1045,8 @@ pub fn domain_to_state(d: &Domain) -> crate::ast::Object {
     Object::Map(map)
 }
 
-/// Materialize Domain into entity cells for EntityDB.
-pub fn domain_to_entities(d: &Domain, slug: &str) -> String {
-    let e: Vec<serde_json::Value> = [
-        // α(noun → json) : nouns
-        d.nouns.iter().map(|(n, def)| {
-            let mut data = serde_json::json!({"name": n, "objectType": &def.object_type});
-            d.subtypes.get(n).map(|s| data["superType"] = serde_json::json!(s));
-            d.enum_values.get(n).map(|v| data["enumValues"] = serde_json::json!(v));
-            d.ref_schemes.get(n).map(|r| data["referenceScheme"] = serde_json::json!(r));
-            d.objectifications.get(n).map(|o| data["objectifies"] = serde_json::json!(o));
-            serde_json::json!({"id": format!("noun:{}", n), "type": "Noun", "domain": slug, "data": data})
-        }).collect::<Vec<_>>(),
-        // α(ft → [schema, roles..., reading]) : fact_types
-        d.fact_types.iter().flat_map(|(id, ft)| {
-            core::iter::once(serde_json::json!({"id": format!("gs:{}", id), "type": "Fact Type", "domain": slug, "data": {"name": id, "reading": ft.reading}}))
-                .chain(ft.roles.iter().enumerate().map(move |(i, role)|
-                    serde_json::json!({"id": format!("role:{}:{}", id, i), "type": "Role", "domain": slug, "data": {"nounName": role.noun_name, "position": i, "factType": id}})))
-                .chain(core::iter::once(serde_json::json!({"id": format!("reading:{}", id), "type": "Reading", "domain": slug, "data": {"text": ft.reading, "factType": id}})))
-        }).collect(),
-        // α(constraint → json)
-        d.constraints.iter().map(|c| {
-            let cid = if c.id.is_empty() { &c.text } else { &c.id };
-            serde_json::json!({"id": format!("constraint:{}", cid), "type": "Constraint", "domain": slug,
-                "data": {"kind": c.kind, "modality": c.modality, "text": c.text, "spans": c.spans, "entity": c.entity, "minOccurrence": c.min_occurrence, "maxOccurrence": c.max_occurrence}})
-        }).collect(),
-        // α(sm → [def, statuses..., transitions...])
-        d.state_machines.iter().flat_map(|(n, sm)| {
-            core::iter::once(serde_json::json!({"id": n, "type": "State Machine Definition", "domain": slug, "data": {"name": n, "forNoun": sm.noun_name}}))
-                .chain(sm.statuses.iter().map(move |s| serde_json::json!({"id": format!("status:{}:{}", n, s), "type": "Status", "domain": slug, "data": {"name": s, "stateMachineDefinition": n}})))
-                .chain(sm.transitions.iter().map(move |t| serde_json::json!({"id": format!("transition:{}:{}:{}", n, t.from, t.event), "type": "Transition", "domain": slug, "data": {"from": t.from, "to": t.to, "event": t.event, "stateMachineDefinition": n}})))
-        }).collect(),
-        // α(rule → json) + α(fact → json)
-        d.derivation_rules.iter().map(|r| serde_json::json!({"id": format!("rule:{}", r.id), "type": "Derivation Rule", "domain": slug,
-            "data": {"ruleId": r.id, "text": r.text, "antecedentFactTypeIds": serde_json::to_string(&r.antecedent_fact_type_ids).unwrap_or_default(),
-                "consequentFactTypeId": r.consequent_fact_type_id, "kind": serde_json::to_string(&r.kind).unwrap_or_default(),
-                "joinOn": serde_json::to_string(&r.join_on).unwrap_or_default(), "matchOn": serde_json::to_string(&r.match_on).unwrap_or_default(),
-                "consequentBindings": serde_json::to_string(&r.consequent_bindings).unwrap_or_default()}})).collect(),
-        d.general_instance_facts.iter().map(|f| serde_json::json!({"id": format!("instance-fact:{}:{}:{}", f.subject_noun, f.subject_value, f.field_name), "type": "Instance Fact", "domain": slug,
-            "data": {"subjectNoun": f.subject_noun, "subjectValue": f.subject_value, "fieldName": f.field_name, "objectNoun": f.object_noun, "objectValue": f.object_value}})).collect(),
-    ].concat();
-    serde_json::to_string(&e).unwrap_or_else(|_| "[]".into())
-}
 
-pub fn parse_markdown(input: &str) -> Result<Domain, String> {
+pub(crate) fn parse_markdown(input: &str) -> Result<Domain, String> {
     let mut ir = Domain {
         domain: String::new(), nouns: HashMap::new(), fact_types: HashMap::new(),
         constraints: vec![], state_machines: HashMap::new(), derivation_rules: vec![],
@@ -1099,15 +1057,6 @@ pub fn parse_markdown(input: &str) -> Result<Domain, String> {
     };
     parse_into(&mut ir, input)?;
     Ok(ir)
-}
-
-/// Re-resolve derivation rules after a state_to_domain round-trip.
-/// The round-trip loses antecedent IDs, join keys, and kind classification.
-/// This rebuilds them from the rule text against the domain's fact types.
-pub fn re_resolve_derivation_rules(domain: &mut Domain) {
-    let mut rules = core::mem::take(&mut domain.derivation_rules);
-    re_resolve_rules(&mut rules, &domain.nouns, &domain.fact_types);
-    domain.derivation_rules = rules;
 }
 
 /// Re-resolve a rules vec given just the typed lookups it needs.

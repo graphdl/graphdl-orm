@@ -15,7 +15,7 @@ use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 
 /// Verbalize a constraint back to its FORML 2 reading.
 #[cfg(test)]
-pub fn verbalize_constraint(constraint: &ConstraintDef, ir: &crate::parse_forml2::Domain) -> String {
+pub(crate) fn verbalize_constraint(constraint: &ConstraintDef, ir: &crate::parse_forml2::Domain) -> String {
     let modal = match (constraint.modality.as_str(), constraint.deontic_operator.as_deref()) {
         ("deontic", Some("forbidden")) => "It is forbidden that ",
         ("deontic", Some("obligatory")) => "It is obligatory that ",
@@ -77,7 +77,7 @@ pub fn verbalize_constraint(constraint: &ConstraintDef, ir: &crate::parse_forml2
 
 /// Verbalize an entity type declaration.
 #[cfg(test)]
-pub fn verbalize_noun(name: &str, def: &NounDef, ir: &crate::parse_forml2::Domain) -> String {
+pub(crate) fn verbalize_noun(name: &str, def: &NounDef, ir: &crate::parse_forml2::Domain) -> String {
     match def.object_type.as_str() {
         "entity" => {
             if let Some(refs) = ir.ref_schemes.get(name) {
@@ -100,7 +100,7 @@ pub fn verbalize_noun(name: &str, def: &NounDef, ir: &crate::parse_forml2::Domai
 
 /// Verbalize a subtype declaration.
 #[cfg(test)]
-pub fn verbalize_subtype(name: &str, ir: &crate::parse_forml2::Domain) -> Option<String> {
+pub(crate) fn verbalize_subtype(name: &str, ir: &crate::parse_forml2::Domain) -> Option<String> {
     ir.subtypes.get(name).map(|sup| format!("{} is a subtype of {}.", name, sup))
 }
 
@@ -125,7 +125,7 @@ fn ir_section(title: Option<&str>, body: Vec<String>) -> Vec<String> {
 
 /// Verbalize an entire IR back to a FORML 2 document.
 #[cfg(test)]
-pub fn verbalize_ir(ir: &crate::parse_forml2::Domain) -> String {
+pub(crate) fn verbalize_ir(ir: &crate::parse_forml2::Domain) -> String {
     // Domain header as an optional pair of lines.
     let header: Vec<String> = (!ir.domain.is_empty())
         .then(|| vec![format!("# {}", ir.domain), String::new()])
