@@ -1637,8 +1637,7 @@ fn platform_compile(x: &Object, d: &Object) -> Object {
 
     // Structural model validation (#48) — catch FORML2 violations.
     // Warnings only for now — pre-existing metamodel issues need cleanup first.
-    let merged_domain = crate::compile::state_to_domain(&merged_state);
-    let model_errors = crate::compile::validate_model(&merged_domain);
+    let model_errors = crate::compile::validate_model_from_state(&merged_state);
     model_errors.iter().for_each(|e| { diag!("[model warning] {}", e); });
 
     // Compile defs from merged state + re-register platform primitives
