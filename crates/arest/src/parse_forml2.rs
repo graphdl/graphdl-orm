@@ -1686,6 +1686,10 @@ fn resolve_derivation_rule(rule: &mut DerivationRuleDef, ir: &Domain, catalog: &
                     .replace(" has no ", " has ")
                     .replace(" does not ", " ");
                 let pos = pos.trim_start_matches("no ").trim_start_matches("not ");
+                // Strip " where ..." suffix — negated clauses with
+                // where-filters ("no X is defined in Y where Z")
+                // need the base FT without the filter tail.
+                let pos = pos.split(" where ").next().unwrap_or(pos);
                 resolve_fact_type(pos)
             });
 
