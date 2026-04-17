@@ -14,6 +14,7 @@
 
 use crate::ast::{binding, fetch_or_phi, Object};
 use crate::rmap::{self, TableDef};
+use crate::types::StateMachineDef;
 #[allow(unused_imports)]
 use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 
@@ -37,8 +38,7 @@ pub fn compile_to_verilog(state: &Object) -> String {
 
     let nouns = fetch_or_phi("Noun", state);
     // Compute RMAP tables for column-derived ports.
-    let domain = crate::compile::state_to_domain(state);
-    let tables = rmap::rmap(&domain);
+    let tables = rmap::rmap_from_state(state);
     let table_map: hashbrown::HashMap<String, &TableDef> = tables.iter()
         .map(|t| (t.name.clone(), t)).collect();
 
@@ -84,7 +84,7 @@ pub fn compile_to_verilog(state: &Object) -> String {
     // State-machine modules. Each SM declared in state gets a module
     // with (clk, rst_n, event_code, status) ports and a case-dispatch
     // transition table keyed on (current status, event code).
-    let (sm_modules, sm_specs) = emit_sm_modules(&domain.state_machines);
+    let (sm_modules, sm_specs) = emit_sm_modules(&state_machines_from_state(state));
     modules.extend(sm_modules);
 
     // Per-noun BRAM cell memory map (#166). One dual-port bank per
@@ -191,6 +191,55 @@ endmodule
 /// code; otherwise a two-level case dispatch on `(current_status,
 /// event_code)` either advances to the destination status or holds.
 ///
+/// Extract state machines directly from InstanceFact cells in state.
+/// No Domain round-trip — reads the same cells domain_to_state would.
+fn state_machines_from_state(state: &Object) -> hashbrown::HashMap<String, StateMachineDef> {
+    let inst = fetch_or_phi("InstanceFact", state);
+    let facts = inst.as_seq().unwrap_or(&[]);
+    let b = |f: &Object, k: &str| binding(f, k).unwrap_or("").to_string();
+
+    let mut sms: hashbrown::HashMap<String, StateMachineDef> = hashbrown::HashMap::new();
+    // "State Machine Definition 'X' is for Noun 'Y'"
+    for f in facts.iter().filter(|f| b(f, "subjectNoun") == "State Machine Definition" && b(f, "fieldName").contains("is for")) {
+        let sm_name = b(f, "subjectValue");
+        let noun = b(f, "objectValue");
+        sms.entry(noun).or_insert_with(|| StateMachineDef {
+            noun_name: sm_name, statuses: vec![], transitions: vec![],
+        });
+    }
+    // "Status 'Z' is defined in State Machine Definition 'X'"
+    for f in facts.iter().filter(|f| b(f, "subjectNoun") == "Status" && b(f, "fieldName").contains("defined in")) {
+        let status = b(f, "subjectValue");
+        let sm_name = b(f, "objectValue");
+        if let Some(sm) = sms.values_mut().find(|s| s.noun_name == sm_name) {
+            if !sm.statuses.contains(&status) { sm.statuses.push(status); }
+        }
+    }
+    // Transitions
+    for f in facts.iter().filter(|f| b(f, "subjectNoun") == "Transition") {
+        let trans_name = b(f, "subjectValue");
+        let field = b(f, "fieldName");
+        let value = b(f, "objectValue");
+        for sm in sms.values_mut() {
+            let t = sm.transitions.iter_mut().find(|t| t.event == trans_name);
+            match t {
+                Some(t) => {
+                    if field.contains("from") { t.from = value.clone(); }
+                    if field.contains("to") { t.to = value.clone(); }
+                }
+                None => {
+                    let mut td = crate::types::TransitionDef { event: trans_name.clone(), from: String::new(), to: String::new(), guard: None };
+                    if field.contains("from") { td.from = value.clone(); }
+                    if field.contains("to") { td.to = value.clone(); }
+                    if field.contains("triggered") { td.event = value.clone(); }
+                    sm.transitions.push(td);
+                }
+            }
+        }
+    }
+    sms
+}
+
 /// Status codes are assigned by position in `StateMachineDef::statuses`
 /// (compile-time deterministic per SM). Event codes are FNV-1a 32-bit
 /// hashes of the event string, so external drivers encode events the
