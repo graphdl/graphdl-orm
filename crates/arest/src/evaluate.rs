@@ -463,7 +463,9 @@ mod tests {
     }
 
     fn ir_to_defs(ir: &Domain) -> (ast::Object, Vec<(String, ast::Func)>, ast::Object) {
-        let model = crate::compile::compile_from_domain(ir);
+        // Via Object state: the AREST pipeline per Thm 2 (parse R→Φ, compile Φ→O).
+        let state = crate::parse_forml2::domain_to_state(ir);
+        let model = crate::compile::compile(&state);
         let defs: Vec<(String, ast::Func)> = model.constraints.iter()
             .map(|c| (format!("constraint:{}", c.id), c.func.clone()))
             .chain(model.state_machines.iter().flat_map(|sm| [
@@ -473,7 +475,6 @@ mod tests {
             .chain(model.derivations.iter().map(|d| (format!("derivation:{}", d.id), d.func.clone())))
             .chain(model.schemas.iter().map(|(id, schema)| (format!("schema:{}", id), schema.construction.clone())))
             .collect();
-        let state = crate::parse_forml2::domain_to_state(ir);
         let def_map = ast::defs_to_state(&defs, &state);
         (state, defs, def_map)
     }

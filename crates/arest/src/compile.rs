@@ -1469,7 +1469,11 @@ pub(crate) fn domain_data_from_state(state: &crate::ast::Object) -> DomainData {
         for f in ns.iter() {
             let name = binding(f, "name").unwrap_or("").to_string();
             let obj_type = binding(f, "objectType").unwrap_or("entity").to_string();
-            nouns.insert(name.clone(), NounDef { object_type: obj_type, world_assumption: WorldAssumption::default() });
+            let wa = match binding(f, "worldAssumption") {
+                Some("open") => WorldAssumption::Open,
+                _ => WorldAssumption::Closed,
+            };
+            nouns.insert(name.clone(), NounDef { object_type: obj_type, world_assumption: wa });
             if let Some(st) = binding(f, "superType") { subtypes.insert(name.clone(), st.to_string()); }
             if let Some(v) = binding(f, "referenceScheme") { ref_schemes.insert(name.clone(), v.split(',').map(|s| s.to_string()).collect()); }
             if let Some(v) = binding(f, "enumValues") { enum_values.insert(name.clone(), v.split(',').map(|s| s.to_string()).collect()); }
@@ -1491,6 +1495,12 @@ pub(crate) fn domain_data_from_state(state: &crate::ast::Object) -> DomainData {
         }).collect()).unwrap_or_default();
     let constraints: Vec<ConstraintDef> = fetch_or_phi("Constraint", state).as_seq()
         .map(|facts| facts.iter().map(|f| {
+            // Lossless JSON path under std-deps.
+            #[cfg(feature = "std-deps")]
+            if let Some(json) = binding(f, "json") {
+                if let Ok(c) = serde_json::from_str::<ConstraintDef>(json) { return c; }
+            }
+            // Fallback: reconstruct from flat fields.
             let get = |key: &str| binding(f, key).map(|s| s.to_string());
             let spans = (0..4).filter_map(|i| {
                 let ft_id = get(&format!("span{}_factTypeId", i))?;
@@ -1507,6 +1517,16 @@ pub(crate) fn domain_data_from_state(state: &crate::ast::Object) -> DomainData {
         }).collect()).unwrap_or_default();
     let derivation_rules: Vec<DerivationRuleDef> = fetch_or_phi("DerivationRule", state).as_seq()
         .map(|facts| facts.iter().map(|f| {
+            // Lossless path: deserialize full struct from the `json` field
+            // if present (written by domain_to_state under std-deps).
+            #[cfg(feature = "std-deps")]
+            if let Some(json) = binding(f, "json") {
+                if let Ok(r) = serde_json::from_str::<DerivationRuleDef>(json) {
+                    return r;
+                }
+            }
+            // Fallback: reconstruct skeleton from flat fields. re_resolve_rules
+            // rebuilds from text below.
             let get = |key: &str| binding(f, key).unwrap_or("").to_string();
             DerivationRuleDef {
                 id: get("id"), text: get("text"), antecedent_fact_type_ids: vec![],
@@ -1525,12 +1545,35 @@ pub(crate) fn domain_data_from_state(state: &crate::ast::Object) -> DomainData {
                 field_name: get("fieldName"), object_noun: get("objectNoun"), object_value: get("objectValue"),
             }
         }).collect()).unwrap_or_default();
-    let state_machines = derive_state_machines_from_facts(&general_instance_facts);
+    // State machines: prefer StateMachine cell (hand-built or lossless-serialized),
+    // else derive from instance facts.
+    let state_machines: HashMap<String, StateMachineDef> = {
+        #[cfg(feature = "std-deps")]
+        {
+            let cell_sms: HashMap<String, StateMachineDef> = fetch_or_phi("StateMachine", state).as_seq()
+                .map(|facts| facts.iter().filter_map(|f| {
+                    let name = binding(f, "name")?.to_string();
+                    let json = binding(f, "json")?;
+                    serde_json::from_str::<StateMachineDef>(json).ok().map(|sm| (name, sm))
+                }).collect()).unwrap_or_default();
+            if !cell_sms.is_empty() { cell_sms } else { derive_state_machines_from_facts(&general_instance_facts) }
+        }
+        #[cfg(not(feature = "std-deps"))]
+        { derive_state_machines_from_facts(&general_instance_facts) }
+    };
 
     // Re-resolve against cell data directly — no Domain struct (#211).
+    // Skip if the rule already has structured bindings (lossless JSON path).
     let resolved_rules = {
         let mut rules = derivation_rules;
-        crate::parse_forml2::re_resolve_rules(&mut rules, &nouns, &fact_types);
+        let needs_resolve = rules.iter().any(|r|
+            r.antecedent_fact_type_ids.is_empty()
+                && r.consequent_aggregates.is_empty()
+                && r.consequent_computed_bindings.is_empty()
+        );
+        if needs_resolve {
+            crate::parse_forml2::re_resolve_rules(&mut rules, &nouns, &fact_types);
+        }
         rules
     };
 
@@ -1538,22 +1581,11 @@ pub(crate) fn domain_data_from_state(state: &crate::ast::Object) -> DomainData {
         subtypes, ref_schemes, enum_values, general_instance_facts, state_machines }
 }
 
-/// Compile from a Domain directly (used by tests that build Domain structs).
-/// Converts Domain fields into DomainData without a state round-trip.
+/// Test-only convenience: compile a Domain via Object state (Thm 2 pipeline).
+/// Per #211, there is no direct Domain→CompiledModel path — only via Φ.
 #[cfg(test)]
 pub(crate) fn compile_from_domain(ir: &crate::parse_forml2::Domain) -> CompiledModel {
-    let data = DomainData {
-        nouns: ir.nouns.clone(),
-        fact_types: ir.fact_types.clone(),
-        constraints: ir.constraints.clone(),
-        derivation_rules: ir.derivation_rules.clone(),
-        subtypes: ir.subtypes.clone(),
-        ref_schemes: ir.ref_schemes.clone(),
-        enum_values: ir.enum_values.clone(),
-        general_instance_facts: ir.general_instance_facts.clone(),
-        state_machines: ir.state_machines.clone(),
-    };
-    compile_data(&data)
+    compile(&crate::parse_forml2::domain_to_state(ir))
 }
 
 pub(crate) fn compile(state: &crate::ast::Object) -> CompiledModel {
