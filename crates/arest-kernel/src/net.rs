@@ -25,10 +25,11 @@
 // inside the kernel before any external packet flows exist.
 
 use alloc::vec::Vec;
-use smoltcp::iface::{Config, Interface, SocketSet};
+use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Loopback, Medium};
+use smoltcp::socket::dhcpv4;
 use smoltcp::time::Instant;
-use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr};
+use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Cidr};
 use spin::Mutex;
 
 /// Monotonically-increasing timestamp for smoltcp's scheduler. Once
@@ -56,6 +57,25 @@ struct NetState {
     device: Loopback,
     iface: Interface,
     sockets: SocketSet<'static>,
+    /// DHCPv4 client socket (#263). Registered at boot; `poll` picks
+    /// up `Event::Configured` once the lease arrives and calls
+    /// `apply_dhcp_config` to install the IP, netmask, and default
+    /// gateway on the interface. Inactive over Loopback (no DHCP
+    /// server), so `dhcp_lease()` returns None until virtio-net is
+    /// live and a real DHCP server responds.
+    dhcp_handle: SocketHandle,
+    /// Cached lease info so the banner / status calls can report
+    /// the assigned address without re-polling the socket.
+    lease: Option<DhcpLease>,
+}
+
+/// Snapshot of a DHCPv4 lease. Populated when the DHCP socket
+/// transitions to the Configured state. Cleared on Deconfigured.
+#[derive(Debug, Clone)]
+pub struct DhcpLease {
+    pub address: Ipv4Cidr,
+    pub router: Option<smoltcp::wire::Ipv4Address>,
+    pub dns_servers: Vec<smoltcp::wire::Ipv4Address>,
 }
 
 /// Initialise the network stack with a loopback interface at
@@ -76,19 +96,76 @@ pub fn init() {
             .expect("loopback address push");
     });
 
-    let sockets = SocketSet::new(Vec::new());
+    let mut sockets = SocketSet::new(Vec::new());
 
-    *NET.lock() = Some(NetState { device, iface, sockets });
+    // DHCPv4 client socket (#263). Registered here so that the
+    // moment a real Ethernet NIC (#262) drops in, `poll` will
+    // DISCOVER/REQUEST a lease automatically — no extra wiring
+    // needed at the call site. Over Loopback the socket simply
+    // times out and retries; harmless.
+    let dhcp_socket = dhcpv4::Socket::new();
+    let dhcp_handle = sockets.add(dhcp_socket);
+
+    *NET.lock() = Some(NetState {
+        device,
+        iface,
+        sockets,
+        dhcp_handle,
+        lease: None,
+    });
 }
 
 /// Drive the stack forward. Call from the idle loop or timer IRQ.
 /// Returns true if any socket woke up (i.e. caller has work to do).
+///
+/// Side effect: if the DHCPv4 socket transitioned to Configured or
+/// Deconfigured since the last poll, the interface's IP address,
+/// gateway, and DNS list are updated in place.
 pub fn poll() -> bool {
     use smoltcp::iface::PollResult;
     let mut guard = NET.lock();
     let Some(state) = guard.as_mut() else { return false; };
-    let NetState { device, iface, sockets } = state;
-    matches!(iface.poll(now(), device, sockets), PollResult::SocketStateChanged)
+    let changed = matches!(
+        state.iface.poll(now(), &mut state.device, &mut state.sockets),
+        PollResult::SocketStateChanged,
+    );
+
+    // Drain DHCP events every poll, regardless of whether socket
+    // state "changed" — smoltcp reports on a different axis.
+    let dhcp = state.sockets.get_mut::<dhcpv4::Socket>(state.dhcp_handle);
+    if let Some(event) = dhcp.poll() {
+        match event {
+            dhcpv4::Event::Configured(config) => {
+                state.lease = Some(DhcpLease {
+                    address: config.address,
+                    router: config.router,
+                    dns_servers: config.dns_servers.iter().copied().collect(),
+                });
+                state.iface.update_ip_addrs(|addrs| {
+                    addrs.clear();
+                    let _ = addrs.push(IpCidr::Ipv4(config.address));
+                });
+                if let Some(router) = config.router {
+                    let _ = state.iface.routes_mut()
+                        .add_default_ipv4_route(router);
+                } else {
+                    state.iface.routes_mut().remove_default_ipv4_route();
+                }
+            }
+            dhcpv4::Event::Deconfigured => {
+                state.lease = None;
+                state.iface.update_ip_addrs(|addrs| addrs.clear());
+                state.iface.routes_mut().remove_default_ipv4_route();
+            }
+        }
+    }
+    changed
+}
+
+/// Most recent DHCP lease (address + gateway + DNS). `None` until
+/// a real NIC comes up and a DHCP server responds.
+pub fn dhcp_lease() -> Option<DhcpLease> {
+    NET.lock().as_ref().and_then(|s| s.lease.clone())
 }
 
 /// Report whether the stack is initialised — used by the banner so
