@@ -2239,6 +2239,46 @@ pub fn cells_iter(state: &Object) -> Vec<(&str, &Object)> {
     }
 }
 
+/// Diff two cell stores: return an Object::Map containing only cells
+/// whose contents differ between `old` and `new`. Cells present in
+/// `new` but absent from `old` are included. Cells present only in
+/// `old` are omitted (delta semantics: delta applied on top of old
+/// reaches new for the cells we ship; cells dropped entirely are a
+/// structural change that belongs on a different path).
+///
+/// Used by task #209 to scope __state in CommandResult so create /
+/// update / transition return only the cells they modified, not a
+/// full D. Per AREST §5.4, each cell is independent; the delta is the
+/// minimal patch that can reach new from old.
+pub fn diff_cells(old: &Object, new: &Object) -> Object {
+    let new_cells: Vec<(&str, &Object)> = cells_iter(new);
+    let delta: HashMap<String, Object> = new_cells.into_iter()
+        .filter(|(k, v)| {
+            let prev = fetch_or_phi(k, old);
+            prev != **v
+        })
+        .map(|(k, v)| (k.to_string(), v.clone()))
+        .collect();
+    Object::Map(delta)
+}
+
+/// Merge a cell delta onto a base store. For each cell in `delta`,
+/// overwrite the corresponding cell in `base`; other cells pass
+/// through unchanged. Complement of `diff_cells`: for any (old, new),
+/// `merge_delta(old, diff_cells(old, new)) == new` for the cells
+/// present in new.
+pub fn merge_delta(base: &Object, delta: &Object) -> Object {
+    let base_map: HashMap<String, Object> = cells_iter(base).into_iter()
+        .map(|(k, v)| (k.to_string(), v.clone()))
+        .collect();
+    let delta_map: HashMap<String, Object> = cells_iter(delta).into_iter()
+        .map(|(k, v)| (k.to_string(), v.clone()))
+        .collect();
+    let mut merged = base_map;
+    for (k, v) in delta_map { merged.insert(k, v); }
+    Object::Map(merged)
+}
+
 /// Demultiplex events by cell assignment (paper Eq. demux).
 /// E_n = Filter(eq ∘ [RMAP, n̄]) : E
 /// Splits a sequence of (fact_type_id, fact) pairs into per-cell groups
@@ -4169,6 +4209,87 @@ mod tests {
         assert_eq!(pairs.len(), 2);
         assert_eq!(pairs[0].0, "A");
         assert_eq!(pairs[1].0, "B");
+    }
+
+    // #209 — diff_cells / merge_delta round-trip invariants.
+
+    #[test]
+    fn diff_cells_of_identical_stores_is_empty() {
+        let state = Object::seq(vec![
+            cell("A", Object::atom("1")),
+            cell("B", Object::atom("2")),
+        ]);
+        let delta = diff_cells(&state, &state);
+        let map = delta.as_map().expect("delta is Map");
+        assert!(map.is_empty(), "identical stores must produce empty delta");
+    }
+
+    #[test]
+    fn diff_cells_from_phi_returns_all_cells() {
+        let new = Object::seq(vec![
+            cell("A", Object::atom("1")),
+            cell("B", Object::atom("2")),
+        ]);
+        let delta = diff_cells(&Object::phi(), &new);
+        let map = delta.as_map().expect("delta is Map");
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get("A"), Some(&Object::atom("1")));
+        assert_eq!(map.get("B"), Some(&Object::atom("2")));
+    }
+
+    #[test]
+    fn diff_cells_emits_only_changed_cells() {
+        let old = Object::seq(vec![
+            cell("A", Object::atom("1")),
+            cell("B", Object::atom("2")),
+            cell("C", Object::atom("3")),
+        ]);
+        let new = Object::seq(vec![
+            cell("A", Object::atom("1")),          // unchanged
+            cell("B", Object::atom("CHANGED")),    // changed
+            cell("C", Object::atom("3")),          // unchanged
+            cell("D", Object::atom("4")),          // added
+        ]);
+        let delta = diff_cells(&old, &new);
+        let map = delta.as_map().expect("delta is Map");
+        assert_eq!(map.len(), 2, "only B and D should be in delta");
+        assert_eq!(map.get("B"), Some(&Object::atom("CHANGED")));
+        assert_eq!(map.get("D"), Some(&Object::atom("4")));
+        assert!(map.get("A").is_none());
+        assert!(map.get("C").is_none());
+    }
+
+    #[test]
+    fn merge_delta_is_inverse_of_diff_cells_for_present_cells() {
+        let old = Object::seq(vec![
+            cell("A", Object::atom("1")),
+            cell("B", Object::atom("2")),
+            cell("C", Object::atom("3")),
+        ]);
+        let new = Object::seq(vec![
+            cell("A", Object::atom("1")),
+            cell("B", Object::atom("CHANGED")),
+            cell("C", Object::atom("3")),
+            cell("D", Object::atom("4")),
+        ]);
+        let delta = diff_cells(&old, &new);
+        let reconstructed = merge_delta(&old, &delta);
+        for name in ["A", "B", "C", "D"] {
+            assert_eq!(fetch_or_phi(name, &reconstructed), fetch_or_phi(name, &new),
+                "cell {} must match after merge_delta(old, diff(old,new))", name);
+        }
+    }
+
+    #[test]
+    fn merge_delta_with_empty_delta_preserves_base() {
+        let base = Object::seq(vec![
+            cell("A", Object::atom("1")),
+            cell("B", Object::atom("2")),
+        ]);
+        let empty_delta = Object::Map(HashMap::new());
+        let merged = merge_delta(&base, &empty_delta);
+        assert_eq!(fetch_or_phi("A", &merged), Object::atom("1"));
+        assert_eq!(fetch_or_phi("B", &merged), Object::atom("2"));
     }
 
     #[test]

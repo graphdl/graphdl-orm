@@ -186,14 +186,14 @@ pub fn encode_update_input(
 /// Decode a compiled handler's Object result into CommandResult.
 ///
 /// Two shapes supported:
-/// 1. New (Map carrier): `{__state: Object, __result: JSON string atom}`
-///    — emit by encode_command_result. Parses the JSON back into fields.
+/// 1. Map carrier: `{__state_delta: Object, __result: JSON string atom}`
+///    — emitted by encode_command_result (#209). `state` holds the
+///    per-command delta.
 /// 2. Legacy (seq): `<entities, status, transitions, violations, derived_count, rejected, new_state>`
-///    — older encode format, kept for callers that haven't migrated.
 pub fn decode_command_result(obj: &ast::Object) -> CommandResult {
     // Try the Map carrier first.
     if let Some(map) = obj.as_map() {
-        let state = map.get("__state").cloned().unwrap_or_else(ast::Object::phi);
+        let state = map.get("__state_delta").cloned().unwrap_or_else(ast::Object::phi);
         let result_json = map.get("__result").and_then(|o| o.as_atom()).unwrap_or("");
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(result_json) {
             let entities = parsed.get("entities").and_then(|v| v.as_array())
@@ -291,21 +291,20 @@ pub fn decode_command_result(obj: &ast::Object) -> CommandResult {
 
 /// Encode a CommandResult as an Object for the dispatch layer.
 ///
-/// Returns a state-carrier Object: the new state is stored (keyed by
-/// CELL name "__state") alongside a JSON summary under "__result".
-/// system_impl recognizes the carrier shape, persists the state into
-/// the handle, and returns the JSON atom as the response body.
+/// Returns a delta-carrier Object (#209): `result.state` is now a
+/// per-command delta — only the cells the command modified — stored
+/// under the CELL name "__state_delta". system_impl merges this onto
+/// the snapshot before commit, so create / update / transition touch
+/// only their RMAP cells and leave schema cells untouched.
 ///
-/// The JSON is compact — entities + status + transitions + violations
-/// + derived_count + rejected — *without* dumping the full D. That
-/// keeps MCP/HTTP responses small and JSON-parseable. Previous encoding
-/// embedded the entire state (often megabytes) in the response.
+/// The JSON summary under "__result" is compact — entities + status +
+/// transitions + violations + derived_count + rejected — *without*
+/// dumping the full D. That keeps MCP/HTTP responses small and
+/// JSON-parseable.
 pub fn encode_command_result(result: &CommandResult) -> ast::Object {
     let summary = serde_json::to_string(&result).unwrap_or_else(|_| "{}".into());
-    // Two-cell Map: __state carries the post-command D so the handle can
-    // persist it; __result is the JSON-string atom the caller sees.
     let mut cells = hashbrown::HashMap::new();
-    cells.insert("__state".to_string(), result.state.clone());
+    cells.insert("__state_delta".to_string(), result.state.clone());
     cells.insert("__result".to_string(), ast::Object::atom(&summary));
     ast::Object::Map(cells)
 }
@@ -342,7 +341,7 @@ pub fn apply_command_defs(
             violations: vec![],
             derived_count: 0,
             rejected: false,
-            state: state.clone(),
+            state: ast::Object::phi(),
         },
     }
 }
@@ -664,10 +663,13 @@ fn create_via_defs(
         sender,
         Some(&entity_id),
     );
+    // #209: return only the cells this command modified, not the full D.
+    // system_impl merges this delta onto the snapshot before commit.
+    let delta = ast::diff_cells(state, &final_state);
     CommandResult {
         entities, status, transitions, navigation, violations,
         derived_count: derived.len(), rejected,
-        state: final_state,
+        state: delta,
     }
 }
 
@@ -722,6 +724,8 @@ fn transition_via_defs(
     let transitions = hateoas_via_rho(d, &noun, entity_id, status.as_deref());
     let navigation = nav_links_via_rho(d, &noun, entity_id);
 
+    // #209: return only the status-cell delta, not the full D.
+    let delta = ast::diff_cells(state, &new_state);
     CommandResult {
         entities: vec![],
         status,
@@ -730,7 +734,7 @@ fn transition_via_defs(
         violations: vec![],
         derived_count: 0,
         rejected: false,
-        state: new_state,
+        state: delta,
     }
 }
 
@@ -788,7 +792,8 @@ fn query_via_defs(
         violations: vec![],
         derived_count: 0,
         rejected: false,
-        state: state.clone(),
+        // #209: queries don't mutate state — empty delta.
+        state: ast::Object::phi(),
     }
 }
 
@@ -879,6 +884,10 @@ fn update_via_defs(
     let transitions = hateoas_via_rho(d, noun, entity_id, status.as_deref());
     let navigation = nav_links_via_rho(d, noun, entity_id);
 
+    // #209: return only the cells this update modified. When rejected,
+    // emit an empty delta (no cells change); otherwise diff new_state
+    // against the input state so only touched FT cells ship.
+    let delta = if rejected { ast::Object::phi() } else { ast::diff_cells(state, &new_state) };
     CommandResult {
         entities: vec![EntityResult {
             id: entity_id.to_string(),
@@ -891,7 +900,7 @@ fn update_via_defs(
         violations,
         derived_count: derived.len(),
         rejected,
-        state: if rejected { state.clone() } else { new_state },
+        state: delta,
     }
 }
 
@@ -1044,7 +1053,8 @@ fn apply_load_readings(
                 }],
                 derived_count: 0,
                 rejected: true,
-                state: state.clone(),
+                // #209: parse failed — no state change.
+                state: ast::Object::phi(),
             };
         }
     };
@@ -1074,6 +1084,11 @@ fn apply_load_readings(
     data.insert("domain".to_string(), domain.to_string());
     data.insert("nouns".to_string(), new_noun_count.to_string());
 
+    // #209: load_readings is a schema-level mutation (Cor 5). Diff the
+    // recompiled D against the input snapshot so the delta carries new
+    // nouns, new FTs, new constraints, and replaced defs — not the
+    // entire store. merge_delta on commit reconstructs the full D.
+    let delta = ast::diff_cells(state, &new_d);
     CommandResult {
         entities: vec![EntityResult {
             id: format!("schema:{}", domain),
@@ -1086,8 +1101,7 @@ fn apply_load_readings(
         violations: vec![],
         derived_count: new_noun_count,
         rejected: false,
-        // Return full D (state + recompiled defs) — Corollary 5
-        state: new_d,
+        state: delta,
     }
 }
 
