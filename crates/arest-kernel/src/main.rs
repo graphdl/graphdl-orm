@@ -35,6 +35,7 @@ mod memory;
 mod net;
 mod repl;
 mod serial;
+mod virtio;
 
 use alloc::string::ToString;
 use bootloader_api::{BootInfo, entry_point};
@@ -49,6 +50,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     interrupts::init_idt();
     interrupts::init_pic();
     memory::init(boot_info);
+    virtio::init_offset(
+        boot_info.physical_memory_offset.into_option()
+            .expect("bootloader did not supply physical_memory_offset"),
+    );
     net::init();
 
     // Collect memory stats for the banner.
