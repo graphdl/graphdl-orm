@@ -304,6 +304,20 @@ fn try_ring(line: &str, noun_names: &[String]) -> Option<ParseAction> {
     }))
 }
 
+/// True when `clause` has the shape `<Noun> has <Noun> '<literal>'`
+/// with both nouns declared. Accepts state-machine status filters and
+/// enum-value filters where the underlying FT isn't always declared
+/// textually (e.g. Status is SM-managed).
+fn is_noun_has_noun_literal(clause: &str, noun_names: &[String]) -> bool {
+    let trimmed = clause.trim().trim_end_matches('.');
+    let re = regex::Regex::new(r"^(.+?) has (.+?) '[^']*'$").expect("static");
+    let Some(caps) = re.captures(trimmed) else { return false; };
+    let subj = caps.get(1).map(|m| m.as_str().trim()).unwrap_or_default();
+    let attr = caps.get(2).map(|m| m.as_str().trim()).unwrap_or_default();
+    let is_noun = |s: &str| noun_names.iter().any(|n| n == s);
+    is_noun(subj) && is_noun(attr)
+}
+
 /// True when `clause` has the shape `<Noun> is (a|an) <Noun>` with
 /// both sides resolving to declared nouns. Treated as a typing
 /// predicate rather than a fact-type reference.
@@ -1205,9 +1219,66 @@ pub(crate) fn re_resolve_rules(
     });
 }
 
+/// Fold indented continuation lines into their derivation-rule head.
+///
+/// A derivation rule like
+/// ```text
+/// * Milestone has done Task Count iff done Task Count is the count of Task
+///   where Task targets that Milestone
+///   and Task has Status 'Done'.
+/// ```
+/// is authored across three physical lines for readability. The per-line
+/// recognizers downstream only see the head, so the `where` and `and`
+/// clauses are dropped and the resolver later flags the truncated
+/// aggregate as unresolved.
+///
+/// Join rule: once a line is recognised as a derivation rule (contains
+/// ` iff `, ` if ` used as marker, ` := `, or starts with a derivation
+/// marker token `*` / `**` / `+`), swallow any subsequent lines that
+/// start with whitespace until either a non-indented line appears or
+/// the accumulated text terminates with `.`. Other indented lines
+/// (constraint blocks under fact type headers, for example) pass
+/// through unchanged.
+fn join_derivation_continuations(input: &str) -> Vec<String> {
+    let raw: Vec<String> = input.lines().map(|s| s.to_string()).collect();
+    let mut out: Vec<String> = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        let line = &raw[i];
+        let stripped = line.trim_start();
+        let is_derivation_head = stripped.starts_with("* ")
+            || stripped.starts_with("** ")
+            || stripped.starts_with("+ ")
+            || stripped.contains(" iff ")
+            || (stripped.contains(" if ") && !stripped.starts_with("If "))
+            || stripped.contains(" := ");
+        if !is_derivation_head || line.trim_end().ends_with('.') {
+            out.push(line.clone());
+            i += 1;
+            continue;
+        }
+        // Accumulate until a non-indented line or a `.`-terminated line.
+        let mut joined = line.trim_end().to_string();
+        let mut j = i + 1;
+        while j < raw.len() {
+            let cont = &raw[j];
+            let is_indented = cont.starts_with(' ') || cont.starts_with('\t');
+            if !is_indented || cont.trim().is_empty() { break; }
+            joined.push(' ');
+            joined.push_str(cont.trim());
+            let terminated = joined.ends_with('.');
+            j += 1;
+            if terminated { break; }
+        }
+        out.push(joined);
+        i = j;
+    }
+    out
+}
+
 fn parse_into(ir: &mut ParseCtx, input: &str) -> Result<(), String> {
 
-    let lines: Vec<String> = input.lines().map(|s| s.to_string()).collect();
+    let lines: Vec<String> = join_derivation_continuations(input);
 
     // Pass 1: alpha(recognize_noun) : lines -- extract nouns and domain
     (0..lines.len()).for_each(|i| {
@@ -1584,19 +1655,27 @@ fn parse_into(ir: &mut ParseCtx, input: &str) -> Result<(), String> {
 fn try_parse_aggregate_clause(text: &str, noun_names: &[String]) -> Option<(String, String, String, String)> {
     let t = text.trim().trim_end_matches('.').trim();
     let t = t.strip_prefix("that ").unwrap_or(t);
+    // `where <filter>` is optional — `done Task Count is the count of Task`
+    // (no where clause) is as valid as the filtered form.
     let re = regex::Regex::new(
-        r"^(.+?) is the (count|sum|avg|min|max) of (.+?) where (.+)$"
+        r"^(.+?) is the (count|sum|avg|min|max) of (.+?)(?: where (.+))?$"
     ).expect("static regex compiles");
     let caps = re.captures(t)?;
     let role = caps.get(1)?.as_str().trim().to_string();
     let op = caps.get(2)?.as_str().to_string();
     let target = caps.get(3)?.as_str().trim().to_string();
-    let where_clause = caps.get(4)?.as_str().trim().to_string();
-    // Consequent role and target must be declared nouns. Without that
-    // check, free text accidentally matches the regex and pollutes the
-    // aggregate list.
-    if !noun_names.iter().any(|n| n == &role) { return None; }
-    if !noun_names.iter().any(|n| n == &target) { return None; }
+    let where_clause = caps.get(4).map(|m| m.as_str().trim().to_string()).unwrap_or_default();
+    // Target must resolve against the noun catalog — either the full
+    // string is a declared noun, or its first space-separated token
+    // is (for compound role paths like `LineItem Amount` meaning the
+    // Amount role of LineItem). Role name is not required to be
+    // declared: derivation rules may introduce implicit role names
+    // for derived aggregates (e.g. `done Task Count`) that never
+    // appear as standalone entity / value types.
+    let target_resolves = noun_names.iter().any(|n| n == &target)
+        || target.split_whitespace().next()
+            .map_or(false, |first| noun_names.iter().any(|n| n == first));
+    if !target_resolves { return None; }
     Some((role, op, target, where_clause))
 }
 
@@ -1929,8 +2008,16 @@ fn resolve_derivation_rule(
         // (1) Comparator-stripped FT lookup (direct + hyphen fallback + negation fallback)
         let (stripped, comparator) = split_antecedent_comparator(part);
         let dehyphenated = stripped.replace("- ", " ").replace(" -", " ");
+        // Strip a trailing `' <value>'` literal (single-quoted) so
+        // `Task has Status 'Done'` resolves to the FT `Task has Status`
+        // just like its unquoted form. The literal is semantically a
+        // filter on the last role, not part of the FT reading.
+        let literal_re = regex::Regex::new(r" '[^']*'\s*$").expect("static");
+        let destripped_literal = literal_re.replace(&stripped, "").to_string();
         let ft_resolved = resolve_fact_type(&stripped)
             .or_else(|| (dehyphenated != stripped).then(|| resolve_fact_type(&dehyphenated)).flatten())
+            .or_else(|| (destripped_literal != stripped)
+                .then(|| resolve_fact_type(&destripped_literal)).flatten())
             .or_else(|| {
                 let pos = strip_anaphora(part)
                     .replace(" is not ", " is ")
@@ -2000,6 +2087,14 @@ fn resolve_derivation_rule(
         //     path in branch (1)/(2) for readings that spell their
         //     comparators out.
         if is_word_comparator_clause(part, &noun_names) { continue; }
+
+        // (9) Literal-value filter: `<Noun> has <Noun> '<literal>'`.
+        //     Covers state-machine status filters (`Task has Status 'Done'`)
+        //     and enum-value filters (`Customer has Tier 'Gold'`) whose
+        //     FT isn't always declared textually when the role is
+        //     SM-managed or enum-valued. `resolve_fact_type` would miss
+        //     it; classify it here as a valid antecedent predicate.
+        if is_noun_has_noun_literal(part, &noun_names) { continue; }
 
         // Nothing classified this clause.
         rule.unresolved_clauses.push(part.to_string());
