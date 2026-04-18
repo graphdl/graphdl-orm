@@ -1,28 +1,40 @@
 // CLI driver — requires std (env, fs, process).
 // crates/arest/src/bin/check-cli.rs
 //
-// Standalone invoker for arest::check::check_readings. Reads every
-// *.md file in each directory passed on the command line (including
-// a sibling app.md of a readings/ subdir, matching arest-cli's
-// convention), concatenates the text, and runs the three-layer
-// readings checker (parse / resolve / deontic) against the merged
-// corpus. Prints diagnostics to stdout; exits 1 if any ERROR
-// diagnostics are reported.
+// Standalone invoker for arest::check_readings_with_metamodel. Reads
+// every *.md file in each directory passed on the command line
+// (including a sibling app.md of a readings/ subdir, matching
+// arest-cli's convention), concatenates the text, and runs the
+// three-layer readings checker (parse / resolve / deontic) against
+// the user corpus with the bundled metamodel preloaded so references
+// to metamodel-declared nouns (Noun, FactType, Domain, App, …)
+// resolve and don't flood diagnostics with false "undeclared" errors.
+//
+// Prints diagnostics to stdout; exits 1 if any ERROR diagnostics are
+// reported.
 //
 // Usage:
-//   check-cli <readings_dir> [<readings_dir> ...]
+//   check-cli [--no-metamodel] <readings_dir> [<readings_dir> ...]
+//
+// --no-metamodel  skip the auto-preload — use when checking the
+//                 bundled metamodel itself (readings/*.md) or a
+//                 replacement core.
 
-use arest::check::{check_readings, Level, Source};
+use arest::check::{Level, Source};
+use arest::{check_readings_with_metamodel, check::check_readings};
 
 fn main() {
-    let dirs: Vec<String> = std::env::args().skip(1).collect();
-    if dirs.is_empty() {
-        eprintln!("Usage: check-cli <readings_dir> [<readings_dir> ...]");
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let no_metamodel = args.iter().any(|a| a == "--no-metamodel");
+    args.retain(|a| a != "--no-metamodel");
+
+    if args.is_empty() {
+        eprintln!("Usage: check-cli [--no-metamodel] <readings_dir> [<readings_dir> ...]");
         std::process::exit(2);
     }
 
     let mut text = String::new();
-    for dir in &dirs {
+    for dir in &args {
         let path = std::path::Path::new(dir);
         if !path.is_dir() {
             eprintln!("Not a directory: {}", dir);
@@ -48,7 +60,10 @@ fn main() {
         }
     }
 
-    let diags = check_readings(&text);
+    let diags = match no_metamodel {
+        true => check_readings(&text),
+        false => check_readings_with_metamodel(&text),
+    };
     let mut err_count = 0usize;
     let mut warn_count = 0usize;
     let mut hint_count = 0usize;
