@@ -1425,6 +1425,22 @@ fn parse_into(ir: &mut ParseCtx, input: &str) -> Result<(), String> {
         cat
     };
 
+    // Pass 2a.5 (#214 follow-up): register derivation-rule consequents
+    // as synthetic FTs in the catalog so later rules can reference
+    // them as antecedents. Example: `Customer is in EEA iff ...`
+    // declares a derived unary; seven other rules in auto.dev use
+    // `Customer is in EEA` as an antecedent. Without this pre-pass
+    // the resolver treats each of those as "unresolved" because the
+    // catalog only knows declared FTs.
+    //
+    // Scan: any line containing a derivation marker (` iff `,
+    // mid-sentence ` if `, ` := `, `* ` / `+ ` / `** ` prefix) has a
+    // consequent on its left-hand side. The consequent text, when
+    // tokenized against the noun catalog, yields the role set for a
+    // synthetic FT the catalog should know about.
+    let mut catalog = catalog;
+    register_derivation_consequents_in_catalog(&lines, &noun_names, &mut catalog);
+
     // Pass 2b: Filter(!pass1) : lines, then apply constraint/derivation/deontic recognizers.
     (0..lines.len())
         .map(|i| (i, lines[i].trim()))
@@ -2399,6 +2415,85 @@ fn fact_type_id(role_nouns: &[&str], verb: &str) -> String {
     let mut parts: Vec<&str> = vec![&noun_parts[0], &verb_part];
     noun_parts[1..].iter().for_each(|n| parts.push(n));
     parts.join("_")
+}
+
+/// Scan the raw reading lines for derivation rules, extract each
+/// rule's consequent text, and register the consequent as a synthetic
+/// FT in `catalog`. Handles multi-line rules by joining indented
+/// continuations exactly as `parse_into` does upstream.
+///
+/// Derivation markers: `* ` / `** ` / `+ ` prefix, or mid-sentence
+/// ` iff ` / ` if ` / ` := `. The consequent is everything to the
+/// left of the marker keyword; find_nouns over it yields the role
+/// set (and verb = text between the first and last noun) that the
+/// catalog indexes by.
+///
+/// `Customer is in EEA iff Customer has some Address that ...` →
+///   catalog registers `derived:Customer_is_in_EEA` keyed on
+///   {customer, eea} with verb "is in". Later rules using
+///   `Customer is in EEA` as an antecedent then resolve cleanly.
+fn register_derivation_consequents_in_catalog(
+    lines: &[String],
+    noun_names: &[String],
+    catalog: &mut SchemaCatalog,
+) {
+    let joined = join_derivation_continuations(&lines.join("\n"));
+    for line in &joined {
+        let stripped = line.trim_start()
+            .strip_prefix("** ").or_else(|| line.trim_start().strip_prefix("* "))
+            .or_else(|| line.trim_start().strip_prefix("+ "))
+            .unwrap_or(line.trim_start());
+        // Find the left-most derivation marker — everything before it
+        // is the consequent reading.
+        let marker_idx = [" iff ", " := ", " if "].iter()
+            .filter(|kw| stripped.contains(*kw))
+            .filter_map(|kw| stripped.find(kw).map(|i| (i, kw.len())))
+            .min_by_key(|(i, _)| *i);
+        let (sep_idx, sep_len) = match marker_idx {
+            Some(m) => m,
+            None => continue,
+        };
+        // Exclude `If ... then ...` — those are conditional
+        // ring/constraint forms, not derivation heads.
+        if stripped.starts_with("If ") { continue; }
+        let consequent = stripped[..sep_idx].trim();
+
+        // Tokenize consequent via the same longest-first noun matcher
+        // used downstream. A consequent with zero declared nouns can't
+        // be registered as an FT. (Same anaphora-stripping that
+        // resolve_fact_type's closure applies — "that X" / "some X"
+        // are quantifiers, not part of the FT reading.)
+        let cleaned = consequent
+            .replace("that ", "")
+            .replace("some ", "")
+            .replace("each ", "")
+            .replace("any ", "");
+        let found: Vec<(usize, usize, String)> = find_nouns(&cleaned, noun_names);
+        // Require 2+ declared nouns in the consequent. Unary
+        // synthetics (only one declared noun) have such low
+        // specificity they'd resolve unrelated clauses like
+        // `Order has Mystery` to the first synthetic registered
+        // under the single-noun key. Binary-or-higher keeps
+        // `Customer is in EEA` working without over-capturing.
+        if found.len() < 2 { continue; }
+        let base_refs: Vec<String> = found.iter()
+            .map(|(_, _, n)| parse_role_token(n).0.to_string())
+            .collect();
+        let role_refs: Vec<&str> = base_refs.iter().map(|s| s.as_str()).collect();
+        // Verb: text between the first and second noun (binary case);
+        // empty for unary consequents.
+        let verb = found.windows(2).next()
+            .map(|pair| cleaned[pair[0].1..pair[1].0].trim())
+            .unwrap_or("");
+        // Synthesise an FT id. Using the fact_type_id helper keeps it
+        // consistent with regular FT registration.
+        let synthetic_id = alloc::format!("derived:{}", fact_type_id(&role_refs, verb));
+        catalog.register(&synthetic_id, &role_refs, verb, consequent);
+
+        // Follow-up: also record (sep_len) is used to avoid unused-
+        // variable warnings on platforms that gate the block.
+        let _ = sep_len;
+    }
 }
 
 /// Schema catalog for rho-lookup: noun set -> Fact Type ID.
