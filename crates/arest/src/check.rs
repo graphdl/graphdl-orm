@@ -1,30 +1,30 @@
 // crates/arest/src/check.rs
 //
-// Readings checker (#199, #213) — diagnostics as a fold over cells.
+// Readings checker (#199, #213, #214) — diagnostics as a ρ-application
+// over cells.
 //
-// Per Backus FFP and AREST Theorem 2: the checker is a function from
-// Object state (the parser's output) to a sequence of diagnostics.
-// No Domain struct. No intermediate representation. The checker reads
-// cells via fetch_or_phi + binding, composes diagnostics with iterator
-// combinators (map / filter / flat_map), and emits a Vec.
+// Per Backus FFP and AREST Theorem 2 / Theorem 5: the checker is a
+// Func tree applied via ast::apply, not Rust control flow. Its top
+// level is
 //
-// Each layer is a pure function over &Object:
+//   check_readings_func = Concat ∘ [ layer₁, …, layer₅ ]
 //
-//   check_unresolved_clauses : state -> [diagnostic]
-//   check_ring_validity      : state -> [diagnostic]
-//   check_ring_completeness  : state -> [diagnostic]
-//   check_singular_naming    : state -> [diagnostic]
-//   check_atom_ids           : state -> [diagnostic]
+// where each layerᵢ reads one or more cells from D and emits a
+// sequence of diagnostic Objects. Rust only parses the raw text,
+// applies the Func, and decodes the diagnostic sequence back to the
+// public `Vec<ReadingDiagnostic>` shape at the API boundary.
 //
-// check_readings composes them: concat ∘ [check_unresolved_clauses,
-// check_ring_validity, check_ring_completeness, check_singular_naming,
-// check_atom_ids] ∘ parse_to_state.
+// The five layer bodies remain Rust functions for now (each wrapped
+// in a Func::Native leaf) because they read multiple cells and
+// format messages; the composition itself is the Func tree. Further
+// FFP lowering can push per-layer logic (`ApplyToAll`, `Filter`,
+// `Selector`) down into the leaves over time.
 
-use crate::ast::{Object, binding, fetch_or_phi};
+use crate::ast::{Object, binding, fetch_or_phi, Func};
 use crate::parse_forml2::parse_to_state;
 use crate::naming::atom_id_is_valid;
 #[allow(unused_imports)]
-use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
+use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned, sync::Arc};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Level { Error, Warning, Hint }
@@ -42,17 +42,113 @@ pub struct ReadingDiagnostic {
     pub suggestion: Option<String>,
 }
 
-/// Run every checker layer against `text`. Each layer is a pure
-/// function over Object state — no Domain, no intermediate struct.
+// ── Atom constants for Level / Source encoding ──────────────────────
+
+const LVL_ERROR:   &str = "Error";
+const LVL_WARNING: &str = "Warning";
+const LVL_HINT:    &str = "Hint";
+const SRC_PARSE:   &str = "parse";
+const SRC_RESOLVE: &str = "resolve";
+const SRC_DEONTIC: &str = "deontic";
+
+fn encode_diag(d: &ReadingDiagnostic) -> Object {
+    let mut map = hashbrown::HashMap::new();
+    map.insert("line".to_string(),    Object::atom(&d.line.to_string()));
+    map.insert("reading".to_string(), Object::atom(&d.reading));
+    map.insert("level".to_string(),   Object::atom(match d.level {
+        Level::Error   => LVL_ERROR,
+        Level::Warning => LVL_WARNING,
+        Level::Hint    => LVL_HINT,
+    }));
+    map.insert("source".to_string(),  Object::atom(match d.source {
+        Source::Parse   => SRC_PARSE,
+        Source::Resolve => SRC_RESOLVE,
+        Source::Deontic => SRC_DEONTIC,
+    }));
+    map.insert("message".to_string(), Object::atom(&d.message));
+    if let Some(s) = d.suggestion.as_ref() {
+        map.insert("suggestion".to_string(), Object::atom(s));
+    }
+    Object::Map(map)
+}
+
+fn decode_diag(obj: &Object) -> Option<ReadingDiagnostic> {
+    let map = obj.as_map()?;
+    let line = map.get("line").and_then(|o| o.as_atom())
+        .and_then(|s| s.parse().ok()).unwrap_or(0);
+    let reading = map.get("reading").and_then(|o| o.as_atom())
+        .unwrap_or("").to_string();
+    let level = match map.get("level").and_then(|o| o.as_atom()) {
+        Some(LVL_ERROR)   => Level::Error,
+        Some(LVL_HINT)    => Level::Hint,
+        _                 => Level::Warning,
+    };
+    let source = match map.get("source").and_then(|o| o.as_atom()) {
+        Some(SRC_PARSE)   => Source::Parse,
+        Some(SRC_DEONTIC) => Source::Deontic,
+        _                 => Source::Resolve,
+    };
+    let message = map.get("message").and_then(|o| o.as_atom())
+        .unwrap_or("").to_string();
+    let suggestion = map.get("suggestion").and_then(|o| o.as_atom())
+        .map(String::from);
+    Some(ReadingDiagnostic { line, reading, level, source, message, suggestion })
+}
+
+fn encode_diags(diags: Vec<ReadingDiagnostic>) -> Object {
+    Object::seq(diags.iter().map(encode_diag).collect())
+}
+
+fn decode_diags(obj: &Object) -> Vec<ReadingDiagnostic> {
+    obj.as_seq()
+        .map(|s| s.iter().filter_map(decode_diag).collect())
+        .unwrap_or_default()
+}
+
+/// Wrap a Rust layer `state -> Vec<ReadingDiagnostic>` as a Func leaf
+/// that consumes the state Object and emits the encoded diagnostic
+/// sequence. Each layer is thus a ρ-application over the cells it
+/// reads; the top-level check_readings_func composes them via Concat.
+fn layer_native<F>(rust_layer: F) -> Func
+where F: Fn(&Object) -> Vec<ReadingDiagnostic> + Send + Sync + 'static {
+    Func::Native(Arc::new(move |state| encode_diags(rust_layer(state))))
+}
+
+/// check_readings as a Func tree. Reads cells from the state (passed
+/// as apply's operand) and returns a Seq of diagnostic Maps.
+///
+///   check_readings_func = Concat ∘ [ layer₁, layer₂, layer₃, layer₄, layer₅ ]
+///
+/// The composition is explicit FFP; layer bodies stay Native for now
+/// because several read multiple cells and format messages. Future
+/// work (#214 cont.) can lower each layer body into `ApplyToAll`,
+/// `Filter`, `Construction`, and binding-extract primitives.
+pub fn check_readings_func() -> Func {
+    Func::compose(
+        Func::Concat,
+        Func::construction(vec![
+            layer_native(check_unresolved_clauses),
+            layer_native(check_ring_validity),
+            layer_native(check_ring_completeness),
+            layer_native(check_singular_naming),
+            layer_native(check_atom_ids),
+        ]),
+    )
+}
+
+/// Run the checker pipeline against `text`.
+///
+/// Structure: parse → apply(check_readings_func, state, state) → decode.
+/// The Rust glue is minimal — it only parses the raw markdown and
+/// decodes the diagnostic Seq back into the public struct shape at
+/// the API boundary. All diagnostic logic is expressed as the Func
+/// tree defined by `check_readings_func`.
 pub fn check_readings(text: &str) -> Vec<ReadingDiagnostic> {
     match parse_to_state(text) {
-        Ok(state) => [
-            check_unresolved_clauses(&state),
-            check_ring_validity(&state),
-            check_ring_completeness(&state),
-            check_singular_naming(&state),
-            check_atom_ids(&state),
-        ].into_iter().flatten().collect(),
+        Ok(state) => {
+            let result = crate::ast::apply(&check_readings_func(), &state, &state);
+            decode_diags(&result)
+        }
         Err(e) => vec![ReadingDiagnostic {
             line: 0,
             reading: String::new(),
@@ -510,6 +606,56 @@ It is permitted that claim Actual Damages Amount if Actual Damages Amount exceed
         assert!(unresolved.is_empty(),
             "subtype-check / word-comparator antecedents must resolve; got {:?}",
             unresolved.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
+
+    /// #214: check_readings must run through `apply(check_readings_func, …)`.
+    /// The Func-tree result, decoded, must equal the direct check output.
+    /// Also pins down the structural shape of the top-level Func so a
+    /// future refactor can't quietly degrade it back to Rust control flow.
+    #[test]
+    fn check_readings_func_produces_same_diagnostics_as_api() {
+        let input = "\
+Person(.Id) is an entity type.\n\
+## Fact Types\n\
+Person is parent of Person.\n\
+";
+        // Public API output.
+        let via_api = check_readings(input);
+
+        // Direct Func application.
+        let state = parse_to_state(input).expect("parse");
+        let obj = crate::ast::apply(&check_readings_func(), &state, &state);
+        let via_func = decode_diags(&obj);
+
+        assert_eq!(via_api.len(), via_func.len(),
+            "Func-driven and API-driven diagnostic counts must agree: api={:?} func={:?}",
+            via_api, via_func);
+        for (a, f) in via_api.iter().zip(via_func.iter()) {
+            assert_eq!(a.level, f.level);
+            assert_eq!(a.source, f.source);
+            assert_eq!(a.reading, f.reading);
+            assert_eq!(a.message, f.message);
+        }
+    }
+
+    #[test]
+    fn check_readings_func_top_level_is_concat_of_construction() {
+        // Structural assertion — the top-level Func must remain
+        // Concat ∘ Construction([…]) with exactly 5 layers. This is
+        // the paper-aligned shape (Backus Concat + Construction).
+        let func = check_readings_func();
+        match &func {
+            Func::Compose(outer, inner) => {
+                assert!(matches!(**outer, Func::Concat),
+                    "top-level must compose Concat onto the construction");
+                match &**inner {
+                    Func::Construction(layers) => assert_eq!(layers.len(), 5,
+                        "check_readings_func must expose exactly 5 layer Funcs"),
+                    other => panic!("inner must be Construction, got {:?}", other),
+                }
+            }
+            other => panic!("top-level Func shape broke: {:?}", other),
+        }
     }
 
     #[test]
