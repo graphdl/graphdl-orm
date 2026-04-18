@@ -38,7 +38,12 @@ macro_rules! diag {
 }
 
 pub mod sync;
-#[cfg(not(feature = "no_std"))]
+// `sync` exports `Arc` (via `alloc::sync::Arc`) and spin-based
+// `Mutex`/`RwLock`/`OnceLock` that work on both std and no_std builds
+// — the cfg gate these imports used to carry was stale. Ungate so the
+// type appears in scope for the `ast` module's Arc<[Object]> Seq and
+// `Func::Native`'s Arc<dyn Fn>, even when the big std-only engine
+// block below is elided.
 use crate::sync::Arc;
 #[cfg(not(feature = "no_std"))]
 use crate::sync::Mutex;
@@ -105,7 +110,15 @@ pub mod cloudflare;
 // The DOMAINS / CompiledState / system_impl machinery requires serde,
 // serde_json, regex, and std — excluded from the no_std kernel build.
 // The kernel uses only `ast` and `freeze` directly.
+//
+// Everything from `struct CompiledState` through the end of this file
+// is gated behind `not(feature = "no_std")` so the kernel build links
+// only the ast + freeze surface. The repetition of the cfg attribute
+// is deliberate: top-level-item gating keeps error messages in the
+// same file as the items themselves, and avoids shuffling 1500 lines
+// into a sub-module just to place one shared cfg.
 
+#[cfg(not(feature = "no_std"))]
 /// D: the unified state — population cells + def cells, split into
 /// per-cell `Arc<RwLock<Object>>`. Backus Sec. 14.3 state-as-cells,
 /// but with each cell independently lockable so disjoint writers
@@ -136,6 +149,7 @@ struct CompiledState {
 }
 
 /// Outcome of a targeted-write attempt via `try_commit_diff`.
+#[cfg(not(feature = "no_std"))]
 enum CommitOutcome {
     /// All cell-level CAS checks passed; the writes have been applied.
     Committed,
@@ -148,6 +162,7 @@ enum CommitOutcome {
     StructuralChange,
 }
 
+#[cfg(not(feature = "no_std"))]
 impl CompiledState {
     fn new(initial_d: ast::Object) -> Self {
         let mut s = Self {
@@ -393,7 +408,9 @@ impl CompiledState {
 // This realises Cell Isolation (Definition 2) at the per-tenant
 // granularity. Per-cell concurrency within a tenant is a follow-up
 // that needs apply() to acquire cell-level locks just-in-time.
+#[cfg(not(feature = "no_std"))]
 static DOMAINS: OnceLock<Mutex<Vec<Option<Arc<RwLock<CompiledState>>>>>> = OnceLock::new();
+#[cfg(not(feature = "no_std"))]
 fn ds() -> &'static Mutex<Vec<Option<Arc<RwLock<CompiledState>>>>> {
     DOMAINS.get_or_init(|| Mutex::new(Vec::new()))
 }
@@ -401,11 +418,13 @@ fn ds() -> &'static Mutex<Vec<Option<Arc<RwLock<CompiledState>>>>> {
 /// Look up a slot's tenant lock by handle. Returns None for invalid
 /// handles or freed slots. The outer Vec mutex is held only for the
 /// duration of the lookup and Arc clone, then released.
+#[cfg(not(feature = "no_std"))]
 fn tenant_lock(handle: u32) -> Option<Arc<RwLock<CompiledState>>> {
     let s = ds().lock();
     s.get(handle as usize).and_then(|x| x.as_ref()).map(Arc::clone)
 }
 
+#[cfg(not(feature = "no_std"))]
 #[allow(dead_code)] // used by tests and the cloudflare feature
 fn allocate(state: ast::Object, defs: Vec<(String, ast::Func)>) -> u32 {
     let d = ast::defs_to_state(&defs, &state);
@@ -442,6 +461,7 @@ pub const METAMODEL_READINGS: &[(&str, &str)] = &[
 /// (Noun, FactType, Domain, App, …) as undeclared. Deterministic —
 /// the fold is over the `METAMODEL_READINGS` table in declaration
 /// order, matching `create_impl`'s load order.
+#[cfg(not(feature = "no_std"))]
 pub fn metamodel_corpus() -> String {
     METAMODEL_READINGS.iter().fold(String::new(), |mut acc, (_, text)| {
         acc.push_str(text);
@@ -458,6 +478,7 @@ pub fn metamodel_corpus() -> String {
 /// absent from the metamodel survive. This is the default mode for
 /// check-cli; use `check::check_readings` directly when validating
 /// the metamodel itself or a replacement core.
+#[cfg(not(feature = "no_std"))]
 pub fn check_readings_with_metamodel(user_text: &str) -> Vec<check::ReadingDiagnostic> {
     let metamodel = metamodel_corpus();
     let metamodel_only: std::collections::HashSet<String> = check::check_readings(&metamodel)
@@ -524,6 +545,7 @@ App 'support' navigates Domain.
 /// create_bare: allocate empty D with ONLY the platform primitives
 /// registered in DEFS. Use this when testing a new core or rebuilding
 /// the metamodel from scratch. Most apps should use `create_impl`.
+#[cfg(not(feature = "no_std"))]
 #[allow(dead_code)] // used by tests and the cloudflare feature
 fn create_bare_impl() -> u32 {
     let state = ast::Object::phi();
@@ -559,8 +581,10 @@ fn create_bare_impl() -> u32 {
 ///   - 3 platform primitive defs (compile, apply, verify_signature)
 ///
 /// Bootstrap mode (#23 guard bypass) wraps the parse fold.
+#[cfg(not(feature = "no_std"))]
 static METAMODEL_STATE: OnceLock<ast::Object> = OnceLock::new();
 
+#[cfg(not(feature = "no_std"))]
 fn metamodel_state() -> &'static ast::Object {
     METAMODEL_STATE.get_or_init(|| {
         struct BootstrapGuard;
@@ -606,6 +630,7 @@ fn metamodel_state() -> &'static ast::Object {
     })
 }
 
+#[cfg(not(feature = "no_std"))]
 fn create_impl() -> u32 {
     // Clone the cached metamodel state into a fresh handle. First call
     // builds the cache (parses 9 metamodel readings + runs the full
@@ -628,6 +653,7 @@ fn create_impl() -> u32 {
 }
 
 /// Legacy: parse_and_compile as create + compile for each readings pair.
+#[cfg(not(feature = "no_std"))]
 fn parse_and_compile_impl(readings: Vec<(String, String)>) -> Result<u32, String> {
     let h = create_impl();
     readings.iter().try_fold(h, |h, (_name, text)| {
@@ -636,6 +662,7 @@ fn parse_and_compile_impl(readings: Vec<(String, String)>) -> Result<u32, String
     })
 }
 
+#[cfg(not(feature = "no_std"))]
 fn release_impl(handle: u32) {
     let mut s = ds().lock();
     s.get_mut(handle as usize).into_iter().for_each(|slot| *slot = None);
@@ -648,6 +675,7 @@ fn release_impl(handle: u32) {
 /// Conservative list — when in doubt, a key falls through to the write
 /// path, which is still correct (just serializes). Extending this list
 /// is the right way to unlock more per-tenant concurrency.
+#[cfg(not(feature = "no_std"))]
 fn is_read_only_op(key: &str) -> bool {
     matches!(
         key,
@@ -673,6 +701,7 @@ fn is_read_only_op(key: &str) -> bool {
 ///     contend with each other, only with writers. Full per-cell
 ///     concurrency (parallel disjoint writes within one handle) is a
 ///     follow-up; it needs apply() to acquire cell locks just-in-time.
+#[cfg(not(feature = "no_std"))]
 fn system_impl(handle: u32, key: &str, input: &str) -> String {
     let tenant = match tenant_lock(handle) {
         Some(t) => t,
@@ -907,6 +936,7 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
 /// FT cells (e.g. `Order_has_total`, `Order_has_Amount`) in the
 /// declared set so that `try_commit_declared` covers every cell the
 /// verb may touch. Extra targets cost one no-op CAS each — cheap.
+#[cfg(not(feature = "no_std"))]
 #[allow(dead_code)]
 fn write_targets_for_key(key: &str, st: &CompiledState) -> Option<Vec<String>> {
     let (verb, noun) = key.split_once(':')?;
@@ -917,6 +947,7 @@ fn write_targets_for_key(key: &str, st: &CompiledState) -> Option<Vec<String>> {
 }
 
 /// Outcome of classifying an `ast::apply` result in the write path.
+#[cfg(not(feature = "no_std"))]
 enum WriterResult {
     /// Result is a full new D (a bare store with a Noun cell), to be
     /// persisted with replace semantics. Used by platform_compile,
@@ -944,6 +975,7 @@ enum WriterResult {
 ///   2. Bare store with a Noun cell — used by platform_compile.
 ///      Commit the result; return a compact summary.
 ///   3. Anything else — pure query result; return as JSON.
+#[cfg(not(feature = "no_std"))]
 fn classify_writer_result(result: &ast::Object) -> WriterResult {
     if let Some(map) = result.as_map() {
         // Shape 1: delta carrier (#209).
