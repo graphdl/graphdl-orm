@@ -817,19 +817,6 @@ fn compile_resolve_family(state: &crate::ast::Object) -> Vec<(String, Func)> {
 /// Matches AREST §4.1 Table 1 verbatim: "Fact type X r Y —
 /// `<CONS, s₁, s₂>` (binary)". The parser records each FT's role
 /// count in the FactType cell's `arity` binding, so the compiler
-/// can build the Construction directly from one FT fact — no Role
-/// cell cross-lookup, no pass through `compile_to_defs_state`. The
-/// body IS the paper's rule.
-fn compile_schemas_family(state: &crate::ast::Object) -> Vec<(String, Func)> {
-    let ft_cell = fetch_or_phi("FactType", state);
-    let ft_facts = match ft_cell.as_seq() {
-        Some(seq) => seq,
-        None => return Vec::new(),
-    };
-
-    ft_facts.iter().filter_map(schema_pair_from_ft_fact).collect()
-}
-
 /// Per-FT compilation step: one `(schema:{id}, Construction)` pair.
 /// Pure per-fact function — amenable to being lowered to an FFP
 /// `Func::ApplyToAll` leaf in a later pass (the iteration itself
