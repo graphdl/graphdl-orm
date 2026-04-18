@@ -653,6 +653,60 @@ Person is parent of Person.\n\
         }
     }
 
+    /// #273: legal / prose-heavy corpora often mention a declared noun
+    /// in lowercase inside a derivation's antecedent (e.g. "… if
+    /// customer ordered Product" against a declared `Customer ordered
+    /// Product` fact type). The resolver must tolerate this case drift
+    /// without falling back to "antecedent clause did not resolve".
+    #[test]
+    fn prose_tolerant_lowercase_noun_in_antecedent() {
+        let input = "\
+Customer(.id) is an entity type.
+Product(.id) is an entity type.
+Review(.id) is an entity type.
+## Fact Types
+Customer ordered Product.
+Customer wrote Review.
+## Derivation Rules
++ Customer wrote Review if customer ordered Product.
+";
+        let diags = check_readings(input);
+        let unresolved: Vec<_> = diags.iter()
+            .filter(|d| d.level == Level::Warning
+                && d.message.contains("antecedent clause did not resolve"))
+            .collect();
+        assert!(unresolved.is_empty(),
+            "lowercase noun mention in antecedent must resolve; got {:?}",
+            unresolved.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
+
+    /// #273: antecedents naturally spell out articles — "the Tool",
+    /// "a Party", "an Exemption" — that the resolver needs to see
+    /// past. Stripping leading determiners before noun-tuple lookup
+    /// keeps the match working without giving up word-boundary
+    /// safety inside the rest of the clause.
+    #[test]
+    fn prose_tolerant_articles_in_antecedent() {
+        let input = "\
+Customer(.id) is an entity type.
+Product(.id) is an entity type.
+Review(.id) is an entity type.
+## Fact Types
+Customer ordered Product.
+Customer wrote Review.
+## Derivation Rules
++ Customer wrote Review if the Customer ordered a Product.
+";
+        let diags = check_readings(input);
+        let unresolved: Vec<_> = diags.iter()
+            .filter(|d| d.level == Level::Warning
+                && d.message.contains("antecedent clause did not resolve"))
+            .collect();
+        assert!(unresolved.is_empty(),
+            "article-prefixed nouns in antecedent must resolve; got {:?}",
+            unresolved.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
+
     #[test]
     fn check_readings_func_top_level_is_concat_of_construction() {
         // Structural assertion — the top-level Func must remain

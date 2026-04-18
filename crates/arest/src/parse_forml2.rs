@@ -1982,12 +1982,29 @@ fn resolve_derivation_rule(
         .filter(|s| !s.is_empty())
         .collect();
 
-    // Strip quantifier and anaphoric words from a text fragment.
+    // Strip quantifier, anaphoric, and determiner words from a text
+    // fragment. #273: legal / prose rule bodies spell out articles
+    // ("the Tool", "a Party", "an Exemption") that aren't part of
+    // the FT identity. Removing them lets the catalog lookup match
+    // against the clean `<Noun> <verb> <Noun>` form the FT was
+    // declared with. Replacements are space-padded to preserve word
+    // boundaries inside the clause (so `the ` inside `theoretical`
+    // is untouched).
     let strip_anaphora = |text: &str| -> String {
-        text.replace("that ", "")
+        let replaced = text
+            .replace("that ", "")
             .replace("some ", "")
             .replace("each ", "")
             .replace("any ", "")
+            .replace(" the ", " ")
+            .replace(" a ", " ")
+            .replace(" an ", " ");
+        // Leading determiners at the very start of the clause.
+        replaced
+            .trim_start_matches("the ")
+            .trim_start_matches("a ")
+            .trim_start_matches("an ")
+            .to_string()
     };
 
     // Resolve a text fragment to a Fact Type ID via rho-lookup through the catalog.
@@ -2756,6 +2773,17 @@ pub(crate) fn find_nouns(text: &str, noun_names: &[String]) -> Vec<(usize, usize
     let mut sorted: Vec<&String> = noun_names.iter().collect();
     sorted.sort_by(|a, b| b.len().cmp(&a.len()));
 
+    // #273: prose-heavy rule bodies (legal text, derivations) routinely
+    // mention a declared noun in lowercase — "… if interpretation is
+    // reasonable" against a capitalised `Interpretation` entity type.
+    // We match case-insensitively against ASCII-lowercased copies so
+    // that drift doesn't fall through to "antecedent clause did not
+    // resolve". ASCII-lowercasing preserves byte length, so indices
+    // in `text_lower` map 1:1 back to `text`; the captured token is
+    // taken from `text` to preserve the reading-author's casing for
+    // downstream ring / join-key consumers.
+    let text_lower: String = text.chars().map(|c| c.to_ascii_lowercase()).collect();
+
     // Foldl over longest-first noun list. Accumulator is (matches, used_ranges).
     // Inner loop over occurrences of `name` in `text` uses Backus's `while`
     // combining form (sequential scan of positions).
@@ -2770,10 +2798,11 @@ pub(crate) fn find_nouns(text: &str, noun_names: &[String]) -> Vec<(usize, usize
     let (mut matches, _): (Vec<(usize, usize, String)>, Vec<(usize, usize)>) = sorted.iter().fold(
         (Vec::new(), Vec::new()),
         |(mut matches, mut used), name| {
+            let name_lower: String = name.chars().map(|c| c.to_ascii_lowercase()).collect();
             let mut pos = 0;
-            while let Some(found) = text[pos..].find(name.as_str()) {
+            while let Some(found) = text_lower[pos..].find(name_lower.as_str()) {
                 let start = pos + found;
-                let mut end = start + name.len();
+                let mut end = start + name_lower.len();
                 let before_ok = start == 0 || !text.as_bytes()[start - 1].is_ascii_alphanumeric();
                 // Extend end past any trailing ASCII digit subscript.
                 while end < text.len() && text.as_bytes()[end].is_ascii_digit() {

@@ -5351,13 +5351,14 @@ mod schema_tests {
             "resolve-family compiler must emit the same resolve:{{noun}} names as the monolithic call");
     }
 
-    /// #214 deeper lowering: the schema-family leaf reads FactType +
-    /// Role cells directly and emits one `schema:{ft_id}` def per
-    /// declared FT — no pass through `compile_to_defs_state`. Verify
-    /// the standalone compiler matches the direct call's schema
-    /// subset exactly.
+    /// #214 deeper lowering: the schema family is a pure FFP
+    /// expression `ApplyToAll(schema_pair_from_ft_native) ∘
+    /// FetchOrPhi(<"FactType", state>)`. Verify that running it via
+    /// `apply(schema_family_func(), …)` produces the same
+    /// `schema:{ft_id}` names the monolithic `compile_to_defs_state`
+    /// call would emit for the same state.
     #[test]
-    fn compile_schemas_family_matches_direct_schema_defs() {
+    fn schema_family_func_matches_direct_schema_defs() {
         let state = make_state_with_fact_type(
             "User has Org Role in Organization",
             "User has Org Role in Organization",
@@ -5366,12 +5367,25 @@ mod schema_tests {
         let via_direct: Vec<_> = compile_to_defs_state(&state).into_iter()
             .filter(|(n, _)| n.starts_with("schema:"))
             .collect();
-        let via_family = super::compile_schemas_family(&state);
 
-        let direct_names: std::collections::HashSet<&str> = via_direct.iter().map(|(n, _)| n.as_str()).collect();
-        let family_names: std::collections::HashSet<&str> = via_family.iter().map(|(n, _)| n.as_str()).collect();
+        // Apply the FFP schema family directly, decode pairs.
+        let encoded = crate::ast::apply(&super::schema_family_func(), &state, &state);
+        let via_family: Vec<(String, crate::ast::Func)> = encoded.as_seq()
+            .map(|pairs| pairs.iter().filter_map(|p| {
+                let items = p.as_seq()?;
+                if items.len() != 2 { return None; }
+                let name = items[0].as_atom()?.to_string();
+                let func = crate::ast::metacompose(&items[1], &state);
+                Some((name, func))
+            }).collect())
+            .unwrap_or_default();
+
+        let direct_names: std::collections::HashSet<&str> =
+            via_direct.iter().map(|(n, _)| n.as_str()).collect();
+        let family_names: std::collections::HashSet<&str> =
+            via_family.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(direct_names, family_names,
-            "schema-family compiler must emit the same schema:{{ft_id}} names as the monolithic call");
+            "schema-family Func must emit the same schema:{{ft_id}} names as the monolithic call");
 
         // And each Construction must have the same role count.
         for (name, func) in &via_family {
