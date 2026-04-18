@@ -30,6 +30,7 @@ extern crate alloc;
 
 mod allocator;
 mod gdt;
+mod http;
 mod interrupts;
 mod memory;
 mod net;
@@ -55,6 +56,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             .expect("bootloader did not supply physical_memory_offset"),
     );
     net::init();
+    net::register_http(80, placeholder_http_handler);
 
     // Collect memory stats for the banner.
     let frame_count = memory::usable_frame_count();
@@ -68,6 +70,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     println!("  pic:    remapped to 32+, keyboard (IRQ 1) unmasked");
     println!("  memory: {usable_mib} MiB usable RAM ({frame_count} x 4 KiB frames) (#180)");
     println!("  net:    smoltcp loopback 127.0.0.1/8 (#261 — virtio-net in #262)");
+    println!("  http:   listening on :80 (#264)");
 
     // Prove the allocator works — allocate a String and echo it.
     let greeting = "heap is live".to_string();
@@ -90,10 +93,31 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 /// Park the CPU in a `hlt` loop. With interrupts enabled, `hlt`
 /// wakes on any IRQ (keyboard, timer once added) so per-keypress
 /// latency is measured in microseconds instead of busy-spin cycles.
+///
+/// Each wake drives `net::poll()` so that any TCP / DHCP progress
+/// queued since the last IRQ gets processed before we sleep again.
+/// Once a dedicated timer IRQ lands (#180 follow-up) we can drop the
+/// poll here and let the timer handler schedule it — for now, piggy-
+/// backing on keyboard IRQs is good enough for the loopback bring-up.
 fn halt_forever() -> ! {
     loop {
+        net::poll();
         x86_64::instructions::hlt();
     }
+}
+
+/// Placeholder HTTP handler until #265 wires route dispatch through
+/// to `arest::system_impl`. Echoes `METHOD path` so a curl against
+/// the QEMU port-forward confirms request parsing works end to end.
+fn placeholder_http_handler(req: &http::Request) -> http::Response {
+    use alloc::string::String;
+    let mut body = String::with_capacity(32 + req.method.len() + req.path.len());
+    body.push_str("AREST ");
+    body.push_str(&req.method);
+    body.push(' ');
+    body.push_str(&req.path);
+    body.push('\n');
+    http::Response::ok("text/plain", body.into_bytes())
 }
 
 #[panic_handler]
