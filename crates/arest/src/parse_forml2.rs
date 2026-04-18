@@ -1016,6 +1016,9 @@ fn ctx_to_state(d: &ParseCtx) -> crate::ast::Object {
     // fields only (e.g. ParseCtx literals in evaluate.rs).
     if !cells.contains_key("DerivationRule") {
         for r in &d.derivation_rules {
+            // `mut` is only consumed under the `std-deps` feature; silence
+            // the no-default-features warning without splitting the decl.
+            #[allow(unused_mut)]
             let mut pairs: Vec<(&str, &str)> = vec![
                 ("id", r.id.as_str()), ("text", r.text.as_str()),
                 ("consequentFactTypeId", r.consequent_fact_type_id.as_str()),
