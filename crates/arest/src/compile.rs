@@ -538,6 +538,51 @@ fn apps_opted_into_generator(
         .into_iter().collect()
 }
 
+/// #214: compile as a Func tree entry point.
+///
+/// Returns a `Func::Native` leaf that, when applied via `ast::apply`
+/// against the state Object, produces an `Object::Seq` of
+/// `<name_atom, func_object>` pairs — the same `(name, Func)` list
+/// the Rust `compile_to_defs_state` returns, encoded through
+/// `ast::func_to_object` so the whole compile output can round-trip
+/// through ρ-application.
+///
+/// The body still wraps the existing `compile_to_defs_state`
+/// procedure (thousands of lines driving every generator, derivation
+/// compiler, constraint compiler, and schema builder). This gives
+/// compile a first-class ρ-dispatchable shape without disturbing any
+/// downstream caller. A deeper FFP rewrite would decompose the
+/// procedure into independent sub-Funcs per construct family
+/// (constraints → Filter(p):P, derivations → COMP, state machines →
+/// foldl); that's tracked as follow-up under #214 so the current
+/// entry point stays stable.
+pub fn compile_func() -> crate::ast::Func {
+    use alloc::sync::Arc;
+    crate::ast::Func::Native(Arc::new(|state: &crate::ast::Object| {
+        let defs = compile_to_defs_state(state);
+        let pairs: Vec<crate::ast::Object> = defs.iter().map(|(name, func)| {
+            crate::ast::Object::seq(vec![
+                crate::ast::Object::atom(name),
+                crate::ast::func_to_object(func),
+            ])
+        }).collect();
+        crate::ast::Object::seq(pairs)
+    }))
+}
+
+/// Decode the output of `apply(compile_func(), state, state)` back
+/// into the `(name, Func)` list the Rust entry point produces. Uses
+/// `ast::metacompose` to reverse `func_to_object` at each pair.
+pub fn decode_compile_result(obj: &crate::ast::Object, d: &crate::ast::Object) -> Vec<(String, crate::ast::Func)> {
+    obj.as_seq().map(|pairs| pairs.iter().filter_map(|p| {
+        let items = p.as_seq()?;
+        if items.len() != 2 { return None; }
+        let name = items[0].as_atom()?.to_string();
+        let func = crate::ast::metacompose(&items[1], d);
+        Some((name, func))
+    }).collect()).unwrap_or_default()
+}
+
 pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> {
     let t = profile_timer::now();
     let model = compile(state);
@@ -4943,5 +4988,26 @@ mod schema_tests {
             "Notification SM must contain its own 'confirm-delivery' transition");
         assert_eq!(notif.statuses.first().map(String::as_str), Some("Sent"),
             "Notification initial must be Sent; got {:?}", notif.statuses.first());
+    }
+
+    /// #214: compile_func applied via ast::apply produces the same
+    /// (name, Func) list as the direct Rust call. Pins the FFP entry
+    /// point so downstream callers can ρ-dispatch to compile.
+    #[test]
+    fn compile_func_round_trip_matches_direct_call() {
+        let state = make_state_with_fact_type(
+            "ft1", "User has Org Role in Organization",
+            vec![("User", 0), ("Org Role", 1), ("Organization", 2)],
+        );
+        let direct = compile_to_defs_state(&state);
+        let encoded = crate::ast::apply(&compile_func(), &state, &state);
+        let decoded = decode_compile_result(&encoded, &state);
+
+        assert_eq!(direct.len(), decoded.len(),
+            "Func-apply must emit the same number of defs as the direct call");
+        let direct_names: Vec<&str> = direct.iter().map(|(n, _)| n.as_str()).collect();
+        let decoded_names: Vec<&str> = decoded.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(direct_names, decoded_names,
+            "Func-apply must preserve def names and order");
     }
 }

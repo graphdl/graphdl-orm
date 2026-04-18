@@ -94,6 +94,41 @@ pub fn rmap_from_state(state: &crate::ast::Object) -> Vec<TableDef> {
     rmap(state)
 }
 
+/// #214: RMAP as a Func tree entry point.
+///
+/// Returns a `Func::Native` leaf that, when applied via `ast::apply`
+/// against the state Object, produces an `Object::atom` containing
+/// the JSON-serialized `Vec<TableDef>`. This is the ρ-dispatchable
+/// form of RMAP — any caller that operates on Func trees (including
+/// future lowered compile pipelines or the MCP dispatch layer) can
+/// treat RMAP as a first-class ρ-application instead of reaching in
+/// to the Rust procedure directly.
+///
+/// The leaf still wraps Halpin's procedural Ch. 10 algorithm as its
+/// body. A deeper FFP rewrite would decompose the six RMAP passes
+/// (binarize → absorb → classify-UC → one-to-one-absorb → compound-
+/// ref-scheme → constraint-map) into a `FoldL` over per-pass Funcs,
+/// each reading / augmenting an intermediate state Object. That
+/// decomposition is tracked as a follow-up; keeping the body intact
+/// here preserves every current behaviour.
+pub fn rmap_func() -> crate::ast::Func {
+    use alloc::sync::Arc;
+    crate::ast::Func::Native(Arc::new(|state: &crate::ast::Object| {
+        let tables = rmap(state);
+        let json = serde_json::to_string(&tables).unwrap_or_else(|_| "[]".to_string());
+        crate::ast::Object::atom(&json)
+    }))
+}
+
+/// Decode the output of `apply(rmap_func(), state, state)` back into
+/// `Vec<TableDef>`. The Func emits a JSON atom; this helper is the
+/// inverse of that encoding.
+pub fn decode_rmap_result(obj: &crate::ast::Object) -> Vec<TableDef> {
+    obj.as_atom()
+        .and_then(|s| serde_json::from_str::<Vec<TableDef>>(s).ok())
+        .unwrap_or_default()
+}
+
 pub fn rmap(state: &crate::ast::Object) -> Vec<TableDef> {
     use crate::ast::{fetch_or_phi, binding};
     use crate::types::*;
@@ -1077,6 +1112,34 @@ mod tests {
         if let Some(w) = wife {
             assert!(!w.columns.iter().any(|c| c.name == "husband_id"),
                 "Wife should NOT have husband_id");
+        }
+    }
+
+    /// #214: rmap_func applied via ast::apply produces the same
+    /// Vec<TableDef> as the direct Rust call. Pins the FFP entry
+    /// point so future callers can ρ-dispatch to RMAP without
+    /// reaching into the Rust procedure.
+    #[test]
+    fn rmap_func_round_trip_matches_direct_call() {
+        let state = make_state(
+            vec![("Person", "entity"), ("Name", "value")],
+            vec![
+                ("ft1", "Person has Name", vec![("Person", 0), ("Name", 1)]),
+            ],
+            vec![("UC", vec![("ft1", 0)])],
+        );
+        let direct = rmap(&state);
+        let via_apply = decode_rmap_result(
+            &crate::ast::apply(&rmap_func(), &state, &state));
+
+        assert_eq!(direct.len(), via_apply.len(),
+            "Func-apply must produce the same number of tables as the direct call");
+        for (a, b) in direct.iter().zip(via_apply.iter()) {
+            assert_eq!(a.name, b.name);
+            assert_eq!(a.primary_key, b.primary_key);
+            assert_eq!(
+                a.columns.iter().map(|c| &c.name).collect::<Vec<_>>(),
+                b.columns.iter().map(|c| &c.name).collect::<Vec<_>>());
         }
     }
 }
