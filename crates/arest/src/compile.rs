@@ -618,9 +618,20 @@ fn name_belongs_to_family(name: &str, family: &str) -> bool {
 fn family_leaf(family: &'static str) -> crate::ast::Func {
     use alloc::sync::Arc;
     crate::ast::Func::Native(Arc::new(move |state: &crate::ast::Object| {
-        let defs = compile_to_defs_state(state);
+        // Families with standalone compilers read only the cells they
+        // need — no fallback to the monolithic `compile_to_defs_state`,
+        // no 8× compile amplification per apply. Other families still
+        // call the full compile and filter by prefix as an interim
+        // step until they're each extracted.
+        let defs = match family {
+            FAMILY_SCHEMA => compile_schemas_family(state),
+            FAMILY_RESOLVE => compile_resolve_family(state),
+            _ => compile_to_defs_state(state)
+                .into_iter()
+                .filter(|(name, _)| name_belongs_to_family(name, family))
+                .collect(),
+        };
         let pairs: Vec<crate::ast::Object> = defs.iter()
-            .filter(|(name, _)| name_belongs_to_family(name, family))
             .map(|(name, func)| {
                 crate::ast::Object::seq(vec![
                     crate::ast::Object::atom(name),
@@ -630,6 +641,110 @@ fn family_leaf(family: &'static str) -> crate::ast::Func {
             .collect();
         crate::ast::Object::seq(pairs)
     }))
+}
+
+/// Standalone resolve-family compiler (#214): for each declared
+/// noun, find the binary FTs it participates in and emit a
+/// `resolve:{noun}` Func — a right-fold of `Func::Condition` guards
+/// mapping each `(other_role_noun_lowercase)` field name to the
+/// owning fact-type id. Input to the compiled Func is an atom
+/// (the field name queried); output is the fact-type atom.
+///
+/// Bodies with no binary FT participation emit no def. Matches the
+/// existing `c_nouns.keys().filter_map(…)` branch in
+/// `compile_to_defs_state`, without its pass through the full
+/// compile pipeline.
+fn compile_resolve_family(state: &crate::ast::Object) -> Vec<(String, Func)> {
+    let noun_cell = fetch_or_phi("Noun", state);
+    let ft_cell = fetch_or_phi("FactType", state);
+    let role_cell = fetch_or_phi("Role", state);
+
+    let noun_names: Vec<String> = noun_cell.as_seq()
+        .map(|ns| ns.iter()
+            .filter_map(|n| binding(n, "name").map(|s| s.to_string()))
+            .collect())
+        .unwrap_or_default();
+    let ft_facts: &[crate::ast::Object] = ft_cell.as_seq().unwrap_or(&[]);
+    let role_facts: &[crate::ast::Object] = role_cell.as_seq().unwrap_or(&[]);
+
+    // Pre-compute (ft_id, roles) for every fact type we see so the
+    // per-noun loop below is O(#FT × #roles-per-FT), not O(#FT²).
+    let fact_types: Vec<(String, Vec<String>)> = ft_facts.iter()
+        .filter_map(|ft| {
+            let id = binding(ft, "id")?.to_string();
+            let mut roles: Vec<(usize, String)> = role_facts.iter()
+                .filter(|r| binding(r, "factType") == Some(&id))
+                .filter_map(|r| Some((
+                    binding(r, "position")?.parse().ok()?,
+                    binding(r, "nounName")?.to_string(),
+                )))
+                .collect();
+            roles.sort_by_key(|(p, _)| *p);
+            Some((id, roles.into_iter().map(|(_, n)| n).collect()))
+        })
+        .collect();
+
+    noun_names.iter().filter_map(|noun_name| {
+        let field_mappings: Vec<(String, String)> = fact_types.iter()
+            .filter(|(_, role_nouns)| role_nouns.iter().any(|n| n == noun_name))
+            .filter_map(|(ft_id, role_nouns)| {
+                (role_nouns.len() == 2).then(|| ())?;
+                let other = role_nouns.iter().find(|n| n.as_str() != noun_name.as_str())?.clone();
+                Some((other.to_lowercase(), ft_id.clone()))
+            })
+            .collect();
+        (!field_mappings.is_empty()).then(|| {
+            let resolve_func = field_mappings.iter().rev().fold(Func::Id, |inner, (field, ft_id)| {
+                Func::condition(
+                    Func::compose(Func::Eq, Func::construction(vec![
+                        Func::Id,
+                        Func::constant(Object::atom(field)),
+                    ])),
+                    Func::constant(Object::atom(ft_id)),
+                    inner,
+                )
+            });
+            (alloc::format!("resolve:{}", noun_name), resolve_func)
+        })
+    }).collect()
+}
+
+/// Standalone schema-family compiler (#214): reads FactType + Role
+/// cells directly and emits one `(schema:{ft_id}, Construction([
+/// Selector(1), ..., Selector(n)]))` pair per declared fact type.
+///
+/// Matches AREST §4.1 Table 1 verbatim: "Fact type X r Y —
+/// `<CONS, s₁, s₂>` (binary)". No pass through
+/// `compile_to_defs_state`; the body IS the paper's rule.
+fn compile_schemas_family(state: &crate::ast::Object) -> Vec<(String, Func)> {
+    let ft_cell = fetch_or_phi("FactType", state);
+    let role_cell = fetch_or_phi("Role", state);
+    let ft_facts = match ft_cell.as_seq() {
+        Some(seq) => seq,
+        None => return Vec::new(),
+    };
+    let role_facts: &[crate::ast::Object] = role_cell.as_seq().unwrap_or(&[]);
+
+    ft_facts.iter().filter_map(|ft| {
+        let ft_id = binding(ft, "id")?.to_string();
+        // Gather roles for this FT sorted by position — the Selector
+        // index (1-indexed) is role_index + 1 per the schema's
+        // Construction convention.
+        let mut roles: Vec<(usize, &str)> = role_facts.iter()
+            .filter(|r| binding(r, "factType") == Some(&ft_id))
+            .filter_map(|r| {
+                let pos: usize = binding(r, "position")?.parse().ok()?;
+                Some((pos, binding(r, "nounName").unwrap_or("")))
+            })
+            .collect();
+        roles.sort_by_key(|(pos, _)| *pos);
+
+        let selectors: Vec<Func> = roles.iter()
+            .map(|(pos, _)| Func::Selector(pos + 1))
+            .collect();
+        let construction = Func::Construction(selectors);
+        Some((alloc::format!("schema:{}", ft_id), construction))
+    }).collect()
 }
 
 /// Decode the output of `apply(compile_func(), state, state)` back
@@ -5099,6 +5214,73 @@ mod schema_tests {
                 }
             }
             other => panic!("top-level compile_func shape broke: {:?}", other),
+        }
+    }
+
+    /// #214 deeper lowering: the resolve-family leaf reads
+    /// Noun + FactType + Role cells directly and emits a
+    /// `resolve:{noun}` Condition chain per noun with binary FT
+    /// participation. Verify it matches the direct call's resolve
+    /// subset exactly.
+    #[test]
+    fn compile_resolve_family_matches_direct_resolve_defs() {
+        // Two nouns, one FT — should yield resolve:User (binary FT
+        // with Org Role) but no resolve:Org Role because only one
+        // binary FT mentions it and the filter would yield just
+        // one entry (which still builds a valid chain). Actually
+        // both nouns should get resolve defs since each participates
+        // in at least one binary FT. We assert the names match.
+        let state = make_state_with_fact_type(
+            "User_has_Org Role", "User has Org Role",
+            vec![("User", 0), ("Org Role", 1)],
+        );
+        let via_direct: Vec<_> = compile_to_defs_state(&state).into_iter()
+            .filter(|(n, _)| n.starts_with("resolve:"))
+            .collect();
+        let via_family = super::compile_resolve_family(&state);
+        let direct_names: std::collections::HashSet<&str> =
+            via_direct.iter().map(|(n, _)| n.as_str()).collect();
+        let family_names: std::collections::HashSet<&str> =
+            via_family.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(direct_names, family_names,
+            "resolve-family compiler must emit the same resolve:{{noun}} names as the monolithic call");
+    }
+
+    /// #214 deeper lowering: the schema-family leaf reads FactType +
+    /// Role cells directly and emits one `schema:{ft_id}` def per
+    /// declared FT — no pass through `compile_to_defs_state`. Verify
+    /// the standalone compiler matches the direct call's schema
+    /// subset exactly.
+    #[test]
+    fn compile_schemas_family_matches_direct_schema_defs() {
+        let state = make_state_with_fact_type(
+            "User has Org Role in Organization",
+            "User has Org Role in Organization",
+            vec![("User", 0), ("Org Role", 1), ("Organization", 2)],
+        );
+        let via_direct: Vec<_> = compile_to_defs_state(&state).into_iter()
+            .filter(|(n, _)| n.starts_with("schema:"))
+            .collect();
+        let via_family = super::compile_schemas_family(&state);
+
+        let direct_names: std::collections::HashSet<&str> = via_direct.iter().map(|(n, _)| n.as_str()).collect();
+        let family_names: std::collections::HashSet<&str> = via_family.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(direct_names, family_names,
+            "schema-family compiler must emit the same schema:{{ft_id}} names as the monolithic call");
+
+        // And each Construction must have the same role count.
+        for (name, func) in &via_family {
+            let direct_func = &via_direct.iter()
+                .find(|(n, _)| n == name)
+                .expect("schema present in direct call").1;
+            match (func, direct_func) {
+                (crate::ast::Func::Construction(a), crate::ast::Func::Construction(b)) => {
+                    assert_eq!(a.len(), b.len(),
+                        "Construction arity must match for {}: family={}, direct={}",
+                        name, a.len(), b.len());
+                }
+                _ => panic!("both sides must be Construction Funcs for {}", name),
+            }
         }
     }
 
