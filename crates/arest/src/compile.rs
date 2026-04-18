@@ -578,6 +578,7 @@ pub fn compile_func() -> crate::ast::Func {
             family_leaf(FAMILY_DERIVATION),
             family_leaf(FAMILY_SCHEMA),
             family_leaf(FAMILY_RESOLVE),
+            family_leaf(FAMILY_SHARD),
             family_leaf(FAMILY_OTHER),
         ]),
     )
@@ -596,6 +597,7 @@ const FAMILY_TRANSITIONS: &str = "transitions:";
 const FAMILY_DERIVATION:  &str = "derivation";
 const FAMILY_SCHEMA:      &str = "schema:";
 const FAMILY_RESOLVE:     &str = "resolve:";
+const FAMILY_SHARD:       &str = "shard:";
 const FAMILY_OTHER:       &str = "";
 
 /// True when a def name belongs to the given family tag. `""` is
@@ -608,7 +610,7 @@ fn name_belongs_to_family(name: &str, family: &str) -> bool {
         "" => ![
             FAMILY_CONSTRAINT, FAMILY_VALIDATE, FAMILY_MACHINE,
             FAMILY_TRANSITIONS, FAMILY_DERIVATION, FAMILY_SCHEMA,
-            FAMILY_RESOLVE,
+            FAMILY_RESOLVE, FAMILY_SHARD,
         ].iter().any(|f| name_belongs_to_family(name, f)),
         tag if tag.ends_with(':') => name.starts_with(tag),
         tag => name == tag || name.starts_with(&alloc::format!("{}:", tag)),
@@ -626,6 +628,7 @@ fn family_leaf(family: &'static str) -> crate::ast::Func {
         let defs = match family {
             FAMILY_SCHEMA => compile_schemas_family(state),
             FAMILY_RESOLVE => compile_resolve_family(state),
+            FAMILY_SHARD => compile_shard_family(state),
             _ => compile_to_defs_state(state)
                 .into_iter()
                 .filter(|(name, _)| name_belongs_to_family(name, family))
@@ -641,6 +644,23 @@ fn family_leaf(family: &'static str) -> crate::ast::Func {
             .collect();
         crate::ast::Object::seq(pairs)
     }))
+}
+
+/// Standalone shard-family compiler (#214): calls RMAP's cell-map
+/// helper and emits one `(shard:{ft_id}, Constant(cell_name))` per
+/// fact type. Matches paper Eq. demux (§8):
+///
+///     E_n = Filter(eq ∘ [RMAP, n̄]) : E
+///
+/// The constant Func is the per-cell identity the demux filter
+/// compares against. No pass through `compile_to_defs_state`.
+fn compile_shard_family(state: &crate::ast::Object) -> Vec<(String, Func)> {
+    crate::rmap::rmap_cell_map_from_state(state).iter()
+        .map(|(ft_id, cell)| (
+            alloc::format!("shard:{}", ft_id),
+            Func::constant(Object::atom(cell)),
+        ))
+        .collect()
 }
 
 /// Standalone resolve-family compiler (#214): for each declared
@@ -5200,8 +5220,8 @@ mod schema_tests {
                     "top level must compose Concat onto the family construction");
                 match &**inner {
                     crate::ast::Func::Construction(families) => {
-                        assert_eq!(families.len(), 8,
-                            "compile_func must expose 8 family leaves per Table 1; got {}",
+                        assert_eq!(families.len(), 9,
+                            "compile_func must expose 9 family leaves (Table 1 + shard); got {}",
                             families.len());
                     }
                     other => panic!("inner must be Construction of family leaves; got {:?}", other),
@@ -5209,6 +5229,29 @@ mod schema_tests {
             }
             other => panic!("top-level compile_func shape broke: {:?}", other),
         }
+    }
+
+    /// #214 deeper lowering: the shard-family leaf calls RMAP's
+    /// cell-map helper and emits one `(shard:{ft_id}, Constant(cell))`
+    /// per fact type. Verify the standalone compiler matches the
+    /// direct call's shard: subset exactly.
+    #[test]
+    fn compile_shard_family_matches_direct_shard_defs() {
+        let state = make_state_with_fact_type(
+            "User has Org Role in Organization",
+            "User has Org Role in Organization",
+            vec![("User", 0), ("Org Role", 1), ("Organization", 2)],
+        );
+        let via_direct: Vec<_> = compile_to_defs_state(&state).into_iter()
+            .filter(|(n, _)| n.starts_with("shard:"))
+            .collect();
+        let via_family = super::compile_shard_family(&state);
+        let direct_names: std::collections::HashSet<&str> =
+            via_direct.iter().map(|(n, _)| n.as_str()).collect();
+        let family_names: std::collections::HashSet<&str> =
+            via_family.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(direct_names, family_names,
+            "shard-family compiler must emit the same shard:{{ft_id}} names as the monolithic call");
     }
 
     /// #214 deeper lowering: the resolve-family leaf reads
@@ -5286,7 +5329,7 @@ mod schema_tests {
         let families = [
             FAMILY_CONSTRAINT, FAMILY_VALIDATE, FAMILY_MACHINE,
             FAMILY_TRANSITIONS, FAMILY_DERIVATION, FAMILY_SCHEMA,
-            FAMILY_RESOLVE,
+            FAMILY_RESOLVE, FAMILY_SHARD,
         ];
         let samples = [
             "constraint:uc_1", "validate", "validate:Order_has_Status",
