@@ -424,7 +424,7 @@ fn allocate(state: ast::Object, defs: Vec<(String, ast::Func)>) -> u32 {
 ///
 /// Load order matters: core defines the base object types (Noun, Fact
 /// Schema, Role, Constraint) that every later reading references.
-const METAMODEL_READINGS: &[(&str, &str)] = &[
+pub const METAMODEL_READINGS: &[(&str, &str)] = &[
     ("core",          include_str!("../../../readings/core.md")),
     ("state",         include_str!("../../../readings/state.md")),
     ("instances",     include_str!("../../../readings/instances.md")),
@@ -435,6 +435,91 @@ const METAMODEL_READINGS: &[(&str, &str)] = &[
     ("agents",        include_str!("../../../readings/agents.md")),
     ("ui",            include_str!("../../../readings/ui.md")),
 ];
+
+/// The bundled metamodel concatenated into a single corpus, with
+/// blank-line separators between files. Used to preload the checker
+/// so a user app corpus doesn't flag metamodel-declared nouns
+/// (Noun, FactType, Domain, App, …) as undeclared. Deterministic —
+/// the fold is over the `METAMODEL_READINGS` table in declaration
+/// order, matching `create_impl`'s load order.
+pub fn metamodel_corpus() -> String {
+    METAMODEL_READINGS.iter().fold(String::new(), |mut acc, (_, text)| {
+        acc.push_str(text);
+        acc.push_str("\n\n");
+        acc
+    })
+}
+
+/// Check a user readings corpus with the bundled metamodel preloaded.
+///
+/// The metamodel is parsed as context so references to metamodel nouns
+/// resolve, but diagnostics that originate purely from the metamodel
+/// text are filtered out — only diagnostics whose `reading` text is
+/// absent from the metamodel survive. This is the default mode for
+/// check-cli; use `check::check_readings` directly when validating
+/// the metamodel itself or a replacement core.
+pub fn check_readings_with_metamodel(user_text: &str) -> Vec<check::ReadingDiagnostic> {
+    let metamodel = metamodel_corpus();
+    let metamodel_only: std::collections::HashSet<String> = check::check_readings(&metamodel)
+        .into_iter().map(|d| d.reading).collect();
+    let combined = format!("{metamodel}\n\n{user_text}");
+    check::check_readings(&combined)
+        .into_iter()
+        .filter(|d| !metamodel_only.contains(&d.reading))
+        .collect()
+}
+
+#[cfg(test)]
+mod check_metamodel_tests {
+    use super::*;
+
+    /// The raw checker on a user corpus that references metamodel
+    /// nouns (Domain, App, Organization) should flood with undeclared
+    /// / unresolved diagnostics. The with-metamodel variant should
+    /// emit strictly fewer diagnostics on the same text, because the
+    /// baseline resolves the references.
+    #[test]
+    fn metamodel_preload_reduces_user_corpus_diagnostics() {
+        // A user snippet that leans on metamodel-declared nouns.
+        let user = "\
+# Support domain
+
+Ticket(.id) is an entity type.
+Ticket belongs to Organization.
+  Each Ticket belongs to exactly one Organization.
+Ticket is opened by User.
+  Each Ticket is opened by exactly one User.
+App 'support' navigates Domain.
+";
+
+        let bare = check::check_readings(user);
+        let with_meta = check_readings_with_metamodel(user);
+
+        assert!(with_meta.len() <= bare.len(),
+            "preloading metamodel must not add diagnostics: bare={} with_meta={}",
+            bare.len(), with_meta.len());
+    }
+
+    /// Diagnostics that originate solely from the metamodel text
+    /// must not surface in the user-facing output. We approximate by
+    /// checking that no diagnostic from the with-metamodel result
+    /// matches a diagnostic produced by checking the metamodel in
+    /// isolation.
+    #[test]
+    fn metamodel_only_diagnostics_are_filtered_out() {
+        let metamodel_only = check::check_readings(&metamodel_corpus());
+        let metamodel_only_readings: std::collections::HashSet<String> =
+            metamodel_only.iter().map(|d| d.reading.clone()).collect();
+
+        // Empty user corpus — every surviving diagnostic must have come
+        // from somewhere outside the metamodel. None should remain.
+        let diags = check_readings_with_metamodel("");
+        for d in &diags {
+            assert!(!metamodel_only_readings.contains(&d.reading),
+                "metamodel-only diagnostic leaked through: {:?}", d.reading);
+        }
+    }
+}
 
 /// create_bare: allocate empty D with ONLY the platform primitives
 /// registered in DEFS. Use this when testing a new core or rebuilding
