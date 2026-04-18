@@ -71,6 +71,8 @@ Article features MediaAsset.
 
 Article is related to Article.
   In each population of Article is related to Article, each Article, Article combination occurs at most once.
+  No Article is related to itself.
+  If Article 1 is related to Article 2, then Article 2 is related to Article 1.
 
 ### Media Asset
 
