@@ -189,7 +189,12 @@ fn try_totality(line: &str) -> Option<ParseAction> {
 }
 
 fn try_ring(line: &str, noun_names: &[String]) -> Option<ParseAction> {
-    let clean = line.trim_end_matches('.');
+    // Strip trailing documentation annotation like " (irreflexive)" or
+    // " (symmetric)" — users write `No X R itself. (irreflexive)` to
+    // label the kind inline, and the parenthetical must not block the
+    // ` itself` / conditional-form recognition that follows.
+    let clean = strip_trailing_annotation(line.trim_end_matches('.').trim_end())
+        .trim_end_matches('.');
 
     // IR: "No A R itself." -- simple irreflexive
     // AC: "No A may cycle back to itself via one or more traversals through R."
@@ -290,8 +295,30 @@ fn try_ring(line: &str, noun_names: &[String]) -> Option<ParseAction> {
         id: String::new(), kind: kind.into(), modality: "alethic".into(),
         deontic_operator: None, text: clean.into(),
         spans: vec![], set_comparison_argument_length: None, clauses: None,
-        entity: None, min_occurrence: None, max_occurrence: None,
+        // The ring noun is the common base shared by every role token
+        // in the antecedent (enforced above). Carry it through so
+        // check_ring_completeness can match this constraint to its FT
+        // without relying on span0_factTypeId.
+        entity: Some(first_base.to_string()),
+        min_occurrence: None, max_occurrence: None,
     }))
+}
+
+/// Strip a trailing ` (word-or-phrase)` documentation annotation.
+/// Used by `try_ring` so readings of the form
+/// `No X R itself. (irreflexive)` or
+/// `If some X1 R some X2 then that X2 R that X1. (symmetric)`
+/// parse the same as the un-annotated forms.
+fn strip_trailing_annotation(text: &str) -> &str {
+    let trimmed = text.trim_end();
+    let Some(close_rel) = trimmed.strip_suffix(')') else { return text; };
+    let Some(open_pos) = close_rel.rfind(" (") else { return text; };
+    let prefix = &close_rel[..open_pos];
+    // The bit between `(` and `)` must not itself contain parentheses
+    // (avoid truncating legitimate content with nested annotations).
+    let inner = &close_rel[open_pos + 2..];
+    if inner.contains('(') || inner.contains(')') { return text; }
+    prefix
 }
 
 /// try_ring_shorthand â€” ORM 2 intuitive-icon parity for ring constraints.

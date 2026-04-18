@@ -451,6 +451,32 @@ Monitoring Body must take Monitoring Body.
             "real self-ring on a compound noun must still produce the completeness hint; got no hints in {:?}", diags);
     }
 
+    /// Regression: sherlock's evidence.md writes ring constraints with
+    /// trailing documentation annotations: `No Hypothesis contradicts
+    /// itself. (irreflexive)` and `If some Hypothesis1 ... . (symmetric)`.
+    /// Before the fix in parse_forml2::try_ring, the parenthetical
+    /// suffix blocked the `.ends_with(" itself")` and if-then
+    /// recognition, AND the if-then branch emitted constraints with
+    /// entity=None so check_ring_completeness couldn't link them to
+    /// their FT. Both cases produced bogus "no ring constraint" hints.
+    #[test]
+    fn declared_ring_constraints_with_annotations_suppress_hint() {
+        let input = "\
+Hypothesis(.id) is an entity type.
+## Fact Types
+Hypothesis contradicts Hypothesis.
+## Ring Constraints
+If some Hypothesis1 contradicts some Hypothesis2 then that Hypothesis2 contradicts that Hypothesis1. (symmetric)
+No Hypothesis contradicts itself. (irreflexive)
+";
+        let diags = check_readings(input);
+        let ring_hints: Vec<_> = diags.iter()
+            .filter(|d| d.level == Level::Hint && d.message.contains("no ring constraint"))
+            .collect();
+        assert!(ring_hints.is_empty(),
+            "declared IR+SY ring constraints with `(kind)` annotations must suppress the hint; got {:?}", ring_hints);
+    }
+
     #[test]
     fn text_contains_capitalized_prefixed_only_fires_on_compound_nouns() {
         // Positive: "Personal Data" has "Personal" as capitalized prefix.
