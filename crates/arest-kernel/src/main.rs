@@ -32,6 +32,7 @@ mod allocator;
 mod gdt;
 mod interrupts;
 mod memory;
+mod net;
 mod repl;
 mod serial;
 
@@ -48,6 +49,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     interrupts::init_idt();
     interrupts::init_pic();
     memory::init(boot_info);
+    net::init();
 
     // Collect memory stats for the banner.
     let frame_count = memory::usable_frame_count();
@@ -60,6 +62,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     println!("  idt:    breakpoint + double-fault + keyboard (#181)");
     println!("  pic:    remapped to 32+, keyboard (IRQ 1) unmasked");
     println!("  memory: {usable_mib} MiB usable RAM ({frame_count} x 4 KiB frames) (#180)");
+    println!("  net:    smoltcp loopback 127.0.0.1/8 (#261 — virtio-net in #262)");
 
     // Prove the allocator works — allocate a String and echo it.
     let greeting = "heap is live".to_string();
