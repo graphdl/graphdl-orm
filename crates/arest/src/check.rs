@@ -477,6 +477,41 @@ No Hypothesis contradicts itself. (irreflexive)
             "declared IR+SY ring constraints with `(kind)` annotations must suppress the hint; got {:?}", ring_hints);
     }
 
+    /// Regression: robocall-service derivation rules use two antecedent
+    /// shapes the resolver previously didn't classify, producing
+    /// "antecedent clause did not resolve" warnings:
+    ///   - Subtype instance check: `Robocall is an Autodialed Call`
+    ///     where Autodialed Call is a declared subtype of Robocall.
+    ///   - Word comparator: `Actual Damages Amount exceeds Per Violation Amount`
+    ///     where both sides reference declared value types.
+    /// Both now resolve via the new branches (7) and (8) in
+    /// resolve_derivation_rule.
+    #[test]
+    fn subtype_check_and_word_comparator_antecedents_resolve() {
+        let input = "\
+Robocall(.id) is an entity type.
+Autodialed Call is a subtype of Robocall.
+Prerecorded Call is a subtype of Robocall.
+TCPA Violation(.id) is an entity type.
+Actual Damages Amount is a value type.
+Per Violation Amount is a value type.
+## Fact Types
+TCPA Violation is for Robocall.
+## Derivation Rules
++ TCPA Violation is for Robocall if Robocall is an Autodialed Call.
++ TCPA Violation is for Robocall if Robocall is a Prerecorded Call.
+It is permitted that claim Actual Damages Amount if Actual Damages Amount exceeds Per Violation Amount.
+";
+        let diags = check_readings(input);
+        let unresolved: Vec<_> = diags.iter()
+            .filter(|d| d.level == Level::Warning
+                && d.message.contains("antecedent clause did not resolve"))
+            .collect();
+        assert!(unresolved.is_empty(),
+            "subtype-check / word-comparator antecedents must resolve; got {:?}",
+            unresolved.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
+
     #[test]
     fn text_contains_capitalized_prefixed_only_fires_on_compound_nouns() {
         // Positive: "Personal Data" has "Personal" as capitalized prefix.

@@ -304,6 +304,48 @@ fn try_ring(line: &str, noun_names: &[String]) -> Option<ParseAction> {
     }))
 }
 
+/// True when `clause` has the shape `<Noun> is (a|an) <Noun>` with
+/// both sides resolving to declared nouns. Treated as a typing
+/// predicate rather than a fact-type reference.
+fn is_subtype_instance_check(clause: &str, noun_names: &[String]) -> bool {
+    let trimmed = clause.trim();
+    [" is a ", " is an "].iter().any(|kw| {
+        let Some(idx) = trimmed.find(kw) else { return false; };
+        let lhs = trimmed[..idx].trim();
+        let rhs = trimmed[idx + kw.len()..].trim();
+        let is_noun = |s: &str| noun_names.iter().any(|n| n == s);
+        is_noun(lhs) && is_noun(rhs)
+    })
+}
+
+/// True when `clause` uses a word-based comparator
+/// (`exceeds`, `is greater than`, `is less than`, `is at least`,
+///  `is at most`, `is more than`, `equals`, `is equal to`)
+/// and both operand sides reference a declared noun. The payload
+/// itself isn't compiled here — classification only suppresses
+/// the "unresolved clause" diagnostic for the legitimate comparison
+/// form.
+fn is_word_comparator_clause(clause: &str, noun_names: &[String]) -> bool {
+    const COMPARATORS: &[&str] = &[
+        " exceeds ", " is greater than ", " is less than ",
+        " is at least ", " is at most ", " is more than ",
+        " equals ", " is equal to ",
+    ];
+    COMPARATORS.iter().any(|kw| {
+        let Some(idx) = clause.find(kw) else { return false; };
+        let lhs = clause[..idx].trim();
+        let rhs = clause[idx + kw.len()..].trim();
+        let side_has_noun = |side: &str| noun_names.iter().any(|n| {
+            // Whole-side match or noun as a whole-word substring.
+            side == n
+                || side.starts_with(&format!("{} ", n))
+                || side.ends_with(&format!(" {}", n))
+                || side.contains(&format!(" {} ", n))
+        });
+        side_has_noun(lhs) && side_has_noun(rhs)
+    })
+}
+
 /// Strip a trailing ` (word-or-phrase)` documentation annotation.
 /// Used by `try_ring` so readings of the form
 /// `No X R itself. (irreflexive)` or
@@ -1942,6 +1984,22 @@ fn resolve_derivation_rule(
 
         // (6) Temporal predicates â€” genuinely new, no existing fn.
         if is_temporal_predicate(part) { continue; }
+
+        // (7) Subtype instance check: `X is a Y` / `X is an Y` where
+        //     both X and Y are declared nouns. Subtype membership is
+        //     inherent to the schema (Noun-is-subtype-of-Noun facts),
+        //     not a separate FT. Recognised so readings like
+        //       TCPA Violation is for Robocall ... if Robocall is
+        //         an Autodialed Call and ...
+        //     don't spuriously flag the subtype check as unresolved.
+        if is_subtype_instance_check(part, &noun_names) { continue; }
+
+        // (8) Word-based value comparison: `X exceeds Y`,
+        //     `X is greater than Y`, etc., where both operands resolve
+        //     against the noun catalog. Complements the ASCII-operator
+        //     path in branch (1)/(2) for readings that spell their
+        //     comparators out.
+        if is_word_comparator_clause(part, &noun_names) { continue; }
 
         // Nothing classified this clause.
         rule.unresolved_clauses.push(part.to_string());
