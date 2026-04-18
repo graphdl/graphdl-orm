@@ -80,13 +80,13 @@ If some Attendee is required for some Meeting then that Attendee is invited to t
 
 ## Derivation Rules
 
--- Each premise below is an elementary fact type reading.
--- Prefer this layout over a single prose sentence with multiple "and"s.
+### Each premise below is an elementary fact type reading.
+### Prefer this layout over a single prose sentence with multiple "and"s.
 * Meeting has Duration iff Meeting has End Time
   and Meeting has Start Time
   and Duration is that End Time minus that Start Time.
 
--- Subset constraint stated as a single elementary implication.
+### Subset constraint stated as a single elementary implication.
 If some Meeting is organized by some Attendee then that Attendee is invited to that Meeting.
 
 ## Instance Facts
