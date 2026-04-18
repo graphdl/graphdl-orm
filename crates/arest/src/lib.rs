@@ -767,20 +767,27 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
         let apply_result = ast::apply(&ast::Func::Def(key.to_string()), &obj, &snapshot);
         match classify_writer_result(&apply_result) {
             WriterResult::NoCommit { response } => return response,
-            WriterResult::Commit { ref new_d, .. } => {
-                // cells_for_noun + try_commit_declared are available
-                // for callers that can enumerate their write set.
-                // system_impl uses full diff because __state carries
-                // the entire D and may touch cells outside the noun's
-                // RMAP partition (metamodel defs, derived cells, etc.).
-                let outcome = st.try_commit_diff(&snapshot, new_d);
+            WriterResult::Commit { new_d, response } => {
+                // Full-state commit (compile paths). Diff against the
+                // snapshot under shared lock; if clean, CAS the changed
+                // cells only. Schema-changing ops fall back to Tier 2.
+                let outcome = st.try_commit_diff(&snapshot, &new_d);
                 match outcome {
-                    CommitOutcome::Committed => {
-                        if let WriterResult::Commit { response, .. } = classify_writer_result(&apply_result) {
-                            return response;
-                        }
-                        unreachable!("classify is deterministic");
+                    CommitOutcome::Committed => return response,
+                    CommitOutcome::StaleSnapshot | CommitOutcome::StructuralChange => {
+                        // fall through to Tier 2
                     }
+                }
+            }
+            WriterResult::CommitDelta { delta, response } => {
+                // #209: per-command delta. Merge onto snapshot, then
+                // try_commit_diff against the same snapshot so the CAS
+                // only touches the delta cells. If the snapshot is
+                // stale, escalate to Tier 2 with a fresh re-apply.
+                let new_d = ast::merge_delta(&snapshot, &delta);
+                let outcome = st.try_commit_diff(&snapshot, &new_d);
+                match outcome {
+                    CommitOutcome::Committed => return response,
                     CommitOutcome::StaleSnapshot | CommitOutcome::StructuralChange => {
                         // fall through to Tier 2
                     }
@@ -796,6 +803,11 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
     match classify_writer_result(&apply_result) {
         WriterResult::NoCommit { response } => response,
         WriterResult::Commit { new_d, response } => {
+            st.replace_d(new_d);
+            response
+        }
+        WriterResult::CommitDelta { delta, response } => {
+            let new_d = ast::merge_delta(&snapshot, &delta);
             st.replace_d(new_d);
             response
         }
@@ -821,39 +833,47 @@ fn write_targets_for_key(key: &str, st: &CompiledState) -> Option<Vec<String>> {
 
 /// Outcome of classifying an `ast::apply` result in the write path.
 enum WriterResult {
-    /// Result is a full new D (possibly extracted from a `__state`
-    /// carrier), to be persisted.
+    /// Result is a full new D (a bare store with a Noun cell), to be
+    /// persisted with replace semantics. Used by platform_compile,
+    /// where the schema itself may change.
     Commit { new_d: ast::Object, response: String },
+    /// Result is a per-command delta (a Map of modified cells only,
+    /// extracted from a `__state_delta` carrier), to be merged onto
+    /// the current snapshot before commit. Used by create / update /
+    /// transition / load_readings, which are encoded via
+    /// `encode_command_result` and should touch only their RMAP cells
+    /// (#209).
+    CommitDelta { delta: ast::Object, response: String },
     /// Result is a query / non-D response; nothing to persist.
     NoCommit { response: String },
 }
 
-/// Classify an apply() result according to the three writer-path
-/// shapes the system recognises. Pure: no tenant mutation; callers
-/// decide whether to commit under Tier-1 or Tier-2 locks.
+/// Classify an apply() result according to the writer-path shapes the
+/// system recognises. Pure: no tenant mutation; callers decide whether
+/// to commit under Tier-1 or Tier-2 locks.
 ///
 /// Shapes:
-///   1. CommandResult carrier `{__state, __result}` — used by
-///      create/update/transition. Commit __state if it looks like a
-///      valid store; return __result as the response.
+///   1. Delta carrier `{__state_delta, __result}` — used by
+///      create / update / transition (#209). Merge the delta cells
+///      onto the snapshot, then commit.
 ///   2. Bare store with a Noun cell — used by platform_compile.
 ///      Commit the result; return a compact summary.
 ///   3. Anything else — pure query result; return as JSON.
 fn classify_writer_result(result: &ast::Object) -> WriterResult {
     if let Some(map) = result.as_map() {
-        if map.contains_key("__state") && map.contains_key("__result") {
-            let new_state = map.get("__state").cloned().unwrap_or(ast::Object::Bottom);
+        // Shape 1: delta carrier (#209).
+        if map.contains_key("__state_delta") && map.contains_key("__result") {
+            let delta = map.get("__state_delta").cloned().unwrap_or(ast::Object::Bottom);
             let response_obj = map.get("__result").cloned().unwrap_or(ast::Object::Bottom);
             let response = response_obj.as_atom().map(|s| s.to_string())
                 .unwrap_or_else(|| response_obj.to_string());
-            let valid = (new_state.as_map().is_some() || new_state.as_seq().is_some())
-                && ast::fetch("Noun", &new_state) != ast::Object::Bottom;
-            if valid {
-                return WriterResult::Commit { new_d: new_state, response };
+            if delta.as_map().is_some() {
+                return WriterResult::CommitDelta { delta, response };
             }
             return WriterResult::NoCommit { response };
         }
     }
+    // Shape 2: bare store with a Noun cell.
     let looks_like_store = result.as_seq().is_some() || result.as_map().is_some();
     let is_new_d = looks_like_store
         && ast::fetch("Noun", result) != ast::Object::Bottom;
