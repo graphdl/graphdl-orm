@@ -118,10 +118,35 @@ fn check_ring_validity(state: &Object) -> Vec<ReadingDiagnostic> {
 
 /// Binary FTs whose two roles reference the same noun without a ring
 /// constraint are usually a bug — nothing prevents self-reference cycles.
+///
+/// Role cells carry `nounName` as set by parse_fact, which runs
+/// longest-first noun matching against whatever nouns had been
+/// declared up to that point. Inline `.id` declarations in role
+/// position (e.g. `Transfer(.id) transmits Personal Data(.id).`) do
+/// NOT auto-declare the noun, so compound nouns like `Personal Data`
+/// are often missing from the noun set when a later reading like
+/// `Personal Data Breach is breach of security leading to loss of
+/// Personal Data` is parsed. Both role positions fall through to
+/// bare `Data`, the stored reading becomes `Data ... Personal Data`
+/// (first-role prefix dropped, second-role kept because the parser
+/// quotes `found[1].2` verbatim and `Data` at the end has no
+/// surviving prefix text after the match), and the check fires.
+///
+/// Suppression heuristic: if the stored reading contains the pattern
+/// `<CapitalizedWord> <ring_noun>` anywhere, at least one role
+/// originally resolved to a compound noun ending in ring_noun —
+/// treat the ring detection as a parse-time artifact and stay quiet.
+/// Reproduces the 9 false positives from the FORML sibling agent's
+/// run against the eu-law corpus.
 fn check_ring_completeness(state: &Object) -> Vec<ReadingDiagnostic> {
     let ft_cell = fetch_or_phi("FactType", state);
     let role_cell = fetch_or_phi("Role", state);
     let constraint_cell = fetch_or_phi("Constraint", state);
+    let noun_names: Vec<String> = fetch_or_phi("Noun", state).as_seq()
+        .map(|ns| ns.iter()
+            .filter_map(|n| binding(n, "name").map(|s| s.to_string()))
+            .collect())
+        .unwrap_or_default();
 
     ft_cell.as_seq()
         .map(|fts| fts.iter().filter_map(|ft| {
@@ -132,9 +157,36 @@ fn check_ring_completeness(state: &Object) -> Vec<ReadingDiagnostic> {
                     .filter_map(|r| binding(r, "nounName"))
                     .collect())
                 .unwrap_or_default();
-            // Binary + same noun both roles
+            // Binary + same noun both roles at parse time
             (roles.len() == 2 && roles[0] == roles[1]).then_some(())?;
             let ring_noun = roles[0];
+
+            // Suppression layer 1: the stored reading still contains a
+            // `<Capitalized> <ring_noun>` pair (e.g. "Personal Data"
+            // surviving at the end of a reading whose first role
+            // prefix was stripped). Evidence of a compound noun that
+            // the parse-time noun list was missing.
+            let reading = binding(ft, "reading").unwrap_or("");
+            let has_compound_prefix = text_contains_capitalized_prefixed(reading, ring_noun);
+            // Suppression layer 2: a compound noun ending in ring_noun
+            // is declared elsewhere in the corpus (e.g. "Biometric
+            // Data" in eu-law). Even if this FT's stored reading has
+            // lost every prefix to parse_fact's role-capture rebuild,
+            // the presence of such a compound makes the ring reading
+            // ambiguous enough to suppress — ring hints are advisory
+            // and false positives from tokenization are strictly
+            // worse than a missed hint.
+            let compound_noun_declared = noun_names.iter().any(|n| {
+                let suffix = match ring_noun.is_empty() {
+                    true => false,
+                    false => n.ends_with(ring_noun)
+                        && n.len() > ring_noun.len()
+                        && n.as_bytes()[n.len() - ring_noun.len() - 1] == b' ',
+                };
+                suffix
+            });
+            (!has_compound_prefix && !compound_noun_declared).then_some(())?;
+
             let has_ring = constraint_cell.as_seq()
                 .map(|cs| cs.iter().any(|c|
                     is_ring_kind(binding(c, "kind").unwrap_or(""))
@@ -142,7 +194,7 @@ fn check_ring_completeness(state: &Object) -> Vec<ReadingDiagnostic> {
                             || binding(c, "entity") == Some(ring_noun))))
                 .unwrap_or(false);
             (!has_ring).then(|| {
-                let reading = binding(ft, "reading").unwrap_or("").to_string();
+                let reading = reading.to_string();
                 ReadingDiagnostic {
                     line: 0,
                     reading: reading.clone(),
@@ -157,6 +209,48 @@ fn check_ring_completeness(state: &Object) -> Vec<ReadingDiagnostic> {
             })
         }).collect())
         .unwrap_or_default()
+}
+
+/// True iff `text` contains an occurrence of `target` that is
+/// immediately preceded by a Capitalized word (ASCII uppercase
+/// followed by at least one lowercase letter) and a single space.
+/// Used by `check_ring_completeness` to detect compound-noun
+/// false positives without needing the parser to have accumulated
+/// the compound declaration.
+fn text_contains_capitalized_prefixed(text: &str, target: &str) -> bool {
+    if target.is_empty() { return false; }
+    let bytes = text.as_bytes();
+    let target_bytes = target.as_bytes();
+    let mut pos = 0;
+    while let Some(hit) = text[pos..].find(target) {
+        let start = pos + hit;
+        // Word boundary at end of match (don't match a prefix of a longer word).
+        let end = start + target_bytes.len();
+        let after_ok = end >= bytes.len() || !bytes[end].is_ascii_alphanumeric();
+        // There must be ` X…` before the target where X is ASCII uppercase
+        // and followed by ASCII lowercase — a Capitalized word token.
+        let prefixed = start >= 2 && bytes[start - 1] == b' '
+            && {
+                // Walk back to the preceding space (or start of text) to
+                // isolate the word immediately before the target.
+                let word_end = start - 1;
+                let mut word_start = word_end;
+                while word_start > 0 && bytes[word_start - 1] != b' ' {
+                    word_start -= 1;
+                }
+                // The preceding word is bytes[word_start..word_end].
+                // It must start with an uppercase ASCII letter and
+                // contain at least one lowercase ASCII letter.
+                let word = &bytes[word_start..word_end];
+                !word.is_empty()
+                    && word[0].is_ascii_uppercase()
+                    && word.iter().skip(1).any(|b| b.is_ascii_lowercase())
+            };
+        if after_ok && prefixed { return true; }
+        pos = start + 1;
+        if pos >= text.len() { break; }
+    }
+    false
 }
 
 /// Noun names that look like plurals of `<base>y` (via the `ies → y`
@@ -307,5 +401,78 @@ mod tests {
             .collect();
         assert!(ring_hints.is_empty(),
             "ring with AC constraint should NOT produce completeness hint, got {:?}", ring_hints);
+    }
+
+    /// Regression: the eu-law corpus uses compound nouns like
+    /// `Personal Data` and `Personal Data Breach` that the parser
+    /// does not auto-declare (inline `.id` in role position is not a
+    /// declaration), so they are missing from the Noun set when the
+    /// FT reading is parsed. find_nouns falls through to bare `Data`
+    /// for both role positions, Role.nounName = "Data" twice, and
+    /// ring completeness fires spuriously. Reproduces the 9 false
+    /// positives from the FORML sibling agent's run against
+    /// C:\Users\lippe\Repos\eu-law\readings.
+    ///
+    /// The fix (in check_ring_completeness): if the stored FT reading
+    /// contains `<CapitalizedWord> <ring_noun>` anywhere, at least
+    /// one role was a compound noun — treat the detection as a
+    /// parse-time artifact and stay quiet.
+    #[test]
+    fn compound_nouns_sharing_suffix_are_not_a_ring_on_suffix() {
+        let input = "\
+Data(.id) is an entity type.
+Personal Data Breach is breach of security leading to accidental or unlawful loss of Personal Data.
+Data is processed in manner that ensures appropriate security of Personal Data.
+";
+        let diags = check_readings(input);
+        let ring_hints: Vec<_> = diags.iter()
+            .filter(|d| d.level == Level::Hint && d.message.contains("no ring constraint"))
+            .collect();
+        assert!(ring_hints.is_empty(),
+            "compound nouns ending in `Data` must not trip ring completeness on bare `Data`; got {:?}", ring_hints);
+    }
+
+    /// Negative: a genuine self-ring on a compound noun should still
+    /// produce the hint — `Monitoring Body must take Monitoring Body`
+    /// has both roles legitimately on `Monitoring Body`, and the
+    /// preceding words (start of string / `take`) are not Capitalized
+    /// prefixes of another noun, so the heuristic does not suppress.
+    #[test]
+    fn genuine_ring_on_compound_noun_still_fires() {
+        let input = "\
+Monitoring Body(.id) is an entity type.
+Monitoring Body must take Monitoring Body.
+";
+        let diags = check_readings(input);
+        let ring_hints: Vec<_> = diags.iter()
+            .filter(|d| d.level == Level::Hint && d.message.contains("no ring constraint"))
+            .collect();
+        assert!(!ring_hints.is_empty(),
+            "real self-ring on a compound noun must still produce the completeness hint; got no hints in {:?}", diags);
+    }
+
+    #[test]
+    fn text_contains_capitalized_prefixed_only_fires_on_compound_nouns() {
+        // Positive: "Personal Data" has "Personal" as capitalized prefix.
+        assert!(super::text_contains_capitalized_prefixed(
+            "Data is processed in manner that ensures appropriate security of Personal Data",
+            "Data",
+        ));
+        // Negative: "Data or Data" — "or" is lowercase, no compound.
+        assert!(!super::text_contains_capitalized_prefixed("Data or Data", "Data"));
+        // Negative: "Monitoring Body takes Monitoring Body" — `takes` is lowercase.
+        assert!(!super::text_contains_capitalized_prefixed(
+            "Monitoring Body takes Monitoring Body",
+            "Monitoring Body",
+        ));
+        // Negative: "Data Subject where Data Subject" — `where` is lowercase.
+        assert!(!super::text_contains_capitalized_prefixed(
+            "Data Subject where Data Subject",
+            "Data Subject",
+        ));
+        // Negative: an acronym like "GDPR Data" — "GDPR" has no lowercase
+        // letters, so it doesn't count as a "Capitalized word" for our
+        // compound-noun heuristic.
+        assert!(!super::text_contains_capitalized_prefixed("GDPR Data processes Data", "Data"));
     }
 }
