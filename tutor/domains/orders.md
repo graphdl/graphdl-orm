@@ -109,16 +109,16 @@ It is obligatory that each LineItem has Quantity greater than 0.
 It is forbidden that a Coupon has Discount Percent greater than 100.
 It is forbidden that a Coupon has Discount Percent less than 0.
 
--- Subset constraint: Order.Shipping Address is populated from Customer.Shipping Address.
--- Expressed as a single elementary equality, not a compound sentence.
+### Subset constraint: Order.Shipping Address is populated from Customer.Shipping Address.
+### Expressed as a single elementary equality, not a compound sentence.
 If some Customer places some Order then that Order has Shipping Address equal to that Customer's Shipping Address.
 
 ## Derivation Rules
 
 * Order has Amount iff Amount is the sum of LineItem Amount where some LineItem belongs to that Order.
 
--- A derivation rule couples a conclusion to its premises. Keep each premise an
--- elementary fact so the rule reads as a composition, not a prose sentence.
+### A derivation rule couples a conclusion to its premises. Keep each premise an
+### elementary fact so the rule reads as a composition, not a prose sentence.
 * Order has discounted Amount iff some Coupon is applied to that Order
   and that Coupon has Discount Percent
   and discounted Amount is that Order's Amount reduced by that Discount Percent.
