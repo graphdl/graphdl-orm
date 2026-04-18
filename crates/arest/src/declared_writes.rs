@@ -41,17 +41,20 @@ pub fn apply_with_declared_writes(
 
 /// Prune an apply result to the declared set of write targets.
 /// Pure — no state mutation, no I/O. Exposed for direct testing.
-pub fn prune_to_declared(result: &Object, snapshot: &Object, write_targets: &[&str]) -> Object {
+pub fn prune_to_declared(
+    result: &Object,
+    #[cfg_attr(not(debug_assertions), allow(unused_variables))] snapshot: &Object,
+    write_targets: &[&str],
+) -> Object {
     let result_map = match result.as_map() {
         Some(m) => m,
         None => return Object::Bottom,
     };
-    let snap_map = snapshot.as_map();
-
     // Debug check: every changed cell in result must be in write_targets.
     // Release builds skip this entirely so the fast path stays cheap.
     #[cfg(debug_assertions)]
     {
+        let snap_map = snapshot.as_map();
         for (key, new_val) in result_map.iter() {
             let snap_val = snap_map.and_then(|m| m.get(key));
             let changed = snap_val.map_or(true, |old| old != new_val);
