@@ -540,32 +540,94 @@ fn apps_opted_into_generator(
 
 /// #214: compile as a Func tree entry point.
 ///
-/// Returns a `Func::Native` leaf that, when applied via `ast::apply`
-/// against the state Object, produces an `Object::Seq` of
-/// `<name_atom, func_object>` pairs — the same `(name, Func)` list
-/// the Rust `compile_to_defs_state` returns, encoded through
-/// `ast::func_to_object` so the whole compile output can round-trip
-/// through ρ-application.
+/// Returns a Func tree shaped per AREST Theorem 2 / paper §4.1
+/// Table 1: compile is the injective map Φ → O that decomposes by
+/// FORML 2 construct family. The top level is
 ///
-/// The body still wraps the existing `compile_to_defs_state`
-/// procedure (thousands of lines driving every generator, derivation
-/// compiler, constraint compiler, and schema builder). This gives
-/// compile a first-class ρ-dispatchable shape without disturbing any
-/// downstream caller. A deeper FFP rewrite would decompose the
-/// procedure into independent sub-Funcs per construct family
-/// (constraints → Filter(p):P, derivations → COMP, state machines →
-/// foldl); that's tracked as follow-up under #214 so the current
-/// entry point stays stable.
+///   compile_func = Concat ∘ Construction([ f_constraint, f_validate,
+///     f_machine, f_transitions, f_derivation, f_schema, f_resolve,
+///     f_other ])
+///
+/// Each family `f_X` is a Func::Native leaf that runs
+/// `compile_to_defs_state` against the state, filters the resulting
+/// `(name, Func)` pairs to its family prefix, and encodes each pair
+/// as `Object::Seq<name_atom, func_object>` via
+/// `ast::func_to_object`. `Concat` flattens the eight sub-sequences
+/// into the full compile output that `decode_compile_result` can
+/// reverse.
+///
+/// Performance: ρ-dispatch via `apply(compile_func(), …)` runs
+/// `compile_to_defs_state` once per family (8×) because each family
+/// leaf is independent. The hot path — direct Rust call to
+/// `compile_to_defs_state` — is unchanged and is the one used by
+/// `platform_compile`, `compile_to_defs_state`, and every in-process
+/// caller. This entry point exists so external dispatch layers
+/// (future lowered compile pipelines, MCP dispatch, FPGA backends)
+/// can ρ-dispatch to compile and see the construct-family structure
+/// at the Func-tree level instead of reaching into a monolithic
+/// Rust procedure.
 pub fn compile_func() -> crate::ast::Func {
+    use crate::ast::Func;
+    Func::compose(
+        Func::Concat,
+        Func::construction(vec![
+            family_leaf(FAMILY_CONSTRAINT),
+            family_leaf(FAMILY_VALIDATE),
+            family_leaf(FAMILY_MACHINE),
+            family_leaf(FAMILY_TRANSITIONS),
+            family_leaf(FAMILY_DERIVATION),
+            family_leaf(FAMILY_SCHEMA),
+            family_leaf(FAMILY_RESOLVE),
+            family_leaf(FAMILY_OTHER),
+        ]),
+    )
+}
+
+// Construct-family tags, matched against def names with
+// `name_belongs_to_family`. Order matches AREST.tex §4.1 Table 1:
+// constraints first (Filter(p):P), validators, state machines
+// (foldl transition), derivations (Compose), fact-type schemas
+// (Construction of role selectors), noun resolvers, then everything
+// else (indices, generator output, platform bindings).
+const FAMILY_CONSTRAINT:  &str = "constraint:";
+const FAMILY_VALIDATE:    &str = "validate";
+const FAMILY_MACHINE:     &str = "machine:";
+const FAMILY_TRANSITIONS: &str = "transitions:";
+const FAMILY_DERIVATION:  &str = "derivation";
+const FAMILY_SCHEMA:      &str = "schema:";
+const FAMILY_RESOLVE:     &str = "resolve:";
+const FAMILY_OTHER:       &str = "";
+
+/// True when a def name belongs to the given family tag. `""` is
+/// the catch-all used for the last family leaf — it matches every
+/// name not claimed by an earlier family, exactly inverting the
+/// specific-family predicates to ensure each name falls into
+/// exactly one family.
+fn name_belongs_to_family(name: &str, family: &str) -> bool {
+    match family {
+        "" => ![
+            FAMILY_CONSTRAINT, FAMILY_VALIDATE, FAMILY_MACHINE,
+            FAMILY_TRANSITIONS, FAMILY_DERIVATION, FAMILY_SCHEMA,
+            FAMILY_RESOLVE,
+        ].iter().any(|f| name_belongs_to_family(name, f)),
+        tag if tag.ends_with(':') => name.starts_with(tag),
+        tag => name == tag || name.starts_with(&alloc::format!("{}:", tag)),
+    }
+}
+
+fn family_leaf(family: &'static str) -> crate::ast::Func {
     use alloc::sync::Arc;
-    crate::ast::Func::Native(Arc::new(|state: &crate::ast::Object| {
+    crate::ast::Func::Native(Arc::new(move |state: &crate::ast::Object| {
         let defs = compile_to_defs_state(state);
-        let pairs: Vec<crate::ast::Object> = defs.iter().map(|(name, func)| {
-            crate::ast::Object::seq(vec![
-                crate::ast::Object::atom(name),
-                crate::ast::func_to_object(func),
-            ])
-        }).collect();
+        let pairs: Vec<crate::ast::Object> = defs.iter()
+            .filter(|(name, _)| name_belongs_to_family(name, family))
+            .map(|(name, func)| {
+                crate::ast::Object::seq(vec![
+                    crate::ast::Object::atom(name),
+                    crate::ast::func_to_object(func),
+                ])
+            })
+            .collect();
         crate::ast::Object::seq(pairs)
     }))
 }
@@ -5005,9 +5067,70 @@ mod schema_tests {
 
         assert_eq!(direct.len(), decoded.len(),
             "Func-apply must emit the same number of defs as the direct call");
-        let direct_names: Vec<&str> = direct.iter().map(|(n, _)| n.as_str()).collect();
-        let decoded_names: Vec<&str> = decoded.iter().map(|(n, _)| n.as_str()).collect();
+        // Order-independent: family decomposition groups defs by
+        // prefix (constraint → validate → machine → … → other), so
+        // direct-emission order need not match after partition. What
+        // must match is the SET of emitted names.
+        let direct_names: std::collections::HashSet<&str> = direct.iter().map(|(n, _)| n.as_str()).collect();
+        let decoded_names: std::collections::HashSet<&str> = decoded.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(direct_names, decoded_names,
-            "Func-apply must preserve def names and order");
+            "Func-apply must preserve the set of def names");
+    }
+
+    /// #214: pin the top-level Func-tree shape so a future refactor
+    /// can't quietly regress compile back to a single Native leaf.
+    /// The shape must remain `Compose(Concat, Construction([8 family Funcs]))`
+    /// matching AREST Table 1 (constraints, validators, machines,
+    /// transitions, derivations, schemas, resolvers, other).
+    #[test]
+    fn compile_func_top_level_is_concat_of_family_construction() {
+        let func = compile_func();
+        match &func {
+            crate::ast::Func::Compose(outer, inner) => {
+                assert!(matches!(**outer, crate::ast::Func::Concat),
+                    "top level must compose Concat onto the family construction");
+                match &**inner {
+                    crate::ast::Func::Construction(families) => {
+                        assert_eq!(families.len(), 8,
+                            "compile_func must expose 8 family leaves per Table 1; got {}",
+                            families.len());
+                    }
+                    other => panic!("inner must be Construction of family leaves; got {:?}", other),
+                }
+            }
+            other => panic!("top-level compile_func shape broke: {:?}", other),
+        }
+    }
+
+    /// Sanity: every family predicate is disjoint except for the
+    /// catch-all. A name must belong to exactly ONE family so the
+    /// Concat doesn't emit duplicates.
+    #[test]
+    fn family_tags_partition_def_names() {
+        let families = [
+            FAMILY_CONSTRAINT, FAMILY_VALIDATE, FAMILY_MACHINE,
+            FAMILY_TRANSITIONS, FAMILY_DERIVATION, FAMILY_SCHEMA,
+            FAMILY_RESOLVE,
+        ];
+        let samples = [
+            "constraint:uc_1", "validate", "validate:Order_has_Status",
+            "machine:Order", "machine:Order:initial",
+            "transitions:Order", "derivation:uncle_rule",
+            "derivation_index:Order", "schema:ft_23",
+            "resolve:Customer", "shard:Order_has_Status",
+            "sql:sqlite:orders", "openapi:my-app",
+            "populate:ExternalNoun", "compile", "apply",
+        ];
+        for name in samples {
+            let claimed: Vec<&&str> = families.iter()
+                .filter(|f| name_belongs_to_family(name, f))
+                .collect();
+            assert!(claimed.len() <= 1,
+                "def name `{}` matches multiple families: {:?}", name, claimed);
+            // Either one specific family claims it, or the catch-all does.
+            let other_claims = name_belongs_to_family(name, FAMILY_OTHER);
+            assert_eq!(claimed.len() == 0, other_claims,
+                "name `{}` must belong to exactly one family (specific or _other)", name);
+        }
     }
 }
