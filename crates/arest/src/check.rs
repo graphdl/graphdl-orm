@@ -376,6 +376,17 @@ fn check_singular_naming(state: &Object) -> Vec<ReadingDiagnostic> {
 /// Atom IDs on instance facts that aren't printable ASCII — Func::Lower
 /// and fixed-width name wires (FPGA ingress) misbehave on those.
 fn check_atom_ids(state: &Object) -> Vec<ReadingDiagnostic> {
+    // Noun → objectType lookup. Value types (`Prompt Icon is a value
+    // type. Suggested Prompt has Prompt Icon.`) carry content, not an
+    // identifier, so emoji / non-ASCII object values in those slots
+    // are intentional and must not trip the atom-id check.
+    let value_type_nouns: hashbrown::HashSet<String> = fetch_or_phi("Noun", state).as_seq()
+        .map(|ns| ns.iter()
+            .filter(|n| binding(n, "objectType") == Some("value"))
+            .filter_map(|n| binding(n, "name").map(|s| s.to_string()))
+            .collect())
+        .unwrap_or_default();
+
     fetch_or_phi("InstanceFact", state).as_seq()
         .map(|facts| facts.iter().flat_map(|f| {
             let subject_noun = binding(f, "subjectNoun").unwrap_or("").to_string();
@@ -396,10 +407,14 @@ fn check_atom_ids(state: &Object) -> Vec<ReadingDiagnostic> {
                     suggestion: Some("use an ASCII slug (e.g. strip diacritics, transliterate)".to_string()),
                 });
 
-            // Only flag object-value atom IDs when the object is an entity
-            // (object_noun non-empty AND value is identifier-shaped).
+            // Only flag object-value atom IDs when the object is an entity.
+            // Value-type objects (e.g. Prompt Icon, Description, URL) hold
+            // content, not identifiers — non-ASCII content (emoji, i18n
+            // text, Unicode symbols) is legitimate and must not be flagged.
+            let object_is_value_type = value_type_nouns.contains(&object_noun);
             let object_diag = (!object_value.is_empty()
                 && !object_noun.is_empty()
+                && !object_is_value_type
                 && !atom_id_is_valid(&object_value)
                 && !object_value.contains(' ')
                 && object_value.len() < 64)

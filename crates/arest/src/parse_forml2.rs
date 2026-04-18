@@ -304,6 +304,56 @@ fn try_ring(line: &str, noun_names: &[String]) -> Option<ParseAction> {
     }))
 }
 
+/// True when `clause` starts with `for each <Noun>` and is followed
+/// by at least one more declared noun reference (the predicate over
+/// the universally-quantified variable). Accepts universal-quantifier
+/// antecedents like
+///     for each Authority that applies to that Support Response,
+///       that Support Response satisfies that Authority
+/// so the overall derivation rule is not flagged as unresolved.
+fn is_universal_quantifier_clause(clause: &str, noun_names: &[String]) -> bool {
+    let trimmed = clause.trim();
+    let Some(after) = trimmed.strip_prefix("for each ") else { return false; };
+    // Must mention a declared noun after `for each`.
+    noun_names.iter().any(|n| after.starts_with(n.as_str()))
+        // ...and at least one more noun reference in the tail.
+        && noun_names.iter().any(|n| {
+            let needle = format!(" {}", n);
+            after.contains(&needle)
+        })
+}
+
+/// True when `clause` has the shape `<Noun> is extracted from <Noun>`
+/// or `<Noun> is derived from <Noun>`. Both operands must be declared.
+/// Used for ML-style computed bindings (free-text extraction,
+/// classifier outputs) where the underlying extractor is registered
+/// at runtime. Classification here suppresses the false-unresolved
+/// noise; the actual extraction function lives in DEFS.
+fn is_extraction_clause(clause: &str, noun_names: &[String]) -> bool {
+    let trimmed = clause.trim().trim_end_matches('.');
+    [" is extracted from ", " is derived from "].iter().any(|kw| {
+        let Some(idx) = trimmed.find(kw) else { return false; };
+        let lhs = trimmed[..idx].trim();
+        let rhs = trimmed[idx + kw.len()..].trim();
+        let is_noun = |s: &str| noun_names.iter().any(|n| n == s);
+        is_noun(lhs) && is_noun(rhs)
+    })
+}
+
+/// Strip existential / anaphoric quantifiers from FT references so
+/// `Feature Request concerns some API Product` resolves against the
+/// declared `Feature Request concerns API Product`. Only ` some ` and
+/// ` that ` (as whole-word tokens) are removed — the surrounding
+/// noun / verb text is untouched.
+fn strip_existential_quantifiers(clause: &str) -> String {
+    clause
+        .replace(" some ", " ")
+        .replace(" that ", " ")
+        .replace("  ", " ")
+        .trim()
+        .to_string()
+}
+
 /// True when `clause` has the shape `<Noun> has <Noun> '<literal>'`
 /// with both nouns declared. Accepts state-machine status filters and
 /// enum-value filters where the underlying FT isn't always declared
@@ -1656,9 +1706,12 @@ fn try_parse_aggregate_clause(text: &str, noun_names: &[String]) -> Option<(Stri
     let t = text.trim().trim_end_matches('.').trim();
     let t = t.strip_prefix("that ").unwrap_or(t);
     // `where <filter>` is optional — `done Task Count is the count of Task`
-    // (no where clause) is as valid as the filtered form.
+    // (no where clause) is as valid as the filtered form. The op list
+    // covers count/sum/avg/min/max plus their prose equivalents
+    // (`earliest` / `latest` / `first` / `last`) which appear in
+    // time-series readings like `Date is the earliest Timestamp`.
     let re = regex::Regex::new(
-        r"^(.+?) is the (count|sum|avg|min|max) of (.+?)(?: where (.+))?$"
+        r"^(.+?) is the (count|sum|avg|min|max|earliest|latest|first|last) of (.+?)(?: where (.+))?$"
     ).expect("static regex compiles");
     let caps = re.captures(t)?;
     let role = caps.get(1)?.as_str().trim().to_string();
@@ -2095,6 +2148,32 @@ fn resolve_derivation_rule(
         //     SM-managed or enum-valued. `resolve_fact_type` would miss
         //     it; classify it here as a valid antecedent predicate.
         if is_noun_has_noun_literal(part, &noun_names) { continue; }
+
+        // (10) Universal quantifier: `for each <Noun> <predicate>`.
+        //      Recognised when the clause starts with `for each` and
+        //      contains a declared noun. The compiled form is a
+        //      population-level restriction; classification here just
+        //      suppresses the noise so legitimate universals don't
+        //      flag as unresolved.
+        if is_universal_quantifier_clause(part, &noun_names) { continue; }
+
+        // (11) `<Noun> is extracted from <Noun>` / `<Noun> is derived from <Noun>`.
+        //      Used for ML-style computed bindings where the RHS is a
+        //      free-text source field (e.g. `Category is extracted
+        //      from Body`). The extraction function itself is a
+        //      runtime primitive; the clause shape is valid here.
+        if is_extraction_clause(part, &noun_names) { continue; }
+
+        // (12) Existential-qualified FT reference: `<Noun> <verb> some <Noun>`
+        //      or `<Noun> <verb> that <Noun>`. The `some` / `that`
+        //      quantifier doesn't change the FT identity; try the
+        //      fact-type lookup again with those tokens stripped. Covers
+        //      `Feature Request concerns some API Product` style where
+        //      the declared FT is `Feature Request concerns API Product`.
+        let stripped_quantifiers = strip_existential_quantifiers(part);
+        if stripped_quantifiers.as_str() != *part
+            && resolve_fact_type(&stripped_quantifiers).is_some()
+        { continue; }
 
         // Nothing classified this clause.
         rule.unresolved_clauses.push(part.to_string());
