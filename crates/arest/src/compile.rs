@@ -709,42 +709,36 @@ fn compile_resolve_family(state: &crate::ast::Object) -> Vec<(String, Func)> {
     }).collect()
 }
 
-/// Standalone schema-family compiler (#214): reads FactType + Role
-/// cells directly and emits one `(schema:{ft_id}, Construction([
+/// Standalone schema-family compiler (#214): reads the FactType
+/// cell directly and emits one `(schema:{ft_id}, Construction([
 /// Selector(1), ..., Selector(n)]))` pair per declared fact type.
 ///
 /// Matches AREST §4.1 Table 1 verbatim: "Fact type X r Y —
-/// `<CONS, s₁, s₂>` (binary)". No pass through
-/// `compile_to_defs_state`; the body IS the paper's rule.
+/// `<CONS, s₁, s₂>` (binary)". The parser records each FT's role
+/// count in the FactType cell's `arity` binding, so the compiler
+/// can build the Construction directly from one FT fact — no Role
+/// cell cross-lookup, no pass through `compile_to_defs_state`. The
+/// body IS the paper's rule.
 fn compile_schemas_family(state: &crate::ast::Object) -> Vec<(String, Func)> {
     let ft_cell = fetch_or_phi("FactType", state);
-    let role_cell = fetch_or_phi("Role", state);
     let ft_facts = match ft_cell.as_seq() {
         Some(seq) => seq,
         None => return Vec::new(),
     };
-    let role_facts: &[crate::ast::Object] = role_cell.as_seq().unwrap_or(&[]);
 
-    ft_facts.iter().filter_map(|ft| {
-        let ft_id = binding(ft, "id")?.to_string();
-        // Gather roles for this FT sorted by position — the Selector
-        // index (1-indexed) is role_index + 1 per the schema's
-        // Construction convention.
-        let mut roles: Vec<(usize, &str)> = role_facts.iter()
-            .filter(|r| binding(r, "factType") == Some(&ft_id))
-            .filter_map(|r| {
-                let pos: usize = binding(r, "position")?.parse().ok()?;
-                Some((pos, binding(r, "nounName").unwrap_or("")))
-            })
-            .collect();
-        roles.sort_by_key(|(pos, _)| *pos);
+    ft_facts.iter().filter_map(schema_pair_from_ft_fact).collect()
+}
 
-        let selectors: Vec<Func> = roles.iter()
-            .map(|(pos, _)| Func::Selector(pos + 1))
-            .collect();
-        let construction = Func::Construction(selectors);
-        Some((alloc::format!("schema:{}", ft_id), construction))
-    }).collect()
+/// Per-FT compilation step: one `(schema:{id}, Construction)` pair.
+/// Pure per-fact function — amenable to being lowered to an FFP
+/// `Func::ApplyToAll` leaf in a later pass (the iteration itself
+/// would then become explicit at the Func level).
+fn schema_pair_from_ft_fact(ft: &crate::ast::Object) -> Option<(String, Func)> {
+    let ft_id = binding(ft, "id")?.to_string();
+    // `arity` is recorded at parse time; selectors are 1-indexed.
+    let arity: usize = binding(ft, "arity")?.parse().ok()?;
+    let selectors: Vec<Func> = (1..=arity).map(Func::Selector).collect();
+    Some((alloc::format!("schema:{}", ft_id), Func::Construction(selectors)))
 }
 
 /// Decode the output of `apply(compile_func(), state, state)` back
