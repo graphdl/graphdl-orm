@@ -91,6 +91,8 @@ Comment is by Person.
 
 Comment replies to Comment.
   Each Comment replies to at most one Comment.
+  No Comment replies to itself.
+  If Comment 1 replies to Comment 2 and Comment 2 replies to Comment 3, then Comment 1 does not reply to Comment 3.
 
 ### Milestone
 
