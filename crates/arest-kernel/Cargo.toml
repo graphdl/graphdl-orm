@@ -59,6 +59,25 @@ pic8259 = "0.11"
 # QEMU) and emits typed `DecodedKey` events — lets us ignore every
 # detail of make/break codes and modifier tracking.
 pc-keyboard = "0.7"
+# smoltcp — pure-Rust, no_std TCP/UDP/ICMP/DHCP/DNS stack (#261).
+# No C libs, no POSIX socket wrapper — just buffers, MAC/IP config,
+# and a `Device` trait that a NIC driver implements. Vendor-neutral:
+# backs Redox OS, several unikernels, Firecracker's MMDS. Feature
+# set is pared to what an HTTP server over virtio-net needs:
+#   medium-ethernet   — L2 framing for virtio-net
+#   proto-ipv4        — L3 (v6 sits behind another feature)
+#   proto-dhcpv4      — DHCPv4 client for DHCP lease acquisition
+#   socket-tcp        — TCP listen sockets for the HTTP server
+#   socket-udp        — UDP sockets for Doom multiplayer (#271)
+smoltcp = { version = "0.12", default-features = false, features = [
+    "alloc",
+    "medium-ethernet",
+    "proto-ipv4",
+    "proto-dhcpv4",
+    "socket-tcp",
+    "socket-udp",
+    "socket-dhcpv4",
+] }
 
 [profile.dev]
 panic = "abort"
