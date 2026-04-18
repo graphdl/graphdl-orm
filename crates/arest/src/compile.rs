@@ -579,6 +579,8 @@ pub fn compile_func() -> crate::ast::Func {
             family_leaf(FAMILY_SCHEMA),
             family_leaf(FAMILY_RESOLVE),
             family_leaf(FAMILY_SHARD),
+            family_leaf(FAMILY_LIST),
+            family_leaf(FAMILY_GET),
             family_leaf(FAMILY_OTHER),
         ]),
     )
@@ -598,6 +600,8 @@ const FAMILY_DERIVATION:  &str = "derivation";
 const FAMILY_SCHEMA:      &str = "schema:";
 const FAMILY_RESOLVE:     &str = "resolve:";
 const FAMILY_SHARD:       &str = "shard:";
+const FAMILY_LIST:        &str = "list:";
+const FAMILY_GET:         &str = "get:";
 const FAMILY_OTHER:       &str = "";
 
 /// True when a def name belongs to the given family tag. `""` is
@@ -610,7 +614,7 @@ fn name_belongs_to_family(name: &str, family: &str) -> bool {
         "" => ![
             FAMILY_CONSTRAINT, FAMILY_VALIDATE, FAMILY_MACHINE,
             FAMILY_TRANSITIONS, FAMILY_DERIVATION, FAMILY_SCHEMA,
-            FAMILY_RESOLVE, FAMILY_SHARD,
+            FAMILY_RESOLVE, FAMILY_SHARD, FAMILY_LIST, FAMILY_GET,
         ].iter().any(|f| name_belongs_to_family(name, f)),
         tag if tag.ends_with(':') => name.starts_with(tag),
         tag => name == tag || name.starts_with(&alloc::format!("{}:", tag)),
@@ -629,6 +633,8 @@ fn family_leaf(family: &'static str) -> crate::ast::Func {
             FAMILY_SCHEMA => compile_schemas_family(state),
             FAMILY_RESOLVE => compile_resolve_family(state),
             FAMILY_SHARD => compile_shard_family(state),
+            FAMILY_LIST => compile_per_noun_platform_family(state, "list", "list_noun"),
+            FAMILY_GET => compile_per_noun_platform_family(state, "get", "get_noun"),
             _ => compile_to_defs_state(state)
                 .into_iter()
                 .filter(|(name, _)| name_belongs_to_family(name, family))
@@ -644,6 +650,30 @@ fn family_leaf(family: &'static str) -> crate::ast::Func {
             .collect();
         crate::ast::Object::seq(pairs)
     }))
+}
+
+/// Standalone per-noun Platform-primitive family compiler (#214):
+/// for each declared noun, emits `({prefix}:{noun}, Func::Platform("{platform_key}:{noun}"))`.
+/// Used by the MCP read-path families `list:` and `get:`. Each
+/// per-noun def is a Platform primitive so the runtime can read the
+/// live D at apply-time (whitepaper Eq 9): the read path is a
+/// ρ-application that fetches from the population as it exists when
+/// the tool is called, so entities added via apply/create become
+/// visible immediately without a recompile.
+fn compile_per_noun_platform_family(
+    state: &crate::ast::Object,
+    prefix: &str,
+    platform_key: &str,
+) -> Vec<(String, Func)> {
+    fetch_or_phi("Noun", state).as_seq()
+        .map(|ns| ns.iter()
+            .filter_map(|n| binding(n, "name").map(|s| s.to_string()))
+            .map(|noun_name| (
+                alloc::format!("{}:{}", prefix, noun_name),
+                Func::Platform(alloc::format!("{}:{}", platform_key, noun_name)),
+            ))
+            .collect())
+        .unwrap_or_default()
 }
 
 /// Standalone shard-family compiler (#214): calls RMAP's cell-map
@@ -5220,8 +5250,8 @@ mod schema_tests {
                     "top level must compose Concat onto the family construction");
                 match &**inner {
                     crate::ast::Func::Construction(families) => {
-                        assert_eq!(families.len(), 9,
-                            "compile_func must expose 9 family leaves (Table 1 + shard); got {}",
+                        assert_eq!(families.len(), 11,
+                            "compile_func must expose 11 family leaves (Table 1 + shard + list + get); got {}",
                             families.len());
                     }
                     other => panic!("inner must be Construction of family leaves; got {:?}", other),
@@ -5329,7 +5359,7 @@ mod schema_tests {
         let families = [
             FAMILY_CONSTRAINT, FAMILY_VALIDATE, FAMILY_MACHINE,
             FAMILY_TRANSITIONS, FAMILY_DERIVATION, FAMILY_SCHEMA,
-            FAMILY_RESOLVE, FAMILY_SHARD,
+            FAMILY_RESOLVE, FAMILY_SHARD, FAMILY_LIST, FAMILY_GET,
         ];
         let samples = [
             "constraint:uc_1", "validate", "validate:Order_has_Status",
@@ -5337,6 +5367,7 @@ mod schema_tests {
             "transitions:Order", "derivation:uncle_rule",
             "derivation_index:Order", "schema:ft_23",
             "resolve:Customer", "shard:Order_has_Status",
+            "list:Customer", "get:Customer",
             "sql:sqlite:orders", "openapi:my-app",
             "populate:ExternalNoun", "compile", "apply",
         ];
