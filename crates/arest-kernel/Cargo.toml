@@ -78,6 +78,15 @@ smoltcp = { version = "0.12", default-features = false, features = [
     "socket-udp",
     "socket-dhcpv4",
 ] }
+# rcore-os virtio-drivers (#262): pure-Rust no_std guest drivers for
+# the full virtio device family (net, blk, gpu, input, console).
+# Backs Redox, rCore, and Android's pKVM reference VMM. The crate
+# requires a `Hal` impl (DMA alloc + virt/phys translation), which
+# we provide via the bootloader's offset-mapped physical memory in
+# `src/virtio.rs`. A PCI transport walker lights up virtio-net at
+# boot once QEMU is launched with `-device virtio-net-pci,...`
+# (tracked under #267).
+virtio-drivers = "0.11"
 
 [profile.dev]
 panic = "abort"
