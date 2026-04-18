@@ -251,6 +251,11 @@ impl fmt::Display for Object {
 // ── State encoding for evaluation ────────────────────────────────────
 // State = Object (sequence of cells). No Population struct.
 
+// `types::Violation` is a serde-derived struct — gated out of no_std
+// along with the `types` module itself. The three helpers below
+// (encode/decode_violation, decode_violations) are only called by
+// check / compile pipelines that are themselves std-only.
+#[cfg(not(feature = "no_std"))]
 use crate::types::Violation;
 
 /// Encode an evaluation context as a single Object.
@@ -324,6 +329,7 @@ pub fn encode_state(state: &Object) -> Object {
 /// Decode a violation Object back to a Violation struct.
 /// Expected: <constraint_id, constraint_text, detail>
 /// Detail can be an atom (string) or a sequence of atoms (joined with spaces).
+#[cfg(not(feature = "no_std"))]
 pub fn decode_violation(obj: &Object) -> Option<Violation> {
     let items = obj.as_seq().filter(|i| i.len() == 3)?;
     let detail: String = match &items[2] {
@@ -343,6 +349,7 @@ pub fn decode_violation(obj: &Object) -> Option<Violation> {
 }
 
 /// Decode a sequence of violation Objects.
+#[cfg(not(feature = "no_std"))]
 pub fn decode_violations(obj: &Object) -> Vec<Violation> {
     match obj.as_seq() {
         Some(items) => items.iter().flat_map(|item|
@@ -353,6 +360,7 @@ pub fn decode_violations(obj: &Object) -> Vec<Violation> {
 }
 
 /// Encode a Violation as an Object.
+#[cfg(not(feature = "no_std"))]
 pub fn encode_violation(v: &Violation) -> Object {
     Object::seq(vec![
         Object::atom(&v.constraint_id),
@@ -581,8 +589,14 @@ fn apply_arithmetic(x: &Object, op: fn(f64, f64) -> Option<f64>) -> Object {
             match (a, b) {
                 (Some(a), Some(b)) => match op(a, b) {
                     Some(r) => {
-                        if r.fract() == 0.0 && r.abs() < i64::MAX as f64 {
-                            Object::Atom((r as i64).to_string())
+                        // "Integer-valued within i64 range" via cast round-
+                        // trip. Avoids `f64::fract` / `f64::abs`, which are
+                        // std-only — this form compiles under no_std too.
+                        // NaN / infinity / oversized values fail the round-
+                        // trip and fall through to the f64 formatting arm.
+                        let int_form = r as i64;
+                        if (int_form as f64) == r {
+                            Object::Atom(int_form.to_string())
                         } else {
                             Object::Atom(r.to_string())
                         }
@@ -1310,6 +1324,7 @@ fn apply_platform(name: &str, x: &Object, d: &Object) -> Object {
 /// Key: "audit_log". Input: ignored. Each entry renders as
 /// `{operation, outcome, sequence, sender, entity}`. Empty cell or
 /// missing cell yields `[]` — never Bottom.
+#[cfg(not(feature = "no_std"))]
 fn platform_audit_log(d: &Object) -> Object {
     let log = fetch_or_phi("audit_log", d);
     let items: Vec<serde_json::Value> = log.as_seq()
@@ -1529,6 +1544,7 @@ fn platform_tc(x: &Object) -> Object {
 /// Output: atom("true"|"false"), or Object::Bottom on malformed input.
 /// Wired through crate::crypto::verify_signature — currently a
 /// DefaultHasher MAC placeholder; swap to HMAC-SHA256 when upgrading.
+#[cfg(not(feature = "no_std"))]
 fn platform_verify_signature(x: &Object) -> Object {
     let parts = match x.as_seq() {
         Some(p) if p.len() == 3 => p,
@@ -1756,6 +1772,7 @@ fn platform_apply_command(x: &Object, d: &Object) -> Object {
 /// Platform primitive: create entity from fact pairs (AREST Eq. 6).
 /// Key: "create:{noun}". Input: <<field, value>, ...> or <<id, val>, <field, val>, ...>.
 /// Returns the result as an Object containing the new state.
+#[cfg(not(feature = "no_std"))]
 fn platform_create(noun: &str, x: &Object, d: &Object) -> Object {
     let (id, fields) = extract_fact_pairs(x);
     let command = crate::command::Command::CreateEntity {
@@ -1772,6 +1789,7 @@ fn platform_create(noun: &str, x: &Object, d: &Object) -> Object {
 
 /// Platform primitive: update entity from fact pairs.
 /// Key: "update:{noun}". Input: <<id, val>, <field, val>, ...>.
+#[cfg(not(feature = "no_std"))]
 fn platform_update(noun: &str, x: &Object, d: &Object) -> Object {
     let (id, fields) = extract_fact_pairs(x);
     let entity_id = id.unwrap_or_default();
@@ -1789,6 +1807,7 @@ fn platform_update(noun: &str, x: &Object, d: &Object) -> Object {
 
 /// Platform primitive: transition entity state machine.
 /// Key: "transition:{noun}". Input: <entity_id, event>.
+#[cfg(not(feature = "no_std"))]
 fn platform_transition(_noun: &str, x: &Object, d: &Object) -> Object {
     let items = match x.as_seq() {
         Some(s) => s,
@@ -1899,6 +1918,7 @@ fn platform_list_noun(noun: &str, d: &Object) -> Object {
 /// emits as an object keyed by role name. Returns an empty array when
 /// the cell is absent or no facts match — never Bottom, since "empty
 /// result" is a valid query outcome distinct from "undefined fact type".
+#[cfg(not(feature = "no_std"))]
 fn platform_query_ft(ft_id: &str, x: &Object, d: &Object) -> Object {
     let facts = fetch_or_phi(ft_id, d);
     let facts_seq = facts.as_seq().map(|s| s.to_vec()).unwrap_or_default();
@@ -1965,6 +1985,7 @@ fn platform_get_noun(noun: &str, x: &Object, d: &Object) -> Object {
 
 /// Walk a Command's string fields and return the name of the first field whose
 /// value exceeds PLATFORM_MAX_FIELD bytes, or None if all values are within bound.
+#[cfg(not(feature = "no_std"))]
 fn command_field_overflow(command: &crate::command::Command) -> Option<&'static str> {
     use crate::command::Command;
     let over = |s: &str| s.len() > PLATFORM_MAX_FIELD;
