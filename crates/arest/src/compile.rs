@@ -576,7 +576,7 @@ pub fn compile_func() -> crate::ast::Func {
             family_leaf(FAMILY_MACHINE),
             family_leaf(FAMILY_TRANSITIONS),
             family_leaf(FAMILY_DERIVATION),
-            family_leaf(FAMILY_SCHEMA),
+            schema_family_func(),
             family_leaf(FAMILY_RESOLVE),
             family_leaf(FAMILY_SHARD),
             family_leaf(FAMILY_LIST),
@@ -584,6 +584,55 @@ pub fn compile_func() -> crate::ast::Func {
             family_leaf(FAMILY_OTHER),
         ]),
     )
+}
+
+/// Schema family as a pure FFP structure (#245 deeper lowering):
+///
+///     schema_family = ApplyToAll(schema_pair_from_ft_native)
+///                   ∘ FetchOrPhi(<"FactType", state>)
+///
+/// The iteration over FactType facts is now explicit at the Func
+/// level (`ApplyToAll`), matching the paper's α-combinator. The
+/// per-fact body (`schema_pair_from_ft_native`) is still a Rust
+/// leaf because building a Map-Object from a named-tuple fact's
+/// `arity` binding + synthesising a Construction of selectors is
+/// terse in Rust and awkward in FFP primitives without a
+/// `binding`/`lookup` form. Further lowering is the natural next
+/// step when such a primitive exists.
+fn schema_family_func() -> crate::ast::Func {
+    use crate::ast::Func;
+    Func::compose(
+        Func::apply_to_all(schema_pair_from_ft_native()),
+        Func::compose(
+            Func::FetchOrPhi,
+            Func::construction(vec![
+                Func::constant(crate::ast::Object::atom("FactType")),
+                Func::Id,
+            ]),
+        ),
+    )
+}
+
+/// Per-FT body for the schema family: named-tuple fact → encoded
+/// <name_atom, Construction-func-object> pair. Native wrapper
+/// because named-tuple binding access and func-object encoding
+/// lean on Rust helpers. The enclosing `ApplyToAll` handles
+/// iteration in FFP.
+fn schema_pair_from_ft_native() -> crate::ast::Func {
+    use alloc::sync::Arc;
+    crate::ast::Func::Native(Arc::new(|ft: &crate::ast::Object| {
+        match schema_pair_from_ft_fact(ft) {
+            Some((name, func)) => crate::ast::Object::seq(vec![
+                crate::ast::Object::atom(&name),
+                crate::ast::func_to_object(&func),
+            ]),
+            // Malformed FT (missing id / arity binding) → empty seq
+            // so the outer ApplyToAll keeps running and the downstream
+            // Concat flattens the nothing contribution to nothing.
+            // Bottom would break Concat's contract.
+            None => crate::ast::Object::phi(),
+        }
+    }))
 }
 
 // Construct-family tags, matched against def names with
@@ -630,7 +679,9 @@ fn family_leaf(family: &'static str) -> crate::ast::Func {
         // call the full compile and filter by prefix as an interim
         // step until they're each extracted.
         let defs = match family {
-            FAMILY_SCHEMA => compile_schemas_family(state),
+            // FAMILY_SCHEMA is now a dedicated Func tree
+            // (`schema_family_func`) inserted directly into
+            // compile_func's Construction, not routed through here.
             FAMILY_RESOLVE => compile_resolve_family(state),
             FAMILY_SHARD => compile_shard_family(state),
             FAMILY_LIST => compile_per_noun_platform_family(state, "list", "list_noun"),
