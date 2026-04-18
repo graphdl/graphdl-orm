@@ -2393,7 +2393,12 @@ fn parse_constraint(line: &str, noun_names: &[String]) -> Option<ConstraintDef> 
 
 /// Find nouns in text -- longest-first matching with word boundaries.
 /// Returns (start, end, name) tuples sorted by position.
-fn find_nouns(text: &str, noun_names: &[String]) -> Vec<(usize, usize, String)> {
+///
+/// Exposed to the crate so post-parse checks (e.g. ring completeness
+/// in `check.rs`) can re-tokenize a FactType reading against the
+/// fully-accumulated Noun set, independent of the parse-time noun
+/// list that was available when the FactType was first parsed.
+pub(crate) fn find_nouns(text: &str, noun_names: &[String]) -> Vec<(usize, usize, String)> {
     let mut sorted: Vec<&String> = noun_names.iter().collect();
     sorted.sort_by(|a, b| b.len().cmp(&a.len()));
 
