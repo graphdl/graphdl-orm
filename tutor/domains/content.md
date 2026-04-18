@@ -93,10 +93,10 @@ It is obligatory that each Article has Content Body before Content Status is 'pu
 
 ## Derivation Rules
 
-### Derivation rule decomposed into elementary premises. Each "and"-joined clause
-### is itself an elementary fact type reading, not prose.
-* Article has Word Count iff Article has Content Body
-  and Word Count is the count of words in that Content Body.
+### Article's Word Count is populated by runtime word-counting over the Content
+### Body. Not expressed as a FORML 2 derivation rule because "count of words
+### in a string value" is a string aggregation, not a count over a fact-type
+### population (which is what FORML 2 "count of X where Y" supports).
 
 ## Instance Facts
 
