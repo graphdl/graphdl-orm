@@ -30,8 +30,6 @@ struct ParseCtx {
     constraints: Vec<ConstraintDef>,
     #[cfg_attr(feature = "std-deps", serde(default))]
     derivation_rules: Vec<DerivationRuleDef>,
-    #[cfg_attr(feature = "std-deps", serde(default))]
-    general_instance_facts: Vec<GeneralInstanceFact>,
     /// Object cells produced by apply_action. This IS the parse output;
     /// the typed fields above are parse-time lookup caches.
     ///
@@ -1036,7 +1034,6 @@ fn parse_markdown_with_context(input: &str, existing_nouns: &HashMap<String, Nou
     let mut standalone = ParseCtx {
         nouns: HashMap::new(), fact_types: HashMap::new(),
         constraints: vec![], derivation_rules: vec![],
-        general_instance_facts: vec![],
         cells: HashMap::new(),
     };
     parse_into(&mut standalone, input)?;
@@ -1054,7 +1051,6 @@ fn parse_markdown_with_context(input: &str, existing_nouns: &HashMap<String, Nou
     let mut ir = ParseCtx {
         nouns: existing_nouns.clone(), fact_types: existing_fact_types.clone(),
         constraints: vec![], derivation_rules: vec![],
-        general_instance_facts: vec![],
         cells: HashMap::new(),
     };
     parse_into(&mut ir, input)?;
@@ -1358,48 +1354,11 @@ fn ctx_to_state(d: &ParseCtx) -> crate::ast::Object {
     // (derive_state_machines_from_facts in compile.rs). The parser does
     // not carry a separate state_machines index.
 
-    // Instance facts: generic cell + fact-type-specific cell (fallback).
-    if !cells.contains_key("InstanceFact") {
-        for f in &d.general_instance_facts {
-            push(&mut cells, "InstanceFact", fact_from_pairs(&[
-                ("subjectNoun", f.subject_noun.as_str()), ("subjectValue", f.subject_value.as_str()),
-                ("fieldName", f.field_name.as_str()), ("objectNoun", f.object_noun.as_str()),
-                ("objectValue", f.object_value.as_str()),
-            ]));
-            let ft_cell = &f.field_name;
-            let subject = &f.subject_noun;
-            let object = if f.object_noun.is_empty() { &f.field_name } else { &f.object_noun };
-            push(&mut cells, ft_cell, fact_from_pairs(&[
-                (subject.as_str(), f.subject_value.as_str()),
-                (object.as_str(), f.object_value.as_str()),
-            ]));
-        }
-    }
-
-    // Compound reference scheme decomposition (fallback — parse_into's
-    // finalize handles this when InstanceFact cell is populated).
-    // For each entity with a compound ref scheme, split instance IDs on '-'
-    // from the right and push component facts to {Noun}_has_{Component} cells.
-    if !cells.contains_key("InstanceFact") {
-      for (noun_name, ref_parts) in all_ref_schemes(&d.cells).into_iter().filter(|(_, p)| p.len() >= 2) {
-        let ids: HashSet<&str> = d.general_instance_facts.iter()
-            .filter(|f| f.subject_noun == noun_name)
-            .map(|f| f.subject_value.as_str())
-            .collect();
-        for id in &ids {
-            let parts: Vec<&str> = id.rsplitn(ref_parts.len(), '-').collect::<Vec<_>>();
-            let parts: Vec<&str> = parts.into_iter().rev().collect();
-            if parts.len() != ref_parts.len() { continue; }
-            for (component, value) in ref_parts.iter().zip(parts.iter()) {
-                let cell_name = format!("{}_has_{}",
-                    noun_name.replace(' ', "_"), component.replace(' ', "_"));
-                push(&mut cells, &cell_name, fact_from_pairs(&[
-                    (noun_name.as_str(), *id), (component.as_str(), *value),
-                ]));
-            }
-        }
-      }
-    }
+    // #283 — Instance facts and per-field cells are written directly
+    // by `emit_instance_fact` during apply_action, and compound
+    // ref-scheme decomposition runs in parse_into's finalize over
+    // the InstanceFact cell. There's nothing left to translate from
+    // typed state here.
 
     // Wrap into Object::Map in one pass: each cell becomes Object::Seq(facts).
     let map: HashMap<String, Object> = cells.into_iter()
@@ -1413,7 +1372,6 @@ fn parse_markdown(input: &str) -> Result<ParseCtx, String> {
     let mut ir = ParseCtx {
         nouns: HashMap::new(), fact_types: HashMap::new(),
         constraints: vec![], derivation_rules: vec![],
-        general_instance_facts: vec![],
         cells: HashMap::new(),
     };
     parse_into(&mut ir, input)?;
@@ -1854,45 +1812,25 @@ fn parse_into(ir: &mut ParseCtx, input: &str) -> Result<(), String> {
         // derive_state_machines_from_facts. The parser never writes
         // ir.state_machines, so there's nothing to emit here.
 
-        // InstanceFact + per-field cells from ir.general_instance_facts.
-        let mut inst_facts: Vec<Object> = Vec::with_capacity(ir.general_instance_facts.len());
-        let mut by_field: hashbrown::HashMap<String, Vec<Object>> = hashbrown::HashMap::new();
-        for f in &ir.general_instance_facts {
-            inst_facts.push(fact_from_pairs(&[
-                ("subjectNoun", f.subject_noun.as_str()),
-                ("subjectValue", f.subject_value.as_str()),
-                ("fieldName", f.field_name.as_str()),
-                ("objectNoun", f.object_noun.as_str()),
-                ("objectValue", f.object_value.as_str()),
-            ]));
-            let object = if f.object_noun.is_empty() { f.field_name.as_str() } else { f.object_noun.as_str() };
-            by_field.entry(f.field_name.clone()).or_default().push(fact_from_pairs(&[
-                (f.subject_noun.as_str(), f.subject_value.as_str()),
-                (object, f.object_value.as_str()),
-            ]));
-        }
-        if !inst_facts.is_empty() {
-            ir.cells.insert("InstanceFact".to_string(), inst_facts);
-        }
-        for (name, facts) in by_field {
-            ir.cells.insert(name, facts);
-        }
+        // #283 — InstanceFact + per-field cells are written directly
+        // by `emit_instance_fact` at the writer sites (AddFactType
+        // derivation-mode expansion and parse_instance_fact). No
+        // typed→cell translation pass is needed.
 
         // Compound reference-scheme decomposition: for each entity with
         // ≥2 ref parts, split instance IDs on '-' from the right and
         // push component facts to {Noun}_has_{Component} cells.
-        use hashbrown::HashSet as HBSet;
         // #283 — snapshot all_ref_schemes before the cell-mutation loop
         // to avoid borrowing `ir.cells` immutably and mutably in
         // overlapping scopes.
+        use hashbrown::HashSet as HBSet;
         let compound_schemes: Vec<(String, Vec<String>)> = all_ref_schemes(&ir.cells)
             .into_iter()
             .filter(|(_, p)| p.len() >= 2)
             .collect();
         for (noun_name, ref_parts) in compound_schemes {
-            let ids: HBSet<String> = ir.general_instance_facts.iter()
-                .filter(|f| f.subject_noun == noun_name)
-                .map(|f| f.subject_value.clone())
+            let ids: HBSet<String> = instance_fact_subject_values_for_noun(&ir.cells, &noun_name)
+                .into_iter()
                 .collect();
             for id in &ids {
                 let parts: Vec<&str> = id.rsplitn(ref_parts.len(), '-').collect::<Vec<_>>();
@@ -2559,6 +2497,52 @@ fn ref_scheme_for_noun(
         })
 }
 
+/// #283 — Write an instance fact directly to the `InstanceFact` cell
+/// and the per-field cell. Replaces pushing into a typed
+/// `general_instance_facts: Vec<GeneralInstanceFact>` plus a later
+/// translation pass; writers emit cells once, no second pass.
+fn emit_instance_fact(
+    ir: &mut ParseCtx,
+    subject_noun: &str,
+    subject_value: &str,
+    field_name: &str,
+    object_noun: &str,
+    object_value: &str,
+) {
+    push_cell(ir, "InstanceFact", crate::ast::fact_from_pairs(&[
+        ("subjectNoun", subject_noun),
+        ("subjectValue", subject_value),
+        ("fieldName", field_name),
+        ("objectNoun", object_noun),
+        ("objectValue", object_value),
+    ]));
+    // Per-field cell: `{fieldName}` cell with (subject, object) pair.
+    // The object key is the object noun if present, otherwise the
+    // field name itself (for attribute-style instance facts).
+    let object_key = if object_noun.is_empty() { field_name } else { object_noun };
+    push_cell(ir, field_name, crate::ast::fact_from_pairs(&[
+        (subject_noun, subject_value),
+        (object_key, object_value),
+    ]));
+}
+
+/// #283 — Collect every instance fact's subject_value for a given
+/// subject noun from the `InstanceFact` cell. Replaces the typed
+/// `.general_instance_facts.iter().filter(|f| f.subject_noun == n)
+/// .map(|f| f.subject_value)` pattern used by compound ref-scheme
+/// decomposition.
+fn instance_fact_subject_values_for_noun(
+    cells: &HashMap<String, Vec<crate::ast::Object>>,
+    subject_noun: &str,
+) -> Vec<String> {
+    cells.get("InstanceFact")
+        .map(|facts| facts.iter()
+            .filter(|f| crate::ast::binding(f, "subjectNoun") == Some(subject_noun))
+            .filter_map(|f| crate::ast::binding(f, "subjectValue").map(String::from))
+            .collect())
+        .unwrap_or_default()
+}
+
 /// #283 — Enum values for a value type, decoded from the `EnumValues`
 /// cell's `value0`, `value1`, ... indexed fields. Replaces
 /// `ir.enum_values.get(name)`.
@@ -2780,14 +2764,11 @@ fn apply_action(ir: &mut ParseCtx, action: Option<ParseAction>, lines: &[String]
             // down, no separate ParseCtx field for what is already expressible
             // as an instance fact.
             let reading_for_mode = def.reading.clone();
+            // #283 — emit InstanceFact cell directly; no typed Vec.
             mode.into_iter().for_each(|m| {
-                ir.general_instance_facts.push(crate::types::GeneralInstanceFact {
-                    subject_noun: "Fact Type".to_string(),
-                    subject_value: reading_for_mode.clone(),
-                    field_name: "Derivation Mode".to_string(),
-                    object_noun: "Derivation Mode".to_string(),
-                    object_value: m,
-                });
+                emit_instance_fact(ir,
+                    "Fact Type", &reading_for_mode,
+                    "Derivation Mode", "Derivation Mode", &m);
             });
             ir.fact_types.entry(id).or_insert(def);
         }
@@ -3372,7 +3353,14 @@ fn parse_general_instance_fact(ir: &mut ParseCtx, line: &str) {
         }),
     };
 
-    fact.into_iter().for_each(|f| ir.general_instance_facts.push(f));
+    // #283 — emit cells directly instead of pushing a typed
+    // GeneralInstanceFact. `emit_instance_fact` writes both
+    // `InstanceFact` and the per-field cell.
+    fact.into_iter().for_each(|f| {
+        emit_instance_fact(ir,
+            &f.subject_noun, &f.subject_value,
+            &f.field_name, &f.object_noun, &f.object_value);
+    });
 }
 
 /// Resolve the field name for an instance fact by looking up the declared fact type.
@@ -3548,41 +3536,44 @@ mod tests {
     fn instance_facts_value() {
         let input = "Domain(.Slug) is an entity type.\nAccess is a value type.\n  The possible values of Access are 'public', 'private'.\n## Fact Types\nDomain has Access.\n## Instance Facts\nDomain 'support' has Access 'public'.";
         let ir = parse_markdown(input).unwrap();
-        assert_eq!(ir.general_instance_facts.len(), 1);
-        assert_eq!(ir.general_instance_facts[0].subject_noun, "Domain");
-        assert_eq!(ir.general_instance_facts[0].subject_value, "support");
-        assert_eq!(ir.general_instance_facts[0].object_value, "public");
+        // #283 — instance facts live in the InstanceFact cell.
+        let facts = ir.cells.get("InstanceFact").expect("InstanceFact cell");
+        assert_eq!(facts.len(), 1);
+        assert_eq!(crate::ast::binding(&facts[0], "subjectNoun"), Some("Domain"));
+        assert_eq!(crate::ast::binding(&facts[0], "subjectValue"), Some("support"));
+        assert_eq!(crate::ast::binding(&facts[0], "objectValue"), Some("public"));
     }
 
     #[test]
     fn instance_facts_noun_to_noun() {
         let input = "API Endpoint(.Path) is an entity type.\nClickHouse Table(.Name) is an entity type.\n## Fact Types\nAPI Endpoint reads from ClickHouse Table.\n## Instance Facts\nAPI Endpoint '/data/:vin' reads from ClickHouse Table 'sources.currentResources'.";
         let ir = parse_markdown(input).unwrap();
-        assert_eq!(ir.general_instance_facts.len(), 1);
-        assert_eq!(ir.general_instance_facts[0].subject_noun, "API Endpoint");
-        assert_eq!(ir.general_instance_facts[0].subject_value, "/data/:vin");
-        assert_eq!(ir.general_instance_facts[0].object_noun, "ClickHouse Table");
-        assert_eq!(ir.general_instance_facts[0].object_value, "sources.currentResources");
+        let facts = ir.cells.get("InstanceFact").expect("InstanceFact cell");
+        assert_eq!(facts.len(), 1);
+        assert_eq!(crate::ast::binding(&facts[0], "subjectNoun"), Some("API Endpoint"));
+        assert_eq!(crate::ast::binding(&facts[0], "subjectValue"), Some("/data/:vin"));
+        assert_eq!(crate::ast::binding(&facts[0], "objectNoun"), Some("ClickHouse Table"));
+        assert_eq!(crate::ast::binding(&facts[0], "objectValue"), Some("sources.currentResources"));
     }
 
     #[test]
     fn instance_facts_multiple() {
         let input = "Domain(.Slug) is an entity type.\nAccess is a value type.\nDomain has Access.\nDomain 'support' has Access 'public'.\nDomain 'core' has Access 'private'.";
         let ir = parse_markdown(input).unwrap();
-        assert_eq!(ir.general_instance_facts.len(), 2);
+        let facts = ir.cells.get("InstanceFact").expect("InstanceFact cell");
+        assert_eq!(facts.len(), 2);
     }
 
     #[test]
     fn instance_fact_noun_uri() {
         let input = "Noun is an entity type.\nURI is a value type.\n## Fact Types\nNoun has URI.\n## Instance Facts\nNoun 'API Product' has URI '/api'.";
         let ir = parse_markdown(input).unwrap();
-        assert_eq!(ir.general_instance_facts.len(), 1);
-        let f = &ir.general_instance_facts[0];
-        diag!("subject_noun={} subject_value={} field_name={} object_noun={} object_value={}",
-            f.subject_noun, f.subject_value, f.field_name, f.object_noun, f.object_value);
-        assert_eq!(f.subject_noun, "Noun");
-        assert_eq!(f.subject_value, "API Product");
-        assert_eq!(f.object_value, "/api");
+        let facts = ir.cells.get("InstanceFact").expect("InstanceFact cell");
+        assert_eq!(facts.len(), 1);
+        let f = &facts[0];
+        assert_eq!(crate::ast::binding(f, "subjectNoun"), Some("Noun"));
+        assert_eq!(crate::ast::binding(f, "subjectValue"), Some("API Product"));
+        assert_eq!(crate::ast::binding(f, "objectValue"), Some("/api"));
     }
 
     #[test]
@@ -4803,11 +4794,13 @@ fn forbidden_ipv6_ula_fd() {
     // the FactTypeDef.
 
     fn mode_for(domain: &ParseCtx, reading: &str) -> Option<String> {
-        domain.general_instance_facts.iter()
-            .find(|f| f.subject_noun == "Fact Type"
-                   && f.subject_value == reading
-                   && f.field_name == "Derivation Mode")
-            .map(|f| f.object_value.clone())
+        // #283 — InstanceFact cell read.
+        domain.cells.get("InstanceFact")?
+            .iter()
+            .find(|f| crate::ast::binding(f, "subjectNoun") == Some("Fact Type")
+                   && crate::ast::binding(f, "subjectValue") == Some(reading)
+                   && crate::ast::binding(f, "fieldName") == Some("Derivation Mode"))
+            .and_then(|f| crate::ast::binding(f, "objectValue").map(String::from))
     }
 
     #[test]
@@ -4907,7 +4900,7 @@ Customer has Email.
         let domain = parse_markdown(input).expect("parse");
         assert!(mode_for(&domain, "Customer has Email").is_none(),
             "a reading without a marker must not emit a Derivation Mode fact; \
-             instance_facts = {:?}", domain.general_instance_facts);
+             instance_facts = {:?}", domain.cells.get("InstanceFact"));
     }
 
     #[test]
@@ -4929,14 +4922,16 @@ Customer has Full Name *.
             "'Customer has Full Name' fact type must be present"
         );
 
-        let mode_fact = domain.general_instance_facts.iter()
-            .find(|f| f.subject_noun == "Fact Type"
-                   && f.subject_value == "Customer has Full Name"
-                   && f.field_name == "Derivation Mode");
+        // #283 — InstanceFact cell read.
+        let instance_cell = domain.cells.get("InstanceFact");
+        let mode_fact = instance_cell.and_then(|facts| facts.iter()
+            .find(|f| crate::ast::binding(f, "subjectNoun") == Some("Fact Type")
+                   && crate::ast::binding(f, "subjectValue") == Some("Customer has Full Name")
+                   && crate::ast::binding(f, "fieldName") == Some("Derivation Mode")));
         assert!(mode_fact.is_some(),
             "`*` marker must emit a 'Fact Type has Derivation Mode' instance fact; \
-             general_instance_facts = {:?}", domain.general_instance_facts);
-        assert_eq!(mode_fact.unwrap().object_value, "fully-derived");
+             instance_facts = {:?}", instance_cell);
+        assert_eq!(crate::ast::binding(mode_fact.unwrap(), "objectValue"), Some("fully-derived"));
     }
 
     #[test]
@@ -5245,13 +5240,15 @@ App uses Generator.
 App 'sherlock' uses Generator 'sqlite'.
 "#;
         let ir = parse_markdown(input).unwrap();
-        assert_eq!(ir.general_instance_facts.len(), 1,
-            "Should parse dual-quoted binary instance fact, got: {:?}", ir.general_instance_facts);
-        let f = &ir.general_instance_facts[0];
-        assert_eq!(f.subject_noun, "App");
-        assert_eq!(f.subject_value, "sherlock");
-        assert_eq!(f.object_noun, "Generator");
-        assert_eq!(f.object_value, "sqlite");
+        // #283 — InstanceFact cell read.
+        let facts = ir.cells.get("InstanceFact").expect("InstanceFact cell");
+        assert_eq!(facts.len(), 1,
+            "Should parse dual-quoted binary instance fact, got: {:?}", facts);
+        let f = &facts[0];
+        assert_eq!(crate::ast::binding(f, "subjectNoun"), Some("App"));
+        assert_eq!(crate::ast::binding(f, "subjectValue"), Some("sherlock"));
+        assert_eq!(crate::ast::binding(f, "objectNoun"), Some("Generator"));
+        assert_eq!(crate::ast::binding(f, "objectValue"), Some("sqlite"));
     }
 
     // â”€â”€ Task #198: Possessive join syntax in derivation bodies â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
