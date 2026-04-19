@@ -38,12 +38,13 @@ struct ParseCtx {
     enum_values: HashMap<String, Vec<String>>,
     #[cfg_attr(feature = "std-deps", serde(default))]
     ref_schemes: HashMap<String, Vec<String>>,
-    #[cfg_attr(feature = "std-deps", serde(default))]
-    named_spans: HashMap<String, Vec<String>>,
-    #[cfg_attr(feature = "std-deps", serde(default))]
-    autofill_spans: Vec<String>,
     /// Object cells produced by apply_action. This IS the parse output;
     /// the typed fields above are parse-time lookup caches.
+    ///
+    /// #283 target: delete the typed caches above and make this the
+    /// sole parser state, with cell-query helpers in place of field
+    /// access. Migration in progress — named_spans + autofill_spans
+    /// already migrated to the NamedSpan / AutofillSpan cells.
     #[cfg_attr(feature = "std-deps", serde(skip))]
     cells: HashMap<String, Vec<crate::ast::Object>>,
 }
@@ -1044,7 +1045,6 @@ fn parse_markdown_with_context(input: &str, existing_nouns: &HashMap<String, Nou
         general_instance_facts: vec![],
         subtypes: HashMap::new(), enum_values: HashMap::new(),
         ref_schemes: HashMap::new(),
-        named_spans: HashMap::new(), autofill_spans: vec![],
         cells: HashMap::new(),
     };
     parse_into(&mut standalone, input)?;
@@ -1065,7 +1065,6 @@ fn parse_markdown_with_context(input: &str, existing_nouns: &HashMap<String, Nou
         general_instance_facts: vec![],
         subtypes: HashMap::new(), enum_values: HashMap::new(),
         ref_schemes: HashMap::new(),
-        named_spans: HashMap::new(), autofill_spans: vec![],
         cells: HashMap::new(),
     };
     parse_into(&mut ir, input)?;
@@ -1424,7 +1423,6 @@ fn parse_markdown(input: &str) -> Result<ParseCtx, String> {
         general_instance_facts: vec![],
         subtypes: HashMap::new(), enum_values: HashMap::new(),
         ref_schemes: HashMap::new(),
-        named_spans: HashMap::new(), autofill_spans: vec![],
         cells: HashMap::new(),
     };
     parse_into(&mut ir, input)?;
@@ -1743,9 +1741,32 @@ fn parse_into(ir: &mut ParseCtx, input: &str) -> Result<(), String> {
     // Post-processing: resolve autofill spans.
     // For each autofill span name, find SS constraints whose role nouns
     // match the named span's role nouns, and set subset_autofill = Some(true).
-    let autofill_role_sets: Vec<hashbrown::HashSet<String>> = ir.autofill_spans.clone()
-        .iter()
-        .filter_map(|span_name| ir.named_spans.get(span_name))
+    //
+    // #283 — both sides query cells (NamedSpan, AutofillSpan) rather than
+    // a parallel typed map. The cells are the parser's only state for
+    // span metadata.
+    let named_spans_by_name: HashMap<String, Vec<String>> = ir.cells.get("NamedSpan")
+        .into_iter()
+        .flat_map(|facts| facts.iter())
+        .filter_map(|fact| {
+            let name = crate::ast::binding(fact, "name")?.to_string();
+            let mut roles: Vec<String> = Vec::new();
+            let mut i: usize = 0;
+            loop {
+                let key = alloc::format!("role{i}");
+                match crate::ast::binding(fact, &key) {
+                    Some(v) => { roles.push(v.to_string()); i += 1; }
+                    None => break,
+                }
+            }
+            Some((name, roles))
+        })
+        .collect();
+    let autofill_role_sets: Vec<hashbrown::HashSet<String>> = ir.cells.get("AutofillSpan")
+        .into_iter()
+        .flat_map(|facts| facts.iter())
+        .filter_map(|fact| crate::ast::binding(fact, "name").map(String::from))
+        .filter_map(|span_name| named_spans_by_name.get(&span_name))
         .map(|nouns| nouns.iter().cloned().collect())
         .collect();
     ir.constraints.iter_mut()
@@ -2623,10 +2644,23 @@ fn apply_action(ir: &mut ParseCtx, action: Option<ParseAction>, lines: &[String]
             parse_instance_fact(ir, &raw, &line_refs, idx);
         }
         ParseAction::AddNamedSpan(name, nouns) => {
-            ir.named_spans.insert(name, nouns);
+            // #283 — NamedSpan cell. `role0`, `role1`, ... carry the
+            // ordered noun list. Cells are the only store: no typed
+            // `ir.named_spans` parallel state.
+            let mut pairs: Vec<(String, String)> = alloc::vec![("name".to_string(), name)];
+            for (i, n) in nouns.into_iter().enumerate() {
+                pairs.push((alloc::format!("role{i}"), n));
+            }
+            let refs: Vec<(&str, &str)> = pairs.iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
+            push_cell(ir, "NamedSpan", crate::ast::fact_from_pairs(&refs));
         }
         ParseAction::AddAutofillSpan(name) => {
-            ir.autofill_spans.push(name);
+            // #283 — AutofillSpan cell.
+            push_cell(ir, "AutofillSpan", crate::ast::fact_from_pairs(&[
+                ("name", name.as_str()),
+            ]));
         }
         ParseAction::Skip => {}
     }
@@ -4061,16 +4095,26 @@ Auth Session uses Session Strategy.
     fn span_naming() {
         let input = "Customer(.Email) is an entity type.\nSupport Request(.Id) is an entity type.\nCustomer submits Support Request.\nIf some Support Request has some Email Address and some Customer is identified by that Email Address then that Customer submits that Support Request.\nThis span with Customer, Support Request provides the preferred identification scheme for Customer Submission Match.";
         let ir = parse_markdown(input).unwrap();
-        assert!(ir.named_spans.contains_key("Customer Submission Match"));
-        assert_eq!(ir.named_spans["Customer Submission Match"], vec!["Customer".to_string(), "Support Request".to_string()]);
+        // #283 — span metadata lives in the NamedSpan cell, not a typed map.
+        let named_spans = ir.cells.get("NamedSpan")
+            .expect("NamedSpan cell must exist");
+        let fact = named_spans.iter()
+            .find(|f| crate::ast::binding(f, "name") == Some("Customer Submission Match"))
+            .expect("NamedSpan fact for 'Customer Submission Match' must exist");
+        assert_eq!(crate::ast::binding(fact, "role0"), Some("Customer"));
+        assert_eq!(crate::ast::binding(fact, "role1"), Some("Support Request"));
     }
 
     #[test]
     fn autofill_declaration() {
         let input = "Customer(.Email) is an entity type.\nSupport Request(.Id) is an entity type.\nEmail Address is a value type.\nCustomer submits Support Request.\nCustomer is identified by Email Address.\nSupport Request has Email Address.\nIf some Support Request has some Email Address and some Customer is identified by that Email Address then that Customer submits that Support Request.\nThis span with Customer, Support Request provides the preferred identification scheme for Customer Submission Match.\nConstraint Span 'Customer Submission Match' autofills from superset.";
         let ir = parse_markdown(input).unwrap();
-        // The autofill span should be recorded
-        assert!(ir.autofill_spans.contains(&"Customer Submission Match".to_string()));
+        // #283 — autofill spans live in the AutofillSpan cell.
+        let autofill = ir.cells.get("AutofillSpan")
+            .expect("AutofillSpan cell must exist");
+        assert!(autofill.iter()
+            .any(|f| crate::ast::binding(f, "name") == Some("Customer Submission Match")),
+            "AutofillSpan cell must carry 'Customer Submission Match'");
         // The SS constraint targeting Customer, Support Request should have autofill enabled
         let ss = ir.constraints.iter().find(|c| c.kind == "SS").expect("Should have SS constraint");
         assert_eq!(ss.spans.iter().any(|s| s.subset_autofill == Some(true)), true, "SS constraint should have autofill enabled");
