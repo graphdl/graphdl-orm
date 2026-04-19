@@ -26,13 +26,14 @@
 
 use alloc::vec::Vec;
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
-use smoltcp::phy::{Loopback, Medium};
+use smoltcp::phy::{self, Device, DeviceCapabilities, Loopback, Medium};
 use smoltcp::socket::{dhcpv4, tcp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Cidr};
 use spin::Mutex;
 
 use crate::http;
+use crate::virtio::VirtioPhy;
 
 /// Monotonically-increasing timestamp for smoltcp's scheduler. Once
 /// the TSC / HPET timer IRQ is wired we hand this a proper tick
@@ -51,12 +52,92 @@ fn now() -> Instant {
 /// serialises on the same smoltcp instance.
 static NET: Mutex<Option<NetState>> = Mutex::new(None);
 
+/// smoltcp `phy::Device` backing the interface. Enum-dispatched so
+/// the same NetState works regardless of whether the boot-time PCI
+/// scan (#262) found a virtio-net NIC or not. Both variants
+/// implement `phy::Device` by delegating through `KernelRxToken` /
+/// `KernelTxToken`.
+pub enum KernelDevice {
+    /// Fallback path when the PCI scan finds no virtio-net. The
+    /// interface still binds `127.0.0.1/8` so in-guest smoke tests
+    /// (e.g. the http self_test) work without external packets.
+    Loopback(Loopback),
+    /// Real NIC — packets cross PCI into QEMU's user-mode NAT and
+    /// on to the host via `-hostfwd=tcp::8080-:80` (#267).
+    Virtio(VirtioPhy),
+}
+
+/// Token variants. One pair for each KernelDevice variant; the
+/// phy::{RxToken,TxToken} impls below forward `consume` into the
+/// inner smoltcp-native token.
+pub enum KernelRxToken<'a> {
+    Loopback(<Loopback as Device>::RxToken<'a>),
+    Virtio(crate::virtio::VirtioRxToken<'a>),
+}
+
+pub enum KernelTxToken<'a> {
+    Loopback(<Loopback as Device>::TxToken<'a>),
+    Virtio(crate::virtio::VirtioTxToken<'a>),
+}
+
+impl<'a> phy::RxToken for KernelRxToken<'a> {
+    fn consume<R, F>(self, f: F) -> R
+    where
+        F: FnOnce(&[u8]) -> R,
+    {
+        match self {
+            KernelRxToken::Loopback(t) => t.consume(f),
+            KernelRxToken::Virtio(t) => t.consume(f),
+        }
+    }
+}
+
+impl<'a> phy::TxToken for KernelTxToken<'a> {
+    fn consume<R, F>(self, len: usize, f: F) -> R
+    where
+        F: FnOnce(&mut [u8]) -> R,
+    {
+        match self {
+            KernelTxToken::Loopback(t) => t.consume(len, f),
+            KernelTxToken::Virtio(t) => t.consume(len, f),
+        }
+    }
+}
+
+impl Device for KernelDevice {
+    type RxToken<'a> = KernelRxToken<'a>;
+    type TxToken<'a> = KernelTxToken<'a>;
+
+    fn receive(&mut self, ts: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        match self {
+            KernelDevice::Loopback(d) => d
+                .receive(ts)
+                .map(|(r, t)| (KernelRxToken::Loopback(r), KernelTxToken::Loopback(t))),
+            KernelDevice::Virtio(d) => d
+                .receive(ts)
+                .map(|(r, t)| (KernelRxToken::Virtio(r), KernelTxToken::Virtio(t))),
+        }
+    }
+
+    fn transmit(&mut self, ts: Instant) -> Option<Self::TxToken<'_>> {
+        match self {
+            KernelDevice::Loopback(d) => d.transmit(ts).map(KernelTxToken::Loopback),
+            KernelDevice::Virtio(d) => d.transmit(ts).map(KernelTxToken::Virtio),
+        }
+    }
+
+    fn capabilities(&self) -> DeviceCapabilities {
+        match self {
+            KernelDevice::Loopback(d) => d.capabilities(),
+            KernelDevice::Virtio(d) => d.capabilities(),
+        }
+    }
+}
+
 struct NetState {
-    /// Loopback device until #262 swaps in virtio-net. smoltcp
-    /// drives its tx/rx over a `VecDeque<Vec<u8>>` inside Loopback,
-    /// so packets originated by the kernel's HTTP server bounce
-    /// right back through the interface's ingress path.
-    device: Loopback,
+    /// The physical-layer device behind the interface — loopback by
+    /// default, virtio-net when #262 discovered a real NIC.
+    device: KernelDevice,
     iface: Interface,
     sockets: SocketSet<'static>,
     /// DHCPv4 client socket (#263). Registered at boot; `poll` picks
@@ -107,31 +188,47 @@ pub struct DhcpLease {
     pub dns_servers: Vec<smoltcp::wire::Ipv4Address>,
 }
 
-/// Initialise the network stack with a loopback interface at
-/// `127.0.0.1/8`. Replaced by a virtio-net-backed interface in
-/// the NIC driver task (#262).
-pub fn init() {
-    let mut device = Loopback::new(Medium::Ethernet);
+/// Initialise the network stack. When `virtio` is Some the
+/// interface binds the real NIC's MAC and talks over virtio-net;
+/// otherwise it falls back to a loopback device at `127.0.0.1/8`
+/// so in-guest smoke tests still run without packet flow.
+///
+/// Called once from `kernel_main` after `virtio::try_init_virtio_net`
+/// has probed PCI.
+pub fn init(virtio: Option<VirtioPhy>) {
+    let (mut device, mac) = match virtio {
+        Some(phy) => {
+            let mac = phy.mac_address();
+            (KernelDevice::Virtio(phy), mac)
+        }
+        None => {
+            // Loopback needs a fake MAC — smoltcp only uses it to frame
+            // Ethernet headers internally, and nothing on the wire cares.
+            let mac = EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+            (KernelDevice::Loopback(Loopback::new(Medium::Ethernet)), mac)
+        }
+    };
 
-    // Loopback needs a fake MAC — smoltcp only uses it to frame
-    // Ethernet headers internally, and nothing on the wire cares.
-    let mac = EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
     let config = Config::new(HardwareAddress::Ethernet(mac));
-
     let mut iface = Interface::new(config, &mut device, now());
-    iface.update_ip_addrs(|addrs| {
-        addrs
-            .push(IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8))
-            .expect("loopback address push");
-    });
+
+    // On loopback we can statically assign 127.0.0.1/8 right away.
+    // On virtio-net we leave the address empty — DHCP fills it in
+    // on the first successful lease (Configured event in `poll`).
+    if matches!(device, KernelDevice::Loopback(_)) {
+        iface.update_ip_addrs(|addrs| {
+            addrs
+                .push(IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8))
+                .expect("loopback address push");
+        });
+    }
 
     let mut sockets = SocketSet::new(Vec::new());
 
-    // DHCPv4 client socket (#263). Registered here so that the
-    // moment a real Ethernet NIC (#262) drops in, `poll` will
-    // DISCOVER/REQUEST a lease automatically — no extra wiring
-    // needed at the call site. Over Loopback the socket simply
-    // times out and retries; harmless.
+    // DHCPv4 client socket (#263). Registered here so that on the
+    // virtio-net path, `poll` DISCOVER / REQUESTs a lease automatically
+    // — no extra wiring at the call site. Over Loopback the socket
+    // simply times out and retries; harmless.
     let dhcp_socket = dhcpv4::Socket::new();
     let dhcp_handle = sockets.add(dhcp_socket);
 

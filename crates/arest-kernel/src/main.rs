@@ -57,19 +57,18 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         boot_info.physical_memory_offset.into_option()
             .expect("bootloader did not supply physical_memory_offset"),
     );
-    net::init();
+    // virtio-net bring-up (#262). PCI scan first (banner-visible),
+    // then construct the full VirtIONet driver, then wrap it in the
+    // `smoltcp::phy::Device` adapter `VirtioPhy` so the interface
+    // talks to the real NIC. If any step fails we fall back to the
+    // loopback device so in-guest smoke tests still run.
+    let virtio_net = pci::find_virtio_net();
+    let virtio_phy = virtio::try_init_virtio_net().map(virtio::VirtioPhy::new);
+    let virtio_mac = virtio_phy.as_ref().map(|p| p.mac_address());
+
+    net::init(virtio_phy);
     system::init();
     net::register_http(80, arest_http_handler);
-
-    // virtio-net bring-up (#262). Two steps: first scan PCI for the
-    // device, then try to construct the full VirtIONet driver on
-    // top of the discovered (bus, device, function). Both results
-    // are banner-visible so the QEMU run shows exactly how far the
-    // stack got. The last-mile smoltcp::phy::Device adapter (which
-    // replaces the loopback device) is still a follow-up — the
-    // driver handle drops at the end of this scope for now.
-    let virtio_net = pci::find_virtio_net();
-    let virtio_net_handle = virtio::try_init_virtio_net();
 
     // Collect memory stats for the banner.
     let frame_count = memory::usable_frame_count();
@@ -90,14 +89,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         ),
         None => println!("  pci:    no virtio-net device found on legacy PCI bus (loopback only)"),
     }
-    match &virtio_net_handle {
-        Some(net) => println!("  virtio: driver constructed, MAC {:02x?}", net.mac_address()),
-        None => println!("  virtio: driver not constructed (no device, or negotiation failed)"),
+    match &virtio_mac {
+        Some(mac) => println!("  virtio: driver online, smoltcp phy bound, MAC {}", mac),
+        None => println!("  virtio: driver not constructed — falling back to loopback"),
     }
-    // TODO(#262 smoltcp adapter): wrap this handle in a
-    // `smoltcp::phy::Device` and swap it in for `Loopback` inside
-    // `net::init`. Until then the handle drops here.
-    drop(virtio_net_handle);
     println!("  http:   listening on :80 (#264)");
 
     // Prove the allocator works — allocate a String and echo it.
