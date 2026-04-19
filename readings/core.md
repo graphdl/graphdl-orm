@@ -282,6 +282,8 @@ External System has Header.
   Each External System has at most one Header.
 External System has Prefix.
   Each External System has at most one Prefix.
+External System has Kind.
+  Each External System has at most one Kind.
 Noun is backed by External System.
   Each Noun is backed by at most one External System.
 Function is backed by External System.
