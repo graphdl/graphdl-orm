@@ -574,6 +574,48 @@ mod tests {
             "`Source Request is for Resource Declaration that has Base Path` must expand + resolve. Full diags: {:#?}", diags);
     }
 
+    /// #277 Category F — `<Noun> has <Noun> within <anaphora>` is
+    /// a binary FT reference with an implicit range filter on the
+    /// trailing role. Must not fire unresolved. Pattern appears
+    /// 3 times in service-health.md.
+    #[test]
+    fn category_f_range_within_filter() {
+        let input = "Log Entry(.Id) is an entity type.\n\
+                     Interval(.Id) is an entity type.\n\
+                     Timestamp is a value type.\n\
+                     ## Fact Types\n\
+                     Log Entry has Timestamp.\n\
+                     ## Derivation Rules\n\
+                     Log Entry has Timestamp if Log Entry has Timestamp within that Interval.";
+        let diags = check_readings(input);
+        let unresolved: Vec<_> = diags.iter()
+            .filter(|d| d.source == Source::Resolve && d.level == Level::Warning)
+            .filter(|d| d.message.contains("within that Interval"))
+            .collect();
+        assert!(unresolved.is_empty(),
+            "`Log Entry has Timestamp within that Interval` must resolve (binary FT + range filter). Full diags: {:#?}", diags);
+    }
+
+    /// #277 Category F — bare `<Noun> of N or more` / `N or less`
+    /// value comparison form. Mirrors the `HTTP Status of 500 or
+    /// more` pattern from service-health.md.
+    #[test]
+    fn category_f_bare_or_more_or_less() {
+        let input = "Request(.Id) is an entity type.\n\
+                     HTTP Status is a value type.\n\
+                     ## Fact Types\n\
+                     Request has HTTP Status.\n\
+                     ## Derivation Rules\n\
+                     Request has HTTP Status if HTTP Status of 500 or more.";
+        let diags = check_readings(input);
+        let unresolved: Vec<_> = diags.iter()
+            .filter(|d| d.source == Source::Resolve && d.level == Level::Warning)
+            .filter(|d| d.message.contains("HTTP Status of 500 or more"))
+            .collect();
+        assert!(unresolved.is_empty(),
+            "`HTTP Status of 500 or more` must resolve as a bare-value filter. Full diags: {:#?}", diags);
+    }
+
     /// #275 Category C — `<Noun> is '<literal>'` on a named entity with
     /// a ref scheme. Mirrors `Email Template is 'limit-50'` from
     /// website.md.
