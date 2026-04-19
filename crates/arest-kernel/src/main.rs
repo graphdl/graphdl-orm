@@ -61,12 +61,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     system::init();
     net::register_http(80, arest_http_handler);
 
-    // PCI scan for virtio-net (#262). First half: discover the
-    // device. Driver instantiation (PciTransport → VirtIONet →
-    // smoltcp::phy::Device) lands in a follow-up; for now the scan
-    // result is banner-visible so the QEMU bring-up confirms the
-    // device the virtio-drivers crate will pick up.
+    // virtio-net bring-up (#262). Two steps: first scan PCI for the
+    // device, then try to construct the full VirtIONet driver on
+    // top of the discovered (bus, device, function). Both results
+    // are banner-visible so the QEMU run shows exactly how far the
+    // stack got. The last-mile smoltcp::phy::Device adapter (which
+    // replaces the loopback device) is still a follow-up — the
+    // driver handle drops at the end of this scope for now.
     let virtio_net = pci::find_virtio_net();
+    let virtio_net_handle = virtio::try_init_virtio_net();
 
     // Collect memory stats for the banner.
     let frame_count = memory::usable_frame_count();
@@ -87,6 +90,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         ),
         None => println!("  pci:    no virtio-net device found on legacy PCI bus (loopback only)"),
     }
+    match &virtio_net_handle {
+        Some(net) => println!("  virtio: driver constructed, MAC {:02x?}", net.mac_address()),
+        None => println!("  virtio: driver not constructed (no device, or negotiation failed)"),
+    }
+    // TODO(#262 smoltcp adapter): wrap this handle in a
+    // `smoltcp::phy::Device` and swap it in for `Loopback` inside
+    // `net::init`. Until then the handle drops here.
+    drop(virtio_net_handle);
     println!("  http:   listening on :80 (#264)");
 
     // Prove the allocator works — allocate a String and echo it.
