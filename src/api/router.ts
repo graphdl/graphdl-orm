@@ -17,9 +17,23 @@ import { dispatchVerb, UNIFIED_VERBS } from './verb-dispatcher'
 
 // ── DO helpers ───────────────────────────────────────────────────────
 
+import { cellKey } from './cell-key'
+
 /** Get an EntityDB DO stub for the given entity ID. */
 function getEntityDO(env: Env, entityId: string): DurableObjectStub {
   const id = env.ENTITY_DB.idFromName(entityId)
+  return env.ENTITY_DB.get(id)
+}
+
+/**
+ * Get the Durable Object stub for a cell identified by (nounType, entityId).
+ * This is the #217 RMAP-derived routing form — it makes the cell naming
+ * that's implicit in `getEntityDO` explicit by computing the canonical
+ * DO name through `cellKey`. Use it at new call sites so the paper's
+ * Definition 2 cell boundary is legible at the worker-routing layer.
+ */
+function getCellDO(env: Env, nounType: string, entityId: string): DurableObjectStub {
+  const id = env.ENTITY_DB.idFromName(cellKey(nounType, entityId))
   return env.ENTITY_DB.get(id)
 }
 
@@ -67,14 +81,18 @@ router.post('/api/connect/:domain/:system', async (request, env: Env) => {
   const secret = body?.secret
   if (!secret) return error(400, { errors: [{ message: 'secret required' }] })
 
-  const domainDO = getEntityDO(env, `domain-secrets:${domain}`) as any
+  // Domain secrets are stored in a cell keyed by ('domain-secrets', domain)
+  // — one DO per domain (§5.4 Def 2: secret writes on distinct domains
+  // never contend). Using `cellKey` instead of the inline `domain-secrets:${…}`
+  // form keeps the #217 RMAP-derived naming authoritative in one place.
+  const domainDO = getCellDO(env, 'domain-secrets', domain) as any
   await domainDO.connectSystem(system, secret)
   return json({ connected: true, domain, system })
 })
 
 router.get('/api/connect/:domain', async (request, env: Env) => {
   const { domain } = request.params
-  const domainDO = getEntityDO(env, `domain-secrets:${domain}`) as any
+  const domainDO = getCellDO(env, 'domain-secrets', domain) as any
   const systems = await domainDO.connectedSystems()
   return json({ domain, connectedSystems: systems })
 })
