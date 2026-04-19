@@ -82,6 +82,50 @@ Derivation rules join across:
 
 The engine does not distinguish local from federated at query time. It fetches the federated data when needed, joins it with the local population, and evaluates the rule as usual.
 
+## Federated analytics backends (#219)
+
+The fetch path above loads a single entity from its source. The
+same External System mechanism covers read-heavy OLAP queries —
+list, count, aggregate — for nouns whose volume makes per-cell
+reads impractical. This is the paper's §5.3 platform-binding
+shape applied to analytics.
+
+Declare a noun is backed by an analytics backend the same way:
+
+```forml2
+External System 'analytics' has URL 'https://clickhouse.internal'.
+External System 'analytics' has Kind 'analytics'.
+External System 'analytics' has Header 'Authorization'.
+External System 'analytics' has Prefix 'Bearer'.
+
+Noun 'Listing' is backed by External System 'analytics'.
+Noun 'Listing' has URI '/v1/query'.
+```
+
+Two things change at compile time for an `analytics`-kind binding:
+
+- The emitted `populate:Listing` def carries an "OLAP" shape —
+  it consumes the same sort / order query params (#218) the
+  REST list endpoint advertises, plus any declared fact-type
+  filters, and returns a JSON array under OWA.
+- Write-path routing is unchanged: create / update still land
+  on per-cell DOs (Definition 2). The analytics backend is a
+  **read replica**, not a write target. Consistency: the
+  backend lags the DOs by its own ingestion window; clients
+  that need last-write-read should bypass the analytics binding
+  and read from the DOs directly.
+
+Per-noun opt-in means you can back one hot noun with ClickHouse
+and leave the rest on per-cell DOs. Typical pattern for a
+marketplace: `Listing` and `Event` are analytics-backed (millions
+of rows, read-heavy aggregations); `Account`, `Order`, `Payment`
+stay on per-cell DOs (single-entity writes dominate, strong
+consistency matters).
+
+The SSRF denylist and credential-env-var rules from the fetch
+path apply unchanged. A compile-time check rejects analytics URLs
+that point into private address space.
+
 ## Built-in integrations
 
 The bundled metamodel includes `organizations.md` which declares:
