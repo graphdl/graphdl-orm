@@ -314,6 +314,144 @@ Derivation Rule depends on Derivation Rule. *
 
 Constraint is semantic iff Constraint has modality of Modality Type 'Deontic' and Constraint spans some Role and that Role is played by some Noun and no Resource is instance of that Noun.
 
+## NORMA Structural Decomposition (#279)
+
+The concepts below mirror NORMA's `ORMCoreMetaModel.orm`
+decomposition of derivation rule bodies. They are the FORML 2
+surface that the meta-circular parser (#280) populates by
+decomposing each user-authored rule into a `Join Path` +
+`Role Sequence` + `Role Projection`, rather than classifying the
+rule text with Rust heuristics.
+
+Paper §4 Table 1 correspondence:
+  Join Path       ↔ Composition (COMP)
+  Role Sequence   ↔ Construction (CONS)
+  Role Projection ↔ Selector
+  Join Type       ↔ Condition (COND)
+
+### Entity types
+
+Join Path(.id) is an entity type.
+Join(.id) is an entity type.
+Role Sequence(.id) is an entity type.
+Role Projection(.id) is an entity type.
+Join Type(.Name) is an entity type.
+
+### Value types
+
+Clusivity is a value type.
+  The possible values of Clusivity are 'inclusive', 'exclusive'.
+
+Derivation Storage Type is a value type.
+  The possible values of Derivation Storage Type are 'stored', 'derived', 'derived-and-stored'.
+
+### Fact types
+
+Derivation Rule has Join Path.
+  Each Derivation Rule has at most one Join Path.
+
+Join Path has Join.
+  Each Join Path has some Join.
+  For each Join, exactly one Join Path has that Join.
+
+Join uses Fact Type.
+  Each Join uses exactly one Fact Type.
+
+Join has Join Type.
+  Each Join has exactly one Join Type.
+
+Join has Role Sequence.
+  Each Join has some Role Sequence.
+
+Role Sequence has Role at Position.
+  For each Role Sequence and Position, at most one Role is at that Position in that Role Sequence.
+
+Role Projection is from Role Sequence.
+  Each Role Projection is from exactly one Role Sequence.
+
+Role Projection produces Role.
+  Each Role Projection produces exactly one Role.
+
+Derivation Rule has Role Projection.
+  Each Derivation Rule has some Role Projection.
+
+Fact Type has Derivation Storage Type.
+  Each Fact Type has at most one Derivation Storage Type.
+
+## NORMA Value Domain (#279)
+
+### Entity types
+
+Bound(.id) is an entity type.
+Value Range(.id) is an entity type.
+Facet(.id) is an entity type.
+Value(.id) is an entity type.
+Unit(.Name) is an entity type.
+Dimension(.Name) is an entity type.
+Textual Constraint is a subtype of Constraint.
+
+### Value types
+
+Regex Pattern is a value type.
+Lexical Value is a value type.
+Alias is a value type.
+Length is a value type.
+Binary Precision is a value type.
+Digit Count is a value type.
+
+### Fact types
+
+Value is of Noun.
+  Each Value is of exactly one Noun.
+
+Value has Lexical Value.
+  Each Value has exactly one Lexical Value.
+
+Value Range has lower Bound.
+  Each Value Range has at most one lower Bound.
+
+Value Range has upper Bound.
+  Each Value Range has at most one upper Bound.
+
+Bound has Value.
+  Each Bound has exactly one Value.
+
+Bound has Clusivity.
+  Each Bound has exactly one Clusivity.
+
+Noun has Value Range.
+  It is possible that more than one Noun has the same Value Range.
+
+Noun has Facet.
+  It is possible that more than one Noun has the same Facet.
+
+Facet has Length.
+  Each Facet has at most one Length.
+
+Facet has Binary Precision.
+  Each Facet has at most one Binary Precision.
+
+Facet has Digit Count.
+  Each Facet has at most one Digit Count.
+
+Facet has Regex Pattern.
+  Each Facet has at most one Regex Pattern.
+
+Unit has Dimension.
+  Each Unit has exactly one Dimension.
+
+Noun is measured in Unit.
+  Each Noun is measured in at most one Unit.
+
+Textual Constraint has Text.
+  Each Textual Constraint has exactly one Text.
+
+Noun has Alias.
+  It is possible that more than one Noun has the same Alias.
+
+Fact Type has Alias.
+  It is possible that more than one Fact Type has the same Alias.
+
 ## Instance Facts
 
 ### Constraint Types
@@ -334,6 +472,14 @@ Constraint Type 'IT' has Name 'Intransitive'.
 Constraint Type 'TR' has Name 'Transitive'.
 Constraint Type 'AC' has Name 'Acyclic'.
 Constraint Type 'VC' has Name 'ValueComparison'.
+
+### Join Types (NORMA #279)
+
+Join Type 'inner' has Name 'inner'.
+Join Type 'outer' has Name 'outer'.
+Join Type 'left-outer' has Name 'left-outer'.
+Join Type 'right-outer' has Name 'right-outer'.
+Join Type 'anti' has Name 'anti'.
 
 ### HTTP Methods
 

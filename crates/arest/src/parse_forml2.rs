@@ -4500,6 +4500,79 @@ fn forbidden_ipv6_ula_fd() {
             "Derivation Mode enum must include 'semi-derived'; got: {:?}", vals);
     }
 
+    /// #279 — NORMA's structural decomposition primitives for derivation
+    /// rule bodies. `JoinPath` + `Join` + `RoleSequence` + `RoleProjection`
+    /// map 1:1 onto paper §4 Table 1 FFP primitives (Composition,
+    /// Construction, Selector, Condition). Every one of the 13 clause
+    /// shapes in `_reports/engine-resolver-gaps.md` decomposes into some
+    /// JoinPath form — that's what makes the meta-circular parser in
+    /// #280 possible.
+    #[test]
+    fn metamodel_declares_norma_join_path_decomposition() {
+        let core_md = include_str!("../../../readings/core.md");
+        let domain = parse_markdown(core_md)
+            .expect("metamodel readings/core.md must parse");
+        for entity in ["Join Path", "Join", "Role Sequence", "Role Projection", "Join Type"] {
+            let noun = domain.nouns.get(entity)
+                .unwrap_or_else(|| panic!(
+                    "core.md must declare NORMA entity '{}' for the meta-circular parser; got nouns: {:?}",
+                    entity, domain.nouns.keys().collect::<Vec<_>>()
+                ));
+            assert_eq!(noun.object_type, "entity",
+                "'{}' must be an entity type (NORMA ObjectType subtype)", entity);
+        }
+    }
+
+    /// #279 — NORMA's value-domain primitives. `Bound` + `Value Range`
+    /// + `Facet` carry per-value-type constraints as first-class facts
+    /// instead of the flat `Minimum`/`Maximum`/... fields we had before.
+    /// `Value` is the entity form of a literal instance.
+    #[test]
+    fn metamodel_declares_norma_value_domain_entities() {
+        let core_md = include_str!("../../../readings/core.md");
+        let domain = parse_markdown(core_md)
+            .expect("metamodel readings/core.md must parse");
+        for entity in ["Bound", "Value Range", "Facet", "Value", "Unit", "Dimension", "Textual Constraint"] {
+            let noun = domain.nouns.get(entity)
+                .unwrap_or_else(|| panic!(
+                    "core.md must declare NORMA entity '{}'; got nouns: {:?}",
+                    entity, domain.nouns.keys().collect::<Vec<_>>()
+                ));
+            assert_eq!(noun.object_type, "entity",
+                "'{}' must be an entity type", entity);
+        }
+    }
+
+    /// #279 — NORMA value types for the new decomposition + value-domain
+    /// entities. Enum value types get their enum listed; plain value
+    /// types just need `is a value type` declared.
+    #[test]
+    fn metamodel_declares_norma_value_types() {
+        let core_md = include_str!("../../../readings/core.md");
+        let domain = parse_markdown(core_md)
+            .expect("metamodel readings/core.md must parse");
+        // Plain value types — no enum required
+        for value_type in ["Regex Pattern", "Lexical Value", "Alias", "Length", "Binary Precision", "Digit Count"] {
+            let noun = domain.nouns.get(value_type)
+                .unwrap_or_else(|| panic!(
+                    "core.md must declare NORMA value type '{}'; got: {:?}",
+                    value_type, domain.nouns.keys().collect::<Vec<_>>()
+                ));
+            assert_eq!(noun.object_type, "value",
+                "'{}' must be a value type", value_type);
+        }
+        // Clusivity: enum of inclusive / exclusive
+        let clusivity = domain.enum_values.get("Clusivity")
+            .expect("core.md must declare 'Clusivity' enum");
+        assert!(clusivity.iter().any(|v| v == "inclusive"));
+        assert!(clusivity.iter().any(|v| v == "exclusive"));
+        // Derivation Storage Type: NORMA's {stored, derived, derived-and-stored}
+        let storage = domain.enum_values.get("Derivation Storage Type")
+            .expect("core.md must declare 'Derivation Storage Type' enum");
+        assert!(storage.iter().any(|v| v == "stored"));
+        assert!(storage.iter().any(|v| v == "derived"));
+    }
+
     // --- Derivation mode markers on fact type readings ---
     //
     // Halpin ORM 2 attaches graphical markers to derived fact types: `*`
