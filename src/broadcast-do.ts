@@ -14,18 +14,29 @@
  */
 
 import { DurableObject } from 'cloudflare:workers'
+import { cellKey as rmapCellKey } from './api/cell-key'
 
 // ── Types ──────────────────────────────────────────────────────────────
 
 /**
  * A subscription filter. Narrower filters receive fewer events.
- * `domain` is required; `noun` restricts to one noun type; `entityId`
- * restricts to one entity. All three match every event in the scope.
+ * `domain` is required; the rest narrow within that scope:
+ *   - `noun` / `entityId` — the historical per-dimension narrowers.
+ *   - `cellKey` (#220) — canonical cell name per §5.4 RMAP. When set,
+ *     it's a direct match against the event's precomputed cellKey and
+ *     subsumes the `noun`/`entityId` pair. Use this form for per-cell
+ *     demux (paper Eq. 11: E_n = Filter(eq ∘ [RMAP, n̄]) : E) — one
+ *     subscriber receives exactly that cell's substream.
+ *
+ * Narrowers compose with AND: all specified fields must match.
+ * Specifying `cellKey` AND `noun`/`entityId` is permitted but
+ * redundant; the cellKey alone is sufficient.
  */
 export interface SubscriptionFilter {
   readonly domain: string
   readonly noun?: string
   readonly entityId?: string
+  readonly cellKey?: string
 }
 
 /**
@@ -42,6 +53,14 @@ export interface CellEvent {
   readonly timestamp: number
   /** Monotonic per-registry sequence number. Assigned by publish(). */
   readonly sequence: number
+  /**
+   * Canonical cell name — `cellKey(noun, entityId)` (#217). Computed
+   * by `publish()` so every subscriber sees the same RMAP-derived
+   * identity without re-deriving it, and so per-cell demux filters
+   * (`filter.cellKey === event.cellKey`, paper Eq. 11) are O(1)
+   * string equality instead of a two-field match.
+   */
+  readonly cellKey: string
 }
 
 /**
@@ -106,6 +125,11 @@ export function listSubscribers(reg: Registry): readonly string[] {
  */
 export function matches(filter: SubscriptionFilter, event: CellEvent): boolean {
   if (filter.domain !== event.domain) return false
+  // #220: cellKey is the canonical per-cell demux axis. When the
+  // filter declares it, it IS the match — the paper's
+  // Eq. 11 (E_n = Filter(eq ∘ [RMAP, n̄]) : E) collapses to one
+  // string comparison against the event's precomputed cellKey.
+  if (filter.cellKey !== undefined && filter.cellKey !== event.cellKey) return false
   if (filter.noun !== undefined && filter.noun !== event.noun) return false
   if (filter.entityId !== undefined && filter.entityId !== event.entityId) return false
   return true
@@ -117,9 +141,13 @@ export function matches(filter: SubscriptionFilter, event: CellEvent): boolean {
  * Callbacks fire synchronously in subscription order; a throwing
  * callback does not abort fanout to the rest.
  */
-export function publish(reg: Registry, event: Omit<CellEvent, 'sequence'>): CellEvent {
+export function publish(reg: Registry, event: Omit<CellEvent, 'sequence' | 'cellKey'>): CellEvent {
   const sequence = reg.sequence++
-  const full: CellEvent = { ...event, sequence }
+  // Precompute the #217 cell key once per publish so every
+  // subscriber's demux match is a single string compare instead
+  // of re-deriving (noun, entityId) → cellKey per check.
+  const cellKey = rmapCellKey(event.noun, event.entityId)
+  const full: CellEvent = { ...event, sequence, cellKey }
   for (const sub of reg.subscribers.values()) {
     if (!matches(sub.filter, full)) continue
     try {
@@ -169,6 +197,10 @@ export async function openSseStream(reg: Registry, request: Request): Promise<Re
   }
   const noun = url.searchParams.get('noun') ?? undefined
   const entityId = url.searchParams.get('entityId') ?? undefined
+  // #220: `?cellKey=Noun:id` subscribes to exactly one cell's
+  // demuxed substream (paper Eq. 11). Takes precedence over the
+  // historical `noun` / `entityId` pair when both are supplied.
+  const cellKey = url.searchParams.get('cellKey') ?? undefined
 
   const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>()
   const writer = writable.getWriter()
@@ -181,7 +213,7 @@ export async function openSseStream(reg: Registry, request: Request): Promise<Re
     })
   }
 
-  subscriptionId = subscribe(reg, { domain, noun, entityId }, callback)
+  subscriptionId = subscribe(reg, { domain, noun, entityId, cellKey }, callback)
 
   writer.write(encoder.encode(`: connected sub=${subscriptionId}\n\n`))
     .catch(() => { /* client already gone */ })
