@@ -530,6 +530,57 @@ fn is_subtype_instance_check(clause: &str, noun_names: &[String]) -> bool {
 /// itself isn't compiled here — classification only suppresses
 /// the "unresolved clause" diagnostic for the legitimate comparison
 /// form.
+/// #277 Category F — `<FT-reference> within|before|after <tail>` is
+/// a binary FT lookup with an implicit range filter on the trailing
+/// role. Recognised when splitting on the range operator yields a
+/// head that resolves through the catalog; the tail is left as an
+/// anaphoric binding. Patterns like `Log Entry has Timestamp within
+/// that Interval` and `Timestamp is before that Fresh Until` appear
+/// across service-health.md, data-pipeline.md, and eu-law corpora.
+fn is_range_filter_clause(
+    clause: &str,
+    noun_names: &[String],
+    catalog: &SchemaCatalog,
+) -> bool {
+    const RANGE_OPS: &[&str] = &[" within ", " before ", " after "];
+    RANGE_OPS.iter().any(|op| {
+        let Some(idx) = clause.find(op) else { return false; };
+        let head = clause[..idx].trim();
+        head_resolves(head, noun_names, catalog)
+    })
+}
+
+/// #277 Category F — bare-value tail comparisons like
+/// `HTTP Status of 500 or more`, `HTTP Status of 500 or less`,
+/// `HTTP Status of at least 500`, `HTTP Status of at most 500`.
+/// The FT reference is the subject noun; the `of <N> <comparator>`
+/// tail is an implicit comparator filter on the value side.
+fn is_bare_value_comparison(clause: &str, noun_names: &[String]) -> bool {
+    const TAILS: &[&str] = &[
+        " or more", " or less", " or greater", " or fewer",
+    ];
+    let trimmed = clause.trim().trim_end_matches('.');
+    let ends_with_tail = TAILS.iter().any(|t| trimmed.ends_with(t));
+    if !ends_with_tail { return false; }
+    // The clause must contain " of " followed by a numeric literal
+    // and reference at least one declared noun on the left side.
+    let Some(of_idx) = trimmed.find(" of ") else { return false; };
+    let head = trimmed[..of_idx].trim();
+    let head_has_noun = noun_names.iter().any(|n| {
+        head == n
+            || head.starts_with(&alloc::format!("{} ", n))
+            || head.ends_with(&alloc::format!(" {}", n))
+            || head.contains(&alloc::format!(" {} ", n))
+    });
+    if !head_has_noun { return false; }
+    // Token after " of " must be a numeric literal (decimal, possibly
+    // signed). Reject quoted-value forms which belong to the
+    // ref-scheme-literal classifier.
+    let after_of = trimmed[of_idx + " of ".len()..].trim_start();
+    let first_token = after_of.split_whitespace().next().unwrap_or("");
+    first_token.parse::<f64>().is_ok()
+}
+
 fn is_word_comparator_clause(clause: &str, noun_names: &[String]) -> bool {
     const COMPARATORS: &[&str] = &[
         " exceeds ", " is greater than ", " is less than ",
@@ -2334,6 +2385,19 @@ fn resolve_derivation_rule(
         //     path in branch (1)/(2) for readings that spell their
         //     comparators out.
         if is_word_comparator_clause(part, &noun_names) { continue; }
+
+        // (8b) #277 Category F — range-filter clauses
+        //      `<FT reference> within|before|after <tail>` where the
+        //      head alone resolves through the catalog. The tail is
+        //      typically anaphora (`that Interval`, `that Fresh Until`)
+        //      or a value literal.
+        if is_range_filter_clause(part, &noun_names, catalog) { continue; }
+
+        // (8c) #277 Category F — bare-value tail comparisons
+        //      `<Noun> of N or more` / `or less` / `or greater`.
+        //      Numeric literal only; quoted literals stay with the
+        //      ref-scheme-value classifier at (9b).
+        if is_bare_value_comparison(part, &noun_names) { continue; }
 
         // (9) Literal-value filter: `<Noun> has <Noun> '<literal>'`.
         //     Covers state-machine status filters (`Task has Status 'Done'`)
