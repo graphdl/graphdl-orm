@@ -120,6 +120,12 @@ pub fn compile_to_verilog(state: &Object) -> String {
         // LOAD_ROM -> INIT_BRAM -> READY. Back-pressures ingress
         // until BRAMs are warm.
         modules.push(emit_boot_fsm_module());
+        // SYSTEM kernel (#154). The ρ-dispatch FSM that orchestrates
+        // the other modules: command in → def lookup → reducer run →
+        // audit → response out. This is SYSTEM(x, D) = ⟨o, D'⟩ in
+        // synthesizable form; it's always emitted alongside the boot
+        // FSM because the kernel's IDLE phase gates on boot_ready.
+        modules.push(emit_system_kernel_module());
     }
     let _ = bram_specs;  // reserved for later top-level wiring work
 
@@ -535,6 +541,150 @@ endmodule
 "#.to_string()
 }
 
+/// Emit the SYSTEM kernel — the top-level ρ-dispatch FSM (#154).
+///
+/// This is the hardware form of `SYSTEM(x, D) = ⟨o, D'⟩` (paper Eq. 1):
+/// one incoming command x with key `k` and input `i`, state D in the
+/// per-noun BRAMs (#166), and output o routed to the egress port
+/// (#168). The FSM is the synthesizable form of the Rust `system_impl`
+/// loop: lookup_def(k) → apply(def, i, D) → commit(new_D) → audit →
+/// respond, ρ-dispatched through the def ROM address — not through
+/// verb keywords.
+///
+/// State encoding is 3 bits so synthesis collapses to three FFs plus
+/// the small combinatorial chain between phases. Phases:
+///
+///   IDLE     wait for boot_ready + cmd_valid; latch (k, i) and begin.
+///   LOOKUP   drive def_lookup_name = k; stall until def_rom_valid.
+///   EXECUTE  raise reducer_start and stall until reducer_done.
+///   COMMIT   capture reducer_result as the output (BRAM writes the
+///            reducer already did while it ran are the new D).
+///   AUDIT    append the result entry into audit_log (#167).
+///   RESPOND  drop result on egress for one cycle, return to IDLE.
+///
+/// Back-pressure: the module never advances past IDLE while boot_ready
+/// is low, so it naturally waits for boot_fsm to finish LOAD_ROM /
+/// INIT_BRAM. Downstream consumers of `result_valid` are responsible
+/// for catching it on the single-cycle pulse in RESPOND.
+fn emit_system_kernel_module() -> String {
+    r#"module system_kernel (
+    input  wire         clk,
+    input  wire         rst_n,
+    // Boot-FSM gate — stays low through LOAD_ROM / INIT_BRAM.
+    input  wire         boot_ready,
+    // Command ingress: one k/i pair per transaction. cmd_accepted
+    // pulses high for one cycle when the kernel latches the command.
+    input  wire         cmd_valid,
+    output reg          cmd_accepted,
+    input  wire [255:0] cmd_key,
+    input  wire [255:0] cmd_input,
+    // Def ROM lookup: k -> def-function handle. The ROM is bundle-
+    // derived (#171) — integrators back it with BRAM / LUT-ROM.
+    output reg  [255:0] def_lookup_name,
+    output reg          def_lookup_req,
+    input  wire [15:0]  def_rom_addr,
+    input  wire         def_rom_valid,
+    // WASM reducer handshake (#169). reducer_result is the top-level
+    // ρ-application's atom-encoded return.
+    output reg          reducer_start,
+    input  wire [255:0] reducer_result,
+    input  wire         reducer_done,
+    // Result egress — one-cycle pulse on result_valid.
+    output reg  [255:0] result_key,
+    output reg  [255:0] result_value,
+    output reg          result_valid,
+    // Audit log write port (#167).
+    output reg          audit_wr_en,
+    output reg  [255:0] audit_entry,
+    // Observable phase encoding (testbench hook).
+    output reg  [2:0]   phase
+);
+    localparam [2:0] P_IDLE    = 3'd0;
+    localparam [2:0] P_LOOKUP  = 3'd1;
+    localparam [2:0] P_EXECUTE = 3'd2;
+    localparam [2:0] P_COMMIT  = 3'd3;
+    localparam [2:0] P_AUDIT   = 3'd4;
+    localparam [2:0] P_RESPOND = 3'd5;
+
+    // Hold the decoded (k, i) for the duration of the transaction so
+    // the def ROM / reducer can pulse their request signals without
+    // racing the external driver's cmd_valid.
+    reg [255:0] latched_key;
+    reg [255:0] latched_input;
+
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            phase           <= P_IDLE;
+            cmd_accepted    <= 1'b0;
+            def_lookup_name <= {256{1'b0}};
+            def_lookup_req  <= 1'b0;
+            reducer_start   <= 1'b0;
+            result_key      <= {256{1'b0}};
+            result_value    <= {256{1'b0}};
+            result_valid    <= 1'b0;
+            audit_wr_en     <= 1'b0;
+            audit_entry     <= {256{1'b0}};
+            latched_key     <= {256{1'b0}};
+            latched_input   <= {256{1'b0}};
+        end else begin
+            case (phase)
+                P_IDLE: begin
+                    result_valid   <= 1'b0;
+                    audit_wr_en    <= 1'b0;
+                    cmd_accepted   <= 1'b0;
+                    if (boot_ready && cmd_valid) begin
+                        latched_key     <= cmd_key;
+                        latched_input   <= cmd_input;
+                        def_lookup_name <= cmd_key;
+                        def_lookup_req  <= 1'b1;
+                        cmd_accepted    <= 1'b1;
+                        phase           <= P_LOOKUP;
+                    end
+                end
+                P_LOOKUP: begin
+                    def_lookup_req <= 1'b0;
+                    cmd_accepted   <= 1'b0;
+                    if (def_rom_valid) begin
+                        // def_rom_addr is the compiled handle. In a fuller
+                        // integration it drives reducer's code-pointer
+                        // register; the atom-level contract here is that
+                        // reducer_start triggers the interpreter pass.
+                        reducer_start <= 1'b1;
+                        phase         <= P_EXECUTE;
+                    end
+                end
+                P_EXECUTE: begin
+                    reducer_start <= 1'b0;
+                    if (reducer_done) begin
+                        phase <= P_COMMIT;
+                    end
+                end
+                P_COMMIT: begin
+                    // D writes happened inside the reducer via
+                    // cell_store (#166) — here we only capture the
+                    // output atom for egress + audit.
+                    result_value <= reducer_result;
+                    result_key   <= latched_key;
+                    phase        <= P_AUDIT;
+                end
+                P_AUDIT: begin
+                    audit_wr_en <= 1'b1;
+                    audit_entry <= reducer_result;
+                    phase       <= P_RESPOND;
+                end
+                P_RESPOND: begin
+                    audit_wr_en  <= 1'b0;
+                    result_valid <= 1'b1;
+                    phase        <= P_IDLE;
+                end
+                default: phase <= P_IDLE;
+            endcase
+        end
+    end
+endmodule
+"#.to_string()
+}
+
 /// Emit the top-level boot-sequence state machine (#170). Sequences
 /// post-reset bring-up across every other FPGA-generator module:
 ///
@@ -906,6 +1056,53 @@ fn emit_top_module(
     out.push_str("        .valid_out(egress_valid_out),\n");
     out.push_str("        .name(egress_name),\n");
     out.push_str("        .payload(egress_payload)\n");
+    out.push_str("    );\n");
+    // Boot FSM + SYSTEM kernel wiring (#154 + #170). The kernel's
+    // IDLE phase depends on `boot_ready`, which the boot FSM latches
+    // after LOAD_ROM + INIT_BRAM complete.
+    out.push_str("    wire boot_ready_sig;\n");
+    out.push_str("    wire [1:0] boot_phase_sig;\n");
+    out.push_str("    boot_fsm boot_fsm_inst (\n");
+    out.push_str("        .clk(clk),\n");
+    out.push_str("        .rst_n(rst_n),\n");
+    out.push_str("        .ready(boot_ready_sig),\n");
+    out.push_str("        .phase(boot_phase_sig),\n");
+    out.push_str("        .phase_cycles(8'd16)\n");
+    out.push_str("    );\n");
+    // SYSTEM kernel. All cmd_* / reducer_* / def_rom_* ports tied
+    // off at top — an integrator wires a real command source, def
+    // ROM, and WASM reducer when the bundle deploys.
+    out.push_str("    wire kernel_cmd_accepted;\n");
+    out.push_str("    wire [255:0] kernel_def_lookup_name;\n");
+    out.push_str("    wire kernel_def_lookup_req;\n");
+    out.push_str("    wire kernel_reducer_start;\n");
+    out.push_str("    wire [255:0] kernel_result_key;\n");
+    out.push_str("    wire [255:0] kernel_result_value;\n");
+    out.push_str("    wire kernel_result_valid;\n");
+    out.push_str("    wire kernel_audit_wr_en;\n");
+    out.push_str("    wire [255:0] kernel_audit_entry;\n");
+    out.push_str("    wire [2:0] kernel_phase;\n");
+    out.push_str("    system_kernel system_kernel_inst (\n");
+    out.push_str("        .clk(clk),\n");
+    out.push_str("        .rst_n(rst_n),\n");
+    out.push_str("        .boot_ready(boot_ready_sig),\n");
+    out.push_str("        .cmd_valid(1'b0),\n");
+    out.push_str("        .cmd_accepted(kernel_cmd_accepted),\n");
+    out.push_str("        .cmd_key({256{1'b0}}),\n");
+    out.push_str("        .cmd_input({256{1'b0}}),\n");
+    out.push_str("        .def_lookup_name(kernel_def_lookup_name),\n");
+    out.push_str("        .def_lookup_req(kernel_def_lookup_req),\n");
+    out.push_str("        .def_rom_addr({16{1'b0}}),\n");
+    out.push_str("        .def_rom_valid(1'b0),\n");
+    out.push_str("        .reducer_start(kernel_reducer_start),\n");
+    out.push_str("        .reducer_result({256{1'b0}}),\n");
+    out.push_str("        .reducer_done(1'b0),\n");
+    out.push_str("        .result_key(kernel_result_key),\n");
+    out.push_str("        .result_value(kernel_result_value),\n");
+    out.push_str("        .result_valid(kernel_result_valid),\n");
+    out.push_str("        .audit_wr_en(kernel_audit_wr_en),\n");
+    out.push_str("        .audit_entry(kernel_audit_entry),\n");
+    out.push_str("        .phase(kernel_phase)\n");
     out.push_str("    );\n");
     // AND-reduce valids after reset release. Empty-entity edge case:
     // emit `1'b1` as the identity so the expression stays well-formed.
@@ -1537,6 +1734,64 @@ Counter has Count.
         assert!(verilog.contains("ready   <= 1'b1"));
         // READY phase is terminal — ready stays high.
         assert!(verilog.contains("PHASE_READY: begin"));
+    }
+
+    // ── SYSTEM kernel dispatch FSM (#154) ──
+
+    #[test]
+    fn system_kernel_module_emitted_alongside_boot_fsm() {
+        let state = state_with_nouns(&[("Widget", "entity")]);
+        let verilog = compile_to_verilog(&state);
+        assert!(verilog.contains("module system_kernel"),
+            "system_kernel must accompany the other FPGA modules:\n{}", verilog);
+        // The kernel gates on boot_ready — integrity of the dependency.
+        assert!(verilog.contains("boot_ready"));
+    }
+
+    #[test]
+    fn system_kernel_has_six_phase_dispatch_fsm() {
+        // IDLE → LOOKUP → EXECUTE → COMMIT → AUDIT → RESPOND → IDLE
+        // — the ρ-dispatch loop. All six phases must land in the
+        // encoding so SYSTEM(x, D) = ⟨o, D'⟩ runs as written.
+        let state = state_with_nouns(&[("Widget", "entity")]);
+        let verilog = compile_to_verilog(&state);
+        for phase in ["P_IDLE", "P_LOOKUP", "P_EXECUTE", "P_COMMIT", "P_AUDIT", "P_RESPOND"] {
+            assert!(verilog.contains(phase),
+                "kernel must expose {} phase encoding:\n{}", phase, verilog);
+        }
+    }
+
+    #[test]
+    fn system_kernel_exposes_def_rom_and_reducer_handshake_ports() {
+        // The kernel's two external dependencies are the def ROM
+        // (key → compiled handle) and the WASM reducer (handle →
+        // result). Both must be visible at the port boundary so a
+        // downstream integrator can wire them without surgery.
+        let state = state_with_nouns(&[("Widget", "entity")]);
+        let verilog = compile_to_verilog(&state);
+        // Def ROM side.
+        assert!(verilog.contains("def_lookup_name"));
+        assert!(verilog.contains("def_lookup_req"));
+        assert!(verilog.contains("def_rom_addr"));
+        assert!(verilog.contains("def_rom_valid"));
+        // Reducer side.
+        assert!(verilog.contains("reducer_start"));
+        assert!(verilog.contains("reducer_result"));
+        assert!(verilog.contains("reducer_done"));
+        // Result egress.
+        assert!(verilog.contains("result_valid"));
+    }
+
+    #[test]
+    fn top_instantiates_system_kernel_gated_on_boot_ready() {
+        let state = state_with_nouns(&[("Widget", "entity")]);
+        let verilog = compile_to_verilog(&state);
+        // The top wires boot_fsm's `ready` into system_kernel's
+        // `boot_ready` — that's the entire Definition-2 gate.
+        assert!(verilog.contains("system_kernel system_kernel_inst"),
+            "top must instantiate the kernel:\n{}", verilog);
+        assert!(verilog.contains(".boot_ready(boot_ready_sig)"),
+            "kernel's boot_ready must be wired to boot_fsm.ready:\n{}", verilog);
     }
 
     // ── Per-noun BRAM cell memory map (#166) ──
