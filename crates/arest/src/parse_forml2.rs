@@ -368,6 +368,29 @@ fn is_noun_has_noun_literal(clause: &str, noun_names: &[String]) -> bool {
     is_noun(subj) && is_noun(attr)
 }
 
+/// #275 Category C — `<Noun> is '<literal>'` or `<Noun> is not
+/// '<literal>'` is a ref-scheme-value filter over the noun's
+/// identity. Optional leading role-binding qualifiers (`other `,
+/// `that `, `some `, `each `, `any `) and numeric subscripts on the
+/// noun (`Source1`, `Customer2`) are stripped before the match. The
+/// clause body in a derivation rule uses this form to select the
+/// entity whose ref scheme value equals the literal — equivalent to
+/// `Noun has <RefSchemeVT> '<literal>'`.
+fn is_entity_ref_scheme_literal(clause: &str, noun_names: &[String]) -> bool {
+    let trimmed = clause.trim().trim_end_matches('.');
+    // Strip a single leading role qualifier. Only one per clause is
+    // idiomatic in Halpin readings; stripping every occurrence would
+    // widen the match beyond intent.
+    let stripped = ["other ", "that ", "some ", "each ", "any ", "the ", "a ", "an "]
+        .iter()
+        .fold(trimmed, |s, q| s.strip_prefix(q).unwrap_or(s));
+    let re = regex::Regex::new(r"^(.+?) (?:is not|is) '[^']*'$").expect("static");
+    let Some(caps) = re.captures(stripped) else { return false; };
+    let raw_subj = caps.get(1).map(|m| m.as_str().trim()).unwrap_or_default();
+    let (base, _) = parse_role_token(raw_subj);
+    noun_names.iter().any(|n| n == base)
+}
+
 /// True when `clause` has the shape `<Noun> is (a|an) <Noun>` with
 /// both sides resolving to declared nouns. Treated as a typing
 /// predicate rather than a fact-type reference.
@@ -2191,6 +2214,15 @@ fn resolve_derivation_rule(
         //     SM-managed or enum-valued. `resolve_fact_type` would miss
         //     it; classify it here as a valid antecedent predicate.
         if is_noun_has_noun_literal(part, &noun_names) { continue; }
+
+        // (9b) Ref-scheme-value filter: `<Noun> is '<literal>'` or
+        //      `<Noun> is not '<literal>'`. The entity's ref scheme
+        //      value IS its identity, so this clause selects the
+        //      entity whose identity equals the literal. Optional
+        //      leading role qualifiers (`other Source`, `that
+        //      Customer`) are stripped before the match. #275
+        //      Category C.
+        if is_entity_ref_scheme_literal(part, &noun_names) { continue; }
 
         // (10) Universal quantifier: `for each <Noun> <predicate>`.
         //      Recognised when the clause starts with `for each` and

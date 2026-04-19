@@ -506,6 +506,46 @@ mod tests {
             "`Customer is eligible for trial` (unary rule consequent) must resolve as antecedent. Full diags: {:#?}", diags);
     }
 
+    /// #275 Category C — `<Noun> is '<literal>'` and `<Noun> is not
+    /// '<literal>'` are ref-scheme-value filters that should resolve.
+    /// 13+ rules in auto.dev (`Source is 'oem'`, `Email Template is
+    /// 'limit-50'`) and widespread elsewhere.
+    #[test]
+    fn category_c_parameter_atom_in_rule_body() {
+        let input = "Source(.Source Name) is an entity type.\n\
+                     ## Fact Types\n\
+                     Source has priority over Source.\n\
+                     ## Derivation Rules\n\
+                     Source has priority over Source if Source is 'oem' and other Source is not 'oem'.";
+        let diags = check_readings(input);
+        let unresolved: Vec<_> = diags.iter()
+            .filter(|d| d.source == Source::Resolve && d.level == Level::Warning)
+            .filter(|d| d.message.contains(" is 'oem'") || d.message.contains(" is not 'oem'"))
+            .collect();
+        assert!(unresolved.is_empty(),
+            "`Source is 'oem'` / `Source is not 'oem'` must resolve as ref-scheme-value filters. Full diags: {:#?}", diags);
+    }
+
+    /// #275 Category C — `<Noun> is '<literal>'` on a named entity with
+    /// a ref scheme. Mirrors `Email Template is 'limit-50'` from
+    /// website.md.
+    #[test]
+    fn category_c_ref_scheme_literal_on_named_entity() {
+        let input = "Email Template(.Name) is an entity type.\n\
+                     Notification(.Id) is an entity type.\n\
+                     ## Fact Types\n\
+                     Notification is triggered by Email Template.\n\
+                     ## Derivation Rules\n\
+                     Notification is triggered by Email Template if Email Template is 'limit-50'.";
+        let diags = check_readings(input);
+        let unresolved: Vec<_> = diags.iter()
+            .filter(|d| d.source == Source::Resolve && d.level == Level::Warning)
+            .filter(|d| d.message.contains("Email Template is 'limit-50'"))
+            .collect();
+        assert!(unresolved.is_empty(),
+            "`Email Template is 'limit-50'` must resolve as ref-scheme-value filter. Full diags: {:#?}", diags);
+    }
+
     #[test]
     fn non_ascii_atom_id_warns() {
         let input = "City(.Name) is an entity type.\n## Instance Facts\nCity 'café' has Population '100'.";
