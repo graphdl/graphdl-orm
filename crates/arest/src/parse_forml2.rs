@@ -32,8 +32,6 @@ struct ParseCtx {
     derivation_rules: Vec<DerivationRuleDef>,
     #[cfg_attr(feature = "std-deps", serde(default))]
     general_instance_facts: Vec<GeneralInstanceFact>,
-    #[cfg_attr(feature = "std-deps", serde(default))]
-    enum_values: HashMap<String, Vec<String>>,
     /// Object cells produced by apply_action. This IS the parse output;
     /// the typed fields above are parse-time lookup caches.
     ///
@@ -1039,7 +1037,6 @@ fn parse_markdown_with_context(input: &str, existing_nouns: &HashMap<String, Nou
         nouns: HashMap::new(), fact_types: HashMap::new(),
         constraints: vec![], derivation_rules: vec![],
         general_instance_facts: vec![],
-        enum_values: HashMap::new(),
         cells: HashMap::new(),
     };
     parse_into(&mut standalone, input)?;
@@ -1058,7 +1055,6 @@ fn parse_markdown_with_context(input: &str, existing_nouns: &HashMap<String, Nou
         nouns: existing_nouns.clone(), fact_types: existing_fact_types.clone(),
         constraints: vec![], derivation_rules: vec![],
         general_instance_facts: vec![],
-        enum_values: HashMap::new(),
         cells: HashMap::new(),
     };
     parse_into(&mut ir, input)?;
@@ -1279,8 +1275,12 @@ fn ctx_to_state(d: &ParseCtx) -> crate::ast::Object {
             let ref_scheme = ref_scheme_for_noun(&d.cells, name)
                 .or_else(|| (def.object_type == "entity").then(|| vec!["id".into()]));
             ref_scheme.as_ref().map(|rs| pairs.push(("referenceScheme".into(), rs.join(","))));
-            d.enum_values.get(name).filter(|evs| !evs.is_empty())
-                .map(|evs| pairs.push(("enumValues".into(), evs.join(","))));
+            {
+                let evs = enum_values_for_noun(&d.cells, name);
+                if !evs.is_empty() {
+                    pairs.push(("enumValues".into(), evs.join(",")));
+                }
+            }
             let refs: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
             push(&mut cells, "Noun", fact_from_pairs(&refs));
         }
@@ -1414,7 +1414,6 @@ fn parse_markdown(input: &str) -> Result<ParseCtx, String> {
         nouns: HashMap::new(), fact_types: HashMap::new(),
         constraints: vec![], derivation_rules: vec![],
         general_instance_facts: vec![],
-        enum_values: HashMap::new(),
         cells: HashMap::new(),
     };
     parse_into(&mut ir, input)?;
@@ -1543,7 +1542,7 @@ fn parse_into(ir: &mut ParseCtx, input: &str) -> Result<(), String> {
                 .and_then(parse_enum)
                 .map(|vals| (name.to_string(), vals)))
             .into_iter()
-            .for_each(|(name, vals)| { ir.enum_values.insert(name, vals); });
+            .for_each(|(name, vals)| { upsert_enum_values(ir, &name, &vals); });
     });
 
     // Pass 2a: collect fact types and instance facts
@@ -1711,9 +1710,9 @@ fn parse_into(ir: &mut ParseCtx, input: &str) -> Result<(), String> {
         });
 
     // Task 6: Value Constraint (VC) -- emit one VC per noun with enum_values.
-    // The compiler reads enum values from ir.enum_values;
+    // The compiler reads enum values from the EnumValues cell (#283);
     // the ConstraintDef just marks which noun has a value constraint.
-    let vcs: Vec<ConstraintDef> = ir.enum_values.keys().cloned().map(|noun_name| ConstraintDef {
+    let vcs: Vec<ConstraintDef> = all_enum_value_nouns(&ir.cells).into_iter().map(|noun_name| ConstraintDef {
         id: format!("VC:{}", noun_name),
         kind: "VC".into(),
         modality: "alethic".into(),
@@ -1795,8 +1794,12 @@ fn parse_into(ir: &mut ParseCtx, input: &str) -> Result<(), String> {
             let ref_scheme = ref_scheme_for_noun(&ir.cells, name)
                 .or_else(|| (def.object_type == "entity").then(|| vec!["id".into()]));
             ref_scheme.as_ref().map(|rs| pairs.push(("referenceScheme".into(), rs.join(","))));
-            ir.enum_values.get(name).filter(|evs| !evs.is_empty())
-                .map(|evs| pairs.push(("enumValues".into(), evs.join(","))));
+            {
+                let evs = enum_values_for_noun(&ir.cells, name);
+                if !evs.is_empty() {
+                    pairs.push(("enumValues".into(), evs.join(",")));
+                }
+            }
             let refs: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
             fact_from_pairs(&refs)
         }).collect();
@@ -2554,6 +2557,65 @@ fn ref_scheme_for_noun(
             }
             parts
         })
+}
+
+/// #283 — Enum values for a value type, decoded from the `EnumValues`
+/// cell's `value0`, `value1`, ... indexed fields. Replaces
+/// `ir.enum_values.get(name)`.
+fn enum_values_for_noun(
+    cells: &HashMap<String, Vec<crate::ast::Object>>,
+    noun: &str,
+) -> Vec<String> {
+    cells.get("EnumValues")
+        .and_then(|facts| facts.iter()
+            .find(|f| crate::ast::binding(f, "noun") == Some(noun)))
+        .map(|fact| {
+            let mut vals: Vec<String> = Vec::new();
+            let mut i: usize = 0;
+            loop {
+                let key = alloc::format!("value{i}");
+                match crate::ast::binding(fact, &key) {
+                    Some(v) => { vals.push(v.to_string()); i += 1; }
+                    None => break,
+                }
+            }
+            vals
+        })
+        .unwrap_or_default()
+}
+
+/// #283 — Every noun name that carries enum values. Replaces
+/// `ir.enum_values.keys()`.
+fn all_enum_value_nouns(
+    cells: &HashMap<String, Vec<crate::ast::Object>>,
+) -> Vec<String> {
+    cells.get("EnumValues")
+        .map(|facts| facts.iter()
+            .filter_map(|f| crate::ast::binding(f, "noun").map(String::from))
+            .collect())
+        .unwrap_or_default()
+}
+
+/// #283 — Upsert enum values for a noun on the `EnumValues` cell.
+/// Removes any prior fact for this noun before pushing the new one.
+fn upsert_enum_values(
+    ir: &mut ParseCtx,
+    noun: &str,
+    values: &[String],
+) {
+    if let Some(facts) = ir.cells.get_mut("EnumValues") {
+        facts.retain(|f| crate::ast::binding(f, "noun") != Some(noun));
+    }
+    let mut pairs: Vec<(String, String)> = alloc::vec![
+        ("noun".to_string(), noun.to_string()),
+    ];
+    for (i, v) in values.iter().enumerate() {
+        pairs.push((alloc::format!("value{i}"), v.clone()));
+    }
+    let refs: Vec<(&str, &str)> = pairs.iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    push_cell(ir, "EnumValues", crate::ast::fact_from_pairs(&refs));
 }
 
 /// #283 — Supertype lookup for a subtype noun via the `Subtype` cell.
@@ -3416,7 +3478,8 @@ mod tests {
     fn value_types_with_enum() {
         let ir = parse_markdown("Priority is a value type.\n  The possible values of Priority are 'low', 'medium', 'high'.").unwrap();
         assert_eq!(ir.nouns["Priority"].object_type, "value");
-        assert_eq!(ir.enum_values["Priority"].len(), 3);
+        // #283 — enum values live in the EnumValues cell.
+        assert_eq!(super::enum_values_for_noun(&ir.cells, "Priority").len(), 3);
     }
 
     #[test]
@@ -4646,8 +4709,9 @@ fn forbidden_ipv6_ula_fd() {
         assert_eq!(noun.object_type, "value",
             "'Derivation Mode' must be a value type");
 
-        let vals = domain.enum_values.get("Derivation Mode")
-            .expect("'Derivation Mode' must have declared enum values");
+        // #283 — enum values on the EnumValues cell.
+        let vals = super::enum_values_for_noun(&domain.cells, "Derivation Mode");
+        assert!(!vals.is_empty(), "'Derivation Mode' must have declared enum values");
         assert!(vals.iter().any(|v| v == "fully-derived"),
             "Derivation Mode enum must include 'fully-derived'; got: {:?}", vals);
         assert!(vals.iter().any(|v| v == "derived-and-stored"),
@@ -4717,14 +4781,14 @@ fn forbidden_ipv6_ula_fd() {
             assert_eq!(noun.object_type, "value",
                 "'{}' must be a value type", value_type);
         }
-        // Clusivity: enum of inclusive / exclusive
-        let clusivity = domain.enum_values.get("Clusivity")
-            .expect("core.md must declare 'Clusivity' enum");
+        // Clusivity: enum of inclusive / exclusive — via EnumValues cell (#283)
+        let clusivity = super::enum_values_for_noun(&domain.cells, "Clusivity");
+        assert!(!clusivity.is_empty(), "core.md must declare 'Clusivity' enum");
         assert!(clusivity.iter().any(|v| v == "inclusive"));
         assert!(clusivity.iter().any(|v| v == "exclusive"));
         // Derivation Storage Type: NORMA's {stored, derived, derived-and-stored}
-        let storage = domain.enum_values.get("Derivation Storage Type")
-            .expect("core.md must declare 'Derivation Storage Type' enum");
+        let storage = super::enum_values_for_noun(&domain.cells, "Derivation Storage Type");
+        assert!(!storage.is_empty(), "core.md must declare 'Derivation Storage Type' enum");
         assert!(storage.iter().any(|v| v == "stored"));
         assert!(storage.iter().any(|v| v == "derived"));
     }
