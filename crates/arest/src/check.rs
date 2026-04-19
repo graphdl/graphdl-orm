@@ -160,21 +160,78 @@ pub fn check_readings(text: &str) -> Vec<ReadingDiagnostic> {
     }
 }
 
-/// Each UnresolvedClause cell entry becomes one Resolve warning.
+/// Layer 1: unresolved antecedent analysis.
+///
+/// A real ρ-application over three cells — `UnresolvedClause`,
+/// `FactType`, and `Noun` — not a string echo of the parser's raw
+/// output. For each unresolved clause the parser flagged, this
+/// layer independently re-inspects the clause and reports which
+/// declared fact types share nouns with it. That grounds the
+/// suggestion in the current schema rather than a static string,
+/// so authors see the candidate FTs they could have meant. Per the
+/// paper's §Distributed Evaluation, diagnostics are pure functions
+/// of the cell state; this keeps them that way.
 fn check_unresolved_clauses(state: &Object) -> Vec<ReadingDiagnostic> {
+    let fact_types = fetch_or_phi("FactType", state);
+    let nouns = fetch_or_phi("Noun", state);
+    let noun_names: Vec<String> = nouns.as_seq()
+        .map(|facts| facts.iter()
+            .filter_map(|n| binding(n, "name").map(String::from))
+            .collect())
+        .unwrap_or_default();
     fetch_or_phi("UnresolvedClause", state).as_seq()
-        .map(|facts| facts.iter().map(|f| ReadingDiagnostic {
-            line: 0,
-            reading: binding(f, "ruleText").unwrap_or("").to_string(),
-            level: Level::Warning,
-            source: Source::Resolve,
-            message: format!(
-                "antecedent clause did not resolve to a declared fact type: `{}`",
-                binding(f, "clause").unwrap_or(""),
-            ),
-            suggestion: Some("check that the clause references a declared fact type, or uses a recognised form (comparison, aggregate, computed binding)".to_string()),
+        .map(|facts| facts.iter().map(|f| {
+            let clause = binding(f, "clause").unwrap_or("");
+            let reading = binding(f, "ruleText").unwrap_or("");
+            let suggestion = suggest_similar_fact_types(clause, &noun_names, &fact_types);
+            ReadingDiagnostic {
+                line: 0,
+                reading: reading.to_string(),
+                level: Level::Warning,
+                source: Source::Resolve,
+                message: format!(
+                    "antecedent clause did not resolve to a declared fact type: `{}`",
+                    clause,
+                ),
+                suggestion: Some(suggestion),
+            }
         }).collect())
         .unwrap_or_default()
+}
+
+/// Join `clause` against the `FactType` cell: for each FT whose
+/// reading shares at least one declared noun with the clause,
+/// surface it as a candidate. Paper Eq. 11's demux form — `Filter`
+/// the FT sequence on noun-overlap with the offending clause.
+fn suggest_similar_fact_types(
+    clause: &str,
+    noun_names: &[String],
+    fact_types: &Object,
+) -> String {
+    let clause_nouns: Vec<&str> = noun_names.iter()
+        .filter(|n| clause.contains(n.as_str()))
+        .map(String::as_str)
+        .collect();
+    if clause_nouns.is_empty() {
+        return "check that the clause references a declared fact type, or uses a recognised form (comparison, aggregate, computed binding)".to_string();
+    }
+    let candidates: Vec<String> = fact_types.as_seq()
+        .map(|fts| fts.iter()
+            .filter_map(|ft| binding(ft, "reading").map(String::from))
+            .filter(|reading| clause_nouns.iter().any(|n| reading.contains(n)))
+            .take(3)
+            .collect())
+        .unwrap_or_default();
+    match candidates.is_empty() {
+        true => format!(
+            "the clause mentions {} but no declared fact type spans those nouns yet",
+            clause_nouns.join(", "),
+        ),
+        false => format!(
+            "did you mean one of: {}?",
+            candidates.join("; "),
+        ),
+    }
 }
 
 /// Ring constraints (IR/AS/AT/SY/IT/TR/AC/RF) must span roles on a
@@ -572,6 +629,30 @@ mod tests {
             .collect();
         assert!(unresolved.is_empty(),
             "`Source Request is for Resource Declaration that has Base Path` must expand + resolve. Full diags: {:#?}", diags);
+    }
+
+    /// Layer-1 refactor — the suggestion must name declared fact
+    /// types that share nouns with the unresolved clause, not a
+    /// static string. Proves the checker joins `UnresolvedClause`
+    /// with `FactType` via ρ-application rather than echoing the
+    /// parser's output.
+    #[test]
+    fn unresolved_clause_suggestion_names_similar_fact_types() {
+        let input = "Order(.Id) is an entity type.\n\
+                     Amount is a value type.\n\
+                     Customer(.Id) is an entity type.\n\
+                     ## Fact Types\n\
+                     Order has Amount.\n\
+                     Order has Customer.\n\
+                     ## Derivation Rules\n\
+                     + Order has Amount if Order has Mystery.";
+        let diags = check_readings(input);
+        let mystery_warning = diags.iter()
+            .find(|d| d.message.contains("Order has Mystery"))
+            .expect("expected Order has Mystery warning");
+        let suggestion = mystery_warning.suggestion.as_ref().expect("suggestion present");
+        assert!(suggestion.contains("Order has Amount") || suggestion.contains("Order has Customer"),
+            "suggestion must name declared FT candidates involving `Order`, got {:?}", suggestion);
     }
 
     /// #277 Category F — `<Noun> has <Noun> within <anaphora>` is
