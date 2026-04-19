@@ -36,8 +36,6 @@ struct ParseCtx {
     subtypes: HashMap<String, String>,
     #[cfg_attr(feature = "std-deps", serde(default))]
     enum_values: HashMap<String, Vec<String>>,
-    #[cfg_attr(feature = "std-deps", serde(default))]
-    ref_schemes: HashMap<String, Vec<String>>,
     /// Object cells produced by apply_action. This IS the parse output;
     /// the typed fields above are parse-time lookup caches.
     ///
@@ -1044,7 +1042,6 @@ fn parse_markdown_with_context(input: &str, existing_nouns: &HashMap<String, Nou
         constraints: vec![], derivation_rules: vec![],
         general_instance_facts: vec![],
         subtypes: HashMap::new(), enum_values: HashMap::new(),
-        ref_schemes: HashMap::new(),
         cells: HashMap::new(),
     };
     parse_into(&mut standalone, input)?;
@@ -1064,7 +1061,6 @@ fn parse_markdown_with_context(input: &str, existing_nouns: &HashMap<String, Nou
         constraints: vec![], derivation_rules: vec![],
         general_instance_facts: vec![],
         subtypes: HashMap::new(), enum_values: HashMap::new(),
-        ref_schemes: HashMap::new(),
         cells: HashMap::new(),
     };
     parse_into(&mut ir, input)?;
@@ -1282,8 +1278,7 @@ fn ctx_to_state(d: &ParseCtx) -> crate::ast::Object {
                 ("worldAssumption".into(), wa.into()),
             ];
             d.subtypes.get(name).map(|st| pairs.push(("superType".into(), st.clone())));
-            let ref_scheme = d.ref_schemes.get(name)
-                .cloned()
+            let ref_scheme = ref_scheme_for_noun(&d.cells, name)
                 .or_else(|| (def.object_type == "entity").then(|| vec!["id".into()]));
             ref_scheme.as_ref().map(|rs| pairs.push(("referenceScheme".into(), rs.join(","))));
             d.enum_values.get(name).filter(|evs| !evs.is_empty())
@@ -1388,9 +1383,9 @@ fn ctx_to_state(d: &ParseCtx) -> crate::ast::Object {
     // For each entity with a compound ref scheme, split instance IDs on '-'
     // from the right and push component facts to {Noun}_has_{Component} cells.
     if !cells.contains_key("InstanceFact") {
-      for (noun_name, ref_parts) in d.ref_schemes.iter().filter(|(_, p)| p.len() >= 2) {
+      for (noun_name, ref_parts) in all_ref_schemes(&d.cells).into_iter().filter(|(_, p)| p.len() >= 2) {
         let ids: HashSet<&str> = d.general_instance_facts.iter()
-            .filter(|f| f.subject_noun == *noun_name)
+            .filter(|f| f.subject_noun == noun_name)
             .map(|f| f.subject_value.as_str())
             .collect();
         for id in &ids {
@@ -1401,7 +1396,7 @@ fn ctx_to_state(d: &ParseCtx) -> crate::ast::Object {
                 let cell_name = format!("{}_has_{}",
                     noun_name.replace(' ', "_"), component.replace(' ', "_"));
                 push(&mut cells, &cell_name, fact_from_pairs(&[
-                    (noun_name, id), (component, value),
+                    (noun_name.as_str(), *id), (component.as_str(), *value),
                 ]));
             }
         }
@@ -1422,7 +1417,6 @@ fn parse_markdown(input: &str) -> Result<ParseCtx, String> {
         constraints: vec![], derivation_rules: vec![],
         general_instance_facts: vec![],
         subtypes: HashMap::new(), enum_values: HashMap::new(),
-        ref_schemes: HashMap::new(),
         cells: HashMap::new(),
     };
     parse_into(&mut ir, input)?;
@@ -1800,8 +1794,7 @@ fn parse_into(ir: &mut ParseCtx, input: &str) -> Result<(), String> {
                 ("worldAssumption".into(), wa.into()),
             ];
             ir.subtypes.get(name).map(|st| pairs.push(("superType".into(), st.clone())));
-            let ref_scheme = ir.ref_schemes.get(name)
-                .cloned()
+            let ref_scheme = ref_scheme_for_noun(&ir.cells, name)
                 .or_else(|| (def.object_type == "entity").then(|| vec!["id".into()]));
             ref_scheme.as_ref().map(|rs| pairs.push(("referenceScheme".into(), rs.join(","))));
             ir.enum_values.get(name).filter(|evs| !evs.is_empty())
@@ -1888,10 +1881,17 @@ fn parse_into(ir: &mut ParseCtx, input: &str) -> Result<(), String> {
         // ≥2 ref parts, split instance IDs on '-' from the right and
         // push component facts to {Noun}_has_{Component} cells.
         use hashbrown::HashSet as HBSet;
-        for (noun_name, ref_parts) in ir.ref_schemes.iter().filter(|(_, p)| p.len() >= 2) {
-            let ids: HBSet<&str> = ir.general_instance_facts.iter()
-                .filter(|f| f.subject_noun == *noun_name)
-                .map(|f| f.subject_value.as_str())
+        // #283 — snapshot all_ref_schemes before the cell-mutation loop
+        // to avoid borrowing `ir.cells` immutably and mutably in
+        // overlapping scopes.
+        let compound_schemes: Vec<(String, Vec<String>)> = all_ref_schemes(&ir.cells)
+            .into_iter()
+            .filter(|(_, p)| p.len() >= 2)
+            .collect();
+        for (noun_name, ref_parts) in compound_schemes {
+            let ids: HBSet<String> = ir.general_instance_facts.iter()
+                .filter(|f| f.subject_noun == noun_name)
+                .map(|f| f.subject_value.clone())
                 .collect();
             for id in &ids {
                 let parts: Vec<&str> = id.rsplitn(ref_parts.len(), '-').collect::<Vec<_>>();
@@ -1901,7 +1901,7 @@ fn parse_into(ir: &mut ParseCtx, input: &str) -> Result<(), String> {
                     let cell_name = format!("{}_has_{}",
                         noun_name.replace(' ', "_"), component.replace(' ', "_"));
                     ir.cells.entry(cell_name).or_default().push(fact_from_pairs(&[
-                        (noun_name.as_str(), *id),
+                        (noun_name.as_str(), id.as_str()),
                         (component.as_str(), *value),
                     ]));
                 }
@@ -2535,6 +2535,54 @@ fn push_cell(ir: &mut ParseCtx, cell: &str, fact: crate::ast::Object) {
     ir.cells.entry(cell.to_string()).or_default().push(fact);
 }
 
+/// #283 — Cell-backed lookup for a noun's reference-scheme components.
+/// Reads the `RefScheme` cell (populated by `ParseAction::AddNoun`)
+/// and decodes the `partN` indexed fields back into a Vec.
+fn ref_scheme_for_noun(
+    cells: &HashMap<String, Vec<crate::ast::Object>>,
+    noun: &str,
+) -> Option<Vec<String>> {
+    cells.get("RefScheme")?
+        .iter()
+        .find(|f| crate::ast::binding(f, "noun") == Some(noun))
+        .map(|f| {
+            let mut parts: Vec<String> = Vec::new();
+            let mut i: usize = 0;
+            loop {
+                let key = alloc::format!("part{i}");
+                match crate::ast::binding(f, &key) {
+                    Some(v) => { parts.push(v.to_string()); i += 1; }
+                    None => break,
+                }
+            }
+            parts
+        })
+}
+
+/// #283 — Iterate every (noun, ref-scheme) pair from the `RefScheme`
+/// cell. Replaces `ir.ref_schemes.iter()` and `d.ref_schemes.iter()`.
+fn all_ref_schemes(
+    cells: &HashMap<String, Vec<crate::ast::Object>>,
+) -> Vec<(String, Vec<String>)> {
+    cells.get("RefScheme")
+        .map(|facts| facts.iter()
+            .filter_map(|f| {
+                let noun = crate::ast::binding(f, "noun")?.to_string();
+                let mut parts: Vec<String> = Vec::new();
+                let mut i: usize = 0;
+                loop {
+                    let key = alloc::format!("part{i}");
+                    match crate::ast::binding(f, &key) {
+                        Some(v) => { parts.push(v.to_string()); i += 1; }
+                        None => break,
+                    }
+                }
+                Some((noun, parts))
+            })
+            .collect())
+        .unwrap_or_default()
+}
+
 /// Emit a Constraint cell fact with the full constraint JSON (lossless)
 /// plus flat fields for check.rs and no_std fallbacks.
 #[cfg(all(test, feature = "std-deps"))]
@@ -2583,7 +2631,27 @@ fn apply_action(ir: &mut ParseCtx, action: Option<ParseAction>, lines: &[String]
                 .then(|| entry.object_type = "abstract".into());
             // Populate IR maps from metadata
             meta.super_type.into_iter().for_each(|st| { ir.subtypes.insert(name.clone(), st); });
-            meta.ref_scheme.into_iter().for_each(|rs| { ir.ref_schemes.entry(name.clone()).or_insert(rs); });
+            // #283 — RefScheme cell write. or_insert semantics preserved
+            // by checking existing cells first; first noun declaration
+            // wins (metamodel guard handles legitimate redeclaration).
+            meta.ref_scheme.into_iter().for_each(|rs| {
+                let already = ir.cells.get("RefScheme")
+                    .map(|facts| facts.iter()
+                        .any(|f| crate::ast::binding(f, "noun") == Some(name.as_str())))
+                    .unwrap_or(false);
+                if !already {
+                    let mut pairs: Vec<(String, String)> = alloc::vec![
+                        ("noun".to_string(), name.clone()),
+                    ];
+                    for (i, p) in rs.iter().enumerate() {
+                        pairs.push((alloc::format!("part{i}"), p.clone()));
+                    }
+                    let refs: Vec<(&str, &str)> = pairs.iter()
+                        .map(|(k, v)| (k.as_str(), v.as_str()))
+                        .collect();
+                    push_cell(ir, "RefScheme", crate::ast::fact_from_pairs(&refs));
+                }
+            });
         }
         ParseAction::MarkAbstract(name) => {
             ir.nouns.get_mut(&name).into_iter()
