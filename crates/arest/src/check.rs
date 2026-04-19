@@ -526,6 +526,54 @@ mod tests {
             "`Source is 'oem'` / `Source is not 'oem'` must resolve as ref-scheme-value filters. Full diags: {:#?}", diags);
     }
 
+    /// #276 Category G — single-level `that`-relative expansion.
+    /// `<head> that <tail>` expands to `<head> and <last_noun_of_head>
+    /// <tail>` during antecedent preprocessing so both halves resolve
+    /// against declared FTs. Mirrors the `Customer has Country Code
+    /// that is an EEA Country Code` pattern from eu-compliance.md.
+    #[test]
+    fn category_g_single_that_relative_expands() {
+        let input = "Customer(.Id) is an entity type.\n\
+                     Country Code is a value type.\n\
+                     EEA Country Code is a value type.\n\
+                     ## Fact Types\n\
+                     Customer has Country Code.\n\
+                     Country Code is an EEA Country Code.\n\
+                     ## Derivation Rules\n\
+                     Customer has Country Code if Customer has Country Code that is an EEA Country Code.";
+        let diags = check_readings(input);
+        let unresolved: Vec<_> = diags.iter()
+            .filter(|d| d.source == Source::Resolve && d.level == Level::Warning)
+            .filter(|d| d.message.contains("that is an EEA Country Code"))
+            .collect();
+        assert!(unresolved.is_empty(),
+            "`Customer has Country Code that is an EEA Country Code` must expand + resolve. Full diags: {:#?}", diags);
+    }
+
+    /// #276 Category G — nested `that`-relative expansion.
+    /// `<head1> that <verb> <X> that <verb> <Y>` iteratively expands
+    /// into three conjoined clauses. Mirrors `Source Request is for
+    /// Resource Declaration that has Base Path` and the deeper chains
+    /// in source-routing.md.
+    #[test]
+    fn category_g_nested_that_relative_expands() {
+        let input = "Source Request(.Id) is an entity type.\n\
+                     Resource Declaration(.Id) is an entity type.\n\
+                     Base Path is a value type.\n\
+                     ## Fact Types\n\
+                     Source Request is for Resource Declaration.\n\
+                     Resource Declaration has Base Path.\n\
+                     ## Derivation Rules\n\
+                     Source Request is for Resource Declaration if Source Request is for Resource Declaration that has Base Path.";
+        let diags = check_readings(input);
+        let unresolved: Vec<_> = diags.iter()
+            .filter(|d| d.source == Source::Resolve && d.level == Level::Warning)
+            .filter(|d| d.message.contains("that has Base Path"))
+            .collect();
+        assert!(unresolved.is_empty(),
+            "`Source Request is for Resource Declaration that has Base Path` must expand + resolve. Full diags: {:#?}", diags);
+    }
+
     /// #275 Category C — `<Noun> is '<literal>'` on a named entity with
     /// a ref scheme. Mirrors `Email Template is 'limit-50'` from
     /// website.md.

@@ -368,6 +368,124 @@ fn is_noun_has_noun_literal(clause: &str, noun_names: &[String]) -> bool {
     is_noun(subj) && is_noun(attr)
 }
 
+/// #276 Category G — iteratively expand relative-clause `that`-chains
+/// into explicit conjunctions.
+///
+/// `<head> that <verb phrase>` rewrites to
+/// `<head> and <last noun of head> <verb phrase>` so the downstream
+/// ` and `-split produces two clauses that both resolve against
+/// declared FTs. The expansion runs repeatedly until no expandable
+/// ` that ` remains, so nested forms
+///
+///   Source Request is for Resource Declaration that has Base Path
+///
+/// flatten to
+///
+///   Source Request is for Resource Declaration
+///   Resource Declaration has Base Path
+///
+/// Back-reference anaphora (`that <Noun> ...`) is untouched — the
+/// existing anaphora classifier handles those join-key forms.
+///
+/// Safety rail: expansion is skipped when the `<head>` portion does
+/// not itself resolve to a declared FT. Blindly rewriting a head
+/// that isn't in the catalog (e.g. the 5-ary `Billable Request is
+/// for Customer and Meter Endpoint and VIN and Date` from auth.md,
+/// whose binary slice `Billable Request is for Customer` doesn't
+/// exist) would replace a single unresolved warning with two, making
+/// the diagnostic output noisier. When the head fails to resolve,
+/// the original clause stays intact and falls through to the
+/// downstream classifier cascade.
+fn expand_that_relatives(
+    antecedent: &str,
+    noun_names: &[String],
+    catalog: &SchemaCatalog,
+) -> String {
+    let mut current = antecedent.to_string();
+    loop {
+        let positions: Vec<usize> = current
+            .match_indices(" that ")
+            .map(|(i, _)| i)
+            .collect();
+        let expand_at = positions.into_iter().find(|&i| {
+            let tail = &current[i + " that ".len()..];
+            let tail_trim = tail.trim_start();
+            if is_that_anaphora_ref(tail_trim, noun_names) { return false; }
+            // Only expand when the head — text up to this ` that ` —
+            // resolves to a declared FT. Otherwise leave the clause
+            // for downstream classifiers to handle whole.
+            let head = &current[..i];
+            head_resolves(head, noun_names, catalog)
+        });
+        let Some(pos) = expand_at else { break; };
+        let head = &current[..pos];
+        let tail = &current[pos + " that ".len()..];
+        let Some(last_noun) = find_last_noun_in(head, noun_names) else { break; };
+        let expanded = alloc::format!("{} and {} {}", head, last_noun, tail);
+        if expanded == current { break; }
+        current = expanded;
+    }
+    current
+}
+
+/// True when the text up to this point resolves to a declared FT
+/// via the schema catalog. Used as a pre-flight check before
+/// expanding a `that`-relative — we only want to split when the
+/// left side is known-good.
+fn head_resolves(head: &str, noun_names: &[String], catalog: &SchemaCatalog) -> bool {
+    let found = find_nouns(head, noun_names);
+    if found.is_empty() { return false; }
+    let base_refs: Vec<String> = found.iter()
+        .map(|(_, _, n)| parse_role_token(n).0.to_string())
+        .collect();
+    let role_refs: Vec<&str> = base_refs.iter().map(|s| s.as_str()).collect();
+    let verb = match found.len() {
+        1 => head[found[0].1..].trim(),
+        _ => head[found[0].1..found[1].0].trim(),
+    };
+    let verb_opt = (!verb.is_empty()).then_some(verb);
+    catalog.resolve(&role_refs, verb_opt).is_some()
+        || catalog.resolve(&role_refs, None).is_some()
+}
+
+/// Find the last declared noun appearing in `text`, longest-first.
+fn find_last_noun_in(text: &str, noun_names: &[String]) -> Option<String> {
+    let found = find_nouns(text, noun_names);
+    found.last().map(|(_, _, name)| parse_role_token(name).0.to_string())
+}
+
+/// True when `tail` (text immediately after `that `) starts with a
+/// noun reference rather than a verb phrase. Noun references take
+/// three forms: plain noun, subscripted noun (`Person3`), and
+/// hyphen-bound role name (`expires- Timestamp`). Used by
+/// `expand_that_relatives` to skip anaphora — back-references to a
+/// previously-bound role shouldn't be rewritten into conjunctions.
+fn is_that_anaphora_ref(tail: &str, noun_names: &[String]) -> bool {
+    // Shape 1 + 2: <Noun> or <Noun><digits>
+    if noun_names.iter().any(|n| {
+        let Some(after) = tail.strip_prefix(n.as_str()) else { return false; };
+        let after_subscript = after.trim_start_matches(|c: char| c.is_ascii_digit());
+        matches!(
+            after_subscript.chars().next(),
+            None | Some(' ') | Some('.') | Some(','),
+        )
+    }) { return true; }
+    // Shape 3: <word>- <Noun>, i.e. hyphen-bound role prefix.
+    // The prefix is a single whitespace-free token followed by `- `.
+    // `cached- Timestamp`, `override- Fetcher` both fit.
+    let Some(hyphen_idx) = tail.find("- ") else { return false; };
+    let prefix = &tail[..hyphen_idx];
+    if prefix.is_empty() || prefix.contains(' ') { return false; }
+    let after_hyphen = &tail[hyphen_idx + "- ".len()..];
+    noun_names.iter().any(|n| {
+        let Some(after) = after_hyphen.strip_prefix(n.as_str()) else { return false; };
+        matches!(
+            after.chars().next(),
+            None | Some(' ') | Some('.') | Some(','),
+        )
+    })
+}
+
 /// #275 Category C — `<Noun> is '<literal>'` or `<Noun> is not
 /// '<literal>'` is a ref-scheme-value filter over the noun's
 /// identity. Optional leading role-binding qualifiers (`other `,
@@ -1994,7 +2112,7 @@ fn resolve_derivation_rule(
     }
 
     // Split on " := ", " iff ", or " if " to get (consequent, antecedent_text)
-    let (consequent_text, antecedent_text) = rule.text
+    let (consequent_text, antecedent_raw) = rule.text
         .find(" := ")
         .map(|i| (&rule.text[..i], &rule.text[i + 4..]))
         .or_else(|| rule.text.find(" iff ")
@@ -2002,6 +2120,16 @@ fn resolve_derivation_rule(
         .or_else(|| rule.text.find(" if ")
             .map(|i| (&rule.text[..i], &rule.text[i + 4..])))
         .unwrap_or((&rule.text, ""));
+
+    // #276 Category G — expand `<head> that <verb>` relative clauses
+    // into explicit `<head> and <last_noun> <verb>` conjunctions so
+    // the downstream split on ` and ` produces resolvable clauses.
+    // Back-reference anaphora (`that <Noun>`) is preserved, and the
+    // expansion self-guards via `head_resolves` to avoid turning a
+    // single unresolved clause into multiple unresolved fragments
+    // when the head isn't a declared FT.
+    let antecedent_expanded = expand_that_relatives(antecedent_raw, &noun_names, catalog);
+    let antecedent_text: &str = antecedent_expanded.as_str();
 
     // Split antecedent on " and " to get individual conditions
     let antecedent_parts: Vec<&str> = antecedent_text
