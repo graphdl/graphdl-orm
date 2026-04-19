@@ -1252,13 +1252,18 @@ pub(crate) fn re_resolve_rules(
     let mut catalog = SchemaCatalog::new();
     fact_types.iter().for_each(|(ft_id, ft)| {
         let role_nouns: Vec<&str> = ft.roles.iter().map(|r| r.noun_name.as_str()).collect();
+        // Verb extraction: text after the first noun up to the second
+        // (binary+), or everything after the single noun (unary — #274
+        // Category A). Without the unary branch the catalog would
+        // register `Customer is in EEA` with an empty verb, which
+        // collides with every other unary keyed on [customer].
         let verb = noun_names.iter()
             .find(|n| ft.reading.starts_with(n.as_str()))
-            .and_then(|first| {
+            .map(|first| {
                 let after = &ft.reading[first.len()..];
-                noun_names.iter().find_map(|second| {
-                    after.find(second.as_str()).map(|pos| after[..pos].trim())
-                })
+                noun_names.iter()
+                    .find_map(|second| after.find(second.as_str()).map(|pos| after[..pos].trim()))
+                    .unwrap_or_else(|| after.trim())
             })
             .unwrap_or("");
         catalog.register(ft_id, &role_nouns, verb, &ft.reading);
@@ -2013,16 +2018,21 @@ fn resolve_derivation_rule(
     let resolve_fact_type = |fragment: &str| -> Option<String> {
         let cleaned = strip_anaphora(fragment);
         let found_nouns: Vec<(usize, usize, String)> = find_nouns(&cleaned, &noun_names);
+        if found_nouns.is_empty() { return None; }
         let base_refs: Vec<String> = found_nouns.iter()
             .map(|(_, _, n)| parse_role_token(n).0.to_string())
             .collect();
         let role_refs: Vec<&str> = base_refs.iter().map(|s| s.as_str()).collect();
 
-        // Extract the verb: text between the first and second noun
-        let verb = found_nouns.windows(2)
-            .next()
-            .map(|pair| cleaned[pair[0].1..pair[1].0].trim())
-            .unwrap_or("");
+        // Verb extraction: text between first and second noun for
+        // binary+ clauses; text after the single noun for unary
+        // clauses (#274 Category A). Without the unary branch
+        // `Customer is in EEA` looks up with empty verb and misses
+        // the catalog entry keyed on verb "is in EEA".
+        let verb = match found_nouns.len() {
+            1 => cleaned[found_nouns[0].1..].trim(),
+            _ => cleaned[found_nouns[0].1..found_nouns[1].0].trim(),
+        };
 
         // rho-lookup: try with verb first, then noun set only
         let verb_opt = (!verb.is_empty()).then_some(verb);
@@ -2486,22 +2496,25 @@ fn register_derivation_consequents_in_catalog(
             .replace("each ", "")
             .replace("any ", "");
         let found: Vec<(usize, usize, String)> = find_nouns(&cleaned, noun_names);
-        // Require 2+ declared nouns in the consequent. Unary
-        // synthetics (only one declared noun) have such low
-        // specificity they'd resolve unrelated clauses like
-        // `Order has Mystery` to the first synthetic registered
-        // under the single-noun key. Binary-or-higher keeps
-        // `Customer is in EEA` working without over-capturing.
-        if found.len() < 2 { continue; }
+        // Need at least one declared noun in the consequent to key
+        // the catalog entry. Unary consequents (#274 Category A) —
+        // `Customer is in EEA`, `Fetcher is proxy-based`, `Customer is
+        // eligible for trial` — carry their verb in the tail after
+        // the single noun. Over-capture is prevented in
+        // `SchemaCatalog::resolve`, which skips the unique-entry
+        // fallback for 1-noun keys and so requires an exact (or
+        // reading-contained) verb match on unary lookups.
+        if found.is_empty() { continue; }
         let base_refs: Vec<String> = found.iter()
             .map(|(_, _, n)| parse_role_token(n).0.to_string())
             .collect();
         let role_refs: Vec<&str> = base_refs.iter().map(|s| s.as_str()).collect();
-        // Verb: text between the first and second noun (binary case);
-        // empty for unary consequents.
-        let verb = found.windows(2).next()
-            .map(|pair| cleaned[pair[0].1..pair[1].0].trim())
-            .unwrap_or("");
+        // Verb: text between the first and second noun for binary+
+        // consequents; text after the single noun for unaries.
+        let verb = match found.len() {
+            1 => cleaned[found[0].1..].trim(),
+            _ => cleaned[found[0].1..found[1].0].trim(),
+        };
         // Synthesise an FT id. Using the fact_type_id helper keeps it
         // consistent with regular FT registration.
         let synthetic_id = alloc::format!("derived:{}", fact_type_id(&role_refs, verb));
@@ -2541,7 +2554,15 @@ impl SchemaCatalog {
     /// Resolution strategy (no COND dispatch, just cascading lookup):
     /// 1. Exact verb match
     /// 2. Verb contained in stored reading (handles inverse voice)
-    /// 3. Unique entry for noun set (no verb needed)
+    /// 3. Unique entry for noun set (no verb needed) — binary+ only
+    ///
+    /// The unique-entry fallback is skipped for 1-noun keys (#274
+    /// Category A). Unaries carry all their identity in the verb:
+    /// without the fallback guard, a clause like `Order has Mystery`
+    /// (noun set [order], `Mystery` undeclared) would resolve to any
+    /// single unary synthetic keyed on [order] — `Order is pending`,
+    /// `Order is cancelled` — regardless of verb. Step 1 and 2 remain
+    /// active and catch the legitimate unary matches.
     fn resolve(&self, role_nouns: &[&str], verb: Option<&str>) -> Option<String> {
         let mut key: Vec<String> = role_nouns.iter().map(|n| {
             let (base, _) = parse_role_token(n);
@@ -2550,6 +2571,7 @@ impl SchemaCatalog {
         key.sort();
         let entries = self.by_noun_set.get(&key)?;
         let vb = verb.map(|v| v.to_lowercase());
+        let allow_unique_fallback = key.len() >= 2;
         // Exact verb match
         entries.iter()
             .find(|(_, v, _)| vb.as_ref().map_or(false, |vb| v == vb))
@@ -2559,8 +2581,8 @@ impl SchemaCatalog {
                     .find(|(_, _, reading)| vb.as_ref().map_or(false, |vb| reading.contains(vb.as_str())))
             )
             .or_else(||
-                // Unique entry for this noun set
-                (entries.len() == 1).then(|| &entries[0])
+                // Unique entry for this noun set (binary+ only)
+                (allow_unique_fallback && entries.len() == 1).then(|| &entries[0])
             )
             .map(|(id, _, _)| id.clone())
     }
@@ -2670,32 +2692,41 @@ fn parse_role_token(token: &str) -> (&str, &str) {
 }
 
 fn parse_fact(line: &str, noun_names: &[String]) -> Option<(String, FactTypeDef, Option<String>)> {
-    let clean = line.trim_end_matches('.');
+    let period_stripped = line.trim_end_matches('.');
+    // ORM 2 derivation marker (Halpin ORM2.pdf p. 8): `**` derived-and-
+    // stored, `*` fully-derived, `+` semi-derived. Strip a trailing
+    // `" **"`, `" *"`, or `" +"` from the line BEFORE noun detection so
+    // the remaining text is a clean reading for both binary
+    // (`Customer has Plan. *`) and unary (`Customer is in EEA. *`)
+    // fact types. The unary path then has a real predicate tail
+    // available; without the pre-strip the marker would dangle inside
+    // it and corrupt the catalog verb.
+    let (clean, derivation_mode) = strip_derivation_marker(period_stripped.trim_end());
     let found = find_nouns(clean, noun_names);
-    (found.len() >= 2).then(|| ())?;
+    // Unaries are only accepted when a derivation marker is explicitly
+    // present. A bare `Customer has Amount` with `Amount` undeclared
+    // must still fall through the binary path (permissive mode will
+    // auto-create `Amount`) rather than silently registering as a
+    // unary with a runaway predicate. #274 Category A.
+    match (found.len(), derivation_mode.as_ref()) {
+        (n, _) if n >= 2 => {},
+        (1, Some(_)) => {},
+        _ => return None,
+    }
 
-    let predicate = clean[found[0].1..found[1].0].trim();
+    let predicate = match found.len() {
+        1 => clean[found[0].1..].trim(),
+        _ => clean[found[0].1..found[1].0].trim(),
+    };
     (!predicate.is_empty()).then(|| ())?;
 
-    let reading = format!("{} {} {}", found[0].2, predicate, found[1].2);
+    let reading = match found.len() {
+        1 => alloc::format!("{} {}", found[0].2, predicate),
+        _ => alloc::format!("{} {} {}", found[0].2, predicate, found[1].2),
+    };
     let roles: Vec<RoleDef> = found.iter().enumerate()
         .map(|(i, (_, _, name))| RoleDef { noun_name: name.clone(), role_index: i })
         .collect();
-
-    // ORM 2 derivation marker (Halpin ORM2.pdf p. 8). The trailing
-    // text after the last noun â€” trimmed of whitespace â€” is compared
-    // to the three markers. User convention requires whitespace
-    // between the verbalization and the marker, so "Full Name *."
-    // is accepted and "Full Name*." is not recognized as a marker.
-    // The caller folds the resulting Some(mode) into the ParseCtx's
-    // `derivation_modes` map keyed by the schema id.
-    let after_last_noun = clean.get(found.last().unwrap().1..).unwrap_or("").trim();
-    let derivation_mode = match after_last_noun {
-        "**" => Some("derived-and-stored".to_string()),
-        "*"  => Some("fully-derived".to_string()),
-        "+"  => Some("semi-derived".to_string()),
-        _    => None,
-    };
 
     // Build role tokens for schema ID (preserving subscript digits from the source text)
     let role_refs: Vec<&str> = found.iter().map(|(_, _, name)| name.as_str()).collect();
@@ -2716,6 +2747,23 @@ fn parse_fact(line: &str, noun_names: &[String]) -> Option<(String, FactTypeDef,
         },
         derivation_mode,
     ))
+}
+
+/// Split a trailing ORM 2 derivation marker (` **`, ` *`, ` +`) off a
+/// fact type reading. Returns the marker-free reading plus the mode
+/// atom. `**` must be checked before `*` since `.strip_suffix(" *")`
+/// would match both.
+fn strip_derivation_marker(text: &str) -> (&str, Option<String>) {
+    if let Some(before) = text.strip_suffix(" **") {
+        return (before.trim_end(), Some("derived-and-stored".to_string()));
+    }
+    if let Some(before) = text.strip_suffix(" *") {
+        return (before.trim_end(), Some("fully-derived".to_string()));
+    }
+    if let Some(before) = text.strip_suffix(" +") {
+        return (before.trim_end(), Some("semi-derived".to_string()));
+    }
+    (text, None)
 }
 
 fn parse_constraint(line: &str, noun_names: &[String]) -> Option<ConstraintDef> {
