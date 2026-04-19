@@ -192,7 +192,8 @@ fn openapi_from_state(state: &Object, app_name: &str) -> serde_json::Value {
         .flat_map(|(name, _)| {
             let plural = plural_for_noun_from_state(name, inst_seq);
             let sm = sms.get(name);
-            paths_for_noun_from_state(name, &plural, sm, &noun_types, inst_seq, ft_seq, role_seq)
+            let table = tables_by_entity.get(&rmap::to_snake(name)).copied();
+            paths_for_noun_from_state(name, &plural, sm, &noun_types, inst_seq, ft_seq, role_seq, table)
         })
         .collect();
 
@@ -371,6 +372,7 @@ fn paths_for_noun_from_state(
     inst_seq: &[Object],
     ft_seq: &[Object],
     role_seq: &[Object],
+    table: Option<&TableDef>,
 ) -> Vec<(String, serde_json::Value)> {
     let schema_ref = serde_json::json!({
         "$ref": format!("#/components/schemas/{}", noun_name),
@@ -409,9 +411,63 @@ fn paths_for_noun_from_state(
         "schema": { "type": "string" },
     });
 
+    // #218: list-endpoint sort/order query parameters enumerated
+    // over the noun's RMAP-derived columns. Each noun's list route
+    // documents exactly which fields a client may sort on — the
+    // cross-product of schema fields × {asc, desc} — so tooling
+    // (OpenAPI code-gen, ui.do table widgets) can render valid
+    // sort UI without guessing. Sorting is bound by Halpin's 3NF
+    // row shape: only scalar columns of the entity's own table
+    // qualify, never joined FTs (those get their own list route).
+    let list_params: Vec<serde_json::Value> = table
+        .map(|t| {
+            let sort_fields: Vec<String> = t.columns.iter()
+                .map(|c| c.name.clone())
+                .collect();
+            if sort_fields.is_empty() {
+                return Vec::new();
+            }
+            vec![
+                serde_json::json!({
+                    "name": "sort",
+                    "in": "query",
+                    "required": false,
+                    "description": format!(
+                        "Field to sort {} by. Enumerates the noun's RMAP columns (§5.4).",
+                        noun_name,
+                    ),
+                    "schema": {
+                        "type": "string",
+                        "enum": sort_fields,
+                    },
+                }),
+                serde_json::json!({
+                    "name": "order",
+                    "in": "query",
+                    "required": false,
+                    "description": "Sort direction. Ignored when `sort` is omitted.",
+                    "schema": {
+                        "type": "string",
+                        "enum": ["asc", "desc"],
+                        "default": "asc",
+                    },
+                }),
+            ]
+        })
+        .unwrap_or_default();
+
+    let mut list_get = serde_json::json!({
+        "summary": format!("List {}.", noun_name),
+        "responses": list_response,
+    });
+    if !list_params.is_empty() {
+        list_get.as_object_mut().unwrap()
+            .insert("parameters".to_string(), serde_json::Value::Array(list_params));
+    }
+
     let crud = vec![
         (format!("/{}", plural), serde_json::json!({
-            "get":  { "summary": format!("List {}.", noun_name),   "responses": list_response },
+            "get":  list_get,
             "post": { "summary": format!("Create {}.", noun_name), "requestBody": request_body, "responses": item_response },
         })),
         (format!("/{}/{{id}}", plural), serde_json::json!({
@@ -875,6 +931,40 @@ mod tests {
             "GET {} (read) must be defined", item_key);
         assert!(paths[item_key]["patch"].is_object(),
             "PATCH {} (update) must be defined", item_key);
+    }
+
+    /// #218: the list-GET endpoint advertises sort + order query
+    /// parameters, with `sort` enumerated over the noun's RMAP
+    /// columns and `order` enumerated over {asc, desc}. Tooling
+    /// can then render valid sort UI without extra introspection.
+    #[test]
+    fn list_endpoint_emits_sort_and_order_params() {
+        let state = organization_with_slug();
+        let doc = openapi_for_app(&state, "test-app");
+        let list_get = &doc["paths"]["/organizations"]["get"];
+        let params = list_get["parameters"].as_array()
+            .expect("list GET must carry a `parameters` array");
+
+        let sort = params.iter()
+            .find(|p| p["name"] == "sort")
+            .expect("sort parameter must be present on list GET");
+        assert_eq!(sort["in"], "query");
+        let sort_enum = sort["schema"]["enum"].as_array()
+            .expect("sort schema must be an enum of RMAP columns");
+        // Organization's RMAP table always has at least the `id`
+        // column (entity key) — stronger assertions live in the
+        // richer fixtures; here we just pin the contract.
+        assert!(sort_enum.iter().any(|v| v == "id"),
+            "sort enum must include the primary-key column; got {:?}", sort_enum);
+
+        let order = params.iter()
+            .find(|p| p["name"] == "order")
+            .expect("order parameter must be present on list GET");
+        let order_enum = order["schema"]["enum"].as_array()
+            .expect("order must enumerate direction values");
+        assert_eq!(order_enum.len(), 2);
+        assert!(order_enum.iter().any(|v| v == "asc"));
+        assert!(order_enum.iter().any(|v| v == "desc"));
     }
 
     #[test]
