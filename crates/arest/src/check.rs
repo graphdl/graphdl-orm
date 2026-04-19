@@ -460,6 +460,52 @@ mod tests {
         assert!(resolve_warnings[0].message.contains("antecedent"));
     }
 
+    /// #274 Category A — unary derived FT (one role + predicate + `*`/`+`
+    /// marker) used as an antecedent in another rule. Before this fix the
+    /// resolver required binary-or-higher fact types and rejected unary
+    /// synthetics, so 18+ rules in auto.dev plus dozens in eu-law/us-law
+    /// fired false "unresolved antecedent" warnings.
+    #[test]
+    fn category_a_unary_derived_factype_as_antecedent() {
+        let input = "Fetcher(.Name) is an entity type.\n\
+                     ## Fact Types\n\
+                     Fetcher has Speed.\n\
+                     Fetcher is proxy-based. +\n\
+                     ## Derivation Rules\n\
+                     + Fetcher has Speed if Fetcher is proxy-based.";
+        let diags = check_readings(input);
+        let unresolved: Vec<_> = diags.iter()
+            .filter(|d| d.source == Source::Resolve && d.level == Level::Warning)
+            .filter(|d| d.message.contains("is proxy-based"))
+            .collect();
+        assert!(unresolved.is_empty(),
+            "`Fetcher is proxy-based` (unary FT with `+` marker) must resolve as antecedent. Full diags: {:#?}", diags);
+    }
+
+    /// #274 Category A — unary derivation-rule consequent (no separate FT
+    /// declaration, the rule itself introduces the unary) used as an
+    /// antecedent in another rule. Mirrors the `Customer is eligible for
+    /// trial` pattern in website.md.
+    #[test]
+    fn category_a_unary_rule_consequent_as_antecedent() {
+        let input = "Customer(.Id) is an entity type.\n\
+                     Plan(.Name) is an entity type.\n\
+                     Invoice(.Id) is an entity type.\n\
+                     ## Fact Types\n\
+                     Customer has Plan.\n\
+                     Customer receives Invoice.\n\
+                     ## Derivation Rules\n\
+                     Customer is eligible for trial if Customer has Plan 'Free'.\n\
+                     Customer receives Invoice if Customer is eligible for trial.";
+        let diags = check_readings(input);
+        let unresolved: Vec<_> = diags.iter()
+            .filter(|d| d.source == Source::Resolve && d.level == Level::Warning)
+            .filter(|d| d.message.contains("is eligible for trial"))
+            .collect();
+        assert!(unresolved.is_empty(),
+            "`Customer is eligible for trial` (unary rule consequent) must resolve as antecedent. Full diags: {:#?}", diags);
+    }
+
     #[test]
     fn non_ascii_atom_id_warns() {
         let input = "City(.Name) is an entity type.\n## Instance Facts\nCity 'café' has Population '100'.";
