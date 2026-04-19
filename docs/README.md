@@ -14,5 +14,7 @@ Read them in order if you are new. If you are looking up a particular topic, jum
 8. [Federation](08-federation.md): external systems, credentials, and populate functions.
 9. [MCP Verbs](09-mcp-verbs.md): the v1.0 tool surface.
 10. [Self-Modification](10-self-modification.md): `compile`, `propose`, and the Domain Change workflow.
+11. [Runtime Portability](11-portability.md): per-primitive target map across Cloudflare / CLI / kernel / WASM / FPGA.
+12. [Physical Mapping](12-physical-mapping.md): one Durable Object per cell, the canonical form of Definition 2.
 
 For a quick start, see the [top-level README](https://github.com/graphdl/arest#readme). For the formal foundations, the [whitepaper](https://github.com/graphdl/arest/blob/main/AREST.pdf) presents the five theorems and their proofs.
