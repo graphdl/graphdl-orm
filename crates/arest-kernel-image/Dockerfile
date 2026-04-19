@@ -16,9 +16,14 @@
 
 FROM rust:latest AS builder
 
-# Install nightly + components the kernel and image-builder need
+# Install nightly + components the kernel and image-builder need.
+# `llvm-tools-preview` provides the llvm-objcopy / llvm-ar binaries
+# that bootloader 0.11's build.rs expects when splicing BIOS stages
+# with the kernel ELF — without it the build panics on
+# "failed to get llvm tools: NotFound".
 RUN rustup toolchain install nightly --profile minimal \
     && rustup component add rust-src --toolchain nightly \
+    && rustup component add llvm-tools-preview --toolchain nightly \
     && rustup target add x86_64-unknown-none --toolchain nightly
 
 WORKDIR /build
