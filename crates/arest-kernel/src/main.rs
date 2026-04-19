@@ -36,6 +36,7 @@ mod memory;
 mod net;
 mod repl;
 mod serial;
+mod system;
 mod virtio;
 
 use alloc::string::ToString;
@@ -56,7 +57,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             .expect("bootloader did not supply physical_memory_offset"),
     );
     net::init();
-    net::register_http(80, placeholder_http_handler);
+    system::init();
+    net::register_http(80, arest_http_handler);
 
     // Collect memory stats for the banner.
     let frame_count = memory::usable_frame_count();
@@ -106,18 +108,16 @@ fn halt_forever() -> ! {
     }
 }
 
-/// Placeholder HTTP handler until #265 wires route dispatch through
-/// to `arest::system_impl`. Echoes `METHOD path` so a curl against
-/// the QEMU port-forward confirms request parsing works end to end.
-fn placeholder_http_handler(req: &http::Request) -> http::Response {
-    use alloc::string::String;
-    let mut body = String::with_capacity(32 + req.method.len() + req.path.len());
-    body.push_str("AREST ");
-    body.push_str(&req.method);
-    body.push(' ');
-    body.push_str(&req.path);
-    body.push('\n');
-    http::Response::ok("text/plain", body.into_bytes())
+/// HTTP handler that routes each request through the baked SYSTEM
+/// (#265). `system::dispatch` maps the path to a def name, looks up
+/// the Func via FetchOrPhi, and ρ-applies it against the baked
+/// state D. When no def matches the path, the handler returns a
+/// plaintext 404 so curl still gets a human-readable answer.
+fn arest_http_handler(req: &http::Request) -> http::Response {
+    match system::dispatch(&req.method, &req.path, &req.body) {
+        Some(body) => http::Response::ok("text/plain; charset=utf-8", body),
+        None => http::Response::not_found(),
+    }
 }
 
 #[panic_handler]

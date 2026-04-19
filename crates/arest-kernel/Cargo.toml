@@ -87,6 +87,12 @@ smoltcp = { version = "0.12", default-features = false, features = [
 # boot once QEMU is launched with `-device virtio-net-pci,...`
 # (tracked under #267).
 virtio-drivers = "0.11"
+# AREST engine — linked in `no_std` mode (default-features off,
+# `no_std` feature on). Gives the kernel `ast::Object`, `ast::Func`,
+# `ast::apply` and `freeze::thaw` so the HTTP handler (#265) can
+# dispatch through the same ρ-application the worker uses, without
+# pulling in the std-only compile / command / parse modules.
+arest = { path = "../arest", default-features = false, features = ["no_std"] }
 
 [profile.dev]
 panic = "abort"
