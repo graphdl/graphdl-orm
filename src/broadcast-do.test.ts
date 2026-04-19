@@ -11,8 +11,9 @@ import {
   type CellEvent,
   type SubscriptionFilter,
 } from './broadcast-do'
+import { cellKey } from './api/cell-key'
 
-function makeEvent(partial: Partial<CellEvent> = {}): Omit<CellEvent, 'sequence'> {
+function makeEvent(partial: Partial<CellEvent> = {}): Omit<CellEvent, 'sequence' | 'cellKey'> {
   return {
     domain: 'organizations',
     noun: 'Organization',
@@ -20,6 +21,16 @@ function makeEvent(partial: Partial<CellEvent> = {}): Omit<CellEvent, 'sequence'
     operation: 'create',
     facts: {},
     timestamp: 0,
+    ...partial,
+  }
+}
+
+function makeFullEvent(partial: Partial<CellEvent> = {}): CellEvent {
+  const base = makeEvent(partial)
+  return {
+    ...base,
+    sequence: 0,
+    cellKey: cellKey(base.noun, base.entityId),
     ...partial,
   }
 }
@@ -58,7 +69,7 @@ describe('BroadcastDO registry', () => {
   })
 
   describe('matches — filter semantics', () => {
-    const evt: CellEvent = { ...makeEvent(), sequence: 0 }
+    const evt: CellEvent = makeFullEvent()
 
     it('matches when every declared field matches', () => {
       expect(matches({ domain: 'organizations' }, evt)).toBe(true)
@@ -77,10 +88,69 @@ describe('BroadcastDO registry', () => {
     })
 
     it('treats omitted fields as wildcards', () => {
-      const usersEvt: CellEvent = { ...makeEvent({ noun: 'User' }), sequence: 0 }
+      const usersEvt: CellEvent = makeFullEvent({ noun: 'User' })
       // Subscriber omitted noun → matches events for ANY noun in the domain
       expect(matches({ domain: 'organizations' }, evt)).toBe(true)
       expect(matches({ domain: 'organizations' }, usersEvt)).toBe(true)
+    })
+
+    describe('#220 per-cell demux via cellKey', () => {
+      const orgEvt = makeFullEvent({ noun: 'Organization', entityId: 'org-1' })
+      const userEvt = makeFullEvent({ noun: 'User', entityId: 'org-1' })
+
+      it('cellKey filter matches the exact cell only', () => {
+        // Paper Eq. 11: E_n = Filter(eq ∘ [RMAP, n̄]) : E — one cell
+        // is one DO's stream. Filter selects exactly n̄.
+        const filter: SubscriptionFilter = {
+          domain: 'organizations',
+          cellKey: 'Organization:org-1',
+        }
+        expect(matches(filter, orgEvt)).toBe(true)
+        // Same entityId but different noun → different cell → miss
+        expect(matches(filter, userEvt)).toBe(false)
+      })
+
+      it('cellKey mismatch rejects even when noun/entityId would match', () => {
+        // A filter explicitly pinned to one cellKey ignores the
+        // historical noun/entityId axis — the cellKey IS the cell.
+        const filter: SubscriptionFilter = {
+          domain: 'organizations',
+          noun: 'Organization',
+          entityId: 'org-1',
+          cellKey: 'Organization:other-org',
+        }
+        expect(matches(filter, orgEvt)).toBe(false)
+      })
+
+      it('publish assigns cellKey computed from noun + entityId', () => {
+        const reg = createRegistry()
+        const emitted = publish(reg, makeEvent({ noun: 'Order', entityId: 'ord-7' }))
+        expect(emitted.cellKey).toBe('Order:ord-7')
+      })
+
+      it('demux via cellKey subscription sees exactly one cell\'s events', () => {
+        // Two concurrent writers touching different cells must reach
+        // disjoint subscribers — paper Definition 2 (Cell Isolation)
+        // in the signal-delivery plane.
+        const reg = createRegistry()
+        const received: string[] = []
+        subscribe(reg, {
+          domain: 'organizations',
+          cellKey: 'Organization:org-1',
+        }, e => received.push(`demux:${e.cellKey}:${e.sequence}`))
+
+        publish(reg, makeEvent({ noun: 'Organization', entityId: 'org-1' }))
+        publish(reg, makeEvent({ noun: 'Organization', entityId: 'org-2' }))
+        publish(reg, makeEvent({ noun: 'User', entityId: 'org-1' }))
+        publish(reg, makeEvent({ noun: 'Organization', entityId: 'org-1' }))
+
+        // Only two events should have reached the subscriber — the
+        // two writes to the exact cell Organization:org-1.
+        expect(received).toEqual([
+          'demux:Organization:org-1:0',
+          'demux:Organization:org-1:3',
+        ])
+      })
     })
   })
 
@@ -297,7 +367,7 @@ describe('BroadcastDO registry', () => {
 
   describe('formatSseFrame', () => {
     it('emits a single data frame with trailing blank line per SSE spec', () => {
-      const evt: CellEvent = { ...makeEvent(), sequence: 7 }
+      const evt: CellEvent = makeFullEvent({ sequence: 7 })
       const frame = formatSseFrame(evt)
       expect(frame.startsWith('data: ')).toBe(true)
       expect(frame.endsWith('\n\n')).toBe(true)
@@ -307,7 +377,7 @@ describe('BroadcastDO registry', () => {
     })
 
     it('encodes the CellEvent as JSON in the data field', () => {
-      const evt: CellEvent = { ...makeEvent({ entityId: 'sherlock' }), sequence: 2 }
+      const evt: CellEvent = makeFullEvent({ entityId: 'sherlock', sequence: 2 })
       const frame = formatSseFrame(evt)
       const jsonPart = frame.replace(/^data: /, '').replace(/\n\n$/, '')
       const parsed = JSON.parse(jsonPart)
