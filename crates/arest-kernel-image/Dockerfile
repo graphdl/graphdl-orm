@@ -26,10 +26,19 @@ WORKDIR /build
 # Copy kernel crate
 COPY crates/arest-kernel/Cargo.toml crates/arest-kernel/Cargo.toml
 COPY crates/arest-kernel/src/ crates/arest-kernel/src/
+COPY crates/arest-kernel/rust-toolchain.toml crates/arest-kernel/rust-toolchain.toml
+
+# Copy arest engine crate — the kernel links it in no_std mode (#265)
+# so the Docker build needs the sources plus every reading the
+# metamodel include_str! pulls in.
+COPY crates/arest/Cargo.toml crates/arest/Cargo.toml
+COPY crates/arest/src/ crates/arest/src/
+COPY readings/ readings/
 
 # Copy image-builder crate
 COPY crates/arest-kernel-image/Cargo.toml crates/arest-kernel-image/Cargo.toml
 COPY crates/arest-kernel-image/src/ crates/arest-kernel-image/src/
+COPY crates/arest-kernel-image/rust-toolchain.toml crates/arest-kernel-image/rust-toolchain.toml
 
 # Build kernel ELF (nightly, bare-metal target)
 RUN cd crates/arest-kernel \
@@ -53,11 +62,29 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /build/arest-kernel.bios.img /kernel.img
 
-# Boot the image. -display none = headless, -serial stdio = banner to
-# stdout, -no-reboot = exit on triple-fault instead of looping.
-# timeout 10s catches infinite hlt loops so `docker run` always exits.
-CMD ["timeout", "10", "qemu-system-x86_64", \
+# Expose container port 8080 so `docker run -p 8080:8080` forwards
+# host:8080 → container:8080 → QEMU's hostfwd → guest-kernel:80.
+EXPOSE 8080
+
+# Boot the image under QEMU:
+#   -display none    headless
+#   -serial stdio    banner to stdout
+#   -no-reboot       exit on triple-fault instead of looping
+#   -netdev user,id=net0,hostfwd=tcp::8080-:80
+#                    SLiRP user-mode NAT — forwards container-local
+#                    8080 into guest's :80 where smoltcp's HTTP
+#                    listener lives (#264).
+#   -device virtio-net-pci,netdev=net0
+#                    attach the guest NIC as modern-virtio so the
+#                    arest-kernel PCI scan (#262) finds it at boot.
+# timeout is deliberately omitted in this CMD — the kernel stays
+# resident so `curl localhost:8080` from the host hits the HTTP
+# server. For headless-CI runs use `boot-kernel.ps1 --smoke` which
+# wraps this CMD in a timeout and asserts on banner lines.
+CMD ["qemu-system-x86_64", \
      "-drive", "format=raw,file=/kernel.img", \
      "-serial", "stdio", \
      "-display", "none", \
-     "-no-reboot", "-no-shutdown"]
+     "-no-reboot", "-no-shutdown", \
+     "-netdev", "user,id=net0,hostfwd=tcp::8080-:80", \
+     "-device", "virtio-net-pci,netdev=net0"]
