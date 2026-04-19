@@ -33,8 +33,6 @@ struct ParseCtx {
     #[cfg_attr(feature = "std-deps", serde(default))]
     general_instance_facts: Vec<GeneralInstanceFact>,
     #[cfg_attr(feature = "std-deps", serde(default))]
-    subtypes: HashMap<String, String>,
-    #[cfg_attr(feature = "std-deps", serde(default))]
     enum_values: HashMap<String, Vec<String>>,
     /// Object cells produced by apply_action. This IS the parse output;
     /// the typed fields above are parse-time lookup caches.
@@ -1041,7 +1039,7 @@ fn parse_markdown_with_context(input: &str, existing_nouns: &HashMap<String, Nou
         nouns: HashMap::new(), fact_types: HashMap::new(),
         constraints: vec![], derivation_rules: vec![],
         general_instance_facts: vec![],
-        subtypes: HashMap::new(), enum_values: HashMap::new(),
+        enum_values: HashMap::new(),
         cells: HashMap::new(),
     };
     parse_into(&mut standalone, input)?;
@@ -1060,7 +1058,7 @@ fn parse_markdown_with_context(input: &str, existing_nouns: &HashMap<String, Nou
         nouns: existing_nouns.clone(), fact_types: existing_fact_types.clone(),
         constraints: vec![], derivation_rules: vec![],
         general_instance_facts: vec![],
-        subtypes: HashMap::new(), enum_values: HashMap::new(),
+        enum_values: HashMap::new(),
         cells: HashMap::new(),
     };
     parse_into(&mut ir, input)?;
@@ -1277,7 +1275,7 @@ fn ctx_to_state(d: &ParseCtx) -> crate::ast::Object {
                 ("name".into(), name.clone()), ("objectType".into(), def.object_type.clone()),
                 ("worldAssumption".into(), wa.into()),
             ];
-            d.subtypes.get(name).map(|st| pairs.push(("superType".into(), st.clone())));
+            supertype_of(&d.cells, name).map(|st| pairs.push(("superType".into(), st)));
             let ref_scheme = ref_scheme_for_noun(&d.cells, name)
                 .or_else(|| (def.object_type == "entity").then(|| vec!["id".into()]));
             ref_scheme.as_ref().map(|rs| pairs.push(("referenceScheme".into(), rs.join(","))));
@@ -1416,7 +1414,7 @@ fn parse_markdown(input: &str) -> Result<ParseCtx, String> {
         nouns: HashMap::new(), fact_types: HashMap::new(),
         constraints: vec![], derivation_rules: vec![],
         general_instance_facts: vec![],
-        subtypes: HashMap::new(), enum_values: HashMap::new(),
+        enum_values: HashMap::new(),
         cells: HashMap::new(),
     };
     parse_into(&mut ir, input)?;
@@ -1793,7 +1791,7 @@ fn parse_into(ir: &mut ParseCtx, input: &str) -> Result<(), String> {
                 ("objectType".into(), def.object_type.clone()),
                 ("worldAssumption".into(), wa.into()),
             ];
-            ir.subtypes.get(name).map(|st| pairs.push(("superType".into(), st.clone())));
+            supertype_of(&ir.cells, name).map(|st| pairs.push(("superType".into(), st)));
             let ref_scheme = ref_scheme_for_noun(&ir.cells, name)
                 .or_else(|| (def.object_type == "entity").then(|| vec!["id".into()]));
             ref_scheme.as_ref().map(|rs| pairs.push(("referenceScheme".into(), rs.join(","))));
@@ -1911,9 +1909,8 @@ fn parse_into(ir: &mut ParseCtx, input: &str) -> Result<(), String> {
 
     // Strict mode: reject undeclared nouns (subtype children, fact type roles).
     if is_strict_mode() {
-        let undeclared: Vec<String> = ir.subtypes.keys()
-            .filter(|sub| !ir.nouns.contains_key(*sub))
-            .cloned()
+        let undeclared: Vec<String> = all_subtype_names(&ir.cells).into_iter()
+            .filter(|sub| !ir.nouns.contains_key(sub))
             .chain(ir.fact_types.values()
                 .flat_map(|ft| ft.roles.iter().map(|r| r.noun_name.clone()))
                 .filter(|n| !ir.nouns.contains_key(n)))
@@ -2559,6 +2556,45 @@ fn ref_scheme_for_noun(
         })
 }
 
+/// #283 — Supertype lookup for a subtype noun via the `Subtype` cell.
+/// Replaces `ir.subtypes.get(name)`.
+fn supertype_of(
+    cells: &HashMap<String, Vec<crate::ast::Object>>,
+    subtype: &str,
+) -> Option<String> {
+    cells.get("Subtype")?
+        .iter()
+        .find(|f| crate::ast::binding(f, "subtype") == Some(subtype))
+        .and_then(|f| crate::ast::binding(f, "supertype").map(String::from))
+}
+
+/// #283 — Every subtype noun name present in the `Subtype` cell.
+/// Replaces `ir.subtypes.keys()`.
+fn all_subtype_names(
+    cells: &HashMap<String, Vec<crate::ast::Object>>,
+) -> Vec<String> {
+    cells.get("Subtype")
+        .map(|facts| facts.iter()
+            .filter_map(|f| crate::ast::binding(f, "subtype").map(String::from))
+            .collect())
+        .unwrap_or_default()
+}
+
+/// #283 — Upsert a (subtype, supertype) pair on the `Subtype` cell.
+/// Removes any prior fact for `subtype` before pushing the new one.
+fn upsert_subtype(
+    ir: &mut ParseCtx,
+    subtype: &str,
+    supertype: &str,
+) {
+    if let Some(facts) = ir.cells.get_mut("Subtype") {
+        facts.retain(|f| crate::ast::binding(f, "subtype") != Some(subtype));
+    }
+    push_cell(ir, "Subtype", crate::ast::fact_from_pairs(&[
+        ("subtype", subtype), ("supertype", supertype),
+    ]));
+}
+
 /// #283 — Iterate every (noun, ref-scheme) pair from the `RefScheme`
 /// cell. Replaces `ir.ref_schemes.iter()` and `d.ref_schemes.iter()`.
 fn all_ref_schemes(
@@ -2630,7 +2666,8 @@ fn apply_action(ir: &mut ParseCtx, action: Option<ParseAction>, lines: &[String]
             (def.object_type == "abstract")
                 .then(|| entry.object_type = "abstract".into());
             // Populate IR maps from metadata
-            meta.super_type.into_iter().for_each(|st| { ir.subtypes.insert(name.clone(), st); });
+            // #283 — Subtype cell write (upsert semantics).
+            meta.super_type.into_iter().for_each(|st| { upsert_subtype(ir, &name, &st); });
             // #283 — RefScheme cell write. or_insert semantics preserved
             // by checking existing cells first; first noun declaration
             // wins (metamodel guard handles legitimate redeclaration).
@@ -2670,7 +2707,7 @@ fn apply_action(ir: &mut ParseCtx, action: Option<ParseAction>, lines: &[String]
                     });
                     None::<()>
                 });
-                ir.subtypes.insert(sub, sup.clone());
+                upsert_subtype(ir, &sub, &sup);
             });
         }
         ParseAction::AddFactType(id, def, mode) => {
@@ -3385,7 +3422,11 @@ mod tests {
     #[test]
     fn subtypes() {
         let ir = parse_markdown("Request(.id) is an entity type.\nSupport Request is a subtype of Request.").unwrap();
-        assert_eq!(ir.subtypes["Support Request"], "Request");
+        // #283 — subtype relationships live in the Subtype cell.
+        assert_eq!(
+            super::supertype_of(&ir.cells, "Support Request"),
+            Some("Request".to_string())
+        );
     }
 
     #[test]
@@ -3398,7 +3439,10 @@ mod tests {
     fn partition_implies_abstract() {
         let ir = parse_markdown("Request(.id) is an entity type.\nRequest is partitioned into Support Request, Feature Request.").unwrap();
         assert_eq!(ir.nouns["Request"].object_type, "abstract");
-        assert_eq!(ir.subtypes["Support Request"], "Request");
+        assert_eq!(
+            super::supertype_of(&ir.cells, "Support Request"),
+            Some("Request".to_string())
+        );
     }
 
     #[test]
