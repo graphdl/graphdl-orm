@@ -34,6 +34,7 @@ mod http;
 mod interrupts;
 mod memory;
 mod net;
+mod pci;
 mod repl;
 mod serial;
 mod system;
@@ -60,6 +61,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     system::init();
     net::register_http(80, arest_http_handler);
 
+    // PCI scan for virtio-net (#262). First half: discover the
+    // device. Driver instantiation (PciTransport → VirtIONet →
+    // smoltcp::phy::Device) lands in a follow-up; for now the scan
+    // result is banner-visible so the QEMU bring-up confirms the
+    // device the virtio-drivers crate will pick up.
+    let virtio_net = pci::find_virtio_net();
+
     // Collect memory stats for the banner.
     let frame_count = memory::usable_frame_count();
     let usable_mib  = (frame_count * 4096) / (1024 * 1024);
@@ -72,6 +80,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     println!("  pic:    remapped to 32+, keyboard (IRQ 1) unmasked");
     println!("  memory: {usable_mib} MiB usable RAM ({frame_count} x 4 KiB frames) (#180)");
     println!("  net:    smoltcp loopback 127.0.0.1/8 (#261 — virtio-net in #262)");
+    match virtio_net {
+        Some(dev) => println!(
+            "  pci:    virtio-net found at {:02x}:{:02x}.{} (vendor={:#06x} device={:#06x}, BAR0={:#010x})",
+            dev.bus, dev.device, dev.function, dev.vendor_id, dev.device_id, dev.bars[0],
+        ),
+        None => println!("  pci:    no virtio-net device found on legacy PCI bus (loopback only)"),
+    }
     println!("  http:   listening on :80 (#264)");
 
     // Prove the allocator works — allocate a String and echo it.
