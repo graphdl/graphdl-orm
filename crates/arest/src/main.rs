@@ -14,6 +14,28 @@
 // Everything goes through SYSTEM. No separate bootstrap, synthesize,
 // or forward-chain commands. Per AREST paper: SYSTEM:x = ⟨o, D'⟩.
 
+// Several modules include `use alloc::{...}` imports and
+// `crate::sync` / `diag!` references that assume the lib's crate
+// root set them up. The bin (std-only) compiles the same source
+// files via `mod <name>;` declarations below, so we re-install the
+// three missing pieces here so those references resolve. Without
+// this the bin fails with hundreds of E0433 / macro-not-found
+// errors.
+#[macro_use]
+extern crate alloc;
+
+#[allow(dead_code)]
+mod sync;
+
+/// Local `diag!` for the bin target. Forwards to `eprintln!` exactly
+/// like the lib's copy; kept local so we don't need to `use arest::*`
+/// (the bin re-declares each module via `mod <name>;` and can't also
+/// import the lib under the same crate name).
+#[allow(unused_macros)]
+macro_rules! diag {
+    ($($arg:tt)*) => { eprintln!($($arg)*) }
+}
+
 #[allow(dead_code)]
 mod ast;
 #[allow(dead_code)]
