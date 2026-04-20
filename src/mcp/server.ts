@@ -134,97 +134,16 @@ async function systemCall(key: string, input: string): Promise<string> {
 }
 
 // ── Data Federation: fetch from external systems via populate:{noun} ──
+//
+// Fetch + Citation-provenance live in ./federation. server.ts only
+// resolves the populate:{noun} def from the engine (getFederationConfig)
+// and delegates the actual ρ(populate_n) application to that module.
 
-interface FederationConfig {
-  system: string
-  url: string
-  uri: string
-  header: string
-  prefix: string
-  noun: string
-  fields: string[]
-}
-
-/** Parse a populate:{noun} def from the engine into a FederationConfig. */
-function parseFederationConfig(raw: string): FederationConfig | null {
-  try {
-    // The def is an Object sequence of pairs: <<key, value>, ...>
-    // Parse the simple pattern: <key, value> pairs
-    const config: Record<string, string | string[]> = {}
-    const pairRe = /<([^,<>]+),\s*([^<>]*?)>/g
-    let match
-    while ((match = pairRe.exec(raw)) !== null) {
-      const [, key, value] = match
-      config[key.trim()] = value.trim()
-    }
-    // Fields is a nested sequence — extract from the raw string
-    const fieldsMatch = raw.match(/fields,\s*<([^>]*)>/)
-    const fields = fieldsMatch
-      ? fieldsMatch[1].split(',').map(s => s.trim().replace(/^'|'$/g, ''))
-      : []
-    return {
-      system: String(config['system'] || ''),
-      url: String(config['url'] || ''),
-      uri: String(config['uri'] || ''),
-      header: String(config['header'] || ''),
-      prefix: String(config['prefix'] || ''),
-      noun: String(config['noun'] || ''),
-      fields,
-    }
-  } catch {
-    return null
-  }
-}
-
-/** Fetch facts from an external system using a populate config. */
-async function federatedFetch(config: FederationConfig, entityId?: string): Promise<any> {
-  const baseUrl = config.url.replace(/\/$/, '')
-  const path = config.uri.replace(/^\//, '')
-  const url = entityId
-    ? `${baseUrl}/${path}/${encodeURIComponent(entityId)}`
-    : `${baseUrl}/${path}`
-
-  const headers: Record<string, string> = {
-    'Accept': 'application/json',
-  }
-
-  // Inject auth from env: AREST_SECRET_{SYSTEM_NAME} (uppercase, underscored)
-  const envKey = `AREST_SECRET_${config.system.replace(/[^a-zA-Z0-9]/g, '_').toUpperCase()}`
-  const secret = process.env[envKey] || ''
-  if (config.header && secret) {
-    const value = config.prefix ? `${config.prefix} ${secret}` : secret
-    headers[config.header] = value
-  }
-
-  const res = await fetch(url, { headers })
-  if (!res.ok) {
-    return { error: `${res.status} ${res.statusText}`, url, system: config.system }
-  }
-  const json = await res.json() as any
-
-  // Map JSON response to facts using field names from the config.
-  // The response is either an object (single entity) or array (list).
-  const items = Array.isArray(json.data) ? json.data : Array.isArray(json) ? json : [json]
-  return {
-    system: config.system,
-    noun: config.noun,
-    count: items.length,
-    facts: items.map((item: any) => {
-      const bindings: Record<string, string> = {}
-      // Map each field to a role binding
-      config.fields.forEach(field => {
-        const snakeField = field.toLowerCase().replace(/ /g, '_')
-        // Try exact match, then snake_case, then camelCase
-        const val = item[field] ?? item[snakeField] ?? item[field.replace(/ /g, '')]
-        if (val !== undefined) bindings[field] = String(val)
-      })
-      // Include the entity ID
-      if (item.id) bindings[config.noun] = String(item.id)
-      return bindings
-    }),
-    _meta: { url, worldAssumption: 'OWA' },
-  }
-}
+import {
+  federatedFetch,
+  parseFederationConfig,
+  type FederationConfig,
+} from './federation'
 
 /** Check if a noun has a populate def and return its config. */
 async function getFederationConfig(noun: string): Promise<FederationConfig | null> {
