@@ -59,10 +59,22 @@ pub fn tokenize_statement(statement_id: &str, text: &str, nouns: &[String]) -> C
 
     // 4. Head Noun + Verb derivation from role refs.
     let head_noun = role_refs.first().map(|r| r.noun.clone());
-    let verb = extract_verb(body, &role_refs);
+    let mut verb = extract_verb(body, &role_refs);
 
     // 5. Trailing Marker.
     let trailing_marker = extract_trailing_marker(body, &role_refs);
+
+    // 6. Enum Values leading-phrase override.
+    //    `The possible values of <Noun> are '<v1>', '<v2>', ...`
+    //    does not fit the "verb between roles" shape — the signalling
+    //    phrase sits BEFORE the noun. Detect and override Verb so the
+    //    grammar's Enum Values Declaration recognizer (keyed on Verb
+    //    = 'the possible values of') fires. Captured values land as
+    //    `Statement has Enum Value '<v>'` repeated tokens.
+    let enum_values = extract_enum_values(body);
+    if enum_values.is_some() {
+        verb = Some("the possible values of".to_string());
+    }
 
     // --- Statement cell ---
     push(&mut cells, "Statement", fact_from_pairs(&[
@@ -119,6 +131,14 @@ pub fn tokenize_statement(statement_id: &str, text: &str, nouns: &[String]) -> C
         if body.contains(needle.as_str()) {
             push(&mut cells, "Statement_has_Keyword", fact_from_pairs(&[
                 ("Statement", statement_id), ("Keyword", kw),
+            ]));
+        }
+    }
+    // Enum values list — one token fact per value.
+    if let Some(values) = enum_values.as_ref() {
+        for v in values {
+            push(&mut cells, "Statement_has_Enum_Value", fact_from_pairs(&[
+                ("Statement", statement_id), ("Enum_Value", v.as_str()),
             ]));
         }
     }
@@ -326,6 +346,26 @@ const TRAILING_MARKERS: &[&str] = &[
     "is a subtype of",
 ];
 
+/// Parse the enum-values leading phrase.
+///
+/// `The possible values of <Noun> are '<v1>', '<v2>', ...`
+/// returns `Some(["v1", "v2", ...])`. `None` if the text does not
+/// open with the phrase or if no `are` clause follows. Recognised
+/// only when the sentence opens with the literal prefix so ordinary
+/// fact type readings can't be mistaken for enum declarations.
+fn extract_enum_values(body: &str) -> Option<Vec<String>> {
+    const PREFIX: &str = "The possible values of ";
+    let rest = body.strip_prefix(PREFIX)?;
+    let (_noun_part, tail) = rest.split_once(" are ")?;
+    let values: Vec<String> = tail.split(',')
+        .filter_map(|chunk| chunk.trim()
+            .strip_prefix('\'')
+            .and_then(|s| s.strip_suffix('\''))
+            .map(String::from))
+        .collect();
+    (!values.is_empty()).then_some(values)
+}
+
 fn extract_trailing_marker(text: &str, refs: &[RoleRef]) -> Option<String> {
     // Look only past the last noun match (including any trailing
     // literal). That keeps "is a value type" from matching inside
@@ -459,5 +499,29 @@ mod tests {
                    Some("Support Request"));
         assert_eq!(stmt_binding(&c, "Statement_has_Verb", "Verb").as_deref(),
                    Some("is a subtype of"));
+    }
+
+    #[test]
+    fn enum_values_declaration_sets_verb_and_emits_values() {
+        // Stage-1 recognises `The possible values of <Noun> are
+        // '<v1>', '<v2>', ...` so the grammar's Enum Values Declaration
+        // rule (keyed on Verb = 'the possible values of') can fire.
+        // Each quoted literal lands as a separate Statement has Enum
+        // Value token so the translator can read them as a list.
+        let c = tokenize_statement(
+            "s1",
+            "The possible values of Priority are 'low', 'medium', 'high'.",
+            &nouns(&["Priority"]),
+        );
+        assert_eq!(stmt_binding(&c, "Statement_has_Head_Noun", "Head_Noun").as_deref(),
+                   Some("Priority"));
+        assert_eq!(stmt_binding(&c, "Statement_has_Verb", "Verb").as_deref(),
+                   Some("the possible values of"));
+        let vals: Vec<String> = c.get("Statement_has_Enum_Value")
+            .map(|facts| facts.iter()
+                .filter_map(|f| binding(f, "Enum_Value").map(String::from))
+                .collect())
+            .unwrap_or_default();
+        assert_eq!(vals, vec!["low", "medium", "high"]);
     }
 }

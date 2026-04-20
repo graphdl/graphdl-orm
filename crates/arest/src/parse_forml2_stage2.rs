@@ -360,6 +360,50 @@ pub fn translate_derivation_rules(classified_state: &Object) -> Vec<Object> {
     out
 }
 
+/// Translate `Enum Values Declaration` classifications into
+/// `EnumValues` cell facts. Each statement contributes one fact with
+/// `noun` bound to the Head Noun and one `value0`, `value1`, …
+/// binding per captured enum value (same shape as
+/// `enum_values_for_noun` expects — see parse_forml2::upsert_enum_values).
+///
+/// The Value Type `Noun` fact is still emitted by `translate_nouns`
+/// from the preceding `Priority is a value type.` statement — this
+/// translator only contributes the value list.
+#[cfg(feature = "std-deps")]
+pub fn translate_enum_values(classified_state: &Object) -> Vec<Object> {
+    let statement_ids = collect_statement_ids(classified_state);
+    let mut out: Vec<Object> = Vec::new();
+    for stmt_id in &statement_ids {
+        let classifications = classifications_for(classified_state, stmt_id);
+        if !classifications.iter().any(|k| k == "Enum Values Declaration") {
+            continue;
+        }
+        let Some(noun) = head_noun_for(classified_state, stmt_id) else { continue };
+        let values = enum_values_for(classified_state, stmt_id);
+        if values.is_empty() { continue; }
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        pairs.push(("noun".to_string(), noun));
+        for (i, v) in values.iter().enumerate() {
+            pairs.push((alloc::format!("value{i}"), v.clone()));
+        }
+        let pairs_ref: Vec<(&str, &str)> = pairs.iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        out.push(fact_from_pairs(&pairs_ref));
+    }
+    out
+}
+
+fn enum_values_for(state: &Object, stmt_id: &str) -> Vec<String> {
+    fetch_or_phi("Statement_has_Enum_Value", state)
+        .as_seq()
+        .map(|facts| facts.iter()
+            .filter(|f| binding(f, "Statement") == Some(stmt_id))
+            .filter_map(|f| binding(f, "Enum_Value").map(String::from))
+            .collect())
+        .unwrap_or_default()
+}
+
 /// Translate `Deontic Constraint` classifications into `Constraint`
 /// cell facts with modality="deontic" and the stripped deontic
 /// operator. Entity defaults to the Head Noun of the body (after
@@ -836,4 +880,31 @@ mod tests {
         assert_eq!(binding(&constraints[0], "entity"), Some("Support Response"));
     }
 
+    #[test]
+    fn enum_values_declaration_is_classified() {
+        let stmt = stage1_state(
+            "s1",
+            "The possible values of Priority are 'low', 'medium', 'high'.",
+            &["Priority"]);
+        let classified = classify_statements(&stmt, &grammar_state());
+        let kinds = classifications_for(&classified, "s1");
+        assert!(kinds.iter().any(|k| k == "Enum Values Declaration"),
+            "expected Enum Values Declaration; got {:?}", kinds);
+    }
+
+    #[test]
+    fn translate_enum_values_emits_value_list_for_noun() {
+        let stmt = stage1_state(
+            "s1",
+            "The possible values of Priority are 'low', 'medium', 'high'.",
+            &["Priority"]);
+        let classified = classify_statements(&stmt, &grammar_state());
+        let facts = super::translate_enum_values(&classified);
+        assert_eq!(facts.len(), 1);
+        let f = &facts[0];
+        assert_eq!(binding(f, "noun"), Some("Priority"));
+        assert_eq!(binding(f, "value0"), Some("low"));
+        assert_eq!(binding(f, "value1"), Some("medium"));
+        assert_eq!(binding(f, "value2"), Some("high"));
+    }
 }
