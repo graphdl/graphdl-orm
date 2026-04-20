@@ -1122,11 +1122,12 @@ mod tests {
 
         let (_meta_pop, defs, _def_map) = compile_cells(cells);
 
-        // No modus ponens derivation should be compiled
+        // No SS-autofill derivation should be compiled. Rule id is
+        // `_ss_autofill_<constraint_id>` — see compile_derivations.
         let mp_count = defs.iter()
-            .filter(|(n, _)| n.starts_with("derivation:") && n.contains("modus_ponens"))
+            .filter(|(n, _)| n.starts_with("derivation:") && n.contains("ss_autofill"))
             .count();
-        assert_eq!(mp_count, 0, "Should NOT compile modus ponens without autofill");
+        assert_eq!(mp_count, 0, "Should NOT compile SS autofill without subset_autofill marker");
 
         // Forward chain should produce no derived facts
         let state = state_with_facts("ft1", &[&[("Person", "p1")]]);
@@ -1813,12 +1814,16 @@ mod tests {
 
         let (_meta_pop, defs, _def_map) = compile_cells(cells);
 
-        // Verify modus ponens derivation was compiled
+        // Verify SS autofill derivation was compiled. Rule id is
+        // `_ss_autofill_<constraint_id>` — compile_derivations synthesizes
+        // one DerivationRuleDef per SS constraint whose span carries
+        // subset_autofill=true and routes it through the standard
+        // compile_explicit_derivation path, same as any user rule.
         let mp_derivations = defs.iter()
-            .filter(|(n, _)| n.starts_with("derivation:") && n.contains("modus_ponens"))
+            .filter(|(n, _)| n.starts_with("derivation:") && n.contains("ss_autofill"))
             .count();
         assert!(mp_derivations > 0,
-            "Expected a modus ponens derivation from SS constraint");
+            "Expected an SS autofill derivation from SS constraint with subset_autofill");
 
         // Forward chain: p1 hasLicense -> should derive p1 hasInsurance
         let mut pop_state = ast::Object::phi();
@@ -1832,7 +1837,7 @@ mod tests {
             .filter(|d| d.fact_type_id == "ft2")
             .collect();
         assert_eq!(insurance_facts.len(), 1,
-            "Expected modus ponens to derive hasInsurance for p1");
+            "Expected SS autofill to derive hasInsurance for p1");
         assert_eq!(insurance_facts[0].bindings, vec![("Person".to_string(), "p1".to_string())]);
         assert_eq!(insurance_facts[0].confidence, Confidence::Definitive);
     }

@@ -2071,8 +2071,34 @@ fn compile_derivations(data: &CellIndex, sm_defs: &HashMap<String, StateMachineD
     // Implicit: subtype inheritance from noun definitions
     derivations.extend(compile_subtype_inheritance(data));
 
-    // Implicit: modus ponens from subset constraints
-    derivations.extend(compile_modus_ponens(data));
+    // SS auto-fill (#287): each Subset Constraint whose `subset_autofill`
+    // span marker is true materializes a derivation that copies every
+    // antecedent fact into the consequent FT. Emitted as a standard
+    // 1-antecedent DerivationRuleDef routed through
+    // `compile_explicit_derivation`, so the per-firing fanout uses the
+    // same Func shape every user-authored derivation takes. The dedup
+    // the old `compile_modus_ponens` did against the consequent cell is
+    // redundant — `forward_chain_defs_state` already filters facts it's
+    // seen via `state_contains_fact` + `same_fact`.
+    derivations.extend(data.constraints.iter()
+        .filter(|cdef| cdef.kind == "SS" && cdef.spans.len() >= 2)
+        .filter(|cdef| cdef.spans.iter().any(|s| s.subset_autofill == Some(true)))
+        .map(|cdef| {
+            let a_ft_id = cdef.spans[0].fact_type_id.clone();
+            let b_ft_id = cdef.spans[1].fact_type_id.clone();
+            let rule = DerivationRuleDef {
+                id: format!("_ss_autofill_{}", cdef.id),
+                text: format!("SS autofill from {}", cdef.text),
+                antecedent_fact_type_ids: vec![a_ft_id],
+                consequent_cell: crate::types::ConsequentCellSource::Literal(b_ft_id),
+                kind: DerivationKind::ModusPonens,
+                join_on: vec![], match_on: vec![], consequent_bindings: vec![],
+                antecedent_filters: vec![], consequent_computed_bindings: vec![],
+                consequent_aggregates: vec![], unresolved_clauses: vec![],
+                antecedent_role_literals: vec![], consequent_role_literals: vec![],
+            };
+            compile_explicit_derivation(data, &rule)
+        }));
 
     // Implicit: transitivity from shared roles
     derivations.extend(compile_transitivity(data));
@@ -2859,110 +2885,6 @@ fn compile_subtype_inheritance(data: &CellIndex) -> Vec<CompiledDerivation> {
             text: format!("{} is a subtype of {} -- inherits fact types", sub, sup),
             kind: DerivationKind::SubtypeInheritance, func,
         })
-    }).collect()
-}
-
-/// Modus ponens on subset constraints: if A subset B (SS constraint),
-/// when we find an instance in A, derive its presence in B.
-///
-/// Pure AST form would be:
-///   alpha(Condition(Not  .  exists_in_B, construct_B_fact, Constant(phi)))
-///      .  alpha(project_to_B_nouns)
-///      .  find_ft(A)
-/// Blocked on: find_ft requires searching the population Seq by atom ID,
-/// and exists_in_B needs a nested membership check. Both need a fold-based
-/// search primitive (Insert + Condition) not yet ergonomic in the AST.
-fn compile_modus_ponens(data: &CellIndex) -> Vec<CompiledDerivation> {
-    // Î±(ss_constraint â†’ derivation) : Filter(kind=SS âˆ§ spansâ‰¥2) : constraints
-    data.constraints.iter()
-        .filter(|cdef| cdef.kind == "SS" && cdef.spans.len() >= 2)
-        .filter_map(|cdef| {
-
-        // Only derive facts when subset_autofill is explicitly true.
-        // Otherwise the SS constraint is just a constraint (produces violations,
-        // doesn't auto-create facts).
-        let has_autofill = cdef.spans.iter().any(|s| s.subset_autofill == Some(true));
-        has_autofill.then_some(())?;
-
-        let a_ft_id = cdef.spans[0].fact_type_id.clone();
-        let b_ft_id = cdef.spans[1].fact_type_id.clone();
-
-        // Collect role noun names from both fact types for full tuple propagation
-        let b_role_names: Vec<String> = data.fact_types.get(&b_ft_id)
-            .map(|ft| ft.roles.iter().map(|r| r.noun_name.clone()).collect())
-            .unwrap_or_default();
-
-        let b_reading = data.fact_types.get(&b_ft_id)
-            .map(|ft| ft.reading.clone())
-            .unwrap_or_default();
-
-        let id = format!("_modus_ponens_{}", cdef.id);
-        let text = format!("Modus ponens from SS constraint: {}", cdef.text);
-
-        // Pure Func: for each A-fact not in B, derive a B-fact.
-        // Uses same pattern as compile_subset_ast membership check.
-        let a_role_names: Vec<String> = data.fact_types.get(&a_ft_id)
-            .map(|ft| ft.roles.iter().map(|r| r.noun_name.clone()).collect())
-            .unwrap_or_default();
-
-        // Common nouns and their role indices in A and B
-        let common: Vec<(usize, usize)> = a_role_names.iter().enumerate().filter_map(|(ai, n)| {
-            b_role_names.iter().position(|bn| bn == n).map(|bi| (ai, bi))
-        }).collect();
-
-        let a_facts = extract_facts_from_pop(&a_ft_id);
-        let b_facts = extract_facts_from_pop(&b_ft_id);
-
-        // match_pred: <a_fact, b_candidate> -> common noun values all equal
-        let match_pred = if common.is_empty() {
-            Func::constant(Object::t())
-        } else {
-            let eqs: Vec<Func> = common.iter().map(|&(ai, bi)| {
-                Func::compose(Func::Eq, Func::construction(vec![
-                    Func::compose(role_value(ai), Func::Selector(1)),
-                    Func::compose(role_value(bi), Func::Selector(2)),
-                ]))
-            }).collect();
-            if eqs.len() == 1 {
-                eqs.into_iter().next().unwrap()
-            } else {
-                eqs.into_iter().reduce(|acc, eq| {
-                    Func::compose(Func::And, Func::construction(vec![acc, eq]))
-                }).unwrap()
-            }
-        };
-
-        // not_in_b: <a_fact, b_facts> -> T when no b_candidate matches a_fact
-        let not_in_b = Func::compose(
-            Func::NullTest,
-            Func::compose(Func::filter(match_pred), Func::DistL),
-        );
-
-        // derived_fact: <a_fact, b_facts> -> <b_ft_id, b_reading, <bindings>>
-        // Project a_fact's common-noun bindings into B's structure.
-        let b_binding_funcs: Vec<Func> = common.iter()
-            .map(|&(ai, _)| Func::compose(Func::Selector(ai + 1), Func::Selector(1)))
-            .collect();
-        let derived_fact = Func::construction(vec![
-            Func::constant(Object::atom(&b_ft_id)),
-            Func::constant(Object::atom(&b_reading)),
-            if b_binding_funcs.is_empty() {
-                Func::constant(Object::phi())
-            } else {
-                // Reuse a_fact's bindings directly (already in <<noun, val>> format)
-                Func::Selector(1)
-            },
-        ]);
-
-        // a(derived_fact) . Filter(not_in_b) . DistR . [a_facts, b_facts]
-        let func = Func::compose(
-            Func::apply_to_all(derived_fact),
-            Func::compose(
-                Func::filter(not_in_b),
-                Func::compose(Func::DistR, Func::construction(vec![a_facts, b_facts])),
-            ),
-        );
-        Some(CompiledDerivation { id, text, kind: DerivationKind::ModusPonens, func })
     }).collect()
 }
 
