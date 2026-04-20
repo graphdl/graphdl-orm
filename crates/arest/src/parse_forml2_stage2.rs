@@ -65,32 +65,100 @@ pub fn classify_statements(statements_state: &Object, grammar_state: &Object) ->
     Object::Map(cells)
 }
 
-/// Translate `Statement has Classification 'Entity Type Declaration'`
-/// and `Statement has Classification 'Value Type Declaration'` facts
-/// into `Noun` cell facts. #280b step 1.
+/// Translate noun-shaping classifications into `Noun` cell facts.
+/// #280b step 1.
 ///
-/// The result is a `Vec<Object>` of Noun facts, one per distinct
-/// declared Head Noun, with `objectType` set from the classification.
-/// The caller merges these into the Noun cell.
+/// Considers every Statement that carries a Head Noun plus one of
+/// these classifications:
+///
+/// - `Entity Type Declaration` → objectType = "entity".
+/// - `Value Type Declaration`  → objectType = "value".
+/// - `Abstract Declaration`    → objectType = "abstract" (overrides
+///   entity/value per the existing parser: `Foo is abstract` on a
+///   line after `Foo is an entity type` wins).
+///
+/// Grouped by Head Noun: one Noun fact per distinct name, with the
+/// most specific objectType across its classifications applied.
 #[cfg(feature = "std-deps")]
 pub fn translate_nouns(classified_state: &Object) -> Vec<Object> {
+    use alloc::collections::BTreeMap;
+    let statement_ids = collect_statement_ids(classified_state);
+    let mut by_noun: BTreeMap<String, &'static str> = BTreeMap::new();
+    for stmt_id in &statement_ids {
+        let Some(head) = head_noun_for(classified_state, stmt_id) else { continue };
+        let classifications = classifications_for(classified_state, stmt_id);
+        let ot = if classifications.iter().any(|k| k == "Abstract Declaration") {
+            Some("abstract")
+        } else if classifications.iter().any(|k| k == "Entity Type Declaration") {
+            Some("entity")
+        } else if classifications.iter().any(|k| k == "Value Type Declaration") {
+            Some("value")
+        } else {
+            None
+        };
+        if let Some(new_ot) = ot {
+            let slot = by_noun.entry(head).or_insert(new_ot);
+            // Abstract wins over entity/value; otherwise keep existing.
+            if new_ot == "abstract" {
+                *slot = "abstract";
+            }
+        }
+    }
+    by_noun.into_iter().map(|(name, ot)| {
+        fact_from_pairs(&[
+            ("name", name.as_str()),
+            ("objectType", ot),
+            ("worldAssumption", "closed"),
+        ])
+    }).collect()
+}
+
+/// Translate `Subtype Declaration` classifications into `Subtype` cell
+/// facts: `(subtype, supertype)` pairs. The subtype is the Statement's
+/// Head Noun; the supertype is the noun at Role Position 1 (the only
+/// other role reference in `A is a subtype of B`).
+///
+/// Partition Declaration is NOT handled here — it needs multi-role
+/// extraction (`A is partitioned into B, C, D`) and will land in a
+/// later commit.
+#[cfg(feature = "std-deps")]
+pub fn translate_subtypes(classified_state: &Object) -> Vec<Object> {
     let statement_ids = collect_statement_ids(classified_state);
     statement_ids.iter().filter_map(|stmt_id| {
-        let head = head_noun_for(classified_state, stmt_id)?;
         let classifications = classifications_for(classified_state, stmt_id);
-        let object_type = if classifications.iter().any(|k| k == "Entity Type Declaration") {
-            "entity"
-        } else if classifications.iter().any(|k| k == "Value Type Declaration") {
-            "value"
-        } else {
+        if !classifications.iter().any(|k| k == "Subtype Declaration") {
             return None;
-        };
+        }
+        let sub = head_noun_for(classified_state, stmt_id)?;
+        let sup = role_noun_at_position(classified_state, stmt_id, 1)?;
         Some(fact_from_pairs(&[
-            ("name", head.as_str()),
-            ("objectType", object_type),
-            ("worldAssumption", "closed"),
+            ("subtype", sub.as_str()),
+            ("supertype", sup.as_str()),
         ]))
     }).collect()
+}
+
+fn role_noun_at_position(state: &Object, stmt_id: &str, position: usize) -> Option<String> {
+    let refs = fetch_or_phi("Statement_has_Role_Reference", state);
+    let refs_seq = refs.as_seq()?;
+    let role_ids: Vec<String> = refs_seq.iter()
+        .filter(|f| binding(f, "Statement") == Some(stmt_id))
+        .filter_map(|f| binding(f, "Role_Reference").map(String::from))
+        .collect();
+    let positions = fetch_or_phi("Role_Reference_has_Role_Position", state);
+    let pos_seq = positions.as_seq()?;
+    let head_nouns = fetch_or_phi("Role_Reference_has_Head_Noun", state);
+    let hn_seq = head_nouns.as_seq()?;
+    // Find the role_id at the requested position.
+    let target_id = role_ids.iter().find(|id| {
+        pos_seq.iter().any(|f| {
+            binding(f, "Role_Reference") == Some(id.as_str())
+                && binding(f, "Role_Position") == Some(&position.to_string())
+        })
+    })?;
+    hn_seq.iter()
+        .find(|f| binding(f, "Role_Reference") == Some(target_id.as_str()))
+        .and_then(|f| binding(f, "Head_Noun").map(String::from))
 }
 
 fn head_noun_for(state: &Object, stmt_id: &str) -> Option<String> {
@@ -389,6 +457,58 @@ mod tests {
             .collect();
         assert_eq!(by_name.get("Customer").map(String::as_str), Some("entity"));
         assert_eq!(by_name.get("Priority").map(String::as_str), Some("value"));
+    }
+
+    #[test]
+    fn translate_nouns_abstract_wins_over_entity() {
+        // Simulate two Statements on the same Head Noun: one Entity
+        // Type Declaration + one Abstract Declaration. The merged
+        // Noun fact must have objectType="abstract".
+        let mut merged: HashMap<String, Object> = HashMap::new();
+        for (i, (text, nouns)) in [
+            ("Request is an entity type.", vec!["Request"]),
+            ("Request is abstract.",       vec!["Request"]),
+        ].into_iter().enumerate() {
+            let stmt_id = format!("s{}", i);
+            let cells = tokenize_statement(
+                &stmt_id, text,
+                &nouns.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            );
+            for (name, facts) in cells {
+                let entry = merged.entry(name).or_insert_with(|| Object::Seq(Vec::new().into()));
+                let existing = entry.as_seq().map(|s| s.to_vec()).unwrap_or_default();
+                let mut combined = existing;
+                combined.extend(facts);
+                *entry = Object::Seq(combined.into());
+            }
+        }
+        let stmt = Object::Map(merged);
+        let classified = classify_statements(&stmt, &grammar_state());
+        let noun_facts = super::translate_nouns(&classified);
+        assert_eq!(noun_facts.len(), 1);
+        assert_eq!(binding(&noun_facts[0], "name"), Some("Request"));
+        assert_eq!(binding(&noun_facts[0], "objectType"), Some("abstract"));
+    }
+
+    #[test]
+    fn translate_subtypes_emits_subtype_fact() {
+        let stmt = stage1_state(
+            "s1", "Support Request is a subtype of Request.",
+            &["Support Request", "Request"]);
+        let classified = classify_statements(&stmt, &grammar_state());
+        let subtype_facts = super::translate_subtypes(&classified);
+        assert_eq!(subtype_facts.len(), 1);
+        assert_eq!(binding(&subtype_facts[0], "subtype"), Some("Support Request"));
+        assert_eq!(binding(&subtype_facts[0], "supertype"), Some("Request"));
+    }
+
+    #[test]
+    fn translate_subtypes_skips_non_subtype_statements() {
+        let stmt = stage1_state(
+            "s1", "Customer is an entity type.", &["Customer"]);
+        let classified = classify_statements(&stmt, &grammar_state());
+        let subtype_facts = super::translate_subtypes(&classified);
+        assert!(subtype_facts.is_empty());
     }
 
     #[test]
