@@ -97,6 +97,22 @@ pub struct DerivationRuleDef {
     /// reports these directly — no parallel heuristic needed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unresolved_clauses: Vec<String>,
+    /// Per-antecedent string-literal role equality filters. FORML 2 grammar
+    /// readings use this for token matching, e.g.
+    ///   `Statement has Classification 'Entity Type Declaration' iff
+    ///    Statement has Trailing Marker 'is an entity type'`
+    /// where the antecedent fact type `Statement has Trailing Marker`
+    /// must have its `Trailing Marker` role equal to the literal
+    /// `'is an entity type'`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub antecedent_role_literals: Vec<AntecedentRoleLiteral>,
+    /// Consequent roles bound to fixed string literals. Used by grammar
+    /// readings whose consequent specifies a role's value, e.g.
+    ///   `Statement has Classification 'Entity Type Declaration'`.
+    /// The `Classification` role is bound to the literal; the remaining
+    /// consequent roles inherit bindings from the antecedent fact.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub consequent_role_literals: Vec<ConsequentRoleLiteral>,
 }
 
 /// Numeric comparison that further restricts a derivation antecedent.
@@ -113,6 +129,30 @@ pub struct AntecedentFilter {
     pub op: String,
     /// Numeric RHS literal.
     pub value: f64,
+}
+
+/// String-literal equality filter pinned to an antecedent role.
+/// See `DerivationRuleDef::antecedent_role_literals`.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AntecedentRoleLiteral {
+    /// Index into `antecedent_fact_type_ids` that this filter restricts.
+    pub antecedent_index: usize,
+    /// Role name (noun name) whose value must equal `value`.
+    pub role: String,
+    /// Required literal value (string equality).
+    pub value: String,
+}
+
+/// Fixed string literal bound to a consequent role.
+/// See `DerivationRuleDef::consequent_role_literals`.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConsequentRoleLiteral {
+    /// Role name (noun name) in the consequent fact type.
+    pub role: String,
+    /// Literal string value to bind to that role.
+    pub value: String,
 }
 
 /// Halpin FORML arithmetic expression used in attribute-style definitions

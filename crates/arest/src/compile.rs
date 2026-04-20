@@ -921,7 +921,7 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
             DerivationRuleDef {
                 id: get("id"), text: get("text"), antecedent_fact_type_ids: vec![],
                 consequent_fact_type_id: get("consequentFactTypeId"),
-                kind: DerivationKind::ModusPonens, join_on: vec![], match_on: vec![], consequent_bindings: vec![], antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![], unresolved_clauses: vec![],
+                kind: DerivationKind::ModusPonens, join_on: vec![], match_on: vec![], consequent_bindings: vec![], antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![], unresolved_clauses: vec![], antecedent_role_literals: vec![], consequent_role_literals: vec![],
             }
         }).collect())
         .unwrap_or_default();
@@ -1849,7 +1849,7 @@ pub(crate) fn cell_index_from_state(state: &crate::ast::Object) -> CellIndex {
                 kind: DerivationKind::ModusPonens, join_on: vec![], match_on: vec![],
                 consequent_bindings: vec![], antecedent_filters: vec![],
                 consequent_computed_bindings: vec![], consequent_aggregates: vec![],
-                unresolved_clauses: vec![],
+                unresolved_clauses: vec![], antecedent_role_literals: vec![], consequent_role_literals: vec![],
             }
         }).collect()).unwrap_or_default();
     let general_instance_facts: Vec<GeneralInstanceFact> = fetch_or_phi("InstanceFact", state).as_seq()
@@ -2322,24 +2322,56 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
         .map(|ft| ft.reading.clone())
         .unwrap_or_default();
 
-    // Per-antecedent inline-comparison filters (Halpin FORML Example 5:
-    // `has Population >= 1000000`). Each filter wraps its antecedent's
-    // extract_facts_from_pop in Func::filter so only facts whose role
-    // value satisfies the comparator survive.
-    let filter_by_idx: hashbrown::HashMap<usize, Func> = rule.antecedent_filters.iter()
-        .filter_map(|af| {
-            let ft_id = antecedent_ids.get(af.antecedent_index)?;
-            let ft = data.fact_types.get(ft_id)?;
-            build_antecedent_filter_pred(af, ft).map(|p| (af.antecedent_index, p))
-        })
-        .collect();
+    // Per-antecedent predicates. Two sources contribute:
+    //   (a) numeric comparators from `antecedent_filters` (Halpin FORML
+    //       Example 5: `has Population >= 1000000`);
+    //   (b) string-literal equality from `antecedent_role_literals`
+    //       (FORML 2 grammar: `Statement has Trailing Marker
+    //       'is an entity type'`, #286).
+    // Multiple predicates on the same antecedent are combined via And.
+    let mut preds_by_idx: hashbrown::HashMap<usize, Vec<Func>> =
+        hashbrown::HashMap::new();
+    for af in rule.antecedent_filters.iter() {
+        if let Some(ft_id) = antecedent_ids.get(af.antecedent_index) {
+            if let Some(ft) = data.fact_types.get(ft_id) {
+                if let Some(p) = build_antecedent_filter_pred(af, ft) {
+                    preds_by_idx.entry(af.antecedent_index).or_default().push(p);
+                }
+            }
+        }
+    }
+    for arl in rule.antecedent_role_literals.iter() {
+        if let Some(ft_id) = antecedent_ids.get(arl.antecedent_index) {
+            if let Some(ft) = data.fact_types.get(ft_id) {
+                if let Some(role_idx) = ft.roles.iter()
+                    .find(|r| r.noun_name == arl.role)
+                    .map(|r| r.role_index)
+                {
+                    let pred = Func::compose(
+                        Func::Eq,
+                        Func::construction(vec![
+                            role_value(role_idx),
+                            Func::constant(Object::atom(&arl.value)),
+                        ]),
+                    );
+                    preds_by_idx.entry(arl.antecedent_index).or_default().push(pred);
+                }
+            }
+        }
+    }
 
-    // Wrap the raw extractor in Filter when this antecedent has a filter;
-    // otherwise return the bare extractor.
+    // Wrap the raw extractor in Filter when this antecedent has any
+    // predicates; otherwise return the bare extractor. Multiple
+    // predicates combine with And.
     let extract = |idx: usize, ft_id: &str| -> Func {
-        match filter_by_idx.get(&idx) {
-            Some(pred) => Func::compose(Func::filter(pred.clone()), extract_facts_from_pop(ft_id)),
-            None => extract_facts_from_pop(ft_id),
+        match preds_by_idx.get(&idx) {
+            Some(preds) if !preds.is_empty() => {
+                let combined = preds.iter().cloned().reduce(|a, b|
+                    Func::compose(Func::And, Func::construction(vec![a, b])))
+                    .unwrap();
+                Func::compose(Func::filter(combined), extract_facts_from_pop(ft_id))
+            }
+            _ => extract_facts_from_pop(ft_id),
         }
     };
 
@@ -2376,30 +2408,45 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
             //   <consequent_id, consequent_reading, consequent_bindings>.
             //
             // consequent_bindings starts as the antecedent's bindings
-            // (Func::Id passes them through unchanged). If the rule has
-            // arithmetic definitions on consequent roles (Halpin's
-            // `Volume is Size * Size * Size`), each computed binding is
-            // built as a <role_name, computed_value> pair and appended
-            // via Concat . [Id, <p1, p2, ...>]. Evaluation order ensures
-            // the computed values see the antecedent fact's raw bindings.
-            let bindings_func: Func = if rule.consequent_computed_bindings.is_empty() {
-                Func::Id
-            } else if let Some(ft) = data.fact_types.get(ft_id) {
-                let computed_pairs: Vec<Func> = rule.consequent_computed_bindings.iter().map(|cb| {
+            // (Func::Id passes them through unchanged). Two optional
+            // extensions append pairs via Concat:
+            //   (a) arithmetic-computed bindings (Halpin's attribute
+            //       `Volume is Size * Size * Size`), and
+            //   (b) literal-constant bindings (#286 — grammar rule head
+            //       specifies a role's value, e.g. `Statement has
+            //       Classification 'Entity Type Declaration'`).
+            // Both forms build <role_name, value> pairs and append them
+            // to the antecedent bindings through
+            //   Concat . [Id, <p1, p2, ...>]
+            // so evaluation order feeds the same input fact to Id and
+            // to the arith expressions.
+            let computed_pairs: Vec<Func> = data.fact_types.get(ft_id)
+                .map(|ft| rule.consequent_computed_bindings.iter().map(|cb| {
                     Func::construction(vec![
                         Func::constant(Object::atom(&cb.role)),
                         compile_arith_expr(&cb.expr, ft),
                     ])
-                }).collect();
+                }).collect())
+                .unwrap_or_default();
+            let literal_pairs: Vec<Func> = rule.consequent_role_literals.iter()
+                .map(|crl| Func::construction(vec![
+                    Func::constant(Object::atom(&crl.role)),
+                    Func::constant(Object::atom(&crl.value)),
+                ]))
+                .collect();
+            let extra_pairs: Vec<Func> = computed_pairs.into_iter()
+                .chain(literal_pairs.into_iter())
+                .collect();
+            let bindings_func: Func = if extra_pairs.is_empty() {
+                Func::Id
+            } else {
                 Func::compose(
                     Func::Concat,
                     Func::construction(vec![
                         Func::Id,
-                        Func::construction(computed_pairs),
+                        Func::construction(extra_pairs),
                     ]),
                 )
-            } else {
-                Func::Id
             };
             let derive_one = Func::construction(vec![
                 Func::constant(Object::atom(&consequent_id)),
