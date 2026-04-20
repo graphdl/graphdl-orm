@@ -740,13 +740,45 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
         if name.is_empty() {
             return "⊥".into();
         }
+        // Determine the body: empty input → Func::Platform(name) stub
+        // (host owns dispatch elsewhere). Non-empty input → hex-encoded
+        // freeze image of a Func-encoded Object, thawed and
+        // metacomposed. Malformed hex / bad freeze → ⊥.
+        let body = if input.is_empty() {
+            ast::Func::Platform(name.to_string())
+        } else {
+            let nibble = |b: u8| -> Option<u8> {
+                match b {
+                    b'0'..=b'9' => Some(b - b'0'),
+                    b'a'..=b'f' => Some(b - b'a' + 10),
+                    b'A'..=b'F' => Some(b - b'A' + 10),
+                    _ => None,
+                }
+            };
+            let clean: String = input.chars().filter(|c| !c.is_whitespace()).collect();
+            if clean.len() % 2 != 0 {
+                return "⊥".into();
+            }
+            let bs = clean.as_bytes();
+            let mut bytes: Vec<u8> = Vec::with_capacity(clean.len() / 2);
+            let mut i = 0;
+            while i + 1 < bs.len() {
+                match (nibble(bs[i]), nibble(bs[i + 1])) {
+                    (Some(h), Some(l)) => bytes.push((h << 4) | l),
+                    _ => return "⊥".into(),
+                }
+                i += 2;
+            }
+            let obj = match crate::freeze::thaw(&bytes) {
+                Ok(o) => o,
+                Err(_) => return "⊥".into(),
+            };
+            let snapshot_read = tenant.read().snapshot_d();
+            ast::metacompose(&obj, &snapshot_read)
+        };
         let mut st = tenant.write();
         let snapshot = st.snapshot_d();
-        let new_d = ast::register_runtime_fn(
-            name,
-            ast::Func::Platform(name.to_string()),
-            &snapshot,
-        );
+        let new_d = ast::register_runtime_fn(name, body, &snapshot);
         st.replace_d(new_d);
         return name.to_string();
     }
@@ -1926,6 +1958,45 @@ Order has total.
         let result = system_impl(h, "register:", "");
         assert_eq!(result, "⊥",
             "register: with empty name must return ⊥; got {result}");
+        release_impl(h);
+    }
+
+    /// register:<name> with non-empty input decodes the payload as a
+    /// hex-encoded freeze image of a Func-encoded Object, thaws it,
+    /// metacomposes back to Func, and installs that as the body. This
+    /// is what lets a host push a composable FFP body (Func::Constant,
+    /// Func::Compose, etc.) rather than just marking the name as a
+    /// Platform stub.
+    #[test]
+    fn system_register_with_hex_body_installs_composable_func() {
+        let h = create_bare_impl();
+        // Encode Func::Constant(atom("hello")) via func_to_object +
+        // freeze + hex, matching what a JS host would do.
+        let body = ast::Func::Constant(ast::Object::atom("hello"));
+        let encoded_obj = ast::func_to_object(&body);
+        let bytes = crate::freeze::freeze(&encoded_obj);
+        let hex: String = bytes.iter().map(|b| alloc::format!("{:02x}", b)).collect();
+
+        let result = system_impl(h, "register:greet", &hex);
+        assert_eq!(result, "greet",
+            "register:<name> with hex body should succeed and echo the name");
+
+        // Dispatch via standard apply; the installed body fires.
+        let tenant = tenant_lock(h).unwrap();
+        let d = tenant.read().snapshot_d();
+        drop(tenant);
+        let out = ast::apply(&ast::Func::Def("greet".to_string()), &ast::Object::phi(), &d);
+        assert_eq!(out, ast::Object::atom("hello"),
+            "Func::Def('greet') should dispatch to the registered Func::Constant body");
+        release_impl(h);
+    }
+
+    #[test]
+    fn system_register_rejects_malformed_hex_body() {
+        let h = create_bare_impl();
+        let result = system_impl(h, "register:bad", "not valid hex");
+        assert_eq!(result, "⊥",
+            "register: with malformed hex payload must return ⊥; got {result}");
         release_impl(h);
     }
 
