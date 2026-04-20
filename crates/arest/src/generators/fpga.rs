@@ -951,6 +951,14 @@ fn emit_constraint_modules(state: &Object) -> (Vec<String>, Vec<String>) {
                     // wires every VC identically.
                     Some(emit_vc_constraint_body(&module_name, &values))
                 }
+                // Cross-fact-type families — SS/EQ/XC/OR/XO — need two
+                // BRAM banks and the post-v1 two-bank handshake. For
+                // now emit explicit TODO stubs with the canonical port
+                // shape so top's AND-reduce picks up the violation
+                // wire without synthesis warnings.
+                "SS" | "EQ" | "XC" | "OR" | "XO" => {
+                    Some(emit_cross_fact_type_stub(&module_name, kind))
+                }
                 _ => None,
             };
             let _ = text;
@@ -1453,20 +1461,33 @@ fn emit_mc_constraint_body(module_name: &str) -> String {
     out
 }
 
-/// Placeholder stub preserved while kind-specific emitters are staged
-/// one commit at a time. Emits the canonical port shape and ties
-/// `violation` to zero so the top aggregate stays well-formed.
-fn emit_placeholder_constraint_stub(module_name: &str, kind: &str) -> String {
+/// Cross-fact-type constraint stub — SS / EQ / XC / OR / XO. Ports
+/// are the canonical (clk, rst_n, violation) so `top` AND-reduces the
+/// output alongside the real kinds; body ties violation to zero with
+/// an explicit TODO block so a reader grepping the output sees the
+/// deferred work.
+///
+/// Real emitters require the two-bank BRAM handshake (two `rdata`
+/// ports, independent active-row counters). That lands after the
+/// single-bank handshake for UC / MC / ring / VC stabilises.
+fn emit_cross_fact_type_stub(module_name: &str, kind: &str) -> String {
     format!(
         "module {name} (\n    \
             input wire clk,\n    \
             input wire rst_n,\n    \
             output reg violation\n\
         );\n    \
-        // {kind} stub — real predicate lands in the kind-specific emitter.\n    \
-        always @(posedge clk) begin\n        \
-            violation <= 1'b0;\n    \
-        end\n\
+            // TODO (#303 follow-up): {kind} cross-fact-type predicate\n    \
+            // requires a two-bank BRAM handshake (compare rows from\n    \
+            // two distinct fact types). Real logic lands once the\n    \
+            // single-bank path stabilises.\n    \
+            always @(posedge clk) begin\n        \
+                if (!rst_n) begin\n            \
+                    violation <= 1'b0;\n        \
+                end else begin\n            \
+                    violation <= 1'b0;\n        \
+                end\n    \
+            end\n\
         endmodule\n",
         name = module_name, kind = kind,
     )
@@ -2164,8 +2185,8 @@ Supplier supplies Widget.
             ("c1", "UC"),
             ("c2", "MC"),
             ("c3", "FC"),
-            ("c4", "SS"),  // cross-fact-type — still a TODO stub (post-v1).
-            ("c5", "IR"),  // ring family — now real hardware.
+            ("c4", "SS"),  // cross-fact-type — emits a TODO stub (post-v1).
+            ("c5", "IR"),  // ring family — real hardware.
         ]);
         let verilog = compile_to_verilog(&state);
 
@@ -2178,10 +2199,11 @@ Supplier supplies Widget.
         // Ring family now lands real hardware; IR is no longer skipped.
         assert!(verilog.contains("module constraint_ir_c5"),
             "ring IR must emit alongside UC/MC/FC:\n{}", verilog);
-        // SS (and the rest of the cross-fact-type family) stay TODO
-        // stubs until their own emitter lands.
-        assert!(!verilog.contains("constraint_ss_c4"),
-            "SS not yet supported, should not emit");
+        // SS (and the rest of the cross-fact-type family) emit as TODO
+        // stubs so top's AND-reduce picks up their violation wires
+        // uniformly. Real predicates land after the two-bank handshake.
+        assert!(verilog.contains("module constraint_ss_c4"),
+            "SS now emits a TODO stub:\n{}", verilog);
     }
 
     #[test]
@@ -2573,6 +2595,46 @@ Supplier supplies Widget.
             assert!(verilog.contains(&inv),
                 "top must invert {} violation:\n{}", kind, verilog);
         }
+    }
+
+    // ── Cross-fact-type stubs: SS / EQ / XC / OR / XO (#303 / E1) ──
+    //
+    // These families compare two BRAM banks at once. Real hardware
+    // requires the two-bank handshake that lands post-v1. For now,
+    // emit the canonical port shape with violation tied to zero and
+    // an explicit TODO comment so `top` aggregates uniformly.
+
+    #[test]
+    fn cross_fact_type_stubs_emitted_for_every_kind() {
+        let state = state_with_constraints(&[
+            ("s1", "SS"), ("s2", "EQ"), ("s3", "XC"),
+            ("s4", "OR"), ("s5", "XO"),
+        ]);
+        let verilog = compile_to_verilog(&state);
+        for kind in ["ss", "eq", "xc", "or", "xo"] {
+            let needle = alloc::format!("module constraint_{}_", kind);
+            assert!(verilog.contains(&needle),
+                "missing stub module for kind {}:\n{}", kind, verilog);
+        }
+    }
+
+    #[test]
+    fn cross_fact_type_stubs_carry_explicit_todo_comment() {
+        let state = state_with_constraints(&[("s1", "SS")]);
+        let verilog = compile_to_verilog(&state);
+        // Stub body must flag itself to a reader — no silent zero.
+        assert!(verilog.contains("TODO"),
+            "cross-fact-type stub must carry a TODO marker:\n{}", verilog);
+    }
+
+    #[test]
+    fn top_wires_cross_fact_type_stubs_with_violation_only_port() {
+        let state = state_with_constraints(&[("s1", "SS"), ("s2", "EQ")]);
+        let verilog = compile_to_verilog(&state);
+        // Canonical wiring: clk/rst_n/violation, no data bus.
+        assert!(verilog.contains("constraint_ss_s1 constraint_ss_s1_inst ("));
+        assert!(verilog.contains("& ~constraint_ss_s1_v"));
+        assert!(verilog.contains("& ~constraint_eq_s2_v"));
     }
 
     // ── Audit-log Verilog ring buffer (#167) ──
