@@ -433,13 +433,29 @@ pub fn translate_derivation_rules(classified_state: &Object) -> Vec<Object> {
             continue;
         }
         let text = statement_text(classified_state, stmt_id).unwrap_or_default();
+        let id = derivation_rule_id(&text);
         out.push(fact_from_pairs(&[
-            ("id",                   text.as_str()),
+            ("id",                   id.as_str()),
             ("text",                 text.as_str()),
             ("consequentFactTypeId", ""),
         ]));
     }
     out
+}
+
+/// FNV-1a 64-bit hash of the rule text, formatted as `rule_<hex>` to
+/// match legacy's stable id. Multiple rules may share a consequent FT
+/// (the grammar has 28 rules all producing `Statement has
+/// Classification`), so keying on consequent alone collapses them;
+/// text hashing gives each rule a unique id.
+#[cfg(feature = "std-deps")]
+fn derivation_rule_id(text: &str) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in text.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    alloc::format!("rule_{h:x}")
 }
 
 /// Translate `Enum Values Declaration` classifications into
@@ -1401,11 +1417,20 @@ mod tests {
 
     #[test]
     fn translate_set_constraints_includes_subset() {
+        // `If some X then that Y` is a subset constraint (ORM 2 shape).
+        // Legacy's `try_subset` fires before `try_derivation` in pass
+        // 2b priority; Stage-1 skips Keyword 'if' emission for this
+        // shape so the Statement classifies only as Subset Constraint.
         let stmt = stage1_state(
             "s1",
             "If some User owns some Organization then that User has some Email.",
             &["User", "Organization", "Email"]);
         let classified = classify_statements(&stmt, &grammar_state());
+        let kinds = classifications_for(&classified, "s1");
+        assert!(kinds.iter().any(|k| k == "Subset Constraint"),
+            "expected Subset Constraint; got {:?}", kinds);
+        assert!(!kinds.iter().any(|k| k == "Derivation Rule"),
+            "expected NO Derivation Rule classification; got {:?}", kinds);
         let constraints = super::translate_set_constraints(&classified);
         let ss: Vec<_> = constraints.iter()
             .filter(|f| binding(f, "kind") == Some("SS"))
@@ -1626,5 +1651,26 @@ mod tests {
         let core = include_str!("../../../readings/core.md");
         let (missing, extra) = diff_cells("core.md", core);
         eprintln!("core.md totals — missing: {}, extra: {}", missing, extra);
+    }
+
+    #[test]
+    #[ignore = "diagnostic: prints derivation-rule texts side by side"]
+    fn dump_derivation_rule_texts_core_md() {
+        let core = include_str!("../../../readings/core.md");
+        let legacy = crate::parse_forml2::parse_to_state(core).expect("legacy");
+        let stage12 = super::parse_to_state_via_stage12(core).expect("stage12");
+        let texts_from = |obj: &Object| -> alloc::collections::BTreeSet<String> {
+            fetch_or_phi("DerivationRule", obj).as_seq()
+                .map(|facts| facts.iter()
+                    .filter_map(|f| binding(f, "text").map(String::from))
+                    .collect())
+                .unwrap_or_default()
+        };
+        let l = texts_from(&legacy);
+        let s = texts_from(&stage12);
+        eprintln!("== legacy-only DerivationRule texts ==");
+        for t in l.difference(&s) { eprintln!("  {}", t); }
+        eprintln!("== stage12-only DerivationRule texts ==");
+        for t in s.difference(&l) { eprintln!("  {}", t); }
     }
 }
