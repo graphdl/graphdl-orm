@@ -80,7 +80,16 @@ pub fn tokenize_statement(statement_id: &str, text: &str, nouns: &[String]) -> C
     let mut verb = extract_verb(body, &role_refs);
 
     // 5. Trailing Marker.
-    let trailing_marker = extract_trailing_marker(body, &role_refs);
+    let mut trailing_marker = extract_trailing_marker(body, &role_refs);
+    // Synthetic ring marker: `No <Noun> <verb> itself` is ORM 2's
+    // irreflexive-constraint shorthand. Legacy's `try_ring` matches
+    // it directly; Stage-2 relies on the `is irreflexive` trailing
+    // marker to route through the Ring Constraint recognizer.
+    // Check `canonical` (not `body`) because the leading quantifier
+    // stripper already consumed the `No `.
+    if canonical.starts_with("No ") && canonical.ends_with(" itself") {
+        trailing_marker = Some("is irreflexive".to_string());
+    }
 
     // 6. Enum Values leading-phrase override.
     //    `The possible values of <Noun> are '<v1>', '<v2>', ...`
