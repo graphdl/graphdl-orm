@@ -178,4 +178,31 @@ describe('buildIngestPayload — federated_ingest FFI shape (E3 / #305)', () => 
     const payload = buildIngestPayload(result)
     expect(payload.facts).toHaveLength(0)
   })
+
+  /// Error-path Citation: fetch returned an HTTP error, federatedFetch
+  /// still emitted a Citation (origin of the error), but facts is
+  /// empty. The ingest payload must still carry origin metadata so
+  /// the engine can absorb the Citation by itself — downstream
+  /// derivations over failed-fetch provenance need the Citation in P.
+  it('preserves citation metadata when facts are empty (error response)', () => {
+    const result = {
+      system: 'stripe',
+      noun: 'Stripe Customer',
+      count: 0,
+      facts: [],
+      citation: {
+        uri: 'https://api.stripe.com/v1/customers/cus_missing',
+        retrievalDate: '2026-04-20T12:00:00Z',
+        authorityType: 'Federated-Fetch',
+        externalSystem: 'stripe',
+      },
+      _meta: { url: 'https://api.stripe.com/v1/customers/cus_missing', worldAssumption: 'OWA' as const },
+      error: '404 Not Found',
+    }
+    const payload = buildIngestPayload(result)
+    expect(payload.facts).toHaveLength(0)
+    expect(payload.externalSystem).toBe('stripe')
+    expect(payload.url).toBe('https://api.stripe.com/v1/customers/cus_missing')
+    expect(payload.retrievalDate).toBe('2026-04-20T12:00:00Z')
+  })
 })
