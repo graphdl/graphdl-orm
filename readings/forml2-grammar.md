@@ -41,6 +41,7 @@ Statement has Trailing Marker.
 Statement has Quantifier.
 Statement has Derivation Marker.
 Statement has Literal Role.
+Statement has Keyword.
 Statement has Classification.
 
 Statement has Role Reference.
@@ -84,7 +85,9 @@ Statement has Classification 'Abstract Declaration' iff Statement has Trailing M
 
 Statement has Classification 'Enum Values Declaration' iff Statement has Verb 'the possible values of'.
 
-Statement has Classification 'Derivation Rule' iff Statement has Verb 'iff'.
+Statement has Classification 'Derivation Rule' iff Statement has Keyword 'iff'.
+Statement has Classification 'Derivation Rule' iff Statement has Keyword 'if'.
+Statement has Classification 'Derivation Rule' iff Statement has Keyword 'when'.
 
 Statement has Classification 'Fact Type Reading' iff Statement has Role Reference.
 
