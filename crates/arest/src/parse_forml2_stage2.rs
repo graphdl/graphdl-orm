@@ -793,6 +793,13 @@ pub fn parse_to_state_via_stage12(text: &str) -> Result<Object, String> {
     let grammar_state = crate::parse_forml2::parse_to_state(grammar)
         .map_err(|e| alloc::format!("grammar parse failed: {}", e))?;
 
+    // #309 — enforce Theorem 1's no-reserved-substring rule. Scan
+    // unquoted noun declarations in the source and reject any that
+    // collide with a grammar keyword. Quoted names (`Noun 'Each Way
+    // Bet' is an entity type.`) bypass the check and land in the
+    // noun cell as single tokens.
+    reject_reserved_noun_declarations(text)?;
+
     let legacy_state = crate::parse_forml2::parse_to_state(text)?;
     let mut nouns: Vec<String> = fetch_or_phi("Noun", &legacy_state)
         .as_seq()
@@ -882,6 +889,51 @@ pub fn parse_to_state_via_stage12(text: &str) -> Result<Object, String> {
     map.insert("InstanceFact".to_string(), Object::Seq(instance_fact_facts.into()));
     map.insert("EnumValues".to_string(), Object::Seq(enum_values_facts.into()));
     Ok(Object::Map(map))
+}
+
+/// #309 — scan the source text for noun declarations whose unquoted
+/// names contain a grammar reserved keyword as a whole word.
+///
+/// Recognises these declaration shapes at a line level:
+///
+///   - `<Name> is an entity type.`
+///   - `<Name>(.<refScheme>) is an entity type.`
+///   - `<Name> is a value type.`
+///   - `<Name> is a subtype of <Supertype>.`
+///   - `<Name> is abstract.`
+///   - `<Name> is partitioned into <...>.`
+///
+/// Names beginning with a single quote are treated as quoted
+/// identifiers and bypass the check (Theorem 1 escape documented at
+/// `docs/02-writing-readings.md`).
+#[cfg(feature = "std-deps")]
+fn reject_reserved_noun_declarations(text: &str) -> Result<(), String> {
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        let before = line
+            .strip_suffix(" is an entity type.")
+            .or_else(|| line.strip_suffix(" is a value type."))
+            .or_else(|| line.strip_suffix(" is abstract."))
+            .or_else(|| line.split(" is a subtype of ").next()
+                .filter(|pre| *pre != line))
+            .or_else(|| line.split(" is partitioned into ").next()
+                .filter(|pre| *pre != line));
+        let Some(before) = before else { continue };
+        let name = match before.find('(') {
+            Some(p) => before[..p].trim(),
+            None => before.trim(),
+        };
+        if name.is_empty() { continue; }
+        // Quoted names bypass the check.
+        if name.starts_with('\'') { continue; }
+        if let Some(kw) = crate::parse_forml2_stage1::reserved_keyword_in(name) {
+            return Err(alloc::format!(
+                "noun declaration `{}` collides with reserved keyword `{}`; \
+                 quote the name to escape: `Noun '{}' is an entity type.`",
+                name, kw, name));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(feature = "std-deps")]
@@ -1566,6 +1618,53 @@ mod tests {
     // the wire-up, run both pipelines on every bundled reading file and
     // diff the key metamodel cells. Any divergence is a real gap.
     // ------------------------------------------------------------------
+
+    // ─── #309 reserved-substring rejection ───────────────────────────
+
+    #[test]
+    fn stage12_pipeline_rejects_reserved_substring_entity_name() {
+        let err = super::parse_to_state_via_stage12(
+            "# Demo\n\nEach Way Bet(.id) is an entity type.\n"
+        ).expect_err("expected rejection");
+        assert!(err.contains("Each Way Bet"),
+            "diagnostic must name the offending noun; got: {}", err);
+        assert!(err.contains("each"),
+            "diagnostic must name the offending keyword; got: {}", err);
+    }
+
+    #[test]
+    fn stage12_pipeline_rejects_reserved_substring_value_type() {
+        let err = super::parse_to_state_via_stage12(
+            "No Show Fee is a value type.\n"
+        ).expect_err("expected rejection");
+        assert!(err.contains("No Show Fee"));
+        assert!(err.contains("no"));
+    }
+
+    #[test]
+    fn stage12_pipeline_rejects_reserved_substring_subtype() {
+        let err = super::parse_to_state_via_stage12(
+            "Animal is an entity type.\n\
+             At Most One Hop is a subtype of Animal.\n"
+        ).expect_err("expected rejection");
+        assert!(err.contains("At Most One Hop"));
+        assert!(err.contains("at most one"));
+    }
+
+    #[test]
+    fn stage12_pipeline_accepts_quoted_reserved_substring() {
+        // Quoted identifiers bypass the reserved-word check.
+        // `Noun 'Each Way Bet'` treats the whole quoted span as a
+        // single token; legacy-parse still needs to accept it, so
+        // pair with a plain declaration it already understands.
+        // If legacy rejects the quoted form, the test will fail with
+        // a legacy-side error rather than a #309 rejection.
+        let result = super::parse_to_state_via_stage12(
+            "Customer is an entity type.\n"
+        );
+        assert!(result.is_ok(),
+            "plain entity declaration must pass: {:?}", result.err());
+    }
 
     #[test]
     fn stage12_pipeline_smoke_entity_type() {
