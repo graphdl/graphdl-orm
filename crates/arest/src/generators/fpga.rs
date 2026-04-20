@@ -1297,7 +1297,7 @@ Noun has Object Type.
 
     /// Multi-entity: three entity nouns produce three module blocks
     /// plus one `top` module that instantiates and AND-reduces them.
-    /// Each module declaration must appear exactly once.
+    /// Each entity-derived module must appear exactly once.
     #[test]
     fn compile_to_verilog_multiple_entities_produce_multiple_modules() {
         let state = state_with_nouns(&[
@@ -1308,19 +1308,26 @@ Noun has Object Type.
 
         let verilog = compile_to_verilog(&state);
 
+        // Balance: every `module` has exactly one `endmodule`.
         let module_count = verilog.matches("module ").count();
         let endmodule_count = verilog.matches("endmodule").count();
-        // 3 entity + 3 bram + audit + ingress + egress + wasm_reducer + boot_fsm + top = 12.
-        assert_eq!(module_count, 12, "expected 12 module decls, got:\n{}", verilog);
-        assert_eq!(endmodule_count, 12, "module/endmodule mismatch:\n{}", verilog);
-        assert!(verilog.contains("module order"));
-        assert!(verilog.contains("module customer"));
-        assert!(verilog.contains("module product"));
+        assert_eq!(module_count, endmodule_count,
+            "module/endmodule mismatch:\n{}", verilog);
+
+        // Each declared entity yields exactly one entity module. The
+        // trailing space distinguishes `module order (` (the entity
+        // declaration) from `module order_bram (` (the companion bram).
+        for entity in ["order", "customer", "product"] {
+            let needle = format!("module {} ", entity);
+            assert_eq!(verilog.matches(&needle).count(), 1,
+                "entity module '{}' must appear exactly once", entity);
+        }
         assert!(verilog.contains("module top"));
     }
 
     /// Value types must NOT become Verilog modules — only entities do.
-    /// Mixed state with one entity and several values emits exactly one module.
+    /// Mixed state with one entity and several values emits exactly one
+    /// entity module, never one per value/enum noun.
     #[test]
     fn compile_to_verilog_skips_non_entity_nouns() {
         let state = state_with_nouns(&[
@@ -1332,14 +1339,18 @@ Noun has Object Type.
 
         let verilog = compile_to_verilog(&state);
 
-        // 1 entity + 1 bram + audit + ingress + egress + wasm_reducer + boot_fsm + top = 8.
-        assert_eq!(verilog.matches("module ").count(), 8);
+        assert_eq!(verilog.matches("module ").count(),
+                   verilog.matches("endmodule").count(),
+                   "module/endmodule mismatch:\n{}", verilog);
+        // The one entity noun produces its module and its bram.
         assert!(verilog.contains("module order"));
         assert!(verilog.contains("module order_bram"));
         assert!(verilog.contains("module top"));
+        // Fixed infrastructure must be present.
         assert!(verilog.contains("module audit_log"));
         assert!(verilog.contains("module fact_ingress"));
         assert!(verilog.contains("module fact_egress"));
+        // Non-entity nouns must NOT yield modules.
         assert!(!verilog.contains("module amount"));
         assert!(!verilog.contains("module currency_code"));
         assert!(!verilog.contains("module priority"));
@@ -1422,8 +1433,9 @@ Supplier supplies Widget.
         assert!(verilog.contains("module widget"));
         assert!(verilog.contains("module supplier"));
         assert!(verilog.contains("module top"));
-        // 2 entity + 2 bram + audit + ingress + egress + wasm_reducer + boot_fsm + top = 10.
-        assert_eq!(verilog.matches("endmodule").count(), 10);
+        assert_eq!(verilog.matches("module ").count(),
+                   verilog.matches("endmodule").count(),
+                   "module/endmodule mismatch:\n{}", verilog);
     }
 
     /// Verilog output is well-formed: every module has clk/rst_n ports,
@@ -2178,9 +2190,10 @@ Counter has Count.
         let verilog = compile_to_verilog(&state);
         let modules = verilog.matches("module ").count();
         let endmodules = verilog.matches("endmodule").count();
-        // 4 entity + 4 bram + audit + ingress + egress + wasm_reducer + boot_fsm + top = 14.
-        assert_eq!(modules, 14);
-        assert_eq!(endmodules, 14);
+        // The invariant under test is balance; the absolute count shifts
+        // whenever the generator gains another fixed module (e.g.
+        // system_kernel from #154). Balance must hold regardless.
         assert_eq!(modules, endmodules);
+        assert!(verilog.contains("module top"));
     }
 }
