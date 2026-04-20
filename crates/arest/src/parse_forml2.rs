@@ -2030,8 +2030,33 @@ fn resolve_derivation_rule(
         })
         .collect::<Vec<_>>();
 
-    // Resolve consequent
+    // Resolve consequent. If the consequent text carries a trailing
+    // single-quoted literal (e.g. grammar rule head `Statement has
+    // Classification 'Entity Type Declaration'`, #286), capture the
+    // literal and record it as a fixed binding on the consequent FT's
+    // last role before handing the text to the FT resolver. find_nouns
+    // already ignores the quoted segment, so the FT itself resolves on
+    // the unquoted portion either way. The vec is cleared first because
+    // re_resolve_rules re-runs this function and would otherwise
+    // accumulate duplicates from prior passes.
+    rule.consequent_role_literals.clear();
+    let trailing_literal_re = regex::Regex::new(r" '([^']*)'\s*$").expect("static");
+    let consequent_trailing_literal = trailing_literal_re
+        .captures(consequent_text)
+        .and_then(|c| c.get(1).map(|m| m.as_str().to_string()));
     rule.consequent_fact_type_id = resolve_fact_type(consequent_text).unwrap_or_default();
+    if let Some(lit) = consequent_trailing_literal {
+        if !rule.consequent_fact_type_id.is_empty() {
+            let role = ir.fact_types.get(&rule.consequent_fact_type_id)
+                .and_then(|ft| ft.roles.last())
+                .map(|r| r.noun_name.clone())
+                .unwrap_or_default();
+            if !role.is_empty() {
+                rule.consequent_role_literals.push(
+                    crate::types::ConsequentRoleLiteral { role, value: lit });
+            }
+        }
+    }
 
     // Resolve antecedents, carrying inline-comparator filters AND
     // arithmetic-definitional clauses alongside. A definitional clause
@@ -2041,6 +2066,7 @@ fn resolve_derivation_rule(
     // with an AntecedentFilter pinned to that antecedent's position.
     let mut resolved_ids: Vec<String> = Vec::new();
     let mut filters: Vec<crate::types::AntecedentFilter> = Vec::new();
+    let mut role_literals: Vec<crate::types::AntecedentRoleLiteral> = Vec::new();
     let mut computed: Vec<crate::types::ConsequentComputedBinding> = Vec::new();
     let mut aggregates: Vec<crate::types::ConsequentAggregate> = Vec::new();
     for part in antecedent_parts.iter() {
@@ -2086,8 +2112,14 @@ fn resolve_derivation_rule(
         // Strip a trailing `' <value>'` literal (single-quoted) so
         // `Task has Status 'Done'` resolves to the FT `Task has Status`
         // just like its unquoted form. The literal is semantically a
-        // filter on the last role, not part of the FT reading.
-        let literal_re = regex::Regex::new(r" '[^']*'\s*$").expect("static");
+        // filter on the last role, not part of the FT reading. The
+        // captured value (trailing_literal) is recorded as an
+        // AntecedentRoleLiteral after the FT resolves, so downstream
+        // compilation can filter antecedent facts by that literal
+        // (#286).
+        let literal_re = regex::Regex::new(r" '([^']*)'\s*$").expect("static");
+        let trailing_literal = literal_re.captures(&stripped)
+            .and_then(|c| c.get(1).map(|m| m.as_str().to_string()));
         let destripped_literal = literal_re.replace(&stripped, "").to_string();
         let ft_resolved = resolve_fact_type(&stripped)
             .or_else(|| (dehyphenated != stripped).then(|| resolve_fact_type(&dehyphenated)).flatten())
@@ -2116,6 +2148,19 @@ fn resolve_derivation_rule(
                     antecedent_index: resolved_ids.len(),
                     role, op, value,
                 });
+            }
+            if let Some(lit) = trailing_literal.clone() {
+                let role = ir.fact_types.get(&ft_id)
+                    .and_then(|ft| ft.roles.last())
+                    .map(|r| r.noun_name.clone())
+                    .unwrap_or_default();
+                if !role.is_empty() {
+                    role_literals.push(crate::types::AntecedentRoleLiteral {
+                        antecedent_index: resolved_ids.len(),
+                        role,
+                        value: lit,
+                    });
+                }
             }
             resolved_ids.push(ft_id);
             continue;
@@ -2224,6 +2269,7 @@ fn resolve_derivation_rule(
     }
     rule.antecedent_fact_type_ids = resolved_ids;
     rule.antecedent_filters = filters;
+    rule.antecedent_role_literals = role_literals;
     rule.consequent_computed_bindings = computed;
     rule.consequent_aggregates = aggregates;
 
@@ -2256,34 +2302,18 @@ fn resolve_derivation_rule(
             .unwrap_or_default();
     });
 
-    // Set rule ID: prefer resolved consequent FT ID, fall back to a
-    // sanitized form of the consequent text, then to a hash of rule text.
-    // A non-empty ID prevents multiple := rules from sharing the cell
-    // `derivation:` in DEFS and clobbering each other.
-    rule.id = if !rule.consequent_fact_type_id.is_empty() {
-        rule.consequent_fact_type_id.clone()
-    } else {
-        let cleaned = strip_anaphora(consequent_text);
-        let sanitized: String = cleaned.trim().trim_end_matches('.').trim().chars()
-            .map(|c| if c.is_alphanumeric() { c } else { '_' })
-            .collect::<String>()
-            .split('_').filter(|s| !s.is_empty())
-            .collect::<Vec<_>>().join("_");
-        if !sanitized.is_empty() {
-            sanitized
-        } else {
-            // FNV-1a 64-bit over the rule text â€” no hasher dep, no
-            // allocation, stable output. Only used as a fallback rule
-            // name when the sanitized text collapses to empty, so
-            // collisions matter only inside a single domain's rules.
-            let mut h: u64 = 0xcbf29ce484222325;
-            for b in rule.text.as_bytes() {
-                h ^= *b as u64;
-                h = h.wrapping_mul(0x100000001b3);
-            }
-            format!("_rule_{h:x}")
-        }
-    };
+    // Set rule ID from the FULL rule text. Multiple rules often share
+    // a consequent FT (the FORML 2 grammar has 28 rules all producing
+    // `Statement has Classification`), so keying on consequent alone
+    // collapses them to a single entry under merge_states's identity
+    // dedup. Hash the full text for stable, collision-resistant IDs.
+    // FNV-1a 64-bit — no hasher dep, no allocation, stable output.
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in rule.text.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    rule.id = format!("rule_{h:x}");
 }
 
 /// Append a fact to a cell in the ParseCtx's Object-state accumulator.
@@ -3905,6 +3935,65 @@ mod tests {
             ArithExpr::Op("+".to_string(),
                 Box::new(ArithExpr::RoleRef("Val".to_string())),
                 Box::new(ArithExpr::Literal(1.0))));
+    }
+
+    // ── String-literal role filters (#286) ────────────────────────────
+    //
+    // FORML 2 grammar readings bind consequent roles to fixed literals
+    // and filter antecedent roles by literals:
+    //   `Statement has Classification 'Entity Type Declaration'
+    //    iff Statement has Trailing Marker 'is an entity type'.`
+    // These two vecs on DerivationRuleDef carry the literals through
+    // to compile_explicit_derivation so Stage-2 no longer needs its
+    // own focused interpreter.
+
+    #[test]
+    fn derivation_rule_captures_consequent_role_literal() {
+        let input = "Statement(.id) is an entity type.\n\
+            Classification(.name) is an entity type.\n\
+            Trailing Marker is a value type.\n\
+            ## Fact Types\n\
+            Statement has Classification.\n\
+            Statement has Trailing Marker.\n\
+            ## Derivation Rules\n\
+            Statement has Classification 'Entity Type Declaration' iff \
+            Statement has Trailing Marker 'is an entity type'.";
+        let ir = parse_markdown(input).unwrap();
+        let rules = super::derivation_rules_from_cells(&ir);
+        let rule = rules.iter()
+            .find(|r| r.text.contains("Entity Type Declaration"))
+            .expect("rule present");
+        assert_eq!(rule.consequent_role_literals.len(), 1,
+            "expected one consequent literal, got {:?}",
+            rule.consequent_role_literals);
+        let crl = &rule.consequent_role_literals[0];
+        assert_eq!(crl.role, "Classification");
+        assert_eq!(crl.value, "Entity Type Declaration");
+    }
+
+    #[test]
+    fn derivation_rule_captures_antecedent_role_literal() {
+        let input = "Statement(.id) is an entity type.\n\
+            Classification(.name) is an entity type.\n\
+            Trailing Marker is a value type.\n\
+            ## Fact Types\n\
+            Statement has Classification.\n\
+            Statement has Trailing Marker.\n\
+            ## Derivation Rules\n\
+            Statement has Classification 'Entity Type Declaration' iff \
+            Statement has Trailing Marker 'is an entity type'.";
+        let ir = parse_markdown(input).unwrap();
+        let rules = super::derivation_rules_from_cells(&ir);
+        let rule = rules.iter()
+            .find(|r| r.text.contains("Entity Type Declaration"))
+            .expect("rule present");
+        assert_eq!(rule.antecedent_role_literals.len(), 1,
+            "expected one antecedent literal, got {:?}",
+            rule.antecedent_role_literals);
+        let arl = &rule.antecedent_role_literals[0];
+        assert_eq!(arl.antecedent_index, 0);
+        assert_eq!(arl.role, "Trailing Marker");
+        assert_eq!(arl.value, "is an entity type");
     }
 
     // â”€â”€ Aggregate clauses (Codd Â§2.3.4 image set + Backus Insert) â”€â”€
