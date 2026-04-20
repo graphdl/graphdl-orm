@@ -949,7 +949,7 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
         .map(|facts| facts.iter().map(|f| {
             let get = |key: &str| binding(f, key).unwrap_or("").to_string();
             DerivationRuleDef {
-                id: get("id"), text: get("text"), antecedent_fact_type_ids: vec![],
+                id: get("id"), text: get("text"), antecedent_sources: vec![], consequent_instance_role: String::new(),
                 consequent_cell: crate::types::ConsequentCellSource::decode(&get("consequentFactTypeId")),
                 kind: DerivationKind::ModusPonens, join_on: vec![], match_on: vec![], consequent_bindings: vec![], antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![], unresolved_clauses: vec![], antecedent_role_literals: vec![], consequent_role_literals: vec![],
             }
@@ -1109,8 +1109,15 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
                 // consequents dispatch dynamically over the metamodel's
                 // Fact Type cell — those rules' nouns are already
                 // covered by the antecedent-FT side of the chain.
+                //
+                // antecedent_sources may carry `InstancesOfNoun` entries;
+                // those don't correspond to a single FT id, so the FT
+                // lookup chain skips them via `.fact_type_id()` which
+                // returns the empty string (filtered out below).
                 let consequent_literal = rule.consequent_cell.literal_id().to_string();
-                for ft_id in rule.antecedent_fact_type_ids.iter()
+                let ante_ft_ids: Vec<String> = rule.antecedent_sources.iter()
+                    .map(|s| s.fact_type_id().to_string()).collect();
+                for ft_id in ante_ft_ids.iter()
                     .chain(core::iter::once(&consequent_literal))
                     .filter(|s| !s.is_empty())
                 {
@@ -1125,8 +1132,10 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
                 // Match domain rules with empty id by antecedent overlap
                 for rule in &c_derivation_rules {
                     if rule.id.is_empty() || rule.id == *did {
-                        for ft_id in &rule.antecedent_fact_type_ids {
-                            if let Some(ft) = c_fact_types.get(ft_id.as_str()) {
+                        for src in &rule.antecedent_sources {
+                            let ft_id = src.fact_type_id();
+                            if ft_id.is_empty() { continue; }
+                            if let Some(ft) = c_fact_types.get(ft_id) {
                                 for role in &ft.roles { nouns.insert(role.noun_name.clone()); }
                             }
                         }
@@ -1881,7 +1890,7 @@ pub(crate) fn cell_index_from_state(state: &crate::ast::Object) -> CellIndex {
             // rebuilds from text below.
             let get = |key: &str| binding(f, key).unwrap_or("").to_string();
             DerivationRuleDef {
-                id: get("id"), text: get("text"), antecedent_fact_type_ids: vec![],
+                id: get("id"), text: get("text"), antecedent_sources: vec![], consequent_instance_role: String::new(),
                 consequent_cell: crate::types::ConsequentCellSource::decode(&get("consequentFactTypeId")),
                 kind: DerivationKind::ModusPonens, join_on: vec![], match_on: vec![],
                 consequent_bindings: vec![], antecedent_filters: vec![],
@@ -1919,7 +1928,7 @@ pub(crate) fn cell_index_from_state(state: &crate::ast::Object) -> CellIndex {
     let resolved_rules = {
         let mut rules = derivation_rules;
         let needs_resolve = rules.iter().any(|r|
-            r.antecedent_fact_type_ids.is_empty()
+            r.antecedent_sources.is_empty()
                 && r.consequent_aggregates.is_empty()
                 && r.consequent_computed_bindings.is_empty()
         );
@@ -2068,8 +2077,48 @@ fn compile_derivations(data: &CellIndex, sm_defs: &HashMap<String, StateMachineD
         }
     }));
 
-    // Implicit: subtype inheritance from noun definitions
-    derivations.extend(compile_subtype_inheritance(data));
+    // Subtype inheritance (#287): for each (subtype, supertype) pair
+    // and each fact type where the supertype plays some role, emit a
+    // standard DerivationRuleDef whose antecedent is
+    // InstancesOfNoun(subtype) and whose consequent cell is the
+    // super-FT id. `compile_explicit_derivation`'s 1-antecedent
+    // branch specialises for `InstancesOfNoun` by wrapping the
+    // per-atom step in a single-pair binding keyed by the supertype
+    // role noun name. `forward_chain_defs_state` then routes the
+    // emitted `<super_ft_id, reading, <<super_role, instance>>>`
+    // tuple into the super-FT's cell, where redundant inheritance
+    // emissions are deduped by `state_contains_fact`.
+    derivations.extend(data.subtypes.iter()
+        .flat_map(|(sub_name, super_name)| {
+            data.fact_types.iter()
+                .flat_map(move |(ft_id, ft)| {
+                    let sub = sub_name.clone();
+                    let sup = super_name.clone();
+                    let ft_id = ft_id.clone();
+                    let reading = ft.reading.clone();
+                    let sup_filter = sup.clone();
+                    ft.roles.iter()
+                        .filter(move |r| r.noun_name == sup_filter)
+                        .map(move |r| (sub.clone(), sup.clone(), ft_id.clone(), reading.clone(), r.noun_name.clone()))
+                })
+        })
+        .map(|(sub, sup, ft_id, reading, super_role)| {
+            let rule = DerivationRuleDef {
+                id: format!("_subtype_{}_{}_{}", sub, sup, ft_id),
+                text: format!("{} is a subtype of {} — inherits {}", sub, sup, reading),
+                antecedent_sources: vec![
+                    crate::types::AntecedentSource::InstancesOfNoun(sub),
+                ],
+                consequent_cell: crate::types::ConsequentCellSource::Literal(ft_id),
+                consequent_instance_role: super_role,
+                kind: DerivationKind::SubtypeInheritance,
+                join_on: vec![], match_on: vec![], consequent_bindings: vec![],
+                antecedent_filters: vec![], consequent_computed_bindings: vec![],
+                consequent_aggregates: vec![], unresolved_clauses: vec![],
+                antecedent_role_literals: vec![], consequent_role_literals: vec![],
+            };
+            compile_explicit_derivation(data, &rule)
+        }));
 
     // SS auto-fill (#287): each Subset Constraint whose `subset_autofill`
     // span marker is true materializes a derivation that copies every
@@ -2089,8 +2138,9 @@ fn compile_derivations(data: &CellIndex, sm_defs: &HashMap<String, StateMachineD
             let rule = DerivationRuleDef {
                 id: format!("_ss_autofill_{}", cdef.id),
                 text: format!("SS autofill from {}", cdef.text),
-                antecedent_fact_type_ids: vec![a_ft_id],
+                antecedent_sources: vec![crate::types::AntecedentSource::FactType(a_ft_id)],
                 consequent_cell: crate::types::ConsequentCellSource::Literal(b_ft_id),
+                consequent_instance_role: String::new(),
                 kind: DerivationKind::ModusPonens,
                 join_on: vec![], match_on: vec![], consequent_bindings: vec![],
                 antecedent_filters: vec![], consequent_computed_bindings: vec![],
@@ -2100,11 +2150,127 @@ fn compile_derivations(data: &CellIndex, sm_defs: &HashMap<String, StateMachineD
             compile_explicit_derivation(data, &rule)
         }));
 
-    // Implicit: transitivity from shared roles
-    derivations.extend(compile_transitivity(data));
+    // Transitivity (#287): for each pair of binary FTs where ft1's
+    // second role shares its noun with ft2's first role (A→B and B→C),
+    // emit a standard Join `DerivationRuleDef` and route through
+    // compile_join_derivation. The compile-time loop enumerating FT
+    // pairs stays (a single FORML 2 rule would need a metamodel
+    // antecedent over `Fact Type has Role` populations — deferred), but
+    // the per-pair work now uses the same two-antecedent Join Func
+    // shape every user rule takes. The consequent cell id
+    // `_transitive_<ft1>_<ft2>` matches the pre-287 name so SM
+    // infrastructure gates in `command.rs` keep working.
+    let binary_fts: Vec<(String, FactTypeDef)> = data.fact_types.iter()
+        .filter(|(_, ft)| ft.roles.len() == 2)
+        .map(|(id, ft)| (id.clone(), ft.clone()))
+        .collect();
+    derivations.extend(binary_fts.iter().enumerate()
+        .flat_map(|(i, (ft1_id, ft1))| binary_fts.iter().enumerate()
+            .filter(move |(j, _)| *j != i)
+            .filter_map(move |(_, (ft2_id, ft2))| {
+                (ft1.roles[1].noun_name == ft2.roles[0].noun_name).then_some(())?;
+                let shared_noun = ft1.roles[1].noun_name.clone();
+                let src_noun = ft1.roles[0].noun_name.clone();
+                let dst_noun = ft2.roles[1].noun_name.clone();
+                let reading = format!(
+                    "{} transitively relates to {} via {}",
+                    src_noun, dst_noun, shared_noun);
+                let rule = DerivationRuleDef {
+                    id: format!("_transitivity_{}_{}", ft1_id, ft2_id),
+                    text: reading,
+                    antecedent_sources: vec![
+                        crate::types::AntecedentSource::FactType(ft1_id.clone()),
+                        crate::types::AntecedentSource::FactType(ft2_id.clone()),
+                    ],
+                    consequent_cell: crate::types::ConsequentCellSource::Literal(
+                        format!("_transitive_{}_{}", ft1_id, ft2_id)),
+                    consequent_instance_role: String::new(),
+                    kind: DerivationKind::Transitivity,
+                    join_on: vec![shared_noun],
+                    match_on: vec![],
+                    consequent_bindings: vec![src_noun, dst_noun],
+                    antecedent_filters: vec![], consequent_computed_bindings: vec![],
+                    consequent_aggregates: vec![], unresolved_clauses: vec![],
+                    antecedent_role_literals: vec![], consequent_role_literals: vec![],
+                };
+                Some(compile_join_derivation(data, &rule))
+            }))
+    );
 
-    // Implicit: CWA negation from world assumptions
-    derivations.extend(compile_cwa_negation(data));
+    // CWA negation (#287): for each closed-world noun and each FT
+    // where the noun plays some role, emit a derivation whose Func
+    // walks every instance of the noun across the population and
+    // emits a negation fact into the `_cwa_negation:<ft_id>` cell
+    // for any instance that doesn't already participate in the FT
+    // at that role.
+    //
+    // The "doesn't participate" check is semantically load-bearing
+    // (`NOT X in ft` is only true when X is genuinely absent), and
+    // it doesn't reduce to the `InstancesOfNoun` + standard
+    // DerivationRuleDef pipeline without a new "negative antecedent"
+    // shape. The logic below is the same Func the ex-named function
+    // built, inlined at the single point of use so the named
+    // `compile_cwa_negation` function can go away. The derivation id
+    // `_cwa_negation_<noun>` is preserved so forward-chain substring
+    // gates (e.g. `evaluate.rs` test assertions) keep matching.
+    derivations.extend(data.nouns.iter()
+        .filter(|(_, def)| def.world_assumption == WorldAssumption::Closed)
+        .filter_map(|(noun_name, _)| {
+            let relevant_fts: Vec<(String, String, usize)> = data.fact_types.iter()
+                .flat_map(|(ft_id, ft)| ft.roles.iter()
+                    .filter(|r| r.noun_name == *noun_name)
+                    .map(move |r| (ft_id.clone(), ft.reading.clone(), r.role_index)))
+                .collect();
+            (!relevant_fts.is_empty()).then_some(())?;
+
+            let noun = noun_name.clone();
+            let id = format!("_cwa_negation_{}", noun);
+            let text = format!("CWA: absent facts about {} are false", noun);
+            let instances = instances_of_noun_func(&noun);
+
+            let per_ft_funcs: Vec<Func> = relevant_fts.iter().map(|(ft_id, reading, role_idx)| {
+                let ft_facts = extract_facts_from_pop(ft_id);
+                let match_cond = Func::compose(Func::Eq, Func::construction(vec![
+                    Func::Selector(1),
+                    Func::compose(role_value(*role_idx), Func::Selector(2)),
+                ]));
+                let participation_check = Func::compose(
+                    Func::NullTest,
+                    Func::compose(Func::filter(match_cond), Func::DistL),
+                );
+                let neg_cell = format!("_cwa_negation:{}", ft_id);
+                let neg_noun = format!("_neg_{}", noun);
+                let neg_reading = format!("NOT: {} (CWA negation for {})", reading, noun);
+                let negation_fact = Func::construction(vec![
+                    Func::constant(Object::atom(&neg_cell)),
+                    Func::constant(Object::atom(&neg_reading)),
+                    Func::construction(vec![
+                        Func::construction(vec![
+                            Func::constant(Object::atom(&neg_noun)),
+                            Func::Selector(1),
+                        ]),
+                    ]),
+                ]);
+                let per_instance = Func::condition(
+                    participation_check,
+                    Func::construction(vec![negation_fact]),
+                    Func::constant(Object::phi()),
+                );
+                Func::compose(
+                    Func::Concat,
+                    Func::compose(
+                        Func::apply_to_all(per_instance),
+                        Func::compose(Func::DistR, Func::construction(vec![instances.clone(), ft_facts])),
+                    ),
+                )
+            }).collect();
+
+            let func = match per_ft_funcs.len() {
+                1 => per_ft_funcs.into_iter().next().unwrap(),
+                _ => Func::compose(Func::Concat, Func::construction(per_ft_funcs)),
+            };
+            Some(CompiledDerivation { id, text, kind: DerivationKind::ClosedWorldNegation, func })
+        }));
 
     // Implicit: state machine initialization from SM definitions
     // Uses sm_defs (derived from instance facts) rather than ir.state_machines.
@@ -2385,7 +2551,14 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
     let id = rule.id.clone();
     let text = rule.text.clone();
     let kind = rule.kind.clone();
-    let antecedent_ids = rule.antecedent_fact_type_ids.clone();
+    // For the existing FactType-antecedent path, collect FT ids in
+    // declaration order so downstream code that indexed
+    // `antecedent_ids[i]` continues to work. `InstancesOfNoun` entries
+    // produce an empty FT id — the dispatch below checks the
+    // `antecedent_sources` directly for the "instances of noun" case
+    // rather than relying on the FT id.
+    let antecedent_ids: Vec<String> = rule.antecedent_sources.iter()
+        .map(|s| s.fact_type_id().to_string()).collect();
     // Consequent cell key & reading:
     //   Literal(id) — resolved at compile time. Every user-authored
     //     rule takes this path; the first tuple element is a constant
@@ -2505,6 +2678,38 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
         }
         1 => {
             let ft_id = &antecedent_ids[0];
+            // InstancesOfNoun source: the antecedent is a Seq of raw
+            // atoms (noun instances) aggregated across all cells by
+            // `instances_of_noun_func`. The per-fact step sees one
+            // atom and emits `<cons_id, reading, <<role, atom>>>`
+            // where `role` comes from `consequent_instance_role`.
+            // This is the shape subtype inheritance and CWA negation
+            // rules use to fan out across every FT that participates
+            // the (sub)noun — one DerivationRuleDef per (noun, target
+            // FT) pair, each with a static consequent cell id.
+            if let Some(crate::types::AntecedentSource::InstancesOfNoun(noun)) =
+                rule.antecedent_sources.first()
+            {
+                let role_key = rule.consequent_instance_role.replace(' ', "_");
+                let bindings = Func::construction(vec![
+                    Func::construction(vec![
+                        Func::constant(Object::atom(&role_key)),
+                        Func::Id,
+                    ]),
+                ]);
+                let derive_one = Func::construction(vec![
+                    consequent_id_func.clone(),
+                    consequent_reading_func.clone(),
+                    bindings,
+                ]);
+                return CompiledDerivation {
+                    id, text, kind,
+                    func: Func::compose(
+                        Func::apply_to_all(derive_one),
+                        instances_of_noun_func(noun),
+                    ),
+                };
+            }
             // Per-fact derived: input is one antecedent fact (already in
             // <<noun, val>, ...> binding-seq shape); output is
             //   <consequent_id, consequent_reading, consequent_bindings>.
@@ -2669,7 +2874,12 @@ fn compile_join_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Compil
     let id = rule.id.clone();
     let text = rule.text.clone();
     let kind = rule.kind.clone();
-    let antecedent_ids = rule.antecedent_fact_type_ids.clone();
+    // Join rules assume FactType antecedents (user-authored `that FT`
+    // anaphora points at declared fact types). InstancesOfNoun entries
+    // collapse to empty FT id, which `data.fact_types.get` returns None
+    // for, degrading to empty role lists — safe no-op.
+    let antecedent_ids: Vec<String> = rule.antecedent_sources.iter()
+        .map(|s| s.fact_type_id().to_string()).collect();
     // Join rules always have a literal consequent — `that FT` anaphora
     // in a user rule points at one specific FT after resolution. The
     // AntecedentRole shape is reserved for metamodel rules that fan out
@@ -2827,213 +3037,14 @@ fn compile_join_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Compil
 // (join_recursive, check_join_keys, check_match_predicates removed --
 //  join logic now expressed as pure Func via pairwise DistR/DistL/Filter/Concat.)
 
-/// Subtype inheritance: for each noun with a supertype,
-/// instances of the subtype inherit participation in the supertype's fact types.
-///
-/// Pure AST form would be:
-///   For each supertype fact type:
-///     alpha(Condition(Not  .  participates, construct_derived, Constant(phi)))  .  instances
-///   Blocked on: instances_of requires a global scan (fold over all fact types
-///   extracting bindings), and participates_in requires a find-by-ID lookup.
-///   Both need Filter/Find primitives not yet in the AST.
-fn compile_subtype_inheritance(data: &CellIndex) -> Vec<CompiledDerivation> {
-    // Î±(subtype_pair â†’ derivation) : subtypes â€” filter out pairs with no supertype fact types
-    data.subtypes.iter().filter_map(|(sub_name, super_name)| {
-        let sft: Vec<(String, String, usize)> = data.fact_types.iter()
-            .flat_map(|(ft_id, ft)| ft.roles.iter()
-                .filter(|r| r.noun_name == *super_name)
-                .map(move |r| (ft_id.clone(), ft.reading.clone(), r.role_index)))
-            .collect();
-        (!sft.is_empty()).then_some(())?;
-
-        let sub = sub_name.clone();
-        let sup = super_name.clone();
-        let instances = instances_of_noun_func(&sub);
-
-        // Î±(super_ft â†’ check_and_derive) : super_fact_types
-        let ft_checks: Vec<Func> = sft.iter().map(|(ft_id, reading, role_idx)| {
-            let ft_facts = extract_facts_from_pop(ft_id);
-            let inst_in_fact = Func::compose(Func::Eq, Func::construction(vec![
-                Func::compose(role_value(*role_idx), Func::Selector(2)),
-                Func::Selector(1),
-            ]));
-            let participates = Func::compose(
-                Func::compose(Func::Not, Func::NullTest),
-                Func::compose(Func::filter(inst_in_fact), Func::DistL));
-            let derived_fact = Func::construction(vec![
-                Func::constant(Object::atom(ft_id)),
-                Func::constant(Object::atom(reading)),
-                Func::construction(vec![Func::construction(vec![
-                    Func::constant(Object::atom(&sup)), Func::Selector(1)])]),
-            ]);
-            let check_one = Func::condition(
-                Func::compose(Func::Not, participates),
-                Func::construction(vec![derived_fact]),
-                Func::constant(Object::phi()));
-            Func::compose(Func::Concat, Func::compose(
-                Func::apply_to_all(check_one),
-                Func::compose(Func::DistR, Func::construction(vec![instances.clone(), ft_facts]))))
-        }).collect();
-
-        let func = match ft_checks.len() {
-            0 => Func::constant(Object::phi()),
-            1 => ft_checks.into_iter().next().unwrap(),
-            _ => Func::construction(ft_checks),
-        };
-        Some(CompiledDerivation {
-            id: format!("_subtype_{}_{}", sub, sup),
-            text: format!("{} is a subtype of {} -- inherits fact types", sub, sup),
-            kind: DerivationKind::SubtypeInheritance, func,
-        })
-    }).collect()
-}
-
-/// Transitivity: for fact types that share a noun in different roles (A->B, B->C),
-/// derive the transitive closure A->C. Limited depth to prevent infinite chains.
-///
-/// Pure Func form:
-///   a(derived_fact) . Filter(join_cond) . Concat . a(Filter(join) . DistL) . DistR . [ft1_facts, ft2_facts]
-///   where join_cond checks role_value(1)(f1) = role_value(0)(f2) on the shared noun.
-fn compile_transitivity(data: &CellIndex) -> Vec<CompiledDerivation> {
-    // Cross-product of binary fact types, filtered by shared noun (A->B, B->C)
-    let binary_fts: Vec<(&String, &FactTypeDef)> = data.fact_types.iter()
-        .filter(|(_, ft)| ft.roles.len() == 2)
-        .collect();
-
-    binary_fts.iter().enumerate()
-        .flat_map(|(i, (ft1_id, ft1))| binary_fts.iter().enumerate()
-            .filter(move |(j, _)| *j != i)
-            .filter_map(move |(_, (ft2_id, ft2))| {
-                // Filter: ft1's role[1] noun == ft2's role[0] noun
-                (ft1.roles[1].noun_name == ft2.roles[0].noun_name).then(|| ())?;
-
-                let shared_noun = ft1.roles[1].noun_name.clone();
-                let src_noun = ft1.roles[0].noun_name.clone();
-                let dst_noun = ft2.roles[1].noun_name.clone();
-                let ft1_id_c = (*ft1_id).clone();
-                let ft2_id_c = (*ft2_id).clone();
-                let reading = format!("{} transitively relates to {} via {}", src_noun, dst_noun, shared_noun);
-                let transitive_ft_id = format!("_transitive_{}_{}", ft1_id_c, ft2_id_c);
-
-                let ft1_facts = extract_facts_from_pop(&ft1_id_c);
-                let ft2_facts = extract_facts_from_pop(&ft2_id_c);
-
-                let join_cond = Func::compose(Func::Eq, Func::construction(vec![
-                    Func::compose(role_value(1), Func::Selector(1)),
-                    Func::compose(role_value(0), Func::Selector(2)),
-                ]));
-
-                let derived_fact = Func::construction(vec![
-                    Func::constant(Object::atom(&transitive_ft_id)),
-                    Func::constant(Object::atom(&reading)),
-                    Func::construction(vec![
-                        Func::construction(vec![Func::constant(Object::atom(&src_noun)), Func::compose(role_value(0), Func::Selector(1))]),
-                        Func::construction(vec![Func::constant(Object::atom(&dst_noun)), Func::compose(role_value(1), Func::Selector(2))]),
-                    ]),
-                ]);
-
-                let func = Func::compose(Func::apply_to_all(derived_fact), Func::compose(Func::Concat,
-                    Func::compose(Func::apply_to_all(Func::compose(Func::filter(join_cond), Func::DistL)),
-                        Func::compose(Func::DistR, Func::construction(vec![ft1_facts, ft2_facts])))));
-
-                Some(CompiledDerivation {
-                    id: format!("_transitivity_{}_{}", ft1_id_c, ft2_id_c),
-                    text: reading, kind: DerivationKind::Transitivity, func,
-                })
-            }))
-        .collect()
-}
-
-/// CWA negation: for nouns with WorldAssumption::Closed,
-/// if a fact type involving this noun has no instances for a given entity,
-/// derive the negation. For OWA nouns, absence is unknown, not false.
-///
-/// Pure Func form (per fact type):
-///   Concat . a(Condition(NullTest . Filter(match) . DistL, [negation], phi)) . DistR . [instances, ft_facts]
-///   where match checks role_value(ri)(fact) = instance on each <instance, fact> pair.
-fn compile_cwa_negation(data: &CellIndex) -> Vec<CompiledDerivation> {
-    data.nouns.iter()
-        .filter(|(_, def)| def.world_assumption == WorldAssumption::Closed)
-        .filter_map(|(noun_name, _)| {
-            let relevant_fts: Vec<(String, String, usize)> = data.fact_types.iter()
-                .flat_map(|(ft_id, ft)| ft.roles.iter()
-                    .filter(|r| r.noun_name == *noun_name)
-                    .map(move |r| (ft_id.clone(), ft.reading.clone(), r.role_index)))
-                .collect();
-            (!relevant_fts.is_empty()).then_some(())?;
-
-            let noun = noun_name.clone();
-            let id = format!("_cwa_negation_{}", noun);
-            let text = format!("CWA: absent facts about {} are false", noun);
-            let instances = instances_of_noun_func(&noun);
-
-            let per_ft_funcs: Vec<Func> = relevant_fts.iter().map(|(ft_id, reading, role_idx)| {
-            let ft_facts = extract_facts_from_pop(ft_id);
-
-            // Match condition for <instance, fact> pair from DistL:
-            // eq . [Sel(1), role_value(role_idx) . Sel(2)]
-            // Sel(1) = instance, Sel(2) = fact, role_value extracts the noun's value from fact
-            let match_cond = Func::compose(Func::Eq, Func::construction(vec![
-                Func::Selector(1),
-                Func::compose(role_value(*role_idx), Func::Selector(2)),
-            ]));
-
-            // For each <instance, all_facts> pair from DistR:
-            //   Filter(match_cond) . DistL gives matching <instance, fact> pairs
-            //   NullTest checks if any matches exist
-            let participation_check = Func::compose(
-                Func::NullTest,
-                Func::compose(Func::filter(match_cond), Func::DistL),
-            );
-
-            // Negation fact goes to a SEPARATE cell ("_cwa_negation:<ft_id>")
-            // and its noun binding is prefixed ("_neg_<noun>") so that
-            // presence constraints (MC, FC, â€¦) enumerating positive
-            // noun instances via instances_of_noun_func never see the
-            // "NOT" facts. The backward-chain prover (evaluate.rs)
-            // consults the derived fact list directly; it does not read
-            // this cell.
-            let neg_cell = format!("_cwa_negation:{}", ft_id);
-            let neg_noun = format!("_neg_{}", noun);
-            let neg_reading = format!("NOT: {} (CWA negation for {})", reading, noun);
-            let negation_fact = Func::construction(vec![
-                Func::constant(Object::atom(&neg_cell)),
-                Func::constant(Object::atom(&neg_reading)),
-                Func::construction(vec![
-                    Func::construction(vec![
-                        Func::constant(Object::atom(&neg_noun)),
-                        Func::Selector(1),
-                    ]),
-                ]),
-            ]);
-
-            // Condition: if NullTest (no participation) -> wrap negation in singleton for Concat;
-            //            else -> phi (empty, contributes nothing to Concat)
-            let per_instance = Func::condition(
-                participation_check,
-                Func::construction(vec![negation_fact]),
-                Func::constant(Object::phi()),
-            );
-
-            // Full pipeline for this ft:
-            // Concat . a(per_instance) . DistR . [instances, ft_facts]
-            let per_ft = Func::compose(
-                Func::Concat,
-                Func::compose(
-                    Func::apply_to_all(per_instance),
-                    Func::compose(Func::DistR, Func::construction(vec![instances.clone(), ft_facts])),
-                ),
-            );
-            per_ft
-        }).collect();
-
-            let func = match per_ft_funcs.len() {
-                1 => per_ft_funcs.into_iter().next().unwrap(),
-                _ => Func::compose(Func::Concat, Func::construction(per_ft_funcs)),
-            };
-            Some(CompiledDerivation { id, text, kind: DerivationKind::ClosedWorldNegation, func })
-        }).collect()
-}
+// compile_subtype_inheritance + compile_cwa_negation deleted (#287).
+// Subtype inheritance: compile_derivations now synthesises a standard
+// DerivationRuleDef per (subtype, super_ft) with an `InstancesOfNoun`
+// antecedent and routes through compile_explicit_derivation's
+// 1-antecedent branch (same Func shape every user rule uses).
+// CWA negation: the custom Func is inlined at its one point of use
+// in compile_derivations so the named function can go away without
+// introducing a "negative antecedent" DerivationRuleDef shape.
 
 /// State machine initialization as a derivation rule.
 ///
@@ -4934,7 +4945,11 @@ pub fn generate_derivation_triggers(
         // their materialization is handled by the forward-chain path,
         // not by a CREATE TRIGGER.
         let consequent = rule.consequent_cell.literal_id();
-        if consequent.is_empty() || rule.antecedent_fact_type_ids.is_empty() { continue; }
+        if consequent.is_empty() || rule.antecedent_sources.is_empty() { continue; }
+        // Skip rules whose antecedents include InstancesOfNoun — those
+        // aren't backed by one FT's cell and can't drive a single SQL
+        // trigger. The forward-chain path handles them at runtime.
+        if rule.antecedent_sources.iter().any(|s| s.is_instances_of_noun()) { continue; }
 
         let consequent_table = crate::rmap::to_snake(consequent);
 
@@ -4964,7 +4979,9 @@ pub fn generate_derivation_triggers(
         }
 
         let mut triggers = Vec::new();
-        for (i, ant_ft_id) in rule.antecedent_fact_type_ids.iter().enumerate() {
+        let ant_ft_ids: Vec<String> = rule.antecedent_sources.iter()
+            .map(|s| s.fact_type_id().to_string()).collect();
+        for (i, ant_ft_id) in ant_ft_ids.iter().enumerate() {
             let ant_table = crate::rmap::to_snake(ant_ft_id);
             if !table_names.contains(&ant_table) { continue; }
 
@@ -4973,7 +4990,7 @@ pub fn generate_derivation_triggers(
             let ant_nouns: Vec<&str> = ant_ft.roles.iter().map(|r| r.noun_name.as_str()).collect();
             let cons_nouns: Vec<&str> = cons_ft.roles.iter().map(|r| r.noun_name.as_str()).collect();
 
-            let other_ants: Vec<&str> = rule.antecedent_fact_type_ids.iter()
+            let other_ants: Vec<&str> = ant_ft_ids.iter()
                 .filter(|id| *id != ant_ft_id)
                 .map(|id| id.as_str())
                 .collect();

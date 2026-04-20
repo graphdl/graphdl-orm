@@ -141,14 +141,80 @@ impl Default for ConsequentCellSource {
     }
 }
 
+/// Where the antecedent fact sequence comes from.
+///
+/// `FactType(id)` — the common case — the antecedent is the cell's
+/// fact list for a declared fact type, same shape every user rule
+/// uses.
+///
+/// `InstancesOfNoun(noun)` — the "all instances of some noun
+/// aggregated across every cell" shape the implicit derivations
+/// (`#287` subtype inheritance and CWA negation) need. Lowers to
+/// `compile::instances_of_noun_func(noun)`, which walks every cell
+/// and extracts atoms of any binding keyed by `noun`. Inputs to the
+/// per-element step are raw atoms (instance identifiers), not
+/// `<<key,val>,…>` binding tuples, so the consequent binding shape
+/// must be paired with a `consequent_instance_role` that names the
+/// consequent role whose value is the raw atom.
+///
+/// Wire format for the flat-field (no-JSON) reconstruction path uses
+/// `@noun:<name>` as a sentinel. Plain strings decode as `FactType`.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase", tag = "kind", content = "value")]
+pub enum AntecedentSource {
+    FactType(String),
+    InstancesOfNoun(String),
+}
+
+impl AntecedentSource {
+    /// The FT id if this source is `FactType`; empty string otherwise.
+    pub fn fact_type_id(&self) -> &str {
+        match self {
+            Self::FactType(s) => s.as_str(),
+            _ => "",
+        }
+    }
+
+    pub fn is_instances_of_noun(&self) -> bool {
+        matches!(self, Self::InstancesOfNoun(_))
+    }
+
+    pub fn encode(&self) -> String {
+        match self {
+            Self::FactType(s) => s.clone(),
+            Self::InstancesOfNoun(noun) => {
+                let mut out = String::from("@noun:");
+                out.push_str(noun);
+                out
+            }
+        }
+    }
+
+    pub fn decode(s: &str) -> Self {
+        if let Some(noun) = s.strip_prefix("@noun:") {
+            Self::InstancesOfNoun(noun.to_string())
+        } else {
+            Self::FactType(s.to_string())
+        }
+    }
+}
+
+impl Default for AntecedentSource {
+    fn default() -> Self {
+        Self::FactType(String::new())
+    }
+}
+
 /// A derivation rule in the IR — compiled to a DeriveFn at compile time.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DerivationRuleDef {
     pub id: String,
     pub text: String,
-    /// The reading/condition that must hold
-    pub antecedent_fact_type_ids: Vec<String>,
+    /// The reading/condition that must hold. Each antecedent source is
+    /// either a declared fact type id (the common case) or an
+    /// instances-of-noun source (the implicit-derivation shape).
+    pub antecedent_sources: Vec<AntecedentSource>,
     /// Where the consequent's cell key comes from. `Literal(..)` is the
     /// common case (every user-authored rule) and preserves the
     /// pre-enum wire format. `AntecedentRole { .. }` lets a single rule
@@ -157,6 +223,14 @@ pub struct DerivationRuleDef {
     /// CWA negation, …) expand into readings (`#287`).
     #[serde(default)]
     pub consequent_cell: ConsequentCellSource,
+    /// When the antecedent source is `InstancesOfNoun`, the per-element
+    /// input to the per-fact step is a raw atom (the instance id), not
+    /// a binding tuple. This field names the consequent role whose
+    /// value becomes that atom — the result is a one-pair binding
+    /// sequence `<<role, instance>>`. Empty for FactType-sourced rules
+    /// (they inherit antecedent bindings via `Func::Id` as before).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub consequent_instance_role: String,
     /// Derivation kind for compile dispatch
     pub kind: DerivationKind,
     /// For Join rules: noun names that must have equal values across all
@@ -227,7 +301,7 @@ pub struct DerivationRuleDef {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AntecedentFilter {
-    /// Index into `antecedent_fact_type_ids` that this filter restricts.
+    /// Index into `antecedent_sources` that this filter restricts.
     pub antecedent_index: usize,
     /// Role name whose value is compared (e.g., "Population").
     pub role: String,
@@ -243,7 +317,7 @@ pub struct AntecedentFilter {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AntecedentRoleLiteral {
-    /// Index into `antecedent_fact_type_ids` that this filter restricts.
+    /// Index into `antecedent_sources` that this filter restricts.
     pub antecedent_index: usize,
     /// Role name (noun name) whose value must equal `value`.
     pub role: String,
