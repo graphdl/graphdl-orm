@@ -156,6 +156,55 @@ Each Party is an Individual or an Organization.
 
 RMAP chooses between partitioned tables (each subtype gets its own) and single-table inheritance depending on whether the subtype has fact types of its own.
 
+## Noun names and reserved words
+
+FORML 2's grammar depends on a small set of reserved keywords — quantifiers, modalities, connectives. The parser uses longest-first matching over declared names, so a noun whose name contains a reserved keyword as a substring ends up classified as part-grammar / part-name, and the declaration is rejected.
+
+### Reserved keywords
+
+Single-word quantifiers, modalities, and connectives:
+
+- `each`, `no`, `some`
+- `at most`, `at least`, `exactly`
+- `iff`, `if`, `then`, `when`
+- `obligatory`, `forbidden`, `permitted`, `possible`, `impossible`
+
+Multi-clause keywords (listed in `crates/arest/src/parse_forml2_stage1.rs` as `CONSTRAINT_KEYWORDS`):
+
+- `if and only if`
+- `at most one of the following holds`
+- `exactly one of the following holds`
+- `at least one of the following holds`
+- `if some then that`
+
+Any substring match against the keyword list is a collision. `Each Way Bet` collides on `Each`; `No Show Fee` on `No`; `At Most One Hop` on `At Most One`.
+
+### Rejected examples
+
+These fail at compile time because the unquoted name contains a reserved substring:
+
+```forml2
+Each Way Bet(.id) is an entity type.
+No Show Fee(.id) is an entity type.
+At Most One Hop(.id) is an entity type.
+```
+
+### Escape: quoted identifiers
+
+Any noun, fact-type reference, or instance-fact identifier may be declared in single quotes. A quoted identifier is a single token regardless of content, so reserved substrings are fine inside quotes:
+
+```forml2
+Noun 'Each Way Bet' is an entity type.
+Noun 'No Show Fee' is an entity type.
+Noun 'At Most One Hop' is an entity type.
+```
+
+Instance facts already use this convention for compound reference schemes (e.g. `Resource 'myapp-orders' has Title 'Order management'.`) so the syntax extends naturally.
+
+### Why the rule exists
+
+Theorem 1 (Grammar Unambiguity) requires that no declared name contain a formal grammar item as a substring. The quoted-identifier escape generalises the theorem: the hypothesis becomes "no *unquoted* name contains a formal grammar item." NORMA (Halpin/Curland) — the reference ORM 2 implementation — uses the same mechanism.
+
 ## What's next
 
 You now have entity types, fact types, and the reading grammar. The next chapter, [Constraints](03-constraints.md), covers all 17 kinds and shows how to use them to keep your data honest.
