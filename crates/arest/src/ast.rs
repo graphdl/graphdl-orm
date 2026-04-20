@@ -664,24 +664,46 @@ pub fn emit_citation_fact(
     retrieval_date.hash(&mut h);
     let cite_id = alloc::format!("cite:{:016x}", h.finish());
 
-    let with_uri = cell_push(
-        "Citation_has_URI",
-        fact_from_pairs(&[("Citation", &cite_id), ("URI", uri)]),
+    // Auto-generated Text satisfies the alethic in readings/instances.md:
+    //   "Each Citation has exactly one Text."
+    // Without this, every Citation we emit would be in immediate
+    // violation of its own mandatory-role constraint. Auto-generation
+    // uses the already-known fields so the text is deterministic and
+    // content-addresses with the id.
+    let text = match external_system {
+        Some(ext) => alloc::format!(
+            "{} citation for {} (backed by {}) retrieved at {}",
+            authority_type, uri, ext, retrieval_date
+        ),
+        None => alloc::format!(
+            "{} citation for {} retrieved at {}",
+            authority_type, uri, retrieval_date
+        ),
+    };
+
+    let with_text = cell_push_unique(
+        "Citation_has_Text",
+        fact_from_pairs(&[("Citation", &cite_id), ("Text", &text)]),
         state,
     );
-    let with_rd = cell_push(
+    let with_uri = cell_push_unique(
+        "Citation_has_URI",
+        fact_from_pairs(&[("Citation", &cite_id), ("URI", uri)]),
+        &with_text,
+    );
+    let with_rd = cell_push_unique(
         "Citation_has_Retrieval_Date",
         fact_from_pairs(&[("Citation", &cite_id), ("Retrieval Date", retrieval_date)]),
         &with_uri,
     );
-    let with_at = cell_push(
+    let with_at = cell_push_unique(
         "Citation_has_Authority_Type",
         fact_from_pairs(&[("Citation", &cite_id), ("Authority Type", authority_type)]),
         &with_rd,
     );
     let final_state = external_system
         .map(|ext| {
-            cell_push(
+            cell_push_unique(
                 "Citation_is_backed_by_External_System",
                 fact_from_pairs(&[("Citation", &cite_id), ("External System", ext)]),
                 &with_at,
@@ -725,9 +747,45 @@ pub fn ingest_federated_facts(
         let pairs: alloc::vec::Vec<(&str, &str)> = bindings.iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
-        cell_push(ft_id, fact_from_pairs(&pairs), &acc)
+        let fact_id = fact_identity_id(ft_id, bindings);
+        // Fact itself into its declared FT cell.
+        let with_fact = cell_push_unique(ft_id, fact_from_pairs(&pairs), &acc);
+        // Fact cites Citation link — instances.md §Fact.
+        let with_link = cell_push_unique(
+            "Fact_cites_Citation",
+            fact_from_pairs(&[("Fact", &fact_id), ("Citation", &cite_id)]),
+            &with_fact,
+        );
+        // Resource has Reference — instances.md §Resource. Fact is a
+        // subtype of Resource, so Reference is the identity scheme.
+        cell_push_unique(
+            "Resource_has_Reference",
+            fact_from_pairs(&[("Resource", &fact_id), ("Reference", &fact_id)]),
+            &with_link,
+        )
     });
     (cite_id, final_state)
+}
+
+/// Deterministic synthetic id for a fact given (factTypeId, bindings).
+/// Used as the Fact / Resource identity when the fact enters P via a
+/// runtime path (federated_ingest, platform-fn emission) rather than
+/// through the command pipeline that would assign a Reference via
+/// RMAP. The id is content-addressed so repeated emission of the same
+/// fact is idempotent at the cell level when paired with cell_push_unique.
+#[cfg(not(feature = "no_std"))]
+fn fact_identity_id(fact_type_id: &str, bindings: &[(String, String)]) -> alloc::string::String {
+    use core::hash::{BuildHasher, Hash, Hasher};
+    let mut h = hashbrown::hash_map::DefaultHashBuilder::default().build_hasher();
+    fact_type_id.hash(&mut h);
+    // Sort bindings to make the hash invariant to caller ordering.
+    let mut sorted = bindings.to_vec();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    sorted.iter().for_each(|(k, v)| {
+        k.hash(&mut h);
+        v.hash(&mut h);
+    });
+    alloc::format!("fact:{:016x}", h.finish())
 }
 
 /// This is Backus Sec. 13.3.2: definitions map atoms to expressions.
@@ -2309,6 +2367,28 @@ pub fn cell_push(name: &str, fact: Object, state: &Object) -> Object {
     store(name, new_contents, state)
 }
 
+/// Append a fact to a named cell only if no structurally-identical fact
+/// is already present. Matches the paper's set-semantics for P: facts
+/// are members of a set, so re-asserting the same fact is a no-op.
+///
+/// Use when emission may fire more than once for the same origin
+/// (Citation cells during idempotent ingest, provenance link facts on
+/// re-fetch, derivation rules that compute the same fact twice). The
+/// primary cell_push remains the default for performance-sensitive
+/// paths (O(1) append vs. O(n) contains-check).
+pub fn cell_push_unique(name: &str, fact: Object, state: &Object) -> Object {
+    let existing = fetch_or_phi(name, state);
+    match existing.as_seq() {
+        Some(items) if items.iter().any(|f| f == &fact) => state.clone(),
+        Some(items) => {
+            let mut v = items.to_vec();
+            v.push(fact);
+            store(name, Object::Seq(v.into()), state)
+        }
+        None => store(name, Object::seq(vec![fact]), state),
+    }
+}
+
 /// Merge two states in O(n): collect all cells into a HashMap,
 /// concatenate overlapping cells, return as Map store.
 pub fn merge_states(target: &Object, source: &Object) -> Object {
@@ -3441,6 +3521,36 @@ mod tests {
         assert_eq!(apply(&f, &seq, &d), Object::atom("b"));
     }
 
+    // ── cell_push_unique: set-semantics for P ────────────────────
+
+    #[test]
+    fn cell_push_unique_appends_new_fact() {
+        let f = fact_from_pairs(&[("Citation", "c1"), ("URI", "platform:x")]);
+        let d = cell_push_unique("Citation_has_URI", f.clone(), &Object::phi());
+        let cell = fetch("Citation_has_URI", &d).as_seq().map(|s| s.to_vec()).unwrap_or_default();
+        assert_eq!(cell.len(), 1);
+        assert_eq!(cell[0], f);
+    }
+
+    #[test]
+    fn cell_push_unique_skips_identical_fact() {
+        let f = fact_from_pairs(&[("Citation", "c1"), ("URI", "platform:x")]);
+        let d1 = cell_push_unique("Citation_has_URI", f.clone(), &Object::phi());
+        let d2 = cell_push_unique("Citation_has_URI", f, &d1);
+        let cell = fetch("Citation_has_URI", &d2).as_seq().map(|s| s.to_vec()).unwrap_or_default();
+        assert_eq!(cell.len(), 1, "identical fact must not produce a duplicate");
+    }
+
+    #[test]
+    fn cell_push_unique_keeps_structurally_distinct_facts() {
+        let f1 = fact_from_pairs(&[("Citation", "c1"), ("URI", "platform:x")]);
+        let f2 = fact_from_pairs(&[("Citation", "c2"), ("URI", "platform:x")]);
+        let d = cell_push_unique("Citation_has_URI", f1, &Object::phi());
+        let d = cell_push_unique("Citation_has_URI", f2, &d);
+        let cell = fetch("Citation_has_URI", &d).as_seq().map(|s| s.to_vec()).unwrap_or_default();
+        assert_eq!(cell.len(), 2, "different Citation ids yield distinct facts");
+    }
+
     // ── Runtime Registration (↓DEFS, AREST §3.2 Platform Binding) ──
     // The paper's IoC/DI primitive: a runtime writes a binding into DEFS
     // at any time. The binding is indistinguishable from a compile-derived
@@ -3553,6 +3663,54 @@ mod tests {
         let (id2, _) = emit_citation_fact(
             "platform:send_email", "Runtime-Function", "2026-04-20T12:00:00Z", None, &d);
         assert_eq!(id1, id2, "same (uri, auth, retrieval_date) must yield the same cite id");
+    }
+
+    /// `Each Citation has exactly one Text.` is alethic in instances.md.
+    /// Every emitted Citation must carry a Text binding so the mandatory-
+    /// role constraint is satisfied. The text is auto-generated from the
+    /// already-known fields (deterministic per id).
+    #[test]
+    fn emit_citation_fact_populates_text_so_mandatory_alethic_holds() {
+        let (cite_id, d) = emit_citation_fact(
+            "https://api.stripe.com/v1/customers",
+            "Federated-Fetch",
+            "2026-04-20T12:00:00Z",
+            Some("stripe"),
+            &Object::phi(),
+        );
+        let text_cell = fetch("Citation_has_Text", &d).as_seq()
+            .map(|s| s.to_vec()).unwrap_or_default();
+        let matched = text_cell.iter()
+            .find(|f| binding(f, "Citation") == Some(cite_id.as_str()))
+            .and_then(|f| binding(f, "Text"))
+            .map(String::from);
+        let matched_str = matched.as_deref().unwrap_or("");
+        assert!(!matched_str.is_empty(),
+            "Citation must have non-empty Text to satisfy 'exactly one Text'");
+        // Auto-text mentions the URI, the system, and the retrieval date
+        // so an LLM reading the cell gets origin at a glance.
+        assert!(matched_str.contains("https://api.stripe.com/v1/customers"),
+            "auto-text should include URI: {matched_str}");
+        assert!(matched_str.contains("stripe"),
+            "auto-text should include external system: {matched_str}");
+        assert!(matched_str.contains("2026-04-20T12:00:00Z"),
+            "auto-text should include retrieval date: {matched_str}");
+    }
+
+    /// Emission uses cell_push_unique, so repeated emission for the same
+    /// (uri, auth, retrieval_date) triple yields the same id AND leaves
+    /// the Citation cells at size 1 — no duplicate facts, matching the
+    /// paper's set-semantics for P.
+    #[test]
+    fn emit_citation_fact_is_truly_idempotent_across_calls() {
+        let uri = "platform:send_email";
+        let (_, d1) = emit_citation_fact(uri, "Runtime-Function", "2026-04-20T12:00:00Z", None, &Object::phi());
+        let (_, d2) = emit_citation_fact(uri, "Runtime-Function", "2026-04-20T12:00:00Z", None, &d1);
+        for cell in ["Citation_has_URI", "Citation_has_Retrieval_Date",
+                     "Citation_has_Authority_Type", "Citation_has_Text"] {
+            let n = fetch(cell, &d2).as_seq().map(|s| s.len()).unwrap_or(0);
+            assert_eq!(n, 1, "{cell} must stay at size 1 after idempotent re-emit; got {n}");
+        }
     }
 
     // ── End-to-end: register → invoke → cite (#305 integration) ─
@@ -3694,6 +3852,79 @@ mod tests {
             .map(|s| s.to_vec()).unwrap_or_default();
         assert_eq!(name_cell.len(), 1);
         assert_eq!(binding(&name_cell[0], "Name"), Some("Alice"));
+    }
+
+    /// Each ingested fact gets a paired `Fact cites Citation` link so
+    /// downstream deontic obligations like "Each Fact of Fact Type 'X'
+    /// cites some Citation" can evaluate. Fact ids are content-
+    /// addressed over (factTypeId, sorted bindings) — deterministic
+    /// per fact, stable across ingestion.
+    #[test]
+    fn ingest_federated_facts_emits_fact_cites_citation_links() {
+        let url = "https://api.stripe.com/v1/customers";
+        let facts = alloc::vec![
+            (
+                "Stripe_Customer_has_Email".to_string(),
+                alloc::vec![
+                    ("Stripe Customer".to_string(), "cus_1".to_string()),
+                    ("Email".to_string(), "a@x.com".to_string()),
+                ],
+            ),
+            (
+                "Stripe_Customer_has_Name".to_string(),
+                alloc::vec![
+                    ("Stripe Customer".to_string(), "cus_1".to_string()),
+                    ("Name".to_string(), "Alice".to_string()),
+                ],
+            ),
+        ];
+        let (cite_id, d) = ingest_federated_facts(
+            "stripe", url, "2026-04-20T12:00:00Z", &facts, &Object::phi(),
+        );
+
+        let link_cell = fetch("Fact_cites_Citation", &d).as_seq()
+            .map(|s| s.to_vec()).unwrap_or_default();
+        assert_eq!(link_cell.len(), 2,
+            "one Fact cites Citation link per ingested fact; got {}", link_cell.len());
+        let cite_bindings: Vec<&str> = link_cell.iter()
+            .filter_map(|f| binding(f, "Citation"))
+            .collect();
+        assert!(cite_bindings.iter().all(|c| *c == cite_id),
+            "every link fact must name the same Citation id {cite_id}; got {cite_bindings:?}");
+        // Each link has a distinct Fact id (one per ingested fact).
+        let fact_ids: Vec<&str> = link_cell.iter()
+            .filter_map(|f| binding(f, "Fact"))
+            .collect();
+        assert_eq!(fact_ids.len(), 2);
+        assert_ne!(fact_ids[0], fact_ids[1],
+            "two different ingested facts must have different Fact ids");
+    }
+
+    /// Ingested facts ARE Resource subtypes (instances.md §Fact: Fact
+    /// is a subtype of Resource; Resource has Reference). Emit a
+    /// Resource_has_Reference fact per ingested fact so identity is
+    /// navigable via the existing Reference scheme — same id used for
+    /// the Fact cites Citation link.
+    #[test]
+    fn ingest_federated_facts_populates_resource_has_reference() {
+        let facts = alloc::vec![(
+            "Stripe_Customer_has_Email".to_string(),
+            alloc::vec![
+                ("Stripe Customer".to_string(), "cus_1".to_string()),
+                ("Email".to_string(), "a@x.com".to_string()),
+            ],
+        )];
+        let (_, d) = ingest_federated_facts(
+            "stripe", "https://api.stripe.com/v1/customers",
+            "2026-04-20T12:00:00Z", &facts, &Object::phi(),
+        );
+        let ref_cell = fetch("Resource_has_Reference", &d).as_seq()
+            .map(|s| s.to_vec()).unwrap_or_default();
+        assert_eq!(ref_cell.len(), 1,
+            "Resource_has_Reference must carry the ingested fact's identity");
+        let ref_val = binding(&ref_cell[0], "Reference");
+        assert!(ref_val.map(|r| r.starts_with("fact:")).unwrap_or(false),
+            "Reference should be the synthetic fact id; got {ref_val:?}");
     }
 
     #[test]
