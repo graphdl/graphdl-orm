@@ -65,6 +65,42 @@ pub fn classify_statements(statements_state: &Object, grammar_state: &Object) ->
     Object::Map(cells)
 }
 
+/// Translate `Statement has Classification 'Entity Type Declaration'`
+/// and `Statement has Classification 'Value Type Declaration'` facts
+/// into `Noun` cell facts. #280b step 1.
+///
+/// The result is a `Vec<Object>` of Noun facts, one per distinct
+/// declared Head Noun, with `objectType` set from the classification.
+/// The caller merges these into the Noun cell.
+#[cfg(feature = "std-deps")]
+pub fn translate_nouns(classified_state: &Object) -> Vec<Object> {
+    let statement_ids = collect_statement_ids(classified_state);
+    statement_ids.iter().filter_map(|stmt_id| {
+        let head = head_noun_for(classified_state, stmt_id)?;
+        let classifications = classifications_for(classified_state, stmt_id);
+        let object_type = if classifications.iter().any(|k| k == "Entity Type Declaration") {
+            "entity"
+        } else if classifications.iter().any(|k| k == "Value Type Declaration") {
+            "value"
+        } else {
+            return None;
+        };
+        Some(fact_from_pairs(&[
+            ("name", head.as_str()),
+            ("objectType", object_type),
+            ("worldAssumption", "closed"),
+        ]))
+    }).collect()
+}
+
+fn head_noun_for(state: &Object, stmt_id: &str) -> Option<String> {
+    fetch_or_phi("Statement_has_Head_Noun", state)
+        .as_seq()?
+        .iter()
+        .find(|f| binding(f, "Statement") == Some(stmt_id))
+        .and_then(|f| binding(f, "Head_Noun").map(String::from))
+}
+
 /// Return the list of classification names attached to a given
 /// Statement id.
 #[cfg(feature = "std-deps")]
@@ -283,6 +319,76 @@ mod tests {
         let kinds = classifications_for(&classified, "s1");
         assert!(kinds.iter().any(|k| k == "Fact Type Reading"),
             "expected Fact Type Reading; got {:?}", kinds);
+    }
+
+    #[test]
+    fn translate_nouns_emits_entity_type_fact() {
+        let stmt = stage1_state(
+            "s1", "Customer is an entity type.", &["Customer"]);
+        let classified = classify_statements(&stmt, &grammar_state());
+        let noun_facts = super::translate_nouns(&classified);
+        assert_eq!(noun_facts.len(), 1);
+        assert_eq!(binding(&noun_facts[0], "name"), Some("Customer"));
+        assert_eq!(binding(&noun_facts[0], "objectType"), Some("entity"));
+    }
+
+    #[test]
+    fn translate_nouns_emits_value_type_fact() {
+        let stmt = stage1_state(
+            "s1", "Priority is a value type.", &["Priority"]);
+        let classified = classify_statements(&stmt, &grammar_state());
+        let noun_facts = super::translate_nouns(&classified);
+        assert_eq!(noun_facts.len(), 1);
+        assert_eq!(binding(&noun_facts[0], "name"), Some("Priority"));
+        assert_eq!(binding(&noun_facts[0], "objectType"), Some("value"));
+    }
+
+    #[test]
+    fn translate_nouns_skips_fact_type_reading_statements() {
+        // Fact type readings have Head Noun but no entity/value declaration.
+        let stmt = stage1_state(
+            "s1", "Customer places Order.", &["Customer", "Order"]);
+        let classified = classify_statements(&stmt, &grammar_state());
+        let noun_facts = super::translate_nouns(&classified);
+        assert!(noun_facts.is_empty(),
+            "fact-type readings must not produce Noun facts; got {:?}", noun_facts);
+    }
+
+    #[test]
+    fn translate_nouns_handles_multiple_statements() {
+        // Run each declaration through its own Stage-1 pass, then merge
+        // the cells before classify — a tiny end-to-end check.
+        let mut merged_cells: HashMap<String, Object> = HashMap::new();
+        for (i, (text, nouns)) in [
+            ("Customer is an entity type.", vec!["Customer"]),
+            ("Priority is a value type.", vec!["Priority"]),
+        ].into_iter().enumerate() {
+            let stmt_id = format!("s{}", i);
+            let cells = tokenize_statement(
+                &stmt_id, text,
+                &nouns.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            );
+            for (name, facts) in cells {
+                let entry = merged_cells.entry(name).or_insert_with(|| Object::Seq(Vec::new().into()));
+                let existing = entry.as_seq().map(|s| s.to_vec()).unwrap_or_default();
+                let mut combined = existing;
+                combined.extend(facts);
+                *entry = Object::Seq(combined.into());
+            }
+        }
+        let stmt = Object::Map(merged_cells);
+        let classified = classify_statements(&stmt, &grammar_state());
+        let noun_facts = super::translate_nouns(&classified);
+        assert_eq!(noun_facts.len(), 2);
+        let by_name: HashMap<String, String> = noun_facts.iter()
+            .filter_map(|f| {
+                let name = binding(f, "name")?.to_string();
+                let ot = binding(f, "objectType")?.to_string();
+                Some((name, ot))
+            })
+            .collect();
+        assert_eq!(by_name.get("Customer").map(String::as_str), Some("entity"));
+        assert_eq!(by_name.get("Priority").map(String::as_str), Some("value"));
     }
 
     #[test]
