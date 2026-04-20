@@ -46,15 +46,19 @@ pub fn tokenize_statement(statement_id: &str, text: &str, nouns: &[String]) -> C
     // strips the prefix via strip_prefix; downstream DerivationRule.id
     // (FNV of text) needs the same normalization so both pipelines
     // produce the same hash.
-    let mut canonical = text.trim().trim_end_matches('.').trim();
-    canonical = canonical
+    let trimmed = text.trim().trim_end_matches('.').trim();
+    let no_prefix = trimmed
         .strip_prefix("** ")
-        .or_else(|| canonical.strip_prefix("* "))
-        .or_else(|| canonical.strip_prefix("+ "))
-        .unwrap_or(canonical);
+        .or_else(|| trimmed.strip_prefix("* "))
+        .or_else(|| trimmed.strip_prefix("+ "))
+        .unwrap_or(trimmed);
 
-    // 1. Strip trailing ORM 2 derivation marker.
-    let (body, derivation_marker) = strip_derivation_marker(canonical);
+    // 1. Strip trailing ORM 2 derivation marker. Apply to the
+    //    canonical text too so downstream consumers (Text cell,
+    //    FactType id construction) don't carry the ` *` suffix.
+    let (body, derivation_marker) = strip_derivation_marker(no_prefix);
+    let canonical: &str = body.trim_end_matches('.').trim();
+    let body: &str = canonical;
 
     // 1b. Strip ORM 2 reference-scheme parens: `Function(.id) is ...`
     //     becomes `Function is ...`. Legacy does this in
