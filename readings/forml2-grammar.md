@@ -36,6 +36,7 @@ Keyword is a value type.
 Deontic Operator is a value type.
   The possible values of Deontic Operator are 'obligatory', 'forbidden', 'permitted'.
 Literal Role is a value type.
+Enum Value is a value type.
 
 ## Fact Types
 
@@ -48,6 +49,7 @@ Statement has Derivation Marker.
 Statement has Literal Role.
 Statement has Keyword.
 Statement has Deontic Operator.
+Statement has Enum Value.
 Statement has Classification.
 
 Statement has Role Reference.
