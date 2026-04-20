@@ -25,7 +25,7 @@
 //!   `Literal Value`.
 
 extern crate alloc;
-use alloc::{string::{String, ToString}, vec::Vec, borrow::ToOwned, format};
+use alloc::{string::{String, ToString}, vec::Vec, format};
 use hashbrown::HashMap;
 use crate::ast::{Object, fact_from_pairs};
 
