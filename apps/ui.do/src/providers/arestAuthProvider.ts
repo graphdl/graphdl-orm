@@ -1,13 +1,18 @@
 /**
- * arestAuthProvider — session-cookie auth against the AREST worker
- * (per #131). Cookies are opaque to the browser; the provider only
- * adjusts fetch's `credentials: include` option so the browser sends
- * / receives them on each request.
+ * arestAuthProvider — thin cookie-forwarding wrapper. Authentication
+ * is enforced upstream by the `apis.` proxy; this provider does NOT
+ * implement login / logout / token flows.
  *
- * /arest/auth/login, /arest/auth/logout, /arest/auth/me are the three
- * endpoints used. /arest/ (root) is hit for permissions — its
- * _links.organizations carries the fact-type that grants membership,
- * which we flatten into a permissions array the UI can role-gate on.
+ * Per whitepaper §3–§7 the user is an entity in P. `GET /arest/`
+ * returns its representation with `_links` (HATEOAS, Theorem 4).
+ *   checkAuth    → GET /arest/ (200 ⇒ signed in; 401 ⇒ redirect upstream)
+ *   getIdentity  → GET /arest/, unwrap envelope
+ *   getPermissions → GET /arest/, flatten _links.organizations
+ *
+ * login / logout are kept in the interface shape only because
+ * @mdxui/app's AuthContext expects them. They either redirect the
+ * browser to a configured upstream URL or reject with an explanatory
+ * message — the SPA never renders a login form.
  */
 import type {
   ArestAuthProvider,
@@ -16,12 +21,33 @@ import type {
 } from './types'
 
 export interface ArestAuthProviderOptions {
+  /** e.g. 'https://ui.auto.dev/arest' */
   baseUrl: string
+  /**
+   * Where to send the browser when login is needed. If absent, `login()`
+   * rejects — useful for tests / SSR. In production this always points
+   * at the upstream `apis.` host.
+   */
+  loginUrl?: string
+  /** Where to send the browser on logout. If absent, `logout()` is a no-op. */
+  logoutUrl?: string
+  /**
+   * Navigator used to hand off to the upstream flow. Defaults to
+   *   (href) => { window.location.href = href }
+   * Injectable for tests.
+   */
+  navigate?: (href: string) => void
   fetch?: typeof globalThis.fetch
 }
 
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null
+}
+
+function defaultNavigate(href: string): void {
+  if (typeof window !== 'undefined') {
+    window.location.href = href
+  }
 }
 
 async function jsonFetch(
@@ -46,41 +72,47 @@ async function jsonFetch(
   return { ok: res.ok, status: res.status, body }
 }
 
-function errorMessage(body: unknown, fallback: string): string {
-  if (isRecord(body) && typeof body.error === 'string') return body.error
-  if (isRecord(body) && Array.isArray(body.errors)) {
-    const first = (body.errors as unknown[])[0]
-    if (isRecord(first) && typeof first.message === 'string') return first.message as string
-  }
-  return fallback
-}
-
 export function createArestAuthProvider(
   options: ArestAuthProviderOptions,
 ): ArestAuthProvider {
   const baseUrl = options.baseUrl.replace(/\/$/, '')
   const fetchImpl = options.fetch ?? ((...args) => globalThis.fetch(...args))
+  const navigate = options.navigate ?? defaultNavigate
 
-  const login = async (params: LoginParams): Promise<void> => {
-    const res = await jsonFetch(
-      `${baseUrl}/auth/login`,
-      { method: 'POST', body: JSON.stringify(params) },
-      fetchImpl,
-    )
-    if (!res.ok) {
-      throw new Error(errorMessage(res.body, `login failed (HTTP ${res.status})`))
+  // Single endpoint for every identity probe — the HATEOAS root.
+  const rootUrl = `${baseUrl}/`
+
+  const login = async (_params: LoginParams): Promise<void> => {
+    if (options.loginUrl) {
+      navigate(options.loginUrl)
+      // Never resolve — the browser is navigating away. Holding the
+      // promise open prevents the caller from racing past the hand-off.
+      return new Promise(() => {})
     }
+    throw new Error(
+      'Login is handled upstream by the apis proxy. Configure loginUrl ' +
+      'on the auth provider to redirect at the edge instead of rendering ' +
+      'a login form in the SPA.',
+    )
   }
 
   const logout = async (): Promise<void> => {
-    // Best-effort. If the session is already gone the worker may return
-    // 401 — that's still a successful logout from the client's view.
-    await jsonFetch(`${baseUrl}/auth/logout`, { method: 'POST' }, fetchImpl)
+    if (options.logoutUrl) {
+      navigate(options.logoutUrl)
+      return new Promise(() => {})
+    }
+    // Session cookie is scoped to the edge — nothing for the SPA to do.
   }
 
   const checkAuth = async (): Promise<void> => {
-    const res = await jsonFetch(`${baseUrl}/auth/me`, { method: 'GET' }, fetchImpl)
-    if (!res.ok) throw new Error(errorMessage(res.body, 'not authenticated'))
+    const res = await jsonFetch(rootUrl, { method: 'GET' }, fetchImpl)
+    if (!res.ok) {
+      throw new Error(
+        isRecord(res.body) && typeof res.body.error === 'string'
+          ? (res.body.error as string)
+          : `not authenticated (HTTP ${res.status})`,
+      )
+    }
   }
 
   const checkError = async (error: Error | { status?: number; message?: string }): Promise<void> => {
@@ -92,15 +124,18 @@ export function createArestAuthProvider(
   }
 
   const getIdentity = async (): Promise<UserIdentity> => {
-    const res = await jsonFetch(`${baseUrl}/auth/me`, { method: 'GET' }, fetchImpl)
-    if (!res.ok) throw new Error(errorMessage(res.body, 'unauthenticated'))
+    const res = await jsonFetch(rootUrl, { method: 'GET' }, fetchImpl)
+    if (!res.ok) throw new Error(`unauthenticated (HTTP ${res.status})`)
 
     const body = res.body
     const payload = isRecord(body) && isRecord(body.data) ? body.data : body
     if (!isRecord(payload)) throw new Error('unauthenticated')
 
     const email = (payload.email as string | undefined) ?? undefined
-    const id = (payload.id as string | undefined) ?? email
+    // /arest/ root may surface id at the envelope level (e.g. `type: 'User',
+    // id: 'sam@driv.ly'`) rather than on the inner `data`. Check both.
+    const envelopeId = isRecord(body) ? (body.id as string | undefined) : undefined
+    const id = (payload.id as string | undefined) ?? envelopeId ?? email
     if (!id) throw new Error('unauthenticated')
 
     const identity: UserIdentity = { id }
@@ -108,7 +143,6 @@ export function createArestAuthProvider(
     if (typeof payload.fullName === 'string') identity.fullName = payload.fullName as string
     if (typeof payload.avatar === 'string') identity.avatar = payload.avatar as string
 
-    // Carry extra fields forward so UI can render richer profiles.
     for (const [key, value] of Object.entries(payload)) {
       if (key === 'id' || key === 'email' || key === 'fullName' || key === 'avatar') continue
       identity[key] = value
@@ -118,7 +152,7 @@ export function createArestAuthProvider(
 
   const getPermissions = async (): Promise<string[]> => {
     try {
-      const res = await jsonFetch(`${baseUrl}/`, { method: 'GET' }, fetchImpl)
+      const res = await jsonFetch(rootUrl, { method: 'GET' }, fetchImpl)
       if (!res.ok) return []
       const body = res.body
       if (!isRecord(body)) return []
@@ -133,7 +167,7 @@ export function createArestAuthProvider(
         const factType = entry.factType as string | undefined
         const href = entry.href as string | undefined
         if (!factType || !href) continue
-        // href: /arest/organizations/{id}. Strip prefix to recover {id}.
+        // href: /arest/organizations/{id}. Last segment is the id.
         const parts = href.split('/').filter(Boolean)
         const id = parts[parts.length - 1]
         permissions.push(`${factType}:${id}`)
