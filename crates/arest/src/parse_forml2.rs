@@ -25,18 +25,17 @@ use hashbrown::HashMap;
 #[cfg_attr(feature = "std-deps", derive(serde::Deserialize, serde::Serialize))]
 #[cfg_attr(feature = "std-deps", serde(rename_all = "camelCase"))]
 struct ParseCtx {
-    constraints: Vec<ConstraintDef>,
     #[cfg_attr(feature = "std-deps", serde(default))]
     derivation_rules: Vec<DerivationRuleDef>,
     /// Object cells produced by apply_action. This IS the parse output;
-    /// the remaining typed fields above are parse-time lookup caches
-    /// still being migrated to cells.
+    /// only derivation_rules still shadows a cell because pass 2b
+    /// mutates its shape (resolve_derivation_rule).
     ///
-    /// #283 target: delete the typed caches above and make this the
-    /// sole parser state, with cell-query helpers in place of field
-    /// access. Migration in progress — named_spans, autofill_spans,
-    /// ref_schemes, subtypes, enum_values, general_instance_facts,
-    /// nouns, and fact_types already migrated to their respective cells.
+    /// #283 target: delete the remaining typed cache and make this the
+    /// sole parser state. Migration in progress — named_spans,
+    /// autofill_spans, ref_schemes, subtypes, enum_values,
+    /// general_instance_facts, nouns, fact_types, and constraints
+    /// already migrated to their respective cells.
     #[cfg_attr(feature = "std-deps", serde(skip))]
     cells: HashMap<String, Vec<crate::ast::Object>>,
 }
@@ -1032,7 +1031,7 @@ fn parse_markdown_with_context(input: &str, existing_nouns: &HashMap<String, Nou
     // the metamodel bootstrap), reject. The bootstrap case (no existing nouns
     // for those names) is allowed to declare them exactly once.
     let mut standalone = ParseCtx {
-        constraints: vec![], derivation_rules: vec![],
+        derivation_rules: vec![],
         cells: HashMap::new(),
     };
     parse_into(&mut standalone, input)?;
@@ -1048,7 +1047,7 @@ fn parse_markdown_with_context(input: &str, existing_nouns: &HashMap<String, Nou
     }
 
     let mut ir = ParseCtx {
-        constraints: vec![], derivation_rules: vec![],
+        derivation_rules: vec![],
         cells: HashMap::new(),
     };
     // #283 — seed the Noun + FactType + Role cells from the pre-existing
@@ -1269,31 +1268,8 @@ fn ctx_to_state(d: &ParseCtx) -> crate::ast::Object {
     // #283 — FactType + Role cells populated directly by apply_action;
     // no fallback from a typed map is needed any longer.
 
-    // Constraints: apply_action already emitted these to d.cells during
-    // parse. Test fixtures building ParseCtx literals with non-empty
-    // d.constraints but empty d.cells fall back to serializing here.
-    if !cells.contains_key("Constraint") {
-        for c in &d.constraints {
-            let mut pairs: Vec<(String, String)> = vec![
-                ("id".into(), c.id.clone()), ("kind".into(), c.kind.clone()),
-                ("modality".into(), c.modality.clone()), ("text".into(), c.text.clone()),
-            ];
-            c.deontic_operator.as_ref().map(|op| pairs.push(("deonticOperator".into(), op.clone())));
-            c.entity.as_ref().map(|e| pairs.push(("entity".into(), e.clone())));
-            pairs.extend(c.spans.iter().enumerate().flat_map(|(i, span)| [
-                (format!("span{}_factTypeId", i), span.fact_type_id.clone()),
-                (format!("span{}_roleIndex", i), span.role_index.to_string()),
-            ]));
-            // Lossless: full constraint as JSON (preserves subset_autofill,
-            // min/max_occurrence, clauses, set_comparison_argument_length).
-            #[cfg(feature = "std-deps")]
-            let json_blob = serde_json::to_string(c).unwrap_or_default();
-            #[cfg(feature = "std-deps")]
-            pairs.push(("json".into(), json_blob));
-            let refs: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-            push(&mut cells, "Constraint", fact_from_pairs(&refs));
-        }
-    }
+    // #283 — Constraint cell is populated directly by apply_action
+    // (plus the VC post-pass and autofill mutator); no fallback needed.
 
     // Derivation rules + unresolved-clause diagnostics.
     // apply_action / parse_into's finalize step emits these to d.cells;
@@ -1342,7 +1318,7 @@ fn ctx_to_state(d: &ParseCtx) -> crate::ast::Object {
 
 fn parse_markdown(input: &str) -> Result<ParseCtx, String> {
     let mut ir = ParseCtx {
-        constraints: vec![], derivation_rules: vec![],
+        derivation_rules: vec![],
         cells: HashMap::new(),
     };
     parse_into(&mut ir, input)?;
@@ -1620,15 +1596,16 @@ fn parse_into(ir: &mut ParseCtx, input: &str) -> Result<(), String> {
                     #[cfg(feature = "std-deps")]
                     { push_cell(ir, "Constraint", constraint_to_fact(&uc));
                       push_cell(ir, "Constraint", constraint_to_fact(&mc)); }
-                    ir.constraints.push(uc);
-                    ir.constraints.push(mc);
+                    // #283 — Constraint cell is the source; no typed vec.
+                    let _ = (uc, mc);
                 }
                 ParseAction::AddConstraint(c) => {
                     let mut resolved = resolve_constraint_schema(c, &noun_names, &catalog, ir);
                     resolved.id.is_empty().then(|| resolved.id = resolved.text.clone());
                     #[cfg(feature = "std-deps")]
                     push_cell(ir, "Constraint", constraint_to_fact(&resolved));
-                    ir.constraints.push(resolved);
+                    // #283 — Constraint cell is the source; no typed vec.
+                    let _ = resolved;
                 }
                 ParseAction::AddDerivation(mut r) => {
                     let nouns_map = nouns_from_cells(&ir.cells);
@@ -1658,7 +1635,8 @@ fn parse_into(ir: &mut ParseCtx, input: &str) -> Result<(), String> {
     }).collect();
     #[cfg(feature = "std-deps")]
     for c in &vcs { push_cell(ir, "Constraint", constraint_to_fact(c)); }
-    ir.constraints.extend(vcs);
+    // #283 — Constraint cell is the source; no typed vec.
+    let _ = vcs;
 
     // Post-processing: resolve autofill spans.
     // For each autofill span name, find SS constraints whose role nouns
@@ -1691,17 +1669,10 @@ fn parse_into(ir: &mut ParseCtx, input: &str) -> Result<(), String> {
         .filter_map(|span_name| named_spans_by_name.get(&span_name))
         .map(|nouns| nouns.iter().cloned().collect())
         .collect();
-    ir.constraints.iter_mut()
-        .filter(|cdef| cdef.kind == "SS")
-        .filter(|cdef| autofill_role_sets.iter().any(|role_set| {
-            role_set.iter().all(|n| cdef.text.contains(n.as_str()))
-        }))
-        .for_each(|cdef| {
-            // Set autofill on the first span (subset span)
-            cdef.spans.first_mut()
-                .into_iter()
-                .for_each(|span| span.subset_autofill = Some(true));
-        });
+    // #283 — mutate the Constraint cell in place (subset_autofill on first span
+    // for any SS constraint whose role set matches an autofill-role-set).
+    #[cfg(feature = "std-deps")]
+    mark_ss_constraints_autofill(ir, &autofill_role_sets);
 
     // Finalize cells from typed fields after all post-processing. This
     // captures mutations applied after the per-arm emission (VC
@@ -1720,9 +1691,9 @@ fn parse_into(ir: &mut ParseCtx, input: &str) -> Result<(), String> {
         // writes the FactType and Role cells directly via
         // `upsert_fact_type`. No finalize rebuild needed.
 
-        // Constraint: ir.constraints → Constraint cell
-        let c_facts: Vec<Object> = ir.constraints.iter().map(constraint_to_fact).collect();
-        ir.cells.insert("Constraint".to_string(), c_facts);
+        // Constraint: #283 — writers emit to the Constraint cell during
+        // parse; mark_ss_constraints_autofill rewrites facts in place.
+        // No finalize rebuild needed.
 
         // DerivationRule + UnresolvedClause: ir.derivation_rules → cells
         let mut dr_facts: Vec<Object> = Vec::with_capacity(ir.derivation_rules.len());
@@ -2861,6 +2832,46 @@ fn upsert_fact_type(ir: &mut ParseCtx, id: &str, def: &FactTypeDef) {
     }
 }
 
+/// #283 — Rebuild `Vec<ConstraintDef>` from the `Constraint` cell.
+/// The cell is lossless — `constraint_to_fact` embeds the full JSON
+/// encoding of each ConstraintDef under the `json` binding. Callers
+/// that want the typed view (tests, resolve paths) go through here.
+#[cfg(feature = "std-deps")]
+fn constraints_from_cells(
+    cells: &HashMap<String, Vec<crate::ast::Object>>,
+) -> Vec<ConstraintDef> {
+    let Some(facts) = cells.get("Constraint") else { return Vec::new() };
+    facts.iter().filter_map(|f| {
+        let json = crate::ast::binding(f, "json")?;
+        serde_json::from_str::<ConstraintDef>(json).ok()
+    }).collect()
+}
+
+/// #283 — Apply subset-span autofill to SS constraints whose role set
+/// matches an autofill-role-set. Mutates the `Constraint` cell in place
+/// by rewriting affected facts with the updated JSON.
+#[cfg(feature = "std-deps")]
+fn mark_ss_constraints_autofill(
+    ir: &mut ParseCtx,
+    role_sets: &[hashbrown::HashSet<String>],
+) {
+    let Some(facts) = ir.cells.get_mut("Constraint") else { return };
+    for fact in facts.iter_mut() {
+        let Some(kind) = crate::ast::binding(fact, "kind") else { continue };
+        if kind != "SS" { continue }
+        let Some(json) = crate::ast::binding(fact, "json") else { continue };
+        let Ok(mut cdef) = serde_json::from_str::<ConstraintDef>(json) else { continue };
+        let matches = role_sets.iter().any(|role_set| {
+            role_set.iter().all(|n| cdef.text.contains(n.as_str()))
+        });
+        if !matches { continue }
+        if let Some(span) = cdef.spans.first_mut() {
+            span.subset_autofill = Some(true);
+        }
+        *fact = constraint_to_fact(&cdef);
+    }
+}
+
 /// Emit a Constraint cell fact with the full constraint JSON (lossless)
 /// plus flat fields for check.rs and no_std fallbacks.
 #[cfg(all(test, feature = "std-deps"))]
@@ -2959,10 +2970,10 @@ fn apply_action(ir: &mut ParseCtx, action: Option<ParseAction>, lines: &[String]
         }
         ParseAction::AddConstraint(c) => {
             // Emit Constraint cell fact directly. Pass 2b does not revisit
-            // constraints, so this is the final form.
+            // constraints, so this is the final form. #283 — no typed vec.
             #[cfg(feature = "std-deps")]
             push_cell(ir, "Constraint", constraint_to_fact(&c));
-            ir.constraints.push(c);
+            let _ = c;
         }
         ParseAction::AddDerivation(r) => {
             // Pass 2b (re_resolve_rules) re-populates structured fields on
@@ -3705,15 +3716,18 @@ mod tests {
     fn exactly_one_splits_to_uc_mc() {
         let input = "Person(.Name) is an entity type.\nCountry(.Code) is an entity type.\nPerson was born in Country.\nEach Person was born in exactly one Country.";
         let ir = parse_markdown(input).unwrap();
-        assert!(ir.constraints.iter().any(|c| c.kind == "UC"));
-        assert!(ir.constraints.iter().any(|c| c.kind == "MC"));
+        // #283 — Constraint cell reads.
+        let cs = super::constraints_from_cells(&ir.cells);
+        assert!(cs.iter().any(|c| c.kind == "UC"));
+        assert!(cs.iter().any(|c| c.kind == "MC"));
     }
 
     #[test]
     fn deontic_constraints() {
         let input = "Response(.id) is an entity type.\nIt is obligatory that each Response is professional.";
         let ir = parse_markdown(input).unwrap();
-        assert!(ir.constraints.iter().any(|c| c.modality == "deontic"));
+        // #283 — Constraint cell read.
+        assert!(super::constraints_from_cells(&ir.cells).iter().any(|c| c.modality == "deontic"));
     }
 
     #[test]
@@ -4046,10 +4060,12 @@ mod tests {
             let input = format!(
                 "Customer(.Name) is an entity type.\nOrder(.Id) is an entity type.\nShipping Address is a value type.\n## Fact Types\nCustomer places Order.\nCustomer has Shipping Address.\nOrder has Shipping Address.\n## Constraints\nIf some Customer places some Order then that Order has Shipping Address {linker} that Customer's Shipping Address.");
             let ir = parse_markdown(&input).unwrap_or_else(|e| panic!("linker={linker:?}: {e:?}"));
-            let ss: Vec<_> = ir.constraints.iter().filter(|c| c.kind == "SS").collect();
+            // #283 — Constraint cell read.
+            let cs = super::constraints_from_cells(&ir.cells);
+            let ss: Vec<_> = cs.iter().filter(|c| c.kind == "SS").collect();
             assert!(!ss.is_empty(),
                 "linker={linker:?}: expected at least one SS, got kinds {:?}",
-                ir.constraints.iter().map(|c| &c.kind).collect::<Vec<_>>());
+                cs.iter().map(|c| &c.kind).collect::<Vec<_>>());
         }
     }
 
@@ -4057,11 +4073,11 @@ mod tests {
     fn ring_shorthand_acyclic_emits_ac_constraint() {
         let input = "Category(.Name) is an entity type.\n## Fact Types\nCategory has parent Category.\nCategory has parent Category is acyclic.";
         let ir = parse_markdown(input).unwrap();
-        let ac: Vec<_> = ir.constraints.iter()
-            .filter(|c| c.kind == "AC")
-            .collect();
+        // #283 — Constraint cell read.
+        let cs = super::constraints_from_cells(&ir.cells);
+        let ac: Vec<_> = cs.iter().filter(|c| c.kind == "AC").collect();
         assert_eq!(ac.len(), 1, "expected one AC constraint, got {:?}",
-            ir.constraints.iter().map(|c| &c.kind).collect::<Vec<_>>());
+            cs.iter().map(|c| &c.kind).collect::<Vec<_>>());
         assert_eq!(ac[0].entity, Some("Category".to_string()));
     }
 
@@ -4069,9 +4085,11 @@ mod tests {
     fn ring_shorthand_irreflexive_emits_ir_constraint() {
         let input = "Person(.Name) is an entity type.\n## Fact Types\nPerson is parent of Person.\nPerson is parent of Person is irreflexive.";
         let ir = parse_markdown(input).unwrap();
-        let irref: Vec<_> = ir.constraints.iter().filter(|c| c.kind == "IR").collect();
+        // #283 — Constraint cell read.
+        let cs = super::constraints_from_cells(&ir.cells);
+        let irref: Vec<_> = cs.iter().filter(|c| c.kind == "IR").collect();
         assert_eq!(irref.len(), 1, "expected one IR, got {:?}",
-            ir.constraints.iter().map(|c| &c.kind).collect::<Vec<_>>());
+            cs.iter().map(|c| &c.kind).collect::<Vec<_>>());
         assert_eq!(irref[0].entity, Some("Person".to_string()));
     }
 
@@ -4090,9 +4108,11 @@ mod tests {
             let input = format!(
                 "Person(.Name) is an entity type.\n## Fact Types\nPerson is parent of Person.\nPerson is parent of Person is {adj}.");
             let ir = parse_markdown(&input).unwrap_or_else(|e| panic!("parse {adj}: {e:?}"));
-            let hits: Vec<_> = ir.constraints.iter().filter(|c| c.kind == want_kind).collect();
+            // #283 — Constraint cell read.
+            let cs = super::constraints_from_cells(&ir.cells);
+            let hits: Vec<_> = cs.iter().filter(|c| c.kind == want_kind).collect();
             assert_eq!(hits.len(), 1, "adj={adj}: expected {want_kind}, got {:?}",
-                ir.constraints.iter().map(|c| &c.kind).collect::<Vec<_>>());
+                cs.iter().map(|c| &c.kind).collect::<Vec<_>>());
         }
     }
 
@@ -4230,9 +4250,11 @@ mod tests {
         // #283 — FactType cell reads. Fact type keyed by Fact Type ID.
         assert!(super::fact_type_exists(&ir.cells, "User_owns_Organization"));
         assert!(!super::fact_type_exists(&ir.cells, "User owns Organization"));
-        // The constraint's spans should reference the same schema ID
-        assert!(!ir.constraints.is_empty());
-        let c = &ir.constraints[0];
+        // The constraint's spans should reference the same schema ID.
+        // #283 — Constraint cell read.
+        let cs = super::constraints_from_cells(&ir.cells);
+        assert!(!cs.is_empty());
+        let c = &cs[0];
         assert_eq!(c.spans[0].fact_type_id, "User_owns_Organization",
             "Constraint span should reference Fact Type ID, not reading text");
     }
@@ -4254,14 +4276,15 @@ mod tests {
         assert!(super::fact_type_exists(&ir.cells, "User_owns_Organization"));
         assert!(super::fact_type_exists(&ir.cells, "User_administers_Organization"));
         // "is owned by" constraint should resolve to "User_owns_Organization"
-        // via word overlap: "owned" matches "owns"
-        let owned_constraint = ir.constraints.iter()
+        // via word overlap: "owned" matches "owns". #283 — Constraint cell read.
+        let cs = super::constraints_from_cells(&ir.cells);
+        let owned_constraint = cs.iter()
             .find(|c| c.text.contains("is owned by"))
             .expect("should have 'is owned by' constraint");
         assert_eq!(owned_constraint.spans[0].fact_type_id, "User_owns_Organization",
             "Inverse voice 'is owned by' should resolve to 'owns' schema");
         // "is administered by" should resolve to "User_administers_Organization"
-        let admin_constraint = ir.constraints.iter()
+        let admin_constraint = cs.iter()
             .find(|c| c.text.contains("is administered by"))
             .expect("should have 'is administered by' constraint");
         assert_eq!(admin_constraint.spans[0].fact_type_id, "User_administers_Organization",
@@ -4272,77 +4295,77 @@ mod tests {
     fn ring_irreflexive() {
         let input = "Person(.Name) is an entity type.\nPerson is a parent of Person.\nNo Person is a parent of itself.";
         let ir = parse_markdown(input).unwrap();
-        assert!(ir.constraints.iter().any(|c| c.kind == "IR"), "Expected IR constraint, got: {:?}", ir.constraints);
+        assert!(super::constraints_from_cells(&ir.cells).iter().any(|c| c.kind == "IR"), "Expected IR constraint, got: {:?}", super::constraints_from_cells(&ir.cells));
     }
 
     #[test]
     fn ring_asymmetric() {
         let input = "Person(.Name) is an entity type.\nPerson is a parent of Person.\nIf Person1 is a parent of Person2 then it is impossible that Person2 is a parent of Person1.";
         let ir = parse_markdown(input).unwrap();
-        assert!(ir.constraints.iter().any(|c| c.kind == "AS"), "Expected AS constraint, got: {:?}", ir.constraints);
+        assert!(super::constraints_from_cells(&ir.cells).iter().any(|c| c.kind == "AS"), "Expected AS constraint, got: {:?}", super::constraints_from_cells(&ir.cells));
     }
 
     #[test]
     fn ring_symmetric() {
         let input = "Person(.Name) is an entity type.\nPerson is married to Person.\nIf Person1 is married to Person2 then Person2 is married to Person1.";
         let ir = parse_markdown(input).unwrap();
-        assert!(ir.constraints.iter().any(|c| c.kind == "SY"), "Expected SY constraint, got: {:?}", ir.constraints);
+        assert!(super::constraints_from_cells(&ir.cells).iter().any(|c| c.kind == "SY"), "Expected SY constraint, got: {:?}", super::constraints_from_cells(&ir.cells));
     }
 
     #[test]
     fn ring_intransitive() {
         let input = "Person(.Name) is an entity type.\nPerson is a parent of Person.\nIf Person1 is a parent of Person2 and Person2 is a parent of Person3 then it is impossible that Person1 is a parent of Person3.";
         let ir = parse_markdown(input).unwrap();
-        assert!(ir.constraints.iter().any(|c| c.kind == "IT"), "Expected IT constraint, got: {:?}", ir.constraints);
+        assert!(super::constraints_from_cells(&ir.cells).iter().any(|c| c.kind == "IT"), "Expected IT constraint, got: {:?}", super::constraints_from_cells(&ir.cells));
     }
 
     #[test]
     fn ring_transitive() {
         let input = "Person(.Name) is an entity type.\nPerson is an ancestor of Person.\nIf Person1 is an ancestor of Person2 and Person2 is an ancestor of Person3 then Person1 is an ancestor of Person3.";
         let ir = parse_markdown(input).unwrap();
-        assert!(ir.constraints.iter().any(|c| c.kind == "TR"), "Expected TR constraint, got: {:?}", ir.constraints);
+        assert!(super::constraints_from_cells(&ir.cells).iter().any(|c| c.kind == "TR"), "Expected TR constraint, got: {:?}", super::constraints_from_cells(&ir.cells));
     }
 
     #[test]
     fn ring_acyclic() {
         let input = "Category(.Name) is an entity type.\nCategory contains Category.\nNo Category may cycle back to itself via one or more traversals through contains.";
         let ir = parse_markdown(input).unwrap();
-        assert!(ir.constraints.iter().any(|c| c.kind == "AC"), "Expected AC constraint, got: {:?}", ir.constraints);
+        assert!(super::constraints_from_cells(&ir.cells).iter().any(|c| c.kind == "AC"), "Expected AC constraint, got: {:?}", super::constraints_from_cells(&ir.cells));
     }
 
     #[test]
     fn subset_constraint() {
         let input = "Person(.Name) is an entity type.\nBook(.Title) is an entity type.\nPerson authored Book.\nPerson reviewed Book.\nIf some Person authored some Book then that Person reviewed that Book.";
         let ir = parse_markdown(input).unwrap();
-        assert!(ir.constraints.iter().any(|c| c.kind == "SS"), "Expected SS constraint, got: {:?}", ir.constraints);
+        assert!(super::constraints_from_cells(&ir.cells).iter().any(|c| c.kind == "SS"), "Expected SS constraint, got: {:?}", super::constraints_from_cells(&ir.cells));
     }
 
     #[test]
     fn equality_constraint() {
         let input = "Person(.Name) is an entity type.\nBook(.Title) is an entity type.\nPerson authored Book.\nPerson reviewed Book.\nFor each Person, that Person authored some Book if and only if that Person reviewed some Book.";
         let ir = parse_markdown(input).unwrap();
-        assert!(ir.constraints.iter().any(|c| c.kind == "EQ"), "Expected EQ constraint, got: {:?}", ir.constraints);
+        assert!(super::constraints_from_cells(&ir.cells).iter().any(|c| c.kind == "EQ"), "Expected EQ constraint, got: {:?}", super::constraints_from_cells(&ir.cells));
     }
 
     #[test]
     fn exclusion_general() {
         let input = "Person(.Name) is an entity type.\nPerson is tenured.\nPerson is contracted.\nFor each Person, at most one of the following holds: that Person is tenured; that Person is contracted.";
         let ir = parse_markdown(input).unwrap();
-        assert!(ir.constraints.iter().any(|c| c.kind == "XC"), "Expected XC, got: {:?}", ir.constraints);
+        assert!(super::constraints_from_cells(&ir.cells).iter().any(|c| c.kind == "XC"), "Expected XC, got: {:?}", super::constraints_from_cells(&ir.cells));
     }
 
     #[test]
     fn exclusive_or() {
         let input = "Person(.Name) is an entity type.\nPerson is tenured.\nPerson is contracted.\nFor each Person, exactly one of the following holds: that Person is tenured; that Person is contracted.";
         let ir = parse_markdown(input).unwrap();
-        assert!(ir.constraints.iter().any(|c| c.kind == "XO"), "Expected XO, got: {:?}", ir.constraints);
+        assert!(super::constraints_from_cells(&ir.cells).iter().any(|c| c.kind == "XO"), "Expected XO, got: {:?}", super::constraints_from_cells(&ir.cells));
     }
 
     #[test]
     fn inclusive_or() {
         let input = "Lecturer(.Name) is an entity type.\nDate(.Value) is a value type.\nLecturer is contracted until Date.\nLecturer is tenured.\nEach Lecturer is contracted until some Date or is tenured.";
         let ir = parse_markdown(input).unwrap();
-        assert!(ir.constraints.iter().any(|c| c.kind == "OR"), "Expected OR, got: {:?}", ir.constraints);
+        assert!(super::constraints_from_cells(&ir.cells).iter().any(|c| c.kind == "OR"), "Expected OR, got: {:?}", super::constraints_from_cells(&ir.cells));
     }
 
     #[test]
@@ -4391,8 +4414,10 @@ Person is uncle of Person.\n\
     fn frequency_constraint() {
         let input = "Customer(.Name) is an entity type.\nOrder(.Id) is an entity type.\nCustomer places Order.\nEach Customer places at least 1 and at most 5 Order.";
         let ir = parse_markdown(input).unwrap();
-        assert!(ir.constraints.iter().any(|c| c.kind == "FC"), "Expected FC constraint, got: {:?}", ir.constraints);
-        let fc = ir.constraints.iter().find(|c| c.kind == "FC").unwrap();
+        // #283 — Constraint cell read.
+        let cs = super::constraints_from_cells(&ir.cells);
+        assert!(cs.iter().any(|c| c.kind == "FC"), "Expected FC constraint, got: {:?}", cs);
+        let fc = cs.iter().find(|c| c.kind == "FC").unwrap();
         assert_eq!(fc.min_occurrence, Some(1));
         assert_eq!(fc.max_occurrence, Some(5));
     }
@@ -4401,21 +4426,21 @@ Person is uncle of Person.\n\
     fn value_constraint() {
         let input = "Priority is a value type.\n  The possible values of Priority are 'Low', 'Medium', 'High'.\nTicket(.Id) is an entity type.\nTicket has Priority.";
         let ir = parse_markdown(input).unwrap();
-        assert!(ir.constraints.iter().any(|c| c.kind == "VC"), "Expected VC constraint, got: {:?}", ir.constraints);
+        assert!(super::constraints_from_cells(&ir.cells).iter().any(|c| c.kind == "VC"), "Expected VC constraint, got: {:?}", super::constraints_from_cells(&ir.cells));
     }
 
     #[test]
     fn external_uniqueness() {
         let input = "Room(.Nr) is an entity type.\nBuilding(.Code) is an entity type.\nRoomNr is a value type.\nRoom is in Building.\nRoom has RoomNr.\nFor each Building and RoomNr, at most one Room is in that Building and has that RoomNr.";
         let ir = parse_markdown(input).unwrap();
-        assert!(ir.constraints.iter().any(|c| c.kind == "UC"), "Expected UC (external), got: {:?}", ir.constraints);
+        assert!(super::constraints_from_cells(&ir.cells).iter().any(|c| c.kind == "UC"), "Expected UC (external), got: {:?}", super::constraints_from_cells(&ir.cells));
     }
 
     #[test]
     fn context_pattern() {
         let input = "Room(.Nr) is an entity type.\nBuilding(.Code) is an entity type.\nRoomNr is a value type.\nRoom is in Building.\nRoom has RoomNr.\nContext: Room is in Building; Room has RoomNr. In this context, each Building, RoomNr combination is associated with at most one Room.";
         let ir = parse_markdown(input).unwrap();
-        assert!(ir.constraints.iter().any(|c| c.kind == "UC"), "Expected UC (context), got: {:?}", ir.constraints);
+        assert!(super::constraints_from_cells(&ir.cells).iter().any(|c| c.kind == "UC"), "Expected UC (context), got: {:?}", super::constraints_from_cells(&ir.cells));
     }
 
     #[test]
@@ -4440,9 +4465,10 @@ Auth Session uses Session Strategy.
             "Fact type keys should not contain spaces");
         assert!(super::fact_type_exists(&ir.cells, "Auth_Session_is_for_Customer"));
         assert!(super::fact_type_exists(&ir.cells, "Auth_Session_uses_Session_Strategy"));
-        // Constraints should reference schema IDs
+        // Constraints should reference schema IDs. #283 — Constraint cell read.
+        let cs = super::constraints_from_cells(&ir.cells);
         assert!(
-            ir.constraints.iter().flat_map(|c| c.spans.iter())
+            cs.iter().flat_map(|c| c.spans.iter())
                 .all(|span| !span.fact_type_id.contains(' ')),
             "Constraint spans should not contain spaces"
         );
@@ -4472,8 +4498,10 @@ Auth Session uses Session Strategy.
         assert!(autofill.iter()
             .any(|f| crate::ast::binding(f, "name") == Some("Customer Submission Match")),
             "AutofillSpan cell must carry 'Customer Submission Match'");
-        // The SS constraint targeting Customer, Support Request should have autofill enabled
-        let ss = ir.constraints.iter().find(|c| c.kind == "SS").expect("Should have SS constraint");
+        // The SS constraint targeting Customer, Support Request should have autofill enabled.
+        // #283 — Constraint cell read.
+        let cs = super::constraints_from_cells(&ir.cells);
+        let ss = cs.iter().find(|c| c.kind == "SS").expect("Should have SS constraint");
         assert_eq!(ss.spans.iter().any(|s| s.subset_autofill == Some(true)), true, "SS constraint should have autofill enabled");
     }
 
@@ -4488,7 +4516,9 @@ If some Person heads some Department then that Person works in that Department.
 This span with Person, Department provides the preferred identification scheme for Department Leadership.
 Constraint Span 'Department Leadership' autofills from superset.";
         let ir = parse_markdown(input).unwrap();
-        let ss = ir.constraints.iter().find(|c| c.kind == "SS").expect("SS constraint");
+        // #283 — Constraint cell read.
+        let cs = super::constraints_from_cells(&ir.cells);
+        let ss = cs.iter().find(|c| c.kind == "SS").expect("SS constraint");
         assert!(ss.spans.iter().any(|s| s.subset_autofill == Some(true)), "autofill should be set");
     }
 
@@ -4505,7 +4535,9 @@ Support Response uses Dash.
 ## Deontic Constraints
 It is forbidden that Support Response uses Dash.";
         let ir = parse_markdown(input).unwrap();
-        let c = ir.constraints.iter()
+        // #283 — Constraint cell read.
+        let cs = super::constraints_from_cells(&ir.cells);
+        let c = cs.iter()
             .find(|c| c.text.contains("forbidden") && c.text.contains("Dash"))
             .expect("Should have forbidden Dash constraint");
         assert_eq!(c.entity, Some("Support Response".into()),
@@ -4523,7 +4555,9 @@ Support Response uses Dash.
 ## Deontic Constraints
 It is forbidden that Support Response uses Dash.";
         let ir = parse_markdown(input).unwrap();
-        let c = ir.constraints.iter()
+        // #283 — Constraint cell read.
+        let cs = super::constraints_from_cells(&ir.cells);
+        let c = cs.iter()
             .find(|c| c.text.contains("forbidden") && c.text.contains("Dash"))
             .unwrap();
         assert!(!c.spans.is_empty(), "Deontic constraint should have at least one span");
@@ -4548,7 +4582,9 @@ Support Response contains Markdown Syntax.
 It is forbidden that Support Response uses Dash.
 It is forbidden that Support Response contains Markdown Syntax.";
         let ir = parse_markdown(input).unwrap();
-        let deontics: Vec<&ConstraintDef> = ir.constraints.iter()
+        // #283 — Constraint cell read.
+        let cs = super::constraints_from_cells(&ir.cells);
+        let deontics: Vec<&ConstraintDef> = cs.iter()
             .filter(|c| c.modality == "deontic")
             .collect();
         assert!(deontics.len() >= 2, "Should have at least 2 deontic constraints");
@@ -4570,7 +4606,9 @@ Support Response conforms to Pricing Model.
 ## Deontic Constraints
 It is obligatory that each Support Response conforms to Pricing Model.";
         let ir = parse_markdown(input).unwrap();
-        let c = ir.constraints.iter()
+        // #283 — Constraint cell read.
+        let cs = super::constraints_from_cells(&ir.cells);
+        let c = cs.iter()
             .find(|c| c.text.contains("obligatory") && c.text.contains("Pricing Model"))
             .expect("Should have obligatory Pricing Model constraint");
         assert_eq!(c.entity, Some("Support Response".into()));
