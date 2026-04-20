@@ -85,6 +85,11 @@ pub fn translate_nouns(classified_state: &Object) -> Vec<Object> {
             Some("entity")
         } else if classifications.iter().any(|k| k == "Value Type Declaration") {
             Some("value")
+        } else if classifications.iter().any(|k| k == "Subtype Declaration") {
+            // `Fact Type is a subtype of Noun` declares `Fact Type`
+            // as a Noun alongside the Subtype relation — legacy
+            // treats it as entity-typed unless later abstracted.
+            Some("entity")
         } else {
             None
         };
@@ -173,7 +178,11 @@ pub fn translate_fact_types(classified_state: &Object) -> (Vec<Object>, Vec<Obje
         if !classifications.iter().any(|k| k == "Fact Type Reading") {
             continue;
         }
-        // Exclude declarative shapes that incidentally match.
+        // Exclude every non-fact-type classification. Fact Type Reading
+        // fires whenever a Role Reference is present, which is true of
+        // declarations, instance facts, and constraint statements alike.
+        // The translator only emits when Fact Type Reading is the ONLY
+        // structural classification.
         const EXCLUDE: &[&str] = &[
             "Entity Type Declaration",
             "Value Type Declaration",
@@ -182,6 +191,18 @@ pub fn translate_fact_types(classified_state: &Object) -> (Vec<Object>, Vec<Obje
             "Enum Values Declaration",
             "Instance Fact",
             "Partition Declaration",
+            "Derivation Rule",
+            "Uniqueness Constraint",
+            "Mandatory Role Constraint",
+            "Frequency Constraint",
+            "Ring Constraint",
+            "Value Constraint",
+            "Equality Constraint",
+            "Subset Constraint",
+            "Exclusion Constraint",
+            "Exclusive-Or Constraint",
+            "Or Constraint",
+            "Deontic Constraint",
         ];
         if classifications.iter().any(|k| EXCLUDE.iter().any(|e| e == k)) {
             continue;
