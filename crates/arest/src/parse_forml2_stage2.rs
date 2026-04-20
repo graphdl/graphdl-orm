@@ -510,20 +510,39 @@ pub fn translate_cardinality_constraints(classified_state: &Object) -> Vec<Objec
     let mut out: Vec<Object> = Vec::new();
     for stmt_id in &statement_ids {
         let classifications = classifications_for(classified_state, stmt_id);
-        // Longest-specific first: Frequency wins over UC/MC when
-        // both fire (a statement is rarely classified as more than
-        // one, but be explicit about precedence).
-        let kind = if classifications.iter().any(|k| k == "Frequency Constraint") {
-            "FC"
-        } else if classifications.iter().any(|k| k == "Uniqueness Constraint") {
-            "UC"
-        } else if classifications.iter().any(|k| k == "Mandatory Role Constraint") {
-            "MC"
-        } else {
-            continue;
-        };
         let text = statement_text(classified_state, stmt_id).unwrap_or_default();
         let entity = head_noun_for(classified_state, stmt_id).unwrap_or_default();
+        let is_fc = classifications.iter().any(|k| k == "Frequency Constraint");
+        let is_uc = classifications.iter().any(|k| k == "Uniqueness Constraint");
+        let is_mc = classifications.iter().any(|k| k == "Mandatory Role Constraint");
+        if !(is_fc || is_uc || is_mc) { continue; }
+
+        // `exactly one` splits into UC + MC per legacy behavior
+        // (ORM 2: cardinality of 1 is the conjunction of "at most
+        // one" and "at least one"). Rewrite the text for each so
+        // downstream consumers see the two expanded constraints.
+        //
+        // Restricted to `Each X ... exactly one Y` — the "For each
+        // X, exactly one Y has that X" external-UC form is preserved
+        // as a single UC per legacy behavior.
+        if is_uc && text.contains("exactly one") && text.starts_with("Each ") {
+            let uc_text = text.replace("exactly one", "at most one");
+            let mc_text = text.replace("exactly one", "some");
+            out.push(fact_from_pairs(&[
+                ("id", uc_text.as_str()), ("kind", "UC"),
+                ("modality", "alethic"),  ("text", uc_text.as_str()),
+                ("entity", entity.as_str()),
+            ]));
+            out.push(fact_from_pairs(&[
+                ("id", mc_text.as_str()), ("kind", "MC"),
+                ("modality", "alethic"),  ("text", mc_text.as_str()),
+                ("entity", entity.as_str()),
+            ]));
+            continue;
+        }
+
+        // FC takes precedence over UC/MC on the same Statement.
+        let kind = if is_fc { "FC" } else if is_uc { "UC" } else { "MC" };
         out.push(fact_from_pairs(&[
             ("id",       text.as_str()),
             ("kind",     kind),
@@ -1359,8 +1378,9 @@ mod tests {
 
     #[test]
     fn translate_cardinality_constraints_emits_uc_mc_fc() {
-        // Three constraints in one state: UC via 'exactly one', MC
-        // via 'at least one', FC via 'at most' + 'at least'.
+        // `exactly one` splits into UC + MC (1+1), `at least one`
+        // gives a second MC (0+1), and `at most N and at least M`
+        // gives FC (0+0+1). Expected totals: UC=1, MC=2, FC=1.
         let nouns_list = &["Order", "Customer", "Email", "Line Item"];
         let uc = stage1_state("s-uc",
             "Each Order was placed by exactly one Customer.", nouns_list);
@@ -1377,11 +1397,24 @@ mod tests {
             constraints.iter().filter(|f| binding(f, "kind") == Some(k)).collect()
         };
         assert_eq!(by_kind("UC").len(), 1, "expected 1 UC, got {:?}", constraints);
-        assert_eq!(by_kind("MC").len(), 1, "expected 1 MC, got {:?}", constraints);
+        assert_eq!(by_kind("MC").len(), 2, "expected 2 MC, got {:?}", constraints);
         assert_eq!(by_kind("FC").len(), 1, "expected 1 FC, got {:?}", constraints);
         for c in &constraints {
             assert_eq!(binding(c, "modality"), Some("alethic"));
         }
+    }
+
+    #[test]
+    fn mandatory_role_constraint_fires_on_some_quantifier() {
+        // ORM 2 plural `some` = "at least one" — `Each X has some Y`
+        // is MC. Stage-1 emits `Statement has Quantifier 'some'`; the
+        // grammar routes it to Mandatory Role Constraint.
+        let stmt = stage1_state(
+            "s1", "Each Noun plays some Role.", &["Noun", "Role"]);
+        let classified = classify_statements(&stmt, &grammar_state());
+        let kinds = classifications_for(&classified, "s1");
+        assert!(kinds.iter().any(|k| k == "Mandatory Role Constraint"),
+            "expected MC classification for 'some' quantifier; got {:?}", kinds);
     }
 
     #[test]
