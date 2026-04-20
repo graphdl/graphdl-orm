@@ -254,9 +254,21 @@ endmodule
 
 `clk` and `rst_n` fan out to every entity; each entity's `valid` is AND-reduced into a single system-level `all_valid`. Column inputs are tied to `{256{1'b0}}` so synthesis tools do not flag unconnected input ports — integrators replace those zero drivers with real wires (BRAM ports, pipeline stages) when integrating with storage. If the compile has no entity nouns, `top` is elided entirely — no entities, nothing to wire, just the header line.
 
+### Constraint modules
+
+Every `Constraint` cell entry compiles to one Verilog module whose `violation` output AND-reduces (after inversion) into `top`'s `constraint_ok` signal. The following predicates now emit real hardware:
+
+- **UC (Uniqueness).** Pairwise comparator tree over a flattened row bus. `violation = 1` iff two active rows match on the spanned columns. DEPTH and ROW_WIDTH are `parameter`s so synthesis can tune the tree; top ties `rows_flat` / `row_count` to zero by default — integrators rewire to the entity BRAM's `rdata_a` ports.
+- **MC (Mandatory).** Per-row zero-sentinel compare. `violation = 1` iff any active row holds all zeros on the payload.
+- **FC (Frequency).** Saturating counter with `create_pulse` / `terminate_pulse` inputs; `violation` high whenever the live count sits outside the parsed `[MIN_COUNT, MAX_COUNT]` window. Bounds come from the Constraint's `text` binding (legacy `at most N and at least M` pattern). Integrators wire the pulses to the SM module's create / terminate edges.
+- **Ring — IR / AS / AT / SY / IT / TR / AC / RF.** Pairwise predicates over `(left, right)` row halves. IR checks for self-loops, AS / AT check for inverse pairs (with / without the self-loop allowance), SY / RF check for missing inverses / self-loops, IT / TR check the transitive-closure predicates, AC approximates acyclicity via the two-row cycle case.
+- **VC (Value).** Case comparator against the declared enum-value set (read from the `EnumValues` cell and baked as 256-bit ASCII literals). `violation = 1` iff some active row matches none of the declared values.
+
 ### What's still future work
 
-Constraint enforcement (UC/MC/FC as synthesizable comparators) and state-machine transitions as signal dispatch are not yet emitted. The current generator proves the pipeline and the top-level wiring are in place; the reduction engine inside each module is still a shell.
+The cross-fact-type constraints — **SS (Subset), EQ (Equality), XC (Exclusion), OR (Inclusive-Or), XO (Exclusive-Or)** — emit canonical-shape stub modules with an explicit `// TODO` comment and `violation` tied to zero. Real predicates require a two-bank BRAM handshake (two distinct entity BRAMs read simultaneously) and land after the single-bank handshake for UC/MC/ring/VC stabilises.
+
+State-machine transition signalling is in place (see `emit_sm_modules`), but the pulse bridge that wires create / terminate transitions into FC's counter pulses is still an integrator step — the ports are there; the default tie-off is `1'b0`.
 
 ## Test
 
