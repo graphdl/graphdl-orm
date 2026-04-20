@@ -29,7 +29,7 @@ The parser produces a `Domain` struct containing:
 - `derivation_rules`: rules with resolved antecedents and consequents.
 - `general_instance_facts`: instance facts and their subject, object, and field bindings.
 
-Parse is currently the slowest step at scale (~58 µs per fact type or instance fact). It only runs once per compile, and per-command `create` does not parse, since it reads already-compiled defs instead.
+Parse is the slowest step in compile, but it only runs once per compile — per-command `create` does not parse, since it reads already-compiled defs instead.
 
 ## Step 2: `domain_to_state`
 
@@ -88,7 +88,7 @@ Constraints are indexed: `validate:{fact_type_id}` runs only the constraints tha
 
 Derivations are indexed by noun: `derivation_index:{Order}` lists the rule IDs relevant to Orders. The engine only forward-chains those.
 
-Fetches against `D` are O(1) (backed by `HashMap`). At scale (100 fact types, 2,000+ defs), one fetch takes around 0.3 µs.
+Fetches against `D` are O(1) (backed by `HashMap`). At realistic def counts the fetch cost is negligible relative to the work inside the ρ-application itself.
 
 ## Incremental compile
 
@@ -98,7 +98,7 @@ Fetches against `D` are O(1) (backed by `HashMap`). At scale (100 fact types, 2,
 
 The metamodel (`readings/core.md` and the rest of the bundled domains) does not change between tenants. It compiles once per process: the first call through `OnceLock` runs parse + `compile_to_defs_state` over the merged metamodel and caches the resulting defs. Every tenant init after that seeds its cells from that cache and layers the tenant's own readings on top, paying only the user-readings delta.
 
-In practice this turns a 150-ms cold compile into a 5-ms per-tenant seed. The cache is a module-global, so long-lived processes (Cloudflare Workers warmed up, native daemons) amortize it across every request.
+In practice this turns a full cold compile into a much smaller per-tenant seed. The cache is a module-global, so long-lived processes (Cloudflare Workers warmed up, native daemons) amortize it across every request.
 
 ## Concurrency: per-cell isolation
 

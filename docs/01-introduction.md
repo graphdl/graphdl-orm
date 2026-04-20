@@ -34,7 +34,7 @@ It is not a fit under these conditions:
 
 - **Your core logic is arithmetic or optimization.** Statistical scoring, ML inference, and numerical simulation are opaque to ρ. For those, call a Platform function whose implementation the runtime resolves by name.
 - **You need to evolve aggressively without review.** `compile` performs immediate self-modification, whereas `propose` is governed. Teams that want neither workflow should not use this system.
-- **Your performance budget is measured in microseconds end-to-end.** The compile step runs at roughly 50 ms for 100 fact types. Per-command `create` runs in sub-millisecond time, but adding arest to a hot path where every microsecond counts is the wrong trade.
+- **Your performance budget is measured in microseconds end-to-end.** Compile runs once per deploy; per-command `create` runs the full pipeline (resolve → derive → validate → emit). Both are fast enough for request-level latencies, but putting arest on a hot path where every microsecond counts is the wrong trade.
 
 ## What you will learn in these docs
 

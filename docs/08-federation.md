@@ -147,6 +147,81 @@ Four steps:
 
 No middleware, no schema translation, no separate query language. The fact type declared in your readings is the response schema; JSON keys map to role bindings through the compiled schema.
 
+## Completeness patterns
+
+Federated reads are OWA by default: a fact not fetched is *unknown*, not *false*. Constraints spanning a federated noun are therefore sound but not complete — a reported violation is genuine, but the absence of a violation is not a guarantee, since the violating fact may live in the remote system and simply not have been fetched.
+
+When you need completeness anyway, reach for one of these three patterns.
+
+### Snapshot into local CWA
+
+Fetch the federated population once, assert each fact locally, then declare the noun CWA going forward. Appropriate when the remote changes slowly (regulatory lists, country codes, chart-of-accounts). After the snapshot, every constraint spanning the noun is complete against the authoritative local population.
+
+```forml2
+External System 'iso' has URL 'https://iso.example/countries'.
+
+Noun 'Country' is backed by External System 'iso'.
+Noun 'Country' has URI '/countries'.
+
+## Instance Facts
+
+Noun 'Country' has World Assumption 'closed'.
+```
+
+The last line flips the noun from OWA (the federation default) to CWA. Further fetches are still permitted, but the compiler treats the locally-asserted population as authoritative when evaluating constraints. Schedule a re-snapshot when the remote source changes.
+
+### Read-only mandatory gate
+
+Declare the federated noun with read-only permission so the compiler rejects alethic constraints that depend on completeness; express federated-spanning rules as deontic instead. This keeps the formalism honest — the system never *claims* a property it can't verify.
+
+```forml2
+Noun 'Stripe Customer' is backed by External System 'stripe'.
+Noun 'Stripe Customer' has URI '/customers'.
+Noun 'Stripe Customer' has Permission 'read'.
+
+## Deontic Constraints
+
+It is obligatory that each Subscription belongs to some Stripe Customer.
+```
+
+An alethic `Each Subscription belongs to exactly one Stripe Customer` would be rejected at compile time: the federation path cannot guarantee the Stripe Customer is present. Deontic lets the system record the expectation and report the violations it can observe, without over-claiming.
+
+### Periodic reconciliation
+
+Run a scheduled job that re-fetches the federated population, diffs against the local snapshot, and emits `Signal` entities for changes. The existing evolution workflow (`readings/evolution.md`) picks them up the same way it picks up Signals from any other source.
+
+```forml2
+## Entity Types
+
+Reconciliation Run(.id) is an entity type.
+
+## Fact Types
+
+Reconciliation Run occurred at Timestamp.
+Reconciliation Run observed Delta Count.
+Reconciliation Run emits Signal.
+
+## Instance Facts (emitted by each scheduled run)
+
+Reconciliation Run 'recon-2026-04-20-01' occurred at Timestamp '2026-04-20T00:00:00Z'.
+Reconciliation Run 'recon-2026-04-20-01' observed Delta Count '7'.
+Signal 'recon-2026-04-20-01' has Signal Source 'Reconciliation'.
+Reconciliation Run 'recon-2026-04-20-01' emits Signal 'recon-2026-04-20-01'.
+Signal 'recon-2026-04-20-01' leads to Domain Change 'dc-2026-04-20-01'.
+```
+
+This is completeness-by-freshness rather than completeness-by-algebra: the incompleteness window is bounded by your reconciliation interval, and the Signal stream is the audit trail.
+
+Note: `'Reconciliation'` is not in the default `Signal Source` enum in `readings/evolution.md` (`Constraint Violation`, `Human`, `Error Pattern`, `Feature Request`, `Support Request`). Extend the enum via a Domain Change before running a reconciliation job that uses it, or pick an existing value that fits your semantics.
+
+### Picking a pattern
+
+- **Snapshot** when the remote is slow-moving and fetch-once is viable.
+- **Read-only gate** when the remote is authoritative but large or frequently changing — trade completeness for honest OWA semantics.
+- **Reconciliation** when you need both: freshness plus constraint completeness, with Signals as the audit trail.
+
+All three keep the federation path working; they differ only in how they reconcile OWA's sound-not-complete limitation with constraints that want CWA semantics.
+
 ## What's next
 
 Your readings now reach everything: schema, constraints, workflows, derivations, and external systems. The next chapter, [The MCP verb set](09-mcp-verbs.md), shows how agents and tools talk to the whole surface.
