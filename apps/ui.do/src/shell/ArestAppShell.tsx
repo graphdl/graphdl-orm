@@ -37,6 +37,12 @@ export interface ArestAppShellProps {
    * links available from the current entity.
    */
   currentEntity?: { noun: string; id: string }
+  /**
+   * Optional noun filter — hides any noun for which the predicate
+   * returns false. Sourced from hostname branding (#128) in production
+   * so support.auto.dev narrows the sidebar to support-domain nouns.
+   */
+  nounScope?: (nounName: string) => boolean
   /** Page header content (breadcrumbs or similar). */
   pageHeader?: ReactNode
   /** Custom footer. Overrides the default (user block + overworld). */
@@ -65,8 +71,8 @@ function resourcesToNavGroup(
 }
 
 export function ArestAppShell(props: ArestAppShellProps): ReactElement {
-  const { baseUrl, app, config, user, currentEntity, pageHeader, footer, children } = props
-  const { resources, isLoading } = useArestResources({ baseUrl, app })
+  const { baseUrl, app, config, user, currentEntity, nounScope, pageHeader, footer, children } = props
+  const { resources, isLoading } = useArestResources({ baseUrl, app, filter: nounScope })
   const basePath = config.basePath ?? ''
   const navigation: NavGroup[] = [resourcesToNavGroup(resources, basePath)]
 

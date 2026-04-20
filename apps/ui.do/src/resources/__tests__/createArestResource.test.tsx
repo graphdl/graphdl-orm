@@ -181,4 +181,27 @@ describe('useArestResources', () => {
     // Default plural label applied.
     expect(screen.getByTestId('resource-organizations').textContent).toContain('Organizations')
   })
+
+  it('honours the optional `filter` prop — branding-driven noun scoping', async () => {
+    stubFetch(() => json(sampleDoc))
+    function FilteredProbe() {
+      const { resources, isLoading } = useArestResources({
+        baseUrl,
+        app: 'support.do',
+        filter: (n) => n === 'SupportRequest',
+      })
+      if (isLoading) return <p>loading</p>
+      return (
+        <ul data-testid="resource-list">
+          {resources.map((r) => (
+            <li key={r.name} data-testid={`resource-${r.name}`}>{r.name}</li>
+          ))}
+        </ul>
+      )
+    }
+    render(wrap(<FilteredProbe />))
+    await waitFor(() => expect(screen.getByTestId('resource-list')).toBeDefined())
+    expect(screen.getByTestId('resource-support-requests')).toBeDefined()
+    expect(screen.queryByTestId('resource-organizations')).toBeNull()
+  })
 })
