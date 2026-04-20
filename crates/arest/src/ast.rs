@@ -3516,6 +3516,102 @@ mod tests {
         assert_eq!(id1, id2, "same (uri, auth, retrieval_date) must yield the same cite id");
     }
 
+    // ── End-to-end: register → invoke → cite (#305 integration) ─
+
+    /// Drives the full IoC/DI + Citation-provenance flow end-to-end.
+    /// A runtime wrapper:
+    ///   1. Registers a Platform-function body via `register_runtime_fn`.
+    ///   2. Invokes it through the normal `apply(Func::Def(name), ...)`
+    ///      dispatch — the engine doesn't distinguish it from a
+    ///      compile-derived binding (uniformity).
+    ///   3. Because the engine records the name in
+    ///      `runtime_registered_names`, the wrapper knows the binding
+    ///      is outside the local ρ algebra and emits a Citation with
+    ///      Authority Type 'Runtime-Function' whose URI is the
+    ///      platform:{name} DEFS key. Theorem 5 is preserved — the
+    ///      Citation is itself a fact in P produced by ρ (cell_push).
+    #[test]
+    fn runtime_registered_platform_fn_emits_citation_on_invocation() {
+        // 1. Runtime registers platform:send_email.
+        let d = register_runtime_fn(
+            "send_email",
+            Func::Constant(Object::atom("sent")),
+            &Object::phi(),
+        );
+
+        // 2. Caller invokes the registered name through the standard
+        //    apply dispatch. The engine treats it uniformly with
+        //    compile-derived defs.
+        let result = apply(&Func::Def("send_email".to_string()), &Object::phi(), &d);
+        assert_eq!(result, Object::atom("sent"));
+
+        // 3. The caller, seeing the name in runtime_registered_names,
+        //    emits a Citation for provenance.
+        let names: Vec<String> = fetch("runtime_registered_names", &d)
+            .as_seq()
+            .map(|s| s.iter().filter_map(|o| o.as_atom().map(String::from)).collect())
+            .unwrap_or_default();
+        assert!(names.contains(&"send_email".to_string()),
+            "send_email must be visible as runtime-registered");
+
+        let (cite_id, d2) = emit_citation_fact(
+            "platform:send_email",
+            "Runtime-Function",
+            "2026-04-20T12:00:00Z",
+            None,
+            &d,
+        );
+
+        // 4. Assertions: Citation fact in P names the Platform DEFS key.
+        let uri_facts = fetch("Citation_has_URI", &d2).as_seq()
+            .map(|s| s.to_vec()).unwrap_or_default();
+        let cited_uris: Vec<&str> = uri_facts.iter()
+            .filter(|f| binding(f, "Citation") == Some(cite_id.as_str()))
+            .filter_map(|f| binding(f, "URI"))
+            .collect();
+        assert_eq!(cited_uris, vec!["platform:send_email"],
+            "Citation URI must name the Platform DEFS key");
+
+        let auth_facts = fetch("Citation_has_Authority_Type", &d2).as_seq()
+            .map(|s| s.to_vec()).unwrap_or_default();
+        let cited_auths: Vec<&str> = auth_facts.iter()
+            .filter(|f| binding(f, "Citation") == Some(cite_id.as_str()))
+            .filter_map(|f| binding(f, "Authority Type"))
+            .collect();
+        assert_eq!(cited_auths, vec!["Runtime-Function"],
+            "Authority Type must be 'Runtime-Function' for platform-layer origin");
+    }
+
+    /// Pure ρ-application (a compile-derived def) produces no Citation.
+    /// Guards the invariant that the engine does not auto-emit Citations
+    /// for domain-layer operations — Citation facts appear only when a
+    /// runtime wrapper explicitly emits them for outside-ρ origins.
+    #[test]
+    fn pure_derivation_produces_no_auto_citation() {
+        let d = defs_to_state(
+            &[("second".to_string(), Func::Selector(2))],
+            &Object::phi(),
+        );
+        let input = Object::seq(vec![Object::atom("a"), Object::atom("b")]);
+        let result = apply(&Func::Def("second".to_string()), &input, &d);
+        assert_eq!(result, Object::atom("b"));
+
+        // No side-effect on Citation cells: emit_citation_fact was not
+        // called, so Citation_has_URI et al. must be absent / empty.
+        for cell in [
+            "Citation_has_URI",
+            "Citation_has_Retrieval_Date",
+            "Citation_has_Authority_Type",
+            "Citation_is_backed_by_External_System",
+        ] {
+            let c = fetch(cell, &d);
+            assert!(
+                c.is_bottom() || c.as_seq().map(|s| s.is_empty()).unwrap_or(true),
+                "{cell} must be empty after pure ρ-application"
+            );
+        }
+    }
+
     // ── Backus sequence primitives (Task 1) ─────────────────────
 
     #[test]
