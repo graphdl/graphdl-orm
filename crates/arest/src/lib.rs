@@ -83,6 +83,8 @@ pub mod conceptual_query;
 #[cfg(not(feature = "no_std"))]
 pub mod parse_forml2;
 #[cfg(not(feature = "no_std"))]
+pub mod parse_forml2_stage1;
+#[cfg(not(feature = "no_std"))]
 // verbalize.rs deleted — zero production callers, tests were self-referential.
 #[cfg(not(feature = "no_std"))]
 pub mod command;
