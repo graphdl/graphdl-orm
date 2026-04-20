@@ -12,6 +12,7 @@ import { ListView } from '@mdxui/admin'
 import { useArestList } from '../hooks/useArestResource'
 import { useOpenApiSchema, type FieldDef } from '../schema'
 import { humanize } from '../schema/openApiSchema'
+import { SchemaDisplay } from './schemaDisplay'
 
 export interface GenericListViewProps {
   /** Noun name — e.g. "Organization". Slugified internally. */
@@ -28,17 +29,6 @@ export interface GenericListViewProps {
   actions?: ReactElement
 }
 
-function renderCell(field: FieldDef, row: Record<string, unknown>): string {
-  const value = row[field.name]
-  if (value == null) return ''
-  if (field.kind === 'boolean') return value ? 'Yes' : 'No'
-  if (field.kind === 'date' || field.kind === 'datetime') {
-    // The value may already be a rendered string; leave as-is.
-    return String(value)
-  }
-  if (typeof value === 'object') return JSON.stringify(value)
-  return String(value)
-}
 
 export function GenericListView(props: GenericListViewProps): ReactElement {
   const { noun, baseUrl, app, title, pagination, actions } = props
@@ -93,7 +83,7 @@ export function GenericListView(props: GenericListViewProps): ReactElement {
                 </td>
                 {fields.map((f) => (
                   <td key={f.name} style={{ padding: '0.5rem', borderBottom: '1px solid #eee' }}>
-                    {renderCell(f, row as Record<string, unknown>)}
+                    <SchemaDisplay field={f} value={(row as Record<string, unknown>)[f.name]} />
                   </td>
                 ))}
               </tr>

@@ -134,9 +134,9 @@ describe('GenericListView', () => {
     expect(screen.getByText('Active')).toBeDefined()
     expect(screen.getByText('Acme')).toBeDefined()
     expect(screen.getByText('Globex')).toBeDefined()
-    // Boolean values render as Yes/No (kind === 'boolean')
-    expect(screen.getByText('Yes')).toBeDefined()
-    expect(screen.getByText('No')).toBeDefined()
+    // Boolean values render via SchemaDisplay as ✓ Yes / ✗ No.
+    expect(screen.getByText(/Yes/)).toBeDefined()
+    expect(screen.getByText(/No/)).toBeDefined()
   })
 
   it('shows the empty state when the collection is empty', async () => {
@@ -166,7 +166,8 @@ describe('GenericShowView', () => {
     await waitFor(() => expect(screen.getByTestId('generic-show-dl')).toBeDefined())
     expect(screen.getByTestId('field-name').textContent).toBe('Acme')
     expect(screen.getByTestId('field-tier').textContent).toBe('Pro')
-    expect(screen.getByTestId('field-active').textContent).toBe('Yes')
+    // SchemaDisplay: booleans get a ✓ / ✗ glyph.
+    expect(screen.getByTestId('field-active').textContent).toMatch(/Yes/)
   })
 })
 
@@ -199,9 +200,11 @@ describe('GenericEditView', () => {
 
     const nameInput = screen.getByTestId('input-name') as HTMLInputElement
     expect(nameInput.value).toBe('Acme')
-    // Tier shows up as a <select> because of the enum
-    const tierSelect = screen.getByTestId('input-tier') as HTMLSelectElement
-    expect(tierSelect.tagName).toBe('SELECT')
+    // Tier has 3 options (Starter/Pro/Enterprise) — below the default
+    // radio-vs-dropdown threshold of 4, so it renders as a radio group.
+    const tierGroup = screen.getByTestId('input-tier')
+    expect(tierGroup.tagName).toBe('FIELDSET')
+    expect(tierGroup.getAttribute('data-widget')).toBe('radio-group')
 
     // Change name and submit — fireEvent.change drives React's synthetic
     // handler correctly (direct .value mutation bypasses the React setter).

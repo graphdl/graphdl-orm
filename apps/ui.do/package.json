@@ -17,9 +17,11 @@
     "@mdxui/app": "6.0.0",
     "@mdxui/widgets": "6.1.0",
     "@tanstack/react-query": "^5.99.2",
+    "@xstate/react": "^6.1.0",
     "mdxui": "6.1.0",
     "react": "19.2.3",
-    "react-dom": "19.2.3"
+    "react-dom": "19.2.3",
+    "xstate": "^5.30.0"
   },
   "devDependencies": {
     "@testing-library/dom": "^10.4.1",

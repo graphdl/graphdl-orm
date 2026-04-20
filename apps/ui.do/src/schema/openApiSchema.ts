@@ -45,6 +45,17 @@ export interface FieldDef {
   label: string
   /** Free-text description from the schema (title or description). */
   description?: string
+  /** Inclusive lower bound for numeric fields (JSON Schema `minimum`). */
+  min?: number
+  /** Inclusive upper bound for numeric fields (JSON Schema `maximum`). */
+  max?: number
+  /** Step size for numeric fields (JSON Schema `multipleOf`). */
+  step?: number
+  /** String length bounds. */
+  minLength?: number
+  maxLength?: number
+  /** Regex pattern for string fields. */
+  pattern?: string
   /** Raw JSON Schema fragment — pass through for callers that need it. */
   raw?: unknown
 }
@@ -158,6 +169,16 @@ export function getFieldsFromSchema(schema: unknown): FieldDef[] {
     if (description) field.description = description
     if (enumValues) field.enum = enumValues
     if (ref) field.ref = ref
+    if (isRecord(prop)) {
+      // Numeric constraints — lift off JSON Schema onto FieldDef so
+      // widget layers don't have to re-parse `raw`.
+      if (typeof prop.minimum === 'number') field.min = prop.minimum
+      if (typeof prop.maximum === 'number') field.max = prop.maximum
+      if (typeof prop.multipleOf === 'number') field.step = prop.multipleOf
+      if (typeof prop.minLength === 'number') field.minLength = prop.minLength
+      if (typeof prop.maxLength === 'number') field.maxLength = prop.maxLength
+      if (typeof prop.pattern === 'string') field.pattern = prop.pattern
+    }
     fields.push(field)
   }
   return fields

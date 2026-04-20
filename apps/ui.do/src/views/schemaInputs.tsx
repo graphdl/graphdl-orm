@@ -1,10 +1,23 @@
 /**
- * Minimum-viable input components used by GenericEditView /
- * GenericCreateView. Each renders a plain HTML control keyed by the
- * FieldDef's kind. @mdxui/admin ships richer TextInput / SelectInput
- * etc., but those require a form context we don't yet build; the
- * ResourceDefinition generator (#126) upgrades to those once the
- * field→component mapping is codified.
+ * Per-kind input components used by GenericEditView / GenericCreateView.
+ *
+ * Kind → widget mapping (keyed off FieldDef.kind + schema constraints):
+ *   number / integer  <input type="number">  with step/min/max from
+ *                     JSON Schema's multipleOf / minimum / maximum
+ *   boolean           <input type="checkbox">
+ *   date              <input type="date">
+ *   datetime          <input type="datetime-local">
+ *   email             <input type="email">
+ *   url               <input type="url">
+ *   enum, <=4 opts    radio group
+ *   enum, >4 opts     <select>
+ *   string            <input type="text"> with minLength/maxLength/
+ *                     pattern lifted to HTML5 validation attrs
+ *
+ * The radio-vs-select threshold matches common admin conventions:
+ * with <=4 options radio buttons scan faster than a dropdown; past
+ * that the radio list gets visually noisy and we fall to a select.
+ * Consumers can override via `enumAsRadioThreshold`.
  */
 import type { ReactElement } from 'react'
 import type { FieldDef } from '../schema'
@@ -13,6 +26,8 @@ export interface SchemaInputProps {
   field: FieldDef
   value: unknown
   onChange: (next: unknown) => void
+  /** Below this option count, enums render as radio buttons. Default 4. */
+  enumAsRadioThreshold?: number
 }
 
 function htmlInputType(field: FieldDef): string {
@@ -35,48 +50,118 @@ function htmlInputType(field: FieldDef): string {
   }
 }
 
-export function SchemaInput({ field, value, onChange }: SchemaInputProps): ReactElement {
+function defaultStep(field: FieldDef): number | undefined {
+  if (field.step !== undefined) return field.step
+  if (field.kind === 'integer') return 1
+  return undefined
+}
+
+export function SchemaInput({
+  field,
+  value,
+  onChange,
+  enumAsRadioThreshold = 4,
+}: SchemaInputProps): ReactElement {
+  // ── Enum: radio for small sets, select for big ones ─────────────
   if (field.kind === 'enum' && field.enum) {
+    const opts = field.enum
+    const current = typeof value === 'string' || typeof value === 'number' ? String(value) : ''
+
+    if (opts.length <= enumAsRadioThreshold) {
+      return (
+        <fieldset
+          data-testid={`input-${field.name}`}
+          data-widget="radio-group"
+          style={{ border: 'none', padding: 0, margin: 0 }}
+        >
+          <legend className="sr-only">{field.label}</legend>
+          {opts.map((opt) => {
+            const v = String(opt)
+            const id = `radio-${field.name}-${v}`
+            return (
+              <label
+                key={v}
+                htmlFor={id}
+                style={{ marginRight: '1rem', display: 'inline-flex', alignItems: 'center', gap: '0.25rem' }}
+              >
+                <input
+                  id={id}
+                  type="radio"
+                  name={field.name}
+                  value={v}
+                  checked={current === v}
+                  onChange={() => onChange(v)}
+                />
+                {v}
+              </label>
+            )
+          })}
+        </fieldset>
+      )
+    }
+
     return (
       <select
         data-testid={`input-${field.name}`}
-        value={typeof value === 'string' || typeof value === 'number' ? String(value) : ''}
+        data-widget="select"
+        value={current}
         onChange={(e) => onChange(e.target.value)}
       >
         <option value="">--</option>
-        {field.enum.map((opt) => (
+        {opts.map((opt) => (
           <option key={String(opt)} value={String(opt)}>{String(opt)}</option>
         ))}
       </select>
     )
   }
 
+  // ── Boolean ─────────────────────────────────────────────────────
   if (field.kind === 'boolean') {
     return (
       <input
         type="checkbox"
         data-testid={`input-${field.name}`}
+        data-widget="checkbox"
         checked={value === true}
         onChange={(e) => onChange(e.target.checked)}
       />
     )
   }
 
+  // ── Number / integer ────────────────────────────────────────────
+  if (field.kind === 'number' || field.kind === 'integer') {
+    const step = defaultStep(field)
+    return (
+      <input
+        type="number"
+        data-testid={`input-${field.name}`}
+        data-widget="number"
+        value={value == null ? '' : String(value)}
+        required={field.required}
+        min={field.min}
+        max={field.max}
+        step={step}
+        onChange={(e) => {
+          const raw = e.target.value
+          onChange(raw === '' ? null : Number(raw))
+        }}
+      />
+    )
+  }
+
+  // ── Date / datetime / email / url ───────────────────────────────
   const type = htmlInputType(field)
   return (
     <input
       type={type}
       data-testid={`input-${field.name}`}
+      data-widget={type}
       value={value == null ? '' : String(value)}
       required={field.required}
-      onChange={(e) => {
-        const raw = e.target.value
-        if (field.kind === 'number' || field.kind === 'integer') {
-          onChange(raw === '' ? null : Number(raw))
-        } else {
-          onChange(raw)
-        }
-      }}
+      minLength={field.minLength}
+      maxLength={field.maxLength}
+      pattern={field.pattern}
+      onChange={(e) => onChange(e.target.value)}
     />
   )
 }
