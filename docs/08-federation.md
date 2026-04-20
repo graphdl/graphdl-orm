@@ -82,6 +82,56 @@ Derivation rules join across:
 
 The engine does not distinguish local from federated at query time. It fetches the federated data when needed, joins it with the local population, and evaluates the rule as usual.
 
+## Provenance via Citation (#305)
+
+Every fact produced by `ρ(populate_n)` carries a paired `Citation` record. An LLM reading the API — or a constraint evaluated over `P` — can ask *where did this fact come from?* and get a queryable answer without the engine having to invent a side-channel. The Citation is itself a fact in `P`, so Theorem 5 continues to hold: every value in the REST representation is produced by a ρ-application, including the Citation record.
+
+Each federated fetch emits one Citation:
+
+```forml2
+Citation 'cite:<hash>' has URI 'https://api.stripe.com/v1/customers/cus_1'.
+Citation 'cite:<hash>' has Retrieval Date '2026-04-20T12:00:00Z'.
+Citation 'cite:<hash>' has Authority Type 'Federated-Fetch'.
+Citation 'cite:<hash>' is backed by External System 'stripe'.
+```
+
+All facts returned by a given fetch share the same Citation (they came from the same response at the same moment). The caller — the MCP server's absorb path, or the engine's populate arm — emits paired `Fact cites Citation` links so each entity fact points back at its origin.
+
+The `Authority Type` enum includes two provenance kinds:
+
+- **`'Federated-Fetch'`** — emitted here, by `federatedFetch` in `src/mcp/federation.ts`.
+- **`'Runtime-Function'`** — emitted by the Rust engine's `ast::emit_citation_fact` when a runtime-registered Platform function (e.g., `send_email`, `httpFetch`, an ML scorer) produces a fact. See *IoC/DI (↓DEFS)* below.
+
+A domain can declare obligations over provenance the same way it declares any other deontic constraint:
+
+```forml2
+It is obligatory that each Fact of Fact Type 'ML Score' cites some Citation
+  where that Citation has Authority Type 'Runtime-Function'.
+```
+
+The enforcement is the usual restriction over `P`. No new mechanism.
+
+### Citation id scheme
+
+Citation ids are content-addressed over `(URI, Authority Type, Retrieval Date)`. Two emissions for the same triple yield the same id, so repeated absorption of the same response is idempotent at the cell level.
+
+### HATEOAS
+
+The `_links.citations` relation on every federated-noun response points at the Citation collection for the entity. Clients walking the link graph can reach the provenance chain without special-casing.
+
+## IoC/DI (↓DEFS) and the platform layer
+
+The paper's §3.2 Platform Binding names two writers to `DEFS`:
+
+- **Compile** writes the **domain layer** from FORML 2 readings. Covered elsewhere in this guide.
+- **Runtime** writes the **platform layer** via `↓DEFS` — each runtime (browser, server, storage backend) registers the functions it owns. The paper's canonical examples are `httpFetch`, `upsert`, `notify`, `render`.
+
+On the Rust engine side, the runtime writer is `ast::register_runtime_fn(name, func, state)`. It pushes `(name, func)` into `DEFS` and records `name` in a `runtime_registered_names` cell. Dispatch via `apply(Func::Def(name), …)` is uniform with compile-derived bindings; the registry cell is the origin marker that `emit_citation_fact` uses to produce the `Runtime-Function` Citation.
+
+The federation path in `src/mcp/federation.ts` is the TS-side analogue — it runs *outside* the synchronous engine because HTTP is async, but the facts it absorbs into `P` carry the same Citation shape the engine would produce for its own runtime-registered primitives.
+
+An open gap: `apply_platform` in `crates/arest/src/ast.rs` currently hardcodes its match over Platform names. Future registrations via `register_runtime_fn` that need engine-native dispatch (synchronous, composable in Func trees) will want a fallback arm that resolves the registered Func body — see `_reports/e3-gap-analysis-2026-04-20.md` for the narrative.
+
 ## Federated analytics backends (#219)
 
 The fetch path above loads a single entity from its source. The
