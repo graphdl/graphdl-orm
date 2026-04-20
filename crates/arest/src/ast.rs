@@ -631,6 +631,66 @@ pub fn register_runtime_fn(name: &str, func: Func, state: &Object) -> Object {
     cell_push("runtime_registered_names", Object::atom(name), &with_def)
 }
 
+/// E3 / #305 — Citation provenance emission.
+///
+/// Pushes a Citation entity and its canonical per-fact readings into
+/// the `Citation_has_URI`, `Citation_has_Retrieval_Date`,
+/// `Citation_has_Authority_Type`, and (when Some) the
+/// `Citation_is_backed_by_External_System` cells. Returns the assigned
+/// Citation id so the caller can emit paired `Fact cites Citation`
+/// link facts for whatever facts the outside-ρ call produced.
+///
+/// The Citation id is content-addressed over (uri, authority_type,
+/// retrieval_date): two calls with the same triple produce the same
+/// id, so repeated emission for the same origin is idempotent at the
+/// cell level (the cell-push writes are idempotent by construction —
+/// cell_push dedupes identical facts).
+///
+/// Authority Type values MUST be one of the enum members declared on
+/// Authority Type in readings/instances.md. For E3, `'Runtime-Function'`
+/// and `'Federated-Fetch'` are the two provenance kinds.
+#[cfg(not(feature = "no_std"))]
+pub fn emit_citation_fact(
+    uri: &str,
+    authority_type: &str,
+    retrieval_date: &str,
+    external_system: Option<&str>,
+    state: &Object,
+) -> (String, Object) {
+    use core::hash::{BuildHasher, Hash, Hasher};
+    let mut h = hashbrown::hash_map::DefaultHashBuilder::default().build_hasher();
+    uri.hash(&mut h);
+    authority_type.hash(&mut h);
+    retrieval_date.hash(&mut h);
+    let cite_id = alloc::format!("cite:{:016x}", h.finish());
+
+    let with_uri = cell_push(
+        "Citation_has_URI",
+        fact_from_pairs(&[("Citation", &cite_id), ("URI", uri)]),
+        state,
+    );
+    let with_rd = cell_push(
+        "Citation_has_Retrieval_Date",
+        fact_from_pairs(&[("Citation", &cite_id), ("Retrieval Date", retrieval_date)]),
+        &with_uri,
+    );
+    let with_at = cell_push(
+        "Citation_has_Authority_Type",
+        fact_from_pairs(&[("Citation", &cite_id), ("Authority Type", authority_type)]),
+        &with_rd,
+    );
+    let final_state = external_system
+        .map(|ext| {
+            cell_push(
+                "Citation_is_backed_by_External_System",
+                fact_from_pairs(&[("Citation", &cite_id), ("External System", ext)]),
+                &with_at,
+            )
+        })
+        .unwrap_or(with_at);
+    (cite_id, final_state)
+}
+
 /// This is Backus Sec. 13.3.2: definitions map atoms to expressions.
 /// Build state from defs + existing cells in O(n).
 /// Collects all cells into a HashMap (O(1) per insert), then
@@ -3379,6 +3439,81 @@ mod tests {
             .unwrap_or_default();
         assert!(!names.contains(&"second".to_string()),
             "defs_to_state-derived names must NOT be in the runtime registry; got {:?}", names);
+    }
+
+    // ── Citation provenance (E3 / #305) ─────────────────────────
+    // emit_citation_fact pushes the four per-Citation facts declared
+    // in readings/instances.md §Citation. It returns the assigned
+    // Citation id so the caller can emit the Fact cites Citation
+    // links it needs. The helper is idempotent over (uri, auth,
+    // retrieval_date) — two calls with the same triple produce the
+    // same id.
+
+    #[test]
+    fn emit_citation_fact_pushes_uri_retrieval_and_authority_facts() {
+        let (cite_id, d2) = emit_citation_fact(
+            "platform:send_email",
+            "Runtime-Function",
+            "2026-04-20T12:00:00Z",
+            None,
+            &Object::phi(),
+        );
+        assert!(cite_id.starts_with("cite:"), "cite id should be 'cite:…'; got {cite_id}");
+
+        let uri_cell = fetch("Citation_has_URI", &d2);
+        let uri_facts = uri_cell.as_seq().map(|s| s.to_vec()).unwrap_or_default();
+        assert_eq!(uri_facts.len(), 1, "one URI fact; got {}", uri_facts.len());
+        assert_eq!(binding(&uri_facts[0], "URI"), Some("platform:send_email"));
+        assert_eq!(binding(&uri_facts[0], "Citation"), Some(cite_id.as_str()));
+
+        let rd_cell = fetch("Citation_has_Retrieval_Date", &d2);
+        let rd_facts = rd_cell.as_seq().map(|s| s.to_vec()).unwrap_or_default();
+        assert_eq!(binding(&rd_facts[0], "Retrieval Date"), Some("2026-04-20T12:00:00Z"));
+
+        let at_cell = fetch("Citation_has_Authority_Type", &d2);
+        let at_facts = at_cell.as_seq().map(|s| s.to_vec()).unwrap_or_default();
+        assert_eq!(binding(&at_facts[0], "Authority Type"), Some("Runtime-Function"));
+    }
+
+    #[test]
+    fn emit_citation_fact_with_external_system_pushes_backed_by_fact() {
+        let (cite_id, d2) = emit_citation_fact(
+            "https://api.stripe.com/v1/customers",
+            "Federated-Fetch",
+            "2026-04-20T12:00:00Z",
+            Some("stripe"),
+            &Object::phi(),
+        );
+        let backed_cell = fetch("Citation_is_backed_by_External_System", &d2);
+        let facts = backed_cell.as_seq().map(|s| s.to_vec()).unwrap_or_default();
+        assert_eq!(facts.len(), 1,
+            "Federated-Fetch citation should record its External System; got {} facts", facts.len());
+        assert_eq!(binding(&facts[0], "Citation"), Some(cite_id.as_str()));
+        assert_eq!(binding(&facts[0], "External System"), Some("stripe"));
+    }
+
+    #[test]
+    fn emit_citation_fact_without_external_system_does_not_push_backed_by() {
+        let (_, d2) = emit_citation_fact(
+            "platform:send_email",
+            "Runtime-Function",
+            "2026-04-20T12:00:00Z",
+            None,
+            &Object::phi(),
+        );
+        let backed_cell = fetch("Citation_is_backed_by_External_System", &d2);
+        assert!(backed_cell.is_bottom() || backed_cell.as_seq().map(|s| s.is_empty()).unwrap_or(true),
+            "Runtime-Function citation (no External System) must NOT push a backed_by fact");
+    }
+
+    #[test]
+    fn emit_citation_fact_id_is_stable_per_triple() {
+        let d = Object::phi();
+        let (id1, _) = emit_citation_fact(
+            "platform:send_email", "Runtime-Function", "2026-04-20T12:00:00Z", None, &d);
+        let (id2, _) = emit_citation_fact(
+            "platform:send_email", "Runtime-Function", "2026-04-20T12:00:00Z", None, &d);
+        assert_eq!(id1, id2, "same (uri, auth, retrieval_date) must yield the same cite id");
     }
 
     // ── Backus sequence primitives (Task 1) ─────────────────────
