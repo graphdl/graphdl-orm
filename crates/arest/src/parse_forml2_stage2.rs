@@ -225,6 +225,86 @@ fn statement_text(state: &Object, stmt_id: &str) -> Option<String> {
         .and_then(|f| binding(f, "Text").map(String::from))
 }
 
+/// Translate `Instance Fact` classifications into `InstanceFact` cell
+/// facts. Binary instance-fact shape (subject + field + object):
+///
+///   subjectNoun = role 0's head noun
+///   subjectValue = role 0's literal
+///   fieldName = Statement's Verb token
+///   objectNoun = role 1's head noun (if present)
+///   objectValue = role 1's literal (if present)
+///
+/// Unary instance-facts (value assertions like `Customer 'alice' is
+/// active`) currently emit with empty objectNoun/objectValue.
+#[cfg(feature = "std-deps")]
+pub fn translate_instance_facts(classified_state: &Object) -> Vec<Object> {
+    let statement_ids = collect_statement_ids(classified_state);
+    let mut out: Vec<Object> = Vec::new();
+    for stmt_id in &statement_ids {
+        let classifications = classifications_for(classified_state, stmt_id);
+        if !classifications.iter().any(|k| k == "Instance Fact") {
+            continue;
+        }
+        let roles = role_refs_with_literals(classified_state, stmt_id);
+        if roles.is_empty() { continue; }
+        let verb = statement_verb(classified_state, stmt_id).unwrap_or_default();
+        let subject_noun = &roles[0].0;
+        let subject_value = roles[0].1.as_deref().unwrap_or("");
+        let (object_noun, object_value) = roles.get(1)
+            .map(|(n, lit)| (n.as_str(), lit.as_deref().unwrap_or("")))
+            .unwrap_or(("", ""));
+        out.push(fact_from_pairs(&[
+            ("subjectNoun",  subject_noun.as_str()),
+            ("subjectValue", subject_value),
+            ("fieldName",    verb.as_str()),
+            ("objectNoun",   object_noun),
+            ("objectValue",  object_value),
+        ]));
+    }
+    out
+}
+
+/// Role head nouns AND literal values for a Statement, ordered by
+/// Role Position. Returns `Vec<(noun, Option<literal>)>`.
+fn role_refs_with_literals(state: &Object, stmt_id: &str) -> Vec<(String, Option<String>)> {
+    let refs = fetch_or_phi("Statement_has_Role_Reference", state);
+    let Some(refs_seq) = refs.as_seq() else { return Vec::new() };
+    let role_ids: Vec<String> = refs_seq.iter()
+        .filter(|f| binding(f, "Statement") == Some(stmt_id))
+        .filter_map(|f| binding(f, "Role_Reference").map(String::from))
+        .collect();
+    let positions = fetch_or_phi("Role_Reference_has_Role_Position", state);
+    let pos_seq = positions.as_seq();
+    let head_nouns = fetch_or_phi("Role_Reference_has_Head_Noun", state);
+    let hn_seq = head_nouns.as_seq();
+    let literals = fetch_or_phi("Role_Reference_has_Literal_Value", state);
+    let lit_seq = literals.as_seq();
+    let mut with_pos: Vec<(usize, String, Option<String>)> = role_ids.iter().filter_map(|id| {
+        let pos_s = pos_seq.as_ref()?.iter()
+            .find(|f| binding(f, "Role_Reference") == Some(id.as_str()))
+            .and_then(|f| binding(f, "Role_Position").map(String::from))?;
+        let pos: usize = pos_s.parse().ok()?;
+        let noun = hn_seq.as_ref()?.iter()
+            .find(|f| binding(f, "Role_Reference") == Some(id.as_str()))
+            .and_then(|f| binding(f, "Head_Noun").map(String::from))?;
+        let literal = lit_seq.as_ref()
+            .and_then(|s| s.iter()
+                .find(|f| binding(f, "Role_Reference") == Some(id.as_str()))
+                .and_then(|f| binding(f, "Literal_Value").map(String::from)));
+        Some((pos, noun, literal))
+    }).collect();
+    with_pos.sort_by_key(|(p, _, _)| *p);
+    with_pos.into_iter().map(|(_, n, l)| (n, l)).collect()
+}
+
+fn statement_verb(state: &Object, stmt_id: &str) -> Option<String> {
+    fetch_or_phi("Statement_has_Verb", state)
+        .as_seq()?
+        .iter()
+        .find(|f| binding(f, "Statement") == Some(stmt_id))
+        .and_then(|f| binding(f, "Verb").map(String::from))
+}
+
 fn role_noun_at_position(state: &Object, stmt_id: &str, position: usize) -> Option<String> {
     let refs = fetch_or_phi("Statement_has_Role_Reference", state);
     let refs_seq = refs.as_seq()?;
@@ -638,6 +718,42 @@ mod tests {
         let classified = classify_statements(&stmt, &grammar_state());
         let (ft, _) = super::translate_fact_types(&classified);
         assert!(ft.is_empty());
+    }
+
+    #[test]
+    fn instance_fact_is_classified() {
+        let stmt = stage1_state(
+            "s1", "Customer 'alice' places Order 'o-7'.",
+            &["Customer", "Order"]);
+        let classified = classify_statements(&stmt, &grammar_state());
+        let kinds = classifications_for(&classified, "s1");
+        assert!(kinds.iter().any(|k| k == "Instance Fact"),
+            "expected Instance Fact; got {:?}", kinds);
+    }
+
+    #[test]
+    fn translate_instance_facts_emits_subject_field_object() {
+        let stmt = stage1_state(
+            "s1", "Customer 'alice' places Order 'o-7'.",
+            &["Customer", "Order"]);
+        let classified = classify_statements(&stmt, &grammar_state());
+        let facts = super::translate_instance_facts(&classified);
+        assert_eq!(facts.len(), 1);
+        let f = &facts[0];
+        assert_eq!(binding(f, "subjectNoun"),  Some("Customer"));
+        assert_eq!(binding(f, "subjectValue"), Some("alice"));
+        assert_eq!(binding(f, "fieldName"),    Some("places"));
+        assert_eq!(binding(f, "objectNoun"),   Some("Order"));
+        assert_eq!(binding(f, "objectValue"),  Some("o-7"));
+    }
+
+    #[test]
+    fn translate_instance_facts_skips_non_instance_statements() {
+        let stmt = stage1_state(
+            "s1", "Customer places Order.", &["Customer", "Order"]);
+        let classified = classify_statements(&stmt, &grammar_state());
+        let facts = super::translate_instance_facts(&classified);
+        assert!(facts.is_empty(), "got {:?}", facts);
     }
 
     #[test]
