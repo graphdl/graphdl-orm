@@ -290,11 +290,41 @@ fn make_violation_func(id: &str, text: &str, detail: Func) -> Func {
     ])
 }
 
-/// Extract the value of a role from an encoded fact.
+/// Extract the value of a role from an encoded fact by position.
 /// Fact encoding: <<noun1, val1>, <noun2, val2>, ...>
 /// Role value at index i: sel(2)  .  sel(i+1)
+///
+/// Position-based. Correct when the fact's bindings are in the FT's
+/// declared role order with no extras. Derived facts may carry extra
+/// bindings (see forward_chain's append path), in which case
+/// `role_value_by_name` — which filters by key rather than position
+/// — is the right tool for filter predicates.
 fn role_value(role_index: usize) -> Func {
     Func::compose(Func::Selector(2), Func::Selector(role_index + 1))
+}
+
+/// Extract the value of a role by noun-name key. Walks the fact's
+/// binding pairs `<key, val>`, keeps those whose key matches the given
+/// name, returns the first match's value. Works regardless of
+/// position — safe when derived facts carry extra bindings (e.g.
+/// grammar classification rules that inherit antecedent bindings and
+/// append a literal `Classification` pair).
+///
+/// Spaces in the name are normalised to underscores before the match.
+/// FT role noun_names carry spaces ("Trailing Marker"), while Stage-1
+/// and cell-push paths key bindings with underscores
+/// ("Trailing_Marker"); normalising at lookup time lets the filter
+/// predicate stay spelled in the grammar's noun name.
+fn role_value_by_name(name: &str) -> Func {
+    let key = name.replace(' ', "_");
+    let match_key = Func::compose(Func::Eq, Func::construction(vec![
+        Func::Selector(1),
+        Func::constant(Object::atom(&key)),
+    ]));
+    Func::compose(
+        Func::compose(Func::Selector(2), Func::Selector(1)),
+        Func::filter(match_key),
+    )
 }
 
 // -- Span Resolution ------------------------------------------------
@@ -2291,11 +2321,15 @@ fn compile_arith_expr(expr: &crate::types::ArithExpr, ft: &crate::types::FactTyp
 /// doesn't resolve against the fact type's roles â€” in that case the
 /// filter is silently dropped rather than failing the whole rule.
 fn build_antecedent_filter_pred(af: &crate::types::AntecedentFilter, ft: &crate::types::FactTypeDef) -> Option<Func> {
-    let role_idx = ft.roles.iter().find(|r| r.noun_name == af.role).map(|r| r.role_index)?;
+    // Role must be declared on the FT — reject unknown roles rather
+    // than silently matching nothing. `role_value_by_name` is
+    // position-independent (walks bindings by key), so the predicate
+    // stays correct even when derived facts carry extra bindings.
+    ft.roles.iter().find(|r| r.noun_name == af.role)?;
     Some(Func::compose(
         comparator_primitive(&af.op),
         Func::construction(vec![
-            role_value(role_idx),
+            role_value_by_name(&af.role),
             Func::constant(Object::atom(&format_numeric_atom(af.value))),
         ]),
     ))
@@ -2343,14 +2377,14 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
     for arl in rule.antecedent_role_literals.iter() {
         if let Some(ft_id) = antecedent_ids.get(arl.antecedent_index) {
             if let Some(ft) = data.fact_types.get(ft_id) {
-                if let Some(role_idx) = ft.roles.iter()
-                    .find(|r| r.noun_name == arl.role)
-                    .map(|r| r.role_index)
-                {
+                // Role must be declared on the FT; the comparison
+                // itself is key-based so extra bindings on derived
+                // antecedent facts don't break it.
+                if ft.roles.iter().any(|r| r.noun_name == arl.role) {
                     let pred = Func::compose(
                         Func::Eq,
                         Func::construction(vec![
-                            role_value(role_idx),
+                            role_value_by_name(&arl.role),
                             Func::constant(Object::atom(&arl.value)),
                         ]),
                     );
@@ -2407,46 +2441,69 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
             // <<noun, val>, ...> binding-seq shape); output is
             //   <consequent_id, consequent_reading, consequent_bindings>.
             //
-            // consequent_bindings starts as the antecedent's bindings
-            // (Func::Id passes them through unchanged). Two optional
-            // extensions append pairs via Concat:
-            //   (a) arithmetic-computed bindings (Halpin's attribute
-            //       `Volume is Size * Size * Size`), and
-            //   (b) literal-constant bindings (#286 — grammar rule head
-            //       specifies a role's value, e.g. `Statement has
-            //       Classification 'Entity Type Declaration'`).
-            // Both forms build <role_name, value> pairs and append them
-            // to the antecedent bindings through
-            //   Concat . [Id, <p1, p2, ...>]
-            // so evaluation order feeds the same input fact to Id and
-            // to the arith expressions.
-            let computed_pairs: Vec<Func> = data.fact_types.get(ft_id)
-                .map(|ft| rule.consequent_computed_bindings.iter().map(|cb| {
-                    Func::construction(vec![
-                        Func::constant(Object::atom(&cb.role)),
-                        compile_arith_expr(&cb.expr, ft),
-                    ])
-                }).collect())
-                .unwrap_or_default();
-            let literal_pairs: Vec<Func> = rule.consequent_role_literals.iter()
-                .map(|crl| Func::construction(vec![
-                    Func::constant(Object::atom(&crl.role)),
-                    Func::constant(Object::atom(&crl.value)),
-                ]))
-                .collect();
-            let extra_pairs: Vec<Func> = computed_pairs.into_iter()
-                .chain(literal_pairs.into_iter())
-                .collect();
-            let bindings_func: Func = if extra_pairs.is_empty() {
-                Func::Id
+            // Two bindings shapes depending on whether the rule pins
+            // any consequent role to a literal (#286):
+            //
+            //   (a) No literal: inherit antecedent bindings via Func::Id
+            //       and optionally append arith-computed pairs via
+            //       Concat. Handles the classic Halpin shape where
+            //       consequent roles reuse antecedent bindings directly
+            //       (subtype-inheritance-style modus ponens) plus
+            //       attribute-style definitions like
+            //       `Volume is Size * Size * Size`.
+            //
+            //   (b) Any literal: construct bindings FRESH in the
+            //       consequent FT's declared role order. For each role,
+            //       emit `<role_name, value>` where value comes from
+            //       the literal (if pinned) or a key-based lookup on
+            //       the antecedent fact (via role_value_by_name).
+            //       Recursive rules like
+            //         Classification 'VC' iff Classification 'EVD'
+            //       depend on this — inheriting+appending would produce
+            //       facts with two `Classification` bindings each round,
+            //       spinning forever.
+            let bindings_func: Func = if rule.consequent_role_literals.is_empty() {
+                let computed_pairs: Vec<Func> = data.fact_types.get(ft_id)
+                    .map(|ft| rule.consequent_computed_bindings.iter().map(|cb| {
+                        Func::construction(vec![
+                            Func::constant(Object::atom(&cb.role)),
+                            compile_arith_expr(&cb.expr, ft),
+                        ])
+                    }).collect())
+                    .unwrap_or_default();
+                if computed_pairs.is_empty() {
+                    Func::Id
+                } else {
+                    Func::compose(
+                        Func::Concat,
+                        Func::construction(vec![
+                            Func::Id,
+                            Func::construction(computed_pairs),
+                        ]),
+                    )
+                }
             } else {
-                Func::compose(
-                    Func::Concat,
+                let literal_by_role: hashbrown::HashMap<&str, &str> =
+                    rule.consequent_role_literals.iter()
+                        .map(|crl| (crl.role.as_str(), crl.value.as_str()))
+                        .collect();
+                let cons_roles = data.fact_types.get(&consequent_id)
+                    .map(|ft| ft.roles.clone())
+                    .unwrap_or_default();
+                // Binding pair keys use underscore-normalised role
+                // names to match Stage-1 / cell-push conventions.
+                let pairs: Vec<Func> = cons_roles.iter().map(|r| {
+                    let key = r.noun_name.replace(' ', "_");
+                    let value_func = match literal_by_role.get(r.noun_name.as_str()) {
+                        Some(lit) => Func::constant(Object::atom(lit)),
+                        None => role_value_by_name(&r.noun_name),
+                    };
                     Func::construction(vec![
-                        Func::Id,
-                        Func::construction(extra_pairs),
-                    ]),
-                )
+                        Func::constant(Object::atom(&key)),
+                        value_func,
+                    ])
+                }).collect();
+                Func::construction(pairs)
             };
             let derive_one = Func::construction(vec![
                 Func::constant(Object::atom(&consequent_id)),

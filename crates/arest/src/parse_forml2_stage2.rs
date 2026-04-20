@@ -422,6 +422,37 @@ pub fn translate_enum_values(classified_state: &Object) -> Vec<Object> {
     out
 }
 
+/// Translate `Value Constraint` classifications into `Constraint` cell
+/// facts with kind="VC" and entity=<noun>. Fired by the grammar's
+/// recursive rule `Value Constraint iff Enum Values Declaration`, so
+/// every value-type noun with an enum-values list gets exactly one VC.
+/// The span set is empty — the existing compiler reads enum values
+/// from the EnumValues cell directly (see
+/// `parse_forml2::enum_values_for_noun`) and attaches the constraint
+/// to every role where the noun appears.
+#[cfg(feature = "std-deps")]
+pub fn translate_value_constraints(classified_state: &Object) -> Vec<Object> {
+    let statement_ids = collect_statement_ids(classified_state);
+    let mut out: Vec<Object> = Vec::new();
+    for stmt_id in &statement_ids {
+        let classifications = classifications_for(classified_state, stmt_id);
+        if !classifications.iter().any(|k| k == "Value Constraint") {
+            continue;
+        }
+        let Some(noun) = head_noun_for(classified_state, stmt_id) else { continue };
+        let id = alloc::format!("VC:{}", noun);
+        let text = alloc::format!("{} has a value constraint", noun);
+        out.push(fact_from_pairs(&[
+            ("id",       id.as_str()),
+            ("kind",     "VC"),
+            ("modality", "alethic"),
+            ("text",     text.as_str()),
+            ("entity",   noun.as_str()),
+        ]));
+    }
+    out
+}
+
 fn enum_values_for(state: &Object, stmt_id: &str) -> Vec<String> {
     fetch_or_phi("Statement_has_Enum_Value", state)
         .as_seq()
@@ -968,5 +999,37 @@ mod tests {
             .find(|f| binding(f, "name") == Some("Animal"))
             .expect("Animal noun fact");
         assert_eq!(binding(animal, "objectType"), Some("abstract"));
+    }
+
+    #[test]
+    fn value_constraint_is_classified_via_enum_values_recursive_rule() {
+        // The grammar rule `Statement has Classification 'Value
+        // Constraint' iff Statement has Classification 'Enum Values
+        // Declaration'` fires after the Enum Values Declaration rule,
+        // giving every enum-values statement a Value Constraint
+        // classification too.
+        let stmt = stage1_state(
+            "s1",
+            "The possible values of Priority are 'low', 'medium', 'high'.",
+            &["Priority"]);
+        let classified = classify_statements(&stmt, &grammar_state());
+        let kinds = classifications_for(&classified, "s1");
+        assert!(kinds.iter().any(|k| k == "Value Constraint"),
+            "expected Value Constraint; got {:?}", kinds);
+    }
+
+    #[test]
+    fn translate_value_constraints_emits_vc_per_enum_noun() {
+        let stmt = stage1_state(
+            "s1",
+            "The possible values of Priority are 'low', 'medium', 'high'.",
+            &["Priority"]);
+        let classified = classify_statements(&stmt, &grammar_state());
+        let vcs = super::translate_value_constraints(&classified);
+        assert_eq!(vcs.len(), 1);
+        let f = &vcs[0];
+        assert_eq!(binding(f, "kind"), Some("VC"));
+        assert_eq!(binding(f, "modality"), Some("alethic"));
+        assert_eq!(binding(f, "entity"), Some("Priority"));
     }
 }
