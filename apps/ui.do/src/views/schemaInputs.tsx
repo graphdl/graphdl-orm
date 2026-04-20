@@ -115,20 +115,39 @@ export function SchemaInput({
     )
   }
 
-  // ── Boolean ─────────────────────────────────────────────────────
-  if (field.kind === 'boolean') {
+  // ── Boolean / switch (iFactr: CheckBox vs Switch are distinct) ──
+  if (field.kind === 'boolean' || field.kind === 'switch') {
+    const isSwitch = field.kind === 'switch'
     return (
       <input
         type="checkbox"
         data-testid={`input-${field.name}`}
-        data-widget="checkbox"
+        data-widget={isSwitch ? 'switch' : 'checkbox'}
+        role={isSwitch ? 'switch' : undefined}
         checked={value === true}
         onChange={(e) => onChange(e.target.checked)}
       />
     )
   }
 
-  // ── Number / integer ────────────────────────────────────────────
+  // ── Slider (iFactr: Slider → Android SeekBar → HTML range) ──────
+  if (field.kind === 'slider') {
+    const step = defaultStep(field)
+    return (
+      <input
+        type="range"
+        data-testid={`input-${field.name}`}
+        data-widget="slider"
+        value={value == null ? (field.min ?? 0) : Number(value)}
+        min={field.min}
+        max={field.max}
+        step={step}
+        onChange={(e) => onChange(Number(e.target.value))}
+      />
+    )
+  }
+
+  // ── Number / integer (iFactr: numeric Text Box → EditText) ──────
   if (field.kind === 'number' || field.kind === 'integer') {
     const step = defaultStep(field)
     return (
@@ -149,7 +168,53 @@ export function SchemaInput({
     )
   }
 
-  // ── Date / datetime / email / url ───────────────────────────────
+  // ── Text Area (iFactr: Text Area → multi-line EditText) ─────────
+  if (field.kind === 'textarea') {
+    return (
+      <textarea
+        data-testid={`input-${field.name}`}
+        data-widget="textarea"
+        value={value == null ? '' : String(value)}
+        required={field.required}
+        minLength={field.minLength}
+        maxLength={field.maxLength}
+        rows={4}
+        onChange={(e) => onChange(e.target.value)}
+      />
+    )
+  }
+
+  // ── Password Box (iFactr: Password Box → EditText w/ password) ──
+  if (field.kind === 'password') {
+    return (
+      <input
+        type="password"
+        data-testid={`input-${field.name}`}
+        data-widget="password"
+        value={value == null ? '' : String(value)}
+        required={field.required}
+        minLength={field.minLength}
+        maxLength={field.maxLength}
+        onChange={(e) => onChange(e.target.value)}
+      />
+    )
+  }
+
+  // ── Time (iFactr: Time Picker → Button+TimePickerDialog) ────────
+  if (field.kind === 'time') {
+    return (
+      <input
+        type="time"
+        data-testid={`input-${field.name}`}
+        data-widget="time"
+        value={value == null ? '' : String(value)}
+        required={field.required}
+        onChange={(e) => onChange(e.target.value)}
+      />
+    )
+  }
+
+  // ── Text Box / email / url / date / datetime ────────────────────
   const type = htmlInputType(field)
   return (
     <input

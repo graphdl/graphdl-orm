@@ -59,11 +59,27 @@ export function SchemaDisplay({ field, value, locale }: SchemaDisplayProps): Rea
       )
 
     case 'boolean':
+    case 'switch':
       return (
-        <span data-testid={`display-${field.name}`} data-display="boolean">
+        <span data-testid={`display-${field.name}`} data-display={field.kind}>
           {value ? '✓ Yes' : '✗ No'}
         </span>
       )
+
+    case 'password':
+      // Never render a password value in show views — match the iFactr
+      // Password Box convention that values are write-only from the UI.
+      return <span data-testid={`display-${field.name}`} data-display="password">••••••••</span>
+
+    case 'time':
+      return <span data-testid={`display-${field.name}`} data-display="time">{String(value)}</span>
+
+    case 'slider':
+    case 'textarea':
+      // Sliders and textareas render their values as their underlying
+      // number / string type; keep the raw rendering with a data-display
+      // hint so styling can pick it up.
+      return <span data-testid={`display-${field.name}`} data-display={field.kind}>{String(value)}</span>
 
     case 'email': {
       const s = String(value)
