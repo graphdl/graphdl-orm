@@ -1304,7 +1304,7 @@ pub(crate) fn re_resolve_rules(
 /// the accumulated text terminates with `.`. Other indented lines
 /// (constraint blocks under fact type headers, for example) pass
 /// through unchanged.
-fn join_derivation_continuations(input: &str) -> Vec<String> {
+pub(crate) fn join_derivation_continuations(input: &str) -> Vec<String> {
     let raw: Vec<String> = input.lines().map(|s| s.to_string()).collect();
     let mut out: Vec<String> = Vec::with_capacity(raw.len());
     let mut i = 0;

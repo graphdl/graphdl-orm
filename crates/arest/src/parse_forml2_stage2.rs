@@ -667,6 +667,92 @@ fn collect_statement_ids(state: &Object) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// End-to-end Stage-1 + Stage-2 pipeline: FORML 2 source text → final
+/// metamodel cell state (Noun / Subtype / FactType / Role / Constraint /
+/// DerivationRule / InstanceFact / EnumValues).
+///
+/// #294 diagnostic harness target; #285 capstone wire-up will replace
+/// the legacy `parse_into` cascade with a call to this function.
+///
+/// Pipeline:
+///   1. Parse the bundled `readings/forml2-grammar.md` to a grammar
+///      state (the Classification vocabulary + recognizer rules).
+///   2. Bootstrap the noun list from the legacy parser. (#285 will
+///      remove this; for the diagnostic it's fine — the point is to
+///      drive Stage-2 with a known-correct noun set and diff the
+///      downstream translators.)
+///   3. Split the source into statement lines (reusing the legacy
+///      continuation-joiner so authored multi-line rules fold).
+///   4. Run `tokenize_statement` on each non-empty, non-comment line.
+///   5. Merge all per-statement cells into one state, then apply
+///      `classify_statements` to emit `Statement_has_Classification`.
+///   6. Run every per-kind translator and assemble the result.
+#[cfg(feature = "std-deps")]
+pub fn parse_to_state_via_stage12(text: &str) -> Result<Object, String> {
+    use crate::ast::merge_states;
+
+    let grammar = include_str!("../../../readings/forml2-grammar.md");
+    let grammar_state = crate::parse_forml2::parse_to_state(grammar)
+        .map_err(|e| alloc::format!("grammar parse failed: {}", e))?;
+
+    let legacy_state = crate::parse_forml2::parse_to_state(text)?;
+    let mut nouns: Vec<String> = fetch_or_phi("Noun", &legacy_state)
+        .as_seq()
+        .map(|facts| facts.iter()
+            .filter_map(|f| binding(f, "name").map(String::from))
+            .collect())
+        .unwrap_or_default();
+    nouns.sort_by(|a, b| b.len().cmp(&a.len()));
+
+    let lines = crate::parse_forml2::join_derivation_continuations(text);
+    let mut stmt_state: Object = Object::Map(HashMap::new());
+    for (i, raw_line) in lines.iter().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let statement_id = alloc::format!("s{}", i);
+        let cells = crate::parse_forml2_stage1::tokenize_statement(
+            &statement_id, line, &nouns);
+        let stage1_object = cells_to_object(cells);
+        stmt_state = merge_states(&stmt_state, &stage1_object);
+    }
+
+    let classified = classify_statements(&stmt_state, &grammar_state);
+
+    let noun_facts = translate_nouns(&classified);
+    let mut subtype_facts: Vec<Object> = translate_subtypes(&classified);
+    subtype_facts.extend(translate_partitions(&classified));
+    let (ft_facts, role_facts) = translate_fact_types(&classified);
+    let mut constraint_facts: Vec<Object> = translate_ring_constraints(&classified);
+    constraint_facts.extend(translate_cardinality_constraints(&classified));
+    constraint_facts.extend(translate_set_constraints(&classified));
+    constraint_facts.extend(translate_value_constraints(&classified));
+    constraint_facts.extend(translate_deontic_constraints(&classified));
+    let derivation_facts = translate_derivation_rules(&classified);
+    let instance_fact_facts = translate_instance_facts(&classified);
+    let enum_values_facts = translate_enum_values(&classified);
+
+    let mut map: HashMap<String, Object> = HashMap::new();
+    map.insert("Noun".to_string(), Object::Seq(noun_facts.into()));
+    map.insert("Subtype".to_string(), Object::Seq(subtype_facts.into()));
+    map.insert("FactType".to_string(), Object::Seq(ft_facts.into()));
+    map.insert("Role".to_string(), Object::Seq(role_facts.into()));
+    map.insert("Constraint".to_string(), Object::Seq(constraint_facts.into()));
+    map.insert("DerivationRule".to_string(), Object::Seq(derivation_facts.into()));
+    map.insert("InstanceFact".to_string(), Object::Seq(instance_fact_facts.into()));
+    map.insert("EnumValues".to_string(), Object::Seq(enum_values_facts.into()));
+    Ok(Object::Map(map))
+}
+
+#[cfg(feature = "std-deps")]
+fn cells_to_object(cells: HashMap<String, Vec<Object>>) -> Object {
+    let map: HashMap<String, Object> = cells.into_iter()
+        .map(|(k, v)| (k, Object::Seq(v.into())))
+        .collect();
+    Object::Map(map)
+}
+
 #[cfg(all(test, feature = "std-deps"))]
 mod tests {
     use super::*;
@@ -1290,5 +1376,134 @@ mod tests {
         assert_eq!(binding(f, "kind"), Some("VC"));
         assert_eq!(binding(f, "modality"), Some("alethic"));
         assert_eq!(binding(f, "entity"), Some("Priority"));
+    }
+
+    // ------------------------------------------------------------------
+    // #294 — Diagnostic parse-and-diff harness.
+    //
+    // `parse_to_state_via_stage12` is the capstone pipeline (#285 will
+    // replace `parse_into`'s legacy cascade with a call to it). Before
+    // the wire-up, run both pipelines on every bundled reading file and
+    // diff the key metamodel cells. Any divergence is a real gap.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn stage12_pipeline_smoke_entity_type() {
+        let state = super::parse_to_state_via_stage12(
+            "# Smoke\n\nCustomer is an entity type.\n"
+        ).expect("pipeline ran");
+        let nouns = fetch_or_phi("Noun", &state);
+        let names: Vec<String> = nouns.as_seq()
+            .map(|s| s.iter().filter_map(|f| binding(f, "name").map(String::from)).collect())
+            .unwrap_or_default();
+        assert!(names.iter().any(|n| n == "Customer"),
+            "expected Customer in Noun cell; got {:?}", names);
+    }
+
+    #[test]
+    fn stage12_pipeline_smoke_subtype() {
+        let text = "Animal is an entity type.\nDog is a subtype of Animal.\n";
+        let state = super::parse_to_state_via_stage12(text).expect("ran");
+        let subs = fetch_or_phi("Subtype", &state);
+        let pairs: Vec<(String, String)> = subs.as_seq()
+            .map(|s| s.iter().filter_map(|f| {
+                Some((binding(f, "subtype")?.to_string(),
+                     binding(f, "supertype")?.to_string()))
+            }).collect())
+            .unwrap_or_default();
+        assert!(pairs.contains(&("Dog".to_string(), "Animal".to_string())),
+            "expected (Dog, Animal) in Subtype cell; got {:?}", pairs);
+    }
+
+    /// Report set-difference by a hashable key over two cells. Prints
+    /// the missing and extra keys to stderr and returns their counts
+    /// so the caller can bound them.
+    fn diff_by_key<F>(
+        label: &str,
+        legacy: &Object,
+        stage12: &Object,
+        cell_name: &str,
+        key_of: F,
+    ) -> (usize, usize)
+    where
+        F: Fn(&Object) -> Option<String>,
+    {
+        use alloc::collections::BTreeSet;
+        let keys_from = |obj: &Object| -> BTreeSet<String> {
+            fetch_or_phi(cell_name, obj)
+                .as_seq()
+                .map(|facts| facts.iter().filter_map(&key_of).collect())
+                .unwrap_or_default()
+        };
+        let a = keys_from(legacy);
+        let b = keys_from(stage12);
+        let missing: Vec<&String> = a.difference(&b).collect();
+        let extra: Vec<&String> = b.difference(&a).collect();
+        if !missing.is_empty() {
+            eprintln!("  [{}] missing from stage12 ({}): {:?}",
+                label, missing.len(), missing);
+        }
+        if !extra.is_empty() {
+            eprintln!("  [{}] extra in stage12 ({}): {:?}",
+                label, extra.len(), extra);
+        }
+        (missing.len(), extra.len())
+    }
+
+    /// Diff the canonical metamodel cells between legacy and stage12
+    /// pipelines. Returns (total_missing, total_extra).
+    fn diff_cells(reading_name: &str, text: &str) -> (usize, usize) {
+        let legacy = crate::parse_forml2::parse_to_state(text)
+            .expect("legacy parse");
+        let stage12 = super::parse_to_state_via_stage12(text)
+            .expect("stage12 parse");
+
+        eprintln!("--- {} ---", reading_name);
+        let mut m = 0;
+        let mut x = 0;
+        let (dm, dx) = diff_by_key("Noun", &legacy, &stage12, "Noun",
+            |f| binding(f, "name").map(String::from));
+        m += dm; x += dx;
+        let (dm, dx) = diff_by_key("Subtype", &legacy, &stage12, "Subtype",
+            |f| Some(alloc::format!("{}<:{}",
+                binding(f, "subtype")?, binding(f, "supertype")?)));
+        m += dm; x += dx;
+        let (dm, dx) = diff_by_key("FactType", &legacy, &stage12, "FactType",
+            |f| binding(f, "id").map(String::from));
+        m += dm; x += dx;
+        let (dm, dx) = diff_by_key("Role", &legacy, &stage12, "Role",
+            |f| Some(alloc::format!("{}/{}#{}",
+                binding(f, "factType")?,
+                binding(f, "nounName")?,
+                binding(f, "position")?)));
+        m += dm; x += dx;
+        let (dm, dx) = diff_by_key("Constraint", &legacy, &stage12, "Constraint",
+            |f| binding(f, "id").map(String::from));
+        m += dm; x += dx;
+        let (dm, dx) = diff_by_key("DerivationRule", &legacy, &stage12, "DerivationRule",
+            |f| binding(f, "id").map(String::from));
+        m += dm; x += dx;
+        let (dm, dx) = diff_by_key("InstanceFact", &legacy, &stage12, "InstanceFact",
+            |f| Some(alloc::format!("{}.{} = {}.{}",
+                binding(f, "subjectNoun").unwrap_or(""),
+                binding(f, "subjectValue").unwrap_or(""),
+                binding(f, "fieldName").unwrap_or(""),
+                binding(f, "objectValue").unwrap_or(""))));
+        m += dm; x += dx;
+        let (dm, dx) = diff_by_key("EnumValues", &legacy, &stage12, "EnumValues",
+            |f| binding(f, "noun").map(String::from));
+        m += dm; x += dx;
+        (m, x)
+    }
+
+    /// Report the full per-cell diff for readings/core.md. This test
+    /// is expected to SHOW real gaps — it prints them and records
+    /// current totals in assertions so regressions (new gaps) fail.
+    #[test]
+    #[ignore = "diagnostic: prints gaps, not yet zero"]
+    fn diff_core_md_legacy_vs_stage12() {
+        let core = include_str!("../../../readings/core.md");
+        let (missing, extra) = diff_cells("core.md", core);
+        eprintln!("core.md totals — missing: {}, extra: {}", missing, extra);
     }
 }

@@ -46,6 +46,14 @@ pub fn tokenize_statement(statement_id: &str, text: &str, nouns: &[String]) -> C
     // 1. Strip trailing ORM 2 derivation marker.
     let (body, derivation_marker) = strip_derivation_marker(canonical);
 
+    // 1b. Strip ORM 2 reference-scheme parens: `Function(.id) is ...`
+    //     becomes `Function is ...`. Legacy does this in
+    //     parse_entity_decl; Stage-1 needs the same so the trailing
+    //     marker (`is an entity type`) is recognizable as a prefix of
+    //     the post-noun tail.
+    let body_stripped: String = strip_ref_scheme_parens(body);
+    let body: &str = body_stripped.as_str();
+
     // 2. Strip leading deontic operator (`It is obligatory/forbidden/permitted that`).
     let (body, deontic_operator) = strip_leading_deontic_operator(body);
 
@@ -282,6 +290,37 @@ fn strip_leading_deontic_operator(text: &str) -> (&str, Option<String>) {
     (text, None)
 }
 
+/// Strip ORM 2 reference-scheme parens from a statement body.
+///
+/// A reference scheme follows an entity-type name to declare how
+/// instances are referenced: `Customer(.Name)`, `Order(.Number,
+/// .Year)`, `Bound(.id)`. The legacy parser handles this in
+/// `parse_entity_decl`; Stage-1 does the equivalent in text so the
+/// trailing marker extractor doesn't see the parens between the
+/// head noun and `is an entity type`.
+///
+/// The pattern we strip: `(.<chars-excluding-close-paren>)`. Only
+/// parens that open with `(.` are reference schemes — ordinary
+/// parenthetical prose (rare in FORML 2) is left alone.
+fn strip_ref_scheme_parens(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut rest = body;
+    while let Some(pos) = rest.find("(.") {
+        out.push_str(&rest[..pos]);
+        match rest[pos..].find(')') {
+            Some(close_rel) => {
+                rest = &rest[pos + close_rel + 1..];
+            }
+            None => {
+                out.push_str(&rest[pos..]);
+                return out;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 #[derive(Debug, Clone)]
 struct RoleRef {
     noun: String,
@@ -302,6 +341,14 @@ fn match_role_references(text: &str, sorted_nouns: &[&str]) -> Vec<RoleRef> {
     let bytes = text.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
+        // Non-ASCII multibyte chars can leave `i` mid-codepoint; the
+        // `&text[i..]` slice requires a char boundary. Noun names are
+        // ASCII per convention (#189), so it's safe to skip interior
+        // bytes until the next boundary.
+        if !text.is_char_boundary(i) {
+            i += 1;
+            continue;
+        }
         // Require word boundary: previous char is non-alphanumeric (or start).
         let at_boundary = i == 0 || {
             let prev = bytes[i - 1];
@@ -504,6 +551,31 @@ mod tests {
         assert_eq!(stmt_binding(&c, "Statement_has_Verb", "Verb").as_deref(),
                    Some("places"));
         assert_eq!(c.get("Role_Reference").map(|v| v.len()), Some(2));
+    }
+
+    #[test]
+    fn entity_type_with_ref_scheme_parens_extracts_trailing_marker() {
+        // `Function(.id) is an entity type.` — the `(.id)` suffix is an
+        // ORM 2 reference scheme; legacy parser strips it via
+        // parse_entity_decl. Stage-1 must do the same so the trailing
+        // marker `is an entity type` survives.
+        let c = tokenize_statement("s1",
+            "Function(.id) is an entity type.",
+            &nouns(&["Function"]));
+        assert_eq!(stmt_binding(&c, "Statement_has_Head_Noun", "Head_Noun").as_deref(),
+                   Some("Function"));
+        assert_eq!(stmt_binding(&c, "Statement_has_Trailing_Marker", "Trailing_Marker").as_deref(),
+                   Some("is an entity type"));
+    }
+
+    #[test]
+    fn tokenize_survives_utf8_multibyte_text() {
+        // Regression: `§` is 2 bytes; the byte-index loop used to slice
+        // `&text[i..]` at a non-char-boundary. #294 diagnostic caught it.
+        let c = tokenize_statement("s1",
+            "Paper §4 Table 1 correspondence: see Function.",
+            &nouns(&["Function"]));
+        assert!(c.contains_key("Statement"));
     }
 
     #[test]
