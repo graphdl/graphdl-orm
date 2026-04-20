@@ -46,7 +46,10 @@ pub fn tokenize_statement(statement_id: &str, text: &str, nouns: &[String]) -> C
     // 1. Strip trailing ORM 2 derivation marker.
     let (body, derivation_marker) = strip_derivation_marker(canonical);
 
-    // 2. Strip leading quantifier.
+    // 2. Strip leading deontic operator (`It is obligatory/forbidden/permitted that`).
+    let (body, deontic_operator) = strip_leading_deontic_operator(body);
+
+    // 3. Strip leading quantifier.
     let (body, quantifier) = strip_leading_quantifier(body);
 
     // 3. Longest-first noun matching over the body.
@@ -93,6 +96,11 @@ pub fn tokenize_statement(statement_id: &str, text: &str, nouns: &[String]) -> C
     if let Some(dm) = derivation_marker.as_ref() {
         push(&mut cells, "Statement_has_Derivation_Marker", fact_from_pairs(&[
             ("Statement", statement_id), ("Derivation_Marker", dm),
+        ]));
+    }
+    if let Some(op) = deontic_operator.as_ref() {
+        push(&mut cells, "Statement_has_Deontic_Operator", fact_from_pairs(&[
+            ("Statement", statement_id), ("Deontic_Operator", op),
         ]));
     }
     // Existential marker: any role has a literal value. Lets the grammar
@@ -176,6 +184,24 @@ fn strip_leading_quantifier(text: &str) -> (&str, Option<String>) {
     for q in QUANTIFIERS {
         if let Some(rest) = text.strip_prefix(q) {
             return (rest, Some(q.trim().to_lowercase()));
+        }
+    }
+    (text, None)
+}
+
+const DEONTIC_PREFIXES: &[(&str, &str)] = &[
+    ("It is obligatory that ", "obligatory"),
+    ("It is forbidden that ",  "forbidden"),
+    ("It is permitted that ",  "permitted"),
+    ("it is obligatory that ", "obligatory"),
+    ("it is forbidden that ",  "forbidden"),
+    ("it is permitted that ",  "permitted"),
+];
+
+fn strip_leading_deontic_operator(text: &str) -> (&str, Option<String>) {
+    for (prefix, op) in DEONTIC_PREFIXES {
+        if let Some(rest) = text.strip_prefix(prefix) {
+            return (rest, Some(op.to_string()));
         }
     }
     (text, None)

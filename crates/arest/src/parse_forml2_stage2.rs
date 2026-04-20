@@ -373,6 +373,42 @@ pub fn translate_derivation_rules(classified_state: &Object) -> Vec<Object> {
     out
 }
 
+/// Translate `Deontic Constraint` classifications into `Constraint`
+/// cell facts with modality="deontic" and the stripped deontic
+/// operator. Entity defaults to the Head Noun of the body (after
+/// the `It is X that` prefix was stripped by Stage-1).
+#[cfg(feature = "std-deps")]
+pub fn translate_deontic_constraints(classified_state: &Object) -> Vec<Object> {
+    let statement_ids = collect_statement_ids(classified_state);
+    let mut out: Vec<Object> = Vec::new();
+    for stmt_id in &statement_ids {
+        let classifications = classifications_for(classified_state, stmt_id);
+        if !classifications.iter().any(|k| k == "Deontic Constraint") {
+            continue;
+        }
+        let text = statement_text(classified_state, stmt_id).unwrap_or_default();
+        let op = deontic_operator_for(classified_state, stmt_id).unwrap_or_default();
+        let entity = head_noun_for(classified_state, stmt_id).unwrap_or_default();
+        out.push(fact_from_pairs(&[
+            ("id",               text.as_str()),
+            ("kind",             "UC"),
+            ("modality",         "deontic"),
+            ("deonticOperator",  op.as_str()),
+            ("text",             text.as_str()),
+            ("entity",           entity.as_str()),
+        ]));
+    }
+    out
+}
+
+fn deontic_operator_for(state: &Object, stmt_id: &str) -> Option<String> {
+    fetch_or_phi("Statement_has_Deontic_Operator", state)
+        .as_seq()?
+        .iter()
+        .find(|f| binding(f, "Statement") == Some(stmt_id))
+        .and_then(|f| binding(f, "Deontic_Operator").map(String::from))
+}
+
 fn ring_adjective_to_kind(marker: &str) -> Option<&'static str> {
     match marker {
         "is irreflexive"   => Some("IR"),
@@ -896,6 +932,30 @@ mod tests {
         let classified = classify_statements(&stmt, &grammar_state());
         let rules = super::translate_derivation_rules(&classified);
         assert!(rules.is_empty());
+    }
+
+    #[test]
+    fn deontic_constraint_is_classified_for_obligatory() {
+        let stmt = stage1_state(
+            "s1", "It is obligatory that Customer has Email.",
+            &["Customer", "Email"]);
+        let classified = classify_statements(&stmt, &grammar_state());
+        let kinds = classifications_for(&classified, "s1");
+        assert!(kinds.iter().any(|k| k == "Deontic Constraint"),
+            "expected Deontic Constraint; got {:?}", kinds);
+    }
+
+    #[test]
+    fn translate_deontic_constraints_emits_with_operator_and_entity() {
+        let stmt = stage1_state(
+            "s1", "It is forbidden that Support Response uses Dash.",
+            &["Support Response", "Dash"]);
+        let classified = classify_statements(&stmt, &grammar_state());
+        let constraints = super::translate_deontic_constraints(&classified);
+        assert_eq!(constraints.len(), 1);
+        assert_eq!(binding(&constraints[0], "modality"), Some("deontic"));
+        assert_eq!(binding(&constraints[0], "deonticOperator"), Some("forbidden"));
+        assert_eq!(binding(&constraints[0], "entity"), Some("Support Response"));
     }
 
     #[test]
