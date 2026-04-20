@@ -940,14 +940,20 @@ pub fn parse_to_state_via_stage12(text: &str) -> Result<Object, String> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        // Skip prose lines: every FORML 2 statement ends with `.`.
-        // Markdown prose interspersed in reading files (section
-        // introductions, bullet continuations with no period) would
-        // otherwise be tokenized and misclassified as Fact Type
-        // Reading via their incidental noun references. Legacy's
-        // cascade only acts when a recognizer matches; its
-        // recognizers all require the period terminator.
-        if !line.ends_with('.') {
+        // Skip prose lines: every FORML 2 statement ends with `.` —
+        // optionally followed by an ORM 2 derivation marker
+        // (`. *`, `. **`, `. +`). Markdown prose interspersed in
+        // reading files (section introductions, bullet continuations
+        // with no period) would otherwise be tokenized and
+        // misclassified as Fact Type Reading via their incidental
+        // noun references. Legacy's cascade only acts when a
+        // recognizer matches; its recognizers all require the period
+        // terminator.
+        let ends_like_statement = line.ends_with('.')
+            || line.ends_with(". *")
+            || line.ends_with(". **")
+            || line.ends_with(". +");
+        if !ends_like_statement {
             continue;
         }
         // Skip ORM 2 possibility-override statements (`It is possible
