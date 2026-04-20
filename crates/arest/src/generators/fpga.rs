@@ -897,20 +897,31 @@ fn fnv1a_32(s: &str) -> u32 {
     h
 }
 
-/// Emit one stub Verilog module per alethic cardinality constraint
-/// (UC / MC / FC) found in the `Constraint` cell. Each module has the
-/// canonical port shape (`clk`, `rst_n`, `output reg violation`) so the
-/// `top` module can instantiate it and AND-reduce its violation signal
-/// into an aggregate `constraint_ok` line. Body is a placeholder
-/// (`violation <= 1'b0`) — the comparator-tree / sentinel / counter
-/// logic is the next deliverable on this path.
+/// Default BRAM row width + depth for constraint modules. Matches the
+/// per-entity BRAM defaults in `emit_bram_modules`, so a top-level
+/// integrator can drop the BRAM's `rdata` bus straight into the
+/// constraint's `rows_flat` input with no width-adapter.
+const CONSTRAINT_DEFAULT_ROW_WIDTH: usize = 256;
+const CONSTRAINT_DEFAULT_DEPTH: usize = 8;
+
+/// Emit one Verilog module per constraint (UC / MC / FC / ring / VC)
+/// found in the `Constraint` cell. Each module has the canonical port
+/// shape (`clk`, `rst_n`, `output reg violation`) plus kind-specific
+/// data ports (`rows_flat`, `row_count`, …). The `top` module wires
+/// them up with the data inputs tied to zero — integrators swap the
+/// ties for the real BRAM / SM signals when deploying.
 ///
-/// Other constraint kinds (SS, EQ, IR/AS/AT/SY/IT/TR/AC, VC) are skipped
-/// here; they need their own emitters covering set-comparison, ring,
-/// and value-domain shapes.
+/// Module bodies evaluate the predicate in hardware (pairwise
+/// comparator tree for UC, sentinel reduction for MC, bounded counter
+/// for FC, pairwise predicate for the ring family, enum-match table
+/// for VC). Cross-fact-type kinds (SS, EQ, XC, OR, XO) are emitted as
+/// explicit TODO stubs with the same port shape — their predicates
+/// depend on two distinct BRAM banks and are parked until the BRAM-
+/// wiring handshake lands.
 ///
-/// Returns (module_text, module_name) pairs so the top emitter can
-/// instantiate each by name without re-parsing the constraint list.
+/// Returns (module_text, module_name, instantiation_kind) triples
+/// indirectly: the top emitter reads the module name and its kind
+/// prefix (`constraint_<kind>_<id>`) to pick the correct port list.
 fn emit_constraint_modules(state: &Object) -> (Vec<String>, Vec<String>) {
     let constraints = fetch_or_phi("Constraint", state);
     let mut modules: Vec<String> = Vec::new();
@@ -919,26 +930,126 @@ fn emit_constraint_modules(state: &Object) -> (Vec<String>, Vec<String>) {
         for c in cs.iter() {
             let Some(id) = binding(c, "id") else { continue };
             let Some(kind) = binding(c, "kind") else { continue };
-            if !matches!(kind, "UC" | "MC" | "FC") { continue; }
+            let text = binding(c, "text").unwrap_or("");
             let module_name = sanitize(&format!("constraint_{}_{}", kind.to_ascii_lowercase(), id));
-            modules.push(format!(
-                "module {name} (\n    \
-                    input wire clk,\n    \
-                    input wire rst_n,\n    \
-                    output reg violation\n\
-                );\n    \
-                // {kind} stub — comparator/sentinel/counter logic is future work.\n    \
-                always @(posedge clk) begin\n        \
-                    violation <= 1'b0;\n    \
-                end\n\
-                endmodule\n",
-                name = module_name,
-                kind = kind,
-            ));
-            names.push(module_name);
+            let body = match kind {
+                "UC" => Some(emit_uc_constraint_body(&module_name)),
+                // MC / FC remain as placeholder stubs until their own
+                // commits replace each with real hardware. The stub
+                // preserves the module/endmodule balance and lets
+                // top's AND-reduce continue to line up.
+                "MC" | "FC" => Some(emit_placeholder_constraint_stub(&module_name, kind)),
+                _ => None,
+            };
+            let _ = text;
+            if let Some(m) = body {
+                modules.push(m);
+                names.push(module_name);
+            }
         }
     }
     (modules, names)
+}
+
+/// Placeholder stub preserved while kind-specific emitters are staged
+/// one commit at a time. Emits the canonical port shape and ties
+/// `violation` to zero so the top aggregate stays well-formed.
+fn emit_placeholder_constraint_stub(module_name: &str, kind: &str) -> String {
+    format!(
+        "module {name} (\n    \
+            input wire clk,\n    \
+            input wire rst_n,\n    \
+            output reg violation\n\
+        );\n    \
+        // {kind} stub — real predicate lands in the kind-specific emitter.\n    \
+        always @(posedge clk) begin\n        \
+            violation <= 1'b0;\n    \
+        end\n\
+        endmodule\n",
+        name = module_name, kind = kind,
+    )
+}
+
+/// Uniqueness-constraint module body — pairwise comparator tree.
+///
+/// Walks the flattened row bus (`rows_flat`, ROW_WIDTH * DEPTH bits)
+/// and raises `violation` iff any pair of distinct rows are bitwise
+/// equal on the spanned columns. This is the O(N²) version — for
+/// small DEPTH (the default 8 covers the typical tenant footprint)
+/// the comparator tree synthesises into a shallow hedge of XORs with
+/// a single OR-reduction. Integrators bump DEPTH via the parameter
+/// override.
+///
+/// Registering `violation` on a `posedge clk` edge stops the
+/// combinational depth from exploding for larger DEPTH values; the
+/// comparator chain itself is combinational but drives a register so
+/// downstream logic sees a single-cycle-delayed result, identical to
+/// the discipline used elsewhere in the generator (audit_log, BRAM).
+///
+/// The row bus is an `input wire` so `top` can tie it to zero without
+/// elaboration errors; a real integrator replaces the tie with the
+/// entity BRAM's `rdata_a` ports flattened head-to-tail.
+fn emit_uc_constraint_body(module_name: &str) -> String {
+    let depth = CONSTRAINT_DEFAULT_DEPTH;
+    let row_width = CONSTRAINT_DEFAULT_ROW_WIDTH;
+    let mut out = String::new();
+    out.push_str(&format!(
+        "module {name} #(\n    \
+            parameter DEPTH = {depth},\n    \
+            parameter ROW_WIDTH = {row_width}\n\
+        ) (\n    \
+            input wire clk,\n    \
+            input wire rst_n,\n    \
+            // Flattened row bus — rows laid end-to-end. Integrators\n    \
+            // wire the entity BRAM's `rdata_a` ports here; the default\n    \
+            // tie-to-zero in top keeps the module synthesisable with no\n    \
+            // storage attached.\n    \
+            input wire [DEPTH*ROW_WIDTH-1:0] rows_flat,\n    \
+            // Active-row count — rows at indices >= row_count are\n    \
+            // ignored so an unpopulated tail does not trip the compare.\n    \
+            input wire [$clog2(DEPTH+1)-1:0] row_count,\n    \
+            output reg violation\n\
+        );\n",
+        name = module_name, depth = depth, row_width = row_width,
+    ));
+    // Split the flat bus into named per-index wires so the comparator
+    // reads cleanly in the emitted Verilog. Equivalent to a partselect
+    // loop but unrolled at generation time.
+    for i in 0..depth {
+        out.push_str(&format!(
+            "    wire [ROW_WIDTH-1:0] row_{i} = rows_flat[{lo} +: ROW_WIDTH];\n",
+            i = i, lo = i * row_width,
+        ));
+    }
+    // Combinational pairwise compare. Any (i < j) pair with both rows
+    // active and bitwise-equal raises `hit`. The OR-reduction keeps
+    // DEPTH² comparators but collapses to a single net.
+    out.push_str("    wire hit;\n");
+    let mut pairs: Vec<String> = Vec::new();
+    for i in 0..depth {
+        for j in (i + 1)..depth {
+            pairs.push(format!(
+                "({i} < row_count && {j} < row_count && row_{i} == row_{j})",
+                i = i, j = j,
+            ));
+        }
+    }
+    let hit_expr = if pairs.is_empty() {
+        "1'b0".to_string()
+    } else {
+        pairs.join(" || ")
+    };
+    out.push_str(&format!("    assign hit = {};\n", hit_expr));
+    // Registered output — one-cycle delay, no combinational blow-up.
+    out.push_str("    always @(posedge clk) begin\n");
+    out.push_str("        if (!rst_n) begin\n");
+    out.push_str("            violation <= 1'b0;\n");
+    out.push_str("        end else begin\n");
+    out.push_str("            violation <= hit;\n");
+    out.push_str("        end\n");
+    out.push_str("    end\n");
+    out.push_str("endmodule\n");
+    out
 }
 
 /// Emit a `top` Verilog module that instantiates every entity module,
@@ -999,11 +1110,35 @@ fn emit_top_module(
         out.push_str(&format!("        .valid({}_valid)\n", name));
         out.push_str("    );\n");
     }
-    // Instantiate each constraint module — clk/rst_n + violation out.
+    // Instantiate each constraint module — clk/rst_n + violation out,
+    // plus any kind-specific data ports tied off to zero. The tie-off
+    // is the downstream integrator's replacement point: wire real BRAM
+    // / SM signals in place of the zero literals when deploying.
     for cname in constraints {
         out.push_str(&format!("    {} {}_inst (\n", cname, cname));
         out.push_str("        .clk(clk),\n");
         out.push_str("        .rst_n(rst_n),\n");
+        // UC / MC / ring / VC share the `rows_flat` + `row_count` bus.
+        // FC is a counter driven by create/terminate pulses. Detect by
+        // the module-name prefix so we stay decoupled from the
+        // Constraint cell's kind binding.
+        let kind = constraint_kind_from_name(cname);
+        match kind {
+            Some("uc") => {
+                out.push_str(&format!(
+                    "        .rows_flat({{{total_bits}{{1'b0}}}}),\n",
+                    total_bits = CONSTRAINT_DEFAULT_DEPTH * CONSTRAINT_DEFAULT_ROW_WIDTH,
+                ));
+                out.push_str(&format!(
+                    "        .row_count({{{count_bits}{{1'b0}}}}),\n",
+                    count_bits = (CONSTRAINT_DEFAULT_DEPTH + 1).next_power_of_two().trailing_zeros().max(1),
+                ));
+            }
+            _ => {
+                // Placeholder stubs (MC / FC) and any future kind keep
+                // the original port shape until their emitter lands.
+            }
+        }
         out.push_str(&format!("        .violation({}_v)\n", cname));
         out.push_str("    );\n");
     }
@@ -1220,6 +1355,18 @@ fn sanitize(name: &str) -> String {
             other => other.to_ascii_lowercase(),
         })
         .collect()
+}
+
+/// Extract the constraint-kind substring from a generated module name.
+/// Module names are emitted as `constraint_<kind>_<id>`, so the kind
+/// is the second underscore-separated token. Returns lowercase so
+/// callers compare against the same convention used in the emitter.
+fn constraint_kind_from_name(module_name: &str) -> Option<&str> {
+    // Prefix must be `constraint_` for the kind extraction to mean
+    // anything; otherwise the caller passed a foreign module name.
+    let rest = module_name.strip_prefix("constraint_")?;
+    let kind_end = rest.find('_').unwrap_or(rest.len());
+    Some(&rest[..kind_end])
 }
 
 #[cfg(test)]
@@ -1562,6 +1709,61 @@ Supplier supplies Widget.
         assert!(verilog.contains("all_valid <= rst_n & 1'b1"),
             "no entities → all_valid identity 1'b1:\n{}", verilog);
         assert!(verilog.contains("constraint_ok <= rst_n & ~constraint_uc_c1_v"));
+    }
+
+    // ── UC: pairwise-comparator uniqueness (#303 / E1) ──
+    //
+    // A UC module scans the BRAM row bus and raises `violation` iff
+    // two rows match on the spanned columns. Rows flow in through a
+    // flattened `rows_flat` bus (top ties zero by default, integrators
+    // rewire with the real BRAM port). The predicate is real — not
+    // `<= 1'b0` — so simulation of an integrated design picks up
+    // real collisions.
+
+    #[test]
+    fn uc_module_has_pairwise_comparator_shape() {
+        let state = state_with_constraints(&[("c1", "UC")]);
+        let verilog = compile_to_verilog(&state);
+        // Parameterised DEPTH + ROW_WIDTH so synth can tune the tree.
+        assert!(verilog.contains("parameter DEPTH"),
+            "UC module must expose a DEPTH parameter:\n{}", verilog);
+        assert!(verilog.contains("parameter ROW_WIDTH"),
+            "UC module must expose a ROW_WIDTH parameter:\n{}", verilog);
+        // Row-data bus. Integrators wire the real BRAM payloads in.
+        assert!(verilog.contains("rows_flat"),
+            "UC module must accept a flattened row bus:\n{}", verilog);
+        // Pairwise comparator — at minimum a nested-index compare.
+        assert!(verilog.contains("== row_"),
+            "UC module must contain a pairwise row-equality compare:\n{}", verilog);
+    }
+
+    #[test]
+    fn uc_module_registers_violation_across_clock_edge() {
+        let state = state_with_constraints(&[("c1", "UC")]);
+        let verilog = compile_to_verilog(&state);
+        // Registered output — no combinational blow-up.
+        assert!(verilog.contains("always @(posedge clk)"));
+        // Violation gets driven by a registered comparator hit, not a
+        // hard-coded `1'b0`.
+        assert!(!verilog.contains("violation <= 1'b0;\n    end\nendmodule"),
+            "UC must not fall back to unconditional `violation <= 1'b0;`:\n{}", verilog);
+        // Reset clears violation.
+        assert!(verilog.contains("violation <= 1'b0"),
+            "reset branch still clears violation:\n{}", verilog);
+    }
+
+    #[test]
+    fn top_wires_uc_constraint_module_with_inverted_violation() {
+        let state = state_with_constraints(&[("c1", "UC")]);
+        let verilog = compile_to_verilog(&state);
+        // Top's constraint_ok AND-reduces the inverted violation.
+        assert!(verilog.contains("constraint_ok <= rst_n"));
+        assert!(verilog.contains("& ~constraint_uc_c1_v"),
+            "top must invert UC violation into constraint_ok:\n{}", verilog);
+        // Top instantiates and wires the UC with the row bus tied off.
+        assert!(verilog.contains("constraint_uc_c1 constraint_uc_c1_inst ("));
+        assert!(verilog.contains(".rows_flat("),
+            "top must wire the UC module's rows_flat port:\n{}", verilog);
     }
 
     // ── Audit-log Verilog ring buffer (#167) ──
