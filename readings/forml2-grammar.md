@@ -42,6 +42,7 @@ Statement has Quantifier.
 Statement has Derivation Marker.
 Statement has Literal Role.
 Statement has Keyword.
+Statement has Deontic Operator.
 Statement has Classification.
 
 Statement has Role Reference.
@@ -113,3 +114,7 @@ Statement has Classification 'Ring Constraint' iff Statement has Trailing Marker
 Statement has Classification 'Exclusion Constraint' iff Statement has Trailing Marker 'are mutually exclusive'.
 
 Statement has Classification 'Value Constraint' iff Statement has Classification 'Enum Values Declaration'.
+
+Statement has Classification 'Deontic Constraint' iff Statement has Deontic Operator 'obligatory'.
+Statement has Classification 'Deontic Constraint' iff Statement has Deontic Operator 'forbidden'.
+Statement has Classification 'Deontic Constraint' iff Statement has Deontic Operator 'permitted'.
