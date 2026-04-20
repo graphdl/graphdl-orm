@@ -453,7 +453,7 @@ fn main() {
                             text: ast::binding(f, "text").unwrap_or("").to_string(),
                             consequent_cell: types::ConsequentCellSource::decode(
                                 ast::binding(f, "consequentFactTypeId").unwrap_or("")),
-                            antecedent_fact_type_ids: vec![], kind: types::DerivationKind::ModusPonens,
+                            antecedent_sources: vec![], consequent_instance_role: String::new(), kind: types::DerivationKind::ModusPonens,
                             join_on: vec![], match_on: vec![], consequent_bindings: vec![],
                             antecedent_filters: vec![], consequent_computed_bindings: vec![],
                             consequent_aggregates: vec![], unresolved_clauses: vec![], antecedent_role_literals: vec![], consequent_role_literals: vec![],

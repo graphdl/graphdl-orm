@@ -952,7 +952,7 @@ fn try_derivation(line: &str) -> Option<ParseAction> {
         let clean = stripped.trim_end_matches('.');
         ParseAction::AddDerivation(DerivationRuleDef {
             id: String::new(), text: clean.into(),
-            antecedent_fact_type_ids: vec![], consequent_cell: crate::types::ConsequentCellSource::default(),
+            antecedent_sources: vec![], consequent_instance_role: String::new(), consequent_cell: crate::types::ConsequentCellSource::default(),
             kind: DerivationKind::ModusPonens,
             join_on: vec![], match_on: vec![], consequent_bindings: vec![], antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![], unresolved_clauses: vec![], antecedent_role_literals: vec![], consequent_role_literals: vec![],
         })
@@ -2303,7 +2303,8 @@ fn resolve_derivation_rule(
         // Nothing classified this clause.
         rule.unresolved_clauses.push(part.to_string());
     }
-    rule.antecedent_fact_type_ids = resolved_ids;
+    rule.antecedent_sources = resolved_ids.into_iter()
+        .map(crate::types::AntecedentSource::FactType).collect();
     rule.antecedent_filters = filters;
     rule.antecedent_role_literals = role_literals;
     rule.consequent_computed_bindings = computed;
@@ -2319,11 +2320,14 @@ fn resolve_derivation_rule(
     // a noun, this is a Join derivation. Rules with "that X" anaphora where X appears
     // in multiple antecedents need an equi-join on X.
     let is_join = !rule.join_on.is_empty()
-        && rule.antecedent_fact_type_ids.len() >= 2
+        && rule.antecedent_sources.len() >= 2
         && rule.join_on.iter().any(|key| {
-            rule.antecedent_fact_type_ids.iter()
-                .filter(|ft_id| ir.fact_types.get(*ft_id)
-                    .map_or(false, |ft| ft.roles.iter().any(|r| r.noun_name == *key)))
+            rule.antecedent_sources.iter()
+                .filter_map(|s| {
+                    let ft_id = s.fact_type_id();
+                    if ft_id.is_empty() { None } else { ir.fact_types.get(ft_id) }
+                })
+                .filter(|ft| ft.roles.iter().any(|r| r.noun_name == *key))
                 .count() >= 2
         });
     is_join.then(|| {
@@ -3797,8 +3801,8 @@ mod tests {
         assert!(!rules.is_empty());
         let rule = &rules[0];
         assert!(!rule.consequent_cell.is_empty_literal(), "consequent should be resolved");
-        assert!(!rule.antecedent_fact_type_ids.is_empty(), "antecedents should be resolved");
-        assert!(rule.antecedent_fact_type_ids.len() >= 2, "should have at least 2 antecedents");
+        assert!(!rule.antecedent_sources.is_empty(), "antecedents should be resolved");
+        assert!(rule.antecedent_sources.len() >= 2, "should have at least 2 antecedents");
     }
 
     #[test]
@@ -3838,8 +3842,8 @@ mod tests {
         assert_eq!(f.role, "Population");
         // Antecedent still resolves to the base fact type â€” the comparator
         // is a filter on it, not a replacement.
-        assert!(rule.antecedent_fact_type_ids.iter().any(|id| id.contains("Population")),
-            "base FT should still resolve: {:?}", rule.antecedent_fact_type_ids);
+        assert!(rule.antecedent_sources.iter().any(|s| s.fact_type_id().contains("Population")),
+            "base FT should still resolve: {:?}", rule.antecedent_sources);
     }
 
     #[test]
@@ -3887,7 +3891,7 @@ mod tests {
     // consequent role's value from other role values or numeric literals.
     // Supports `+`, `-`, `*`, `/`; left-associative; parentheses not yet
     // supported. These clauses populate `consequent_computed_bindings` and
-    // are stripped from `antecedent_fact_type_ids` since they aren't fact
+    // are stripped from `antecedent_sources` since they aren't fact
     // types to resolve.
 
     fn single_op(op: &str, lhs: &str, rhs: &str) -> crate::types::ArithExpr {
@@ -3911,10 +3915,10 @@ mod tests {
         assert_eq!(cb.role, "Doubled");
         assert_eq!(cb.expr, single_op("+", "Val", "Val"));
         // The definitional antecedent doesn't resolve to a fact type;
-        // only `Foo has Val` should remain in antecedent_fact_type_ids.
-        assert_eq!(rule.antecedent_fact_type_ids.len(), 1,
+        // only `Foo has Val` should remain in antecedent_sources.
+        assert_eq!(rule.antecedent_sources.len(), 1,
             "definitional clause must be stripped from antecedents, got {:?}",
-            rule.antecedent_fact_type_ids);
+            rule.antecedent_sources);
     }
 
     #[test]
@@ -4107,8 +4111,8 @@ mod tests {
             "two-antecedent rule with `that Manager` should be Join, got {:?}", rule.kind);
         assert!(rule.join_on.iter().any(|k| k == "Manager"),
             "join_on should include Manager, got {:?}", rule.join_on);
-        assert_eq!(rule.antecedent_fact_type_ids.len(), 2,
-            "two antecedents, got {:?}", rule.antecedent_fact_type_ids);
+        assert_eq!(rule.antecedent_sources.len(), 2,
+            "two antecedents, got {:?}", rule.antecedent_sources);
     }
 
     // â”€â”€ Ring-constraint shorthand (ORM 2 intuitive-icon parity) â”€â”€
@@ -4212,11 +4216,11 @@ mod tests {
             "source_fact_type_id should reference Thing and Part, got {:?}", a.source_fact_type_id);
         assert_eq!(a.group_key_role, "Thing");
         // The where-clause IS the source fact type; it belongs only in the
-        // aggregate metadata, not in antecedent_fact_type_ids (otherwise
+        // aggregate metadata, not in antecedent_sources (otherwise
         // the compile path would double-count it).
-        assert!(rule.antecedent_fact_type_ids.is_empty(),
+        assert!(rule.antecedent_sources.is_empty(),
             "aggregate clause must consume the whole antecedent list, got {:?}",
-            rule.antecedent_fact_type_ids);
+            rule.antecedent_sources);
     }
 
     #[test]
@@ -4475,9 +4479,9 @@ Person is uncle of Person.\n\
             .find(|r| r.text.contains("uncle"))
             .expect("uncle derivation rule must be present");
         assert_eq!(
-            rule.antecedent_fact_type_ids.len(), 2,
+            rule.antecedent_sources.len(), 2,
             "uncle rule must have 2 antecedents (brother + parent), got {:?}",
-            rule.antecedent_fact_type_ids
+            rule.antecedent_sources
         );
         assert_eq!(
             rule.kind,
@@ -5681,9 +5685,9 @@ Order has Customer Age iff Order's Customer has Age.\n";
             .find(|r| r.text.contains("Customer Age"))
             .expect("derivation rule for Customer Age must be present");
         assert_eq!(
-            rule.antecedent_fact_type_ids.len(), 2,
+            rule.antecedent_sources.len(), 2,
             "possessive join rule must have 2 antecedents (Order has Customer + Customer has Age), got {:?}",
-            rule.antecedent_fact_type_ids
+            rule.antecedent_sources
         );
         assert_eq!(
             rule.kind,
