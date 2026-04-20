@@ -25,7 +25,6 @@ use hashbrown::HashMap;
 #[cfg_attr(feature = "std-deps", derive(serde::Deserialize, serde::Serialize))]
 #[cfg_attr(feature = "std-deps", serde(rename_all = "camelCase"))]
 struct ParseCtx {
-    fact_types: HashMap<String, FactTypeDef>,
     constraints: Vec<ConstraintDef>,
     #[cfg_attr(feature = "std-deps", serde(default))]
     derivation_rules: Vec<DerivationRuleDef>,
@@ -36,8 +35,8 @@ struct ParseCtx {
     /// #283 target: delete the typed caches above and make this the
     /// sole parser state, with cell-query helpers in place of field
     /// access. Migration in progress — named_spans, autofill_spans,
-    /// ref_schemes, subtypes, enum_values, general_instance_facts, and
-    /// nouns already migrated to their respective cells.
+    /// ref_schemes, subtypes, enum_values, general_instance_facts,
+    /// nouns, and fact_types already migrated to their respective cells.
     #[cfg_attr(feature = "std-deps", serde(skip))]
     cells: HashMap<String, Vec<crate::ast::Object>>,
 }
@@ -1033,7 +1032,6 @@ fn parse_markdown_with_context(input: &str, existing_nouns: &HashMap<String, Nou
     // the metamodel bootstrap), reject. The bootstrap case (no existing nouns
     // for those names) is allowed to declare them exactly once.
     let mut standalone = ParseCtx {
-        fact_types: HashMap::new(),
         constraints: vec![], derivation_rules: vec![],
         cells: HashMap::new(),
     };
@@ -1050,14 +1048,17 @@ fn parse_markdown_with_context(input: &str, existing_nouns: &HashMap<String, Nou
     }
 
     let mut ir = ParseCtx {
-        fact_types: existing_fact_types.clone(),
         constraints: vec![], derivation_rules: vec![],
         cells: HashMap::new(),
     };
-    // #283 — seed the Noun cell from the pre-existing typed map so the
-    // parser sees metamodel nouns as already declared.
+    // #283 — seed the Noun + FactType + Role cells from the pre-existing
+    // typed maps so the parser sees metamodel definitions as already
+    // declared.
     for (name, def) in existing_nouns.iter() {
         upsert_noun(&mut ir, name, def);
+    }
+    for (id, def) in existing_fact_types.iter() {
+        upsert_fact_type(&mut ir, id, def);
     }
     parse_into(&mut ir, input)?;
     Ok(ir)
@@ -1265,20 +1266,8 @@ fn ctx_to_state(d: &ParseCtx) -> crate::ast::Object {
     // #283 — Noun cell is populated directly by apply_action; no fallback
     // from a typed map is needed any longer.
 
-    // Fact types: schemas + roles (fallback).
-    if !cells.contains_key("FactType") {
-        for (ft_id, ft) in &d.fact_types {
-            push(&mut cells, "FactType", fact_from_pairs(&[
-                ("id", ft_id), ("reading", &ft.reading), ("arity", &ft.roles.len().to_string()),
-            ]));
-            for role in &ft.roles {
-                push(&mut cells, "Role", fact_from_pairs(&[
-                    ("factType", ft_id), ("nounName", &role.noun_name),
-                    ("position", &role.role_index.to_string()),
-                ]));
-            }
-        }
-    }
+    // #283 — FactType + Role cells populated directly by apply_action;
+    // no fallback from a typed map is needed any longer.
 
     // Constraints: apply_action already emitted these to d.cells during
     // parse. Test fixtures building ParseCtx literals with non-empty
@@ -1353,7 +1342,6 @@ fn ctx_to_state(d: &ParseCtx) -> crate::ast::Object {
 
 fn parse_markdown(input: &str) -> Result<ParseCtx, String> {
     let mut ir = ParseCtx {
-        fact_types: HashMap::new(),
         constraints: vec![], derivation_rules: vec![],
         cells: HashMap::new(),
     };
@@ -1530,10 +1518,10 @@ fn parse_into(ir: &mut ParseCtx, input: &str) -> Result<(), String> {
             apply_action(ir, action, &lines, i);
         });
 
-    // Build schema catalog from collected fact types
+    // Build schema catalog from collected fact types (via FactType + Role cells, #283)
     let catalog = {
         let mut cat = SchemaCatalog::new();
-        ir.fact_types.iter().for_each(|(schema_id, ft)| {
+        fact_types_from_cells(&ir.cells).iter().for_each(|(schema_id, ft)| {
             let role_nouns: Vec<&str> = ft.roles.iter().map(|r| r.noun_name.as_str()).collect();
             // Extract verb from reading: text between first and last noun
             let verb = ft.roles.first()
@@ -1644,7 +1632,8 @@ fn parse_into(ir: &mut ParseCtx, input: &str) -> Result<(), String> {
                 }
                 ParseAction::AddDerivation(mut r) => {
                     let nouns_map = nouns_from_cells(&ir.cells);
-                    resolve_derivation_rule(&mut r, &nouns_map, &ir.fact_types, &catalog);
+                    let fact_types_map = fact_types_from_cells(&ir.cells);
+                    resolve_derivation_rule(&mut r, &nouns_map, &fact_types_map, &catalog);
                     ir.derivation_rules.push(r);
                 }
                 other => { apply_action(ir, Some(other), &lines, i); }
@@ -1727,23 +1716,9 @@ fn parse_into(ir: &mut ParseCtx, input: &str) -> Result<(), String> {
         // / enumValues bindings by joining the sibling cells.
         enrich_noun_cells(ir);
 
-        // FactType + Role from ir.fact_types
-        let mut ft_facts: Vec<Object> = Vec::with_capacity(ir.fact_types.len());
-        let mut role_facts: Vec<Object> = Vec::new();
-        for (ft_id, ft) in &ir.fact_types {
-            ft_facts.push(fact_from_pairs(&[
-                ("id", ft_id.as_str()), ("reading", ft.reading.as_str()),
-                ("arity", &ft.roles.len().to_string()),
-            ]));
-            for role in &ft.roles {
-                role_facts.push(fact_from_pairs(&[
-                    ("factType", ft_id.as_str()), ("nounName", role.noun_name.as_str()),
-                    ("position", &role.role_index.to_string()),
-                ]));
-            }
-        }
-        ir.cells.insert("FactType".to_string(), ft_facts);
-        ir.cells.insert("Role".to_string(), role_facts);
+        // FactType + Role: #283 — apply_action's AddFactType branch
+        // writes the FactType and Role cells directly via
+        // `upsert_fact_type`. No finalize rebuild needed.
 
         // Constraint: ir.constraints → Constraint cell
         let c_facts: Vec<Object> = ir.constraints.iter().map(constraint_to_fact).collect();
@@ -1814,10 +1789,14 @@ fn parse_into(ir: &mut ParseCtx, input: &str) -> Result<(), String> {
 
     // Strict mode: reject undeclared nouns (subtype children, fact type roles).
     if is_strict_mode() {
+        let role_noun_names: Vec<String> = ir.cells.get("Role")
+            .map(|facts| facts.iter()
+                .filter_map(|f| crate::ast::binding(f, "nounName").map(String::from))
+                .collect())
+            .unwrap_or_default();
         let undeclared: Vec<String> = all_subtype_names(&ir.cells).into_iter()
             .filter(|sub| !noun_exists(&ir.cells, sub))
-            .chain(ir.fact_types.values()
-                .flat_map(|ft| ft.roles.iter().map(|r| r.noun_name.clone()))
+            .chain(role_noun_names.into_iter()
                 .filter(|n| !noun_exists(&ir.cells, n)))
             .collect::<alloc::collections::BTreeSet<_>>()
             .into_iter()
@@ -2783,6 +2762,105 @@ fn enrich_noun_cells(ir: &mut ParseCtx) {
     ir.cells.insert("Noun".to_string(), enriched);
 }
 
+/// #283 — Every fact-type id in the `FactType` cell. Replaces
+/// `ir.fact_types.keys()`.
+fn fact_type_ids(
+    cells: &HashMap<String, Vec<crate::ast::Object>>,
+) -> Vec<String> {
+    cells.get("FactType")
+        .map(|facts| facts.iter()
+            .filter_map(|f| crate::ast::binding(f, "id").map(String::from))
+            .collect())
+        .unwrap_or_default()
+}
+
+/// #283 — Whether a fact-type id is declared in the `FactType` cell.
+/// Replaces `ir.fact_types.contains_key(id)`.
+fn fact_type_exists(
+    cells: &HashMap<String, Vec<crate::ast::Object>>,
+    id: &str,
+) -> bool {
+    cells.get("FactType")
+        .map(|facts| facts.iter()
+            .any(|f| crate::ast::binding(f, "id") == Some(id)))
+        .unwrap_or(false)
+}
+
+/// #283 — Reading text for a fact-type via the `FactType` cell.
+fn fact_type_reading(
+    cells: &HashMap<String, Vec<crate::ast::Object>>,
+    id: &str,
+) -> Option<String> {
+    cells.get("FactType")?
+        .iter()
+        .find(|f| crate::ast::binding(f, "id") == Some(id))
+        .and_then(|f| crate::ast::binding(f, "reading").map(String::from))
+}
+
+/// #283 — Roles for a fact-type via the `Role` cell. Replaces
+/// `ir.fact_types[id].roles`. Roles are returned in `position` order.
+fn fact_type_roles(
+    cells: &HashMap<String, Vec<crate::ast::Object>>,
+    id: &str,
+) -> Vec<crate::types::RoleDef> {
+    let Some(facts) = cells.get("Role") else { return Vec::new() };
+    let mut roles: Vec<crate::types::RoleDef> = facts.iter()
+        .filter(|f| crate::ast::binding(f, "factType") == Some(id))
+        .filter_map(|f| {
+            let noun_name = crate::ast::binding(f, "nounName")?.to_string();
+            let position = crate::ast::binding(f, "position")?.parse::<usize>().ok()?;
+            Some(crate::types::RoleDef { noun_name, role_index: position })
+        })
+        .collect();
+    roles.sort_by_key(|r| r.role_index);
+    roles
+}
+
+/// #283 — Rebuild `HashMap<String, FactTypeDef>` from the `FactType` +
+/// `Role` cells. Used at API boundaries that still take a typed map
+/// (e.g. `resolve_derivation_rule`, `resolve_instance_field`). Each
+/// call is O(N) over fact-type + role count, which is cheap compared
+/// with the resolution it seeds. `readings` and `schema_id` are
+/// minimally reconstructed — downstream consumers that care only
+/// about the `reading` string and `roles` vec keep working.
+fn fact_types_from_cells(
+    cells: &HashMap<String, Vec<crate::ast::Object>>,
+) -> HashMap<String, FactTypeDef> {
+    let Some(ft_facts) = cells.get("FactType") else { return HashMap::new() };
+    ft_facts.iter().filter_map(|f| {
+        let id = crate::ast::binding(f, "id")?.to_string();
+        let reading = crate::ast::binding(f, "reading").unwrap_or("").to_string();
+        let roles = fact_type_roles(cells, &id);
+        Some((id.clone(), FactTypeDef {
+            schema_id: id,
+            reading,
+            readings: Vec::new(),
+            roles,
+        }))
+    }).collect()
+}
+
+/// #283 — Upsert a fact-type on the `FactType` + `Role` cells.
+/// Preserves the `or_insert` semantics of the previous
+/// `ir.fact_types.entry(id).or_insert(def)`: first declaration wins.
+fn upsert_fact_type(ir: &mut ParseCtx, id: &str, def: &FactTypeDef) {
+    if fact_type_exists(&ir.cells, id) {
+        return;
+    }
+    push_cell(ir, "FactType", crate::ast::fact_from_pairs(&[
+        ("id", id),
+        ("reading", def.reading.as_str()),
+        ("arity", &def.roles.len().to_string()),
+    ]));
+    for role in &def.roles {
+        push_cell(ir, "Role", crate::ast::fact_from_pairs(&[
+            ("factType", id),
+            ("nounName", role.noun_name.as_str()),
+            ("position", &role.role_index.to_string()),
+        ]));
+    }
+}
+
 /// Emit a Constraint cell fact with the full constraint JSON (lossless)
 /// plus flat fields for check.rs and no_std fallbacks.
 #[cfg(all(test, feature = "std-deps"))]
@@ -2876,7 +2954,8 @@ fn apply_action(ir: &mut ParseCtx, action: Option<ParseAction>, lines: &[String]
                     "Fact Type", &reading_for_mode,
                     "Derivation Mode", "Derivation Mode", &m);
             });
-            ir.fact_types.entry(id).or_insert(def);
+            // #283 — upsert FactType + Role cells directly.
+            upsert_fact_type(ir, &id, &def);
         }
         ParseAction::AddConstraint(c) => {
             // Emit Constraint cell fact directly. Pass 2b does not revisit
@@ -3139,12 +3218,12 @@ fn resolve_constraint_schema(
             .or_else(|| catalog.resolve(&role_nouns, None))
             .or_else(|| {
                 // Inverse voice fallback: find schema where constraint verb appears in reading
-                // or reading verb appears in constraint text
-                let noun_set: hashbrown::HashSet<&str> = role_nouns.iter().copied().collect();
-                ir.fact_types.iter()
+                // or reading verb appears in constraint text. #283 — cell read.
+                let noun_set: hashbrown::HashSet<String> = role_nouns.iter().map(|s| s.to_string()).collect();
+                fact_types_from_cells(&ir.cells).into_iter()
                     .filter(|(_, ft)| {
-                        let ft_nouns: hashbrown::HashSet<&str> = ft.roles.iter()
-                            .map(|r| r.noun_name.as_str()).collect();
+                        let ft_nouns: hashbrown::HashSet<String> = ft.roles.iter()
+                            .map(|r| r.noun_name.clone()).collect();
                         ft_nouns == noun_set
                     })
                     .find(|(_, ft)| {
@@ -3161,7 +3240,7 @@ fn resolve_constraint_schema(
                                     .any(|rw| rw.len() >= 3 && shared_prefix(w, rw) >= 3))
                         })
                     })
-                    .map(|(id, _)| id.clone())
+                    .map(|(id, _)| id)
             })
     }).flatten();
 
@@ -3173,12 +3252,12 @@ fn resolve_constraint_schema(
         // constrains A's role (the first noun after the prefix).
         // Per Halpin TechReport ORM2-02: the constrained role is the one
         // under the quantifier.
-        let resolved_ft = ir.fact_types.get(&schema_id);
-        let first_noun_idx = resolved_ft
-            .and_then(|ft| {
-                let first_noun = &found[0].2;
-                ft.roles.iter().position(|r| &r.noun_name == first_noun)
-            });
+        // #283 — Role cell read.
+        let resolved_ft_roles = fact_type_roles(&ir.cells, &schema_id);
+        let first_noun_idx = (!resolved_ft_roles.is_empty()).then(|| {
+            let first_noun = &found[0].2;
+            resolved_ft_roles.iter().position(|r| &r.noun_name == first_noun)
+        }).flatten();
         constraint.spans.iter_mut().for_each(|span| {
             span.fact_type_id = schema_id.clone();
             // Set role_index to the first noun's position in the fact type.
@@ -3441,7 +3520,7 @@ fn parse_general_instance_fact(ir: &mut ParseCtx, line: &str) {
             // Resolve field name from declared fact types.
             // The instance fact "A 'x' predicate B 'y'" should match the
             // declared fact type "A predicate B" and use its fact type ID.
-            let field = resolve_instance_field(&ir.fact_types, &subject_noun, &predicate, &object_noun);
+            let field = resolve_instance_field(&fact_types_from_cells(&ir.cells), &subject_noun, &predicate, &object_noun);
             Some(GeneralInstanceFact {
                 subject_noun,
                 subject_value,
@@ -3618,7 +3697,8 @@ mod tests {
     fn fact_types() {
         let input = "Customer(.Name) is an entity type.\nOrder(.OrderId) is an entity type.\nOrder was placed by Customer.";
         let ir = parse_markdown(input).unwrap();
-        assert!(!ir.fact_types.is_empty());
+        // #283 — FactType cell read.
+        assert!(!super::fact_type_ids(&ir.cells).is_empty());
     }
 
     #[test]
@@ -4147,9 +4227,9 @@ mod tests {
             ## Constraints\n\
             Each Organization is owned by at most one User.\n";
         let ir = parse_markdown(input).unwrap();
-        // Fact type keyed by Fact Type ID
-        assert!(ir.fact_types.contains_key("User_owns_Organization"));
-        assert!(!ir.fact_types.contains_key("User owns Organization"));
+        // #283 — FactType cell reads. Fact type keyed by Fact Type ID.
+        assert!(super::fact_type_exists(&ir.cells, "User_owns_Organization"));
+        assert!(!super::fact_type_exists(&ir.cells, "User owns Organization"));
         // The constraint's spans should reference the same schema ID
         assert!(!ir.constraints.is_empty());
         let c = &ir.constraints[0];
@@ -4170,9 +4250,9 @@ mod tests {
             Each Organization is owned by at most one User.\n\
             Each Organization is administered by at most one User.\n";
         let ir = parse_markdown(input).unwrap();
-        // Both fact types present
-        assert!(ir.fact_types.contains_key("User_owns_Organization"));
-        assert!(ir.fact_types.contains_key("User_administers_Organization"));
+        // #283 — FactType cell reads.
+        assert!(super::fact_type_exists(&ir.cells, "User_owns_Organization"));
+        assert!(super::fact_type_exists(&ir.cells, "User_administers_Organization"));
         // "is owned by" constraint should resolve to "User_owns_Organization"
         // via word overlap: "owned" matches "owns"
         let owned_constraint = ir.constraints.iter()
@@ -4355,11 +4435,11 @@ Auth Session uses Session Strategy.
   Each Auth Session uses exactly one Session Strategy.
 ";
         let ir = parse_markdown(input).unwrap();
-        // All keys should be underscore format, not reading format
-        assert!(ir.fact_types.keys().all(|key| !key.contains(' ')),
+        // #283 — FactType cell reads. Keys should be underscore format, not reading format.
+        assert!(super::fact_type_ids(&ir.cells).iter().all(|key| !key.contains(' ')),
             "Fact type keys should not contain spaces");
-        assert!(ir.fact_types.contains_key("Auth_Session_is_for_Customer"));
-        assert!(ir.fact_types.contains_key("Auth_Session_uses_Session_Strategy"));
+        assert!(super::fact_type_exists(&ir.cells, "Auth_Session_is_for_Customer"));
+        assert!(super::fact_type_exists(&ir.cells, "Auth_Session_uses_Session_Strategy"));
         // Constraints should reference schema IDs
         assert!(
             ir.constraints.iter().flat_map(|c| c.spans.iter())
@@ -5032,8 +5112,12 @@ Customer has Last Name.
 Customer has Full Name *.
 ";
         let domain = parse_markdown(input).expect("parse");
+        // #283 — FactType cell read.
+        let ft_readings: Vec<String> = super::fact_type_ids(&domain.cells).iter()
+            .filter_map(|id| super::fact_type_reading(&domain.cells, id))
+            .collect();
         assert!(
-            domain.fact_types.values().any(|ft| ft.reading == "Customer has Full Name"),
+            ft_readings.iter().any(|r| r == "Customer has Full Name"),
             "'Customer has Full Name' fact type must be present"
         );
 
@@ -5055,14 +5139,15 @@ Customer has Full Name *.
         let domain = parse_markdown(core_md)
             .expect("metamodel readings/core.md must parse");
 
-        let ft_exists = domain.fact_types.values().any(|ft| {
-            ft.reading == "Fact Type has Derivation Mode"
-        });
+        // #283 — FactType cell reads.
+        let ft_readings: Vec<String> = super::fact_type_ids(&domain.cells).iter()
+            .filter_map(|id| super::fact_type_reading(&domain.cells, id))
+            .collect();
+        let ft_exists = ft_readings.iter().any(|r| r == "Fact Type has Derivation Mode");
         assert!(ft_exists,
             "core.md must declare 'Fact Type has Derivation Mode.' so the parser \
              can emit a Fact Type's derivation modality when the */**/+ marker \
-             is applied. Got fact type readings: {:?}",
-            domain.fact_types.values().map(|ft| ft.reading.as_str()).collect::<Vec<_>>());
+             is applied. Got fact type readings: {:?}", ft_readings);
     }
 
     #[test]
