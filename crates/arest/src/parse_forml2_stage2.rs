@@ -274,6 +274,23 @@ fn statement_text(state: &Object, stmt_id: &str) -> Option<String> {
 /// active`) currently emit with empty objectNoun/objectValue.
 #[cfg(feature = "std-deps")]
 pub fn translate_instance_facts(classified_state: &Object) -> Vec<Object> {
+    translate_instance_facts_with_ft_ids(classified_state, &[])
+}
+
+/// Variant that can resolve `fieldName` to a canonical FT id when the
+/// (subject, verb, object) triple matches a declared Fact Type. The
+/// caller supplies the already-translated FactType ids; when the
+/// constructed canonical id is among them, it wins; otherwise fall
+/// back to the raw verb token. Legacy exhibits the same behavior —
+/// `Constraint Type 'AC' has Name 'Acyclic'` resolves to
+/// `Constraint_Type_has_Name` because the FT is declared, but
+/// `HTTP Method 'DELETE' has Name 'DELETE'` stays on `has` because no
+/// `HTTP Method has Name` FT is declared.
+#[cfg(feature = "std-deps")]
+pub fn translate_instance_facts_with_ft_ids(
+    classified_state: &Object,
+    declared_ft_ids: &[String],
+) -> Vec<Object> {
     let statement_ids = collect_statement_ids(classified_state);
     let mut out: Vec<Object> = Vec::new();
     for stmt_id in &statement_ids {
@@ -289,10 +306,26 @@ pub fn translate_instance_facts(classified_state: &Object) -> Vec<Object> {
         let (object_noun, object_value) = roles.get(1)
             .map(|(n, lit)| (n.as_str(), lit.as_deref().unwrap_or("")))
             .unwrap_or(("", ""));
+
+        let canonical = if object_noun.is_empty() {
+            alloc::format!("{}_{}",
+                subject_noun.replace(' ', "_"),
+                verb.to_lowercase().replace(' ', "_"))
+        } else {
+            alloc::format!("{}_{}_{}",
+                subject_noun.replace(' ', "_"),
+                verb.to_lowercase().replace(' ', "_"),
+                object_noun.replace(' ', "_"))
+        };
+        let field_name: String = if declared_ft_ids.iter().any(|id| *id == canonical) {
+            canonical
+        } else {
+            verb.clone()
+        };
         out.push(fact_from_pairs(&[
             ("subjectNoun",  subject_noun.as_str()),
             ("subjectValue", subject_value),
-            ("fieldName",    verb.as_str()),
+            ("fieldName",    field_name.as_str()),
             ("objectNoun",   object_noun),
             ("objectValue",  object_value),
         ]));
@@ -779,7 +812,14 @@ pub fn parse_to_state_via_stage12(text: &str) -> Result<Object, String> {
     constraint_facts.extend(translate_value_constraints(&classified));
     constraint_facts.extend(translate_deontic_constraints(&classified));
     let derivation_facts = translate_derivation_rules(&classified);
-    let instance_fact_facts = translate_instance_facts(&classified);
+    // Instance-fact fieldName resolution consults the FactType ids
+    // translated above — when the canonical `subject_verb_object` id
+    // is declared, use it; otherwise fall back to the raw verb.
+    let declared_ft_ids: Vec<String> = ft_facts.iter()
+        .filter_map(|f| binding(f, "id").map(String::from))
+        .collect();
+    let instance_fact_facts =
+        translate_instance_facts_with_ft_ids(&classified, &declared_ft_ids);
     let enum_values_facts = translate_enum_values(&classified);
 
     let mut map: HashMap<String, Object> = HashMap::new();
@@ -1076,9 +1116,27 @@ mod tests {
         let f = &facts[0];
         assert_eq!(binding(f, "subjectNoun"),  Some("Customer"));
         assert_eq!(binding(f, "subjectValue"), Some("alice"));
+        // translate_instance_facts (no FT context) falls back to the
+        // raw verb — the pipeline passes declared FT ids via
+        // translate_instance_facts_with_ft_ids to resolve canonically.
         assert_eq!(binding(f, "fieldName"),    Some("places"));
         assert_eq!(binding(f, "objectNoun"),   Some("Order"));
         assert_eq!(binding(f, "objectValue"),  Some("o-7"));
+    }
+
+    #[test]
+    fn translate_instance_facts_with_ft_ids_resolves_canonical() {
+        // When the canonical `subject_verb_object` FT id is declared,
+        // the fieldName resolves to it. Same statement, with FT list.
+        let stmt = stage1_state(
+            "s1", "Customer 'alice' places Order 'o-7'.",
+            &["Customer", "Order"]);
+        let classified = classify_statements(&stmt, &grammar_state());
+        let facts = super::translate_instance_facts_with_ft_ids(
+            &classified, &["Customer_places_Order".to_string()]);
+        assert_eq!(facts.len(), 1);
+        assert_eq!(binding(&facts[0], "fieldName"),
+            Some("Customer_places_Order"));
     }
 
     #[test]
