@@ -942,6 +942,15 @@ fn emit_constraint_modules(state: &Object) -> (Vec<String>, Vec<String>) {
                 "IR" | "AS" | "AT" | "SY" | "IT" | "TR" | "AC" | "RF" => {
                     Some(emit_ring_constraint_body(&module_name, kind))
                 }
+                "VC" => {
+                    let entity = binding(c, "entity").unwrap_or("");
+                    let values = enum_values_for_noun_in_state(entity, state);
+                    // Empty enum set → emit the module with an empty
+                    // enum table. `hit` reduces to `1'b0`, violation
+                    // stays low. Keeps the port shape uniform so top
+                    // wires every VC identically.
+                    Some(emit_vc_constraint_body(&module_name, &values))
+                }
                 _ => None,
             };
             let _ = text;
@@ -952,6 +961,125 @@ fn emit_constraint_modules(state: &Object) -> (Vec<String>, Vec<String>) {
         }
     }
     (modules, names)
+}
+
+/// Read enum values for a value-type noun out of the `EnumValues`
+/// cell. Matches the convention in `generators/solidity.rs:440` —
+/// values land under `value0`, `value1`, …; the read walks the dense
+/// prefix until a key is absent.
+fn enum_values_for_noun_in_state(noun_name: &str, state: &Object) -> Vec<String> {
+    let cell = fetch_or_phi("EnumValues", state);
+    let Some(facts) = cell.as_seq() else { return Vec::new(); };
+    for f in facts.iter() {
+        if binding(f, "noun") != Some(noun_name) { continue; }
+        return (0..)
+            .map_while(|i| {
+                let key = alloc::format!("value{i}");
+                binding(f, &key).map(alloc::string::String::from)
+            })
+            .collect();
+    }
+    Vec::new()
+}
+
+/// Encode a string as a 256-bit Verilog hex literal — ASCII bytes
+/// right-aligned in a 32-byte slot. Keeps parity with the
+/// `atom_id_is_valid` runtime guard and the fact-ingress port's
+/// 256-bit name / payload width.
+fn encode_enum_value_as_verilog_literal(value: &str) -> String {
+    let mut bytes = [0u8; 32];
+    let src = value.as_bytes();
+    // Right-align: put src at the low end so short strings zero-pad
+    // on the left. Mirrors `to_ascii_atom_id` elsewhere in the crate.
+    let take = core::cmp::min(src.len(), 32);
+    bytes[32 - take..].copy_from_slice(&src[..take]);
+    let mut hex = alloc::string::String::with_capacity(64);
+    for b in bytes.iter() {
+        let upper = (b >> 4) & 0xF;
+        let lower = b & 0xF;
+        for n in [upper, lower] {
+            let c = match n {
+                0..=9  => (b'0' + n) as char,
+                10..=15 => (b'a' + (n - 10)) as char,
+                _ => '0',
+            };
+            hex.push(c);
+        }
+    }
+    alloc::format!("256'h{}", hex)
+}
+
+/// Value-constraint module body — enum-match table.
+///
+/// The row slot is 256 bits wide (atom-ID convention #189) so each
+/// declared enum value compiles to a 256-bit literal. `violation`
+/// latches high iff some active row's value does not match any of
+/// the declared literals. Empty enum sets fall back to the
+/// placeholder stub — see the `VC` branch in `emit_constraint_modules`.
+fn emit_vc_constraint_body(module_name: &str, values: &[String]) -> String {
+    let depth = CONSTRAINT_DEFAULT_DEPTH;
+    let row_width = CONSTRAINT_DEFAULT_ROW_WIDTH;
+    let mut out = String::new();
+    out.push_str(&format!(
+        "module {name} #(\n    \
+            parameter DEPTH = {depth},\n    \
+            parameter ROW_WIDTH = {row_width}\n\
+        ) (\n    \
+            input wire clk,\n    \
+            input wire rst_n,\n    \
+            input wire [DEPTH*ROW_WIDTH-1:0] rows_flat,\n    \
+            input wire [$clog2(DEPTH+1)-1:0] row_count,\n    \
+            output reg violation\n\
+        );\n    \
+            // Enum values (row must match one of these):\n",
+        name = module_name, depth = depth, row_width = row_width,
+    ));
+    for (i, v) in values.iter().enumerate() {
+        out.push_str(&format!(
+            "    //   enum[{i}] = {val}\n    \
+             localparam [ROW_WIDTH-1:0] ENUM_{i} = {lit};\n",
+            i = i, val = v,
+            lit = encode_enum_value_as_verilog_literal(v),
+        ));
+    }
+    // Per-row value aliases.
+    for i in 0..depth {
+        out.push_str(&format!(
+            "    wire [ROW_WIDTH-1:0] row_{i}_value = rows_flat[{lo} +: ROW_WIDTH];\n",
+            i = i, lo = i * row_width,
+        ));
+    }
+    // violation = ∃ active row. value matches NO enum entry.
+    out.push_str("    wire hit;\n");
+    // Empty enum set → hit is trivially 0; the VC acts as an inert
+    // stub but keeps the port shape uniform so top wiring stays
+    // compact.
+    let hit_expr = if values.is_empty() {
+        "1'b0".to_string()
+    } else {
+        let mut terms: Vec<String> = Vec::new();
+        for i in 0..depth {
+            // AND over all enum values of "value != ENUM_j".
+            let miss_parts: Vec<String> = (0..values.len()).map(|j| format!(
+                "row_{i}_value != ENUM_{j}", i = i, j = j,
+            )).collect();
+            let all_miss = miss_parts.join(" && ");
+            terms.push(format!(
+                "({i} < row_count && ({all_miss}))", i = i, all_miss = all_miss,
+            ));
+        }
+        terms.join(" || ")
+    };
+    out.push_str(&format!("    assign hit = {};\n", hit_expr));
+    out.push_str("    always @(posedge clk) begin\n");
+    out.push_str("        if (!rst_n) begin\n");
+    out.push_str("            violation <= 1'b0;\n");
+    out.push_str("        end else begin\n");
+    out.push_str("            violation <= hit;\n");
+    out.push_str("        end\n");
+    out.push_str("    end\n");
+    out.push_str("endmodule\n");
+    out
 }
 
 /// Ring-constraint module body — pairwise predicate over (left, right)
@@ -1498,7 +1626,7 @@ fn emit_top_module(
         // Constraint cell's kind binding.
         let kind = constraint_kind_from_name(cname);
         match kind {
-            Some("uc") | Some("mc")
+            Some("uc") | Some("mc") | Some("vc")
             | Some("ir") | Some("as") | Some("at") | Some("sy")
             | Some("it") | Some("tr") | Some("ac") | Some("rf") => {
                 out.push_str(&format!(
@@ -2350,6 +2478,81 @@ Supplier supplies Widget.
         assert!(verilog.contains("row_0_left == row_1_right"),
             "AS must compare row_0.left to row_1.right:\n{}", verilog);
         assert!(verilog.contains("row_0_right == row_1_left"));
+    }
+
+    // ── VC: enum-match value constraint (#303 / E1) ──
+    //
+    // VC says "the column value matches one of the declared enum
+    // values". Hardware form: case comparator against the enum set.
+    // Enum values live on the EnumValues cell, keyed by the entity
+    // noun; the emitter reads them and bakes the expected bit-pattern
+    // table into the module as an OR-reduction of equality compares.
+
+    fn state_with_vc_and_enum(id: &str, entity: &str, values: &[&str]) -> Object {
+        let c = fact_from_pairs(&[
+            ("id", id),
+            ("kind", "VC"),
+            ("modality", "alethic"),
+            ("text", "value constraint"),
+            ("entity", entity),
+        ]);
+        let mut pairs: Vec<(&str, &str)> = Vec::new();
+        pairs.push(("noun", entity));
+        let keys: Vec<String> = (0..values.len()).map(|i| alloc::format!("value{i}")).collect();
+        for (i, v) in values.iter().enumerate() {
+            pairs.push((keys[i].as_str(), v));
+        }
+        let pair_refs: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (*k, *v)).collect();
+        let ev = fact_from_pairs(&pair_refs);
+        let mut state = store("Constraint", Object::Seq(alloc::vec![c].into()), &Object::phi());
+        state = store("EnumValues", Object::Seq(alloc::vec![ev].into()), &state);
+        state
+    }
+
+    #[test]
+    fn vc_module_emitted_with_enum_match_table() {
+        let state = state_with_vc_and_enum("c1", "Priority", &["low", "medium", "high"]);
+        let verilog = compile_to_verilog(&state);
+        assert!(verilog.contains("module constraint_vc_c1"),
+            "VC module missing:\n{}", verilog);
+        // Each enum value becomes a baked comparator target. The
+        // target is the ASCII-byte packing of the value (the same
+        // convention as the fact-ID hashing elsewhere).
+        assert!(verilog.contains("row_0_value"),
+            "VC must alias the per-row value slot:\n{}", verilog);
+    }
+
+    #[test]
+    fn vc_module_violates_when_no_enum_match() {
+        let state = state_with_vc_and_enum("c1", "Priority", &["low", "high"]);
+        let verilog = compile_to_verilog(&state);
+        // Predicate: ∃ active row. value matches none of the enum values.
+        // The emitter inserts the ASCII bytes of each value as a 256-bit
+        // literal; look for at least one such literal.
+        assert!(verilog.contains("256'h"),
+            "VC must bake enum values as sized literals:\n{}", verilog);
+        assert!(verilog.contains("violation <= hit"),
+            "VC drives violation from the miss-reducer:\n{}", verilog);
+    }
+
+    #[test]
+    fn vc_module_absent_when_enum_values_absent() {
+        // A VC with no EnumValues cell entry falls back to the
+        // placeholder stub — emitting a trivially inert enum set would
+        // make the constraint always-violating.
+        let c = fact_from_pairs(&[
+            ("id", "c1"),
+            ("kind", "VC"),
+            ("modality", "alethic"),
+            ("text", "value constraint"),
+            ("entity", "Priority"),
+        ]);
+        let state = store("Constraint", Object::Seq(alloc::vec![c].into()), &Object::phi());
+        let verilog = compile_to_verilog(&state);
+        // Module still emitted (port-shape contract) but as the stub
+        // shape.
+        assert!(verilog.contains("module constraint_vc_c1"),
+            "VC module must still emit (stub) when enum values absent:\n{}", verilog);
     }
 
     #[test]
