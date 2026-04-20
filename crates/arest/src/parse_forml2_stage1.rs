@@ -139,13 +139,45 @@ pub fn tokenize_statement(statement_id: &str, text: &str, nouns: &[String]) -> C
     // keywords so the grammar's `Statement has Keyword 'iff'` recognizers
     // can fire without requiring the keyword to land in the Verb slot
     // (which only captures text between roles 0 and 1).
-    for kw in KEYWORDS {
-        let needle = alloc::format!(" {} ", kw);
-        if body.contains(needle.as_str()) {
-            push(&mut cells, "Statement_has_Keyword", fact_from_pairs(&[
-                ("Statement", statement_id), ("Keyword", kw),
+    //
+    // Exclude sentences that carry one of the multi-clause constraint
+    // keywords below — `if and only if` would otherwise also emit the
+    // shorter `if` keyword and spuriously classify the statement as a
+    // Derivation Rule.
+    let is_constraint_body = CONSTRAINT_KEYWORDS.iter().any(|k| body.contains(*k));
+    if !is_constraint_body {
+        for kw in KEYWORDS {
+            let needle = alloc::format!(" {} ", kw);
+            if body.contains(needle.as_str()) {
+                push(&mut cells, "Statement_has_Keyword", fact_from_pairs(&[
+                    ("Statement", statement_id), ("Keyword", kw),
+                ]));
+            }
+        }
+    }
+    // Multi-clause constraint keyword markers. Each is a phrase that
+    // signals a specific constraint kind:
+    //   'if and only if'                         → Equality Constraint
+    //   'at most one of the following holds'     → Exclusion Constraint
+    //   'exactly one of the following holds'     → Exclusive-Or Constraint
+    //   'at least one of the following holds'    → Or Constraint
+    for kw in CONSTRAINT_KEYWORDS {
+        if body.contains(*kw) {
+            push(&mut cells, "Statement_has_Constraint_Keyword", fact_from_pairs(&[
+                ("Statement", statement_id), ("Constraint_Keyword", kw),
             ]));
         }
+    }
+    // Subset Constraint (ORM 2): conditional frame with existential
+    // `some` in the antecedent and anaphoric `that` in the consequent.
+    //   `If some <X> <verb> some <Y> then that <X> ...`
+    // We key the grammar's recognizer on a synthetic `if some then
+    // that` token so the rule stays a simple literal-keyword match.
+    if body.starts_with("If some ") && body.contains(" then that ") {
+        push(&mut cells, "Statement_has_Constraint_Keyword", fact_from_pairs(&[
+            ("Statement", statement_id),
+            ("Constraint_Keyword", "if some then that"),
+        ]));
     }
     // Enum values list — one token fact per value.
     if let Some(values) = enum_values.as_ref() {
@@ -198,6 +230,16 @@ fn strip_derivation_marker(text: &str) -> (&str, Option<String>) {
 }
 
 const KEYWORDS: &[&str] = &["iff", "if", "when"];
+
+/// Multi-clause constraint keywords (Halpin FORML / ORM 2). Each
+/// phrase uniquely signals one constraint kind per the grammar's
+/// recognizer rules.
+const CONSTRAINT_KEYWORDS: &[&str] = &[
+    "if and only if",
+    "at most one of the following holds",
+    "exactly one of the following holds",
+    "at least one of the following holds",
+];
 
 const QUANTIFIERS: &[&str] = &[
     "at most one ",
@@ -537,6 +579,94 @@ mod tests {
                    Some("Support Request"));
         assert_eq!(stmt_binding(&c, "Statement_has_Verb", "Verb").as_deref(),
                    Some("is a subtype of"));
+    }
+
+    #[test]
+    fn equality_constraint_emits_if_and_only_if_keyword() {
+        // EQ shape: `<clause A> if and only if <clause B>`.
+        // Stage-1 captures the keyword phrase as its own token so
+        // the grammar's Equality Constraint recognizer can fire
+        // without colliding with the Derivation Rule's ` if `
+        // match.
+        let c = tokenize_statement(
+            "s1",
+            "Each Employee is paid if and only if Employee has Salary.",
+            &nouns(&["Employee", "Salary"]),
+        );
+        let ks: Vec<String> = c.get("Statement_has_Constraint_Keyword")
+            .map(|facts| facts.iter()
+                .filter_map(|f| binding(f, "Constraint_Keyword").map(String::from))
+                .collect())
+            .unwrap_or_default();
+        assert!(ks.iter().any(|k| k == "if and only if"),
+            "expected 'if and only if' constraint-keyword token; got {:?}", ks);
+    }
+
+    #[test]
+    fn exclusion_constraint_emits_at_most_one_of_the_following_holds() {
+        let c = tokenize_statement(
+            "s1",
+            "For each Account at most one of the following holds: Account is open; Account is closed.",
+            &nouns(&["Account"]),
+        );
+        let ks: Vec<String> = c.get("Statement_has_Constraint_Keyword")
+            .map(|facts| facts.iter()
+                .filter_map(|f| binding(f, "Constraint_Keyword").map(String::from))
+                .collect())
+            .unwrap_or_default();
+        assert!(ks.iter().any(|k| k == "at most one of the following holds"),
+            "expected 'at most one of the following holds'; got {:?}", ks);
+    }
+
+    #[test]
+    fn exclusive_or_constraint_emits_exactly_one_keyword() {
+        let c = tokenize_statement(
+            "s1",
+            "For each Order exactly one of the following holds: Order is draft; Order is placed.",
+            &nouns(&["Order"]),
+        );
+        let ks: Vec<String> = c.get("Statement_has_Constraint_Keyword")
+            .map(|facts| facts.iter()
+                .filter_map(|f| binding(f, "Constraint_Keyword").map(String::from))
+                .collect())
+            .unwrap_or_default();
+        assert!(ks.iter().any(|k| k == "exactly one of the following holds"),
+            "expected 'exactly one of the following holds'; got {:?}", ks);
+    }
+
+    #[test]
+    fn subset_constraint_emits_if_some_then_that_keyword() {
+        // Subset Constraint shape (ORM 2): `If some <X> <verb> some
+        // <Y> then that <X> ...` — existential `some` in the
+        // antecedent + anaphoric `that` in the consequent.
+        let c = tokenize_statement(
+            "s1",
+            "If some User owns some Organization then that User has some Email.",
+            &nouns(&["User", "Organization", "Email"]),
+        );
+        let ks: Vec<String> = c.get("Statement_has_Constraint_Keyword")
+            .map(|facts| facts.iter()
+                .filter_map(|f| binding(f, "Constraint_Keyword").map(String::from))
+                .collect())
+            .unwrap_or_default();
+        assert!(ks.iter().any(|k| k == "if some then that"),
+            "expected 'if some then that' constraint-keyword; got {:?}", ks);
+    }
+
+    #[test]
+    fn or_constraint_emits_at_least_one_keyword() {
+        let c = tokenize_statement(
+            "s1",
+            "For each User at least one of the following holds: User has Email; User has Phone.",
+            &nouns(&["User", "Email", "Phone"]),
+        );
+        let ks: Vec<String> = c.get("Statement_has_Constraint_Keyword")
+            .map(|facts| facts.iter()
+                .filter_map(|f| binding(f, "Constraint_Keyword").map(String::from))
+                .collect())
+            .unwrap_or_default();
+        assert!(ks.iter().any(|k| k == "at least one of the following holds"),
+            "expected 'at least one of the following holds'; got {:?}", ks);
     }
 
     #[test]

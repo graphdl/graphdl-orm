@@ -37,6 +37,8 @@ Deontic Operator is a value type.
   The possible values of Deontic Operator are 'obligatory', 'forbidden', 'permitted'.
 Literal Role is a value type.
 Enum Value is a value type.
+Constraint Keyword is a value type.
+  The possible values of Constraint Keyword are 'if and only if', 'at most one of the following holds', 'exactly one of the following holds', 'at least one of the following holds', 'if some then that'.
 
 ## Fact Types
 
@@ -50,6 +52,7 @@ Statement has Literal Role.
 Statement has Keyword.
 Statement has Deontic Operator.
 Statement has Enum Value.
+Statement has Constraint Keyword.
 Statement has Classification.
 
 Statement has Role Reference.
@@ -76,6 +79,8 @@ Classification 'Value Constraint' is a Classification.
 Classification 'Subset Constraint' is a Classification.
 Classification 'Equality Constraint' is a Classification.
 Classification 'Exclusion Constraint' is a Classification.
+Classification 'Exclusive-Or Constraint' is a Classification.
+Classification 'Or Constraint' is a Classification.
 Classification 'Ring Constraint' is a Classification.
 Classification 'Deontic Constraint' is a Classification.
 
@@ -119,6 +124,15 @@ Statement has Classification 'Ring Constraint' iff Statement has Trailing Marker
 Statement has Classification 'Ring Constraint' iff Statement has Trailing Marker 'is reflexive'.
 
 Statement has Classification 'Exclusion Constraint' iff Statement has Trailing Marker 'are mutually exclusive'.
+Statement has Classification 'Exclusion Constraint' iff Statement has Constraint Keyword 'at most one of the following holds'.
+
+Statement has Classification 'Exclusive-Or Constraint' iff Statement has Constraint Keyword 'exactly one of the following holds'.
+
+Statement has Classification 'Or Constraint' iff Statement has Constraint Keyword 'at least one of the following holds'.
+
+Statement has Classification 'Equality Constraint' iff Statement has Constraint Keyword 'if and only if'.
+
+Statement has Classification 'Subset Constraint' iff Statement has Constraint Keyword 'if some then that'.
 
 Statement has Classification 'Value Constraint' iff Statement has Classification 'Enum Values Declaration'.
 
