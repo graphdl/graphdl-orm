@@ -954,7 +954,7 @@ fn try_derivation(line: &str) -> Option<ParseAction> {
             id: String::new(), text: clean.into(),
             antecedent_fact_type_ids: vec![], consequent_fact_type_id: String::new(),
             kind: DerivationKind::ModusPonens,
-            join_on: vec![], match_on: vec![], consequent_bindings: vec![], antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![], unresolved_clauses: vec![],
+            join_on: vec![], match_on: vec![], consequent_bindings: vec![], antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![], unresolved_clauses: vec![], antecedent_role_literals: vec![], consequent_role_literals: vec![],
         })
     })
 }

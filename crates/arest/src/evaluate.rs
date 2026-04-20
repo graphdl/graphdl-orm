@@ -2114,7 +2114,7 @@ mod tests {
             match_on: vec![],
             consequent_bindings: vec![],
             antecedent_filters: filter.into_iter().collect(),
-            consequent_computed_bindings: vec![], consequent_aggregates: vec![], unresolved_clauses: vec![],
+            consequent_computed_bindings: vec![], consequent_aggregates: vec![], unresolved_clauses: vec![], antecedent_role_literals: vec![], consequent_role_literals: vec![],
         };
         let mut cells = empty_cells();
         cells = with_ft(cells, "city_has_population", &ft1);
@@ -2276,7 +2276,7 @@ mod tests {
             consequent_computed_bindings: vec![crate::types::ConsequentComputedBinding {
                 role: derived_role.to_string(), expr,
             }],
-            consequent_aggregates: vec![], unresolved_clauses: vec![],
+            consequent_aggregates: vec![], unresolved_clauses: vec![], antecedent_role_literals: vec![], consequent_role_literals: vec![],
         };
         let mut cells = empty_cells();
         cells = with_ft(cells, "foo_has_val", &ft1);
@@ -2416,7 +2416,7 @@ mod tests {
                 source_fact_type_id: "thing_has_part".to_string(),
                 group_key_role: "Thing".to_string(),
             }],
-            unresolved_clauses: vec![],
+            unresolved_clauses: vec![], antecedent_role_literals: vec![], consequent_role_literals: vec![],
         };
         let mut cells = empty_cells();
         cells = with_ft(cells, "thing_has_part", &ft1);
@@ -2497,7 +2497,7 @@ mod tests {
                 source_fact_type_id: "order_has_line_amount".to_string(),
                 group_key_role: "Order".to_string(),
             }],
-            unresolved_clauses: vec![],
+            unresolved_clauses: vec![], antecedent_role_literals: vec![], consequent_role_literals: vec![],
         };
         let mut cells = empty_cells();
         cells = with_ft(cells, "order_has_line_amount", &ft1);
@@ -2567,7 +2567,7 @@ mod tests {
                 source_fact_type_id: "order_has_line_amount".to_string(),
                 group_key_role: "Order".to_string(),
             }],
-            unresolved_clauses: vec![],
+            unresolved_clauses: vec![], antecedent_role_literals: vec![], consequent_role_literals: vec![],
         };
         let mut cells = empty_cells();
         cells = with_ft(cells, "order_has_line_amount", &ft1);
@@ -2701,7 +2701,7 @@ mod tests {
             join_on: vec!["Key".to_string()],
             match_on: vec![],
             consequent_bindings: vec!["A".to_string(), "B".to_string()],
-            antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![], unresolved_clauses: vec![],
+            antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![], unresolved_clauses: vec![], antecedent_role_literals: vec![], consequent_role_literals: vec![],
         });
 
         let (_meta_pop, defs, _def_map) = compile_cells(cells);
@@ -2762,7 +2762,7 @@ mod tests {
             join_on: vec!["Key".to_string(), "X".to_string()],
             match_on: vec![],
             consequent_bindings: vec!["Y".to_string(), "X".to_string()],
-            antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![], unresolved_clauses: vec![],
+            antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![], unresolved_clauses: vec![], antecedent_role_literals: vec![], consequent_role_literals: vec![],
         });
 
         let (_meta_pop, defs, _def_map) = compile_cells(cells);
@@ -2814,7 +2814,7 @@ mod tests {
             join_on: vec![],
             match_on: vec![("Full Name".to_string(), "Short Name".to_string())],
             consequent_bindings: vec!["B".to_string(), "A".to_string()],
-            antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![], unresolved_clauses: vec![],
+            antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![], unresolved_clauses: vec![], antecedent_role_literals: vec![], consequent_role_literals: vec![],
         });
 
         let (_meta_pop, defs, _def_map) = compile_cells(cells);
@@ -2866,7 +2866,7 @@ mod tests {
             join_on: vec!["Key".to_string()],
             match_on: vec![],
             consequent_bindings: vec!["A".to_string(), "B".to_string()],
-            antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![], unresolved_clauses: vec![],
+            antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![], unresolved_clauses: vec![], antecedent_role_literals: vec![], consequent_role_literals: vec![],
         });
 
         let (_meta_pop, defs, _def_map) = compile_cells(cells);
@@ -2933,6 +2933,123 @@ mod tests {
         let (_meta_state, defs, def_map) = compile_cells(cells);
         let result = eval_constraints_defs(&defs, &def_map, "Hello, how can I help you today?", None, &empty_state());
         assert!(result.is_empty());
+    }
+
+    // ── Literal-in-consequent derivation (#286) ──────────────────────
+    //
+    // Grammar readings take the shape:
+    //   Statement has Classification 'Entity Type Declaration'
+    //     iff Statement has Trailing Marker 'is an entity type'.
+    // The antecedent role `Trailing Marker` must EQUAL a string literal
+    // (not a numeric comparator), and the consequent role `Classification`
+    // must be BOUND to a string literal (not inherited from antecedent).
+    // Both paths are required to make Stage-2 meta-circular.
+
+    fn stmt_classification_cells(ant_literal: &str, cons_literal: &str) -> S {
+        let ant_ft = FactTypeDef {
+            schema_id: String::new(),
+            reading: "Statement has Trailing Marker".to_string(),
+            readings: vec![],
+            roles: vec![
+                RoleDef { noun_name: "Statement".to_string(), role_index: 0 },
+                RoleDef { noun_name: "Trailing Marker".to_string(), role_index: 1 },
+            ],
+        };
+        let cons_ft = FactTypeDef {
+            schema_id: String::new(),
+            reading: "Statement has Classification".to_string(),
+            readings: vec![],
+            roles: vec![
+                RoleDef { noun_name: "Statement".to_string(), role_index: 0 },
+                RoleDef { noun_name: "Classification".to_string(), role_index: 1 },
+            ],
+        };
+        let rule = DerivationRuleDef {
+            id: "entity-type-recognizer".to_string(),
+            text: format!(
+                "Statement has Classification '{}' iff Statement has Trailing Marker '{}'",
+                cons_literal, ant_literal),
+            antecedent_fact_type_ids: vec!["stmt_has_trailing_marker".to_string()],
+            consequent_fact_type_id: "stmt_has_classification".to_string(),
+            kind: DerivationKind::ModusPonens,
+            join_on: vec![], match_on: vec![], consequent_bindings: vec![],
+            antecedent_filters: vec![],
+            consequent_computed_bindings: vec![], consequent_aggregates: vec![],
+            unresolved_clauses: vec![],
+            antecedent_role_literals: vec![crate::types::AntecedentRoleLiteral {
+                antecedent_index: 0,
+                role: "Trailing Marker".to_string(),
+                value: ant_literal.to_string(),
+            }],
+            consequent_role_literals: vec![crate::types::ConsequentRoleLiteral {
+                role: "Classification".to_string(),
+                value: cons_literal.to_string(),
+            }],
+        };
+        let mut cells = empty_cells();
+        cells = with_ft(cells, "stmt_has_trailing_marker", &ant_ft);
+        cells = with_ft(cells, "stmt_has_classification", &cons_ft);
+        cells = with_derivation(cells, &rule);
+        cells
+    }
+
+    #[test]
+    fn literal_in_consequent_fires_when_antecedent_literal_matches() {
+        // Stage-2 must see the derived classification fact when a
+        // Statement carries the exact trailing-marker literal the
+        // grammar rule names.
+        let cells = stmt_classification_cells(
+            "is an entity type", "Entity Type Declaration");
+        let (_meta, defs, _def_map) = compile_cells(cells);
+
+        let mut pop = ast::Object::phi();
+        pop = ast::cell_push("stmt_has_trailing_marker",
+            ast::fact_from_pairs(&[
+                ("Statement", "s1"),
+                ("Trailing Marker", "is an entity type"),
+            ]), &pop);
+
+        let dd = derivation_defs_from(&defs);
+        let (_new_state, derived) = forward_chain_defs_state(&dd, &pop);
+
+        let hits: Vec<_> = derived.iter()
+            .filter(|d| d.fact_type_id == "stmt_has_classification")
+            .collect();
+        assert_eq!(hits.len(), 1,
+            "expected exactly one classification fact, got {:?}", derived);
+        let bindings = &hits[0].bindings;
+        assert!(bindings.iter().any(|(k, v)| k == "Statement" && v == "s1"),
+            "Statement binding missing: {:?}", bindings);
+        assert!(bindings.iter().any(|(k, v)|
+            k == "Classification" && v == "Entity Type Declaration"),
+            "Classification literal binding missing: {:?}", bindings);
+    }
+
+    #[test]
+    fn literal_in_consequent_suppressed_when_antecedent_literal_mismatches() {
+        // If the trailing-marker value on the Statement does NOT match
+        // the grammar rule's literal, no classification fact should be
+        // emitted. Same-shaped rule with a different literal remains
+        // inert for this statement.
+        let cells = stmt_classification_cells(
+            "is an entity type", "Entity Type Declaration");
+        let (_meta, defs, _def_map) = compile_cells(cells);
+
+        let mut pop = ast::Object::phi();
+        pop = ast::cell_push("stmt_has_trailing_marker",
+            ast::fact_from_pairs(&[
+                ("Statement", "s1"),
+                ("Trailing Marker", "is a value type"),
+            ]), &pop);
+
+        let dd = derivation_defs_from(&defs);
+        let (_new_state, derived) = forward_chain_defs_state(&dd, &pop);
+
+        let hits: Vec<_> = derived.iter()
+            .filter(|d| d.fact_type_id == "stmt_has_classification")
+            .collect();
+        assert!(hits.is_empty(),
+            "expected no classification facts, got {:?}", hits);
     }
 }
 
