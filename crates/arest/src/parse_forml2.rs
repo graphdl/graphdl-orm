@@ -17,20 +17,14 @@ use hashbrown::HashMap;
 /// producer; every external consumer reads Object state via
 /// `parse_to_state`. This struct is NOT IR — it is the parser's
 /// working memory and vanishes as soon as parse completes.
+/// Parser state is nothing but cells (§5.2 Definition 2). This type alias
+/// replaced the ParseCtx wrapper once every typed field had been migrated
+/// to cells (#283). The parser threads `&mut Cells` directly — no IR.
 ///
-/// Invariant: `ctx_to_state` is a private conversion helper that
+/// Invariant: `cells_to_state` is a private conversion helper that
 /// wraps `cells` in `Object::Map`. Callers outside this module see
 /// only `Object` per Thm 2 (parse: R → Φ).
-#[derive(Debug, Clone, Default)]
-#[cfg_attr(feature = "std-deps", derive(serde::Deserialize, serde::Serialize))]
-#[cfg_attr(feature = "std-deps", serde(rename_all = "camelCase"))]
-struct ParseCtx {
-    /// Object cells produced by apply_action. This IS the parse output
-    /// — every typed field has now been migrated to cells (#283). The
-    /// parser is Gossamer: all hair and sneakers.
-    #[cfg_attr(feature = "std-deps", serde(skip))]
-    cells: HashMap<String, Vec<crate::ast::Object>>,
-}
+type Cells = HashMap<String, Vec<crate::ast::Object>>;
 #[allow(unused_imports)]
 use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 
@@ -1011,35 +1005,31 @@ fn try_fact_type(line: &str, noun_names: &[String]) -> Option<ParseAction> {
 
 /// Parse with pre-existing nouns from other domains.
 /// Domains are NORMA tabs. Nouns are global across the UoD.
-fn parse_markdown_with_nouns(input: &str, existing_nouns: &HashMap<String, NounDef>) -> Result<ParseCtx, String> {
+fn parse_markdown_with_nouns(input: &str, existing_nouns: &HashMap<String, NounDef>) -> Result<Cells, String> {
     parse_markdown_with_context(input, existing_nouns, &HashMap::new())
 }
 
-fn parse_markdown_with_context(input: &str, existing_nouns: &HashMap<String, NounDef>, existing_fact_types: &HashMap<String, FactTypeDef>) -> Result<ParseCtx, String> {
+fn parse_markdown_with_context(input: &str, existing_nouns: &HashMap<String, NounDef>, existing_fact_types: &HashMap<String, FactTypeDef>) -> Result<Cells, String> {
     // Metamodel namespace protection (security #23):
     // First parse the input in isolation to see which nouns IT actually declares.
     // If the input declares any metamodel-reserved noun AND that noun is already
     // present in `existing_nouns` (i.e. this is a user domain layered on top of
     // the metamodel bootstrap), reject. The bootstrap case (no existing nouns
     // for those names) is allowed to declare them exactly once.
-    let mut standalone = ParseCtx {
-        cells: HashMap::new(),
-    };
+    let mut standalone: Cells = HashMap::new();
     parse_into(&mut standalone, input)?;
     // Metamodel namespace guard (#23). Skipped during bundled metamodel
     // bootstrap â€” the metamodel is loaded as a series of cross-referencing
     // files and legitimately redeclares the same reserved nouns.
     if !is_bootstrap_mode() {
         if let Some(reserved) = METAMODEL_NOUNS.iter()
-            .find(|n| noun_exists(&standalone.cells, n) && existing_nouns.contains_key(**n))
+            .find(|n| noun_exists(&standalone, n) && existing_nouns.contains_key(**n))
         {
             return Err(format!("metamodel noun '{}' cannot be redeclared", reserved));
         }
     }
 
-    let mut ir = ParseCtx {
-        cells: HashMap::new(),
-    };
+    let mut ir: Cells = HashMap::new();
     // #283 — seed the Noun + FactType + Role cells from the pre-existing
     // typed maps so the parser sees metamodel definitions as already
     // declared.
@@ -1190,7 +1180,7 @@ pub fn find_forbidden_instance_url(state: &crate::ast::Object) -> Option<String>
 /// Every declaration becomes a fact (cell) in state. No intermediate struct.
 pub fn parse_to_state(input: &str) -> Result<crate::ast::Object, String> {
     let domain = parse_markdown(input)?;
-    Ok(ctx_to_state(&domain))
+    Ok(cells_to_state(&domain))
 }
 
 /// Extract nouns directly from the Noun cell in D.
@@ -1228,59 +1218,33 @@ pub fn parse_to_state_from(input: &str, d: &crate::ast::Object) -> Result<crate:
     let nouns = nouns_from_state(d);
     let fact_types = fact_types_from_state(d);
     let domain = parse_markdown_with_context(input, &nouns, &fact_types)?;
-    Ok(ctx_to_state(&domain))
+    Ok(cells_to_state(&domain))
 }
 
 /// Legacy: parse with nouns only (no fact type context).
 pub fn parse_to_state_with_nouns(input: &str, existing: &crate::ast::Object) -> Result<crate::ast::Object, String> {
     let nouns = nouns_from_state(existing);
     let domain = parse_markdown_with_nouns(input, &nouns)?;
-    Ok(ctx_to_state(&domain))
+    Ok(cells_to_state(&domain))
 }
 
 /// Convert a ParseCtx to an Object state (sequence of cells).
 /// Each category becomes a cell: <CELL, fact_type_id, <facts...>>
-fn ctx_to_state(d: &ParseCtx) -> crate::ast::Object {
+/// Lift a `Cells` HashMap into an `Object::Map` where each cell becomes
+/// `Object::Seq(facts)`. The cells ARE the parser output (§5.2); this is
+/// just the representation shift from mutable builder to immutable Object.
+fn cells_to_state(d: &Cells) -> crate::ast::Object {
     use crate::ast::Object;
     use hashbrown::HashMap;
-    // #283 — all parser state lives in cells; ctx_to_state is now just
-    // a wrapper that lifts the cell map into an Object::Map.
-    let cells: HashMap<String, Vec<Object>> = d.cells.clone();
-
-    // #283 — Noun cell is populated directly by apply_action; no fallback
-    // from a typed map is needed any longer.
-
-    // #283 — FactType + Role cells populated directly by apply_action;
-    // no fallback from a typed map is needed any longer.
-
-    // #283 — Constraint cell is populated directly by apply_action
-    // (plus the VC post-pass and autofill mutator); no fallback needed.
-
-    // #283 — DerivationRule + UnresolvedClause cells populated directly
-    // by apply_action / parse_into's AddDerivation branch. No fallback.
-
-    // State machines are derived from instance facts at compile time
-    // (derive_state_machines_from_facts in compile.rs). The parser does
-    // not carry a separate state_machines index.
-
-    // #283 — Instance facts and per-field cells are written directly
-    // by `emit_instance_fact` during apply_action, and compound
-    // ref-scheme decomposition runs in parse_into's finalize over
-    // the InstanceFact cell. There's nothing left to translate from
-    // typed state here.
-
-    // Wrap into Object::Map in one pass: each cell becomes Object::Seq(facts).
-    let map: HashMap<String, Object> = cells.into_iter()
-        .map(|(k, v)| (k, Object::Seq(v.into())))
+    let map: HashMap<String, Object> = d.iter()
+        .map(|(k, v)| (k.clone(), Object::Seq(v.clone().into())))
         .collect();
     Object::Map(map)
 }
 
 
-fn parse_markdown(input: &str) -> Result<ParseCtx, String> {
-    let mut ir = ParseCtx {
-        cells: HashMap::new(),
-    };
+fn parse_markdown(input: &str) -> Result<Cells, String> {
+    let mut ir: Cells = HashMap::new();
     parse_into(&mut ir, input)?;
     Ok(ir)
 }
@@ -1377,7 +1341,7 @@ fn join_derivation_continuations(input: &str) -> Vec<String> {
     out
 }
 
-fn parse_into(ir: &mut ParseCtx, input: &str) -> Result<(), String> {
+fn parse_into(ir: &mut Cells, input: &str) -> Result<(), String> {
 
     let lines: Vec<String> = join_derivation_continuations(input);
 
@@ -1412,7 +1376,7 @@ fn parse_into(ir: &mut ParseCtx, input: &str) -> Result<(), String> {
 
     // Pass 2a: collect fact types and instance facts
     // Sorted longest-first for Theorem 1 (unambiguous longest-first matching)
-    let mut noun_names: Vec<String> = noun_names(&ir.cells);
+    let mut noun_names: Vec<String> = noun_names(&ir);
     noun_names.sort_by(|a, b| b.len().cmp(&a.len()));
 
     // Pass 2a: Filter(!pass1 && !pass2b) : lines, then apply fact_type/instance_fact
@@ -1457,7 +1421,7 @@ fn parse_into(ir: &mut ParseCtx, input: &str) -> Result<(), String> {
     // Build schema catalog from collected fact types (via FactType + Role cells, #283)
     let catalog = {
         let mut cat = SchemaCatalog::new();
-        fact_types_from_cells(&ir.cells).iter().for_each(|(schema_id, ft)| {
+        fact_types_from_cells(&ir).iter().for_each(|(schema_id, ft)| {
             let role_nouns: Vec<&str> = ft.roles.iter().map(|r| r.noun_name.as_str()).collect();
             // Extract verb from reading: text between first and last noun
             let verb = ft.roles.first()
@@ -1568,8 +1532,8 @@ fn parse_into(ir: &mut ParseCtx, input: &str) -> Result<(), String> {
                     let _ = resolved;
                 }
                 ParseAction::AddDerivation(mut r) => {
-                    let nouns_map = nouns_from_cells(&ir.cells);
-                    let fact_types_map = fact_types_from_cells(&ir.cells);
+                    let nouns_map = nouns_from_cells(&ir);
+                    let fact_types_map = fact_types_from_cells(&ir);
                     resolve_derivation_rule(&mut r, &nouns_map, &fact_types_map, &catalog);
                     // #283 — DerivationRule + UnresolvedClause cells.
                     #[cfg(feature = "std-deps")]
@@ -1583,7 +1547,7 @@ fn parse_into(ir: &mut ParseCtx, input: &str) -> Result<(), String> {
     // Task 6: Value Constraint (VC) -- emit one VC per noun with enum_values.
     // The compiler reads enum values from the EnumValues cell (#283);
     // the ConstraintDef just marks which noun has a value constraint.
-    let vcs: Vec<ConstraintDef> = all_enum_value_nouns(&ir.cells).into_iter().map(|noun_name| ConstraintDef {
+    let vcs: Vec<ConstraintDef> = all_enum_value_nouns(&ir).into_iter().map(|noun_name| ConstraintDef {
         id: format!("VC:{}", noun_name),
         kind: "VC".into(),
         modality: "alethic".into(),
@@ -1608,7 +1572,7 @@ fn parse_into(ir: &mut ParseCtx, input: &str) -> Result<(), String> {
     // #283 — both sides query cells (NamedSpan, AutofillSpan) rather than
     // a parallel typed map. The cells are the parser's only state for
     // span metadata.
-    let named_spans_by_name: HashMap<String, Vec<String>> = ir.cells.get("NamedSpan")
+    let named_spans_by_name: HashMap<String, Vec<String>> = ir.get("NamedSpan")
         .into_iter()
         .flat_map(|facts| facts.iter())
         .filter_map(|fact| {
@@ -1625,7 +1589,7 @@ fn parse_into(ir: &mut ParseCtx, input: &str) -> Result<(), String> {
             Some((name, roles))
         })
         .collect();
-    let autofill_role_sets: Vec<hashbrown::HashSet<String>> = ir.cells.get("AutofillSpan")
+    let autofill_role_sets: Vec<hashbrown::HashSet<String>> = ir.get("AutofillSpan")
         .into_iter()
         .flat_map(|facts| facts.iter())
         .filter_map(|fact| crate::ast::binding(fact, "name").map(String::from))
@@ -1671,15 +1635,15 @@ fn parse_into(ir: &mut ParseCtx, input: &str) -> Result<(), String> {
         // ≥2 ref parts, split instance IDs on '-' from the right and
         // push component facts to {Noun}_has_{Component} cells.
         // #283 — snapshot all_ref_schemes before the cell-mutation loop
-        // to avoid borrowing `ir.cells` immutably and mutably in
+        // to avoid borrowing `ir` immutably and mutably in
         // overlapping scopes.
         use hashbrown::HashSet as HBSet;
-        let compound_schemes: Vec<(String, Vec<String>)> = all_ref_schemes(&ir.cells)
+        let compound_schemes: Vec<(String, Vec<String>)> = all_ref_schemes(&ir)
             .into_iter()
             .filter(|(_, p)| p.len() >= 2)
             .collect();
         for (noun_name, ref_parts) in compound_schemes {
-            let ids: HBSet<String> = instance_fact_subject_values_for_noun(&ir.cells, &noun_name)
+            let ids: HBSet<String> = instance_fact_subject_values_for_noun(&ir, &noun_name)
                 .into_iter()
                 .collect();
             for id in &ids {
@@ -1689,7 +1653,7 @@ fn parse_into(ir: &mut ParseCtx, input: &str) -> Result<(), String> {
                 for (component, value) in ref_parts.iter().zip(parts.iter()) {
                     let cell_name = format!("{}_has_{}",
                         noun_name.replace(' ', "_"), component.replace(' ', "_"));
-                    ir.cells.entry(cell_name).or_default().push(crate::ast::fact_from_pairs(&[
+                    ir.entry(cell_name).or_default().push(crate::ast::fact_from_pairs(&[
                         (noun_name.as_str(), id.as_str()),
                         (component.as_str(), *value),
                     ]));
@@ -1700,15 +1664,15 @@ fn parse_into(ir: &mut ParseCtx, input: &str) -> Result<(), String> {
 
     // Strict mode: reject undeclared nouns (subtype children, fact type roles).
     if is_strict_mode() {
-        let role_noun_names: Vec<String> = ir.cells.get("Role")
+        let role_noun_names: Vec<String> = ir.get("Role")
             .map(|facts| facts.iter()
                 .filter_map(|f| crate::ast::binding(f, "nounName").map(String::from))
                 .collect())
             .unwrap_or_default();
-        let undeclared: Vec<String> = all_subtype_names(&ir.cells).into_iter()
-            .filter(|sub| !noun_exists(&ir.cells, sub))
+        let undeclared: Vec<String> = all_subtype_names(&ir).into_iter()
+            .filter(|sub| !noun_exists(&ir, sub))
             .chain(role_noun_names.into_iter()
-                .filter(|n| !noun_exists(&ir.cells, n)))
+                .filter(|n| !noun_exists(&ir, n)))
             .collect::<alloc::collections::BTreeSet<_>>()
             .into_iter()
             .collect();
@@ -2323,8 +2287,8 @@ fn resolve_derivation_rule(
 }
 
 /// Append a fact to a cell in the ParseCtx's Object-state accumulator.
-fn push_cell(ir: &mut ParseCtx, cell: &str, fact: crate::ast::Object) {
-    ir.cells.entry(cell.to_string()).or_default().push(fact);
+fn push_cell(ir: &mut Cells, cell: &str, fact: crate::ast::Object) {
+    ir.entry(cell.to_string()).or_default().push(fact);
 }
 
 /// #283 — Cell-backed lookup for a noun's reference-scheme components.
@@ -2356,7 +2320,7 @@ fn ref_scheme_for_noun(
 /// `general_instance_facts: Vec<GeneralInstanceFact>` plus a later
 /// translation pass; writers emit cells once, no second pass.
 fn emit_instance_fact(
-    ir: &mut ParseCtx,
+    ir: &mut Cells,
     subject_noun: &str,
     subject_value: &str,
     field_name: &str,
@@ -2437,11 +2401,11 @@ fn all_enum_value_nouns(
 /// #283 — Upsert enum values for a noun on the `EnumValues` cell.
 /// Removes any prior fact for this noun before pushing the new one.
 fn upsert_enum_values(
-    ir: &mut ParseCtx,
+    ir: &mut Cells,
     noun: &str,
     values: &[String],
 ) {
-    if let Some(facts) = ir.cells.get_mut("EnumValues") {
+    if let Some(facts) = ir.get_mut("EnumValues") {
         facts.retain(|f| crate::ast::binding(f, "noun") != Some(noun));
     }
     let mut pairs: Vec<(String, String)> = alloc::vec![
@@ -2483,11 +2447,11 @@ fn all_subtype_names(
 /// #283 — Upsert a (subtype, supertype) pair on the `Subtype` cell.
 /// Removes any prior fact for `subtype` before pushing the new one.
 fn upsert_subtype(
-    ir: &mut ParseCtx,
+    ir: &mut Cells,
     subtype: &str,
     supertype: &str,
 ) {
-    if let Some(facts) = ir.cells.get_mut("Subtype") {
+    if let Some(facts) = ir.get_mut("Subtype") {
         facts.retain(|f| crate::ast::binding(f, "subtype") != Some(subtype));
     }
     push_cell(ir, "Subtype", crate::ast::fact_from_pairs(&[
@@ -2580,7 +2544,7 @@ fn nouns_from_cells(
 /// finalize via `enrich_noun_cells`, reading the sibling cells that
 /// those writers populate.
 fn push_noun_fact(
-    ir: &mut ParseCtx,
+    ir: &mut Cells,
     name: &str,
     object_type: &str,
     wa: WorldAssumption,
@@ -2602,12 +2566,12 @@ fn push_noun_fact(
 ///   - existing, `def.object_type != existing && def.object_type != "abstract"`:
 ///     overwrite the fact with `def` (conflict detected later in platform_compile).
 ///   - otherwise: preserve existing.
-fn upsert_noun(ir: &mut ParseCtx, name: &str, def: &NounDef) {
-    let existing_type = noun_object_type(&ir.cells, name);
+fn upsert_noun(ir: &mut Cells, name: &str, def: &NounDef) {
+    let existing_type = noun_object_type(&ir, name);
     match existing_type.as_deref() {
         None => push_noun_fact(ir, name, &def.object_type, def.world_assumption.clone()),
         Some(existing) if existing != def.object_type.as_str() && def.object_type != "abstract" => {
-            if let Some(facts) = ir.cells.get_mut("Noun") {
+            if let Some(facts) = ir.get_mut("Noun") {
                 facts.retain(|f| crate::ast::binding(f, "name") != Some(name));
             }
             push_noun_fact(ir, name, &def.object_type, def.world_assumption.clone());
@@ -2619,8 +2583,8 @@ fn upsert_noun(ir: &mut ParseCtx, name: &str, def: &NounDef) {
 
 /// #283 — Flip an existing Noun fact's `objectType` binding to `"abstract"`.
 /// No-op if no such fact. Replaces `ir.nouns.get_mut(name).for_each(|n| n.object_type = "abstract".into())`.
-fn mark_noun_abstract(ir: &mut ParseCtx, name: &str) {
-    let Some(facts) = ir.cells.get_mut("Noun") else { return };
+fn mark_noun_abstract(ir: &mut Cells, name: &str) {
+    let Some(facts) = ir.get_mut("Noun") else { return };
     if let Some(f) = facts.iter_mut()
         .find(|f| crate::ast::binding(f, "name") == Some(name))
     {
@@ -2633,8 +2597,8 @@ fn mark_noun_abstract(ir: &mut ParseCtx, name: &str) {
 
 /// #283 — In loose mode, auto-create an `entity` noun if undeclared.
 /// Replaces `ir.nouns.entry(name).or_insert(NounDef { object_type: "entity", .. })`.
-fn ensure_noun_entity(ir: &mut ParseCtx, name: &str) {
-    if !noun_exists(&ir.cells, name) {
+fn ensure_noun_entity(ir: &mut Cells, name: &str) {
+    if !noun_exists(&ir, name) {
         push_noun_fact(ir, name, "entity", WorldAssumption::default());
     }
 }
@@ -2644,8 +2608,8 @@ fn ensure_noun_entity(ir: &mut ParseCtx, name: &str) {
 /// (`Subtype`, `RefScheme`, `EnumValues`). Writers emit basic Noun facts
 /// during parse; this pass joins them once downstream consumers are ready.
 #[cfg(feature = "std-deps")]
-fn enrich_noun_cells(ir: &mut ParseCtx) {
-    let Some(facts) = ir.cells.get("Noun").cloned() else { return };
+fn enrich_noun_cells(ir: &mut Cells) {
+    let Some(facts) = ir.get("Noun").cloned() else { return };
     let enriched: Vec<crate::ast::Object> = facts.iter().map(|f| {
         let name = crate::ast::binding(f, "name").unwrap_or("").to_string();
         let object_type = crate::ast::binding(f, "objectType").unwrap_or("entity").to_string();
@@ -2655,22 +2619,22 @@ fn enrich_noun_cells(ir: &mut ParseCtx) {
             ("objectType".into(), object_type.clone()),
             ("worldAssumption".into(), wa),
         ];
-        if let Some(st) = supertype_of(&ir.cells, &name) {
+        if let Some(st) = supertype_of(&ir, &name) {
             pairs.push(("superType".into(), st));
         }
-        let ref_scheme = ref_scheme_for_noun(&ir.cells, &name)
+        let ref_scheme = ref_scheme_for_noun(&ir, &name)
             .or_else(|| (object_type == "entity").then(|| vec!["id".into()]));
         if let Some(rs) = ref_scheme {
             pairs.push(("referenceScheme".into(), rs.join(",")));
         }
-        let evs = enum_values_for_noun(&ir.cells, &name);
+        let evs = enum_values_for_noun(&ir, &name);
         if !evs.is_empty() {
             pairs.push(("enumValues".into(), evs.join(",")));
         }
         let refs: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         crate::ast::fact_from_pairs(&refs)
     }).collect();
-    ir.cells.insert("Noun".to_string(), enriched);
+    ir.insert("Noun".to_string(), enriched);
 }
 
 /// #283 — Every fact-type id in the `FactType` cell. Replaces
@@ -2754,8 +2718,8 @@ fn fact_types_from_cells(
 /// #283 — Upsert a fact-type on the `FactType` + `Role` cells.
 /// Preserves the `or_insert` semantics of the previous
 /// `ir.fact_types.entry(id).or_insert(def)`: first declaration wins.
-fn upsert_fact_type(ir: &mut ParseCtx, id: &str, def: &FactTypeDef) {
-    if fact_type_exists(&ir.cells, id) {
+fn upsert_fact_type(ir: &mut Cells, id: &str, def: &FactTypeDef) {
+    if fact_type_exists(&ir, id) {
         return;
     }
     push_cell(ir, "FactType", crate::ast::fact_from_pairs(&[
@@ -2776,7 +2740,7 @@ fn upsert_fact_type(ir: &mut ParseCtx, id: &str, def: &FactTypeDef) {
 /// its unresolved clauses to the `UnresolvedClause` cell). Replaces
 /// `ir.derivation_rules.push(r)`. Lossless via JSON.
 #[cfg(feature = "std-deps")]
-fn push_derivation_rule_cells(ir: &mut ParseCtx, rule: &DerivationRuleDef) {
+fn push_derivation_rule_cells(ir: &mut Cells, rule: &DerivationRuleDef) {
     let json = serde_json::to_string(rule).unwrap_or_default();
     push_cell(ir, "DerivationRule", crate::ast::fact_from_pairs(&[
         ("id", rule.id.as_str()),
@@ -2826,10 +2790,10 @@ fn constraints_from_cells(
 /// by rewriting affected facts with the updated JSON.
 #[cfg(feature = "std-deps")]
 fn mark_ss_constraints_autofill(
-    ir: &mut ParseCtx,
+    ir: &mut Cells,
     role_sets: &[hashbrown::HashSet<String>],
 ) {
-    let Some(facts) = ir.cells.get_mut("Constraint") else { return };
+    let Some(facts) = ir.get_mut("Constraint") else { return };
     for fact in facts.iter_mut() {
         let Some(kind) = crate::ast::binding(fact, "kind") else { continue };
         if kind != "SS" { continue }
@@ -2878,7 +2842,7 @@ fn constraint_to_fact(c: &ConstraintDef) -> crate::ast::Object {
 /// per Thm 2. Kinds that need in-parse mutation/lookup (Noun, FactType)
 /// still accumulate typed fields; ctx_to_state serializes them to
 /// cells at finalize.
-fn apply_action(ir: &mut ParseCtx, action: Option<ParseAction>, lines: &[String], idx: usize) {
+fn apply_action(ir: &mut Cells, action: Option<ParseAction>, lines: &[String], idx: usize) {
     let Some(action) = action else { return };
     match action {
         ParseAction::AddNoun(name, def, meta) => {
@@ -2893,7 +2857,7 @@ fn apply_action(ir: &mut ParseCtx, action: Option<ParseAction>, lines: &[String]
             // by checking existing cells first; first noun declaration
             // wins (metamodel guard handles legitimate redeclaration).
             meta.ref_scheme.into_iter().for_each(|rs| {
-                let already = ir.cells.get("RefScheme")
+                let already = ir.get("RefScheme")
                     .map(|facts| facts.iter()
                         .any(|f| crate::ast::binding(f, "noun") == Some(name.as_str())))
                     .unwrap_or(false);
@@ -3170,7 +3134,7 @@ fn resolve_constraint_schema(
     mut constraint: ConstraintDef,
     noun_names: &[String],
     catalog: &SchemaCatalog,
-    ir: &ParseCtx,
+    ir: &Cells,
 ) -> ConstraintDef {
     // Extract nouns from the constraint text to find the target schema.
     // Strip quantifiers and quoted values before noun matching.
@@ -3206,7 +3170,7 @@ fn resolve_constraint_schema(
                 // Inverse voice fallback: find schema where constraint verb appears in reading
                 // or reading verb appears in constraint text. #283 — cell read.
                 let noun_set: hashbrown::HashSet<String> = role_nouns.iter().map(|s| s.to_string()).collect();
-                fact_types_from_cells(&ir.cells).into_iter()
+                fact_types_from_cells(&ir).into_iter()
                     .filter(|(_, ft)| {
                         let ft_nouns: hashbrown::HashSet<String> = ft.roles.iter()
                             .map(|r| r.noun_name.clone()).collect();
@@ -3239,7 +3203,7 @@ fn resolve_constraint_schema(
         // Per Halpin TechReport ORM2-02: the constrained role is the one
         // under the quantifier.
         // #283 — Role cell read.
-        let resolved_ft_roles = fact_type_roles(&ir.cells, &schema_id);
+        let resolved_ft_roles = fact_type_roles(&ir, &schema_id);
         let first_noun_idx = (!resolved_ft_roles.is_empty()).then(|| {
             let first_noun = &found[0].2;
             resolved_ft_roles.iter().position(|r| &r.noun_name == first_noun)
@@ -3463,14 +3427,14 @@ pub(crate) fn find_nouns(text: &str, noun_names: &[String]) -> Vec<(usize, usize
 // Instance fact parsing (state machines)
 // =========================================================================
 
-fn parse_instance_fact(ir: &mut ParseCtx, line: &str, _lines: &[&str], _idx: usize) {
+fn parse_instance_fact(ir: &mut Cells, line: &str, _lines: &[&str], _idx: usize) {
     let clean = line.trim_end_matches('.');
     parse_general_instance_fact(ir, clean);
 }
 
-fn parse_general_instance_fact(ir: &mut ParseCtx, line: &str) {
+fn parse_general_instance_fact(ir: &mut Cells, line: &str) {
     // Longest-first noun matching (Theorem 1, step 3)
-    let mut noun_names: Vec<String> = noun_names(&ir.cells);
+    let mut noun_names: Vec<String> = noun_names(&ir);
     noun_names.sort_by(|a, b| b.len().cmp(&a.len()));
 
     // bu(match_subject, line) -- find the first noun that matches as subject
@@ -3506,7 +3470,7 @@ fn parse_general_instance_fact(ir: &mut ParseCtx, line: &str) {
             // Resolve field name from declared fact types.
             // The instance fact "A 'x' predicate B 'y'" should match the
             // declared fact type "A predicate B" and use its fact type ID.
-            let field = resolve_instance_field(&fact_types_from_cells(&ir.cells), &subject_noun, &predicate, &object_noun);
+            let field = resolve_instance_field(&fact_types_from_cells(&ir), &subject_noun, &predicate, &object_noun);
             Some(GeneralInstanceFact {
                 subject_noun,
                 subject_value,
@@ -3629,18 +3593,18 @@ mod tests {
     fn entity_types() {
         let ir = parse_markdown("Customer(.Name) is an entity type.\nOrder(.OrderId) is an entity type.").unwrap();
         // #283 — nouns live in the Noun cell.
-        assert_eq!(super::noun_names(&ir.cells).len(), 2);
-        assert!(super::noun_exists(&ir.cells, "Customer"));
-        assert!(super::noun_exists(&ir.cells, "Order"));
+        assert_eq!(super::noun_names(&ir).len(), 2);
+        assert!(super::noun_exists(&ir, "Customer"));
+        assert!(super::noun_exists(&ir, "Order"));
     }
 
     #[test]
     fn value_types_with_enum() {
         let ir = parse_markdown("Priority is a value type.\n  The possible values of Priority are 'low', 'medium', 'high'.").unwrap();
         // #283 — Noun object type lives on the Noun cell.
-        assert_eq!(super::noun_object_type(&ir.cells, "Priority").as_deref(), Some("value"));
+        assert_eq!(super::noun_object_type(&ir, "Priority").as_deref(), Some("value"));
         // #283 — enum values live in the EnumValues cell.
-        assert_eq!(super::enum_values_for_noun(&ir.cells, "Priority").len(), 3);
+        assert_eq!(super::enum_values_for_noun(&ir, "Priority").len(), 3);
     }
 
     #[test]
@@ -3648,7 +3612,7 @@ mod tests {
         let ir = parse_markdown("Request(.id) is an entity type.\nSupport Request is a subtype of Request.").unwrap();
         // #283 — subtype relationships live in the Subtype cell.
         assert_eq!(
-            super::supertype_of(&ir.cells, "Support Request"),
+            super::supertype_of(&ir, "Support Request"),
             Some("Request".to_string())
         );
     }
@@ -3657,16 +3621,16 @@ mod tests {
     fn abstract_noun() {
         let ir = parse_markdown("Request(.id) is an entity type.\nRequest is abstract.").unwrap();
         // #283 — Noun object type lives on the Noun cell.
-        assert_eq!(super::noun_object_type(&ir.cells, "Request").as_deref(), Some("abstract"));
+        assert_eq!(super::noun_object_type(&ir, "Request").as_deref(), Some("abstract"));
     }
 
     #[test]
     fn partition_implies_abstract() {
         let ir = parse_markdown("Request(.id) is an entity type.\nRequest is partitioned into Support Request, Feature Request.").unwrap();
         // #283 — Noun object type lives on the Noun cell.
-        assert_eq!(super::noun_object_type(&ir.cells, "Request").as_deref(), Some("abstract"));
+        assert_eq!(super::noun_object_type(&ir, "Request").as_deref(), Some("abstract"));
         assert_eq!(
-            super::supertype_of(&ir.cells, "Support Request"),
+            super::supertype_of(&ir, "Support Request"),
             Some("Request".to_string())
         );
     }
@@ -3676,7 +3640,7 @@ mod tests {
         let input = "Request(.id) is an entity type.\nSupport Request is a subtype of Request.\nEach Request is a Support Request or a Feature Request.";
         let ir = parse_markdown(input).unwrap();
         // #283 — Noun object type lives on the Noun cell.
-        assert_eq!(super::noun_object_type(&ir.cells, "Request").as_deref(), Some("abstract"));
+        assert_eq!(super::noun_object_type(&ir, "Request").as_deref(), Some("abstract"));
     }
 
     #[test]
@@ -3684,7 +3648,7 @@ mod tests {
         let input = "Customer(.Name) is an entity type.\nOrder(.OrderId) is an entity type.\nOrder was placed by Customer.";
         let ir = parse_markdown(input).unwrap();
         // #283 — FactType cell read.
-        assert!(!super::fact_type_ids(&ir.cells).is_empty());
+        assert!(!super::fact_type_ids(&ir).is_empty());
     }
 
     #[test]
@@ -3692,7 +3656,7 @@ mod tests {
         let input = "Person(.Name) is an entity type.\nCountry(.Code) is an entity type.\nPerson was born in Country.\nEach Person was born in exactly one Country.";
         let ir = parse_markdown(input).unwrap();
         // #283 — Constraint cell reads.
-        let cs = super::constraints_from_cells(&ir.cells);
+        let cs = super::constraints_from_cells(&ir);
         assert!(cs.iter().any(|c| c.kind == "UC"));
         assert!(cs.iter().any(|c| c.kind == "MC"));
     }
@@ -3702,7 +3666,7 @@ mod tests {
         let input = "Response(.id) is an entity type.\nIt is obligatory that each Response is professional.";
         let ir = parse_markdown(input).unwrap();
         // #283 — Constraint cell read.
-        assert!(super::constraints_from_cells(&ir.cells).iter().any(|c| c.modality == "deontic"));
+        assert!(super::constraints_from_cells(&ir).iter().any(|c| c.modality == "deontic"));
     }
 
     #[test]
@@ -3710,7 +3674,7 @@ mod tests {
         let input = "X(.id) is an entity type.\nY(.id) is an entity type.\nX has Y iff some condition.";
         let ir = parse_markdown(input).unwrap();
         // #283 — DerivationRule cell read.
-        assert!(!super::derivation_rules_from_cells(&ir.cells).is_empty());
+        assert!(!super::derivation_rules_from_cells(&ir).is_empty());
     }
 
     #[test]
@@ -3718,7 +3682,7 @@ mod tests {
         let input = "Domain(.Slug) is an entity type.\nAccess is a value type.\n  The possible values of Access are 'public', 'private'.\n## Fact Types\nDomain has Access.\n## Instance Facts\nDomain 'support' has Access 'public'.";
         let ir = parse_markdown(input).unwrap();
         // #283 — instance facts live in the InstanceFact cell.
-        let facts = ir.cells.get("InstanceFact").expect("InstanceFact cell");
+        let facts = ir.get("InstanceFact").expect("InstanceFact cell");
         assert_eq!(facts.len(), 1);
         assert_eq!(crate::ast::binding(&facts[0], "subjectNoun"), Some("Domain"));
         assert_eq!(crate::ast::binding(&facts[0], "subjectValue"), Some("support"));
@@ -3729,7 +3693,7 @@ mod tests {
     fn instance_facts_noun_to_noun() {
         let input = "API Endpoint(.Path) is an entity type.\nClickHouse Table(.Name) is an entity type.\n## Fact Types\nAPI Endpoint reads from ClickHouse Table.\n## Instance Facts\nAPI Endpoint '/data/:vin' reads from ClickHouse Table 'sources.currentResources'.";
         let ir = parse_markdown(input).unwrap();
-        let facts = ir.cells.get("InstanceFact").expect("InstanceFact cell");
+        let facts = ir.get("InstanceFact").expect("InstanceFact cell");
         assert_eq!(facts.len(), 1);
         assert_eq!(crate::ast::binding(&facts[0], "subjectNoun"), Some("API Endpoint"));
         assert_eq!(crate::ast::binding(&facts[0], "subjectValue"), Some("/data/:vin"));
@@ -3741,7 +3705,7 @@ mod tests {
     fn instance_facts_multiple() {
         let input = "Domain(.Slug) is an entity type.\nAccess is a value type.\nDomain has Access.\nDomain 'support' has Access 'public'.\nDomain 'core' has Access 'private'.";
         let ir = parse_markdown(input).unwrap();
-        let facts = ir.cells.get("InstanceFact").expect("InstanceFact cell");
+        let facts = ir.get("InstanceFact").expect("InstanceFact cell");
         assert_eq!(facts.len(), 2);
     }
 
@@ -3749,7 +3713,7 @@ mod tests {
     fn instance_fact_noun_uri() {
         let input = "Noun is an entity type.\nURI is a value type.\n## Fact Types\nNoun has URI.\n## Instance Facts\nNoun 'API Product' has URI '/api'.";
         let ir = parse_markdown(input).unwrap();
-        let facts = ir.cells.get("InstanceFact").expect("InstanceFact cell");
+        let facts = ir.get("InstanceFact").expect("InstanceFact cell");
         assert_eq!(facts.len(), 1);
         let f = &facts[0];
         assert_eq!(crate::ast::binding(f, "subjectNoun"), Some("Noun"));
@@ -3762,7 +3726,7 @@ mod tests {
         let input = "User(.Email) is an entity type.\nDomain(.Slug) is an entity type.\nOrg Role is a value type.\nOrganization(.Slug) is an entity type.\n## Fact Types\nUser has Org Role in Organization.\nDomain belongs to Organization.\nUser accesses Domain.\n## Derivation Rules\nUser accesses Domain if User has Org Role in Organization and Domain belongs to that Organization.";
         let ir = parse_markdown(input).unwrap();
         // #283 — DerivationRule cell read.
-        let rules = super::derivation_rules_from_cells(&ir.cells);
+        let rules = super::derivation_rules_from_cells(&ir);
         assert!(!rules.is_empty());
         let rule = &rules[0];
         assert!(!rule.consequent_fact_type_id.is_empty(), "consequent should be resolved");
@@ -3775,7 +3739,7 @@ mod tests {
         let input = "User(.Email) is an entity type.\nDomain(.Slug) is an entity type.\nOrg Role is a value type.\nOrganization(.Slug) is an entity type.\n## Fact Types\nUser has Org Role in Organization.\nDomain belongs to Organization.\nUser accesses Domain.\n## Derivation Rules\nUser accesses Domain if User has Org Role in Organization and Domain belongs to that Organization.";
         let ir = parse_markdown(input).unwrap();
         // #283 — DerivationRule cell read.
-        let rules = super::derivation_rules_from_cells(&ir.cells);
+        let rules = super::derivation_rules_from_cells(&ir);
         let rule = &rules[0];
         assert!(rule.join_on.contains(&"Organization".to_string()), "Organization should be a join key (referenced with 'that')");
     }
@@ -3795,7 +3759,7 @@ mod tests {
     fn derivation_rule_captures_inline_ge_comparison() {
         let input = "City(.Name) is an entity type.\nBig City(.Name) is an entity type.\nPopulation is a value type.\n## Fact Types\nCity has Population.\nBig City has City.\n## Derivation Rules\n* Big City has City iff City has Population >= 1000000.";
         let ir = parse_markdown(input).unwrap();
-        let rules = super::derivation_rules_from_cells(&ir.cells);
+        let rules = super::derivation_rules_from_cells(&ir);
         let rule = rules.iter()
             .find(|r| r.text.contains("Big City has City"))
             .expect("derivation rule present");
@@ -3824,7 +3788,7 @@ mod tests {
             let input = format!(
                 "City(.Name) is an entity type.\nBig City(.Name) is an entity type.\nPopulation is a value type.\n## Fact Types\nCity has Population.\nBig City has City.\n## Derivation Rules\n* Big City has City iff City has Population {op_in} 100.");
             let ir = parse_markdown(&input).expect("parse ok");
-            let rules = super::derivation_rules_from_cells(&ir.cells);
+            let rules = super::derivation_rules_from_cells(&ir);
         let rule = rules.iter()
                 .find(|r| r.text.contains("Big City has City"))
                 .unwrap_or_else(|| panic!("rule missing for op {op_in}"));
@@ -3840,7 +3804,7 @@ mod tests {
         // Float + negative literal should parse; irrelevant whitespace too.
         let input = "Reading(.Name) is an entity type.\nWarm Reading(.Name) is an entity type.\nTemperature is a value type.\n## Fact Types\nReading has Temperature.\nWarm Reading has Reading.\n## Derivation Rules\n* Warm Reading has Reading iff Reading has Temperature > -273.15.";
         let ir = parse_markdown(input).unwrap();
-        let rules = super::derivation_rules_from_cells(&ir.cells);
+        let rules = super::derivation_rules_from_cells(&ir);
         let rule = rules.iter()
             .find(|r| r.text.contains("Warm Reading has Reading"))
             .expect("rule present");
@@ -3870,7 +3834,7 @@ mod tests {
     fn derivation_rule_captures_computed_binding_with_plus() {
         let input = "Foo(.id) is an entity type.\nVal is a value type.\nDoubled is a value type.\n## Fact Types\nFoo has Val.\nFoo has Doubled.\n## Derivation Rules\n* Foo has Doubled iff Foo has Val and Doubled is Val + Val.";
         let ir = parse_markdown(input).unwrap();
-        let rules = super::derivation_rules_from_cells(&ir.cells);
+        let rules = super::derivation_rules_from_cells(&ir);
         let rule = rules.iter()
             .find(|r| r.text.contains("Foo has Doubled"))
             .expect("rule present");
@@ -3893,7 +3857,7 @@ mod tests {
             let input = format!(
                 "Foo(.id) is an entity type.\nA is a value type.\nB is a value type.\nC is a value type.\n## Fact Types\nFoo has A.\nFoo has B.\nFoo has C.\n## Derivation Rules\n* Foo has C iff Foo has A and Foo has B and C is A {op} B.");
             let ir = parse_markdown(&input).expect("parse ok");
-            let rules = super::derivation_rules_from_cells(&ir.cells);
+            let rules = super::derivation_rules_from_cells(&ir);
         let rule = rules.iter()
                 .find(|r| r.text.contains("Foo has C"))
                 .unwrap_or_else(|| panic!("rule missing for op {op}"));
@@ -3913,7 +3877,7 @@ mod tests {
         use crate::types::ArithExpr;
         let input = "Box(.id) is an entity type.\nSize is a value type.\nVolume is a value type.\n## Fact Types\nBox has Size.\nBox has Volume.\n## Derivation Rules\n* Box has Volume iff Box has Size and Volume is Size * Size * Size.";
         let ir = parse_markdown(input).unwrap();
-        let rules = super::derivation_rules_from_cells(&ir.cells);
+        let rules = super::derivation_rules_from_cells(&ir);
         let rule = rules.iter()
             .find(|r| r.text.contains("Box has Volume"))
             .expect("rule present");
@@ -3931,7 +3895,7 @@ mod tests {
         use crate::types::ArithExpr;
         let input = "Foo(.id) is an entity type.\nVal is a value type.\nNext is a value type.\n## Fact Types\nFoo has Val.\nFoo has Next.\n## Derivation Rules\n* Foo has Next iff Foo has Val and Next is Val + 1.";
         let ir = parse_markdown(input).unwrap();
-        let rules = super::derivation_rules_from_cells(&ir.cells);
+        let rules = super::derivation_rules_from_cells(&ir);
         let rule = rules.iter()
             .find(|r| r.text.contains("Foo has Next"))
             .expect("rule present");
@@ -4009,7 +3973,7 @@ mod tests {
         // path handles natively.
         let input = "Worker(.Id) is an entity type.\nManager(.Id) is an entity type.\nVP(.Id) is an entity type.\n## Fact Types\nWorker reports to Manager.\nManager reports to VP.\nWorker reports up to VP.\n## Derivation Rules\n+ Worker reports up to VP if Worker reports to some Manager and that Manager reports to VP.";
         let ir = parse_markdown(input).unwrap();
-        let rules = super::derivation_rules_from_cells(&ir.cells);
+        let rules = super::derivation_rules_from_cells(&ir);
         let rule = rules.iter()
             .find(|r| r.text.contains("reports up to VP"))
             .expect("rule present");
@@ -4049,7 +4013,7 @@ mod tests {
                 "Customer(.Name) is an entity type.\nOrder(.Id) is an entity type.\nShipping Address is a value type.\n## Fact Types\nCustomer places Order.\nCustomer has Shipping Address.\nOrder has Shipping Address.\n## Constraints\nIf some Customer places some Order then that Order has Shipping Address {linker} that Customer's Shipping Address.");
             let ir = parse_markdown(&input).unwrap_or_else(|e| panic!("linker={linker:?}: {e:?}"));
             // #283 — Constraint cell read.
-            let cs = super::constraints_from_cells(&ir.cells);
+            let cs = super::constraints_from_cells(&ir);
             let ss: Vec<_> = cs.iter().filter(|c| c.kind == "SS").collect();
             assert!(!ss.is_empty(),
                 "linker={linker:?}: expected at least one SS, got kinds {:?}",
@@ -4062,7 +4026,7 @@ mod tests {
         let input = "Category(.Name) is an entity type.\n## Fact Types\nCategory has parent Category.\nCategory has parent Category is acyclic.";
         let ir = parse_markdown(input).unwrap();
         // #283 — Constraint cell read.
-        let cs = super::constraints_from_cells(&ir.cells);
+        let cs = super::constraints_from_cells(&ir);
         let ac: Vec<_> = cs.iter().filter(|c| c.kind == "AC").collect();
         assert_eq!(ac.len(), 1, "expected one AC constraint, got {:?}",
             cs.iter().map(|c| &c.kind).collect::<Vec<_>>());
@@ -4074,7 +4038,7 @@ mod tests {
         let input = "Person(.Name) is an entity type.\n## Fact Types\nPerson is parent of Person.\nPerson is parent of Person is irreflexive.";
         let ir = parse_markdown(input).unwrap();
         // #283 — Constraint cell read.
-        let cs = super::constraints_from_cells(&ir.cells);
+        let cs = super::constraints_from_cells(&ir);
         let irref: Vec<_> = cs.iter().filter(|c| c.kind == "IR").collect();
         assert_eq!(irref.len(), 1, "expected one IR, got {:?}",
             cs.iter().map(|c| &c.kind).collect::<Vec<_>>());
@@ -4097,7 +4061,7 @@ mod tests {
                 "Person(.Name) is an entity type.\n## Fact Types\nPerson is parent of Person.\nPerson is parent of Person is {adj}.");
             let ir = parse_markdown(&input).unwrap_or_else(|e| panic!("parse {adj}: {e:?}"));
             // #283 — Constraint cell read.
-            let cs = super::constraints_from_cells(&ir.cells);
+            let cs = super::constraints_from_cells(&ir);
             let hits: Vec<_> = cs.iter().filter(|c| c.kind == want_kind).collect();
             assert_eq!(hits.len(), 1, "adj={adj}: expected {want_kind}, got {:?}",
                 cs.iter().map(|c| &c.kind).collect::<Vec<_>>());
@@ -4108,7 +4072,7 @@ mod tests {
     fn derivation_rule_captures_count_aggregate() {
         let input = "Thing(.Name) is an entity type.\nPart(.Name) is an entity type.\nArity is a value type.\n## Fact Types\nThing has Part.\nThing has Arity.\n## Derivation Rules\n* Thing has Arity iff Arity is the count of Part where Thing has Part.";
         let ir = parse_markdown(input).unwrap();
-        let rules = super::derivation_rules_from_cells(&ir.cells);
+        let rules = super::derivation_rules_from_cells(&ir);
         let rule = rules.iter()
             .find(|r| r.text.contains("Thing has Arity"))
             .expect("rule present");
@@ -4135,7 +4099,7 @@ mod tests {
         let input = "User(.Email) is an entity type.\nDomain(.Slug) is an entity type.\nOrganization(.Slug) is an entity type.\n## Fact Types\nUser belongs to Organization.\nDomain belongs to Organization.\nUser accesses Domain.\n## Derivation Rules\n+ User accesses Domain if User belongs to Organization and Domain belongs to that Organization.";
         let ir = parse_markdown(input).unwrap();
         // #283 — DerivationRule cell read.
-        let rules = super::derivation_rules_from_cells(&ir.cells);
+        let rules = super::derivation_rules_from_cells(&ir);
         let rule = &rules[0];
         assert!(rule.antecedent_filters.is_empty(),
             "expected no filters on plain join rule, got {:?}", rule.antecedent_filters);
@@ -4239,11 +4203,11 @@ mod tests {
             Each Organization is owned by at most one User.\n";
         let ir = parse_markdown(input).unwrap();
         // #283 — FactType cell reads. Fact type keyed by Fact Type ID.
-        assert!(super::fact_type_exists(&ir.cells, "User_owns_Organization"));
-        assert!(!super::fact_type_exists(&ir.cells, "User owns Organization"));
+        assert!(super::fact_type_exists(&ir, "User_owns_Organization"));
+        assert!(!super::fact_type_exists(&ir, "User owns Organization"));
         // The constraint's spans should reference the same schema ID.
         // #283 — Constraint cell read.
-        let cs = super::constraints_from_cells(&ir.cells);
+        let cs = super::constraints_from_cells(&ir);
         assert!(!cs.is_empty());
         let c = &cs[0];
         assert_eq!(c.spans[0].fact_type_id, "User_owns_Organization",
@@ -4264,11 +4228,11 @@ mod tests {
             Each Organization is administered by at most one User.\n";
         let ir = parse_markdown(input).unwrap();
         // #283 — FactType cell reads.
-        assert!(super::fact_type_exists(&ir.cells, "User_owns_Organization"));
-        assert!(super::fact_type_exists(&ir.cells, "User_administers_Organization"));
+        assert!(super::fact_type_exists(&ir, "User_owns_Organization"));
+        assert!(super::fact_type_exists(&ir, "User_administers_Organization"));
         // "is owned by" constraint should resolve to "User_owns_Organization"
         // via word overlap: "owned" matches "owns". #283 — Constraint cell read.
-        let cs = super::constraints_from_cells(&ir.cells);
+        let cs = super::constraints_from_cells(&ir);
         let owned_constraint = cs.iter()
             .find(|c| c.text.contains("is owned by"))
             .expect("should have 'is owned by' constraint");
@@ -4286,77 +4250,77 @@ mod tests {
     fn ring_irreflexive() {
         let input = "Person(.Name) is an entity type.\nPerson is a parent of Person.\nNo Person is a parent of itself.";
         let ir = parse_markdown(input).unwrap();
-        assert!(super::constraints_from_cells(&ir.cells).iter().any(|c| c.kind == "IR"), "Expected IR constraint, got: {:?}", super::constraints_from_cells(&ir.cells));
+        assert!(super::constraints_from_cells(&ir).iter().any(|c| c.kind == "IR"), "Expected IR constraint, got: {:?}", super::constraints_from_cells(&ir));
     }
 
     #[test]
     fn ring_asymmetric() {
         let input = "Person(.Name) is an entity type.\nPerson is a parent of Person.\nIf Person1 is a parent of Person2 then it is impossible that Person2 is a parent of Person1.";
         let ir = parse_markdown(input).unwrap();
-        assert!(super::constraints_from_cells(&ir.cells).iter().any(|c| c.kind == "AS"), "Expected AS constraint, got: {:?}", super::constraints_from_cells(&ir.cells));
+        assert!(super::constraints_from_cells(&ir).iter().any(|c| c.kind == "AS"), "Expected AS constraint, got: {:?}", super::constraints_from_cells(&ir));
     }
 
     #[test]
     fn ring_symmetric() {
         let input = "Person(.Name) is an entity type.\nPerson is married to Person.\nIf Person1 is married to Person2 then Person2 is married to Person1.";
         let ir = parse_markdown(input).unwrap();
-        assert!(super::constraints_from_cells(&ir.cells).iter().any(|c| c.kind == "SY"), "Expected SY constraint, got: {:?}", super::constraints_from_cells(&ir.cells));
+        assert!(super::constraints_from_cells(&ir).iter().any(|c| c.kind == "SY"), "Expected SY constraint, got: {:?}", super::constraints_from_cells(&ir));
     }
 
     #[test]
     fn ring_intransitive() {
         let input = "Person(.Name) is an entity type.\nPerson is a parent of Person.\nIf Person1 is a parent of Person2 and Person2 is a parent of Person3 then it is impossible that Person1 is a parent of Person3.";
         let ir = parse_markdown(input).unwrap();
-        assert!(super::constraints_from_cells(&ir.cells).iter().any(|c| c.kind == "IT"), "Expected IT constraint, got: {:?}", super::constraints_from_cells(&ir.cells));
+        assert!(super::constraints_from_cells(&ir).iter().any(|c| c.kind == "IT"), "Expected IT constraint, got: {:?}", super::constraints_from_cells(&ir));
     }
 
     #[test]
     fn ring_transitive() {
         let input = "Person(.Name) is an entity type.\nPerson is an ancestor of Person.\nIf Person1 is an ancestor of Person2 and Person2 is an ancestor of Person3 then Person1 is an ancestor of Person3.";
         let ir = parse_markdown(input).unwrap();
-        assert!(super::constraints_from_cells(&ir.cells).iter().any(|c| c.kind == "TR"), "Expected TR constraint, got: {:?}", super::constraints_from_cells(&ir.cells));
+        assert!(super::constraints_from_cells(&ir).iter().any(|c| c.kind == "TR"), "Expected TR constraint, got: {:?}", super::constraints_from_cells(&ir));
     }
 
     #[test]
     fn ring_acyclic() {
         let input = "Category(.Name) is an entity type.\nCategory contains Category.\nNo Category may cycle back to itself via one or more traversals through contains.";
         let ir = parse_markdown(input).unwrap();
-        assert!(super::constraints_from_cells(&ir.cells).iter().any(|c| c.kind == "AC"), "Expected AC constraint, got: {:?}", super::constraints_from_cells(&ir.cells));
+        assert!(super::constraints_from_cells(&ir).iter().any(|c| c.kind == "AC"), "Expected AC constraint, got: {:?}", super::constraints_from_cells(&ir));
     }
 
     #[test]
     fn subset_constraint() {
         let input = "Person(.Name) is an entity type.\nBook(.Title) is an entity type.\nPerson authored Book.\nPerson reviewed Book.\nIf some Person authored some Book then that Person reviewed that Book.";
         let ir = parse_markdown(input).unwrap();
-        assert!(super::constraints_from_cells(&ir.cells).iter().any(|c| c.kind == "SS"), "Expected SS constraint, got: {:?}", super::constraints_from_cells(&ir.cells));
+        assert!(super::constraints_from_cells(&ir).iter().any(|c| c.kind == "SS"), "Expected SS constraint, got: {:?}", super::constraints_from_cells(&ir));
     }
 
     #[test]
     fn equality_constraint() {
         let input = "Person(.Name) is an entity type.\nBook(.Title) is an entity type.\nPerson authored Book.\nPerson reviewed Book.\nFor each Person, that Person authored some Book if and only if that Person reviewed some Book.";
         let ir = parse_markdown(input).unwrap();
-        assert!(super::constraints_from_cells(&ir.cells).iter().any(|c| c.kind == "EQ"), "Expected EQ constraint, got: {:?}", super::constraints_from_cells(&ir.cells));
+        assert!(super::constraints_from_cells(&ir).iter().any(|c| c.kind == "EQ"), "Expected EQ constraint, got: {:?}", super::constraints_from_cells(&ir));
     }
 
     #[test]
     fn exclusion_general() {
         let input = "Person(.Name) is an entity type.\nPerson is tenured.\nPerson is contracted.\nFor each Person, at most one of the following holds: that Person is tenured; that Person is contracted.";
         let ir = parse_markdown(input).unwrap();
-        assert!(super::constraints_from_cells(&ir.cells).iter().any(|c| c.kind == "XC"), "Expected XC, got: {:?}", super::constraints_from_cells(&ir.cells));
+        assert!(super::constraints_from_cells(&ir).iter().any(|c| c.kind == "XC"), "Expected XC, got: {:?}", super::constraints_from_cells(&ir));
     }
 
     #[test]
     fn exclusive_or() {
         let input = "Person(.Name) is an entity type.\nPerson is tenured.\nPerson is contracted.\nFor each Person, exactly one of the following holds: that Person is tenured; that Person is contracted.";
         let ir = parse_markdown(input).unwrap();
-        assert!(super::constraints_from_cells(&ir.cells).iter().any(|c| c.kind == "XO"), "Expected XO, got: {:?}", super::constraints_from_cells(&ir.cells));
+        assert!(super::constraints_from_cells(&ir).iter().any(|c| c.kind == "XO"), "Expected XO, got: {:?}", super::constraints_from_cells(&ir));
     }
 
     #[test]
     fn inclusive_or() {
         let input = "Lecturer(.Name) is an entity type.\nDate(.Value) is a value type.\nLecturer is contracted until Date.\nLecturer is tenured.\nEach Lecturer is contracted until some Date or is tenured.";
         let ir = parse_markdown(input).unwrap();
-        assert!(super::constraints_from_cells(&ir.cells).iter().any(|c| c.kind == "OR"), "Expected OR, got: {:?}", super::constraints_from_cells(&ir.cells));
+        assert!(super::constraints_from_cells(&ir).iter().any(|c| c.kind == "OR"), "Expected OR, got: {:?}", super::constraints_from_cells(&ir));
     }
 
     #[test]
@@ -4380,7 +4344,7 @@ Person is uncle of Person.\n\
 ## Derivation Rules\n\
 + Person1 is uncle of Person2 iff Person1 is brother of some Person3 and that Person3 is parent of Person2.\n";
         let ir = parse_markdown(input).unwrap();
-        let rules = super::derivation_rules_from_cells(&ir.cells);
+        let rules = super::derivation_rules_from_cells(&ir);
         let rule = rules.iter()
             .find(|r| r.text.contains("uncle"))
             .expect("uncle derivation rule must be present");
@@ -4407,7 +4371,7 @@ Person is uncle of Person.\n\
         let input = "Customer(.Name) is an entity type.\nOrder(.Id) is an entity type.\nCustomer places Order.\nEach Customer places at least 1 and at most 5 Order.";
         let ir = parse_markdown(input).unwrap();
         // #283 — Constraint cell read.
-        let cs = super::constraints_from_cells(&ir.cells);
+        let cs = super::constraints_from_cells(&ir);
         assert!(cs.iter().any(|c| c.kind == "FC"), "Expected FC constraint, got: {:?}", cs);
         let fc = cs.iter().find(|c| c.kind == "FC").unwrap();
         assert_eq!(fc.min_occurrence, Some(1));
@@ -4418,21 +4382,21 @@ Person is uncle of Person.\n\
     fn value_constraint() {
         let input = "Priority is a value type.\n  The possible values of Priority are 'Low', 'Medium', 'High'.\nTicket(.Id) is an entity type.\nTicket has Priority.";
         let ir = parse_markdown(input).unwrap();
-        assert!(super::constraints_from_cells(&ir.cells).iter().any(|c| c.kind == "VC"), "Expected VC constraint, got: {:?}", super::constraints_from_cells(&ir.cells));
+        assert!(super::constraints_from_cells(&ir).iter().any(|c| c.kind == "VC"), "Expected VC constraint, got: {:?}", super::constraints_from_cells(&ir));
     }
 
     #[test]
     fn external_uniqueness() {
         let input = "Room(.Nr) is an entity type.\nBuilding(.Code) is an entity type.\nRoomNr is a value type.\nRoom is in Building.\nRoom has RoomNr.\nFor each Building and RoomNr, at most one Room is in that Building and has that RoomNr.";
         let ir = parse_markdown(input).unwrap();
-        assert!(super::constraints_from_cells(&ir.cells).iter().any(|c| c.kind == "UC"), "Expected UC (external), got: {:?}", super::constraints_from_cells(&ir.cells));
+        assert!(super::constraints_from_cells(&ir).iter().any(|c| c.kind == "UC"), "Expected UC (external), got: {:?}", super::constraints_from_cells(&ir));
     }
 
     #[test]
     fn context_pattern() {
         let input = "Room(.Nr) is an entity type.\nBuilding(.Code) is an entity type.\nRoomNr is a value type.\nRoom is in Building.\nRoom has RoomNr.\nContext: Room is in Building; Room has RoomNr. In this context, each Building, RoomNr combination is associated with at most one Room.";
         let ir = parse_markdown(input).unwrap();
-        assert!(super::constraints_from_cells(&ir.cells).iter().any(|c| c.kind == "UC"), "Expected UC (context), got: {:?}", super::constraints_from_cells(&ir.cells));
+        assert!(super::constraints_from_cells(&ir).iter().any(|c| c.kind == "UC"), "Expected UC (context), got: {:?}", super::constraints_from_cells(&ir));
     }
 
     #[test]
@@ -4453,12 +4417,12 @@ Auth Session uses Session Strategy.
 ";
         let ir = parse_markdown(input).unwrap();
         // #283 — FactType cell reads. Keys should be underscore format, not reading format.
-        assert!(super::fact_type_ids(&ir.cells).iter().all(|key| !key.contains(' ')),
+        assert!(super::fact_type_ids(&ir).iter().all(|key| !key.contains(' ')),
             "Fact type keys should not contain spaces");
-        assert!(super::fact_type_exists(&ir.cells, "Auth_Session_is_for_Customer"));
-        assert!(super::fact_type_exists(&ir.cells, "Auth_Session_uses_Session_Strategy"));
+        assert!(super::fact_type_exists(&ir, "Auth_Session_is_for_Customer"));
+        assert!(super::fact_type_exists(&ir, "Auth_Session_uses_Session_Strategy"));
         // Constraints should reference schema IDs. #283 — Constraint cell read.
-        let cs = super::constraints_from_cells(&ir.cells);
+        let cs = super::constraints_from_cells(&ir);
         assert!(
             cs.iter().flat_map(|c| c.spans.iter())
                 .all(|span| !span.fact_type_id.contains(' ')),
@@ -4471,7 +4435,7 @@ Auth Session uses Session Strategy.
         let input = "Customer(.Email) is an entity type.\nSupport Request(.Id) is an entity type.\nCustomer submits Support Request.\nIf some Support Request has some Email Address and some Customer is identified by that Email Address then that Customer submits that Support Request.\nThis span with Customer, Support Request provides the preferred identification scheme for Customer Submission Match.";
         let ir = parse_markdown(input).unwrap();
         // #283 — span metadata lives in the NamedSpan cell, not a typed map.
-        let named_spans = ir.cells.get("NamedSpan")
+        let named_spans = ir.get("NamedSpan")
             .expect("NamedSpan cell must exist");
         let fact = named_spans.iter()
             .find(|f| crate::ast::binding(f, "name") == Some("Customer Submission Match"))
@@ -4485,14 +4449,14 @@ Auth Session uses Session Strategy.
         let input = "Customer(.Email) is an entity type.\nSupport Request(.Id) is an entity type.\nEmail Address is a value type.\nCustomer submits Support Request.\nCustomer is identified by Email Address.\nSupport Request has Email Address.\nIf some Support Request has some Email Address and some Customer is identified by that Email Address then that Customer submits that Support Request.\nThis span with Customer, Support Request provides the preferred identification scheme for Customer Submission Match.\nConstraint Span 'Customer Submission Match' autofills from superset.";
         let ir = parse_markdown(input).unwrap();
         // #283 — autofill spans live in the AutofillSpan cell.
-        let autofill = ir.cells.get("AutofillSpan")
+        let autofill = ir.get("AutofillSpan")
             .expect("AutofillSpan cell must exist");
         assert!(autofill.iter()
             .any(|f| crate::ast::binding(f, "name") == Some("Customer Submission Match")),
             "AutofillSpan cell must carry 'Customer Submission Match'");
         // The SS constraint targeting Customer, Support Request should have autofill enabled.
         // #283 — Constraint cell read.
-        let cs = super::constraints_from_cells(&ir.cells);
+        let cs = super::constraints_from_cells(&ir);
         let ss = cs.iter().find(|c| c.kind == "SS").expect("Should have SS constraint");
         assert_eq!(ss.spans.iter().any(|s| s.subset_autofill == Some(true)), true, "SS constraint should have autofill enabled");
     }
@@ -4509,7 +4473,7 @@ This span with Person, Department provides the preferred identification scheme f
 Constraint Span 'Department Leadership' autofills from superset.";
         let ir = parse_markdown(input).unwrap();
         // #283 — Constraint cell read.
-        let cs = super::constraints_from_cells(&ir.cells);
+        let cs = super::constraints_from_cells(&ir);
         let ss = cs.iter().find(|c| c.kind == "SS").expect("SS constraint");
         assert!(ss.spans.iter().any(|s| s.subset_autofill == Some(true)), "autofill should be set");
     }
@@ -4528,7 +4492,7 @@ Support Response uses Dash.
 It is forbidden that Support Response uses Dash.";
         let ir = parse_markdown(input).unwrap();
         // #283 — Constraint cell read.
-        let cs = super::constraints_from_cells(&ir.cells);
+        let cs = super::constraints_from_cells(&ir);
         let c = cs.iter()
             .find(|c| c.text.contains("forbidden") && c.text.contains("Dash"))
             .expect("Should have forbidden Dash constraint");
@@ -4548,7 +4512,7 @@ Support Response uses Dash.
 It is forbidden that Support Response uses Dash.";
         let ir = parse_markdown(input).unwrap();
         // #283 — Constraint cell read.
-        let cs = super::constraints_from_cells(&ir.cells);
+        let cs = super::constraints_from_cells(&ir);
         let c = cs.iter()
             .find(|c| c.text.contains("forbidden") && c.text.contains("Dash"))
             .unwrap();
@@ -4575,7 +4539,7 @@ It is forbidden that Support Response uses Dash.
 It is forbidden that Support Response contains Markdown Syntax.";
         let ir = parse_markdown(input).unwrap();
         // #283 — Constraint cell read.
-        let cs = super::constraints_from_cells(&ir.cells);
+        let cs = super::constraints_from_cells(&ir);
         let deontics: Vec<&ConstraintDef> = cs.iter()
             .filter(|c| c.modality == "deontic")
             .collect();
@@ -4599,7 +4563,7 @@ Support Response conforms to Pricing Model.
 It is obligatory that each Support Response conforms to Pricing Model.";
         let ir = parse_markdown(input).unwrap();
         // #283 — Constraint cell read.
-        let cs = super::constraints_from_cells(&ir.cells);
+        let cs = super::constraints_from_cells(&ir);
         let c = cs.iter()
             .find(|c| c.text.contains("obligatory") && c.text.contains("Pricing Model"))
             .expect("Should have obligatory Pricing Model constraint");
@@ -4609,8 +4573,8 @@ It is obligatory that each Support Response conforms to Pricing Model.";
     }
 
     /// Helper: compile IR to defs, then evaluate constraints via defs path.
-    fn eval_deontic_defs(ir: &ParseCtx, text: &str) -> Vec<crate::types::Violation> {
-        let state = ctx_to_state(ir);
+    fn eval_deontic_defs(ir: &Cells, text: &str) -> Vec<crate::types::Violation> {
+        let state = cells_to_state(ir);
         let defs = crate::compile::compile_to_defs_state(&state);
         let empty_state = crate::ast::Object::phi();
         let def_obj = crate::ast::defs_to_state(&defs, &empty_state);
@@ -4917,13 +4881,13 @@ fn forbidden_ipv6_ula_fd() {
             .expect("metamodel readings/core.md must parse");
 
         // #283 — Noun cell read.
-        let obj_type = super::noun_object_type(&domain.cells, "Derivation Mode")
+        let obj_type = super::noun_object_type(&domain, "Derivation Mode")
             .expect("core.md must declare 'Derivation Mode' as a noun");
         assert_eq!(obj_type, "value",
             "'Derivation Mode' must be a value type");
 
         // #283 — enum values on the EnumValues cell.
-        let vals = super::enum_values_for_noun(&domain.cells, "Derivation Mode");
+        let vals = super::enum_values_for_noun(&domain, "Derivation Mode");
         assert!(!vals.is_empty(), "'Derivation Mode' must have declared enum values");
         assert!(vals.iter().any(|v| v == "fully-derived"),
             "Derivation Mode enum must include 'fully-derived'; got: {:?}", vals);
@@ -4947,10 +4911,10 @@ fn forbidden_ipv6_ula_fd() {
             .expect("metamodel readings/core.md must parse");
         for entity in ["Join Path", "Join", "Role Sequence", "Role Projection", "Join Type"] {
             // #283 — Noun cell read.
-            let obj_type = super::noun_object_type(&domain.cells, entity)
+            let obj_type = super::noun_object_type(&domain, entity)
                 .unwrap_or_else(|| panic!(
                     "core.md must declare NORMA entity '{}' for the meta-circular parser; got nouns: {:?}",
-                    entity, super::noun_names(&domain.cells)
+                    entity, super::noun_names(&domain)
                 ));
             assert_eq!(obj_type, "entity",
                 "'{}' must be an entity type (NORMA ObjectType subtype)", entity);
@@ -4968,10 +4932,10 @@ fn forbidden_ipv6_ula_fd() {
             .expect("metamodel readings/core.md must parse");
         for entity in ["Bound", "Value Range", "Facet", "Value", "Unit", "Dimension", "Textual Constraint"] {
             // #283 — Noun cell read.
-            let obj_type = super::noun_object_type(&domain.cells, entity)
+            let obj_type = super::noun_object_type(&domain, entity)
                 .unwrap_or_else(|| panic!(
                     "core.md must declare NORMA entity '{}'; got nouns: {:?}",
-                    entity, super::noun_names(&domain.cells)
+                    entity, super::noun_names(&domain)
                 ));
             assert_eq!(obj_type, "entity",
                 "'{}' must be an entity type", entity);
@@ -4989,21 +4953,21 @@ fn forbidden_ipv6_ula_fd() {
         // Plain value types — no enum required
         for value_type in ["Regex Pattern", "Lexical Value", "Alias", "Length", "Binary Precision", "Digit Count"] {
             // #283 — Noun cell read.
-            let obj_type = super::noun_object_type(&domain.cells, value_type)
+            let obj_type = super::noun_object_type(&domain, value_type)
                 .unwrap_or_else(|| panic!(
                     "core.md must declare NORMA value type '{}'; got: {:?}",
-                    value_type, super::noun_names(&domain.cells)
+                    value_type, super::noun_names(&domain)
                 ));
             assert_eq!(obj_type, "value",
                 "'{}' must be a value type", value_type);
         }
         // Clusivity: enum of inclusive / exclusive — via EnumValues cell (#283)
-        let clusivity = super::enum_values_for_noun(&domain.cells, "Clusivity");
+        let clusivity = super::enum_values_for_noun(&domain, "Clusivity");
         assert!(!clusivity.is_empty(), "core.md must declare 'Clusivity' enum");
         assert!(clusivity.iter().any(|v| v == "inclusive"));
         assert!(clusivity.iter().any(|v| v == "exclusive"));
         // Derivation Storage Type: NORMA's {stored, derived, derived-and-stored}
-        let storage = super::enum_values_for_noun(&domain.cells, "Derivation Storage Type");
+        let storage = super::enum_values_for_noun(&domain, "Derivation Storage Type");
         assert!(!storage.is_empty(), "core.md must declare 'Derivation Storage Type' enum");
         assert!(storage.iter().any(|v| v == "stored"));
         assert!(storage.iter().any(|v| v == "derived"));
@@ -5018,9 +4982,9 @@ fn forbidden_ipv6_ula_fd() {
     // recognizes the marker and stores the corresponding Derivation Mode on
     // the FactTypeDef.
 
-    fn mode_for(domain: &ParseCtx, reading: &str) -> Option<String> {
+    fn mode_for(domain: &super::Cells, reading: &str) -> Option<String> {
         // #283 — InstanceFact cell read.
-        domain.cells.get("InstanceFact")?
+        domain.get("InstanceFact")?
             .iter()
             .find(|f| crate::ast::binding(f, "subjectNoun") == Some("Fact Type")
                    && crate::ast::binding(f, "subjectValue") == Some(reading)
@@ -5072,7 +5036,7 @@ Customer has Full Name *.
 ";
         let domain = parse_markdown(input).expect("parse");
         // #283 — DerivationRule cell read.
-        let rules = super::derivation_rules_from_cells(&domain.cells);
+        let rules = super::derivation_rules_from_cells(&domain);
         let has_rule = rules.iter()
             .any(|r| r.text.contains("Customer has Full Name") && r.text.contains(" iff "));
         assert!(has_rule,
@@ -5097,7 +5061,7 @@ Order has Total **.
 ";
         let domain = parse_markdown(input).expect("parse");
         // #283 — DerivationRule cell read.
-        let rules = super::derivation_rules_from_cells(&domain.cells);
+        let rules = super::derivation_rules_from_cells(&domain);
         let has_rule = rules.iter()
             .any(|r| r.text.starts_with("Order has Total") && r.text.contains(" iff "));
         assert!(has_rule,
@@ -5114,7 +5078,7 @@ Person(.Name) is an entity type.
 ";
         let domain = parse_markdown(input).expect("parse");
         // #283 — DerivationRule cell read.
-        let rules = super::derivation_rules_from_cells(&domain.cells);
+        let rules = super::derivation_rules_from_cells(&domain);
         let has_rule = rules.iter()
             .any(|r| r.text.contains("Grandparent") && r.text.contains(" if "));
         assert!(has_rule,
@@ -5131,7 +5095,7 @@ Customer has Email.
         let domain = parse_markdown(input).expect("parse");
         assert!(mode_for(&domain, "Customer has Email").is_none(),
             "a reading without a marker must not emit a Derivation Mode fact; \
-             instance_facts = {:?}", domain.cells.get("InstanceFact"));
+             instance_facts = {:?}", domain.get("InstanceFact"));
     }
 
     #[test]
@@ -5149,8 +5113,8 @@ Customer has Full Name *.
 ";
         let domain = parse_markdown(input).expect("parse");
         // #283 — FactType cell read.
-        let ft_readings: Vec<String> = super::fact_type_ids(&domain.cells).iter()
-            .filter_map(|id| super::fact_type_reading(&domain.cells, id))
+        let ft_readings: Vec<String> = super::fact_type_ids(&domain).iter()
+            .filter_map(|id| super::fact_type_reading(&domain, id))
             .collect();
         assert!(
             ft_readings.iter().any(|r| r == "Customer has Full Name"),
@@ -5158,7 +5122,7 @@ Customer has Full Name *.
         );
 
         // #283 — InstanceFact cell read.
-        let instance_cell = domain.cells.get("InstanceFact");
+        let instance_cell = domain.get("InstanceFact");
         let mode_fact = instance_cell.and_then(|facts| facts.iter()
             .find(|f| crate::ast::binding(f, "subjectNoun") == Some("Fact Type")
                    && crate::ast::binding(f, "subjectValue") == Some("Customer has Full Name")
@@ -5176,8 +5140,8 @@ Customer has Full Name *.
             .expect("metamodel readings/core.md must parse");
 
         // #283 — FactType cell reads.
-        let ft_readings: Vec<String> = super::fact_type_ids(&domain.cells).iter()
-            .filter_map(|id| super::fact_type_reading(&domain.cells, id))
+        let ft_readings: Vec<String> = super::fact_type_ids(&domain).iter()
+            .filter_map(|id| super::fact_type_reading(&domain, id))
             .collect();
         let ft_exists = ft_readings.iter().any(|r| r == "Fact Type has Derivation Mode");
         assert!(ft_exists,
@@ -5273,10 +5237,10 @@ Customer has Full Name *.
         let ir = parse_markdown_with_nouns(input, &existing)
             .expect("non-reserved user domain should parse when metamodel is already present");
         // #283 — nouns live in the Noun cell.
-        assert!(super::noun_exists(&ir.cells, "Order"));
-        assert!(super::noun_exists(&ir.cells, "Customer"));
+        assert!(super::noun_exists(&ir, "Order"));
+        assert!(super::noun_exists(&ir, "Customer"));
         // Existing metamodel nouns remain visible in the merged IR.
-        assert!(super::noun_exists(&ir.cells, "Noun"));
+        assert!(super::noun_exists(&ir, "Noun"));
     }
 
     #[test]
@@ -5292,9 +5256,9 @@ Customer has Full Name *.
         let ir = parse_markdown_with_nouns(input, &empty)
             .expect("bootstrap compile of metamodel nouns must succeed");
         // #283 — nouns live in the Noun cell.
-        assert!(super::noun_exists(&ir.cells, "Noun"));
-        assert!(super::noun_exists(&ir.cells, "Constraint"));
-        assert!(super::noun_exists(&ir.cells, "Role"));
+        assert!(super::noun_exists(&ir, "Noun"));
+        assert!(super::noun_exists(&ir, "Constraint"));
+        assert!(super::noun_exists(&ir, "Role"));
     }
 
     #[test]
@@ -5305,7 +5269,7 @@ Customer has Full Name *.
         let input = "# Sales\nOrder(.Id) is an entity type.";
         let ir = parse_markdown_with_nouns(input, &empty).unwrap();
         // #283 — Noun cell read.
-        assert!(super::noun_exists(&ir.cells, "Order"));
+        assert!(super::noun_exists(&ir, "Order"));
     }
 
     // One test per reserved metamodel noun. Each verifies that redeclaring
@@ -5384,7 +5348,7 @@ Thing 'alice-2' has Color 'blue'.
 Thing 'bob-1' has Color 'green'.
 "#;
         let ir = parse_markdown(input).unwrap();
-        let state = ctx_to_state(&ir);
+        let state = cells_to_state(&ir);
 
         // Component cells should exist with decomposed bindings
         let owner_cell = fetch_or_phi("Thing_has_Owner", &state);
@@ -5412,7 +5376,7 @@ Widget has Label.
 Widget 'my-system-3' has Label 'foo'.
 "#;
         let ir = parse_markdown(input).unwrap();
-        let state = ctx_to_state(&ir);
+        let state = cells_to_state(&ir);
 
         let name_cell = fetch_or_phi("Widget_has_System_Name", &state);
         let names = name_cell.as_seq().expect("Widget_has_System_Name must exist");
@@ -5428,7 +5392,7 @@ Widget 'my-system-3' has Label 'foo'.
         use crate::ast::{fetch_or_phi, binding};
         let input = "Person is an entity type.\nColor is a value type.\n";
         let ir = parse_markdown(input).unwrap();
-        let state = ctx_to_state(&ir);
+        let state = cells_to_state(&ir);
         let nouns = fetch_or_phi("Noun", &state);
         let facts = nouns.as_seq().expect("Noun cell");
         let person = facts.iter().find(|f| binding(f, "name") == Some("Person")).unwrap();
@@ -5442,7 +5406,7 @@ Widget 'my-system-3' has Label 'foo'.
         use crate::ast::{fetch_or_phi, binding};
         let input = "Case (.nr) is an entity type.\n";
         let ir = parse_markdown(input).unwrap();
-        let state = ctx_to_state(&ir);
+        let state = cells_to_state(&ir);
         let nouns = fetch_or_phi("Noun", &state);
         let facts = nouns.as_seq().expect("Noun cell");
         let case = facts.iter().find(|f| binding(f, "name") == Some("Case")).unwrap();
@@ -5466,8 +5430,8 @@ Widget 'my-system-3' has Label 'foo'.
         let input = "Animal is an entity type.\nAnimal is partitioned into Cat, Dog.\n";
         let ir = parse_markdown(input).unwrap();
         // #283 — Noun cell read.
-        assert!(super::noun_exists(&ir.cells, "Cat"), "Cat should be auto-created in loose mode");
-        assert!(super::noun_exists(&ir.cells, "Dog"), "Dog should be auto-created in loose mode");
+        assert!(super::noun_exists(&ir, "Cat"), "Cat should be auto-created in loose mode");
+        assert!(super::noun_exists(&ir, "Dog"), "Dog should be auto-created in loose mode");
     }
 
     #[test]
@@ -5481,7 +5445,7 @@ App 'sherlock' uses Generator 'sqlite'.
 "#;
         let ir = parse_markdown(input).unwrap();
         // #283 — InstanceFact cell read.
-        let facts = ir.cells.get("InstanceFact").expect("InstanceFact cell");
+        let facts = ir.get("InstanceFact").expect("InstanceFact cell");
         assert_eq!(facts.len(), 1,
             "Should parse dual-quoted binary instance fact, got: {:?}", facts);
         let f = &facts[0];
@@ -5537,7 +5501,7 @@ Order has Customer Age.\n\
 ## Derivation Rules\n\
 Order has Customer Age iff Order's Customer has Age.\n";
         let ir = parse_markdown(input).unwrap();
-        let rules = super::derivation_rules_from_cells(&ir.cells);
+        let rules = super::derivation_rules_from_cells(&ir);
         let rule = rules.iter()
             .find(|r| r.text.contains("Customer Age"))
             .expect("derivation rule for Customer Age must be present");
