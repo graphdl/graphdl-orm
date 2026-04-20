@@ -470,7 +470,14 @@ fn inner_quantifiers(body: &str) -> Vec<&'static str> {
         })
         .copied()
         .collect();
-    long_hits.into_iter().chain(short_hits).collect()
+    // ORM 2 plural `some` is the MC signal — `Each X has some Y` is
+    // the "at least one" shorthand. Emit as its own quantifier atom
+    // so the grammar's MC rule matches on either spelling. Require a
+    // space on each side to avoid matching inside words like `someone`
+    // or at the start when `some` is the leading quantifier (stripped
+    // upstream by `strip_leading_quantifier`).
+    let some_hit: Option<&'static str> = body.contains(" some ").then_some("some");
+    long_hits.into_iter().chain(short_hits).chain(some_hit).collect()
 }
 
 /// Parse the enum-values leading phrase.

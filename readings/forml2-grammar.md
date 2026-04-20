@@ -112,6 +112,8 @@ Statement has Classification 'Uniqueness Constraint' iff Statement has Quantifie
 
 Statement has Classification 'Mandatory Role Constraint' iff Statement has Quantifier 'at least one'.
 
+Statement has Classification 'Mandatory Role Constraint' iff Statement has Quantifier 'some'.
+
 Statement has Classification 'Frequency Constraint' iff Statement has Quantifier 'at most' and Statement has Quantifier 'at least'.
 
 Statement has Classification 'Ring Constraint' iff Statement has Trailing Marker 'is irreflexive'.
