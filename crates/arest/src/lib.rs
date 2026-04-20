@@ -722,6 +722,35 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
     //   system(h, "snapshot", "label") → label                    (caller-named)
     //   system(h, "rollback", "id")    → id on success, ⊥ on miss
     //   system(h, "snapshots", "")     → <id₁, id₂, ...> FFP seq
+    // ── ↓DEFS FFI: runtime registers a Platform function (#305) ─────
+    //
+    //   system(h, "register:<name>", "") → <name> on success, ⊥ on failure
+    //
+    // Pushes Func::Platform(<name>) into DEFS and records <name> in
+    // `runtime_registered_names`. This is the FFI form of
+    // ast::register_runtime_fn — it gives hosts (JS, wasm, browser) a
+    // way to mark which Platform primitives they own so Citation
+    // provenance can cite them with Authority Type 'Runtime-Function'.
+    //
+    // Input is currently empty. Future revisions may accept a
+    // serialized Func body (freeze-encoded, same scheme as the
+    // thaw FFI) to register composable FFP bodies instead of
+    // Platform stubs.
+    if let Some(name) = key.strip_prefix("register:") {
+        if name.is_empty() {
+            return "⊥".into();
+        }
+        let mut st = tenant.write();
+        let snapshot = st.snapshot_d();
+        let new_d = ast::register_runtime_fn(
+            name,
+            ast::Func::Platform(name.to_string()),
+            &snapshot,
+        );
+        st.replace_d(new_d);
+        return name.to_string();
+    }
+
     if key == "snapshot" {
         let mut st = tenant.write();
         let label = if input.is_empty() {
@@ -1768,6 +1797,58 @@ Order has total.
         // Untouched FT cell must be preserved.
         assert_eq!(ast::fetch("Order_has_Amount",&d), ast::Object::atom("100"));
 
+        release_impl(h);
+    }
+
+    // ── FFI: ↓DEFS via system(h, "register:<name>", "") (#305) ─────
+    // Exposes ast::register_runtime_fn to hosts (JS, wasm, browser)
+    // through the system() surface. Key is "register:<name>"; input
+    // is currently empty (stub body = Func::Platform(<name>), which
+    // the engine dispatches via apply_platform — unknown names
+    // return Bottom until a callback mechanism lands). The host's
+    // job at this commit is only to mark which names it owns so
+    // Citation provenance can cite them.
+
+    #[test]
+    fn system_register_key_records_name_in_runtime_registry() {
+        let h = create_bare_impl();
+        let result = system_impl(h, "register:send_email", "");
+        assert_eq!(result, "send_email",
+            "register:<name> should echo the registered name on success; got {result}");
+
+        let d = peek(h).expect("handle must be live");
+        let registry = ast::fetch("runtime_registered_names", &d);
+        let names: Vec<String> = registry.as_seq()
+            .map(|s| s.iter().filter_map(|o| o.as_atom().map(String::from)).collect())
+            .unwrap_or_default();
+        assert!(names.contains(&"send_email".to_string()),
+            "runtime_registered_names must contain 'send_email' after system('register:send_email'); got {names:?}");
+        release_impl(h);
+    }
+
+    #[test]
+    fn system_register_key_binds_name_in_defs() {
+        let h = create_bare_impl();
+        let _ = system_impl(h, "register:http_fetch", "");
+
+        let d = peek(h).expect("handle must be live");
+        // apply(Func::Def("http_fetch"), ...) should resolve the binding.
+        // The body is Func::Platform("http_fetch"), which apply_platform
+        // falls through on (no arm for http_fetch yet) — that's a
+        // callback-layer concern for a follow-up; this test only verifies
+        // the DEFS entry exists.
+        let def_obj = ast::fetch("http_fetch", &d);
+        assert_ne!(def_obj, ast::Object::Bottom,
+            "register:<name> must push a DEFS binding for the name");
+        release_impl(h);
+    }
+
+    #[test]
+    fn system_register_rejects_empty_name() {
+        let h = create_bare_impl();
+        let result = system_impl(h, "register:", "");
+        assert_eq!(result, "⊥",
+            "register: with empty name must return ⊥; got {result}");
         release_impl(h);
     }
 }
