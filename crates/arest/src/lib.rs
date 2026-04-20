@@ -751,6 +751,57 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
         return name.to_string();
     }
 
+    // ── Federated ingest FFI (#305) ──────────────────────────────────
+    //
+    //   system(h, "federated_ingest:<noun>", <JSON>) → <cite-id> | ⊥
+    //
+    // Full ρ(populate_n) end-to-end: the host supplies the pre-fetched
+    // response along with origin metadata; the engine pushes facts to
+    // their declared FT cells and emits a Citation with Authority Type
+    // 'Federated-Fetch'. All facts from the same fetch share the
+    // returned Citation id.
+    //
+    // Payload shape:
+    //   {
+    //     "externalSystem": "stripe",
+    //     "url": "https://api.stripe.com/v1/customers",
+    //     "retrievalDate": "2026-04-20T12:00:00Z",
+    //     "facts": [
+    //       {"factTypeId": "Stripe_Customer_has_Email",
+    //        "bindings": {"Stripe Customer": "cus_1", "Email": "a@x.com"}}
+    //     ]
+    //   }
+    if let Some(_noun) = key.strip_prefix("federated_ingest:") {
+        let parsed: serde_json::Value = match serde_json::from_str(input) {
+            Ok(v) => v,
+            Err(_) => return "⊥".into(),
+        };
+        let external_system = parsed.get("externalSystem").and_then(|v| v.as_str()).unwrap_or("");
+        let url = parsed.get("url").and_then(|v| v.as_str()).unwrap_or("");
+        let retrieval_date = parsed.get("retrievalDate").and_then(|v| v.as_str()).unwrap_or("");
+        if url.is_empty() || external_system.is_empty() || retrieval_date.is_empty() {
+            return "⊥".into();
+        }
+        let facts: Vec<(String, Vec<(String, String)>)> = parsed.get("facts")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|entry| {
+                let ft_id = entry.get("factTypeId")?.as_str()?.to_string();
+                let bindings = entry.get("bindings")?.as_object()?;
+                let pairs: Vec<(String, String)> = bindings.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect();
+                Some((ft_id, pairs))
+            }).collect())
+            .unwrap_or_default();
+        let mut st = tenant.write();
+        let snapshot = st.snapshot_d();
+        let (cite_id, new_d) = ast::ingest_federated_facts(
+            external_system, url, retrieval_date, &facts, &snapshot,
+        );
+        st.replace_d(new_d);
+        return cite_id;
+    }
+
     if key == "snapshot" {
         let mut st = tenant.write();
         let label = if input.is_empty() {
@@ -1849,6 +1900,53 @@ Order has total.
         let result = system_impl(h, "register:", "");
         assert_eq!(result, "⊥",
             "register: with empty name must return ⊥; got {result}");
+        release_impl(h);
+    }
+
+    // ── FFI: federated_ingest: push fetched facts + Citation into P ─
+
+    /// Full ρ(populate_n) end-to-end via FFI. The host (MCP server,
+    /// Cloudflare worker) does the async HTTP fetch and maps JSON to
+    /// facts, then hands the result to the engine through this key.
+    #[test]
+    fn system_federated_ingest_pushes_facts_and_citation() {
+        let h = create_bare_impl();
+        let payload = r#"{
+          "externalSystem": "stripe",
+          "url": "https://api.stripe.com/v1/customers",
+          "retrievalDate": "2026-04-20T12:00:00Z",
+          "facts": [
+            {"factTypeId": "Stripe_Customer_has_Email",
+             "bindings": {"Stripe Customer": "cus_1", "Email": "a@x.com"}},
+            {"factTypeId": "Stripe_Customer_has_Name",
+             "bindings": {"Stripe Customer": "cus_1", "Name": "Alice"}}
+          ]
+        }"#;
+
+        let cite_id = system_impl(h, "federated_ingest:Stripe Customer", payload);
+        assert!(cite_id.starts_with("cite:"),
+            "federated_ingest should return the Citation id; got {cite_id}");
+
+        let d = peek(h).expect("handle live");
+        let uri_facts = ast::fetch("Citation_has_URI", &d).as_seq()
+            .map(|s| s.to_vec()).unwrap_or_default();
+        assert!(uri_facts.iter().any(|f|
+            ast::binding(f, "URI") == Some("https://api.stripe.com/v1/customers")
+        ), "Citation_has_URI must record the fetch URL");
+
+        let email_cell = ast::fetch("Stripe_Customer_has_Email", &d).as_seq()
+            .map(|s| s.to_vec()).unwrap_or_default();
+        assert_eq!(email_cell.len(), 1);
+        assert_eq!(ast::binding(&email_cell[0], "Email"), Some("a@x.com"));
+        release_impl(h);
+    }
+
+    #[test]
+    fn system_federated_ingest_rejects_malformed_payload() {
+        let h = create_bare_impl();
+        let result = system_impl(h, "federated_ingest:X", "not json");
+        assert_eq!(result, "⊥",
+            "federated_ingest with invalid JSON must return ⊥; got {result}");
         release_impl(h);
     }
 }
