@@ -939,6 +939,9 @@ fn emit_constraint_modules(state: &Object) -> (Vec<String>, Vec<String>) {
                     let (min_c, max_c) = parse_fc_bounds(text);
                     Some(emit_fc_constraint_body(&module_name, min_c, max_c))
                 }
+                "IR" | "AS" | "AT" | "SY" | "IT" | "TR" | "AC" | "RF" => {
+                    Some(emit_ring_constraint_body(&module_name, kind))
+                }
                 _ => None,
             };
             let _ = text;
@@ -949,6 +952,217 @@ fn emit_constraint_modules(state: &Object) -> (Vec<String>, Vec<String>) {
         }
     }
     (modules, names)
+}
+
+/// Ring-constraint module body — pairwise predicate over (left, right)
+/// row halves.
+///
+/// Each ring kind maps to a specific pairwise shape:
+///   IR : violation = ∃ row. row.left == row.right (no self-loops).
+///   AS : violation = ∃ (r1, r2) distinct. r1.left == r2.right
+///                  && r1.right == r2.left.
+///   AT : antisymmetric — like AS but only when left != right (the
+///        self-loop case is allowed under antisymmetry).
+///   SY : symmetric — every (a, b) must have a matching (b, a).
+///        violation = ∃ row. no active row matches (row.right, row.left).
+///   IT : intransitive — violation = ∃ r1, r2 with r1.right == r2.left
+///        AND a third r3 covers (r1.left, r2.right).
+///   TR : transitive — violation = ∃ r1, r2 with r1.right == r2.left
+///        AND no r3 covers (r1.left, r2.right).
+///   AC : acyclic — approximate as "no two-row cycle" (the same pair
+///        pattern as AS restricted to distinct halves). A full closure
+///        check is post-1.0.
+///   RF : reflexive — every distinct left must have its own self-loop.
+///        violation = ∃ row. no active row matches (row.left, row.left).
+///
+/// The module always takes the full row bus + row_count so the
+/// integrator-side wiring mirrors UC / MC and a single BRAM handshake
+/// covers every ring kind. The ring-specific predicate compiles to a
+/// combinational hedge of comparators driving a single `hit` OR-
+/// reduction, clocked into `violation`.
+fn emit_ring_constraint_body(module_name: &str, kind: &str) -> String {
+    let depth = CONSTRAINT_DEFAULT_DEPTH;
+    let row_width = CONSTRAINT_DEFAULT_ROW_WIDTH;
+    let half = row_width / 2;
+    let mut out = String::new();
+    out.push_str(&format!(
+        "module {name} #(\n    \
+            parameter DEPTH = {depth},\n    \
+            parameter ROW_WIDTH = {row_width}\n\
+        ) (\n    \
+            input wire clk,\n    \
+            input wire rst_n,\n    \
+            input wire [DEPTH*ROW_WIDTH-1:0] rows_flat,\n    \
+            input wire [$clog2(DEPTH+1)-1:0] row_count,\n    \
+            output reg violation\n\
+        );\n    \
+            // {kind} predicate over (left, right) row halves.\n",
+        name = module_name, depth = depth, row_width = row_width, kind = kind,
+    ));
+    // Per-row (left, right) aliases.
+    for i in 0..depth {
+        let row_lo = i * row_width;
+        let right_lo = row_lo;
+        let left_lo = row_lo + half;
+        out.push_str(&format!(
+            "    wire [{hm1}:0] row_{i}_left  = rows_flat[{left_lo} +: {half}];\n",
+            hm1 = half - 1, i = i, left_lo = left_lo, half = half,
+        ));
+        out.push_str(&format!(
+            "    wire [{hm1}:0] row_{i}_right = rows_flat[{right_lo} +: {half}];\n",
+            hm1 = half - 1, i = i, right_lo = right_lo, half = half,
+        ));
+    }
+    out.push_str("    wire hit;\n");
+    // Build the predicate expression per kind.
+    let expr = match kind {
+        "IR" => {
+            // ∃ active row. left == right.
+            let terms: Vec<String> = (0..depth).map(|i| format!(
+                "({i} < row_count && row_{i}_left == row_{i}_right)", i = i,
+            )).collect();
+            terms.join(" || ")
+        }
+        "AS" => {
+            // ∃ distinct (i, j) active. row_i.left == row_j.right
+            // && row_i.right == row_j.left.
+            let mut terms: Vec<String> = Vec::new();
+            for i in 0..depth {
+                for j in 0..depth {
+                    if i == j { continue; }
+                    terms.push(format!(
+                        "({i} < row_count && {j} < row_count \
+                         && row_{i}_left == row_{j}_right \
+                         && row_{i}_right == row_{j}_left)",
+                        i = i, j = j,
+                    ));
+                }
+            }
+            if terms.is_empty() { "1'b0".to_string() } else { terms.join(" || ") }
+        }
+        "AT" => {
+            // Antisymmetric: AS with the self-loop case excluded.
+            let mut terms: Vec<String> = Vec::new();
+            for i in 0..depth {
+                for j in 0..depth {
+                    if i == j { continue; }
+                    terms.push(format!(
+                        "({i} < row_count && {j} < row_count \
+                         && row_{i}_left == row_{j}_right \
+                         && row_{i}_right == row_{j}_left \
+                         && row_{i}_left != row_{i}_right)",
+                        i = i, j = j,
+                    ));
+                }
+            }
+            if terms.is_empty() { "1'b0".to_string() } else { terms.join(" || ") }
+        }
+        "SY" => {
+            // ∃ active row i. no active row j matches (row_i.right, row_i.left).
+            let mut terms: Vec<String> = Vec::new();
+            for i in 0..depth {
+                // "no inverse present" = AND over all j of "j inactive OR j doesn't match".
+                let inverse_parts: Vec<String> = (0..depth).map(|j| format!(
+                    "!({j} < row_count && row_{j}_left == row_{i}_right \
+                     && row_{j}_right == row_{i}_left)",
+                    i = i, j = j,
+                )).collect();
+                let no_inverse = inverse_parts.join(" && ");
+                terms.push(format!(
+                    "({i} < row_count && ({no_inverse}))",
+                    i = i, no_inverse = no_inverse,
+                ));
+            }
+            if terms.is_empty() { "1'b0".to_string() } else { terms.join(" || ") }
+        }
+        "RF" => {
+            // ∃ active row i. no active row j has row_j.left == row_i.left
+            // && row_j.right == row_i.left (i.e. no self-loop covers it).
+            let mut terms: Vec<String> = Vec::new();
+            for i in 0..depth {
+                let self_parts: Vec<String> = (0..depth).map(|j| format!(
+                    "!({j} < row_count && row_{j}_left == row_{i}_left \
+                     && row_{j}_right == row_{i}_left)",
+                    i = i, j = j,
+                )).collect();
+                let no_self = self_parts.join(" && ");
+                terms.push(format!(
+                    "({i} < row_count && ({no_self}))",
+                    i = i, no_self = no_self,
+                ));
+            }
+            if terms.is_empty() { "1'b0".to_string() } else { terms.join(" || ") }
+        }
+        "IT" => {
+            // ∃ (i, j, k) active. row_i.right == row_j.left
+            // && row_k.left == row_i.left && row_k.right == row_j.right.
+            let mut terms: Vec<String> = Vec::new();
+            for i in 0..depth {
+                for j in 0..depth {
+                    for k in 0..depth {
+                        terms.push(format!(
+                            "({i} < row_count && {j} < row_count && {k} < row_count \
+                             && row_{i}_right == row_{j}_left \
+                             && row_{k}_left == row_{i}_left \
+                             && row_{k}_right == row_{j}_right)",
+                            i = i, j = j, k = k,
+                        ));
+                    }
+                }
+            }
+            if terms.is_empty() { "1'b0".to_string() } else { terms.join(" || ") }
+        }
+        "TR" => {
+            // ∃ (i, j) active. row_i.right == row_j.left AND
+            // no k covers (row_i.left, row_j.right).
+            let mut terms: Vec<String> = Vec::new();
+            for i in 0..depth {
+                for j in 0..depth {
+                    let cover_parts: Vec<String> = (0..depth).map(|k| format!(
+                        "!({k} < row_count && row_{k}_left == row_{i}_left \
+                         && row_{k}_right == row_{j}_right)",
+                        i = i, j = j, k = k,
+                    )).collect();
+                    let no_cover = cover_parts.join(" && ");
+                    terms.push(format!(
+                        "({i} < row_count && {j} < row_count \
+                         && row_{i}_right == row_{j}_left \
+                         && ({no_cover}))",
+                        i = i, j = j, no_cover = no_cover,
+                    ));
+                }
+            }
+            if terms.is_empty() { "1'b0".to_string() } else { terms.join(" || ") }
+        }
+        "AC" => {
+            // Two-row cycle approximation — ∃ distinct (i, j) active.
+            // row_i.left == row_j.right && row_i.right == row_j.left.
+            // Full acyclic closure is post-1.0.
+            let mut terms: Vec<String> = Vec::new();
+            for i in 0..depth {
+                for j in (i + 1)..depth {
+                    terms.push(format!(
+                        "({i} < row_count && {j} < row_count \
+                         && row_{i}_left == row_{j}_right \
+                         && row_{i}_right == row_{j}_left)",
+                        i = i, j = j,
+                    ));
+                }
+            }
+            if terms.is_empty() { "1'b0".to_string() } else { terms.join(" || ") }
+        }
+        _ => "1'b0".to_string(),
+    };
+    out.push_str(&format!("    assign hit = {};\n", expr));
+    out.push_str("    always @(posedge clk) begin\n");
+    out.push_str("        if (!rst_n) begin\n");
+    out.push_str("            violation <= 1'b0;\n");
+    out.push_str("        end else begin\n");
+    out.push_str("            violation <= hit;\n");
+    out.push_str("        end\n");
+    out.push_str("    end\n");
+    out.push_str("endmodule\n");
+    out
 }
 
 /// Default counter width for FC modules — 16 bits covers the full
@@ -1284,7 +1498,9 @@ fn emit_top_module(
         // Constraint cell's kind binding.
         let kind = constraint_kind_from_name(cname);
         match kind {
-            Some("uc") | Some("mc") => {
+            Some("uc") | Some("mc")
+            | Some("ir") | Some("as") | Some("at") | Some("sy")
+            | Some("it") | Some("tr") | Some("ac") | Some("rf") => {
                 out.push_str(&format!(
                     "        .rows_flat({{{total_bits}{{1'b0}}}}),\n",
                     total_bits = CONSTRAINT_DEFAULT_DEPTH * CONSTRAINT_DEFAULT_ROW_WIDTH,
@@ -1820,22 +2036,24 @@ Supplier supplies Widget.
             ("c1", "UC"),
             ("c2", "MC"),
             ("c3", "FC"),
-            ("c4", "SS"),  // skipped — set-comparison emitter is future work
-            ("c5", "IR"),  // skipped — ring emitter is future work
+            ("c4", "SS"),  // cross-fact-type — still a TODO stub (post-v1).
+            ("c5", "IR"),  // ring family — now real hardware.
         ]);
         let verilog = compile_to_verilog(&state);
 
         assert!(verilog.contains("module constraint_uc_c1"),
-            "expected UC stub module:\n{}", verilog);
+            "expected UC module:\n{}", verilog);
         assert!(verilog.contains("module constraint_mc_c2"),
-            "expected MC stub module:\n{}", verilog);
+            "expected MC module:\n{}", verilog);
         assert!(verilog.contains("module constraint_fc_c3"),
-            "expected FC stub module:\n{}", verilog);
-        // SS and IR are NOT emitted yet — separate task per family.
+            "expected FC module:\n{}", verilog);
+        // Ring family now lands real hardware; IR is no longer skipped.
+        assert!(verilog.contains("module constraint_ir_c5"),
+            "ring IR must emit alongside UC/MC/FC:\n{}", verilog);
+        // SS (and the rest of the cross-fact-type family) stay TODO
+        // stubs until their own emitter lands.
         assert!(!verilog.contains("constraint_ss_c4"),
             "SS not yet supported, should not emit");
-        assert!(!verilog.contains("constraint_ir_c5"),
-            "ring not yet supported, should not emit");
     }
 
     #[test]
@@ -2080,6 +2298,78 @@ Supplier supplies Widget.
         // handlers from the SM transition signals.
         assert!(verilog.contains(".create_pulse(1'b0)"));
         assert!(verilog.contains(".terminate_pulse(1'b0)"));
+    }
+
+    // ── Ring family: IR / AS / AT / SY / IT / TR / AC / RF (#303 / E1) ──
+    //
+    // Each ring kind has a pairwise predicate over a 2-role fact-type
+    // row. Rows split into (left, right) halves of equal width so the
+    // predicate speaks in terms of half-width comparisons:
+    //   IR  — no self-loops   : violation = ∃ row. row.left == row.right
+    //   AS  — asymmetric      : violation = ∃ (r1, r2). r1.l == r2.r && r1.r == r2.l
+    //   SY  — symmetric       : violation = ∃ row. no inverse present
+    //   RF  — reflexive       : violation = ∃ row. no self-loop for row.left
+    //   AT / IT / TR / AC     — approximate predicates (documented inline).
+
+    #[test]
+    fn ring_modules_emitted_for_every_adjective() {
+        let state = state_with_constraints(&[
+            ("ir1", "IR"), ("as1", "AS"), ("at1", "AT"), ("sy1", "SY"),
+            ("it1", "IT"), ("tr1", "TR"), ("ac1", "AC"), ("rf1", "RF"),
+        ]);
+        let verilog = compile_to_verilog(&state);
+        for kind in ["ir", "as", "at", "sy", "it", "tr", "ac", "rf"] {
+            let needle = format!("module constraint_{}_", kind);
+            assert!(verilog.contains(&needle),
+                "missing ring module for kind {}:\n{}", kind, verilog);
+        }
+    }
+
+    #[test]
+    fn ir_module_detects_self_loop() {
+        let state = state_with_constraints(&[("r1", "IR")]);
+        let verilog = compile_to_verilog(&state);
+        // IR = row.left == row.right on any active row. Module must
+        // split each row into halves and compare.
+        assert!(verilog.contains("module constraint_ir_r1"));
+        // Left / right half aliases.
+        assert!(verilog.contains("row_0_left"),
+            "IR must name a row-half alias:\n{}", verilog);
+        assert!(verilog.contains("row_0_right"));
+        // Predicate form: left == right.
+        assert!(verilog.contains("row_0_left == row_0_right"));
+    }
+
+    #[test]
+    fn as_module_detects_inverse_pair() {
+        let state = state_with_constraints(&[("r1", "AS")]);
+        let verilog = compile_to_verilog(&state);
+        // AS = ∃ (r1,r2) distinct. r1.left == r2.right && r1.right == r2.left.
+        assert!(verilog.contains("module constraint_as_r1"));
+        // Predicate form: inverse-pair compare.
+        assert!(verilog.contains("row_0_left == row_1_right"),
+            "AS must compare row_0.left to row_1.right:\n{}", verilog);
+        assert!(verilog.contains("row_0_right == row_1_left"));
+    }
+
+    #[test]
+    fn top_wires_every_ring_kind_into_constraint_ok() {
+        let state = state_with_constraints(&[
+            ("r1", "IR"), ("r2", "AS"), ("r3", "AT"), ("r4", "SY"),
+            ("r5", "IT"), ("r6", "TR"), ("r7", "AC"), ("r8", "RF"),
+        ]);
+        let verilog = compile_to_verilog(&state);
+        for (kind, id) in [
+            ("ir", "r1"), ("as", "r2"), ("at", "r3"), ("sy", "r4"),
+            ("it", "r5"), ("tr", "r6"), ("ac", "r7"), ("rf", "r8"),
+        ] {
+            let wire = format!("wire constraint_{}_{}_v;", kind, id);
+            assert!(verilog.contains(&wire),
+                "missing wire for ring kind {}:\n{}", kind, verilog);
+            let inv = format!("& ~constraint_{}_{}_v", kind, id);
+            assert!(verilog.contains(&inv),
+                "top must invert {} violation:\n{}", kind, verilog);
+        }
     }
 
     // ── Audit-log Verilog ring buffer (#167) ──
