@@ -305,6 +305,68 @@ fn statement_verb(state: &Object, stmt_id: &str) -> Option<String> {
         .and_then(|f| binding(f, "Verb").map(String::from))
 }
 
+/// Translate `Ring Constraint` classifications into `Constraint` cell
+/// facts. Each ring adjective maps to a two-letter ORM 2 kind code:
+///
+///   is irreflexive   → IR
+///   is asymmetric    → AS
+///   is antisymmetric → AT
+///   is symmetric     → SY
+///   is intransitive  → IT
+///   is transitive    → TR
+///   is acyclic       → AC
+///   is reflexive     → RF
+///
+/// The Constraint fact carries `kind`, `modality="alethic"`,
+/// `text` (Statement text), and `entity` (Head Noun). Spans
+/// (fact_type_id resolution) are left empty — a follow-up
+/// commit will populate them once the FactType cell exists.
+#[cfg(feature = "std-deps")]
+pub fn translate_ring_constraints(classified_state: &Object) -> Vec<Object> {
+    let statement_ids = collect_statement_ids(classified_state);
+    let mut out: Vec<Object> = Vec::new();
+    for stmt_id in &statement_ids {
+        let classifications = classifications_for(classified_state, stmt_id);
+        if !classifications.iter().any(|k| k == "Ring Constraint") {
+            continue;
+        }
+        let Some(marker) = trailing_marker_for(classified_state, stmt_id) else { continue };
+        let Some(kind) = ring_adjective_to_kind(&marker) else { continue };
+        let text = statement_text(classified_state, stmt_id).unwrap_or_default();
+        let entity = head_noun_for(classified_state, stmt_id).unwrap_or_default();
+        out.push(fact_from_pairs(&[
+            ("id",       text.as_str()),
+            ("kind",     kind),
+            ("modality", "alethic"),
+            ("text",     text.as_str()),
+            ("entity",   entity.as_str()),
+        ]));
+    }
+    out
+}
+
+fn ring_adjective_to_kind(marker: &str) -> Option<&'static str> {
+    match marker {
+        "is irreflexive"   => Some("IR"),
+        "is asymmetric"    => Some("AS"),
+        "is antisymmetric" => Some("AT"),
+        "is symmetric"     => Some("SY"),
+        "is intransitive"  => Some("IT"),
+        "is transitive"    => Some("TR"),
+        "is acyclic"       => Some("AC"),
+        "is reflexive"     => Some("RF"),
+        _                  => None,
+    }
+}
+
+fn trailing_marker_for(state: &Object, stmt_id: &str) -> Option<String> {
+    fetch_or_phi("Statement_has_Trailing_Marker", state)
+        .as_seq()?
+        .iter()
+        .find(|f| binding(f, "Statement") == Some(stmt_id))
+        .and_then(|f| binding(f, "Trailing_Marker").map(String::from))
+}
+
 fn role_noun_at_position(state: &Object, stmt_id: &str, position: usize) -> Option<String> {
     let refs = fetch_or_phi("Statement_has_Role_Reference", state);
     let refs_seq = refs.as_seq()?;
@@ -754,6 +816,37 @@ mod tests {
         let classified = classify_statements(&stmt, &grammar_state());
         let facts = super::translate_instance_facts(&classified);
         assert!(facts.is_empty(), "got {:?}", facts);
+    }
+
+    #[test]
+    fn translate_ring_constraints_covers_all_eight_adjectives() {
+        for (text, nouns, expected_kind) in [
+            ("Category has parent Category is acyclic.",    vec!["Category"], "AC"),
+            ("Person is parent of Person is irreflexive.",  vec!["Person"],   "IR"),
+            ("Person loves Person is symmetric.",           vec!["Person"],   "SY"),
+            ("Thing owns Thing is asymmetric.",             vec!["Thing"],    "AS"),
+            ("Thing owns Thing is antisymmetric.",          vec!["Thing"],    "AT"),
+            ("Thing owns Thing is transitive.",             vec!["Thing"],    "TR"),
+            ("Thing owns Thing is intransitive.",           vec!["Thing"],    "IT"),
+            ("Thing owns Thing is reflexive.",              vec!["Thing"],    "RF"),
+        ] {
+            let stmt = stage1_state("s1", text, &nouns);
+            let classified = classify_statements(&stmt, &grammar_state());
+            let constraints = super::translate_ring_constraints(&classified);
+            assert_eq!(constraints.len(), 1, "text={:?}", text);
+            assert_eq!(binding(&constraints[0], "kind"), Some(expected_kind),
+                "text={:?}", text);
+            assert_eq!(binding(&constraints[0], "modality"), Some("alethic"));
+        }
+    }
+
+    #[test]
+    fn translate_ring_constraints_skips_non_ring_statements() {
+        let stmt = stage1_state(
+            "s1", "Customer is an entity type.", &["Customer"]);
+        let classified = classify_statements(&stmt, &grammar_state());
+        let constraints = super::translate_ring_constraints(&classified);
+        assert!(constraints.is_empty());
     }
 
     #[test]
