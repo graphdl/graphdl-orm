@@ -809,6 +809,23 @@ pub fn parse_to_state_via_stage12(text: &str) -> Result<Object, String> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
+        // Skip prose lines: every FORML 2 statement ends with `.`.
+        // Markdown prose interspersed in reading files (section
+        // introductions, bullet continuations with no period) would
+        // otherwise be tokenized and misclassified as Fact Type
+        // Reading via their incidental noun references. Legacy's
+        // cascade only acts when a recognizer matches; its
+        // recognizers all require the period terminator.
+        if !line.ends_with('.') {
+            continue;
+        }
+        // Skip ORM 2 possibility-override statements (`It is possible
+        // that ...`). These declare that a constraint is waived, not
+        // a new fact/constraint; legacy's Pass 2b has no recognizer
+        // for them and they fall through without producing cells.
+        if line.starts_with("It is possible that ") {
+            continue;
+        }
         let statement_id = alloc::format!("s{}", i);
         let cells = crate::parse_forml2_stage1::tokenize_statement(
             &statement_id, line, &nouns);
