@@ -143,6 +143,7 @@ import {
   federatedFetch,
   parseFederationConfig,
   buildIngestPayload,
+  enrichResponseWithCitation,
   type FederationConfig,
   type FederatedFetchResult,
 } from './federation'
@@ -253,7 +254,7 @@ server.registerTool(
       // returned to the caller either way.
       const citeId = await absorbFederatedIntoD(noun, data)
       if (citeId) {
-        return textResult({ ...data, citationId: citeId, absorbed: true })
+        return textResult(enrichResponseWithCitation(data, citeId, '/arest/default'))
       }
       return textResult(data)
     }

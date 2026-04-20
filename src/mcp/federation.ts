@@ -75,6 +75,38 @@ export interface IngestPayload {
 }
 
 /**
+ * Enrich a federated fetch response with HATEOAS provenance linkage
+ * (#305 #9). Adds:
+ *   - citationId — the stable engine-assigned Citation id
+ *   - absorbed: true — signal that the citation reached P
+ *   - _links.citations — navigable link to the Citation entity
+ *
+ * Pre-existing _links entries are preserved. Consumers walking the
+ * link graph can now reach the provenance record without knowing the
+ * citationId→URL mapping by convention.
+ */
+export function enrichResponseWithCitation<T extends { _links?: Record<string, unknown> }>(
+  data: T,
+  citationId: string,
+  basePath: string,
+): T & {
+  citationId: string
+  absorbed: true
+  _links: Record<string, unknown> & { citations: { href: string } }
+} {
+  const existingLinks = (data._links ?? {}) as Record<string, unknown>
+  return {
+    ...data,
+    citationId,
+    absorbed: true as const,
+    _links: {
+      ...existingLinks,
+      citations: { href: `${basePath}/Citation/${citationId}` },
+    },
+  }
+}
+
+/**
  * Translate a FederatedFetchResult into the engine's federated_ingest
  * JSON shape. Each entity record is split into one fact per field
  * (the noun id stays in every binding so the engine can identify the

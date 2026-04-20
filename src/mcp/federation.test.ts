@@ -116,7 +116,7 @@ describe('federatedFetch — Citation provenance (E3 / #305)', () => {
 // federated_ingest:<noun> JSON contract (#305). One fact per (entity,
 // field) pair because the engine's cells are keyed per fact type
 // (Noun_verb_Role) and each FT holds the (Noun, Role) binding shape.
-import { buildIngestPayload } from './federation'
+import { buildIngestPayload, enrichResponseWithCitation } from './federation'
 
 describe('buildIngestPayload — federated_ingest FFI shape (E3 / #305)', () => {
   it('splits one entity record into one fact per field', () => {
@@ -177,6 +177,41 @@ describe('buildIngestPayload — federated_ingest FFI shape (E3 / #305)', () => 
     }
     const payload = buildIngestPayload(result)
     expect(payload.facts).toHaveLength(0)
+  })
+
+  /// HATEOAS (#305 #9): federated responses enrich the outgoing data
+  /// with a _links.citations entry so MCP clients walking the link
+  /// graph can reach the Citation record without knowing the
+  /// citationId-to-URL mapping by convention.
+  it('enrichResponseWithCitation adds _links.citations pointing at the Citation entity', () => {
+    const data = {
+      system: 'stripe',
+      noun: 'Stripe Customer',
+      count: 1,
+      facts: [{ 'Stripe Customer': 'cus_1' }],
+      _meta: { url: '', worldAssumption: 'OWA' as const },
+    }
+    const enriched = enrichResponseWithCitation(data as any, 'cite:abc123', '/arest/default')
+    expect(enriched.citationId).toBe('cite:abc123')
+    expect(enriched.absorbed).toBe(true)
+    expect(enriched._links).toBeDefined()
+    expect(enriched._links.citations).toEqual({
+      href: '/arest/default/Citation/cite:abc123',
+    })
+  })
+
+  it('enrichResponseWithCitation preserves pre-existing _links', () => {
+    const data = {
+      system: 'stripe',
+      noun: 'Stripe Customer',
+      count: 0,
+      facts: [],
+      _meta: { url: '', worldAssumption: 'OWA' as const },
+      _links: { self: { href: '/arest/default/Stripe Customer' } },
+    }
+    const enriched = enrichResponseWithCitation(data as any, 'cite:abc', '/arest/default')
+    expect(enriched._links.self).toEqual({ href: '/arest/default/Stripe Customer' })
+    expect(enriched._links.citations.href).toBe('/arest/default/Citation/cite:abc')
   })
 
   /// Error-path Citation: fetch returned an HTTP error, federatedFetch
