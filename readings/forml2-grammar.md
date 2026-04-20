@@ -31,6 +31,11 @@ Derivation Marker is a value type.
   The possible values of Derivation Marker are 'fully-derived', 'derived-and-stored', 'semi-derived'.
 Role Position is a value type.
 Literal Value is a value type.
+Keyword is a value type.
+  The possible values of Keyword are 'iff', 'if', 'when'.
+Deontic Operator is a value type.
+  The possible values of Deontic Operator are 'obligatory', 'forbidden', 'permitted'.
+Literal Role is a value type.
 
 ## Fact Types
 
