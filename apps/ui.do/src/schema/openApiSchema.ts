@@ -15,13 +15,52 @@
  * without re-parsing the schema each time.
  */
 
+/**
+ * Semantic field kinds — mirrors the `Control` subtype list in the
+ * readings/ui.md UI domain, which in turn matches the iFactr.UI
+ * Control interfaces (IDatePicker, ISelectList, ISlider, etc.). The
+ * iFactr.Droid renderer maps each of those to a native Android
+ * widget; the web port here maps each one to the richest HTML5
+ * control available:
+ *
+ *   FieldKind      readings/ui.md      iFactr.Droid          Web
+ *   ─────────────  ──────────────      ──────────────────    ───────────────────────
+ *   string         Text Box            EditText              <input type="text">
+ *   textarea       Text Area           EditText (multiline)  <textarea>
+ *   password       Password Box        EditText (password)   <input type="password">
+ *   email          Text Box            EditText (email)      <input type="email">
+ *   url            Text Box            EditText (URL)        <input type="url">
+ *   number         (numeric Text Box)  EditText (numeric)    <input type="number">
+ *   integer        (numeric Text Box)  EditText (numeric)    <input type="number" step=1>
+ *   slider         Slider              SeekBar               <input type="range">
+ *   boolean        Checkbox            CheckBox              <input type="checkbox">
+ *   switch         Switch              Switch                <input type="checkbox" role="switch">
+ *   date           Date Picker         Button+DatePicker     <input type="date">
+ *   datetime       Date Picker         Button+DatePicker     <input type="datetime-local">
+ *   time           Time Picker         Button+TimePicker     <input type="time">
+ *   enum (small)   Select List         Spinner               radio group
+ *   enum (large)   Select List         Spinner               <select>
+ *   reference      (custom)            (custom)              text with ref title
+ *   array/object   (custom)            (custom)              JSON debug fallback
+ *
+ * An `x-widget` OpenAPI extension overrides the default mapping
+ * (e.g. a numeric field with `x-widget: slider` becomes a range
+ * input instead of a number input). This matches how iFactr.UI
+ * lets a view author substitute a Slider for a Text Box on the
+ * same underlying value.
+ */
 export type FieldKind =
   | 'string'
+  | 'textarea'
+  | 'password'
   | 'number'
   | 'integer'
+  | 'slider'
   | 'boolean'
+  | 'switch'
   | 'date'
   | 'datetime'
+  | 'time'
   | 'email'
   | 'url'
   | 'enum'
@@ -102,16 +141,24 @@ export function getNounSchema(doc: unknown, noun: string): unknown {
 function classifyProperty(prop: unknown): { kind: FieldKind; enumValues?: ReadonlyArray<string | number>; ref?: string } {
   if (!isRecord(prop)) return { kind: 'unknown' }
 
+  // Explicit `x-widget` wins over format-based heuristics. Matches
+  // iFactr.UI's model where the view author picks the concrete
+  // Control (e.g. substitute Slider for Text Box on the same value).
+  const xWidget = (prop['x-widget'] as string | undefined)
+  const widgetOverride = xWidget && isValidKind(xWidget) ? (xWidget as FieldKind) : undefined
+
   // $ref -> reference field
   if (typeof prop.$ref === 'string') {
     // #/components/schemas/Organization -> Organization
     const tail = (prop.$ref as string).split('/').pop()
-    return { kind: 'reference', ref: tail }
+    return { kind: widgetOverride ?? 'reference', ref: tail }
   }
 
   if (Array.isArray(prop.enum)) {
-    return { kind: 'enum', enumValues: prop.enum as ReadonlyArray<string | number> }
+    return { kind: widgetOverride ?? 'enum', enumValues: prop.enum as ReadonlyArray<string | number> }
   }
+
+  if (widgetOverride) return { kind: widgetOverride }
 
   const type = prop.type
   const format = prop.format
@@ -121,6 +168,12 @@ function classifyProperty(prop: unknown): { kind: FieldKind; enumValues?: Readon
     if (format === 'uri' || format === 'url') return { kind: 'url' }
     if (format === 'date') return { kind: 'date' }
     if (format === 'date-time' || format === 'datetime') return { kind: 'datetime' }
+    if (format === 'time') return { kind: 'time' }
+    if (format === 'password') return { kind: 'password' }
+    if (format === 'textarea' || format === 'multi-line') return { kind: 'textarea' }
+    // Heuristic: very long strings default to a textarea so the admin
+    // surface picks a usable control without manual annotation.
+    if (typeof prop.maxLength === 'number' && prop.maxLength > 255) return { kind: 'textarea' }
     return { kind: 'string' }
   }
   if (type === 'integer') return { kind: 'integer' }
@@ -130,6 +183,16 @@ function classifyProperty(prop: unknown): { kind: FieldKind; enumValues?: Readon
   if (type === 'object') return { kind: 'object' }
 
   return { kind: 'unknown' }
+}
+
+/** FieldKind values that x-widget can legally override to. */
+const ALL_KINDS: ReadonlySet<string> = new Set([
+  'string', 'textarea', 'password', 'number', 'integer', 'slider',
+  'boolean', 'switch', 'date', 'datetime', 'time',
+  'email', 'url', 'enum', 'reference', 'array', 'object', 'unknown',
+])
+function isValidKind(s: string): s is FieldKind {
+  return ALL_KINDS.has(s)
 }
 
 /**

@@ -101,6 +101,52 @@ describe('SchemaInput', () => {
     })
   })
 
+  describe('iFactr-parallel widgets (textarea / password / slider / switch / time)', () => {
+    it('kind=textarea renders <textarea>', () => {
+      render(<SchemaInput field={field({ kind: 'textarea' })} value="abc" onChange={vi.fn()} />)
+      const w = screen.getByTestId('input-f')
+      expect(w.tagName).toBe('TEXTAREA')
+      expect(w.getAttribute('data-widget')).toBe('textarea')
+    })
+
+    it('kind=password renders <input type="password">', () => {
+      render(<SchemaInput field={field({ kind: 'password' })} value="" onChange={vi.fn()} />)
+      const w = screen.getByTestId('input-f') as HTMLInputElement
+      expect(w.type).toBe('password')
+    })
+
+    it('kind=slider renders <input type="range"> with min/max/step', () => {
+      const onChange = vi.fn()
+      render(
+        <SchemaInput
+          field={field({ kind: 'slider', min: 0, max: 10, step: 1 })}
+          value={5}
+          onChange={onChange}
+        />,
+      )
+      const w = screen.getByTestId('input-f') as HTMLInputElement
+      expect(w.type).toBe('range')
+      expect(w.min).toBe('0')
+      expect(w.max).toBe('10')
+      expect(w.step).toBe('1')
+      fireEvent.change(w, { target: { value: '7' } })
+      expect(onChange).toHaveBeenLastCalledWith(7)
+    })
+
+    it('kind=switch renders a checkbox with role="switch"', () => {
+      render(<SchemaInput field={field({ kind: 'switch' })} value={true} onChange={vi.fn()} />)
+      const w = screen.getByTestId('input-f') as HTMLInputElement
+      expect(w.type).toBe('checkbox')
+      expect(w.getAttribute('role')).toBe('switch')
+    })
+
+    it('kind=time renders <input type="time">', () => {
+      render(<SchemaInput field={field({ kind: 'time' })} value="09:30" onChange={vi.fn()} />)
+      const w = screen.getByTestId('input-f') as HTMLInputElement
+      expect(w.type).toBe('time')
+    })
+  })
+
   describe('string widgets', () => {
     it('forwards minLength / maxLength / pattern to the HTML5 attrs', () => {
       render(

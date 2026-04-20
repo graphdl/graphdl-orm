@@ -104,4 +104,54 @@ describe('getFieldsFromSchema', () => {
     expect(getFieldsFromSchema({})).toEqual([])
     expect(getFieldsFromSchema({ type: 'object' })).toEqual([])
   })
+
+  describe('iFactr-parallel kind classification', () => {
+    it.each([
+      ['password',  { type: 'string', format: 'password' }],
+      ['time',      { type: 'string', format: 'time' }],
+      ['textarea',  { type: 'string', format: 'textarea' }],
+      ['textarea',  { type: 'string', format: 'multi-line' }],
+    ])('format -> kind=%s', (expected, prop) => {
+      const fields = getFieldsFromSchema({ properties: { f: prop } })
+      expect(fields[0].kind).toBe(expected)
+    })
+
+    it('long strings (maxLength > 255) default to kind=textarea', () => {
+      const fields = getFieldsFromSchema({
+        properties: { bio: { type: 'string', maxLength: 500 } },
+      })
+      expect(fields[0].kind).toBe('textarea')
+      expect(fields[0].maxLength).toBe(500)
+    })
+
+    it('x-widget extension overrides the format-based heuristic', () => {
+      // A numeric field with x-widget: slider becomes a range input,
+      // matching iFactr.UI's model where the view author substitutes
+      // Control types on the same value.
+      const fields = getFieldsFromSchema({
+        properties: {
+          volume: { type: 'integer', minimum: 0, maximum: 100, 'x-widget': 'slider' },
+        },
+      })
+      expect(fields[0].kind).toBe('slider')
+      expect(fields[0].min).toBe(0)
+      expect(fields[0].max).toBe(100)
+    })
+
+    it('x-widget ignores unknown widget names (falls back to default)', () => {
+      const fields = getFieldsFromSchema({
+        properties: {
+          name: { type: 'string', 'x-widget': 'martian-device' },
+        },
+      })
+      expect(fields[0].kind).toBe('string')
+    })
+
+    it('x-widget can upgrade a boolean to a switch', () => {
+      const fields = getFieldsFromSchema({
+        properties: { enabled: { type: 'boolean', 'x-widget': 'switch' } },
+      })
+      expect(fields[0].kind).toBe('switch')
+    })
+  })
 })
