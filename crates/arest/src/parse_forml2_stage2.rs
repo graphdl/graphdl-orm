@@ -74,7 +74,12 @@ pub fn translate_nouns(classified_state: &Object) -> Vec<Object> {
     for stmt_id in &statement_ids {
         let Some(head) = head_noun_for(classified_state, stmt_id) else { continue };
         let classifications = classifications_for(classified_state, stmt_id);
-        let ot = if classifications.iter().any(|k| k == "Abstract Declaration") {
+        let ot = if classifications.iter().any(|k|
+            k == "Abstract Declaration" || k == "Partition Declaration")
+        {
+            // Partition Declaration marks the supertype abstract
+            // (ORM 2: a partitioned type has no direct instances;
+            // every instance is in exactly one subtype).
             Some("abstract")
         } else if classifications.iter().any(|k| k == "Entity Type Declaration") {
             Some("entity")
@@ -104,10 +109,6 @@ pub fn translate_nouns(classified_state: &Object) -> Vec<Object> {
 /// facts: `(subtype, supertype)` pairs. The subtype is the Statement's
 /// Head Noun; the supertype is the noun at Role Position 1 (the only
 /// other role reference in `A is a subtype of B`).
-///
-/// Partition Declaration is NOT handled here — it needs multi-role
-/// extraction (`A is partitioned into B, C, D`) and will land in a
-/// later commit.
 #[cfg(feature = "std-deps")]
 pub fn translate_subtypes(classified_state: &Object) -> Vec<Object> {
     let statement_ids = collect_statement_ids(classified_state);
@@ -123,6 +124,33 @@ pub fn translate_subtypes(classified_state: &Object) -> Vec<Object> {
             ("supertype", sup.as_str()),
         ]))
     }).collect()
+}
+
+/// Translate `Partition Declaration` classifications into `Subtype`
+/// cell facts — one `(subtype, supertype)` pair per subtype in the
+/// comma-separated list. Shape: `A is partitioned into B, C, D` →
+/// (B, A), (C, A), (D, A). The supertype's abstractness flows
+/// through `translate_nouns` which treats Partition Declaration as
+/// an abstract-marking classification.
+#[cfg(feature = "std-deps")]
+pub fn translate_partitions(classified_state: &Object) -> Vec<Object> {
+    let statement_ids = collect_statement_ids(classified_state);
+    let mut out: Vec<Object> = Vec::new();
+    for stmt_id in &statement_ids {
+        let classifications = classifications_for(classified_state, stmt_id);
+        if !classifications.iter().any(|k| k == "Partition Declaration") {
+            continue;
+        }
+        let Some(sup) = head_noun_for(classified_state, stmt_id) else { continue };
+        let roles = role_refs_for(classified_state, stmt_id);
+        for sub in roles.iter().skip(1) {
+            out.push(fact_from_pairs(&[
+                ("subtype", sub.as_str()),
+                ("supertype", sup.as_str()),
+            ]));
+        }
+    }
+    out
 }
 
 /// Translate `Fact Type Reading` classifications into `FactType` +
@@ -906,5 +934,39 @@ mod tests {
         assert_eq!(binding(f, "value0"), Some("low"));
         assert_eq!(binding(f, "value1"), Some("medium"));
         assert_eq!(binding(f, "value2"), Some("high"));
+    }
+
+    #[test]
+    fn partition_declaration_is_classified() {
+        let stmt = stage1_state(
+            "s1", "Animal is partitioned into Cat, Dog, Bird.",
+            &["Animal", "Cat", "Dog", "Bird"]);
+        let classified = classify_statements(&stmt, &grammar_state());
+        let kinds = classifications_for(&classified, "s1");
+        assert!(kinds.iter().any(|k| k == "Partition Declaration"),
+            "expected Partition Declaration; got {:?}", kinds);
+    }
+
+    #[test]
+    fn translate_partitions_emits_subtype_facts_and_marks_supertype_abstract() {
+        let stmt = stage1_state(
+            "s1", "Animal is partitioned into Cat, Dog, Bird.",
+            &["Animal", "Cat", "Dog", "Bird"]);
+        let classified = classify_statements(&stmt, &grammar_state());
+        let subtypes = super::translate_partitions(&classified);
+        let subs: Vec<_> = subtypes.iter()
+            .filter_map(|f| binding(f, "subtype").map(String::from))
+            .collect();
+        assert_eq!(subs, vec!["Cat", "Dog", "Bird"]);
+        for s in &subtypes {
+            assert_eq!(binding(s, "supertype"), Some("Animal"));
+        }
+        // translate_nouns must see Partition Declaration as a signal
+        // to mark Animal as abstract.
+        let nouns = super::translate_nouns(&classified);
+        let animal = nouns.iter()
+            .find(|f| binding(f, "name") == Some("Animal"))
+            .expect("Animal noun fact");
+        assert_eq!(binding(animal, "objectType"), Some("abstract"));
     }
 }
