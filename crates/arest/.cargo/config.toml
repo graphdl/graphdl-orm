@@ -1,0 +1,21 @@
+# Repo-local cargo config. Checked in so every contributor gets the
+# same aliases and profile defaults.
+
+[alias]
+# Inner-loop test runner: unoptimized build, std-deps feature, lib
+# target only. Use while iterating on a narrow feature — cold build
+# ~60-90s, incremental after a single-file edit ~15s, test run ~5-10s.
+#
+# Example:
+#   cargo t parse_forml2_stage2
+# runs only the Stage-2 tests with the dev-fast profile.
+t = "test --profile dev-fast --lib --features std-deps"
+
+# Syntax-only validator — no codegen, no link. Fastest way to check
+# that a change compiles before committing to a full test run.
+c = "check --lib --features std-deps"
+
+# Full test suite with the default (optimized) test profile. Use
+# before pushing / committing to catch perf-sensitive test failures
+# that dev-fast might hide.
+tall = "test --lib --features std-deps"
