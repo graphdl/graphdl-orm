@@ -102,8 +102,23 @@ lto = "thin"
 # interpreter-heavy (every ast::apply call goes through a match on
 # ~40 Func variants). At opt-level = 0 these match arms don't inline,
 # so the interpreter pays match-overhead per reduction step. opt-level
-# = 2 collapses them. Debug info is on by default for stack traces.
-# Compile cost goes up on the first test run after a code change;
-# runtime drops by 100× on interpreter workloads.
+# = 2 collapses them. `debug = 1` keeps line tables (needed for
+# backtraces / panic messages) without the full DWARF tree — 2x faster
+# linking on Windows. `incremental = true` forces Cargo to keep the
+# incremental compile cache even with opt > 0; small edits then
+# recompile only the touched module.
 [profile.test]
 opt-level = 2
+debug = 1
+incremental = true
+
+# Fast-iteration test profile — `cargo test --profile dev-fast --lib`.
+# Runs unoptimized so tests that exercise ast::apply over large
+# populations are ~100× slower; the trade is 3-5× faster compile +
+# link. Use while iterating on a narrow feature; switch back to the
+# default test profile before committing to catch perf regressions.
+[profile.dev-fast]
+inherits = "test"
+opt-level = 0
+debug = 1
+incremental = true
