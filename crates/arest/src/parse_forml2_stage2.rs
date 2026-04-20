@@ -426,6 +426,7 @@ pub fn translate_ring_constraints(classified_state: &Object) -> Vec<Object> {
 #[cfg(feature = "std-deps")]
 pub fn translate_derivation_rules(classified_state: &Object) -> Vec<Object> {
     let statement_ids = collect_statement_ids(classified_state);
+    let declared_nouns = declared_noun_names(classified_state);
     let mut out: Vec<Object> = Vec::new();
     for stmt_id in &statement_ids {
         let classifications = classifications_for(classified_state, stmt_id);
@@ -433,6 +434,16 @@ pub fn translate_derivation_rules(classified_state: &Object) -> Vec<Object> {
             continue;
         }
         let text = statement_text(classified_state, stmt_id).unwrap_or_default();
+        // Arbitrate with `translate_set_constraints`: when the
+        // Statement also classifies as Subset Constraint AND the
+        // antecedent has ≥2 distinct declared nouns, the SS
+        // translator claims this statement — skip DR emission.
+        // Legacy's pass-2b priority gives try_subset first dibs;
+        // only on semantic failure does try_derivation take over.
+        let is_subset = classifications.iter().any(|k| k == "Subset Constraint");
+        if is_subset && antecedent_distinct_nouns(&text, &declared_nouns) >= 2 {
+            continue;
+        }
         let id = derivation_rule_id(&text);
         out.push(fact_from_pairs(&[
             ("id",                   id.as_str()),
@@ -512,27 +523,41 @@ pub fn translate_enum_values(classified_state: &Object) -> Vec<Object> {
 #[cfg(feature = "std-deps")]
 pub fn translate_set_constraints(classified_state: &Object) -> Vec<Object> {
     let statement_ids = collect_statement_ids(classified_state);
+    let declared_nouns = declared_noun_names(classified_state);
     let mut out: Vec<Object> = Vec::new();
     for stmt_id in &statement_ids {
         let classifications = classifications_for(classified_state, stmt_id);
-        // Derivation Rule wins over any incidentally-matched set
-        // constraint — the presence of `iff` / `if` / `when` makes
-        // this a derivation. See #300.
-        if classifications.iter().any(|k| k == "Derivation Rule") { continue; }
+        let text = statement_text(classified_state, stmt_id).unwrap_or_default();
         let kind = if classifications.iter().any(|k| k == "Equality Constraint") {
+            // `iff` keyword also classifies as Derivation Rule; prefer
+            // DR when no `if and only if` multi-clause keyword fires
+            // (that's the grammar's EQ signal, not mere `iff`).
+            if classifications.iter().any(|k| k == "Derivation Rule") { continue; }
             "EQ"
         } else if classifications.iter().any(|k| k == "Subset Constraint") {
+            // SS classification fires on the synthetic `if some then
+            // that` constraint keyword. Legacy's `try_subset` also
+            // requires the antecedent to contain 2+ DISTINCT declared
+            // noun types; below that threshold, `try_derivation`
+            // wins. Mirror that arbitration here — when the
+            // antecedent doesn't have enough declared-noun diversity,
+            // defer to the Derivation Rule translator.
+            if antecedent_distinct_nouns(&text, &declared_nouns) < 2 {
+                continue;
+            }
             "SS"
         } else if classifications.iter().any(|k| k == "Exclusive-Or Constraint") {
+            if classifications.iter().any(|k| k == "Derivation Rule") { continue; }
             "XO"
         } else if classifications.iter().any(|k| k == "Or Constraint") {
+            if classifications.iter().any(|k| k == "Derivation Rule") { continue; }
             "OR"
         } else if classifications.iter().any(|k| k == "Exclusion Constraint") {
+            if classifications.iter().any(|k| k == "Derivation Rule") { continue; }
             "XC"
         } else {
             continue;
         };
-        let text = statement_text(classified_state, stmt_id).unwrap_or_default();
         let entity = head_noun_for(classified_state, stmt_id).unwrap_or_default();
         out.push(fact_from_pairs(&[
             ("id",       text.as_str()),
@@ -543,6 +568,57 @@ pub fn translate_set_constraints(classified_state: &Object) -> Vec<Object> {
         ]));
     }
     out
+}
+
+/// All declared noun names in a classified state, sorted longest-first
+/// so substring-style matching prefers `Fact Type` over `Fact` etc.
+#[cfg(feature = "std-deps")]
+fn declared_noun_names(state: &Object) -> Vec<String> {
+    let cell = fetch_or_phi("Noun", state);
+    let mut names: Vec<String> = cell.as_seq()
+        .map(|s| s.iter()
+            .filter_map(|f| binding(f, "name").map(String::from))
+            .collect())
+        .unwrap_or_default();
+    names.sort_by(|a, b| b.len().cmp(&a.len()));
+    names
+}
+
+/// Count the distinct declared-noun names that appear in the
+/// antecedent of a `If ... then ...` shape. Used to match legacy's
+/// `try_subset` pass-2b precedence: a subset constraint requires
+/// antecedent-noun diversity ≥ 2, otherwise the derivation-rule
+/// branch wins.
+///
+/// Longest-first pass with masking — `Fact Type` wins over `Fact`
+/// when both are declared, preventing substring double-counts.
+#[cfg(feature = "std-deps")]
+fn antecedent_distinct_nouns(text: &str, declared: &[String]) -> usize {
+    let Some((ante, _)) = text.split_once(" then ") else { return 0 };
+    let bytes = ante.as_bytes();
+    let mut masked: Vec<bool> = alloc::vec![false; bytes.len()];
+    let mut distinct: alloc::collections::BTreeSet<String> =
+        alloc::collections::BTreeSet::new();
+    // `declared` is already sorted longest-first by
+    // `declared_noun_names`.
+    for noun in declared {
+        let needle = noun.as_str();
+        if needle.is_empty() { continue; }
+        let mut start = 0;
+        while start <= bytes.len().saturating_sub(needle.len()) {
+            let Some(rel) = ante[start..].find(needle) else { break };
+            let abs = start + rel;
+            let end = abs + needle.len();
+            if (abs..end).any(|i| masked[i]) {
+                start = abs + 1;
+                continue;
+            }
+            for i in abs..end { masked[i] = true; }
+            distinct.insert(noun.clone());
+            start = end;
+        }
+    }
+    distinct.len()
 }
 
 /// Translate Uniqueness / Mandatory Role / Frequency Constraint
@@ -960,9 +1036,17 @@ mod tests {
             statement_id, text,
             &nouns.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
         );
-        let map: HashMap<String, Object> = cells.into_iter()
+        let mut map: HashMap<String, Object> = cells.into_iter()
             .map(|(k, v)| (k, Object::Seq(v.into())))
             .collect();
+        // Seed the `Noun` cell so Stage-2 translators that consult
+        // the declared-noun catalog (e.g. `translate_set_constraints`'
+        // antecedent-noun-count arbitration) see the same nouns that
+        // Stage-1 was told about.
+        let noun_facts: Vec<Object> = nouns.iter().map(|n| {
+            fact_from_pairs(&[("name", *n), ("objectType", "entity")])
+        }).collect();
+        map.insert("Noun".to_string(), Object::Seq(noun_facts.into()));
         Object::Map(map)
     }
 
@@ -1503,10 +1587,13 @@ mod tests {
 
     #[test]
     fn translate_set_constraints_includes_subset() {
-        // `If some X then that Y` is a subset constraint (ORM 2 shape).
-        // Legacy's `try_subset` fires before `try_derivation` in pass
-        // 2b priority; Stage-1 skips Keyword 'if' emission for this
-        // shape so the Statement classifies only as Subset Constraint.
+        // `If some X then that Y` with ≥2 distinct declared antecedent
+        // nouns is a subset constraint (ORM 2 shape). Stage-1 emits
+        // Keyword 'if' unconditionally, so BOTH SS and Derivation
+        // Rule classifications fire; Stage-2 translators arbitrate by
+        // counting distinct declared nouns in the antecedent.
+        // Here antecedent has `User` + `Organization` (2 distinct) →
+        // SS wins; translate_derivation_rules defers.
         let stmt = stage1_state(
             "s1",
             "If some User owns some Organization then that User has some Email.",
@@ -1515,14 +1602,52 @@ mod tests {
         let kinds = classifications_for(&classified, "s1");
         assert!(kinds.iter().any(|k| k == "Subset Constraint"),
             "expected Subset Constraint; got {:?}", kinds);
-        assert!(!kinds.iter().any(|k| k == "Derivation Rule"),
-            "expected NO Derivation Rule classification; got {:?}", kinds);
+        assert!(kinds.iter().any(|k| k == "Derivation Rule"),
+            "expected Derivation Rule classification (arbitrated below); \
+             got {:?}", kinds);
         let constraints = super::translate_set_constraints(&classified);
         let ss: Vec<_> = constraints.iter()
             .filter(|f| binding(f, "kind") == Some("SS"))
             .collect();
         assert_eq!(ss.len(), 1, "expected 1 SS, got {:?}", constraints);
         assert_eq!(binding(ss[0], "modality"), Some("alethic"));
+        let rules = super::translate_derivation_rules(&classified);
+        assert!(rules.is_empty(),
+            "expected no Derivation Rule emission (SS wins); got {:?}",
+            rules);
+    }
+
+    #[test]
+    fn translate_derivation_rules_wins_when_subset_has_under_two_nouns() {
+        // Same `If some ... then that ...` shape but only ONE distinct
+        // declared noun in the antecedent — legacy's `try_subset`
+        // would fail the multi-noun check, and `try_derivation` picks
+        // up the slack. Match that precedence.
+        //
+        // "some Stuff" — "Stuff" is not a declared noun. antecedent
+        // distinct count = 0 < 2. DR wins, SS defers.
+        let stmt = stage1_state(
+            "s1",
+            "If some Stuff matches some Thing then that Stuff is Thing.",
+            &["Stuff", "Thing"]);
+        // Override the Noun cell to force only one of the referenced
+        // nouns to actually be declared, matching the legacy "nouns
+        // in the antecedent are mostly unknown" shape.
+        let stmt_only_thing = {
+            let mut map = match stmt {
+                Object::Map(m) => m,
+                _ => unreachable!(),
+            };
+            let noun = fact_from_pairs(&[("name", "Thing"), ("objectType", "entity")]);
+            map.insert("Noun".to_string(), Object::Seq(alloc::vec![noun].into()));
+            Object::Map(map)
+        };
+        let classified = classify_statements(&stmt_only_thing, &grammar_state());
+        let ss = super::translate_set_constraints(&classified);
+        assert!(ss.is_empty(), "SS defers when antecedent nouns < 2; got {:?}", ss);
+        let rules = super::translate_derivation_rules(&classified);
+        assert_eq!(rules.len(), 1,
+            "DR picks up the statement when SS defers; got {:?}", rules);
     }
 
     #[test]
