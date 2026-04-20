@@ -345,6 +345,34 @@ pub fn translate_ring_constraints(classified_state: &Object) -> Vec<Object> {
     out
 }
 
+/// Translate `Derivation Rule` classifications into `DerivationRule`
+/// cell facts. Stage-2 emits a minimal skeleton — id + text —
+/// matching the existing cell shape's `id` / `text` /
+/// `consequentFactTypeId` / `json` bindings. Full Halpin resolution
+/// (join keys, antecedent filters, consequent bindings,
+/// consequent aggregates) stays in the Rust classifier for now and
+/// will migrate in a follow-up commit once the
+/// FactType + Role cells have been populated by Stage-2 earlier in
+/// the pipeline.
+#[cfg(feature = "std-deps")]
+pub fn translate_derivation_rules(classified_state: &Object) -> Vec<Object> {
+    let statement_ids = collect_statement_ids(classified_state);
+    let mut out: Vec<Object> = Vec::new();
+    for stmt_id in &statement_ids {
+        let classifications = classifications_for(classified_state, stmt_id);
+        if !classifications.iter().any(|k| k == "Derivation Rule") {
+            continue;
+        }
+        let text = statement_text(classified_state, stmt_id).unwrap_or_default();
+        out.push(fact_from_pairs(&[
+            ("id",                   text.as_str()),
+            ("text",                 text.as_str()),
+            ("consequentFactTypeId", ""),
+        ]));
+    }
+    out
+}
+
 fn ring_adjective_to_kind(marker: &str) -> Option<&'static str> {
     match marker {
         "is irreflexive"   => Some("IR"),
@@ -847,6 +875,27 @@ mod tests {
         let classified = classify_statements(&stmt, &grammar_state());
         let constraints = super::translate_ring_constraints(&classified);
         assert!(constraints.is_empty());
+    }
+
+    #[test]
+    fn translate_derivation_rules_captures_text() {
+        let stmt = stage1_state(
+            "s1",
+            "Customer has Full Name iff Customer has First Name.",
+            &["Customer", "Full Name", "First Name"]);
+        let classified = classify_statements(&stmt, &grammar_state());
+        let rules = super::translate_derivation_rules(&classified);
+        assert_eq!(rules.len(), 1);
+        assert!(binding(&rules[0], "text").unwrap()
+                .contains("Customer has Full Name iff"));
+    }
+
+    #[test]
+    fn translate_derivation_rules_skips_non_derivations() {
+        let stmt = stage1_state("s1", "Customer is an entity type.", &["Customer"]);
+        let classified = classify_statements(&stmt, &grammar_state());
+        let rules = super::translate_derivation_rules(&classified);
+        assert!(rules.is_empty());
     }
 
     #[test]

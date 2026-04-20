@@ -102,6 +102,18 @@ pub fn tokenize_statement(statement_id: &str, text: &str, nouns: &[String]) -> C
             ("Statement", statement_id), ("Literal_Role", "true"),
         ]));
     }
+    // Keyword markers: scan the body for derivation / conditional
+    // keywords so the grammar's `Statement has Keyword 'iff'` recognizers
+    // can fire without requiring the keyword to land in the Verb slot
+    // (which only captures text between roles 0 and 1).
+    for kw in KEYWORDS {
+        let needle = alloc::format!(" {} ", kw);
+        if body.contains(needle.as_str()) {
+            push(&mut cells, "Statement_has_Keyword", fact_from_pairs(&[
+                ("Statement", statement_id), ("Keyword", kw),
+            ]));
+        }
+    }
     // --- Role References ---
     for (i, rr) in role_refs.iter().enumerate() {
         let role_id = format!("{statement_id}:role:{i}");
@@ -143,6 +155,8 @@ fn strip_derivation_marker(text: &str) -> (&str, Option<String>) {
     }
     (text, None)
 }
+
+const KEYWORDS: &[&str] = &["iff", "if", "when"];
 
 const QUANTIFIERS: &[&str] = &[
     "at most one ",
