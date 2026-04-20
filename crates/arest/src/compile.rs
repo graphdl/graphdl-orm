@@ -2513,7 +2513,8 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
             Func::compose(Func::apply_to_all(derive_one), extract(0, ft_id))
         }
         _ => {
-            // Multi-antecedent existence check (legacy shape).
+            // Multi-antecedent existence check. Fires when every
+            // antecedent has at least one surviving fact.
             let ant_checks: Vec<Func> = antecedent_ids.iter().enumerate()
                 .map(|(i, ft_id)| Func::compose(
                     Func::compose(Func::Not, Func::NullTest),
@@ -2523,8 +2524,38 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
             let all_hold = ant_checks.into_iter()
                 .reduce(|a, b| Func::compose(Func::And, Func::construction(vec![a, b])))
                 .unwrap();
-            // Bindings: first fact from first antecedent.
-            let bindings = Func::compose(Func::Selector(1), extract(0, &antecedent_ids[0]));
+            // Bindings: when the rule pins consequent roles to literals
+            // (#286 — grammar recognizer rules like Frequency
+            // Constraint), construct the consequent fact fresh in the
+            // declared role order so forward-chain emits a canonical
+            // fact without position drift. Otherwise fall back to the
+            // first-fact-from-first-antecedent shape.
+            let first_fact = Func::compose(Func::Selector(1), extract(0, &antecedent_ids[0]));
+            let bindings = if rule.consequent_role_literals.is_empty() {
+                first_fact
+            } else {
+                let literal_by_role: hashbrown::HashMap<&str, &str> =
+                    rule.consequent_role_literals.iter()
+                        .map(|crl| (crl.role.as_str(), crl.value.as_str()))
+                        .collect();
+                let cons_roles = data.fact_types.get(&consequent_id)
+                    .map(|ft| ft.roles.clone())
+                    .unwrap_or_default();
+                let pairs: Vec<Func> = cons_roles.iter().map(|r| {
+                    let key = r.noun_name.replace(' ', "_");
+                    let value_func = match literal_by_role.get(r.noun_name.as_str()) {
+                        Some(lit) => Func::constant(Object::atom(lit)),
+                        None => Func::compose(
+                            role_value_by_name(&r.noun_name),
+                            first_fact.clone()),
+                    };
+                    Func::construction(vec![
+                        Func::constant(Object::atom(&key)),
+                        value_func,
+                    ])
+                }).collect();
+                Func::construction(pairs)
+            };
             let derived = Func::construction(vec![
                 Func::constant(Object::atom(&consequent_id)),
                 Func::constant(Object::atom(&consequent_reading)),
