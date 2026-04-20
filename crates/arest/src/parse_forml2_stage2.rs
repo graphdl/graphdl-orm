@@ -138,6 +138,93 @@ pub fn translate_subtypes(classified_state: &Object) -> Vec<Object> {
     }).collect()
 }
 
+/// Translate `Fact Type Reading` classifications into `FactType` +
+/// `Role` cell facts. Returns `(fact_type_facts, role_facts)`.
+///
+/// Exclusions: Statements whose Fact Type Reading classification is
+/// an artifact of declaring a noun (Entity Type / Value Type /
+/// Subtype / Abstract / Enum Values Declaration) or asserting an
+/// instance (Instance Fact) are NOT emitted as fact types. The
+/// current FORML 2 corpus relies on this separation — the noun-
+/// declaration shape `Customer is an entity type` also matches Fact
+/// Type Reading because it has a Role Reference.
+#[cfg(feature = "std-deps")]
+pub fn translate_fact_types(classified_state: &Object) -> (Vec<Object>, Vec<Object>) {
+    let statement_ids = collect_statement_ids(classified_state);
+    let mut ft_facts: Vec<Object> = Vec::new();
+    let mut role_facts: Vec<Object> = Vec::new();
+    for stmt_id in &statement_ids {
+        let classifications = classifications_for(classified_state, stmt_id);
+        if !classifications.iter().any(|k| k == "Fact Type Reading") {
+            continue;
+        }
+        // Exclude declarative shapes that incidentally match.
+        const EXCLUDE: &[&str] = &[
+            "Entity Type Declaration",
+            "Value Type Declaration",
+            "Subtype Declaration",
+            "Abstract Declaration",
+            "Enum Values Declaration",
+            "Instance Fact",
+            "Partition Declaration",
+        ];
+        if classifications.iter().any(|k| EXCLUDE.iter().any(|e| e == k)) {
+            continue;
+        }
+        let roles = role_refs_for(classified_state, stmt_id);
+        let Some(text) = statement_text(classified_state, stmt_id) else { continue };
+        let reading = text;
+        let id = reading.replace(' ', "_");
+        ft_facts.push(fact_from_pairs(&[
+            ("id", id.as_str()),
+            ("reading", reading.as_str()),
+            ("arity", &roles.len().to_string()),
+        ]));
+        for (i, noun_name) in roles.iter().enumerate() {
+            role_facts.push(fact_from_pairs(&[
+                ("factType", id.as_str()),
+                ("nounName", noun_name.as_str()),
+                ("position", &i.to_string()),
+            ]));
+        }
+    }
+    (ft_facts, role_facts)
+}
+
+/// Role head nouns for a Statement, ordered by Role Position.
+fn role_refs_for(state: &Object, stmt_id: &str) -> Vec<String> {
+    let refs = fetch_or_phi("Statement_has_Role_Reference", state);
+    let Some(refs_seq) = refs.as_seq() else { return Vec::new() };
+    let role_ids: Vec<String> = refs_seq.iter()
+        .filter(|f| binding(f, "Statement") == Some(stmt_id))
+        .filter_map(|f| binding(f, "Role_Reference").map(String::from))
+        .collect();
+    let positions = fetch_or_phi("Role_Reference_has_Role_Position", state);
+    let pos_seq = positions.as_seq();
+    let head_nouns = fetch_or_phi("Role_Reference_has_Head_Noun", state);
+    let hn_seq = head_nouns.as_seq();
+    let mut with_pos: Vec<(usize, String)> = role_ids.iter().filter_map(|id| {
+        let pos_s = pos_seq.as_ref()?.iter()
+            .find(|f| binding(f, "Role_Reference") == Some(id.as_str()))
+            .and_then(|f| binding(f, "Role_Position").map(String::from))?;
+        let pos: usize = pos_s.parse().ok()?;
+        let noun = hn_seq.as_ref()?.iter()
+            .find(|f| binding(f, "Role_Reference") == Some(id.as_str()))
+            .and_then(|f| binding(f, "Head_Noun").map(String::from))?;
+        Some((pos, noun))
+    }).collect();
+    with_pos.sort_by_key(|(p, _)| *p);
+    with_pos.into_iter().map(|(_, n)| n).collect()
+}
+
+fn statement_text(state: &Object, stmt_id: &str) -> Option<String> {
+    fetch_or_phi("Statement_has_Text", state)
+        .as_seq()?
+        .iter()
+        .find(|f| binding(f, "Statement") == Some(stmt_id))
+        .and_then(|f| binding(f, "Text").map(String::from))
+}
+
 fn role_noun_at_position(state: &Object, stmt_id: &str, position: usize) -> Option<String> {
     let refs = fetch_or_phi("Statement_has_Role_Reference", state);
     let refs_seq = refs.as_seq()?;
@@ -509,6 +596,48 @@ mod tests {
         let classified = classify_statements(&stmt, &grammar_state());
         let subtype_facts = super::translate_subtypes(&classified);
         assert!(subtype_facts.is_empty());
+    }
+
+    #[test]
+    fn translate_fact_types_emits_ft_and_role_facts_for_binary() {
+        let stmt = stage1_state(
+            "s1", "Customer places Order.", &["Customer", "Order"]);
+        let classified = classify_statements(&stmt, &grammar_state());
+        let (ft, roles) = super::translate_fact_types(&classified);
+        assert_eq!(ft.len(), 1);
+        assert_eq!(binding(&ft[0], "id"), Some("Customer_places_Order"));
+        assert_eq!(binding(&ft[0], "reading"), Some("Customer places Order"));
+        assert_eq!(binding(&ft[0], "arity"), Some("2"));
+        assert_eq!(roles.len(), 2);
+        let positions: Vec<String> = roles.iter()
+            .filter_map(|r| Some(format!("{}@{}",
+                binding(r, "nounName")?,
+                binding(r, "position")?)))
+            .collect();
+        assert!(positions.contains(&"Customer@0".to_string()), "got {:?}", positions);
+        assert!(positions.contains(&"Order@1".to_string()), "got {:?}", positions);
+    }
+
+    #[test]
+    fn translate_fact_types_skips_entity_type_declaration() {
+        // `Customer is an entity type` matches Fact Type Reading
+        // (has a Role Reference) but is excluded from FT emission.
+        let stmt = stage1_state(
+            "s1", "Customer is an entity type.", &["Customer"]);
+        let classified = classify_statements(&stmt, &grammar_state());
+        let (ft, roles) = super::translate_fact_types(&classified);
+        assert!(ft.is_empty(), "got FT facts: {:?}", ft);
+        assert!(roles.is_empty());
+    }
+
+    #[test]
+    fn translate_fact_types_skips_subtype_declaration() {
+        let stmt = stage1_state(
+            "s1", "Support Request is a subtype of Request.",
+            &["Support Request", "Request"]);
+        let classified = classify_statements(&stmt, &grammar_state());
+        let (ft, _) = super::translate_fact_types(&classified);
+        assert!(ft.is_empty());
     }
 
     #[test]
