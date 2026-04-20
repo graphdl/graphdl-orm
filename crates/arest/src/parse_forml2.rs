@@ -25,17 +25,9 @@ use hashbrown::HashMap;
 #[cfg_attr(feature = "std-deps", derive(serde::Deserialize, serde::Serialize))]
 #[cfg_attr(feature = "std-deps", serde(rename_all = "camelCase"))]
 struct ParseCtx {
-    #[cfg_attr(feature = "std-deps", serde(default))]
-    derivation_rules: Vec<DerivationRuleDef>,
-    /// Object cells produced by apply_action. This IS the parse output;
-    /// only derivation_rules still shadows a cell because pass 2b
-    /// mutates its shape (resolve_derivation_rule).
-    ///
-    /// #283 target: delete the remaining typed cache and make this the
-    /// sole parser state. Migration in progress — named_spans,
-    /// autofill_spans, ref_schemes, subtypes, enum_values,
-    /// general_instance_facts, nouns, fact_types, and constraints
-    /// already migrated to their respective cells.
+    /// Object cells produced by apply_action. This IS the parse output
+    /// — every typed field has now been migrated to cells (#283). The
+    /// parser is Gossamer: all hair and sneakers.
     #[cfg_attr(feature = "std-deps", serde(skip))]
     cells: HashMap<String, Vec<crate::ast::Object>>,
 }
@@ -1031,7 +1023,6 @@ fn parse_markdown_with_context(input: &str, existing_nouns: &HashMap<String, Nou
     // the metamodel bootstrap), reject. The bootstrap case (no existing nouns
     // for those names) is allowed to declare them exactly once.
     let mut standalone = ParseCtx {
-        derivation_rules: vec![],
         cells: HashMap::new(),
     };
     parse_into(&mut standalone, input)?;
@@ -1047,7 +1038,6 @@ fn parse_markdown_with_context(input: &str, existing_nouns: &HashMap<String, Nou
     }
 
     let mut ir = ParseCtx {
-        derivation_rules: vec![],
         cells: HashMap::new(),
     };
     // #283 — seed the Noun + FactType + Role cells from the pre-existing
@@ -1251,16 +1241,11 @@ pub fn parse_to_state_with_nouns(input: &str, existing: &crate::ast::Object) -> 
 /// Convert a ParseCtx to an Object state (sequence of cells).
 /// Each category becomes a cell: <CELL, fact_type_id, <facts...>>
 fn ctx_to_state(d: &ParseCtx) -> crate::ast::Object {
-    use crate::ast::{Object, fact_from_pairs};
+    use crate::ast::Object;
     use hashbrown::HashMap;
-    // Seed with cells already emitted by apply_action (Constraint,
-    // DerivationRule, etc.). Kinds that need cross-ref resolution (Noun,
-    // FactType, Role, compound-ref-scheme) are emitted below from typed
-    // fields; for write-only kinds already in d.cells, skip re-emission.
-    let mut cells: HashMap<String, Vec<Object>> = d.cells.clone();
-    let push = |cells: &mut HashMap<String, Vec<Object>>, name: &str, fact: Object| {
-        cells.entry(name.to_string()).or_default().push(fact);
-    };
+    // #283 — all parser state lives in cells; ctx_to_state is now just
+    // a wrapper that lifts the cell map into an Object::Map.
+    let cells: HashMap<String, Vec<Object>> = d.cells.clone();
 
     // #283 — Noun cell is populated directly by apply_action; no fallback
     // from a typed map is needed any longer.
@@ -1271,32 +1256,8 @@ fn ctx_to_state(d: &ParseCtx) -> crate::ast::Object {
     // #283 — Constraint cell is populated directly by apply_action
     // (plus the VC post-pass and autofill mutator); no fallback needed.
 
-    // Derivation rules + unresolved-clause diagnostics.
-    // apply_action / parse_into's finalize step emits these to d.cells;
-    // the fallback path below handles test fixtures built from typed
-    // fields only (e.g. ParseCtx literals in evaluate.rs).
-    if !cells.contains_key("DerivationRule") {
-        for r in &d.derivation_rules {
-            // `mut` is only consumed under the `std-deps` feature; silence
-            // the no-default-features warning without splitting the decl.
-            #[allow(unused_mut)]
-            let mut pairs: Vec<(&str, &str)> = vec![
-                ("id", r.id.as_str()), ("text", r.text.as_str()),
-                ("consequentFactTypeId", r.consequent_fact_type_id.as_str()),
-            ];
-            #[cfg(feature = "std-deps")]
-            let json_blob = serde_json::to_string(r).unwrap_or_default();
-            #[cfg(feature = "std-deps")]
-            pairs.push(("json", json_blob.as_str()));
-            push(&mut cells, "DerivationRule", fact_from_pairs(&pairs));
-            for clause in &r.unresolved_clauses {
-                push(&mut cells, "UnresolvedClause", fact_from_pairs(&[
-                    ("ruleId", r.id.as_str()), ("ruleText", r.text.as_str()),
-                    ("clause", clause.as_str()),
-                ]));
-            }
-        }
-    }
+    // #283 — DerivationRule + UnresolvedClause cells populated directly
+    // by apply_action / parse_into's AddDerivation branch. No fallback.
 
     // State machines are derived from instance facts at compile time
     // (derive_state_machines_from_facts in compile.rs). The parser does
@@ -1318,7 +1279,6 @@ fn ctx_to_state(d: &ParseCtx) -> crate::ast::Object {
 
 fn parse_markdown(input: &str) -> Result<ParseCtx, String> {
     let mut ir = ParseCtx {
-        derivation_rules: vec![],
         cells: HashMap::new(),
     };
     parse_into(&mut ir, input)?;
@@ -1611,7 +1571,10 @@ fn parse_into(ir: &mut ParseCtx, input: &str) -> Result<(), String> {
                     let nouns_map = nouns_from_cells(&ir.cells);
                     let fact_types_map = fact_types_from_cells(&ir.cells);
                     resolve_derivation_rule(&mut r, &nouns_map, &fact_types_map, &catalog);
-                    ir.derivation_rules.push(r);
+                    // #283 — DerivationRule + UnresolvedClause cells.
+                    #[cfg(feature = "std-deps")]
+                    push_derivation_rule_cells(ir, &r);
+                    let _ = r;
                 }
                 other => { apply_action(ir, Some(other), &lines, i); }
             }
@@ -1674,17 +1637,12 @@ fn parse_into(ir: &mut ParseCtx, input: &str) -> Result<(), String> {
     #[cfg(feature = "std-deps")]
     mark_ss_constraints_autofill(ir, &autofill_role_sets);
 
-    // Finalize cells from typed fields after all post-processing. This
-    // captures mutations applied after the per-arm emission (VC
-    // extension, autofill span marking, derivation re-resolution, etc.)
-    // and keeps the parse output Object-native per Thm 2.
+    // Finalize: #283 — with every typed field migrated to cells, the
+    // only remaining finalize work is enriching Noun facts with
+    // supertype/ref-scheme/enum-values bindings joined from sibling
+    // cells, plus the compound-ref-scheme decomposition below.
     #[cfg(feature = "std-deps")]
     {
-        use crate::ast::{Object, fact_from_pairs};
-
-        // Noun: #283 — writers emit to the Noun cell during parse.
-        // Finalize enriches each Noun fact with superType / referenceScheme
-        // / enumValues bindings by joining the sibling cells.
         enrich_noun_cells(ir);
 
         // FactType + Role: #283 — apply_action's AddFactType branch
@@ -1695,27 +1653,9 @@ fn parse_into(ir: &mut ParseCtx, input: &str) -> Result<(), String> {
         // parse; mark_ss_constraints_autofill rewrites facts in place.
         // No finalize rebuild needed.
 
-        // DerivationRule + UnresolvedClause: ir.derivation_rules → cells
-        let mut dr_facts: Vec<Object> = Vec::with_capacity(ir.derivation_rules.len());
-        let mut uc_facts: Vec<Object> = Vec::new();
-        for r in &ir.derivation_rules {
-            let json = serde_json::to_string(r).unwrap_or_default();
-            dr_facts.push(fact_from_pairs(&[
-                ("id", r.id.as_str()), ("text", r.text.as_str()),
-                ("consequentFactTypeId", r.consequent_fact_type_id.as_str()),
-                ("json", json.as_str()),
-            ]));
-            for clause in &r.unresolved_clauses {
-                uc_facts.push(fact_from_pairs(&[
-                    ("ruleId", r.id.as_str()), ("ruleText", r.text.as_str()),
-                    ("clause", clause.as_str()),
-                ]));
-            }
-        }
-        ir.cells.insert("DerivationRule".to_string(), dr_facts);
-        if !uc_facts.is_empty() {
-            ir.cells.insert("UnresolvedClause".to_string(), uc_facts);
-        }
+        // DerivationRule + UnresolvedClause: #283 — apply_action /
+        // pass 2b AddDerivation branch writes these cells directly via
+        // push_derivation_rule_cells. No finalize rebuild needed.
 
         // StateMachine cells are derived at compile time from instance
         // facts ("State Machine Definition 'X' is for Noun 'Y'" etc.) by
@@ -1749,7 +1689,7 @@ fn parse_into(ir: &mut ParseCtx, input: &str) -> Result<(), String> {
                 for (component, value) in ref_parts.iter().zip(parts.iter()) {
                     let cell_name = format!("{}_has_{}",
                         noun_name.replace(' ', "_"), component.replace(' ', "_"));
-                    ir.cells.entry(cell_name).or_default().push(fact_from_pairs(&[
+                    ir.cells.entry(cell_name).or_default().push(crate::ast::fact_from_pairs(&[
                         (noun_name.as_str(), id.as_str()),
                         (component.as_str(), *value),
                     ]));
@@ -2832,6 +2772,40 @@ fn upsert_fact_type(ir: &mut ParseCtx, id: &str, def: &FactTypeDef) {
     }
 }
 
+/// #283 — Push a derivation rule to the `DerivationRule` cell (plus
+/// its unresolved clauses to the `UnresolvedClause` cell). Replaces
+/// `ir.derivation_rules.push(r)`. Lossless via JSON.
+#[cfg(feature = "std-deps")]
+fn push_derivation_rule_cells(ir: &mut ParseCtx, rule: &DerivationRuleDef) {
+    let json = serde_json::to_string(rule).unwrap_or_default();
+    push_cell(ir, "DerivationRule", crate::ast::fact_from_pairs(&[
+        ("id", rule.id.as_str()),
+        ("text", rule.text.as_str()),
+        ("consequentFactTypeId", rule.consequent_fact_type_id.as_str()),
+        ("json", json.as_str()),
+    ]));
+    for clause in &rule.unresolved_clauses {
+        push_cell(ir, "UnresolvedClause", crate::ast::fact_from_pairs(&[
+            ("ruleId", rule.id.as_str()),
+            ("ruleText", rule.text.as_str()),
+            ("clause", clause.as_str()),
+        ]));
+    }
+}
+
+/// #283 — Rebuild `Vec<DerivationRuleDef>` from the `DerivationRule` cell.
+/// The `json` binding on each fact is the lossless encoding.
+#[cfg(feature = "std-deps")]
+fn derivation_rules_from_cells(
+    cells: &HashMap<String, Vec<crate::ast::Object>>,
+) -> Vec<DerivationRuleDef> {
+    let Some(facts) = cells.get("DerivationRule") else { return Vec::new() };
+    facts.iter().filter_map(|f| {
+        let json = crate::ast::binding(f, "json")?;
+        serde_json::from_str::<DerivationRuleDef>(json).ok()
+    }).collect()
+}
+
 /// #283 — Rebuild `Vec<ConstraintDef>` from the `Constraint` cell.
 /// The cell is lossless — `constraint_to_fact` embeds the full JSON
 /// encoding of each ConstraintDef under the `json` binding. Callers
@@ -2976,12 +2950,13 @@ fn apply_action(ir: &mut ParseCtx, action: Option<ParseAction>, lines: &[String]
             let _ = c;
         }
         ParseAction::AddDerivation(r) => {
-            // Pass 2b (re_resolve_rules) re-populates structured fields on
-            // the typed Vec; the corresponding cell fact is (re-)emitted
-            // at finalize. Here we only push the typed representation —
-            // no cell emission yet, because the rule's JSON shape will
-            // change after resolution.
-            ir.derivation_rules.push(r);
+            // #283 — DerivationRule + UnresolvedClause cells directly.
+            // Pass 2b's explicit branch normally handles AddDerivation
+            // after resolve; this defensive branch only fires if a
+            // different pass routes here.
+            #[cfg(feature = "std-deps")]
+            push_derivation_rule_cells(ir, &r);
+            let _ = r;
         }
         ParseAction::AddInstanceFact(raw) => {
             let line_refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
@@ -3734,7 +3709,8 @@ mod tests {
     fn derivation_rules() {
         let input = "X(.id) is an entity type.\nY(.id) is an entity type.\nX has Y iff some condition.";
         let ir = parse_markdown(input).unwrap();
-        assert!(!ir.derivation_rules.is_empty());
+        // #283 — DerivationRule cell read.
+        assert!(!super::derivation_rules_from_cells(&ir.cells).is_empty());
     }
 
     #[test]
@@ -3785,8 +3761,10 @@ mod tests {
     fn derivation_rule_extracts_fact_types() {
         let input = "User(.Email) is an entity type.\nDomain(.Slug) is an entity type.\nOrg Role is a value type.\nOrganization(.Slug) is an entity type.\n## Fact Types\nUser has Org Role in Organization.\nDomain belongs to Organization.\nUser accesses Domain.\n## Derivation Rules\nUser accesses Domain if User has Org Role in Organization and Domain belongs to that Organization.";
         let ir = parse_markdown(input).unwrap();
-        assert!(!ir.derivation_rules.is_empty());
-        let rule = &ir.derivation_rules[0];
+        // #283 — DerivationRule cell read.
+        let rules = super::derivation_rules_from_cells(&ir.cells);
+        assert!(!rules.is_empty());
+        let rule = &rules[0];
         assert!(!rule.consequent_fact_type_id.is_empty(), "consequent should be resolved");
         assert!(!rule.antecedent_fact_type_ids.is_empty(), "antecedents should be resolved");
         assert!(rule.antecedent_fact_type_ids.len() >= 2, "should have at least 2 antecedents");
@@ -3796,7 +3774,9 @@ mod tests {
     fn derivation_rule_identifies_join_keys() {
         let input = "User(.Email) is an entity type.\nDomain(.Slug) is an entity type.\nOrg Role is a value type.\nOrganization(.Slug) is an entity type.\n## Fact Types\nUser has Org Role in Organization.\nDomain belongs to Organization.\nUser accesses Domain.\n## Derivation Rules\nUser accesses Domain if User has Org Role in Organization and Domain belongs to that Organization.";
         let ir = parse_markdown(input).unwrap();
-        let rule = &ir.derivation_rules[0];
+        // #283 — DerivationRule cell read.
+        let rules = super::derivation_rules_from_cells(&ir.cells);
+        let rule = &rules[0];
         assert!(rule.join_on.contains(&"Organization".to_string()), "Organization should be a join key (referenced with 'that')");
     }
 
@@ -3815,7 +3795,8 @@ mod tests {
     fn derivation_rule_captures_inline_ge_comparison() {
         let input = "City(.Name) is an entity type.\nBig City(.Name) is an entity type.\nPopulation is a value type.\n## Fact Types\nCity has Population.\nBig City has City.\n## Derivation Rules\n* Big City has City iff City has Population >= 1000000.";
         let ir = parse_markdown(input).unwrap();
-        let rule = ir.derivation_rules.iter()
+        let rules = super::derivation_rules_from_cells(&ir.cells);
+        let rule = rules.iter()
             .find(|r| r.text.contains("Big City has City"))
             .expect("derivation rule present");
         assert_eq!(rule.antecedent_filters.len(), 1,
@@ -3843,7 +3824,8 @@ mod tests {
             let input = format!(
                 "City(.Name) is an entity type.\nBig City(.Name) is an entity type.\nPopulation is a value type.\n## Fact Types\nCity has Population.\nBig City has City.\n## Derivation Rules\n* Big City has City iff City has Population {op_in} 100.");
             let ir = parse_markdown(&input).expect("parse ok");
-            let rule = ir.derivation_rules.iter()
+            let rules = super::derivation_rules_from_cells(&ir.cells);
+        let rule = rules.iter()
                 .find(|r| r.text.contains("Big City has City"))
                 .unwrap_or_else(|| panic!("rule missing for op {op_in}"));
             assert_eq!(rule.antecedent_filters.len(), 1, "op {op_in}: filters = {:?}", rule.antecedent_filters);
@@ -3858,7 +3840,8 @@ mod tests {
         // Float + negative literal should parse; irrelevant whitespace too.
         let input = "Reading(.Name) is an entity type.\nWarm Reading(.Name) is an entity type.\nTemperature is a value type.\n## Fact Types\nReading has Temperature.\nWarm Reading has Reading.\n## Derivation Rules\n* Warm Reading has Reading iff Reading has Temperature > -273.15.";
         let ir = parse_markdown(input).unwrap();
-        let rule = ir.derivation_rules.iter()
+        let rules = super::derivation_rules_from_cells(&ir.cells);
+        let rule = rules.iter()
             .find(|r| r.text.contains("Warm Reading has Reading"))
             .expect("rule present");
         assert_eq!(rule.antecedent_filters.len(), 1);
@@ -3887,7 +3870,8 @@ mod tests {
     fn derivation_rule_captures_computed_binding_with_plus() {
         let input = "Foo(.id) is an entity type.\nVal is a value type.\nDoubled is a value type.\n## Fact Types\nFoo has Val.\nFoo has Doubled.\n## Derivation Rules\n* Foo has Doubled iff Foo has Val and Doubled is Val + Val.";
         let ir = parse_markdown(input).unwrap();
-        let rule = ir.derivation_rules.iter()
+        let rules = super::derivation_rules_from_cells(&ir.cells);
+        let rule = rules.iter()
             .find(|r| r.text.contains("Foo has Doubled"))
             .expect("rule present");
         assert_eq!(rule.consequent_computed_bindings.len(), 1,
@@ -3909,7 +3893,8 @@ mod tests {
             let input = format!(
                 "Foo(.id) is an entity type.\nA is a value type.\nB is a value type.\nC is a value type.\n## Fact Types\nFoo has A.\nFoo has B.\nFoo has C.\n## Derivation Rules\n* Foo has C iff Foo has A and Foo has B and C is A {op} B.");
             let ir = parse_markdown(&input).expect("parse ok");
-            let rule = ir.derivation_rules.iter()
+            let rules = super::derivation_rules_from_cells(&ir.cells);
+        let rule = rules.iter()
                 .find(|r| r.text.contains("Foo has C"))
                 .unwrap_or_else(|| panic!("rule missing for op {op}"));
             assert_eq!(rule.consequent_computed_bindings.len(), 1, "op {op} missed");
@@ -3928,7 +3913,8 @@ mod tests {
         use crate::types::ArithExpr;
         let input = "Box(.id) is an entity type.\nSize is a value type.\nVolume is a value type.\n## Fact Types\nBox has Size.\nBox has Volume.\n## Derivation Rules\n* Box has Volume iff Box has Size and Volume is Size * Size * Size.";
         let ir = parse_markdown(input).unwrap();
-        let rule = ir.derivation_rules.iter()
+        let rules = super::derivation_rules_from_cells(&ir.cells);
+        let rule = rules.iter()
             .find(|r| r.text.contains("Box has Volume"))
             .expect("rule present");
         assert_eq!(rule.consequent_computed_bindings.len(), 1);
@@ -3945,7 +3931,8 @@ mod tests {
         use crate::types::ArithExpr;
         let input = "Foo(.id) is an entity type.\nVal is a value type.\nNext is a value type.\n## Fact Types\nFoo has Val.\nFoo has Next.\n## Derivation Rules\n* Foo has Next iff Foo has Val and Next is Val + 1.";
         let ir = parse_markdown(input).unwrap();
-        let rule = ir.derivation_rules.iter()
+        let rules = super::derivation_rules_from_cells(&ir.cells);
+        let rule = rules.iter()
             .find(|r| r.text.contains("Foo has Next"))
             .expect("rule present");
         let cb = &rule.consequent_computed_bindings[0];
@@ -4022,7 +4009,8 @@ mod tests {
         // path handles natively.
         let input = "Worker(.Id) is an entity type.\nManager(.Id) is an entity type.\nVP(.Id) is an entity type.\n## Fact Types\nWorker reports to Manager.\nManager reports to VP.\nWorker reports up to VP.\n## Derivation Rules\n+ Worker reports up to VP if Worker reports to some Manager and that Manager reports to VP.";
         let ir = parse_markdown(input).unwrap();
-        let rule = ir.derivation_rules.iter()
+        let rules = super::derivation_rules_from_cells(&ir.cells);
+        let rule = rules.iter()
             .find(|r| r.text.contains("reports up to VP"))
             .expect("rule present");
         assert_eq!(rule.kind, crate::types::DerivationKind::Join,
@@ -4120,7 +4108,8 @@ mod tests {
     fn derivation_rule_captures_count_aggregate() {
         let input = "Thing(.Name) is an entity type.\nPart(.Name) is an entity type.\nArity is a value type.\n## Fact Types\nThing has Part.\nThing has Arity.\n## Derivation Rules\n* Thing has Arity iff Arity is the count of Part where Thing has Part.";
         let ir = parse_markdown(input).unwrap();
-        let rule = ir.derivation_rules.iter()
+        let rules = super::derivation_rules_from_cells(&ir.cells);
+        let rule = rules.iter()
             .find(|r| r.text.contains("Thing has Arity"))
             .expect("rule present");
         assert_eq!(rule.consequent_aggregates.len(), 1,
@@ -4145,7 +4134,9 @@ mod tests {
         // Regression: a plain join rule must not accidentally produce filters.
         let input = "User(.Email) is an entity type.\nDomain(.Slug) is an entity type.\nOrganization(.Slug) is an entity type.\n## Fact Types\nUser belongs to Organization.\nDomain belongs to Organization.\nUser accesses Domain.\n## Derivation Rules\n+ User accesses Domain if User belongs to Organization and Domain belongs to that Organization.";
         let ir = parse_markdown(input).unwrap();
-        let rule = &ir.derivation_rules[0];
+        // #283 — DerivationRule cell read.
+        let rules = super::derivation_rules_from_cells(&ir.cells);
+        let rule = &rules[0];
         assert!(rule.antecedent_filters.is_empty(),
             "expected no filters on plain join rule, got {:?}", rule.antecedent_filters);
     }
@@ -4389,7 +4380,8 @@ Person is uncle of Person.\n\
 ## Derivation Rules\n\
 + Person1 is uncle of Person2 iff Person1 is brother of some Person3 and that Person3 is parent of Person2.\n";
         let ir = parse_markdown(input).unwrap();
-        let rule = ir.derivation_rules.iter()
+        let rules = super::derivation_rules_from_cells(&ir.cells);
+        let rule = rules.iter()
             .find(|r| r.text.contains("uncle"))
             .expect("uncle derivation rule must be present");
         assert_eq!(
@@ -5079,13 +5071,15 @@ Customer has Full Name *.
 * Customer has Full Name iff Customer has First Name and Customer has Last Name.
 ";
         let domain = parse_markdown(input).expect("parse");
-        let has_rule = domain.derivation_rules.iter()
+        // #283 — DerivationRule cell read.
+        let rules = super::derivation_rules_from_cells(&domain.cells);
+        let has_rule = rules.iter()
             .any(|r| r.text.contains("Customer has Full Name") && r.text.contains(" iff "));
         assert!(has_rule,
             "rule with `*` prefix must be captured (prefix is stripped, body parsed normally); \
-             derivation_rules = {:?}", domain.derivation_rules);
+             derivation_rules = {:?}", rules);
         // Prefix must have been stripped from the stored rule text.
-        assert!(!domain.derivation_rules.iter().any(|r| r.text.starts_with("* ")),
+        assert!(!rules.iter().any(|r| r.text.starts_with("* ")),
             "the leading `*` marker must be stripped from the rule text");
     }
 
@@ -5102,10 +5096,12 @@ Order has Total **.
 ** Order has Total iff Order has Line Item and that Line Item has Amount.
 ";
         let domain = parse_markdown(input).expect("parse");
-        let has_rule = domain.derivation_rules.iter()
+        // #283 — DerivationRule cell read.
+        let rules = super::derivation_rules_from_cells(&domain.cells);
+        let has_rule = rules.iter()
             .any(|r| r.text.starts_with("Order has Total") && r.text.contains(" iff "));
         assert!(has_rule,
-            "`**` prefix must be stripped; derivation_rules = {:?}", domain.derivation_rules);
+            "`**` prefix must be stripped; derivation_rules = {:?}", rules);
     }
 
     #[test]
@@ -5117,10 +5113,12 @@ Person(.Name) is an entity type.
 + Person is Grandparent if Person is parent of some Person that is parent of some Person.
 ";
         let domain = parse_markdown(input).expect("parse");
-        let has_rule = domain.derivation_rules.iter()
+        // #283 — DerivationRule cell read.
+        let rules = super::derivation_rules_from_cells(&domain.cells);
+        let has_rule = rules.iter()
             .any(|r| r.text.contains("Grandparent") && r.text.contains(" if "));
         assert!(has_rule,
-            "`+` prefix must be stripped; derivation_rules = {:?}", domain.derivation_rules);
+            "`+` prefix must be stripped; derivation_rules = {:?}", rules);
     }
 
     #[test]
@@ -5539,7 +5537,8 @@ Order has Customer Age.\n\
 ## Derivation Rules\n\
 Order has Customer Age iff Order's Customer has Age.\n";
         let ir = parse_markdown(input).unwrap();
-        let rule = ir.derivation_rules.iter()
+        let rules = super::derivation_rules_from_cells(&ir.cells);
+        let rule = rules.iter()
             .find(|r| r.text.contains("Customer Age"))
             .expect("derivation rule for Customer Age must be present");
         assert_eq!(
