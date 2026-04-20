@@ -4921,6 +4921,55 @@ fn forbidden_ipv6_ula_fd() {
         }
     }
 
+    /// #284 — the FORML 2 grammar readings must themselves parse under
+    /// the current parser. This is the meta-circular contract: the file
+    /// that defines how to parse FORML 2 is written IN FORML 2, using
+    /// only Stage-1 bootstrap features. When Stage-1 exists (#285) the
+    /// grammar file becomes Stage-2's input.
+    #[test]
+    fn forml2_grammar_parses_under_stage1_subset() {
+        let grammar = include_str!("../../../readings/forml2-grammar.md");
+        let domain = parse_markdown(grammar)
+            .expect("readings/forml2-grammar.md must parse under Stage-1 subset");
+        // The three root entities plus the core classification vocabulary
+        // must be registered as nouns.
+        for entity in ["Statement", "Role Reference", "Classification"] {
+            assert_eq!(super::noun_object_type(&domain, entity).as_deref(),
+                       Some("entity"),
+                       "'{}' must be an entity type", entity);
+        }
+        // The tokenized-input fact types Stage-1 populates for each Statement.
+        let readings: Vec<String> = super::fact_type_ids(&domain).iter()
+            .filter_map(|id| super::fact_type_reading(&domain, id))
+            .collect();
+        for ft in [
+            "Statement has Text",
+            "Statement has Head Noun",
+            "Statement has Verb",
+            "Statement has Trailing Marker",
+            "Statement has Quantifier",
+            "Statement has Derivation Marker",
+            "Statement has Classification",
+            "Statement has Role Reference",
+            "Role Reference has Head Noun",
+            "Role Reference has Literal Value",
+            "Role Reference has Role Position",
+        ] {
+            assert!(readings.iter().any(|r| r == ft),
+                "grammar must declare fact type '{}'; got: {:?}", ft, readings);
+        }
+        // Recognizer derivation rules land in the DerivationRule cell.
+        let rules = super::derivation_rules_from_cells(&domain);
+        assert!(rules.len() >= 12,
+            "grammar must declare recognizer derivation rules; got {}: {:?}",
+            rules.len(),
+            rules.iter().map(|r| r.text.as_str()).collect::<Vec<_>>());
+        // Spot-check: the Entity Type Declaration recognizer is present.
+        assert!(rules.iter().any(|r|
+            r.text.contains("Entity Type Declaration") && r.text.contains(" iff ")),
+            "grammar must contain the Entity Type Declaration recognizer");
+    }
+
     /// #279 — NORMA's value-domain primitives. `Bound` + `Value Range`
     /// + `Facet` carry per-value-type constraints as first-class facts
     /// instead of the flat `Minimum`/`Maximum`/... fields we had before.
