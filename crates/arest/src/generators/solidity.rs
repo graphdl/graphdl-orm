@@ -141,7 +141,7 @@ fn emit_contract(
     let struct_def = emit_struct(table);
     let events = emit_events(name, state, scope);
     let sm_parts = sm.map(emit_state_machine).unwrap_or_default();
-    let create_fn = emit_create(name, table, sm);
+    let create_fn = emit_create(name, table, sm, state);
     let transitions = sm.map(|s| emit_transitions(s)).unwrap_or_default();
 
     format!(
@@ -243,8 +243,13 @@ fn emit_state_machine(sm: &StateMachineDef) -> String {
     format!("\n{}{}", enum_def, modifier)
 }
 
-/// Emit the create(...) function with UC + MC requires.
-fn emit_create(noun_name: &str, table: Option<&TableDef>, sm: Option<&StateMachineDef>) -> String {
+/// Emit the create(...) function with UC + MC + VC requires (E2, #304).
+fn emit_create(
+    noun_name: &str,
+    table: Option<&TableDef>,
+    sm: Option<&StateMachineDef>,
+    state: &Object,
+) -> String {
     let params: Vec<String> = match table {
         Some(t) => t.columns.iter().map(|c| {
             let t = solidity_type(c);
@@ -264,6 +269,32 @@ fn emit_create(noun_name: &str, table: Option<&TableDef>, sm: Option<&StateMachi
         pk, pk, noun_name
     );
 
+    // MC: every mandatory role of this entity requires its column to
+    // be non-empty at create time.
+    let mc_checks = mandatory_fields_for(noun_name, state).into_iter()
+        .map(|field_noun| {
+            let f = sanitize_field(&field_noun);
+            format!(
+                "        require(bytes({}).length > 0, \"MC: {} required\");",
+                f, field_noun)
+        })
+        .collect::<Vec<_>>();
+
+    // VC: for each column whose value-type noun has enum values
+    // declared, require the incoming parameter to match one of them.
+    let vc_checks = match table {
+        Some(t) => t.columns.iter().filter_map(|c| {
+            let col_noun = column_value_type_noun(&c.name, noun_name, state)?;
+            let values = enum_values_for_value_type(&col_noun, state);
+            if values.is_empty() { return None; }
+            let f = sanitize_field(&c.name);
+            Some(format!(
+                "        require(_validate{}({}), \"VC: {} invalid\");",
+                sanitize_name(&col_noun), f, c.name))
+        }).collect::<Vec<_>>(),
+        None => vec![],
+    };
+
     // Assign struct fields
     let assignments: Vec<String> = match table {
         Some(t) => t.columns.iter().map(|c| {
@@ -282,6 +313,8 @@ fn emit_create(noun_name: &str, table: Option<&TableDef>, sm: Option<&StateMachi
 
     let body = [
         vec![uc_check],
+        mc_checks,
+        vc_checks,
         assignments,
         if initial_status.is_empty() { vec![] } else { vec![initial_status] },
     ].concat().join("\n");
@@ -290,6 +323,90 @@ fn emit_create(noun_name: &str, table: Option<&TableDef>, sm: Option<&StateMachi
         "\n    function create({}) external {{\n{}\n    }}\n",
         params.join(", "), body
     )
+}
+
+/// Return every role noun `field_noun` such that a Constraint cell
+/// fact has `kind == "MC"`, `entity == noun_name`, and the constraint
+/// text names `field_noun` via `some <field_noun>` phrasing.
+///
+/// MC constraints in the Constraint cell today carry only `entity` +
+/// `text` (stage-2 translator doesn't populate role-noun binding yet
+/// per task #304's field-resolution note). Parse the text locally —
+/// Legacy emits `Each <entity> <verb> some <field>.` for MC shapes.
+fn mandatory_fields_for(noun_name: &str, state: &Object) -> Vec<String> {
+    let constraints = fetch_or_phi("Constraint", state);
+    let facts = constraints.as_seq().unwrap_or(&[]);
+    facts.iter()
+        .filter(|c| binding(c, "kind") == Some("MC"))
+        .filter(|c| binding(c, "entity") == Some(noun_name))
+        .filter_map(|c| {
+            let text = binding(c, "text")?;
+            // `Each X has some Y.` or `Each X <verb> some Y.` — take
+            // the phrase after ` some ` up to punctuation / trailing
+            // period.
+            let after = text.split(" some ").nth(1)?;
+            let tail = after
+                .trim_end_matches('.')
+                .split(|c: char| c == '.' || c == ',')
+                .next()?
+                .trim();
+            if tail.is_empty() { return None; }
+            Some(tail.to_string())
+        })
+        .collect()
+}
+
+/// Look up the value-type noun referenced by a column on the entity.
+/// Returns `Some(noun_name)` when the column's fact type resolves to
+/// `Entity has <ValueNoun>`; `None` otherwise. Used by VC emission to
+/// decide which columns need an enum validator.
+fn column_value_type_noun(
+    column_name: &str,
+    entity_name: &str,
+    state: &Object,
+) -> Option<String> {
+    let ft_cell = fetch_or_phi("FactType", state);
+    let role_cell = fetch_or_phi("Role", state);
+    let fts = ft_cell.as_seq()?;
+    let roles = role_cell.as_seq()?;
+
+    // Find the fact type whose reading mentions both the entity and
+    // `column_name`, and whose non-entity role noun is the column.
+    for ft in fts {
+        let ft_id = binding(ft, "id").unwrap_or("");
+        let reading = binding(ft, "reading").unwrap_or("");
+        if !reading.contains(entity_name) { continue; }
+        let ft_roles: Vec<&str> = roles.iter()
+            .filter(|r| binding(r, "factType") == Some(ft_id))
+            .filter_map(|r| binding(r, "nounName"))
+            .collect();
+        // Binary `Entity has <Value>` — the non-entity role is the
+        // value-type noun.
+        for &other in ft_roles.iter().filter(|n| **n != entity_name) {
+            if sanitize_field(other) == sanitize_field(column_name) {
+                return Some(other.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Read enum values declared for a value-type noun from the
+/// `EnumValues` cell. Empty vec if none.
+fn enum_values_for_value_type(noun_name: &str, state: &Object) -> Vec<String> {
+    let cell = fetch_or_phi("EnumValues", state);
+    let Some(facts) = cell.as_seq() else { return vec![]; };
+    for f in facts {
+        if binding(f, "noun") != Some(noun_name) { continue; }
+        // Values land under `value0`, `value1`, …
+        return (0..)
+            .map_while(|i| {
+                let key = format!("value{i}");
+                binding(f, &key).map(String::from)
+            })
+            .collect();
+    }
+    vec![]
 }
 
 /// Emit one function per state machine transition.
@@ -422,19 +539,17 @@ Order has Amount.
 ## Entity Types
 
 Order(.Order Number) is an entity type.
-
-## Value Types
-
-Email Address is a value type.
+Amount is a value type.
 
 ## Fact Types
 
-Order has Email Address.
-  Each Order has some Email Address.
+Order has Amount.
+  Each Order has at most one Amount.
+  Each Order has some Amount.
 "#;
 
     #[test]
-    #[ignore = "E2: MC require not yet implemented; see _reports/followup-2026-04-20.md"]
+    #[ignore = "E2: MC scaffold landed, awaiting RMAP column-absorption investigation — test input needs the Amount to appear as a struct column, which requires UC metadata in the Constraint cell that stage-2 doesn't yet populate"]
     fn compile_to_solidity_emits_mc_require() {
         let meta = parse_to_state(STATE_METAMODEL).unwrap();
         let state = parse_to_state_with_nouns(MC_READINGS, &meta).unwrap();
@@ -442,8 +557,8 @@ Order has Email Address.
         let out = compile_to_solidity_for_nouns(&state, &["Order"]);
         assert!(out.contains("MC:"),
             "expected MC require in create(), got:\n{}", out);
-        assert!(out.contains("bytes(emailAddress).length"),
-            "expected MC require on emailAddress field, got:\n{}", out);
+        assert!(out.contains("bytes(amount).length"),
+            "expected MC require on amount field, got:\n{}", out);
     }
 
     const VC_READINGS: &str = r#"
