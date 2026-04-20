@@ -441,15 +441,35 @@ fn statement_verb(state: &Object, stmt_id: &str) -> Option<String> {
 #[cfg(feature = "std-deps")]
 pub fn translate_ring_constraints(classified_state: &Object) -> Vec<Object> {
     let statement_ids = collect_statement_ids(classified_state);
+    let declared_nouns = declared_noun_names(classified_state);
     let mut out: Vec<Object> = Vec::new();
     for stmt_id in &statement_ids {
         let classifications = classifications_for(classified_state, stmt_id);
-        if !classifications.iter().any(|k| k == "Ring Constraint") {
-            continue;
-        }
-        let Some(marker) = trailing_marker_for(classified_state, stmt_id) else { continue };
-        let Some(kind) = ring_adjective_to_kind(&marker) else { continue };
+        // Two sources for ring emission:
+        //   (a) Ring Constraint classification (trailing-marker shape:
+        //       `<FT> is irreflexive.` / `No X R itself.`).
+        //   (b) Conditional ring shape (`If X R Y and Y R Z, then
+        //       X R Z` etc.) not caught by the grammar's trailing-
+        //       marker rule — matches legacy `try_ring`'s pass-2b
+        //       conditional-pattern dispatcher.
+        let is_classified_ring = classifications.iter()
+            .any(|k| k == "Ring Constraint");
         let text = statement_text(classified_state, stmt_id).unwrap_or_default();
+        let (kind, kind_source) = if is_classified_ring {
+            let marker = match trailing_marker_for(classified_state, stmt_id) {
+                Some(m) => m,
+                None => continue,
+            };
+            match ring_adjective_to_kind(&marker) {
+                Some(k) => (k, "marker"),
+                None => continue,
+            }
+        } else if let Some(k) = conditional_ring_kind(&text, &declared_nouns) {
+            (k, "conditional")
+        } else {
+            continue;
+        };
+        let _ = kind_source;
         let entity = head_noun_for(classified_state, stmt_id).unwrap_or_default();
         out.push(fact_from_pairs(&[
             ("id",       text.as_str()),
@@ -460,6 +480,92 @@ pub fn translate_ring_constraints(classified_state: &Object) -> Vec<Object> {
         ]));
     }
     out
+}
+
+/// Detect a conditional ring-constraint shape in a statement text.
+/// Mirrors legacy `try_ring`'s Pass 2b conditional dispatcher:
+///
+///   - antecedent role tokens (after subscript strip) all share one
+///     base noun type
+///   - consequent contains the same base noun
+///   - the (has_and, impossible, itself_in_consequent,
+///     is_not_in_antecedent) matrix picks a ring kind
+///
+/// Returns the ring kind (`TR` / `AS` / `SY` / `AT` / `IT` / `RF`)
+/// or `None` when the statement doesn't match a ring shape.
+#[cfg(feature = "std-deps")]
+fn conditional_ring_kind(text: &str, declared_nouns: &[String])
+    -> Option<&'static str>
+{
+    if !text.starts_with("If ") { return None; }
+    let then_idx = text.find(" then ")?;
+    let antecedent = &text[3..then_idx];
+    let consequent = &text[then_idx + 6..];
+
+    // Helper: strip a trailing digit subscript from a token.
+    // `Noun1` → "Noun"; `Noun` → "Noun".
+    let strip_subscript = |w: &str| -> String {
+        let trimmed = w.trim_end_matches(',');
+        let end = trimmed.char_indices()
+            .rev()
+            .take_while(|(_, c)| c.is_ascii_digit())
+            .map(|(i, _)| i)
+            .last()
+            .unwrap_or(trimmed.len());
+        trimmed[..end].to_string()
+    };
+
+    let role_bases: Vec<String> = antecedent.split_whitespace()
+        .filter_map(|w| {
+            let base = strip_subscript(w);
+            if declared_nouns.iter().any(|n| n.as_str() == base.as_str()) {
+                Some(base)
+            } else {
+                None
+            }
+        })
+        .collect();
+    if role_bases.len() < 2 { return None; }
+    let first = &role_bases[0];
+    if !role_bases.iter().all(|b| b == first) { return None; }
+
+    let consequent_body = consequent
+        .strip_prefix("it is impossible that ")
+        .unwrap_or(consequent);
+    let consequent_has_same_noun = consequent_body.split_whitespace()
+        .any(|w| strip_subscript(w) == *first);
+    if !consequent_has_same_noun { return None; }
+
+    let has_and = antecedent.contains(" and ");
+    let impossible = consequent.starts_with("it is impossible that ");
+    let itself_in_consequent = consequent.contains(" itself");
+    let is_not_in_antecedent = antecedent.contains(" is not ");
+    let is_not_in_consequent = consequent.contains(" is not ");
+
+    match (has_and, impossible, itself_in_consequent,
+           is_not_in_antecedent, is_not_in_consequent) {
+        // AT: `If A1 R A2 and A1 is not A2 then impossible A2 R A1`.
+        (true, true, _, true, _)        => Some("AT"),
+        // IT: `If A1 R A2 and A2 R A3 then impossible A1 R A3`.
+        (true, true, _, false, _)       => Some("IT"),
+        // TR: `If A1 R A2 and A2 R A3 then A1 R A3`.
+        (true, false, _, _, _)          => Some("TR"),
+        // AS via "impossible": `If A1 R A2 then it is impossible that
+        // A2 R A1`.
+        (false, true, false, _, _)      => Some("AS"),
+        // AS via "is not" in consequent: `If Noun1 R Noun2, then
+        // Noun2 is not R Noun1`. Legacy's matrix maps this to `SY`
+        // but the semantic is asymmetry — stage12 matches the
+        // semantic rather than reproduce the legacy matrix bug.
+        (false, false, false, _, true)  => Some("AS"),
+        // RF: `If A1 R some A2 then A1 R itself`.
+        (false, false, true, _, _)      => Some("RF"),
+        // SY: `If A1 R A2 then A2 R A1`.
+        (false, false, false, _, false) => Some("SY"),
+        // Anything else (e.g. `impossible + itself_in_consequent`) is
+        // not a recognised ring shape.
+        _ => None,
+    }
 }
 
 /// Translate `Derivation Rule` classifications into `DerivationRule`
@@ -490,6 +596,13 @@ pub fn translate_derivation_rules(classified_state: &Object) -> Vec<Object> {
         // only on semantic failure does try_derivation take over.
         let is_subset = classifications.iter().any(|k| k == "Subset Constraint");
         if is_subset && antecedent_distinct_nouns(&text, &declared_nouns) >= 2 {
+            continue;
+        }
+        // Arbitrate with `translate_ring_constraints`: when the
+        // statement matches a conditional ring shape (all antecedent
+        // role tokens share a base noun, consequent matches), the
+        // ring translator claims it — skip DR emission.
+        if conditional_ring_kind(&text, &declared_nouns).is_some() {
             continue;
         }
         let id = derivation_rule_id(&text);
