@@ -934,11 +934,12 @@ fn emit_constraint_modules(state: &Object) -> (Vec<String>, Vec<String>) {
             let module_name = sanitize(&format!("constraint_{}_{}", kind.to_ascii_lowercase(), id));
             let body = match kind {
                 "UC" => Some(emit_uc_constraint_body(&module_name)),
-                // MC / FC remain as placeholder stubs until their own
-                // commits replace each with real hardware. The stub
-                // preserves the module/endmodule balance and lets
-                // top's AND-reduce continue to line up.
-                "MC" | "FC" => Some(emit_placeholder_constraint_stub(&module_name, kind)),
+                "MC" => Some(emit_mc_constraint_body(&module_name)),
+                // FC remains as a placeholder stub until its own commit
+                // replaces it with the real counter. The stub preserves
+                // the module/endmodule balance and lets top's AND-reduce
+                // continue to line up.
+                "FC" => Some(emit_placeholder_constraint_stub(&module_name, kind)),
                 _ => None,
             };
             let _ = text;
@@ -949,6 +950,69 @@ fn emit_constraint_modules(state: &Object) -> (Vec<String>, Vec<String>) {
         }
     }
     (modules, names)
+}
+
+/// Mandatory-role constraint module body — sentinel reducer.
+///
+/// The MC predicate is "no active row is empty on the constrained
+/// column". Hardware form: compare each active row against the
+/// all-zero sentinel and OR-reduce the hits. `violation = 1` iff some
+/// active row matches all zeros. The convention follows the existing
+/// file's sanitize / to_snake treatment — integer columns default to
+/// all-zero-bits as the empty value; string columns use the same
+/// all-zero bit pattern (length-zero, since the BRAM write handler
+/// zero-initialises the row payload on row allocation).
+///
+/// Width-wise this mirrors UC exactly so an integrator can reuse the
+/// same BRAM wiring.
+fn emit_mc_constraint_body(module_name: &str) -> String {
+    let depth = CONSTRAINT_DEFAULT_DEPTH;
+    let row_width = CONSTRAINT_DEFAULT_ROW_WIDTH;
+    let mut out = String::new();
+    out.push_str(&format!(
+        "module {name} #(\n    \
+            parameter DEPTH = {depth},\n    \
+            parameter ROW_WIDTH = {row_width}\n\
+        ) (\n    \
+            input wire clk,\n    \
+            input wire rst_n,\n    \
+            input wire [DEPTH*ROW_WIDTH-1:0] rows_flat,\n    \
+            input wire [$clog2(DEPTH+1)-1:0] row_count,\n    \
+            output reg violation\n\
+        );\n",
+        name = module_name, depth = depth, row_width = row_width,
+    ));
+    // Per-row aliases.
+    for i in 0..depth {
+        out.push_str(&format!(
+            "    wire [ROW_WIDTH-1:0] row_{i} = rows_flat[{lo} +: ROW_WIDTH];\n",
+            i = i, lo = i * row_width,
+        ));
+    }
+    // Combinational sentinel compare — row matches all zeros.
+    out.push_str("    wire hit;\n");
+    let mut sentinels: Vec<String> = Vec::new();
+    for i in 0..depth {
+        sentinels.push(format!(
+            "({i} < row_count && row_{i} == {{ROW_WIDTH{{1'b0}}}})",
+            i = i,
+        ));
+    }
+    let hit_expr = if sentinels.is_empty() {
+        "1'b0".to_string()
+    } else {
+        sentinels.join(" || ")
+    };
+    out.push_str(&format!("    assign hit = {};\n", hit_expr));
+    out.push_str("    always @(posedge clk) begin\n");
+    out.push_str("        if (!rst_n) begin\n");
+    out.push_str("            violation <= 1'b0;\n");
+    out.push_str("        end else begin\n");
+    out.push_str("            violation <= hit;\n");
+    out.push_str("        end\n");
+    out.push_str("    end\n");
+    out.push_str("endmodule\n");
+    out
 }
 
 /// Placeholder stub preserved while kind-specific emitters are staged
@@ -1124,7 +1188,7 @@ fn emit_top_module(
         // Constraint cell's kind binding.
         let kind = constraint_kind_from_name(cname);
         match kind {
-            Some("uc") => {
+            Some("uc") | Some("mc") => {
                 out.push_str(&format!(
                     "        .rows_flat({{{total_bits}{{1'b0}}}}),\n",
                     total_bits = CONSTRAINT_DEFAULT_DEPTH * CONSTRAINT_DEFAULT_ROW_WIDTH,
@@ -1135,7 +1199,7 @@ fn emit_top_module(
                 ));
             }
             _ => {
-                // Placeholder stubs (MC / FC) and any future kind keep
+                // Placeholder stubs (FC) and any future kind keep
                 // the original port shape until their emitter lands.
             }
         }
@@ -1764,6 +1828,54 @@ Supplier supplies Widget.
         assert!(verilog.contains("constraint_uc_c1 constraint_uc_c1_inst ("));
         assert!(verilog.contains(".rows_flat("),
             "top must wire the UC module's rows_flat port:\n{}", verilog);
+    }
+
+    // ── MC: sentinel-reduction mandatory role (#303 / E1) ──
+    //
+    // The MC predicate is "the mandatory column is not empty" on every
+    // active row. Hardware form: reduce the per-row all-zeroes test
+    // across the row bus. `violation = 1` iff some active row holds
+    // all-zeroes on the relevant bit-range.
+
+    #[test]
+    fn mc_module_exposes_row_bus_and_sentinel_detection() {
+        let state = state_with_constraints(&[("c1", "MC")]);
+        let verilog = compile_to_verilog(&state);
+        // Same DEPTH / ROW_WIDTH parameters as UC so integrators drop
+        // in the same BRAM signals.
+        assert!(verilog.contains("parameter DEPTH"),
+            "MC module must expose DEPTH parameter:\n{}", verilog);
+        assert!(verilog.contains("parameter ROW_WIDTH"),
+            "MC module must expose ROW_WIDTH parameter:\n{}", verilog);
+        // Row-data bus and active-row counter.
+        assert!(verilog.contains("rows_flat"),
+            "MC module must accept a flattened row bus:\n{}", verilog);
+        assert!(verilog.contains("row_count"),
+            "MC module must accept the active-row count:\n{}", verilog);
+    }
+
+    #[test]
+    fn mc_module_tests_against_zero_sentinel() {
+        let state = state_with_constraints(&[("c1", "MC")]);
+        let verilog = compile_to_verilog(&state);
+        // The MC predicate compares rows against the all-zero sentinel.
+        // Look for the `== {ROW_WIDTH{1'b0}}` shape emitted per row.
+        assert!(verilog.contains("{ROW_WIDTH{1'b0}}"),
+            "MC module must compare against the zero sentinel:\n{}", verilog);
+        // Result register — no unconditional `violation <= 1'b0` in the
+        // else branch.
+        assert!(verilog.contains("violation <= hit"),
+            "MC must drive violation from the sentinel hit:\n{}", verilog);
+    }
+
+    #[test]
+    fn top_wires_mc_constraint_module_with_row_bus() {
+        let state = state_with_constraints(&[("c1", "MC")]);
+        let verilog = compile_to_verilog(&state);
+        assert!(verilog.contains("& ~constraint_mc_c1_v"));
+        assert!(verilog.contains("constraint_mc_c1 constraint_mc_c1_inst ("));
+        assert!(verilog.contains(".rows_flat("),
+            "top must wire MC's row bus:\n{}", verilog);
     }
 
     // ── Audit-log Verilog ring buffer (#167) ──
