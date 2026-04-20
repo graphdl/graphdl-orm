@@ -422,6 +422,49 @@ pub fn translate_enum_values(classified_state: &Object) -> Vec<Object> {
     out
 }
 
+/// Translate Uniqueness / Mandatory Role / Frequency Constraint
+/// classifications into `Constraint` cell facts. Kinds:
+///
+///   - UC (`at most one` or `exactly one` quantifier).
+///   - MC (`at least one` quantifier).
+///   - FC (both `at most` and `at least` without the `one` suffix).
+///
+/// All three fire at alethic modality. Spans (which role on which
+/// fact type) are left empty here — fact-type resolution happens in
+/// `translate_fact_types`, and span binding is a follow-up pass that
+/// reads both cells. This matches the deferred-span shape used by
+/// `translate_ring_constraints`.
+#[cfg(feature = "std-deps")]
+pub fn translate_cardinality_constraints(classified_state: &Object) -> Vec<Object> {
+    let statement_ids = collect_statement_ids(classified_state);
+    let mut out: Vec<Object> = Vec::new();
+    for stmt_id in &statement_ids {
+        let classifications = classifications_for(classified_state, stmt_id);
+        // Longest-specific first: Frequency wins over UC/MC when
+        // both fire (a statement is rarely classified as more than
+        // one, but be explicit about precedence).
+        let kind = if classifications.iter().any(|k| k == "Frequency Constraint") {
+            "FC"
+        } else if classifications.iter().any(|k| k == "Uniqueness Constraint") {
+            "UC"
+        } else if classifications.iter().any(|k| k == "Mandatory Role Constraint") {
+            "MC"
+        } else {
+            continue;
+        };
+        let text = statement_text(classified_state, stmt_id).unwrap_or_default();
+        let entity = head_noun_for(classified_state, stmt_id).unwrap_or_default();
+        out.push(fact_from_pairs(&[
+            ("id",       text.as_str()),
+            ("kind",     kind),
+            ("modality", "alethic"),
+            ("text",     text.as_str()),
+            ("entity",   entity.as_str()),
+        ]));
+    }
+    out
+}
+
 /// Translate `Value Constraint` classifications into `Constraint` cell
 /// facts with kind="VC" and entity=<noun>. Fired by the grammar's
 /// recursive rule `Value Constraint iff Enum Values Declaration`, so
@@ -1016,6 +1059,69 @@ mod tests {
         let kinds = classifications_for(&classified, "s1");
         assert!(kinds.iter().any(|k| k == "Value Constraint"),
             "expected Value Constraint; got {:?}", kinds);
+    }
+
+    #[test]
+    fn uniqueness_constraint_is_classified_on_exactly_one() {
+        let stmt = stage1_state(
+            "s1",
+            "Each Order was placed by exactly one Customer.",
+            &["Order", "Customer"]);
+        let classified = classify_statements(&stmt, &grammar_state());
+        let kinds = classifications_for(&classified, "s1");
+        assert!(kinds.iter().any(|k| k == "Uniqueness Constraint"),
+            "expected Uniqueness Constraint; got {:?}", kinds);
+    }
+
+    #[test]
+    fn mandatory_role_constraint_is_classified_on_at_least_one() {
+        let stmt = stage1_state(
+            "s1",
+            "Each Customer has at least one Email.",
+            &["Customer", "Email"]);
+        let classified = classify_statements(&stmt, &grammar_state());
+        let kinds = classifications_for(&classified, "s1");
+        assert!(kinds.iter().any(|k| k == "Mandatory Role Constraint"),
+            "expected Mandatory Role Constraint; got {:?}", kinds);
+    }
+
+    #[test]
+    fn frequency_constraint_is_classified_on_at_most_and_at_least() {
+        let stmt = stage1_state(
+            "s1",
+            "Each Order has at most 5 and at least 2 Line Items.",
+            &["Order", "Line Item"]);
+        let classified = classify_statements(&stmt, &grammar_state());
+        let kinds = classifications_for(&classified, "s1");
+        assert!(kinds.iter().any(|k| k == "Frequency Constraint"),
+            "expected Frequency Constraint; got {:?}", kinds);
+    }
+
+    #[test]
+    fn translate_cardinality_constraints_emits_uc_mc_fc() {
+        // Three constraints in one state: UC via 'exactly one', MC
+        // via 'at least one', FC via 'at most' + 'at least'.
+        let nouns_list = &["Order", "Customer", "Email", "Line Item"];
+        let uc = stage1_state("s-uc",
+            "Each Order was placed by exactly one Customer.", nouns_list);
+        let mc = stage1_state("s-mc",
+            "Each Customer has at least one Email.", nouns_list);
+        let fc = stage1_state("s-fc",
+            "Each Order has at most 5 and at least 2 Line Items.", nouns_list);
+        let merged = crate::ast::merge_states(&uc, &mc);
+        let merged = crate::ast::merge_states(&merged, &fc);
+        let classified = classify_statements(&merged, &grammar_state());
+
+        let constraints = super::translate_cardinality_constraints(&classified);
+        let by_kind = |k: &str| -> Vec<&Object> {
+            constraints.iter().filter(|f| binding(f, "kind") == Some(k)).collect()
+        };
+        assert_eq!(by_kind("UC").len(), 1, "expected 1 UC, got {:?}", constraints);
+        assert_eq!(by_kind("MC").len(), 1, "expected 1 MC, got {:?}", constraints);
+        assert_eq!(by_kind("FC").len(), 1, "expected 1 FC, got {:?}", constraints);
+        for c in &constraints {
+            assert_eq!(binding(c, "modality"), Some("alethic"));
+        }
     }
 
     #[test]

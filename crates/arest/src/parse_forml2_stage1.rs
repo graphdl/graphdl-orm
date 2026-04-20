@@ -105,6 +105,19 @@ pub fn tokenize_statement(statement_id: &str, text: &str, nouns: &[String]) -> C
             ("Statement", statement_id), ("Quantifier", q),
         ]));
     }
+    // Inner quantifiers. Constraint statements put the quantifier
+    // that determines their kind INSIDE the sentence, not at the
+    // start: `Each Order was placed by exactly one Customer.` (UC on
+    // 'exactly one'); `Each Order has at most 5 and at least 2 Line
+    // Items.` (FC on 'at most' AND 'at least'). Emit one fact per
+    // distinct inner quantifier so the grammar's recognizer rules
+    // can fire. Longest-first: when 'at most one' is present, drop
+    // the bare 'at most' so FC doesn't mis-fire on a UC sentence.
+    for q in inner_quantifiers(body) {
+        push(&mut cells, "Statement_has_Quantifier", fact_from_pairs(&[
+            ("Statement", statement_id), ("Quantifier", q),
+        ]));
+    }
     if let Some(dm) = derivation_marker.as_ref() {
         push(&mut cells, "Statement_has_Derivation_Marker", fact_from_pairs(&[
             ("Statement", statement_id), ("Derivation_Marker", dm),
@@ -346,6 +359,31 @@ const TRAILING_MARKERS: &[&str] = &[
     "is a subtype of",
 ];
 
+/// Scan the body for inner quantifier phrases and return those
+/// present, in longest-first order. Longest-match semantics prevent
+/// UC-on-'at most one' sentences from also firing FC (which requires
+/// both 'at most' and 'at least' without the 'one' suffix).
+fn inner_quantifiers(body: &str) -> Vec<&'static str> {
+    const LONG: &[&str] = &["at most one", "at least one", "exactly one"];
+    const SHORT: &[&str] = &["at most", "at least"];
+    let long_hits: Vec<&'static str> = LONG.iter()
+        .filter(|q| body.contains(**q))
+        .copied()
+        .collect();
+    // A bare 'at most' / 'at least' is emitted only when its
+    // "<phrase> one" extension isn't already present in the body —
+    // that way `at most 5 and at least 2` yields both shorts but
+    // `at most one Customer` yields only the long form.
+    let short_hits: Vec<&'static str> = SHORT.iter()
+        .filter(|q| {
+            let long = alloc::format!("{} one", q);
+            body.contains(**q) && !body.contains(long.as_str())
+        })
+        .copied()
+        .collect();
+    long_hits.into_iter().chain(short_hits).collect()
+}
+
 /// Parse the enum-values leading phrase.
 ///
 /// `The possible values of <Noun> are '<v1>', '<v2>', ...`
@@ -499,6 +537,64 @@ mod tests {
                    Some("Support Request"));
         assert_eq!(stmt_binding(&c, "Statement_has_Verb", "Verb").as_deref(),
                    Some("is a subtype of"));
+    }
+
+    #[test]
+    fn uniqueness_constraint_emits_exactly_one_quantifier() {
+        // `Each Order was placed by exactly one Customer.` is a UC:
+        // the grammar rule fires on Statement has Quantifier 'exactly
+        // one'. The leading 'each' is still emitted, and the inner
+        // 'exactly one' lands as its own Quantifier fact so both
+        // grammar-rule variants can fire.
+        let c = tokenize_statement(
+            "s1",
+            "Each Order was placed by exactly one Customer.",
+            &nouns(&["Order", "Customer"]),
+        );
+        let qs: Vec<String> = c.get("Statement_has_Quantifier")
+            .map(|facts| facts.iter()
+                .filter_map(|f| binding(f, "Quantifier").map(String::from))
+                .collect())
+            .unwrap_or_default();
+        assert!(qs.iter().any(|q| q == "exactly one"),
+            "expected 'exactly one' quantifier token; got {:?}", qs);
+    }
+
+    #[test]
+    fn mandatory_role_constraint_emits_at_least_one_quantifier() {
+        let c = tokenize_statement(
+            "s1",
+            "Each Customer has at least one Email.",
+            &nouns(&["Customer", "Email"]),
+        );
+        let qs: Vec<String> = c.get("Statement_has_Quantifier")
+            .map(|facts| facts.iter()
+                .filter_map(|f| binding(f, "Quantifier").map(String::from))
+                .collect())
+            .unwrap_or_default();
+        assert!(qs.iter().any(|q| q == "at least one"),
+            "expected 'at least one' quantifier token; got {:?}", qs);
+    }
+
+    #[test]
+    fn frequency_constraint_emits_at_most_and_at_least_quantifiers() {
+        // FC rule requires BOTH 'at most' and 'at least' (without
+        // the "one" suffix). Stage-1 must emit both tokens so the
+        // grammar's `and`-conjunction rule fires.
+        let c = tokenize_statement(
+            "s1",
+            "Each Order has at most 5 and at least 2 Line Items.",
+            &nouns(&["Order", "Line Item"]),
+        );
+        let qs: Vec<String> = c.get("Statement_has_Quantifier")
+            .map(|facts| facts.iter()
+                .filter_map(|f| binding(f, "Quantifier").map(String::from))
+                .collect())
+            .unwrap_or_default();
+        assert!(qs.iter().any(|q| q == "at most"),
+            "expected 'at most' quantifier token; got {:?}", qs);
+        assert!(qs.iter().any(|q| q == "at least"),
+            "expected 'at least' quantifier token; got {:?}", qs);
     }
 
     #[test]
