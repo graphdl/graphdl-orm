@@ -422,6 +422,55 @@ pub fn translate_enum_values(classified_state: &Object) -> Vec<Object> {
     out
 }
 
+/// Translate set-comparison / multi-clause constraints into
+/// `Constraint` cell facts. Kinds:
+///
+///   - EQ (`if and only if` keyword) — equality / bi-implication.
+///   - XC (`at most one of the following holds` keyword, OR the
+///         `are mutually exclusive` trailing marker form handled
+///         by the Exclusion Constraint classification).
+///   - XO (`exactly one of the following holds` keyword) —
+///         exclusive-or.
+///   - OR (`at least one of the following holds` keyword) —
+///         disjunctive.
+///
+/// All four fire at alethic modality. Spans are deferred (same as
+/// Ring / UC-MC-FC translators). This translator is separate from
+/// `translate_cardinality_constraints` because the grammar keys the
+/// two families on different tokens (Quantifier vs Constraint
+/// Keyword vs Trailing Marker).
+#[cfg(feature = "std-deps")]
+pub fn translate_set_constraints(classified_state: &Object) -> Vec<Object> {
+    let statement_ids = collect_statement_ids(classified_state);
+    let mut out: Vec<Object> = Vec::new();
+    for stmt_id in &statement_ids {
+        let classifications = classifications_for(classified_state, stmt_id);
+        let kind = if classifications.iter().any(|k| k == "Equality Constraint") {
+            "EQ"
+        } else if classifications.iter().any(|k| k == "Subset Constraint") {
+            "SS"
+        } else if classifications.iter().any(|k| k == "Exclusive-Or Constraint") {
+            "XO"
+        } else if classifications.iter().any(|k| k == "Or Constraint") {
+            "OR"
+        } else if classifications.iter().any(|k| k == "Exclusion Constraint") {
+            "XC"
+        } else {
+            continue;
+        };
+        let text = statement_text(classified_state, stmt_id).unwrap_or_default();
+        let entity = head_noun_for(classified_state, stmt_id).unwrap_or_default();
+        out.push(fact_from_pairs(&[
+            ("id",       text.as_str()),
+            ("kind",     kind),
+            ("modality", "alethic"),
+            ("text",     text.as_str()),
+            ("entity",   entity.as_str()),
+        ]));
+    }
+    out
+}
+
 /// Translate Uniqueness / Mandatory Role / Frequency Constraint
 /// classifications into `Constraint` cell facts. Kinds:
 ///
@@ -1095,6 +1144,110 @@ mod tests {
         let kinds = classifications_for(&classified, "s1");
         assert!(kinds.iter().any(|k| k == "Frequency Constraint"),
             "expected Frequency Constraint; got {:?}", kinds);
+    }
+
+    #[test]
+    fn equality_constraint_is_classified_on_if_and_only_if() {
+        let stmt = stage1_state(
+            "s1",
+            "Each Employee is paid if and only if Employee has Salary.",
+            &["Employee", "Salary"]);
+        let classified = classify_statements(&stmt, &grammar_state());
+        let kinds = classifications_for(&classified, "s1");
+        assert!(kinds.iter().any(|k| k == "Equality Constraint"),
+            "expected Equality Constraint; got {:?}", kinds);
+    }
+
+    #[test]
+    fn exclusion_constraint_is_classified_on_at_most_one_of_the_following() {
+        let stmt = stage1_state(
+            "s1",
+            "For each Account at most one of the following holds: Account is open; Account is closed.",
+            &["Account"]);
+        let classified = classify_statements(&stmt, &grammar_state());
+        let kinds = classifications_for(&classified, "s1");
+        assert!(kinds.iter().any(|k| k == "Exclusion Constraint"),
+            "expected Exclusion Constraint (multi-clause form); got {:?}", kinds);
+    }
+
+    #[test]
+    fn exclusive_or_constraint_is_classified() {
+        let stmt = stage1_state(
+            "s1",
+            "For each Order exactly one of the following holds: Order is draft; Order is placed.",
+            &["Order"]);
+        let classified = classify_statements(&stmt, &grammar_state());
+        let kinds = classifications_for(&classified, "s1");
+        assert!(kinds.iter().any(|k| k == "Exclusive-Or Constraint"),
+            "expected Exclusive-Or Constraint; got {:?}", kinds);
+    }
+
+    #[test]
+    fn or_constraint_is_classified() {
+        let stmt = stage1_state(
+            "s1",
+            "For each User at least one of the following holds: User has Email; User has Phone.",
+            &["User", "Email", "Phone"]);
+        let classified = classify_statements(&stmt, &grammar_state());
+        let kinds = classifications_for(&classified, "s1");
+        assert!(kinds.iter().any(|k| k == "Or Constraint"),
+            "expected Or Constraint; got {:?}", kinds);
+    }
+
+    #[test]
+    fn subset_constraint_is_classified_on_if_some_then_that() {
+        let stmt = stage1_state(
+            "s1",
+            "If some User owns some Organization then that User has some Email.",
+            &["User", "Organization", "Email"]);
+        let classified = classify_statements(&stmt, &grammar_state());
+        let kinds = classifications_for(&classified, "s1");
+        assert!(kinds.iter().any(|k| k == "Subset Constraint"),
+            "expected Subset Constraint; got {:?}", kinds);
+    }
+
+    #[test]
+    fn translate_set_constraints_includes_subset() {
+        let stmt = stage1_state(
+            "s1",
+            "If some User owns some Organization then that User has some Email.",
+            &["User", "Organization", "Email"]);
+        let classified = classify_statements(&stmt, &grammar_state());
+        let constraints = super::translate_set_constraints(&classified);
+        let ss: Vec<_> = constraints.iter()
+            .filter(|f| binding(f, "kind") == Some("SS"))
+            .collect();
+        assert_eq!(ss.len(), 1, "expected 1 SS, got {:?}", constraints);
+        assert_eq!(binding(ss[0], "modality"), Some("alethic"));
+    }
+
+    #[test]
+    fn translate_set_constraints_emits_eq_xc_xo_or() {
+        let nouns_all = &["Employee", "Salary", "Account", "Order", "User", "Email", "Phone"];
+        let eq = stage1_state("s-eq",
+            "Each Employee is paid if and only if Employee has Salary.", nouns_all);
+        let xc = stage1_state("s-xc",
+            "For each Account at most one of the following holds: Account is open; Account is closed.", nouns_all);
+        let xo = stage1_state("s-xo",
+            "For each Order exactly one of the following holds: Order is draft; Order is placed.", nouns_all);
+        let or_stmt = stage1_state("s-or",
+            "For each User at least one of the following holds: User has Email; User has Phone.", nouns_all);
+        let merged = crate::ast::merge_states(&eq, &xc);
+        let merged = crate::ast::merge_states(&merged, &xo);
+        let merged = crate::ast::merge_states(&merged, &or_stmt);
+        let classified = classify_statements(&merged, &grammar_state());
+
+        let constraints = super::translate_set_constraints(&classified);
+        let by_kind = |k: &str| -> Vec<&Object> {
+            constraints.iter().filter(|f| binding(f, "kind") == Some(k)).collect()
+        };
+        assert_eq!(by_kind("EQ").len(), 1, "expected 1 EQ, got {:?}", constraints);
+        assert_eq!(by_kind("XC").len(), 1, "expected 1 XC, got {:?}", constraints);
+        assert_eq!(by_kind("XO").len(), 1, "expected 1 XO, got {:?}", constraints);
+        assert_eq!(by_kind("OR").len(), 1, "expected 1 OR, got {:?}", constraints);
+        for c in &constraints {
+            assert_eq!(binding(c, "modality"), Some("alethic"));
+        }
     }
 
     #[test]

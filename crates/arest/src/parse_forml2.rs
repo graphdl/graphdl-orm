@@ -1790,6 +1790,38 @@ fn parse_arithmetic_expr(text: &str, noun_names: &[String]) -> Option<crate::typ
 /// to `!=` so compile-time dispatch sees one canonical form. Longer operators
 /// (`>=`, `<=`, `!=`, `<>`) are listed first in the alternation so the engine
 /// prefers `>=` over `>` on input like `has Amount >= 100`.
+/// Split text on " and " only when the delimiter is not inside a
+/// single-quoted literal. Example: `Statement has Constraint Keyword
+/// 'if and only if'` stays as one clause; `X has A and Y has B`
+/// splits into two.
+fn split_top_level_and(text: &str) -> Vec<&str> {
+    let needle = " and ";
+    let mut parts: Vec<&str> = Vec::new();
+    let mut in_quote = false;
+    let mut start = 0usize;
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            in_quote = !in_quote;
+            i += 1;
+            continue;
+        }
+        if !in_quote
+            && i + needle.len() <= bytes.len()
+            && &bytes[i..i + needle.len()] == needle.as_bytes()
+        {
+            parts.push(&text[start..i]);
+            start = i + needle.len();
+            i = start;
+            continue;
+        }
+        i += 1;
+    }
+    parts.push(&text[start..]);
+    parts
+}
+
 fn split_antecedent_comparator(text: &str) -> (String, Option<(String, f64)>) {
     let re = regex::Regex::new(
         r"\s*(>=|<=|!=|<>|>|<|=)\s*(-?\d+(?:\.\d+)?)\s*$"
@@ -1960,8 +1992,11 @@ fn resolve_derivation_rule(
     let antecedent_text: &str = antecedent_expanded.as_str();
 
     // Split antecedent on " and " to get individual conditions
-    let antecedent_parts: Vec<&str> = antecedent_text
-        .split(" and ")
+    // Split on top-level " and " only — a literal like `'if and only
+    // if'` contains an `and` that must not break the clause. Walk the
+    // text and break only when not inside a single-quoted span.
+    let antecedent_parts: Vec<&str> = split_top_level_and(antecedent_text)
+        .into_iter()
         .map(|s| s.trim().trim_end_matches('.'))
         .filter(|s| !s.is_empty())
         .collect();
