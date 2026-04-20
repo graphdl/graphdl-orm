@@ -613,6 +613,24 @@ fn apply_arithmetic(x: &Object, op: fn(f64, f64) -> Option<f64>) -> Object {
 /// Apply a function to an object. The only operation in the FP system.
 /// Store compiled defs as cells in D. Each def becomes a cell whose name
 /// is the def name and whose contents is the Object representation of the Func.
+/// ↓DEFS (AREST §3.2 Platform Binding). Runtime-side writer to DEFS.
+///
+/// Pushes a single (name, func) binding into state and also records
+/// `name` in the `runtime_registered_names` cell. The binding is
+/// indistinguishable from a compile-derived one at apply time — the
+/// registry cell is the origin marker, consulted by provenance
+/// emission (Citation with Authority Type 'Runtime-Function').
+///
+/// Per the paper:
+/// - compile writes the domain layer via `defs_to_state`.
+/// - the runtime writes the platform layer via this function.
+/// Together they span DEFS; the surjectivity remark (§ Remark after
+/// Theorem \ref{thm:spec}) names this split explicitly.
+pub fn register_runtime_fn(name: &str, func: Func, state: &Object) -> Object {
+    let with_def = store(name, func_to_object(&func), state);
+    cell_push("runtime_registered_names", Object::atom(name), &with_def)
+}
+
 /// This is Backus Sec. 13.3.2: definitions map atoms to expressions.
 /// Build state from defs + existing cells in O(n).
 /// Collects all cells into a HashMap (O(1) per insert), then
@@ -3322,6 +3340,45 @@ mod tests {
         let f = Func::Def("second".to_string());
         let seq = Object::seq(vec![Object::atom("a"), Object::atom("b")]);
         assert_eq!(apply(&f, &seq, &d), Object::atom("b"));
+    }
+
+    // ── Runtime Registration (↓DEFS, AREST §3.2 Platform Binding) ──
+    // The paper's IoC/DI primitive: a runtime writes a binding into DEFS
+    // at any time. The binding is indistinguishable from a compile-derived
+    // one at apply time (uniformity); the `runtime_registered_names` cell
+    // records which names entered via the runtime writer so downstream
+    // layers (provenance / Citation emission) can tell origin apart.
+
+    #[test]
+    fn register_runtime_fn_binds_name_in_defs() {
+        let d = Object::phi();
+        let d2 = register_runtime_fn("sample", Func::Constant(Object::atom("hi")), &d);
+        let resolved = apply(&Func::Def("sample".to_string()), &Object::phi(), &d2);
+        assert_eq!(resolved, Object::atom("hi"),
+            "Func::Def('sample') should resolve to the registered body");
+    }
+
+    #[test]
+    fn register_runtime_fn_records_name_in_registry_cell() {
+        let d = Object::phi();
+        let d2 = register_runtime_fn("sample", Func::Constant(Object::atom("hi")), &d);
+        let registry = fetch("runtime_registered_names", &d2);
+        let names: Vec<String> = registry.as_seq()
+            .map(|s| s.iter().filter_map(|o| o.as_atom().map(String::from)).collect())
+            .unwrap_or_default();
+        assert!(names.contains(&"sample".to_string()),
+            "runtime_registered_names should include 'sample' after registration; got {:?}", names);
+    }
+
+    #[test]
+    fn compile_derived_defs_are_not_in_registry() {
+        let d = defs_to_state(&[("second".to_string(), Func::Selector(2))], &Object::phi());
+        let registry = fetch("runtime_registered_names", &d);
+        let names: Vec<String> = registry.as_seq()
+            .map(|s| s.iter().filter_map(|o| o.as_atom().map(String::from)).collect())
+            .unwrap_or_default();
+        assert!(!names.contains(&"second".to_string()),
+            "defs_to_state-derived names must NOT be in the runtime registry; got {:?}", names);
     }
 
     // ── Backus sequence primitives (Task 1) ─────────────────────
