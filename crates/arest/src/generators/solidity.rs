@@ -415,4 +415,114 @@ Order has Amount.
         assert!(out.contains("pragma solidity"));
         assert!(!out.contains("contract "));
     }
+
+    // ─── E2 — ORM 2 constraint coverage in Solidity ────────────────────
+
+    const MC_READINGS: &str = r#"
+## Entity Types
+
+Order(.Order Number) is an entity type.
+
+## Value Types
+
+Email Address is a value type.
+
+## Fact Types
+
+Order has Email Address.
+  Each Order has some Email Address.
+"#;
+
+    #[test]
+    #[ignore = "E2: MC require not yet implemented; see _reports/followup-2026-04-20.md"]
+    fn compile_to_solidity_emits_mc_require() {
+        let meta = parse_to_state(STATE_METAMODEL).unwrap();
+        let state = parse_to_state_with_nouns(MC_READINGS, &meta).unwrap();
+        let state = merge_states(&meta, &state);
+        let out = compile_to_solidity_for_nouns(&state, &["Order"]);
+        assert!(out.contains("MC:"),
+            "expected MC require in create(), got:\n{}", out);
+        assert!(out.contains("bytes(emailAddress).length"),
+            "expected MC require on emailAddress field, got:\n{}", out);
+    }
+
+    const VC_READINGS: &str = r#"
+## Entity Types
+
+Order(.Order Number) is an entity type.
+
+## Value Types
+
+Priority is a value type.
+  The possible values of Priority are 'low', 'medium', 'high'.
+
+## Fact Types
+
+Order has Priority.
+"#;
+
+    #[test]
+    #[ignore = "E2: VC validator not yet implemented; see _reports/followup-2026-04-20.md"]
+    fn compile_to_solidity_emits_vc_validator() {
+        let meta = parse_to_state(STATE_METAMODEL).unwrap();
+        let state = parse_to_state_with_nouns(VC_READINGS, &meta).unwrap();
+        let state = merge_states(&meta, &state);
+        let out = compile_to_solidity_for_nouns(&state, &["Order"]);
+        assert!(out.contains("VC:") || out.contains("_validatePriority"),
+            "expected VC validator, got:\n{}", out);
+        // Must reference each enum value
+        assert!(out.contains("low") && out.contains("medium") && out.contains("high"),
+            "expected enum values in validator, got:\n{}", out);
+    }
+
+    const IR_READINGS: &str = r#"
+## Entity Types
+
+Person(.person-id) is an entity type.
+
+## Fact Types
+
+Person reports to Person.
+  Person reports to Person is irreflexive.
+"#;
+
+    #[test]
+    #[ignore = "E2: Ring IR require not yet implemented; see _reports/followup-2026-04-20.md"]
+    fn compile_to_solidity_emits_ir_require() {
+        let meta = parse_to_state(STATE_METAMODEL).unwrap();
+        let state = parse_to_state_with_nouns(IR_READINGS, &meta).unwrap();
+        let state = merge_states(&meta, &state);
+        let out = compile_to_solidity_for_nouns(&state, &["Person"]);
+        assert!(out.contains("IR:"),
+            "expected IR require, got:\n{}", out);
+    }
+
+    const OFF_CHAIN_READINGS: &str = r#"
+## Entity Types
+
+Claim(.id) is an entity type.
+Cause(.id) is an entity type.
+
+## Fact Types
+
+Claim has Cause.
+
+## Subset Constraints
+
+If some Claim has some Cause then that Claim has some Cause.
+"#;
+
+    #[test]
+    #[ignore = "E2: off-chain SS/EQ/XC docs not yet emitted; see _reports/followup-2026-04-20.md"]
+    fn compile_to_solidity_documents_off_chain_constraints() {
+        // SS / EQ / XC are too expensive to enforce on-chain; the
+        // generator should emit a comment block rather than silently
+        // dropping the constraint.
+        let meta = parse_to_state(STATE_METAMODEL).unwrap();
+        let state = parse_to_state_with_nouns(OFF_CHAIN_READINGS, &meta).unwrap();
+        let state = merge_states(&meta, &state);
+        let out = compile_to_solidity_for_nouns(&state, &["Claim"]);
+        assert!(out.contains("off-chain") || out.contains("Off-chain"),
+            "expected off-chain-enforcement comment, got:\n{}", out);
+    }
 }
