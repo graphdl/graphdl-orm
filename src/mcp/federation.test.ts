@@ -111,3 +111,71 @@ describe('federatedFetch — Citation provenance (E3 / #305)', () => {
     expect(result.facts[0]['Stripe Customer']).toBe('cus_1')
   })
 })
+
+// ── Ingest-payload shape: maps FederatedFetchResult to the engine's
+// federated_ingest:<noun> JSON contract (#305). One fact per (entity,
+// field) pair because the engine's cells are keyed per fact type
+// (Noun_verb_Role) and each FT holds the (Noun, Role) binding shape.
+import { buildIngestPayload } from './federation'
+
+describe('buildIngestPayload — federated_ingest FFI shape (E3 / #305)', () => {
+  it('splits one entity record into one fact per field', () => {
+    const result = {
+      system: 'stripe',
+      noun: 'Stripe Customer',
+      count: 1,
+      facts: [{ 'Stripe Customer': 'cus_1', Email: 'a@x.com', Name: 'Alice' }],
+      citation: {
+        uri: 'https://api.stripe.com/v1/customers',
+        retrievalDate: '2026-04-20T12:00:00Z',
+        authorityType: 'Federated-Fetch',
+        externalSystem: 'stripe',
+      },
+      _meta: { url: 'https://api.stripe.com/v1/customers', worldAssumption: 'OWA' as const },
+    }
+    const payload = buildIngestPayload(result)
+    expect(payload.externalSystem).toBe('stripe')
+    expect(payload.url).toBe('https://api.stripe.com/v1/customers')
+    expect(payload.retrievalDate).toBe('2026-04-20T12:00:00Z')
+    expect(payload.facts).toHaveLength(2)
+    expect(payload.facts).toContainEqual({
+      factTypeId: 'Stripe_Customer_has_Email',
+      bindings: { 'Stripe Customer': 'cus_1', Email: 'a@x.com' },
+    })
+    expect(payload.facts).toContainEqual({
+      factTypeId: 'Stripe_Customer_has_Name',
+      bindings: { 'Stripe Customer': 'cus_1', Name: 'Alice' },
+    })
+  })
+
+  it('multi-word role names underscore in factTypeId but not in binding keys', () => {
+    const result = {
+      system: 'stripe',
+      noun: 'Stripe Customer',
+      count: 1,
+      facts: [{ 'Stripe Customer': 'cus_1', 'Billing Address': '1 Main St' }],
+      citation: {
+        uri: 'https://api.stripe.com/v1/customers',
+        retrievalDate: '2026-04-20T12:00:00Z',
+        authorityType: 'Federated-Fetch',
+        externalSystem: 'stripe',
+      },
+      _meta: { url: 'https://api.stripe.com/v1/customers', worldAssumption: 'OWA' as const },
+    }
+    const payload = buildIngestPayload(result)
+    expect(payload.facts[0].factTypeId).toBe('Stripe_Customer_has_Billing_Address')
+    expect(payload.facts[0].bindings['Billing Address']).toBe('1 Main St')
+  })
+
+  it('returns empty facts array when no citation is present', () => {
+    const result = {
+      system: 'stripe',
+      noun: 'Stripe Customer',
+      count: 0,
+      facts: [],
+      _meta: { url: '', worldAssumption: 'OWA' as const },
+    }
+    const payload = buildIngestPayload(result)
+    expect(payload.facts).toHaveLength(0)
+  })
+})
