@@ -132,6 +132,35 @@ The federation path in `src/mcp/federation.ts` is the TS-side analogue — it ru
 
 An open gap: `apply_platform` in `crates/arest/src/ast.rs` currently hardcodes its match over Platform names. Future registrations via `register_runtime_fn` that need engine-native dispatch (synchronous, composable in Func trees) will want a fallback arm that resolves the registered Func body — see `_reports/e3-gap-analysis-2026-04-20.md` for the narrative.
 
+### Engine FFI for federated ingest
+
+The paper's `ρ(populate_n): I → {f₁, …, fₖ} ⊆ P_OWA` splits across async and sync boundaries in practice:
+
+- **Async (host side).** The MCP server / Cloudflare worker does the HTTP fetch and maps the JSON response to `(factTypeId, bindings)` tuples. See `src/mcp/federation.ts` `federatedFetch` + `buildIngestPayload`.
+- **Sync (engine side).** The host hands the pre-fetched tuples to the engine through a dedicated FFI key:
+
+  ```
+  system(h, "federated_ingest:<noun>", <JSON>) → <cite-id> | ⊥
+  ```
+
+  The engine pushes each fact to its declared FT cell and emits a single Citation with Authority Type `'Federated-Fetch'`, returning the content-addressed cite-id.
+
+This split is why `populate:{noun}` stays a compile-time config constant rather than a Platform dispatch arm: the engine cannot do async I/O inside `apply`, so the dispatch point is the FFI boundary, not a synthetic platform primitive. The JSON payload shape:
+
+```json
+{
+  "externalSystem": "stripe",
+  "url": "https://api.stripe.com/v1/customers",
+  "retrievalDate": "2026-04-20T12:00:00Z",
+  "facts": [
+    {"factTypeId": "Stripe_Customer_has_Email",
+     "bindings": {"Stripe Customer": "cus_1", "Email": "a@x.com"}}
+  ]
+}
+```
+
+After `federated_ingest`, downstream constraints and derivations see the federated facts as part of the unified population — no special-casing.
+
 ## Federated analytics backends (#219)
 
 The fetch path above loads a single entity from its source. The
