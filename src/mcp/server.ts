@@ -142,8 +142,35 @@ async function systemCall(key: string, input: string): Promise<string> {
 import {
   federatedFetch,
   parseFederationConfig,
+  buildIngestPayload,
   type FederationConfig,
+  type FederatedFetchResult,
 } from './federation'
+
+/**
+ * Absorb a federated fetch result into P via the engine's
+ * federated_ingest:<noun> FFI (#305). Returns the Citation id on
+ * success, or null if the result has no citation or the ingest fails.
+ * Local mode only — remote mode is already server-side.
+ */
+async function absorbFederatedIntoD(
+  noun: string,
+  result: FederatedFetchResult,
+): Promise<string | null> {
+  if (AREST_MODE !== 'local') return null
+  if (!result.citation) return null
+  try {
+    const payload = buildIngestPayload(result)
+    if (payload.facts.length === 0) return null
+    const citeId = await systemCall(
+      `federated_ingest:${noun}`,
+      JSON.stringify(payload),
+    )
+    return citeId && citeId !== '⊥' ? citeId : null
+  } catch {
+    return null
+  }
+}
 
 /** Check if a noun has a populate def and return its config. */
 async function getFederationConfig(noun: string): Promise<FederationConfig | null> {
@@ -215,6 +242,14 @@ server.registerTool(
     const fedConfig = await getFederationConfig(noun)
     if (fedConfig) {
       const data = await federatedFetch(fedConfig, id || undefined)
+      // Absorb fetched facts + Citation into P so downstream constraints
+      // and derivations over the unified population see the federated
+      // data. Errors are non-fatal — the fetched result is still
+      // returned to the caller either way.
+      const citeId = await absorbFederatedIntoD(noun, data)
+      if (citeId) {
+        return textResult({ ...data, citationId: citeId, absorbed: true })
+      }
       return textResult(data)
     }
 

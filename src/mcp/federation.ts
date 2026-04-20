@@ -56,6 +56,61 @@ export interface FederatedFetchResult {
   error?: string
 }
 
+/**
+ * Payload for the engine's `federated_ingest:<noun>` FFI key (#305).
+ *
+ * The engine expects one entry per (fact-type, bindings) tuple — one
+ * fact per (entity, field) pair on the TS side. The factTypeId follows
+ * the canonical `Noun_verb_Role` shape produced by the parser's
+ * `fact_type_id_from_reading` (spaces replaced with underscores).
+ */
+export interface IngestPayload {
+  externalSystem: string
+  url: string
+  retrievalDate: string
+  facts: Array<{
+    factTypeId: string
+    bindings: Record<string, string>
+  }>
+}
+
+/**
+ * Translate a FederatedFetchResult into the engine's federated_ingest
+ * JSON shape. Each entity record is split into one fact per field
+ * (the noun id stays in every binding so the engine can identify the
+ * entity). When the fetch produced no citation (e.g., bare empty-state
+ * result), the payload is returned with an empty facts array so the
+ * caller can skip the FFI call.
+ */
+export function buildIngestPayload(result: FederatedFetchResult): IngestPayload {
+  if (!result.citation) {
+    return {
+      externalSystem: result.system,
+      url: result._meta.url,
+      retrievalDate: new Date().toISOString(),
+      facts: [],
+    }
+  }
+  const noun = result.noun
+  const nounUnderscore = noun.replace(/ /g, '_')
+  const facts: IngestPayload['facts'] = []
+  for (const record of result.facts) {
+    const entityId = record[noun]
+    if (entityId === undefined) continue
+    for (const [field, value] of Object.entries(record)) {
+      if (field === noun) continue
+      const factTypeId = `${nounUnderscore}_has_${field.replace(/ /g, '_')}`
+      facts.push({ factTypeId, bindings: { [noun]: entityId, [field]: value } })
+    }
+  }
+  return {
+    externalSystem: result.citation.externalSystem || result.system,
+    url: result.citation.uri,
+    retrievalDate: result.citation.retrievalDate,
+    facts,
+  }
+}
+
 /** Parse a populate:{noun} def from the engine into a FederationConfig. */
 export function parseFederationConfig(raw: string): FederationConfig | null {
   try {
