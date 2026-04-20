@@ -26,5 +26,10 @@ export default defineConfig(({ mode }) => ({
     globals: true,
     environment: 'jsdom',
     include: ['src/**/*.test.ts', 'src/**/*.test.tsx'],
+    // @mdxui/admin's dist uses ESM directory imports ("./components/layout")
+    // which Node's native resolver rejects. Inlining routes the import
+    // through Vite's resolver (same path Vite uses at build time), so
+    // jsdom sees the same module graph the browser does.
+    server: { deps: { inline: [/@mdxui\//] } },
   },
 }))
