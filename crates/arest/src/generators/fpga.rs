@@ -935,11 +935,10 @@ fn emit_constraint_modules(state: &Object) -> (Vec<String>, Vec<String>) {
             let body = match kind {
                 "UC" => Some(emit_uc_constraint_body(&module_name)),
                 "MC" => Some(emit_mc_constraint_body(&module_name)),
-                // FC remains as a placeholder stub until its own commit
-                // replaces it with the real counter. The stub preserves
-                // the module/endmodule balance and lets top's AND-reduce
-                // continue to line up.
-                "FC" => Some(emit_placeholder_constraint_stub(&module_name, kind)),
+                "FC" => {
+                    let (min_c, max_c) = parse_fc_bounds(text);
+                    Some(emit_fc_constraint_body(&module_name, min_c, max_c))
+                }
                 _ => None,
             };
             let _ = text;
@@ -950,6 +949,103 @@ fn emit_constraint_modules(state: &Object) -> (Vec<String>, Vec<String>) {
         }
     }
     (modules, names)
+}
+
+/// Default counter width for FC modules — 16 bits covers the full
+/// 1024-row BRAM depth with a comfortable saturation headroom.
+const FC_COUNTER_WIDTH: usize = 16;
+
+/// Parse legacy FC bounds `at most N and at least M` out of the
+/// Constraint text. Returns (min, max) — None entries mean the text
+/// did not match the legacy pattern for that bound, and the caller
+/// defaults to the inert window [0, 2^COUNT_WIDTH - 1].
+///
+/// Stage-2's `translate_cardinality_constraints` emits FC entries
+/// with only kind / modality / text / entity bindings today, so the
+/// bounds live in `text`. This parser scans both orderings (`at most`
+/// / `at least`) and tolerates any text between them; the grammar's
+/// canonical form is `at most N and at least M`, but the regex-free
+/// substring scan works on any phrasing the Stage-2 emitter produces.
+fn parse_fc_bounds(text: &str) -> (Option<u64>, Option<u64>) {
+    // Extract the first integer immediately following a marker phrase.
+    fn after(text: &str, marker: &str) -> Option<u64> {
+        let idx = text.find(marker)?;
+        let rest = &text[idx + marker.len()..];
+        // Skip whitespace + at most one leading non-digit buffer word.
+        let digits: String = rest.trim_start()
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        if digits.is_empty() { return None; }
+        digits.parse::<u64>().ok()
+    }
+    let max = after(text, "at most ");
+    let min = after(text, "at least ");
+    (min, max)
+}
+
+/// Frequency-constraint module body — bounded-count register.
+///
+/// `count` increments on `create_pulse`, decrements on
+/// `terminate_pulse`, saturates at zero on the low end and at the
+/// counter-width ceiling on the high end. `violation` latches high
+/// iff the live count is outside [MIN_COUNT, MAX_COUNT].
+///
+/// The pulse ports are intended for integrators to wire from the SM
+/// module's create / terminate transition edges (see `emit_sm_modules`
+/// at fpga.rs:262 for the edge-detection pattern). Top ties both
+/// pulses low by default; the predicate then stays dormant until the
+/// real SM signals flow in.
+fn emit_fc_constraint_body(
+    module_name: &str,
+    min_bound: Option<u64>,
+    max_bound: Option<u64>,
+) -> String {
+    let min_c = min_bound.unwrap_or(0);
+    // Default MAX = (1 << COUNT_WIDTH) - 1 — all-ones saturation.
+    let max_c_default: u64 = (1u64 << FC_COUNTER_WIDTH).saturating_sub(1);
+    let max_c = max_bound.unwrap_or(max_c_default);
+    let mut out = String::new();
+    out.push_str(&format!(
+        "module {name} #(\n    \
+            parameter COUNT_WIDTH = {width},\n    \
+            parameter MIN_COUNT = {min_c},\n    \
+            parameter MAX_COUNT = {max_c}\n\
+        ) (\n    \
+            input wire clk,\n    \
+            input wire rst_n,\n    \
+            // Pulse-in handshake: integrator wires these from the SM\n    \
+            // module's create / terminate transition edges.\n    \
+            input wire create_pulse,\n    \
+            input wire terminate_pulse,\n    \
+            output reg violation\n\
+        );\n    \
+            reg [COUNT_WIDTH-1:0] count;\n\n    \
+            always @(posedge clk) begin\n        \
+                if (!rst_n) begin\n            \
+                    count     <= {{COUNT_WIDTH{{1'b0}}}};\n            \
+                    violation <= 1'b0;\n        \
+                end else begin\n            \
+                    // Saturating counter. The paired create/terminate\n            \
+                    // pulses from a single-cycle event cancel out\n            \
+                    // (net +0); a lone pulse updates by ±1.\n            \
+                    if (create_pulse && !terminate_pulse) begin\n                \
+                        if (count != {{COUNT_WIDTH{{1'b1}}}})\n                    \
+                            count <= count + 1;\n            \
+                    end else if (terminate_pulse && !create_pulse) begin\n                \
+                        if (count != {{COUNT_WIDTH{{1'b0}}}})\n                    \
+                            count <= count - 1;\n            \
+                    end\n            \
+                    violation <= (count < MIN_COUNT) || (count > MAX_COUNT);\n        \
+                end\n    \
+            end\n\
+        endmodule\n",
+        name = module_name,
+        width = FC_COUNTER_WIDTH,
+        min_c = min_c,
+        max_c = max_c,
+    ));
+    out
 }
 
 /// Mandatory-role constraint module body — sentinel reducer.
@@ -1198,9 +1294,13 @@ fn emit_top_module(
                     count_bits = (CONSTRAINT_DEFAULT_DEPTH + 1).next_power_of_two().trailing_zeros().max(1),
                 ));
             }
+            Some("fc") => {
+                out.push_str("        .create_pulse(1'b0),\n");
+                out.push_str("        .terminate_pulse(1'b0),\n");
+            }
             _ => {
-                // Placeholder stubs (FC) and any future kind keep
-                // the original port shape until their emitter lands.
+                // Any future kind keeps the original port shape until
+                // its emitter lands.
             }
         }
         out.push_str(&format!("        .violation({}_v)\n", cname));
@@ -1876,6 +1976,110 @@ Supplier supplies Widget.
         assert!(verilog.contains("constraint_mc_c1 constraint_mc_c1_inst ("));
         assert!(verilog.contains(".rows_flat("),
             "top must wire MC's row bus:\n{}", verilog);
+    }
+
+    // ── FC: bounded-count frequency constraint (#303 / E1) ──
+    //
+    // FC tracks an entity's cardinality against a [min, max] window.
+    // Increment on create, decrement on terminate, violation whenever
+    // the count is outside the window. Min / max come from the text
+    // field (legacy pattern `at most N and at least M`); absent bounds
+    // default to [0, DEPTH] so the stub stays inert.
+
+    /// Build a Constraint state with an FC carrying a specific text so
+    /// the bounds parser sees a real reading to chew on.
+    fn state_with_fc_text(id: &str, text: &str) -> Object {
+        let c = fact_from_pairs(&[
+            ("id", id),
+            ("kind", "FC"),
+            ("modality", "alethic"),
+            ("text", text),
+            ("entity", "Widget"),
+        ]);
+        store("Constraint", Object::Seq(alloc::vec![c].into()), &Object::phi())
+    }
+
+    #[test]
+    fn fc_module_has_counter_and_pulse_ports() {
+        let state = state_with_constraints(&[("c1", "FC")]);
+        let verilog = compile_to_verilog(&state);
+        // FC tracks a count that bumps on create and drops on terminate.
+        assert!(verilog.contains("input wire create_pulse"),
+            "FC must accept a create pulse:\n{}", verilog);
+        assert!(verilog.contains("input wire terminate_pulse"),
+            "FC must accept a terminate pulse:\n{}", verilog);
+        // Counter width parameterisable.
+        assert!(verilog.contains("parameter COUNT_WIDTH"),
+            "FC must parameterise its counter width:\n{}", verilog);
+    }
+
+    #[test]
+    fn fc_module_parses_legacy_at_most_at_least_bounds_from_text() {
+        // Legacy pattern: `at most N and at least M` → MAX=N, MIN=M.
+        let state = state_with_fc_text(
+            "c1",
+            "Each Widget has at most 5 Items and at least 2 Items.",
+        );
+        let verilog = compile_to_verilog(&state);
+        // Bounds come through as parameters the comparator uses.
+        assert!(verilog.contains("parameter MIN_COUNT = 2"),
+            "FC text parse must resolve min=2:\n{}", verilog);
+        assert!(verilog.contains("parameter MAX_COUNT = 5"),
+            "FC text parse must resolve max=5:\n{}", verilog);
+        // Violation fires when count is outside the window.
+        assert!(verilog.contains("count < MIN_COUNT"));
+        assert!(verilog.contains("count > MAX_COUNT"));
+    }
+
+    #[test]
+    fn fc_module_without_bounds_defaults_to_inert_window() {
+        // No bounds in text → MIN=0, MAX=(1<<COUNT_WIDTH)-1 so the
+        // inert window never trips unless driven from outside.
+        let state = state_with_fc_text("c1", "Widget has Frequency Thing.");
+        let verilog = compile_to_verilog(&state);
+        assert!(verilog.contains("parameter MIN_COUNT = 0"),
+            "no parse → default MIN_COUNT=0:\n{}", verilog);
+        // MAX defaults to the all-ones sentinel so a no-bounds
+        // constraint is inert until re-parsed.
+        assert!(verilog.contains("MAX_COUNT"));
+    }
+
+    #[test]
+    fn parse_fc_bounds_picks_up_both_directions() {
+        // Canonical: `at most N and at least M`.
+        let (min, max) = super::parse_fc_bounds(
+            "Each Widget has at most 7 Items and at least 3 Items.",
+        );
+        assert_eq!(min, Some(3));
+        assert_eq!(max, Some(7));
+        // Reversed order also works — no ordering assumption.
+        let (min, max) = super::parse_fc_bounds(
+            "Each Widget has at least 3 Items and at most 7 Items.",
+        );
+        assert_eq!(min, Some(3));
+        assert_eq!(max, Some(7));
+        // Lone `at most` picks up just the max.
+        let (min, max) = super::parse_fc_bounds(
+            "Each Widget has at most 7 Items.",
+        );
+        assert_eq!(min, None);
+        assert_eq!(max, Some(7));
+        // No match → no bounds.
+        let (min, max) = super::parse_fc_bounds("Widget has Items.");
+        assert_eq!(min, None);
+        assert_eq!(max, None);
+    }
+
+    #[test]
+    fn top_wires_fc_constraint_module_with_tied_pulses() {
+        let state = state_with_constraints(&[("c1", "FC")]);
+        let verilog = compile_to_verilog(&state);
+        assert!(verilog.contains("& ~constraint_fc_c1_v"));
+        assert!(verilog.contains("constraint_fc_c1 constraint_fc_c1_inst ("));
+        // Pulses tied low until integrator wires create/terminate
+        // handlers from the SM transition signals.
+        assert!(verilog.contains(".create_pulse(1'b0)"));
+        assert!(verilog.contains(".terminate_pulse(1'b0)"));
     }
 
     // ── Audit-log Verilog ring buffer (#167) ──
