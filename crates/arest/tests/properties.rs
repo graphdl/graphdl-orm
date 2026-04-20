@@ -2461,3 +2461,25 @@ Noun 'Stripe Customer' has URI '/customers'.
     assert_eq!(stripe_binding("prefix").as_deref(), Some("Bearer"));
     assert_eq!(stripe_binding("noun").as_deref(), Some("Stripe Customer"));
 }
+
+// ── E3 / #305: Citation-fact provenance — Authority Type enum ──────
+
+/// The Authority Type enum in instances.md must cover both legal/regulatory
+/// citations (original legal-research motivation) AND the two new provenance
+/// kinds Citation carries in the platform-binding path (§3.2 Platform
+/// Binding, §3.3 Data Federation):
+/// - `Runtime-Function` — the Citation names a runtime-registered Platform
+///   function as the origin (e.g. `platform:send_email`).
+/// - `Federated-Fetch` — the Citation names an external system fetched
+///   under OWA as the origin (e.g. Stripe, auto.dev).
+#[test]
+fn authority_type_enum_carries_runtime_function_and_federated_fetch() {
+    let instances = include_str!("../../../readings/instances.md");
+    let enum_line = instances.lines()
+        .find(|l| l.contains("possible values of Authority Type"))
+        .expect("Authority Type enum declaration should exist in instances.md");
+    assert!(enum_line.contains("'Runtime-Function'"),
+        "Authority Type enum should declare 'Runtime-Function'; line: {enum_line}");
+    assert!(enum_line.contains("'Federated-Fetch'"),
+        "Authority Type enum should declare 'Federated-Fetch'; line: {enum_line}");
+}
