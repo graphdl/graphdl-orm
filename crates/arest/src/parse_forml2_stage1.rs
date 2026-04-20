@@ -95,6 +95,13 @@ pub fn tokenize_statement(statement_id: &str, text: &str, nouns: &[String]) -> C
             ("Statement", statement_id), ("Derivation_Marker", dm),
         ]));
     }
+    // Existential marker: any role has a literal value. Lets the grammar
+    // classify Instance Facts without walking the role list.
+    if role_refs.iter().any(|r| r.literal.is_some()) {
+        push(&mut cells, "Statement_has_Literal_Role", fact_from_pairs(&[
+            ("Statement", statement_id), ("Literal_Role", "true"),
+        ]));
+    }
     // --- Role References ---
     for (i, rr) in role_refs.iter().enumerate() {
         let role_id = format!("{statement_id}:role:{i}");
@@ -166,8 +173,13 @@ struct RoleRef {
     literal: Option<String>,
     /// Byte offset where the noun match starts in the body.
     start: usize,
-    /// Byte offset where the noun match ends (exclusive).
+    /// Byte offset where the noun match ends (exclusive). Excludes any
+    /// following `'literal'` — that's tracked by `span_end`.
     end: usize,
+    /// Effective end including any `' literal '` that followed. Used
+    /// by the verb extractor so `Customer 'alice' places Order` yields
+    /// verb = "places", not "'alice' places".
+    span_end: usize,
 }
 
 fn match_role_references(text: &str, sorted_nouns: &[&str]) -> Vec<RoleRef> {
@@ -200,14 +212,15 @@ fn match_role_references(text: &str, sorted_nouns: &[&str]) -> Vec<RoleRef> {
             // Skip if this match is entirely inside an earlier match.
             let nested = refs.iter().any(|r| start >= r.start && end <= r.end);
             if !nested {
-                let literal = extract_following_literal(text, end);
+                let (literal, span_end) = extract_following_literal_span(text, end);
                 refs.push(RoleRef {
                     noun: (*noun).to_string(),
                     literal,
                     start,
                     end,
+                    span_end,
                 });
-                i = end;
+                i = span_end;
                 continue;
             }
         }
@@ -218,28 +231,36 @@ fn match_role_references(text: &str, sorted_nouns: &[&str]) -> Vec<RoleRef> {
 
 /// Extract a single-quoted literal immediately after a noun match.
 /// Halpin's `<Noun> '<value>'` instance-fact / ref-scheme-literal form.
-fn extract_following_literal(text: &str, from: usize) -> Option<String> {
-    let rest = text[from..].trim_start();
-    let after_ws_offset = text[from..].len() - rest.len();
-    if !rest.starts_with('\'') {
-        // Also accept `<Noun>(.<Key>)` form? No — that's entity declaration,
-        // not instance literal. Only ' literals here.
-        let _ = after_ws_offset;
-        return None;
+/// Returns `(literal, span_end)` where `span_end` is the byte offset
+/// immediately after the closing `'` (or `from` if no literal).
+fn extract_following_literal_span(text: &str, from: usize) -> (Option<String>, usize) {
+    let rest = &text[from..];
+    let after_ws = rest.trim_start();
+    let ws_len = rest.len() - after_ws.len();
+    if !after_ws.starts_with('\'') {
+        return (None, from);
     }
-    let body = &rest[1..];
-    body.find('\'').map(|end| body[..end].to_string())
+    let body = &after_ws[1..];
+    match body.find('\'') {
+        Some(end) => {
+            let literal = body[..end].to_string();
+            // from + ws_len + 1 (opening quote) + end + 1 (closing quote)
+            let span_end = from + ws_len + 1 + end + 1;
+            (Some(literal), span_end)
+        }
+        None => (None, from),
+    }
 }
 
 fn extract_verb(text: &str, refs: &[RoleRef]) -> Option<String> {
     match refs.len() {
         0 => None,
         1 => {
-            let tail = &text[refs[0].end..];
+            let tail = &text[refs[0].span_end..];
             Some(tail.trim().to_string())
         }
         _ => {
-            let between = &text[refs[0].end..refs[1].start];
+            let between = &text[refs[0].span_end..refs[1].start];
             Some(between.trim().to_string())
         }
     }
@@ -266,9 +287,10 @@ const TRAILING_MARKERS: &[&str] = &[
 ];
 
 fn extract_trailing_marker(text: &str, refs: &[RoleRef]) -> Option<String> {
-    // Look only past the last noun match. That keeps "is a value type"
-    // from matching inside "X is a value type" where X is a noun.
-    let start = refs.last().map(|r| r.end).unwrap_or(0);
+    // Look only past the last noun match (including any trailing
+    // literal). That keeps "is a value type" from matching inside
+    // "X is a value type" where X is a noun.
+    let start = refs.last().map(|r| r.span_end).unwrap_or(0);
     let tail = text[start..].trim();
     TRAILING_MARKERS.iter()
         .find(|m| tail == **m || tail.starts_with(*m))

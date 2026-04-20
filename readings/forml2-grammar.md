@@ -40,6 +40,7 @@ Statement has Verb.
 Statement has Trailing Marker.
 Statement has Quantifier.
 Statement has Derivation Marker.
+Statement has Literal Role.
 Statement has Classification.
 
 Statement has Role Reference.
@@ -86,6 +87,8 @@ Statement has Classification 'Enum Values Declaration' iff Statement has Verb 't
 Statement has Classification 'Derivation Rule' iff Statement has Verb 'iff'.
 
 Statement has Classification 'Fact Type Reading' iff Statement has Role Reference.
+
+Statement has Classification 'Instance Fact' iff Statement has Literal Role.
 
 Statement has Classification 'Uniqueness Constraint' iff Statement has Quantifier 'at most one'.
 
