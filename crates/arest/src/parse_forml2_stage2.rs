@@ -826,6 +826,23 @@ pub fn parse_to_state_via_stage12(text: &str) -> Result<Object, String> {
         if line.starts_with("It is possible that ") {
             continue;
         }
+        // Skip mutually-exclusive-subtypes braces declarations — ORM
+        // 2's `{A, B} are mutually exclusive subtypes of C`. Legacy
+        // recognises these via `try_exclusive_subtypes` and emits
+        // `ParseAction::Skip` (no cell). The semantics live in the
+        // individual `A is a subtype of C` / `B is a subtype of C`
+        // lines above, plus the implicit partition.
+        if line.starts_with('{') && line.contains("subtypes of") {
+            continue;
+        }
+        // Skip named-span-association declarations — `This
+        // association with A, B provides the preferred
+        // identification scheme for C`. Legacy's `try_association`
+        // emits Skip; the semantics are carried by the NamedSpan
+        // cell which `try_span_naming` populates (not this shape).
+        if line.starts_with("This association with") {
+            continue;
+        }
         let statement_id = alloc::format!("s{}", i);
         let cells = crate::parse_forml2_stage1::tokenize_statement(
             &statement_id, line, &nouns);
