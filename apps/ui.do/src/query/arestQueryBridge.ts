@@ -78,7 +78,7 @@ function isCellEvent(value: unknown): value is CellEventPayload {
  * the client derives the same slug the worker exposes. PascalCase and
  * "Multi Word" forms are supported: "Support Request" -> "support-requests".
  */
-function nounToSlug(noun: string): string {
+export function nounToSlug(noun: string): string {
   // "SupportRequest" -> "Support Request"
   const withSpaces = noun.replace(/([a-z])([A-Z])/g, '$1 $2')
   return withSpaces.toLowerCase().replace(/ /g, '-') + 's'

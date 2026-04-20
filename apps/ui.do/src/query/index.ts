@@ -10,6 +10,7 @@
 export {
   createArestQueryBridge,
   createArestQueryKeys,
+  nounToSlug,
   type ArestQueryBridge,
   type ArestQueryBridgeOptions,
   type ArestQueryKeys,
