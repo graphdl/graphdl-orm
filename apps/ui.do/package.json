@@ -1,0 +1,32 @@
+{
+  "name": "@arest/ui.do",
+  "version": "0.0.1",
+  "private": true,
+  "description": "AREST front-end — mdxui admin shell backed by direct calls to the AREST worker's /arest/* surface.",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -p tsconfig.build.json && vite build",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@mdxui/admin": "6.0.1",
+    "@mdxui/app": "6.0.0",
+    "@mdxui/widgets": "6.1.0",
+    "mdxui": "6.1.0",
+    "react": "19.2.3",
+    "react-dom": "19.2.3"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.7",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^4.3.4",
+    "jsdom": "^26.0.0",
+    "typescript": "~5.7.2",
+    "vite": "^7.3.2",
+    "vitest": "^4.0.18"
+  }
+}
