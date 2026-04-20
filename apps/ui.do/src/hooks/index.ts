@@ -6,3 +6,14 @@
  */
 export { useActions } from './useActions'
 export type { ArestAction, UseActionsOptions, UseActionsResult } from './useActions'
+export { useEntityLinks, extractNavLinks } from './useEntityLinks'
+export type { EntityNavLink, UseEntityLinksOptions, UseEntityLinksResult } from './useEntityLinks'
+export {
+  useArestList,
+  useArestOne,
+  useArestCreate,
+  useArestUpdate,
+  type ArestResourceOptions,
+  type UseArestCreateResult,
+  type UseArestUpdateResult,
+} from './useArestResource'
