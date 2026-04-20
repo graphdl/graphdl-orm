@@ -466,6 +466,10 @@ pub fn translate_set_constraints(classified_state: &Object) -> Vec<Object> {
     let mut out: Vec<Object> = Vec::new();
     for stmt_id in &statement_ids {
         let classifications = classifications_for(classified_state, stmt_id);
+        // Derivation Rule wins over any incidentally-matched set
+        // constraint — the presence of `iff` / `if` / `when` makes
+        // this a derivation. See #300.
+        if classifications.iter().any(|k| k == "Derivation Rule") { continue; }
         let kind = if classifications.iter().any(|k| k == "Equality Constraint") {
             "EQ"
         } else if classifications.iter().any(|k| k == "Subset Constraint") {
@@ -510,6 +514,11 @@ pub fn translate_cardinality_constraints(classified_state: &Object) -> Vec<Objec
     let mut out: Vec<Object> = Vec::new();
     for stmt_id in &statement_ids {
         let classifications = classifications_for(classified_state, stmt_id);
+        // A Statement classified as Derivation Rule never contributes
+        // a cardinality Constraint — the `iff` keyword makes the whole
+        // sentence a rule, even when it incidentally contains a `some`
+        // quantifier inside an antecedent clause.
+        if classifications.iter().any(|k| k == "Derivation Rule") { continue; }
         let text = statement_text(classified_state, stmt_id).unwrap_or_default();
         let entity = head_noun_for(classified_state, stmt_id).unwrap_or_default();
         let is_fc = classifications.iter().any(|k| k == "Frequency Constraint");
