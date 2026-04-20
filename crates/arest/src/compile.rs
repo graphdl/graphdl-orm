@@ -950,7 +950,7 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
             let get = |key: &str| binding(f, key).unwrap_or("").to_string();
             DerivationRuleDef {
                 id: get("id"), text: get("text"), antecedent_fact_type_ids: vec![],
-                consequent_fact_type_id: get("consequentFactTypeId"),
+                consequent_cell: crate::types::ConsequentCellSource::decode(&get("consequentFactTypeId")),
                 kind: DerivationKind::ModusPonens, join_on: vec![], match_on: vec![], consequent_bindings: vec![], antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![], unresolved_clauses: vec![], antecedent_role_literals: vec![], consequent_role_literals: vec![],
             }
         }).collect())
@@ -1103,8 +1103,15 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
             // Try to find a matching domain rule (user-defined derivations)
             let domain_rule = c_derivation_rules.iter().find(|r| r.id == *did);
             if let Some(rule) = domain_rule {
+                // For Literal consequents we include the consequent FT's
+                // nouns so the derivation_index catches rules that fire
+                // on any role of the consequent. AntecedentRole
+                // consequents dispatch dynamically over the metamodel's
+                // Fact Type cell — those rules' nouns are already
+                // covered by the antecedent-FT side of the chain.
+                let consequent_literal = rule.consequent_cell.literal_id().to_string();
                 for ft_id in rule.antecedent_fact_type_ids.iter()
-                    .chain(core::iter::once(&rule.consequent_fact_type_id))
+                    .chain(core::iter::once(&consequent_literal))
                     .filter(|s| !s.is_empty())
                 {
                     if let Some(ft) = c_fact_types.get(ft_id.as_str()) {
@@ -1875,7 +1882,7 @@ pub(crate) fn cell_index_from_state(state: &crate::ast::Object) -> CellIndex {
             let get = |key: &str| binding(f, key).unwrap_or("").to_string();
             DerivationRuleDef {
                 id: get("id"), text: get("text"), antecedent_fact_type_ids: vec![],
-                consequent_fact_type_id: get("consequentFactTypeId"),
+                consequent_cell: crate::types::ConsequentCellSource::decode(&get("consequentFactTypeId")),
                 kind: DerivationKind::ModusPonens, join_on: vec![], match_on: vec![],
                 consequent_bindings: vec![], antecedent_filters: vec![],
                 consequent_computed_bindings: vec![], consequent_aggregates: vec![],
@@ -2157,7 +2164,9 @@ fn compile_aggregate_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> C
     let id = rule.id.clone();
     let text = rule.text.clone();
     let kind = rule.kind.clone();
-    let consequent_id = rule.consequent_fact_type_id.clone();
+    // Aggregate rules always have a literal consequent (Halpin §4 examples
+    // tie the aggregate to a single group-key role on a named FT).
+    let consequent_id = rule.consequent_cell.literal_id().to_string();
     let consequent_reading = data.fact_types.get(&consequent_id)
         .map(|ft| ft.reading.clone())
         .unwrap_or_default();
@@ -2351,7 +2360,18 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
     let text = rule.text.clone();
     let kind = rule.kind.clone();
     let antecedent_ids = rule.antecedent_fact_type_ids.clone();
-    let consequent_id = rule.consequent_fact_type_id.clone();
+    // Consequent cell key & reading:
+    //   Literal(id) — resolved at compile time. Every user-authored
+    //     rule takes this path; the first tuple element is a constant
+    //     atom, the second is the FT's declared reading.
+    //   AntecedentRole { idx, role } — resolved at evaluation time
+    //     per antecedent fact. The first tuple element lifts the role
+    //     value out of the antecedent fact; the reading column is left
+    //     empty because it's fact-type-specific and the consuming
+    //     cell does not require it for routing. Used by the four
+    //     implicit-derivation readings in #287 (subtype inheritance,
+    //     CWA negation, subset auto-fill across FTs, transitivity).
+    let consequent_id = rule.consequent_cell.literal_id().to_string();
     let consequent_reading = data.fact_types.get(&consequent_id)
         .map(|ft| ft.reading.clone())
         .unwrap_or_default();
@@ -2426,11 +2446,33 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
     // DerivationKind::Join during resolve_derivation_rule and routed to
     // compile_join_derivation instead. This explicit path handles the
     // rare multi-antecedent rules without `that` anaphora.
+    // First/second tuple elements of the derived fact:
+    //   Literal — constant atom (existing behaviour).
+    //   AntecedentRole — role_value_by_name applied to the antecedent
+    //     fact currently under apply_to_all, which pulls the cell key
+    //     out of that fact's <<key,val>,…> binding sequence at
+    //     evaluation time. Reading is left empty for the dynamic case;
+    //     callers route by cell_id, not by reading text.
+    let consequent_id_func = match &rule.consequent_cell {
+        crate::types::ConsequentCellSource::Literal(id) => Func::constant(Object::atom(id)),
+        crate::types::ConsequentCellSource::AntecedentRole { role, .. } => role_value_by_name(role),
+    };
+    let consequent_reading_func = match &rule.consequent_cell {
+        crate::types::ConsequentCellSource::Literal(_) => Func::constant(Object::atom(&consequent_reading)),
+        crate::types::ConsequentCellSource::AntecedentRole { .. } => Func::constant(Object::atom("")),
+    };
+
     let func = match antecedent_ids.len() {
         0 => {
+            // 0-antecedent rules assert one constant fact; AntecedentRole
+            // has no antecedent to read from, so this branch only makes
+            // sense for Literal consequents. For AntecedentRole here the
+            // id_func degenerates to the role lookup over phi, which
+            // yields phi — the emission is a no-op, matching the spec's
+            // "no antecedent, no binding" behaviour.
             let derived = Func::construction(vec![
-                Func::constant(Object::atom(&consequent_id)),
-                Func::constant(Object::atom(&consequent_reading)),
+                consequent_id_func.clone(),
+                consequent_reading_func.clone(),
                 Func::constant(Object::phi()),
             ]);
             Func::construction(vec![derived])
@@ -2506,8 +2548,8 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                 Func::construction(pairs)
             };
             let derive_one = Func::construction(vec![
-                Func::constant(Object::atom(&consequent_id)),
-                Func::constant(Object::atom(&consequent_reading)),
+                consequent_id_func.clone(),
+                consequent_reading_func.clone(),
                 bindings_func,
             ]);
             Func::compose(Func::apply_to_all(derive_one), extract(0, ft_id))
@@ -2556,9 +2598,17 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                 }).collect();
                 Func::construction(pairs)
             };
+            // Multi-antecedent path emits one derived fact on existence
+            // only; the inputs are structured (nested tuples of per-FT
+            // fact lists), not a single fact. AntecedentRole here would
+            // need an explicit antecedent selector to be meaningful —
+            // not yet supported. Literal consequents work exactly as
+            // before; AntecedentRole degenerates to role_value_by_name
+            // against a non-fact input, which safely returns phi (no
+            // derivation fires) rather than producing a wrong cell key.
             let derived = Func::construction(vec![
-                Func::constant(Object::atom(&consequent_id)),
-                Func::constant(Object::atom(&consequent_reading)),
+                consequent_id_func.clone(),
+                consequent_reading_func.clone(),
                 bindings,
             ]);
             Func::condition(
@@ -2594,7 +2644,11 @@ fn compile_join_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Compil
     let text = rule.text.clone();
     let kind = rule.kind.clone();
     let antecedent_ids = rule.antecedent_fact_type_ids.clone();
-    let consequent_id = rule.consequent_fact_type_id.clone();
+    // Join rules always have a literal consequent — `that FT` anaphora
+    // in a user rule points at one specific FT after resolution. The
+    // AntecedentRole shape is reserved for metamodel rules that fan out
+    // dynamically (compile_explicit_derivation's 1-antecedent branch).
+    let consequent_id = rule.consequent_cell.literal_id().to_string();
     let join_keys = rule.join_on.clone();
     let match_pairs = rule.match_on.clone();
     let consequent_binding_names = rule.consequent_bindings.clone();
@@ -4952,7 +5006,12 @@ pub fn generate_derivation_triggers(
     let mut result = Vec::new();
 
     for rule in derivation_rules {
-        let consequent = &rule.consequent_fact_type_id;
+        // SQL triggers materialize a specific consequent table — only
+        // Literal consequents name one concrete FT. AntecedentRole
+        // shapes fan out across FTs at runtime and are skipped here;
+        // their materialization is handled by the forward-chain path,
+        // not by a CREATE TRIGGER.
+        let consequent = rule.consequent_cell.literal_id();
         if consequent.is_empty() || rule.antecedent_fact_type_ids.is_empty() { continue; }
 
         let consequent_table = crate::rmap::to_snake(consequent);

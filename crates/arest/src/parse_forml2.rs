@@ -952,7 +952,7 @@ fn try_derivation(line: &str) -> Option<ParseAction> {
         let clean = stripped.trim_end_matches('.');
         ParseAction::AddDerivation(DerivationRuleDef {
             id: String::new(), text: clean.into(),
-            antecedent_fact_type_ids: vec![], consequent_fact_type_id: String::new(),
+            antecedent_fact_type_ids: vec![], consequent_cell: crate::types::ConsequentCellSource::default(),
             kind: DerivationKind::ModusPonens,
             join_on: vec![], match_on: vec![], consequent_bindings: vec![], antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![], unresolved_clauses: vec![], antecedent_role_literals: vec![], consequent_role_literals: vec![],
         })
@@ -2079,10 +2079,11 @@ fn resolve_derivation_rule(
     let consequent_trailing_literal = trailing_literal_re
         .captures(consequent_text)
         .and_then(|c| c.get(1).map(|m| m.as_str().to_string()));
-    rule.consequent_fact_type_id = resolve_fact_type(consequent_text).unwrap_or_default();
+    let resolved_consequent = resolve_fact_type(consequent_text).unwrap_or_default();
+    rule.consequent_cell = crate::types::ConsequentCellSource::Literal(resolved_consequent);
     if let Some(lit) = consequent_trailing_literal {
-        if !rule.consequent_fact_type_id.is_empty() {
-            let role = ir.fact_types.get(&rule.consequent_fact_type_id)
+        if !rule.consequent_cell.is_empty_literal() {
+            let role = ir.fact_types.get(rule.consequent_cell.literal_id())
                 .and_then(|ft| ft.roles.last())
                 .map(|r| r.noun_name.clone())
                 .unwrap_or_default();
@@ -2332,7 +2333,7 @@ fn resolve_derivation_rule(
             .map(|key| (key.clone(), key.clone()))
             .collect();
         // Consequent bindings: nouns from the consequent fact type
-        rule.consequent_bindings = ir.fact_types.get(&rule.consequent_fact_type_id)
+        rule.consequent_bindings = ir.fact_types.get(rule.consequent_cell.literal_id())
             .map(|ft| ft.roles.iter().map(|r| r.noun_name.clone()).collect())
             .unwrap_or_default();
     });
@@ -2807,10 +2808,11 @@ fn upsert_fact_type(ir: &mut Cells, id: &str, def: &FactTypeDef) {
 #[cfg(feature = "std-deps")]
 fn push_derivation_rule_cells(ir: &mut Cells, rule: &DerivationRuleDef) {
     let json = serde_json::to_string(rule).unwrap_or_default();
+    let consequent_encoded = rule.consequent_cell.encode();
     push_cell(ir, "DerivationRule", crate::ast::fact_from_pairs(&[
         ("id", rule.id.as_str()),
         ("text", rule.text.as_str()),
-        ("consequentFactTypeId", rule.consequent_fact_type_id.as_str()),
+        ("consequentFactTypeId", consequent_encoded.as_str()),
         ("json", json.as_str()),
     ]));
     for clause in &rule.unresolved_clauses {
@@ -3794,7 +3796,7 @@ mod tests {
         let rules = super::derivation_rules_from_cells(&ir);
         assert!(!rules.is_empty());
         let rule = &rules[0];
-        assert!(!rule.consequent_fact_type_id.is_empty(), "consequent should be resolved");
+        assert!(!rule.consequent_cell.is_empty_literal(), "consequent should be resolved");
         assert!(!rule.antecedent_fact_type_ids.is_empty(), "antecedents should be resolved");
         assert!(rule.antecedent_fact_type_ids.len() >= 2, "should have at least 2 antecedents");
     }

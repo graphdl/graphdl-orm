@@ -40,6 +40,107 @@ pub struct NounDef {
     pub world_assumption: WorldAssumption,
 }
 
+/// How the consequent cell key is determined for a derivation.
+///
+/// `Literal` (the common case) pins a single cell at compile time — every
+/// user-authored `iff`/`if` rule uses this shape, and the compiler lowers
+/// it to `Func::constant(Object::atom(&id))` as the first element of each
+/// derived tuple.
+///
+/// `AntecedentRole` pulls the cell key from a role value on one of the
+/// antecedent facts. This is the shape implicit metamodel derivations
+/// need — e.g. subtype inheritance fires against every user fact type
+/// whose supertype appears as a role, and the target cell is that fact
+/// type id, read from the antecedent `Fact Type has Role` tuple. The
+/// compiler lowers to `Func::compose(role_value_by_name(role), Selector(n))`
+/// for the first tuple element, and the evaluator already routes output
+/// tuples to `ast::cell_push(&fact.fact_type_id, …)` — see
+/// `evaluate::forward_chain_defs_state`.
+///
+/// Serialized as a sentinel-prefixed string on `consequentCell` bindings
+/// so that plain (`Literal`) ids continue to parse and deserialize
+/// exactly as before. The `@role:<idx>:<role_name>` prefix tags the
+/// `AntecedentRole` form.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase", tag = "kind", content = "value")]
+pub enum ConsequentCellSource {
+    /// Single cell keyed by a literal string.
+    Literal(String),
+    /// Cell key is the value of `role` on the `antecedent_index`-th
+    /// antecedent fact at evaluation time.
+    AntecedentRole {
+        antecedent_index: usize,
+        role: String,
+    },
+}
+
+impl ConsequentCellSource {
+    /// The literal cell key if this source is a `Literal`, else empty.
+    ///
+    /// Many compile-time code paths need the concrete id (to look up the
+    /// fact type's reading, its RMAP table, or its role list). Those
+    /// paths only apply to `Literal` consequents — dynamic ones resolve
+    /// their reading/bindings at evaluation time. Returning empty for
+    /// the dynamic case makes existing `is_empty()` guards continue to
+    /// skip work appropriately.
+    pub fn literal_id(&self) -> &str {
+        match self {
+            Self::Literal(s) => s.as_str(),
+            _ => "",
+        }
+    }
+
+    /// Is this the default empty-literal consequent? Used by parser
+    /// fallbacks that construct a skeleton rule before resolution.
+    pub fn is_empty_literal(&self) -> bool {
+        matches!(self, Self::Literal(s) if s.is_empty())
+    }
+
+    /// Compact wire-format encoding. Literals serialize to bare strings
+    /// so the pre-enum wire format (a `consequentFactTypeId` binding
+    /// holding the id directly) is preserved. Dynamic shapes use
+    /// sentinel-prefixed strings.
+    ///
+    /// Built via push rather than `format!` so the types module stays
+    /// usable from both the no_std library and the std binary.
+    pub fn encode(&self) -> String {
+        match self {
+            Self::Literal(s) => s.clone(),
+            Self::AntecedentRole { antecedent_index, role } => {
+                let mut out = String::from("@role:");
+                out.push_str(&antecedent_index.to_string());
+                out.push(':');
+                out.push_str(role);
+                out
+            }
+        }
+    }
+
+    /// Inverse of `encode`. Unknown or malformed sentinels fall through
+    /// to `Literal` so forward compatibility is preserved: a future
+    /// variant unknown to an older reader just looks like a strange
+    /// literal id rather than a parse failure.
+    pub fn decode(s: &str) -> Self {
+        if let Some(rest) = s.strip_prefix("@role:") {
+            if let Some((idx_str, role)) = rest.split_once(':') {
+                if let Ok(antecedent_index) = idx_str.parse::<usize>() {
+                    return Self::AntecedentRole {
+                        antecedent_index,
+                        role: role.to_string(),
+                    };
+                }
+            }
+        }
+        Self::Literal(s.to_string())
+    }
+}
+
+impl Default for ConsequentCellSource {
+    fn default() -> Self {
+        Self::Literal(String::new())
+    }
+}
+
 /// A derivation rule in the IR — compiled to a DeriveFn at compile time.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -48,8 +149,14 @@ pub struct DerivationRuleDef {
     pub text: String,
     /// The reading/condition that must hold
     pub antecedent_fact_type_ids: Vec<String>,
-    /// What is derived when antecedent holds
-    pub consequent_fact_type_id: String,
+    /// Where the consequent's cell key comes from. `Literal(..)` is the
+    /// common case (every user-authored rule) and preserves the
+    /// pre-enum wire format. `AntecedentRole { .. }` lets a single rule
+    /// fan out across all user fact types matching the antecedent,
+    /// which the four implicit-derivation shapes (subtype inheritance,
+    /// CWA negation, …) expand into readings (`#287`).
+    #[serde(default)]
+    pub consequent_cell: ConsequentCellSource,
     /// Derivation kind for compile dispatch
     pub kind: DerivationKind,
     /// For Join rules: noun names that must have equal values across all

@@ -131,6 +131,81 @@ pub fn translate_subtypes(classified_state: &Object) -> Vec<Object> {
     }).collect()
 }
 
+/// Translate statements carrying an ORM 2 derivation marker (`*` /
+/// `**` / `+`) into `Fact Type has Derivation Mode` instance facts,
+/// matching legacy's `emit_instance_fact(ir, "Fact Type", <reading>,
+/// "Derivation Mode", "Derivation Mode", &m)` in `apply_action`.
+///
+///   `Fact Type has Arity. *` → InstanceFact
+///     subjectNoun = "Fact Type"
+///     subjectValue = "Fact Type has Arity"          (canonical reading)
+///     fieldName = "Fact_Type_has_Derivation_Mode"   (canonical FT id)
+///     objectNoun = "Derivation Mode"
+///     objectValue = "fully-derived"                 (mode atom)
+///
+/// Emitted only for Statements classified as Fact Type Reading so
+/// the derivation-marker on derivation-rule statements (where the
+/// `*` prefix is a readability marker, not a mode signal on a Fact
+/// Type) doesn't spawn spurious InstanceFacts.
+#[cfg(feature = "std-deps")]
+pub fn translate_derivation_mode_facts(classified_state: &Object) -> Vec<Object> {
+    let statement_ids = collect_statement_ids(classified_state);
+    let mut out: Vec<Object> = Vec::new();
+    for stmt_id in &statement_ids {
+        let classifications = classifications_for(classified_state, stmt_id);
+        // Fact Type Reading classification is the anchor — an `iff`
+        // derivation rule also has a marker but lands as Derivation
+        // Rule, not Fact Type Reading, because Stage-1 strips the
+        // leading `* ` prefix before tokenization (see #294).
+        if !classifications.iter().any(|k| k == "Fact Type Reading") {
+            continue;
+        }
+        // Same exclude list as translate_fact_types — don't emit on
+        // noun declarations or instance facts that incidentally
+        // carry role references.
+        const EXCLUDE: &[&str] = &[
+            "Entity Type Declaration", "Value Type Declaration",
+            "Subtype Declaration", "Abstract Declaration",
+            "Enum Values Declaration", "Instance Fact",
+            "Partition Declaration", "Derivation Rule",
+            "Uniqueness Constraint", "Mandatory Role Constraint",
+            "Frequency Constraint", "Ring Constraint",
+            "Value Constraint", "Equality Constraint",
+            "Subset Constraint", "Exclusion Constraint",
+            "Exclusive-Or Constraint", "Or Constraint",
+            "Deontic Constraint",
+        ];
+        if classifications.iter().any(|k| EXCLUDE.iter().any(|e| e == k)) {
+            continue;
+        }
+        let Some(mode) = derivation_marker_for(classified_state, stmt_id) else { continue };
+        let Some(text) = statement_text(classified_state, stmt_id) else { continue };
+        // Legacy passes `field_name = "Derivation Mode"` — the
+        // attribute noun itself — rather than constructing a
+        // canonical FT id. This is the attribute-style
+        // `subjectNoun '<value>' has <objectNoun> '<objectValue>'`
+        // shape applied to the metamodel binary `Fact Type has
+        // Derivation Mode`.
+        out.push(fact_from_pairs(&[
+            ("subjectNoun",  "Fact Type"),
+            ("subjectValue", text.as_str()),
+            ("fieldName",    "Derivation Mode"),
+            ("objectNoun",   "Derivation Mode"),
+            ("objectValue",  mode.as_str()),
+        ]));
+    }
+    out
+}
+
+#[cfg(feature = "std-deps")]
+fn derivation_marker_for(state: &Object, stmt_id: &str) -> Option<String> {
+    fetch_or_phi("Statement_has_Derivation_Marker", state)
+        .as_seq()?
+        .iter()
+        .find(|f| binding(f, "Statement") == Some(stmt_id))
+        .and_then(|f| binding(f, "Derivation_Marker").map(String::from))
+}
+
 /// Translate `Partition Declaration` classifications into `Subtype`
 /// cell facts — one `(subtype, supertype)` pair per subtype in the
 /// comma-separated list. Shape: `A is partitioned into B, C, D` →
@@ -1118,8 +1193,11 @@ pub fn parse_to_state_via_stage12(text: &str) -> Result<Object, String> {
     let declared_ft_ids: Vec<String> = ft_facts.iter()
         .filter_map(|f| binding(f, "id").map(String::from))
         .collect();
-    let instance_fact_facts =
+    let mut instance_fact_facts =
         translate_instance_facts_with_ft_ids(&classified, &declared_ft_ids);
+    // Append derivation-mode InstanceFacts (`Fact Type has Arity. *`
+    // → `Fact Type.<reading> = Derivation Mode.fully-derived`).
+    instance_fact_facts.extend(translate_derivation_mode_facts(&classified));
     let enum_values_facts = translate_enum_values(&classified);
 
     let mut map: HashMap<String, Object> = HashMap::new();
