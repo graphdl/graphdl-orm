@@ -29,6 +29,12 @@ export interface UseArestResourcesOptions {
   fetch?: typeof globalThis.fetch
   /** Optional noun-to-label overrides. */
   labels?: Record<string, string>
+  /**
+   * Optional noun-name filter — return true to keep the noun, false
+   * to drop it. Used by the hostname-based branding surface (#128)
+   * to narrow the sidebar to support-domain nouns on support.auto.dev.
+   */
+  filter?: (nounName: string) => boolean
 }
 
 export interface UseArestResourcesResult {
@@ -90,7 +96,8 @@ export function useArestResources(
   const resources = useMemo<ResourceDefinition[]>(() => {
     if (!query.data) return []
     const nouns = extractNounsFromDoc(query.data)
-    return nouns.map((noun) => {
+    const filtered = options.filter ? nouns.filter(options.filter) : nouns
+    return filtered.map((noun) => {
       const opts: CreateArestResourceOptions = {
         baseUrl: options.baseUrl,
         app,
@@ -98,7 +105,7 @@ export function useArestResources(
       }
       return createArestResource(noun, opts)
     })
-  }, [query.data, options.baseUrl, app, options.labels])
+  }, [query.data, options.baseUrl, app, options.labels, options.filter])
 
   return {
     resources,
