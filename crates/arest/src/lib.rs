@@ -771,7 +771,7 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
     //        "bindings": {"Stripe Customer": "cus_1", "Email": "a@x.com"}}
     //     ]
     //   }
-    if let Some(_noun) = key.strip_prefix("federated_ingest:") {
+    if let Some(noun) = key.strip_prefix("federated_ingest:") {
         let parsed: serde_json::Value = match serde_json::from_str(input) {
             Ok(v) => v,
             Err(_) => return "⊥".into(),
@@ -782,6 +782,32 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
         if url.is_empty() || external_system.is_empty() || retrieval_date.is_empty() {
             return "⊥".into();
         }
+
+        // Cross-check against the compile-emitted populate:{noun} config
+        // (#305): if the engine has a populate config for this noun, the
+        // payload's externalSystem MUST match the declared `system`
+        // value. This prevents a buggy / malicious caller from citing
+        // origin other than what the domain's readings declare. Nouns
+        // without a populate config (ad-hoc ingest) are unrestricted.
+        let snapshot = tenant.read().snapshot_d();
+        let config_obj = ast::apply(
+            &ast::Func::Def(format!("populate:{}", noun)),
+            &ast::Object::phi(),
+            &snapshot,
+        );
+        let declared_system = config_obj.as_seq().and_then(|pairs| {
+            pairs.iter().find_map(|pair| {
+                let kv = pair.as_seq()?;
+                let k = kv.first()?.as_atom()?;
+                (k == "system").then(|| kv.get(1)?.as_atom().map(String::from)).flatten()
+            })
+        });
+        if let Some(expected) = declared_system {
+            if expected != external_system {
+                return "⊥".into();
+            }
+        }
+
         let facts: Vec<(String, Vec<(String, String)>)> = parsed.get("facts")
             .and_then(|v| v.as_array())
             .map(|arr| arr.iter().filter_map(|entry| {
@@ -1947,6 +1973,66 @@ Order has total.
         let result = system_impl(h, "federated_ingest:X", "not json");
         assert_eq!(result, "⊥",
             "federated_ingest with invalid JSON must return ⊥; got {result}");
+        release_impl(h);
+    }
+
+    /// Populate cross-check (#305 #6): when a populate:{noun} config
+    /// is present in D, federated_ingest must verify the payload's
+    /// externalSystem matches the compiled `system`. Mismatches are
+    /// rejected with ⊥ so a buggy or malicious caller can't cite a
+    /// different system than the one declared for the noun.
+    #[test]
+    fn system_federated_ingest_rejects_system_mismatch_with_populate_config() {
+        let h = create_bare_impl();
+        // Install a populate:Stripe Customer config declaring system = 'stripe'.
+        {
+            let tenant = tenant_lock(h).expect("live handle");
+            let mut st = tenant.write();
+            let snapshot = st.snapshot_d();
+            let config = ast::Object::seq(alloc::vec![
+                ast::Object::seq(alloc::vec![ast::Object::atom("system"), ast::Object::atom("stripe")]),
+                ast::Object::seq(alloc::vec![ast::Object::atom("url"), ast::Object::atom("https://api.stripe.com/v1")]),
+            ]);
+            let new_d = ast::store("populate:Stripe Customer", ast::func_to_object(&ast::Func::constant(config)), &snapshot);
+            st.replace_d(new_d);
+        }
+
+        let payload = r#"{
+          "externalSystem": "evil.com",
+          "url": "https://api.stripe.com/v1/customers",
+          "retrievalDate": "2026-04-20T12:00:00Z",
+          "facts": []
+        }"#;
+        let result = system_impl(h, "federated_ingest:Stripe Customer", payload);
+        assert_eq!(result, "⊥",
+            "externalSystem != populate config's system must return ⊥; got {result}");
+        release_impl(h);
+    }
+
+    #[test]
+    fn system_federated_ingest_accepts_system_match_with_populate_config() {
+        let h = create_bare_impl();
+        {
+            let tenant = tenant_lock(h).expect("live handle");
+            let mut st = tenant.write();
+            let snapshot = st.snapshot_d();
+            let config = ast::Object::seq(alloc::vec![
+                ast::Object::seq(alloc::vec![ast::Object::atom("system"), ast::Object::atom("stripe")]),
+                ast::Object::seq(alloc::vec![ast::Object::atom("url"), ast::Object::atom("https://api.stripe.com/v1")]),
+            ]);
+            let new_d = ast::store("populate:Stripe Customer", ast::func_to_object(&ast::Func::constant(config)), &snapshot);
+            st.replace_d(new_d);
+        }
+
+        let payload = r#"{
+          "externalSystem": "stripe",
+          "url": "https://api.stripe.com/v1/customers",
+          "retrievalDate": "2026-04-20T12:00:00Z",
+          "facts": []
+        }"#;
+        let result = system_impl(h, "federated_ingest:Stripe Customer", payload);
+        assert!(result.starts_with("cite:"),
+            "matching system should succeed and return a citation id; got {result}");
         release_impl(h);
     }
 }
