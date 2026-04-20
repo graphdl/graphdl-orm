@@ -152,6 +152,12 @@ import {
  * federated_ingest:<noun> FFI (#305). Returns the Citation id on
  * success, or null if the result has no citation or the ingest fails.
  * Local mode only — remote mode is already server-side.
+ *
+ * Error-path semantics: when the fetch returned an HTTP error,
+ * `result.facts` is empty but `result.citation` still records the
+ * origin (URL / retrieval date / external system). We absorb the
+ * Citation alone so downstream derivations over failed-fetch
+ * provenance can fire. The engine accepts empty facts arrays.
  */
 async function absorbFederatedIntoD(
   noun: string,
@@ -161,7 +167,6 @@ async function absorbFederatedIntoD(
   if (!result.citation) return null
   try {
     const payload = buildIngestPayload(result)
-    if (payload.facts.length === 0) return null
     const citeId = await systemCall(
       `federated_ingest:${noun}`,
       JSON.stringify(payload),
