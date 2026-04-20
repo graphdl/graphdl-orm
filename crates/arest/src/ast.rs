@@ -713,6 +713,63 @@ pub fn emit_citation_fact(
     (cite_id, final_state)
 }
 
+// ── Runtime Platform callback registry (#305 IoC/DI completion) ───
+//
+// apply_platform's hardcoded match only covers compile-derived names.
+// When a host installs a synchronous Platform body for a runtime-
+// registered name (ML scorer, local cache projector, test double),
+// the engine looks it up here. Registration is orthogonal to
+// register_runtime_fn: that one marks the name so provenance can cite
+// it; install_platform_fn attaches the actual callable.
+//
+// Async I/O (HTTP fetch, external writes) cannot cross this boundary
+// because apply is synchronous — hosts bridge async work at the FFI
+// level (federated_ingest) instead. This registry is only for
+// genuinely synchronous callbacks.
+
+#[cfg(not(feature = "no_std"))]
+pub type PlatformFn = crate::sync::Arc<
+    dyn Fn(&Object, &Object) -> Object + Send + Sync
+>;
+
+#[cfg(not(feature = "no_std"))]
+static PLATFORM_FALLBACK: crate::sync::OnceLock<
+    crate::sync::RwLock<HashMap<String, PlatformFn>>
+> = crate::sync::OnceLock::new();
+
+/// Install a synchronous Platform body. apply_platform falls through
+/// here for names not covered by the hardcoded match. The body is an
+/// `Arc<dyn Fn(&Object, &Object) -> Object>` — takes the operand and
+/// the current `D`, returns an Object. Thread-safe; callers may
+/// re-install to replace the body.
+#[cfg(not(feature = "no_std"))]
+pub fn install_platform_fn(name: &str, f: PlatformFn) {
+    let reg = PLATFORM_FALLBACK.get_or_init(|| crate::sync::RwLock::new(HashMap::new()));
+    reg.write().insert(name.to_string(), f);
+}
+
+/// Remove a previously-installed Platform body. Used by tests to
+/// avoid leakage between test cases sharing process state.
+#[cfg(not(feature = "no_std"))]
+pub fn uninstall_platform_fn(name: &str) {
+    if let Some(reg) = PLATFORM_FALLBACK.get() {
+        reg.write().remove(name);
+    }
+}
+
+#[cfg(not(feature = "no_std"))]
+fn dispatch_platform_fallback(name: &str, x: &Object, d: &Object) -> Object {
+    let reg = match PLATFORM_FALLBACK.get() {
+        Some(r) => r,
+        None => return Object::Bottom,
+    };
+    let maybe_f = reg.read().get(name).cloned();
+    match maybe_f {
+        Some(f) => f(x, d),
+        None => Object::Bottom,
+    }
+}
+
 /// E3 / #305 — Federated ingestion end-to-end.
 ///
 /// Realizes the paper's `ρ(populate_n) : I → {f₁, …, fₖ} ⊆ P_OWA`:
@@ -1491,7 +1548,12 @@ fn apply_platform(name: &str, x: &Object, d: &Object) -> Object {
         s if s.starts_with("get_noun:") => platform_get_noun(&s[9..], x, d),
         s if s.starts_with("query_ft:") => platform_query_ft(&s[9..], x, d),
         "audit" => platform_audit_log(d),
-        _ => Object::Bottom,
+        // Fall through to the runtime-installed callback registry for
+        // names outside the compile-derived range. See
+        // `install_platform_fn` — hosts (ML scorer, local projector,
+        // tests) install sync bodies here. Returns Bottom when no body
+        // is installed, preserving total-function semantics.
+        _ => dispatch_platform_fallback(name, x, d),
     }
 }
 
@@ -3711,6 +3773,65 @@ mod tests {
             let n = fetch(cell, &d2).as_seq().map(|s| s.len()).unwrap_or(0);
             assert_eq!(n, 1, "{cell} must stay at size 1 after idempotent re-emit; got {n}");
         }
+    }
+
+    // ── Platform fallback registry (#305 IoC/DI completion) ────
+
+    /// apply_platform's hardcoded match covers compile-derived names.
+    /// Runtime-registered names (httpFetch, send_email, ML scorers)
+    /// install synchronous bodies via install_platform_fn, which
+    /// apply_platform dispatches when no hardcoded arm matches.
+    #[test]
+    fn apply_platform_dispatches_to_installed_runtime_body() {
+        install_platform_fn(
+            "e3_test_echo",
+            crate::sync::Arc::new(|x: &Object, _d: &Object| x.clone()),
+        );
+        // register_runtime_fn installs DEFS[name] = Func::Platform(name)
+        // + marks the name in runtime_registered_names. The metacompose
+        // of Func::Platform(name) is itself — so apply(Def(name), x, d)
+        // dispatches via apply_platform to the installed body.
+        let d = register_runtime_fn(
+            "e3_test_echo",
+            Func::Platform("e3_test_echo".to_string()),
+            &Object::phi(),
+        );
+        let result = apply(&Func::Def("e3_test_echo".to_string()), &Object::atom("hi"), &d);
+        uninstall_platform_fn("e3_test_echo");
+        assert_eq!(result, Object::atom("hi"),
+            "apply must dispatch Func::Platform('e3_test_echo') to the installed closure");
+    }
+
+    #[test]
+    fn apply_platform_returns_bottom_for_uninstalled_runtime_name() {
+        let d = register_runtime_fn(
+            "e3_test_no_body",
+            Func::Platform("e3_test_no_body".to_string()),
+            &Object::phi(),
+        );
+        let result = apply(&Func::Def("e3_test_no_body".to_string()), &Object::atom("hi"), &d);
+        assert_eq!(result, Object::Bottom,
+            "name marked in DEFS but with no installed body must return ⊥");
+    }
+
+    #[test]
+    fn apply_platform_body_sees_both_operand_and_state() {
+        install_platform_fn(
+            "e3_test_readx",
+            crate::sync::Arc::new(|x: &Object, d: &Object| {
+                let key = x.as_atom().unwrap_or("");
+                fetch(key, d)
+            }),
+        );
+        let d = register_runtime_fn(
+            "e3_test_readx",
+            Func::Platform("e3_test_readx".to_string()),
+            &store("secret_cell", Object::atom("the-value"), &Object::phi()),
+        );
+        let result = apply(&Func::Def("e3_test_readx".to_string()), &Object::atom("secret_cell"), &d);
+        uninstall_platform_fn("e3_test_readx");
+        assert_eq!(result, Object::atom("the-value"),
+            "installed closure must have access to D so it can fetch cells");
     }
 
     // ── End-to-end: register → invoke → cite (#305 integration) ─
