@@ -182,21 +182,18 @@ pub fn tokenize_statement(statement_id: &str, text: &str, nouns: &[String]) -> C
             }
         }
         // `If ... then ...` sentences starting with capital `If` are
-        // conditional derivation rules (ORM 2): `If Noun1 is subtype of
-        // Noun2, then Noun2 is not subtype of Noun1`. The ` if ` needle
-        // above only catches mid-sentence lowercase `if`; this branch
-        // covers the conditional-frame head.
-        //
-        // Exception: legacy's `try_subset` fires BEFORE `try_derivation`
-        // for `If some X ... then that Y ...` patterns, emitting an SS
-        // constraint rather than a derivation rule. Mirror that
-        // precedence by skipping Keyword emission when the statement
-        // matches the subset shape (the synthetic `if some then that`
-        // constraint keyword is emitted below and drives SS
-        // classification).
-        let is_subset_pattern = body.starts_with("If some ")
-            && body.contains(" then that ");
-        if !is_subset_pattern && body.starts_with("If ") && body.contains(" then ") {
+        // conditional derivation rules (ORM 2). Legacy's `try_subset`
+        // fires BEFORE `try_derivation` in Pass 2b priority — but
+        // only when the antecedent contains 2+ DISTINCT declared
+        // noun types; otherwise `try_subset` returns None and
+        // `try_derivation` emits the rule. Stage-1 can't do the
+        // noun-count check here (it doesn't have the full noun
+        // catalog), so emit Keyword 'if' UNCONDITIONALLY for every
+        // `If ... then ...` shape. Stage-2's translators
+        // (`translate_set_constraints`, `translate_derivation_rules`)
+        // then arbitrate using the declared noun list in the
+        // classified state — matching legacy's pass-order precedence.
+        if body.starts_with("If ") && body.contains(" then ") {
             push(&mut cells, "Statement_has_Keyword", fact_from_pairs(&[
                 ("Statement", statement_id), ("Keyword", "if"),
             ]));
