@@ -41,7 +41,17 @@ type Cells = HashMap<String, Vec<Object>>;
 /// Returns a `Cells` map the caller can merge into a larger state.
 pub fn tokenize_statement(statement_id: &str, text: &str, nouns: &[String]) -> Cells {
     let mut cells: Cells = HashMap::new();
-    let canonical = text.trim().trim_end_matches('.').trim();
+    // Canonical text: drop the trailing period AND the leading ORM 2
+    // derivation marker (`* ` / `** ` / `+ `). Legacy's `try_derivation`
+    // strips the prefix via strip_prefix; downstream DerivationRule.id
+    // (FNV of text) needs the same normalization so both pipelines
+    // produce the same hash.
+    let mut canonical = text.trim().trim_end_matches('.').trim();
+    canonical = canonical
+        .strip_prefix("** ")
+        .or_else(|| canonical.strip_prefix("* "))
+        .or_else(|| canonical.strip_prefix("+ "))
+        .unwrap_or(canonical);
 
     // 1. Strip trailing ORM 2 derivation marker.
     let (body, derivation_marker) = strip_derivation_marker(canonical);
@@ -161,6 +171,26 @@ pub fn tokenize_statement(statement_id: &str, text: &str, nouns: &[String]) -> C
                     ("Statement", statement_id), ("Keyword", kw),
                 ]));
             }
+        }
+        // `If ... then ...` sentences starting with capital `If` are
+        // conditional derivation rules (ORM 2): `If Noun1 is subtype of
+        // Noun2, then Noun2 is not subtype of Noun1`. The ` if ` needle
+        // above only catches mid-sentence lowercase `if`; this branch
+        // covers the conditional-frame head.
+        //
+        // Exception: legacy's `try_subset` fires BEFORE `try_derivation`
+        // for `If some X ... then that Y ...` patterns, emitting an SS
+        // constraint rather than a derivation rule. Mirror that
+        // precedence by skipping Keyword emission when the statement
+        // matches the subset shape (the synthetic `if some then that`
+        // constraint keyword is emitted below and drives SS
+        // classification).
+        let is_subset_pattern = body.starts_with("If some ")
+            && body.contains(" then that ");
+        if !is_subset_pattern && body.starts_with("If ") && body.contains(" then ") {
+            push(&mut cells, "Statement_has_Keyword", fact_from_pairs(&[
+                ("Statement", statement_id), ("Keyword", "if"),
+            ]));
         }
     }
     // Multi-clause constraint keyword markers. Each is a phrase that
