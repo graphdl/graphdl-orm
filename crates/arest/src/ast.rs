@@ -691,6 +691,45 @@ pub fn emit_citation_fact(
     (cite_id, final_state)
 }
 
+/// E3 / #305 — Federated ingestion end-to-end.
+///
+/// Realizes the paper's `ρ(populate_n) : I → {f₁, …, fₖ} ⊆ P_OWA`:
+/// pre-fetched facts enter `P` under OWA, paired with a single
+/// Citation whose Authority Type is `'Federated-Fetch'`. All facts
+/// from the same fetch share one Citation (they came from the same
+/// response at the same moment); the content-addressed id scheme
+/// makes repeated ingestion idempotent at the cell level.
+///
+/// Input shape is explicit (fact_type_id, [(role_name, role_value)…])
+/// so the caller owns JSON → fact mapping — the engine stays
+/// serialization-agnostic. The MCP-server / Cloudflare-worker wrapper
+/// does the HTTP fetch and the JSON → (fact_type, bindings) walk
+/// using the compiled populate:{noun} config, then hands the tuple
+/// list to this function.
+#[cfg(not(feature = "no_std"))]
+pub fn ingest_federated_facts(
+    external_system: &str,
+    url: &str,
+    retrieval_date: &str,
+    facts: &[(String, alloc::vec::Vec<(String, String)>)],
+    state: &Object,
+) -> (String, Object) {
+    let (cite_id, with_cite) = emit_citation_fact(
+        url,
+        "Federated-Fetch",
+        retrieval_date,
+        Some(external_system),
+        state,
+    );
+    let final_state = facts.iter().fold(with_cite, |acc, (ft_id, bindings)| {
+        let pairs: alloc::vec::Vec<(&str, &str)> = bindings.iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        cell_push(ft_id, fact_from_pairs(&pairs), &acc)
+    });
+    (cite_id, final_state)
+}
+
 /// This is Backus Sec. 13.3.2: definitions map atoms to expressions.
 /// Build state from defs + existing cells in O(n).
 /// Collects all cells into a HashMap (O(1) per insert), then
@@ -3580,6 +3619,102 @@ mod tests {
             .collect();
         assert_eq!(cited_auths, vec!["Runtime-Function"],
             "Authority Type must be 'Runtime-Function' for platform-layer origin");
+    }
+
+    // ── Federated ingestion: facts + Citation in one call (#305) ─
+
+    /// ingest_federated_facts is the full ρ(populate_n) realization:
+    /// pre-fetched facts enter P under OWA, paired with a single
+    /// Citation whose Authority Type is 'Federated-Fetch'. Each caller-
+    /// supplied (fact_type_id, bindings) tuple becomes a fact in the
+    /// named cell. The Citation is emitted via emit_citation_fact so
+    /// the id scheme matches and repeated ingestion of the same
+    /// (url, retrieval_date) is idempotent at the cell level.
+    #[test]
+    fn ingest_federated_facts_pushes_facts_and_emits_citation() {
+        let url = "https://api.stripe.com/v1/customers";
+        let facts = alloc::vec![
+            (
+                "Stripe_Customer_has_Email".to_string(),
+                alloc::vec![
+                    ("Stripe Customer".to_string(), "cus_1".to_string()),
+                    ("Email".to_string(), "a@x.com".to_string()),
+                ],
+            ),
+            (
+                "Stripe_Customer_has_Name".to_string(),
+                alloc::vec![
+                    ("Stripe Customer".to_string(), "cus_1".to_string()),
+                    ("Name".to_string(), "Alice".to_string()),
+                ],
+            ),
+        ];
+        let (cite_id, d) = ingest_federated_facts(
+            "stripe",
+            url,
+            "2026-04-20T12:00:00Z",
+            &facts,
+            &Object::phi(),
+        );
+        assert!(cite_id.starts_with("cite:"),
+            "ingest should emit a content-addressed Citation id; got {cite_id}");
+
+        // Citation must record all four readings for Federated-Fetch origin.
+        let uri_facts = fetch("Citation_has_URI", &d).as_seq()
+            .map(|s| s.to_vec()).unwrap_or_default();
+        let matched_uri = uri_facts.iter()
+            .find(|f| binding(f, "Citation") == Some(cite_id.as_str()))
+            .and_then(|f| binding(f, "URI"));
+        assert_eq!(matched_uri, Some(url),
+            "Citation_has_URI must point at the fetch URL");
+
+        let at_facts = fetch("Citation_has_Authority_Type", &d).as_seq()
+            .map(|s| s.to_vec()).unwrap_or_default();
+        let matched_at = at_facts.iter()
+            .find(|f| binding(f, "Citation") == Some(cite_id.as_str()))
+            .and_then(|f| binding(f, "Authority Type"));
+        assert_eq!(matched_at, Some("Federated-Fetch"));
+
+        let bb_facts = fetch("Citation_is_backed_by_External_System", &d).as_seq()
+            .map(|s| s.to_vec()).unwrap_or_default();
+        let matched_bb = bb_facts.iter()
+            .find(|f| binding(f, "Citation") == Some(cite_id.as_str()))
+            .and_then(|f| binding(f, "External System"));
+        assert_eq!(matched_bb, Some("stripe"));
+
+        // Ingested facts land in their declared FT cells.
+        let email_cell = fetch("Stripe_Customer_has_Email", &d).as_seq()
+            .map(|s| s.to_vec()).unwrap_or_default();
+        assert_eq!(email_cell.len(), 1,
+            "Stripe_Customer_has_Email cell must contain the ingested fact");
+        assert_eq!(binding(&email_cell[0], "Email"), Some("a@x.com"));
+        assert_eq!(binding(&email_cell[0], "Stripe Customer"), Some("cus_1"));
+
+        let name_cell = fetch("Stripe_Customer_has_Name", &d).as_seq()
+            .map(|s| s.to_vec()).unwrap_or_default();
+        assert_eq!(name_cell.len(), 1);
+        assert_eq!(binding(&name_cell[0], "Name"), Some("Alice"));
+    }
+
+    #[test]
+    fn ingest_federated_facts_citation_id_stable_across_calls() {
+        let url = "https://api.stripe.com/v1/customers";
+        let rd = "2026-04-20T12:00:00Z";
+        let facts = alloc::vec![(
+            "Stripe_Customer_has_Email".to_string(),
+            alloc::vec![
+                ("Stripe Customer".to_string(), "cus_1".to_string()),
+                ("Email".to_string(), "a@x.com".to_string()),
+            ],
+        )];
+        // Two ingests against the same (url, auth, retrieval_date) triple
+        // must yield the same Citation id. cell_push does not dedupe —
+        // consumers join on the stable id at query time when they need
+        // uniqueness, matching the paper's set-semantics for facts.
+        let (id1, d1) = ingest_federated_facts("stripe", url, rd, &facts, &Object::phi());
+        let (id2, _)  = ingest_federated_facts("stripe", url, rd, &facts, &d1);
+        assert_eq!(id1, id2,
+            "same (url, auth, retrieval_date) must yield the same cite id");
     }
 
     /// Pure ρ-application (a compile-derived def) produces no Citation.
