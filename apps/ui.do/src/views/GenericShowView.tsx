@@ -8,8 +8,9 @@
 import type { ReactElement } from 'react'
 import { ShowView } from '@mdxui/admin'
 import { useArestOne } from '../hooks/useArestResource'
-import { useOpenApiSchema, type FieldDef } from '../schema'
+import { useOpenApiSchema } from '../schema'
 import { humanize } from '../schema/openApiSchema'
+import { SchemaDisplay } from './schemaDisplay'
 
 export interface GenericShowViewProps {
   noun: string
@@ -19,13 +20,6 @@ export interface GenericShowViewProps {
   title?: string
   actions?: ReactElement
   aside?: ReactElement
-}
-
-function formatValue(field: FieldDef, value: unknown): string {
-  if (value == null) return '—'
-  if (field.kind === 'boolean') return value ? 'Yes' : 'No'
-  if (typeof value === 'object') return JSON.stringify(value)
-  return String(value)
 }
 
 export function GenericShowView(props: GenericShowViewProps): ReactElement {
@@ -50,7 +44,9 @@ export function GenericShowView(props: GenericShowViewProps): ReactElement {
           {schema.fields.map((f) => (
             <div key={f.name} style={{ display: 'contents' }}>
               <dt style={{ fontWeight: 600 }}>{f.label}</dt>
-              <dd data-testid={`field-${f.name}`}>{formatValue(f, (record as Record<string, unknown>)[f.name])}</dd>
+              <dd data-testid={`field-${f.name}`}>
+                <SchemaDisplay field={f} value={(record as Record<string, unknown>)[f.name]} />
+              </dd>
             </div>
           ))}
         </dl>
