@@ -263,6 +263,54 @@ fn push(cells: &mut Cells, name: &str, fact: Object) {
     cells.entry(name.to_string()).or_default().push(fact);
 }
 
+/// Detect whether an unquoted noun name would collide with a grammar
+/// reserved keyword (Theorem 1's no-substring hypothesis). Returns
+/// `Some(keyword)` naming the offending term when a collision exists.
+///
+/// Matching is case-insensitive and word-bounded: the keyword must
+/// appear as a whole word in the noun name (surrounded by whitespace
+/// or the name's start/end). `Each Way Bet` collides on `each`;
+/// `At Most One Hop` collides on `at most one`; `Teacher` does NOT
+/// collide on `each` because `each` is not a whole word inside it.
+///
+/// The keyword set is the single-word quantifiers / modalities /
+/// connectives plus the multi-clause `CONSTRAINT_KEYWORDS`. Multi-
+/// word phrases are tested first so `at most one` beats `at most`
+/// when both would apply.
+///
+/// Documented rule at `docs/02-writing-readings.md` §"Noun names and
+/// reserved words". Escape: quote the noun name
+/// (`Noun 'Each Way Bet' is an entity type.`).
+#[cfg(feature = "std-deps")]
+pub fn reserved_keyword_in(name: &str) -> Option<&'static str> {
+    // Longest first so `at most one` beats `at most` on `At Most One
+    // Hop`, etc.
+    const RESERVED: &[&str] = &[
+        "at most one of the following holds",
+        "at least one of the following holds",
+        "exactly one of the following holds",
+        "if some then that",
+        "if and only if",
+        "at most one",
+        "at least one",
+        "exactly one",
+        "at most",
+        "at least",
+        "each", "no", "some", "exactly",
+        "iff", "if", "then", "when",
+        "obligatory", "forbidden", "permitted",
+        "possible", "impossible",
+    ];
+    let padded: alloc::string::String =
+        alloc::format!(" {} ", name.to_lowercase());
+    RESERVED.iter()
+        .find(|kw| {
+            let needle = alloc::format!(" {} ", kw);
+            padded.contains(needle.as_str())
+        })
+        .copied()
+}
+
 fn strip_derivation_marker(text: &str) -> (&str, Option<String>) {
     if let Some(before) = text.strip_suffix(" **") {
         return (before, Some("derived-and-stored".to_string()));
@@ -597,6 +645,54 @@ mod tests {
         assert_eq!(stmt_binding(&c, "Statement_has_Verb", "Verb").as_deref(),
                    Some("places"));
         assert_eq!(c.get("Role_Reference").map(|v| v.len()), Some(2));
+    }
+
+    // ─── #309 reserved-keyword rejection ──────────────────────────────
+
+    #[test]
+    fn reserved_keyword_in_catches_each_way_bet() {
+        assert_eq!(super::reserved_keyword_in("Each Way Bet"), Some("each"));
+    }
+
+    #[test]
+    fn reserved_keyword_in_catches_no_show_fee() {
+        assert_eq!(super::reserved_keyword_in("No Show Fee"), Some("no"));
+    }
+
+    #[test]
+    fn reserved_keyword_in_catches_at_most_one_hop_longest_first() {
+        // `at most one` wins over `at most` per longest-first ordering.
+        assert_eq!(super::reserved_keyword_in("At Most One Hop"),
+                   Some("at most one"));
+    }
+
+    #[test]
+    fn reserved_keyword_in_catches_multi_clause_phrase() {
+        assert_eq!(super::reserved_keyword_in("If And Only If Then Noun"),
+                   Some("if and only if"));
+    }
+
+    #[test]
+    fn reserved_keyword_in_accepts_normal_names() {
+        assert_eq!(super::reserved_keyword_in("Order"), None);
+        assert_eq!(super::reserved_keyword_in("Customer"), None);
+        assert_eq!(super::reserved_keyword_in("Line Item"), None);
+        assert_eq!(super::reserved_keyword_in("Fact Type"), None);
+    }
+
+    #[test]
+    fn reserved_keyword_in_does_not_match_substring_inside_word() {
+        // Word-bounded: `each` must be a whole word, not a letter
+        // sequence inside one.
+        assert_eq!(super::reserved_keyword_in("Teacher"), None);
+        assert_eq!(super::reserved_keyword_in("Beach"), None);
+        assert_eq!(super::reserved_keyword_in("Reacher"), None);
+    }
+
+    #[test]
+    fn reserved_keyword_in_is_case_insensitive() {
+        assert_eq!(super::reserved_keyword_in("EACH way bet"), Some("each"));
+        assert_eq!(super::reserved_keyword_in("no Show Fee"), Some("no"));
     }
 
     #[test]
