@@ -210,7 +210,12 @@ pub fn translate_fact_types(classified_state: &Object) -> (Vec<Object>, Vec<Obje
         let roles = role_refs_for(classified_state, stmt_id);
         let Some(text) = statement_text(classified_state, stmt_id) else { continue };
         let reading = text;
-        let id = reading.replace(' ', "_");
+        // Mirror legacy's `fact_type_id(role_nouns, verb)` shape:
+        // noun parts preserve their declared casing, the verb between
+        // roles lowercases. Keeps `Noun_has_reference_scheme_Noun`
+        // matching legacy (the reading text has capital `Reference
+        // Scheme` but the id lowercases).
+        let id = fact_type_id_from_reading(&reading, &roles);
         ft_facts.push(fact_from_pairs(&[
             ("id", id.as_str()),
             ("reading", reading.as_str()),
@@ -225,6 +230,49 @@ pub fn translate_fact_types(classified_state: &Object) -> (Vec<Object>, Vec<Obje
         }
     }
     (ft_facts, role_facts)
+}
+
+/// Build a canonical FactType id from a reading text + ordered role
+/// noun names — matches legacy's `fact_type_id(role_nouns, verb)`
+/// convention. Noun parts preserve case (with spaces replaced by
+/// underscores); the verb between role positions is lowercased.
+///
+/// For `Noun has Reference Scheme Noun` with roles `[Noun, Noun]`:
+///   verb = "has Reference Scheme" → "has_reference_scheme"
+///   parts = ["Noun", "has_reference_scheme", "Noun"]
+///   id = "Noun_has_reference_scheme_Noun"
+fn fact_type_id_from_reading(reading: &str, roles: &[String]) -> String {
+    if roles.is_empty() {
+        return reading.replace(' ', "_");
+    }
+    // Walk the text once, identifying role-noun spans in order so
+    // repeated nouns (ring shapes) bind to distinct positions.
+    let mut cursor = 0;
+    let mut parts: Vec<String> = Vec::new();
+    for (i, noun) in roles.iter().enumerate() {
+        let Some(pos) = reading[cursor..].find(noun.as_str()) else {
+            // Fall through: if the reading doesn't align with roles,
+            // use the legacy text-replace fallback.
+            return reading.replace(' ', "_");
+        };
+        let abs = cursor + pos;
+        if i > 0 {
+            // Everything between the previous role end and this
+            // role's start is verb text. Lowercase + underscore.
+            let verb = reading[cursor..abs].trim();
+            if !verb.is_empty() {
+                parts.push(verb.to_lowercase().replace(' ', "_"));
+            }
+        }
+        parts.push(noun.replace(' ', "_"));
+        cursor = abs + noun.len();
+    }
+    // Tail after last role (unary predicate or trailing text).
+    let tail = reading[cursor..].trim();
+    if !tail.is_empty() {
+        parts.push(tail.to_lowercase().replace(' ', "_"));
+    }
+    parts.join("_")
 }
 
 /// Role head nouns for a Statement, ordered by Role Position.
@@ -1909,6 +1957,27 @@ mod tests {
         let core = include_str!("../../../readings/core.md");
         let (missing, extra) = diff_cells("core.md", core);
         eprintln!("core.md totals — missing: {}, extra: {}", missing, extra);
+    }
+
+    #[test]
+    #[ignore = "diagnostic: prints FactType id diff"]
+    fn dump_fact_type_ids_core_md() {
+        let core = include_str!("../../../readings/core.md");
+        let legacy = crate::parse_forml2::parse_to_state(core).expect("legacy");
+        let stage12 = super::parse_to_state_via_stage12(core).expect("stage12");
+        let ids_from = |obj: &Object| -> alloc::collections::BTreeSet<String> {
+            fetch_or_phi("FactType", obj).as_seq()
+                .map(|facts| facts.iter()
+                    .filter_map(|f| binding(f, "id").map(String::from))
+                    .collect())
+                .unwrap_or_default()
+        };
+        let l = ids_from(&legacy);
+        let s = ids_from(&stage12);
+        eprintln!("== legacy-only FactType ids ==");
+        for t in l.difference(&s) { eprintln!("  {}", t); }
+        eprintln!("== stage12-only FactType ids ==");
+        for t in s.difference(&l) { eprintln!("  {}", t); }
     }
 
     #[test]
