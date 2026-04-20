@@ -25,18 +25,19 @@ use hashbrown::HashMap;
 #[cfg_attr(feature = "std-deps", derive(serde::Deserialize, serde::Serialize))]
 #[cfg_attr(feature = "std-deps", serde(rename_all = "camelCase"))]
 struct ParseCtx {
-    nouns: HashMap<String, NounDef>,
     fact_types: HashMap<String, FactTypeDef>,
     constraints: Vec<ConstraintDef>,
     #[cfg_attr(feature = "std-deps", serde(default))]
     derivation_rules: Vec<DerivationRuleDef>,
     /// Object cells produced by apply_action. This IS the parse output;
-    /// the typed fields above are parse-time lookup caches.
+    /// the remaining typed fields above are parse-time lookup caches
+    /// still being migrated to cells.
     ///
     /// #283 target: delete the typed caches above and make this the
     /// sole parser state, with cell-query helpers in place of field
-    /// access. Migration in progress — named_spans + autofill_spans
-    /// already migrated to the NamedSpan / AutofillSpan cells.
+    /// access. Migration in progress — named_spans, autofill_spans,
+    /// ref_schemes, subtypes, enum_values, general_instance_facts, and
+    /// nouns already migrated to their respective cells.
     #[cfg_attr(feature = "std-deps", serde(skip))]
     cells: HashMap<String, Vec<crate::ast::Object>>,
 }
@@ -1032,7 +1033,7 @@ fn parse_markdown_with_context(input: &str, existing_nouns: &HashMap<String, Nou
     // the metamodel bootstrap), reject. The bootstrap case (no existing nouns
     // for those names) is allowed to declare them exactly once.
     let mut standalone = ParseCtx {
-        nouns: HashMap::new(), fact_types: HashMap::new(),
+        fact_types: HashMap::new(),
         constraints: vec![], derivation_rules: vec![],
         cells: HashMap::new(),
     };
@@ -1042,17 +1043,22 @@ fn parse_markdown_with_context(input: &str, existing_nouns: &HashMap<String, Nou
     // files and legitimately redeclares the same reserved nouns.
     if !is_bootstrap_mode() {
         if let Some(reserved) = METAMODEL_NOUNS.iter()
-            .find(|n| standalone.nouns.contains_key(**n) && existing_nouns.contains_key(**n))
+            .find(|n| noun_exists(&standalone.cells, n) && existing_nouns.contains_key(**n))
         {
             return Err(format!("metamodel noun '{}' cannot be redeclared", reserved));
         }
     }
 
     let mut ir = ParseCtx {
-        nouns: existing_nouns.clone(), fact_types: existing_fact_types.clone(),
+        fact_types: existing_fact_types.clone(),
         constraints: vec![], derivation_rules: vec![],
         cells: HashMap::new(),
     };
+    // #283 — seed the Noun cell from the pre-existing typed map so the
+    // parser sees metamodel nouns as already declared.
+    for (name, def) in existing_nouns.iter() {
+        upsert_noun(&mut ir, name, def);
+    }
     parse_into(&mut ir, input)?;
     Ok(ir)
 }
@@ -1246,7 +1252,7 @@ pub fn parse_to_state_with_nouns(input: &str, existing: &crate::ast::Object) -> 
 /// Each category becomes a cell: <CELL, fact_type_id, <facts...>>
 fn ctx_to_state(d: &ParseCtx) -> crate::ast::Object {
     use crate::ast::{Object, fact_from_pairs};
-    use hashbrown::{HashMap, HashSet};
+    use hashbrown::HashMap;
     // Seed with cells already emitted by apply_action (Constraint,
     // DerivationRule, etc.). Kinds that need cross-ref resolution (Noun,
     // FactType, Role, compound-ref-scheme) are emitted below from typed
@@ -1256,31 +1262,8 @@ fn ctx_to_state(d: &ParseCtx) -> crate::ast::Object {
         cells.entry(name.to_string()).or_default().push(fact);
     };
 
-    // Nouns (fallback — parse_into's finalize seeds cells directly).
-    if !cells.contains_key("Noun") {
-        for (name, def) in &d.nouns {
-            let wa = match def.world_assumption {
-                WorldAssumption::Closed => "closed",
-                WorldAssumption::Open => "open",
-            };
-            let mut pairs: Vec<(String, String)> = vec![
-                ("name".into(), name.clone()), ("objectType".into(), def.object_type.clone()),
-                ("worldAssumption".into(), wa.into()),
-            ];
-            supertype_of(&d.cells, name).map(|st| pairs.push(("superType".into(), st)));
-            let ref_scheme = ref_scheme_for_noun(&d.cells, name)
-                .or_else(|| (def.object_type == "entity").then(|| vec!["id".into()]));
-            ref_scheme.as_ref().map(|rs| pairs.push(("referenceScheme".into(), rs.join(","))));
-            {
-                let evs = enum_values_for_noun(&d.cells, name);
-                if !evs.is_empty() {
-                    pairs.push(("enumValues".into(), evs.join(",")));
-                }
-            }
-            let refs: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-            push(&mut cells, "Noun", fact_from_pairs(&refs));
-        }
-    }
+    // #283 — Noun cell is populated directly by apply_action; no fallback
+    // from a typed map is needed any longer.
 
     // Fact types: schemas + roles (fallback).
     if !cells.contains_key("FactType") {
@@ -1370,7 +1353,7 @@ fn ctx_to_state(d: &ParseCtx) -> crate::ast::Object {
 
 fn parse_markdown(input: &str) -> Result<ParseCtx, String> {
     let mut ir = ParseCtx {
-        nouns: HashMap::new(), fact_types: HashMap::new(),
+        fact_types: HashMap::new(),
         constraints: vec![], derivation_rules: vec![],
         cells: HashMap::new(),
     };
@@ -1505,7 +1488,7 @@ fn parse_into(ir: &mut ParseCtx, input: &str) -> Result<(), String> {
 
     // Pass 2a: collect fact types and instance facts
     // Sorted longest-first for Theorem 1 (unambiguous longest-first matching)
-    let mut noun_names: Vec<String> = ir.nouns.keys().cloned().collect();
+    let mut noun_names: Vec<String> = noun_names(&ir.cells);
     noun_names.sort_by(|a, b| b.len().cmp(&a.len()));
 
     // Pass 2a: Filter(!pass1 && !pass2b) : lines, then apply fact_type/instance_fact
@@ -1660,7 +1643,8 @@ fn parse_into(ir: &mut ParseCtx, input: &str) -> Result<(), String> {
                     ir.constraints.push(resolved);
                 }
                 ParseAction::AddDerivation(mut r) => {
-                    resolve_derivation_rule(&mut r, &ir.nouns, &ir.fact_types, &catalog);
+                    let nouns_map = nouns_from_cells(&ir.cells);
+                    resolve_derivation_rule(&mut r, &nouns_map, &ir.fact_types, &catalog);
                     ir.derivation_rules.push(r);
                 }
                 other => { apply_action(ir, Some(other), &lines, i); }
@@ -1738,30 +1722,10 @@ fn parse_into(ir: &mut ParseCtx, input: &str) -> Result<(), String> {
     {
         use crate::ast::{Object, fact_from_pairs};
 
-        // Noun: ir.nouns + ir.subtypes + ir.ref_schemes + ir.enum_values
-        let n_facts: Vec<Object> = ir.nouns.iter().map(|(name, def)| {
-            let wa = match def.world_assumption {
-                WorldAssumption::Closed => "closed", WorldAssumption::Open => "open",
-            };
-            let mut pairs: Vec<(String, String)> = vec![
-                ("name".into(), name.clone()),
-                ("objectType".into(), def.object_type.clone()),
-                ("worldAssumption".into(), wa.into()),
-            ];
-            supertype_of(&ir.cells, name).map(|st| pairs.push(("superType".into(), st)));
-            let ref_scheme = ref_scheme_for_noun(&ir.cells, name)
-                .or_else(|| (def.object_type == "entity").then(|| vec!["id".into()]));
-            ref_scheme.as_ref().map(|rs| pairs.push(("referenceScheme".into(), rs.join(","))));
-            {
-                let evs = enum_values_for_noun(&ir.cells, name);
-                if !evs.is_empty() {
-                    pairs.push(("enumValues".into(), evs.join(",")));
-                }
-            }
-            let refs: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-            fact_from_pairs(&refs)
-        }).collect();
-        ir.cells.insert("Noun".to_string(), n_facts);
+        // Noun: #283 — writers emit to the Noun cell during parse.
+        // Finalize enriches each Noun fact with superType / referenceScheme
+        // / enumValues bindings by joining the sibling cells.
+        enrich_noun_cells(ir);
 
         // FactType + Role from ir.fact_types
         let mut ft_facts: Vec<Object> = Vec::with_capacity(ir.fact_types.len());
@@ -1851,10 +1815,10 @@ fn parse_into(ir: &mut ParseCtx, input: &str) -> Result<(), String> {
     // Strict mode: reject undeclared nouns (subtype children, fact type roles).
     if is_strict_mode() {
         let undeclared: Vec<String> = all_subtype_names(&ir.cells).into_iter()
-            .filter(|sub| !ir.nouns.contains_key(sub))
+            .filter(|sub| !noun_exists(&ir.cells, sub))
             .chain(ir.fact_types.values()
                 .flat_map(|ft| ft.roles.iter().map(|r| r.noun_name.clone()))
-                .filter(|n| !ir.nouns.contains_key(n)))
+                .filter(|n| !noun_exists(&ir.cells, n)))
             .collect::<alloc::collections::BTreeSet<_>>()
             .into_iter()
             .collect();
@@ -2665,6 +2629,160 @@ fn all_ref_schemes(
         .unwrap_or_default()
 }
 
+/// #283 — Every noun name present in the `Noun` cell.
+/// Replaces `ir.nouns.keys()`.
+fn noun_names(
+    cells: &HashMap<String, Vec<crate::ast::Object>>,
+) -> Vec<String> {
+    cells.get("Noun")
+        .map(|facts| facts.iter()
+            .filter_map(|f| crate::ast::binding(f, "name").map(String::from))
+            .collect())
+        .unwrap_or_default()
+}
+
+/// #283 — Whether a noun is already declared in the `Noun` cell.
+/// Replaces `ir.nouns.contains_key(name)`.
+fn noun_exists(
+    cells: &HashMap<String, Vec<crate::ast::Object>>,
+    name: &str,
+) -> bool {
+    cells.get("Noun")
+        .map(|facts| facts.iter()
+            .any(|f| crate::ast::binding(f, "name") == Some(name)))
+        .unwrap_or(false)
+}
+
+/// #283 — Object-type lookup for a noun via the `Noun` cell.
+/// Replaces `ir.nouns.get(name).map(|d| &d.object_type)`.
+fn noun_object_type(
+    cells: &HashMap<String, Vec<crate::ast::Object>>,
+    name: &str,
+) -> Option<String> {
+    cells.get("Noun")?
+        .iter()
+        .find(|f| crate::ast::binding(f, "name") == Some(name))
+        .and_then(|f| crate::ast::binding(f, "objectType").map(String::from))
+}
+
+/// #283 — Rebuild `HashMap<String, NounDef>` from the `Noun` cell.
+/// Used at API boundaries that still take a typed map (e.g.
+/// `resolve_derivation_rule`). Each call is O(N) over noun count,
+/// which is cheap compared with the derivation resolution it seeds.
+fn nouns_from_cells(
+    cells: &HashMap<String, Vec<crate::ast::Object>>,
+) -> HashMap<String, NounDef> {
+    cells.get("Noun")
+        .map(|facts| facts.iter().filter_map(|f| {
+            let name = crate::ast::binding(f, "name")?.to_string();
+            let obj_type = crate::ast::binding(f, "objectType").unwrap_or("entity").to_string();
+            let wa = match crate::ast::binding(f, "worldAssumption") {
+                Some("open") => WorldAssumption::Open,
+                _ => WorldAssumption::Closed,
+            };
+            Some((name, NounDef { object_type: obj_type, world_assumption: wa }))
+        }).collect())
+        .unwrap_or_default()
+}
+
+/// #283 — Push a basic Noun fact (name + objectType + worldAssumption).
+/// Enrichment with superType / referenceScheme / enumValues happens at
+/// finalize via `enrich_noun_cells`, reading the sibling cells that
+/// those writers populate.
+fn push_noun_fact(
+    ir: &mut ParseCtx,
+    name: &str,
+    object_type: &str,
+    wa: WorldAssumption,
+) {
+    let wa_str = match wa {
+        WorldAssumption::Closed => "closed",
+        WorldAssumption::Open => "open",
+    };
+    push_cell(ir, "Noun", crate::ast::fact_from_pairs(&[
+        ("name", name), ("objectType", object_type), ("worldAssumption", wa_str),
+    ]));
+}
+
+/// #283 — Upsert a noun on the `Noun` cell. Preserves the same semantics
+/// as the previous `ir.nouns.entry(name).or_insert_with(def)` branch in
+/// `apply_action`:
+///   - new: insert `def`.
+///   - existing, `def.object_type == "abstract"`: force existing to abstract.
+///   - existing, `def.object_type != existing && def.object_type != "abstract"`:
+///     overwrite the fact with `def` (conflict detected later in platform_compile).
+///   - otherwise: preserve existing.
+fn upsert_noun(ir: &mut ParseCtx, name: &str, def: &NounDef) {
+    let existing_type = noun_object_type(&ir.cells, name);
+    match existing_type.as_deref() {
+        None => push_noun_fact(ir, name, &def.object_type, def.world_assumption.clone()),
+        Some(existing) if existing != def.object_type.as_str() && def.object_type != "abstract" => {
+            if let Some(facts) = ir.cells.get_mut("Noun") {
+                facts.retain(|f| crate::ast::binding(f, "name") != Some(name));
+            }
+            push_noun_fact(ir, name, &def.object_type, def.world_assumption.clone());
+        }
+        Some(_) if def.object_type == "abstract" => mark_noun_abstract(ir, name),
+        _ => {}
+    }
+}
+
+/// #283 — Flip an existing Noun fact's `objectType` binding to `"abstract"`.
+/// No-op if no such fact. Replaces `ir.nouns.get_mut(name).for_each(|n| n.object_type = "abstract".into())`.
+fn mark_noun_abstract(ir: &mut ParseCtx, name: &str) {
+    let Some(facts) = ir.cells.get_mut("Noun") else { return };
+    if let Some(f) = facts.iter_mut()
+        .find(|f| crate::ast::binding(f, "name") == Some(name))
+    {
+        let wa = crate::ast::binding(f, "worldAssumption").unwrap_or("closed").to_string();
+        *f = crate::ast::fact_from_pairs(&[
+            ("name", name), ("objectType", "abstract"), ("worldAssumption", wa.as_str()),
+        ]);
+    }
+}
+
+/// #283 — In loose mode, auto-create an `entity` noun if undeclared.
+/// Replaces `ir.nouns.entry(name).or_insert(NounDef { object_type: "entity", .. })`.
+fn ensure_noun_entity(ir: &mut ParseCtx, name: &str) {
+    if !noun_exists(&ir.cells, name) {
+        push_noun_fact(ir, name, "entity", WorldAssumption::default());
+    }
+}
+
+/// #283 — Finalize pass: enrich each Noun fact with `superType`,
+/// `referenceScheme`, and `enumValues` bindings by joining sibling cells
+/// (`Subtype`, `RefScheme`, `EnumValues`). Writers emit basic Noun facts
+/// during parse; this pass joins them once downstream consumers are ready.
+#[cfg(feature = "std-deps")]
+fn enrich_noun_cells(ir: &mut ParseCtx) {
+    let Some(facts) = ir.cells.get("Noun").cloned() else { return };
+    let enriched: Vec<crate::ast::Object> = facts.iter().map(|f| {
+        let name = crate::ast::binding(f, "name").unwrap_or("").to_string();
+        let object_type = crate::ast::binding(f, "objectType").unwrap_or("entity").to_string();
+        let wa = crate::ast::binding(f, "worldAssumption").unwrap_or("closed").to_string();
+        let mut pairs: Vec<(String, String)> = vec![
+            ("name".into(), name.clone()),
+            ("objectType".into(), object_type.clone()),
+            ("worldAssumption".into(), wa),
+        ];
+        if let Some(st) = supertype_of(&ir.cells, &name) {
+            pairs.push(("superType".into(), st));
+        }
+        let ref_scheme = ref_scheme_for_noun(&ir.cells, &name)
+            .or_else(|| (object_type == "entity").then(|| vec!["id".into()]));
+        if let Some(rs) = ref_scheme {
+            pairs.push(("referenceScheme".into(), rs.join(",")));
+        }
+        let evs = enum_values_for_noun(&ir.cells, &name);
+        if !evs.is_empty() {
+            pairs.push(("enumValues".into(), evs.join(",")));
+        }
+        let refs: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        crate::ast::fact_from_pairs(&refs)
+    }).collect();
+    ir.cells.insert("Noun".to_string(), enriched);
+}
+
 /// Emit a Constraint cell fact with the full constraint JSON (lossless)
 /// plus flat fields for check.rs and no_std fallbacks.
 #[cfg(all(test, feature = "std-deps"))]
@@ -2701,16 +2819,10 @@ fn apply_action(ir: &mut ParseCtx, action: Option<ParseAction>, lines: &[String]
     let Some(action) = action else { return };
     match action {
         ParseAction::AddNoun(name, def, meta) => {
-            // Record the declaration faithfully. If the noun already exists with
-            // a different object type, the UC "Each Noun has exactly one Object Type"
-            // will be caught by the validate pipeline during compile.
-            let entry = ir.nouns.entry(name.clone()).or_insert_with(|| def.clone());
-            // Explicit redeclaration overwrites (conflict detected in platform_compile)
-            (entry.object_type != def.object_type && def.object_type != "abstract")
-                .then(|| *entry = def.clone());
-            // Merge: subtype/abstract declarations update existing nouns
-            (def.object_type == "abstract")
-                .then(|| entry.object_type = "abstract".into());
+            // #283 — Upsert the Noun cell directly. Conflict detection
+            // (e.g. "Each Noun has exactly one Object Type") is the
+            // validate pipeline's job at compile time.
+            upsert_noun(ir, &name, &def);
             // Populate IR maps from metadata
             // #283 — Subtype cell write (upsert semantics).
             meta.super_type.into_iter().for_each(|st| { upsert_subtype(ir, &name, &st); });
@@ -2737,22 +2849,16 @@ fn apply_action(ir: &mut ParseCtx, action: Option<ParseAction>, lines: &[String]
             });
         }
         ParseAction::MarkAbstract(name) => {
-            ir.nouns.get_mut(&name).into_iter()
-                .for_each(|noun| noun.object_type = "abstract".into());
+            mark_noun_abstract(ir, &name);
         }
         ParseAction::AddPartition(sup, subs) => {
-            ir.nouns.get_mut(&sup).into_iter()
-                .for_each(|noun| noun.object_type = "abstract".into());
+            mark_noun_abstract(ir, &sup);
             subs.into_iter().for_each(|sub| {
                 // In strict mode, don't auto-create undeclared nouns.
                 // The post-parse validation will catch them.
-                is_strict_mode().then(|| ()).or_else(|| {
-                    ir.nouns.entry(sub.clone()).or_insert(NounDef {
-                        object_type: "entity".into(),
-                        world_assumption: WorldAssumption::default(),
-                    });
-                    None::<()>
-                });
+                if !is_strict_mode() {
+                    ensure_noun_entity(ir, &sub);
+                }
                 upsert_subtype(ir, &sub, &sup);
             });
         }
@@ -3299,7 +3405,7 @@ fn parse_instance_fact(ir: &mut ParseCtx, line: &str, _lines: &[&str], _idx: usi
 
 fn parse_general_instance_fact(ir: &mut ParseCtx, line: &str) {
     // Longest-first noun matching (Theorem 1, step 3)
-    let mut noun_names: Vec<String> = ir.nouns.keys().cloned().collect();
+    let mut noun_names: Vec<String> = noun_names(&ir.cells);
     noun_names.sort_by(|a, b| b.len().cmp(&a.len()));
 
     // bu(match_subject, line) -- find the first noun that matches as subject
@@ -3457,15 +3563,17 @@ mod tests {
     #[test]
     fn entity_types() {
         let ir = parse_markdown("Customer(.Name) is an entity type.\nOrder(.OrderId) is an entity type.").unwrap();
-        assert_eq!(ir.nouns.len(), 2);
-        assert!(ir.nouns.contains_key("Customer"));
-        assert!(ir.nouns.contains_key("Order"));
+        // #283 — nouns live in the Noun cell.
+        assert_eq!(super::noun_names(&ir.cells).len(), 2);
+        assert!(super::noun_exists(&ir.cells, "Customer"));
+        assert!(super::noun_exists(&ir.cells, "Order"));
     }
 
     #[test]
     fn value_types_with_enum() {
         let ir = parse_markdown("Priority is a value type.\n  The possible values of Priority are 'low', 'medium', 'high'.").unwrap();
-        assert_eq!(ir.nouns["Priority"].object_type, "value");
+        // #283 — Noun object type lives on the Noun cell.
+        assert_eq!(super::noun_object_type(&ir.cells, "Priority").as_deref(), Some("value"));
         // #283 — enum values live in the EnumValues cell.
         assert_eq!(super::enum_values_for_noun(&ir.cells, "Priority").len(), 3);
     }
@@ -3483,13 +3591,15 @@ mod tests {
     #[test]
     fn abstract_noun() {
         let ir = parse_markdown("Request(.id) is an entity type.\nRequest is abstract.").unwrap();
-        assert_eq!(ir.nouns["Request"].object_type, "abstract");
+        // #283 — Noun object type lives on the Noun cell.
+        assert_eq!(super::noun_object_type(&ir.cells, "Request").as_deref(), Some("abstract"));
     }
 
     #[test]
     fn partition_implies_abstract() {
         let ir = parse_markdown("Request(.id) is an entity type.\nRequest is partitioned into Support Request, Feature Request.").unwrap();
-        assert_eq!(ir.nouns["Request"].object_type, "abstract");
+        // #283 — Noun object type lives on the Noun cell.
+        assert_eq!(super::noun_object_type(&ir.cells, "Request").as_deref(), Some("abstract"));
         assert_eq!(
             super::supertype_of(&ir.cells, "Support Request"),
             Some("Request".to_string())
@@ -3500,7 +3610,8 @@ mod tests {
     fn totality_implies_abstract() {
         let input = "Request(.id) is an entity type.\nSupport Request is a subtype of Request.\nEach Request is a Support Request or a Feature Request.";
         let ir = parse_markdown(input).unwrap();
-        assert_eq!(ir.nouns["Request"].object_type, "abstract");
+        // #283 — Noun object type lives on the Noun cell.
+        assert_eq!(super::noun_object_type(&ir.cells, "Request").as_deref(), Some("abstract"));
     }
 
     #[test]
@@ -4695,9 +4806,10 @@ fn forbidden_ipv6_ula_fd() {
         let domain = parse_markdown(core_md)
             .expect("metamodel readings/core.md must parse");
 
-        let noun = domain.nouns.get("Derivation Mode")
+        // #283 — Noun cell read.
+        let obj_type = super::noun_object_type(&domain.cells, "Derivation Mode")
             .expect("core.md must declare 'Derivation Mode' as a noun");
-        assert_eq!(noun.object_type, "value",
+        assert_eq!(obj_type, "value",
             "'Derivation Mode' must be a value type");
 
         // #283 — enum values on the EnumValues cell.
@@ -4724,12 +4836,13 @@ fn forbidden_ipv6_ula_fd() {
         let domain = parse_markdown(core_md)
             .expect("metamodel readings/core.md must parse");
         for entity in ["Join Path", "Join", "Role Sequence", "Role Projection", "Join Type"] {
-            let noun = domain.nouns.get(entity)
+            // #283 — Noun cell read.
+            let obj_type = super::noun_object_type(&domain.cells, entity)
                 .unwrap_or_else(|| panic!(
                     "core.md must declare NORMA entity '{}' for the meta-circular parser; got nouns: {:?}",
-                    entity, domain.nouns.keys().collect::<Vec<_>>()
+                    entity, super::noun_names(&domain.cells)
                 ));
-            assert_eq!(noun.object_type, "entity",
+            assert_eq!(obj_type, "entity",
                 "'{}' must be an entity type (NORMA ObjectType subtype)", entity);
         }
     }
@@ -4744,12 +4857,13 @@ fn forbidden_ipv6_ula_fd() {
         let domain = parse_markdown(core_md)
             .expect("metamodel readings/core.md must parse");
         for entity in ["Bound", "Value Range", "Facet", "Value", "Unit", "Dimension", "Textual Constraint"] {
-            let noun = domain.nouns.get(entity)
+            // #283 — Noun cell read.
+            let obj_type = super::noun_object_type(&domain.cells, entity)
                 .unwrap_or_else(|| panic!(
                     "core.md must declare NORMA entity '{}'; got nouns: {:?}",
-                    entity, domain.nouns.keys().collect::<Vec<_>>()
+                    entity, super::noun_names(&domain.cells)
                 ));
-            assert_eq!(noun.object_type, "entity",
+            assert_eq!(obj_type, "entity",
                 "'{}' must be an entity type", entity);
         }
     }
@@ -4764,12 +4878,13 @@ fn forbidden_ipv6_ula_fd() {
             .expect("metamodel readings/core.md must parse");
         // Plain value types — no enum required
         for value_type in ["Regex Pattern", "Lexical Value", "Alias", "Length", "Binary Precision", "Digit Count"] {
-            let noun = domain.nouns.get(value_type)
+            // #283 — Noun cell read.
+            let obj_type = super::noun_object_type(&domain.cells, value_type)
                 .unwrap_or_else(|| panic!(
                     "core.md must declare NORMA value type '{}'; got: {:?}",
-                    value_type, domain.nouns.keys().collect::<Vec<_>>()
+                    value_type, super::noun_names(&domain.cells)
                 ));
-            assert_eq!(noun.object_type, "value",
+            assert_eq!(obj_type, "value",
                 "'{}' must be a value type", value_type);
         }
         // Clusivity: enum of inclusive / exclusive — via EnumValues cell (#283)
@@ -5036,10 +5151,11 @@ Customer has Full Name *.
                      Customer(.Name) is an entity type.";
         let ir = parse_markdown_with_nouns(input, &existing)
             .expect("non-reserved user domain should parse when metamodel is already present");
-        assert!(ir.nouns.contains_key("Order"));
-        assert!(ir.nouns.contains_key("Customer"));
+        // #283 — nouns live in the Noun cell.
+        assert!(super::noun_exists(&ir.cells, "Order"));
+        assert!(super::noun_exists(&ir.cells, "Customer"));
         // Existing metamodel nouns remain visible in the merged IR.
-        assert!(ir.nouns.contains_key("Noun"));
+        assert!(super::noun_exists(&ir.cells, "Noun"));
     }
 
     #[test]
@@ -5054,9 +5170,10 @@ Customer has Full Name *.
                      Role(.Id) is an entity type.";
         let ir = parse_markdown_with_nouns(input, &empty)
             .expect("bootstrap compile of metamodel nouns must succeed");
-        assert!(ir.nouns.contains_key("Noun"));
-        assert!(ir.nouns.contains_key("Constraint"));
-        assert!(ir.nouns.contains_key("Role"));
+        // #283 — nouns live in the Noun cell.
+        assert!(super::noun_exists(&ir.cells, "Noun"));
+        assert!(super::noun_exists(&ir.cells, "Constraint"));
+        assert!(super::noun_exists(&ir.cells, "Role"));
     }
 
     #[test]
@@ -5066,7 +5183,8 @@ Customer has Full Name *.
         let empty: HashMap<String, NounDef> = HashMap::new();
         let input = "# Sales\nOrder(.Id) is an entity type.";
         let ir = parse_markdown_with_nouns(input, &empty).unwrap();
-        assert!(ir.nouns.contains_key("Order"));
+        // #283 — Noun cell read.
+        assert!(super::noun_exists(&ir.cells, "Order"));
     }
 
     // One test per reserved metamodel noun. Each verifies that redeclaring
@@ -5226,8 +5344,9 @@ Widget 'my-system-3' has Label 'foo'.
     fn loose_mode_auto_creates_partition_subtypes() {
         let input = "Animal is an entity type.\nAnimal is partitioned into Cat, Dog.\n";
         let ir = parse_markdown(input).unwrap();
-        assert!(ir.nouns.contains_key("Cat"), "Cat should be auto-created in loose mode");
-        assert!(ir.nouns.contains_key("Dog"), "Dog should be auto-created in loose mode");
+        // #283 — Noun cell read.
+        assert!(super::noun_exists(&ir.cells, "Cat"), "Cat should be auto-created in loose mode");
+        assert!(super::noun_exists(&ir.cells, "Dog"), "Dog should be auto-created in loose mode");
     }
 
     #[test]
