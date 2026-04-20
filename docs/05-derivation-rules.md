@@ -62,13 +62,16 @@ Multiple anaphors are allowed; the more you use, the tighter the join becomes.
 
 ## Kinds of derivation
 
-The compiler classifies rules and emits different Func shapes:
+The compiler classifies rules and emits different Func shapes. All of them lower to the same three compile-functions — `compile_explicit_derivation`, `compile_join_derivation`, `compile_aggregate_derivation` — with no dedicated per-kind implementations (`#287`).
 
 - **Modus ponens** applies when there is no join key and a single antecedent. The compiler lifts every antecedent tuple into the consequent shape.
 - **Join** applies when there is one or more `that` anaphor. The compiler computes an equi-join on the shared nouns, then derives the consequent.
-- **Subtype inheritance** is automatic for subtype hierarchies. The subtype inherits every fact type that the supertype declares.
-- **Transitivity** applies when two fact types share a role structure (`A → B` and `B → C`). The compiler can derive `A → C` from the pair.
-- **CWA negation** is generated for nouns under the closed-world assumption. The compiler produces a negation-by-failure rule of the form `NOT A has B iff A is instance of Noun and no B exists for A`.
+- **Subtype inheritance** fires for every (subtype, super-fact-type) pair implied by the schema. Each pair is materialized as a `DerivationRuleDef` whose antecedent source is `InstancesOfNoun(subtype)` and whose consequent cell is the super-fact-type id — one standard 1-antecedent rule per pair, routed through `compile_explicit_derivation`.
+- **Transitivity** applies when two binary fact types share a role structure (`A → B` and `B → C`). Each matching pair is materialized as a 2-antecedent Join `DerivationRuleDef` whose consequent cell is a synthesized `_transitive_<ft1>_<ft2>` and whose join key is the shared noun — routed through `compile_join_derivation`.
+- **SS auto-fill** fires for every Subset Constraint whose span carries `subset_autofill: true`. Each such constraint materializes a standard 1-antecedent `DerivationRuleDef` copying facts from the antecedent FT to the consequent FT.
+- **CWA negation** is generated for nouns under the closed-world assumption. For each (CWA noun, FT) pair where the noun plays a role, the compiler emits derivations into a separate `_cwa_negation:<ft_id>` cell for any instance that doesn't already participate in the FT at that role. Negation facts carry a prefixed `_neg_<noun>` binding key so presence constraints never see them.
+
+The compile-time loops that enumerate these (per-subtype-pair, per-FT-pair, per-SS-constraint, per-CWA-noun-and-FT) are pure schema enumeration, not domain logic — they feed a single pipeline.
 
 ## Examples
 

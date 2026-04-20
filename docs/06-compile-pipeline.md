@@ -43,7 +43,7 @@ This is the big one. It reconstructs a Domain from the state (a round trip, sinc
 
 - **Constraints.** Each constraint gets `constraint:{id}` plus `validate:{fact_type_id}` per-FT indexed validators.
 - **Machines.** Each SM gets `machine:{noun}`, `machine:{noun}:initial`, and `transitions:{noun}`.
-- **Derivations.** Each user-defined and synthetic derivation (CWA negation, subtype inheritance, transitivity) gets `derivation:{id}`.
+- **Derivations.** Each derivation rule (user-authored or materialized by the schema — subtype inheritance, transitivity, SS auto-fill, CWA negation) lowers through the same compile pipeline and gets `derivation:{id}`. The pre-`#287` "synthetic" path — dedicated per-kind functions — is gone; the schema-materialized rules are `DerivationRuleDef`s emitted alongside user rules inside `compile_derivations`.
 - **Derivation index.** The compiler emits `derivation_index:{noun}` cells so that `create` can gate which rules run.
 - **Shard map.** The compiler emits `shard:{fact_type_id}` mapping each fact type to its owning cell (the RMAP partition).
 - **Schemas.** Each fact type gets `schema:{fact_type_id}` Construction funcs (tuple constructors).
