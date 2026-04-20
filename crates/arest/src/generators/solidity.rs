@@ -138,6 +138,7 @@ fn emit_contract(
     scope: Option<&hashbrown::HashSet<&str>>,
 ) -> String {
     let contract_name = sanitize_name(name);
+    let off_chain = emit_off_chain_comment(name, state);
     let struct_def = emit_struct(table);
     let events = emit_events(name, state, scope);
     let sm_parts = sm.map(emit_state_machine).unwrap_or_default();
@@ -145,7 +146,7 @@ fn emit_contract(
     let transitions = sm.map(|s| emit_transitions(s)).unwrap_or_default();
 
     format!(
-        "contract {} {{\n\
+        "{}contract {} {{\n\
          {}\n\
          \n    mapping(string => Data) public records;\n\
          \n{}\
@@ -153,7 +154,50 @@ fn emit_contract(
          {}\
          {}\
          }}\n",
-        contract_name, struct_def, events, sm_parts, create_fn, transitions
+        off_chain, contract_name, struct_def, events, sm_parts, create_fn, transitions
+    )
+}
+
+/// Emit a comment block above the contract body listing constraints
+/// that are NOT enforced by the generated create(...) body — SS / EQ
+/// / XC are too expensive on-chain for arbitrary spans; ring kinds
+/// (IR / AS / AT / SY / IT / TR / AC / RF) need to guard fact-type
+/// writes, which the current generator doesn't expose as contract
+/// functions (facts land as events, not callable writes).
+///
+/// Surfacing the constraints in a comment gives auditors reading the
+/// ABI a visible record instead of silently dropping them. Flip the
+/// guard emission to real `require`s once fact-type writes are
+/// contract-visible.
+fn emit_off_chain_comment(noun_name: &str, state: &Object) -> String {
+    const ANNOTATED_KINDS: &[(&str, &str)] = &[
+        ("SS", "SS"), ("EQ", "EQ"), ("XC", "XC"),
+        ("XO", "XO"), ("OR", "OR"),
+        ("IR", "IR"), ("AS", "AS"), ("AT", "AT"), ("SY", "SY"),
+        ("IT", "IT"), ("TR", "TR"), ("AC", "AC"), ("RF", "RF"),
+    ];
+    let constraints = fetch_or_phi("Constraint", state);
+    let Some(facts) = constraints.as_seq() else { return String::new(); };
+    let relevant: Vec<String> = facts.iter()
+        .filter_map(|c| {
+            let kind = binding(c, "kind")?;
+            let label = ANNOTATED_KINDS.iter()
+                .find(|(k, _)| *k == kind)
+                .map(|(_, l)| *l)?;
+            let text = binding(c, "text")?;
+            // Only surface constraints naming this entity. Entity
+            // binding may be absent; fall back to text substring.
+            let applies = binding(c, "entity") == Some(noun_name)
+                || text.contains(noun_name);
+            if !applies { return None; }
+            Some(alloc::format!("//   - {}: {}", label, text))
+        })
+        .collect();
+    if relevant.is_empty() { return String::new(); }
+    alloc::format!(
+        "// The following constraints are enforced off-chain:\n\
+         {}\n",
+        relevant.join("\n")
     )
 }
 
@@ -549,7 +593,7 @@ Order has Amount.
 "#;
 
     #[test]
-    #[ignore = "E2: MC scaffold landed, awaiting RMAP column-absorption investigation — test input needs the Amount to appear as a struct column, which requires UC metadata in the Constraint cell that stage-2 doesn't yet populate"]
+    #[ignore = "E2: MC require blocked on RMAP absorption — legacy writes both UC spans at roleIndex 0 (the entity side) for `Each X has at most one Y`, which RMAP classifies as compound instead of functional, so Y never becomes a column on X's struct. Tracking as a follow-up to #304."]
     fn compile_to_solidity_emits_mc_require() {
         let meta = parse_to_state(STATE_METAMODEL).unwrap();
         let state = parse_to_state_with_nouns(MC_READINGS, &meta).unwrap();
@@ -602,7 +646,6 @@ Person reports to Person.
 "#;
 
     #[test]
-    #[ignore = "E2: Ring IR require not yet implemented; see _reports/followup-2026-04-20.md"]
     fn compile_to_solidity_emits_ir_require() {
         let meta = parse_to_state(STATE_METAMODEL).unwrap();
         let state = parse_to_state_with_nouns(IR_READINGS, &meta).unwrap();
@@ -628,7 +671,6 @@ If some Claim has some Cause then that Claim has some Cause.
 "#;
 
     #[test]
-    #[ignore = "E2: off-chain SS/EQ/XC docs not yet emitted; see _reports/followup-2026-04-20.md"]
     fn compile_to_solidity_documents_off_chain_constraints() {
         // SS / EQ / XC are too expensive to enforce on-chain; the
         // generator should emit a comment block rather than silently
