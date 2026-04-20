@@ -1,11 +1,21 @@
 /**
  * arestAuthProvider tests.
  *
- * AREST auth is session-cookie based (per #131). The provider's job is
- * to shape fetch calls so the worker stamps / revokes / observes the
- * cookie, and to translate HTTP errors into the react-admin-style auth
- * contract (`checkAuth` rejects when unauthed; `checkError` rejects
- * the request for 401/403).
+ * AREST is fact-based (whitepaper §3–§7): the user is an entity in P,
+ * and `/arest/` returns its representation with `_links`. There is no
+ * SPA-side auth logic — authentication is enforced upstream by the
+ * `apis.` proxy, which stamps a session cookie on the browser before
+ * requests reach the AREST worker.
+ *
+ * This provider is therefore a thin cookie-forwarding wrapper:
+ *   - `login` / `logout` do NOT post to /arest/auth/*. They redirect
+ *     the browser to the upstream login/logout URL if one was
+ *     configured, or throw otherwise. The SPA never renders a login
+ *     form.
+ *   - `checkAuth` / `getIdentity` / `getPermissions` all probe
+ *     `GET /arest/` (the HATEOAS root) with `credentials: include`
+ *     and let the proxy's cookie do the work. 401 → caller-level
+ *     redirect.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createArestAuthProvider } from '../arestAuthProvider'
@@ -14,7 +24,7 @@ interface Recorded {
   url: string
   method: string
   credentials?: RequestCredentials
-  body?: unknown
+  headers?: Record<string, string>
 }
 
 function stubFetch(responder: (req: Recorded) => Response): Recorded[] {
@@ -22,11 +32,12 @@ function stubFetch(responder: (req: Recorded) => Response): Recorded[] {
   vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
     const method = (init?.method ?? 'GET').toUpperCase()
-    let body: unknown
-    if (init?.body != null) {
-      try { body = JSON.parse(init.body as string) } catch { body = init.body }
+    const headers: Record<string, string> = {}
+    if (init?.headers) {
+      const h = new Headers(init.headers as HeadersInit)
+      h.forEach((v, k) => { headers[k] = v })
     }
-    const req: Recorded = { url, method, credentials: init?.credentials, body }
+    const req: Recorded = { url, method, credentials: init?.credentials, headers }
     recorded.push(req)
     return responder(req)
   })
@@ -42,63 +53,97 @@ function json(payload: unknown, status = 200): Response {
 
 describe('arestAuthProvider', () => {
   const baseUrl = 'https://ui.auto.dev/arest'
-  let provider: ReturnType<typeof createArestAuthProvider>
 
-  beforeEach(() => { provider = createArestAuthProvider({ baseUrl }) })
   afterEach(() => { vi.unstubAllGlobals() })
 
-  describe('login', () => {
-    it('POSTs credentials to /arest/auth/login with credentials: include', async () => {
-      const recorded = stubFetch(() => json({ ok: true }))
-
-      await provider.login({ username: 'sam@driv.ly', password: 'sekret' })
-
-      expect(recorded).toHaveLength(1)
-      expect(recorded[0].url).toBe('https://ui.auto.dev/arest/auth/login')
-      expect(recorded[0].method).toBe('POST')
-      expect(recorded[0].credentials).toBe('include')
-      expect(recorded[0].body).toEqual({ username: 'sam@driv.ly', password: 'sekret' })
+  describe('login (handled upstream)', () => {
+    it('rejects with a clear message when no loginUrl is configured', async () => {
+      const provider = createArestAuthProvider({ baseUrl })
+      await expect(provider.login({ username: 'x', password: 'y' }))
+        .rejects.toThrow(/upstream|edge|apis/i)
     })
 
-    it('rejects when the worker returns 401', async () => {
-      stubFetch(() => json({ error: 'Bad credentials' }, 401))
-      await expect(provider.login({ username: 'x', password: 'y' }))
-        .rejects.toThrow(/Bad credentials|401/)
+    it('redirects to the configured loginUrl and never calls /arest/auth/login', async () => {
+      const recorded = stubFetch(() => json({ ok: true }))
+      const href = vi.fn()
+      const provider = createArestAuthProvider({
+        baseUrl,
+        loginUrl: 'https://apis.auto.dev/login?redirect=/',
+        navigate: href,
+      })
+      // login() hands off to the navigator; its promise may never resolve,
+      // so we race it against a microtask deadline.
+      const race = Promise.race([
+        provider.login({}),
+        new Promise((resolve) => setTimeout(resolve, 10)),
+      ])
+      await race
+      expect(href).toHaveBeenCalledWith('https://apis.auto.dev/login?redirect=/')
+      // Critically: the provider never posts anywhere.
+      expect(recorded).toEqual([])
     })
   })
 
-  describe('logout', () => {
-    it('POSTs /arest/auth/logout with credentials: include', async () => {
+  describe('logout (handled upstream)', () => {
+    it('resolves as a no-op when no logoutUrl is configured (cookie is edge-managed)', async () => {
       const recorded = stubFetch(() => json({ ok: true }))
-      await provider.logout()
-      expect(recorded[0].url).toBe('https://ui.auto.dev/arest/auth/logout')
-      expect(recorded[0].method).toBe('POST')
-      expect(recorded[0].credentials).toBe('include')
+      const provider = createArestAuthProvider({ baseUrl })
+      await expect(provider.logout()).resolves.toBeUndefined()
+      expect(recorded).toEqual([])
     })
 
-    it('resolves even when the worker returns 401 (already logged out)', async () => {
-      stubFetch(() => json({ error: 'no session' }, 401))
-      await expect(provider.logout()).resolves.toBeUndefined()
+    it('redirects to the configured logoutUrl and never calls /arest/auth/logout', async () => {
+      const recorded = stubFetch(() => json({ ok: true }))
+      const href = vi.fn()
+      const provider = createArestAuthProvider({
+        baseUrl,
+        logoutUrl: 'https://apis.auto.dev/logout',
+        navigate: href,
+      })
+      const race = Promise.race([
+        provider.logout(),
+        new Promise((resolve) => setTimeout(resolve, 10)),
+      ])
+      await race
+      expect(href).toHaveBeenCalledWith('https://apis.auto.dev/logout')
+      expect(recorded).toEqual([])
     })
   })
 
   describe('checkAuth', () => {
-    it('resolves when /arest/auth/me returns 200', async () => {
-      const recorded = stubFetch(() => json({ data: { email: 'sam@driv.ly' }, _links: {} }))
+    let provider: ReturnType<typeof createArestAuthProvider>
+    beforeEach(() => { provider = createArestAuthProvider({ baseUrl }) })
+
+    it('GETs /arest/ with credentials: include and resolves on 200', async () => {
+      const recorded = stubFetch(() => json({
+        type: 'User',
+        data: { email: 'sam@driv.ly' },
+        _links: {},
+      }))
       await expect(provider.checkAuth()).resolves.toBeUndefined()
-      expect(recorded[0].url).toBe('https://ui.auto.dev/arest/auth/me')
+      expect(recorded[0].url).toBe('https://ui.auto.dev/arest/')
+      expect(recorded[0].method).toBe('GET')
       expect(recorded[0].credentials).toBe('include')
     })
 
-    it('rejects when /arest/auth/me returns 401', async () => {
-      stubFetch(() => json({ error: 'not signed in' }, 401))
+    it('rejects on 401 so callers can redirect to host-level login', async () => {
+      stubFetch(() => json({ error: 'no session' }, 401))
       await expect(provider.checkAuth()).rejects.toThrow()
+    })
+
+    it('does NOT send an explicit Authorization header', async () => {
+      const recorded = stubFetch(() => json({ data: { email: 'x' }, _links: {} }))
+      await provider.checkAuth()
+      // Auth is cookie-only — the provider must not attempt token logic.
+      expect(recorded[0].headers?.authorization).toBeUndefined()
     })
   })
 
   describe('checkError', () => {
+    let provider: ReturnType<typeof createArestAuthProvider>
+    beforeEach(() => { provider = createArestAuthProvider({ baseUrl }) })
+
     it('rejects on 401', async () => {
-      stubFetch(() => json({}, 200))
       await expect(provider.checkError({ status: 401 } as unknown as Error)).rejects.toThrow()
     })
 
@@ -113,30 +158,34 @@ describe('arestAuthProvider', () => {
   })
 
   describe('getIdentity', () => {
-    it('returns the envelope data unwrapped with id=email fallback', async () => {
+    let provider: ReturnType<typeof createArestAuthProvider>
+    beforeEach(() => { provider = createArestAuthProvider({ baseUrl }) })
+
+    it('returns envelope data from /arest/; id falls back to email', async () => {
       stubFetch(() => json({
+        type: 'User',
         data: { email: 'sam@driv.ly' },
         _links: {},
       }))
       const identity = await provider.getIdentity()
       expect(identity.email).toBe('sam@driv.ly')
-      // AREST's /arest/ root resource is keyed by email, so id falls
-      // back to email when the body doesn't carry a separate id.
+      // /arest/ root resource is keyed by email; id falls back to email.
       expect(identity.id).toBe('sam@driv.ly')
     })
 
-    it('rejects when no identity is returned', async () => {
+    it('rejects when /arest/ returns 401', async () => {
       stubFetch(() => json({ error: 'unauthenticated' }, 401))
       await expect(provider.getIdentity()).rejects.toThrow()
     })
   })
 
   describe('getPermissions', () => {
-    it('returns a flat array of org-membership fact-type names', async () => {
-      // The /arest/ root returns _links.organizations which encodes the
-      // fact-type (User_owns_* / _administers_ / _belongs_to_). The auth
-      // provider flattens those to a simple string[] suitable for
-      // role-based UI gating.
+    let provider: ReturnType<typeof createArestAuthProvider>
+    beforeEach(() => { provider = createArestAuthProvider({ baseUrl }) })
+
+    it('flattens _links.organizations into factType:id permission strings', async () => {
+      // /arest/ exposes _links.organizations — HATEOAS Theorem 4 navigation
+      // links — annotated with the fact type that grants membership.
       stubFetch(() => json({
         type: 'User',
         id: 'sam@driv.ly',
@@ -154,7 +203,7 @@ describe('arestAuthProvider', () => {
       expect(perms).toContain('User_belongs_to_Organization:globex')
     })
 
-    it('returns an empty array on failure', async () => {
+    it('returns an empty array on failure rather than throwing', async () => {
       stubFetch(() => json({}, 500))
       await expect(provider.getPermissions()).resolves.toEqual([])
     })
