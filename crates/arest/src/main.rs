@@ -451,7 +451,8 @@ fn main() {
                         .map(|facts| facts.iter().map(|f| types::DerivationRuleDef {
                             id: ast::binding(f, "id").unwrap_or("").to_string(),
                             text: ast::binding(f, "text").unwrap_or("").to_string(),
-                            consequent_fact_type_id: ast::binding(f, "consequentFactTypeId").unwrap_or("").to_string(),
+                            consequent_cell: types::ConsequentCellSource::decode(
+                                ast::binding(f, "consequentFactTypeId").unwrap_or("")),
                             antecedent_fact_type_ids: vec![], kind: types::DerivationKind::ModusPonens,
                             join_on: vec![], match_on: vec![], consequent_bindings: vec![],
                             antecedent_filters: vec![], consequent_computed_bindings: vec![],
