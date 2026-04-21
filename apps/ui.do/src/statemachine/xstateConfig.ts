@@ -139,3 +139,103 @@ export function describeStatuses(
     }
   })
 }
+
+/**
+ * Find cycles that have no exit transition.
+ *
+ * Whitepaper §7 Theorem 3 proof: "Transition graphs may contain
+ * cycles. It is obligatory that each cycle has some exit
+ * transition, a deontic constraint that ensures liveness without
+ * requiring acyclicity." This helper surfaces violating cycles so
+ * the editor can warn on save before a machine deadlocks.
+ *
+ * Implementation: Tarjan-style SCC detection, then filter SCCs
+ * that have >1 node (or 1 node with a self-loop) and whose every
+ * outgoing transition from members stays inside the SCC — no exit.
+ * Returns the status-name lists for each offending SCC.
+ */
+export function findDeadCycles(
+  smd: ArestStateMachineDefinition,
+  transitions: readonly ArestTransition[],
+): string[][] {
+  const adj = new Map<string, string[]>()
+  const statuses = listStatuses(smd, transitions)
+  for (const s of statuses) adj.set(s, [])
+  for (const t of transitions) {
+    const out = adj.get(t.from)
+    if (out && !out.includes(t.to)) out.push(t.to)
+  }
+
+  // Tarjan's strongly-connected-components algorithm.
+  const index = new Map<string, number>()
+  const lowlink = new Map<string, number>()
+  const onStack = new Set<string>()
+  const stack: string[] = []
+  let counter = 0
+  const sccs: string[][] = []
+
+  function strongconnect(v: string): void {
+    index.set(v, counter)
+    lowlink.set(v, counter)
+    counter++
+    stack.push(v)
+    onStack.add(v)
+
+    for (const w of adj.get(v) ?? []) {
+      if (!index.has(w)) {
+        strongconnect(w)
+        lowlink.set(v, Math.min(lowlink.get(v)!, lowlink.get(w)!))
+      } else if (onStack.has(w)) {
+        lowlink.set(v, Math.min(lowlink.get(v)!, index.get(w)!))
+      }
+    }
+
+    if (lowlink.get(v) === index.get(v)) {
+      const scc: string[] = []
+      let w: string
+      do {
+        w = stack.pop()!
+        onStack.delete(w)
+        scc.push(w)
+      } while (w !== v)
+      sccs.push(scc)
+    }
+  }
+
+  for (const s of statuses) if (!index.has(s)) strongconnect(s)
+
+  const dead: string[][] = []
+  for (const scc of sccs) {
+    // Skip trivial SCCs (single node, no self-loop) — they can't cycle.
+    if (scc.length === 1) {
+      const only = scc[0]
+      const hasSelfLoop = transitions.some((t) => t.from === only && t.to === only)
+      if (!hasSelfLoop) continue
+    }
+    const set = new Set(scc)
+    // A cycle has an exit iff some transition from an SCC member
+    // lands outside the SCC.
+    const hasExit = transitions.some((t) => set.has(t.from) && !set.has(t.to))
+    if (!hasExit) dead.push(scc.sort())
+  }
+  return dead
+}
+
+/**
+ * Build a Stately Studio URL (stately.ai) with the machine config
+ * serialised into the URL hash. Lets users hand a machine off to
+ * Stately's full visual editor for a second-opinion edit session.
+ *
+ * Format matches stately.ai/viz: base64-encoded JSON payload in the
+ * hash. The URL opens in the viz tab of Stately Studio; the
+ * "Open in editor" control on that page lets the user fork it.
+ */
+export function buildStatelyDeeplink(config: XStateConfig): string {
+  const payload = JSON.stringify({ version: 5, machine: config })
+  // Stately's viz URL takes URL-safe base64 in the hash.
+  const base64 = typeof btoa !== 'undefined'
+    ? btoa(payload)
+    : Buffer.from(payload).toString('base64')
+  const urlSafe = base64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+  return `https://stately.ai/viz?machine=${urlSafe}`
+}
