@@ -990,6 +990,34 @@ pub fn defs_to_state(defs: &[(String, Func)], state: &Object) -> Object {
     Object::Map(map)
 }
 
+/// Look up `allowed_writes:{def_name}` in DEFS. If it's a Seq of atom
+/// cell names, push those as the current capability frame and return a
+/// Some(guard) whose Drop pops it. Absent or non-seq cell → None
+/// (unrestricted, legacy behavior). Called by `Func::Def` dispatch so
+/// user-authored defs self-enforce their declared writes. See Sec-5.
+///
+/// `*` in the allow-list acts as a wildcard — emitted by compile for
+/// system defs (kernel helpers, cache invalidation) that legitimately
+/// touch any cell. User-authored readings never emit "*".
+#[cfg(not(feature = "no_std"))]
+fn defs_writes_scope(def_name: &str, d: &Object) -> Option<crate::declared_writes::CapGuard> {
+    let key = alloc::format!("allowed_writes:{}", def_name);
+    let cell = fetch(&key, d);
+    let items = cell.as_seq()?;
+    let frame: hashbrown::HashSet<String> = items.iter()
+        .filter_map(|o| o.as_atom().map(|s| s.to_string()))
+        .collect();
+    // Empty-seq frame is still meaningful: "no writes allowed at all".
+    // Only Bottom / non-seq skips enforcement.
+    Some(crate::declared_writes::push_caps(frame))
+}
+
+#[cfg(feature = "no_std")]
+fn defs_writes_scope(_def_name: &str, _d: &Object) -> Option<crate::declared_writes::CapGuard> {
+    // Kernel build: no capability enforcement (no user code path).
+    None
+}
+
 /// Rewrite a Func to a smaller equivalent form before reduction.
 ///
 /// Implements a subset of Backus (1978) §12 algebraic laws. Each rule is
@@ -1460,10 +1488,17 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
         }
 
         Func::Store => {
-            // store:<name, contents, D> → D' with cell updated
+            // store:<name, contents, D> → D' with cell updated.
+            // Sec-5: consult the capability stack. Under a user-scoped
+            // frame (apply_with_caps or Func::Def with allowed_writes),
+            // writes to cells outside the allow-list or to the
+            // protected metamodel set collapse to ⊥. Empty stack =
+            // system mode = unrestricted (preserves legacy apply()).
             match x.as_seq() {
                 Some(items) if items.len() == 3 => {
                     match items[0].as_atom() {
+                        Some(name) if !crate::declared_writes::is_store_allowed(name) =>
+                            Object::Bottom,
                         Some(name) => store(name, items[1].clone(), &items[2]),
                         None => Object::Bottom,
                     }
@@ -1634,7 +1669,14 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
             let def_obj = fetch(name, d);
             match def_obj {
                 Object::Bottom => Object::Bottom,
-                obj => apply(&metacompose(&obj, d), x, d),
+                obj => {
+                    // Sec-5: if DEFS contains `allowed_writes:{name}`
+                    // as a Seq of atom cell names, scope the body under
+                    // those caps. Absent cell = unrestricted (legacy
+                    // behavior, preserves the established baseline).
+                    let _caps_guard = defs_writes_scope(name, d);
+                    apply(&metacompose(&obj, d), x, d)
+                }
             }
         }
 
