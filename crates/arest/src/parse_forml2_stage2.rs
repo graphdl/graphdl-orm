@@ -3215,4 +3215,127 @@ mod tests {
             "Constraint stable bindings diverged between legacy and stage12");
     }
 
+    // ── Perf Benchmarks (opt-in) ───────────────────────────────────────
+    //
+    // Kept out of the default suite by `#[ignore]`. Run with:
+    //
+    //   cargo test --lib --features std-deps \
+    //       bench_forward_chain_over_grammar_rules -- --ignored --nocapture
+    //
+    // The chainer owns most of Stage-2's call-time cost; optimisation
+    // passes on `forward_chain_defs_state_semi_naive_*` (see #297 for
+    // history) want a focused signal without the surrounding parse,
+    // compile, and translator noise. Numbers are printed to stderr
+    // (stable run-to-run within ~15% on the same machine).
+
+    /// Benchmark `forward_chain_defs_state_semi_naive_with_base_keys`
+    /// against the cached FORML 2 grammar classifier rule set.
+    ///
+    /// Fixture choice: 10 hand-rolled canonical FORML 2 statement
+    /// shapes, tokenized via Stage-1 and replicated 10× (100 Statements
+    /// total). Self-contained vs. loading `readings/core.md` — both
+    /// fixtures are permitted by handoff-297; the hand-rolled form
+    /// keeps the bench deterministic and free of readings I/O so
+    /// run-to-run variance reflects the chainer, not disk or parser
+    /// noise.
+    #[ignore = "perf benchmark; run with --ignored --nocapture"]
+    #[test]
+    fn bench_forward_chain_over_grammar_rules() {
+        use alloc::collections::BTreeSet;
+
+        // 1. Warm the grammar cache. First call builds `GRAMMAR_CACHE`;
+        //    `cached_grammar()` below then hits the warm cache.
+        let _ = parse_to_state_via_stage12("Customer is an entity type.")
+            .expect("grammar warm-up parse must succeed");
+        let (grammar_state, classifier_defs, classifier_antecedents, base_keys) =
+            cached_grammar().expect("grammar cache must be populated");
+
+        // 2. Synthetic statement state: 10 shapes × 10 instantiations.
+        //    Each instance gets a unique `s{n}` id so the chainer sees
+        //    100 distinct Statement facts.
+        let shapes: &[(&str, &[&str])] = &[
+            ("Customer is an entity type.",              &["Customer"]),
+            ("Priority is a value type.",                &["Priority"]),
+            ("Request is abstract.",                     &["Request"]),
+            ("Support Request is a subtype of Request.", &["Support Request", "Request"]),
+            ("Customer places Order.",                   &["Customer", "Order"]),
+            ("Order has Status.",                        &["Order", "Status"]),
+            ("Customer has Full Name *.",                &["Customer", "Full Name"]),
+            ("Each Customer places at most one Order.",  &["Customer", "Order"]),
+            ("Category has parent Category is acyclic.", &["Category"]),
+            ("Person loves Person is symmetric.",        &["Person"]),
+        ];
+        const STMT_COUNT: usize = 100;
+        let mut stmt_cells: HashMap<String, Vec<Object>> = HashMap::new();
+        let mut noun_set: BTreeSet<String> = BTreeSet::new();
+        for (i, (text, nouns)) in shapes.iter().cycle().take(STMT_COUNT).enumerate() {
+            let sid = format!("s{}", i);
+            let owned: Vec<String> = nouns.iter().map(|s| s.to_string()).collect();
+            for (k, v) in tokenize_statement(&sid, text, &owned) {
+                stmt_cells.entry(k).or_default().extend(v);
+            }
+            noun_set.extend(owned);
+        }
+        // Seed the Noun cell to match `stage1_state`'s pattern —
+        // classifier rules don't read it directly, but it nudges the
+        // merged state closer to real workload shape.
+        let noun_facts: Vec<Object> = noun_set.iter()
+            .map(|n| fact_from_pairs(&[("name", n.as_str()), ("objectType", "entity")]))
+            .collect();
+        stmt_cells.insert("Noun".to_string(), noun_facts);
+        let stmt_state = Object::Map(stmt_cells.into_iter()
+            .map(|(k, v)| (k, Object::Seq(v.into())))
+            .collect());
+
+        // 3. Merge with cached grammar — same shape `classify_statements`
+        //    builds internally.
+        let merged = crate::ast::merge_states(&stmt_state, grammar_state);
+
+        // (&name, &func, Some(&antecedent_cells)) slice the semi-naive
+        // chainer wants.
+        let deriv: Vec<(&str, &crate::ast::Func, Option<&[String]>)> = classifier_defs.iter()
+            .zip(classifier_antecedents.iter())
+            .map(|((n, f), a)| (n.as_str(), f, Some(a.as_slice())))
+            .collect();
+
+        // base_keys for the merged state: cached grammar keys plus
+        // statement-side keys. Matches `classify_statements` wiring —
+        // skipping this would have the chainer re-hash ~4000 grammar
+        // facts per iteration, masking the signal we want to measure.
+        let stmt_keys = crate::evaluate::state_keys(&stmt_state);
+        let mut combined_keys = base_keys.clone();
+        combined_keys.extend(stmt_keys.into_iter());
+
+        // Round-2 active-def count: with a single round-1 write to
+        // `Statement_has_Classification`, only rules whose antecedents
+        // list that cell survive the semi-naive filter in round 2.
+        let round2_active = classifier_antecedents.iter()
+            .filter(|cells| cells.iter().any(|c| c == "Statement_has_Classification"))
+            .count();
+
+        // 4. Hot loop.
+        const N: usize = 50;
+        let t0 = std::time::Instant::now();
+        let mut last_derived = 0usize;
+        for _ in 0..N {
+            let (_, derived) = crate::evaluate::forward_chain_defs_state_semi_naive_with_base_keys(
+                &deriv, &merged, 2, Some(combined_keys.clone()));
+            last_derived = derived.len();
+        }
+        let elapsed = t0.elapsed();
+
+        // 5. Perf report (stderr via eprintln so `--nocapture` prints it).
+        let mean_ns = elapsed.as_nanos() as f64 / N as f64;
+        eprintln!(
+            "bench_forward_chain_over_grammar_rules: \
+             {} iters over {} statements in {:?} | \
+             mean {:.3} ms/call ({:.0} ns) | \
+             {} candidates derived per call | \
+             active defs: round 1 = {}, round 2 = {}",
+            N, STMT_COUNT, elapsed,
+            mean_ns / 1_000_000.0, mean_ns,
+            last_derived,
+            deriv.len(), round2_active);
+    }
+
 }
