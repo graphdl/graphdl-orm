@@ -207,6 +207,190 @@ describe('arestQueryBridge — SSE → queryClient.invalidateQueries', () => {
   })
 })
 
+describe('arestQueryBridge — sequence-number replay and reconnect', () => {
+  beforeEach(() => {
+    MockEventSource.instances = []
+    vi.stubGlobal('EventSource', MockEventSource)
+  })
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    vi.useRealTimers()
+  })
+
+  it('getLastSequence tracks the highest observed sequence number', async () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const bridge = createArestQueryBridge({
+      baseUrl: 'https://ui.auto.dev/arest',
+      domain: 'organizations',
+      queryClient,
+    })
+    expect(bridge.getLastSequence()).toBeNull()
+
+    MockEventSource.instances[0].emit({
+      domain: 'organizations', noun: 'Organization', entityId: 'a',
+      operation: 'create', facts: {}, timestamp: 0, sequence: 7, cellKey: 'Organization:a',
+    })
+    expect(bridge.getLastSequence()).toBe(7)
+
+    // Out-of-order late delivery mustn't rewind the cursor.
+    MockEventSource.instances[0].emit({
+      domain: 'organizations', noun: 'Organization', entityId: 'a',
+      operation: 'update', facts: {}, timestamp: 0, sequence: 3, cellKey: 'Organization:a',
+    })
+    expect(bridge.getLastSequence()).toBe(7)
+
+    MockEventSource.instances[0].emit({
+      domain: 'organizations', noun: 'Organization', entityId: 'a',
+      operation: 'update', facts: {}, timestamp: 0, sequence: 12, cellKey: 'Organization:a',
+    })
+    expect(bridge.getLastSequence()).toBe(12)
+    bridge.close()
+  })
+
+  it('reopens EventSource with ?lastSequence=<N> after onerror', async () => {
+    vi.useFakeTimers()
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const bridge = createArestQueryBridge({
+      baseUrl: 'https://ui.auto.dev/arest',
+      domain: 'organizations',
+      queryClient,
+      reconnect: { initialDelayMs: 10, maxDelayMs: 100 },
+    })
+
+    MockEventSource.instances[0].emit({
+      domain: 'organizations', noun: 'Organization', entityId: 'a',
+      operation: 'create', facts: {}, timestamp: 0, sequence: 5, cellKey: 'Organization:a',
+    })
+    expect(bridge.getLastSequence()).toBe(5)
+
+    // Simulate a dropped connection.
+    MockEventSource.instances[0].onerror?.(new Event('error'))
+    expect(MockEventSource.instances[0].closed).toBe(true)
+
+    // Advance the reconnect timer; a new EventSource should open.
+    await vi.advanceTimersByTimeAsync(15)
+    expect(MockEventSource.instances).toHaveLength(2)
+
+    const replayUrl = new URL(MockEventSource.instances[1].url)
+    expect(replayUrl.searchParams.get('domain')).toBe('organizations')
+    expect(replayUrl.searchParams.get('lastSequence')).toBe('5')
+    bridge.close()
+  })
+
+  it('backs off exponentially and caps at maxDelayMs', async () => {
+    vi.useFakeTimers()
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const bridge = createArestQueryBridge({
+      baseUrl: 'https://ui.auto.dev/arest',
+      domain: 'organizations',
+      queryClient,
+      reconnect: { initialDelayMs: 10, maxDelayMs: 40 },
+    })
+
+    // First error -> 10ms delay
+    MockEventSource.instances[0].onerror?.(new Event('error'))
+    await vi.advanceTimersByTimeAsync(10)
+    expect(MockEventSource.instances).toHaveLength(2)
+    // Second error -> 20ms
+    MockEventSource.instances[1].onerror?.(new Event('error'))
+    await vi.advanceTimersByTimeAsync(20)
+    expect(MockEventSource.instances).toHaveLength(3)
+    // Third error -> 40ms (40ms cap reached, not 80ms)
+    MockEventSource.instances[2].onerror?.(new Event('error'))
+    await vi.advanceTimersByTimeAsync(40)
+    expect(MockEventSource.instances).toHaveLength(4)
+    // Fourth error -> still 40ms (at cap)
+    MockEventSource.instances[3].onerror?.(new Event('error'))
+    await vi.advanceTimersByTimeAsync(40)
+    expect(MockEventSource.instances).toHaveLength(5)
+    bridge.close()
+  })
+
+  it('close() cancels any pending reconnect timer', async () => {
+    vi.useFakeTimers()
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const bridge = createArestQueryBridge({
+      baseUrl: 'https://ui.auto.dev/arest',
+      domain: 'organizations',
+      queryClient,
+      reconnect: { initialDelayMs: 100, maxDelayMs: 200 },
+    })
+
+    MockEventSource.instances[0].onerror?.(new Event('error'))
+    bridge.close()
+    // Even after the reconnect delay elapses, no new EventSource opens.
+    await vi.advanceTimersByTimeAsync(500)
+    expect(MockEventSource.instances).toHaveLength(1)
+  })
+})
+
+describe('arestQueryBridge — schema-compile invalidation', () => {
+  beforeEach(() => {
+    MockEventSource.instances = []
+    vi.stubGlobal('EventSource', MockEventSource)
+  })
+  afterEach(() => { vi.unstubAllGlobals() })
+
+  it('invalidates ["arest","openapi"] on an event with operation=compile', async () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const realInvalidate = queryClient.invalidateQueries.bind(queryClient)
+    const spy = vi.fn((...args) => realInvalidate(...args))
+    ;(queryClient as unknown as { invalidateQueries: unknown }).invalidateQueries = spy
+
+    const bridge = createArestQueryBridge({
+      baseUrl: 'https://ui.auto.dev/arest',
+      domain: 'organizations',
+      queryClient,
+    })
+    MockEventSource.instances[0].emit({
+      domain: 'organizations',
+      // A compile event's noun is the entity noun being recompiled.
+      noun: 'Schema',
+      entityId: 'organizations',
+      // We treat operation === 'compile' as a schema-level event.
+      operation: 'compile' as unknown as 'create',
+      facts: {},
+      timestamp: Date.now(),
+      sequence: 100,
+      cellKey: 'Schema:organizations',
+    })
+    await new Promise((r) => setTimeout(r, 10))
+    const calls = (spy.mock.calls as unknown[][]).map((c) => c[0])
+    expect(calls).toContainEqual(expect.objectContaining({ queryKey: ['arest', 'openapi'] }))
+    // Entity-level list shouldn't be invalidated for a compile event.
+    expect(calls).not.toContainEqual(expect.objectContaining({ queryKey: ['arest', 'list', 'schemas'] }))
+    bridge.close()
+  })
+
+  it('invalidateSchemaOnCompile=false suppresses the compile-event override', async () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const realInvalidate = queryClient.invalidateQueries.bind(queryClient)
+    const spy = vi.fn((...args) => realInvalidate(...args))
+    ;(queryClient as unknown as { invalidateQueries: unknown }).invalidateQueries = spy
+
+    const bridge = createArestQueryBridge({
+      baseUrl: 'https://ui.auto.dev/arest',
+      domain: 'organizations',
+      queryClient,
+      invalidateSchemaOnCompile: false,
+    })
+    MockEventSource.instances[0].emit({
+      domain: 'organizations',
+      noun: 'Schema',
+      entityId: 'x',
+      operation: 'compile' as unknown as 'create',
+      facts: {},
+      timestamp: 0,
+      sequence: 1,
+      cellKey: 'Schema:x',
+    })
+    await new Promise((r) => setTimeout(r, 10))
+    const calls = (spy.mock.calls as unknown[][]).map((c) => c[0])
+    expect(calls).not.toContainEqual(expect.objectContaining({ queryKey: ['arest', 'openapi'] }))
+    bridge.close()
+  })
+})
+
 describe('arestQueryBridge integration — create then list auto-refreshes', () => {
   beforeEach(() => {
     MockEventSource.instances = []
