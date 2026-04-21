@@ -8,6 +8,14 @@
  * polling: mutate through the dataProvider, the worker broadcasts,
  * every connected tab refreshes within the 500ms budget.
  *
+ * Sequence-number replay (whitepaper Corollary 4 — constraint
+ * consensus from a deterministic event log requires continuity of
+ * the stream): the bridge tracks the last seen CellEvent.sequence
+ * and, on reconnect, re-opens the EventSource with
+ * `?lastSequence=<N>` so the worker replays events > N. Without
+ * this, missed events during a network blip would silently
+ * desynchronise the client's cache from the authoritative state.
+ *
  * Key scheme (see createArestQueryKeys):
  *   list       : ['arest', 'list',      resource]
  *   list(args) : ['arest', 'list',      resource, args]
@@ -15,14 +23,9 @@
  *   reference  : ['arest', 'reference', resource, target, targetId]
  *
  * Invalidation strategy on a CellEvent:
- *   - The affected noun -> slug becomes the resource key.
  *   - `['arest', 'list', resource]`                (prefix match)
  *   - `['arest', 'one',  resource, entityId]`      (exact)
  *   - `['arest', 'reference', resource]`           (prefix, conservative)
- *
- * We intentionally over-invalidate references — TanStack Query's
- * prefix match on `queryKey` means callers only re-fetch what they
- * have observers on, so the cost is bounded.
  */
 import type { QueryClient, QueryKey } from '@tanstack/react-query'
 
@@ -103,11 +106,28 @@ export interface ArestQueryBridgeOptions {
    * not. Useful to wire metrics; no-op by default.
    */
   onEvent?: (event: CellEventPayload | null, raw: string) => void
+  /**
+   * Reconnect backoff (ms). Tests override to keep test wall-time
+   * short; production defaults are `initial: 1000, max: 30000`.
+   */
+  reconnect?: { initialDelayMs?: number; maxDelayMs?: number }
+  /**
+   * When true, the bridge additionally invalidates the OpenAPI
+   * schema query on any event whose operation is 'compile' (schema
+   * mutation). Lets useArestResources / useOpenApiSchema react to
+   * compile events without a full page reload. Defaults to true.
+   */
+  invalidateSchemaOnCompile?: boolean
 }
 
 export interface ArestQueryBridge {
   /** Tear down the EventSource and stop invalidating. */
   close(): void
+  /**
+   * The last sequence number the bridge has observed. Resets on a
+   * successful reconnect-and-replay. Exposed for tests / metrics.
+   */
+  getLastSequence(): number | null
 }
 
 export function createArestQueryBridge(
@@ -115,6 +135,7 @@ export function createArestQueryBridge(
 ): ArestQueryBridge {
   const { baseUrl, domain, queryClient } = options
   const EventSourceCtor = options.EventSource ?? globalThis.EventSource
+  const invalidateSchemaOnCompile = options.invalidateSchemaOnCompile ?? true
 
   if (typeof EventSourceCtor !== 'function') {
     throw new Error('arestQueryBridge: EventSource is not available in this environment')
@@ -125,11 +146,28 @@ export function createArestQueryBridge(
   const workerRoot = trimmed.endsWith('/arest')
     ? trimmed.slice(0, -'/arest'.length)
     : trimmed
-  const eventsUrl = `${workerRoot}/api/events?domain=${encodeURIComponent(domain)}`
 
-  const source = new EventSourceCtor(eventsUrl, { withCredentials: true })
+  const initialBackoffMs = options.reconnect?.initialDelayMs ?? 1000
+  const maxBackoffMs = options.reconnect?.maxDelayMs ?? 30_000
 
-  source.onmessage = (msg: MessageEvent) => {
+  let lastSequence: number | null = null
+  let source: InstanceType<typeof EventSourceCtor> | null = null
+  let closed = false
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null
+  let currentBackoff = initialBackoffMs
+
+  function buildUrl(): string {
+    const params = new URLSearchParams({ domain })
+    // Replay: ask the worker for every event strictly after the last
+    // one we successfully processed. If the worker doesn't know this
+    // query param, it'll ignore it and stream normally.
+    if (lastSequence !== null) {
+      params.set('lastSequence', String(lastSequence))
+    }
+    return `${workerRoot}/api/events?${params.toString()}`
+  }
+
+  function handleMessage(msg: MessageEvent): void {
     const raw = typeof msg.data === 'string' ? msg.data : ''
     let parsed: unknown
     try { parsed = JSON.parse(raw) } catch { parsed = null }
@@ -140,28 +178,77 @@ export function createArestQueryBridge(
     }
 
     options.onEvent?.(parsed, raw)
+    // Track sequence monotonically — out-of-order events (late
+    // deliveries) shouldn't rewind the replay cursor.
+    if (typeof parsed.sequence === 'number' && (lastSequence === null || parsed.sequence > lastSequence)) {
+      lastSequence = parsed.sequence
+    }
+
     const resource = nounToSlug(parsed.noun)
+
+    // Schema compile events invalidate the OpenAPI doc so the
+    // resource list + per-noun schema re-fetch without a page
+    // reload. The worker emits these with operation === 'compile'
+    // (see compile.rs in the compile pipeline).
+    if (invalidateSchemaOnCompile && (parsed.operation as string) === 'compile') {
+      queryClient.invalidateQueries({ queryKey: ['arest', 'openapi'] })
+      return
+    }
 
     // Prefix-invalidate the list so ['arest', 'list', resource, { ... }]
     // variants also refetch when there's an observer.
     queryClient.invalidateQueries({ queryKey: ['arest', 'list', resource] })
-
     // Exact-invalidate the specific entity's one-query.
     queryClient.invalidateQueries({ queryKey: ['arest', 'one', resource, parsed.entityId] })
-
     // Conservative: invalidate any reference queries that depend on
-    // this resource. The prefix match bounds the blast radius to
-    // queries that actually observe it.
+    // this resource.
     queryClient.invalidateQueries({ queryKey: ['arest', 'reference', resource] })
+
+    // Successful event receipt resets the backoff — reconnect now
+    // happens quickly next time the socket breaks.
+    currentBackoff = initialBackoffMs
   }
 
-  source.onerror = () => {
-    // EventSource auto-reconnects by default — onerror fires during
-    // reconnect attempts too. We deliberately don't close the stream
-    // here; the caller's close() is the authoritative teardown.
+  function open(): void {
+    if (closed) return
+    const url = buildUrl()
+    const s = new EventSourceCtor(url, { withCredentials: true })
+    source = s
+    s.onmessage = handleMessage
+    s.onerror = () => {
+      // EventSource's native reconnect doesn't carry `lastSequence`,
+      // so we close the browser's auto-reconnect and reopen
+      // ourselves with the current cursor.
+      s.close()
+      if (closed) return
+      scheduleReconnect()
+    }
   }
+
+  function scheduleReconnect(): void {
+    if (closed || reconnectTimer !== null) return
+    const delay = currentBackoff
+    currentBackoff = Math.min(maxBackoffMs, currentBackoff * 2)
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null
+      open()
+    }, delay)
+  }
+
+  open()
 
   return {
-    close() { source.close() },
+    close() {
+      closed = true
+      if (reconnectTimer !== null) {
+        clearTimeout(reconnectTimer)
+        reconnectTimer = null
+      }
+      if (source) {
+        source.close()
+        source = null
+      }
+    },
+    getLastSequence() { return lastSequence },
   }
 }
