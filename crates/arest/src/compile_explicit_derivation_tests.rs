@@ -23,7 +23,7 @@
 use crate::ast::{self, Func, Object};
 use crate::compile;
 use crate::parse_forml2::parse_to_state;
-use crate::types::{AntecedentSource, ConsequentCellSource, DerivationRuleDef};
+use crate::types::{ConsequentCellSource, DerivationRuleDef};
 
 /// Parse a self-contained reading, return the sole derivation rule and
 /// its compiled Func. Panics with a legible message if the reading
@@ -206,6 +206,73 @@ Vehicle has Transit Category.
     assert!(
         bindings.iter().any(|(k, v)| k == "Transit_Category" && v == "heavy"),
         "expected Transit_Category='heavy', got {:#?}", bindings,
+    );
+}
+
+// ─── Category 5: Arithmetic in RHS ──────────────────────────────────
+//
+// Shape: `* X has R iff X has A and R is <arith-expr over A>` — the
+// consequent role R is defined by an arithmetic expression on the
+// antecedent fact's role values. Routes through
+// `compile_explicit_derivation`'s 1-antecedent branch where
+// `consequent_computed_bindings` is non-empty, the bindings function
+// `Concat · [Id, computed_pairs]` appends the computed pair to the
+// inherited antecedent bindings.
+//
+// compile_arith_expr resolves RoleRef by looking up the role on the
+// single antecedent FT, so all referenced roles must exist on the
+// same FT. The multi-antecedent N≥2 branch doesn't apply arith, so
+// this shape is specifically for single-antecedent rules.
+
+#[test]
+fn shape_arithmetic_in_rhs_computes_consequent_role() {
+    let src = r#"# Test
+Order(.OrderId) is an entity type.
+OrderId is a value type.
+Subtotal is a value type.
+Total is a value type.
+
+## Fact Types
+Order has OrderId.
+Order has Subtotal.
+Order has Total.
+
+## Derivation Rules
+* Order has Total iff Order has Subtotal and Total is Subtotal + Subtotal.
+"#;
+    let (rule, func) = parse_and_compile(src);
+
+    // Shape: single antecedent; consequent_computed_bindings populated
+    // with the Total = Subtotal + Subtotal expression; role literals
+    // empty (the other literal-pinning path isn't used here).
+    match &rule.consequent_cell {
+        ConsequentCellSource::Literal(id) => assert!(!id.is_empty()),
+        other => panic!("expected Literal(..), got {:?}", other),
+    }
+    assert_eq!(rule.antecedent_sources.len(), 1);
+    assert!(rule.consequent_role_literals.is_empty(),
+        "no literal-pin expected for arith rule, got {:#?}", rule.consequent_role_literals);
+    assert_eq!(rule.consequent_computed_bindings.len(), 1,
+        "one computed binding expected, got {:#?}", rule.consequent_computed_bindings);
+    let cb = &rule.consequent_computed_bindings[0];
+    assert_eq!(cb.role, "Total");
+
+    // Eval: Subtotal=50 → Total=100 (50 + 50). Arith primitives parse
+    // the atoms as f64; the formatter turns integers back into
+    // atom strings without a ".0" suffix.
+    let out = apply_to_facts(&func, &[
+        ("Order_has_Subtotal", &[("Order", "ord-1"), ("Subtotal", "50")]),
+    ]);
+    let derived = decode_derived(&out);
+    assert_eq!(derived.len(), 1, "one derived fact expected, got {:#?}", derived);
+    let (_ft, _reading, bindings) = &derived[0];
+    assert!(
+        bindings.iter().any(|(k, v)| k == "Total" && v == "100"),
+        "expected Total=100, got {:#?}", bindings,
+    );
+    assert!(
+        bindings.iter().any(|(k, v)| k == "Order" && v == "ord-1"),
+        "antecedent Order binding must propagate, got {:#?}", bindings,
     );
 }
 
