@@ -2379,13 +2379,6 @@ fn extract_declared_noun_names(text: &str) -> Vec<String> {
 }
 
 #[cfg(feature = "std-deps")]
-fn cells_to_object(cells: HashMap<String, Vec<Object>>) -> Object {
-    let map: HashMap<String, Object> = cells.into_iter()
-        .map(|(k, v)| (k, Object::Seq(v.into())))
-        .collect();
-    Object::Map(map)
-}
-
 #[cfg(all(test, feature = "std-deps"))]
 mod tests {
     use super::*;
@@ -3185,142 +3178,14 @@ mod tests {
             "expected (Dog, Animal) in Subtype cell; got {:?}", pairs);
     }
 
-    /// Report set-difference by a hashable key over two cells. Prints
-    /// the missing and extra keys to stderr and returns their counts
-    /// so the caller can bound them.
-    fn diff_by_key<F>(
-        label: &str,
-        legacy: &Object,
-        stage12: &Object,
-        cell_name: &str,
-        key_of: F,
-    ) -> (usize, usize)
-    where
-        F: Fn(&Object) -> Option<String>,
-    {
-        use alloc::collections::BTreeSet;
-        let keys_from = |obj: &Object| -> BTreeSet<String> {
-            fetch_or_phi(cell_name, obj)
-                .as_seq()
-                .map(|facts| facts.iter().filter_map(&key_of).collect())
-                .unwrap_or_default()
-        };
-        let a = keys_from(legacy);
-        let b = keys_from(stage12);
-        let missing: Vec<&String> = a.difference(&b).collect();
-        let extra: Vec<&String> = b.difference(&a).collect();
-        if !missing.is_empty() {
-            eprintln!("  [{}] missing from stage12 ({}): {:?}",
-                label, missing.len(), missing);
-        }
-        if !extra.is_empty() {
-            eprintln!("  [{}] extra in stage12 ({}): {:?}",
-                label, extra.len(), extra);
-        }
-        (missing.len(), extra.len())
-    }
-
-    /// Diff the canonical metamodel cells between legacy and stage12
-    /// pipelines. Returns (total_missing, total_extra).
-    fn diff_cells(reading_name: &str, text: &str) -> (usize, usize) {
-        let legacy = crate::parse_forml2::parse_to_state(text)
-            .expect("legacy parse");
-        let stage12 = super::parse_to_state_via_stage12(text)
-            .expect("stage12 parse");
-
-        eprintln!("--- {} ---", reading_name);
-        let mut m = 0;
-        let mut x = 0;
-        let (dm, dx) = diff_by_key("Noun", &legacy, &stage12, "Noun",
-            |f| binding(f, "name").map(String::from));
-        m += dm; x += dx;
-        let (dm, dx) = diff_by_key("Subtype", &legacy, &stage12, "Subtype",
-            |f| Some(alloc::format!("{}<:{}",
-                binding(f, "subtype")?, binding(f, "supertype")?)));
-        m += dm; x += dx;
-        let (dm, dx) = diff_by_key("FactType", &legacy, &stage12, "FactType",
-            |f| binding(f, "id").map(String::from));
-        m += dm; x += dx;
-        let (dm, dx) = diff_by_key("Role", &legacy, &stage12, "Role",
-            |f| Some(alloc::format!("{}/{}#{}",
-                binding(f, "factType")?,
-                binding(f, "nounName")?,
-                binding(f, "position")?)));
-        m += dm; x += dx;
-        let (dm, dx) = diff_by_key("Constraint", &legacy, &stage12, "Constraint",
-            |f| binding(f, "id").map(String::from));
-        m += dm; x += dx;
-        let (dm, dx) = diff_by_key("DerivationRule", &legacy, &stage12, "DerivationRule",
-            |f| binding(f, "id").map(String::from));
-        m += dm; x += dx;
-        let (dm, dx) = diff_by_key("InstanceFact", &legacy, &stage12, "InstanceFact",
-            |f| Some(alloc::format!("{}.{} = {}.{}",
-                binding(f, "subjectNoun").unwrap_or(""),
-                binding(f, "subjectValue").unwrap_or(""),
-                binding(f, "fieldName").unwrap_or(""),
-                binding(f, "objectValue").unwrap_or(""))));
-        m += dm; x += dx;
-        let (dm, dx) = diff_by_key("EnumValues", &legacy, &stage12, "EnumValues",
-            |f| binding(f, "noun").map(String::from));
-        m += dm; x += dx;
-        (m, x)
-    }
-
-    /// Report the full per-cell diff for readings/core.md. This test
-    /// is expected to SHOW real gaps — it prints them and records
-    /// current totals in assertions so regressions (new gaps) fail.
+    /// Structural parity check for the organization_with_slug fixture.
+    /// Noun / FactType / Role / Subtype match byte-for-byte; Constraint
+    /// cells carry a legacy-only `json` NORMA-blob binding that
+    /// stage12 intentionally drops (the key metadata — id / kind /
+    /// modality / text / span0_* / span1_* — is preserved on both
+    /// sides), so the Constraint assertion checks those bindings
+    /// individually instead of full equality.
     #[test]
-    #[ignore = "diagnostic: prints gaps, not yet zero"]
-    fn diff_core_md_legacy_vs_stage12() {
-        let core = include_str!("../../../readings/core.md");
-        let (missing, extra) = diff_cells("core.md", core);
-        eprintln!("core.md totals — missing: {}, extra: {}", missing, extra);
-    }
-
-    /// Per-call overhead benchmark: legacy vs stage12 on a small fixture
-    /// and on core.md. Used to gauge whether `parse_to_state` can safely
-    /// delegate to stage12 for #285 wire-up.
-    #[test]
-    #[ignore = "perf diagnostic: times stage12 vs legacy per call"]
-    fn perf_legacy_vs_stage12_per_call() {
-        use std::time::Instant;
-        let small = "Entity type Person called Person.\nEach Person has at most one Name.\n";
-        let core = include_str!("../../../readings/core.md");
-
-        // Warm caches: first stage12 call parses the grammar.
-        let _ = super::parse_to_state_via_stage12(small).expect("warm");
-
-        let iters = 20usize;
-        let t0 = Instant::now();
-        for _ in 0..iters {
-            let _ = crate::parse_forml2::parse_to_state_legacy(small).expect("legacy");
-        }
-        let legacy_small = t0.elapsed();
-
-        let t0 = Instant::now();
-        for _ in 0..iters {
-            let _ = super::parse_to_state_via_stage12(small).expect("s12");
-        }
-        let s12_small = t0.elapsed();
-
-        let t0 = Instant::now();
-        let _ = crate::parse_forml2::parse_to_state_legacy(core).expect("legacy core");
-        let legacy_core = t0.elapsed();
-
-        let t0 = Instant::now();
-        let _ = super::parse_to_state_via_stage12(core).expect("s12 core");
-        let s12_core = t0.elapsed();
-
-        eprintln!("small ({} iters): legacy {:?} / stage12 {:?} — ratio {:.2}x",
-            iters, legacy_small, s12_small,
-            s12_small.as_nanos() as f64 / legacy_small.as_nanos() as f64);
-        eprintln!("core.md (single): legacy {:?} / stage12 {:?} — ratio {:.2}x",
-            legacy_core, s12_core,
-            s12_core.as_nanos() as f64 / legacy_core.as_nanos() as f64);
-    }
-
-    #[test]
-    #[ignore = "diagnostic: diff stage12 vs legacy for organization_with_slug fixture"]
     fn diff_organization_fixture() {
         let src = "\
             Organization(.Slug) is an entity type.\n\
@@ -3329,80 +3194,25 @@ mod tests {
               Each Organization has exactly one Slug.\n";
         let legacy = crate::parse_forml2::parse_to_state_legacy(src).expect("legacy");
         let stage12 = super::parse_to_state_via_stage12(src).expect("stage12");
-        for name in &["Noun", "FactType", "Role", "Subtype", "Constraint"] {
-            eprintln!("--- {} ---", name);
-            eprintln!("legacy: {:?}", fetch_or_phi(name, &legacy));
-            eprintln!("stage12: {:?}", fetch_or_phi(name, &stage12));
+        for name in &["Noun", "FactType", "Role", "Subtype"] {
+            assert_eq!(fetch_or_phi(name, &legacy), fetch_or_phi(name, &stage12),
+                "cell {} diverged between legacy and stage12", name);
         }
+        // Constraint: compare only the stable key bindings.
+        let stable = ["id", "kind", "modality", "text",
+            "span0_factTypeId", "span0_roleIndex",
+            "span1_factTypeId", "span1_roleIndex"];
+        let bindings_of = |obj: &Object| -> Vec<Vec<(String, String)>> {
+            fetch_or_phi("Constraint", obj).as_seq().map(|facts| {
+                facts.iter().map(|f| {
+                    stable.iter().filter_map(|k|
+                        binding(f, k).map(|v| ((*k).to_string(), v.to_string())))
+                        .collect()
+                }).collect()
+            }).unwrap_or_default()
+        };
+        assert_eq!(bindings_of(&legacy), bindings_of(&stage12),
+            "Constraint stable bindings diverged between legacy and stage12");
     }
 
-    #[test]
-    #[ignore = "diagnostic: probe conditional ring statements in core.md"]
-    fn dump_subtype_if_then_classifications() {
-        let core = include_str!("../../../readings/core.md");
-        let stage12 = super::parse_to_state_via_stage12(core).expect("stage12");
-        let texts = fetch_or_phi("Statement_has_Text", &stage12);
-        let Some(txt_seq) = texts.as_seq() else {
-            eprintln!("no Statement_has_Text cell"); return;
-        };
-        let total = txt_seq.len();
-        let if_count = txt_seq.iter()
-            .filter(|f| binding(f, "Text").map(|t| t.starts_with("If ")).unwrap_or(false))
-            .count();
-        eprintln!("total Statement_has_Text entries: {}", total);
-        eprintln!("entries starting with `If `: {}", if_count);
-        for f in txt_seq.iter()
-            .filter(|f| binding(f, "Text").map(|t| t.starts_with("If Noun")).unwrap_or(false))
-        {
-            let stmt_id = binding(f, "Statement").unwrap_or("?");
-            let text = binding(f, "Text").unwrap_or("?");
-            let kinds = classifications_for(&stage12, stmt_id);
-            let declared = super::declared_noun_names(&stage12);
-            let ring = super::conditional_ring_kind(text, &declared);
-            eprintln!("{}: kinds={:?} ring={:?}", stmt_id, kinds, ring);
-            eprintln!("  text: {}", text);
-        }
-    }
-
-    #[test]
-    #[ignore = "diagnostic: prints FactType id diff"]
-    fn dump_fact_type_ids_core_md() {
-        let core = include_str!("../../../readings/core.md");
-        let legacy = crate::parse_forml2::parse_to_state(core).expect("legacy");
-        let stage12 = super::parse_to_state_via_stage12(core).expect("stage12");
-        let ids_from = |obj: &Object| -> alloc::collections::BTreeSet<String> {
-            fetch_or_phi("FactType", obj).as_seq()
-                .map(|facts| facts.iter()
-                    .filter_map(|f| binding(f, "id").map(String::from))
-                    .collect())
-                .unwrap_or_default()
-        };
-        let l = ids_from(&legacy);
-        let s = ids_from(&stage12);
-        eprintln!("== legacy-only FactType ids ==");
-        for t in l.difference(&s) { eprintln!("  {}", t); }
-        eprintln!("== stage12-only FactType ids ==");
-        for t in s.difference(&l) { eprintln!("  {}", t); }
-    }
-
-    #[test]
-    #[ignore = "diagnostic: prints derivation-rule texts side by side"]
-    fn dump_derivation_rule_texts_core_md() {
-        let core = include_str!("../../../readings/core.md");
-        let legacy = crate::parse_forml2::parse_to_state(core).expect("legacy");
-        let stage12 = super::parse_to_state_via_stage12(core).expect("stage12");
-        let texts_from = |obj: &Object| -> alloc::collections::BTreeSet<String> {
-            fetch_or_phi("DerivationRule", obj).as_seq()
-                .map(|facts| facts.iter()
-                    .filter_map(|f| binding(f, "text").map(String::from))
-                    .collect())
-                .unwrap_or_default()
-        };
-        let l = texts_from(&legacy);
-        let s = texts_from(&stage12);
-        eprintln!("== legacy-only DerivationRule texts ==");
-        for t in l.difference(&s) { eprintln!("  {}", t); }
-        eprintln!("== stage12-only DerivationRule texts ==");
-        for t in s.difference(&l) { eprintln!("  {}", t); }
-    }
 }
