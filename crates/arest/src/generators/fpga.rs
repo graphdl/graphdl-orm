@@ -13,7 +13,7 @@
 // reset release. FP style: fold/map only, no for loops, no control-flow ifs.
 
 use crate::ast::{binding, fetch_or_phi, Object};
-use crate::rmap::{self, TableDef};
+use crate::rmap::{self, ColumnView};
 #[allow(unused_imports)]
 use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 
@@ -36,10 +36,10 @@ pub fn compile_to_verilog(state: &Object) -> String {
                   // Backus FP combining forms synthesize to parallel hardware\n\n";
 
     let nouns = fetch_or_phi("Noun", state);
-    // Compute RMAP tables for column-derived ports.
-    let tables = rmap::rmap_from_state(state);
-    let table_map: hashbrown::HashMap<String, &TableDef> = tables.iter()
-        .map(|t| (t.name.clone(), t)).collect();
+    // Read RMAP as cells (#325): per-noun columns come from
+    // `columns_for_table` against an `rmap_cells_from_state` snapshot.
+    // No typed RMAP struct crosses the generator boundary.
+    let cells = rmap::rmap_cells_from_state(state);
 
     // Single pass: build each entity module and capture its top-
     // module wiring spec at the same time. The RMAP key is
@@ -58,13 +58,15 @@ pub fn compile_to_verilog(state: &Object) -> String {
             let Some(obj_type) = binding(n, "objectType") else { continue };
             if obj_type != "entity" { continue; }
             let name = name_str.to_string();
-            let table = table_map.get(&rmap::to_snake(&name));
-            let columns: Vec<(String, usize)> = table
-                .map(|t| t.columns.iter()
+            let cols = rmap::columns_for_table(&cells, &rmap::to_snake(&name));
+            let columns: Vec<(String, usize)> = if cols.is_empty() {
+                vec![("id_in".to_string(), 256)]
+            } else {
+                cols.iter()
                     .map(|c| (sanitize(&c.name), verilog_width_for(&c.col_type)))
-                    .collect())
-                .unwrap_or_else(|| vec![("id_in".to_string(), 256)]);
-            modules.push(emit_module(&name, table.map(|t| &t.columns)));
+                    .collect()
+            };
+            modules.push(emit_module(&name, &cols));
             entities.push((sanitize(&name), columns));
         }
     }
@@ -1833,33 +1835,32 @@ fn emit_top_module(
 /// Emit a Verilog module for an entity noun with RMAP-derived ports.
 /// Each RMAP column becomes a port: PK columns are inputs, others are
 /// input/output wires. If no RMAP table exists, emits a minimal shell.
-fn emit_module(name: &str, columns: Option<&Vec<rmap::TableColumn>>) -> String {
+fn emit_module(name: &str, columns: &[ColumnView]) -> String {
     let m = sanitize(name);
 
     // Build port declarations from RMAP columns.
-    let ports: Vec<String> = match columns {
-        Some(cols) if !cols.is_empty() => {
-            let mut p = vec![
-                "    input wire clk".to_string(),
-                "    input wire rst_n".to_string(),
-            ];
-            for col in cols {
-                let wire_name = sanitize(&col.name);
-                // Per-column width from the RMAP type (#187) — INTEGER
-                // → 32 bits, BIGINT → 64, TEXT → 256, etc. Replaces the
-                // pre-#187 blanket 256-bit default.
-                let width = verilog_width_for(&col.col_type);
-                p.push(format!("    input wire [{}:0] {}", width.saturating_sub(1), wire_name));
-            }
-            p.push("    output reg valid".to_string());
-            p
-        }
-        _ => vec![
+    let ports: Vec<String> = if columns.is_empty() {
+        vec![
             "    input wire clk".to_string(),
             "    input wire rst_n".to_string(),
             "    input wire [255:0] id_in".to_string(),
             "    output reg valid".to_string(),
-        ],
+        ]
+    } else {
+        let mut p = vec![
+            "    input wire clk".to_string(),
+            "    input wire rst_n".to_string(),
+        ];
+        for col in columns {
+            let wire_name = sanitize(&col.name);
+            // Per-column width from the RMAP type (#187) — INTEGER
+            // → 32 bits, BIGINT → 64, TEXT → 256, etc. Replaces the
+            // pre-#187 blanket 256-bit default.
+            let width = verilog_width_for(&col.col_type);
+            p.push(format!("    input wire [{}:0] {}", width.saturating_sub(1), wire_name));
+        }
+        p.push("    output reg valid".to_string());
+        p
     };
 
     format!(
