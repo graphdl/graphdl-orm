@@ -713,6 +713,83 @@ pub fn emit_citation_fact(
     (cite_id, final_state)
 }
 
+// ── Async Platform callback registry (#305 #2) ────────────────────
+//
+// Sibling to the sync registry below: hosts that want to register a
+// Platform body that actually does async work (HTTP fetch, a channel
+// send, waiting on a JS Promise) install via install_async_platform_fn
+// and invoke via apply_platform_async. The sync `apply_platform` path
+// is unchanged — the engine's synchronous reduction semantics are
+// preserved for every caller that doesn't explicitly opt into async.
+//
+// How it composes across runtimes:
+//
+// - Browser / Cloudflare Workers: host uses wasm-bindgen-futures to
+//   await apply_platform_async from a JS-facing async boundary. No
+//   blocking; the JS Promise returned to the host's framework resolves
+//   when the Rust future resolves.
+//
+// - Native std (server, CLI): host uses any executor (tokio,
+//   async-std, pollster) to drive apply_platform_async to completion
+//   and pass the result into a sync apply call or federated_ingest.
+//
+// - Pure no_std: no Future executor is available; async registry is
+//   compiled out via #[cfg(not(feature = "no_std"))].
+
+#[cfg(not(feature = "no_std"))]
+pub type AsyncPlatformFn = crate::sync::Arc<
+    dyn Fn(&Object, &Object) -> core::pin::Pin<alloc::boxed::Box<
+        dyn core::future::Future<Output = Object> + Send
+    >> + Send + Sync
+>;
+
+#[cfg(not(feature = "no_std"))]
+static ASYNC_PLATFORM_FALLBACK: crate::sync::OnceLock<
+    crate::sync::RwLock<HashMap<String, AsyncPlatformFn>>
+> = crate::sync::OnceLock::new();
+
+/// Install an async Platform body. apply_platform_async looks up here
+/// for names not covered by the sync registry below. The body returns
+/// a Pin<Box<dyn Future<Output = Object>>> — caller awaits to get the
+/// Object. Thread-safe; callers may re-install to replace the body.
+#[cfg(not(feature = "no_std"))]
+pub fn install_async_platform_fn(name: &str, f: AsyncPlatformFn) {
+    let reg = ASYNC_PLATFORM_FALLBACK
+        .get_or_init(|| crate::sync::RwLock::new(HashMap::new()));
+    reg.write().insert(name.to_string(), f);
+}
+
+/// Remove a previously-installed async Platform body.
+#[cfg(not(feature = "no_std"))]
+pub fn uninstall_async_platform_fn(name: &str) {
+    if let Some(reg) = ASYNC_PLATFORM_FALLBACK.get() {
+        reg.write().remove(name);
+    }
+}
+
+/// Async counterpart to `apply_platform` + `dispatch_platform_fallback`.
+/// Dispatch order:
+///   1. Async registry (install_async_platform_fn) — awaited.
+///   2. Sync registry (install_platform_fn) — returns immediately.
+///   3. Bottom.
+///
+/// Hardcoded `apply_platform` arms are not consulted here: they are
+/// already sync and accessible via `apply(Func::Platform(...), ...)`.
+/// This function is for the complement — names the engine doesn't
+/// ship a hardcoded body for.
+#[cfg(not(feature = "no_std"))]
+pub async fn apply_platform_async(name: &str, x: &Object, d: &Object) -> Object {
+    // Async fallback first — clone the Arc out of the lock so the
+    // guard's lifetime ends before the `.await`.
+    let async_fn = ASYNC_PLATFORM_FALLBACK.get()
+        .and_then(|reg| reg.read().get(name).cloned());
+    if let Some(f) = async_fn {
+        return f(x, d).await;
+    }
+    // Fall through to sync fallback.
+    dispatch_platform_fallback(name, x, d)
+}
+
 // ── Runtime Platform callback registry (#305 IoC/DI completion) ───
 //
 // apply_platform's hardcoded match only covers compile-derived names.
@@ -3773,6 +3850,83 @@ mod tests {
             let n = fetch(cell, &d2).as_seq().map(|s| s.len()).unwrap_or(0);
             assert_eq!(n, 1, "{cell} must stay at size 1 after idempotent re-emit; got {n}");
         }
+    }
+
+    // ── Async Platform registry (#305 #2) ──────────────────────
+    //
+    // Sibling to the sync registry: hosts that genuinely need async
+    // bodies (HTTP fetch, Promise-returning JS, channel sends) install
+    // via install_async_platform_fn. Sync callers go through the
+    // existing registry unchanged. The tests use a hand-rolled
+    // block_on so we don't pull in a Future executor as a dep.
+
+    /// Minimal busy-wait executor for test only — drives a Future to
+    /// completion by repeatedly polling with a dummy waker. Safe
+    /// because the futures under test are short-lived and complete
+    /// on the first poll in practice.
+    fn block_on<F: core::future::Future>(fut: F) -> F::Output {
+        use core::pin::pin;
+        use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(
+            |_| RawWaker::new(core::ptr::null(), &VTABLE),
+            |_| {}, |_| {}, |_| {},
+        );
+        let raw = RawWaker::new(core::ptr::null(), &VTABLE);
+        let waker = unsafe { Waker::from_raw(raw) };
+        let mut cx = Context::from_waker(&waker);
+        let mut f = pin!(fut);
+        loop {
+            match f.as_mut().poll(&mut cx) {
+                Poll::Ready(v) => return v,
+                Poll::Pending => core::hint::spin_loop(),
+            }
+        }
+    }
+
+    #[test]
+    fn apply_platform_async_dispatches_to_installed_async_body() {
+        install_async_platform_fn(
+            "e3_async_echo",
+            crate::sync::Arc::new(|x: &Object, _d: &Object| {
+                let cloned = x.clone();
+                alloc::boxed::Box::pin(async move { cloned })
+            }),
+        );
+        let out = block_on(apply_platform_async(
+            "e3_async_echo",
+            &Object::atom("hello"),
+            &Object::phi(),
+        ));
+        uninstall_async_platform_fn("e3_async_echo");
+        assert_eq!(out, Object::atom("hello"),
+            "async platform body must be awaited and return its Future's output");
+    }
+
+    #[test]
+    fn apply_platform_async_falls_through_to_sync_registry() {
+        install_platform_fn(
+            "e3_async_sync_fallback",
+            crate::sync::Arc::new(|x: &Object, _d: &Object| x.clone()),
+        );
+        let out = block_on(apply_platform_async(
+            "e3_async_sync_fallback",
+            &Object::atom("sync"),
+            &Object::phi(),
+        ));
+        uninstall_platform_fn("e3_async_sync_fallback");
+        assert_eq!(out, Object::atom("sync"),
+            "async dispatch must fall through to the sync registry when no async body is registered");
+    }
+
+    #[test]
+    fn apply_platform_async_returns_bottom_when_no_body_registered() {
+        let out = block_on(apply_platform_async(
+            "e3_async_nothing_registered",
+            &Object::atom("x"),
+            &Object::phi(),
+        ));
+        assert_eq!(out, Object::Bottom,
+            "name with no sync AND no async body must resolve to ⊥");
     }
 
     // ── Platform fallback registry (#305 IoC/DI completion) ────
