@@ -42,10 +42,23 @@ mod userspace;
 mod virtio;
 
 use alloc::string::ToString;
+use bootloader_api::config::{BootloaderConfig, Mapping};
 use bootloader_api::{BootInfo, entry_point};
 use core::panic::PanicInfo;
 
-entry_point!(kernel_main);
+// The default bootloader config leaves `physical_memory` unmapped,
+// which breaks `memory::init` (it needs `BootInfo::physical_memory_offset`
+// to be Some). Request dynamic mapping so the bootloader picks a
+// free virtual range for the full physical-memory window — this is
+// what the offset-page-table construction in memory.rs reads, and
+// what virtio::init_offset and every later subsystem depends on.
+pub static BOOTLOADER_CONFIG: BootloaderConfig = {
+    let mut cfg = BootloaderConfig::new_default();
+    cfg.mappings.physical_memory = Some(Mapping::Dynamic);
+    cfg
+};
+
+entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 
 /// Called by the bootloader the moment we land in 64-bit long mode.
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
