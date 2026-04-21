@@ -62,6 +62,27 @@ pub fn verify_signature(sender: &str, payload: &str, signature: &str) -> bool {
         && expected.as_bytes().ct_eq(signature.as_bytes()).into()
 }
 
+/// HMAC-SHA256 with a caller-supplied key. Returns the full 64-char
+/// lowercase-hex digest; callers that only need a shorter tag truncate
+/// the returned string (e.g. `[..16]` for a 64-bit tag, as Sec-4
+/// snapshot-id signing does).
+pub fn sign_with(key: &[u8], data: &[u8]) -> String {
+    let mut mac = HmacSha256::new_from_slice(key)
+        .expect("HMAC accepts any key length");
+    mac.update(data);
+    let result = mac.finalize().into_bytes();
+    result.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// Constant-time equality on two string slices. Length mismatch
+/// short-circuits to `false` (length is public; the early return is
+/// not timing-sensitive); equal-length compares go through
+/// `subtle::ct_eq` so partial-prefix matches don't leak timing.
+pub fn ct_eq_str(a: &str, b: &str) -> bool {
+    a.len() == b.len()
+        && bool::from(a.as_bytes().ct_eq(b.as_bytes()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
