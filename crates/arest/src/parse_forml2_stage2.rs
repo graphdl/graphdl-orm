@@ -350,6 +350,101 @@ fn fact_type_id_from_reading(reading: &str, roles: &[String]) -> String {
     parts.join("_")
 }
 
+/// Extract a synthetic FactType + its Roles from the body of an
+/// `It is possible that ...` possibility-override statement. Returns
+/// the FT fact (shaped like `translate_fact_types` output) plus a
+/// vec of Role facts, or `None` when the body doesn't look like a
+/// fact-type predicate.
+///
+/// Legacy emits these implicitly via its constraint-text scan. Stage-2
+/// does it explicitly here so `It is possible that more than one
+/// Noun has the same Alias.` registers a synthetic
+/// `Noun_has_the_same_Alias` FT alongside the two Role facts
+/// `(factType=Noun_has_the_same_Alias, nounName=Noun, position=0)`
+/// and `(factType=Noun_has_the_same_Alias, nounName=Alias,
+/// position=1)`.
+///
+/// `nouns` is the full declared-noun list. Longest-first matching
+/// drives role extraction, same as Stage-1 tokenisation.
+#[cfg(feature = "std-deps")]
+fn possibility_synthetic_fact_type(
+    body: &str,
+    nouns: &[String],
+) -> Option<(Object, Vec<Object>)> {
+    // Strip the existential prefix. Legacy's id drops the
+    // quantifiers from the noun positions but keeps them in the
+    // verb — so the synthetic reading starts at the subject noun.
+    let body = body
+        .strip_prefix("some ")
+        .or_else(|| body.strip_prefix("more than one "))
+        .unwrap_or(body);
+
+    // Longest-first noun matching. Mirrors Stage-1.
+    let mut sorted: Vec<&str> = nouns.iter().map(|s| s.as_str()).collect();
+    sorted.sort_by(|a, b| b.len().cmp(&a.len()));
+
+    // Scan the body for role nouns, preserving order. Each matched
+    // noun advances the cursor past itself so later matches pick up
+    // the next role.
+    let mut roles: Vec<(String, usize, usize)> = Vec::new();
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if !body.is_char_boundary(i) {
+            i += 1;
+            continue;
+        }
+        let rest = &body[i..];
+        let at_word_start = i == 0 || {
+            let prev = bytes[i - 1];
+            !prev.is_ascii_alphanumeric() && prev != b'_'
+        };
+        if !at_word_start { i += 1; continue; }
+        let Some(noun) = sorted.iter().find(|n| {
+            rest.starts_with(**n) && {
+                let end = i + n.len();
+                end == bytes.len() || {
+                    let next = bytes[end];
+                    !next.is_ascii_alphanumeric() && next != b'_'
+                }
+            }
+        }) else {
+            i += 1;
+            continue;
+        };
+        let start = i;
+        let end = i + noun.len();
+        roles.push(((*noun).to_string(), start, end));
+        i = end;
+    }
+    if roles.len() < 2 { return None; }
+
+    // Build the reading: preserve the body text verbatim (verb
+    // phrases like `has the same` / `has more than one` are part of
+    // the canonical reading, not stripped).
+    let reading = body.to_string();
+    let role_nouns: Vec<String> = roles.iter().map(|(n, _, _)| n.clone()).collect();
+    let id = fact_type_id_from_reading(&reading, &role_nouns);
+
+    let arity = role_nouns.len().to_string();
+    let ft = fact_from_pairs(&[
+        ("id", id.as_str()),
+        ("reading", reading.as_str()),
+        ("arity", arity.as_str()),
+    ]);
+    let role_facts: Vec<Object> = role_nouns.iter().enumerate()
+        .map(|(pos, n)| {
+            let pos_s = pos.to_string();
+            fact_from_pairs(&[
+                ("factType", id.as_str()),
+                ("nounName", n.as_str()),
+                ("position", pos_s.as_str()),
+            ])
+        })
+        .collect();
+    Some((ft, role_facts))
+}
+
 /// Role head nouns for a Statement, ordered by Role Position.
 fn role_refs_for(state: &Object, stmt_id: &str) -> Vec<String> {
     let refs = fetch_or_phi("Statement_has_Role_Reference", state);
@@ -1144,10 +1239,15 @@ pub fn parse_to_state_via_stage12(text: &str) -> Result<Object, String> {
         if !ends_like_statement {
             continue;
         }
-        // Skip ORM 2 possibility-override statements (`It is possible
-        // that ...`). These declare that a constraint is waived, not
-        // a new fact/constraint; legacy's Pass 2b has no recognizer
-        // for them and they fall through without producing cells.
+        // ORM 2 possibility-override statements (`It is possible that
+        // ...`) don't land as `Constraint` or `DerivationRule` cells
+        // — legacy's Pass 2b has no recognizer. But legacy DOES
+        // register a synthetic FactType from the embedded predicate
+        // (e.g. `more than one Noun has the same Alias` →
+        // `Noun_has_the_same_Alias` FT). Stage-2 emits those
+        // synthetic FTs after the main tokenization loop via
+        // `possibility_synthetic_fact_type`. Skip Stage-1 tokenization
+        // here so no Statement cell fires on the outer prefix.
         if line.starts_with("It is possible that ") {
             continue;
         }
@@ -1175,6 +1275,24 @@ pub fn parse_to_state_via_stage12(text: &str) -> Result<Object, String> {
         stmt_state = merge_states(&stmt_state, &stage1_object);
     }
 
+    // #301 — possibility-override synthetic FactType registrations.
+    // Scan the raw source for `It is possible that ...` lines and
+    // emit synthetic FT + Role facts for the embedded predicate
+    // (matches legacy's implicit registration path). Done before
+    // classify so the synthetic FTs live in the pre-classified state
+    // cells if downstream passes want them; currently they're merged
+    // straight into the output after translator runs.
+    let synthetic_fts_and_roles: Vec<(Object, Vec<Object>)> = text.lines()
+        .filter_map(|raw| {
+            let line = raw.trim();
+            line.strip_prefix("It is possible that ")
+                .and_then(|body| {
+                    let body = body.trim_end_matches('.').trim();
+                    possibility_synthetic_fact_type(body, &nouns)
+                })
+        })
+        .collect();
+
     let classified = classify_statements(&stmt_state, &grammar_state);
 
     // Run translate_nouns FIRST so subsequent translators that consult
@@ -1197,7 +1315,17 @@ pub fn parse_to_state_via_stage12(text: &str) -> Result<Object, String> {
 
     let mut subtype_facts: Vec<Object> = translate_subtypes(&classified);
     subtype_facts.extend(translate_partitions(&classified));
-    let (ft_facts, role_facts) = translate_fact_types(&classified);
+    let (mut ft_facts, mut role_facts) = translate_fact_types(&classified);
+    // Append possibility-synthetic FactType + Role facts.
+    for (ft_fact, role_fs) in &synthetic_fts_and_roles {
+        // De-dup: skip if translate_fact_types already emitted this id.
+        let Some(ft_id) = binding(ft_fact, "id") else { continue };
+        if ft_facts.iter().any(|f| binding(f, "id") == Some(ft_id)) {
+            continue;
+        }
+        ft_facts.push(ft_fact.clone());
+        role_facts.extend(role_fs.clone());
+    }
     let mut constraint_facts: Vec<Object> = translate_ring_constraints(&classified);
     constraint_facts.extend(translate_cardinality_constraints(&classified));
     constraint_facts.extend(translate_set_constraints(&classified));
