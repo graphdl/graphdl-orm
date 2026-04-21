@@ -2535,7 +2535,18 @@ pub fn merge_states(target: &Object, source: &Object) -> Object {
         .map(|(name, contents)| (name.to_string(), contents.clone()))
         .collect();
     cells_iter(source).into_iter().for_each(|(name, contents)| {
-        let entry = map.entry(name.to_string()).or_insert_with(Object::phi);
+        // Fast path: when target has no entry for this cell the
+        // merge reduces to a direct Arc clone. `concat_dedup` below
+        // is O(n²) in the source-cell size because every appended
+        // fact scans the accumulator via `same_identity` — so
+        // skipping it when there's nothing to dedup against avoids
+        // millions of comparisons on the 4k-fact expanded-grammar
+        // cells that Stage-2's classify pass merges every call.
+        if !map.contains_key(name) {
+            map.insert(name.to_string(), contents.clone());
+            return;
+        }
+        let entry = map.get_mut(name).expect("checked above");
         *entry = concat_dedup(entry, contents);
     });
     Object::Map(map)
