@@ -132,19 +132,18 @@ pub fn translate_nouns(classified_state: &Object) -> Vec<Object> {
     let mut super_types: BTreeMap<String, String> = BTreeMap::new();
     for stmt_id in &statement_ids {
         let Some(head) = head_noun_for(classified_state, stmt_id) else { continue };
-        let classifications = classifications_for(classified_state, stmt_id);
-        let ot = if classifications.iter().any(|k|
-            k == "Abstract Declaration" || k == "Partition Declaration")
+        let ot = if classifications_contains_any(classified_state, stmt_id,
+            &["Abstract Declaration", "Partition Declaration"])
         {
             // Partition Declaration marks the supertype abstract
             // (ORM 2: a partitioned type has no direct instances;
             // every instance is in exactly one subtype).
             Some("abstract")
-        } else if classifications.iter().any(|k| k == "Entity Type Declaration") {
+        } else if classifications_contains(classified_state, stmt_id, "Entity Type Declaration") {
             Some("entity")
-        } else if classifications.iter().any(|k| k == "Value Type Declaration") {
+        } else if classifications_contains(classified_state, stmt_id, "Value Type Declaration") {
             Some("value")
-        } else if classifications.iter().any(|k| k == "Subtype Declaration") {
+        } else if classifications_contains(classified_state, stmt_id, "Subtype Declaration") {
             // `Fact Type is a subtype of Noun` declares `Fact Type`
             // as a Noun alongside the Subtype relation — legacy
             // treats it as entity-typed unless later abstracted.
@@ -168,8 +167,8 @@ pub fn translate_nouns(classified_state: &Object) -> Vec<Object> {
         // them. Re-scan here rather than plumb a separate
         // `Statement_has_Reference_Scheme` cell through the grammar
         // just for this one shape.
-        if classifications.iter().any(|k|
-            k == "Entity Type Declaration" || k == "Value Type Declaration")
+        if classifications_contains_any(classified_state, stmt_id,
+            &["Entity Type Declaration", "Value Type Declaration"])
         {
             if let Some(text) = statement_text(classified_state, stmt_id) {
                 if let Some(rs) = extract_reference_scheme(&text, &head) {
@@ -179,14 +178,14 @@ pub fn translate_nouns(classified_state: &Object) -> Vec<Object> {
         }
 
         // Supertype binding: `Subtype is a subtype of Supertype.`
-        if classifications.iter().any(|k| k == "Subtype Declaration") {
+        if classifications_contains(classified_state, stmt_id, "Subtype Declaration") {
             if let Some(sup) = role_noun_at_position(classified_state, stmt_id, 1) {
                 super_types.insert(head.clone(), sup);
             }
         }
 
         // Enum values: `The possible values of Priority are 'low', 'medium', 'high'.`
-        if classifications.iter().any(|k| k == "Enum Values Declaration") {
+        if classifications_contains(classified_state, stmt_id, "Enum Values Declaration") {
             if let Some(text) = statement_text(classified_state, stmt_id) {
                 if let Some(vals) = extract_enum_values(&text) {
                     enum_values.insert(head.clone(), vals);
@@ -348,8 +347,7 @@ fn extract_enum_values(text: &str) -> Option<String> {
 pub fn translate_subtypes(classified_state: &Object) -> Vec<Object> {
     let statement_ids = collect_statement_ids(classified_state);
     statement_ids.iter().filter_map(|stmt_id| {
-        let classifications = classifications_for(classified_state, stmt_id);
-        if !classifications.iter().any(|k| k == "Subtype Declaration") {
+        if !classifications_contains(classified_state, stmt_id, "Subtype Declaration") {
             return None;
         }
         let sub = head_noun_for(classified_state, stmt_id)?;
@@ -381,31 +379,30 @@ pub fn translate_subtypes(classified_state: &Object) -> Vec<Object> {
 pub fn translate_derivation_mode_facts(classified_state: &Object) -> Vec<Object> {
     let statement_ids = collect_statement_ids(classified_state);
     let mut out: Vec<Object> = Vec::new();
+    // Same exclude list as translate_fact_types — don't emit on
+    // noun declarations or instance facts that incidentally
+    // carry role references.
+    const EXCLUDE: &[&str] = &[
+        "Entity Type Declaration", "Value Type Declaration",
+        "Subtype Declaration", "Abstract Declaration",
+        "Enum Values Declaration", "Instance Fact",
+        "Partition Declaration", "Derivation Rule",
+        "Uniqueness Constraint", "Mandatory Role Constraint",
+        "Frequency Constraint", "Ring Constraint",
+        "Value Constraint", "Equality Constraint",
+        "Subset Constraint", "Exclusion Constraint",
+        "Exclusive-Or Constraint", "Or Constraint",
+        "Deontic Constraint",
+    ];
     for stmt_id in &statement_ids {
-        let classifications = classifications_for(classified_state, stmt_id);
         // Fact Type Reading classification is the anchor — an `iff`
         // derivation rule also has a marker but lands as Derivation
         // Rule, not Fact Type Reading, because Stage-1 strips the
         // leading `* ` prefix before tokenization (see #294).
-        if !classifications.iter().any(|k| k == "Fact Type Reading") {
+        if !classifications_contains(classified_state, stmt_id, "Fact Type Reading") {
             continue;
         }
-        // Same exclude list as translate_fact_types — don't emit on
-        // noun declarations or instance facts that incidentally
-        // carry role references.
-        const EXCLUDE: &[&str] = &[
-            "Entity Type Declaration", "Value Type Declaration",
-            "Subtype Declaration", "Abstract Declaration",
-            "Enum Values Declaration", "Instance Fact",
-            "Partition Declaration", "Derivation Rule",
-            "Uniqueness Constraint", "Mandatory Role Constraint",
-            "Frequency Constraint", "Ring Constraint",
-            "Value Constraint", "Equality Constraint",
-            "Subset Constraint", "Exclusion Constraint",
-            "Exclusive-Or Constraint", "Or Constraint",
-            "Deontic Constraint",
-        ];
-        if classifications.iter().any(|k| EXCLUDE.iter().any(|e| e == k)) {
+        if classifications_contains_any(classified_state, stmt_id, EXCLUDE) {
             continue;
         }
         let Some(mode) = derivation_marker_for(classified_state, stmt_id) else { continue };
@@ -452,8 +449,7 @@ pub fn translate_partitions(classified_state: &Object) -> Vec<Object> {
     let statement_ids = collect_statement_ids(classified_state);
     let mut out: Vec<Object> = Vec::new();
     for stmt_id in &statement_ids {
-        let classifications = classifications_for(classified_state, stmt_id);
-        if !classifications.iter().any(|k| k == "Partition Declaration") {
+        if !classifications_contains(classified_state, stmt_id, "Partition Declaration") {
             continue;
         }
         let Some(sup) = head_noun_for(classified_state, stmt_id) else { continue };
@@ -483,38 +479,37 @@ pub fn translate_fact_types(classified_state: &Object) -> (Vec<Object>, Vec<Obje
     let statement_ids = collect_statement_ids(classified_state);
     let mut ft_facts: Vec<Object> = Vec::new();
     let mut role_facts: Vec<Object> = Vec::new();
+    // Exclude every non-fact-type classification. Fact Type Reading
+    // fires whenever a Role Reference is present, which is true of
+    // declarations, instance facts, and constraint statements alike.
+    // The translator only emits when Fact Type Reading is the ONLY
+    // structural classification.
+    const EXCLUDE: &[&str] = &[
+        "Entity Type Declaration",
+        "Value Type Declaration",
+        "Subtype Declaration",
+        "Abstract Declaration",
+        "Enum Values Declaration",
+        "Instance Fact",
+        "Partition Declaration",
+        "Derivation Rule",
+        "Uniqueness Constraint",
+        "Mandatory Role Constraint",
+        "Frequency Constraint",
+        "Ring Constraint",
+        "Value Constraint",
+        "Equality Constraint",
+        "Subset Constraint",
+        "Exclusion Constraint",
+        "Exclusive-Or Constraint",
+        "Or Constraint",
+        "Deontic Constraint",
+    ];
     for stmt_id in &statement_ids {
-        let classifications = classifications_for(classified_state, stmt_id);
-        if !classifications.iter().any(|k| k == "Fact Type Reading") {
+        if !classifications_contains(classified_state, stmt_id, "Fact Type Reading") {
             continue;
         }
-        // Exclude every non-fact-type classification. Fact Type Reading
-        // fires whenever a Role Reference is present, which is true of
-        // declarations, instance facts, and constraint statements alike.
-        // The translator only emits when Fact Type Reading is the ONLY
-        // structural classification.
-        const EXCLUDE: &[&str] = &[
-            "Entity Type Declaration",
-            "Value Type Declaration",
-            "Subtype Declaration",
-            "Abstract Declaration",
-            "Enum Values Declaration",
-            "Instance Fact",
-            "Partition Declaration",
-            "Derivation Rule",
-            "Uniqueness Constraint",
-            "Mandatory Role Constraint",
-            "Frequency Constraint",
-            "Ring Constraint",
-            "Value Constraint",
-            "Equality Constraint",
-            "Subset Constraint",
-            "Exclusion Constraint",
-            "Exclusive-Or Constraint",
-            "Or Constraint",
-            "Deontic Constraint",
-        ];
-        if classifications.iter().any(|k| EXCLUDE.iter().any(|e| e == k)) {
+        if classifications_contains_any(classified_state, stmt_id, EXCLUDE) {
             continue;
         }
         let roles = role_refs_for(classified_state, stmt_id);
@@ -876,8 +871,7 @@ pub fn translate_instance_facts_with_ft_ids(
     let statement_ids = collect_statement_ids(classified_state);
     let mut out: Vec<Object> = Vec::new();
     for stmt_id in &statement_ids {
-        let classifications = classifications_for(classified_state, stmt_id);
-        if !classifications.iter().any(|k| k == "Instance Fact") {
+        if !classifications_contains(classified_state, stmt_id, "Instance Fact") {
             continue;
         }
         let roles = role_refs_with_literals(classified_state, stmt_id);
@@ -1000,7 +994,6 @@ pub fn translate_ring_constraints(classified_state: &Object) -> Vec<Object> {
     let declared_nouns = declared_noun_names(classified_state);
     let mut out: Vec<Object> = Vec::new();
     for stmt_id in &statement_ids {
-        let classifications = classifications_for(classified_state, stmt_id);
         // Two sources for ring emission:
         //   (a) Ring Constraint classification (trailing-marker shape:
         //       `<FT> is irreflexive.` / `No X R itself.`).
@@ -1008,8 +1001,8 @@ pub fn translate_ring_constraints(classified_state: &Object) -> Vec<Object> {
         //       X R Z` etc.) not caught by the grammar's trailing-
         //       marker rule — matches legacy `try_ring`'s pass-2b
         //       conditional-pattern dispatcher.
-        let is_classified_ring = classifications.iter()
-            .any(|k| k == "Ring Constraint");
+        let is_classified_ring = classifications_contains(
+            classified_state, stmt_id, "Ring Constraint");
         let text = statement_text(classified_state, stmt_id).unwrap_or_default();
         let (kind, kind_source) = if is_classified_ring {
             let marker = match trailing_marker_for(classified_state, stmt_id) {
@@ -1139,8 +1132,7 @@ pub fn translate_derivation_rules(classified_state: &Object) -> Vec<Object> {
     let declared_nouns = declared_noun_names(classified_state);
     let mut out: Vec<Object> = Vec::new();
     for stmt_id in &statement_ids {
-        let classifications = classifications_for(classified_state, stmt_id);
-        if !classifications.iter().any(|k| k == "Derivation Rule") {
+        if !classifications_contains(classified_state, stmt_id, "Derivation Rule") {
             continue;
         }
         let text = statement_text(classified_state, stmt_id).unwrap_or_default();
@@ -1150,7 +1142,7 @@ pub fn translate_derivation_rules(classified_state: &Object) -> Vec<Object> {
         // translator claims this statement — skip DR emission.
         // Legacy's pass-2b priority gives try_subset first dibs;
         // only on semantic failure does try_derivation take over.
-        let is_subset = classifications.iter().any(|k| k == "Subset Constraint");
+        let is_subset = classifications_contains(classified_state, stmt_id, "Subset Constraint");
         if is_subset && antecedent_distinct_nouns(&text, &declared_nouns) >= 2 {
             continue;
         }
@@ -1202,8 +1194,7 @@ pub fn translate_unresolved_clauses(
     let _ = &declared;
     let mut out: Vec<Object> = Vec::new();
     for stmt_id in &statement_ids {
-        let classifications = classifications_for(classified_state, stmt_id);
-        if !classifications.iter().any(|k| k == "Derivation Rule") { continue; }
+        if !classifications_contains(classified_state, stmt_id, "Derivation Rule") { continue; }
         let text = match statement_text(classified_state, stmt_id) {
             Some(t) => t, None => continue,
         };
@@ -1277,8 +1268,7 @@ pub fn translate_enum_values(classified_state: &Object) -> Vec<Object> {
     let statement_ids = collect_statement_ids(classified_state);
     let mut out: Vec<Object> = Vec::new();
     for stmt_id in &statement_ids {
-        let classifications = classifications_for(classified_state, stmt_id);
-        if !classifications.iter().any(|k| k == "Enum Values Declaration") {
+        if !classifications_contains(classified_state, stmt_id, "Enum Values Declaration") {
             continue;
         }
         let Some(noun) = head_noun_for(classified_state, stmt_id) else { continue };
@@ -1320,15 +1310,15 @@ pub fn translate_set_constraints(classified_state: &Object) -> Vec<Object> {
     let declared_nouns = declared_noun_names(classified_state);
     let mut out: Vec<Object> = Vec::new();
     for stmt_id in &statement_ids {
-        let classifications = classifications_for(classified_state, stmt_id);
         let text = statement_text(classified_state, stmt_id).unwrap_or_default();
-        let kind = if classifications.iter().any(|k| k == "Equality Constraint") {
+        let is_dr = classifications_contains(classified_state, stmt_id, "Derivation Rule");
+        let kind = if classifications_contains(classified_state, stmt_id, "Equality Constraint") {
             // `iff` keyword also classifies as Derivation Rule; prefer
             // DR when no `if and only if` multi-clause keyword fires
             // (that's the grammar's EQ signal, not mere `iff`).
-            if classifications.iter().any(|k| k == "Derivation Rule") { continue; }
+            if is_dr { continue; }
             "EQ"
-        } else if classifications.iter().any(|k| k == "Subset Constraint") {
+        } else if classifications_contains(classified_state, stmt_id, "Subset Constraint") {
             // SS classification fires on the synthetic `if some then
             // that` constraint keyword. Legacy's `try_subset` also
             // requires the antecedent to contain 2+ DISTINCT declared
@@ -1340,14 +1330,14 @@ pub fn translate_set_constraints(classified_state: &Object) -> Vec<Object> {
                 continue;
             }
             "SS"
-        } else if classifications.iter().any(|k| k == "Exclusive-Or Constraint") {
-            if classifications.iter().any(|k| k == "Derivation Rule") { continue; }
+        } else if classifications_contains(classified_state, stmt_id, "Exclusive-Or Constraint") {
+            if is_dr { continue; }
             "XO"
-        } else if classifications.iter().any(|k| k == "Or Constraint") {
-            if classifications.iter().any(|k| k == "Derivation Rule") { continue; }
+        } else if classifications_contains(classified_state, stmt_id, "Or Constraint") {
+            if is_dr { continue; }
             "OR"
-        } else if classifications.iter().any(|k| k == "Exclusion Constraint") {
-            if classifications.iter().any(|k| k == "Derivation Rule") { continue; }
+        } else if classifications_contains(classified_state, stmt_id, "Exclusion Constraint") {
+            if is_dr { continue; }
             "XC"
         } else {
             continue;
@@ -1432,17 +1422,16 @@ pub fn translate_cardinality_constraints(classified_state: &Object) -> Vec<Objec
     let statement_ids = collect_statement_ids(classified_state);
     let mut out: Vec<Object> = Vec::new();
     for stmt_id in &statement_ids {
-        let classifications = classifications_for(classified_state, stmt_id);
         // A Statement classified as Derivation Rule never contributes
         // a cardinality Constraint — the `iff` keyword makes the whole
         // sentence a rule, even when it incidentally contains a `some`
         // quantifier inside an antecedent clause.
-        if classifications.iter().any(|k| k == "Derivation Rule") { continue; }
+        if classifications_contains(classified_state, stmt_id, "Derivation Rule") { continue; }
         let text = statement_text(classified_state, stmt_id).unwrap_or_default();
         let entity = head_noun_for(classified_state, stmt_id).unwrap_or_default();
-        let is_fc = classifications.iter().any(|k| k == "Frequency Constraint");
-        let is_uc = classifications.iter().any(|k| k == "Uniqueness Constraint");
-        let is_mc = classifications.iter().any(|k| k == "Mandatory Role Constraint");
+        let is_fc = classifications_contains(classified_state, stmt_id, "Frequency Constraint");
+        let is_uc = classifications_contains(classified_state, stmt_id, "Uniqueness Constraint");
+        let is_mc = classifications_contains(classified_state, stmt_id, "Mandatory Role Constraint");
         if !(is_fc || is_uc || is_mc) { continue; }
 
         // `exactly one` splits into UC + MC per legacy behavior
@@ -1495,8 +1484,7 @@ pub fn translate_value_constraints(classified_state: &Object) -> Vec<Object> {
     let statement_ids = collect_statement_ids(classified_state);
     let mut out: Vec<Object> = Vec::new();
     for stmt_id in &statement_ids {
-        let classifications = classifications_for(classified_state, stmt_id);
-        if !classifications.iter().any(|k| k == "Value Constraint") {
+        if !classifications_contains(classified_state, stmt_id, "Value Constraint") {
             continue;
         }
         let Some(noun) = head_noun_for(classified_state, stmt_id) else { continue };
@@ -1532,8 +1520,7 @@ pub fn translate_deontic_constraints(classified_state: &Object) -> Vec<Object> {
     let statement_ids = collect_statement_ids(classified_state);
     let mut out: Vec<Object> = Vec::new();
     for stmt_id in &statement_ids {
-        let classifications = classifications_for(classified_state, stmt_id);
-        if !classifications.iter().any(|k| k == "Deontic Constraint") {
+        if !classifications_contains(classified_state, stmt_id, "Deontic Constraint") {
             continue;
         }
         let text = statement_text(classified_state, stmt_id).unwrap_or_default();
@@ -1639,6 +1626,47 @@ pub fn classifications_for(state: &Object, statement_id: &str) -> Vec<String> {
             .filter_map(|f| binding(f, "Classification").map(String::from))
             .collect())
         .unwrap_or_default()
+}
+
+/// Fast membership check — returns `true` when `statement_id` carries
+/// a classification equal to `name`. Avoids the `Vec<String>` clone
+/// that `classifications_for` pays on every call; translators that
+/// only need boolean membership can loop over statements at ~O(1) per
+/// check instead of paying an allocation plus a linear scan of a
+/// cloned vector.
+#[cfg(feature = "std-deps")]
+pub fn classifications_contains(state: &Object, statement_id: &str, name: &str) -> bool {
+    let via_index: Option<bool> = STMT_INDEX.with(|c|
+        c.borrow().as_ref().map(|i|
+            i.classifications.get(statement_id)
+                .is_some_and(|v| v.iter().any(|k| k == name))));
+    if let Some(b) = via_index { return b; }
+    fetch_or_phi("Statement_has_Classification", state)
+        .as_seq()
+        .map(|facts| facts.iter().any(|f|
+            binding(f, "Statement") == Some(statement_id)
+            && binding(f, "Classification") == Some(name)))
+        .unwrap_or(false)
+}
+
+/// Fast disjoint-membership check — returns `true` when any of the
+/// given names matches a classification on `statement_id`. Translators
+/// use this for "does this statement carry ANY excluded kind" and
+/// "is this a fact-type-like statement" tests; preferring this over a
+/// clone-and-iterate pattern saves per-call allocation.
+#[cfg(feature = "std-deps")]
+pub fn classifications_contains_any(state: &Object, statement_id: &str, names: &[&str]) -> bool {
+    let via_index: Option<bool> = STMT_INDEX.with(|c|
+        c.borrow().as_ref().map(|i|
+            i.classifications.get(statement_id)
+                .is_some_and(|v| v.iter().any(|k| names.iter().any(|n| n == k)))));
+    if let Some(b) = via_index { return b; }
+    fetch_or_phi("Statement_has_Classification", state)
+        .as_seq()
+        .map(|facts| facts.iter().any(|f|
+            binding(f, "Statement") == Some(statement_id)
+            && binding(f, "Classification").is_some_and(|k| names.iter().any(|n| *n == k))))
+        .unwrap_or(false)
 }
 
 /// Collect all Statement ids from the `Statement` cell.
