@@ -462,53 +462,19 @@ fn main() {
                         ast::fact_from_pairs(&[("App", app.as_str()), ("Generator", g.as_str())]),
                         &state);
                 });
-                // Generate SQL triggers for derivation rules. Build the
-                // typed inputs generate_derivation_triggers needs directly
-                // from Object cells — no Domain struct.
-                if opted_generators.iter().any(|g| ["sqlite","postgresql","mysql"].contains(&g.as_str())) {
-                    let sql_tables = crate::rmap::rmap(&state);
-                    let table_names: std::collections::HashSet<String> = sql_tables.iter()
-                        .map(|t| t.name.clone()).collect();
-                    // Derivation rules from cell (id, text, consequentFactTypeId).
-                    // Antecedent resolution happens at compile time — triggers
-                    // only need the consequent FT to key the trigger group.
-                    let rule_cell = ast::fetch_or_phi("DerivationRule", &state);
-                    let derivation_rules: Vec<types::DerivationRuleDef> = rule_cell.as_seq()
-                        .map(|facts| facts.iter().map(|f| types::DerivationRuleDef {
-                            id: ast::binding(f, "id").unwrap_or("").to_string(),
-                            text: ast::binding(f, "text").unwrap_or("").to_string(),
-                            consequent_cell: types::ConsequentCellSource::decode(
-                                ast::binding(f, "consequentFactTypeId").unwrap_or("")),
-                            antecedent_sources: vec![], consequent_instance_role: String::new(), kind: types::DerivationKind::ModusPonens,
-                            join_on: vec![], match_on: vec![], consequent_bindings: vec![],
-                            antecedent_filters: vec![], consequent_computed_bindings: vec![],
-                            consequent_aggregates: vec![], unresolved_clauses: vec![], antecedent_role_literals: vec![], consequent_role_literals: vec![],
-                        }).collect())
-                        .unwrap_or_default();
-                    // Fact types built from FactType + Role cells.
-                    let role_cell = ast::fetch_or_phi("Role", &state);
-                    let fact_types: hashbrown::HashMap<String, types::FactTypeDef> = ast::fetch_or_phi("FactType", &state).as_seq()
-                        .map(|facts| facts.iter().filter_map(|f| {
-                            let id = ast::binding(f, "id")?.to_string();
-                            let reading = ast::binding(f, "reading").unwrap_or("").to_string();
-                            let roles: Vec<types::RoleDef> = role_cell.as_seq()
-                                .map(|rs| rs.iter()
-                                    .filter(|r| ast::binding(r, "factType") == Some(&id))
-                                    .map(|r| types::RoleDef {
-                                        noun_name: ast::binding(r, "nounName").unwrap_or("").to_string(),
-                                        role_index: ast::binding(r, "position").and_then(|v| v.parse().ok()).unwrap_or(0),
-                                    }).collect())
-                                .unwrap_or_default();
-                            Some((id, types::FactTypeDef { schema_id: String::new(), reading, readings: vec![], roles }))
-                        }).collect())
-                        .unwrap_or_default();
-                    let triggers = compile::generate_derivation_triggers(&derivation_rules, &fact_types, &sql_tables, &table_names);
-                    triggers.iter().for_each(|(name, ddl)| {
-                        state = ast::cell_push(&format!("sql:trigger:{}", name),
-                            ast::Object::atom(ddl), &state);
-                    });
-                    eprintln!("[load] {} SQL triggers generated", triggers.len());
-                }
+                // `sql:trigger:*` DDL is already emitted by
+                // `compile::compile_to_defs_state` (see compile.rs:1363
+                // — `Func::constant(Object::atom(ddl))`). An earlier
+                // block here re-materialised the typed derivation-rule
+                // + fact-type inputs from cells and called
+                // `generate_derivation_triggers` again, but the
+                // materialisation only copied three fields out of
+                // `DerivationRuleDef` and left `antecedent_sources`
+                // empty — the function bails on empty antecedents, so
+                // this path always produced zero triggers and the
+                // "[load] N SQL triggers generated" log was always
+                // "0". Removed; retire four typed-IR materialisations
+                // along the way (#325).
 
                 let defs = vec![
                     ("compile".to_string(), ast::Func::Platform("compile".to_string())),
