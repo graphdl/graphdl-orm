@@ -67,16 +67,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     interrupts::init_idt();
     interrupts::init_pic();
 
-    // Sec-6 ring-3 smoke test mode. Short-circuits the full init path
-    // (which depends on BootInfo::physical_memory_offset being mapped
-    // by the bootloader config) and goes straight to the privilege-
-    // transition harness. Task 4 will promote this branch so it runs
-    // after the memory subsystem is available, once map_user_page
-    // lands.
+    // Sec-6 ring-3 smoke test mode. Run only the subsystems needed
+    // by userspace::launch_test_payload (memory — so map_user_page
+    // can allocate user pages) and skip the rest (virtio / net /
+    // system / REPL). Diverges into ring 3 and never returns.
     #[cfg(feature = "ring3-smoke")]
     {
         println!("AREST kernel online");
         println!("  mode: ring3-smoke — launching test payload");
+        memory::init(boot_info);
         userspace::launch_test_payload();
     }
 
