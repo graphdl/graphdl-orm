@@ -1254,20 +1254,22 @@ pub fn fact_types_from_state(state: &crate::ast::Object) -> HashMap<String, Fact
         .unwrap_or_default()
 }
 
-/// Parse FORML2 readings into an Object state with full context from D.
-/// Extracts nouns and fact types directly from cells â€” no ParseCtx struct round-trip.
+/// Parse FORML2 readings with context from `d` (#285). `d`'s noun
+/// catalog is threaded through stage12's tokeniser so statements may
+/// reference nouns declared by `d` without redeclaring them. Callers
+/// typically `merge_states(d, &result)` to carry `d`'s non-noun cells
+/// forward.
+#[cfg(feature = "std-deps")]
 pub fn parse_to_state_from(input: &str, d: &crate::ast::Object) -> Result<crate::ast::Object, String> {
-    let nouns = nouns_from_state(d);
-    let fact_types = fact_types_from_state(d);
-    let domain = parse_markdown_with_context(input, &nouns, &fact_types)?;
-    Ok(cells_to_state(&domain))
+    crate::parse_forml2_stage2::parse_to_state_via_stage12_with_context(input, d)
 }
 
-/// Legacy: parse with nouns only (no fact type context).
+/// Alias for `parse_to_state_from` kept for API compatibility. Legacy
+/// took only nouns; stage12's context path accepts the full state and
+/// extracts what it needs.
+#[cfg(feature = "std-deps")]
 pub fn parse_to_state_with_nouns(input: &str, existing: &crate::ast::Object) -> Result<crate::ast::Object, String> {
-    let nouns = nouns_from_state(existing);
-    let domain = parse_markdown_with_nouns(input, &nouns)?;
-    Ok(cells_to_state(&domain))
+    crate::parse_forml2_stage2::parse_to_state_via_stage12_with_context(input, existing)
 }
 
 /// Convert a ParseCtx to an Object state (sequence of cells).

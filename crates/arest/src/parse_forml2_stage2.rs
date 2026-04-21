@@ -2429,8 +2429,36 @@ fn cached_grammar_state() -> Result<&'static Object, String> {
     cached_grammar().map(|(s, _, _, _)| s)
 }
 
+/// Public entry point: parse FORML 2 source with no external context.
 #[cfg(feature = "std-deps")]
 pub fn parse_to_state_via_stage12(text: &str) -> Result<Object, String> {
+    parse_to_state_via_stage12_impl(text, &[])
+}
+
+/// Context-aware parse (#285). Used by `parse_to_state_from` and
+/// `parse_to_state_with_nouns` so a statement mentioning a noun
+/// declared in a previously-parsed domain tokenises correctly. Only
+/// noun *names* are propagated — fact types are re-derived from
+/// `text` by `translate_fact_types`, and `merge_states(ctx, result)`
+/// on the caller's side carries the rest of `ctx`'s cells forward.
+#[cfg(feature = "std-deps")]
+pub fn parse_to_state_via_stage12_with_context(
+    text: &str,
+    ctx: &Object,
+) -> Result<Object, String> {
+    let extra: Vec<String> = fetch_or_phi("Noun", ctx).as_seq()
+        .map(|facts| facts.iter()
+            .filter_map(|f| binding(f, "name").map(String::from))
+            .collect())
+        .unwrap_or_default();
+    parse_to_state_via_stage12_impl(text, &extra)
+}
+
+#[cfg(feature = "std-deps")]
+fn parse_to_state_via_stage12_impl(
+    text: &str,
+    extra_nouns: &[String],
+) -> Result<Object, String> {
     let trace = std::env::var("AREST_STAGE12_TRACE").is_ok();
     let t0 = std::time::Instant::now();
     let grammar_state = cached_grammar_state()?;
@@ -2446,7 +2474,15 @@ pub fn parse_to_state_via_stage12(text: &str) -> Result<Object, String> {
 
     // Direct text-scan bootstrap for noun names — avoids running the
     // full legacy cascade a second time just to recover the Noun cell.
+    // `extra_nouns` threads in the noun catalog of a caller-supplied
+    // context (e.g. metamodel state on a user-domain parse) so
+    // statements can reference those nouns without redeclaring them.
     let mut nouns: Vec<String> = extract_declared_noun_names(text);
+    for n in extra_nouns {
+        if !nouns.iter().any(|existing| existing == n) {
+            nouns.push(n.clone());
+        }
+    }
     nouns.sort_by(|a, b| b.len().cmp(&a.len()));
     // Build the first-byte noun index ONCE per parse so the per-line
     // tokenizer doesn't re-partition on every call.
