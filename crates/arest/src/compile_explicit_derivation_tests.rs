@@ -480,6 +480,60 @@ Person is ancestor of Person.
         "second Person binding should be bob, got {:?}", bindings[1]);
 }
 
+// ─── Category 7: Transitive closure (parse+compile shape only) ──────
+//
+// Shape: `* X R Z iff X R Y and Y R Z` on a binary self-ring relation.
+// The parser's `join_on` detection keys off "that" anaphora — numeric
+// subscripts alone don't mark Person2 as a join key, so a rule using
+// Person1/Person2/Person3 compiles as a 2-antecedent modus-ponens,
+// NOT as DerivationKind::Join. Consequently the Func that
+// compile_explicit_derivation's N≥2 branch builds is an existence
+// check with first-fact bindings, not the per-tuple equi-join semantic
+// a transitive closure needs. Exercising the Func on a hand-built
+// population never fires because of the bindings-key vs. role-index
+// mismatch on self-ring FTs.
+//
+// The test asserts only parse+compile shape here and leaves the
+// eval-side verification to the forward-chainer's end-to-end tests
+// (evaluate.rs). Noted in a follow-up handoff: Person1/Person2/Person3
+// should either route to compile_join_derivation or gain an anaphora
+// hint at resolve time.
+
+#[test]
+fn shape_transitive_closure_parses_as_two_antecedent_literal() {
+    let src = r#"# Test
+Person(.Name) is an entity type.
+Name is a value type.
+
+## Fact Types
+Person has Name.
+Person is parent of Person.
+Person is ancestor of Person.
+
+## Derivation Rules
+* Person1 is ancestor of Person3 iff Person1 is parent of Person2 and Person2 is ancestor of Person3.
+"#;
+    let (rule, _func) = parse_and_compile(src);
+
+    match &rule.consequent_cell {
+        ConsequentCellSource::Literal(id) => assert_eq!(id, "Person_is_ancestor_of_Person",
+            "consequent resolves to the declared ancestor FT, got {}", id),
+        other => panic!("expected Literal(..), got {:?}", other),
+    }
+    assert_eq!(rule.antecedent_sources.len(), 2,
+        "two-antecedent transitive rule expected, got {:#?}", rule.antecedent_sources);
+    // Both antecedents should resolve to declared FTs (not InstancesOfNoun
+    // or AbsenceOf). The parent+ancestor pair is exactly the classic
+    // transitive-closure antecedent shape.
+    for src in rule.antecedent_sources.iter() {
+        let id = src.fact_type_id();
+        assert!(
+            id == "Person_is_parent_of_Person" || id == "Person_is_ancestor_of_Person",
+            "antecedent should be parent or ancestor FT, got {}", id,
+        );
+    }
+}
+
 // ─── Category 2: AntecedentRole (deferred) ──────────────────────────
 //
 // `ConsequentCellSource::AntecedentRole` is declared on the type and
