@@ -161,6 +161,18 @@ struct CompiledState {
     /// leaves the process. See the `snapshot:` / `rollback:` branches
     /// of `system_impl` for the sign/verify flow.
     snapshot_secret: [u8; 32],
+    /// Per-tenant reductions-per-call budget (Sec-3, #159). Sentinel
+    /// `u64::MAX` = unlimited; the default so existing tests are
+    /// unaffected. Debited by `system_impl` at each SYSTEM dispatch;
+    /// when it hits zero every further call short-circuits to "⊥"
+    /// without entering the evaluator. Reset by calling
+    /// `set_tenant_call_budget` again — both sets the new ceiling AND
+    /// re-fills the remaining count to it.
+    ///
+    /// AtomicU64 rather than a `u64` field so the check lives outside
+    /// the `RwLock<CompiledState>` write path — checking the budget
+    /// must not serialize otherwise-disjoint callers.
+    call_budget_remaining: core::sync::atomic::AtomicU64,
 }
 
 /// Outcome of a targeted-write attempt via `try_commit_diff`.
@@ -238,9 +250,29 @@ impl CompiledState {
             cells: hashbrown::HashMap::new(),
             snapshots: hashbrown::HashMap::new(),
             snapshot_secret: boot_time_snapshot_secret(),
+            call_budget_remaining: core::sync::atomic::AtomicU64::new(u64::MAX),
         };
         s.replace_d(initial_d);
         s
+    }
+
+    /// Try to debit one unit from the tenant's per-call budget.
+    /// Returns `true` when the call may proceed (counter > 0, or
+    /// unlimited sentinel), `false` when the tenant is exhausted.
+    /// Lock-free — does not serialize callers on the outer RwLock.
+    fn debit_call_budget(&self) -> bool {
+        use core::sync::atomic::Ordering;
+        let mut fuel = self.call_budget_remaining.load(Ordering::Relaxed);
+        loop {
+            if fuel == u64::MAX { return true; }
+            if fuel == 0 { return false; }
+            match self.call_budget_remaining.compare_exchange_weak(
+                fuel, fuel - 1, Ordering::Relaxed, Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(curr) => fuel = curr,
+            }
+        }
     }
 
     /// Assemble an `Object::Map` view of the full state. Each cell's
@@ -492,6 +524,23 @@ fn ds() -> &'static Mutex<Vec<Option<Arc<RwLock<CompiledState>>>>> {
 fn tenant_lock(handle: u32) -> Option<Arc<RwLock<CompiledState>>> {
     let s = ds().lock();
     s.get(handle as usize).and_then(|x| x.as_ref()).map(Arc::clone)
+}
+
+/// Set (or reset) a tenant's per-call budget. Every subsequent
+/// `system_impl` dispatch debits one unit; once the counter hits zero
+/// the tenant short-circuits to "⊥" on every call until this function
+/// is invoked again. Setting `u64::MAX` disables the cap entirely —
+/// the startup default.
+///
+/// No-op on an unknown handle (consistent with `release_impl`). Takes
+/// only a read lock: the budget lives in an AtomicU64, so resetting
+/// doesn't serialize concurrent queries.
+#[cfg(not(feature = "no_std"))]
+pub fn set_tenant_call_budget(handle: u32, limit: u64) {
+    if let Some(tenant) = tenant_lock(handle) {
+        let st = tenant.read();
+        st.call_budget_remaining.store(limit, core::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 #[cfg(not(feature = "no_std"))]
@@ -777,6 +826,17 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
         Some(t) => t,
         None => return "⊥".into(),
     };
+
+    // Sec-3 (#159): tenant-level debit BEFORE any work. An exhausted
+    // tenant must never re-enter the evaluator — otherwise a caller
+    // who has already burned their budget could still force
+    // arbitrary apply() work (fuel-bounded, but still work) by
+    // issuing more calls. Returning "⊥" here short-circuits the
+    // whole dispatch; the counter is lock-free so this check does
+    // not serialize concurrent in-budget callers.
+    if !tenant.read().debit_call_budget() {
+        return "⊥".into();
+    }
 
     // ── CompiledState-level intercepts ──────────────────────────────
     //
@@ -2419,6 +2479,51 @@ Order has total.
         let result = system_impl(h, "federated_ingest:Stripe Customer", payload);
         assert!(result.starts_with("cite:"),
             "matching system should succeed and return a citation id; got {result}");
+        release_impl(h);
+    }
+
+    // ── Tenant-level quota (Sec-3 lane 2) ───────────────────────────
+    //
+    // Per-tenant call budget debited around every SYSTEM dispatch.
+    // Once a tenant's budget for the window is zero, future calls
+    // short-circuit to "⊥" until `set_tenant_call_budget` is called
+    // again (which both sets and resets the counter).
+
+    #[test]
+    fn tenant_call_budget_exhaustion_short_circuits_to_bottom() {
+        let h = create_bare_impl();
+        set_tenant_call_budget(h, 2);
+        // Two calls fit the budget — both succeed.
+        assert_ne!(system_impl(h, "audit", ""), "⊥");
+        assert_ne!(system_impl(h, "audit", ""), "⊥");
+        // Third call is over budget — must return ⊥.
+        assert_eq!(system_impl(h, "audit", ""), "⊥",
+            "exhausted tenant must short-circuit to ⊥ without invoking apply");
+        release_impl(h);
+    }
+
+    #[test]
+    fn tenant_call_budget_reset_restores_capacity() {
+        let h = create_bare_impl();
+        set_tenant_call_budget(h, 1);
+        assert_ne!(system_impl(h, "audit", ""), "⊥");
+        assert_eq!(system_impl(h, "audit", ""), "⊥");
+        // Reset via set-again — capacity should come back.
+        set_tenant_call_budget(h, 1);
+        assert_ne!(system_impl(h, "audit", ""), "⊥",
+            "after reset, tenant must be able to call again");
+        release_impl(h);
+    }
+
+    #[test]
+    fn tenant_call_budget_default_is_unlimited() {
+        // A freshly created handle with no budget set must not spuriously
+        // exhaust on normal traffic — existing tests (which issue many
+        // calls without touching the budget) must keep passing.
+        let h = create_bare_impl();
+        for _ in 0..16 {
+            assert_ne!(system_impl(h, "audit", ""), "⊥");
+        }
         release_impl(h);
     }
 }

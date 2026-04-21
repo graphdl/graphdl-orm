@@ -35,6 +35,107 @@ static SKIP_VALIDATE_ATOMIC: core::sync::atomic::AtomicBool = core::sync::atomic
 pub fn set_skip_validate(on: bool) { SKIP_VALIDATE_ATOMIC.store(on, core::sync::atomic::Ordering::Relaxed); }
 #[cfg(feature = "no_std")]
 fn is_skip_validate() -> bool { SKIP_VALIDATE_ATOMIC.load(core::sync::atomic::Ordering::Relaxed) }
+
+// ── Reductions fuel (Sec-3: #159 enforcement inside apply) ─────────
+//
+// A thread-local "reductions remaining" counter, decremented at the
+// top of every `apply` call. When it reaches zero, `apply` short-
+// circuits to Bottom — which then propagates outward through the
+// bottom-preserving combining forms (Compose, Construction, α, etc.)
+// and stops the evaluator cleanly instead of letting a malicious
+// Func tree run until the OS stack overflows.
+//
+// Sentinel `u64::MAX` = unlimited. Default is unlimited so existing
+// call sites are unaffected; callers bound a suspect tree with
+// `with_fuel(n, || apply(…))`.
+
+#[cfg(not(feature = "no_std"))]
+thread_local! {
+    static APPLY_FUEL: core::cell::Cell<u64> = const { core::cell::Cell::new(u64::MAX) };
+}
+
+#[cfg(feature = "no_std")]
+static APPLY_FUEL_ATOMIC: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Evaluate `f` with the `apply` reductions budget set to `budget`.
+/// Restores the previous budget when `f` returns — nested calls are
+/// well-scoped, so callers (system dispatch, test fixtures) can bound
+/// a specific subtree without leaking state to sibling scopes.
+///
+/// `u64::MAX` means "unlimited"; this is the startup default and what
+/// `with_fuel` restores after inner scopes complete.
+#[cfg(not(feature = "no_std"))]
+pub fn with_fuel<T, F: FnOnce() -> T>(budget: u64, f: F) -> T {
+    struct Restore(u64);
+    impl Drop for Restore {
+        fn drop(&mut self) { APPLY_FUEL.with(|c| c.set(self.0)); }
+    }
+    let _guard = APPLY_FUEL.with(|c| {
+        let prior = c.get();
+        c.set(budget);
+        Restore(prior)
+    });
+    f()
+}
+
+#[cfg(feature = "no_std")]
+pub fn with_fuel<T, F: FnOnce() -> T>(budget: u64, f: F) -> T {
+    use core::sync::atomic::Ordering;
+    let prior = APPLY_FUEL_ATOMIC.swap(budget, Ordering::Relaxed);
+    let out = f();
+    APPLY_FUEL_ATOMIC.store(prior, Ordering::Relaxed);
+    out
+}
+
+/// Debit one reduction from the fuel counter. Returns `true` when the
+/// caller may proceed, `false` when the budget is exhausted and the
+/// caller must return Bottom. The unlimited sentinel short-circuits
+/// without touching the counter — the fast path costs a compare.
+#[cfg(not(feature = "no_std"))]
+fn consume_fuel() -> bool {
+    APPLY_FUEL.with(|c| {
+        let fuel = c.get();
+        if fuel == u64::MAX { return true; }
+        if fuel == 0 { return false; }
+        c.set(fuel - 1);
+        true
+    })
+}
+
+#[cfg(feature = "no_std")]
+fn consume_fuel() -> bool {
+    use core::sync::atomic::Ordering;
+    let mut fuel = APPLY_FUEL_ATOMIC.load(Ordering::Relaxed);
+    loop {
+        if fuel == u64::MAX { return true; }
+        if fuel == 0 { return false; }
+        match APPLY_FUEL_ATOMIC.compare_exchange_weak(
+            fuel, fuel - 1, Ordering::Relaxed, Ordering::Relaxed,
+        ) {
+            Ok(_) => return true,
+            Err(curr) => fuel = curr,
+        }
+    }
+}
+
+/// True when a non-default budget is in effect. Used by the parallel
+/// branches of ApplyToAll / Construction / Filter to fall back to the
+/// serial path — Rayon workers have their own thread-local fuel, so
+/// spawning loses the caller's bound. Serial is the correct behavior
+/// under a fuel cap; the parallel speed-up applies only to the
+/// unlimited default.
+#[cfg(not(feature = "no_std"))]
+#[allow(dead_code)] // only referenced under `feature = "parallel"`
+fn fuel_is_bounded() -> bool {
+    APPLY_FUEL.with(|c| c.get() != u64::MAX)
+}
+
+#[cfg(feature = "no_std")]
+#[allow(dead_code)]
+fn fuel_is_bounded() -> bool {
+    APPLY_FUEL_ATOMIC.load(core::sync::atomic::Ordering::Relaxed) != u64::MAX
+}
 //
 // All framework objects compile to these types:
 //   Role        → Selector
@@ -1230,8 +1331,35 @@ fn variant_name(f: &Func) -> &'static str {
     }
 }
 
+/// Apply `func` to `x` with `d` as the def / cell store. Single-entry
+/// β-reduction for the FP algebra: every combining form eventually
+/// dispatches back here for its recursive sub-applications.
+///
+/// # Bottom preservation
+///
+/// `apply(f, ⊥, d) = ⊥` for every `f`; ⊥ flows through Compose,
+/// Construction, ApplyToAll, Insert, Filter, FoldL, and Condition.
+///
+/// # Fuel model (Sec-3, #159)
+///
+/// Each call debits one unit from a thread-local reductions counter
+/// and short-circuits to Bottom when the counter reaches zero. This
+/// is the kernel's cgroup-equivalent *inside* the evaluator: a
+/// malicious Func tree (deep Compose, Def cycle, exploding
+/// Construction over a 1 M-element Seq) hits the ceiling mid-
+/// evaluation. No panic, no stack overflow — Bottom propagates
+/// outward via the bottom-preservation law.
+///
+/// The default budget is `u64::MAX` (unlimited), so existing call
+/// sites are unchanged. Callers scope a suspect tree with
+/// `with_fuel(n, || apply(&f, x, d))`; the prior budget is restored
+/// on return so nested scopes compose cleanly. Tenant-level budgets
+/// (per-minute call caps) live one layer up, around SYSTEM dispatch.
 #[cfg(all(feature = "profile", not(target_arch = "wasm32")))]
 pub fn apply(func: &Func, x: &Object, d: &Object) -> Object {
+    if !consume_fuel() {
+        return Object::Bottom;
+    }
     if !profile::ENABLED.with(|c| c.get()) {
         return match x.is_bottom() {
             true => Object::Bottom,
@@ -1248,8 +1376,15 @@ pub fn apply(func: &Func, x: &Object, d: &Object) -> Object {
     result
 }
 
+/// See the `profile`-gated twin above for the fuel-model doc.
 #[cfg(not(all(feature = "profile", not(target_arch = "wasm32"))))]
 pub fn apply(func: &Func, x: &Object, d: &Object) -> Object {
+    // Fuel debit first: a Func tree that's already blown the budget
+    // must collapse to ⊥ before even checking `x.is_bottom()`, else a
+    // bottom argument would let a malicious caller "free" reductions.
+    if !consume_fuel() {
+        return Object::Bottom;
+    }
     // All functions are bottom-preserving: ⊥ propagates unchanged.
     match x.is_bottom() {
         true => Object::Bottom,
@@ -1551,8 +1686,10 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
         }
 
         Func::Construction(funcs) => {
+            // Serial under a fuel cap (thread-local, Rayon workers
+            // would start at u64::MAX and escape the caller's bound).
             #[cfg(feature = "parallel")]
-            if funcs.len() >= 16 {
+            if funcs.len() >= 16 && !fuel_is_bounded() {
                 let results: Vec<Object> = funcs.par_iter()
                     .map(|f| apply(f, x, d))
                     .collect();
@@ -1578,8 +1715,10 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
                 Some(items) => {
                     // Parallel α: Rayon par_iter for large sequences.
                     // Threshold 64: below this, Rayon spawn overhead exceeds gain.
+                    // Stays serial under a fuel cap so the per-element
+                    // debit is observed on this thread (fuel is thread-local).
                     #[cfg(feature = "parallel")]
-                    if items.len() >= 64 {
+                    if items.len() >= 64 && !fuel_is_bounded() {
                         return Object::seq(
                             items.par_iter().map(|xi| apply(f, xi, d)).collect()
                         );
@@ -1606,8 +1745,10 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
             match x.as_seq() {
                 Some(items) if items.is_empty() => Object::phi(),
                 Some(items) => {
+                    // Parallel filter falls back to serial when a fuel
+                    // cap is in effect — same reasoning as ApplyToAll.
                     #[cfg(feature = "parallel")]
-                    if items.len() >= 64 {
+                    if items.len() >= 64 && !fuel_is_bounded() {
                         let kept: Vec<Object> = items.par_iter()
                             .filter(|xi| apply(p, xi, d) == Object::t())
                             .cloned()
@@ -6218,5 +6359,88 @@ mod tests {
         let before = apply(&map_comp, &x_seq3, &d);
         let after = apply(&normalize(&map_comp), &x_seq3, &d);
         assert_eq!(before, after);
+    }
+
+    // ── Fuel model (Sec-3: #159 enforcement inside apply) ────────
+    //
+    // A malicious Func tree (deep ApplyToAll, recursive Def dispatch,
+    // Compose nested thousands deep) should hit the reductions ceiling
+    // mid-evaluation and return Bottom instead of blowing the stack.
+    // Tests below describe the contract:
+    //   - No fuel set ⇒ unrestricted (existing 789 tests still green).
+    //   - `with_fuel(n, …)` ⇒ at most n apply() recursions; the (n+1)ᵗʰ
+    //     collapses to Bottom and propagates outward.
+
+    #[test]
+    fn fuel_unset_leaves_apply_unrestricted() {
+        // 1 000 nested Compose(Id, Id) evaluates to x when fuel is
+        // unset — default behavior must not regress.
+        let mut f = Func::Id;
+        for _ in 0..1_000 {
+            f = Func::Compose(Box::new(f), Box::new(Func::Id));
+        }
+        assert_eq!(apply(&f, &Object::atom("x"), &defs()), Object::atom("x"));
+    }
+
+    #[test]
+    fn fuel_with_headroom_leaves_result_unchanged() {
+        // Shallow tree + generous budget must still return the real
+        // result, not Bottom. Rules out an off-by-one that treats
+        // unused fuel as exhaustion.
+        let f = Func::Compose(Box::new(Func::Id), Box::new(Func::Id));
+        let result = with_fuel(1_000, || apply(&f, &Object::atom("x"), &defs()));
+        assert_eq!(result, Object::atom("x"));
+    }
+
+    #[test]
+    fn fuel_exhaustion_collapses_deep_compose_to_bottom() {
+        // ~10 000 deep Compose chain with budget = 100: must collapse
+        // to Bottom mid-reduction, not stack-overflow.
+        let mut f = Func::Id;
+        for _ in 0..10_000 {
+            f = Func::Compose(Box::new(f), Box::new(Func::Id));
+        }
+        let result = with_fuel(100, || apply(&f, &Object::atom("x"), &defs()));
+        assert_eq!(result, Object::Bottom);
+    }
+
+    #[test]
+    fn fuel_debits_per_element_in_apply_to_all() {
+        // ApplyToAll over 10 000 elements with budget = 100 must hit
+        // the ceiling mid-scan — per-element fuel, not one-shot.
+        let items: Vec<Object> = (0..10_000)
+            .map(|i| Object::atom(&i.to_string()))
+            .collect();
+        let seq = Object::Seq(items.into());
+        let f = Func::ApplyToAll(Box::new(Func::Id));
+        let result = with_fuel(100, || apply(&f, &seq, &defs()));
+        assert_eq!(result, Object::Bottom);
+    }
+
+    #[test]
+    fn with_fuel_restores_prior_setting_on_return() {
+        // Nested `with_fuel` must be well-scoped — the outer budget
+        // must be restored when the inner scope returns. (Otherwise
+        // callers leak state between sequential invocations.)
+        with_fuel(5, || {
+            with_fuel(100, || {
+                // Inner: no restriction relative to inner budget.
+                assert_eq!(apply(&Func::Id, &Object::atom("x"), &defs()),
+                           Object::atom("x"));
+            });
+            // Outer: fuel should be back to 5 (fully) — spend it all.
+            let mut f = Func::Id;
+            for _ in 0..50 {
+                f = Func::Compose(Box::new(f), Box::new(Func::Id));
+            }
+            // 50-deep chain against budget 5 → Bottom.
+            assert_eq!(apply(&f, &Object::atom("x"), &defs()), Object::Bottom);
+        });
+        // Post-scope: fuel is unset, deep chains succeed again.
+        let mut f = Func::Id;
+        for _ in 0..100 {
+            f = Func::Compose(Box::new(f), Box::new(Func::Id));
+        }
+        assert_eq!(apply(&f, &Object::atom("x"), &defs()), Object::atom("x"));
     }
 }
