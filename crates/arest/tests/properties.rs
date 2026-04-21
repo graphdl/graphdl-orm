@@ -88,28 +88,9 @@ mod compat {
     fn domain_from_state(state: &ast::Object) -> Domain {
         use arest::ast::{fetch_or_phi, binding};
         let nouns = parse_forml2::nouns_from_state(state);
-
-        // fact_types_from_state intentionally leaves roles empty;
-        // fill them in from the Role cell so the old IR shape is
-        // complete.
-        let mut fact_types = parse_forml2::fact_types_from_state(state);
-        let role_cell = fetch_or_phi("Role", state);
-        if let Some(roles) = role_cell.as_seq() {
-            for r in roles.iter() {
-                let ft_id = binding(r, "factType").unwrap_or("").to_string();
-                let noun_name = binding(r, "nounName").unwrap_or("").to_string();
-                let role_index: usize = binding(r, "position")
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0);
-                if let Some(ft) = fact_types.get_mut(&ft_id) {
-                    ft.roles.push(RoleDef { noun_name, role_index });
-                }
-            }
-            // Sort by role_index so role[0] is the first position.
-            for ft in fact_types.values_mut() {
-                ft.roles.sort_by_key(|r| r.role_index);
-            }
-        }
+        // fact_types_from_state populates roles from the Role cell
+        // (sorted by `position`) — no extra compat refill needed.
+        let fact_types = parse_forml2::fact_types_from_state(state);
 
         let mut subtypes: HashMap<String, String> = HashMap::new();
         let mut enum_values: HashMap<String, Vec<String>> = HashMap::new();
@@ -482,8 +463,13 @@ fn t1_constraint_kinds_determined_by_quantifiers() {
     assert!(ir.constraints.iter().any(|c| c.kind == "MC" && c.text.contains("placed by")));
     // "at most one" is UC only
     assert!(ir.constraints.iter().any(|c| c.kind == "UC" && c.text.contains("Email")));
-    // Deontic forbidden
-    assert!(ir.constraints.iter().any(|c| c.kind == "forbidden" && c.text.contains("Prohibited Shipping Method")));
+    // Deontic forbidden — stage12 keeps structural `kind` (UC) and
+    // surfaces the deontic operator via `modality` + `deontic_operator`,
+    // the stable bindings per `parse_forml2_stage2::tests::diff_organization_fixture`.
+    assert!(ir.constraints.iter().any(|c|
+        c.modality == "deontic"
+            && c.deontic_operator.as_deref() == Some("forbidden")
+            && c.text.contains("Prohibited Shipping Method")));
 }
 
 #[test]
