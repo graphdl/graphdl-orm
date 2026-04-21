@@ -2762,7 +2762,8 @@ fn enrich_noun_cells(ir: &mut Cells) {
 }
 
 /// #283 — Every fact-type id in the `FactType` cell. Replaces
-/// `ir.fact_types.keys()`.
+/// `ir.fact_types.keys()`. Test-only helper.
+#[cfg(test)]
 fn fact_type_ids(
     cells: &HashMap<String, Vec<crate::ast::Object>>,
 ) -> Vec<String> {
@@ -2786,6 +2787,8 @@ fn fact_type_exists(
 }
 
 /// #283 — Reading text for a fact-type via the `FactType` cell.
+/// Test-only helper.
+#[cfg(test)]
 fn fact_type_reading(
     cells: &HashMap<String, Vec<crate::ast::Object>>,
     id: &str,
@@ -2884,7 +2887,8 @@ fn push_derivation_rule_cells(ir: &mut Cells, rule: &DerivationRuleDef) {
 
 /// #283 — Rebuild `Vec<DerivationRuleDef>` from the `DerivationRule` cell.
 /// The `json` binding on each fact is the lossless encoding.
-#[cfg(feature = "std-deps")]
+/// Test-only helper (legacy JSON-blob path).
+#[cfg(all(test, feature = "std-deps"))]
 fn derivation_rules_from_cells(
     cells: &HashMap<String, Vec<crate::ast::Object>>,
 ) -> Vec<DerivationRuleDef> {
@@ -2897,9 +2901,9 @@ fn derivation_rules_from_cells(
 
 /// #283 — Rebuild `Vec<ConstraintDef>` from the `Constraint` cell.
 /// The cell is lossless — `constraint_to_fact` embeds the full JSON
-/// encoding of each ConstraintDef under the `json` binding. Callers
-/// that want the typed view (tests, resolve paths) go through here.
-#[cfg(feature = "std-deps")]
+/// encoding of each ConstraintDef under the `json` binding.
+/// Test-only helper.
+#[cfg(all(test, feature = "std-deps"))]
 fn constraints_from_cells(
     cells: &HashMap<String, Vec<crate::ast::Object>>,
 ) -> Vec<ConstraintDef> {
