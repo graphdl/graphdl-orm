@@ -1458,6 +1458,18 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
 
             Some((format!("populate:{}", noun_name), Func::constant(config)))
         }));
+        // Parallel emission of populate_fetch:{noun} as a dispatchable
+        // Platform name (#305 #3). Hosts install a sync callback via
+        // `ast::install_platform_fn("populate_fetch:<noun>", ...)`
+        // that reads the compile-emitted populate:{noun} config,
+        // performs the fetch (or projects a pre-staged cache cell),
+        // calls `ast::ingest_federated_facts`, and returns the
+        // resulting Citation id as an atom. Without an installed
+        // callback, apply_platform returns Bottom — safe default.
+        defs.extend(backed_nouns.iter().map(|(noun_name, _)| {
+            let key = format!("populate_fetch:{}", noun_name);
+            (key.clone(), Func::Platform(key))
+        }));
         diag!("  [profile] {} federation defs", backed_nouns.len());
     }
 
@@ -2702,13 +2714,85 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                     consequent_reading_func.clone(),
                     bindings,
                 ]);
-                return CompiledDerivation {
-                    id, text, kind,
-                    func: Func::compose(
-                        Func::apply_to_all(derive_one),
-                        instances_of_noun_func(noun),
+                // Dedup guard (#287 gap #12): when the consequent cell is
+                // statically known and the instance role is declared on
+                // the consequent FT, skip per-instance emission for any
+                // instance that already appears at that role. Mirrors
+                // the participation check the deleted
+                // `compile_subtype_inheritance` did, so the fixpoint
+                // doesn't run an extra round deduping partial inherits
+                // that would collide with user-asserted facts. Degrades
+                // gracefully when the consequent FT or role isn't known
+                // (AntecedentRole consequents, or roles missing from
+                // the catalog) — emits unconditionally and relies on
+                // `forward_chain_defs_state` dedup.
+                let role_idx_in_cons = {
+                    let cell_id = rule.consequent_cell.literal_id();
+                    // The `_cwa_negation:<ft_id>` synthesized cells carry
+                    // a prefix — strip it when looking up the underlying
+                    // FT schema. Literal cells without `:` pass through.
+                    let lookup_id = cell_id.split_once(':').map(|(_, b)| b).unwrap_or(cell_id);
+                    data.fact_types.get(lookup_id)
+                        .and_then(|ft| ft.roles.iter()
+                            .find(|r| r.noun_name == rule.consequent_instance_role)
+                            .map(|r| r.role_index))
+                };
+                let per_instance = match role_idx_in_cons {
+                    Some(ri) => {
+                        // match_pred: <instance, cons_fact> -> T when cons_fact
+                        // has this instance at the target role.
+                        let match_pred = Func::compose(Func::Eq, Func::construction(vec![
+                            Func::Selector(1),
+                            Func::compose(role_value(ri), Func::Selector(2)),
+                        ]));
+                        // <instance, cons_facts> -> T when no cons_fact matches.
+                        let not_participates = Func::compose(
+                            Func::NullTest,
+                            Func::compose(Func::filter(match_pred), Func::DistL),
+                        );
+                        // Per <instance, cons_facts>: if not_participates, Selector(1)
+                        // projects back to the instance atom and feeds derive_one.
+                        Func::condition(
+                            not_participates,
+                            Func::construction(vec![
+                                Func::compose(derive_one, Func::Selector(1)),
+                            ]),
+                            Func::constant(Object::phi()),
+                        )
+                    }
+                    None => {
+                        // Fallback (no consequent catalog entry or unknown role):
+                        // emit always, let forward_chain dedup. Wrap in singleton
+                        // for Concat symmetry with the guarded path.
+                        Func::construction(vec![derive_one])
+                    }
+                };
+                // Shape depends on whether we needed the guard:
+                //   guarded: Concat . α(per_instance) . DistR . [instances, cons_facts]
+                //   unguarded: Concat . α(per_instance) . instances
+                let func = match role_idx_in_cons {
+                    Some(_) => {
+                        let cons_facts = extract_facts_from_pop(rule.consequent_cell.literal_id());
+                        Func::compose(
+                            Func::Concat,
+                            Func::compose(
+                                Func::apply_to_all(per_instance),
+                                Func::compose(Func::DistR, Func::construction(vec![
+                                    instances_of_noun_func(noun),
+                                    cons_facts,
+                                ])),
+                            ),
+                        )
+                    }
+                    None => Func::compose(
+                        Func::Concat,
+                        Func::compose(
+                            Func::apply_to_all(per_instance),
+                            instances_of_noun_func(noun),
+                        ),
                     ),
                 };
+                return CompiledDerivation { id, text, kind, func };
             }
             // Per-fact derived: input is one antecedent fact (already in
             // <<noun, val>, ...> binding-seq shape); output is
@@ -2788,6 +2872,20 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
         _ => {
             // Multi-antecedent existence check. Fires when every
             // antecedent has at least one surviving fact.
+            //
+            // Defensive: the multi-antecedent branch isn't wired up for
+            // `AntecedentRole` consequents — the per-step input is a
+            // structured nested tuple rather than a single fact, so
+            // `role_value_by_name` would silently return phi and the
+            // derivation would emit nothing. Rather than fail quietly,
+            // report it at compile time so a bad rule shape is
+            // visible. Callers that want this shape should either
+            // route to `compile_join_derivation` or reshape the rule.
+            if matches!(rule.consequent_cell, crate::types::ConsequentCellSource::AntecedentRole { .. }) {
+                diag!("[warn] multi-antecedent rule `{}` has an AntecedentRole consequent; \
+                      this path emits phi (no facts). Route through compile_join_derivation or restructure.",
+                      rule.id);
+            }
             let ant_checks: Vec<Func> = antecedent_ids.iter().enumerate()
                 .map(|(i, ft_id)| Func::compose(
                     Func::compose(Func::Not, Func::NullTest),
