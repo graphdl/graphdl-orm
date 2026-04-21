@@ -40,6 +40,54 @@ type Cells = HashMap<String, Vec<Object>>;
 ///
 /// Returns a `Cells` map the caller can merge into a larger state.
 pub fn tokenize_statement(statement_id: &str, text: &str, nouns: &[String]) -> Cells {
+    let mut sorted_nouns: Vec<&str> = nouns.iter().map(|s| s.as_str()).collect();
+    sorted_nouns.sort_by(|a, b| b.len().cmp(&a.len()));
+    tokenize_statement_presorted(statement_id, text, &sorted_nouns)
+}
+
+/// Pre-built first-byte index over a length-desc noun list. Stage-2
+/// builds one of these per parse and reuses it across all ~500 calls
+/// to `tokenize_statement_with_buckets`, avoiding the per-call bucket
+/// rebuild.
+pub struct NounBuckets<'a> {
+    by_first_byte: [Option<Vec<&'a str>>; 128],
+}
+
+impl<'a> NounBuckets<'a> {
+    /// `sorted_nouns` must be length-desc. Bucketing by first byte
+    /// preserves that order inside each bucket, which keeps
+    /// longest-first match semantics (`Support Request` before
+    /// `Request`).
+    pub fn from_sorted(sorted_nouns: &[&'a str]) -> Self {
+        let mut by_first_byte: [Option<Vec<&'a str>>; 128] = [const { None }; 128];
+        for n in sorted_nouns {
+            if let Some(&b0) = n.as_bytes().first() {
+                if b0 < 128 {
+                    by_first_byte[b0 as usize].get_or_insert_with(Vec::new).push(*n);
+                }
+            }
+        }
+        NounBuckets { by_first_byte }
+    }
+
+    fn bucket(&self, b0: u8) -> Option<&[&'a str]> {
+        if b0 >= 128 { return None; }
+        self.by_first_byte[b0 as usize].as_deref()
+    }
+}
+
+/// Hot-path entry point: caller has already sorted the noun slice by
+/// length descending. Builds a `NounBuckets` index and delegates; for
+/// bulk tokenization prefer `tokenize_statement_with_buckets` so the
+/// index is shared across calls.
+pub fn tokenize_statement_presorted(statement_id: &str, text: &str, sorted_nouns: &[&str]) -> Cells {
+    let buckets = NounBuckets::from_sorted(sorted_nouns);
+    tokenize_statement_with_buckets(statement_id, text, &buckets)
+}
+
+/// Fastest entry point for bulk tokenization: caller has pre-built
+/// the `NounBuckets` index. Stage-2 uses this for the per-line loop.
+pub fn tokenize_statement_with_buckets(statement_id: &str, text: &str, buckets: &NounBuckets<'_>) -> Cells {
     let mut cells: Cells = HashMap::new();
     // Canonical text: drop the trailing period AND the leading ORM 2
     // derivation marker (`* ` / `** ` / `+ `). Legacy's `try_derivation`
@@ -74,10 +122,9 @@ pub fn tokenize_statement(statement_id: &str, text: &str, nouns: &[String]) -> C
     // 3. Strip leading quantifier.
     let (body, quantifier) = strip_leading_quantifier(body);
 
-    // 3. Longest-first noun matching over the body.
-    let mut sorted_nouns: Vec<&str> = nouns.iter().map(|s| s.as_str()).collect();
-    sorted_nouns.sort_by(|a, b| b.len().cmp(&a.len()));
-    let role_refs = match_role_references(body, &sorted_nouns);
+    // 3. Longest-first noun matching over the body. Caller supplies
+    //    a pre-built `NounBuckets` so we skip per-call partitioning.
+    let role_refs = match_role_references(body, buckets);
 
     // 4. Head Noun + Verb derivation from role refs.
     let head_noun = role_refs.first().map(|r| r.noun.clone());
@@ -424,7 +471,7 @@ struct RoleRef {
     span_end: usize,
 }
 
-fn match_role_references(text: &str, sorted_nouns: &[&str]) -> Vec<RoleRef> {
+fn match_role_references(text: &str, buckets: &NounBuckets<'_>) -> Vec<RoleRef> {
     let mut refs: Vec<RoleRef> = Vec::new();
     let bytes = text.as_bytes();
     let mut i = 0;
@@ -446,9 +493,13 @@ fn match_role_references(text: &str, sorted_nouns: &[&str]) -> Vec<RoleRef> {
             i += 1;
             continue;
         }
+        let bucket = match buckets.bucket(bytes[i]) {
+            Some(b) => b,
+            None => { i += 1; continue; }
+        };
         let rest = &text[i..];
-        // Longest-first match.
-        if let Some(noun) = sorted_nouns.iter().find(|n| {
+        // Longest-first match within the first-byte bucket.
+        if let Some(noun) = bucket.iter().find(|n| {
             rest.starts_with(**n) && {
                 let end = i + n.len();
                 end == bytes.len() || {
