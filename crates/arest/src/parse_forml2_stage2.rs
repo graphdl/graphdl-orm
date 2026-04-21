@@ -1192,13 +1192,29 @@ fn collect_statement_ids(state: &Object) -> Vec<String> {
 ///   5. Merge all per-statement cells into one state, then apply
 ///      `classify_statements` to emit `Statement_has_Classification`.
 ///   6. Run every per-kind translator and assemble the result.
+/// Process-wide cache for the bundled FORML 2 grammar state. Parsed
+/// once on first access; every `parse_to_state_via_stage12` call
+/// reuses the same `Object`. Killed the primary perf cliff that
+/// would have made the #285 wire-up melt machines (legacy parse of
+/// the ~140-line grammar file per call).
+#[cfg(feature = "std-deps")]
+static GRAMMAR_STATE_CACHE: std::sync::OnceLock<Object> = std::sync::OnceLock::new();
+
+#[cfg(feature = "std-deps")]
+fn cached_grammar_state() -> Result<&'static Object, String> {
+    if let Some(s) = GRAMMAR_STATE_CACHE.get() { return Ok(s); }
+    let grammar = include_str!("../../../readings/forml2-grammar.md");
+    let parsed = crate::parse_forml2::parse_to_state(grammar)
+        .map_err(|e| alloc::format!("grammar parse failed: {}", e))?;
+    // OnceLock::set is safe under races — first writer wins, others
+    // drop their parse. We then read via `get` which succeeds.
+    let _ = GRAMMAR_STATE_CACHE.set(parsed);
+    Ok(GRAMMAR_STATE_CACHE.get().expect("just set"))
+}
+
 #[cfg(feature = "std-deps")]
 pub fn parse_to_state_via_stage12(text: &str) -> Result<Object, String> {
-    use crate::ast::merge_states;
-
-    let grammar = include_str!("../../../readings/forml2-grammar.md");
-    let grammar_state = crate::parse_forml2::parse_to_state(grammar)
-        .map_err(|e| alloc::format!("grammar parse failed: {}", e))?;
+    let grammar_state = cached_grammar_state()?;
 
     // #309 — enforce Theorem 1's no-reserved-substring rule. Scan
     // unquoted noun declarations in the source and reject any that
@@ -1207,17 +1223,17 @@ pub fn parse_to_state_via_stage12(text: &str) -> Result<Object, String> {
     // noun cell as single tokens.
     reject_reserved_noun_declarations(text)?;
 
-    let legacy_state = crate::parse_forml2::parse_to_state(text)?;
-    let mut nouns: Vec<String> = fetch_or_phi("Noun", &legacy_state)
-        .as_seq()
-        .map(|facts| facts.iter()
-            .filter_map(|f| binding(f, "name").map(String::from))
-            .collect())
-        .unwrap_or_default();
+    // Direct text-scan bootstrap for noun names — avoids running the
+    // full legacy cascade a second time just to recover the Noun cell.
+    let mut nouns: Vec<String> = extract_declared_noun_names(text);
     nouns.sort_by(|a, b| b.len().cmp(&a.len()));
 
     let lines = crate::parse_forml2::join_derivation_continuations(text);
-    let mut stmt_state: Object = Object::Map(HashMap::new());
+    // Accumulate per-statement cells into a single HashMap, then lift
+    // to Object::Map once at the end. Previously we did
+    // `stmt_state = merge_states(&stmt_state, ...)` per line, which is
+    // O(n²) on the growing cell vectors.
+    let mut acc_cells: HashMap<String, Vec<Object>> = HashMap::new();
     for (i, raw_line) in lines.iter().enumerate() {
         let line = raw_line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -1271,9 +1287,16 @@ pub fn parse_to_state_via_stage12(text: &str) -> Result<Object, String> {
         let statement_id = alloc::format!("s{}", i);
         let cells = crate::parse_forml2_stage1::tokenize_statement(
             &statement_id, line, &nouns);
-        let stage1_object = cells_to_object(cells);
-        stmt_state = merge_states(&stmt_state, &stage1_object);
+        for (cell_name, facts) in cells.into_iter() {
+            acc_cells.entry(cell_name).or_default().extend(facts);
+        }
     }
+    let stmt_state: Object = {
+        let map: HashMap<String, Object> = acc_cells.into_iter()
+            .map(|(k, v)| (k, Object::Seq(v.into())))
+            .collect();
+        Object::Map(map)
+    };
 
     // #301 — possibility-override synthetic FactType registrations.
     // Scan the raw source for `It is possible that ...` lines and
@@ -1293,7 +1316,7 @@ pub fn parse_to_state_via_stage12(text: &str) -> Result<Object, String> {
         })
         .collect();
 
-    let classified = classify_statements(&stmt_state, &grammar_state);
+    let classified = classify_statements(&stmt_state, grammar_state);
 
     // Run translate_nouns FIRST so subsequent translators that consult
     // `declared_noun_names` see domain nouns (not just the grammar's
@@ -1400,6 +1423,88 @@ fn reject_reserved_noun_declarations(text: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Direct text scan for declared noun names — avoids running the
+/// full legacy cascade just to recover the Noun cell.
+///
+/// Recognises the same declaration shapes as
+/// `reject_reserved_noun_declarations` (entity / value / subtype /
+/// abstract / partition), plus `{A, B, ...} are mutually exclusive
+/// subtypes of C` which contributes A, B, and C to the list.
+/// Quoted names have their surrounding quotes stripped. Partition
+/// subtype lists are expanded so each member becomes a noun name.
+/// Handles `(.refScheme)` suffixes by trimming at the open paren.
+#[cfg(feature = "std-deps")]
+fn extract_declared_noun_names(text: &str) -> Vec<String> {
+    let mut names: alloc::collections::BTreeSet<String> =
+        alloc::collections::BTreeSet::new();
+
+    let push = |names: &mut alloc::collections::BTreeSet<String>, raw: &str| {
+        let trimmed = raw.trim();
+        let unquoted = trimmed
+            .strip_prefix('\'')
+            .and_then(|s| s.strip_suffix('\''))
+            .unwrap_or(trimmed);
+        let name = match unquoted.find('(') {
+            Some(p) => unquoted[..p].trim(),
+            None => unquoted.trim(),
+        };
+        if !name.is_empty() {
+            names.insert(name.to_string());
+        }
+    };
+
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        // Partition declaration — both the super and each subtype get
+        // added. `Animal is partitioned into Cat, Dog, Bird.`
+        if let Some(idx) = line.find(" is partitioned into ") {
+            push(&mut names, &line[..idx]);
+            let tail = line[idx + " is partitioned into ".len()..]
+                .trim_end_matches('.')
+                .trim();
+            for sub in tail.split(',') {
+                push(&mut names, sub);
+            }
+            continue;
+        }
+        // Mutually-exclusive-subtypes braces. Both braced entries and
+        // the post-`subtypes of` supertype count.
+        if line.starts_with('{') {
+            if let Some(end) = line.find('}') {
+                let inner = &line[1..end];
+                for sub in inner.split(',') {
+                    push(&mut names, sub);
+                }
+                if let Some(st_idx) = line.find(" subtypes of ") {
+                    let tail = line[st_idx + " subtypes of ".len()..]
+                        .trim_end_matches('.')
+                        .trim();
+                    push(&mut names, tail);
+                }
+                continue;
+            }
+        }
+        // Subtype. `Dog is a subtype of Animal.`
+        if let Some(idx) = line.find(" is a subtype of ") {
+            push(&mut names, &line[..idx]);
+            let tail = line[idx + " is a subtype of ".len()..]
+                .trim_end_matches('.')
+                .trim();
+            push(&mut names, tail);
+            continue;
+        }
+        // Entity / value type / abstract.
+        let before = line
+            .strip_suffix(" is an entity type.")
+            .or_else(|| line.strip_suffix(" is a value type."))
+            .or_else(|| line.strip_suffix(" is abstract."));
+        if let Some(before) = before {
+            push(&mut names, before);
+        }
+    }
+    names.into_iter().collect()
 }
 
 #[cfg(feature = "std-deps")]
