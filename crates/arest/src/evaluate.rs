@@ -61,11 +61,23 @@ fn derive_one_round(
     all_derived: &[DerivedFact],
     d: &ast::Object,
 ) -> Vec<DerivedFact> {
-    let trace = std::env::var("AREST_STAGE12_TRACE").is_ok();
-    let t_ek = std::time::Instant::now();
     let existing_keys = state_keys(current_state);
-    if trace { eprintln!("    [rnd] state_keys: {:?} ({} keys)",
-        t_ek.elapsed(), existing_keys.len()); }
+    derive_one_round_with_keys(
+        derivation_defs, current_state, all_derived, d, &existing_keys)
+}
+
+/// Like [`derive_one_round`] but takes a pre-built `existing_keys`
+/// set — lets the semi-naive chainer maintain it incrementally
+/// across rounds instead of rebuilding ~5k-element HashSets every
+/// round. On core.md this was ~3ms per round of pure re-hashing.
+fn derive_one_round_with_keys(
+    derivation_defs: &[(&str, &ast::Func)],
+    current_state: &ast::Object,
+    all_derived: &[DerivedFact],
+    d: &ast::Object,
+    existing_keys: &HashSet<FactKey>,
+) -> Vec<DerivedFact> {
+    let trace = std::env::var("AREST_STAGE12_TRACE").is_ok();
     let t_dk = std::time::Instant::now();
     let derived_keys: HashSet<FactKey> = all_derived.iter().map(fact_key).collect();
     if trace { eprintln!("    [rnd] derived_keys: {:?}", t_dk.elapsed()); }
@@ -121,12 +133,18 @@ pub fn forward_chain_defs_state_semi_naive(
     let trace = std::env::var("AREST_STAGE12_TRACE").is_ok();
     let mut current_state = d.clone();
     let mut all_derived: Vec<DerivedFact> = Vec::new();
+    // Base set of fact keys in `d`. Built once here and updated
+    // incrementally as rounds emit new facts — on core.md this cut
+    // ~3ms per round of re-hashing the unchanged grammar portion of
+    // the state.
+    let t_ek = std::time::Instant::now();
+    let mut existing_keys = state_keys(&current_state);
+    if trace { eprintln!("    [sn] initial state_keys: {:?} ({} keys)",
+        t_ek.elapsed(), existing_keys.len()); }
     // `dirty_cells == None` means "run everything" (initial round or
     // caller wants no filtering); `Some(set)` restricts to rules that
     // read at least one of those cells.
     let mut dirty_cells: Option<HashSet<String>> = None;
-    // Project to `(&str, &Func)` for the inner kernel — same logic as
-    // the naïve chainer but with the per-round def filter applied.
     for round in 0..max_rounds {
         let active: Vec<(&str, &ast::Func)> = derivation_defs.iter()
             .filter(|(_, _, cells)| match (&dirty_cells, cells) {
@@ -142,7 +160,8 @@ pub fn forward_chain_defs_state_semi_naive(
                 round, active.len(), derivation_defs.len());
         }
         if active.is_empty() { break; }
-        let new_facts = derive_one_round(active.as_slice(), &current_state, &all_derived, d);
+        let new_facts = derive_one_round_with_keys(
+            active.as_slice(), &current_state, &all_derived, d, &existing_keys);
         if new_facts.is_empty() { break; }
 
         let mut by_cell: HashMap<String, Vec<ast::Object>> =
@@ -152,6 +171,9 @@ pub fn forward_chain_defs_state_semi_naive(
                 .map(|(k, v)| (k.as_str(), v.as_str())).collect();
             by_cell.entry(fact.fact_type_id.clone()).or_default()
                 .push(ast::fact_from_pairs(&pairs));
+            // Keep `existing_keys` in sync so the next round's filter
+            // doesn't have to re-walk the whole state.
+            existing_keys.insert(fact_key(fact));
         }
         let mut next_dirty = HashSet::new();
         for (cell_name, facts) in by_cell {
