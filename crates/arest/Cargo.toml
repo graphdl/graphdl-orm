@@ -51,6 +51,12 @@ std-deps = ["dep:serde", "dep:serde_json", "dep:regex", "dep:hmac", "dep:sha2", 
 # both of which are unconditional deps — the feature flag only
 # toggles std / core / alloc selection in the crate itself.
 no_std = []
+# SWIM-style gossip membership (Cluster-1). Pulls in std::net +
+# std::thread — incompatible with no_std. Off by default so embedded
+# and FPGA builds don't pay for a network stack they won't use.
+# Enable via `cargo test --features cluster --lib` or at runtime by
+# passing `--cluster <bootstrap-addr>` to arest-cli.
+cluster = []
 
 [dependencies]
 # serde / serde_json / regex require std — made optional so the no_std

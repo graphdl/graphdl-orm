@@ -111,6 +111,12 @@ pub mod check;
 #[cfg(not(feature = "no_std"))]
 pub mod storage;
 
+// SWIM-style gossip membership. Gated on `cluster` feature (off by
+// default) and std — uses std::net, std::thread, std::time. See
+// cluster/mod.rs for the protocol details.
+#[cfg(all(feature = "cluster", not(feature = "no_std")))]
+pub mod cluster;
+
 // Stress harness for compile_explicit_derivation (#296). Test-only; not
 // shipped in any build.
 #[cfg(all(test, not(feature = "no_std")))]
