@@ -81,6 +81,38 @@ function violationMessage(body: unknown): string | null {
   return null
 }
 
+/**
+ * Error thrown by arestDataProvider when the worker returns a 4xx /
+ * 5xx. Carries the full violations list (Thm-5 envelope) on the
+ * error instance so form-level UI can map each violation to a
+ * specific field via mapViolationsToFields.
+ */
+type ViolationList = NonNullable<ArestEnvelope<unknown>['violations']>
+
+export class ArestError extends Error {
+  readonly status: number
+  readonly violations: ViolationList
+  readonly body: unknown
+
+  constructor(message: string, status: number, body: unknown, violations: ViolationList) {
+    super(message)
+    this.name = 'ArestError'
+    this.status = status
+    this.violations = violations
+    this.body = body
+  }
+}
+
+function extractViolationsList(body: unknown): ViolationList {
+  if (!isRecord(body)) return []
+  const v = body.violations
+  if (Array.isArray(v)) return v as ViolationList
+  if (isRecord(body.data) && Array.isArray((body.data as { violations?: unknown }).violations)) {
+    return (body.data as { violations: ViolationList }).violations
+  }
+  return []
+}
+
 async function request(
   url: string,
   init: RequestInit,
@@ -102,7 +134,7 @@ async function request(
   }
   if (!response.ok) {
     const msg = violationMessage(body) || `HTTP ${response.status}`
-    throw new Error(msg)
+    throw new ArestError(msg, response.status, body, extractViolationsList(body))
   }
   return body
 }

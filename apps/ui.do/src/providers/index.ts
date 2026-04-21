@@ -10,7 +10,7 @@
  * The navigation provider caches its resource list on first call;
  * tests can construct a fresh factory per run.
  */
-export { createArestDataProvider } from './arestDataProvider'
+export { createArestDataProvider, ArestError } from './arestDataProvider'
 export type { ArestDataProviderOptions } from './arestDataProvider'
 export { createArestAuthProvider } from './arestAuthProvider'
 export type { ArestAuthProviderOptions } from './arestAuthProvider'

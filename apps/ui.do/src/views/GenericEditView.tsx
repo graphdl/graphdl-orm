@@ -12,6 +12,8 @@ import { useArestOne, useArestUpdate } from '../hooks/useArestResource'
 import { useOpenApiSchema, type FieldDef } from '../schema'
 import { humanize } from '../schema/openApiSchema'
 import { SchemaInput } from './schemaInputs'
+import { ArestError } from '../providers'
+import { mapViolationsToFields, type Violation } from './violationMapping'
 
 export interface GenericEditViewProps {
   noun: string
@@ -30,6 +32,7 @@ export function GenericEditView(props: GenericEditViewProps): ReactElement {
   const mutate = useArestUpdate<Record<string, unknown>>(noun, id, { baseUrl })
   const [values, setValues] = useState<Record<string, unknown>>({})
   const [error, setError] = useState<string | null>(null)
+  const [fieldErrors, setFieldErrors] = useState<Record<string, Violation>>({})
 
   // Hydrate the form once the record loads. Schema fields only (so we
   // don't silently persist worker-emitted derived fields).
@@ -45,11 +48,15 @@ export function GenericEditView(props: GenericEditViewProps): ReactElement {
   const onSubmit = async (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault()
     setError(null)
+    setFieldErrors({})
     try {
       const res = await mutate.update(values)
       onSaved?.(res.data as Record<string, unknown>)
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
+      if (err instanceof ArestError) {
+        setFieldErrors(mapViolationsToFields(err.violations, schema.fields))
+      }
     }
   }
 
@@ -63,16 +70,29 @@ export function GenericEditView(props: GenericEditViewProps): ReactElement {
       record={entity.data?.data as Record<string, unknown> | undefined}
     >
       <form data-testid="generic-edit-form" onSubmit={onSubmit}>
-        {schema.fields.map((f: FieldDef) => (
-          <div key={f.name} style={{ marginBottom: '1rem' }}>
-            <label style={{ display: 'block', fontWeight: 600 }}>{f.label}</label>
-            <SchemaInput
-              field={f}
-              value={values[f.name]}
-              onChange={(next) => setValues((prev) => ({ ...prev, [f.name]: next }))}
-            />
-          </div>
-        ))}
+        {schema.fields.map((f: FieldDef) => {
+          const fe = fieldErrors[f.name]
+          return (
+            <div key={f.name} style={{ marginBottom: '1rem' }}>
+              <label style={{ display: 'block', fontWeight: 600 }}>{f.label}</label>
+              <SchemaInput
+                field={f}
+                value={values[f.name]}
+                onChange={(next) => setValues((prev) => ({ ...prev, [f.name]: next }))}
+                baseUrl={baseUrl}
+              />
+              {fe && (
+                <p
+                  role="alert"
+                  data-testid={`field-error-${f.name}`}
+                  style={{ color: 'crimson', fontSize: '0.875rem', margin: '0.25rem 0 0' }}
+                >
+                  {fe.detail ?? fe.reading}
+                </p>
+              )}
+            </div>
+          )
+        })}
         {error && <p role="alert" data-testid="edit-error" style={{ color: 'crimson' }}>{error}</p>}
         <div style={{ display: 'flex', gap: '0.5rem' }}>
           <button type="submit" disabled={mutate.isPending}>
