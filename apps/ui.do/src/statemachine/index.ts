@@ -6,7 +6,9 @@
  */
 export {
   arestToXStateConfig,
+  buildStatelyDeeplink,
   describeStatuses,
+  findDeadCycles,
   listStatuses,
   type ArestStateMachineDefinition,
   type ArestTransition,
@@ -14,6 +16,13 @@ export {
   type XStateConfig,
   type XStateNode,
 } from './xstateConfig'
+
+export {
+  useGuards,
+  type ArestGuard,
+  type UseGuardsOptions,
+  type UseGuardsResult,
+} from './useGuards'
 
 export {
   useStateMachine,

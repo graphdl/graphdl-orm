@@ -2,7 +2,9 @@ import { describe, expect, it } from 'vitest'
 import { createMachine } from 'xstate'
 import {
   arestToXStateConfig,
+  buildStatelyDeeplink,
   describeStatuses,
+  findDeadCycles,
   listStatuses,
   type ArestStateMachineDefinition,
   type ArestTransition,
@@ -58,6 +60,60 @@ describe('arestToXStateConfig', () => {
     // state in an `on` block). This asserts that arestToXStateConfig
     // produces a valid machine whenever the facts are consistent.
     expect(() => createMachine(cfg)).not.toThrow()
+  })
+})
+
+describe('findDeadCycles', () => {
+  it('returns empty when every cycle has an exit', () => {
+    // Order SM: all cycles (none) have exits. Every state is either
+    // the initial or reaches a terminal.
+    expect(findDeadCycles(orderSMD, orderTransitions)).toEqual([])
+  })
+
+  it('flags a two-state cycle with no outgoing exit', () => {
+    const smd: ArestStateMachineDefinition = { id: 'X', noun: 'X', initial: 'A' }
+    const ts: ArestTransition[] = [
+      { id: 'a-to-b', from: 'A', to: 'B' },
+      { id: 'b-to-a', from: 'B', to: 'A' },
+    ]
+    const dead = findDeadCycles(smd, ts)
+    expect(dead).toHaveLength(1)
+    expect(dead[0].sort()).toEqual(['A', 'B'])
+  })
+
+  it('does NOT flag a cycle that has an exit transition', () => {
+    const smd: ArestStateMachineDefinition = { id: 'X', noun: 'X', initial: 'A' }
+    const ts: ArestTransition[] = [
+      { id: 'a-to-b', from: 'A', to: 'B' },
+      { id: 'b-to-a', from: 'B', to: 'A' },
+      { id: 'escape', from: 'A', to: 'Done' },
+    ]
+    expect(findDeadCycles(smd, ts)).toEqual([])
+  })
+
+  it('flags a self-loop without exit', () => {
+    const smd: ArestStateMachineDefinition = { id: 'X', noun: 'X', initial: 'Stuck' }
+    const ts: ArestTransition[] = [
+      { id: 'self', from: 'Stuck', to: 'Stuck' },
+    ]
+    expect(findDeadCycles(smd, ts)).toEqual([['Stuck']])
+  })
+})
+
+describe('buildStatelyDeeplink', () => {
+  it('produces a stately.ai URL with a URL-safe base64 machine payload', () => {
+    const cfg = arestToXStateConfig(orderSMD, orderTransitions)
+    const url = buildStatelyDeeplink(cfg)
+    expect(url.startsWith('https://stately.ai/viz?machine=')).toBe(true)
+    // The encoded payload is URL-safe (no +, /, or = padding).
+    const encoded = url.slice('https://stately.ai/viz?machine='.length)
+    expect(encoded).not.toMatch(/[+/=]/)
+    // Reversing the encoding recovers the original config.
+    const b64 = encoded.replace(/-/g, '+').replace(/_/g, '/')
+    const pad = b64.length % 4 === 0 ? '' : '='.repeat(4 - (b64.length % 4))
+    const payload = JSON.parse(atob(b64 + pad))
+    expect(payload.machine.id).toBe('Order')
+    expect(payload.machine.initial).toBe('In Cart')
   })
 })
 

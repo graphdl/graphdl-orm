@@ -18,7 +18,9 @@ import { useEffect, useMemo, useState, type FormEvent, type ReactElement } from 
 import { createMachine } from 'xstate'
 import {
   arestToXStateConfig,
+  buildStatelyDeeplink,
   describeStatuses,
+  findDeadCycles,
   listStatuses,
   type ArestTransition,
   type XStateConfig,
@@ -33,6 +35,12 @@ export interface StateMachineEditorProps {
   onConfigChange?: (config: XStateConfig) => void
   /** When true, disables all edit controls (view-only mode). */
   readOnly?: boolean
+  /**
+   * When set, overlays an "active state" indicator on the named
+   * status. Used to show the live state of a running instance:
+   *   <StateMachineEditor smdId="Order" currentStatus={order.status} />
+   */
+  currentStatus?: string
 }
 
 interface EditorRow {
@@ -41,7 +49,7 @@ interface EditorRow {
 }
 
 export function StateMachineEditor(props: StateMachineEditorProps): ReactElement {
-  const { smdId, baseUrl, onConfigChange, readOnly } = props
+  const { smdId, baseUrl, onConfigChange, readOnly, currentStatus } = props
   const {
     smd,
     transitions,
@@ -58,6 +66,13 @@ export function StateMachineEditor(props: StateMachineEditorProps): ReactElement
   const xstateConfig = useMemo<XStateConfig | null>(() => {
     if (!smd) return null
     return arestToXStateConfig(smd, transitions)
+  }, [smd, transitions])
+
+  // Liveness warning — whitepaper Theorem 3 proof requires every
+  // cycle to have an exit transition.
+  const deadCycles = useMemo(() => {
+    if (!smd) return []
+    return findDeadCycles(smd, transitions)
   }, [smd, transitions])
 
   // Surface the xstate config to consumers — and validate it compiles.
@@ -135,11 +150,36 @@ export function StateMachineEditor(props: StateMachineEditorProps): ReactElement
         <h2>{smd.noun} state machine</h2>
         <p>
           Initial: <code data-testid="sm-initial">{smd.initial}</code>
+          {currentStatus && (
+            <> · Current: <code data-testid="sm-current">{currentStatus}</code></>
+          )}
         </p>
+        {xstateConfig && (
+          <p>
+            <a
+              data-testid="sm-stately-deeplink"
+              href={buildStatelyDeeplink(xstateConfig)}
+              target="_blank"
+              rel="noopener noreferrer"
+            >Open in Stately Studio ↗</a>
+          </p>
+        )}
       </header>
 
       {error && (
         <p role="alert" data-testid="sm-error" style={{ color: 'crimson' }}>{error}</p>
+      )}
+
+      {deadCycles.length > 0 && (
+        <p
+          role="alert"
+          data-testid="sm-dead-cycle-warning"
+          style={{ color: '#b45309', background: '#fef3c7', padding: '0.5rem', borderRadius: 4 }}
+        >
+          Liveness warning: cycle with no exit transition — {' '}
+          {deadCycles.map((scc) => `[${scc.join(' → ')}]`).join(', ')}
+          . Whitepaper Theorem 3 requires every cycle to have at least one exit.
+        </p>
       )}
 
       <ol data-testid="sm-states" style={{ listStyle: 'none', padding: 0, display: 'grid', gap: '0.75rem' }}>
@@ -149,11 +189,23 @@ export function StateMachineEditor(props: StateMachineEditorProps): ReactElement
             data-testid={`sm-state-${s.name}`}
             data-initial={s.isInitial ? 'true' : undefined}
             data-terminal={s.isTerminal ? 'true' : undefined}
-            style={{ border: '1px solid #ccc', padding: '0.5rem', borderRadius: 6 }}
+            data-current={currentStatus === s.name ? 'true' : undefined}
+            style={{
+              border: '1px solid #ccc',
+              padding: '0.5rem',
+              borderRadius: 6,
+              // Active-state overlay: highlighted border and tinted
+              // background when a live instance sits in this state.
+              ...(currentStatus === s.name
+                ? { borderColor: '#2563eb', borderWidth: 2, background: '#eff6ff' }
+                : {}),
+            }}
           >
             <header style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
               <strong>{s.name}</strong>
               <small style={{ color: '#666' }}>
+                {currentStatus === s.name && 'current'}
+                {currentStatus === s.name && (s.isInitial || s.isTerminal) && ' · '}
                 {s.isInitial && 'initial'}
                 {s.isInitial && s.isTerminal && ' · '}
                 {s.isTerminal && 'terminal'}

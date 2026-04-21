@@ -179,6 +179,57 @@ describe('StateMachineEditor', () => {
     expect((patch!.body as { to?: string }).to).toBe('Delivered')
   })
 
+  it('highlights the current state when currentStatus prop is set', async () => {
+    stubFetch((req) => {
+      if (req.url.includes('/arest/state-machine-definitions/Order')) return smdRespond()
+      if (req.url.includes('/arest/transitions')) return transitionsRespond()
+      return json({}, 404)
+    })
+
+    render(wrap(<StateMachineEditor smdId="Order" baseUrl={baseUrl} currentStatus="Placed" />))
+    await waitFor(() => expect(screen.getByTestId('sm-current')).toBeDefined())
+    expect(screen.getByTestId('sm-current').textContent).toBe('Placed')
+    expect(screen.getByTestId('sm-state-Placed').getAttribute('data-current')).toBe('true')
+    expect(screen.getByTestId('sm-state-In Cart').getAttribute('data-current')).toBeNull()
+  })
+
+  it('surfaces a Stately Studio deeplink', async () => {
+    stubFetch((req) => {
+      if (req.url.includes('/arest/state-machine-definitions/Order')) return smdRespond()
+      if (req.url.includes('/arest/transitions')) return transitionsRespond()
+      return json({}, 404)
+    })
+
+    render(wrap(<StateMachineEditor smdId="Order" baseUrl={baseUrl} />))
+    await waitFor(() => expect(screen.getByTestId('sm-stately-deeplink')).toBeDefined())
+    const href = (screen.getByTestId('sm-stately-deeplink') as HTMLAnchorElement).href
+    expect(href.startsWith('https://stately.ai/viz?machine=')).toBe(true)
+  })
+
+  it('warns when a cycle has no exit transition', async () => {
+    // Override the transitions response with a dead cycle: A↔B with
+    // no exit.
+    stubFetch((req) => {
+      if (req.url.includes('/arest/state-machine-definitions/Loop')) {
+        return json({ data: { id: 'Loop', noun: 'Loop', initial: 'A' }, _links: {} })
+      }
+      if (req.url.includes('/arest/transitions')) {
+        return json({
+          data: [
+            { id: 'a-to-b', from: 'A', to: 'B' },
+            { id: 'b-to-a', from: 'B', to: 'A' },
+          ],
+          _links: {},
+        })
+      }
+      return json({}, 404)
+    })
+    render(wrap(<StateMachineEditor smdId="Loop" baseUrl={baseUrl} />))
+    await waitFor(() => expect(screen.getByTestId('sm-dead-cycle-warning')).toBeDefined())
+    expect(screen.getByTestId('sm-dead-cycle-warning').textContent).toMatch(/A/)
+    expect(screen.getByTestId('sm-dead-cycle-warning').textContent).toMatch(/B/)
+  })
+
   it('hides edit / delete / add-form when readOnly=true', async () => {
     stubFetch((req) => {
       if (req.url.includes('/arest/state-machine-definitions/Order')) return smdRespond()
