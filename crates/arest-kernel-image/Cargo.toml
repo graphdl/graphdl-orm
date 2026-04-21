@@ -23,6 +23,13 @@ edition = "2021"
 description = "Builds bootable disk images for arest-kernel using the rust-osdev bootloader"
 license = "MIT"
 
+[features]
+# Forwarded to arest-kernel via the test harness. Not used by the
+# image-builder itself; the tests/ring3_smoke.rs wrapper passes
+# --features ring3-smoke to the kernel build via the harness script.
+ring3-smoke = []
+default = []
+
 [[bin]]
 name = "arest-kernel-image"
 path = "src/main.rs"

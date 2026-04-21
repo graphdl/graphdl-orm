@@ -19,6 +19,14 @@ edition = "2021"
 description = "AREST bare-metal kernel for x86_64"
 license = "MIT"
 
+[features]
+# Enables the ring-3 smoke test boot path (Sec-6). When on, kernel_main
+# short-circuits the REPL + HTTP init and descends to a hand-rolled
+# ring-3 test payload that exercises the syscall gate, then halts via
+# QEMU isa-debug-exit. When off (default), behavior is unchanged.
+ring3-smoke = []
+default = []
+
 [[bin]]
 name = "arest-kernel"
 path = "src/main.rs"
