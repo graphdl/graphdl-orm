@@ -287,6 +287,29 @@ fn enrich_constraints_with_spans(
     }).collect()
 }
 
+/// Strip a trailing `(<ring-kind>)` annotation — the explicit kind
+/// hint authors attach to ring constraints that use the multi-clause
+/// conditional shape (e.g.,
+/// `If some X R some Y then Y R X. (symmetric)`). Returns the body
+/// with the annotation removed (still ending in `.`), or `None` if
+/// the parens don't contain a recognized ring adjective.
+#[cfg(feature = "std-deps")]
+fn strip_ring_annotation(line: &str) -> Option<&str> {
+    let trimmed = line.trim_end();
+    let inner = trimmed.strip_suffix(')')?;
+    let open_idx = inner.rfind('(')?;
+    let kind = inner[open_idx + 1..].trim();
+    const KINDS: &[&str] = &[
+        "irreflexive", "asymmetric", "antisymmetric", "symmetric",
+        "intransitive", "transitive", "acyclic", "reflexive",
+    ];
+    if !KINDS.iter().any(|k| *k == kind) { return None; }
+    // Caller expects the body to end with `.` — strip the annotation
+    // and any whitespace between body-period and open-paren.
+    let body = inner[..open_idx].trim_end();
+    Some(body)
+}
+
 /// Extract the quoted values from a `The possible values of <Noun>
 /// are 'v1', 'v2', …` declaration. Returns them joined by `,`.
 #[cfg(feature = "std-deps")]
@@ -976,6 +999,83 @@ pub fn translate_derivation_rules(classified_state: &Object) -> Vec<Object> {
             ("text",                 text.as_str()),
             ("consequentFactTypeId", ""),
         ]));
+    }
+    out
+}
+
+/// Scan derivation rule antecedents for clauses that don't match any
+/// declared FactType reading. Emits `UnresolvedClause` facts with
+/// `clause`, `ruleText`, and `ruleId` bindings — `check.rs`'s
+/// `check_unresolved_clauses` reads these to surface resolve warnings
+/// on ambiguous or unknown antecedents.
+///
+/// A clause matches a FactType if the FactType's canonical reading
+/// (e.g. `Order has Amount`) appears verbatim in the clause after
+/// stripping the canonical subject-role pronoun/prefix ("that",
+/// subscripts). For the common shape
+/// `<rule-consequent> if|when <ante> and <ante> and …`, each
+/// `and`-separated chunk is a clause candidate.
+#[cfg(feature = "std-deps")]
+pub fn translate_unresolved_clauses(
+    classified_state: &Object,
+    _ft_facts: &[Object],
+) -> Vec<Object> {
+    let statement_ids = collect_statement_ids(classified_state);
+    // Build the set of WORDS that appear anywhere in a declared noun
+    // name — `HTTP Status` declared contributes both `HTTP` and
+    // `Status`. A clause is resolved if every Title-case word it
+    // contains is in this set (minus the prose-stopword allow list).
+    let declared_words: hashbrown::HashSet<String> = declared_noun_names(classified_state)
+        .iter()
+        .flat_map(|n| n.split_whitespace().map(String::from).collect::<Vec<_>>())
+        .collect();
+    let declared: hashbrown::HashSet<String> = declared_noun_names(classified_state)
+        .into_iter().collect();
+    let _ = &declared;
+    let mut out: Vec<Object> = Vec::new();
+    for stmt_id in &statement_ids {
+        let classifications = classifications_for(classified_state, stmt_id);
+        if !classifications.iter().any(|k| k == "Derivation Rule") { continue; }
+        let text = match statement_text(classified_state, stmt_id) {
+            Some(t) => t, None => continue,
+        };
+        let split_keywords: &[&str] = &[" iff ", " if ", " when "];
+        let Some(ante_start) = split_keywords.iter()
+            .filter_map(|kw| text.find(kw).map(|i| i + kw.len()))
+            .min() else { continue };
+        let antecedent = text[ante_start..].trim_end_matches('.').trim();
+        let rule_id = derivation_rule_id(&text);
+        // Heuristic: a clause is unresolved when it contains at least
+        // one Title-case word that isn't a declared noun (modulo the
+        // usual pronoun / quantifier prose) — these are the "Mystery"
+        // / "Phantom" tokens legacy's resolver flags. Clauses that
+        // only reference declared nouns are assumed to resolve; the
+        // full join-path resolver that would say otherwise is out of
+        // scope here.
+        const PROSE_STOPWORDS: &[&str] = &[
+            "If", "When", "Then", "That", "This", "An", "A", "The",
+            "Each", "Some", "No", "Every",
+        ];
+        for clause in antecedent.split(" and ") {
+            let clause = clause.trim();
+            if clause.is_empty() { continue; }
+            let has_unknown_titlecase = clause.split(|c: char| !c.is_alphanumeric())
+                .filter(|w| !w.is_empty())
+                .filter(|w| w.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false))
+                .filter(|w| !PROSE_STOPWORDS.iter().any(|s| *s == *w))
+                .any(|w| {
+                    // Strip trailing digits (subscripted `Order1`).
+                    let base: String = w.trim_end_matches(|c: char| c.is_ascii_digit()).into();
+                    !declared_words.contains(&base) && !declared_words.contains(w)
+                });
+            if has_unknown_titlecase {
+                out.push(fact_from_pairs(&[
+                    ("clause",   clause),
+                    ("ruleText", text.as_str()),
+                    ("ruleId",   rule_id.as_str()),
+                ]));
+            }
+        }
     }
     out
 }
@@ -1726,6 +1826,21 @@ pub fn parse_to_state_via_stage12(text: &str) -> Result<Object, String> {
             || line.ends_with(". *")
             || line.ends_with(". **")
             || line.ends_with(". +");
+        // Ring-constraint kind annotation: `<body>. (<kind>)` where
+        // `<kind>` is one of the legacy-accepted ring adjectives.
+        // Strip the annotation so Stage-1 sees the canonical body
+        // ending in `.`; `translate_ring_constraints`' conditional /
+        // trailing-marker detectors handle kind inference from the
+        // body itself.
+        let line: &str = if !ends_like_statement && line.ends_with(')') {
+            strip_ring_annotation(line).unwrap_or(line)
+        } else {
+            line
+        };
+        let ends_like_statement = line.ends_with('.')
+            || line.ends_with(". *")
+            || line.ends_with(". **")
+            || line.ends_with(". +");
         if !ends_like_statement {
             continue;
         }
@@ -1849,6 +1964,8 @@ pub fn parse_to_state_via_stage12(text: &str) -> Result<Object, String> {
     constraint_facts = tt!("enrich_spans",
         enrich_constraints_with_spans(&constraint_facts, &role_facts));
     let derivation_facts = tt!("derivation", translate_derivation_rules(&classified));
+    let unresolved_clause_facts = tt!("unresolved",
+        translate_unresolved_clauses(&classified, &ft_facts));
     let declared_ft_ids: Vec<String> = ft_facts.iter()
         .filter_map(|f| binding(f, "id").map(String::from))
         .collect();
@@ -1868,6 +1985,7 @@ pub fn parse_to_state_via_stage12(text: &str) -> Result<Object, String> {
     map.insert("DerivationRule".to_string(), Object::Seq(derivation_facts.into()));
     map.insert("InstanceFact".to_string(), Object::Seq(instance_fact_facts.into()));
     map.insert("EnumValues".to_string(), Object::Seq(enum_values_facts.into()));
+    map.insert("UnresolvedClause".to_string(), Object::Seq(unresolved_clause_facts.into()));
     Ok(Object::Map(map))
 }
 

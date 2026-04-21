@@ -1184,6 +1184,12 @@ pub fn find_forbidden_instance_url(state: &crate::ast::Object) -> Option<String>
 /// and ring-constraint `(kind)` annotation handling. The
 /// `parse_to_state_via_stage12` entry point is a drop-in replacement
 /// for everything else and benchmarks faster than this function.
+#[cfg(feature = "std-deps")]
+pub fn parse_to_state(input: &str) -> Result<crate::ast::Object, String> {
+    crate::parse_forml2_stage2::parse_to_state_via_stage12(input)
+}
+
+#[cfg(not(feature = "std-deps"))]
 pub fn parse_to_state(input: &str) -> Result<crate::ast::Object, String> {
     parse_to_state_legacy(input)
 }
