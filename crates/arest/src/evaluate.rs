@@ -48,6 +48,131 @@ pub fn forward_chain_defs_state(
     forward_chain_defs_state_bounded(derivation_defs, d, 100)
 }
 
+/// Apply all derivation rules once, returning novel facts.
+///
+/// Dedup against three populations: facts already in `current_state`,
+/// facts derived in prior rounds (`all_derived`), and facts emitted
+/// earlier in this round. All three use a canonical `FactKey`
+/// (fact_type_id + sorted bindings) and `HashSet` lookups — a naive
+/// per-candidate linear scan is O(K·N); the hashed form is O(K+N).
+fn derive_one_round(
+    derivation_defs: &[(&str, &ast::Func)],
+    current_state: &ast::Object,
+    all_derived: &[DerivedFact],
+    d: &ast::Object,
+) -> Vec<DerivedFact> {
+    let trace = std::env::var("AREST_STAGE12_TRACE").is_ok();
+    let t_ek = std::time::Instant::now();
+    let existing_keys = state_keys(current_state);
+    if trace { eprintln!("    [rnd] state_keys: {:?} ({} keys)",
+        t_ek.elapsed(), existing_keys.len()); }
+    let t_dk = std::time::Instant::now();
+    let derived_keys: HashSet<FactKey> = all_derived.iter().map(fact_key).collect();
+    if trace { eprintln!("    [rnd] derived_keys: {:?}", t_dk.elapsed()); }
+    let t_en = std::time::Instant::now();
+    let pop_obj = ast::encode_state(current_state);
+    if trace { eprintln!("    [rnd] encode_state: {:?}", t_en.elapsed()); }
+    let t_ap = std::time::Instant::now();
+    let candidates: Vec<DerivedFact> = derivation_defs.iter()
+        .flat_map(|(name, func)| {
+            let result = ast::apply(func, &pop_obj, d);
+            let name = name.to_string();
+            result.as_seq().into_iter()
+                .flat_map(move |items| items.iter().cloned().collect::<Vec<_>>())
+                .filter_map(move |item| parse_derived_fact(&item, &name))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    if trace { eprintln!("    [rnd] apply {} defs: {:?} ({} candidates)",
+        derivation_defs.len(), t_ap.elapsed(), candidates.len()); }
+    let t_dd = std::time::Instant::now();
+    let mut round_keys: HashSet<FactKey> = HashSet::with_capacity(candidates.len());
+    let mut out: Vec<DerivedFact> = Vec::with_capacity(candidates.len());
+    for cand in candidates {
+        let key = fact_key(&cand);
+        if !existing_keys.contains(&key)
+            && !derived_keys.contains(&key)
+            && round_keys.insert(key)
+        {
+            out.push(cand);
+        }
+    }
+    if trace { eprintln!("    [rnd] dedup: {:?} ({} novel)",
+        t_dd.elapsed(), out.len()); }
+    out
+}
+
+/// Semi-naive forward-chain: rules that know which cells they read
+/// (via the third tuple element) get skipped in any round whose prior
+/// round didn't touch any of those cells. Rules without antecedent
+/// metadata (`None`) run every round, matching the classical naïve
+/// behavior for that rule.
+///
+/// For the Stage-2 grammar, round 1 writes only
+/// `Statement_has_Classification`; with all 69 classification rules
+/// tagged, only the one rule that actually reads that cell survives
+/// the round-2 filter. Everything else is a ~zero-cost skip.
+pub fn forward_chain_defs_state_semi_naive(
+    derivation_defs: &[(&str, &ast::Func, Option<&[String]>)],
+    d: &ast::Object,
+    max_rounds: usize,
+) -> (ast::Object, Vec<DerivedFact>) {
+    use hashbrown::HashMap;
+    let trace = std::env::var("AREST_STAGE12_TRACE").is_ok();
+    let mut current_state = d.clone();
+    let mut all_derived: Vec<DerivedFact> = Vec::new();
+    // `dirty_cells == None` means "run everything" (initial round or
+    // caller wants no filtering); `Some(set)` restricts to rules that
+    // read at least one of those cells.
+    let mut dirty_cells: Option<HashSet<String>> = None;
+    // Project to `(&str, &Func)` for the inner kernel — same logic as
+    // the naïve chainer but with the per-round def filter applied.
+    for round in 0..max_rounds {
+        let active: Vec<(&str, &ast::Func)> = derivation_defs.iter()
+            .filter(|(_, _, cells)| match (&dirty_cells, cells) {
+                (None, _) => true,                       // first round or filtering off
+                (Some(_), None) => true,                 // unknown reads → run it
+                (Some(dirty), Some(reads)) =>
+                    reads.iter().any(|c| dirty.contains(c)),
+            })
+            .map(|(n, f, _)| (*n, *f))
+            .collect();
+        if trace {
+            eprintln!("    [sn] round {}: active {}/{} defs",
+                round, active.len(), derivation_defs.len());
+        }
+        if active.is_empty() { break; }
+        let new_facts = derive_one_round(active.as_slice(), &current_state, &all_derived, d);
+        if new_facts.is_empty() { break; }
+
+        let mut by_cell: HashMap<String, Vec<ast::Object>> =
+            HashMap::with_capacity(new_facts.len().min(active.len()));
+        for fact in &new_facts {
+            let pairs: Vec<(&str, &str)> = fact.bindings.iter()
+                .map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            by_cell.entry(fact.fact_type_id.clone()).or_default()
+                .push(ast::fact_from_pairs(&pairs));
+        }
+        let mut next_dirty = HashSet::new();
+        for (cell_name, facts) in by_cell {
+            next_dirty.insert(cell_name.clone());
+            let existing = ast::fetch_or_phi(&cell_name, &current_state);
+            let combined = match existing.as_seq() {
+                Some(items) => {
+                    let mut v = items.to_vec();
+                    v.extend(facts);
+                    ast::Object::Seq(v.into())
+                }
+                None => ast::Object::seq(facts),
+            };
+            current_state = ast::store(&cell_name, combined, &current_state);
+        }
+        all_derived.extend(new_facts);
+        dirty_cells = Some(next_dirty);
+    }
+    (current_state, all_derived)
+}
+
 /// Like [`forward_chain_defs_state`] but capped at `max_rounds` rule
 /// applications. Callers that know their rule set is stratified (no
 /// rule's antecedent reads another rule's consequent cell) can pass
@@ -62,87 +187,50 @@ pub fn forward_chain_defs_state_bounded(
     d: &ast::Object,
     max_rounds: usize,
 ) -> (ast::Object, Vec<DerivedFact>) {
-
-    /// Apply all derivation rules once, returning novel facts.
-    ///
-    /// Dedup against three populations: facts already in `current_state`,
-    /// facts derived in prior rounds (`all_derived`), and facts emitted
-    /// earlier in this round. All three use a canonical `FactKey`
-    /// (fact_type_id + sorted bindings) and `HashSet` lookups — a naive
-    /// per-candidate linear scan is O(K·N); the hashed form is O(K+N).
-    fn derive_one_round(
-        derivation_defs: &[(&str, &ast::Func)],
-        current_state: &ast::Object,
-        all_derived: &[DerivedFact],
-        d: &ast::Object,
-    ) -> Vec<DerivedFact> {
-        let existing_keys = state_keys(current_state);
-        let derived_keys: HashSet<FactKey> = all_derived.iter().map(fact_key).collect();
-        let pop_obj = ast::encode_state(current_state);
-        let candidates: Vec<DerivedFact> = derivation_defs.iter()
-            .flat_map(|(name, func)| {
-                let result = ast::apply(func, &pop_obj, d);
-                let name = name.to_string();
-                result.as_seq().into_iter()
-                    .flat_map(move |items| items.iter().cloned().collect::<Vec<_>>())
-                    .filter_map(move |item| parse_derived_fact(&item, &name))
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        let mut round_keys: HashSet<FactKey> = HashSet::with_capacity(candidates.len());
-        let mut out: Vec<DerivedFact> = Vec::with_capacity(candidates.len());
-        for cand in candidates {
-            let key = fact_key(&cand);
-            if !existing_keys.contains(&key)
-                && !derived_keys.contains(&key)
-                && round_keys.insert(key)
-            {
-                out.push(cand);
-            }
-        }
-        out
-    }
-
-    // Fixed-point iteration via iter::successors (Backus while form, Knaster-Tarski lfp).
-    // Terminates when derive_one_round produces no new facts (returns None).
+    // Fixed-point iteration, bounded by `max_rounds`.
+    //
+    // A `core::iter::successors(…).take(N).last()` form reads cleaner
+    // but is an off-by-one footgun: `successors` eagerly pre-computes
+    // the NEXT value on every `next()` call, so a bound of N fires
+    // `derive_one_round` N+1 times. For core.md with stratified
+    // grammar rules, that extra call was ~7s of pure waste against
+    // already-saturated state. The manual loop runs exactly
+    // `max_rounds` rounds or fewer (early-exits the first time a
+    // round produces nothing novel).
     //
     // Per-round fact integration batches by cell: a naive
     // `fold(state.clone(), cell_push)` is O(n²) because each
     // `cell_push` re-clones the cell's full Vec. Grouping the round's
     // new facts by cell and appending once per cell makes it O(n).
-    let (final_state, all_derived) = core::iter::successors(
-        Some((d.clone(), Vec::<DerivedFact>::new())),
-        |(current_state, all_derived)| {
-            let new_facts = derive_one_round(derivation_defs, current_state, all_derived, d);
-            (!new_facts.is_empty()).then(|| {
-                use hashbrown::HashMap;
-                let mut by_cell: HashMap<String, Vec<ast::Object>> =
-                    HashMap::with_capacity(new_facts.len().min(derivation_defs.len()));
-                for fact in &new_facts {
-                    let pairs: Vec<(&str, &str)> = fact.bindings.iter()
-                        .map(|(k, v)| (k.as_str(), v.as_str())).collect();
-                    by_cell.entry(fact.fact_type_id.clone()).or_default()
-                        .push(ast::fact_from_pairs(&pairs));
+    let mut current_state = d.clone();
+    let mut all_derived: Vec<DerivedFact> = Vec::new();
+    for _ in 0..max_rounds {
+        let new_facts = derive_one_round(derivation_defs, &current_state, &all_derived, d);
+        if new_facts.is_empty() { break; }
+        use hashbrown::HashMap;
+        let mut by_cell: HashMap<String, Vec<ast::Object>> =
+            HashMap::with_capacity(new_facts.len().min(derivation_defs.len()));
+        for fact in &new_facts {
+            let pairs: Vec<(&str, &str)> = fact.bindings.iter()
+                .map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            by_cell.entry(fact.fact_type_id.clone()).or_default()
+                .push(ast::fact_from_pairs(&pairs));
+        }
+        for (cell_name, facts) in by_cell {
+            let existing = ast::fetch_or_phi(&cell_name, &current_state);
+            let combined = match existing.as_seq() {
+                Some(items) => {
+                    let mut v = items.to_vec();
+                    v.extend(facts);
+                    ast::Object::Seq(v.into())
                 }
-                let mut new_state = current_state.clone();
-                for (cell_name, facts) in by_cell {
-                    let existing = ast::fetch_or_phi(&cell_name, &new_state);
-                    let combined = match existing.as_seq() {
-                        Some(items) => {
-                            let mut v = items.to_vec();
-                            v.extend(facts);
-                            ast::Object::Seq(v.into())
-                        }
-                        None => ast::Object::seq(facts),
-                    };
-                    new_state = ast::store(&cell_name, combined, &new_state);
-                }
-                let all = [all_derived.clone(), new_facts].concat();
-                (new_state, all)
-            })
-        },
-    ).take(max_rounds.saturating_add(1)).last().unwrap();
-    (final_state, all_derived)
+                None => ast::Object::seq(facts),
+            };
+            current_state = ast::store(&cell_name, combined, &current_state);
+        }
+        all_derived.extend(new_facts);
+    }
+    (current_state, all_derived)
 }
 
 /// Parse a derivation result Object into a DerivedFact.
