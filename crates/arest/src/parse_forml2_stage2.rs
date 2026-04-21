@@ -417,6 +417,11 @@ pub fn translate_derivation_mode_facts(classified_state: &Object) -> Vec<Object>
 
 #[cfg(feature = "std-deps")]
 fn derivation_marker_for(state: &Object, stmt_id: &str) -> Option<String> {
+    if let Some(v) = STMT_INDEX.with(|c|
+        c.borrow().as_ref().map(|i| i.derivation_markers.get(stmt_id).cloned()))
+    {
+        return v;
+    }
     fetch_or_phi("Statement_has_Derivation_Marker", state)
         .as_seq()?
         .iter()
@@ -690,11 +695,92 @@ fn role_refs_for(state: &Object, stmt_id: &str) -> Vec<String> {
 }
 
 fn statement_text(state: &Object, stmt_id: &str) -> Option<String> {
+    if let Some(v) = STMT_INDEX.with(|c|
+        c.borrow().as_ref().map(|i| i.texts.get(stmt_id).cloned()))
+    {
+        return v;
+    }
     fetch_or_phi("Statement_has_Text", state)
         .as_seq()?
         .iter()
         .find(|f| binding(f, "Statement") == Some(stmt_id))
         .and_then(|f| binding(f, "Text").map(String::from))
+}
+
+/// Thread-local index cache populated once per parse call (during
+/// the translator block). Short-circuits `classifications_for` /
+/// `head_noun_for` / `statement_text` etc. from O(cell_size) scans
+/// per call to O(1) HashMap lookups. Core.md has ~150 statements and
+/// ~500 Statement_has_Classification facts; without this cache each
+/// of the 15 translators was scanning the full cell 150 times.
+#[cfg(feature = "std-deps")]
+#[derive(Default)]
+struct StmtIndex {
+    classifications: hashbrown::HashMap<String, Vec<String>>,
+    head_nouns: hashbrown::HashMap<String, String>,
+    texts: hashbrown::HashMap<String, String>,
+    trailing_markers: hashbrown::HashMap<String, String>,
+    derivation_markers: hashbrown::HashMap<String, String>,
+}
+
+#[cfg(feature = "std-deps")]
+std::thread_local! {
+    static STMT_INDEX: std::cell::RefCell<Option<StmtIndex>>
+        = std::cell::RefCell::new(None);
+}
+
+#[cfg(feature = "std-deps")]
+fn build_stmt_index(state: &Object) -> StmtIndex {
+    let mut idx = StmtIndex::default();
+    let index_single = |cell: &str, key_field: &str, value_field: &str,
+                        target: &mut hashbrown::HashMap<String, String>| {
+        if let Some(seq) = fetch_or_phi(cell, state).as_seq() {
+            for f in seq.iter() {
+                let (Some(k), Some(v)) = (binding(f, key_field), binding(f, value_field))
+                    else { continue };
+                target.entry(k.to_string()).or_insert_with(|| v.to_string());
+            }
+        }
+    };
+    // classifications: many-per-statement → Vec
+    if let Some(seq) = fetch_or_phi("Statement_has_Classification", state).as_seq() {
+        for f in seq.iter() {
+            let (Some(stmt), Some(cls)) = (
+                binding(f, "Statement"), binding(f, "Classification")
+            ) else { continue };
+            idx.classifications.entry(stmt.to_string())
+                .or_default()
+                .push(cls.to_string());
+        }
+    }
+    index_single("Statement_has_Head_Noun", "Statement", "Head_Noun", &mut idx.head_nouns);
+    index_single("Statement_has_Text", "Statement", "Text", &mut idx.texts);
+    index_single("Statement_has_Trailing_Marker", "Statement", "Trailing_Marker",
+        &mut idx.trailing_markers);
+    index_single("Statement_has_Derivation_Marker", "Statement", "Derivation_Marker",
+        &mut idx.derivation_markers);
+    idx
+}
+
+/// RAII guard so the thread-local index is always cleared at the end
+/// of the translator block, even on early return or panic.
+#[cfg(feature = "std-deps")]
+struct StmtIndexGuard;
+
+#[cfg(feature = "std-deps")]
+impl StmtIndexGuard {
+    fn install(state: &Object) -> Self {
+        let idx = build_stmt_index(state);
+        STMT_INDEX.with(|c| *c.borrow_mut() = Some(idx));
+        StmtIndexGuard
+    }
+}
+
+#[cfg(feature = "std-deps")]
+impl Drop for StmtIndexGuard {
+    fn drop(&mut self) {
+        STMT_INDEX.with(|c| *c.borrow_mut() = None);
+    }
 }
 
 /// Translate `Instance Fact` classifications into `InstanceFact` cell
@@ -1406,6 +1492,11 @@ fn ring_adjective_to_kind(marker: &str) -> Option<&'static str> {
 }
 
 fn trailing_marker_for(state: &Object, stmt_id: &str) -> Option<String> {
+    if let Some(v) = STMT_INDEX.with(|c|
+        c.borrow().as_ref().map(|i| i.trailing_markers.get(stmt_id).cloned()))
+    {
+        return v;
+    }
     fetch_or_phi("Statement_has_Trailing_Marker", state)
         .as_seq()?
         .iter()
@@ -1437,6 +1528,11 @@ fn role_noun_at_position(state: &Object, stmt_id: &str, position: usize) -> Opti
 }
 
 fn head_noun_for(state: &Object, stmt_id: &str) -> Option<String> {
+    if let Some(v) = STMT_INDEX.with(|c|
+        c.borrow().as_ref().map(|i| i.head_nouns.get(stmt_id).cloned()))
+    {
+        return v;
+    }
     fetch_or_phi("Statement_has_Head_Noun", state)
         .as_seq()?
         .iter()
@@ -1448,6 +1544,12 @@ fn head_noun_for(state: &Object, stmt_id: &str) -> Option<String> {
 /// Statement id.
 #[cfg(feature = "std-deps")]
 pub fn classifications_for(state: &Object, statement_id: &str) -> Vec<String> {
+    if let Some(v) = STMT_INDEX.with(|c|
+        c.borrow().as_ref().map(|i|
+            i.classifications.get(statement_id).cloned().unwrap_or_default()))
+    {
+        return v;
+    }
     fetch_or_phi("Statement_has_Classification", state)
         .as_seq()
         .map(|facts| facts.iter()
@@ -1912,6 +2014,15 @@ pub fn parse_to_state_via_stage12(text: &str) -> Result<Object, String> {
     if trace { eprintln!("[s12] classify: {:?}", t_cls.elapsed()); }
 
     let t_tr = std::time::Instant::now();
+    // Install a thread-local statement index. `classifications_for`
+    // / `head_noun_for` / `statement_text` / `trailing_marker_for` /
+    // `derivation_marker_for` short-circuit cell scans by hitting
+    // this index — the 15 translators each called those helpers
+    // per statement, so without the cache core.md paid ~1M fact
+    // scans (~12ms) that now collapse to O(1) HashMap lookups.
+    // RAII guard resets on Drop so early returns / panics can't
+    // leave a stale index.
+    let _idx_guard = StmtIndexGuard::install(&classified);
     macro_rules! tt { ($name:expr, $e:expr) => {{
         let t = std::time::Instant::now();
         let v = $e;
