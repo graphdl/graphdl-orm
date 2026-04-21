@@ -169,7 +169,6 @@ Fact Type has Derivation Mode.
 Constraint spans Role.
   Each Constraint spans some Role.
   This association with Constraint, Role provides the preferred identification scheme for Constraint Span.
-Role is used in Reading.
 Role has Position for Reading.
   For each Role and Reading that Role has that Reading at most one Position.
 
@@ -206,7 +205,6 @@ Constraint has modality of Modality Type.
 Constraint has Text.
   Each Constraint has at most one Text.
 Constraint is semantic.
-Constraint spans Role.
 
 ### Constraint Type
 Constraint Type has Name.
