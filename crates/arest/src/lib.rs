@@ -105,6 +105,11 @@ pub mod declared_writes;
 #[cfg(not(feature = "no_std"))]
 pub mod check;
 
+// Stress harness for compile_explicit_derivation (#296). Test-only; not
+// shipped in any build.
+#[cfg(all(test, not(feature = "no_std")))]
+mod compile_explicit_derivation_tests;
+
 #[cfg(feature = "wasm-lower")]
 pub mod wasm_lower;
 
