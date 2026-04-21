@@ -670,6 +670,23 @@ fn possibility_synthetic_fact_type(
 
 /// Role head nouns for a Statement, ordered by Role Position.
 fn role_refs_for(state: &Object, stmt_id: &str) -> Vec<String> {
+    // Indexed fast path — avoids three O(cell_size) scans per call.
+    if let Some(out) = STMT_INDEX.with(|c| {
+        let borrowed = c.borrow();
+        let idx = borrowed.as_ref()?;
+        let role_ids = idx.role_refs_by_stmt.get(stmt_id)?;
+        let mut with_pos: Vec<(usize, String)> = role_ids.iter()
+            .filter_map(|rid| {
+                let pos: usize = idx.role_pos_by_ref.get(rid)?.parse().ok()?;
+                let noun = idx.role_head_noun_by_ref.get(rid)?.clone();
+                Some((pos, noun))
+            })
+            .collect();
+        with_pos.sort_by_key(|(p, _)| *p);
+        Some(with_pos.into_iter().map(|(_, n)| n).collect())
+    }) {
+        return out;
+    }
     let refs = fetch_or_phi("Statement_has_Role_Reference", state);
     let Some(refs_seq) = refs.as_seq() else { return Vec::new() };
     let role_ids: Vec<String> = refs_seq.iter()
@@ -721,6 +738,14 @@ struct StmtIndex {
     texts: hashbrown::HashMap<String, String>,
     trailing_markers: hashbrown::HashMap<String, String>,
     derivation_markers: hashbrown::HashMap<String, String>,
+    // Role-reference indexing: per-statement list of role ref ids, plus
+    // per-ref position / head noun / literal. `translate_fact_types`
+    // reaches into all three cells for every Fact-Type-Reading stmt.
+    role_refs_by_stmt: hashbrown::HashMap<String, Vec<String>>,
+    role_pos_by_ref: hashbrown::HashMap<String, String>,
+    role_head_noun_by_ref: hashbrown::HashMap<String, String>,
+    role_literal_by_ref: hashbrown::HashMap<String, String>,
+    verbs: hashbrown::HashMap<String, String>,
 }
 
 #[cfg(feature = "std-deps")]
@@ -759,6 +784,23 @@ fn build_stmt_index(state: &Object) -> StmtIndex {
         &mut idx.trailing_markers);
     index_single("Statement_has_Derivation_Marker", "Statement", "Derivation_Marker",
         &mut idx.derivation_markers);
+    // Role-reference chain: stmt → [ref_id], ref_id → position / head noun / literal.
+    if let Some(seq) = fetch_or_phi("Statement_has_Role_Reference", state).as_seq() {
+        for f in seq.iter() {
+            let (Some(stmt), Some(rref)) = (
+                binding(f, "Statement"), binding(f, "Role_Reference")
+            ) else { continue };
+            idx.role_refs_by_stmt.entry(stmt.to_string())
+                .or_default().push(rref.to_string());
+        }
+    }
+    index_single("Role_Reference_has_Role_Position", "Role_Reference", "Role_Position",
+        &mut idx.role_pos_by_ref);
+    index_single("Role_Reference_has_Head_Noun", "Role_Reference", "Head_Noun",
+        &mut idx.role_head_noun_by_ref);
+    index_single("Role_Reference_has_Literal_Value", "Role_Reference", "Literal_Value",
+        &mut idx.role_literal_by_ref);
+    index_single("Statement_has_Verb", "Statement", "Verb", &mut idx.verbs);
     idx
 }
 
@@ -858,6 +900,23 @@ pub fn translate_instance_facts_with_ft_ids(
 /// Role head nouns AND literal values for a Statement, ordered by
 /// Role Position. Returns `Vec<(noun, Option<literal>)>`.
 fn role_refs_with_literals(state: &Object, stmt_id: &str) -> Vec<(String, Option<String>)> {
+    if let Some(out) = STMT_INDEX.with(|c| {
+        let borrowed = c.borrow();
+        let idx = borrowed.as_ref()?;
+        let role_ids = idx.role_refs_by_stmt.get(stmt_id)?;
+        let mut with_pos: Vec<(usize, String, Option<String>)> = role_ids.iter()
+            .filter_map(|rid| {
+                let pos: usize = idx.role_pos_by_ref.get(rid)?.parse().ok()?;
+                let noun = idx.role_head_noun_by_ref.get(rid)?.clone();
+                let lit = idx.role_literal_by_ref.get(rid).cloned();
+                Some((pos, noun, lit))
+            })
+            .collect();
+        with_pos.sort_by_key(|(p, _, _)| *p);
+        Some(with_pos.into_iter().map(|(_, n, l)| (n, l)).collect())
+    }) {
+        return out;
+    }
     let refs = fetch_or_phi("Statement_has_Role_Reference", state);
     let Some(refs_seq) = refs.as_seq() else { return Vec::new() };
     let role_ids: Vec<String> = refs_seq.iter()
@@ -889,6 +948,11 @@ fn role_refs_with_literals(state: &Object, stmt_id: &str) -> Vec<(String, Option
 }
 
 fn statement_verb(state: &Object, stmt_id: &str) -> Option<String> {
+    if let Some(v) = STMT_INDEX.with(|c|
+        c.borrow().as_ref().map(|i| i.verbs.get(stmt_id).cloned()))
+    {
+        return v;
+    }
     fetch_or_phi("Statement_has_Verb", state)
         .as_seq()?
         .iter()
