@@ -1255,7 +1255,7 @@ static GRAMMAR_CACHE: std::sync::OnceLock<GrammarCacheEntry>
 fn cached_grammar() -> Result<&'static GrammarCacheEntry, String> {
     if let Some(g) = GRAMMAR_CACHE.get() { return Ok(g); }
     let grammar = include_str!("../../../readings/forml2-grammar.md");
-    let parsed = crate::parse_forml2::parse_to_state(grammar)
+    let parsed = crate::parse_forml2::parse_to_state_legacy(grammar)
         .map_err(|e| alloc::format!("grammar parse failed: {}", e))?;
     let mut defs = crate::compile::compile_to_defs_state(&parsed);
     // Swap the compiled FFP derivation Funcs for equivalent Native
@@ -2772,6 +2772,23 @@ mod tests {
         eprintln!("core.md (single): legacy {:?} / stage12 {:?} — ratio {:.2}x",
             legacy_core, s12_core,
             s12_core.as_nanos() as f64 / legacy_core.as_nanos() as f64);
+    }
+
+    #[test]
+    #[ignore = "diagnostic: diff stage12 vs legacy for organization_with_slug fixture"]
+    fn diff_organization_fixture() {
+        let src = "\
+            Organization(.Slug) is an entity type.\n\
+            Slug is a value type.\n\
+            Organization has Slug.\n\
+              Each Organization has exactly one Slug.\n";
+        let legacy = crate::parse_forml2::parse_to_state_legacy(src).expect("legacy");
+        let stage12 = super::parse_to_state_via_stage12(src).expect("stage12");
+        for name in &["Noun", "FactType", "Role", "Subtype", "Constraint"] {
+            eprintln!("--- {} ---", name);
+            eprintln!("legacy: {:?}", fetch_or_phi(name, &legacy));
+            eprintln!("stage12: {:?}", fetch_or_phi(name, &stage12));
+        }
     }
 
     #[test]
