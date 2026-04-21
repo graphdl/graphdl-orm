@@ -37,6 +37,11 @@ yarn-error.log*
 **/target/
 /crates/arest/pkg/
 
+# Agent scratch — per-session reports, diagnostics, handoffs, commit
+# message drafts. CLAUDE.md declares `_reports/*` "Transient — never
+# commit"; ignore the whole dir so `git status` stops listing it.
+/_reports/
+
 # legacy build artifacts
 .next/
 obj/
