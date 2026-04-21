@@ -94,6 +94,159 @@ pub fn rmap_from_state(state: &crate::ast::Object) -> Vec<TableDef> {
     rmap(state)
 }
 
+/// RMAP as cells: `RMAPTable` + `RMAPColumn` rows covering the same
+/// information `Vec<TableDef>` exposes today, but as an `Object::Map`
+/// that downstream generators can read directly — no typed struct
+/// boundary (#325).
+///
+/// `RMAPTable` rows carry one fact per table:
+///   name          — snake_case table name
+///   primaryKey    — comma-separated PK column names
+///   uniqueConstraints (optional) — semicolon-separated groups of
+///                   comma-separated columns (e.g. `a,b;c,d`)
+///
+/// `RMAPColumn` rows carry one fact per (table, column):
+///   table         — owning table's name
+///   name          — column name
+///   colType       — SQL type string
+///   nullable      — `true` / `false`
+///   position      — zero-based declaration order
+///   references (optional) — referenced table (FK target)
+///
+/// Column ordering is preserved via the `position` field; callers who
+/// want columns in declaration order should sort by it (the helpers in
+/// this module already do).
+pub fn rmap_cells_from_state(state: &crate::ast::Object) -> crate::ast::Object {
+    use crate::ast::{Object, fact_from_pairs};
+    let tables = rmap(state);
+    let mut table_rows: Vec<Object> = Vec::new();
+    let mut column_rows: Vec<Object> = Vec::new();
+
+    for t in &tables {
+        let pk_joined = t.primary_key.join(",");
+        let mut table_pairs: Vec<(&str, String)> = vec![
+            ("name", t.name.clone()),
+            ("primaryKey", pk_joined),
+        ];
+        let encoded_ucs = t.unique_constraints.as_ref().map(|ucs|
+            ucs.iter().map(|uc| uc.join(",")).collect::<Vec<_>>().join(";"));
+        if let Some(enc) = encoded_ucs.as_ref() {
+            table_pairs.push(("uniqueConstraints", enc.clone()));
+        }
+        let pair_refs: Vec<(&str, &str)> = table_pairs.iter()
+            .map(|(k, v)| (*k, v.as_str())).collect();
+        table_rows.push(fact_from_pairs(&pair_refs));
+
+        for (i, c) in t.columns.iter().enumerate() {
+            let pos = i.to_string();
+            let nullable = if c.nullable { "true" } else { "false" };
+            let mut col_pairs: Vec<(&str, String)> = vec![
+                ("table", t.name.clone()),
+                ("name", c.name.clone()),
+                ("colType", c.col_type.clone()),
+                ("nullable", nullable.to_string()),
+                ("position", pos),
+            ];
+            if let Some(r) = c.references.as_ref() {
+                col_pairs.push(("references", r.clone()));
+            }
+            let pair_refs: Vec<(&str, &str)> = col_pairs.iter()
+                .map(|(k, v)| (*k, v.as_str())).collect();
+            column_rows.push(fact_from_pairs(&pair_refs));
+        }
+    }
+
+    let mut map: HashMap<String, Object> = HashMap::new();
+    map.insert("RMAPTable".to_string(), Object::Seq(table_rows.into()));
+    map.insert("RMAPColumn".to_string(), Object::Seq(column_rows.into()));
+    Object::Map(map)
+}
+
+// -- Cell reader helpers for downstream generators (#325) -------------
+//
+// Downstream generators consume RMAP output through these helpers so
+// they never hold a `TableDef` / `TableColumn` value. The typed structs
+// survive inside rmap.rs as working types; crate-internal callers may
+// still use them (e.g. `compile.rs` for DDL emission). New consumers
+// should prefer these cell-readers.
+
+/// Cell-backed view of a column. Crate-internal by design — a thin
+/// borrow struct that lets generators read the four fields they need
+/// without importing the public `TableColumn` serialization IR.
+#[derive(Debug, Clone)]
+pub(crate) struct ColumnView {
+    pub name: String,
+    pub col_type: String,
+    pub nullable: bool,
+    pub references: Option<String>,
+}
+
+/// Return the RMAP table name for an entity noun, if one exists in
+/// the rmap-cells view. Value types and unreferenced nouns map to
+/// `None` so callers can skip them uniformly.
+pub fn table_name_for_noun(cells: &crate::ast::Object, noun_name: &str) -> Option<String> {
+    let snake = to_snake(noun_name);
+    let rows = crate::ast::fetch_or_phi("RMAPTable", cells);
+    rows.as_seq()?.iter()
+        .find(|f| crate::ast::binding(f, "name") == Some(snake.as_str()))
+        .and_then(|f| crate::ast::binding(f, "name").map(String::from))
+}
+
+/// Return every column of a table in declaration order (sorted by the
+/// `position` field). Returns an empty vec if the table is unknown.
+pub(crate) fn columns_for_table(cells: &crate::ast::Object, table_name: &str) -> Vec<ColumnView> {
+    let rows = crate::ast::fetch_or_phi("RMAPColumn", cells);
+    let Some(seq) = rows.as_seq() else { return Vec::new(); };
+    let mut with_pos: Vec<(usize, ColumnView)> = seq.iter()
+        .filter(|f| crate::ast::binding(f, "table") == Some(table_name))
+        .map(|f| {
+            let pos: usize = crate::ast::binding(f, "position")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            let view = ColumnView {
+                name: crate::ast::binding(f, "name").unwrap_or("").to_string(),
+                col_type: crate::ast::binding(f, "colType").unwrap_or("").to_string(),
+                nullable: crate::ast::binding(f, "nullable") == Some("true"),
+                references: crate::ast::binding(f, "references").map(String::from),
+            };
+            (pos, view)
+        })
+        .collect();
+    with_pos.sort_by_key(|(p, _)| *p);
+    with_pos.into_iter().map(|(_, v)| v).collect()
+}
+
+/// Return the primary-key columns of a table in order. Empty when the
+/// table has no `RMAPTable` row or the `primaryKey` binding is empty.
+pub fn primary_key_of_table(cells: &crate::ast::Object, table_name: &str) -> Vec<String> {
+    let rows = crate::ast::fetch_or_phi("RMAPTable", cells);
+    let Some(seq) = rows.as_seq() else { return Vec::new(); };
+    seq.iter()
+        .find(|f| crate::ast::binding(f, "name") == Some(table_name))
+        .and_then(|f| crate::ast::binding(f, "primaryKey"))
+        .filter(|s| !s.is_empty())
+        .map(|s| s.split(',').map(|p| p.to_string()).collect())
+        .unwrap_or_default()
+}
+
+/// Return the extra UNIQUE constraints declared on a table — each inner
+/// `Vec<String>` is a set of column names. Empty when none are declared.
+pub(crate) fn unique_constraints_of_table(
+    cells: &crate::ast::Object,
+    table_name: &str,
+) -> Vec<Vec<String>> {
+    let rows = crate::ast::fetch_or_phi("RMAPTable", cells);
+    let Some(seq) = rows.as_seq() else { return Vec::new(); };
+    seq.iter()
+        .find(|f| crate::ast::binding(f, "name") == Some(table_name))
+        .and_then(|f| crate::ast::binding(f, "uniqueConstraints"))
+        .filter(|s| !s.is_empty())
+        .map(|s| s.split(';')
+            .map(|grp| grp.split(',').map(|p| p.to_string()).collect())
+            .collect())
+        .unwrap_or_default()
+}
+
 /// #214: RMAP as a Func tree entry point.
 ///
 /// Returns a `Func::Native` leaf that, when applied via `ast::apply`
@@ -1113,6 +1266,192 @@ mod tests {
             assert!(!w.columns.iter().any(|c| c.name == "husband_id"),
                 "Wife should NOT have husband_id");
         }
+    }
+
+    // ── #325: cell-based RMAP output for downstream generators ────────
+
+    #[test]
+    fn rmap_cells_emits_rmaptable_and_rmapcolumn_for_simple_entity() {
+        // Person has Name (UC on Person). The typed API produces a
+        // single `person` table with id + name columns. The cell API
+        // must carry the same information via RMAPTable / RMAPColumn
+        // rows keyed by table name — no typed struct crosses the
+        // boundary.
+        let state = make_state(
+            vec![("Person", "entity"), ("Name", "value")],
+            vec![("ft1", "Person has Name", vec![("Person", 0), ("Name", 1)])],
+            vec![("UC", vec![("ft1", 0)])],
+        );
+        let cells = rmap_cells_from_state(&state);
+
+        let tables = crate::ast::fetch_or_phi("RMAPTable", &cells);
+        let table_rows = tables.as_seq().expect("RMAPTable cell must be a Seq");
+        let person_row = table_rows.iter()
+            .find(|f| crate::ast::binding(f, "name") == Some("person"))
+            .expect("RMAPTable must carry a `person` row");
+        assert_eq!(crate::ast::binding(person_row, "primaryKey"), Some("id"));
+
+        let columns = crate::ast::fetch_or_phi("RMAPColumn", &cells);
+        let col_rows = columns.as_seq().expect("RMAPColumn cell must be a Seq");
+        let person_cols: Vec<&Object> = col_rows.iter()
+            .filter(|f| crate::ast::binding(f, "table") == Some("person"))
+            .collect();
+        assert_eq!(person_cols.len(), 2,
+            "person table has id + name — 2 column rows expected");
+
+        // id column: nullable=false, no references
+        let id_col = person_cols.iter()
+            .find(|f| crate::ast::binding(f, "name") == Some("id"))
+            .expect("id column must exist");
+        assert_eq!(crate::ast::binding(id_col, "nullable"), Some("false"));
+        assert_eq!(crate::ast::binding(id_col, "colType"), Some("TEXT"));
+        assert_eq!(crate::ast::binding(id_col, "references"), None);
+
+        // name column: references a value type => no reference target
+        let name_col = person_cols.iter()
+            .find(|f| crate::ast::binding(f, "name") == Some("name"))
+            .expect("name column must exist");
+        assert_eq!(crate::ast::binding(name_col, "references"), None);
+    }
+
+    #[test]
+    fn table_name_for_noun_returns_snake_name_for_entity() {
+        // Person(.name) entity => `person` table. Helper answers from
+        // the RMAPTable cell, no typed-IR lookup.
+        let state = make_state(
+            vec![("Person", "entity"), ("Name", "value")],
+            vec![("ft1", "Person has Name", vec![("Person", 0), ("Name", 1)])],
+            vec![("UC", vec![("ft1", 0)])],
+        );
+        let cells = rmap_cells_from_state(&state);
+        assert_eq!(table_name_for_noun(&cells, "Person"), Some("person".to_string()));
+    }
+
+    #[test]
+    fn table_name_for_noun_returns_none_for_value_type() {
+        // Value types don't produce their own RMAP table — helper
+        // must return None so callers can skip them uniformly.
+        let state = make_state(
+            vec![("Person", "entity"), ("Name", "value")],
+            vec![("ft1", "Person has Name", vec![("Person", 0), ("Name", 1)])],
+            vec![("UC", vec![("ft1", 0)])],
+        );
+        let cells = rmap_cells_from_state(&state);
+        assert_eq!(table_name_for_noun(&cells, "Name"), None);
+    }
+
+    #[test]
+    fn columns_for_table_returns_columns_in_position_order() {
+        // Columns must come back in declaration order — the cell
+        // layout doesn't guarantee insertion order, so the helper
+        // sorts by `position`. This is load-bearing for generators
+        // that emit struct fields / schema properties in a fixed
+        // order.
+        let state = make_state(
+            vec![("Person", "entity"), ("Name", "value")],
+            vec![("ft1", "Person has Name", vec![("Person", 0), ("Name", 1)])],
+            vec![("UC", vec![("ft1", 0)])],
+        );
+        let cells = rmap_cells_from_state(&state);
+        let cols = columns_for_table(&cells, "person");
+        assert_eq!(cols.len(), 2, "person table has id + name");
+        assert_eq!(cols[0].name, "id", "id (PK) must come first");
+        assert_eq!(cols[1].name, "name");
+        assert_eq!(cols[0].nullable, false);
+        assert_eq!(cols[0].col_type, "TEXT");
+        assert!(cols[0].references.is_none());
+    }
+
+    #[test]
+    fn columns_for_table_empty_for_unknown_table() {
+        let cells = rmap_cells_from_state(&make_state(vec![], vec![], vec![]));
+        assert!(columns_for_table(&cells, "nonexistent").is_empty());
+    }
+
+    #[test]
+    fn primary_key_of_table_returns_columns_in_order() {
+        // Single-PK `person` table returns `vec!["id"]`.
+        let state = make_state(
+            vec![("Person", "entity"), ("Name", "value")],
+            vec![("ft1", "Person has Name", vec![("Person", 0), ("Name", 1)])],
+            vec![("UC", vec![("ft1", 0)])],
+        );
+        let cells = rmap_cells_from_state(&state);
+        assert_eq!(primary_key_of_table(&cells, "person"), vec!["id"]);
+    }
+
+    #[test]
+    fn primary_key_of_table_preserves_composite_key_order() {
+        // Compound ref scheme => composite PK. Helper must preserve
+        // the order so generators can use it for SQL DDL / routing.
+        let state = make_state_with_ref_schemes(
+            vec![
+                ("Room", "entity"),
+                ("Building", "entity"),
+                ("RoomNr", "value"),
+            ],
+            vec![
+                ("ft1", "Room is in Building", vec![("Room", 0), ("Building", 1)]),
+                ("ft2", "Room has RoomNr", vec![("Room", 0), ("RoomNr", 1)]),
+            ],
+            vec![
+                ("UC", vec![("ft1", 0)]),
+                ("UC", vec![("ft2", 0)]),
+            ],
+            vec![("Room", vec!["Building", "RoomNr"])],
+        );
+        let cells = rmap_cells_from_state(&state);
+        let pk = primary_key_of_table(&cells, "room");
+        assert_eq!(pk.len(), 2);
+        assert!(pk.contains(&"building_id".to_string()));
+        assert!(pk.contains(&"room_nr".to_string()));
+    }
+
+    #[test]
+    fn rmap_cells_encode_fk_references_and_composite_pk() {
+        // Room(Building, RoomNr) — compound reference scheme produces
+        // composite PK on (building_id, room_nr), with building_id
+        // pointing to the building table via `references`.
+        let state = make_state_with_ref_schemes(
+            vec![
+                ("Room", "entity"),
+                ("Building", "entity"),
+                ("RoomNr", "value"),
+            ],
+            vec![
+                ("ft1", "Room is in Building", vec![("Room", 0), ("Building", 1)]),
+                ("ft2", "Room has RoomNr", vec![("Room", 0), ("RoomNr", 1)]),
+            ],
+            vec![
+                ("UC", vec![("ft1", 0)]),
+                ("UC", vec![("ft2", 0)]),
+            ],
+            vec![("Room", vec!["Building", "RoomNr"])],
+        );
+        let cells = rmap_cells_from_state(&state);
+
+        let tables = crate::ast::fetch_or_phi("RMAPTable", &cells);
+        let table_rows = tables.as_seq().expect("RMAPTable cell must be a Seq");
+        let room_row = table_rows.iter()
+            .find(|f| crate::ast::binding(f, "name") == Some("room"))
+            .expect("RMAPTable must carry a `room` row");
+        let pk = crate::ast::binding(room_row, "primaryKey")
+            .expect("room has a primaryKey binding");
+        let pk_parts: Vec<&str> = pk.split(',').collect();
+        assert_eq!(pk_parts.len(), 2,
+            "compound ref scheme => composite PK, got {:?}", pk_parts);
+        assert!(pk_parts.contains(&"building_id"));
+        assert!(pk_parts.contains(&"room_nr"));
+
+        // building_id column on room should carry `references=building`
+        let columns = crate::ast::fetch_or_phi("RMAPColumn", &cells);
+        let col_rows = columns.as_seq().unwrap();
+        let building_fk = col_rows.iter()
+            .find(|f|
+                crate::ast::binding(f, "table") == Some("room")
+                && crate::ast::binding(f, "name") == Some("building_id"))
+            .expect("room.building_id column must exist");
+        assert_eq!(crate::ast::binding(building_fk, "references"), Some("building"));
     }
 
     /// #214: rmap_func applied via ast::apply produces the same
