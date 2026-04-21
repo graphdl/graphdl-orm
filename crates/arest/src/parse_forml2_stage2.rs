@@ -3217,7 +3217,7 @@ mod tests {
         let iters = 20usize;
         let t0 = Instant::now();
         for _ in 0..iters {
-            let _ = crate::parse_forml2::parse_to_state(small).expect("legacy");
+            let _ = crate::parse_forml2::parse_to_state_legacy(small).expect("legacy");
         }
         let legacy_small = t0.elapsed();
 
@@ -3228,7 +3228,7 @@ mod tests {
         let s12_small = t0.elapsed();
 
         let t0 = Instant::now();
-        let _ = crate::parse_forml2::parse_to_state(core).expect("legacy core");
+        let _ = crate::parse_forml2::parse_to_state_legacy(core).expect("legacy core");
         let legacy_core = t0.elapsed();
 
         let t0 = Instant::now();
