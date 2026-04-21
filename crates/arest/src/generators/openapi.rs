@@ -46,71 +46,72 @@ use hashbrown::HashMap;
 
 use crate::ast::{Object, binding, fetch_or_phi};
 use crate::rmap::{self, TableColumn, TableDef};
-use crate::types::StateMachineDef;
 #[allow(unused_imports)]
 use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 
-/// Extract state machines directly from InstanceFact cells in state.
-/// Mirrors the same helper in solidity.rs â€” no Domain round-trip.
-fn state_machines_from_state(state: &Object) -> hashbrown::HashMap<String, StateMachineDef> {
-    // Lossless path: StateMachine cell carries full SM as JSON (written
-    // by domain_to_state when tests build SMs directly). Use it if present.
-    #[cfg(feature = "std-deps")]
-    {
-        let cell_sms: hashbrown::HashMap<String, StateMachineDef> =
-            fetch_or_phi("StateMachine", state).as_seq()
-                .map(|facts| facts.iter().filter_map(|f| {
-                    let name = binding(f, "name")?.to_string();
-                    let json = binding(f, "json")?;
-                    serde_json::from_str::<StateMachineDef>(json).ok().map(|sm| (name, sm))
-                }).collect()).unwrap_or_default();
-        if !cell_sms.is_empty() { return cell_sms; }
-    }
-    let inst = fetch_or_phi("InstanceFact", state);
-    let facts = inst.as_seq().unwrap_or(&[]);
-    let b = |f: &Object, k: &str| binding(f, k).unwrap_or("").to_string();
+// State-machine cell readers (#325). Replaces the earlier
+// `state_machines_from_state -> HashMap<String, StateMachineDef>`
+// typed-IR materialisation. Consumers read per-noun SM info via these
+// three helpers directly, no typed struct in flight.
 
-    let mut sms: hashbrown::HashMap<String, StateMachineDef> = hashbrown::HashMap::new();
-    // "State Machine Definition 'X' is for Noun 'Y'"
-    for f in facts.iter().filter(|f| b(f, "subjectNoun") == "State Machine Definition" && b(f, "fieldName").contains("is for")) {
-        let sm_name = b(f, "subjectValue");
-        let noun = b(f, "objectValue");
-        sms.entry(noun).or_insert_with(|| StateMachineDef {
-            noun_name: sm_name, statuses: vec![], transitions: vec![],
-            initial: String::new(),
-        });
-    }
-    // "Status 'Z' is defined in State Machine Definition 'X'"
-    for f in facts.iter().filter(|f| b(f, "subjectNoun") == "Status" && b(f, "fieldName").contains("defined in")) {
-        let status = b(f, "subjectValue");
-        let sm_name = b(f, "objectValue");
-        if let Some(sm) = sms.values_mut().find(|s| s.noun_name == sm_name) {
-            if !sm.statuses.contains(&status) { sm.statuses.push(status); }
+/// Resolve the SM name attached to a noun, if any.
+fn sm_name_for_noun(state: &Object, noun_name: &str) -> Option<String> {
+    fetch_or_phi("InstanceFact", state).as_seq()?
+        .iter()
+        .find(|f| binding(f, "subjectNoun") == Some("State Machine Definition")
+            && binding(f, "fieldName").map(|s| s.contains("is for")).unwrap_or(false)
+            && binding(f, "objectValue") == Some(noun_name))
+        .and_then(|f| binding(f, "subjectValue").map(String::from))
+}
+
+/// Statuses for the SM attached to `noun_name`, in declaration order.
+fn sm_statuses(state: &Object, noun_name: &str) -> Vec<String> {
+    let Some(sm_name) = sm_name_for_noun(state, noun_name) else { return vec![]; };
+    let inst = fetch_or_phi("InstanceFact", state);
+    let Some(facts) = inst.as_seq() else { return vec![]; };
+    let mut out: Vec<String> = Vec::new();
+    for f in facts.iter().filter(|f|
+        binding(f, "subjectNoun") == Some("Status")
+        && binding(f, "fieldName").map(|s| s.contains("defined in")).unwrap_or(false)
+        && binding(f, "objectValue") == Some(sm_name.as_str()))
+    {
+        if let Some(s) = binding(f, "subjectValue") {
+            let s = s.to_string();
+            if !out.contains(&s) { out.push(s); }
         }
     }
-    // Transitions
-    for f in facts.iter().filter(|f| b(f, "subjectNoun") == "Transition") {
-        let trans_name = b(f, "subjectValue");
-        let field = b(f, "fieldName");
-        let value = b(f, "objectValue");
-        for sm in sms.values_mut() {
-            let t = sm.transitions.iter_mut().find(|t| t.event == trans_name);
-            match t {
-                Some(t) => {
-                    if field.contains("from") { t.from = value.clone(); }
-                    if field.contains("to") { t.to = value.clone(); }
-                }
-                None => {
-                    let mut td = crate::types::TransitionDef { event: trans_name.clone(), from: String::new(), to: String::new(), guard: None };
-                    if field.contains("from") { td.from = value.clone(); }
-                    if field.contains("to") { td.to = value.clone(); }
-                    if field.contains("triggered") { td.event = value.clone(); }
-                    sm.transitions.push(td);
-                }
+    out
+}
+
+/// Transitions for the SM attached to `noun_name` as
+/// `(event, from, to)` tuples.
+fn sm_transitions(state: &Object, noun_name: &str) -> Vec<(String, String, String)> {
+    if sm_name_for_noun(state, noun_name).is_none() { return vec![]; }
+    let inst = fetch_or_phi("InstanceFact", state);
+    let Some(facts) = inst.as_seq() else { return vec![]; };
+    let mut by_event: Vec<(String, String, String)> = Vec::new();
+    for f in facts.iter().filter(|f| binding(f, "subjectNoun") == Some("Transition")) {
+        let Some(event) = binding(f, "subjectValue").map(String::from) else { continue };
+        let field = binding(f, "fieldName").unwrap_or("");
+        let value = binding(f, "objectValue").unwrap_or("").to_string();
+        let slot = by_event.iter_mut().find(|(e, _, _)| *e == event);
+        match slot {
+            Some((_, from, to)) => {
+                if field.contains("from") { *from = value; }
+                else if field.contains("to") { *to = value; }
+            }
+            None => {
+                let mut from = String::new();
+                let mut to = String::new();
+                let mut ev = event.clone();
+                if field.contains("from") { from = value; }
+                else if field.contains("to") { to = value; }
+                else if field.contains("triggered") { ev = value; }
+                by_event.push((ev, from, to));
             }
         }
     }
-    sms
+    by_event
 }
 
 /// Compile state into an OpenAPI 3.1 JSON document for one App.
@@ -159,8 +160,6 @@ fn openapi_from_state(state: &Object, app_name: &str) -> serde_json::Value {
         .map(|n| (rmap::to_snake(n), n.clone()))
         .collect();
 
-    let sms = state_machines_from_state(state);
-
     // InstanceFact cell for general_instance_facts (plural / app description)
     let inst_cell = fetch_or_phi("InstanceFact", state);
     let inst_seq = inst_cell.as_seq().unwrap_or(&[]);
@@ -170,7 +169,7 @@ fn openapi_from_state(state: &Object, app_name: &str) -> serde_json::Value {
         .filter_map(|(name, _)| {
             let table_name = rmap::to_snake(name);
             tables_by_entity.get(&table_name)
-                .map(|table| (name.clone(), component_schema_from_state(name, table, &noun_by_snake, &enum_values, &sms)))
+                .map(|table| (name.clone(), component_schema_from_state(name, table, &noun_by_snake, &enum_values, state)))
         })
         .collect();
 
@@ -191,9 +190,8 @@ fn openapi_from_state(state: &Object, app_name: &str) -> serde_json::Value {
         })
         .flat_map(|(name, _)| {
             let plural = plural_for_noun_from_state(name, inst_seq);
-            let sm = sms.get(name);
             let table = tables_by_entity.get(&rmap::to_snake(name)).copied();
-            paths_for_noun_from_state(name, &plural, sm, &noun_types, inst_seq, ft_seq, role_seq, table)
+            paths_for_noun_from_state(name, &plural, state, &noun_types, inst_seq, ft_seq, role_seq, table)
         })
         .collect();
 
@@ -367,7 +365,7 @@ fn envelope_schema(data_schema: serde_json::Value, include_derived: bool) -> ser
 fn paths_for_noun_from_state(
     noun_name: &str,
     plural: &str,
-    sm: Option<&StateMachineDef>,
+    state: &Object,
     noun_types: &HashMap<String, String>,
     inst_seq: &[Object],
     ft_seq: &[Object],
@@ -477,8 +475,12 @@ fn paths_for_noun_from_state(
         })),
     ];
 
-    let transitions = sm.into_iter().flat_map(|sm| {
-        let events: Vec<&str> = sm.transitions.iter().map(|t| t.event.as_str()).collect();
+    let sm_trans = sm_transitions(state, noun_name);
+    let transitions: Vec<(String, serde_json::Value)> = if sm_trans.is_empty() {
+        vec![]
+    } else {
+        let events: Vec<String> = sm_trans.iter().map(|(e, _, _)| e.clone()).collect();
+        let events: Vec<&str> = events.iter().map(|s| s.as_str()).collect();
         let fire_request = serde_json::json!({
             "required": true,
             "description": "Fire a transition by event name.",
@@ -521,7 +523,7 @@ fn paths_for_noun_from_state(
                 },
             })),
         ]
-    });
+    };
 
     // Theorem 4b navigation from state cells
     let participations: Vec<(String, String)> = ft_seq.iter().filter_map(|f| {
@@ -595,8 +597,11 @@ fn paths_for_noun_from_state(
         })
         .collect();
 
-    let actions_route = sm.into_iter().map(|sm| {
-        let events: Vec<&str> = sm.transitions.iter().map(|t| t.event.as_str()).collect();
+    let actions_route: Vec<(String, serde_json::Value)> = if sm_trans.is_empty() {
+        vec![]
+    } else {
+        let events: Vec<String> = sm_trans.iter().map(|(e, _, _)| e.clone()).collect();
+        let events: Vec<&str> = events.iter().map(|s| s.as_str()).collect();
         let events_response = serde_json::json!({
             "200": {
                 "description": format!("Events (actions) valid from the current status of this {}.", noun_name),
@@ -607,7 +612,7 @@ fn paths_for_noun_from_state(
                 },
             },
         });
-        (
+        vec![(
             format!("/{}/{{id}}/actions", plural),
             serde_json::json!({
                 "parameters": [id_param.clone()],
@@ -617,8 +622,8 @@ fn paths_for_noun_from_state(
                     "responses": events_response,
                 },
             }),
-        )
-    }).collect::<Vec<_>>();
+        )]
+    };
 
     let explain_response = serde_json::json!({
         "200": {
@@ -723,20 +728,24 @@ fn component_schema_from_state(
     table: &TableDef,
     noun_by_snake: &HashMap<String, String>,
     enum_values: &HashMap<String, Vec<String>>,
-    sms: &hashbrown::HashMap<String, StateMachineDef>,
+    state: &Object,
 ) -> serde_json::Value {
     let column_props = table.columns.iter()
         .map(|col| (col.name.clone(), column_property_from_state(col, noun_by_snake, enum_values)));
 
-    let sm_props = sms.values()
-        .filter(|sm| sm.noun_name == noun_name)
-        .map(|sm| (
+    // SM-derived "status" property, if this noun has a state machine.
+    let statuses = sm_statuses(state, noun_name);
+    let sm_props: Box<dyn Iterator<Item = (String, serde_json::Value)>> = if statuses.is_empty() {
+        Box::new(core::iter::empty())
+    } else {
+        Box::new(core::iter::once((
             "status".to_string(),
             serde_json::json!({
                 "type": "string",
-                "enum": &sm.statuses,
+                "enum": statuses,
             }),
-        ));
+        )))
+    };
 
     let properties: serde_json::Map<String, serde_json::Value> =
         column_props.chain(sm_props).collect();
@@ -846,18 +855,51 @@ mod tests {
         state
     }
 
+    /// Push SM instance-fact rows onto `state`: one "State Machine
+    /// Definition … is for …" row, one "Status … defined in …" per
+    /// status, two rows ("from" / "to") per transition. Matches the
+    /// shape the parser produces and that `sm_*` helpers read.
     fn push_state_machine(
-        mut state: Object, name: &str, sm: &crate::types::StateMachineDef,
+        state: Object, sm_name: &str, noun_name: &str,
+        statuses: &[&str], transitions: &[(&str, &str, &str)], // (from, to, event)
     ) -> Object {
-        let json = serde_json::to_string(sm).unwrap_or_default();
-        let fact = fact_from_pairs(&[("name", name), ("json", json.as_str())]);
+        let mut rows: Vec<Object> = Vec::new();
+        rows.push(fact_from_pairs(&[
+            ("subjectNoun", "State Machine Definition"),
+            ("subjectValue", sm_name),
+            ("fieldName", "is for"),
+            ("objectValue", noun_name),
+        ]));
+        for s in statuses {
+            rows.push(fact_from_pairs(&[
+                ("subjectNoun", "Status"),
+                ("subjectValue", s),
+                ("fieldName", "defined in"),
+                ("objectValue", sm_name),
+            ]));
+        }
+        for (from, to, event) in transitions {
+            rows.push(fact_from_pairs(&[
+                ("subjectNoun", "Transition"),
+                ("subjectValue", event),
+                ("fieldName", "from"),
+                ("objectValue", from),
+            ]));
+            rows.push(fact_from_pairs(&[
+                ("subjectNoun", "Transition"),
+                ("subjectValue", event),
+                ("fieldName", "to"),
+                ("objectValue", to),
+            ]));
+        }
+        let mut state = state;
         if let Object::Map(ref mut m) = state {
-            let mut v: Vec<Object> = m.get("StateMachine")
+            let mut v: Vec<Object> = m.get("InstanceFact")
                 .and_then(|o| o.as_seq())
                 .map(|s| s.to_vec())
                 .unwrap_or_default();
-            v.push(fact);
-            m.insert("StateMachine".into(), Object::Seq(v.into()));
+            v.extend(rows);
+            m.insert("InstanceFact".into(), Object::Seq(v.into()));
         }
         state
     }
@@ -1005,19 +1047,12 @@ mod tests {
         // GET /transitions to list the events valid from the current
         // status. They only exist when the noun has a State Machine
         // Definition; a status-less noun has no transitions to project.
-        use crate::types::{StateMachineDef, TransitionDef};
-        let sm = StateMachineDef {
-            noun_name: "Organization".into(),
-            statuses: vec!["active".into(), "archived".into()],
-            transitions: vec![TransitionDef {
-                from: "active".into(),
-                to: "archived".into(),
-                event: "archive".into(),
-                guard: None,
-            }],
-            initial: String::new(),
-        };
-        let state = push_state_machine(organization_with_slug(), "Organization", &sm);
+        let state = push_state_machine(
+            organization_with_slug(),
+            "Organization Lifecycle", "Organization",
+            &["active", "archived"],
+            &[("active", "archived", "archive")],
+        );
 
         let doc = openapi_for_app(&state, "test-app");
         let paths = doc["paths"].as_object()
@@ -1221,19 +1256,12 @@ mod tests {
     #[test]
     fn introspection_routes_emit_explain_always_and_actions_when_sm_present(){
         // /explain always. /actions only when the noun has an SM.
-        use crate::types::{StateMachineDef, TransitionDef};
-        let sm = StateMachineDef {
-            noun_name: "Organization".into(),
-            statuses: vec!["active".into(), "archived".into()],
-            transitions: vec![TransitionDef {
-                from: "active".into(),
-                to: "archived".into(),
-                event: "archive".into(),
-                guard: None,
-            }],
-            initial: String::new(),
-        };
-        let state = push_state_machine(organization_with_slug(), "Organization", &sm);
+        let state = push_state_machine(
+            organization_with_slug(),
+            "Organization Lifecycle", "Organization",
+            &["active", "archived"],
+            &[("active", "archived", "archive")],
+        );
 
         let doc = openapi_for_app(&state, "test-app");
         let paths = doc["paths"].as_object().unwrap();
