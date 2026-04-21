@@ -337,6 +337,18 @@ impl PeerPicker for LcgPicker {
 
 // ── Gossiper ──────────────────────────────────────────────────────────
 
+/// A probe currently in flight. The Gossiper holds at most one at a
+/// time — SWIM deliberately serializes probes so failure-detection
+/// latency is bounded by T_ack, not T_ack × n_peers.
+#[derive(Clone, Debug)]
+struct Probe {
+    target: NodeId,
+    /// Clock-ms when the current phase began. On direct-phase
+    /// timeout we'd escalate to indirect PingReqs; with no other
+    /// alive peers to ask, the Gossiper short-circuits to Suspect.
+    phase_started_at: u64,
+}
+
 /// The SWIM state machine. Owns a Membership, a Transport, a Clock,
 /// and a PeerPicker. `tick()` drives everything — there is no
 /// background thread inside; the caller (a background thread in
@@ -349,6 +361,10 @@ pub struct Gossiper<T: Transport, C: Clock, P: PeerPicker> {
     cfg: GossipConfig,
     next_gossip_at: u64,
     next_seq: u64,
+    probe: Option<Probe>,
+    /// Map of NodeId → clock-ms when we marked it Suspect. On
+    /// tick, any entry older than T_suspect flips to Dead.
+    suspect_since: HashMap<NodeId, u64>,
 }
 
 impl<T: Transport, C: Clock, P: PeerPicker> Gossiper<T, C, P> {
@@ -368,6 +384,8 @@ impl<T: Transport, C: Clock, P: PeerPicker> Gossiper<T, C, P> {
             cfg,
             next_gossip_at: 0,
             next_seq: 1,
+            probe: None,
+            suspect_since: HashMap::new(),
         }
     }
 
@@ -383,17 +401,26 @@ impl<T: Transport, C: Clock, P: PeerPicker> Gossiper<T, C, P> {
         self.membership.merge(delta)
     }
 
-    /// One step of the state machine. Drains inbound messages, and
-    /// if the gossip interval has elapsed, picks a peer and sends a
-    /// PING carrying the current snapshot as piggyback.
+    /// One step of the state machine. Drains inbound messages, checks
+    /// probe and suspect deadlines, and (if no probe is in flight and
+    /// the gossip interval has elapsed) starts a fresh probe by
+    /// sending a Ping to a random Alive peer with the current
+    /// snapshot as piggyback.
+    ///
+    /// One probe in flight at a time: SWIM deliberately serializes
+    /// probes so failure-detection latency is bounded by T_ack, and
+    /// so a slow peer doesn't pile up probes and distort the
+    /// cluster-wide gossip load.
     pub fn tick(&mut self) {
         let inbound = self.transport.recv_nonblocking();
         for (from_addr, msg) in inbound {
             self.handle(from_addr, msg);
         }
         let now = self.clock.now_millis();
-        if now >= self.next_gossip_at {
-            self.send_periodic_ping();
+        self.check_probe_deadline(now);
+        self.check_suspect_deadlines(now);
+        if now >= self.next_gossip_at && self.probe.is_none() {
+            self.start_probe(now);
             self.next_gossip_at = now + self.cfg.t_gossip_ms;
         }
     }
@@ -411,11 +438,19 @@ impl<T: Transport, C: Clock, P: PeerPicker> Gossiper<T, C, P> {
                 };
                 let _ = self.transport.send(from_addr, &ack);
             }
-            GossipMsg::Ack { piggyback, .. } => {
+            GossipMsg::Ack { from, piggyback, .. } => {
                 for d in piggyback { self.apply_delta(d); }
+                // An Ack from our probe target clears the probe:
+                // direct evidence the node is alive.
+                if let Some(probe) = self.probe.as_ref() {
+                    if probe.target == from {
+                        self.probe = None;
+                    }
+                }
             }
             // PingReq / Join / JoinAck / Leave land in follow-up
-            // commits — acceptance test #1 only exercises Ping/Ack.
+            // commits — these acceptance tests only exercise direct
+            // Ping/Ack + the Suspect → Dead timer.
             GossipMsg::PingReq { .. }
             | GossipMsg::Join { .. }
             | GossipMsg::JoinAck { .. }
@@ -423,7 +458,10 @@ impl<T: Transport, C: Clock, P: PeerPicker> Gossiper<T, C, P> {
         }
     }
 
-    fn send_periodic_ping(&mut self) {
+    /// Start a new probe: pick a random Alive peer, send Ping, record
+    /// the probe so the deadline checker can escalate to Suspect if
+    /// no Ack arrives in time.
+    fn start_probe(&mut self, now: u64) {
         let self_id = self.membership.self_id().clone();
         let peers: Vec<NodeId> = self
             .membership
@@ -441,6 +479,62 @@ impl<T: Transport, C: Clock, P: PeerPicker> Gossiper<T, C, P> {
             piggyback: self.membership.snapshot(),
         };
         let _ = self.transport.send(target_meta.addr, &ping);
+        self.probe = Some(Probe { target, phase_started_at: now });
+    }
+
+    fn check_probe_deadline(&mut self, now: u64) {
+        let Some(probe) = self.probe.as_ref() else { return };
+        if now.saturating_sub(probe.phase_started_at) <= self.cfg.t_ack_ms {
+            return;
+        }
+        // Direct probe timed out. SWIM would escalate to indirect
+        // PingReqs here; with no intermediaries (0 other Alive peers),
+        // we short-circuit to Suspect. The PingReq relay path lives
+        // in a follow-up — until then, even the 2-node case falls
+        // through to Suspect correctly.
+        let target = probe.target.clone();
+        self.mark_suspect(&target, now);
+        self.probe = None;
+    }
+
+    fn check_suspect_deadlines(&mut self, now: u64) {
+        let expired: Vec<NodeId> = self
+            .suspect_since
+            .iter()
+            .filter(|(_, &started)| now.saturating_sub(started) > self.cfg.t_suspect_ms)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in expired {
+            self.mark_dead(&id);
+        }
+    }
+
+    fn mark_suspect(&mut self, id: &NodeId, now: u64) {
+        let Some(existing) = self.membership.get(id).cloned() else { return };
+        // Only transition Alive → Suspect at the current incarnation.
+        // A peer can refute the Suspect by broadcasting Alive at a
+        // higher incarnation (once the Gossiper implements self-
+        // refutation — see follow-up commit).
+        if existing.state == State::Alive {
+            self.membership.merge(Delta {
+                id: id.clone(),
+                addr: existing.addr,
+                incarnation: existing.incarnation,
+                state: State::Suspect,
+            });
+            self.suspect_since.insert(id.clone(), now);
+        }
+    }
+
+    fn mark_dead(&mut self, id: &NodeId) {
+        let Some(existing) = self.membership.get(id).cloned() else { return };
+        self.membership.merge(Delta {
+            id: id.clone(),
+            addr: existing.addr,
+            incarnation: existing.incarnation,
+            state: State::Dead,
+        });
+        self.suspect_since.remove(id);
     }
 }
 
@@ -603,5 +697,57 @@ mod tests {
                 assert_eq!(m.state, State::Alive, "{name} sees {peer} as {:?}", m.state);
             }
         }
+    }
+
+    /// Acceptance test #2 (handoff): a node going silent is marked
+    /// Suspect then Dead within T_suspect + T_gossip.
+    ///
+    /// Setup: A holds B in its view as Alive, but B has no Gossiper —
+    /// its mailbox fills up and nothing ever drains it. A's probe of
+    /// B times out on the direct phase; with no intermediaries in the
+    /// cluster (only A and B), there is no one to PingReq, so A
+    /// short-circuits directly to Suspect. After T_suspect elapses
+    /// without refutation, A flips B to Dead.
+    #[test]
+    fn silent_node_transitions_alive_to_suspect_to_dead() {
+        let net = InMemNet::new();
+        let clock = Arc::new(TestClock::new());
+        let cfg = GossipConfig::for_tests();
+
+        let mut a = new_gossiper("a", 1000, &net, clock.clone(), cfg.clone());
+
+        // Reserve B's mailbox so A's Pings don't error on send —
+        // they just queue up in a mailbox nobody drains.
+        let _silent_b = net.endpoint(addr(2000));
+        a.apply_delta(Delta { id: "b".into(), addr: addr(2000), incarnation: 0, state: State::Alive });
+
+        assert_eq!(a.membership().get(&"b".to_string()).unwrap().state, State::Alive);
+
+        // Round 1: tick fires periodic gossip, A probes B.
+        clock.advance_millis(cfg.t_gossip_ms + 1);
+        a.tick();
+
+        // Still Alive — the probe is in flight.
+        assert_eq!(a.membership().get(&"b".to_string()).unwrap().state, State::Alive);
+
+        // Past T_ack: probe times out, no intermediaries, B → Suspect.
+        clock.advance_millis(cfg.t_ack_ms + 1);
+        a.tick();
+
+        assert_eq!(
+            a.membership().get(&"b".to_string()).unwrap().state,
+            State::Suspect,
+            "after T_ack without reply, B should be Suspect"
+        );
+
+        // Past T_suspect: Suspect → Dead.
+        clock.advance_millis(cfg.t_suspect_ms + 1);
+        a.tick();
+
+        assert_eq!(
+            a.membership().get(&"b".to_string()).unwrap().state,
+            State::Dead,
+            "after T_suspect without refutation, B should be Dead"
+        );
     }
 }
