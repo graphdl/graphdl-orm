@@ -78,6 +78,9 @@ pub fn init_idt() {
                 .set_handler_fn(double_fault_handler)
                 .set_stack_index(DOUBLE_FAULT_IST_INDEX);
         }
+        idt.page_fault.set_handler_fn(page_fault_handler);
+        idt.general_protection_fault.set_handler_fn(general_protection_handler);
+        idt.invalid_opcode.set_handler_fn(invalid_opcode_handler);
         idt[InterruptIndex::Keyboard.as_u8()].set_handler_fn(keyboard_handler);
         idt
     });
@@ -116,6 +119,52 @@ extern "x86-interrupt" fn double_fault_handler(
     _error_code: u64,
 ) -> ! {
     panic!("EXCEPTION: DOUBLE FAULT\n{stack_frame:#?}");
+}
+
+/// True when the exception was delivered from CPL=3 (ring-3 user code).
+/// Reads the low two bits of the pushed CS selector — the CPL.
+fn from_ring3(stack_frame: &InterruptStackFrame) -> bool {
+    (stack_frame.code_segment.0 & 3) == 3
+}
+
+extern "x86-interrupt" fn page_fault_handler(
+    stack_frame: InterruptStackFrame,
+    error_code: x86_64::structures::idt::PageFaultErrorCode,
+) {
+    use x86_64::registers::control::Cr2;
+    let fault_addr = Cr2::read_raw();
+    println!(
+        "EXCEPTION: PAGE FAULT  addr={fault_addr:#x}  err={error_code:?}\n{stack_frame:#?}"
+    );
+    if from_ring3(&stack_frame) {
+        // Ring-3 code took a fault — smoke test has failed. Halt
+        // cleanly via isa-debug-exit so the harness sees a distinct
+        // exit code (0x11 -> QEMU exit 35).
+        crate::userspace::halt_on_exit(crate::userspace::exit_code::RING3_FAULT);
+    }
+    // Ring-0 page fault is an unrecoverable kernel bug.
+    panic!("page fault from ring 0");
+}
+
+extern "x86-interrupt" fn general_protection_handler(
+    stack_frame: InterruptStackFrame,
+    error_code: u64,
+) {
+    println!(
+        "EXCEPTION: GENERAL PROTECTION  err={error_code:#x}\n{stack_frame:#?}"
+    );
+    if from_ring3(&stack_frame) {
+        crate::userspace::halt_on_exit(crate::userspace::exit_code::RING3_FAULT);
+    }
+    panic!("GP fault from ring 0");
+}
+
+extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStackFrame) {
+    println!("EXCEPTION: INVALID OPCODE\n{stack_frame:#?}");
+    if from_ring3(&stack_frame) {
+        crate::userspace::halt_on_exit(crate::userspace::exit_code::RING3_FAULT);
+    }
+    panic!("#UD from ring 0");
 }
 
 extern "x86-interrupt" fn keyboard_handler(_stack_frame: InterruptStackFrame) {
