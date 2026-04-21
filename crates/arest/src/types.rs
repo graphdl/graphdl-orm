@@ -104,6 +104,22 @@ mod wire_tests {
     }
 
     #[test]
+    fn round_trip_absence_of() {
+        let src = AntecedentSource::AbsenceOf {
+            fact_type: "ft_some:thing".to_string(),
+            role: "Weird:Role".to_string(),
+        };
+        assert_eq!(AntecedentSource::decode(&src.encode()), src);
+    }
+
+    #[test]
+    fn round_trip_plain_fact_type_id_passes_through() {
+        let src = AntecedentSource::FactType("ordinary_ft_id".to_string());
+        assert_eq!(src.encode(), "ordinary_ft_id");
+        assert_eq!(AntecedentSource::decode(&src.encode()), src);
+    }
+
+    #[test]
     fn literal_id_passes_through_unescaped() {
         // Legacy literal ids without any `:` round-trip as bare strings,
         // preserving the pre-enum wire format.
@@ -271,8 +287,21 @@ impl Default for ConsequentCellSource {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase", tag = "kind", content = "value")]
 pub enum AntecedentSource {
+    /// Antecedent is the cell's fact list for this FT id.
     FactType(String),
+    /// Antecedent is a Seq of raw noun-instance atoms aggregated
+    /// across every cell that binds the noun.
     InstancesOfNoun(String),
+    /// Guard antecedent: the rule fires only when no fact of
+    /// `fact_type` has the primary-antecedent instance bound at
+    /// `role`. Used to express CWA negation's participation check
+    /// as a standard rule shape rather than a bespoke inlined Func
+    /// (`#287` gap #2). Currently only meaningful as a secondary
+    /// antecedent when the primary is `InstancesOfNoun`.
+    AbsenceOf {
+        fact_type: String,
+        role: String,
+    },
 }
 
 impl AntecedentSource {
@@ -300,15 +329,29 @@ impl AntecedentSource {
                 out.push_str(&wire_escape(noun));
                 out
             }
+            Self::AbsenceOf { fact_type, role } => {
+                let mut out = String::from("@absence:");
+                out.push_str(&wire_escape(fact_type));
+                out.push(':');
+                out.push_str(&wire_escape(role));
+                out
+            }
         }
     }
 
     pub fn decode(s: &str) -> Self {
         if let Some(escaped) = s.strip_prefix("@noun:") {
-            Self::InstancesOfNoun(wire_unescape(escaped))
-        } else {
-            Self::FactType(s.to_string())
+            return Self::InstancesOfNoun(wire_unescape(escaped));
         }
+        if let Some(rest) = s.strip_prefix("@absence:") {
+            if let Some((ft_escaped, role_escaped)) = wire_split_once_unescaped(rest, ':') {
+                return Self::AbsenceOf {
+                    fact_type: wire_unescape(&ft_escaped),
+                    role: wire_unescape(&role_escaped),
+                };
+            }
+        }
+        Self::FactType(s.to_string())
     }
 }
 
