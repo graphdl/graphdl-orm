@@ -60,31 +60,32 @@ try {
 
 # 3. Launch QEMU. isa-debug-exit lets the kernel exit QEMU with a
 #    specific code by writing a u32 to port 0xf4.
+#
+#    `-serial stdio` is redirected to $SerialLog via PowerShell
+#    (Start-Process -RedirectStandardOutput). We can't use `-serial
+#    file:...` because QEMU on Windows doesn't flush the file backend
+#    on isa-debug-exit termination — the log comes back empty.
+#
+#    We deliberately omit `-no-shutdown`: that flag converts shutdown
+#    events (including our isa-debug-exit port write) into a paused
+#    VM, leaving QEMU alive. With only `-no-reboot`, isa-debug-exit
+#    actually terminates QEMU so the exit code can reach the harness.
 $QemuArgs = @(
     "-drive",  "format=raw,file=$ImagePath",
     "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
-    "-serial", "file:$SerialLog",
+    "-serial", "stdio",
     "-display","none",
-    "-no-reboot","-no-shutdown"
+    "-no-reboot"
 )
 
-# Start QEMU via the call operator so it inherits stdio properly and
-# its return code comes back via $LASTEXITCODE. We enforce the timeout
-# by running in a System.Diagnostics.Process and polling WaitForExit.
-$psi = New-Object System.Diagnostics.ProcessStartInfo
-$psi.FileName = $Qemu
-foreach ($arg in $QemuArgs) { [void]$psi.ArgumentList.Add($arg) }
-$psi.UseShellExecute = $false
-$psi.RedirectStandardOutput = $false
-$psi.RedirectStandardError = $false
-$psi.CreateNoWindow = $true
-$qemu = [System.Diagnostics.Process]::Start($psi)
-if (-not $qemu.WaitForExit(30000)) {
-    $qemu.Kill()
-    Write-Host "-- serial log (timeout) --"
-    if (Test-Path $SerialLog) { Get-Content $SerialLog }
-    exit 2
-}
+# Use Start-Process with -Wait so QEMU's exit code is captured
+# properly and its stdout is actually flushed to $SerialLog before we
+# read it. PowerShell 5.1's Start-Process -RedirectStandardOutput
+# does not reliably flush stdio when combined with -PassThru +
+# manual WaitForExit — using -Wait avoids that gotcha.
+$qemu = Start-Process -FilePath $Qemu -ArgumentList $QemuArgs `
+    -NoNewWindow -PassThru -Wait `
+    -RedirectStandardOutput $SerialLog
 
 # 4. Translate QEMU exit code to harness exit code.
 #    Kernel 0x10  -> QEMU (0x10<<1)|1 = 33   -> success
