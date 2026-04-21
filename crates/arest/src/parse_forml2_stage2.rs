@@ -2244,6 +2244,15 @@ pub fn parse_to_state_via_stage12(text: &str) -> Result<Object, String> {
     // from the right and push `{Noun}_has_{Component}` cells carrying
     // the noun id + component value. command.rs / rmap read these.
     let compound_cells = compound_ref_component_cells(&noun_facts, &instance_fact_facts);
+    // Per-field cells for instance facts: `emit_instance_fact` in the
+    // legacy cascade writes every instance fact twice — once to the
+    // canonical `InstanceFact` cell (stage12 already does this) AND
+    // once to a `{fieldName}` cell (e.g. `A_has_B`) keyed by the
+    // subject/object nouns. `extract_facts_from_pop` in compile.rs
+    // reads these per-field cells at runtime, so derivations over
+    // instance-fact populations (forward_chain over joins, CWA
+    // negations, etc.) need them present.
+    let per_field_cells = instance_fact_field_cells(&instance_fact_facts);
 
     let mut map: HashMap<String, Object> = HashMap::new();
     map.insert("Noun".to_string(), Object::Seq(noun_facts.into()));
@@ -2257,6 +2266,16 @@ pub fn parse_to_state_via_stage12(text: &str) -> Result<Object, String> {
     map.insert("UnresolvedClause".to_string(), Object::Seq(unresolved_clause_facts.into()));
     for (cell_name, facts) in compound_cells {
         map.insert(cell_name, Object::Seq(facts.into()));
+    }
+    for (cell_name, facts) in per_field_cells {
+        map.entry(cell_name)
+            .and_modify(|existing| {
+                let mut all: Vec<Object> = existing.as_seq()
+                    .map(|s| s.to_vec()).unwrap_or_default();
+                all.extend(facts.iter().cloned());
+                *existing = Object::Seq(all.into());
+            })
+            .or_insert_with(|| Object::Seq(facts.into()));
     }
     Ok(Object::Map(map))
 }
@@ -2318,6 +2337,37 @@ fn compound_ref_component_cells(
                 out.entry(cell_name).or_default().push(fact);
             }
         }
+    }
+    out.into_iter().collect()
+}
+
+/// Fan out `InstanceFact` facts into per-field cells keyed by
+/// `fieldName`. Legacy parity: `parse_forml2::emit_instance_fact`
+/// writes both the canonical `InstanceFact` fact and a `{fieldName}`
+/// cell carrying `(subjectNoun, subjectValue) + (objectKey, objectValue)`.
+///
+/// The object key is `objectNoun` when non-empty, else falls back to
+/// `fieldName` — matches the attribute-style path in `emit_instance_fact`.
+///
+/// Returns `(cell_name, facts)` pairs the caller merges into the
+/// final cell map.
+#[cfg(feature = "std-deps")]
+fn instance_fact_field_cells(instance_facts: &[Object]) -> Vec<(String, Vec<Object>)> {
+    let mut out: hashbrown::HashMap<String, Vec<Object>> = hashbrown::HashMap::new();
+    for f in instance_facts {
+        let Some(field_name) = binding(f, "fieldName") else { continue };
+        if field_name.is_empty() { continue; }
+        let subject_noun = binding(f, "subjectNoun").unwrap_or("");
+        let subject_value = binding(f, "subjectValue").unwrap_or("");
+        let object_noun = binding(f, "objectNoun").unwrap_or("");
+        let object_value = binding(f, "objectValue").unwrap_or("");
+        if subject_noun.is_empty() { continue; }
+        let object_key = if object_noun.is_empty() { field_name } else { object_noun };
+        let fact = fact_from_pairs(&[
+            (subject_noun, subject_value),
+            (object_key, object_value),
+        ]);
+        out.entry(field_name.to_string()).or_default().push(fact);
     }
     out.into_iter().collect()
 }
