@@ -101,6 +101,19 @@ export function SchemaDisplay({ field, value, locale }: SchemaDisplayProps): Rea
       )
     }
 
+    case 'image': {
+      const s = String(value)
+      return (
+        <img
+          src={s}
+          alt={field.label}
+          data-testid={`display-${field.name}`}
+          data-display="image"
+          style={{ maxWidth: 120, maxHeight: 120, border: '1px solid #ccc' }}
+        />
+      )
+    }
+
     case 'enum':
       return <span data-testid={`display-${field.name}`} data-display="enum">{String(value)}</span>
 

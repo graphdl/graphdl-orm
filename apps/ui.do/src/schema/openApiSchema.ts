@@ -63,6 +63,7 @@ export type FieldKind =
   | 'time'
   | 'email'
   | 'url'
+  | 'image'
   | 'enum'
   | 'reference'
   | 'array'
@@ -165,6 +166,7 @@ function classifyProperty(prop: unknown): { kind: FieldKind; enumValues?: Readon
 
   if (type === 'string') {
     if (format === 'email') return { kind: 'email' }
+    if (format === 'image' || format === 'uri-image' || format === 'uri-reference-image') return { kind: 'image' }
     if (format === 'uri' || format === 'url') return { kind: 'url' }
     if (format === 'date') return { kind: 'date' }
     if (format === 'date-time' || format === 'datetime') return { kind: 'datetime' }
@@ -189,7 +191,7 @@ function classifyProperty(prop: unknown): { kind: FieldKind; enumValues?: Readon
 const ALL_KINDS: ReadonlySet<string> = new Set([
   'string', 'textarea', 'password', 'number', 'integer', 'slider',
   'boolean', 'switch', 'date', 'datetime', 'time',
-  'email', 'url', 'enum', 'reference', 'array', 'object', 'unknown',
+  'email', 'url', 'image', 'enum', 'reference', 'array', 'object', 'unknown',
 ])
 function isValidKind(s: string): s is FieldKind {
   return ALL_KINDS.has(s)

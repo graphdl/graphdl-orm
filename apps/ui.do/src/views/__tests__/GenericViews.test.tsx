@@ -17,12 +17,13 @@ import type { ReactNode } from 'react'
 // at build time; tests assert the children — which is what the
 // schema-driven work is actually producing.
 vi.mock('@mdxui/admin', () => ({
-  ListView: ({ title, actions, loading, empty, children }: any) =>
+  ListView: ({ title, actions, loading, empty, pagination, children }: any) =>
     (
       <div data-testid="list-container">
         {title && <h1>{title}</h1>}
         {actions}
         {loading ? <span>Loading…</span> : (children || empty)}
+        {pagination}
       </div>
     ),
   ShowView: ({ title, loading, children, actions, aside }: any) => (

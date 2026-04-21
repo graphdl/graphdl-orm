@@ -121,7 +121,10 @@ describe('createArestResource', () => {
     const List = def.list!
     render(wrap(<List />))
     await waitFor(() => expect(screen.getByTestId('list-container')).toBeDefined())
-    const listFetch = recorded.find((r) => r.url.endsWith('/arest/organizations'))
+    // GenericListView now sends pagination params by default, so the
+    // URL is /arest/organizations?page=1&perPage=20. Match on the path
+    // rather than exact end.
+    const listFetch = recorded.find((r) => r.url.includes('/arest/organizations'))
     expect(listFetch).toBeDefined()
   })
 

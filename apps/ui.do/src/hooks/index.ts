@@ -6,6 +6,7 @@
  */
 export { useActions } from './useActions'
 export type { ArestAction, UseActionsOptions, UseActionsResult } from './useActions'
+export { usePermissions, type UsePermissionsOptions, type UsePermissionsResult } from './usePermissions'
 export { useEntityLinks, extractNavLinks } from './useEntityLinks'
 export type { EntityNavLink, UseEntityLinksOptions, UseEntityLinksResult } from './useEntityLinks'
 export {

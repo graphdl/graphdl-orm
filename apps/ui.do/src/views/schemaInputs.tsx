@@ -21,6 +21,7 @@
  */
 import type { ReactElement } from 'react'
 import type { FieldDef } from '../schema'
+import { ReferencePicker } from './ReferencePicker'
 
 export interface SchemaInputProps {
   field: FieldDef
@@ -28,6 +29,12 @@ export interface SchemaInputProps {
   onChange: (next: unknown) => void
   /** Below this option count, enums render as radio buttons. Default 4. */
   enumAsRadioThreshold?: number
+  /**
+   * AREST worker base URL — only required when the input is a
+   * reference picker (`kind: 'reference'`), which fetches the
+   * referenced noun's collection for options.
+   */
+  baseUrl?: string
 }
 
 function htmlInputType(field: FieldDef): string {
@@ -61,7 +68,61 @@ export function SchemaInput({
   value,
   onChange,
   enumAsRadioThreshold = 4,
+  baseUrl,
 }: SchemaInputProps): ReactElement {
+  // ── Reference (iFactr: cross-entity navigation → picker) ────────
+  if (field.kind === 'reference') {
+    if (!field.ref || !baseUrl) {
+      // Missing context (schema lacked $ref or caller didn't pass
+      // baseUrl) — fall back to a plain text input so edit flows
+      // still work. This mirrors iFactr.UI's behaviour when a
+      // reference control can't resolve its binding: degrade to
+      // the underlying value type.
+      return (
+        <input
+          type="text"
+          data-testid={`input-${field.name}`}
+          data-widget="reference-fallback"
+          value={value == null ? '' : String(value)}
+          onChange={(e) => onChange(e.target.value)}
+        />
+      )
+    }
+    return (
+      <ReferencePicker
+        noun={field.ref}
+        value={typeof value === 'string' ? value : value == null ? '' : String(value)}
+        onChange={onChange}
+        baseUrl={baseUrl}
+        testId={`input-${field.name}`}
+      />
+    )
+  }
+
+  // ── Image (iFactr: Image → ImageView → <img>) ───────────────────
+  if (field.kind === 'image') {
+    const href = value == null ? '' : String(value)
+    return (
+      <div data-testid={`input-${field.name}`} data-widget="image" style={{ display: 'flex', gap: '0.5rem', alignItems: 'flex-start' }}>
+        <input
+          type="url"
+          value={href}
+          placeholder="https://..."
+          onChange={(e) => onChange(e.target.value)}
+          style={{ flex: 1 }}
+        />
+        {href && (
+          <img
+            src={href}
+            alt={field.label}
+            data-testid={`input-${field.name}-preview`}
+            style={{ maxWidth: 80, maxHeight: 80, border: '1px solid #ccc' }}
+          />
+        )}
+      </div>
+    )
+  }
+
   // ── Enum: radio for small sets, select for big ones ─────────────
   if (field.kind === 'enum' && field.enum) {
     const opts = field.enum
