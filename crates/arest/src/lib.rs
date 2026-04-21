@@ -104,6 +104,12 @@ pub mod ring;
 pub mod declared_writes;
 #[cfg(not(feature = "no_std"))]
 pub mod check;
+// Storage-1: pluggable StorageBackend trait + in-mem/local-fs impls.
+// std-only because backends need heap + owned types and the fs impl
+// needs std::fs. The kernel / no_std target uses `freeze::thaw`
+// directly against baked ROM bytes instead of routing through this.
+#[cfg(not(feature = "no_std"))]
+pub mod storage;
 
 // Stress harness for compile_explicit_derivation (#296). Test-only; not
 // shipped in any build.
@@ -517,13 +523,85 @@ fn ds() -> &'static Mutex<Vec<Option<Arc<RwLock<CompiledState>>>>> {
     DOMAINS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-/// Look up a slot's tenant lock by handle. Returns None for invalid
-/// handles or freed slots. The outer Vec mutex is held only for the
-/// duration of the lookup and Arc clone, then released.
+// Storage-1: process-global storage backend.
+//
+// `tenant_lock` is the one gateway every engine operation goes through
+// to reach a tenant's in-memory state. Routing it through a trait lets
+// the runtime rehydrate from a persistent backend on miss — the
+// `InMemoryBackend` default preserves pre-Storage-1 semantics (miss →
+// None) because nothing commits to it unless a caller explicitly does.
+//
+// Configurable at boot via `set_storage_backend(...)`. The slot holds
+// an `Arc<dyn StorageBackend>` so callers that need to keep a handle
+// across a swap can, and so the fast path clones out of the lock in
+// one atomic ref-count bump.
+#[cfg(not(feature = "no_std"))]
+static STORAGE_BACKEND: OnceLock<Mutex<Arc<dyn storage::StorageBackend>>> = OnceLock::new();
+
+#[cfg(not(feature = "no_std"))]
+fn storage_backend_slot() -> &'static Mutex<Arc<dyn storage::StorageBackend>> {
+    STORAGE_BACKEND.get_or_init(|| Mutex::new(Arc::new(storage::InMemoryBackend::new())))
+}
+
+/// Clone the current process-global storage backend. Every
+/// `tenant_lock` that misses the in-memory slot consults this. The
+/// returned `Arc` is independent of the slot — a concurrent
+/// `set_storage_backend` will be visible to subsequent callers but
+/// won't yank the backend out from under an in-flight operation.
+#[cfg(not(feature = "no_std"))]
+pub fn storage_backend() -> Arc<dyn storage::StorageBackend> {
+    Arc::clone(&*storage_backend_slot().lock())
+}
+
+/// Install a storage backend for this process. Intended to be called
+/// once at boot before any `tenant_lock` runs; replacing mid-run is
+/// legal but in-flight operations keep the old backend via their
+/// `storage_backend()` clone.
+#[cfg(not(feature = "no_std"))]
+pub fn set_storage_backend(backend: Arc<dyn storage::StorageBackend>) {
+    *storage_backend_slot().lock() = backend;
+}
+
+/// Look up a slot's tenant lock by handle, rehydrating via the
+/// process-global `StorageBackend` on miss. Returns None for handles
+/// the backend has never seen. The outer Vec mutex is held only for
+/// the slot lookup / Arc clone — the backend's `open()` runs outside
+/// it so a slow fs read does not serialise unrelated lookups.
+///
+/// Rehydrate semantics: if the in-memory slot is empty but the
+/// backend has bytes for this handle, we thaw them into a fresh
+/// `CompiledState` and install under the original handle index. This
+/// is the mechanism that makes the Storage-1 acceptance test work —
+/// commit, release (or process restart), `tenant_lock` returns a
+/// CompiledState with the persisted Object.
 #[cfg(not(feature = "no_std"))]
 fn tenant_lock(handle: u32) -> Option<Arc<RwLock<CompiledState>>> {
-    let s = ds().lock();
-    s.get(handle as usize).and_then(|x| x.as_ref()).map(Arc::clone)
+    // Fast path: slot is already populated.
+    {
+        let s = ds().lock();
+        if let Some(Some(arc)) = s.get(handle as usize) {
+            return Some(Arc::clone(arc));
+        }
+    }
+
+    // Slow path: ask the backend. Drops the DOMAINS lock so a slow fs
+    // read doesn't serialise other tenants' lookups. Re-checks the
+    // slot under the lock before installing, in case another thread
+    // rehydrated the same handle concurrently.
+    let obj = match storage_backend().open(handle) {
+        Ok(o) => o,
+        Err(_) => return None,
+    };
+    let mut s = ds().lock();
+    if s.len() <= handle as usize {
+        s.resize(handle as usize + 1, None);
+    }
+    if let Some(arc) = &s[handle as usize] {
+        return Some(Arc::clone(arc));
+    }
+    let arc = Arc::new(RwLock::new(CompiledState::new(obj)));
+    s[handle as usize] = Some(Arc::clone(&arc));
+    Some(arc)
 }
 
 /// Set (or reset) a tenant's per-call budget. Every subsequent
@@ -2525,5 +2603,164 @@ Order has total.
             assert_ne!(system_impl(h, "audit", ""), "⊥");
         }
         release_impl(h);
+    }
+}
+
+// ── Storage-1: backend routing integration tests ─────────────────────
+//
+// Acceptance criterion 4: LocalFilesystemBackend round-trip — commit,
+// simulate process restart, rehydrate, assert state equal.
+//
+// These tests swap the process-global STORAGE_BACKEND, so they must
+// serialise with anything else that also swaps it. `STORAGE_TEST_LOCK`
+// below is the single gate — hold it for the full commit → release →
+// rehydrate sequence. A drop guard restores the default in-memory
+// backend even on panic so subsequent tests aren't poisoned.
+#[cfg(test)]
+mod storage_routing_tests {
+    use super::*;
+    use crate::storage::{LocalFilesystemBackend, StorageBackend};
+
+    static STORAGE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    struct BackendGuard;
+    impl Drop for BackendGuard {
+        fn drop(&mut self) {
+            // Restore the default in-memory backend so tests that run
+            // after this one see the same semantics they'd see at
+            // process start. An empty InMemoryBackend always returns
+            // NotFound from open(), so released slots still rehydrate
+            // to None — i.e., pre-Storage-1 behaviour is preserved.
+            set_storage_backend(Arc::new(storage::InMemoryBackend::new()));
+        }
+    }
+
+    fn unique_tempdir(label: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let mut p = std::env::temp_dir();
+        p.push(format!("arest-storage-lib-{label}-{pid}-{n}"));
+        let _ = std::fs::remove_dir_all(&p);
+        p
+    }
+
+    fn sample_state() -> ast::Object {
+        let mut m = hashbrown::HashMap::new();
+        m.insert(
+            "Noun".to_string(),
+            ast::Object::Seq(alloc::vec![
+                ast::Object::Atom("Ticket".to_string()),
+                ast::Object::Atom("Customer".to_string()),
+            ].into()),
+        );
+        m.insert(
+            "counter".to_string(),
+            ast::Object::Atom("42".to_string()),
+        );
+        ast::Object::Map(m)
+    }
+
+    /// The acceptance round-trip. Commit bytes to a filesystem backend
+    /// for a handle the in-memory slot table has never seen. Ensure
+    /// `tenant_lock` rehydrates the CompiledState from disk and the
+    /// observable snapshot matches the bytes we committed.
+    #[test]
+    fn local_fs_backend_round_trip_commit_release_rehydrate() {
+        let _gate = STORAGE_TEST_LOCK.lock();
+        let _guard = BackendGuard;
+        let tmp = unique_tempdir("round-trip");
+
+        let fs_backend = Arc::new(
+            LocalFilesystemBackend::new(&tmp).expect("fs backend init"),
+        );
+        set_storage_backend(Arc::clone(&fs_backend) as Arc<dyn StorageBackend>);
+
+        // Use a handle high enough to sit past any prior test's
+        // allocate() call in the shared DOMAINS vec, but low enough
+        // that the Vec-resize inside the rehydrate path doesn't
+        // allocate gigabytes — DOMAINS is a dense Vec indexed by
+        // handle. Real sparse-handle support is a Storage-4 concern.
+        const HANDLE: u32 = 8_000;
+        let expected = sample_state();
+
+        // Commit via the backend. This simulates a clean shutdown of
+        // a previous process that left bytes for HANDLE on disk.
+        fs_backend
+            .commit(HANDLE, &expected)
+            .expect("fs commit ok");
+
+        // "Simulate process restart": the in-memory DOMAINS slot for
+        // HANDLE has never been populated. tenant_lock must consult
+        // the backend, thaw, and install a fresh CompiledState.
+        let tenant = tenant_lock(HANDLE)
+            .expect("tenant_lock must rehydrate a committed handle via the backend");
+        let got = tenant.read().snapshot_d();
+        assert_eq!(
+            got, expected,
+            "rehydrated state must byte-equal the committed Object",
+        );
+
+        // A second tenant_lock on the same handle must return the same
+        // Arc (now cached in DOMAINS) — the backend should be consulted
+        // once per cold miss, not once per lookup.
+        let tenant_again = tenant_lock(HANDLE)
+            .expect("second tenant_lock must return the cached Arc");
+        assert!(
+            Arc::ptr_eq(&tenant, &tenant_again),
+            "cached slot must return the same Arc as the initial rehydrate",
+        );
+
+        // Cleanup: wipe the slot and the tempdir.
+        release_impl(HANDLE);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// InMemoryBackend default: the old "miss → None" semantics must
+    /// be preserved. Acceptance criterion 3 — existing tests pass
+    /// unchanged against the default backend because nothing ever
+    /// commits to it.
+    #[test]
+    fn in_memory_backend_default_still_returns_none_for_unseen_handles() {
+        let _gate = STORAGE_TEST_LOCK.lock();
+        let _guard = BackendGuard;
+        // Force a fresh in-memory backend so earlier tests can't leak
+        // state into this assertion.
+        set_storage_backend(Arc::new(storage::InMemoryBackend::new()));
+
+        // A handle that nobody has allocated and nobody has committed
+        // to. tenant_lock must return None — same as pre-Storage-1.
+        assert!(
+            tenant_lock(0xFFFF_0000).is_none(),
+            "tenant_lock on an uncommitted handle must return None with the default backend",
+        );
+    }
+
+    /// Rehydrate must resolve even when the slot index is past the
+    /// current Vec length. The in-memory DOMAINS starts empty and
+    /// grows via allocate(); the backend rehydrate path has its own
+    /// resize step that must not panic on a sparse index.
+    #[test]
+    fn rehydrate_grows_domains_vec_to_reach_sparse_handle() {
+        let _gate = STORAGE_TEST_LOCK.lock();
+        let _guard = BackendGuard;
+        let tmp = unique_tempdir("sparse");
+
+        let fs_backend = Arc::new(
+            LocalFilesystemBackend::new(&tmp).expect("fs backend init"),
+        );
+        set_storage_backend(Arc::clone(&fs_backend) as Arc<dyn StorageBackend>);
+
+        const HANDLE: u32 = 10_000;
+        let expected = sample_state();
+        fs_backend.commit(HANDLE, &expected).expect("fs commit ok");
+
+        let tenant = tenant_lock(HANDLE)
+            .expect("tenant_lock must rehydrate a sparse handle");
+        assert_eq!(tenant.read().snapshot_d(), expected);
+
+        release_impl(HANDLE);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
