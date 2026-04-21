@@ -1843,24 +1843,14 @@ fn build_native_classifier(
         "Statement has Classification '{}'",
         classification,
     );
-    Func::Native(Arc::new(move |pop: &Object| {
-        // Find each clause's cell contents inside pop (Seq-of-pairs form).
-        let pop_entries = match pop.as_seq() {
-            Some(s) => s,
-            None => return Object::phi(),
-        };
-        let find_cell = |name: &str| -> Option<&[Object]> {
-            for entry in pop_entries.iter() {
-                let pair = entry.as_seq()?;
-                if pair.len() != 2 { continue; }
-                if pair[0].as_atom()? == name {
-                    return pair[1].as_seq();
-                }
-            }
-            None
-        };
-        // Compute the set of Statement atoms that satisfy the first
-        // clause, then intersect against subsequent clauses.
+    Func::Native(Arc::new(move |input: &Object| {
+        // Two possible input shapes:
+        //   (a) raw state (`Object::Map`) — fast path, used by the
+        //       semi-naive chainer when all active funcs are Native.
+        //       Each clause resolves via O(1) `fetch_or_phi`.
+        //   (b) `encode_state` output (`Object::Seq` of
+        //       `[cell_name, facts_seq]` pairs) — compatibility path
+        //       for `ast::apply` call sites that pre-encode.
         let matching_statement = |fact: &Object, want_lit: Option<&str>| -> Option<String> {
             let pairs = fact.as_seq()?;
             let mut stmt: Option<&str> = None;
@@ -1877,15 +1867,42 @@ fn build_native_classifier(
             if !saw_lit { return None; }
             stmt.map(String::from)
         };
+        let collect_stmts = |facts: &[Object], want_lit: Option<&str>|
+            -> hashbrown::HashSet<String>
+        {
+            facts.iter()
+                .filter_map(|f| matching_statement(f, want_lit))
+                .collect()
+        };
 
+        // Resolve each clause to a set of matching Statement ids. The
+        // raw-state branch uses `fetch_or_phi` (O(1) on Object::Map);
+        // the encoded-pop branch linear-scans pop entries.
+        let use_state_path = matches!(input, Object::Map(_));
         let mut stmts: Option<hashbrown::HashSet<String>> = None;
         for (cell_name, lit) in &clauses {
-            let Some(facts) = find_cell(cell_name) else {
-                return Object::phi();
+            let local: hashbrown::HashSet<String> = if use_state_path {
+                let cell = crate::ast::fetch_or_phi(cell_name, input);
+                let Some(facts) = cell.as_seq() else {
+                    return Object::phi();
+                };
+                collect_stmts(facts, lit.as_deref())
+            } else {
+                let Some(pop_entries) = input.as_seq() else {
+                    return Object::phi();
+                };
+                let mut found: Option<&[Object]> = None;
+                for entry in pop_entries.iter() {
+                    let Some(pair) = entry.as_seq() else { continue };
+                    if pair.len() != 2 { continue; }
+                    if pair[0].as_atom() == Some(cell_name.as_str()) {
+                        found = pair[1].as_seq();
+                        break;
+                    }
+                }
+                let Some(facts) = found else { return Object::phi(); };
+                collect_stmts(facts, lit.as_deref())
             };
-            let local: hashbrown::HashSet<String> = facts.iter()
-                .filter_map(|f| matching_statement(f, lit.as_deref()))
-                .collect();
             stmts = Some(match stmts.take() {
                 None => local,
                 Some(prev) => prev.intersection(&local).cloned().collect(),

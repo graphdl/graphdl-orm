@@ -81,13 +81,28 @@ fn derive_one_round_with_keys(
     let t_dk = std::time::Instant::now();
     let derived_keys: HashSet<FactKey> = all_derived.iter().map(fact_key).collect();
     if trace { eprintln!("    [rnd] derived_keys: {:?}", t_dk.elapsed()); }
+    // `encode_state` is a ~1-2ms pure-clone pass on core.md-scale
+    // inputs. Skip it when every active Func is a `Native` — the
+    // specialized grammar classifiers accept `&Object` directly
+    // (raw state or encoded pop) and resolve cells via
+    // `fetch_or_phi` on `Object::Map`. Non-Native variants
+    // (interpreted FFP) still require the encoded pop shape.
+    let all_native = derivation_defs.iter()
+        .all(|(_, f)| matches!(f, ast::Func::Native(_)));
     let t_en = std::time::Instant::now();
-    let pop_obj = ast::encode_state(current_state);
-    if trace { eprintln!("    [rnd] encode_state: {:?}", t_en.elapsed()); }
+    let pop_obj;
+    let apply_input: &ast::Object = if all_native {
+        current_state
+    } else {
+        pop_obj = ast::encode_state(current_state);
+        &pop_obj
+    };
+    if trace { eprintln!("    [rnd] encode_state: {:?} (skipped={})",
+        t_en.elapsed(), all_native); }
     let t_ap = std::time::Instant::now();
     let candidates: Vec<DerivedFact> = derivation_defs.iter()
         .flat_map(|(name, func)| {
-            let result = ast::apply(func, &pop_obj, d);
+            let result = ast::apply(func, apply_input, d);
             let name = name.to_string();
             result.as_seq().into_iter()
                 .flat_map(move |items| items.iter().cloned().collect::<Vec<_>>())
