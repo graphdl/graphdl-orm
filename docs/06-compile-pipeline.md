@@ -5,41 +5,32 @@ This doc walks through what happens between the moment you hand the engine a dir
 ## One-line summary
 
 ```
-readings text → parse → Domain → domain_to_state → P (Map) → compile_to_defs_state → defs (Vec) → defs_to_state → D (Map) → split into cells
+readings text → parse_to_state → P (Map) → compile_to_defs_state → defs (Vec) → defs_to_state → D (Map) → split into cells
 ```
 
 `P` is the population (facts). `D` is the state, meaning `P` plus all compiled defs. At rest, `D` is held as a `HashMap<String, Arc<RwLock<Object>>>` — one independently-lockable cell per key, with Backus's fetch / store operators mapped onto per-cell read and write locks. Every MCP call operates against that cells map through a snapshot / diff / commit cycle (see "Concurrency" below).
 
+The pre-#211 design had a typed `Domain` struct in the middle (`parse → Domain → domain_to_state → P`) and a second round-trip (`state → Domain → compile`). Both are gone: parse emits cells directly, and the compiler reads cells directly.
+
 ## Step 1: Parse
 
-`parse_markdown` reads each reading and classifies it into one of three families (Theorem 1: Grammar Unambiguity):
+Since #285 the public `parse_to_state` delegates to the two-stage meta-circular pipeline defined in `readings/forml2-grammar.md`. Stage 1 (`parse_forml2_stage1::tokenize_statement`) turns each line into `Statement` + `Role Reference` cells; Stage 2 (`parse_forml2_stage2::parse_to_state_via_stage12`) runs the grammar's derivation rules over those cells to produce the full metamodel cell set (Noun / FactType / Role / Constraint / Subtype / DerivationRule / InstanceFact / EnumValues). The legacy cascade (`parse_to_state_legacy`) survives only as the bootstrap for parsing the grammar itself — stage12 can't parse its own grammar without recursion.
+
+Either pipeline recognises the same three constraint families (Theorem 1: Grammar Unambiguity):
 
 - Quantified constraints (`Each X has some Y`, `For each X, at most one Y ...`)
 - Conditional constraints (`If ... then ...`, `... iff ...`)
 - Multi-clause constraints (`exactly one of the following holds ...`)
 
-Nouns are matched longest-first so that multi-word names like `State Machine Definition` are recognized before `State` alone. Unknown nouns are auto-created in permissive mode, or rejected in `--strict` mode.
+Nouns are matched longest-first so that multi-word names like `State Machine Definition` are recognised before `State` alone. Unknown nouns are auto-created in permissive mode, or rejected in `--strict` mode.
 
-The parser produces a `Domain` struct containing:
-
-- `nouns`: the entity and value type declarations.
-- `fact_types`: every declared fact type along with its roles.
-- `constraints`: every constraint with its spans and modality.
-- `state_machines`: SM definitions and their transitions.
-- `derivation_rules`: rules with resolved antecedents and consequents.
-- `general_instance_facts`: instance facts and their subject, object, and field bindings.
+Parse returns `Object::Map` directly — one cell per category (Noun, FactType, Role, Constraint, Subtype, DerivationRule, InstanceFact, EnumValues) plus one cell per declared fact-type ID for instance facts. There is no typed `Domain` struct in flight; every downstream consumer reads cells directly.
 
 Parse is the slowest step in compile, but it only runs once per compile — per-command `create` does not parse, since it reads already-compiled defs instead.
 
-## Step 2: `domain_to_state`
+## Step 2: `compile_to_defs_state`
 
-The `Domain` struct becomes a single `Object::Map` where each cell holds a sequence of facts. There is one cell per category (Noun, FactType, Constraint, DerivationRule, and so on) plus one cell per declared fact type ID for instance facts.
-
-This step is O(n) in the number of facts. Cells are built mutably and wrapped in a `Map` once at the end, which is cheaper than the equivalent fold over `cell_push` would be (that would be O(n²)).
-
-## Step 3: `compile_to_defs_state`
-
-This is the big one. It reconstructs a Domain from the state (a round trip, since the engine operates over the Object representation rather than the struct), then produces a flat list of `(name, Func)` pairs.
+This is the big one. It reads metamodel cells directly from `P` and produces a flat list of `(name, Func)` pairs.
 
 - **Constraints.** Each constraint gets `constraint:{id}` plus `validate:{fact_type_id}` per-FT indexed validators.
 - **Machines.** Each SM gets `machine:{noun}`, `machine:{noun}:initial`, and `transitions:{noun}`.
@@ -54,7 +45,7 @@ This is the big one. It reconstructs a Domain from the state (a round trip, sinc
 
 The result is a vector of named Funcs. Debug output during compile shows timing per phase.
 
-## Step 4: `defs_to_state`
+## Step 3: `defs_to_state`
 
 This step merges the compiled defs with the existing state cells into a single `Object::Map`. Every def becomes a key; every cell becomes a key; lookup is O(1). The result is the `D` that the rest of the runtime consumes.
 
@@ -72,7 +63,7 @@ Halpin Ch. 10 gives the procedure. The engine's RMAP runs as follows.
 5. Compound reference schemes become a composite primary key on the components.
 6. Constraints map directly: UC becomes UNIQUE, MC becomes NOT NULL, VC becomes CHECK, and SS becomes a foreign key.
 
-The result is a list of `TableDef` structs with columns, primary keys, uniqueness constraints, and check constraints. SQL and FPGA generators both consume this same structure.
+The result is today still a list of `TableDef` structs with columns, primary keys, uniqueness constraints, and check constraints — that boundary is the last remaining typed-IR layer in the compile path (tracked under #325 follow-up: "retire `Vec<TableDef>` as rmap's output"). SQL and FPGA generators consume it; OpenAPI and Solidity have already moved their state-machine reads off typed structs and onto direct `InstanceFact` cell lookups.
 
 ## Hot paths
 
