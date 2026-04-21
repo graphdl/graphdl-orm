@@ -21,6 +21,11 @@
 // `get_or_init` shape std users expect.
 
 pub use alloc::sync::Arc;
+// Re-exports. The bin target pulls this module in but only ends up
+// using `RwLock` transitively; lib consumers use the full set.
+// `#[allow(unused_imports)]` keeps the bin build warning-free without
+// having to split the re-exports by compilation target.
+#[allow(unused_imports)]
 pub use spin::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 /// std-flavoured `OnceLock` façade over `spin::Once`. The wrapper
