@@ -24,59 +24,84 @@
 //   - Output is solc-compilable.
 
 use crate::ast::{Object, binding, fetch_or_phi};
-use crate::rmap::{self, TableDef, TableColumn};
-use crate::types::StateMachineDef;
+use crate::rmap;
 #[allow(unused_imports)]
 use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 
-/// Extract state machines directly from InstanceFact cells in state.
-/// No Domain round-trip — reads the same cells domain_to_state would.
-fn state_machines_from_state(state: &Object) -> hashbrown::HashMap<String, StateMachineDef> {
-    let inst = fetch_or_phi("InstanceFact", state);
-    let facts = inst.as_seq().unwrap_or(&[]);
-    let b = |f: &Object, k: &str| binding(f, k).unwrap_or("").to_string();
+// State-machine access helpers. The generator reads `InstanceFact`
+// cells on demand instead of materialising a `StateMachineDef` struct
+// — no typed IR layer over the cell store (#325).
+//
+// Source shape in `InstanceFact`:
+//   subjectNoun="State Machine Definition" subjectValue=<sm_name>
+//     fieldName contains "is for" objectValue=<noun_name>
+//   subjectNoun="Status" subjectValue=<status>
+//     fieldName contains "defined in" objectValue=<sm_name>
+//   subjectNoun="Transition" subjectValue=<event>
+//     fieldName contains "from" | "to" | "triggered" objectValue=<…>
 
-    let mut sms: hashbrown::HashMap<String, StateMachineDef> = hashbrown::HashMap::new();
-    // "State Machine Definition 'X' is for Noun 'Y'"
-    for f in facts.iter().filter(|f| b(f, "subjectNoun") == "State Machine Definition" && b(f, "fieldName").contains("is for")) {
-        let sm_name = b(f, "subjectValue");
-        let noun = b(f, "objectValue");
-        sms.entry(noun).or_insert_with(|| StateMachineDef {
-            noun_name: sm_name, statuses: vec![], transitions: vec![],
-            initial: String::new(),
-        });
-    }
-    // "Status 'Z' is defined in State Machine Definition 'X'"
-    for f in facts.iter().filter(|f| b(f, "subjectNoun") == "Status" && b(f, "fieldName").contains("defined in")) {
-        let status = b(f, "subjectValue");
-        let sm_name = b(f, "objectValue");
-        if let Some(sm) = sms.values_mut().find(|s| s.noun_name == sm_name) {
-            if !sm.statuses.contains(&status) { sm.statuses.push(status); }
+/// Resolve the SM name attached to a noun, if any.
+fn sm_name_for_noun(state: &Object, noun_name: &str) -> Option<String> {
+    fetch_or_phi("InstanceFact", state).as_seq()?
+        .iter()
+        .find(|f| binding(f, "subjectNoun") == Some("State Machine Definition")
+            && binding(f, "fieldName").map(|s| s.contains("is for")).unwrap_or(false)
+            && binding(f, "objectValue") == Some(noun_name))
+        .and_then(|f| binding(f, "subjectValue").map(String::from))
+}
+
+/// All status names declared under the SM attached to `noun_name`, in
+/// declaration order (first status is treated as the initial state
+/// by `emit_create`).
+fn sm_statuses(state: &Object, noun_name: &str) -> Vec<String> {
+    let Some(sm_name) = sm_name_for_noun(state, noun_name) else { return vec![]; };
+    let inst = fetch_or_phi("InstanceFact", state);
+    let Some(facts) = inst.as_seq() else { return vec![]; };
+    let mut out: Vec<String> = Vec::new();
+    for f in facts.iter().filter(|f|
+        binding(f, "subjectNoun") == Some("Status")
+        && binding(f, "fieldName").map(|s| s.contains("defined in")).unwrap_or(false)
+        && binding(f, "objectValue") == Some(sm_name.as_str()))
+    {
+        if let Some(s) = binding(f, "subjectValue") {
+            let s = s.to_string();
+            if !out.contains(&s) { out.push(s); }
         }
     }
-    // Transitions
-    for f in facts.iter().filter(|f| b(f, "subjectNoun") == "Transition") {
-        let trans_name = b(f, "subjectValue");
-        let field = b(f, "fieldName");
-        let value = b(f, "objectValue");
-        for sm in sms.values_mut() {
-            let t = sm.transitions.iter_mut().find(|t| t.event == trans_name);
-            match t {
-                Some(t) => {
-                    if field.contains("from") { t.from = value.clone(); }
-                    if field.contains("to") { t.to = value.clone(); }
-                }
-                None => {
-                    let mut td = crate::types::TransitionDef { event: trans_name.clone(), from: String::new(), to: String::new(), guard: None };
-                    if field.contains("from") { td.from = value.clone(); }
-                    if field.contains("to") { td.to = value.clone(); }
-                    if field.contains("triggered") { td.event = value.clone(); }
-                    sm.transitions.push(td);
-                }
+    out
+}
+
+/// Every transition under the SM attached to `noun_name`, as
+/// `(event_name, from_status, to_status)`. The `InstanceFact` rows
+/// for a single transition are scattered across `from` / `to` /
+/// `triggered` fields; fold them into per-event tuples.
+fn sm_transitions(state: &Object, noun_name: &str) -> Vec<(String, String, String)> {
+    if sm_name_for_noun(state, noun_name).is_none() { return vec![]; }
+    let inst = fetch_or_phi("InstanceFact", state);
+    let Some(facts) = inst.as_seq() else { return vec![]; };
+    let mut by_event: Vec<(String, String, String)> = Vec::new();
+    for f in facts.iter().filter(|f| binding(f, "subjectNoun") == Some("Transition")) {
+        let Some(event) = binding(f, "subjectValue").map(String::from) else { continue };
+        let field = binding(f, "fieldName").unwrap_or("");
+        let value = binding(f, "objectValue").unwrap_or("").to_string();
+        let slot = by_event.iter_mut().find(|(e, _, _)| *e == event);
+        match slot {
+            Some((_, from, to)) => {
+                if field.contains("from") { *from = value; }
+                else if field.contains("to") { *to = value; }
+            }
+            None => {
+                let mut from = String::new();
+                let mut to = String::new();
+                let mut ev = event.clone();
+                if field.contains("from") { from = value; }
+                else if field.contains("to") { to = value; }
+                else if field.contains("triggered") { ev = value; }
+                by_event.push((ev, from, to));
             }
         }
     }
-    sms
+    by_event
 }
 
 /// Compile every entity noun in `state` into a Solidity contract.
@@ -105,10 +130,10 @@ fn compile_to_solidity_inner(
                   // Generated from FORML2 readings by AREST\n\
                   pragma solidity ^0.8.20;\n\n";
 
+    // RMAP still returns `Vec<TableDef>` today — that's the next
+    // typed-IR consumer to retire per #325. For now read it into a
+    // scope-local index, not a module-level type alias.
     let tables = rmap::rmap_from_state(state);
-    let table_by_name: hashbrown::HashMap<String, &TableDef> = tables.iter()
-        .map(|t| (t.name.clone(), t)).collect();
-    let sms = state_machines_from_state(state);
 
     let nouns = fetch_or_phi("Noun", state);
     let contracts: Vec<String> = nouns.as_seq().map(|ns| {
@@ -120,9 +145,8 @@ fn compile_to_solidity_inner(
                 if !set.contains(name.as_str()) { return None; }
             }
             let table_name = rmap::to_snake(&name);
-            let table = table_by_name.get(&table_name).copied();
-            let sm = sms.get(&name);
-            Some(emit_contract(&name, table, sm, state, include.as_ref()))
+            let table = tables.iter().find(|t| t.name == table_name);
+            Some(emit_contract(&name, table, state, include.as_ref()))
         }).collect()
     }).unwrap_or_default();
 
@@ -132,8 +156,7 @@ fn compile_to_solidity_inner(
 /// Emit a full Solidity contract for an entity noun.
 fn emit_contract(
     name: &str,
-    table: Option<&TableDef>,
-    sm: Option<&StateMachineDef>,
+    table: Option<&rmap::TableDef>,
     state: &Object,
     scope: Option<&hashbrown::HashSet<&str>>,
 ) -> String {
@@ -141,9 +164,10 @@ fn emit_contract(
     let off_chain = emit_off_chain_comment(name, state);
     let struct_def = emit_struct(table);
     let events = emit_events(name, state, scope);
-    let sm_parts = sm.map(emit_state_machine).unwrap_or_default();
-    let create_fn = emit_create(name, table, sm, state);
-    let transitions = sm.map(|s| emit_transitions(s)).unwrap_or_default();
+    let has_sm = sm_name_for_noun(state, name).is_some();
+    let sm_parts = if has_sm { emit_state_machine(name, state) } else { String::new() };
+    let create_fn = emit_create(name, table, state);
+    let transitions = if has_sm { emit_transitions(name, state) } else { String::new() };
     let vc_validators = emit_vc_validators(name, table, state);
 
     format!(
@@ -167,7 +191,7 @@ fn emit_contract(
 /// calls emitted by `emit_create`.
 fn emit_vc_validators(
     noun_name: &str,
-    table: Option<&TableDef>,
+    table: Option<&rmap::TableDef>,
     state: &Object,
 ) -> String {
     let Some(t) = table else { return String::new(); };
@@ -235,7 +259,7 @@ fn emit_off_chain_comment(noun_name: &str, state: &Object) -> String {
 }
 
 /// Emit the Data struct with RMAP columns as typed fields.
-fn emit_struct(table: Option<&TableDef>) -> String {
+fn emit_struct(table: Option<&rmap::TableDef>) -> String {
     let fields: Vec<String> = match table {
         Some(t) => t.columns.iter().map(|c| {
             let sol_type = solidity_type(c);
@@ -250,7 +274,7 @@ fn emit_struct(table: Option<&TableDef>) -> String {
 }
 
 /// Map an RMAP column type to a Solidity type.
-fn solidity_type(col: &TableColumn) -> &'static str {
+fn solidity_type(col: &rmap::TableColumn) -> &'static str {
     match col.col_type.as_str() {
         "TEXT" | "VARCHAR" => "string",
         "INTEGER" | "INT" => "int256",
@@ -303,9 +327,10 @@ fn emit_events(
     if events.is_empty() { String::new() } else { format!("{}\n", events.join("\n")) }
 }
 
-/// Emit SM status enum and modifier.
-fn emit_state_machine(sm: &StateMachineDef) -> String {
-    let statuses: Vec<String> = sm.statuses.iter()
+/// Emit SM status enum and modifier. Reads `InstanceFact` cells
+/// directly; no typed StateMachineDef materialisation.
+fn emit_state_machine(noun_name: &str, state: &Object) -> String {
+    let statuses: Vec<String> = sm_statuses(state, noun_name).iter()
         .map(|s| sanitize_name(s))
         .collect();
     let enum_def = if statuses.is_empty() {
@@ -323,8 +348,7 @@ fn emit_state_machine(sm: &StateMachineDef) -> String {
 /// Emit the create(...) function with UC + MC + VC requires (E2, #304).
 fn emit_create(
     noun_name: &str,
-    table: Option<&TableDef>,
-    sm: Option<&StateMachineDef>,
+    table: Option<&rmap::TableDef>,
     state: &Object,
 ) -> String {
     let params: Vec<String> = match table {
@@ -381,8 +405,9 @@ fn emit_create(
         None => vec![],
     };
 
-    // Initial SM status
-    let initial_status = sm.and_then(|s| s.statuses.first())
+    // Initial SM status: first status declared under the noun's SM
+    // (or empty if no SM attached).
+    let initial_status = sm_statuses(state, noun_name).first()
         .map(|s| format!(
             "        records[{}].status = keccak256(bytes(\"{}\"));",
             pk, s))
@@ -486,15 +511,18 @@ fn enum_values_for_value_type(noun_name: &str, state: &Object) -> Vec<String> {
     vec![]
 }
 
-/// Emit one function per state machine transition.
-fn emit_transitions(sm: &StateMachineDef) -> String {
-    let fns: Vec<String> = sm.transitions.iter().map(|t| {
-        let fn_name = sanitize_field(&t.event);
-        format!(
-            "\n    function {}(string memory id) external onlyInStatus(id, keccak256(bytes(\"{}\"))) {{\n        records[id].status = keccak256(bytes(\"{}\"));\n    }}\n",
-            fn_name, t.from, t.to
-        )
-    }).collect();
+/// Emit one function per state machine transition. Reads
+/// `InstanceFact` cells directly.
+fn emit_transitions(noun_name: &str, state: &Object) -> String {
+    let fns: Vec<String> = sm_transitions(state, noun_name).into_iter()
+        .map(|(event, from, to)| {
+            let fn_name = sanitize_field(&event);
+            format!(
+                "\n    function {}(string memory id) external onlyInStatus(id, keccak256(bytes(\"{}\"))) {{\n        records[id].status = keccak256(bytes(\"{}\"));\n    }}\n",
+                fn_name, from, to
+            )
+        })
+        .collect();
     fns.join("")
 }
 
