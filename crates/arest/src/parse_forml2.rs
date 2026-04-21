@@ -1189,19 +1189,6 @@ pub fn parse_to_state(input: &str) -> Result<crate::ast::Object, String> {
     crate::parse_forml2_stage2::parse_to_state_via_stage12(input)
 }
 
-#[cfg(not(feature = "std-deps"))]
-pub fn parse_to_state(input: &str) -> Result<crate::ast::Object, String> {
-    parse_to_state_legacy(input)
-}
-
-/// Legacy markdown cascade. Used today as the public `parse_to_state`
-/// body; also the grammar bootstrap path (`parse_to_state_via_stage12`
-/// can't parse its own grammar without recursion).
-pub fn parse_to_state_legacy(input: &str) -> Result<crate::ast::Object, String> {
-    let domain = parse_markdown(input)?;
-    Ok(cells_to_state(&domain))
-}
-
 /// Extract nouns directly from the Noun cell in D.
 pub fn nouns_from_state(state: &crate::ast::Object) -> HashMap<String, NounDef> {
     use crate::ast::{fetch_or_phi, binding};
