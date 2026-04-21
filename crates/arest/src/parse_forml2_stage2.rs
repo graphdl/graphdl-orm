@@ -130,7 +130,7 @@ pub fn translate_nouns(classified_state: &Object) -> Vec<Object> {
     let mut ref_schemes: BTreeMap<String, String> = BTreeMap::new();
     let mut enum_values: BTreeMap<String, String> = BTreeMap::new();
     let mut super_types: BTreeMap<String, String> = BTreeMap::new();
-    for stmt_id in &statement_ids {
+    for stmt_id in statement_ids.iter() {
         let Some(head) = head_noun_for(classified_state, stmt_id) else { continue };
         let ot = if classifications_contains_any(classified_state, stmt_id,
             &["Abstract Declaration", "Partition Declaration"])
@@ -394,7 +394,7 @@ pub fn translate_derivation_mode_facts(classified_state: &Object) -> Vec<Object>
         "Exclusive-Or Constraint", "Or Constraint",
         "Deontic Constraint",
     ];
-    for stmt_id in &statement_ids {
+    for stmt_id in statement_ids.iter() {
         // Fact Type Reading classification is the anchor — an `iff`
         // derivation rule also has a marker but lands as Derivation
         // Rule, not Fact Type Reading, because Stage-1 strips the
@@ -448,7 +448,7 @@ fn derivation_marker_for(state: &Object, stmt_id: &str) -> Option<String> {
 pub fn translate_partitions(classified_state: &Object) -> Vec<Object> {
     let statement_ids = collect_statement_ids(classified_state);
     let mut out: Vec<Object> = Vec::new();
-    for stmt_id in &statement_ids {
+    for stmt_id in statement_ids.iter() {
         if !classifications_contains(classified_state, stmt_id, "Partition Declaration") {
             continue;
         }
@@ -505,7 +505,7 @@ pub fn translate_fact_types(classified_state: &Object) -> (Vec<Object>, Vec<Obje
         "Or Constraint",
         "Deontic Constraint",
     ];
-    for stmt_id in &statement_ids {
+    for stmt_id in statement_ids.iter() {
         if !classifications_contains(classified_state, stmt_id, "Fact Type Reading") {
             continue;
         }
@@ -753,7 +753,10 @@ struct StmtIndex {
     role_head_noun_by_ref: hashbrown::HashMap<String, String>,
     role_literal_by_ref: hashbrown::HashMap<String, String>,
     verbs: hashbrown::HashMap<String, String>,
-    statement_ids: Vec<String>,
+    /// Wrapped in `Arc` so `collect_statement_ids` does a refcount
+    /// bump rather than cloning 506 heap-allocated `String`s on
+    /// every translator call.
+    statement_ids: alloc::sync::Arc<Vec<String>>,
 }
 
 #[cfg(feature = "std-deps")]
@@ -810,9 +813,9 @@ fn build_stmt_index(state: &Object) -> StmtIndex {
         &mut idx.role_literal_by_ref);
     index_single("Statement_has_Verb", "Statement", "Verb", &mut idx.verbs);
     if let Some(seq) = fetch_or_phi("Statement", state).as_seq() {
-        idx.statement_ids = seq.iter()
+        idx.statement_ids = alloc::sync::Arc::new(seq.iter()
             .filter_map(|f| binding(f, "id").map(String::from))
-            .collect();
+            .collect());
     }
     idx
 }
@@ -870,7 +873,7 @@ pub fn translate_instance_facts_with_ft_ids(
 ) -> Vec<Object> {
     let statement_ids = collect_statement_ids(classified_state);
     let mut out: Vec<Object> = Vec::new();
-    for stmt_id in &statement_ids {
+    for stmt_id in statement_ids.iter() {
         if !classifications_contains(classified_state, stmt_id, "Instance Fact") {
             continue;
         }
@@ -993,7 +996,7 @@ pub fn translate_ring_constraints(classified_state: &Object) -> Vec<Object> {
     let statement_ids = collect_statement_ids(classified_state);
     let declared_nouns = declared_noun_names(classified_state);
     let mut out: Vec<Object> = Vec::new();
-    for stmt_id in &statement_ids {
+    for stmt_id in statement_ids.iter() {
         // Two sources for ring emission:
         //   (a) Ring Constraint classification (trailing-marker shape:
         //       `<FT> is irreflexive.` / `No X R itself.`).
@@ -1131,7 +1134,7 @@ pub fn translate_derivation_rules(classified_state: &Object) -> Vec<Object> {
     let statement_ids = collect_statement_ids(classified_state);
     let declared_nouns = declared_noun_names(classified_state);
     let mut out: Vec<Object> = Vec::new();
-    for stmt_id in &statement_ids {
+    for stmt_id in statement_ids.iter() {
         if !classifications_contains(classified_state, stmt_id, "Derivation Rule") {
             continue;
         }
@@ -1193,7 +1196,7 @@ pub fn translate_unresolved_clauses(
         .into_iter().collect();
     let _ = &declared;
     let mut out: Vec<Object> = Vec::new();
-    for stmt_id in &statement_ids {
+    for stmt_id in statement_ids.iter() {
         if !classifications_contains(classified_state, stmt_id, "Derivation Rule") { continue; }
         let text = match statement_text(classified_state, stmt_id) {
             Some(t) => t, None => continue,
@@ -1267,7 +1270,7 @@ fn derivation_rule_id(text: &str) -> String {
 pub fn translate_enum_values(classified_state: &Object) -> Vec<Object> {
     let statement_ids = collect_statement_ids(classified_state);
     let mut out: Vec<Object> = Vec::new();
-    for stmt_id in &statement_ids {
+    for stmt_id in statement_ids.iter() {
         if !classifications_contains(classified_state, stmt_id, "Enum Values Declaration") {
             continue;
         }
@@ -1309,7 +1312,7 @@ pub fn translate_set_constraints(classified_state: &Object) -> Vec<Object> {
     let statement_ids = collect_statement_ids(classified_state);
     let declared_nouns = declared_noun_names(classified_state);
     let mut out: Vec<Object> = Vec::new();
-    for stmt_id in &statement_ids {
+    for stmt_id in statement_ids.iter() {
         let text = statement_text(classified_state, stmt_id).unwrap_or_default();
         let is_dr = classifications_contains(classified_state, stmt_id, "Derivation Rule");
         let kind = if classifications_contains(classified_state, stmt_id, "Equality Constraint") {
@@ -1421,7 +1424,7 @@ fn antecedent_distinct_nouns(text: &str, declared: &[String]) -> usize {
 pub fn translate_cardinality_constraints(classified_state: &Object) -> Vec<Object> {
     let statement_ids = collect_statement_ids(classified_state);
     let mut out: Vec<Object> = Vec::new();
-    for stmt_id in &statement_ids {
+    for stmt_id in statement_ids.iter() {
         // A Statement classified as Derivation Rule never contributes
         // a cardinality Constraint — the `iff` keyword makes the whole
         // sentence a rule, even when it incidentally contains a `some`
@@ -1483,7 +1486,7 @@ pub fn translate_cardinality_constraints(classified_state: &Object) -> Vec<Objec
 pub fn translate_value_constraints(classified_state: &Object) -> Vec<Object> {
     let statement_ids = collect_statement_ids(classified_state);
     let mut out: Vec<Object> = Vec::new();
-    for stmt_id in &statement_ids {
+    for stmt_id in statement_ids.iter() {
         if !classifications_contains(classified_state, stmt_id, "Value Constraint") {
             continue;
         }
@@ -1519,7 +1522,7 @@ fn enum_values_for(state: &Object, stmt_id: &str) -> Vec<String> {
 pub fn translate_deontic_constraints(classified_state: &Object) -> Vec<Object> {
     let statement_ids = collect_statement_ids(classified_state);
     let mut out: Vec<Object> = Vec::new();
-    for stmt_id in &statement_ids {
+    for stmt_id in statement_ids.iter() {
         if !classifications_contains(classified_state, stmt_id, "Deontic Constraint") {
             continue;
         }
@@ -1669,19 +1672,24 @@ pub fn classifications_contains_any(state: &Object, statement_id: &str, names: &
         .unwrap_or(false)
 }
 
-/// Collect all Statement ids from the `Statement` cell.
-fn collect_statement_ids(state: &Object) -> Vec<String> {
+/// Collect all Statement ids from the `Statement` cell. When the
+/// thread-local `StmtIndex` is installed this is a refcount bump on
+/// the cached `Arc<Vec<String>>` rather than a full `Vec<String>`
+/// clone; the 15+ translators that call it per parse therefore
+/// don't collectively pay the allocation cost of ~500 strings each.
+fn collect_statement_ids(state: &Object) -> alloc::sync::Arc<Vec<String>> {
     if let Some(v) = STMT_INDEX.with(|c|
         c.borrow().as_ref().map(|i| i.statement_ids.clone()))
     {
         return v;
     }
-    fetch_or_phi("Statement", state)
-        .as_seq()
-        .map(|facts| facts.iter()
-            .filter_map(|f| binding(f, "id").map(String::from))
-            .collect())
-        .unwrap_or_default()
+    alloc::sync::Arc::new(
+        fetch_or_phi("Statement", state)
+            .as_seq()
+            .map(|facts| facts.iter()
+                .filter_map(|f| binding(f, "id").map(String::from))
+                .collect())
+            .unwrap_or_default())
 }
 
 /// End-to-end Stage-1 + Stage-2 pipeline: FORML 2 source text → final
