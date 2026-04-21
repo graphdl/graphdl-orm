@@ -1640,6 +1640,12 @@ pub fn parse_to_state_via_stage12(text: &str) -> Result<Object, String> {
     if trace { eprintln!("[s12] classify: {:?}", t_cls.elapsed()); }
 
     let t_tr = std::time::Instant::now();
+    macro_rules! tt { ($name:expr, $e:expr) => {{
+        let t = std::time::Instant::now();
+        let v = $e;
+        if trace { eprintln!("    [tr] {}: {:?}", $name, t.elapsed()); }
+        v
+    }}; }
 
     // Run translate_nouns FIRST so subsequent translators that consult
     // `declared_noun_names` see domain nouns (not just the grammar's
@@ -1649,7 +1655,7 @@ pub fn parse_to_state_via_stage12(text: &str) -> Result<Object, String> {
     // antecedent-noun-count arbitration and
     // `translate_ring_constraints`' `conditional_ring_kind` helper
     // both need the domain-level catalog.
-    let noun_facts = translate_nouns(&classified);
+    let noun_facts = tt!("nouns", translate_nouns(&classified));
     let classified = {
         let mut map: HashMap<String, Object> = match &classified {
             Object::Map(m) => m.clone(),
@@ -1659,9 +1665,9 @@ pub fn parse_to_state_via_stage12(text: &str) -> Result<Object, String> {
         Object::Map(map)
     };
 
-    let mut subtype_facts: Vec<Object> = translate_subtypes(&classified);
-    subtype_facts.extend(translate_partitions(&classified));
-    let (mut ft_facts, mut role_facts) = translate_fact_types(&classified);
+    let mut subtype_facts: Vec<Object> = tt!("subtypes", translate_subtypes(&classified));
+    subtype_facts.extend(tt!("partitions", translate_partitions(&classified)));
+    let (mut ft_facts, mut role_facts) = tt!("fact_types", translate_fact_types(&classified));
     // Append possibility-synthetic FactType + Role facts.
     for (ft_fact, role_fs) in &synthetic_fts_and_roles {
         // De-dup: skip if translate_fact_types already emitted this id.
@@ -1672,24 +1678,19 @@ pub fn parse_to_state_via_stage12(text: &str) -> Result<Object, String> {
         ft_facts.push(ft_fact.clone());
         role_facts.extend(role_fs.clone());
     }
-    let mut constraint_facts: Vec<Object> = translate_ring_constraints(&classified);
-    constraint_facts.extend(translate_cardinality_constraints(&classified));
-    constraint_facts.extend(translate_set_constraints(&classified));
-    constraint_facts.extend(translate_value_constraints(&classified));
-    constraint_facts.extend(translate_deontic_constraints(&classified));
-    let derivation_facts = translate_derivation_rules(&classified);
-    // Instance-fact fieldName resolution consults the FactType ids
-    // translated above — when the canonical `subject_verb_object` id
-    // is declared, use it; otherwise fall back to the raw verb.
+    let mut constraint_facts: Vec<Object> = tt!("ring", translate_ring_constraints(&classified));
+    constraint_facts.extend(tt!("cardinality", translate_cardinality_constraints(&classified)));
+    constraint_facts.extend(tt!("set", translate_set_constraints(&classified)));
+    constraint_facts.extend(tt!("value_c", translate_value_constraints(&classified)));
+    constraint_facts.extend(tt!("deontic", translate_deontic_constraints(&classified)));
+    let derivation_facts = tt!("derivation", translate_derivation_rules(&classified));
     let declared_ft_ids: Vec<String> = ft_facts.iter()
         .filter_map(|f| binding(f, "id").map(String::from))
         .collect();
-    let mut instance_fact_facts =
-        translate_instance_facts_with_ft_ids(&classified, &declared_ft_ids);
-    // Append derivation-mode InstanceFacts (`Fact Type has Arity. *`
-    // → `Fact Type.<reading> = Derivation Mode.fully-derived`).
-    instance_fact_facts.extend(translate_derivation_mode_facts(&classified));
-    let enum_values_facts = translate_enum_values(&classified);
+    let mut instance_fact_facts = tt!("instance_facts",
+        translate_instance_facts_with_ft_ids(&classified, &declared_ft_ids));
+    instance_fact_facts.extend(tt!("deriv_mode", translate_derivation_mode_facts(&classified)));
+    let enum_values_facts = tt!("enum_values", translate_enum_values(&classified));
     if trace { eprintln!("[s12] translators: {:?}", t_tr.elapsed()); }
     if trace { eprintln!("[s12] TOTAL: {:?}", t0.elapsed()); }
 
