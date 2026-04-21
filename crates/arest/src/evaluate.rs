@@ -45,6 +45,23 @@ pub fn forward_chain_defs_state(
     derivation_defs: &[(&str, &ast::Func)],
     d: &ast::Object,
 ) -> (ast::Object, Vec<DerivedFact>) {
+    forward_chain_defs_state_bounded(derivation_defs, d, 100)
+}
+
+/// Like [`forward_chain_defs_state`] but capped at `max_rounds` rule
+/// applications. Callers that know their rule set is stratified (no
+/// rule's antecedent reads another rule's consequent cell) can pass
+/// `max_rounds = 1` to skip the empty confirmation round the naive
+/// fixpoint does last — the round where `derive_one_round` re-applies
+/// every rule against the round-1 output only to dedup it all away.
+///
+/// Unbounded behavior is preserved through the default 100-round cap
+/// in [`forward_chain_defs_state`].
+pub fn forward_chain_defs_state_bounded(
+    derivation_defs: &[(&str, &ast::Func)],
+    d: &ast::Object,
+    max_rounds: usize,
+) -> (ast::Object, Vec<DerivedFact>) {
 
     /// Apply all derivation rules once, returning novel facts.
     ///
@@ -124,7 +141,7 @@ pub fn forward_chain_defs_state(
                 (new_state, all)
             })
         },
-    ).take(101).last().unwrap();
+    ).take(max_rounds.saturating_add(1)).last().unwrap();
     (final_state, all_derived)
 }
 

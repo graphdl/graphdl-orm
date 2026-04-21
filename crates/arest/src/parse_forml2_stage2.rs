@@ -41,14 +41,35 @@ pub fn classify_statements(statements_state: &Object, grammar_state: &Object) ->
     // `compile_to_defs_state` sees both the nouns/fact-types/rules
     // declared by the grammar and the Statement facts they apply to.
     let merged = crate::ast::merge_states(statements_state, grammar_state);
-    let defs = crate::compile::compile_to_defs_state(&merged);
-    let with_defs = crate::ast::defs_to_state(&defs, &merged);
+    // Grammar defs are pure functions of forml2-grammar.md — cached
+    // in `GRAMMAR_CACHE` at first access. Stage-1 never populates the
+    // DerivationRule cell (user rules stay in Statement form until
+    // translate_derivation_rules runs after classification), so the
+    // cached grammar-only defs match a fresh `compile_to_defs_state`
+    // of the merged state at this call site.
+    let defs = cached_grammar().map(|(_, d)| d).unwrap_or_else(|_| {
+        // Fallback: if grammar cache somehow failed, recompile from
+        // the grammar_state passed in (keeps meta-circular behavior).
+        // SAFETY: leaks once per process; acceptable for fallback.
+        let fresh = crate::compile::compile_to_defs_state(grammar_state);
+        Box::leak(Box::new(fresh))
+    });
+    let with_defs = crate::ast::defs_to_state(defs, &merged);
     let deriv_funcs: Vec<(&str, &crate::ast::Func)> = defs.iter()
         .filter(|(n, _)| n.starts_with("derivation:"))
         .map(|(n, f)| (n.as_str(), f))
         .collect();
-    let (final_state, _) =
-        crate::evaluate::forward_chain_defs_state(&deriv_funcs, &with_defs);
+    // Grammar rules stratify in depth 2: round 1 emits the base
+    // classifications (Entity Type Declaration, Enum Values
+    // Declaration, Uniqueness Constraint, …) from the Stage-1
+    // `Statement_has_*` tokens; round 2 fires the single
+    // `Value Constraint iff Classification 'Enum Values Declaration'`
+    // rule (forml2-grammar.md:139) over the round-1 output. No rule's
+    // antecedent reads a Value-Constraint-derived classification, so
+    // round 3 is guaranteed empty and the default chainer's third
+    // round is pure confirmation waste.
+    let (final_state, _) = crate::evaluate::forward_chain_defs_state_bounded(
+        &deriv_funcs, &with_defs, 2);
     final_state
 }
 
@@ -1192,24 +1213,36 @@ fn collect_statement_ids(state: &Object) -> Vec<String> {
 ///   5. Merge all per-statement cells into one state, then apply
 ///      `classify_statements` to emit `Statement_has_Classification`.
 ///   6. Run every per-kind translator and assemble the result.
-/// Process-wide cache for the bundled FORML 2 grammar state. Parsed
-/// once on first access; every `parse_to_state_via_stage12` call
-/// reuses the same `Object`. Killed the primary perf cliff that
-/// would have made the #285 wire-up melt machines (legacy parse of
-/// the ~140-line grammar file per call).
+/// Process-wide cache for the bundled FORML 2 grammar: the parsed
+/// state AND its compiled defs. Both are pure functions of the
+/// committed `readings/forml2-grammar.md`, so neither has to be
+/// redone per `parse_to_state_via_stage12` call.
+///
+/// Killed two perf cliffs: the legacy parse of the grammar MD (~140
+/// lines) and the compile-to-defs pass (~20ms/call for 69
+/// classification rules).
 #[cfg(feature = "std-deps")]
-static GRAMMAR_STATE_CACHE: std::sync::OnceLock<Object> = std::sync::OnceLock::new();
+static GRAMMAR_CACHE: std::sync::OnceLock<(Object, alloc::vec::Vec<(String, crate::ast::Func)>)>
+    = std::sync::OnceLock::new();
 
 #[cfg(feature = "std-deps")]
-fn cached_grammar_state() -> Result<&'static Object, String> {
-    if let Some(s) = GRAMMAR_STATE_CACHE.get() { return Ok(s); }
+fn cached_grammar()
+    -> Result<&'static (Object, alloc::vec::Vec<(String, crate::ast::Func)>), String>
+{
+    if let Some(g) = GRAMMAR_CACHE.get() { return Ok(g); }
     let grammar = include_str!("../../../readings/forml2-grammar.md");
     let parsed = crate::parse_forml2::parse_to_state(grammar)
         .map_err(|e| alloc::format!("grammar parse failed: {}", e))?;
+    let defs = crate::compile::compile_to_defs_state(&parsed);
     // OnceLock::set is safe under races — first writer wins, others
-    // drop their parse. We then read via `get` which succeeds.
-    let _ = GRAMMAR_STATE_CACHE.set(parsed);
-    Ok(GRAMMAR_STATE_CACHE.get().expect("just set"))
+    // drop their work. We then read via `get` which succeeds.
+    let _ = GRAMMAR_CACHE.set((parsed, defs));
+    Ok(GRAMMAR_CACHE.get().expect("just set"))
+}
+
+#[cfg(feature = "std-deps")]
+fn cached_grammar_state() -> Result<&'static Object, String> {
+    cached_grammar().map(|(s, _)| s)
 }
 
 #[cfg(feature = "std-deps")]
