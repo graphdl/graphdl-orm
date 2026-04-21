@@ -141,3 +141,84 @@ Widget has Kind.
         "derived fact must preserve Widget='w1' from antecedent, got {:#?}", bindings,
     );
 }
+
+// ─── Category 3: ParameterAtom — antecedent + consequent literals ──
+//
+// Shape: `* X has A '<a>' iff X has B '<b>'` — the rule fires only
+// when the antecedent's role B equals a specific atom, and the derived
+// fact pins role A to another specific atom. Exercises
+// `compile_explicit_derivation`'s 1-antecedent branch with BOTH
+// `antecedent_role_literals` (the Filter-predicate path) and
+// `consequent_role_literals` (the construct-in-declared-role-order
+// path) populated.
+
+#[test]
+fn shape_parameter_atom_on_both_antecedent_and_consequent() {
+    let src = r#"# Test
+Vehicle(.VIN) is an entity type.
+VIN is a value type.
+Weight Class is a value type.
+Transit Category is a value type.
+
+## Fact Types
+Vehicle has VIN.
+Vehicle has Weight Class.
+Vehicle has Transit Category.
+
+## Derivation Rules
+* Vehicle has Transit Category 'heavy' iff Vehicle has Weight Class 'extra heavy'.
+"#;
+    let (rule, func) = parse_and_compile(src);
+
+    match &rule.consequent_cell {
+        ConsequentCellSource::Literal(id) => assert!(!id.is_empty()),
+        other => panic!("expected Literal(..), got {:?}", other),
+    }
+    assert_eq!(rule.antecedent_sources.len(), 1);
+    assert!(
+        rule.antecedent_role_literals.iter().any(|l|
+            l.role == "Weight Class" && l.value == "extra heavy" && l.antecedent_index == 0),
+        "expected antecedent_role_literals to pin Weight Class='extra heavy', got {:#?}",
+        rule.antecedent_role_literals,
+    );
+    assert!(
+        rule.consequent_role_literals.iter().any(|l|
+            l.role == "Transit Category" && l.value == "heavy"),
+        "expected consequent_role_literals to pin Transit Category='heavy', got {:#?}",
+        rule.consequent_role_literals,
+    );
+
+    // Antecedent predicate must filter on the role literal: two facts
+    // with different Weight Class values, only the matching one derives.
+    // Binding keys are underscore-normalised to match role_value_by_name's
+    // lookup key (compile.rs::role_value_by_name replaces ' ' with '_').
+    let out = apply_to_facts(&func, &[
+        ("Vehicle_has_Weight_Class", &[("Vehicle", "v-heavy"), ("Weight_Class", "extra heavy")]),
+        ("Vehicle_has_Weight_Class", &[("Vehicle", "v-light"), ("Weight_Class", "light")]),
+    ]);
+    let derived = decode_derived(&out);
+    assert_eq!(derived.len(), 1, "only the matching Vehicle should derive, got {:#?}", derived);
+    let (_ft, _reading, bindings) = &derived[0];
+    assert!(
+        bindings.iter().any(|(k, v)| k == "Vehicle" && v == "v-heavy"),
+        "expected Vehicle='v-heavy', got {:#?}", bindings,
+    );
+    assert!(
+        bindings.iter().any(|(k, v)| k == "Transit_Category" && v == "heavy"),
+        "expected Transit_Category='heavy', got {:#?}", bindings,
+    );
+}
+
+// ─── Category 2: AntecedentRole (deferred) ──────────────────────────
+//
+// `ConsequentCellSource::AntecedentRole` is declared on the type and
+// handled by `compile_explicit_derivation`'s 1-antecedent branch, but
+// no parser path emits it today — every user reading resolves to
+// `Literal(ft_id)`, and the #287 implicit-derivation synthesizers
+// (compile_derivations' subtype-inheritance / CWA-negation / SS
+// auto-fill loops) also build rules with Literal consequents. A rule
+// like `* X has Y iff X is a Z and Z has Y` that the handoff names as
+// AntecedentRole parses as a 2-antecedent Join and routes to
+// `compile_join_derivation`, outside this harness' target. Left as a
+// TODO so a future shape that exercises the AntecedentRole branch can
+// be added next to its sibling shapes.
