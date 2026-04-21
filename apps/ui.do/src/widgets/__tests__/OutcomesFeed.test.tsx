@@ -67,12 +67,20 @@ describe('ViolationsFeed', () => {
     expect(screen.getByTestId('violations-empty').textContent).toMatch(/every path is a valid claim/i)
   })
 
-  it('forwards a domain filter to /arest/violations as filter[belongs to Domain]', async () => {
+  it('forwards a domain filter using the default `domain` field name', async () => {
     const urls = stubFetch(() => json({ data: [], _links: {} }))
     render(wrap(<ViolationsFeed baseUrl={baseUrl} domain="organizations" />))
     await waitFor(() => expect(urls).toHaveLength(1))
     const url = new URL(urls[0])
-    expect(url.searchParams.get('filter[belongs to Domain]')).toBe('organizations')
+    expect(url.searchParams.get('filter[domain]')).toBe('organizations')
+  })
+
+  it('honours `domainField` override for apps whose OpenAPI emits a different key', async () => {
+    const urls = stubFetch(() => json({ data: [], _links: {} }))
+    render(wrap(<ViolationsFeed baseUrl={baseUrl} domain="organizations" domainField="domainSlug" />))
+    await waitFor(() => expect(urls).toHaveLength(1))
+    const url = new URL(urls[0])
+    expect(url.searchParams.get('filter[domainSlug]')).toBe('organizations')
   })
 })
 

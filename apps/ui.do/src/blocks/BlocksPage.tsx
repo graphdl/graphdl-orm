@@ -72,12 +72,19 @@ export interface BlocksPageProps {
   /** AREST worker base URL. */
   baseUrl: string
   /**
-   * Optional parent entity — when provided the page fetches the
-   * noun's rows as a child collection of the parent
-   * (/arest/{parent-slug}/{parent-id}/{noun-slug}), otherwise the
-   * flat collection.
+   * Optional parent entity — when provided the page filters the
+   * noun's rows by the configured `parentField` set to parent.id.
    */
   parent?: { noun: string; id: string }
+  /**
+   * Field name used when applying the parent filter. The AREST
+   * compiler produces field names from the noun's binary fact
+   * relationships (e.g. `Section belongs to Page` -> `page` or
+   * `pageId`). Callers who know their app's OpenAPI can override
+   * here. Defaults to the parent noun lowercased with no spaces
+   * (e.g. parent.noun="Page" -> "page").
+   */
+  parentField?: string
   /** Block registry. Defaults to DEFAULT_BLOCK_REGISTRY. */
   registry?: BlockRegistry
   /** Fallback component when a row's type isn't in the registry. */
@@ -107,6 +114,7 @@ export function BlocksPage(props: BlocksPageProps): ReactElement {
     noun,
     baseUrl,
     parent,
+    parentField,
     registry = DEFAULT_BLOCK_REGISTRY,
     fallback = DefaultFallback,
     typeField = 'type',
@@ -118,7 +126,11 @@ export function BlocksPage(props: BlocksPageProps): ReactElement {
   // a child collection of an entity, useArestOne primes the parent
   // record so loading/isLoading aligns across both fetches.
   const parentQuery = useArestOne(parent?.noun ?? '', parent?.id ?? '', opts)
-  const listFilter = parent ? { [`belongs to ${parent.noun}`]: parent.id } : undefined
+  // Default the filter field to the parent noun lowercased without
+  // spaces. Overridable for OpenAPI schemas that emit a different key.
+  const defaultParentField = parent ? parent.noun.replace(/\s+/g, '').toLowerCase() : ''
+  const effectiveParentField = parentField ?? defaultParentField
+  const listFilter = parent ? { [effectiveParentField]: parent.id } : undefined
   const listQuery = useArestList<BlockRow>(noun, listFilter ? { filter: listFilter } : undefined, opts)
 
   const isLoading = (parent && parentQuery.isLoading) || listQuery.isLoading
