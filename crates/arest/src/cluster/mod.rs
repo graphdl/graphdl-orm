@@ -27,7 +27,7 @@ use crate::freeze::{freeze, thaw};
 use alloc::sync::Arc;
 use hashbrown::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use transport::Transport;
 
 /// Human-readable node identifier. Not a newtype yet — the SWIM paper
@@ -550,7 +550,17 @@ pub struct Gossiper<T: Transport, C: Clock, P: PeerPicker> {
     /// Map of NodeId → clock-ms when we marked it Suspect. On
     /// tick, any entry older than T_suspect flips to Dead.
     suspect_since: HashMap<NodeId, u64>,
+    /// Bootstrap addresses we still need to Join. Drained when a
+    /// JoinAck arrives. Tick retries until `bootstrap_attempts` hits
+    /// MAX_JOIN_ATTEMPTS or at least one JoinAck is received.
+    bootstrap_pending: Vec<SocketAddr>,
+    bootstrap_attempts: u32,
 }
+
+/// Retry ceiling for bootstrap JOIN. At T_gossip = 1s, 10 attempts
+/// = 10s of patience — plenty for a cold-started seed node, not so
+/// much that we never give up.
+const MAX_JOIN_ATTEMPTS: u32 = 10;
 
 impl<T: Transport, C: Clock, P: PeerPicker> Gossiper<T, C, P> {
     pub fn new(
@@ -571,7 +581,47 @@ impl<T: Transport, C: Clock, P: PeerPicker> Gossiper<T, C, P> {
             next_seq: 1,
             probe: None,
             suspect_since: HashMap::new(),
+            bootstrap_pending: Vec::new(),
+            bootstrap_attempts: 0,
         }
+    }
+
+    /// Register bootstrap peers to contact on startup. The next few
+    /// `tick()` calls will send `Join` messages; once a `JoinAck`
+    /// arrives (or `MAX_JOIN_ATTEMPTS` pass) the pending list is
+    /// cleared.
+    pub fn set_bootstrap(&mut self, addrs: Vec<SocketAddr>) {
+        self.bootstrap_pending = addrs;
+        self.bootstrap_attempts = 0;
+    }
+
+    /// Announce a graceful exit: broadcast `Leave` to every Alive
+    /// peer, then mark self as `Left` locally so the final snapshot
+    /// reflects the departure. The caller should stop calling
+    /// `tick()` after this returns; the peer-side transition to
+    /// `Left` is driven by the broadcast.
+    pub fn broadcast_leave(&mut self) {
+        let self_id = self.membership.self_id().clone();
+        let Some(me) = self.membership.get(&self_id).cloned() else { return };
+        let leave = GossipMsg::Leave {
+            from: self_id.clone(),
+            incarnation: me.incarnation,
+        };
+        let alive: Vec<SocketAddr> = self
+            .membership
+            .iter()
+            .filter(|(id, m)| **id != self_id && m.state == State::Alive)
+            .map(|(_, m)| m.addr)
+            .collect();
+        for addr in alive {
+            let _ = self.transport.send(addr, &leave);
+        }
+        self.membership.merge(Delta {
+            id: self_id,
+            addr: me.addr,
+            incarnation: me.incarnation,
+            state: State::Left,
+        });
     }
 
     pub fn membership(&self) -> &Membership { &self.membership }
@@ -587,10 +637,10 @@ impl<T: Transport, C: Clock, P: PeerPicker> Gossiper<T, C, P> {
     }
 
     /// One step of the state machine. Drains inbound messages, checks
-    /// probe and suspect deadlines, and (if no probe is in flight and
-    /// the gossip interval has elapsed) starts a fresh probe by
-    /// sending a Ping to a random Alive peer with the current
-    /// snapshot as piggyback.
+    /// probe and suspect deadlines, retries pending bootstrap joins,
+    /// and (if no probe is in flight and the gossip interval has
+    /// elapsed) starts a fresh probe by sending a Ping to a random
+    /// Alive peer with the current snapshot as piggyback.
     ///
     /// One probe in flight at a time: SWIM deliberately serializes
     /// probes so failure-detection latency is bounded by T_ack, and
@@ -601,6 +651,7 @@ impl<T: Transport, C: Clock, P: PeerPicker> Gossiper<T, C, P> {
         for (from_addr, msg) in inbound {
             self.handle(from_addr, msg);
         }
+        self.retry_bootstrap();
         let now = self.clock.now_millis();
         self.check_probe_deadline(now);
         self.check_suspect_deadlines(now);
@@ -608,6 +659,25 @@ impl<T: Transport, C: Clock, P: PeerPicker> Gossiper<T, C, P> {
             self.start_probe(now);
             self.next_gossip_at = now + self.cfg.t_gossip_ms;
         }
+    }
+
+    fn retry_bootstrap(&mut self) {
+        if self.bootstrap_pending.is_empty() || self.bootstrap_attempts >= MAX_JOIN_ATTEMPTS {
+            return;
+        }
+        let self_id = self.membership.self_id().clone();
+        let self_addr = self.self_addr();
+        let incarnation = self
+            .membership
+            .get(&self_id)
+            .map(|m| m.incarnation)
+            .unwrap_or(0);
+        let join = GossipMsg::Join { from: self_id, addr: self_addr, incarnation };
+        let targets: Vec<SocketAddr> = self.bootstrap_pending.clone();
+        for addr in targets {
+            let _ = self.transport.send(addr, &join);
+        }
+        self.bootstrap_attempts += 1;
     }
 
     fn handle(&mut self, from_addr: SocketAddr, msg: GossipMsg) {
@@ -633,13 +703,44 @@ impl<T: Transport, C: Clock, P: PeerPicker> Gossiper<T, C, P> {
                     }
                 }
             }
-            // PingReq / Join / JoinAck / Leave land in follow-up
-            // commits — these acceptance tests only exercise direct
-            // Ping/Ack + the Suspect → Dead timer.
-            GossipMsg::PingReq { .. }
-            | GossipMsg::Join { .. }
-            | GossipMsg::JoinAck { .. }
-            | GossipMsg::Leave { .. } => {}
+            GossipMsg::Join { from, addr, incarnation } => {
+                // The newbie has announced themselves. Add them to
+                // our view and reply with the current snapshot so
+                // they boot straight into a full membership list.
+                self.apply_delta(Delta {
+                    id: from,
+                    addr,
+                    incarnation,
+                    state: State::Alive,
+                });
+                let ack = GossipMsg::JoinAck { members: self.membership.snapshot() };
+                let _ = self.transport.send(addr, &ack);
+            }
+            GossipMsg::JoinAck { members } => {
+                for d in members { self.apply_delta(d); }
+                // Any JoinAck satisfies bootstrap — we've been
+                // welcomed; no need to keep spamming the seed list.
+                self.bootstrap_pending.clear();
+            }
+            GossipMsg::Leave { from, incarnation } => {
+                // Honor the Leave only if it matches or exceeds the
+                // incarnation we have. A stale Leave at a lower
+                // incarnation cannot retire a restarted peer.
+                if let Some(existing) = self.membership.get(&from).cloned() {
+                    if incarnation >= existing.incarnation {
+                        self.membership.merge(Delta {
+                            id: from,
+                            addr: existing.addr,
+                            incarnation,
+                            state: State::Left,
+                        });
+                    }
+                }
+            }
+            // PingReq relay lands in a later commit — the acceptance
+            // tests short-circuit to Suspect when no intermediaries
+            // are available, which is the SWIM paper's own fallback.
+            GossipMsg::PingReq { .. } => {}
         }
     }
 
@@ -721,6 +822,115 @@ impl<T: Transport, C: Clock, P: PeerPicker> Gossiper<T, C, P> {
         });
         self.suspect_since.remove(id);
     }
+}
+
+// ── Boot path ─────────────────────────────────────────────────────────
+//
+// `start` is the entry point main.rs (or any host) calls to turn a
+// listen address plus a bootstrap list into a live, gossiping node.
+// It binds a UdpTransport, constructs a Gossiper with production
+// defaults (SystemClock + LcgPicker seeded from UNIX time), and
+// spawns a background thread that drives tick() on a tight
+// interval. The returned ClusterHandle exposes the latest
+// membership snapshot and a blocking shutdown.
+
+use std::io;
+
+/// Driver-thread tick cadence. Much smaller than T_gossip so the
+/// state machine reacts promptly to ack/suspect deadlines (20-40ms
+/// granularity) without busy-looping.
+const TICK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Handle to a gossiping node running on a background thread.
+/// Dropping the handle (or calling `shutdown`) stops the thread,
+/// broadcasts a Leave, and joins. Callers inspect the latest view
+/// via `snapshot`.
+pub struct ClusterHandle {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    local_addr: SocketAddr,
+    shared: Arc<std::sync::RwLock<Vec<Delta>>>,
+}
+
+impl ClusterHandle {
+    pub fn local_addr(&self) -> SocketAddr { self.local_addr }
+
+    /// Latest membership snapshot. Updated on every tick (every
+    /// TICK_INTERVAL), so two consecutive calls may yield
+    /// different vectors.
+    pub fn snapshot(&self) -> Vec<Delta> {
+        self.shared.read().unwrap().clone()
+    }
+
+    /// Stop gossiping: set the flag, join the thread. The thread
+    /// broadcasts Leave before exiting so peers transition us to
+    /// `Left` promptly rather than waiting for T_suspect.
+    pub fn shutdown(mut self) {
+        self.stop_and_join();
+    }
+
+    fn stop_and_join(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+impl Drop for ClusterHandle {
+    fn drop(&mut self) {
+        self.stop_and_join();
+    }
+}
+
+/// Spawn a gossiping node. Binds `listen`, joins each `bootstrap`
+/// address if non-empty, and returns a handle for inspection and
+/// shutdown.
+pub fn start(
+    self_id: NodeId,
+    listen: SocketAddr,
+    bootstrap: Vec<SocketAddr>,
+    cfg: GossipConfig,
+) -> io::Result<ClusterHandle> {
+    let transport = transport::UdpTransport::bind(listen)?;
+    let actual_addr = transport.addr();
+    let clock = Arc::new(SystemClock::new());
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(1);
+    let picker = LcgPicker::new(seed);
+    let mut gossiper = Gossiper::new(self_id, actual_addr, transport, clock, picker, cfg);
+    if !bootstrap.is_empty() {
+        gossiper.set_bootstrap(bootstrap);
+    }
+    let initial = gossiper.membership().snapshot();
+    let shared = Arc::new(std::sync::RwLock::new(initial));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let shared_rx = Arc::clone(&shared);
+    let stop_rx = Arc::clone(&stop);
+    let thread = std::thread::Builder::new()
+        .name(format!("cluster-gossiper-{actual_addr}"))
+        .spawn(move || {
+            while !stop_rx.load(Ordering::Relaxed) {
+                gossiper.tick();
+                *shared_rx.write().unwrap() = gossiper.membership().snapshot();
+                std::thread::sleep(TICK_INTERVAL);
+            }
+            // Graceful exit — tell everyone we're Leaving so they
+            // transition us to Left instantly instead of discovering
+            // it via T_suspect timeout.
+            gossiper.broadcast_leave();
+            *shared_rx.write().unwrap() = gossiper.membership().snapshot();
+        })?;
+
+    Ok(ClusterHandle {
+        stop,
+        thread: Some(thread),
+        local_addr: actual_addr,
+        shared,
+    })
 }
 
 #[cfg(test)]
