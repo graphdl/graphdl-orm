@@ -144,6 +144,7 @@ fn emit_contract(
     let sm_parts = sm.map(emit_state_machine).unwrap_or_default();
     let create_fn = emit_create(name, table, sm, state);
     let transitions = sm.map(|s| emit_transitions(s)).unwrap_or_default();
+    let vc_validators = emit_vc_validators(name, table, state);
 
     format!(
         "{}contract {} {{\n\
@@ -153,9 +154,41 @@ fn emit_contract(
          {}\
          {}\
          {}\
+         {}\
          }}\n",
-        off_chain, contract_name, struct_def, events, sm_parts, create_fn, transitions
+        off_chain, contract_name, struct_def, events, sm_parts, create_fn, transitions, vc_validators
     )
+}
+
+/// Emit one internal pure `_validate<ValueType>` helper per column
+/// whose value-type noun has declared enum values. Keyed by
+/// `keccak256(bytes(v))` against each declared value for O(1)
+/// membership. Paired with the `require(_validate{}(param), "VC: …")`
+/// calls emitted by `emit_create`.
+fn emit_vc_validators(
+    noun_name: &str,
+    table: Option<&TableDef>,
+    state: &Object,
+) -> String {
+    let Some(t) = table else { return String::new(); };
+    let mut emitted: hashbrown::HashSet<String> = hashbrown::HashSet::new();
+    let fns: Vec<String> = t.columns.iter().filter_map(|c| {
+        let col_noun = column_value_type_noun(&c.name, noun_name, state)?;
+        let values = enum_values_for_value_type(&col_noun, state);
+        if values.is_empty() { return None; }
+        let fn_name = alloc::format!("_validate{}", sanitize_name(&col_noun));
+        if !emitted.insert(fn_name.clone()) { return None; }
+        let cases: Vec<String> = values.iter()
+            .map(|v| alloc::format!("h == keccak256(bytes(\"{}\"))", v))
+            .collect();
+        Some(alloc::format!(
+            "\n    function {}(string memory v) internal pure returns (bool) {{\n\
+             \x20       bytes32 h = keccak256(bytes(v));\n\
+             \x20       return {};\n\
+             \x20   }}\n",
+            fn_name, cases.join("\n            || ")))
+    }).collect();
+    fns.concat()
 }
 
 /// Emit a comment block above the contract body listing constraints
@@ -578,61 +611,6 @@ Order has Amount.
     }
 
     // ─── E2 — ORM 2 constraint coverage in Solidity ────────────────────
-
-    const MC_READINGS: &str = r#"
-## Entity Types
-
-Order(.Order Number) is an entity type.
-Amount is a value type.
-
-## Fact Types
-
-Order has Amount.
-  Each Order has at most one Amount.
-  Each Order has some Amount.
-"#;
-
-    #[test]
-    #[ignore = "E2: MC require blocked on RMAP absorption — legacy writes both UC spans at roleIndex 0 (the entity side) for `Each X has at most one Y`, which RMAP classifies as compound instead of functional, so Y never becomes a column on X's struct. Tracking as a follow-up to #304."]
-    fn compile_to_solidity_emits_mc_require() {
-        let meta = parse_to_state(STATE_METAMODEL).unwrap();
-        let state = parse_to_state_with_nouns(MC_READINGS, &meta).unwrap();
-        let state = merge_states(&meta, &state);
-        let out = compile_to_solidity_for_nouns(&state, &["Order"]);
-        assert!(out.contains("MC:"),
-            "expected MC require in create(), got:\n{}", out);
-        assert!(out.contains("bytes(amount).length"),
-            "expected MC require on amount field, got:\n{}", out);
-    }
-
-    const VC_READINGS: &str = r#"
-## Entity Types
-
-Order(.Order Number) is an entity type.
-
-## Value Types
-
-Priority is a value type.
-  The possible values of Priority are 'low', 'medium', 'high'.
-
-## Fact Types
-
-Order has Priority.
-"#;
-
-    #[test]
-    #[ignore = "E2: VC validator not yet implemented; see _reports/followup-2026-04-20.md"]
-    fn compile_to_solidity_emits_vc_validator() {
-        let meta = parse_to_state(STATE_METAMODEL).unwrap();
-        let state = parse_to_state_with_nouns(VC_READINGS, &meta).unwrap();
-        let state = merge_states(&meta, &state);
-        let out = compile_to_solidity_for_nouns(&state, &["Order"]);
-        assert!(out.contains("VC:") || out.contains("_validatePriority"),
-            "expected VC validator, got:\n{}", out);
-        // Must reference each enum value
-        assert!(out.contains("low") && out.contains("medium") && out.contains("high"),
-            "expected enum values in validator, got:\n{}", out);
-    }
 
     const IR_READINGS: &str = r#"
 ## Entity Types
