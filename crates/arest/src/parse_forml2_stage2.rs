@@ -1177,7 +1177,24 @@ pub fn parse_to_state_via_stage12(text: &str) -> Result<Object, String> {
 
     let classified = classify_statements(&stmt_state, &grammar_state);
 
+    // Run translate_nouns FIRST so subsequent translators that consult
+    // `declared_noun_names` see domain nouns (not just the grammar's
+    // metamodel nouns). Inject the resulting Noun facts into the
+    // classified state before invoking constraint translators that
+    // depend on the declared-noun list — `translate_set_constraints`'
+    // antecedent-noun-count arbitration and
+    // `translate_ring_constraints`' `conditional_ring_kind` helper
+    // both need the domain-level catalog.
     let noun_facts = translate_nouns(&classified);
+    let classified = {
+        let mut map: HashMap<String, Object> = match &classified {
+            Object::Map(m) => m.clone(),
+            _ => HashMap::new(),
+        };
+        map.insert("Noun".to_string(), Object::Seq(noun_facts.clone().into()));
+        Object::Map(map)
+    };
+
     let mut subtype_facts: Vec<Object> = translate_subtypes(&classified);
     subtype_facts.extend(translate_partitions(&classified));
     let (ft_facts, role_facts) = translate_fact_types(&classified);
@@ -2154,6 +2171,34 @@ mod tests {
         let core = include_str!("../../../readings/core.md");
         let (missing, extra) = diff_cells("core.md", core);
         eprintln!("core.md totals — missing: {}, extra: {}", missing, extra);
+    }
+
+    #[test]
+    #[ignore = "diagnostic: probe conditional ring statements in core.md"]
+    fn dump_subtype_if_then_classifications() {
+        let core = include_str!("../../../readings/core.md");
+        let stage12 = super::parse_to_state_via_stage12(core).expect("stage12");
+        let texts = fetch_or_phi("Statement_has_Text", &stage12);
+        let Some(txt_seq) = texts.as_seq() else {
+            eprintln!("no Statement_has_Text cell"); return;
+        };
+        let total = txt_seq.len();
+        let if_count = txt_seq.iter()
+            .filter(|f| binding(f, "Text").map(|t| t.starts_with("If ")).unwrap_or(false))
+            .count();
+        eprintln!("total Statement_has_Text entries: {}", total);
+        eprintln!("entries starting with `If `: {}", if_count);
+        for f in txt_seq.iter()
+            .filter(|f| binding(f, "Text").map(|t| t.starts_with("If Noun")).unwrap_or(false))
+        {
+            let stmt_id = binding(f, "Statement").unwrap_or("?");
+            let text = binding(f, "Text").unwrap_or("?");
+            let kinds = classifications_for(&stage12, stmt_id);
+            let declared = super::declared_noun_names(&stage12);
+            let ring = super::conditional_ring_kind(text, &declared);
+            eprintln!("{}: kinds={:?} ring={:?}", stmt_id, kinds, ring);
+            eprintln!("  text: {}", text);
+        }
     }
 
     #[test]
