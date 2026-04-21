@@ -1546,9 +1546,13 @@ It is forbidden that Support Response contains Prohibited Word.
     let defs: Vec<(String, Func)> = compile::compile_to_defs_state(&domain_state);
     let d = ast::defs_to_state(&defs, &domain_state);
 
-    // Find the forbidden constraint
+    // Find the forbidden constraint. Stage12 also emits a VC
+    // (Value Constraint) for the enum-valued "Prohibited Word" noun,
+    // so filter on the "It is forbidden" prefix to disambiguate from
+    // `constraint:VC:Prohibited Word`.
     let (_, constraint_func) = defs.iter()
-        .find(|(name, _)| name.contains("constraint:") && name.contains("Prohibited Word"))
+        .find(|(name, _)| name.starts_with("constraint:It is forbidden")
+            && name.contains("Prohibited Word"))
         .expect("Prohibited Word constraint");
 
     // Bad response: eval context has "overnight" in the text position

@@ -241,61 +241,191 @@ fn extract_reference_scheme(text: &str, head_noun: &str) -> Option<String> {
     if cols.is_empty() { None } else { Some(cols.join(",")) }
 }
 
-/// Post-translator enrichment: for each Constraint fact that carries
-/// an `entity` binding, find the first Role whose `nounName` matches
-/// and emit `span0_factTypeId` / `span0_roleIndex` (plus `span1_*`
-/// duplicating span0 for single-role UC/MC — legacy quirk).
+/// Post-translator enrichment: emit `span0_factTypeId`/`span0_roleIndex`
+/// (plus `span1_*` mirroring span0 for the UC/MC/VC/FC legacy quirk)
+/// on every Constraint fact so `check.rs`, `command.rs`, and
+/// `compile.rs::collect_enum_values` can attach the constraint to the
+/// right fact type.
 ///
-/// `check.rs` and `command.rs` read these span bindings to decide
-/// which constraints attach to a given fact-type role; without them,
-/// the RMAP → OpenAPI → MC-validation pipeline thinks no constraints
-/// exist on the fact type.
-///
-/// Multi-span constraints (ring, equality, subset, exclusion, etc.)
-/// would need per-kind span derivation — this pass covers the UC /
-/// MC / VC / FC shapes where span0 = span1 = the-entity-role. Kinds
-/// without an `entity` binding are left untouched.
+/// Resolution preference:
+///   1. Full noun-sequence match against declared FTs — parity with
+///      legacy's `resolve_constraint_schema`. A constraint text like
+///      `It is forbidden that Support Response contains Prohibited
+///      Word` mentions two declared nouns; the FT whose role
+///      sequence equals `[Support Response, Prohibited Word]` is
+///      the right binding. This matters for multi-noun deontic
+///      constraints where the entity noun appears in several FTs
+///      (e.g. Support Response → has Body AND contains Prohibited
+///      Word) — picking the first match by entity alone points the
+///      span at the wrong FT and `collect_enum_values` misses
+///      Prohibited Word's enum values.
+///   2. Entity-based fallback for single-noun constraints (ring kinds,
+///      value constraints, etc.) where the stripped text surfaces
+///      one noun and step 1 yields no match.
 #[cfg(feature = "std-deps")]
 fn enrich_constraints_with_spans(
     constraints: &[Object],
     role_facts: &[Object],
 ) -> Vec<Object> {
-    // Pre-index roles by noun name → (factType, position). Single pass
-    // instead of K × N when this runs on large states.
+    // Roles indexed two ways: by noun (first-match fallback) and by
+    // fact type (full-sequence resolution).
     let mut roles_by_noun: hashbrown::HashMap<String, (String, String)> =
         hashbrown::HashMap::with_capacity(role_facts.len());
+    let mut roles_by_ft: hashbrown::HashMap<String, Vec<(usize, String)>> =
+        hashbrown::HashMap::new();
+    let mut declared_noun_set: hashbrown::HashSet<String> = hashbrown::HashSet::new();
     for r in role_facts.iter() {
-        let (Some(noun), Some(ft), Some(pos)) = (
+        let (Some(noun), Some(ft), Some(pos_str)) = (
             binding(r, "nounName"),
             binding(r, "factType"),
             binding(r, "position"),
         ) else { continue };
         roles_by_noun.entry(noun.to_string())
-            .or_insert((ft.to_string(), pos.to_string()));
+            .or_insert((ft.to_string(), pos_str.to_string()));
+        let pos: usize = pos_str.parse().unwrap_or(0);
+        roles_by_ft.entry(ft.to_string()).or_default().push((pos, noun.to_string()));
+        declared_noun_set.insert(noun.to_string());
     }
+    for roles in roles_by_ft.values_mut() {
+        roles.sort_by_key(|(p, _)| *p);
+    }
+    let mut declared_nouns: Vec<String> = declared_noun_set.into_iter().collect();
+    declared_nouns.sort_by(|a, b| b.len().cmp(&a.len()));
+
     constraints.iter().map(|c| {
-        // Copy the fact's existing bindings, then append span bindings
-        // when we find a Role match on `entity`.
         let pairs: Vec<Object> = c.as_seq()
             .map(|s| s.to_vec())
             .unwrap_or_default();
-        let Some(entity) = binding(c, "entity") else { return c.clone() };
-        let Some((ft_id, pos)) = roles_by_noun.get(entity) else { return c.clone() };
-        let mut new_pairs = pairs;
         // Avoid duplicate span bindings if somehow already present.
-        let has_span = new_pairs.iter().any(|p| p.as_seq()
+        let has_span = pairs.iter().any(|p| p.as_seq()
             .and_then(|s| s.get(0)?.as_atom())
             .map(|k| k == "span0_factTypeId").unwrap_or(false));
         if has_span { return c.clone(); }
+
+        // Preference 1: resolve by full noun-sequence match.
+        let text = binding(c, "text").unwrap_or("");
+        let resolved = resolve_constraint_span_ft(text, &roles_by_ft, &declared_nouns);
+        // Preference 2: fall back to entity-based first-match.
+        let fallback = || -> Option<(String, String)> {
+            let entity = binding(c, "entity")?;
+            roles_by_noun.get(entity).cloned()
+        };
+        let (ft_id, pos) = match resolved.or_else(fallback) {
+            Some(x) => x,
+            None => return c.clone(),
+        };
+
+        let mut new_pairs = pairs;
         let push = |np: &mut Vec<Object>, k: &str, v: &str| {
             np.push(Object::seq(vec![Object::atom(k), Object::atom(v)]));
         };
-        push(&mut new_pairs, "span0_factTypeId", ft_id);
-        push(&mut new_pairs, "span0_roleIndex", pos);
-        push(&mut new_pairs, "span1_factTypeId", ft_id);
-        push(&mut new_pairs, "span1_roleIndex", pos);
+        push(&mut new_pairs, "span0_factTypeId", &ft_id);
+        push(&mut new_pairs, "span0_roleIndex", &pos);
+        push(&mut new_pairs, "span1_factTypeId", &ft_id);
+        push(&mut new_pairs, "span1_roleIndex", &pos);
         Object::Seq(new_pairs.into())
     }).collect()
+}
+
+/// Resolve a Constraint's target fact type by noun-sequence match
+/// — legacy `resolve_constraint_schema` parity without the catalog
+/// machinery. Returns `(ft_id, role_index_of_first_noun_in_ft)` when
+/// the stripped constraint text mentions declared nouns whose order
+/// (with repetition) exactly matches some declared FT's role sequence.
+///
+/// The first noun in the stripped text is the quantified / forbidden
+/// noun — `role_index` points at its position in the FT, so downstream
+/// code (`check.rs`'s `constraint_applies_to_role`) attaches the
+/// constraint to the correct role.
+#[cfg(feature = "std-deps")]
+fn resolve_constraint_span_ft(
+    text: &str,
+    roles_by_ft: &hashbrown::HashMap<String, Vec<(usize, String)>>,
+    sorted_nouns_longest_first: &[String],
+) -> Option<(String, String)> {
+    // Strip quoted literals (constraint body may carry `'Overnight'` etc.).
+    let stripped = {
+        let mut s = text.to_string();
+        while let Some(open) = s.find('\'') {
+            match s[open + 1..].find('\'') {
+                Some(close) => {
+                    s = alloc::format!("{}{}", &s[..open], &s[open + 1 + close + 1..]);
+                }
+                None => break,
+            }
+        }
+        s
+    };
+    // Strip deontic / quantifier prefixes that precede the noun-verb-noun
+    // backbone. Order matches legacy's `resolve_constraint_schema`.
+    let stripped = stripped
+        .replace("It is obligatory that ", "")
+        .replace("It is forbidden that ", "")
+        .replace("It is permitted that ", "")
+        .replace("Each ", "").replace("each ", "")
+        .replace("at most one ", "").replace("exactly one ", "")
+        .replace("at least one ", "").replace("some ", "")
+        .replace("No ", "").replace("no ", "");
+
+    let found_nouns: Vec<String> = find_noun_sequence(&stripped, sorted_nouns_longest_first);
+    if found_nouns.len() < 2 { return None; }
+
+    // Find an FT whose role noun sequence matches the found noun sequence.
+    for (ft_id, roles) in roles_by_ft {
+        if roles.len() != found_nouns.len() { continue; }
+        let role_nouns: Vec<&str> = roles.iter().map(|(_, n)| n.as_str()).collect();
+        if role_nouns.iter().zip(found_nouns.iter())
+            .all(|(a, b)| a == &b.as_str())
+        {
+            let first = found_nouns[0].as_str();
+            let role_index = roles.iter()
+                .find(|(_, n)| n == first)
+                .map(|(p, _)| *p)
+                .unwrap_or(0);
+            return Some((ft_id.clone(), alloc::format!("{}", role_index)));
+        }
+    }
+    None
+}
+
+/// Walk `text` left-to-right, matching declared nouns longest-first at
+/// each cursor position with word-boundary checking (next char must be
+/// absent, whitespace, or a non-alphanumeric separator). Returns the
+/// ordered sequence of noun names — duplicates preserved (e.g. ring
+/// constraints' `Person ... Person` becomes `[Person, Person]`).
+#[cfg(feature = "std-deps")]
+fn find_noun_sequence(text: &str, sorted_nouns_longest_first: &[String]) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if !text.is_char_boundary(i) { i += 1; continue; }
+        let rest = &text[i..];
+        let matched = sorted_nouns_longest_first.iter().find(|n| {
+            if !rest.starts_with(n.as_str()) { return false; }
+            // Word-boundary after: EOF or non-alphanumeric char.
+            rest[n.len()..].chars().next()
+                .map(|c| !c.is_alphanumeric())
+                .unwrap_or(true)
+        });
+        if let Some(n) = matched {
+            // Word-boundary before: SOF or non-alphanumeric char.
+            let before_ok = if i == 0 {
+                true
+            } else {
+                text[..i].chars().next_back()
+                    .map(|c| !c.is_alphanumeric())
+                    .unwrap_or(true)
+            };
+            if before_ok {
+                found.push(n.clone());
+                i += n.len();
+                continue;
+            }
+        }
+        i += 1;
+    }
+    found
 }
 
 /// Strip a trailing `(<ring-kind>)` annotation — the explicit kind
