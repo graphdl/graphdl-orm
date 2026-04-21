@@ -1177,13 +1177,13 @@ pub fn find_forbidden_instance_url(state: &crate::ast::Object) -> Option<String>
 }
 
 /// Parse FORML2 readings directly into an Object state.
-/// Every declaration becomes a fact (cell) in state. No intermediate struct.
 ///
-/// #285 wire-up is blocked on translator semantic parity (#319); the
-/// `parse_to_state_via_stage12` entry point is ready and benchmarks
-/// faster than this function, but stage12's translators don't yet
-/// emit every binding legacy does (Noun.referenceScheme, Constraint
-/// span0_factTypeId/span0_roleIndex/…, etc.). Switch once #319 closes.
+/// #285 wire-up is blocked on three remaining `check::` test gaps
+/// (tracked in #319): the stage12 pipeline needs an `UnresolvedClause`
+/// cell emission for derivation rules with unresolvable antecedents,
+/// and ring-constraint `(kind)` annotation handling. The
+/// `parse_to_state_via_stage12` entry point is a drop-in replacement
+/// for everything else and benchmarks faster than this function.
 pub fn parse_to_state(input: &str) -> Result<crate::ast::Object, String> {
     parse_to_state_legacy(input)
 }

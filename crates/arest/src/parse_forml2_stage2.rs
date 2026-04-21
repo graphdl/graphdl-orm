@@ -111,6 +111,13 @@ pub fn translate_nouns(classified_state: &Object) -> Vec<Object> {
     use alloc::collections::BTreeMap;
     let statement_ids = collect_statement_ids(classified_state);
     let mut by_noun: BTreeMap<String, &'static str> = BTreeMap::new();
+    // Side-tables, keyed by noun name: reference scheme columns, enum
+    // values, supertype. Legacy emits all three as bindings on the
+    // Noun fact itself; rmap / openapi / the ref-scheme-driven OpenAPI
+    // schema generator all read them from there.
+    let mut ref_schemes: BTreeMap<String, String> = BTreeMap::new();
+    let mut enum_values: BTreeMap<String, String> = BTreeMap::new();
+    let mut super_types: BTreeMap<String, String> = BTreeMap::new();
     for stmt_id in &statement_ids {
         let Some(head) = head_noun_for(classified_state, stmt_id) else { continue };
         let classifications = classifications_for(classified_state, stmt_id);
@@ -134,20 +141,168 @@ pub fn translate_nouns(classified_state: &Object) -> Vec<Object> {
             None
         };
         if let Some(new_ot) = ot {
-            let slot = by_noun.entry(head).or_insert(new_ot);
+            let slot = by_noun.entry(head.clone()).or_insert(new_ot);
             // Abstract wins over entity/value; otherwise keep existing.
             if new_ot == "abstract" {
                 *slot = "abstract";
             }
         }
+
+        // Reference-scheme shorthand: the entity declaration text is
+        // e.g. `Organization(.Slug) is an entity type.` or the
+        // multi-column form `Booking(.Year, .Course)…`. Stage-1
+        // strips the parens before tokenization (so the Trailing
+        // Marker rule can fire), but the original Text cell preserves
+        // them. Re-scan here rather than plumb a separate
+        // `Statement_has_Reference_Scheme` cell through the grammar
+        // just for this one shape.
+        if classifications.iter().any(|k|
+            k == "Entity Type Declaration" || k == "Value Type Declaration")
+        {
+            if let Some(text) = statement_text(classified_state, stmt_id) {
+                if let Some(rs) = extract_reference_scheme(&text, &head) {
+                    ref_schemes.insert(head.clone(), rs);
+                }
+            }
+        }
+
+        // Supertype binding: `Subtype is a subtype of Supertype.`
+        if classifications.iter().any(|k| k == "Subtype Declaration") {
+            if let Some(sup) = role_noun_at_position(classified_state, stmt_id, 1) {
+                super_types.insert(head.clone(), sup);
+            }
+        }
+
+        // Enum values: `The possible values of Priority are 'low', 'medium', 'high'.`
+        if classifications.iter().any(|k| k == "Enum Values Declaration") {
+            if let Some(text) = statement_text(classified_state, stmt_id) {
+                if let Some(vals) = extract_enum_values(&text) {
+                    enum_values.insert(head.clone(), vals);
+                }
+            }
+        }
     }
     by_noun.into_iter().map(|(name, ot)| {
-        fact_from_pairs(&[
+        let mut pairs: Vec<(&str, &str)> = vec![
             ("name", name.as_str()),
             ("objectType", ot),
             ("worldAssumption", "closed"),
-        ])
+        ];
+        if let Some(rs) = ref_schemes.get(&name) {
+            pairs.push(("referenceScheme", rs.as_str()));
+        }
+        if let Some(sup) = super_types.get(&name) {
+            pairs.push(("superType", sup.as_str()));
+        }
+        if let Some(ev) = enum_values.get(&name) {
+            pairs.push(("enumValues", ev.as_str()));
+        }
+        fact_from_pairs(&pairs)
     }).collect()
+}
+
+/// Extract the reference-scheme column list from an entity
+/// declaration like `Noun(.Col) is an entity type.` or
+/// `Noun(.A, .B) is an entity type.`. Returns the columns joined by
+/// `,` (matching legacy's binding format rmap reads via
+/// `referenceScheme.split(',')`). Returns `None` if the text doesn't
+/// contain a `(.…)` suffix for this noun.
+#[cfg(feature = "std-deps")]
+fn extract_reference_scheme(text: &str, head_noun: &str) -> Option<String> {
+    let after_noun = text.find(head_noun).map(|i| i + head_noun.len())?;
+    let rest = &text[after_noun..];
+    let open_idx = rest.find("(.")?;
+    // Only accept `(.` that immediately follows the noun (allowing
+    // whitespace) — otherwise we might pick up an unrelated later
+    // parenthetical.
+    if !rest[..open_idx].chars().all(|c| c.is_whitespace()) {
+        return None;
+    }
+    let after_open = &rest[open_idx + 2..];
+    let close_idx = after_open.find(')')?;
+    let inside = &after_open[..close_idx];
+    // Columns are `.Col` or just `Col` (the leading `.` is already
+    // consumed for the first). Split by `,` and trim each.
+    let cols: Vec<String> = inside.split(',')
+        .map(|c| c.trim().trim_start_matches('.').to_string())
+        .filter(|c| !c.is_empty())
+        .collect();
+    if cols.is_empty() { None } else { Some(cols.join(",")) }
+}
+
+/// Post-translator enrichment: for each Constraint fact that carries
+/// an `entity` binding, find the first Role whose `nounName` matches
+/// and emit `span0_factTypeId` / `span0_roleIndex` (plus `span1_*`
+/// duplicating span0 for single-role UC/MC — legacy quirk).
+///
+/// `check.rs` and `command.rs` read these span bindings to decide
+/// which constraints attach to a given fact-type role; without them,
+/// the RMAP → OpenAPI → MC-validation pipeline thinks no constraints
+/// exist on the fact type.
+///
+/// Multi-span constraints (ring, equality, subset, exclusion, etc.)
+/// would need per-kind span derivation — this pass covers the UC /
+/// MC / VC / FC shapes where span0 = span1 = the-entity-role. Kinds
+/// without an `entity` binding are left untouched.
+#[cfg(feature = "std-deps")]
+fn enrich_constraints_with_spans(
+    constraints: &[Object],
+    role_facts: &[Object],
+) -> Vec<Object> {
+    // Pre-index roles by noun name → (factType, position). Single pass
+    // instead of K × N when this runs on large states.
+    let mut roles_by_noun: hashbrown::HashMap<String, (String, String)> =
+        hashbrown::HashMap::with_capacity(role_facts.len());
+    for r in role_facts.iter() {
+        let (Some(noun), Some(ft), Some(pos)) = (
+            binding(r, "nounName"),
+            binding(r, "factType"),
+            binding(r, "position"),
+        ) else { continue };
+        roles_by_noun.entry(noun.to_string())
+            .or_insert((ft.to_string(), pos.to_string()));
+    }
+    constraints.iter().map(|c| {
+        // Copy the fact's existing bindings, then append span bindings
+        // when we find a Role match on `entity`.
+        let pairs: Vec<Object> = c.as_seq()
+            .map(|s| s.to_vec())
+            .unwrap_or_default();
+        let Some(entity) = binding(c, "entity") else { return c.clone() };
+        let Some((ft_id, pos)) = roles_by_noun.get(entity) else { return c.clone() };
+        let mut new_pairs = pairs;
+        // Avoid duplicate span bindings if somehow already present.
+        let has_span = new_pairs.iter().any(|p| p.as_seq()
+            .and_then(|s| s.get(0)?.as_atom())
+            .map(|k| k == "span0_factTypeId").unwrap_or(false));
+        if has_span { return c.clone(); }
+        let push = |np: &mut Vec<Object>, k: &str, v: &str| {
+            np.push(Object::seq(vec![Object::atom(k), Object::atom(v)]));
+        };
+        push(&mut new_pairs, "span0_factTypeId", ft_id);
+        push(&mut new_pairs, "span0_roleIndex", pos);
+        push(&mut new_pairs, "span1_factTypeId", ft_id);
+        push(&mut new_pairs, "span1_roleIndex", pos);
+        Object::Seq(new_pairs.into())
+    }).collect()
+}
+
+/// Extract the quoted values from a `The possible values of <Noun>
+/// are 'v1', 'v2', …` declaration. Returns them joined by `,`.
+#[cfg(feature = "std-deps")]
+fn extract_enum_values(text: &str) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
+    let are_idx = lower.find(" are ")?;
+    let tail = &text[are_idx + 5..];
+    let mut vals: Vec<String> = Vec::new();
+    let mut rest = tail;
+    while let Some(open) = rest.find('\'') {
+        let after = &rest[open + 1..];
+        let close = after.find('\'')?;
+        vals.push(after[..close].to_string());
+        rest = &after[close + 1..];
+    }
+    if vals.is_empty() { None } else { Some(vals.join(",")) }
 }
 
 /// Translate `Subtype Declaration` classifications into `Subtype` cell
@@ -1255,6 +1410,8 @@ static GRAMMAR_CACHE: std::sync::OnceLock<GrammarCacheEntry>
 fn cached_grammar() -> Result<&'static GrammarCacheEntry, String> {
     if let Some(g) = GRAMMAR_CACHE.get() { return Ok(g); }
     let grammar = include_str!("../../../readings/forml2-grammar.md");
+    // Must use the legacy path — the public `parse_to_state` is
+    // the stage12 entry now; bootstrapping through it would recurse.
     let parsed = crate::parse_forml2::parse_to_state_legacy(grammar)
         .map_err(|e| alloc::format!("grammar parse failed: {}", e))?;
     let mut defs = crate::compile::compile_to_defs_state(&parsed);
@@ -1683,6 +1840,14 @@ pub fn parse_to_state_via_stage12(text: &str) -> Result<Object, String> {
     constraint_facts.extend(tt!("set", translate_set_constraints(&classified)));
     constraint_facts.extend(tt!("value_c", translate_value_constraints(&classified)));
     constraint_facts.extend(tt!("deontic", translate_deontic_constraints(&classified)));
+    // Enrich each constraint with span0_factTypeId / span0_roleIndex
+    // (and span1_*) bindings derived from the Role cell. Legacy emits
+    // these at constraint-translation time; check.rs, command.rs and
+    // the RMAP-attached-constraints code path all read them. Single-
+    // role UC/MC/VC get span0 and span1 both pointing at the same
+    // role (legacy quirk preserved for byte-level parity).
+    constraint_facts = tt!("enrich_spans",
+        enrich_constraints_with_spans(&constraint_facts, &role_facts));
     let derivation_facts = tt!("derivation", translate_derivation_rules(&classified));
     let declared_ft_ids: Vec<String> = ft_facts.iter()
         .filter_map(|f| binding(f, "id").map(String::from))
