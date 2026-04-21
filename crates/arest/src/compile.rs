@@ -1818,20 +1818,24 @@ pub(crate) fn validate_model_data(ir: &CellIndex) -> Vec<String> {
 /// that lifts repeated `fetch_or_phi` + `binding` lookups into HashMaps so
 /// sub-functions don't pay O(n) cell scans on every access. Rebuilt fresh
 /// on every `compile(state)` call.
-pub(crate) struct CellIndex {
-    pub(crate) nouns: HashMap<String, NounDef>,
-    pub(crate) fact_types: HashMap<String, FactTypeDef>,
-    pub(crate) constraints: Vec<ConstraintDef>,
-    pub(crate) derivation_rules: Vec<DerivationRuleDef>,
-    pub(crate) subtypes: HashMap<String, String>,
-    pub(crate) ref_schemes: HashMap<String, Vec<String>>,
-    pub(crate) enum_values: HashMap<String, Vec<String>>,
-    pub(crate) general_instance_facts: Vec<GeneralInstanceFact>,
-    pub(crate) state_machines: HashMap<String, StateMachineDef>,
+///
+/// `pub` so tests, doc tools, and generators can consume the same typed
+/// view of state the compiler uses — retires the ~200-line compat shim
+/// that `properties.rs` previously carried (see `#314`).
+pub struct CellIndex {
+    pub nouns: HashMap<String, NounDef>,
+    pub fact_types: HashMap<String, FactTypeDef>,
+    pub constraints: Vec<ConstraintDef>,
+    pub derivation_rules: Vec<DerivationRuleDef>,
+    pub subtypes: HashMap<String, String>,
+    pub ref_schemes: HashMap<String, Vec<String>>,
+    pub enum_values: HashMap<String, Vec<String>>,
+    pub general_instance_facts: Vec<GeneralInstanceFact>,
+    pub state_machines: HashMap<String, StateMachineDef>,
 }
 
 /// Build a CellIndex by scanning the cells of state once.
-pub(crate) fn cell_index_from_state(state: &crate::ast::Object) -> CellIndex {
+pub fn cell_index_from_state(state: &crate::ast::Object) -> CellIndex {
     use crate::ast::{fetch_or_phi, binding};
 
     let mut nouns: HashMap<String, NounDef> = HashMap::new();
