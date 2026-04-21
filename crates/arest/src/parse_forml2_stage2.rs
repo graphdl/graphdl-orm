@@ -2045,7 +2045,7 @@ pub fn parse_to_state_via_stage12(text: &str) -> Result<Object, String> {
     let sorted_nouns: Vec<&str> = nouns.iter().map(|s| s.as_str()).collect();
     let noun_buckets = crate::parse_forml2_stage1::NounBuckets::from_sorted(&sorted_nouns);
 
-    let lines = crate::parse_forml2::join_derivation_continuations(text);
+    let lines = crate::parse_forml2::join_derivation_continuations_cow(text);
     if trace { eprintln!("[s12] preproc (reject+nouns+join): {:?}", t_pre.elapsed()); }
     // Accumulate per-statement cells into a single HashMap, then lift
     // to Object::Map once at the end. Previously we did

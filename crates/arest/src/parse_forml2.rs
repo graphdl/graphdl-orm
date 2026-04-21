@@ -1347,11 +1347,23 @@ pub(crate) fn re_resolve_rules(
 /// (constraint blocks under fact type headers, for example) pass
 /// through unchanged.
 pub(crate) fn join_derivation_continuations(input: &str) -> Vec<String> {
-    let raw: Vec<String> = input.lines().map(|s| s.to_string()).collect();
-    let mut out: Vec<String> = Vec::with_capacity(raw.len());
+    join_derivation_continuations_cow(input)
+        .into_iter()
+        .map(|c| c.into_owned())
+        .collect()
+}
+
+/// Cow-returning variant. Non-joined lines stay borrowed from `input`;
+/// only the rare joined-continuation line allocates a fresh `String`.
+/// On core.md-scale inputs (506 lines, ~1% need joining) this skips
+/// ~500 String allocations per parse.
+pub(crate) fn join_derivation_continuations_cow(input: &str) -> Vec<alloc::borrow::Cow<'_, str>> {
+    use alloc::borrow::Cow;
+    let raw: Vec<&str> = input.lines().collect();
+    let mut out: Vec<Cow<'_, str>> = Vec::with_capacity(raw.len());
     let mut i = 0;
     while i < raw.len() {
-        let line = &raw[i];
+        let line = raw[i];
         let stripped = line.trim_start();
         let is_derivation_head = stripped.starts_with("* ")
             || stripped.starts_with("** ")
@@ -1360,7 +1372,7 @@ pub(crate) fn join_derivation_continuations(input: &str) -> Vec<String> {
             || (stripped.contains(" if ") && !stripped.starts_with("If "))
             || stripped.contains(" := ");
         if !is_derivation_head || line.trim_end().ends_with('.') {
-            out.push(line.clone());
+            out.push(Cow::Borrowed(line));
             i += 1;
             continue;
         }
@@ -1368,7 +1380,7 @@ pub(crate) fn join_derivation_continuations(input: &str) -> Vec<String> {
         let mut joined = line.trim_end().to_string();
         let mut j = i + 1;
         while j < raw.len() {
-            let cont = &raw[j];
+            let cont = raw[j];
             let is_indented = cont.starts_with(' ') || cont.starts_with('\t');
             if !is_indented || cont.trim().is_empty() { break; }
             joined.push(' ');
@@ -1377,7 +1389,7 @@ pub(crate) fn join_derivation_continuations(input: &str) -> Vec<String> {
             j += 1;
             if terminated { break; }
         }
-        out.push(joined);
+        out.push(Cow::Owned(joined));
         i = j;
     }
     out
