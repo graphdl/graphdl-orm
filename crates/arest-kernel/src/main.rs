@@ -25,6 +25,7 @@
 #![no_std]
 #![no_main]
 #![feature(abi_x86_interrupt)]
+#![feature(naked_functions)]
 
 extern crate alloc;
 
@@ -37,6 +38,7 @@ mod net;
 mod pci;
 mod repl;
 mod serial;
+mod syscall;
 mod system;
 mod userspace;
 mod virtio;
@@ -76,6 +78,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         println!("AREST kernel online");
         println!("  mode: ring3-smoke — launching test payload");
         memory::init(boot_info);
+        syscall::init();
         userspace::launch_test_payload();
     }
 
