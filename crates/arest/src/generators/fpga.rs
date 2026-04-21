@@ -14,7 +14,6 @@
 
 use crate::ast::{binding, fetch_or_phi, Object};
 use crate::rmap::{self, TableDef};
-use crate::types::StateMachineDef;
 #[allow(unused_imports)]
 use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 
@@ -84,7 +83,7 @@ pub fn compile_to_verilog(state: &Object) -> String {
     // State-machine modules. Each SM declared in state gets a module
     // with (clk, rst_n, event_code, status) ports and a case-dispatch
     // transition table keyed on (current status, event code).
-    let (sm_modules, sm_specs) = emit_sm_modules(&state_machines_from_state(state));
+    let (sm_modules, sm_specs) = emit_sm_modules(state);
     modules.extend(sm_modules);
 
     // Per-noun BRAM cell memory map (#166). One dual-port bank per
@@ -197,60 +196,91 @@ endmodule
 /// code; otherwise a two-level case dispatch on `(current_status,
 /// event_code)` either advances to the destination status or holds.
 ///
-/// Extract state machines directly from InstanceFact cells in state.
-/// No Domain round-trip — reads the same cells domain_to_state would.
-fn state_machines_from_state(state: &Object) -> hashbrown::HashMap<String, StateMachineDef> {
-    let inst = fetch_or_phi("InstanceFact", state);
-    let facts = inst.as_seq().unwrap_or(&[]);
-    let b = |f: &Object, k: &str| binding(f, k).unwrap_or("").to_string();
+// ── State-machine cell readers (#325) ──────────────────────────────
+//
+// State machines land in `InstanceFact` cells during parse; the FPGA
+// emitter used to pre-materialise `HashMap<String, StateMachineDef>`
+// here, then hand it to `emit_sm_modules`. That's the Domain-IR
+// anti-pattern — typed struct view over cells. Replaced with per-use
+// cell reads.
+//
+// InstanceFact row shapes:
+//   subjectNoun="State Machine Definition" subjectValue=<sm_name>
+//     fieldName contains "is for" objectValue=<noun_name>
+//   subjectNoun="Status" subjectValue=<status>
+//     fieldName contains "defined in" objectValue=<sm_name>
+//   subjectNoun="Transition" subjectValue=<event>
+//     fieldName contains "from" | "to" | "triggered" objectValue=<…>
 
-    let mut sms: hashbrown::HashMap<String, StateMachineDef> = hashbrown::HashMap::new();
-    // "State Machine Definition 'X' is for Noun 'Y'"
-    for f in facts.iter().filter(|f| b(f, "subjectNoun") == "State Machine Definition" && b(f, "fieldName").contains("is for")) {
-        let sm_name = b(f, "subjectValue");
-        let noun = b(f, "objectValue");
-        sms.entry(noun).or_insert_with(|| StateMachineDef {
-            noun_name: sm_name, statuses: vec![], transitions: vec![],
-            initial: String::new(),
-        });
-    }
-    // "Status 'Z' is defined in State Machine Definition 'X'"
-    for f in facts.iter().filter(|f| b(f, "subjectNoun") == "Status" && b(f, "fieldName").contains("defined in")) {
-        let status = b(f, "subjectValue");
-        let sm_name = b(f, "objectValue");
-        if let Some(sm) = sms.values_mut().find(|s| s.noun_name == sm_name) {
-            if !sm.statuses.contains(&status) { sm.statuses.push(status); }
+/// Every `(sm_name, noun_name)` pair declared by a
+/// "State Machine Definition … is for …" instance fact, sorted by
+/// `noun_name` for deterministic emitter output.
+fn sm_entries(state: &Object) -> Vec<(String, String)> {
+    let inst = fetch_or_phi("InstanceFact", state);
+    let Some(facts) = inst.as_seq() else { return vec![]; };
+    let mut out: Vec<(String, String)> = facts.iter().filter_map(|f| {
+        if binding(f, "subjectNoun") != Some("State Machine Definition") { return None; }
+        let field = binding(f, "fieldName")?;
+        if !field.contains("is for") { return None; }
+        let sm_name = binding(f, "subjectValue")?.to_string();
+        let noun_name = binding(f, "objectValue")?.to_string();
+        Some((sm_name, noun_name))
+    }).collect();
+    out.sort_by(|a, b| a.1.cmp(&b.1));
+    out
+}
+
+/// Statuses for a given SM, in declaration order.
+fn sm_statuses(state: &Object, sm_name: &str) -> Vec<String> {
+    let inst = fetch_or_phi("InstanceFact", state);
+    let Some(facts) = inst.as_seq() else { return vec![]; };
+    let mut out: Vec<String> = Vec::new();
+    for f in facts.iter().filter(|f|
+        binding(f, "subjectNoun") == Some("Status")
+        && binding(f, "fieldName").map(|s| s.contains("defined in")).unwrap_or(false)
+        && binding(f, "objectValue") == Some(sm_name))
+    {
+        if let Some(s) = binding(f, "subjectValue") {
+            let s = s.to_string();
+            if !out.contains(&s) { out.push(s); }
         }
     }
-    // Transitions
-    for f in facts.iter().filter(|f| b(f, "subjectNoun") == "Transition") {
-        let trans_name = b(f, "subjectValue");
-        let field = b(f, "fieldName");
-        let value = b(f, "objectValue");
-        for sm in sms.values_mut() {
-            let t = sm.transitions.iter_mut().find(|t| t.event == trans_name);
-            match t {
-                Some(t) => {
-                    if field.contains("from") { t.from = value.clone(); }
-                    if field.contains("to") { t.to = value.clone(); }
-                }
-                None => {
-                    let mut td = crate::types::TransitionDef { event: trans_name.clone(), from: String::new(), to: String::new(), guard: None };
-                    if field.contains("from") { td.from = value.clone(); }
-                    if field.contains("to") { td.to = value.clone(); }
-                    if field.contains("triggered") { td.event = value.clone(); }
-                    sm.transitions.push(td);
-                }
+    out
+}
+
+/// Transitions for a given SM as `(event, from, to)` tuples.
+fn sm_transitions(state: &Object) -> Vec<(String, String, String)> {
+    let inst = fetch_or_phi("InstanceFact", state);
+    let Some(facts) = inst.as_seq() else { return vec![]; };
+    let mut by_event: Vec<(String, String, String)> = Vec::new();
+    for f in facts.iter().filter(|f| binding(f, "subjectNoun") == Some("Transition")) {
+        let Some(event) = binding(f, "subjectValue").map(String::from) else { continue };
+        let field = binding(f, "fieldName").unwrap_or("");
+        let value = binding(f, "objectValue").unwrap_or("").to_string();
+        let slot = by_event.iter_mut().find(|(e, _, _)| *e == event);
+        match slot {
+            Some((_, from, to)) => {
+                if field.contains("from") { *from = value; }
+                else if field.contains("to") { *to = value; }
+            }
+            None => {
+                let mut from = String::new();
+                let mut to = String::new();
+                let mut ev = event.clone();
+                if field.contains("from") { from = value; }
+                else if field.contains("to") { to = value; }
+                else if field.contains("triggered") { ev = value; }
+                by_event.push((ev, from, to));
             }
         }
     }
-    sms
+    by_event
 }
 
-/// Status codes are assigned by position in `StateMachineDef::statuses`
-/// (compile-time deterministic per SM). Event codes are FNV-1a 32-bit
-/// hashes of the event string, so external drivers encode events the
-/// same way when pushing into `event_code`.
+/// Status codes are assigned by declaration order (compile-time
+/// deterministic per SM). Event codes are FNV-1a 32-bit hashes of the
+/// event string, so external drivers encode events the same way when
+/// pushing into `event_code`.
 ///
 /// Unknown events from the current status are held (default arm) —
 /// matching the AREST machine fold's "invalid events are no-ops"
@@ -259,23 +289,23 @@ fn state_machines_from_state(state: &Object) -> hashbrown::HashMap<String, State
 ///
 /// Returns (module_text, (name, status_width)) pairs so the top
 /// emitter can size the status wire it declares for each SM.
-fn emit_sm_modules(sms: &hashbrown::HashMap<String, crate::types::StateMachineDef>) -> (Vec<String>, Vec<(String, usize)>) {
-    let mut entries: Vec<(&String, &crate::types::StateMachineDef)> = sms.iter().collect();
-    entries.sort_by(|a, b| a.0.cmp(b.0));
+fn emit_sm_modules(state: &Object) -> (Vec<String>, Vec<(String, usize)>) {
     let mut modules: Vec<String> = Vec::new();
     let mut specs: Vec<(String, usize)> = Vec::new();
-    for (_, sm) in entries {
-        if sm.statuses.is_empty() { continue; }
-        let module_name = sanitize(&format!("sm_{}", sm.noun_name));
-        let status_count = sm.statuses.len();
+    let all_transitions = sm_transitions(state);
+    for (sm_name, noun_name) in sm_entries(state) {
+        let statuses = sm_statuses(state, &sm_name);
+        if statuses.is_empty() { continue; }
+        let module_name = sanitize(&format!("sm_{}", noun_name));
+        let status_count = statuses.len();
         // Width = ceil(log2(max(count, 2))). Needs at least 1 bit.
         let status_width = core::cmp::max(
             1,
             (status_count.max(2) as f64).log2().ceil() as usize,
         );
-        let status_codes: hashbrown::HashMap<&str, usize> = sm.statuses.iter()
+        let status_codes: hashbrown::HashMap<&str, usize> = statuses.iter()
             .enumerate().map(|(i, s)| (s.as_str(), i)).collect();
-        let initial_code = status_codes.get(sm.statuses[0].as_str()).copied().unwrap_or(0);
+        let initial_code = 0usize; // first status in declaration order
 
         let mut m = String::new();
         m.push_str(&format!("module {module_name} (\n"));
@@ -285,32 +315,38 @@ fn emit_sm_modules(sms: &hashbrown::HashMap<String, crate::types::StateMachineDe
         m.push_str(&format!("    output reg [{}:0] status\n", status_width.saturating_sub(1)));
         m.push_str(");\n");
         m.push_str("    // Status codes (position in SM definition):\n");
-        for (i, s) in sm.statuses.iter().enumerate() {
+        for (i, s) in statuses.iter().enumerate() {
             m.push_str(&format!("    //   {status_width}'d{i} = {s}\n"));
         }
         m.push_str("    always @(posedge clk) begin\n");
         m.push_str("        if (!rst_n) begin\n");
         m.push_str(&format!("            status <= {status_width}'d{initial_code};\n"));
         m.push_str("        end else begin\n");
-        if sm.transitions.is_empty() {
+        // Transitions that belong to THIS SM: their from/to are in
+        // our status set.
+        let local_transitions: Vec<&(String, String, String)> = all_transitions.iter()
+            .filter(|(_, from, to)| status_codes.contains_key(from.as_str())
+                || status_codes.contains_key(to.as_str()))
+            .collect();
+        if local_transitions.is_empty() {
             m.push_str("            status <= status;\n");
         } else {
             // Group transitions by from-status.
-            let mut by_from: alloc::collections::BTreeMap<&str, Vec<&crate::types::TransitionDef>>
+            let mut by_from: alloc::collections::BTreeMap<&str, Vec<&(String, String, String)>>
                 = alloc::collections::BTreeMap::new();
-            for t in &sm.transitions {
-                by_from.entry(t.from.as_str()).or_default().push(t);
+            for t in &local_transitions {
+                by_from.entry(t.1.as_str()).or_default().push(t);
             }
             m.push_str("            case (status)\n");
             for (from, ts) in &by_from {
                 let from_code = status_codes.get(from).copied().unwrap_or(0);
                 m.push_str(&format!("                {status_width}'d{from_code}: case (event_code)\n"));
-                for t in ts {
-                    let to_code = status_codes.get(t.to.as_str()).copied().unwrap_or(0);
-                    let event_code = fnv1a_32(&t.event);
+                for (event, _from, to) in ts {
+                    let to_code = status_codes.get(to.as_str()).copied().unwrap_or(0);
+                    let event_code = fnv1a_32(event);
                     m.push_str(&format!(
                         "                    32'd{event_code}: status <= {status_width}'d{to_code};  // {}\n",
-                        t.event,
+                        event,
                     ));
                 }
                 m.push_str("                    default: status <= status;\n");
@@ -3107,20 +3143,59 @@ Counter has Count.
             "write data tied to zero:\n{}", verilog);
     }
 
+    // Test helper: build an Object state containing one SM's
+    // `InstanceFact` rows. Each row is a `fact_from_pairs` of the
+    // shape the parser produces. Tests that used to build typed
+    // `StateMachineDef` literals now assemble cells.
+    fn sm_state(
+        sm_name: &str,
+        noun_name: &str,
+        statuses: &[&str],
+        transitions: &[(&str, &str, &str)], // (from, to, event)
+    ) -> Object {
+        use crate::ast::fact_from_pairs;
+        let mut facts: Vec<Object> = Vec::new();
+        facts.push(fact_from_pairs(&[
+            ("subjectNoun", "State Machine Definition"),
+            ("subjectValue", sm_name),
+            ("fieldName", "is for"),
+            ("objectValue", noun_name),
+        ]));
+        for s in statuses {
+            facts.push(fact_from_pairs(&[
+                ("subjectNoun", "Status"),
+                ("subjectValue", s),
+                ("fieldName", "defined in"),
+                ("objectValue", sm_name),
+            ]));
+        }
+        for (from, to, event) in transitions {
+            facts.push(fact_from_pairs(&[
+                ("subjectNoun", "Transition"),
+                ("subjectValue", event),
+                ("fieldName", "from"),
+                ("objectValue", from),
+            ]));
+            facts.push(fact_from_pairs(&[
+                ("subjectNoun", "Transition"),
+                ("subjectValue", event),
+                ("fieldName", "to"),
+                ("objectValue", to),
+            ]));
+        }
+        let mut map: hashbrown::HashMap<String, Object> = hashbrown::HashMap::new();
+        map.insert("InstanceFact".to_string(), Object::seq(facts));
+        Object::Map(map)
+    }
+
     #[test]
     fn sm_module_emits_case_dispatch_with_status_codes() {
-        use crate::types::{StateMachineDef, TransitionDef};
-        let mut sms = hashbrown::HashMap::new();
-        sms.insert("Order".to_string(), StateMachineDef {
-            noun_name: "Order".to_string(),
-            statuses: vec!["Draft".to_string(), "Placed".to_string(), "Shipped".to_string()],
-            transitions: vec![
-                TransitionDef { from: "Draft".to_string(), to: "Placed".to_string(), event: "place".to_string(), guard: None },
-                TransitionDef { from: "Placed".to_string(), to: "Shipped".to_string(), event: "ship".to_string(), guard: None },
-            ],
-            initial: String::new(),
-        });
-        let (modules, specs) = emit_sm_modules(&sms);
+        let state = sm_state(
+            "Order Lifecycle", "Order",
+            &["Draft", "Placed", "Shipped"],
+            &[("Draft", "Placed", "place"), ("Placed", "Shipped", "ship")],
+        );
+        let (modules, specs) = emit_sm_modules(&state);
         assert_eq!(modules.len(), 1);
         assert_eq!(specs[0].0, "sm_order");
         assert_eq!(specs[0].1, 2, "3 statuses → 2-bit width");
@@ -3151,38 +3226,32 @@ Counter has Count.
 
     #[test]
     fn sm_module_with_two_statuses_uses_1bit_width() {
-        use crate::types::{StateMachineDef, TransitionDef};
-        let mut sms = hashbrown::HashMap::new();
-        sms.insert("Door".to_string(), StateMachineDef {
-            noun_name: "Door".to_string(),
-            statuses: vec!["Closed".to_string(), "Open".to_string()],
-            transitions: vec![
-                TransitionDef { from: "Closed".to_string(), to: "Open".to_string(), event: "open".to_string(), guard: None },
-            ],
-            initial: String::new(),
-        });
-        let (_modules, specs) = emit_sm_modules(&sms);
+        let state = sm_state(
+            "Door Lifecycle", "Door",
+            &["Closed", "Open"],
+            &[("Closed", "Open", "open")],
+        );
+        let (_modules, specs) = emit_sm_modules(&state);
         assert_eq!(specs[0].1, 1, "2 statuses → 1-bit width");
     }
 
     #[test]
     fn sm_module_empty_sms_map_produces_nothing() {
-        let (modules, specs) = emit_sm_modules(&hashbrown::HashMap::new());
+        // State with no InstanceFact cell → no SM modules.
+        let state = Object::Map(hashbrown::HashMap::new());
+        let (modules, specs) = emit_sm_modules(&state);
         assert!(modules.is_empty());
         assert!(specs.is_empty());
     }
 
     #[test]
     fn sm_module_without_transitions_holds_initial() {
-        use crate::types::StateMachineDef;
-        let mut sms = hashbrown::HashMap::new();
-        sms.insert("Frozen".to_string(), StateMachineDef {
-            noun_name: "Frozen".to_string(),
-            statuses: vec!["Only".to_string()],
-            transitions: vec![],
-            initial: String::new(),
-        });
-        let (modules, _specs) = emit_sm_modules(&sms);
+        let state = sm_state(
+            "Frozen Lifecycle", "Frozen",
+            &["Only"],
+            &[],
+        );
+        let (modules, _specs) = emit_sm_modules(&state);
         // Transition table absent → always holds status.
         assert!(modules[0].contains("status <= status;"),
             "no-transition SM must hold status:\n{}", modules[0]);
