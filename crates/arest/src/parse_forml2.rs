@@ -1195,18 +1195,41 @@ pub fn nouns_from_state(state: &crate::ast::Object) -> HashMap<String, NounDef> 
         .unwrap_or_default()
 }
 
-/// Extract fact types directly from the FactType cell in D.
+/// Extract fact types directly from the FactType cell in D, with
+/// roles resolved from the `Role` cell. Replaces the earlier
+/// `roles: vec![]` stub — callers no longer need a per-caller compat
+/// shim (see `_reports/e3-handoff-2026-04-20.md` §"Ownership #2").
 pub fn fact_types_from_state(state: &crate::ast::Object) -> HashMap<String, FactTypeDef> {
     use crate::ast::{fetch_or_phi, binding};
+    // Pre-collect Role cell facts so each FactType iteration is O(|R|)
+    // rather than re-fetching per FT.
+    let role_cell = fetch_or_phi("Role", state);
+    let role_facts: Vec<&crate::ast::Object> = role_cell.as_seq()
+        .map(|s| s.iter().collect())
+        .unwrap_or_default();
     fetch_or_phi("FactType", state)
         .as_seq().map(|facts| facts.iter().filter_map(|f| {
             let id = binding(f, "id")?.to_string();
             let reading = binding(f, "reading").unwrap_or("").to_string();
+            // Gather role entries whose `factType` binding matches
+            // this FT id, then sort by `position` so `role_index`
+            // reflects declaration order.
+            let mut roles: Vec<RoleDef> = role_facts.iter()
+                .filter(|r| binding(r, "factType") == Some(id.as_str()))
+                .filter_map(|r| {
+                    let noun_name = binding(r, "nounName")?.to_string();
+                    let role_index = binding(r, "position")
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .unwrap_or(0);
+                    Some(RoleDef { noun_name, role_index })
+                })
+                .collect();
+            roles.sort_by_key(|r| r.role_index);
             Some((id, FactTypeDef {
                 schema_id: String::new(),
                 reading,
                 readings: vec![],
-                roles: vec![], // roles resolved separately if needed
+                roles,
             }))
         }).collect())
         .unwrap_or_default()
