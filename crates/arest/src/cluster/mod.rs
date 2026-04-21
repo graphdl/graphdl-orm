@@ -22,6 +22,8 @@
 
 pub mod transport;
 
+use crate::ast::Object;
+use crate::freeze::{freeze, thaw};
 use alloc::sync::Arc;
 use hashbrown::HashMap;
 use std::net::SocketAddr;
@@ -175,6 +177,189 @@ pub enum GossipMsg {
     Join { from: NodeId, addr: SocketAddr, incarnation: u64 },
     JoinAck { members: Vec<Delta> },
     Leave { from: NodeId, incarnation: u64 },
+}
+
+/// Serialize a GossipMsg to bytes via freeze (#185). The cluster
+/// protocol reuses AREST's canonical byte format — any consumer of
+/// frozen Objects (the FPGA boot ROM, future mTLS framing in
+/// Cluster-5) understands these bytes without a second codec.
+pub fn encode(msg: &GossipMsg) -> Vec<u8> {
+    freeze(&msg.to_object())
+}
+
+/// Deserialize bytes into a GossipMsg. Returns an error on bad
+/// magic, truncated input, unknown tags, or a well-formed Object
+/// that doesn't match any GossipMsg shape. The UDP transport drops
+/// errors silently — gossip is lossy by design.
+pub fn decode(bytes: &[u8]) -> Result<GossipMsg, String> {
+    GossipMsg::from_object(&thaw(bytes)?)
+}
+
+// Encoding keys — one constant per field so typos fail at compile
+// time, not at wire-decode time.
+const K_TYPE: &str = "type";
+const K_FROM: &str = "from";
+const K_SEQ: &str = "seq";
+const K_PIGGYBACK: &str = "piggyback";
+const K_TARGET: &str = "target";
+const K_ADDR: &str = "addr";
+const K_INCARNATION: &str = "incarnation";
+const K_MEMBERS: &str = "members";
+const K_ID: &str = "id";
+const K_STATE: &str = "state";
+
+const T_PING: &str = "ping";
+const T_ACK: &str = "ack";
+const T_PING_REQ: &str = "pingreq";
+const T_JOIN: &str = "join";
+const T_JOIN_ACK: &str = "joinack";
+const T_LEAVE: &str = "leave";
+
+const S_ALIVE: &str = "alive";
+const S_SUSPECT: &str = "suspect";
+const S_LEFT: &str = "left";
+const S_DEAD: &str = "dead";
+
+impl State {
+    fn wire_str(&self) -> &'static str {
+        match self {
+            State::Alive => S_ALIVE,
+            State::Suspect => S_SUSPECT,
+            State::Left => S_LEFT,
+            State::Dead => S_DEAD,
+        }
+    }
+
+    fn from_wire(s: &str) -> Result<Self, String> {
+        match s {
+            S_ALIVE => Ok(State::Alive),
+            S_SUSPECT => Ok(State::Suspect),
+            S_LEFT => Ok(State::Left),
+            S_DEAD => Ok(State::Dead),
+            other => Err(format!("unknown state on wire: {other:?}")),
+        }
+    }
+}
+
+impl Delta {
+    fn to_object(&self) -> Object {
+        let mut m: hashbrown::HashMap<String, Object> = hashbrown::HashMap::new();
+        m.insert(K_ID.into(), Object::atom(&self.id));
+        m.insert(K_ADDR.into(), Object::atom(&self.addr.to_string()));
+        m.insert(K_INCARNATION.into(), Object::atom(&self.incarnation.to_string()));
+        m.insert(K_STATE.into(), Object::atom(self.state.wire_str()));
+        Object::Map(m)
+    }
+
+    fn from_object(obj: &Object) -> Result<Self, String> {
+        let m = obj.as_map().ok_or_else(|| "Delta: expected Map".to_string())?;
+        Ok(Delta {
+            id: map_atom(m, K_ID)?.to_string(),
+            addr: map_atom(m, K_ADDR)?
+                .parse()
+                .map_err(|e| format!("Delta.addr parse: {e}"))?,
+            incarnation: map_atom(m, K_INCARNATION)?
+                .parse()
+                .map_err(|e| format!("Delta.incarnation parse: {e}"))?,
+            state: State::from_wire(map_atom(m, K_STATE)?)?,
+        })
+    }
+}
+
+impl GossipMsg {
+    pub fn to_object(&self) -> Object {
+        let mut m: hashbrown::HashMap<String, Object> = hashbrown::HashMap::new();
+        match self {
+            GossipMsg::Ping { from, seq, piggyback } => {
+                m.insert(K_TYPE.into(), Object::atom(T_PING));
+                m.insert(K_FROM.into(), Object::atom(from));
+                m.insert(K_SEQ.into(), Object::atom(&seq.to_string()));
+                m.insert(K_PIGGYBACK.into(), deltas_to_seq(piggyback));
+            }
+            GossipMsg::Ack { from, seq, piggyback } => {
+                m.insert(K_TYPE.into(), Object::atom(T_ACK));
+                m.insert(K_FROM.into(), Object::atom(from));
+                m.insert(K_SEQ.into(), Object::atom(&seq.to_string()));
+                m.insert(K_PIGGYBACK.into(), deltas_to_seq(piggyback));
+            }
+            GossipMsg::PingReq { from, target, seq } => {
+                m.insert(K_TYPE.into(), Object::atom(T_PING_REQ));
+                m.insert(K_FROM.into(), Object::atom(from));
+                m.insert(K_TARGET.into(), Object::atom(target));
+                m.insert(K_SEQ.into(), Object::atom(&seq.to_string()));
+            }
+            GossipMsg::Join { from, addr, incarnation } => {
+                m.insert(K_TYPE.into(), Object::atom(T_JOIN));
+                m.insert(K_FROM.into(), Object::atom(from));
+                m.insert(K_ADDR.into(), Object::atom(&addr.to_string()));
+                m.insert(K_INCARNATION.into(), Object::atom(&incarnation.to_string()));
+            }
+            GossipMsg::JoinAck { members } => {
+                m.insert(K_TYPE.into(), Object::atom(T_JOIN_ACK));
+                m.insert(K_MEMBERS.into(), deltas_to_seq(members));
+            }
+            GossipMsg::Leave { from, incarnation } => {
+                m.insert(K_TYPE.into(), Object::atom(T_LEAVE));
+                m.insert(K_FROM.into(), Object::atom(from));
+                m.insert(K_INCARNATION.into(), Object::atom(&incarnation.to_string()));
+            }
+        }
+        Object::Map(m)
+    }
+
+    pub fn from_object(obj: &Object) -> Result<Self, String> {
+        let m = obj.as_map().ok_or_else(|| "GossipMsg: expected Map".to_string())?;
+        match map_atom(m, K_TYPE)? {
+            T_PING => Ok(GossipMsg::Ping {
+                from: map_atom(m, K_FROM)?.to_string(),
+                seq: map_atom(m, K_SEQ)?.parse().map_err(|e| format!("seq parse: {e}"))?,
+                piggyback: seq_to_deltas(m.get(K_PIGGYBACK).ok_or("piggyback missing")?)?,
+            }),
+            T_ACK => Ok(GossipMsg::Ack {
+                from: map_atom(m, K_FROM)?.to_string(),
+                seq: map_atom(m, K_SEQ)?.parse().map_err(|e| format!("seq parse: {e}"))?,
+                piggyback: seq_to_deltas(m.get(K_PIGGYBACK).ok_or("piggyback missing")?)?,
+            }),
+            T_PING_REQ => Ok(GossipMsg::PingReq {
+                from: map_atom(m, K_FROM)?.to_string(),
+                target: map_atom(m, K_TARGET)?.to_string(),
+                seq: map_atom(m, K_SEQ)?.parse().map_err(|e| format!("seq parse: {e}"))?,
+            }),
+            T_JOIN => Ok(GossipMsg::Join {
+                from: map_atom(m, K_FROM)?.to_string(),
+                addr: map_atom(m, K_ADDR)?.parse().map_err(|e| format!("addr parse: {e}"))?,
+                incarnation: map_atom(m, K_INCARNATION)?
+                    .parse()
+                    .map_err(|e| format!("incarnation parse: {e}"))?,
+            }),
+            T_JOIN_ACK => Ok(GossipMsg::JoinAck {
+                members: seq_to_deltas(m.get(K_MEMBERS).ok_or("members missing")?)?,
+            }),
+            T_LEAVE => Ok(GossipMsg::Leave {
+                from: map_atom(m, K_FROM)?.to_string(),
+                incarnation: map_atom(m, K_INCARNATION)?
+                    .parse()
+                    .map_err(|e| format!("incarnation parse: {e}"))?,
+            }),
+            other => Err(format!("GossipMsg: unknown type {other:?}")),
+        }
+    }
+}
+
+fn map_atom<'a>(m: &'a hashbrown::HashMap<String, Object>, key: &str) -> Result<&'a str, String> {
+    m.get(key)
+        .ok_or_else(|| format!("missing key {key:?}"))?
+        .as_atom()
+        .ok_or_else(|| format!("key {key:?} not an Atom"))
+}
+
+fn deltas_to_seq(deltas: &[Delta]) -> Object {
+    Object::Seq(deltas.iter().map(Delta::to_object).collect::<Vec<_>>().into())
+}
+
+fn seq_to_deltas(obj: &Object) -> Result<Vec<Delta>, String> {
+    let items = obj.as_seq().ok_or_else(|| "deltas: expected Seq".to_string())?;
+    items.iter().map(Delta::from_object).collect()
 }
 
 /// Gossip timing configuration. `Default` yields the paper's
@@ -697,6 +882,106 @@ mod tests {
                 assert_eq!(m.state, State::Alive, "{name} sees {peer} as {:?}", m.state);
             }
         }
+    }
+
+    // ── Wire roundtrip tests ─────────────────────────────────────────
+
+    fn wire_roundtrip(msg: GossipMsg) {
+        let bytes = encode(&msg);
+        let decoded = decode(&bytes).unwrap_or_else(|e| panic!("decode({msg:?}): {e}"));
+        assert_eq!(msg, decoded, "roundtrip of {:?}", decoded);
+    }
+
+    fn sample_delta(id: &str, port: u16, incarnation: u64, state: State) -> Delta {
+        Delta { id: id.into(), addr: addr(port), incarnation, state }
+    }
+
+    #[test]
+    fn wire_roundtrip_ping() {
+        wire_roundtrip(GossipMsg::Ping {
+            from: "a".into(),
+            seq: 42,
+            piggyback: vec![
+                sample_delta("a", 1000, 0, State::Alive),
+                sample_delta("b", 2000, 3, State::Suspect),
+            ],
+        });
+    }
+
+    #[test]
+    fn wire_roundtrip_ack() {
+        wire_roundtrip(GossipMsg::Ack {
+            from: "b".into(),
+            seq: 7,
+            piggyback: vec![sample_delta("c", 3000, 1, State::Dead)],
+        });
+    }
+
+    #[test]
+    fn wire_roundtrip_ack_empty_piggyback() {
+        wire_roundtrip(GossipMsg::Ack {
+            from: "b".into(),
+            seq: 0,
+            piggyback: vec![],
+        });
+    }
+
+    #[test]
+    fn wire_roundtrip_ping_req() {
+        wire_roundtrip(GossipMsg::PingReq {
+            from: "a".into(),
+            target: "c".into(),
+            seq: 99,
+        });
+    }
+
+    #[test]
+    fn wire_roundtrip_join() {
+        wire_roundtrip(GossipMsg::Join {
+            from: "newbie".into(),
+            addr: addr(4040),
+            incarnation: 0,
+        });
+    }
+
+    #[test]
+    fn wire_roundtrip_join_ack() {
+        wire_roundtrip(GossipMsg::JoinAck {
+            members: vec![
+                sample_delta("a", 1000, 0, State::Alive),
+                sample_delta("b", 2000, 5, State::Alive),
+                sample_delta("c", 3000, 2, State::Left),
+            ],
+        });
+    }
+
+    #[test]
+    fn wire_roundtrip_leave() {
+        wire_roundtrip(GossipMsg::Leave {
+            from: "graceful".into(),
+            incarnation: 12,
+        });
+    }
+
+    #[test]
+    fn decode_empty_bytes_errors() {
+        assert!(decode(&[]).is_err());
+    }
+
+    #[test]
+    fn decode_bad_magic_errors() {
+        let garbage = vec![0xffu8; 32];
+        assert!(decode(&garbage).is_err());
+    }
+
+    #[test]
+    fn decode_unknown_type_errors() {
+        // A well-formed frozen Map with an unrecognised "type" value.
+        let mut m: hashbrown::HashMap<String, Object> = hashbrown::HashMap::new();
+        m.insert("type".into(), Object::atom("nope"));
+        let bytes = freeze(&Object::Map(m));
+        let err = decode(&bytes).unwrap_err();
+        assert!(err.contains("unknown type"), "error was {err:?}");
     }
 
     /// Acceptance test #2 (handoff): a node going silent is marked
