@@ -352,6 +352,73 @@ User has Permission.
         "missing antecedent must suppress derivation, got {:#?}", derived);
 }
 
+// ─── Category 10: Parameter-atom-in-rule-body (#275) ────────────────
+//
+// Shape: `* X has Q iff X has P '<v>'` — only the antecedent carries a
+// role-literal predicate; the consequent inherits antecedent bindings
+// whole (bindings_func = Func::Id, no literal pin, no arith). Distinct
+// from Category 3 (which populates BOTH antecedent and consequent
+// literals, triggering the fresh-bindings path). This test isolates
+// the Filter-predicate path from #286 / #275 so a regression in the
+// antecedent-side literal compile doesn't hide behind the fresh-
+// bindings path.
+
+#[test]
+fn shape_parameter_atom_in_rule_body_filters_antecedent_only() {
+    let src = r#"# Test
+Task(.ID) is an entity type.
+ID is a value type.
+Priority is a value type.
+Escalation is a value type.
+
+## Fact Types
+Task has ID.
+Task has Priority.
+Task has Escalation.
+
+## Derivation Rules
+* Task has Escalation iff Task has Priority 'critical'.
+"#;
+    let (rule, func) = parse_and_compile(src);
+
+    assert_eq!(rule.antecedent_sources.len(), 1);
+    assert!(
+        rule.antecedent_role_literals.iter().any(|l|
+            l.role == "Priority" && l.value == "critical" && l.antecedent_index == 0),
+        "expected antecedent_role_literals to pin Priority='critical', got {:#?}",
+        rule.antecedent_role_literals,
+    );
+    assert!(
+        rule.consequent_role_literals.is_empty(),
+        "no consequent literal pin — bindings come from antecedent via Func::Id, got {:#?}",
+        rule.consequent_role_literals,
+    );
+    assert!(
+        rule.consequent_computed_bindings.is_empty(),
+        "no arith on the consequent, got {:#?}", rule.consequent_computed_bindings,
+    );
+
+    // Filter keeps only the matching antecedent fact.
+    let out = apply_to_facts(&func, &[
+        ("Task_has_Priority", &[("Task", "t-crit"), ("Priority", "critical")]),
+        ("Task_has_Priority", &[("Task", "t-low"),  ("Priority", "low")]),
+    ]);
+    let derived = decode_derived(&out);
+    assert_eq!(derived.len(), 1, "only the critical Task should derive, got {:#?}", derived);
+    let (_ft, _reading, bindings) = &derived[0];
+    assert!(
+        bindings.iter().any(|(k, v)| k == "Task" && v == "t-crit"),
+        "expected Task='t-crit', got {:#?}", bindings,
+    );
+
+    // Nothing matching → no derivation.
+    let out = apply_to_facts(&func, &[
+        ("Task_has_Priority", &[("Task", "t-low"), ("Priority", "low")]),
+    ]);
+    assert!(decode_derived(&out).is_empty(),
+        "no matching Priority literal → no derivation");
+}
+
 // ─── Category 2: AntecedentRole (deferred) ──────────────────────────
 //
 // `ConsequentCellSource::AntecedentRole` is declared on the type and
