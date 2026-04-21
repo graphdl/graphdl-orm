@@ -860,6 +860,37 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
         return cite_id;
     }
 
+    // ── Re-derive FFI (#305 follow-up to #14/#15) ────────────────────
+    //
+    //   system(h, "re_derive", "") → "<count>"
+    //
+    // Runs forward chaining (derivation rules) to lfp over the current
+    // D, writing all newly-derived facts into their declared
+    // consequent cells. Returns the count of newly-derived facts as a
+    // decimal string.
+    //
+    // The standard path (command::create_via_defs) runs forward
+    // chaining inline when a create command fires. federated_ingest
+    // and register_runtime_fn bypass that path — they push facts
+    // directly without retriggering lfp. This FFI is the opt-in
+    // trigger for hosts that want derivations to fire over federated
+    // or runtime-ingested facts.
+    if key == "re_derive" {
+        let mut st = tenant.write();
+        let snapshot = st.snapshot_d();
+        let derivation_defs_owned: Vec<(String, ast::Func)> = ast::cells_iter(&snapshot)
+            .into_iter()
+            .filter(|(n, _)| n.starts_with("derivation:"))
+            .map(|(n, contents)| (n.to_string(), ast::metacompose(contents, &snapshot)))
+            .collect();
+        let refs: Vec<(&str, &ast::Func)> = derivation_defs_owned.iter()
+            .map(|(n, f)| (n.as_str(), f))
+            .collect();
+        let (new_d, derived) = crate::evaluate::forward_chain_defs_state(&refs, &snapshot);
+        st.replace_d(new_d);
+        return format!("{}", derived.len());
+    }
+
     if key == "snapshot" {
         let mut st = tenant.write();
         let label = if input.is_empty() {
@@ -1997,6 +2028,31 @@ Order has total.
         let result = system_impl(h, "register:bad", "not valid hex");
         assert_eq!(result, "⊥",
             "register: with malformed hex payload must return ⊥; got {result}");
+        release_impl(h);
+    }
+
+    /// re_derive FFI (#305): explicit opt-in trigger for forward-
+    /// chaining after federated_ingest / register_runtime_fn bypass
+    /// the create-time lfp loop. On a bare handle with zero derivation
+    /// rules, re_derive is a no-op and returns "0".
+    #[test]
+    fn system_re_derive_returns_zero_when_no_rules_present() {
+        let h = create_bare_impl();
+        let result = system_impl(h, "re_derive", "");
+        assert_eq!(result, "0",
+            "re_derive on a bare handle must report 0 newly-derived facts; got {result}");
+        release_impl(h);
+    }
+
+    /// re_derive is idempotent: re-running on a state that is already
+    /// at lfp returns 0 — no new facts appear.
+    #[test]
+    fn system_re_derive_is_idempotent_at_lfp() {
+        let h = create_bare_impl();
+        let _first = system_impl(h, "re_derive", "");
+        let second = system_impl(h, "re_derive", "");
+        assert_eq!(second, "0",
+            "second re_derive on stable state must be a no-op; got {second}");
         release_impl(h);
     }
 
