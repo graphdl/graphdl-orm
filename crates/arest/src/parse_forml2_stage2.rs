@@ -1862,13 +1862,283 @@ type GrammarCacheEntry = (
 static GRAMMAR_CACHE: std::sync::OnceLock<GrammarCacheEntry>
     = std::sync::OnceLock::new();
 
+/// Stage-0 grammar bootstrap (#285 follow-up). Parses the narrow subset
+/// of FORML 2 shapes used by `readings/forml2-grammar.md` directly into
+/// the same cell map that Stage-1+Stage-2 would produce — so
+/// `cached_grammar` can populate the classifier cache without recursing
+/// through the full parser (stage12 needs this cache before it can
+/// classify its own grammar) and without pulling in the legacy
+/// markdown-cascade parser.
+///
+/// Recognised shapes (exactly what the grammar file uses):
+///   - `X(.ref) is an entity type.` / `X is an entity type.`
+///   - `X is a value type.`
+///   - `The possible values of X are 'a', 'b', ...`
+///   - `A has B.` — binary fact type reading (no literals)
+///   - `A has B 'lit' iff …` / `A has B iff …` — classifier rules
+///   - `Class 'Value' is a Class.` — documentary instance facts;
+///     legacy's `parse_general_instance_fact` emits nothing for these,
+///     so we skip them silently.
+///
+/// Output `Object::Map` carries the same cells the legacy cascade
+/// would: `Noun` (with `referenceScheme` + `enumValues` enrichment),
+/// `RefScheme`, `EnumValues`, `FactType`, `Role`, `DerivationRule`.
+/// `DerivationRule` facts include a lossless `json` binding so
+/// `compile_to_defs_state` takes the no-resolve fast path (grammar
+/// rules never feed through `re_resolve_rules`).
+#[cfg(feature = "std-deps")]
+fn bootstrap_grammar_state(text: &str) -> Result<Object, String> {
+    use crate::types::{
+        DerivationRuleDef, DerivationKind, AntecedentSource,
+        AntecedentRoleLiteral, ConsequentRoleLiteral, ConsequentCellSource,
+    };
+
+    struct RawNoun {
+        name: String,
+        object_type: &'static str,
+        ref_scheme: Option<Vec<String>>,
+    }
+    let mut raw_nouns: Vec<RawNoun> = Vec::new();
+    let mut enum_values_by_noun: HashMap<String, Vec<String>> = HashMap::new();
+    let mut fact_types: Vec<Object> = Vec::new();
+    let mut roles: Vec<Object> = Vec::new();
+    // (id, text, consequent_ft_encoded, json)
+    let mut derivation_rules_info: Vec<(String, String, String, String)> = Vec::new();
+
+    fn fnv1a64(s: &str) -> u64 {
+        let mut h: u64 = 0xcbf29ce484222325;
+        for b in s.as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        h
+    }
+
+    fn extract_entity_decl(before: &str) -> (String, Option<Vec<String>>) {
+        match before.find('(') {
+            Some(p) => {
+                let name = before[..p].trim().to_string();
+                let tail = &before[p + 1..];
+                let end = tail.find(')').unwrap_or(tail.len());
+                let parts: Vec<String> = tail[..end]
+                    .split(',')
+                    .map(|s| s.trim().trim_start_matches('.').trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                (name, if parts.is_empty() { None } else { Some(parts) })
+            }
+            None => (before.trim().to_string(), None),
+        }
+    }
+
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let body = line.trim_end_matches('.').trim();
+
+        // 1. Entity type.
+        if let Some(before) = body.strip_suffix(" is an entity type") {
+            let (name, ref_scheme) = extract_entity_decl(before.trim());
+            raw_nouns.push(RawNoun { name, object_type: "entity", ref_scheme });
+            continue;
+        }
+
+        // 2. Value type.
+        if let Some(before) = body.strip_suffix(" is a value type") {
+            raw_nouns.push(RawNoun {
+                name: before.trim().to_string(),
+                object_type: "value",
+                ref_scheme: None,
+            });
+            continue;
+        }
+
+        // 3. Enum values.
+        if let Some(rest) = body.strip_prefix("The possible values of ") {
+            let (noun_name, values_part) = rest.split_once(" are ")
+                .ok_or_else(|| format!("grammar bootstrap: malformed enum: {}", line))?;
+            let noun_name = noun_name.trim();
+            let values: Vec<String> = values_part.split(',')
+                .map(|s| {
+                    let s = s.trim();
+                    s.strip_prefix('\'').and_then(|v| v.strip_suffix('\''))
+                        .unwrap_or(s).to_string()
+                })
+                .filter(|s| !s.is_empty())
+                .collect();
+            enum_values_by_noun.insert(noun_name.to_string(), values);
+            continue;
+        }
+
+        // 4. Derivation rule.
+        if body.contains(" iff ") {
+            let rule_text = body.to_string();
+            let spec = parse_classification_rule_spec(body)
+                .ok_or_else(|| format!("grammar bootstrap: could not parse classifier rule: {}", line))?;
+            let (classification, clauses) = spec;
+            let id = format!("rule_{:x}", fnv1a64(&rule_text));
+
+            let antecedent_sources: Vec<AntecedentSource> = clauses.iter()
+                .map(|(cell_name, _)| AntecedentSource::FactType(cell_name.clone()))
+                .collect();
+            let antecedent_role_literals: Vec<AntecedentRoleLiteral> = clauses.iter()
+                .enumerate()
+                .filter_map(|(i, (cell_name, lit))| lit.as_ref().map(|v| AntecedentRoleLiteral {
+                    antecedent_index: i,
+                    role: cell_name.strip_prefix("Statement_has_")
+                        .unwrap_or(cell_name.as_str())
+                        .replace('_', " "),
+                    value: v.clone(),
+                }))
+                .collect();
+            let consequent_role_literals = alloc::vec![ConsequentRoleLiteral {
+                role: "Classification".into(),
+                value: classification.clone(),
+            }];
+
+            let consequent_cell = ConsequentCellSource::Literal(
+                "Statement_has_Classification".into(),
+            );
+            let consequent_ft_encoded = consequent_cell.encode();
+
+            let rule = DerivationRuleDef {
+                id: id.clone(),
+                text: rule_text.clone(),
+                antecedent_sources,
+                consequent_instance_role: String::new(),
+                consequent_cell,
+                kind: DerivationKind::ModusPonens,
+                join_on: Vec::new(),
+                match_on: Vec::new(),
+                consequent_bindings: Vec::new(),
+                antecedent_filters: Vec::new(),
+                consequent_computed_bindings: Vec::new(),
+                consequent_aggregates: Vec::new(),
+                unresolved_clauses: Vec::new(),
+                antecedent_role_literals,
+                consequent_role_literals,
+            };
+            let json = serde_json::to_string(&rule)
+                .map_err(|e| format!("grammar bootstrap: rule json serialization failed: {}", e))?;
+            derivation_rules_info.push((id, rule_text, consequent_ft_encoded, json));
+            continue;
+        }
+
+        // 5. Binary fact type reading (no quotes, contains ` has `).
+        if !body.contains('\'') {
+            if let Some(has_idx) = body.find(" has ") {
+                let subject = body[..has_idx].trim();
+                let object = body[has_idx + " has ".len()..].trim();
+                let id = format!("{}_has_{}",
+                    subject.replace(' ', "_"),
+                    object.replace(' ', "_"));
+                let reading = format!("{} has {}", subject, object);
+                fact_types.push(fact_from_pairs(&[
+                    ("id", id.as_str()),
+                    ("reading", reading.as_str()),
+                    ("arity", "2"),
+                ]));
+                roles.push(fact_from_pairs(&[
+                    ("factType", id.as_str()),
+                    ("nounName", subject),
+                    ("position", "0"),
+                ]));
+                roles.push(fact_from_pairs(&[
+                    ("factType", id.as_str()),
+                    ("nounName", object),
+                    ("position", "1"),
+                ]));
+                continue;
+            }
+        }
+
+        // 6. Anything else (documentary instance facts, prose between
+        //    sections) — silently skip, matching legacy's no-op on
+        //    unrecognised lines.
+    }
+
+    let refschemes: Vec<Object> = raw_nouns.iter()
+        .filter_map(|n| n.ref_scheme.as_ref().map(|parts| (n.name.clone(), parts.clone())))
+        .map(|(name, parts)| {
+            let mut pairs: Vec<(String, String)> = alloc::vec![("noun".to_string(), name)];
+            for (i, p) in parts.iter().enumerate() {
+                pairs.push((format!("part{i}"), p.clone()));
+            }
+            let refs: Vec<(&str, &str)> = pairs.iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
+            fact_from_pairs(&refs)
+        })
+        .collect();
+
+    let enum_values: Vec<Object> = enum_values_by_noun.iter()
+        .map(|(noun, vals)| {
+            let mut pairs: Vec<(String, String)> = alloc::vec![("noun".to_string(), noun.clone())];
+            for (i, v) in vals.iter().enumerate() {
+                pairs.push((format!("value{i}"), v.clone()));
+            }
+            let refs: Vec<(&str, &str)> = pairs.iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
+            fact_from_pairs(&refs)
+        })
+        .collect();
+
+    // Noun cell with enrichment (`referenceScheme` / `enumValues`
+    // bindings), matching `enrich_noun_cells` in the legacy path.
+    let enriched_nouns: Vec<Object> = raw_nouns.iter().map(|n| {
+        let mut pairs: Vec<(String, String)> = alloc::vec![
+            ("name".into(), n.name.clone()),
+            ("objectType".into(), n.object_type.to_string()),
+            ("worldAssumption".into(), "closed".into()),
+        ];
+        let rs_joined: Option<String> = n.ref_scheme.as_ref()
+            .map(|parts| parts.join(","))
+            .or_else(|| (n.object_type == "entity").then(|| "id".into()));
+        if let Some(rs) = rs_joined {
+            pairs.push(("referenceScheme".into(), rs));
+        }
+        if let Some(evs) = enum_values_by_noun.get(&n.name) {
+            if !evs.is_empty() {
+                pairs.push(("enumValues".into(), evs.join(",")));
+            }
+        }
+        let refs: Vec<(&str, &str)> = pairs.iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        fact_from_pairs(&refs)
+    }).collect();
+
+    let derivation_rules: Vec<Object> = derivation_rules_info.iter()
+        .map(|(id, text, ft, json)| fact_from_pairs(&[
+            ("id", id.as_str()),
+            ("text", text.as_str()),
+            ("consequentFactTypeId", ft.as_str()),
+            ("json", json.as_str()),
+        ]))
+        .collect();
+
+    let mut map: HashMap<String, Object> = HashMap::new();
+    map.insert("Noun".into(), Object::Seq(enriched_nouns.into()));
+    map.insert("RefScheme".into(), Object::Seq(refschemes.into()));
+    map.insert("EnumValues".into(), Object::Seq(enum_values.into()));
+    map.insert("FactType".into(), Object::Seq(fact_types.into()));
+    map.insert("Role".into(), Object::Seq(roles.into()));
+    map.insert("DerivationRule".into(), Object::Seq(derivation_rules.into()));
+    Ok(Object::Map(map))
+}
+
 #[cfg(feature = "std-deps")]
 fn cached_grammar() -> Result<&'static GrammarCacheEntry, String> {
     if let Some(g) = GRAMMAR_CACHE.get() { return Ok(g); }
     let grammar = include_str!("../../../readings/forml2-grammar.md");
-    // Must use the legacy path — the public `parse_to_state` is
-    // the stage12 entry now; bootstrapping through it would recurse.
-    let parsed = crate::parse_forml2::parse_to_state_legacy(grammar)
+    // Stage-0 bootstrap: the grammar file uses a narrow subset of FORML 2
+    // shapes (entity / value / enum / binary FT / iff rule). Parsing it
+    // here directly avoids the recursion that would hit `parse_to_state`
+    // (the stage12 entry) needing `cached_grammar` to populate itself.
+    let parsed = bootstrap_grammar_state(grammar)
         .map_err(|e| alloc::format!("grammar parse failed: {}", e))?;
     let mut defs = crate::compile::compile_to_defs_state(&parsed);
     // Swap the compiled FFP derivation Funcs for equivalent Native
@@ -2639,6 +2909,48 @@ mod tests {
     fn grammar_state() -> Object {
         let grammar = include_str!("../../../readings/forml2-grammar.md");
         parse_to_state(grammar).expect("grammar must parse")
+    }
+
+    /// Stage-0 bootstrap must produce every cell `compile_to_defs_state`
+    /// and `specialize_grammar_classifiers` read from. Specific counts
+    /// are pinned to the committed `readings/forml2-grammar.md` (16
+    /// nouns, 16 binary FTs, 5 enum-valued value types, 30+ classifier
+    /// rules) to guard against a shape recognizer silently dropping a
+    /// line when the grammar file is edited.
+    #[test]
+    fn bootstrap_grammar_covers_expected_shapes() {
+        let grammar = include_str!("../../../readings/forml2-grammar.md");
+        let state = super::bootstrap_grammar_state(grammar).expect("bootstrap");
+
+        let noun_count = fetch_or_phi("Noun", &state)
+            .as_seq().map(|s| s.len()).unwrap_or(0);
+        assert_eq!(noun_count, 16, "noun count");
+
+        let ft_count = fetch_or_phi("FactType", &state)
+            .as_seq().map(|s| s.len()).unwrap_or(0);
+        assert_eq!(ft_count, 16, "fact type count");
+
+        let role_count = fetch_or_phi("Role", &state)
+            .as_seq().map(|s| s.len()).unwrap_or(0);
+        assert_eq!(role_count, 32, "role count (2 per FT)");
+
+        let enum_count = fetch_or_phi("EnumValues", &state)
+            .as_seq().map(|s| s.len()).unwrap_or(0);
+        assert_eq!(enum_count, 5, "enum-valued noun count");
+
+        let dr_count = fetch_or_phi("DerivationRule", &state)
+            .as_seq().map(|s| s.len()).unwrap_or(0);
+        assert!(dr_count >= 30, "classifier rule count, got {}", dr_count);
+
+        // Every rule must carry a parseable `json` binding so
+        // `compile_to_defs_state`'s lossless path activates and
+        // `re_resolve_rules` (legacy-dependent) is never called.
+        let rules = fetch_or_phi("DerivationRule", &state);
+        for f in rules.as_seq().expect("rules").iter() {
+            let json = binding(f, "json").expect("rule carries json");
+            let _parsed: crate::types::DerivationRuleDef =
+                serde_json::from_str(json).expect("rule json round-trips");
+        }
     }
 
     fn stage1_state(statement_id: &str, text: &str, nouns: &[&str]) -> Object {
