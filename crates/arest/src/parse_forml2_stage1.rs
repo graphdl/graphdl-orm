@@ -25,7 +25,7 @@
 //!   `Literal Value`.
 
 extern crate alloc;
-use alloc::{string::{String, ToString}, vec::Vec, format};
+use alloc::{string::{String, ToString}, vec::Vec, format, borrow::Cow};
 use hashbrown::HashMap;
 use crate::ast::{Object, fact_from_pairs};
 
@@ -113,8 +113,8 @@ pub fn tokenize_statement_with_buckets(statement_id: &str, text: &str, buckets: 
     //     parse_entity_decl; Stage-1 needs the same so the trailing
     //     marker (`is an entity type`) is recognizable as a prefix of
     //     the post-noun tail.
-    let body_stripped: String = strip_ref_scheme_parens(body);
-    let body: &str = body_stripped.as_str();
+    let body_stripped: Cow<'_, str> = strip_ref_scheme_parens(body);
+    let body: &str = body_stripped.as_ref();
 
     // 2. Strip leading deontic operator (`It is obligatory/forbidden/permitted that`).
     let (body, deontic_operator) = strip_leading_deontic_operator(body);
@@ -224,9 +224,11 @@ pub fn tokenize_statement_with_buckets(statement_id: &str, text: &str, buckets: 
     // Derivation Rule.
     let is_constraint_body = CONSTRAINT_KEYWORDS.iter().any(|k| body.contains(*k));
     if !is_constraint_body {
-        for kw in KEYWORDS {
-            let needle = alloc::format!(" {} ", kw);
-            if body.contains(needle.as_str()) {
+        // Pre-materialized `" <kw> "` needles — parallel to KEYWORDS.
+        // Avoids allocating a fresh String per (line × keyword) pair.
+        const KEYWORD_NEEDLES: &[&str] = &[" iff ", " if ", " when "];
+        for (kw_idx, kw) in KEYWORDS.iter().enumerate() {
+            if body.contains(KEYWORD_NEEDLES[kw_idx]) {
                 push(&mut cells, "Statement_has_Keyword", fact_from_pairs(&[
                     ("Statement", statement_id), ("Keyword", kw),
                 ]));
@@ -437,7 +439,13 @@ fn strip_leading_deontic_operator(text: &str) -> (&str, Option<String>) {
 /// The pattern we strip: `(.<chars-excluding-close-paren>)`. Only
 /// parens that open with `(.` are reference schemes — ordinary
 /// parenthetical prose (rare in FORML 2) is left alone.
-fn strip_ref_scheme_parens(body: &str) -> String {
+fn strip_ref_scheme_parens(body: &str) -> Cow<'_, str> {
+    // Fast path: no reference-scheme parens. Almost every non-entity-
+    // declaration statement hits this branch, so skipping the String
+    // allocation here shaves real time off bulk tokenization.
+    if !body.contains("(.") {
+        return Cow::Borrowed(body);
+    }
     let mut out = String::with_capacity(body.len());
     let mut rest = body;
     while let Some(pos) = rest.find("(.") {
@@ -448,12 +456,12 @@ fn strip_ref_scheme_parens(body: &str) -> String {
             }
             None => {
                 out.push_str(&rest[pos..]);
-                return out;
+                return Cow::Owned(out);
             }
         }
     }
     out.push_str(rest);
-    out
+    Cow::Owned(out)
 }
 
 #[derive(Debug, Clone)]
@@ -593,7 +601,10 @@ const TRAILING_MARKERS: &[&str] = &[
 /// both 'at most' and 'at least' without the 'one' suffix).
 fn inner_quantifiers(body: &str) -> Vec<&'static str> {
     const LONG: &[&str] = &["at most one", "at least one", "exactly one"];
+    // Parallel arrays — SHORT[i]'s "one" extension is SHORT_ONE[i].
+    // Pre-materialized so the filter below doesn't `format!` per call.
     const SHORT: &[&str] = &["at most", "at least"];
+    const SHORT_ONE: &[&str] = &["at most one", "at least one"];
     let long_hits: Vec<&'static str> = LONG.iter()
         .filter(|q| body.contains(**q))
         .copied()
@@ -603,11 +614,9 @@ fn inner_quantifiers(body: &str) -> Vec<&'static str> {
     // that way `at most 5 and at least 2` yields both shorts but
     // `at most one Customer` yields only the long form.
     let short_hits: Vec<&'static str> = SHORT.iter()
-        .filter(|q| {
-            let long = alloc::format!("{} one", q);
-            body.contains(**q) && !body.contains(long.as_str())
-        })
-        .copied()
+        .enumerate()
+        .filter(|(i, q)| body.contains(**q) && !body.contains(SHORT_ONE[*i]))
+        .map(|(_, q)| *q)
         .collect();
     // ORM 2 plural `some` is the MC signal — `Each X has some Y` is
     // the "at least one" shorthand. Emit as its own quantifier atom
