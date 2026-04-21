@@ -276,6 +276,82 @@ Order has Total.
     );
 }
 
+// ─── Category 8: Multi-antecedent `and` chain ───────────────────────
+//
+// Shape: `* X has R '<r>' iff X has A and X has B and X has C` —
+// N ≥ 2 antecedents combined with `and`, with the consequent role
+// pinned to a literal so the "fresh bindings in declared role order"
+// path in compile_explicit_derivation's N-antecedent branch fires
+// (without literals, bindings are copied whole from the first
+// antecedent — see #286 design note). The rule fires once iff every
+// antecedent FT has at least one surviving fact (existence-AND
+// semantic; not a per-tuple join).
+
+#[test]
+fn shape_multi_antecedent_and_chain_existence_check() {
+    let src = r#"# Test
+User(.Email) is an entity type.
+Email is a value type.
+Status is a value type.
+Role is a value type.
+Permission is a value type.
+
+## Fact Types
+User has Email.
+User has Status.
+User has Role.
+User has Permission.
+
+## Derivation Rules
+* User has Permission 'granted' iff User has Email and User has Status and User has Role.
+"#;
+    let (rule, func) = parse_and_compile(src);
+
+    match &rule.consequent_cell {
+        ConsequentCellSource::Literal(id) => assert!(!id.is_empty()),
+        other => panic!("expected Literal(..), got {:?}", other),
+    }
+    assert_eq!(
+        rule.antecedent_sources.len(), 3,
+        "three-antecedent shape expected, got {:#?}", rule.antecedent_sources,
+    );
+    assert!(
+        rule.consequent_role_literals.iter().any(|l|
+            l.role == "Permission" && l.value == "granted"),
+        "expected consequent_role_literals to pin Permission='granted', got {:#?}",
+        rule.consequent_role_literals,
+    );
+
+    // All three antecedents populated → one derivation with the
+    // pinned Permission literal. The User binding propagates from the
+    // first antecedent (`role_value_by_name("User") . first_fact`).
+    let out = apply_to_facts(&func, &[
+        ("User_has_Email", &[("User", "u-1"), ("Email", "u1@ex.com")]),
+        ("User_has_Status", &[("User", "u-1"), ("Status", "verified")]),
+        ("User_has_Role", &[("User", "u-1"), ("Role", "admin")]),
+    ]);
+    let derived = decode_derived(&out);
+    assert_eq!(derived.len(), 1, "existence-AND should emit one fact, got {:#?}", derived);
+    let (_ft, _reading, bindings) = &derived[0];
+    assert!(
+        bindings.iter().any(|(k, v)| k == "Permission" && v == "granted"),
+        "expected Permission='granted', got {:#?}", bindings,
+    );
+    assert!(
+        bindings.iter().any(|(k, v)| k == "User" && v == "u-1"),
+        "expected User='u-1' from first antecedent, got {:#?}", bindings,
+    );
+
+    // Missing one antecedent (no Role fact) → no derivation.
+    let out = apply_to_facts(&func, &[
+        ("User_has_Email", &[("User", "u-2"), ("Email", "u2@ex.com")]),
+        ("User_has_Status", &[("User", "u-2"), ("Status", "verified")]),
+    ]);
+    let derived = decode_derived(&out);
+    assert!(derived.is_empty(),
+        "missing antecedent must suppress derivation, got {:#?}", derived);
+}
+
 // ─── Category 2: AntecedentRole (deferred) ──────────────────────────
 //
 // `ConsequentCellSource::AntecedentRole` is declared on the type and
