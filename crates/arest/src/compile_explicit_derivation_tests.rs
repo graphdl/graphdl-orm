@@ -591,6 +591,65 @@ Order has Email.
         "Email binding should be alice@example.com, got {:#?}", bindings);
 }
 
+// ─── Category 6: Aggregate ─────────────────────────────────────────
+//
+// Shape: `* X has R iff R is the <op> of Y where X has Y` — R is a
+// scalar aggregation over the image set of Y facts grouped by X. The
+// parser populates `rule.consequent_aggregates` and the dispatcher
+// routes aggregate rules to `compile_aggregate_derivation` (Codd §2.3.4
+// image-set pattern), NOT to `compile_explicit_derivation`. Covered
+// here because the shape is a canonical user reading.
+
+#[test]
+fn shape_aggregate_count_groups_image_set() {
+    let src = r#"# Test
+Thing(.ID) is an entity type.
+ID is a value type.
+Part is a value type.
+Arity is a value type.
+
+## Fact Types
+Thing has ID.
+Thing has Part.
+Thing has Arity.
+
+## Derivation Rules
+* Thing has Arity iff Arity is the count of Part where Thing has Part.
+"#;
+    let (rule, func) = parse_and_compile(src);
+
+    match &rule.consequent_cell {
+        ConsequentCellSource::Literal(id) => assert_eq!(id, "Thing_has_Arity",
+            "consequent must resolve to Thing_has_Arity, got {}", id),
+        other => panic!("expected Literal(..), got {:?}", other),
+    }
+    assert!(!rule.consequent_aggregates.is_empty(),
+        "consequent_aggregates populated for aggregate rules, got {:#?}",
+        rule.consequent_aggregates);
+    let agg = &rule.consequent_aggregates[0];
+    assert_eq!(agg.role, "Arity", "aggregate target role, got {}", agg.role);
+
+    // Three Parts on the same Thing → Arity=3 for that Thing.
+    // Each source fact iterates; the aggregate folds within each group
+    // (group key: Thing). With identical group keys, the chainer would
+    // dedup the three identical derivations down to one; apply_to_facts
+    // is one step so we may see duplicates. The test verifies at least
+    // one derivation with the correct count.
+    let out = apply_to_facts(&func, &[
+        ("Thing_has_Part", &[("Thing", "t-1"), ("Part", "wheel")]),
+        ("Thing_has_Part", &[("Thing", "t-1"), ("Part", "engine")]),
+        ("Thing_has_Part", &[("Thing", "t-1"), ("Part", "seat")]),
+    ]);
+    let derived = decode_derived(&out);
+    assert!(!derived.is_empty(), "at least one aggregate derivation expected, got nothing");
+    assert!(
+        derived.iter().any(|(_, _, bindings)|
+            bindings.iter().any(|(k, v)| k == "Thing" && v == "t-1") &&
+            bindings.iter().any(|(k, v)| k == "Arity" && v == "3")),
+        "expected (Thing=t-1, Arity=3) somewhere in derivations, got {:#?}", derived,
+    );
+}
+
 // ─── Category 2: AntecedentRole (deferred) ──────────────────────────
 //
 // `ConsequentCellSource::AntecedentRole` is declared on the type and
