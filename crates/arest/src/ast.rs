@@ -767,6 +767,31 @@ pub fn uninstall_async_platform_fn(name: &str) {
     }
 }
 
+/// Names the crate's production paths are permitted to install into
+/// `ASYNC_PLATFORM_FALLBACK`. Empty by construction: no production
+/// path in `arest` writes this registry today — see
+/// `_reports/sec-2-platform-audit-2026-04-21.md`. A future writer
+/// MUST add its name here and revise the audit; the integration test
+/// `tests/sec_2_platform_fallback_audit.rs` fails otherwise.
+#[cfg(not(feature = "no_std"))]
+pub const APPROVED_ASYNC_PLATFORM_FN_NAMES: &[&str] = &[];
+
+/// Sorted names currently installed in `ASYNC_PLATFORM_FALLBACK`.
+/// Empty when the `OnceLock` has never been initialized. Used by the
+/// sec-2 guard test; also exposable for host-side introspection.
+#[cfg(not(feature = "no_std"))]
+pub fn installed_async_platform_fn_names() -> alloc::vec::Vec<alloc::string::String> {
+    match ASYNC_PLATFORM_FALLBACK.get() {
+        Some(reg) => {
+            let mut v: alloc::vec::Vec<alloc::string::String> =
+                reg.read().keys().cloned().collect();
+            v.sort();
+            v
+        }
+        None => alloc::vec::Vec::new(),
+    }
+}
+
 /// Async counterpart to `apply_platform` + `dispatch_platform_fallback`.
 /// Dispatch order:
 ///   1. Async registry (install_async_platform_fn) — awaited.
@@ -831,6 +856,31 @@ pub fn install_platform_fn(name: &str, f: PlatformFn) {
 pub fn uninstall_platform_fn(name: &str) {
     if let Some(reg) = PLATFORM_FALLBACK.get() {
         reg.write().remove(name);
+    }
+}
+
+/// Names the crate's production paths are permitted to install into
+/// `PLATFORM_FALLBACK`. Empty by construction: no production path in
+/// `arest` writes this registry today — see
+/// `_reports/sec-2-platform-audit-2026-04-21.md`. A future writer
+/// MUST add its name here and revise the audit; the integration test
+/// `tests/sec_2_platform_fallback_audit.rs` fails otherwise.
+#[cfg(not(feature = "no_std"))]
+pub const APPROVED_PLATFORM_FN_NAMES: &[&str] = &[];
+
+/// Sorted names currently installed in `PLATFORM_FALLBACK`. Empty
+/// when the `OnceLock` has never been initialized. Used by the sec-2
+/// guard test; also exposable for host-side introspection.
+#[cfg(not(feature = "no_std"))]
+pub fn installed_platform_fn_names() -> alloc::vec::Vec<alloc::string::String> {
+    match PLATFORM_FALLBACK.get() {
+        Some(reg) => {
+            let mut v: alloc::vec::Vec<alloc::string::String> =
+                reg.read().keys().cloned().collect();
+            v.sort();
+            v
+        }
+        None => alloc::vec::Vec::new(),
     }
 }
 
