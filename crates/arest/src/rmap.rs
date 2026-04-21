@@ -229,23 +229,6 @@ pub fn primary_key_of_table(cells: &crate::ast::Object, table_name: &str) -> Vec
         .unwrap_or_default()
 }
 
-/// Return the extra UNIQUE constraints declared on a table — each inner
-/// `Vec<String>` is a set of column names. Empty when none are declared.
-pub(crate) fn unique_constraints_of_table(
-    cells: &crate::ast::Object,
-    table_name: &str,
-) -> Vec<Vec<String>> {
-    let rows = crate::ast::fetch_or_phi("RMAPTable", cells);
-    let Some(seq) = rows.as_seq() else { return Vec::new(); };
-    seq.iter()
-        .find(|f| crate::ast::binding(f, "name") == Some(table_name))
-        .and_then(|f| crate::ast::binding(f, "uniqueConstraints"))
-        .filter(|s| !s.is_empty())
-        .map(|s| s.split(';')
-            .map(|grp| grp.split(',').map(|p| p.to_string()).collect())
-            .collect())
-        .unwrap_or_default()
-}
 
 /// #214: RMAP as a Func tree entry point.
 ///
