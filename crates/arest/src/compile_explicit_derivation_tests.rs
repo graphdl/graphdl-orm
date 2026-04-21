@@ -534,6 +534,63 @@ Person is ancestor of Person.
     }
 }
 
+// ─── Category 4: Join-path derivation via possessive syntax ─────────
+//
+// Shape: `* X has Z iff X's Y has Z` — the antecedent `X's Y`
+// possessive expands at parse time (`try_expand_possessive`) to
+// `X has Y and that Y has Z`, which the anaphora detector flags as
+// a Join on Y. The dispatcher routes to `compile_join_derivation`,
+// not `compile_explicit_derivation`, but the shape is a canonical
+// user-reading pattern so it belongs in the harness.
+
+#[test]
+fn shape_join_path_via_possessive_expands_and_fires() {
+    let src = r#"# Test
+Order(.OrderId) is an entity type.
+OrderId is a value type.
+Customer(.CustomerId) is an entity type.
+CustomerId is a value type.
+Email is a value type.
+
+## Fact Types
+Order has OrderId.
+Order has Customer.
+Customer has CustomerId.
+Customer has Email.
+Order has Email.
+
+## Derivation Rules
+* Order has Email iff Order's Customer has Email.
+"#;
+    let (rule, func) = parse_and_compile(src);
+
+    match &rule.consequent_cell {
+        ConsequentCellSource::Literal(id) => assert_eq!(id, "Order_has_Email",
+            "consequent must resolve to Order_has_Email, got {}", id),
+        other => panic!("expected Literal(..), got {:?}", other),
+    }
+    assert_eq!(rule.antecedent_sources.len(), 2,
+        "possessive expands to two antecedents, got {:#?}", rule.antecedent_sources);
+    assert!(rule.join_on.contains(&"Customer".to_string()),
+        "Customer should be the join key (via that-anaphora from expansion), got {:?}",
+        rule.join_on);
+
+    // ord-1 ─(Customer)→ cus-1 ─(Email)→ alice@example.com
+    //   should join to ord-1 has Email alice@example.com.
+    let out = apply_to_facts(&func, &[
+        ("Order_has_Customer", &[("Order", "ord-1"), ("Customer", "cus-1")]),
+        ("Customer_has_Email", &[("Customer", "cus-1"), ("Email", "alice@example.com")]),
+    ]);
+    let derived = decode_derived(&out);
+    assert_eq!(derived.len(), 1, "one joined fact expected, got {:#?}", derived);
+    let (ft, _, bindings) = &derived[0];
+    assert_eq!(ft, "Order_has_Email");
+    assert!(bindings.iter().any(|(k, v)| k == "Order" && v == "ord-1"),
+        "Order binding should be ord-1, got {:#?}", bindings);
+    assert!(bindings.iter().any(|(k, v)| k == "Email" && v == "alice@example.com"),
+        "Email binding should be alice@example.com, got {:#?}", bindings);
+}
+
 // ─── Category 2: AntecedentRole (deferred) ──────────────────────────
 //
 // `ConsequentCellSource::AntecedentRole` is declared on the type and
