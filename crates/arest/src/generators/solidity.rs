@@ -24,7 +24,7 @@
 //   - Output is solc-compilable.
 
 use crate::ast::{Object, binding, fetch_or_phi};
-use crate::rmap;
+use crate::rmap::{self, ColumnView};
 #[allow(unused_imports)]
 use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 
@@ -130,10 +130,11 @@ fn compile_to_solidity_inner(
                   // Generated from FORML2 readings by AREST\n\
                   pragma solidity ^0.8.20;\n\n";
 
-    // RMAP still returns `Vec<TableDef>` today — that's the next
-    // typed-IR consumer to retire per #325. For now read it into a
-    // scope-local index, not a module-level type alias.
-    let tables = rmap::rmap_from_state(state);
+    // Read RMAP through the cell API (#325): per-noun columns + primary
+    // key are looked up via `columns_for_table` + `primary_key_of_table`.
+    // Halpin's 3NF shape crosses the generator boundary as `RMAPTable` /
+    // `RMAPColumn` facts — no typed IR struct in flight.
+    let cells = rmap::rmap_cells_from_state(state);
 
     let nouns = fetch_or_phi("Noun", state);
     let contracts: Vec<String> = nouns.as_seq().map(|ns| {
@@ -145,8 +146,9 @@ fn compile_to_solidity_inner(
                 if !set.contains(name.as_str()) { return None; }
             }
             let table_name = rmap::to_snake(&name);
-            let table = tables.iter().find(|t| t.name == table_name);
-            Some(emit_contract(&name, table, state, include.as_ref()))
+            let columns = rmap::columns_for_table(&cells, &table_name);
+            let primary_key = rmap::primary_key_of_table(&cells, &table_name);
+            Some(emit_contract(&name, &columns, &primary_key, state, include.as_ref()))
         }).collect()
     }).unwrap_or_default();
 
@@ -156,19 +158,20 @@ fn compile_to_solidity_inner(
 /// Emit a full Solidity contract for an entity noun.
 fn emit_contract(
     name: &str,
-    table: Option<&rmap::TableDef>,
+    columns: &[ColumnView],
+    primary_key: &[String],
     state: &Object,
     scope: Option<&hashbrown::HashSet<&str>>,
 ) -> String {
     let contract_name = sanitize_name(name);
     let off_chain = emit_off_chain_comment(name, state);
-    let struct_def = emit_struct(table);
+    let struct_def = emit_struct(columns);
     let events = emit_events(name, state, scope);
     let has_sm = sm_name_for_noun(state, name).is_some();
     let sm_parts = if has_sm { emit_state_machine(name, state) } else { String::new() };
-    let create_fn = emit_create(name, table, state);
+    let create_fn = emit_create(name, columns, primary_key, state);
     let transitions = if has_sm { emit_transitions(name, state) } else { String::new() };
-    let vc_validators = emit_vc_validators(name, table, state);
+    let vc_validators = emit_vc_validators(name, columns, state);
 
     format!(
         "{}contract {} {{\n\
@@ -191,12 +194,12 @@ fn emit_contract(
 /// calls emitted by `emit_create`.
 fn emit_vc_validators(
     noun_name: &str,
-    table: Option<&rmap::TableDef>,
+    columns: &[ColumnView],
     state: &Object,
 ) -> String {
-    let Some(t) = table else { return String::new(); };
+    if columns.is_empty() { return String::new(); }
     let mut emitted: hashbrown::HashSet<String> = hashbrown::HashSet::new();
-    let fns: Vec<String> = t.columns.iter().filter_map(|c| {
+    let fns: Vec<String> = columns.iter().filter_map(|c| {
         let col_noun = column_value_type_noun(&c.name, noun_name, state)?;
         let values = enum_values_for_value_type(&col_noun, state);
         if values.is_empty() { return None; }
@@ -259,13 +262,14 @@ fn emit_off_chain_comment(noun_name: &str, state: &Object) -> String {
 }
 
 /// Emit the Data struct with RMAP columns as typed fields.
-fn emit_struct(table: Option<&rmap::TableDef>) -> String {
-    let fields: Vec<String> = match table {
-        Some(t) => t.columns.iter().map(|c| {
-            let sol_type = solidity_type(c);
+fn emit_struct(columns: &[ColumnView]) -> String {
+    let fields: Vec<String> = if columns.is_empty() {
+        vec!["        string id;".to_string()]
+    } else {
+        columns.iter().map(|c| {
+            let sol_type = solidity_type(&c.col_type);
             format!("        {} {};", sol_type, sanitize_field(&c.name))
-        }).collect(),
-        None => vec!["        string id;".to_string()],
+        }).collect()
     };
     let status_line = "        bytes32 status;  // SM current state".to_string();
     let mut all = fields;
@@ -273,9 +277,9 @@ fn emit_struct(table: Option<&rmap::TableDef>) -> String {
     format!("    struct Data {{\n{}\n    }}", all.join("\n"))
 }
 
-/// Map an RMAP column type to a Solidity type.
-fn solidity_type(col: &rmap::TableColumn) -> &'static str {
-    match col.col_type.as_str() {
+/// Map an RMAP column SQL type string to a Solidity type.
+fn solidity_type(col_type: &str) -> &'static str {
+    match col_type {
         "TEXT" | "VARCHAR" => "string",
         "INTEGER" | "INT" => "int256",
         "REAL" | "FLOAT" => "int256", // Solidity lacks floats; use fixed-point
@@ -348,17 +352,19 @@ fn emit_state_machine(noun_name: &str, state: &Object) -> String {
 /// Emit the create(...) function with UC + MC + VC requires (E2, #304).
 fn emit_create(
     noun_name: &str,
-    table: Option<&rmap::TableDef>,
+    columns: &[ColumnView],
+    primary_key: &[String],
     state: &Object,
 ) -> String {
-    let params: Vec<String> = match table {
-        Some(t) => t.columns.iter().map(|c| {
-            let t = solidity_type(c);
+    let params: Vec<String> = if columns.is_empty() {
+        vec!["string memory id".to_string()]
+    } else {
+        columns.iter().map(|c| {
+            let t = solidity_type(&c.col_type);
             format!("{} memory {}", t, sanitize_field(&c.name))
-        }).collect(),
-        None => vec!["string memory id".to_string()],
+        }).collect()
     };
-    let pk = table.and_then(|t| t.primary_key.first())
+    let pk = primary_key.first()
         .map(|s| sanitize_field(s))
         .unwrap_or_else(|| "id".to_string());
 
@@ -383,27 +389,21 @@ fn emit_create(
 
     // VC: for each column whose value-type noun has enum values
     // declared, require the incoming parameter to match one of them.
-    let vc_checks = match table {
-        Some(t) => t.columns.iter().filter_map(|c| {
-            let col_noun = column_value_type_noun(&c.name, noun_name, state)?;
-            let values = enum_values_for_value_type(&col_noun, state);
-            if values.is_empty() { return None; }
-            let f = sanitize_field(&c.name);
-            Some(format!(
-                "        require(_validate{}({}), \"VC: {} invalid\");",
-                sanitize_name(&col_noun), f, c.name))
-        }).collect::<Vec<_>>(),
-        None => vec![],
-    };
+    let vc_checks: Vec<String> = columns.iter().filter_map(|c| {
+        let col_noun = column_value_type_noun(&c.name, noun_name, state)?;
+        let values = enum_values_for_value_type(&col_noun, state);
+        if values.is_empty() { return None; }
+        let f = sanitize_field(&c.name);
+        Some(format!(
+            "        require(_validate{}({}), \"VC: {} invalid\");",
+            sanitize_name(&col_noun), f, c.name))
+    }).collect();
 
     // Assign struct fields
-    let assignments: Vec<String> = match table {
-        Some(t) => t.columns.iter().map(|c| {
-            let f = sanitize_field(&c.name);
-            format!("        records[{}].{} = {};", pk, f, f)
-        }).collect(),
-        None => vec![],
-    };
+    let assignments: Vec<String> = columns.iter().map(|c| {
+        let f = sanitize_field(&c.name);
+        format!("        records[{}].{} = {};", pk, f, f)
+    }).collect();
 
     // Initial SM status: first status declared under the noun's SM
     // (or empty if no SM attached).
