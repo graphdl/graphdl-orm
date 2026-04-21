@@ -2012,6 +2012,10 @@ pub fn parse_to_state_via_stage12(text: &str) -> Result<Object, String> {
     // full legacy cascade a second time just to recover the Noun cell.
     let mut nouns: Vec<String> = extract_declared_noun_names(text);
     nouns.sort_by(|a, b| b.len().cmp(&a.len()));
+    // Build the first-byte noun index ONCE per parse so the per-line
+    // tokenizer doesn't re-partition on every call.
+    let sorted_nouns: Vec<&str> = nouns.iter().map(|s| s.as_str()).collect();
+    let noun_buckets = crate::parse_forml2_stage1::NounBuckets::from_sorted(&sorted_nouns);
 
     let lines = crate::parse_forml2::join_derivation_continuations(text);
     if trace { eprintln!("[s12] preproc (reject+nouns+join): {:?}", t_pre.elapsed()); }
@@ -2087,8 +2091,8 @@ pub fn parse_to_state_via_stage12(text: &str) -> Result<Object, String> {
             continue;
         }
         let statement_id = alloc::format!("s{}", i);
-        let cells = crate::parse_forml2_stage1::tokenize_statement(
-            &statement_id, line, &nouns);
+        let cells = crate::parse_forml2_stage1::tokenize_statement_with_buckets(
+            &statement_id, line, &noun_buckets);
         for (cell_name, facts) in cells.into_iter() {
             acc_cells.entry(cell_name).or_default().extend(facts);
         }
