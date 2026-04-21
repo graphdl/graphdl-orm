@@ -251,6 +251,17 @@ pub fn tokenize_statement_with_buckets(statement_id: &str, text: &str, buckets: 
                 ("Statement", statement_id), ("Keyword", "if"),
             ]));
         }
+        // `<consequent> := <antecedent>.` is legacy's explicit derivation
+        // rule separator (parse_forml2.rs treats " := ", " iff ", " if "
+        // as interchangeable derivation markers). The grammar's
+        // Derivation Rule recognizers key off Keyword 'iff' / 'if' /
+        // 'when', so emit Keyword 'iff' here to route `:=` rules into
+        // the same classification path.
+        if body.contains(" := ") {
+            push(&mut cells, "Statement_has_Keyword", fact_from_pairs(&[
+                ("Statement", statement_id), ("Keyword", "iff"),
+            ]));
+        }
     }
     // Multi-clause constraint keyword markers. Each is a phrase that
     // signals a specific constraint kind:
