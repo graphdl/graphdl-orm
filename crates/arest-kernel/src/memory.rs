@@ -161,3 +161,100 @@ unsafe impl FrameAllocator<Size4KiB> for BootInfoFrameAllocator {
         frame
     }
 }
+
+// ---------------------------------------------------------------------------
+// User-page mapping (Sec-6.1)
+// ---------------------------------------------------------------------------
+
+/// Errors reported by `map_user_page` / `remap_user_page_flags`.
+#[derive(Debug)]
+pub enum MapUserError {
+    /// The frame allocator is exhausted.
+    OutOfFrames,
+    /// The target virtual address is already mapped.
+    AlreadyMapped,
+    /// The virtual address is not 4 KiB aligned.
+    Misaligned,
+    /// Any other paging error reported by the x86_64 crate.
+    Paging,
+}
+
+/// Allocate a fresh 4 KiB physical frame and map it at `virt` with
+/// USER_ACCESSIBLE + PRESENT + the supplied extra flags. The TLB
+/// is flushed for `virt` before the function returns so the new
+/// mapping is visible to the caller on the next access.
+///
+/// Primary hook for setting up ring-3-accessible pages (user text,
+/// user stack, and, once Sec-6.3 lands, per-tenant address spaces).
+///
+/// # Errors
+/// - `Misaligned` if `virt` is not 4 KiB aligned.
+/// - `OutOfFrames` if the boot-time allocator has no more frames.
+/// - `AlreadyMapped` if `virt` is already bound to a frame.
+/// - `Paging` for any other error from `Mapper::map_to`.
+pub fn map_user_page(
+    virt: VirtAddr,
+    extra_flags: x86_64::structures::paging::PageTableFlags,
+) -> Result<PhysFrame, MapUserError> {
+    use x86_64::instructions::tlb;
+    use x86_64::structures::paging::{Mapper, Page, PageTableFlags};
+
+    if virt.as_u64() & 0xFFF != 0 {
+        return Err(MapUserError::Misaligned);
+    }
+    let page: Page<Size4KiB> = Page::containing_address(virt);
+
+    let flags = PageTableFlags::PRESENT
+        | PageTableFlags::USER_ACCESSIBLE
+        | extra_flags;
+
+    with_page_table(|pt| {
+        with_frame_allocator(|fa| {
+            let frame = fa.allocate_frame().ok_or(MapUserError::OutOfFrames)?;
+            // SAFETY: Frame is freshly allocated from the boot-time
+            // allocator and is not mapped anywhere else. No aliasing.
+            unsafe {
+                pt.map_to(page, frame, flags, fa)
+                    .map_err(|e| match e {
+                        x86_64::structures::paging::mapper::MapToError::PageAlreadyMapped(_) =>
+                            MapUserError::AlreadyMapped,
+                        _ => MapUserError::Paging,
+                    })?
+                    .flush();
+            }
+            tlb::flush(virt);
+            Ok(frame)
+        })
+    })
+}
+
+/// Re-map an existing user page with a new set of flags. Used to
+/// flip the user text page from RW (during payload copy) to RX
+/// (before the iretq descent). The backing frame is unchanged.
+pub fn remap_user_page_flags(
+    virt: VirtAddr,
+    extra_flags: x86_64::structures::paging::PageTableFlags,
+) -> Result<(), MapUserError> {
+    use x86_64::instructions::tlb;
+    use x86_64::structures::paging::{Mapper, Page, PageTableFlags};
+
+    if virt.as_u64() & 0xFFF != 0 {
+        return Err(MapUserError::Misaligned);
+    }
+    let page: Page<Size4KiB> = Page::containing_address(virt);
+    let flags = PageTableFlags::PRESENT
+        | PageTableFlags::USER_ACCESSIBLE
+        | extra_flags;
+
+    with_page_table(|pt| {
+        // SAFETY: page is already mapped (we mapped it via
+        // map_user_page just before); we only update the flags.
+        unsafe {
+            pt.update_flags(page, flags)
+                .map_err(|_| MapUserError::Paging)?
+                .flush();
+        }
+        tlb::flush(virt);
+        Ok(())
+    })
+}
