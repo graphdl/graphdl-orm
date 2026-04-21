@@ -45,7 +45,7 @@
 use hashbrown::HashMap;
 
 use crate::ast::{Object, binding, fetch_or_phi};
-use crate::rmap::{self, TableColumn, TableDef};
+use crate::rmap::{self, ColumnView};
 #[allow(unused_imports)]
 use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 
@@ -117,8 +117,9 @@ fn sm_transitions(state: &Object, noun_name: &str) -> Vec<(String, String, Strin
 /// Compile state into an OpenAPI 3.1 JSON document for one App.
 ///
 /// Public entry point matching the solidity/fpga generator signature.
-/// Reads directly from state cells via `rmap_from_state` and
-/// `state_machines_from_state` â€” no `state_to_domain` round-trip.
+/// Reads directly from state cells via `rmap_cells_from_state` and the
+/// SM cell-reader helpers â€” no `state_to_domain` round-trip, no typed
+/// IR struct in flight.
 pub fn compile_to_openapi(state: &Object, app_name: &str) -> String {
     openapi_from_state(state, app_name).to_string()
 }
@@ -128,10 +129,10 @@ pub fn compile_to_openapi(state: &Object, app_name: &str) -> String {
 /// Used by `compile_to_openapi`. Reads nouns, fact types, instance facts,
 /// enum values, and state machines directly from state cells.
 fn openapi_from_state(state: &Object, app_name: &str) -> serde_json::Value {
-    let tables = rmap::rmap_from_state(state);
-    let tables_by_entity: HashMap<String, &TableDef> = tables.iter()
-        .map(|t| (t.name.clone(), t))
-        .collect();
+    // RMAP as cells (#325): per-noun columns + PK come from the
+    // `RMAPTable` / `RMAPColumn` cell readers. No typed-IR struct
+    // crosses the generator boundary.
+    let cells = rmap::rmap_cells_from_state(state);
 
     let nouns_cell = fetch_or_phi("Noun", state);
     let nouns_seq = nouns_cell.as_seq().unwrap_or(&[]);
@@ -168,8 +169,9 @@ fn openapi_from_state(state: &Object, app_name: &str) -> serde_json::Value {
         .filter(|(_, obj_type)| obj_type.as_str() == "entity")
         .filter_map(|(name, _)| {
             let table_name = rmap::to_snake(name);
-            tables_by_entity.get(&table_name)
-                .map(|table| (name.clone(), component_schema_from_state(name, table, &noun_by_snake, &enum_values, state)))
+            let cols = rmap::columns_for_table(&cells, &table_name);
+            if cols.is_empty() { return None; }
+            Some((name.clone(), component_schema_from_state(name, &cols, &noun_by_snake, &enum_values, state)))
         })
         .collect();
 
@@ -184,14 +186,12 @@ fn openapi_from_state(state: &Object, app_name: &str) -> serde_json::Value {
 
     let paths: serde_json::Map<String, serde_json::Value> = noun_types.iter()
         .filter(|(_, obj_type)| obj_type.as_str() == "entity")
-        .filter(|(name, _)| {
-            let table_name = rmap::to_snake(name);
-            tables_by_entity.contains_key(&table_name)
-        })
         .flat_map(|(name, _)| {
+            let table_name = rmap::to_snake(name);
+            let cols = rmap::columns_for_table(&cells, &table_name);
+            if cols.is_empty() { return Vec::new(); }
             let plural = plural_for_noun_from_state(name, inst_seq);
-            let table = tables_by_entity.get(&rmap::to_snake(name)).copied();
-            paths_for_noun_from_state(name, &plural, state, &noun_types, inst_seq, ft_seq, role_seq, table)
+            paths_for_noun_from_state(name, &plural, state, &noun_types, inst_seq, ft_seq, role_seq, &cols)
         })
         .collect();
 
@@ -370,7 +370,7 @@ fn paths_for_noun_from_state(
     inst_seq: &[Object],
     ft_seq: &[Object],
     role_seq: &[Object],
-    table: Option<&TableDef>,
+    columns: &[ColumnView],
 ) -> Vec<(String, serde_json::Value)> {
     let schema_ref = serde_json::json!({
         "$ref": format!("#/components/schemas/{}", noun_name),
@@ -417,42 +417,37 @@ fn paths_for_noun_from_state(
     // sort UI without guessing. Sorting is bound by Halpin's 3NF
     // row shape: only scalar columns of the entity's own table
     // qualify, never joined FTs (those get their own list route).
-    let list_params: Vec<serde_json::Value> = table
-        .map(|t| {
-            let sort_fields: Vec<String> = t.columns.iter()
-                .map(|c| c.name.clone())
-                .collect();
-            if sort_fields.is_empty() {
-                return Vec::new();
-            }
-            vec![
-                serde_json::json!({
-                    "name": "sort",
-                    "in": "query",
-                    "required": false,
-                    "description": format!(
-                        "Field to sort {} by. Enumerates the noun's RMAP columns (§5.4).",
-                        noun_name,
-                    ),
-                    "schema": {
-                        "type": "string",
-                        "enum": sort_fields,
-                    },
-                }),
-                serde_json::json!({
-                    "name": "order",
-                    "in": "query",
-                    "required": false,
-                    "description": "Sort direction. Ignored when `sort` is omitted.",
-                    "schema": {
-                        "type": "string",
-                        "enum": ["asc", "desc"],
-                        "default": "asc",
-                    },
-                }),
-            ]
-        })
-        .unwrap_or_default();
+    let sort_fields: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+    let list_params: Vec<serde_json::Value> = if sort_fields.is_empty() {
+        Vec::new()
+    } else {
+        vec![
+            serde_json::json!({
+                "name": "sort",
+                "in": "query",
+                "required": false,
+                "description": format!(
+                    "Field to sort {} by. Enumerates the noun's RMAP columns (§5.4).",
+                    noun_name,
+                ),
+                "schema": {
+                    "type": "string",
+                    "enum": sort_fields,
+                },
+            }),
+            serde_json::json!({
+                "name": "order",
+                "in": "query",
+                "required": false,
+                "description": "Sort direction. Ignored when `sort` is omitted.",
+                "schema": {
+                    "type": "string",
+                    "enum": ["asc", "desc"],
+                    "default": "asc",
+                },
+            }),
+        ]
+    };
 
     let mut list_get = serde_json::json!({
         "summary": format!("List {}.", noun_name),
@@ -725,12 +720,12 @@ fn verb_slug_from_reading(reading: &str, noun_names: &[&str]) -> String {
 /// HashMaps derived from state cells rather than `&Domain`.
 fn component_schema_from_state(
     noun_name: &str,
-    table: &TableDef,
+    columns: &[ColumnView],
     noun_by_snake: &HashMap<String, String>,
     enum_values: &HashMap<String, Vec<String>>,
     state: &Object,
 ) -> serde_json::Value {
-    let column_props = table.columns.iter()
+    let column_props = columns.iter()
         .map(|col| (col.name.clone(), column_property_from_state(col, noun_by_snake, enum_values)));
 
     // SM-derived "status" property, if this noun has a state machine.
@@ -750,7 +745,7 @@ fn component_schema_from_state(
     let properties: serde_json::Map<String, serde_json::Value> =
         column_props.chain(sm_props).collect();
 
-    let required: Vec<String> = table.columns.iter()
+    let required: Vec<String> = columns.iter()
         .filter(|c| !c.nullable)
         .map(|c| c.name.clone())
         .collect();
@@ -771,7 +766,7 @@ fn component_schema_from_state(
 /// State-based variant of `column_property`. Uses `enum_values` HashMap
 /// derived directly from the Noun cell rather than `domain.enum_values`.
 fn column_property_from_state(
-    col: &TableColumn,
+    col: &ColumnView,
     noun_by_snake: &HashMap<String, String>,
     enum_values: &HashMap<String, Vec<String>>,
 ) -> serde_json::Value {
