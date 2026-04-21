@@ -55,6 +55,10 @@ mod conceptual_query;
 #[allow(dead_code)]
 mod parse_forml2;
 #[allow(dead_code)]
+mod parse_forml2_stage1;
+#[allow(dead_code)]
+mod parse_forml2_stage2;
+#[allow(dead_code)]
 // verbalize module deleted (#211)
 // mod arest was deleted in 5aa1f7e (GraphDL → AREST rebrand).
 // The Command enum + apply_command_defs entry points moved to
