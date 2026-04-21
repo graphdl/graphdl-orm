@@ -155,6 +155,12 @@ pub mod cloudflare;
 struct CompiledState {
     cells: hashbrown::HashMap<String, Arc<RwLock<ast::Object>>>,
     snapshots: hashbrown::HashMap<String, ast::Object>,
+    /// Sec-4: per-tenant secret that HMAC-signs snapshot ids so
+    /// `system(h, "rollback", …)` cannot be driven by brute-forcing
+    /// raw labels. Filled from a boot-time nonce in `new()`; never
+    /// leaves the process. See the `snapshot:` / `rollback:` branches
+    /// of `system_impl` for the sign/verify flow.
+    snapshot_secret: [u8; 32],
 }
 
 /// Outcome of a targeted-write attempt via `try_commit_diff`.
@@ -171,12 +177,67 @@ enum CommitOutcome {
     StructuralChange,
 }
 
+/// Sec-4: per-tenant 32-byte secret used to HMAC-sign snapshot ids.
+///
+/// `getrandom` is not a dep of this crate, so we tap `std::collections::
+/// hash_map::RandomState` which std seeds from OS entropy
+/// (getrandom/BCryptGenRandom) for hashmap iteration-order
+/// randomization. Four fresh `RandomState::new()` calls cover four
+/// 8-byte chunks of the secret. A SHA-256 final mix absorbs a
+/// `SystemTime` nanosecond stamp, the process id, and a
+/// per-tenant monotonic counter so two tenants instantiated in the
+/// same thread at the same nanosecond still land on distinct secrets.
+///
+/// This is a "boot-time nonce" per the Sec-4 handoff: not a drop-in
+/// replacement for a CSPRNG, but enough entropy (>> 128 bits under
+/// any sane std platform) that a caller who can only reach `system`
+/// cannot feasibly forge a valid tag for any raw id.
+#[cfg(not(feature = "no_std"))]
+fn boot_time_snapshot_secret() -> [u8; 32] {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use sha2::{Digest, Sha256};
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let mut h = Sha256::new();
+    // Four OS-seeded RandomState draws, each hashed with a distinct
+    // salt so we extract 4 × 64 bits of output dependent on the
+    // OS-seeded keys. std uses getrandom / BCryptGenRandom under the
+    // hood to seed these keys.
+    for salt in 0u8..4 {
+        let rs = RandomState::new();
+        let mut hh = rs.build_hasher();
+        hh.write(&[0xA5, salt, 0x5A]);
+        h.update(hh.finish().to_le_bytes());
+    }
+    // SystemTime nanos: defense in depth against platforms where
+    // RandomState might be weak — the absolute boot instant is not
+    // predictable to an outside attacker.
+    let now_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u128)
+        .unwrap_or(0);
+    h.update(now_nanos.to_le_bytes());
+    h.update((std::process::id() as u64).to_le_bytes());
+    // Monotonic counter differentiates tenants created in the same
+    // nanosecond within the same process.
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    h.update(COUNTER.fetch_add(1, Ordering::Relaxed).to_le_bytes());
+
+    let digest = h.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
+
 #[cfg(not(feature = "no_std"))]
 impl CompiledState {
     fn new(initial_d: ast::Object) -> Self {
         let mut s = Self {
             cells: hashbrown::HashMap::new(),
             snapshots: hashbrown::HashMap::new(),
+            snapshot_secret: boot_time_snapshot_secret(),
         };
         s.replace_d(initial_d);
         s
@@ -905,11 +966,39 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
         };
         let snap = st.snapshot_d();
         st.snapshots.insert(label.clone(), snap);
-        return label;
+        // Sec-4: append an HMAC tag over the raw label under the
+        // tenant's secret. Caller keeps the signed form and must
+        // hand it back unmodified to `rollback`. 16 hex chars = first
+        // 64 bits of the HMAC-SHA256 digest — large enough that a
+        // forger cannot enumerate tags even with unlimited rollback
+        // attempts (2^64 guesses at one round-trip each).
+        let digest = crate::crypto::sign_with(&st.snapshot_secret, label.as_bytes());
+        return format!("{}.{}", label, &digest[..16]);
     }
     if key == "rollback" {
         let mut st = tenant.write();
-        return match st.snapshots.get(input).cloned() {
+        // Sec-4: accept only `<raw>.<tag>` form. Split on the LAST
+        // dot so labels may contain dots ("release-v1.2.3" → raw =
+        // "release-v1.2.3", tag = "…"). Unsigned ids are refused so
+        // a caller that only reaches `system` cannot rewind state by
+        // guessing or reading raw labels out of `snapshots`.
+        let Some(dot_at) = input.rfind('.') else {
+            return "⊥".into();
+        };
+        let raw = &input[..dot_at];
+        let tag = &input[dot_at + 1..];
+        if tag.len() != 16 || !tag.chars().all(|c| c.is_ascii_hexdigit()) {
+            return "⊥".into();
+        }
+        // Constant-time tag compare against HMAC-SHA256(secret, raw).
+        // Rejected tags never advance to the snapshot-map lookup, so
+        // an attacker can't probe which raw labels exist through
+        // timing of the rollback path.
+        let expected = crate::crypto::sign_with(&st.snapshot_secret, raw.as_bytes());
+        if !crate::crypto::ct_eq_str(&expected[..16], tag) {
+            return "⊥".into();
+        }
+        return match st.snapshots.get(raw).cloned() {
             Some(snap) => {
                 st.replace_d(snap);
                 input.to_string()
@@ -1500,20 +1589,30 @@ Order has total.
 
     #[test]
     fn snapshot_returns_auto_id_when_input_empty() {
+        // Sec-4: the raw portion carries the monotonic counter; the
+        // full id adds an HMAC tag. Compare on the raw prefix only —
+        // the tag itself is exercised by the Sec-4 test block below.
         let h = create_bare_impl();
         let id1 = system_impl(h, "snapshot", "");
         let id2 = system_impl(h, "snapshot", "");
-        assert_eq!(id1, "snap-0", "first auto id");
-        assert_eq!(id2, "snap-1", "second auto id — monotonic counter");
+        let (raw1, _) = split_signed_id(&id1);
+        let (raw2, _) = split_signed_id(&id2);
+        assert_eq!(raw1, "snap-0", "first auto id");
+        assert_eq!(raw2, "snap-1", "second auto id — monotonic counter");
         release_impl(h);
     }
 
     #[test]
     fn snapshot_accepts_caller_label_verbatim() {
+        // Sec-4: the raw portion echoes the caller label; the HMAC tag
+        // is deterministic per (secret, label), so a second snapshot
+        // under the same label returns an identical signed id.
         let h = create_bare_impl();
-        assert_eq!(system_impl(h, "snapshot", "before-migrate"), "before-migrate");
-        assert_eq!(system_impl(h, "snapshot", "before-migrate"), "before-migrate",
-            "same label is idempotent — overwrites the prior snapshot");
+        let first = system_impl(h, "snapshot", "before-migrate");
+        let (raw, _) = split_signed_id(&first);
+        assert_eq!(raw, "before-migrate", "raw portion echoes label");
+        assert_eq!(system_impl(h, "snapshot", "before-migrate"), first,
+            "same label is idempotent — tag is deterministic, so signed id is stable");
         release_impl(h);
     }
 
@@ -1539,7 +1638,7 @@ Order has total.
         // Snapshot a known-good state; mutate it via direct cell write;
         // rollback; confirm the cell is back to its pre-mutation content.
         let h = alloc_with_noun("before");
-        let _ = system_impl(h, "snapshot", "v1");
+        let signed = system_impl(h, "snapshot", "v1");
         // Mutate the Noun cell by replacing the whole state.
         {
             let tenant = tenant_lock(h).unwrap();
@@ -1551,8 +1650,8 @@ Order has total.
             ast::Object::atom("after"),
             "mutation landed"
         );
-        // Roll back to v1.
-        assert_eq!(system_impl(h, "rollback", "v1"), "v1");
+        // Roll back to v1 via the signed id returned by snapshot.
+        assert_eq!(system_impl(h, "rollback", &signed), signed);
         assert_eq!(
             ast::fetch("Noun", &peek(h).unwrap()),
             ast::Object::atom("before"),
@@ -1566,7 +1665,7 @@ Order has total.
         // One snapshot can be rolled back to many times — the snapshot
         // map is not drained on rollback.
         let h = alloc_with_noun("origin");
-        let _ = system_impl(h, "snapshot", "anchor");
+        let signed = system_impl(h, "snapshot", "anchor");
         for round in 0..3 {
             {
                 let tenant = tenant_lock(h).unwrap();
@@ -1577,7 +1676,7 @@ Order has total.
                     &ast::Object::phi(),
                 ));
             }
-            assert_eq!(system_impl(h, "rollback", "anchor"), "anchor");
+            assert_eq!(system_impl(h, "rollback", &signed), signed);
             assert_eq!(
                 ast::fetch("Noun", &peek(h).unwrap()),
                 ast::Object::atom("origin"),
@@ -1611,6 +1710,161 @@ Order has total.
         assert_eq!(system_impl(u32::MAX, "snapshot", ""), "⊥");
         assert_eq!(system_impl(u32::MAX, "rollback", "whatever"), "⊥");
         assert_eq!(system_impl(u32::MAX, "snapshots", ""), "⊥");
+    }
+
+    // ── Sec-4: HMAC-signed snapshot ids ──────────────────────────────
+    //
+    // Without signatures, any caller that can reach `system` can pass
+    // `rollback <guess>` and rewind tenant state by brute-forcing ids.
+    // snapshot: now returns `<raw>.<16-hex-tag>` where the tag is an
+    // HMAC-SHA256 of the raw id under a per-tenant secret generated at
+    // CompiledState::new(). rollback: splits on the last `.`, validates
+    // the tag in constant time, and only then consults the snapshot
+    // map. Unsigned legacy ids are refused outright — the signed form
+    // is the only path through.
+    //
+    // Split on the LAST dot so labels may themselves contain dots
+    // (e.g. "release-v1.2.3" → raw="release-v1.2.3", tag="…").
+
+    /// Parse the `<raw>.<hex-tag>` form for tests. Panics with a
+    /// descriptive message if the shape is wrong.
+    fn split_signed_id(id: &str) -> (&str, &str) {
+        let dot = id.rfind('.').unwrap_or_else(||
+            panic!("expected signed id '<raw>.<tag>', got {id:?}"));
+        (&id[..dot], &id[dot + 1..])
+    }
+
+    #[test]
+    fn snapshot_returns_signed_id_with_16_hex_tag() {
+        let h = create_bare_impl();
+        let id = system_impl(h, "snapshot", "v1");
+        let (raw, tag) = split_signed_id(&id);
+        assert_eq!(raw, "v1", "raw portion must echo the caller label");
+        assert_eq!(tag.len(), 16,
+            "tag must be 16 hex chars (64 bits of HMAC-SHA256); got {} in {id:?}",
+            tag.len());
+        assert!(tag.chars().all(|c| c.is_ascii_hexdigit()),
+            "tag must be lowercase hex; got {tag:?}");
+        release_impl(h);
+    }
+
+    #[test]
+    fn snapshot_auto_id_is_also_signed() {
+        let h = create_bare_impl();
+        let id = system_impl(h, "snapshot", "");
+        let (raw, tag) = split_signed_id(&id);
+        assert_eq!(raw, "snap-0", "auto id numbering unchanged");
+        assert_eq!(tag.len(), 16);
+        release_impl(h);
+    }
+
+    #[test]
+    fn rollback_with_raw_portion_alone_is_refused() {
+        // Handoff acceptance: "rollback with raw portion alone fails."
+        // An attacker who only learns the raw label (e.g. via
+        // `snapshots`) must not be able to rewind — the tag is required.
+        let h = alloc_with_noun("before");
+        let signed = system_impl(h, "snapshot", "anchor");
+        let (raw, _tag) = split_signed_id(&signed);
+        assert_eq!(system_impl(h, "rollback", raw), "⊥",
+            "rollback with only the raw label must return ⊥; \
+             signed id was {signed:?}");
+        release_impl(h);
+    }
+
+    #[test]
+    fn rollback_with_signed_id_succeeds_and_restores_state() {
+        // Handoff acceptance: "rollback with signed id succeeds."
+        let h = alloc_with_noun("origin");
+        let signed = system_impl(h, "snapshot", "v1");
+
+        // Mutate the tenant, then roll back with the signed id.
+        {
+            let tenant = tenant_lock(h).unwrap();
+            let mut st = tenant.write();
+            st.replace_d(ast::store("Noun", ast::Object::atom("mutated"), &ast::Object::phi()));
+        }
+        assert_eq!(
+            ast::fetch("Noun", &peek(h).unwrap()),
+            ast::Object::atom("mutated"),
+            "precondition: mutation landed"
+        );
+
+        assert_eq!(system_impl(h, "rollback", &signed), signed,
+            "rollback must echo the signed id on success");
+        assert_eq!(
+            ast::fetch("Noun", &peek(h).unwrap()),
+            ast::Object::atom("origin"),
+            "rollback must restore the pre-mutation payload"
+        );
+        release_impl(h);
+    }
+
+    #[test]
+    fn rollback_with_tampered_signature_returns_bottom() {
+        // Handoff acceptance: "tampering the signature portion returns
+        // Bottom." Any edit to the tag — even one hex nibble — must
+        // fail HMAC verification and be rejected before the snapshot
+        // map is consulted.
+        let h = alloc_with_noun("origin");
+        let signed = system_impl(h, "snapshot", "v1");
+        let (raw, tag) = split_signed_id(&signed);
+
+        // Flip the first hex char of the tag to a guaranteed-different
+        // nibble (0<->1).
+        let mut bytes = tag.as_bytes().to_vec();
+        bytes[0] = match bytes[0] {
+            b'0' => b'1',
+            _    => b'0',
+        };
+        let tampered_tag = std::str::from_utf8(&bytes).unwrap();
+        let tampered = format!("{raw}.{tampered_tag}");
+        assert_ne!(tampered, signed, "test setup must produce a distinct tag");
+
+        assert_eq!(system_impl(h, "rollback", &tampered), "⊥",
+            "rollback with tampered tag must return ⊥; tampered id was {tampered:?}");
+        release_impl(h);
+    }
+
+    #[test]
+    fn rollback_rejects_unsigned_id_even_after_matching_snapshot_stored() {
+        // Regression: even if the snapshot map DOES contain an entry
+        // under the raw label, rollback with the raw label alone must
+        // still fail. The tag check is the primary gate; the map
+        // lookup only runs after successful verification.
+        let h = alloc_with_noun("origin");
+        let _signed = system_impl(h, "snapshot", "legacy");
+        assert_eq!(system_impl(h, "rollback", "legacy"), "⊥",
+            "raw label without tag must be refused");
+        // State must be unchanged — rollback didn't fire.
+        assert_eq!(
+            ast::fetch("Noun", &peek(h).unwrap()),
+            ast::Object::atom("origin"),
+            "refused rollback must not mutate state"
+        );
+        release_impl(h);
+    }
+
+    #[test]
+    fn signed_id_from_one_tenant_does_not_validate_on_another() {
+        // The secret is per-tenant — leaking a signed id from h1 must
+        // not let a caller rollback on h2. h2 has no matching snapshot
+        // under the raw label anyway, but signature verification must
+        // fail first (so even pre-loading the label on h2 wouldn't
+        // help).
+        let h1 = alloc_with_noun("h1");
+        let h2 = alloc_with_noun("h2");
+        let signed_on_h1 = system_impl(h1, "snapshot", "shared-label");
+
+        // Stash a snapshot under the same raw label on h2 so any
+        // lookup that bypasses signature verification would spuriously
+        // succeed. The signed id from h1 must still fail on h2.
+        let _h2_signed = system_impl(h2, "snapshot", "shared-label");
+
+        assert_eq!(system_impl(h2, "rollback", &signed_on_h1), "⊥",
+            "h1's signed id must not validate against h2's secret");
+        release_impl(h1);
+        release_impl(h2);
     }
 
     // ── freeze / thaw round-trip through system bridge (#203) ──────
