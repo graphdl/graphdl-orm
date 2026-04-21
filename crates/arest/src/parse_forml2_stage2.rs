@@ -50,59 +50,43 @@ pub fn classify_statements(statements_state: &Object, grammar_state: &Object) ->
     // translate_derivation_rules runs after classification), so the
     // cached grammar-only defs match a fresh `compile_to_defs_state`
     // of the merged state at this call site.
-    let (defs, antecedents): (&Vec<(String, crate::ast::Func)>, &Vec<Option<Vec<String>>>)
-        = match cached_grammar() {
+    let (classifier_defs, classifier_antecedents): (
+        &Vec<(String, crate::ast::Func)>,
+        &Vec<Vec<String>>,
+    ) = match cached_grammar() {
         Ok((_, d, a)) => (d, a),
         Err(_) => {
-            // Fallback: if grammar cache somehow failed, recompile from
-            // the grammar_state passed in (keeps meta-circular behavior).
-            // SAFETY: leaks once per process; acceptable for fallback.
-            let fresh = crate::compile::compile_to_defs_state(grammar_state);
-            let leaked: &'static _ = Box::leak(Box::new(fresh));
-            let empty: &'static _ = Box::leak(Box::new(vec![None; leaked.len()]));
-            (leaked, empty)
+            // Fallback: if grammar cache failed, run nothing (classify
+            // is a no-op and translators will see an un-classified
+            // state — the caller's error path handles this).
+            static EMPTY_DEFS: std::sync::OnceLock<
+                (Vec<(String, crate::ast::Func)>, Vec<Vec<String>>)
+            > = std::sync::OnceLock::new();
+            let (d, a) = EMPTY_DEFS.get_or_init(|| (Vec::new(), Vec::new()));
+            (d, a)
         }
     };
-    let t1 = std::time::Instant::now();
-    let with_defs = crate::ast::defs_to_state(defs, &merged);
-    if trace { eprintln!("  [cls] defs_to_state: {:?}", t1.elapsed()); }
-    // Build a parallel antecedent-cells slice for just the derivation
-    // defs, in the same order the chainer iterates them.
-    //
-    // Unspecialized grammar defs (the implicit-derivation funcs
-    // compile emits — subtype transitivity, CWA, etc. — applied to the
-    // grammar itself) read only cells populated by the grammar's own
-    // declarations, which Stage-1 never mutates. Their output on
-    // round 2 against unchanged input is always a superset of round
-    // 1's and gets entirely deduped away. Force them into round 1 by
-    // declaring "reads nothing chain-relevant" (`Some(&[])`); the
-    // semi-naive filter then skips them after round 1, saving the
-    // ~5s of wasted work we measured.
-    static EMPTY_READS: &[String] = &[];
-    let deriv: Vec<(&str, &crate::ast::Func, Option<&[String]>)> = defs.iter()
-        .zip(antecedents.iter())
-        .filter(|((n, _), _)| n.starts_with("derivation:"))
-        .map(|((n, f), a)| {
-            let reads = match a.as_deref() {
-                Some(cells) => Some(cells),
-                None => Some(EMPTY_READS),
-            };
-            (n.as_str(), f, reads)
-        })
+    // `merged` already contains the cached expanded grammar state
+    // (grammar + fixpoint of implicit compile-emitted derivations);
+    // the only defs we still need to fire at call time are the
+    // classifier Natives, which run semi-naive. Skip `defs_to_state`
+    // — the expanded grammar_state has them already.
+    let deriv: Vec<(&str, &crate::ast::Func, Option<&[String]>)> = classifier_defs.iter()
+        .zip(classifier_antecedents.iter())
+        .map(|((n, f), a)| (n.as_str(), f, Some(a.as_slice())))
         .collect();
     let t2 = std::time::Instant::now();
-    // Grammar rules stratify in depth 2: round 1 emits the base
-    // classifications (Entity Type Declaration, Enum Values
-    // Declaration, Uniqueness Constraint, …) from the Stage-1
-    // `Statement_has_*` tokens; round 2 fires the single
+    // Grammar classification rules stratify in depth 2: round 1 emits
+    // base classifications from Stage-1 `Statement_has_*` tokens;
+    // round 2 fires the single
     // `Value Constraint iff Classification 'Enum Values Declaration'`
-    // rule (forml2-grammar.md:139) over the round-1 output. The
+    // rule (forml2-grammar.md:139) over round 1's output. The
     // semi-naive chainer uses per-rule antecedent cells to skip
-    // round 2 rules whose read cells didn't change in round 1 — with
-    // grammar the only cell that changes between rounds is
-    // `Statement_has_Classification`, so 68 of 69 rules skip round 2.
+    // unchained rules in round 2 — with grammar the only cell that
+    // changes between rounds is `Statement_has_Classification`, so
+    // only the one chaining rule runs.
     let (final_state, _) = crate::evaluate::forward_chain_defs_state_semi_naive(
-        &deriv, &with_defs, 2);
+        &deriv, &merged, 2);
     if trace { eprintln!("  [cls] forward_chain ({} defs): {:?}",
         deriv.len(), t2.elapsed()); }
     final_state
@@ -1258,9 +1242,9 @@ fn collect_statement_ids(state: &Object) -> Vec<String> {
 /// classification rules).
 #[cfg(feature = "std-deps")]
 type GrammarCacheEntry = (
-    Object,
-    alloc::vec::Vec<(String, crate::ast::Func)>,
-    alloc::vec::Vec<Option<Vec<String>>>,
+    Object,                                             // expanded grammar state
+    alloc::vec::Vec<(String, crate::ast::Func)>,        // classifier defs only
+    alloc::vec::Vec<Vec<String>>,                       // classifier antecedent cells
 );
 
 #[cfg(feature = "std-deps")]
@@ -1284,17 +1268,73 @@ fn cached_grammar() -> Result<&'static GrammarCacheEntry, String> {
     // Func interpreter paid a ~100× tax. Keeping the grammar as the
     // source of truth (the text came from `readings/forml2-grammar.md`)
     // plus specializing at cache time gets legacy's speed back without
-    // abandoning meta-circularity. Unmatched rules fall through to the
-    // general interpreter.
-    //
-    // Also computes the parallel antecedent-cells-per-def vector used
-    // by the semi-naive chainer: for specialized rules we know exactly
-    // which cells they read; for everything else we leave `None` and
-    // the chainer falls back to "run every round".
+    // abandoning meta-circularity.
     let antecedents = specialize_grammar_classifiers(&parsed, &mut defs);
+
+    // Partition compiled defs: classifier rules (specialized, with
+    // known antecedent cells) vs everything else (compile-emitted
+    // implicit derivations — subtype transitivity, modus ponens, CWA,
+    // …, plus any other derivation:* defs that weren't specialized).
+    //
+    // Stage-1 tokenization only writes `Statement_has_*` cells; the
+    // implicit derivations read grammar-static cells (`Subtype`,
+    // `FactType`, `Role`, `DerivationRule`, …) that no user input
+    // ever touches. Their fixpoint over the grammar alone is
+    // therefore the fixpoint over any (grammar ⊕ statements) state.
+    // Pre-run them here — once, at cache init — so classify_statements
+    // can skip them entirely. Moves ~2s/call of interpreter cost to
+    // a single process-lifetime operation.
+    let mut expanded_grammar = parsed.clone();
+    let mut classifier_defs: Vec<(String, crate::ast::Func)> = Vec::new();
+    let mut classifier_antecedents: Vec<Vec<String>> = Vec::new();
+    let mut implicit_defs: Vec<(String, crate::ast::Func)> = Vec::new();
+    for ((name, func), anc) in defs.into_iter().zip(antecedents.into_iter()) {
+        if name.starts_with("derivation:") {
+            match anc {
+                Some(cells) => {
+                    classifier_defs.push((name, func));
+                    classifier_antecedents.push(cells);
+                }
+                None => {
+                    implicit_defs.push((name, func));
+                }
+            }
+        } else {
+            // Non-derivation defs (schemas, validators, …) go into
+            // the expanded state via `defs_to_state` below so
+            // downstream lookups still find them.
+            implicit_defs.push((name, func));
+        }
+    }
+    // Materialize all defs into cells so `forward_chain_defs_state`
+    // can reference them from within derivations if needed.
+    let all_defs: Vec<(String, crate::ast::Func)> = implicit_defs.iter()
+        .cloned()
+        .chain(classifier_defs.iter().cloned())
+        .collect();
+    let grammar_with_defs = crate::ast::defs_to_state(&all_defs, &expanded_grammar);
+    // Run ONLY the implicit derivation:* defs over the grammar state
+    // to full fixpoint. No semi-naive here — generic fixpoint since
+    // implicit rules may chain against each other.
+    let implicit_deriv_refs: Vec<(&str, &crate::ast::Func)> = implicit_defs.iter()
+        .filter(|(n, _)| n.starts_with("derivation:"))
+        .map(|(n, f)| (n.as_str(), f))
+        .collect();
+    if !implicit_deriv_refs.is_empty() {
+        let (fixed, _) = crate::evaluate::forward_chain_defs_state(
+            &implicit_deriv_refs, &grammar_with_defs);
+        expanded_grammar = fixed;
+    } else {
+        expanded_grammar = grammar_with_defs;
+    }
+
     // OnceLock::set is safe under races — first writer wins, others
     // drop their work. We then read via `get` which succeeds.
-    let _ = GRAMMAR_CACHE.set((parsed, defs, antecedents));
+    let _ = GRAMMAR_CACHE.set((
+        expanded_grammar,
+        classifier_defs,
+        classifier_antecedents,
+    ));
     Ok(GRAMMAR_CACHE.get().expect("just set"))
 }
 
@@ -1313,9 +1353,22 @@ fn parse_classification_rule_spec(text: &str)
     let rest = t.strip_prefix(prefix)?;
     let (classification, after_cls) = rest.split_once('\'')?;
     let iff_clause = after_cls.strip_prefix(" iff ")?;
-    // Split on " and " to handle two-antecedent rules (Frequency Constraint).
+    // Split on " and Statement has " to handle two-antecedent rules
+    // (Frequency Constraint). A plain " and " split would break on
+    // literal values containing `and` (e.g. the Equality Constraint
+    // rule's `'if and only if'` keyword).
     let mut clauses: Vec<(String, Option<String>)> = Vec::new();
-    for clause in iff_clause.split(" and ") {
+    let mut parts: Vec<String> = Vec::new();
+    let mut rest = iff_clause;
+    const SEP: &str = " and Statement has ";
+    while let Some(i) = rest.find(SEP) {
+        parts.push(rest[..i].to_string());
+        // Skip the " and " portion but keep "Statement has " so the
+        // downstream clause parser sees it as a full clause.
+        rest = &rest[i + 5..];  // 5 = len(" and ")
+    }
+    parts.push(rest.to_string());
+    for clause in parts.iter() {
         let clause = clause.trim();
         // Each clause: `Statement has <Cell> ['<literal>']`.
         let body = clause.strip_prefix("Statement has ")?;
