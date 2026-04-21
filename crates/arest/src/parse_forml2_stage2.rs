@@ -2238,6 +2238,13 @@ pub fn parse_to_state_via_stage12(text: &str) -> Result<Object, String> {
     if trace { eprintln!("[s12] translators: {:?}", t_tr.elapsed()); }
     if trace { eprintln!("[s12] TOTAL: {:?}", t0.elapsed()); }
 
+    // Compound reference-scheme decomposition: mirrors the legacy
+    // parse_forml2.rs path. For each noun declared with `(.A, .B, ...)`
+    // (ref-scheme arity ≥ 2), split every instance subject value on '-'
+    // from the right and push `{Noun}_has_{Component}` cells carrying
+    // the noun id + component value. command.rs / rmap read these.
+    let compound_cells = compound_ref_component_cells(&noun_facts, &instance_fact_facts);
+
     let mut map: HashMap<String, Object> = HashMap::new();
     map.insert("Noun".to_string(), Object::Seq(noun_facts.into()));
     map.insert("Subtype".to_string(), Object::Seq(subtype_facts.into()));
@@ -2248,7 +2255,71 @@ pub fn parse_to_state_via_stage12(text: &str) -> Result<Object, String> {
     map.insert("InstanceFact".to_string(), Object::Seq(instance_fact_facts.into()));
     map.insert("EnumValues".to_string(), Object::Seq(enum_values_facts.into()));
     map.insert("UnresolvedClause".to_string(), Object::Seq(unresolved_clause_facts.into()));
+    for (cell_name, facts) in compound_cells {
+        map.insert(cell_name, Object::Seq(facts.into()));
+    }
     Ok(Object::Map(map))
+}
+
+/// Decompose compound reference-scheme instance ids into component
+/// cells. Legacy parity: `parse_forml2::parse_into` does this at the
+/// end of the cascade (crates/arest/src/parse_forml2.rs §"Compound
+/// reference-scheme decomposition"). For a noun `Thing(.Owner, .Seq)`
+/// and an instance `Thing 'alice-1' has …`, emit:
+///
+///   Thing_has_Owner { Thing: alice-1, Owner: alice }
+///   Thing_has_Seq   { Thing: alice-1, Seq:   1 }
+///
+/// Ids are rsplit on `-` so multi-hyphen first components
+/// (`alpha-team-7` into (`alpha-team`, `7`)) survive.
+#[cfg(feature = "std-deps")]
+fn compound_ref_component_cells(
+    noun_facts: &[Object],
+    instance_facts: &[Object],
+) -> Vec<(String, Vec<Object>)> {
+    // (noun_name, ref_parts) for nouns with arity ≥ 2.
+    let compound: Vec<(String, Vec<String>)> = noun_facts.iter()
+        .filter_map(|f| {
+            let name = binding(f, "name")?.to_string();
+            let rs = binding(f, "referenceScheme")?;
+            let parts: Vec<String> = rs.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            (parts.len() >= 2).then_some((name, parts))
+        })
+        .collect();
+    if compound.is_empty() { return Vec::new(); }
+
+    let mut out: hashbrown::HashMap<String, Vec<Object>> = hashbrown::HashMap::new();
+    for (noun_name, ref_parts) in &compound {
+        // Distinct subject ids for this noun.
+        let mut seen: hashbrown::HashSet<String> = hashbrown::HashSet::new();
+        let ids: Vec<String> = instance_facts.iter()
+            .filter_map(|f| {
+                (binding(f, "subjectNoun")? == noun_name.as_str())
+                    .then(|| binding(f, "subjectValue").map(String::from))
+                    .flatten()
+            })
+            .filter(|id| seen.insert(id.clone()))
+            .collect();
+        for id in &ids {
+            let parts_rev: Vec<&str> = id.rsplitn(ref_parts.len(), '-').collect();
+            if parts_rev.len() != ref_parts.len() { continue; }
+            let parts: Vec<&str> = parts_rev.into_iter().rev().collect();
+            for (component, value) in ref_parts.iter().zip(parts.iter()) {
+                let cell_name = alloc::format!("{}_has_{}",
+                    noun_name.replace(' ', "_"),
+                    component.replace(' ', "_"));
+                let fact = fact_from_pairs(&[
+                    (noun_name.as_str(), id.as_str()),
+                    (component.as_str(), *value),
+                ]);
+                out.entry(cell_name).or_default().push(fact);
+            }
+        }
+    }
+    out.into_iter().collect()
 }
 
 /// #309 — scan the source text for noun declarations whose unquoted
