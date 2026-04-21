@@ -37,39 +37,74 @@ use crate::ast::{Object, fetch_or_phi, fact_from_pairs, binding};
 /// cell.
 #[cfg(feature = "std-deps")]
 pub fn classify_statements(statements_state: &Object, grammar_state: &Object) -> Object {
+    let trace = std::env::var("AREST_STAGE12_TRACE").is_ok();
+    let tc0 = std::time::Instant::now();
     // Merge Stage-1 statement cells with grammar cells so
     // `compile_to_defs_state` sees both the nouns/fact-types/rules
     // declared by the grammar and the Statement facts they apply to.
     let merged = crate::ast::merge_states(statements_state, grammar_state);
+    if trace { eprintln!("  [cls] merge: {:?}", tc0.elapsed()); }
     // Grammar defs are pure functions of forml2-grammar.md — cached
     // in `GRAMMAR_CACHE` at first access. Stage-1 never populates the
     // DerivationRule cell (user rules stay in Statement form until
     // translate_derivation_rules runs after classification), so the
     // cached grammar-only defs match a fresh `compile_to_defs_state`
     // of the merged state at this call site.
-    let defs = cached_grammar().map(|(_, d)| d).unwrap_or_else(|_| {
-        // Fallback: if grammar cache somehow failed, recompile from
-        // the grammar_state passed in (keeps meta-circular behavior).
-        // SAFETY: leaks once per process; acceptable for fallback.
-        let fresh = crate::compile::compile_to_defs_state(grammar_state);
-        Box::leak(Box::new(fresh))
-    });
+    let (defs, antecedents): (&Vec<(String, crate::ast::Func)>, &Vec<Option<Vec<String>>>)
+        = match cached_grammar() {
+        Ok((_, d, a)) => (d, a),
+        Err(_) => {
+            // Fallback: if grammar cache somehow failed, recompile from
+            // the grammar_state passed in (keeps meta-circular behavior).
+            // SAFETY: leaks once per process; acceptable for fallback.
+            let fresh = crate::compile::compile_to_defs_state(grammar_state);
+            let leaked: &'static _ = Box::leak(Box::new(fresh));
+            let empty: &'static _ = Box::leak(Box::new(vec![None; leaked.len()]));
+            (leaked, empty)
+        }
+    };
+    let t1 = std::time::Instant::now();
     let with_defs = crate::ast::defs_to_state(defs, &merged);
-    let deriv_funcs: Vec<(&str, &crate::ast::Func)> = defs.iter()
-        .filter(|(n, _)| n.starts_with("derivation:"))
-        .map(|(n, f)| (n.as_str(), f))
+    if trace { eprintln!("  [cls] defs_to_state: {:?}", t1.elapsed()); }
+    // Build a parallel antecedent-cells slice for just the derivation
+    // defs, in the same order the chainer iterates them.
+    //
+    // Unspecialized grammar defs (the implicit-derivation funcs
+    // compile emits — subtype transitivity, CWA, etc. — applied to the
+    // grammar itself) read only cells populated by the grammar's own
+    // declarations, which Stage-1 never mutates. Their output on
+    // round 2 against unchanged input is always a superset of round
+    // 1's and gets entirely deduped away. Force them into round 1 by
+    // declaring "reads nothing chain-relevant" (`Some(&[])`); the
+    // semi-naive filter then skips them after round 1, saving the
+    // ~5s of wasted work we measured.
+    static EMPTY_READS: &[String] = &[];
+    let deriv: Vec<(&str, &crate::ast::Func, Option<&[String]>)> = defs.iter()
+        .zip(antecedents.iter())
+        .filter(|((n, _), _)| n.starts_with("derivation:"))
+        .map(|((n, f), a)| {
+            let reads = match a.as_deref() {
+                Some(cells) => Some(cells),
+                None => Some(EMPTY_READS),
+            };
+            (n.as_str(), f, reads)
+        })
         .collect();
+    let t2 = std::time::Instant::now();
     // Grammar rules stratify in depth 2: round 1 emits the base
     // classifications (Entity Type Declaration, Enum Values
     // Declaration, Uniqueness Constraint, …) from the Stage-1
     // `Statement_has_*` tokens; round 2 fires the single
     // `Value Constraint iff Classification 'Enum Values Declaration'`
-    // rule (forml2-grammar.md:139) over the round-1 output. No rule's
-    // antecedent reads a Value-Constraint-derived classification, so
-    // round 3 is guaranteed empty and the default chainer's third
-    // round is pure confirmation waste.
-    let (final_state, _) = crate::evaluate::forward_chain_defs_state_bounded(
-        &deriv_funcs, &with_defs, 2);
+    // rule (forml2-grammar.md:139) over the round-1 output. The
+    // semi-naive chainer uses per-rule antecedent cells to skip
+    // round 2 rules whose read cells didn't change in round 1 — with
+    // grammar the only cell that changes between rounds is
+    // `Statement_has_Classification`, so 68 of 69 rules skip round 2.
+    let (final_state, _) = crate::evaluate::forward_chain_defs_state_semi_naive(
+        &deriv, &with_defs, 2);
+    if trace { eprintln!("  [cls] forward_chain ({} defs): {:?}",
+        deriv.len(), t2.elapsed()); }
     final_state
 }
 
@@ -1222,13 +1257,18 @@ fn collect_statement_ids(state: &Object) -> Vec<String> {
 /// lines) and the compile-to-defs pass (~20ms/call for 69
 /// classification rules).
 #[cfg(feature = "std-deps")]
-static GRAMMAR_CACHE: std::sync::OnceLock<(Object, alloc::vec::Vec<(String, crate::ast::Func)>)>
+type GrammarCacheEntry = (
+    Object,
+    alloc::vec::Vec<(String, crate::ast::Func)>,
+    alloc::vec::Vec<Option<Vec<String>>>,
+);
+
+#[cfg(feature = "std-deps")]
+static GRAMMAR_CACHE: std::sync::OnceLock<GrammarCacheEntry>
     = std::sync::OnceLock::new();
 
 #[cfg(feature = "std-deps")]
-fn cached_grammar()
-    -> Result<&'static (Object, alloc::vec::Vec<(String, crate::ast::Func)>), String>
-{
+fn cached_grammar() -> Result<&'static GrammarCacheEntry, String> {
     if let Some(g) = GRAMMAR_CACHE.get() { return Ok(g); }
     let grammar = include_str!("../../../readings/forml2-grammar.md");
     let parsed = crate::parse_forml2::parse_to_state(grammar)
@@ -1246,10 +1286,15 @@ fn cached_grammar()
     // plus specializing at cache time gets legacy's speed back without
     // abandoning meta-circularity. Unmatched rules fall through to the
     // general interpreter.
-    specialize_grammar_classifiers(&parsed, &mut defs);
+    //
+    // Also computes the parallel antecedent-cells-per-def vector used
+    // by the semi-naive chainer: for specialized rules we know exactly
+    // which cells they read; for everything else we leave `None` and
+    // the chainer falls back to "run every round".
+    let antecedents = specialize_grammar_classifiers(&parsed, &mut defs);
     // OnceLock::set is safe under races — first writer wins, others
     // drop their work. We then read via `get` which succeeds.
-    let _ = GRAMMAR_CACHE.set((parsed, defs));
+    let _ = GRAMMAR_CACHE.set((parsed, defs, antecedents));
     Ok(GRAMMAR_CACHE.get().expect("just set"))
 }
 
@@ -1386,13 +1431,18 @@ fn build_native_classifier(
 /// Walk the grammar's `DerivationRule` cell, build a map from rule id
 /// to a specialization spec for recognized classification rules, then
 /// replace matching entries in `defs` with Native equivalents.
+/// Returns a parallel `Vec<Option<Vec<String>>>` of per-def
+/// antecedent cells — `Some(cells)` for specialized rules, `None` for
+/// unspecialized ones (meaning the semi-naive chainer should run them
+/// every round conservatively).
 #[cfg(feature = "std-deps")]
 fn specialize_grammar_classifiers(
     grammar_state: &Object,
     defs: &mut alloc::vec::Vec<(String, crate::ast::Func)>,
-) {
+) -> Vec<Option<Vec<String>>> {
+    let mut antecedents: Vec<Option<Vec<String>>> = vec![None; defs.len()];
     let rule_cell = crate::ast::fetch_or_phi("DerivationRule", grammar_state);
-    let Some(rules) = rule_cell.as_seq() else { return };
+    let Some(rules) = rule_cell.as_seq() else { return antecedents };
     let mut id_to_spec: hashbrown::HashMap<String, (String, Vec<(String, Option<String>)>)>
         = hashbrown::HashMap::new();
     for fact in rules.iter() {
@@ -1406,27 +1456,33 @@ fn specialize_grammar_classifiers(
             id_to_spec.insert(id, spec);
         }
     }
-    for (name, func) in defs.iter_mut() {
+    for (i, (name, func)) in defs.iter_mut().enumerate() {
         let Some(id) = name.strip_prefix("derivation:") else { continue };
         let Some(spec) = id_to_spec.get(id) else { continue };
         *func = build_native_classifier(spec.0.clone(), spec.1.clone());
+        antecedents[i] = Some(spec.1.iter().map(|(c, _)| c.clone()).collect());
     }
+    antecedents
 }
 
 #[cfg(feature = "std-deps")]
 fn cached_grammar_state() -> Result<&'static Object, String> {
-    cached_grammar().map(|(s, _)| s)
+    cached_grammar().map(|(s, _, _)| s)
 }
 
 #[cfg(feature = "std-deps")]
 pub fn parse_to_state_via_stage12(text: &str) -> Result<Object, String> {
+    let trace = std::env::var("AREST_STAGE12_TRACE").is_ok();
+    let t0 = std::time::Instant::now();
     let grammar_state = cached_grammar_state()?;
+    if trace { eprintln!("[s12] grammar cache: {:?}", t0.elapsed()); }
 
     // #309 — enforce Theorem 1's no-reserved-substring rule. Scan
     // unquoted noun declarations in the source and reject any that
     // collide with a grammar keyword. Quoted names (`Noun 'Each Way
     // Bet' is an entity type.`) bypass the check and land in the
     // noun cell as single tokens.
+    let t_pre = std::time::Instant::now();
     reject_reserved_noun_declarations(text)?;
 
     // Direct text-scan bootstrap for noun names — avoids running the
@@ -1435,10 +1491,12 @@ pub fn parse_to_state_via_stage12(text: &str) -> Result<Object, String> {
     nouns.sort_by(|a, b| b.len().cmp(&a.len()));
 
     let lines = crate::parse_forml2::join_derivation_continuations(text);
+    if trace { eprintln!("[s12] preproc (reject+nouns+join): {:?}", t_pre.elapsed()); }
     // Accumulate per-statement cells into a single HashMap, then lift
     // to Object::Map once at the end. Previously we did
     // `stmt_state = merge_states(&stmt_state, ...)` per line, which is
     // O(n²) on the growing cell vectors.
+    let t_tok = std::time::Instant::now();
     let mut acc_cells: HashMap<String, Vec<Object>> = HashMap::new();
     for (i, raw_line) in lines.iter().enumerate() {
         let line = raw_line.trim();
@@ -1503,6 +1561,8 @@ pub fn parse_to_state_via_stage12(text: &str) -> Result<Object, String> {
             .collect();
         Object::Map(map)
     };
+    if trace { eprintln!("[s12] stage1 tokenize: {:?} ({} lines)",
+        t_tok.elapsed(), lines.len()); }
 
     // #301 — possibility-override synthetic FactType registrations.
     // Scan the raw source for `It is possible that ...` lines and
@@ -1522,7 +1582,11 @@ pub fn parse_to_state_via_stage12(text: &str) -> Result<Object, String> {
         })
         .collect();
 
+    let t_cls = std::time::Instant::now();
     let classified = classify_statements(&stmt_state, grammar_state);
+    if trace { eprintln!("[s12] classify: {:?}", t_cls.elapsed()); }
+
+    let t_tr = std::time::Instant::now();
 
     // Run translate_nouns FIRST so subsequent translators that consult
     // `declared_noun_names` see domain nouns (not just the grammar's
@@ -1573,6 +1637,8 @@ pub fn parse_to_state_via_stage12(text: &str) -> Result<Object, String> {
     // → `Fact Type.<reading> = Derivation Mode.fully-derived`).
     instance_fact_facts.extend(translate_derivation_mode_facts(&classified));
     let enum_values_facts = translate_enum_values(&classified);
+    if trace { eprintln!("[s12] translators: {:?}", t_tr.elapsed()); }
+    if trace { eprintln!("[s12] TOTAL: {:?}", t0.elapsed()); }
 
     let mut map: HashMap<String, Object> = HashMap::new();
     map.insert("Noun".to_string(), Object::Seq(noun_facts.into()));
