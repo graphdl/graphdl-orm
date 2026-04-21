@@ -173,5 +173,12 @@ fn arest_http_handler(req: &http::Request) -> http::Response {
 fn panic(info: &PanicInfo) -> ! {
     println!("\n!! AREST kernel panic !!");
     println!("{info}");
-    halt_forever();
+    #[cfg(feature = "ring3-smoke")]
+    {
+        userspace::halt_on_exit(userspace::exit_code::KERNEL_PANIC);
+    }
+    #[cfg(not(feature = "ring3-smoke"))]
+    {
+        halt_forever();
+    }
 }
