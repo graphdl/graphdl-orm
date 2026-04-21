@@ -144,6 +144,23 @@ pub fn forward_chain_defs_state_semi_naive(
     d: &ast::Object,
     max_rounds: usize,
 ) -> (ast::Object, Vec<DerivedFact>) {
+    forward_chain_defs_state_semi_naive_with_base_keys(
+        derivation_defs, d, max_rounds, None)
+}
+
+/// Like [`forward_chain_defs_state_semi_naive`] but accepts a
+/// pre-computed `base_keys` set so callers that have already hashed
+/// part of `d` (e.g. the cached grammar state in
+/// `parse_forml2_stage2::cached_grammar`) can skip the re-hash
+/// during the initial state_keys pass. On core.md-scale inputs this
+/// saves the ~3-4ms that `state_keys(merged)` would otherwise cost
+/// at the start of every `classify_statements` call.
+pub fn forward_chain_defs_state_semi_naive_with_base_keys(
+    derivation_defs: &[(&str, &ast::Func, Option<&[String]>)],
+    d: &ast::Object,
+    max_rounds: usize,
+    base_keys: Option<HashSet<FactKey>>,
+) -> (ast::Object, Vec<DerivedFact>) {
     use hashbrown::HashMap;
     let trace = std::env::var("AREST_STAGE12_TRACE").is_ok();
     let mut current_state = d.clone();
@@ -153,7 +170,7 @@ pub fn forward_chain_defs_state_semi_naive(
     // ~3ms per round of re-hashing the unchanged grammar portion of
     // the state.
     let t_ek = std::time::Instant::now();
-    let mut existing_keys = state_keys(&current_state);
+    let mut existing_keys = base_keys.unwrap_or_else(|| state_keys(&current_state));
     if trace { eprintln!("    [sn] initial state_keys: {:?} ({} keys)",
         t_ek.elapsed(), existing_keys.len()); }
     // `dirty_cells == None` means "run everything" (initial round or
@@ -298,7 +315,7 @@ fn parse_derived_fact(item: &ast::Object, derived_by: &str) -> Option<DerivedFac
 /// Collision probability at the scales we see (<10^4 facts) is ~10^-12,
 /// so `HashSet<FactKey>` is effectively exact without the String
 /// allocation cost a `(String, Vec<_>)` key would pay per insertion.
-type FactKey = u64;
+pub(crate) type FactKey = u64;
 
 const FNV_OFFSET: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x100000001b3;
@@ -329,7 +346,7 @@ fn fact_key(f: &DerivedFact) -> FactKey {
 /// O(N) pass replaces the K × O(N) linear scans the filter would
 /// otherwise make via `state_contains_fact`. Borrows &str out of the
 /// population — no String allocation per key.
-fn state_keys(state: &ast::Object) -> HashSet<FactKey> {
+pub(crate) fn state_keys(state: &ast::Object) -> HashSet<FactKey> {
     let mut set: HashSet<FactKey> = HashSet::new();
     for (cell_name, cell_contents) in ast::cells_iter(state) {
         let Some(facts) = cell_contents.as_seq() else { continue };
