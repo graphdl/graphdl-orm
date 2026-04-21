@@ -419,6 +419,67 @@ Task has Escalation.
         "no matching Priority literal → no derivation");
 }
 
+// ─── Category 9: Subscripted antecedent noun ────────────────────────
+//
+// Shape: self-ring FT where both roles share a noun name, disambiguated
+// in rule text by ASCII-digit subscripts (`Person1`, `Person2` — Halpin
+// position-paper Example 6). The parser strips the subscript before FT
+// catalog lookup (`parse_role_token` returns the base noun), so the
+// resolved antecedent FT is the plain `Person_is_parent_of_Person` and
+// the derived fact's bindings use the bare `Person` key twice,
+// distinguished by position. The test catches a regression where
+// subscripted references in the rule body would fail to resolve to
+// the declared self-ring FT.
+
+#[test]
+fn shape_subscripted_antecedent_noun_preserves_subscripts() {
+    let src = r#"# Test
+Person(.Name) is an entity type.
+Name is a value type.
+
+## Fact Types
+Person has Name.
+Person is parent of Person.
+Person is ancestor of Person.
+
+## Derivation Rules
+* Person1 is ancestor of Person2 iff Person1 is parent of Person2.
+"#;
+    let (rule, func) = parse_and_compile(src);
+
+    match &rule.consequent_cell {
+        ConsequentCellSource::Literal(id) => assert!(!id.is_empty()),
+        other => panic!("expected Literal(..), got {:?}", other),
+    }
+    assert_eq!(rule.antecedent_sources.len(), 1);
+    assert!(rule.consequent_role_literals.is_empty());
+    assert!(rule.consequent_computed_bindings.is_empty());
+
+    // One parent fact → one ancestor derivation with the subscripted
+    // Person1/Person2 bindings preserved on the wire.
+    // FT id comes from the declaration `Person is parent of Person`,
+    // which has no subscripts — subscripts in the rule body are
+    // stripped for FT resolution. Bindings use plain "Person" twice,
+    // distinguished by position.
+    let out = apply_to_facts(&func, &[
+        ("Person_is_parent_of_Person",
+            &[("Person", "alice"), ("Person", "bob")]),
+    ]);
+    let derived = decode_derived(&out);
+    assert_eq!(derived.len(), 1,
+        "one ancestor fact expected from one parent fact, got {:#?}", derived);
+    let (ft, _reading, bindings) = &derived[0];
+    assert_eq!(ft, "Person_is_ancestor_of_Person",
+        "derived fact must land in the consequent self-ring cell, got {}", ft);
+    assert_eq!(bindings.len(), 2, "two Person bindings (positional), got {:#?}", bindings);
+    // Positional: first Person is the parent (alice), second is the child (bob).
+    // Both keys are bare "Person" after subscript stripping.
+    assert_eq!(bindings[0], ("Person".to_string(), "alice".to_string()),
+        "first Person binding should be alice, got {:?}", bindings[0]);
+    assert_eq!(bindings[1], ("Person".to_string(), "bob".to_string()),
+        "second Person binding should be bob, got {:?}", bindings[1]);
+}
+
 // ─── Category 2: AntecedentRole (deferred) ──────────────────────────
 //
 // `ConsequentCellSource::AntecedentRole` is declared on the type and
