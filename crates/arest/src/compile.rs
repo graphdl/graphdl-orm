@@ -1087,6 +1087,28 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
     defs.extend(model.derivations.iter()
         .map(|d| (format!("derivation:{}", d.id), d.func.clone())));
 
+    // Sec-5 (#322): `allowed_writes:derivation:{id}` companion defs.
+    // Each user-authored derivation whose consequent is a Literal FT
+    // cell emits a cap declaration naming that single cell. At apply
+    // time, `Func::Def("derivation:{id}")` pushes this as the cap
+    // frame, so any `Func::Store` in the body is checked against it
+    // (and against the protected-metamodel set). Synthetic rules
+    // without a matching domain-rule entry (CWA negation, subtype
+    // inheritance, SM init, transitivity) skip emission — absence =
+    // unrestricted, which preserves legacy behavior for all rules the
+    // compiler itself owns. User readings never emit "*"; only kernel
+    // paths would, and this loop never writes the wildcard.
+    defs.extend(model.derivations.iter()
+        .filter_map(|compiled| {
+            let user_rule = c_derivation_rules.iter().find(|r| r.id == compiled.id)?;
+            let literal = user_rule.consequent_cell.literal_id();
+            if literal.is_empty() { return None; }
+            Some((
+                format!("allowed_writes:derivation:{}", compiled.id),
+                Func::constant(Object::seq(vec![Object::atom(literal)])),
+            ))
+        }));
+
     // Derivation index: derivation_index:{noun} â†’ comma-separated derivation IDs.
     // For each derivation rule, collect nouns that play roles in its antecedent/
     // consequent fact types. At runtime, create_via_defs fetches the index for the
@@ -5642,5 +5664,109 @@ mod schema_tests {
             assert_eq!(claimed.len() == 0, other_claims,
                 "name `{}` must belong to exactly one family (specific or _other)", name);
         }
+    }
+
+    // ── Sec-5: compile emits allowed_writes:{name} for user rules ────
+
+    /// State with one Noun, one FactType+roles, and one user-authored
+    /// DerivationRule whose consequentFactTypeId is the FT above.
+    /// Minimal fixture for compile-to-defs-state tests.
+    fn state_with_one_derivation(rule_id: &str, consequent_ft: &str) -> Object {
+        let mut cells: HashMap<String, Vec<Object>> = HashMap::new();
+        cells.entry("Noun".into()).or_default().push(fact_from_pairs(&[
+            ("name", "Order"), ("objectType", "entity"),
+        ]));
+        cells.entry("FactType".into()).or_default().push(fact_from_pairs(&[
+            ("id", consequent_ft), ("reading", "Order has Status"), ("arity", "2"),
+        ]));
+        cells.entry("Role".into()).or_default().push(fact_from_pairs(&[
+            ("factType", consequent_ft), ("nounName", "Order"), ("position", "0"),
+        ]));
+        cells.entry("Role".into()).or_default().push(fact_from_pairs(&[
+            ("factType", consequent_ft), ("nounName", "Status"), ("position", "1"),
+        ]));
+        cells.entry("DerivationRule".into()).or_default().push(fact_from_pairs(&[
+            ("id", rule_id),
+            ("text", "Order has Status 'open'."),
+            ("consequentFactTypeId", consequent_ft),
+        ]));
+        Object::Map(cells.into_iter().map(|(k, v)| (k, Object::Seq(v.into()))).collect())
+    }
+
+    /// A user-authored derivation compiles to a `derivation:{id}` def
+    /// AND a companion `allowed_writes:derivation:{id}` def whose body
+    /// is a Seq-of-atoms naming the consequent FT cell. Without it the
+    /// runtime cap stack can't distinguish "this def may write FT_X"
+    /// from "unrestricted."
+    ///
+    /// re_resolve_rules hashes the rule text for a stable id, so the
+    /// test doesn't pin the exact id — it scans for any `derivation:rule_*`
+    /// entry and verifies the companion is present with the right
+    /// allow-list.
+    #[test]
+    fn compile_emits_allowed_writes_for_user_derivation_with_literal_consequent() {
+        let state = state_with_one_derivation("r_open", "Order_has_Status");
+        let defs = compile_to_defs_state(&state);
+
+        let (user_def_name, _) = defs.iter()
+            .find(|(n, _)| n.starts_with("derivation:rule_"))
+            .unwrap_or_else(|| panic!(
+                "compile must emit derivation:rule_<hash> for user rule; got {:?}",
+                defs.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()
+            ));
+        let companion = alloc::format!("allowed_writes:{}", user_def_name);
+        let (_, cap_func) = defs.iter()
+            .find(|(n, _)| n == &companion)
+            .unwrap_or_else(|| panic!(
+                "compile must emit {} companion def; got keys {:?}",
+                companion,
+                defs.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()
+            ));
+
+        let body = ast::apply(cap_func, &ast::Object::phi(), &ast::Object::phi());
+        let items = body.as_seq()
+            .expect("allowed_writes body must evaluate to a Seq of atoms");
+        let names: Vec<&str> = items.iter().filter_map(|o| o.as_atom()).collect();
+        assert!(names.contains(&"Order_has_Status"),
+            "allowed_writes must name the consequent FT 'Order_has_Status'; got {:?}",
+            names);
+    }
+
+    /// End-to-end: the allowed_writes companion cell actually scopes
+    /// the def body at apply time. Inject a forged `Func::Store` into
+    /// the user-derived def's body (simulating a compile path that
+    /// future-emits stores) and verify the protected-set check refuses
+    /// the metamodel write, even while the legitimate consequent is
+    /// still in the allow-list.
+    #[test]
+    fn compiled_derivation_caps_refuse_metamodel_writes_via_func_def() {
+        let state = state_with_one_derivation("evil", "Order_has_Status");
+        let defs = compile_to_defs_state(&state);
+        let d = ast::defs_to_state(&defs, &state);
+
+        // Locate the derivation def by pattern (id is hashed).
+        let user_def_name = defs.iter()
+            .map(|(n, _)| n.as_str())
+            .find(|n| n.starts_with("derivation:rule_"))
+            .expect("user derivation present")
+            .to_string();
+
+        // Overwrite the body with a store to "Noun" (a protected cell).
+        let malicious = Func::Compose(
+            Box::new(Func::Store),
+            Box::new(Func::construction(vec![
+                Func::constant(Object::atom("Noun")),
+                Func::constant(Object::atom("malicious")),
+                Func::Id,
+            ])),
+        );
+        let d = ast::store(&user_def_name, ast::func_to_object(&malicious), &d);
+
+        let result = ast::apply(&Func::Def(user_def_name.clone()), &d, &d);
+        assert_eq!(
+            result, Object::Bottom,
+            "compiled {} under its allowed_writes must refuse metamodel store",
+            user_def_name
+        );
     }
 }
