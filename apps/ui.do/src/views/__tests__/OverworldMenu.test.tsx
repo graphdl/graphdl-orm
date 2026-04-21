@@ -112,17 +112,15 @@ describe('OverworldMenu (presentational)', () => {
 describe('EntityOverworldMenu (composed)', () => {
   it('wires useActions + useEntityLinks into a single menu for the entity', async () => {
     stubFetch((req) => {
-      if (req.url.endsWith('/actions')) {
+      // useActions now hits /api/entities/{noun}/{id}/transitions (the
+      // actual worker endpoint, see src/api/router.ts:573).
+      if (req.url.includes('/api/entities/Order/ord-1/transitions')) {
         return json({
-          data: {
-            entity: 'ord-1',
-            noun: 'Order',
-            status: 'Placed',
-            transitions: [
-              { event: 'ship', targetStatus: 'Shipped' },
-              { event: 'cancel', targetStatus: 'Cancelled', label: 'Cancel order' },
-            ],
-          },
+          currentStatus: 'Placed',
+          transitions: [
+            { event: 'ship', targetStatus: 'Shipped' },
+            { event: 'cancel', targetStatus: 'Cancelled', label: 'Cancel order' },
+          ],
         })
       }
       // GET /arest/orders/ord-1 — entity body with HATEOAS links
@@ -159,14 +157,14 @@ describe('EntityOverworldMenu (composed)', () => {
 
   it('dispatches the clicked action through useActions', async () => {
     const recorded = stubFetch((req) => {
-      if (req.url.endsWith('/actions')) {
-        return json({ data: { transitions: [{ event: 'place', targetStatus: 'Placed' }] } })
+      if (req.url.includes('/api/entities/Order/ord-1/transitions')) {
+        return json({ transitions: [{ event: 'place', targetStatus: 'Placed' }] })
       }
       if (req.method === 'POST') {
-        return json({ data: { id: 'ord-1', status: 'Placed' } })
+        return json({ id: 'ord-1', status: 'Placed', event: 'place' })
       }
-      // /arest/orders/ord-1 entity
-      return json({ data: { id: 'ord-1' }, _links: {} })
+      // /arest/orders/ord-1 entity — real server shape
+      return json({ id: 'ord-1', type: 'Order', data: {}, _links: {} })
     })
 
     render(wrap(<EntityOverworldMenu noun="Order" id="ord-1" baseUrl={baseUrl} />))
@@ -178,6 +176,6 @@ describe('EntityOverworldMenu (composed)', () => {
 
     const post = recorded.find((r) => r.method === 'POST')
     expect(post).toBeDefined()
-    expect(post!.url).toBe('https://ui.auto.dev/arest/orders/ord-1/place')
+    expect(post!.url).toBe('https://ui.auto.dev/api/entities/Order/ord-1/transition')
   })
 })

@@ -23,6 +23,13 @@ import type { ArestStateMachineDefinition, ArestTransition } from './xstateConfi
 export interface UseStateMachineOptions {
   baseUrl: string
   fetch?: typeof globalThis.fetch
+  /**
+   * Field name on the Transition entity that references its
+   * parent State Machine Definition. Defaults to
+   * `'stateMachineDefinition'` — overridable for apps whose OpenAPI
+   * emits a different key (e.g. `'definedIn'`).
+   */
+  smdField?: string
 }
 
 export interface UseStateMachineResult {
@@ -42,6 +49,7 @@ export function useStateMachine(
   smdId: string,
   options: UseStateMachineOptions,
 ): UseStateMachineResult {
+  const smdField = options.smdField ?? 'stateMachineDefinition'
   const provider = useMemo(
     () => createArestDataProvider({ baseUrl: options.baseUrl, fetch: options.fetch }),
     [options.baseUrl, options.fetch],
@@ -55,9 +63,9 @@ export function useStateMachine(
   })
 
   const transitionsQuery = useQuery({
-    queryKey: ['arest', 'list', TRANSITION_RESOURCE, { stateMachineDefinition: smdId }],
+    queryKey: ['arest', 'list', TRANSITION_RESOURCE, { [smdField]: smdId }],
     queryFn: () => provider.getList<ArestTransition>(TRANSITION_RESOURCE, {
-      filter: { stateMachineDefinition: smdId },
+      filter: { [smdField]: smdId },
     }),
     enabled: smdId !== '',
   })
@@ -72,7 +80,7 @@ export function useStateMachine(
   const addMutation = useMutation({
     mutationFn: (t: ArestTransition) =>
       provider.create<ArestTransition>(TRANSITION_RESOURCE, {
-        data: { ...t, stateMachineDefinition: smdId } as Partial<ArestTransition>,
+        data: { ...t, [smdField]: smdId } as Partial<ArestTransition>,
       }),
     onSuccess: invalidate,
   })

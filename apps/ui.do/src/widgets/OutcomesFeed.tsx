@@ -47,6 +47,14 @@ export interface Failure {
 export interface OutcomesFeedOptions extends ArestResourceOptions {
   /** Optional domain filter — corresponds to the Violation belongs to Domain fact. */
   domain?: string
+  /**
+   * Field name used when applying the `domain` filter. The AREST
+   * compiler produces JSON field names from fact-role readings (e.g.
+   * `Violation belongs to Domain` -> `belongsToDomain` or `domain`
+   * depending on the generator). If the default doesn't match your
+   * app's OpenAPI schema, override here. Defaults to `'domain'`.
+   */
+  domainField?: string
   /** Maximum rows per section. */
   perSection?: number
 }
@@ -74,8 +82,8 @@ export interface ViolationsFeedProps extends OutcomesFeedOptions {
 }
 
 export function ViolationsFeed(props: ViolationsFeedProps): ReactElement {
-  const { title = 'Violations', domain, perSection = 5, ...opts } = props
-  const filter = domain ? { 'belongs to Domain': domain } : undefined
+  const { title = 'Violations', domain, domainField = 'domain', perSection = 5, ...opts } = props
+  const filter = domain ? { [domainField]: domain } : undefined
   const query = useArestList<Violation>(
     'Violation',
     filter ? { filter } : undefined,
@@ -122,8 +130,8 @@ export interface FailuresFeedProps extends OutcomesFeedOptions {
 }
 
 export function FailuresFeed(props: FailuresFeedProps): ReactElement {
-  const { title = 'Failures', domain, perSection = 5, ...opts } = props
-  const filter = domain ? { 'belongs to Domain': domain } : undefined
+  const { title = 'Failures', domain, domainField = 'domain', perSection = 5, ...opts } = props
+  const filter = domain ? { [domainField]: domain } : undefined
   const query = useArestList<Failure>(
     'Failure',
     filter ? { filter } : undefined,

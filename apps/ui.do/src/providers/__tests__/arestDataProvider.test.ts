@@ -130,6 +130,21 @@ describe('arestDataProvider', () => {
       expect(out.data).toEqual({ id: 'acme', name: 'Acme' })
     })
 
+    it('handles the /arest/ entity shape with id at the envelope root', async () => {
+      // Real server route returns { id, type, data: {fields}, _links }
+      // where id lives at the envelope level, not inside data.
+      stubFetch(() => json({
+        id: 'acme',
+        type: 'Organization',
+        data: { name: 'Acme', slug: 'acme' },
+        _links: { self: { href: '/arest/organizations/acme' } },
+      }))
+      const out = await provider.getOne('organizations', { id: 'acme' })
+      // id must be promoted onto the flat record so the caller can
+      // read `result.data.id` consistently across both envelope shapes.
+      expect(out.data).toEqual({ id: 'acme', type: 'Organization', name: 'Acme', slug: 'acme' })
+    })
+
     it('URL-encodes IDs that contain special characters', async () => {
       const recorded = stubFetch(() => json(envelope({ id: 'orders:2026/05' })))
 

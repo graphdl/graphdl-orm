@@ -108,13 +108,12 @@ describe('BlocksPage', () => {
     ))
 
     await waitFor(() => expect(urls.some((u) => u.endsWith('/arest/pages/home'))).toBe(true))
-    // The parent-scoped list goes through filter[belongs to Page] on the
-    // sections collection — keeps the data provider path consistent.
+    // Default parent filter field: parent.noun lowercased without
+    // spaces — "Page" -> "page". The caller can override via
+    // `parentField` when the OpenAPI schema emits a different key.
     const listUrl = urls.find((u) => u.includes('/arest/sections?'))
     expect(listUrl).toBeDefined()
-    // URLSearchParams encodes spaces as '+', so decode via the parser
-    // rather than decodeURIComponent (which leaves '+' as-is).
     const parsed = new URL(listUrl!)
-    expect(parsed.searchParams.get('filter[belongs to Page]')).toBe('home')
+    expect(parsed.searchParams.get('filter[page]')).toBe('home')
   })
 })

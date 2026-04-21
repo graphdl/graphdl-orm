@@ -107,11 +107,32 @@ async function request(
   return body
 }
 
+/**
+ * Unwrap an AREST response body to the entity fields.
+ *
+ * Handles both shapes AREST emits:
+ *   1. Entity route (/arest/<slug>/<id>):
+ *      { id, type, data: { ...fields }, _links }
+ *      — id and type live at the envelope root; data holds fields.
+ *   2. Theorem-5 envelope (verb-dispatcher / Managed Agents):
+ *      { data: { id?, ...fields }, derived?, violations?, _links }
+ *      — id may be inside data or not present at all.
+ *
+ * In both cases, callers want a single flat object of fields keyed
+ * by name, including id so getOne's caller can read `result.data.id`.
+ * So we merge the envelope's top-level id/type into the unwrapped
+ * object when they're absent from the inner data block.
+ */
 function unwrap<T>(body: unknown): T {
-  if (isRecord(body) && 'data' in body) {
-    return (body as { data: T }).data
-  }
-  return body as T
+  if (!isRecord(body)) return body as T
+  if (!('data' in body)) return body as T
+  const data = body.data
+  if (!isRecord(data)) return data as T
+  const merged: Record<string, unknown> = { ...data }
+  // Promote envelope-level id / type when the inner data doesn't carry them.
+  if ('id' in body && !('id' in merged) && body.id != null) merged.id = body.id
+  if ('type' in body && !('type' in merged) && body.type != null) merged.type = body.type
+  return merged as T
 }
 
 function normalizeList<T>(body: unknown): GetListResult<T> {
