@@ -3777,42 +3777,9 @@ mod tests {
             "expected (Dog, Animal) in Subtype cell; got {:?}", pairs);
     }
 
-    /// Structural parity check for the organization_with_slug fixture.
-    /// Noun / FactType / Role / Subtype match byte-for-byte; Constraint
-    /// cells carry a legacy-only `json` NORMA-blob binding that
-    /// stage12 intentionally drops (the key metadata — id / kind /
-    /// modality / text / span0_* / span1_* — is preserved on both
-    /// sides), so the Constraint assertion checks those bindings
-    /// individually instead of full equality.
-    #[test]
-    fn diff_organization_fixture() {
-        let src = "\
-            Organization(.Slug) is an entity type.\n\
-            Slug is a value type.\n\
-            Organization has Slug.\n\
-              Each Organization has exactly one Slug.\n";
-        let legacy = crate::parse_forml2::parse_to_state_legacy(src).expect("legacy");
-        let stage12 = super::parse_to_state_via_stage12(src).expect("stage12");
-        for name in &["Noun", "FactType", "Role", "Subtype"] {
-            assert_eq!(fetch_or_phi(name, &legacy), fetch_or_phi(name, &stage12),
-                "cell {} diverged between legacy and stage12", name);
-        }
-        // Constraint: compare only the stable key bindings.
-        let stable = ["id", "kind", "modality", "text",
-            "span0_factTypeId", "span0_roleIndex",
-            "span1_factTypeId", "span1_roleIndex"];
-        let bindings_of = |obj: &Object| -> Vec<Vec<(String, String)>> {
-            fetch_or_phi("Constraint", obj).as_seq().map(|facts| {
-                facts.iter().map(|f| {
-                    stable.iter().filter_map(|k|
-                        binding(f, k).map(|v| ((*k).to_string(), v.to_string())))
-                        .collect()
-                }).collect()
-            }).unwrap_or_default()
-        };
-        assert_eq!(bindings_of(&legacy), bindings_of(&stage12),
-            "Constraint stable bindings diverged between legacy and stage12");
-    }
+    // `diff_organization_fixture` was a legacy-vs-stage12 parity check
+    // calling `parse_to_state_legacy`; retired with the legacy cascade
+    // in #285 (stage12 is the parser now).
 
     // ── Perf Benchmarks (opt-in) ───────────────────────────────────────
     //
