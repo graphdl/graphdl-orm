@@ -1233,11 +1233,184 @@ fn cached_grammar()
     let grammar = include_str!("../../../readings/forml2-grammar.md");
     let parsed = crate::parse_forml2::parse_to_state(grammar)
         .map_err(|e| alloc::format!("grammar parse failed: {}", e))?;
-    let defs = crate::compile::compile_to_defs_state(&parsed);
+    let mut defs = crate::compile::compile_to_defs_state(&parsed);
+    // Swap the compiled FFP derivation Funcs for equivalent Native
+    // classifiers where the rule matches the
+    //   `Statement has Classification 'X' iff Statement has <Cell> ['<lit>']`
+    // or the multi-antecedent variant
+    //   `Statement has Classification 'X' iff Statement has <Cell1> '<lit1>' and Statement has <Cell2> '<lit2>'`
+    // shape. Legacy's parse cascade is essentially this check written as
+    // native Rust; routing the grammar through `ast::apply`'s general
+    // Func interpreter paid a ~100× tax. Keeping the grammar as the
+    // source of truth (the text came from `readings/forml2-grammar.md`)
+    // plus specializing at cache time gets legacy's speed back without
+    // abandoning meta-circularity. Unmatched rules fall through to the
+    // general interpreter.
+    specialize_grammar_classifiers(&parsed, &mut defs);
     // OnceLock::set is safe under races — first writer wins, others
     // drop their work. We then read via `get` which succeeds.
     let _ = GRAMMAR_CACHE.set((parsed, defs));
     Ok(GRAMMAR_CACHE.get().expect("just set"))
+}
+
+/// Parse a classification rule's reading text into
+/// `(classification, [(cell_name, literal), ...])`. Returns `None`
+/// if the text doesn't match the expected shape. Single- and
+/// two-clause-with-`and` antecedents are both supported.
+#[cfg(feature = "std-deps")]
+fn parse_classification_rule_spec(text: &str)
+    -> Option<(String, Vec<(String, Option<String>)>)>
+{
+    // Trim markdown artifacts + trailing period.
+    let t = text.trim().trim_end_matches('.').trim();
+    // Require "Statement has Classification '<C>'" prefix.
+    let prefix = "Statement has Classification '";
+    let rest = t.strip_prefix(prefix)?;
+    let (classification, after_cls) = rest.split_once('\'')?;
+    let iff_clause = after_cls.strip_prefix(" iff ")?;
+    // Split on " and " to handle two-antecedent rules (Frequency Constraint).
+    let mut clauses: Vec<(String, Option<String>)> = Vec::new();
+    for clause in iff_clause.split(" and ") {
+        let clause = clause.trim();
+        // Each clause: `Statement has <Cell> ['<literal>']`.
+        let body = clause.strip_prefix("Statement has ")?;
+        // Literal present?
+        if let Some(lit_start) = body.find(" '") {
+            let cell_raw = body[..lit_start].trim();
+            let lit_tail = &body[lit_start + 2..];
+            let (lit, _) = lit_tail.split_once('\'')?;
+            let cell_name = format!("Statement_has_{}", cell_raw.replace(' ', "_"));
+            clauses.push((cell_name, Some(lit.to_string())));
+        } else {
+            // Classification antecedent without literal (e.g., "Statement
+            // has Role Reference.") — cell_raw is the whole body.
+            let cell_name = format!("Statement_has_{}", body.trim().replace(' ', "_"));
+            clauses.push((cell_name, None));
+        }
+    }
+    Some((classification.to_string(), clauses))
+}
+
+/// Build a Native Func that, given the encoded population, emits one
+/// `Statement_has_Classification` derived-fact Object per Statement
+/// whose antecedent clauses all match. The emitted Object shape
+/// matches `parse_derived_fact`: `Seq[Atom(ft_id), Atom(reading),
+/// Seq[Seq[Atom(k), Atom(v)], ...]]`.
+///
+/// Input shape: `encode_state` produces
+/// `Seq[Seq[Atom(ft_id), Seq[fact, ...]], ...]` — scan once for each
+/// clause's cell by name.
+#[cfg(feature = "std-deps")]
+fn build_native_classifier(
+    classification: String,
+    clauses: Vec<(String, Option<String>)>,
+) -> crate::ast::Func {
+    use alloc::sync::Arc;
+    use crate::ast::Func;
+    let reading_atom = alloc::format!(
+        "Statement has Classification '{}'",
+        classification,
+    );
+    Func::Native(Arc::new(move |pop: &Object| {
+        // Find each clause's cell contents inside pop (Seq-of-pairs form).
+        let pop_entries = match pop.as_seq() {
+            Some(s) => s,
+            None => return Object::phi(),
+        };
+        let find_cell = |name: &str| -> Option<&[Object]> {
+            for entry in pop_entries.iter() {
+                let pair = entry.as_seq()?;
+                if pair.len() != 2 { continue; }
+                if pair[0].as_atom()? == name {
+                    return pair[1].as_seq();
+                }
+            }
+            None
+        };
+        // Compute the set of Statement atoms that satisfy the first
+        // clause, then intersect against subsequent clauses.
+        let matching_statement = |fact: &Object, want_lit: Option<&str>| -> Option<String> {
+            let pairs = fact.as_seq()?;
+            let mut stmt: Option<&str> = None;
+            let mut saw_lit = want_lit.is_none();
+            for p in pairs.iter() {
+                let kv = match p.as_seq() { Some(s) if s.len() == 2 => s, _ => continue };
+                let k = match kv[0].as_atom() { Some(a) => a, None => continue };
+                let v = match kv[1].as_atom() { Some(a) => a, None => continue };
+                if k == "Statement" { stmt = Some(v); }
+                if let Some(want) = want_lit {
+                    if v == want { saw_lit = true; }
+                }
+            }
+            if !saw_lit { return None; }
+            stmt.map(String::from)
+        };
+
+        let mut stmts: Option<hashbrown::HashSet<String>> = None;
+        for (cell_name, lit) in &clauses {
+            let Some(facts) = find_cell(cell_name) else {
+                return Object::phi();
+            };
+            let local: hashbrown::HashSet<String> = facts.iter()
+                .filter_map(|f| matching_statement(f, lit.as_deref()))
+                .collect();
+            stmts = Some(match stmts.take() {
+                None => local,
+                Some(prev) => prev.intersection(&local).cloned().collect(),
+            });
+            if stmts.as_ref().map(|s| s.is_empty()).unwrap_or(true) {
+                return Object::phi();
+            }
+        }
+        let stmts = stmts.unwrap_or_default();
+
+        // Emit one derived-fact-encoded Object per matching Statement.
+        let emitted: Vec<Object> = stmts.into_iter().map(|stmt_id| {
+            let bindings = Object::seq(vec![
+                Object::seq(vec![Object::atom("Statement"), Object::atom(&stmt_id)]),
+                Object::seq(vec![
+                    Object::atom("Classification"),
+                    Object::atom(&classification),
+                ]),
+            ]);
+            Object::seq(vec![
+                Object::atom("Statement_has_Classification"),
+                Object::atom(&reading_atom),
+                bindings,
+            ])
+        }).collect();
+        Object::seq(emitted)
+    }))
+}
+
+/// Walk the grammar's `DerivationRule` cell, build a map from rule id
+/// to a specialization spec for recognized classification rules, then
+/// replace matching entries in `defs` with Native equivalents.
+#[cfg(feature = "std-deps")]
+fn specialize_grammar_classifiers(
+    grammar_state: &Object,
+    defs: &mut alloc::vec::Vec<(String, crate::ast::Func)>,
+) {
+    let rule_cell = crate::ast::fetch_or_phi("DerivationRule", grammar_state);
+    let Some(rules) = rule_cell.as_seq() else { return };
+    let mut id_to_spec: hashbrown::HashMap<String, (String, Vec<(String, Option<String>)>)>
+        = hashbrown::HashMap::new();
+    for fact in rules.iter() {
+        let id = match crate::ast::binding(fact, "id") {
+            Some(s) => s.to_string(), None => continue
+        };
+        let text = match crate::ast::binding(fact, "text") {
+            Some(s) => s, None => continue
+        };
+        if let Some(spec) = parse_classification_rule_spec(text) {
+            id_to_spec.insert(id, spec);
+        }
+    }
+    for (name, func) in defs.iter_mut() {
+        let Some(id) = name.strip_prefix("derivation:") else { continue };
+        let Some(spec) = id_to_spec.get(id) else { continue };
+        *func = build_native_classifier(spec.0.clone(), spec.1.clone());
+    }
 }
 
 #[cfg(feature = "std-deps")]
