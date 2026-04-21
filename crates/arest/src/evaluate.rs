@@ -47,14 +47,22 @@ pub fn forward_chain_defs_state(
 ) -> (ast::Object, Vec<DerivedFact>) {
 
     /// Apply all derivation rules once, returning novel facts.
+    ///
+    /// Dedup against three populations: facts already in `current_state`,
+    /// facts derived in prior rounds (`all_derived`), and facts emitted
+    /// earlier in this round. All three use a canonical `FactKey`
+    /// (fact_type_id + sorted bindings) and `HashSet` lookups — a naive
+    /// per-candidate linear scan is O(K·N); the hashed form is O(K+N).
     fn derive_one_round(
         derivation_defs: &[(&str, &ast::Func)],
         current_state: &ast::Object,
         all_derived: &[DerivedFact],
         d: &ast::Object,
     ) -> Vec<DerivedFact> {
+        let existing_keys = state_keys(current_state);
+        let derived_keys: HashSet<FactKey> = all_derived.iter().map(fact_key).collect();
         let pop_obj = ast::encode_state(current_state);
-        derivation_defs.iter()
+        let candidates: Vec<DerivedFact> = derivation_defs.iter()
             .flat_map(|(name, func)| {
                 let result = ast::apply(func, &pop_obj, d);
                 let name = name.to_string();
@@ -63,27 +71,55 @@ pub fn forward_chain_defs_state(
                     .filter_map(move |item| parse_derived_fact(&item, &name))
                     .collect::<Vec<_>>()
             })
-            .filter(|fact| {
-                !state_contains_fact(current_state, fact)
-                    && !all_derived.iter().any(|d| same_fact(d, fact))
-            })
-            .fold(Vec::new(), |mut acc, fact| {
-                (!acc.iter().any(|d| same_fact(d, &fact))).then(|| acc.push(fact));
-                acc
-            })
+            .collect();
+        let mut round_keys: HashSet<FactKey> = HashSet::with_capacity(candidates.len());
+        let mut out: Vec<DerivedFact> = Vec::with_capacity(candidates.len());
+        for cand in candidates {
+            let key = fact_key(&cand);
+            if !existing_keys.contains(&key)
+                && !derived_keys.contains(&key)
+                && round_keys.insert(key)
+            {
+                out.push(cand);
+            }
+        }
+        out
     }
 
     // Fixed-point iteration via iter::successors (Backus while form, Knaster-Tarski lfp).
     // Terminates when derive_one_round produces no new facts (returns None).
+    //
+    // Per-round fact integration batches by cell: a naive
+    // `fold(state.clone(), cell_push)` is O(n²) because each
+    // `cell_push` re-clones the cell's full Vec. Grouping the round's
+    // new facts by cell and appending once per cell makes it O(n).
     let (final_state, all_derived) = core::iter::successors(
         Some((d.clone(), Vec::<DerivedFact>::new())),
         |(current_state, all_derived)| {
             let new_facts = derive_one_round(derivation_defs, current_state, all_derived, d);
             (!new_facts.is_empty()).then(|| {
-                let new_state = new_facts.iter().fold(current_state.clone(), |acc, fact| {
-                    let pairs: Vec<(&str, &str)> = fact.bindings.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-                    ast::cell_push(&fact.fact_type_id, ast::fact_from_pairs(&pairs), &acc)
-                });
+                use hashbrown::HashMap;
+                let mut by_cell: HashMap<String, Vec<ast::Object>> =
+                    HashMap::with_capacity(new_facts.len().min(derivation_defs.len()));
+                for fact in &new_facts {
+                    let pairs: Vec<(&str, &str)> = fact.bindings.iter()
+                        .map(|(k, v)| (k.as_str(), v.as_str())).collect();
+                    by_cell.entry(fact.fact_type_id.clone()).or_default()
+                        .push(ast::fact_from_pairs(&pairs));
+                }
+                let mut new_state = current_state.clone();
+                for (cell_name, facts) in by_cell {
+                    let existing = ast::fetch_or_phi(&cell_name, &new_state);
+                    let combined = match existing.as_seq() {
+                        Some(items) => {
+                            let mut v = items.to_vec();
+                            v.extend(facts);
+                            ast::Object::Seq(v.into())
+                        }
+                        None => ast::Object::seq(facts),
+                    };
+                    new_state = ast::store(&cell_name, combined, &new_state);
+                }
                 let all = [all_derived.clone(), new_facts].concat();
                 (new_state, all)
             })
@@ -114,28 +150,65 @@ fn parse_derived_fact(item: &ast::Object, derived_by: &str) -> Option<DerivedFac
     })
 }
 
-/// Check if a derived fact already exists in the state.
-fn state_contains_fact(state: &ast::Object, fact: &DerivedFact) -> bool {
-    let cell = ast::fetch_or_phi(&fact.fact_type_id, state);
-    cell.as_seq().map_or(false, |facts| {
-        facts.iter().any(|f| {
-            let fb: Vec<(String, String)> = f.as_seq().map(|pairs| {
-                pairs.iter().filter_map(|pair| {
-                    let items = pair.as_seq()?;
-                    Some((items.get(0)?.as_atom()?.to_string(), items.get(1)?.as_atom()?.to_string()))
-                }).collect()
-            }).unwrap_or_default();
-            fb.len() == fact.bindings.len()
-                && fb.iter().all(|b| fact.bindings.contains(b))
-        })
-    })
+/// Canonical key for deduplicating facts across rounds and against
+/// `current_state`. A 64-bit FNV-1a hash of `fact_type_id` + the
+/// multiset of bindings (role atoms sorted for order-independence).
+/// Collision probability at the scales we see (<10^4 facts) is ~10^-12,
+/// so `HashSet<FactKey>` is effectively exact without the String
+/// allocation cost a `(String, Vec<_>)` key would pay per insertion.
+type FactKey = u64;
+
+const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+const FNV_PRIME: u64 = 0x100000001b3;
+
+#[inline]
+fn fnv_mix(mut h: u64, bytes: &[u8]) -> u64 {
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    h
 }
 
-/// Check if two derived facts represent the same fact.
-fn same_fact(a: &DerivedFact, b: &DerivedFact) -> bool {
-    a.fact_type_id == b.fact_type_id
-        && a.bindings.len() == b.bindings.len()
-        && a.bindings.iter().all(|ab| b.bindings.contains(ab))
+fn fact_key(f: &DerivedFact) -> FactKey {
+    let mut refs: Vec<&(String, String)> = f.bindings.iter().collect();
+    refs.sort();
+    let mut h = fnv_mix(FNV_OFFSET, f.fact_type_id.as_bytes());
+    for (k, v) in refs {
+        h = fnv_mix(h, b"|");
+        h = fnv_mix(h, k.as_bytes());
+        h = fnv_mix(h, b"=");
+        h = fnv_mix(h, v.as_bytes());
+    }
+    h
+}
+
+/// Build a set of fact keys for every fact currently in `state`. One
+/// O(N) pass replaces the K × O(N) linear scans the filter would
+/// otherwise make via `state_contains_fact`. Borrows &str out of the
+/// population — no String allocation per key.
+fn state_keys(state: &ast::Object) -> HashSet<FactKey> {
+    let mut set: HashSet<FactKey> = HashSet::new();
+    for (cell_name, cell_contents) in ast::cells_iter(state) {
+        let Some(facts) = cell_contents.as_seq() else { continue };
+        for f in facts.iter() {
+            let Some(pairs) = f.as_seq() else { continue };
+            let mut kv: Vec<(&str, &str)> = pairs.iter().filter_map(|pair| {
+                let items = pair.as_seq()?;
+                Some((items.get(0)?.as_atom()?, items.get(1)?.as_atom()?))
+            }).collect();
+            kv.sort();
+            let mut h = fnv_mix(FNV_OFFSET, cell_name.as_bytes());
+            for (k, v) in &kv {
+                h = fnv_mix(h, b"|");
+                h = fnv_mix(h, k.as_bytes());
+                h = fnv_mix(h, b"=");
+                h = fnv_mix(h, v.as_bytes());
+            }
+            set.insert(h);
+        }
+    }
+    set
 }
 
 // -- Proof Engine (Backward Chaining) ---------------------------------

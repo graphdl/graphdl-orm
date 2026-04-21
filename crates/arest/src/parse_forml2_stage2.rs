@@ -2406,6 +2406,48 @@ mod tests {
         eprintln!("core.md totals — missing: {}, extra: {}", missing, extra);
     }
 
+    /// Per-call overhead benchmark: legacy vs stage12 on a small fixture
+    /// and on core.md. Used to gauge whether `parse_to_state` can safely
+    /// delegate to stage12 for #285 wire-up.
+    #[test]
+    #[ignore = "perf diagnostic: times stage12 vs legacy per call"]
+    fn perf_legacy_vs_stage12_per_call() {
+        use std::time::Instant;
+        let small = "Entity type Person called Person.\nEach Person has at most one Name.\n";
+        let core = include_str!("../../../readings/core.md");
+
+        // Warm caches: first stage12 call parses the grammar.
+        let _ = super::parse_to_state_via_stage12(small).expect("warm");
+
+        let iters = 20usize;
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            let _ = crate::parse_forml2::parse_to_state(small).expect("legacy");
+        }
+        let legacy_small = t0.elapsed();
+
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            let _ = super::parse_to_state_via_stage12(small).expect("s12");
+        }
+        let s12_small = t0.elapsed();
+
+        let t0 = Instant::now();
+        let _ = crate::parse_forml2::parse_to_state(core).expect("legacy core");
+        let legacy_core = t0.elapsed();
+
+        let t0 = Instant::now();
+        let _ = super::parse_to_state_via_stage12(core).expect("s12 core");
+        let s12_core = t0.elapsed();
+
+        eprintln!("small ({} iters): legacy {:?} / stage12 {:?} — ratio {:.2}x",
+            iters, legacy_small, s12_small,
+            s12_small.as_nanos() as f64 / legacy_small.as_nanos() as f64);
+        eprintln!("core.md (single): legacy {:?} / stage12 {:?} — ratio {:.2}x",
+            legacy_core, s12_core,
+            s12_core.as_nanos() as f64 / legacy_core.as_nanos() as f64);
+    }
+
     #[test]
     #[ignore = "diagnostic: probe conditional ring statements in core.md"]
     fn dump_subtype_if_then_classifications() {
