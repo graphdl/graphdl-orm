@@ -18,7 +18,7 @@ name = "arest-cli"
 path = "src/main.rs"
 
 [features]
-default = ["wit", "debug-def", "std-deps"]
+default = ["wit", "debug-def", "std-deps", "parallel"]
 wit = ["dep:wit-bindgen"]
 cloudflare = ["dep:wasm-bindgen", "dep:console_error_panic_hook"]
 local = ["dep:rusqlite"]
