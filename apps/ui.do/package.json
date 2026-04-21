@@ -21,6 +21,7 @@
     "mdxui": "6.1.0",
     "react": "19.2.3",
     "react-dom": "19.2.3",
+    "react-router-dom": "^6.30.3",
     "xstate": "^5.30.0"
   },
   "devDependencies": {
