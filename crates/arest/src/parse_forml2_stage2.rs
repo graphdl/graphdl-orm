@@ -746,6 +746,7 @@ struct StmtIndex {
     role_head_noun_by_ref: hashbrown::HashMap<String, String>,
     role_literal_by_ref: hashbrown::HashMap<String, String>,
     verbs: hashbrown::HashMap<String, String>,
+    statement_ids: Vec<String>,
 }
 
 #[cfg(feature = "std-deps")]
@@ -801,6 +802,11 @@ fn build_stmt_index(state: &Object) -> StmtIndex {
     index_single("Role_Reference_has_Literal_Value", "Role_Reference", "Literal_Value",
         &mut idx.role_literal_by_ref);
     index_single("Statement_has_Verb", "Statement", "Verb", &mut idx.verbs);
+    if let Some(seq) = fetch_or_phi("Statement", state).as_seq() {
+        idx.statement_ids = seq.iter()
+            .filter_map(|f| binding(f, "id").map(String::from))
+            .collect();
+    }
     idx
 }
 
@@ -1625,6 +1631,11 @@ pub fn classifications_for(state: &Object, statement_id: &str) -> Vec<String> {
 
 /// Collect all Statement ids from the `Statement` cell.
 fn collect_statement_ids(state: &Object) -> Vec<String> {
+    if let Some(v) = STMT_INDEX.with(|c|
+        c.borrow().as_ref().map(|i| i.statement_ids.clone()))
+    {
+        return v;
+    }
     fetch_or_phi("Statement", state)
         .as_seq()
         .map(|facts| facts.iter()
