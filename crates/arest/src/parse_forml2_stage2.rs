@@ -50,11 +50,12 @@ pub fn classify_statements(statements_state: &Object, grammar_state: &Object) ->
     // translate_derivation_rules runs after classification), so the
     // cached grammar-only defs match a fresh `compile_to_defs_state`
     // of the merged state at this call site.
-    let (classifier_defs, classifier_antecedents): (
+    let (classifier_defs, classifier_antecedents, base_keys): (
         &Vec<(String, crate::ast::Func)>,
         &Vec<Vec<String>>,
+        Option<&hashbrown::HashSet<u64>>,
     ) = match cached_grammar() {
-        Ok((_, d, a)) => (d, a),
+        Ok((_, d, a, k)) => (d, a, Some(k)),
         Err(_) => {
             // Fallback: if grammar cache failed, run nothing (classify
             // is a no-op and translators will see an un-classified
@@ -63,7 +64,7 @@ pub fn classify_statements(statements_state: &Object, grammar_state: &Object) ->
                 (Vec<(String, crate::ast::Func)>, Vec<Vec<String>>)
             > = std::sync::OnceLock::new();
             let (d, a) = EMPTY_DEFS.get_or_init(|| (Vec::new(), Vec::new()));
-            (d, a)
+            (d, a, None)
         }
     };
     // `merged` already contains the cached expanded grammar state
@@ -85,8 +86,19 @@ pub fn classify_statements(statements_state: &Object, grammar_state: &Object) ->
     // unchained rules in round 2 — with grammar the only cell that
     // changes between rounds is `Statement_has_Classification`, so
     // only the one chaining rule runs.
-    let (final_state, _) = crate::evaluate::forward_chain_defs_state_semi_naive(
-        &deriv, &merged, 2);
+    // Seed the chainer's `existing_keys` with the cached grammar key
+    // set plus the user-statement keys. The statement side is tiny
+    // (~100-300 facts for typical input vs. ~4000 for grammar), so
+    // hashing only that portion is substantially cheaper than
+    // re-hashing the whole merged state.
+    let initial_keys = base_keys.map(|gk| {
+        let stmt_keys = crate::evaluate::state_keys(statements_state);
+        let mut combined = gk.clone();
+        combined.extend(stmt_keys.into_iter());
+        combined
+    });
+    let (final_state, _) = crate::evaluate::forward_chain_defs_state_semi_naive_with_base_keys(
+        &deriv, &merged, 2, initial_keys);
     if trace { eprintln!("  [cls] forward_chain ({} defs): {:?}",
         deriv.len(), t2.elapsed()); }
     final_state
@@ -1677,6 +1689,7 @@ type GrammarCacheEntry = (
     Object,                                             // expanded grammar state
     alloc::vec::Vec<(String, crate::ast::Func)>,        // classifier defs only
     alloc::vec::Vec<Vec<String>>,                       // classifier antecedent cells
+    hashbrown::HashSet<u64>,                            // cached state_keys of expanded grammar
 );
 
 #[cfg(feature = "std-deps")]
@@ -1762,12 +1775,18 @@ fn cached_grammar() -> Result<&'static GrammarCacheEntry, String> {
         expanded_grammar = grammar_with_defs;
     }
 
+    // Pre-compute `state_keys` for the expanded grammar state — the
+    // semi-naive chainer uses it as the base `existing_keys` set,
+    // avoiding a ~3-4ms per-call re-hash of ~4000 grammar facts
+    // inside every `classify_statements` invocation.
+    let expanded_keys = crate::evaluate::state_keys(&expanded_grammar);
     // OnceLock::set is safe under races — first writer wins, others
     // drop their work. We then read via `get` which succeeds.
     let _ = GRAMMAR_CACHE.set((
         expanded_grammar,
         classifier_defs,
         classifier_antecedents,
+        expanded_keys,
     ));
     Ok(GRAMMAR_CACHE.get().expect("just set"))
 }
@@ -1971,7 +1990,7 @@ fn specialize_grammar_classifiers(
 
 #[cfg(feature = "std-deps")]
 fn cached_grammar_state() -> Result<&'static Object, String> {
-    cached_grammar().map(|(s, _, _)| s)
+    cached_grammar().map(|(s, _, _, _)| s)
 }
 
 #[cfg(feature = "std-deps")]
