@@ -6,6 +6,113 @@ use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 // Domain struct moved to parse_forml2.rs (#211) — it is a parse-time
 // accumulator, not a public type. Re-exported as pub(crate) from there.
 
+// -- Wire format helpers (#287 gap #6) --------------------------------
+// Backslash-escape the delimiter `:` and escape char `\` so sentinel
+// encodings for ConsequentCellSource / AntecedentSource survive role /
+// noun names that legitimately contain either character. Used only by
+// the compact single-binding wire format the metamodel flat-read path
+// round-trips through; the lossless JSON `json` binding goes through
+// serde directly and is unaffected.
+
+fn wire_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => { out.push('\\'); out.push('\\'); }
+            ':'  => { out.push('\\'); out.push(':'); }
+            _    => out.push(c),
+        }
+    }
+    out
+}
+
+fn wire_unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some(n) => out.push(n),
+                None    => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Split once at the first UNESCAPED occurrence of `delim`. `\` in the
+/// input can be used to escape `delim` or itself; any other `\<c>`
+/// leaves `c` in the left half (wire_unescape handles the final
+/// inverse). Returns `None` if no unescaped delimiter is found.
+fn wire_split_once_unescaped(s: &str, delim: char) -> Option<(String, String)> {
+    let mut left = String::new();
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            // Take the next char verbatim into the left half. This
+            // keeps the \-escape visible to downstream wire_unescape.
+            left.push('\\');
+            if let Some(n) = chars.next() { left.push(n); }
+            continue;
+        }
+        if c == delim {
+            let right: String = chars.collect();
+            return Some((left, right));
+        }
+        left.push(c);
+    }
+    None
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+
+    #[test]
+    fn round_trip_plain_role() {
+        let src = ConsequentCellSource::AntecedentRole {
+            antecedent_index: 0,
+            role: "Fact Type".to_string(),
+        };
+        assert_eq!(ConsequentCellSource::decode(&src.encode()), src);
+    }
+
+    #[test]
+    fn round_trip_role_with_colon() {
+        let src = ConsequentCellSource::AntecedentRole {
+            antecedent_index: 2,
+            role: "Weird:Noun".to_string(),
+        };
+        assert_eq!(ConsequentCellSource::decode(&src.encode()), src);
+    }
+
+    #[test]
+    fn round_trip_role_with_backslash_and_colon() {
+        let src = ConsequentCellSource::AntecedentRole {
+            antecedent_index: 7,
+            role: "a\\b:c\\:d".to_string(),
+        };
+        assert_eq!(ConsequentCellSource::decode(&src.encode()), src);
+    }
+
+    #[test]
+    fn round_trip_noun_with_colon() {
+        let src = AntecedentSource::InstancesOfNoun("NS:Thing".to_string());
+        assert_eq!(AntecedentSource::decode(&src.encode()), src);
+    }
+
+    #[test]
+    fn literal_id_passes_through_unescaped() {
+        // Legacy literal ids without any `:` round-trip as bare strings,
+        // preserving the pre-enum wire format.
+        let src = ConsequentCellSource::Literal("foo_has_bar".to_string());
+        assert_eq!(src.encode(), "foo_has_bar");
+        assert_eq!(ConsequentCellSource::decode(&src.encode()), src);
+    }
+}
+
 /// x̄ — a constant asserted into P.
 /// Subject noun 'value' predicate object 'value'.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -99,7 +206,9 @@ impl ConsequentCellSource {
     /// Compact wire-format encoding. Literals serialize to bare strings
     /// so the pre-enum wire format (a `consequentFactTypeId` binding
     /// holding the id directly) is preserved. Dynamic shapes use
-    /// sentinel-prefixed strings.
+    /// sentinel-prefixed strings with backslash-escaping of the
+    /// delimiter and escape character — so a role name containing `:`
+    /// or `\` round-trips intact (#287 gap #6).
     ///
     /// Built via push rather than `format!` so the types module stays
     /// usable from both the no_std library and the std binary.
@@ -110,7 +219,7 @@ impl ConsequentCellSource {
                 let mut out = String::from("@role:");
                 out.push_str(&antecedent_index.to_string());
                 out.push(':');
-                out.push_str(role);
+                out.push_str(&wire_escape(role));
                 out
             }
         }
@@ -122,11 +231,11 @@ impl ConsequentCellSource {
     /// literal id rather than a parse failure.
     pub fn decode(s: &str) -> Self {
         if let Some(rest) = s.strip_prefix("@role:") {
-            if let Some((idx_str, role)) = rest.split_once(':') {
+            if let Some((idx_str, role_escaped)) = wire_split_once_unescaped(rest, ':') {
                 if let Ok(antecedent_index) = idx_str.parse::<usize>() {
                     return Self::AntecedentRole {
                         antecedent_index,
-                        role: role.to_string(),
+                        role: wire_unescape(&role_escaped),
                     };
                 }
             }
@@ -184,15 +293,19 @@ impl AntecedentSource {
             Self::FactType(s) => s.clone(),
             Self::InstancesOfNoun(noun) => {
                 let mut out = String::from("@noun:");
-                out.push_str(noun);
+                // Noun names round-trip through wire_escape so ":" in a
+                // noun name doesn't break subsequent decoders (#287 gap
+                // #6). FT ids are treated as opaque strings — a literal
+                // id containing ":" still round-trips as `FactType(s)`.
+                out.push_str(&wire_escape(noun));
                 out
             }
         }
     }
 
     pub fn decode(s: &str) -> Self {
-        if let Some(noun) = s.strip_prefix("@noun:") {
-            Self::InstancesOfNoun(noun.to_string())
+        if let Some(escaped) = s.strip_prefix("@noun:") {
+            Self::InstancesOfNoun(wire_unescape(escaped))
         } else {
             Self::FactType(s.to_string())
         }
