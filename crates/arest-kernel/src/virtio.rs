@@ -21,7 +21,6 @@
 use core::ptr::NonNull;
 
 use virtio_drivers::{BufferDirection, Hal, PhysAddr};
-use x86_64::structures::paging::FrameAllocator;
 
 use crate::memory;
 
@@ -70,26 +69,28 @@ unsafe impl Hal for KernelHal {
         pages: usize,
         _direction: BufferDirection,
     ) -> (PhysAddr, NonNull<u8>) {
-        memory::with_frame_allocator(|fa| {
-            let first = fa
-                .allocate_frame()
-                .expect("dma_alloc: out of physical frames");
-            // virtio-drivers expects N *contiguous* frames. Our
-            // BootInfoFrameAllocator hands out ascending frames in
-            // order, so N sequential allocs yield a contiguous
-            // run — but only for the very first call. A robust
-            // dma_alloc needs a dedicated contiguous pool; until
-            // that lands (#262 follow-up), assert N ≤ 1 or the
-            // first page of a fresh allocator.
-            for _ in 1..pages {
-                let _ = fa
-                    .allocate_frame()
-                    .expect("dma_alloc: out of physical frames");
-            }
-            let paddr = first.start_address().as_u64() as PhysAddr;
-            let vaddr = phys_to_virt(paddr);
-            (paddr, vaddr)
+        // #268: virtio-drivers issues several `dma_alloc` calls during
+        // `VirtIONet::new` (one per virtqueue + one per rx/tx buffer
+        // pool). Each returned range must be page-aligned and physically
+        // contiguous; the descriptor rings treat the stored addresses
+        // as raw pointers into their own buffers. We satisfy that by
+        // bump-allocating out of a dedicated pool carved at `memory::
+        // init` time (see `crates/arest-kernel/src/dma.rs`), so every
+        // call lands in one contiguous physical window and never
+        // collides with the BootInfoFrameAllocator.
+        let (paddr_u64, vaddr_u64) = memory::with_dma_pool(|pool| {
+            pool.alloc(pages)
+                .expect("dma_alloc: DMA pool exhausted (bump DMA_POOL_PAGES)")
         })
+        .expect("dma_alloc: DMA pool not carved (no usable region big enough)");
+
+        let paddr = paddr_u64 as PhysAddr;
+        // SAFETY: the bootloader guarantees that every physical frame
+        // inside the DMA carve-out is mapped at `paddr + phys_offset`
+        // for the lifetime of the kernel, and the carver ensures the
+        // range is non-zero, page-aligned, and usable RAM.
+        let vaddr = unsafe { NonNull::new_unchecked(vaddr_u64 as *mut u8) };
+        (paddr, vaddr)
     }
 
     unsafe fn dma_dealloc(
@@ -97,9 +98,11 @@ unsafe impl Hal for KernelHal {
         _vaddr: NonNull<u8>,
         _pages: usize,
     ) -> i32 {
-        // BootInfoFrameAllocator is forward-only; freed frames are
-        // leaked for the lifetime of the kernel. Fine for the
-        // single virtio device class we'll instantiate.
+        // The DmaPool cursor is one-way; freed pages are leaked for the
+        // lifetime of the kernel. Fine for the single virtio device
+        // class the kernel currently instantiates — the pool is sized
+        // (`DMA_POOL_PAGES` in memory.rs) to cover the device's full
+        // lifetime footprint.
         0
     }
 
