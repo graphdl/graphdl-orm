@@ -27,10 +27,20 @@
 #   Boots the kernel headless under QEMU with a 20 s timeout, captures
 #   every byte that comes out of COM1, and asserts every banner line
 #   appears. Exits 0 on success, 1 with the captured log on failure.
+#
+# E2E mode (#268):
+#   Smoke-mode banner check, plus publish host:8080 -> container:8080
+#   (QEMU forwards to guest:80) and assert `curl http://localhost:8080/`
+#   returns 200 with the kernel's welcome payload. Exits 0 iff both
+#   the banner check and the HTTP GET succeed.
 
 param(
-    [switch]$Smoke
+    [switch]$Smoke,
+    [switch]$E2E
 )
+
+# -E2E implies smoke-mode verification of the boot sequence.
+if ($E2E) { $Smoke = $true }
 
 $ErrorActionPreference = "Stop"
 $repoRoot = (Resolve-Path "$PSScriptRoot\..").Path
@@ -62,10 +72,18 @@ if ($Smoke) {
     New-Item -ItemType Directory -Force -Path $targetDir | Out-Null
 
     # Run detached so we can terminate after the boot-banner window.
+    # -E2E publishes host:8080 -> container:8080 so the curl check can
+    # reach the guest kernel via QEMU's hostfwd.
+    $dockerArgs = @("run", "--rm", "--name", $containerName, "-d")
+    if ($E2E) {
+        $dockerArgs += @("-p", "8080:8080")
+    }
+    $dockerArgs += "arest-kernel"
+
     $prevEAP = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
-        docker run --rm --name $containerName -d arest-kernel | Out-Null
+        & docker @dockerArgs | Out-Null
     } finally {
         $ErrorActionPreference = $prevEAP
     }
@@ -119,6 +137,48 @@ if ($Smoke) {
 
         Write-Host "PASS: all banner phrases observed." -ForegroundColor Green
         Write-Host "Serial log: $logPath"
+
+        if ($E2E) {
+            Write-Host "`nE2E: curl http://localhost:8080/ ..." -ForegroundColor Cyan
+
+            # smoltcp's listener takes a moment to bind after the banner
+            # prints; poll for up to 10 s before giving up.
+            $httpDeadline = (Get-Date).AddSeconds(10)
+            $response = $null
+            $lastError = $null
+            while ((Get-Date) -lt $httpDeadline) {
+                try {
+                    $response = Invoke-WebRequest -Uri "http://localhost:8080/" `
+                        -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop
+                    break
+                } catch {
+                    $lastError = $_
+                    Start-Sleep -Milliseconds 500
+                }
+            }
+
+            if ($null -eq $response) {
+                Write-Host "FAIL: curl never reached the kernel (last error: $lastError)" -ForegroundColor Red
+                exit 1
+            }
+
+            if ($response.StatusCode -ne 200) {
+                Write-Host "FAIL: expected HTTP 200; got $($response.StatusCode)" -ForegroundColor Red
+                Write-Host "Body: $($response.Content)"
+                exit 1
+            }
+
+            $body = $response.Content
+            if ($body -notmatch "AREST kernel") {
+                Write-Host "FAIL: response body missing 'AREST kernel' marker" -ForegroundColor Red
+                Write-Host "Body: $body"
+                exit 1
+            }
+
+            Write-Host "PASS: host:8080 reached guest kernel :80 (HTTP 200)." -ForegroundColor Green
+            Write-Host "Body: $($body.Trim())"
+        }
+
         exit 0
     }
     finally {
