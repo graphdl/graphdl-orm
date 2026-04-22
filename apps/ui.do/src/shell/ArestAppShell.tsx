@@ -19,7 +19,7 @@
 import type { ReactElement, ReactNode } from 'react'
 import { AppShell } from '@mdxui/app'
 import type { NavGroup, NavItem, UserIdentity } from '@mdxui/app'
-import { useArestResources } from '../resources'
+import { useArestResources, useExternalSystems } from '../resources'
 import { EntityOverworldMenu } from '../views'
 
 export interface ArestAppShellProps {
@@ -70,11 +70,34 @@ function resourcesToNavGroup(
   return { label: 'Resources', items }
 }
 
+/**
+ * Mirror of `resourcesToNavGroup` for mounted External Systems
+ * (#343). Rendered as its own nav group so vocabulary browsers
+ * don't clutter the first-class Resources list.
+ */
+function externalResourcesToNavGroup(
+  resources: ReturnType<typeof useExternalSystems>['resources'],
+  basePath: string,
+): NavGroup {
+  const prefix = basePath.endsWith('/') ? basePath.slice(0, -1) : basePath
+  const items: NavItem[] = resources
+    .filter((r) => !r.options?.hideFromMenu)
+    .map((r) => ({
+      title: r.options?.label ?? r.name,
+      url: `${prefix}/${r.name}`,
+    }))
+  return { label: 'External Systems', items }
+}
+
 export function ArestAppShell(props: ArestAppShellProps): ReactElement {
   const { baseUrl, app, config, user, currentEntity, nounScope, pageHeader, footer, children } = props
   const { resources, isLoading } = useArestResources({ baseUrl, app, filter: nounScope })
+  const { resources: externalResources, systems: externalSystems } = useExternalSystems({ baseUrl, app })
   const basePath = config.basePath ?? ''
   const navigation: NavGroup[] = [resourcesToNavGroup(resources, basePath)]
+  if (externalSystems.length > 0) {
+    navigation.push(externalResourcesToNavGroup(externalResources, basePath))
+  }
 
   const defaultFooter = currentEntity ? (
     <EntityOverworldMenu
@@ -91,7 +114,7 @@ export function ArestAppShell(props: ArestAppShellProps): ReactElement {
       user={user}
       isLoading={isLoading}
       pageHeader={pageHeader}
-      nav={<ArestSidebarNavList group={navigation[0]} />}
+      nav={<ArestSidebarNav groups={navigation} />}
       footer={footer ?? defaultFooter}
     >
       {children}
@@ -119,5 +142,27 @@ export function ArestSidebarNavList({ group }: { group: NavGroup }): ReactElemen
         </li>
       ))}
     </ul>
+  )
+}
+
+/**
+ * Multi-group sidebar — renders every NavGroup with a heading. #343
+ * introduced the second group (External Systems); future lanes may
+ * add more (saved searches, etc.) without further edits here.
+ */
+export function ArestSidebarNav({ groups }: { groups: NavGroup[] }): ReactElement {
+  return (
+    <nav data-testid="arest-sidebar-nav-root">
+      {groups.map((group, idx) => (
+        <section key={`${group.label}-${idx}`} data-testid={`arest-sidebar-group-${group.label}`}>
+          {group.label ? (
+            <h3 style={{ margin: '0.75rem 1rem 0.25rem', fontSize: '0.8rem', opacity: 0.7 }}>
+              {group.label}
+            </h3>
+          ) : null}
+          <ArestSidebarNavList group={group} />
+        </section>
+      ))}
+    </nav>
   )
 }

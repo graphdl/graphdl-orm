@@ -149,6 +149,40 @@ describe('ArestAppShell', () => {
     await waitFor(() => expect(screen.getByTestId('overworld-menu')).toBeDefined())
   })
 
+  it('renders an "External Systems" nav group when /external/* paths exist in the doc (#343)', async () => {
+    const docWithSchemaOrg = {
+      ...sampleDoc,
+      paths: {
+        '/organizations': { get: {} },
+        '/external/schema.org/types': { get: {} },
+        '/external/schema.org/types/{name}': { get: {} },
+      },
+    }
+    stubFetch(() => json(docWithSchemaOrg))
+
+    render(wrap(
+      <ArestAppShell baseUrl={baseUrl} config={{ name: 'ui.do' }}>
+        <p>content</p>
+      </ArestAppShell>,
+    ))
+
+    await waitFor(() =>
+      expect(screen.getByTestId('nav-group-external systems').textContent).toContain('1')
+    )
+    expect(screen.getByTestId('nav-/external-schema-org')).toBeDefined()
+  })
+
+  it('omits the External Systems nav group when no /external/* paths exist', async () => {
+    stubFetch(() => json(sampleDoc))
+    render(wrap(
+      <ArestAppShell baseUrl={baseUrl} config={{ name: 'ui.do' }}>
+        <p>content</p>
+      </ArestAppShell>,
+    ))
+    await waitFor(() => expect(screen.getByTestId('nav-group-resources')).toBeDefined())
+    expect(screen.queryByTestId('nav-group-external systems')).toBeNull()
+  })
+
   it('forwards a caller-supplied pageHeader (breadcrumbs slot)', async () => {
     stubFetch(() => json(sampleDoc))
     render(wrap(
