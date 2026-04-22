@@ -198,6 +198,27 @@ fn openapi_from_state(state: &Object, app_name: &str) -> serde_json::Value {
     let app_description = app_description_from_state(inst_seq, app_name)
         .unwrap_or_else(|| format!("Compiled from FORML2 readings for App '{}'.", app_name));
 
+    // #343 External System browse routes. For every mounted system
+    // (rows in the "External System" cell) emit:
+    //   GET /external/{system}/types          → list of type names
+    //   GET /external/{system}/types/{name}   → BrowseResponse shape
+    // Schema component for BrowseResponse is inserted once into
+    // `components.schemas` so both routes can $ref it.
+    let mut paths = paths;
+    let mut schemas = schemas;
+    let mounted = crate::external::mounted_systems(state);
+    if !mounted.is_empty() {
+        schemas.entry("ExternalTypeList".to_string())
+            .or_insert_with(external_type_list_component_schema);
+        schemas.entry("ExternalTypeDescription".to_string())
+            .or_insert_with(external_type_description_component_schema);
+        for system in mounted.iter() {
+            let (collection, item) = external_paths_for_system(system);
+            paths.insert(format!("/external/{}/types", system), collection);
+            paths.insert(format!("/external/{}/types/{{name}}", system), item);
+        }
+    }
+
     serde_json::json!({
         "openapi": "3.1.0",
         "info": {
@@ -210,6 +231,98 @@ fn openapi_from_state(state: &Object, app_name: &str) -> serde_json::Value {
             "schemas": schemas,
         },
     })
+}
+
+/// Component schema for the `/external/{system}/types` list response —
+/// a JSON array of strings (type names).
+fn external_type_list_component_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Type names exposed by the External System.",
+    })
+}
+
+/// Component schema for the `/external/{system}/types/{name}` item
+/// response — mirrors `external::BrowseResponse` verbatim (handoff
+/// §1. MCP verb shape).
+fn external_type_description_component_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "required": ["type", "supertypes", "subtypes", "properties"],
+        "properties": {
+            "type":       { "type": "string" },
+            "supertypes": { "type": "array", "items": { "type": "string" } },
+            "subtypes":   { "type": "array", "items": { "type": "string" } },
+            "properties": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["name", "range"],
+                    "properties": {
+                        "name":  { "type": "string" },
+                        "range": { "type": "string" },
+                    },
+                },
+            },
+        },
+    })
+}
+
+/// Build the (collection, item) path items for `system`. Matches the
+/// handoff contract §2.
+fn external_paths_for_system(system: &str) -> (serde_json::Value, serde_json::Value) {
+    let op_id_list = format!("listExternalTypes_{}", rmap::to_snake(system));
+    let op_id_get  = format!("getExternalType_{}",   rmap::to_snake(system));
+    let tag        = format!("external:{}", system);
+
+    let collection = serde_json::json!({
+        "get": {
+            "operationId": op_id_list,
+            "summary":     format!("List types in External System '{}'", system),
+            "tags":        [tag.clone()],
+            "responses": {
+                "200": {
+                    "description": "Type names exposed by this External System.",
+                    "content": {
+                        "application/json": {
+                            "schema": { "$ref": "#/components/schemas/ExternalTypeList" },
+                        },
+                    },
+                },
+            },
+        },
+    });
+
+    let item = serde_json::json!({
+        "get": {
+            "operationId": op_id_get,
+            "summary":     format!("Browse a type in External System '{}'", system),
+            "tags":        [tag],
+            "parameters": [{
+                "name":     "name",
+                "in":       "path",
+                "required": true,
+                "schema":   { "type": "string" },
+                "description": "Local type name (e.g. 'Person').",
+            }],
+            "responses": {
+                "200": {
+                    "description": "Type description (supertypes, subtypes, properties).",
+                    "content": {
+                        "application/json": {
+                            "schema": { "$ref": "#/components/schemas/ExternalTypeDescription" },
+                        },
+                    },
+                },
+                "404": {
+                    "description": "Unknown type for this External System.",
+                },
+            },
+        },
+    });
+
+    (collection, item)
 }
 
 /// Build the OpenAPI 3.1 document for one App as a `serde_json::Value`.
@@ -1312,5 +1425,68 @@ mod tests {
              is asserted; got openapi:* keys: {:?}",
             defs_with.iter().filter(|(k, _)| k.starts_with("openapi:")).map(|(k, _)| k).collect::<Vec<_>>()
         );
+    }
+
+    // ── #343 /external/{system}/types + /types/{name} routes ────────
+
+    /// Tenant with schema.org mounted via `external::schema_org::mount`
+    /// — tests exercise the generator on the same minimal mount the
+    /// production path uses. Avoids reaching into the parsed graph.
+    fn state_with_schema_org_mounted() -> Object {
+        let base = organization_with_slug();
+        crate::external::schema_org::mount(&base)
+    }
+
+    #[test]
+    fn openapi_emits_external_types_collection_path_when_system_mounted() {
+        let state = state_with_schema_org_mounted();
+        let doc = openapi_for_app(&state, "test-app");
+        let paths = doc["paths"].as_object().expect("paths must be an object");
+        assert!(paths.contains_key("/external/schema.org/types"),
+            "mounted schema.org must emit GET /external/schema.org/types; \
+             paths present: {:?}", paths.keys().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn openapi_emits_external_type_item_path_when_system_mounted() {
+        let state = state_with_schema_org_mounted();
+        let doc = openapi_for_app(&state, "test-app");
+        let paths = doc["paths"].as_object().unwrap();
+        assert!(paths.contains_key("/external/schema.org/types/{name}"),
+            "mounted schema.org must emit GET /external/schema.org/types/{{name}}; \
+             paths present: {:?}", paths.keys().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn openapi_external_routes_absent_without_mount() {
+        let state = organization_with_slug();
+        let doc = openapi_for_app(&state, "test-app");
+        let paths = doc["paths"].as_object().unwrap();
+        let external_keys: Vec<&String> = paths.keys()
+            .filter(|k| k.starts_with("/external/"))
+            .collect();
+        assert!(external_keys.is_empty(),
+            "no External System cell → no /external/* routes; got: {:?}",
+            external_keys);
+    }
+
+    #[test]
+    fn openapi_external_type_item_response_references_handoff_shape() {
+        let state = state_with_schema_org_mounted();
+        let doc = openapi_for_app(&state, "test-app");
+        let op = &doc["paths"]["/external/schema.org/types/{name}"]["get"];
+        let resp_schema = &op["responses"]["200"]["content"]["application/json"]["schema"];
+        assert_eq!(resp_schema["$ref"], "#/components/schemas/ExternalTypeDescription",
+            "item response must $ref the shared component so both systems reuse one shape");
+        // And the referenced component describes the handoff's
+        // BrowseResponse fields verbatim.
+        let component = &doc["components"]["schemas"]["ExternalTypeDescription"];
+        let props = component["properties"].as_object()
+            .expect("ExternalTypeDescription must carry properties");
+        for required in ["type", "supertypes", "subtypes", "properties"] {
+            assert!(props.contains_key(required),
+                "component must describe '{required}'; got props: {:?}",
+                props.keys().collect::<Vec<_>>());
+        }
     }
 }
