@@ -27,7 +27,7 @@
 //! (Noun, Fact Type, Role, …) is the per-kind #280b commits.
 
 extern crate alloc;
-use alloc::{string::{String, ToString}, vec::Vec, format};
+use alloc::{string::{String, ToString}, vec::Vec};
 use hashbrown::HashMap;
 use crate::ast::{Object, fetch_or_phi, fact_from_pairs, binding};
 
