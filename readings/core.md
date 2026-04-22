@@ -376,6 +376,29 @@ Derivation Rule has Role Projection.
 Fact Type has Derivation Storage Type.
   Each Fact Type has at most one Derivation Storage Type.
 
+## Antecedent Clause Shape (#281)
+
+Every clause inside a derivation-rule antecedent should parse into a
+recognised `Clause Shape`. If the compiler can't attach a shape (the
+clause didn't match any known pattern — Fact-Type literal, Antecedent
+Role bind, Negation, Comparison, …) the rule is unsafe to chain and
+the validator surfaces the violation. Expressing this as a deontic
+constraint lets the runtime emit the diagnostic through Theorem 4's
+violation path rather than a hard-coded check pass.
+
+Antecedent Clause(.id) is an entity type.
+Clause Shape is a value type.
+  The possible values of Clause Shape are 'fact-type-literal', 'antecedent-role', 'negation', 'comparison', 'conjunction', 'quantified', 'unresolved'.
+
+Derivation Rule has Antecedent Clause.
+  Each Derivation Rule has some Antecedent Clause.
+  For each Antecedent Clause, exactly one Derivation Rule has that Antecedent Clause.
+
+Antecedent Clause has Clause Shape.
+  Each Antecedent Clause has at most one Clause Shape.
+
+It is obligatory that each Antecedent Clause has Clause Shape.
+
 ## NORMA Value Domain (#279)
 
 ### Entity types
