@@ -1372,12 +1372,19 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
         .filter(|(name, _)| generators.contains(*name))
         .collect();
     if !active_dialects.is_empty() {
-        let sql_tables = crate::rmap::rmap_from_state(state);
-        defs.extend(sql_tables.iter().flat_map(|table|
-            active_dialects.iter().map(move |(name, dialect)|
-                (format!("sql:{}:{}", name, table.name), Func::constant(Object::atom(&generate_ddl(table, dialect))))
-            )
-        ));
+        // #325: DDL emission reads the RMAP cells view directly instead
+        // of a `Vec<TableDef>`. Same bytes out; one less typed-IR hop.
+        let rmap_cells = crate::rmap::rmap_cells_from_state(state);
+        let names = crate::rmap::table_names(&rmap_cells);
+        for table_name in &names {
+            for (dialect_name, dialect) in active_dialects.iter() {
+                let ddl = generate_ddl(&rmap_cells, table_name, dialect);
+                defs.push((
+                    format!("sql:{}:{}", dialect_name, table_name),
+                    Func::constant(Object::atom(&ddl)),
+                ));
+            }
+        }
     }
 
     // â”€â”€ Generator 3b: SQL Triggers for derivation rules â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -4923,8 +4930,11 @@ fn compile_state_machine(
 #[derive(Clone, Copy)]
 enum SqlDialect { Sqlite, PostgreSql, MySql, SqlServer, Oracle, Db2, Standard, ClickHouse }
 
-/// Generate DDL for a table in the given SQL dialect.
-fn generate_ddl(table: &crate::rmap::TableDef, dialect: &SqlDialect) -> String {
+/// Generate DDL for a table in the given SQL dialect. Reads the RMAP
+/// cells view directly (#325) — no TableDef allocation, no typed-IR
+/// round-trip. `table_name` is the snake_case name present in the
+/// `RMAPTable` cell.
+fn generate_ddl(cells: &crate::ast::Object, table_name: &str, dialect: &SqlDialect) -> String {
     let q = |s: &str| match dialect {
         SqlDialect::MySql => format!("`{}`", s),
         SqlDialect::SqlServer => format!("[{}]", s),
@@ -4968,17 +4978,19 @@ fn generate_ddl(table: &crate::rmap::TableDef, dialect: &SqlDialect) -> String {
         }
     };
 
+    let columns_view = crate::rmap::columns_for_table(cells, table_name);
+    let pk_cols = crate::rmap::primary_key_of_table(cells, table_name);
+    let ucs_vec = crate::rmap::unique_constraints_of_table(cells, table_name);
+
     let create_kw = match dialect {
-        SqlDialect::ClickHouse => format!("CREATE TABLE IF NOT EXISTS {} (\n", q(&table.name)),
-        SqlDialect::Oracle => format!("CREATE TABLE {} (\n", q(&table.name)),
-        _ => format!("CREATE TABLE IF NOT EXISTS {} (\n", q(&table.name)),
+        SqlDialect::Oracle => format!("CREATE TABLE {} (\n", q(table_name)),
+        _ => format!("CREATE TABLE IF NOT EXISTS {} (\n", q(table_name)),
     };
 
-    let has_pk = !table.primary_key.is_empty();
-    let has_checks = table.checks.as_ref().map_or(false, |c| !c.is_empty());
-    let has_ucs = table.unique_constraints.as_ref().map_or(false, |u| !u.is_empty());
+    let has_pk = !pk_cols.is_empty();
+    let has_ucs = !ucs_vec.is_empty();
 
-    let columns: String = table.columns.iter().enumerate().map(|(i, col)| {
+    let columns: String = columns_view.iter().enumerate().map(|(i, col)| {
         let col_type = map_type(&col.col_type);
         let nullable = if col.nullable {
             match dialect { SqlDialect::ClickHouse => " Nullable", _ => "" }
@@ -4987,36 +4999,29 @@ fn generate_ddl(table: &crate::rmap::TableDef, dialect: &SqlDialect) -> String {
         };
         let refs = col.references.as_ref()
             .map(|r| match dialect {
-                SqlDialect::ClickHouse => String::new(), // no FK in ClickHouse
+                SqlDialect::ClickHouse => String::new(),
                 _ => format!(" REFERENCES {}", q(r)),
             })
             .unwrap_or_default();
-        let trailing = if i < table.columns.len() - 1 || has_pk || has_checks || has_ucs { "," } else { "" };
+        let trailing = if i < columns_view.len() - 1 || has_pk || has_ucs { "," } else { "" };
         format!("  {} {}{}{}{}\n", q(&col.name), col_type, nullable, refs, trailing)
     }).collect();
 
     let pk = if has_pk {
-        let pk_cols: Vec<String> = table.primary_key.iter().map(|c| q(c)).collect();
-        let trailing = if has_checks || has_ucs { "," } else { "" };
-        format!("  PRIMARY KEY ({}){}\n", pk_cols.join(", "), trailing)
+        let pk_cols_q: Vec<String> = pk_cols.iter().map(|c| q(c)).collect();
+        let trailing = if has_ucs { "," } else { "" };
+        format!("  PRIMARY KEY ({}){}\n", pk_cols_q.join(", "), trailing)
     } else { String::new() };
 
-    let checks: String = match (dialect, &table.checks) {
-        (SqlDialect::ClickHouse, _) => String::new(), // no CHECK in ClickHouse
-        (_, Some(checks)) => checks.iter().enumerate().map(|(i, check)| {
-            let trailing = if i < checks.len() - 1 || has_ucs { "," } else { "" };
-            format!("  CHECK ({}){}\n", check, trailing)
-        }).collect(),
-        _ => String::new(),
-    };
+    let checks: String = String::new(); // RMAP never emits CHECK constraints.
 
-    let ucs: String = table.unique_constraints.as_ref().map(|ucs| {
-        ucs.iter().enumerate().map(|(i, uc)| {
+    let ucs: String = if has_ucs {
+        ucs_vec.iter().enumerate().map(|(i, uc)| {
             let uc_cols: Vec<String> = uc.iter().map(|c| q(c)).collect();
-            let trailing = if i < ucs.len() - 1 { "," } else { "" };
+            let trailing = if i < ucs_vec.len() - 1 { "," } else { "" };
             format!("  UNIQUE ({}){}\n", uc_cols.join(", "), trailing)
         }).collect::<String>()
-    }).unwrap_or_default();
+    } else { String::new() };
 
     let engine = match dialect {
         SqlDialect::ClickHouse => "\nENGINE = MergeTree()\nORDER BY tuple()",

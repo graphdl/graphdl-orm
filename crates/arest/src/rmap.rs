@@ -216,6 +216,37 @@ pub(crate) fn columns_for_table(cells: &crate::ast::Object, table_name: &str) ->
     with_pos.into_iter().map(|(_, v)| v).collect()
 }
 
+/// Return a table's UNIQUE constraints as a `Vec<Vec<String>>` — each
+/// inner Vec is one UNIQUE set of column names. Empty when the table
+/// has no extra UNIQUE beyond its primary key.
+///
+/// Decodes the `uniqueConstraints` binding on the RMAPTable row: the
+/// wire form is `a,b;c,d` → `[[a,b],[c,d]]` (semicolons between UC
+/// groups, commas within a group). Matches the encoding from
+/// `rmap_cells_from_state`.
+pub fn unique_constraints_of_table(cells: &crate::ast::Object, table_name: &str) -> Vec<Vec<String>> {
+    let rows = crate::ast::fetch_or_phi("RMAPTable", cells);
+    let Some(seq) = rows.as_seq() else { return Vec::new(); };
+    seq.iter()
+        .find(|f| crate::ast::binding(f, "name") == Some(table_name))
+        .and_then(|f| crate::ast::binding(f, "uniqueConstraints"))
+        .filter(|s| !s.is_empty())
+        .map(|s| s.split(';')
+            .map(|grp| grp.split(',').map(|c| c.to_string()).collect())
+            .collect())
+        .unwrap_or_default()
+}
+
+/// Every table name in the RMAP cells view, in declaration order.
+pub fn table_names(cells: &crate::ast::Object) -> Vec<String> {
+    let rows = crate::ast::fetch_or_phi("RMAPTable", cells);
+    rows.as_seq()
+        .map(|seq| seq.iter()
+            .filter_map(|f| crate::ast::binding(f, "name").map(String::from))
+            .collect())
+        .unwrap_or_default()
+}
+
 /// Return the primary-key columns of a table in order. Empty when the
 /// table has no `RMAPTable` row or the `primaryKey` binding is empty.
 pub fn primary_key_of_table(cells: &crate::ast::Object, table_name: &str) -> Vec<String> {
