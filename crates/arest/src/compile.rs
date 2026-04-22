@@ -1100,7 +1100,12 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
     // paths would, and this loop never writes the wildcard.
     defs.extend(model.derivations.iter()
         .filter_map(|compiled| {
-            let user_rule = c_derivation_rules.iter().find(|r| r.id == compiled.id)?;
+            // Match by `text` rather than `id`: parse_forml2::re_resolve_rules
+            // rehashes rule ids to a content-stable `rule_<fnv>` form
+            // before compile sees them, so `compiled.id` never equals the
+            // cell-stored `DerivationRule.id` that `c_derivation_rules`
+            // carries. `text` survives the rehash on both sides.
+            let user_rule = c_derivation_rules.iter().find(|r| r.text == compiled.text)?;
             let literal = user_rule.consequent_cell.literal_id();
             if literal.is_empty() { return None; }
             Some((
