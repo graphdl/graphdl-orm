@@ -264,6 +264,272 @@ pub fn boxed_in_memory() -> Box<dyn StorageBackend> {
     Box::new(InMemoryBackend::new())
 }
 
+// ── CellStorageBackend + DurableObjectBackend (Storage-3, #336) ─────
+//
+// The paper (§5.4, Definition 2 — Cell Isolation) is explicit: each
+// entity is a cell, and at most one μ-application writes to any
+// cell at a time. Distributed deployments realise that by giving
+// each cell its own writer — one DurableObject per cell keyed by
+// `(tenant, cell_name)`. This matches docs/12-physical-mapping.md
+// §"One DO per cell" and the `EntityDB` shape already in the
+// Worker.
+//
+// `StorageBackend` above treats the whole tenant state as one blob
+// — the right surface for in-memory / single-file backends, but
+// the wrong shape for per-cell DOs. A tenant-blob DO would serialise
+// every disjoint-cell write behind a single DO, violating Def 2.
+//
+// `CellStorageBackend` is the per-cell surface: read/commit/list/
+// delete one `(tenant, cell)` pair at a time. The DO impl maps each
+// `(tenant, cell)` to one DO instance by name, which is exactly the
+// tenant-separation model the ring-3 userspace design uses
+// (per-tenant CR3) applied to persistence: the `tenant` namespace
+// scopes the cell keys so no DO is accessible across tenants.
+//
+// `AsCellStorage` provides a default `StorageBackend` shim on top of
+// `CellStorageBackend`: `open(handle)` rehydrates every cell for
+// that tenant into one `Object::Map`; `commit(handle, state)` splits
+// a Map back into per-cell writes. This preserves the single-object
+// engine API while the underlying writes are cell-granular.
+
+/// Cell-granular storage surface (paper §5.4 / Def 2).
+///
+/// Writes on disjoint cells within one tenant are safe to run
+/// concurrently. The backend is responsible for serialising
+/// concurrent writes *within* one cell.
+pub trait CellStorageBackend: Send + Sync {
+    /// Read one cell's contents for `tenant`. `NotFound` when the
+    /// (tenant, cell) pair has never been committed.
+    fn cell_read(&self, tenant: u32, cell: &str) -> Result<Object, StorageError>;
+
+    /// Commit one cell's contents for `tenant`. Replaces any prior
+    /// value atomically.
+    fn cell_commit(&self, tenant: u32, cell: &str, value: &Object) -> Result<(), StorageError>;
+
+    /// Enumerate every cell name that has a committed value for
+    /// `tenant`. Used on boot / first `open` to rehydrate.
+    fn cell_list(&self, tenant: u32) -> Result<alloc::vec::Vec<String>, StorageError>;
+
+    /// Drop one cell. Tenant teardown uses this after listing; idempotent.
+    fn cell_delete(&self, tenant: u32, cell: &str) -> Result<(), StorageError>;
+}
+
+// ── DurableObjectBackend ────────────────────────────────────────────
+//
+// Wire form (Cloudflare DO addressed via an intermediary Worker):
+//
+//   GET    {endpoint}/{tenant}/cell/{cell}          -> 200 freeze-bytes | 404
+//   PUT    {endpoint}/{tenant}/cell/{cell} [bytes]  -> 204 | 5xx
+//   GET    {endpoint}/{tenant}/cells                -> 200 JSON array of names | 404
+//   DELETE {endpoint}/{tenant}/cell/{cell}          -> 204
+//
+// All cell bodies are raw freeze bytes — same format the kernel ROM
+// path uses so a DO export can feed the kernel without conversion.
+//
+// `HttpTransport` is the pluggable HTTP client. Callers implement it
+// against whichever stack they run (workers-rs, reqwest, a mock in
+// tests). `DurableObjectBackend` is parameterised on it so the test
+// suite can exercise the full protocol without a live Worker.
+
+/// Minimal HTTP surface the DurableObject backend uses. Supplied by
+/// the caller so this crate stays HTTP-client-agnostic.
+pub trait HttpTransport: Send + Sync {
+    /// GET the given URL. `Ok(Some(bytes))` on 200, `Ok(None)` on
+    /// 404, `Err(_)` on any other non-success or transport failure.
+    fn get(&self, url: &str) -> Result<Option<alloc::vec::Vec<u8>>, StorageError>;
+
+    /// PUT bytes to the given URL. Any non-2xx / transport failure
+    /// is an error.
+    fn put(&self, url: &str, body: &[u8]) -> Result<(), StorageError>;
+
+    /// DELETE the given URL. `Ok(())` on 2xx or 404 (idempotent),
+    /// `Err(_)` otherwise.
+    fn delete(&self, url: &str) -> Result<(), StorageError>;
+}
+
+/// Cloudflare DurableObject per-cell storage backend. Each
+/// `(tenant, cell)` pair maps to one DO instance behind the Worker
+/// at `endpoint`. Tenant separation is enforced by the DO router: a
+/// request for `tenant=3/cell=foo` never resolves to tenant=7's DOs.
+pub struct DurableObjectBackend<T: HttpTransport> {
+    /// Base URL with no trailing slash (e.g. `https://arest-storage.example.com`).
+    endpoint: String,
+    transport: T,
+}
+
+impl<T: HttpTransport> DurableObjectBackend<T> {
+    pub fn new(endpoint: impl Into<String>, transport: T) -> Self {
+        let mut e: String = endpoint.into();
+        while e.ends_with('/') { e.pop(); }
+        Self { endpoint: e, transport }
+    }
+
+    fn cell_url(&self, tenant: u32, cell: &str) -> String {
+        // URL-encode cell names minimally (paper cell names are
+        // ASCII identifiers with '_', '.', and ':' — all legal in
+        // paths). The DO router splits on '/', so any embedded '/'
+        // in a cell name would ambiguate the route. Replace '/'
+        // with '%2F' as a belt-and-braces guard.
+        let encoded = cell.replace('/', "%2F");
+        format!("{}/{}/cell/{}", self.endpoint, tenant, encoded)
+    }
+
+    fn list_url(&self, tenant: u32) -> String {
+        format!("{}/{}/cells", self.endpoint, tenant)
+    }
+}
+
+impl<T: HttpTransport> CellStorageBackend for DurableObjectBackend<T> {
+    fn cell_read(&self, tenant: u32, cell: &str) -> Result<Object, StorageError> {
+        match self.transport.get(&self.cell_url(tenant, cell))? {
+            Some(bytes) => crate::freeze::thaw(&bytes)
+                .map_err(StorageError::Corrupted),
+            None => Err(StorageError::NotFound),
+        }
+    }
+
+    fn cell_commit(&self, tenant: u32, cell: &str, value: &Object) -> Result<(), StorageError> {
+        let bytes = crate::freeze::freeze(value);
+        self.transport.put(&self.cell_url(tenant, cell), &bytes)
+    }
+
+    fn cell_list(&self, tenant: u32) -> Result<alloc::vec::Vec<String>, StorageError> {
+        match self.transport.get(&self.list_url(tenant))? {
+            Some(bytes) => {
+                let text = core::str::from_utf8(&bytes)
+                    .map_err(|e| StorageError::Corrupted(format!("non-utf8 cell list: {e}")))?;
+                Ok(parse_name_array(text))
+            }
+            None => Ok(alloc::vec::Vec::new()),
+        }
+    }
+
+    fn cell_delete(&self, tenant: u32, cell: &str) -> Result<(), StorageError> {
+        self.transport.delete(&self.cell_url(tenant, cell))
+    }
+}
+
+/// Parse a JSON array of strings without pulling serde_json in:
+/// `["Noun","Role","Constraint"]` → `vec!["Noun","Role","Constraint"]`.
+/// Non-string elements are dropped; malformed input returns empty.
+fn parse_name_array(text: &str) -> alloc::vec::Vec<String> {
+    let mut out = alloc::vec::Vec::new();
+    let mut i = 0;
+    let bytes = text.as_bytes();
+    while i < bytes.len() {
+        if bytes[i] == b'"' {
+            i += 1;
+            let start = i;
+            while i < bytes.len() && bytes[i] != b'"' { i += 1; }
+            if i >= bytes.len() { break; }
+            out.push(String::from(&text[start..i]));
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Shim that lifts a `CellStorageBackend` into the tenant-blob
+/// `StorageBackend` trait. Used when the engine's single-Object API
+/// needs to sit on top of per-cell storage. `open` enumerates every
+/// cell for the tenant and rebuilds the `Object::Map`; `commit`
+/// splits the Map back into per-cell writes.
+///
+/// Checkpoint / restore are implemented as bulk operations: snapshot
+/// the whole tenant as one blob inside a sibling cell namespace
+/// keyed by `{cell_name}@{checkpoint_id}`. Rough but keeps the trait
+/// contract without a separate checkpoint DO — the per-cell
+/// isolation guarantee (Def 2) still holds because each checkpoint
+/// cell is its own DO.
+pub struct AsCellStorage<C: CellStorageBackend> {
+    inner: C,
+    next_id: Mutex<u64>,
+}
+
+impl<C: CellStorageBackend> AsCellStorage<C> {
+    pub fn new(inner: C) -> Self {
+        Self { inner, next_id: Mutex::new(0) }
+    }
+
+    pub fn into_inner(self) -> C {
+        self.inner
+    }
+
+    pub fn cells(&self) -> &C {
+        &self.inner
+    }
+}
+
+impl<C: CellStorageBackend> StorageBackend for AsCellStorage<C> {
+    fn open(&self, handle: u32) -> Result<Object, StorageError> {
+        let names = self.inner.cell_list(handle)?;
+        if names.is_empty() {
+            return Err(StorageError::NotFound);
+        }
+        let mut map = hashbrown::HashMap::new();
+        for name in names {
+            // Skip checkpoint shadow cells when rehydrating head.
+            if name.contains('@') { continue; }
+            let value = self.inner.cell_read(handle, &name)?;
+            map.insert(name, value);
+        }
+        Ok(Object::Map(map))
+    }
+
+    fn commit(&self, handle: u32, delta: &Object) -> Result<(), StorageError> {
+        // Engine commits a whole-state Object::Map; split into
+        // per-cell writes. Disjoint cells can be parallelised by a
+        // future revision — the trait contract permits it. For now
+        // write sequentially so an error half-way through surfaces
+        // deterministically.
+        let map = delta.as_map()
+            .ok_or_else(|| StorageError::Corrupted(
+                "AsCellStorage::commit expects Object::Map; got other shape".to_string()))?;
+        for (cell, value) in map {
+            self.inner.cell_commit(handle, cell, value)?;
+        }
+        Ok(())
+    }
+
+    fn checkpoint(&self, handle: u32) -> Result<CheckpointId, StorageError> {
+        let names = self.inner.cell_list(handle)?;
+        if names.is_empty() {
+            return Err(StorageError::NotFound);
+        }
+        let id = {
+            let mut n = self.next_id.lock();
+            let id = format!("ckpt-{}", *n);
+            *n += 1;
+            id
+        };
+        for name in &names {
+            if name.contains('@') { continue; }
+            let value = self.inner.cell_read(handle, name)?;
+            let shadow = format!("{name}@{id}");
+            self.inner.cell_commit(handle, &shadow, &value)?;
+        }
+        Ok(CheckpointId(id))
+    }
+
+    fn restore(&self, handle: u32, id: &CheckpointId) -> Result<Object, StorageError> {
+        let names = self.inner.cell_list(handle)?;
+        let suffix = format!("@{}", id.as_str());
+        let mut map = hashbrown::HashMap::new();
+        for name in names {
+            if let Some(base) = name.strip_suffix(&suffix) {
+                let value = self.inner.cell_read(handle, &name)?;
+                map.insert(base.to_string(), value);
+            }
+        }
+        if map.is_empty() {
+            return Err(StorageError::NotFound);
+        }
+        Ok(Object::Map(map))
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -483,5 +749,158 @@ mod tests {
         b.commit(0, &sample()).expect("commit via trait object");
         let got = b.open(0).expect("open via trait object");
         assert_eq!(got, sample());
+    }
+
+    // ── DurableObjectBackend + AsCellStorage (#336) ────────────────
+    //
+    // MockHttp is an in-memory HTTP surrogate keyed by URL. The DO
+    // backend drives it through its public contract and we assert on
+    // the resulting cell-namespace shape. Proves:
+    //   - cell_read/commit/list/delete round-trip per (tenant, cell)
+    //   - tenant separation: a request under tenant=3 never touches
+    //     tenant=7's URL path, so the two tenants' namespaces are
+    //     disjoint by construction.
+    //   - AsCellStorage lifts cell-granular writes into the blob
+    //     StorageBackend API without collapsing the cell partition —
+    //     every commit splits into per-cell writes the DO runtime
+    //     serialises independently.
+
+    #[derive(Default)]
+    struct MockHttp {
+        // URL -> bytes. Mutex so the trait's `&self` can mutate.
+        store: Mutex<hashbrown::HashMap<String, alloc::vec::Vec<u8>>>,
+    }
+
+    impl HttpTransport for MockHttp {
+        fn get(&self, url: &str) -> Result<Option<alloc::vec::Vec<u8>>, StorageError> {
+            if url.ends_with("/cells") {
+                // Synthesize the JSON name array from the mock store's
+                // URL namespace.
+                let prefix = url.trim_end_matches("/cells");
+                let cell_pfx = format!("{}/cell/", prefix);
+                let names: Vec<String> = self.store.lock().keys()
+                    .filter_map(|k| k.strip_prefix(&cell_pfx).map(String::from))
+                    .collect();
+                if names.is_empty() { return Ok(None); }
+                let body = format!(
+                    "[{}]",
+                    names.iter()
+                        .map(|n| format!("\"{}\"", n))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                );
+                return Ok(Some(body.into_bytes()));
+            }
+            Ok(self.store.lock().get(url).cloned())
+        }
+
+        fn put(&self, url: &str, body: &[u8]) -> Result<(), StorageError> {
+            self.store.lock().insert(url.to_string(), body.to_vec());
+            Ok(())
+        }
+
+        fn delete(&self, url: &str) -> Result<(), StorageError> {
+            self.store.lock().remove(url);
+            Ok(())
+        }
+    }
+
+    fn do_backend() -> DurableObjectBackend<MockHttp> {
+        DurableObjectBackend::new("https://arest-test.example/", MockHttp::default())
+    }
+
+    #[test]
+    fn do_cell_read_missing_returns_not_found() {
+        let b = do_backend();
+        match b.cell_read(1, "Noun") {
+            Err(StorageError::NotFound) => {}
+            other => panic!("expected NotFound; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn do_cell_commit_then_read_round_trips() {
+        let b = do_backend();
+        let value = Object::atom("Order");
+        b.cell_commit(1, "Noun", &value).expect("commit ok");
+        assert_eq!(b.cell_read(1, "Noun").expect("read ok"), value);
+    }
+
+    #[test]
+    fn do_cell_list_names_every_committed_cell_for_tenant() {
+        let b = do_backend();
+        b.cell_commit(1, "Noun", &Object::atom("n")).expect("ok");
+        b.cell_commit(1, "Role", &Object::atom("r")).expect("ok");
+        b.cell_commit(1, "FactType", &Object::atom("f")).expect("ok");
+        let mut names = b.cell_list(1).expect("list ok");
+        names.sort();
+        assert_eq!(names, vec!["FactType", "Noun", "Role"]);
+    }
+
+    #[test]
+    fn do_cell_namespaces_are_tenant_disjoint() {
+        let b = do_backend();
+        b.cell_commit(1, "Noun", &Object::atom("tenant-1")).expect("ok");
+        b.cell_commit(2, "Noun", &Object::atom("tenant-2")).expect("ok");
+
+        assert_eq!(b.cell_read(1, "Noun").expect("ok"), Object::atom("tenant-1"));
+        assert_eq!(b.cell_read(2, "Noun").expect("ok"), Object::atom("tenant-2"));
+
+        // Tenant 1 deleting its Noun cell must not affect tenant 2.
+        b.cell_delete(1, "Noun").expect("delete ok");
+        match b.cell_read(1, "Noun") {
+            Err(StorageError::NotFound) => {}
+            other => panic!("expected NotFound for tenant 1; got {other:?}"),
+        }
+        assert_eq!(b.cell_read(2, "Noun").expect("ok"), Object::atom("tenant-2"));
+    }
+
+    #[test]
+    fn do_cell_url_escapes_slashes_in_cell_names() {
+        // Defensive: no cell name the engine generates has '/', but
+        // the DO router would split on it if one ever did. Verify the
+        // encoder sidesteps the problem.
+        let b = do_backend();
+        // Construct a cell name with a slash to exercise the URL
+        // encoder path — shape-check by committing and listing.
+        b.cell_commit(1, "oddly/named", &Object::atom("v")).expect("ok");
+        let got = b.cell_read(1, "oddly/named").expect("read ok");
+        assert_eq!(got, Object::atom("v"));
+    }
+
+    #[test]
+    fn as_cell_storage_lifts_cell_backend_into_blob_backend() {
+        // Engine-level contract: open after commit returns the same
+        // state. AsCellStorage must preserve that while splitting the
+        // commit into per-cell writes underneath.
+        let shim = AsCellStorage::new(do_backend());
+        let state = sample(); // Object::Map with two cells.
+        shim.commit(1, &state).expect("commit ok");
+        let got = shim.open(1).expect("open ok");
+        assert_eq!(got, state);
+    }
+
+    #[test]
+    fn as_cell_storage_checkpoint_and_restore_round_trip() {
+        let shim = AsCellStorage::new(do_backend());
+        shim.commit(1, &sample()).expect("commit ok");
+        let id = shim.checkpoint(1).expect("checkpoint ok");
+
+        // Later commit changes head but must not disturb the checkpoint.
+        let mut later = hashbrown::HashMap::new();
+        later.insert("a".to_string(), Object::atom("later"));
+        shim.commit(1, &Object::Map(later)).expect("later commit ok");
+
+        let restored = shim.restore(1, &id).expect("restore ok");
+        assert_eq!(restored, sample(), "checkpoint must pin the earlier state");
+    }
+
+    #[test]
+    fn as_cell_storage_rejects_non_map_commit() {
+        let shim = AsCellStorage::new(do_backend());
+        match shim.commit(1, &Object::atom("not-a-map")) {
+            Err(StorageError::Corrupted(_)) => {}
+            other => panic!("expected Corrupted; got {other:?}"),
+        }
     }
 }
