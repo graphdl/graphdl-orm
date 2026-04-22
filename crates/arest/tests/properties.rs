@@ -2354,6 +2354,52 @@ fn bundled_metamodel_passes_validate_model() {
         errors.len(), errors.join("\n"));
 }
 
+/// #281: every Antecedent Clause must have a Clause Shape. The
+/// constraint is declared deontically in core.md so violations surface
+/// via Theorem 4's path instead of a hard-coded check-pass diagnostic.
+/// This test pins the readings shape so the vocabulary doesn't drift
+/// away from what #288 will wire up in check.rs.
+#[test]
+fn antecedent_clause_has_shape_constraint_declared_in_core_md() {
+    let core_src = include_str!("../../../readings/core.md");
+    let state = arest::parse_forml2::parse_to_state(core_src)
+        .expect("core.md parses");
+
+    // Antecedent Clause landed as an entity type.
+    let nouns = ast::fetch_or_phi("Noun", &state);
+    let seq = nouns.as_seq().expect("Noun cell Seq");
+    let antecedent_clause = seq.iter()
+        .find(|f| ast::binding(f, "name") == Some("Antecedent Clause"))
+        .expect("Antecedent Clause declared");
+    assert_eq!(ast::binding(antecedent_clause, "objectType"), Some("entity"),
+        "Antecedent Clause should be an entity type");
+
+    // Clause Shape landed as a value type.
+    let clause_shape = seq.iter()
+        .find(|f| ast::binding(f, "name") == Some("Clause Shape"))
+        .expect("Clause Shape declared");
+    assert_eq!(ast::binding(clause_shape, "objectType"), Some("value"),
+        "Clause Shape should be a value type");
+
+    // The deontic obligation on Antecedent Clause has Clause Shape landed.
+    // Stage-2 tags every deontic constraint as kind=UC (the base shape);
+    // the modality + deonticOperator + text carry the semantics that
+    // #288 will wire into the check.rs violation path.
+    let constraints = ast::fetch_or_phi("Constraint", &state);
+    let deontic = constraints.as_seq().expect("Constraint Seq").iter()
+        .find(|f| {
+            ast::binding(f, "modality") == Some("deontic")
+                && ast::binding(f, "deonticOperator") == Some("obligatory")
+                && ast::binding(f, "entity") == Some("Antecedent Clause")
+        })
+        .expect("deontic obligation on Antecedent Clause declared");
+    let text = ast::binding(deontic, "text").unwrap();
+    assert!(text.contains("Antecedent Clause") && text.contains("Clause Shape"),
+        "deontic constraint text must mention both Antecedent Clause and Clause Shape; got {text:?}");
+    assert!(text.starts_with("It is obligatory"),
+        "deontic constraint should surface as 'It is obligatory …'; got {text:?}");
+}
+
 // ── Cell Sharding: RMAP partitions to independent folds ────────────
 
 #[test]
