@@ -312,6 +312,51 @@ Derivation Rule depends on Derivation Rule. *
 
 Constraint is semantic iff Constraint has modality of Modality Type 'Deontic' and Constraint spans some Role and that Role is played by some Noun and no Resource is instance of that Noun.
 
+## Implicit Derivation Rules (#316 / #287c)
+
+The four derivations below are currently materialised by the
+compiler's `compile_derivations` synthesis pass (per-subtype, per-SS,
+per-noun-FT, per-binary-pair fan-out). Expressing them as rules in the
+metamodel closes the loop: the parser will drive them straight from
+these readings once #317 lands anaphora + subscript + metamodel-cell
+push; until then the Rust synthesis continues to cover them.
+
+### Subtype inheritance
+
+Every fact that binds a subtype also binds the supertype: if `Noun1`
+is a subtype of `Noun2` and a Fact uses a Resource whose Noun is
+`Noun1` for some Role, then that same Resource is also an instance of
+`Noun2` in every Fact Type where `Noun2` plays a Role.
+
+* Resource is inherited instance of Noun iff Resource is instance of some subtype of that Noun.
+
+### Closed-world negation (CWA)
+
+For every (Noun, Fact Type) pair where the Noun plays a Role of the
+Fact Type, the complement cell `_cwa_negation:<ft_id>` carries every
+Noun instance that does *not* participate via that Role. This is what
+deontic "no X has Y" constraints evaluate against.
+
+* Resource is in complement of Fact Type iff Resource is instance of some Noun and Noun plays some Role of Fact Type and no Fact uses Resource for that Role.
+
+### Subset Constraint auto-fill (SS)
+
+Each declared Subset Constraint whose `autofill` span marker is true
+copies every antecedent fact into the consequent Fact Type. One
+DerivationRule per SS constraint, each routed through
+`compile_explicit_derivation` as a single-antecedent rule.
+
+* Fact is in consequent Fact Type iff some Subset Constraint has autofill 'true' and Subset Constraint spans antecedent Fact Type and Fact is instance of that antecedent Fact Type.
+
+### Transitivity of binary Fact Types
+
+For each pair of binary Fact Types `(A R B, B R C)` where the second
+Role of the first FT and the first Role of the second FT share a Noun,
+emit inferred `A R C` facts. Compile-time enumerates FT pairs; runtime
+derives one fact per join.
+
+* Fact Type has inferred Fact iff some Fact uses Resource for the first Role of that Fact Type and some other Fact uses other Resource for the second Role of a Fact Type sharing the join Noun.
+
 ## NORMA Structural Decomposition (#279)
 
 The concepts below mirror NORMA's `ORMCoreMetaModel.orm`
