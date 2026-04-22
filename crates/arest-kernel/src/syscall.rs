@@ -33,6 +33,7 @@
 
 #![allow(dead_code)] // Some constants stay for future syscalls (6.3/6.4).
 
+use alloc::vec::Vec;
 use spin::Once;
 use x86_64::VirtAddr;
 use x86_64::registers::model_specific::{Efer, EferFlags, KernelGsBase, LStar, SFMask, Star};
@@ -222,28 +223,128 @@ impl From<SyscallErr> for i64 {
     fn from(e: SyscallErr) -> i64 { e as i64 }
 }
 
-/// Rust entry point for the SYSCALL trampoline. SysV C ABI —
-/// 7 args, 6 in regs + 1 on the stack.
+// ---------------------------------------------------------------------------
+// User-buffer validation
+// ---------------------------------------------------------------------------
+
+/// Virtual address above which the kernel half begins on x86_64
+/// canonical addressing (bit 47 sign-extended). Any user pointer
+/// whose end crosses this boundary is rejected.
+pub const KERNEL_START: u64 = 0xFFFF_8000_0000_0000;
+
+/// A validated (ptr, len) pair from ring 3. Points entirely into
+/// the user half of the address space with no wraparound and
+/// canonical addresses at both ends.
+#[derive(Clone, Copy)]
+pub struct UserBuf {
+    pub ptr: *const u8,
+    pub len: usize,
+}
+
+impl UserBuf {
+    /// Validate a raw (ptr, len) pair from user space. Returns a
+    /// `UserBuf` on success or a `SyscallErr` describing the
+    /// failure mode.
+    pub fn from_raw(ptr: u64, len: u64) -> Result<Self, SyscallErr> {
+        if len == 0 {
+            return Ok(Self { ptr: core::ptr::null(), len: 0 });
+        }
+        if len > isize::MAX as u64 {
+            return Err(SyscallErr::EInval);
+        }
+        let end = ptr.checked_add(len).ok_or(SyscallErr::EFault)?;
+        if end > KERNEL_START {
+            return Err(SyscallErr::EFault);
+        }
+        if !is_canonical(ptr) || !is_canonical(end.saturating_sub(1)) {
+            return Err(SyscallErr::EFault);
+        }
+        Ok(Self { ptr: ptr as *const u8, len: len as usize })
+    }
+
+    /// Copy the validated buffer into a kernel-owned Vec<u8>. No-op
+    /// (empty vec) when `len == 0`.
+    pub fn copy_in(&self) -> Vec<u8> {
+        if self.len == 0 {
+            return Vec::new();
+        }
+        let mut buf = Vec::with_capacity(self.len);
+        // SAFETY: `from_raw` validated ptr + len; SMAP is off (6.6
+        // concern) so the kernel can freely read user pages when
+        // the U bit is set.
+        unsafe {
+            core::ptr::copy_nonoverlapping(self.ptr, buf.as_mut_ptr(), self.len);
+            buf.set_len(self.len);
+        }
+        buf
+    }
+}
+
+/// Canonical-address check: on x86_64 the top 17 bits (47..=63)
+/// must all match bit 47, i.e. sign-extend from bit 47.
+pub fn is_canonical(addr: u64) -> bool {
+    let top = addr >> 47;
+    top == 0 || top == 0x1_FFFF
+}
+
+/// Rust entry point for the SYSCALL trampoline. SysV C ABI — 7 args,
+/// 6 in regs + 1 on the stack.
 ///
-/// Returns the user-side RAX value: non-negative on success, negative
-/// `SyscallErr` on error.
+/// Delegates to `dispatch_inner` and flattens the Result<i64,
+/// SyscallErr> into the user-side RAX value: non-negative on
+/// success, negative SyscallErr on error.
 #[no_mangle]
 pub extern "C" fn dispatch(
     nr: u64,
-    a0: u64,
-    _a1: u64,
-    _a2: u64,
-    _a3: u64,
-    _a4: u64,
-    _a5: u64,
+    a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64,
 ) -> i64 {
+    match dispatch_inner(nr, a0, a1, a2, a3, a4, a5) {
+        Ok(v)  => v,
+        Err(e) => e.into(),
+    }
+}
+
+/// Inner dispatcher so handlers can use `?` with `SyscallErr`. SYS_EXIT
+/// returns `!` via `halt_on_exit`; Rust's never-type coercion makes it
+/// fit the `Result<i64, SyscallErr>` return type.
+fn dispatch_inner(
+    nr: u64,
+    a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64,
+) -> Result<i64, SyscallErr> {
     match nr {
-        SYS_YIELD => 0,
+        SYS_YIELD => Ok(0),
         SYS_EXIT  => userspace::halt_on_exit(a0 as u8),
-        // Remaining numbers: ABI placeholder — Task 10 adds arg
-        // validation. For now they all ENoSys.
-        SYS_SYSTEM | SYS_FETCH | SYS_STORE | SYS_SNAPSHOT | SYS_ROLLBACK =>
-            SyscallErr::ENoSys.into(),
-        _ => SyscallErr::ENoSys.into(),
+
+        SYS_SYSTEM => {
+            // (key_ptr, key_len, input_ptr, input_len, out_ptr, out_cap)
+            UserBuf::from_raw(a0, a1)?;
+            UserBuf::from_raw(a2, a3)?;
+            UserBuf::from_raw(a4, a5)?;
+            Err(SyscallErr::ENoSys)
+        }
+        SYS_FETCH => {
+            // (cell_ptr, cell_len, out_ptr, out_cap)
+            UserBuf::from_raw(a0, a1)?;
+            UserBuf::from_raw(a2, a3)?;
+            Err(SyscallErr::ENoSys)
+        }
+        SYS_STORE => {
+            // (cell_ptr, cell_len, val_ptr, val_len)
+            UserBuf::from_raw(a0, a1)?;
+            UserBuf::from_raw(a2, a3)?;
+            Err(SyscallErr::ENoSys)
+        }
+        SYS_SNAPSHOT => {
+            // (label_ptr, label_len)
+            UserBuf::from_raw(a0, a1)?;
+            Err(SyscallErr::ENoSys)
+        }
+        SYS_ROLLBACK => {
+            // (id_ptr, id_len)
+            UserBuf::from_raw(a0, a1)?;
+            Err(SyscallErr::ENoSys)
+        }
+
+        _ => Err(SyscallErr::ENoSys),
     }
 }
