@@ -2316,14 +2316,13 @@ Order has Reason.
 // ── Metamodel Validation ───────────────────────────────────────────
 // validate_model must produce zero warnings on the bundled metamodel.
 
-// ignored: current metamodel readings (ui.md, organizations.md,
-// validation.md) declare fact types that reference lowercase role
-// nouns ("color", "value", "title", "failure", …) while the Noun
-// declarations use capitalized forms ("Color", "Name", etc.). The
-// validate_model path surfaces these as legitimate warnings — the
-// fix belongs in the metamodel readings (a parser / naming pass),
-// not here. Re-enable once those readings are cleaned up.
-#[ignore]
+// Previously #[ignore]d on four ring-span misattributions in the
+// bundled metamodel. #312's commit 9e0c2b9 fixed three via a
+// duplicate-reading cleanup; #326 fixed the fourth by extending
+// `resolve_constraint_span_ft` with digit-subscript stripping and
+// "itself" pronoun expansion, so "No X R itself." and
+// "If X1 R X2 … then X1 R X3." both resolve to the self-referential
+// binary FT instead of the first X-bearing FT in hashmap order.
 #[test]
 fn bundled_metamodel_passes_validate_model() {
     let readings: Vec<(&str, &str)> = vec![

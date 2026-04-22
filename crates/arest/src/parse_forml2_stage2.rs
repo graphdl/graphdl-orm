@@ -367,7 +367,47 @@ fn resolve_constraint_span_ft(
         .replace("at least one ", "").replace("some ", "")
         .replace("No ", "").replace("no ", "");
 
+    // #326: strip digit subscripts (`Noun1`, `Noun2` → `Noun`) so
+    // conditional ring shapes like "If Noun1 is subtype of Noun2 …
+    // then Noun1 is subtype of Noun3" surface the base noun. Without
+    // this the trailing digit breaks the word-boundary check in
+    // find_noun_sequence and the antecedent matches zero nouns.
+    let stripped = strip_digit_subscripts(&stripped);
+
     let found_nouns: Vec<String> = find_noun_sequence(&stripped, sorted_nouns_longest_first);
+
+    // #326: pronoun expansion for ring constraints.
+    // "No X R-s itself." surfaces as `found_nouns = [X]`; the self-
+    // referential binary FT we want to target has two roles both X.
+    // Duplicate the last noun when `itself` is present so the
+    // subsequent role-sequence match finds `[X, X]` on the FT with
+    // roles [(0,X),(1,X)] — e.g. `Noun is subtype of Noun`, not
+    // the first App-bearing FT in hashmap iteration order.
+    let found_nouns: Vec<String> = if !found_nouns.is_empty()
+        && stripped.contains("itself")
+    {
+        let mut v = found_nouns;
+        if let Some(last) = v.last().cloned() {
+            v.push(last);
+        }
+        v
+    } else {
+        found_nouns
+    };
+
+    // #326: for the conditional ring shape the antecedent + consequent
+    // together surface 3-4 subscripted references to the same noun
+    // ("Noun1 … Noun2 … Noun3"). The self-referential FT `X R X` has
+    // two roles; truncate the found sequence to `[X, X]` so the
+    // role-sequence match lands.
+    let found_nouns: Vec<String> = if found_nouns.len() > 2
+        && found_nouns.iter().all(|n| n == &found_nouns[0])
+    {
+        alloc::vec![found_nouns[0].clone(), found_nouns[0].clone()]
+    } else {
+        found_nouns
+    };
+
     if found_nouns.len() < 2 { return None; }
 
     // Find an FT whose role noun sequence matches the found noun sequence.
@@ -426,6 +466,25 @@ fn find_noun_sequence(text: &str, sorted_nouns_longest_first: &[String]) -> Vec<
         i += 1;
     }
     found
+}
+
+/// Strip `<alpha><digits>` patterns to `<alpha>` so ring conditional
+/// shapes surface the base noun. `Noun1` → `Noun`; `API3` → `API`.
+/// Digits not preceded by a letter (numeric literals) are preserved.
+#[cfg(feature = "std-deps")]
+fn strip_digit_subscripts(s: &str) -> alloc::string::String {
+    let mut out = alloc::string::String::with_capacity(s.len());
+    let mut last_was_alpha = false;
+    for c in s.chars() {
+        if c.is_ascii_digit() && last_was_alpha {
+            // digit after a letter — treat as subscript, drop it;
+            // last_was_alpha stays true so the next digit also drops.
+            continue;
+        }
+        last_was_alpha = c.is_alphabetic();
+        out.push(c);
+    }
+    out
 }
 
 /// Strip a trailing `(<ring-kind>)` annotation — the explicit kind
@@ -3311,6 +3370,77 @@ mod tests {
             assert_eq!(binding(&constraints[0], "kind"), Some(expected_kind),
                 "text={:?}", text);
             assert_eq!(binding(&constraints[0], "modality"), Some("alethic"));
+        }
+    }
+
+    /// #326: a ring constraint using the "No X R-s itself." shape
+    /// must attach its spans to the self-referential binary FT
+    /// `X R X`, not to whichever other X-bearing FT happens to be
+    /// enumerated first. Previously the span lookup fell back to
+    /// `roles_by_noun`, which on `find_noun_sequence` returning
+    /// `["App"]` picked the first App FT in hashmap order — for the
+    /// bundled metamodel that was `App has navigable Domain`, not
+    /// `App extends App`, and the validator flagged the ring as
+    /// landing on `{App, Domain}` with "expected matched pair".
+    #[test]
+    fn ring_constraint_on_itself_resolves_to_self_referential_ft() {
+        let src = "\
+            App is an entity type.
+            Domain is an entity type.
+            App has navigable Domain.
+            App extends App.
+            No App extends itself.
+        ";
+        let state = super::parse_to_state_via_stage12(src)
+            .expect("parse_to_state_via_stage12");
+        let constraints = crate::ast::fetch_or_phi("Constraint", &state);
+        let ring = constraints.as_seq()
+            .expect("Constraint cell Seq")
+            .iter()
+            .find(|c| binding(c, "kind") == Some("IR"))
+            .cloned()
+            .expect("one IR ring constraint");
+        let span = binding(&ring, "span0_factTypeId")
+            .expect("span0_factTypeId on ring");
+        assert!(span.contains("App") && span.contains("extend"),
+            "ring span attached to {span}; expected self-referential `App extends App`");
+        assert!(!span.contains("Domain"),
+            "ring span must not land on `App has navigable Domain`; got {span}");
+    }
+
+    /// Same fix across the three Metamodel shapes that were failing:
+    /// Noun / Derivation Rule / App.
+    #[test]
+    fn ring_on_itself_resolves_across_metamodel_noun_kinds() {
+        let src = "\
+            Noun is an entity type.
+            Object Type is an entity type.
+            Derivation Rule is an entity type.
+            Text is an entity type.
+            Noun has Object Type.
+            Noun is subtype of Noun.
+            Derivation Rule has Text.
+            Derivation Rule depends on Derivation Rule.
+            No Noun is subtype of itself.
+            No Derivation Rule depends on itself.
+        ";
+        let state = super::parse_to_state_via_stage12(src)
+            .expect("parse_to_state_via_stage12");
+        let constraints = crate::ast::fetch_or_phi("Constraint", &state);
+        let rings: Vec<_> = constraints.as_seq()
+            .expect("Constraint cell Seq")
+            .iter()
+            .filter(|c| binding(c, "kind") == Some("IR"))
+            .cloned()
+            .collect();
+        assert_eq!(rings.len(), 2,
+            "expected 2 IR ring constraints; got {}", rings.len());
+        for r in &rings {
+            let span = binding(r, "span0_factTypeId")
+                .expect("span0_factTypeId on ring");
+            // Must not land on a mixed-noun FT.
+            assert!(!span.contains("Object") && !span.contains("_has_Text"),
+                "ring span attached to non-self-referential {span}");
         }
     }
 
