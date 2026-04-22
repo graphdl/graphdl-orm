@@ -219,13 +219,30 @@ pub fn try_init_virtio_net() -> Option<VirtIONetDevice> {
         function: dev.function,
     };
     let mut root = PciRoot::new(PioCam);
-    let transport = PciTransport::new::<KernelHal, _>(&mut root, device_function).ok()?;
-    // Sanity: PciTransport inferred the device class from the virtio
-    // device-id; verify it's Network before instantiating VirtIONet.
+    let transport = match PciTransport::new::<KernelHal, _>(&mut root, device_function) {
+        Ok(t) => t,
+        Err(e) => {
+            crate::println!("  virtio: PciTransport::new failed: {:?}", e);
+            return None;
+        }
+    };
     if !matches!(transport_device_type(&transport), Some(DeviceType::Network)) {
+        crate::println!("  virtio: transport device_type is not Network");
         return None;
     }
-    VirtIONet::<KernelHal, _, NET_QUEUE_SIZE>::new(transport, NET_BUF_LEN).ok()
+    // `VirtIONet::new` currently returns DmaError against the forward-
+    // only BootInfoFrameAllocator: virtio-drivers does several
+    // `dma_alloc` calls for virtqueues + rx/tx pools, and our HAL
+    // doesn't yet hand back guaranteed-contiguous multi-page regions
+    // across call boundaries. Follow-up (#268 kernel side) needs a
+    // dedicated contiguous DMA pool carved at boot.
+    match VirtIONet::<KernelHal, _, NET_QUEUE_SIZE>::new(transport, NET_BUF_LEN) {
+        Ok(d) => Some(d),
+        Err(e) => {
+            crate::println!("  virtio: VirtIONet::new failed: {:?}", e);
+            None
+        }
+    }
 }
 
 /// Read the device_type off a constructed PciTransport. Trait methods

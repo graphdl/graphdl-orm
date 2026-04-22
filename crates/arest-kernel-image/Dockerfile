@@ -79,17 +79,23 @@ EXPOSE 8080
 #                    SLiRP user-mode NAT — forwards container-local
 #                    8080 into guest's :80 where smoltcp's HTTP
 #                    listener lives (#264).
-#   -device virtio-net-pci,netdev=net0
-#                    attach the guest NIC as modern-virtio so the
-#                    arest-kernel PCI scan (#262) finds it at boot.
+#   -device virtio-net-pci,netdev=net0,disable-legacy=on
+#                    attach the guest NIC as modern-virtio (PCI device
+#                    ID 0x1041) so the arest-kernel PCI scan (#262)
+#                    finds it at boot. The default `disable-legacy=auto`
+#                    on the `pc` machine yields a transitional device
+#                    with the legacy ID 0x1000 — outside the kernel's
+#                    0x1040..0x107F modern window — so the scan misses
+#                    it and the HTTP listener falls back to loopback.
 # timeout is deliberately omitted in this CMD — the kernel stays
 # resident so `curl localhost:8080` from the host hits the HTTP
-# server. For headless-CI runs use `boot-kernel.ps1 --smoke` which
-# wraps this CMD in a timeout and asserts on banner lines.
+# server. For headless-CI runs use `boot-kernel.ps1 -Smoke` (banner
+# check) or `-E2E` (banner + HTTP GET) which wrap this CMD in a
+# timeout and assert the expected output.
 CMD ["qemu-system-x86_64", \
      "-drive", "format=raw,file=/kernel.img", \
      "-serial", "stdio", \
      "-display", "none", \
      "-no-reboot", "-no-shutdown", \
      "-netdev", "user,id=net0,hostfwd=tcp::8080-:80", \
-     "-device", "virtio-net-pci,netdev=net0"]
+     "-device", "virtio-net-pci,netdev=net0,disable-legacy=on"]
