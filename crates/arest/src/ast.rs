@@ -516,6 +516,33 @@ pub enum Func {
     /// Contains: contains:<x,y> = T if atom x contains atom y (case-insensitive), else F
     Contains,
 
+    /// StartsWith: starts_with:<x,y> = T if atom x has atom y as a prefix (case-insensitive), else F
+    /// Text-pattern primitive (#282): used by the readings-form Stage-1
+    /// tokenizer (#295) to check prefixes like `Statement has Deontic
+    /// Operator` matching `It is obligatory that …`.
+    StartsWith,
+
+    /// EndsWith: ends_with:<x,y> = T if atom x has atom y as a suffix (case-insensitive), else F
+    /// Text-pattern primitive (#282): pairs with StartsWith for the
+    /// trailing-marker checks (`is an entity type`, `is abstract`, …).
+    EndsWith,
+
+    /// Trim: trim:x = atom x with leading/trailing ASCII whitespace removed.
+    /// Text-pattern primitive (#282): normalises statement text before
+    /// the classification rules see it.
+    Trim,
+
+    /// Split: split:<x,y> = <x₁, x₂, …> where atom x is split on every
+    /// occurrence of atom y (empty delimiter yields char-by-char).
+    /// Text-pattern primitive (#282): produces the comma-separated
+    /// enum-value list in `Enum Values Declaration` tokenization.
+    Split,
+
+    /// Replace: replace:<x,<y,z>> = atom x with every occurrence of
+    /// atom y replaced by atom z. Text-pattern primitive (#282): strips
+    /// the `It is obligatory that ` prefix before subject parsing.
+    Replace,
+
     /// Lower: lower:x = lowercase of atom x
     Lower,
 
@@ -1113,11 +1140,10 @@ fn defs_writes_scope(def_name: &str, d: &Object) -> Option<crate::declared_write
     Some(crate::declared_writes::push_caps(frame))
 }
 
-#[cfg(feature = "no_std")]
-fn defs_writes_scope(_def_name: &str, _d: &Object) -> Option<crate::declared_writes::CapGuard> {
-    // Kernel build: no capability enforcement (no user code path).
-    None
-}
+// TODO(session-2026-04-21 ring-3 lane): no_std stub removed — it
+// referenced `crate::declared_writes::CapGuard` which is gated out of
+// the kernel build. Sec-5 owner to decide whether a kernel-side
+// capability type is needed; for now the sole caller is cfg-gated.
 
 /// Rewrite a Func to a smaller equivalent form before reduction.
 ///
@@ -1294,6 +1320,11 @@ fn variant_name(f: &Func) -> &'static str {
         Func::Ge => "Ge",
         Func::Le => "Le",
         Func::Contains => "Contains",
+        Func::StartsWith => "StartsWith",
+        Func::EndsWith => "EndsWith",
+        Func::Trim => "Trim",
+        Func::Split => "Split",
+        Func::Replace => "Replace",
         Func::Lower => "Lower",
         Func::Length => "Length",
         Func::Concat => "Concat",
@@ -1445,6 +1476,88 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
                     match (items[0].as_atom(), items[1].as_atom()) {
                         (Some(haystack), Some(needle)) =>
                             if haystack.to_lowercase().contains(&needle.to_lowercase()) { Object::t() } else { Object::f() },
+                        _ => Object::Bottom,
+                    }
+                }
+                _ => Object::Bottom,
+            }
+        }
+
+        Func::StartsWith => {
+            match x.as_seq() {
+                Some(items) if items.len() == 2 => {
+                    match (items[0].as_atom(), items[1].as_atom()) {
+                        (Some(haystack), Some(needle)) =>
+                            if haystack.to_lowercase().starts_with(&needle.to_lowercase()) { Object::t() } else { Object::f() },
+                        _ => Object::Bottom,
+                    }
+                }
+                _ => Object::Bottom,
+            }
+        }
+
+        Func::EndsWith => {
+            match x.as_seq() {
+                Some(items) if items.len() == 2 => {
+                    match (items[0].as_atom(), items[1].as_atom()) {
+                        (Some(haystack), Some(needle)) =>
+                            if haystack.to_lowercase().ends_with(&needle.to_lowercase()) { Object::t() } else { Object::f() },
+                        _ => Object::Bottom,
+                    }
+                }
+                _ => Object::Bottom,
+            }
+        }
+
+        Func::Trim => {
+            match x.as_atom() {
+                Some(s) => Object::Atom(s.trim().to_string()),
+                None => Object::Bottom,
+            }
+        }
+
+        Func::Split => {
+            // split:<haystack, delim> → <part₁, part₂, …>. Empty
+            // delimiter yields the char-by-char decomposition (each
+            // grapheme cluster as a single-char atom).
+            match x.as_seq() {
+                Some(items) if items.len() == 2 => {
+                    match (items[0].as_atom(), items[1].as_atom()) {
+                        (Some(haystack), Some(delim)) => {
+                            let parts: Vec<Object> = if delim.is_empty() {
+                                haystack.chars()
+                                    .map(|c| Object::Atom(c.to_string()))
+                                    .collect()
+                            } else {
+                                haystack.split(delim)
+                                    .map(|p| Object::Atom(p.to_string()))
+                                    .collect()
+                            };
+                            Object::Seq(parts.into())
+                        }
+                        _ => Object::Bottom,
+                    }
+                }
+                _ => Object::Bottom,
+            }
+        }
+
+        Func::Replace => {
+            // replace:<haystack, <needle, replacement>>. The three-ary
+            // shape is wrapped as <h, <n, r>> so it composes cleanly
+            // under the single-argument apply rule.
+            match x.as_seq() {
+                Some(items) if items.len() == 2 => {
+                    let haystack = items[0].as_atom();
+                    let pair = items[1].as_seq();
+                    match (haystack, pair) {
+                        (Some(h), Some(p)) if p.len() == 2 => {
+                            match (p[0].as_atom(), p[1].as_atom()) {
+                                (Some(needle), Some(replacement)) =>
+                                    Object::Atom(h.replace(needle, replacement)),
+                                _ => Object::Bottom,
+                            }
+                        }
                         _ => Object::Bottom,
                     }
                 }
@@ -1632,6 +1745,10 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
             match x.as_seq() {
                 Some(items) if items.len() == 3 => {
                     match items[0].as_atom() {
+                        // TODO(session-2026-04-21 ring-3 lane): declared_writes
+                        // is gated out of no_std; restrict this arm to std
+                        // until Sec-5 picks a kernel-side policy.
+                        #[cfg(not(feature = "no_std"))]
                         Some(name) if !crate::declared_writes::is_store_allowed(name) =>
                             Object::Bottom,
                         Some(name) => store(name, items[1].clone(), &items[2]),
@@ -1815,6 +1932,7 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
                     // as a Seq of atom cell names, scope the body under
                     // those caps. Absent cell = unrestricted (legacy
                     // behavior, preserves the established baseline).
+                    #[cfg(not(feature = "no_std"))]
                     let _caps_guard = defs_writes_scope(name, d);
                     apply(&metacompose(&obj, d), x, d)
                 }
@@ -2628,6 +2746,11 @@ pub mod primitives {
     pub const FETCH_OR_PHI: &str = "^?";
     pub const STORE: &str = "v";
     pub const CONTAINS: &str = "in";
+    pub const STARTS_WITH: &str = "in<";
+    pub const ENDS_WITH: &str = "in>";
+    pub const TRIM: &str = "tm";
+    pub const SPLIT: &str = "sp";
+    pub const REPLACE: &str = "rp";
     pub const LOWER: &str = "lc";
     pub const CONCAT: &str = "++";
 }
@@ -2970,6 +3093,11 @@ fn metacompose_atom(name: &str, d: &Object) -> Func {
         primitives::GE => Func::Ge,
         primitives::LE => Func::Le,
         primitives::CONTAINS => Func::Contains,
+        primitives::STARTS_WITH => Func::StartsWith,
+        primitives::ENDS_WITH => Func::EndsWith,
+        primitives::TRIM => Func::Trim,
+        primitives::SPLIT => Func::Split,
+        primitives::REPLACE => Func::Replace,
         primitives::CONCAT => Func::Concat,
         primitives::LOWER => Func::Lower,
         primitives::NULL => Func::NullTest,
@@ -3096,6 +3224,11 @@ pub fn func_to_object(func: &Func) -> Object {
         Func::Ge => Object::atom(primitives::GE),
         Func::Le => Object::atom(primitives::LE),
         Func::Contains => Object::atom(primitives::CONTAINS),
+        Func::StartsWith => Object::atom(primitives::STARTS_WITH),
+        Func::EndsWith => Object::atom(primitives::ENDS_WITH),
+        Func::Trim => Object::atom(primitives::TRIM),
+        Func::Split => Object::atom(primitives::SPLIT),
+        Func::Replace => Object::atom(primitives::REPLACE),
         Func::Concat => Object::atom(primitives::CONCAT),
         Func::Lower => Object::atom(primitives::LOWER),
         Func::Length => Object::atom(primitives::LENGTH),
@@ -3417,6 +3550,11 @@ impl fmt::Debug for Func {
             Func::Ge => write!(f, "≥"),
             Func::Le => write!(f, "≤"),
             Func::Contains => write!(f, "contains"),
+            Func::StartsWith => write!(f, "starts_with"),
+            Func::EndsWith => write!(f, "ends_with"),
+            Func::Trim => write!(f, "trim"),
+            Func::Split => write!(f, "split"),
+            Func::Replace => write!(f, "replace"),
             Func::Concat => write!(f, "concat"),
             Func::Lower => write!(f, "lower"),
             Func::Length => write!(f, "length"),
@@ -3556,6 +3694,105 @@ mod tests {
             assert_eq!(apply(&variant, &input, &defs()),
                        apply(&recovered, &input, &defs()),
                        "{} round-trip failed", name);
+        }
+    }
+
+    // #282: text-pattern primitives used by the readings-form
+    // Stage-1 tokenizer (#295).
+
+    #[test]
+    fn starts_with_and_ends_with_are_case_insensitive() {
+        let pair = Object::seq(vec![
+            Object::atom("It is obligatory that Customer has Email"),
+            Object::atom("it is obligatory that"),
+        ]);
+        assert_eq!(apply(&Func::StartsWith, &pair, &defs()), Object::t());
+
+        let mismatch = Object::seq(vec![
+            Object::atom("Customer is an entity type"),
+            Object::atom("It is obligatory"),
+        ]);
+        assert_eq!(apply(&Func::StartsWith, &mismatch, &defs()), Object::f());
+
+        let ends = Object::seq(vec![
+            Object::atom("Customer is an entity type"),
+            Object::atom("IS AN ENTITY TYPE"),
+        ]);
+        assert_eq!(apply(&Func::EndsWith, &ends, &defs()), Object::t());
+    }
+
+    #[test]
+    fn trim_strips_ascii_whitespace() {
+        let input = Object::atom("   Noun has Name.   ");
+        assert_eq!(
+            apply(&Func::Trim, &input, &defs()),
+            Object::atom("Noun has Name."),
+        );
+    }
+
+    #[test]
+    fn split_breaks_on_delimiter() {
+        let pair = Object::seq(vec![
+            Object::atom("'low', 'medium', 'high'"),
+            Object::atom(", "),
+        ]);
+        assert_eq!(
+            apply(&Func::Split, &pair, &defs()),
+            Object::seq(vec![
+                Object::atom("'low'"),
+                Object::atom("'medium'"),
+                Object::atom("'high'"),
+            ]),
+        );
+    }
+
+    #[test]
+    fn split_on_empty_delimiter_returns_chars() {
+        let pair = Object::seq(vec![
+            Object::atom("abc"),
+            Object::atom(""),
+        ]);
+        assert_eq!(
+            apply(&Func::Split, &pair, &defs()),
+            Object::seq(vec![
+                Object::atom("a"), Object::atom("b"), Object::atom("c"),
+            ]),
+        );
+    }
+
+    #[test]
+    fn replace_substitutes_every_occurrence() {
+        let triple = Object::seq(vec![
+            Object::atom("Noun1 is subtype of Noun2 and Noun2 is subtype of Noun3"),
+            Object::seq(vec![Object::atom("Noun"), Object::atom("Entity")]),
+        ]);
+        assert_eq!(
+            apply(&Func::Replace, &triple, &defs()),
+            Object::atom("Entity1 is subtype of Entity2 and Entity2 is subtype of Entity3"),
+        );
+    }
+
+    #[test]
+    fn text_primitives_roundtrip_through_metacompose() {
+        for (variant, name) in [
+            (Func::StartsWith, "starts_with"),
+            (Func::EndsWith, "ends_with"),
+            (Func::Trim, "trim"),
+            (Func::Split, "split"),
+            (Func::Replace, "replace"),
+        ] {
+            let obj = func_to_object(&variant);
+            let recovered = metacompose(&obj, &defs());
+            // Sanity: round-tripped Func applied to trivial input
+            // matches direct apply (shape / Bottom propagation
+            // preserved).
+            let input = Object::seq(vec![Object::atom("x"), Object::atom("x")]);
+            assert_eq!(
+                apply(&variant, &input, &defs()),
+                apply(&recovered, &input, &defs()),
+                "{} round-trip failed",
+                name,
+            );
         }
     }
 
