@@ -180,6 +180,13 @@ impl Replicator {
     /// Cluster-4 can hook failover / retry decisions here without the
     /// primary's caller needing to know about internal state.
     pub fn observe(&mut self, _msg: &ReplMsg) { /* reserved */ }
+
+    /// Cluster-4 uses this to align the counter to a follower's HWM
+    /// on promotion. Narrow crate-only API so external callers must
+    /// go through `resume_from` (which enforces monotonicity).
+    pub(crate) fn set_generation_raw(&mut self, tenant: u32, value: u64) {
+        self.generations.insert(tenant, value);
+    }
 }
 
 /// Follower-side apply loop.
