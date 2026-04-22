@@ -24,6 +24,7 @@ pub mod failover;
 pub mod placement;
 pub mod replication;
 pub mod transport;
+pub mod wire;
 
 use crate::ast::Object;
 use crate::freeze::{freeze, thaw};
