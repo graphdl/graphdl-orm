@@ -144,19 +144,24 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     halt_forever();
 }
 
-/// Park the CPU in a `hlt` loop. With interrupts enabled, `hlt`
-/// wakes on any IRQ (keyboard, timer once added) so per-keypress
-/// latency is measured in microseconds instead of busy-spin cycles.
+/// Drive the kernel's idle loop. Busy-polls `net::poll()` so smoltcp
+/// can advance DHCP, TCP retransmit, and HTTP dispatch without a
+/// dedicated periodic IRQ.
 ///
-/// Each wake drives `net::poll()` so that any TCP / DHCP progress
-/// queued since the last IRQ gets processed before we sleep again.
-/// Once a dedicated timer IRQ lands (#180 follow-up) we can drop the
-/// poll here and let the timer handler schedule it — for now, piggy-
-/// backing on keyboard IRQs is good enough for the loopback bring-up.
+/// Trade-off: 100 % CPU when idle, because a naive `hlt` here only
+/// wakes on a keyboard IRQ (the sole IRQ currently unmasked in the
+/// PIC) — which never fires in the E2E smoke harness, so DHCP stalls
+/// before it can request a lease from QEMU's SLiRP and `curl` times
+/// out at the host (observed pre-fix, #268). Once a periodic timer
+/// IRQ (#180 follow-up) or a PCI-line virtio IRQ lands, this can go
+/// back to `hlt`-then-poll.
+///
+/// Interrupts stay enabled throughout, so keyboard / exception ISRs
+/// still fire and return back into the loop.
 fn halt_forever() -> ! {
     loop {
         net::poll();
-        x86_64::instructions::hlt();
+        core::hint::spin_loop();
     }
 }
 
