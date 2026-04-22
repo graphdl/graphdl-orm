@@ -1389,10 +1389,12 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
 
     // â”€â”€ Generator 3b: SQL Triggers for derivation rules â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     if !active_dialects.is_empty() {
-        let sql_tables = crate::rmap::rmap_from_state(state);
-        let table_names: hashbrown::HashSet<String> = sql_tables.iter()
-            .map(|t| t.name.clone()).collect();
-        let triggers = generate_derivation_triggers(&c_derivation_rules, &c_fact_types, &sql_tables, &table_names);
+        // #325: triggers read RMAP via cells too, matching generator 3.
+        let rmap_cells = crate::rmap::rmap_cells_from_state(state);
+        let table_names: hashbrown::HashSet<String> = crate::rmap::table_names(&rmap_cells)
+            .into_iter().collect();
+        let triggers = generate_derivation_triggers(
+            &c_derivation_rules, &c_fact_types, &rmap_cells, &table_names);
         defs.extend(triggers.into_iter().map(|(name, ddl)| {
             (format!("sql:trigger:{}", name), Func::constant(Object::atom(&ddl)))
         }));
@@ -5040,7 +5042,7 @@ fn generate_ddl(cells: &crate::ast::Object, table_name: &str, dialect: &SqlDiale
 pub fn generate_derivation_triggers(
     derivation_rules: &[DerivationRuleDef],
     fact_types: &HashMap<String, FactTypeDef>,
-    sql_tables: &[crate::rmap::TableDef],
+    rmap_cells: &crate::ast::Object,
     table_names: &HashSet<String>,
 ) -> Vec<(String, String)> {
     let mut result = Vec::new();
@@ -5060,13 +5062,17 @@ pub fn generate_derivation_triggers(
 
         let consequent_table = crate::rmap::to_snake(consequent);
 
-        // Get consequent columns from RMAP table, or derive from fact type roles.
-        let consequent_cols: Vec<String> = sql_tables.iter()
-            .find(|t| t.name == consequent_table)
-            .map(|t| t.columns.iter().map(|c| c.name.clone()).collect())
-            .or_else(|| fact_types.get(consequent).map(|ft|
-                ft.roles.iter().map(|r| crate::rmap::to_snake(&r.noun_name)).collect()))
-            .unwrap_or_default();
+        // Get consequent columns from RMAP cells, or derive from fact type
+        // roles when RMAP didn't create a table for this FT.
+        let rmap_cols = crate::rmap::columns_for_table(rmap_cells, &consequent_table);
+        let consequent_cols: Vec<String> = if !rmap_cols.is_empty() {
+            rmap_cols.iter().map(|c| c.name.clone()).collect()
+        } else {
+            fact_types.get(consequent)
+                .map(|ft| ft.roles.iter()
+                    .map(|r| crate::rmap::to_snake(&r.noun_name)).collect())
+                .unwrap_or_default()
+        };
         if consequent_cols.is_empty() { continue; }
 
         // If RMAP didn't create the table, generate a CREATE TABLE for it.
