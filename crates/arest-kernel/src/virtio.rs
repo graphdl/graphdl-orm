@@ -22,7 +22,7 @@ use core::ptr::NonNull;
 
 use virtio_drivers::{BufferDirection, Hal, PhysAddr};
 
-use crate::memory;
+use crate::{dma, memory};
 
 /// Bootloader-supplied offset between physical and virtual addresses.
 /// Stored by `set_phys_offset` during `memory::init`'s caller chain
@@ -41,13 +41,38 @@ fn phys_offset() -> u64 {
     PHYS_OFFSET.lock().expect("virtio::init_offset() not called")
 }
 
-/// Translate a kernel virtual address (pointer into the offset
-/// mapping) back to its physical address.
+/// Translate a kernel virtual address back to its physical address
+/// by walking the active page table.
+///
+/// `share()` can be called with buffers that live *outside* the
+/// bootloader's offset-mapped physical-memory window — in particular,
+/// rx/tx buffers are `alloc::vec::Vec`s backed by `HEAP_STORAGE` in the
+/// kernel's BSS segment, which the bootloader maps at the kernel's
+/// linked virtual addresses, not at `phys + phys_offset`. Subtracting
+/// `phys_offset` from those vaddrs yields garbage (observed pre-fix:
+/// every rx descriptor pointed to a bogus low-RAM paddr, so QEMU's DMA
+/// went nowhere and the guest saw zero packets — #268).
+///
+/// Page-walking handles both cases uniformly: offset-mapped DMA pages
+/// resolve the same way kernel ELF-mapped BSS resolves. The buffer is
+/// required to be physically contiguous; virtio descriptors describe
+/// a single `(addr, len)` range. Our heap is a contiguous static BSS
+/// segment so any `Vec` inside it is physically contiguous, and the
+/// DMA pool is contiguous by construction.
 fn virt_to_phys(vaddr: usize) -> PhysAddr {
-    (vaddr as u64 - phys_offset()) as PhysAddr
+    use x86_64::structures::paging::mapper::Translate;
+    use x86_64::VirtAddr;
+    let virt = VirtAddr::new(vaddr as u64);
+    memory::with_page_table(|pt| {
+        pt.translate_addr(virt)
+            .expect("virt_to_phys: kernel virtual address is unmapped")
+            .as_u64() as PhysAddr
+    })
 }
 
-/// Translate a physical address into its kernel virtual pointer.
+/// Translate a physical address into its kernel virtual pointer via
+/// the bootloader's offset mapping (not through a page-table walk —
+/// the offset mapping is an identity translation by construction).
 fn phys_to_virt(paddr: PhysAddr) -> NonNull<u8> {
     let vaddr = (paddr as u64 + phys_offset()) as *mut u8;
     // SAFETY: the bootloader guarantees every physical frame is
@@ -90,6 +115,24 @@ unsafe impl Hal for KernelHal {
         // for the lifetime of the kernel, and the carver ensures the
         // range is non-zero, page-aligned, and usable RAM.
         let vaddr = unsafe { NonNull::new_unchecked(vaddr_u64 as *mut u8) };
+
+        // Per the Hal trait contract (hal.rs:90 in virtio-drivers), the
+        // returned pages must be zeroed. virtio-drivers relies on this
+        // for the virtqueue's used-ring `idx` to read as zero at setup
+        // — otherwise `can_pop()` returns true on the first poll and
+        // `peek_used` reads a garbage descriptor id out of the stale
+        // memory (observed as token=60547 pre-fix, #268). BIOS-backed
+        // QEMU happens to boot with zero RAM, but relying on that is
+        // fragile; explicit zeroing makes the contract hold regardless
+        // of what was in the carved region before boot.
+        //
+        // SAFETY: `vaddr` was just handed back by the pool, so no other
+        // pointer aliases the region; the region is `pages * PAGE_SIZE`
+        // bytes of kernel-owned writable memory.
+        unsafe {
+            core::ptr::write_bytes(vaddr.as_ptr(), 0, pages * dma::PAGE_SIZE);
+        }
+
         (paddr, vaddr)
     }
 
