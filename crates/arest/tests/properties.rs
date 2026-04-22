@@ -2400,6 +2400,43 @@ fn antecedent_clause_has_shape_constraint_declared_in_core_md() {
         "deontic constraint should surface as 'It is obligatory …'; got {text:?}");
 }
 
+/// #316: the four implicit derivation kinds (subtype inheritance,
+/// CWA negation, SS auto-fill, transitivity) are now declared as
+/// derivation rules in readings/core.md. The parser's anaphora +
+/// metamodel-cell push is #317's job; this test only pins the
+/// readings, so a future drift (rename, section move) surfaces as a
+/// failure instead of quietly rotting.
+#[test]
+fn implicit_derivations_landed_as_rules_in_core_md() {
+    let core_src = include_str!("../../../readings/core.md");
+    let state = arest::parse_forml2::parse_to_state(core_src)
+        .expect("core.md parses");
+
+    let rules = ast::fetch_or_phi("DerivationRule", &state);
+    let seq = rules.as_seq().expect("DerivationRule cell Seq");
+    let texts: Vec<String> = seq.iter()
+        .filter_map(|r| ast::binding(r, "text").map(String::from))
+        .collect();
+
+    // Each kind is anchored on a phrase unique to its reading line.
+    let anchors = [
+        ("subtype inheritance",
+            "Resource is inherited instance of Noun iff"),
+        ("CWA negation",
+            "Resource is in complement of Fact Type iff"),
+        ("SS auto-fill",
+            "Fact is in consequent Fact Type iff some Subset Constraint has autofill"),
+        ("transitivity",
+            "Fact Type has inferred Fact iff"),
+    ];
+
+    for (kind, needle) in &anchors {
+        assert!(texts.iter().any(|t| t.contains(needle)),
+            "{kind} rule not found in DerivationRule cell; anchor {needle:?} missing.\n\
+             Found texts: {texts:#?}");
+    }
+}
+
 // ── Cell Sharding: RMAP partitions to independent folds ────────────
 
 #[test]
