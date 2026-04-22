@@ -20,6 +20,7 @@
 
 #![cfg(all(feature = "cluster", not(feature = "no_std")))]
 
+pub mod failover;
 pub mod placement;
 pub mod replication;
 pub mod transport;
