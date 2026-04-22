@@ -111,6 +111,14 @@ pub mod check;
 #[cfg(not(feature = "no_std"))]
 pub mod storage;
 
+// #343 External System catalogs (schema.org, later DCMI/FOAF/Wikidata).
+// Parses vendored JSON-LD into External System + Noun + FactType + Role
+// cells, and exposes a `browse` projection used by the external_browse
+// MCP verb and /external/{system}/types OpenAPI routes. std-deps because
+// the parser uses serde_json and the vendored source is gzip-compressed.
+#[cfg(all(feature = "std-deps", not(feature = "no_std")))]
+pub mod external;
+
 // SWIM-style gossip membership. Gated on `cluster` feature (off by
 // default) and std — uses std::net, std::thread, std::time. See
 // cluster/mod.rs for the protocol details.
@@ -185,6 +193,24 @@ struct CompiledState {
     /// the `RwLock<CompiledState>` write path — checking the budget
     /// must not serialize otherwise-disjoint callers.
     call_budget_remaining: core::sync::atomic::AtomicU64,
+
+    /// Sec-1: gate for `system(h, "register:<name>", …)`. Defaults to
+    /// `Untrusted` so an accidentally-exposed MCP / HTTP frontend
+    /// cannot let remote actors push arbitrary Func bodies into DEFS.
+    /// Flip to `Privileged` at boot via `set_register_mode` (admin-
+    /// initiated) to re-enable the `register:` branch.
+    register_mode: RegisterMode,
+}
+
+/// Sec-1: privilege mode for the `register:<name>` SYSTEM intercept.
+/// `Untrusted` (the default) refuses `register:*` outright;
+/// `Privileged` allows it. The boundary sits at the `register:`
+/// dispatch in `system_impl`.
+#[cfg(not(feature = "no_std"))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RegisterMode {
+    Untrusted,
+    Privileged,
 }
 
 /// Outcome of a targeted-write attempt via `try_commit_diff`.
@@ -263,6 +289,7 @@ impl CompiledState {
             snapshots: hashbrown::HashMap::new(),
             snapshot_secret: boot_time_snapshot_secret(),
             call_budget_remaining: core::sync::atomic::AtomicU64::new(u64::MAX),
+            register_mode: RegisterMode::Untrusted,
         };
         s.replace_d(initial_d);
         s
@@ -627,6 +654,21 @@ pub fn set_tenant_call_budget(handle: u32, limit: u64) {
     }
 }
 
+/// Sec-1: flip a tenant's `register:<name>` dispatch between
+/// `Untrusted` (default — every `system(h, "register:*", …)` returns
+/// `"⊥"`) and `Privileged`. The expected caller is the boot path /
+/// admin CLI, never a request handler; the gate exists so an
+/// accidentally-exposed `system_impl` over HTTP/MCP cannot let a
+/// remote actor push arbitrary Func bodies into DEFS.
+///
+/// No-op on an unknown handle.
+#[cfg(not(feature = "no_std"))]
+pub fn set_register_mode(handle: u32, mode: RegisterMode) {
+    if let Some(tenant) = tenant_lock(handle) {
+        tenant.write().register_mode = mode;
+    }
+}
+
 #[cfg(not(feature = "no_std"))]
 #[allow(dead_code)] // used by tests and the cloudflare feature
 fn allocate(state: ast::Object, defs: Vec<(String, ast::Func)>) -> u32 {
@@ -947,6 +989,13 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
     // thaw FFI) to register composable FFP bodies instead of
     // Platform stubs.
     if let Some(name) = key.strip_prefix("register:") {
+        // Sec-1: refuse outright unless the tenant has been flipped to
+        // Privileged by an admin caller. Default is Untrusted so an
+        // HTTP/MCP frontend exposing system_impl cannot let remote
+        // actors push Func bodies into DEFS.
+        if tenant.read().register_mode != RegisterMode::Privileged {
+            return "⊥".into();
+        }
         if name.is_empty() {
             return "⊥".into();
         }
@@ -1244,6 +1293,20 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
         };
     }
 
+    // ── #343 external_browse intercept ──────────────────────────────
+    //
+    //   system(h, "external_browse", <JSON body>) → <JSON BrowseResponse> | "⊥"
+    //
+    // Input is a JSON object `{"system":"…","path":[…]}` — NOT FFP —
+    // so the usual read-only dispatch (which `ast::Object::parse`s the
+    // input) is bypassed. Read-only: the call reads the tenant snapshot
+    // to check the External System cell gate, then reads the OnceLock'd
+    // parsed graph inside `external::schema_org`. No state mutation.
+    if key == "external_browse" {
+        let snapshot = tenant.read().snapshot_d();
+        return external::external_browse_json(input, &snapshot);
+    }
+
     // ── Read-only dispatch path ─────────────────────────────────────
     //
     // Known-read ops (list / get / query / debug / audit / explain /
@@ -1433,6 +1496,84 @@ impl exports::arest::engine::engine::Guest for E {
     fn release(handle: u32) { release_impl(handle) }
     fn system(handle: u32, key: String, input: String) -> String {
         system_impl(handle, &key, &input)
+    }
+}
+
+// ── #343 external_browse verb (schema.org vocabulary browse) ────────
+//
+// The engine-side entry point behind the `external_browse` MCP tool.
+// Intercepts the verb directly so the JSON-in / JSON-out contract
+// matches freeze/thaw and register: — the read-only dispatch loop
+// below would route a Func::Def lookup and thaw the input as an FFP
+// Object, but external_browse's input is a plain JSON object, not FFP.
+//
+// State is read-only (populate-on-browse reads the OnceLock'd parsed
+// graph from `external::schema_org`; no cells are mutated).
+#[cfg(test)]
+mod external_browse_tests {
+    use super::*;
+
+    fn mount_schema_org(h: u32) {
+        let tenant = tenant_lock(h).expect("handle must be allocated");
+        let mut st = tenant.write();
+        let snap = st.snapshot_d();
+        let mounted = external::schema_org::mount(&snap);
+        st.replace_d(mounted);
+    }
+
+    fn snapshot_for(h: u32) -> ast::Object {
+        let tenant = tenant_lock(h).expect("handle must be allocated");
+        let g = tenant.read();
+        g.snapshot_d()
+    }
+
+    #[test]
+    fn external_browse_returns_person_with_name_and_birthdate_after_mount() {
+        let h = create_impl();
+        // Mount schema.org: seeds the External System cell + 6 core
+        // Noun anchors. Everything else is populated on browse from
+        // the parsed graph.
+        mount_schema_org(h);
+
+        let body = r#"{"system":"schema.org","path":["Person"]}"#;
+        let out = system_impl(h, "external_browse", body);
+        assert!(!out.starts_with('⊥'),
+            "external_browse on Person must not return ⊥; got: {out}");
+        assert!(out.contains("\"type\":\"Person\""),
+            "response must carry type=Person; got: {out}");
+        assert!(out.contains("\"name\":\"name\""),
+            "Person.properties must include inherited 'name'; got: {out}");
+        assert!(out.contains("\"name\":\"birthDate\""),
+            "Person.properties must include direct 'birthDate'; got: {out}");
+
+        release_impl(h);
+    }
+
+    #[test]
+    fn external_browse_is_bottom_for_unmounted_system() {
+        let h = create_impl();
+        let body = r#"{"system":"schema.org","path":["Person"]}"#;
+        let out = system_impl(h, "external_browse", body);
+        assert_eq!(out, "⊥",
+            "browse without mount must refuse (gated on External System cell)");
+        release_impl(h);
+    }
+
+    #[test]
+    fn external_browse_is_read_only_no_snapshot_change() {
+        let h = create_impl();
+        mount_schema_org(h);
+        // Two successive browses must leave the snapshot byte-identical
+        // so the read-only contract is observable from outside the
+        // engine — any tier-1 write commit would perturb it.
+        let body = r#"{"system":"schema.org","path":["Person"]}"#;
+        let before = snapshot_for(h);
+        let _ = system_impl(h, "external_browse", body);
+        let _ = system_impl(h, "external_browse", body);
+        let after = snapshot_for(h);
+        assert_eq!(before, after,
+            "external_browse must not mutate the tenant snapshot");
+        release_impl(h);
     }
 }
 
@@ -2355,6 +2496,7 @@ Order has total.
     #[test]
     fn system_register_key_records_name_in_runtime_registry() {
         let h = create_bare_impl();
+        super::set_register_mode(h, super::RegisterMode::Privileged);
         let result = system_impl(h, "register:send_email", "");
         assert_eq!(result, "send_email",
             "register:<name> should echo the registered name on success; got {result}");
@@ -2372,6 +2514,7 @@ Order has total.
     #[test]
     fn system_register_key_binds_name_in_defs() {
         let h = create_bare_impl();
+        super::set_register_mode(h, super::RegisterMode::Privileged);
         let _ = system_impl(h, "register:http_fetch", "");
 
         let d = peek(h).expect("handle must be live");
@@ -2389,9 +2532,59 @@ Order has total.
     #[test]
     fn system_register_rejects_empty_name() {
         let h = create_bare_impl();
+        super::set_register_mode(h, super::RegisterMode::Privileged);
         let result = system_impl(h, "register:", "");
         assert_eq!(result, "⊥",
             "register: with empty name must return ⊥; got {result}");
+        release_impl(h);
+    }
+
+    /// Sec-1 (#328): without a privileged flip, `register:*` must
+    /// return "⊥" regardless of the name or payload. This is the
+    /// boundary between an HTTP/MCP-accessible `system` surface and
+    /// the FFI that lets hosts push Func bodies into DEFS.
+    #[test]
+    fn system_register_is_gated_untrusted_by_default() {
+        let h = create_bare_impl();
+        // No set_register_mode call — tenant starts in Untrusted.
+        let result = system_impl(h, "register:send_email", "");
+        assert_eq!(result, "⊥",
+            "register:<name> must return ⊥ on an Untrusted tenant; got {result}");
+
+        // Also check the hex-body path: same gate, before any
+        // decoding. A malformed-hex body should still be gated (the
+        // gate fires before parse errors).
+        let result = system_impl(h, "register:greet", "deadbeef");
+        assert_eq!(result, "⊥",
+            "register:<name> with body must return ⊥ on an Untrusted tenant; got {result}");
+
+        // The runtime registry should still be empty — the gate
+        // short-circuits before any DEFS mutation.
+        let d = peek(h).expect("handle must be live");
+        let registry = ast::fetch("runtime_registered_names", &d);
+        let names: Vec<String> = registry.as_seq()
+            .map(|s| s.iter().filter_map(|o| o.as_atom().map(String::from)).collect())
+            .unwrap_or_default();
+        assert!(names.is_empty(),
+            "Untrusted tenant must not have touched runtime_registered_names; got {names:?}");
+        release_impl(h);
+    }
+
+    /// Sec-1 (#328): after flipping to Privileged the gate opens; the
+    /// existing semantics (empty name → ⊥, hex-body install, etc.)
+    /// are exercised by the other register tests, which all run with
+    /// Privileged toggled on.
+    #[test]
+    fn system_register_allows_after_privileged_flip() {
+        let h = create_bare_impl();
+        // Sanity: blocked before flip.
+        assert_eq!(system_impl(h, "register:open_door", ""), "⊥");
+        super::set_register_mode(h, super::RegisterMode::Privileged);
+        // Opens after flip.
+        assert_eq!(system_impl(h, "register:open_door", ""), "open_door");
+        // And closes again after downgrading.
+        super::set_register_mode(h, super::RegisterMode::Untrusted);
+        assert_eq!(system_impl(h, "register:second_name", ""), "⊥");
         release_impl(h);
     }
 
@@ -2404,6 +2597,7 @@ Order has total.
     #[test]
     fn system_register_with_hex_body_installs_composable_func() {
         let h = create_bare_impl();
+        super::set_register_mode(h, super::RegisterMode::Privileged);
         // Encode Func::Constant(atom("hello")) via func_to_object +
         // freeze + hex, matching what a JS host would do.
         let body = ast::Func::Constant(ast::Object::atom("hello"));
@@ -2428,6 +2622,7 @@ Order has total.
     #[test]
     fn system_register_rejects_malformed_hex_body() {
         let h = create_bare_impl();
+        super::set_register_mode(h, super::RegisterMode::Privileged);
         let result = system_impl(h, "register:bad", "not valid hex");
         assert_eq!(result, "⊥",
             "register: with malformed hex payload must return ⊥; got {result}");
