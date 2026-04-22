@@ -42,7 +42,7 @@ wasm-lower = ["dep:wasm-encoder", "dep:wasmi"]
 # std-deps bundles serde, serde_json, regex, hmac, sha2, subtle — all
 # require std and are excluded from the no_std / kernel build. Included
 # in `default` so all normal (std) builds keep working without changes.
-std-deps = ["dep:serde", "dep:serde_json", "dep:regex", "dep:hmac", "dep:sha2", "dep:subtle", "hashbrown/serde"]
+std-deps = ["dep:serde", "dep:serde_json", "dep:regex", "dep:hmac", "dep:sha2", "dep:subtle", "dep:flate2", "hashbrown/serde"]
 # no_std build target — gates every `use std::*` behind a
 # `std`/`no_std` split so the crate can be embedded in bare-metal
 # contexts (FPGA soft-cores, x86_64 kernel via #175+). Enable via:
@@ -75,6 +75,10 @@ rayon = { version = "1", optional = true }
 hmac = { version = "0.12", optional = true }
 sha2 = { version = "0.10", optional = true }
 subtle = { version = "2", optional = true }
+# flate2: gzip decompression for the vendored schema.org JSON-LD
+# (#343). Used only by src/external/schema_org.rs which decompresses
+# the embedded `schema_org.jsonld.gz` at ingest time.
+flate2 = { version = "1", optional = true }
 # WASM-lowering PoC. wasm-encoder emits bytes; wasmtime
 # hosts them for the roundtrip test so we can prove semantic
 # equivalence with Rust apply() before investing in the full
