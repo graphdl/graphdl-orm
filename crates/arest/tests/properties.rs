@@ -2437,6 +2437,38 @@ fn implicit_derivations_landed_as_rules_in_core_md() {
     }
 }
 
+/// #288: check.rs Layers 2+3 expressed as deontic obligations in
+/// core.md. Pins the readings so #317's metamodel-FT push can later
+/// drive them at runtime through Theorem 4's violation path.
+#[test]
+fn ring_validity_and_completeness_obligations_declared_in_core_md() {
+    let core_src = include_str!("../../../readings/core.md");
+    let state = arest::parse_forml2::parse_to_state(core_src)
+        .expect("core.md parses");
+
+    let constraints = ast::fetch_or_phi("Constraint", &state);
+    let deontics: Vec<_> = constraints.as_seq().expect("Constraint Seq").iter()
+        .filter(|c| ast::binding(c, "modality") == Some("deontic"))
+        .filter(|c| ast::binding(c, "deonticOperator") == Some("obligatory"))
+        .cloned()
+        .collect();
+
+    // Layer 2 invariant: ring constraints span same-noun role pairs.
+    assert!(deontics.iter().any(|c| {
+        let text = ast::binding(c, "text").unwrap_or("");
+        text.contains("Ring Constraint") && text.contains("same Noun")
+    }), "Layer 2 obligation missing (ring-spans-same-noun). Deontics: {:?}",
+        deontics.iter().map(|c| ast::binding(c, "text").unwrap_or("").to_string()).collect::<Vec<_>>());
+
+    // Layer 3 obligation: same-noun binary FT should carry a ring.
+    assert!(deontics.iter().any(|c| {
+        let text = ast::binding(c, "text").unwrap_or("");
+        text.contains("binary Fact Type")
+            && text.contains("Ring Constraint")
+            && text.contains("same Noun")
+    }), "Layer 3 obligation missing (same-noun-binary-has-ring)");
+}
+
 // ── Cell Sharding: RMAP partitions to independent folds ────────────
 
 #[test]

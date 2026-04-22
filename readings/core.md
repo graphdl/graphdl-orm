@@ -357,6 +357,37 @@ derives one fact per join.
 
 * Fact Type has inferred Fact iff some Fact uses Resource for the first Role of that Fact Type and some other Fact uses other Resource for the second Role of a Fact Type sharing the join Noun.
 
+## Check-Readings Deontic Obligations (#288)
+
+Layers 2 and 3 of the readings checker (`crates/arest/src/check.rs`)
+enforce ring-constraint validity and completeness as Rust control
+flow today. Expressing them as deontic constraints here lets #317's
+metamodel-FT push eventually drive them through Theorem 4's
+violation path — the Rust layers retire, and authors see the same
+diagnostics via the standard violation surface.
+
+### Layer 2: ring validity — same-noun spans
+
+A ring constraint (`IR`, `AS`, `AT`, `SY`, `IT`, `TR`, `AC`, `RF`)
+must span roles whose Nouns are identical. A ring across mixed
+nouns is nonsensical — `No Customer is-subtype-of Address` has
+nothing to forbid. check.rs emits an Error-level diagnostic
+today; the deontic form is the same invariant spelled
+declaratively.
+
+It is obligatory that each Ring Constraint spans two Roles and both Roles are played by the same Noun.
+
+### Layer 3: ring completeness — declare the ring on a same-noun binary
+
+A binary Fact Type whose two Roles share the same Noun almost
+always wants an explicit ring constraint — without one, nothing
+prevents the self-reference cycle the schema is implicitly
+modelling. check.rs emits a Hint-level diagnostic that points
+authors at the missing `is acyclic.` / `is irreflexive.`
+annotation.
+
+It is obligatory that each binary Fact Type whose Roles are played by the same Noun has some Ring Constraint spanning it.
+
 ## NORMA Structural Decomposition (#279)
 
 The concepts below mirror NORMA's `ORMCoreMetaModel.orm`
