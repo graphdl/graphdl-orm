@@ -1630,25 +1630,32 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
     }));
 
     // â”€ï¿½ï¿½ Generator 12: NHibernate Mapping â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    let tables = crate::rmap::rmap_from_state(state);
-    defs.extend(tables.iter().map(|table| {
-        let columns = Object::Seq(table.columns.iter().map(|col| Object::seq(vec![
+    // #325: read RMAP via cells; no TableDef hop.
+    let rmap_cells = crate::rmap::rmap_cells_from_state(state);
+    let table_names_vec = crate::rmap::table_names(&rmap_cells);
+    for table_name in &table_names_vec {
+        let cols = crate::rmap::columns_for_table(&rmap_cells, table_name);
+        let pk_cols = crate::rmap::primary_key_of_table(&rmap_cells, table_name);
+
+        let columns = Object::Seq(cols.iter().map(|col| Object::seq(vec![
             Object::atom(&col.name), Object::atom(&col.col_type),
             Object::atom(if col.nullable { "true" } else { "false" }),
             col.references.as_ref().map(|r| Object::atom(r)).unwrap_or(Object::phi()),
         ])).collect());
-        let pk = Object::Seq(table.primary_key.iter().map(|k| Object::atom(k)).collect());
-        (format!("nhibernate:{}", table.name), Func::constant(Object::seq(vec![
-            Object::seq(vec![Object::atom("class"), Object::atom(&table.name)]),
-            Object::seq(vec![Object::atom("table"), Object::atom(&table.name)]),
+        let pk = Object::Seq(pk_cols.iter().map(|k| Object::atom(k)).collect());
+        defs.push((format!("nhibernate:{}", table_name), Func::constant(Object::seq(vec![
+            Object::seq(vec![Object::atom("class"), Object::atom(table_name)]),
+            Object::seq(vec![Object::atom("table"), Object::atom(table_name)]),
             Object::seq(vec![Object::atom("id"), pk]),
             Object::seq(vec![Object::atom("properties"), columns]),
-        ])))
-    }));
+        ]))));
+    }
 
     // â”€â”€ Generator 13: LINQ â€” Î±(table â†’ linq_def) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    defs.extend(tables.iter().map(|table| {
-        let members = Object::Seq(table.columns.iter().map(|col| {
+    for table_name in &table_names_vec {
+        let cols = crate::rmap::columns_for_table(&rmap_cells, table_name);
+        let pk_cols = crate::rmap::primary_key_of_table(&rmap_cells, table_name);
+        let members = Object::Seq(cols.iter().map(|col| {
             let db_type = match col.col_type.as_str() {
                 "TEXT" => "NVarChar", "INTEGER" => "Int", "REAL" => "Float",
                 "BOOLEAN" => "Bit", _ => "NVarChar",
@@ -1656,14 +1663,14 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
             Object::seq(vec![
                 Object::atom(&col.name), Object::atom(db_type),
                 Object::atom(if col.nullable { "true" } else { "false" }),
-                Object::atom(if table.primary_key.contains(&col.name) { "true" } else { "false" }),
+                Object::atom(if pk_cols.iter().any(|k| k == &col.name) { "true" } else { "false" }),
             ])
         }).collect());
-        (format!("linq:{}", table.name), Func::constant(Object::seq(vec![
-            Object::seq(vec![Object::atom("table"), Object::atom(&table.name)]),
+        defs.push((format!("linq:{}", table_name), Func::constant(Object::seq(vec![
+            Object::seq(vec![Object::atom("table"), Object::atom(table_name)]),
             Object::seq(vec![Object::atom("columns"), members]),
-        ])))
-    }));
+        ]))));
+    }
 
     // â”€â”€ Generator 14: PLiX â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     defs.extend(c_nouns.iter().map(|(noun_name, noun_def)| {
