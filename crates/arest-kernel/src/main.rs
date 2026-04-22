@@ -30,6 +30,7 @@
 extern crate alloc;
 
 mod allocator;
+mod dma;
 mod gdt;
 mod http;
 mod interrupts;
