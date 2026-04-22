@@ -170,6 +170,22 @@ export async function dispatchVerb(
       return envelope({ result: raw })
     }
 
+    case 'external_browse': {
+      // #343 — browse a mounted External System vocabulary.
+      // Body: { system: string, path: string[] }.
+      // The engine-side intercept (system_impl `external_browse`)
+      // parses this JSON, gates on the External System cell, and
+      // returns either a BrowseResponse JSON or the glyph "⊥".
+      const { system, path } = body as { system?: string; path?: string[] }
+      if (!system) throw new Error('external_browse requires `system`')
+      const input = JSON.stringify({ system, path: Array.isArray(path) ? path : [] })
+      const raw = engine.system(h, 'external_browse', input)
+      if (raw === '⊥') {
+        return envelope({ error: 'unknown system or type', system, path: path ?? [] })
+      }
+      return envelope(safeJson(raw) ?? { raw })
+    }
+
     default:
       throw new Error(`unknown verb: ${verb}`)
   }
@@ -215,6 +231,7 @@ export const UNIFIED_VERBS = [
   'snapshot',
   'rollback',
   'snapshots',
+  'external_browse',
 ] as const
 
 export type UnifiedVerb = typeof UNIFIED_VERBS[number]
