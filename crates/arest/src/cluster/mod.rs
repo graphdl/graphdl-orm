@@ -20,6 +20,7 @@
 
 #![cfg(all(feature = "cluster", not(feature = "no_std")))]
 
+pub mod placement;
 pub mod transport;
 
 use crate::ast::Object;
