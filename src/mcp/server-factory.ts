@@ -187,6 +187,22 @@ export function createArestServer(options: CreateArestServerOptions = {}): McpSe
     async () => dispatch('snapshots', {}),
   )
 
+  // ── External System browse (#343) ─────────────────────────────────
+
+  server.registerTool(
+    'external_browse',
+    {
+      description:
+        'Browse a type in a mounted External System (e.g. schema.org). Returns {type, supertypes[], subtypes[], properties[{name, range}]}. Inherited properties are included — Person surfaces schema:name via schema:Thing.',
+      inputSchema: {
+        system: z.string().describe('External System name (e.g. "schema.org")'),
+        path: z.array(z.string()).optional()
+          .describe('Breadcrumb to the type; last segment picks the type. Empty → system root.'),
+      },
+    },
+    async (input) => dispatch('external_browse', input as Record<string, unknown>),
+  )
+
   // ── LLM bridge (MCP-specific — uses client sampling) ──────────────
 
   server.registerTool(
