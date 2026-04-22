@@ -84,6 +84,8 @@ mod check;
 #[allow(dead_code)]
 mod crypto;
 #[allow(dead_code)]
+mod external;
+#[allow(dead_code)]
 mod generators;
 
 // =========================================================================
