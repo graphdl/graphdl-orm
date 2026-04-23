@@ -2551,6 +2551,74 @@ fn migration_application_entity_declared_in_core_md() {
     }
 }
 
+/// #349 runtime: when the compiler forward-chains a Migration rule,
+/// one MigrationApplication fact appears per source fact, carrying the
+/// migration id, a reference to the source fact, a reference to the
+/// target fact, and the migration's timestamp. §5 Theorem 5 holds
+/// because population is append-only — the MA records the rewrite
+/// without mutating the source cell, which is what the
+/// visible_population projection in #350 reads to filter.
+#[test]
+fn migration_firing_emits_migration_application_per_source_fact() {
+    let core_src = include_str!("../../../readings/core.md");
+    let mut state = arest::parse_forml2::parse_to_state(core_src).expect("core.md parses");
+
+    // User schema: Widget with two same-shape FTs (legacy + modern).
+    let user = r#"Widget(.id) is an entity type.
+Legacy Name is a value type.
+Modern Name is a value type.
+Widget has Legacy Name.
+Widget has Modern Name."#;
+    let user_state = arest::parse_forml2::parse_to_state_with_nouns(user, &state)
+        .expect("user schema parses");
+    state = merge_state_into(&state, &user_state);
+
+    // Inject a Migration instance referencing the two FTs.
+    state = ast::cell_push("Migration",
+        ast::fact_from_pairs(&[
+            ("id", "mig-legacy-to-modern"),
+            ("sourceFactType", "Widget_has_Legacy_Name"),
+            ("targetFactType", "Widget_has_Modern_Name"),
+            ("migrationRuleText", "copy"),
+            ("timestamp", "2026-04-23T00:00:00Z"),
+        ]),
+        &state);
+
+    // Inject one source-FT fact.
+    state = ast::cell_push("Widget_has_Legacy_Name",
+        ast::fact_from_pairs(&[
+            ("Widget", "wgt-1"),
+            ("Legacy Name", "old-name"),
+        ]),
+        &state);
+
+    // Compile → forward-chain.
+    let defs = compile::compile_to_defs_state(&state);
+    let derivation_defs: Vec<(&str, &ast::Func)> = defs.iter()
+        .filter(|(n, _)| n.starts_with("derivation:"))
+        .map(|(n, f)| (n.as_str(), f))
+        .collect();
+    let (final_state, _) = evaluate::forward_chain_defs_state(&derivation_defs, &state);
+
+    // A MigrationApplication must exist recording the rewrite.
+    let mas = ast::fetch_or_phi("MigrationApplication", &final_state);
+    let mas_seq = mas.as_seq().expect("MigrationApplication cell populated");
+    assert_eq!(mas_seq.len(), 1,
+        "one source fact ⇒ one MigrationApplication; got {}: {:?}",
+        mas_seq.len(), mas_seq);
+    let ma = &mas_seq[0];
+    assert_eq!(ast::binding(ma, "migration"), Some("mig-legacy-to-modern"),
+        "MA.migration should identify the migration");
+    assert_eq!(ast::binding(ma, "timestamp"), Some("2026-04-23T00:00:00Z"),
+        "MA.timestamp should copy from migration");
+    let source = ast::binding(ma, "source").expect("MA.source present");
+    assert!(source.contains("Widget_has_Legacy_Name"),
+        "MA.source should reference source FT; got {source:?}");
+    let produces = ast::binding(ma, "produces").expect("MA.produces present");
+    assert!(produces.contains("Widget_has_Modern_Name"),
+        "MA.produces should reference target FT; got {produces:?}");
+}
+
 // ── Cell Sharding: RMAP partitions to independent folds ────────────
 
 #[test]
