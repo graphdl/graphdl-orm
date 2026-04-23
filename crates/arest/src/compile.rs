@@ -910,9 +910,9 @@ pub(crate) fn compile_migration_defs(state: &crate::ast::Object) -> Vec<(String,
             let facts = read_cell_facts_flex(&source_ft, pop);
             let mut out: Vec<Object> = Vec::with_capacity(facts.len() * target_fts.len() * 2);
             for fact in &facts {
-                let source_id = synthesize_fact_id(&source_ft, fact);
+                let source_id = crate::ast::synthesize_fact_id(&source_ft, fact);
                 for target_ft in &target_fts {
-                    let produces_id = synthesize_fact_id(target_ft, fact);
+                    let produces_id = crate::ast::synthesize_fact_id(target_ft, fact);
                     out.push(ma_item(&mig_id, &source_id, &produces_id, &timestamp));
                     if rule_text == "copy" {
                         out.push(copy_target_item(target_ft, fact));
@@ -952,31 +952,6 @@ fn read_cell_facts_flex(ft_id: &str, input: &crate::ast::Object) -> Vec<crate::a
         }).unwrap_or_default(),
         _ => Vec::new(),
     }
-}
-
-/// Stable content-address for a fact: `{ft_id}#{fnv64 of sorted bindings}`.
-/// Same FNV-1a the forward-chain dedup uses, so two paths to the same fact
-/// produce the same id.
-fn synthesize_fact_id(ft_id: &str, fact: &crate::ast::Object) -> String {
-    let mut pairs: Vec<(String, String)> = fact.as_seq()
-        .map(|ps| ps.iter().filter_map(|p| {
-            let pair = p.as_seq()?;
-            if pair.len() != 2 { return None; }
-            Some((pair[0].as_atom()?.to_string(), pair[1].as_atom()?.to_string()))
-        }).collect())
-        .unwrap_or_default();
-    pairs.sort();
-    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-    const FNV_PRIME:  u64 = 0x100000001b3;
-    let mut h: u64 = FNV_OFFSET;
-    for b in ft_id.bytes() { h ^= b as u64; h = h.wrapping_mul(FNV_PRIME); }
-    for (k, v) in &pairs {
-        h ^= b'|' as u64; h = h.wrapping_mul(FNV_PRIME);
-        for b in k.bytes() { h ^= b as u64; h = h.wrapping_mul(FNV_PRIME); }
-        h ^= b'=' as u64; h = h.wrapping_mul(FNV_PRIME);
-        for b in v.bytes() { h ^= b as u64; h = h.wrapping_mul(FNV_PRIME); }
-    }
-    alloc::format!("{}#{:016x}", ft_id, h)
 }
 
 /// Build a derived-fact item for the `MigrationApplication` cell —
