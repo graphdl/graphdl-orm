@@ -54,8 +54,6 @@ mod block_storage;
 #[cfg(not(target_os = "uefi"))]
 mod dma;
 #[cfg(not(target_os = "uefi"))]
-mod gdt;
-#[cfg(not(target_os = "uefi"))]
 mod http;
 #[cfg(not(target_os = "uefi"))]
 mod interrupts;
@@ -105,7 +103,7 @@ entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 #[cfg(not(target_os = "uefi"))]
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     allocator::init();
-    gdt::init();
+    arch::gdt::init();
     interrupts::init_idt();
     interrupts::init_pic();
 

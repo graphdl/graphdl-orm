@@ -10,6 +10,7 @@
 // caller. Step 4 of the UEFI pivot (#344) wires the UEFI entry to the
 // same facade after ExitBootServices.
 
+pub mod gdt;
 pub mod serial;
 
 // `_print` is the function the `print!` / `println!` macros at the
