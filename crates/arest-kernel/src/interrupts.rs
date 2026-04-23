@@ -22,7 +22,7 @@
 // (#183). EOI is sent before calling process_key so the PIC is not
 // held while dispatch runs.
 
-use crate::gdt::DOUBLE_FAULT_IST_INDEX;
+use crate::arch::gdt::DOUBLE_FAULT_IST_INDEX;
 use crate::println;
 use pc_keyboard::{DecodedKey, HandleControl, Keyboard, ScancodeSet1, layouts};
 use pic8259::ChainedPics;

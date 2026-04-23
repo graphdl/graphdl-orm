@@ -28,7 +28,7 @@ use x86_64::VirtAddr;
 use x86_64::instructions::port::Port;
 use x86_64::structures::paging::PageTableFlags;
 
-use crate::gdt;
+use crate::arch::gdt;
 use crate::memory;
 use crate::println;
 

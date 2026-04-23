@@ -1,7 +1,8 @@
-// crates/arest-kernel/src/gdt.rs
+// crates/arest-kernel/src/arch/x86_64/gdt.rs
 //
 // Global Descriptor Table + Task State Segment for x86_64 long mode
-// with ring-3 support.
+// with ring-3 support. Lives under `arch/x86_64/` (#344 step 2); the
+// kernel body reaches it through `crate::arch::gdt`.
 //
 // SYSCALL/SYSRETQ require a specific descriptor ordering in the GDT
 // because the CPU derives the user-mode selectors from STAR.SYSRET_CS
