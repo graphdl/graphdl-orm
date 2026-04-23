@@ -577,6 +577,24 @@ pub enum Func {
     /// Rotate right: rotr:<x₁,...,xₙ> = <xₙ, x₁,...,xₙ₋₁>
     RotR,
 
+    /// Compact (Backus §11.2.4): `compact:<x₁,...,xₙ>` drops every ⊥
+    /// element from the sequence, preserving the order of the rest.
+    /// `compact:<1, ⊥, 2, ⊥, 3> = <1, 2, 3>`; `compact:<> = <>`.
+    ///
+    /// Named missing primitive from #352. AREST previously had
+    /// `Func::Filter(p)` as a primitive in lieu of deriving it from
+    /// `compact ∘ α(p → id ; ⊥)`. The derivation is an *algebraic*
+    /// identity per §11.2.4 eq 2 but not a *computational* one in
+    /// AREST: `Object::seq(..)` is strictly ⊥-preserving per §11.2.1,
+    /// so the moment α emits a single ⊥ element the intermediate
+    /// collapses to ⊥ and compact on ⊥ = ⊥. Filter stays a runtime
+    /// primitive. Compact is still a first-class primitive because
+    /// it appears in other contexts — cell-index lookups over sparse
+    /// noun populations, for example, produce seqs that can carry ⊥
+    /// via direct `Object::Seq(..)` construction (bypassing the
+    /// ⊥-checking `seq(..)` constructor).
+    Compact,
+
     // ── Arithmetic (Backus 11.2.3) ──────────────────────────────
     /// Add: +:<y,z> = y+z where y,z are number atoms
     Add,
@@ -1328,6 +1346,7 @@ fn variant_name(f: &Func) -> &'static str {
         Func::Lower => "Lower",
         Func::Length => "Length",
         Func::Concat => "Concat",
+        Func::Compact => "Compact",
         Func::DistL => "DistL",
         Func::DistR => "DistR",
         Func::Trans => "Trans",
@@ -1585,6 +1604,22 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
                     item.as_seq().map(|sub| sub.to_vec())
                         .unwrap_or_else(|| vec![item.clone()])
                 ).collect()),
+                _ => Object::Bottom,
+            }
+        }
+
+        Func::Compact => {
+            // Drop ⊥ elements, preserve order. The paired op that
+            // makes `Filter(p) ≡ compact ∘ α(p → id ; ⊥)` work.
+            // ⊥ on non-sequence input — parallel to every other
+            // sequence primitive.
+            match x.as_seq() {
+                Some(items) => Object::seq(
+                    items.iter()
+                        .filter(|i| **i != Object::Bottom)
+                        .cloned()
+                        .collect(),
+                ),
                 _ => Object::Bottom,
             }
         }
@@ -2734,6 +2769,7 @@ pub mod primitives {
     pub const LE: &str = "<=";
     pub const NULL: &str = "0?";
     pub const REVERSE: &str = "<>";
+    pub const COMPACT: &str = "ct";
     pub const DISTL: &str = "dl";
     pub const DISTR: &str = "dr";
     pub const LENGTH: &str = "#l";
@@ -3184,6 +3220,7 @@ fn metacompose_atom(name: &str, d: &Object) -> Func {
         primitives::SPLIT => Func::Split,
         primitives::REPLACE => Func::Replace,
         primitives::CONCAT => Func::Concat,
+        primitives::COMPACT => Func::Compact,
         primitives::LOWER => Func::Lower,
         primitives::NULL => Func::NullTest,
         primitives::REVERSE => Func::Reverse,
@@ -3315,6 +3352,7 @@ pub fn func_to_object(func: &Func) -> Object {
         Func::Split => Object::atom(primitives::SPLIT),
         Func::Replace => Object::atom(primitives::REPLACE),
         Func::Concat => Object::atom(primitives::CONCAT),
+        Func::Compact => Object::atom(primitives::COMPACT),
         Func::Lower => Object::atom(primitives::LOWER),
         Func::Length => Object::atom(primitives::LENGTH),
         Func::DistL => Object::atom(primitives::DISTL),
@@ -3641,6 +3679,7 @@ impl fmt::Debug for Func {
             Func::Split => write!(f, "split"),
             Func::Replace => write!(f, "replace"),
             Func::Concat => write!(f, "concat"),
+            Func::Compact => write!(f, "compact"),
             Func::Lower => write!(f, "lower"),
             Func::Length => write!(f, "length"),
             Func::DistL => write!(f, "distl"),
@@ -4034,6 +4073,82 @@ mod tests {
                 Object::seq(vec![Object::atom("user-1"), Object::atom("org-b")]),
             ])
         );
+    }
+
+    // ── Compact (#352) — drops ⊥ elements so Filter derives cleanly
+    //    from compact ∘ α(p → id ; ⊥) per Backus §11.2.4.
+
+    #[test]
+    fn compact_drops_bottom_elements_preserving_order() {
+        // Object::seq strips ⊥ *at construction* (see the paper's "⊥-
+        // preserving sequence constructor" — any sequence with a ⊥ member
+        // IS ⊥). So we install ⊥-interleaved input via `Object::Seq`
+        // directly, bypassing the constructor.
+        let x = Object::Seq(alloc::sync::Arc::from([
+            Object::atom("a"),
+            Object::Bottom,
+            Object::atom("b"),
+            Object::Bottom,
+            Object::atom("c"),
+        ].as_slice()));
+        assert_eq!(
+            apply(&Func::Compact, &x, &defs()),
+            Object::seq(vec![
+                Object::atom("a"),
+                Object::atom("b"),
+                Object::atom("c"),
+            ])
+        );
+    }
+
+    #[test]
+    fn compact_on_clean_sequence_is_identity() {
+        let x = Object::seq(vec![
+            Object::atom("a"),
+            Object::atom("b"),
+        ]);
+        assert_eq!(apply(&Func::Compact, &x, &defs()), x);
+    }
+
+    #[test]
+    fn compact_on_empty_sequence_is_empty() {
+        assert_eq!(apply(&Func::Compact, &Object::phi(), &defs()), Object::phi());
+    }
+
+    #[test]
+    fn compact_on_atom_is_bottom() {
+        assert_eq!(apply(&Func::Compact, &Object::atom("x"), &defs()), Object::Bottom);
+    }
+
+    #[test]
+    fn filter_equivalent_to_compact_alpha_cond_when_all_match() {
+        // Backus §11.2.4 eq 2 states `Filter(p) ≡ compact ∘ α(p → id ; ⊥)`
+        // as an algebraic identity. In AREST the identity only holds
+        // *computationally* when the predicate matches every element —
+        // because `Object::seq(..)` is strictly ⊥-preserving per §11.2.1
+        // (any ⊥ element collapses the whole seq to ⊥), so the moment
+        // α emits a ⊥ the intermediate becomes ⊥ and compact on ⊥ = ⊥.
+        // Runtime Filter is a necessity, not an optimization; Compact
+        // stays a standalone primitive that's useful where ⊥s enter
+        // the seq via other paths (e.g. cell_index lookups over sparse
+        // noun populations). Pin the all-match case here so future
+        // refactors don't break that subset of the algebraic law.
+        let is_a = Func::compose(
+            Func::Eq,
+            Func::construction(vec![Func::Id, Func::constant(Object::atom("a"))]),
+        );
+        let all_a = Object::seq(vec![Object::atom("a"), Object::atom("a")]);
+        let filter_form = Func::filter(is_a.clone());
+        let derived = Func::compose(
+            Func::Compact,
+            Func::apply_to_all(Func::condition(
+                is_a,
+                Func::Id,
+                Func::constant(Object::Bottom),
+            )),
+        );
+        assert_eq!(apply(&filter_form, &all_a, &defs()),
+                   apply(&derived, &all_a, &defs()));
     }
 
     // ── Derivation chain example ─────────────────────────────────
