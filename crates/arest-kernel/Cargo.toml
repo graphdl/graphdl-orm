@@ -102,6 +102,16 @@ virtio-drivers = "0.11"
 # pulling in the std-only compile / command / parse modules.
 arest = { path = "../arest", default-features = false, features = ["no_std"] }
 
+# UEFI target (#344) — uefi-rs gives us an `#[entry]` macro, Boot
+# Services (serial, memory map, device discovery, framebuffer), and
+# a panic handler. Only compiled for `x86_64-unknown-uefi` /
+# `aarch64-unknown-uefi` builds; the BIOS path (`x86_64-unknown-none`)
+# keeps using `bootloader_api` unchanged. `panic_handler` + `logger`
+# features take the uefi-provided impls so we don't need an arch-
+# specific one for the scaffold.
+[target.'cfg(target_os = "uefi")'.dependencies]
+uefi = { version = "0.34", features = ["alloc", "panic_handler", "logger"] }
+
 [profile.dev]
 panic = "abort"
 
