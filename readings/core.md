@@ -502,6 +502,31 @@ Migration has Timestamp.
 
 It is obligatory that each Migration produces some target Fact Type.
 
+## Migration Application (#349)
+
+### Rationale
+Migration firing emits a Migration Application per source fact touched,
+recording which target facts were produced and when. §5 Theorem 5 holds
+because Migration Application is itself a fact: the visible_population
+projection (#350) reads it to filter out migrated sources without a
+destructive write, so population monotonicity is preserved and Cor 3
+(closure under self-modification) survives.
+
+Migration Application(.id) is an entity type.
+
+Migration Application has Migration.
+  Each Migration Application has exactly one Migration.
+
+Migration Application has source Fact.
+  Each Migration Application has exactly one source Fact.
+
+Migration Application produces Fact.
+  Each Migration Application produces some Fact.
+  It is possible that some Migration Application produces more than one Fact.
+
+Migration Application has Timestamp.
+  Each Migration Application has exactly one Timestamp.
+
 ## NORMA Value Domain (#279)
 
 ### Entity types
