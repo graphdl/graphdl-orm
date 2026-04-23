@@ -2619,6 +2619,136 @@ Widget has Modern Name."#;
         "MA.produces should reference target FT; got {produces:?}");
 }
 
+/// #350: visible_population(P) = P \ { f | ∃ MigrationApplication points
+/// at f AND the Migration it belongs to is still in DEFS }. Append-only
+/// P: we don't mutate source cells, we project. Retract the Migration
+/// and the projection reverts — this is why rollback is free and why
+/// Theorem 5 (no value outside ρ) survives §5 Migration.
+#[test]
+fn visible_population_hides_facts_referenced_by_migration_application() {
+    let source_fact = ast::fact_from_pairs(&[("Widget", "wgt-1"), ("Legacy Name", "old")]);
+    let target_fact = ast::fact_from_pairs(&[("Widget", "wgt-1"), ("Modern Name", "old")]);
+    let source_id = ast::synthesize_fact_id("Widget_has_Legacy_Name", &source_fact);
+    let produces_id = ast::synthesize_fact_id("Widget_has_Modern_Name", &target_fact);
+
+    let ma = ast::fact_from_pairs(&[
+        ("id", "ma-1"),
+        ("migration", "mig-1"),
+        ("source", &source_id),
+        ("produces", &produces_id),
+        ("timestamp", "2026-04-23T00:00:00Z"),
+    ]);
+    let migration = ast::fact_from_pairs(&[
+        ("id", "mig-1"),
+        ("sourceFactType", "Widget_has_Legacy_Name"),
+        ("targetFactType", "Widget_has_Modern_Name"),
+        ("migrationRuleText", "copy"),
+        ("timestamp", "2026-04-23T00:00:00Z"),
+    ]);
+
+    let mut state = ast::Object::phi();
+    state = ast::cell_push("Widget_has_Legacy_Name", source_fact, &state);
+    state = ast::cell_push("Widget_has_Modern_Name", target_fact, &state);
+    state = ast::cell_push("MigrationApplication", ma, &state);
+    state = ast::cell_push("Migration", migration, &state);
+
+    let v = ast::visible_population(&state);
+
+    // Source is hidden through the projection.
+    let legacy = ast::fetch_or_phi("Widget_has_Legacy_Name", &v);
+    assert!(legacy.as_seq().map(|s| s.is_empty()).unwrap_or(true),
+        "legacy cell should be hidden after migration; got {:?}", legacy);
+    // Target stays visible.
+    let modern = ast::fetch_or_phi("Widget_has_Modern_Name", &v);
+    assert_eq!(modern.as_seq().map(|s| s.len()).unwrap_or(0), 1,
+        "modern cell should have the target fact visible");
+    // MigrationApplication itself is visible metadata (not subject to
+    // the projection — facts about facts don't hide facts about facts).
+    let mas = ast::fetch_or_phi("MigrationApplication", &v);
+    assert_eq!(mas.as_seq().map(|s| s.len()).unwrap_or(0), 1,
+        "MigrationApplication cell should remain visible");
+
+    // Retract the Migration (remove from DEFS). Projection reverts: source
+    // returns without anyone having to un-write the population.
+    let without_migration = ast::store("Migration", ast::Object::phi(), &state);
+    let v2 = ast::visible_population(&without_migration);
+    let legacy2 = ast::fetch_or_phi("Widget_has_Legacy_Name", &v2);
+    assert_eq!(legacy2.as_seq().map(|s| s.len()).unwrap_or(0), 1,
+        "retracting Migration should un-hide sources");
+}
+
+/// #350 integration: the `list_noun:{noun}` read path is a consumer of
+/// `visible_population`, so /api/{Noun}/{id}-style reads see the
+/// projected view. Before a Migration lands, the source shape is
+/// visible. After it lands (source flagged by an MA), the source is
+/// filtered out and only the target shape reaches the response.
+/// Retracting the Migration reverts the view — that's the whole point
+/// of doing this through a ρ-projection instead of a destructive
+/// rewrite.
+#[test]
+fn list_noun_reads_through_visible_population() {
+    let core_src = include_str!("../../../readings/core.md");
+    let mut state = arest::parse_forml2::parse_to_state(core_src).unwrap();
+    let user = r#"Widget(.id) is an entity type.
+Legacy Name is a value type.
+Modern Name is a value type.
+Widget has Legacy Name.
+Widget has Modern Name."#;
+    let user_state = arest::parse_forml2::parse_to_state_with_nouns(user, &state).unwrap();
+    state = merge_state_into(&state, &user_state);
+
+    let source = ast::fact_from_pairs(&[("Widget", "wgt-1"), ("Legacy Name", "old-name")]);
+    let target = ast::fact_from_pairs(&[("Widget", "wgt-1"), ("Modern Name", "old-name")]);
+    state = ast::cell_push("Widget_has_Legacy_Name", source.clone(), &state);
+    state = ast::cell_push("Widget_has_Modern_Name", target.clone(), &state);
+
+    // Helper: compile, build d, apply list_noun:Widget.
+    let list_widget = |s: &ast::Object| -> String {
+        let defs = compile::compile_to_defs_state(s);
+        let d = ast::defs_to_state(&defs, s);
+        let out = ast::apply(
+            &ast::Func::Platform("list_noun:Widget".into()),
+            &ast::Object::phi(), &d);
+        out.as_atom().expect("list returns JSON atom").to_string()
+    };
+
+    // No Migration yet: the union of both cells is visible.
+    let before = list_widget(&state);
+    assert!(before.contains("Legacy Name") && before.contains("Modern Name"),
+        "before migration, both shapes visible; got {before}");
+
+    // Land the Migration + MA.
+    let source_id = ast::synthesize_fact_id("Widget_has_Legacy_Name", &source);
+    let produces_id = ast::synthesize_fact_id("Widget_has_Modern_Name", &target);
+    state = ast::cell_push("Migration", ast::fact_from_pairs(&[
+        ("id", "mig-1"),
+        ("sourceFactType", "Widget_has_Legacy_Name"),
+        ("targetFactType", "Widget_has_Modern_Name"),
+        ("migrationRuleText", "copy"),
+        ("timestamp", "2026-04-23T00:00:00Z"),
+    ]), &state);
+    state = ast::cell_push("MigrationApplication", ast::fact_from_pairs(&[
+        ("id", "ma-1"),
+        ("migration", "mig-1"),
+        ("source", &source_id),
+        ("produces", &produces_id),
+        ("timestamp", "2026-04-23T00:00:00Z"),
+    ]), &state);
+
+    let after = list_widget(&state);
+    assert!(!after.contains("Legacy Name"),
+        "after migration, source shape projected out; got {after}");
+    assert!(after.contains("Modern Name"),
+        "after migration, target shape remains; got {after}");
+
+    // Retract the Migration fact — the MA becomes orphaned, projection
+    // reverts. Population was never mutated.
+    let reverted = ast::store("Migration", ast::Object::phi(), &state);
+    let reverted_json = list_widget(&reverted);
+    assert!(reverted_json.contains("Legacy Name"),
+        "retracting Migration un-hides Legacy shape; got {reverted_json}");
+}
+
 // ── Cell Sharding: RMAP partitions to independent folds ────────────
 
 #[test]

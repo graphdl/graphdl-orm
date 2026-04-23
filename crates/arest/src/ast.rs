@@ -2533,9 +2533,13 @@ fn extract_fact_pairs(x: &Object) -> (Option<String>, hashbrown::HashMap<String,
 #[cfg(not(feature = "no_std"))]
 fn platform_list_noun(noun: &str, d: &Object) -> Object {
     use hashbrown::HashMap;
+    // ρ-projection (#350): hide facts a Migration has rewritten away.
+    // Destructive rewrite would violate §5 Thm 5; projecting here lets
+    // every read path pick up the MA-filtered view for free.
+    let d = visible_population(d);
     let mut entities: HashMap<String, HashMap<String, String>> = HashMap::new();
 
-    cells_iter(d).iter().for_each(|(_, contents)| {
+    cells_iter(&d).iter().for_each(|(_, contents)| {
         let facts = contents.as_seq().map(|s| s.to_vec()).unwrap_or_default();
         facts.iter().for_each(|fact| {
             let pairs = match fact.as_seq() {
@@ -3055,6 +3059,84 @@ pub fn cell_filter(name: &str, predicate: impl Fn(&Object) -> bool, state: &Obje
         None => Object::phi(),
     };
     store(name, filtered, state)
+}
+
+/// Content-address for a fact: `{ft_id}#{fnv64 of sorted bindings}`.
+///
+/// Same FNV-1a the forward-chain dedup uses, so two code paths that
+/// produce the same fact shape end up at the same id. Used by the
+/// Migration runtime (#349) to stamp `source`/`produces` role values
+/// on `MigrationApplication` facts, and by `visible_population`
+/// (#350) to re-identify those facts in the population.
+pub fn synthesize_fact_id(ft_id: &str, fact: &Object) -> String {
+    let mut pairs: Vec<(String, String)> = fact.as_seq()
+        .map(|ps| ps.iter().filter_map(|p| {
+            let pair = p.as_seq()?;
+            if pair.len() != 2 { return None; }
+            Some((pair[0].as_atom()?.to_string(), pair[1].as_atom()?.to_string()))
+        }).collect())
+        .unwrap_or_default();
+    pairs.sort();
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME:  u64 = 0x100000001b3;
+    let mut h: u64 = FNV_OFFSET;
+    for b in ft_id.bytes() { h ^= b as u64; h = h.wrapping_mul(FNV_PRIME); }
+    for (k, v) in &pairs {
+        h ^= b'|' as u64; h = h.wrapping_mul(FNV_PRIME);
+        for b in k.bytes() { h ^= b as u64; h = h.wrapping_mul(FNV_PRIME); }
+        h ^= b'=' as u64; h = h.wrapping_mul(FNV_PRIME);
+        for b in v.bytes() { h ^= b as u64; h = h.wrapping_mul(FNV_PRIME); }
+    }
+    alloc::format!("{}#{:016x}", ft_id, h)
+}
+
+/// ρ-projection of the population, hiding facts migrated away by an
+/// active Migration (paper §5, #350).
+///
+/// A fact `f` is hidden iff some `MigrationApplication` names `f`'s
+/// `synthesize_fact_id` in its `source` binding AND that MA's
+/// `migration` role still resolves to a row in the `Migration` cell.
+/// Tying the projection to the Migration's presence is what makes
+/// rollback free: retract the Migration and the MA becomes orphaned,
+/// so visible_population stops filtering — P itself stays append-only
+/// (Thm 5), and Cor 3 (closure under self-modification) survives.
+///
+/// Cells with a `:` in their name (defs, indices, schema shards) are
+/// passed through untouched; they're never subject to the projection.
+/// The `MigrationApplication` and `Migration` cells themselves are
+/// passed through verbatim so callers can still read the metadata that
+/// drives the projection.
+pub fn visible_population(state: &Object) -> Object {
+    use hashbrown::HashSet;
+    let migrations = fetch_or_phi("Migration", state);
+    let active_migrations: HashSet<String> = migrations.as_seq()
+        .map(|s| s.iter().filter_map(|m| binding(m, "id").map(String::from)).collect())
+        .unwrap_or_default();
+    if active_migrations.is_empty() { return state.clone(); }
+    let mas = fetch_or_phi("MigrationApplication", state);
+    let hidden_ids: HashSet<String> = mas.as_seq()
+        .map(|s| s.iter().filter_map(|ma| {
+            let m_id = binding(ma, "migration")?;
+            if !active_migrations.contains(m_id) { return None; }
+            binding(ma, "source").map(String::from)
+        }).collect())
+        .unwrap_or_default();
+    if hidden_ids.is_empty() { return state.clone(); }
+
+    let mut out = state.clone();
+    for (cell_name, contents) in cells_iter(state) {
+        if cell_name.contains(':') { continue; }
+        if cell_name == "MigrationApplication" || cell_name == "Migration" { continue; }
+        let Some(facts) = contents.as_seq() else { continue; };
+        let filtered: Vec<Object> = facts.iter().filter(|f| {
+            let fid = synthesize_fact_id(&cell_name, f);
+            !hidden_ids.contains(&fid)
+        }).cloned().collect();
+        if filtered.len() != facts.len() {
+            out = store(&cell_name, Object::Seq(filtered.into()), &out);
+        }
+    }
+    out
 }
 
 /// The representation function ρ: Object → Func (Backus 13.3.2).
