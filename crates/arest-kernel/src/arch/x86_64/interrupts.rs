@@ -1,6 +1,8 @@
-// crates/arest-kernel/src/interrupts.rs
+// crates/arest-kernel/src/arch/x86_64/interrupts.rs
 //
-// Interrupt Descriptor Table setup + hardware IRQ routing.
+// Interrupt Descriptor Table setup + hardware IRQ routing. Lives under
+// `arch/x86_64/` (#344 step 2); the kernel body reaches it through
+// `crate::arch::interrupts`.
 //
 // Breakpoint (#BP, int 3) and double-fault (#DF, int 8) cover the
 // CPU-exception path. For device IRQs we remap the legacy 8259 PIC
@@ -22,7 +24,7 @@
 // (#183). EOI is sent before calling process_key so the PIC is not
 // held while dispatch runs.
 
-use crate::arch::gdt::DOUBLE_FAULT_IST_INDEX;
+use super::gdt::DOUBLE_FAULT_IST_INDEX;
 use crate::println;
 use pc_keyboard::{DecodedKey, HandleControl, Keyboard, ScancodeSet1, layouts};
 use pic8259::ChainedPics;

@@ -56,8 +56,6 @@ mod dma;
 #[cfg(not(target_os = "uefi"))]
 mod http;
 #[cfg(not(target_os = "uefi"))]
-mod interrupts;
-#[cfg(not(target_os = "uefi"))]
 mod memory;
 #[cfg(not(target_os = "uefi"))]
 mod net;
@@ -104,8 +102,8 @@ entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     allocator::init();
     arch::gdt::init();
-    interrupts::init_idt();
-    interrupts::init_pic();
+    arch::interrupts::init_idt();
+    arch::interrupts::init_pic();
 
     // Sec-6 ring-3 smoke test mode. Run only the subsystems needed
     // by userspace::launch_test_payload (memory — so map_user_page

@@ -11,6 +11,7 @@
 // same facade after ExitBootServices.
 
 pub mod gdt;
+pub mod interrupts;
 pub mod serial;
 
 // `_print` is the function the `print!` / `println!` macros at the
