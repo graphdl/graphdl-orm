@@ -44,6 +44,8 @@ mod entry_uefi;
 #[cfg(not(target_os = "uefi"))]
 mod allocator;
 #[cfg(not(target_os = "uefi"))]
+mod arch;
+#[cfg(not(target_os = "uefi"))]
 mod assets;
 #[cfg(not(target_os = "uefi"))]
 mod block;
@@ -65,8 +67,6 @@ mod net;
 mod pci;
 #[cfg(not(target_os = "uefi"))]
 mod repl;
-#[cfg(not(target_os = "uefi"))]
-mod serial;
 #[cfg(not(target_os = "uefi"))]
 mod syscall;
 #[cfg(not(target_os = "uefi"))]

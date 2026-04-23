@@ -1,4 +1,4 @@
-// crates/arest-kernel/src/serial.rs
+// crates/arest-kernel/src/arch/x86_64/serial.rs
 //
 // 8250 / 16550 UART driver on COM1 (I/O port 0x3F8). Provides:
 //   - a `SERIAL` singleton behind a spin::Mutex,
@@ -14,6 +14,12 @@
 // no OS to block against. Lock contention on bare metal is resolved
 // by spinning. For a single-core kernel the mutex is mostly a
 // compile-time guard against split borrows; on SMP it's a real lock.
+//
+// Lives under `arch/x86_64/` (#344 step 2). The crate-root macros
+// route `print!` through `$crate::arch::_print` which is re-exported
+// from this module's `_print` — so adding an aarch64 serial driver
+// later is a matter of providing a matching `arch::_print` without
+// touching the shared kernel body or the macros.
 
 use core::fmt;
 use spin::Mutex;
@@ -69,7 +75,7 @@ pub fn _print(args: fmt::Arguments<'_>) {
 
 #[macro_export]
 macro_rules! print {
-    ($($arg:tt)*) => ($crate::serial::_print(format_args!($($arg)*)));
+    ($($arg:tt)*) => ($crate::arch::_print(format_args!($($arg)*)));
 }
 
 #[macro_export]
