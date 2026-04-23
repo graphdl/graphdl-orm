@@ -24,32 +24,65 @@
 
 #![no_std]
 #![no_main]
-#![feature(abi_x86_interrupt)]
-#![feature(naked_functions)]
+#![cfg_attr(not(target_os = "uefi"), feature(abi_x86_interrupt))]
+#![cfg_attr(not(target_os = "uefi"), feature(naked_functions))]
 
 extern crate alloc;
 
+// UEFI entry path (#344) — compiles only on `x86_64-unknown-uefi` /
+// `aarch64-unknown-uefi`. Its `#[entry]` macro defines the PE32+
+// `_start` symbol; all the BIOS-path code below is cfg-gated out.
+#[cfg(target_os = "uefi")]
+mod entry_uefi;
+
+// BIOS path — everything below here is the existing `bootloader_api`
+// entry plus the kernel modules it drives. Gated on
+// `target_os = "none"` (the `x86_64-unknown-none` target). Once the
+// arch trait lands (#344 step 2) these modules move behind it and
+// the UEFI path can call through to `kernel_run` without duplicating.
+
+#[cfg(not(target_os = "uefi"))]
 mod allocator;
+#[cfg(not(target_os = "uefi"))]
 mod assets;
+#[cfg(not(target_os = "uefi"))]
 mod block;
+#[cfg(not(target_os = "uefi"))]
 mod block_storage;
+#[cfg(not(target_os = "uefi"))]
 mod dma;
+#[cfg(not(target_os = "uefi"))]
 mod gdt;
+#[cfg(not(target_os = "uefi"))]
 mod http;
+#[cfg(not(target_os = "uefi"))]
 mod interrupts;
+#[cfg(not(target_os = "uefi"))]
 mod memory;
+#[cfg(not(target_os = "uefi"))]
 mod net;
+#[cfg(not(target_os = "uefi"))]
 mod pci;
+#[cfg(not(target_os = "uefi"))]
 mod repl;
+#[cfg(not(target_os = "uefi"))]
 mod serial;
+#[cfg(not(target_os = "uefi"))]
 mod syscall;
+#[cfg(not(target_os = "uefi"))]
 mod system;
+#[cfg(not(target_os = "uefi"))]
 mod userspace;
+#[cfg(not(target_os = "uefi"))]
 mod virtio;
 
+#[cfg(not(target_os = "uefi"))]
 use alloc::string::ToString;
+#[cfg(not(target_os = "uefi"))]
 use bootloader_api::config::{BootloaderConfig, Mapping};
+#[cfg(not(target_os = "uefi"))]
 use bootloader_api::{BootInfo, entry_point};
+#[cfg(not(target_os = "uefi"))]
 use core::panic::PanicInfo;
 
 // The default bootloader config leaves `physical_memory` unmapped,
@@ -58,15 +91,18 @@ use core::panic::PanicInfo;
 // free virtual range for the full physical-memory window — this is
 // what the offset-page-table construction in memory.rs reads, and
 // what virtio::init_offset and every later subsystem depends on.
+#[cfg(not(target_os = "uefi"))]
 pub static BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut cfg = BootloaderConfig::new_default();
     cfg.mappings.physical_memory = Some(Mapping::Dynamic);
     cfg
 };
 
+#[cfg(not(target_os = "uefi"))]
 entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 
 /// Called by the bootloader the moment we land in 64-bit long mode.
+#[cfg(not(target_os = "uefi"))]
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     allocator::init();
     gdt::init();
@@ -236,6 +272,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 ///
 /// Interrupts stay enabled throughout, so keyboard / exception ISRs
 /// still fire and return back into the loop.
+#[cfg(not(target_os = "uefi"))]
 fn halt_forever() -> ! {
     loop {
         net::poll();
@@ -253,6 +290,7 @@ fn halt_forever() -> ! {
 ///      the legacy `/` banner.
 ///
 /// Anything that neither resolves returns a plaintext 404.
+#[cfg(not(target_os = "uefi"))]
 fn arest_http_handler(req: &http::Request) -> http::Response {
     if let Some(asset) = assets::lookup(&req.path) {
         return http::Response::ok_cached(
@@ -267,6 +305,10 @@ fn arest_http_handler(req: &http::Request) -> http::Response {
     }
 }
 
+// BIOS path panic handler. The UEFI path gets its handler from
+// `uefi-rs`'s `panic_handler` feature — we MUST NOT declare a
+// second one or the linker complains about duplicate `rust_begin_unwind`.
+#[cfg(not(target_os = "uefi"))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     println!("\n!! AREST kernel panic !!");
