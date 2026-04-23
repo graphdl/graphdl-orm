@@ -2513,6 +2513,44 @@ fn migration_entity_type_and_obligation_declared_in_core_md() {
         "deontic obligation should surface as 'It is obligatory …'; got {text:?}");
 }
 
+/// #349: MigrationApplication is the applied-to event. One MA per
+/// source fact touched, recording which target facts were produced
+/// and when. Pins the schema so the runtime hooks in compile.rs
+/// (and the visible_population projection in #350) have something
+/// stable to fire into.
+#[test]
+fn migration_application_entity_declared_in_core_md() {
+    let core_src = include_str!("../../../readings/core.md");
+    let state = arest::parse_forml2::parse_to_state(core_src)
+        .expect("core.md parses");
+
+    // Migration Application landed as an entity type.
+    let nouns = ast::fetch_or_phi("Noun", &state);
+    let seq = nouns.as_seq().expect("Noun cell Seq");
+    let ma = seq.iter()
+        .find(|f| ast::binding(f, "name") == Some("Migration Application"))
+        .expect("Migration Application entity type declared");
+    assert_eq!(ast::binding(ma, "objectType"), Some("entity"),
+        "Migration Application should be an entity type");
+
+    // The four required roles are declared as fact types.
+    let fact_types = ast::fetch_or_phi("FactType", &state);
+    let ft_seq = fact_types.as_seq().expect("FactType cell Seq");
+    let readings: Vec<String> = ft_seq.iter()
+        .filter_map(|f| ast::binding(f, "reading").map(|s| s.to_string()))
+        .collect();
+    for needle in [
+        "Migration Application has Migration",
+        "Migration Application has source Fact",
+        "Migration Application produces Fact",
+        "Migration Application has Timestamp",
+    ] {
+        assert!(readings.iter().any(|r| r.contains(needle)),
+            "expected fact-type reading containing {:?}; got readings = {:?}",
+            needle, readings);
+    }
+}
+
 // ── Cell Sharding: RMAP partitions to independent folds ────────────
 
 #[test]
