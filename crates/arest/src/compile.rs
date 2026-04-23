@@ -876,6 +876,143 @@ pub fn decode_compile_result(obj: &crate::ast::Object, d: &crate::ast::Object) -
     }).collect()).unwrap_or_default()
 }
 
+/// Compile Migration entity instances in `state` into derivation-shaped
+/// defs. One def per Migration, named `derivation:migration:{id}`. When
+/// forward-chained, each def reads the source FT cell from the population
+/// and, for every source fact, emits:
+///   1. a target fact (positional copy of bindings onto each target FT)
+///   2. a `MigrationApplication` fact recording the rewrite — source and
+///      target fact ids are synthesised as stable FNV hashes so the MA
+///      points at specific rows even in the encoded pop view derivations
+///      see at apply time.
+///
+/// §5 Theorem 5 holds because population is append-only: the MA is a
+/// fact, and #350's visible_population projection reads it to filter
+/// migrated sources without a destructive delete.
+pub(crate) fn compile_migration_defs(state: &crate::ast::Object) -> Vec<(String, Func)> {
+    use alloc::sync::Arc;
+    use crate::ast::Object;
+
+    let migration_cell = fetch_or_phi("Migration", state);
+    let Some(migs) = migration_cell.as_seq() else { return Vec::new(); };
+    migs.iter().filter_map(|mig_fact| {
+        let mig_id = binding(mig_fact, "id")?.to_string();
+        let source_ft = binding(mig_fact, "sourceFactType")?.to_string();
+        let targets_raw = binding(mig_fact, "targetFactType")?.to_string();
+        let target_fts: Vec<String> = targets_raw.split(',')
+            .filter(|s| !s.is_empty()).map(|s| s.to_string()).collect();
+        if mig_id.is_empty() || source_ft.is_empty() || target_fts.is_empty() { return None; }
+        let rule_text = binding(mig_fact, "migrationRuleText").unwrap_or("copy").to_string();
+        let timestamp = binding(mig_fact, "timestamp").unwrap_or("").to_string();
+
+        let def_name = alloc::format!("derivation:migration:{}", mig_id);
+        let func = Func::Native(Arc::new(move |pop: &Object| {
+            let facts = read_cell_facts_flex(&source_ft, pop);
+            let mut out: Vec<Object> = Vec::with_capacity(facts.len() * target_fts.len() * 2);
+            for fact in &facts {
+                let source_id = synthesize_fact_id(&source_ft, fact);
+                for target_ft in &target_fts {
+                    let produces_id = synthesize_fact_id(target_ft, fact);
+                    out.push(ma_item(&mig_id, &source_id, &produces_id, &timestamp));
+                    if rule_text == "copy" {
+                        out.push(copy_target_item(target_ft, fact));
+                    }
+                }
+            }
+            Object::Seq(out.into())
+        }));
+        Some((def_name, func))
+    }).collect()
+}
+
+/// Read a cell's facts from either the raw state (`<CELL, name, contents>`),
+/// the encoded population (`<name, facts>` pairs, produced by `encode_state`),
+/// or an `Object::Map` indexed view. Forward-chain decides which shape to
+/// hand Native defs based on whether every active rule is Native; Migration
+/// defs coexist with the non-Native derivation rules from core.md, so in
+/// practice we see the encoded form — but we handle all three for safety.
+fn read_cell_facts_flex(ft_id: &str, input: &crate::ast::Object) -> Vec<crate::ast::Object> {
+    use crate::ast::Object;
+    match input {
+        Object::Map(map) => map.get(ft_id)
+            .and_then(|v| v.as_seq().map(|s| s.to_vec()))
+            .unwrap_or_default(),
+        Object::Seq(cells) => cells.iter().find_map(|cell| {
+            let items = cell.as_seq()?;
+            if items.len() == 3
+                && items[0].as_atom() == Some(crate::ast::CELL_TAG)
+                && items[1].as_atom() == Some(ft_id)
+            {
+                return items[2].as_seq().map(|s| s.to_vec());
+            }
+            if items.len() == 2 && items[0].as_atom() == Some(ft_id) {
+                return items[1].as_seq().map(|s| s.to_vec());
+            }
+            None
+        }).unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+/// Stable content-address for a fact: `{ft_id}#{fnv64 of sorted bindings}`.
+/// Same FNV-1a the forward-chain dedup uses, so two paths to the same fact
+/// produce the same id.
+fn synthesize_fact_id(ft_id: &str, fact: &crate::ast::Object) -> String {
+    let mut pairs: Vec<(String, String)> = fact.as_seq()
+        .map(|ps| ps.iter().filter_map(|p| {
+            let pair = p.as_seq()?;
+            if pair.len() != 2 { return None; }
+            Some((pair[0].as_atom()?.to_string(), pair[1].as_atom()?.to_string()))
+        }).collect())
+        .unwrap_or_default();
+    pairs.sort();
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME:  u64 = 0x100000001b3;
+    let mut h: u64 = FNV_OFFSET;
+    for b in ft_id.bytes() { h ^= b as u64; h = h.wrapping_mul(FNV_PRIME); }
+    for (k, v) in &pairs {
+        h ^= b'|' as u64; h = h.wrapping_mul(FNV_PRIME);
+        for b in k.bytes() { h ^= b as u64; h = h.wrapping_mul(FNV_PRIME); }
+        h ^= b'=' as u64; h = h.wrapping_mul(FNV_PRIME);
+        for b in v.bytes() { h ^= b as u64; h = h.wrapping_mul(FNV_PRIME); }
+    }
+    alloc::format!("{}#{:016x}", ft_id, h)
+}
+
+/// Build a derived-fact item for the `MigrationApplication` cell —
+/// shape: `<ft_id, reading, <<k,v>, …>>` per `parse_derived_fact`.
+fn ma_item(mig_id: &str, source_id: &str, produces_id: &str, timestamp: &str) -> crate::ast::Object {
+    use crate::ast::Object;
+    let ma_id = alloc::format!("ma:{}:{}", mig_id, source_id);
+    Object::seq(vec![
+        Object::atom("MigrationApplication"),
+        Object::atom("Migration Application has Migration"),
+        Object::Seq(vec![
+            Object::seq(vec![Object::atom("id"), Object::atom(&ma_id)]),
+            Object::seq(vec![Object::atom("migration"), Object::atom(mig_id)]),
+            Object::seq(vec![Object::atom("source"), Object::atom(source_id)]),
+            Object::seq(vec![Object::atom("produces"), Object::atom(produces_id)]),
+            Object::seq(vec![Object::atom("timestamp"), Object::atom(timestamp)]),
+        ].into()),
+    ])
+}
+
+/// Build a target-FT derived fact by copying the source fact's bindings
+/// verbatim. Valid for the `copy` rule text when source and target FTs
+/// are shape-compatible; richer rule-text DSLs (rename, combine, project)
+/// layer on later.
+fn copy_target_item(target_ft: &str, source_fact: &crate::ast::Object) -> crate::ast::Object {
+    use crate::ast::Object;
+    let pairs: Vec<Object> = source_fact.as_seq()
+        .map(|ps| ps.iter().cloned().collect())
+        .unwrap_or_default();
+    Object::seq(vec![
+        Object::atom(target_ft),
+        Object::atom(""),
+        Object::Seq(pairs.into()),
+    ])
+}
+
 pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> {
     let t = profile_timer::now();
     let model = compile(state);
@@ -1090,6 +1227,12 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
     // Derivation rules â€” Î±(derivation â†’ def)
     defs.extend(model.derivations.iter()
         .map(|d| (format!("derivation:{}", d.id), d.func.clone())));
+
+    // Migration rules (#349). One derivation-shaped def per Migration
+    // instance in the population. Fires inside forward_chain alongside
+    // the classical derivations, emitting MigrationApplication facts +
+    // target-FT facts.
+    defs.extend(compile_migration_defs(state));
 
     // Sec-5 (#322): `allowed_writes:derivation:{id}` companion defs.
     // Each user-authored derivation whose consequent is a Literal FT
