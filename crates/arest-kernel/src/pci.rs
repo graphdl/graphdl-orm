@@ -42,6 +42,10 @@ pub const VIRTIO_MODERN_DEVICE_HI: u16 = 0x107F;
 /// a network device. virtio-net-pci = VIRTIO_MODERN_DEVICE_LO + 1.
 pub const VIRTIO_NET_DEVICE_ID: u16 = 0x1041;
 
+/// Modern-virtio block device. Spec: device-type 2 → 0x1040 + 2.
+/// Used by `find_virtio_blk` for the Storage-2 bring-up (#335).
+pub const VIRTIO_BLK_DEVICE_ID: u16 = 0x1042;
+
 /// One enumerated PCI device. Fields come straight from the standard
 /// PCI Type-0 header; callers that only need the identity ignore the
 /// BARs, and driver-instantiating callers read them.
@@ -123,6 +127,16 @@ pub fn find_virtio() -> Option<PciDevice> {
 pub fn find_virtio_net() -> Option<PciDevice> {
     scan_devices().into_iter().find(|d| {
         d.vendor_id == VIRTIO_VENDOR && d.device_id == VIRTIO_NET_DEVICE_ID
+    })
+}
+
+/// Find a virtio-blk-pci device — the first matching one if more than
+/// one is attached. Used by Storage-2 (#335) to locate the persistence
+/// disk. Returns None when the machine wasn't launched with
+/// `-device virtio-blk-pci,disable-legacy=on,...`.
+pub fn find_virtio_blk() -> Option<PciDevice> {
+    scan_devices().into_iter().find(|d| {
+        d.vendor_id == VIRTIO_VENDOR && d.device_id == VIRTIO_BLK_DEVICE_ID
     })
 }
 

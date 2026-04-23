@@ -117,6 +117,8 @@ if ($Smoke) {
             "heap:",
             "gdt:",
             "idt:",
+            "blk:    driver online",
+            "blk:    checkpoint round-trip OK",
             "EXCEPTION: BREAKPOINT",
             "int3 round-tripped"
         )

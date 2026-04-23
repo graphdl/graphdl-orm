@@ -184,6 +184,7 @@ use virtio_drivers::transport::pci::{PciTransport, bus::{
 }};
 use virtio_drivers::transport::DeviceType;
 use virtio_drivers::device::net::VirtIONet;
+use virtio_drivers::device::blk::VirtIOBlk;
 
 /// Queue size for the virtio-net rx/tx virtqueues. 16 is enough for
 /// bring-up; production scaling revisits this based on the cost curve.
@@ -195,6 +196,11 @@ pub const NET_BUF_LEN: usize = 2048;
 
 /// The fully-typed VirtIONet driver handle.
 pub type VirtIONetDevice = VirtIONet<KernelHal, PciTransport, NET_QUEUE_SIZE>;
+
+/// The fully-typed VirtIOBlk driver handle (#335). virtio-drivers' blk
+/// module hard-codes its virtqueue size to 16 and does not expose it as
+/// a const generic, so nothing to tune here.
+pub type VirtIOBlkDevice = VirtIOBlk<KernelHal, PciTransport>;
 
 /// Legacy-PIO `ConfigurationAccess` impl. virtio-drivers' bundled
 /// `MmioCam` expects an ECAM / MMIO-CAM base address, which we don't
@@ -298,6 +304,40 @@ pub fn try_init_virtio_net() -> Option<VirtIONetDevice> {
 fn transport_device_type(transport: &PciTransport) -> Option<DeviceType> {
     use virtio_drivers::transport::Transport;
     Some(transport.device_type())
+}
+
+/// Bring up the virtio-blk driver against the first matching PCI
+/// device (#335). Returns `Some(driver)` on success, `None` when no
+/// virtio-blk is present or construction failed. Shares the
+/// `KernelHal` + `PioCam` infrastructure with `try_init_virtio_net`;
+/// the two drivers co-exist by virtue of the DMA pool being sized for
+/// both (`DMA_POOL_PAGES` in memory.rs).
+pub fn try_init_virtio_blk() -> Option<VirtIOBlkDevice> {
+    let dev = crate::pci::find_virtio_blk()?;
+    let device_function = DeviceFunction {
+        bus: dev.bus,
+        device: dev.device,
+        function: dev.function,
+    };
+    let mut root = PciRoot::new(PioCam);
+    let transport = match PciTransport::new::<KernelHal, _>(&mut root, device_function) {
+        Ok(t) => t,
+        Err(e) => {
+            crate::println!("  virtio-blk: PciTransport::new failed: {:?}", e);
+            return None;
+        }
+    };
+    if !matches!(transport_device_type(&transport), Some(DeviceType::Block)) {
+        crate::println!("  virtio-blk: transport device_type is not Block");
+        return None;
+    }
+    match VirtIOBlk::<KernelHal, _>::new(transport) {
+        Ok(d) => Some(d),
+        Err(e) => {
+            crate::println!("  virtio-blk: VirtIOBlk::new failed: {:?}", e);
+            None
+        }
+    }
 }
 
 // ── smoltcp::phy::Device adapter (#262 final mile) ──────────────
