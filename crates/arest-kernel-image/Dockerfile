@@ -75,6 +75,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /build/arest-kernel.bios.img /kernel.img
 
+# Pre-allocate a 1 MiB raw disk image for the virtio-blk persistence
+# device (#335). The kernel's `block` module scans legacy PCI for the
+# device-id 0x1042 slot and, if present, publishes a sector-oriented
+# API to the Storage-2 layer. The image is created with a single
+# `dd`-style seek-and-zero so every sector reads as 0x00 on a fresh
+# container; #337's boot-time rehydrate treats that as "no checkpoint
+# yet" and falls through to the baked metamodel.
+RUN dd if=/dev/zero of=/disk.img bs=1M count=1 status=none
+
 # Expose container port 8080 so `docker run -p 8080:8080` forwards
 # host:8080 → container:8080 → QEMU's hostfwd → guest-kernel:80.
 EXPOSE 8080
@@ -106,4 +115,6 @@ CMD ["qemu-system-x86_64", \
      "-display", "none", \
      "-no-reboot", "-no-shutdown", \
      "-netdev", "user,id=net0,hostfwd=tcp::8080-:80", \
-     "-device", "virtio-net-pci,netdev=net0,disable-legacy=on"]
+     "-device", "virtio-net-pci,netdev=net0,disable-legacy=on", \
+     "-drive", "file=/disk.img,format=raw,if=none,id=disk0", \
+     "-device", "virtio-blk-pci,drive=disk0,disable-legacy=on"]

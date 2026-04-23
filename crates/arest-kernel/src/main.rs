@@ -31,6 +31,8 @@ extern crate alloc;
 
 mod allocator;
 mod assets;
+mod block;
+mod block_storage;
 mod dma;
 mod gdt;
 mod http;
@@ -98,6 +100,18 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let virtio_phy = virtio::try_init_virtio_net().map(virtio::VirtioPhy::new);
     let virtio_mac = virtio_phy.as_ref().map(|p| p.mac_address());
 
+    // virtio-blk bring-up (#335). PCI scan + driver init; on success
+    // the `block` module takes ownership of the driver and exposes a
+    // sector-oriented API to `block_storage` (#337). Absence is non-
+    // fatal — the kernel continues booting with in-memory state only.
+    let virtio_blk_pci = pci::find_virtio_blk();
+    let virtio_blk = virtio::try_init_virtio_blk();
+    let blk_capacity_sectors = virtio_blk.as_ref().map(|d| d.capacity()).unwrap_or(0);
+    let blk_readonly = virtio_blk.as_ref().map(|d| d.readonly()).unwrap_or(false);
+    if let Some(dev) = virtio_blk {
+        block::install(dev);
+    }
+
     net::init(virtio_phy);
     system::init();
     net::register_http(80, arest_http_handler);
@@ -124,6 +138,69 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     match &virtio_mac {
         Some(mac) => println!("  virtio: driver online, smoltcp phy bound, MAC {}", mac),
         None => println!("  virtio: driver not constructed — falling back to loopback"),
+    }
+    match virtio_blk_pci {
+        Some(dev) => println!(
+            "  blk:    virtio-blk found at {:02x}:{:02x}.{} (device={:#06x})",
+            dev.bus, dev.device, dev.function, dev.device_id,
+        ),
+        None => println!("  blk:    no virtio-blk device on legacy PCI bus (non-persistent boot)"),
+    }
+    if blk_capacity_sectors > 0 {
+        let cap_kib = (blk_capacity_sectors * (block::BLOCK_SECTOR_SIZE as u64)) / 1024;
+        let mode = if blk_readonly { "read-only" } else { "read-write" };
+        println!(
+            "  blk:    driver online, {} sectors ({} KiB), {} (#335)",
+            blk_capacity_sectors, cap_kib, mode,
+        );
+    } else {
+        println!("  blk:    driver not constructed — persistence disabled");
+    }
+
+    // Storage-4 (#337). Boot-time mount reads sector 0 off the disk;
+    // on success, `block_storage::last_state` exposes the rehydrated
+    // freeze bytes for system::init to consume (not yet wired here —
+    // the kernel's Once<Object> is immutable per boot; wiring happens
+    // once the mutation path lands). Until then the mount status +
+    // round-trip smoke prove the pipeline is live end-to-end.
+    let mount_status = block_storage::mount();
+    match mount_status {
+        block_storage::MountStatus::NoDevice => {
+            println!("  blk:    no persistence device — kernel state is ephemeral");
+        }
+        block_storage::MountStatus::FreshDisk => {
+            println!("  blk:    fresh disk (no prior checkpoint) — first-boot semantics");
+        }
+        block_storage::MountStatus::Rehydrated => {
+            let prev = block_storage::last_boot_count();
+            let bytes = block_storage::last_state().map(|v| v.len()).unwrap_or(0);
+            println!(
+                "  blk:    rehydrated checkpoint ({} bytes, boot_count was {}) (#337)",
+                bytes, prev,
+            );
+        }
+        block_storage::MountStatus::Corrupted => {
+            println!("  blk:    checkpoint CRC mismatch — refusing silent overwrite");
+        }
+    }
+    if matches!(
+        mount_status,
+        block_storage::MountStatus::FreshDisk | block_storage::MountStatus::Rehydrated,
+    ) {
+        // End-to-end smoke: write a marker + read it back via the full
+        // header-plus-sectors path. Proves virtio-blk read/write, CRC
+        // validation, and the header-last write ordering. Runs once
+        // per boot; replaced by the real commit path once the kernel
+        // grows a mutable state transition.
+        if block_storage::smoke_round_trip() {
+            let new_bc = block_storage::last_boot_count();
+            println!(
+                "  blk:    checkpoint round-trip OK (boot_count now {}) (#337)",
+                new_bc,
+            );
+        } else {
+            println!("  blk:    checkpoint round-trip FAILED");
+        }
     }
     println!("  http:   listening on :80 (#264)");
 
