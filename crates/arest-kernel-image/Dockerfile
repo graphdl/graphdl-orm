@@ -30,8 +30,16 @@ WORKDIR /build
 
 # Copy kernel crate
 COPY crates/arest-kernel/Cargo.toml crates/arest-kernel/Cargo.toml
+COPY crates/arest-kernel/build.rs crates/arest-kernel/build.rs
 COPY crates/arest-kernel/src/ crates/arest-kernel/src/
 COPY crates/arest-kernel/rust-toolchain.toml crates/arest-kernel/rust-toolchain.toml
+
+# Copy the ui.do static bundle (#266). `build.rs` bakes every file
+# under `apps/ui.do/dist/` into the kernel ELF via `include_bytes!`,
+# so the handler can serve `/` and `/assets/*` without a filesystem.
+# If the bundle is missing, `build.rs` emits an empty asset table
+# and the kernel falls back to the plaintext welcome banner.
+COPY apps/ui.do/dist/ apps/ui.do/dist/
 
 # Copy arest engine crate — the kernel links it in no_std mode (#265)
 # so the Docker build needs the sources plus every reading the
