@@ -618,8 +618,10 @@ pub fn compile_func() -> crate::ast::Func {
 
 /// Schema family as a pure FFP structure (#245 deeper lowering):
 ///
-///     schema_family = ApplyToAll(schema_pair_from_ft_native)
-///                   ∘ FetchOrPhi(<"FactType", state>)
+/// ```text
+/// schema_family = ApplyToAll(schema_pair_from_ft_native)
+///               ∘ FetchOrPhi(<"FactType", state>)
+/// ```
 ///
 /// The iteration over FactType facts is now explicit at the Func
 /// level (`ApplyToAll`), matching the paper's α-combinator. The
@@ -761,7 +763,9 @@ fn compile_per_noun_platform_family(
 /// helper and emits one `(shard:{ft_id}, Constant(cell_name))` per
 /// fact type. Matches paper Eq. demux (§8):
 ///
-///     E_n = Filter(eq ∘ [RMAP, n̄]) : E
+/// ```text
+/// E_n = Filter(eq ∘ [RMAP, n̄]) : E
+/// ```
 ///
 /// The constant Func is the per-cell identity the demux filter
 /// compares against. No pass through `compile_to_defs_state`.
