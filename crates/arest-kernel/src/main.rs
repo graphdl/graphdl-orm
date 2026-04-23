@@ -6,21 +6,25 @@
 // 64-bit long mode with paging already turned on and a populated
 // `BootInfo` on the stack.
 //
-// Current boot pipeline:
-//   BIOS / UEFI
-//     └─> bootloader (Multiboot2 stage, built by arest-kernel-image)
-//           └─> kernel_main(&'static mut BootInfo) -> !
-//                 └─> allocator::init()        — 1 MiB static heap
-//                 └─> gdt::init()              — GDT + TSS + IST
-//                 └─> interrupts::init_idt()
-//                 └─> interrupts::init_pic()   — remap + unmask KB
-//                 └─> SERIAL banner
-//                 └─> hlt loop (waits for IRQs)
+// Current boot pipeline (BIOS path — the UEFI path lives in
+// `entry_uefi.rs` and is still a scaffold):
+//   rust-osdev bootloader (Multiboot2 stage, built by arest-kernel-image)
+//     └─> kernel_main(&'static mut BootInfo) -> !
+//           ├─ allocator::init()                 — 1 MiB static heap
+//           ├─ arch::init_console()              — serial (16550, lazy)
+//           ├─ arch::init_gdt_and_interrupts()   — GDT + TSS + IDT + PIC
+//           ├─ arch::init_memory(boot_info)      — page tables + DMA pool;
+//           │                                      returns phys-mem offset
+//           ├─ virtio / net / system / http init
+//           ├─ boot banners over SERIAL
+//           ├─ arch::breakpoint()                — int3 round-trip smoke
+//           ├─ repl::init()                      — first prompt
+//           └─ arch::halt_forever()              — idle polling loop
 //
-// With the PIC live the `hlt` loop wakes on every keyboard scancode.
 // The REPL (#183) accumulates keystrokes into a line buffer and
-// dispatches commands on Enter. The arest engine is not yet linked
-// so all non-built-in input returns a stub message.
+// dispatches commands on Enter. Everything above `arch::halt_forever`
+// is arch-neutral once it reaches the shared kernel body; the x86-
+// specific pieces live under `arch/x86_64/` (#344 step 2).
 
 #![no_std]
 #![no_main]
@@ -37,9 +41,11 @@ mod entry_uefi;
 
 // BIOS path — everything below here is the existing `bootloader_api`
 // entry plus the kernel modules it drives. Gated on
-// `target_os = "none"` (the `x86_64-unknown-none` target). Once the
-// arch trait lands (#344 step 2) these modules move behind it and
-// the UEFI path can call through to `kernel_run` without duplicating.
+// `target_os = "none"` (the `x86_64-unknown-none` target). X86-
+// specific pieces (serial, gdt, interrupts, memory) live under
+// `arch/x86_64/` (#344 step 2). Step 3 routes println! through the
+// arch console impl; step 4 wires UEFI ExitBootServices to a shared
+// `kernel_run(BootInfo)` that reaches the same arch facade.
 
 #[cfg(not(target_os = "uefi"))]
 mod allocator;
@@ -80,10 +86,10 @@ use bootloader_api::{BootInfo, entry_point};
 use core::panic::PanicInfo;
 
 // The default bootloader config leaves `physical_memory` unmapped,
-// which breaks `memory::init` (it needs `BootInfo::physical_memory_offset`
+// which breaks `arch::init_memory` (it needs `BootInfo::physical_memory_offset`
 // to be Some). Request dynamic mapping so the bootloader picks a
 // free virtual range for the full physical-memory window — this is
-// what the offset-page-table construction in memory.rs reads, and
+// what the offset-page-table construction in arch::memory reads, and
 // what virtio::init_offset and every later subsystem depends on.
 #[cfg(not(target_os = "uefi"))]
 pub static BOOTLOADER_CONFIG: BootloaderConfig = {
@@ -99,9 +105,8 @@ entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 #[cfg(not(target_os = "uefi"))]
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     allocator::init();
-    arch::gdt::init();
-    arch::interrupts::init_idt();
-    arch::interrupts::init_pic();
+    arch::init_console();
+    arch::init_gdt_and_interrupts();
 
     // Sec-6 ring-3 smoke test mode. Run only the subsystems needed
     // by userspace::launch_test_payload (memory — so map_user_page
@@ -111,16 +116,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     {
         println!("AREST kernel online");
         println!("  mode: ring3-smoke — launching test payload");
-        arch::memory::init(boot_info);
+        arch::init_memory(boot_info);
         syscall::init();
         userspace::launch_test_payload();
     }
 
-    arch::memory::init(boot_info);
-    virtio::init_offset(
-        boot_info.physical_memory_offset.into_option()
-            .expect("bootloader did not supply physical_memory_offset"),
-    );
+    let phys_offset = arch::init_memory(boot_info);
+    virtio::init_offset(phys_offset);
     // virtio-net bring-up (#262). PCI scan first (banner-visible),
     // then construct the full VirtIONet driver, then wrap it in the
     // `smoltcp::phy::Device` adapter `VirtioPhy` so the interface
@@ -238,9 +240,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let greeting = "heap is live".to_string();
     println!("  alloc: {greeting}");
 
-    // Prove the IDT routes — `int3` should land in our breakpoint
-    // handler, print a frame, and return cleanly.
-    x86_64::instructions::interrupts::int3();
+    // Prove the IDT routes — fire a software breakpoint, which should
+    // land in our breakpoint handler, print a frame, and return cleanly.
+    arch::breakpoint();
     println!("  idt:   int3 round-tripped through breakpoint handler");
 
     println!("  repl:   line-buffered keyboard REPL online (#183)");
@@ -249,29 +251,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // Print initial prompt — REPL is now live.
     repl::init();
 
-    halt_forever();
-}
-
-/// Drive the kernel's idle loop. Busy-polls `net::poll()` so smoltcp
-/// can advance DHCP, TCP retransmit, and HTTP dispatch without a
-/// dedicated periodic IRQ.
-///
-/// Trade-off: 100 % CPU when idle, because a naive `hlt` here only
-/// wakes on a keyboard IRQ (the sole IRQ currently unmasked in the
-/// PIC) — which never fires in the E2E smoke harness, so DHCP stalls
-/// before it can request a lease from QEMU's SLiRP and `curl` times
-/// out at the host (observed pre-fix, #268). Once a periodic timer
-/// IRQ (#180 follow-up) or a PCI-line virtio IRQ lands, this can go
-/// back to `hlt`-then-poll.
-///
-/// Interrupts stay enabled throughout, so keyboard / exception ISRs
-/// still fire and return back into the loop.
-#[cfg(not(target_os = "uefi"))]
-fn halt_forever() -> ! {
-    loop {
-        net::poll();
-        core::hint::spin_loop();
-    }
+    arch::halt_forever();
 }
 
 /// HTTP handler. Two-stage routing:
@@ -313,6 +293,6 @@ fn panic(info: &PanicInfo) -> ! {
     }
     #[cfg(not(feature = "ring3-smoke"))]
     {
-        halt_forever();
+        arch::halt_forever();
     }
 }
