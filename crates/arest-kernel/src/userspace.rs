@@ -29,7 +29,7 @@ use x86_64::instructions::port::Port;
 use x86_64::structures::paging::PageTableFlags;
 
 use crate::arch::gdt;
-use crate::memory;
+use crate::arch::memory;
 use crate::println;
 
 /// QEMU isa-debug-exit port.

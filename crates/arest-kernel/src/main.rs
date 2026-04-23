@@ -56,8 +56,6 @@ mod dma;
 #[cfg(not(target_os = "uefi"))]
 mod http;
 #[cfg(not(target_os = "uefi"))]
-mod memory;
-#[cfg(not(target_os = "uefi"))]
 mod net;
 #[cfg(not(target_os = "uefi"))]
 mod pci;
@@ -113,12 +111,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     {
         println!("AREST kernel online");
         println!("  mode: ring3-smoke — launching test payload");
-        memory::init(boot_info);
+        arch::memory::init(boot_info);
         syscall::init();
         userspace::launch_test_payload();
     }
 
-    memory::init(boot_info);
+    arch::memory::init(boot_info);
     virtio::init_offset(
         boot_info.physical_memory_offset.into_option()
             .expect("bootloader did not supply physical_memory_offset"),
@@ -149,7 +147,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     net::register_http(80, arest_http_handler);
 
     // Collect memory stats for the banner.
-    let frame_count = memory::usable_frame_count();
+    let frame_count = arch::memory::usable_frame_count();
     let usable_mib  = (frame_count * 4096) / (1024 * 1024);
 
     println!("AREST kernel online");

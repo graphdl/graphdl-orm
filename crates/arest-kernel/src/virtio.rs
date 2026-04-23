@@ -22,7 +22,8 @@ use core::ptr::NonNull;
 
 use virtio_drivers::{BufferDirection, Hal, PhysAddr};
 
-use crate::{dma, memory};
+use crate::arch::memory;
+use crate::dma;
 
 /// Bootloader-supplied offset between physical and virtual addresses.
 /// Stored by `set_phys_offset` during `memory::init`'s caller chain
