@@ -527,6 +527,22 @@ Migration Application produces Fact.
 Migration Application has Timestamp.
   Each Migration Application has exactly one Timestamp.
 
+## Migration Application ordering (#351)
+
+### Rationale
+Two deontics compose migration chains and make federation convergence
+constructive. The at-most-one obligation rules out direct v1 → v3
+shortcuts: competing MAs for the same source row would flag, forcing
+the chain through v2 via a paired Migration + MA. The distinct-Timestamp
+obligation is what lets two peers replay the same Migration + MA stream
+and converge by Cor 5 — timestamps establish the total order the
+replay needs, and visible_population is a function of the replayed
+set, so partial replays up to any T agree across peers.
+
+It is obligatory that each source Fact has at most one Migration Application per target Fact Type.
+
+It is obligatory that each Migration Application has a distinct Timestamp.
+
 ## NORMA Value Domain (#279)
 
 ### Entity types

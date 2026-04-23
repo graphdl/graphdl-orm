@@ -2749,6 +2749,115 @@ Widget has Modern Name."#;
         "retracting Migration un-hides Legacy shape; got {reverted_json}");
 }
 
+/// #351: two deontic obligations govern how Migration Applications compose.
+///
+/// (a) At-most-one MA per (source Fact, target Fact Type). Makes a
+///     direct v1→v3 shortcut ill-formed: the population would carry
+///     competing MAs for the same source targeting different versions,
+///     and the obligation flags that. The chain has to pass through
+///     v2 explicitly via two paired Migrations + MAs.
+/// (b) Each Migration Application has a distinct Timestamp. This is
+///     what makes federation convergence constructive (Cor 5): two
+///     peers replaying the same Migration + MA stream in timestamp
+///     order reach the same visible_population projection because the
+///     order is a total order.
+#[test]
+fn migration_application_ordering_obligations_declared_in_core_md() {
+    let core_src = include_str!("../../../readings/core.md");
+    let state = arest::parse_forml2::parse_to_state(core_src).expect("core.md parses");
+
+    let constraints = ast::fetch_or_phi("Constraint", &state);
+    let deontics: Vec<_> = constraints.as_seq().expect("Constraint Seq").iter()
+        .filter(|c| ast::binding(c, "modality") == Some("deontic"))
+        .filter(|c| ast::binding(c, "deonticOperator") == Some("obligatory"))
+        .cloned()
+        .collect();
+
+    // (a) At-most-one MA per (source Fact, target Fact Type).
+    let obl_a = deontics.iter().find(|c| {
+        let t = ast::binding(c, "text").unwrap_or("");
+        t.contains("Migration Application") && t.contains("target Fact Type") && t.contains("at most one")
+    }).expect("obligation A (at-most-one MA per target Fact Type) declared");
+    let a_text = ast::binding(obl_a, "text").unwrap();
+    assert!(a_text.starts_with("It is obligatory"),
+        "obligation A should be 'It is obligatory …'; got {a_text:?}");
+
+    // (b) Distinct Timestamp per Migration Application.
+    let obl_b = deontics.iter().find(|c| {
+        let t = ast::binding(c, "text").unwrap_or("");
+        t.contains("Migration Application") && t.contains("Timestamp") && t.contains("distinct")
+    }).expect("obligation B (distinct Timestamp per MA) declared");
+    let b_text = ast::binding(obl_b, "text").unwrap();
+    assert!(b_text.starts_with("It is obligatory"),
+        "obligation B should be 'It is obligatory …'; got {b_text:?}");
+}
+
+/// #351 federation: two peers that replay the same Migration + MA
+/// stream in timestamp order reach the same projected view (Cor 5).
+/// Append-only P + the distinct-Timestamp obligation + the ρ-projection
+/// gives this for free: because visible_population is a function of
+/// (Migration set, MA set, population), and sets are order-independent,
+/// two peers with the same sets converge regardless of insert order.
+/// The timestamp order matters for *partial* replays: after receiving
+/// everything up to T, both peers must agree on what's visible.
+#[test]
+fn peers_converge_on_visible_population_regardless_of_insert_order() {
+    // Shared inputs.
+    let source = ast::fact_from_pairs(&[("Widget", "wgt-1"), ("Legacy Name", "old")]);
+    let target = ast::fact_from_pairs(&[("Widget", "wgt-1"), ("Modern Name", "old")]);
+    let source_id = ast::synthesize_fact_id("Widget_has_Legacy_Name", &source);
+    let produces_id = ast::synthesize_fact_id("Widget_has_Modern_Name", &target);
+    let migration = ast::fact_from_pairs(&[
+        ("id", "mig-1"),
+        ("sourceFactType", "Widget_has_Legacy_Name"),
+        ("targetFactType", "Widget_has_Modern_Name"),
+        ("migrationRuleText", "copy"),
+        ("timestamp", "2026-04-23T00:00:00Z"),
+    ]);
+    let ma = ast::fact_from_pairs(&[
+        ("id", "ma-1"),
+        ("migration", "mig-1"),
+        ("source", &source_id),
+        ("produces", &produces_id),
+        ("timestamp", "2026-04-23T00:00:01Z"),
+    ]);
+
+    // Peer A: insert in timestamp order (source, migration, target, MA).
+    let mut peer_a = ast::Object::phi();
+    peer_a = ast::cell_push("Widget_has_Legacy_Name", source.clone(), &peer_a);
+    peer_a = ast::cell_push("Migration", migration.clone(), &peer_a);
+    peer_a = ast::cell_push("Widget_has_Modern_Name", target.clone(), &peer_a);
+    peer_a = ast::cell_push("MigrationApplication", ma.clone(), &peer_a);
+
+    // Peer B: insert in reverse order (MA first — it will reference
+    // the not-yet-seen source, then target, then migration, then
+    // source). The visible_population projection only reads Migration
+    // + MA + cell names, so the fact-insert order doesn't matter.
+    let mut peer_b = ast::Object::phi();
+    peer_b = ast::cell_push("MigrationApplication", ma, &peer_b);
+    peer_b = ast::cell_push("Widget_has_Modern_Name", target, &peer_b);
+    peer_b = ast::cell_push("Migration", migration, &peer_b);
+    peer_b = ast::cell_push("Widget_has_Legacy_Name", source, &peer_b);
+
+    let va = ast::visible_population(&peer_a);
+    let vb = ast::visible_population(&peer_b);
+
+    // Same hidden set + same visible targets on both peers.
+    let va_legacy = ast::fetch_or_phi("Widget_has_Legacy_Name", &va)
+        .as_seq().map(|s| s.len()).unwrap_or(0);
+    let vb_legacy = ast::fetch_or_phi("Widget_has_Legacy_Name", &vb)
+        .as_seq().map(|s| s.len()).unwrap_or(0);
+    assert_eq!(va_legacy, 0, "peer A: legacy hidden");
+    assert_eq!(vb_legacy, 0, "peer B: legacy hidden");
+
+    let va_modern = ast::fetch_or_phi("Widget_has_Modern_Name", &va)
+        .as_seq().map(|s| s.len()).unwrap_or(0);
+    let vb_modern = ast::fetch_or_phi("Widget_has_Modern_Name", &vb)
+        .as_seq().map(|s| s.len()).unwrap_or(0);
+    assert_eq!(va_modern, 1, "peer A: target visible");
+    assert_eq!(vb_modern, 1, "peer B: target visible");
+}
+
 // ── Cell Sharding: RMAP partitions to independent folds ────────────
 
 #[test]
