@@ -2589,7 +2589,10 @@ fn platform_list_noun(noun: &str, d: &Object) -> Object {
 /// result" is a valid query outcome distinct from "undefined fact type".
 #[cfg(not(feature = "no_std"))]
 fn platform_query_ft(ft_id: &str, x: &Object, d: &Object) -> Object {
-    let facts = fetch_or_phi(ft_id, d);
+    // ρ-projection (#350): query_ft is a population read path, so
+    // migrated-away sources must not appear in results.
+    let d = visible_population(d);
+    let facts = fetch_or_phi(ft_id, &d);
     let facts_seq = facts.as_seq().map(|s| s.to_vec()).unwrap_or_default();
 
     let filter: hashbrown::HashMap<String, String> = x.as_atom()
