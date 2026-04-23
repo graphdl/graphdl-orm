@@ -475,6 +475,33 @@ Antecedent Clause has Clause Shape.
 
 It is obligatory that each Antecedent Clause has Clause Shape.
 
+## Migration (#348)
+
+### Rationale
+Population-level rewriting when a schema evolves. §5 allows migration
+to land as derivation rules / transition triggers / deontic
+constraints; none is shaped for "rewrite facts of one Fact Type into
+facts of another," so `Migration` names it directly. Firing a rule
+emits a `MigrationApplication` (#349); visible_population (#350)
+projects out migrated sources, keeping P monotonic.
+
+Migration(.id) is an entity type.
+Migration Rule Text is a value type.
+
+Migration has source Fact Type.
+  Each Migration has exactly one source Fact Type.
+
+Migration produces target Fact Type.
+  Each Migration produces some target Fact Type.
+
+Migration has Migration Rule Text.
+  Each Migration has exactly one Migration Rule Text.
+
+Migration has Timestamp.
+  Each Migration has exactly one Timestamp.
+
+It is obligatory that each Migration produces some target Fact Type.
+
 ## NORMA Value Domain (#279)
 
 ### Entity types

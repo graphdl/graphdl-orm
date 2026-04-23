@@ -2469,6 +2469,50 @@ fn ring_validity_and_completeness_obligations_declared_in_core_md() {
     }), "Layer 3 obligation missing (same-noun-binary-has-ring)");
 }
 
+/// #348: Migration entity type + rule-text value type land in core.md
+/// with a deontic obligation covering the target-Fact-Type role.
+/// Pins the readings so drift (rename, section move, accidental
+/// delete) surfaces as a test failure instead of quietly rotting
+/// #349 / #350 / #351 which depend on these declarations.
+#[test]
+fn migration_entity_type_and_obligation_declared_in_core_md() {
+    let core_src = include_str!("../../../readings/core.md");
+    let state = arest::parse_forml2::parse_to_state(core_src)
+        .expect("core.md parses");
+
+    // Migration landed as an entity type.
+    let nouns = ast::fetch_or_phi("Noun", &state);
+    let seq = nouns.as_seq().expect("Noun cell Seq");
+    let migration = seq.iter()
+        .find(|f| ast::binding(f, "name") == Some("Migration"))
+        .expect("Migration entity type declared");
+    assert_eq!(ast::binding(migration, "objectType"), Some("entity"),
+        "Migration should be an entity type");
+
+    // Migration Rule Text landed as a value type.
+    let rule_text = seq.iter()
+        .find(|f| ast::binding(f, "name") == Some("Migration Rule Text"))
+        .expect("Migration Rule Text value type declared");
+    assert_eq!(ast::binding(rule_text, "objectType"), Some("value"),
+        "Migration Rule Text should be a value type");
+
+    // Deontic obligation: each Migration produces some target Fact Type.
+    let constraints = ast::fetch_or_phi("Constraint", &state);
+    let deontic = constraints.as_seq().expect("Constraint Seq").iter()
+        .find(|f| {
+            ast::binding(f, "modality") == Some("deontic")
+                && ast::binding(f, "deonticOperator") == Some("obligatory")
+                && ast::binding(f, "entity") == Some("Migration")
+        })
+        .expect("deontic obligation on Migration declared")
+        .clone();
+    let text = ast::binding(&deontic, "text").unwrap();
+    assert!(text.contains("Migration") && text.contains("target Fact Type"),
+        "deontic obligation must mention Migration and target Fact Type; got {text:?}");
+    assert!(text.starts_with("It is obligatory"),
+        "deontic obligation should surface as 'It is obligatory …'; got {text:?}");
+}
+
 // ── Cell Sharding: RMAP partitions to independent folds ────────────
 
 #[test]
