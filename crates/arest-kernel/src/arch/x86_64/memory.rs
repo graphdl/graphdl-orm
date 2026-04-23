@@ -1,6 +1,10 @@
-// crates/arest-kernel/src/memory.rs
+// crates/arest-kernel/src/arch/x86_64/memory.rs
 //
 // Page-table access and physical frame allocation for the AREST kernel.
+// Lives under `arch/x86_64/` (#344 step 2); the kernel body reaches it
+// through `crate::arch::memory`. Still coupled to `bootloader_api`'s
+// BootInfo shape — the shared BootInfo abstraction is a step-4 concern
+// once UEFI ExitBootServices lands.
 //
 // The bootloader (rust-osdev/bootloader 0.11) enters the kernel in 64-bit
 // long mode with:
