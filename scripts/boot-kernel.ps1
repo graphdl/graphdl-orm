@@ -144,11 +144,11 @@ if ($Smoke) {
             # smoltcp's listener takes a moment to bind after the banner
             # prints; poll for up to 10 s before giving up.
             $httpDeadline = (Get-Date).AddSeconds(10)
-            $response = $null
+            $rootResponse = $null
             $lastError = $null
             while ((Get-Date) -lt $httpDeadline) {
                 try {
-                    $response = Invoke-WebRequest -Uri "http://localhost:8080/" `
+                    $rootResponse = Invoke-WebRequest -Uri "http://localhost:8080/" `
                         -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop
                     break
                 } catch {
@@ -157,26 +157,104 @@ if ($Smoke) {
                 }
             }
 
-            if ($null -eq $response) {
+            if ($null -eq $rootResponse) {
                 Write-Host "FAIL: curl never reached the kernel (last error: $lastError)" -ForegroundColor Red
                 exit 1
             }
 
-            if ($response.StatusCode -ne 200) {
-                Write-Host "FAIL: expected HTTP 200; got $($response.StatusCode)" -ForegroundColor Red
-                Write-Host "Body: $($response.Content)"
+            if ($rootResponse.StatusCode -ne 200) {
+                Write-Host "FAIL: expected HTTP 200; got $($rootResponse.StatusCode)" -ForegroundColor Red
+                Write-Host "Body: $($rootResponse.Content)"
                 exit 1
             }
 
-            $body = $response.Content
-            if ($body -notmatch "AREST kernel") {
-                Write-Host "FAIL: response body missing 'AREST kernel' marker" -ForegroundColor Red
-                Write-Host "Body: $body"
+            $rootBody = $rootResponse.Content
+            $rootContentType = $rootResponse.Headers['Content-Type']
+            if ($rootContentType -is [System.Array]) { $rootContentType = $rootContentType[0] }
+
+            # #266 — `/` serves the ui.do HTML shell. Assert Content-Type
+            # and a body marker from `apps/ui.do/dist/index.html`.
+            if ($rootContentType -notmatch '^text/html') {
+                Write-Host "FAIL: expected Content-Type: text/html at /; got '$rootContentType'" -ForegroundColor Red
+                Write-Host "Body: $rootBody"
                 exit 1
             }
+            if ($rootBody -notmatch '<!doctype html>') {
+                Write-Host "FAIL: `/` body missing '<!doctype html>' marker" -ForegroundColor Red
+                Write-Host "Body: $rootBody"
+                exit 1
+            }
+            if ($rootBody -notmatch 'ui\.do') {
+                Write-Host "FAIL: `/` body missing 'ui.do' marker" -ForegroundColor Red
+                Write-Host "Body: $rootBody"
+                exit 1
+            }
+            Write-Host "PASS: / served HTML shell (Content-Type: $rootContentType)" -ForegroundColor Green
 
-            Write-Host "PASS: host:8080 reached guest kernel :80 (HTTP 200)." -ForegroundColor Green
-            Write-Host "Body: $($body.Trim())"
+            # Extract the Vite-hashed bundle URL from the HTML shell and
+            # verify it's served with Cache-Control: immutable and the
+            # JavaScript MIME type.
+            $assetMatch = [regex]::Match($rootBody, '/assets/[A-Za-z0-9._\-]+\.js')
+            if (-not $assetMatch.Success) {
+                Write-Host "FAIL: could not find /assets/*.js URL in the HTML shell" -ForegroundColor Red
+                Write-Host "Body: $rootBody"
+                exit 1
+            }
+            $assetUrl = "http://localhost:8080" + $assetMatch.Value
+            Write-Host "`nE2E: curl $assetUrl ..." -ForegroundColor Cyan
+            $assetResponse = Invoke-WebRequest -Uri $assetUrl -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+            if ($assetResponse.StatusCode -ne 200) {
+                Write-Host "FAIL: asset GET returned $($assetResponse.StatusCode)" -ForegroundColor Red
+                exit 1
+            }
+            $assetCt = $assetResponse.Headers['Content-Type']
+            if ($assetCt -is [System.Array]) { $assetCt = $assetCt[0] }
+            if ($assetCt -notmatch 'javascript') {
+                Write-Host "FAIL: expected Content-Type: application/javascript on asset; got '$assetCt'" -ForegroundColor Red
+                exit 1
+            }
+            $assetCache = $assetResponse.Headers['Cache-Control']
+            if ($assetCache -is [System.Array]) { $assetCache = $assetCache[0] }
+            if ($assetCache -notmatch 'immutable') {
+                Write-Host "FAIL: hashed asset missing Cache-Control: immutable; got '$assetCache'" -ForegroundColor Red
+                exit 1
+            }
+            Write-Host "PASS: asset served ($($assetResponse.RawContentLength) bytes, $assetCt, Cache-Control: $assetCache)" -ForegroundColor Green
+
+            # SPA fallback — any non-/assets, non-/api path must return
+            # the HTML shell so the React router claims it client-side.
+            Write-Host "`nE2E: curl http://localhost:8080/Organization/abc (SPA fallback) ..." -ForegroundColor Cyan
+            $spaResponse = Invoke-WebRequest -Uri "http://localhost:8080/Organization/abc" `
+                -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+            $spaCt = $spaResponse.Headers['Content-Type']
+            if ($spaCt -is [System.Array]) { $spaCt = $spaCt[0] }
+            if ($spaResponse.StatusCode -ne 200 -or $spaCt -notmatch '^text/html') {
+                Write-Host "FAIL: SPA fallback path returned $($spaResponse.StatusCode) / $spaCt" -ForegroundColor Red
+                exit 1
+            }
+            if ($spaResponse.Content -notmatch '<!doctype html>') {
+                Write-Host "FAIL: SPA fallback body missing '<!doctype html>'" -ForegroundColor Red
+                exit 1
+            }
+            Write-Host "PASS: SPA fallback served index.html" -ForegroundColor Green
+
+            # Dynamic API dispatch — /api/welcome must reach the baked
+            # SYSTEM handler and return the ρ-applied banner.
+            Write-Host "`nE2E: curl http://localhost:8080/api/welcome ..." -ForegroundColor Cyan
+            $apiResponse = Invoke-WebRequest -Uri "http://localhost:8080/api/welcome" `
+                -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+            if ($apiResponse.StatusCode -ne 200) {
+                Write-Host "FAIL: /api/welcome returned $($apiResponse.StatusCode)" -ForegroundColor Red
+                exit 1
+            }
+            if ($apiResponse.Content -notmatch 'AREST kernel') {
+                Write-Host "FAIL: /api/welcome body missing 'AREST kernel' marker" -ForegroundColor Red
+                Write-Host "Body: $($apiResponse.Content)"
+                exit 1
+            }
+            Write-Host "PASS: /api/welcome reached SYSTEM dispatch" -ForegroundColor Green
+
+            Write-Host "`nE2E complete: ui.do bundle + SPA fallback + API dispatch all live on :80" -ForegroundColor Green
         }
 
         exit 0

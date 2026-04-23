@@ -55,8 +55,8 @@ pub fn init() {
                 "welcome".to_string(),
                 Func::Constant(Object::atom(
                     "AREST kernel — one ρ-application away from the wire.\n\n\
-                     Try:  curl http://127.0.0.1/\n\
-                           curl -d 'hello' http://127.0.0.1/echo\n",
+                     Try:  curl http://127.0.0.1/api/welcome\n\
+                           curl -d 'hello' http://127.0.0.1/api/echo\n",
                 )),
             ),
             // Func::Id is the identity ρ-application — apply(Id, x, D) = x.
@@ -82,9 +82,24 @@ pub fn dispatch(_method: &str, path: &str, body: &[u8]) -> Option<Vec<u8>> {
 }
 
 fn route_to_def(path: &str) -> Option<&'static str> {
+    // Strip an optional query string so `/api/welcome?v=1` still matches.
+    let path = path.split('?').next().unwrap_or(path);
     match path {
+        // Canonical API namespace introduced in #266. The HTML shell
+        // lives at `/`; every dynamic verb is reached at `/api/<def>`.
+        "/api/welcome" => Some("welcome"),
+        "/api/echo" => Some("echo"),
+
+        // Legacy bundle-free routes. When no ui.do bundle is baked in
+        // (assets::UI_ASSETS is empty), the handler falls through
+        // from `assets::lookup` to `system::dispatch` for the bare
+        // `/` path — keeping the pre-#266 "AREST kernel — one
+        // ρ-application away from the wire" banner reachable via
+        // `curl http://127.0.0.1/`. Once the bundle is present these
+        // paths are shadowed by `/index.html`.
         "/" | "/welcome" => Some("welcome"),
         "/echo" => Some("echo"),
+
         _ => None,
     }
 }

@@ -66,25 +66,44 @@ pub struct Request {
     pub accept: Option<String>,
 }
 
-/// Response the handler returns. Headers are fixed (Content-Type
-/// configurable, Connection: close always) to keep the surface
-/// small.
+/// Response the handler returns. Content-Type is always emitted;
+/// `Cache-Control` is optional so API responses (no sensible cache
+/// policy at this layer) stay header-light while static assets
+/// (#266) emit the right directive per path.
 #[derive(Debug)]
 pub struct Response {
     pub status: Status,
     pub content_type: &'static str,
+    pub cache_control: Option<&'static str>,
     pub body: Vec<u8>,
 }
 
 impl Response {
     pub fn ok(content_type: &'static str, body: Vec<u8>) -> Self {
-        Self { status: Status(200), content_type, body }
+        Self { status: Status(200), content_type, cache_control: None, body }
+    }
+
+    /// `ok` with an explicit Cache-Control directive — used by the
+    /// static-asset handler (#266) to mark immutable bundles and
+    /// no-cache the HTML shell.
+    pub fn ok_cached(
+        content_type: &'static str,
+        cache_control: &'static str,
+        body: Vec<u8>,
+    ) -> Self {
+        Self {
+            status: Status(200),
+            content_type,
+            cache_control: Some(cache_control),
+            body,
+        }
     }
 
     pub fn not_found() -> Self {
         Self {
             status: Status(404),
             content_type: "text/plain",
+            cache_control: None,
             body: b"Not Found\n".to_vec(),
         }
     }
@@ -93,6 +112,7 @@ impl Response {
         Self {
             status: Status(400),
             content_type: "text/plain",
+            cache_control: None,
             body: msg.as_bytes().to_vec(),
         }
     }
@@ -101,6 +121,7 @@ impl Response {
         Self {
             status: Status(500),
             content_type: "text/plain",
+            cache_control: None,
             body: msg.as_bytes().to_vec(),
         }
     }
@@ -110,18 +131,20 @@ impl Response {
     /// the full buffer so the caller can hand it straight to
     /// `TcpSocket::send_slice`.
     pub fn to_wire(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(128 + self.body.len());
+        let mut out = Vec::with_capacity(192 + self.body.len());
         write_fmt(&mut out, format_args!(
             "HTTP/1.1 {} {}\r\n\
              Content-Type: {}\r\n\
-             Content-Length: {}\r\n\
-             Connection: close\r\n\
-             \r\n",
+             Content-Length: {}\r\n",
             self.status.0,
             self.status.reason(),
             self.content_type,
             self.body.len(),
         ));
+        if let Some(cache) = self.cache_control {
+            write_fmt(&mut out, format_args!("Cache-Control: {}\r\n", cache));
+        }
+        out.extend_from_slice(b"Connection: close\r\n\r\n");
         out.extend_from_slice(&self.body);
         out
     }

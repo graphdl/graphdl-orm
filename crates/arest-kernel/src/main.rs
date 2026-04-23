@@ -30,6 +30,7 @@
 extern crate alloc;
 
 mod allocator;
+mod assets;
 mod dma;
 mod gdt;
 mod http;
@@ -165,12 +166,24 @@ fn halt_forever() -> ! {
     }
 }
 
-/// HTTP handler that routes each request through the baked SYSTEM
-/// (#265). `system::dispatch` maps the path to a def name, looks up
-/// the Func via FetchOrPhi, and ρ-applies it against the baked
-/// state D. When no def matches the path, the handler returns a
-/// plaintext 404 so curl still gets a human-readable answer.
+/// HTTP handler. Two-stage routing:
+///
+///   1. `assets::lookup` — baked ui.do bundle (#266). Matches `/`,
+///      `/assets/*`, and SPA fallback for React-router paths. API
+///      paths (`/api/*`) and `/assets/*` misses return `None` here.
+///   2. `system::dispatch` — ρ-applied defs over the baked state
+///      (#265). Handles `/api/*` and, when no bundle is baked in,
+///      the legacy `/` banner.
+///
+/// Anything that neither resolves returns a plaintext 404.
 fn arest_http_handler(req: &http::Request) -> http::Response {
+    if let Some(asset) = assets::lookup(&req.path) {
+        return http::Response::ok_cached(
+            asset.content_type,
+            asset.cache_control,
+            asset.body.to_vec(),
+        );
+    }
     match system::dispatch(&req.method, &req.path, &req.body) {
         Some(body) => http::Response::ok("text/plain; charset=utf-8", body),
         None => http::Response::not_found(),
