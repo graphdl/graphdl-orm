@@ -358,6 +358,41 @@ fn efi_main() -> Status {
         None => println!("  virtio-blk: no device / init failed"),
     }
 
+    // Install the virtio-blk device in the block module's singleton,
+    // then run boot-time mount (#337 BIOS parity). `mount` reads
+    // sector 0, validates the CRC, and either reports "fresh disk"
+    // (zero-filled) or "rehydrated" (valid checkpoint found). On the
+    // UEFI smoke's 1 MiB zero-filled disk.img it should report fresh
+    // disk; a subsequent `smoke_round_trip` then exercises the full
+    // write-read path end-to-end against virtio-blk MMIO.
+    if let Some(dev) = virtio_blk_dev {
+        crate::block::install(dev);
+        match crate::block_storage::mount() {
+            crate::block_storage::MountStatus::NoDevice =>
+                println!("  block:    no persistence device"),
+            crate::block_storage::MountStatus::FreshDisk =>
+                println!("  block:    fresh disk (no prior checkpoint)"),
+            crate::block_storage::MountStatus::Rehydrated => {
+                let prev = crate::block_storage::last_boot_count();
+                let bytes = crate::block_storage::last_state()
+                    .map(|v| v.len()).unwrap_or(0);
+                println!(
+                    "  block:    rehydrated checkpoint ({bytes} bytes, boot_count was {prev})"
+                );
+            }
+            crate::block_storage::MountStatus::Corrupted =>
+                println!("  block:    checkpoint CRC mismatch"),
+        }
+        if crate::block_storage::smoke_round_trip() {
+            let new_bc = crate::block_storage::last_boot_count();
+            println!(
+                "  block:    checkpoint round-trip OK (boot_count now {new_bc})"
+            );
+        } else {
+            println!("  block:    checkpoint round-trip FAILED");
+        }
+    }
+
     // Report GOP capture (the pre-EBS snapshot above). MMIO at
     // `gop_ptr..gop_ptr+gop_size` is driven by the GPU post-EBS,
     // so direct pixel writes are valid without BootServices.
