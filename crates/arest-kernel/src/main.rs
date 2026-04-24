@@ -121,17 +121,24 @@ mod system;
 //                  blocks on arch-neutral page-table abstraction.
 #[cfg(not(target_os = "uefi"))]
 mod allocator;
-#[cfg(not(target_os = "uefi"))]
+// `block` / `block_storage` / `net` / `virtio` are available on every
+// x86_64 target (BIOS + UEFI). They reach `x86_64::structures::paging::
+// Translate` via `arch::memory::with_page_table`, which both arms
+// publish with identical signatures -- see `arch::x86_64::memory` and
+// `arch::uefi::memory`. aarch64 UEFI still elides them (PCI port I/O
+// + x86_64 paging traits have no aarch64 analogue without a device-
+// tree walker).
+#[cfg(target_arch = "x86_64")]
 mod block;
-#[cfg(not(target_os = "uefi"))]
+#[cfg(target_arch = "x86_64")]
 mod block_storage;
-#[cfg(not(target_os = "uefi"))]
+#[cfg(target_arch = "x86_64")]
 mod net;
 #[cfg(not(target_os = "uefi"))]
 mod syscall;
 #[cfg(not(target_os = "uefi"))]
 mod userspace;
-#[cfg(not(target_os = "uefi"))]
+#[cfg(target_arch = "x86_64")]
 mod virtio;
 
 #[cfg(not(target_os = "uefi"))]
