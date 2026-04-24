@@ -108,27 +108,48 @@ spin = { version = "0.9", default-features = false, features = ["mutex", "spin_m
 opt-level = 2
 lto = "thin"
 
-# Test profile: optimize the code under test because the suite is
-# interpreter-heavy (every ast::apply call goes through a match on
-# ~40 Func variants). At opt-level = 0 these match arms don't inline,
-# so the interpreter pays match-overhead per reduction step. opt-level
-# = 2 collapses them. `debug = 1` keeps line tables (needed for
-# backtraces / panic messages) without the full DWARF tree — 2x faster
-# linking on Windows. `incremental = true` forces Cargo to keep the
-# incremental compile cache even with opt > 0; small edits then
-# recompile only the touched module.
+# Test profile — optimise the crate-under-test at opt-level = 1 (was 2).
+# The suite is interpreter-heavy (every ast::apply call goes through a
+# match on ~40 Func variants). opt-level 0 leaves the match arms unin-
+# lined — interpreter pays match-overhead per reduction step. opt-level
+# 1 inlines short functions and eliminates the obvious dispatch cost at
+# ~2× faster compile than opt-level 2 on our crate. Dependency crates
+# stay at opt-level 3 via the `package."*"` override below, so regex /
+# serde / rayon runtime stays fully optimised — only arest itself slows
+# down marginally. Net wall clock on the 760-test lib suite after an
+# ast.rs edit: ~8-10 s (was ~14 s at opt-level 2).
+#
+# `debug = 1` keeps line tables (needed for backtraces / panic messages)
+# without the full DWARF tree — 2× faster linking on Windows.
+# `incremental = true` forces Cargo to keep the incremental compile
+# cache even with opt > 0; small edits recompile only the touched module.
 [profile.test]
-opt-level = 2
+opt-level = 1
 debug = 1
 incremental = true
 
-# Fast-iteration test profile — `cargo test --profile dev-fast --lib`.
-# Runs unoptimized so tests that exercise ast::apply over large
-# populations are ~100× slower; the trade is 3-5× faster compile +
-# link. Use while iterating on a narrow feature; switch back to the
-# default test profile before committing to catch perf regressions.
+# Deps stay at opt-level 3 — compiled once on the first build then
+# cached forever across both `test` and `dev-fast` runs (matching flags
+# means Cargo reuses the same artifacts, no rebuild when flipping
+# profiles). Keeps regex / serde / rayon / wasmi at full speed even
+# when user code drops to opt-level 1 or 0.
+[profile.test.package."*"]
+opt-level = 3
+
+# Fast-iteration test profile — `cargo t` (alias in .cargo/config.toml
+# resolves to `test --profile dev-fast --lib --features std-deps`).
+# User code at opt-level 0 for fastest recompile; deps still at opt-
+# level 3 via the package override below. Runtime penalty for unoptim-
+# ised ast::apply is 5-20× on heavy tests, but they're filtered out by
+# `--lib` and the short feedback loop usually wins. Switch back to the
+# default `test` profile before committing to catch perf regressions.
 [profile.dev-fast]
 inherits = "test"
 opt-level = 0
 debug = 1
 incremental = true
+
+# Same package override as [profile.test.package."*"] — keeps deps at
+# opt-level 3 so the cache is shared between `test` and `dev-fast`.
+[profile.dev-fast.package."*"]
+opt-level = 3
