@@ -64,22 +64,12 @@ impl fmt::Write for LazyUart {
     }
 }
 
-/// Called by the `print!` / `println!` macros. Locks the serial
-/// port and writes the formatted string; panics are impossible
+/// Called by the `print!` / `println!` macros (declared in
+/// `arch/mod.rs` so the same macros work on both arches). Locks the
+/// serial port and writes the formatted string; panics are impossible
 /// because `fmt::Write` for LazyUart never fails.
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments<'_>) {
     use core::fmt::Write;
     let _ = SERIAL.lock().write_fmt(args);
-}
-
-#[macro_export]
-macro_rules! print {
-    ($($arg:tt)*) => ($crate::arch::_print(format_args!($($arg)*)));
-}
-
-#[macro_export]
-macro_rules! println {
-    () => ($crate::print!("\n"));
-    ($($arg:tt)*) => ($crate::print!("{}\n", format_args!($($arg)*)));
 }

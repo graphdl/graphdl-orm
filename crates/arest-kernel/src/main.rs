@@ -39,6 +39,13 @@ extern crate alloc;
 #[cfg(target_os = "uefi")]
 mod entry_uefi;
 
+// `arch` is shared between both entries (#344 step 3). On UEFI it
+// supplies `_print` via ConOut so the existing `println!` macros
+// work pre-ExitBootServices; on the BIOS path it carries the full
+// 16550 / GDT / IDT / paging surface. Step 4 grows the UEFI arm to
+// match once the kernel_run handoff lands.
+mod arch;
+
 // BIOS path — everything below here is the existing `bootloader_api`
 // entry plus the kernel modules it drives. Gated on
 // `target_os = "none"` (the `x86_64-unknown-none` target). X86-
@@ -49,8 +56,6 @@ mod entry_uefi;
 
 #[cfg(not(target_os = "uefi"))]
 mod allocator;
-#[cfg(not(target_os = "uefi"))]
-mod arch;
 #[cfg(not(target_os = "uefi"))]
 mod assets;
 #[cfg(not(target_os = "uefi"))]
