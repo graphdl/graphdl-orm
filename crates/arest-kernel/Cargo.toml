@@ -38,10 +38,6 @@ bench = false
 # macro / BootInfo struct — no code that touches the host OS. Works
 # on x86_64-unknown-none without any feature gymnastics.
 bootloader_api = "0.11"
-# 8250 / 16550 UART driver. Gives us a `SerialPort` struct with
-# `core::fmt::Write` implemented — that's what lets `write!` and
-# `writeln!` format directly into serial output.
-uart_16550 = "0.3"
 # Spin-based Mutex so SERIAL (the global SerialPort singleton) can
 # be locked from any context including the panic handler. spin::Mutex
 # never blocks the way std::sync::Mutex would; fine on bare metal.
@@ -53,19 +49,12 @@ spin = "0.9"
 # memory map handling lands (#180) this will switch to a dynamic
 # region picked from `BootInfo.memory_regions`.
 linked_list_allocator = "0.10"
-# Rust-osdev helpers for x86_64-specific structures — GDT, IDT, TSS,
-# page-table flags, privilege rings. Small, no-alloc, no-std. Only
-# pulls in the descriptor / interrupt plumbing; no scheduler or
-# driver stack.
-x86_64 = "0.15"
-# Legacy 8259 PIC driver. Needed to route hardware IRQs (keyboard,
-# timer) to IDT vectors — without PIC remap, the firmware-default
-# IRQ 0-7 collide with CPU exception vectors 8-15 and a timer tick
-# would fire the same vector as #DF.
-pic8259 = "0.11"
 # PS/2 keyboard decoder. Takes raw scancodes (set 1 by default on
 # QEMU) and emits typed `DecodedKey` events — lets us ignore every
-# detail of make/break codes and modifier tracking.
+# detail of make/break codes and modifier tracking. Pure protocol
+# code — compiles on aarch64 too (kept here unconditionally so the
+# BIOS x86_64 arm and a future aarch64 PS/2-over-USB decoder can
+# share the same crate).
 pc-keyboard = "0.7"
 # smoltcp — pure-Rust, no_std TCP/UDP/ICMP/DHCP/DNS stack (#261).
 # No C libs, no POSIX socket wrapper — just buffers, MAC/IP config,
@@ -111,6 +100,37 @@ arest = { path = "../arest", default-features = false, features = ["no_std"] }
 # that the BIOS path operates under, so wasmi ships as a
 # UEFI-target-only dep (below, under the target-specific block).
 
+# Rust-osdev helpers for x86_64-specific structures — GDT, IDT, TSS,
+# page-table flags, privilege rings. Small, no-alloc, no-std. Only
+# pulls in the descriptor / interrupt plumbing; no scheduler or
+# driver stack. The crate's `instructions` module is internally
+# gated on `target_arch = "x86_64"`, so it compiles on aarch64 with
+# that module absent — the shared kernel modules (`pci`, `repl`)
+# that reach `x86_64::instructions` are cfg-gated below so their
+# use sites don't trip on aarch64 UEFI builds.
+x86_64 = "0.15"
+
+# x86-arch-only crates (#344 cross-arch). These unconditionally
+# reach into x86 port I/O or the `x86_64` crate's `instructions`
+# module without gating, so the dep resolver refuses them on
+# aarch64 targets. Gating on `target_arch = "x86_64"` keeps them
+# available to both BIOS (x86_64-unknown-none) and UEFI x86_64
+# (x86_64-unknown-uefi) builds while excluding them from aarch64
+# builds entirely.
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+# 8250 / 16550 UART driver. Gives us a `SerialPort` struct with
+# `core::fmt::Write` implemented — that's what lets `write!` and
+# `writeln!` format directly into serial output. Uses x86 port I/O
+# (`in`/`out` instructions) so it's strictly x86-only — the aarch64
+# arm uses PL011 MMIO in `arch::aarch64::serial` instead.
+uart_16550 = "0.3"
+# Legacy 8259 PIC driver. Needed to route hardware IRQs (keyboard,
+# timer) to IDT vectors — without PIC remap, the firmware-default
+# IRQ 0-7 collide with CPU exception vectors 8-15 and a timer tick
+# would fire the same vector as #DF. Unconditionally imports
+# `x86_64::instructions::port::Port`, so truly x86-only.
+pic8259 = "0.11"
+
 # UEFI target (#344) — uefi-rs gives us an `#[entry]` macro, Boot
 # Services (serial, memory map, device discovery, framebuffer), and
 # a panic handler. Only compiled for `x86_64-unknown-uefi` /
@@ -118,20 +138,35 @@ arest = { path = "../arest", default-features = false, features = ["no_std"] }
 # keeps using `bootloader_api` unchanged. `panic_handler` + `logger`
 # features take the uefi-provided impls so we don't need an arch-
 # specific one for the scaffold.
-#
-# wasmi — step 4d wave 5 (#270/#271). UEFI-only because the BIOS
-# bootloader can't load a kernel image the wasmi runtime-including
-# binary produces (verified via `5e8a15e` revert). UEFI firmware has
-# no such size limit. `hash-collections` feature gives us
-# hashbrown-backed tables for wasm's type / function tables without
-# needing std. `no_std` default — we supply the `alloc` global.
 [target.'cfg(target_os = "uefi")'.dependencies]
 # Dropped `panic_handler` feature — uefi-rs's default panic handler
 # logs via `system_table.stderr()`, which is gone post-EBS. Our
-# own handler in `entry_uefi.rs` uses raw COM1 I/O so it prints
-# both pre- and post-EBS without depending on BootServices.
+# own handler in `entry_uefi.rs` uses raw COM1 I/O (x86_64 arm) or
+# PL011 MMIO (aarch64 arm) so it prints both pre- and post-EBS
+# without depending on BootServices.
 uefi = { version = "0.34", features = ["alloc", "logger"] }
+
+# x86_64-unknown-uefi specific deps (#344 cross-arch). wasmi was
+# added here as part of step 4d wave 5 (#270/#271) — the BIOS
+# bootloader can't load a kernel image the wasmi runtime-including
+# binary produces (verified via `5e8a15e` revert), and the aarch64
+# UEFI arm is scaffold-only this commit (no kernel_run yet, hence
+# no wasmi caller). `hash-collections` feature gives us
+# hashbrown-backed tables for wasm's type / function tables without
+# needing std. `no_std` default — we supply the `alloc` global.
+[target.'cfg(all(target_os = "uefi", target_arch = "x86_64"))'.dependencies]
 wasmi = { version = "0.50", default-features = false, features = ["hash-collections"] }
+
+# aarch64-unknown-uefi specific deps (#344 cross-arch scaffold). The
+# aarch64 UEFI arm today is compile-only: a banner via PL011 MMIO at
+# 0x0900_0000 and a `wfi` halt loop. All of that lives inside
+# `arch::aarch64` and `entry_uefi_aarch64`, which use `core::arch::asm!`
+# + `core::ptr::write_volatile` + the `uefi::prelude::*` Status /
+# entry macro — nothing beyond what the shared `uefi` dep above
+# supplies. The block is present (rather than elided) so a future
+# aarch64-only dep (GICv2 driver for IRQ follow-up, or a PL011 crate
+# if we drop the hand-rolled writer) has an obvious home.
+[target.'cfg(all(target_os = "uefi", target_arch = "aarch64"))'.dependencies]
 
 [profile.dev]
 panic = "abort"
