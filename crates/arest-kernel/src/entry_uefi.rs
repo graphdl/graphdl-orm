@@ -37,18 +37,49 @@
 
 #![cfg(target_os = "uefi")]
 
+use core::cell::UnsafeCell;
+use linked_list_allocator::LockedHeap;
 use uefi::prelude::*;
 use uefi::boot::MemoryType;
 
 use crate::println;
 
-// Global allocator — uefi-rs ships a small wrapper around
-// `BootServices::allocate_pool`. Required because the kernel crate
-// has `extern crate alloc;` at the top; without a global allocator
-// the UEFI bin won't link, and `arch::uefi::_print` needs `String`
-// allocation to format args before transcoding to UCS-2.
+// Global allocator. Uses a static .bss-backed `LockedHeap` rather
+// than `uefi::allocator::Allocator` so the heap SURVIVES
+// ExitBootServices — uefi-rs's allocator is backed by
+// `BootServices::allocate_pool`, which faults after EBS.
+//
+// The BIOS arm uses the same crate for the same reason (see
+// `allocator.rs`); this keeps the kernel's Box/Vec/String codepaths
+// identical on both boot targets.
+//
+// Size: 8 MiB is a conservative pick that matches the BIOS heap
+// (see `allocator.rs`'s HEAP_SIZE). UEFI firmware loaders typically
+// pre-allocate BSS when mapping the PE32+ image, so 8 MiB of kernel
+// BSS just reserves that many pages up-front. QEMU+OVMF with the
+// default 128 MiB guest accommodates this comfortably. The .bss
+// bytes themselves are zeroed by the firmware before _start runs,
+// so `LockedHeap::empty()` + a single init() call is enough.
+//
+// The init() call runs at the TOP of efi_main — before ANY
+// alloc-using code (println! transcodes args via a String on the
+// UEFI serial path). Must NOT move later without switching to a
+// crate that supports delayed init.
+const HEAP_SIZE: usize = 8 * 1024 * 1024;
+
+// SAFETY wrapper: static mut arrays aren't directly Sync-safe. The
+// heap is only touched via `ALLOCATOR.lock()` (single-CPU kernel,
+// no preemption), and the init() below happens before any concurrent
+// use. UnsafeCell documents the interior mutability to the borrow
+// checker without requiring `static mut`.
+#[repr(C, align(16))]
+struct HeapBytes(UnsafeCell<[u8; HEAP_SIZE]>);
+unsafe impl Sync for HeapBytes {}
+
+static HEAP: HeapBytes = HeapBytes(UnsafeCell::new([0u8; HEAP_SIZE]));
+
 #[global_allocator]
-static ALLOCATOR: uefi::allocator::Allocator = uefi::allocator::Allocator;
+static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
 /// UEFI entry point. `uefi-rs`'s `#[entry]` expands this into the
 /// PE32+ `_start` symbol the firmware invokes after loading the
@@ -76,6 +107,22 @@ static ALLOCATOR: uefi::allocator::Allocator = uefi::allocator::Allocator;
 ///      drop their `cfg(not(target_os = "uefi"))` gates.
 #[entry]
 fn efi_main() -> Status {
+    // Heap init MUST be the first thing — the global allocator is an
+    // empty LockedHeap; the first alloc call before init() would
+    // panic. Subsequent `println!` and any uefi-rs internal alloc
+    // work (transcoding format args to UCS-2, for example) all route
+    // through this heap.
+    //
+    // SAFETY: HEAP is a static, zero-initialized byte array. No code
+    // has run that could be holding a pointer into it yet — we're
+    // literally the first line of efi_main. The cast to *mut u8 is
+    // trivially safe on a `static HeapBytes` with `UnsafeCell`
+    // interior; single-threaded kernel means no racing initialisation.
+    unsafe {
+        let heap_start = HEAP.0.get() as *mut u8;
+        ALLOCATOR.lock().init(heap_start, HEAP_SIZE);
+    }
+
     crate::arch::init_console();
 
     // Pre-EBS SSE enable (step 4d prep). Does not depend on boot
