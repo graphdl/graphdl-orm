@@ -797,3 +797,256 @@ mod tests {
         }
     }
 }
+
+/// Per-kind `FolTerm` predicate builders for `compile.rs`.
+///
+/// Each function returns the pure FOL predicate a constraint kind's
+/// `compile_*_ast` function in `compile.rs` used to construct inline.
+/// Callers are responsible for lowering via `.to_func()` and wrapping
+/// the result in the violation-reporting pipeline (Filter / DistR /
+/// apply_to_all / make_violation — unchanged).
+///
+/// This is the reified parse-half of #357: Theorem 2's `parse: R → Φ`
+/// is now a named pure function per constraint kind, rather than
+/// inline `FolTerm::…` construction scattered across compile.rs.
+///
+/// Shape conventions (match the call sites in compile.rs):
+///   * Input to the predicate is typically `<fact, candidate>` with
+///     `Func::Selector(1)` reaching the current fact and `Selector(2)`
+///     reaching the candidate (or `all_facts`), unless otherwise noted.
+///   * Role indices are **1-indexed** (matching FORML 2 "role 1",
+///     "role 2" verbal convention and `FolTerm::FactRole` /
+///     `FolTerm::RoleVal`). Callers that hold a 0-indexed
+///     `role_index` from `SpanDef` convert with `ri + 1` at the call
+///     site.
+pub mod constraint {
+    use super::*;
+
+    // ── Ring helpers ───────────────────────────────────────────
+    //
+    // Used by the AS / SY / AT (reverse-pair + not-self) and
+    // IT / TR (chain + shortcut) ring constraints.
+
+    /// Ring "not self-referring": `role 1 of fact ≠ role 2 of fact`.
+    /// Shape: input is `<fact, …>`; `Selector(1)` reaches the fact.
+    pub fn ring_not_self() -> FolTerm {
+        FolTerm::Not(Box::new(FolTerm::Eq(
+            Box::new(FolTerm::FactRole { fact: Func::Selector(1), role: 1 }),
+            Box::new(FolTerm::FactRole { fact: Func::Selector(1), role: 2 }),
+        )))
+    }
+
+    /// Ring "reverse pair match": for a fact `<x, y>` at `Selector(1)`
+    /// and a candidate `<a, b>` at `Selector(2)`, returns true iff
+    /// `a = y ∧ b = x`.
+    pub fn ring_match_reversed() -> FolTerm {
+        let fact = Func::Selector(1);
+        let cand = Func::Selector(2);
+        FolTerm::And(vec![
+            FolTerm::Eq(
+                Box::new(FolTerm::FactRole { fact: cand.clone(), role: 1 }),
+                Box::new(FolTerm::FactRole { fact: fact.clone(), role: 2 }),
+            ),
+            FolTerm::Eq(
+                Box::new(FolTerm::FactRole { fact: cand,         role: 2 }),
+                Box::new(FolTerm::FactRole { fact,               role: 1 }),
+            ),
+        ])
+    }
+
+    /// Ring "transitive-chain pair": input shape `<f1, f2>`. True iff
+    /// `role 2 of f1 = role 1 of f2` (chainable) AND `role 1 of f1 ≠
+    /// role 2 of f2` (not a trivial self-loop). Used by IT / TR.
+    pub fn ring_is_chain() -> FolTerm {
+        let f1 = Func::Selector(1);
+        let f2 = Func::Selector(2);
+        FolTerm::And(vec![
+            FolTerm::Eq(
+                Box::new(FolTerm::FactRole { fact: f1.clone(), role: 2 }),
+                Box::new(FolTerm::FactRole { fact: f2.clone(), role: 1 }),
+            ),
+            FolTerm::Not(Box::new(FolTerm::Eq(
+                Box::new(FolTerm::FactRole { fact: f1, role: 1 }),
+                Box::new(FolTerm::FactRole { fact: f2, role: 2 }),
+            ))),
+        ])
+    }
+
+    /// Ring "shortcut match": input shape `<<f1, f2>, candidate>`.
+    /// True iff the candidate spans the same endpoints the chain does:
+    /// `role 1 of cand = role 1 of f1` AND `role 2 of cand = role 2 of f2`.
+    /// Used by IT (shortcut must NOT exist → violation) and TR
+    /// (shortcut MUST exist).
+    pub fn ring_shortcut_match() -> FolTerm {
+        let cand = Func::Selector(2);
+        // <f1, f2> is Selector(1). f1 = Sel(1).Sel(1); f2 = Sel(2).Sel(1).
+        let f1 = Func::compose(Func::Selector(1), Func::Selector(1));
+        let f2 = Func::compose(Func::Selector(2), Func::Selector(1));
+        FolTerm::And(vec![
+            FolTerm::Eq(
+                Box::new(FolTerm::FactRole { fact: cand.clone(), role: 1 }),
+                Box::new(FolTerm::FactRole { fact: f1,           role: 1 }),
+            ),
+            FolTerm::Eq(
+                Box::new(FolTerm::FactRole { fact: cand, role: 2 }),
+                Box::new(FolTerm::FactRole { fact: f2,   role: 2 }),
+            ),
+        ])
+    }
+
+    // ── Per-kind predicates ────────────────────────────────────
+
+    /// IR self-reference predicate: `role 1 of f = role 2 of f` for
+    /// the fact currently bound to variable `"f"`. Also used by RF to
+    /// filter the self-referencing facts out of the full fact set.
+    pub fn ir_self_ref() -> FolTerm {
+        FolTerm::Eq(
+            Box::new(FolTerm::RoleVal("f".into(), 1)),
+            Box::new(FolTerm::RoleVal("f".into(), 2)),
+        )
+    }
+
+    /// RF self-reference predicate. Identical to `ir_self_ref` — RF
+    /// and IR share the "role 1 = role 2" atom on the same variable
+    /// shape. Named separately so call sites read naturally and in
+    /// case future RF-specific shape adjustments diverge from IR.
+    pub fn rf_self_ref() -> FolTerm { ir_self_ref() }
+
+    /// UC duplicate-check predicate: `<fact, candidate>` such that
+    /// `role[scope] of fact = role[scope] of candidate ∧
+    ///  role[other] of fact ≠ role[other] of candidate`.
+    ///
+    /// `scope_idx_0` / `other_idx_0` are the caller's 0-indexed role
+    /// indices (as stored in `SpanDef`); this helper converts to the
+    /// 1-indexed `FactRole::role` convention internally.
+    pub fn uc_dup_check(scope_idx_0: usize, other_idx_0: usize) -> FolTerm {
+        let fact = Func::Selector(1);
+        let cand = Func::Selector(2);
+        FolTerm::And(vec![
+            FolTerm::Eq(
+                Box::new(FolTerm::FactRole { fact: fact.clone(), role: scope_idx_0 + 1 }),
+                Box::new(FolTerm::FactRole { fact: cand.clone(), role: scope_idx_0 + 1 }),
+            ),
+            FolTerm::Not(Box::new(FolTerm::Eq(
+                Box::new(FolTerm::FactRole { fact,               role: other_idx_0 + 1 }),
+                Box::new(FolTerm::FactRole { fact: cand,         role: other_idx_0 + 1 }),
+            ))),
+        ])
+    }
+
+    /// MC binding-match predicate: `<instance, <noun, val>>` such that
+    /// `noun (inner key) = noun_name literal ∧ val (inner value) = instance`.
+    ///
+    /// `Raw` wraps the key/val tuple-field accesses because
+    /// `binding` is a single `<key, val>` pair (not a fact's seq of
+    /// pairs), so `FactRole` does not apply — this is a legitimate
+    /// Raw residue documented in the #357 foundation notes.
+    pub fn mc_binding_match(noun_name: &str) -> FolTerm {
+        let binding_noun = Func::compose(Func::Selector(1), Func::Selector(2));
+        let binding_val  = Func::compose(Func::Selector(2), Func::Selector(2));
+        FolTerm::And(vec![
+            FolTerm::Eq(
+                Box::new(FolTerm::Raw(binding_noun)),
+                Box::new(FolTerm::Const(Object::atom(noun_name))),
+            ),
+            FolTerm::Eq(
+                Box::new(FolTerm::Raw(binding_val)),
+                Box::new(FolTerm::Raw(Func::Selector(1))),
+            ),
+        ])
+    }
+
+    /// Set-comparison binding-match predicate. Same atom shape as
+    /// `mc_binding_match` but named for the set-comparison call site.
+    pub fn set_comparison_binding_match(entity_name: &str) -> FolTerm {
+        mc_binding_match(entity_name)
+    }
+
+    /// FC same-scope predicate: `<fact, candidate>` such that
+    /// `role[scope] of fact = role[scope] of candidate`.
+    ///
+    /// `scope_idx_0` is 0-indexed; converted to 1-indexed inside.
+    pub fn fc_same_scope(scope_idx_0: usize) -> FolTerm {
+        FolTerm::Eq(
+            Box::new(FolTerm::FactRole { fact: Func::Selector(1), role: scope_idx_0 + 1 }),
+            Box::new(FolTerm::FactRole { fact: Func::Selector(2), role: scope_idx_0 + 1 }),
+        )
+    }
+
+    /// SS match predicate: `<a_fact, b_candidate>` such that every
+    /// common noun has equal value in a_fact and b_candidate. Each
+    /// pair `(ai, bi)` is 0-indexed (SpanDef convention); the helper
+    /// converts to 1-indexed `FactRole::role` internally.
+    ///
+    /// `FolTerm::And` handles the empty / single / N-ary cases
+    /// uniformly (empty And = True, single And passes through, N ≥ 2
+    /// becomes `Insert(And) ∘ Construction`).
+    pub fn ss_match_pred(common: &[(usize, usize)]) -> FolTerm {
+        let atoms: Vec<FolTerm> = common.iter().map(|&(ai, bi)| {
+            FolTerm::Eq(
+                Box::new(FolTerm::FactRole { fact: Func::Selector(1), role: ai + 1 }),
+                Box::new(FolTerm::FactRole { fact: Func::Selector(2), role: bi + 1 }),
+            )
+        }).collect();
+        FolTerm::And(atoms)
+    }
+
+    /// EQ build-match predicate: same atom shape as `ss_match_pred`,
+    /// but with an optional `swap` that flips left/right indices
+    /// (used when checking the B-not-in-A direction). Pairs are
+    /// 0-indexed.
+    pub fn eq_build_match(pairs: &[(usize, usize)], swap: bool) -> FolTerm {
+        let atoms: Vec<FolTerm> = pairs.iter().map(|&(ai, bi)| {
+            let (li, ri) = if swap { (bi, ai) } else { (ai, bi) };
+            FolTerm::Eq(
+                Box::new(FolTerm::FactRole { fact: Func::Selector(1), role: li + 1 }),
+                Box::new(FolTerm::FactRole { fact: Func::Selector(2), role: ri + 1 }),
+            )
+        }).collect();
+        FolTerm::And(atoms)
+    }
+
+    /// Explicit-derivation dedup-guard predicate: candidate's role
+    /// `ri` at `Selector(2)` equals the outer instance at `Selector(1)`.
+    /// `ri_0` is 0-indexed.
+    ///
+    /// The outer-instance `Raw(Selector(1))` is a legitimate residue:
+    /// `Selector(1)` here addresses the *outer* distributed-pair slot,
+    /// not "role 1 of the selected fact", so `FactRole` doesn't apply.
+    pub fn explicit_deriv_dedup(ri_0: usize) -> FolTerm {
+        FolTerm::Eq(
+            Box::new(FolTerm::Raw(Func::Selector(1))),
+            Box::new(FolTerm::FactRole { fact: Func::Selector(2), role: ri_0 + 1 }),
+        )
+    }
+
+    /// Join-derivation per-step predicate. Combines:
+    ///   * join-key equalities — one `FactRole = FactRole` per
+    ///     `(ref_fact, ref_role_0, j_role_0)` triple; role indices
+    ///     are 0-indexed.
+    ///   * match-pair atoms — pre-built `Func` atoms (usually
+    ///     `Contains[left_val, right_val]`) that don't fit FolTerm's
+    ///     existing atom set; wrapped in `FolTerm::Raw`.
+    ///
+    /// Returns `FolTerm::And` of all atoms (empty → True, singleton
+    /// passes through, N-ary uses `Insert(And) ∘ Construction`).
+    pub fn join_deriv_atoms(
+        join_key_specs: &[(Func, usize, usize)],
+        match_pair_raws: Vec<Func>,
+    ) -> FolTerm {
+        let mut atoms: Vec<FolTerm> = join_key_specs.iter().map(|(ref_fact, ref_role_0, j_role_0)| {
+            FolTerm::Eq(
+                Box::new(FolTerm::FactRole {
+                    fact: ref_fact.clone(),
+                    role: ref_role_0 + 1,
+                }),
+                Box::new(FolTerm::FactRole {
+                    fact: Func::Selector(2),
+                    role: j_role_0 + 1,
+                }),
+            )
+        }).collect();
+        atoms.extend(match_pair_raws.into_iter().map(FolTerm::Raw));
+        FolTerm::And(atoms)
+    }
+}
