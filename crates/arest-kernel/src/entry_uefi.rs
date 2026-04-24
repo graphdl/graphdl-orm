@@ -301,6 +301,28 @@ fn efi_main() -> Status {
         println!(
             "  gop:      {gop_w}x{gop_h} stride={gop_stride} fmt={gop_fmt} fb={gop_ptr:#018x}+{gop_size}"
         );
+
+        // Direct-MMIO write smoke. The captured pointer is the
+        // physical address of the firmware-mapped framebuffer; on
+        // QEMU+OVMF it stays writable post-EBS (the GPU keeps
+        // scanning the same region). Write a 4x1 pixel pattern of
+        // 0xDEADBEEF to the top-left, read it back, print the
+        // first pixel as hex. If MMIO is live AND writable AND
+        // readable, we get 0xDEADBEEF back — otherwise garbage
+        // (or fault).
+        //
+        // SAFETY: fb_ptr points at firmware-mapped MMIO that will
+        // remain valid for the rest of boot. Bgr 32bpp = 4 bytes
+        // per pixel; writing 4 * u32 stays inside the fb_size
+        // bound we captured earlier.
+        let fb = gop_ptr as *mut u32;
+        unsafe {
+            for i in 0..4 {
+                core::ptr::write_volatile(fb.add(i), 0xDEADBEEF);
+            }
+            let readback = core::ptr::read_volatile(fb);
+            println!("  gop-mmio: wrote 4 pixels, readback[0]={readback:#010x}");
+        }
     } else {
         println!("  gop:      not available (headless UEFI boot)");
     }
