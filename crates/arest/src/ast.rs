@@ -511,6 +511,27 @@ pub enum Func {
     /// Null test: null:x = T if x = φ, F otherwise
     NullTest,
 
+    /// Cell-name test (Backus §13.3.4 `cellname`): T if x is a cell
+    /// triple — a length-3 sequence whose first element is the atom
+    /// `"CELL"` (`CELL_TAG`). F otherwise.
+    ///
+    /// Backus's `cellname n` is the *parameterized* form that also
+    /// checks the cell's name; in AREST that decomposes cleanly:
+    /// ```text
+    /// cellname_n  ≡  And ∘ [
+    ///   CellNameTest,                       — structural check (this primitive)
+    ///   Eq ∘ [Selector(2), Constant(n̄)],   — name match
+    /// ]
+    /// ```
+    /// so this primitive is the structural half; the parameterized
+    /// half composes from existing primitives (#355).
+    ///
+    /// Closes the gap where the engine was reaching into Rust
+    /// (`items.len() == 3 && items[0].as_atom() == Some(CELL_TAG)`)
+    /// for what should be an FFP-expressible predicate. With this in
+    /// place, a Func-level cell walk is `Filter(CellNameTest)`.
+    CellNameTest,
+
     /// Equals: eq:<x, y> = T if x = y, F otherwise
     Eq,
 
@@ -1383,6 +1404,7 @@ fn variant_name(f: &Func) -> &'static str {
         Func::Tail => "Tail",
         Func::AtomTest => "AtomTest",
         Func::NullTest => "NullTest",
+        Func::CellNameTest => "CellNameTest",
         Func::Eq => "Eq",
         Func::Gt => "Gt",
         Func::Lt => "Lt",
@@ -1522,6 +1544,17 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
         Func::NullTest => {
             match x {
                 Object::Seq(items) if items.is_empty() => Object::t(),
+                _ => Object::f(),
+            }
+        }
+
+        Func::CellNameTest => {
+            // Backus §13.3.4 cellname (structural half): cell? = T iff x
+            // is `<CELL_TAG, name, contents>` — sequence of length 3
+            // whose first element is the atom "CELL".
+            match x.as_seq() {
+                Some(items) if items.len() == 3
+                    && items[0].as_atom() == Some(CELL_TAG) => Object::t(),
                 _ => Object::f(),
             }
         }
@@ -2819,6 +2852,7 @@ pub mod primitives {
     pub const GE: &str = ">=";
     pub const LE: &str = "<=";
     pub const NULL: &str = "0?";
+    pub const CELL_NAME_TEST: &str = "cn?";
     pub const REVERSE: &str = "<>";
     pub const COMPACT: &str = "ct";
     pub const DISTL: &str = "dl";
@@ -3274,6 +3308,7 @@ fn metacompose_atom(name: &str, d: &Object) -> Func {
         primitives::COMPACT => Func::Compact,
         primitives::LOWER => Func::Lower,
         primitives::NULL => Func::NullTest,
+        primitives::CELL_NAME_TEST => Func::CellNameTest,
         primitives::REVERSE => Func::Reverse,
         primitives::DISTL => Func::DistL,
         primitives::DISTR => Func::DistR,
@@ -3391,6 +3426,7 @@ pub fn func_to_object(func: &Func) -> Object {
         Func::Tail => Object::atom(primitives::TL),
         Func::AtomTest => Object::atom(primitives::ATOM),
         Func::NullTest => Object::atom(primitives::NULL),
+        Func::CellNameTest => Object::atom(primitives::CELL_NAME_TEST),
         Func::Eq => Object::atom(primitives::EQ),
         Func::Gt => Object::atom(primitives::GT),
         Func::Lt => Object::atom(primitives::LT),
@@ -3718,6 +3754,7 @@ impl fmt::Debug for Func {
             Func::Tail => write!(f, "tl"),
             Func::AtomTest => write!(f, "atom"),
             Func::NullTest => write!(f, "null"),
+            Func::CellNameTest => write!(f, "cell?"),
             Func::Eq => write!(f, "eq"),
             Func::Gt => write!(f, ">"),
             Func::Lt => write!(f, "<"),
@@ -4169,6 +4206,88 @@ mod tests {
     #[test]
     fn compact_on_atom_is_bottom() {
         assert_eq!(apply(&Func::Compact, &Object::atom("x"), &defs()), Object::Bottom);
+    }
+
+    // ── CellNameTest (#355) — Backus §13.3.4 cellname (structural).
+
+    #[test]
+    fn cell_name_test_matches_cell_triple() {
+        let c = cell("greeting", Object::atom("hello"));
+        assert_eq!(apply(&Func::CellNameTest, &c, &defs()), Object::t());
+    }
+
+    #[test]
+    fn cell_name_test_rejects_atom() {
+        assert_eq!(apply(&Func::CellNameTest, &Object::atom("x"), &defs()), Object::f());
+    }
+
+    #[test]
+    fn cell_name_test_rejects_two_element_seq() {
+        let s = Object::seq(vec![Object::atom(CELL_TAG), Object::atom("name-only")]);
+        assert_eq!(apply(&Func::CellNameTest, &s, &defs()), Object::f());
+    }
+
+    #[test]
+    fn cell_name_test_rejects_three_element_seq_without_cell_tag() {
+        let s = Object::seq(vec![
+            Object::atom("OTHER"),
+            Object::atom("name"),
+            Object::atom("contents"),
+        ]);
+        assert_eq!(apply(&Func::CellNameTest, &s, &defs()), Object::f());
+    }
+
+    #[test]
+    fn cell_name_test_rejects_phi() {
+        assert_eq!(apply(&Func::CellNameTest, &Object::phi(), &defs()), Object::f());
+    }
+
+    #[test]
+    fn cell_name_test_rejects_bottom() {
+        // ⊥ propagates through every primitive — apply(_, ⊥, _) = ⊥, not F.
+        assert_eq!(apply(&Func::CellNameTest, &Object::Bottom, &defs()), Object::Bottom);
+    }
+
+    #[test]
+    fn cell_name_test_round_trips_through_metacompose() {
+        // Pin the atom-name + metacompose round-trip so the FFP-object
+        // representation of CellNameTest stays stable across freeze/thaw.
+        // Func has no PartialEq; compare via a second func_to_object pass.
+        let f = Func::CellNameTest;
+        let obj = func_to_object(&f);
+        assert_eq!(obj, Object::atom(primitives::CELL_NAME_TEST));
+        let back = metacompose(&obj, &Object::phi());
+        assert_eq!(func_to_object(&back), obj);
+    }
+
+    #[test]
+    fn parameterized_cellname_n_composes_from_primitives() {
+        // Backus §13.3.4 `(cellname n)` = "is x a cell triple named n?"
+        // Backus's paper form uses nested Condition for short-circuit
+        // semantics: if x isn't a cell, return F without reaching for
+        // Sel(2):x (which would be ⊥ on an atom and would collapse an
+        // eager `And ∘ Construction([..])` form to ⊥ per §11.2.1's
+        // ⊥-preserving seq constructor).
+        //
+        //   (cellname n) ≡ CellNameTest → (Eq ∘ [Sel(2), n̄]) ; F̄
+        let probe = cell("greeting", Object::atom("hello"));
+        let other = cell("farewell", Object::atom("bye"));
+
+        let is_cell_named_greeting = Func::condition(
+            Func::CellNameTest,
+            Func::compose(
+                Func::Eq,
+                Func::construction(vec![
+                    Func::Selector(2),
+                    Func::constant(Object::atom("greeting")),
+                ]),
+            ),
+            Func::constant(Object::f()),
+        );
+
+        assert_eq!(apply(&is_cell_named_greeting, &probe, &defs()), Object::t());
+        assert_eq!(apply(&is_cell_named_greeting, &other, &defs()), Object::f());
+        assert_eq!(apply(&is_cell_named_greeting, &Object::atom("nope"), &defs()), Object::f());
     }
 
     #[test]
