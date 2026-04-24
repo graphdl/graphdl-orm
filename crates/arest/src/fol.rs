@@ -1,19 +1,16 @@
 // crates/arest/src/fol.rs
 //
 // First-Order Logic intermediate representation between parse (Φ
-// cells) and compile (Func trees). Foundation commit for #357 —
-// defines the `FolTerm` enum + `to_func` translator + basic tests.
-// No `compile.rs` call sites rewired yet; that lands in follow-up
-// commits where each `compile_<kind>_ast` function gets routed via
-// FolTerm instead of building Func directly.
+// cells) and compile (Func trees). The compile half of Theorem 2's
+// `parse: R → Φ` / `compile: Φ → O` pipeline. Closes #357.
 //
 // Why FolTerm exists:
 //
-// `compile.rs` has ~17 functions (compile_uniqueness_ast,
+// `compile.rs` had ~17 functions (compile_uniqueness_ast,
 // compile_ring_irreflexive_ast, compile_subset_ast, ...) each
 // hand-translating a constraint kind directly to Func. That's a
 // hand-rolled FOL→FFP compiler, distributed across 17 sites with
-// no shared algebra. Adding a new constraint kind means adding a
+// no shared algebra. Adding a new constraint kind meant adding a
 // 18th compile_*_ast function from scratch.
 //
 // FolTerm gives the compiler a single algebra to work in. Each
@@ -24,32 +21,52 @@
 // quantifier elimination) become single rewrites over FolTerm
 // instead of needing per-site changes.
 //
-// What's in this commit:
+// What shipped (compile half — #357 closed):
 //
 //   * `enum FolTerm` — variants for boolean combinators, FOL
-//     quantifiers, atomic predicates, terms, and an escape hatch
-//     (`Raw`) so callers can wrap an existing Func during gradual
-//     migration.
-//   * `FactSource` — what a quantifier ranges over (a single fact
-//     type or a subtype-union).
-//   * `to_func(self) -> Func` — lowers FolTerm to the existing
-//     ast::Func vocabulary. The translation is direct: each
-//     variant maps to the corresponding Func combinator. Quantifier
-//     translation uses Backus's `Insert` form (∀f. P(f) →
-//     `Insert(And) ∘ α(P)`); ∃ → `Insert(Or) ∘ α(P)`. Same shape
-//     `query.rs::build_predicate` already uses for N-ary AND.
-//   * Round-trip tests confirm common shapes (Eq, And, ForAll, …)
-//     produce a Func that evaluates correctly against an empty
-//     state.
+//     quantifiers, atomic predicates, terms, plus `FactRole` for
+//     "role N of the fact reached by accessor F" (the commonest
+//     shape in ring / UC / MC / FC / SS / EQ predicates) and
+//     `Raw` as a fall-through for arbitrary Func.
+//   * `FactSource::{Single, Union}` — what a quantifier ranges
+//     over. `Union` flattens via `Concat` (fixed from an initial
+//     `Compact` bug in 7d25dec).
+//   * `to_func(self) -> Func` lowering. Quantifier lowering uses
+//     Backus's Insert form (∀f.P(f) → Insert(And)∘α(P)) with an
+//     ApndL unit prepend so empty-source quantifiers reduce to
+//     the right boolean per FOL semantics.
+//   * 15 of 17 constraint / derivation compile sites rewired:
+//     IR, AS, SY, AT, IT, TR, RF, UC, MC, FC, SS, EQ, set_comparison
+//     (XO/XC/OR), explicit-derivation dedup, join-derivation
+//     join_pred. AC skipped (Platform("tc_cycles") primitive);
+//     VC skipped (requires Var scope resolution — open for a
+//     follow-up wave).
+//   * Raw-wrap reduction: 35 → 8 residue (77%). Remaining Raws
+//     are legitimate: 1 outer-instance accessor, 6 key/val tuple-
+//     field accesses in MC/set_comparison binding_match (not the
+//     `compose(role_value, accessor)` shape FactRole captures),
+//     1 Contains wrap in join derivation.
+//   * 18 unit tests covering truth values, boolean combinators,
+//     quantifiers (empty + populated), Lt/Gt/Le/Ge, Implies
+//     vacuous cases, Union multi-id flattening, FactRole across
+//     selector shapes, nested-quantifier #[ignore] stub
+//     documenting the Var scope-resolution follow-up, and an
+//     And/Or fold-identity property test.
 //
-// What this does NOT do (later commits):
+// What's deliberately NOT in #357's scope (separate future work):
 //
-//   * Rewire `compile_uniqueness_ast` / `compile_ring_*_ast` /
-//     `compile_subset_ast` etc. to build FolTerm and lower via
-//     `to_func`. That's the scoped work in #357 follow-ups.
-//   * Optimisation passes over FolTerm. Once enough call sites
-//     route through it, redundant-quantifier elimination becomes
-//     a single rewrite.
+//   * Parse half: `parse_forml2 → FolTerm` directly (today parse
+//     still produces ConstraintDef/DerivationRuleDef structs,
+//     which compile_*_ast then translates into FolTerm). The
+//     compile half's success validates the IR shape; the parse-
+//     side reshape would make Theorem 2's pipeline literal in
+//     code (R → Φ → O with Φ as FolTerm throughout).
+//   * `Var` scope resolution — today `Var(x) → Func::Id`, correct
+//     only for the innermost binding. Narrowed docstring
+//     documents the gap; nested-quantifier test is #[ignore]'d.
+//     Fix unlocks the VC rewire + cleaner ring/join shapes.
+//   * Optimisation passes over FolTerm (Backus §12 distributivity,
+//     redundant quantifier elimination).
 //   * Pretty-printing back to FORML 2 prose for verbalisation
 //     (#215 / Theorem 5). FolTerm is the natural shape for the
 //     verbaliser to read.
