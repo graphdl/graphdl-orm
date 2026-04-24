@@ -38,6 +38,7 @@
 #![cfg(target_os = "uefi")]
 
 use uefi::prelude::*;
+use uefi::boot::MemoryType;
 
 use crate::println;
 
@@ -52,25 +53,57 @@ static ALLOCATOR: uefi::allocator::Allocator = uefi::allocator::Allocator;
 /// UEFI entry point. `uefi-rs`'s `#[entry]` expands this into the
 /// PE32+ `_start` symbol the firmware invokes after loading the
 /// image.
+///
+/// Boot pipeline (#344 step 4 — partial):
+///   1. ConOut online (firmware-managed, init_console no-op on UEFI).
+///   2. Pre-EBS banner via `println!` → ConOut.
+///   3. `boot::exit_boot_services` — firmware tears down. After
+///      this, the system table is invalidated and `with_stdout`
+///      silently no-ops.
+///   4. `arch::switch_to_post_ebs_serial` flips `_print` onto the
+///      direct-I/O 16550 path. Same COM1 line QEMU's `-serial
+///      stdio` is wired to, so the banner survives the hand-off
+///      unbroken on the host terminal.
+///   5. Post-EBS banner via `println!` → 16550. Proves the cutover
+///      works end-to-end.
+///   6. Halt. Steps 4c-4f (UEFI memory map -> kernel_run handoff,
+///      arch facade matching the BIOS path) come in follow-up
+///      commits — the kernel body subsystems still have
+///      `cfg(not(target_os = "uefi"))` gates that need to drop one
+///      at a time.
 #[entry]
 fn efi_main() -> Status {
-    // ConOut is already configured by the firmware; init_console is
-    // a no-op on UEFI but kept as the named entry so step 4's shared
-    // kernel_run can call it target-agnostically.
     crate::arch::init_console();
 
     // ASCII hyphens — keeps the line printable on bare COM1, which
-    // most OVMF builds downcode UCS-2 → ASCII on. The kernel itself
+    // most OVMF builds downcode UCS-2 -> ASCII on. The kernel itself
     // happily transcodes BMP glyphs through ConOut, but the smoke
     // harness reads stdout via QEMU's `-serial stdio`, where the
     // round-trip survives only if the banner is ASCII.
     println!("AREST kernel - UEFI scaffold (#344)");
-    println!("  step 3 of 8: println! routed through arch::_print");
-    println!("  next:        ExitBootServices + kernel_run handoff");
+    println!("  step 4 of 8: ExitBootServices + post-EBS serial");
+    println!("  pre-EBS:  ConOut active (firmware-managed)");
 
-    // Scaffold halt. A real boot calls BootServices::exit_boot_services
-    // and jumps to kernel_run(BootInfo); until that lands, park here
-    // so the firmware doesn't fall through to "no image loaded."
+    // SAFETY: `boot::exit_boot_services` walks the current memory
+    // map, gets the firmware's signature lock, and tears down
+    // BootServices. The returned `MemoryMapOwned` is a stable copy
+    // of the map the firmware handed us — usable for page-table
+    // construction in step 4c. We drop it here because step 4b
+    // doesn't need it yet (no kernel_run call, no init_memory).
+    let _memory_map = unsafe { boot::exit_boot_services(MemoryType::LOADER_DATA) };
+
+    // Firmware ConOut is now invalid. Switch `_print` onto the
+    // direct-I/O 16550 path BEFORE the next println! so the
+    // banner doesn't disappear into a no-op.
+    crate::arch::switch_to_post_ebs_serial();
+
+    println!("  post-EBS: 16550 COM1 active (kernel-managed)");
+    println!("  next:        UEFI memory map -> kernel_run handoff");
+
+    // Scaffold halt. Real boot continues into init_gdt_and_interrupts,
+    // init_memory(memory_map), and kernel_run(phys_offset) — not yet
+    // wired because the kernel body subsystems (virtio / net / blk /
+    // repl) still have `cfg(not(target_os = "uefi"))` gates.
     loop {
         unsafe { core::arch::asm!("pause", options(nomem, nostack)); }
     }

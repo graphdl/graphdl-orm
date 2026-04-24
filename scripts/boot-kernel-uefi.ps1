@@ -82,17 +82,19 @@ if ($Smoke) {
             # Match against the most recent line the scaffold writes.
             # Once step 4 boots through `kernel_run`, swap the marker
             # for "int3 round-tripped" -- the BIOS smoke's same beacon.
-            if ($log -match "ExitBootServices \+ kernel_run handoff") { break }
+            if ($log -match "post-EBS: 16550 COM1 active") { break }
         }
         $log | Out-File -FilePath $logPath -Encoding utf8
 
-        # Step 3 banner phrases. Each line the entry writes is asserted
+        # Step 4 banner phrases. Each line the entry writes is asserted
         # individually so a partial-write regression is easy to spot.
-        # Step 4b will append the BIOS-path banner phrases here.
+        # The "post-EBS" line is the critical one — it proves the
+        # 16550 COM1 fall-back works after firmware ConOut is invalid.
         $expected = @(
             "AREST kernel - UEFI scaffold (#344)",
-            "step 3 of 8: println! routed through arch::_print",
-            "ExitBootServices + kernel_run handoff"
+            "step 4 of 8: ExitBootServices + post-EBS serial",
+            "pre-EBS:  ConOut active",
+            "post-EBS: 16550 COM1 active"
         )
         $missing = @()
         foreach ($phrase in $expected) {

@@ -29,7 +29,7 @@
 
 mod serial;
 
-pub use serial::_print;
+pub use serial::{_print, switch_to_post_ebs_serial};
 
 /// Initialise the architecture's console. Under UEFI the firmware has
 /// already configured ConOut before transferring control to our entry,
