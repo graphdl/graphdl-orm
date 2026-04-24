@@ -107,6 +107,13 @@ pub static BOOTLOADER_CONFIG: BootloaderConfig = {
 entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 
 /// Called by the bootloader the moment we land in 64-bit long mode.
+///
+/// Owns the BIOS-specific boot-info shape (`bootloader_api::BootInfo`)
+/// and the early-init sequence that needs it (allocator, console,
+/// GDT/IDT, page tables). Once `arch::init_memory` has produced a
+/// `phys_offset`, the rest of bring-up is arch-neutral and lives in
+/// [`kernel_run`] — the same function the UEFI path will call after
+/// step 4's ExitBootServices handoff.
 #[cfg(not(target_os = "uefi"))]
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     allocator::init();
@@ -127,6 +134,27 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
 
     let phys_offset = arch::init_memory(boot_info);
+    kernel_run(phys_offset)
+}
+
+/// Arch-neutral kernel bring-up. Runs after the entry path has
+/// brought up allocator, console, descriptor tables, and page
+/// tables, and supplied the bootloader-mapped physical-memory
+/// offset.
+///
+/// Today only the BIOS path (`kernel_main`) reaches it. The UEFI
+/// path (`entry_uefi.rs`) still parks in a pre-ExitBootServices halt
+/// loop after the banner — step 4 of #344 brings it through
+/// ExitBootServices into `arch::init_*` and then here, at which
+/// point a single `cargo build --target x86_64-unknown-uefi` boots
+/// over OVMF with the same banner the BIOS path produces.
+///
+/// The set of `cfg(not(target_os = "uefi"))` gates on `mod`
+/// declarations above is what currently constrains `kernel_run` to
+/// the BIOS build — every subsystem this function touches needs to
+/// compile on UEFI before the gate can drop.
+#[cfg(not(target_os = "uefi"))]
+fn kernel_run(phys_offset: u64) -> ! {
     virtio::init_offset(phys_offset);
     // virtio-net bring-up (#262). PCI scan first (banner-visible),
     // then construct the full VirtIONet driver, then wrap it in the
