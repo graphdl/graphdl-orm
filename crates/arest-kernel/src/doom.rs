@@ -305,11 +305,17 @@ pub trait DoomHost {
 ///
 /// The real impl is filled in incrementally alongside the
 /// doomgeneric-wasm module landing:
-///   * `wad_sizes` / `read_wads` — wire in the embedded `doom.wad`
-///     bytes once the WAD-load wave (#383) lands. Today the trait
-///     reports zero WADs so the guest falls through to its built-in
-///     shareware path (per doom_wasm.h "If numberOfWads remains 0,
-///     Doom loads shareware WAD").
+///   * `wad_sizes` / `read_wads` — live (#383). Feed the baked
+///     `DOOM_WAD` bytes (DOOM 1 Shareware v1.9 IWAD, sourced from
+///     the id Software 1993 shareware release and baked via
+///     build.rs -> `$OUT_DIR/doom_wad.rs`, re-exported through
+///     `crate::doom_wad::DOOM_WAD`) into the guest. When the WAD is
+///     absent (fresh clone that skipped the binary stage) the trait
+///     falls back to `(0, 0)`, which per doom_wasm.h "If
+///     numberOfWads remains 0, Doom loads shareware WAD" makes the
+///     guest use the copy embedded in its own rodata (jacobenget/
+///     doom.wasm v0.1.0 ships the Shareware WAD inline — see
+///     doom_assets/README.md's "WAD bundling" note).
 pub struct KernelDoomHost;
 
 impl KernelDoomHost {
@@ -344,26 +350,66 @@ impl DoomHost for KernelDoomHost {
     }
 
     fn wad_sizes(&mut self) -> (u32, u32) {
-        // TODO(#383): once the embedded `doom.wad` bytes are wired
-        // (Track C baked `doom_assets/doom.wasm`; the WAD-load wave
-        // is its sibling), return the actual `(num_wads, total_bytes)`
-        // pair so the guest can size its allocation. Today we report
-        // zero WADs, which per doom_wasm.h ("If numberOfWads remains
-        // 0, Doom loads shareware WAD") signals the guest to fall
-        // through to its built-in shareware path — a legible scaffold
-        // behavior that doesn't require the trampoline to ship real
-        // WAD bytes through guest memory yet.
-        (0, 0)
+        // #383. Report the baked `DOOM_WAD` (DOOM 1 Shareware v1.9
+        // IWAD, ~4 MiB) when build.rs managed to stage the binary,
+        // otherwise fall through to `(0, 0)` which — per doom_wasm.h
+        // "If numberOfWads remains 0, Doom loads shareware WAD" —
+        // tells the guest engine to use the WAD embedded in its own
+        // rodata (the jacobenget/doom.wasm binary carries a copy of
+        // the same Shareware WAD; see doom_assets/README.md for the
+        // internal-vs-external tradeoff).
+        //
+        // Contract per the trampoline in `bind_doom_imports`
+        // (verified against the `wadSizes` func_wrap above):
+        //   * tuple.0 = number of WADs (here: 1 for the single IWAD,
+        //                or 0 for the absent-binary fallback).
+        //   * tuple.1 = total bytes across all WADs (= DOOM_WAD.len()
+        //                because we only ship one WAD).
+        //
+        // `read_wads` below MUST be kept in sync with these numbers
+        // — the trampoline calls `wad_sizes` twice (once for the
+        // guest's `wadSizes` import, once to size the scratch buffers
+        // before `readWads`), so drift between the two calls would
+        // surface as the trampoline allocating the wrong length and
+        // either truncating the WAD or over-reading into garbage
+        // memory.
+        if crate::doom_wad::DOOM_WAD.is_empty() {
+            (0, 0)
+        } else {
+            (1, crate::doom_wad::DOOM_WAD.len() as u32)
+        }
     }
 
-    fn read_wads(&mut self, _wad_out: &mut [u8], _lengths_out: &mut [i32]) {
-        // TODO(#383): copy the embedded WAD blob and per-WAD length
-        // array into the host-side slices the trampoline allocated.
-        // While `wad_sizes` returns `(0, 0)` the guest does not call
-        // through here — the trampoline forms zero-length slices and
-        // this body is a no-op even if the guest does ignore the
-        // count and call anyway, so leaving it empty is safer than a
-        // panic that could fire mid-tic.
+    fn read_wads(&mut self, wad_out: &mut [u8], lengths_out: &mut [i32]) {
+        // #383. Copy the baked IWAD bytes into the trampoline-formed
+        // scratch buffer and record its length in the per-WAD length
+        // array. The trampoline sizes `wad_out` to the `total_bytes`
+        // returned by `wad_sizes` and `lengths_out` to `num_wads`;
+        // since we report (1, DOOM_WAD.len()) both slices should be
+        // exactly the right shape — a length mismatch here would
+        // indicate the trampoline's two `wad_sizes` calls disagreed,
+        // which shouldn't happen with a pure-query impl but is
+        // guarded against below via `copy_from_slice`'s length-check
+        // behaviour (panics loudly rather than writing garbage).
+        //
+        // When the WAD is absent (fresh clone) the slices are empty
+        // and both copies are no-ops — matching the `(0, 0)` return
+        // from `wad_sizes`.
+        let wad = crate::doom_wad::DOOM_WAD;
+        if wad.is_empty() {
+            return;
+        }
+        // Guard against a trampoline that under-allocated. In
+        // practice the two `wad_sizes` calls inside the trampoline
+        // return identical values, so these conditions shouldn't fire
+        // — but a silent truncate is worse than a visible drop for a
+        // pipeline bug, so bail cleanly rather than copying a
+        // partial WAD the guest would then misparse.
+        if wad_out.len() < wad.len() || lengths_out.is_empty() {
+            return;
+        }
+        wad_out[..wad.len()].copy_from_slice(wad);
+        lengths_out[0] = wad.len() as i32;
     }
 
     fn time_in_milliseconds(&mut self) -> i64 {
