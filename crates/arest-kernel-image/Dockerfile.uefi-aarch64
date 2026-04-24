@@ -99,37 +99,65 @@ RUN dd if=/dev/zero of=/uefi-disk.img bs=1M count=64 status=none \
     && mmd -i /uefi-disk.img ::/EFI/BOOT \
     && mcopy -i /uefi-disk.img /arest-kernel.efi ::/EFI/BOOT/BOOTAA64.EFI
 
+# Separate raw disk image for the virtio-blk persistence device
+# (#369 aarch64 parity with the x86_64 arm's #337 path). 1 MiB,
+# zero-initialised — treated as "no checkpoint yet" by the aarch64
+# kernel's boot-time rehydrate logic once that lands. For now the
+# aarch64 arm only reads capacity + readonly off the virtio-blk
+# driver (not the full mount / round-trip path — `block_storage` is
+# cfg-gated on x86_64), so a zero-filled image is all we need.
+RUN dd if=/dev/zero of=/disk.img bs=1M count=1 status=none
+
 # Boot under QEMU-aarch64 + AAVMF:
 #   -machine virt           aarch64 "virt" machine — QEMU's generic
-#                           virtual aarch64 SoC. PCIe root port +
-#                           virtio-mmio slots + PL011 UART at
+#                           virtual aarch64 SoC. virtio-mmio slots at
+#                           0x0a00_0000 + 0x200*n + PL011 UART at
 #                           0x0900_0000 (where `arch::aarch64::raw_puts`
 #                           writes).
 #   -cpu cortex-a57         ARMv8-A reference core. Modest but
 #                           sufficient for UEFI + kernel bring-up.
-#   -m 256M                 Guest RAM — more than enough for a
-#                           banner-only scaffold, matches the
-#                           pattern the x86_64 smoke will need as it
-#                           grows.
+#   -m 256M                 Guest RAM.
 #   -bios ...AAVMF_CODE.fd  Combined AAVMF code+vars. varstore
 #                           persistence irrelevant for smokes.
-#   -drive ...              ESP as a VirtIO block device. AAVMF
-#                           probes for `EFI/BOOT/BOOTAA64.EFI` and
-#                           loads it.
+#   -drive ...if=virtio     ESP as a virtio-blk device. AAVMF probes
+#                           for `EFI/BOOT/BOOTAA64.EFI` and loads it.
+#                           (This uses the BOOT virtio slot; the #369
+#                           data virtio-blk-device below is a
+#                           separate slot.)
+#   -netdev user,...        SLiRP user-mode NAT, no host-port
+#                           forwards for now (the aarch64 arm has no
+#                           HTTP listener on this boot).
+#   -device virtio-net-device,netdev=net0
+#                           virtio-net attached via MMIO (not PCI).
+#                           QEMU aarch64 virt's default transport for
+#                           `-device virtio-*-device` is MMIO — the
+#                           x86_64 `virtio-net-pci` alias is NOT a
+#                           drop-in, our scanner walks MMIO slots
+#                           only.
+#   -drive ...id=disk0      raw image for the #369 virtio-blk data
+#                           device. Independent from the ESP above.
+#   -device virtio-blk-device,drive=disk0
+#                           virtio-blk attached via MMIO. QEMU picks
+#                           the next free slot after the ESP device
+#                           (usually slot 16 for net, 15 for the data
+#                           blk, but the exact indices depend on
+#                           QEMU's internal allocator).
 #   -serial stdio           PL011 output to QEMU stdout. Our
 #                           `arch::aarch64::raw_puts` writes MMIO
 #                           directly to 0x0900_0000 = PL011 UARTDR,
 #                           which QEMU wires to `-serial stdio`.
 #   -display none           headless.
 #   -no-reboot / -no-shutdown  exit on fault rather than loop.
-#   -nographic variants are avoided — they multiplex COM1 onto stdio
-#   in a way that collides with `-serial stdio` on some QEMU builds.
 CMD ["qemu-system-aarch64", \
      "-machine", "virt", \
      "-cpu", "cortex-a57", \
      "-m", "256M", \
      "-bios", "/usr/share/AAVMF/AAVMF_CODE.fd", \
      "-drive", "format=raw,file=/uefi-disk.img,if=virtio", \
+     "-netdev", "user,id=net0", \
+     "-device", "virtio-net-device,netdev=net0", \
+     "-drive", "file=/disk.img,format=raw,if=none,id=disk0", \
+     "-device", "virtio-blk-device,drive=disk0", \
      "-serial", "stdio", \
      "-display", "none", \
      "-no-reboot", "-no-shutdown"]
