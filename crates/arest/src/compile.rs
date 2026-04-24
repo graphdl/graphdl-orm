@@ -3908,12 +3908,21 @@ fn compile_ring_reflexive_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
         .unwrap_or_default();
 
     // self_refs: instances that DO reference themselves in the ring facts.
-    // Filter(eq . [role(0), role(1)]) : facts -> self-referencing facts
-    // alpha(role(0)) -> just the values
+    // Filter(role 1 = role 2) : facts -> self-referencing facts; then α(role(0))
+    // projects out the entity id. Predicate routed through FolTerm (#357) —
+    // same FOL atom as compile_ring_irreflexive_ast's is_self_ref.
+    let is_self_ref = {
+        use crate::fol::FolTerm;
+        FolTerm::Eq(
+            Box::new(FolTerm::RoleVal("f".into(), 1)),
+            Box::new(FolTerm::RoleVal("f".into(), 2)),
+        )
+        .to_func()
+    };
     let self_refs = Func::compose(
         Func::apply_to_all(role_value(0)),
         Func::compose(
-            Func::filter(Func::compose(Func::Eq, Func::construction(vec![role_value(0), role_value(1)]))),
+            Func::filter(is_self_ref),
             facts,
         ),
     );
