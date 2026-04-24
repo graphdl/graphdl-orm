@@ -95,8 +95,15 @@ pub enum Error {
     /// invocation time.
     StateTooLarge,
     /// Checkpoint called before a successful mount. Protects against
-    /// writing a header to an uninitialized mount.
+    /// writing a header to an uninitialized mount. Also surfaced from
+    /// `reserve_region` when no virtio-blk device is attached — callers
+    /// get a hard error rather than a silent-drop handle.
     NotMounted,
+    /// A `RegionHandle` operation addressed a sector outside the
+    /// reserved range, or was passed a buffer whose length is not a
+    /// whole multiple of `BLOCK_SECTOR_SIZE`. Callers that want
+    /// variable-length payloads layer framing on top of the region.
+    OutOfRange,
 }
 
 // ── Mount state ────────────────────────────────────────────────────
@@ -344,6 +351,173 @@ pub fn mark_clean_shutdown() -> Result<(), Error> {
     block::write_sector(0, &sector0).map_err(|_| Error::Io)?;
     block::flush().map_err(|_| Error::Io)?;
     Ok(())
+}
+
+// ── Reserved sub-regions ───────────────────────────────────────────
+//
+// `reserve_region` carves a contiguous sector range out of the
+// virtio-blk disk and hands back a `RegionHandle` with its own
+// sector-oriented read/write/flush verbs. It exists so persistence
+// clients other than the #337 kernel checkpoint (Doom saves #375,
+// future config storage, log rotation, etc.) can live on the same
+// disk without stepping on the checkpoint header/body.
+//
+// Footprint of the existing checkpoint (callers must avoid this
+// window when choosing a `base_sector`):
+//
+//   * Sector 0          — checkpoint header (`AREST-K1` magic + CRC).
+//   * Sectors 1..=N     — checkpoint state body, where `N` is bounded
+//                         by `block::capacity_sectors() - 1`.
+//
+// The checkpoint body grows up to the full disk minus one sector
+// (see `checkpoint()` above), so a shared disk layout MUST either
+// cap the checkpoint size (the kernel's state blob is KB-scale today,
+// comfortably inside a few hundred sectors) or pick a disk size
+// generous enough that high-sector regions don't collide. As a rule
+// of thumb Doom and other callers should base their regions well
+// above the checkpoint's practical upper bound — e.g. start at
+// sector 1024 on the ≥8 MiB disks the harness configures, which
+// leaves 512 KiB for checkpoint growth.
+//
+// There is no on-disk header or CRC at the `RegionHandle` layer.
+// Clients that want framing/versioning/integrity layer it themselves
+// (Doom's save-file format already carries its own header).
+
+/// Carve a reserved sub-range of the virtio-blk disk. Returns an
+/// owning handle that routes all subsequent I/O through the block
+/// layer with an offset applied. Collisions with the checkpoint
+/// region (sector 0 + body) are the caller's responsibility — see the
+/// module-level footprint note above.
+///
+/// Fails with:
+///   * `Error::NotMounted` — no virtio-blk device installed, so any
+///     write would be silently dropped. We surface the absence up
+///     front rather than handing back a stub handle.
+///   * `Error::OutOfRange` — the requested `[base, base+count)` range
+///     exceeds the disk capacity, or `sector_count == 0`.
+///
+/// Zero capacity is rejected because the block layer is wedged in
+/// that state (a zero-capacity disk fails the first `read_sector`
+/// anyway); callers get the cleaner error shape from here.
+#[allow(dead_code)]
+pub fn reserve_region(base_sector: u64, sector_count: u64) -> Result<RegionHandle, Error> {
+    if !block::available() {
+        return Err(Error::NotMounted);
+    }
+    if sector_count == 0 {
+        return Err(Error::OutOfRange);
+    }
+    let end = base_sector
+        .checked_add(sector_count)
+        .ok_or(Error::OutOfRange)?;
+    let capacity = block::capacity_sectors();
+    if end > capacity {
+        return Err(Error::OutOfRange);
+    }
+    Ok(RegionHandle { base_sector, sector_count })
+}
+
+/// Owning handle over a reserved sector range of the virtio-blk
+/// disk. Instances are small (two `u64`s) and freely copyable — the
+/// block device itself lives behind `block::DEVICE` globally, so a
+/// `RegionHandle` doesn't borrow it and has no lifetime. Dropping a
+/// handle does nothing; two handles over overlapping ranges both see
+/// the same on-disk bytes, which is by design (Doom's save-slot code
+/// happily drops a handle mid-boot and reconstructs a fresh one from
+/// (base, count) on the next save).
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+pub struct RegionHandle {
+    base_sector: u64,
+    sector_count: u64,
+}
+
+#[allow(dead_code)]
+impl RegionHandle {
+    /// Base sector on the underlying device. Primarily useful for
+    /// logging + tests; production callers should prefer `read` /
+    /// `write`, which apply the offset for them.
+    pub fn base_sector(&self) -> u64 {
+        self.base_sector
+    }
+
+    /// Size of the reserved range in 512-byte sectors.
+    pub fn sector_count(&self) -> u64 {
+        self.sector_count
+    }
+
+    /// Size of the reserved range in bytes. `sector_count *
+    /// BLOCK_SECTOR_SIZE`, pre-computed for convenience.
+    pub fn len_bytes(&self) -> u64 {
+        self.sector_count * BLOCK_SECTOR_SIZE as u64
+    }
+
+    /// Read `buf.len() / BLOCK_SECTOR_SIZE` sectors starting at
+    /// `offset_sector` within the region into `buf`. `buf.len()` must
+    /// be a whole multiple of `BLOCK_SECTOR_SIZE` and the read must
+    /// stay inside the reserved range.
+    pub fn read(&self, offset_sector: u64, buf: &mut [u8]) -> Result<(), Error> {
+        let n_sectors = self.check_range(offset_sector, buf.len())?;
+        for s in 0..n_sectors {
+            let start = (s as usize) * BLOCK_SECTOR_SIZE;
+            let end = start + BLOCK_SECTOR_SIZE;
+            block::read_sector(
+                self.base_sector + offset_sector + s,
+                &mut buf[start..end],
+            )
+            .map_err(|_| Error::Io)?;
+        }
+        Ok(())
+    }
+
+    /// Write `data.len() / BLOCK_SECTOR_SIZE` sectors starting at
+    /// `offset_sector` within the region from `data`. Same length /
+    /// range rules as `read`. Callers that need durability must call
+    /// `flush` afterwards.
+    pub fn write(&self, offset_sector: u64, data: &[u8]) -> Result<(), Error> {
+        let n_sectors = self.check_range(offset_sector, data.len())?;
+        for s in 0..n_sectors {
+            let start = (s as usize) * BLOCK_SECTOR_SIZE;
+            let end = start + BLOCK_SECTOR_SIZE;
+            block::write_sector(
+                self.base_sector + offset_sector + s,
+                &data[start..end],
+            )
+            .map_err(|_| Error::Io)?;
+        }
+        Ok(())
+    }
+
+    /// Flush pending writes to durable storage. Forwards straight to
+    /// `block::flush` — the virtio-blk driver has no concept of
+    /// per-region flush, so this is a whole-device fence. Cheap but
+    /// not free; batch writes and call once at the end.
+    pub fn flush(&self) -> Result<(), Error> {
+        block::flush().map_err(|_| Error::Io)
+    }
+
+    /// Shared range + multiple-of-sector check for read/write. On
+    /// success returns the number of sectors the operation will
+    /// touch.
+    fn check_range(&self, offset_sector: u64, byte_len: usize) -> Result<u64, Error> {
+        if byte_len == 0 {
+            // Zero-length I/O is a no-op; allow it so callers can
+            // pass empty slices for "flush only" semantics without
+            // special-casing.
+            return Ok(0);
+        }
+        if byte_len % BLOCK_SECTOR_SIZE != 0 {
+            return Err(Error::OutOfRange);
+        }
+        let n_sectors = (byte_len / BLOCK_SECTOR_SIZE) as u64;
+        let end = offset_sector
+            .checked_add(n_sectors)
+            .ok_or(Error::OutOfRange)?;
+        if end > self.sector_count {
+            return Err(Error::OutOfRange);
+        }
+        Ok(n_sectors)
+    }
 }
 
 // ── CRC-32/IEEE ────────────────────────────────────────────────────
