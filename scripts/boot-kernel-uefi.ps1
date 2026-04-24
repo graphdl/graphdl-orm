@@ -101,7 +101,8 @@ if ($Smoke) {
             "SSE enabled",
             "post-EBS: 16550 COM1 active",
             "frames usable",
-            "post-EBS heap live (sum 0..16 = 120)"
+            "post-EBS heap live (sum 0..16 = 120)",
+            "system::init() completed (arest engine live on UEFI)"
         )
         $missing = @()
         foreach ($phrase in $expected) {
