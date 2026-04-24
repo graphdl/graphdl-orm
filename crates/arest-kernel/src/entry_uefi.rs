@@ -324,6 +324,40 @@ fn efi_main() -> Status {
         },
     );
 
+    // Actually drive the virtio devices the PCI walker found. Both
+    // `try_init_*` functions return None when no device is present
+    // (they internally repeat the PCI scan), so this block is safe
+    // even on the -device-less historical path. When virtio-net is
+    // present we read and report the MAC address; when virtio-blk
+    // is present we report capacity + read-only flag. These are the
+    // same probes the BIOS `kernel_run` does for its boot banner,
+    // now running on UEFI x86_64 thanks to the DMA-pool carve
+    // (ed869c4) plus the block/net/virtio un-gate (ed869c4).
+    let virtio_net_dev = crate::virtio::try_init_virtio_net();
+    let virtio_net_mac = virtio_net_dev.as_ref().map(|d| d.mac_address());
+    match &virtio_net_mac {
+        Some(m) => println!(
+            "  virtio-net: driver online, MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            m[0], m[1], m[2], m[3], m[4], m[5],
+        ),
+        None => println!("  virtio-net: no device / init failed"),
+    }
+
+    let virtio_blk_dev = crate::virtio::try_init_virtio_blk();
+    match &virtio_blk_dev {
+        Some(d) => {
+            let sectors = d.capacity();
+            let ro = d.readonly();
+            let cap_kib =
+                (sectors * (crate::block::BLOCK_SECTOR_SIZE as u64)) / 1024;
+            let mode = if ro { "read-only" } else { "read-write" };
+            println!(
+                "  virtio-blk: driver online, {sectors} sectors ({cap_kib} KiB), {mode}"
+            );
+        }
+        None => println!("  virtio-blk: no device / init failed"),
+    }
+
     // Report GOP capture (the pre-EBS snapshot above). MMIO at
     // `gop_ptr..gop_ptr+gop_size` is driven by the GPU post-EBS,
     // so direct pixel writes are valid without BootServices.
