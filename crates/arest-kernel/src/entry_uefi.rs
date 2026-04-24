@@ -200,6 +200,46 @@ fn efi_main() -> Status {
     println!("  step 4 of 8: ExitBootServices + post-EBS serial");
     println!("  pre-EBS:  ConOut active (firmware-managed), SSE enabled");
 
+    // GOP framebuffer capture (#270/#271 prep, 57efd07 diagnosis).
+    // The earlier full-GOP attempt (reverted) hung the kernel post-
+    // EBS — narrowed to the ScopedProtocol's Drop (which calls
+    // BootServices::close_protocol). This version captures the
+    // mode info + framebuffer pointer/size, then `mem::forget`s the
+    // ScopedProtocol so Drop does not run. We leak a protocol lock
+    // that firmware tears down at ExitBootServices anyway.
+    let (gop_w, gop_h, gop_stride, gop_fmt_idx, gop_ptr, gop_size) =
+        match uefi::boot::get_handle_for_protocol::<
+            uefi::proto::console::gop::GraphicsOutput,
+        >() {
+            Ok(handle) => {
+                match uefi::boot::open_protocol_exclusive::<
+                    uefi::proto::console::gop::GraphicsOutput,
+                >(handle) {
+                    Ok(mut gop) => {
+                        let info = gop.current_mode_info();
+                        let (w, h) = info.resolution();
+                        let stride = info.stride();
+                        let fmt_idx = match info.pixel_format() {
+                            uefi::proto::console::gop::PixelFormat::Rgb     => 0usize,
+                            uefi::proto::console::gop::PixelFormat::Bgr     => 1,
+                            uefi::proto::console::gop::PixelFormat::Bitmask => 2,
+                            uefi::proto::console::gop::PixelFormat::BltOnly => 3,
+                        };
+                        let mut fb = gop.frame_buffer();
+                        let ptr = fb.as_mut_ptr() as usize;
+                        let size = fb.size();
+                        drop(fb);
+                        // SKIP Drop — forget leaks the ScopedProtocol
+                        // rather than running its close_protocol path.
+                        core::mem::forget(gop);
+                        (w, h, stride, fmt_idx, ptr, size)
+                    }
+                    Err(_) => (0, 0, 0, 9, 0, 0),
+                }
+            }
+            Err(_) => (0, 0, 0, 9, 0, 0),
+        };
+
     // GOP locate diagnostic — narrow-scope test to see if the
     // MERE presence of a GOP protocol lookup affects the post-
     // EBS memory map. Uses `get_handle_for_protocol` only (no
@@ -246,6 +286,24 @@ fn efi_main() -> Status {
     println!(
         "  mem:      {frame_count} frames usable ({usable_mib} MiB) (UEFI memory map)"
     );
+
+    // Report GOP capture (the pre-EBS snapshot above). MMIO at
+    // `gop_ptr..gop_ptr+gop_size` is driven by the GPU post-EBS,
+    // so direct pixel writes are valid without BootServices.
+    let gop_fmt = match gop_fmt_idx {
+        0 => "Rgb",
+        1 => "Bgr",
+        2 => "Bitmask",
+        3 => "BltOnly",
+        _ => "none",
+    };
+    if gop_ptr != 0 {
+        println!(
+            "  gop:      {gop_w}x{gop_h} stride={gop_stride} fmt={gop_fmt} fb={gop_ptr:#018x}+{gop_size}"
+        );
+    } else {
+        println!("  gop:      not available (headless UEFI boot)");
+    }
 
     // Post-EBS heap smoke (step 4d wave 3, 5b74f2a). `uefi::allocator`
     // would fault here because BootServices is gone; our static-BSS
