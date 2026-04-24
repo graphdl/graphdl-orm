@@ -2876,10 +2876,17 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
         let per_instance = match &guard {
             Some((_ft, ri)) => {
                 let ri = *ri;
-                let match_pred = Func::compose(Func::Eq, Func::construction(vec![
-                    Func::Selector(1),
-                    Func::compose(role_value(ri), Func::Selector(2)),
-                ]));
+                // Dedup guard: candidate's role[ri] == the outer
+                // instance value. Routed through FolTerm (#357).
+                let match_pred = {
+                    use crate::fol::FolTerm;
+                    let candidate_role = Func::compose(role_value(ri), Func::Selector(2));
+                    FolTerm::Eq(
+                        Box::new(FolTerm::Raw(Func::Selector(1))),
+                        Box::new(FolTerm::Raw(candidate_role)),
+                    )
+                    .to_func()
+                };
                 let not_participates = Func::compose(
                     Func::NullTest,
                     Func::compose(Func::filter(match_pred), Func::DistL),
@@ -3201,19 +3208,28 @@ fn compile_join_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Compil
     let current = (1..n).fold(ft0, |current, j| {
         let ft_j = fact_extractors[j].clone();
 
-        // Î±(key â†’ eq_condition) : join_keys â€” build join predicates
-        let mut join_conds: Vec<Func> = join_keys.iter().filter_map(|key| {
+        use crate::fol::FolTerm;
+
+        // Î±(key â†’ eq_condition) : join_keys â€” one FolTerm::Eq per
+        // join key; combined via FolTerm::And below so the empty /
+        // single / N-ary cases collapse uniformly.
+        let mut join_atoms: Vec<FolTerm> = join_keys.iter().filter_map(|key| {
             let j_role = find_role(j, key)?;
             let ref_ft = (0..j).find(|&fi| find_role(fi, key).is_some())?;
             let ref_role = find_role(ref_ft, key)?;
             let ref_val = Func::compose(role_value(ref_role),
                 Func::compose(access_fact(ref_ft, j), Func::Selector(1)));
             let new_val = Func::compose(role_value(j_role), Func::Selector(2));
-            Some(Func::compose(Func::Eq, Func::construction(vec![ref_val, new_val])))
+            Some(FolTerm::Eq(
+                Box::new(FolTerm::Raw(ref_val)),
+                Box::new(FolTerm::Raw(new_val)),
+            ))
         }).collect();
 
-        // Î±(match_pair â†’ contains_condition) : match_pairs
-        join_conds.extend(match_pairs.iter().filter_map(|(left_noun, right_noun)| {
+        // Î±(match_pair â†’ contains_condition) : match_pairs â€”
+        // Contains isn't a FolTerm atom (yet); Raw-wrap each atom
+        // so the combining conjunction still goes through FolTerm.
+        join_atoms.extend(match_pairs.iter().filter_map(|(left_noun, right_noun)| {
             let left_ft = (0..=j).find(|&fi| find_role(fi, left_noun).is_some())?;
             let right_ft = (0..=j).find(|&fi| find_role(fi, right_noun).is_some())?;
             (left_ft == j || right_ft == j).then_some(())?;
@@ -3224,15 +3240,14 @@ fn compile_join_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Compil
             } else {
                 Func::compose(role_value(ri), Func::compose(access_fact(ft, j), Func::Selector(1)))
             };
-            Some(Func::compose(Func::Contains, Func::construction(vec![val(left_ft, left_role), val(right_ft, right_role)])))
+            Some(FolTerm::Raw(Func::compose(Func::Contains, Func::construction(vec![
+                val(left_ft, left_role), val(right_ft, right_role),
+            ]))))
         }));
 
-        let join_pred = match join_conds.len() {
-            0 => Func::constant(Object::t()),
-            1 => join_conds.into_iter().next().unwrap(),
-            _ => join_conds.into_iter().reduce(|a, b|
-                Func::compose(Func::And, Func::construction(vec![a, b]))).unwrap(),
-        };
+        // FolTerm::And handles the empty / single / N-ary cases
+        // uniformly â€” replaces the manual reduce() boilerplate.
+        let join_pred = FolTerm::And(join_atoms).to_func();
 
         // Pipeline: Filter(join_pred) . Concat . Î±(DistL) . DistR . [current, ft_j]
         Func::compose(Func::filter(join_pred), Func::compose(Func::Concat,
