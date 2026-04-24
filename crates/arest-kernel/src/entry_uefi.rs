@@ -66,11 +66,14 @@ static ALLOCATOR: uefi::allocator::Allocator = uefi::allocator::Allocator;
 ///      unbroken on the host terminal.
 ///   5. Post-EBS banner via `println!` → 16550. Proves the cutover
 ///      works end-to-end.
-///   6. Halt. Steps 4c-4f (UEFI memory map -> kernel_run handoff,
-///      arch facade matching the BIOS path) come in follow-up
-///      commits — the kernel body subsystems still have
-///      `cfg(not(target_os = "uefi"))` gates that need to drop one
-///      at a time.
+///   6. `arch::init_memory(memory_map)` (step 4c) — consume the
+///      firmware memory map, install the OffsetPageTable + frame
+///      allocator singletons behind the same accessor surface the
+///      BIOS arm publishes, and print a post-init banner proving
+///      the page-table singleton is live.
+///   7. Halt. Step 4d (kernel_run handoff) wires the arch-neutral
+///      kernel body once its subsystems (virtio / net / blk / repl)
+///      drop their `cfg(not(target_os = "uefi"))` gates.
 #[entry]
 fn efi_main() -> Status {
     crate::arch::init_console();
@@ -87,10 +90,11 @@ fn efi_main() -> Status {
     // SAFETY: `boot::exit_boot_services` walks the current memory
     // map, gets the firmware's signature lock, and tears down
     // BootServices. The returned `MemoryMapOwned` is a stable copy
-    // of the map the firmware handed us — usable for page-table
-    // construction in step 4c. We drop it here because step 4b
-    // doesn't need it yet (no kernel_run call, no init_memory).
-    let _memory_map = unsafe { boot::exit_boot_services(MemoryType::LOADER_DATA) };
+    // of the map the firmware handed us. We hand it straight into
+    // `arch::init_memory` (step 4c) which flattens the CONVENTIONAL
+    // regions into a frame allocator and stands up the page-table
+    // singleton.
+    let memory_map = unsafe { boot::exit_boot_services(MemoryType::LOADER_DATA) };
 
     // Firmware ConOut is now invalid. Switch `_print` onto the
     // direct-I/O 16550 path BEFORE the next println! so the
@@ -98,12 +102,27 @@ fn efi_main() -> Status {
     crate::arch::switch_to_post_ebs_serial();
 
     println!("  post-EBS: 16550 COM1 active (kernel-managed)");
-    println!("  next:        UEFI memory map -> kernel_run handoff");
 
-    // Scaffold halt. Real boot continues into init_gdt_and_interrupts,
-    // init_memory(memory_map), and kernel_run(phys_offset) — not yet
-    // wired because the kernel body subsystems (virtio / net / blk /
-    // repl) still have `cfg(not(target_os = "uefi"))` gates.
+    // Step 4c: consume the firmware memory map, install the paging
+    // + frame-allocator singletons. `init_memory` returns the
+    // physical-memory offset (always 0 on UEFI — firmware identity-
+    // maps RAM), matching the shape of the BIOS arm's facade.
+    let _phys_offset = crate::arch::init_memory(memory_map);
+
+    // Proves the page-table singleton is live post-EBS: going
+    // through `memory::usable_frame_count()` forces a `FRAME_ALLOCATOR.lock()`
+    // + a pass over the descriptor iterator, so a hung lock or a
+    // malformed memory map surfaces here rather than silently at
+    // first allocation inside kernel_run.
+    let frame_count = crate::arch::memory::usable_frame_count();
+    let usable_mib = (frame_count * 4096) / (1024 * 1024);
+    println!(
+        "  mem:      {frame_count} frames usable ({usable_mib} MiB) (UEFI memory map)"
+    );
+    println!("  next:        kernel_run handoff (step 4d)");
+
+    // Scaffold halt. Step 4d wires `kernel_run(phys_offset)` once
+    // the shared kernel body subsystems are UEFI-capable.
     loop {
         unsafe { core::arch::asm!("pause", options(nomem, nostack)); }
     }
