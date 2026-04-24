@@ -121,6 +121,27 @@ pub enum FolTerm {
     /// `var.role(n)` — the n'th role's value of the fact bound to
     /// `var`. Lowers to a `Selector(n)` against the bound fact.
     RoleVal(VarName, RoleIdx),
+    /// Role value of a fact reached via an arbitrary `Func` accessor.
+    ///
+    /// The ring / UC / MC / FC / SS / EQ compilers in compile.rs all
+    /// run over input shapes like `<fact, candidate>` or
+    /// `<<f1, f2>, candidate>`, where the fact(s) are pulled out with
+    /// a composition of `Func::Selector(_)`s rather than sitting at
+    /// "self". Prior to this variant each site wrote
+    /// `FolTerm::Raw(Func::compose(role_value(n), accessor))`, the
+    /// biggest class of `Raw` wraps in the codebase. `FactRole`
+    /// lifts that pattern into a first-class atom so the surrounding
+    /// FolTerm shape stays non-Raw and readable.
+    ///
+    /// `fact` is a Func (not a FolTerm) because the accessors in
+    /// question — `Selector(1)`, `Selector(2)`, or small compositions
+    /// of them — already exist as Func values at every call site;
+    /// re-wrapping in FolTerm::Raw is bureaucratic. The review
+    /// (ac474845) flagged this variant as the biggest reach-per-
+    /// effort Raw-debt follow-up.
+    ///
+    /// Role index is 1-indexed, matching `RoleVal`.
+    FactRole { fact: Func, role: RoleIdx },
     /// Literal constant.
     Const(Object),
 
@@ -209,6 +230,15 @@ impl FolTerm {
             FolTerm::RoleVal(_, n) => Func::compose(
                 Func::Selector(2),
                 Func::Selector(n),
+            ),
+            // "role `role` of the fact `fact` reaches" — first run
+            // `fact` to produce the fact (a seq of <key, val>
+            // pairs), then extract pair `role`'s value. Shape:
+            // `Func::compose(role_extractor, fact)` — read right to
+            // left, the fact accessor runs first (innermost).
+            FolTerm::FactRole { fact, role } => Func::compose(
+                Func::compose(Func::Selector(2), Func::Selector(role)),
+                fact,
             ),
             FolTerm::Const(obj) => Func::constant(obj),
 
@@ -470,6 +500,64 @@ mod tests {
             )),
         );
         assert_eq!(apply(&term.to_func(), &state, &state), t());
+    }
+
+    #[test]
+    fn fact_role_picks_role_from_chosen_fact() {
+        // Input shape is `<fact1, fact2>`. FactRole's `fact`
+        // accessor picks which one; its `role` picks which role
+        // value to extract. This mirrors the ring / UC / SS / EQ
+        // compile sites that used to wrap
+        // `Func::compose(role_value(i), Func::Selector(n))` in
+        // `FolTerm::Raw`.
+        let fact1 = ast::fact_from_pairs(&[("a", "x"), ("b", "y")]);
+        let fact2 = ast::fact_from_pairs(&[("c", "u"), ("d", "v")]);
+        let input = Object::seq(vec![fact1, fact2]);
+        let phi = Object::phi();
+
+        // role 1 of fact1 = "x"
+        let term = FolTerm::FactRole { fact: Func::Selector(1), role: 1 };
+        assert_eq!(apply(&term.to_func(), &input, &phi), Object::atom("x"));
+
+        // role 2 of fact1 = "y"
+        let term = FolTerm::FactRole { fact: Func::Selector(1), role: 2 };
+        assert_eq!(apply(&term.to_func(), &input, &phi), Object::atom("y"));
+
+        // role 1 of fact2 = "u"
+        let term = FolTerm::FactRole { fact: Func::Selector(2), role: 1 };
+        assert_eq!(apply(&term.to_func(), &input, &phi), Object::atom("u"));
+
+        // role 2 of fact2 = "v"
+        let term = FolTerm::FactRole { fact: Func::Selector(2), role: 2 };
+        assert_eq!(apply(&term.to_func(), &input, &phi), Object::atom("v"));
+    }
+
+    #[test]
+    fn fact_role_with_nested_accessor_reaches_through_construction() {
+        // Shape used by the ring transitivity shortcut-match
+        // compiler: input is `<<f1, f2>, candidate>`, reaching f1
+        // needs `Selector(1).Selector(1)` and reaching f2 needs
+        // `Selector(2).Selector(1)`.
+        let f1 = ast::fact_from_pairs(&[("r1", "a"), ("r2", "b")]);
+        let f2 = ast::fact_from_pairs(&[("r1", "b"), ("r2", "c")]);
+        let cand = ast::fact_from_pairs(&[("r1", "a"), ("r2", "c")]);
+        let chain = Object::seq(vec![f1, f2]);
+        let input = Object::seq(vec![chain, cand]);
+        let phi = Object::phi();
+
+        // role 1 of f1 (via <<f1,f2>, cand>) = "a"
+        let term = FolTerm::FactRole {
+            fact: Func::compose(Func::Selector(1), Func::Selector(1)),
+            role: 1,
+        };
+        assert_eq!(apply(&term.to_func(), &input, &phi), Object::atom("a"));
+
+        // role 2 of f2 = "c"
+        let term = FolTerm::FactRole {
+            fact: Func::compose(Func::Selector(2), Func::Selector(1)),
+            role: 2,
+        };
+        assert_eq!(apply(&term.to_func(), &input, &phi), Object::atom("c"));
     }
 
     #[test]
