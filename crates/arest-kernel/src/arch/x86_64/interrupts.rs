@@ -12,7 +12,7 @@
 // Vector layout:
 //   0-31     CPU exceptions (IDT entries declared individually;
 //            for now only #BP + #DF are populated)
-//   32       PIC primary (IRQ 0)    — timer   (unused until #180)
+//   32       PIC primary (IRQ 0)    — PIT timer → arch::time::tick
 //   33       PIC primary (IRQ 1)    — keyboard  [this commit]
 //   34-39    PIC primary (IRQ 2-7)  — unused
 //   40       PIC secondary (IRQ 8)  — RTC (masked)
@@ -41,6 +41,7 @@ pub const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
 #[derive(Debug, Clone, Copy)]
 #[repr(u8)]
 pub enum InterruptIndex {
+    Timer    = PIC_1_OFFSET,
     Keyboard = PIC_1_OFFSET + 1,
 }
 
@@ -83,6 +84,7 @@ pub fn init_idt() {
         idt.page_fault.set_handler_fn(page_fault_handler);
         idt.general_protection_fault.set_handler_fn(general_protection_handler);
         idt.invalid_opcode.set_handler_fn(invalid_opcode_handler);
+        idt[InterruptIndex::Timer.as_u8()].set_handler_fn(timer_handler);
         idt[InterruptIndex::Keyboard.as_u8()].set_handler_fn(keyboard_handler);
         idt
     });
@@ -104,12 +106,19 @@ pub fn init_pic() {
     unsafe {
         let mut pics = PICS.lock();
         pics.initialize();
-        // Mask everything, then unmask IRQ 1 (keyboard). The timer
-        // IRQ 0 comes online in a later commit once we decide how
-        // preemption is triggered.
-        pics.write_masks(0xFD, 0xFF);
+        // 0xFC = 1111_1100 — unmask IRQ 0 (timer) and IRQ 1
+        // (keyboard). The timer drives `arch::time::now_ms` so net
+        // retry budgets, Doom's tic accumulator, and any future
+        // `hlt`-then-poll idle all have a monotonic ms source.
+        pics.write_masks(0xFC, 0xFF);
     }
     x86_64::instructions::interrupts::enable();
+
+    // Program the PIT itself AFTER the PIC is initialised + the IDT
+    // entry is populated. Otherwise the first tick fires into an
+    // unprogrammed vector (reserved CPU-exception slot before PIC
+    // remap; empty IDT slot before init_idt) and triple-faults.
+    super::time::init();
 }
 
 extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {
@@ -167,6 +176,17 @@ extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStackFram
         crate::userspace::halt_on_exit(crate::userspace::exit_code::RING3_FAULT);
     }
     panic!("#UD from ring 0");
+}
+
+extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
+    super::time::tick();
+    // EOI immediately — the handler is just an atomic bump so there's
+    // nothing that benefits from holding the PIC line. Delaying EOI
+    // past a dispatch would risk lost ticks if a consumer stalled.
+    unsafe {
+        PICS.lock()
+            .notify_end_of_interrupt(InterruptIndex::Timer.as_u8());
+    }
 }
 
 extern "x86-interrupt" fn keyboard_handler(_stack_frame: InterruptStackFrame) {

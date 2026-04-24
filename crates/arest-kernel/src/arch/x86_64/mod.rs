@@ -14,6 +14,7 @@ pub mod gdt;
 pub mod interrupts;
 pub mod memory;
 pub mod serial;
+pub mod time;
 
 // `_print` is the function the `print!` / `println!` macros at the
 // crate root call. Expose it at `arch::_print` so the macros can
