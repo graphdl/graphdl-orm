@@ -41,8 +41,13 @@ pub(crate) fn state_to_object(state: &Object, schema: &CompiledSchema) -> Object
 
 /// Build a predicate Func from filter bindings.
 ///
-/// Single binding:  eq ∘ [Sel(i), valuē]
-/// Multiple:        nested Condition — each check gates the next (pure AND).
+/// Single binding:  `eq ∘ [Sel(i), valuē]`
+/// Multiple:        `(/and) ∘ [p₁, p₂, …, pₙ]` — Backus's algebraic
+///                   N-ary conjunction (#353). Insert (right-fold) over
+///                   the predicate sequence collapses to a single
+///                   `and:<T,T,…>` cascade. Single-level, FPGA-friendly,
+///                   composes with §12 distributivity laws (the
+///                   Condition-ladder it replaced did neither).
 /// Zero:            constant T (match all)
 fn build_predicate(filter_bindings: &[(usize, &str)]) -> Func {
     let checks: Vec<Func> = filter_bindings.iter().map(|(role_idx, value)| {
@@ -58,14 +63,10 @@ fn build_predicate(filter_bindings: &[(usize, &str)]) -> Func {
     match checks.len() {
         0 => Func::constant(Object::t()),
         1 => checks.into_iter().next().unwrap(),
-        _ => {
-            // AND via nested Condition: (p₁ → (p₂ → ... → T̄; F̄); F̄)
-            // Each check gates the next — all must pass.
-            checks.into_iter().rev().fold(
-                Func::constant(Object::t()),
-                |inner, check| Func::condition(check, inner, Func::constant(Object::f())),
-            )
-        }
+        _ => Func::compose(
+            Func::insert(Func::And),
+            Func::construction(checks),
+        ),
     }
 }
 
