@@ -189,14 +189,22 @@ pub trait DoomHost {
 
     /// `console.onInfoMessage`. Guest's `I_Printf` / `DEH_printf` /
     /// game-logic status messages. UTF-8 bytes at `ptr..ptr+len` in
-    /// guest memory; mirror to the kernel console.
-    fn on_info_message(&mut self, ptr: i32, len: i32);
+    /// guest memory; the [`bind_doom_imports`] trampoline resolves
+    /// the guest `memory` export, copies the slice out, validates
+    /// UTF-8 (silent drop on decode failure — Doom text is
+    /// canonically ASCII), and hands the decoded `&str` here. Mirror
+    /// to the kernel console.
+    ///
+    /// Signature matches `draw_frame`'s shape: the trampoline owns
+    /// guest-memory translation; the impl just writes to serial.
+    fn on_info_message(&mut self, message: &str);
 
-    /// `console.onErrorMessage`. Guest's `I_Error` — fatal path. The
-    /// host prints the message then lets the guest `unreachable` /
-    /// abort; the `call_indirect` trap surfaces back up through the
-    /// wasmi `Result`.
-    fn on_error_message(&mut self, ptr: i32, len: i32);
+    /// `console.onErrorMessage`. Guest's `I_Error` — fatal path. Same
+    /// trampoline-owned UTF-8 decode as `on_info_message`. The host
+    /// prints the message then lets the guest `unreachable` / abort;
+    /// the `call_indirect` trap surfaces back up through the wasmi
+    /// `Result`.
+    fn on_error_message(&mut self, message: &str);
 }
 
 /// Default in-kernel implementation of [`DoomHost`]. Side-effect
@@ -212,20 +220,27 @@ pub trait DoomHost {
 ///   * `draw_frame` — live (#373). Calls `framebuffer::with_back` +
 ///     `BackBuffer::blit_doom_frame` + `framebuffer::present`; a
 ///     no-op when the framebuffer driver isn't installed.
+///   * `on_game_init` — live (#384). Prints a one-line `doom: game
+///     init` marker to serial so the boot log shows the guest
+///     reaching `D_DoomMain`; argv synthesis is deferred.
+///   * `on_info_message` / `on_error_message` — live (#384). Route
+///     UTF-8 bytes out of guest memory to the kernel serial console
+///     with `doom: info:` / `doom: ERROR:` prefixes. Silent drop on
+///     malformed UTF-8 so a corrupt message can't itself trap Doom.
+///   * `size_of_save_game` — returns 0 ("no save present") per
+///     trait contract; the matching `read_save_game` impl is still
+///     gated on #375's block_storage reserved-region API.
 ///
 /// The real impl is filled in incrementally alongside the
 /// doomgeneric-wasm module landing:
-///   * `on_game_init` / `wad_sizes` / `read_wads` — once the WAD
-///     bytes ship embedded in the kernel image (or are served from
-///     virtio-blk).
+///   * `wad_sizes` / `read_wads` — once the WAD bytes ship embedded
+///     in the kernel image (or are served from virtio-blk).
 ///   * `time_in_milliseconds` — wire to `arch::time::now_ms` with
 ///     a `u64 -> i32` truncation.
-///   * `size_of_save_game` / `read_save_game` / `write_save_game` —
-///     wire to virtio-blk save-slot region (#375). Waiting on
-///     `block_storage` to grow a reserved-region API that doesn't
-///     clobber the #337 checkpoint at sector 0.
-///   * `on_info_message` / `on_error_message` — wire to `println!`
-///     with a guest-memory copy of the UTF-8 slice.
+///   * `read_save_game` / `write_save_game` — wire to virtio-blk
+///     save-slot region (#375). Waiting on `block_storage` to grow
+///     a reserved-region API that doesn't clobber the #337
+///     checkpoint at sector 0.
 pub struct KernelDoomHost;
 
 impl KernelDoomHost {
@@ -247,11 +262,14 @@ impl Default for KernelDoomHost {
 
 impl DoomHost for KernelDoomHost {
     fn on_game_init(&mut self, _argc: i32, _argv_ptr: i32) {
-        // Side-effect import — panic so the harness sees the guest
-        // reached the unimplemented entry point rather than the call
-        // quietly succeeding and the guest later stalling on an
-        // empty WAD.
-        panic!("doom: on_game_init not yet implemented");
+        // Observational — the guest is telling us it's alive and has
+        // begun `D_DoomMain`. Print one line so the serial log shows
+        // the handoff. `argv_ptr` translation is deferred: the host
+        // doesn't yet synthesize a command-line for the guest (that
+        // wave lands alongside the embedded WAD work in
+        // `on_game_init` / `wad_sizes` / `read_wads` — see the
+        // module-level TODO list).
+        crate::println!("doom: game init");
     }
 
     fn wad_sizes(&mut self, _out_ptr: i32) -> i32 {
@@ -297,8 +315,21 @@ impl DoomHost for KernelDoomHost {
 
     fn size_of_save_game(&mut self) -> i32 {
         // Pure-query. Zero = no save, which is the correct reading
-        // on a fresh boot regardless of wiring, so the scaffold can
-        // safely return it.
+        // on a fresh boot regardless of wiring: the guest interprets
+        // 0 as "no save slot present" and skips the `read_save_game`
+        // call path entirely (which is exactly what we need while
+        // `read_save_game` / `write_save_game` are still gated on
+        // the block_storage reserved-region API — see #375 TODOs
+        // below).
+        //
+        // TODO(#372 / #375): once the doomgeneric-wasm binary lands
+        // and its save-game format is fixed (doomgeneric ports
+        // typically hard-code a 352256-byte slot), return the actual
+        // persisted slot length from the block_storage reserved
+        // region. Returning a non-zero value here without the
+        // corresponding `read_save_game` impl would cause the guest
+        // to call through and panic, so the TODO is intentionally
+        // paired with the #375 block_storage API gap.
         0
     }
 
@@ -342,18 +373,28 @@ impl DoomHost for KernelDoomHost {
         panic!("doom: write_save_game not yet implemented (see #375 TODO)");
     }
 
-    fn on_info_message(&mut self, _ptr: i32, _len: i32) {
-        // Messages are observational; silently dropping during
-        // scaffold is defensible (the messages are only for the
-        // human-operator console). Real impl copies UTF-8 out of
-        // guest memory and forwards to `println!`.
+    fn on_info_message(&mut self, message: &str) {
+        // Mirror the guest's `I_Printf` / `DEH_printf` line to the
+        // kernel serial console with a `doom: info: ` prefix so the
+        // log stream stays grep-able when Doom output is interleaved
+        // with other kernel chatter. The trampoline in
+        // [`bind_doom_imports`] has already copied the bytes out of
+        // guest linear memory and validated UTF-8, so all we do here
+        // is forward.
+        crate::println!("doom: info: {}", message);
     }
 
-    fn on_error_message(&mut self, _ptr: i32, _len: i32) {
-        // Same reasoning as `on_info_message`. The actual guest trap
-        // that typically follows `I_Error` will still surface as a
-        // wasmi execution error regardless of whether we printed
-        // the message.
+    fn on_error_message(&mut self, message: &str) {
+        // Same path as `on_info_message` but louder prefix — Doom's
+        // `I_Error` is the fatal shutdown funnel (bad WAD lump,
+        // failed level load, assertion trip), and when it fires the
+        // guest typically follows with a `call_indirect`-to-
+        // unreachable trap that surfaces through wasmi as a runtime
+        // error. Visibility matters more here than stream
+        // separation, so we route to the same serial writer as info
+        // messages — just with `ERROR` where a structured log shim
+        // would later set a severity level.
+        crate::println!("doom: ERROR: {}", message);
     }
 }
 
@@ -502,12 +543,43 @@ pub fn bind_doom_imports<T: DoomHost + 'static>(linker: &mut Linker<T>) {
         .expect("doom: duplicate import gameSaving.writeSaveGame");
 
     // console.*
+    //
+    // Both onInfoMessage and onErrorMessage are (ptr, len) pairs into
+    // guest linear memory carrying UTF-8 bytes. Same trampoline
+    // shape as `ui.drawFrame`:
+    //   1. resolve guest `memory` export (silent no-op if absent —
+    //      matches drawFrame's tolerance for scaffold guests),
+    //   2. copy `len` bytes into a host-side `Vec<u8>` via
+    //      `Memory::read` (messages are short, typically <256 bytes,
+    //      so allocation cost is trivial),
+    //   3. validate UTF-8 with `core::str::from_utf8`; silently drop
+    //      on decode failure — Doom text is canonically ASCII and
+    //      the `onErrorMessage` path especially must not itself trap
+    //      on malformed bytes,
+    //   4. dispatch to the trait method with the decoded `&str`.
+    // A negative `len` (guest bug) would wrap to a huge usize via
+    // `as usize`; clamp via `try_into`, dropping on conversion
+    // failure so a malformed call doesn't stall the kernel on a
+    // 4 GiB allocation.
     linker
         .func_wrap(
             "console",
             "onInfoMessage",
             |mut caller: wasmi::Caller<'_, T>, ptr: i32, len: i32| {
-                caller.data_mut().on_info_message(ptr, len);
+                let Ok(len) = usize::try_from(len) else { return };
+                let memory = match caller
+                    .get_export("memory")
+                    .and_then(|e| e.into_memory())
+                {
+                    Some(m) => m,
+                    None => return,
+                };
+                let mut buf = vec![0u8; len];
+                if memory.read(&caller, ptr as usize, &mut buf).is_err() {
+                    return;
+                }
+                let Ok(message) = core::str::from_utf8(&buf) else { return };
+                caller.data_mut().on_info_message(message);
             },
         )
         .expect("doom: duplicate import console.onInfoMessage");
@@ -516,7 +588,20 @@ pub fn bind_doom_imports<T: DoomHost + 'static>(linker: &mut Linker<T>) {
             "console",
             "onErrorMessage",
             |mut caller: wasmi::Caller<'_, T>, ptr: i32, len: i32| {
-                caller.data_mut().on_error_message(ptr, len);
+                let Ok(len) = usize::try_from(len) else { return };
+                let memory = match caller
+                    .get_export("memory")
+                    .and_then(|e| e.into_memory())
+                {
+                    Some(m) => m,
+                    None => return,
+                };
+                let mut buf = vec![0u8; len];
+                if memory.read(&caller, ptr as usize, &mut buf).is_err() {
+                    return;
+                }
+                let Ok(message) = core::str::from_utf8(&buf) else { return };
+                caller.data_mut().on_error_message(message);
             },
         )
         .expect("doom: duplicate import console.onErrorMessage");
