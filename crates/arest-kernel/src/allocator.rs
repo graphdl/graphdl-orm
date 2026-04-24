@@ -17,10 +17,21 @@
 use core::mem::MaybeUninit;
 use linked_list_allocator::LockedHeap;
 
-/// Heap size for the static-buffer bootstrap allocator. 1 MiB is
-/// overkill for hello-world but comfortably covers a parsed Domain
-/// plus its compiled DEFS table for a single-tenant REPL.
-const HEAP_SIZE: usize = 1024 * 1024;
+/// Heap size for the static-buffer bootstrap allocator.
+///
+/// Sized to comfortably hold:
+///   * Object graphs + DEFS table for the baked metamodel (~64 KiB).
+///   * Two back-buffers for the framebuffer driver — at the
+///     bootloader-default 1280x720x24bpp that's 2.7 MiB each, so
+///     ~5.4 MiB just for the buffer chain (#269 triple-buffering).
+///   * Vec / String / BTreeMap churn from command parsing, HTTP
+///     bodies, syscall copy_in/out, and freeze/thaw cycles.
+///
+/// 16 MiB headroom is overkill for everything we ship today and
+/// well within QEMU's default 128 MiB guest RAM. When the dynamic
+/// memory plumbing (#180 follow-up) lands, this gets carved out of
+/// `BootInfo.memory_regions` instead of the static BSS.
+const HEAP_SIZE: usize = 16 * 1024 * 1024;
 
 /// Backing storage for the heap. `MaybeUninit` avoids zero-filling
 /// the 1 MiB buffer in the binary — the BSS pattern handles that on

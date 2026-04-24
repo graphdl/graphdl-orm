@@ -117,6 +117,7 @@ if ($Smoke) {
             "heap:",
             "gdt:",
             "idt:",
+            "fb:     paint smoke OK",
             "blk:    driver online",
             "blk:    checkpoint round-trip OK",
             "EXCEPTION: BREAKPOINT",

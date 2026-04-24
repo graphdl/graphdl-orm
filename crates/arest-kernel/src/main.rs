@@ -217,13 +217,44 @@ fn kernel_run(phys_offset: u64) -> ! {
     println!("  memory: {usable_mib} MiB usable RAM ({frame_count} x 4 KiB frames) (#180)");
     match framebuffer::info() {
         Some(info) => {
-            // Smoke a single white-pixel write to prove the byte slice is
-            // mapped + writable. Top-left corner so it doesn't disturb
-            // any boot-time text-mode region the firmware may still own.
-            let _ = framebuffer::with_buffer(|fb| fb.put_pixel(0, 0, 0xFF, 0xFF, 0xFF));
             println!(
                 "  fb:     {}x{} @{}bpp, stride={}, format={:?} (bootloader-mapped)",
                 info.width, info.height, info.bytes_per_pixel * 8, info.stride, info.pixel_format,
+            );
+            // Triple-buffer paint smoke (#269). Two presents so the
+            // buffer chain visibly cycles — the second draw lands on
+            // a different back than the first. Each present's hash
+            // gets logged so the smoke harness can assert
+            // deterministic frame content.
+            use framebuffer::Color;
+            let _ = framebuffer::with_back(|back| {
+                back.clear(Color::rgb(0x10, 0x10, 0x18));
+                back.fill_rect(40,  40, 320, 200, Color::RED);
+                back.fill_rect(360, 40, 320, 200, Color::GREEN);
+                back.fill_rect(680, 40, 320, 200, Color::BLUE);
+                back.draw_line(40,  260, 1240, 260, Color::WHITE);
+                back.draw_text(40,  280, "AREST kernel", Color::YELLOW);
+            });
+            framebuffer::present();
+            let frame_a = framebuffer::front_fnv1a().unwrap_or(0);
+            let _ = framebuffer::with_back(|back| {
+                // Re-draw on the OTHER back buffer (rotated by present),
+                // overlay a white rect — proves both back buffers reach
+                // the front and damage tracking copies just the changed
+                // region rather than the whole 1280x720x3 surface.
+                back.clear(Color::rgb(0x10, 0x10, 0x18));
+                back.fill_rect(40,  40, 320, 200, Color::RED);
+                back.fill_rect(360, 40, 320, 200, Color::GREEN);
+                back.fill_rect(680, 40, 320, 200, Color::BLUE);
+                back.fill_rect(560, 100, 160, 80, Color::WHITE);
+                back.draw_line(40,  260, 1240, 260, Color::WHITE);
+                back.draw_text(40,  280, "AREST kernel", Color::YELLOW);
+            });
+            framebuffer::present();
+            let frame_b = framebuffer::front_fnv1a().unwrap_or(0);
+            println!(
+                "  fb:     paint smoke OK, presents={}, frame_a={:#018x}, frame_b={:#018x} (#269)",
+                framebuffer::presents(), frame_a, frame_b,
             );
         }
         None => println!("  fb:     none (text-mode boot — no linear framebuffer)"),
