@@ -1,10 +1,20 @@
 # Repo-local cargo config. Checked in so every contributor gets the
 # same aliases and profile defaults.
 
+# Use rust-lld (the LLVM linker bundled with rustc) on Windows MSVC.
+# 2-3× faster than link.exe / lld-link for our integration-test
+# binaries, which each statically link the full arest rlib + deps.
+# Per-binary link time on the test suite drops from ~3-5 s to ~1-2 s.
+# Scoped to the arest crate's .cargo/config.toml so arest-kernel
+# (which uses different linker plumbing for the bare-metal target)
+# is unaffected.
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld"
+
 [alias]
 # Inner-loop test runner: unoptimized build, std-deps feature, lib
 # target only. Use while iterating on a narrow feature — cold build
-# ~60-90s, incremental after a single-file edit ~15s, test run ~5-10s.
+# ~60-90s, incremental after a single-file edit ~8-10s, test run ~5s.
 #
 # Example:
 #   cargo t parse_forml2_stage2
@@ -17,5 +27,14 @@ c = "check --lib --features std-deps"
 
 # Full test suite with the default (optimized) test profile. Use
 # before pushing / committing to catch perf-sensitive test failures
-# that dev-fast might hide.
+# that dev-fast might hide. ~10-12 s after an ast.rs edit since the
+# opt-level = 1 / deps-at-opt-level-3 profile split landed.
 tall = "test --lib --features std-deps"
+
+# Parallel test runner via cargo-nextest. Each test runs in its own
+# process so Mutex-contended tests don't serialise on lock acquisition.
+# Slower than `cargo test` for trivially-parallel short tests (process
+# spawn overhead dominates) — use for suites with blocking tests or
+# when surfacing flakiness is the goal.
+#   Install: cargo install cargo-nextest --locked
+nt = "nextest run --lib --features std-deps"
