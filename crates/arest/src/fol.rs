@@ -430,6 +430,67 @@ mod tests {
     }
 
     #[test]
+    fn lt_gt_le_ge_lower_via_construction_and_primitive() {
+        let phi = Object::phi();
+        let two = FolTerm::Const(Object::atom("2"));
+        let three = FolTerm::Const(Object::atom("3"));
+
+        // Lt: 2 < 3 -> True, 3 < 3 -> False
+        assert_eq!(
+            apply(&FolTerm::Lt(Box::new(two.clone()), Box::new(three.clone())).to_func(), &phi, &phi),
+            t(),
+        );
+        assert_eq!(
+            apply(&FolTerm::Lt(Box::new(three.clone()), Box::new(three.clone())).to_func(), &phi, &phi),
+            f(),
+        );
+
+        // Gt: 3 > 2 -> True, 2 > 2 -> False
+        assert_eq!(
+            apply(&FolTerm::Gt(Box::new(three.clone()), Box::new(two.clone())).to_func(), &phi, &phi),
+            t(),
+        );
+        assert_eq!(
+            apply(&FolTerm::Gt(Box::new(two.clone()), Box::new(two.clone())).to_func(), &phi, &phi),
+            f(),
+        );
+
+        // Le: 2 <= 2 -> True, 3 <= 2 -> False
+        assert_eq!(
+            apply(&FolTerm::Le(Box::new(two.clone()), Box::new(two.clone())).to_func(), &phi, &phi),
+            t(),
+        );
+        assert_eq!(
+            apply(&FolTerm::Le(Box::new(three.clone()), Box::new(two.clone())).to_func(), &phi, &phi),
+            f(),
+        );
+
+        // Ge: 3 >= 3 -> True, 2 >= 3 -> False
+        assert_eq!(
+            apply(&FolTerm::Ge(Box::new(three.clone()), Box::new(three)).to_func(), &phi, &phi),
+            t(),
+        );
+        assert_eq!(
+            apply(&FolTerm::Ge(Box::new(two.clone()), Box::new(FolTerm::Const(Object::atom("3")))).to_func(), &phi, &phi),
+            f(),
+        );
+    }
+
+    #[test]
+    fn implies_false_to_true_is_vacuously_true() {
+        // The review flagged that `implies_lowers_to_or_not` only
+        // covered `True -> True`, `True -> False`, and `False -> False`
+        // — missing the `False -> True = True` vacuous case that
+        // distinguishes implication from conjunction.
+        let phi = Object::phi();
+        let term = FolTerm::Implies(
+            Box::new(FolTerm::False),
+            Box::new(FolTerm::True),
+        );
+        assert_eq!(apply(&term.to_func(), &phi, &phi), t());
+    }
+
+    #[test]
     fn forall_over_empty_source_is_true() {
         // ∀ f ∈ ft1. True   with no facts under "ft1"  →  True
         let phi = Object::phi();
