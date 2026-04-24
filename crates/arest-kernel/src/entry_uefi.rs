@@ -408,6 +408,42 @@ fn efi_main() -> Status {
                 "  fb:       paint smoke OK, presents={}, frame_a={frame_a:#018x}, frame_b={frame_b:#018x} (#269)",
                 crate::framebuffer::presents(),
             );
+
+            // Runtime exercise of the 4bpp blit_doom_frame path
+            // (9c4984d). Builds a synthetic 640x400 BGRA frame with
+            // a diagonal gradient (R = x & 0xFF, G = y & 0xFF, B =
+            // (x ^ y) & 0xFF), runs the blit, presents, and reports
+            // the new front-buffer hash. The hash MUST differ from
+            // the `frame_b` emitted above — if the 4bpp path is
+            // still silently no-op'ing (as it did before 9c4984d),
+            // the present would leave the framebuffer unchanged
+            // and the two hashes would match. The smoke harness
+            // inspects the "doom-blit:" line for presence; any
+            // human-level audit can compare the hash against
+            // frame_b.
+            const DOOM_W: usize = 640;
+            const DOOM_H: usize = 400;
+            let mut doom_buf: alloc::vec::Vec<u8> =
+                alloc::vec![0u8; DOOM_W * DOOM_H * 4];
+            for y in 0..DOOM_H {
+                for x in 0..DOOM_W {
+                    let off = (y * DOOM_W + x) * 4;
+                    // Doom writes 0xAARRGGBB little-endian →
+                    // [B, G, R, A] in memory.
+                    doom_buf[off]     = ((x ^ y) & 0xFF) as u8; // B
+                    doom_buf[off + 1] = (y & 0xFF) as u8;       // G
+                    doom_buf[off + 2] = (x & 0xFF) as u8;       // R
+                    doom_buf[off + 3] = 0xFF;                    // A
+                }
+            }
+            let _ = crate::framebuffer::with_back(|back| {
+                back.blit_doom_frame(&doom_buf);
+            });
+            crate::framebuffer::present();
+            let frame_doom = crate::framebuffer::front_fnv1a().unwrap_or(0);
+            println!(
+                "  doom-blit: synthetic 640x400 BGRA frame blitted, fnv1a={frame_doom:#018x} (#270/#271)"
+            );
         } else {
             println!("  fb:       format {gop_fmt} unsupported by framebuffer::install (BltOnly/Bitmask)");
         }

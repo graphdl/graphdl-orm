@@ -72,11 +72,16 @@ if ($Smoke) {
     try {
         # OVMF prints its own boot banners (TianoCore, UefiVersion, etc.)
         # before the firmware hands control to our PE32+. Poll for the
-        # step-4c "mem: N frames usable" marker, which is the latest
-        # line our entry prints before parking -- it's written only
-        # after the page-table + frame-allocator singletons are live,
-        # so it proves every step from ConOut through EBS through the
-        # post-EBS 16550 cutover through init_memory worked.
+        # FINAL line the entry prints before halt -- "next: kernel_run
+        # handoff (step 4d)" -- rather than an early line like "frames
+        # usable". Without that, the docker-logs snapshot can race the
+        # kernel's later output: the matcher fires on the early line,
+        # the loop breaks, and the snapshot we then write to disk is
+        # missing everything the kernel printed after. Polling on the
+        # last line guarantees the snapshot includes every banner.
+        #
+        # Once step 4d boots through `kernel_run`, swap the marker for
+        # "int3 round-tripped" -- the BIOS smoke's same beacon.
         $deadline = (Get-Date).AddSeconds(30)
         $log = ""
         while ((Get-Date) -lt $deadline) {
@@ -88,10 +93,7 @@ if ($Smoke) {
             } finally {
                 $ErrorActionPreference = $prevEAP
             }
-            # Match against the most recent line the scaffold writes.
-            # Once step 4d boots through `kernel_run`, swap the marker
-            # for "int3 round-tripped" -- the BIOS smoke's same beacon.
-            if ($log -match "frames usable") { break }
+            if ($log -match "next:\s+kernel_run handoff") { break }
         }
         $log | Out-File -FilePath $logPath -Encoding utf8
 
@@ -114,7 +116,8 @@ if ($Smoke) {
             "10 host imports bound to wasmi::Linker",
             "gop:      ",
             "gop-mmio: wrote 320x200, readback sum=0xffff8300",
-            "fb:       paint smoke OK, presents=2"
+            "fb:       paint smoke OK, presents=2",
+            "doom-blit: synthetic 640x400 BGRA frame blitted"
         )
         $missing = @()
         foreach ($phrase in $expected) {
