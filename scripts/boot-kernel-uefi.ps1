@@ -9,7 +9,7 @@
 #   .\scripts\boot-kernel-uefi.ps1            # interactive boot
 #   .\scripts\boot-kernel-uefi.ps1 -Smoke     # headless: assert banner
 #
-# Smoke mode (#344 step 4 waves 1-5 + #270/#271):
+# Smoke mode (#344 step 4 waves 1-6 + #270/#271):
 #   Boots the kernel under OVMF with a 30 s cap (boot-time UEFI
 #   initialisation is slower than the BIOS path -- OVMF prints its
 #   own banners before our entry runs), captures every byte of
@@ -23,6 +23,8 @@
 #     * step 4d wave 4: AREST engine init on UEFI (8ea0528)
 #     * step 4d wave 5: wasmi executes user WASM (58cf113)
 #     * #270/#271 shim: 10 Doom host imports bound (f8c11d2)
+#     * step 4d wave 6: framebuffer::install + triple-buffer paint
+#       smoke on GOP (#269 BIOS path now reachable on UEFI)
 #
 # Remaining for step 4d completion: kernel_run() handoff — requires
 # virtio / block / net to compile on UEFI (currently gated) or a
@@ -111,7 +113,8 @@ if ($Smoke) {
             "tiny module executed, main() = 42",
             "10 host imports bound to wasmi::Linker",
             "gop:      ",
-            "gop-mmio: wrote 320x200, readback sum=0xffff8300"
+            "gop-mmio: wrote 320x200, readback sum=0xffff8300",
+            "fb:       paint smoke OK, presents=2"
         )
         $missing = @()
         foreach ($phrase in $expected) {
