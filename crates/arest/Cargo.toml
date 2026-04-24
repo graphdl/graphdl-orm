@@ -6,6 +6,11 @@ edition = "2021"
 description = "AREST engine: FORML2 parser, constraint compiler, evaluator, forward chainer, RMAP, and verbalization"
 repository = "https://github.com/graphdl/arest"
 license = "MIT"
+# Disable Cargo's per-file `tests/*.rs` auto-discovery so the three
+# big integration suites can be bundled into one `tests/all.rs` binary
+# (see comments there). Each remaining standalone test binary is
+# declared explicitly via [[test]] below.
+autotests = false
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -16,6 +21,26 @@ crate-type = ["cdylib", "rlib"]
 #   cargo run --bin arest-cli -- <readings_dir>
 name = "arest-cli"
 path = "src/main.rs"
+
+# Merged integration test binary — bundles tests/integration.rs,
+# tests/properties.rs, tests/e3_integration.rs as submodules. Avoids
+# linking arest + deps three times for the same suite.
+[[test]]
+name = "all"
+path = "tests/all.rs"
+
+# Stays standalone — must observe process-global PLATFORM_FALLBACK
+# registry untainted by other suites' install_platform_fn calls.
+[[test]]
+name = "sec_2_platform_fallback_audit"
+path = "tests/sec_2_platform_fallback_audit.rs"
+
+# Cluster gossip tests — gated on the `cluster` feature so default
+# `cargo test` runs don't pay for spinning up real UDP sockets.
+[[test]]
+name = "cluster_udp"
+path = "tests/cluster_udp.rs"
+required-features = ["cluster"]
 
 [features]
 default = ["wit", "debug-def", "std-deps", "parallel"]
