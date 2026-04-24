@@ -3728,6 +3728,29 @@ impl Func {
         Func::Selector(n)
     }
 
+    /// Right-selector (Backus §11.2.4 `nr`): the n-th element *from the
+    /// right* of a sequence. `selector_from_right(1)` is Backus's `1r`
+    /// (last), `selector_from_right(2)` is `2r` (second-to-last), etc.
+    ///
+    /// Backus lists `1r`, `2r`, … as primitives; AREST derives them as
+    /// `Selector(n) ∘ Reverse`, so no enum variant is added. Equivalent
+    /// semantics, one extra ρ-application per evaluation, which is
+    /// fine for the contexts where right-selectors appear (audit-log
+    /// tail reads, trailing-role access in FORML 2 role subscripts).
+    /// If a hot path ever justifies promoting these to variants, the
+    /// constructor stays source-compatible — callers don't change.
+    pub fn selector_from_right(n: usize) -> Func {
+        Func::compose(Func::Selector(n), Func::Reverse)
+    }
+
+    /// Right-tail (Backus §11.2.4 `tlr`): the sequence `<x₁, …, xₙ₋₁>`
+    /// dropping the last element. Derives as `Reverse ∘ Tail ∘ Reverse`.
+    /// Same rationale as `selector_from_right`: Backus-named, AREST-
+    /// derived, cheap to promote if perf ever calls for it.
+    pub fn tail_from_right() -> Func {
+        Func::compose(Func::Reverse, Func::compose(Func::Tail, Func::Reverse))
+    }
+
     /// Returns true if this Func or any sub-Func contains a Native closure.
     /// Pure Func = no Native anywhere in the tree.
     pub fn has_native(&self) -> bool {
@@ -4258,6 +4281,48 @@ mod tests {
         assert_eq!(obj, Object::atom(primitives::CELL_NAME_TEST));
         let back = metacompose(&obj, &Object::phi());
         assert_eq!(func_to_object(&back), obj);
+    }
+
+    // ── Right-selectors (#356) — Backus §11.2.4 `nr`, `tlr`, derived.
+
+    #[test]
+    fn selector_from_right_gets_last_element() {
+        let s = Object::seq(vec![Object::atom("a"), Object::atom("b"), Object::atom("c")]);
+        assert_eq!(apply(&Func::selector_from_right(1), &s, &defs()), Object::atom("c"));
+    }
+
+    #[test]
+    fn selector_from_right_gets_nth_from_end() {
+        let s = Object::seq(vec![
+            Object::atom("a"), Object::atom("b"),
+            Object::atom("c"), Object::atom("d"),
+        ]);
+        assert_eq!(apply(&Func::selector_from_right(1), &s, &defs()), Object::atom("d"));
+        assert_eq!(apply(&Func::selector_from_right(2), &s, &defs()), Object::atom("c"));
+        assert_eq!(apply(&Func::selector_from_right(3), &s, &defs()), Object::atom("b"));
+    }
+
+    #[test]
+    fn tail_from_right_drops_last() {
+        let s = Object::seq(vec![
+            Object::atom("a"), Object::atom("b"), Object::atom("c"),
+        ]);
+        assert_eq!(
+            apply(&Func::tail_from_right(), &s, &defs()),
+            Object::seq(vec![Object::atom("a"), Object::atom("b")]),
+        );
+    }
+
+    #[test]
+    fn right_selectors_propagate_bottom() {
+        assert_eq!(
+            apply(&Func::selector_from_right(1), &Object::Bottom, &defs()),
+            Object::Bottom,
+        );
+        assert_eq!(
+            apply(&Func::tail_from_right(), &Object::Bottom, &defs()),
+            Object::Bottom,
+        );
     }
 
     #[test]
