@@ -7,7 +7,7 @@
 // the pre-EBS heap + SSE init sequence diverges (x86_64 flips CR0/CR4
 // for SSE; aarch64 has NEON on by default under UEFI).
 //
-// Scope of THIS commit chain (#366 + #367):
+// Scope of THIS commit chain (#366 + #367 + #368):
 //   * Static-BSS `LockedHeap` heap (post-EBS-safe, parallels x86_64).
 //   * `efi_main`
 //       - Initialise the heap (before any `println!`).
@@ -15,15 +15,17 @@
 //       - `boot::exit_boot_services` — firmware tears down.
 //       - `arch::init_memory(memory_map)` — consume the firmware
 //         memory map, install the UefiFrameAllocator singleton AND
-//         carve the 2 MiB DMA pool for a future virtio-mmio bring-up.
-//       - Print post-EBS banner: frame count, usable MiB, DMA pool status.
+//         carve the 2 MiB DMA pool for virtio-mmio.
+//       - virtio_mmio scan: walk 32 QEMU-virt MMIO slots at
+//         0x0a00_0000 + 0x200*n, report which (if any) hold
+//         virtio-net / virtio-blk headers.
+//       - Print post-EBS banner: frame count, usable MiB, DMA pool
+//         status, MMIO slot scan summary.
 //       - Halt via `wfi` loop.
 //   * `panic` — print a one-line fault marker via PL011, then `wfi` loop.
 //
-// Deliberately NOT here yet (matching the x86_64 arm's step-by-step
-// progression, and tracked by #368 / #369):
-//   * virtio-mmio transport + find_virtio_net / find_virtio_blk (#368).
-//   * virtio-net + virtio-blk drivers online + MAC / sector banners (#369).
+// Deliberately NOT here yet (tracked by #369):
+//   * virtio-net + virtio-blk drivers online + MAC / sector banners.
 //
 // Gated on `cfg(all(target_os = "uefi", target_arch = "aarch64"))`
 // and lives behind a `mod entry_uefi_aarch64;` in `main.rs` guarded
@@ -151,6 +153,34 @@ fn efi_main() -> Status {
     println!(
         "  dma:      pool {} (2 MiB UEFI memory-map carve for virtio)",
         if dma_ok { "live" } else { "NONE (carve failed)" }
+    );
+
+    // #368: virtio-mmio slot scan. Seed the HAL's phys_offset (= 0
+    // under AAVMF identity mapping) and walk the 32 virtio-mmio slots
+    // QEMU's aarch64 virt machine exposes at 0x0a00_0000 + 0x200 * n.
+    // This mirrors the x86_64-UEFI arm's `pci: walk OK (...)` banner
+    // line (entry_uefi.rs L310-L325) — a `virtio-mmio: walk OK`
+    // line with the first found net/blk slot index proves the MMIO
+    // scanner + identity-mapped reads work end-to-end on AAVMF.
+    // Without `-device virtio-*-device` in the QEMU args, both
+    // lookups return None; with them, the slot indices appear here.
+    crate::virtio_mmio::init_offset(0);
+    let virtio_net_slot = crate::virtio_mmio::find_virtio_net();
+    let virtio_blk_slot = crate::virtio_mmio::find_virtio_blk();
+    println!(
+        "  virtio-mmio: walk OK (virtio-net: {}, virtio-blk: {})",
+        match &virtio_net_slot {
+            Some(s) => alloc::format!(
+                "slot {} @ {:#010x}", s.index, s.base_paddr
+            ),
+            None => alloc::string::String::from("none"),
+        },
+        match &virtio_blk_slot {
+            Some(s) => alloc::format!(
+                "slot {} @ {:#010x}", s.index, s.base_paddr
+            ),
+            None => alloc::string::String::from("none"),
+        },
     );
 
     println!("  next:   ExitBootServices + memory map (follow-ups)");
