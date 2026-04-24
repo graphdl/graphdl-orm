@@ -4580,25 +4580,22 @@ fn compile_subset_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
     let a_facts = extract_facts_func(&a_ft_id);
     let b_facts = extract_facts_func(&b_ft_id);
 
-    // match_pred: <a_fact, b_candidate> -> common noun values all equal
-    // For each common noun: Eq . [role_value(a_idx) . Sel(1), role_value(b_idx) . Sel(2)]
-    let match_pred = if common.is_empty() {
-        // No common nouns: every a_fact trivially matches (no violation possible)
-        Func::constant(Object::t())
-    } else {
-        let eqs: Vec<Func> = common.iter().map(|&(ai, bi)| {
-            Func::compose(Func::Eq, Func::construction(vec![
-                Func::compose(role_value(ai), Func::Selector(1)),
-                Func::compose(role_value(bi), Func::Selector(2)),
-            ]))
+    // match_pred: <a_fact, b_candidate> -> common noun values all equal.
+    // Routed through FolTerm (#357): `FolTerm::And` with one Eq per
+    // common noun handles the empty / single / N-ary cases uniformly
+    // (empty And = True, single And passes through, N ≥ 2 becomes
+    // Insert(And) ∘ Construction). Replaces the manual Rust reduce.
+    let match_pred = {
+        use crate::fol::FolTerm;
+        let atoms: Vec<FolTerm> = common.iter().map(|&(ai, bi)| {
+            let a_val = Func::compose(role_value(ai), Func::Selector(1));
+            let b_val = Func::compose(role_value(bi), Func::Selector(2));
+            FolTerm::Eq(
+                Box::new(FolTerm::Raw(a_val)),
+                Box::new(FolTerm::Raw(b_val)),
+            )
         }).collect();
-        if eqs.len() == 1 {
-            eqs.into_iter().next().unwrap()
-        } else {
-            eqs.into_iter().reduce(|acc, eq| {
-                Func::compose(Func::And, Func::construction(vec![acc, eq]))
-            }).unwrap()
-        }
+        FolTerm::And(atoms).to_func()
     };
 
     // not_in_b: <a_fact, b_facts> -> T when no b_candidate matches a_fact
@@ -4662,17 +4659,21 @@ fn compile_equality_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
         false => {},
     }
 
-    // Build match predicate for <left_fact, right_candidate>
+    // Build match predicate for <left_fact, right_candidate>.
+    // Routed through FolTerm (#357); shares N-ary-And shape with
+    // compile_subset_ast's match_pred.
     let build_match = |left_indices: &[(usize, usize)], swap: bool| -> Func {
-        let eqs: Vec<Func> = left_indices.iter().map(|&(ai, bi)| {
+        use crate::fol::FolTerm;
+        let atoms: Vec<FolTerm> = left_indices.iter().map(|&(ai, bi)| {
             let (li, ri) = if swap { (bi, ai) } else { (ai, bi) };
-            Func::compose(Func::Eq, Func::construction(vec![
-                Func::compose(role_value(li), Func::Selector(1)),
-                Func::compose(role_value(ri), Func::Selector(2)),
-            ]))
+            let l_val = Func::compose(role_value(li), Func::Selector(1));
+            let r_val = Func::compose(role_value(ri), Func::Selector(2));
+            FolTerm::Eq(
+                Box::new(FolTerm::Raw(l_val)),
+                Box::new(FolTerm::Raw(r_val)),
+            )
         }).collect();
-        if eqs.len() == 1 { eqs.into_iter().next().unwrap() }
-        else { eqs.into_iter().reduce(|a, b| Func::compose(Func::And, Func::construction(vec![a, b]))).unwrap() }
+        FolTerm::And(atoms).to_func()
     };
 
     let a_facts = extract_facts_func(&a_ft_id);
