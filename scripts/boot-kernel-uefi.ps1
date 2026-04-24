@@ -110,7 +110,8 @@ if ($Smoke) {
             "system::init() completed (arest engine live on UEFI)",
             "tiny module executed, main() = 42",
             "10 host imports bound to wasmi::Linker",
-            "gop:      "
+            "gop:      ",
+            "gop-mmio: wrote 4 pixels, readback[0]=0xdeadbeef"
         )
         $missing = @()
         foreach ($phrase in $expected) {
