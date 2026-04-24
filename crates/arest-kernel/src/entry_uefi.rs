@@ -279,6 +279,21 @@ fn efi_main() -> Status {
         "  mem:      {frame_count} frames usable ({usable_mib} MiB) (UEFI memory map)"
     );
 
+    // DMA pool carve smoke (ed869c4). `arch::init_memory` on UEFI
+    // now mirrors the BIOS arm: carves a 2 MiB contiguous region out
+    // of the firmware memory map and reserves it for virtio-drivers.
+    // This line proves the carve landed at runtime (not just at
+    // compile time) -- `with_dma_pool` returns `Some` only when the
+    // pool was built, which in turn only happens when
+    // `dma::carve_dma_region` found a big-enough CONVENTIONAL region.
+    // A `none` here (on a 128 MiB QEMU guest with 60+ MiB usable)
+    // would indicate a regression in the carve logic.
+    let dma_ok = crate::arch::memory::with_dma_pool(|_| true).unwrap_or(false);
+    println!(
+        "  dma:      pool {} (2 MiB UEFI memory-map carve for virtio)",
+        if dma_ok { "live" } else { "NONE (carve failed)" }
+    );
+
     // Report GOP capture (the pre-EBS snapshot above). MMIO at
     // `gop_ptr..gop_ptr+gop_size` is driven by the GPU post-EBS,
     // so direct pixel writes are valid without BootServices.
