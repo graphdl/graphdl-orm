@@ -7,25 +7,21 @@
 // the pre-EBS heap + SSE init sequence diverges (x86_64 flips CR0/CR4
 // for SSE; aarch64 has NEON on by default under UEFI).
 //
-// Scope of THIS commit chain (#366 + #367 + #368):
+// Scope of THIS commit chain (#366 + #367 + #368 + #369):
 //   * Static-BSS `LockedHeap` heap (post-EBS-safe, parallels x86_64).
 //   * `efi_main`
 //       - Initialise the heap (before any `println!`).
 //       - Print pre-EBS banner via PL011.
 //       - `boot::exit_boot_services` — firmware tears down.
-//       - `arch::init_memory(memory_map)` — consume the firmware
-//         memory map, install the UefiFrameAllocator singleton AND
-//         carve the 2 MiB DMA pool for virtio-mmio.
-//       - virtio_mmio scan: walk 32 QEMU-virt MMIO slots at
-//         0x0a00_0000 + 0x200*n, report which (if any) hold
-//         virtio-net / virtio-blk headers.
-//       - Print post-EBS banner: frame count, usable MiB, DMA pool
-//         status, MMIO slot scan summary.
+//       - `arch::init_memory(memory_map)` — install the
+//         UefiFrameAllocator singleton + carve the 2 MiB DMA pool.
+//       - virtio_mmio scan — find virtio-net / virtio-blk slots.
+//       - Drive each discovered device: read MAC, read sector count
+//         + read-only flag, print a driver-online banner. Mirrors
+//         the x86_64-UEFI arm (entry_uefi.rs waves 1-6) on the
+//         aarch64 silicon.
 //       - Halt via `wfi` loop.
 //   * `panic` — print a one-line fault marker via PL011, then `wfi` loop.
-//
-// Deliberately NOT here yet (tracked by #369):
-//   * virtio-net + virtio-blk drivers online + MAC / sector banners.
 //
 // Gated on `cfg(all(target_os = "uefi", target_arch = "aarch64"))`
 // and lives behind a `mod entry_uefi_aarch64;` in `main.rs` guarded
@@ -182,6 +178,45 @@ fn efi_main() -> Status {
             None => alloc::string::String::from("none"),
         },
     );
+
+    // #369: actually drive the virtio devices the MMIO scanner
+    // found. Both `try_init_*` functions return None when no
+    // matching slot is present (they internally repeat the MMIO
+    // scan), so this block is safe even if QEMU was launched
+    // without the `-device virtio-*-device` pair. When virtio-net is
+    // present we read + report the MAC; when virtio-blk is present
+    // we report capacity + read-only flag. Mirrors the banner the
+    // x86_64-UEFI arm emits in entry_uefi.rs L336-L359 — same shape,
+    // different transport layer under the hood.
+    let virtio_net_dev = crate::virtio_mmio::try_init_virtio_net();
+    let virtio_net_mac = virtio_net_dev.as_ref().map(|d| d.mac_address());
+    match &virtio_net_mac {
+        Some(m) => println!(
+            "  virtio-net: driver online, MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            m[0], m[1], m[2], m[3], m[4], m[5],
+        ),
+        None => println!("  virtio-net: no device / init failed"),
+    }
+
+    let virtio_blk_dev = crate::virtio_mmio::try_init_virtio_blk();
+    match &virtio_blk_dev {
+        Some(d) => {
+            let sectors = d.capacity();
+            let ro = d.readonly();
+            // virtio-blk spec sector size = 512 bytes. Same constant
+            // the x86_64 arm's `crate::block::BLOCK_SECTOR_SIZE`
+            // carries (512 per virtio 1.1 §5.2.3); hard-coded here
+            // because `crate::block` is `cfg(target_arch = "x86_64")`
+            // gated and unreachable from aarch64 UEFI.
+            const SECTOR_SIZE: u64 = 512;
+            let cap_kib = (sectors * SECTOR_SIZE) / 1024;
+            let mode = if ro { "read-only" } else { "read-write" };
+            println!(
+                "  virtio-blk: driver online, {sectors} sectors ({cap_kib} KiB), {mode}"
+            );
+        }
+        None => println!("  virtio-blk: no device / init failed"),
+    }
 
     println!("  next:   ExitBootServices + memory map (follow-ups)");
 

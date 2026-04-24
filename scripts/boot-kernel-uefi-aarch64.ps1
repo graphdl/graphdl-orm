@@ -9,23 +9,28 @@
 #   .\scripts\boot-kernel-uefi-aarch64.ps1            # interactive boot
 #   .\scripts\boot-kernel-uefi-aarch64.ps1 -Smoke     # headless: assert banner
 #
-# Smoke mode: proves the aarch64-UEFI scaffold boots end-to-end on
-# QEMU-virt + AAVMF. Asserted banner phrases cover the three lines
-# `entry_uefi_aarch64.rs::efi_main` writes before the `wfi` halt:
-#   * "AREST kernel - aarch64-UEFI scaffold"
-#   * "target: aarch64-unknown-uefi"
-#   * "next:   ExitBootServices + memory map (follow-ups)"
+# Smoke mode (#366-#369):
+#   Boots the aarch64-UEFI kernel under QEMU-virt + AAVMF, caps at
+#   120 s (TCG emulation is slow + AAVMF boot surface + virtio bring-
+#   up is heavier than a banner-only scaffold), captures every byte
+#   of PL011 serial, and asserts every banner line the entry writes
+#   pre- and post-ExitBootServices. Exits 0 on success, 1 with the
+#   captured log on failure. Asserted banner lines cover:
+#     * #366 memory bring-up: "mem: N frames usable (M MiB)" via
+#       the UefiFrameAllocator singleton.
+#     * #367 DMA pool carve: "dma: pool live (2 MiB UEFI memory-map
+#       carve for virtio)".
+#     * #368 MMIO walker: "virtio-mmio: walk OK (virtio-net: slot N
+#       @ 0x..., virtio-blk: slot N @ 0x...)".
+#     * #369 device bring-up: "virtio-net: driver online, MAC ..."
+#       and "virtio-blk: driver online, N sectors ..., read-write".
 #
-# Remaining for #344 acceptance on aarch64 (tracked in follow-ups,
-# matching the x86_64 arm's step-by-step progression):
-#   * ExitBootServices + post-EBS PL011 cutover — aarch64 arm writes
-#     PL011 MMIO directly from the start, so no _print swap is
-#     needed; an explicit EBS call is still required to reclaim the
-#     firmware memory map.
-#   * GetMemoryMap consumption + aarch64 page-table abstraction.
-#   * Kernel body modules (virtio, net, system) un-gated on aarch64
-#     — blocked on the arch-neutral paging trait the x86_64 arm
-#     also needs for virtio bring-up.
+# Remaining for full x86_64 parity:
+#   * #337 mount / round-trip path — `block_storage` is
+#     cfg(target_arch = "x86_64") gated; drops alongside an arch-
+#     neutral block storage facade.
+#   * GICv2/v3 + IDT-equivalent vector table for IRQ-driven smoltcp
+#     parity (the x86_64 UEFI arm also doesn't reach this yet).
 
 param(
     [switch]$Smoke
@@ -49,12 +54,14 @@ try {
 if ($LASTEXITCODE -ne 0) { throw "Docker build failed (exit $LASTEXITCODE)" }
 
 if ($Smoke) {
-    Write-Host "`nBooting aarch64-UEFI kernel in smoke mode (60 s cap)..." -ForegroundColor Cyan
+    Write-Host "`nBooting aarch64-UEFI kernel in smoke mode (120 s cap)..." -ForegroundColor Cyan
 
     # aarch64 + AAVMF boot is noticeably slower than x86_64 + OVMF
     # under emulated QEMU — no KVM acceleration on x86 hosts, so
-    # every ARM instruction goes through TCG. Budget 60 s for the
-    # firmware scroll + banner, up from the x86 smoke's 30 s.
+    # every ARM instruction goes through TCG. Budget 120 s for the
+    # firmware scroll + banner + virtio bring-up, up from the
+    # pre-#369 60 s (additional virtio-drivers init + MMIO queue
+    # setup pushes the tail past 60 s on colder hosts).
     $containerName = "arest-kernel-uefi-aarch64-smoke-$([guid]::NewGuid().ToString('N').Substring(0,8))"
     $targetDir = Join-Path $repoRoot "target"
     $logPath = Join-Path $targetDir "kernel-uefi-aarch64-smoke.log"
@@ -70,11 +77,11 @@ if ($Smoke) {
     if ($LASTEXITCODE -ne 0) { throw "docker run failed (exit $LASTEXITCODE)" }
 
     try {
-        # Poll for the final scaffold line ("next:   ExitBootServices"),
+        # Poll for the final banner line ("next:   ExitBootServices"),
         # same pattern the x86_64 smoke uses: matching the last line
         # guarantees the log snapshot captures every prior banner
         # before we dump it to disk.
-        $deadline = (Get-Date).AddSeconds(60)
+        $deadline = (Get-Date).AddSeconds(120)
         $log = ""
         while ((Get-Date) -lt $deadline) {
             Start-Sleep -Milliseconds 500
@@ -91,10 +98,19 @@ if ($Smoke) {
 
         # Banner phrases the aarch64 entry writes via PL011 MMIO.
         # Each line is asserted individually; partial-write regressions
-        # show the exact line that dropped.
+        # show the exact line that dropped. The #369 lines are the
+        # proof the MMIO transport + virtio bring-up reach the same
+        # device-online state the x86_64-UEFI arm does.
         $expected = @(
             "AREST kernel - aarch64-UEFI scaffold",
             "target: aarch64-unknown-uefi",
+            "pre-EBS:  PL011 MMIO active at 0x0900_0000",
+            "post-EBS: PL011 MMIO survives",
+            "frames usable",
+            "dma:      pool live (2 MiB UEFI memory-map carve for virtio)",
+            "virtio-mmio: walk OK (virtio-net:",
+            "virtio-net: driver online, MAC",
+            "virtio-blk: driver online,",
             "next:   ExitBootServices + memory map"
         )
         $missing = @()
