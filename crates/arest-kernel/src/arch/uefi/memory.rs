@@ -20,13 +20,17 @@
 //     `MemoryDescriptor` carries `ty`, `phys_start`, `page_count`.
 //     Frames marked `CONVENTIONAL` are free for OS use; after EBS
 //     the `BOOT_SERVICES_CODE` / `BOOT_SERVICES_DATA` regions also
-//     become reclaimable (UEFI spec §7.2.6). For the step-4c
-//     bring-up we only claim `CONVENTIONAL` — the boot-services
-//     regions still hold our in-flight data structures (the
-//     `MemoryMapOwned` itself lives in `LOADER_DATA` which *is*
-//     reserved), so keeping them off-limits is the conservative
-//     choice. A later step can enlarge the pool once the freshly
-//     mapped heap has copied anything we care about out of them.
+//     become reclaimable (UEFI spec §7.2.6) — the firmware teardown
+//     is complete and nothing the kernel owns lives in those pages
+//     (our PE image is `LOADER_CODE`, the `MemoryMapOwned` buffer
+//     is `LOADER_DATA`, the GOP framebuffer is firmware-reserved
+//     MMIO, and the static-BSS heap is inside the PE image). We
+//     therefore fold both `BOOT_SERVICES_*` types into the usable-
+//     frame pool alongside `CONVENTIONAL`, and the DMA carver does
+//     the same so its window of contiguous-`Usable` candidates has
+//     the same symmetry. `LOADER_DATA` stays off the free list so
+//     the in-flight memory map itself remains valid for the life of
+//     the allocator.
 //
 // This module exposes the same public surface as the BIOS arm:
 //   * `init(memory_map)` — called once from `entry_uefi::efi_main`
@@ -64,7 +68,8 @@ static FRAME_ALLOCATOR: Mutex<Option<UefiFrameAllocator>> = Mutex::new(None);
 /// Dedicated contiguous DMA pool for virtio-drivers. Parallels the
 /// BIOS arm's `DMA_POOL` — carved out of the firmware's memory map
 /// before `FRAME_ALLOCATOR` is handed the same map, so the two
-/// allocators never collide. `None` only if no CONVENTIONAL region
+/// allocators never collide. `None` only if no reclaimable region
+/// (`CONVENTIONAL` / `BOOT_SERVICES_CODE` / `BOOT_SERVICES_DATA`)
 /// fits the configured pool size (unlikely on any reasonable QEMU
 /// guest but the same graceful-degrade path the BIOS arm has).
 static DMA_POOL: Mutex<Option<DmaPool>> = Mutex::new(None);
@@ -129,11 +134,15 @@ pub fn init(memory_map: MemoryMapOwned) -> u64 {
     0
 }
 
-/// Scan the UEFI memory map and hand the first-N CONVENTIONAL regions
-/// to `dma::carve_dma_region` in the same `(u64, u64, RegionKind)`
-/// shape the BIOS arm uses. Stack-allocated 32-entry buffer matches
-/// the BIOS arm's `MAX_REGIONS` — QEMU + OVMF emits on the order of
-/// a dozen descriptor entries for a 128 MiB guest.
+/// Scan the UEFI memory map and hand regions to `dma::carve_dma_region`
+/// in the same `(u64, u64, RegionKind)` shape the BIOS arm uses.
+/// Post-ExitBootServices the `BOOT_SERVICES_CODE` / `BOOT_SERVICES_DATA`
+/// types are reclaimable (UEFI spec §7.2.6) so we mark them `Usable`
+/// alongside `CONVENTIONAL`; this keeps the DMA pool's pool of
+/// candidate regions symmetric with `UefiFrameAllocator::usable_frames`.
+/// Stack-allocated 32-entry buffer matches the BIOS arm's `MAX_REGIONS`
+/// — QEMU + OVMF emits on the order of a dozen descriptor entries for
+/// a 128 MiB guest.
 fn carve_from_memory_map(
     map: &MemoryMapOwned,
     capacity_bytes: u64,
@@ -149,7 +158,12 @@ fn carve_from_memory_map(
         }
         let start = d.phys_start;
         let end = start + d.page_count * PAGE_SIZE;
-        let kind = if d.ty == MemoryType::CONVENTIONAL {
+        let kind = if matches!(
+            d.ty,
+            MemoryType::CONVENTIONAL
+                | MemoryType::BOOT_SERVICES_CODE
+                | MemoryType::BOOT_SERVICES_DATA
+        ) {
             RegionKind::Usable
         } else {
             RegionKind::Other
@@ -192,7 +206,8 @@ pub fn with_frame_allocator<R>(f: impl FnOnce(&mut UefiFrameAllocator) -> R) -> 
 
 /// Call `f` with a mutable reference to the global `DmaPool`, if one
 /// was carved at boot. Returns `None` when `init()` ran on a memory
-/// map where no CONVENTIONAL region fit the configured pool size —
+/// map where no reclaimable region (`CONVENTIONAL` or post-EBS
+/// `BOOT_SERVICES_*`) fit the configured pool size —
 /// `virtio::KernelHal::dma_alloc` then panics, same graceful-fail
 /// behavior the BIOS arm has. Same signature as
 /// `arch::x86_64::memory::with_dma_pool` so `virtio.rs` compiles
@@ -244,10 +259,12 @@ unsafe fn build_offset_page_table(phys_offset: VirtAddr) -> OffsetPageTable<'sta
 ///
 /// Frames are yielded in the order the firmware reports them (usually
 /// physical-address ascending); each frame is returned at most once.
-/// Only descriptors with `ty == MemoryType::CONVENTIONAL` contribute
-/// — reclaiming `BOOT_SERVICES_*` after EBS is a later step, kept off
-/// the first-boot path to avoid accidentally trampling the in-flight
-/// `MemoryMapOwned` itself (which lives in `LOADER_DATA`).
+/// Descriptors with `ty` in `{ CONVENTIONAL, BOOT_SERVICES_CODE,
+/// BOOT_SERVICES_DATA }` contribute — the last two are reclaimable
+/// after `ExitBootServices` per UEFI spec §7.2.6 because the firmware
+/// teardown has already happened. `LOADER_DATA` (where the in-flight
+/// `MemoryMapOwned` lives) and `LOADER_CODE` (our PE image) stay off
+/// the free list; so do every MMIO/reserved type the firmware reports.
 pub struct UefiFrameAllocator {
     /// Owned buffer carrying the firmware's memory descriptors. Kept
     /// alive for the lifetime of the allocator so the descriptor slice
@@ -291,16 +308,24 @@ impl UefiFrameAllocator {
     /// Iterator over every usable `PhysFrame` in the memory map, minus
     /// any that fall inside the DMA carve-out.
     ///
-    /// Flattens each `CONVENTIONAL` descriptor's `[phys_start,
-    /// phys_start + page_count * 4 KiB)` range into individual 4 KiB
-    /// `PhysFrame`s. Descriptor order is preserved; within each
-    /// descriptor, frames emerge in ascending address order.
+    /// Flattens each `CONVENTIONAL` / `BOOT_SERVICES_CODE` /
+    /// `BOOT_SERVICES_DATA` descriptor's `[phys_start, phys_start +
+    /// page_count * 4 KiB)` range into individual 4 KiB `PhysFrame`s.
+    /// Descriptor order is preserved; within each descriptor, frames
+    /// emerge in ascending address order.
     fn usable_frames(&self) -> impl Iterator<Item = PhysFrame> + '_ {
         const PAGE_SIZE: u64 = 4096;
         let reserved = self.reserved;
         self.map
             .entries()
-            .filter(|d| d.ty == MemoryType::CONVENTIONAL)
+            .filter(|d| {
+                matches!(
+                    d.ty,
+                    MemoryType::CONVENTIONAL
+                        | MemoryType::BOOT_SERVICES_CODE
+                        | MemoryType::BOOT_SERVICES_DATA
+                )
+            })
             .flat_map(|d| {
                 let start = PhysAddr::new(d.phys_start);
                 let end = PhysAddr::new(d.phys_start + d.page_count * PAGE_SIZE);
@@ -326,7 +351,9 @@ impl UefiFrameAllocator {
 }
 
 // SAFETY: `UefiFrameAllocator` hands each frame out exactly once and
-// only yields frames the firmware marked `CONVENTIONAL`.
+// only yields frames the firmware marked `CONVENTIONAL`,
+// `BOOT_SERVICES_CODE`, or `BOOT_SERVICES_DATA` — the last two are
+// reclaimable post-ExitBootServices (UEFI spec §7.2.6).
 unsafe impl FrameAllocator<Size4KiB> for UefiFrameAllocator {
     fn allocate_frame(&mut self) -> Option<PhysFrame> {
         let frame = self.usable_frames().nth(self.next);
