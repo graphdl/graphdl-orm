@@ -33,11 +33,28 @@
 
 extern crate alloc;
 
-// UEFI entry path (#344) — compiles only on `x86_64-unknown-uefi` /
-// `aarch64-unknown-uefi`. Its `#[entry]` macro defines the PE32+
-// `_start` symbol; all the BIOS-path code below is cfg-gated out.
-#[cfg(target_os = "uefi")]
+// UEFI entry path (#344). Two separate entry files — the x86_64 arm
+// (`entry_uefi.rs`) and the aarch64 arm (`entry_uefi_aarch64.rs`) —
+// because the panic handlers diverge (COM1 port I/O vs PL011 MMIO)
+// and the pre-EBS init surface grew x86_64-specific helpers (heap,
+// SSE enable, CR0/CR4) before the aarch64 arm entered the picture.
+// Each `#[entry]` macro defines the PE32+ `_start` symbol the
+// firmware picks up; all the BIOS-path code below is cfg-gated out.
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 mod entry_uefi;
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+mod entry_uefi_aarch64;
+
+// Doom WASM host-shim (#270/#271). Publishes the `DoomHost` trait
+// and the `bind_doom_imports` helper that registers the 10 guest-
+// side imports against a `wasmi::Linker`. x86_64-UEFI-only: wasmi
+// is gated on `cfg(all(target_os = "uefi", target_arch = "x86_64"))`
+// in Cargo.toml (the BIOS bootloader triple-faults before `_start`
+// when the wasmi crate is reachable from the kernel binary, verified
+// via revert 5e8a15e; the aarch64 UEFI arm is scaffold-only this
+// commit with no kernel_run → no wasmi caller).
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+mod doom;
 
 // `arch` is shared between both entries (#344 step 3). On UEFI it
 // supplies `_print` via ConOut so the existing `println!` macros
@@ -70,7 +87,18 @@ mod assets;
 mod dma;
 mod framebuffer;
 mod http;
+// `pci` / `repl` reach `x86_64::instructions::port::Port` +
+// `x86_64::instructions::interrupts::disable` at module scope (see
+// pci.rs L30, repl.rs L118-120). The `x86_64` crate gates those on
+// `target_arch = "x86_64"` internally, so on aarch64-unknown-uefi
+// the imports fail. Keep the modules available on every x86_64
+// target (BIOS + UEFI) and elide them on aarch64 — there's nothing
+// PCI-like to probe on QEMU virt until the aarch64 arm grows a
+// device-tree walker in a follow-up commit, and the REPL's
+// keyboard IRQ path has no aarch64 analogue without a GIC driver.
+#[cfg(target_arch = "x86_64")]
 mod pci;
+#[cfg(target_arch = "x86_64")]
 mod repl;
 mod system;
 
