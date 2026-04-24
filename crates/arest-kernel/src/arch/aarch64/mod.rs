@@ -46,6 +46,7 @@
 // same `arch::_print` / `arch::halt_forever` shape regardless of
 // which arm is active.
 
+pub mod memory;
 mod serial;
 
 // `_print` is the callee of the crate-wide `print!` / `println!`
@@ -67,6 +68,22 @@ pub use serial::{_print, raw_puts};
 /// target-agnostically once it drops its x86_64-only gates.
 pub fn init_console() {
     // Intentionally empty — see module docstring.
+}
+
+/// Initialise the memory subsystem from the UEFI-provided memory map.
+/// Consumes the `MemoryMapOwned` that `boot::exit_boot_services`
+/// returns, installs the frame-allocator singleton, and returns the
+/// physical-memory offset (0 on UEFI — AAVMF identity-maps RAM under
+/// QEMU virt, so phys == virt).
+///
+/// Matches the shape of `arch::uefi::init_memory(memory_map) -> u64`
+/// so the aarch64 entry can call `arch::init_memory(...)` with the
+/// same signature the x86_64-UEFI arm uses. See
+/// `arch::aarch64::memory::init` for details on what's divergent
+/// (no `OffsetPageTable`, no TTBR1_EL1 inspection — firmware tables
+/// stay live for the rest of boot).
+pub fn init_memory(memory_map: uefi::mem::memory_map::MemoryMapOwned) -> u64 {
+    memory::init(memory_map)
 }
 
 /// Drive the kernel's idle loop. `wfi` (Wait For Interrupt) is the
