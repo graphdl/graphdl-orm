@@ -148,6 +148,14 @@ mod syscall;
 mod userspace;
 #[cfg(target_arch = "x86_64")]
 mod virtio;
+// virtio-mmio transport for aarch64 UEFI (#368/#369). Sibling of the
+// x86_64 `virtio` module (which is PCI-based). QEMU aarch64 virt
+// exposes virtio devices as MMIO slots at 0x0a00_0000 rather than on
+// the PCI bus, so the discovery / transport construction path is
+// entirely different — cleaner to keep it in a parallel module than
+// to cfg-gate half of virtio.rs.
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+mod virtio_mmio;
 
 #[cfg(not(target_os = "uefi"))]
 use alloc::string::ToString;
