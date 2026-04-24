@@ -59,7 +59,12 @@ fn efi_main() -> Status {
     // kernel_run can call it target-agnostically.
     crate::arch::init_console();
 
-    println!("AREST kernel — UEFI scaffold (#344)");
+    // ASCII hyphens — keeps the line printable on bare COM1, which
+    // most OVMF builds downcode UCS-2 → ASCII on. The kernel itself
+    // happily transcodes BMP glyphs through ConOut, but the smoke
+    // harness reads stdout via QEMU's `-serial stdio`, where the
+    // round-trip survives only if the banner is ASCII.
+    println!("AREST kernel - UEFI scaffold (#344)");
     println!("  step 3 of 8: println! routed through arch::_print");
     println!("  next:        ExitBootServices + kernel_run handoff");
 
