@@ -3487,6 +3487,56 @@ fn ring_match_reversed_pred() -> Func {
     .to_func()
 }
 
+/// Predicate: the two facts form a transitive chain. Input shape is
+/// `<f1, f2>`. Returns true iff `role 2 of f1 = role 1 of f2`
+/// (chainable) AND `role 1 of f1 ≠ role 2 of f2` (not self-looping
+/// trivially — the transitive-closure check doesn't care about
+/// reflexive pairs). Used by IT / TR / AC.
+fn ring_is_chain_pred() -> Func {
+    use crate::fol::FolTerm;
+    let f1_role_1 = Func::compose(role_value(0), Func::Selector(1));
+    let f1_role_2 = Func::compose(role_value(1), Func::Selector(1));
+    let f2_role_1 = Func::compose(role_value(0), Func::Selector(2));
+    let f2_role_2 = Func::compose(role_value(1), Func::Selector(2));
+    FolTerm::And(vec![
+        FolTerm::Eq(
+            Box::new(FolTerm::Raw(f1_role_2)),
+            Box::new(FolTerm::Raw(f2_role_1)),
+        ),
+        FolTerm::Not(Box::new(FolTerm::Eq(
+            Box::new(FolTerm::Raw(f1_role_1)),
+            Box::new(FolTerm::Raw(f2_role_2)),
+        ))),
+    ])
+    .to_func()
+}
+
+/// Predicate: candidate is the transitive-shortcut pair of a chain.
+/// Input shape is `<<f1, f2>, candidate>`. Returns true iff
+/// `role 1 of candidate = role 1 of f1` AND
+/// `role 2 of candidate = role 2 of f2` — i.e. the candidate spans
+/// the same endpoints the chain does. Used by IT (shortcut must
+/// NOT exist → violation) and TR (shortcut MUST exist).
+fn ring_shortcut_match_pred() -> Func {
+    use crate::fol::FolTerm;
+    let cand_role_1 = Func::compose(role_value(0), Func::Selector(2));
+    let cand_role_2 = Func::compose(role_value(1), Func::Selector(2));
+    // <f1, f2> is Selector(1). f1 = Sel(1).Sel(1); f2 = Sel(2).Sel(1).
+    let f1_role_1 = Func::compose(role_value(0), Func::compose(Func::Selector(1), Func::Selector(1)));
+    let f2_role_2 = Func::compose(role_value(1), Func::compose(Func::Selector(2), Func::Selector(1)));
+    FolTerm::And(vec![
+        FolTerm::Eq(
+            Box::new(FolTerm::Raw(cand_role_1)),
+            Box::new(FolTerm::Raw(f1_role_1)),
+        ),
+        FolTerm::Eq(
+            Box::new(FolTerm::Raw(cand_role_2)),
+            Box::new(FolTerm::Raw(f2_role_2)),
+        ),
+    ])
+    .to_func()
+}
+
 /// IR: not exists(x,x) -- no fact where both roles reference the same entity.
 /// alpha(make_violation)  .  Filter(eq  .  [role1_val, role2_val])  .  facts
 ///
@@ -3664,37 +3714,8 @@ fn compile_ring_intransitive_ast(def: &ConstraintDef) -> Func {
     //   Shortcut = <role0(f1), role1(f2)> = <x, z>
     //   distr [chains, all_facts], distl, Filter(shortcut matches candidate)
 
-    // chain predicate: <f1, f2> -> role1(f1) = role0(f2) AND role0(f1) != role1(f2)
-    let is_chain = Func::compose(Func::And, Func::construction(vec![
-        Func::compose(Func::Eq, Func::construction(vec![
-            Func::compose(role_value(1), Func::Selector(1)), // role1(f1)
-            Func::compose(role_value(0), Func::Selector(2)), // role0(f2)
-        ])),
-        Func::compose(Func::Not, Func::compose(Func::Eq, Func::construction(vec![
-            Func::compose(role_value(0), Func::Selector(1)), // role0(f1) = x
-            Func::compose(role_value(1), Func::Selector(2)), // role1(f2) = z
-        ]))),
-    ]));
-
-    // all_pairs: distr [facts, facts] -> <f, all> for each f
-    // then distl + filter(is_chain) finds chains
-    // But we need chains as <f1, f2> pairs AND the full facts for shortcut check.
-    // Structure: for each <f, all>, distl gives <f, f'> pairs, filter chains.
-    // Then for each chain <f1, f2>, pair with all_facts again for shortcut test.
-
-    // shortcut_match: <<chain, candidate>> -> role0(candidate) = role0(f1) AND role1(candidate) = role1(f2)
-    // chain is sel1, candidate is sel2
-    // f1 = sel1(sel1), f2 = sel2(sel1)
-    let shortcut_match = Func::compose(Func::And, Func::construction(vec![
-        Func::compose(Func::Eq, Func::construction(vec![
-            Func::compose(role_value(0), Func::Selector(2)),                    // role0(candidate)
-            Func::compose(role_value(0), Func::compose(Func::Selector(1), Func::Selector(1))), // role0(f1)
-        ])),
-        Func::compose(Func::Eq, Func::construction(vec![
-            Func::compose(role_value(1), Func::Selector(2)),                    // role1(candidate)
-            Func::compose(role_value(1), Func::compose(Func::Selector(2), Func::Selector(1))), // role1(f2)
-        ])),
-    ]));
+    let is_chain = ring_is_chain_pred();
+    let shortcut_match = ring_shortcut_match_pred();
 
     let has_shortcut = Func::compose(
         Func::compose(Func::Not, Func::NullTest),
@@ -3759,27 +3780,8 @@ fn compile_ring_transitive_ast(def: &ConstraintDef) -> Func {
     let facts = extract_facts_multi(&ft_ids);
 
     // TR: same chain pattern as IT, but violation when shortcut is MISSING.
-    let is_chain = Func::compose(Func::And, Func::construction(vec![
-        Func::compose(Func::Eq, Func::construction(vec![
-            Func::compose(role_value(1), Func::Selector(1)),
-            Func::compose(role_value(0), Func::Selector(2)),
-        ])),
-        Func::compose(Func::Not, Func::compose(Func::Eq, Func::construction(vec![
-            Func::compose(role_value(0), Func::Selector(1)),
-            Func::compose(role_value(1), Func::Selector(2)),
-        ]))),
-    ]));
-
-    let shortcut_match = Func::compose(Func::And, Func::construction(vec![
-        Func::compose(Func::Eq, Func::construction(vec![
-            Func::compose(role_value(0), Func::Selector(2)),
-            Func::compose(role_value(0), Func::compose(Func::Selector(1), Func::Selector(1))),
-        ])),
-        Func::compose(Func::Eq, Func::construction(vec![
-            Func::compose(role_value(1), Func::Selector(2)),
-            Func::compose(role_value(1), Func::compose(Func::Selector(2), Func::Selector(1))),
-        ])),
-    ]));
+    let is_chain = ring_is_chain_pred();
+    let shortcut_match = ring_shortcut_match_pred();
 
     // NullTest = shortcut missing = violation (opposite of IT)
     let no_shortcut = Func::compose(
