@@ -122,15 +122,18 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     arch::init_console();
     arch::init_gdt_and_interrupts();
 
-    // Sec-6 ring-3 smoke test mode. Run only the subsystems needed
-    // by userspace::launch_test_payload (memory — so map_user_page
-    // can allocate user pages) and skip the rest (virtio / net /
-    // system / REPL). Diverges into ring 3 and never returns.
+    // Sec-6 ring-3 smoke test mode. Run the subsystems
+    // `userspace::launch_test_payload` exercises through the syscall
+    // gate (memory for `map_user_page`; system for the SYS_system
+    // ρ-dispatch path the smoke calls into) and skip the rest
+    // (virtio / net / blk / REPL). Diverges into ring 3 and never
+    // returns.
     #[cfg(feature = "ring3-smoke")]
     {
         println!("AREST kernel online");
         println!("  mode: ring3-smoke — launching test payload");
         arch::init_memory(boot_info);
+        system::init();
         syscall::init();
         userspace::launch_test_payload();
     }

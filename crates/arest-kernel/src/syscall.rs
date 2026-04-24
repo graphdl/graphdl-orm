@@ -40,6 +40,8 @@ use x86_64::registers::model_specific::{Efer, EferFlags, KernelGsBase, LStar, SF
 use x86_64::registers::rflags::RFlags;
 
 use crate::arch::gdt;
+use crate::println;
+use crate::system;
 use crate::userspace;
 
 // ---------------------------------------------------------------------------
@@ -278,6 +280,36 @@ impl UserBuf {
         }
         buf
     }
+
+    /// Copy `data` into this user buffer, writing up to `len` bytes.
+    /// Returns the number of bytes written (`min(data.len(), self.len)`).
+    /// No-op (returns 0) when the buffer has zero capacity.
+    ///
+    /// # Safety
+    ///
+    /// The `from_raw` constructor verifies the pointer range is in
+    /// the user half of the address space. This function assumes the
+    /// pages backing the buffer are mapped + writable + USER_ACCESS-
+    /// IBLE — the smoke-test payload allocates its output on the
+    /// already-mapped user stack, so this holds. Production calls
+    /// (post-#333 follow-up) need a fault-fixup recovery path that
+    /// catches #PF during the copy and returns `EFault` instead of
+    /// double-faulting. Without that, an unmapped output buffer
+    /// from ring 3 will trigger a kernel-side page fault.
+    pub fn copy_out(&self, data: &[u8]) -> usize {
+        if self.len == 0 || data.is_empty() {
+            return 0;
+        }
+        let n = data.len().min(self.len);
+        // SAFETY: `from_raw` validated ptr + len in the user half.
+        // Caller-side: the user buffer's pages are mapped (smoke-
+        // test invariant). SMAP is off so CPL=0 can write user pages
+        // when U=1.
+        unsafe {
+            core::ptr::copy_nonoverlapping(data.as_ptr(), self.ptr as *mut u8, n);
+        }
+        n
+    }
 }
 
 /// Canonical-address check: on x86_64 the top 17 bits (47..=63)
@@ -307,40 +339,88 @@ pub extern "C" fn dispatch(
 /// Inner dispatcher so handlers can use `?` with `SyscallErr`. SYS_EXIT
 /// returns `!` via `halt_on_exit`; Rust's never-type coercion makes it
 /// fit the `Result<i64, SyscallErr>` return type.
+///
+/// Each arm validates user pointers via `UserBuf::from_raw` BEFORE any
+/// kernel-side work — so a malicious or malformed (ptr, len) from
+/// ring 3 returns `EFault` / `EInval` cleanly rather than corrupting
+/// kernel memory or page-faulting in the kernel.
 fn dispatch_inner(
     nr: u64,
     a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64,
 ) -> Result<i64, SyscallErr> {
+    // One-line per-syscall trace BEFORE arg validation. A malicious
+    // pointer (e.g. into the kernel half) is caught by `UserBuf::
+    // from_raw` and never reaches the per-arm `println!` below — so
+    // this trace is the only place the rejection becomes visible to
+    // the smoke harness. Cheap (~80 bytes) and useful for debugging
+    // any future syscall that lands unexpectedly.
+    println!(
+        "  syscall: enter nr={} a0={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x}",
+        nr, a0, a1, a2, a3, a4, a5,
+    );
     match nr {
-        SYS_YIELD => Ok(0),
-        SYS_EXIT  => userspace::halt_on_exit(a0 as u8),
+        SYS_YIELD => {
+            println!("  syscall: SYS_yield");
+            Ok(0)
+        }
+        SYS_EXIT  => {
+            println!("  syscall: SYS_exit({:#x})", a0 as u8);
+            userspace::halt_on_exit(a0 as u8)
+        }
 
         SYS_SYSTEM => {
             // (key_ptr, key_len, input_ptr, input_len, out_ptr, out_cap)
-            UserBuf::from_raw(a0, a1)?;
-            UserBuf::from_raw(a2, a3)?;
-            UserBuf::from_raw(a4, a5)?;
-            Err(SyscallErr::ENoSys)
+            // Same shape as the HTTP handler — `apply_named` does
+            // FetchOrPhi(<key, D>) → metacompose → apply(f, input, D).
+            let key   = UserBuf::from_raw(a0, a1)?;
+            let input = UserBuf::from_raw(a2, a3)?;
+            let out   = UserBuf::from_raw(a4, a5)?;
+            let key_bytes = key.copy_in();
+            let input_bytes = input.copy_in();
+            let key_str = core::str::from_utf8(&key_bytes).map_err(|_| SyscallErr::EInval)?;
+            let result = system::apply_named_pub(key_str, &input_bytes);
+            let written = out.copy_out(&result);
+            println!(
+                "  syscall: SYS_system(key={:?}, input={} B) -> {} B (truncated from {})",
+                key_str, input_bytes.len(), written, result.len(),
+            );
+            Ok(written as i64)
         }
         SYS_FETCH => {
             // (cell_ptr, cell_len, out_ptr, out_cap)
-            UserBuf::from_raw(a0, a1)?;
-            UserBuf::from_raw(a2, a3)?;
-            Err(SyscallErr::ENoSys)
+            // Cell-name lookup against the baked SYSTEM state via the
+            // FetchOrPhi primitive. Same dispatch the engine uses for
+            // every state read.
+            let cell = UserBuf::from_raw(a0, a1)?;
+            let out  = UserBuf::from_raw(a2, a3)?;
+            let cell_bytes = cell.copy_in();
+            let cell_str = core::str::from_utf8(&cell_bytes).map_err(|_| SyscallErr::EInval)?;
+            let result = system::fetch_named(cell_str);
+            let written = out.copy_out(&result);
+            println!(
+                "  syscall: SYS_fetch(cell={:?}) -> {} B (truncated from {})",
+                cell_str, written, result.len(),
+            );
+            Ok(written as i64)
         }
         SYS_STORE => {
             // (cell_ptr, cell_len, val_ptr, val_len)
+            // Mutation surface — kernel SYSTEM is currently a
+            // `Once<Object>` (read-only after init). SYS_STORE will
+            // light up when #156 / #157's per-cell write lock lands
+            // in the kernel target alongside a mutable Object pool.
             UserBuf::from_raw(a0, a1)?;
             UserBuf::from_raw(a2, a3)?;
             Err(SyscallErr::ENoSys)
         }
         SYS_SNAPSHOT => {
-            // (label_ptr, label_len)
+            // (label_ptr, label_len) — needs a mutable state pool +
+            // #331's HMAC-signed snap-id. Stub stays.
             UserBuf::from_raw(a0, a1)?;
             Err(SyscallErr::ENoSys)
         }
         SYS_ROLLBACK => {
-            // (id_ptr, id_len)
+            // (id_ptr, id_len) — see SYS_SNAPSHOT.
             UserBuf::from_raw(a0, a1)?;
             Err(SyscallErr::ENoSys)
         }
