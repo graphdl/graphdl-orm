@@ -132,6 +132,9 @@ use alloc::vec;
 use alloc::vec::Vec;
 use wasmi::Linker;
 
+use crate::block::BLOCK_SECTOR_SIZE;
+use crate::block_storage::{self, RegionHandle};
+
 /// Host-side callbacks the doomgeneric-wasm guest expects. Every
 /// method corresponds to one WASM import across four import-module
 /// namespaces (`loading`, `runtimeControl`, `ui`, `gameSaving`,
@@ -288,10 +291,17 @@ pub trait DoomHost {
 ///     IRQ + monotonic ms counter mirroring the BIOS arm's
 ///     `arch::time::now_ms`; doom.rs is UEFI-x86_64-only so the
 ///     BIOS arm's existing counter isn't reachable.
-///   * `size_of_save_game(gamemap)` — returns 0 ("no save present"
-///     for that gamemap) per trait contract; the matching
-///     `read_save_game` / `write_save_game` impls are still gated on
-///     #375's block_storage reserved-region API.
+///   * `size_of_save_game` / `read_save_game` / `write_save_game` —
+///     live (#375). Persist save slots into a reserved sub-range of
+///     the virtio-blk disk via `block_storage::reserve_region`
+///     (commit ad2889c). 64 slots × 65 sectors per slot, based at
+///     sector 1024 — well clear of the #337 checkpoint at sector 0.
+///     Each slot is one header sector ("DOOMSAV1" magic + length +
+///     CRC-32) followed by up to 64 data sectors (32 KiB cap, ample
+///     for Doom's typical sub-1-KiB save shape). Magic / CRC failure
+///     reads as length-0 ("no save"), so a fresh disk or a torn write
+///     surface as cleanly as a missing slot. See "Save-slot
+///     persistence (#375)" section below for the full layout.
 ///
 /// The real impl is filled in incrementally alongside the
 /// doomgeneric-wasm module landing:
@@ -300,10 +310,6 @@ pub trait DoomHost {
 ///     reports zero WADs so the guest falls through to its built-in
 ///     shareware path (per doom_wasm.h "If numberOfWads remains 0,
 ///     Doom loads shareware WAD").
-///   * `read_save_game` / `write_save_game` — wire to virtio-blk
-///     save-slot region (#375). Waiting on `block_storage` to grow
-///     a reserved-region API that doesn't clobber the #337
-///     checkpoint at sector 0.
 pub struct KernelDoomHost;
 
 impl KernelDoomHost {
@@ -405,70 +411,127 @@ impl DoomHost for KernelDoomHost {
         crate::framebuffer::present();
     }
 
-    fn size_of_save_game(&mut self, _gamemap: i32) -> i32 {
-        // Pure-query. Zero = no save for that gamemap, which is the
-        // correct reading on a fresh boot regardless of wiring: the
-        // guest interprets 0 as "no save slot present" and skips the
-        // `read_save_game` call path entirely (which is exactly what
-        // we need while `read_save_game` / `write_save_game` are
-        // still gated on the block_storage reserved-region API — see
-        // #375 TODOs below).
-        //
-        // TODO(#375): once the block_storage reserved-region API
-        // lands, return the actual persisted slot length for the
-        // requested `gamemap`. Returning a non-zero value here
-        // without the corresponding `read_save_game` impl would cause
-        // the guest to call through and panic, so the TODO is
-        // intentionally paired with the #375 block_storage API gap.
-        0
+    fn size_of_save_game(&mut self, gamemap: i32) -> i32 {
+        // #375. Resolve the slot, read its one-sector header, validate
+        // the magic + CRC, and return the recorded length. Any failure
+        // along the path (slot index out of range, region reserve
+        // refused because the disk is unmounted or undersized, header
+        // I/O failure, magic mismatch, CRC mismatch) collapses to 0 —
+        // the guest interprets 0 as "no save present for this gamemap"
+        // and skips the matching `read_save_game` call entirely, which
+        // is the safe behavior whether the disk is genuinely empty or
+        // we just can't read it. Errors are silent (no `crate::println`
+        // chatter) because Doom calls this every time the player opens
+        // the load menu and a noisy log on a fresh disk would drown
+        // the rest of boot.
+        match read_save_header(gamemap) {
+            Some(header) => header.length as i32,
+            None => 0,
+        }
     }
 
-    fn read_save_game(&mut self, _gamemap: i32, _out: &mut [u8]) -> i32 {
-        // TODO(#375): wire to a block_storage reserved-region API.
+    fn read_save_game(&mut self, gamemap: i32, out: &mut [u8]) -> i32 {
+        // #375. Two-phase read:
+        //   1. Read + validate the header sector. Bail with 0 on any
+        //      magic / CRC failure (matches `size_of_save_game`'s
+        //      contract — if it would have returned 0, this returns
+        //      0 too, even if the guest calls through anyway).
+        //   2. Read the data sectors covering `header.length` bytes
+        //      into a sector-sized scratch vec, verify CRC32, and
+        //      copy `min(header.length, out.len())` bytes into `out`.
         //
-        // Today `block_storage` only exposes checkpoint semantics
-        // (`mount` / `checkpoint` / `last_state` / `smoke_round_trip`)
-        // — one global state slot covering sector 0 (header) and
-        // sectors 1..N (state bytes), owned by the #337 checkpoint
-        // pipeline. There is no per-region sector API that would let
-        // Doom claim its own slab without stomping on #337 or sharing
-        // a serializer with it. Implementing save/restore here would
-        // require adding a reserved-region primitive to
-        // `block_storage` (e.g. sectors 1000..1999 as a Doom save
-        // region, with its own header + CRC), which this sub-task is
-        // explicitly scoped out of (file ownership: doom.rs only).
-        //
-        // Guarded by the `size_of_save_game(gamemap) == 0` check on
-        // the guest side — if the guest still calls through before
-        // the API lands, return 0 (zero bytes copied) rather than
-        // panicking, so a stray call doesn't crash the kernel mid-
-        // tic. The header allows 0 as a legal return ("returns bytes
-        // actually copied").
-        0
+        // RegionHandle::read takes whole-sector buffers, so we round
+        // `header.length` up to the next 512-byte boundary for the
+        // scratch allocation, then truncate when copying out. The
+        // 64-sector cap on slot data (`SAVE_DATA_SECTORS`) bounds the
+        // allocation at 32 KiB.
+        let header = match read_save_header(gamemap) {
+            Some(h) => h,
+            None => return 0,
+        };
+        let region = match save_slot_region(gamemap) {
+            Some(r) => r,
+            None => return 0,
+        };
+        let length = header.length as usize;
+        if length == 0 {
+            return 0;
+        }
+        let data_sectors = length.div_ceil(BLOCK_SECTOR_SIZE);
+        if data_sectors as u64 > SAVE_DATA_SECTORS {
+            return 0;
+        }
+        let mut data = vec![0u8; data_sectors * BLOCK_SECTOR_SIZE];
+        if region.read(SAVE_HEADER_SECTOR_OFFSET + 1, &mut data).is_err() {
+            return 0;
+        }
+        // Verify CRC over the in-range data. A mismatch here means the
+        // header was clean but the data sectors are torn — treat as
+        // "no save".
+        if crc32_bytes(&data[..length]) != header.crc32 {
+            return 0;
+        }
+        let to_copy = core::cmp::min(length, out.len());
+        out[..to_copy].copy_from_slice(&data[..to_copy]);
+        to_copy as i32
     }
 
-    fn write_save_game(&mut self, _gamemap: i32, _data: &[u8]) -> i32 {
-        // TODO(#375): wire to a block_storage reserved-region API.
+    fn write_save_game(&mut self, gamemap: i32, data: &[u8]) -> i32 {
+        // #375. Build the header (magic + length + CRC32 over `data`),
+        // write the data sectors first, then the header sector, then
+        // flush. Header-last ordering mirrors `block_storage::checkpoint`
+        // (#337): a torn write that loses the header leaves the slot
+        // with a stale magic / mismatched CRC, so the next read falls
+        // back to "no save" rather than surfacing inconsistent bytes.
         //
-        // Same shape as `read_save_game` above — `block_storage` has
-        // no per-region sector API today; the only primitive is
-        // `checkpoint(&[u8])` / `last_state()` which owns the single
-        // global state slot and would conflict with #337's kernel-
-        // state checkpoint. The sector-level primitives in
-        // `crate::block` (`read_sector` / `write_sector` / `flush`)
-        // are available, but carving out a Doom save region at e.g.
-        // sectors 1000..1999 belongs in `block_storage` (header +
-        // CRC + version lives alongside the existing checkpoint
-        // header), not scattered across callers.
-        //
-        // Per the header: returns "bytes persisted (0 if
-        // unsupported)". Returning 0 is the documented "unsupported"
-        // signal, which is exactly the truth while #375 is open —
-        // the guest should treat the save as failed and surface a
-        // visible error rather than spinning on an apparent success.
-        // Deferred until the `block_storage` API grows a
-        // `reserve_region(base, sectors)` primitive — see #375.
-        0
+        // Returns `data.len()` on full success, 0 on any I/O failure.
+        // The guest's contract for write is "bytes persisted (0 if
+        // unsupported)" — anything short of a full success is reported
+        // as 0 so Doom can surface a visible save-failed error rather
+        // than spinning on a partial write.
+        if data.len() > SAVE_DATA_BYTES_MAX {
+            return 0;
+        }
+        let region = match save_slot_region(gamemap) {
+            Some(r) => r,
+            None => return 0,
+        };
+        // Round data up to whole sectors with zero padding. The CRC is
+        // taken over the original `data` (not the padded buffer) so a
+        // future shorter save in the same slot won't accidentally
+        // CRC-collide with stale tail bytes.
+        let data_sectors = if data.is_empty() {
+            0
+        } else {
+            data.len().div_ceil(BLOCK_SECTOR_SIZE)
+        };
+        if data_sectors > 0 {
+            let mut padded = vec![0u8; data_sectors * BLOCK_SECTOR_SIZE];
+            padded[..data.len()].copy_from_slice(data);
+            if region
+                .write(SAVE_HEADER_SECTOR_OFFSET + 1, &padded)
+                .is_err()
+            {
+                return 0;
+            }
+        }
+        let header = SaveHeader {
+            magic: *SAVE_MAGIC,
+            length: data.len() as u32,
+            crc32: crc32_bytes(data),
+        };
+        let mut header_sector = [0u8; BLOCK_SECTOR_SIZE];
+        header.encode(&mut header_sector);
+        if region
+            .write(SAVE_HEADER_SECTOR_OFFSET, &header_sector)
+            .is_err()
+        {
+            return 0;
+        }
+        if region.flush().is_err() {
+            return 0;
+        }
+        data.len() as i32
     }
 
     fn on_info_message(&mut self, message: &str) {
@@ -833,4 +896,176 @@ pub fn bind_doom_imports<T: DoomHost + 'static>(linker: &mut Linker<T>) {
             },
         )
         .expect("doom: duplicate import console.onErrorMessage");
+}
+
+// ── Save-slot persistence (#375) ────────────────────────────────────
+//
+// Doom's save imports (`sizeOfSaveGame` / `readSaveGame` /
+// `writeSaveGame`) land here. The on-disk layout is a fixed-size table
+// reserved out of the virtio-blk disk via
+// `block_storage::reserve_region` (#394 / commit ad2889c) so it sits
+// well above the #337 checkpoint footprint at sector 0..N.
+//
+// Layout:
+//
+//   Slot stride    = 65 sectors  = 32.5 KiB  (1 header + 64 data).
+//   Slot count     = 64.
+//   Base sector    = 1024.
+//   Footprint      = 1024 + 64*65 = 5184 sectors = 2.59 MiB.
+//
+// The 2.59 MiB total fits inside the harness's current 8 MiB virtio-blk
+// disk image and well clear of the checkpoint body's practical upper
+// bound (the kernel's checkpoint state is KB-scale today; sector 1024
+// leaves ~512 KiB of headroom for checkpoint growth before we collide,
+// per the module-level "rule of thumb" in `block_storage`).
+//
+// 32 KiB per slot is generous: Doom's save shape is typically <1 KiB
+// (one player, current level state, a few flags). Anything that grows
+// past 32 KiB is a malformed save and is rejected with 0.
+//
+// Per-slot header (one sector, only the first 16 bytes are populated;
+// the rest is zero-padded so a torn previous-write doesn't leak into
+// the new header on a partial commit):
+//
+//   bytes  0..8   — magic "DOOMSAV1" (distinguishes from the #337
+//                   `AREST-K1` checkpoint magic so a misdirected read
+//                   fails fast).
+//   bytes  8..12  — `length: u32 LE`  — actual save-data byte count.
+//   bytes 12..16  — `crc32:  u32 LE`  — CRC-32/IEEE over the first
+//                   `length` data bytes.
+//   bytes 16..512 — zero.
+//
+// CRC and magic are validated together: a mismatch on either is treated
+// as "no save" and the slot reads as length-0. This trades the
+// possibility of silently dropping a torn save for the safety of never
+// surfacing inconsistent bytes to Doom.
+//
+// Round-trip example (sanity-check the arithmetic):
+//   `write_save_game(5, &[1, 2, 3])`:
+//     * slot 5 base sector  = 1024 + 5 * 65 = 1349.
+//     * data sector         = 1350 (offset 1 inside the region).
+//     * header sector       = 1349 (offset 0 inside the region).
+//     * `padded` = [1, 2, 3, 0, 0, ..., 0] (512 bytes); written.
+//     * header = { magic="DOOMSAV1", length=3, crc32=CRC32([1,2,3]) }.
+//     * header sector written, region flushed.
+//     * returns 3.
+//   `read_save_game(5, &mut out)` afterwards:
+//     * reads header, validates magic + that CRC arithmetic isn't done
+//       yet (we only trust crc after data is read);
+//     * `data_sectors = ceil(3/512) = 1`, allocates 512-byte buf,
+//       region.read(1, buf);
+//     * `crc32_bytes(buf[..3]) == header.crc32` — yes;
+//     * copies `min(3, out.len())` bytes; returns that count.
+
+/// Magic bytes for the save-slot header. Distinct from the #337
+/// `AREST-K1` checkpoint magic so a misdirected read at the wrong
+/// sector is recognized and rejected rather than silently parsed.
+const SAVE_MAGIC: &[u8; 8] = b"DOOMSAV1";
+
+/// First sector of the Doom save table. Picked well clear of the #337
+/// checkpoint footprint (sector 0 + body sectors 1..N).
+const SAVE_BASE_SECTOR: u64 = 1024;
+
+/// Number of save slots in the table. Doom only ever uses 0..7
+/// (`load1`..`load8` in the menu), but the table is over-provisioned
+/// so a future mod that exposes more slots doesn't reshape the disk.
+const SAVE_SLOT_COUNT: u64 = 64;
+
+/// Per-slot data sectors (excluding the header sector). 64 sectors =
+/// 32 KiB max payload — comfortably above Doom's typical sub-1-KiB
+/// save shape.
+const SAVE_DATA_SECTORS: u64 = 64;
+
+/// Per-slot stride in sectors: 1 header + `SAVE_DATA_SECTORS` data.
+const SAVE_SLOT_STRIDE: u64 = 1 + SAVE_DATA_SECTORS;
+
+/// Header sector offset within a slot's region (always 0 — the header
+/// is always the first sector). Named for clarity at the call site.
+const SAVE_HEADER_SECTOR_OFFSET: u64 = 0;
+
+/// Maximum save data length in bytes. Anything larger is rejected at
+/// `write_save_game` time so we never write a header whose `length`
+/// field exceeds the data sector capacity.
+const SAVE_DATA_BYTES_MAX: usize = (SAVE_DATA_SECTORS as usize) * BLOCK_SECTOR_SIZE;
+
+/// Build a `RegionHandle` for the given gamemap's save slot, or `None`
+/// if the gamemap is out of range or `block_storage::reserve_region`
+/// refuses (no virtio-blk device, range past disk capacity).
+fn save_slot_region(gamemap: i32) -> Option<RegionHandle> {
+    if gamemap < 0 {
+        return None;
+    }
+    let slot = gamemap as u64;
+    if slot >= SAVE_SLOT_COUNT {
+        return None;
+    }
+    let base = SAVE_BASE_SECTOR + slot * SAVE_SLOT_STRIDE;
+    block_storage::reserve_region(base, SAVE_SLOT_STRIDE).ok()
+}
+
+/// Read + validate the header sector for a slot. Returns `None` if the
+/// region can't be reserved, the header read fails, the magic doesn't
+/// match, or the recorded length exceeds the slot's data capacity.
+/// (CRC validation is deferred to `read_save_game` since it needs the
+/// data bytes; here we only confirm the header is structurally valid.)
+fn read_save_header(gamemap: i32) -> Option<SaveHeader> {
+    let region = save_slot_region(gamemap)?;
+    let mut sector = [0u8; BLOCK_SECTOR_SIZE];
+    region.read(SAVE_HEADER_SECTOR_OFFSET, &mut sector).ok()?;
+    let header = SaveHeader::decode(&sector);
+    if &header.magic != SAVE_MAGIC {
+        return None;
+    }
+    if header.length as usize > SAVE_DATA_BYTES_MAX {
+        return None;
+    }
+    Some(header)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SaveHeader {
+    magic: [u8; 8],
+    length: u32,
+    crc32: u32,
+}
+
+impl SaveHeader {
+    fn encode(self, buf: &mut [u8; BLOCK_SECTOR_SIZE]) {
+        // Zero the entire sector first so the unused 16..512 range is
+        // deterministic — keeps the on-disk image reproducible across
+        // writes and prevents stale bytes from a torn previous header
+        // from looking like meaningful state to a debugging hex-dump.
+        buf.fill(0);
+        buf[0..8].copy_from_slice(&self.magic);
+        buf[8..12].copy_from_slice(&self.length.to_le_bytes());
+        buf[12..16].copy_from_slice(&self.crc32.to_le_bytes());
+    }
+
+    fn decode(buf: &[u8; BLOCK_SECTOR_SIZE]) -> Self {
+        let mut magic = [0u8; 8];
+        magic.copy_from_slice(&buf[0..8]);
+        let length = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+        let crc32 = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
+        Self { magic, length, crc32 }
+    }
+}
+
+/// CRC-32/IEEE over `data`. Inlined here rather than depending on
+/// `crc32fast` because (a) the kernel doesn't already have that crate
+/// (verified against `Cargo.toml` at #375 implementation time) and a
+/// new dep would touch a file outside this sub-task's ownership, and
+/// (b) Doom save data is sub-KiB so a table-free implementation costs
+/// microseconds. Algorithm matches `block_storage::crc32` exactly so
+/// the Doom save format is verifiable with the same off-line tooling
+/// that inspects #337 checkpoints.
+fn crc32_bytes(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
 }
