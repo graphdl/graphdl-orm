@@ -100,7 +100,8 @@ if ($Smoke) {
             "pre-EBS:  ConOut active",
             "SSE enabled",
             "post-EBS: 16550 COM1 active",
-            "frames usable"
+            "frames usable",
+            "post-EBS heap live (sum 0..16 = 120)"
         )
         $missing = @()
         foreach ($phrase in $expected) {

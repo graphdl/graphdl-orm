@@ -175,6 +175,18 @@ fn efi_main() -> Status {
     println!(
         "  mem:      {frame_count} frames usable ({usable_mib} MiB) (UEFI memory map)"
     );
+
+    // Post-EBS heap smoke (step 4d wave 3, 5b74f2a). `uefi::allocator`
+    // would fault here because BootServices is gone; our static-BSS
+    // `LockedHeap` keeps serving allocations. Building a Vec and
+    // summing it proves both the heap init from pre-EBS carried
+    // through AND `format!` on the post-EBS 16550 path still works.
+    // Sum of 0..16 is 120 — the host-side smoke asserts that exact
+    // number.
+    let test_vec: alloc::vec::Vec<u32> = (0..16u32).collect();
+    let sum: u32 = test_vec.iter().sum();
+    println!("  alloc:    post-EBS heap live (sum 0..16 = {sum})");
+
     println!("  next:        kernel_run handoff (step 4d)");
 
     // Scaffold halt — via the facade so the call site is identical
