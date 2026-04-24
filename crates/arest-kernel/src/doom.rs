@@ -303,14 +303,43 @@ impl DoomHost for KernelDoomHost {
     }
 
     fn read_save_game(&mut self, _buf_ptr: i32) {
+        // TODO(#375): wire to a block_storage reserved-region API.
+        //
+        // Today `block_storage` only exposes checkpoint semantics
+        // (`mount` / `checkpoint` / `last_state` / `smoke_round_trip`)
+        // — one global state slot covering sector 0 (header) and
+        // sectors 1..N (state bytes), owned by the #337 checkpoint
+        // pipeline. There is no per-region sector API that would let
+        // Doom claim its own slab without stomping on #337 or sharing
+        // a serializer with it. Implementing save/restore here would
+        // require adding a reserved-region primitive to
+        // `block_storage` (e.g. sectors 1000..1999 as a Doom save
+        // region, with its own header + CRC), which this sub-task is
+        // explicitly scoped out of (file ownership: doom.rs only).
+        //
         // Guarded by the `size_of_save_game() == 0` check on the
-        // guest side — if the guest still calls through, treat it
-        // as a contract violation and panic.
-        panic!("doom: read_save_game not yet implemented");
+        // guest side — if the guest still calls through before the
+        // API lands, treat it as a contract violation and panic.
+        panic!("doom: read_save_game not yet implemented (see #375 TODO)");
     }
 
     fn write_save_game(&mut self, _buf_ptr: i32, _len: i32) {
-        panic!("doom: write_save_game not yet implemented");
+        // TODO(#375): wire to a block_storage reserved-region API.
+        //
+        // Same shape as `read_save_game` above — `block_storage` has
+        // no per-region sector API today; the only primitive is
+        // `checkpoint(&[u8])` / `last_state()` which owns the single
+        // global state slot and would conflict with #337's kernel-
+        // state checkpoint. The sector-level primitives in
+        // `crate::block` (`read_sector` / `write_sector` / `flush`)
+        // are available, but carving out a Doom save region at e.g.
+        // sectors 1000..1999 belongs in `block_storage` (header +
+        // CRC + version lives alongside the existing checkpoint
+        // header), not scattered across callers.
+        //
+        // Deferred until the `block_storage` API grows a
+        // `reserve_region(base, sectors)` primitive — see #375.
+        panic!("doom: write_save_game not yet implemented (see #375 TODO)");
     }
 
     fn on_info_message(&mut self, _ptr: i32, _len: i32) {
