@@ -294,6 +294,36 @@ fn efi_main() -> Status {
         if dma_ok { "live" } else { "NONE (carve failed)" }
     );
 
+    // virtio statics + PCI walker smoke (#344/#345). Seeds the virtio
+    // HAL's phys_offset (= 0 under UEFI's identity mapping) and walks
+    // legacy PCI config space via the 0xCF8/0xCFC port pair. On UEFI
+    // x86_64 + QEMU-OVMF the port pair remains wired to the PCI host
+    // bridge -- firmware boot mode doesn't change the legacy PIO path
+    // -- so the same `pci::find_virtio_net` / `find_virtio_blk` the
+    // BIOS `kernel_run` calls works byte-for-byte here. Without
+    // `-device virtio-*-pci` in the smoke's QEMU args, both scans
+    // return None; a live scan would appear here with the device
+    // coordinates. Either way, a `pci: walk OK` line proves the port
+    // I/O path + PCI bus iteration ran without faulting.
+    crate::virtio::init_offset(0);
+    let virtio_net_pci = crate::pci::find_virtio_net();
+    let virtio_blk_pci = crate::pci::find_virtio_blk();
+    println!(
+        "  pci:      walk OK (virtio-net: {}, virtio-blk: {})",
+        match &virtio_net_pci {
+            Some(d) => alloc::format!(
+                "{:02x}:{:02x}.{}", d.bus, d.device, d.function
+            ),
+            None => alloc::string::String::from("none"),
+        },
+        match &virtio_blk_pci {
+            Some(d) => alloc::format!(
+                "{:02x}:{:02x}.{}", d.bus, d.device, d.function
+            ),
+            None => alloc::string::String::from("none"),
+        },
+    );
+
     // Report GOP capture (the pre-EBS snapshot above). MMIO at
     // `gop_ptr..gop_ptr+gop_size` is driven by the GPU post-EBS,
     // so direct pixel writes are valid without BootServices.

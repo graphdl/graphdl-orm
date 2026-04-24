@@ -111,6 +111,7 @@ if ($Smoke) {
             "post-EBS: 16550 COM1 active",
             "frames usable",
             "dma:      pool live (2 MiB UEFI memory-map carve for virtio)",
+            "pci:      walk OK (virtio-net:",
             "post-EBS heap live (sum 0..16 = 120)",
             "system::init() completed (arest engine live on UEFI)",
             "tiny module executed, main() = 42",
