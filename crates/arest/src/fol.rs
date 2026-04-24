@@ -639,4 +639,144 @@ mod tests {
         let term = FolTerm::Raw(inner);
         assert_eq!(apply(&term.to_func(), &phi, &phi), Object::atom("answer"));
     }
+
+    /// Review finding (ac474845): even a `#[ignore]` stub would
+    /// document the gap. The foundation docstring (`fol.rs:118-130`
+    /// on `FolTerm::Var`) explicitly flags that nested quantifiers
+    /// with `Var("outer")` silently resolve to the *innermost*
+    /// binding because lowering today just emits `Func::Id`.
+    ///
+    /// This test sets up `ForAll(x, ..., ForAll(y, ..., Eq(Var("x"),
+    /// Var("y"))))` with a state where the outer and inner fact
+    /// types have distinct role-1 atoms. Under correct scope
+    /// resolution the inner body should compare the outer-bound
+    /// variable to the inner-bound variable (so True iff outer == inner
+    /// for every pair), which with disjoint role values is False for
+    /// the cross terms and True only on the diagonal.
+    ///
+    /// Under the current `Var` lowering (`Func::Id`) both `Var("x")`
+    /// and `Var("y")` resolve to the innermost bound fact, so the
+    /// comparison degrades to `fact_y = fact_y` and always returns
+    /// True — masking the bug.
+    ///
+    /// Until the `Var` → scope-stack rewire lands, this test stays
+    /// `#[ignore]` so it documents the open work without failing
+    /// the suite.
+    #[test]
+    #[ignore]
+    fn nested_quantifier_resolves_outer_var() {
+        // State: ft_outer has one fact with role 1 = "x";
+        //        ft_inner has two facts with role 1 = "x" and "y".
+        let mut state = Object::phi();
+        state = ast::cell_push("ft_outer", ast::fact_from_pairs(&[("o", "x")]), &state);
+        state = ast::cell_push("ft_inner", ast::fact_from_pairs(&[("i", "x")]), &state);
+        state = ast::cell_push("ft_inner", ast::fact_from_pairs(&[("i", "y")]), &state);
+
+        // ∀ x ∈ ft_outer. ∀ y ∈ ft_inner. role_1(x) = role_1(y)
+        // Correct semantics: outer role_1 is "x"; inner role_1 is
+        // "x" for one fact and "y" for the other. ∀-over-inner
+        // requires every pairing to hold, and "x" ≠ "y" for one of
+        // the pairs, so the whole expression is False.
+        let term = FolTerm::ForAll(
+            "x".into(),
+            FactSource::Single("ft_outer".into()),
+            Box::new(FolTerm::ForAll(
+                "y".into(),
+                FactSource::Single("ft_inner".into()),
+                Box::new(FolTerm::Eq(
+                    Box::new(FolTerm::RoleVal("x".into(), 1)),
+                    Box::new(FolTerm::RoleVal("y".into(), 1)),
+                )),
+            )),
+        );
+        assert_eq!(apply(&term.to_func(), &state, &state), f());
+    }
+
+    /// Review finding (ac474845): "one quickcheck closure catches
+    /// `Insert`-over-empty edge cases better than adding 6 one-off
+    /// variant tests."
+    ///
+    /// This is a hand-rolled property check (no quickcheck crate)
+    /// over a small set of FolTerm shapes. It verifies the semantic
+    /// identity:
+    ///
+    ///   And(xs).to_func().evaluate(state)
+    ///     == T iff every x in xs lowers to T
+    ///
+    /// and likewise for Or. The shape set covers:
+    ///
+    ///   * empty   — Backus's Insert is undefined on `<>`, so
+    ///     lowering must emit the unit element directly
+    ///     (`And` → T, `Or` → F).
+    ///   * singleton — lowering passes the element through; no
+    ///     Insert wrapper.
+    ///   * N-ary (2+ elements) — Insert-over-Construction path,
+    ///     mixing T/F inputs to exercise both early- and late-
+    ///     terminating fold positions.
+    #[test]
+    fn and_or_lowerings_match_fold_identity() {
+        let phi = Object::phi();
+        let t_obj = t();
+
+        // Hand-curated shape set. Each element reduces to T or F
+        // via its `to_func()`, so we can compute the expected
+        // conjunction / disjunction directly with `.all` / `.any`.
+        let shape_sets: Vec<Vec<FolTerm>> = vec![
+            // empty
+            vec![],
+            // singletons
+            vec![FolTerm::True],
+            vec![FolTerm::False],
+            // 2-ary, both truth polarities
+            vec![FolTerm::True, FolTerm::True],
+            vec![FolTerm::True, FolTerm::False],
+            vec![FolTerm::False, FolTerm::True],
+            vec![FolTerm::False, FolTerm::False],
+            // 3-ary mix — exercises the Construction path
+            vec![FolTerm::True, FolTerm::True, FolTerm::True],
+            vec![FolTerm::True, FolTerm::False, FolTerm::True],
+            vec![FolTerm::False, FolTerm::False, FolTerm::True],
+            // 5-ary — beyond the 2/3-arg cases the unit tests above
+            // lock in, confirming the fold extends uniformly.
+            vec![
+                FolTerm::True,
+                FolTerm::True,
+                FolTerm::True,
+                FolTerm::True,
+                FolTerm::True,
+            ],
+            vec![
+                FolTerm::True,
+                FolTerm::True,
+                FolTerm::False,
+                FolTerm::True,
+                FolTerm::True,
+            ],
+        ];
+
+        for xs in shape_sets {
+            // Expected values via Rust's own iterator fold over each
+            // element's lowered evaluation.
+            let per_elem: Vec<Object> = xs
+                .iter()
+                .map(|x| apply(&x.clone().to_func(), &phi, &phi))
+                .collect();
+            let expected_and = if per_elem.iter().all(|v| *v == t_obj) { t() } else { f() };
+            let expected_or = if per_elem.iter().any(|v| *v == t_obj) { t() } else { f() };
+
+            let and_result = apply(&FolTerm::And(xs.clone()).to_func(), &phi, &phi);
+            let or_result = apply(&FolTerm::Or(xs.clone()).to_func(), &phi, &phi);
+
+            assert_eq!(
+                and_result, expected_and,
+                "And fold identity violated for shape {:?}",
+                xs,
+            );
+            assert_eq!(
+                or_result, expected_or,
+                "Or fold identity violated for shape {:?}",
+                xs,
+            );
+        }
+    }
 }
