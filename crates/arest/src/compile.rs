@@ -4204,18 +4204,28 @@ fn compile_mandatory_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
         // facts of the constrained fact type from eval context
         let ft_facts = extract_facts_func(&span.fact_type_id);
 
-        // binding_match: <instance, <noun, val>> -> T if noun == noun_name AND val == instance
-        let noun_const = Func::constant(Object::atom(noun_name));
-        let binding_match = Func::compose(Func::And, Func::construction(vec![
-            Func::compose(Func::Eq, Func::construction(vec![
-                Func::compose(Func::Selector(1), Func::Selector(2)),  // noun from binding
-                noun_const,
-            ])),
-            Func::compose(Func::Eq, Func::construction(vec![
-                Func::compose(Func::Selector(2), Func::Selector(2)),  // val from binding
-                Func::Selector(1),                                     // instance from outer pair
-            ])),
-        ]));
+        // binding_match: <instance, <noun, val>> -> T if
+        //   noun (inner Sel(1).Sel(2)) = noun_name literal
+        //   AND val (inner Sel(2).Sel(2)) = instance (outer Sel(1)).
+        // Routed through FolTerm (#357). Raw wraps the nested-
+        // Selector reach into the <outer, inner> tuple; the
+        // conjunction + equalities are pure FOL atoms.
+        let binding_match = {
+            use crate::fol::FolTerm;
+            let binding_noun = Func::compose(Func::Selector(1), Func::Selector(2));
+            let binding_val  = Func::compose(Func::Selector(2), Func::Selector(2));
+            FolTerm::And(vec![
+                FolTerm::Eq(
+                    Box::new(FolTerm::Raw(binding_noun)),
+                    Box::new(FolTerm::Const(Object::atom(noun_name))),
+                ),
+                FolTerm::Eq(
+                    Box::new(FolTerm::Raw(binding_val)),
+                    Box::new(FolTerm::Raw(Func::Selector(1))),
+                ),
+            ])
+            .to_func()
+        };
 
         // fact_mentions: <instance, fact> -> T if fact has binding <noun, instance>
         // DistL on <instance, fact_bindings> -> <<instance, binding1>, ...>
@@ -4284,11 +4294,18 @@ fn compile_frequency_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
         let facts = extract_facts_func(&span.fact_type_id);
         let scope_idx = span.role_index;
 
-        // same_scope: <fact, candidate> -> T if scope values match
-        let same_scope = Func::compose(Func::Eq, Func::construction(vec![
-            Func::compose(role_value(scope_idx), Func::Selector(1)),
-            Func::compose(role_value(scope_idx), Func::Selector(2)),
-        ]));
+        // same_scope: <fact, candidate> -> T if scope values match.
+        // Routed through FolTerm (#357).
+        let same_scope = {
+            use crate::fol::FolTerm;
+            let scope_fact = Func::compose(role_value(scope_idx), Func::Selector(1));
+            let scope_cand = Func::compose(role_value(scope_idx), Func::Selector(2));
+            FolTerm::Eq(
+                Box::new(FolTerm::Raw(scope_fact)),
+                Box::new(FolTerm::Raw(scope_cand)),
+            )
+            .to_func()
+        };
 
         // For <fact, all_facts>: DistL gives <<fact, f1>, <fact, f2>, ...>
         // Filter(same_scope) keeps pairs where scope matches
