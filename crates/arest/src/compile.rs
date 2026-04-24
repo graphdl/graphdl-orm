@@ -4472,21 +4472,26 @@ fn compile_set_comparison_ast(
     // All instances of the entity noun from eval context population
     let instances = Func::compose(instances_of_noun_func(&entity_name), Func::Selector(3));
 
-    // For each clause FT, build a participation check: <instance, ctx> -> T/F
-    // A fact mentions the entity if any binding has noun == entity_name AND val == instance.
-    let entity_const = Func::constant(Object::atom(&entity_name));
-
-    // binding_match : <instance, <noun, val>> -> T if noun == entity AND val == instance
-    let binding_match = Func::compose(Func::And, Func::construction(vec![
-        Func::compose(Func::Eq, Func::construction(vec![
-            Func::compose(Func::Selector(1), Func::Selector(2)),  // noun from binding
-            entity_const,
-        ])),
-        Func::compose(Func::Eq, Func::construction(vec![
-            Func::compose(Func::Selector(2), Func::Selector(2)),  // val from binding
-            Func::Selector(1),                                     // instance
-        ])),
-    ]));
+    // For each clause FT, build a participation check: <instance, ctx> -> T/F.
+    // A fact mentions the entity if any binding has noun == entity_name AND
+    // val == instance. Same atom shape as compile_mandatory_ast's
+    // binding_match — routed through FolTerm (#357).
+    let binding_match = {
+        use crate::fol::FolTerm;
+        let binding_noun = Func::compose(Func::Selector(1), Func::Selector(2));
+        let binding_val  = Func::compose(Func::Selector(2), Func::Selector(2));
+        FolTerm::And(vec![
+            FolTerm::Eq(
+                Box::new(FolTerm::Raw(binding_noun)),
+                Box::new(FolTerm::Const(Object::atom(&entity_name))),
+            ),
+            FolTerm::Eq(
+                Box::new(FolTerm::Raw(binding_val)),
+                Box::new(FolTerm::Raw(Func::Selector(1))),
+            ),
+        ])
+        .to_func()
+    };
 
     // fact_mentions : <instance, fact> -> T if fact has matching binding
     let fact_mentions = Func::compose(
