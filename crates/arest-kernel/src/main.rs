@@ -55,6 +55,14 @@ mod entry_uefi_aarch64;
 // commit with no kernel_run → no wasmi caller).
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 mod doom;
+// Doom WASM binary re-export (#372). Pairs with `mod doom;` — while
+// `doom.rs` is the host-shim trait + linker binding, `doom_bin.rs`
+// just exposes `DOOM_WASM: &[u8]` baked from `doom_assets/doom.wasm`
+// by build.rs. Gated the same way as the shim itself (wasmi is
+// UEFI-x86_64-only). Empty slice on fresh clones that skipped the
+// binary stage — see doom_bin.rs top-of-file for the rationale.
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+mod doom_bin;
 
 // `arch` is shared between both entries (#344 step 3). On UEFI it
 // supplies `_print` via ConOut so the existing `println!` macros
