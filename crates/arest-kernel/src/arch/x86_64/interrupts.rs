@@ -193,11 +193,17 @@ extern "x86-interrupt" fn keyboard_handler(_stack_frame: InterruptStackFrame) {
     let mut port = Port::<u8>::new(0x60);
     let scancode: u8 = unsafe { port.read() };
 
-    // Decode the scancode first so we can determine whether this is
-    // an Enter key before deciding when to send EOI.
+    // Decode the scancode once; fork the decoded event into two
+    // consumers:
+    //   - Doom input ring (raw KeyEvent, includes press/release) —
+    //     only the keycode + state matters, so we forward *before*
+    //     process_keyevent collapses the event to DecodedKey.
+    //   - REPL (DecodedKey::Unicode only) — the existing line-editor
+    //     path; raw keys are irrelevant to it.
     let decoded_ch: Option<char> = if let Some(keyboard) = KEYBOARD.get() {
         let mut kb = keyboard.lock();
         if let Ok(Some(event)) = kb.add_byte(scancode) {
+            super::input::push_event(&event);
             if let Some(key) = kb.process_keyevent(event) {
                 match key {
                     DecodedKey::Unicode(ch) => Some(ch),

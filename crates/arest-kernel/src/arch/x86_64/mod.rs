@@ -11,6 +11,7 @@
 // same facade after ExitBootServices.
 
 pub mod gdt;
+pub mod input;
 pub mod interrupts;
 pub mod memory;
 pub mod serial;
