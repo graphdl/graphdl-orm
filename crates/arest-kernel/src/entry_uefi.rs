@@ -41,6 +41,7 @@ use core::cell::UnsafeCell;
 use linked_list_allocator::LockedHeap;
 use uefi::prelude::*;
 use uefi::boot::MemoryType;
+use uefi::mem::memory_map::MemoryMapOwned;
 
 use crate::println;
 
@@ -260,6 +261,41 @@ fn efi_main() -> Status {
     // banner doesn't disappear into a no-op.
     crate::arch::switch_to_post_ebs_serial();
 
+    // Hand off to the post-EBS body. Mirrors the BIOS arm's shape
+    // (`kernel_main` -> `kernel_run`): everything that depends on
+    // a live, post-ExitBootServices world lives in `kernel_run_uefi`,
+    // so downstream UEFI work (#359 net, #363 IDT, #370 virtio-gpu)
+    // can keep adding to the post-EBS tail without growing
+    // `efi_main` further. Never returns.
+    kernel_run_uefi(
+        memory_map,
+        gop_w, gop_h, gop_stride, gop_fmt_idx, gop_ptr, gop_size,
+    )
+}
+
+/// Post-ExitBootServices body for the UEFI x86_64 path.
+///
+/// `efi_main` owns everything that needs BootServices alive (heap
+/// init, ConOut println!s, GOP capture, the `exit_boot_services`
+/// call itself, and the cutover to the direct-I/O 16550 serial).
+/// Once that hand-off is complete, this function takes ownership of
+/// the rest of boot: memory init, DMA pool, virtio, block, the
+/// AREST engine, wasmi, and the Doom shim binding.
+///
+/// Sibling of the BIOS arm's `main.rs::kernel_run(phys_offset)` —
+/// same arch-neutral tail, just parameterised differently because
+/// the UEFI path has the firmware memory map + a captured GOP
+/// framebuffer descriptor to feed in, where the BIOS path gets
+/// those via `bootloader_api::BootInfo`.
+fn kernel_run_uefi(
+    memory_map: MemoryMapOwned,
+    gop_w: usize,
+    gop_h: usize,
+    gop_stride: usize,
+    gop_fmt_idx: usize,
+    gop_ptr: usize,
+    gop_size: usize,
+) -> ! {
     println!("  post-EBS: 16550 COM1 active (kernel-managed)");
 
     // Step 4c: consume the firmware memory map, install the paging
