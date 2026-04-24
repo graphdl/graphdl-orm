@@ -103,7 +103,8 @@ if ($Smoke) {
             "frames usable",
             "post-EBS heap live (sum 0..16 = 120)",
             "system::init() completed (arest engine live on UEFI)",
-            "tiny module executed, main() = 42"
+            "tiny module executed, main() = 42",
+            "10 host imports bound to wasmi::Linker"
         )
         $missing = @()
         foreach ($phrase in $expected) {
