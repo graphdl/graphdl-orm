@@ -3997,17 +3997,30 @@ fn compile_uniqueness_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
             .find(|&i| i != scope_idx)
             .unwrap_or(if scope_idx == 0 { 1 } else { 0 });
 
-        // same_scope_diff_other on <fact, candidate>
-        let dup_check = Func::compose(Func::And, Func::construction(vec![
-            Func::compose(Func::Eq, Func::construction(vec![
-                Func::compose(role_value(scope_idx), Func::Selector(1)),
-                Func::compose(role_value(scope_idx), Func::Selector(2)),
-            ])),
-            Func::compose(Func::Not, Func::compose(Func::Eq, Func::construction(vec![
-                Func::compose(role_value(other_idx), Func::Selector(1)),
-                Func::compose(role_value(other_idx), Func::Selector(2)),
-            ]))),
-        ]));
+        // same_scope_diff_other on <fact, candidate>:
+        //   role[scope] of fact = role[scope] of candidate
+        //   ∧ role[other] of fact ≠ role[other] of candidate
+        // Routed through FolTerm (#357). Uses Raw so the caller-
+        // supplied `role_value(…)` helpers stay in their original
+        // 0-indexed role-extraction shape.
+        let dup_check = {
+            use crate::fol::FolTerm;
+            let scope_fact = Func::compose(role_value(scope_idx), Func::Selector(1));
+            let scope_cand = Func::compose(role_value(scope_idx), Func::Selector(2));
+            let other_fact = Func::compose(role_value(other_idx), Func::Selector(1));
+            let other_cand = Func::compose(role_value(other_idx), Func::Selector(2));
+            FolTerm::And(vec![
+                FolTerm::Eq(
+                    Box::new(FolTerm::Raw(scope_fact)),
+                    Box::new(FolTerm::Raw(scope_cand)),
+                ),
+                FolTerm::Not(Box::new(FolTerm::Eq(
+                    Box::new(FolTerm::Raw(other_fact)),
+                    Box::new(FolTerm::Raw(other_cand)),
+                ))),
+            ])
+            .to_func()
+        };
 
         // has_any_dup: <fact, all> -> T if scope is duplicated
         let has_any_dup = Func::compose(
