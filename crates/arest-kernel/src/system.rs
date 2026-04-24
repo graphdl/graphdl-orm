@@ -104,6 +104,31 @@ fn route_to_def(path: &str) -> Option<&'static str> {
     }
 }
 
+/// Public entry for ring-3 callers (#333). Same dispatch the HTTP
+/// handler uses, exposed by name for the syscall layer.
+pub fn apply_named_pub(name: &str, body: &[u8]) -> Vec<u8> {
+    apply_named(name, body)
+}
+
+/// Public cell-fetch entry for ring-3 callers (#333). Looks up the
+/// named cell in the baked SYSTEM state and serialises the result
+/// to bytes. Returns the same `\xE2\x8A\xA5\n` (⊥) marker that the
+/// HTTP path uses when the cell is absent or empty.
+///
+/// Goes through `Func::FetchOrPhi` rather than `ast::fetch_or_phi`
+/// so the syscall path is structurally identical to the wire path
+/// — same ρ-dispatch shape, just a different transport.
+pub fn fetch_named(name: &str) -> Vec<u8> {
+    let state = match SYSTEM.get() {
+        Some(s) => s,
+        None => return serialise(&Object::Bottom),
+    };
+    let name_obj = Object::atom(name);
+    let tuple = Object::seq(alloc::vec![name_obj, state.clone()]);
+    let val = ast::apply(&Func::FetchOrPhi, &tuple, state);
+    serialise(&val)
+}
+
 /// Apply the named def to `body` against the baked state and
 /// return the resulting Object serialised as bytes.
 ///

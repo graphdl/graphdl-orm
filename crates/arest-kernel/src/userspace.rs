@@ -54,16 +54,25 @@ pub mod exit_code {
 
 /// Hand-assembled ring-3 test payload.
 ///
-/// For Sec-6.1 on its own, this payload's first `syscall` instruction
-/// triggers a #GP (IA32_EFER.SCE is still zero), which proves we
-/// successfully entered ring 3. Sec-6.2 installs the SYSCALL handler
-/// and this payload then executes the full SYS_yield → SYS_system(stub)
-/// → SYS_exit sequence cleanly.
+/// Drives the syscall gate end-to-end:
 ///
-/// asm source:
-///   mov rax, 5          ; SYS_yield
+///   1. SYS_yield  — proves the trampoline + dispatch + sysretq path.
+///   2. SYS_system — empty key + empty input, validates the ρ-app
+///                   surface even with no-op args.
+///   3. SYS_fetch  with a kernel-half pointer (0xFFFF_8000_…) — proves
+///                   `UserBuf::from_raw` rejects the malicious pointer
+///                   with `EFault` (-14) BEFORE any kernel-side read
+///                   happens. The dispatcher's early-trace `println!`
+///                   makes this rejection visible in the smoke log so
+///                   the harness can assert the security boundary
+///                   was exercised.
+///   4. SYS_exit(SUCCESS) — writes 0x10 to the isa-debug-exit port,
+///                   QEMU exits with code (0x10 << 1) | 1 = 33.
+///
+/// asm source (NASM-flavoured):
+///   mov rax, 5                       ; SYS_yield
 ///   syscall
-///   mov rax, 0          ; SYS_system
+///   mov rax, 0                       ; SYS_system
 ///   xor rdi, rdi
 ///   xor rsi, rsi
 ///   xor rdx, rdx
@@ -71,16 +80,26 @@ pub mod exit_code {
 ///   xor r8,  r8
 ///   xor r9,  r9
 ///   syscall
-///   mov rax, 6          ; SYS_exit
-///   mov rdi, 0x10       ; exit_code::SUCCESS
+///   ; Kernel-half pointer probe — must be rejected with EFault.
+///   mov rax, 1                       ; SYS_fetch
+///   mov rdi, 0xFFFF800000000000      ; kernel-half ptr (illegal)
+///   mov rsi, 4                       ; len
+///   xor rdx, rdx                     ; out_ptr (null OK — never reached)
+///   xor r10, r10                     ; out_cap
+///   syscall
+///   ; (not checking RAX here; the early-trace println in dispatch_inner
+///   ;  surfaces the syscall, and UserBuf::from_raw's EFault is the
+///   ;  expected return — visible in the smoke harness assertions.)
+///   mov rax, 6                       ; SYS_exit
+///   mov rdi, 0x10                    ; exit_code::SUCCESS
 ///   syscall
 ///   ud2
 pub const TEST_PAYLOAD: &[u8] = &[
-    // mov rax, 5
+    // mov rax, 5  (SYS_yield)
     0x48, 0xC7, 0xC0, 0x05, 0x00, 0x00, 0x00,
     // syscall
     0x0F, 0x05,
-    // mov rax, 0
+    // mov rax, 0  (SYS_system)
     0x48, 0xC7, 0xC0, 0x00, 0x00, 0x00, 0x00,
     // xor rdi, rdi
     0x48, 0x31, 0xFF,
@@ -96,7 +115,20 @@ pub const TEST_PAYLOAD: &[u8] = &[
     0x4D, 0x31, 0xC9,
     // syscall
     0x0F, 0x05,
-    // mov rax, 6
+    // mov rax, 1  (SYS_fetch)
+    0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00,
+    // movabs rdi, 0xFFFF800000000000  (REX.W + B8+rd id64) — kernel-half.
+    // imm64 little-endian = 00 00 00 00 00 80 FF FF (LSB → MSB).
+    0x48, 0xBF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0xFF, 0xFF,
+    // mov rsi, 4
+    0x48, 0xC7, 0xC6, 0x04, 0x00, 0x00, 0x00,
+    // xor rdx, rdx
+    0x48, 0x31, 0xD2,
+    // xor r10, r10
+    0x4D, 0x31, 0xD2,
+    // syscall
+    0x0F, 0x05,
+    // mov rax, 6  (SYS_exit)
     0x48, 0xC7, 0xC0, 0x06, 0x00, 0x00, 0x00,
     // mov rdi, 0x10
     0x48, 0xC7, 0xC7, 0x10, 0x00, 0x00, 0x00,
