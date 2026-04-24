@@ -3924,8 +3924,8 @@ fn compile_ring_reflexive_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
 
     // self_refs: instances that DO reference themselves in the ring facts.
     // Filter(role 1 = role 2) : facts -> self-referencing facts; then α(role(0))
-    // projects out the entity id. Predicate routed through FolTerm (#357) —
-    // same FOL atom as compile_ring_irreflexive_ast's is_self_ref.
+    // projects out the entity id. Same FOL atom as
+    // compile_ring_irreflexive_ast's is_self_ref.
     let is_self_ref = {
         use crate::fol::FolTerm;
         FolTerm::Eq(
@@ -4222,9 +4222,9 @@ fn compile_mandatory_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
         // binding_match: <instance, <noun, val>> -> T if
         //   noun (inner Sel(1).Sel(2)) = noun_name literal
         //   AND val (inner Sel(2).Sel(2)) = instance (outer Sel(1)).
-        // Routed through FolTerm (#357). Raw wraps the nested-
-        // Selector reach into the <outer, inner> tuple; the
-        // conjunction + equalities are pure FOL atoms.
+        // `Raw` wraps the key/val tuple-field access (not role
+        // extraction — `binding` is a single <key, val> pair, not
+        // a fact's seq of pairs, so FactRole doesn't apply here).
         let binding_match = {
             use crate::fol::FolTerm;
             let binding_noun = Func::compose(Func::Selector(1), Func::Selector(2));
@@ -4487,7 +4487,8 @@ fn compile_set_comparison_ast(
     // For each clause FT, build a participation check: <instance, ctx> -> T/F.
     // A fact mentions the entity if any binding has noun == entity_name AND
     // val == instance. Same atom shape as compile_mandatory_ast's
-    // binding_match — routed through FolTerm (#357).
+    // binding_match — key/val tuple access uses Raw (FactRole doesn't
+    // fit for single <key, val> pairs).
     let binding_match = {
         use crate::fol::FolTerm;
         let binding_noun = Func::compose(Func::Selector(1), Func::Selector(2));
