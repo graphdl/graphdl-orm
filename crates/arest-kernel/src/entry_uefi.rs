@@ -288,6 +288,20 @@ fn efi_main() -> Status {
     let answer = main_fn.call(&mut store, ()).expect("call main");
     println!("  wasmi:    tiny module executed, main() = {answer} (runtime live on UEFI)");
 
+    // Doom host-shim binding smoke (#270/#271, scaffold f3be6d4).
+    // Creates a Linker<KernelDoomHost>, binds all 10 Doom imports
+    // via `doom::bind_doom_imports`, and prints a success line.
+    // Does NOT invoke any import — the stubs panic — so this only
+    // verifies the binding path compiles and the func_wrap calls
+    // run without a DuplicateDefinition. A real Doom .wasm with
+    // these imports can be instantiated against this linker in a
+    // later commit without needing to re-register.
+    let doom_engine = wasmi::Engine::default();
+    let mut doom_linker: wasmi::Linker<crate::doom::KernelDoomHost> =
+        wasmi::Linker::new(&doom_engine);
+    crate::doom::bind_doom_imports(&mut doom_linker);
+    println!("  doom:     10 host imports bound to wasmi::Linker (ready for #270 guest)");
+
     println!("  next:        kernel_run handoff (step 4d)");
 
     // Scaffold halt — via the facade so the call site is identical
