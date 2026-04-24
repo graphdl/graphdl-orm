@@ -200,6 +200,88 @@ impl BackBuffer {
     pub fn fnv1a(&self) -> u64 {
         fnv1a(&self.bytes)
     }
+
+    /// Blit a Doom-format 640x400 frame into the back buffer,
+    /// centered at 1x scale. `src` is the raw bytes of Doom's
+    /// `DG_ScreenBuffer` — `640 * 400 * 4 = 1_024_000` bytes, stored
+    /// as `0xAARRGGBB` little-endian, which is `[B, G, R, A]` in
+    /// memory. Alpha is ignored (Doom always writes opaque pixels).
+    ///
+    /// Centering: a 1280x720 surface gets a 320-col border on each
+    /// side and a 160-row border top and bottom. Smaller surfaces
+    /// clip from the bottom-right corner. The borders stay whatever
+    /// colour the caller painted them before calling (typical:
+    /// black-filled once at boot, then blit the central rect each
+    /// frame).
+    ///
+    /// Pixel format: only 3bpp Bgr and 3bpp Rgb target surfaces are
+    /// supported — the two QEMU / bootloader_api 0.11 combos that
+    /// appear in practice. Other formats are a no-op (same policy
+    /// `write_pixel` follows — never corrupt the surface).
+    ///
+    /// This is the #270/#271 Doom-host-shim's `drawFrame` import
+    /// implementation. ~1 MB source read + ~0.75 MB destination
+    /// write per call; autovectorises into a row-wise copy on the
+    /// Bgr path (trivial stride match).
+    pub fn blit_doom_frame(&mut self, src: &[u8]) {
+        const DOOM_W: usize = 640;
+        const DOOM_H: usize = 400;
+        const SRC_STRIDE: usize = DOOM_W * 4;
+
+        // Size / format gates. Silent no-op on mismatch — matches
+        // the clipping / format policy of the other draw_* methods.
+        if src.len() < DOOM_H * SRC_STRIDE {
+            return;
+        }
+        let info = self.info;
+        if info.bytes_per_pixel != 3 {
+            return;
+        }
+        let swap_rb = match info.pixel_format {
+            PixelFormat::Bgr => false,
+            PixelFormat::Rgb => true,
+            _ => return,
+        };
+
+        // Centered placement. `saturating_sub` guards against
+        // framebuffers smaller than the Doom frame — in that case
+        // the blit starts at (0, 0) and clips.
+        let x_off = info.width.saturating_sub(DOOM_W) / 2;
+        let y_off = info.height.saturating_sub(DOOM_H) / 2;
+        let cols = DOOM_W.min(info.width.saturating_sub(x_off));
+        let rows = DOOM_H.min(info.height.saturating_sub(y_off));
+        if cols == 0 || rows == 0 {
+            return;
+        }
+        let dst_stride_bytes = info.stride * 3;
+
+        for dy in 0..rows {
+            let src_row = dy * SRC_STRIDE;
+            let dst_row = (y_off + dy) * dst_stride_bytes + x_off * 3;
+            for dx in 0..cols {
+                let so = src_row + dx * 4;
+                let d_off = dst_row + dx * 3;
+                if swap_rb {
+                    // Doom writes [B, G, R, A]; Rgb target wants
+                    // [R, G, B] so swap byte 0 and byte 2.
+                    self.bytes[d_off]     = src[so + 2];
+                    self.bytes[d_off + 1] = src[so + 1];
+                    self.bytes[d_off + 2] = src[so];
+                } else {
+                    // Bgr target — matches Doom's in-memory byte
+                    // order directly. Drop the alpha byte.
+                    self.bytes[d_off]     = src[so];
+                    self.bytes[d_off + 1] = src[so + 1];
+                    self.bytes[d_off + 2] = src[so + 2];
+                }
+            }
+        }
+        DirtyRect::extend(
+            &mut self.dirty,
+            x_off, y_off,
+            x_off + cols, y_off + rows,
+        );
+    }
 }
 
 /// Channel-layout-aware pixel write. Bgr is what QEMU's standard
