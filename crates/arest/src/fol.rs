@@ -264,10 +264,15 @@ fn facts_of(source: &FactSource) -> Func {
                 .iter()
                 .map(|id| facts_of(&FactSource::Single(id.clone())))
                 .collect();
-            // Flatten via Compact ∘ Construction — Compact removes
-            // ⊥ entries the per-id facts may produce when a fact
-            // type has no population.
-            Func::compose(Func::Compact, Func::construction(parts))
+            // Flatten via Concat ∘ Construction — each `parts[i]`
+            // is a seq of facts for a single fact type, so Concat
+            // turns `<seq_ft1, seq_ft2, ...>` into the flat seq
+            // of all facts. Missing cells surface as phi (empty
+            // seq) through FetchOrPhi, which Concat absorbs
+            // cleanly. Compact would only drop ⊥ elements — it
+            // does not flatten — which leaves a seq-of-seqs that
+            // breaks any per-fact RoleVal access downstream.
+            Func::compose(Func::Concat, Func::construction(parts))
         }
     }
 }
@@ -420,6 +425,48 @@ mod tests {
             Box::new(FolTerm::Eq(
                 Box::new(FolTerm::RoleVal("f".into(), 1)),
                 Box::new(FolTerm::Const(Object::atom("x"))),
+            )),
+        );
+        assert_eq!(apply(&term.to_func(), &state, &state), t());
+    }
+
+    #[test]
+    fn forall_union_multi_id_walks_every_fact() {
+        // ∀ f ∈ ft1 ∪ ft2. role_1(f) = "x"
+        // Facts in both fact types have role 1 = "x"; the union
+        // must reach every individual fact, not the per-ft seqs.
+        // A Compact-based lowering would leave a seq-of-seqs and
+        // RoleVal would hit the wrong shape. The correct lowering
+        // uses Concat to flatten.
+        let mut state = Object::phi();
+        state = ast::cell_push("ft1", ast::fact_from_pairs(&[("a", "x")]), &state);
+        state = ast::cell_push("ft2", ast::fact_from_pairs(&[("b", "x")]), &state);
+        let term = FolTerm::ForAll(
+            "f".into(),
+            FactSource::Union(vec!["ft1".into(), "ft2".into()]),
+            Box::new(FolTerm::Eq(
+                Box::new(FolTerm::RoleVal("f".into(), 1)),
+                Box::new(FolTerm::Const(Object::atom("x"))),
+            )),
+        );
+        assert_eq!(apply(&term.to_func(), &state, &state), t());
+    }
+
+    #[test]
+    fn exists_union_multi_id_flattens_before_predicate() {
+        // ∃ f ∈ ft1 ∪ ft2. role_1(f) = "y"
+        // Only ft2's fact has role 1 = "y"; ft1's fact has "x".
+        // After flattening, Or over the per-fact predicate results
+        // must pick up the single match.
+        let mut state = Object::phi();
+        state = ast::cell_push("ft1", ast::fact_from_pairs(&[("a", "x")]), &state);
+        state = ast::cell_push("ft2", ast::fact_from_pairs(&[("b", "y")]), &state);
+        let term = FolTerm::Exists(
+            "f".into(),
+            FactSource::Union(vec!["ft1".into(), "ft2".into()]),
+            Box::new(FolTerm::Eq(
+                Box::new(FolTerm::RoleVal("f".into(), 1)),
+                Box::new(FolTerm::Const(Object::atom("y"))),
             )),
         );
         assert_eq!(apply(&term.to_func(), &state, &state), t());
