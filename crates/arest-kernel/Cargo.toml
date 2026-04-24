@@ -126,7 +126,11 @@ arest = { path = "../arest", default-features = false, features = ["no_std"] }
 # hashbrown-backed tables for wasm's type / function tables without
 # needing std. `no_std` default — we supply the `alloc` global.
 [target.'cfg(target_os = "uefi")'.dependencies]
-uefi = { version = "0.34", features = ["alloc", "panic_handler", "logger"] }
+# Dropped `panic_handler` feature — uefi-rs's default panic handler
+# logs via `system_table.stderr()`, which is gone post-EBS. Our
+# own handler in `entry_uefi.rs` uses raw COM1 I/O so it prints
+# both pre- and post-EBS without depending on BootServices.
+uefi = { version = "0.34", features = ["alloc", "logger"] }
 wasmi = { version = "0.50", default-features = false, features = ["hash-collections"] }
 
 [profile.dev]

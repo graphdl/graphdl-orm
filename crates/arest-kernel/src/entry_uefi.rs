@@ -81,6 +81,63 @@ static HEAP: HeapBytes = HeapBytes(UnsafeCell::new([0u8; HEAP_SIZE]));
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
+/// Panic handler for the UEFI path. Replaces uefi-rs's default
+/// (which logs via `system_table.stderr()` — gone post-EBS, so a
+/// panic after ExitBootServices prints nothing and the kernel
+/// silently hangs).
+///
+/// Strategy: raw port I/O to COM1 0x3F8. Works before and after
+/// EBS identically — QEMU's OVMF binds COM1 at boot and our
+/// post-EBS 16550 path uses the same port, so this handler
+/// produces visible output in both phases without depending on
+/// BootServices or the kernel's SERIAL singleton (the latter may
+/// be mid-mutation when a panic fires).
+///
+/// Busy-polls the LSR's THR-empty bit between each byte so slow
+/// consoles don't drop characters. `writeln!` via core::fmt
+/// handles formatting without alloc — panic inside alloc would
+/// otherwise deadlock on the LockedHeap mutex.
+#[panic_handler]
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    use core::fmt::Write;
+    use x86_64::instructions::port::Port;
+
+    struct RawCom1 {
+        data: Port<u8>,
+        lsr: Port<u8>,
+    }
+    impl RawCom1 {
+        fn new() -> Self {
+            Self {
+                data: Port::new(0x3F8),
+                lsr: Port::new(0x3FD),
+            }
+        }
+    }
+    impl Write for RawCom1 {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            for b in s.bytes() {
+                // Wait until THR empty (LSR bit 5 set).
+                // SAFETY: 0x3F8/0x3FD are COM1's 16550 ports —
+                // accessible on every PC-compatible, no memory
+                // safety impact. Raw reads/writes only.
+                unsafe {
+                    while self.lsr.read() & 0x20 == 0 {}
+                    self.data.write(b);
+                }
+            }
+            Ok(())
+        }
+    }
+
+    let mut com1 = RawCom1::new();
+    let _ = writeln!(com1, "\n!! UEFI kernel panic !!");
+    let _ = writeln!(com1, "{info}");
+    loop {
+        unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
+    }
+}
+
 /// UEFI entry point. `uefi-rs`'s `#[entry]` expands this into the
 /// PE32+ `_start` symbol the firmware invokes after loading the
 /// image.
@@ -199,16 +256,37 @@ fn efi_main() -> Status {
     crate::system::init();
     println!("  engine:   system::init() completed (arest engine live on UEFI)");
 
-    // Step 4d wave 5: wasmi runtime smoke. The wasmi crate is UEFI-
-    // only because the BIOS bootloader can't load a kernel image the
-    // wasmi-linking binary produces (triple-faults pre-_start, see
-    // 5e8a15e). Constructing an Engine exercises wasmi's
-    // hash-collections backing, global registries, and default
-    // config — enough to prove the runtime links + initializes
-    // under UEFI. Running an actual Module lands alongside the Doom
-    // shim (#270/#271) once kernel_run reaches here.
-    let _wasmi_engine = wasmi::Engine::default();
-    println!("  wasmi:    Engine::default() constructed (runtime live on UEFI)");
+    // Step 4d wave 5: wasmi runtime smoke. UEFI-only — the BIOS
+    // bootloader can't load a kernel image the wasmi-linking binary
+    // produces (triple-faults pre-_start, 5e8a15e). Loads a hand-
+    // assembled 37-byte WASM module that exports `main` -> i32 42,
+    // instantiates, and calls it. The returned 42 proves the full
+    // wasmi pipeline works under UEFI: decoder, type section, code
+    // section parsing, instantiation, execution. With the custom
+    // panic handler (above) raw-port-I/O'ing to COM1, any fault in
+    // the pipeline surfaces as a visible "UEFI kernel panic" line
+    // rather than a silent hang.
+    //
+    // The hex below is the WebAssembly binary encoding of:
+    //   (module (func (export "main") (result i32) i32.const 42))
+    const TINY_WASM: &[u8] = &[
+        0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, // \0asm version 1
+        0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7F,       // type: () -> i32
+        0x03, 0x02, 0x01, 0x00,                         // funcs: [type 0]
+        0x07, 0x08, 0x01, 0x04, 0x6D, 0x61, 0x69, 0x6E, 0x00, 0x00, // exp "main"
+        0x0A, 0x06, 0x01, 0x04, 0x00, 0x41, 0x2A, 0x0B, // code: i32.const 42
+    ];
+    let engine = wasmi::Engine::default();
+    let module = wasmi::Module::new(&engine, TINY_WASM).expect("parse tiny wasm");
+    let mut store = wasmi::Store::new(&engine, ());
+    let linker = wasmi::Linker::<()>::new(&engine);
+    let pre = linker.instantiate(&mut store, &module).expect("instantiate");
+    let instance = pre.start(&mut store).expect("start");
+    let main_fn = instance
+        .get_typed_func::<(), i32>(&store, "main")
+        .expect("get main");
+    let answer = main_fn.call(&mut store, ()).expect("call main");
+    println!("  wasmi:    tiny module executed, main() = {answer} (runtime live on UEFI)");
 
     println!("  next:        kernel_run handoff (step 4d)");
 
