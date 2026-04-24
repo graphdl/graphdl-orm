@@ -663,10 +663,25 @@ pub enum Func {
     /// Binary-to-unary: (bu f x):y = f:<x, y>. Partial application / currying.
     BinaryToUnary(Box<Func>, Object),
 
-    /// Filter: Filter(p):<x₁,...,xₙ> = <xᵢ | p:xᵢ = T>.
+    /// Filter: `Filter(p):<x₁,...,xₙ> = <xᵢ | p:xᵢ = T>`.
     /// The missing primitive for queries as partial application.
     /// Partial apply a fact type (bind some roles) → predicate falls out.
     /// Filter(predicate) applied to population → matching facts.
+    ///
+    /// Why this is a primitive even though Backus §11.2.4 eq 2 writes
+    /// `Filter(p) ≡ compact ∘ α(p → id ; ⊥)` as a derived form: the
+    /// derivation can't be executed step-by-step under §11.2.1's
+    /// strict ⊥-preserving sequence constructor, because the moment
+    /// α emits a single ⊥ element the intermediate sequence collapses
+    /// to ⊥ and `compact ∘ ⊥ = ⊥`. Backus's derived-form definition is
+    /// intensional — describing what Filter computes — not a literal
+    /// substitution. AREST honors the §11.2.4 identity as an algebraic
+    /// law (the runtime produces the same result as the derived form
+    /// would, modulo the collapsed intermediate) without executing it
+    /// compositionally. Compact (#352) is a separate primitive useful
+    /// where ⊥s enter sequences via the bypassing `Object::Seq(..)`
+    /// constructor (sparse cell-index lookups, etc.) — but Filter and
+    /// Compact don't compose into a Filter substitute under §11.2.1.
     Filter(Box<Func>),
 
     /// While: (while p f):x = if p:x = T then (while p f):(f:x) else x.
