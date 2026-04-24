@@ -9,19 +9,19 @@
 #   .\scripts\boot-kernel-uefi.ps1            # interactive boot
 #   .\scripts\boot-kernel-uefi.ps1 -Smoke     # headless: assert banner
 #
-# Smoke mode (#344 step 4 prep):
+# Smoke mode (#344 step 4c):
 #   Boots the kernel under OVMF with a 30 s cap (boot-time UEFI
 #   initialisation is slower than the BIOS path -- OVMF prints its
 #   own banners before our entry runs), captures every byte of
-#   serial, and asserts the UEFI scaffold banner is present. Exits
-#   0 on success, 1 with the captured log on failure.
+#   serial, and asserts every banner line our entry writes pre- and
+#   post-ExitBootServices, including the step-4c
+#   "mem: N frames usable" line that proves the page-table + frame-
+#   allocator singletons are live post-EBS. Exits 0 on success, 1
+#   with the captured log on failure.
 #
-# Today the banner check verifies step 3 of the pivot -- `println!`
-# is routed through `arch::_print` which writes via ConOut. Once
-# step 4b lands ExitBootServices + the shared `kernel_run` handoff,
-# the banner phrase list grows to match `boot-kernel.ps1`'s
-# (heap / gdt / idt / blk / http) and the smoke gains parity with
-# the BIOS one.
+# Once step 4d lands the shared `kernel_run` handoff, the banner
+# phrase list grows to match `boot-kernel.ps1`'s (heap / gdt / idt
+# / blk / http) and the smoke gains parity with the BIOS one.
 
 param(
     [switch]$Smoke
@@ -65,9 +65,11 @@ if ($Smoke) {
     try {
         # OVMF prints its own boot banners (TianoCore, UefiVersion, etc.)
         # before the firmware hands control to our PE32+. Poll for the
-        # AREST scaffold marker that the kernel writes once ConOut is
-        # the only thing in scope -- that's the latest line we emit
-        # before parking, so it's the cleanest "boot reached us" signal.
+        # step-4c "mem: N frames usable" marker, which is the latest
+        # line our entry prints before parking -- it's written only
+        # after the page-table + frame-allocator singletons are live,
+        # so it proves every step from ConOut through EBS through the
+        # post-EBS 16550 cutover through init_memory worked.
         $deadline = (Get-Date).AddSeconds(30)
         $log = ""
         while ((Get-Date) -lt $deadline) {
@@ -80,21 +82,24 @@ if ($Smoke) {
                 $ErrorActionPreference = $prevEAP
             }
             # Match against the most recent line the scaffold writes.
-            # Once step 4 boots through `kernel_run`, swap the marker
+            # Once step 4d boots through `kernel_run`, swap the marker
             # for "int3 round-tripped" -- the BIOS smoke's same beacon.
-            if ($log -match "post-EBS: 16550 COM1 active") { break }
+            if ($log -match "frames usable") { break }
         }
         $log | Out-File -FilePath $logPath -Encoding utf8
 
         # Step 4 banner phrases. Each line the entry writes is asserted
         # individually so a partial-write regression is easy to spot.
-        # The "post-EBS" line is the critical one — it proves the
-        # 16550 COM1 fall-back works after firmware ConOut is invalid.
+        # The "post-EBS" line proves the 16550 COM1 fall-back works
+        # after firmware ConOut is invalid; the "mem:" line proves
+        # step 4c's init_memory + page-table / frame-allocator
+        # singletons are live post-EBS.
         $expected = @(
             "AREST kernel - UEFI scaffold (#344)",
             "step 4 of 8: ExitBootServices + post-EBS serial",
             "pre-EBS:  ConOut active",
-            "post-EBS: 16550 COM1 active"
+            "post-EBS: 16550 COM1 active",
+            "frames usable"
         )
         $missing = @()
         foreach ($phrase in $expected) {
