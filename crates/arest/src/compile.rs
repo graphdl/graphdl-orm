@@ -2877,16 +2877,13 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
             Some((_ft, ri)) => {
                 let ri = *ri;
                 // Dedup guard: candidate's role[ri] == the outer
-                // instance value. The outer instance lives at
-                // Selector(1); the candidate at Selector(2).
-                let match_pred = {
-                    use crate::fol::FolTerm;
-                    FolTerm::Eq(
-                        Box::new(FolTerm::Raw(Func::Selector(1))),
-                        Box::new(FolTerm::FactRole { fact: Func::Selector(2), role: ri + 1 }),
-                    )
-                    .to_func()
-                };
+                // instance value. Sourced from
+                // `crate::fol::constraint::explicit_deriv_dedup` —
+                // the outer-instance `Raw(Selector(1))` is a
+                // legitimate residue since `Selector(1)` here
+                // addresses the outer distributed-pair slot, not
+                // "role 1 of the selected fact".
+                let match_pred = crate::fol::constraint::explicit_deriv_dedup(ri).to_func();
                 let not_participates = Func::compose(
                     Func::NullTest,
                     Func::compose(Func::filter(match_pred), Func::DistL),
@@ -3208,12 +3205,11 @@ fn compile_join_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Compil
     let current = (1..n).fold(ft0, |current, j| {
         let ft_j = fact_extractors[j].clone();
 
-        use crate::fol::FolTerm;
-
-        // Î±(key â†’ eq_condition) : join_keys â€” one FolTerm::Eq per
-        // join key; combined via FolTerm::And below so the empty /
-        // single / N-ary cases collapse uniformly.
-        let mut join_atoms: Vec<FolTerm> = join_keys.iter().filter_map(|key| {
+        // Î±(key â†’ (ref_fact, ref_role, j_role)) : join_keys â€”
+        // one spec per join key, resolved to a pre-built accessor
+        // Func. `crate::fol::constraint::join_deriv_atoms` turns
+        // these into `FolTerm::Eq(FactRole, FactRole)` atoms.
+        let join_key_specs: Vec<(Func, usize, usize)> = join_keys.iter().filter_map(|key| {
             let j_role = find_role(j, key)?;
             let ref_ft = (0..j).find(|&fi| find_role(fi, key).is_some())?;
             let ref_role = find_role(ref_ft, key)?;
@@ -3222,22 +3218,18 @@ fn compile_join_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Compil
             // right. The ref-FT accessor is a small composition
             // (access_fact(ref_ft, j) . Selector(1)), which FactRole
             // accepts as an opaque Func.
-            Some(FolTerm::Eq(
-                Box::new(FolTerm::FactRole {
-                    fact: Func::compose(access_fact(ref_ft, j), Func::Selector(1)),
-                    role: ref_role + 1,
-                }),
-                Box::new(FolTerm::FactRole {
-                    fact: Func::Selector(2),
-                    role: j_role + 1,
-                }),
+            Some((
+                Func::compose(access_fact(ref_ft, j), Func::Selector(1)),
+                ref_role,
+                j_role,
             ))
         }).collect();
 
-        // Î±(match_pair â†’ contains_condition) : match_pairs â€”
-        // Contains isn't a FolTerm atom (yet); Raw-wrap each atom
-        // so the combining conjunction still goes through FolTerm.
-        join_atoms.extend(match_pairs.iter().filter_map(|(left_noun, right_noun)| {
+        // Î±(match_pair â†’ contains Func) : match_pairs â€”
+        // Contains isn't a FolTerm atom (yet); each pair lowers
+        // to a raw Contains-Func that `join_deriv_atoms` wraps
+        // in `FolTerm::Raw` before combining.
+        let match_pair_raws: Vec<Func> = match_pairs.iter().filter_map(|(left_noun, right_noun)| {
             let left_ft = (0..=j).find(|&fi| find_role(fi, left_noun).is_some())?;
             let right_ft = (0..=j).find(|&fi| find_role(fi, right_noun).is_some())?;
             (left_ft == j || right_ft == j).then_some(())?;
@@ -3248,14 +3240,16 @@ fn compile_join_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Compil
             } else {
                 Func::compose(role_value(ri), Func::compose(access_fact(ft, j), Func::Selector(1)))
             };
-            Some(FolTerm::Raw(Func::compose(Func::Contains, Func::construction(vec![
+            Some(Func::compose(Func::Contains, Func::construction(vec![
                 val(left_ft, left_role), val(right_ft, right_role),
-            ]))))
-        }));
+            ])))
+        }).collect();
 
         // FolTerm::And handles the empty / single / N-ary cases
         // uniformly â€” replaces the manual reduce() boilerplate.
-        let join_pred = FolTerm::And(join_atoms).to_func();
+        let join_pred = crate::fol::constraint::join_deriv_atoms(
+            &join_key_specs, match_pair_raws,
+        ).to_func();
 
         // Pipeline: Filter(join_pred) . Concat . Î±(DistL) . DistR . [current, ft_j]
         Func::compose(Func::filter(join_pred), Func::compose(Func::Concat,
@@ -3470,113 +3464,30 @@ fn compile_constraint(data: &CellIndex, def: &ConstraintDef) -> CompiledConstrai
 // Ring constraints on binary self-referential fact types.
 // Each returns a Func that takes an eval context Object -> violations.
 
-/// Predicate: `role 1 ≠ role 2` of the original fact. Used by every
-/// ring constraint that excludes the (x, x) self-pair (AS, SY, AT).
-/// The input shape is `<fact, all>`; `Selector(1)` reaches the fact.
-fn ring_not_self_pred() -> Func {
-    use crate::fol::FolTerm;
-    FolTerm::Not(Box::new(FolTerm::Eq(
-        Box::new(FolTerm::FactRole { fact: Func::Selector(1), role: 1 }),
-        Box::new(FolTerm::FactRole { fact: Func::Selector(1), role: 2 }),
-    )))
-    .to_func()
-}
-
-/// Predicate: candidate is the reverse pair of the fact. For a fact
-/// `<x, y>` and a candidate `<a, b>`, returns true iff `a = y ∧ b = x`.
-/// The input shape is `<fact, candidate>`; `Selector(1)` is the
-/// original fact, `Selector(2)` is the candidate under test. The
-/// reverse-pair rule is a conjunction of two role-equalities,
-/// expressed directly in FOL via FactRole atoms.
-fn ring_match_reversed_pred() -> Func {
-    use crate::fol::FolTerm;
-    let fact = Func::Selector(1);
-    let cand = Func::Selector(2);
-    FolTerm::And(vec![
-        FolTerm::Eq(
-            Box::new(FolTerm::FactRole { fact: cand.clone(), role: 1 }),
-            Box::new(FolTerm::FactRole { fact: fact.clone(), role: 2 }),
-        ),
-        FolTerm::Eq(
-            Box::new(FolTerm::FactRole { fact: cand,         role: 2 }),
-            Box::new(FolTerm::FactRole { fact,               role: 1 }),
-        ),
-    ])
-    .to_func()
-}
-
-/// Predicate: the two facts form a transitive chain. Input shape is
-/// `<f1, f2>`. Returns true iff `role 2 of f1 = role 1 of f2`
-/// (chainable) AND `role 1 of f1 ≠ role 2 of f2` (not self-looping
-/// trivially — the transitive-closure check doesn't care about
-/// reflexive pairs). Used by IT / TR / AC.
-fn ring_is_chain_pred() -> Func {
-    use crate::fol::FolTerm;
-    let f1 = Func::Selector(1);
-    let f2 = Func::Selector(2);
-    FolTerm::And(vec![
-        FolTerm::Eq(
-            Box::new(FolTerm::FactRole { fact: f1.clone(), role: 2 }),
-            Box::new(FolTerm::FactRole { fact: f2.clone(), role: 1 }),
-        ),
-        FolTerm::Not(Box::new(FolTerm::Eq(
-            Box::new(FolTerm::FactRole { fact: f1, role: 1 }),
-            Box::new(FolTerm::FactRole { fact: f2, role: 2 }),
-        ))),
-    ])
-    .to_func()
-}
-
-/// Predicate: candidate is the transitive-shortcut pair of a chain.
-/// Input shape is `<<f1, f2>, candidate>`. Returns true iff
-/// `role 1 of candidate = role 1 of f1` AND
-/// `role 2 of candidate = role 2 of f2` — i.e. the candidate spans
-/// the same endpoints the chain does. Used by IT (shortcut must
-/// NOT exist → violation) and TR (shortcut MUST exist).
-fn ring_shortcut_match_pred() -> Func {
-    use crate::fol::FolTerm;
-    let cand = Func::Selector(2);
-    // <f1, f2> is Selector(1). f1 = Sel(1).Sel(1); f2 = Sel(2).Sel(1).
-    let f1 = Func::compose(Func::Selector(1), Func::Selector(1));
-    let f2 = Func::compose(Func::Selector(2), Func::Selector(1));
-    FolTerm::And(vec![
-        FolTerm::Eq(
-            Box::new(FolTerm::FactRole { fact: cand.clone(), role: 1 }),
-            Box::new(FolTerm::FactRole { fact: f1,           role: 1 }),
-        ),
-        FolTerm::Eq(
-            Box::new(FolTerm::FactRole { fact: cand, role: 2 }),
-            Box::new(FolTerm::FactRole { fact: f2,   role: 2 }),
-        ),
-    ])
-    .to_func()
-}
+// Ring helper predicates moved to `crate::fol::constraint` (#357 parse
+// half). Call sites in the AS/SY/AT/IT/TR compilers below source the
+// predicate FolTerm from `constraint::ring_*` and lower at use site
+// via `.to_func()`.
 
 /// IR: not exists(x,x) -- no fact where both roles reference the same entity.
 /// alpha(make_violation)  .  Filter(eq  .  [role1_val, role2_val])  .  facts
 ///
-/// Predicate construction routed via `crate::fol::FolTerm` (#357): the
-/// "role 1 of f = role 2 of f" check is the natural FOL atom
-/// `Eq(RoleVal(f, 1), RoleVal(f, 2))` and produces an identical
-/// Func to the previous hand-built `Func::compose(Func::Eq, …)`. This
-/// is the first compile site routed through the FolTerm IR — each
-/// follow-up commit migrates one more constraint kind.
+/// Predicate sourced from `crate::fol::constraint::ir_self_ref`
+/// (#357 parse half): the "role 1 of f = role 2 of f" check is the
+/// natural FOL atom `Eq(RoleVal(f, 1), RoleVal(f, 2))` and produces
+/// an identical Func to the previous hand-built `Func::compose(
+/// Func::Eq, …)`.
 fn compile_ring_irreflexive_ast(def: &ConstraintDef) -> Func {
-    use crate::fol::FolTerm;
-
     let ft_ids: Vec<String> = def.spans.iter().map(|s| s.fact_type_id.clone()).collect();
     let facts = extract_facts_multi(&ft_ids);
 
     // Predicate: role 1 value = role 2 value (self-reference).
     // FolTerm::RoleVal is 1-indexed (matches the FORML 2 verbal
     // "role 1" / "role 2" convention); compile.rs's `role_value`
-    // helper is 0-indexed, so the constants here look off-by-one
-    // vs the surrounding hand-built Func sites — this is the IR
-    // doing the renumbering for us.
-    let is_self_ref = FolTerm::Eq(
-        Box::new(FolTerm::RoleVal("f".into(), 1)),
-        Box::new(FolTerm::RoleVal("f".into(), 2)),
-    ).to_func();
+    // helper is 0-indexed, so the constants inside `ir_self_ref`
+    // look off-by-one vs the surrounding hand-built Func sites —
+    // this is the IR doing the renumbering for us.
+    let is_self_ref = crate::fol::constraint::ir_self_ref().to_func();
 
     // Violation detail: <"Irreflexive violation:", value, "references itself">
     let detail = Func::construction(vec![
@@ -3613,7 +3524,7 @@ fn compile_ring_asymmetric_ast(def: &ConstraintDef) -> Func {
     //     not null -> has_reverse
     //   Filter facts where has_reverse  AND  x!=y, wrap in violations.
 
-    let match_reversed = ring_match_reversed_pred();
+    let match_reversed = crate::fol::constraint::ring_match_reversed().to_func();
 
     // check_one: <fact, all_facts> -> T if reverse exists, else F
     let check_one = Func::compose(
@@ -3621,7 +3532,7 @@ fn compile_ring_asymmetric_ast(def: &ConstraintDef) -> Func {
         Func::compose(Func::filter(match_reversed), Func::DistL),
     );
 
-    let not_self = ring_not_self_pred();
+    let not_self = crate::fol::constraint::ring_not_self().to_func();
 
     // combined: has_reverse  AND  not_self
     let pred = Func::compose(Func::And, Func::construction(vec![check_one, not_self]));
@@ -3651,14 +3562,14 @@ fn compile_ring_symmetric_ast(def: &ConstraintDef) -> Func {
     let ft_ids: Vec<String> = def.spans.iter().map(|s| s.fact_type_id.clone()).collect();
     let facts = extract_facts_multi(&ft_ids);
 
-    let match_reversed = ring_match_reversed_pred();
+    let match_reversed = crate::fol::constraint::ring_match_reversed().to_func();
 
     let has_no_reverse = Func::compose(
         Func::NullTest,
         Func::compose(Func::filter(match_reversed), Func::DistL),
     );
 
-    let not_self = ring_not_self_pred();
+    let not_self = crate::fol::constraint::ring_not_self().to_func();
 
     let pred = Func::compose(Func::And, Func::construction(vec![has_no_reverse, not_self]));
 
@@ -3685,14 +3596,14 @@ fn compile_ring_antisymmetric_ast(def: &ConstraintDef) -> Func {
     let ft_ids: Vec<String> = def.spans.iter().map(|s| s.fact_type_id.clone()).collect();
     let facts = extract_facts_multi(&ft_ids);
 
-    let match_reversed = ring_match_reversed_pred();
+    let match_reversed = crate::fol::constraint::ring_match_reversed().to_func();
 
     let has_reverse = Func::compose(
         Func::compose(Func::Not, Func::NullTest),
         Func::compose(Func::filter(match_reversed), Func::DistL),
     );
 
-    let not_self = ring_not_self_pred();
+    let not_self = crate::fol::constraint::ring_not_self().to_func();
 
     let pred = Func::compose(Func::And, Func::construction(vec![has_reverse, not_self]));
 
@@ -3729,8 +3640,8 @@ fn compile_ring_intransitive_ast(def: &ConstraintDef) -> Func {
     //   Shortcut = <role0(f1), role1(f2)> = <x, z>
     //   distr [chains, all_facts], distl, Filter(shortcut matches candidate)
 
-    let is_chain = ring_is_chain_pred();
-    let shortcut_match = ring_shortcut_match_pred();
+    let is_chain = crate::fol::constraint::ring_is_chain().to_func();
+    let shortcut_match = crate::fol::constraint::ring_shortcut_match().to_func();
 
     let has_shortcut = Func::compose(
         Func::compose(Func::Not, Func::NullTest),
@@ -3795,8 +3706,8 @@ fn compile_ring_transitive_ast(def: &ConstraintDef) -> Func {
     let facts = extract_facts_multi(&ft_ids);
 
     // TR: same chain pattern as IT, but violation when shortcut is MISSING.
-    let is_chain = ring_is_chain_pred();
-    let shortcut_match = ring_shortcut_match_pred();
+    let is_chain = crate::fol::constraint::ring_is_chain().to_func();
+    let shortcut_match = crate::fol::constraint::ring_shortcut_match().to_func();
 
     // NullTest = shortcut missing = violation (opposite of IT)
     let no_shortcut = Func::compose(
@@ -3925,15 +3836,9 @@ fn compile_ring_reflexive_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
     // self_refs: instances that DO reference themselves in the ring facts.
     // Filter(role 1 = role 2) : facts -> self-referencing facts; then α(role(0))
     // projects out the entity id. Same FOL atom as
-    // compile_ring_irreflexive_ast's is_self_ref.
-    let is_self_ref = {
-        use crate::fol::FolTerm;
-        FolTerm::Eq(
-            Box::new(FolTerm::RoleVal("f".into(), 1)),
-            Box::new(FolTerm::RoleVal("f".into(), 2)),
-        )
-        .to_func()
-    };
+    // compile_ring_irreflexive_ast's is_self_ref (shared via
+    // `crate::fol::constraint::rf_self_ref`).
+    let is_self_ref = crate::fol::constraint::rf_self_ref().to_func();
     let self_refs = Func::compose(
         Func::apply_to_all(role_value(0)),
         Func::compose(
@@ -4015,27 +3920,9 @@ fn compile_uniqueness_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
         // same_scope_diff_other on <fact, candidate>:
         //   role[scope] of fact = role[scope] of candidate
         //   ∧ role[other] of fact ≠ role[other] of candidate
-        // "scope-role of fact = scope-role of candidate AND
-        //  other-role of fact ≠ other-role of candidate".
-        // FactRole atoms take a 1-indexed role, matching the FOL
-        // "role N" verbal convention; compile.rs's 0-indexed
-        // `role_value(n)` maps to `role: n + 1`.
-        let dup_check = {
-            use crate::fol::FolTerm;
-            let fact = Func::Selector(1);
-            let cand = Func::Selector(2);
-            FolTerm::And(vec![
-                FolTerm::Eq(
-                    Box::new(FolTerm::FactRole { fact: fact.clone(), role: scope_idx + 1 }),
-                    Box::new(FolTerm::FactRole { fact: cand.clone(), role: scope_idx + 1 }),
-                ),
-                FolTerm::Not(Box::new(FolTerm::Eq(
-                    Box::new(FolTerm::FactRole { fact,               role: other_idx + 1 }),
-                    Box::new(FolTerm::FactRole { fact: cand,         role: other_idx + 1 }),
-                ))),
-            ])
-            .to_func()
-        };
+        // Sourced from `crate::fol::constraint::uc_dup_check` —
+        // 0-indexed scope/other → 1-indexed `FactRole::role` inside.
+        let dup_check = crate::fol::constraint::uc_dup_check(scope_idx, other_idx).to_func();
 
         // has_any_dup: <fact, all> -> T if scope is duplicated
         let has_any_dup = Func::compose(
@@ -4222,25 +4109,11 @@ fn compile_mandatory_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
         // binding_match: <instance, <noun, val>> -> T if
         //   noun (inner Sel(1).Sel(2)) = noun_name literal
         //   AND val (inner Sel(2).Sel(2)) = instance (outer Sel(1)).
+        // Sourced from `crate::fol::constraint::mc_binding_match` —
         // `Raw` wraps the key/val tuple-field access (not role
         // extraction — `binding` is a single <key, val> pair, not
         // a fact's seq of pairs, so FactRole doesn't apply here).
-        let binding_match = {
-            use crate::fol::FolTerm;
-            let binding_noun = Func::compose(Func::Selector(1), Func::Selector(2));
-            let binding_val  = Func::compose(Func::Selector(2), Func::Selector(2));
-            FolTerm::And(vec![
-                FolTerm::Eq(
-                    Box::new(FolTerm::Raw(binding_noun)),
-                    Box::new(FolTerm::Const(Object::atom(noun_name))),
-                ),
-                FolTerm::Eq(
-                    Box::new(FolTerm::Raw(binding_val)),
-                    Box::new(FolTerm::Raw(Func::Selector(1))),
-                ),
-            ])
-            .to_func()
-        };
+        let binding_match = crate::fol::constraint::mc_binding_match(noun_name).to_func();
 
         // fact_mentions: <instance, fact> -> T if fact has binding <noun, instance>
         // DistL on <instance, fact_bindings> -> <<instance, binding1>, ...>
@@ -4310,14 +4183,8 @@ fn compile_frequency_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
         let scope_idx = span.role_index;
 
         // same_scope: <fact, candidate> -> T if scope values match.
-        let same_scope = {
-            use crate::fol::FolTerm;
-            FolTerm::Eq(
-                Box::new(FolTerm::FactRole { fact: Func::Selector(1), role: scope_idx + 1 }),
-                Box::new(FolTerm::FactRole { fact: Func::Selector(2), role: scope_idx + 1 }),
-            )
-            .to_func()
-        };
+        // Sourced from `crate::fol::constraint::fc_same_scope`.
+        let same_scope = crate::fol::constraint::fc_same_scope(scope_idx).to_func();
 
         // For <fact, all_facts>: DistL gives <<fact, f1>, <fact, f2>, ...>
         // Filter(same_scope) keeps pairs where scope matches
@@ -4486,25 +4353,11 @@ fn compile_set_comparison_ast(
 
     // For each clause FT, build a participation check: <instance, ctx> -> T/F.
     // A fact mentions the entity if any binding has noun == entity_name AND
-    // val == instance. Same atom shape as compile_mandatory_ast's
-    // binding_match — key/val tuple access uses Raw (FactRole doesn't
-    // fit for single <key, val> pairs).
-    let binding_match = {
-        use crate::fol::FolTerm;
-        let binding_noun = Func::compose(Func::Selector(1), Func::Selector(2));
-        let binding_val  = Func::compose(Func::Selector(2), Func::Selector(2));
-        FolTerm::And(vec![
-            FolTerm::Eq(
-                Box::new(FolTerm::Raw(binding_noun)),
-                Box::new(FolTerm::Const(Object::atom(&entity_name))),
-            ),
-            FolTerm::Eq(
-                Box::new(FolTerm::Raw(binding_val)),
-                Box::new(FolTerm::Raw(Func::Selector(1))),
-            ),
-        ])
-        .to_func()
-    };
+    // val == instance. Sourced from `crate::fol::constraint::
+    // set_comparison_binding_match` — same atom shape as MC's
+    // `binding_match`; key/val tuple access uses `Raw` (FactRole
+    // doesn't fit for single <key, val> pairs).
+    let binding_match = crate::fol::constraint::set_comparison_binding_match(&entity_name).to_func();
 
     // fact_mentions : <instance, fact> -> T if fact has matching binding
     let fact_mentions = Func::compose(
@@ -4599,19 +4452,11 @@ fn compile_subset_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
     let b_facts = extract_facts_func(&b_ft_id);
 
     // match_pred: <a_fact, b_candidate> -> common noun values all equal.
+    // Sourced from `crate::fol::constraint::ss_match_pred` —
     // `FolTerm::And` with one Eq per common noun handles the empty /
     // single / N-ary cases uniformly (empty And = True, single And
     // passes through, N >= 2 becomes Insert(And) ∘ Construction).
-    let match_pred = {
-        use crate::fol::FolTerm;
-        let atoms: Vec<FolTerm> = common.iter().map(|&(ai, bi)| {
-            FolTerm::Eq(
-                Box::new(FolTerm::FactRole { fact: Func::Selector(1), role: ai + 1 }),
-                Box::new(FolTerm::FactRole { fact: Func::Selector(2), role: bi + 1 }),
-            )
-        }).collect();
-        FolTerm::And(atoms).to_func()
-    };
+    let match_pred = crate::fol::constraint::ss_match_pred(&common).to_func();
 
     // not_in_b: <a_fact, b_facts> -> T when no b_candidate matches a_fact
     // NullTest . Filter(match_pred) . DistL
@@ -4676,16 +4521,10 @@ fn compile_equality_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
 
     // Build match predicate for <left_fact, right_candidate>. Shares
     // the N-ary-And shape with compile_subset_ast's match_pred.
+    // Sourced from `crate::fol::constraint::eq_build_match` —
+    // `swap=true` flips left/right for the B-not-in-A direction.
     let build_match = |left_indices: &[(usize, usize)], swap: bool| -> Func {
-        use crate::fol::FolTerm;
-        let atoms: Vec<FolTerm> = left_indices.iter().map(|&(ai, bi)| {
-            let (li, ri) = if swap { (bi, ai) } else { (ai, bi) };
-            FolTerm::Eq(
-                Box::new(FolTerm::FactRole { fact: Func::Selector(1), role: li + 1 }),
-                Box::new(FolTerm::FactRole { fact: Func::Selector(2), role: ri + 1 }),
-            )
-        }).collect();
-        FolTerm::And(atoms).to_func()
+        crate::fol::constraint::eq_build_match(left_indices, swap).to_func()
     };
 
     let a_facts = extract_facts_func(&a_ft_id);
