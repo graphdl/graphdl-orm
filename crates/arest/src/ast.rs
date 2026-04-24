@@ -192,8 +192,21 @@ impl Object {
     pub fn f() -> Self { Object::Atom("F".to_string()) }
     pub fn phi() -> Self { Object::Seq(Arc::from([])) }
 
+    /// Construct a sequence of `Object`s. **Bottom-preserving** per
+    /// Backus §11.2.1: if any element is ⊥, the whole sequence is ⊥.
+    /// This is the canonical, paper-faithful constructor and the one
+    /// downstream code should reach for.
+    ///
+    /// To build a sequence that *carries* ⊥ as a member element —
+    /// the intermediate scaffolding §11.2.4's `compact ∘ α(p → id ; ⊥)`
+    /// presupposes — bypass this constructor and call
+    /// `Object::Seq(Arc::from(items))` directly. That path skips the
+    /// ⊥-check and is what makes `Func::Compact` a meaningful
+    /// primitive (it operates on those bypassed sequences). Use the
+    /// bypass only at internal interpreter / lowering boundaries; user-
+    /// visible `Object`s should go through `Object::seq` so §11.2.1
+    /// holds at the API surface.
     pub fn seq(items: Vec<Object>) -> Self {
-        // Bottom-preserving: if any element is Bottom, whole sequence is Bottom.
         if items.iter().any(|x| matches!(x, Object::Bottom)) {
             Object::Bottom
         } else {
@@ -501,6 +514,18 @@ pub enum Func {
     /// Equals: eq:<x, y> = T if x = y, F otherwise
     Eq,
 
+    // ── AREST extensions (not in Backus's primitive set) ─────────
+    //
+    // Backus 1977's primitive set covers atoms, sequences, and
+    // numeric/logical operations on them but stops short of two
+    // categories AREST needs: ordered comparisons (for range /
+    // count constraints) and string operations (for prose-tokenizer
+    // primitives, FORML 2 text-pattern checks, and atom-name
+    // manipulation). The variants below extend the set with those
+    // pragmatic additions. Each is ⊥-preserving and follows the
+    // same "function from object to atom (or T/F)" shape as
+    // Backus's `eq` so the §12 algebraic laws extend cleanly.
+
     /// Greater than: gt:<x, y> = T if x > y (numeric), F otherwise. ⊥ on non-numeric.
     Gt,
 
@@ -546,11 +571,16 @@ pub enum Func {
     /// Lower: lower:x = lowercase of atom x
     Lower,
 
+    // ── Back to Backus's primitive set ───────────────────────────
+
     /// Length: length:<x₁, ..., xₙ> = n
     Length,
 
     /// Concat: concat:<<x1,...>, <y1,...>, ...> = <x1,...,y1,...,...>
     /// Flattens one level of nesting. Each element must be a sequence.
+    /// AREST extension (not in Backus's primitive set) — derivable as a
+    /// pattern over Insert + ApndR but awkward enough that the
+    /// primitive carries its weight.
     Concat,
 
     /// Distribute from left: distl:<y, <z₁,...,zₙ>> = <<y,z₁>,...,<y,zₙ>>
@@ -619,11 +649,17 @@ pub enum Func {
     /// must not propagate ⊥ through Construction (which would void
     /// unrelated computations sharing the parent expression).
     Fetch,
-    /// FetchOrPhi: like Fetch but returns φ (empty seq) when the name is
-    /// absent. Used by indexed fact-type lookup so a missing FT cell
-    /// (no instances of that type yet) yields an empty fact list rather
-    /// than ⊥. Drops the Filter+Eq linear scan that extract_facts_func
-    /// previously needed.
+    /// FetchOrPhi: like Fetch but returns φ (empty seq) when the name
+    /// is absent. Used by indexed fact-type lookup so a missing FT
+    /// cell (no instances of that type yet) yields an empty fact list
+    /// rather than ⊥. Drops the Filter+Eq linear scan that
+    /// extract_facts_func previously needed.
+    ///
+    /// Not a Backus primitive — it's an AREST pragmatic specialization
+    /// of `(Null ∘ Fetch → φ̄ ; Fetch)` kept as a primitive because the
+    /// derived form would call `Fetch:n:D` twice (once for the test,
+    /// once for the value) when the cell could be looked up once.
+    /// Equivalent in semantics; cheaper in evaluation.
     FetchOrPhi,
     /// Store: ↓n:<name, contents, D> → D' with cell name updated
     Store,
