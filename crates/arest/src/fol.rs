@@ -115,8 +115,19 @@ pub enum FolTerm {
     Ge(Box<FolTerm>, Box<FolTerm>),
 
     // ── Terms ───────────────────────────────────────────────
-    /// Variable reference. Resolves to the bound fact by walking
-    /// the enclosing quantifier scope.
+    /// Variable reference — shorthand for the innermost
+    /// enclosing quantifier's binding. Lowers to `Func::Id`, so
+    /// semantically *only* the innermost binding is addressable
+    /// today; nested quantifiers with `Var("outer")` silently
+    /// resolve to the inner binding and produce wrong Funcs.
+    ///
+    /// When a rewire needs true scope resolution (e.g. the ring
+    /// shortcut-match predicate reaching across `<<f1, f2>, cand>`
+    /// wants to name `f1`/`f2`/`cand` independently), build the
+    /// accessor explicitly via `FactRole { fact: <selector>, … }`
+    /// or `Raw(<selector>)` instead of relying on `Var`. Fixing
+    /// this to thread a real scope stack is a follow-up tracked
+    /// under the #357 review findings.
     Var(VarName),
     /// `var.role(n)` — the n'th role's value of the fact bound to
     /// `var`. Lowers to a `Selector(n)` against the bound fact.
