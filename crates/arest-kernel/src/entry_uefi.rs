@@ -18,25 +18,34 @@
 //     prints the AREST scaffold banner via firmware ConOut.
 //   * BIOS path is untouched — existing x86_64-unknown-none build
 //     still produces the same kernel image.
+//   * `println!` (#344 step 3) routes through `arch::_print`, whose
+//     UEFI implementation (`arch::uefi::serial::_print`) writes via
+//     ConOut. Same macro the BIOS path uses — no UEFI-specific
+//     printing call sites in shared kernel code.
 //
 // What this does not do yet (tracked in #344 follow-up commits):
-//   * ExitBootServices + hand-off to `kernel_run`.
-//   * Wire serial → println! through the kernel's existing
-//     `serial.rs` path (currently 16550-specific).
+//   * ExitBootServices + hand-off to `kernel_run` (step 4).
+//   * Real arch serial driver post-ExitBootServices (16550 on
+//     x86_64-uefi → COM1 in QEMU; PL011 on aarch64-uefi → virt
+//     pl011 in QEMU). Until then `_print` writes silently no-op
+//     after firmware services tear down.
 //   * Populate a `BootInfo` from UEFI GetMemoryMap + Graphics Output
 //     Protocol, so `memory::init` / the framebuffer work the same
-//     way the BIOS path does.
+//     way the BIOS path does (step 4).
 //   * aarch64-unknown-uefi — this entry is target-agnostic, but the
-//     kernel body below the arch trait doesn't exist yet.
+//     kernel body below the arch trait doesn't exist yet (step 5).
 
 #![cfg(target_os = "uefi")]
 
 use uefi::prelude::*;
 
+use crate::println;
+
 // Global allocator — uefi-rs ships a small wrapper around
 // `BootServices::allocate_pool`. Required because the kernel crate
 // has `extern crate alloc;` at the top; without a global allocator
-// the UEFI bin won't link.
+// the UEFI bin won't link, and `arch::uefi::_print` needs `String`
+// allocation to format args before transcoding to UCS-2.
 #[global_allocator]
 static ALLOCATOR: uefi::allocator::Allocator = uefi::allocator::Allocator;
 
@@ -45,20 +54,14 @@ static ALLOCATOR: uefi::allocator::Allocator = uefi::allocator::Allocator;
 /// image.
 #[entry]
 fn efi_main() -> Status {
-    // `uefi-rs` 0.34 installs the system table as a global, so
-    // `uefi::system::with_stdout` reaches the ConOut protocol
-    // without threading the table through every call.
-    uefi::system::with_stdout(|stdout| {
-        let _ = stdout.output_string(
-            cstr16!("AREST kernel — UEFI scaffold (#344)\r\n")
-        );
-        let _ = stdout.output_string(
-            cstr16!("  step 1 of 8: entry + ConOut online\r\n")
-        );
-        let _ = stdout.output_string(
-            cstr16!("  next:      ExitBootServices + kernel_run handoff\r\n")
-        );
-    });
+    // ConOut is already configured by the firmware; init_console is
+    // a no-op on UEFI but kept as the named entry so step 4's shared
+    // kernel_run can call it target-agnostically.
+    crate::arch::init_console();
+
+    println!("AREST kernel — UEFI scaffold (#344)");
+    println!("  step 3 of 8: println! routed through arch::_print");
+    println!("  next:        ExitBootServices + kernel_run handoff");
 
     // Scaffold halt. A real boot calls BootServices::exit_boot_services
     // and jumps to kernel_run(BootInfo); until that lands, park here
