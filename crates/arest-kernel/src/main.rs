@@ -54,14 +54,21 @@ mod arch;
 // arch console impl; step 4 wires UEFI ExitBootServices to a shared
 // `kernel_run(BootInfo)` that reaches the same arch facade.
 
-// Step 4d wave 1 (audit a3f6d9b + dep verification): un-gate the
-// modules that compile cleanly on x86_64-unknown-uefi with zero
-// source changes. Six leaf modules with no intra-crate dependencies
-// on BIOS-only siblings — pure parsing / state plumbing code.
-// They're still unreferenced from the UEFI entry path; the wiring
-// lands alongside the remaining step 4d waves.
+// Step 4d waves 1-2 (audit a3f6d9b + dep verification): un-gate the
+// modules that compile cleanly on x86_64-unknown-uefi with zero or
+// near-zero source changes. These have no intra-crate dependencies
+// on BIOS-only siblings — pure parsing, state plumbing, or leaf
+// drawing code. They're still unreferenced from the UEFI entry
+// path; the wiring lands alongside the remaining step 4d waves.
+//
+// `framebuffer` lands here (wave 2) because `bootloader_api::info::
+// FrameBufferInfo` is a non-target-gated dep — the struct shape
+// compiles on both targets. The UEFI-side adapter that actually
+// populates one from `GraphicsOutputProtocol` lives in arch::uefi
+// and lands alongside the kernel_run handoff.
 mod assets;
 mod dma;
+mod framebuffer;
 mod http;
 mod pci;
 mod repl;
@@ -90,8 +97,6 @@ mod allocator;
 mod block;
 #[cfg(not(target_os = "uefi"))]
 mod block_storage;
-#[cfg(not(target_os = "uefi"))]
-mod framebuffer;
 #[cfg(not(target_os = "uefi"))]
 mod net;
 #[cfg(not(target_os = "uefi"))]
