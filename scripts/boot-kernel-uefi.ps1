@@ -112,6 +112,8 @@ if ($Smoke) {
             "frames usable",
             "dma:      pool live (2 MiB UEFI memory-map carve for virtio)",
             "pci:      walk OK (virtio-net:",
+            "virtio-net: driver online, MAC",
+            "virtio-blk: driver online,",
             "post-EBS heap live (sum 0..16 = 120)",
             "system::init() completed (arest engine live on UEFI)",
             "tiny module executed, main() = 42",
