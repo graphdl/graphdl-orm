@@ -98,6 +98,7 @@ if ($Smoke) {
             "AREST kernel - UEFI scaffold (#344)",
             "step 4 of 8: ExitBootServices + post-EBS serial",
             "pre-EBS:  ConOut active",
+            "SSE enabled",
             "post-EBS: 16550 COM1 active",
             "frames usable"
         )
