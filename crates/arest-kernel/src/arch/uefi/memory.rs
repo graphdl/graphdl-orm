@@ -37,16 +37,19 @@
 //     helpers.
 //   * `usable_frame_count()` — convenience for the boot banner.
 //
-// The `dma` / `DmaPool` surface that the x86_64 arm carves is NOT
-// re-exported here yet — UEFI path kernel_run integration (step 4d)
-// doesn't reach virtio yet, so a DMA pool would be dead weight. The
-// BIOS path's `arch::memory::with_dma_pool` caller (`virtio::HAL`) is
-// cfg-gated out of the UEFI build.
+// The `dma` / `DmaPool` surface parallels the BIOS arm exactly — carve
+// a contiguous chunk out of the firmware's memory map before building
+// the frame allocator, reserve the same range so the two allocators
+// never collide. That lets `virtio::KernelHal::dma_alloc` (the only
+// caller of `memory::with_dma_pool`) work byte-for-byte on UEFI as on
+// BIOS, unblocking virtio compilation + bring-up on the UEFI path.
 
 use spin::Mutex;
 use uefi::mem::memory_map::{MemoryMap, MemoryMapOwned, MemoryType};
 use x86_64::structures::paging::{FrameAllocator, OffsetPageTable, PhysFrame, Size4KiB};
 use x86_64::{PhysAddr, VirtAddr};
+
+use crate::dma::{self, DmaPool, RegionKind};
 
 // ---------------------------------------------------------------------------
 // Global singletons
@@ -57,6 +60,21 @@ static PAGE_TABLE: Mutex<Option<OffsetPageTable<'static>>> = Mutex::new(None);
 
 /// The boot-time frame allocator. Valid after `init()`.
 static FRAME_ALLOCATOR: Mutex<Option<UefiFrameAllocator>> = Mutex::new(None);
+
+/// Dedicated contiguous DMA pool for virtio-drivers. Parallels the
+/// BIOS arm's `DMA_POOL` — carved out of the firmware's memory map
+/// before `FRAME_ALLOCATOR` is handed the same map, so the two
+/// allocators never collide. `None` only if no CONVENTIONAL region
+/// fits the configured pool size (unlikely on any reasonable QEMU
+/// guest but the same graceful-degrade path the BIOS arm has).
+static DMA_POOL: Mutex<Option<DmaPool>> = Mutex::new(None);
+
+/// Size of the DMA pool in 4 KiB pages (= 2 MiB). Matches the BIOS
+/// arm's `DMA_POOL_PAGES` so virtio-drivers' fixed queue sizes
+/// (`NET_QUEUE_SIZE = 16` + buffer pools) fit identically on both
+/// paths. Bump once if a future device class (virtio-gpu, virtio-blk
+/// with larger sector caches) needs more.
+const DMA_POOL_PAGES: usize = 512;
 
 // ---------------------------------------------------------------------------
 // Public init
@@ -79,18 +97,67 @@ pub fn init(memory_map: MemoryMapOwned) -> u64 {
     // UEFI's post-EBS page tables identity-map physical RAM, so the
     // "offset mapping" is zero.
     let phys_offset_virt = VirtAddr::new(0);
+    let phys_offset: u64 = 0;
 
     // SAFETY: post-EBS the firmware hands us a stable CR3 pointing at
     // page tables that cover the full RAM identity-mapped. We take
     // ownership of them for the lifetime of the kernel.
     let page_table = unsafe { build_offset_page_table(phys_offset_virt) };
 
-    let frame_alloc = UefiFrameAllocator::new(memory_map);
+    // Carve a dedicated contiguous DMA pool out of the firmware's
+    // memory map BEFORE the general-purpose frame allocator sees it,
+    // then tell the allocator about the reserved range so frames
+    // inside it never leave both pools. Mirrors the BIOS arm's path
+    // (arch::x86_64::memory::init) so virtio::KernelHal::dma_alloc
+    // works identically on both boot paths.
+    let dma_capacity_bytes = (DMA_POOL_PAGES * dma::PAGE_SIZE) as u64;
+    let (reserved, pool) =
+        match carve_from_memory_map(&memory_map, dma_capacity_bytes) {
+            Some((start, end)) => {
+                let p = DmaPool::new(start, DMA_POOL_PAGES, phys_offset);
+                (Some((start, end)), Some(p))
+            }
+            None => (None, None),
+        };
+
+    let frame_alloc = UefiFrameAllocator::new(memory_map, reserved);
 
     *PAGE_TABLE.lock() = Some(page_table);
+    *DMA_POOL.lock() = pool;
     *FRAME_ALLOCATOR.lock() = Some(frame_alloc);
 
     0
+}
+
+/// Scan the UEFI memory map and hand the first-N CONVENTIONAL regions
+/// to `dma::carve_dma_region` in the same `(u64, u64, RegionKind)`
+/// shape the BIOS arm uses. Stack-allocated 32-entry buffer matches
+/// the BIOS arm's `MAX_REGIONS` — QEMU + OVMF emits on the order of
+/// a dozen descriptor entries for a 128 MiB guest.
+fn carve_from_memory_map(
+    map: &MemoryMapOwned,
+    capacity_bytes: u64,
+) -> Option<(u64, u64)> {
+    const MAX_REGIONS: usize = 32;
+    const PAGE_SIZE: u64 = 4096;
+    let mut buf: [(u64, u64, RegionKind); MAX_REGIONS] =
+        [(0, 0, RegionKind::Other); MAX_REGIONS];
+    let mut n = 0usize;
+    for d in map.entries() {
+        if n >= MAX_REGIONS {
+            break;
+        }
+        let start = d.phys_start;
+        let end = start + d.page_count * PAGE_SIZE;
+        let kind = if d.ty == MemoryType::CONVENTIONAL {
+            RegionKind::Usable
+        } else {
+            RegionKind::Other
+        };
+        buf[n] = (start, end, kind);
+        n += 1;
+    }
+    dma::carve_dma_region(&buf[..n], capacity_bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -121,6 +188,18 @@ pub fn with_page_table<R>(f: impl FnOnce(&mut OffsetPageTable<'static>) -> R) ->
 pub fn with_frame_allocator<R>(f: impl FnOnce(&mut UefiFrameAllocator) -> R) -> R {
     let mut guard = FRAME_ALLOCATOR.lock();
     f(guard.as_mut().expect("uefi memory::init() not called"))
+}
+
+/// Call `f` with a mutable reference to the global `DmaPool`, if one
+/// was carved at boot. Returns `None` when `init()` ran on a memory
+/// map where no CONVENTIONAL region fit the configured pool size —
+/// `virtio::KernelHal::dma_alloc` then panics, same graceful-fail
+/// behavior the BIOS arm has. Same signature as
+/// `arch::x86_64::memory::with_dma_pool` so `virtio.rs` compiles
+/// against either arm's `arch::memory::` re-export.
+pub fn with_dma_pool<R>(f: impl FnOnce(&mut DmaPool) -> R) -> Option<R> {
+    let mut guard = DMA_POOL.lock();
+    guard.as_mut().map(f)
 }
 
 /// Return the number of 4 KiB usable frames reported by the firmware
@@ -178,6 +257,11 @@ pub struct UefiFrameAllocator {
     /// sequence. Matches the pattern the BIOS arm's
     /// `BootInfoFrameAllocator::next` uses.
     next: usize,
+    /// Half-open `(start, end)` physical range reserved for the DMA
+    /// pool. Frames whose start address falls inside this range are
+    /// skipped so the two allocators never hand out the same page.
+    /// Mirrors the BIOS arm's `BootInfoFrameAllocator::reserved`.
+    reserved: Option<(u64, u64)>,
 }
 
 // SAFETY: `MemoryMapOwned` holds a `NonNull<[u8]>` under the covers
@@ -192,17 +276,20 @@ pub struct UefiFrameAllocator {
 unsafe impl Send for UefiFrameAllocator {}
 
 impl UefiFrameAllocator {
-    /// Build a new allocator from the firmware's memory map.
-    pub fn new(map: MemoryMapOwned) -> Self {
-        Self { map, next: 0 }
+    /// Build a new allocator from the firmware's memory map, excluding
+    /// frames that fall inside the `reserved` DMA range (if any).
+    pub fn new(map: MemoryMapOwned, reserved: Option<(u64, u64)>) -> Self {
+        Self { map, next: 0, reserved }
     }
 
-    /// Total number of usable 4 KiB frames visible in the memory map.
+    /// Total number of usable 4 KiB frames visible in the memory map,
+    /// after DMA-reserved frames are excluded.
     pub fn usable_frame_count(&self) -> usize {
         self.usable_frames().count()
     }
 
-    /// Iterator over every usable `PhysFrame` in the memory map.
+    /// Iterator over every usable `PhysFrame` in the memory map, minus
+    /// any that fall inside the DMA carve-out.
     ///
     /// Flattens each `CONVENTIONAL` descriptor's `[phys_start,
     /// phys_start + page_count * 4 KiB)` range into individual 4 KiB
@@ -210,6 +297,7 @@ impl UefiFrameAllocator {
     /// descriptor, frames emerge in ascending address order.
     fn usable_frames(&self) -> impl Iterator<Item = PhysFrame> + '_ {
         const PAGE_SIZE: u64 = 4096;
+        let reserved = self.reserved;
         self.map
             .entries()
             .filter(|d| d.ty == MemoryType::CONVENTIONAL)
@@ -222,6 +310,17 @@ impl UefiFrameAllocator {
                 // frame, matching the BIOS arm's `end - 1u64` pattern.
                 let end_frame = PhysFrame::containing_address(end - 1u64);
                 PhysFrame::range_inclusive(start_frame, end_frame)
+            })
+            .filter(move |frame| {
+                // Skip the DMA carve-out window. Exactly the BIOS arm's
+                // `BootInfoFrameAllocator::usable_frames` filter.
+                match reserved {
+                    Some((r_start, r_end)) => {
+                        let addr = frame.start_address().as_u64();
+                        !(addr >= r_start && addr < r_end)
+                    }
+                    None => true,
+                }
             })
     }
 }
