@@ -63,6 +63,18 @@ mod doom;
 // binary stage — see doom_bin.rs top-of-file for the rationale.
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 mod doom_bin;
+// Doom IWAD binary re-export (#383). Sibling of `mod doom_bin;` —
+// same pattern, different binary. `doom_wad.rs` exposes
+// `DOOM_WAD: &[u8]` baked from `doom_assets/doom1.wad` (DOOM 1
+// Shareware v1.9 IWAD) by build.rs, consumed by
+// `KernelDoomHost::wad_sizes` / `read_wads` in src/doom.rs to feed
+// the guest engine a real WAD instead of its internally-embedded
+// Shareware fallback. Same UEFI-x86_64 gating as `doom_bin` since
+// the only consumer is the wasmi host-shim. Empty slice on fresh
+// clones that skipped the WAD stage — see doom_wad.rs top-of-file
+// for the rationale.
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+mod doom_wad;
 
 // `arch` is shared between both entries (#344 step 3). On UEFI it
 // supplies `_print` via ConOut so the existing `println!` macros
