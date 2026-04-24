@@ -9,19 +9,24 @@
 #   .\scripts\boot-kernel-uefi.ps1            # interactive boot
 #   .\scripts\boot-kernel-uefi.ps1 -Smoke     # headless: assert banner
 #
-# Smoke mode (#344 step 4c):
+# Smoke mode (#344 step 4 waves 1-5 + #270/#271):
 #   Boots the kernel under OVMF with a 30 s cap (boot-time UEFI
 #   initialisation is slower than the BIOS path -- OVMF prints its
 #   own banners before our entry runs), captures every byte of
 #   serial, and asserts every banner line our entry writes pre- and
-#   post-ExitBootServices, including the step-4c
-#   "mem: N frames usable" line that proves the page-table + frame-
-#   allocator singletons are live post-EBS. Exits 0 on success, 1
-#   with the captured log on failure.
+#   post-ExitBootServices. Exits 0 on success, 1 with the captured
+#   log on failure. Asserted banner lines cover:
+#     * step 4b: ExitBootServices + post-EBS 16550 serial cutover
+#     * step 4d prep: SSE enable pre-EBS (5dc246a)
+#     * step 4c: init_memory from UEFI memory map -> frames usable
+#     * step 4d wave 3: post-EBS static-BSS heap (5b74f2a)
+#     * step 4d wave 4: AREST engine init on UEFI (8ea0528)
+#     * step 4d wave 5: wasmi executes user WASM (58cf113)
+#     * #270/#271 shim: 10 Doom host imports bound (f8c11d2)
 #
-# Once step 4d lands the shared `kernel_run` handoff, the banner
-# phrase list grows to match `boot-kernel.ps1`'s (heap / gdt / idt
-# / blk / http) and the smoke gains parity with the BIOS one.
+# Remaining for step 4d completion: kernel_run() handoff — requires
+# virtio / block / net to compile on UEFI (currently gated) or a
+# UEFI-specific kernel_run_uefi that skips those subsystems.
 
 param(
     [switch]$Smoke
