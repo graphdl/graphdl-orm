@@ -78,6 +78,15 @@ static ALLOCATOR: uefi::allocator::Allocator = uefi::allocator::Allocator;
 fn efi_main() -> Status {
     crate::arch::init_console();
 
+    // Pre-EBS SSE enable (step 4d prep). Does not depend on boot
+    // services, so firing it up front keeps the f32/f64-emitting
+    // codegen in kernel body callers (notably wasmi once #270/#271
+    // land) from tripping #UD. The BIOS arm fires this from
+    // `kernel_main` for the same reason; doing it here means the
+    // shared `kernel_run` body can assume SSE is live regardless of
+    // which entry path got us here.
+    crate::arch::enable_sse();
+
     // ASCII hyphens — keeps the line printable on bare COM1, which
     // most OVMF builds downcode UCS-2 -> ASCII on. The kernel itself
     // happily transcodes BMP glyphs through ConOut, but the smoke
@@ -85,7 +94,7 @@ fn efi_main() -> Status {
     // round-trip survives only if the banner is ASCII.
     println!("AREST kernel - UEFI scaffold (#344)");
     println!("  step 4 of 8: ExitBootServices + post-EBS serial");
-    println!("  pre-EBS:  ConOut active (firmware-managed)");
+    println!("  pre-EBS:  ConOut active (firmware-managed), SSE enabled");
 
     // SAFETY: `boot::exit_boot_services` walks the current memory
     // map, gets the firmware's signature lock, and tears down
@@ -121,9 +130,10 @@ fn efi_main() -> Status {
     );
     println!("  next:        kernel_run handoff (step 4d)");
 
-    // Scaffold halt. Step 4d wires `kernel_run(phys_offset)` once
-    // the shared kernel body subsystems are UEFI-capable.
-    loop {
-        unsafe { core::arch::asm!("pause", options(nomem, nostack)); }
-    }
+    // Scaffold halt — via the facade so the call site is identical
+    // to the BIOS arm's bottom-of-kernel_run. Step 4d wires
+    // `kernel_run(phys_offset)` once the shared body subsystems are
+    // UEFI-capable; until then the entry parks here after proving
+    // the page-table + frame-allocator singletons are live.
+    crate::arch::halt_forever()
 }
