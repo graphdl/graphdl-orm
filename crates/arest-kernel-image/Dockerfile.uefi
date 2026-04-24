@@ -1,0 +1,130 @@
+# crates/arest-kernel-image/Dockerfile.uefi
+#
+# Builds the arest-kernel as a UEFI executable and boots it under
+# QEMU with OVMF firmware. Mirrors `Dockerfile` (the BIOS path) so
+# both pipelines run from the same `boot-kernel.ps1` harness — the
+# `-Uefi` switch picks this Dockerfile + OVMF runtime instead.
+#
+# UEFI removes the entire BIOS-era image-builder step (no Multiboot2
+# stub, no MBR splice). `cargo build --target x86_64-unknown-uefi`
+# emits a PE32+ `arest-kernel.efi` directly; the runner stage stages
+# it onto a FAT ESP under `/EFI/BOOT/BOOTX64.EFI` (the firmware-
+# probed default) and hands the disk to QEMU.
+#
+# Usage from repo root:
+#   docker build -t arest-kernel-uefi -f crates/arest-kernel-image/Dockerfile.uefi .
+#   docker run --rm arest-kernel-uefi
+#
+# What you should see (today, #344 step 3):
+#   ... OVMF boot screen scrolls past ...
+#   AREST kernel — UEFI scaffold (#344)
+#     step 3 of 8: println! routed through arch::_print
+#     next:        ExitBootServices + kernel_run handoff
+#   ... and the kernel halts in a pause-loop until you ^C QEMU ...
+#
+# Step 4 of #344 swaps the halt loop for the same `kernel_run`
+# bring-up the BIOS path drives — at that point the UEFI banner
+# gains the rest of the kernel's boot lines (heap / gdt / idt / blk
+# / http / etc.) and `boot-kernel.ps1 -Uefi -Smoke` asserts the
+# same phrases the BIOS smoke does.
+
+FROM rust:latest AS builder
+
+# Same nightly + components as the BIOS Dockerfile, plus the two
+# UEFI targets (x86_64 today, aarch64 lined up for #345).
+# `llvm-tools-preview` isn't needed for the UEFI path — there's no
+# bootloader stage splicing — but installing it keeps the toolchain
+# layer identical to the BIOS image, so the layer cache is shared
+# when both Dockerfiles build on the same host.
+RUN rustup toolchain install nightly --profile minimal \
+    && rustup component add rust-src --toolchain nightly \
+    && rustup component add llvm-tools-preview --toolchain nightly \
+    && rustup target add x86_64-unknown-none --toolchain nightly \
+    && rustup target add x86_64-unknown-uefi --toolchain nightly \
+    && rustup target add aarch64-unknown-uefi --toolchain nightly
+
+WORKDIR /build
+
+# Same source-copy layout as the BIOS Dockerfile so layer caching
+# kicks in when both build pipelines run.
+COPY crates/arest-kernel/Cargo.toml crates/arest-kernel/Cargo.toml
+COPY crates/arest-kernel/build.rs crates/arest-kernel/build.rs
+COPY crates/arest-kernel/src/ crates/arest-kernel/src/
+COPY crates/arest-kernel/rust-toolchain.toml crates/arest-kernel/rust-toolchain.toml
+
+# ui.do bundle (#266) — `build.rs` bakes it into the kernel ELF the
+# same way for either target. UEFI build path inherits the same
+# baked assets.
+COPY apps/ui.do/dist/ apps/ui.do/dist/
+
+# arest engine sources + readings — same as the BIOS path, the
+# kernel links the engine in no_std mode for either target.
+COPY crates/arest/Cargo.toml crates/arest/Cargo.toml
+COPY crates/arest/src/ crates/arest/src/
+COPY readings/ readings/
+
+# Build the UEFI .efi. Override the kernel's default target
+# (`x86_64-unknown-none` from .cargo/config.toml) with --target.
+# Output lands at target/x86_64-unknown-uefi/release/arest-kernel.efi.
+RUN cd crates/arest-kernel \
+    && cargo +nightly build --target x86_64-unknown-uefi --release
+
+# ── Runtime stage: QEMU + OVMF + FAT staging tools ─────────────────
+FROM debian:bookworm-slim AS runner
+
+# qemu-system-x86  : QEMU itself.
+# ovmf             : `/usr/share/OVMF/OVMF_CODE.fd` + `OVMF_VARS.fd`
+#                    (split firmware) plus the legacy single-file
+#                    `/usr/share/ovmf/OVMF.fd`. We use the single
+#                    file — varstore persistence is irrelevant for
+#                    a smoke test.
+# dosfstools       : `mkfs.fat` for the ESP.
+# mtools           : `mmd` / `mcopy` to write to the ESP without a
+#                    loop-mount (no kernel mount support inside the
+#                    container's slim Debian).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    qemu-system-x86 \
+    ovmf \
+    dosfstools \
+    mtools \
+    && rm -rf /var/lib/apt/lists/*
+
+# Pull the .efi out of the builder stage and stage it onto a FAT
+# ESP at the firmware's default search path:
+#   /EFI/BOOT/BOOTX64.EFI
+# OVMF probes that location after firmware initialises and hands
+# control to the loaded image.
+COPY --from=builder /build/crates/arest-kernel/target/x86_64-unknown-uefi/release/arest-kernel.efi /arest-kernel.efi
+
+# 64 MiB FAT image — overkill for a single .efi (~5 MiB) but cheap,
+# leaves headroom for the framebuffer / config files later phases
+# (#270 Doom / #269 framebuffer) want to drop alongside the loader.
+RUN dd if=/dev/zero of=/uefi-disk.img bs=1M count=64 status=none \
+    && mkfs.fat -F 32 /uefi-disk.img >/dev/null \
+    && mmd -i /uefi-disk.img ::/EFI \
+    && mmd -i /uefi-disk.img ::/EFI/BOOT \
+    && mcopy -i /uefi-disk.img /arest-kernel.efi ::/EFI/BOOT/BOOTX64.EFI
+
+# Boot the image under QEMU + OVMF:
+#   -bios /usr/share/ovmf/OVMF.fd
+#                    legacy single-file OVMF — code + vars in one
+#                    blob. Fine for a smoke; production use should
+#                    split into OVMF_CODE.fd + OVMF_VARS.fd.
+#   -drive format=raw,file=/uefi-disk.img,if=ide
+#                    expose the ESP as an IDE disk so OVMF probes it
+#                    and finds /EFI/BOOT/BOOTX64.EFI. virtio-blk
+#                    works too but OVMF's boot-priority logic prefers
+#                    legacy IDE for the ESP discovery path.
+#   -serial stdio    AREST kernel writes to ConOut → OVMF mirrors
+#                    ConOut to COM1 → QEMU surfaces COM1 on stdout.
+#                    Same path the BIOS image uses (16550 on COM1).
+#   -display none    headless.
+#   -no-reboot       exit on triple-fault instead of looping —
+#                    keeps smoke runs from spinning forever on a
+#                    crash.
+CMD ["qemu-system-x86_64", \
+     "-bios", "/usr/share/ovmf/OVMF.fd", \
+     "-drive", "format=raw,file=/uefi-disk.img,if=ide", \
+     "-serial", "stdio", \
+     "-display", "none", \
+     "-no-reboot", "-no-shutdown"]
