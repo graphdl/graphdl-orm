@@ -102,6 +102,13 @@ use core::panic::PanicInfo;
 pub static BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut cfg = BootloaderConfig::new_default();
     cfg.mappings.physical_memory = Some(Mapping::Dynamic);
+    // Default kernel stack is 80 KiB which is enough for the
+    // baseline init path but overflows the moment wasmi parses
+    // a module (its WASM-binary parser is recursion-heavy on the
+    // type / function / code section walks). 1 MiB is comfortable
+    // for the wasmi parser plus headroom for any future deep
+    // dispatches; well within QEMU's 128 MiB guest RAM.
+    cfg.kernel_stack_size = 1024 * 1024;
     cfg
 };
 
@@ -121,6 +128,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     allocator::init();
     arch::init_console();
     arch::init_gdt_and_interrupts();
+    println!("boot: pre-enable_sse");
+    // CR0/CR4 SSE enable — required before any dep that emits SSE
+    // (wasmi for f32/f64 ops, core's FP-codegen paths). Bootloader
+    // leaves CR0.EM=1 and CR4.OSFXSR=0, so the first SSE op
+    // triple-faults. See arch::enable_sse for the bits flipped.
+    arch::enable_sse();
+    println!("boot: post-enable_sse");
 
     // Sec-6 ring-3 smoke test mode. Run the subsystems
     // `userspace::launch_test_payload` exercises through the syscall
@@ -335,6 +349,21 @@ fn kernel_run(phys_offset: u64) -> ! {
         }
     }
     println!("  http:   listening on :80 (#264)");
+
+    // wasmi-in-kernel deferred (#270 research follow-up). The
+    // wasmi crate compiles cleanly into x86_64-unknown-none with
+    // `default-features = false, features = ["hash-collections"]`
+    // (verified via `cargo build`), and SSE is now enabled in
+    // arch::enable_sse so f32/f64 ops won't fault. But the BIOS
+    // bootloader silently triple-faults at kernel load time when
+    // the wasmi runtime entry is reachable — Engine + Linker +
+    // Module::new pulls in enough .text + .data.rel.ro that the
+    // bootloader-stage frame allocator can't satisfy the load.
+    // Likely fix: switch to UEFI loader (#344 step 4c+) which has
+    // a much larger early-boot pool, or carve a non-static heap
+    // from BootInfo.memory_regions (#180 follow-up). Until then,
+    // Doom-via-WASM stays a future task — this kernel ships
+    // without the runtime.
 
     // Prove the allocator works — allocate a String and echo it.
     let greeting = "heap is live".to_string();

@@ -24,14 +24,19 @@ use linked_list_allocator::LockedHeap;
 ///   * Two back-buffers for the framebuffer driver — at the
 ///     bootloader-default 1280x720x24bpp that's 2.7 MiB each, so
 ///     ~5.4 MiB just for the buffer chain (#269 triple-buffering).
+///   * wasmi runtime instances + parsed modules (#270) — single
+///     digit MiB for typical guest workloads.
 ///   * Vec / String / BTreeMap churn from command parsing, HTTP
 ///     bodies, syscall copy_in/out, and freeze/thaw cycles.
 ///
-/// 16 MiB headroom is overkill for everything we ship today and
-/// well within QEMU's default 128 MiB guest RAM. When the dynamic
+/// 8 MiB headroom comfortably covers everything we ship today and
+/// stays well below the bootloader 0.11 BIOS-stage's static-frame-
+/// allocator headroom (16 MiB BSS pushed past it once the wasmi
+/// `.text` got pulled in alongside; combined LOAD-segment sizes
+/// were too large for the early-boot region). When the dynamic
 /// memory plumbing (#180 follow-up) lands, this gets carved out of
 /// `BootInfo.memory_regions` instead of the static BSS.
-const HEAP_SIZE: usize = 16 * 1024 * 1024;
+const HEAP_SIZE: usize = 8 * 1024 * 1024;
 
 /// Backing storage for the heap. `MaybeUninit` avoids zero-filling
 /// the 1 MiB buffer in the binary — the BSS pattern handles that on
