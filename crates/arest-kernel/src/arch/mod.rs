@@ -44,6 +44,26 @@ pub mod aarch64;
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 pub use aarch64::*;
 
+// armv7 UEFI arm (#346 — first commit of the sub-chain). Scaffold-
+// only this commit: PL011 MMIO `_print` + `init_console` no-op +
+// `wfi` `halt_forever`, mirroring the aarch64 arm's bring-up shape.
+// No memory / DMA / virtio-mmio yet — those are #346b/c. No runtime
+// harness yet — that's #346d. Gated on `target_arch = "arm"` to
+// pick up only the custom `arest-kernel-armv7-uefi.json` target;
+// `target_arch = "aarch64"` (the 64-bit ARM UEFI arm) is a sibling
+// arm and stays on its own arch arm above.
+#[cfg(all(target_os = "uefi", target_arch = "arm"))]
+pub mod armv7;
+// `pub use` is unused on this commit: the armv7 arm has no runtime
+// harness yet (#346d brings it online), so no caller resolves
+// `arch::_print` / `arch::halt_forever` / `arch::init_console` on
+// the armv7 build. Mirrors the `#[allow(unused_imports)]` the
+// aarch64 arm carries on its `serial::{_print, raw_puts}` re-export
+// for the same reason.
+#[cfg(all(target_os = "uefi", target_arch = "arm"))]
+#[allow(unused_imports)]
+pub use armv7::*;
+
 /// Crate-wide `print!`. Routes to `$crate::arch::_print`, which is
 /// supplied by the active arch arm above.
 #[macro_export]
