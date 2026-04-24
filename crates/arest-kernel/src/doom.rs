@@ -7,33 +7,59 @@
 // WebAssembly import-module namespaces matching the groupings used in
 // the doomgeneric-wasm sidecar contract:
 //
+// Signatures below are reconciled against the authoritative
+// jacobenget/doom.wasm v0.1.0 (commit dc94345) doom_wasm.h header at
+// 24bb772 — six imports drifted from the binary contract on the prior
+// wave and `wasmi::Linker::instantiate` will reject the mismatches. The
+// `_ptr: i32` arguments are guest-linear-memory offsets (wasm32 makes
+// them 4 bytes wide, passed through the host ABI as signed i32 by
+// wasmi's `IntoFunc` machinery). `size_t` from the C header is i32 in
+// wasm32; `uint64_t` is i64.
+//
 //   loading:
-//     onGameInit(argc: i32, argv_ptr: i32)           - notify host the
-//                                                       guest is ready
-//                                                       for WAD data;
-//                                                       argv_ptr points
-//                                                       into guest linear
-//                                                       memory.
-//     wadSizes(out_ptr: i32) -> i32                  - write i32 count +
-//                                                       length table into
+//     onGameInit(width: i32, height: i32)            - one-time init
+//                                                       with framebuffer
+//                                                       dimensions in
+//                                                       pixels (640x400
+//                                                       under our build).
+//     wadSizes(num_wads_ptr: i32,
+//              total_bytes_ptr: i32)                  - host writes
+//                                                       `int32_t` WAD
+//                                                       count and
+//                                                       `size_t` total
+//                                                       byte size into
 //                                                       guest memory at
-//                                                       out_ptr; return
-//                                                       total bytes
-//                                                       needed.
-//     readWads(buffer_ptr: i32) -> i32               - copy concatenated
-//                                                       WAD blobs into
-//                                                       guest memory
-//                                                       starting at
-//                                                       buffer_ptr;
-//                                                       return bytes
-//                                                       written.
+//                                                       the two
+//                                                       out-pointers.
+//                                                       Count of 0 makes
+//                                                       Doom fall back to
+//                                                       its built-in
+//                                                       shareware path.
+//     readWads(wad_buf_ptr: i32,
+//              lengths_ptr: i32)                      - guest has
+//                                                       allocated
+//                                                       `total_bytes` of
+//                                                       WAD storage and
+//                                                       a per-WAD length
+//                                                       array; host
+//                                                       copies the WAD
+//                                                       blob and the
+//                                                       `int32_t` length
+//                                                       per WAD into
+//                                                       guest memory.
 //
 //   runtimeControl:
-//     timeInMilliseconds() -> i32                    - monotonic ms
-//                                                       since boot.
-//                                                       Sourced from
-//                                                       arch::time::now_ms
-//                                                       (603b77a).
+//     timeInMilliseconds() -> i64                    - monotonic
+//                                                       milliseconds
+//                                                       since boot
+//                                                       (`uint64_t` per
+//                                                       header).
+//                                                       Returns 0 until
+//                                                       the UEFI arch
+//                                                       arm grows a
+//                                                       timer IRQ —
+//                                                       see TODO in
+//                                                       the impl body.
 //
 //   ui:
 //     drawFrame(frame_ptr: i32)                      - present one
@@ -45,18 +71,27 @@
 //                                                       (02bdae1).
 //
 //   gameSaving:
-//     sizeOfSaveGame() -> i32                        - length of the
+//     sizeOfSaveGame(gamemap: i32) -> i32            - length of the
 //                                                       host-persisted
-//                                                       save slot; 0
+//                                                       save slot for
+//                                                       `gamemap`; 0
 //                                                       if none.
-//     readSaveGame(buf_ptr: i32)                     - copy save bytes
+//     readSaveGame(gamemap: i32,
+//                  out_ptr: i32) -> i32              - copy save bytes
 //                                                       into guest
 //                                                       memory at
-//                                                       buf_ptr.
-//     writeSaveGame(buf_ptr: i32, len: i32)          - persist `len`
+//                                                       out_ptr; return
+//                                                       bytes actually
+//                                                       written.
+//     writeSaveGame(gamemap: i32,
+//                   data_ptr: i32,
+//                   data_len: i32) -> i32            - persist `data_len`
 //                                                       bytes from
-//                                                       guest memory
-//                                                       at buf_ptr.
+//                                                       guest memory at
+//                                                       data_ptr; return
+//                                                       bytes persisted
+//                                                       (0 if
+//                                                       unsupported).
 //
 //   console:
 //     onInfoMessage(ptr: i32, len: i32)              - I_Printf-class
@@ -94,6 +129,7 @@
 #![cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 
 use alloc::vec;
+use alloc::vec::Vec;
 use wasmi::Linker;
 
 /// Host-side callbacks the doomgeneric-wasm guest expects. Every
@@ -118,34 +154,44 @@ pub trait DoomHost {
 
     /// `loading.onGameInit`. Invoked once during `D_DoomMain` so the
     /// host can bring up the WAD pipeline before the guest calls
-    /// `readWads`. `argc` / `argv_ptr` mirror the usual `main(argc,
-    /// argv)` surface — `argv_ptr` points into guest linear memory at
-    /// an array of `i32` offsets, each pointing to a null-terminated
-    /// UTF-8 command-line argument.
-    fn on_game_init(&mut self, argc: i32, argv_ptr: i32);
+    /// `readWads`. The header passes the framebuffer dimensions in
+    /// pixels (`width`, `height`) — under our build that's 640x400
+    /// matching `BackBuffer::blit_doom_frame`'s expectations.
+    fn on_game_init(&mut self, width: i32, height: i32);
 
     /// `loading.wadSizes`. Guest asks the host how much memory to
-    /// reserve for the WAD payload. The host writes a `u32` WAD count
-    /// followed by a table of `u32` lengths into guest memory at
-    /// `out_ptr`. Returns the total number of bytes the guest needs
-    /// to allocate for the subsequent `readWads` copy.
-    fn wad_sizes(&mut self, out_ptr: i32) -> i32;
+    /// reserve for the WAD payload. Convention: the trampoline owns
+    /// guest-memory translation, so the trait method returns the two
+    /// values and the trampoline writes them back to the guest's
+    /// out-pointers. Tuple is `(num_wads, total_bytes_in_all_wads)`
+    /// — `int32_t numberOfWads` and `size_t numberOfTotalBytesInAllWads`
+    /// in the C header, both 4 bytes in wasm32. Returning a count of 0
+    /// signals the guest to fall back to its built-in shareware WAD.
+    fn wad_sizes(&mut self) -> (u32, u32);
 
-    /// `loading.readWads`. Guest has allocated a buffer of the size
-    /// returned by `wadSizes` and passes its offset. The host copies
-    /// the WAD blobs concatenated in the order the length table
-    /// announced. Returns bytes written (= `wadSizes` return value
-    /// on success).
-    fn read_wads(&mut self, buffer_ptr: i32) -> i32;
+    /// `loading.readWads`. Guest has allocated a destination buffer
+    /// (sized to `total_bytes` from `wad_sizes`) and a per-WAD length
+    /// array (sized to `num_wads` × 4 bytes). Convention: the
+    /// trampoline owns guest-memory translation — it forms host-side
+    /// `&mut [u8]` / `&mut [i32]` slices for the trait method to fill,
+    /// then copies both back into guest memory at the out-pointers.
+    /// `wad_out` receives the concatenated WAD bytes; `lengths_out`
+    /// receives the per-WAD byte length so the guest can index into
+    /// `wad_out`.
+    fn read_wads(&mut self, wad_out: &mut [u8], lengths_out: &mut [i32]);
 
     // --- runtimeControl ---------------------------------------------
 
     /// `runtimeControl.timeInMilliseconds`. Doom's game loop
     /// accumulates tics against an ms clock — 35 tics/sec expected.
-    /// Backed on UEFI by `arch::time::now_ms`; returned as `i32` to
-    /// match the doomgeneric-wasm ABI (wraps every ~24 days, which
-    /// Doom's delta-based loop tolerates).
-    fn time_in_milliseconds(&mut self) -> i32;
+    /// Header declares this as `uint64_t` (monotonically non-
+    /// decreasing); we mirror with `i64` since wasmi's host-func ABI
+    /// is signed but the bit pattern round-trips. Implementations
+    /// that don't have a monotonic ms source available may return 0
+    /// — Doom's loop tolerates a stuck clock by simply not advancing
+    /// tics, which keeps the WASM module instantiable and lets the
+    /// guest reach `drawFrame` for visual smoke.
+    fn time_in_milliseconds(&mut self) -> i64;
 
     // --- ui ---------------------------------------------------------
 
@@ -169,21 +215,28 @@ pub trait DoomHost {
     // --- gameSaving -------------------------------------------------
 
     /// `gameSaving.sizeOfSaveGame`. Guest queries the host-persisted
-    /// save-slot length before calling `readSaveGame`. Returns 0 if
-    /// no save exists, which lets the guest skip the read entirely.
-    fn size_of_save_game(&mut self) -> i32;
+    /// save-slot length for the given `gamemap` (which level the save
+    /// is for) before calling `readSaveGame`. Returns 0 if no save
+    /// exists, which lets the guest skip the read entirely.
+    fn size_of_save_game(&mut self, gamemap: i32) -> i32;
 
     /// `gameSaving.readSaveGame`. Guest has allocated a buffer of the
-    /// size returned by `sizeOfSaveGame` and passes its offset. Host
-    /// copies the save payload in; guest replays it through
-    /// `M_ReadFile` / `P_UnArchive*`.
-    fn read_save_game(&mut self, buf_ptr: i32);
+    /// size returned by `sizeOfSaveGame(gamemap)` and passes its
+    /// offset. Convention: the trampoline owns guest-memory
+    /// translation — it forms a host-side `&mut [u8]` slice for the
+    /// trait method to fill, then copies the bytes back into guest
+    /// memory. Returns the number of bytes actually written
+    /// (`size_t` in the C header, fits an i32 since it is bounded by
+    /// the slice length).
+    fn read_save_game(&mut self, gamemap: i32, out: &mut [u8]) -> i32;
 
-    /// `gameSaving.writeSaveGame`. Guest asks the host to persist
-    /// `len` bytes from guest memory at `buf_ptr`. Under UEFI this
-    /// will land on the virtio-blk checkpoint pipeline (#337) once
-    /// the save-slot namespace is carved; until then the stub panics.
-    fn write_save_game(&mut self, buf_ptr: i32, len: i32);
+    /// `gameSaving.writeSaveGame`. Guest asks the host to persist a
+    /// save-game payload for `gamemap`. Convention: the trampoline
+    /// owns guest-memory translation — it copies `data_len` bytes
+    /// out of guest memory at `data_ptr` into a host-side `&[u8]`
+    /// before calling. Returns bytes persisted (0 if unsupported,
+    /// per the header's "0 if unsupported" contract).
+    fn write_save_game(&mut self, gamemap: i32, data: &[u8]) -> i32;
 
     // --- console ----------------------------------------------------
 
@@ -222,21 +275,31 @@ pub trait DoomHost {
 ///     no-op when the framebuffer driver isn't installed.
 ///   * `on_game_init` — live (#384). Prints a one-line `doom: game
 ///     init` marker to serial so the boot log shows the guest
-///     reaching `D_DoomMain`; argv synthesis is deferred.
+///     reaching `D_DoomMain`. Now receives `(width, height)` per
+///     doom_wasm.h header; the host already knows the framebuffer
+///     dimensions so the values are observational.
 ///   * `on_info_message` / `on_error_message` — live (#384). Route
 ///     UTF-8 bytes out of guest memory to the kernel serial console
 ///     with `doom: info:` / `doom: ERROR:` prefixes. Silent drop on
 ///     malformed UTF-8 so a corrupt message can't itself trap Doom.
-///   * `size_of_save_game` — returns 0 ("no save present") per
-///     trait contract; the matching `read_save_game` impl is still
-///     gated on #375's block_storage reserved-region API.
+///   * `time_in_milliseconds` — signature widened to `i64` (#395) to
+///     match the header's `uint64_t` declaration. Body returns 0
+///     (TODO #344 step 4d) until the UEFI arch arm grows a timer
+///     IRQ + monotonic ms counter mirroring the BIOS arm's
+///     `arch::time::now_ms`; doom.rs is UEFI-x86_64-only so the
+///     BIOS arm's existing counter isn't reachable.
+///   * `size_of_save_game(gamemap)` — returns 0 ("no save present"
+///     for that gamemap) per trait contract; the matching
+///     `read_save_game` / `write_save_game` impls are still gated on
+///     #375's block_storage reserved-region API.
 ///
 /// The real impl is filled in incrementally alongside the
 /// doomgeneric-wasm module landing:
-///   * `wad_sizes` / `read_wads` — once the WAD bytes ship embedded
-///     in the kernel image (or are served from virtio-blk).
-///   * `time_in_milliseconds` — wire to `arch::time::now_ms` with
-///     a `u64 -> i32` truncation.
+///   * `wad_sizes` / `read_wads` — wire in the embedded `doom.wad`
+///     bytes once the WAD-load wave (#383) lands. Today the trait
+///     reports zero WADs so the guest falls through to its built-in
+///     shareware path (per doom_wasm.h "If numberOfWads remains 0,
+///     Doom loads shareware WAD").
 ///   * `read_save_game` / `write_save_game` — wire to virtio-blk
 ///     save-slot region (#375). Waiting on `block_storage` to grow
 ///     a reserved-region API that doesn't clobber the #337
@@ -261,35 +324,64 @@ impl Default for KernelDoomHost {
 }
 
 impl DoomHost for KernelDoomHost {
-    fn on_game_init(&mut self, _argc: i32, _argv_ptr: i32) {
+    fn on_game_init(&mut self, _width: i32, _height: i32) {
         // Observational — the guest is telling us it's alive and has
         // begun `D_DoomMain`. Print one line so the serial log shows
-        // the handoff. `argv_ptr` translation is deferred: the host
-        // doesn't yet synthesize a command-line for the guest (that
-        // wave lands alongside the embedded WAD work in
-        // `on_game_init` / `wad_sizes` / `read_wads` — see the
-        // module-level TODO list).
+        // the handoff. `width`/`height` arrive from the guest's view
+        // of the framebuffer dimensions; under our build the host
+        // already configures `BackBuffer::blit_doom_frame` for
+        // 640x400 BGRA so the values are observational only — a
+        // mismatch here would surface as a frame-size assertion on
+        // the next `draw_frame` call rather than something this stub
+        // needs to reject.
         crate::println!("doom: game init");
     }
 
-    fn wad_sizes(&mut self, _out_ptr: i32) -> i32 {
-        // Pure-query — return 0 so the guest reads an empty WAD
-        // table rather than panicking at import time. A 0 here makes
-        // Doom's init path fail with its own "no IWAD found" error,
-        // which is a legible failure mode during scaffold stages.
-        0
+    fn wad_sizes(&mut self) -> (u32, u32) {
+        // TODO(#383): once the embedded `doom.wad` bytes are wired
+        // (Track C baked `doom_assets/doom.wasm`; the WAD-load wave
+        // is its sibling), return the actual `(num_wads, total_bytes)`
+        // pair so the guest can size its allocation. Today we report
+        // zero WADs, which per doom_wasm.h ("If numberOfWads remains
+        // 0, Doom loads shareware WAD") signals the guest to fall
+        // through to its built-in shareware path — a legible scaffold
+        // behavior that doesn't require the trampoline to ship real
+        // WAD bytes through guest memory yet.
+        (0, 0)
     }
 
-    fn read_wads(&mut self, _buffer_ptr: i32) -> i32 {
-        // Wad transfer is a side-effect on guest memory — no safe
-        // zero-return. Panic until the real impl lands.
-        panic!("doom: read_wads not yet implemented");
+    fn read_wads(&mut self, _wad_out: &mut [u8], _lengths_out: &mut [i32]) {
+        // TODO(#383): copy the embedded WAD blob and per-WAD length
+        // array into the host-side slices the trampoline allocated.
+        // While `wad_sizes` returns `(0, 0)` the guest does not call
+        // through here — the trampoline forms zero-length slices and
+        // this body is a no-op even if the guest does ignore the
+        // count and call anyway, so leaving it empty is safer than a
+        // panic that could fire mid-tic.
     }
 
-    fn time_in_milliseconds(&mut self) -> i32 {
-        // Pure-query. Zero is a valid ms clock reading at t=0, so
-        // stubbing zero is defensible; the real impl (one line,
-        // `arch::time::now_ms() as i32`) lands with wave 6.
+    fn time_in_milliseconds(&mut self) -> i64 {
+        // Header declares `uint64_t timeInMilliseconds`; the trait
+        // returns `i64` so the wasmi host-func ABI marshals a 64-bit
+        // value. Doom's game loop accumulates tics against this
+        // clock at 35 Hz, but it only cares about monotonic deltas
+        // — a 0 baseline that never advances will let the guest run
+        // its init path and reach the first `drawFrame` (the visible
+        // smoke for Track A's UEFI handoff) even if the tic counter
+        // never increments.
+        //
+        // TODO(#344 step 4d / #180-followup): once the UEFI arch arm
+        // installs an IDT + timer interrupt, expose a UEFI-side
+        // `arch::time::now_ms` mirroring the BIOS arm's PIT-driven
+        // `AtomicU64` counter and return `arch::time::now_ms() as
+        // i64` here. Today the UEFI arm has no IRQ infrastructure
+        // (`arch::halt_forever` busy-loops on `pause` for that
+        // reason — see `arch::uefi::mod` docstring), so there is no
+        // monotonic ms source reachable from the host shim. The
+        // cast `u64 -> i64` is the trivial part — bit-pattern
+        // preserving for any clock value below `i64::MAX` ms (≈ 292
+        // million years), which any realistic uptime stays well
+        // under.
         0
     }
 
@@ -313,27 +405,25 @@ impl DoomHost for KernelDoomHost {
         crate::framebuffer::present();
     }
 
-    fn size_of_save_game(&mut self) -> i32 {
-        // Pure-query. Zero = no save, which is the correct reading
-        // on a fresh boot regardless of wiring: the guest interprets
-        // 0 as "no save slot present" and skips the `read_save_game`
-        // call path entirely (which is exactly what we need while
-        // `read_save_game` / `write_save_game` are still gated on
-        // the block_storage reserved-region API — see #375 TODOs
-        // below).
+    fn size_of_save_game(&mut self, _gamemap: i32) -> i32 {
+        // Pure-query. Zero = no save for that gamemap, which is the
+        // correct reading on a fresh boot regardless of wiring: the
+        // guest interprets 0 as "no save slot present" and skips the
+        // `read_save_game` call path entirely (which is exactly what
+        // we need while `read_save_game` / `write_save_game` are
+        // still gated on the block_storage reserved-region API — see
+        // #375 TODOs below).
         //
-        // TODO(#372 / #375): once the doomgeneric-wasm binary lands
-        // and its save-game format is fixed (doomgeneric ports
-        // typically hard-code a 352256-byte slot), return the actual
-        // persisted slot length from the block_storage reserved
-        // region. Returning a non-zero value here without the
-        // corresponding `read_save_game` impl would cause the guest
-        // to call through and panic, so the TODO is intentionally
-        // paired with the #375 block_storage API gap.
+        // TODO(#375): once the block_storage reserved-region API
+        // lands, return the actual persisted slot length for the
+        // requested `gamemap`. Returning a non-zero value here
+        // without the corresponding `read_save_game` impl would cause
+        // the guest to call through and panic, so the TODO is
+        // intentionally paired with the #375 block_storage API gap.
         0
     }
 
-    fn read_save_game(&mut self, _buf_ptr: i32) {
+    fn read_save_game(&mut self, _gamemap: i32, _out: &mut [u8]) -> i32 {
         // TODO(#375): wire to a block_storage reserved-region API.
         //
         // Today `block_storage` only exposes checkpoint semantics
@@ -348,13 +438,16 @@ impl DoomHost for KernelDoomHost {
         // region, with its own header + CRC), which this sub-task is
         // explicitly scoped out of (file ownership: doom.rs only).
         //
-        // Guarded by the `size_of_save_game() == 0` check on the
-        // guest side — if the guest still calls through before the
-        // API lands, treat it as a contract violation and panic.
-        panic!("doom: read_save_game not yet implemented (see #375 TODO)");
+        // Guarded by the `size_of_save_game(gamemap) == 0` check on
+        // the guest side — if the guest still calls through before
+        // the API lands, return 0 (zero bytes copied) rather than
+        // panicking, so a stray call doesn't crash the kernel mid-
+        // tic. The header allows 0 as a legal return ("returns bytes
+        // actually copied").
+        0
     }
 
-    fn write_save_game(&mut self, _buf_ptr: i32, _len: i32) {
+    fn write_save_game(&mut self, _gamemap: i32, _data: &[u8]) -> i32 {
         // TODO(#375): wire to a block_storage reserved-region API.
         //
         // Same shape as `read_save_game` above — `block_storage` has
@@ -368,9 +461,14 @@ impl DoomHost for KernelDoomHost {
         // CRC + version lives alongside the existing checkpoint
         // header), not scattered across callers.
         //
+        // Per the header: returns "bytes persisted (0 if
+        // unsupported)". Returning 0 is the documented "unsupported"
+        // signal, which is exactly the truth while #375 is open —
+        // the guest should treat the save as failed and surface a
+        // visible error rather than spinning on an apparent success.
         // Deferred until the `block_storage` API grows a
         // `reserve_region(base, sectors)` primitive — see #375.
-        panic!("doom: write_save_game not yet implemented (see #375 TODO)");
+        0
     }
 
     fn on_info_message(&mut self, message: &str) {
@@ -403,7 +501,17 @@ impl DoomHost for KernelDoomHost {
 /// is looked up under its WASM module namespace
 /// (`loading` / `runtimeControl` / `ui` / `gameSaving` / `console`)
 /// and name, wrapped via `Linker::func_wrap` so wasmi's `IntoFunc`
-/// machinery handles the i32 parameter / return marshaling.
+/// machinery handles the parameter / return marshaling.
+///
+/// The function-type signatures here are reconciled against the
+/// authoritative jacobenget/doom.wasm v0.1.0 (commit dc94345)
+/// `doom_wasm.h` header at 24bb772 — `wasmi::Linker::instantiate`
+/// matches imports by exact `(params, results)` shape, so any drift
+/// from the binary contract surfaces as `LinkerError::CannotFindDefinitionForImport`
+/// at instantiate time. Most imports are `(i32, ...)`-shaped because
+/// guest pointers / `int32_t` / `size_t` are all 4 bytes in wasm32;
+/// `runtimeControl.timeInMilliseconds` is the lone i64 (header
+/// declares it `uint64_t`).
 ///
 /// Call once at module-instantiate time, AFTER `linker` is
 /// constructed and BEFORE `linker.instantiate(&mut store, &module)`.
@@ -431,36 +539,97 @@ pub fn bind_doom_imports<T: DoomHost + 'static>(linker: &mut Linker<T>) {
         .func_wrap(
             "loading",
             "onGameInit",
-            |mut caller: wasmi::Caller<'_, T>, argc: i32, argv_ptr: i32| {
-                caller.data_mut().on_game_init(argc, argv_ptr);
+            |mut caller: wasmi::Caller<'_, T>, width: i32, height: i32| {
+                caller.data_mut().on_game_init(width, height);
             },
         )
         .expect("doom: duplicate import loading.onGameInit");
+    // loading.wadSizes — `(int32_t *numberOfWads, size_t *numberOfTotalBytesInAllWads) -> ()`.
+    // The trait method returns the pair; this trampoline writes both
+    // 32-bit values back into guest memory at the supplied out-
+    // pointers. Memory-export resolution and write failures are silent
+    // no-ops for parity with `ui.drawFrame` / `console.*` — a
+    // mid-call error surfaces as the guest seeing a stale (zero-
+    // initialized) out-buffer, which falls through to the shareware
+    // fallback Doom already handles cleanly.
     linker
         .func_wrap(
             "loading",
             "wadSizes",
-            |mut caller: wasmi::Caller<'_, T>, out_ptr: i32| -> i32 {
-                caller.data_mut().wad_sizes(out_ptr)
+            |mut caller: wasmi::Caller<'_, T>, num_wads_ptr: i32, total_bytes_ptr: i32| {
+                let (num_wads, total_bytes) = caller.data_mut().wad_sizes();
+                let memory = match caller
+                    .get_export("memory")
+                    .and_then(|e| e.into_memory())
+                {
+                    Some(m) => m,
+                    None => return,
+                };
+                let _ = memory.write(
+                    &mut caller,
+                    num_wads_ptr as usize,
+                    &num_wads.to_le_bytes(),
+                );
+                let _ = memory.write(
+                    &mut caller,
+                    total_bytes_ptr as usize,
+                    &total_bytes.to_le_bytes(),
+                );
             },
         )
         .expect("doom: duplicate import loading.wadSizes");
+    // loading.readWads — `(uint8_t *wadDataDestination, int32_t *byteLengthOfEachWad) -> ()`.
+    // The trampoline forms host-side scratch slices, lets the trait
+    // method fill them, then writes both back into guest memory. While
+    // the impl is stubbed (#383), `wad_sizes` reports zero WADs / zero
+    // bytes so the slices are empty and both writes are no-ops; the
+    // function still has to exist with the right `(i32, i32) -> ()`
+    // type for `wasmi::Linker::instantiate` to accept the module.
     linker
         .func_wrap(
             "loading",
             "readWads",
-            |mut caller: wasmi::Caller<'_, T>, buffer_ptr: i32| -> i32 {
-                caller.data_mut().read_wads(buffer_ptr)
+            |mut caller: wasmi::Caller<'_, T>, wad_buf_ptr: i32, lengths_ptr: i32| {
+                // Mirror `wad_sizes` to size the host scratch buffers.
+                // While the stub returns (0, 0) both slices are empty;
+                // once #383 lands the trampoline will need to
+                // remember the prior `wad_sizes` answer (a
+                // `Cell`-style cache on the host) instead of re-
+                // querying — the contract is that `wad_sizes` is
+                // always called first by Doom, so a re-query here
+                // matches the eventual real answer.
+                let (num_wads, total_bytes) = caller.data_mut().wad_sizes();
+                let mut wad_buf = vec![0u8; total_bytes as usize];
+                let mut lengths_buf = vec![0i32; num_wads as usize];
+                caller.data_mut().read_wads(&mut wad_buf, &mut lengths_buf);
+                let memory = match caller
+                    .get_export("memory")
+                    .and_then(|e| e.into_memory())
+                {
+                    Some(m) => m,
+                    None => return,
+                };
+                let _ = memory.write(&mut caller, wad_buf_ptr as usize, &wad_buf);
+                // `int32_t` array: serialize little-endian since
+                // wasm is fixed-LE.
+                let mut lengths_le: Vec<u8> = Vec::with_capacity(lengths_buf.len() * 4);
+                for n in &lengths_buf {
+                    lengths_le.extend_from_slice(&n.to_le_bytes());
+                }
+                let _ = memory.write(&mut caller, lengths_ptr as usize, &lengths_le);
             },
         )
         .expect("doom: duplicate import loading.readWads");
 
     // runtimeControl.*
+    // `uint64_t timeInMilliseconds(void)` — mirrored as `() -> i64` on
+    // the wasmi side; the trait returns `i64` and the host clock is
+    // `arch::time::now_ms() as i64`.
     linker
         .func_wrap(
             "runtimeControl",
             "timeInMilliseconds",
-            |mut caller: wasmi::Caller<'_, T>| -> i32 {
+            |mut caller: wasmi::Caller<'_, T>| -> i64 {
                 caller.data_mut().time_in_milliseconds()
             },
         )
@@ -514,30 +683,89 @@ pub fn bind_doom_imports<T: DoomHost + 'static>(linker: &mut Linker<T>) {
         .expect("doom: duplicate import ui.drawFrame");
 
     // gameSaving.*
+    // `size_t sizeOfSaveGame(int32_t gameSaveId)` — `(i32) -> i32`
+    // (`size_t` is 4 bytes in wasm32). The `gamemap` argument is
+    // which level the save is for; the trait method does the lookup
+    // and returns the byte length (or 0 for "no save").
     linker
         .func_wrap(
             "gameSaving",
             "sizeOfSaveGame",
-            |mut caller: wasmi::Caller<'_, T>| -> i32 {
-                caller.data_mut().size_of_save_game()
+            |mut caller: wasmi::Caller<'_, T>, gamemap: i32| -> i32 {
+                caller.data_mut().size_of_save_game(gamemap)
             },
         )
         .expect("doom: duplicate import gameSaving.sizeOfSaveGame");
+    // `size_t readSaveGame(int32_t gameSaveId, uint8_t *dataDestination)`
+    // — `(i32, i32) -> i32`. Trampoline forms a host-side scratch
+    // buffer sized to the host's prior `size_of_save_game(gamemap)`
+    // answer, lets the trait method fill it, then copies the written
+    // bytes back into guest memory. Returns the byte count actually
+    // written (`size_t` per the header). While #375 is open the trait
+    // returns 0 so the buffer is empty and the write is a no-op.
     linker
         .func_wrap(
             "gameSaving",
             "readSaveGame",
-            |mut caller: wasmi::Caller<'_, T>, buf_ptr: i32| {
-                caller.data_mut().read_save_game(buf_ptr);
+            |mut caller: wasmi::Caller<'_, T>, gamemap: i32, out_ptr: i32| -> i32 {
+                let len = caller.data_mut().size_of_save_game(gamemap);
+                let len_usize = match usize::try_from(len) {
+                    Ok(v) => v,
+                    Err(_) => return 0,
+                };
+                let mut buf = vec![0u8; len_usize];
+                let written = caller.data_mut().read_save_game(gamemap, &mut buf);
+                let written_usize = usize::try_from(written).unwrap_or(0).min(buf.len());
+                let memory = match caller
+                    .get_export("memory")
+                    .and_then(|e| e.into_memory())
+                {
+                    Some(m) => m,
+                    None => return 0,
+                };
+                if memory
+                    .write(&mut caller, out_ptr as usize, &buf[..written_usize])
+                    .is_err()
+                {
+                    return 0;
+                }
+                written
             },
         )
         .expect("doom: duplicate import gameSaving.readSaveGame");
+    // `size_t writeSaveGame(int32_t gameSaveId, uint8_t *data, size_t length)`
+    // — `(i32, i32, i32) -> i32`. Trampoline copies `length` bytes
+    // out of guest memory at `data_ptr` into a host-side `Vec<u8>`,
+    // then hands the slice to the trait method. Returns the byte
+    // count actually persisted (or 0 if unsupported, per the header).
     linker
         .func_wrap(
             "gameSaving",
             "writeSaveGame",
-            |mut caller: wasmi::Caller<'_, T>, buf_ptr: i32, len: i32| {
-                caller.data_mut().write_save_game(buf_ptr, len);
+            |mut caller: wasmi::Caller<'_, T>,
+             gamemap: i32,
+             data_ptr: i32,
+             data_len: i32|
+             -> i32 {
+                let len = match usize::try_from(data_len) {
+                    Ok(v) => v,
+                    Err(_) => return 0,
+                };
+                let memory = match caller
+                    .get_export("memory")
+                    .and_then(|e| e.into_memory())
+                {
+                    Some(m) => m,
+                    None => return 0,
+                };
+                let mut buf = vec![0u8; len];
+                if memory
+                    .read(&caller, data_ptr as usize, &mut buf)
+                    .is_err()
+                {
+                    return 0;
+                }
+                caller.data_mut().write_save_game(gamemap, &buf)
             },
         )
         .expect("doom: duplicate import gameSaving.writeSaveGame");
