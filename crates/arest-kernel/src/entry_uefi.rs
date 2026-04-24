@@ -200,6 +200,20 @@ fn efi_main() -> Status {
     println!("  step 4 of 8: ExitBootServices + post-EBS serial");
     println!("  pre-EBS:  ConOut active (firmware-managed), SSE enabled");
 
+    // GOP locate diagnostic — narrow-scope test to see if the
+    // MERE presence of a GOP protocol lookup affects the post-
+    // EBS memory map. Uses `get_handle_for_protocol` only (no
+    // open_protocol_exclusive). If this causes the kernel to hang
+    // post-EBS at init_memory (as the earlier full-GOP attempt
+    // did), the handle lookup itself is the trigger — not the
+    // exclusive open. If it boots clean, the culprit is the open
+    // path (likely its ScopedProtocol Drop leaving BootServices
+    // state the memory map can't cope with post-EBS).
+    let gop_handle_found = uefi::boot::get_handle_for_protocol::<
+        uefi::proto::console::gop::GraphicsOutput,
+    >().is_ok();
+    println!("  gop-lookup: handle_found={gop_handle_found}");
+
     // SAFETY: `boot::exit_boot_services` walks the current memory
     // map, gets the firmware's signature lock, and tears down
     // BootServices. The returned `MemoryMapOwned` is a stable copy
