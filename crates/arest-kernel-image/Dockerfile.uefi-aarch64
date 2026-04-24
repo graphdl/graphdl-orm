@@ -1,0 +1,135 @@
+# crates/arest-kernel-image/Dockerfile.uefi-aarch64
+#
+# aarch64 sibling of `Dockerfile.uefi`. Builds the arest-kernel as an
+# aarch64 PE32+ UEFI executable and boots it under QEMU-aarch64 +
+# AAVMF firmware (the aarch64 counterpart of OVMF). Mirrors the x86_64
+# UEFI Dockerfile structure so `boot-kernel-uefi-aarch64.ps1` can
+# reuse the same `docker run --rm` + `-serial stdio` model.
+#
+# Compiles the same source tree the x86_64 build uses; the
+# target = `aarch64-unknown-uefi` switch activates the aarch64-gated
+# code paths (`arch::aarch64::_print` via PL011 MMIO, plus the
+# `entry_uefi_aarch64.rs` entry file). No separate aarch64 source
+# tree exists — cross-arch from the start per #344.
+#
+# Usage from repo root:
+#   docker build -t arest-kernel-uefi-aarch64 \
+#                -f crates/arest-kernel-image/Dockerfile.uefi-aarch64 .
+#   docker run --rm arest-kernel-uefi-aarch64
+#
+# What you see (scaffold-only today):
+#   ... AAVMF's own banners ...
+#   AREST kernel - aarch64-UEFI scaffold
+#     target: aarch64-unknown-uefi
+#     next:   ExitBootServices + memory map (follow-ups)
+#   ... kernel halts in a wfi-loop; Ctrl-C the container to exit ...
+
+FROM rust:latest AS builder
+
+# Same toolchain as Dockerfile.uefi — nightly + rust-src + the two
+# UEFI targets. `x86_64-unknown-uefi` is kept in the install set so
+# this layer is cache-compatible with the x86 Dockerfile's builder.
+RUN rustup toolchain install nightly --profile minimal \
+    && rustup component add rust-src --toolchain nightly \
+    && rustup component add llvm-tools-preview --toolchain nightly \
+    && rustup target add x86_64-unknown-none --toolchain nightly \
+    && rustup target add x86_64-unknown-uefi --toolchain nightly \
+    && rustup target add aarch64-unknown-uefi --toolchain nightly
+
+WORKDIR /build
+
+# Source copy layout matches Dockerfile.uefi exactly so layer caching
+# applies across both builds on the same host.
+COPY crates/arest-kernel/Cargo.toml crates/arest-kernel/Cargo.toml
+COPY crates/arest-kernel/build.rs   crates/arest-kernel/build.rs
+COPY crates/arest-kernel/src/       crates/arest-kernel/src/
+COPY crates/arest-kernel/rust-toolchain.toml crates/arest-kernel/rust-toolchain.toml
+
+# ui.do bundle — #266 baked-assets path is arch-neutral; the aarch64
+# kernel's `entry_uefi_aarch64.rs` doesn't reference `assets` yet, but
+# `build.rs` baking still needs the directory to exist.
+COPY apps/ui.do/dist/ apps/ui.do/dist/
+
+# arest engine sources + readings — arch-neutral, same as x86_64.
+COPY crates/arest/Cargo.toml crates/arest/Cargo.toml
+COPY crates/arest/src/       crates/arest/src/
+COPY readings/               readings/
+
+# Build the aarch64 UEFI .efi. Override the kernel's default target
+# (`x86_64-unknown-none` from .cargo/config.toml) with --target.
+# Output lands at target/aarch64-unknown-uefi/release/arest-kernel.efi.
+RUN cd crates/arest-kernel \
+    && cargo +nightly build --target aarch64-unknown-uefi --release
+
+# ── Runtime stage: QEMU-aarch64 + AAVMF + FAT staging tools ─────────
+FROM debian:bookworm-slim AS runner
+
+# qemu-system-arm   : both `qemu-system-arm` (ARMv7-M) and
+#                     `qemu-system-aarch64` (ARMv8 + ARMv9) binaries.
+# qemu-efi-aarch64  : `/usr/share/AAVMF/AAVMF_CODE.fd` +
+#                     `AAVMF_VARS.fd` — aarch64 counterpart of OVMF.
+# ipxe-qemu         : `/usr/lib/ipxe/qemu/efi-virtio.rom` — iPXE ROM
+#                     that QEMU's virtio-blk-pci and virtio-net-pci
+#                     devices load by default. Without it QEMU aborts
+#                     at startup: `failed to find romfile efi-virtio.rom`.
+#                     `qemu-system-arm` does not pull this in
+#                     transitively on Debian bookworm; make it
+#                     explicit.
+# dosfstools+mtools : FAT ESP staging (same as Dockerfile.uefi).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    qemu-system-arm \
+    qemu-efi-aarch64 \
+    ipxe-qemu \
+    dosfstools \
+    mtools \
+    && rm -rf /var/lib/apt/lists/*
+
+# Stage the aarch64 .efi at the firmware's default boot path. Same
+# `EFI/BOOT/<arch>.EFI` convention OVMF uses, but with `BOOTAA64.EFI`
+# instead of `BOOTX64.EFI` — AAVMF probes the aarch64 canonical name.
+COPY --from=builder \
+     /build/crates/arest-kernel/target/aarch64-unknown-uefi/release/arest-kernel.efi \
+     /arest-kernel.efi
+
+# 64 MiB FAT image (same size as x86_64's — uefi-disk.img's shape is
+# arch-neutral).
+RUN dd if=/dev/zero of=/uefi-disk.img bs=1M count=64 status=none \
+    && mkfs.fat -F 32 /uefi-disk.img >/dev/null \
+    && mmd -i /uefi-disk.img ::/EFI \
+    && mmd -i /uefi-disk.img ::/EFI/BOOT \
+    && mcopy -i /uefi-disk.img /arest-kernel.efi ::/EFI/BOOT/BOOTAA64.EFI
+
+# Boot under QEMU-aarch64 + AAVMF:
+#   -machine virt           aarch64 "virt" machine — QEMU's generic
+#                           virtual aarch64 SoC. PCIe root port +
+#                           virtio-mmio slots + PL011 UART at
+#                           0x0900_0000 (where `arch::aarch64::raw_puts`
+#                           writes).
+#   -cpu cortex-a57         ARMv8-A reference core. Modest but
+#                           sufficient for UEFI + kernel bring-up.
+#   -m 256M                 Guest RAM — more than enough for a
+#                           banner-only scaffold, matches the
+#                           pattern the x86_64 smoke will need as it
+#                           grows.
+#   -bios ...AAVMF_CODE.fd  Combined AAVMF code+vars. varstore
+#                           persistence irrelevant for smokes.
+#   -drive ...              ESP as a VirtIO block device. AAVMF
+#                           probes for `EFI/BOOT/BOOTAA64.EFI` and
+#                           loads it.
+#   -serial stdio           PL011 output to QEMU stdout. Our
+#                           `arch::aarch64::raw_puts` writes MMIO
+#                           directly to 0x0900_0000 = PL011 UARTDR,
+#                           which QEMU wires to `-serial stdio`.
+#   -display none           headless.
+#   -no-reboot / -no-shutdown  exit on fault rather than loop.
+#   -nographic variants are avoided — they multiplex COM1 onto stdio
+#   in a way that collides with `-serial stdio` on some QEMU builds.
+CMD ["qemu-system-aarch64", \
+     "-machine", "virt", \
+     "-cpu", "cortex-a57", \
+     "-m", "256M", \
+     "-bios", "/usr/share/AAVMF/AAVMF_CODE.fd", \
+     "-drive", "format=raw,file=/uefi-disk.img,if=virtio", \
+     "-serial", "stdio", \
+     "-display", "none", \
+     "-no-reboot", "-no-shutdown"]
