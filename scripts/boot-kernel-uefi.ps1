@@ -111,7 +111,7 @@ if ($Smoke) {
             "tiny module executed, main() = 42",
             "10 host imports bound to wasmi::Linker",
             "gop:      ",
-            "gop-mmio: wrote 4 pixels, readback[0]=0xdeadbeef"
+            "gop-mmio: wrote 320x200, readback sum=0xffff8300"
         )
         $missing = @()
         foreach ($phrase in $expected) {
