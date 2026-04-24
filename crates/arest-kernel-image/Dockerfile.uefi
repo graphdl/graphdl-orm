@@ -105,6 +105,18 @@ RUN dd if=/dev/zero of=/uefi-disk.img bs=1M count=64 status=none \
     && mmd -i /uefi-disk.img ::/EFI/BOOT \
     && mcopy -i /uefi-disk.img /arest-kernel.efi ::/EFI/BOOT/BOOTX64.EFI
 
+# Separate raw disk image for the virtio-blk persistence device
+# (#335 BIOS-parity). 1 MiB, zero-initialised, treated as
+# "no checkpoint yet" by the kernel's boot-time rehydrate logic
+# (#337). Matches the BIOS Dockerfile's `/disk.img` exactly so
+# the storage layer sees identical state on both boot paths.
+RUN dd if=/dev/zero of=/disk.img bs=1M count=1 status=none
+
+# Expose container port 8080 so `docker run -p 8080:8080` forwards
+# host:8080 -> container:8080 -> QEMU's hostfwd -> guest-kernel:80
+# (#264 HTTP listener path). Mirrors BIOS Dockerfile.
+EXPOSE 8080
+
 # Boot the image under QEMU + OVMF:
 #   -bios /usr/share/ovmf/OVMF.fd
 #                    legacy single-file OVMF — code + vars in one
@@ -115,16 +127,36 @@ RUN dd if=/dev/zero of=/uefi-disk.img bs=1M count=64 status=none \
 #                    and finds /EFI/BOOT/BOOTX64.EFI. virtio-blk
 #                    works too but OVMF's boot-priority logic prefers
 #                    legacy IDE for the ESP discovery path.
-#   -serial stdio    AREST kernel writes to ConOut → OVMF mirrors
-#                    ConOut to COM1 → QEMU surfaces COM1 on stdout.
+#   -netdev user,id=net0,hostfwd=tcp::8080-:80
+#                    SLiRP user-mode NAT -- forwards container-local
+#                    8080 to guest :80 for the #264 HTTP listener
+#                    once kernel_run_uefi is wired. Same shape the
+#                    BIOS Dockerfile uses.
+#   -device virtio-net-pci,netdev=net0,disable-legacy=on
+#                    attach guest NIC as modern-virtio (device-id
+#                    0x1041) so the PCI scan (#262 / f1123ff UEFI
+#                    smoke) finds it. `disable-legacy=on` forces
+#                    the modern ID window the kernel's scan probes.
+#   -drive ...,id=disk0 + -device virtio-blk-pci,drive=disk0
+#                    separate raw image for the #335 virtio-blk
+#                    persistence device. Independent from the ESP
+#                    above -- OVMF uses the ESP for boot, kernel
+#                    uses the 1 MiB disk for checkpoint/restore
+#                    (#337).
+#   -serial stdio    AREST kernel writes to ConOut -> OVMF mirrors
+#                    ConOut to COM1 -> QEMU surfaces COM1 on stdout.
 #                    Same path the BIOS image uses (16550 on COM1).
 #   -display none    headless.
-#   -no-reboot       exit on triple-fault instead of looping —
+#   -no-reboot       exit on triple-fault instead of looping --
 #                    keeps smoke runs from spinning forever on a
 #                    crash.
 CMD ["qemu-system-x86_64", \
      "-bios", "/usr/share/ovmf/OVMF.fd", \
      "-drive", "format=raw,file=/uefi-disk.img,if=ide", \
+     "-netdev", "user,id=net0,hostfwd=tcp::8080-:80", \
+     "-device", "virtio-net-pci,netdev=net0,disable-legacy=on", \
+     "-drive", "file=/disk.img,format=raw,if=none,id=disk0", \
+     "-device", "virtio-blk-pci,drive=disk0,disable-legacy=on", \
      "-serial", "stdio", \
      "-display", "none", \
      "-no-reboot", "-no-shutdown"]
