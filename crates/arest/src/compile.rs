@@ -2877,13 +2877,13 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
             Some((_ft, ri)) => {
                 let ri = *ri;
                 // Dedup guard: candidate's role[ri] == the outer
-                // instance value. Routed through FolTerm (#357).
+                // instance value. The outer instance lives at
+                // Selector(1); the candidate at Selector(2).
                 let match_pred = {
                     use crate::fol::FolTerm;
-                    let candidate_role = Func::compose(role_value(ri), Func::Selector(2));
                     FolTerm::Eq(
                         Box::new(FolTerm::Raw(Func::Selector(1))),
-                        Box::new(FolTerm::Raw(candidate_role)),
+                        Box::new(FolTerm::FactRole { fact: Func::Selector(2), role: ri + 1 }),
                     )
                     .to_func()
                 };
@@ -4007,23 +4007,23 @@ fn compile_uniqueness_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
         // same_scope_diff_other on <fact, candidate>:
         //   role[scope] of fact = role[scope] of candidate
         //   ∧ role[other] of fact ≠ role[other] of candidate
-        // Routed through FolTerm (#357). Uses Raw so the caller-
-        // supplied `role_value(…)` helpers stay in their original
-        // 0-indexed role-extraction shape.
+        // "scope-role of fact = scope-role of candidate AND
+        //  other-role of fact ≠ other-role of candidate".
+        // FactRole atoms take a 1-indexed role, matching the FOL
+        // "role N" verbal convention; compile.rs's 0-indexed
+        // `role_value(n)` maps to `role: n + 1`.
         let dup_check = {
             use crate::fol::FolTerm;
-            let scope_fact = Func::compose(role_value(scope_idx), Func::Selector(1));
-            let scope_cand = Func::compose(role_value(scope_idx), Func::Selector(2));
-            let other_fact = Func::compose(role_value(other_idx), Func::Selector(1));
-            let other_cand = Func::compose(role_value(other_idx), Func::Selector(2));
+            let fact = Func::Selector(1);
+            let cand = Func::Selector(2);
             FolTerm::And(vec![
                 FolTerm::Eq(
-                    Box::new(FolTerm::Raw(scope_fact)),
-                    Box::new(FolTerm::Raw(scope_cand)),
+                    Box::new(FolTerm::FactRole { fact: fact.clone(), role: scope_idx + 1 }),
+                    Box::new(FolTerm::FactRole { fact: cand.clone(), role: scope_idx + 1 }),
                 ),
                 FolTerm::Not(Box::new(FolTerm::Eq(
-                    Box::new(FolTerm::Raw(other_fact)),
-                    Box::new(FolTerm::Raw(other_cand)),
+                    Box::new(FolTerm::FactRole { fact,               role: other_idx + 1 }),
+                    Box::new(FolTerm::FactRole { fact: cand,         role: other_idx + 1 }),
                 ))),
             ])
             .to_func()
@@ -4302,14 +4302,11 @@ fn compile_frequency_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
         let scope_idx = span.role_index;
 
         // same_scope: <fact, candidate> -> T if scope values match.
-        // Routed through FolTerm (#357).
         let same_scope = {
             use crate::fol::FolTerm;
-            let scope_fact = Func::compose(role_value(scope_idx), Func::Selector(1));
-            let scope_cand = Func::compose(role_value(scope_idx), Func::Selector(2));
             FolTerm::Eq(
-                Box::new(FolTerm::Raw(scope_fact)),
-                Box::new(FolTerm::Raw(scope_cand)),
+                Box::new(FolTerm::FactRole { fact: Func::Selector(1), role: scope_idx + 1 }),
+                Box::new(FolTerm::FactRole { fact: Func::Selector(2), role: scope_idx + 1 }),
             )
             .to_func()
         };
@@ -4593,18 +4590,15 @@ fn compile_subset_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
     let b_facts = extract_facts_func(&b_ft_id);
 
     // match_pred: <a_fact, b_candidate> -> common noun values all equal.
-    // Routed through FolTerm (#357): `FolTerm::And` with one Eq per
-    // common noun handles the empty / single / N-ary cases uniformly
-    // (empty And = True, single And passes through, N ≥ 2 becomes
-    // Insert(And) ∘ Construction). Replaces the manual Rust reduce.
+    // `FolTerm::And` with one Eq per common noun handles the empty /
+    // single / N-ary cases uniformly (empty And = True, single And
+    // passes through, N >= 2 becomes Insert(And) ∘ Construction).
     let match_pred = {
         use crate::fol::FolTerm;
         let atoms: Vec<FolTerm> = common.iter().map(|&(ai, bi)| {
-            let a_val = Func::compose(role_value(ai), Func::Selector(1));
-            let b_val = Func::compose(role_value(bi), Func::Selector(2));
             FolTerm::Eq(
-                Box::new(FolTerm::Raw(a_val)),
-                Box::new(FolTerm::Raw(b_val)),
+                Box::new(FolTerm::FactRole { fact: Func::Selector(1), role: ai + 1 }),
+                Box::new(FolTerm::FactRole { fact: Func::Selector(2), role: bi + 1 }),
             )
         }).collect();
         FolTerm::And(atoms).to_func()
@@ -4671,18 +4665,15 @@ fn compile_equality_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
         false => {},
     }
 
-    // Build match predicate for <left_fact, right_candidate>.
-    // Routed through FolTerm (#357); shares N-ary-And shape with
-    // compile_subset_ast's match_pred.
+    // Build match predicate for <left_fact, right_candidate>. Shares
+    // the N-ary-And shape with compile_subset_ast's match_pred.
     let build_match = |left_indices: &[(usize, usize)], swap: bool| -> Func {
         use crate::fol::FolTerm;
         let atoms: Vec<FolTerm> = left_indices.iter().map(|&(ai, bi)| {
             let (li, ri) = if swap { (bi, ai) } else { (ai, bi) };
-            let l_val = Func::compose(role_value(li), Func::Selector(1));
-            let r_val = Func::compose(role_value(ri), Func::Selector(2));
             FolTerm::Eq(
-                Box::new(FolTerm::Raw(l_val)),
-                Box::new(FolTerm::Raw(r_val)),
+                Box::new(FolTerm::FactRole { fact: Func::Selector(1), role: li + 1 }),
+                Box::new(FolTerm::FactRole { fact: Func::Selector(2), role: ri + 1 }),
             )
         }).collect();
         FolTerm::And(atoms).to_func()
