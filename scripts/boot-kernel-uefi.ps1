@@ -114,6 +114,7 @@ if ($Smoke) {
             "pci:      walk OK (virtio-net:",
             "virtio-net: driver online, MAC",
             "virtio-blk: driver online,",
+            "block:    checkpoint round-trip OK",
             "post-EBS heap live (sum 0..16 = 120)",
             "system::init() completed (arest engine live on UEFI)",
             "tiny module executed, main() = 42",
