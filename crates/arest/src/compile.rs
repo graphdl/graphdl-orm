@@ -3449,15 +3449,29 @@ fn compile_constraint(data: &CellIndex, def: &ConstraintDef) -> CompiledConstrai
 
 /// IR: not exists(x,x) -- no fact where both roles reference the same entity.
 /// alpha(make_violation)  .  Filter(eq  .  [role1_val, role2_val])  .  facts
+///
+/// Predicate construction routed via `crate::fol::FolTerm` (#357): the
+/// "role 1 of f = role 2 of f" check is the natural FOL atom
+/// `Eq(RoleVal(f, 1), RoleVal(f, 2))` and produces an identical
+/// Func to the previous hand-built `Func::compose(Func::Eq, …)`. This
+/// is the first compile site routed through the FolTerm IR — each
+/// follow-up commit migrates one more constraint kind.
 fn compile_ring_irreflexive_ast(def: &ConstraintDef) -> Func {
+    use crate::fol::FolTerm;
+
     let ft_ids: Vec<String> = def.spans.iter().map(|s| s.fact_type_id.clone()).collect();
     let facts = extract_facts_multi(&ft_ids);
 
-    // Predicate: role 0 value = role 1 value (self-reference)
-    let is_self_ref = Func::compose(
-        Func::Eq,
-        Func::construction(vec![role_value(0), role_value(1)]),
-    );
+    // Predicate: role 1 value = role 2 value (self-reference).
+    // FolTerm::RoleVal is 1-indexed (matches the FORML 2 verbal
+    // "role 1" / "role 2" convention); compile.rs's `role_value`
+    // helper is 0-indexed, so the constants here look off-by-one
+    // vs the surrounding hand-built Func sites — this is the IR
+    // doing the renumbering for us.
+    let is_self_ref = FolTerm::Eq(
+        Box::new(FolTerm::RoleVal("f".into(), 1)),
+        Box::new(FolTerm::RoleVal("f".into(), 2)),
+    ).to_func();
 
     // Violation detail: <"Irreflexive violation:", value, "references itself">
     let detail = Func::construction(vec![
@@ -3512,11 +3526,20 @@ fn compile_ring_asymmetric_ast(def: &ConstraintDef) -> Func {
         Func::compose(Func::filter(match_reversed), Func::DistL),
     );
 
-    // not_self on original fact: role0 != role1
-    let not_self = Func::compose(Func::Not, Func::compose(Func::Eq, Func::construction(vec![
-        Func::compose(role_value(0), Func::Selector(1)),
-        Func::compose(role_value(1), Func::Selector(1)),
-    ])));
+    // not_self on original fact: role 1 ≠ role 2.
+    // Routed via FolTerm (#357). The outer Selector(1) reaches
+    // into the <fact, all> tuple to grab the original fact;
+    // FolTerm handles the role-extraction on top of that.
+    let not_self = {
+        use crate::fol::FolTerm;
+        let role_1 = Func::compose(role_value(0), Func::Selector(1));
+        let role_2 = Func::compose(role_value(1), Func::Selector(1));
+        FolTerm::Not(Box::new(FolTerm::Eq(
+            Box::new(FolTerm::Raw(role_1)),
+            Box::new(FolTerm::Raw(role_2)),
+        )))
+        .to_func()
+    };
 
     // combined: has_reverse  AND  not_self
     let pred = Func::compose(Func::And, Func::construction(vec![check_one, not_self]));
