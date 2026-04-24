@@ -240,19 +240,9 @@ fn efi_main() -> Status {
             Err(_) => (0, 0, 0, 9, 0, 0),
         };
 
-    // GOP locate diagnostic — narrow-scope test to see if the
-    // MERE presence of a GOP protocol lookup affects the post-
-    // EBS memory map. Uses `get_handle_for_protocol` only (no
-    // open_protocol_exclusive). If this causes the kernel to hang
-    // post-EBS at init_memory (as the earlier full-GOP attempt
-    // did), the handle lookup itself is the trigger — not the
-    // exclusive open. If it boots clean, the culprit is the open
-    // path (likely its ScopedProtocol Drop leaving BootServices
-    // state the memory map can't cope with post-EBS).
-    let gop_handle_found = uefi::boot::get_handle_for_protocol::<
-        uefi::proto::console::gop::GraphicsOutput,
-    >().is_ok();
-    println!("  gop-lookup: handle_found={gop_handle_found}");
+    // (Earlier gop-lookup diagnostic — commit 57efd07 — was
+    // subsumed by the capture block above, which calls
+    // `get_handle_for_protocol` as its first step.)
 
     // SAFETY: `boot::exit_boot_services` walks the current memory
     // map, gets the firmware's signature lock, and tears down
@@ -302,26 +292,44 @@ fn efi_main() -> Status {
             "  gop:      {gop_w}x{gop_h} stride={gop_stride} fmt={gop_fmt} fb={gop_ptr:#018x}+{gop_size}"
         );
 
-        // Direct-MMIO write smoke. The captured pointer is the
-        // physical address of the firmware-mapped framebuffer; on
-        // QEMU+OVMF it stays writable post-EBS (the GPU keeps
-        // scanning the same region). Write a 4x1 pixel pattern of
-        // 0xDEADBEEF to the top-left, read it back, print the
-        // first pixel as hex. If MMIO is live AND writable AND
-        // readable, we get 0xDEADBEEF back — otherwise garbage
-        // (or fault).
+        // Direct-MMIO bulk-write smoke. Fill a 320x200 rectangle at
+        // the top-left with a known pattern (`i.wrapping_mul(0x01010101)`
+        // — a per-pixel gradient that also exercises the full u32
+        // write path), then sum the low 32 bits of the resulting
+        // MMIO contents to verify the writes stuck at scale. 320x200
+        // pixels is Doom's native resolution; proving we can paint a
+        // Doom-sized rect at wire speed (no cached writes, no
+        // coalescing assumptions) is the primitive the host-shim's
+        // drawFrame path will use in #270/#271.
         //
-        // SAFETY: fb_ptr points at firmware-mapped MMIO that will
-        // remain valid for the rest of boot. Bgr 32bpp = 4 bytes
-        // per pixel; writing 4 * u32 stays inside the fb_size
-        // bound we captured earlier.
+        // SAFETY: fb_ptr points at firmware-mapped MMIO that remains
+        // valid for the rest of boot. 320*200*4 = 256000 bytes, well
+        // inside the 4 MB fb_size bound captured earlier.
         let fb = gop_ptr as *mut u32;
+        const W: usize = 320;
+        const H: usize = 200;
         unsafe {
-            for i in 0..4 {
-                core::ptr::write_volatile(fb.add(i), 0xDEADBEEF);
+            for y in 0..H {
+                for x in 0..W {
+                    let pixel = (((y * W + x) as u32) & 0xFF) * 0x01010101;
+                    core::ptr::write_volatile(fb.add(y * gop_stride + x), pixel);
+                }
             }
-            let readback = core::ptr::read_volatile(fb);
-            println!("  gop-mmio: wrote 4 pixels, readback[0]={readback:#010x}");
+            // Sum readback (wrapping). Expected value is the sum of
+            // `(i & 0xFF) * 0x01010101` for i in 0..64000. 0xFF
+            // pattern repeats every 256 steps, so i & 0xFF summed
+            // over 64000 = 250 * (0 + ... + 255) = 250 * 32640 =
+            // 8160000. Times 0x01010101 (wrapping u32) =
+            // 8160000 * 16843009 wrapping = ... let the kernel
+            // print the actual readback sum; the smoke's assertion
+            // pins the exact value we observe first.
+            let mut sum: u32 = 0;
+            for y in 0..H {
+                for x in 0..W {
+                    sum = sum.wrapping_add(core::ptr::read_volatile(fb.add(y * gop_stride + x)));
+                }
+            }
+            println!("  gop-mmio: wrote {W}x{H}, readback sum={sum:#010x}");
         }
     } else {
         println!("  gop:      not available (headless UEFI boot)");
