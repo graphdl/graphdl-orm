@@ -102,17 +102,14 @@ virtio-drivers = "0.11"
 # pulling in the std-only compile / command / parse modules.
 arest = { path = "../arest", default-features = false, features = ["no_std"] }
 
-# wasmi — deferred from #270 scaffold. The crate compiles cleanly
-# into x86_64-unknown-none with `default-features = false,
-# features = ["hash-collections"]` and is logically the right
-# runtime (same crate the std-only `wasm-lower` feature uses), but
-# making it reachable from kernel_main pulls in enough additional
-# .text + relocations that the bootloader 0.11 BIOS-stage loader
-# silently triple-faults before any println! runs. The likely fix
-# is the UEFI loader path (#344 step 4c+) plus the dynamic memory
-# plumbing (#180 follow-up); both unblock a much larger kernel
-# image than the BIOS path tolerates today.
-# wasmi = { version = "0.50", default-features = false, features = ["hash-collections"] }
+# wasmi — kept off the BIOS build. The crate compiles cleanly into
+# `x86_64-unknown-none` but making it REACHABLE from `kernel_main`
+# pulls in enough additional .text + relocations that the bootloader
+# 0.11 BIOS-stage loader silently triple-faults before any println!
+# runs. The fix is the UEFI path: UEFI firmware loads arbitrary
+# PE32+ images without the bootloader-stage frame-allocator budget
+# that the BIOS path operates under, so wasmi ships as a
+# UEFI-target-only dep (below, under the target-specific block).
 
 # UEFI target (#344) — uefi-rs gives us an `#[entry]` macro, Boot
 # Services (serial, memory map, device discovery, framebuffer), and
@@ -121,8 +118,16 @@ arest = { path = "../arest", default-features = false, features = ["no_std"] }
 # keeps using `bootloader_api` unchanged. `panic_handler` + `logger`
 # features take the uefi-provided impls so we don't need an arch-
 # specific one for the scaffold.
+#
+# wasmi — step 4d wave 5 (#270/#271). UEFI-only because the BIOS
+# bootloader can't load a kernel image the wasmi runtime-including
+# binary produces (verified via `5e8a15e` revert). UEFI firmware has
+# no such size limit. `hash-collections` feature gives us
+# hashbrown-backed tables for wasm's type / function tables without
+# needing std. `no_std` default — we supply the `alloc` global.
 [target.'cfg(target_os = "uefi")'.dependencies]
 uefi = { version = "0.34", features = ["alloc", "panic_handler", "logger"] }
+wasmi = { version = "0.50", default-features = false, features = ["hash-collections"] }
 
 [profile.dev]
 panic = "abort"

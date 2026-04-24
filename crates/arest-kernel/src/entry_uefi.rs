@@ -199,6 +199,17 @@ fn efi_main() -> Status {
     crate::system::init();
     println!("  engine:   system::init() completed (arest engine live on UEFI)");
 
+    // Step 4d wave 5: wasmi runtime smoke. The wasmi crate is UEFI-
+    // only because the BIOS bootloader can't load a kernel image the
+    // wasmi-linking binary produces (triple-faults pre-_start, see
+    // 5e8a15e). Constructing an Engine exercises wasmi's
+    // hash-collections backing, global registries, and default
+    // config — enough to prove the runtime links + initializes
+    // under UEFI. Running an actual Module lands alongside the Doom
+    // shim (#270/#271) once kernel_run reaches here.
+    let _wasmi_engine = wasmi::Engine::default();
+    println!("  wasmi:    Engine::default() constructed (runtime live on UEFI)");
+
     println!("  next:        kernel_run handoff (step 4d)");
 
     // Scaffold halt — via the facade so the call site is identical
