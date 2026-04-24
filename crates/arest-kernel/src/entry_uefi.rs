@@ -187,6 +187,18 @@ fn efi_main() -> Status {
     let sum: u32 = test_vec.iter().sum();
     println!("  alloc:    post-EBS heap live (sum 0..16 = {sum})");
 
+    // Step 4d wave 4: initialise the AREST engine under UEFI.
+    // `system::init()` stands up the baked metamodel + single-
+    // tenant DEFS table via the same ρ-application path the BIOS
+    // arm uses (see main.rs `kernel_run`). This is a pure
+    // alloc-heavy call — Box / Vec / Arc / BTreeMap churn — so
+    // it's the strongest test yet that the post-EBS heap is
+    // correctly feeding every alloc codepath in the shared kernel
+    // body. A silent freeze here would mean a subtle alloc
+    // regression, surfaced via missing banner + smoke timeout.
+    crate::system::init();
+    println!("  engine:   system::init() completed (arest engine live on UEFI)");
+
     println!("  next:        kernel_run handoff (step 4d)");
 
     // Scaffold halt — via the facade so the call site is identical
