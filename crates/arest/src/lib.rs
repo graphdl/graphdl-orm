@@ -55,6 +55,7 @@ use crate::sync::RwLock;
 use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 
 pub mod ast;
+pub mod fol;
 // types.rs uses serde Serialize/Deserialize — excluded from no_std build
 #[cfg(not(feature = "no_std"))]
 pub mod types;
