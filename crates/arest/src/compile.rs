@@ -3217,12 +3217,20 @@ fn compile_join_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Compil
             let j_role = find_role(j, key)?;
             let ref_ft = (0..j).find(|&fi| find_role(fi, key).is_some())?;
             let ref_role = find_role(ref_ft, key)?;
-            let ref_val = Func::compose(role_value(ref_role),
-                Func::compose(access_fact(ref_ft, j), Func::Selector(1)));
-            let new_val = Func::compose(role_value(j_role), Func::Selector(2));
+            // "role ref_role of the ref-FT's fact" on the left,
+            // "role j_role of the candidate at Selector(2)" on the
+            // right. The ref-FT accessor is a small composition
+            // (access_fact(ref_ft, j) . Selector(1)), which FactRole
+            // accepts as an opaque Func.
             Some(FolTerm::Eq(
-                Box::new(FolTerm::Raw(ref_val)),
-                Box::new(FolTerm::Raw(new_val)),
+                Box::new(FolTerm::FactRole {
+                    fact: Func::compose(access_fact(ref_ft, j), Func::Selector(1)),
+                    role: ref_role + 1,
+                }),
+                Box::new(FolTerm::FactRole {
+                    fact: Func::Selector(2),
+                    role: j_role + 1,
+                }),
             ))
         }).collect();
 
