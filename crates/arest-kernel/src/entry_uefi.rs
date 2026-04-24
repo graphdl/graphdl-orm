@@ -53,19 +53,21 @@ use crate::println;
 // `allocator.rs`); this keeps the kernel's Box/Vec/String codepaths
 // identical on both boot targets.
 //
-// Size: 8 MiB is a conservative pick that matches the BIOS heap
-// (see `allocator.rs`'s HEAP_SIZE). UEFI firmware loaders typically
-// pre-allocate BSS when mapping the PE32+ image, so 8 MiB of kernel
-// BSS just reserves that many pages up-front. QEMU+OVMF with the
-// default 128 MiB guest accommodates this comfortably. The .bss
-// bytes themselves are zeroed by the firmware before _start runs,
-// so `LockedHeap::empty()` + a single init() call is enough.
+// Size: 16 MiB. Initial pick was 8 MiB (matching the BIOS heap),
+// bumped when framebuffer::install started running on UEFI — its
+// two heap-backed BackBuffers each mirror the GPU framebuffer byte-
+// for-byte, so at 1024x768x4 that's ~6.3 MiB of back-buffer alone,
+// leaving room for system::init's Box / Vec / Arc / BTreeMap churn
+// plus any follow-up alloc traffic. QEMU+OVMF with the default 128
+// MiB guest accommodates this comfortably. The .bss bytes themselves
+// are zeroed by the firmware before _start runs, so
+// `LockedHeap::empty()` + a single init() call is enough.
 //
 // The init() call runs at the TOP of efi_main — before ANY
 // alloc-using code (println! transcodes args via a String on the
 // UEFI serial path). Must NOT move later without switching to a
 // crate that supports delayed init.
-const HEAP_SIZE: usize = 8 * 1024 * 1024;
+const HEAP_SIZE: usize = 16 * 1024 * 1024;
 
 // SAFETY wrapper: static mut arrays aren't directly Sync-safe. The
 // heap is only touched via `ALLOCATOR.lock()` (single-CPU kernel,
@@ -330,6 +332,84 @@ fn efi_main() -> Status {
                 }
             }
             println!("  gop-mmio: wrote {W}x{H}, readback sum={sum:#010x}");
+        }
+
+        // Install the triple-buffered framebuffer singleton on top
+        // of the GOP front buffer, mirroring the BIOS path's
+        // `framebuffer::install` call in kernel_run. The back
+        // buffers are heap-allocated Vec<u8>s of the same byte length
+        // as the front (`gop_size`), so the post-EBS heap must have
+        // been init'd — which it has (above) — before we reach here.
+        //
+        // UEFI spec guarantees Rgb/Bgr PixelFormats carry a reserved
+        // alpha byte (UEFI §12.9: PixelRedGreenBlueReserved8BitPerColor
+        // and PixelBlueGreenRedReserved8BitPerColor), so
+        // bytes_per_pixel = 4 for every GOP-reachable boot. Bitmask
+        // and BltOnly both fall through to the `else` branch below
+        // — framebuffer::install expects a linear byte surface, and
+        // BltOnly has none; Bitmask's channel offsets would require
+        // a PixelFormat::Unknown construction we don't yet populate.
+        let fb_info = match gop_fmt_idx {
+            0 => Some(bootloader_api::info::FrameBufferInfo {
+                byte_len: gop_size,
+                width: gop_w,
+                height: gop_h,
+                pixel_format: bootloader_api::info::PixelFormat::Rgb,
+                bytes_per_pixel: 4,
+                stride: gop_stride,
+            }),
+            1 => Some(bootloader_api::info::FrameBufferInfo {
+                byte_len: gop_size,
+                width: gop_w,
+                height: gop_h,
+                pixel_format: bootloader_api::info::PixelFormat::Bgr,
+                bytes_per_pixel: 4,
+                stride: gop_stride,
+            }),
+            _ => None,
+        };
+        if let Some(info) = fb_info {
+            // SAFETY: `gop_ptr` + `gop_size` describe the firmware-
+            // mapped GOP framebuffer, valid for the rest of boot (we
+            // mem::forget'd the ScopedProtocol above so firmware won't
+            // reclaim it at EBS). No other code in efi_main is holding
+            // a reference into that MMIO region at this point.
+            unsafe { crate::framebuffer::install(info, gop_ptr as *mut u8, gop_size) };
+
+            // Triple-buffer paint smoke — mirrors kernel_run's #269
+            // paint smoke (main.rs line ~299), including the second
+            // present that rotates to the other back buffer. The
+            // front_fnv1a readback then computes an FNV-1a hash over
+            // the GPU MMIO bytes (cacheable under QEMU+OVMF's default
+            // paging attributes) to prove pixels made it through.
+            use crate::framebuffer::Color;
+            let _ = crate::framebuffer::with_back(|back| {
+                back.clear(Color::rgb(0x10, 0x10, 0x18));
+                back.fill_rect(40,  40, 320, 200, Color::RED);
+                back.fill_rect(360, 40, 320, 200, Color::GREEN);
+                back.fill_rect(680, 40, 320, 200, Color::BLUE);
+                back.draw_line(40, 260, 1240, 260, Color::WHITE);
+                back.draw_text(40, 280, "AREST UEFI", Color::YELLOW);
+            });
+            crate::framebuffer::present();
+            let frame_a = crate::framebuffer::front_fnv1a().unwrap_or(0);
+            let _ = crate::framebuffer::with_back(|back| {
+                back.clear(Color::rgb(0x10, 0x10, 0x18));
+                back.fill_rect(40,  40, 320, 200, Color::RED);
+                back.fill_rect(360, 40, 320, 200, Color::GREEN);
+                back.fill_rect(680, 40, 320, 200, Color::BLUE);
+                back.fill_rect(560, 100, 160, 80, Color::WHITE);
+                back.draw_line(40, 260, 1240, 260, Color::WHITE);
+                back.draw_text(40, 280, "AREST UEFI", Color::YELLOW);
+            });
+            crate::framebuffer::present();
+            let frame_b = crate::framebuffer::front_fnv1a().unwrap_or(0);
+            println!(
+                "  fb:       paint smoke OK, presents={}, frame_a={frame_a:#018x}, frame_b={frame_b:#018x} (#269)",
+                crate::framebuffer::presents(),
+            );
+        } else {
+            println!("  fb:       format {gop_fmt} unsupported by framebuffer::install (BltOnly/Bitmask)");
         }
     } else {
         println!("  gop:      not available (headless UEFI boot)");
