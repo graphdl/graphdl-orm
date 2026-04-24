@@ -54,30 +54,48 @@ mod arch;
 // arch console impl; step 4 wires UEFI ExitBootServices to a shared
 // `kernel_run(BootInfo)` that reaches the same arch facade.
 
+// Step 4d wave 1 (audit a3f6d9b + dep verification): un-gate the
+// modules that compile cleanly on x86_64-unknown-uefi with zero
+// source changes. Six leaf modules with no intra-crate dependencies
+// on BIOS-only siblings — pure parsing / state plumbing code.
+// They're still unreferenced from the UEFI entry path; the wiring
+// lands alongside the remaining step 4d waves.
+mod assets;
+mod dma;
+mod http;
+mod pci;
+mod repl;
+mod system;
+
+// Still BIOS-only. Three categories:
+//   (a) double-global-allocator conflict with uefi-rs:
+//         allocator — `#[global_allocator]` fights
+//         `uefi::allocator::Allocator`.
+//   (b) pull in a BIOS-only sibling:
+//         block / block_storage -> `crate::virtio`
+//         net                   -> `crate::virtio` + `crate::http`
+//   (c) need a UEFI adapter before they compile:
+//         framebuffer — `bootloader_api::FrameBufferInfo` type dep;
+//                       a UEFI `GraphicsOutputProtocol`-sourced
+//                       equivalent unblocks this.
+//         syscall / userspace — x86_64-only `naked_asm!` entry +
+//                       ring-3 iretq descent; needs aarch64 arm
+//                       OR a UEFI stub-facade so kernel_run
+//                       compiles without pulling in ring-3.
+//         virtio — HAL's virt_to_phys reaches x86_64 `Translate`;
+//                  blocks on arch-neutral page-table abstraction.
 #[cfg(not(target_os = "uefi"))]
 mod allocator;
-#[cfg(not(target_os = "uefi"))]
-mod assets;
 #[cfg(not(target_os = "uefi"))]
 mod block;
 #[cfg(not(target_os = "uefi"))]
 mod block_storage;
 #[cfg(not(target_os = "uefi"))]
-mod dma;
-#[cfg(not(target_os = "uefi"))]
 mod framebuffer;
-#[cfg(not(target_os = "uefi"))]
-mod http;
 #[cfg(not(target_os = "uefi"))]
 mod net;
 #[cfg(not(target_os = "uefi"))]
-mod pci;
-#[cfg(not(target_os = "uefi"))]
-mod repl;
-#[cfg(not(target_os = "uefi"))]
 mod syscall;
-#[cfg(not(target_os = "uefi"))]
-mod system;
 #[cfg(not(target_os = "uefi"))]
 mod userspace;
 #[cfg(not(target_os = "uefi"))]
