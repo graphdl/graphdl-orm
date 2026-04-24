@@ -65,6 +65,8 @@ mod block_storage;
 #[cfg(not(target_os = "uefi"))]
 mod dma;
 #[cfg(not(target_os = "uefi"))]
+mod framebuffer;
+#[cfg(not(target_os = "uefi"))]
 mod http;
 #[cfg(not(target_os = "uefi"))]
 mod net;
@@ -133,6 +135,24 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         userspace::launch_test_payload();
     }
 
+    // Install the framebuffer singleton (#269 prep — bootloader
+    // already maps a linear FB; no virtio-gpu needed for the basic
+    // graphics path). Done BEFORE `arch::init_memory` consumes
+    // `boot_info` since the field-disjoint borrow on `.framebuffer`
+    // here is independent from the whole-struct re-borrow below.
+    if let Some(fb) = boot_info.framebuffer.as_mut() {
+        let info = fb.info();
+        let buf = fb.buffer_mut();
+        let ptr = buf.as_mut_ptr();
+        let len = buf.len();
+        // SAFETY: `buf` originates in the bootloader-managed
+        // `&'static mut BootInfo`, so the bytes live for the whole
+        // boot. `framebuffer::install` immediately stashes the
+        // pointer behind a Mutex — no other code is holding a
+        // reference at this point in init.
+        unsafe { framebuffer::install(info, ptr, len) };
+    }
+
     let phys_offset = arch::init_memory(boot_info);
     kernel_run(phys_offset)
 }
@@ -192,6 +212,19 @@ fn kernel_run(phys_offset: u64) -> ! {
     println!("  idt:    breakpoint + double-fault + keyboard (#181)");
     println!("  pic:    remapped to 32+, keyboard (IRQ 1) unmasked");
     println!("  memory: {usable_mib} MiB usable RAM ({frame_count} x 4 KiB frames) (#180)");
+    match framebuffer::info() {
+        Some(info) => {
+            // Smoke a single white-pixel write to prove the byte slice is
+            // mapped + writable. Top-left corner so it doesn't disturb
+            // any boot-time text-mode region the firmware may still own.
+            let _ = framebuffer::with_buffer(|fb| fb.put_pixel(0, 0, 0xFF, 0xFF, 0xFF));
+            println!(
+                "  fb:     {}x{} @{}bpp, stride={}, format={:?} (bootloader-mapped)",
+                info.width, info.height, info.bytes_per_pixel * 8, info.stride, info.pixel_format,
+            );
+        }
+        None => println!("  fb:     none (text-mode boot — no linear framebuffer)"),
+    }
     println!("  net:    smoltcp loopback 127.0.0.1/8 (#261 — virtio-net in #262)");
     match virtio_net {
         Some(dev) => println!(
