@@ -3465,14 +3465,11 @@ fn compile_constraint(data: &CellIndex, def: &ConstraintDef) -> CompiledConstrai
 /// Predicate: `role 1 ≠ role 2` of the original fact. Used by every
 /// ring constraint that excludes the (x, x) self-pair (AS, SY, AT).
 /// The input shape is `<fact, all>`; `Selector(1)` reaches the fact.
-/// Routed through FolTerm (#357) so the atom's FOL shape is explicit.
 fn ring_not_self_pred() -> Func {
     use crate::fol::FolTerm;
-    let role_1 = Func::compose(role_value(0), Func::Selector(1));
-    let role_2 = Func::compose(role_value(1), Func::Selector(1));
     FolTerm::Not(Box::new(FolTerm::Eq(
-        Box::new(FolTerm::Raw(role_1)),
-        Box::new(FolTerm::Raw(role_2)),
+        Box::new(FolTerm::FactRole { fact: Func::Selector(1), role: 1 }),
+        Box::new(FolTerm::FactRole { fact: Func::Selector(1), role: 2 }),
     )))
     .to_func()
 }
@@ -3480,23 +3477,21 @@ fn ring_not_self_pred() -> Func {
 /// Predicate: candidate is the reverse pair of the fact. For a fact
 /// `<x, y>` and a candidate `<a, b>`, returns true iff `a = y ∧ b = x`.
 /// The input shape is `<fact, candidate>`; `Selector(1)` is the
-/// original fact, `Selector(2)` is the candidate under test.
-/// Routed through FolTerm — the constraint's reverse-pair rule is a
-/// conjunction of two role-equalities, expressed directly in FOL.
+/// original fact, `Selector(2)` is the candidate under test. The
+/// reverse-pair rule is a conjunction of two role-equalities,
+/// expressed directly in FOL via FactRole atoms.
 fn ring_match_reversed_pred() -> Func {
     use crate::fol::FolTerm;
-    let cand_role_1 = Func::compose(role_value(0), Func::Selector(2));
-    let cand_role_2 = Func::compose(role_value(1), Func::Selector(2));
-    let fact_role_1 = Func::compose(role_value(0), Func::Selector(1));
-    let fact_role_2 = Func::compose(role_value(1), Func::Selector(1));
+    let fact = Func::Selector(1);
+    let cand = Func::Selector(2);
     FolTerm::And(vec![
         FolTerm::Eq(
-            Box::new(FolTerm::Raw(cand_role_1)),
-            Box::new(FolTerm::Raw(fact_role_2)),
+            Box::new(FolTerm::FactRole { fact: cand.clone(), role: 1 }),
+            Box::new(FolTerm::FactRole { fact: fact.clone(), role: 2 }),
         ),
         FolTerm::Eq(
-            Box::new(FolTerm::Raw(cand_role_2)),
-            Box::new(FolTerm::Raw(fact_role_1)),
+            Box::new(FolTerm::FactRole { fact: cand,         role: 2 }),
+            Box::new(FolTerm::FactRole { fact,               role: 1 }),
         ),
     ])
     .to_func()
@@ -3509,18 +3504,16 @@ fn ring_match_reversed_pred() -> Func {
 /// reflexive pairs). Used by IT / TR / AC.
 fn ring_is_chain_pred() -> Func {
     use crate::fol::FolTerm;
-    let f1_role_1 = Func::compose(role_value(0), Func::Selector(1));
-    let f1_role_2 = Func::compose(role_value(1), Func::Selector(1));
-    let f2_role_1 = Func::compose(role_value(0), Func::Selector(2));
-    let f2_role_2 = Func::compose(role_value(1), Func::Selector(2));
+    let f1 = Func::Selector(1);
+    let f2 = Func::Selector(2);
     FolTerm::And(vec![
         FolTerm::Eq(
-            Box::new(FolTerm::Raw(f1_role_2)),
-            Box::new(FolTerm::Raw(f2_role_1)),
+            Box::new(FolTerm::FactRole { fact: f1.clone(), role: 2 }),
+            Box::new(FolTerm::FactRole { fact: f2.clone(), role: 1 }),
         ),
         FolTerm::Not(Box::new(FolTerm::Eq(
-            Box::new(FolTerm::Raw(f1_role_1)),
-            Box::new(FolTerm::Raw(f2_role_2)),
+            Box::new(FolTerm::FactRole { fact: f1, role: 1 }),
+            Box::new(FolTerm::FactRole { fact: f2, role: 2 }),
         ))),
     ])
     .to_func()
@@ -3534,19 +3527,18 @@ fn ring_is_chain_pred() -> Func {
 /// NOT exist → violation) and TR (shortcut MUST exist).
 fn ring_shortcut_match_pred() -> Func {
     use crate::fol::FolTerm;
-    let cand_role_1 = Func::compose(role_value(0), Func::Selector(2));
-    let cand_role_2 = Func::compose(role_value(1), Func::Selector(2));
+    let cand = Func::Selector(2);
     // <f1, f2> is Selector(1). f1 = Sel(1).Sel(1); f2 = Sel(2).Sel(1).
-    let f1_role_1 = Func::compose(role_value(0), Func::compose(Func::Selector(1), Func::Selector(1)));
-    let f2_role_2 = Func::compose(role_value(1), Func::compose(Func::Selector(2), Func::Selector(1)));
+    let f1 = Func::compose(Func::Selector(1), Func::Selector(1));
+    let f2 = Func::compose(Func::Selector(2), Func::Selector(1));
     FolTerm::And(vec![
         FolTerm::Eq(
-            Box::new(FolTerm::Raw(cand_role_1)),
-            Box::new(FolTerm::Raw(f1_role_1)),
+            Box::new(FolTerm::FactRole { fact: cand.clone(), role: 1 }),
+            Box::new(FolTerm::FactRole { fact: f1,           role: 1 }),
         ),
         FolTerm::Eq(
-            Box::new(FolTerm::Raw(cand_role_2)),
-            Box::new(FolTerm::Raw(f2_role_2)),
+            Box::new(FolTerm::FactRole { fact: cand, role: 2 }),
+            Box::new(FolTerm::FactRole { fact: f2,   role: 2 }),
         ),
     ])
     .to_func()
