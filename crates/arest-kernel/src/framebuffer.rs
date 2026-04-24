@@ -214,15 +214,21 @@ impl BackBuffer {
     /// black-filled once at boot, then blit the central rect each
     /// frame).
     ///
-    /// Pixel format: only 3bpp Bgr and 3bpp Rgb target surfaces are
-    /// supported — the two QEMU / bootloader_api 0.11 combos that
-    /// appear in practice. Other formats are a no-op (same policy
-    /// `write_pixel` follows — never corrupt the surface).
+    /// Pixel format: 3bpp and 4bpp Bgr/Rgb target surfaces supported.
+    /// 3bpp covers bootloader_api 0.11 under BIOS + `-vga std`; 4bpp
+    /// covers GOP under UEFI (UEFI §12.9 mandates a reserved byte
+    /// after the RGB triple, so every GOP-reachable boot reports
+    /// bpp=4). Other formats are a no-op (same policy `write_pixel`
+    /// follows — never corrupt the surface).
+    ///
+    /// On 4bpp target surfaces the trailing reserved byte is zeroed;
+    /// GOP firmware + QEMU's GPU both ignore it, so the colour stays
+    /// correct.
     ///
     /// This is the #270/#271 Doom-host-shim's `drawFrame` import
-    /// implementation. ~1 MB source read + ~0.75 MB destination
-    /// write per call; autovectorises into a row-wise copy on the
-    /// Bgr path (trivial stride match).
+    /// implementation. ~1 MB source read + ~0.75 MB (3bpp) or ~1 MB
+    /// (4bpp) destination write per call; autovectorises into a
+    /// row-wise copy on the Bgr path (trivial stride match).
     pub fn blit_doom_frame(&mut self, src: &[u8]) {
         const DOOM_W: usize = 640;
         const DOOM_H: usize = 400;
@@ -234,7 +240,8 @@ impl BackBuffer {
             return;
         }
         let info = self.info;
-        if info.bytes_per_pixel != 3 {
+        let bpp = info.bytes_per_pixel;
+        if bpp != 3 && bpp != 4 {
             return;
         }
         let swap_rb = match info.pixel_format {
@@ -253,26 +260,36 @@ impl BackBuffer {
         if cols == 0 || rows == 0 {
             return;
         }
-        let dst_stride_bytes = info.stride * 3;
+        let dst_stride_bytes = info.stride * bpp;
 
         for dy in 0..rows {
             let src_row = dy * SRC_STRIDE;
-            let dst_row = (y_off + dy) * dst_stride_bytes + x_off * 3;
+            let dst_row = (y_off + dy) * dst_stride_bytes + x_off * bpp;
             for dx in 0..cols {
                 let so = src_row + dx * 4;
-                let d_off = dst_row + dx * 3;
+                let d_off = dst_row + dx * bpp;
+                // Doom source is `[B, G, R, A]` in memory (little-
+                // endian 0xAARRGGBB). Target byte order depends on
+                // PixelFormat.
                 if swap_rb {
-                    // Doom writes [B, G, R, A]; Rgb target wants
-                    // [R, G, B] so swap byte 0 and byte 2.
+                    // Rgb target: R first, then G, then B.
                     self.bytes[d_off]     = src[so + 2];
                     self.bytes[d_off + 1] = src[so + 1];
                     self.bytes[d_off + 2] = src[so];
                 } else {
-                    // Bgr target — matches Doom's in-memory byte
-                    // order directly. Drop the alpha byte.
+                    // Bgr target: B first — matches Doom's byte order.
                     self.bytes[d_off]     = src[so];
                     self.bytes[d_off + 1] = src[so + 1];
                     self.bytes[d_off + 2] = src[so + 2];
+                }
+                if bpp == 4 {
+                    // GOP-reserved / XRGB alpha byte. Zero rather
+                    // than copying src[so+3] (Doom's alpha) because
+                    // callers may have pre-filled the surround with
+                    // a non-zero byte for the same slot and GPU
+                    // firmware may still honour it; zero is the
+                    // documented "ignore me" value under UEFI §12.9.
+                    self.bytes[d_off + 3] = 0;
                 }
             }
         }
