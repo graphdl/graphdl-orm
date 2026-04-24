@@ -7,21 +7,21 @@
 // the pre-EBS heap + SSE init sequence diverges (x86_64 flips CR0/CR4
 // for SSE; aarch64 has NEON on by default under UEFI).
 //
-// Scope of THIS commit (#366 — memory bring-up):
+// Scope of THIS commit chain (#366 + #367):
 //   * Static-BSS `LockedHeap` heap (post-EBS-safe, parallels x86_64).
 //   * `efi_main`
 //       - Initialise the heap (before any `println!`).
 //       - Print pre-EBS banner via PL011.
 //       - `boot::exit_boot_services` — firmware tears down.
 //       - `arch::init_memory(memory_map)` — consume the firmware
-//         memory map, install the UefiFrameAllocator singleton.
-//       - Print post-EBS banner: frame count, usable MiB.
+//         memory map, install the UefiFrameAllocator singleton AND
+//         carve the 2 MiB DMA pool for a future virtio-mmio bring-up.
+//       - Print post-EBS banner: frame count, usable MiB, DMA pool status.
 //       - Halt via `wfi` loop.
 //   * `panic` — print a one-line fault marker via PL011, then `wfi` loop.
 //
 // Deliberately NOT here yet (matching the x86_64 arm's step-by-step
-// progression, and tracked by #367 / #368 / #369):
-//   * DMA pool carve banner (#367 lands the "dma: pool live" line).
+// progression, and tracked by #368 / #369):
 //   * virtio-mmio transport + find_virtio_net / find_virtio_blk (#368).
 //   * virtio-net + virtio-blk drivers online + MAC / sector banners (#369).
 //
@@ -136,6 +136,21 @@ fn efi_main() -> Status {
     let usable_mib = (frame_count * 4096) / (1024 * 1024);
     println!(
         "  mem:      {frame_count} frames usable ({usable_mib} MiB) (UEFI memory map)"
+    );
+
+    // #367: DMA pool carve smoke. `arch::init_memory` on aarch64 now
+    // mirrors the x86_64-UEFI arm: carves a 2 MiB contiguous region
+    // out of the firmware memory map and reserves it for a future
+    // virtio-mmio bring-up (#368/#369). This line proves the carve
+    // landed at runtime -- `with_dma_pool` returns `Some` only when
+    // the pool was built, which in turn only happens when
+    // `dma::carve_dma_region` found a big-enough CONVENTIONAL region.
+    // A `NONE` here (on a 256 MiB QEMU guest with 60+ MiB usable)
+    // would indicate a regression in the carve logic.
+    let dma_ok = crate::arch::memory::with_dma_pool(|_| true).unwrap_or(false);
+    println!(
+        "  dma:      pool {} (2 MiB UEFI memory-map carve for virtio)",
+        if dma_ok { "live" } else { "NONE (carve failed)" }
     );
 
     println!("  next:   ExitBootServices + memory map (follow-ups)");
