@@ -227,7 +227,11 @@ fn kernel_run(phys_offset: u64) -> ! {
     println!("  heap:   1 MiB static (#178)");
     println!("  gdt:    loaded with TSS + double-fault IST (#179)");
     println!("  idt:    breakpoint + double-fault + keyboard (#181)");
-    println!("  pic:    remapped to 32+, keyboard (IRQ 1) unmasked");
+    println!("  pic:    remapped to 32+, timer (IRQ 0) + keyboard (IRQ 1) unmasked");
+    println!(
+        "  time:   PIT 1 kHz monotonic ms (#180 followup), now_ms={}",
+        arch::time::now_ms(),
+    );
     println!("  memory: {usable_mib} MiB usable RAM ({frame_count} x 4 KiB frames) (#180)");
     match framebuffer::info() {
         Some(info) => {
