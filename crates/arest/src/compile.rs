@@ -3447,6 +3447,46 @@ fn compile_constraint(data: &CellIndex, def: &ConstraintDef) -> CompiledConstrai
 // Ring constraints on binary self-referential fact types.
 // Each returns a Func that takes an eval context Object -> violations.
 
+/// Predicate: `role 1 ≠ role 2` of the original fact. Used by every
+/// ring constraint that excludes the (x, x) self-pair (AS, SY, AT).
+/// The input shape is `<fact, all>`; `Selector(1)` reaches the fact.
+/// Routed through FolTerm (#357) so the atom's FOL shape is explicit.
+fn ring_not_self_pred() -> Func {
+    use crate::fol::FolTerm;
+    let role_1 = Func::compose(role_value(0), Func::Selector(1));
+    let role_2 = Func::compose(role_value(1), Func::Selector(1));
+    FolTerm::Not(Box::new(FolTerm::Eq(
+        Box::new(FolTerm::Raw(role_1)),
+        Box::new(FolTerm::Raw(role_2)),
+    )))
+    .to_func()
+}
+
+/// Predicate: candidate is the reverse pair of the fact. For a fact
+/// `<x, y>` and a candidate `<a, b>`, returns true iff `a = y ∧ b = x`.
+/// The input shape is `<fact, candidate>`; `Selector(1)` is the
+/// original fact, `Selector(2)` is the candidate under test.
+/// Routed through FolTerm — the constraint's reverse-pair rule is a
+/// conjunction of two role-equalities, expressed directly in FOL.
+fn ring_match_reversed_pred() -> Func {
+    use crate::fol::FolTerm;
+    let cand_role_1 = Func::compose(role_value(0), Func::Selector(2));
+    let cand_role_2 = Func::compose(role_value(1), Func::Selector(2));
+    let fact_role_1 = Func::compose(role_value(0), Func::Selector(1));
+    let fact_role_2 = Func::compose(role_value(1), Func::Selector(1));
+    FolTerm::And(vec![
+        FolTerm::Eq(
+            Box::new(FolTerm::Raw(cand_role_1)),
+            Box::new(FolTerm::Raw(fact_role_2)),
+        ),
+        FolTerm::Eq(
+            Box::new(FolTerm::Raw(cand_role_2)),
+            Box::new(FolTerm::Raw(fact_role_1)),
+        ),
+    ])
+    .to_func()
+}
+
 /// IR: not exists(x,x) -- no fact where both roles reference the same entity.
 /// alpha(make_violation)  .  Filter(eq  .  [role1_val, role2_val])  .  facts
 ///
@@ -3508,17 +3548,7 @@ fn compile_ring_asymmetric_ast(def: &ConstraintDef) -> Func {
     //     not null -> has_reverse
     //   Filter facts where has_reverse  AND  x!=y, wrap in violations.
 
-    // match_reversed: <fact, candidate> -> role0(cand) = role1(fact)  AND  role1(cand) = role0(fact)
-    let match_reversed = Func::compose(Func::And, Func::construction(vec![
-        Func::compose(Func::Eq, Func::construction(vec![
-            Func::compose(role_value(0), Func::Selector(2)), // role0(candidate)
-            Func::compose(role_value(1), Func::Selector(1)), // role1(fact)
-        ])),
-        Func::compose(Func::Eq, Func::construction(vec![
-            Func::compose(role_value(1), Func::Selector(2)), // role1(candidate)
-            Func::compose(role_value(0), Func::Selector(1)), // role0(fact)
-        ])),
-    ]));
+    let match_reversed = ring_match_reversed_pred();
 
     // check_one: <fact, all_facts> -> T if reverse exists, else F
     let check_one = Func::compose(
@@ -3526,20 +3556,7 @@ fn compile_ring_asymmetric_ast(def: &ConstraintDef) -> Func {
         Func::compose(Func::filter(match_reversed), Func::DistL),
     );
 
-    // not_self on original fact: role 1 ≠ role 2.
-    // Routed via FolTerm (#357). The outer Selector(1) reaches
-    // into the <fact, all> tuple to grab the original fact;
-    // FolTerm handles the role-extraction on top of that.
-    let not_self = {
-        use crate::fol::FolTerm;
-        let role_1 = Func::compose(role_value(0), Func::Selector(1));
-        let role_2 = Func::compose(role_value(1), Func::Selector(1));
-        FolTerm::Not(Box::new(FolTerm::Eq(
-            Box::new(FolTerm::Raw(role_1)),
-            Box::new(FolTerm::Raw(role_2)),
-        )))
-        .to_func()
-    };
+    let not_self = ring_not_self_pred();
 
     // combined: has_reverse  AND  not_self
     let pred = Func::compose(Func::And, Func::construction(vec![check_one, not_self]));
@@ -3569,34 +3586,14 @@ fn compile_ring_symmetric_ast(def: &ConstraintDef) -> Func {
     let ft_ids: Vec<String> = def.spans.iter().map(|s| s.fact_type_id.clone()).collect();
     let facts = extract_facts_multi(&ft_ids);
 
-    let match_reversed = Func::compose(Func::And, Func::construction(vec![
-        Func::compose(Func::Eq, Func::construction(vec![
-            Func::compose(role_value(0), Func::Selector(2)),
-            Func::compose(role_value(1), Func::Selector(1)),
-        ])),
-        Func::compose(Func::Eq, Func::construction(vec![
-            Func::compose(role_value(1), Func::Selector(2)),
-            Func::compose(role_value(0), Func::Selector(1)),
-        ])),
-    ]));
+    let match_reversed = ring_match_reversed_pred();
 
     let has_no_reverse = Func::compose(
         Func::NullTest,
         Func::compose(Func::filter(match_reversed), Func::DistL),
     );
 
-    // not_self: role 1 ≠ role 2 of the original fact. Routed via
-    // FolTerm (#357) — same atom as compile_ring_asymmetric_ast.
-    let not_self = {
-        use crate::fol::FolTerm;
-        let role_1 = Func::compose(role_value(0), Func::Selector(1));
-        let role_2 = Func::compose(role_value(1), Func::Selector(1));
-        FolTerm::Not(Box::new(FolTerm::Eq(
-            Box::new(FolTerm::Raw(role_1)),
-            Box::new(FolTerm::Raw(role_2)),
-        )))
-        .to_func()
-    };
+    let not_self = ring_not_self_pred();
 
     let pred = Func::compose(Func::And, Func::construction(vec![has_no_reverse, not_self]));
 
@@ -3623,35 +3620,14 @@ fn compile_ring_antisymmetric_ast(def: &ConstraintDef) -> Func {
     let ft_ids: Vec<String> = def.spans.iter().map(|s| s.fact_type_id.clone()).collect();
     let facts = extract_facts_multi(&ft_ids);
 
-    let match_reversed = Func::compose(Func::And, Func::construction(vec![
-        Func::compose(Func::Eq, Func::construction(vec![
-            Func::compose(role_value(0), Func::Selector(2)),
-            Func::compose(role_value(1), Func::Selector(1)),
-        ])),
-        Func::compose(Func::Eq, Func::construction(vec![
-            Func::compose(role_value(1), Func::Selector(2)),
-            Func::compose(role_value(0), Func::Selector(1)),
-        ])),
-    ]));
+    let match_reversed = ring_match_reversed_pred();
 
     let has_reverse = Func::compose(
         Func::compose(Func::Not, Func::NullTest),
         Func::compose(Func::filter(match_reversed), Func::DistL),
     );
 
-    // not_self: role 1 ≠ role 2 of the original fact. Routed via
-    // FolTerm (#357) — same atom as compile_ring_asymmetric_ast
-    // and compile_ring_symmetric_ast.
-    let not_self = {
-        use crate::fol::FolTerm;
-        let role_1 = Func::compose(role_value(0), Func::Selector(1));
-        let role_2 = Func::compose(role_value(1), Func::Selector(1));
-        FolTerm::Not(Box::new(FolTerm::Eq(
-            Box::new(FolTerm::Raw(role_1)),
-            Box::new(FolTerm::Raw(role_2)),
-        )))
-        .to_func()
-    };
+    let not_self = ring_not_self_pred();
 
     let pred = Func::compose(Func::And, Func::construction(vec![has_reverse, not_self]));
 
