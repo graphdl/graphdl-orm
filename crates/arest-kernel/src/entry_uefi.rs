@@ -604,6 +604,20 @@ fn kernel_run_uefi(
     crate::net::init(virtio_phy);
     println!("  net:      smoltcp interface live (DHCPv4 pending)");
 
+    // #360: register the kernel's HTTP handler on :80, mirroring the
+    // BIOS path's `kernel_run` (main.rs L369). Without this, the
+    // smoltcp `HttpListener` is never armed and generic routes
+    // (`/api/*`, the SPA fallback served by `assets::lookup`, the
+    // legacy `/` banner served by `system::dispatch`) silently 404 —
+    // the file_* intercept arms in `net::drive_http` already serve
+    // their narrow surface (#403, #444, #445) but bypass the
+    // `Handler` chain entirely. Must run AFTER `net::init` so the
+    // socket-set exists; runs BEFORE the REPL drainer loop below
+    // since that loop never returns. Clears the dead-code warning
+    // on `net::register_http` LLL flagged.
+    crate::net::register_http(80, crate::arest_http_handler);
+    println!("  http:     handler registered on :80");
+
     let virtio_blk_dev = crate::virtio::try_init_virtio_blk();
     match &virtio_blk_dev {
         Some(d) => {
@@ -1214,6 +1228,16 @@ fn kernel_run_uefi(
         {
             crate::repl::process_key(ch);
         }
+        // #360 follow-up: drive smoltcp + the HTTP listener every
+        // tick of the drainer. Mirrors the BIOS arm's
+        // `arch::x86_64::halt_forever` shape (which busy-polls
+        // `net::poll()` because the keyboard IRQ is the only PIC
+        // line unmasked there). Without this, the listener
+        // registered above silently sits in `Listen` forever and
+        // generic `/api/*` routes would never reach
+        // `arest_http_handler`. Cheap when idle: `poll` early-
+        // returns when no socket woke up.
+        crate::net::poll();
         // SAFETY: `pause` is documented as always safe; it hints
         // the CPU that this loop is busy-waiting, reducing power
         // draw and SMT-sibling contention without blocking IRQs.

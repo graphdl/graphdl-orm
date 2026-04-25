@@ -32,10 +32,28 @@ use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Cidr};
 use spin::Mutex;
 
+// `file_serve` / `file_upload` reach into `crate::block_storage`, which
+// is `cfg(target_arch = "x86_64")`-gated (see main.rs L186-L197). The
+// aarch64 + armv7 UEFI arms can compile `net` end-to-end without those
+// helpers — `drive_http` simply skips the file_* intercept arms and
+// falls straight through to the registered `Handler` chain. The cfg
+// guards on the `try_serve` call sites in `drive_http` mirror this.
+#[cfg(target_arch = "x86_64")]
 use crate::file_serve::{self, ServeOutcome};
+#[cfg(target_arch = "x86_64")]
 use crate::file_upload::{self, ServeOutcome as UploadOutcome};
 use crate::http;
+
+// `VirtioPhy` source is arch-specific. On x86_64 we wrap the PCI-
+// transport `crate::virtio::VirtioPhy` (BIOS + UEFI). On aarch64 +
+// armv7 UEFI we wrap the MMIO-transport `crate::virtio_mmio::VirtioPhy`
+// (#449's parallel adapter). The `KernelDevice::Virtio` arm threads
+// through whichever flavour the cfg picks, so the rest of `net` is
+// transport-agnostic.
+#[cfg(target_arch = "x86_64")]
 use crate::virtio::VirtioPhy;
+#[cfg(all(target_os = "uefi", any(target_arch = "aarch64", target_arch = "arm")))]
+use crate::virtio_mmio::VirtioPhy;
 
 /// Monotonically-increasing timestamp for smoltcp's scheduler. Once
 /// the TSC / HPET timer IRQ is wired we hand this a proper tick
@@ -74,12 +92,18 @@ pub enum KernelDevice {
 /// inner smoltcp-native token.
 pub enum KernelRxToken<'a> {
     Loopback(<Loopback as Device>::RxToken<'a>),
+    #[cfg(target_arch = "x86_64")]
     Virtio(crate::virtio::VirtioRxToken<'a>),
+    #[cfg(all(target_os = "uefi", any(target_arch = "aarch64", target_arch = "arm")))]
+    Virtio(crate::virtio_mmio::VirtioRxToken<'a>),
 }
 
 pub enum KernelTxToken<'a> {
     Loopback(<Loopback as Device>::TxToken<'a>),
+    #[cfg(target_arch = "x86_64")]
     Virtio(crate::virtio::VirtioTxToken<'a>),
+    #[cfg(all(target_os = "uefi", any(target_arch = "aarch64", target_arch = "arm")))]
+    Virtio(crate::virtio_mmio::VirtioTxToken<'a>),
 }
 
 impl<'a> phy::RxToken for KernelRxToken<'a> {
@@ -426,67 +450,7 @@ fn drive_http(listener: &mut HttpListener, sockets: &mut SocketSet<'static>) {
         Err(msg) => Err(msg),
     };
     let wire = match parsed {
-        Ok(req) => {
-            let range = file_serve::extract_range_header(&listener.rx_buf);
-            match file_serve::try_serve(
-                &req.method,
-                &req.path,
-                range.as_deref(),
-                crate::system::state(),
-            ) {
-                ServeOutcome::Response(bytes) => bytes,
-                ServeOutcome::NotApplicable => {
-                    let ct = file_upload::extract_content_type_header(&listener.rx_buf);
-                    match file_upload::try_serve(
-                        &req.method,
-                        &req.path,
-                        ct.as_deref(),
-                        &req.body,
-                        crate::system::state(),
-                    ) {
-                        UploadOutcome::Response(bytes) => bytes,
-                        UploadOutcome::NotApplicable => {
-                            // PUT /file/{id}/chunk?offset=N — second
-                            // half of the resumable-upload protocol
-                            // (#445). Looks up the in-memory upload
-                            // session keyed by `{id}`, writes the body
-                            // bytes at `offset`, and either advances
-                            // the high-water mark (204) or seals the
-                            // file (200) on the last chunk.
-                            let cr = file_upload::extract_content_range_header(
-                                &listener.rx_buf,
-                            );
-                            match file_upload::try_serve_chunk(
-                                &req.method,
-                                &req.path,
-                                &req.body,
-                                cr.as_deref(),
-                            ) {
-                                UploadOutcome::Response(bytes) => bytes,
-                                UploadOutcome::NotApplicable => {
-                                    // GET /file/{id}/upload-state — the
-                                    // resume probe (#445). Returns the
-                                    // in-flight session's high-water mark
-                                    // for in-progress uploads, or the
-                                    // sealed File's size for completed
-                                    // ones.
-                                    match file_upload::try_serve_upload_state(
-                                        &req.method,
-                                        &req.path,
-                                        crate::system::state(),
-                                    ) {
-                                        UploadOutcome::Response(bytes) => bytes,
-                                        UploadOutcome::NotApplicable => {
-                                            (listener.handler)(&req).to_wire()
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        Ok(req) => dispatch_request(&req, &listener.rx_buf, listener.handler),
         Err(msg) => http::Response::bad_request(msg).to_wire(),
     };
     listener.tx_buf = wire;
@@ -502,6 +466,84 @@ fn drive_http(listener: &mut HttpListener, sockets: &mut SocketSet<'static>) {
     if listener.tx_sent >= listener.tx_buf.len() {
         socket.close();
     }
+}
+
+/// Route one parsed request through the file-* intercept arms (when
+/// available) before falling back to the registered `Handler` chain.
+///
+/// On x86_64 (BIOS + UEFI) the intercept arms cover the file_serve +
+/// file_upload routes that need wire-byte responses (dynamic
+/// Content-Type, Content-Range, Location headers) the static-typed
+/// `http::Response` builder can't emit. On aarch64 + armv7 UEFI those
+/// modules are gated out (see main.rs L186-L197 — they reach
+/// `crate::block_storage` which is x86_64-only), so `dispatch_request`
+/// shrinks to a direct handler call. Generic routes (`/api/*`, the
+/// HATEOAS site, the SPA fallback) reach the `Handler` chain on every
+/// arch.
+#[cfg(target_arch = "x86_64")]
+fn dispatch_request(
+    req: &http::Request,
+    rx_buf: &[u8],
+    handler: http::Handler,
+) -> alloc::vec::Vec<u8> {
+    let range = file_serve::extract_range_header(rx_buf);
+    match file_serve::try_serve(
+        &req.method,
+        &req.path,
+        range.as_deref(),
+        crate::system::state(),
+    ) {
+        ServeOutcome::Response(bytes) => bytes,
+        ServeOutcome::NotApplicable => {
+            let ct = file_upload::extract_content_type_header(rx_buf);
+            match file_upload::try_serve(
+                &req.method,
+                &req.path,
+                ct.as_deref(),
+                &req.body,
+                crate::system::state(),
+            ) {
+                UploadOutcome::Response(bytes) => bytes,
+                UploadOutcome::NotApplicable => {
+                    // PUT /file/{id}/chunk?offset=N — second
+                    // half of the resumable-upload protocol
+                    // (#445).
+                    let cr = file_upload::extract_content_range_header(rx_buf);
+                    match file_upload::try_serve_chunk(
+                        &req.method,
+                        &req.path,
+                        &req.body,
+                        cr.as_deref(),
+                    ) {
+                        UploadOutcome::Response(bytes) => bytes,
+                        UploadOutcome::NotApplicable => {
+                            // GET /file/{id}/upload-state — the
+                            // resume probe (#445).
+                            match file_upload::try_serve_upload_state(
+                                &req.method,
+                                &req.path,
+                                crate::system::state(),
+                            ) {
+                                UploadOutcome::Response(bytes) => bytes,
+                                UploadOutcome::NotApplicable => {
+                                    handler(req).to_wire()
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn dispatch_request(
+    req: &http::Request,
+    _rx_buf: &[u8],
+    handler: http::Handler,
+) -> alloc::vec::Vec<u8> {
+    handler(req).to_wire()
 }
 
 /// Most recent DHCP lease (address + gateway + DNS). `None` until

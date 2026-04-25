@@ -211,23 +211,18 @@ fn efi_main() -> Status {
         None => println!("  virtio-net: no device / init failed"),
     }
 
-    // #449: hand the discovered virtio-net device to smoltcp. Mirrors
-    // the wiring DDD landed for x86_64 UEFI in entry_uefi.rs (#359):
-    //   `net::init(virtio_net_dev.map(VirtioPhy::new))`
-    // — wraps the NIC in the `smoltcp::phy::Device` adapter
-    // (`virtio_mmio::VirtioPhy`, the parallel of `virtio::VirtioPhy`
-    // for the MMIO transport, added in this commit), builds the
-    // Interface + SocketSet behind a Mutex, registers the DHCPv4
-    // socket. The MMIO phy itself is in place; the call below is
-    // currently gated out because `crate::net` lives behind
-    // `#[cfg(target_arch = "x86_64")]` in `main.rs`. Loosening that
-    // gate is Track FFF's (#444 family) — once it lands, replace this
-    // block with the unconditional `net::init` call mirroring DDD's
-    // pattern. Leaving the wiring as a no-op `let` ensures
-    // `try_init_virtio_net` is the only consumer of the slot until
-    // then; consuming `virtio_net_dev` also keeps it from triggering
-    // an unused-binding warning.
-    let _virtio_phy = virtio_net_dev.map(crate::virtio_mmio::VirtioPhy::new);
+    // #450: hand the discovered virtio-net device to smoltcp. Mirrors
+    // the wiring DDD landed for x86_64 UEFI in entry_uefi.rs (#359),
+    // now that #450 has widened the `mod net;` gate in main.rs to
+    // include aarch64 + armv7 UEFI. `crate::virtio_mmio::VirtioPhy`
+    // (HHH's #449 parallel of `crate::virtio::VirtioPhy` for the MMIO
+    // transport) is the `smoltcp::phy::Device` adapter the cfg-gated
+    // `net::KernelDevice::Virtio` arm consumes. When no virtio-net is
+    // present (`virtio_net_dev = None`), `net::init` falls back to a
+    // Loopback device bound to 127.0.0.1/8 so in-guest smoke still
+    // has a reachable address.
+    crate::net::init(virtio_net_dev.map(crate::virtio_mmio::VirtioPhy::new));
+    println!("  net:      smoltcp interface live (DHCPv4 pending)");
 
     let virtio_blk_dev = crate::virtio_mmio::try_init_virtio_blk();
     match &virtio_blk_dev {
