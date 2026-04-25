@@ -43,11 +43,20 @@ bootloader_api = "0.11"
 # never blocks the way std::sync::Mutex would; fine on bare metal.
 spin = "0.9"
 # Global allocator for `alloc` (Box / Vec / String / format!). The
-# `LockedHeap` type is a spin-guarded linked-list free-list allocator
-# that can be placed in a `static`. We initialise it from a fixed
-# static-buffer heap in allocator::init() at boot. Once the bootloader
-# memory map handling lands (#180) this will switch to a dynamic
-# region picked from `BootInfo.memory_regions`.
+# BIOS path (`allocator.rs`) uses `talc` — a modern slab-style
+# allocator that survives heavy realloc churn cleanly, where
+# `linked_list_allocator-0.10`'s freelist trips a "Freed node aliases
+# existing hole" assertion under wasmi `Memory::grow` reallocs during
+# Doom's `Z_Init` (#440 / #376-post). Initialised from a fixed static
+# buffer in `allocator::init()` at boot. Once the bootloader memory
+# map handling lands (#180) this will switch to a dynamic region
+# picked from `BootInfo.memory_regions`.
+talc = "4.4"
+# Still pulled in for the UEFI x86_64 / aarch64 / armv7 entry harnesses
+# (`entry_uefi*.rs`), each of which carries its own `#[global_allocator]`
+# wired against `boot::allocate_pages`-derived heaps. Migrating those
+# to `talc` is tracked separately so the per-arch entry surface stays
+# under one owner per commit (CLAUDE.md staging discipline).
 linked_list_allocator = "0.10"
 # PS/2 keyboard decoder. Takes raw scancodes (set 1 by default on
 # QEMU) and emits typed `DecodedKey` events — lets us ignore every
