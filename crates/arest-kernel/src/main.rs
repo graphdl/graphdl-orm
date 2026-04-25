@@ -167,13 +167,18 @@ mod syscall;
 mod userspace;
 #[cfg(target_arch = "x86_64")]
 mod virtio;
-// virtio-mmio transport for aarch64 UEFI (#368/#369). Sibling of the
-// x86_64 `virtio` module (which is PCI-based). QEMU aarch64 virt
-// exposes virtio devices as MMIO slots at 0x0a00_0000 rather than on
-// the PCI bus, so the discovery / transport construction path is
-// entirely different — cleaner to keep it in a parallel module than
-// to cfg-gate half of virtio.rs.
-#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+// virtio-mmio transport for aarch64 + armv7 UEFI (#368/#369 aarch64,
+// #388 armv7 widening). Sibling of the x86_64 `virtio` module (which
+// is PCI-based). QEMU's `virt` machine — both the aarch64 and the
+// armv7 variants — exposes virtio devices as MMIO slots at
+// 0x0a00_0000 rather than on the PCI bus, so the discovery / transport
+// construction path is entirely different — cleaner to keep it in a
+// parallel module than to cfg-gate half of virtio.rs. The transport
+// itself is arch-neutral (volatile MMIO byte writes + magic-number
+// scan); pointer-width differences (aarch64 = 64-bit, armv7 = 32-bit)
+// flow through `virtio_drivers::PhysAddr` (= `usize`) and the
+// arch-specific `arch::memory::with_dma_pool` re-export.
+#[cfg(all(target_os = "uefi", any(target_arch = "aarch64", target_arch = "arm")))]
 mod virtio_mmio;
 
 #[cfg(not(target_os = "uefi"))]

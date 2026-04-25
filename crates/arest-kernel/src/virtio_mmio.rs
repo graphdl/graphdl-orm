@@ -1,11 +1,35 @@
 // crates/arest-kernel/src/virtio_mmio.rs
 //
-// virtio-mmio transport for the aarch64 UEFI path (#368/#369). Sibling
-// of `virtio.rs` — the latter drives virtio-over-PCI on x86_64 (legacy
-// PIO ConfigurationAccess + PciTransport). QEMU's aarch64 `virt`
-// machine exposes virtio devices as MMIO slots at 0x0a00_0000 instead,
-// each slot 0x200 bytes wide, up to 32 slots. This module is the
-// aarch64 analogue of `pci.rs` + `virtio.rs`'s bring-up halves.
+// virtio-mmio transport for the aarch64 + armv7 UEFI paths (#368/#369
+// aarch64, #388 armv7 widening). Sibling of `virtio.rs` — the latter
+// drives virtio-over-PCI on x86_64 (legacy PIO ConfigurationAccess +
+// PciTransport). QEMU's `virt` machine — both the aarch64 and armv7
+// variants — exposes virtio devices as MMIO slots at 0x0a00_0000
+// instead, each slot 0x200 bytes wide, up to 32 slots. This module is
+// the aarch64 / armv7 analogue of `pci.rs` + `virtio.rs`'s bring-up
+// halves.
+//
+// ── Cross-arch shape ─────────────────────────────────────────────────
+//
+// The transport body is arch-neutral: volatile u32 reads probe the
+// MMIO slot headers, and `virtio-drivers`' `MmioTransport` carries
+// the rest of the device-side handshake. Two arch-specific seams
+// flow through `cfg`-resolved re-exports rather than per-arm code:
+//
+//   1. `virtio_drivers::PhysAddr` is a type alias for `usize`, so it
+//      naturally narrows to 32 bits on armv7 and stays 64-bit on
+//      aarch64 — `paddr_u64 as PhysAddr` is the only cast that
+//      truncates on the 32-bit arm, and only in the lower bits where
+//      the DMA pool's `(u64, u64)` return value already fits by the
+//      32-bit-PA invariant `arch::armv7::memory::init` enforces.
+//   2. `arch::memory::with_dma_pool` resolves to either
+//      `arch::aarch64::memory::with_dma_pool` or
+//      `arch::armv7::memory::with_dma_pool` via the per-arm `pub use`
+//      in `arch/mod.rs`. Both have signature
+//      `with_dma_pool<R>(f: impl FnOnce(&mut DmaPool) -> R) -> Option<R>`,
+//      and `DmaPool::alloc` returns `Option<(u64, u64)>` from the
+//      shared `dma` module — so the HAL impl below compiles
+//      identically on both arms with no per-arch arms.
 //
 // ── MMIO slot layout (QEMU virt) ─────────────────────────────────────
 //
@@ -20,8 +44,12 @@
 // ── Scope ────────────────────────────────────────────────────────────
 //
 // * `AarchMmioHal` — `virtio_drivers::Hal` impl using the DMA pool
-//   carved in `arch::aarch64::memory`. Identity phys↔virt translation
-//   (UEFI firmware identity-maps RAM + MMIO under AAVMF).
+//   carved in `arch::{aarch64,armv7}::memory`. Identity phys↔virt
+//   translation (UEFI firmware identity-maps RAM + MMIO under AAVMF
+//   on aarch64 and ArmVirtPkg on armv7). The "Aarch" prefix is
+//   historical — the type is shared between the aarch64 and armv7
+//   arms now, but renaming would churn callers in the aarch64 entry
+//   harness and the armv7 entry harness (#346d) hasn't landed yet.
 // * `scan_mmio_slots` — iterate 32 QEMU-virt MMIO slots and return
 //   every slot whose header magic matches.
 // * `find_virtio_net` / `find_virtio_blk` — filter by virtio
@@ -29,8 +57,8 @@
 // * `try_init_virtio_net` / `try_init_virtio_blk` — construct the
 //   MmioTransport + corresponding VirtIO device driver.
 // * `init_offset` — HAL phys_offset seed (kept for symmetry with
-//   `virtio::init_offset`; always called with 0 on aarch64 UEFI
-//   since the firmware identity-maps).
+//   `virtio::init_offset`; always called with 0 on aarch64 + armv7
+//   UEFI since the firmware identity-maps in both cases).
 //
 // The module lives as a separate file rather than an
 // `#[cfg(target_arch = "aarch64")]` block at the bottom of `virtio.rs`
@@ -38,12 +66,20 @@
 // `x86_64::structures::paging::mapper::Translate` and the virtio-
 // drivers `PciTransport` at module scope; both of those are gated on
 // `target_arch = "x86_64"` inside their source crates, so co-located
-// aarch64 code inside the same file would fight the module-level
-// imports. A parallel module keeps the two arch arms cleanly
-// separable -- same way `arch::aarch64` is a sibling of `arch::uefi`
-// rather than a conditional block in a shared file.
+// aarch64 / armv7 code inside the same file would fight the module-
+// level imports. A parallel module keeps the two arch families
+// cleanly separable -- same way `arch::aarch64` and `arch::armv7`
+// are siblings of `arch::uefi` rather than conditional blocks in a
+// shared file.
 
-#![cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+#![cfg(all(target_os = "uefi", any(target_arch = "aarch64", target_arch = "arm")))]
+// On armv7 the entry harness that consumes this module
+// (`entry_uefi_armv7.rs`) hasn't landed yet — that's #346d / #389 —
+// so every public item below is currently unreferenced on the armv7
+// build. Silence the resulting `dead_code` cascade until those land.
+// On aarch64 the consumer (`entry_uefi_aarch64.rs`) is already wired
+// so the gate has no effect there.
+#![cfg_attr(target_arch = "arm", allow(dead_code))]
 
 extern crate alloc;
 
