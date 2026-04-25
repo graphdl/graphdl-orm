@@ -21,8 +21,10 @@
 #                -f crates/arest-kernel-image/Dockerfile.uefi-armv7 .
 #   docker run --rm arest-kernel-uefi-armv7
 #
-# What you see (kernel-side — once a virtio-blk-capable firmware is in
-# place; see KNOWN BLOCKER below):
+# What you see (kernel-side — virtio-blk-capable firmware is now in
+# place via #438; see FIRMWARE comment below for provenance — but a
+# *new* kernel-side blocker surfaced once the firmware was working;
+# see PE-MACHINE BLOCKER below for the full story):
 #   ... ArmVirtPkg's own banners ...
 #   AREST kernel - armv7-UEFI scaffold
 #     target: armv7-unknown-uefi (custom target JSON)
@@ -36,7 +38,7 @@
 #     next:   ExitBootServices + memory map (follow-ups)
 #   ... kernel halts in a wfi-loop; Ctrl-C the container to exit ...
 #
-# KNOWN BLOCKER (#389 final report):
+# FIRMWARE (#438 — replaces the #389 KNOWN BLOCKER):
 #   The Debian `qemu-efi-arm` package (version 2022.11-6+deb12u2 on
 #   bookworm) ships an AAVMF32_CODE.fd that does NOT include the
 #   VirtIO Block / FAT / Partition Table / Loaded-Image-Protocol
@@ -45,36 +47,115 @@
 #   AAVMF_CODE.fd which contains the full VirtioBlkDxe + Fat + Part
 #   set). At runtime BdsDxe finds the virtio-blk-device but logs
 #   `Boot0002 "UEFI Non-Block Boot Device" from VenHw(...): Unsupported`
-#   and falls back to PXE (also unconfigured), then halts. `-kernel`
-#   doesn't help — the firmware's PE32+ loader needs the same chain
-#   to wrap the kernel as a Loaded Image.
+#   and falls back to PXE (also unconfigured), then halts.
 #
-#   The kernel itself is correct: `cargo +nightly build --target
+#   #438 swaps that broken Debian firmware for an upstream EDK2
+#   `Build/ArmVirtQemu-ARM/RELEASE_GCC5/FV/QEMU_EFI.fd` blob, pulled
+#   from `retrage/edk2-nightly` — the well-known automated CircleCI
+#   nightly that mirrors `tianocore/edk2`'s master into per-platform
+#   .fd builds and publishes them at GitHub Pages + raw.gh. ARM 32-bit
+#   (`ArmVirtQemu-ARM`) was removed from upstream's CI matrix when
+#   ArmVirtPkg dropped 32-bit ARM, so the file is marked "deprecated"
+#   on the index page but the build job still runs and the binary is
+#   still served and refreshed with each nightly. Since upstream is
+#   no longer changing its 32-bit ARM tree, the blob is effectively
+#   frozen — the SHA below has been stable since 2025-08-29.
+#
+#   Pinning details (so a future audit can verify provenance):
+#     Source URL :
+#       https://raw.githubusercontent.com/retrage/edk2-nightly/
+#         23068f498687bf64f2b8f80fbcf11e82d987fd9b/bin/RELEASEARM_QEMU_EFI.fd
+#     Commit     : 23068f498687bf64f2b8f80fbcf11e82d987fd9b
+#                  ("[ci skip] Deploy nightly build", 2025-08-29 UTC).
+#     Git blob   : 8f3c2356b152fca64912aab8ee8b12da944c5e35
+#     Size       : 2,097,152 bytes (2 MiB, EDK2 ArmVirtQemu-ARM FV).
+#     sha256     : 972b77d2ff478338c84b0869e660062084f7194ba4b7cbf3f8963aba4cf2f186
+#
+#   Provenance check performed before this commit (decompressed the
+#   FV's LZMA-encoded DXEFV section and grepped the inflated bytes
+#   for module path strings — EDK2 embeds the build path of every
+#   .dll module in its FV, so the listing below proves which Pkg+
+#   driver each module was compiled from):
+#     /src/edk2/Build/ArmVirtQemu-ARM/RELEASE_GCC5/ARM/
+#       OvmfPkg/VirtioBlkDxe/VirtioBlk/DEBUG/VirtioBlkDxe.dll   <-- core fix
+#       OvmfPkg/VirtioNetDxe/VirtioNet/DEBUG/VirtioNetDxe.dll
+#       OvmfPkg/VirtioFdtDxe/VirtioFdtDxe/DEBUG/VirtioFdtDxe.dll
+#       OvmfPkg/Virtio10Dxe/Virtio10/DEBUG/Virtio10.dll
+#       FatPkg/EnhancedFatDxe/Fat/DEBUG/Fat.dll
+#       MdeModulePkg/Universal/Disk/PartitionDxe/PartitionDxe/DEBUG/PartitionDxe.dll
+#   These are exactly the modules AAVMF32_CODE.fd was missing. The
+#   build path also confirms `ArmVirtQemu-ARM/RELEASE_GCC5` (i.e. the
+#   32-bit ARM ArmVirtPkg target with -O2, not the aarch64 one).
+#
+#   The kernel itself builds: `cargo +nightly build --target
 #   ./arest-kernel-armv7-uefi.json -Z build-std=core,compiler_builtins,alloc
-#   -Z unstable-options -Z json-target-spec` produces a valid PE32+
-#   `.efi` that this Dockerfile happily stages onto a FAT ESP, and
-#   the entry harness in `entry_uefi_armv7.rs` is wave-for-wave
-#   identical to the proven `entry_uefi_aarch64.rs`. The boot wall is
-#   purely on the firmware side.
+#   -Z unstable-options -Z json-target-spec` produces a PE32 `.efi`
+#   that this Dockerfile happily stages onto a FAT ESP, and the
+#   entry harness in `entry_uefi_armv7.rs` is wave-for-wave identical
+#   to the proven `entry_uefi_aarch64.rs`. But see the PE-MACHINE
+#   BLOCKER below — the kernel's PE header turned out to need a
+#   one-byte tweak that is outside this commit's file ownership.
 #
-#   Resolution paths (any of):
-#     1. Switch to a fuller ArmVirtPkg32 build (e.g. EDK2 nightly
-#        `Build/ArmVirtQemu-ARM/RELEASE_GCC5/FV/QEMU_EFI.fd` —
-#        confirmed to include VirtioBlkDxe). Brief explicitly cautions
-#        against pulling a "random EDK2 build" without provenance, so
-#        this needs a follow-up that pins to a specific verified
-#        EDK2 tag + sha.
-#     2. Boot via U-Boot's UEFI sub-system (u-boot.bin loaded with
-#        `-bios`, then `bootefi` from a virtio-blk shell command) —
-#        u-boot includes virtio-blk + fat + partition out of the box.
-#     3. Bypass UEFI entirely with a hand-rolled `_start` for
-#        `armv7a-none-eabi`. Defeats the whole point of #344's
-#        cross-arch UEFI shape, so likely a non-starter.
+# PE-MACHINE BLOCKER (#438 follow-up — separate kernel-side issue):
+#   Once the firmware swap above started actually probing the ESP,
+#   the smoke surfaced a new failure mode that was hidden behind
+#   #389's firmware blocker. Captured by booting a DEBUG-build of
+#   the same firmware (DEBUGARM_QEMU_EFI.fd at the same retrage
+#   commit) which prints driver-level diagnostics:
 #
-#   None of these can land in this commit without dragging in either
-#   external EDK2 binaries or a U-Boot dep. Documenting the blocker
-#   per the brief's instructions; the smoke harness will fail until
-#   one of the above lands.
+#     VirtioBlkInit: LbaSize=0x200[B] NumBlocks=0x20000[Lba]
+#     ...
+#     Installed Fat filesystem on 4F827490
+#     ...
+#     FSOpen: Open '\EFI\BOOT\BOOTARM.EFI' Success
+#     [Bds] Expand VenHw(...) -> VenHw(...)/\EFI\BOOT\BOOTARM.EFI
+#     BdsDxe: loading Boot0002 ... from VenHw(...)
+#     [Security] 3rd party image[0] can be loaded after EndOfDxe ...
+#     BdsDxe: failed to load Boot0002 ... : Unsupported
+#
+#   Translation: the new firmware now binds VirtioBlkDxe, mounts the
+#   FAT ESP, opens `/EFI/BOOT/BOOTARM.EFI`, hands the bytes to
+#   `LoadImage()`, and gets back `EFI_UNSUPPORTED`. The PE rejection
+#   is in EDK2's PE-COFF loader, on the COFF Machine field of the
+#   .efi header.
+#
+#   Decoded PE header of the staged BOOTARM.EFI:
+#     Magic    : MZ + PE\0\0
+#     Machine  : 0x01c4  (IMAGE_FILE_MACHINE_ARMNT — Microsoft's
+#                         "ARM Thumb-2 Little-Endian, ARMv7")
+#     Subsystem: 0x000a  (EFI_IMAGE_SUBSYSTEM_EFI_APPLICATION) — OK
+#     Magic2   : 0x010b  (PE32, not PE32+) — OK on 32-bit ARM
+#
+#   EDK2's `MdePkg/Include/IndustryStandard/PeImage.h` only knows the
+#   older Microsoft constant for 32-bit ARM:
+#     #define IMAGE_FILE_MACHINE_ARMTHUMB_MIXED  0x01c2
+#   `0x01c4` (ARMNT) is not in EDK2's list of supported machines, so
+#   the loader returns EFI_UNSUPPORTED before our `efi_main` ever
+#   runs.
+#
+#   The fix lives in the kernel's custom target JSON
+#   `crates/arest-kernel/arest-kernel-armv7-uefi.json` (and possibly
+#   the linker flags it pre-link-arg's into rust-lld), not in this
+#   Dockerfile. Out of scope for #438 per its strict file-ownership
+#   rules — the brief explicitly forbids touching the kernel target
+#   JSON or sources from this commit. The firmware swap stands; the
+#   PE machine fix is a separate follow-up.
+#
+#   Bisect path for that follow-up:
+#     1. Set `"llvm-target": "armv7a-pc-windows-msvc"` (drop the
+#        `thumbv7a-` prefix) so LLVM emits ARM mode rather than
+#        Thumb-2 (Microsoft's ARMNT is a Thumb-2-only target — that's
+#        what selects 0x01c4). Plain `armv7a` lowers to
+#        IMAGE_FILE_MACHINE_ARM (0x01c0)/THUMB (0x01c2) per
+#        rust-lld / link.exe convention.
+#     2. Or override the linker arg: `/machine:thumb` (instead of
+#        `/machine:arm`) makes link.exe emit 0x01c2 directly.
+#     3. Or post-process the .efi: patch byte 4 of the COFF header
+#        from 0xc4 to 0xc2 (one-byte fixup; ugly, but unblocks
+#        smoke-testing the rest of the entry harness).
+#   Cross-check after fix: re-run the smoke; the kernel banner lines
+#   the script asserts (mem/dma/virtio-mmio/virtio-net/virtio-blk/
+#   ExitBootServices) should now stream out of PL011 stdio.
 
 FROM rust:latest AS builder
 
@@ -170,33 +251,41 @@ FROM debian:bookworm-slim AS runner
 #                     machine in some details, but the PL011 UART and
 #                     virtio-mmio slots sit at the same physical
 #                     addresses on both — same `hw/arm/virt.c` driver).
-# qemu-efi-arm      : `/usr/share/AAVMF/AAVMF32_CODE.fd` +
-#                     `AAVMF32_VARS.fd` — ArmVirtPkg compiled for
-#                     32-bit ARM. The 32-bit ARM analogue of
-#                     `qemu-efi-aarch64`'s `AAVMF_CODE.fd`. Verified
-#                     present on debian:bookworm-slim:
-#                       $ apt-cache search qemu-efi
-#                       qemu-efi-arm - UEFI firmware for 32-bit ARM ...
-#                       $ dpkg -L qemu-efi-arm | grep '\.fd$'
-#                       /usr/share/AAVMF/AAVMF32_CODE.fd
-#                       /usr/share/AAVMF/AAVMF32_VARS.fd
-#                     File name is `AAVMF32_CODE.fd` (NOT
-#                     `QEMU_EFI-arm.fd` as some upstream EDK2 builds
-#                     ship it) — Debian's packaging renames to keep
-#                     the AAVMF prefix consistent with the aarch64
-#                     package's `AAVMF_CODE.fd`.
 # ipxe-qemu         : `/usr/lib/ipxe/qemu/efi-virtio.rom` — iPXE ROM
 #                     QEMU's virtio devices load on init. Mirrors the
 #                     aarch64 Dockerfile (without it qemu-system-arm
 #                     aborts: `failed to find romfile efi-virtio.rom`).
 # dosfstools+mtools : FAT ESP staging (same as Dockerfile.uefi-aarch64).
+# curl + ca-certs   : pulls the pinned EDK2 ArmVirtQemu-ARM firmware
+#                     in the next layer (replaces Debian's broken
+#                     `qemu-efi-arm` package — see FIRMWARE comment
+#                     above). `ca-certificates` is required for the
+#                     HTTPS handshake against raw.githubusercontent.com.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     qemu-system-arm \
-    qemu-efi-arm \
     ipxe-qemu \
     dosfstools \
     mtools \
+    curl \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
+# Download the pinned EDK2 ArmVirtQemu-ARM firmware (provenance +
+# sha256 documented in the FIRMWARE comment at the top of this file).
+# The blob is fetched from a commit-pinned raw.githubusercontent.com
+# URL (NOT `master`) so the build is bit-for-bit reproducible: even
+# if `retrage/edk2-nightly` later removes the deprecated 32-bit ARM
+# build entirely, this URL keeps resolving to the exact same bytes
+# until the commit itself is pruned. The sha256 check below makes
+# the build fail loudly the moment the upstream blob shifts under us
+# — that's by design: a silent firmware swap would invalidate every
+# guarantee in the comment block above.
+ARG EDK2_ARM_FIRMWARE_URL=https://raw.githubusercontent.com/retrage/edk2-nightly/23068f498687bf64f2b8f80fbcf11e82d987fd9b/bin/RELEASEARM_QEMU_EFI.fd
+ARG EDK2_ARM_FIRMWARE_SHA256=972b77d2ff478338c84b0869e660062084f7194ba4b7cbf3f8963aba4cf2f186
+RUN mkdir -p /usr/share/AAVMF \
+    && curl -fsSL -o /usr/share/AAVMF/QEMU_EFI-arm.fd "${EDK2_ARM_FIRMWARE_URL}" \
+    && echo "${EDK2_ARM_FIRMWARE_SHA256}  /usr/share/AAVMF/QEMU_EFI-arm.fd" \
+        | sha256sum -c -
 
 # Stage the armv7 .efi at the firmware's default boot path. The
 # `EFI/BOOT/<arch>.EFI` convention is the same shape OVMF and AAVMF
@@ -238,10 +327,20 @@ RUN dd if=/dev/zero of=/disk.img bs=1M count=1 status=none
 #   -m 256M                 Guest RAM. Same as aarch64 — fits the
 #                           16 MiB kernel heap + DMA pool + UEFI
 #                           firmware comfortably.
-#   -bios ...AAVMF32_CODE.fd
-#                           Combined ArmVirtPkg code+vars for 32-bit
-#                           ARM. Varstore persistence irrelevant for
-#                           smokes (we boot fresh every container).
+#   -bios ...QEMU_EFI-arm.fd
+#                           EDK2 ArmVirtQemu-ARM firmware (RELEASE,
+#                           upstream tianocore/edk2 via the
+#                           retrage/edk2-nightly automated build —
+#                           pinned URL + sha256 verified at build
+#                           time; see FIRMWARE comment block at the
+#                           top of this Dockerfile). Includes the
+#                           VirtioBlkDxe + Fat + PartitionDxe driver
+#                           chain that Debian's AAVMF32_CODE.fd was
+#                           missing (#438 fix for #389's blocker).
+#                           Varstore is built into the same FV (no
+#                           separate VARS file); persistence
+#                           irrelevant for smokes regardless (we boot
+#                           fresh every container).
 #   -drive ...,if=none,id=esp + -device virtio-blk-device,drive=esp
 #                           ESP as a virtio-blk device, attached via
 #                           MMIO transport. The aarch64 Dockerfile
@@ -282,7 +381,7 @@ CMD ["qemu-system-arm", \
      "-machine", "virt", \
      "-cpu", "cortex-a15", \
      "-m", "256M", \
-     "-bios", "/usr/share/AAVMF/AAVMF32_CODE.fd", \
+     "-bios", "/usr/share/AAVMF/QEMU_EFI-arm.fd", \
      "-drive", "format=raw,file=/uefi-disk.img,if=none,id=esp", \
      "-device", "virtio-blk-device,drive=esp", \
      "-netdev", "user,id=net0", \
