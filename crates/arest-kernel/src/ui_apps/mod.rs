@@ -24,6 +24,7 @@
 
 pub mod hateoas;
 pub mod launcher;
+pub mod registry;
 pub mod repl;
 // Doom (#455 + #456 Track VVV). Gated behind `feature = "doom"`
 // because the wasmi-instantiated jacobenget/doom.wasm v0.1.0 binary
