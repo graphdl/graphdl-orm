@@ -129,6 +129,7 @@ name = "arest-kernel"
 version = "0.1.0"
 dependencies = [
  "arest",
+ "cc",
  "pc-keyboard",
  "pic8259",
  "slint",
