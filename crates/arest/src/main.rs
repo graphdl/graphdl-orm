@@ -285,20 +285,6 @@ fn read_readings(dirs: &[String]) -> Vec<(String, String)> {
     app_md.into_iter().chain(readings).collect()
 }
 
-/// Bundled metamodel readings — same as lib.rs METAMODEL_READINGS.
-#[cfg(feature = "local")]
-const METAMODEL_READINGS: &[(&str, &str)] = &[
-    ("core",          include_str!("../../../readings/core.md")),
-    ("state",         include_str!("../../../readings/state.md")),
-    ("instances",     include_str!("../../../readings/instances.md")),
-    ("outcomes",      include_str!("../../../readings/outcomes.md")),
-    ("validation",    include_str!("../../../readings/validation.md")),
-    ("evolution",     include_str!("../../../readings/evolution.md")),
-    ("organizations", include_str!("../../../readings/organizations.md")),
-    ("agents",        include_str!("../../../readings/agents.md")),
-    ("ui",            include_str!("../../../readings/ui.md")),
-];
-
 /// Load population from SQLite, compile defs in memory.
 /// Defs are never persisted — population cells only on disk.
 /// Compile takes ~500ms and produces the full D for SYSTEM calls.
@@ -415,8 +401,8 @@ fn main() {
                 // merge via cell concatenation. No Domain struct.
                 parse_forml2::set_bootstrap_mode(true);
                 parse_forml2::set_strict_mode(strict);
-                let all_readings: Vec<(&str, &str)> = METAMODEL_READINGS.iter()
-                    .map(|(n, t)| (*n, *t))
+                let all_readings: Vec<(&str, &str)> = arest::metamodel_readings().into_iter()
+                    .map(|r| (r.0, r.1))
                     .chain(readings.iter().map(|(n, t)| (n.as_str(), t.as_str())))
                     .collect();
                 let state = all_readings.iter().fold(
