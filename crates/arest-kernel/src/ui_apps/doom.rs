@@ -204,6 +204,58 @@ impl SlintDoomHost {
     fn new(frame: CapturedFrame) -> Self {
         Self { inner: crate::doom::KernelDoomHost::new(), frame }
     }
+
+    /// One pass of the UDP receive ring → host inbound queue
+    /// (#385). Pulls every pending packet via `crate::net::udp_recv_from`
+    /// and pushes it onto the kernel host's in-memory ring so the
+    /// guest's next `net_recv_packet` import resolves them. Bounded
+    /// at `MAX_PACKETS_PER_DRAIN` per call so a flood doesn't stall
+    /// the per-frame timer; the smoltcp ring (16 packets) drops the
+    /// oldest under back-pressure if we don't drain fast enough,
+    /// which matches the wire-level "UDP is best-effort" semantic.
+    ///
+    /// No-op when:
+    ///   * `crate::net::init` hasn't run (fresh boot path);
+    ///   * the kernel host hasn't bound a UDP socket yet — happens
+    ///     when no peer table is configured (single-player mode), so
+    ///     skipping the bind is the correct behaviour.
+    ///
+    /// The drain runs against `inner` directly to avoid locking the
+    /// `inner.inbound` Mutex twice per packet (once for the size
+    /// check, once for the push) — `push_inbound_packet` takes
+    /// `&self` and locks internally per call, so the cost is one
+    /// lock acquire + one ring entry per packet. At Doom's typical
+    /// ~1 packet/tic NetGame rate this is microseconds per frame.
+    fn drain_udp(&mut self) {
+        const MAX_PACKETS_PER_DRAIN: usize = 16;
+        // Buffer sized to one Ethernet MTU — matches the smoltcp
+        // ring's per-packet capacity. Doom packets are well under
+        // this (~70 B), but sizing for the worst case avoids
+        // `RecvBufferTooSmall` drops.
+        let mut buf = [0u8; 1500];
+        let Some(handle) = self.inner.ensure_socket() else { return };
+        for _ in 0..MAX_PACKETS_PER_DRAIN {
+            match crate::net::udp_recv_from(handle, &mut buf) {
+                Ok(Some((n, peer))) => {
+                    let peer_idx = peer_endpoint_to_index(peer);
+                    self.inner
+                        .push_inbound_packet(buf[..n].to_vec(), peer_idx);
+                }
+                Ok(None) => break, // ring empty
+                Err(_) => break,   // truncated / not initialised — drop quietly
+            }
+        }
+    }
+}
+
+/// Map a smoltcp `IpEndpoint` back to the index in the boot-time
+/// `crate::doom::PEERS` table via `crate::doom::peer_index_of`.
+/// Returns `-1` for an unknown peer; the guest's NetGame layer
+/// treats that as a "drop" signal so a stray packet from outside
+/// the configured table doesn't cascade into a bogus `peer_idx`
+/// in the inbound ring.
+fn peer_endpoint_to_index(peer: smoltcp::wire::IpEndpoint) -> i32 {
+    crate::doom::peer_index_of(peer)
 }
 
 impl DoomHost for SlintDoomHost {
@@ -266,6 +318,26 @@ impl DoomHost for SlintDoomHost {
 
     fn on_error_message(&mut self, message: &str) {
         self.inner.on_error_message(message);
+    }
+
+    fn net_send_packet(&mut self, payload: &[u8], peer_idx: i32) -> i32 {
+        // Forward to the kernel host — UDP socket lives on
+        // `inner.udp_handle`, peer table on the `crate::doom::PEERS`
+        // static. See `crate::doom::KernelDoomHost::net_send_packet`
+        // for the resolve-peer + lazy-bind flow.
+        self.inner.net_send_packet(payload, peer_idx)
+    }
+
+    fn net_recv_packet(&mut self, buf: &mut [u8]) -> Option<(usize, i32)> {
+        // Pop from `inner`'s in-memory inbound ring. The ring is
+        // populated by the per-frame timer's `udp_drain_pass` call
+        // below, which routes smoltcp's `udp_recv_from` packets onto
+        // it before each `tickGame` fires.
+        self.inner.net_recv_packet(buf)
+    }
+
+    fn net_peer_count(&mut self) -> i32 {
+        self.inner.net_peer_count()
     }
 }
 
@@ -553,6 +625,18 @@ fn tic(
     {
         let mut maybe_guest = guest_cell.borrow_mut();
         let Some(guest) = maybe_guest.as_mut() else { return };
+
+        // 1a. Drain any pending inbound UDP packets onto the host's
+        //     in-memory ring (#385). Doom's NetGame layer expects
+        //     `net_recv_packet` to find packets ready when the next
+        //     `tickGame` runs — drain BEFORE the tic so the guest
+        //     sees fresh state on this frame, not next.
+        //
+        //     No-op when the host hasn't bound a UDP socket yet
+        //     (single-player session that never touched the net
+        //     imports). `drain_udp` short-circuits cheaply on the
+        //     missing-socket path.
+        guest.store.data_mut().drain_udp();
 
         // tickGame. Refill fuel before the call so the guest gets
         // a fresh budget per tic (same shape `entry_uefi.rs` uses
