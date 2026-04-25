@@ -43,10 +43,20 @@
 //     fires `int3` so the boot banner can prove the IDT is live via a
 //     round-trip smoke. Re-exported here so the entry calls
 //     `arch::init_interrupts()` / `arch::breakpoint()` target-agnostically.
+//
+// What #379 adds:
+//   * `time` module — PIT-backed monotonic millisecond counter,
+//     mirror of `arch::x86_64::time`. Exposes `now_ms() -> u64` for
+//     the shared kernel body's call sites (Doom tic, net retry).
+//   * `init_time()` — entry that programs the 8259 PIC remap, the
+//     PIT divisor, and `sti`s. Called from `kernel_run_uefi` after
+//     `init_interrupts()` so the IRQ 0 vector is populated before
+//     hardware interrupts come online.
 
 pub mod interrupts;
 pub mod memory;
 mod serial;
+pub mod time;
 
 pub use interrupts::{breakpoint, init_interrupts};
 pub use serial::{_print, switch_to_post_ebs_serial};
@@ -70,6 +80,28 @@ pub fn init_console() {
 /// knowing which boot path produced the map.
 pub fn init_memory(memory_map: uefi::mem::memory_map::MemoryMapOwned) -> u64 {
     memory::init(memory_map)
+}
+
+/// Bring the 1 kHz monotonic-millisecond timer online (#379). Three
+/// pieces, in order:
+///   1. Remap the 8259 PIC pair so IRQ 0..15 land on vectors 32..47
+///      (UEFI firmware leaves the PIC physically present but masked;
+///      the standard ICW sequence works post-EBS on QEMU+OVMF).
+///   2. Program the PIT (8254) at 1 kHz (mode 3, divisor 1193).
+///   3. `sti` so hardware interrupts flow.
+///
+/// Must run AFTER `init_interrupts` has loaded the IDT — the IRQ 0
+/// vector is populated there, and stepping into `sti` before the
+/// vector exists would triple-fault on the first tick.
+///
+/// Once this returns, `arch::time::now_ms()` advances ~once per
+/// millisecond. Idle code can use `hlt` to wait on the timer (the
+/// PIT IRQ wakes the CPU); polling code can budget retries against
+/// `now_ms()`.
+pub fn init_time() {
+    interrupts::pic_init();
+    time::init();
+    interrupts::enable_irqs();
 }
 
 /// Configure CR0/CR4 so SSE / SSE2 instructions don't fault. Same
