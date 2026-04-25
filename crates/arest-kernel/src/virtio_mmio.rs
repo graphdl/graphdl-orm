@@ -392,3 +392,143 @@ pub fn try_init_virtio_blk() -> Option<VirtIOBlkDevice> {
         }
     }
 }
+
+// ── smoltcp::phy::Device adapter (#449 — aarch64 + armv7 UEFI mile) ──
+//
+// Parallel of `crate::virtio::VirtioPhy` (`virtio.rs:374-`) for the
+// MMIO transport. The PCI version is hard-typed against
+// `VirtIONet<KernelHal, PciTransport, NET_QUEUE_SIZE>` at module
+// scope, so it can't accept the MMIO-flavoured `VirtIONetDevice`
+// declared above without a generic-ising refactor. Mirroring the
+// shape into a sibling impl is Option 1 from #449's description —
+// lowest risk, no churn in the existing PCI arm. (Option 2: hoist
+// `VirtioPhy` to be generic over any `VirtIONet<HAL, Transport, QSIZE>`
+// and consume both transports through the same type. Worth doing
+// later when both arms need the same poll/IRQ machinery; not in
+// this commit, scope creep.)
+//
+// Borrow-checker reasoning + RxBuffer recycling rationale: identical
+// to `virtio.rs:344-368`; see that comment block for the full
+// justification of the raw `*mut VirtIONetDevice` carried in the
+// tokens. The single-CPU + single-writer + sequential-token-consumption
+// invariants hold the same way on aarch64 / armv7 as they do on x86_64.
+
+use smoltcp::phy::{self, Checksum, DeviceCapabilities, Medium};
+use smoltcp::time::Instant;
+use virtio_drivers::device::net::{RxBuffer, TxBuffer};
+
+/// smoltcp Device wrapping a virtio-mmio VirtIONet driver.
+pub struct VirtioPhy {
+    nic: VirtIONetDevice,
+}
+
+impl VirtioPhy {
+    /// Take ownership of the VirtIONet driver so smoltcp can
+    /// drive it. The NIC lives for the lifetime of the phy.
+    pub fn new(nic: VirtIONetDevice) -> Self {
+        Self { nic }
+    }
+
+    /// Expose the NIC's MAC address so the interface can set
+    /// itself up with a real hardware address instead of the
+    /// loopback placeholder.
+    pub fn mac_address(&self) -> smoltcp::wire::EthernetAddress {
+        smoltcp::wire::EthernetAddress(self.nic.mac_address())
+    }
+}
+
+pub struct VirtioRxToken<'a> {
+    nic: *mut VirtIONetDevice,
+    buf: Option<RxBuffer>,
+    _marker: core::marker::PhantomData<&'a mut VirtIONetDevice>,
+}
+
+pub struct VirtioTxToken<'a> {
+    nic: *mut VirtIONetDevice,
+    _marker: core::marker::PhantomData<&'a mut VirtIONetDevice>,
+}
+
+impl<'a> phy::RxToken for VirtioRxToken<'a> {
+    fn consume<R, F>(mut self, f: F) -> R
+    where
+        F: FnOnce(&[u8]) -> R,
+    {
+        let buf = self.buf.take().expect("rx token consumed twice");
+        let result = f(buf.packet());
+        // SAFETY: justified in the module-level comment — single
+        // writer, sequential token consumption, `'a` scoped lifetime.
+        let nic = unsafe { &mut *self.nic };
+        // A failure here means the pool lost the buffer index — the
+        // kernel's next receive() will just allocate fresh.
+        let _ = nic.recycle_rx_buffer(buf);
+        result
+    }
+}
+
+impl<'a> phy::TxToken for VirtioTxToken<'a> {
+    fn consume<R, F>(self, len: usize, f: F) -> R
+    where
+        F: FnOnce(&mut [u8]) -> R,
+    {
+        // SAFETY: as in RxToken.consume — the pointer is live
+        // through `'a` and no other borrower is active.
+        let nic = unsafe { &mut *self.nic };
+        let mut tx_buf: TxBuffer = nic.new_tx_buffer(len);
+        let result = f(tx_buf.packet_mut());
+        // If send fails the packet just gets dropped — smoltcp
+        // retransmits via its TCP stack; there's no in-band way
+        // to report a NIC error back through TxToken.
+        let _ = nic.send(tx_buf);
+        result
+    }
+}
+
+impl phy::Device for VirtioPhy {
+    type RxToken<'a> = VirtioRxToken<'a>;
+    type TxToken<'a> = VirtioTxToken<'a>;
+
+    fn receive(&mut self, _ts: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        if !self.nic.can_recv() {
+            return None;
+        }
+        let buf = self.nic.receive().ok()?;
+        let nic_ptr: *mut VirtIONetDevice = &mut self.nic;
+        let rx = VirtioRxToken {
+            nic: nic_ptr,
+            buf: Some(buf),
+            _marker: core::marker::PhantomData,
+        };
+        let tx = VirtioTxToken {
+            nic: nic_ptr,
+            _marker: core::marker::PhantomData,
+        };
+        Some((rx, tx))
+    }
+
+    fn transmit(&mut self, _ts: Instant) -> Option<Self::TxToken<'_>> {
+        if !self.nic.can_send() {
+            return None;
+        }
+        let nic_ptr: *mut VirtIONetDevice = &mut self.nic;
+        Some(VirtioTxToken {
+            nic: nic_ptr,
+            _marker: core::marker::PhantomData,
+        })
+    }
+
+    fn capabilities(&self) -> DeviceCapabilities {
+        let mut caps = DeviceCapabilities::default();
+        // Standard Ethernet MTU — 14-byte header + 1500-byte payload.
+        // The NIC pool is 2048 bytes per buffer (`NET_BUF_LEN`), so
+        // we've got comfortable headroom even for slightly larger
+        // jumbo frames if the host ever negotiates them.
+        caps.max_transmission_unit = 1514;
+        caps.medium = Medium::Ethernet;
+        // No checksum offload — virtio-drivers doesn't advertise it
+        // at this API level, so we let smoltcp compute every sum.
+        caps.checksum.ipv4 = Checksum::Both;
+        caps.checksum.tcp = Checksum::Both;
+        caps.checksum.udp = Checksum::Both;
+        caps
+    }
+}
