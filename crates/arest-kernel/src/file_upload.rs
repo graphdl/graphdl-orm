@@ -27,21 +27,19 @@
 // `Handler` chain. `net::drive_http` calls this immediately after
 // the GET/HEAD intercept arm.
 //
-// ── Persistence note (TODO #444b) ───────────────────────────────────
+// ── Persistence (resolved in #451) ──────────────────────────────────
 //
-// The kernel's SYSTEM is `spin::Once<Object>` — mutable state writes
-// (`ast::cell_push`) build a *new* Object but cannot be installed
-// back into the live SYSTEM at this commit. The route therefore
-// computes the would-be next state (so the cell-push pipeline is
-// exercised + tested) and returns 201 with a deterministic id, but
-// the new File facts vanish at end-of-request. Wiring a `RwLock`
-// (or transactional cell store) into `system::SYSTEM` belongs to a
-// sibling slice — flagged in the Track FFF report. `file_serve` will
-// 404 on the returned id until that track lands.
-//
-// Once persistence wires up, the only changes here are: (a) replace
-// the discarded `_new_state` with `system::install(new_state)` and
-// (b) remove this disclaimer block. The 201 wire shape stays.
+// Earlier slices of this route discarded the would-be next state as
+// `_new_state` because the kernel's SYSTEM was `spin::Once<Object>`
+// and had no install path. #451 swapped that for an `RwLock`-backed
+// pointer slot with `system::apply(new_state)` as the atomic-swap
+// commit. This route now installs the new state before returning
+// 201, so the returned id round-trips through `GET /file/{id}/
+// content` immediately. An `apply` failure (only possible if
+// `system::init()` hasn't run, which is a kernel-boot ordering
+// regression) surfaces as `500 Internal Server Error` so the client
+// retries against a freshly-booted tenant rather than silently
+// losing the upload.
 
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -183,12 +181,15 @@ pub fn try_serve(
     // the persistence track when the no_std gate gets relaxed).
     let mime = detect_mime(&file_part.body);
 
-    // Build the would-be next state — the same fact-type ids the
-    // engine-side `direct_push_file` (zip.rs) and the file_serve
-    // reader (file_serve.rs) use. Held as `_new_state` because the
-    // kernel SYSTEM mutator hasn't landed (see top-of-file note);
-    // this commit ships the cell-push pipeline without the install.
-    let _new_state = build_file_facts(
+    // Build the next state — the same fact-type ids the engine-side
+    // `direct_push_file` (zip.rs) and the file_serve reader
+    // (file_serve.rs) use — and atomically install it via the #451
+    // SYSTEM mutator. The pre-state is `state.cloned()` so the new
+    // facts layer on top of whatever was already there; an empty
+    // `Object::phi()` fallback covers the early-boot smoke-test
+    // case where SYSTEM hasn't been initialised yet (apply will
+    // then surface a 500 — see below).
+    let new_state = build_file_facts(
         state.cloned().unwrap_or_else(Object::phi),
         &file_id,
         &file_part.filename,
@@ -196,6 +197,12 @@ pub fn try_serve(
         &file_part.body,
         directory_id,
     );
+    if let Err(msg) = crate::system::apply(new_state) {
+        // The only failure mode is "init() not called", which is a
+        // boot-ordering regression. Surface it as 500 so the client
+        // gets a clear signal rather than a silent vanish-on-write.
+        return ServeOutcome::Response(internal_error(msg));
+    }
 
     ServeOutcome::Response(created_response(&file_id))
 }
@@ -693,6 +700,22 @@ fn method_not_allowed() -> Vec<u8> {
     out
 }
 
+/// 500 Internal Server Error. Surfaced when `system::apply` fails —
+/// today the only failure mode is "init() not called" (boot ordering
+/// regression). Mirrors `file_serve::internal_error` so a future
+/// refactor can collapse the two.
+fn internal_error(msg: &str) -> Vec<u8> {
+    let body = format!("{}\n", msg).into_bytes();
+    let mut out = Vec::with_capacity(96 + body.len());
+    push_status(&mut out, 500, "Internal Server Error");
+    push_header(&mut out, "Content-Type", "text/plain; charset=utf-8");
+    push_header(&mut out, "Content-Length", &format!("{}", body.len()));
+    push_header(&mut out, "Connection", "close");
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(&body);
+    out
+}
+
 fn push_status(out: &mut Vec<u8>, code: u16, reason: &str) {
     let line = format!("HTTP/1.1 {} {}\r\n", code, reason);
     out.extend_from_slice(line.as_bytes());
@@ -1012,6 +1035,13 @@ mod tests {
 
     #[test]
     fn try_serve_happy_path_201() {
+        // #451 made `try_serve` actually install the new state via
+        // `system::apply`, which requires `system::init()` to have
+        // run. Without it, apply errors and the route returns 500.
+        // Init the singleton once for the test process — the
+        // `spin::Once` guard makes repeated calls idempotent.
+        crate::system::init();
+
         let body = synth_multipart("BNDRY", "greet.txt", b"Hello", "dir-1");
         match try_serve(
             "POST", "/file",
@@ -1037,8 +1067,10 @@ mod tests {
         // The cell-push pipeline must produce all five File facts:
         // Name / MimeType / ContentRef / Size / is_in_Directory. We
         // assert each one by re-fetching the cell off the returned
-        // state — this is the state the SYSTEM mutator will install
-        // when it lands.
+        // state — and (post-#451) this is the state the SYSTEM
+        // mutator does install via `system::apply` on the real wire
+        // path. See `try_serve_round_trips_into_system` below for the
+        // upload-then-read assertion.
         let state = build_file_facts(
             Object::phi(),
             "file-upload-77",
@@ -1070,6 +1102,57 @@ mod tests {
         assert_eq!(
             ast::binding(&cref, "ContentRef"),
             Some("48656c6c6f"),
+        );
+    }
+
+    /// End-to-end shape assertion for #451's mutator: a successful
+    /// `try_serve` (POST /file) must install the new state into
+    /// SYSTEM such that a subsequent `system::with_state` lookup
+    /// finds the new File facts. This is the "uploads now persist"
+    /// claim made on the wire — without `system::apply`, the test
+    /// below would fail on `with_state` returning `None` for the
+    /// File_has_Name cell.
+    #[test]
+    fn try_serve_round_trips_into_system() {
+        crate::system::init();
+
+        // Snapshot the count of File_has_Name facts on the live
+        // SYSTEM before the upload, so we can assert the upload
+        // really did add one (rather than just observing leftover
+        // facts from a prior test).
+        let before = crate::system::with_state(|s| {
+            ast::fetch_or_phi("File_has_Name", s)
+                .as_seq()
+                .map(|v| v.len())
+                .unwrap_or(0)
+        })
+        .unwrap_or(0);
+
+        let body = synth_multipart("BNDRY", "round.txt", b"round-trip", "dir-xx");
+        match try_serve(
+            "POST", "/file",
+            Some("multipart/form-data; boundary=BNDRY"),
+            &body,
+            // `state` parameter is the *pre-state* the route layers
+            // facts on top of. Pass the live SYSTEM snapshot so the
+            // test mirrors what `net::drive_http` does in production.
+            crate::system::state(),
+        ) {
+            ServeOutcome::Response(_) => {}
+            _ => panic!("expected Response from happy-path upload"),
+        }
+
+        let after = crate::system::with_state(|s| {
+            ast::fetch_or_phi("File_has_Name", s)
+                .as_seq()
+                .map(|v| v.len())
+                .unwrap_or(0)
+        })
+        .expect("with_state returns Some after init");
+        assert_eq!(
+            after, before + 1,
+            "File_has_Name count should grow by 1 after upload (before={}, after={})",
+            before, after,
         );
     }
 }

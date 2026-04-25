@@ -74,7 +74,31 @@ pub enum ServeOutcome {
 ///
 /// `range_header` is the raw value of the `Range` request header
 /// (e.g. `Some("bytes=0-1023")`) — `None` when absent.
+///
+/// `state` is the baked SYSTEM snapshot. Today's caller in
+/// `net::drive_http` passes `system::state()` (the legacy
+/// `&'static Object` shim retained in #451 for net.rs back-compat);
+/// new callers should reach for the closure-form
+/// `system::with_state(|s| try_serve_with(..., s))` and route the
+/// snapshot in via the convenience wrapper below. Both paths share
+/// the same lookup body — see `try_serve_with`.
 pub fn try_serve(
+    method: &str,
+    path: &str,
+    range_header: Option<&str>,
+    state: Option<&Object>,
+) -> ServeOutcome {
+    try_serve_with(method, path, range_header, state)
+}
+
+/// Closure-form-friendly entry — identical body to `try_serve`,
+/// re-exposed so a caller that holds `state` inside a
+/// `system::with_state(|s| ...)` closure can call straight through
+/// without re-stashing the borrow. Added in #451 alongside the
+/// SYSTEM mutator; once `net.rs` migrates off the legacy
+/// `state()` shim, `try_serve` collapses into this body and the
+/// `state: Option<&Object>` parameter becomes the sole entry.
+pub fn try_serve_with(
     method: &str,
     path: &str,
     range_header: Option<&str>,
