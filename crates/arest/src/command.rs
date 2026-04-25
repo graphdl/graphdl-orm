@@ -1527,6 +1527,77 @@ pub fn select_component_json(state: &ast::Object, body: &str) -> String {
     serde_json::to_string(&results).unwrap_or_else(|_| "[]".to_string())
 }
 
+// =====================================================================
+// wine_prefix_for (#481) — convenience verb for the Wine App → prefix
+//                          Directory join
+// =====================================================================
+//
+// Per readings/compat/wine.md (#481), every Wine App owns a single
+// `Directory` cell as its prefix root via the 1:1 fact type
+// `Wine App has prefix Directory`. The runtime layer (#462c), the
+// `arest run "App Name"` CLI, and the future `arest backup` CLI all
+// need the same lookup: given a Wine App id, return its prefix
+// Directory id so they can route filesystem writes through it (or
+// hand it to `zip_directory(prefix_id)` from #404 for snapshotting).
+//
+// `wine_prefix_for` is the engine-side handler. It reads the
+// `Wine_App_has_prefix_Directory` cell and returns the matching
+// `prefix Directory` binding. Returns `None` when the Wine App does
+// not exist or has no prefix Directory bound (which can only happen
+// pre-derivation; the mandatory constraint declared in wine.md
+// guarantees the binding exists once the readings are compiled in).
+//
+// Read-only: no state mutation, no Platform fn calls.
+
+/// Look up the prefix Directory id for a Wine App.
+///
+/// Returns `None` when the Wine App is not in the population OR the
+/// `Wine App has prefix Directory` cell carries no binding for it.
+/// The latter is a constraint violation per wine.md's mandatory
+/// constraint and indicates either an un-compiled tenant or a
+/// hand-rolled state that bypassed the readings.
+///
+/// The cell key is `Wine_App_has_prefix_Directory` (the parser's
+/// `<subject>_has_<object>` munge of `Wine App has prefix Directory`).
+/// Within each fact the bindings are keyed by the underlying *noun*
+/// name (`Wine App` and `Directory`) rather than the full role
+/// reference (`prefix Directory`) — `instance_fact_field_cells` in
+/// `parse_forml2_stage2.rs` strips the leading adjective so any
+/// `belongs to` / `is in` / `has prefix` overlay collapses to the
+/// noun id at runtime. Hand-pushed cells from `cell_push` follow the
+/// same convention so the two sources stay binding-compatible.
+pub fn wine_prefix_for(state: &ast::Object, app_id: &str) -> Option<String> {
+    let cell = ast::fetch_or_phi("Wine_App_has_prefix_Directory", state);
+    cell.as_seq()?.iter().find_map(|fact| {
+        if ast::binding(fact, "Wine App") == Some(app_id) {
+            ast::binding(fact, "Directory").map(|s| s.to_string())
+        } else {
+            None
+        }
+    })
+}
+
+/// JSON wrapper for the system_impl intercept (follow-up wiring).
+/// Parses `{"appId": "..."}`, runs `wine_prefix_for`, returns the
+/// directory id as a JSON string on success or `"⊥"` on miss.
+pub fn wine_prefix_for_json(state: &ast::Object, body: &str) -> String {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Req {
+        #[serde(default)]
+        app_id: String,
+    }
+    let req: Req = match serde_json::from_str(body) {
+        Ok(r) => r,
+        Err(_) => return "⊥".to_string(),
+    };
+    match wine_prefix_for(state, &req.app_id) {
+        Some(dir_id) => serde_json::to_string(&dir_id)
+            .unwrap_or_else(|_| "⊥".to_string()),
+        None => "⊥".to_string(),
+    }
+}
+
 // -- Tests ------------------------------------------------------------
 
 #[cfg(test)]
@@ -2550,5 +2621,135 @@ Each Order is created by exactly one User.
         };
         let results = select_component(&state, "", &constraints);
         assert_eq!(results.len(), 2, "limit must clamp result set");
+    }
+
+    // ── wine_prefix_for (#481) ─────────────────────────────────────────
+
+    /// Build a minimal D containing one Wine App ↔ prefix Directory
+    /// binding, exercising the same fact-type id and binding-key
+    /// shape the readings produce. The cell key is
+    /// `Wine_App_has_prefix_Directory`; the binding role key for the
+    /// object is the bare `Directory` noun name (the parser strips the
+    /// leading `prefix` adjective in
+    /// `parse_forml2_stage2::instance_fact_field_cells`, so the
+    /// hand-pushed cell must mirror that or the lookup misses).
+    fn seeded_wine_prefix_state() -> ast::Object {
+        let d = ast::Object::phi();
+        let d = ast::cell_push(
+            "Wine_App_has_prefix_Directory",
+            ast::fact_from_pairs(&[
+                ("Wine App", "notepad-plus-plus"),
+                ("Directory", "notepad-plus-plus-prefix"),
+            ]),
+            &d,
+        );
+        ast::cell_push(
+            "Wine_App_has_prefix_Directory",
+            ast::fact_from_pairs(&[
+                ("Wine App", "photoshop-cs6"),
+                ("Directory", "photoshop-cs6-prefix"),
+            ]),
+            &d,
+        )
+    }
+
+    #[test]
+    fn wine_prefix_for_returns_directory_id_for_known_app() {
+        let state = seeded_wine_prefix_state();
+        assert_eq!(
+            wine_prefix_for(&state, "notepad-plus-plus").as_deref(),
+            Some("notepad-plus-plus-prefix")
+        );
+        assert_eq!(
+            wine_prefix_for(&state, "photoshop-cs6").as_deref(),
+            Some("photoshop-cs6-prefix")
+        );
+    }
+
+    #[test]
+    fn wine_prefix_for_returns_none_for_unknown_app() {
+        let state = seeded_wine_prefix_state();
+        assert!(wine_prefix_for(&state, "no-such-app").is_none());
+    }
+
+    #[test]
+    fn wine_prefix_for_returns_none_when_cell_missing() {
+        // Empty D — no Wine_App_has_prefix_Directory cell at all.
+        let state = ast::Object::phi();
+        assert!(wine_prefix_for(&state, "notepad-plus-plus").is_none());
+    }
+
+    #[test]
+    fn wine_prefix_for_json_round_trips() {
+        let state = seeded_wine_prefix_state();
+        let body = r#"{"appId": "photoshop-cs6"}"#;
+        let out = wine_prefix_for_json(&state, body);
+        assert_eq!(out, "\"photoshop-cs6-prefix\"",
+            "JSON output must be the prefix Directory id as a JSON string; got {out}");
+    }
+
+    #[test]
+    fn wine_prefix_for_json_returns_bottom_on_unknown_app() {
+        let state = seeded_wine_prefix_state();
+        let body = r#"{"appId": "no-such-app"}"#;
+        assert_eq!(wine_prefix_for_json(&state, body), "⊥");
+    }
+
+    #[test]
+    fn wine_prefix_for_json_returns_bottom_on_malformed_body() {
+        let state = seeded_wine_prefix_state();
+        assert_eq!(wine_prefix_for_json(&state, "not-json"), "⊥");
+    }
+
+    /// End-to-end: parse `readings/os/filesystem.md` (which declares
+    /// the `Directory` noun) followed by `readings/compat/wine.md`,
+    /// then confirm `wine_prefix_for` resolves the prefix Directory id
+    /// for every Wine App declared there. The two-file order matters:
+    /// `Directory` must be in scope before wine.md's
+    /// `Wine App has prefix Directory` fact type can resolve its
+    /// second role. This mirrors the load order
+    /// `metamodel_readings()` uses in production
+    /// (os-readings → compat-readings, see lib.rs).
+    ///
+    /// Gated on `compat-readings` so it only runs when the wine.md
+    /// slice is enabled (default-off).
+    #[cfg(feature = "compat-readings")]
+    #[test]
+    fn wine_prefix_for_resolves_every_seeded_wine_app() {
+        let filesystem_md = include_str!("../../../readings/os/filesystem.md");
+        let wine_md = include_str!("../../../readings/compat/wine.md");
+
+        let fs_state = crate::parse_forml2::parse_to_state(filesystem_md)
+            .expect("filesystem.md must parse cleanly");
+        let state = crate::parse_forml2::parse_to_state_from(wine_md, &fs_state)
+            .expect("wine.md must parse cleanly with filesystem.md preloaded");
+
+        // Every Wine App declared in the readings has its prefix
+        // Directory bound by an explicit instance fact:
+        //
+        //   Wine App '<slug>' has prefix Directory '<slug>-prefix'.
+        //
+        // `wine_prefix_for` must resolve each one to the matching
+        // `<slug>-prefix` Directory id.
+        let expected: &[(&str, &str)] = &[
+            ("notepad-plus-plus",  "notepad-plus-plus-prefix"),
+            ("office-2016-word",   "office-2016-word-prefix"),
+            ("photoshop-cs6",      "photoshop-cs6-prefix"),
+            ("autohotkey-v1",      "autohotkey-v1-prefix"),
+            ("notion-desktop",     "notion-desktop-prefix"),
+            ("total-commander",    "total-commander-prefix"),
+            ("vscode",             "vscode-prefix"),
+            ("spotify",            "spotify-prefix"),
+            ("steam-windows",      "steam-windows-prefix"),
+            ("7-zip",              "7-zip-prefix"),
+        ];
+        for (app_id, expected_dir_id) in expected {
+            assert_eq!(
+                wine_prefix_for(&state, app_id).as_deref(),
+                Some(*expected_dir_id),
+                "Wine App {app_id} must resolve to Directory {expected_dir_id} \
+                 via the Wine_App_has_prefix_Directory cell"
+            );
+        }
     }
 }
