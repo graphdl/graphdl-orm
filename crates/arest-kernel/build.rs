@@ -147,6 +147,58 @@ fn main() {
     let wad_out_path = out_dir.join("doom_wad.rs");
     fs::write(&wad_out_path, wad_out_src).expect("write doom_wad.rs");
 
+    // --- Slint UI watch (#436) ---------------------------------------
+    //
+    // The .slint files under `ui/` are compiled by the inline
+    // `slint::slint!{}` macro inside `arch::uefi::slint_backend`,
+    // not by `slint-build` from this build script. Rationale lives
+    // in the comment block above `slint::slint!{}`; the short
+    // version is that `slint-build` is gated to UEFI x86_64 in the
+    // `[target.cfg(...).build-dependencies]` table, but Cargo
+    // evaluates that cfg expression against the host triple
+    // (Windows / Linux), so `slint-build` is never actually a
+    // build-dep of this script — `use slint_build` would fail to
+    // resolve. Migrating to `slint-build` would require lifting the
+    // `[target.cfg(...)]` gate to an unconditional
+    // `[build-dependencies]` block in Cargo.toml, which is owned by
+    // Track II / #426 and out of scope for this commit.
+    //
+    // The block below emits `cargo:rerun-if-changed` for every
+    // .slint file + every vendored font / icon under `assets/` so
+    // that incremental builds re-expand `slint::slint!{}` when the
+    // proc-macro's input changes.
+    let ui_dir = manifest_dir.join("ui");
+    if ui_dir.is_dir() {
+        let mut slints: Vec<PathBuf> = Vec::new();
+        collect_slint(&ui_dir, &mut slints);
+        for p in &slints {
+            println!("cargo:rerun-if-changed={}", p.display());
+        }
+    }
+    // Watch the vendored fonts (#433) so a font swap re-triggers
+    // the Slint proc-macro on the next build (relevant once the
+    // .slint files import them via `import "...ttf";`).
+    let fonts_dir = manifest_dir.join("assets").join("fonts");
+    if fonts_dir.is_dir() {
+        for entry in fs::read_dir(&fonts_dir).into_iter().flatten().flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) == Some("ttf") {
+                println!("cargo:rerun-if-changed={}", p.display());
+            }
+        }
+    }
+    // Watch the Lucide SVGs (#434) — `@image-url` references in
+    // .slint files cause the compiler to embed the rasterised SVG.
+    let icons_dir = manifest_dir.join("assets").join("icons").join("lucide");
+    if icons_dir.is_dir() {
+        for entry in fs::read_dir(&icons_dir).into_iter().flatten().flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) == Some("svg") {
+                println!("cargo:rerun-if-changed={}", p.display());
+            }
+        }
+    }
+
     // Re-run whenever the bundle changes.
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed={}", dist.display());
@@ -158,6 +210,22 @@ fn main() {
     // non-existent path still triggers when the path later appears).
     println!("cargo:rerun-if-changed={}", doom_wasm.display());
     println!("cargo:rerun-if-changed={}", doom_wad.display());
+}
+
+/// Walk `dir` recursively and push every `.slint` file into `out`.
+fn collect_slint(dir: &Path, out: &mut Vec<PathBuf>) {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_slint(&path, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("slint") {
+            out.push(path);
+        }
+    }
 }
 
 /// Convert a filesystem path into a form accepted by rustc's
