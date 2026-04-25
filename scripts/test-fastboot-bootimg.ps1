@@ -262,7 +262,7 @@ if (-not $imagesList) {
     $ErrorActionPreference = "Continue"
     try {
         docker build -t $qemuImage `
-            -f "$repoRoot\crates\arest-kernel-image\Dockerfile.uefi-aarch64" `
+            -f "$repoRoot\crates\arest-kernel\Dockerfile.uefi-aarch64" `
             $repoRoot 2>&1 | Select-Object -Last 5 |
                 ForEach-Object { Add-Report ("  | " + $_) }
         $qemuBuildExit = $LASTEXITCODE

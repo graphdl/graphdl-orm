@@ -3,7 +3,6 @@ AREST is licensed under the GNU Affero General Public License v3.0 or later
 
   - `crates/arest`
   - `crates/arest-kernel`
-  - `crates/arest-kernel-image`
 
 The web-side glue under `apps/ui.do/` is licensed under the MIT License so
 applications built on top of AREST stay unencumbered. See

@@ -1,30 +1,32 @@
 # crates/arest-kernel/Cargo.toml
 #
-# x86_64 bare-metal kernel for AREST. Builds for the stable built-in
-# target `x86_64-unknown-none` (no std, no libc). Uses the rust-osdev
-# `bootloader` crate to wrap the kernel into a bootable disk image —
-# the bootloader handles Multiboot2 internally and hands the kernel a
-# populated `BootInfo` at entry time.
+# UEFI bare-metal kernel for AREST. Builds against firmware-provided
+# UEFI Boot Services on three targets:
+#   * `x86_64-unknown-uefi`   — laptops, OVMF / QEMU x86
+#   * `aarch64-unknown-uefi`  — Raspberry Pi 4, AAVMF / QEMU virt-arm
+#   * `arest-kernel-armv7-uefi.json` (custom spec)
+#                              — older 32-bit ARM, ArmVirtPkg
+#
+# UEFI is the only kernel target — the legacy BIOS path
+# (`x86_64-unknown-none` + the rust-osdev `bootloader` crate's
+# Multiboot2 stage) was deprecated in #380 once UEFI reached
+# full parity with the kernel surface (#344 series + #429/#430/#431
+# launcher landed). See `docs/16-uefi-pivot.md` for the rationale.
 #
 # Build:
-#   cargo build --release
+#   cargo +nightly build --release --target x86_64-unknown-uefi
 # Run:
-#   (follow-up commit — needs the bootloader image-builder task to
-#   produce an .img and a qemu-system-x86_64 launch script)
+#   .\scripts\boot-kernel-uefi.ps1            # interactive boot
+#   .\scripts\boot-kernel-uefi.ps1 -Smoke     # headless: assert banner
 
 [package]
 name = "arest-kernel"
 version = "0.1.0"
 edition = "2021"
-description = "AREST bare-metal kernel for x86_64"
+description = "AREST UEFI kernel"
 license = "AGPL-3.0-or-later"
 
 [features]
-# Enables the ring-3 smoke test boot path (Sec-6). When on, kernel_main
-# short-circuits the REPL + HTTP init and descends to a hand-rolled
-# ring-3 test payload that exercises the syscall gate, then halts via
-# QEMU isa-debug-exit. When off (default), behavior is unchanged.
-ring3-smoke = []
 # Enables the Doom launcher app + its WASM-backed game loop (#455 +
 # #456 Track VVV). Off by default because the baked
 # jacobenget/doom.wasm v0.1.0 binary is GPL-2.0 (per #396 license
@@ -46,36 +48,23 @@ test = false
 bench = false
 
 [dependencies]
-# Public ABI with the bootloader crate. Just the trait / entry_point
-# macro / BootInfo struct — no code that touches the host OS. Works
-# on x86_64-unknown-none without any feature gymnastics.
-bootloader_api = "0.11"
 # Spin-based Mutex so SERIAL (the global SerialPort singleton) can
 # be locked from any context including the panic handler. spin::Mutex
 # never blocks the way std::sync::Mutex would; fine on bare metal.
 spin = "0.9"
-# Global allocator for `alloc` (Box / Vec / String / format!). The
-# BIOS path (`allocator.rs`) uses `talc` — a modern slab-style
-# allocator that survives heavy realloc churn cleanly, where
+# Global allocator for `alloc` (Box / Vec / String / format!). Each
+# UEFI entry (`entry_uefi*.rs`) carries its own `#[global_allocator]`
+# wired against `boot::allocate_pages`-derived heaps. talc is a modern
+# slab-style allocator that survives heavy realloc churn cleanly, where
 # `linked_list_allocator-0.10`'s freelist trips a "Freed node aliases
 # existing hole" assertion under wasmi `Memory::grow` reallocs during
-# Doom's `Z_Init` (#440 / #376-post). Initialised from a fixed static
-# buffer in `allocator::init()` at boot. Once the bootloader memory
-# map handling lands (#180) this will switch to a dynamic region
-# picked from `BootInfo.memory_regions`.
+# Doom's `Z_Init` (#440 / #376-post).
 talc = "4.4"
-# Still pulled in for the UEFI x86_64 / aarch64 / armv7 entry harnesses
-# (`entry_uefi*.rs`), each of which carries its own `#[global_allocator]`
-# wired against `boot::allocate_pages`-derived heaps. Migrating those
-# to `talc` is tracked separately so the per-arch entry surface stays
-# under one owner per commit (CLAUDE.md staging discipline).
-linked_list_allocator = "0.10"
 # PS/2 keyboard decoder. Takes raw scancodes (set 1 by default on
 # QEMU) and emits typed `DecodedKey` events — lets us ignore every
 # detail of make/break codes and modifier tracking. Pure protocol
-# code — compiles on aarch64 too (kept here unconditionally so the
-# BIOS x86_64 arm and a future aarch64 PS/2-over-USB decoder can
-# share the same crate).
+# code — compiles on aarch64 too (the UEFI x86_64 keyboard handler
+# and a future aarch64 PS/2-over-USB decoder share the same crate).
 pc-keyboard = "0.7"
 # smoltcp — pure-Rust, no_std TCP/UDP/ICMP/DHCP/DNS stack (#261).
 # No C libs, no POSIX socket wrapper — just buffers, MAC/IP config,
@@ -100,10 +89,11 @@ smoltcp = { version = "0.12", default-features = false, features = [
 # the full virtio device family (net, blk, gpu, input, console).
 # Backs Redox, rCore, and Android's pKVM reference VMM. The crate
 # requires a `Hal` impl (DMA alloc + virt/phys translation), which
-# we provide via the bootloader's offset-mapped physical memory in
-# `src/virtio.rs`. A PCI transport walker lights up virtio-net at
-# boot once QEMU is launched with `-device virtio-net-pci,...`
-# (tracked under #267).
+# we provide via the firmware-mapped physical memory + DMA pool
+# carved from UEFI's GetMemoryMap (`src/virtio.rs` for x86_64
+# transport; `src/virtio_mmio.rs` for aarch64 / armv7 transport).
+# A PCI transport walker lights up virtio-net at boot once QEMU
+# is launched with `-device virtio-net-pci,...` (tracked under #267).
 virtio-drivers = "0.11"
 # AREST engine — linked in `no_std` mode (default-features off,
 # `no_std` feature on). Gives the kernel `ast::Object`, `ast::Func`,
@@ -124,15 +114,6 @@ arest = { path = "../arest", default-features = false, features = [
     "templates",
 ] }
 
-# wasmi — kept off the BIOS build. The crate compiles cleanly into
-# `x86_64-unknown-none` but making it REACHABLE from `kernel_main`
-# pulls in enough additional .text + relocations that the bootloader
-# 0.11 BIOS-stage loader silently triple-faults before any println!
-# runs. The fix is the UEFI path: UEFI firmware loads arbitrary
-# PE32+ images without the bootloader-stage frame-allocator budget
-# that the BIOS path operates under, so wasmi ships as a
-# UEFI-target-only dep (below, under the target-specific block).
-
 # Rust-osdev helpers for x86_64-specific structures — GDT, IDT, TSS,
 # page-table flags, privilege rings. Small, no-alloc, no-std. Only
 # pulls in the descriptor / interrupt plumbing; no scheduler or
@@ -143,13 +124,12 @@ arest = { path = "../arest", default-features = false, features = [
 # use sites don't trip on aarch64 UEFI builds.
 x86_64 = "0.15"
 
-# x86-arch-only crates (#344 cross-arch). These unconditionally
-# reach into x86 port I/O or the `x86_64` crate's `instructions`
-# module without gating, so the dep resolver refuses them on
-# aarch64 targets. Gating on `target_arch = "x86_64"` keeps them
-# available to both BIOS (x86_64-unknown-none) and UEFI x86_64
-# (x86_64-unknown-uefi) builds while excluding them from aarch64
-# builds entirely.
+# x86-arch-only crates. These unconditionally reach into x86 port
+# I/O or the `x86_64` crate's `instructions` module without gating,
+# so the dep resolver refuses them on aarch64 targets. Gating on
+# `target_arch = "x86_64"` keeps them available to the UEFI x86_64
+# build (`x86_64-unknown-uefi`) while excluding them from aarch64
+# / armv7 UEFI builds.
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 # 8250 / 16550 UART driver. Gives us a `SerialPort` struct with
 # `core::fmt::Write` implemented — that's what lets `write!` and
@@ -160,17 +140,20 @@ uart_16550 = "0.3"
 # Legacy 8259 PIC driver. Needed to route hardware IRQs (keyboard,
 # timer) to IDT vectors — without PIC remap, the firmware-default
 # IRQ 0-7 collide with CPU exception vectors 8-15 and a timer tick
-# would fire the same vector as #DF. Unconditionally imports
+# would fire the same vector as #DF. UEFI x86_64 firmware (OVMF)
+# leaves the legacy 8259 PIC physically present but fully masked;
+# `arch::uefi::interrupts` re-runs the standard ICW1..ICW4 init to
+# remap IRQs 0..15 from vectors 0x08..0x0F to 32..47, identical to
+# what the BIOS path used to do. Unconditionally imports
 # `x86_64::instructions::port::Port`, so truly x86-only.
 pic8259 = "0.11"
 
-# UEFI target (#344) — uefi-rs gives us an `#[entry]` macro, Boot
+# UEFI common deps — uefi-rs gives us an `#[entry]` macro, Boot
 # Services (serial, memory map, device discovery, framebuffer), and
-# a panic handler. Only compiled for `x86_64-unknown-uefi` /
-# `aarch64-unknown-uefi` builds; the BIOS path (`x86_64-unknown-none`)
-# keeps using `bootloader_api` unchanged. `panic_handler` + `logger`
-# features take the uefi-provided impls so we don't need an arch-
-# specific one for the scaffold.
+# a panic handler. Compiled for every UEFI target
+# (x86_64-unknown-uefi / aarch64-unknown-uefi / the armv7 spec).
+# `panic_handler` + `logger` features take the uefi-provided impls
+# so we don't need an arch-specific one for the scaffold.
 [target.'cfg(target_os = "uefi")'.dependencies]
 # Dropped `panic_handler` feature — uefi-rs's default panic handler
 # logs via `system_table.stderr()`, which is gone post-EBS. Our
@@ -179,24 +162,20 @@ pic8259 = "0.11"
 # without depending on BootServices.
 uefi = { version = "0.34", features = ["alloc", "logger"] }
 
-# x86_64-unknown-uefi specific deps (#344 cross-arch). wasmi was
-# added here as part of step 4d wave 5 (#270/#271) — the BIOS
-# bootloader can't load a kernel image the wasmi runtime-including
-# binary produces (verified via `5e8a15e` revert), and the aarch64
-# UEFI arm is scaffold-only this commit (no kernel_run yet, hence
-# no wasmi caller). `hash-collections` feature gives us
-# hashbrown-backed tables for wasm's type / function tables without
-# needing std. `no_std` default — we supply the `alloc` global.
+# x86_64-unknown-uefi specific deps (#344 cross-arch). wasmi powers
+# the Doom WASM host-shim (#270/#271/#376). `hash-collections` feature
+# gives us hashbrown-backed tables for wasm's type / function tables
+# without needing std. `no_std` default — we supply the `alloc` global.
+# Aarch64 / armv7 UEFI arms don't yet wire wasmi (no kernel_run handoff
+# on those arms reaches the doom path).
 [target.'cfg(all(target_os = "uefi", target_arch = "x86_64"))'.dependencies]
 wasmi = { version = "0.50", default-features = false, features = ["hash-collections"] }
 # Slint UI toolkit (#426) — picked over egui per the Track II
 # decision recorded in `docs/24-ui-toolkit-decision.md` (commit
-# `75f1022`). Same gating story as wasmi: only the UEFI x86_64
-# build wires Slint into a render path, and pulling Slint into the
-# BIOS (`x86_64-unknown-none`) image overflows the bootloader-stage
-# loader budget. Aarch64 UEFI is still scaffold (no framebuffer
-# backend yet), so it stays out of that arm too. The feature
-# selection follows Slint's own MCU/no_std recipe
+# `75f1022`). Only the UEFI x86_64 build wires Slint into a render
+# path; aarch64 UEFI is still scaffold (no framebuffer backend yet),
+# so it stays out of that arm too. The feature selection follows
+# Slint's own MCU/no_std recipe
 # (https://docs.rs/slint/latest/slint/docs/mcu/index.html):
 #   default-features = false   — drops every std-pulling backend
 #   compat-1-2                 — opt into the 1.2-stable API surface
@@ -239,9 +218,9 @@ slint = { version = "1.16", default-features = false, features = [
 # graph, which forced the inline `slint::slint!{}` proc-macro
 # workaround and blocked compile-time font baking. slint-build is a
 # host-side compiler crate; it does not link into the `.efi` image, so
-# the unconditional gate has no impact on BIOS / aarch64 / armv7
-# builds beyond pulling the slint compiler into their host build
-# graph (which is already resolved unconditionally for the runtime
+# the unconditional gate has no impact on aarch64 / armv7 builds
+# beyond pulling the slint compiler into their host build graph
+# (which is already resolved unconditionally for the runtime
 # `slint` crate's transitive deps anyway).
 [build-dependencies]
 slint-build = "1.16"

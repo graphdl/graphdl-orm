@@ -70,7 +70,7 @@ $prevEAP = $ErrorActionPreference
 $ErrorActionPreference = "Continue"
 try {
     docker build -t arest-kernel-uefi-armv7 `
-        -f "$repoRoot\crates\arest-kernel-image\Dockerfile.uefi-armv7" `
+        -f "$repoRoot\crates\arest-kernel\Dockerfile.uefi-armv7" `
         $repoRoot
 } finally {
     $ErrorActionPreference = $prevEAP

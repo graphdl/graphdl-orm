@@ -1,4 +1,4 @@
-# arest-kernel-image: Android boot.img wrapper (#390)
+# arest-kernel: Android boot.img wrapper (#390)
 
 Packages the aarch64-unknown-uefi build of `arest-kernel` into an
 Android boot image (`boot.img`) so it can eventually be flashed
@@ -110,8 +110,8 @@ won't brick the device because nothing is written to flash.
 
 This task (#390) owns:
 
-- `crates/arest-kernel-image/Dockerfile.boot-img` (new)
-- `crates/arest-kernel-image/boot-img-README.md` (this file, new)
+- `crates/arest-kernel/Dockerfile.boot-img` (new)
+- `crates/arest-kernel/boot-img-README.md` (this file, new)
 - `scripts/package-aarch64-boot-img.ps1` (new)
 
 It does **not** touch:

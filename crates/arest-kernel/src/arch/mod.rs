@@ -6,33 +6,24 @@
 // `arch::init_memory`, `arch::breakpoint`, `arch::halt_forever` — and
 // per-target submodules supply the implementations.
 //
-// Today three arms are wired:
+// Three UEFI arms are wired:
 //
-//   * `x86_64/`  — full kernel surface for the BIOS path (16550 UART,
-//                   GDT/TSS, IDT + 8259 PIC, OffsetPageTable, idle loop).
-//                   Active under `not(target_os = "uefi")`.
-//   * `uefi/`    — x86_64-specific UEFI arm (16550 UART, x86_64 port
-//                   I/O + CR0/CR4 control). Named `uefi` for historical
-//                   reasons — it's actually an x86_64 UEFI arm. Gated
-//                   on `all(target_os = "uefi", target_arch = "x86_64")`
-//                   rather than plain `target_os = "uefi"` so the
-//                   aarch64 arm below can compile independently.
-//   * `aarch64/` — aarch64 UEFI arm (PL011 MMIO at 0x0900_0000, `wfi`
-//                   idle loop). Scaffold-only today: `_print`,
-//                   `init_console`, `halt_forever`. Active under
+//   * `uefi/`    — x86_64 UEFI arm (16550 UART, GDT/TSS, IDT + 8259
+//                   PIC remap, x86_64 port I/O + CR0/CR4 control,
+//                   PIT timer, PS/2 keyboard, OffsetPageTable, slint
+//                   backend). Named `uefi` for historical reasons —
+//                   it's actually the x86_64 UEFI arm. Gated on
+//                   `all(target_os = "uefi", target_arch = "x86_64")`.
+//   * `aarch64/` — aarch64 UEFI arm (PL011 MMIO at 0x0900_0000, virtio-
+//                   mmio bring-up, `wfi` idle loop). Active under
 //                   `all(target_os = "uefi", target_arch = "aarch64")`.
-//                   See `aarch64/mod.rs` for the step-by-step surface
-//                   the x86_64 UEFI arm carries that this arm still
-//                   needs to grow.
+//   * `armv7/`   — armv7 UEFI arm (PL011 MMIO + virtio-mmio + MSVC ARM
+//                   CRT shims). Active under `all(target_os = "uefi",
+//                   target_arch = "arm")`.
 //
-// The `print!` / `println!` macros are declared here (not in either
-// arm) so the same macro definitions resolve on both targets — only
-// the `_print` callee is arch-specific.
-
-#[cfg(not(target_os = "uefi"))]
-pub mod x86_64;
-#[cfg(not(target_os = "uefi"))]
-pub use x86_64::*;
+// The `print!` / `println!` macros are declared here (not in any of
+// the arms) so the same macro definitions resolve on every target —
+// only the `_print` callee is arch-specific.
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 pub mod uefi;

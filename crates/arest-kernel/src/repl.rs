@@ -145,26 +145,14 @@ pub fn dispatch(line: &str) -> String {
         }
 
         "heap" => {
-            // linked_list_allocator::LockedHeap exposes .lock() -> Heap
-            // which has .size() (total) and .free() bytes. Only the BIOS
-            // path uses it; the UEFI arm rides uefi-rs's pool allocator,
-            // which doesn't expose comparable counters — report "n/a".
-            #[cfg(not(target_os = "uefi"))]
-            {
-                let heap = crate::allocator::ALLOCATOR.lock();
-                let total = heap.size();
-                let free  = heap.free();
-                let used  = total - free;
-                alloc::format!(
-                    "heap: {used} B used / {free} B free / {total} B total"
-                )
-            }
-            #[cfg(target_os = "uefi")]
-            {
-                alloc::format!(
-                    "heap: n/a (uefi-rs pool allocator — counters not exposed)"
-                )
-            }
+            // The UEFI arm's per-entry talc allocator (see
+            // `entry_uefi*.rs`'s `#[global_allocator]`) does not
+            // currently expose counters; report "n/a" until the
+            // entries grow a stats accessor matching the prior
+            // BIOS-path `KernelHeap::lock()` shape.
+            alloc::format!(
+                "heap: n/a (per-entry talc allocator — counters not exposed)"
+            )
         }
 
         _ => {
