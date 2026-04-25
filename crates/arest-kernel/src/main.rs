@@ -114,6 +114,21 @@ pub mod icons;
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 pub mod ui_apps;
 mod framebuffer;
+// `composer` (#489 Track LLLL). Foreign-toolkit texture compositor
+// — the runtime substrate Qt (GGGG #487) and GTK (IIII #488)
+// adapters plug into so their widgets render into ForeignSurface
+// pixel buffers and Slint composites them per frame as just-
+// another-Image source (same primitive VVV's #455 Doom uses to
+// push WASM-rendered frames at Slint). The trait surface
+// (`ToolkitRenderer`) is the integration seam the toolkit
+// adapters fill in once their loader.rs stops returning
+// LibraryNotFound (post-#460 + #461). Available unconditionally
+// — the abstraction has no toolkit-specific deps and the
+// `compositor-test` feature gates the only renderer included
+// in the foundation slice (a checkerboard `RustTestRenderer` for
+// end-to-end verification). pub so the future Qt/GTK adapters
+// and the launcher's super-loop can reach `compose_frame`.
+pub mod composer;
 mod http;
 // `pci` / `repl` reach `x86_64::instructions::port::Port` +
 // `x86_64::instructions::interrupts::disable` at module scope (see

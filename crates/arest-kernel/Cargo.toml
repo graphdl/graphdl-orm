@@ -90,6 +90,20 @@ qt-adapter = []
 # slice #460 was driver-mode focused), the stub keeps the module
 # compile-clean and the registration still emits the facts.
 gtk-adapter = []
+# compositor-test (#489 Track LLLL). Gates a `RustTestRenderer`
+# checkerboard generator inside `crate::composer` so the boot path
+# can register a `test` toolkit and prove the foreign-toolkit
+# composition runtime end-to-end without needing a real Qt or GTK
+# library to load. Default kernel builds elide the renderer
+# entirely; `--features compositor-test` brings it in. The renderer
+# is a few hundred bytes of pure Rust (no extra deps) so the gate
+# is purely about not shipping a debug surface to release builds.
+# The composer abstraction itself (ForeignSurface,
+# ToolkitRenderer trait, register_toolkit / create_surface /
+# compose_frame) is unconditionally compiled so the Qt (#487) and
+# GTK (#488) adapters can call into it once their loader.rs stops
+# returning LibraryNotFound.
+compositor-test = []
 default = []
 
 [[bin]]
