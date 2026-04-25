@@ -1,0 +1,88 @@
+// crates/arest-kernel/ui/components/Dialog.slint
+//
+// AREST kernel UI — modal Dialog overlay (#436).
+//
+// When `open` is true, paints `Theme.overlay` over the full host
+// size and a centred Card with `title`, free-form children, and a
+// confirm / cancel button row at the bottom.
+//
+// Closing is owner-controlled — the component emits `confirmed()`
+// or `cancelled()`; the owner toggles `open` in response.
+
+import { Theme } from "../theme.slint";
+import { Button, ButtonVariant } from "Button.slint";
+
+export component Dialog {
+    in property <bool> open: false;
+    in property <string> title;
+    in property <string> confirm-text: "OK";
+    in property <string> cancel-text: "Cancel";
+    in property <bool> confirm-danger: false;
+    callback confirmed();
+    callback cancelled();
+
+    visible: open;
+
+    // Backdrop — covers the host. Touching it cancels the dialog
+    // (matches the "click outside to dismiss" idiom).
+    Rectangle {
+        background: Theme.overlay;
+        TouchArea {
+            clicked => { root.cancelled(); }
+        }
+    }
+
+    // Centred panel. Sized to its content via the inner VerticalLayout's
+    // min sizes; min-width keeps narrow titles from collapsing.
+    Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: max(320px, self.preferred-width);
+        height: self.preferred-height;
+        background: Theme.surface;
+        border-color: Theme.border;
+        border-width: 1px;
+        border-radius: 8px;
+
+        // Eat clicks on the panel so the backdrop's TouchArea doesn't
+        // also fire when the user interacts with the dialog body.
+        TouchArea { }
+
+        VerticalLayout {
+            padding: Theme.spacing-lg;
+            spacing: Theme.spacing-md;
+
+            if root.title != "" : Text {
+                text: root.title;
+                color: Theme.text-primary;
+                font-family: Theme.type-h2.family;
+                font-weight: Theme.type-h2.weight;
+                font-size: Theme.type-h2.size;
+            }
+
+            // Caller-supplied body content.
+            VerticalLayout {
+                spacing: Theme.spacing-sm;
+                @children
+            }
+
+            // Action row.
+            HorizontalLayout {
+                spacing: Theme.spacing-sm;
+                alignment: end;
+                padding-top: Theme.spacing-sm;
+
+                Button {
+                    text: root.cancel-text;
+                    variant: ButtonVariant.secondary;
+                    clicked => { root.cancelled(); }
+                }
+                Button {
+                    text: root.confirm-text;
+                    variant: confirm-danger ? ButtonVariant.danger : ButtonVariant.primary;
+                    clicked => { root.confirmed(); }
+                }
+            }
+        }
+    }
+}

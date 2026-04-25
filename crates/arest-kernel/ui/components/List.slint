@@ -1,0 +1,67 @@
+// crates/arest-kernel/ui/components/List.slint
+//
+// AREST kernel UI — vertical List (#436).
+//
+// A scrollable vertical list of string items. Each row has a hover
+// highlight and emits `item-clicked(index, value)` on press. Used
+// by #429 (HATEOAS link list) and #430 (REPL history).
+//
+// More structured row content (icons, secondary text) is composed
+// by callers using Card / HorizontalLayout outside the list — the
+// List itself is intentionally narrow in scope so consumers can
+// pick a row template per use site.
+
+import { Theme } from "../theme.slint";
+
+export component ListItem {
+    in property <string> text;
+    in property <bool> selected: false;
+    callback clicked();
+
+    min-height: 32px;
+
+    Rectangle {
+        background: touch.has-hover ? Theme.neutral-200 :
+                    selected         ? Theme.neutral-200 : transparent;
+        border-radius: 4px;
+
+        animate background { duration: Theme.motion-fast; easing: ease-in-out; }
+
+        HorizontalLayout {
+            padding-left: Theme.spacing-md;
+            padding-right: Theme.spacing-md;
+            padding-top: Theme.spacing-xs;
+            padding-bottom: Theme.spacing-xs;
+
+            Text {
+                text: root.text;
+                color: Theme.text-primary;
+                font-family: Theme.type-body.family;
+                font-weight: Theme.type-body.weight;
+                font-size: Theme.type-body.size;
+                vertical-alignment: center;
+            }
+        }
+    }
+
+    touch := TouchArea {
+        clicked => { root.clicked(); }
+        mouse-cursor: MouseCursor.pointer;
+    }
+}
+
+export component List {
+    in property <[string]> items;
+    in property <int> selected-index: -1;
+    callback item-clicked(int /* index */, string /* value */);
+
+    VerticalLayout {
+        spacing: 0px;
+
+        for value[idx] in items : ListItem {
+            text: value;
+            selected: idx == root.selected-index;
+            clicked => { root.item-clicked(idx, value); }
+        }
+    }
+}

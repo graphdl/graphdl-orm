@@ -1,0 +1,37 @@
+// crates/arest-kernel/ui/components/Card.slint
+//
+// AREST kernel UI — Card (container) base component (#436).
+//
+// A surface-coloured rounded rectangle with a 1px border, padded
+// `Theme.spacing-md` on all sides. Children are stacked vertically
+// in the default slot; `title` shows above them in `Theme.type-h3`
+// when set.
+
+import { Theme } from "../theme.slint";
+
+export component Card {
+    in property <string> title;
+
+    background := Rectangle {
+        background: Theme.surface;
+        border-color: Theme.border;
+        border-width: 1px;
+        border-radius: 8px;
+
+        VerticalLayout {
+            padding: Theme.spacing-md;
+            spacing: Theme.spacing-sm;
+
+            if root.title != "" : Text {
+                text: root.title;
+                color: Theme.text-primary;
+                font-family: Theme.type-h3.family;
+                font-weight: Theme.type-h3.weight;
+                font-size: Theme.type-h3.size;
+            }
+
+            // Default slot — children of the Card go here.
+            @children
+        }
+    }
+}

@@ -1,0 +1,125 @@
+// crates/arest-kernel/ui/AppShell.slint
+//
+// AREST kernel UI — root composition shell (#436).
+//
+// Top bar (title + theme-toggle) + content slot + status footer.
+// Subsequent tracks compose into the `@children` slot:
+//
+//   #429 — HATEOAS browser
+//   #430 — REPL toolkit
+//   #431 — boot UI launcher
+//
+// All theming flows through the `Theme` global; switching dark/light
+// is a single `Theme.toggle-mode()` call wired to the top-bar button.
+
+import { Theme, ThemeMode } from "theme.slint";
+import { Button, ButtonVariant } from "components/Button.slint";
+
+export { Theme, ThemeMode }
+
+export component AppShell inherits Window {
+    // `title` is a built-in property of Window; redeclaring it as
+    // `in property <string>` would shadow the parent. Use a
+    // separate name for the AppShell display title.
+    in property <string> app-title: "AREST";
+    in property <string> status: "Ready";
+    callback theme-toggled();
+
+    background: Theme.surface;
+    default-font-family: Theme.type-body.family;
+    default-font-size: Theme.type-body.size;
+    preferred-width: 1024px;
+    preferred-height: 768px;
+
+    VerticalLayout {
+        spacing: 0px;
+
+        // ----- Top bar -------------------------------------------------
+        Rectangle {
+            background: Theme.neutral-100;
+            border-color: Theme.border;
+            border-width: 0px;
+            // Bottom border only — set via overlay rectangle so we don't
+            // get the box border on top/sides.
+            min-height: 56px;
+
+            HorizontalLayout {
+                padding-left: Theme.spacing-lg;
+                padding-right: Theme.spacing-lg;
+                padding-top: Theme.spacing-md;
+                padding-bottom: Theme.spacing-md;
+                spacing: Theme.spacing-md;
+                alignment: space-between;
+
+                Text {
+                    text: root.app-title;
+                    color: Theme.text-primary;
+                    font-family: Theme.type-h2.family;
+                    font-weight: Theme.type-h2.weight;
+                    font-size: Theme.type-h2.size;
+                    vertical-alignment: center;
+                }
+
+                Button {
+                    text: Theme.mode == ThemeMode.dark ? "Light" : "Dark";
+                    variant: ButtonVariant.ghost;
+                    clicked => {
+                        Theme.toggle-mode();
+                        root.theme-toggled();
+                    }
+                }
+            }
+
+            // 1px bottom border.
+            Rectangle {
+                y: parent.height - 1px;
+                height: 1px;
+                background: Theme.border;
+            }
+        }
+
+        // ----- Content slot --------------------------------------------
+        // Caller content goes here — vertical-fill so the user app can
+        // grow with the window size.
+        Rectangle {
+            background: Theme.surface;
+            vertical-stretch: 1;
+
+            VerticalLayout {
+                padding: Theme.spacing-lg;
+                spacing: Theme.spacing-md;
+
+                @children
+            }
+        }
+
+        // ----- Status footer -------------------------------------------
+        Rectangle {
+            background: Theme.neutral-100;
+            min-height: 28px;
+
+            // 1px top border.
+            Rectangle {
+                y: 0;
+                height: 1px;
+                background: Theme.border;
+            }
+
+            HorizontalLayout {
+                padding-left: Theme.spacing-lg;
+                padding-right: Theme.spacing-lg;
+                padding-top: Theme.spacing-xs;
+                padding-bottom: Theme.spacing-xs;
+
+                Text {
+                    text: root.status;
+                    color: Theme.text-muted;
+                    font-family: Theme.type-caption.family;
+                    font-weight: Theme.type-caption.weight;
+                    font-size: Theme.type-caption.size;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+}

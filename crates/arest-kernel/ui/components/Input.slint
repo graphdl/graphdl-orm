@@ -1,0 +1,80 @@
+// crates/arest-kernel/ui/components/Input.slint
+//
+// AREST kernel UI — Input (text field) base component (#436).
+//
+// Wraps Slint's built-in `TextInput` with the design system's
+// border / focus styling, an optional placeholder, and an optional
+// label rendered above the field.
+//
+// The focus border uses `Theme.accent`; the resting border uses
+// `Theme.border`. Transitions are `Theme.motion-fast`.
+
+import { Theme } from "../theme.slint";
+
+export component Input {
+    in-out property <string> text;
+    in property <string> placeholder;
+    in property <string> label;
+    in property <bool> read-only: false;
+    in property <bool> password: false;
+    callback edited(string);
+    callback accepted(string);
+
+    property <bool> focused: input.has-focus;
+    min-height: label != "" ? 60px : 36px;
+
+    VerticalLayout {
+        spacing: Theme.spacing-xs;
+
+        if label != "" : Text {
+            text: root.label;
+            color: Theme.text-muted;
+            font-family: Theme.type-label.family;
+            font-weight: Theme.type-label.weight;
+            font-size: Theme.type-label.size;
+        }
+
+        frame := Rectangle {
+            background: Theme.neutral-100;
+            border-color: focused ? Theme.accent : Theme.border;
+            border-width: 1px;
+            border-radius: 6px;
+            min-height: 36px;
+
+            animate border-color { duration: Theme.motion-fast; easing: ease-in-out; }
+
+            HorizontalLayout {
+                padding-left: Theme.spacing-md;
+                padding-right: Theme.spacing-md;
+                padding-top: Theme.spacing-sm;
+                padding-bottom: Theme.spacing-sm;
+
+                input := TextInput {
+                    text <=> root.text;
+                    color: Theme.text-primary;
+                    font-family: Theme.type-body.family;
+                    font-weight: Theme.type-body.weight;
+                    font-size: Theme.type-body.size;
+                    read-only: root.read-only;
+                    input-type: root.password ? InputType.password : InputType.text;
+                    single-line: true;
+                    edited => { root.edited(self.text); }
+                    accepted => { root.accepted(self.text); }
+                }
+            }
+
+            // Placeholder: only visible when the field is empty and
+            // not focused. Painted in `text-muted` underneath the
+            // TextInput (Z-order: input above, this below).
+            if root.text == "" && !focused : Text {
+                x: Theme.spacing-md;
+                y: (parent.height - self.preferred-height) / 2;
+                text: root.placeholder;
+                color: Theme.text-muted;
+                font-family: Theme.type-body.family;
+                font-weight: Theme.type-body.weight;
+                font-size: Theme.type-body.size;
+            }
+        }
+    }
+}

@@ -1,0 +1,171 @@
+// crates/arest-kernel/ui/theme.slint
+//
+// AREST kernel UI — Theme global (#436).
+//
+// Mirrors the FORML 2 instance facts in `readings/ui/design.md`
+// (Track YY, #432 commit c52e38f). Two themes (`dark`, `light`) ×
+// 17 ColorTokens, 7 SpacingTokens (4px grid), 5 MotionTokens
+// (durations + easings), and 10 TypographyScales.
+//
+// The dark theme is the design.md default (`Theme 'dark' is the
+// default Theme.`). Switching between themes flips a single
+// `mode` enum on the `Theme` global; every color out-property is
+// derived from `mode` so consumer components only need to read
+// `Theme.text-primary` etc. without knowing the active theme.
+//
+// Spacings, typography sizes and motion durations are theme-
+// invariant — same numbers in dark + light.
+//
+// This file is the single source of truth for the Slint surface;
+// no .slint component should hard-code colors / spacings.
+//
+// Font families: Inter (sans) for everything except `code`, which
+// uses JetBrains Mono. The TTF bytes are vendored under
+// `crates/arest-kernel/assets/fonts/` (Track JJJ, #433) and exposed
+// to Rust via `crate::fonts::INTER_REGULAR` / `JETBRAINS_MONO_REGULAR`.
+//
+// Font registration:
+//   * Slint v1.16's `register_font_from_memory` is std-only (it's
+//     gated by the `systemfonts` cargo feature, which would pull in
+//     `parley`/`fontique`/`std::fs` and is not in this crate's
+//     `slint = { features = [...] }` MCU recipe).
+//   * The compile-time alternative is `register_bitmap_font`, which
+//     consumes `BitmapFont` statics produced by the slint compiler's
+//     `EmbedForSoftwareRenderer` resource mode. That mode requires
+//     the `software-renderer` feature on `i-slint-compiler`, which
+//     only `slint-build` enables — `slint-macros` (the proc-macro
+//     crate behind the inline `slint!{}` macro) does NOT. Wiring
+//     `slint-build` into this kernel's build script requires moving
+//     the existing target-conditional `[target.cfg(...).build-
+//     dependencies]` declaration to an unconditional
+//     `[build-dependencies]` block (Cargo evaluates the build-dep
+//     cfg expression against the host triple, not the target — so
+//     the existing gating prevents slint-build from ever reaching
+//     the build script's dep graph). That move is a one-line
+//     Cargo.toml change owned by Track II / #426 — out of scope for
+//     this commit per the file ownership map.
+//   * Until the slint-build wiring lands, the .slint files below
+//     reference fonts by `family` name only and rely on Slint's
+//     default-font fallback at render time. Text rendering will
+//     panic with "No font fallback found" until #431 wires either
+//     the slint-build glyph-atlas pipeline or a runtime font
+//     registration callback.
+//   * AppShell construction (the smoke test in slint_backend.rs's
+//     `#[cfg(test)]`) does not touch text rendering, so the
+//     compile-time pipeline is sufficient to verify the design
+//     system end to end.
+
+// Theme mode toggle. Components flip this to switch palette.
+export enum ThemeMode { dark, light }
+
+// Typography role bundle — one struct per `TypographyScale` instance
+// in design.md. Spelled out with `font-family`, `font-weight`,
+// `font-size`, `line-height` so a consuming component can apply all
+// four in one assignment.
+export struct TypeStyle {
+    family: string,
+    weight: int,
+    size: length,
+    line-height: length,
+}
+
+export global Theme {
+    // ----- mode toggle ----------------------------------------------
+    // `dark` matches design.md's `Theme 'dark' is the default Theme.`
+    in-out property <ThemeMode> mode: ThemeMode.dark;
+
+    // ----- ColorTokens (17 × 2 themes) ------------------------------
+    // Each `*-color` out-property selects between the dark and light
+    // hex values from design.md based on `mode`.
+
+    // Neutrals (5)
+    out property <color> neutral-50:  mode == ThemeMode.dark ? #0A0A0B : #FFFFFF;
+    out property <color> neutral-100: mode == ThemeMode.dark ? #111114 : #FAFAFB;
+    out property <color> neutral-200: mode == ThemeMode.dark ? #1A1A1F : #F0F0F2;
+    out property <color> neutral-700: mode == ThemeMode.dark ? #A0A0AB : #52525B;
+    out property <color> neutral-900: mode == ThemeMode.dark ? #F5F5F7 : #0A0A0B;
+
+    // Surface + primary/secondary
+    out property <color> surface:     mode == ThemeMode.dark ? #111114 : #FFFFFF;
+    out property <color> primary:     mode == ThemeMode.dark ? #F5F5F7 : #0A0A0B;
+    out property <color> secondary:   mode == ThemeMode.dark ? #A0A0AB : #52525B;
+
+    // Text
+    out property <color> text-primary: mode == ThemeMode.dark ? #F5F5F7 : #0A0A0B;
+    out property <color> text-muted:   mode == ThemeMode.dark ? #A0A0AB : #52525B;
+
+    // Border + overlay
+    out property <color> border:  mode == ThemeMode.dark ? #26262C : #E4E4E7;
+    out property <color> overlay: mode == ThemeMode.dark ? #00000099 : #00000033;
+
+    // Accent — single accent per design.md "restrained palette discipline".
+    out property <color> accent: mode == ThemeMode.dark ? #7C5CFF : #5B3FE6;
+
+    // Semantic (4)
+    out property <color> success: mode == ThemeMode.dark ? #34D399 : #059669;
+    out property <color> warning: mode == ThemeMode.dark ? #F59E0B : #D97706;
+    out property <color> danger:  mode == ThemeMode.dark ? #EF4444 : #DC2626;
+    out property <color> info:    mode == ThemeMode.dark ? #38BDF8 : #0284C7;
+
+    // ----- SpacingTokens (7, 4px grid, theme-invariant) -------------
+    out property <length> spacing-xs:  4px;
+    out property <length> spacing-sm:  8px;
+    out property <length> spacing-md:  16px;
+    out property <length> spacing-lg:  24px;
+    out property <length> spacing-xl:  32px;
+    out property <length> spacing-2xl: 48px;
+    out property <length> spacing-3xl: 64px;
+
+    // ----- MotionTokens (5, durations only — easing constants below) -
+    // Slint's `animate` blocks accept `duration` and `easing` per
+    // property; consumers reference these via `Theme.motion-fast`
+    // etc.
+    out property <duration> motion-fast:       150ms;
+    out property <duration> motion-normal:     250ms;
+    out property <duration> motion-enter:      250ms;
+    out property <duration> motion-exit:       150ms;
+    out property <duration> motion-emphasized: 250ms;
+
+    // ----- TypographyScales (10, theme-invariant) -------------------
+    // Inter-backed scales. Family name strings match design.md's
+    // `FontFamily 'Inter'` / `FontFamily 'JetBrains Mono'` exactly so
+    // the slint compiler's font lookup hits the embedded glyph atlas
+    // generated from the imports at the top of this file.
+
+    out property <TypeStyle> type-display: {
+        family: "Inter", weight: 600, size: 36px, line-height: 44px,
+    };
+    out property <TypeStyle> type-h1: {
+        family: "Inter", weight: 600, size: 28px, line-height: 36px,
+    };
+    out property <TypeStyle> type-h2: {
+        family: "Inter", weight: 600, size: 22px, line-height: 28px,
+    };
+    out property <TypeStyle> type-h3: {
+        family: "Inter", weight: 500, size: 18px, line-height: 24px,
+    };
+    out property <TypeStyle> type-body: {
+        family: "Inter", weight: 400, size: 14px, line-height: 20px,
+    };
+    out property <TypeStyle> type-body-sm: {
+        family: "Inter", weight: 400, size: 13px, line-height: 20px,
+    };
+    out property <TypeStyle> type-caption: {
+        family: "Inter", weight: 400, size: 12px, line-height: 16px,
+    };
+    out property <TypeStyle> type-label: {
+        family: "Inter", weight: 500, size: 12px, line-height: 16px,
+    };
+    out property <TypeStyle> type-button: {
+        family: "Inter", weight: 500, size: 14px, line-height: 20px,
+    };
+    out property <TypeStyle> type-code: {
+        family: "JetBrains Mono", weight: 400, size: 13px, line-height: 20px,
+    };
+
+    // ----- Convenience callbacks for theme switching ----------------
+    callback toggle-mode();
+    toggle-mode => {
+        self.mode = self.mode == ThemeMode.dark ? ThemeMode.light : ThemeMode.dark;
+    }
+}

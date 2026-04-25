@@ -78,6 +78,58 @@ use slint::platform::{Platform, PlatformError, WindowAdapter};
 
 use crate::arch::time::now_ms;
 
+// Slint design system + base components (#436).
+//
+// Pulls Track YY's #432 design tokens + Track JJJ's #433 fonts +
+// #434 icons into the kernel UI by importing the .slint files
+// under `crates/arest-kernel/ui/` via the inline `slint::slint!`
+// macro.
+//
+// Why `slint!` (proc-macro) instead of `slint-build` (build-script):
+//   * Cargo evaluates `[target.'cfg(...)'.build-dependencies]` cfg
+//     expressions against the *host* triple, not the target — so
+//     the existing `slint-build = "1.16"` declaration in Cargo.toml
+//     gated to `cfg(all(target_os = "uefi", target_arch = "x86_64"))`
+//     never reaches this build script's dep graph (host is always
+//     Windows / Linux). `use slint_build` in `build.rs` would fail
+//     to resolve. Migrating to an unconditional `[build-dependencies]`
+//     block is a Cargo.toml edit owned by Track II / #426 and out
+//     of scope for this commit.
+//   * The proc-macro path doesn't need the build-script dep — it
+//     ships under the runtime `slint` crate, which IS available on
+//     the UEFI x86_64 target via the existing
+//     `[target.cfg(...).dependencies]` block.
+//
+// Font rendering caveat:
+//   * `slint!` routes through `slint-macros` → `i-slint-compiler`
+//     *without* the `software-renderer` feature. So we cannot use
+//     `EmbedForSoftwareRenderer` (which needs that feature to
+//     pre-rasterise glyph atlases into `BitmapFont` statics). The
+//     default mode (`EmbedAllResources`) embeds TTF bytes raw and
+//     emits `register_font_from_memory(...).unwrap()` calls in
+//     component init — but `register_font_from_memory` is std-only
+//     (gated by Slint's `systemfonts` feature, off in our MCU
+//     recipe), so the unwrap panics.
+//   * Therefore the .slint files below reference fonts by `family`
+//     name only and DO NOT `import "...ttf";` the vendored TTFs.
+//     Component construction succeeds; text rendering panics with
+//     "No font fallback found" until either (a) `slint-build` is
+//     wired and switches to `BitmapFont`, or (b) the runtime
+//     registers fonts via a different path. Both are tracked
+//     under #431 (UI bootstrap + main loop).
+//   * The smoke test in `#[cfg(test)] mod tests` only constructs
+//     `AppShell` — no rendering, no panic — which exercises the
+//     design-system pipeline end to end (parser, codegen, struct
+//     layout) without depending on the runtime font path.
+//
+// `#![include_path = "ui"]` makes file imports inside the macro
+// resolve relative to `<CARGO_MANIFEST_DIR>/ui/`.
+slint::slint! {
+    import { AppShell, Theme, ThemeMode } from "ui/AppShell.slint";
+
+    export { AppShell, Theme, ThemeMode }
+}
+
 /// GOP-side pixel layout. The kernel framebuffer is always 4 bytes
 /// per pixel under UEFI; the only thing that changes between mode
 /// variants is whether the byte order is `[R, G, B, _]` (RGBX, the
@@ -457,6 +509,39 @@ mod tests {
         });
         // BGRX layout: [B=0xCC, G=0xBB, R=0xAA, X=0]
         assert_eq!(&fb[0..4], &[0xCC, 0xBB, 0xAA, 0x00]);
+    }
+
+    /// AppShell construction smoke test (#436). Installs the
+    /// `UefiSlintPlatform` and constructs `AppShell` without
+    /// rendering — exercises the design-system .slint pipeline
+    /// (parser, codegen, struct layout) end to end without
+    /// depending on the runtime font path.
+    ///
+    /// No render call: the inline `slint!` macro's
+    /// `EmbedAllResources` mode would emit
+    /// `register_font_from_memory(...).unwrap()` calls if the
+    /// .slint files imported any TTF — see the rationale comment
+    /// above the `slint::slint!` block — and `register_font_from_memory`
+    /// is std-only in our MCU feature recipe, so it would panic.
+    /// The .slint files reference fonts by family name only, so
+    /// construction is panic-free; render-time text would still
+    /// panic until #431 wires the slint-build glyph-atlas pipeline
+    /// or a runtime font registration callback.
+    #[test]
+    fn appshell_constructs_under_minimal_window() {
+        // Slint refuses to instantiate a component before
+        // `set_platform` has run. `set_platform` returns Err on
+        // the second call, which is harmless if a previous test
+        // in the same binary already installed the platform.
+        let platform = UefiSlintPlatform::new(800, 600);
+        let _ = slint::platform::set_platform(alloc::boxed::Box::new(platform));
+
+        // Construct AppShell. If the slint compiler / codegen
+        // misfired (malformed .slint, missing import, type error),
+        // this would fail to compile or panic at construction.
+        let shell = super::AppShell::new().expect("AppShell::new failed");
+        shell.set_app_title("AREST".into());
+        shell.set_status("Ready".into());
     }
 
     #[test]
