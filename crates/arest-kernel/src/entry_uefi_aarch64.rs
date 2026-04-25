@@ -8,7 +8,7 @@
 // for SSE; aarch64 has NEON on by default under UEFI).
 //
 // Scope of THIS commit chain (#366 + #367 + #368 + #369):
-//   * Static-BSS `LockedHeap` heap (post-EBS-safe, parallels x86_64).
+//   * Static-BSS `Talck` heap (post-EBS-safe, parallels x86_64).
 //   * `efi_main`
 //       - Initialise the heap (before any `println!`).
 //       - Print pre-EBS banner via PL011.
@@ -31,20 +31,22 @@
 #![cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 
 use core::cell::UnsafeCell;
-use linked_list_allocator::LockedHeap;
+use talc::{ClaimOnOom, Span, Talc, Talck};
 use uefi::prelude::*;
 use uefi::boot::MemoryType;
 
 use crate::println;
 
-// Global allocator. Uses a static .bss-backed `LockedHeap` rather
-// than `uefi::allocator::Allocator` so the heap SURVIVES
-// ExitBootServices — uefi-rs's allocator is backed by
+// Global allocator. Uses a static .bss-backed `Talck<spin::Mutex<()>,
+// ClaimOnOom>` rather than `uefi::allocator::Allocator` so the heap
+// SURVIVES ExitBootServices — uefi-rs's allocator is backed by
 // `BootServices::allocate_pool`, which faults after EBS.
 //
-// Mirrors the x86_64-UEFI arm's pattern (`entry_uefi.rs`) byte-for-
-// byte: same crate, same size (16 MiB), same `static` + UnsafeCell
-// wrapping, same init-at-top-of-efi_main discipline.
+// Mirrors the x86_64-UEFI arm's pattern (`entry_uefi.rs`): same crate
+// (talc, swapped from linked_list_allocator under #440 / #443 to
+// survive wasmi `Memory::grow` realloc churn during Doom's `Z_Init`),
+// same UnsafeCell-wrapped static heap region, same init-at-top-of-
+// efi_main discipline.
 //
 // Size: 16 MiB. Generous for the aarch64 UEFI bring-up path — the
 // smoke is banner-only so the main alloc pressure is `format_args!`
@@ -64,14 +66,21 @@ unsafe impl Sync for HeapBytes {}
 
 static HEAP: HeapBytes = HeapBytes(UnsafeCell::new([0u8; HEAP_SIZE]));
 
+// `ClaimOnOom::empty()` starts the allocator with no backing region;
+// the explicit `claim(Span::from_base_size(...))` below in `efi_main`
+// attaches the static `HEAP` array once the kernel is running. Wrapped
+// in `Talck` (talc's `lock_api`-backed `GlobalAlloc` adapter) over a
+// `spin::Mutex<()>` — `spin` is already in the kernel's deps so this
+// picks up no new transitive.
 #[global_allocator]
-static ALLOCATOR: LockedHeap = LockedHeap::empty();
+static ALLOCATOR: Talck<spin::Mutex<()>, ClaimOnOom> =
+    Talc::new(unsafe { ClaimOnOom::new(Span::empty()) }).lock();
 
 /// UEFI entry point for the aarch64 target. `uefi-rs`'s `#[entry]`
 /// expands this into the PE32+ `_start` symbol the firmware invokes.
 ///
 /// Boot pipeline (#344 cross-arch, #366 memory bring-up):
-///   1. Heap init — static-BSS LockedHeap gets a fixed byte range.
+///   1. Heap init — static-BSS Talck gets a fixed byte range claimed.
 ///   2. Pre-EBS banner via `println!` → PL011 MMIO.
 ///   3. `boot::exit_boot_services` — firmware tears down. The
 ///      returned `MemoryMapOwned` is the snapshot we feed to
@@ -85,16 +94,20 @@ static ALLOCATOR: LockedHeap = LockedHeap::empty();
 #[entry]
 fn efi_main() -> Status {
     // Heap init MUST be the first thing — the global allocator is an
-    // empty LockedHeap; the first alloc call before init() would
-    // panic. Subsequent `println!` and any uefi-rs internal alloc
-    // work all route through this heap.
+    // empty Talck; the first alloc call before claim() would panic
+    // (ClaimOnOom would then trigger but with an empty span).
+    // Subsequent `println!` and any uefi-rs internal alloc work all
+    // route through this heap.
     //
     // SAFETY: HEAP is a static, zero-initialized byte array. No code
     // has run that could be holding a pointer into it yet — we're
     // literally the first line of efi_main.
     unsafe {
         let heap_start = HEAP.0.get() as *mut u8;
-        ALLOCATOR.lock().init(heap_start, HEAP_SIZE);
+        ALLOCATOR
+            .lock()
+            .claim(Span::from_base_size(heap_start, HEAP_SIZE))
+            .expect("heap claim");
     }
 
     crate::arch::init_console();
