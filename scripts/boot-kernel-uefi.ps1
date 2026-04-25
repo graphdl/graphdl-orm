@@ -123,7 +123,17 @@ if ($Smoke) {
             "gop-mmio: wrote 320x200, readback sum=0xffff8300",
             "fb:       paint smoke OK, presents=2",
             "doom-blit: synthetic 640x400 BGRA frame blitted",
-            "idt:      int3 round-tripped through UEFI IDT"
+            "idt:      int3 round-tripped through UEFI IDT",
+            # #379: PIT 1 kHz timer banner. The first phrase is printed
+            # immediately after `init_time()` returns; the second phrase
+            # confirms the IRQ 0 handler advanced `now_ms` between two
+            # snapshots ~10 ms apart. A regression in PIC remap, IRQ 0
+            # vector, or `sti` would surface here as a missing
+            # "now_ms advanced" line (the spin loop times out without
+            # observing motion) or, in the worst case, an absent
+            # banner entirely (triple-fault before the line writes).
+            "pit:      1 kHz timer online, IRQ 0",
+            "pit:      now_ms advanced t0="
         )
         $missing = @()
         foreach ($phrase in $expected) {

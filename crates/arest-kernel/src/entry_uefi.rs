@@ -309,9 +309,44 @@ fn kernel_run_uefi(
     // `boot::exit_boot_services`, so any CPU exception (a stray
     // `int3`, a #DF fired by a buggy MMIO write below) would
     // triple-fault the box silently if we did not stand one up.
-    // The IDT installs the breakpoint + double-fault gates only;
-    // hardware IRQs (PIT timer, PS/2 keyboard) are #344f scope.
+    // The IDT installs the breakpoint + double-fault gates plus
+    // (since #379) the IRQ 0..47 vectors so PIT-driven ticks land
+    // on `timer_handler` rather than an unpopulated slot once
+    // `sti` is on.
     crate::arch::init_interrupts();
+
+    // #379: bring the 1 kHz monotonic ms timer online. PIC remap +
+    // PIT divisor + `sti`. Must run AFTER init_interrupts so the
+    // IRQ 0 vector is populated before the first tick fires.
+    // Mirrors the BIOS arm's `init_pic` -> `time::init` chain that
+    // `init_gdt_and_interrupts` runs after `init_idt`.
+    crate::arch::init_time();
+    let pit_t0 = crate::arch::time::now_ms();
+    println!(
+        "  pit:      1 kHz timer online, IRQ 0 → vector 32 (now_ms={pit_t0})"
+    );
+
+    // Prove the counter actually advances by spinning ~10 ms and
+    // re-reading. The 8259 PIC fires IRQ 0 every ~1 ms once `sti`
+    // is on, so a busy loop long enough to cover several PIT
+    // periods MUST observe the counter move forward — if it
+    // doesn't, either the PIC unmask, the IRQ 0 vector, or the
+    // `sti` is broken. Spin against `now_ms()` itself rather than
+    // a cycle-count proxy so the loop terminates as soon as the
+    // counter actually advances; capped at a `pause`-loop budget
+    // so a never-ticking timer surfaces as a smoke-harness
+    // timeout (no banner advancement) rather than a hang here.
+    let pit_target = pit_t0.wrapping_add(10);
+    let mut spins: u64 = 0;
+    while crate::arch::time::now_ms() < pit_target && spins < 200_000_000 {
+        unsafe { core::arch::asm!("pause", options(nomem, nostack)); }
+        spins = spins.wrapping_add(1);
+    }
+    let pit_t1 = crate::arch::time::now_ms();
+    println!(
+        "  pit:      now_ms advanced t0={pit_t0} t1={pit_t1} (delta={})",
+        pit_t1.wrapping_sub(pit_t0),
+    );
 
     // Proves the page-table singleton is live post-EBS: going
     // through `memory::usable_frame_count()` forces a `FRAME_ALLOCATOR.lock()`
