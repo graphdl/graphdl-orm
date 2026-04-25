@@ -74,6 +74,7 @@
 //     emitted today; if a later kernel dep needs hardware FP, add a
 //     CPACR-write helper here parallel to `arch::uefi::enable_sse`.
 
+pub mod memory;
 mod msvc_shims;
 mod runtime_stub;
 mod serial;
@@ -97,6 +98,36 @@ pub use serial::{_print, raw_puts};
 /// once it drops its x86_64-only gates.
 pub fn init_console() {
     // Intentionally empty — see module docstring.
+}
+
+// Re-exports from the `memory` submodule so the `arch::armv7::<name>`
+// call sites line up with the aarch64 arm's shape (`arch::aarch64::
+// with_frame_allocator`, `arch::aarch64::with_dma_pool`, etc.). These
+// are additive — the scaffold's compile-only surface above stays as
+// it was before #387. `#[allow(unused_imports)]` because the runtime
+// harness that actually calls these (the future
+// `entry_uefi_armv7.rs`) hasn't landed yet; once it does, the gate
+// comes off and the shared kernel body resolves against the same
+// names on every arm.
+#[allow(unused_imports)]
+pub use memory::{usable_frame_count, with_dma_pool, with_frame_allocator};
+
+/// Initialise the memory subsystem from the UEFI-provided memory map.
+/// Consumes the `MemoryMapOwned` that `boot::exit_boot_services`
+/// returns, installs the frame-allocator + DMA-pool singletons, and
+/// returns the physical-memory offset (0 on UEFI — ArmVirtPkg
+/// identity-maps RAM under QEMU virt-armv7, so phys == virt).
+///
+/// Matches the shape of `arch::aarch64::init_memory(memory_map)` so
+/// the future armv7 entry can call `arch::init_memory(...)` with the
+/// same signature the other UEFI arms use — only the return type
+/// narrows (`u32` instead of `u64`) to reflect armv7's 32-bit
+/// pointer width. See `arch::armv7::memory::init` for details on
+/// what's divergent (no `OffsetPageTable`, no TTBR inspection —
+/// firmware tables stay live for the rest of boot).
+#[allow(dead_code)]
+pub fn init_memory(memory_map: uefi::mem::memory_map::MemoryMapOwned) -> u32 {
+    memory::init(memory_map)
 }
 
 /// Drive the kernel's idle loop. `wfi` (Wait For Interrupt) is the
