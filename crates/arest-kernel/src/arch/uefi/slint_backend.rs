@@ -78,57 +78,48 @@ use slint::platform::{Platform, PlatformError, WindowAdapter};
 
 use crate::arch::time::now_ms;
 
-// Slint design system + base components (#436).
+// Slint design system + base components (#436 / #452).
 //
-// Pulls Track YY's #432 design tokens + Track JJJ's #433 fonts +
-// #434 icons into the kernel UI by importing the .slint files
-// under `crates/arest-kernel/ui/` via the inline `slint::slint!`
-// macro.
+// Track MMM's #436 (commit `0b32b17`) wired Track YY's #432 design
+// tokens + Track JJJ's #433 fonts + #434 icons into `ui/AppShell.slint`
+// + 5 base components, but the `slint-build` dep was unreachable from
+// `build.rs` at the time (the cfg-gated `[target.cfg(...).build-
+// dependencies]` block in Cargo.toml never resolved against the host
+// triple). MMM worked around with the inline `slint::slint!{}` proc-
+// macro, which routes through `slint-macros` → `i-slint-compiler` and
+// crucially does NOT enable the compiler's `software-renderer` feature
+// — so `EmbedForSoftwareRenderer` (the only no_std-friendly font path
+// in slint v1.16) was inaccessible and text rendering would have
+// panicked at runtime with "No font fallback found".
 //
-// Why `slint!` (proc-macro) instead of `slint-build` (build-script):
-//   * Cargo evaluates `[target.'cfg(...)'.build-dependencies]` cfg
-//     expressions against the *host* triple, not the target — so
-//     the existing `slint-build = "1.16"` declaration in Cargo.toml
-//     gated to `cfg(all(target_os = "uefi", target_arch = "x86_64"))`
-//     never reaches this build script's dep graph (host is always
-//     Windows / Linux). `use slint_build` in `build.rs` would fail
-//     to resolve. Migrating to an unconditional `[build-dependencies]`
-//     block is a Cargo.toml edit owned by Track II / #426 and out
-//     of scope for this commit.
-//   * The proc-macro path doesn't need the build-script dep — it
-//     ships under the runtime `slint` crate, which IS available on
-//     the UEFI x86_64 target via the existing
-//     `[target.cfg(...).dependencies]` block.
+// Track QQQ #452 lifts the cfg gate (slint-build is now an
+// unconditional `[build-dependencies]` entry in Cargo.toml) and
+// replaces the proc-macro callsite with `slint::include_modules!()`.
+// The build script (`build.rs`) now invokes
+// `slint_build::compile_with_config("ui/AppShell.slint",
+// EmbedResourcesKind::EmbedForSoftwareRenderer)`, which:
+//   1. Compiles the `.slint` source tree to Rust under
+//      `$OUT_DIR/AppShell.rs`.
+//   2. Pre-rasterises a glyph atlas for every (character, size,
+//      weight) tuple referenced by the design system (Inter for the
+//      sans family, JetBrains Mono for `code`).
+//   3. Emits `Renderer::register_bitmap_font(&BITMAP_FONT_DATA)`
+//      calls into each component's init code so the bitmap fonts
+//      auto-register with the `SoftwareRenderer` Slint hands back via
+//      `WindowAdapter::renderer()` — no manual font wiring needed
+//      here. (`register_bitmap_font` is the only no_std font entry
+//      point on `i_slint_core::renderer::Renderer`;
+//      `register_font_from_memory` and `register_font_from_path` are
+//      both `#[cfg(feature = "std")]` / gated on `systemfonts`, which
+//      we deliberately do NOT enable on the MCU recipe.)
 //
-// Font rendering caveat:
-//   * `slint!` routes through `slint-macros` → `i-slint-compiler`
-//     *without* the `software-renderer` feature. So we cannot use
-//     `EmbedForSoftwareRenderer` (which needs that feature to
-//     pre-rasterise glyph atlases into `BitmapFont` statics). The
-//     default mode (`EmbedAllResources`) embeds TTF bytes raw and
-//     emits `register_font_from_memory(...).unwrap()` calls in
-//     component init — but `register_font_from_memory` is std-only
-//     (gated by Slint's `systemfonts` feature, off in our MCU
-//     recipe), so the unwrap panics.
-//   * Therefore the .slint files below reference fonts by `family`
-//     name only and DO NOT `import "...ttf";` the vendored TTFs.
-//     Component construction succeeds; text rendering panics with
-//     "No font fallback found" until either (a) `slint-build` is
-//     wired and switches to `BitmapFont`, or (b) the runtime
-//     registers fonts via a different path. Both are tracked
-//     under #431 (UI bootstrap + main loop).
-//   * The smoke test in `#[cfg(test)] mod tests` only constructs
-//     `AppShell` — no rendering, no panic — which exercises the
-//     design-system pipeline end to end (parser, codegen, struct
-//     layout) without depending on the runtime font path.
-//
-// `#![include_path = "ui"]` makes file imports inside the macro
-// resolve relative to `<CARGO_MANIFEST_DIR>/ui/`.
-slint::slint! {
-    import { AppShell, Theme, ThemeMode } from "ui/AppShell.slint";
-
-    export { AppShell, Theme, ThemeMode }
-}
+// `crate::fonts::INTER_REGULAR` / `JETBRAINS_MONO_REGULAR` (Track
+// JJJ #433) stay exposed as `pub static &[u8]` slices for any future
+// runtime path that needs raw TrueType bytes (e.g. shaping a glyph
+// set outside the Slint pipeline) but are not consumed by the
+// embedded-glyph path: the slint compiler bakes the glyph atlas at
+// host build time using `fontique`, not at runtime.
+slint::include_modules!();
 
 /// GOP-side pixel layout. The kernel framebuffer is always 4 bytes
 /// per pixel under UEFI; the only thing that changes between mode
@@ -511,22 +502,24 @@ mod tests {
         assert_eq!(&fb[0..4], &[0xCC, 0xBB, 0xAA, 0x00]);
     }
 
-    /// AppShell construction smoke test (#436). Installs the
-    /// `UefiSlintPlatform` and constructs `AppShell` without
-    /// rendering — exercises the design-system .slint pipeline
-    /// (parser, codegen, struct layout) end to end without
-    /// depending on the runtime font path.
+    /// AppShell construction smoke test (#436 / #452). Installs the
+    /// `UefiSlintPlatform` and constructs `AppShell` — exercises the
+    /// design-system .slint pipeline (parser, codegen, struct layout,
+    /// `register_bitmap_font` call sites emitted by
+    /// `EmbedForSoftwareRenderer`) end to end. With Track QQQ #452's
+    /// slint-build wiring in place, the auto-emitted
+    /// `Renderer::register_bitmap_font(&BITMAP_FONT_DATA)` calls in
+    /// `AppShell::new()`'s init body run against the
+    /// `MinimalSoftwareWindow` renderer the platform hands out — so
+    /// construction now exercises the no_std font path too, not just
+    /// the codegen surface.
     ///
-    /// No render call: the inline `slint!` macro's
-    /// `EmbedAllResources` mode would emit
-    /// `register_font_from_memory(...).unwrap()` calls if the
-    /// .slint files imported any TTF — see the rationale comment
-    /// above the `slint::slint!` block — and `register_font_from_memory`
-    /// is std-only in our MCU feature recipe, so it would panic.
-    /// The .slint files reference fonts by family name only, so
-    /// construction is panic-free; render-time text would still
-    /// panic until #431 wires the slint-build glyph-atlas pipeline
-    /// or a runtime font registration callback.
+    /// No render call here: rendering needs a backing framebuffer
+    /// (covered by the `process_line_*` tests above) and the bitmap-
+    /// font registration is the only piece this test exists to
+    /// guard. A future #431-wired smoke test under qemu UEFI will
+    /// drive `draw_if_needed` against `FramebufferBackend` to verify
+    /// glyphs land on screen.
     #[test]
     fn appshell_constructs_under_minimal_window() {
         // Slint refuses to instantiate a component before
@@ -537,7 +530,8 @@ mod tests {
         let _ = slint::platform::set_platform(alloc::boxed::Box::new(platform));
 
         // Construct AppShell. If the slint compiler / codegen
-        // misfired (malformed .slint, missing import, type error),
+        // misfired (malformed .slint, missing import, type error,
+        // or the embedded bitmap font wasn't registered correctly),
         // this would fail to compile or panic at construction.
         let shell = super::AppShell::new().expect("AppShell::new failed");
         shell.set_app_title("AREST".into());

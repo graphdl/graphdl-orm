@@ -147,37 +147,76 @@ fn main() {
     let wad_out_path = out_dir.join("doom_wad.rs");
     fs::write(&wad_out_path, wad_out_src).expect("write doom_wad.rs");
 
-    // --- Slint UI watch (#436) ---------------------------------------
+    // --- Slint UI compile (#436 / #452) ------------------------------
     //
-    // The .slint files under `ui/` are compiled by the inline
-    // `slint::slint!{}` macro inside `arch::uefi::slint_backend`,
-    // not by `slint-build` from this build script. Rationale lives
-    // in the comment block above `slint::slint!{}`; the short
-    // version is that `slint-build` is gated to UEFI x86_64 in the
-    // `[target.cfg(...).build-dependencies]` table, but Cargo
-    // evaluates that cfg expression against the host triple
-    // (Windows / Linux), so `slint-build` is never actually a
-    // build-dep of this script — `use slint_build` would fail to
-    // resolve. Migrating to `slint-build` would require lifting the
-    // `[target.cfg(...)]` gate to an unconditional
-    // `[build-dependencies]` block in Cargo.toml, which is owned by
-    // Track II / #426 and out of scope for this commit.
+    // Track QQQ #452 follow-up to MMM's #436 (commit `0b32b17`):
+    // `slint-build` is now an unconditional `[build-dependencies]`
+    // entry (see Cargo.toml), so the build script can finally invoke
+    // the slint compiler for real. That replaces MMM's
+    // `slint::slint!{}` proc-macro workaround in
+    // `arch/uefi/slint_backend.rs`, which couldn't reach
+    // `EmbedForSoftwareRenderer` (the proc-macro path doesn't enable
+    // the `software-renderer` feature on `i-slint-compiler`) and
+    // therefore couldn't bake bitmap fonts at compile time.
     //
-    // The block below emits `cargo:rerun-if-changed` for every
-    // .slint file + every vendored font / icon under `assets/` so
-    // that incremental builds re-expand `slint::slint!{}` when the
-    // proc-macro's input changes.
+    // Compile entry: `ui/AppShell.slint`. AppShell's transitive
+    // imports (theme.slint + every component under ui/components/)
+    // get pulled in by the slint compiler's import resolver; we don't
+    // need to enumerate them. slint-build emits one
+    // `cargo:rerun-if-changed=` line per .slint file it touches +
+    // one per font/image resource it embeds, so we don't need a
+    // separate watch loop for those either.
+    //
+    // `EmbedResourcesKind::EmbedForSoftwareRenderer` is the no_std-
+    // friendly font path: the compiler pre-rasterises glyph atlases
+    // (or SDF, behind the `sdf-fonts` feature) for every character +
+    // size + weight referenced by the design system, embeds them as
+    // `BitmapFont` statics, and emits
+    // `Renderer::register_bitmap_font(&BITMAP_FONT_DATA)` calls into
+    // each component's init code. `register_bitmap_font` is the only
+    // font registration entry point on `i_slint_core::renderer::Renderer`
+    // that does NOT require the `systemfonts` feature (which would
+    // pull in `parley`/`fontique`/`std::fs` and break `no_std`). The
+    // glyph data is selected by the host build's `fontique` against
+    // the family names declared in the .slint files (`Inter` and
+    // `JetBrains Mono` per Track YY / #432); when the host has those
+    // families installed (rsms/inter, JetBrains/JetBrainsMono OFL
+    // fonts vendored under `assets/fonts/`), the embedded atlases are
+    // a perfect match. When the host falls back to a system Sans-
+    // Serif, the design-system spelling stays correct but the
+    // rendered glyph shapes follow the host fallback — acceptable for
+    // the boot UI since the only on-screen text pre-#431 is the
+    // AppShell title bar + status footer (`AREST` / `Ready`).
+    //
+    // The vendored TTF bytes in `crate::fonts` (Track JJJ #433) stay
+    // exposed as `pub static &[u8]` slices for any future runtime path
+    // that needs raw font bytes (e.g. shaping a custom glyph set
+    // outside the Slint pipeline) — they are unused by the embedded-
+    // glyph path because `register_bitmap_font` consumes pre-
+    // rasterised data, not TrueType.
     let ui_dir = manifest_dir.join("ui");
     if ui_dir.is_dir() {
-        let mut slints: Vec<PathBuf> = Vec::new();
-        collect_slint(&ui_dir, &mut slints);
-        for p in &slints {
-            println!("cargo:rerun-if-changed={}", p.display());
+        let app_shell = ui_dir.join("AppShell.slint");
+        if app_shell.is_file() {
+            let config = slint_build::CompilerConfiguration::new()
+                .embed_resources(slint_build::EmbedResourcesKind::EmbedForSoftwareRenderer);
+            slint_build::compile_with_config("ui/AppShell.slint", config)
+                .expect("slint_build::compile_with_config(ui/AppShell.slint) failed");
+        } else {
+            println!(
+                "cargo:warning=ui/AppShell.slint not found at {} — skipping slint-build invocation",
+                app_shell.display(),
+            );
         }
     }
-    // Watch the vendored fonts (#433) so a font swap re-triggers
-    // the Slint proc-macro on the next build (relevant once the
-    // .slint files import them via `import "...ttf";`).
+    // Watch the vendored fonts (#433) directory. slint-build emits
+    // `rerun-if-changed` for each individual TTF it actually embeds
+    // (the host fontique matches against the family names in the
+    // .slint files); this loop adds the directory contents as a
+    // belt-and-braces measure so swapping a font file in place
+    // re-triggers the build even if the compiler's last invocation
+    // didn't see it (e.g. a future ttf added but not yet referenced
+    // by any .slint file).
     let fonts_dir = manifest_dir.join("assets").join("fonts");
     if fonts_dir.is_dir() {
         for entry in fs::read_dir(&fonts_dir).into_iter().flatten().flatten() {
@@ -210,22 +249,6 @@ fn main() {
     // non-existent path still triggers when the path later appears).
     println!("cargo:rerun-if-changed={}", doom_wasm.display());
     println!("cargo:rerun-if-changed={}", doom_wad.display());
-}
-
-/// Walk `dir` recursively and push every `.slint` file into `out`.
-fn collect_slint(dir: &Path, out: &mut Vec<PathBuf>) {
-    let entries = match fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_slint(&path, out);
-        } else if path.extension().and_then(|e| e.to_str()) == Some("slint") {
-            out.push(path);
-        }
-    }
 }
 
 /// Convert a filesystem path into a form accepted by rustc's
