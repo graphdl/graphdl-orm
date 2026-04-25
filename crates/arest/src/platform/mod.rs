@@ -25,3 +25,4 @@
 #![cfg(not(feature = "no_std"))]
 
 pub mod zip;
+pub mod mime;
