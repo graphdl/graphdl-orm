@@ -150,6 +150,18 @@ Dotnet Framework Version is a value type.
 Notice Text is a value type.
   <!-- Short human-readable string, the body of a Notice instance. -->
 
+Wine Prefix Path is a value type.
+  <!-- POSIX-shaped absolute path under the canonical
+       `/var/wine/` parent, e.g. `/var/wine/notepad-plus-plus/`. The
+       path is wholly derived from the Wine App's slug (= its `.Name`
+       reference mode) by the prefix-path derivation rule below; the
+       value type exists so the runtime layer (#462c) and the future
+       MCP `wine_prefix_for(app_id)` verb (#481) can hand the same
+       string out without each consumer re-deriving it. The trailing
+       slash is mandatory — every consumer of this value treats it as
+       a *directory* path so the slash keeps the join with relative
+       sub-paths (`drive_c/users/wineuser/...`) total. -->
+
 ## Fact Types
 
 ### Wine App
@@ -282,6 +294,33 @@ Wine App requires GPU Vendor.
        multiplicity: a single app can be compatible with several
        vendors so the host-probe can pick whichever is present. -->
 
+### Per-app prefix isolation (#481)
+
+Wine App has prefix Directory.
+  Each Wine App has exactly one prefix Directory.
+  Each Directory is the prefix Directory of at most one Wine App.
+  <!-- Cross-domain join: the second role binds to the `Directory`
+       entity declared in `readings/os/filesystem.md`. The 1:1
+       multiplicity (mandatory + uniqueness on the Wine App side,
+       uniqueness on the Directory side) makes the prefix Directory
+       co-extensional with its owning Wine App: dropping the App
+       leaves the Directory cell with no inbound `prefix Directory`
+       reference, and the runtime layer (#462c) reaps it as part of
+       the standard cell-eviction sweep. Backup is symmetric — the
+       existing `zip_directory(prefix_id)` Platform fn from #404
+       (see `crates/arest/src/platform/zip.rs`) walks exactly the
+       prefix subtree the join points at, so a per-app snapshot is a
+       single call once the prefix Directory id is known. -->
+
+Wine App has Wine Prefix Path.
+  Each Wine App has exactly one Wine Prefix Path.
+  No two Wine Apps share the same Wine Prefix Path.
+  <!-- Derived; see Derivation Rules below. The path is a pure
+       function of the Wine App's slug, so the uniqueness constraint
+       follows transitively from `No two Wine Apps share the same
+       Name`; restating it here makes the disjoint-prefix invariant
+       readable at the constraint surface. -->
+
 ## Constraints
 
 Each Wine App has exactly one Compat Rating.
@@ -298,10 +337,32 @@ Each Wine App, Registry Path combination occurs at most once in the
 Each Wine App, Env Var Name combination occurs at most once in the
   population of Wine App requires Environment Variable.
 
+Each Wine App has exactly one prefix Directory.
+Each Directory is the prefix Directory of at most one Wine App.
+Each Wine App has exactly one Wine Prefix Path.
+No two Wine Apps share the same prefix Directory.
+No two Wine Apps share the same Wine Prefix Path.
+
+No prefix Directory of a Wine App has another prefix Directory of a
+  Wine App as parent Directory.
+  <!-- Disjoint-subtree invariant. Two Wine Apps' prefixes share at
+       most the canonical `/var/wine/` parent Directory; no Wine App's
+       prefix is ever nested inside another Wine App's prefix. The
+       canonical parent itself is NOT a prefix Directory of any Wine
+       App (it is the shared root, declared as a single Directory
+       instance under "## Instance Facts" below), so the constraint
+       reduces to: prefix Directories of distinct Wine Apps are
+       sibling subtrees. The runtime layer relies on this when it
+       routes a per-app filesystem write — the route is always the
+       single prefix Directory id; cross-prefix collisions cannot
+       arise by construction. -->
+
 ## Deontic Constraints
 
 It is obligatory that each Wine App has some Compat Rating.
 It is obligatory that each Wine App has some Prefix Architecture.
+It is obligatory that each Wine App has some prefix Directory.
+It is obligatory that each Wine App has some Wine Prefix Path.
 
 ## Derivation Rules
 
@@ -482,6 +543,60 @@ It is obligatory that each Wine App has some Prefix Architecture.
        d3dcompiler family pin is the canonical Electron-on-Wine
        fingerprint; emit the standard advisory so users know to
        expect occasional GPU-process restarts. -->
+
+### Per-app prefix path derivation (#481)
+
+* Wine App has Wine Prefix Path (P) iff Wine App has Name (N)
+    and P is the concatenation of '/var/wine/' and N and '/'.
+  <!-- The prefix path is a pure function of the Wine App's slug
+       (which is its `.Name` reference mode value): each Wine App
+       lives at `/var/wine/<slug>/`. Mirrors the
+       `File has Size iff File has ContentRef and Size is the
+       byte-length of ContentRef.` shape from
+       `readings/os/filesystem.md`. The runtime layer (#462c) and the
+       MCP `wine_prefix_for(app_id)` verb (#481) read this derived
+       value rather than re-concatenating per call site, so any
+       future re-rooting (e.g. `/home/<user>/.local/share/wine/`)
+       is one rule edit. -->
+
+* Wine App has prefix Directory (D) iff Wine App has Name (N)
+    and Directory (D) has Name (N)
+    and Directory (D) has parent Directory 'wine-prefix-root'.
+  <!-- The prefix Directory is the unique Directory whose Name equals
+       the Wine App's slug AND whose parent is the canonical
+       `/var/wine/` root (declared as `Directory 'wine-prefix-root'`
+       under "## Instance Facts" below). Together with the
+       1:1 multiplicity declared in the fact-type section, this is
+       the join the runtime layer follows when it wants to write into
+       a per-app prefix: look up the Wine App, follow `prefix
+       Directory`, and route every File create / Directory mkdir
+       through the resulting Directory id. The two-clause antecedent
+       (Name match + canonical parent) is what enforces the
+       sibling-subtree invariant: any Directory cell that matches
+       both clauses is necessarily a child of `/var/wine/` and so
+       cannot also be a child of another Wine App's prefix. -->
+
+<!-- Uninstall cascade (#481): when a Wine App fact is removed (the
+     user runs `arest uninstall "App Name"`), its prefix Directory is
+     no longer the value of any Wine App's `prefix Directory` role —
+     the App was the unique inbound reference (1:1 multiplicity, see
+     "### Per-app prefix isolation (#481)" above). The runtime layer
+     reaps the orphaned prefix Directory (and, transitively, every
+     File and child Directory in its subtree) as part of the standard
+     cell-eviction sweep. The kernel's command pipeline already
+     cascades on `parent Directory` (see the ring-acyclic constraint
+     in `readings/os/filesystem.md`); the 1:1 fact type declared
+     above is what gives the eviction sweep something unambiguous to
+     follow at the Wine App layer.
+
+     This is *not* expressed as a `+`/`*` derivation rule: FORML 2
+     derivation rules are monotonic — they add facts, they do not
+     describe deletion. The cascade is a runtime policy whose pre-
+     condition (the Directory has no inbound `prefix Directory`
+     reference) is an algebraic consequence of the 1:1 constraint,
+     so no extra rule body is needed. The future `arest uninstall`
+     CLI executes a single `delete:Wine App` command and the
+     standard cascade handles the rest. -->
 
 ## Instance Facts
 
@@ -682,6 +797,78 @@ GPU Vendor 'intel-xe' has minimum GPU Driver Version 'xe'.
 Notice 'unsupported-current-wine' has Notice Text 'This app is rated `borked` on the current Wine version; `arest run` will refuse to launch unless --force is passed.'.
 
 Notice 'electron-gpu-process-quirks' has Notice Text 'Electron / Chromium app under Wine; expect occasional GPU-process crashes that the app auto-recovers from.'.
+
+### Per-app prefix Directory instances (#481)
+
+<!-- The canonical `/var/wine/` parent. Every Wine App's prefix
+     Directory hangs off this single shared root, which itself is
+     never the prefix Directory of any Wine App. The Name 'wine' +
+     parent path conventions match the FHS layout the runtime layer
+     materialises on first boot. The root has no parent Directory
+     fact — by the ring-acyclic constraint in
+     `readings/os/filesystem.md` it is therefore a top-level
+     Directory; the runtime probes `/var/` itself via the host OS
+     mount. -->
+
+Directory 'wine-prefix-root' has Name 'wine'.
+
+<!-- Per-Wine-App prefix Directory anchors. The Directory id is the
+     Wine App's slug + the literal `-prefix` suffix; the Directory's
+     Name role carries the slug verbatim so the prefix-Directory
+     derivation rule above (`Directory (D) has Name (N)`) joins
+     unambiguously. Every prefix Directory's parent is the canonical
+     'wine-prefix-root' declared just above. The slug → derived path
+     mapping is then:
+
+       'notepad-plus-plus'  → /var/wine/notepad-plus-plus/
+       'office-2016-word'   → /var/wine/office-2016-word/
+       'photoshop-cs6'      → /var/wine/photoshop-cs6/
+       … etc.
+
+     One block per Wine App declared above. New Wine Apps need to add
+     three lines here (Directory has Name, Directory has parent
+     Directory, Wine App has prefix Directory) — the rest of the
+     prefix machinery is derived. -->
+
+Directory 'notepad-plus-plus-prefix' has Name 'notepad-plus-plus'.
+Directory 'notepad-plus-plus-prefix' has parent Directory 'wine-prefix-root'.
+Wine App 'notepad-plus-plus' has prefix Directory 'notepad-plus-plus-prefix'.
+
+Directory 'office-2016-word-prefix' has Name 'office-2016-word'.
+Directory 'office-2016-word-prefix' has parent Directory 'wine-prefix-root'.
+Wine App 'office-2016-word' has prefix Directory 'office-2016-word-prefix'.
+
+Directory 'photoshop-cs6-prefix' has Name 'photoshop-cs6'.
+Directory 'photoshop-cs6-prefix' has parent Directory 'wine-prefix-root'.
+Wine App 'photoshop-cs6' has prefix Directory 'photoshop-cs6-prefix'.
+
+Directory 'autohotkey-v1-prefix' has Name 'autohotkey-v1'.
+Directory 'autohotkey-v1-prefix' has parent Directory 'wine-prefix-root'.
+Wine App 'autohotkey-v1' has prefix Directory 'autohotkey-v1-prefix'.
+
+Directory 'notion-desktop-prefix' has Name 'notion-desktop'.
+Directory 'notion-desktop-prefix' has parent Directory 'wine-prefix-root'.
+Wine App 'notion-desktop' has prefix Directory 'notion-desktop-prefix'.
+
+Directory 'total-commander-prefix' has Name 'total-commander'.
+Directory 'total-commander-prefix' has parent Directory 'wine-prefix-root'.
+Wine App 'total-commander' has prefix Directory 'total-commander-prefix'.
+
+Directory 'vscode-prefix' has Name 'vscode'.
+Directory 'vscode-prefix' has parent Directory 'wine-prefix-root'.
+Wine App 'vscode' has prefix Directory 'vscode-prefix'.
+
+Directory 'spotify-prefix' has Name 'spotify'.
+Directory 'spotify-prefix' has parent Directory 'wine-prefix-root'.
+Wine App 'spotify' has prefix Directory 'spotify-prefix'.
+
+Directory 'steam-windows-prefix' has Name 'steam-windows'.
+Directory 'steam-windows-prefix' has parent Directory 'wine-prefix-root'.
+Wine App 'steam-windows' has prefix Directory 'steam-windows-prefix'.
+
+Directory '7-zip-prefix' has Name '7-zip'.
+Directory '7-zip-prefix' has parent Directory 'wine-prefix-root'.
+Wine App '7-zip' has prefix Directory '7-zip-prefix'.
 
 ### Federated source: ProtonDB
 
