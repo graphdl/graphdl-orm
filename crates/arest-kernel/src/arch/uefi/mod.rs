@@ -57,10 +57,33 @@ pub mod interrupts;
 pub mod keyboard;
 pub mod memory;
 mod serial;
+// Slint software-renderer → GOP framebuffer adapter (#427). Adds the
+// `LineBufferProvider` impl + the `Platform` impl that Slint needs to
+// drive a render loop against the captured GOP framebuffer. Dead
+// code until #431 wires the entry / main-loop call sites — see
+// the module docstring for the integration shape.
+pub mod slint_backend;
+// Slint input adapter (#428): drains the post-decode keyboard ring
+// (`keyboard::read_keystroke`, populated by the IRQ 1 handler) and
+// dispatches each entry as a paired KeyPressed + KeyReleased
+// `WindowEvent` to a caller-supplied `slint::Window`. Pure / single-
+// pass; intended to be called once per frame from the eventual main
+// loop (#431). Dead code today — the public surface carries
+// `#[allow(dead_code)]` until the main-loop wiring lands.
+pub mod slint_input;
 pub mod time;
 
 pub use interrupts::{breakpoint, init_interrupts};
 pub use serial::{_print, switch_to_post_ebs_serial};
+// Re-export the public adapter types so the entry / main-loop wiring
+// in #431 can refer to them as `arch::FramebufferBackend` /
+// `arch::UefiSlintPlatform`, matching how `arch::breakpoint` etc.
+// reach through the per-arm `pub use`. `unused_imports` while the
+// re-exports have no callers — silenced until #431 lands the entry
+// wiring; mirrors the `#[allow(unused_imports)]` the aarch64 arm
+// carries on its serial re-export for the same reason.
+#[allow(unused_imports)]
+pub use slint_backend::{FramebufferBackend, FramebufferPixelOrder, UefiSlintPlatform};
 
 /// Initialise the architecture's console. Under UEFI the firmware has
 /// already configured ConOut before transferring control to our entry,
