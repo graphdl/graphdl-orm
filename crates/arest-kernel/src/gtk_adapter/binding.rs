@@ -490,6 +490,196 @@ fn log_resolved_pointers() -> (usize, usize) {
     (resolved, total)
 }
 
+// ── ComponentBinder impl (#491 Track PPPP) ───────────────────────────
+//
+// Concrete `ComponentBinder` for the GTK 4 toolkit. Sibling of
+// `qt_adapter::binding::QtBinder` — same shape, different reflection
+// system underneath: where Qt routes through `QObject::setProperty
+// (name, QVariant)` + `QObject::connect(sender, signal, ...)`, GTK
+// routes through `g_object_set_property(obj, name, GValue)` +
+// `g_signal_connect(obj, signal, callback)`. Marshalling differences
+// land in the marshalling.rs `set_property`/`connect_signal`
+// surface; this binder is a thin glue between PPPP's dispatch
+// surface and the GObject reflection.
+//
+// Foundation-slice behaviour: every `set_property` returns
+// `Err(MarshalError::Stub)` because libgtk-4 / libgobject-2.0 never
+// loaded; the binder swallows the error silently — same graceful-
+// degrade contract `qt_adapter::binding::QtBinder` follows.
+//
+// The GtkBinder maintains a per-handle map of (GTK class name, raw
+// GObject*) pairs because PPPP's `ToolkitHandle(u64)` is opaque to
+// the kernel — GTK needs both the GType (looked up via the class
+// name → widgets::resolved chain) AND the GObject pointer itself.
+
+use crate::component_binding::{
+    ComponentBinder, PropertyValue, SignalCallback, ToolkitHandle,
+};
+use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
+use core::ffi::c_void;
+use spin::Mutex;
+
+use super::marshalling::{self, ComponentValue, GObjectPtr};
+
+/// Per-handle metadata the GtkBinder needs to drive marshalling.
+/// Stored in `GTK_HANDLE_TABLE` keyed by the kernel-side
+/// `ToolkitHandle.0`. The GTK class name is the lookup key into
+/// `widgets::resolved` (which returns the GType pointer); the raw
+/// `GObject*` is the actual instance pointer the marshalling layer
+/// hands to `g_object_set_property` / `g_signal_connect`.
+#[derive(Clone)]
+struct GtkWidgetEntry {
+    /// GTK class name (e.g. `"GtkButton"`). Used to resolve the
+    /// GType pointer via `widgets::resolved` at marshalling time.
+    /// `&'static str` rather than owned String — the class names
+    /// live in static storage (one of `GTK_COMPONENT_DECLS::
+    /// gtk_class`), saves an allocation per handle.
+    class_name: &'static str,
+    /// Raw `GObject*` for the live widget instance.
+    ///
+    /// SAFETY: same caveat as `qt_adapter::binding::QtWidgetEntry`
+    /// — the binder treats the pointer as opaque on the kernel
+    /// side; the marshalling layer dereferences it via GObject's
+    /// reflection thunks. The adapter that calls `bind_widget` is
+    /// responsible for that contract.
+    ptr: WidgetPtrSendSync,
+}
+
+/// `Send + Sync` newtype around `*mut c_void` so the GtkWidgetEntry
+/// can live in a `BTreeMap` behind a `spin::Mutex`. Same pattern as
+/// `qt_adapter::binding::WidgetPtrSendSync` — kernel runs single-
+/// threaded; the unsafe impl satisfies the trait bound the static
+/// storage requires.
+#[derive(Clone, Copy)]
+struct WidgetPtrSendSync(*mut c_void);
+
+unsafe impl Send for WidgetPtrSendSync {}
+unsafe impl Sync for WidgetPtrSendSync {}
+
+/// Per-handle table mapping `ToolkitHandle.0` → `GtkWidgetEntry`.
+/// Sibling of `qt_adapter::binding::QT_HANDLE_TABLE`. Same lookup
+/// shape, separate storage so each adapter manages its own handle
+/// space without colliding.
+static GTK_HANDLE_TABLE: Mutex<BTreeMap<u64, GtkWidgetEntry>> =
+    Mutex::new(BTreeMap::new());
+
+/// GtkBinder — concrete `ComponentBinder` impl for the GTK 4
+/// toolkit. Stateless (the per-handle state lives in
+/// `GTK_HANDLE_TABLE`), so this is a unit struct. Built once per
+/// boot via `GtkBinder::install`, which also registers the binder
+/// against the `component_binding::BINDERS` map under the `"gtk4"`
+/// slug.
+pub struct GtkBinder;
+
+impl GtkBinder {
+    /// Build the GtkBinder + register it against
+    /// `component_binding::BINDERS` under the `"gtk4"` slug. Called
+    /// from `gtk_adapter::init` after `register_gtk_components` has
+    /// run (so the BINDERS map is populated before any
+    /// `register_component` call).
+    ///
+    /// Idempotent — `register_binder` replaces atomically at the
+    /// slug level.
+    pub fn install() {
+        crate::component_binding::register_binder("gtk4", Arc::new(GtkBinder));
+    }
+
+    /// Bind a GTK widget instance to a kernel-side ToolkitHandle.
+    /// Sibling of `qt_adapter::binding::QtBinder::bind_widget`.
+    ///
+    /// SAFETY: `ptr` must be a live GObject of class `class_name`
+    /// (one of `widgets::GTK_WIDGET_TABLE::class_name`). The binder
+    /// treats the pointer as opaque on the kernel side; the
+    /// marshalling layer dereferences it via GObject's reflection
+    /// thunks.
+    ///
+    /// Returns the allocated `ToolkitHandle`. The handle is
+    /// monotonic via `NEXT_GTK_HANDLE` and the class_name is
+    /// stored alongside the raw pointer in `GTK_HANDLE_TABLE`.
+    pub unsafe fn bind_widget(class_name: &'static str, ptr: GObjectPtr) -> ToolkitHandle {
+        let id = NEXT_GTK_HANDLE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let entry = GtkWidgetEntry {
+            class_name,
+            ptr: WidgetPtrSendSync(ptr),
+        };
+        GTK_HANDLE_TABLE.lock().insert(id, entry);
+        ToolkitHandle(id)
+    }
+
+    /// Convert PPPP's `PropertyValue` to gtk_adapter's
+    /// `ComponentValue`. When `qt-adapter` is also enabled, the
+    /// gtk_adapter::marshalling::ComponentValue is re-exported
+    /// from qt_adapter::marshalling so this is the same conversion
+    /// `qt_adapter::binding::QtBinder::to_qt_value` does. When
+    /// only `gtk-adapter` is enabled, gtk_adapter has its own
+    /// local ComponentValue with the same shape — same eight
+    /// variants per DDDD's #485 Property Type enumeration.
+    fn to_gtk_value(value: PropertyValue) -> ComponentValue {
+        match value {
+            PropertyValue::String(s) => ComponentValue::String(s),
+            PropertyValue::Int(v) => ComponentValue::Int(v),
+            PropertyValue::Bool(v) => ComponentValue::Bool(v),
+            PropertyValue::Enum(s) => ComponentValue::Enum(s),
+            PropertyValue::Color(s) => ComponentValue::Color(s),
+            PropertyValue::Length(v) => ComponentValue::Length(v),
+            PropertyValue::Image(s) => ComponentValue::Image(s),
+            PropertyValue::Callback => ComponentValue::Callback,
+        }
+    }
+}
+
+/// Monotonic ToolkitHandle counter, allocated by `bind_widget`.
+/// Starts at 1 so 0 stays available as a "no widget" sentinel.
+/// Separate from `qt_adapter::binding::NEXT_QT_HANDLE` so each
+/// adapter's handle space is independent — a Qt handle 7 and a GTK
+/// handle 7 are different widgets and the kernel never confuses
+/// them (the per-toolkit BINDERS lookup picks the right table).
+static NEXT_GTK_HANDLE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(1);
+
+impl ComponentBinder for GtkBinder {
+    /// Forward (cell → GTK widget): look up the GObject* + class
+    /// name in `GTK_HANDLE_TABLE`, convert PPPP's PropertyValue to
+    /// gtk_adapter's ComponentValue, and dispatch through
+    /// `marshalling::set_property` (which under the hood would
+    /// reach `g_object_set_property(obj, name, GValue)`).
+    ///
+    /// On the foundation slice the marshalling call returns
+    /// `Err(MarshalError::Stub)`; the binder swallows the error
+    /// silently — same graceful-degrade as the Qt sibling.
+    fn set_property(&self, handle: ToolkitHandle, name: &str, value: PropertyValue) {
+        let entry = match GTK_HANDLE_TABLE.lock().get(&handle.0).cloned() {
+            Some(e) => e,
+            None => return,
+        };
+        let gtk_value = Self::to_gtk_value(value);
+        let _ = marshalling::set_property(entry.ptr.0, entry.class_name, name, gtk_value);
+    }
+
+    /// Reverse (GTK signal → cell): wire the callback through
+    /// `marshalling::connect_signal` (which under the hood would
+    /// reach `g_signal_connect(obj, signal, callback, user_data)`).
+    /// The marshalling-layer callback type is `Box<dyn Fn() + Send
+    /// + Sync>` (no payload); we adapt by capturing the signal
+    /// name in the closure and passing an empty payload — full
+    /// payload marshalling lands when `connect_signal` grows a
+    /// payload-bearing variant (post-loader-extension work, same
+    /// constraint the Qt binder operates under).
+    fn install_signal(&self, handle: ToolkitHandle, signal: &str, callback: SignalCallback) {
+        let entry = match GTK_HANDLE_TABLE.lock().get(&handle.0).cloned() {
+            Some(e) => e,
+            None => return,
+        };
+        let signal_name = alloc::string::String::from(signal);
+        let trampoline: Box<dyn Fn() + Send + Sync> = Box::new(move || {
+            callback(&signal_name, "");
+        });
+        let _ = marshalling::connect_signal(entry.ptr.0, entry.class_name, signal, trampoline);
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]

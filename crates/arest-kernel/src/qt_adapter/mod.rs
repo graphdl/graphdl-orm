@@ -79,6 +79,13 @@ pub mod loader;
 pub mod marshalling;
 pub mod widgets;
 
+// Re-export the PPPP #491 ComponentBinder impl so call sites can
+// reach it via the conventional `qt_adapter::QtBinder` path
+// (mirrors the `qt_adapter::widgets::QT_WIDGET_TABLE` re-export
+// shape — mod-level re-export of the canonical binder type the
+// adapter contributes to the kernel's binding registry).
+pub use binding::QtBinder;
+
 /// One-shot boot-time initialiser. Brings up the qt_adapter slice in
 /// dependency order: load the libraries, resolve QMetaObject
 /// pointers, then push the Component / ImplementationBinding facts
@@ -116,4 +123,16 @@ pub fn init() {
     // reaches for) lives in the widgets table, keyed by the same
     // class name.
     let _ = binding::register_qt_components();
+
+    // Step 4 (#491 Track PPPP): register the ComponentBinder for
+    // the qt6 toolkit against `component_binding::BINDERS`. The
+    // binder wires `marshalling::set_property` /
+    // `marshalling::connect_signal` into the kernel-side
+    // dispatch path so AREST cell mutations propagate into Qt's
+    // setProperty + signal connections (or stub-no-op silently
+    // when the library hasn't loaded). Order: AFTER
+    // register_qt_components so the BINDERS map is populated
+    // before any future `qt_adapter::widgets::create` call wants
+    // to register a live component instance.
+    QtBinder::install();
 }

@@ -442,6 +442,209 @@ fn log_resolved_pointers() -> (usize, usize) {
     (resolved, total)
 }
 
+// ── ComponentBinder impl (#491 Track PPPP) ───────────────────────────
+//
+// Concrete `ComponentBinder` for the Qt 6 toolkit. Wraps the
+// `marshalling::set_property` / `marshalling::connect_signal` surface
+// so PPPP's #491 dispatcher can route AREST-cell mutations into the
+// resolved QMetaObject's setProperty + connect thunks.
+//
+// Foundation-slice behaviour: every `set_property` returns
+// `Err(MarshalError::Stub)` because the library never loaded; the
+// binder swallows the error silently — the cell write is still
+// authoritative at the SYSTEM level, the toolkit-side render just
+// stays at the previous pixel state until the loader extension
+// lands. Same graceful-degrade pattern the rest of qt_adapter
+// follows.
+//
+// The QtBinder maintains a per-handle map of (Qt class name, raw
+// QObject*) pairs because PPPP's `ToolkitHandle(u64)` is opaque to
+// the kernel — Qt needs both the QMetaObject (looked up via the
+// class name → widgets::resolved chain) AND the QObject pointer
+// itself. The class name lookup happens at register time
+// (`bind_widget`), the raw pointer is stored in a `BTreeMap<u64,
+// QtWidgetEntry>` keyed by `ToolkitHandle.0`.
+
+use crate::component_binding::{
+    ComponentBinder, PropertyValue, SignalCallback, ToolkitHandle,
+};
+use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
+use core::ffi::c_void;
+use spin::Mutex;
+
+use super::marshalling::{self, ComponentValue, QObjectPtr};
+
+/// Per-handle metadata the QtBinder needs to drive marshalling.
+/// Stored in `QT_HANDLE_TABLE` keyed by the kernel-side
+/// `ToolkitHandle.0`. The Qt class name is the lookup key into
+/// `widgets::resolved` (which returns the QMetaObject pointer);
+/// the raw `QObject*` is the actual instance pointer the
+/// marshalling layer hands to `setProperty` / `connect`.
+#[derive(Clone)]
+struct QtWidgetEntry {
+    /// Qt class name (e.g. `"QPushButton"`). Used to resolve the
+    /// QMetaObject pointer via `widgets::resolved` at marshalling
+    /// time. The class name lives in static storage (it's one of
+    /// `QT_COMPONENT_DECLS::qt_class`), so we store the
+    /// `&'static str` rather than an owned String — saves an
+    /// allocation per handle.
+    class_name: &'static str,
+    /// Raw `QObject*` for the live widget instance. `*mut c_void`
+    /// because `marshalling::QObjectPtr` is the same shape; we
+    /// pass it through unchanged.
+    ///
+    /// SAFETY: the binder treats the pointer as opaque — never
+    /// dereferenced on the kernel side. The marshalling layer
+    /// hands it to Qt's `setProperty` / `connect` thunks, which
+    /// require it to be a live QObject of the declared
+    /// `class_name`. The adapter that calls `bind_widget` is
+    /// responsible for that contract; `QObjectPtr` is wrapped in
+    /// `WidgetPtrSendSync` so the binder's `Arc<dyn>` storage
+    /// satisfies its `Send + Sync` bound.
+    ptr: WidgetPtrSendSync,
+}
+
+/// `Send + Sync` newtype around `*mut c_void` so the QtWidgetEntry
+/// can live in a `BTreeMap` behind a `spin::Mutex`. The kernel
+/// runs single-threaded; the unsafe impl just satisfies the trait
+/// bound the static storage requires.
+#[derive(Clone, Copy)]
+struct WidgetPtrSendSync(*mut c_void);
+
+unsafe impl Send for WidgetPtrSendSync {}
+unsafe impl Sync for WidgetPtrSendSync {}
+
+/// Per-handle table mapping `ToolkitHandle.0` → `QtWidgetEntry`.
+/// Populated by `bind_widget`; consulted by `QtBinder::set_property`
+/// + `QtBinder::install_signal` to recover the QMetaObject lookup
+/// key + the raw QObject pointer.
+///
+/// `BTreeMap` (not `HashMap`) for the same reason
+/// `component_binding::REGISTERED` is — arest-kernel doesn't link
+/// hashbrown; O(log n) over n ≤ 100 is negligible.
+static QT_HANDLE_TABLE: Mutex<BTreeMap<u64, QtWidgetEntry>> =
+    Mutex::new(BTreeMap::new());
+
+/// QtBinder — concrete `ComponentBinder` impl for the Qt 6 toolkit.
+/// Stateless (the per-handle state lives in `QT_HANDLE_TABLE`), so
+/// this is a unit struct. Built once per boot via `QtBinder::install`,
+/// which also registers the binder against the
+/// `component_binding::BINDERS` map under the `"qt6"` slug.
+pub struct QtBinder;
+
+impl QtBinder {
+    /// Build the QtBinder + register it against
+    /// `component_binding::BINDERS` under the `"qt6"` slug. Called
+    /// from `qt_adapter::init` after `register_qt_components` has
+    /// run (so the BINDERS map is populated before any
+    /// `register_component` call).
+    ///
+    /// Idempotent — `register_binder` replaces atomically at the
+    /// slug level.
+    pub fn install() {
+        crate::component_binding::register_binder("qt6", Arc::new(QtBinder));
+    }
+
+    /// Bind a Qt widget instance to a kernel-side ToolkitHandle.
+    /// Called by adapter code that has just instantiated a Qt
+    /// widget (e.g. via the future `qt_adapter::widgets::create`
+    /// surface, which doesn't exist on the foundation slice).
+    ///
+    /// SAFETY: `ptr` must be a live QObject of class `class_name`
+    /// (one of `widgets::QT_WIDGET_TABLE::class_name`). The binder
+    /// treats the pointer as opaque on the kernel side; the
+    /// marshalling layer dereferences it via Qt's reflection thunks.
+    ///
+    /// Returns the allocated `ToolkitHandle`. The handle is
+    /// monotonic via `NEXT_QT_HANDLE` and the class_name is stored
+    /// alongside the raw pointer in `QT_HANDLE_TABLE`.
+    pub unsafe fn bind_widget(class_name: &'static str, ptr: QObjectPtr) -> ToolkitHandle {
+        let id = NEXT_QT_HANDLE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let entry = QtWidgetEntry {
+            class_name,
+            ptr: WidgetPtrSendSync(ptr),
+        };
+        QT_HANDLE_TABLE.lock().insert(id, entry);
+        ToolkitHandle(id)
+    }
+
+    /// Convert PPPP's `PropertyValue` to qt_adapter's
+    /// `ComponentValue` — they're shape-compatible (both mirror
+    /// DDDD's #485 Property Type enumeration), but they're
+    /// distinct types so the binder needs an explicit
+    /// pattern-match conversion at the dispatch boundary.
+    fn to_qt_value(value: PropertyValue) -> ComponentValue {
+        match value {
+            PropertyValue::String(s) => ComponentValue::String(s),
+            PropertyValue::Int(v) => ComponentValue::Int(v),
+            PropertyValue::Bool(v) => ComponentValue::Bool(v),
+            PropertyValue::Enum(s) => ComponentValue::Enum(s),
+            PropertyValue::Color(s) => ComponentValue::Color(s),
+            PropertyValue::Length(v) => ComponentValue::Length(v),
+            PropertyValue::Image(s) => ComponentValue::Image(s),
+            PropertyValue::Callback => ComponentValue::Callback,
+        }
+    }
+}
+
+/// Monotonic ToolkitHandle counter, allocated by `bind_widget`.
+/// Starts at 1 so 0 stays available as a "no widget" sentinel.
+/// 64-bit chosen for headroom — at one widget per frame at 60Hz
+/// the counter takes ~10 billion years to wrap.
+static NEXT_QT_HANDLE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(1);
+
+impl ComponentBinder for QtBinder {
+    /// Forward (cell → Qt widget): look up the QObject* + class
+    /// name in `QT_HANDLE_TABLE`, convert PPPP's PropertyValue to
+    /// qt_adapter's ComponentValue, and dispatch through
+    /// `marshalling::set_property`.
+    ///
+    /// On the foundation slice the marshalling call returns
+    /// `Err(MarshalError::Stub)` because no Qt library loaded;
+    /// the binder swallows the error silently — the cell write
+    /// is still authoritative.
+    fn set_property(&self, handle: ToolkitHandle, name: &str, value: PropertyValue) {
+        let entry = match QT_HANDLE_TABLE.lock().get(&handle.0).cloned() {
+            Some(e) => e,
+            None => return, // unknown handle → no-op, same as a missing Component
+        };
+        let qt_value = Self::to_qt_value(value);
+        // Discard the Result — Stub / TypeMismatch / UnknownProperty
+        // all leave the cell write authoritative; the toolkit side
+        // catches up when the library loads.
+        let _ = marshalling::set_property(entry.ptr.0, entry.class_name, name, qt_value);
+    }
+
+    /// Reverse (Qt widget signal → cell): wire the callback through
+    /// `marshalling::connect_signal`. The marshalling layer's
+    /// callback type is `Box<dyn Fn() + Send + Sync>` (no payload);
+    /// the PPPP-side `SignalCallback` carries (name, payload) for
+    /// payload-bearing signals. We adapt by capturing the signal
+    /// name in the closure and passing an empty payload — full
+    /// payload marshalling lands when `connect_signal` grows a
+    /// payload-bearing variant (post-loader-extension work).
+    fn install_signal(&self, handle: ToolkitHandle, signal: &str, callback: SignalCallback) {
+        let entry = match QT_HANDLE_TABLE.lock().get(&handle.0).cloned() {
+            Some(e) => e,
+            None => return,
+        };
+        let signal_name = alloc::string::String::from(signal);
+        let trampoline: Box<dyn Fn() + Send + Sync> = Box::new(move || {
+            // Empty payload — the marshalling-layer connect
+            // signature doesn't carry a payload yet (post-loader
+            // work). Adapters that need payload should wrap
+            // their own connect path with explicit
+            // QObject::connect lambdas that close over the
+            // payload value before re-entering AREST.
+            callback(&signal_name, "");
+        });
+        let _ = marshalling::connect_signal(entry.ptr.0, entry.class_name, signal, trampoline);
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]

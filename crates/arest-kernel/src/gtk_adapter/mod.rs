@@ -115,6 +115,11 @@ pub mod loader;
 pub mod marshalling;
 pub mod widgets;
 
+// Re-export the PPPP #491 ComponentBinder impl so call sites can
+// reach it via the conventional `gtk_adapter::GtkBinder` path —
+// mirrors `qt_adapter::QtBinder` re-export shape.
+pub use binding::GtkBinder;
+
 /// One-shot boot-time initialiser. Brings up the gtk_adapter slice in
 /// dependency order: load the libraries, resolve GType pointers,
 /// then push the Component / ImplementationBinding facts into SYSTEM.
@@ -150,4 +155,17 @@ pub fn init() {
     // resolved GType pointer (which is what marshalling.rs reaches
     // for) lives in the widgets table, keyed by the same class name.
     let _ = binding::register_gtk_components();
+
+    // Step 4 (#491 Track PPPP): register the ComponentBinder for
+    // the gtk4 toolkit against `component_binding::BINDERS`. The
+    // binder wires `marshalling::set_property` /
+    // `marshalling::connect_signal` into the kernel-side dispatch
+    // path so AREST cell mutations propagate into GTK's
+    // g_object_set_property + g_signal_connect calls (or stub-no-
+    // op silently when the libgtk-4 / libgobject-2.0 libraries
+    // haven't loaded). Order: AFTER register_gtk_components so the
+    // BINDERS map is populated before any future
+    // `gtk_adapter::widgets::create` call wants to register a live
+    // component instance. Mirrors the Step 4 in qt_adapter::init.
+    GtkBinder::install();
 }

@@ -129,6 +129,23 @@ mod framebuffer;
 // end-to-end verification). pub so the future Qt/GTK adapters
 // and the launcher's super-loop can reach `compose_frame`.
 pub mod composer;
+// `component_binding` (#491 Track PPPP). Property + signal binding —
+// the third leg of the foreign-toolkit Component runtime trifecta.
+// Sibling of LLLL's #489 `composer` (texture compositing) and MMMM's
+// #490 `toolkit_loop` (event-loop multiplexing). Where the composer
+// owns the per-frame pixel round-trip and the toolkit_loop owns
+// event-loop coordination, this module owns the *data* round-trip:
+// AREST-cell mutations push into toolkit widget properties via the
+// per-toolkit `ComponentBinder` impl (qt_adapter::binding::QtBinder /
+// gtk_adapter::binding::GtkBinder / future Slint + Web binders), and
+// toolkit-side signals flow back as `system::apply` mutations on
+// `ComponentInstance_emitted_Event`. Per-Component handle map keyed
+// by `<role>.<toolkit>` slug enforces O(log n) dispatch per change
+// rather than O(n * cells) re-scan. Available unconditionally — the
+// abstraction has no toolkit-specific deps; binder impls (QtBinder,
+// GtkBinder) are gated by their respective adapter features and
+// register against this module's `BINDERS` map at adapter init.
+pub mod component_binding;
 // `toolkit_loop` (#490 Track MMMM). Event-loop side of the foreign-
 // toolkit Component runtime — sibling of LLLL's #489 `composer`.
 // Where the composer owns the texture round-trip (Qt/GTK render into
