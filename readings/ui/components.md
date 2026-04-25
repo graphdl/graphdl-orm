@@ -347,6 +347,212 @@ It is obligatory that each Toolkit has some Toolkit Version.
        implementation. The follow-up adapter slices (#486-#488,
        #494) close gaps surfaced this way. -->
 
+### Pointer-interaction preference
+
++ ImplementationBinding is preferred for MonoView
+    if MonoView has default Interaction Mode 'pointer'
+    and ImplementationBinding pivots Component is implemented by Toolkit
+    and Component has Trait 'keyboard_navigable'.
+  <!-- Pointer-driven MonoViews still benefit from keyboard-navigable
+       widgets — mouse + keyboard share enough surface that focus
+       rings and tab-order matter for any non-touch user. Keyboard-
+       navigable bindings score above un-tagged peers. The rule does
+       not exclude touch_optimized peers; the touch rule above is
+       gated by Interaction Mode 'touch' so the two cannot fire on
+       the same MonoView. -->
+
+### Keyboard-interaction preference
+
++ ImplementationBinding is preferred for MonoView
+    if MonoView has default Interaction Mode 'keyboard'
+    and ImplementationBinding pivots Component is implemented by Toolkit
+    and Component has Trait 'keyboard_navigable'.
+  <!-- Keyboard-only MonoViews (REPLs, terminal-host surfaces) require
+       full keyboard navigation. The trait is mandatory for the
+       binding to be considered, not just preferred — but FORML 2
+       derivation rules express preference, not exclusion, so the
+       scoring layer in #493 treats this as the strongest signal. -->
+
++ ImplementationBinding is preferred for MonoView
+    if MonoView has default Interaction Mode 'keyboard'
+    and ImplementationBinding pivots Component is implemented by Toolkit
+    and ImplementationBinding has Trait 'compact_native'.
+  <!-- Keyboard MonoViews additionally favour compact_native bindings:
+       keyboard-driven workflows pack more surface per pixel than
+       touch and rarely need 44px hit targets. The two rules compose
+       additively — a Qt LineEdit with both keyboard_navigable
+       (inherited from the abstract Component) and compact_native
+       (per-binding override) scores 2 on a keyboard MonoView. -->
+
+### Compact density preference
+
++ ImplementationBinding is preferred for MonoView
+    if MonoView has default Density Scale 'compact'
+    and ImplementationBinding pivots Component is implemented by Toolkit
+    and ImplementationBinding has Trait 'compact_native'.
+  <!-- Compact density requests bindings whose declared trait set
+       confirms a compact native variant (Qt's desktop defaults, GTK's
+       legacy widget classes). Bindings without compact_native may
+       still be selected — they just degrade through the runtime's
+       density-substitution layer (#491) rather than rendering at
+       their declared compact metric. -->
+
+### Spacious density preference
+
++ ImplementationBinding is preferred for MonoView
+    if MonoView has default Density Scale 'spacious'
+    and ImplementationBinding pivots Component is implemented by Toolkit
+    and Component has Trait 'touch_optimized'.
+  <!-- Spacious density and touch optimisation correlate per the
+       MonoView reading (#457a) — `default Density Scale 'spacious'`
+       is itself derived from `default Interaction Mode 'touch'`.
+       Restating the touch_optimized preference here lets MonoViews
+       with explicit spacious density (without touch interaction)
+       still pick up touch-optimised bindings. The two preference
+       paths converge on the same scoring boost for touch MonoViews. -->
+
+### High-contrast a11y preference
+
++ ImplementationBinding is preferred for MonoView
+    if MonoView has default A11y Profile 'high-contrast'
+    and ImplementationBinding pivots Component is implemented by Toolkit
+    and Component has Trait 'theming_consumer'.
+  <!-- High-contrast MonoViews require bindings that honour the
+       active theme's design tokens (#432) — a hardcoded-color binding
+       cannot react to a contrast-boosted ColorToken substitution.
+       The theming_consumer trait is declared on the abstract
+       Component when it applies uniformly across all toolkit
+       implementations of that role; the rule fires through the
+       Component side of the union. -->
+
+### Reduced-motion / Slint preference
+
++ ImplementationBinding is preferred for MonoView
+    if MonoView has default A11y Profile 'reduced-motion'
+    and ImplementationBinding pivots Component is implemented by Toolkit
+    and Toolkit has Toolkit Slug 'slint'.
+  <!-- Reduced-motion MonoViews route away from Qt's QtQuick-based
+       widgets (where animations are baked into the rendering path
+       and difficult to suppress per-instance). Slint and GTK 4 both
+       degrade gracefully under reduced-motion: Slint exposes
+       per-animation toggles in the .slint surface, GTK 4 honours the
+       desktop reduce-animations setting natively. The rule is
+       expressed as two parallel preferences rather than as a single
+       "Toolkit not in {Qt 6}" exclusion because FORML 2 derivation
+       antecedents do not admit set-difference idioms — see CCCC's
+       #483 wine.md note on regex / set-membership replacement with
+       enumerated `belongs to` joins. -->
+
+### Reduced-motion / GTK 4 preference
+
++ ImplementationBinding is preferred for MonoView
+    if MonoView has default A11y Profile 'reduced-motion'
+    and ImplementationBinding pivots Component is implemented by Toolkit
+    and Toolkit has Toolkit Slug 'gtk4'.
+  <!-- Companion to the Slint reduced-motion rule above. GTK 4's
+       reduce-animations preference is wired through GtkSettings
+       and propagates to every widget; a reduced-motion MonoView
+       gets GTK widgets without an app-side bridge. -->
+
+### Kernel-resident Slint preference
+
++ ImplementationBinding is preferred for MonoView
+    if ImplementationBinding pivots Component is implemented by Toolkit
+    and Toolkit has Toolkit Slug 'slint'
+    and ImplementationBinding has Trait 'kernel_native'.
+  <!-- The kernel ships Slint in-image (#486 wired the adapter at
+       boot — commit 28e1961). Every other toolkit pays a heap +
+       process + IPC cost the Slint binding does not. When a Component
+       has any Slint binding at all, prefer it over the heavier
+       toolkits absent a stronger signal pulling the other way (a11y,
+       density, interaction). The kernel_native trait is the gate —
+       a hypothetical Slint binding that did NOT ship in the kernel
+       image (e.g. a downloadable Slint plugin) would not collect
+       this preference. -->
+
+### Single-toolkit role wins by default
+
++ ImplementationBinding is preferred for MonoView
+    if ImplementationBinding pivots Component is implemented by Toolkit (T1)
+    and Component has Component Role (R)
+    and no other Toolkit (T2) is such that some Component has Component Role (R)
+        and that Component is implemented by Toolkit (T2).
+  <!-- Makes the gap-detection rule's complement explicit for the
+       chainer: when only one toolkit has a binding for a role, that
+       binding wins regardless of MonoView constraints. The form
+       mirrors the gap-detection rule's `no Component is implemented
+       by Toolkit` negation idiom — FORML 2 antecedents support
+       `no <other Noun> is such that ...` set-emptiness checks but
+       not numeric cardinality. The runtime (#493) still surfaces a
+       soft-warning Notice if the resulting toolkit conflicts with
+       the MonoView's preferred toolkit family — the user gets the
+       working widget plus a "this is the only option for this role
+       on this surface" advisory. -->
+
+### Surface Tier overlay -> Web Components
+
++ ImplementationBinding is preferred for MonoView
+    if Region belongs to MonoView
+    and Region has Surface Tier 'overlay'
+    and ImplementationBinding pivots Component is implemented by Toolkit
+    and Toolkit has Toolkit Slug 'web-components'.
+  <!-- Hypothetical, scoped to the ui.do tier (#494) where the host
+       is the browser DOM. Overlay-tier surfaces (popovers, command
+       palettes, tooltips) ride on the platform's z-index + stacking-
+       context machinery; CSS overlay handling is the most mature
+       implementation surface across the supported toolkits. On the
+       kernel-host side this rule contributes nothing because no
+       Region routes to web-components without an explicit ui.do
+       crossover (#494) — the runtime simply ignores the preference
+       when the toolkit is not loaded. -->
+
+### Surface Tier panel preference
+
++ ImplementationBinding is preferred for MonoView
+    if Region belongs to MonoView
+    and Region has Surface Tier 'panel'
+    and ImplementationBinding pivots Component is implemented by Toolkit
+    and Component has Trait 'theming_consumer'.
+  <!-- Panel-tier surfaces (sidebars, footers, command bars) carry
+       the bulk of the design-token surface area; theming-consumer
+       bindings let token edits propagate without per-binding adapter
+       work. Backdrop and drop-shadow tiers do not get the same
+       boost because their visual contribution is closer to "fill
+       region with surface color" — token discipline matters less. -->
+
+### Dark theme preference
+
++ ImplementationBinding is preferred for MonoView
+    if Theme has Theme Mode 'dark'
+    and Theme is the default Theme
+    and ImplementationBinding pivots Component is implemented by Toolkit
+    and ImplementationBinding has Trait 'dark_mode_native'.
+  <!-- Honours the design system's default Theme (#432, currently the
+       dark Theme). Dark-mode-native bindings follow the host's color
+       scheme without an app-side bridge — GTK 4's whole-application
+       Adwaita dark, Slint's per-style theme, web's
+       prefers-color-scheme. Bindings without the trait can still be
+       selected; the runtime layer (#491) then routes design-token
+       Hex Color values into them via the binding adapter. The
+       Theme-conditional rule joins through the design.md reading
+       (#432) without restating the Theme Mode population. -->
+
+### Tie-breaker: deterministic Slint default
+
++ ImplementationBinding is preferred for MonoView
+    if ImplementationBinding pivots Component is implemented by Toolkit
+    and Toolkit has Toolkit Slug 'slint'.
+  <!-- Final disambiguator. After all the above preferences score the
+       candidate set, ties (multiple bindings with the same score)
+       resolve to Slint deterministically. This is intentionally the
+       weakest preference — every prior rule that names a non-Slint
+       trait or toolkit overrides it — but it guarantees the chainer
+       always picks one binding without consulting external state.
+       The runtime (#493) leans on this for property-test
+       reproducibility: the same (Component Role, MonoView,
+       A11yProfile, Theme) tuple resolves to the same binding across
+       runs, regardless of fact-population insertion order. -->
+
 ## Instance Facts
 
 Domain 'ui' has Description 'Component registry — UI widgets across Slint, Qt 6, GTK 4, and Web Components as FORML 2 facts. Apps compose by Component Role; the metamodel selects per-toolkit implementations against MonoView constraints (#457a) and design tokens (#432). Substrate for #486-#494.'.
@@ -395,11 +601,13 @@ Component 'button' is implemented by Toolkit 'slint' at Toolkit Symbol 'Button'.
 ImplementationBinding 'button.slint' pivots Component 'button' is implemented by Toolkit 'slint'.
 ImplementationBinding 'button.slint' has Trait 'kernel_native'.
 ImplementationBinding 'button.slint' has Trait 'hidpi_native'.
+ImplementationBinding 'button.slint' has Trait 'dark_mode_native'.
 
 Component 'button' is implemented by Toolkit 'qt6' at Toolkit Symbol 'QPushButton'.
 ImplementationBinding 'button.qt6' pivots Component 'button' is implemented by Toolkit 'qt6'.
 ImplementationBinding 'button.qt6' has Trait 'screen_reader_aware'.
 ImplementationBinding 'button.qt6' has Trait 'hidpi_native'.
+ImplementationBinding 'button.qt6' has Trait 'compact_native'.
 
 Component 'button' is implemented by Toolkit 'gtk4' at Toolkit Symbol 'GtkButton'.
 ImplementationBinding 'button.gtk4' pivots Component 'button' is implemented by Toolkit 'gtk4'.
@@ -436,10 +644,12 @@ Component 'text-input' has Trait 'theming_consumer'.
 Component 'text-input' is implemented by Toolkit 'slint' at Toolkit Symbol 'Input'.
 ImplementationBinding 'text-input.slint' pivots Component 'text-input' is implemented by Toolkit 'slint'.
 ImplementationBinding 'text-input.slint' has Trait 'kernel_native'.
+ImplementationBinding 'text-input.slint' has Trait 'dark_mode_native'.
 
 Component 'text-input' is implemented by Toolkit 'qt6' at Toolkit Symbol 'QLineEdit'.
 ImplementationBinding 'text-input.qt6' pivots Component 'text-input' is implemented by Toolkit 'qt6'.
 ImplementationBinding 'text-input.qt6' has Trait 'screen_reader_aware'.
+ImplementationBinding 'text-input.qt6' has Trait 'compact_native'.
 
 Component 'text-input' is implemented by Toolkit 'gtk4' at Toolkit Symbol 'GtkEntry'.
 ImplementationBinding 'text-input.gtk4' pivots Component 'text-input' is implemented by Toolkit 'gtk4'.
@@ -472,10 +682,12 @@ Component 'list' has Trait 'theming_consumer'.
 Component 'list' is implemented by Toolkit 'slint' at Toolkit Symbol 'List'.
 ImplementationBinding 'list.slint' pivots Component 'list' is implemented by Toolkit 'slint'.
 ImplementationBinding 'list.slint' has Trait 'kernel_native'.
+ImplementationBinding 'list.slint' has Trait 'dark_mode_native'.
 
 Component 'list' is implemented by Toolkit 'qt6' at Toolkit Symbol 'QListView'.
 ImplementationBinding 'list.qt6' pivots Component 'list' is implemented by Toolkit 'qt6'.
 ImplementationBinding 'list.qt6' has Trait 'screen_reader_aware'.
+ImplementationBinding 'list.qt6' has Trait 'compact_native'.
 
 Component 'list' is implemented by Toolkit 'gtk4' at Toolkit Symbol 'GtkListView'.
 ImplementationBinding 'list.gtk4' pivots Component 'list' is implemented by Toolkit 'gtk4'.
@@ -646,6 +858,7 @@ Component 'combo-box' has Trait 'theming_consumer'.
 Component 'combo-box' is implemented by Toolkit 'qt6' at Toolkit Symbol 'QComboBox'.
 ImplementationBinding 'combo-box.qt6' pivots Component 'combo-box' is implemented by Toolkit 'qt6'.
 ImplementationBinding 'combo-box.qt6' has Trait 'screen_reader_aware'.
+ImplementationBinding 'combo-box.qt6' has Trait 'compact_native'.
 
 Component 'combo-box' is implemented by Toolkit 'gtk4' at Toolkit Symbol 'GtkDropDown'.
 ImplementationBinding 'combo-box.gtk4' pivots Component 'combo-box' is implemented by Toolkit 'gtk4'.
@@ -672,9 +885,11 @@ Component 'progress-bar' has Trait 'theming_consumer'.
 Component 'progress-bar' is implemented by Toolkit 'slint' at Toolkit Symbol 'ProgressIndicator'.
 ImplementationBinding 'progress-bar.slint' pivots Component 'progress-bar' is implemented by Toolkit 'slint'.
 ImplementationBinding 'progress-bar.slint' has Trait 'kernel_native'.
+ImplementationBinding 'progress-bar.slint' has Trait 'dark_mode_native'.
 
 Component 'progress-bar' is implemented by Toolkit 'qt6' at Toolkit Symbol 'QProgressBar'.
 ImplementationBinding 'progress-bar.qt6' pivots Component 'progress-bar' is implemented by Toolkit 'qt6'.
+ImplementationBinding 'progress-bar.qt6' has Trait 'compact_native'.
 
 Component 'progress-bar' is implemented by Toolkit 'gtk4' at Toolkit Symbol 'GtkProgressBar'.
 ImplementationBinding 'progress-bar.gtk4' pivots Component 'progress-bar' is implemented by Toolkit 'gtk4'.
@@ -702,10 +917,12 @@ Component 'checkbox' has Trait 'theming_consumer'.
 Component 'checkbox' is implemented by Toolkit 'slint' at Toolkit Symbol 'CheckBox'.
 ImplementationBinding 'checkbox.slint' pivots Component 'checkbox' is implemented by Toolkit 'slint'.
 ImplementationBinding 'checkbox.slint' has Trait 'kernel_native'.
+ImplementationBinding 'checkbox.slint' has Trait 'dark_mode_native'.
 
 Component 'checkbox' is implemented by Toolkit 'qt6' at Toolkit Symbol 'QCheckBox'.
 ImplementationBinding 'checkbox.qt6' pivots Component 'checkbox' is implemented by Toolkit 'qt6'.
 ImplementationBinding 'checkbox.qt6' has Trait 'screen_reader_aware'.
+ImplementationBinding 'checkbox.qt6' has Trait 'compact_native'.
 
 Component 'checkbox' is implemented by Toolkit 'gtk4' at Toolkit Symbol 'GtkCheckButton'.
 ImplementationBinding 'checkbox.gtk4' pivots Component 'checkbox' is implemented by Toolkit 'gtk4'.
