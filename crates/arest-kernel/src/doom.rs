@@ -54,12 +54,14 @@
 //                                                       since boot
 //                                                       (`uint64_t` per
 //                                                       header).
-//                                                       Returns 0 until
-//                                                       the UEFI arch
-//                                                       arm grows a
-//                                                       timer IRQ —
-//                                                       see TODO in
-//                                                       the impl body.
+//                                                       Backed by the
+//                                                       UEFI PIT 1 kHz
+//                                                       IRQ counter
+//                                                       (Track AA,
+//                                                       commit be9320d
+//                                                       / #379) via
+//                                                       `arch::time::
+//                                                       now_ms`.
 //
 //   ui:
 //     drawFrame(frame_ptr: i32)                      - present one
@@ -285,12 +287,16 @@ pub trait DoomHost {
 ///     UTF-8 bytes out of guest memory to the kernel serial console
 ///     with `doom: info:` / `doom: ERROR:` prefixes. Silent drop on
 ///     malformed UTF-8 so a corrupt message can't itself trap Doom.
-///   * `time_in_milliseconds` — signature widened to `i64` (#395) to
-///     match the header's `uint64_t` declaration. Body returns 0
-///     (TODO #344 step 4d) until the UEFI arch arm grows a timer
-///     IRQ + monotonic ms counter mirroring the BIOS arm's
-///     `arch::time::now_ms`; doom.rs is UEFI-x86_64-only so the
-///     BIOS arm's existing counter isn't reachable.
+///   * `time_in_milliseconds` — live (#374). Signature widened to
+///     `i64` (#395) to match the header's `uint64_t` declaration;
+///     body now returns `crate::arch::time::now_ms() as i64`,
+///     reading the UEFI arch arm's PIT 1 kHz IRQ counter that
+///     Track AA landed in commit `be9320d` (#379). The smoke
+///     verified the counter advances 0 -> 10 across a 10 ms wait,
+///     so Doom's 35 Hz tic accumulator will see real progress as
+///     soon as #376 instantiates the guest. The `u64 -> i64` cast
+///     is bit-pattern-preserving below `i64::MAX` ms (~292 million
+///     years), well clear of any realistic uptime.
 ///   * `size_of_save_game` / `read_save_game` / `write_save_game` —
 ///     live (#375). Persist save slots into a reserved sub-range of
 ///     the virtio-blk disk via `block_storage::reserve_region`
@@ -416,25 +422,20 @@ impl DoomHost for KernelDoomHost {
         // Header declares `uint64_t timeInMilliseconds`; the trait
         // returns `i64` so the wasmi host-func ABI marshals a 64-bit
         // value. Doom's game loop accumulates tics against this
-        // clock at 35 Hz, but it only cares about monotonic deltas
-        // — a 0 baseline that never advances will let the guest run
-        // its init path and reach the first `drawFrame` (the visible
-        // smoke for Track A's UEFI handoff) even if the tic counter
-        // never increments.
+        // clock at 35 Hz and only cares about monotonic deltas, so
+        // any monotonic ms source suffices — we use the UEFI arch
+        // arm's PIT 1 kHz IRQ counter, exposed as
+        // `arch::time::now_ms() -> u64` (Track AA, commit be9320d /
+        // #379). The smoke verified the counter advances 0 -> 10
+        // across a 10 ms wait, so the 35 Hz tic accumulator inside
+        // Doom will see real progress as soon as the guest is
+        // instantiated (#376).
         //
-        // TODO(#344 step 4d / #180-followup): once the UEFI arch arm
-        // installs an IDT + timer interrupt, expose a UEFI-side
-        // `arch::time::now_ms` mirroring the BIOS arm's PIT-driven
-        // `AtomicU64` counter and return `arch::time::now_ms() as
-        // i64` here. Today the UEFI arm has no IRQ infrastructure
-        // (`arch::halt_forever` busy-loops on `pause` for that
-        // reason — see `arch::uefi::mod` docstring), so there is no
-        // monotonic ms source reachable from the host shim. The
-        // cast `u64 -> i64` is the trivial part — bit-pattern
-        // preserving for any clock value below `i64::MAX` ms (≈ 292
-        // million years), which any realistic uptime stays well
-        // under.
-        0
+        // The `u64 -> i64` cast is bit-pattern-preserving for any
+        // clock value below `i64::MAX` ms (~292 million years), so
+        // any realistic uptime round-trips through wasmi's signed
+        // ABI back to the guest's `uint64_t` cleanly.
+        crate::arch::time::now_ms() as i64
     }
 
     fn draw_frame(&mut self, frame: &[u8]) {
