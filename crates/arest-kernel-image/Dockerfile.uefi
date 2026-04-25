@@ -152,6 +152,12 @@ EXPOSE 8080
 #                    above -- OVMF uses the ESP for boot, kernel
 #                    uses the 1 MiB disk for checkpoint/restore
 #                    (#337).
+#   -device virtio-gpu-pci
+#                    attach a modern virtio-gpu (device-id 0x1050)
+#                    so the PCI scan (#370) finds it. Resource
+#                    attach + display setup is wired up in #371;
+#                    today the device is exposed solely so
+#                    pci::find_virtio_gpu has something to discover.
 #   -serial stdio    AREST kernel writes to ConOut -> OVMF mirrors
 #                    ConOut to COM1 -> QEMU surfaces COM1 on stdout.
 #                    Same path the BIOS image uses (16550 on COM1).
@@ -166,6 +172,7 @@ CMD ["qemu-system-x86_64", \
      "-device", "virtio-net-pci,netdev=net0,disable-legacy=on", \
      "-drive", "file=/disk.img,format=raw,if=none,id=disk0", \
      "-device", "virtio-blk-pci,drive=disk0,disable-legacy=on", \
+     "-device", "virtio-gpu-pci", \
      "-serial", "stdio", \
      "-display", "none", \
      "-no-reboot", "-no-shutdown"]

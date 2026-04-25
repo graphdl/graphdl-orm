@@ -46,6 +46,13 @@ pub const VIRTIO_NET_DEVICE_ID: u16 = 0x1041;
 /// Used by `find_virtio_blk` for the Storage-2 bring-up (#335).
 pub const VIRTIO_BLK_DEVICE_ID: u16 = 0x1042;
 
+/// Modern-virtio GPU device. Spec: device-type 16 → 0x1040 + 16 = 0x1050.
+/// Used by `find_virtio_gpu` for the framebuffer / display bring-up
+/// (#370). Some emulators also expose a transitional 0x1010 device-id;
+/// we deliberately match only the modern 0x1050 to stay consistent
+/// with the rest of this module's modern-only stance.
+pub const VIRTIO_GPU_DEVICE_ID: u16 = 0x1050;
+
 /// One enumerated PCI device. Fields come straight from the standard
 /// PCI Type-0 header; callers that only need the identity ignore the
 /// BARs, and driver-instantiating callers read them.
@@ -137,6 +144,16 @@ pub fn find_virtio_net() -> Option<PciDevice> {
 pub fn find_virtio_blk() -> Option<PciDevice> {
     scan_devices().into_iter().find(|d| {
         d.vendor_id == VIRTIO_VENDOR && d.device_id == VIRTIO_BLK_DEVICE_ID
+    })
+}
+
+/// Find a virtio-gpu-pci device — the first matching one if more than
+/// one is attached. Used by the framebuffer / display bring-up (#370)
+/// to locate the GPU. Returns None when the machine wasn't launched
+/// with `-device virtio-gpu-pci`.
+pub fn find_virtio_gpu() -> Option<PciDevice> {
+    scan_devices().into_iter().find(|d| {
+        d.vendor_id == VIRTIO_VENDOR && d.device_id == VIRTIO_GPU_DEVICE_ID
     })
 }
 
