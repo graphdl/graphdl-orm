@@ -1,0 +1,182 @@
+# crates/arest-kernel-image/Dockerfile.boot-img
+#
+# Wraps the aarch64-unknown-uefi kernel into an Android boot.img
+# (header v0) so it can be flashed with `fastboot boot boot.img` on
+# devices whose bootloaders speak the legacy AOSP boot image format.
+# Targets the Nexus 5X (msm8992 / Snapdragon 808, codename "bullhead")
+# because its BoardConfig.mk and recovery flash flow have the widest
+# AOSP coverage of the pre-Pixel-3 generation -- Nexus 5 / 6P pickups
+# are tracked in #393.
+#
+# This image only PRODUCES the boot.img -- it does not boot it.
+# Actually `fastboot boot`-ing the artifact on a physical Nexus 5X
+# is #393. The success criterion for #390 is:
+#   1. `docker build` returns 0
+#   2. /boot.img exists, non-empty
+#   3. /boot.img starts with the magic bytes "ANDROID!"
+#
+# Pipeline:
+#   stage 1 (builder)   same toolchain as Dockerfile.uefi-aarch64;
+#                       produces target/aarch64-unknown-uefi/release/
+#                       arest-kernel.efi (PE32+).
+#   stage 2 (packager)  Debian + LLVM (for `llvm-objcopy`) + Python
+#                       + AOSP `mkbootimg` (cloned from
+#                       android.googlesource.com -- there is no
+#                       canonical PyPI distribution and the bookworm-
+#                       slim apt repos dropped the package after
+#                       buster). Strips the PE32+ wrapper into a flat
+#                       binary (`arest-kernel.img`) and runs
+#                       `mkbootimg` with Nexus 5X bullhead offsets to
+#                       emit `/boot.img`.
+#
+# Known limitation -- carried forward into boot-img-README.md:
+#   The PE32+ -> flat-binary strip discards the EFI entry-point
+#   metadata. Android's bootloader on Nexus 5X jumps to offset 0 of
+#   the flattened image expecting an ARM64 boot protocol header
+#   (see Documentation/arm64/booting.rst in the Linux kernel tree:
+#   first 8 bytes branch to text_offset, then `MAGIC = "ARM\x64"`
+#   at offset 0x38). The arest-kernel doesn't carry that header
+#   today (the UEFI entry is the only entry point), so the produced
+#   boot.img is a packaging-only scaffold -- it will be rejected by
+#   the bootloader's "missing arm64 magic" check the moment a real
+#   device attempts to load it. Wiring the ARM64 boot header onto
+#   the kernel is a separate task.
+#
+# Usage from repo root:
+#   docker build -t arest-kernel-boot-img \
+#                -f crates/arest-kernel-image/Dockerfile.boot-img .
+#   docker create --name boot-img-extract arest-kernel-boot-img
+#   docker cp boot-img-extract:/boot.img target/boot.img
+#   docker rm boot-img-extract
+# (The PowerShell wrapper `scripts/package-aarch64-boot-img.ps1`
+# automates the create/cp/rm dance.)
+
+# ── Stage 1: builder ───────────────────────────────────────────────
+# Mirrors Dockerfile.uefi-aarch64 exactly so layer caching is shared
+# when both images are built on the same host.
+FROM rust:latest AS builder
+
+RUN rustup toolchain install nightly --profile minimal \
+    && rustup component add rust-src --toolchain nightly \
+    && rustup component add llvm-tools-preview --toolchain nightly \
+    && rustup target add x86_64-unknown-none --toolchain nightly \
+    && rustup target add x86_64-unknown-uefi --toolchain nightly \
+    && rustup target add aarch64-unknown-uefi --toolchain nightly
+
+WORKDIR /build
+
+COPY crates/arest-kernel/Cargo.toml crates/arest-kernel/Cargo.toml
+COPY crates/arest-kernel/build.rs   crates/arest-kernel/build.rs
+COPY crates/arest-kernel/src/       crates/arest-kernel/src/
+COPY crates/arest-kernel/rust-toolchain.toml crates/arest-kernel/rust-toolchain.toml
+
+# ui.do bundle (#266) -- arch-neutral baked assets.
+COPY apps/ui.do/dist/ apps/ui.do/dist/
+
+# arest engine sources + readings -- arch-neutral.
+COPY crates/arest/Cargo.toml crates/arest/Cargo.toml
+COPY crates/arest/src/       crates/arest/src/
+COPY readings/               readings/
+
+RUN cd crates/arest-kernel \
+    && cargo +nightly build --target aarch64-unknown-uefi --release
+
+# ── Stage 2: packager ──────────────────────────────────────────────
+# Debian bookworm-slim with:
+#   - llvm        : `llvm-objcopy` for PE32+ -> flat binary strip.
+#                   `llvm-objcopy -O binary` honours the section
+#                   layout LLD wrote into the .efi (.text + .data
+#                   contiguous) and emits a flat blob suitable for
+#                   the AOSP boot.img kernel slot.
+#   - python3     : AOSP's `mkbootimg` is a pure-Python script.
+#   - git         : clone the upstream `mkbootimg` source straight
+#                   from android.googlesource.com.
+#
+# Why clone instead of pip-install:
+#   There is no canonical `mkbootimg` PyPI distribution -- Google
+#   ships the script via the AOSP `platform/system/tools/mkbootimg`
+#   repository, not PyPI. The Debian packages `android-sdk-
+#   libsparse-utils` and `mkbootimg` were dropped after buster, so
+#   bookworm-slim's apt repos don't have them either. Cloning the
+#   AOSP repo at a known tag is the path with the fewest moving
+#   pieces: pure-Python, single import outside stdlib (gki/), no
+#   build step.
+FROM debian:bookworm-slim AS packager
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    llvm \
+    python3 \
+    git \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Clone AOSP `mkbootimg` from android.googlesource.com. Pin to a
+# specific platform release tag so the build is reproducible.
+# `android-platform-14.0.0_r26` is a published Android 14 platform
+# release whose mkbootimg supports boot image header v0 through v4
+# (v0 is what Nexus 5X expects). `--depth 1` keeps the layer small
+# (~200 KB vs 30 MB for the full history).
+RUN git clone --depth 1 --branch android-platform-14.0.0_r26 \
+        https://android.googlesource.com/platform/system/tools/mkbootimg \
+        /opt/mkbootimg
+
+# Wrap the script as `mkbootimg` on PATH so the RUN below reads
+# naturally. The script's own `from gki.generate_gki_certificate
+# import generate_gki_certificate` resolves because we keep CWD-
+# independent imports working by exec'ing python3 against the
+# absolute path inside /opt/mkbootimg.
+RUN printf '#!/bin/sh\nexec python3 /opt/mkbootimg/mkbootimg.py "$@"\n' > /usr/local/bin/mkbootimg \
+    && chmod +x /usr/local/bin/mkbootimg
+
+# Pull the .efi out of the builder.
+COPY --from=builder \
+     /build/crates/arest-kernel/target/aarch64-unknown-uefi/release/arest-kernel.efi \
+     /arest-kernel.efi
+
+# Strip the PE32+ wrapper into a flat binary. `llvm-objcopy -O binary`
+# concatenates allocatable sections in load-address order and writes
+# a contiguous blob -- the same shape Android's `mkbootimg` expects
+# for the kernel slot. (The PE entry-point metadata is dropped in
+# this step, which is the source of the "no ARM64 boot header"
+# limitation documented in boot-img-README.md.)
+RUN llvm-objcopy -O binary /arest-kernel.efi /arest-kernel.img
+
+# Nexus 5X (bullhead / msm8992 / Snapdragon 808) board values from
+# AOSP `device/lge/bullhead/BoardConfig.mk`:
+#   BOARD_KERNEL_BASE    := 0x00000000
+#   BOARD_KERNEL_PAGESIZE := 4096
+#   BOARD_KERNEL_OFFSET  := 0x00008000   (added to base for kernel load)
+#   BOARD_RAMDISK_OFFSET := 0x02000000   (added to base for ramdisk)
+#   BOARD_TAGS_OFFSET    := 0x01e00000   (added to base for ATAGS / DTB)
+#   BOARD_KERNEL_CMDLINE := console=ttyMSM0,115200,n8 androidboot.console=ttyMSM0 ...
+# Header version 0 is the legacy pre-boot-image-v3 layout the Nexus
+# 5X bootloader speaks (boot image v3 / v4 are Pixel-3-and-later).
+#
+# `--ramdisk /dev/null` substitutes a zero-byte ramdisk -- the AREST
+# kernel doesn't need an initramfs, and `mkbootimg` requires *some*
+# ramdisk argument (it cannot be omitted entirely on header v0).
+# The bootloader treats a zero-length ramdisk as "no initramfs",
+# which is what we want for a single-binary kernel.
+RUN mkbootimg \
+    --kernel /arest-kernel.img \
+    --ramdisk /dev/null \
+    --base 0x00000000 \
+    --kernel_offset 0x00008000 \
+    --ramdisk_offset 0x02000000 \
+    --tags_offset 0x01e00000 \
+    --pagesize 4096 \
+    --header_version 0 \
+    --cmdline "console=ttyMSM0,115200,n8 androidboot.console=ttyMSM0" \
+    --output /boot.img
+
+# Sanity-check: boot.img must exist and start with "ANDROID!".
+# `head -c 8` reads the magic; comparing in shell catches a build-
+# time regression before the artifact escapes the container.
+RUN test -s /boot.img \
+    && head -c 8 /boot.img | grep -q "ANDROID!" \
+    && echo "boot.img magic OK ($(stat -c %s /boot.img) bytes)"
+
+# Default CMD prints the artifact's location + size when the image
+# is `docker run` directly -- helpful for manual extraction without
+# the PowerShell wrapper.
+CMD ["sh", "-c", "echo 'boot.img ready at /boot.img'; ls -la /boot.img; head -c 8 /boot.img | xxd"]
