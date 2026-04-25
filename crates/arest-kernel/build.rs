@@ -271,6 +271,153 @@ fn main() {
         }
     }
 
+    // --- linuxkpi C-side compile (#460 Track AAAA) -------------------
+    //
+    // Builds the vendored Linux driver source against the shim's stub
+    // headers, producing a libvirtio_input.a that the Rust kernel
+    // links in. Gated on the `linuxkpi` cargo feature so default
+    // builds skip it entirely.
+    //
+    // Cross-compilation notes (Windows host -> x86_64-unknown-uefi):
+    //   * The `cc` crate auto-discovers a host C toolchain. On
+    //     Windows the default is MSVC's cl.exe, but MSVC can't target
+    //     the SysV-AMD64 calling convention that x86_64-unknown-uefi
+    //     PE32+ expects (UEFI is Microsoft-x64 ABI which IS what
+    //     MSVC emits, so this works out — UEFI and MSVC share the
+    //     same calling convention). However, MSVC chokes on Linux's
+    //     `__attribute__((packed))` and various other GNU-isms in
+    //     the vendored header subset. Using clang-cl or plain clang
+    //     with `--target=x86_64-pc-windows-msvc` (since UEFI ABI ==
+    //     MSVC ABI on x86_64) is the cleanest path.
+    //   * If the host doesn't have clang available, `cc::Build::new()
+    //     .try_compile()` returns an Err with a clear message. We
+    //     surface that as a `cargo:warning=` and continue with the
+    //     Rust-only build — the Rust shim modules still compile, the
+    //     C-side just isn't linked. Downstream of #459b the C side
+    //     becomes load-bearing; today this graceful-degrade keeps
+    //     fresh-clone builds from breaking on hosts without clang.
+    //   * The `KBUILD_MODNAME` / `THIS_MODULE` macros that the Linux
+    //     `module_virtio_driver` macro uses are stubbed out in
+    //     `vendor/linux/include/linux/module.h` (see that header's
+    //     comment block for the why).
+    if env::var("CARGO_FEATURE_LINUXKPI").is_ok() {
+        let vendor_root = manifest_dir.join("vendor").join("linux");
+        let virtio_input_c = vendor_root
+            .join("drivers").join("virtio").join("virtio_input.c");
+        let include_dir = vendor_root.join("include");
+        let uapi_dir = include_dir.join("uapi");
+        if !virtio_input_c.is_file() {
+            println!(
+                "cargo:warning=linuxkpi feature enabled but {} missing — skipping C compile",
+                virtio_input_c.display(),
+            );
+        } else {
+            let mut build = cc::Build::new();
+            // The `cc` crate's auto-discovery looks for a host C
+            // compiler keyed on the Cargo target triple. For
+            // `x86_64-unknown-uefi` it looks for a `cc` named after
+            // that triple (or plain `cc` on Unix), neither of which
+            // exists on a Windows MSVC host. We force-prefer clang —
+            // freestanding clang accepts a `-target` flag that emits
+            // SysV-x86_64 (Linux ABI) object code; the real link
+            // target is `x86_64-pc-windows-msvc` because UEFI uses
+            // the Microsoft x64 calling convention. Setting the
+            // compiler explicitly + the target via flag matches the
+            // task brief's "cc needs -target x86_64-unknown-uefi
+            // flags" guidance for the Windows-host cross story.
+            //
+            // If clang isn't in PATH either, `cc::Build::compiler`
+            // still reports failure on `try_compile`, and the
+            // surrounding match arm degrades gracefully. Both
+            // common host setups now have a path forward:
+            //   * Linux/macOS — `cc` auto-discovers system clang.
+            //   * Windows + clang — explicit override below picks
+            //     it up.
+            //   * Windows + MSVC only (no clang) — degrades to
+            //     "Rust-only" with a warning.
+            if cfg!(target_os = "windows") {
+                build.compiler("clang");
+            }
+            build
+                .file(&virtio_input_c)
+                .include(&include_dir)
+                .include(&uapi_dir)
+                // UEFI target uses Microsoft x64 ABI on x86_64. We
+                // tell clang to emit it directly so the resulting
+                // object links cleanly into the .efi PE32+ image.
+                .flag_if_supported("--target=x86_64-pc-windows-msvc")
+                // Tell clang we're building against a freestanding
+                // environment — no libc, no host headers.
+                .flag_if_supported("-ffreestanding")
+                .flag_if_supported("-fno-builtin")
+                .flag_if_supported("/GS-")
+                // Ignore unused / unknown attributes coming out of the
+                // Linux `__attribute__((...))` decorations.
+                .flag_if_supported("-Wno-unknown-attributes")
+                .flag_if_supported("-Wno-attributes")
+                .flag_if_supported("-Wno-unused-parameter")
+                .flag_if_supported("-Wno-unused-function")
+                .flag_if_supported("-Wno-unused-variable")
+                // Suppress harmless C99-isms / GNU-isms.
+                .flag_if_supported("-Wno-pointer-sign")
+                // The vendored headers + .c are GPL-2.0; add the
+                // license note inline in case a third-party tool
+                // grovels the build args for SBOM generation.
+                .define("KBUILD_MODNAME", Some("\"virtio_input\""))
+                .define("THIS_MODULE", Some("((void *)0)"))
+                .define("MODULE", None)
+                .warnings(false)
+                .opt_level(2);
+            // Try the compile; on failure (clang missing, MSVC errors,
+            // etc) emit a warning and continue. The kernel still links
+            // — the Rust shim modules are present and registered, the
+            // C-side virtio_input thunk just won't resolve and any
+            // attempt to call `virtio_input_driver_init()` from the
+            // Rust side will fail at link time. We guard that call
+            // behind the same feature, so it only matters if the
+            // user explicitly opts in to linuxkpi AND has a working
+            // cross-compiler.
+            // Communicate whether the cc step succeeded via a custom
+            // cfg, so the Rust side's `virtio_input_driver_init`
+            // extern call is only compiled when the symbol actually
+            // exists. Without this, a Windows host without clang/MSVC
+            // in PATH would `cargo check` clean (check skips linking)
+            // but `cargo build` would fail at link time on the
+            // unresolved extern. The cfg keeps `cargo build` honest:
+            // when the C side is absent, the Rust call site is
+            // elided entirely and the extern decl never instantiates.
+            //
+            // The `linuxkpi` cargo feature itself stays a pure Rust
+            // gate — it controls module visibility. The custom cfg
+            // controls only the C-driver-link sub-step inside the
+            // module.
+            println!("cargo:rustc-check-cfg=cfg(linuxkpi_c_linked)");
+            match build.try_compile("virtio_input") {
+                Ok(()) => {
+                    println!("cargo:rustc-link-lib=static=virtio_input");
+                    println!("cargo:rustc-cfg=linuxkpi_c_linked");
+                }
+                Err(e) => {
+                    println!(
+                        "cargo:warning=linuxkpi cc::Build failed: {}. \
+                        The Rust shim modules still compile — the C \
+                        side (vendor/linux/drivers/virtio/virtio_input.c) \
+                        was skipped, so `virtio_input_driver_init` is \
+                        elided from `linuxkpi::init()`. Workaround for \
+                        Windows hosts: install clang or run cargo from \
+                        a Visual Studio Developer PowerShell so cl.exe \
+                        is in PATH (cc auto-detects vcvars from there). \
+                        Linux/macOS hosts get cc / clang from the \
+                        system package manager.",
+                        e,
+                    );
+                }
+            }
+            println!("cargo:rerun-if-changed={}", virtio_input_c.display());
+            println!("cargo:rerun-if-changed={}", include_dir.display());
+        }
+    }
+
     // Re-run whenever the bundle changes.
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed={}", dist.display());

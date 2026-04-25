@@ -56,6 +56,15 @@
 pub mod interrupts;
 pub mod keyboard;
 pub mod memory;
+// Pointer event ring (#460 Track AAAA, foundation for #459b virtio-
+// input wiring). Sibling of `keyboard.rs` — same ring shape, different
+// payload (`PointerEvent` instead of `DecodedKey`). Fed by the
+// linuxkpi input shim (`crate::linuxkpi::input::input_event` translates
+// EV_REL/EV_ABS/BTN_* into pushes here); drained by the future Slint
+// pointer dispatch in #459b/d. No code path consumes this ring on the
+// foundation slice — `#[allow(dead_code)]` inside the module itself
+// guards the public surface until the consumer lands.
+pub mod pointer;
 mod serial;
 // Slint software-renderer → GOP framebuffer adapter (#427). Adds the
 // `LineBufferProvider` impl + the `Platform` impl that Slint needs to

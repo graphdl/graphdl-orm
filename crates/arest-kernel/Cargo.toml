@@ -39,6 +39,20 @@ license = "AGPL-3.0-or-later"
 # pure source-level so the .efi footprint matches the licensing
 # story. See `crates/arest-kernel/doom_assets/README.md`.
 doom = []
+# linuxkpi (#460 Track AAAA, foundation for the AREST-on-real-hardware
+# epic #459). FreeBSD-style Linux kernel API shim that lets unmodified
+# Linux C drivers link against AREST primitives. Off by default
+# because the build script's `cc::Build` invocation pulls in the
+# vendored Linux source (vendor/linux/drivers/virtio/virtio_input.c,
+# GPL-2.0-only — see vendor/LINUX-VERSION.txt for provenance), which
+# extends the build's license inheritance from AGPL-3.0-or-later
+# to AGPL-3.0-or-later + GPL-2.0 (FSF-compatible per
+# https://www.gnu.org/licenses/license-list.html). Default kernel
+# builds skip the C compile + every Rust shim module — same gate
+# shape as the `doom` feature above. Opt in via `--features linuxkpi`
+# to enable. Available on x86_64 UEFI only — the C compile for the
+# vendored Linux source assumes amd64 calling convention.
+linuxkpi = []
 default = []
 
 [[bin]]
@@ -224,6 +238,17 @@ slint = { version = "1.16", default-features = false, features = [
 # `slint` crate's transitive deps anyway).
 [build-dependencies]
 slint-build = "1.16"
+# `cc` for the linuxkpi C-side compile (#460 Track AAAA). build.rs
+# only invokes `cc::Build` when CARGO_FEATURE_LINUXKPI is set, so this
+# dep is harmless on default builds (the `cc` crate itself is small
+# and pulls only `std`-side host plumbing — not linked into the
+# .efi). When the feature IS enabled, build.rs compiles
+# vendor/linux/drivers/virtio/virtio_input.c against the shim's
+# stub headers (vendor/linux/include/linux/*.h) targeting
+# x86_64-unknown-uefi and produces libvirtio_input.a which
+# `cargo:rustc-link-lib=static=virtio_input` then links into the
+# final kernel image.
+cc = "1.0"
 
 # aarch64-unknown-uefi specific deps (#344 cross-arch scaffold). The
 # aarch64 UEFI arm today is compile-only: a banner via PL011 MMIO at

@@ -1,0 +1,40 @@
+Linux kernel source vendored under crates/arest-kernel/vendor/linux/
+====================================================================
+
+Upstream tag:   v6.6 (Long Term Support, released 2023-10-29)
+Maintained by:  Greg Kroah-Hartman; LTS support through Dec 2026.
+Upstream URL:   https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/
+
+Vendored files are the minimum subset needed to compile + link
+`drivers/virtio/virtio_input.c` against the AREST linuxkpi shim
+(crates/arest-kernel/src/linuxkpi/). Per FreeBSD's compat/linuxkpi
+pattern, we do NOT vendor the full Linux header tree — instead we
+provide stubbed/minimal `include/linux/*.h` files that declare ONLY
+the types and prototypes the vendored .c source actually references.
+
+Driver source (verbatim from upstream v6.6):
+  vendor/linux/drivers/virtio/virtio_input.c
+    SPDX: GPL-2.0-only
+    Upstream: drivers/virtio/virtio_input.c
+
+Headers (minimal stubs declaring the symbols virtio_input.c uses):
+  vendor/linux/include/linux/*.h
+  vendor/linux/include/linux/input/mt.h
+  vendor/linux/include/uapi/linux/virtio_ids.h
+  vendor/linux/include/uapi/linux/virtio_input.h
+
+License:
+  Linux kernel source is GPL-2.0-only. AREST itself is licensed
+  AGPL-3.0-or-later, which is GPL-compatible per FSF compatibility
+  matrix (https://www.gnu.org/licenses/license-list.html). The full
+  GPL-2.0 text is available at vendor/linux/COPYING.
+
+How to refresh:
+  curl -o vendor/linux/drivers/virtio/virtio_input.c \
+    "https://raw.githubusercontent.com/torvalds/linux/v6.6/drivers/virtio/virtio_input.c"
+
+  Note: the canonical kernel.org URL
+  (https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/...)
+  is now behind Anubis bot-protection and may 403 from automated
+  fetches. The torvalds/linux GitHub mirror serves byte-identical
+  content via raw.githubusercontent.com.
