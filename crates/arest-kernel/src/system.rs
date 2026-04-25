@@ -60,10 +60,60 @@
 //     lifetime (memory leaks on each `apply`).
 
 use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
+use alloc::collections::BTreeSet;
 use alloc::string::{String, ToString};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 use arest::ast::{self, Func, Object};
-use spin::{Once, RwLock};
+use spin::{Mutex, Once, RwLock};
+
+/// Opaque identifier handed back to subscribers of `apply()` change
+/// notifications. Pass this value to `unsubscribe` to drop the
+/// registered handler.
+///
+/// Monotonically allocated via `NEXT_SUBSCRIBER_ID`; the kernel runs
+/// for the lifetime of one boot, so a `u64` is unbounded enough for
+/// realistic subscribe/unsubscribe rates (HateoasBrowser registers
+/// once per app re-launch; smoke harness exercises the path a few
+/// times per test run).
+pub type SubscriberId = u64;
+
+/// Registry of `apply()` change subscribers. The handler is invoked
+/// once per `apply()` call with the slice of cell names whose
+/// contents changed (symmetric difference of the cell-name sets, plus
+/// cells that exist in both but whose `Object` contents differ).
+///
+/// Stored behind a `spin::Mutex<BTreeMap<...>>`:
+///   * `Mutex` (not `RwLock`) — the read-side path (delivery) needs
+///     to snapshot handler refs and release the lock before invoking
+///     them; a `RwLock` buys nothing for that pattern.
+///   * `BTreeMap` rather than `Vec<(SubscriberId, ...)>` so
+///     `unsubscribe` is `O(log n)` rather than `O(n)` — handlers
+///     come and go over the kernel boot lifetime as apps open/close.
+///   * Each handler is wrapped in `Arc<dyn Fn>` (not `Box<dyn Fn>`)
+///     so the delivery snapshot can clone-the-Arc-and-release-the-
+///     lock cheaply. The public `subscribe_changes` API still takes
+///     a `Box<dyn Fn>` per #458's spec; we re-wrap into `Arc` at the
+///     registration site, which is a one-allocation conversion
+///     (`Arc::from(box)` on an unsized trait object).
+///
+/// Delivery iterates a snapshot of the `Arc<dyn Fn>` handles taken
+/// under a brief lock, then drops the lock before invoking any
+/// handler — so a handler that calls `unsubscribe` from inside the
+/// closure (the HateoasBrowser drop path can in principle do this)
+/// doesn't deadlock on the same `Mutex`. The `Arc` keeps the
+/// handler alive for the duration of the call even if a concurrent
+/// `unsubscribe` removed it from the registry between snapshot and
+/// invocation.
+static SUBSCRIBERS: Mutex<BTreeMap<SubscriberId, Arc<dyn Fn(&[String]) + Send + Sync>>>
+    = Mutex::new(BTreeMap::new());
+
+/// Monotonic id counter for `subscribe_changes`. `Relaxed` ordering
+/// is sufficient — we only need uniqueness, not happens-before
+/// ordering with the registry insertion (the `Mutex` provides that).
+static NEXT_SUBSCRIBER_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Baked kernel state — built once during boot and then mutable
 /// through `apply()` for the tenant's lifetime. Stored as an
@@ -228,8 +278,19 @@ pub fn with_state<R>(f: impl FnOnce(&Object) -> R) -> Option<R> {
 /// `Box::leak`s the new state so the legacy `state()` shim's
 /// `&'static Object` snapshots remain valid for the kernel
 /// lifetime. The write lock is held only across the pointer swap
-/// — `f`-style closures that rebuild state should compute
-/// `new_state` first, then call `apply` to commit.
+/// + the diff computation — `f`-style closures that rebuild state
+/// should compute `new_state` first, then call `apply` to commit.
+///
+/// After the pointer swap commits, every registered
+/// `subscribe_changes` handler is invoked with the slice of cell
+/// names whose contents changed (#458 — symmetric live-update path
+/// for kernel Slint apps that mirrors ui.do's SSE +
+/// TanStack-Query-cache-invalidation story from BroadcastDO #220 +
+/// #234). Subscriber delivery happens AFTER the write lock is
+/// released, against a snapshot of the registry — so a slow
+/// handler doesn't block writes, and a handler that calls
+/// `unsubscribe` from inside the closure can't deadlock on the
+/// `SUBSCRIBERS` `Mutex`.
 ///
 /// Returns `Err` only when `init()` hasn't run yet (a programmer
 /// error — the call site should ensure boot ordering puts
@@ -237,9 +298,127 @@ pub fn with_state<R>(f: impl FnOnce(&Object) -> R) -> Option<R> {
 pub fn apply(new_state: Object) -> Result<(), &'static str> {
     let lock = SYSTEM.get().ok_or("system::init() not called")?;
     let leaked: &'static Object = Box::leak(Box::new(new_state));
-    let mut guard = lock.write();
-    *guard = leaked;
+    // Diff inside the write critical section so we have stable
+    // references to both old and new state. The diff returns an
+    // owned `Vec<String>` so we can release the write lock before
+    // delivering to subscribers.
+    let changed: Vec<String> = {
+        let mut guard = lock.write();
+        let old: &Object = *guard;
+        let diff = diff_cell_names(old, leaked);
+        *guard = leaked;
+        diff
+    };
+    deliver_changes(&changed);
     Ok(())
+}
+
+/// Register a handler invoked from `apply()` after every state
+/// install. The handler receives a slice of cell names whose
+/// contents differ between the previous and new state; it is
+/// invoked synchronously on the thread calling `apply()` (the
+/// kernel super-loop in `ui_apps::launcher::run`, which is also
+/// where `net::poll()` drives HTTP-side `system::apply` calls).
+///
+/// Returns a `SubscriberId` for `unsubscribe`. The handler keeps
+/// running until explicitly unsubscribed; callers that hold weak
+/// references to UI components must keep the registration alive
+/// for the lifetime of those components and call `unsubscribe`
+/// from a Drop impl when the component goes away.
+///
+/// Handler signature is `Fn(&[String]) + Send + Sync` because
+/// `SUBSCRIBERS` is shared mutable state behind a `Mutex` — even
+/// though the kernel is single-threaded today, the bound matches
+/// what an SMP-ready future will need without a re-shape of every
+/// call site (SSE-on-the-kernel-wire is a likely #220-equivalent
+/// follow-up that wants the same API surface).
+pub fn subscribe_changes(handler: Box<dyn Fn(&[String]) + Send + Sync>) -> SubscriberId {
+    let id = NEXT_SUBSCRIBER_ID.fetch_add(1, Ordering::Relaxed);
+    // `Arc::from(Box<dyn Trait>)` reuses the existing allocation —
+    // no extra allocation on the hot path. The internal storage is
+    // `Arc` so delivery can snapshot-and-release (see SUBSCRIBERS
+    // doc); the public surface accepts `Box` per #458's spec.
+    let arc: Arc<dyn Fn(&[String]) + Send + Sync> = Arc::from(handler);
+    SUBSCRIBERS.lock().insert(id, arc);
+    id
+}
+
+/// Drop the handler associated with `id`. No-op if the id was
+/// never registered or has already been removed (idempotent — the
+/// HateoasBrowser drop path can call this even when the
+/// subscriber registry has already been swept by some hypothetical
+/// future tear-down).
+pub fn unsubscribe(id: SubscriberId) {
+    SUBSCRIBERS.lock().remove(&id);
+}
+
+/// Compute the cell-name diff between two SYSTEM states. Returns
+/// every cell name that:
+///   * appears in `old` but not `new` (cell removed),
+///   * appears in `new` but not `old` (cell added), or
+///   * appears in both but whose `Object` contents differ
+///     (cell mutated — `cell_push` shape on `file_upload`'s POST
+///     /file path appends a fact, which lands here as a content
+///     mismatch on the existing cell name).
+///
+/// Cell-content equality is `Object: PartialEq` (derived in
+/// `arest::ast`); this is a deep walk, but the kernel's HTTP
+/// write rate is low and the working set is tens of cells with
+/// hundreds of facts — well within budget for a synchronous
+/// per-`apply` diff.
+fn diff_cell_names(old: &Object, new: &Object) -> Vec<String> {
+    // Build name → contents maps for both sides. `cells_iter`
+    // returns `Vec<(&str, &Object)>` (see `arest::ast::cells_iter`),
+    // which is fine to consume into a `BTreeMap` here — the
+    // borrows live only as long as this function.
+    let old_cells: BTreeMap<&str, &Object> = ast::cells_iter(old).into_iter().collect();
+    let new_cells: BTreeMap<&str, &Object> = ast::cells_iter(new).into_iter().collect();
+
+    let mut names: BTreeSet<String> = BTreeSet::new();
+    // Symmetric difference + value-mismatch on the intersection.
+    for (name, new_val) in &new_cells {
+        match old_cells.get(name) {
+            Some(old_val) if *old_val == *new_val => {} // unchanged
+            _ => {
+                names.insert((*name).to_string());
+            }
+        }
+    }
+    for name in old_cells.keys() {
+        if !new_cells.contains_key(name) {
+            names.insert((*name).to_string());
+        }
+    }
+    names.into_iter().collect()
+}
+
+/// Invoke every registered subscriber with the changed-cells
+/// slice. Iterates over a snapshot of `Arc`-cloned handler handles
+/// taken under a brief lock, so:
+///   * Handler reentrancy via `subscribe_changes` /
+///     `unsubscribe` can't deadlock — the snapshot is owned, the
+///     `SUBSCRIBERS` `Mutex` is released before any handler runs.
+///   * A slow handler doesn't block other writes — the
+///     `SYSTEM` `RwLock` is already released by the caller
+///     (`apply()` drops its write guard before calling here).
+///   * A handler that triggers its own unsubscribe still gets to
+///     run to completion: the `Arc` clone in the snapshot keeps
+///     the closure alive even after `unsubscribe` removes it from
+///     the registry.
+///
+/// The snapshot is `Vec<Arc<dyn Fn>>` rather than `Vec<(id, Arc)>`
+/// — we don't need the ids past the snapshot point, only the
+/// handles. Order is BTreeMap-key order (i.e. registration
+/// order, since SubscriberIds are monotonic), which gives stable
+/// per-frame delivery semantics.
+fn deliver_changes(changed: &[String]) {
+    let snapshot: Vec<Arc<dyn Fn(&[String]) + Send + Sync>> = {
+        let guard = SUBSCRIBERS.lock();
+        guard.values().cloned().collect()
+    };
+    for handler in snapshot {
+        handler(changed);
+    }
 }
 
 /// Legacy borrow of the baked SYSTEM state, retained as a shim
@@ -455,5 +634,183 @@ mod tests {
         let via_shim = state().expect("init ran");
         let via_with = with_state(|s| s as *const Object).expect("init ran");
         assert_eq!(via_shim as *const Object, via_with);
+    }
+
+    // ── #458 subscribe_changes / unsubscribe / diff_cell_names ─────
+
+    /// Diff sees an added cell (present in new, absent in old).
+    /// Mirrors the `POST /file` shape: the previous state had no
+    /// `File_has_Name` cell; the new state adds one.
+    #[test]
+    fn diff_cell_names_emits_added_cells() {
+        let old = Object::phi();
+        let new = ast::cell_push(
+            "File_has_Name",
+            fact_from_pairs(&[("File", "f1"), ("Name", "alpha.txt")]),
+            &old,
+        );
+        let changed = diff_cell_names(&old, &new);
+        assert_eq!(changed, alloc::vec!["File_has_Name".to_string()]);
+    }
+
+    /// Diff sees a mutated cell (same name, different contents).
+    /// Mirrors the `cell_push`-on-existing-cell shape: a second
+    /// `File_has_Name` fact appended changes the cell's contents
+    /// even though the cell name is identical.
+    #[test]
+    fn diff_cell_names_emits_mutated_cells() {
+        let s1 = ast::cell_push(
+            "File_has_Name",
+            fact_from_pairs(&[("File", "f1"), ("Name", "a")]),
+            &Object::phi(),
+        );
+        let s2 = ast::cell_push(
+            "File_has_Name",
+            fact_from_pairs(&[("File", "f2"), ("Name", "b")]),
+            &s1,
+        );
+        let changed = diff_cell_names(&s1, &s2);
+        assert!(changed.iter().any(|n| n == "File_has_Name"),
+            "expected File_has_Name in changed, got {changed:?}");
+    }
+
+    /// Identical states yield no changes — important for the
+    /// HateoasBrowser path, which redraws on every subscriber call:
+    /// a no-op `apply` shouldn't trigger a redraw.
+    #[test]
+    fn diff_cell_names_empty_for_unchanged_states() {
+        let s = ast::cell_push(
+            "Probe",
+            fact_from_pairs(&[("k", "v")]),
+            &Object::phi(),
+        );
+        let changed = diff_cell_names(&s, &s);
+        assert!(changed.is_empty(), "expected empty diff, got {changed:?}");
+    }
+
+    /// `subscribe_changes` returns distinct ids per registration;
+    /// `unsubscribe` is idempotent and a second call is a no-op.
+    #[test]
+    fn subscribe_unsubscribe_id_lifecycle() {
+        use core::sync::atomic::AtomicUsize;
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c1 = counter.clone();
+        let id1 = subscribe_changes(Box::new(move |_changed: &[String]| {
+            c1.fetch_add(1, Ordering::Relaxed);
+        }));
+        let c2 = counter.clone();
+        let id2 = subscribe_changes(Box::new(move |_changed: &[String]| {
+            c2.fetch_add(1, Ordering::Relaxed);
+        }));
+        assert_ne!(id1, id2, "subscriber ids must be distinct");
+        unsubscribe(id1);
+        unsubscribe(id1); // double-unsubscribe is a no-op
+        unsubscribe(id2);
+    }
+
+    /// End-to-end: a subscribed handler sees the cell-name diff
+    /// after `apply()`. This is the path #458 wires for
+    /// HateoasBrowser to react to `POST /file` mutations.
+    #[test]
+    fn apply_delivers_changed_cells_to_subscribers() {
+        use core::sync::atomic::AtomicUsize;
+        init();
+
+        // Capture the changed-cells slice the handler receives.
+        // We use a `Mutex<Vec<String>>` rather than the `RefCell`
+        // shape the rest of the kernel uses because the handler's
+        // `Send + Sync` bound forbids `RefCell`.
+        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let captured_clone = captured.clone();
+        let calls_clone = calls.clone();
+        let id = subscribe_changes(Box::new(move |changed: &[String]| {
+            calls_clone.fetch_add(1, Ordering::Relaxed);
+            *captured_clone.lock() = changed.to_vec();
+        }));
+
+        // Build a successor state with a unique cell-name probe so
+        // the assertion is stable against whatever other tests have
+        // already mutated SYSTEM. Picking a cell name that won't
+        // collide with `File_*` in case other tests in the same
+        // binary touch file_upload.
+        let pre = with_state(|s| s.clone()).expect("init ran");
+        let probe_cell = "Subscribe458Probe_has_Marker";
+        let next = ast::cell_push(
+            probe_cell,
+            fact_from_pairs(&[("Subscribe458Probe", "p"), ("Marker", "m")]),
+            &pre,
+        );
+        apply(next).expect("apply succeeds post-init");
+
+        // Handler ran at least once (other tests may also be
+        // applying state in the same binary; we only assert OUR
+        // call observed the probe).
+        assert!(calls.load(Ordering::Relaxed) >= 1, "handler must have run");
+        let observed = captured.lock().clone();
+        assert!(observed.iter().any(|n| n == probe_cell),
+            "expected {probe_cell} in changed list, got {observed:?}");
+
+        unsubscribe(id);
+    }
+
+    /// A subscriber that calls `unsubscribe(its_own_id)` from
+    /// inside the handler must not deadlock — the snapshot
+    /// pattern in `deliver_changes` clones an `Arc` of each
+    /// handler under a brief lock, releases the lock, then
+    /// invokes; an unsubscribe-during-handler-call only mutates
+    /// the registry, the `Arc` snapshot keeps the closure alive
+    /// for the rest of the call.
+    #[test]
+    fn handler_can_unsubscribe_itself_without_deadlock() {
+        use core::cell::Cell;
+        init();
+        // Cell of the id, populated after we know the id.
+        let id_slot: Arc<Mutex<Option<SubscriberId>>> = Arc::new(Mutex::new(None));
+        let ran: Arc<Cell<bool>> = Arc::new(Cell::new(false));
+        // `Cell` is !Sync — but the kernel runs single-threaded
+        // and the test harness is single-threaded too. We need
+        // `Send + Sync` on the closure; wrap the `Cell` in an
+        // `unsafe impl Send + Sync` shim via a newtype. For test
+        // purposes we use an `AtomicBool` instead — same
+        // semantics, no unsafe.
+        let _ = ran;
+        use core::sync::atomic::AtomicBool;
+        let ran = Arc::new(AtomicBool::new(false));
+        let id_slot_handler = id_slot.clone();
+        let ran_handler = ran.clone();
+        let id = subscribe_changes(Box::new(move |_changed: &[String]| {
+            ran_handler.store(true, Ordering::Relaxed);
+            // Self-unsubscribe. Without the snapshot pattern this
+            // would deadlock against the SUBSCRIBERS Mutex.
+            if let Some(my_id) = *id_slot_handler.lock() {
+                unsubscribe(my_id);
+            }
+        }));
+        *id_slot.lock() = Some(id);
+
+        // Force an apply — handler must run + survive its own
+        // unsubscribe call.
+        let pre = with_state(|s| s.clone()).expect("init ran");
+        let next = ast::cell_push(
+            "DeadlockProbe",
+            fact_from_pairs(&[("k", "v")]),
+            &pre,
+        );
+        apply(next).expect("apply succeeds post-init");
+
+        assert!(ran.load(Ordering::Relaxed), "handler must have run");
+        // After the self-unsubscribe, a second apply must NOT
+        // re-invoke the handler.
+        ran.store(false, Ordering::Relaxed);
+        let pre2 = with_state(|s| s.clone()).expect("init ran");
+        let next2 = ast::cell_push(
+            "DeadlockProbe2",
+            fact_from_pairs(&[("k", "w")]),
+            &pre2,
+        );
+        apply(next2).expect("apply succeeds post-init");
+        assert!(!ran.load(Ordering::Relaxed),
+            "handler must not re-run after self-unsubscribe");
     }
 }
