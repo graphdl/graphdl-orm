@@ -71,7 +71,10 @@ if ($Smoke) {
     $prevEAP = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
-        & docker run --rm --name $containerName -d arest-kernel-uefi | Out-Null
+        # -p 8080:8080: bridge container's exposed 8080 to the host so the
+        # post-launcher curl step (#361) can reach the kernel's HTTP listener
+        # via QEMU's hostfwd=tcp::8080-:80.
+        & docker run --rm --name $containerName -d -p 8080:8080 arest-kernel-uefi | Out-Null
     } finally {
         $ErrorActionPreference = $prevEAP
     }
@@ -210,6 +213,44 @@ if ($Smoke) {
             Write-Host "`n--- captured serial log ($logPath) ---"
             Write-Host $log
             exit 1
+        }
+
+        # #361: curl the kernel's HTTP listener from the host. Soft check —
+        # smoke PASSES on the banner observation alone (the in-kernel
+        # network/handler path is already verified there). The curl seals
+        # the host-reachable half (host -> docker:8080 -> QEMU hostfwd
+        # -> guest:80) when it works; if it doesn't, surface a WARNING
+        # rather than failing because:
+        #   - Slint's event loop pauses when idle, so net::poll() may
+        #     fire only every few hundred ms, slowing DHCPv4 settle.
+        #   - QEMU SLiRP DHCPv4 typically resolves in <1 s but UEFI
+        #     boot timing variance can push past 30 s on a cold container.
+        # The kernel banner stack already covers what register_http +
+        # net::init being live needs to prove; the host-reachability
+        # piece is bonus. Promote to hard-fail once the timing is
+        # consistently < 30 s.
+        $curlOk = $false
+        $curlBody = $null
+        $curlDeadline = (Get-Date).AddSeconds(45)
+        while ((Get-Date) -lt $curlDeadline) {
+            try {
+                $resp = Invoke-WebRequest -Uri "http://localhost:8080/" -TimeoutSec 3 -ErrorAction Stop
+                if ($resp.StatusCode -ge 200 -and $resp.StatusCode -lt 500) {
+                    $curlOk = $true
+                    $curlBody = $resp.StatusCode
+                    break
+                }
+            } catch {
+                Start-Sleep -Milliseconds 500
+            }
+        }
+
+        if (-not $curlOk) {
+            Write-Host "WARN: banner OK but http://localhost:8080/ unreachable from host within 45 s (#361)." -ForegroundColor Yellow
+            Write-Host "      Network path: host -> docker -p 8080 -> QEMU hostfwd -> guest :80." -ForegroundColor Yellow
+            Write-Host "      Banner-level smoke still PASSES; the in-kernel side is verified." -ForegroundColor Yellow
+        } else {
+            Write-Host "PASS: http://localhost:8080/ reachable (HTTP $curlBody) — full host curl path verified." -ForegroundColor Green
         }
 
         Write-Host "PASS: UEFI scaffold banner observed." -ForegroundColor Green
