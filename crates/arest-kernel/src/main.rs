@@ -168,6 +168,14 @@ mod allocator;
 mod block;
 #[cfg(target_arch = "x86_64")]
 mod block_storage;
+// `file_serve` (#403): HTTP `GET|HEAD /file/{id}/content` route. Reads
+// File noun bytes out of the baked SYSTEM state and produces fully-
+// serialised HTTP/1.1 wire bytes (including 206 Partial Content for
+// `Range` requests). Lives next to `net` because the dispatch path
+// reaches both — same x86_64-only gating since the lookup uses
+// `block_storage::reserve_region` for region-backed blobs.
+#[cfg(target_arch = "x86_64")]
+mod file_serve;
 #[cfg(target_arch = "x86_64")]
 mod net;
 #[cfg(not(target_os = "uefi"))]
