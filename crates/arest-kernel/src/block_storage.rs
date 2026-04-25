@@ -520,6 +520,187 @@ impl RegionHandle {
     }
 }
 
+// ── Blob slot allocator (#401) ─────────────────────────────────────
+//
+// Layered on top of `reserve_region` to back `File.content_ref`
+// region storage (readings/filesystem.md). The encoding spec lives
+// in that reading; the kernel side ships only the allocator and the
+// fixed slot table.
+//
+// Layout:
+//
+//   * Slots are fixed-size, fixed-position. Slot `i` covers sectors
+//     [BLOB_BASE_SECTOR + i * BLOB_SLOT_SECTORS,
+//      BLOB_BASE_SECTOR + (i + 1) * BLOB_SLOT_SECTORS).
+//   * BLOB_BASE_SECTOR = 8192. Sits well above the Doom save table
+//     (1024..=5184 — see `doom::save_slot_region`) and the #337
+//     checkpoint footprint (sector 0 + a few hundred sectors of
+//     body). The window 5185..8191 is intentionally left as slack
+//     so a future audit-log primitive can land between Doom and
+//     the blob region without re-shuffling.
+//   * BLOB_SLOT_BYTES = 256 KiB per slot. Bigger than the 64 KiB
+//     inline-vs-region threshold by a factor of 4 so the typical
+//     "just over inline" file (a small image, a 100 KiB CSV) fits
+//     in one slot with headroom.
+//   * BLOB_SLOT_COUNT = 256. 256 × 256 KiB = 64 MiB of region-
+//     backed storage. End sector = 8192 + 256 × 512 = 139_264 →
+//     requires a virtio-blk disk ≥ ~80 MiB. Smaller disks fail
+//     allocation and the consumer is expected to fall back to
+//     inline-only storage (which holds ≤ 64 KiB per file).
+//
+// Free-list state is a fixed-size `[bool; 256]` behind a
+// `spin::Mutex` — small, contention-free in practice (the kernel
+// is currently single-threaded outside IRQ context), and sized to
+// match `BLOB_SLOT_COUNT` exactly so a slot-id always indexes
+// safely.
+//
+// KNOWN LIMITATION: the free-list is in-memory only. After a
+// reboot it appears empty, even if the rehydrated `File` table
+// references slots that were live before the crash. The follow-up
+// (file-ops layer) is responsible for walking the rehydrated File
+// rows and re-marking their slots used during `mount` — that's why
+// `alloc_region` is exposed as a separate primitive rather than
+// being driven from inside this module.
+
+/// First sector of the blob slot table. Picked well clear of the
+/// Doom save region (`doom::SAVE_BASE_SECTOR` = 1024 with 64-slot
+/// stride 65 → 5184 sectors used) and the #337 checkpoint
+/// footprint, with slack between for a future audit-log primitive.
+pub const BLOB_BASE_SECTOR: u64 = 8192;
+
+/// Bytes per blob slot. 256 KiB — chosen as 4× the 64 KiB inline-
+/// vs-region threshold so a "just over inline" file fits with
+/// headroom, and small enough that the full table (256 × 256 KiB
+/// = 64 MiB) fits inside the 80 MiB disk size that the harness
+/// can be asked to provision for filesystem-enabled boots.
+pub const BLOB_SLOT_BYTES: u64 = 256 * 1024;
+
+/// Per-slot stride in 512-byte sectors. Pre-computed so the
+/// arithmetic is obvious at the call site.
+pub const BLOB_SLOT_SECTORS: u64 = BLOB_SLOT_BYTES / BLOCK_SECTOR_SIZE as u64;
+
+/// Number of slots in the table. 256 × 256 KiB = 64 MiB region-
+/// backed blob storage ceiling. A consumer that needs more either
+/// shares slots (multi-blob-per-slot framing) or waits for the
+/// bitmap-allocator follow-up.
+pub const BLOB_SLOT_COUNT: usize = 256;
+
+/// Inline-vs-region cut-over threshold the file-ops encoder uses
+/// when deciding which `ContentRef` shape to emit. Documented here
+/// (rather than in the encoder) because the on-disk allocator
+/// needs to know it to size slots sensibly. 64 KiB = one DO write
+/// payload, comfortable Vec resize bound, small enough not to
+/// bloat in-memory cells that hold inline blobs.
+pub const BLOB_INLINE_MAX_BYTES: u64 = 64 * 1024;
+
+/// In-memory free-list. `false` = free, `true` = allocated. Sized
+/// to exactly `BLOB_SLOT_COUNT` so a `slot_id < BLOB_SLOT_COUNT`
+/// check is sufficient before indexing.
+static BLOB_SLOTS: Mutex<[bool; BLOB_SLOT_COUNT]> = Mutex::new([false; BLOB_SLOT_COUNT]);
+
+/// Allocate a region large enough to hold `byte_len` bytes of blob
+/// payload. The returned `RegionHandle` covers exactly one slot —
+/// `BLOB_SLOT_BYTES` of contiguous on-disk storage — regardless of
+/// the requested length, so a caller that writes a 100 KiB blob
+/// into a slot-sized region simply leaves the trailing bytes
+/// undefined (this layer carries no length framing; the file-ops
+/// `ContentRef::Region { byte_len, .. }` field tracks the live
+/// length).
+///
+/// Fails with:
+///   * `Error::StateTooLarge` — `byte_len > BLOB_SLOT_BYTES`. A
+///     follow-up may grow the slot or chain multiple slots; for
+///     now the consumer must reject the file.
+///   * `Error::OutOfRange` — every slot is allocated, or the
+///     virtio-blk disk is too small for the slot table (the
+///     underlying `reserve_region` call refuses). Callers that
+///     get this error should either fall back to inline storage
+///     (when the blob fits the inline threshold) or surface the
+///     out-of-space condition.
+///   * `Error::NotMounted` — propagated from `reserve_region`
+///     when no virtio-blk device is installed.
+#[allow(dead_code)]
+pub fn alloc_region(byte_len: u64) -> Result<RegionHandle, Error> {
+    if byte_len > BLOB_SLOT_BYTES {
+        return Err(Error::StateTooLarge);
+    }
+    let slot_id = {
+        let mut slots = BLOB_SLOTS.lock();
+        let free = slots.iter().position(|&used| !used);
+        match free {
+            Some(i) => {
+                slots[i] = true;
+                i
+            }
+            None => return Err(Error::OutOfRange),
+        }
+    };
+    let base = BLOB_BASE_SECTOR + (slot_id as u64) * BLOB_SLOT_SECTORS;
+    match reserve_region(base, BLOB_SLOT_SECTORS) {
+        Ok(handle) => Ok(handle),
+        Err(e) => {
+            // Roll back the in-memory mark so the slot doesn't leak
+            // when the underlying disk refuses the range. Without
+            // this, a too-small disk would burn through the slot
+            // table on repeated alloc attempts.
+            BLOB_SLOTS.lock()[slot_id] = false;
+            Err(e)
+        }
+    }
+}
+
+/// Return a previously-allocated region to the free-list. The
+/// `handle` must have come from `alloc_region` — handles minted
+/// directly via `reserve_region` outside the slot table will fail
+/// with `Error::OutOfRange`.
+///
+/// Fails with:
+///   * `Error::OutOfRange` — `handle.base_sector` is not aligned
+///     to a slot boundary, or its slot id is out of range, or the
+///     handle's `sector_count` doesn't match `BLOB_SLOT_SECTORS`.
+///   * (No `Error::NotMounted` — freeing is purely an in-memory
+///     bookkeeping op and works even when the disk has gone away
+///     mid-session.)
+///
+/// Double-free is detected: freeing an already-free slot returns
+/// `Error::OutOfRange`. The kernel does not panic, so a buggy
+/// consumer can't take down the system through repeat-frees.
+#[allow(dead_code)]
+pub fn free_region(handle: RegionHandle) -> Result<(), Error> {
+    let base = handle.base_sector();
+    if handle.sector_count() != BLOB_SLOT_SECTORS {
+        return Err(Error::OutOfRange);
+    }
+    if base < BLOB_BASE_SECTOR {
+        return Err(Error::OutOfRange);
+    }
+    let offset = base - BLOB_BASE_SECTOR;
+    if offset % BLOB_SLOT_SECTORS != 0 {
+        return Err(Error::OutOfRange);
+    }
+    let slot_id = (offset / BLOB_SLOT_SECTORS) as usize;
+    if slot_id >= BLOB_SLOT_COUNT {
+        return Err(Error::OutOfRange);
+    }
+    let mut slots = BLOB_SLOTS.lock();
+    if !slots[slot_id] {
+        // Double-free — the slot was already free. Surface as
+        // OutOfRange so the consumer notices, but don't poison
+        // the slot.
+        return Err(Error::OutOfRange);
+    }
+    slots[slot_id] = false;
+    Ok(())
+}
+
+/// Number of currently-allocated blob slots. Useful for boot-time
+/// banner reporting and for the future free-list-rehydrate hook
+/// to confirm post-mount state matches the rehydrated File table.
+#[allow(dead_code)]
+pub fn blob_slots_in_use() -> usize {
+    BLOB_SLOTS.lock().iter().filter(|&&used| used).count()
+}
+
 // ── CRC-32/IEEE ────────────────────────────────────────────────────
 //
 // Textbook table-free implementation. Fine for the MVP checkpoint
