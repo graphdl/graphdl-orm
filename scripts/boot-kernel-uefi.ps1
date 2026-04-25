@@ -133,7 +133,19 @@ if ($Smoke) {
             # observing motion) or, in the worst case, an absent
             # banner entirely (triple-fault before the line writes).
             "pit:      1 kHz timer online, IRQ 0",
-            "pit:      now_ms advanced t0="
+            "pit:      now_ms advanced t0=",
+            # #364: PS/2 keyboard banner. The "driver online" line is
+            # printed immediately after `init_time()` (which is what
+            # unmasks IRQ 1); its appearance proves the unmask + the
+            # IDT vector 33 swap from defensive stub to
+            # `keyboard_handler` did not fault. The "poll" line shows
+            # the read-keystroke API surface works -- expected outcome
+            # under the headless smoke harness is "idle" because QEMU
+            # has no keyboard input wired, but the matcher is broad
+            # enough that a future smoke that injects a scancode
+            # would still pass without rewriting the assertion.
+            "kbd:      PS/2 driver online (IRQ 1 unmasked)",
+            "kbd:      poll "
         )
         $missing = @()
         foreach ($phrase in $expected) {

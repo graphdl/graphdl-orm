@@ -54,6 +54,7 @@
 //     hardware interrupts come online.
 
 pub mod interrupts;
+pub mod keyboard;
 pub mod memory;
 mod serial;
 pub mod time;

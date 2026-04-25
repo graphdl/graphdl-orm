@@ -24,7 +24,13 @@
 //     shared kernel body's Doom tic accumulator, net retry budgets,
 //     and any `hlt`-then-poll idle work identically on UEFI as on
 //     BIOS. From #379.
-//   * IRQ 1..15 (vectors 33..47) wired to a default handler that just
+//   * IRQ 1 (PS/2 keyboard, vector 33 after PIC remap) — drives
+//     `arch::uefi::keyboard::handle_scancode`. Reads the scancode
+//     from port 0x60, hands it to `pc-keyboard`'s decoder, and
+//     pushes any resulting `DecodedKey` onto the kernel-side ring
+//     for later drain by the boot smoke or (in #365 scope) the
+//     UEFI REPL pump. From #364.
+//   * IRQ 2..15 (vectors 34..47) wired to a default handler that just
 //     EOIs and returns. Defensive — once `sti` is on, firmware-leftover
 //     pending IRQs (RTC, mouse, COM2 from before EBS) can fire into
 //     the IDT; without these stubs they'd hit unpopulated vectors and
@@ -38,9 +44,9 @@
 //     #DF handler runs on the firmware-supplied stack rather than a
 //     dedicated IST entry, which is sufficient for "print + halt"
 //     but not for stack-overflow recovery.
-//   * PS/2 keyboard (IRQ 1) handler with real decode + dispatch.
-//     The default IRQ 1 handler currently just EOIs; #344f / #364
-//     wire the keyboard pipeline.
+//   * REPL drain pump — the keyboard ring is fed from IRQ 1 but
+//     nothing on the UEFI path drains it into the line editor yet.
+//     #365 wires the pump alongside a UEFI-reachable REPL.
 //   * Page-fault / GP-fault / #UD handlers — kernel ring-0 only on
 //     the UEFI path today; ring-3 descent and its associated fault
 //     decoding lands alongside a UEFI syscall path.
@@ -48,6 +54,7 @@
 use crate::println;
 use pic8259::ChainedPics;
 use spin::{Mutex, Once};
+use x86_64::instructions::port::Port;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
 
 /// Base vectors for the two cascaded PICs. Chosen to sit right
@@ -98,11 +105,13 @@ static IDT: Once<InterruptDescriptorTable> = Once::new();
 /// firmware's post-EBS state must be settled (no more BootServices
 /// callbacks reaching for their own gates).
 ///
-/// What this populates (extended in #379 for the IRQ 0 timer):
+/// What this populates (extended in #379 for the IRQ 0 timer, in
+/// #364 for the IRQ 1 keyboard):
 ///   * #BP and #DF — the original #363 surface.
 ///   * IRQ 0 (vector 32) → `timer_handler`.
-///   * IRQ 1 (vector 33) → `default_irq_handler` — placeholder until
-///     #344f / #364 wires the real keyboard handler.
+///   * IRQ 1 (vector 33) → `keyboard_handler` (#364) — reads scancode
+///     from port 0x60, decodes via `pc-keyboard`, and pushes the
+///     resulting `DecodedKey` onto the `arch::uefi::keyboard` ring.
 ///   * Vectors 34..47 → `default_irq_handler` (PIC IRQ 2..15 — RTC,
 ///     mouse, COM ports — defensive stubs so a firmware-pending IRQ
 ///     doesn't trigger an unpopulated-vector triple fault once the
@@ -131,16 +140,21 @@ pub fn init_interrupts() {
         // `pic_init` below.
         idt[InterruptIndex::Timer.as_u8()].set_handler_fn(timer_handler);
 
-        // Defensive: IRQ 1..15 (vectors 33..47) get a stub handler.
+        // IRQ 1 — PS/2 keyboard (#364). Reads port 0x60, runs the
+        // byte through the `pc-keyboard` decoder, and pushes the
+        // decoded keystroke onto the kernel-side ring. The ring is
+        // drained by the boot smoke today; the UEFI REPL pump (#365)
+        // becomes the production drainer.
+        idt[InterruptIndex::Keyboard.as_u8()].set_handler_fn(keyboard_handler);
+
+        // Defensive: IRQ 2..15 (vectors 34..47) get a stub handler.
         // Without this, a firmware-leftover pending IRQ that fires
         // immediately after `sti` (e.g. RTC, mouse, COM2 from
         // before EBS) would hit an unpopulated vector and triple-
         // fault the box. The stub EOIs to both PICs (since we
         // don't know which line fired without checking ISR) and
-        // returns. The keyboard slot is included here so #344f /
-        // #364 can override it with a real handler later without
-        // changing any other site.
-        for vec in (PIC_1_OFFSET + 1)..=(PIC_2_OFFSET + 7) {
+        // returns.
+        for vec in (PIC_1_OFFSET + 2)..=(PIC_2_OFFSET + 7) {
             idt[vec].set_handler_fn(default_irq_handler);
         }
 
@@ -159,28 +173,40 @@ pub fn init_interrupts() {
 
 /// Remap the cascaded 8259 PIC pair so IRQ 0..15 land on vectors
 /// 32..47 instead of the firmware-default 0x08..0x0F (which collide
-/// with CPU-exception slots). Then unmask only IRQ 0 (the PIT timer)
-/// — IRQ 1 (keyboard) is #344f / #364 scope and stays masked here so
-/// the boot banner is deterministic regardless of host keyboard
-/// activity inside the smoke container.
+/// with CPU-exception slots), then unmask IRQ 0 (PIT timer) and
+/// IRQ 1 (PS/2 keyboard). All other lines stay masked so a stray
+/// RTC / mouse / COM IRQ doesn't fire into the defensive stubs and
+/// burn cycles for no observable effect.
+///
+/// Keyboard decoder is initialised here (rather than in
+/// `init_interrupts`) so the lazy `Once` payload is populated
+/// BEFORE the IRQ 1 mask is cleared — otherwise a firmware-pending
+/// scancode that fires between unmask and the first decoder-feed
+/// would land in `keyboard_handler` with `KEYBOARD.get()` returning
+/// `None`, dropping the byte. Order matters.
 ///
 /// SAFETY: programs the legacy 8259 ICW sequence over ports
 /// 0x20/0x21/0xA0/0xA1. UEFI firmware leaves these ports wired even
 /// post-EBS on QEMU+OVMF; the same `Pic8259::initialize` sequence
 /// the BIOS arm uses works byte-for-byte here.
 pub fn pic_init() {
+    // Stand up the `pc-keyboard` decoder singleton before the IRQ
+    // mask is cleared — see docstring for the ordering rationale.
+    super::keyboard::init();
+
     // SAFETY: ICW programming sequence — driven entirely through the
     // PIC's documented port pair. No memory state is touched. Same
     // call the BIOS arm makes from `init_pic`.
     unsafe {
         let mut pics = PICS.lock();
         pics.initialize();
-        // 0xFE = 1111_1110 on PIC1 — unmask only IRQ 0 (timer).
+        // 0xFC = 1111_1100 on PIC1 — unmask IRQ 0 (timer) AND
+        // IRQ 1 (keyboard). Bit 0 = 0 → IRQ 0 enabled; bit 1 = 0 →
+        // IRQ 1 enabled. Same mask byte the BIOS arm writes (see
+        // `arch::x86_64::interrupts::init_pic`) so the keyboard
+        // wakes the same way on both boot paths.
         // 0xFF on PIC2 — keep RTC/mouse/etc all masked.
-        // Keyboard (IRQ 1, mask bit 0xFD) stays masked here on the
-        // UEFI arm because #379 scope is timer-only; #344f / #364
-        // will widen the mask when the keyboard handler lands.
-        pics.write_masks(0xFE, 0xFF);
+        pics.write_masks(0xFC, 0xFF);
     }
 }
 
@@ -264,10 +290,45 @@ extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
     }
 }
 
-/// Stub handler for IRQ vectors 33..47 (PIC IRQ 1..15). EOIs the
+/// PS/2 keyboard (IRQ 1, vector 33) handler (#364). Reads the
+/// scancode byte from port 0x60, hands it to the
+/// `arch::uefi::keyboard` ring (which feeds the byte through the
+/// `pc-keyboard` decoder and stashes any resulting `DecodedKey`),
+/// then EOIs the primary PIC.
+///
+/// Same shape as the BIOS arm's `keyboard_handler`: keep the
+/// in-ISR work bounded, EOI before any potentially-blocking
+/// dispatch (here the dispatch is just a lock + push, which we do
+/// inline because there is no REPL drainer on UEFI yet).
+///
+/// EOI is sent at the END so the next scancode can fire only after
+/// the ring write completes — important on a slow drainer because
+/// the ring is bounded and the ISR drops oldest under back-pressure;
+/// late EOI here would surface as a spurious double-pop on the
+/// drainer side rather than a silent drop.
+extern "x86-interrupt" fn keyboard_handler(_stack_frame: InterruptStackFrame) {
+    // SAFETY: 0x60 is the PS/2 keyboard data port — a documented
+    // PC-architecture port that returns the most recent scancode
+    // byte. Single read, no side effects beyond clearing the
+    // controller's output buffer.
+    let mut port = Port::<u8>::new(0x60);
+    let scancode: u8 = unsafe { port.read() };
+
+    super::keyboard::handle_scancode(scancode);
+
+    // SAFETY: `notify_end_of_interrupt` writes the EOI command byte
+    // (0x20) to PIC1's command port. Standard PIC EOI sequence;
+    // idempotent and tolerant of being called from any ring 0
+    // context.
+    unsafe {
+        PICS.lock()
+            .notify_end_of_interrupt(InterruptIndex::Keyboard.as_u8());
+    }
+}
+
+/// Stub handler for IRQ vectors 34..47 (PIC IRQ 2..15). EOIs the
 /// PIC so the line doesn't stay latched, but does no other work —
-/// real per-IRQ handlers (keyboard #344f, etc.) replace this slot
-/// when they come online.
+/// real per-IRQ handlers replace this slot when they come online.
 ///
 /// We don't know which IRQ fired without reading ISR, so we just
 /// EOI both PICs unconditionally. This is safe: an EOI to a PIC
