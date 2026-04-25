@@ -333,12 +333,34 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 /// two heap-allocated back buffers; `draw_idx` selects which back
 /// is currently the draw target. `present()` copies the dirty
 /// region of the active back to the front, then flips `draw_idx`.
+///
+/// `backend` decides what (if anything) `present()` does AFTER the
+/// memcpy lands. `Gop` is the existing path — once bytes are in the
+/// firmware-mapped MMIO region the GPU picks them up on its own
+/// vsync. `VirtioGpu` requires an explicit transfer_to_host_2d +
+/// resource_flush submission via `virtio_gpu::flush_active_surface`
+/// so the host actually sees the new pixels (#371).
 struct Driver {
     info: FrameBufferInfo,
     front: &'static mut [u8],
     backs: [BackBuffer; 2],
     draw_idx: usize,
     presents: u64,
+    backend: FrontBackend,
+}
+
+/// Where the front buffer's bytes ultimately end up.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FrontBackend {
+    /// Firmware-mapped MMIO surface (BIOS bootloader_api framebuffer
+    /// or UEFI GraphicsOutputProtocol). The GPU reads it on its own
+    /// vsync; nothing more for `present()` to do.
+    Gop,
+    /// virtio-gpu DMA-backed 2D resource attached to scanout 0 (#371).
+    /// `present()` calls `virtio_gpu::flush_active_surface()` to
+    /// submit `RESOURCE_FLUSH` (virtio-gpu spec sec 5.7.6.7) so the
+    /// host actually blits the new pixels to the display.
+    VirtioGpu,
 }
 
 impl Driver {
@@ -362,6 +384,15 @@ impl Driver {
                     .copy_from_slice(&back.bytes[off + row_byte_start..off + row_byte_end]);
             }
             self.presents = self.presents.wrapping_add(1);
+            // Backend-specific submission. GOP firmware picks the
+            // bytes up on its next vsync; virtio-gpu needs an
+            // explicit resource_flush so the host blits to the
+            // attached scanout (spec sec 5.7.6.7) — without it the
+            // DMA buffer changes invisibly to the display.
+            if let FrontBackend::VirtioGpu = self.backend {
+                #[cfg(target_arch = "x86_64")]
+                let _ = crate::virtio_gpu::flush_active_surface();
+            }
         }
         self.draw_idx ^= 1;
     }
@@ -385,7 +416,55 @@ pub unsafe fn install(info: FrameBufferInfo, buffer_ptr: *mut u8, buffer_len: us
         BackBuffer::new(info, buffer_len),
         BackBuffer::new(info, buffer_len),
     ];
-    *FB.lock() = Some(Driver { info, front, backs, draw_idx: 0, presents: 0 });
+    *FB.lock() = Some(Driver {
+        info,
+        front,
+        backs,
+        draw_idx: 0,
+        presents: 0,
+        backend: FrontBackend::Gop,
+    });
+}
+
+/// Install the framebuffer singleton on top of a virtio-gpu DMA-backed
+/// 2D resource (#371). Mirrors `install` for the GOP path but the
+/// front-buffer bytes are the virtio-gpu surface returned by the
+/// driver's `framebuffer_buffer()`, and `present()` additionally
+/// issues a `resource_flush` after the dirty-rect memcpy so the host
+/// actually blits the new pixels to scanout 0.
+///
+/// The driver itself must already be parked in
+/// `virtio_gpu::install(...)` before this call so `present()`'s
+/// flush callback can reach it through the singleton.
+///
+/// # Safety
+///
+/// `buffer_ptr` + `buffer_len` must describe the virtio-gpu DMA region
+/// returned by `VirtIoGpuDriver::framebuffer_buffer()`. The driver
+/// lives in `virtio_gpu::GPU` for the rest of the kernel's lifetime,
+/// so the underlying `Dma<H>` storage is `'static`. No other code may
+/// hold a reference to those bytes when this is called — the
+/// framebuffer driver becomes the sole writer.
+pub unsafe fn install_virtio_gpu(
+    info: FrameBufferInfo,
+    buffer_ptr: *mut u8,
+    buffer_len: usize,
+) {
+    let front: &'static mut [u8] = unsafe {
+        core::slice::from_raw_parts_mut(buffer_ptr, buffer_len)
+    };
+    let backs = [
+        BackBuffer::new(info, buffer_len),
+        BackBuffer::new(info, buffer_len),
+    ];
+    *FB.lock() = Some(Driver {
+        info,
+        front,
+        backs,
+        draw_idx: 0,
+        presents: 0,
+        backend: FrontBackend::VirtioGpu,
+    });
 }
 
 /// Surface metadata, lock-free. `None` if the driver wasn't

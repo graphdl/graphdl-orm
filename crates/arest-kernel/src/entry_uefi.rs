@@ -541,8 +541,14 @@ fn kernel_run_uefi(
     crate::virtio::init_offset(0);
     let virtio_net_pci = crate::pci::find_virtio_net();
     let virtio_blk_pci = crate::pci::find_virtio_blk();
+    // Track AAA's deferred hookup (#370): drive `find_virtio_gpu` here
+    // alongside the net + blk walks. Banner is the same shape so a
+    // smoke harness can pattern-match the family. Driver bring-up
+    // (#371 — this commit) lives further down so virtio-gpu init
+    // sits next to the framebuffer install path it feeds into.
+    let virtio_gpu_pci = crate::pci::find_virtio_gpu();
     println!(
-        "  pci:      walk OK (virtio-net: {}, virtio-blk: {})",
+        "  pci:      walk OK (virtio-net: {}, virtio-blk: {}, virtio-gpu: {})",
         match &virtio_net_pci {
             Some(d) => alloc::format!(
                 "{:02x}:{:02x}.{}", d.bus, d.device, d.function
@@ -550,6 +556,12 @@ fn kernel_run_uefi(
             None => alloc::string::String::from("none"),
         },
         match &virtio_blk_pci {
+            Some(d) => alloc::format!(
+                "{:02x}:{:02x}.{}", d.bus, d.device, d.function
+            ),
+            None => alloc::string::String::from("none"),
+        },
+        match &virtio_gpu_pci {
             Some(d) => alloc::format!(
                 "{:02x}:{:02x}.{}", d.bus, d.device, d.function
             ),
@@ -812,6 +824,71 @@ fn kernel_run_uefi(
         }
     } else {
         println!("  gop:      not available (headless UEFI boot)");
+    }
+
+    // virtio-gpu bring-up (#371). When the PCI walk above found a
+    // virtio-gpu-pci device, construct the driver, allocate a 2D
+    // resource attached to scanout 0, and re-install the framebuffer
+    // singleton on top of the DMA-backed surface. Subsequent
+    // `framebuffer::with_back` draws + `present()` calls will then
+    // blit through virtio-gpu's resource_flush path instead of the
+    // GOP firmware-mapped MMIO fallback above.
+    //
+    // GOP fallback retained: when no virtio-gpu device is present
+    // (or driver init fails), the GOP install above stays in place
+    // and the kernel keeps drawing through the firmware framebuffer.
+    // Backend priority across both surfaces is a follow-up (#382);
+    // this commit just wires the virtio-gpu surface in opportunistically.
+    if let Some(dev) = virtio_gpu_pci {
+        match crate::virtio_gpu::init_from_pci(dev) {
+            Ok(driver) => {
+                let w = driver.width();
+                let h = driver.height();
+                let buf_len = driver.buffer_len();
+                println!(
+                    "  virtio-gpu: driver online, {w}x{h} (B8G8R8A8UNORM, {buf_len} bytes)"
+                );
+                // Park the driver so framebuffer's present() can call
+                // back through `flush_active_surface()`, then re-borrow
+                // the DMA surface for the framebuffer install. The
+                // driver lives in the static `Mutex` for the rest of
+                // the kernel's lifetime, so the buffer pointer is
+                // effectively `'static` — see virtio_gpu.rs's lifetime-
+                // story comment for the soundness argument.
+                crate::virtio_gpu::install(driver);
+                let (fb_ptr, fb_len) = crate::virtio_gpu::with_driver(|d| {
+                    let buf = d.framebuffer_buffer();
+                    (buf.as_mut_ptr(), buf.len())
+                }).expect("virtio-gpu driver was just installed");
+                // virtio-gpu always blits B8G8R8A8UNORM (4 bpp, Bgr
+                // channel order, no separate stride). Build the
+                // FrameBufferInfo to match — the existing write_pixel
+                // Bgr arm + 4bpp blit_doom_frame paths Just Work.
+                let info = bootloader_api::info::FrameBufferInfo {
+                    byte_len: fb_len,
+                    width: w as usize,
+                    height: h as usize,
+                    pixel_format: bootloader_api::info::PixelFormat::Bgr,
+                    bytes_per_pixel: 4,
+                    stride: w as usize,
+                };
+                // SAFETY: fb_ptr/fb_len describe the virtio-gpu DMA
+                // region returned by setup_framebuffer; the driver is
+                // parked in the singleton above so the storage is
+                // 'static for the kernel's lifetime. No other code
+                // holds a reference to the surface bytes — the
+                // framebuffer driver becomes the sole writer.
+                unsafe {
+                    crate::framebuffer::install_virtio_gpu(info, fb_ptr, fb_len);
+                }
+                println!("  fb:       virtio-gpu surface installed");
+            }
+            Err(e) => {
+                println!("  virtio-gpu: init failed ({e:?}); GOP fallback retained");
+            }
+        }
+    } else {
+        println!("  virtio-gpu: no device");
     }
 
     // Post-EBS heap smoke (step 4d wave 3, 5b74f2a). `uefi::allocator`
