@@ -129,6 +129,21 @@ mod framebuffer;
 // end-to-end verification). pub so the future Qt/GTK adapters
 // and the launcher's super-loop can reach `compose_frame`.
 pub mod composer;
+// `toolkit_loop` (#490 Track MMMM). Event-loop side of the foreign-
+// toolkit Component runtime — sibling of LLLL's #489 `composer`.
+// Where the composer owns the texture round-trip (Qt/GTK render into
+// `ForeignSurface`, Slint composites), this module owns event-loop
+// coordination: Qt's `QEventLoop`, GTK's `GMainLoop`, and Slint's
+// own per-tick housekeeping multiplexed inside UUU's #431 launcher
+// super-loop. Each registered `ToolkitPump` gets a budgeted time
+// slice (≤4ms) per tick; events from AREST's keyboard/pointer rings
+// route through `dispatch_key` / `dispatch_pointer` to the
+// focused-by-foreign-toolkit pump (existing direct dispatch is the
+// fallback when no foreign toolkit owns focus). Available
+// unconditionally — the abstraction has no toolkit-specific deps;
+// pump impls (qt_adapter::event_loop, gtk_adapter::event_loop) are
+// gated by their respective adapter features.
+pub mod toolkit_loop;
 mod http;
 // `pci` / `repl` reach `x86_64::instructions::port::Port` +
 // `x86_64::instructions::interrupts::disable` at module scope (see

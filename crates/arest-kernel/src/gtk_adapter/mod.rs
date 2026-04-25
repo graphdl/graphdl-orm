@@ -110,6 +110,7 @@
 #![allow(dead_code)]
 
 pub mod binding;
+pub mod event_loop;
 pub mod loader;
 pub mod marshalling;
 pub mod widgets;
