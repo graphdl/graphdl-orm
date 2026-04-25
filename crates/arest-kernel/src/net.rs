@@ -496,12 +496,18 @@ fn dispatch_request(
         ServeOutcome::Response(bytes) => bytes,
         ServeOutcome::NotApplicable => {
             let ct = file_upload::extract_content_type_header(rx_buf);
-            match file_upload::try_serve(
+            // #453: extract the optional Idempotency-Key header once
+            // and thread it through both upload entry points so a
+            // retried POST /file or PUT /file/{id}/chunk returns the
+            // cached response instead of duplicating work (per #446).
+            let idem = file_upload::extract_idempotency_key_header(rx_buf);
+            match file_upload::try_serve_idempotent(
                 &req.method,
                 &req.path,
                 ct.as_deref(),
                 &req.body,
                 crate::system::state(),
+                idem.as_deref(),
             ) {
                 UploadOutcome::Response(bytes) => bytes,
                 UploadOutcome::NotApplicable => {
@@ -509,11 +515,12 @@ fn dispatch_request(
                     // half of the resumable-upload protocol
                     // (#445).
                     let cr = file_upload::extract_content_range_header(rx_buf);
-                    match file_upload::try_serve_chunk(
+                    match file_upload::try_serve_chunk_idempotent(
                         &req.method,
                         &req.path,
                         &req.body,
                         cr.as_deref(),
+                        idem.as_deref(),
                     ) {
                         UploadOutcome::Response(bytes) => bytes,
                         UploadOutcome::NotApplicable => {
