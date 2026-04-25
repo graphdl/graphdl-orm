@@ -5,7 +5,7 @@ version = "0.9.0"
 edition = "2021"
 description = "AREST engine: FORML2 parser, constraint compiler, evaluator, forward chainer, RMAP, and verbalization"
 repository = "https://github.com/graphdl/arest"
-license = "MIT"
+license = "AGPL-3.0-or-later"
 # Disable Cargo's per-file `tests/*.rs` auto-discovery so the three
 # big integration suites can be bundled into one `tests/all.rs` binary
 # (see comments there). Each remaining standalone test binary is

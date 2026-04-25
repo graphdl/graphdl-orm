@@ -21,7 +21,7 @@ name = "arest-kernel-image"
 version = "0.1.0"
 edition = "2021"
 description = "Builds bootable disk images for arest-kernel using the rust-osdev bootloader"
-license = "MIT"
+license = "AGPL-3.0-or-later"
 
 [features]
 # Forwarded to arest-kernel via the test harness. Not used by the
