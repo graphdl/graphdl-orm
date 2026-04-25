@@ -76,14 +76,24 @@ import { AppLauncher } from "./AppLauncher.slint";
 // kernel binary doesn't grow the WASM-driver weight when the feature
 // is off — only the Slint codegen for the unused Window survives.
 import { Doom } from "./Doom.slint";
+// Track QQQQ #465: same re-export trick for the fourth app icon —
+// the touch-driven on-screen keyboard. The Keyboard Window is
+// always reachable from the launcher (no cargo feature gate); it
+// is the foundation for the "phone shape" milestone where AREST
+// runs on a touch-only display under QEMU. Pulling it through the
+// import graph here ensures `crate::arch::uefi::slint_backend::
+// Keyboard` is generated alongside the other Window types in the
+// single `HateoasBrowser.rs` slint-build entry's output.
+import { Keyboard } from "./Keyboard.slint";
 
 // Re-export AppShell + Theme so the existing slint_backend.rs smoke
 // test (which constructs `AppShell::new()` after `slint::include_modules!()`)
 // keeps compiling without touching that file. `Repl` is re-exported
 // for `crate::ui_apps::repl` (Track TTT #430), `AppLauncher` for
-// `crate::ui_apps::launcher` (Track UUU #431), and `Doom` for
-// `crate::ui_apps::doom` (Track VVV #455) for the same reason.
-export { AppShell, Theme, ThemeMode, Repl, AppLauncher, Doom }
+// `crate::ui_apps::launcher` (Track UUU #431), `Doom` for
+// `crate::ui_apps::doom` (Track VVV #455), and `Keyboard` for
+// `crate::ui_apps::keyboard` (Track QQQQ #465) for the same reason.
+export { AppShell, Theme, ThemeMode, Repl, AppLauncher, Doom, Keyboard }
 
 // The HATEOAS browser window. The Rust glue (`ui_apps::hateoas`) sets
 // the four `*-model` properties from `system::with_state`, and the

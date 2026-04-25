@@ -1,0 +1,582 @@
+// crates/arest-kernel/ui/apps/Keyboard.slint
+//
+// AREST kernel — fourth Slint app: Virtual Keyboard (#465 Track QQQQ).
+//
+// Touch / pointer-driven on-screen QWERTY. Joins HateoasBrowser
+// (Track SSS #429), Repl (Track TTT #430), and Doom (Track VVV #455)
+// as the fourth launchable Slint app under the launcher splash
+// (Track UUU #431). Mirrors their Window-derived shape so the
+// launcher's show/hide navigation in `ui_apps::launcher` treats it
+// the same way: Esc returns to the launcher, taps on key cells route
+// through Slint callbacks to the Rust glue in `crate::ui_apps::keyboard`.
+//
+// # Why this matters
+//
+// Until #465 the kernel's only input path was a real PS/2 keyboard
+// (BIOS / OVMF IRQ 1 → `arch::uefi::keyboard::handle_scancode`,
+// Track EE / commit `8d9c14e`). On a touch-only display under QEMU
+// (or any future hardware with no keyboard) the AREST UI would be
+// inert. This app makes the system usable on a touch-only surface by
+// dispatching synthesised keystrokes onto the same kernel keyboard
+// ring the IRQ handler feeds — every other app (REPL, HATEOAS, Doom)
+// keeps consuming from `arch::uefi::keyboard::read_keystroke` without
+// any change.
+//
+// # Layout
+//
+// QWERTY hardcoded for this commit. Three modes (letters / numbers /
+// symbols) toggled via a row of mode buttons. Layout matches the
+// physical US-104 layout the `pc-keyboard` decoder targets so the
+// dispatched `DecodedKey::Unicode(c)` values land in the same shape
+// the IRQ path produces.
+//
+// The grid is sized to fit the bottom half of the screen (roughly
+// 50% vertical), leaving the top half for whichever app is focused.
+// On a 1024x720 panel that's ~360px tall — large enough for finger-
+// sized targets at ~60px per key. A future revision can swap the
+// hard-coded layout for FORML facts cross-referenced from #457's
+// MonoView readings (per task spec); this commit ships the QWERTY
+// baseline so the rest of the wiring lands first.
+//
+// # Callback contract
+//
+// `key-pressed(string)` fires once per pointer click on a key cell.
+// The string payload is the canonical Unicode codepoint the key
+// represents (e.g. "a", "A" if Shift is on, " " for space, "\u{0008}"
+// for backspace, "\u{000A}" for return, "\u{001B}" for escape).
+// `mode-changed()` fires after the user toggles between the letters /
+// numbers / symbols modes — the Rust glue can ignore it; it exists
+// for parity with the other apps' theme-toggled callback.
+//
+// # Multi-entry pattern
+//
+// Per Track SSS's #429 convention, this file is re-exported via
+// `HateoasBrowser.slint` (the slint-build entry — see Dockerfile.uefi
+// L54 comment) so the slint compiler walks the import graph and emits
+// `Keyboard` alongside the other Window-derived components into the
+// single generated `HateoasBrowser.rs` reached by
+// `slint::include_modules!()` in `arch/uefi/slint_backend.rs`. No
+// `build.rs` change needed.
+
+import { AppShell, Theme, ThemeMode } from "../AppShell.slint";
+import { Button, ButtonVariant } from "../components/Button.slint";
+
+// One key cell. Renders as a flat surface with the key's display
+// label centred; pointer-down fires `pressed(label)` so the parent
+// keyboard can dispatch the matching codepoint. We don't reuse the
+// shared `Button` component because that one is sized for prose
+// labels (variable-width text with horizontal padding); virtual
+// keyboard keys want a fixed square cell so the rows align even when
+// the labels have very different widths (compare "Q" vs "Shift" vs
+// "Space").
+component Key inherits Rectangle {
+    in property <string> label;
+    // Optional alternate codepoint dispatched on click — when set,
+    // overrides the visible label. Used for special keys whose
+    // display ("Bksp", "Esc", "Enter", "Space") differs from the
+    // codepoint they emit ("\u{0008}", "\u{001B}", "\u{000A}", " ").
+    in property <string> codepoint;
+    // Width units — most keys are 1, Space is wide, Shift / Bksp /
+    // Enter are 1.5x. Parent layout multiplies by a base cell size
+    // (60px) to compute pixel width.
+    in property <float> units: 1.0;
+    // Highlight when this is a "modifier" cell (Shift, mode toggle).
+    in property <bool> active: false;
+
+    callback pressed(string);
+
+    // Pointer-down feels more responsive on touch than click (which
+    // requires a press+release within the same area). We dispatch on
+    // `pointer-event(PointerEventKind.down)` so a touch that starts
+    // on this cell fires immediately, even if the user drags off
+    // before lifting.
+    background: active ? Theme.accent : Theme.neutral-100;
+    border-color: Theme.border;
+    border-width: 1px;
+    border-radius: 6px;
+    min-height: 56px;
+    min-width: 56px;
+
+    states [
+        pressed when touch.pressed : {
+            background: Theme.accent.darker(0.12);
+        }
+        hovered when touch.has-hover : {
+            background: active ? Theme.accent.darker(0.06) : Theme.neutral-200;
+        }
+    ]
+
+    animate background { duration: Theme.motion-fast; easing: ease-in-out; }
+
+    Text {
+        text: label;
+        color: active ? Theme.surface : Theme.text-primary;
+        font-family: Theme.type-button.family;
+        font-weight: Theme.type-button.weight;
+        font-size: Theme.type-button.size;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    touch := TouchArea {
+        // `clicked` rather than pointer-event for predictability:
+        // press-and-drag-off cancels (matches the Button component's
+        // semantics and the platform expectation for a virtual
+        // keyboard tap). The Slint MinimalSoftwareWindow translates
+        // the kernel pointer ring (Track AAAA #460 — populated by
+        // virtio-input under the linuxkpi shim per #459b/#495) into
+        // pointer events, which TouchArea consumes natively.
+        clicked => {
+            // Prefer the codepoint override when set, otherwise
+            // fall back to the label itself (for plain printable
+            // keys where label == codepoint).
+            root.pressed(root.codepoint != "" ? root.codepoint : root.label);
+        }
+        mouse-cursor: MouseCursor.pointer;
+    }
+}
+
+// Mode enum: which key set is currently rendered. The Rust glue
+// doesn't need to know about this — it's pure UI state.
+enum KeyMode { letters, numbers, symbols }
+
+export component Keyboard inherits Window {
+    // ---- Inputs (driven by the Rust glue) -------------------------
+
+    // Status line shown in the footer. Rust glue can update this
+    // with the count of dispatched keys, etc. Defaults to a hint.
+    in property <string> status-text: "Virtual Keyboard — tap a key to dispatch";
+
+    // ---- Callbacks (Rust glue mutates state) ----------------------
+
+    // Fires once per key tap. Argument is the codepoint string (one
+    // char for printable keys, an escape sequence for control chars).
+    // Rust glue translates to `pc_keyboard::DecodedKey::Unicode(c)`
+    // and pushes onto the kernel keyboard ring via
+    // `crate::arch::uefi::keyboard::push_keystroke`.
+    callback key-pressed(string);
+
+    // Mode toggle, exposed for parity with the other apps. Rust glue
+    // can ignore — Slint handles the mode swap internally.
+    callback mode-changed();
+
+    // Theme toggle (mirrors the other apps).
+    callback theme-toggled();
+
+    title: "AREST — Keyboard";
+    background: Theme.surface;
+    default-font-family: Theme.type-body.family;
+    default-font-size: Theme.type-body.size;
+    preferred-width: 1024px;
+    preferred-height: 720px;
+
+    // Local mode state. `letters` is the default (matches what the
+    // user expects when opening the keyboard). Shift toggles within
+    // letters between lowercase and uppercase. `numbers` and
+    // `symbols` are separate sub-pages for the numeric / punctuation
+    // rows.
+    property <KeyMode> mode: KeyMode.letters;
+    property <bool> shift: false;
+
+    VerticalLayout {
+        spacing: 0px;
+
+        // ----- Top bar: title + theme toggle ------------------------
+        // Matches HateoasBrowser / REPL / Doom / Launcher styling so
+        // all five surfaces feel continuous.
+        Rectangle {
+            background: Theme.neutral-100;
+            min-height: 56px;
+
+            HorizontalLayout {
+                padding-left: Theme.spacing-lg;
+                padding-right: Theme.spacing-lg;
+                padding-top: Theme.spacing-md;
+                padding-bottom: Theme.spacing-md;
+                spacing: Theme.spacing-md;
+                alignment: space-between;
+
+                Text {
+                    text: "Virtual Keyboard";
+                    color: Theme.text-primary;
+                    font-family: Theme.type-h2.family;
+                    font-weight: Theme.type-h2.weight;
+                    font-size: Theme.type-h2.size;
+                    vertical-alignment: center;
+                }
+
+                Button {
+                    text: Theme.mode == ThemeMode.dark ? "Light" : "Dark";
+                    variant: ButtonVariant.ghost;
+                    clicked => {
+                        Theme.toggle-mode();
+                        root.theme-toggled();
+                    }
+                }
+            }
+
+            // 1px bottom border.
+            Rectangle {
+                y: parent.height - 1px;
+                height: 1px;
+                background: Theme.border;
+            }
+        }
+
+        // ----- Body: spacer (top half) + key grid (bottom half) ------
+        // The keyboard occupies roughly the bottom half of the screen,
+        // leaving the top half blank so a future revision can show a
+        // "what was just typed" preview line, or to keep the surface
+        // visually balanced when the user navigates here from the
+        // launcher (rather than as an overlay over another app —
+        // overlay support is a follow-up; this commit ships the
+        // self-contained Window pattern that mirrors the other apps).
+        Rectangle {
+            background: Theme.surface;
+            vertical-stretch: 1;
+        }
+
+        // ----- Key grid ---------------------------------------------
+        Rectangle {
+            background: Theme.neutral-100;
+            min-height: 360px;
+
+            // 1px top border.
+            Rectangle {
+                y: 0;
+                height: 1px;
+                background: Theme.border;
+            }
+
+            VerticalLayout {
+                padding: Theme.spacing-md;
+                spacing: Theme.spacing-sm;
+                alignment: center;
+
+                // Letters mode: standard QWERTY rows.
+                if root.mode == KeyMode.letters : VerticalLayout {
+                    spacing: Theme.spacing-sm;
+                    alignment: center;
+
+                    // Row 1: Q W E R T Y U I O P
+                    HorizontalLayout {
+                        spacing: Theme.spacing-sm;
+                        alignment: center;
+                        Key {
+                            label: root.shift ? "Q" : "q";
+                            pressed(s) => { root.key-pressed(s); }
+                        }
+                        Key {
+                            label: root.shift ? "W" : "w";
+                            pressed(s) => { root.key-pressed(s); }
+                        }
+                        Key {
+                            label: root.shift ? "E" : "e";
+                            pressed(s) => { root.key-pressed(s); }
+                        }
+                        Key {
+                            label: root.shift ? "R" : "r";
+                            pressed(s) => { root.key-pressed(s); }
+                        }
+                        Key {
+                            label: root.shift ? "T" : "t";
+                            pressed(s) => { root.key-pressed(s); }
+                        }
+                        Key {
+                            label: root.shift ? "Y" : "y";
+                            pressed(s) => { root.key-pressed(s); }
+                        }
+                        Key {
+                            label: root.shift ? "U" : "u";
+                            pressed(s) => { root.key-pressed(s); }
+                        }
+                        Key {
+                            label: root.shift ? "I" : "i";
+                            pressed(s) => { root.key-pressed(s); }
+                        }
+                        Key {
+                            label: root.shift ? "O" : "o";
+                            pressed(s) => { root.key-pressed(s); }
+                        }
+                        Key {
+                            label: root.shift ? "P" : "p";
+                            pressed(s) => { root.key-pressed(s); }
+                        }
+                    }
+
+                    // Row 2: A S D F G H J K L
+                    HorizontalLayout {
+                        spacing: Theme.spacing-sm;
+                        alignment: center;
+                        Key {
+                            label: root.shift ? "A" : "a";
+                            pressed(s) => { root.key-pressed(s); }
+                        }
+                        Key {
+                            label: root.shift ? "S" : "s";
+                            pressed(s) => { root.key-pressed(s); }
+                        }
+                        Key {
+                            label: root.shift ? "D" : "d";
+                            pressed(s) => { root.key-pressed(s); }
+                        }
+                        Key {
+                            label: root.shift ? "F" : "f";
+                            pressed(s) => { root.key-pressed(s); }
+                        }
+                        Key {
+                            label: root.shift ? "G" : "g";
+                            pressed(s) => { root.key-pressed(s); }
+                        }
+                        Key {
+                            label: root.shift ? "H" : "h";
+                            pressed(s) => { root.key-pressed(s); }
+                        }
+                        Key {
+                            label: root.shift ? "J" : "j";
+                            pressed(s) => { root.key-pressed(s); }
+                        }
+                        Key {
+                            label: root.shift ? "K" : "k";
+                            pressed(s) => { root.key-pressed(s); }
+                        }
+                        Key {
+                            label: root.shift ? "L" : "l";
+                            pressed(s) => { root.key-pressed(s); }
+                        }
+                    }
+
+                    // Row 3: Shift Z X C V B N M Bksp
+                    HorizontalLayout {
+                        spacing: Theme.spacing-sm;
+                        alignment: center;
+                        Key {
+                            label: "Shift";
+                            active: root.shift;
+                            min-width: 84px;
+                            pressed(s) => {
+                                root.shift = !root.shift;
+                            }
+                        }
+                        Key {
+                            label: root.shift ? "Z" : "z";
+                            pressed(s) => { root.key-pressed(s); }
+                        }
+                        Key {
+                            label: root.shift ? "X" : "x";
+                            pressed(s) => { root.key-pressed(s); }
+                        }
+                        Key {
+                            label: root.shift ? "C" : "c";
+                            pressed(s) => { root.key-pressed(s); }
+                        }
+                        Key {
+                            label: root.shift ? "V" : "v";
+                            pressed(s) => { root.key-pressed(s); }
+                        }
+                        Key {
+                            label: root.shift ? "B" : "b";
+                            pressed(s) => { root.key-pressed(s); }
+                        }
+                        Key {
+                            label: root.shift ? "N" : "n";
+                            pressed(s) => { root.key-pressed(s); }
+                        }
+                        Key {
+                            label: root.shift ? "M" : "m";
+                            pressed(s) => { root.key-pressed(s); }
+                        }
+                        Key {
+                            label: "Bksp";
+                            // U+0008 — pc-keyboard US-104 emits this
+                            // for the Backspace scancode; matches
+                            // Slint's Key::Backspace constant.
+                            codepoint: "\u{0008}";
+                            min-width: 84px;
+                            pressed(s) => { root.key-pressed(s); }
+                        }
+                    }
+                }
+
+                // Numbers mode: 0-9 plus common punctuation.
+                if root.mode == KeyMode.numbers : VerticalLayout {
+                    spacing: Theme.spacing-sm;
+                    alignment: center;
+
+                    HorizontalLayout {
+                        spacing: Theme.spacing-sm;
+                        alignment: center;
+                        Key { label: "1"; pressed(s) => { root.key-pressed(s); } }
+                        Key { label: "2"; pressed(s) => { root.key-pressed(s); } }
+                        Key { label: "3"; pressed(s) => { root.key-pressed(s); } }
+                        Key { label: "4"; pressed(s) => { root.key-pressed(s); } }
+                        Key { label: "5"; pressed(s) => { root.key-pressed(s); } }
+                        Key { label: "6"; pressed(s) => { root.key-pressed(s); } }
+                        Key { label: "7"; pressed(s) => { root.key-pressed(s); } }
+                        Key { label: "8"; pressed(s) => { root.key-pressed(s); } }
+                        Key { label: "9"; pressed(s) => { root.key-pressed(s); } }
+                        Key { label: "0"; pressed(s) => { root.key-pressed(s); } }
+                    }
+
+                    HorizontalLayout {
+                        spacing: Theme.spacing-sm;
+                        alignment: center;
+                        Key { label: "-"; pressed(s) => { root.key-pressed(s); } }
+                        Key { label: "/"; pressed(s) => { root.key-pressed(s); } }
+                        Key { label: ":"; pressed(s) => { root.key-pressed(s); } }
+                        Key { label: ";"; pressed(s) => { root.key-pressed(s); } }
+                        Key { label: "("; pressed(s) => { root.key-pressed(s); } }
+                        Key { label: ")"; pressed(s) => { root.key-pressed(s); } }
+                        Key { label: "$"; pressed(s) => { root.key-pressed(s); } }
+                        Key { label: "&"; pressed(s) => { root.key-pressed(s); } }
+                        Key { label: "@"; pressed(s) => { root.key-pressed(s); } }
+                        Key { label: "\""; pressed(s) => { root.key-pressed(s); } }
+                    }
+
+                    HorizontalLayout {
+                        spacing: Theme.spacing-sm;
+                        alignment: center;
+                        Key { label: "."; pressed(s) => { root.key-pressed(s); } }
+                        Key { label: ","; pressed(s) => { root.key-pressed(s); } }
+                        Key { label: "?"; pressed(s) => { root.key-pressed(s); } }
+                        Key { label: "!"; pressed(s) => { root.key-pressed(s); } }
+                        Key { label: "'"; pressed(s) => { root.key-pressed(s); } }
+                        Key {
+                            label: "Bksp";
+                            codepoint: "\u{0008}";
+                            min-width: 84px;
+                            pressed(s) => { root.key-pressed(s); }
+                        }
+                    }
+                }
+
+                // Symbols mode: less-common punctuation + brackets.
+                if root.mode == KeyMode.symbols : VerticalLayout {
+                    spacing: Theme.spacing-sm;
+                    alignment: center;
+
+                    HorizontalLayout {
+                        spacing: Theme.spacing-sm;
+                        alignment: center;
+                        Key { label: "["; pressed(s) => { root.key-pressed(s); } }
+                        Key { label: "]"; pressed(s) => { root.key-pressed(s); } }
+                        Key { label: "{"; pressed(s) => { root.key-pressed(s); } }
+                        Key { label: "}"; pressed(s) => { root.key-pressed(s); } }
+                        Key { label: "#"; pressed(s) => { root.key-pressed(s); } }
+                        Key { label: "%"; pressed(s) => { root.key-pressed(s); } }
+                        Key { label: "^"; pressed(s) => { root.key-pressed(s); } }
+                        Key { label: "*"; pressed(s) => { root.key-pressed(s); } }
+                        Key { label: "+"; pressed(s) => { root.key-pressed(s); } }
+                        Key { label: "="; pressed(s) => { root.key-pressed(s); } }
+                    }
+
+                    HorizontalLayout {
+                        spacing: Theme.spacing-sm;
+                        alignment: center;
+                        Key { label: "_"; pressed(s) => { root.key-pressed(s); } }
+                        Key { label: "\\"; pressed(s) => { root.key-pressed(s); } }
+                        Key { label: "|"; pressed(s) => { root.key-pressed(s); } }
+                        Key { label: "~"; pressed(s) => { root.key-pressed(s); } }
+                        Key { label: "<"; pressed(s) => { root.key-pressed(s); } }
+                        Key { label: ">"; pressed(s) => { root.key-pressed(s); } }
+                        Key { label: "`"; pressed(s) => { root.key-pressed(s); } }
+                        Key {
+                            label: "Bksp";
+                            codepoint: "\u{0008}";
+                            min-width: 84px;
+                            pressed(s) => { root.key-pressed(s); }
+                        }
+                    }
+                }
+
+                // Bottom row: mode toggles + space + Tab + Enter.
+                // Always visible regardless of mode.
+                HorizontalLayout {
+                    spacing: Theme.spacing-sm;
+                    alignment: center;
+                    Key {
+                        label: "abc";
+                        active: root.mode == KeyMode.letters;
+                        min-width: 84px;
+                        pressed(s) => {
+                            root.mode = KeyMode.letters;
+                            root.mode-changed();
+                        }
+                    }
+                    Key {
+                        label: "123";
+                        active: root.mode == KeyMode.numbers;
+                        min-width: 84px;
+                        pressed(s) => {
+                            root.mode = KeyMode.numbers;
+                            root.mode-changed();
+                        }
+                    }
+                    Key {
+                        label: "#+=";
+                        active: root.mode == KeyMode.symbols;
+                        min-width: 84px;
+                        pressed(s) => {
+                            root.mode = KeyMode.symbols;
+                            root.mode-changed();
+                        }
+                    }
+                    Key {
+                        label: "Tab";
+                        // U+0009 — Slint Key::Tab is at the same
+                        // codepoint per the slint_input mapping
+                        // (slint_input.rs L101).
+                        codepoint: "\u{0009}";
+                        pressed(s) => { root.key-pressed(s); }
+                    }
+                    Key {
+                        label: "Space";
+                        codepoint: " ";
+                        // Wide enough for the dominant key on the
+                        // physical layout. Min-width pushes it past
+                        // the standard cell.
+                        min-width: 280px;
+                        pressed(s) => { root.key-pressed(s); }
+                    }
+                    Key {
+                        label: "Enter";
+                        // U+000A — Slint Key::Return is at this
+                        // codepoint per slint_input.rs L101.
+                        codepoint: "\u{000A}";
+                        min-width: 100px;
+                        pressed(s) => { root.key-pressed(s); }
+                    }
+                }
+            }
+        }
+
+        // ----- Status footer ----------------------------------------
+        Rectangle {
+            background: Theme.neutral-100;
+            min-height: 28px;
+
+            // 1px top border.
+            Rectangle {
+                y: 0;
+                height: 1px;
+                background: Theme.border;
+            }
+
+            HorizontalLayout {
+                padding-left: Theme.spacing-lg;
+                padding-right: Theme.spacing-lg;
+                padding-top: Theme.spacing-xs;
+                padding-bottom: Theme.spacing-xs;
+
+                Text {
+                    text: root.status-text;
+                    color: Theme.text-muted;
+                    font-family: Theme.type-caption.family;
+                    font-weight: Theme.type-caption.weight;
+                    font-size: Theme.type-caption.size;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+}

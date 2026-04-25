@@ -107,6 +107,27 @@ pub fn read_keystroke() -> Option<DecodedKey> {
     RING.lock().pop_front()
 }
 
+/// Push a fully-decoded keystroke onto the ring directly, bypassing
+/// the PS/2 scancode decoder. Designed for synthetic-input feeders
+/// like the virtual on-screen keyboard (#465 Track QQQQ): the touch /
+/// pointer event in the Slint Keyboard app maps a key cell to a
+/// `DecodedKey::Unicode(c)` value and pushes here so the next call to
+/// `read_keystroke` (or to one of the per-frame drainers in
+/// `arch::uefi::slint_input` / `ui_apps::launcher`) sees it as if it
+/// had come from the IRQ 1 path.
+///
+/// Drops the oldest entry first when the ring is full — same back-
+/// pressure shape the `handle_scancode` path uses. Cheap (single
+/// `Mutex::lock` + a `VecDeque::push_back`); safe to call from a
+/// Slint callback in the kernel super-loop.
+pub fn push_keystroke(decoded: DecodedKey) {
+    let mut ring = RING.lock();
+    if ring.len() >= RING_CAP {
+        ring.pop_front();
+    }
+    ring.push_back(decoded);
+}
+
 /// Number of pending keystrokes in the ring. Useful for the boot
 /// smoke ("idle" vs "scancode received") and for back-pressure logic
 /// in any future drainer that wants to throttle output bandwidth

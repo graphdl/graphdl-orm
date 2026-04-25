@@ -90,23 +90,27 @@ use crate::arch::uefi::slint_backend::{
 };
 use crate::arch::uefi::slint_input::drain_keyboard_into_slint_window;
 use crate::toolkit_loop;
-use crate::ui_apps::{hateoas, repl};
+use crate::ui_apps::{hateoas, keyboard as kbd_app, repl};
 #[cfg(feature = "doom")]
 use crate::ui_apps::doom;
 
 /// Which Slint surface is currently visible. Driven by the
-/// open-hateoas / open-repl / open-doom callbacks (forward) and the
-/// Esc intercept in `drain_keyboard_with_esc_intercept` (back). The
-/// `Doom` variant is unconditional in the enum so the navigation
-/// state machine doesn't fork on `cfg`; the actual transition into
-/// `Active::Doom` is gated behind `cfg(feature = "doom")` at the
-/// callback registration site below — when the feature is off the
-/// state can never reach Doom because `open-doom` is never wired.
+/// open-hateoas / open-repl / open-doom / open-keyboard callbacks
+/// (forward) and the Esc intercept in
+/// `drain_keyboard_with_esc_intercept` (back). The `Doom` variant is
+/// unconditional in the enum so the navigation state machine doesn't
+/// fork on `cfg`; the actual transition into `Active::Doom` is gated
+/// behind `cfg(feature = "doom")` at the callback registration site
+/// below — when the feature is off the state can never reach Doom
+/// because `open-doom` is never wired. The `Keyboard` variant
+/// (Track QQQQ #465) is always available; the on-screen QWERTY is
+/// the foundation for the touch-only "phone shape" milestone.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Active {
     Launcher,
     Hateoas,
     Repl,
+    Keyboard,
     #[cfg(feature = "doom")]
     Doom,
 }
@@ -231,6 +235,14 @@ pub fn run(
         .expect("HateoasBrowser construction failed");
     let repl_app = repl::build_app()
         .expect("Repl construction failed");
+    // Track QQQQ #465: virtual keyboard. Always constructed (no
+    // feature gate); the on-screen QWERTY is the path to making
+    // AREST usable on a touch-only display under QEMU. Touch / pointer
+    // events on key cells push synthesised `DecodedKey::Unicode(c)`
+    // values onto the kernel keyboard ring (see
+    // `crate::ui_apps::keyboard::build_app` for the full flow).
+    let keyboard_app = kbd_app::build_app()
+        .expect("Keyboard construction failed");
     // Track VVV (#455 + #456): Doom is feature-gated. When the
     // feature is off, `doom_app` is never constructed and the
     // launcher's `open-doom` callback is never wired (so the Slint
@@ -270,6 +282,28 @@ pub fn run(
             let _ = launcher.hide();
             let _ = repl_window.show();
             *nav.borrow_mut() = Active::Repl;
+        });
+    }
+    // Track QQQQ #465: Keyboard open callback. Always wired (no
+    // feature gate). When active, the Esc-intercept arm in the
+    // super-loop below short-circuits back to the launcher when the
+    // user presses a real Esc on the host keyboard (or when a future
+    // on-screen Esc cell pushes U+001B onto the ring); otherwise
+    // taps on the on-screen keys push synthesised
+    // `DecodedKey::Unicode(c)` values via
+    // `arch::uefi::keyboard::push_keystroke` (see
+    // `crate::ui_apps::keyboard::build_app`'s `on_key_pressed`
+    // closure).
+    {
+        let nav = nav.clone();
+        let launcher_weak = launcher.as_weak();
+        let keyboard_weak = keyboard_app.window.as_weak();
+        launcher.on_open_keyboard(move || {
+            let Some(launcher) = launcher_weak.upgrade() else { return };
+            let Some(keyboard_window) = keyboard_weak.upgrade() else { return };
+            let _ = launcher.hide();
+            let _ = keyboard_window.show();
+            *nav.borrow_mut() = Active::Keyboard;
         });
     }
     // Track VVV #455: Doom open callback. Only registered when the
@@ -360,6 +394,28 @@ pub fn run(
             Active::Repl => {
                 if drain_keyboard_with_esc_intercept(&repl_app.window.window()) {
                     let _ = repl_app.window.hide();
+                    let _ = launcher.show();
+                    *nav.borrow_mut() = Active::Launcher;
+                }
+            }
+            // Track QQQQ #465: when the on-screen Keyboard is active
+            // we run the same Esc-intercept drain the other apps
+            // use. The Keyboard's own Slint window doesn't read
+            // keystrokes from the ring (it's the *producer* — taps
+            // on its key cells push synthesised entries onto the
+            // ring); the ring entries that reach the drain are
+            // either real keystrokes from a host keyboard (when
+            // present) or feedback loops where the user has somehow
+            // gotten the Keyboard to receive its own taps (not
+            // possible under the current single-Window pattern but
+            // worth defending against). Esc still routes back to
+            // the launcher; non-Esc keys are dispatched into the
+            // Keyboard window where Slint's default handling drops
+            // them (the Keyboard surface has no FocusScope that
+            // consumes keys — taps drive the only input path).
+            Active::Keyboard => {
+                if drain_keyboard_with_esc_intercept(&keyboard_app.window.window()) {
+                    let _ = keyboard_app.window.hide();
                     let _ = launcher.show();
                     *nav.borrow_mut() = Active::Launcher;
                 }
