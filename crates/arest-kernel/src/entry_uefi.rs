@@ -348,6 +348,40 @@ fn kernel_run_uefi(
         pit_t1.wrapping_sub(pit_t0),
     );
 
+    // #364: PS/2 keyboard online — IRQ 1 unmasked at `init_time()`,
+    // the IDT vector 33 routes to `keyboard_handler` which feeds
+    // scancodes through `pc-keyboard` into a kernel-side ring. The
+    // banner line is printed AFTER `init_time()` (which is what
+    // unmasks IRQ 1) so its appearance in the log is causal proof
+    // that the unmask ran without faulting. Drainer (the UEFI REPL
+    // pump) lands in #365; this commit only proves the IRQ pipeline
+    // came up.
+    println!("  kbd:      PS/2 driver online (IRQ 1 unmasked)");
+
+    // Scancode-poll smoke. The QEMU smoke harness runs headless
+    // (no `-display`, no virtual keyboard input), so the expected
+    // outcome is "idle" — no scancode arrives within the 50 ms
+    // budget. The line's purpose is to prove the driver
+    // initialised without a fault: a triple-fault inside
+    // `keyboard_handler` would have killed the boot before this
+    // line ran. Spinning against `now_ms()` (which the PIT IRQ 0
+    // advances every ~1 ms) lets us cap the wait without depending
+    // on the exact CPU speed of the smoke container.
+    let kbd_deadline = crate::arch::time::now_ms().wrapping_add(50);
+    let mut kbd_observed = false;
+    while crate::arch::time::now_ms() < kbd_deadline {
+        if crate::arch::keyboard::read_keystroke().is_some() {
+            kbd_observed = true;
+            break;
+        }
+        unsafe { core::arch::asm!("pause", options(nomem, nostack)); }
+    }
+    println!(
+        "  kbd:      poll {} (50 ms budget, ring depth={})",
+        if kbd_observed { "scancode received" } else { "idle" },
+        crate::arch::keyboard::pending(),
+    );
+
     // Proves the page-table singleton is live post-EBS: going
     // through `memory::usable_frame_count()` forces a `FRAME_ALLOCATOR.lock()`
     // + a pass over the descriptor iterator, so a hung lock or a
