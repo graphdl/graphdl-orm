@@ -53,6 +53,18 @@ pub const VIRTIO_BLK_DEVICE_ID: u16 = 0x1042;
 /// with the rest of this module's modern-only stance.
 pub const VIRTIO_GPU_DEVICE_ID: u16 = 0x1050;
 
+/// Modern-virtio input device. Spec: device-type 18 (VIRTIO_ID_INPUT)
+/// → 0x1040 + 18 = 0x1052. QEMU's `virtio-keyboard-pci` and
+/// `virtio-tablet-pci` both enumerate at this device-id — they're
+/// distinguished only at the virtio-input config-space layer
+/// (VIRTIO_INPUT_CFG_EV_BITS query reveals EV_KEY-only vs
+/// EV_KEY+EV_ABS capability sets). Used by `find_virtio_input_devices`
+/// for the linuxkpi virtio-input wire-up (#464). Returns Vec because
+/// QEMU typically exposes both keyboard and tablet on the same guest;
+/// every other `find_virtio_*` helper above returns a singleton because
+/// only one of that device-class is interesting.
+pub const VIRTIO_INPUT_DEVICE_ID: u16 = 0x1052;
+
 /// One enumerated PCI device. Fields come straight from the standard
 /// PCI Type-0 header; callers that only need the identity ignore the
 /// BARs, and driver-instantiating callers read them.
@@ -155,6 +167,33 @@ pub fn find_virtio_gpu() -> Option<PciDevice> {
     scan_devices().into_iter().find(|d| {
         d.vendor_id == VIRTIO_VENDOR && d.device_id == VIRTIO_GPU_DEVICE_ID
     })
+}
+
+/// Find every virtio-input-pci device on the legacy PCI bus. Returns
+/// a Vec because QEMU's typical input config exposes both
+/// `virtio-keyboard-pci` and `virtio-tablet-pci` simultaneously — both
+/// enumerate at vendor 0x1AF4 / device 0x1052, distinguished only by
+/// their EV_BITS config-space response. Used by the #464 linuxkpi
+/// virtio-input wire-up to feed each discovered slot through the
+/// shim's driver-probe path.
+///
+/// Returns an empty Vec when the machine wasn't launched with any
+/// `-device virtio-{keyboard,tablet,mouse}-pci` line. Iteration order
+/// matches the legacy PCI bus walk's enumeration order, which is
+/// deterministic per (bus, device, function) — and on QEMU that's the
+/// order the devices appear on the `-device` command-line. So when
+/// QEMU is launched with `-device virtio-keyboard-pci -device
+/// virtio-tablet-pci`, the first element is the keyboard slot and the
+/// second is the tablet slot. The linuxkpi caller uses this ordering
+/// for its `keyboard online (slot N)` / `tablet online (slot N, abs)`
+/// banner discrimination on the foundation slice — once the virtio
+/// transport is fully wired through the linuxkpi shim (post-#464),
+/// the discrimination flips to a real EV_BITS read at probe time.
+pub fn find_virtio_input_devices() -> Vec<PciDevice> {
+    scan_devices()
+        .into_iter()
+        .filter(|d| d.vendor_id == VIRTIO_VENDOR && d.device_id == VIRTIO_INPUT_DEVICE_ID)
+        .collect()
 }
 
 // ── Low-level config access ──────────────────────────────────────
