@@ -89,7 +89,19 @@ virtio-drivers = "0.11"
 # `ast::apply` and `freeze::thaw` so the HTTP handler (#265) can
 # dispatch through the same ρ-application the worker uses, without
 # pulling in the std-only compile / command / parse modules.
-arest = { path = "../arest", default-features = false, features = ["no_std"] }
+#
+# Bundled-readings scope (#437): the kernel needs the OS nouns
+# (filesystem) for VFS / block-device dispatch, the UI nouns
+# (design tokens / render tree) for the Slint surface, and the
+# stock templates (Organization / Agent) for the demo boot. The
+# `core` slice is always compiled in; the other three are explicit.
+arest = { path = "../arest", default-features = false, features = [
+    "no_std",
+    "core",
+    "ui-readings",
+    "os-readings",
+    "templates",
+] }
 
 # wasmi — kept off the BIOS build. The crate compiles cleanly into
 # `x86_64-unknown-none` but making it REACHABLE from `kernel_main`
