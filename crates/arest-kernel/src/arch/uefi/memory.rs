@@ -73,12 +73,16 @@ static FRAME_ALLOCATOR: Mutex<Option<UefiFrameAllocator>> = Mutex::new(None);
 /// guest but the same graceful-degrade path the BIOS arm has).
 static DMA_POOL: Mutex<Option<DmaPool>> = Mutex::new(None);
 
-/// Size of the DMA pool in 4 KiB pages (= 2 MiB). Matches the BIOS
-/// arm's `DMA_POOL_PAGES` so virtio-drivers' fixed queue sizes
-/// (`NET_QUEUE_SIZE = 16` + buffer pools) fit identically on both
-/// paths. Bump once if a future device class (virtio-gpu, virtio-blk
-/// with larger sector caches) needs more.
-const DMA_POOL_PAGES: usize = 512;
+/// Size of the DMA pool in 4 KiB pages (= 8 MiB). Originally 2 MiB
+/// for net + blk queues + buffer pools; bumped to 8 MiB after Track
+/// III's #371 virtio-gpu init landed and exhausted the 2 MiB pool
+/// at runtime ("dma_alloc: DMA pool exhausted" panic in virtio.rs:109
+/// on first UEFI smoke after the launcher path went live).
+/// virtio-gpu's resource alloc + scanout setup is the dominant new
+/// consumer; 8 MiB gives comfortable headroom for net (16-deep RX +
+/// TX queues + 1.5 KiB buffers each), blk (sector-cache + queues),
+/// and gpu (1280x800x4 = 4 MiB scanout + queues).
+const DMA_POOL_PAGES: usize = 2048;
 
 // ---------------------------------------------------------------------------
 // Public init
