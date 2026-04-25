@@ -180,6 +180,15 @@ mod virtio;
 // arch-specific `arch::memory::with_dma_pool` re-export.
 #[cfg(all(target_os = "uefi", any(target_arch = "aarch64", target_arch = "arm")))]
 mod virtio_mmio;
+// USB-over-USB serial gadget for Nexus debug (#392). Scaffold only —
+// publishes `init` / `write_bytes` / `read_byte` with `unimplemented!()`
+// bodies, plus a research summary in the module docstring covering
+// dwc3 (Nexus 5X/6P) vs msm-otg (Nexus 5), the usb-device + usbd-serial
+// crate landscape, and the dependency chain a working CDC-ACM gadget
+// will need. Cfg-gated on aarch64 + armv7 (the architectures real
+// Nexus phones run on); x86_64 builds elide the module entirely.
+#[cfg(any(target_arch = "aarch64", target_arch = "arm"))]
+mod usb_uart;
 
 #[cfg(not(target_os = "uefi"))]
 use alloc::string::ToString;
