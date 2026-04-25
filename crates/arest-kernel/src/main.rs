@@ -164,6 +164,25 @@ pub mod linuxkpi;
 #[cfg(all(target_os = "uefi", target_arch = "x86_64", feature = "qt-adapter"))]
 pub mod qt_adapter;
 
+// `gtk_adapter` (#488 Track IIII, third adapter slice in the toolkit
+// registry chain). Symmetric to qt_adapter (#487) — load
+// `libgtk-4.so.1` + `libgobject-2.0.so.0` + `libglib-2.0.so.0` as
+// Linux-style shared libraries via the linuxkpi shim, expose GTK 4's
+// widget classes as `Component` cells via `ImplementationBinding`
+// facts (mirroring the static declarations DDDD #485 emitted in
+// `readings/ui/components.md`). Off by default behind the
+// `gtk-adapter` cargo feature — same gate shape as `linuxkpi`,
+// `doom`, and `qt-adapter`. Default kernel builds elide the module
+// entirely; --features gtk-adapter brings in the loader + Component
+// fact registration. The library loader degrades to a
+// `LibraryNotFound` stub when linuxkpi has no library-loading path
+// yet (foundation slice was driver-mode focused), so the Component
+// cells populate with class-name string Symbols + null GType pointers;
+// future linuxkpi extension fills them in. Selection still picks
+// Slint over GTK because the compositor isn't wired (#489).
+#[cfg(all(target_os = "uefi", target_arch = "x86_64", feature = "gtk-adapter"))]
+pub mod gtk_adapter;
+
 // `block` / `block_storage` / `virtio` reach `x86_64::structures::
 // paging::Translate` via `arch::memory::with_page_table`, plus the
 // PCI transport. All three are x86_64-only today; aarch64 / armv7
