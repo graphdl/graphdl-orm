@@ -195,7 +195,18 @@ mod file_serve;
 // reader's lookup pipeline.
 #[cfg(target_arch = "x86_64")]
 mod file_upload;
-#[cfg(target_arch = "x86_64")]
+// `net` is available on every x86_64 target (BIOS + UEFI) and on the
+// aarch64 + armv7 UEFI arms (#450). The smoltcp + virtio-drivers deps
+// build cleanly under no_std cross-arch. The intra-crate refs in net.rs
+// to `crate::virtio` (PCI transport, x86_64-only) and `crate::virtio_mmio`
+// (MMIO transport, aarch64+armv7-UEFI-only) are themselves cfg-gated
+// inside net.rs so each arm picks the right phy adapter; the file_*
+// intercept arms in `drive_http` are cfg-gated to x86_64 because they
+// reach `crate::block_storage` which is x86_64-only.
+#[cfg(any(
+    target_arch = "x86_64",
+    all(target_os = "uefi", any(target_arch = "aarch64", target_arch = "arm")),
+))]
 mod net;
 #[cfg(not(target_os = "uefi"))]
 mod syscall;
@@ -547,7 +558,20 @@ fn kernel_run(phys_offset: u64) -> ! {
 ///      the legacy `/` banner.
 ///
 /// Anything that neither resolves returns a plaintext 404.
-#[cfg(not(target_os = "uefi"))]
+///
+/// Available on every arch that compiles `mod net;` (BIOS x86_64 +
+/// UEFI x86_64/aarch64/armv7 — same gate). UEFI arms call
+/// `net::register_http(80, arest_http_handler)` to make `/api/*` and
+/// the SPA fallback reachable through the official `Handler` chain
+/// (#360 + #450). The intercept-style file_* routes in
+/// `net::drive_http` short-circuit before this handler runs, so the
+/// non-x86_64 UEFI arms (no `block_storage` / `file_serve` /
+/// `file_upload`) still get the assets + system::dispatch surface
+/// without pulling in the storage stack.
+#[cfg(any(
+    target_arch = "x86_64",
+    all(target_os = "uefi", any(target_arch = "aarch64", target_arch = "arm")),
+))]
 fn arest_http_handler(req: &http::Request) -> http::Response {
     if let Some(asset) = assets::lookup(&req.path) {
         return http::Response::ok_cached(
