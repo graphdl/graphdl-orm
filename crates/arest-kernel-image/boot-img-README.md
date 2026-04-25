@@ -123,3 +123,90 @@ It does **not** touch:
 
 The kernel-source ARM64 boot header work blocks actual booting and
 will be a separate task.
+
+## QEMU launch behavior under emulation (#391 follow-up)
+
+#391 added `scripts/test-fastboot-bootimg.ps1` -- a sibling smoke
+that drives `package-aarch64-boot-img.ps1`, re-verifies the
+`ANDROID!` magic, runs AOSP's `unpack_bootimg.py` against the
+artifact (reusing `arest-kernel-boot-img`'s baked
+`/opt/mkbootimg/unpack_bootimg.py`) to dump every header v0 field,
+and then makes a best-effort attempt to launch the extracted
+kernel slot under QEMU-aarch64 to record exactly how `qemu-system-
+aarch64 -kernel <slot>` reacts to a kernel that lacks the ARM64
+Linux boot header.
+
+The launch line, mirrored from the script's `[4/4]` step:
+
+```
+qemu-system-aarch64 -machine virt -cpu cortex-a57 -m 256M \
+    -kernel /work/boot-img-unpack/kernel -nographic -no-reboot
+```
+
+(Run inside the `arest-kernel-uefi-aarch64` container so QEMU is on
+PATH on the Windows host without a local install. Capped at 30 s
+via `coreutils timeout` to keep the smoke bounded.)
+
+### What `qemu-system-aarch64 -kernel` does with our slot
+
+QEMU's `-kernel` path on the `aarch64-virt` machine first sniffs
+the input for known kernel headers. The decision tree
+(`hw/arm/boot.c::arm_load_kernel`, simplified):
+
+1. **PE32+ with `MZ` at offset 0 + ARM64 Linux header at 0x38** ->
+   loaded as a Linux ARM64 image; QEMU also synthesises a small
+   bootloader at `kernel_offset` that branches to the kernel's
+   text entry. (This is the path Linux distros use when they ship
+   `vmlinuz` as a PE32+ that's *also* an ARM64 Linux image -- the
+   PE wrapper is what UEFI loads, the ARM64 header is what raw
+   bootloaders parse.)
+2. **`ARM\x64` at offset 0x38, no `MZ`** -> loaded as a "plain"
+   Linux ARM64 image; same synthesised bootloader as above.
+3. **Neither header recognised** -> QEMU falls back to "raw binary
+   at the kernel-offset address" and just jumps to it. No magic
+   check on the binary, no diagnostic.
+
+Our slot today is path 3 *minus* the MS-DOS stub: `llvm-objcopy
+-O binary` strips the PE32+ wrapper (so no `MZ`), and the kernel
+source carries no ARM64 boot header (so no `ARM\x64` at 0x38), so
+QEMU silently jumps to whatever instruction LLD placed at offset
+0 of the flat binary. That instruction is part of UEFI's
+`_start` epilogue, which expects the UEFI System Table in `x1`
+and a System Table-like environment generally; without that the
+CPU faults or wedges on the first memory access into the
+nonexistent UEFI structures.
+
+### Observed outcome
+
+The expected outcome on first run is one of:
+
+- **Silent timeout** at the 30 s cap (`docker run` exits 124).
+  This is the most common behavior because QEMU's CPU keeps
+  spinning on whatever the flat binary's offset-0 instruction
+  decoded to; there's no panic path in this configuration.
+- **Immediate exit 0** with no PL011 output. Same root cause --
+  the CPU executed something, took an exception QEMU didn't
+  treat as fatal, and the `-no-reboot` flag means QEMU shuts the
+  machine down rather than restart.
+
+In either case the QEMU output never contains `Booting Linux on
+physical CPU` or any other Linux-style banner, because we never
+reach a Linux-style entry point.
+
+The smoke script writes its full report (header dump + QEMU log
+excerpt) to `target/boot-img-test-report.txt` and the raw QEMU
+log to `target/boot-img-qemu.log`. The script's exit code is
+strictly governed by packaging + ANDROID! magic + header parse;
+the QEMU step is documentation-only because the boot-header gap
+is expected (this file's "Known limitation" section, plus #393).
+
+### Why this matters for #393
+
+#393 is the kernel-source change that adds an ARM64 Linux boot
+header to the kernel binary. Once that lands, this script's
+QEMU launch step should change from "silent timeout" to
+"`Booting Linux on physical CPU 0x...`" followed by whatever the
+aarch64 entry path prints over PL011. That transition is the
+cheap end-to-end check that the new entry header is wired up
+correctly *before* anyone risks it on physical Nexus 5X
+hardware.
