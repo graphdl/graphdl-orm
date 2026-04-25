@@ -304,6 +304,15 @@ fn kernel_run_uefi(
     // maps RAM), matching the shape of the BIOS arm's facade.
     let _phys_offset = crate::arch::init_memory(memory_map);
 
+    // #363: install the kernel-owned IDT now that the heap +
+    // frame allocator are live. Firmware's IDT is gone after
+    // `boot::exit_boot_services`, so any CPU exception (a stray
+    // `int3`, a #DF fired by a buggy MMIO write below) would
+    // triple-fault the box silently if we did not stand one up.
+    // The IDT installs the breakpoint + double-fault gates only;
+    // hardware IRQs (PIT timer, PS/2 keyboard) are #344f scope.
+    crate::arch::init_interrupts();
+
     // Proves the page-table singleton is live post-EBS: going
     // through `memory::usable_frame_count()` forces a `FRAME_ALLOCATOR.lock()`
     // + a pass over the descriptor iterator, so a hung lock or a
@@ -314,6 +323,15 @@ fn kernel_run_uefi(
     println!(
         "  mem:      {frame_count} frames usable ({usable_mib} MiB) (UEFI memory map)"
     );
+
+    // #363: int3 round-trip smoke. Fires a software breakpoint;
+    // the kernel-owned IDT routes #BP into `breakpoint_handler`
+    // which prints + iretqs back. The next println! confirms
+    // execution resumed past the int3 — i.e. the IDT hand-off
+    // worked end-to-end. Mirrors the BIOS arm's identical smoke
+    // in `kernel_run` (main.rs).
+    crate::arch::breakpoint();
+    println!("  idt:      int3 round-tripped through UEFI IDT");
 
     // DMA pool carve smoke (ed869c4). `arch::init_memory` on UEFI
     // now mirrors the BIOS arm: carves a 2 MiB contiguous region out
