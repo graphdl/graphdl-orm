@@ -55,6 +55,16 @@
 //     compile-time pipeline is sufficient to verify the design
 //     system end to end.
 
+// #454: bake the actual TTF bytes Track JJJ vendored, instead of
+// relying on slint-build's fontique-against-host-system fallback
+// (Arial on hosts without Inter installed). slint-build's `import`
+// statement consumes the file at compile time and emits a
+// `BitmapFont` static whose family-name records what the .ttf
+// declares — so `Theme.body.family = "Inter"` resolves to the
+// real Inter glyphs no matter what the build host has installed.
+import "../assets/fonts/Inter-Regular.ttf";
+import "../assets/fonts/JetBrainsMono-Regular.ttf";
+
 // Theme mode toggle. Components flip this to switch palette.
 export enum ThemeMode { dark, light }
 
