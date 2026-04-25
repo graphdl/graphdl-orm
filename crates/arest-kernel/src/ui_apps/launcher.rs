@@ -89,6 +89,7 @@ use crate::arch::uefi::slint_backend::{
     AppLauncher, FramebufferBackend, FramebufferPixelOrder, UefiSlintPlatform,
 };
 use crate::arch::uefi::slint_input::drain_keyboard_into_slint_window;
+use crate::toolkit_loop;
 use crate::ui_apps::{hateoas, repl};
 #[cfg(feature = "doom")]
 use crate::ui_apps::doom;
@@ -294,6 +295,19 @@ pub fn run(
     // hook reachable for a future `ThemePref` cell wire-up.
     launcher.on_theme_toggled(|| {});
 
+    // Track MMMM #490: register the kernel-resident SlintPump with
+    // the toolkit_loop multiplexer. Qt + GTK pump registrations
+    // happen inside their respective adapter `init()` calls
+    // (qt_adapter::event_loop::init / gtk_adapter::event_loop::init);
+    // those are wired in `entry_uefi.rs::kernel_run_uefi` post-
+    // `system::init`, so by the time we reach the super-loop body the
+    // pump registry holds 1 + (qt-adapter? 1 : 0) + (gtk-adapter? 1 : 0)
+    // entries. This call is idempotent at the singleton level — if
+    // some other init path already registered SlintPump it would just
+    // append a second copy (which is observable as a benign extra
+    // tick per frame; not currently a concern under the boot wiring).
+    toolkit_loop::register_default_pumps();
+
     // Show the launcher first. Until this returns Ok, the
     // MinimalSoftwareWindow has no visible component and
     // `draw_if_needed` would no-op.
@@ -312,6 +326,23 @@ pub fn run(
         //    the active Slint window via the existing
         //    `drain_keyboard_into_slint_window` shape.
         let active_now = *nav.borrow();
+        // Track MMMM #490: when any registered foreign-toolkit pump
+        // owns keyboard focus, drain the ring through
+        // `toolkit_loop::dispatch_key` rather than the
+        // direct-to-Slint path below. On the foundation slice every
+        // pump's `focused_widget` returns `None` (no Qt / GTK
+        // widgets are loaded), so this short-circuits and falls
+        // through to the existing per-arm direct dispatch — today's
+        // behaviour is preserved exactly. Once a Qt or GTK widget
+        // gains focus (post-#491 binding), the ring entries route
+        // through the focused pump instead. Esc still flows through
+        // the existing arm-specific intercept code below: a foreign
+        // toolkit owning focus while an app arm is active is
+        // unreachable today and a future concern for #491 to detail.
+        if drain_keyboard_into_focused_toolkit_pump() {
+            // All ring entries claimed by a foreign toolkit; skip
+            // the existing direct-dispatch arm.
+        } else {
         match active_now {
             Active::Launcher => {
                 // Esc on the launcher is a no-op (we're already at
@@ -362,6 +393,7 @@ pub fn run(
                 }
             }
         }
+        } // end of `else` from `drain_keyboard_into_focused_toolkit_pump`
 
         // 2. Slint-side timer + animation tick. Slint reads
         //    `arch::time::now_ms()` via `Platform::duration_since_start`
@@ -369,6 +401,28 @@ pub fn run(
         //    (e.g. Theme.motion-fast for Button hover transitions)
         //    advances against the kernel's PIT clock.
         slint::platform::update_timers_and_animations();
+
+        // Track MMMM #490: cooperative event-loop pump for every
+        // foreign toolkit registered with the multiplexer. Each pump
+        // gets a 4ms budget per tick (Qt's
+        // `QCoreApplication::processEvents(AllEvents, 4)`, GTK's
+        // budget loop over `g_main_context_iteration(NULL, FALSE)`,
+        // Slint's no-op observation tick — see `toolkit_loop::pump_all`
+        // for the dispatch shape). On the foundation slice every Qt /
+        // GTK pump body short-circuits because the loader returned
+        // `LibraryNotFound`, so this is one tick-counter bump per
+        // registered pump; the call still runs every frame so the
+        // wiring is exercised + observable in boot diagnostics.
+        //
+        // Note: this is placed right after `update_timers_and_animations`
+        // per the #490 spec ("between update_timers_and_animations and
+        // the keyboard drain"). UUU's #431 super-loop drains the
+        // keyboard FIRST (step 1 above), so the spec's intended
+        // anchor point is just-after-`update_timers_and_animations`;
+        // the keyboard drain has already run by then. Per-frame budget
+        // = 4ms × pump_count (3 worst case = 12ms, comfortably under
+        // the 16ms 60Hz frame budget).
+        let _ = toolkit_loop::pump_all(4);
 
         // 3. Background work — drive smoltcp + the HTTP listener
         //    every frame. Mirrors GGG's REPL drainer hook (#365 /
@@ -393,6 +447,75 @@ pub fn run(
         //    fire on schedule). Same shape GGG's drainer used.
         unsafe { core::arch::asm!("pause", options(nomem, nostack)); }
     }
+}
+
+/// Track MMMM #490: drain the keyboard ring through the toolkit_loop
+/// multiplexer when a foreign-toolkit pump owns keyboard focus.
+///
+/// Returns `true` if a foreign pump claimed the drain (caller should
+/// skip the existing direct-dispatch arm); `false` otherwise (caller
+/// falls through to the per-arm direct-dispatch path that was already
+/// wired before this helper landed).
+///
+/// The check `toolkit_loop::dispatch_key` performs is "walk every
+/// registered pump, route to the first one whose `focused_widget`
+/// returns `Some`". On the foundation slice every Qt / GTK pump returns
+/// `None` (no widgets are loaded), so this helper drains zero entries
+/// and returns `false` unconditionally — today's behaviour is preserved
+/// exactly.
+///
+/// We translate each `pc-keyboard::DecodedKey` into the kernel-neutral
+/// `toolkit_loop::KeyEvent` shape before dispatch:
+/// `DecodedKey::Unicode(c)` → `KeyEvent { codepoint: c, pressed: true }`
+/// (matching the press-only semantics the existing slint_input drain
+/// uses — `pc-keyboard` swallows release scancodes after using them
+/// for modifier state). `DecodedKey::RawKey(_)` is dropped (same
+/// behaviour as the existing `drain_keyboard_with_esc_intercept`).
+///
+/// Today's single-pump-with-focus call boundary: when `dispatch_key`
+/// returns `false` for an entry (no pump owns focus), we PUT the entry
+/// BACK in the ring? No — `read_keystroke` is `pop_front` with no
+/// push-front, so once consumed an entry can't go back. The helper's
+/// design therefore only consumes entries when a foreign pump WILL
+/// claim them: the early-return `if toolkit_loop` check below skips
+/// the drain entirely when no pump owns focus, leaving the ring
+/// untouched for the per-arm direct-dispatch path to consume.
+fn drain_keyboard_into_focused_toolkit_pump() -> bool {
+    use pc_keyboard::DecodedKey;
+
+    // Cheap pre-flight: ask the multiplexer whether any registered
+    // pump owns focus. If not, leave the ring untouched so the
+    // existing per-arm direct-dispatch arm consumes it as before.
+    // On the foundation slice no Qt / GTK widget can hold focus
+    // (their loaders return `LibraryNotFound` so no widget exists
+    // to focus), so this returns `false` immediately — today's
+    // direct-dispatch behaviour is preserved exactly.
+    if !toolkit_loop::has_foreign_focus() {
+        return false;
+    }
+
+    // A foreign pump owns focus — drain the entire ring through it.
+    // Each ring entry becomes a `KeyEvent { pressed: true }` (the
+    // existing slint_input drain uses press-only semantics because
+    // `pc-keyboard` swallows release scancodes for modifier-state
+    // tracking; we mirror the same shape here so the foreign
+    // toolkit's event queue receives the same events Slint would
+    // have).
+    while let Some(decoded) = keyboard::read_keystroke() {
+        match decoded {
+            DecodedKey::Unicode(c) => {
+                let ev = toolkit_loop::KeyEvent { codepoint: c, pressed: true };
+                let _ = toolkit_loop::dispatch_key(ev);
+            }
+            DecodedKey::RawKey(_) => {
+                // Drop. Same behaviour as the existing
+                // `drain_keyboard_with_esc_intercept` — the foreign
+                // toolkits don't have a kernel-neutral RawKey
+                // mapping yet (#491 territory).
+            }
+        }
+    }
+    true
 }
 
 /// Variant of `drain_keyboard_into_slint_window` that intercepts the
