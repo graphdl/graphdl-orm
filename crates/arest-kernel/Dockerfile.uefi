@@ -82,11 +82,28 @@ COPY crates/arest/Cargo.toml crates/arest/Cargo.toml
 COPY crates/arest/src/ crates/arest/src/
 COPY readings/ readings/
 
+# Vendored Linux source (#460 Track AAAA — `crates/arest-kernel/
+# vendor/linux/`). build.rs's cc::Build pass walks this tree to
+# compile `drivers/virtio/virtio_input.c` against the linuxkpi shim
+# headers and link the resulting libvirtio_input.a into the .efi.
+# Only consumed under `--features linuxkpi`; unconditional COPY here
+# matches the always-on Slint / fonts / assets layers above (build
+# context is shared across feature variants for layer-cache reuse).
+COPY crates/arest-kernel/vendor/ crates/arest-kernel/vendor/
+
 # Build the UEFI .efi. Output lands at
 # target/x86_64-unknown-uefi/release/arest-kernel.efi (the kernel's
 # default target via .cargo/config.toml).
+#
+# `--features linuxkpi` (#464 Track EEEE) brings in AAAA's #460
+# linuxkpi shim + the vendored Linux virtio_input.c so the new
+# virtio-input wire-up at the bottom of `entry_uefi.rs` actually
+# fires its discovery + driver-probe loop. Without this flag the
+# `mod linuxkpi` gate in main.rs elides the whole subsystem and
+# the new banner phrases (`virtio-input: keyboard online (slot ...)`
+# etc.) never appear, breaking the smoke harness assertion below.
 RUN cd crates/arest-kernel \
-    && cargo +nightly build --target x86_64-unknown-uefi --release
+    && cargo +nightly build --target x86_64-unknown-uefi --release --features linuxkpi
 
 # ── Runtime stage: QEMU + OVMF + FAT staging tools ─────────────────
 FROM debian:bookworm-slim AS runner
@@ -168,6 +185,24 @@ EXPOSE 8080
 #                    attach + display setup is wired up in #371;
 #                    today the device is exposed solely so
 #                    pci::find_virtio_gpu has something to discover.
+#   -device virtio-keyboard-pci + -device virtio-tablet-pci
+#                    attach two modern virtio-input devices
+#                    (device-id 0x1052 each, distinguished only at
+#                    the virtio-input config-space layer by their
+#                    EV_BITS response: keyboard exposes EV_KEY,
+#                    tablet exposes EV_KEY+EV_ABS). Discovered by
+#                    `pci::find_virtio_input_devices` (#464 Track
+#                    EEEE) and fed through the linuxkpi shim's
+#                    driver-probe path. CMD line ordering matters —
+#                    QEMU enumerates these onto the PCI bus in the
+#                    order they appear here, and the linuxkpi
+#                    wire-up's banner discriminates keyboard from
+#                    tablet by enumeration ordinal on the
+#                    foundation slice (real EV_BITS-based
+#                    discrimination lands when the shim's virtio
+#                    transport is fully wired through; see the
+#                    long comment in entry_uefi.rs at the
+#                    virtio-input wire-up site).
 #   -serial stdio    AREST kernel writes to ConOut -> OVMF mirrors
 #                    ConOut to COM1 -> QEMU surfaces COM1 on stdout.
 #                    Same path the BIOS image uses (16550 on COM1).
@@ -183,6 +218,8 @@ CMD ["qemu-system-x86_64", \
      "-drive", "file=/disk.img,format=raw,if=none,id=disk0", \
      "-device", "virtio-blk-pci,drive=disk0,disable-legacy=on", \
      "-device", "virtio-gpu-pci", \
+     "-device", "virtio-keyboard-pci", \
+     "-device", "virtio-tablet-pci", \
      "-serial", "stdio", \
      "-display", "none", \
      "-no-reboot", "-no-shutdown"]

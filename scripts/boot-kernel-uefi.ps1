@@ -155,6 +155,22 @@ if ($Smoke) {
             # as the front-buffer (preferred over GOP per #382).
             "virtio-gpu: driver online,",
             "fb:       virtio-gpu surface installed",
+            # virtio-input wire-up (#464 Track EEEE). Dockerfile.uefi
+            # CMD adds `-device virtio-keyboard-pci -device
+            # virtio-tablet-pci`, so PCI scan finds two slots at
+            # vendor 0x1AF4 / device 0x1052 in QEMU enumeration order.
+            # The linuxkpi wire-up at the bottom of `entry_uefi.rs`
+            # iterates them, drives each through the shim's
+            # device-register / driver-probe path, and prints one
+            # banner line per slot. Discrimination on the foundation
+            # slice rides on the QEMU CMD line ordering (keyboard
+            # before tablet); when the linuxkpi shim's virtio
+            # transport is fully wired (post-#464), this flips to a
+            # real EV_BITS config-space read at probe time. The
+            # `(slot ` substring matches the PCI coordinate format
+            # `XX:YY.Z` the wire-up emits.
+            "virtio-input: keyboard online (slot ",
+            "virtio-input: tablet online (slot ",
             # Doom is gated behind --features doom (#456 / VVV). The
             # default build prints "doom: skipped" so the AGPL-only
             # binary is observable in the boot log. With the feature

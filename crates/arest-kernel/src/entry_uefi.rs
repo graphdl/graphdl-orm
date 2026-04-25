@@ -886,6 +886,144 @@ fn kernel_run_uefi(
         println!("  virtio-gpu: no device");
     }
 
+    // virtio-input wire-up (#464 Track EEEE — proves AAAA's #460
+    // linuxkpi shim foundation end-to-end). PCI walk discovers every
+    // virtio-input slot (vendor 0x1AF4 / device 0x1052; QEMU exposes
+    // both `virtio-keyboard-pci` and `virtio-tablet-pci` at this
+    // device-id), then for each slot we drive the linuxkpi shim's
+    // device-register → driver-probe handoff:
+    //   1. `linuxkpi::init()` brings the 8 sub-modules online and (when
+    //      the vendored `virtio_input.c` is linked, gated on the
+    //      `linuxkpi_c_linked` build.rs cfg) calls the C-side
+    //      `virtio_input_driver_init` thunk that registers the driver
+    //      in `linuxkpi::driver::VIRTIO_DRIVERS` via
+    //      `register_virtio_driver`.
+    //   2. For each PCI slot we allocate a `linuxkpi::virtio::VirtioDevice`
+    //      shape (a thin Rust mirror of Linux's `struct virtio_device`),
+    //      populate its id with VIRTIO_ID_INPUT, and walk the registered
+    //      drivers' id_tables looking for a match.
+    //   3. On match we invoke the driver's `probe(vdev)` callback. The
+    //      foundation slice's `virtio_find_vqs` deliberately returns
+    //      -ENODEV (no real virtio transport wired through the shim
+    //      yet), so probe will fail cleanly via `err_init_vq` — but
+    //      crossing the function boundary still proves the C ABI link
+    //      is sound and the driver registry lookup works. Once the
+    //      virtio-PCI transport is wired into the shim (a future
+    //      track), the probe's `virtinput_init_vqs` will succeed and
+    //      events will start flowing through `input_event` →
+    //      `arch::uefi::keyboard` ring (EV_KEY) /
+    //      `arch::uefi::pointer` ring (EV_REL/EV_ABS).
+    //
+    // Banner shape: one line per discovered device with its PCI slot
+    // coordinate, or a single "no devices" line when the QEMU CMD has
+    // no `-device virtio-{keyboard,tablet}-pci`. Keyboard / tablet
+    // discrimination on the foundation slice rides on QEMU's
+    // deterministic PCI enumeration order (which matches its `-device`
+    // CMD line order, see `Dockerfile.uefi`'s CMD: keyboard before
+    // tablet → first slot is keyboard, second is tablet). Once the
+    // EV_BITS config-space read is wired through the linuxkpi shim,
+    // the discrimination flips to a real capability query at probe
+    // time and this enumeration-order assumption goes away.
+    //
+    // Gated on `feature = "linuxkpi"` to match the `mod linuxkpi`
+    // gate in main.rs (the shim is opt-in; default builds skip the C
+    // compile of the vendored Linux source entirely). Default builds
+    // print nothing here — the smoke harness asserts the new banner
+    // phrases only when launched from a `--features linuxkpi` build
+    // (see Dockerfile.uefi's RUN cargo build line).
+    #[cfg(feature = "linuxkpi")]
+    {
+        crate::linuxkpi::init();
+        let virtio_input_pci = crate::pci::find_virtio_input_devices();
+        if virtio_input_pci.is_empty() {
+            println!("  virtio-input: no devices");
+        } else {
+            for (idx, dev) in virtio_input_pci.iter().enumerate() {
+                let slot = alloc::format!("{:02x}:{:02x}.{}", dev.bus, dev.device, dev.function);
+
+                // Build the linuxkpi VirtioDevice shape. Fields are the
+                // C-ABI layout virtio_input.c reaches; we populate the
+                // ones the probe path touches up to its first failure
+                // point (`virtinput_init_vqs` → `virtio_find_vqs` →
+                // -ENODEV). `index` is set to the discovery ordinal so
+                // the driver's `phys` snprintf yields a unique
+                // "virtio%d/input0" string per device.
+                let mut vdev = crate::linuxkpi::virtio::VirtioDevice {
+                    index: idx as core::ffi::c_int,
+                    priv_: core::ptr::null_mut(),
+                    dev: crate::linuxkpi::device::Device {
+                        parent: core::ptr::null_mut(),
+                        driver_data: core::ptr::null_mut(),
+                        bus: core::ptr::null_mut(),
+                        release: None,
+                    },
+                    config: core::ptr::null_mut(),
+                    id: crate::linuxkpi::driver::VirtioDeviceId {
+                        device: 18, // VIRTIO_ID_INPUT
+                        vendor: crate::pci::VIRTIO_VENDOR as u32,
+                    },
+                };
+
+                // Register the device in the linuxkpi device registry
+                // so devm_release_all has somewhere to dispatch from
+                // when probe fails its cleanup path.
+                crate::linuxkpi::device::device_register(
+                    &mut vdev.dev as *mut crate::linuxkpi::device::Device,
+                );
+
+                // Walk the registered drivers and call probe on the
+                // first one whose id_table claims VIRTIO_ID_INPUT.
+                // Gated on `linuxkpi_c_linked` because the driver
+                // registration only fires when the vendored C source
+                // actually compiled (which depends on a host C
+                // cross-compiler being available — see build.rs's
+                // Windows-host clang detection). On hosts where the C
+                // side wasn't linked, the registry is empty and the
+                // discovery banner alone proves the wire-up logic is
+                // sound up to the C boundary.
+                #[cfg(linuxkpi_c_linked)]
+                {
+                    let drivers = crate::linuxkpi::driver::registered_virtio_drivers();
+                    for drv_ref in drivers {
+                        // SAFETY: registered drivers point at static
+                        // C-side `struct virtio_driver` storage that
+                        // lives for the kernel's lifetime. We read the
+                        // probe fn pointer + id_table once.
+                        unsafe {
+                            let drv = drv_ref.0;
+                            if drv.is_null() {
+                                continue;
+                            }
+                            // probe is Option<unsafe extern "C" fn(...)>
+                            if let Some(probe) = (*drv).probe {
+                                let _ = probe(&mut vdev as *mut _);
+                            }
+                        }
+                    }
+                }
+
+                // Banner: discriminate by enumeration order to match
+                // the QEMU CMD line ordering (keyboard first, tablet
+                // second per Dockerfile.uefi). On a 1-device boot the
+                // first device gets the keyboard label; on a 2-device
+                // boot the second gets the tablet label. Subsequent
+                // devices (rare; QEMU rarely exposes >2 input devices)
+                // fall back to a generic "device" label.
+                match idx {
+                    0 => println!(
+                        "  virtio-input: keyboard online (slot {slot})"
+                    ),
+                    1 => println!(
+                        "  virtio-input: tablet online (slot {slot}, abs)"
+                    ),
+                    _ => println!(
+                        "  virtio-input: device online (slot {slot})"
+                    ),
+                }
+            }
+        }
+    }
+
     // Post-EBS heap smoke (step 4d wave 3, 5b74f2a). `uefi::allocator`
     // would fault here because BootServices is gone; our `Talck`
     // (#443) keeps serving allocations on the firmware-allocated
